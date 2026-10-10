@@ -31,6 +31,11 @@ vi.mock(import('../ipc/items'), async (importOriginal) => ({
 vi.mock('../ipc/folders', () => ({
   foldersTree: vi.fn(async () => []),
 }));
+vi.mock('../ipc/search', () => ({
+  smartFolders: vi.fn(async () => []),
+  queryParse: vi.fn(),
+  querySuggest: vi.fn(async () => []),
+}));
 vi.mock('@tauri-apps/api/path', () => ({
   homeDir: async () => '/Users/me',
   pictureDir: async () => '/Users/me/Pictures',

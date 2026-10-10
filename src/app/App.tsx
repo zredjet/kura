@@ -10,6 +10,7 @@ import { DragGhost } from '../features/library/DragGhost';
 import { useFileDrop, useImportShortcut } from '../features/import/useFileDrop';
 import { LibraryView } from '../features/library/LibraryView';
 import { Sidebar } from '../features/sidebar/Sidebar';
+import { SearchPalette } from '../features/search/SearchPalette';
 import { TagDialog } from '../features/tags/TagDialog';
 import { Welcome } from '../features/welcome/Welcome';
 import { startJobEvents, useJobsStore } from '../stores/jobsStore';
@@ -51,6 +52,7 @@ function LibraryScreen() {
       <ImportSheet />
       <DropOverlay />
       <TagDialog />
+      <SearchPalette />
       <Overlays />
       <Menu />
       <Notice />

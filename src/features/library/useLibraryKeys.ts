@@ -5,6 +5,7 @@ import { ja } from '../../i18n/ja';
 import { isUnitEntry, unitIdOf } from '../../ipc/items';
 import { useImportStore } from '../../stores/importStore';
 import { useLibraryStore } from '../../stores/libraryStore';
+import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import {
@@ -61,7 +62,9 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
 
   if (e.metaKey) {
-    if (key === 'i') {
+    if ((key === 'k' || key === 'f') && !e.shiftKey) {
+      useSearchStore.getState().openPalette();
+    } else if (key === 'i') {
       view.toggleInspector();
     } else if (key === '+' || key === '=' || key === ';') {
       view.setThumbSize(view.thumbSize + 1);

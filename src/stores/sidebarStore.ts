@@ -2,6 +2,7 @@ import { create } from 'zustand';
 
 import { type FolderNodeDto, foldersTree } from '../ipc/folders';
 import { libraryCounts, type LibraryCountsDto } from '../ipc/items';
+import { type SmartFolderDto, smartFolders } from '../ipc/search';
 
 const STORAGE_KEY = 'kura.sidebar';
 
@@ -33,11 +34,15 @@ function saveExpanded(expanded: Record<number, true>) {
 
 /** サイドバーで編集中のもの（フォルダの改名、新しいフォルダの名前入力）。 */
 export type SidebarEditing =
-  { kind: 'rename'; id: number } | { kind: 'create'; parentId: number | null } | null;
+  | { kind: 'rename'; id: number }
+  | { kind: 'create'; parentId: number | null }
+  | { kind: 'renameSmart'; id: number }
+  | null;
 
 interface SidebarState {
   counts: LibraryCountsDto | null;
   folders: FolderNodeDto[];
+  smartFolders: SmartFolderDto[];
   expanded: Record<number, true>;
   editing: SidebarEditing;
   /** 件数とフォルダを読み直す。 */
@@ -53,6 +58,7 @@ let again = false;
 export const useSidebarStore = create<SidebarState>((set, get) => ({
   counts: null,
   folders: [],
+  smartFolders: [],
   expanded: loadExpanded(),
   editing: null,
   load: () => {
@@ -63,8 +69,12 @@ export const useSidebarStore = create<SidebarState>((set, get) => ({
     }
     loading = (async () => {
       try {
-        const [counts, folders] = await Promise.all([libraryCounts(), foldersTree(true)]);
-        set({ counts, folders });
+        const [counts, folders, smart] = await Promise.all([
+          libraryCounts(),
+          foldersTree(true),
+          smartFolders(true),
+        ]);
+        set({ counts, folders, smartFolders: smart });
       } catch (error) {
         console.warn('サイドバーの内容を読めませんでした', error);
       } finally {
@@ -88,5 +98,5 @@ export const useSidebarStore = create<SidebarState>((set, get) => ({
     saveExpanded(expanded);
   },
   setEditing: (editing) => set({ editing }),
-  clear: () => set({ counts: null, folders: [], editing: null }),
+  clear: () => set({ counts: null, folders: [], smartFolders: [], editing: null }),
 }));

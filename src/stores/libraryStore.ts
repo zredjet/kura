@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
 import { prune } from '../features/library/selection';
+import { joinClauses } from '../features/search/clauses';
 import { type IdList, queryIds } from '../ipc/items';
 import {
   createLibrary,
@@ -11,6 +12,7 @@ import {
 } from '../ipc/library';
 import { isIpcError } from '../ipc/result';
 import { clearItems } from './itemCache';
+import { notify } from './noticeStore';
 import { useSidebarStore } from './sidebarStore';
 import { useViewStore } from './viewStore';
 
@@ -41,20 +43,31 @@ export const useLibraryStore = create<LibraryState>((set) => ({
   missingPath: null,
   list: null,
   loadList: async () => {
-    const { view, collapseUnits } = useViewStore.getState();
+    const { view, collapseUnits, filter, sort } = useViewStore.getState();
     try {
-      const list = await queryIds(view, collapseUnits);
-      // 読んでいるあいだに一覧を切り替えていたら捨てる
+      const list = await queryIds(view, { collapseUnits, query: joinClauses(filter), sort });
+      // 読んでいるあいだに一覧・条件・並び順を変えていたら捨てる
       const now = useViewStore.getState();
-      if (now.view !== view || now.collapseUnits !== collapseUnits) {
+      if (
+        now.view !== view ||
+        now.collapseUnits !== collapseUnits ||
+        now.filter !== filter ||
+        now.sort !== sort
+      ) {
         return;
       }
       set({ list });
       now.setSelection(prune(now.selection, list.ids));
     } catch (error) {
       if (isIpcError(error, 'NotFound')) {
-        // 開いていたフォルダ・ユニットがなくなったら「すべて」に戻る
+        // 開いていたフォルダ・ユニット・スマートフォルダがなくなったら「すべて」に戻る
         useViewStore.getState().setView({ kind: 'all' });
+        return;
+      }
+      if (isIpcError(error, 'Invalid') || isIpcError(error, 'InvalidQuery')) {
+        // スマートフォルダの条件が壊れているときなど
+        notify(error.message);
+        set({ list: { ids: new Uint32Array(), aspects: new Uint16Array(), groups: [] } });
         return;
       }
       console.warn('一覧を取得できませんでした', error);

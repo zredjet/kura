@@ -1,3 +1,6 @@
+import { ja } from '../i18n/ja';
+import { NO_DATE_DAY } from '../ipc/items';
+
 const DAY_MS = 86_400_000;
 const WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'] as const;
 
@@ -11,6 +14,9 @@ export function localDay(ms: number, offsetMinutes = -new Date(ms).getTimezoneOf
  * `day` と `today` は 1970-01-01 からの日数。
  */
 export function dayLabel(day: number, today: number): string {
+  if (day === NO_DATE_DAY) {
+    return ja.library.noDate;
+  }
   if (day === today) {
     return '今日';
   }

@@ -95,3 +95,99 @@
 .iconButton:hover {
   background: var(--fill-2);
 }
+
+/* 検索欄（Main.dc.html：高さ 36px、幅 320px まで、カプセル、--fill-2 の地。押すと ⌘K パレット） */
+.search {
+  position: relative;
+  flex: 0 1 320px;
+  min-width: 200px;
+  display: flex;
+  align-items: center;
+  height: var(--h-toolbar);
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  border: 1px solid var(--stroke-2);
+}
+
+.search[data-active] {
+  border-color: var(--stroke-3);
+}
+
+.searchButton {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 100%;
+  padding: 0 var(--space-2) 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  color: var(--text-tertiary);
+  font-size: var(--text-md);
+  text-align: left;
+}
+
+.searchButton:focus-visible,
+.searchClear:focus-visible,
+.pillButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.searchPlaceholder,
+.searchQuery {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.searchQuery {
+  color: var(--text-primary);
+}
+
+.kbd {
+  padding: 1px var(--space-1-5);
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--stroke-kbd);
+  background: var(--fill-1);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.searchClear {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-right: var(--space-1-5);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+}
+
+.searchClear:hover {
+  background: var(--fill-3);
+  color: var(--text-primary);
+}
+
+/* 並び順（Main.dc.html の「追加日」：高さ 36px のカプセル） */
+.pillButton {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  height: var(--h-toolbar);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  border: 1px solid var(--stroke-2);
+  font-size: var(--text-md);
+  color: var(--text-primary);
+}
+
+.pillButton:hover {
+  background: var(--fill-3);
+}

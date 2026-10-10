@@ -5,6 +5,7 @@ import {
   type ItemDetailDto,
   type ItemPatchDto,
   type ItemSummaryDto,
+  type ItemViewDto,
   type LibraryCountsDto,
   type SelectionInfoDto,
   type TrashEmptiedDto,
@@ -38,16 +39,22 @@ export function unitEntry(unitId: number): number {
   return LIST_FLAG + unitId;
 }
 
-/** 一覧の種類（サイドバーの項目。`items_query_ids` の `view`）。 */
-export type ListView =
-  | { kind: 'all' }
-  | { kind: 'recent' }
-  | { kind: 'unsorted' }
-  | { kind: 'untagged' }
-  | { kind: 'random'; seed: number }
-  | { kind: 'trash' }
-  | { kind: 'folder'; id: number }
-  | { kind: 'unit'; id: number };
+/** 一覧の種類（サイドバーの項目・ユニットの中・スマートフォルダ。`items_query_ids` の `view`）。 */
+export type ListView = ItemViewDto;
+
+/** 並べる基準。 */
+export type SortKey = 'imported' | 'captured' | 'name' | 'rating' | 'duration' | 'size';
+
+/** 並び順（`desc` は大きい・新しい順）。 */
+export interface ItemSort {
+  key: SortKey;
+  desc: boolean;
+}
+
+export const DEFAULT_SORT: ItemSort = { key: 'imported', desc: true };
+
+/** 撮影日で並べたとき、撮影日のないもののグループの日（Rust の `NO_DATE_DAY`）。 */
+export const NO_DATE_DAY = -2147483648;
 
 /** 日付の見出しのグループ（`start` 番目から始まる、`day` 日のアイテム）。 */
 export interface DayGroup {
@@ -103,15 +110,26 @@ export function utcOffsetMinutes(now: Date = new Date()): number {
   return -now.getTimezoneOffset();
 }
 
-/** 一覧の ID・縦横比・日付のグループを取る。`collapseUnits` なら set ユニットを 1 件にまとめる。 */
+/** 一覧の取り方。 */
+export interface ListOptions {
+  /** set ユニットを 1 件にまとめる。 */
+  collapseUnits?: boolean;
+  /** 検索の条件（docs/search-query.md）。 */
+  query?: string;
+  sort?: ItemSort;
+}
+
+/** 一覧の ID・縦横比・日付のグループを取る。 */
 export async function queryIds(
   view: ListView = { kind: 'all' },
-  collapseUnits = false,
+  options: ListOptions = {},
 ): Promise<IdList> {
   const buffer = await invoke<ArrayBuffer>('items_query_ids', {
     utcOffsetMinutes: utcOffsetMinutes(),
     view,
-    collapseUnits,
+    collapseUnits: options.collapseUnits ?? false,
+    query: options.query ?? null,
+    sort: options.sort ?? null,
   });
   return parseIdList(buffer);
 }

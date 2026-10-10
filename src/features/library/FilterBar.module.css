@@ -26,3 +26,114 @@
   width: 110px;
   accent-color: var(--accent);
 }
+
+/* 種類のセグメント（Main.dc.html：角丸 15px の枠に高さ 26px のボタン。オンは --fill-pressed＋白） */
+.segment {
+  display: flex;
+  gap: var(--space-0-5);
+  padding: var(--space-0-5);
+  border-radius: 15px;
+  background: var(--fill-1);
+  border: 1px solid var(--stroke-1);
+}
+
+.segmentButton {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 var(--space-2-5);
+  border-radius: 13px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.segmentButton:hover {
+  color: var(--text-primary);
+}
+
+.segmentButton[aria-pressed='true'] {
+  background: var(--fill-pressed);
+  color: var(--text-on-media);
+  font-weight: var(--weight-semibold);
+}
+
+/* チップ（design.md §4：高さ 28px、カプセル、--fill-1。オンは --fill-pressed＋白文字） */
+.chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: var(--h-chip);
+  padding: 0 var(--space-2-5);
+  border-radius: var(--radius-pill);
+  background: var(--fill-1);
+  border: 1px solid var(--stroke-1);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.chip:hover {
+  background: var(--fill-2);
+}
+
+.chip[data-active] {
+  background: var(--fill-pressed);
+  color: var(--text-on-media);
+}
+
+.segmentButton:focus-visible,
+.chip:focus-visible,
+.remove:focus-visible,
+.clear:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* そのほかの条件（Search.dc.html のトークン。除外は点線の縁＋「除外」） */
+.condition {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: var(--h-chip);
+  padding: 0 var(--space-1) 0 var(--space-2-5);
+  border-radius: var(--radius-md);
+  background: var(--fill-3);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+.condition[data-excluded] {
+  background: transparent;
+  border: 1px dashed var(--stroke-dashed);
+}
+
+.prefix {
+  color: var(--text-tertiary);
+}
+
+.remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-xs);
+  color: var(--text-secondary);
+}
+
+.remove:hover {
+  background: var(--fill-3);
+  color: var(--text-primary);
+}
+
+.clear {
+  height: var(--h-chip);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}
+
+.clear:hover {
+  color: var(--text-primary);
+}

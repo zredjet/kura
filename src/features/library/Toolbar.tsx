@@ -1,6 +1,9 @@
 import { Button } from '../../components/Button/Button';
+import { CloseIcon } from '../../components/icons/CloseIcon';
 import { InspectorIcon } from '../../components/icons/InspectorIcon';
 import { PlusIcon } from '../../components/icons/PlusIcon';
+import { SearchIcon } from '../../components/icons/SearchIcon';
+import { SortIcon } from '../../components/icons/SortIcon';
 import { UnitIcon } from '../../components/icons/UnitIcon';
 import { ja } from '../../i18n/ja';
 import styles from './Toolbar.module.css';
@@ -20,6 +23,13 @@ interface ToolbarProps {
   onToggleCollapse: () => void;
   /** ゴミ箱を開いているときの「ゴミ箱を空にする」（null なら出さない）。 */
   onEmptyTrash: (() => void) | null;
+  /** 掛かっている検索の条件（空なら欄に案内を出す）。 */
+  query: string;
+  onOpenSearch: () => void;
+  onClearSearch: () => void;
+  /** 並び順のボタンの文字（null なら並び順を切り替えない一覧）。 */
+  sortLabel: string | null;
+  onSortMenu: (anchor: HTMLElement) => void;
 }
 
 /**
@@ -38,6 +48,11 @@ export function Toolbar({
   canCollapse,
   onToggleCollapse,
   onEmptyTrash,
+  query,
+  onOpenSearch,
+  onClearSearch,
+  sortLabel,
+  onSortMenu,
 }: ToolbarProps) {
   return (
     <header className={styles.toolbar} data-tauri-drag-region>
@@ -64,6 +79,43 @@ export function Toolbar({
           {subtitle}
         </span>
       </div>
+      <div className={styles.search} data-active={query !== '' || undefined}>
+        <button
+          type="button"
+          className={styles.searchButton}
+          aria-label={query ? `${ja.search.fieldLabel}：${query}` : ja.search.fieldLabel}
+          aria-haspopup="dialog"
+          onClick={onOpenSearch}
+        >
+          <SearchIcon size={16} strokeWidth={1.9} />
+          <span className={query ? styles.searchQuery : styles.searchPlaceholder}>
+            {query || ja.search.placeholder}
+          </span>
+          {!query && <kbd className={styles.kbd}>⌘K</kbd>}
+        </button>
+        {query && (
+          <button
+            type="button"
+            className={styles.searchClear}
+            aria-label={ja.search.clear}
+            onClick={onClearSearch}
+          >
+            <CloseIcon size={10} strokeWidth={3} />
+          </button>
+        )}
+      </div>
+      {sortLabel !== null && (
+        <button
+          type="button"
+          className={styles.pillButton}
+          aria-label={`${ja.sort.label}：${sortLabel}`}
+          aria-haspopup="menu"
+          onClick={(e) => onSortMenu(e.currentTarget)}
+        >
+          <SortIcon size={15} strokeWidth={1.8} />
+          {sortLabel}
+        </button>
+      )}
       {onEmptyTrash && (
         <Button size="sm" onClick={onEmptyTrash}>
           {ja.library.emptyTrash}

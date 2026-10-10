@@ -14,6 +14,7 @@ import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import { FolderTree } from './FolderTree';
 import { LibrarySwitcher } from './LibrarySwitcher';
+import { SmartFolderList } from './SmartFolderList';
 import styles from './Sidebar.module.css';
 
 /** 行のボタンに付ける印（↑↓ でたどるため）。 */
@@ -45,7 +46,7 @@ function viewFor(kind: LibraryKind): ListView {
 
 /**
  * サイドバー（Sidebar.dc.html）。先頭の行にはネイティブの信号機が重なる。
- * ライブラリの切り替え・ライブラリの項目・フォルダの木。スマートフォルダ（M4）・プレイリスト（M6）・
+ * ライブラリの切り替え・ライブラリの項目・スマートフォルダ・フォルダの木。プレイリスト（M6）・
  * 取得（M7）・容量と設定（M9）は、その機能を入れるときに足す。
  */
 export function Sidebar() {
@@ -115,6 +116,7 @@ export function Sidebar() {
             );
           })}
         </section>
+        <SmartFolderList current={current} />
         <FolderTree current={current} />
       </div>
     </nav>
