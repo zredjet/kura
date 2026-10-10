@@ -1,6 +1,40 @@
 import { create } from 'zustand';
 
 import { listJobs, type JobProgress, onJobProgress, progressFromJob } from '../ipc/jobs';
+import { refreshPending } from './itemCache';
+import { useLibraryStore } from './libraryStore';
+
+/** 取り込み中に一覧を読み直す間隔・サムネイルのでき具合を反映する間隔（ms）。 */
+const LIST_RELOAD_MS = 1000;
+const THUMB_REFRESH_MS = 500;
+
+/** 呼ばれてから `ms` のあいだに何度呼ばれても 1 回にまとめる。 */
+function coalesce(ms: number, run: () => void): () => void {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return () => {
+    if (timer === null) {
+      timer = setTimeout(() => {
+        timer = null;
+        run();
+      }, ms);
+    }
+  };
+}
+
+const reloadList = coalesce(LIST_RELOAD_MS, () => {
+  void useLibraryStore.getState().loadList();
+  void useLibraryStore.getState().refresh();
+});
+const refreshThumbs = coalesce(THUMB_REFRESH_MS, refreshPending);
+
+/** ジョブの進みに合わせて画面のデータを更新する（取り込み → 一覧、サムネイル → タイル）。 */
+export function reactToJob(event: JobProgress): void {
+  if (event.kind === 'import' && (event.state === 'running' || event.state === 'done')) {
+    reloadList();
+  } else if (event.kind === 'thumbnail') {
+    refreshThumbs();
+  }
+}
 
 interface JobsState {
   /** 取り込みジョブの最新の状態（ID ごと）。 */
@@ -58,7 +92,10 @@ export function selectCurrentImport(state: JobsState): JobProgress | null {
 export function startJobEvents(): () => void {
   let stop: (() => void) | null = null;
   let stopped = false;
-  onJobProgress((event) => useJobsStore.getState().apply(event))
+  onJobProgress((event) => {
+    useJobsStore.getState().apply(event);
+    reactToJob(event);
+  })
     .then((unlisten) => {
       if (stopped) {
         unlisten();

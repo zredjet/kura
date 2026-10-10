@@ -93,6 +93,7 @@ function SheetBody({ titleId, preview }: { titleId: string; preview: ImportPrevi
   const [reproduce, setReproduce] = useState(true);
   const [folderTags, setFolderTags] = useState(false);
   const [units, setUnits] = useState(false);
+  const [fileInfoTags, setFileInfoTags] = useState(true);
   const [tags, setTags] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const organizeId = useId();
@@ -115,6 +116,7 @@ function SheetBody({ titleId, preview }: { titleId: string; preview: ImportPrevi
       reproduceFolders: hasFolders && reproduce,
       folderNamesAsTags: hasFolders && folderTags,
       unitsPerFolder: hasFolders && units,
+      fileInfoTags,
       tags,
       duplicates,
     });
@@ -206,6 +208,12 @@ function SheetBody({ titleId, preview }: { titleId: string; preview: ImportPrevi
             />
           </>
         )}
+        <SwitchRow
+          label={t.fileInfoTags}
+          hint={t.fileInfoTagsHint}
+          checked={fileInfoTags}
+          onChange={setFileInfoTags}
+        />
       </section>
 
       <section className={styles.tags} aria-labelledby={tagsId}>

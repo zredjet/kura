@@ -21,6 +21,11 @@ vi.mock('../ipc/jobs', () => ({
   pauseJob: vi.fn(),
   resumeJob: vi.fn(),
 }));
+vi.mock('../ipc/items', () => ({
+  queryIds: vi.fn(async () => ({ ids: new Uint32Array(), aspects: new Uint16Array(), groups: [] })),
+  getItems: vi.fn(async () => []),
+  getItemDetail: vi.fn(),
+}));
 vi.mock('@tauri-apps/api/path', () => ({
   homeDir: async () => '/Users/me',
   pictureDir: async () => '/Users/me/Pictures',
@@ -52,7 +57,7 @@ describe('App（前回のライブラリを開けたとき）', () => {
     expect(
       screen.getByRole('heading', { level: 1, name: ja.library.allItems }),
     ).toBeInTheDocument();
-    expect(screen.getByText('12,480 項目')).toBeInTheDocument();
+    expect(screen.getByText('12,480 項目 · 追加日の新しい順')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: ja.library.importFiles })).toBeInTheDocument();
     expect(screen.getByRole('region', { name: ja.library.gridLabel })).toBeInTheDocument();
     expect(

@@ -89,6 +89,7 @@ describe('ImportSheet', () => {
       reproduceFolders: true,
       folderNamesAsTags: true,
       unitsPerFolder: false,
+      fileInfoTags: true,
       tags: ['旅行'],
       duplicates: 'ignore',
     });
@@ -97,7 +98,9 @@ describe('ImportSheet', () => {
   it('ファイルだけのときはフォルダのオプションを出さない', () => {
     open({ ...PREVIEW, roots: [{ name: 'a.jpg', isDir: false }], subfolders: 0, sampleDirs: [] });
     render(<ImportSheet />);
-    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+    // フォルダのスイッチは出さず、ファイルの情報からタグだけ出す
+    expect(screen.getAllByRole('switch')).toHaveLength(1);
+    expect(screen.getByRole('switch', { name: /ファイルの情報からタグを付ける/ })).toBeChecked();
   });
 
   it('取り込めるものがない・確認に失敗した・esc で閉じる', () => {

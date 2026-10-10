@@ -1,0 +1,68 @@
+/* Main.dc.html：余白 0・8・96・12（下の 96px はミニプレーヤーの分）、タイルの間隔 6px */
+
+.grid {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 0 var(--space-2) calc(var(--space-6) * 4) var(--space-3);
+  overscroll-behavior: contain;
+}
+
+.canvas {
+  position: relative;
+  width: 100%;
+}
+
+.row,
+.heading {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  will-change: transform;
+}
+
+.row {
+  display: flex;
+  gap: var(--space-1-5);
+}
+
+/* 日付の見出し（Main.dc.html：余白 8・2・2、13px semibold ＋件数 12px tertiary） */
+.heading {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-0-5) var(--space-0-5);
+}
+
+.headingTitle {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+
+.headingCount {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.empty {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  text-align: center;
+}
+
+.emptyTitle {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+}
+
+.emptyHint {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}

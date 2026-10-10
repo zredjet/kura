@@ -33,3 +33,18 @@ export function tildePath(path: string, home: string | null): string {
   const base = home.endsWith('/') ? home.slice(0, -1) : home;
   return path === base || path.startsWith(`${base}/`) ? `~${path.slice(base.length)}` : path;
 }
+
+/** 長さを「1:12:40」「4:18」「0:45」の形にする。 */
+export function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+}
+
+/** ハッシュを「b3:9f2c…41a7」の形に短くする。 */
+export function shortHash(hash: string): string {
+  return hash.length > 8 ? `b3:${hash.slice(0, 4)}…${hash.slice(-4)}` : `b3:${hash}`;
+}

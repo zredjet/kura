@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { formatBytes, formatCount, tildePath } from './format';
+import { formatBytes, formatCount, formatDuration, shortHash, tildePath } from './format';
 
 describe('formatCount', () => {
   it('3 桁ごとに区切る', () => {
@@ -30,5 +30,20 @@ describe('tildePath', () => {
     expect(tildePath('/Users/me', '/Users/me/')).toBe('~');
     expect(tildePath('/Users/meg/x', '/Users/me')).toBe('/Users/meg/x');
     expect(tildePath('/Volumes/SSD/K.kuralib', null)).toBe('/Volumes/SSD/K.kuralib');
+  });
+});
+
+describe('formatDuration', () => {
+  it('時間があれば h:mm:ss、なければ m:ss', () => {
+    expect(formatDuration(4_360_000)).toBe('1:12:40');
+    expect(formatDuration(258_000)).toBe('4:18');
+    expect(formatDuration(45_000)).toBe('0:45');
+    expect(formatDuration(0)).toBe('0:00');
+  });
+});
+
+describe('shortHash', () => {
+  it('先頭と末尾 4 桁', () => {
+    expect(shortHash('9f2c0000000041a7')).toBe('b3:9f2c…41a7');
   });
 });

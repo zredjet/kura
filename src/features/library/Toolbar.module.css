@@ -47,3 +47,23 @@
 .importButton:hover {
   background: color-mix(in srgb, var(--accent) 88%, var(--text-on-media));
 }
+
+/* インスペクタの表示切り替え：36px の丸、地なし */
+.iconButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--h-toolbar);
+  height: var(--h-toolbar);
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+}
+
+.iconButton:hover,
+.iconButton[aria-pressed='true'] {
+  color: var(--text-primary);
+}
+
+.iconButton:hover {
+  background: var(--fill-2);
+}
