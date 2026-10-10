@@ -3,6 +3,7 @@
 //! - 種類は画像 70%・動画 20%・音楽 10%。縦横比は 8 種類、追加日は約 2 年に散らす。
 //! - 実ファイルとサムネイルは、少数のひな形 JPEG を APFS クローンで複製する（容量はほとんど増えない）。
 //! - タグ（2,000 個、1 件あたり 0〜5 個）と仮想フォルダ（60 個）も付ける（M4 の検索の計測用）。
+//! - 200 件ごとに 10 件の set ユニットを作る（M3 の「ユニットをまとめて表示」の計測用）。
 //! - 乱数はシード付きの ChaCha8 なので、同じ件数なら毎回同じライブラリになる。
 
 use std::path::{Path, PathBuf};
@@ -39,6 +40,9 @@ const PALETTES: [([u8; 3], [u8; 3], [u8; 3]); 6] = [
 const TAGS: usize = 2000;
 const NAMESPACES: [&str; 6] = ["", "作者", "場所", "イベント", "投稿者", "アーティスト"];
 const DAY_MS: i64 = 86_400_000;
+/// ユニットを作る間隔と大きさ（200 件ごとに 10 件のユニット）。
+const UNIT_EVERY: usize = 200;
+const UNIT_SIZE: usize = 10;
 /// 1 トランザクションで入れる件数（.claude/rules/database.md：大量挿入は 500 件程度ずつ）。
 const CHUNK: usize = 500;
 
@@ -124,6 +128,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     );
 
     insert_items(&library, &templates, seeded)?;
+    seed_units(&library, items, now)?;
     std::fs::remove_dir_all(&template_dir).map_err(|e| e.to_string())?;
     tracing::info!(
         items,
@@ -249,6 +254,31 @@ fn seed_tags(library: &Library, now: i64) -> Result<(), String> {
             for i in 0..TAGS {
                 let ns = NAMESPACES[i % NAMESPACES.len()];
                 stmt.execute((i as i64 + 1, ns, format!("タグ{i}"), now))?;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// 200 件ごとに、続く 10 件を set ユニットにまとめる（「ユニットをまとめて表示」の計測用）。
+fn seed_units(library: &Library, items: usize, now: i64) -> Result<(), String> {
+    let units = items / UNIT_EVERY;
+    library
+        .db()
+        .write(move |tx| {
+            let mut unit_stmt = tx.prepare_cached(
+                "INSERT INTO units (kind, name, cover_item_id, order_mode, origin, created_at, updated_at)
+                 VALUES ('set', ?1, ?2, 'manual', 'user', ?3, ?3)",
+            )?;
+            let mut member_stmt = tx
+                .prepare_cached("INSERT INTO unit_items (unit_id, item_id, pos) VALUES (?1, ?2, ?3)")?;
+            for u in 0..units {
+                let first = (u * UNIT_EVERY + 1) as i64;
+                unit_stmt.execute((format!("ユニット{u}"), first, now))?;
+                let unit = tx.last_insert_rowid();
+                for k in 0..UNIT_SIZE as i64 {
+                    member_stmt.execute((unit, first + k, (k + 1) as f64))?;
+                }
             }
             Ok(())
         })
@@ -465,6 +495,18 @@ mod tests {
         assert!(filed > 400, "filed {filed}");
         assert_eq!(tags, TAGS as i64);
         assert!(folders > 0);
+        let (units, members) = library
+            .db()
+            .read(|c| {
+                Ok((
+                    c.query_row("SELECT count(*) FROM units", [], |r| r.get::<_, i64>(0))?,
+                    c.query_row("SELECT count(*) FROM unit_items", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((units, members), (6, 60));
 
         // 実ファイル・サムネイル・ジャケットが置かれ、ひな形は消えている
         let layout = library.layout();

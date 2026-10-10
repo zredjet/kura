@@ -3,8 +3,12 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use kura_core::items::{ItemQuery, ItemSort, MAX_SUMMARIES, detail, query_ids, summaries};
+use kura_core::items::{
+    ItemQuery, ItemSort, ItemView, MAX_SUMMARIES, counts, detail, query_ids, recent_since,
+    summaries,
+};
 use kura_core::library::Library;
+use kura_core::time::now_ms;
 
 /// `bench query --library <path>` / `bench thumbs --src <dir> [--threads N]`。
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -139,6 +143,73 @@ fn query(path: &std::path::Path) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         detail_runs.push(started.elapsed());
     }
+
+    // M3：サイドバーの一覧の種類と件数
+    let folder = db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT min(id) FROM folders WHERE parent_id IS NULL",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )?)
+        })
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0);
+    let view_ms = |view: ItemView, collapse: bool| -> Result<(f64, usize), String> {
+        let mut runs = Vec::new();
+        let mut n = 0;
+        for _ in 0..5 {
+            let started = Instant::now();
+            let query = ItemQuery {
+                view,
+                collapse_units: collapse,
+            };
+            let list = db
+                .read(|conn| query_ids(conn, &query, ItemSort::ImportedDesc, 540))
+                .map_err(|e| e.to_string())?;
+            runs.push(started.elapsed());
+            n = list.ids.len();
+        }
+        Ok((median(runs).as_secs_f64() * 1000.0, n))
+    };
+    let since = recent_since(now_ms());
+    let (recent_ms, _) = view_ms(ItemView::Recent { since }, false)?;
+    let (unsorted_ms, unsorted) = view_ms(ItemView::Unsorted, false)?;
+    let (untagged_ms, untagged) = view_ms(ItemView::Untagged, false)?;
+    let (folder_ms, in_folder) = view_ms(ItemView::Folder { id: folder }, false)?;
+    let (random_ms, _) = view_ms(ItemView::Random { seed: 1 }, false)?;
+    let (collapse_ms, collapsed) = view_ms(ItemView::All, true)?;
+    let mut count_runs = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        db.read(|conn| counts(conn, since))
+            .map_err(|e| e.to_string())?;
+        db.read(kura_core::folders::item_counts)
+            .map_err(|e| e.to_string())?;
+        count_runs.push(started.elapsed());
+    }
+    let mut suggest_runs = Vec::new();
+    for prefix in ["タ", "タグ1", "作者:", "", "タグ19"] {
+        let started = Instant::now();
+        db.read(|conn| kura_core::tags::suggest(conn, prefix, 8))
+            .map_err(|e| e.to_string())?;
+        suggest_runs.push(started.elapsed());
+    }
+    tracing::info!(
+        recent_ms,
+        unsorted_ms,
+        unsorted,
+        untagged_ms,
+        untagged,
+        folder_ms,
+        in_folder,
+        random_ms,
+        collapse_ms,
+        collapsed,
+        sidebar_counts_ms = median(count_runs).as_secs_f64() * 1000.0,
+        tags_suggest_ms = median(suggest_runs).as_secs_f64() * 1000.0,
+        "サイドバーの一覧と件数（中央値）"
+    );
 
     tracing::info!(
         items = ids.len(),
