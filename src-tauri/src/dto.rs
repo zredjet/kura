@@ -6,12 +6,15 @@ use specta::Type;
 use kura_core::folders::{FolderNode, FolderPatch};
 use kura_core::import::{DuplicatePolicy, ImportOptions, ImportPreview, ScanRoot};
 use kura_core::items::{
-    FolderRef, ItemDetail, ItemPatch, ItemSummary, LibraryCounts, SelectionInfo, TagRef, UnitRef,
+    FolderRef, ItemDetail, ItemPatch, ItemSort, ItemSummary, KindCounts, LibraryCounts,
+    SelectionInfo, SortKey, TagRef, UnitRef,
 };
 use kura_core::jobs::{JobEvent, JobFilter, JobKind, JobRecord, JobState};
 use kura_core::library::{
     IntegrityReport, LibraryInfo, LocationCheck, LocationStatus, TrashEmptied,
 };
+use kura_core::query::QueryCheck;
+use kura_core::query::suggest::{Suggestion, SuggestionKind};
 use kura_core::tags::{TagDetail, TagPatch, TagSuggestion};
 use kura_core::unit::{Cover, OrderMode, UnitDetail, UnitKind, UnitPatch, UnitSummary};
 
@@ -570,7 +573,7 @@ impl From<LibraryCounts> for LibraryCountsDto {
 }
 
 /// 一覧の種類（`items_query_ids` の引数。生バイトのコマンドなので TS の型は `src/ipc/items.ts` に書く）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Type)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ItemViewDto {
     All,
@@ -581,6 +584,178 @@ pub enum ItemViewDto {
     Trash,
     Folder { id: i64 },
     Unit { id: i64 },
+    Smart { id: i64 },
+}
+
+/// 並び順（`items_query_ids` の引数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemSortDto {
+    pub key: SortKeyDto,
+    pub desc: bool,
+}
+
+/// 並べる基準。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SortKeyDto {
+    Imported,
+    Captured,
+    Name,
+    Rating,
+    Duration,
+    Size,
+}
+
+impl From<ItemSortDto> for ItemSort {
+    fn from(s: ItemSortDto) -> Self {
+        Self {
+            key: match s.key {
+                SortKeyDto::Imported => SortKey::Imported,
+                SortKeyDto::Captured => SortKey::Captured,
+                SortKeyDto::Name => SortKey::Name,
+                SortKeyDto::Rating => SortKey::Rating,
+                SortKeyDto::Duration => SortKey::Duration,
+                SortKeyDto::Size => SortKey::Size,
+            },
+            desc: s.desc,
+        }
+    }
+}
+
+/// 解析のエラー（位置は入力の UTF-16 の文字位置）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ParseErrorDto {
+    pub start: u32,
+    pub end: u32,
+    pub message: String,
+}
+
+/// チップに分けた条件。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ClauseDto {
+    pub start: u32,
+    pub end: u32,
+    pub text: String,
+    pub negated: bool,
+    /// フィールドの条件なら英語名（`type` など）。
+    pub field: Option<String>,
+}
+
+/// 種類ごとの件数。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct KindCountsDto {
+    pub image: i64,
+    pub video: i64,
+    pub audio: i64,
+    pub total: i64,
+}
+
+impl From<KindCounts> for KindCountsDto {
+    fn from(c: KindCounts) -> Self {
+        Self {
+            image: c.image,
+            video: c.video,
+            audio: c.audio,
+            total: c.total(),
+        }
+    }
+}
+
+/// パレットに出す解析の結果。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryCheckDto {
+    pub error: Option<ParseErrorDto>,
+    pub clauses: Vec<ClauseDto>,
+    pub counts: Option<KindCountsDto>,
+}
+
+fn to_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+impl From<QueryCheck> for QueryCheckDto {
+    fn from(c: QueryCheck) -> Self {
+        Self {
+            error: c.error.map(|e| ParseErrorDto {
+                start: to_u32(e.start),
+                end: to_u32(e.end),
+                message: e.message,
+            }),
+            clauses: c
+                .clauses
+                .into_iter()
+                .map(|c| ClauseDto {
+                    start: to_u32(c.start),
+                    end: to_u32(c.end),
+                    text: c.text,
+                    negated: c.negated,
+                    field: c.field.map(str::to_string),
+                })
+                .collect(),
+            counts: c.counts.map(Into::into),
+        }
+    }
+}
+
+/// 候補の種類。
+#[derive(Debug, Clone, Copy, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum SuggestionKindDto {
+    Tag,
+    Field,
+    Value,
+    Saved,
+}
+
+/// パレットの候補。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionDto {
+    pub kind: SuggestionKindDto,
+    /// 入力中の語と置き換える文字列（保存済みの検索は、その条件）。
+    pub insert: String,
+    /// 前に薄く出す部分（名前空間・フィールド名）。
+    pub prefix: String,
+    pub label: String,
+    pub detail: Option<String>,
+    pub count: Option<i64>,
+    /// 保存済みの検索の ID。
+    pub id: Option<i64>,
+}
+
+impl From<Suggestion> for SuggestionDto {
+    fn from(s: Suggestion) -> Self {
+        Self {
+            kind: match s.kind {
+                SuggestionKind::Tag => SuggestionKindDto::Tag,
+                SuggestionKind::Field => SuggestionKindDto::Field,
+                SuggestionKind::Value => SuggestionKindDto::Value,
+                SuggestionKind::Saved => SuggestionKindDto::Saved,
+            },
+            insert: s.insert,
+            prefix: s.prefix,
+            label: s.label,
+            detail: s.detail,
+            count: s.count,
+            id: s.id,
+        }
+    }
+}
+
+/// スマートフォルダ。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartFolderDto {
+    pub id: i64,
+    pub name: String,
+    pub query: String,
+    /// 一致する件数（`withCounts` のときだけ）。
+    pub count: Option<i64>,
 }
 
 /// アイテムの変更（省略した項目は変えない。`note` の空文字はメモを消す）。

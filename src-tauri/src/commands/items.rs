@@ -3,21 +3,23 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kura_core::items::{
-    self, ItemPatch, ItemQuery, ItemSort, ItemView, detail, query_ids, recent_since, summaries,
+    self, ItemPatch, ItemQuery, ItemView, detail, query_ids, recent_since, summaries,
 };
+use kura_core::query::{QueryContext, parse};
 use kura_core::time::now_ms;
 use tauri::State;
 use tauri::ipc::Response;
 
 use super::blocking;
 use crate::dto::{
-    ItemDetailDto, ItemPatchDto, ItemSummaryDto, ItemViewDto, LibraryCountsDto, SelectionInfoDto,
-    TrashEmptiedDto,
+    ItemDetailDto, ItemPatchDto, ItemSortDto, ItemSummaryDto, ItemViewDto, LibraryCountsDto,
+    SelectionInfoDto, TrashEmptiedDto,
 };
-use crate::error::AppError;
+use crate::error::{AppError, AppErrorCode};
 use crate::state::AppState;
 
-fn to_view(view: ItemViewDto, now: i64) -> ItemView {
+/// 一覧の種類にする（「最近の取り込み」の起点は今の時刻から決める）。
+pub(crate) fn to_view(view: ItemViewDto, now: i64) -> ItemView {
     match view {
         ItemViewDto::All => ItemView::All,
         ItemViewDto::Recent => ItemView::Recent {
@@ -29,6 +31,7 @@ fn to_view(view: ItemViewDto, now: i64) -> ItemView {
         ItemViewDto::Trash => ItemView::Trash,
         ItemViewDto::Folder { id } => ItemView::Folder { id },
         ItemViewDto::Unit { id } => ItemView::Unit { id },
+        ItemViewDto::Smart { id } => ItemView::Smart { id },
     }
 }
 
@@ -43,17 +46,34 @@ pub async fn items_query_ids(
     utc_offset_minutes: i32,
     view: Option<ItemViewDto>,
     collapse_units: Option<bool>,
+    query: Option<String>,
+    sort: Option<ItemSortDto>,
 ) -> Result<Response, AppError> {
     let session = state.session()?;
     let bytes = blocking(move || {
+        let now = now_ms();
+        let filter = match query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+            Some(text) => Some(
+                parse(text)
+                    .map_err(|e| AppError::new(AppErrorCode::InvalidQuery, e.message))?
+                    .expr,
+            ),
+            None => None,
+        };
         let query = ItemQuery {
-            view: to_view(view.unwrap_or(ItemViewDto::All), now_ms()),
+            view: to_view(view.unwrap_or(ItemViewDto::All), now),
             collapse_units: collapse_units.unwrap_or(false),
+            filter,
+            sort: sort.map(Into::into).unwrap_or_default(),
+        };
+        let ctx = QueryContext {
+            now_ms: now,
+            utc_offset_minutes,
         };
         let list = session
             .library()
             .db()
-            .read(|conn| query_ids(conn, &query, ItemSort::ImportedDesc, utc_offset_minutes))?;
+            .read(|conn| query_ids(conn, &query, &ctx))?;
         if FIRST_IDS.swap(false, Ordering::Relaxed) {
             tracing::info!(
                 items = list.ids.len(),

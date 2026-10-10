@@ -99,6 +99,18 @@ export const commands = {
 	unitTagsApply: (id: number, add: string[], remove: number[]) => typedError<null, AppError>(__TAURI_INVOKE("unit_tags_apply", { id, add, remove })),
 	/**  ユニットを解除する（アイテムは残る）。 */
 	unitDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("unit_delete", { id })),
+	/**  入力を解析し、開いている一覧の中で一致する件数を数える（パレットの「一致 186 項目」）。 */
+	queryParse: (text: string, view: { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number } | null, utcOffsetMinutes: number) => typedError<QueryCheckDto, AppError>(__TAURI_INVOKE("query_parse", { text, view, utcOffsetMinutes })),
+	/**  入力中の語の候補（タグ → フィールド名・値 → 保存済みの検索）。 */
+	querySuggest: (word: string, limit: number) => typedError<SuggestionDto[], AppError>(__TAURI_INVOKE("query_suggest", { word, limit })),
+	/**  すべてのスマートフォルダ。`withCounts` なら一致する件数も数える。 */
+	smartFoldersList: (withCounts: boolean | null, utcOffsetMinutes: number) => typedError<SmartFolderDto[], AppError>(__TAURI_INVOKE("smart_folders_list", { withCounts, utcOffsetMinutes })),
+	/**  検索をスマートフォルダとして保存する。作ったスマートフォルダの ID を返す。 */
+	smartFolderSave: (name: string, query: string) => typedError<number, AppError>(__TAURI_INVOKE("smart_folder_save", { name, query })),
+	/**  名前・条件を変える（省いたものは変えない）。 */
+	smartFolderUpdate: (id: number, name: string | null, query: string | null) => typedError<null, AppError>(__TAURI_INVOKE("smart_folder_update", { id, name, query })),
+	/**  スマートフォルダを消す（アイテムはそのまま）。 */
+	smartFolderDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("smart_folder_delete", { id })),
 };
 
 /** Events */
@@ -122,6 +134,16 @@ export type AppErrorCode = "NotFound" | "InvalidQuery" | "Invalid" | "ToolMissin
 export type Appearance = {
 	/**  「透明度を下げる」がオンか。オンならガラスを不透明な面に置き換える。 */
 	reduceTransparency: boolean,
+};
+
+/**  チップに分けた条件。 */
+export type ClauseDto = {
+	start: number,
+	end: number,
+	text: string,
+	negated: boolean,
+	/**  フィールドの条件なら英語名（`type` など）。 */
+	field: string | null,
 };
 
 /**  ユニットの表紙。 */
@@ -261,6 +283,9 @@ export type ItemSummaryDto = {
 	thumbState: string,
 };
 
+/**  一覧の種類（`items_query_ids` の引数。生バイトのコマンドなので TS の型は `src/ipc/items.ts` に書く）。 */
+export type ItemViewDto = { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number };
+
 /**  ジョブ 1 件。 */
 export type JobDto = {
 	id: number,
@@ -298,6 +323,14 @@ export type JobProgress = {
 /**  ジョブの状態。 */
 export type JobStateDto = "queued" | "running" | "paused" | "done" | "failed" | "canceled";
 
+/**  種類ごとの件数。 */
+export type KindCountsDto = {
+	image: number,
+	video: number,
+	audio: number,
+	total: number,
+};
+
 /**  サイドバーの「ライブラリ」の件数。 */
 export type LibraryCountsDto = {
 	all: number,
@@ -334,6 +367,20 @@ export type LocationStatusDto = "new" | "existingLibrary" | "occupied";
 /**  ユニットのメンバーの並び順。 */
 export type OrderModeDto = "manual" | "name" | "imported" | "captured" | "duration";
 
+/**  解析のエラー（位置は入力の UTF-16 の文字位置）。 */
+export type ParseErrorDto = {
+	start: number,
+	end: number,
+	message: string,
+};
+
+/**  パレットに出す解析の結果。 */
+export type QueryCheckDto = {
+	error: ParseErrorDto | null,
+	clauses: ClauseDto[],
+	counts: KindCountsDto | null,
+};
+
 /**  ドロップされたもの。 */
 export type ScanRootDto = {
 	name: string,
@@ -352,6 +399,32 @@ export type SelectionInfoDto = {
 	tags: TagCountDto[],
 	folders: FolderCountDto[],
 };
+
+/**  スマートフォルダ。 */
+export type SmartFolderDto = {
+	id: number,
+	name: string,
+	query: string,
+	/**  一致する件数（`withCounts` のときだけ）。 */
+	count: number | null,
+};
+
+/**  パレットの候補。 */
+export type SuggestionDto = {
+	kind: SuggestionKindDto,
+	/**  入力中の語と置き換える文字列（保存済みの検索は、その条件）。 */
+	insert: string,
+	/**  前に薄く出す部分（名前空間・フィールド名）。 */
+	prefix: string,
+	label: string,
+	detail: string | null,
+	count: number | null,
+	/**  保存済みの検索の ID。 */
+	id: number | null,
+};
+
+/**  候補の種類。 */
+export type SuggestionKindDto = "tag" | "field" | "value" | "saved";
 
 /**  タグと、付いている件数。 */
 export type TagCountDto = {
