@@ -1,8 +1,20 @@
-//! 開発用ツール。`seed`（ダミーライブラリの生成）は M2 で実装する。
+//! 開発用ツール。
+//!
+//! - `import --library <path> [--create] [<src>...]`：取り込む（<src> を省くと、中断していた取り込みの再開だけ待つ）
+//! - `check --library <path>`：件数と整合性（DB とファイルの食い違い）を表示する
+//! - `seed`（ダミーライブラリの生成）は M2 で実装する。
 
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
-const USAGE: &str = "使い方: kura-devtools seed --items <件数> --out <パス>";
+use kura_core::import::{ImportInput, ImportOptions, start_import};
+use kura_core::jobs::{EventSink, JobFilter, JobKind, JobState};
+use kura_core::library::{LibrarySession, check_files};
+
+const USAGE: &str =
+    "使い方: kura-devtools import --library <path> [--create] [<src>...] | check --library <path>";
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -10,14 +22,123 @@ fn main() -> ExitCode {
         .with_target(false)
         .init();
 
-    match std::env::args().nth(1).as_deref() {
-        Some("seed") => {
-            tracing::error!("seed はまだ実装されていません（M2 で実装）");
-            ExitCode::FAILURE
-        }
-        _ => {
-            tracing::info!("{USAGE}");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = match args.first().map(String::as_str) {
+        Some("import") => import(&args[1..]),
+        Some("check") => check(&args[1..]),
+        Some("seed") => Err("seed はまだ実装されていません（M2 で実装）".to_string()),
+        _ => Err(USAGE.to_string()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            tracing::error!("{message}");
             ExitCode::FAILURE
         }
     }
+}
+
+struct Args {
+    library: PathBuf,
+    create: bool,
+    sources: Vec<PathBuf>,
+}
+
+fn parse(args: &[String]) -> Result<Args, String> {
+    let mut library = None;
+    let mut create = false;
+    let mut sources = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--library" => library = it.next().map(PathBuf::from),
+            "--create" => create = true,
+            other => sources.push(PathBuf::from(other)),
+        }
+    }
+    Ok(Args {
+        library: library.ok_or(USAGE)?,
+        create,
+        sources,
+    })
+}
+
+fn progress_sink() -> EventSink {
+    Arc::new(|event| {
+        tracing::info!(
+            id = event.id,
+            state = event.state.as_str(),
+            progress = event.progress.unwrap_or(0.0),
+            message = event.message.as_deref().unwrap_or(""),
+        );
+    })
+}
+
+fn import(args: &[String]) -> Result<(), String> {
+    let args = parse(args)?;
+    let session = if args.create {
+        LibrarySession::create(&args.library, progress_sink())
+    } else {
+        LibrarySession::open(&args.library, progress_sink())
+    }
+    .map_err(|e| e.to_string())?;
+
+    if !args.sources.is_empty() {
+        let input = ImportInput {
+            paths: args.sources,
+            options: ImportOptions::default(),
+        };
+        let id = start_import(session.jobs(), &input).map_err(|e| e.to_string())?;
+        tracing::info!(id, "取り込みを積みました");
+    }
+    session.wait_ready();
+    if !session.jobs().wait_idle(Duration::from_secs(3600)) {
+        return Err("1 時間待っても終わりませんでした".into());
+    }
+    let jobs = session
+        .jobs()
+        .list(&JobFilter {
+            kinds: vec![JobKind::Import],
+            states: vec![],
+            limit: Some(5),
+        })
+        .map_err(|e| e.to_string())?;
+    for job in jobs {
+        tracing::info!(
+            id = job.id,
+            state = job.state.as_str(),
+            result = job.result_json.as_deref().unwrap_or(""),
+            "ジョブ"
+        );
+        if job.state == JobState::Failed {
+            return Err(job.message.unwrap_or_default());
+        }
+    }
+    report(&session)
+}
+
+fn check(args: &[String]) -> Result<(), String> {
+    let args = parse(args)?;
+    let session =
+        LibrarySession::open(&args.library, progress_sink()).map_err(|e| e.to_string())?;
+    session.wait_ready();
+    report(&session)
+}
+
+fn report(session: &LibrarySession) -> Result<(), String> {
+    let info = session.info().map_err(|e| e.to_string())?;
+    let (missing, orphans) = check_files(session.library().db(), session.library().layout())
+        .map_err(|e| e.to_string())?;
+    let staging = std::fs::read_dir(session.library().layout().staging_dir())
+        .map(|d| d.count())
+        .unwrap_or(0);
+    tracing::info!(
+        items = info.item_count,
+        missing_files = missing,
+        orphan_files = orphans,
+        staging_files = staging,
+        integrity_at_open = ?info.integrity,
+        "ライブラリの状態"
+    );
+    Ok(())
 }
