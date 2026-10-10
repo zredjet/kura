@@ -11,6 +11,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0002_thumb_pending_index",
         include_str!("../../migrations/0002_thumb_pending_index.sql"),
     ),
+    (
+        "0003_proxy_todo_index",
+        include_str!("../../migrations/0003_proxy_todo_index.sql"),
+    ),
 ];
 
 /// 未適用のマイグレーションを順に適用する。DB の方が新しければエラー。
@@ -119,6 +123,51 @@ mod tests {
         );
         assert!(plan.contains("idx_items_thumb_pending"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    #[test]
+    fn proxy_todo_index_settles_images_and_keeps_items() {
+        // 0002 までの DB に画像・動画を入れてから 0003 を適用する
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_until(&mut conn, 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+             VALUES (1, x'01', 'jpg', 'image', 1, 'a', 'a.jpg', 10, 10),
+                    (2, x'02', 'mkv', 'video', 1, 'b', 'b.mkv', 20, 20),
+                    (3, x'03', 'ogg', 'audio', 1, 'c', 'c.ogg', 30, 30);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+
+        let states: Vec<(i64, String)> = conn
+            .prepare("SELECT id, proxy_state FROM items ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                (1, "not_needed".to_string()),
+                (2, "unknown".to_string()),
+                (3, "unknown".to_string())
+            ]
+        );
+        for (state, index) in [
+            ("unknown", "idx_items_proxy_unknown"),
+            ("pending", "idx_items_proxy_pending"),
+        ] {
+            let plan = crate::db::query_plan(
+                &conn,
+                &format!(
+                    "SELECT id FROM items WHERE proxy_state = '{state}' AND kind != 'image'
+                     ORDER BY imported_at DESC, id DESC LIMIT 16"
+                ),
+            );
+            assert!(plan.contains(index), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
     }
 
     #[test]

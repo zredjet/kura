@@ -46,15 +46,16 @@ pub fn find_by_hash(conn: &Connection, hash: &[u8; 32]) -> Result<Option<Existin
         .optional()?)
 }
 
-/// アイテムを追加して ID を返す。
+/// アイテムを追加して ID を返す。画像はプロキシを作らないので proxy_state は not_needed。
 pub fn insert_item(conn: &Connection, item: &NewItem<'_>) -> Result<i64> {
     let size = i64::try_from(item.size)
         .map_err(|_| CoreError::Invalid(format!("ファイルが大きすぎます: {}", item.size)))?;
     let mut stmt = conn.prepare_cached(
         "INSERT INTO items (hash, ext, kind, mime, size_bytes, title, original_name, original_path,
                             source_site, imported_at, updated_at,
-                            width, height, duration_ms, captured_at, codec_info)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'local', ?9, ?9, ?10, ?11, ?12, ?13, ?14)",
+                            width, height, duration_ms, captured_at, codec_info, proxy_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'local', ?9, ?9, ?10, ?11, ?12, ?13, ?14,
+                 CASE ?3 WHEN 'image' THEN 'not_needed' ELSE 'unknown' END)",
     )?;
     stmt.execute(params![
         &item.hash[..],

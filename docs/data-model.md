@@ -36,6 +36,7 @@ Kura Library.kuralib/
 |---|---|
 | `0001_init` | 初期スキーマ |
 | `0002_thumb_pending_index` | `idx_items_thumb_pending`（サムネイル未作成を新しい順に取り出す部分索引） |
+| `0003_proxy_todo_index` | 画像の `proxy_state` を `not_needed` にし、`idx_items_proxy_unknown` / `idx_items_proxy_pending`（プロキシの判定・作成を待つものを新しい順に取り出す部分索引）を足す |
 
 ```sql
 -- ===== アイテム =====
@@ -49,7 +50,7 @@ CREATE TABLE items (
   width           INTEGER,
   height          INTEGER,
   duration_ms     INTEGER,                          -- 音楽・動画
-  codec_info      TEXT,                             -- ffprobe 要約 JSON
+  codec_info      TEXT,                             -- ffprobe 要約 JSON：{"codec": 主なコーデック}、プロキシの判定後は {"codec", "video", "audio"}
   title           TEXT    NOT NULL,                 -- 表示名（初期値は元ファイル名から拡張子を除いたもの）
   original_name   TEXT    NOT NULL,
   original_path   TEXT,                             -- 取り込み元（参考情報。アクセスはしない）
@@ -65,6 +66,7 @@ CREATE TABLE items (
   last_played_at  INTEGER,
   thumb_state     TEXT    NOT NULL DEFAULT 'pending' CHECK (thumb_state IN ('pending','ready','failed')),
   proxy_state     TEXT    NOT NULL DEFAULT 'unknown' CHECK (proxy_state IN ('unknown','not_needed','pending','ready','failed'))
+                                                    -- 判定前／元のまま再生できる（画像は常にこれ）／作成待ち／作成済み／読めない・作れない（architecture §8.1）
 );
 CREATE INDEX idx_items_imported ON items(imported_at DESC, id DESC) WHERE trashed_at IS NULL;
 CREATE INDEX idx_items_kind     ON items(kind, imported_at DESC) WHERE trashed_at IS NULL;
@@ -73,6 +75,8 @@ CREATE INDEX idx_items_played   ON items(last_played_at);
 CREATE INDEX idx_items_trashed  ON items(trashed_at) WHERE trashed_at IS NOT NULL;
 CREATE INDEX idx_items_size     ON items(size_bytes);                       -- 取り込みの重複の見込み（サイズで候補を絞る）
 CREATE INDEX idx_items_thumb_pending ON items(imported_at DESC, id DESC) WHERE thumb_state = 'pending'; -- 0002：サムネイルのジョブが新しい順に取り出す
+CREATE INDEX idx_items_proxy_unknown ON items(imported_at DESC, id DESC) WHERE proxy_state = 'unknown'; -- 0003：プロキシのジョブが判定するもの
+CREATE INDEX idx_items_proxy_pending ON items(imported_at DESC, id DESC) WHERE proxy_state = 'pending'; -- 0003：プロキシのジョブが作るもの
 
 -- ===== 仮想フォルダ =====
 CREATE TABLE folders (
@@ -226,14 +230,14 @@ CREATE TABLE playlist_state (                       -- 再開用
   updated_at    INTEGER NOT NULL
 );
 
-CREATE TABLE play_events (
+CREATE TABLE play_events (                          -- 再生済みになったスロットごとに 1 行（playlists.md §6.4）
   id            INTEGER PRIMARY KEY,
   item_id       INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-  unit_id       INTEGER REFERENCES units(id)     ON DELETE SET NULL,
-  playlist_id   INTEGER REFERENCES playlists(id) ON DELETE SET NULL,
+  unit_id       INTEGER REFERENCES units(id)     ON DELETE SET NULL,  -- ユニットとして再生したとき
+  playlist_id   INTEGER REFERENCES playlists(id) ON DELETE SET NULL,  -- M6（選択から作ったキューでは NULL）
   played_at     INTEGER NOT NULL,
-  played_ms     INTEGER NOT NULL,
-  completed     INTEGER NOT NULL
+  played_ms     INTEGER NOT NULL,                   -- 実際に再生・表示した時間（シークで飛ばした分は除く）
+  completed     INTEGER NOT NULL                    -- 最後まで再生・表示したか
 );
 CREATE INDEX idx_play_events_item ON play_events(item_id, played_at DESC);
 
@@ -290,6 +294,7 @@ CREATE TABLE settings (
   key    TEXT PRIMARY KEY,
   value  TEXT NOT NULL                              -- JSON
 );
+-- キー：'playback.support' = プロキシの判定に使った再生可否の表の指紋（文字列。変われば判定をやり直す。M5）
 
 -- ===== 全文検索（外部コンテンツ FTS5、trigram）=====
 CREATE VIRTUAL TABLE items_fts USING fts5(
