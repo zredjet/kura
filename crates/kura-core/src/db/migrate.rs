@@ -5,11 +5,21 @@ use rusqlite::Connection;
 use crate::{CoreError, Result};
 
 /// マイグレーションの一覧（連番順）。適用済みのファイルは編集しない。
-pub const MIGRATIONS: &[(&str, &str)] =
-    &[("0001_init", include_str!("../../migrations/0001_init.sql"))];
+pub const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_init", include_str!("../../migrations/0001_init.sql")),
+    (
+        "0002_thumb_pending_index",
+        include_str!("../../migrations/0002_thumb_pending_index.sql"),
+    ),
+];
 
 /// 未適用のマイグレーションを順に適用する。DB の方が新しければエラー。
 pub fn migrate(conn: &mut Connection) -> Result<()> {
+    migrate_until(conn, MIGRATIONS.len())
+}
+
+/// `count` 番目までのマイグレーションを適用する（テストで前の版のスキーマを作るのにも使う）。
+pub(crate) fn migrate_until(conn: &mut Connection, count: usize) -> Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let latest = i64::try_from(MIGRATIONS.len()).unwrap_or(i64::MAX);
     if current > latest {
@@ -17,7 +27,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             "このライブラリは新しい版の Kura で作られています（スキーマ {current}、対応 {latest}）"
         )));
     }
-    for (index, (name, sql)) in MIGRATIONS.iter().enumerate() {
+    for (index, (name, sql)) in MIGRATIONS.iter().enumerate().take(count) {
         let version = i64::try_from(index).unwrap_or(i64::MAX) + 1;
         if version <= current {
             continue;
@@ -81,6 +91,34 @@ mod tests {
         ] {
             assert!(tables.iter().any(|t| t == expected), "{expected} がない");
         }
+    }
+
+    #[test]
+    fn thumb_pending_index_keeps_existing_items() {
+        // 0001 だけの DB にアイテムを入れてから 0002 を適用する
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_until(&mut conn, 1).unwrap();
+        conn.execute(
+            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+             VALUES (1, x'01', 'jpg', 'image', 1, 'a', 'a.jpg', 10, 10)",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+
+        let (count, state): (i64, String) = conn
+            .query_row("SELECT COUNT(*), max(thumb_state) FROM items", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((count, state.as_str()), (1, "pending"));
+        let plan = crate::db::query_plan(
+            &conn,
+            "SELECT id FROM items WHERE thumb_state = 'pending'
+             ORDER BY imported_at DESC, id DESC LIMIT 64",
+        );
+        assert!(plan.contains("idx_items_thumb_pending"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
 
     #[test]

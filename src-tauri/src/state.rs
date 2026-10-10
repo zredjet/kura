@@ -45,10 +45,11 @@ impl AppState {
         self.config.lock().ok().and_then(|c| c.last_library.clone())
     }
 
-    /// ライブラリを開く（作る）。前のライブラリは閉じ、場所を「前回のライブラリ」として保存する。
+    /// ライブラリを開く（作る）。前のライブラリは閉じ、`remember` なら場所を「前回のライブラリ」として保存する。
     pub fn replace_session(
         &self,
         open: impl FnOnce() -> kura_core::Result<LibrarySession>,
+        remember: bool,
     ) -> Result<Arc<LibrarySession>, AppError> {
         self.close();
         let session = Arc::new(open()?);
@@ -56,7 +57,9 @@ impl AppState {
         if let Ok(mut slot) = self.session.write() {
             *slot = Some(session.clone());
         }
-        self.remember(&root);
+        if remember {
+            self.remember(&root);
+        }
         Ok(session)
     }
 

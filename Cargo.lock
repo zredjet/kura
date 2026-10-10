@@ -1748,6 +1748,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-encoder"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0370574b86f7eca156b9f298392b5e69a23f8c86f3f865add60bbc2e79467a6"
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1832,7 +1838,15 @@ dependencies = [
 name = "kura-devtools"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "jpeg-encoder",
  "kura-core",
+ "kura-mac",
+ "rand_chacha",
+ "rayon",
+ "reflink-copy",
+ "rusqlite",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1841,7 +1855,10 @@ dependencies = [
 name = "kura-mac"
 version = "0.1.0"
 dependencies = [
+ "kura-core",
+ "serde_json",
  "swift-rs",
+ "tempfile",
 ]
 
 [[package]]
@@ -2534,6 +2551,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
 
 [[package]]
+name = "ppv-lite86"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2630,6 +2656,22 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rand_chacha"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "raw-window-handle"
@@ -4918,6 +4960,26 @@ dependencies = [
  "quote",
  "syn 3.0.7",
  "synstructure",
+]
+
+[[package]]
+name = "zerocopy"
+version = "0.8.62"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86502bf56ac7c77571a32e2647bb2a15894565e981fb2a48d7bde2d91c965a9d"
+dependencies = [
+ "zerocopy-derive",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.8.62"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5457206954b06561e2608c7e19cf58b1926586d999c246eebe4502f7e2039d1a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

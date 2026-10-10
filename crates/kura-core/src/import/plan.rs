@@ -28,6 +28,8 @@ pub struct ImportOptions {
     pub folder_names_as_tags: bool,
     /// 末端フォルダごとに set ユニットを作る。
     pub units_per_folder: bool,
+    /// ファイルの情報からタグを付ける（音楽のアーティスト・アルバム）。
+    pub file_info_tags: bool,
     /// すべてに付けるタグ（「名前」または「名前空間:名前」）。
     pub tags: Vec<String>,
     pub duplicates: DuplicatePolicy,

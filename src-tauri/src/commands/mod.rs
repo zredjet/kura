@@ -1,8 +1,10 @@
 //! フロントから呼ぶコマンド。薄いラッパーに保ち、ロジックは kura-core / kura-mac に置く。
 
 pub mod appearance;
+pub mod bench;
 pub mod folders;
 pub mod import;
+pub mod items;
 pub mod jobs;
 pub mod library;
 

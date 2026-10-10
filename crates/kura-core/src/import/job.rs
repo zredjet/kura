@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -25,6 +26,7 @@ use crate::jobs::{
     Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, save_partial,
 };
 use crate::library::Layout;
+use crate::media::{MediaBackend, MediaInfo, NoBackend};
 use crate::time::now_ms;
 use crate::{CoreError, Result};
 
@@ -81,19 +83,30 @@ pub struct ImportResult {
 pub struct ImportHandler {
     batch_files: usize,
     batch_bytes: u64,
+    /// メディア情報（幅・高さ・長さ・撮影日時など）を読む実装。
+    backend: Arc<dyn MediaBackend>,
     /// テスト用：この番号のバッチを配置したところで、DB に入れずに失敗する（強制終了の再現）。
     #[cfg(test)]
     abort_before_commit: Option<usize>,
 }
 
-impl Default for ImportHandler {
-    fn default() -> Self {
+impl ImportHandler {
+    /// メディア情報を `backend` で読む取り込み。
+    pub fn new(backend: Arc<dyn MediaBackend>) -> Self {
         Self {
             batch_files: BATCH_FILES,
             batch_bytes: BATCH_BYTES,
+            backend,
             #[cfg(test)]
             abort_before_commit: None,
         }
+    }
+}
+
+impl Default for ImportHandler {
+    /// メディア情報を読まない取り込み（テスト用。読めなかった分はサムネイルのジョブが埋める）。
+    fn default() -> Self {
+        Self::new(Arc::new(NoBackend))
     }
 }
 
@@ -154,7 +167,8 @@ impl JobHandler for ImportHandler {
             }
             let end = batch_end(&files, cursor, self.batch_files, self.batch_bytes);
             let job_id = ctx.id();
-            // コピー・ハッシュ・配置は並列に（DB には触らない）
+            // コピー・ハッシュ・配置・メディア情報の読み取りは並列に（DB には触らない）
+            let backend = self.backend.as_ref();
             let outcomes: Vec<(usize, PlaceOutcome)> = pool.install(|| {
                 (cursor..end)
                     .into_par_iter()
@@ -163,7 +177,7 @@ impl JobHandler for ImportHandler {
                         let staging = layout
                             .staging_dir()
                             .join(format!("import-{job_id}-{i}.{}", file.ext));
-                        let outcome = stage_and_place(&layout, &file.path, &staging, &file.ext)
+                        let outcome = stage_and_place(&layout, backend, file, &staging)
                             .map_err(|err| err.to_string());
                         (i, outcome)
                     })
@@ -197,9 +211,15 @@ impl JobHandler for ImportHandler {
                 end,
                 total,
                 policy: options.duplicates,
+                file_info_tags: options.file_info_tags,
                 layout: layout.clone(),
             };
+            let added_before = state.added;
             let (next, extra_files) = library.db().write(move |tx| commit.apply(tx))?;
+            // 新しく入ったアイテムのサムネイルを作る（取り込みと並行して進める）
+            if next.added > added_before {
+                ctx.ensure_queued(JobKind::Thumbnail, "{}")?;
+            }
             // 既存と同じ中身で拡張子だけ違ったコピーは、どのアイテムも使わないので消す
             for path in extra_files {
                 if let Err(err) = std::fs::remove_file(&path) {
@@ -223,8 +243,16 @@ impl JobHandler for ImportHandler {
     }
 }
 
-/// 1 ファイルを配置した結果（ハッシュとサイズ、または失敗の理由）。
-type PlaceOutcome = std::result::Result<([u8; 32], u64), String>;
+/// 1 ファイルを配置した結果。
+struct Placed {
+    hash: [u8; 32],
+    size: u64,
+    /// 読めたメディア情報（読めなければサムネイルのジョブがあとで読む）。
+    info: Option<MediaInfo>,
+}
+
+/// 1 ファイルを配置した結果、または失敗の理由。
+type PlaceOutcome = std::result::Result<Placed, String>;
 
 /// 1 ファイル分の配置結果と所属。
 struct BatchEntry {
@@ -242,6 +270,7 @@ struct BatchCommit {
     end: usize,
     total: usize,
     policy: DuplicatePolicy,
+    file_info_tags: bool,
     layout: Layout,
 }
 
@@ -256,7 +285,7 @@ impl BatchCommit {
 
         for entry in self.entries {
             let file = &entry.file;
-            let (hash, size) = match entry.outcome {
+            let placed = match entry.outcome {
                 Ok(placed) => placed,
                 Err(reason) => {
                     state.failed += 1;
@@ -269,6 +298,7 @@ impl BatchCommit {
                     continue;
                 }
             };
+            let hash = placed.hash;
             let item_id = match find_by_hash(tx, &hash)? {
                 Some(existing) => {
                     state.duplicates += 1;
@@ -291,10 +321,11 @@ impl BatchCommit {
                             ext: &file.ext,
                             kind: file.kind,
                             mime: mime_for(&file.ext),
-                            size,
+                            size: placed.size,
                             title: &title_from_name(&file.name),
                             original_name: &file.name,
                             original_path: &file.path.to_string_lossy(),
+                            info: placed.info.as_ref(),
                             now,
                         },
                     )?;
@@ -316,7 +347,12 @@ impl BatchCommit {
                     add_to_folder(tx, folder, item_id)?;
                 }
             }
-            for tag in &entry.assignment.tags {
+            let info_tags = if self.file_info_tags {
+                placed.info.as_ref().map(info_tags).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for tag in entry.assignment.tags.iter().chain(&info_tags) {
                 let tag_id = match tags.get(tag) {
                     Some(id) => *id,
                     None => {
@@ -353,16 +389,36 @@ impl BatchCommit {
     }
 }
 
-/// staging にコピーしてハッシュを取り、files/ に置く。
+/// staging にコピーしてハッシュを取り、files/ に置いてからメディア情報を読む。
 fn stage_and_place(
     layout: &Layout,
-    src: &Path,
+    backend: &dyn MediaBackend,
+    file: &ScannedFile,
     staging: &Path,
-    ext: &str,
-) -> Result<([u8; 32], u64)> {
-    let staged = stage(src, staging)?;
-    place(&staged, &layout.content_path(&staged.hash, ext))?;
-    Ok((staged.hash, staged.size))
+) -> Result<Placed> {
+    let staged = stage(&file.path, staging)?;
+    let final_path = layout.content_path(&staged.hash, &file.ext);
+    place(&staged, &final_path)?;
+    let info = backend.probe(&final_path, file.kind).ok();
+    Ok(Placed {
+        hash: staged.hash,
+        size: staged.size,
+        info,
+    })
+}
+
+/// 「ファイルの情報からタグ」：音楽のアーティストとアルバム（docs/decisions.md ADR-30）。
+fn info_tags(info: &MediaInfo) -> Vec<TagName> {
+    [("アーティスト", &info.artist), ("アルバム", &info.album)]
+        .into_iter()
+        .filter_map(|(namespace, value)| {
+            let name = crate::text::nfc(value.as_deref()?.trim());
+            (!name.is_empty()).then(|| TagName {
+                namespace: namespace.to_string(),
+                name,
+            })
+        })
+        .collect()
 }
 
 /// `start` から、ファイル数か合計サイズの上限に達するまでを 1 バッチにする（最低 1 件）。
@@ -607,6 +663,7 @@ mod tests {
             reproduce_folders: true,
             folder_names_as_tags: true,
             units_per_folder: true,
+            file_info_tags: false,
             tags: vec!["旅行".into(), "撮影者:わたし".into()],
             duplicates: DuplicatePolicy::AddMemberships,
         };
@@ -964,6 +1021,65 @@ mod tests {
         for dir in [src.clone(), src.join("sub")] {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[test]
+    fn probes_media_and_tags_from_file_info() {
+        let env = Env::new();
+        let src = env.src();
+        write(&src.join("photo.jpg"), b"photo");
+        write(&src.join("song.flac"), b"song");
+        let handler = ImportHandler::new(Arc::new(crate::media::fake::FakeBackend));
+        let jobs = env.manager(handler);
+        let options = ImportOptions {
+            file_info_tags: true,
+            ..ImportOptions::default()
+        };
+        let id = start_import(
+            &jobs,
+            &ImportInput {
+                paths: vec![src],
+                options,
+            },
+        )
+        .unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(WAIT));
+        assert_eq!(jobs.get(id).unwrap().state, JobState::Done);
+
+        let (w, h, codec): (i64, i64, String) = env
+            .library
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT width, height, codec_info FROM items WHERE ext = 'jpg'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!((w, h, codec.as_str()), (1600, 900, r#"{"codec":"jpeg"}"#));
+        let duration: i64 = env
+            .library
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT duration_ms FROM items WHERE ext = 'flac'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(duration, 180_000);
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM tags WHERE (namespace, name) IN (VALUES ('アーティスト', '灯野'), ('アルバム', '夜'))"),
+            2
+        );
+        // 取り込んだらサムネイルのジョブが積まれる
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'thumbnail' AND state = 'queued'"),
+            1
+        );
     }
 
     #[test]

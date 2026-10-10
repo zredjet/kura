@@ -4,6 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::kind::MediaKind;
 use super::plan::TagName;
+use crate::media::MediaInfo;
 use crate::text::nfc;
 use crate::{CoreError, Result};
 
@@ -26,6 +27,8 @@ pub struct NewItem<'a> {
     pub title: &'a str,
     pub original_name: &'a str,
     pub original_path: &'a str,
+    /// 読めたメディア情報。
+    pub info: Option<&'a MediaInfo>,
     pub now: i64,
 }
 
@@ -50,8 +53,9 @@ pub fn insert_item(conn: &Connection, item: &NewItem<'_>) -> Result<i64> {
         .map_err(|_| CoreError::Invalid(format!("ファイルが大きすぎます: {}", item.size)))?;
     let mut stmt = conn.prepare_cached(
         "INSERT INTO items (hash, ext, kind, mime, size_bytes, title, original_name, original_path,
-                            source_site, imported_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'local', ?9, ?9)",
+                            source_site, imported_at, updated_at,
+                            width, height, duration_ms, captured_at, codec_info)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'local', ?9, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
     stmt.execute(params![
         &item.hash[..],
@@ -63,6 +67,11 @@ pub fn insert_item(conn: &Connection, item: &NewItem<'_>) -> Result<i64> {
         item.original_name,
         item.original_path,
         item.now,
+        item.info.and_then(|i| i.width),
+        item.info.and_then(|i| i.height),
+        item.info.and_then(|i| i.duration_ms),
+        item.info.and_then(|i| i.captured_at),
+        item.info.and_then(MediaInfo::codec_json),
     ])?;
     Ok(conn.last_insert_rowid())
 }
@@ -229,6 +238,7 @@ mod tests {
             title: name,
             original_name: name,
             original_path: "/src/x.jpg",
+            info: None,
             now: 100,
         }
     }

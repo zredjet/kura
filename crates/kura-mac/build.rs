@@ -9,5 +9,11 @@ fn main() {
         swift_rs::SwiftLinker::new(MACOS_MIN_VERSION)
             .with_package("KuraMac", "swift")
             .link();
+        // Swift の並行処理ランタイムは OS の /usr/lib/swift にある（このクレートのテスト用。
+        // 実行ファイル側の build.rs にも同じ指定がいる）
+        #[allow(clippy::print_stdout)]
+        {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+        }
     }
 }

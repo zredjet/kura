@@ -7,6 +7,8 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 export const commands = {
 	/**  OS の表示設定を返す。AppKit を呼ぶので同期コマンド（メインスレッドで実行）にしている。 */
 	appearanceGet: () => typedError<Appearance, AppError>(__TAURI_INVOKE("appearance_get")),
+	/**  フロントで測った結果（JSON の文字列）をログに書く。 */
+	benchReport: (name: string, result: string) => typedError<null, AppError>(__TAURI_INVOKE("bench_report", { name, result })),
 	/**  ライブラリを置く場所を確かめる（拡張子の補完、既存のライブラリか、同期フォルダの中か）。 */
 	libraryCheckLocation: (path: string) => typedError<LocationCheckDto, AppError>(__TAURI_INVOKE("library_check_location", { path })),
 	/**  新しいライブラリを作って開く。 */
@@ -21,6 +23,10 @@ export const commands = {
 	importPreview: (paths: string[]) => typedError<ImportPreviewDto, AppError>(__TAURI_INVOKE("import_preview", { paths })),
 	/**  取り込みジョブを積み、ジョブの ID を返す。進捗は `job://progress` で届く。 */
 	importStart: (paths: string[], options: ImportOptionsDto) => typedError<number, AppError>(__TAURI_INVOKE("import_start", { paths, options })),
+	/**  見えている分の詳細（最大 200 件、渡した順）。 */
+	itemsGet: (ids: number[]) => typedError<ItemSummaryDto[], AppError>(__TAURI_INVOKE("items_get", { ids })),
+	/**  インスペクタ用の詳細（タグ・フォルダ・ユニットを含む）。 */
+	itemDetail: (id: number) => typedError<ItemDetailDto, AppError>(__TAURI_INVOKE("item_detail", { id })),
 	/**  ジョブを新しい順に一覧する。 */
 	jobsList: (filter: {
 	kinds?: JobKindDto[],
@@ -72,6 +78,12 @@ export type FolderNodeDto = {
 	pos: number | null,
 };
 
+/**  所属する仮想フォルダ（いちばん上からのパス）。 */
+export type FolderRefDto = {
+	id: number,
+	path: string[],
+};
+
 /**  取り込みに失敗したファイル。 */
 export type ImportFailureDto = {
 	path: string,
@@ -84,6 +96,7 @@ export type ImportOptionsDto = {
 	reproduceFolders?: boolean,
 	folderNamesAsTags?: boolean,
 	unitsPerFolder?: boolean,
+	fileInfoTags?: boolean,
 	tags?: string[],
 	duplicates?: DuplicatePolicyDto,
 };
@@ -119,6 +132,42 @@ export type IntegrityDto = {
 	stagingRemoved: number,
 	missingFiles: number,
 	orphanFiles: number,
+};
+
+/**  インスペクタ用の詳細。 */
+export type ItemDetailDto = {
+	item: ItemSummaryDto,
+	mime: string | null,
+	codecInfo: string | null,
+	originalName: string,
+	originalPath: string | null,
+	sourceUrl: string | null,
+	note: string | null,
+	trashedAt: number | null,
+	tags: TagRefDto[],
+	folders: FolderRefDto[],
+	units: UnitRefDto[],
+};
+
+/**  一覧の 1 件（グリッドのタイル）。 */
+export type ItemSummaryDto = {
+	id: number,
+	/**  BLAKE3 の 16 進（`kura://localhost/thumb/{hash}/s` などに使う）。 */
+	hash: string,
+	ext: string,
+	/**  `image` / `video` / `audio`。 */
+	kind: string,
+	width: number | null,
+	height: number | null,
+	durationMs: number | null,
+	sizeBytes: number,
+	title: string,
+	rating: number,
+	sourceSite: string | null,
+	importedAt: number,
+	capturedAt: number | null,
+	/**  `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。 */
+	thumbState: string,
 };
 
 /**  ジョブ 1 件。 */
@@ -186,6 +235,20 @@ export type LocationStatusDto = "new" | "existingLibrary" | "occupied";
 export type ScanRootDto = {
 	name: string,
 	isDir: boolean,
+};
+
+/**  タグ。 */
+export type TagRefDto = {
+	id: number,
+	namespace: string,
+	name: string,
+};
+
+/**  所属するユニット。 */
+export type UnitRefDto = {
+	id: number,
+	name: string,
+	kind: string,
 };
 
 /* Tauri Specta runtime */

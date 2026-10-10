@@ -30,7 +30,12 @@ Kura Library.kuralib/
 - 論理削除：アイテムは `trashed_at` を立てる。ゴミ箱を空にしたときに行とファイルを消す。
 - 接続時の PRAGMA：`journal_mode=WAL`、`synchronous=NORMAL`、`foreign_keys=ON`、`temp_store=MEMORY`、`mmap_size=268435456`、`cache_size=-65536`。
 
-## 3. スキーマ（初期マイグレーション `0001_init.sql`）
+## 3. スキーマ（`0001_init.sql` と、それ以降のマイグレーションを反映したもの）
+
+| マイグレーション | 内容 |
+|---|---|
+| `0001_init` | 初期スキーマ |
+| `0002_thumb_pending_index` | `idx_items_thumb_pending`（サムネイル未作成を新しい順に取り出す部分索引） |
 
 ```sql
 -- ===== アイテム =====
@@ -67,6 +72,7 @@ CREATE INDEX idx_items_rating   ON items(rating) WHERE trashed_at IS NULL;
 CREATE INDEX idx_items_played   ON items(last_played_at);
 CREATE INDEX idx_items_trashed  ON items(trashed_at) WHERE trashed_at IS NOT NULL;
 CREATE INDEX idx_items_size     ON items(size_bytes);                       -- 取り込みの重複の見込み（サイズで候補を絞る）
+CREATE INDEX idx_items_thumb_pending ON items(imported_at DESC, id DESC) WHERE thumb_state = 'pending'; -- 0002：サムネイルのジョブが新しい順に取り出す
 
 -- ===== 仮想フォルダ =====
 CREATE TABLE folders (

@@ -52,14 +52,12 @@ impl JobKind {
         })
     }
 
-    /// 同時に動かす数（import 1、thumbnail = CPU コア数、proxy 1、download 2、capture 1）。
+    /// 同時に動かす数（download 2、ほかは 1）。サムネイルは 1 本のジョブの中でコア数の並列にする
+    /// （未作成のものをまとめて処理するので、複数動かすと同じアイテムを取り合う）。
     pub fn concurrency(self) -> usize {
         match self {
-            Self::Thumbnail => std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4),
             Self::Download => 2,
-            Self::Import | Self::Proxy | Self::Capture => 1,
+            Self::Import | Self::Thumbnail | Self::Proxy | Self::Capture => 1,
         }
     }
 }
@@ -154,6 +152,6 @@ mod tests {
     fn concurrency_follows_architecture() {
         assert_eq!(JobKind::Import.concurrency(), 1);
         assert_eq!(JobKind::Download.concurrency(), 2);
-        assert!(JobKind::Thumbnail.concurrency() >= 1);
+        assert_eq!(JobKind::Thumbnail.concurrency(), 1);
     }
 }

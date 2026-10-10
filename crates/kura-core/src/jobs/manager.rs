@@ -61,6 +61,7 @@ pub enum Control {
 /// ジョブの実行に必要なもの。
 pub struct JobContext {
     record: JobRecord,
+    inner: Arc<Inner>,
     library: Arc<Library>,
     control: Arc<AtomicU8>,
     sink: EventSink,
@@ -117,6 +118,11 @@ impl JobContext {
         }
     }
 
+    /// `kind` のジョブが待ち行列になければ積む（取り込みのあとにサムネイルを作る、など）。
+    pub fn ensure_queued(&self, kind: JobKind, input_json: &str) -> Result<Option<JobId>> {
+        self.inner.ensure_queued(kind, input_json)
+    }
+
     /// ジョブのログ（`logs/job-<id>.log`）に 1 行書く。
     pub fn log(&self, line: &str) {
         let Ok(mut file) = self.log.lock() else {
@@ -146,6 +152,31 @@ struct Inner {
     sink: EventSink,
     sched: Mutex<Sched>,
     wake: Condvar,
+}
+
+impl Inner {
+    /// `kind` のジョブが待ち行列になければ積んで、スケジューラを起こす。積んだら ID を返す。
+    fn ensure_queued(&self, kind: JobKind, input_json: &str) -> Result<Option<JobId>> {
+        let input = input_json.to_string();
+        let id = self.library.db().write(move |tx| {
+            if store::has_queued(tx, kind)? {
+                return Ok(None);
+            }
+            store::insert(tx, kind, &input, now_ms()).map(Some)
+        })?;
+        if let Some(id) = id {
+            (self.sink)(JobEvent {
+                id,
+                kind,
+                state: JobState::Queued,
+                progress: None,
+                message: None,
+                result_json: None,
+            });
+            self.wake.notify_all();
+        }
+        Ok(id)
+    }
 }
 
 /// ジョブの待ち行列。
@@ -219,6 +250,11 @@ impl JobManager {
         });
         self.inner.wake.notify_all();
         Ok(id)
+    }
+
+    /// `kind` のジョブが待ち行列になければ積む。積んだら ID を返す。
+    pub fn ensure_queued(&self, kind: JobKind, input_json: &str) -> Result<Option<JobId>> {
+        self.inner.ensure_queued(kind, input_json)
     }
 
     /// 1 件読む。
@@ -422,6 +458,7 @@ fn spawn_worker(inner: &Arc<Inner>, sched: &mut Sched, record: JobRecord) {
     let control = Arc::new(AtomicU8::new(RUN));
     let ctx = JobContext {
         record,
+        inner: inner.clone(),
         library: inner.library.clone(),
         control: control.clone(),
         sink: inner.sink.clone(),
@@ -750,6 +787,19 @@ mod tests {
         let record = jobs.get(id).unwrap();
         assert_eq!(record.state, JobState::Queued);
         assert!(record.result_json.is_some());
+    }
+
+    #[test]
+    fn ensure_queued_adds_only_one_waiting_job() {
+        let f = fixture();
+        let jobs = manager(&f, |_| done("{}"));
+        let first = jobs.ensure_queued(JobKind::Import, "{}").unwrap();
+        assert!(first.is_some());
+        assert_eq!(jobs.ensure_queued(JobKind::Import, "{}").unwrap(), None);
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(Duration::from_secs(5)));
+        // 終わったあとならまた積める
+        assert!(jobs.ensure_queued(JobKind::Import, "{}").unwrap().is_some());
     }
 
     #[test]

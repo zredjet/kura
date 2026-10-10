@@ -6,9 +6,13 @@ pub mod db;
 pub mod error;
 pub mod folders;
 pub mod import;
+pub mod items;
 pub mod jobs;
 pub mod library;
+pub mod media;
+pub mod serve;
 pub mod text;
 pub mod time;
+pub mod tools;
 
 pub use error::{CoreError, Result};

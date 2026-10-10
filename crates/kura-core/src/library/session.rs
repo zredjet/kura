@@ -9,6 +9,7 @@ use super::integrity::{IntegrityReport, check_files, clean_staging};
 use crate::Result;
 use crate::import::ImportHandler;
 use crate::jobs::{JobKind, JobManager};
+use crate::media::{MediaBackend, ThumbnailHandler};
 
 pub use crate::jobs::EventSink;
 
@@ -32,23 +33,29 @@ pub struct LibrarySession {
 }
 
 impl LibrarySession {
-    /// 既存のライブラリを開く。
-    pub fn open(path: &Path, sink: EventSink) -> Result<Self> {
-        Self::start(Library::open(path)?, sink)
+    /// 既存のライブラリを開く。メディア情報とサムネイルは `backend` で作る。
+    pub fn open(path: &Path, sink: EventSink, backend: Arc<dyn MediaBackend>) -> Result<Self> {
+        Self::start(Library::open(path)?, sink, backend)
     }
 
     /// 新しいライブラリを作って開く。
-    pub fn create(path: &Path, sink: EventSink) -> Result<Self> {
-        Self::start(Library::create(path)?, sink)
+    pub fn create(path: &Path, sink: EventSink, backend: Arc<dyn MediaBackend>) -> Result<Self> {
+        Self::start(Library::create(path)?, sink, backend)
     }
 
-    fn start(library: Library, sink: EventSink) -> Result<Self> {
+    fn start(library: Library, sink: EventSink, backend: Arc<dyn MediaBackend>) -> Result<Self> {
         let library = Arc::new(library);
         // ジョブを動かす前に書きかけを消す（再開するジョブは最初からコピーし直す）
         let staging_removed = clean_staging(library.layout())?;
         let jobs = Arc::new(JobManager::new(
             library.clone(),
-            vec![(JobKind::Import, Arc::new(ImportHandler::default()))],
+            vec![
+                (
+                    JobKind::Import,
+                    Arc::new(ImportHandler::new(backend.clone())),
+                ),
+                (JobKind::Thumbnail, Arc::new(ThumbnailHandler::new(backend))),
+            ],
             sink,
         )?);
         let integrity = Arc::new(Mutex::new(None));
@@ -82,6 +89,18 @@ impl LibrarySession {
                 }
                 if let Err(err) = jobs2.start() {
                     tracing::error!(%err, "ジョブを開始できませんでした");
+                }
+                // サムネイルが未作成のもの（前回の続き・M1 で取り込んだものなど）があれば作る
+                let pending = lib.db().read(|conn| {
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT EXISTS (SELECT 1 FROM items WHERE thumb_state = 'pending')",
+                    )?;
+                    Ok(stmt.query_row([], |row| row.get::<_, bool>(0))?)
+                });
+                if matches!(pending, Ok(true))
+                    && let Err(err) = jobs2.ensure_queued(JobKind::Thumbnail, "{}")
+                {
+                    tracing::error!(%err, "サムネイルのジョブを積めませんでした");
                 }
             })?;
 
@@ -145,10 +164,15 @@ impl Drop for LibrarySession {
 mod tests {
     use super::*;
     use crate::import::{ImportInput, ImportOptions, start_import};
+    use crate::media::fake::FakeBackend;
     use std::time::Duration;
 
     fn sink() -> EventSink {
         Arc::new(|_| {})
+    }
+
+    fn backend() -> Arc<dyn MediaBackend> {
+        Arc::new(FakeBackend)
     }
 
     #[test]
@@ -156,7 +180,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Kura Library");
         {
-            let session = LibrarySession::create(&path, sink()).unwrap();
+            let session = LibrarySession::create(&path, sink(), backend()).unwrap();
             session.wait_ready();
             let info = session.info().unwrap();
             assert_eq!(info.name, "Kura Library");
@@ -165,7 +189,7 @@ mod tests {
         }
         let path = dir.path().join("Kura Library.kuralib");
         std::fs::write(path.join("staging/leftover"), "x").unwrap();
-        let session = LibrarySession::open(&path, sink()).unwrap();
+        let session = LibrarySession::open(&path, sink(), backend()).unwrap();
         session.wait_ready();
         assert_eq!(session.integrity().unwrap().staging_removed, 1);
     }
@@ -176,7 +200,7 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.jpg"), "a").unwrap();
-        let session = LibrarySession::create(&dir.path().join("L"), sink()).unwrap();
+        let session = LibrarySession::create(&dir.path().join("L"), sink(), backend()).unwrap();
         start_import(
             session.jobs(),
             &ImportInput {
@@ -188,5 +212,12 @@ mod tests {
         session.wait_ready();
         assert!(session.jobs().wait_idle(Duration::from_secs(10)));
         assert_eq!(session.info().unwrap().item_count, 1);
+        // 取り込みのあとサムネイルまで作られる
+        let state: String = session
+            .library()
+            .db()
+            .read(|c| Ok(c.query_row("SELECT thumb_state FROM items", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(state, "ready");
     }
 }

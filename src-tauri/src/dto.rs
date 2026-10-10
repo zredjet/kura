@@ -5,6 +5,7 @@ use specta::Type;
 
 use kura_core::folders::FolderNode;
 use kura_core::import::{DuplicatePolicy, ImportOptions, ImportPreview, ScanRoot};
+use kura_core::items::{FolderRef, ItemDetail, ItemSummary, TagRef, UnitRef};
 use kura_core::jobs::{JobEvent, JobFilter, JobKind, JobRecord, JobState};
 use kura_core::library::{IntegrityReport, LibraryInfo, LocationCheck, LocationStatus};
 
@@ -157,6 +158,7 @@ pub struct ImportOptionsDto {
     pub reproduce_folders: bool,
     pub folder_names_as_tags: bool,
     pub units_per_folder: bool,
+    pub file_info_tags: bool,
     pub tags: Vec<String>,
     pub duplicates: DuplicatePolicyDto,
 }
@@ -168,6 +170,7 @@ impl From<ImportOptionsDto> for ImportOptions {
             reproduce_folders: o.reproduce_folders,
             folder_names_as_tags: o.folder_names_as_tags,
             units_per_folder: o.units_per_folder,
+            file_info_tags: o.file_info_tags,
             tags: o.tags,
             duplicates: match o.duplicates {
                 DuplicatePolicyDto::AddMemberships => DuplicatePolicy::AddMemberships,
@@ -345,6 +348,140 @@ impl From<JobEvent> for JobProgress {
             progress: e.progress,
             message: e.message,
             result_json: e.result_json,
+        }
+    }
+}
+
+/// 一覧の 1 件（グリッドのタイル）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemSummaryDto {
+    pub id: i64,
+    /// BLAKE3 の 16 進（`kura://localhost/thumb/{hash}/s` などに使う）。
+    pub hash: String,
+    pub ext: String,
+    /// `image` / `video` / `audio`。
+    pub kind: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub size_bytes: i64,
+    pub title: String,
+    pub rating: i64,
+    pub source_site: Option<String>,
+    pub imported_at: i64,
+    pub captured_at: Option<i64>,
+    /// `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。
+    pub thumb_state: String,
+}
+
+impl From<ItemSummary> for ItemSummaryDto {
+    fn from(i: ItemSummary) -> Self {
+        Self {
+            id: i.id,
+            hash: i.hash,
+            ext: i.ext,
+            kind: i.kind,
+            width: i.width,
+            height: i.height,
+            duration_ms: i.duration_ms,
+            size_bytes: i.size_bytes,
+            title: i.title,
+            rating: i.rating,
+            source_site: i.source_site,
+            imported_at: i.imported_at,
+            captured_at: i.captured_at,
+            thumb_state: i.thumb_state,
+        }
+    }
+}
+
+/// タグ。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TagRefDto {
+    pub id: i64,
+    pub namespace: String,
+    pub name: String,
+}
+
+impl From<TagRef> for TagRefDto {
+    fn from(t: TagRef) -> Self {
+        Self {
+            id: t.id,
+            namespace: t.namespace,
+            name: t.name,
+        }
+    }
+}
+
+/// 所属する仮想フォルダ（いちばん上からのパス）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderRefDto {
+    pub id: i64,
+    pub path: Vec<String>,
+}
+
+impl From<FolderRef> for FolderRefDto {
+    fn from(f: FolderRef) -> Self {
+        Self {
+            id: f.id,
+            path: f.path,
+        }
+    }
+}
+
+/// 所属するユニット。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UnitRefDto {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+}
+
+impl From<UnitRef> for UnitRefDto {
+    fn from(u: UnitRef) -> Self {
+        Self {
+            id: u.id,
+            name: u.name,
+            kind: u.kind,
+        }
+    }
+}
+
+/// インスペクタ用の詳細。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemDetailDto {
+    pub item: ItemSummaryDto,
+    pub mime: Option<String>,
+    pub codec_info: Option<String>,
+    pub original_name: String,
+    pub original_path: Option<String>,
+    pub source_url: Option<String>,
+    pub note: Option<String>,
+    pub trashed_at: Option<i64>,
+    pub tags: Vec<TagRefDto>,
+    pub folders: Vec<FolderRefDto>,
+    pub units: Vec<UnitRefDto>,
+}
+
+impl From<ItemDetail> for ItemDetailDto {
+    fn from(d: ItemDetail) -> Self {
+        Self {
+            item: d.summary.into(),
+            mime: d.mime,
+            codec_info: d.codec_info,
+            original_name: d.original_name,
+            original_path: d.original_path,
+            source_url: d.source_url,
+            note: d.note,
+            trashed_at: d.trashed_at,
+            tags: d.tags.into_iter().map(Into::into).collect(),
+            folders: d.folders.into_iter().map(Into::into).collect(),
+            units: d.units.into_iter().map(Into::into).collect(),
         }
     }
 }

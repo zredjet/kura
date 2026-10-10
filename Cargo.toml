@@ -27,6 +27,8 @@ reflink-copy = "0.1"
 walkdir = "2.5"
 unicode-normalization = "0.1"
 tempfile = "3"
+rand_chacha = "0.10"
+jpeg-encoder = "0.7"
 
 tauri = "2.12"
 tauri-build = "2.7"

@@ -6,7 +6,7 @@ mod location;
 mod session;
 
 pub use integrity::{IntegrityReport, check_files, clean_staging};
-pub use layout::{DB_FILE, Layout, SUBDIRS, content_rel_path, hex, parse_hex32};
+pub use layout::{DB_FILE, Layout, SUBDIRS, ThumbSize, content_rel_path, hex, parse_hex32};
 pub use location::{
     LIBRARY_EXT, LocationCheck, LocationStatus, check_location, is_library, normalize_library_path,
 };

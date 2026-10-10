@@ -5,19 +5,43 @@ mod config;
 mod dto;
 mod error;
 mod logging;
+mod protocol;
 mod state;
 
 pub use error::{AppError, AppErrorCode};
 
 use std::process::ExitCode;
+use std::sync::OnceLock;
+use std::time::Instant;
 
+#[cfg(any(debug_assertions, test))]
 use specta_typescript::Typescript;
 use tauri::Manager;
 use tauri_specta::{Builder, collect_commands, collect_events};
 
 use crate::state::AppState;
 
+/// 起動した時刻（起動時間の計測に使う）。
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// 起動からの経過ミリ秒。
+pub(crate) fn since_start_ms() -> u64 {
+    STARTED
+        .get()
+        .map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// 型生成を通さずに登録するコマンド（生バイトを返すもの）。
+const RAW_COMMANDS: [&str; 1] = ["items_query_ids"];
+
+/// 型生成を通さないコマンドの受け口。
+fn raw_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![commands::items::items_query_ids]
+}
+
 /// フロント用の型定義の出力先（`src/ipc/bindings.ts`）。
+#[cfg(any(debug_assertions, test))]
 const BINDINGS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/ipc/bindings.ts");
 
 /// コマンドとイベントを登録した tauri-specta のビルダー。コマンドを増やしたらここに足す。
@@ -25,6 +49,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             commands::appearance::appearance_get,
+            commands::bench::bench_report,
             commands::library::library_check_location,
             commands::library::library_create,
             commands::library::library_open,
@@ -32,6 +57,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::library::library_info,
             commands::import::import_preview,
             commands::import::import_start,
+            commands::items::items_get,
+            commands::items::item_detail,
             commands::jobs::jobs_list,
             commands::jobs::job_cancel,
             commands::jobs::job_pause,
@@ -45,6 +72,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .dangerously_cast_bigints_to_number()
 }
 
+#[cfg(any(debug_assertions, test))]
 /// 型定義を `src/ipc/bindings.ts` に書き出す。内容が変わったときだけ書き換える
 /// （毎回書くと開発サーバーがページを再読み込みしてしまう）。
 fn export_bindings(builder: &Builder<tauri::Wry>) -> Result<(), BindingsError> {
@@ -61,6 +89,7 @@ fn export_bindings(builder: &Builder<tauri::Wry>) -> Result<(), BindingsError> {
     Ok(())
 }
 
+#[cfg(any(debug_assertions, test))]
 #[derive(Debug, thiserror::Error)]
 enum BindingsError {
     #[error(transparent)]
@@ -71,6 +100,7 @@ enum BindingsError {
 
 /// アプリを起動し、終了まで待つ。
 pub fn run() -> ExitCode {
+    let _ = STARTED.set(Instant::now());
     let context = tauri::generate_context!();
     let _log_guard = logging::init(logging::log_dir(&context.config().identifier).as_deref());
 
@@ -81,9 +111,23 @@ pub fn run() -> ExitCode {
         tracing::warn!(%err, "型定義（bindings.ts）の書き出しに失敗しました");
     }
 
-    let app = tauri::Builder::default()
+    let typed = builder.invoke_handler();
+    let raw = raw_handler();
+    let app = tauri::Builder::<tauri::Wry>::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(builder.invoke_handler())
+        .invoke_handler(move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
+            if RAW_COMMANDS.contains(&invoke.message.command()) {
+                raw(invoke)
+            } else {
+                typed(invoke)
+            }
+        })
+        .register_asynchronous_uri_scheme_protocol("kura", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(protocol::respond(&app, &request));
+            });
+        })
         .setup(move |app| {
             builder.mount_events(app);
             let config_path = app.path().app_config_dir()?.join("app.json");

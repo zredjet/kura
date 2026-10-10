@@ -5,6 +5,40 @@ use std::path::{Path, PathBuf};
 /// DB のファイル名。
 pub const DB_FILE: &str = "library.sqlite";
 
+/// サムネイルの大きさ（s：長辺 512px、l：長辺 1600px）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ThumbSize {
+    Small,
+    Large,
+}
+
+impl ThumbSize {
+    /// 長辺のピクセル数。
+    pub fn max_px(self) -> u32 {
+        match self {
+            Self::Small => 512,
+            Self::Large => 1600,
+        }
+    }
+
+    /// ファイル名とパスに使う記号（`s` / `l`）。
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Small => "s",
+            Self::Large => "l",
+        }
+    }
+
+    /// `s` / `l` から戻す。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "s" => Some(Self::Small),
+            "l" => Some(Self::Large),
+            _ => None,
+        }
+    }
+}
+
 /// ライブラリの中に作るフォルダ。
 pub const SUBDIRS: [&str; 7] = [
     "files", "thumbs", "art", "proxies", "staging", "archives", "logs",
@@ -56,6 +90,42 @@ impl Layout {
     pub fn content_path(&self, hash: &[u8; 32], ext: &str) -> PathBuf {
         self.files_dir().join(content_rel_path(&hex(hash), ext))
     }
+
+    /// 実ファイルが置かれるフォルダ（`files/ab/cd`）。拡張子がわからないときに探すのに使う。
+    pub fn content_dir(&self, hash_hex: &str) -> Option<PathBuf> {
+        Some(
+            self.files_dir()
+                .join(hash_hex.get(0..2)?)
+                .join(hash_hex.get(2..4)?),
+        )
+    }
+
+    /// サムネイル（`thumbs/ab/<hash>_s.jpg`・`_l.jpg`）。
+    pub fn thumb_path(&self, hash_hex: &str, size: ThumbSize) -> PathBuf {
+        let a = hash_hex.get(0..2).unwrap_or("00");
+        self.root
+            .join("thumbs")
+            .join(a)
+            .join(format!("{hash_hex}_{}.jpg", size.suffix()))
+    }
+
+    /// 音楽のジャケット（`art/ab/<hash>.jpg`）。
+    pub fn art_path(&self, hash_hex: &str) -> PathBuf {
+        let a = hash_hex.get(0..2).unwrap_or("00");
+        self.root
+            .join("art")
+            .join(a)
+            .join(format!("{hash_hex}.jpg"))
+    }
+
+    /// 再生用プロキシ（`proxies/ab/<hash>.mp4`。作るのは M5）。
+    pub fn proxy_path(&self, hash_hex: &str) -> PathBuf {
+        let a = hash_hex.get(0..2).unwrap_or("00");
+        self.root
+            .join("proxies")
+            .join(a)
+            .join(format!("{hash_hex}.mp4"))
+    }
 }
 
 /// `files/` からの相対パス（`ab/cd/<hash>.<ext>`）。
@@ -104,6 +174,30 @@ mod tests {
             path,
             PathBuf::from(format!("/lib/Kura Library.kuralib/files/ab/cd/{hex}.jpg"))
         );
+    }
+
+    #[test]
+    fn thumb_and_art_paths() {
+        let layout = Layout::new("/lib/L.kuralib");
+        let hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert_eq!(
+            layout.thumb_path(hex, ThumbSize::Small),
+            PathBuf::from(format!("/lib/L.kuralib/thumbs/ab/{hex}_s.jpg"))
+        );
+        assert_eq!(
+            layout.thumb_path(hex, ThumbSize::Large),
+            PathBuf::from(format!("/lib/L.kuralib/thumbs/ab/{hex}_l.jpg"))
+        );
+        assert_eq!(
+            layout.art_path(hex),
+            PathBuf::from(format!("/lib/L.kuralib/art/ab/{hex}.jpg"))
+        );
+        assert_eq!(
+            layout.content_dir(hex),
+            Some(PathBuf::from("/lib/L.kuralib/files/ab/cd"))
+        );
+        assert_eq!(ThumbSize::parse("l"), Some(ThumbSize::Large));
+        assert_eq!(ThumbSize::Small.max_px(), 512);
     }
 
     #[test]

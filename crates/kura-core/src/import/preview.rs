@@ -137,6 +137,7 @@ mod tests {
                         title: "x",
                         original_name: "x.jpg",
                         original_path: "/x.jpg",
+                        info: None,
                         now: 0,
                     },
                 )

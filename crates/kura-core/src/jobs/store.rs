@@ -76,6 +76,13 @@ pub fn insert(conn: &Connection, kind: JobKind, input_json: &str, now: i64) -> R
     Ok(conn.last_insert_rowid())
 }
 
+/// `kind` の `queued` のジョブがあるか。
+pub fn has_queued(conn: &Connection, kind: JobKind) -> Result<bool> {
+    let mut stmt =
+        conn.prepare_cached("SELECT 1 FROM jobs WHERE state = 'queued' AND kind = ?1 LIMIT 1")?;
+    Ok(stmt.exists([kind.as_str()])?)
+}
+
 /// 1 件読む。
 pub fn get(conn: &Connection, id: JobId) -> Result<Option<JobRecord>> {
     let mut stmt = conn.prepare_cached(&format!("SELECT {COLUMNS} FROM jobs WHERE id = ?1"))?;
