@@ -1,0 +1,17 @@
+[package]
+name = "kura-mac"
+description = "Kura の macOS 専用機能（Swift ヘルパー経由の ImageIO / AVFoundation / AppKit）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+swift-rs.workspace = true
+
+[build-dependencies]
+swift-rs = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true
