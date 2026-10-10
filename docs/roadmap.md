@@ -94,11 +94,11 @@
 
 ## M5　再生
 
-- [ ] `canPlayType` による再生可否の表、`proxy_state` の判定、プロキシ生成ジョブ（remux / VideoToolbox）
-- [ ] `PlaybackController`（video / audio×2 / image、先読み）
-- [ ] ミニプレーヤー（`Main.dc.html`）とシアター（`Player.dc.html`）
-- [ ] 画像の間の BGM（`docs/playlists.md` §6.2）
-- [ ] 再生イベントの記録（§6.4）
+- [x] `canPlayType` による再生可否の表、`proxy_state` の判定、プロキシ生成ジョブ（remux / VideoToolbox）（architecture §8.1）
+- [x] `PlaybackController`（video / audio×2 / image、先読み）
+- [x] ミニプレーヤー（`Main.dc.html`）とシアター（`Player.dc.html`）（シャッフル・連続制限・並べ直すは M6。ADR-70）
+- [x] 画像の間の BGM（`docs/playlists.md` §6.2。解釈は ADR-68）
+- [x] 再生イベントの記録（§6.4。判定は Rust、ADR-67）
 
 **完了条件**：MKV・WebM・OGG を含む混在キューが途切れずに再生できる／BGM のフェードが仕様どおり／再生済みの判定がテストで確認できる
 

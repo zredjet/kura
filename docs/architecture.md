@@ -75,7 +75,13 @@
 | | `playlist_snapshot_to_files(id, entry_ids?)` | 「ファイルに固定」 |
 | | `playlist_build_queue(id, options)` → `Queue` | シード・開始位置を含む |
 | | `quick_queue(query, granularity, shuffle)` → `Queue` | ⌘K の ⇧↵「結果をランダム再生」 |
-| 再生 | `playback_report(event)` / `playback_save_state(playlist_id, state)` | |
+| 再生 | `playback_support_set(entries)` | 起動時にフロントが `canPlayType` で作った「入れ物 × コーデック」の表（§8）。表が前回と変わっていれば、作り済み以外のプロキシの判定をやり直す |
+| | `player_queue(entries)` → `Queue` | 選択（アイテムと `0x8000_0000 \| unit_id`）を一覧の並び順のままキューにする（M5。ユニットはメンバー順に展開）。`Queue` は Slot 列を列ごとの配列で持つ：`itemIds` / `unitIds` / `indexInUnit` / `unitLen` / `imageDurationMs`（音楽・動画は null）と `totalMs` |
+| | `playback_report({ itemId, unitId, unitStart, playedMs, completed, durationMs })` → 記録したか | スロットを離れたときに送る。再生済みの判定（playlists.md §6.4）は Rust がし、再生済みなら `play_events` と回数・日時を更新する |
+| | `proxy_request(ids, force)` | 再生キューの今と次のプロキシを先に作ってもらう。`force` は元のまま再生できなかったものを作成待ちに戻す（§8） |
+| | `open_external(hash)` → `mpv` \| `quickTime` | 元のファイルを外部プレイヤーで開く（mpv があれば mpv） |
+| | `player_prefs_get()` / `player_prefs_set(prefs)` | 再生の設定（音量・画像の間も直前の音楽を流す・BGM をループ・画像の表示時間の既定値）。app.json に保存 |
+| | `playback_save_state(playlist_id, state)` | 再開（M6） |
 | ジョブ | `jobs_list(filter)` / `job_cancel(id)` / `job_pause(id)` / `job_resume(id)` / `job_retry(id)` / `job_log(id)` | 進捗はイベント `job://progress` |
 | ダウンロード | `download_detect(url)` → `DetectedSource` / `download_enqueue(url, options)` → `JobId` | |
 | キャプチャ | `capture_rules_*` / `capture_run(url, rule_id?)` → `JobId` / `browser_open(url)` / `browser_snapshot(label)` | |
@@ -176,6 +182,16 @@ import_start:    ジョブとして実行
   - それ以外 → VideoToolbox でハードウェアエンコード（`-c:v h264_videotoolbox` など）、音声は AAC 256kbps
 - プロキシ作成中・失敗時は「外部プレイヤー（mpv または QuickTime Player）で開く」を出す。
 
+### 8.1 実装（M5）
+
+- **再生可否の表**：フロント（`src/features/player/support.ts`）が「入れ物（mp4・webm・ogg・mp3・flac・wav・aiff・aac）× ffprobe のコーデック名」ごとに `canPlayType` を調べ、空でなければ再生できるとする。表はアプリのメモリに持ち、ライブラリを開くたびに渡す。表の指紋を `settings` の `playback.support` に記録し、変わっていれば `not_needed` / `pending` / `failed` の動画・音楽を `unknown` に戻す（ADR-61）。
+- **判定**（`kura_core::playback::support::plan`、純粋関数）：入れ物は拡張子で決める（mov・m4v・m4a は mp4、opus は ogg、mkv・avi などは「その他」）。元の入れ物で映像・音声とも再生できれば `not_needed`。そうでなければ `pending` で、プロキシ（mp4）では mp4 で再生できるストリームはコピー、できないストリームだけ変換する（ADR-63）。映像も音声もなければ `failed`。画像はプロキシを作らない（取り込み時に `not_needed`、ADR-65）。
+- **プロキシのジョブ**（`kind = 'proxy'`、同時に 1 つ）：取り込みのあとに積む。`unknown` を新しい順に 16 件ずつ ffprobe（4 並列）で判定し、`pending` を 1 件ずつ作る。再生キューの今と次 3 件（`proxy_request`）を先に処理する。一時ファイル（`.mp4.part`）に書いてから置き換え、一時停止・中止・アプリの終了では ffmpeg を止める（`pending` のまま残り、次回に続きから）。ffmpeg の進み具合が 2 分止まったら失敗にする。ffmpeg がなければ何もしない（`unknown` のまま、元のファイルで再生を試す）。
+- **ffmpeg の引数**：`-map 0:<映像> -map 0:<音声>`（ジャケット・字幕・データは落とす）、コピーは `-c copy`（HEVC は `-tag:v hvc1`）、映像の変換は `h264_videotoolbox -b:v 5M/10M/30M（720p/1080p/それ以上）-pix_fmt yuv420p -allow_sw 1`、音声の変換は `aac -b:a 256k`、`-movflags +faststart -f mp4`。
+- **再生できなかったとき**：`not_needed` / `unknown` のものが再生エラーになったら `proxy_request(force)` で `pending` に戻し、判定が「不要」でもすべて変換する。プロキシでもだめなら「外部プレイヤーで開く」「もう一度変換する」を出す（ADR-64）。
+- **配信**：`/play/{hash}` はプロキシがあればプロキシ、なければ元ファイル。作り直したプロキシは `?a=<回数>` を付けて読み直す。`.opus` は `audio/ogg` で配る（ADR-73）。
+- **再生**（`src/features/player/engine/PlaybackController.ts`）：キューを順に再生するだけ（playlists.md §6）。`<video>` はシアターに置いたものを使い、BGM 用の `<audio>` 2 つと先読み用の要素はコントローラが作る。シアターは再生中ずっと DOM に残し、ミニプレーヤーのときは隠す（ADR-71）。ウィンドウが隠れても止まらないよう、WebView のバックグラウンドの抑制を切る（§11、ADR-72）。
+
 ## 9. ダウンロード
 
 | 段階 | 内容 |
@@ -208,6 +224,7 @@ import_start:    ジョブとして実行
 - ガラス表現は CSS の `backdrop-filter` で行う（`docs/decisions.md` ADR-12）。ウィンドウの透明化・private API は使わない。
 - 「透明度を下げる」がオンなら `<html data-reduce-transparency="true">` を付け、ガラスを不透明な面に置き換える。
 - ファイルのドラッグ＆ドロップは `getCurrentWebview().onDragDropEvent` で受ける（`enter` で重ね表示、`drop` で取り込みシート）。
+- `backgroundThrottling: "disabled"`（M5）：既定では、ウィンドウがほかのウィンドウに隠れると WebKit が動画の再生開始や CSS アニメーションを止め、再生キューが動画のところで止まる。メディアプレーヤーなので隠れていても再生を続ける（ADR-72）。
 - 署名は個人利用なのでアドホック署名（`bundle.macOS.signingIdentity: "-"`）。App Store には出さない。
 - 書類・デスクトップ・ダウンロードを「ファイルを選択」で開くと macOS の許可ダイアログが出る。ドラッグ＆ドロップした項目は許可なしで読める。
 
@@ -273,3 +290,11 @@ M4 の実測（同じ環境、10 万件、`bench query` の検索の中央値）
 | OR・除外・種類の組み合わせ | 5,763 件 | 15ms | — |
 | 名前順（10 万件、自然順） | — | 135ms | — |
 | 撮影日順（10 万件） | — | 53ms | — |
+
+M5 の実測（同じ環境）：
+
+| 項目 | 結果 |
+|---|---|
+| 10 万件の選択からキューを作る（`player_queue` の中身） | 25ms＋合計の長さ 13ms（`cargo test --release -p kura-core queue -- --ignored`） |
+| 起動から判定とプロキシの作成まで（動画・音楽 8 件、mkv 2 件の入れ替え・avi 1 件の変換） | 0.5 秒 |
+| 混在キュー 12 件（mkv×2・webm・ogg・opus・flac・avi・mp4・画像 4、ウィンドウは隠した状態） | 途中で止まらず全件を「最後まで再生」で記録。スロットの切り替えは画像 0〜0.1 秒・音楽と動画 0.5〜1.4 秒（読み込み） |
