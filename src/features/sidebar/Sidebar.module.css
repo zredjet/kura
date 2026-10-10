@@ -1,0 +1,19 @@
+/* Sidebar.dc.html：幅 248px、余白 上下 12px・左右 8px、項目の間隔 14px */
+
+.sidebar {
+  flex: none;
+  width: var(--w-sidebar);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3-5);
+  padding: var(--space-3) var(--space-2);
+}
+
+/*
+ * 信号機（ネイティブのウィンドウボタン）を置く高さ 24px の行。ウィンドウのドラッグ領域を兼ねる。
+ * 信号機の位置は tauri.conf.json の trafficLightPosition で合わせる。
+ */
+.titlebar {
+  flex: none;
+  height: var(--space-6);
+}

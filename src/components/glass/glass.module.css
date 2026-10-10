@@ -1,0 +1,14 @@
+/*
+ * ガラス面（design.md §4）。浮いている部品（サイドバー・インスペクタ・ダイアログなど）だけに使う。
+ * 使う側で `className={`${glass.panel} ${styles.xxx}`}` のように組み合わせる。
+ * 「透明度を下げる」がオンなら tokens.css が不透明な面に置き換える。
+ */
+
+.panel {
+  background: var(--glass-panel);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-panel);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+}

@@ -1,0 +1,36 @@
+/* アプリ全体の既定。値は tokens.css の変数だけを使う。 */
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  /* ウィンドウ自体はスクロールさせない（各ペインが自分でスクロールする） */
+  overflow: hidden;
+  background: var(--bg-window);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-md);
+  line-height: var(--leading-tight);
+  -webkit-font-smoothing: antialiased;
+  /* アプリの UI は文字選択させない（入力欄は除く） */
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* フォーカスリングはキーボード操作のときだけ（design.md §7） */
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  box-shadow: var(--focus-ring);
+}

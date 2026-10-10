@@ -1,0 +1,9 @@
+/* Main.dc.html：余白 0・8・96・12（下の 96px はミニプレーヤーの分） */
+
+.grid {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 0 var(--space-2) 96px var(--space-3);
+}

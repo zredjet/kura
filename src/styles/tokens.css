@@ -1,0 +1,141 @@
+/*
+ * Kura デザイントークン
+ * 実装時は src/styles/tokens.css にコピーして使う。値の正本はこのファイル。
+ * 色はダーク基調のみ（v1）。ライトモードは v2 で検討。
+ */
+
+:root {
+  /* ---- 書体 ---- */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Hiragino Sans", "Hiragino Kaku Gothic ProN", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, monospace;
+
+  --text-2xs: 10px;   /* kbd の小さい表示 */
+  --text-xs: 11px;    /* 見出しラベル、補足、バッジ */
+  --text-sm: 12px;    /* チップ、メタ情報 */
+  --text-md: 13px;    /* 本文の基準（UI の既定） */
+  --text-lg: 14px;    /* 強調した本文、候補行 */
+  --text-xl: 15px;    /* パネルの見出し、入力欄（パレット） */
+  --text-2xl: 17px;   /* ダイアログの見出し */
+  --text-3xl: 20px;   /* 画面の見出し */
+  --text-4xl: 30px;   /* プレイリストのタイトル */
+
+  --weight-regular: 400;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+  --leading-tight: 1.35;
+  --leading-body: 1.55;
+
+  /* ---- 地の色 ---- */
+  --bg-window: #121214;          /* ウィンドウ全体の地 */
+  --bg-theater: #08080A;         /* シアター表示の地 */
+  --bg-media: #0B0B0D;           /* プレビュー枠の地 */
+  --bg-input: rgba(0, 0, 0, 0.22);
+
+  /* ---- ガラス面（浮いている部品だけに使う）---- */
+  --glass-panel: rgba(38, 38, 43, 0.86);      /* サイドバー、インスペクタ、右パネル */
+  --glass-capsule: rgba(44, 44, 50, 0.84);    /* ミニプレーヤー、再生バー */
+  --glass-dialog: rgba(40, 40, 46, 0.94);     /* ⌘K パレット、シート */
+  --glass-blur: blur(28px) saturate(150%);
+  --glass-blur-strong: blur(32px) saturate(160%);
+  --scrim: rgba(6, 6, 8, 0.56);               /* ダイアログの背面 */
+
+  /* ---- 塗り（白の重ね）---- */
+  --fill-1: rgba(255, 255, 255, 0.05);  /* 控えめなチップ、統計の箱 */
+  --fill-2: rgba(255, 255, 255, 0.07);  /* ボタン、入力の地 */
+  --fill-3: rgba(255, 255, 255, 0.10);  /* トークン、ホバー */
+  --fill-selected: rgba(255, 255, 255, 0.11);  /* 選択中の行 */
+  --fill-pressed: rgba(255, 255, 255, 0.16);   /* 押下中・オンのセグメント */
+  --fill-track: rgba(255, 255, 255, 0.14);     /* プログレスの溝 */
+
+  /* ---- 線 ---- */
+  --stroke-1: rgba(255, 255, 255, 0.07);  /* 区切り線 */
+  --stroke-2: rgba(255, 255, 255, 0.08);  /* パネル・チップの縁 */
+  --stroke-3: rgba(255, 255, 255, 0.12);  /* ダイアログの縁、入力の縁 */
+  --stroke-kbd: rgba(255, 255, 255, 0.16);
+  --stroke-dashed: rgba(255, 255, 255, 0.30);  /* 除外条件、追加ボタン */
+
+  /* ---- 文字色 ---- */
+  --text-primary: #F4F4F6;
+  --text-secondary: #C2C2CA;
+  --text-tertiary: #A3A3AC;    /* 暗い地の上でも 4.5:1 以上 */
+  --text-on-media: #FFFFFF;    /* サムネイル上のバッジ */
+
+  /* ---- アクセント（1 色のみ）---- */
+  --accent: #FF7A45;           /* 柿色。選択リング、主ボタン、再生位置、オンのスイッチ */
+  --on-accent: #1C0E07;        /* アクセントの上の文字 */
+
+  /* ---- 状態色 ---- */
+  --warning: #F2C14E;
+  --danger-text: #FF9A8A;
+
+  /* ---- フォルダの色（ラベル用、文字色には使わない）---- */
+  --folder-blue: #6FB1FF;
+  --folder-violet: #C49BFF;
+  --folder-amber: #FFB35C;
+  --folder-teal: #5FD4C4;
+
+  /* ---- 角丸 ---- */
+  --radius-xs: 5px;    /* kbd */
+  --radius-sm: 7px;    /* タグ、トークン、小さなサムネ */
+  --radius-md: 8px;    /* タイル、入力、選択肢ボタン、サイドバー行 */
+  --radius-lg: 12px;   /* 行（候補・キュー）、統計の箱、カード */
+  --radius-xl: 16px;   /* パネル */
+  --radius-2xl: 22px;  /* ダイアログ、再生バー */
+  --radius-pill: 999px;
+
+  /* ---- 余白（4 の倍数を基本に 2/6/10/14 を補助で使う）---- */
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-2-5: 10px;
+  --space-3: 12px;
+  --space-3-5: 14px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* ---- 部品の高さ ---- */
+  --h-toolbar: 36px;
+  --h-chip: 28px;
+  --h-sidebar-row: 32px;
+  --h-list-row: 52px;
+  --h-button: 34px;
+  --h-button-lg: 38px;
+  --h-switch: 20px;
+  --w-sidebar: 248px;
+  --w-inspector: 300px;
+  --w-queue: 340px;
+
+  /* ---- 影 ---- */
+  --shadow-panel: 0 10px 30px rgba(0, 0, 0, 0.32);
+  --shadow-capsule: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.55);
+  --shadow-media: 0 30px 80px rgba(0, 0, 0, 0.50);
+
+  /* ---- 選択リング（タイル）---- */
+  --ring-selected: inset 0 0 0 2.5px var(--accent), inset 0 0 0 5px rgba(18, 18, 20, 0.85);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 55%, transparent);
+
+  /* ---- 動き ---- */
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-fade: 300ms;   /* BGM のフェードと同じ長さ */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* 「透明度を下げる」：ガラスを不透明な面に置き換える */
+:root[data-reduce-transparency="true"] {
+  --glass-panel: #26262B;
+  --glass-capsule: #2C2C32;
+  --glass-dialog: #28282E;
+  --glass-blur: none;
+  --glass-blur-strong: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur-base: 0ms;
+  }
+}

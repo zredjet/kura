@@ -1,0 +1,14 @@
+/*
+ * Main.dc.html：余白 2・4・8・12、チップの間隔 6px。
+ * 行の高さはモックで最も高い「種類」のセグメント（32px）に合わせ、合計 42px（y=74〜116）。
+ */
+
+.filterBar {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-height: calc(32px + var(--space-0-5) + var(--space-2));
+  padding: var(--space-0-5) var(--space-1) var(--space-2) var(--space-3);
+}
