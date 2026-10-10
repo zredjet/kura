@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>シアター再生</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&amp;display=swap">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="box-sizing: border-box; width: 100%; min-height: 900px; padding: 10px; display: flex; flex-wrap: wrap; gap: 10px; background: #08080A; color: #F4F4F6; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Hiragino Sans', 'Noto Sans JP', sans-serif">
+
+  <section aria-label="再生中" style="position: relative; flex: 999 1 640px; min-width: 0; min-height: 880px; box-sizing: border-box; padding: 76px 24px 176px; border-radius: 16px; overflow: hidden; background: {{cur.tint}}; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px">
+
+    <div style="position: absolute; top: 12px; left: 12px; right: 12px; display: flex; align-items: center; gap: 12px">
+      <a href="Main.dc.html" aria-label="ライブラリに戻る" style="display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 18px; background: rgba(255, 255, 255, 0.10); border: 1px solid rgba(255, 255, 255, 0.10); color: #F4F4F6"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"></path></svg></a>
+      <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px">
+        <span style="font-size: 15px; font-weight: 600">夜の作業</span>
+        <span style="font-size: 12px; color: #C2C2CA">{{cur.pos}} / 42 · シャッフル（シード 7F3A）</span>
+      </div>
+      <div style="display: flex; gap: 2px; padding: 3px; border-radius: 18px; background: rgba(255, 255, 255, 0.10); border: 1px solid rgba(255, 255, 255, 0.10)">
+        <button type="button" aria-label="情報" style="display: flex; align-items: center; justify-content: center; width: 30px; height: 28px; border: 0; border-radius: 14px; background: transparent; color: #F4F4F6; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 11v5M12 8h.01"></path></svg></button>
+        <button type="button" aria-label="タグを編集" style="display: flex; align-items: center; justify-content: center; width: 30px; height: 28px; border: 0; border-radius: 14px; background: transparent; color: #F4F4F6; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><path d="M3 12V4h8l10 10-8 8z"></path><circle cx="7.5" cy="7.5" r="1.4"></circle></svg></button>
+        <button type="button" aria-label="キューを表示" aria-pressed="true" style="display: flex; align-items: center; justify-content: center; width: 30px; height: 28px; border: 0; border-radius: 14px; background: rgba(255, 255, 255, 0.16); color: #FFFFFF; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2.5"></rect><path d="M15 5v14"></path></svg></button>
+      </div>
+    </div>
+
+    <div aria-hidden="true" style="position: relative; width: {{cur.pw}}; height: {{cur.ph}}; max-width: 100%; aspect-ratio: {{cur.ar}}; border-radius: 6px; overflow: hidden; background: {{cur.bg}}; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.5)">
+      <span style="position: absolute; left: {{cur.cx}}%; top: {{cur.cy}}%; width: {{cur.r}}%; aspect-ratio: 1; border-radius: 50%; background: {{cur.fg}}; transform: translate(-50%, -50%)"></span>
+      <span style="position: absolute; left: 0; right: 0; bottom: 0; height: {{cur.bandH}}%; background: {{cur.band}}"></span>
+    </div>
+
+    <sc-if value="{{cur.isAudio}}" hint-placeholder-val="{{ false }}">
+      <svg viewBox="0 0 240 40" preserveAspectRatio="none" aria-hidden="true" style="width: min(520px, 90%); height: 56px"><path d="M4 16v8M10 12v16M16 8v24M22 14v12M28 6v28M34 2v36M40 10v20M46 4v32M52 0v40M58 8v24M64 12v16M70 6v28M76 2v36M82 0v40M88 4v32M94 10v20M100 14v12M106 8v24M112 4v32M118 0v40M124 6v28M130 12v16M136 16v8M142 10v20M148 6v28M154 2v36M160 8v24M166 12v16M172 14v12M178 16v8M184 10v20M190 4v32M196 0v40M202 6v28M208 12v16M214 8v24M220 14v12M226 16v8M232 12v16M238 16v8" stroke="rgba(255,255,255,0.8)" stroke-width="3" stroke-linecap="round" vector-effect="non-scaling-stroke"></path></svg>
+    </sc-if>
+
+    <sc-if value="{{hasBgm}}" hint-placeholder-val="{{ true }}">
+      <div style="position: absolute; bottom: 150px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px; border-radius: 15px; background: rgba(0, 0, 0, 0.42); border: 1px solid rgba(255, 255, 255, 0.10); font-size: 12px; color: #E4E4E8; white-space: nowrap">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="{{accent}}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V6l11-2v12"></path><circle cx="6.5" cy="18" r="2.5"></circle><circle cx="17.5" cy="16" r="2.5"></circle></svg>
+        {{bgm.title}} を背景で再生中 · {{bgm.time}}
+      </div>
+    </sc-if>
+
+    <div style="position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); width: min(780px, calc(100% - 32px)); box-sizing: border-box; padding: 12px 16px 14px; border-radius: 22px; background: rgba(36, 36, 42, 0.86); border: 1px solid rgba(255, 255, 255, 0.10); box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5); backdrop-filter: blur(28px) saturate(160%); -webkit-backdrop-filter: blur(28px) saturate(160%); display: flex; flex-direction: column; gap: 10px">
+      <div style="display: flex; align-items: center; gap: 10px; font-size: 11px; color: #C2C2CA; font-variant-numeric: tabular-nums">
+        <span>{{cur.elapsed}}</span>
+        <div role="progressbar" aria-label="再生位置" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{cur.pct}}" style="flex: 1; height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.14); overflow: hidden">
+          <div style="width: {{cur.pct}}%; height: 100%; border-radius: 2px; background: {{accent}}"></div>
+        </div>
+        <span>{{cur.total}}</span>
+      </div>
+      <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px">
+        <div style="flex: 1 1 200px; min-width: 0; display: flex; flex-direction: column; gap: 2px">
+          <span style="font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{cur.title}}</span>
+          <span style="font-size: 12px; color: #C2C2CA; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{cur.kindLabel}} · {{cur.tagLine}}</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 4px">
+          <button type="button" aria-label="シャッフル" aria-pressed="true" style="display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: 0; border-radius: 18px; background: transparent; color: {{accent}}; cursor: pointer"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 4h4v4M4 20L20 4M20 16v4h-4M15 15l5 5M4 4l5 5"></path></svg></button>
+          <button type="button" aria-label="前へ" style="display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; border: 0; border-radius: 20px; background: transparent; color: #F4F4F6; cursor: pointer"><svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h2v14H6zM19 5v14L9 12z" fill="currentColor"></path></svg></button>
+          <button type="button" aria-label="{{playLabel}}" onClick="{{togglePlay}}" style="display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; border: 0; border-radius: 24px; background: #F4F4F6; color: #121214; cursor: pointer">
+            <sc-if value="{{playing}}" hint-placeholder-val="{{ true }}">
+              <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor"></rect><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor"></rect></svg>
+            </sc-if>
+            <sc-if value="{{paused}}" hint-placeholder-val="{{ false }}">
+              <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5v14l12-7z" fill="currentColor"></path></svg>
+            </sc-if>
+          </button>
+          <button type="button" aria-label="次へ" style="display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; border: 0; border-radius: 20px; background: transparent; color: #F4F4F6; cursor: pointer"><svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path d="M16 5h2v14h-2zM5 5v14l10-7z" fill="currentColor"></path></svg></button>
+          <button type="button" aria-label="リピート" aria-pressed="false" style="display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: 0; border-radius: 18px; background: transparent; color: #C2C2CA; cursor: pointer"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3l3 3-3 3M4 11V9a3 3 0 0 1 3-3h13M7 21l-3-3 3-3M20 13v2a3 3 0 0 1-3 3H4"></path></svg></button>
+        </div>
+        <div style="flex: 1 1 200px; min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 10px">
+          <div role="group" aria-label="画像の表示時間" style="display: flex; align-items: center; height: 30px; border-radius: 15px; background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.08); font-size: 12px">
+            <button type="button" aria-label="表示時間を短く" style="width: 28px; height: 28px; border: 0; background: transparent; color: #E4E4E8; font: inherit; font-size: 15px; cursor: pointer">−</button>
+            <span style="padding: 0 4px; color: #E4E4E8; white-space: nowrap">画像 8秒</span>
+            <button type="button" aria-label="表示時間を長く" style="width: 28px; height: 28px; border: 0; background: transparent; color: #E4E4E8; font: inherit; font-size: 15px; cursor: pointer">＋</button>
+          </div>
+          <label style="display: flex; align-items: center; gap: 6px; color: #C2C2CA">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 10v4h4l5 4V6L8 10z"></path><path d="M16 9a4 4 0 0 1 0 6"></path></svg>
+            <input type="range" min="0" max="100" value="70" aria-label="音量" style="width: 84px; accent-color: #F4F4F6">
+          </label>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <aside aria-label="次に再生" style="flex: 1 1 320px; max-width: 360px; min-width: 0; box-sizing: border-box; padding: 16px 10px 12px; border-radius: 16px; background: rgba(28, 28, 32, 0.94); border: 1px solid rgba(255, 255, 255, 0.07); display: flex; flex-direction: column; gap: 12px">
+    <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 0 6px">
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <h2 style="margin: 0; font-size: 15px; font-weight: 600">次に再生</h2>
+        <span style="font-size: 12px; color: #A9A9B2">42 項目 · 2時間14分</span>
+      </div>
+      <button type="button" style="display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 15px; background: rgba(255, 255, 255, 0.06); color: #E4E4E8; font: inherit; font-size: 12px; cursor: pointer"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4"></path></svg>並べ直す</button>
+    </div>
+
+    <div role="tablist" aria-label="キューの表示" style="display: flex; gap: 2px; margin: 0 6px; padding: 2px; border-radius: 10px; background: rgba(255, 255, 255, 0.06)">
+      <button type="button" role="tab" aria-selected="true" style="flex: 1; height: 28px; border: 0; border-radius: 8px; background: rgba(255, 255, 255, 0.14); color: #FFFFFF; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer">キュー</button>
+      <button type="button" role="tab" aria-selected="false" style="flex: 1; height: 28px; border: 0; border-radius: 8px; background: transparent; color: #C2C2CA; font: inherit; font-size: 12px; cursor: pointer">履歴</button>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 2px">
+      <sc-for list="{{queue}}" as="q" hint-placeholder-count="10">
+        <button type="button" aria-label="{{q.title}}" onClick="{{q.pick}}" style="display: flex; align-items: center; gap: 10px; height: 54px; padding: 0 8px; border: 0; border-radius: 10px; background: {{q.rowBg}}; color: #F4F4F6; font: inherit; text-align: left; cursor: pointer; opacity: {{q.opacity}}">
+          <span aria-hidden="true" style="position: relative; flex: none; width: 40px; height: 40px; border-radius: 7px; overflow: hidden; background: {{q.bg}}">
+            <span style="position: absolute; left: {{q.cx}}%; top: {{q.cy}}%; width: {{q.r}}%; aspect-ratio: 1; border-radius: 50%; background: {{q.fg}}; transform: translate(-50%, -50%)"></span>
+            <span style="position: absolute; left: 0; right: 0; bottom: 0; height: {{q.bandH}}%; background: {{q.band}}"></span>
+          </span>
+          <span style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px">
+            <span style="font-size: 13px; font-weight: {{q.weight}}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{q.title}}</span>
+            <span style="font-size: 11px; color: {{q.subColor}}; white-space: nowrap">{{q.sub}}</span>
+          </span>
+          <sc-if value="{{q.isCurrent}}" hint-placeholder-val="{{ false }}">
+            <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="9" width="3" height="10" rx="1" fill="{{accent}}"></rect><rect x="10.5" y="5" width="3" height="14" rx="1" fill="{{accent}}"></rect><rect x="17" y="11" width="3" height="8" rx="1" fill="{{accent}}"></rect></svg>
+          </sc-if>
+          <sc-if value="{{q.showGrip}}" hint-placeholder-val="{{ true }}">
+            <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="6" r="1.5" fill="#7A7A84"></circle><circle cx="15" cy="6" r="1.5" fill="#7A7A84"></circle><circle cx="9" cy="12" r="1.5" fill="#7A7A84"></circle><circle cx="15" cy="12" r="1.5" fill="#7A7A84"></circle><circle cx="9" cy="18" r="1.5" fill="#7A7A84"></circle><circle cx="15" cy="18" r="1.5" fill="#7A7A84"></circle></svg>
+          </sc-if>
+        </button>
+      </sc-for>
+    </div>
+
+    <div style="margin-top: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px 6px 0; border-top: 1px solid rgba(255, 255, 255, 0.07); font-size: 12px; color: #C2C2CA">
+      <label style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+        画像の間も直前の音楽を流す
+        <span style="position: relative; display: flex; width: 34px; height: 20px; border-radius: 10px; background: {{accent}}">
+          <input type="checkbox" checked aria-label="画像の間も直前の音楽を流す" style="position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer">
+          <span aria-hidden="true" style="position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; border-radius: 50%; background: #FFFFFF"></span>
+        </span>
+      </label>
+      <label style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+        同じ種類を3回以上続けない
+        <span style="position: relative; display: flex; width: 34px; height: 20px; border-radius: 10px; background: {{accent}}">
+          <input type="checkbox" checked aria-label="同じ種類を3回以上続けない" style="position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer">
+          <span aria-hidden="true" style="position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; border-radius: 50%; background: #FFFFFF"></span>
+        </span>
+      </label>
+    </div>
+  </aside>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#FF7A45","options":["#FF7A45","#5AA9FF","#B48CFF","#F2C14E"]},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const acc = this.props.accent ?? '#FF7A45';
+    const st = this.state || {};
+    const curId = st.cur || 'c';
+    const playing = st.paused ? false : true;
+    const Q = [
+      { id: 'p', pos: 5, title: '港の朝.jpg', kind: 'image', dur: '8秒', ar: 1.5, bg: '#6E8AA3', fg: '#FBE3B5', cx: 22, cy: 30, r: 18, bandH: 38, band: '#4C6378', tint: '#1A222B', tagLine: '場所:横浜 · 朝 · 港', elapsed: '0:05', total: '0:08', pct: 62 },
+      { id: 'd', pos: 6, title: 'rain-loop.flac', kind: 'audio', dur: '4:18', ar: 1, bg: '#1E3A36', fg: '#7ED8C3', cx: 72, cy: 30, r: 30, bandH: 0, band: '#1E3A36', tint: '#0F1D1B', tagLine: '環境音 · 雨 · 作業用', elapsed: '2:41', total: '4:18', pct: 62 },
+      { id: 'c', pos: 7, title: 'pixiv_12345678_p0.png', kind: 'image', dur: '8秒', ar: 0.707, bg: '#3A3150', fg: '#FFC77A', cx: 50, cy: 28, r: 30, bandH: 44, band: '#272038', tint: '#17131F', tagLine: '作者:もりの · 背景 · 夕景', elapsed: '0:05', total: '0:08', pct: 62 },
+      { id: 'j', pos: 8, title: '星空タイムラプス.mov', kind: 'video', dur: '0:45', ar: 1.778, bg: '#0E1424', fg: '#C9D6FF', cx: 72, cy: 28, r: 6, bandH: 28, band: '#080C16', tint: '#0B0F18', tagLine: '場所:八ヶ岳 · 星空', elapsed: '0:17', total: '0:45', pct: 38 },
+      { id: 'k', pos: 9, title: 'スケッチ_0412.png', kind: 'image', dur: '8秒', ar: 1, bg: '#D8D2C4', fg: '#4A4A50', cx: 40, cy: 46, r: 28, bandH: 16, band: '#C9C2B2', tint: '#24221E', tagLine: 'ラフ · 構図', elapsed: '0:03', total: '0:08', pct: 38 },
+      { id: 'h', pos: 10, title: '作業用BGM_01.m4a', kind: 'audio', dur: '3:52', ar: 1, bg: '#2F2440', fg: '#FF9F7A', cx: 30, cy: 34, r: 34, bandH: 0, band: '#2F2440', tint: '#18121F', tagLine: 'アーティスト:灯野 · ローファイ', elapsed: '1:12', total: '3:52', pct: 31 },
+      { id: 'o', pos: 11, title: '打ち上げ花火.mp4', kind: 'video', dur: '0:58', ar: 0.5625, bg: '#120E1C', fg: '#FF9DC9', cx: 50, cy: 32, r: 44, bandH: 18, band: '#0A0710', tint: '#0E0B14', tagLine: 'イベント:花火大会 · 縦動画', elapsed: '0:21', total: '0:58', pct: 36 },
+      { id: 'n', pos: 12, title: '構図メモ.png', kind: 'image', dur: '8秒', ar: 1.333, bg: '#2B2B30', fg: '#9FB7FF', cx: 58, cy: 50, r: 30, bandH: 0, band: '#2B2B30', tint: '#141418', tagLine: '構図 · メモ', elapsed: '0:02', total: '0:08', pct: 25 },
+      { id: 'm', pos: 13, title: 'ambient_forest.ogg', kind: 'audio', dur: '12:00', ar: 1, bg: '#1C2E26', fg: '#A9D18E', cx: 64, cy: 36, r: 36, bandH: 0, band: '#1C2E26', tint: '#0E1813', tagLine: '環境音 · 森 · 作業用', elapsed: '4:05', total: '12:00', pct: 34 },
+      { id: 'a', pos: 14, title: '夕方の海.jpg', kind: 'image', dur: '8秒', ar: 1.5, bg: '#2C4A63', fg: '#F2A65A', cx: 68, cy: 40, r: 24, bandH: 34, band: '#1B3247', tint: '#121D27', tagLine: '場所:三浦海岸 · 夕景 · 海', elapsed: '0:05', total: '0:08', pct: 62 }
+    ];
+    const kindName = (k) => (k === 'video' ? '動画' : (k === 'audio' ? '音楽' : '画像'));
+    const curIdx = Math.max(0, Q.findIndex((x) => x.id === curId));
+    const c = Q[curIdx];
+    let bgIdx = -1;
+    if (c.kind === 'image') {
+      for (let i = curIdx - 1; i >= 0; i--) { if (Q[i].kind === 'audio') { bgIdx = i; break; } }
+    }
+    const queue = Q.map((x, i) => {
+      const isCurrent = i === curIdx;
+      const isBg = i === bgIdx;
+      const played = i < curIdx && !isBg;
+      return Object.assign({}, x, {
+        isCurrent,
+        showGrip: !isCurrent,
+        rowBg: isCurrent ? 'rgba(255,255,255,0.11)' : 'transparent',
+        opacity: played ? '0.55' : '1',
+        weight: isCurrent ? '600' : '400',
+        sub: isCurrent ? kindName(x.kind) + ' · 再生中' : (isBg ? '音楽 · 背景で再生中' : kindName(x.kind) + ' · ' + x.dur),
+        subColor: (isCurrent || isBg) ? acc : '#A9A9B2',
+        pick: () => this.setState({ cur: x.id })
+      });
+    });
+    const wide = c.ar >= 1.2;
+    const cur = Object.assign({}, c, {
+      kindLabel: kindName(c.kind),
+      isAudio: c.kind === 'audio',
+      pw: c.kind === 'audio' ? 'auto' : (wide ? '82%' : 'auto'),
+      ph: c.kind === 'audio' ? '360px' : (wide ? 'auto' : '560px')
+    });
+    const hasBgm = bgIdx >= 0;
+    const bgm = hasBgm ? { title: Q[bgIdx].title, time: '2:41 / ' + Q[bgIdx].dur } : { title: '', time: '' };
+    return {
+      accent: acc, cur, queue, hasBgm, bgm,
+      playing, paused: !playing,
+      playLabel: playing ? '一時停止' : '再生',
+      togglePlay: () => this.setState({ paused: playing })
+    };
+  }
+}
+</script>
+</body>
+</html>

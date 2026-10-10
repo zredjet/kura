@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>スマートプレイリスト</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&amp;display=swap">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="box-sizing: border-box; width: 100%; min-height: 1000px; padding: 8px; display: flex; flex-wrap: wrap; gap: 8px; background: #121214; color: #F4F4F6; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Hiragino Sans', 'Noto Sans JP', sans-serif">
+
+  <div style="flex: 1 1 248px; min-width: 0; display: block">
+    <dc-import name="Sidebar" active="pl2" accent="{{accent}}" hint-size="100%,984px"></dc-import>
+  </div>
+
+  <main style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 20px 24px 28px; display: flex; flex-direction: column; gap: 22px">
+
+    <div style="display: flex; flex-wrap: wrap; align-items: flex-end; gap: 22px">
+      <div aria-hidden="true" style="flex: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px; width: 136px; height: 136px; border-radius: 14px; overflow: hidden; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4)">
+        <div style="position: relative; background: #0E1424; overflow: hidden"><span style="position: absolute; left: 72%; top: 30%; width: 14%; aspect-ratio: 1; border-radius: 50%; background: #C9D6FF; transform: translate(-50%, -50%)"></span><span style="position: absolute; left: 0; right: 0; bottom: 0; height: 30%; background: #080C16"></span></div>
+        <div style="position: relative; background: #2F2440; overflow: hidden"><span style="position: absolute; left: 34%; top: 40%; width: 46%; aspect-ratio: 1; border-radius: 50%; background: #FF9F7A; transform: translate(-50%, -50%)"></span></div>
+        <div style="position: relative; background: #2C4A63; overflow: hidden"><span style="position: absolute; left: 66%; top: 40%; width: 34%; aspect-ratio: 1; border-radius: 50%; background: #F2A65A; transform: translate(-50%, -50%)"></span><span style="position: absolute; left: 0; right: 0; bottom: 0; height: 36%; background: #1B3247"></span></div>
+        <div style="position: relative; background: #3A3150; overflow: hidden"><span style="position: absolute; left: 50%; top: 32%; width: 40%; aspect-ratio: 1; border-radius: 50%; background: #FFC77A; transform: translate(-50%, -50%)"></span><span style="position: absolute; left: 0; right: 0; bottom: 0; height: 44%; background: #272038"></span></div>
+      </div>
+
+      <div style="flex: 1 1 320px; min-width: 0; display: flex; flex-direction: column; gap: 6px">
+        <span style="display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: {{accent}}">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l1.9 4.6 4.6 1.9-4.6 1.9L12 16.5l-1.9-4.6L5.5 10l4.6-1.9z"></path></svg>
+          スマートプレイリスト
+        </span>
+        <h1 style="margin: 0; font-size: 30px; font-weight: 700; letter-spacing: -0.01em">シャッフル：お気に入り</h1>
+        <span style="font-size: 13px; color: #C2C2CA">50 項目 · 画像 21 · 音楽 18 · 動画 11 · 約 1時間48分</span>
+        <span style="font-size: 12px; color: #A3A3AC">今日 21:02 に生成 · 再生のたびに作り直す</span>
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; gap: 8px">
+        <a href="Player.dc.html" style="display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 18px; border-radius: 19px; background: {{accent}}; color: #1C0E07; font-size: 14px; font-weight: 600; text-decoration: none"><svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5v14l12-7z" fill="currentColor"></path></svg>再生</a>
+        <button type="button" style="display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 16px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 19px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 14px; cursor: pointer"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4"></path></svg>作り直す</button>
+        <button type="button" aria-label="その他の操作" style="display: flex; align-items: center; justify-content: center; width: 38px; height: 38px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 19px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="1.6" fill="currentColor"></circle><circle cx="12" cy="12" r="1.6" fill="currentColor"></circle><circle cx="18" cy="12" r="1.6" fill="currentColor"></circle></svg></button>
+      </div>
+    </div>
+
+    <section aria-label="ルール" style="box-sizing: border-box; padding: 16px 18px 18px; border-radius: 16px; background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); display: flex; flex-direction: column; gap: 12px">
+      <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; color: #C2C2CA">
+        <h2 style="margin: 0 8px 0 0; font-size: 14px; font-weight: 600; color: #F4F4F6">ルール</h2>
+        次の
+        <button type="button" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">すべて<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        に一致
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px">
+        <button type="button" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 120px; height: 32px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">評価<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <button type="button" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 136px; height: 32px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">が次以上<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <span role="img" aria-label="星4つ" style="display: flex; gap: 2px; padding: 0 6px">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="{{accent}}" stroke="{{accent}}" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l2.4 5 5.4.6-4 3.7 1.1 5.3L12 16l-4.9 2.6 1.1-5.3-4-3.7 5.4-.6z"></path></svg>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="{{accent}}" stroke="{{accent}}" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l2.4 5 5.4.6-4 3.7 1.1 5.3L12 16l-4.9 2.6 1.1-5.3-4-3.7 5.4-.6z"></path></svg>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="{{accent}}" stroke="{{accent}}" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l2.4 5 5.4.6-4 3.7 1.1 5.3L12 16l-4.9 2.6 1.1-5.3-4-3.7 5.4-.6z"></path></svg>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="{{accent}}" stroke="{{accent}}" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l2.4 5 5.4.6-4 3.7 1.1 5.3L12 16l-4.9 2.6 1.1-5.3-4-3.7 5.4-.6z"></path></svg>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#7A7A84" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l2.4 5 5.4.6-4 3.7 1.1 5.3L12 16l-4.9 2.6 1.1-5.3-4-3.7 5.4-.6z"></path></svg>
+        </span>
+        <span style="margin-left: auto; display: flex; gap: 4px">
+          <button type="button" aria-label="この条件を削除" style="width: 28px; height: 28px; border: 0; border-radius: 14px; background: rgba(255, 255, 255, 0.06); color: #C2C2CA; font: inherit; font-size: 15px; cursor: pointer">−</button>
+          <button type="button" aria-label="条件を追加" style="width: 28px; height: 28px; border: 0; border-radius: 14px; background: rgba(255, 255, 255, 0.06); color: #C2C2CA; font: inherit; font-size: 15px; cursor: pointer">＋</button>
+        </span>
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px">
+        <button type="button" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 120px; height: 32px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">種類<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <button type="button" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 136px; height: 32px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">が次のいずれか<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <button type="button" aria-pressed="true" style="display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 10px; border: 0; border-radius: 15px; background: rgba(255, 255, 255, 0.16); color: #FFFFFF; font: inherit; font-size: 12px; cursor: pointer"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>画像</button>
+        <button type="button" aria-pressed="true" style="display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 10px; border: 0; border-radius: 15px; background: rgba(255, 255, 255, 0.16); color: #FFFFFF; font: inherit; font-size: 12px; cursor: pointer"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>音楽</button>
+        <button type="button" aria-pressed="true" style="display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 10px; border: 0; border-radius: 15px; background: rgba(255, 255, 255, 0.16); color: #FFFFFF; font: inherit; font-size: 12px; cursor: pointer"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>動画</button>
+        <span style="margin-left: auto; display: flex; gap: 4px">
+          <button type="button" aria-label="この条件を削除" style="width: 28px; height: 28px; border: 0; border-radius: 14px; background: rgba(255, 255, 255, 0.06); color: #C2C2CA; font: inherit; font-size: 15px; cursor: pointer">−</button>
+          <button type="button" aria-label="条件を追加" style="width: 28px; height: 28px; border: 0; border-radius: 14px; background: rgba(255, 255, 255, 0.06); color: #C2C2CA; font: inherit; font-size: 15px; cursor: pointer">＋</button>
+        </span>
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px">
+        <button type="button" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 120px; height: 32px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">タグ<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <button type="button" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 136px; height: 32px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">を含まない<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <span style="display: flex; align-items: center; height: 28px; padding: 0 9px; border-radius: 7px; border: 1px dashed rgba(255, 255, 255, 0.30); font-size: 12px; color: #EDEDF0">未整理</span>
+        <span style="display: flex; align-items: center; height: 28px; padding: 0 9px; border-radius: 7px; border: 1px dashed rgba(255, 255, 255, 0.30); font-size: 12px; color: #EDEDF0">ラフ</span>
+        <span style="margin-left: auto; display: flex; gap: 4px">
+          <button type="button" aria-label="この条件を削除" style="width: 28px; height: 28px; border: 0; border-radius: 14px; background: rgba(255, 255, 255, 0.06); color: #C2C2CA; font: inherit; font-size: 15px; cursor: pointer">−</button>
+          <button type="button" aria-label="条件を追加" style="width: 28px; height: 28px; border: 0; border-radius: 14px; background: rgba(255, 255, 255, 0.06); color: #C2C2CA; font: inherit; font-size: 15px; cursor: pointer">＋</button>
+        </span>
+      </div>
+
+      <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px">
+        <button type="button" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 120px; height: 32px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">最終再生<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <button type="button" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 136px; height: 32px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">が次より前<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: #C2C2CA">
+          <input type="number" value="7" min="1" aria-label="日数" style="width: 52px; height: 30px; box-sizing: border-box; padding: 0 8px; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px; background: rgba(0, 0, 0, 0.25); color: #F4F4F6; font: inherit; font-size: 13px">
+          日前（未再生も含む）
+        </label>
+        <span style="margin-left: auto; display: flex; gap: 4px">
+          <button type="button" aria-label="この条件を削除" style="width: 28px; height: 28px; border: 0; border-radius: 14px; background: rgba(255, 255, 255, 0.06); color: #C2C2CA; font: inherit; font-size: 15px; cursor: pointer">−</button>
+          <button type="button" aria-label="条件を追加" style="width: 28px; height: 28px; border: 0; border-radius: 14px; background: rgba(255, 255, 255, 0.06); color: #C2C2CA; font: inherit; font-size: 15px; cursor: pointer">＋</button>
+        </span>
+      </div>
+
+      <div style="height: 1px; background: rgba(255, 255, 255, 0.07); margin: 4px 0"></div>
+
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px 24px; font-size: 13px; color: #C2C2CA">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px">
+          並び順
+          <button type="button" style="display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">ランダム（評価で重み付け）<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px">
+          上限
+          <button type="button" style="display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">50 項目<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        </div>
+        <label style="display: flex; align-items: center; justify-content: space-between; gap: 10px">
+          再生のたびに作り直す
+          <span style="position: relative; display: flex; flex: none; width: 34px; height: 20px; border-radius: 10px; background: {{accent}}">
+            <input type="checkbox" checked aria-label="再生のたびに作り直す" style="position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer">
+            <span aria-hidden="true" style="position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; border-radius: 50%; background: #FFFFFF"></span>
+          </span>
+        </label>
+        <label style="display: flex; align-items: center; justify-content: space-between; gap: 10px">
+          シードを固定して同じ順番を再現
+          <span style="position: relative; display: flex; flex: none; width: 34px; height: 20px; border-radius: 10px; background: rgba(255, 255, 255, 0.18)">
+            <input type="checkbox" aria-label="シードを固定して同じ順番を再現" style="position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer">
+            <span aria-hidden="true" style="position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #D9D9DE"></span>
+          </span>
+        </label>
+        <label style="display: flex; align-items: center; justify-content: space-between; gap: 10px">
+          同じ種類を3回以上続けない
+          <span style="position: relative; display: flex; flex: none; width: 34px; height: 20px; border-radius: 10px; background: {{accent}}">
+            <input type="checkbox" checked aria-label="同じ種類を3回以上続けない" style="position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer">
+            <span aria-hidden="true" style="position: absolute; top: 2px; right: 2px; width: 16px; height: 16px; border-radius: 50%; background: #FFFFFF"></span>
+          </span>
+        </label>
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px">
+          画像の表示時間
+          <button type="button" style="display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 13px; cursor: pointer">8 秒<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        </div>
+      </div>
+    </section>
+
+    <section aria-label="生成された項目" style="display: flex; flex-direction: column; gap: 8px">
+      <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 12px">
+        <h2 style="margin: 0; font-size: 14px; font-weight: 600">今回の並び</h2>
+        <span style="font-size: 12px; color: #A3A3AC">50 項目中 8 項目を表示</span>
+      </div>
+      <div style="overflow-x: auto">
+        <table style="width: 100%; min-width: 680px; border-collapse: collapse; font-size: 13px">
+          <thead>
+            <tr style="height: 32px; color: #A3A3AC; font-size: 11px; text-align: left">
+              <th scope="col" style="width: 36px; padding: 0 8px; font-weight: 600">#</th>
+              <th scope="col" style="padding: 0 8px; font-weight: 600">名前</th>
+              <th scope="col" style="width: 72px; padding: 0 8px; font-weight: 600">種類</th>
+              <th scope="col" style="width: 80px; padding: 0 8px; font-weight: 600; text-align: right">長さ</th>
+              <th scope="col" style="width: 64px; padding: 0 8px; font-weight: 600">評価</th>
+              <th scope="col" style="width: 104px; padding: 0 8px; font-weight: 600">最終再生</th>
+            </tr>
+          </thead>
+          <tbody>
+            <sc-for list="{{rows}}" as="row" hint-placeholder-count="8">
+              <tr style="height: 50px; border-top: 1px solid rgba(255, 255, 255, 0.06)">
+                <td style="padding: 0 8px; color: #A3A3AC; font-variant-numeric: tabular-nums">{{row.n}}</td>
+                <td style="padding: 0 8px">
+                  <span style="display: flex; align-items: center; gap: 10px; min-width: 0">
+                    <span aria-hidden="true" style="position: relative; flex: none; width: 34px; height: 34px; border-radius: 6px; overflow: hidden; background: {{row.bg}}">
+                      <span style="position: absolute; left: {{row.cx}}%; top: {{row.cy}}%; width: {{row.r}}%; aspect-ratio: 1; border-radius: 50%; background: {{row.fg}}; transform: translate(-50%, -50%)"></span>
+                      <span style="position: absolute; left: 0; right: 0; bottom: 0; height: {{row.bandH}}%; background: {{row.band}}"></span>
+                    </span>
+                    <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{row.title}}</span>
+                  </span>
+                </td>
+                <td style="padding: 0 8px; color: #C2C2CA">{{row.kind}}</td>
+                <td style="padding: 0 8px; color: #C2C2CA; text-align: right; font-variant-numeric: tabular-nums">{{row.dur}}</td>
+                <td style="padding: 0 8px; color: #C2C2CA"><span style="color: {{accent}}">★</span> {{row.rating}}</td>
+                <td style="padding: 0 8px; color: #A3A3AC">{{row.last}}</td>
+              </tr>
+            </sc-for>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#FF7A45","options":["#FF7A45","#5AA9FF","#B48CFF","#F2C14E"]},"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const acc = this.props.accent ?? '#FF7A45';
+    const rows = [
+      { n: 1, title: '星空タイムラプス.mov', kind: '動画', dur: '0:45', rating: 5, last: '3週間前', bg: '#0E1424', fg: '#C9D6FF', cx: 72, cy: 28, r: 14, bandH: 28, band: '#080C16' },
+      { n: 2, title: '作業用BGM_01.m4a', kind: '音楽', dur: '3:52', rating: 4, last: '10日前', bg: '#2F2440', fg: '#FF9F7A', cx: 30, cy: 34, r: 40, bandH: 0, band: '#2F2440' },
+      { n: 3, title: '夕方の海.jpg', kind: '画像', dur: '8秒', rating: 4, last: '未再生', bg: '#2C4A63', fg: '#F2A65A', cx: 68, cy: 40, r: 34, bandH: 34, band: '#1B3247' },
+      { n: 4, title: 'live_2026-08-30.mp4', kind: '動画', dur: '1:12:40', rating: 5, last: '1か月前', bg: '#241E33', fg: '#8E6BFF', cx: 30, cy: 52, r: 50, bandH: 22, band: '#17121F' },
+      { n: 5, title: 'ambient_forest.ogg', kind: '音楽', dur: '12:00', rating: 4, last: '2週間前', bg: '#1C2E26', fg: '#A9D18E', cx: 64, cy: 36, r: 42, bandH: 0, band: '#1C2E26' },
+      { n: 6, title: 'pixiv_12345678_p0.png', kind: '画像', dur: '8秒', rating: 4, last: '未再生', bg: '#3A3150', fg: '#FFC77A', cx: 50, cy: 28, r: 40, bandH: 44, band: '#272038' },
+      { n: 7, title: '打ち上げ花火.mp4', kind: '動画', dur: '0:58', rating: 4, last: '9日前', bg: '#120E1C', fg: '#FF9DC9', cx: 50, cy: 32, r: 48, bandH: 18, band: '#0A0710' },
+      { n: 8, title: '夏祭りダイジェスト.mp4', kind: '動画', dur: '6:31', rating: 4, last: '2週間前', bg: '#2A1C14', fg: '#FFB35C', cx: 40, cy: 40, r: 30, bandH: 30, band: '#1A110C' }
+    ];
+    return { accent: acc, rows };
+  }
+}
+</script>
+</body>
+</html>

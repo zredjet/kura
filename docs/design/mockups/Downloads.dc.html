@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>ダウンロードとキャプチャ</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&amp;display=swap">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="box-sizing: border-box; width: 100%; min-height: 1000px; padding: 8px; display: flex; flex-wrap: wrap; gap: 8px; background: #121214; color: #F4F4F6; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Hiragino Sans', 'Noto Sans JP', sans-serif">
+
+  <div style="flex: 1 1 248px; min-width: 0; display: block">
+    <dc-import name="Sidebar" active="dl" accent="{{accent}}" hint-size="100%,984px"></dc-import>
+  </div>
+
+  <main style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 14px 8px 20px 16px; display: flex; flex-wrap: wrap; gap: 20px; align-content: flex-start">
+
+    <div style="flex: 999 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <h1 style="margin: 0; font-size: 20px; font-weight: 700">ダウンロード</h1>
+        <span style="font-size: 12px; color: #A9A9B2">進行中 2 · 待機 1 · 今日の完了 14</span>
+      </div>
+
+      <div style="box-sizing: border-box; padding: 14px; border-radius: 16px; background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); display: flex; flex-direction: column; gap: 12px">
+        <div style="display: flex; gap: 8px">
+          <label style="flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; height: 40px; box-sizing: border-box; padding: 0 12px; border-radius: 12px; border: 1px solid rgba(255, 255, 255, 0.12); background: rgba(0, 0, 0, 0.25); color: #B4B4BC">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"></path></svg>
+            <input type="url" aria-label="ダウンロードするURL" value="https://www.youtube.com/watch?v=xxxxxxxxxxx" style="flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: #F4F4F6; font: inherit; font-size: 13px">
+          </label>
+          <button type="button" style="flex: none; height: 40px; padding: 0 18px; border: 0; border-radius: 12px; background: {{accent}}; color: #1C0E07; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer">追加</button>
+        </div>
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px">
+          <span style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 14px; background: rgba(255, 255, 255, 0.08); color: #EDEDF0">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="{{accent}}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>
+            YouTube を検出 · <code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace">yt-dlp</code>
+          </span>
+          <button type="button" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 14px; background: transparent; color: #D9D9DE; font: inherit; font-size: 12px; cursor: pointer"><span style="color: #A9A9B2">画質</span>最高<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+          <button type="button" aria-pressed="false" style="display: flex; align-items: center; height: 28px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 14px; background: transparent; color: #D9D9DE; font: inherit; font-size: 12px; cursor: pointer">音声のみ</button>
+          <button type="button" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 14px; background: transparent; color: #D9D9DE; font: inherit; font-size: 12px; cursor: pointer"><span style="color: #A9A9B2">保存先</span>動画 / 未分類<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+          <button type="button" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 14px; background: transparent; color: #D9D9DE; font: inherit; font-size: 12px; cursor: pointer"><span style="color: #A9A9B2">自動タグ</span>投稿者・ハッシュタグ<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        </div>
+      </div>
+
+      <div role="tablist" aria-label="ダウンロードの表示" style="display: flex; gap: 2px; align-self: flex-start; padding: 2px; border-radius: 10px; background: rgba(255, 255, 255, 0.06)">
+        <button type="button" role="tab" aria-selected="true" style="height: 28px; padding: 0 14px; border: 0; border-radius: 8px; background: rgba(255, 255, 255, 0.14); color: #FFFFFF; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer">すべて</button>
+        <button type="button" role="tab" aria-selected="false" style="height: 28px; padding: 0 14px; border: 0; border-radius: 8px; background: transparent; color: #C2C2CA; font: inherit; font-size: 12px; cursor: pointer">進行中</button>
+        <button type="button" role="tab" aria-selected="false" style="height: 28px; padding: 0 14px; border: 0; border-radius: 8px; background: transparent; color: #C2C2CA; font: inherit; font-size: 12px; cursor: pointer">完了</button>
+        <button type="button" role="tab" aria-selected="false" style="height: 28px; padding: 0 14px; border: 0; border-radius: 8px; background: transparent; color: #C2C2CA; font: inherit; font-size: 12px; cursor: pointer">失敗 1</button>
+      </div>
+
+      <div style="display: flex; flex-direction: column; border-radius: 16px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.07); overflow: hidden">
+        <sc-for list="{{jobs}}" as="job" hint-placeholder-count="5">
+          <div style="display: flex; align-items: center; gap: 14px; min-height: 76px; box-sizing: border-box; padding: 12px 14px; border-top: {{job.divider}}">
+            <span aria-hidden="true" style="position: relative; flex: none; width: 64px; height: 44px; border-radius: 7px; overflow: hidden; background: {{job.bg}}">
+              <span style="position: absolute; left: {{job.cx}}%; top: {{job.cy}}%; width: {{job.r}}%; aspect-ratio: 1; border-radius: 50%; background: {{job.fg}}; transform: translate(-50%, -50%)"></span>
+              <span style="position: absolute; left: 0; right: 0; bottom: 0; height: 30%; background: {{job.band}}"></span>
+            </span>
+            <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px">
+              <div style="display: flex; align-items: center; gap: 8px; min-width: 0">
+                <span style="font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{job.title}}</span>
+              </div>
+              <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 11px; color: #A9A9B2">
+                <span>{{job.site}}</span>
+                <code style="padding: 1px 6px; border-radius: 5px; background: rgba(255, 255, 255, 0.07); color: #D9D9DE; font-family: 'SF Mono', ui-monospace, Menlo, monospace; font-size: 10.5px">{{job.tool}}</code>
+                <span style="color: {{job.statusColor}}; font-weight: 600">{{job.status}}</span>
+              </div>
+              <sc-if value="{{job.isActive}}" hint-placeholder-val="{{ false }}">
+                <div role="progressbar" aria-label="進捗" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{job.pct}}" style="height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.10); overflow: hidden">
+                  <div style="width: {{job.pct}}%; height: 100%; border-radius: 2px; background: {{accent}}"></div>
+                </div>
+              </sc-if>
+              <span style="font-size: 11px; color: #B4B4BC; font-variant-numeric: tabular-nums">{{job.detail}}</span>
+            </div>
+            <div style="flex: none; display: flex; align-items: center; gap: 4px">
+              <sc-if value="{{job.isActive}}" hint-placeholder-val="{{ false }}">
+                <button type="button" aria-label="一時停止" style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 16px; background: rgba(255, 255, 255, 0.07); color: #E4E4E8; cursor: pointer"><svg width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor"></rect><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor"></rect></svg></button>
+                <button type="button" aria-label="中止" style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 16px; background: rgba(255, 255, 255, 0.07); color: #E4E4E8; cursor: pointer"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg></button>
+              </sc-if>
+              <sc-if value="{{job.isQueued}}" hint-placeholder-val="{{ false }}">
+                <button type="button" aria-label="先に取得する" style="display: flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 16px; background: rgba(255, 255, 255, 0.07); color: #E4E4E8; cursor: pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"></path></svg></button>
+              </sc-if>
+              <sc-if value="{{job.isDone}}" hint-placeholder-val="{{ false }}">
+                <a href="Main.dc.html" style="display: flex; align-items: center; height: 30px; padding: 0 12px; border-radius: 15px; background: rgba(255, 255, 255, 0.07); color: #E4E4E8; font-size: 12px; text-decoration: none">ライブラリで表示</a>
+              </sc-if>
+              <sc-if value="{{job.isFailed}}" hint-placeholder-val="{{ false }}">
+                <button type="button" style="height: 30px; padding: 0 12px; border: 0; border-radius: 15px; background: rgba(255, 255, 255, 0.07); color: #E4E4E8; font: inherit; font-size: 12px; cursor: pointer">ログ</button>
+                <button type="button" style="height: 30px; padding: 0 12px; border: 0; border-radius: 15px; background: #F4F4F6; color: #121214; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer">再試行</button>
+              </sc-if>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+
+    <div style="flex: 1 1 300px; max-width: 380px; min-width: 0; display: flex; flex-direction: column; gap: 14px">
+      <section aria-label="キャプチャ" style="box-sizing: border-box; padding: 16px; border-radius: 16px; background: rgba(38, 38, 43, 0.86); border: 1px solid rgba(255, 255, 255, 0.08); display: flex; flex-direction: column; gap: 12px">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 600">キャプチャ</h2>
+          <button type="button" style="display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 15px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 12px; cursor: pointer"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"></path><circle cx="12" cy="13" r="3.5"></circle></svg>見たままキャプチャ…</button>
+        </div>
+        <p style="margin: 0; font-size: 12px; line-height: 1.55; color: #B4B4BC">URL がルールに一致すると、ヘッドレスブラウザで開いて自動で撮影します。ログイン状態はアプリ専用のプロファイルに保存されます。</p>
+
+        <div style="display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 12px; background: rgba(0, 0, 0, 0.2); border: 1px solid rgba(255, 255, 255, 0.06)">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+            <span style="font-size: 13px; font-weight: 600">SNS 投稿</span>
+            <span style="display: flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 11px; background: rgba(255, 255, 255, 0.08); font-size: 11px; color: #D9D9DE">要素のみ</span>
+          </div>
+          <code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace; font-size: 11px; color: #D9D9DE; word-break: break-all">https://example.com/*/status/*</code>
+          <div style="display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 10px; font-size: 11px">
+            <span style="color: #A9A9B2">対象</span><code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace; color: #D9D9DE">article</code>
+            <span style="color: #A9A9B2">非表示</span><code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace; color: #D9D9DE">header, .cookie-banner</code>
+            <span style="color: #A9A9B2">最終実行</span><span style="color: #D9D9DE">10月8日 23:05 · 成功</span>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 12px; background: rgba(0, 0, 0, 0.2); border: 1px solid rgba(255, 255, 255, 0.06)">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+            <span style="font-size: 13px; font-weight: 600">記事ページ</span>
+            <span style="display: flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 11px; background: rgba(255, 255, 255, 0.08); font-size: 11px; color: #D9D9DE">ページ全体</span>
+          </div>
+          <code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace; font-size: 11px; color: #D9D9DE; word-break: break-all">https://news.example.jp/articles/*</code>
+          <div style="display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 10px; font-size: 11px">
+            <span style="color: #A9A9B2">幅</span><span style="color: #D9D9DE">800 px · 遅延読み込み対策でスクロール 3 回</span>
+            <span style="color: #A9A9B2">非表示</span><code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace; color: #D9D9DE">.ad, .related</code>
+            <span style="color: #A9A9B2">最終実行</span><span style="color: #D9D9DE">9月30日 · 成功</span>
+          </div>
+        </div>
+
+        <button type="button" style="display: flex; align-items: center; justify-content: center; gap: 6px; height: 34px; border: 1px dashed rgba(255, 255, 255, 0.22); border-radius: 10px; background: transparent; color: #D9D9DE; font: inherit; font-size: 12px; cursor: pointer"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>ルールを追加</button>
+      </section>
+
+      <section aria-label="外部ツール" style="box-sizing: border-box; padding: 16px; border-radius: 16px; background: rgba(38, 38, 43, 0.86); border: 1px solid rgba(255, 255, 255, 0.08); display: flex; flex-direction: column; gap: 10px">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+          <h2 style="margin: 0; font-size: 15px; font-weight: 600">外部ツール</h2>
+          <button type="button" style="height: 28px; padding: 0 12px; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 14px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 12px; cursor: pointer">更新を確認</button>
+        </div>
+        <div style="display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; font-size: 12px">
+          <code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace; color: #EDEDF0">yt-dlp</code>
+          <span style="display: flex; align-items: center; gap: 5px; color: #D9D9DE"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="{{accent}}" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>利用可能</span>
+          <code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace; color: #EDEDF0">gallery-dl</code>
+          <span style="display: flex; align-items: center; gap: 5px; color: #D9D9DE"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="{{accent}}" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>利用可能</span>
+          <span style="color: #EDEDF0"><code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace">deno</code><span style="color: #A9A9B2">（YouTube 用）</span></span>
+          <span style="display: flex; align-items: center; gap: 5px; color: #D9D9DE"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="{{accent}}" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>利用可能</span>
+          <code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace; color: #EDEDF0">ffmpeg</code>
+          <span style="display: flex; align-items: center; gap: 5px; color: #D9D9DE"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="{{accent}}" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>利用可能</span>
+          <code style="font-family: 'SF Mono', ui-monospace, Menlo, monospace; color: #EDEDF0">mpv</code>
+          <span style="display: flex; align-items: center; gap: 5px; color: #D9D9DE"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="{{accent}}" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"></path></svg>利用可能</span>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.07); font-size: 12px; color: #C2C2CA">
+          ログイン情報（Cookie）
+          <button type="button" style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.10); border-radius: 8px; background: rgba(255, 255, 255, 0.07); color: #F4F4F6; font: inherit; font-size: 12px; cursor: pointer">Firefox から読む<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg></button>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#FF7A45","options":["#FF7A45","#5AA9FF","#B48CFF","#F2C14E"]},"$preview":{"width":1440,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const acc = this.props.accent ?? '#FF7A45';
+    const J = [
+      { title: '【4K】大阪 雨の夜散歩', site: 'YouTube', tool: 'yt-dlp', state: 'active', pct: 41, detail: '1.2 GB / 2.9 GB · 12.4 MB/s · 残り 2分', bg: '#141C26', fg: '#9FC4FF', cx: 64, cy: 40, r: 14, band: '#0B1018' },
+      { title: 'もりの のイラスト一覧', site: 'pixiv', tool: 'gallery-dl', state: 'active', pct: 34, detail: '38 / 112 枚 · 取得済みの 214 枚はスキップ', bg: '#3A3150', fg: '#FFC77A', cx: 50, cy: 34, r: 30, band: '#272038' },
+      { title: '作業用ミックス 2026 秋', site: 'SoundCloud', tool: 'yt-dlp', state: 'queued', pct: 0, detail: '音声のみ · 音楽 / 作業用 に保存', bg: '#2F2440', fg: '#FF9F7A', cx: 30, cy: 40, r: 34, band: '#2F2440' },
+      { title: '夏祭りダイジェスト', site: 'YouTube', tool: 'yt-dlp', state: 'done', pct: 100, detail: '動画 / ライブ に登録 · タグ 4 件を自動付与', bg: '#2A1C14', fg: '#FFB35C', cx: 40, cy: 40, r: 30, band: '#1A110C' },
+      { title: '限定公開の投稿', site: 'X', tool: 'gallery-dl', state: 'failed', pct: 0, detail: 'ログインが必要です。Cookie の読み込み元を確認してください', bg: '#26262C', fg: '#6E6E78', cx: 50, cy: 44, r: 24, band: '#1C1C21' }
+    ];
+    const label = { active: '取得中', queued: '待機中', done: '完了', failed: '失敗' };
+    const color = { active: acc, queued: '#B4B4BC', done: '#D9D9DE', failed: '#FF9A8A' };
+    const jobs = J.map((j, i) => Object.assign({}, j, {
+      isActive: j.state === 'active',
+      isQueued: j.state === 'queued',
+      isDone: j.state === 'done',
+      isFailed: j.state === 'failed',
+      status: label[j.state] + (j.state === 'active' ? ' ' + j.pct + '%' : ''),
+      statusColor: color[j.state],
+      divider: i === 0 ? '0' : '1px solid rgba(255,255,255,0.06)'
+    }));
+    return { accent: acc, jobs };
+  }
+}
+</script>
+</body>
+</html>

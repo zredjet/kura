@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>サイドバー</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&amp;display=swap">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<nav aria-label="ライブラリのナビゲーション" style="box-sizing: border-box; width: 100%; min-height: 944px; height: 100%; padding: 12px 8px 12px; border-radius: 16px; background: rgba(38, 38, 43, 0.86); border: 1px solid rgba(255, 255, 255, 0.08); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.32); backdrop-filter: blur(28px) saturate(150%); -webkit-backdrop-filter: blur(28px) saturate(150%); font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Hiragino Sans', 'Noto Sans JP', sans-serif; color: #F4F4F6; display: flex; flex-direction: column; gap: 14px">
+
+  <div style="display: flex; align-items: center; gap: 8px; height: 24px; padding: 0 8px">
+    <span aria-hidden="true" style="width: 12px; height: 12px; border-radius: 50%; background: #FF5F57"></span>
+    <span aria-hidden="true" style="width: 12px; height: 12px; border-radius: 50%; background: #FEBC2E"></span>
+    <span aria-hidden="true" style="width: 12px; height: 12px; border-radius: 50%; background: #28C840"></span>
+  </div>
+
+  <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 40px; padding: 0 10px; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 10px; background: rgba(255, 255, 255, 0.05); color: #F4F4F6; font: inherit; font-size: 13px; font-weight: 600; text-align: left; cursor: pointer">
+    <span style="display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 7px; background: {{accent}}; color: #1C0E07">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 10l8-5 8 5"></path><path d="M6 10v9h12v-9"></path><path d="M10 19v-5h4v5"></path></svg>
+    </span>
+    <span style="flex: 1; min-width: 0">メインライブラリ</span>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#9696A0" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 10l4-4 4 4M8 14l4 4 4-4"></path></svg>
+  </button>
+
+  <div style="display: flex; flex-direction: column; gap: 1px">
+    <div style="padding: 0 10px; height: 22px; display: flex; align-items: center; font-size: 11px; font-weight: 600; color: #9696A0">ライブラリ</div>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.all.bg}}; color: {{s.all.fg}}; font: inherit; font-size: 13px; font-weight: {{s.all.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.all.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="7" width="13" height="13" rx="2"></rect><path d="M8 4h10a2 2 0 0 1 2 2v10"></path></svg></span>
+      <span style="flex: 1; min-width: 0">すべて</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">12,480</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.recent.bg}}; color: {{s.recent.fg}}; font: inherit; font-size: 13px; font-weight: {{s.recent.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.recent.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="M12 8v4l3 2"></path></svg></span>
+      <span style="flex: 1; min-width: 0">最近の取り込み</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">128</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.unsorted.bg}}; color: {{s.unsorted.fg}}; font: inherit; font-size: 13px; font-weight: {{s.unsorted.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.unsorted.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" stroke-dasharray="3 2.5"></path></svg></span>
+      <span style="flex: 1; min-width: 0">未分類</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">341</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.untagged.bg}}; color: {{s.untagged.fg}}; font: inherit; font-size: 13px; font-weight: {{s.untagged.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.untagged.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12V4h8l10 10-8 8z"></path><path d="M4 20L20 4"></path></svg></span>
+      <span style="flex: 1; min-width: 0">タグなし</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">1,022</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.random.bg}}; color: {{s.random.fg}}; font: inherit; font-size: 13px; font-weight: {{s.random.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.random.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3.5"></rect><circle cx="9" cy="9" r="1.2" fill="currentColor"></circle><circle cx="15" cy="15" r="1.2" fill="currentColor"></circle><circle cx="15" cy="9" r="1.2" fill="currentColor"></circle><circle cx="9" cy="15" r="1.2" fill="currentColor"></circle></svg></span>
+      <span style="flex: 1; min-width: 0">ランダム</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.trash.bg}}; color: {{s.trash.fg}}; font: inherit; font-size: 13px; font-weight: {{s.trash.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.trash.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 7h14M10 7V5h4v2M7 7l1 13h8l1-13"></path></svg></span>
+      <span style="flex: 1; min-width: 0">ゴミ箱</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">17</span>
+    </button>
+  </div>
+
+  <div style="display: flex; flex-direction: column; gap: 1px">
+    <div style="display: flex; align-items: center; justify-content: space-between; padding: 0 4px 0 10px; height: 22px">
+      <span style="font-size: 11px; font-weight: 600; color: #9696A0">スマートフォルダ</span>
+      <button type="button" aria-label="スマートフォルダを追加" style="display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 0; border-radius: 6px; background: transparent; color: #9696A0; cursor: pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button>
+    </div>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.smart1.bg}}; color: {{s.smart1.fg}}; font: inherit; font-size: 13px; font-weight: {{s.smart1.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.smart1.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l1.9 4.6 4.6 1.9-4.6 1.9L12 16.5l-1.9-4.6L5.5 10l4.6-1.9z"></path><path d="M18 15.5l.8 1.7 1.7.8-1.7.8-.8 1.7-.8-1.7-1.7-.8 1.7-.8z"></path></svg></span>
+      <span style="flex: 1; min-width: 0">未再生の動画</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">86</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.smart2.bg}}; color: {{s.smart2.fg}}; font: inherit; font-size: 13px; font-weight: {{s.smart2.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.smart2.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l1.9 4.6 4.6 1.9-4.6 1.9L12 16.5l-1.9-4.6L5.5 10l4.6-1.9z"></path><path d="M18 15.5l.8 1.7 1.7.8-1.7.8-.8 1.7-.8-1.7-1.7-.8 1.7-.8z"></path></svg></span>
+      <span style="flex: 1; min-width: 0">夜景の背景資料</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">54</span>
+    </button>
+  </div>
+
+  <div style="display: flex; flex-direction: column; gap: 1px">
+    <div style="display: flex; align-items: center; justify-content: space-between; padding: 0 4px 0 10px; height: 22px">
+      <span style="font-size: 11px; font-weight: 600; color: #9696A0">フォルダ</span>
+      <button type="button" aria-label="フォルダを追加" style="display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 0; border-radius: 6px; background: transparent; color: #9696A0; cursor: pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button>
+    </div>
+    <button type="button" style="display: flex; align-items: center; gap: 6px; width: 100%; height: 32px; padding: 0 10px 0 4px; border: 0; border-radius: 8px; background: {{s.photos.bg}}; color: {{s.photos.fg}}; font: inherit; font-size: 13px; font-weight: {{s.photos.w}}; text-align: left; cursor: pointer">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#9696A0" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="rgba(111,177,255,0.18)" stroke="#6FB1FF" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
+      <span style="flex: 1; min-width: 0; margin-left: 4px">写真</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">4,210</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px 0 40px; border: 0; border-radius: 8px; background: {{s.trip.bg}}; color: {{s.trip.fg}}; font: inherit; font-size: 13px; font-weight: {{s.trip.w}}; text-align: left; cursor: pointer">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6FB1FF" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
+      <span style="flex: 1; min-width: 0">2026 旅行</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">128</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px 0 40px; border: 0; border-radius: 8px; background: {{s.family.bg}}; color: {{s.family.fg}}; font: inherit; font-size: 13px; font-weight: {{s.family.w}}; text-align: left; cursor: pointer">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6FB1FF" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
+      <span style="flex: 1; min-width: 0">家族</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">902</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 6px; width: 100%; height: 32px; padding: 0 10px 0 4px; border: 0; border-radius: 8px; background: {{s.illust.bg}}; color: {{s.illust.fg}}; font: inherit; font-size: 13px; font-weight: {{s.illust.w}}; text-align: left; cursor: pointer">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#9696A0" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="rgba(196,155,255,0.18)" stroke="#C49BFF" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
+      <span style="flex: 1; min-width: 0; margin-left: 4px">イラスト</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">3,876</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px 0 40px; border: 0; border-radius: 8px; background: {{s.bg.bg}}; color: {{s.bg.fg}}; font: inherit; font-size: 13px; font-weight: {{s.bg.w}}; text-align: left; cursor: pointer">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#C49BFF" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
+      <span style="flex: 1; min-width: 0">背景資料</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">611</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 6px; width: 100%; height: 32px; padding: 0 10px 0 4px; border: 0; border-radius: 8px; background: {{s.music.bg}}; color: {{s.music.fg}}; font: inherit; font-size: 13px; font-weight: {{s.music.w}}; text-align: left; cursor: pointer">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#9696A0" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="rgba(255,179,92,0.18)" stroke="#FFB35C" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
+      <span style="flex: 1; min-width: 0; margin-left: 4px">音楽</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">2,140</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 6px; width: 100%; height: 32px; padding: 0 10px 0 4px; border: 0; border-radius: 8px; background: {{s.video.bg}}; color: {{s.video.fg}}; font: inherit; font-size: 13px; font-weight: {{s.video.w}}; text-align: left; cursor: pointer">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#9696A0" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="rgba(95,212,196,0.18)" stroke="#5FD4C4" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>
+      <span style="flex: 1; min-width: 0; margin-left: 4px">動画</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">1,890</span>
+    </button>
+  </div>
+
+  <div style="display: flex; flex-direction: column; gap: 1px">
+    <div style="display: flex; align-items: center; justify-content: space-between; padding: 0 4px 0 10px; height: 22px">
+      <span style="font-size: 11px; font-weight: 600; color: #9696A0">プレイリスト</span>
+      <button type="button" aria-label="プレイリストを追加" style="display: flex; align-items: center; justify-content: center; width: 22px; height: 22px; border: 0; border-radius: 6px; background: transparent; color: #9696A0; cursor: pointer"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button>
+    </div>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.pl1.bg}}; color: {{s.pl1.fg}}; font: inherit; font-size: 13px; font-weight: {{s.pl1.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.pl1.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h11M4 11h11M4 16h6"></path><path d="M15 19v-7l5-1.5v7"></path><circle cx="13.5" cy="19" r="1.5"></circle><circle cx="18.5" cy="17.5" r="1.5"></circle></svg></span>
+      <span style="flex: 1; min-width: 0">夜の作業</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">42</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.pl2.bg}}; color: {{s.pl2.fg}}; font: inherit; font-size: 13px; font-weight: {{s.pl2.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.pl2.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 4h4v4M4 20L20 4M20 16v4h-4M15 15l5 5M4 4l5 5"></path></svg></span>
+      <span style="flex: 1; min-width: 0">シャッフル：お気に入り</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">50</span>
+    </button>
+  </div>
+
+  <div style="display: flex; flex-direction: column; gap: 1px">
+    <div style="padding: 0 10px; height: 22px; display: flex; align-items: center; font-size: 11px; font-weight: 600; color: #9696A0">取得</div>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.dl.bg}}; color: {{s.dl.fg}}; font: inherit; font-size: 13px; font-weight: {{s.dl.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.dl.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"></path></svg></span>
+      <span style="flex: 1; min-width: 0">ダウンロード</span>
+      <span style="min-width: 18px; height: 18px; padding: 0 5px; box-sizing: border-box; border-radius: 9px; background: {{accent}}; color: #1C0E07; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center">2</span>
+    </button>
+    <button type="button" style="display: flex; align-items: center; gap: 10px; width: 100%; height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: {{s.cap.bg}}; color: {{s.cap.fg}}; font: inherit; font-size: 13px; font-weight: {{s.cap.w}}; text-align: left; cursor: pointer">
+      <span style="display: flex; color: {{s.cap.ic}}"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"></path><circle cx="12" cy="13" r="3.5"></circle></svg></span>
+      <span style="flex: 1; min-width: 0">キャプチャ</span>
+      <span style="font-size: 12px; color: #9696A0; font-variant-numeric: tabular-nums">215</span>
+    </button>
+  </div>
+
+  <div style="margin-top: auto; display: flex; align-items: center; gap: 8px; padding: 10px 10px 0; border-top: 1px solid rgba(255, 255, 255, 0.07)">
+    <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px">
+      <div style="display: flex; justify-content: space-between; font-size: 11px; color: #9696A0"><span>ライブラリ容量</span><span style="font-variant-numeric: tabular-nums">1.2 TB</span></div>
+      <div style="height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.08); overflow: hidden"><div style="width: 46%; height: 100%; border-radius: 2px; background: #B4B4BC"></div></div>
+    </div>
+    <button type="button" aria-label="設定" style="display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; border: 0; border-radius: 8px; background: transparent; color: #B4B4BC; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"></path></svg></button>
+  </div>
+</nav>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#FF7A45","options":["#FF7A45","#5AA9FF","#B48CFF","#F2C14E"]},"active":{"editor":"enum","default":"all","options":["all","recent","unsorted","untagged","random","trash","smart1","smart2","photos","trip","family","illust","bg","music","video","pl1","pl2","dl","cap"]},"$preview":{"width":264,"height":960}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const acc = this.props.accent ?? '#FF7A45';
+    const active = this.props.active ?? 'all';
+    const keys = ['all','recent','unsorted','untagged','random','trash','smart1','smart2','photos','trip','family','illust','bg','music','video','pl1','pl2','dl','cap'];
+    const s = {};
+    keys.forEach((k) => {
+      s[k] = k === active
+        ? { bg: 'rgba(255,255,255,0.11)', fg: '#FFFFFF', ic: acc, w: '600' }
+        : { bg: 'transparent', fg: '#D9D9DE', ic: '#A3A3AC', w: '400' };
+    });
+    return { s, accent: acc };
+  }
+}
+</script>
+</body>
+</html>
