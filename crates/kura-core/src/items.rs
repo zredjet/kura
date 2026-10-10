@@ -7,13 +7,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::library::hex;
-use crate::random;
-use crate::text::nfc;
+use crate::query::{DbResolver, Expr, QueryContext, compile};
+use crate::text::{natural_cmp, nfc};
 use crate::unit::{self, LIST_FLAG, SetIndex};
-use crate::{CoreError, Result};
+use crate::{CoreError, Result, folders, random, smart};
 
 pub use crate::tags::TagRef;
 pub use crate::unit::UnitRef;
@@ -31,15 +32,40 @@ pub fn recent_since(now: i64) -> i64 {
     now - RECENT_DAYS * DAY_MS
 }
 
-/// 並び順。
+/// 並べる基準。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ItemSort {
-    /// 追加日の新しい順（既定）。
+pub enum SortKey {
+    /// 追加日（日付の見出しあり）。
     #[default]
-    ImportedDesc,
+    Imported,
+    /// 撮影日（日付の見出しあり。不明は最後）。
+    Captured,
+    /// 名前の自然順。
+    Name,
+    Rating,
+    /// 長さ（不明は最後）。
+    Duration,
+    Size,
 }
 
-/// 一覧の種類（サイドバーの項目。検索言語は M4）。
+/// 並び順。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemSort {
+    pub key: SortKey,
+    /// 大きい・新しい順か。
+    pub desc: bool,
+}
+
+impl Default for ItemSort {
+    fn default() -> Self {
+        Self {
+            key: SortKey::Imported,
+            desc: true,
+        }
+    }
+}
+
+/// 一覧の種類（サイドバーの項目）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ItemView {
     /// すべて（ゴミ箱以外）。
@@ -59,6 +85,8 @@ pub enum ItemView {
     Folder { id: i64 },
     /// ユニットのメンバー（ユニットの並び順。見出しなし）。
     Unit { id: i64 },
+    /// スマートフォルダ（保存した検索）。
+    Smart { id: i64 },
 }
 
 /// 一覧の条件。
@@ -67,6 +95,10 @@ pub struct ItemQuery {
     pub view: ItemView,
     /// set ユニットを 1 件にまとめる（「ユニットをまとめて表示」）。ゴミ箱とユニットの中では使わない。
     pub collapse_units: bool,
+    /// 検索の条件（docs/search-query.md）。一覧の種類の条件に AND で重ねる。
+    pub filter: Option<Expr>,
+    /// 並び順（ゴミ箱・ランダム・ユニットの中では使わない）。
+    pub sort: ItemSort,
 }
 
 /// 日付の見出しのグループ（`start` 番目から始まる、`day` 日のアイテム）。
@@ -122,117 +154,201 @@ pub fn aspect_code(width: Option<i64>, height: Option<i64>) -> u16 {
     }
 }
 
-/// 一覧の 1 行（日付の見出しに使う時刻付き）。
+/// 一覧の 1 行（日付の見出しに使う時刻付き。時刻が不明なら None）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ListRow {
     id: u32,
     aspect: u16,
-    at: i64,
+    at: Option<i64>,
 }
 
-const LIST_COLUMNS: &str = "id, width, height, imported_at";
+/// 撮影日で並べたときの、撮影日のないもののグループの日（フロントは「撮影日なし」と出す）。
+pub const NO_DATE_DAY: i32 = i32::MIN;
 
-/// 条件に合う ID・縦横比・日付のグループを並び順で返す。`utc_offset_minutes` は日付の区切りに使う時差。
-pub fn query_ids(
-    conn: &Connection,
-    query: &ItemQuery,
-    sort: ItemSort,
-    utc_offset_minutes: i32,
-) -> Result<IdList> {
-    let ItemSort::ImportedDesc = sort;
-    // 一覧は全件を並び順で読む（意図した全件の走査。idx_items_imported の順に読む）
+/// 一覧の種類の条件（`items i` に対する WHERE）。
+struct Scope {
+    sql: String,
+    params: Vec<Value>,
+}
+
+fn scope(conn: &Connection, view: ItemView, ctx: &QueryContext) -> Result<Scope> {
+    let alive = "i.trashed_at IS NULL".to_string();
+    Ok(match view {
+        ItemView::All | ItemView::Random { .. } | ItemView::Unit { .. } => Scope {
+            sql: alive,
+            params: Vec::new(),
+        },
+        ItemView::Recent { since } => Scope {
+            sql: format!("{alive} AND i.imported_at >= ?"),
+            params: vec![Value::Integer(since)],
+        },
+        ItemView::Unsorted => Scope {
+            sql: format!(
+                "{alive} AND NOT EXISTS (SELECT 1 FROM item_folders m WHERE m.item_id = i.id)"
+            ),
+            params: Vec::new(),
+        },
+        ItemView::Untagged => Scope {
+            sql: format!(
+                "{alive} AND NOT EXISTS (SELECT 1 FROM item_tags m WHERE m.item_id = i.id)"
+            ),
+            params: Vec::new(),
+        },
+        ItemView::Trash => Scope {
+            sql: "i.trashed_at IS NOT NULL".to_string(),
+            params: Vec::new(),
+        },
+        ItemView::Folder { id } => {
+            let ids = folders::descendants(conn, id)?;
+            if ids.is_empty() {
+                return Err(CoreError::NotFound(format!("フォルダ {id}")));
+            }
+            let marks = vec!["?"; ids.len()].join(", ");
+            Scope {
+                sql: format!(
+                    "{alive} AND i.id IN (SELECT m.item_id FROM item_folders m WHERE m.folder_id IN ({marks}))"
+                ),
+                params: ids.into_iter().map(Value::Integer).collect(),
+            }
+        }
+        ItemView::Smart { id } => {
+            let folder = smart::get(conn, id)?;
+            let cond = compile(&smart::expr_of(&folder)?, &DbResolver { conn }, ctx)?;
+            Scope {
+                sql: format!("{alive} AND ({})", cond.sql),
+                params: cond.params,
+            }
+        }
+    })
+}
+
+/// 一覧の種類と検索の条件を合わせた WHERE。
+fn where_clause(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> Result<Scope> {
+    let mut scope = scope(conn, query.view, ctx)?;
+    if let Some(filter) = &query.filter {
+        let cond = compile(filter, &DbResolver { conn }, ctx)?;
+        scope.sql = format!("{} AND ({})", scope.sql, cond.sql);
+        scope.params.extend(cond.params);
+    }
+    Ok(scope)
+}
+
+/// 条件に合う ID・縦横比・日付のグループを並び順で返す。日付の見出しは `ctx` の時差で区切る。
+pub fn query_ids(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> Result<IdList> {
+    let scope = where_clause(conn, query, ctx)?;
     let (mut rows, grouped) = match query.view {
-        ItemView::All => (
-            read_rows(
-                conn,
-                &format!(
-                    "SELECT {LIST_COLUMNS} FROM items WHERE trashed_at IS NULL ORDER BY imported_at DESC, id DESC"
-                ),
-                [],
-            )?,
-            true,
-        ),
-        ItemView::Recent { since } => (
-            read_rows(
-                conn,
-                &format!(
-                    "SELECT {LIST_COLUMNS} FROM items WHERE trashed_at IS NULL AND imported_at >= ?1 ORDER BY imported_at DESC, id DESC"
-                ),
-                [since],
-            )?,
-            true,
-        ),
-        ItemView::Unsorted => (
-            read_rows(
-                conn,
-                &format!(
-                    "SELECT {LIST_COLUMNS} FROM items WHERE trashed_at IS NULL
-                     AND NOT EXISTS (SELECT 1 FROM item_folders m WHERE m.item_id = items.id)
-                     ORDER BY imported_at DESC, id DESC"
-                ),
-                [],
-            )?,
-            true,
-        ),
-        ItemView::Untagged => (
-            read_rows(
-                conn,
-                &format!(
-                    "SELECT {LIST_COLUMNS} FROM items WHERE trashed_at IS NULL
-                     AND NOT EXISTS (SELECT 1 FROM item_tags m WHERE m.item_id = items.id)
-                     ORDER BY imported_at DESC, id DESC"
-                ),
-                [],
-            )?,
-            true,
-        ),
+        ItemView::Unit { id } => {
+            let members = unit::members(conn, id)?;
+            let matching: HashSet<i64> = if query.filter.is_some() {
+                matching_ids(conn, &scope)?
+            } else {
+                members.iter().copied().collect()
+            };
+            let kept: Vec<i64> = members
+                .into_iter()
+                .filter(|m| matching.contains(m))
+                .collect();
+            (unit_rows(conn, &kept)?, false)
+        }
         ItemView::Random { seed } => {
-            let mut rows = read_rows(
-                conn,
-                &format!("SELECT {LIST_COLUMNS} FROM items WHERE trashed_at IS NULL ORDER BY id"),
-                [],
-            )?;
+            let mut rows = read_rows(conn, &scope, "i.imported_at", "i.id")?;
             random::shuffle(&mut rows, &mut random::rng(seed));
             (rows, false)
         }
         ItemView::Trash => (
-            read_rows(
-                conn,
-                "SELECT id, width, height, trashed_at FROM items WHERE trashed_at IS NOT NULL ORDER BY trashed_at DESC, id DESC",
-                [],
-            )?,
+            read_rows(conn, &scope, "i.trashed_at", "i.trashed_at DESC, i.id DESC")?,
             true,
         ),
-        ItemView::Folder { id } => {
-            if !conn
-                .prepare_cached("SELECT 1 FROM folders WHERE id = ?1")?
-                .exists([id])?
-            {
-                return Err(CoreError::NotFound(format!("フォルダ {id}")));
-            }
-            (
-                read_rows(
-                    conn,
-                    &format!(
-                        "WITH RECURSIVE sub(id) AS (
-                           SELECT ?1 UNION SELECT f.id FROM folders f JOIN sub ON f.parent_id = sub.id
-                         )
-                         SELECT {LIST_COLUMNS} FROM items WHERE trashed_at IS NULL
-                         AND id IN (SELECT m.item_id FROM item_folders m WHERE m.folder_id IN sub)
-                         ORDER BY imported_at DESC, id DESC"
-                    ),
-                    [id],
-                )?,
-                true,
-            )
-        }
-        ItemView::Unit { id } => (unit_rows(conn, &unit::members(conn, id)?)?, false),
+        _ => sorted_rows(conn, &scope, query.sort)?,
     };
     let collapsible = !matches!(query.view, ItemView::Trash | ItemView::Unit { .. });
     if query.collapse_units && collapsible {
         rows = collapse(rows, &unit::set_index(conn)?);
     }
-    Ok(build_list(&rows, grouped, utc_offset_minutes))
+    Ok(build_list(&rows, grouped, ctx.utc_offset_minutes))
+}
+
+fn matching_ids(conn: &Connection, scope: &Scope) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare(&format!("SELECT i.id FROM items i WHERE {}", scope.sql))?;
+    let rows = stmt.query_map(params_from_iter(scope.params.iter()), |r| r.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// 並び順で読む。見出しを付けるか（追加日・撮影日のときだけ）も返す。
+fn sorted_rows(conn: &Connection, scope: &Scope, sort: ItemSort) -> Result<(Vec<ListRow>, bool)> {
+    let dir = if sort.desc { "DESC" } else { "ASC" };
+    Ok(match sort.key {
+        // 一覧は全件を並び順で読む（意図した全件の走査。追加日なら idx_items_imported の順に読む）
+        SortKey::Imported => (
+            read_rows(
+                conn,
+                scope,
+                "i.imported_at",
+                &format!("i.imported_at {dir}, i.id {dir}"),
+            )?,
+            true,
+        ),
+        SortKey::Captured => (
+            read_rows(
+                conn,
+                scope,
+                "i.captured_at",
+                &format!("i.captured_at IS NULL, i.captured_at {dir}, i.id {dir}"),
+            )?,
+            true,
+        ),
+        SortKey::Rating => (
+            read_rows(
+                conn,
+                scope,
+                "NULL",
+                &format!("i.rating {dir}, i.imported_at DESC, i.id DESC"),
+            )?,
+            false,
+        ),
+        SortKey::Duration => (
+            read_rows(
+                conn,
+                scope,
+                "NULL",
+                &format!("i.duration_ms IS NULL, i.duration_ms {dir}, i.id {dir}"),
+            )?,
+            false,
+        ),
+        SortKey::Size => (
+            read_rows(
+                conn,
+                scope,
+                "NULL",
+                &format!("i.size_bytes {dir}, i.id {dir}"),
+            )?,
+            false,
+        ),
+        SortKey::Name => {
+            // 自然順（「2」<「10」）は SQL ではできないので読んでから並べる
+            let mut stmt = conn.prepare(&format!(
+                "SELECT i.id, i.width, i.height, i.title FROM items i WHERE {}",
+                scope.sql
+            ))?;
+            let mut rows = stmt.query(params_from_iter(scope.params.iter()))?;
+            let mut named: Vec<(String, ListRow)> = Vec::new();
+            while let Some(row) = rows.next()? {
+                named.push((
+                    row.get(3)?,
+                    ListRow {
+                        id: to_u32(row.get(0)?)?,
+                        aspect: aspect_code(row.get(1)?, row.get(2)?),
+                        at: None,
+                    },
+                ));
+            }
+            named.sort_by(|(a, ra), (b, rb)| natural_cmp(a, b).then_with(|| ra.id.cmp(&rb.id)));
+            if sort.desc {
+                named.reverse();
+            }
+            (named.into_iter().map(|(_, r)| r).collect(), false)
+        }
+    })
 }
 
 fn to_u32(id: i64) -> Result<u32> {
@@ -242,9 +358,13 @@ fn to_u32(id: i64) -> Result<u32> {
         .ok_or_else(|| CoreError::Invalid(format!("ID が大きすぎます: {id}")))
 }
 
-fn read_rows<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Result<Vec<ListRow>> {
-    let mut stmt = conn.prepare_cached(sql)?;
-    let mut rows = stmt.query(params)?;
+/// WHERE と並び順で読む。`at` は見出しに使う時刻の列（なければ `NULL`）。
+fn read_rows(conn: &Connection, scope: &Scope, at: &str, order: &str) -> Result<Vec<ListRow>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT i.id, i.width, i.height, {at} FROM items i WHERE {} ORDER BY {order}",
+        scope.sql
+    ))?;
+    let mut rows = stmt.query(params_from_iter(scope.params.iter()))?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         out.push(ListRow {
@@ -258,7 +378,7 @@ fn read_rows<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Re
 
 fn unit_rows(conn: &Connection, members: &[i64]) -> Result<Vec<ListRow>> {
     let mut stmt =
-        conn.prepare_cached(&format!("SELECT {LIST_COLUMNS} FROM items WHERE id = ?1"))?;
+        conn.prepare_cached("SELECT id, width, height, imported_at FROM items WHERE id = ?1")?;
     let mut out = Vec::with_capacity(members.len());
     for id in members {
         let row = stmt
@@ -270,11 +390,66 @@ fn unit_rows(conn: &Connection, members: &[i64]) -> Result<Vec<ListRow>> {
             out.push(ListRow {
                 id: to_u32(id)?,
                 aspect: aspect_code(w, h),
-                at,
+                at: Some(at),
             });
         }
     }
     Ok(out)
+}
+
+/// 種類ごとの件数（⌘K パレットの「一致 186 項目 — 画像 142 · 動画 44」）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KindCounts {
+    pub image: i64,
+    pub video: i64,
+    pub audio: i64,
+}
+
+impl KindCounts {
+    /// 合計。
+    pub fn total(&self) -> i64 {
+        self.image + self.video + self.audio
+    }
+}
+
+/// 一覧と同じ条件で、種類ごとに数える。
+pub fn count_kinds(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> Result<KindCounts> {
+    let scope = where_clause(conn, query, ctx)?;
+    let mut counts = KindCounts::default();
+    let mut add = |kind: &str, n: i64| match kind {
+        "image" => counts.image += n,
+        "video" => counts.video += n,
+        _ => counts.audio += n,
+    };
+    if let ItemView::Unit { id } = query.view {
+        let members: HashSet<i64> = unit::members(conn, id)?.into_iter().collect();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT i.id, i.kind FROM items i WHERE {}",
+            scope.sql
+        ))?;
+        let rows = stmt.query_map(params_from_iter(scope.params.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, kind) = row?;
+            if members.contains(&id) {
+                add(&kind, 1);
+            }
+        }
+        return Ok(counts);
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT i.kind, count(*) FROM items i WHERE {} GROUP BY i.kind",
+        scope.sql
+    ))?;
+    let rows = stmt.query_map(params_from_iter(scope.params.iter()), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (kind, n) = row?;
+        add(&kind, n);
+    }
+    Ok(counts)
 }
 
 /// set ユニットに入っているアイテムを、最初に現れた位置の 1 件のユニット（`LIST_FLAG | unit_id`）にまとめる。
@@ -314,7 +489,9 @@ fn build_list(rows: &[ListRow], grouped: bool, utc_offset_minutes: i32) -> IdLis
     let mut current_day: Option<i32> = None;
     for row in rows {
         if grouped {
-            let day = i32::try_from((row.at + offset_ms).div_euclid(DAY_MS)).unwrap_or(0);
+            let day = row.at.map_or(NO_DATE_DAY, |at| {
+                i32::try_from((at + offset_ms).div_euclid(DAY_MS)).unwrap_or(0)
+            });
             if current_day != Some(day) {
                 list.groups.push(DayGroup {
                     start: list.ids.len() as u32,
@@ -748,6 +925,13 @@ mod tests {
     use super::*;
     use crate::db::{query_plan, test_conn};
 
+    fn ctx(utc_offset_minutes: i32) -> QueryContext {
+        QueryContext {
+            now_ms: 0,
+            utc_offset_minutes,
+        }
+    }
+
     fn insert(conn: &Connection, id: i64, w: Option<i64>, h: Option<i64>, at: i64) {
         conn.execute(
             "INSERT INTO items (id, hash, ext, kind, size_bytes, width, height, title, original_name, imported_at, updated_at)
@@ -777,7 +961,7 @@ mod tests {
         conn.execute("UPDATE items SET trashed_at = 1 WHERE id = 4", [])
             .unwrap();
 
-        let list = query_ids(&conn, &ItemQuery::default(), ItemSort::ImportedDesc, 0).unwrap();
+        let list = query_ids(&conn, &ItemQuery::default(), &ctx(0)).unwrap();
         assert_eq!(list.ids, vec![3, 2, 1]);
         assert_eq!(list.aspects, vec![1000, 1000, 1500]);
         assert_eq!(
@@ -786,7 +970,7 @@ mod tests {
         );
 
         // 時差 -1 時間なら、どれも 1 日ずつ前の日になる（3 は 1 日目、1・2 は 0 日目）
-        let shifted = query_ids(&conn, &ItemQuery::default(), ItemSort::ImportedDesc, -60).unwrap();
+        let shifted = query_ids(&conn, &ItemQuery::default(), &ctx(-60)).unwrap();
         assert_eq!(
             shifted.groups,
             vec![DayGroup { start: 0, day: 1 }, DayGroup { start: 1, day: 0 }]
@@ -798,8 +982,7 @@ mod tests {
                 view: ItemView::Trash,
                 ..ItemQuery::default()
             },
-            ItemSort::ImportedDesc,
-            0,
+            &ctx(0),
         )
         .unwrap();
         assert_eq!(trash.ids, vec![4]);
@@ -870,8 +1053,8 @@ mod tests {
         let conn = test_conn();
         let plan = query_plan(
             &conn,
-            "SELECT id, width, height, imported_at FROM items
-             WHERE trashed_at IS NULL ORDER BY imported_at DESC, id DESC",
+            "SELECT i.id, i.width, i.height, i.imported_at FROM items i
+             WHERE i.trashed_at IS NULL ORDER BY i.imported_at DESC, i.id DESC",
         );
         assert!(plan.contains("idx_items_imported"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
@@ -883,9 +1066,9 @@ mod tests {
             &ItemQuery {
                 view,
                 collapse_units: collapse,
+                ..ItemQuery::default()
             },
-            ItemSort::ImportedDesc,
-            0,
+            &ctx(0),
         )
         .unwrap()
         .ids
@@ -925,8 +1108,7 @@ mod tests {
                     view: ItemView::Folder { id: 99 },
                     ..ItemQuery::default()
                 },
-                ItemSort::ImportedDesc,
-                0
+                &ctx(0)
             )
             .is_err()
         );
@@ -946,8 +1128,7 @@ mod tests {
                     view: ItemView::Random { seed },
                     ..ItemQuery::default()
                 },
-                ItemSort::ImportedDesc,
-                0,
+                &ctx(0),
             )
             .unwrap()
         };
@@ -969,9 +1150,9 @@ mod tests {
             &ItemQuery {
                 view: ItemView::Unit { id: unit },
                 collapse_units: true,
+                ..ItemQuery::default()
             },
-            ItemSort::ImportedDesc,
-            0,
+            &ctx(0),
         )
         .unwrap();
         assert_eq!(list.ids, vec![4, 1, 6]);
@@ -1005,9 +1186,9 @@ mod tests {
             &ItemQuery {
                 view: ItemView::All,
                 collapse_units: true,
+                ..ItemQuery::default()
             },
-            ItemSort::ImportedDesc,
-            0,
+            &ctx(0),
         )
         .unwrap();
         assert_eq!(list.groups.len(), 5); // 6・5・3・2（a）・1（b）の日
@@ -1128,9 +1309,9 @@ mod tests {
     fn filtered_views_use_indexes() {
         let conn = test_conn();
         for sql in [
-            "SELECT id FROM items WHERE trashed_at IS NULL AND NOT EXISTS (SELECT 1 FROM item_folders m WHERE m.item_id = items.id) ORDER BY imported_at DESC, id DESC",
-            "SELECT id FROM items WHERE trashed_at IS NULL AND NOT EXISTS (SELECT 1 FROM item_tags m WHERE m.item_id = items.id) ORDER BY imported_at DESC, id DESC",
-            "SELECT id FROM items WHERE trashed_at IS NULL AND imported_at >= 0 ORDER BY imported_at DESC, id DESC",
+            "SELECT i.id FROM items i WHERE i.trashed_at IS NULL AND NOT EXISTS (SELECT 1 FROM item_folders m WHERE m.item_id = i.id) ORDER BY i.imported_at DESC, i.id DESC",
+            "SELECT i.id FROM items i WHERE i.trashed_at IS NULL AND NOT EXISTS (SELECT 1 FROM item_tags m WHERE m.item_id = i.id) ORDER BY i.imported_at DESC, i.id DESC",
+            "SELECT i.id FROM items i WHERE i.trashed_at IS NULL AND i.imported_at >= 0 ORDER BY i.imported_at DESC, i.id DESC",
         ] {
             let plan = query_plan(&conn, sql);
             assert!(plan.contains("idx_items_imported"), "{plan}");
@@ -1172,5 +1353,182 @@ mod tests {
         assert_eq!((mixed.rating, mixed.note), (None, None));
         let none = selection_info(&conn, &[3, 4]).unwrap();
         assert_eq!((none.rating, none.note), (Some(0), Some(None)));
+    }
+
+    fn search(conn: &Connection, view: ItemView, filter: &str, sort: ItemSort) -> Vec<u32> {
+        let filter = crate::query::parse(filter).unwrap().expr;
+        query_ids(
+            conn,
+            &ItemQuery {
+                view,
+                filter: Some(filter),
+                sort,
+                ..ItemQuery::default()
+            },
+            &ctx(0),
+        )
+        .unwrap()
+        .ids
+    }
+
+    #[test]
+    fn filters_within_the_current_view() {
+        let conn = library();
+        conn.execute_batch(
+            "UPDATE items SET kind = 'video', duration_ms = 1000 WHERE id IN (2, 5);
+             UPDATE items SET rating = 4 WHERE id IN (1, 5, 6);",
+        )
+        .unwrap();
+        let sort = ItemSort::default();
+        assert_eq!(search(&conn, ItemView::All, "評価>=4", sort), vec![6, 5, 1]);
+        // フォルダの中で絞る（写真 = 1, 2, 3）
+        assert_eq!(
+            search(&conn, ItemView::Folder { id: 1 }, "種類:動画", sort),
+            vec![2]
+        );
+        assert_eq!(
+            search(&conn, ItemView::Unsorted, "評価>=4", sort),
+            vec![6, 5]
+        );
+        // ユニットの中で絞っても、ユニットの並び順のまま
+        let unit = crate::unit::create_set(&conn, "u", &[5, 1, 2], 0).unwrap();
+        assert_eq!(
+            search(&conn, ItemView::Unit { id: unit }, "評価>=4", sort),
+            vec![5, 1]
+        );
+        // 夕景は 1 にだけ付いている
+        assert_eq!(
+            search(&conn, ItemView::All, "-夕景 種類:画像", sort),
+            vec![6, 4, 3]
+        );
+    }
+
+    #[test]
+    fn smart_folders_are_views() {
+        let conn = library();
+        conn.execute("UPDATE items SET rating = 5 WHERE id IN (2, 4)", [])
+            .unwrap();
+        let id = crate::smart::save(&conn, "高評価", "評価>=5", 0).unwrap();
+        assert_eq!(ids(&conn, ItemView::Smart { id }, false), vec![4, 2]);
+        // スマートフォルダの条件と検索の条件は AND
+        assert_eq!(
+            search(
+                &conn,
+                ItemView::Smart { id },
+                "フォルダ:写真",
+                ItemSort::default()
+            ),
+            vec![2]
+        );
+        assert!(matches!(
+            query_ids(
+                &conn,
+                &ItemQuery {
+                    view: ItemView::Smart { id: 99 },
+                    ..ItemQuery::default()
+                },
+                &ctx(0)
+            ),
+            Err(CoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn sorts_by_each_key() {
+        let conn = library();
+        conn.execute_batch(
+            "UPDATE items SET title = 'p' || ((7 - id) * 5) WHERE id <= 6;
+             UPDATE items SET rating = id % 3, size_bytes = id * 10;
+             UPDATE items SET duration_ms = 100 * id WHERE id IN (2, 4);
+             UPDATE items SET captured_at = imported_at WHERE id IN (1, 3);",
+        )
+        .unwrap();
+        let sort = |key, desc| ItemSort { key, desc };
+        // 名前：p5 < p10 < p15 …（自然順）。id 6 = p5、id 1 = p30
+        assert_eq!(
+            search(&conn, ItemView::All, "", sort(SortKey::Name, false)),
+            vec![6, 5, 4, 3, 2, 1]
+        );
+        assert_eq!(
+            search(&conn, ItemView::All, "", sort(SortKey::Name, true)),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            search(&conn, ItemView::All, "", sort(SortKey::Size, true)),
+            vec![6, 5, 4, 3, 2, 1]
+        );
+        // 評価が同じなら追加日の新しい順
+        assert_eq!(
+            search(&conn, ItemView::All, "", sort(SortKey::Rating, true)),
+            vec![5, 2, 4, 1, 6, 3]
+        );
+        // 長さ・撮影日が不明なものは後ろ
+        assert_eq!(
+            search(&conn, ItemView::All, "", sort(SortKey::Duration, true))[..2],
+            [4, 2]
+        );
+        assert_eq!(
+            search(&conn, ItemView::All, "", sort(SortKey::Imported, false)),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        let list = query_ids(
+            &conn,
+            &ItemQuery {
+                sort: sort(SortKey::Captured, true),
+                ..ItemQuery::default()
+            },
+            &ctx(0),
+        )
+        .unwrap();
+        assert_eq!(list.ids[..2], [3, 1]);
+        assert_eq!(
+            list.groups.last().map(|g| (g.start, g.day)),
+            Some((2, NO_DATE_DAY))
+        );
+        // 名前・評価などの並びには見出しがない
+        let named = query_ids(
+            &conn,
+            &ItemQuery {
+                sort: sort(SortKey::Name, false),
+                ..ItemQuery::default()
+            },
+            &ctx(0),
+        )
+        .unwrap();
+        assert!(named.groups.is_empty());
+    }
+
+    #[test]
+    fn counts_matches_by_kind() {
+        let conn = library();
+        conn.execute("UPDATE items SET kind = 'video' WHERE id IN (2, 3)", [])
+            .unwrap();
+        conn.execute("UPDATE items SET kind = 'audio' WHERE id = 6", [])
+            .unwrap();
+        let query = |view, text: &str| ItemQuery {
+            view,
+            filter: Some(crate::query::parse(text).unwrap().expr),
+            ..ItemQuery::default()
+        };
+        let counts = count_kinds(&conn, &query(ItemView::All, ""), &ctx(0)).unwrap();
+        assert_eq!(
+            (counts.image, counts.video, counts.audio, counts.total()),
+            (3, 2, 1, 6)
+        );
+        let counts = count_kinds(
+            &conn,
+            &query(ItemView::Folder { id: 1 }, "-種類:画像"),
+            &ctx(0),
+        )
+        .unwrap();
+        assert_eq!((counts.image, counts.video, counts.audio), (0, 2, 0));
+        let unit = crate::unit::create_set(&conn, "u", &[2, 6, 1], 0).unwrap();
+        let counts = count_kinds(
+            &conn,
+            &query(ItemView::Unit { id: unit }, "-種類:動画"),
+            &ctx(0),
+        )
+        .unwrap();
+        assert_eq!((counts.image, counts.video, counts.audio), (1, 0, 1));
     }
 }

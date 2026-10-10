@@ -73,7 +73,7 @@ pub fn parse_iso8601_ms(text: &str) -> Option<i64> {
 }
 
 /// 年月日を 1970-01-01 からの日数にする（Howard Hinnant の days_from_civil）。
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400);
