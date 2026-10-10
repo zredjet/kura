@@ -47,15 +47,25 @@
 | | `library_check_location(path)` → `{ path, status, syncService }` | 置き場所の確認（`.kuralib` の補完、`new` / `existingLibrary` / `occupied`、同期フォルダの中か） |
 | 取り込み | `import_preview(paths)` | 種類別件数・合計サイズ・重複の見込み・フォルダ木を返す |
 | | `import_start(paths, options)` → `JobId` | 取り込みジョブを開始 |
-| 一覧 | `items_query_ids(utcOffsetMinutes, trashed?)` → 生バイト | 条件に合う ID と縦横比を並び順で、日付見出しのグループ付きで返す。`[件数 u32][id u32 × N][縦横比×1000 u16 × N][グループ数 u32][開始位置 u32 × G][日 i32 × G]`（LE）。縦横比が分からないもの（音楽など）は 1000。日は `utcOffsetMinutes` の時差で区切った 1970-01-01 からの日数。M2 は追加日の新しい順だけで、検索条件 `query` と並び順 `sort` は M4 で足す。tauri-specta を通さず `tauri::ipc::Response` で返す（フロントには ArrayBuffer で届く。ラッパーは `src/ipc/items.ts`。ADR-33） |
-| | （`items_query_ids` の `collapse_units` が true のとき） | set ユニットに属するアイテムを、最初に一致したメンバーの位置で 1 件のユニットにまとめる。ユニットは `0x8000_0000 | unit_id` で表し、縦横比は表紙のもの |
+| 一覧 | `items_query_ids(utcOffsetMinutes, view?, collapseUnits?)` → 生バイト | 一覧の ID と縦横比を並び順で、日付見出しのグループ付きで返す。`[件数 u32][id u32 × N][縦横比×1000 u16 × N][グループ数 u32][開始位置 u32 × G][日 i32 × G]`（LE）。縦横比が分からないもの（音楽など）は 1000。日は `utcOffsetMinutes` の時差で区切った 1970-01-01 からの日数。tauri-specta を通さず `tauri::ipc::Response` で返す（フロントには ArrayBuffer で届く。ラッパーは `src/ipc/items.ts`。ADR-33） |
+| | （`view`） | `{ kind: 'all' \| 'recent' \| 'unsorted' \| 'untagged' \| 'trash' }`、`{ kind: 'random', seed }`、`{ kind: 'folder', id }`（子孫フォルダの分も含む）、`{ kind: 'unit', id }`（ユニットの並び順）。ランダムとユニットの中は見出しなし。ゴミ箱は入れた日の新しい順、それ以外は追加日の新しい順。検索条件 `query` と並び順 `sort` は M4 で足す |
+| | （`collapseUnits` が true のとき） | set ユニットに属するアイテムを、最初に一致したメンバーの位置で 1 件のユニットにまとめる。ユニットは `0x8000_0000 \| unit_id` で表し、縦横比は表紙のもの。ゴミ箱とユニットの中ではまとめない |
 | | `items_get(ids)` → `ItemSummary[]` / `units_get(ids)` → `UnitSummary[]` | 最大 200 件。要求した順で返し、ないものは省く |
-| | `item_detail(id)` → `ItemDetail` | タグ・フォルダ・ユニット・取得元を含む |
-| 編集 | `items_update(ids, patch)` | タイトル・評価・メモ（複数選択対応） |
-| | `items_trash(ids)` / `items_restore(ids)` / `trash_empty()` | ゴミ箱 |
-| タグ | `tags_suggest(prefix, limit)` / `tags_apply(item_ids, add, remove)` / `tag_update(id, patch)` / `tag_merge(from, into)` | |
-| フォルダ | `folders_tree()` / `folder_create` / `folder_update` / `folder_move` / `folder_delete` / `items_set_folders(item_ids, add, remove)` | |
-| ユニット | `units_list(filter)` / `unit_create_set(name, item_ids)` / `unit_create_folder(name, folder_refs)` / `unit_update(id, patch)` / `unit_members(id)` / `unit_set_items(id, item_ids)` / `unit_delete(id)` | `docs/playlists.md` §2 |
+| | `item_detail(id)` → `ItemDetail` | タグ・フォルダ・ユニット（set のメンバー、または参照フォルダに入っている folder ユニット）・取得元を含む |
+| | `items_selection_info(ids)` → `SelectionInfo` | 複数選択のインスペクタ用：評価とメモ（全件が同じときだけ）、タグとフォルダ（付いている件数付き） |
+| | `library_counts()` → `{ all, recent, unsorted, untagged, trash }` | サイドバーの件数。グリッドを出したあとに別に取る（NFR-01 に響かないように） |
+| 編集 | `items_update(ids, patch)` | タイトル（1 件のときだけ）・評価・メモ（全件に同じ値）。メモの空文字は消す |
+| | `items_trash(ids)` / `items_restore(ids)` → 件数 / `trash_empty()` → `{ items, bytes, failed }` | ゴミ箱。空にするときは DB の行を先に消し、そのあと実ファイル・サムネイル・ジャケット・プロキシを消す（ADR-46） |
+| タグ | `tags_suggest(prefix, limit)` → `{ tag, count, alias }[]` | 前方一致 → 部分一致、使われている数の多い順。「名前空間:名前」なら名前空間で絞る。別名でも一致する |
+| | `tags_apply(itemIds, add: 名前[], remove: id[])` → 付けたタグの ID | 名前は「名前」か「名前空間:名前」（全角の「：」も可、NFC）。なければ作り、別名なら正式タグに置き換える |
+| | `tag_detail(id)` / `tag_update(id, patch)` / `tag_merge(from, into)` / `tag_delete(id)` | 名前空間・名前・色・別名・親タグ（`aliases`・`parents` は置き換え、循環は不可）。統合すると `from` の名前は別名として残る |
+| フォルダ | `folders_tree(withCounts?)` | すべてのフォルダ（木はフロントで組む）。件数は子孫フォルダの分を含み、同じアイテムは 1 回（ADR-40）。参照する folder ユニットの ID も返す |
+| | `folder_create(parentId, name)` / `folder_update(id, { name?, color? })` / `folder_move(id, parentId, beforeId)` / `folder_delete(id)` | 同じ親の下で名前は重複不可（`Conflict`）、「/」は不可。自分の中へは移せない。削除は中のフォルダごと（アイテムは残る。参照がなくなった folder ユニットも消す） |
+| | `items_set_folders(itemIds, add, remove)` | フォルダへの所属の付け外し |
+| ユニット | `unit_detail(id)` / `units_list(filter, kind?, limit)` | インスペクタ用の詳細、選ぶための一覧（更新の新しい順） |
+| | `unit_create_set(name, itemIds)` / `unit_create_folder(name, folders)` | set は渡した順＝manual、表紙は先頭。folder は名前順 |
+| | `unit_update(id, patch)` / `unit_tags_apply(id, add, remove)` | 名前・表紙・並び順・ユニット内シャッフル・画像の表示時間（0 で既定）・評価・メモ（空文字で消す）。folder は manual にできない |
+| | `unit_add_items(id, itemIds)` / `unit_remove_items(id, itemIds)` / `unit_reorder(id, itemIds)` / `unit_set_folders(id, folders)` / `unit_delete(id)` | set のメンバーの追加・削除・並べ替え（並べ替えると manual になる）、folder の参照フォルダの置き換え、解除（アイテムは残る）。`docs/playlists.md` §2 |
 | スマートフォルダ | `smart_folders_list` / `smart_folder_save(name, query)` / `smart_folder_delete` | |
 | 検索 | `query_parse(text)` → `QueryAst` | ⌘K の候補表示・エラー表示用 |
 | | `query_suggest(text, cursor)` → `Suggestion[]` | タグ・フィールド・保存済み検索の候補 |
@@ -73,6 +83,8 @@
 | 設定 | `settings_get(keys)` / `settings_set(map)` | |
 | 外観 | `appearance_get()` → `Appearance` | OS の表示設定（「透明度を下げる」）。起動時に `<html data-reduce-transparency>` へ反映する（§11） |
 | 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測の結果をログに書く（§13） |
+
+変更（patch）の型は、省いた項目を変えない。色・メモの空文字は「消す」の意味（`Option<Option<T>>` を JSON で表しにくいため）。
 
 コマンドの追加は `.claude/skills/add-command` の手順で行い、この表に追記します。
 
@@ -204,15 +216,21 @@ import_start:    ジョブとして実行
 - Zustand のストアを機能ごとに分ける：`libraryStore`（開いているライブラリ・検索結果の ID 列）、`viewStore`（選択・表示の設定）、`itemCache`（ID → 詳細の LRU）、`playerStore`（キュー・現在位置・再生状態）、`jobsStore`（イベントで更新）。
 - 検索結果の ID 列は `Uint32Array` で保持する。
 - ジャスティファイ配置は「行の高さ目標・コンテナ幅・各アイテムの縦横比」から行分割を計算する純粋関数（`src/features/library/layout/justify.ts`）にし、テストする。縦横比は `items_query_ids` が ID と一緒に全件分返すので、詳細を取得する前に全体の高さと行分割が決まる（音楽は 1.0、不明は 1.0 として扱う）。
-- `itemCache` は 4,000 件の LRU。見えている行の ID を 200 件ずつまとめて `items_get` する。取り込み中の一覧の取り直しは 1 秒、サムネイルのイベントでの取り直しは 0.5 秒にまとめる。
+- `itemCache` は 4,000 件の LRU（アイテムとユニットで 1 つずつ）。見えている行の ID を 200 件ずつまとめて `items_get`・`units_get` する。編集したものは捨てずに取り直す（届くまで前の内容を出す）。取り込み中の一覧の取り直しは 1 秒、サムネイルのイベントでの取り直しは 0.5 秒にまとめる。
+- 選択は「選んだ順の ID・範囲の基点・注目している ID」を持つ純粋関数（`src/features/library/selection.ts`）。選んだ順は ⌘G のユニットの並び順に使う。
+- 編集は `src/features/library/actions.ts` に集め、IPC のあとで画面のデータを読み直す：`revisionStore` を進める（インスペクタ・サイドバーが読み直す）、変わったアイテム・ユニットを取り直す、一覧はその変更で中身が変わる種類（未分類・タグなし・フォルダなど）を開いているときだけ読み直す。失敗は `noticeStore` の一行で知らせる。
+- サイドバーの件数とフォルダの木は `sidebarStore`（開いているフォルダだけ `localStorage` の `kura.sidebar`）。
+- 右クリックのメニュー（`components/Menu`）と、名前の入力・確認・候補から選ぶダイアログ（`components/Overlay` の `askText`・`askConfirm`・`askPick`）は 1 か所で描き、どこからでも開ける。
+- アプリの中のドラッグ（タイル → フォルダ、フォルダの移動、ユニットの中の並べ替え）はポインタイベントで自前に行う（`dragState.ts`）。Tauri のファイルドロップの処理が WebView の HTML5 ドラッグのイベントをすべて受け取り、JS に `dragover` / `drop` が届かないため（ADR-44）。
+- WebKit ではボタンを押してもフォーカスが移らないので、タイルとサイドバーの行は押したときにフォーカスを移す（続けて押したキーがそこに届くように）。
 - `viewStore` は選択中の ID・サムネイルの大きさ（行の高さ 110 / 140 / 180 / 230 / 300px の 5 段階）・インスペクタの開閉・クイックルックを持つ。大きさとインスペクタの開閉だけを `localStorage`（`kura.view`）に残す。
 
 ## 13. 開発用のツールと計測
 
 | コマンド・環境変数 | 用途 |
 |---|---|
-| `cargo run --release -p kura-devtools -- seed --items 100000 --out <path>` | ダミーライブラリを作る（画像 7・動画 2・音楽 1、2,000 タグ、60 フォルダ、ひな形 JPEG をクローンで配置、シード付き ChaCha8）。10 万件で約 28 秒 |
-| `kura-devtools bench query --library <path>` | 開く・`query_ids`・`items_get`（200 件）・`item_detail` の中央値 |
+| `cargo run --release -p kura-devtools -- seed --items 100000 --out <path>` | ダミーライブラリを作る（画像 7・動画 2・音楽 1、2,000 タグ、60 フォルダ、200 件ごとに 10 件の set ユニット、ひな形 JPEG をクローンで配置、シード付き ChaCha8）。10 万件で約 28 秒 |
+| `kura-devtools bench query --library <path>` | 開く・`query_ids`・`items_get`（200 件）・`item_detail`、サイドバーの一覧の種類・件数・タグの候補の中央値 |
 | `kura-devtools bench thumbs --src <dir> [--threads N]` | 画像サムネイルの生成速度（枚/秒） |
 | `kura-devtools import` / `check` | コマンドラインからの取り込みと整合性の確認（§6） |
 | `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない） |
@@ -227,3 +245,15 @@ M2 の実測（Apple Silicon・16 コア、リリースビルド、10 万件）�
 | 起動から最初の `items_get` まで | 628ms | NFR-01：1.5 秒以内 |
 | スクロール（601 フレーム） | p50 17ms・p99 18ms、20ms 超え 0 | NFR-02：60fps |
 | 画像サムネイル（4000×3000 の JPEG・HEIC） | 1 並列 27・4 並列 101・8 並列 185・16 並列 211 枚/秒 | NFR-04：50 枚/秒以上 |
+
+M3 の実測（同じ環境、10 万件・ユニット 500 個、`bench query` の中央値。2 回測った幅）：
+
+| 一覧・件数 | 結果 |
+|---|---|
+| 未分類（約 5 万件） | 21〜24ms |
+| タグなし（約 1.7 万件） | 20〜24ms |
+| フォルダ（子孫を含む、約 5 千件） | 3ms |
+| ランダム（10 万件） | 9〜12ms |
+| まとめて表示（10 万件 → 95,500 件） | 20〜30ms |
+| サイドバーの件数（ライブラリの 5 項目＋フォルダ 60 個） | 40〜64ms（グリッドのあとに別に取る） |
+| タグの候補（2,000 個から） | 6〜10ms |

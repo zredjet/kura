@@ -325,6 +325,13 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 1. `items_query_ids(query, sort)` で条件に合う ID と縦横比だけを並び順で返す（`tauri::ipc::Response` で生バイト。形式は `docs/architecture.md` §3）。縦横比は `width / height`、音楽と不明は 1.0。
 2. フロントは見えている範囲の ID だけ `items_get(ids)` で詳細を取る（最大 200 件ずつ）。
 
+### サイドバーの一覧（M3）
+
+- すべて・最近の取り込み・未分類・タグなしは `idx_items_imported` の順に読み、未分類・タグなしは `NOT EXISTS (… item_folders / item_tags …)` で絞る（それぞれ `idx_item_folders_item`・`idx_item_tags_item` を引く）。
+- フォルダは再帰 CTE で子孫フォルダを求め、`id IN (SELECT item_id FROM item_folders WHERE folder_id IN …)` で絞る。
+- 「ユニットをまとめて表示」は、ゴミ箱以外の set ユニットの所属（`unit_items`）を一度読んで、Rust で最初に現れた位置にまとめる。
+- フォルダの件数は `item_folders` を `item_id` 順に一度読み、祖先へ数え上げる（同じアイテムは 1 回）。
+
 ### 全文検索
 
 - 3 文字以上：`items_fts MATCH ?`。

@@ -50,6 +50,7 @@
 
 - **set**：`unit_items` に登録されたアイテムを `order_mode` で並べる。`manual` のときは `unit_items.pos` の昇順。
 - **folder**：`unit_folders` に登録された各フォルダについて、`recursive = true` なら子孫フォルダも含めてメンバーを集め、和集合を取って重複を除き、`order_mode` で並べる。複数フォルダのときは、`unit_folders.pos` の順にフォルダごとに並べてからつなげる。
+- 並び順はいずれも昇順：`name` は名前（タイトル）の自然順、`imported` / `captured` は古い順、`duration` は短い順。不明は後ろ、同じなら ID の順。folder ユニットは `manual` を選べない（ADR-45）。
 - ゴミ箱に入ったアイテムは常にメンバーから除く。
 - 1 つのアイテムが複数の set ユニットに属してもよい。
 - ユニットの中にユニットは入れられない（v1 ではネストなし。階層は folder ユニットの `recursive` で表す）。
