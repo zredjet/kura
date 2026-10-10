@@ -1,0 +1,46 @@
+/* design.md §4：主ボタンは --accent の地、副ボタンは --fill-2 の地に --stroke-3 の縁 */
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1-5);
+  height: var(--h-button);
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-md);
+  white-space: nowrap;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    opacity var(--dur-fast) var(--ease-out);
+}
+
+.button:disabled {
+  opacity: 0.45;
+}
+
+.primary {
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: var(--weight-semibold);
+}
+
+.primary:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent) 88%, var(--text-on-media));
+}
+
+.secondary {
+  background: var(--fill-2);
+  border: 1px solid var(--stroke-3);
+  color: var(--text-primary);
+}
+
+.secondary:not(:disabled):hover {
+  background: var(--fill-3);
+}
+
+.small {
+  height: 30px;
+  padding: 0 var(--space-2-5);
+  border-radius: var(--radius-md);
+}

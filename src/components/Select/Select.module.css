@@ -1,0 +1,32 @@
+/* Import.dc.html：高さ 30px、余白 0 10px、角丸 8px、--fill-2 の地、縁 --stroke-3 */
+
+.wrap {
+  position: relative;
+  display: inline-flex;
+  max-width: 100%;
+}
+
+.select {
+  appearance: none;
+  height: 30px;
+  max-width: 100%;
+  padding: 0 calc(var(--space-6) + var(--space-1)) 0 var(--space-2-5);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke-3);
+  background: var(--fill-2);
+  font-size: var(--text-md);
+  text-overflow: ellipsis;
+}
+
+.select:hover {
+  background: var(--fill-3);
+}
+
+.chevron {
+  position: absolute;
+  top: 50%;
+  right: var(--space-2-5);
+  display: flex;
+  transform: translateY(-50%);
+  pointer-events: none;
+}

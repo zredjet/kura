@@ -1,0 +1,31 @@
+/* 暗幕（--scrim）＋内側 16px に点線（--stroke-dashed）の角丸の枠。マウスの操作は下へ通す */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  padding: var(--space-4);
+  background: var(--scrim);
+  pointer-events: none;
+}
+
+.frame {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  border: 2px dashed var(--stroke-dashed);
+  border-radius: var(--radius-2xl);
+}
+
+.icon {
+  display: flex;
+  color: var(--accent);
+}
+
+.message {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+}

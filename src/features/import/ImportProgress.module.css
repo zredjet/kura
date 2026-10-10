@@ -1,0 +1,82 @@
+/* Main.dc.html のミニプレーヤーと同じ置き方：グリッドの下中央、幅 560px まで、ガラスのカプセル */
+
+.capsule {
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-5);
+  z-index: 5;
+  transform: translateX(-50%);
+  width: min(560px, calc(100% - var(--space-4) * 2));
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-2-5) var(--space-2) var(--space-2);
+  border-radius: var(--radius-2xl);
+  background: var(--glass-capsule);
+  border: 1px solid var(--stroke-3);
+  box-shadow: var(--shadow-capsule);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  backdrop-filter: var(--glass-blur-strong);
+}
+
+.icon {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  background: var(--fill-2);
+  color: var(--accent);
+}
+
+.text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+}
+
+.title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.detail {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bar {
+  margin-top: var(--space-1);
+}
+
+.actions {
+  display: flex;
+  flex: none;
+  gap: var(--space-1);
+}
+
+.action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  color: var(--text-primary);
+}
+
+.action:hover {
+  background: var(--fill-3);
+}

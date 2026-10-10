@@ -1,0 +1,59 @@
+import { describe, expect, it } from 'vitest';
+
+import type { JobProgress } from '../../ipc/jobs';
+import { progressView } from './progressView';
+
+function job(over: Partial<JobProgress>): JobProgress {
+  return {
+    id: 1,
+    kind: 'import',
+    state: 'running',
+    progress: 0.3,
+    message: '38 / 122 項目',
+    resultJson: null,
+    ...over,
+  };
+}
+
+const result = (added: number, duplicates: number, failed: number) =>
+  JSON.stringify({ cursor: 0, total: 0, added, duplicates, skipped: 0, failed, failures: [] });
+
+describe('progressView', () => {
+  it('実行中は進捗と一時停止・中止', () => {
+    const view = progressView(job({}));
+    expect(view).toMatchObject({
+      title: '取り込み中',
+      detail: '38 / 122 項目',
+      progress: 0.3,
+      actions: ['pause', 'cancel'],
+      finished: false,
+    });
+  });
+
+  it('待ち・一時停止', () => {
+    expect(progressView(job({ state: 'queued', progress: null })).actions).toEqual(['cancel']);
+    const paused = progressView(job({ state: 'paused' }));
+    expect(paused.title).toBe('一時停止中');
+    expect(paused.actions).toEqual(['resume', 'cancel']);
+  });
+
+  it('完了は件数と重複・失敗', () => {
+    const view = progressView(job({ state: 'done', resultJson: result(1220, 6, 0) }));
+    expect(view.title).toBe('1,220 項目を取り込みました');
+    expect(view.detail).toBe('重複 6');
+    expect(view.finished).toBe(true);
+    expect(progressView(job({ state: 'done', resultJson: result(3, 0, 1) })).detail).toBe('失敗 1');
+    expect(progressView(job({ state: 'done', resultJson: result(3, 0, 0) })).detail).toBeNull();
+  });
+
+  it('失敗・中止', () => {
+    expect(progressView(job({ state: 'failed', message: '書き込めません' }))).toMatchObject({
+      title: '取り込みに失敗しました',
+      detail: '書き込めません',
+      actions: ['close'],
+    });
+    expect(progressView(job({ state: 'canceled', resultJson: result(20, 0, 0) })).detail).toBe(
+      '20 項目は取り込み済みです',
+    );
+  });
+});

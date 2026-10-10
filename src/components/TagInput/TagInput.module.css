@@ -1,0 +1,61 @@
+/* Import.dc.html：高さ 38px 以上、余白 4・6、--bg-input の地、縁 --stroke-3。チップは高さ 26px、--fill-3 の地 */
+
+.field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5);
+  min-height: 38px;
+  padding: var(--space-1) var(--space-1-5);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--stroke-3);
+  background: var(--bg-input);
+}
+
+.field:focus-within {
+  box-shadow: var(--focus-ring);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 26px;
+  padding: 0 var(--space-1) 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--fill-3);
+  font-size: var(--text-sm);
+}
+
+.remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-xs);
+  color: var(--text-tertiary);
+}
+
+.remove:hover {
+  background: var(--fill-3);
+  color: var(--text-primary);
+}
+
+.input {
+  flex: 1;
+  min-width: 120px;
+  height: 26px;
+  border: 0;
+  background: transparent;
+  font-size: var(--text-sm);
+}
+
+.input:focus,
+.input:focus-visible {
+  box-shadow: none;
+}
+
+.input::placeholder {
+  color: var(--text-tertiary);
+}

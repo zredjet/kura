@@ -1,0 +1,31 @@
+/* design.md §4：--glass-dialog、縁 --stroke-3、角丸 22px、影 --shadow-dialog、背面に --scrim。
+ * Import.dc.html：上から 72px、幅 600px（狭いときは左右 16px あける）、余白 22・22・18、間隔 18px */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: var(--scrim);
+  overflow-y: auto;
+}
+
+.dialog {
+  position: relative;
+  width: min(600px, calc(100% - var(--space-4) * 2));
+  margin: calc(var(--space-6) * 3) auto var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--space-4) + var(--space-0-5));
+  padding: calc(var(--space-5) + var(--space-0-5)) calc(var(--space-5) + var(--space-0-5))
+    calc(var(--space-4) + var(--space-0-5));
+  border-radius: var(--radius-2xl);
+  background: var(--glass-dialog);
+  border: 1px solid var(--stroke-3);
+  box-shadow: var(--shadow-dialog);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  backdrop-filter: var(--glass-blur-strong);
+}
+
+.dialog:focus {
+  outline: none;
+}

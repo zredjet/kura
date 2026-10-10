@@ -11,7 +11,8 @@ const stylesheets = Object.entries(
 const COLOR_LITERALS = [
   /#[0-9a-f]{3,8}\b/i,
   /\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(/i,
-  /\b(?:white|black)\b/i,
+  // white-space などのプロパティ名は除く
+  /\b(?:white|black)\b(?!-)/i,
 ];
 
 function stripComments(css: string): string {
