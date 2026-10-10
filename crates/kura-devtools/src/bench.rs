@@ -4,10 +4,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use kura_core::items::{
-    ItemQuery, ItemSort, ItemView, MAX_SUMMARIES, counts, detail, query_ids, recent_since,
+    ItemQuery, ItemSort, ItemView, MAX_SUMMARIES, SortKey, counts, detail, query_ids, recent_since,
     summaries,
 };
 use kura_core::library::Library;
+use kura_core::query::{QueryContext, parse};
 use kura_core::time::now_ms;
 
 /// `bench query --library <path>` / `bench thumbs --src <dir> [--threads N]`。
@@ -105,6 +106,10 @@ fn query(path: &std::path::Path) -> Result<(), String> {
     let library = Library::open(path).map_err(|e| e.to_string())?;
     let open_time = opened.elapsed();
     let db = library.db();
+    let ctx = QueryContext {
+        now_ms: now_ms(),
+        utc_offset_minutes: 540,
+    };
 
     let mut list_runs = Vec::new();
     let mut bytes = 0;
@@ -112,7 +117,7 @@ fn query(path: &std::path::Path) -> Result<(), String> {
     for _ in 0..7 {
         let started = Instant::now();
         let list = db
-            .read(|conn| query_ids(conn, &ItemQuery::default(), ItemSort::ImportedDesc, 540))
+            .read(|conn| query_ids(conn, &ItemQuery::default(), &ctx))
             .map_err(|e| e.to_string())?;
         bytes = list.encode().len();
         list_runs.push(started.elapsed());
@@ -163,9 +168,10 @@ fn query(path: &std::path::Path) -> Result<(), String> {
             let query = ItemQuery {
                 view,
                 collapse_units: collapse,
+                ..ItemQuery::default()
             };
             let list = db
-                .read(|conn| query_ids(conn, &query, ItemSort::ImportedDesc, 540))
+                .read(|conn| query_ids(conn, &query, &ctx))
                 .map_err(|e| e.to_string())?;
             runs.push(started.elapsed());
             n = list.ids.len();
@@ -211,6 +217,8 @@ fn query(path: &std::path::Path) -> Result<(), String> {
         "サイドバーの一覧と件数（中央値）"
     );
 
+    search(db, &ctx)?;
+
     tracing::info!(
         items = ids.len(),
         open_ms = open_time.as_secs_f64() * 1000.0,
@@ -220,5 +228,58 @@ fn query(path: &std::path::Path) -> Result<(), String> {
         item_detail_ms = median(detail_runs).as_secs_f64() * 1000.0,
         "一覧の取得（中央値）"
     );
+    Ok(())
+}
+
+/// M4：検索（NFR-03：タグ 3 つの AND が 50ms 以内、全文検索が 100ms 以内）。
+fn search(db: &kura_core::db::Db, ctx: &QueryContext) -> Result<(), String> {
+    let cases = [
+        (
+            "tags3_popular",
+            "タグ0 作者:タグ1 場所:タグ2",
+            SortKey::Imported,
+        ),
+        ("tags3_plain", "タグ0 タグ6 タグ12", SortKey::Imported),
+        ("tags3_rare", "タグ1800 タグ0 タグ6", SortKey::Imported),
+        ("fulltext_3", "IMG_00012", SortKey::Imported),
+        ("fulltext_2", "99", SortKey::Imported),
+        (
+            "fields",
+            "種類:画像 評価>=4 追加:365日以内",
+            SortKey::Imported,
+        ),
+        (
+            "or_not",
+            "(タグ0 | タグ6) -タグ12 種類:動画,音楽",
+            SortKey::Imported,
+        ),
+        ("sort_name", "", SortKey::Name),
+        ("sort_captured", "", SortKey::Captured),
+    ];
+    for (name, text, key) in cases {
+        let filter = parse(text).map_err(|e| e.message)?.expr;
+        let query = ItemQuery {
+            filter: Some(filter),
+            sort: ItemSort { key, desc: true },
+            ..ItemQuery::default()
+        };
+        let mut runs = Vec::new();
+        let mut n = 0;
+        for _ in 0..7 {
+            let started = Instant::now();
+            let list = db
+                .read(|conn| query_ids(conn, &query, ctx))
+                .map_err(|e| e.to_string())?;
+            runs.push(started.elapsed());
+            n = list.ids.len();
+        }
+        tracing::info!(
+            case = name,
+            query = text,
+            matched = n,
+            ms = median(runs).as_secs_f64() * 1000.0,
+            "検索（中央値）"
+        );
+    }
     Ok(())
 }
