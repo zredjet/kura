@@ -1,0 +1,10 @@
+<!-- 仮のアプリアイコン（アクセント色の角丸に、サイドバーのライブラリと同じ家の形）。
+     `pnpm tauri icon src-tauri/icons/source/app-icon.svg` で各サイズを生成する。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#FF7A45"/>
+  <g transform="translate(212 212) scale(25)" fill="none" stroke="#1C0E07" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 10l8-5 8 5"/>
+    <path d="M6 10v9h12v-9"/>
+    <path d="M10 19v-5h4v5"/>
+  </g>
+</svg>

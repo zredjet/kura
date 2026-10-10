@@ -1,0 +1,33 @@
+[package]
+name = "kura-app"
+description = "Kura メディアライブラリ（Tauri アプリ本体）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "kura_app_lib"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+kura-core.workspace = true
+kura-mac.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+tauri.workspace = true
+specta.workspace = true
+specta-typescript.workspace = true
+tauri-specta.workspace = true
+
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
