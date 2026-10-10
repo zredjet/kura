@@ -2,7 +2,12 @@
 //!
 //! - `import --library <path> [--create] [<src>...]`：取り込む（<src> を省くと、中断していた取り込みの再開だけ待つ）
 //! - `check --library <path>`：件数と整合性（DB とファイルの食い違い）を表示する
-//! - `seed`（ダミーライブラリの生成）は M2 で実装する。
+//! - `seed --items <件数> --out <path>`：ダミーライブラリを作る（グリッドと起動時間の計測用）
+//! - `bench query --library <path>`：一覧の取得の速さを測る
+//! - `bench thumbs --src <画像のフォルダ> [--threads N]`：画像サムネイルの速さを測る（NFR-04）
+
+mod bench;
+mod seed;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,7 +31,8 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("import") => import(&args[1..]),
         Some("check") => check(&args[1..]),
-        Some("seed") => Err("seed はまだ実装されていません（M2 で実装）".to_string()),
+        Some("seed") => seed::run(&args[1..]),
+        Some("bench") => bench::run(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     match result {
@@ -77,9 +83,9 @@ fn progress_sink() -> EventSink {
 fn import(args: &[String]) -> Result<(), String> {
     let args = parse(args)?;
     let session = if args.create {
-        LibrarySession::create(&args.library, progress_sink())
+        LibrarySession::create(&args.library, progress_sink(), kura_mac::media_backend())
     } else {
-        LibrarySession::open(&args.library, progress_sink())
+        LibrarySession::open(&args.library, progress_sink(), kura_mac::media_backend())
     }
     .map_err(|e| e.to_string())?;
 
@@ -98,7 +104,7 @@ fn import(args: &[String]) -> Result<(), String> {
     let jobs = session
         .jobs()
         .list(&JobFilter {
-            kinds: vec![JobKind::Import],
+            kinds: vec![JobKind::Import, JobKind::Thumbnail],
             states: vec![],
             limit: Some(5),
         })
@@ -119,8 +125,8 @@ fn import(args: &[String]) -> Result<(), String> {
 
 fn check(args: &[String]) -> Result<(), String> {
     let args = parse(args)?;
-    let session =
-        LibrarySession::open(&args.library, progress_sink()).map_err(|e| e.to_string())?;
+    let session = LibrarySession::open(&args.library, progress_sink(), kura_mac::media_backend())
+        .map_err(|e| e.to_string())?;
     session.wait_ready();
     report(&session)
 }

@@ -8,8 +8,18 @@ publish.workspace = true
 
 [dependencies]
 kura-core.workspace = true
+kura-mac.workspace = true
+blake3.workspace = true
+jpeg-encoder.workspace = true
+rand_chacha.workspace = true
+rayon.workspace = true
+reflink-copy.workspace = true
+rusqlite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
