@@ -94,11 +94,99 @@ impl Library {
             Ok(u64::try_from(count).unwrap_or(0))
         })
     }
+
+    /// ゴミ箱を空にする。DB の行を先に消し、そのあと実ファイル・サムネイル・ジャケット・プロキシを消す
+    /// （途中で落ちてもファイルが残るだけで、整合性チェックで「DB にないファイル」として数えられる）。
+    pub fn empty_trash(&self) -> Result<TrashEmptied> {
+        let removed = self.db.write(|tx| crate::items::delete_trashed(tx))?;
+        let mut result = TrashEmptied::default();
+        for item in &removed {
+            let hash_hex = hex(&item.hash);
+            let paths = [
+                self.layout.content_path(&item.hash, &item.ext),
+                self.layout.thumb_path(&hash_hex, ThumbSize::Small),
+                self.layout.thumb_path(&hash_hex, ThumbSize::Large),
+                self.layout.art_path(&hash_hex),
+                self.layout.proxy_path(&hash_hex),
+            ];
+            for path in paths {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        result.failed += 1;
+                        tracing::warn!(%err, path = %path.display(), "ゴミ箱のファイルを消せませんでした");
+                    }
+                }
+            }
+            result.items += 1;
+            result.bytes += u64::try_from(item.size_bytes).unwrap_or(0);
+        }
+        Ok(result)
+    }
+}
+
+/// ゴミ箱を空にした結果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrashEmptied {
+    /// 消したアイテムの数。
+    pub items: u64,
+    /// 消したアイテムの合計サイズ。
+    pub bytes: u64,
+    /// 消せなかったファイルの数。
+    pub failed: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_trash_removes_rows_and_files_but_keeps_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::create(&dir.path().join("L")).unwrap();
+        let (gone, kept) = ([1u8; 32], [2u8; 32]);
+        for (id, hash) in [(1, gone), (2, kept)] {
+            let content = lib.layout().content_path(&hash, "jpg");
+            std::fs::create_dir_all(content.parent().unwrap()).unwrap();
+            std::fs::write(&content, b"0123456789").unwrap();
+            let thumb = lib.layout().thumb_path(&hex(&hash), ThumbSize::Small);
+            std::fs::create_dir_all(thumb.parent().unwrap()).unwrap();
+            std::fs::write(&thumb, b"t").unwrap();
+            lib.db()
+                .write(move |tx| {
+                    tx.execute(
+                        "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+                         VALUES (?1, ?2, 'jpg', 'image', 10, 't', 't', 0, 0)",
+                        rusqlite::params![id, &hash[..]],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        lib.db()
+            .write(|tx| crate::items::trash(tx, &[1], 5))
+            .unwrap();
+
+        let result = lib.empty_trash().unwrap();
+        assert_eq!(
+            result,
+            TrashEmptied {
+                items: 1,
+                bytes: 10,
+                failed: 0
+            }
+        );
+        assert!(!lib.layout().content_path(&gone, "jpg").exists());
+        assert!(
+            !lib.layout()
+                .thumb_path(&hex(&gone), ThumbSize::Small)
+                .exists()
+        );
+        assert!(lib.layout().content_path(&kept, "jpg").exists());
+        assert_eq!(lib.item_count().unwrap(), 1);
+        assert_eq!(lib.empty_trash().unwrap(), TrashEmptied::default());
+    }
 
     #[test]
     fn create_makes_layout_and_db() {

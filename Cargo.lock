@@ -1822,6 +1822,7 @@ name = "kura-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "rand_chacha",
  "rayon",
  "reflink-copy",
  "rusqlite",

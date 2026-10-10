@@ -35,31 +35,7 @@ pub struct ImportOptions {
     pub duplicates: DuplicatePolicy,
 }
 
-/// タグの名前（名前空間なしは空文字）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TagName {
-    pub namespace: String,
-    pub name: String,
-}
-
-impl TagName {
-    /// 名前空間なしのタグ。
-    pub fn plain(name: impl Into<String>) -> Self {
-        Self {
-            namespace: String::new(),
-            name: name.into(),
-        }
-    }
-
-    /// 入力どおりの表記（別名の照合に使う）。
-    pub fn display(&self) -> String {
-        if self.namespace.is_empty() {
-            self.name.clone()
-        } else {
-            format!("{}:{}", self.namespace, self.name)
-        }
-    }
-}
+pub use crate::tags::{TagName, parse_tag};
 
 /// 仮想フォルダの置き場所。`base`（なければいちばん上）の下に `path` の順にフォルダを作る。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,25 +69,6 @@ pub struct Assignment {
     pub folder: Option<FolderTarget>,
     pub tags: Vec<TagName>,
     pub unit: Option<UnitKey>,
-}
-
-/// 「名前」または「名前空間:名前」を読む（全角の「：」も区切りとして扱う）。空なら None。
-pub fn parse_tag(input: &str) -> Option<TagName> {
-    let text = nfc(input.trim());
-    let (namespace, name) = match text.char_indices().find(|(_, c)| *c == ':' || *c == '：') {
-        Some((i, c)) => (
-            text.get(..i).unwrap_or_default().trim(),
-            text.get(i + c.len_utf8()..).unwrap_or_default().trim(),
-        ),
-        None => ("", text.as_str()),
-    };
-    if name.is_empty() {
-        return None;
-    }
-    Some(TagName {
-        namespace: namespace.to_string(),
-        name: name.to_string(),
-    })
 }
 
 /// 仮想フォルダの置き場所を決める。

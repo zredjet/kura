@@ -3,7 +3,6 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::kind::MediaKind;
-use super::plan::TagName;
 use crate::media::MediaInfo;
 use crate::text::nfc;
 use crate::{CoreError, Result};
@@ -160,30 +159,7 @@ pub fn add_to_folder(conn: &Connection, folder_id: i64, item_id: i64) -> Result<
     Ok(())
 }
 
-/// タグの ID を返す（別名なら正式タグ。なければ作る）。
-pub fn ensure_tag(conn: &Connection, tag: &TagName, now: i64) -> Result<i64> {
-    let alias: Option<i64> = {
-        let mut stmt = conn.prepare_cached("SELECT tag_id FROM tag_aliases WHERE alias = ?1")?;
-        stmt.query_row([tag.display()], |row| row.get(0))
-            .optional()?
-    };
-    if let Some(id) = alias {
-        return Ok(id);
-    }
-    let existing: Option<i64> = {
-        let mut stmt =
-            conn.prepare_cached("SELECT id FROM tags WHERE namespace = ?1 AND name = ?2")?;
-        stmt.query_row(params![tag.namespace, tag.name], |row| row.get(0))
-            .optional()?
-    };
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-    let mut stmt =
-        conn.prepare_cached("INSERT INTO tags (namespace, name, created_at) VALUES (?1, ?2, ?3)")?;
-    stmt.execute(params![tag.namespace, tag.name, now])?;
-    Ok(conn.last_insert_rowid())
-}
+pub use crate::tags::ensure_tag;
 
 /// アイテムにタグを付ける（付いていれば何もしない）。
 pub fn add_tag(conn: &Connection, tag_id: i64, item_id: i64, source: &str) -> Result<()> {
@@ -227,6 +203,7 @@ pub fn add_unit_member(conn: &Connection, unit_id: i64, item_id: i64, pos: f64) 
 mod tests {
     use super::*;
     use crate::db::{query_plan, test_conn};
+    use crate::tags::TagName;
 
     fn new_item<'a>(hash: &'a [u8; 32], name: &'a str) -> NewItem<'a> {
         NewItem {

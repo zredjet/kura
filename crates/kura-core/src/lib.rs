@@ -10,9 +10,12 @@ pub mod items;
 pub mod jobs;
 pub mod library;
 pub mod media;
+pub mod random;
 pub mod serve;
+pub mod tags;
 pub mod text;
 pub mod time;
 pub mod tools;
+pub mod unit;
 
 pub use error::{CoreError, Result};

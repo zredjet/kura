@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 blake3.workspace = true
+rand_chacha.workspace = true
 rayon.workspace = true
 reflink-copy.workspace = true
 rusqlite.workspace = true
