@@ -1,0 +1,419 @@
+//! 取り込みで使う DB の読み書き（アイテム・仮想フォルダ・タグ・ユニット）。
+
+use rusqlite::{Connection, OptionalExtension, params};
+
+use super::kind::MediaKind;
+use super::plan::TagName;
+use crate::text::nfc;
+use crate::{CoreError, Result};
+
+/// 同じハッシュの既存アイテム。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingItem {
+    pub id: i64,
+    pub ext: String,
+    pub trashed: bool,
+}
+
+/// 追加するアイテム。
+#[derive(Debug, Clone)]
+pub struct NewItem<'a> {
+    pub hash: &'a [u8; 32],
+    pub ext: &'a str,
+    pub kind: MediaKind,
+    pub mime: Option<&'a str>,
+    pub size: u64,
+    pub title: &'a str,
+    pub original_name: &'a str,
+    pub original_path: &'a str,
+    pub now: i64,
+}
+
+/// ハッシュでアイテムを探す。
+pub fn find_by_hash(conn: &Connection, hash: &[u8; 32]) -> Result<Option<ExistingItem>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT id, ext, trashed_at IS NOT NULL FROM items WHERE hash = ?1")?;
+    Ok(stmt
+        .query_row([&hash[..]], |row| {
+            Ok(ExistingItem {
+                id: row.get(0)?,
+                ext: row.get(1)?,
+                trashed: row.get(2)?,
+            })
+        })
+        .optional()?)
+}
+
+/// アイテムを追加して ID を返す。
+pub fn insert_item(conn: &Connection, item: &NewItem<'_>) -> Result<i64> {
+    let size = i64::try_from(item.size)
+        .map_err(|_| CoreError::Invalid(format!("ファイルが大きすぎます: {}", item.size)))?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO items (hash, ext, kind, mime, size_bytes, title, original_name, original_path,
+                            source_site, imported_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'local', ?9, ?9)",
+    )?;
+    stmt.execute(params![
+        &item.hash[..],
+        item.ext,
+        item.kind.as_str(),
+        item.mime,
+        size,
+        item.title,
+        item.original_name,
+        item.original_path,
+        item.now,
+    ])?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// ゴミ箱から戻す。
+pub fn restore_item(conn: &Connection, id: i64, now: i64) -> Result<()> {
+    let mut stmt =
+        conn.prepare_cached("UPDATE items SET trashed_at = NULL, updated_at = ?2 WHERE id = ?1")?;
+    stmt.execute(params![id, now])?;
+    Ok(())
+}
+
+/// 同じサイズのアイテムの (ハッシュ, 拡張子)。重複の見込みに使う。
+pub fn hashes_by_size(conn: &Connection, size: u64) -> Result<Vec<([u8; 32], String)>> {
+    let Ok(size) = i64::try_from(size) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare_cached("SELECT hash, ext FROM items WHERE size_bytes = ?1")?;
+    let rows = stmt.query_map([size], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (hash, ext) = row?;
+        if let Ok(hash) = <[u8; 32]>::try_from(hash.as_slice()) {
+            out.push((hash, ext));
+        }
+    }
+    Ok(out)
+}
+
+/// 仮想フォルダがあるか。
+pub fn folder_exists(conn: &Connection, id: i64) -> Result<bool> {
+    let mut stmt = conn.prepare_cached("SELECT 1 FROM folders WHERE id = ?1")?;
+    Ok(stmt.exists([id])?)
+}
+
+/// `base` の下に `path` の順でフォルダをたどり、なければ作る。最後のフォルダの ID を返す（path が空なら base）。
+pub fn ensure_folder_path(
+    conn: &Connection,
+    base: Option<i64>,
+    path: &[String],
+    now: i64,
+) -> Result<Option<i64>> {
+    let mut parent = base;
+    for name in path {
+        let name = nfc(name.trim());
+        if name.is_empty() {
+            continue;
+        }
+        let parent_key = parent.unwrap_or(0);
+        let existing: Option<i64> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id FROM folders WHERE ifnull(parent_id, 0) = ?1 AND name = ?2",
+            )?;
+            stmt.query_row(params![parent_key, name], |row| row.get(0))
+                .optional()?
+        };
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let pos: f64 = {
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT coalesce(max(pos), 0) + 1 FROM folders WHERE ifnull(parent_id, 0) = ?1",
+                    )?;
+                    stmt.query_row([parent_key], |row| row.get(0))?
+                };
+                let mut stmt = conn.prepare_cached(
+                    "INSERT INTO folders (parent_id, name, pos, created_at) VALUES (?1, ?2, ?3, ?4)",
+                )?;
+                stmt.execute(params![parent, name, pos, now])?;
+                conn.last_insert_rowid()
+            }
+        };
+        parent = Some(id);
+    }
+    Ok(parent)
+}
+
+/// アイテムを仮想フォルダに入れる（入っていれば何もしない）。
+pub fn add_to_folder(conn: &Connection, folder_id: i64, item_id: i64) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO item_folders (folder_id, item_id) VALUES (?1, ?2)",
+    )?;
+    stmt.execute([folder_id, item_id])?;
+    Ok(())
+}
+
+/// タグの ID を返す（別名なら正式タグ。なければ作る）。
+pub fn ensure_tag(conn: &Connection, tag: &TagName, now: i64) -> Result<i64> {
+    let alias: Option<i64> = {
+        let mut stmt = conn.prepare_cached("SELECT tag_id FROM tag_aliases WHERE alias = ?1")?;
+        stmt.query_row([tag.display()], |row| row.get(0))
+            .optional()?
+    };
+    if let Some(id) = alias {
+        return Ok(id);
+    }
+    let existing: Option<i64> = {
+        let mut stmt =
+            conn.prepare_cached("SELECT id FROM tags WHERE namespace = ?1 AND name = ?2")?;
+        stmt.query_row(params![tag.namespace, tag.name], |row| row.get(0))
+            .optional()?
+    };
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    let mut stmt =
+        conn.prepare_cached("INSERT INTO tags (namespace, name, created_at) VALUES (?1, ?2, ?3)")?;
+    stmt.execute(params![tag.namespace, tag.name, now])?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// アイテムにタグを付ける（付いていれば何もしない）。
+pub fn add_tag(conn: &Connection, tag_id: i64, item_id: i64, source: &str) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO item_tags (tag_id, item_id, source) VALUES (?1, ?2, ?3)",
+    )?;
+    stmt.execute(params![tag_id, item_id, source])?;
+    Ok(())
+}
+
+/// ユニットがあるか。
+pub fn unit_exists(conn: &Connection, id: i64) -> Result<bool> {
+    let mut stmt = conn.prepare_cached("SELECT 1 FROM units WHERE id = ?1")?;
+    Ok(stmt.exists([id])?)
+}
+
+/// 取り込みで作る set ユニット（origin = import、並びは manual）。
+pub fn create_import_unit(conn: &Connection, name: &str, now: i64) -> Result<i64> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT INTO units (kind, name, order_mode, origin, created_at, updated_at)
+         VALUES ('set', ?1, 'manual', 'import', ?2, ?2)",
+    )?;
+    stmt.execute(params![name, now])?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// set ユニットにアイテムを加える。表紙が空なら最初のメンバーを表紙にする。
+pub fn add_unit_member(conn: &Connection, unit_id: i64, item_id: i64, pos: f64) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO unit_items (unit_id, item_id, pos) VALUES (?1, ?2, ?3)",
+    )?;
+    stmt.execute(params![unit_id, item_id, pos])?;
+    let mut stmt = conn.prepare_cached(
+        "UPDATE units SET cover_item_id = ?2 WHERE id = ?1 AND cover_item_id IS NULL",
+    )?;
+    stmt.execute([unit_id, item_id])?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{query_plan, test_conn};
+
+    fn new_item<'a>(hash: &'a [u8; 32], name: &'a str) -> NewItem<'a> {
+        NewItem {
+            hash,
+            ext: "jpg",
+            kind: MediaKind::Image,
+            mime: Some("image/jpeg"),
+            size: 42,
+            title: name,
+            original_name: name,
+            original_path: "/src/x.jpg",
+            now: 100,
+        }
+    }
+
+    #[test]
+    fn inserts_and_finds_items_by_hash() {
+        let conn = test_conn();
+        let hash = [7u8; 32];
+        assert_eq!(find_by_hash(&conn, &hash).unwrap(), None);
+        let id = insert_item(&conn, &new_item(&hash, "夕方の海")).unwrap();
+        assert_eq!(
+            find_by_hash(&conn, &hash).unwrap(),
+            Some(ExistingItem {
+                id,
+                ext: "jpg".into(),
+                trashed: false
+            })
+        );
+        let (kind, source_site, imported_at, title): (String, String, i64, String) = conn
+            .query_row(
+                "SELECT kind, source_site, imported_at, title FROM items WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (kind.as_str(), source_site.as_str(), imported_at),
+            ("image", "local", 100)
+        );
+        assert_eq!(title, "夕方の海");
+
+        conn.execute("UPDATE items SET trashed_at = 5 WHERE id = ?1", [id])
+            .unwrap();
+        assert!(find_by_hash(&conn, &hash).unwrap().unwrap().trashed);
+        restore_item(&conn, id, 200).unwrap();
+        assert!(!find_by_hash(&conn, &hash).unwrap().unwrap().trashed);
+
+        assert_eq!(
+            hashes_by_size(&conn, 42).unwrap(),
+            vec![(hash, "jpg".into())]
+        );
+        assert!(hashes_by_size(&conn, 41).unwrap().is_empty());
+    }
+
+    #[test]
+    fn folder_paths_are_created_once() {
+        let conn = test_conn();
+        let path = vec![
+            "写真".to_string(),
+            "2026 旅行".to_string(),
+            "鎌倉".to_string(),
+        ];
+        let id = ensure_folder_path(&conn, None, &path, 1).unwrap().unwrap();
+        assert_eq!(ensure_folder_path(&conn, None, &path, 2).unwrap(), Some(id));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM folders", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // 取り込み先の下に作る。並び順は末尾に足していく
+        let photos = ensure_folder_path(&conn, None, &path[..1], 3)
+            .unwrap()
+            .unwrap();
+        let a = ensure_folder_path(&conn, Some(photos), &["a".to_string()], 4)
+            .unwrap()
+            .unwrap();
+        let b = ensure_folder_path(&conn, Some(photos), &["b".to_string()], 5)
+            .unwrap()
+            .unwrap();
+        let pos = |id: i64| -> f64 {
+            conn.query_row("SELECT pos FROM folders WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(pos(b) > pos(a));
+        assert_eq!(
+            ensure_folder_path(&conn, Some(photos), &[], 6).unwrap(),
+            Some(photos)
+        );
+        assert_eq!(ensure_folder_path(&conn, None, &[], 6).unwrap(), None);
+        assert!(folder_exists(&conn, photos).unwrap());
+        assert!(!folder_exists(&conn, 999).unwrap());
+
+        let item = insert_item(&conn, &new_item(&[1u8; 32], "x")).unwrap();
+        add_to_folder(&conn, a, item).unwrap();
+        add_to_folder(&conn, a, item).unwrap();
+        let members: i64 = conn
+            .query_row("SELECT COUNT(*) FROM item_folders", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(members, 1);
+    }
+
+    #[test]
+    fn tags_resolve_aliases_and_namespaces() {
+        let conn = test_conn();
+        let plain = ensure_tag(&conn, &TagName::plain("夕景"), 1).unwrap();
+        assert_eq!(
+            ensure_tag(&conn, &TagName::plain("夕景"), 2).unwrap(),
+            plain
+        );
+
+        let author = TagName {
+            namespace: "作者".into(),
+            name: "もりの".into(),
+        };
+        let author_id = ensure_tag(&conn, &author, 3).unwrap();
+        assert_ne!(author_id, plain);
+
+        conn.execute(
+            "INSERT INTO tag_aliases (alias, tag_id) VALUES ('夕焼け', ?1)",
+            [plain],
+        )
+        .unwrap();
+        assert_eq!(
+            ensure_tag(&conn, &TagName::plain("夕焼け"), 4).unwrap(),
+            plain
+        );
+
+        let item = insert_item(&conn, &new_item(&[2u8; 32], "x")).unwrap();
+        add_tag(&conn, plain, item, "import").unwrap();
+        add_tag(&conn, plain, item, "import").unwrap();
+        let source: String = conn
+            .query_row(
+                "SELECT source FROM item_tags WHERE item_id = ?1",
+                [item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "import");
+    }
+
+    #[test]
+    fn import_units_keep_member_order_and_cover() {
+        let conn = test_conn();
+        let unit = create_import_unit(&conn, "鎌倉", 1).unwrap();
+        assert!(unit_exists(&conn, unit).unwrap());
+        let a = insert_item(&conn, &new_item(&[3u8; 32], "a")).unwrap();
+        let b = insert_item(&conn, &new_item(&[4u8; 32], "b")).unwrap();
+        add_unit_member(&conn, unit, a, 1.0).unwrap();
+        add_unit_member(&conn, unit, b, 2.0).unwrap();
+        add_unit_member(&conn, unit, a, 1.0).unwrap();
+
+        let (kind, origin, order_mode, cover): (String, String, String, i64) = conn
+            .query_row(
+                "SELECT kind, origin, order_mode, cover_item_id FROM units WHERE id = ?1",
+                [unit],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (kind.as_str(), origin.as_str(), order_mode.as_str()),
+            ("set", "import", "manual")
+        );
+        assert_eq!(cover, a);
+        let members: Vec<i64> = conn
+            .prepare("SELECT item_id FROM unit_items WHERE unit_id = ?1 ORDER BY pos")
+            .unwrap()
+            .query_map([unit], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(members, vec![a, b]);
+    }
+
+    #[test]
+    fn lookups_use_indexes() {
+        let conn = test_conn();
+        let by_hash = query_plan(
+            &conn,
+            "SELECT id, ext, trashed_at FROM items WHERE hash = x'00'",
+        );
+        assert!(
+            by_hash.contains("USING INDEX sqlite_autoindex_items_1"),
+            "{by_hash}"
+        );
+        let by_size = query_plan(&conn, "SELECT hash, ext FROM items WHERE size_bytes = 1");
+        assert!(by_size.contains("idx_items_size"), "{by_size}");
+        let folder = query_plan(
+            &conn,
+            "SELECT id FROM folders WHERE ifnull(parent_id, 0) = 0 AND name = 'a'",
+        );
+        assert!(folder.contains("idx_folders_name"), "{folder}");
+        let tag = query_plan(
+            &conn,
+            "SELECT id FROM tags WHERE namespace = '' AND name = 'a'",
+        );
+        assert!(tag.contains("sqlite_autoindex_tags_1"), "{tag}");
+    }
+}

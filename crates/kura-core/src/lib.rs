@@ -2,6 +2,13 @@
 //!
 //! macOS 固有の処理は `kura-mac` に置き、このクレートには `cfg(target_os)` を書かない。
 
+pub mod db;
 pub mod error;
+pub mod folders;
+pub mod import;
+pub mod jobs;
+pub mod library;
+pub mod text;
+pub mod time;
 
 pub use error::{CoreError, Result};

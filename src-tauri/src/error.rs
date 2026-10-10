@@ -8,10 +8,13 @@ use serde::Serialize;
 pub enum AppErrorCode {
     NotFound,
     InvalidQuery,
+    Invalid,
     ToolMissing,
     Io,
     Db,
     Conflict,
+    /// アプリ内部の想定外の失敗。
+    Internal,
 }
 
 /// コマンドが返すエラー。JSON では `{ code, message }` になる。
@@ -30,6 +33,11 @@ impl AppError {
             message: message.into(),
         }
     }
+
+    /// 想定外の失敗。
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::new(AppErrorCode::Internal, message)
+    }
 }
 
 impl From<CoreError> for AppError {
@@ -37,9 +45,17 @@ impl From<CoreError> for AppError {
         let code = match &err {
             CoreError::NotFound(_) => AppErrorCode::NotFound,
             CoreError::Conflict(_) => AppErrorCode::Conflict,
+            CoreError::Invalid(_) => AppErrorCode::Invalid,
             CoreError::Io(_) => AppErrorCode::Io,
+            CoreError::Db(_) | CoreError::Json(_) | CoreError::DbClosed => AppErrorCode::Db,
         };
         Self::new(code, err.to_string())
+    }
+}
+
+impl From<tauri::Error> for AppError {
+    fn from(err: tauri::Error) -> Self {
+        Self::internal(err.to_string())
     }
 }
 
@@ -56,6 +72,11 @@ mod tests {
         let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let err: AppError = CoreError::Io(io).into();
         assert_eq!(err.code, AppErrorCode::Io);
+
+        let err: AppError = CoreError::Invalid("x".into()).into();
+        assert_eq!(err.code, AppErrorCode::Invalid);
+        let err: AppError = CoreError::DbClosed.into();
+        assert_eq!(err.code, AppErrorCode::Db);
     }
 
     #[test]

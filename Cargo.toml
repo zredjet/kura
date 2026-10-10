@@ -19,8 +19,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 
+rusqlite = { version = "0.40", features = ["bundled"] }
+blake3 = { version = "1.8", features = ["mmap", "rayon"] }
+rayon = "1.12"
+reflink-copy = "0.1"
+# jwalk は開発終了のため walkdir を使う（docs/decisions.md）
+walkdir = "2.5"
+unicode-normalization = "0.1"
+tempfile = "3"
+
 tauri = "2.12"
 tauri-build = "2.7"
+tauri-plugin-dialog = "2.8"
 # tauri-specta はまだ RC のため版を固定する（ADR-16）
 specta = "=2.0.0-rc.25"
 specta-typescript = "=0.0.12"

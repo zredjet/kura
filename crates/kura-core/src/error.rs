@@ -9,9 +9,40 @@ pub enum CoreError {
     /// 既存のものと競合する（同名・同一など）。
     #[error("競合しています: {0}")]
     Conflict(String),
+    /// 入力が正しくない。
+    #[error("入力が正しくありません: {0}")]
+    Invalid(String),
     /// ファイル操作の失敗。
     #[error("ファイル操作に失敗しました: {0}")]
     Io(#[from] std::io::Error),
+    /// SQLite の失敗。
+    #[error("データベースの操作に失敗しました: {0}")]
+    Db(#[from] rusqlite::Error),
+    /// JSON の読み書きの失敗（ジョブの入力・結果など）。
+    #[error("データの読み書きに失敗しました: {0}")]
+    Json(#[from] serde_json::Error),
+    /// DB の書き込みスレッドが止まっている。
+    #[error("データベースが閉じられています")]
+    DbClosed,
+}
+
+impl CoreError {
+    /// エラーの種類を表す短い名前（jobs.error_code・AppError.code に使う）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "NotFound",
+            Self::Conflict(_) => "Conflict",
+            Self::Invalid(_) => "Invalid",
+            Self::Io(_) => "Io",
+            Self::Db(_) | Self::Json(_) | Self::DbClosed => "Db",
+        }
+    }
+}
+
+impl From<walkdir::Error> for CoreError {
+    fn from(err: walkdir::Error) -> Self {
+        Self::Io(err.into())
+    }
 }
 
 /// kura-core の `Result`。
