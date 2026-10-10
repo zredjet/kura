@@ -3,11 +3,17 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use kura_core::folders::FolderNode;
+use kura_core::folders::{FolderNode, FolderPatch};
 use kura_core::import::{DuplicatePolicy, ImportOptions, ImportPreview, ScanRoot};
-use kura_core::items::{FolderRef, ItemDetail, ItemSummary, TagRef, UnitRef};
+use kura_core::items::{
+    FolderRef, ItemDetail, ItemPatch, ItemSummary, LibraryCounts, SelectionInfo, TagRef, UnitRef,
+};
 use kura_core::jobs::{JobEvent, JobFilter, JobKind, JobRecord, JobState};
-use kura_core::library::{IntegrityReport, LibraryInfo, LocationCheck, LocationStatus};
+use kura_core::library::{
+    IntegrityReport, LibraryInfo, LocationCheck, LocationStatus, TrashEmptied,
+};
+use kura_core::tags::{TagDetail, TagPatch, TagSuggestion};
+use kura_core::unit::{Cover, OrderMode, UnitDetail, UnitKind, UnitPatch, UnitSummary};
 
 /// ライブラリの概要。
 #[derive(Debug, Clone, Serialize, Type)]
@@ -403,6 +409,8 @@ pub struct TagRefDto {
     pub id: i64,
     pub namespace: String,
     pub name: String,
+    /// 色のトークン名（`blue` / `violet` / `amber` / `teal`）。
+    pub color: Option<String>,
 }
 
 impl From<TagRef> for TagRefDto {
@@ -411,6 +419,7 @@ impl From<TagRef> for TagRefDto {
             id: t.id,
             namespace: t.namespace,
             name: t.name,
+            color: t.color,
         }
     }
 }
@@ -438,7 +447,7 @@ impl From<FolderRef> for FolderRefDto {
 pub struct UnitRefDto {
     pub id: i64,
     pub name: String,
-    pub kind: String,
+    pub kind: UnitKindDto,
 }
 
 impl From<UnitRef> for UnitRefDto {
@@ -446,7 +455,7 @@ impl From<UnitRef> for UnitRefDto {
         Self {
             id: u.id,
             name: u.name,
-            kind: u.kind,
+            kind: u.kind.into(),
         }
     }
 }
@@ -495,6 +504,10 @@ pub struct FolderNodeDto {
     pub name: String,
     pub color: Option<String>,
     pub pos: f64,
+    /// 件数（子孫フォルダの分を含む。`folders_tree(withCounts)` のときだけ）。
+    pub count: Option<i64>,
+    /// このフォルダを参照する folder ユニット。
+    pub unit_id: Option<i64>,
 }
 
 impl From<FolderNode> for FolderNodeDto {
@@ -505,6 +518,436 @@ impl From<FolderNode> for FolderNodeDto {
             name: n.name,
             color: n.color,
             pos: n.pos,
+            count: None,
+            unit_id: n.unit_id,
+        }
+    }
+}
+
+/// 空文字を「消す」として読む（色・メモなど）。
+fn clearable(value: Option<String>) -> Option<Option<String>> {
+    value.map(|v| (!v.trim().is_empty()).then_some(v))
+}
+
+/// フォルダの変更（省略した項目は変えない。`color` の空文字は色を外す）。
+#[derive(Debug, Clone, Default, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FolderPatchDto {
+    pub name: Option<String>,
+    pub color: Option<String>,
+}
+
+impl From<FolderPatchDto> for FolderPatch {
+    fn from(p: FolderPatchDto) -> Self {
+        Self {
+            name: p.name,
+            color: clearable(p.color),
+        }
+    }
+}
+
+/// サイドバーの「ライブラリ」の件数。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryCountsDto {
+    pub all: i64,
+    pub recent: i64,
+    pub unsorted: i64,
+    pub untagged: i64,
+    pub trash: i64,
+}
+
+impl From<LibraryCounts> for LibraryCountsDto {
+    fn from(c: LibraryCounts) -> Self {
+        Self {
+            all: c.all,
+            recent: c.recent,
+            unsorted: c.unsorted,
+            untagged: c.untagged,
+            trash: c.trash,
+        }
+    }
+}
+
+/// 一覧の種類（`items_query_ids` の引数。生バイトのコマンドなので TS の型は `src/ipc/items.ts` に書く）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ItemViewDto {
+    All,
+    Recent,
+    Unsorted,
+    Untagged,
+    Random { seed: u64 },
+    Trash,
+    Folder { id: i64 },
+    Unit { id: i64 },
+}
+
+/// アイテムの変更（省略した項目は変えない。`note` の空文字はメモを消す）。
+#[derive(Debug, Clone, Default, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ItemPatchDto {
+    pub title: Option<String>,
+    pub rating: Option<i64>,
+    pub note: Option<String>,
+}
+
+impl From<ItemPatchDto> for ItemPatch {
+    fn from(p: ItemPatchDto) -> Self {
+        Self {
+            title: p.title,
+            rating: p.rating,
+            note: clearable(p.note),
+        }
+    }
+}
+
+/// タグと、付いている件数。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TagCountDto {
+    pub tag: TagRefDto,
+    pub count: u32,
+}
+
+/// フォルダと、入っている件数。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderCountDto {
+    pub folder: FolderRefDto,
+    pub count: u32,
+}
+
+/// 複数選択のインスペクタに出す集計。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionInfoDto {
+    pub count: u32,
+    /// 全件の評価が同じならその値。
+    pub rating: Option<i64>,
+    /// 全件のメモが同じか。
+    pub same_note: bool,
+    /// 全件が同じときのメモ。
+    pub note: Option<String>,
+    pub tags: Vec<TagCountDto>,
+    pub folders: Vec<FolderCountDto>,
+}
+
+impl From<SelectionInfo> for SelectionInfoDto {
+    fn from(s: SelectionInfo) -> Self {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        Self {
+            count: count(s.count),
+            rating: s.rating,
+            same_note: s.note.is_some(),
+            note: s.note.flatten(),
+            tags: s
+                .tags
+                .into_iter()
+                .map(|(tag, n)| TagCountDto {
+                    tag: tag.into(),
+                    count: count(n),
+                })
+                .collect(),
+            folders: s
+                .folders
+                .into_iter()
+                .map(|(folder, n)| FolderCountDto {
+                    folder: folder.into(),
+                    count: count(n),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// ゴミ箱を空にした結果。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TrashEmptiedDto {
+    pub items: u64,
+    pub bytes: u64,
+    pub failed: u64,
+}
+
+impl From<TrashEmptied> for TrashEmptiedDto {
+    fn from(t: TrashEmptied) -> Self {
+        Self {
+            items: t.items,
+            bytes: t.bytes,
+            failed: t.failed,
+        }
+    }
+}
+
+/// タグの候補。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TagSuggestionDto {
+    pub tag: TagRefDto,
+    pub count: i64,
+    /// 別名で一致したときの別名。
+    pub alias: Option<String>,
+}
+
+impl From<TagSuggestion> for TagSuggestionDto {
+    fn from(s: TagSuggestion) -> Self {
+        Self {
+            tag: s.tag.into(),
+            count: s.count,
+            alias: s.alias,
+        }
+    }
+}
+
+/// タグの編集画面の内容。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TagDetailDto {
+    pub tag: TagRefDto,
+    pub count: i64,
+    pub aliases: Vec<String>,
+    pub parents: Vec<TagRefDto>,
+    pub children: Vec<TagRefDto>,
+}
+
+impl From<TagDetail> for TagDetailDto {
+    fn from(d: TagDetail) -> Self {
+        Self {
+            tag: d.tag.into(),
+            count: d.count,
+            aliases: d.aliases,
+            parents: d.parents.into_iter().map(Into::into).collect(),
+            children: d.children.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// タグの変更（省略した項目は変えない。`color` の空文字は色を外す。`aliases`・`parents` は置き換え）。
+#[derive(Debug, Clone, Default, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TagPatchDto {
+    pub namespace: Option<String>,
+    pub name: Option<String>,
+    pub color: Option<String>,
+    pub aliases: Option<Vec<String>>,
+    pub parents: Option<Vec<i64>>,
+}
+
+impl From<TagPatchDto> for TagPatch {
+    fn from(p: TagPatchDto) -> Self {
+        Self {
+            namespace: p.namespace,
+            name: p.name,
+            color: clearable(p.color),
+            aliases: p.aliases,
+            parents: p.parents,
+        }
+    }
+}
+
+/// ユニットの種類（`set` = ファイル群、`folder` = フォルダ群）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum UnitKindDto {
+    Set,
+    Folder,
+}
+
+impl From<UnitKind> for UnitKindDto {
+    fn from(k: UnitKind) -> Self {
+        match k {
+            UnitKind::Set => Self::Set,
+            UnitKind::Folder => Self::Folder,
+        }
+    }
+}
+
+impl From<UnitKindDto> for UnitKind {
+    fn from(k: UnitKindDto) -> Self {
+        match k {
+            UnitKindDto::Set => Self::Set,
+            UnitKindDto::Folder => Self::Folder,
+        }
+    }
+}
+
+/// ユニットのメンバーの並び順。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum OrderModeDto {
+    Manual,
+    Name,
+    Imported,
+    Captured,
+    Duration,
+}
+
+impl From<OrderMode> for OrderModeDto {
+    fn from(m: OrderMode) -> Self {
+        match m {
+            OrderMode::Manual => Self::Manual,
+            OrderMode::Name => Self::Name,
+            OrderMode::Imported => Self::Imported,
+            OrderMode::Captured => Self::Captured,
+            OrderMode::Duration => Self::Duration,
+        }
+    }
+}
+
+impl From<OrderModeDto> for OrderMode {
+    fn from(m: OrderModeDto) -> Self {
+        match m {
+            OrderModeDto::Manual => Self::Manual,
+            OrderModeDto::Name => Self::Name,
+            OrderModeDto::Imported => Self::Imported,
+            OrderModeDto::Captured => Self::Captured,
+            OrderModeDto::Duration => Self::Duration,
+        }
+    }
+}
+
+/// ユニットの表紙。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverDto {
+    pub item_id: i64,
+    pub hash: String,
+    pub kind: String,
+    pub thumb_state: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+
+impl From<Cover> for CoverDto {
+    fn from(c: Cover) -> Self {
+        Self {
+            item_id: c.item_id,
+            hash: c.hash,
+            kind: c.kind,
+            thumb_state: c.thumb_state,
+            width: c.width,
+            height: c.height,
+        }
+    }
+}
+
+/// グリッドのタイルに出すユニットの要約。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UnitSummaryDto {
+    pub id: i64,
+    pub kind: UnitKindDto,
+    pub name: String,
+    pub cover: Option<CoverDto>,
+    pub count: i64,
+    /// 音楽・動画は長さ、画像は表示時間の合計（ミリ秒）。
+    pub duration_ms: i64,
+    /// メンバーの種類（`image` / `video` / `audio`）。
+    pub kinds: Vec<String>,
+    /// 集計した評価（ユニットの評価、なければメンバーの平均）。
+    pub rating: i64,
+    /// ユニット自体の評価（0 は未評価）。
+    pub own_rating: i64,
+    /// `user` / `import` / `download`。
+    pub origin: String,
+    pub created_at: i64,
+}
+
+impl From<UnitSummary> for UnitSummaryDto {
+    fn from(u: UnitSummary) -> Self {
+        Self {
+            id: u.id,
+            kind: u.kind.into(),
+            name: u.name,
+            cover: u.cover.map(Into::into),
+            count: i64::try_from(u.stats.count).unwrap_or(i64::MAX),
+            duration_ms: u.stats.duration_ms,
+            kinds: u.stats.kinds.into_iter().map(str::to_string).collect(),
+            rating: u.stats.rating,
+            own_rating: u.own_rating,
+            origin: u.origin,
+            created_at: u.created_at,
+        }
+    }
+}
+
+/// folder ユニットの参照フォルダ。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UnitFolderDto {
+    pub folder_id: i64,
+    /// いちばん上からのパス（出力のときだけ）。
+    #[serde(default)]
+    pub path: Vec<String>,
+    pub recursive: bool,
+}
+
+/// ユニットのインスペクタ用の詳細。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UnitDetailDto {
+    pub unit: UnitSummaryDto,
+    pub order_mode: OrderModeDto,
+    pub inner_shuffle: bool,
+    /// 画像の表示時間（なしはプレイリストや既定の値）。
+    pub image_duration_ms: Option<i64>,
+    pub note: Option<String>,
+    pub source_url: Option<String>,
+    pub tags: Vec<TagRefDto>,
+    pub folders: Vec<UnitFolderDto>,
+    pub play_count: i64,
+    pub last_played_at: Option<i64>,
+}
+
+impl From<UnitDetail> for UnitDetailDto {
+    fn from(d: UnitDetail) -> Self {
+        Self {
+            unit: d.summary.into(),
+            order_mode: d.order_mode.into(),
+            inner_shuffle: d.inner_shuffle,
+            image_duration_ms: d.image_duration_ms,
+            note: d.note,
+            source_url: d.source_url,
+            tags: d.tags.into_iter().map(Into::into).collect(),
+            folders: d
+                .folders
+                .into_iter()
+                .map(|f| UnitFolderDto {
+                    folder_id: f.folder_id,
+                    path: f.path,
+                    recursive: f.recursive,
+                })
+                .collect(),
+            play_count: d.play_count,
+            last_played_at: d.last_played_at,
+        }
+    }
+}
+
+/// ユニットの変更（省略した項目は変えない。`imageDurationMs` の 0 は既定に戻す。`note` の空文字はメモを消す）。
+#[derive(Debug, Clone, Default, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UnitPatchDto {
+    pub name: Option<String>,
+    pub cover_item_id: Option<i64>,
+    pub order_mode: Option<OrderModeDto>,
+    pub inner_shuffle: Option<bool>,
+    pub image_duration_ms: Option<i64>,
+    pub rating: Option<i64>,
+    pub note: Option<String>,
+}
+
+impl From<UnitPatchDto> for UnitPatch {
+    fn from(p: UnitPatchDto) -> Self {
+        Self {
+            name: p.name,
+            cover_item_id: p.cover_item_id.map(Some),
+            order_mode: p.order_mode.map(Into::into),
+            inner_shuffle: p.inner_shuffle,
+            image_duration_ms: p.image_duration_ms.map(|ms| (ms != 0).then_some(ms)),
+            rating: p.rating,
+            note: clearable(p.note),
         }
     }
 }

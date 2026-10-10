@@ -27,6 +27,18 @@ export const commands = {
 	itemsGet: (ids: number[]) => typedError<ItemSummaryDto[], AppError>(__TAURI_INVOKE("items_get", { ids })),
 	/**  インスペクタ用の詳細（タグ・フォルダ・ユニットを含む）。 */
 	itemDetail: (id: number) => typedError<ItemDetailDto, AppError>(__TAURI_INVOKE("item_detail", { id })),
+	/**  サイドバーの「ライブラリ」の件数。 */
+	libraryCounts: () => typedError<LibraryCountsDto, AppError>(__TAURI_INVOKE("library_counts")),
+	/**  複数選択のインスペクタに出す集計（評価・メモ・タグ・フォルダ）。 */
+	itemsSelectionInfo: (ids: number[]) => typedError<SelectionInfoDto, AppError>(__TAURI_INVOKE("items_selection_info", { ids })),
+	/**  タイトル（1 件のとき）・評価・メモを変える。 */
+	itemsUpdate: (ids: number[], patch: ItemPatchDto) => typedError<null, AppError>(__TAURI_INVOKE("items_update", { ids, patch })),
+	/**  ゴミ箱に入れる。入れた件数を返す。 */
+	itemsTrash: (ids: number[]) => typedError<number, AppError>(__TAURI_INVOKE("items_trash", { ids })),
+	/**  ゴミ箱から戻す。戻した件数を返す。 */
+	itemsRestore: (ids: number[]) => typedError<number, AppError>(__TAURI_INVOKE("items_restore", { ids })),
+	/**  ゴミ箱を空にする（実ファイルも消す。確認はフロントで行う）。 */
+	trashEmpty: () => typedError<TrashEmptiedDto, AppError>(__TAURI_INVOKE("trash_empty")),
 	/**  ジョブを新しい順に一覧する。 */
 	jobsList: (filter: {
 	kinds?: JobKindDto[],
@@ -39,8 +51,54 @@ export const commands = {
 	jobPause: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("job_pause", { id })),
 	/**  一時停止したジョブを再開する。 */
 	jobResume: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("job_resume", { id })),
-	/**  すべての仮想フォルダ（木はフロントで組み立てる）。 */
-	foldersTree: () => typedError<FolderNodeDto[], AppError>(__TAURI_INVOKE("folders_tree")),
+	/**  すべての仮想フォルダ（木はフロントで組み立てる）。`with_counts` なら件数も数える。 */
+	foldersTree: (withCounts: boolean | null) => typedError<FolderNodeDto[], AppError>(__TAURI_INVOKE("folders_tree", { withCounts })),
+	/**  フォルダを作る（`parent_id` がなければいちばん上）。作ったフォルダの ID を返す。 */
+	folderCreate: (parentId: number | null, name: string) => typedError<number, AppError>(__TAURI_INVOKE("folder_create", { parentId, name })),
+	/**  名前・色を変える。 */
+	folderUpdate: (id: number, patch: FolderPatchDto) => typedError<null, AppError>(__TAURI_INVOKE("folder_update", { id, patch })),
+	/**  フォルダを `parent_id` の下の `before_id` の前（なければ最後）へ移す。 */
+	folderMove: (id: number, parentId: number | null, beforeId: number | null) => typedError<null, AppError>(__TAURI_INVOKE("folder_move", { id, parentId, beforeId })),
+	/**  フォルダと中のフォルダを消す（アイテムは残る）。消したフォルダの数を返す。 */
+	folderDelete: (id: number) => typedError<number, AppError>(__TAURI_INVOKE("folder_delete", { id })),
+	/**  アイテムを `add` のフォルダに入れ、`remove` のフォルダから外す。 */
+	itemsSetFolders: (itemIds: number[], add: number[], remove: number[]) => typedError<null, AppError>(__TAURI_INVOKE("items_set_folders", { itemIds, add, remove })),
+	/**  入力に合うタグの候補（前方一致 → 部分一致、使われている数の多い順）。 */
+	tagsSuggest: (prefix: string, limit: number) => typedError<TagSuggestionDto[], AppError>(__TAURI_INVOKE("tags_suggest", { prefix, limit })),
+	/**  アイテムに `add`（名前。なければ作る）を付け、`remove`（ID）を外す。付けたタグの ID を返す。 */
+	tagsApply: (itemIds: number[], add: string[], remove: number[]) => typedError<number[], AppError>(__TAURI_INVOKE("tags_apply", { itemIds, add, remove })),
+	/**  タグの編集画面の内容（別名・親・子を含む）。 */
+	tagDetail: (id: number) => typedError<TagDetailDto, AppError>(__TAURI_INVOKE("tag_detail", { id })),
+	/**  名前空間・名前・色・別名・親タグを変える。 */
+	tagUpdate: (id: number, patch: TagPatchDto) => typedError<null, AppError>(__TAURI_INVOKE("tag_update", { id, patch })),
+	/**  `from` を `into` に統合する（`from` の名前は別名として残る）。 */
+	tagMerge: (from: number, into: number) => typedError<null, AppError>(__TAURI_INVOKE("tag_merge", { from, into })),
+	/**  タグを消す（付いていたアイテムからも外れる）。 */
+	tagDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("tag_delete", { id })),
+	/**  見えている分のユニットの要約（最大 200 件、渡した順）。 */
+	unitsGet: (ids: number[]) => typedError<UnitSummaryDto[], AppError>(__TAURI_INVOKE("units_get", { ids })),
+	/**  ユニットのインスペクタ用の詳細。 */
+	unitDetail: (id: number) => typedError<UnitDetailDto, AppError>(__TAURI_INVOKE("unit_detail", { id })),
+	/**  ユニットを選ぶ一覧（名前に `filter` を含むもの、更新の新しい順）。 */
+	unitsList: (filter: string, kind: "set" | "folder" | null, limit: number) => typedError<UnitRefDto[], AppError>(__TAURI_INVOKE("units_list", { filter, kind, limit })),
+	/**  選んだアイテムを set ユニットにまとめる（渡した順が並び順）。作ったユニットの ID を返す。 */
+	unitCreateSet: (name: string, itemIds: number[]) => typedError<number, AppError>(__TAURI_INVOKE("unit_create_set", { name, itemIds })),
+	/**  フォルダを参照する folder ユニットを作る。作ったユニットの ID を返す。 */
+	unitCreateFolder: (name: string, folders: UnitFolderDto[]) => typedError<number, AppError>(__TAURI_INVOKE("unit_create_folder", { name, folders })),
+	/**  ユニットの設定を変える。 */
+	unitUpdate: (id: number, patch: UnitPatchDto) => typedError<null, AppError>(__TAURI_INVOKE("unit_update", { id, patch })),
+	/**  set ユニットの最後にアイテムを加える。 */
+	unitAddItems: (id: number, itemIds: number[]) => typedError<null, AppError>(__TAURI_INVOKE("unit_add_items", { id, itemIds })),
+	/**  set ユニットからアイテムを外す。 */
+	unitRemoveItems: (id: number, itemIds: number[]) => typedError<null, AppError>(__TAURI_INVOKE("unit_remove_items", { id, itemIds })),
+	/**  set ユニットのメンバーを渡した順に並べ直す（並び順は手動になる）。 */
+	unitReorder: (id: number, itemIds: number[]) => typedError<null, AppError>(__TAURI_INVOKE("unit_reorder", { id, itemIds })),
+	/**  folder ユニットの参照フォルダを置き換える。 */
+	unitSetFolders: (id: number, folders: UnitFolderDto[]) => typedError<null, AppError>(__TAURI_INVOKE("unit_set_folders", { id, folders })),
+	/**  ユニット自体にタグを付け外しする。 */
+	unitTagsApply: (id: number, add: string[], remove: number[]) => typedError<null, AppError>(__TAURI_INVOKE("unit_tags_apply", { id, add, remove })),
+	/**  ユニットを解除する（アイテムは残る）。 */
+	unitDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("unit_delete", { id })),
 };
 
 /** Events */
@@ -66,8 +124,24 @@ export type Appearance = {
 	reduceTransparency: boolean,
 };
 
+/**  ユニットの表紙。 */
+export type CoverDto = {
+	itemId: number,
+	hash: string,
+	kind: string,
+	thumbState: string,
+	width: number | null,
+	height: number | null,
+};
+
 /**  重複の扱い。 */
 export type DuplicatePolicyDto = "addMemberships" | "ignore";
+
+/**  フォルダと、入っている件数。 */
+export type FolderCountDto = {
+	folder: FolderRefDto,
+	count: number,
+};
 
 /**  仮想フォルダ 1 つ。 */
 export type FolderNodeDto = {
@@ -76,6 +150,16 @@ export type FolderNodeDto = {
 	name: string,
 	color: string | null,
 	pos: number | null,
+	/**  件数（子孫フォルダの分を含む。`folders_tree(withCounts)` のときだけ）。 */
+	count: number | null,
+	/**  このフォルダを参照する folder ユニット。 */
+	unitId: number | null,
+};
+
+/**  フォルダの変更（省略した項目は変えない。`color` の空文字は色を外す）。 */
+export type FolderPatchDto = {
+	name?: string | null,
+	color?: string | null,
 };
 
 /**  所属する仮想フォルダ（いちばん上からのパス）。 */
@@ -149,6 +233,13 @@ export type ItemDetailDto = {
 	units: UnitRefDto[],
 };
 
+/**  アイテムの変更（省略した項目は変えない。`note` の空文字はメモを消す）。 */
+export type ItemPatchDto = {
+	title?: string | null,
+	rating?: number | null,
+	note?: string | null,
+};
+
 /**  一覧の 1 件（グリッドのタイル）。 */
 export type ItemSummaryDto = {
 	id: number,
@@ -207,6 +298,15 @@ export type JobProgress = {
 /**  ジョブの状態。 */
 export type JobStateDto = "queued" | "running" | "paused" | "done" | "failed" | "canceled";
 
+/**  サイドバーの「ライブラリ」の件数。 */
+export type LibraryCountsDto = {
+	all: number,
+	recent: number,
+	unsorted: number,
+	untagged: number,
+	trash: number,
+};
+
 /**  ライブラリの概要。 */
 export type LibraryInfoDto = {
 	name: string,
@@ -231,10 +331,50 @@ export type LocationCheckDto = {
 /**  場所の状態。 */
 export type LocationStatusDto = "new" | "existingLibrary" | "occupied";
 
+/**  ユニットのメンバーの並び順。 */
+export type OrderModeDto = "manual" | "name" | "imported" | "captured" | "duration";
+
 /**  ドロップされたもの。 */
 export type ScanRootDto = {
 	name: string,
 	isDir: boolean,
+};
+
+/**  複数選択のインスペクタに出す集計。 */
+export type SelectionInfoDto = {
+	count: number,
+	/**  全件の評価が同じならその値。 */
+	rating: number | null,
+	/**  全件のメモが同じか。 */
+	sameNote: boolean,
+	/**  全件が同じときのメモ。 */
+	note: string | null,
+	tags: TagCountDto[],
+	folders: FolderCountDto[],
+};
+
+/**  タグと、付いている件数。 */
+export type TagCountDto = {
+	tag: TagRefDto,
+	count: number,
+};
+
+/**  タグの編集画面の内容。 */
+export type TagDetailDto = {
+	tag: TagRefDto,
+	count: number,
+	aliases: string[],
+	parents: TagRefDto[],
+	children: TagRefDto[],
+};
+
+/**  タグの変更（省略した項目は変えない。`color` の空文字は色を外す。`aliases`・`parents` は置き換え）。 */
+export type TagPatchDto = {
+	namespace?: string | null,
+	name?: string | null,
+	color?: string | null,
+	aliases?: string[] | null,
+	parents?: number[] | null,
 };
 
 /**  タグ。 */
@@ -242,13 +382,87 @@ export type TagRefDto = {
 	id: number,
 	namespace: string,
 	name: string,
+	/**  色のトークン名（`blue` / `violet` / `amber` / `teal`）。 */
+	color: string | null,
+};
+
+/**  タグの候補。 */
+export type TagSuggestionDto = {
+	tag: TagRefDto,
+	count: number,
+	/**  別名で一致したときの別名。 */
+	alias: string | null,
+};
+
+/**  ゴミ箱を空にした結果。 */
+export type TrashEmptiedDto = {
+	items: number,
+	bytes: number,
+	failed: number,
+};
+
+/**  ユニットのインスペクタ用の詳細。 */
+export type UnitDetailDto = {
+	unit: UnitSummaryDto,
+	orderMode: OrderModeDto,
+	innerShuffle: boolean,
+	/**  画像の表示時間（なしはプレイリストや既定の値）。 */
+	imageDurationMs: number | null,
+	note: string | null,
+	sourceUrl: string | null,
+	tags: TagRefDto[],
+	folders: UnitFolderDto[],
+	playCount: number,
+	lastPlayedAt: number | null,
+};
+
+/**  folder ユニットの参照フォルダ。 */
+export type UnitFolderDto = {
+	folderId: number,
+	/**  いちばん上からのパス（出力のときだけ）。 */
+	path?: string[],
+	recursive: boolean,
+};
+
+/**  ユニットの種類（`set` = ファイル群、`folder` = フォルダ群）。 */
+export type UnitKindDto = "set" | "folder";
+
+/**  ユニットの変更（省略した項目は変えない。`imageDurationMs` の 0 は既定に戻す。`note` の空文字はメモを消す）。 */
+export type UnitPatchDto = {
+	name?: string | null,
+	coverItemId?: number | null,
+	orderMode?: OrderModeDto | null,
+	innerShuffle?: boolean | null,
+	imageDurationMs?: number | null,
+	rating?: number | null,
+	note?: string | null,
 };
 
 /**  所属するユニット。 */
 export type UnitRefDto = {
 	id: number,
 	name: string,
-	kind: string,
+	kind: UnitKindDto,
+};
+
+/**  グリッドのタイルに出すユニットの要約。 */
+export type UnitSummaryDto = {
+	id: number,
+	kind: UnitKindDto,
+	name: string,
+	cover: CoverDto | null,
+	count: number,
+	/**  音楽・動画は長さ、画像は表示時間の合計（ミリ秒）。 */
+	durationMs: number,
+	/**  メンバーの種類（`image` / `video` / `audio`）。 */
+	kinds: string[],
+	/**  集計した評価（ユニットの評価、なければメンバーの平均）。 */
+	rating: number,
+	/**  ユニット自体の評価（0 は未評価）。 */
+	ownRating: number,
+	/**  `user` / `import` / `download`。 */
+	origin: string,
+	createdAt: number,
 };
 
 /* Tauri Specta runtime */

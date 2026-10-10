@@ -1,15 +1,36 @@
-//! 一覧（ID 先取り）と、見えている分の詳細。
+//! 一覧（ID 先取り）と、見えている分の詳細、アイテムの編集とゴミ箱。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kura_core::items::{ItemQuery, ItemSort, detail, query_ids, summaries};
+use kura_core::items::{
+    self, ItemPatch, ItemQuery, ItemSort, ItemView, detail, query_ids, recent_since, summaries,
+};
+use kura_core::time::now_ms;
 use tauri::State;
 use tauri::ipc::Response;
 
 use super::blocking;
-use crate::dto::{ItemDetailDto, ItemSummaryDto};
+use crate::dto::{
+    ItemDetailDto, ItemPatchDto, ItemSummaryDto, ItemViewDto, LibraryCountsDto, SelectionInfoDto,
+    TrashEmptiedDto,
+};
 use crate::error::AppError;
 use crate::state::AppState;
+
+fn to_view(view: ItemViewDto, now: i64) -> ItemView {
+    match view {
+        ItemViewDto::All => ItemView::All,
+        ItemViewDto::Recent => ItemView::Recent {
+            since: recent_since(now),
+        },
+        ItemViewDto::Unsorted => ItemView::Unsorted,
+        ItemViewDto::Untagged => ItemView::Untagged,
+        ItemViewDto::Random { seed } => ItemView::Random { seed },
+        ItemViewDto::Trash => ItemView::Trash,
+        ItemViewDto::Folder { id } => ItemView::Folder { id },
+        ItemViewDto::Unit { id } => ItemView::Unit { id },
+    }
+}
 
 static FIRST_IDS: AtomicBool = AtomicBool::new(true);
 static FIRST_GET: AtomicBool = AtomicBool::new(true);
@@ -20,12 +41,14 @@ static FIRST_GET: AtomicBool = AtomicBool::new(true);
 pub async fn items_query_ids(
     state: State<'_, AppState>,
     utc_offset_minutes: i32,
-    trashed: Option<bool>,
+    view: Option<ItemViewDto>,
+    collapse_units: Option<bool>,
 ) -> Result<Response, AppError> {
     let session = state.session()?;
     let bytes = blocking(move || {
         let query = ItemQuery {
-            trashed: trashed.unwrap_or(false),
+            view: to_view(view.unwrap_or(ItemViewDto::All), now_ms()),
+            collapse_units: collapse_units.unwrap_or(false),
         };
         let list = session
             .library()
@@ -72,4 +95,108 @@ pub async fn items_get(
 pub async fn item_detail(state: State<'_, AppState>, id: i64) -> Result<ItemDetailDto, AppError> {
     let session = state.session()?;
     blocking(move || Ok(session.library().db().read(|conn| detail(conn, id))?.into())).await
+}
+
+/// サイドバーの「ライブラリ」の件数。
+#[tauri::command]
+#[specta::specta]
+pub async fn library_counts(state: State<'_, AppState>) -> Result<LibraryCountsDto, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        let since = recent_since(now_ms());
+        Ok(session
+            .library()
+            .db()
+            .read(|conn| items::counts(conn, since))?
+            .into())
+    })
+    .await
+}
+
+/// タイトル（1 件のとき）・評価・メモを変える。
+#[tauri::command]
+#[specta::specta]
+pub async fn items_update(
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+    patch: ItemPatchDto,
+) -> Result<(), AppError> {
+    let session = state.session()?;
+    let patch: ItemPatch = patch.into();
+    blocking(move || {
+        let now = now_ms();
+        Ok(session
+            .library()
+            .db()
+            .write(move |tx| items::update(tx, &ids, &patch, now))?)
+    })
+    .await
+}
+
+/// ゴミ箱に入れる。入れた件数を返す。
+#[tauri::command]
+#[specta::specta]
+pub async fn items_trash(state: State<'_, AppState>, ids: Vec<i64>) -> Result<u32, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        let now = now_ms();
+        let n = session
+            .library()
+            .db()
+            .write(move |tx| items::trash(tx, &ids, now))?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    })
+    .await
+}
+
+/// ゴミ箱から戻す。戻した件数を返す。
+#[tauri::command]
+#[specta::specta]
+pub async fn items_restore(state: State<'_, AppState>, ids: Vec<i64>) -> Result<u32, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        let now = now_ms();
+        let n = session
+            .library()
+            .db()
+            .write(move |tx| items::restore(tx, &ids, now))?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    })
+    .await
+}
+
+/// ゴミ箱を空にする（実ファイルも消す。確認はフロントで行う）。
+#[tauri::command]
+#[specta::specta]
+pub async fn trash_empty(state: State<'_, AppState>) -> Result<TrashEmptiedDto, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        let result = session.library().empty_trash()?;
+        tracing::info!(
+            items = result.items,
+            bytes = result.bytes,
+            failed = result.failed,
+            "ゴミ箱を空にしました"
+        );
+        Ok(result.into())
+    })
+    .await
+}
+
+/// 複数選択のインスペクタに出す集計（評価・メモ・タグ・フォルダ）。
+#[tauri::command]
+#[specta::specta]
+pub async fn items_selection_info(
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+) -> Result<SelectionInfoDto, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        Ok(session
+            .library()
+            .db()
+            .read(|conn| items::selection_info(conn, &ids))?
+            .into())
+    })
+    .await
 }

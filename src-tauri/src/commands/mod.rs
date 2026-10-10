@@ -7,6 +7,8 @@ pub mod import;
 pub mod items;
 pub mod jobs;
 pub mod library;
+pub mod tags;
+pub mod units;
 
 use crate::error::AppError;
 
