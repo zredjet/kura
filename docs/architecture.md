@@ -47,8 +47,8 @@
 | | `library_check_location(path)` → `{ path, status, syncService }` | 置き場所の確認（`.kuralib` の補完、`new` / `existingLibrary` / `occupied`、同期フォルダの中か） |
 | 取り込み | `import_preview(paths)` | 種類別件数・合計サイズ・重複の見込み・フォルダ木を返す |
 | | `import_start(paths, options)` → `JobId` | 取り込みジョブを開始 |
-| 一覧 | `items_query_ids(utcOffsetMinutes, view?, collapseUnits?)` → 生バイト | 一覧の ID と縦横比を並び順で、日付見出しのグループ付きで返す。`[件数 u32][id u32 × N][縦横比×1000 u16 × N][グループ数 u32][開始位置 u32 × G][日 i32 × G]`（LE）。縦横比が分からないもの（音楽など）は 1000。日は `utcOffsetMinutes` の時差で区切った 1970-01-01 からの日数。tauri-specta を通さず `tauri::ipc::Response` で返す（フロントには ArrayBuffer で届く。ラッパーは `src/ipc/items.ts`。ADR-33） |
-| | （`view`） | `{ kind: 'all' \| 'recent' \| 'unsorted' \| 'untagged' \| 'trash' }`、`{ kind: 'random', seed }`、`{ kind: 'folder', id }`（子孫フォルダの分も含む）、`{ kind: 'unit', id }`（ユニットの並び順）。ランダムとユニットの中は見出しなし。ゴミ箱は入れた日の新しい順、それ以外は追加日の新しい順。検索条件 `query` と並び順 `sort` は M4 で足す |
+| 一覧 | `items_query_ids(utcOffsetMinutes, view?, collapseUnits?, query?, sort?)` → 生バイト | 一覧の ID と縦横比を並び順で、日付見出しのグループ付きで返す。`[件数 u32][id u32 × N][縦横比×1000 u16 × N][グループ数 u32][開始位置 u32 × G][日 i32 × G]`（LE）。縦横比が分からないもの（音楽など）は 1000。日は `utcOffsetMinutes` の時差で区切った 1970-01-01 からの日数。tauri-specta を通さず `tauri::ipc::Response` で返す（フロントには ArrayBuffer で届く。ラッパーは `src/ipc/items.ts`。ADR-33） |
+| | （`view`） | `{ kind: 'all' \| 'recent' \| 'unsorted' \| 'untagged' \| 'trash' }`、`{ kind: 'random', seed }`、`{ kind: 'folder', id }`（子孫フォルダの分も含む）、`{ kind: 'unit', id }`（ユニットの並び順）、`{ kind: 'smart', id }`（スマートフォルダ）。`query` は検索の文字列（docs/search-query.md。解析できなければ `InvalidQuery`）で、一覧の種類の条件に AND で重ねる。`sort` は `{ key: imported \| captured \| name \| rating \| duration \| size, desc }`。日付の見出しは追加日・撮影日で並べたときだけ（撮影日のないものは日 `-2147483648` のグループ）。ランダム・ユニットの中は見出しなし、ゴミ箱は入れた日の新しい順で、並び順は使わない |
 | | （`collapseUnits` が true のとき） | set ユニットに属するアイテムを、最初に一致したメンバーの位置で 1 件のユニットにまとめる。ユニットは `0x8000_0000 \| unit_id` で表し、縦横比は表紙のもの。ゴミ箱とユニットの中ではまとめない |
 | | `items_get(ids)` → `ItemSummary[]` / `units_get(ids)` → `UnitSummary[]` | 最大 200 件。要求した順で返し、ないものは省く |
 | | `item_detail(id)` → `ItemDetail` | タグ・フォルダ・ユニット（set のメンバー、または参照フォルダに入っている folder ユニット）・取得元を含む |
@@ -66,9 +66,9 @@
 | | `unit_create_set(name, itemIds)` / `unit_create_folder(name, folders)` | set は渡した順＝manual、表紙は先頭。folder は名前順 |
 | | `unit_update(id, patch)` / `unit_tags_apply(id, add, remove)` | 名前・表紙・並び順・ユニット内シャッフル・画像の表示時間（0 で既定）・評価・メモ（空文字で消す）。folder は manual にできない |
 | | `unit_add_items(id, itemIds)` / `unit_remove_items(id, itemIds)` / `unit_reorder(id, itemIds)` / `unit_set_folders(id, folders)` / `unit_delete(id)` | set のメンバーの追加・削除・並べ替え（並べ替えると manual になる）、folder の参照フォルダの置き換え、解除（アイテムは残る）。`docs/playlists.md` §2 |
-| スマートフォルダ | `smart_folders_list` / `smart_folder_save(name, query)` / `smart_folder_delete` | |
-| 検索 | `query_parse(text)` → `QueryAst` | ⌘K の候補表示・エラー表示用 |
-| | `query_suggest(text, cursor)` → `Suggestion[]` | タグ・フィールド・保存済み検索の候補 |
+| スマートフォルダ | `smart_folders_list(withCounts?, utcOffsetMinutes)` / `smart_folder_save(name, query)` / `smart_folder_update(id, name?, query?)` / `smart_folder_delete(id)` | 条件は検索の文字列のまま保存（解析できない条件は保存しない）。件数は一致するアイテムの数 |
+| 検索 | `query_parse(text, view?, utcOffsetMinutes)` → `{ error?, clauses, counts? }` | ⌘K のチップ・件数・エラー表示用。`error` は位置（UTF-16）と理由、`clauses` はいちばん外側の AND の条件、`counts` は開いている一覧の中で一致する種類ごとの件数 |
+| | `query_suggest(word, limit)` → `Suggestion[]` | 入力中の語の候補：タグ → フィールド名・値 → 保存済みの検索（`kind` / `insert` / `prefix` / `label` / `count` / `id`） |
 | プレイリスト | `playlists_list()` / `playlist_create(name, kind, granularity)` / `playlist_update(id, patch)` / `playlist_delete(id)` | |
 | | `playlist_entries(id)` / `playlist_add(id, targets, at, mode)` / `playlist_move(entry_ids, before_entry_id)` / `playlist_remove(entry_ids)` | `mode` は `auto` / `expand` / `keep`（§3.5） |
 | | `playlist_set_granularity(id, granularity)` | 非破壊（§3.4） |
@@ -223,6 +223,8 @@ import_start:    ジョブとして実行
 - 右クリックのメニュー（`components/Menu`）と、名前の入力・確認・候補から選ぶダイアログ（`components/Overlay` の `askText`・`askConfirm`・`askPick`）は 1 か所で描き、どこからでも開ける。
 - アプリの中のドラッグ（タイル → フォルダ、フォルダの移動、ユニットの中の並べ替え）はポインタイベントで自前に行う（`dragState.ts`）。Tauri のファイルドロップの処理が WebView の HTML5 ドラッグのイベントをすべて受け取り、JS に `dragover` / `drop` が届かないため（ADR-44）。
 - WebKit ではボタンを押してもフォーカスが移らないので、タイルとサイドバーの行は押したときにフォーカスを移す（続けて押したキーがそこに届くように）。
+- 検索の条件は `viewStore.filter`（チップの文字列の列）。⌘K パレット（`features/search`）・ツールバーの検索欄・フィルタバーは、どれもこの列を読み書きする。一覧を切り替えると外し、ユニットを開いたら預けて、戻ったら戻す（ADR-53）。パレットの開き方（新しいスマートフォルダ・条件の編集）は `searchStore`。
+- 並び順は `viewStore.sort`（表示の設定として `localStorage` の `kura.view` に残す）。
 - `viewStore` は選択中の ID・サムネイルの大きさ（行の高さ 110 / 140 / 180 / 230 / 300px の 5 段階）・インスペクタの開閉・クイックルックを持つ。大きさとインスペクタの開閉だけを `localStorage`（`kura.view`）に残す。
 
 ## 13. 開発用のツールと計測
@@ -257,3 +259,17 @@ M3 の実測（同じ環境、10 万件・ユニット 500 個、`bench query` �
 | まとめて表示（10 万件 → 95,500 件） | 20〜30ms |
 | サイドバーの件数（ライブラリの 5 項目＋フォルダ 60 個） | 40〜64ms（グリッドのあとに別に取る） |
 | タグの候補（2,000 個から） | 6〜10ms |
+
+M4 の実測（同じ環境、10 万件、`bench query` の検索の中央値）：
+
+| 検索 | 一致 | 結果 | 目標 |
+|---|---|---|---|
+| タグ 3 つの AND（よく使うタグ） | 32 件 | 1.0ms | NFR-03：50ms 以内 |
+| タグ 3 つの AND（名前空間なし） | 5 件 | 0.7ms | 同上 |
+| タグ 3 つの AND（珍しいタグを含む） | 0 件 | 0.5ms | 同上 |
+| 全文検索（3 文字以上、FTS5 trigram） | 6 件 | 0.2ms | NFR-03：100ms 以内 |
+| 全文検索（2 文字、LIKE） | 3,691 件 | 21ms | 同上 |
+| 種類・評価・追加日の組み合わせ | 10,439 件 | 7.5ms | — |
+| OR・除外・種類の組み合わせ | 5,763 件 | 15ms | — |
+| 名前順（10 万件、自然順） | — | 135ms | — |
+| 撮影日順（10 万件） | — | 53ms | — |

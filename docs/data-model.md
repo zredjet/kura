@@ -334,8 +334,14 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 
 ### 全文検索
 
-- 3 文字以上：`items_fts MATCH ?`。
-- 1〜2 文字：`title LIKE '%' || ? || '%'`（インデックスは効かないが、ほかの条件で絞ってから適用する）。
+- 3 文字以上：`items_fts MATCH ?`（語は `"…"` で囲んだ句として渡す）。
+- 1〜2 文字：`title` / `original_name` / `note` / `source_url` の `LIKE '%…%' ESCAPE '\'`（インデックスは効かないが、10 万件で 21ms）。
+
+### 検索の条件（M4）
+
+- 検索言語（docs/search-query.md）の AST を `items i` に対する WHERE に変換し、一覧の種類の条件に AND で重ねる。値はすべてバインド変数。
+- タグの AND は `i.id IN (SELECT item_id FROM item_tags WHERE tag_id IN (…) INTERSECT …)`（主キー `(tag_id, item_id)` の範囲を交わらせる）。
+- スマートフォルダは `smart_folders.query` に検索の文字列をそのまま保存し、開くたびに解析・変換する（相対の日付が今の時刻で解決されるように）。
 
 ### ユニットの集計
 

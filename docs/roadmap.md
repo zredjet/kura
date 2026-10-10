@@ -80,10 +80,10 @@
 
 ## M4　検索
 
-- [ ] 検索言語：字句解析・構文解析・AST・SQL 生成（`docs/search-query.md`）
-- [ ] FTS5 trigram とトリガー（テーブルとトリガーは M1 の `0001_init.sql` で作成済み。M4 では検索での利用）
-- [ ] ⌘K パレット（`Search.dc.html`）、フィルタバーのチップ
-- [ ] スマートフォルダの保存・表示
+- [x] 検索言語：字句解析・構文解析・AST・SQL 生成（`docs/search-query.md`）
+- [x] FTS5 trigram とトリガー（テーブルとトリガーは M1 の `0001_init.sql` で作成済み。M4 では検索での利用）
+- [x] ⌘K パレット（`Search.dc.html`）、フィルタバーのチップ（色のチップは M9 で検討。ADR-56）
+- [x] スマートフォルダの保存・表示
 
 **完了条件**：`docs/search-query.md` §7 のテストが通る／10 万件でタグ 3 つの AND が 50ms 以内
 
