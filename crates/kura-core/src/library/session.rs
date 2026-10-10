@@ -10,6 +10,7 @@ use crate::Result;
 use crate::import::ImportHandler;
 use crate::jobs::{JobKind, JobManager};
 use crate::media::{MediaBackend, ThumbnailHandler};
+use crate::playback::{PlaybackSupport, ProxyHandler, ProxyShared, ProxyTools, proxy};
 
 pub use crate::jobs::EventSink;
 
@@ -28,6 +29,7 @@ pub struct LibraryInfo {
 pub struct LibrarySession {
     library: Arc<Library>,
     jobs: Arc<JobManager>,
+    proxy: Arc<ProxyShared>,
     integrity: Arc<Mutex<Option<IntegrityReport>>>,
     startup: Mutex<Option<JoinHandle<()>>>,
 }
@@ -47,6 +49,7 @@ impl LibrarySession {
         let library = Arc::new(library);
         // ジョブを動かす前に書きかけを消す（再開するジョブは最初からコピーし直す）
         let staging_removed = clean_staging(library.layout())?;
+        let proxy = Arc::new(ProxyShared::default());
         let jobs = Arc::new(JobManager::new(
             library.clone(),
             vec![
@@ -55,6 +58,10 @@ impl LibrarySession {
                     Arc::new(ImportHandler::new(backend.clone())),
                 ),
                 (JobKind::Thumbnail, Arc::new(ThumbnailHandler::new(backend))),
+                (
+                    JobKind::Proxy,
+                    Arc::new(ProxyHandler::new(ProxyTools::detect(), proxy.clone())),
+                ),
             ],
             sink,
         )?);
@@ -107,6 +114,7 @@ impl LibrarySession {
         Ok(Self {
             library,
             jobs,
+            proxy,
             integrity,
             startup: Mutex::new(Some(startup)),
         })
@@ -120,6 +128,36 @@ impl LibrarySession {
     /// ジョブ。
     pub fn jobs(&self) -> &JobManager {
         &self.jobs
+    }
+
+    /// 再生可否の表を受け取る。前回と変わっていれば判定をやり直し、判定・作成を待つものがあればプロキシのジョブを積む。
+    pub fn set_playback_support(&self, support: PlaybackSupport) -> Result<()> {
+        let fingerprint = support.fingerprint();
+        self.proxy.set_support(support);
+        let todo = self
+            .library
+            .db()
+            .write(move |tx| proxy::sync_support(tx, &fingerprint))?;
+        if todo {
+            self.jobs.ensure_queued(JobKind::Proxy, "{}")?;
+        }
+        Ok(())
+    }
+
+    /// 再生キューの今と次のアイテムのプロキシを先に作る。`force` なら、元のまま再生できなかったものを作成待ちに戻す。
+    pub fn request_proxies(&self, ids: Vec<i64>, force: bool) -> Result<()> {
+        self.proxy.prioritize(ids.clone());
+        let todo = if force {
+            self.library
+                .db()
+                .write(move |tx| proxy::force_pending(tx, &ids))?
+        } else {
+            self.library.db().read(|conn| proxy::any_todo(conn, &ids))?
+        };
+        if todo {
+            self.jobs.ensure_queued(JobKind::Proxy, "{}")?;
+        }
+        Ok(())
     }
 
     /// 整合性チェックの結果（終わるまでは None）。

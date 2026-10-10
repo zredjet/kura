@@ -556,10 +556,14 @@ pub struct ItemSummary {
     pub imported_at: i64,
     pub captured_at: Option<i64>,
     pub thumb_state: String,
+    /// 再生用プロキシの状態（unknown / not_needed / pending / ready / failed）。
+    pub proxy_state: String,
 }
 
 const SUMMARY_COLUMNS: &str = "id, hash, ext, kind, width, height, duration_ms, size_bytes, title, \
-                               rating, source_site, imported_at, captured_at, thumb_state";
+                               rating, source_site, imported_at, captured_at, thumb_state, proxy_state";
+/// `SUMMARY_COLUMNS` の列数（続けて読む列の位置に使う）。
+const SUMMARY_LEN: usize = 15;
 
 fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ItemSummary> {
     let hash: Vec<u8> = row.get(1)?;
@@ -578,6 +582,7 @@ fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ItemSummary> {
         imported_at: row.get(11)?,
         captured_at: row.get(12)?,
         thumb_state: row.get(13)?,
+        proxy_state: row.get(14)?,
     })
 }
 
@@ -638,13 +643,13 @@ pub fn detail(conn: &Connection, id: i64) -> Result<ItemDetail> {
         .query_row([id], |row| {
             Ok((
                 summary_from_row(row)?,
-                row.get::<_, Option<String>>(14)?,
-                row.get::<_, Option<String>>(15)?,
-                row.get::<_, String>(16)?,
-                row.get::<_, Option<String>>(17)?,
-                row.get::<_, Option<String>>(18)?,
-                row.get::<_, Option<String>>(19)?,
-                row.get::<_, Option<i64>>(20)?,
+                row.get::<_, Option<String>>(SUMMARY_LEN)?,
+                row.get::<_, Option<String>>(SUMMARY_LEN + 1)?,
+                row.get::<_, String>(SUMMARY_LEN + 2)?,
+                row.get::<_, Option<String>>(SUMMARY_LEN + 3)?,
+                row.get::<_, Option<String>>(SUMMARY_LEN + 4)?,
+                row.get::<_, Option<String>>(SUMMARY_LEN + 5)?,
+                row.get::<_, Option<i64>>(SUMMARY_LEN + 6)?,
             ))
         })
         .optional()?;
@@ -923,6 +928,11 @@ pub fn delete_trashed(conn: &Connection) -> Result<Vec<RemovedItem>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_len_matches_columns() {
+        assert_eq!(SUMMARY_COLUMNS.split(',').count(), SUMMARY_LEN);
+    }
     use crate::db::{query_plan, test_conn};
 
     fn ctx(utc_offset_minutes: i32) -> QueryContext {

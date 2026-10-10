@@ -219,6 +219,8 @@ impl JobHandler for ImportHandler {
             // 新しく入ったアイテムのサムネイルを作る（取り込みと並行して進める）
             if next.added > added_before {
                 ctx.ensure_queued(JobKind::Thumbnail, "{}")?;
+                // 動画・音楽は再生できるかを確かめ、要ればプロキシを作る
+                ctx.ensure_queued(JobKind::Proxy, "{}")?;
             }
             // 既存と同じ中身で拡張子だけ違ったコピーは、どのアイテムも使わないので消す
             for path in extra_files {

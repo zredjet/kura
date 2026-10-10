@@ -60,7 +60,8 @@ pub fn mime_for(ext: &str) -> Option<&'static str> {
         "wav" => "audio/wav",
         "aif" | "aiff" => "audio/aiff",
         "ogg" => "audio/ogg",
-        "opus" => "audio/opus",
+        // Ogg に入った Opus（RFC 7845）。WebKit は audio/opus では再生しない
+        "opus" => "audio/ogg",
         _ => return None,
     })
 }
@@ -89,5 +90,7 @@ mod tests {
             assert!(classify(ext).is_some(), "{ext}");
             assert!(mime_for(ext).is_some(), "{ext}");
         }
+        // WebKit が再生できる形で配る
+        assert_eq!(mime_for("opus"), Some("audio/ogg"));
     }
 }
