@@ -1,0 +1,195 @@
+/*
+ * Player.dc.html の再生バー：下から 20px、幅 780px まで、余白 12px 16px 14px、角丸 22px のガラスのカプセル。
+ * 1 段目は再生位置、2 段目は題名・操作・表示時間と音量。
+ */
+
+.bar {
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-5);
+  transform: translateX(-50%);
+  width: min(780px, calc(100% - var(--space-4) * 2));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2-5);
+  padding: var(--space-3) var(--space-4) var(--space-3-5);
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-2xl);
+  background: var(--glass-capsule);
+  box-shadow: var(--shadow-capsule);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  backdrop-filter: var(--glass-blur-strong);
+}
+
+.progressRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2-5);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 再生位置：溝 4px、進んだ分はアクセント。つまみはホバー・フォーカスのときだけ */
+.seek {
+  flex: 1;
+  height: 16px;
+  margin: 0;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+}
+
+.seek::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to right,
+    var(--accent) var(--pct, 0%),
+    var(--fill-track) var(--pct, 0%)
+  );
+}
+
+.seek::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: var(--text-primary);
+  opacity: 0;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.seek:hover::-webkit-slider-thumb,
+.seek:focus-visible::-webkit-slider-thumb {
+  opacity: 1;
+}
+
+.seek:disabled {
+  cursor: default;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.meta {
+  flex: 1 1 200px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+}
+
+.title {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sub {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.small,
+.toggle,
+.play {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill);
+}
+
+.small {
+  width: 40px;
+  height: 40px;
+  color: var(--text-primary);
+}
+
+.toggle {
+  width: 36px;
+  height: 36px;
+  color: var(--text-secondary);
+}
+
+.small:hover,
+.toggle:hover {
+  background: var(--fill-2);
+}
+
+.toggle[aria-pressed='true'] {
+  color: var(--accent);
+}
+
+.play {
+  width: 48px;
+  height: 48px;
+  background: var(--text-primary);
+  color: var(--bg-window);
+}
+
+.side {
+  flex: 1 1 200px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2-5);
+}
+
+.stepper {
+  display: flex;
+  align-items: center;
+  height: 30px;
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  font-size: var(--text-sm);
+}
+
+.stepButton {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-pill);
+  color: var(--text-primary);
+  font-size: var(--text-xl);
+}
+
+.stepButton:hover {
+  background: var(--fill-3);
+}
+
+.stepValue {
+  padding: 0 var(--space-1);
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.volume {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  color: var(--text-secondary);
+}
+
+.volumeInput {
+  width: 84px;
+  accent-color: var(--text-primary);
+}

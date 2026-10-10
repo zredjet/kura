@@ -18,6 +18,7 @@ const base: ItemSummaryDto = {
   importedAt: 0,
   capturedAt: null,
   thumbState: 'ready',
+  proxyState: 'not_needed',
 };
 
 describe('itemMeta', () => {

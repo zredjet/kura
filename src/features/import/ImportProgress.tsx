@@ -18,7 +18,7 @@ const AUTO_HIDE_MS = 6000;
 const t = ja.progress;
 
 /** 取り込みの進捗（グリッドの下中央に浮かぶカプセル）。 */
-export function ImportProgress() {
+export function ImportProgress({ raised = false }: { raised?: boolean }) {
   const job = useJobsStore(selectCurrentImport);
   const dismiss = useJobsStore((s) => s.dismiss);
   const refresh = useLibraryStore((s) => s.refresh);
@@ -59,7 +59,12 @@ export function ImportProgress() {
   };
 
   return (
-    <div className={styles.capsule} aria-label={t.label} role="group">
+    <div
+      className={styles.capsule}
+      data-raised={raised || undefined}
+      aria-label={t.label}
+      role="group"
+    >
       <span className={styles.icon}>
         <ImportIcon size={18} />
       </span>

@@ -3,6 +3,7 @@ import { ja } from '../../i18n/ja';
 import { isUnitEntry, unitIdOf } from '../../ipc/items';
 import { getCachedUnit } from '../../stores/itemCache';
 import { useViewStore } from '../../stores/viewStore';
+import { playSelection } from '../player/playSelection';
 import {
   dissolveUnits,
   groupEntries,
@@ -53,7 +54,9 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
   }
 
   const setUnit = viewedSetUnit();
-  const out: MenuEntry[] = [];
+  const out: MenuEntry[] = [
+    { label: ja.itemMenu.play, shortcut: '⌘↩', onSelect: () => playSelection(entries) },
+  ];
   if (only !== undefined && items.length === 1) {
     out.push({
       label: ja.itemMenu.quickLook,
@@ -68,9 +71,7 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
       onSelect: () => state.openUnit(unitIdOf(only)),
     });
   }
-  if (out.length > 0) {
-    out.push('separator');
-  }
+  out.push('separator');
   out.push({
     label: ja.itemMenu.addToFolder,
     shortcut: 'F',

@@ -44,6 +44,17 @@ export function formatDuration(ms: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
 }
 
+/** 長い時間を「2時間14分」「14分」「45秒」の形にする（キューの合計など）。 */
+export function formatLongDuration(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  if (h > 0) {
+    return m > 0 ? `${h}時間${m}分` : `${h}時間`;
+  }
+  return m > 0 ? `${m}分` : `${total}秒`;
+}
+
 /** ハッシュを「b3:9f2c…41a7」の形に短くする。 */
 export function shortHash(hash: string): string {
   return hash.length > 8 ? `b3:${hash.slice(0, 4)}…${hash.slice(-4)}` : `b3:${hash}`;

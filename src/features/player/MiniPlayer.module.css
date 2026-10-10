@@ -1,0 +1,102 @@
+/*
+ * Main.dc.html のミニプレーヤー：グリッドの下中央、幅 560px まで、余白 8px 10px 8px 8px のガラスのカプセル。
+ * ジャケット 40px、前・次 32px、再生 36px（白地）。下端に 2px の再生位置。
+ */
+
+.capsule {
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-5);
+  z-index: 5;
+  transform: translateX(-50%);
+  width: min(560px, calc(100% - var(--space-4) * 2));
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-2-5) var(--space-2) var(--space-2);
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-2xl);
+  overflow: hidden;
+  background: var(--glass-capsule);
+  box-shadow: var(--shadow-capsule);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  backdrop-filter: var(--glass-blur-strong);
+}
+
+.art {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--fill-2);
+  color: var(--text-tertiary);
+}
+
+.art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+}
+
+.title {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sub {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.button,
+.play {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill);
+}
+
+.button {
+  width: 32px;
+  height: 32px;
+  color: var(--text-primary);
+}
+
+.button:hover {
+  background: var(--fill-2);
+}
+
+.play {
+  width: 36px;
+  height: 36px;
+  background: var(--text-primary);
+  color: var(--bg-window);
+}
+
+.progress {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: var(--pct, 0%);
+  height: 2px;
+  background: var(--accent);
+}

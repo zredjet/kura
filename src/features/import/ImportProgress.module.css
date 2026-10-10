@@ -19,6 +19,11 @@
   backdrop-filter: var(--glass-blur-strong);
 }
 
+/* ミニプレーヤーが出ているときは、その上に積む（ミニプレーヤーの高さ 58px と間隔 8px） */
+.capsule[data-raised] {
+  bottom: calc(var(--space-5) + 58px + var(--space-2));
+}
+
 .icon {
   display: flex;
   flex: none;

@@ -8,6 +8,7 @@ import { useLibraryStore } from '../../stores/libraryStore';
 import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
+import { playSelection } from '../player/playSelection';
 import {
   dissolveUnits,
   groupEntries,
@@ -31,9 +32,9 @@ function isTyping(target: EventTarget | null): boolean {
   );
 }
 
-/** シート（ダイアログ）やメニューが開いているか。 */
+/** シート（ダイアログ）・メニュー・シアターが開いているか。 */
 function isBlocked(): boolean {
-  return document.querySelector('[data-sheet], [role="menu"]') !== null;
+  return document.querySelector('[data-sheet], [role="menu"], [data-theater]') !== null;
 }
 
 /** インスペクタのタグの入力欄に移る（T）。 */
@@ -72,6 +73,8 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
       view.setThumbSize(view.thumbSize - 1);
     } else if (key === 'a' && !e.shiftKey) {
       view.setSelection(selectAll(ids));
+    } else if (key === 'Enter' && entries.length > 0 && kind !== 'trash') {
+      playSelection(entries);
     } else if (key === 'g' && e.shiftKey) {
       void dissolveUnits(entries);
     } else if (key === 'g' && entries.length > 0 && kind !== 'trash') {

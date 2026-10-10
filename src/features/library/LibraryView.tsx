@@ -3,9 +3,7 @@ import { useEffect } from 'react';
 import { type MenuEntry, openMenuBelow } from '../../components/Menu/menuStore';
 import { CheckIcon } from '../../components/icons/CheckIcon';
 import { ja } from '../../i18n/ja';
-import type { FolderNodeDto } from '../../ipc/folders';
-import type { ItemSort, ListView, SortKey } from '../../ipc/items';
-import type { SmartFolderDto } from '../../ipc/search';
+import type { ItemSort, SortKey } from '../../ipc/items';
 import { formatCount } from '../../lib/format';
 import { getCachedUnit, useItemCacheVersion } from '../../stores/itemCache';
 import { useLibraryStore } from '../../stores/libraryStore';
@@ -13,6 +11,7 @@ import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import { ImportProgress } from '../import/ImportProgress';
+import { MiniPlayer, useMiniPlayerVisible } from '../player/MiniPlayer';
 import { pickAndImport } from '../import/useFileDrop';
 import { joinClauses } from '../search/clauses';
 import { emptyTrashWithConfirm } from './actions';
@@ -23,6 +22,7 @@ import styles from './LibraryView.module.css';
 import { QuickLook } from './QuickLook';
 import { Toolbar } from './Toolbar';
 import { useLibraryKeys } from './useLibraryKeys';
+import { viewTitle } from './viewTitle';
 
 /** 並び順の言い方（「追加日の新しい順」など）。 */
 export function sortLabel(sort: ItemSort): string {
@@ -59,37 +59,10 @@ function sortMenu(anchor: HTMLElement): void {
   openMenuBelow(anchor, ja.sort.label, entries);
 }
 
-/** 一覧の見出し（サイドバーの項目名・フォルダ名・ユニット名・スマートフォルダ名）。 */
-export function viewTitle(
-  view: ListView,
-  folders: readonly FolderNodeDto[],
-  smart: readonly SmartFolderDto[] = [],
-): string {
-  switch (view.kind) {
-    case 'all':
-      return ja.sidebar.all;
-    case 'recent':
-      return ja.sidebar.recent;
-    case 'unsorted':
-      return ja.sidebar.unsorted;
-    case 'untagged':
-      return ja.sidebar.untagged;
-    case 'random':
-      return ja.sidebar.random;
-    case 'trash':
-      return ja.sidebar.trash;
-    case 'folder':
-      return folders.find((f) => f.id === view.id)?.name ?? ja.sidebar.folders;
-    case 'unit':
-      return getCachedUnit(view.id)?.name ?? ja.library.unitTitle;
-    case 'smart':
-      return smart.find((s) => s.id === view.id)?.name ?? ja.library.smartTitle;
-  }
-}
-
 /** ライブラリ画面（Main.dc.html）。上にツールバーとフィルタバー、下にグリッドとインスペクタ。 */
 export function LibraryView() {
   const list = useLibraryStore((s) => s.list);
+  const miniPlayer = useMiniPlayerVisible();
   const itemCount = useLibraryStore((s) => s.info?.itemCount ?? 0);
   const folders = useSidebarStore((s) => s.folders);
   const smartFolders = useSidebarStore((s) => s.smartFolders);
@@ -164,7 +137,8 @@ export function LibraryView() {
       <div className={styles.content}>
         <div className={styles.gridColumn}>
           <Grid />
-          <ImportProgress />
+          <MiniPlayer />
+          <ImportProgress raised={miniPlayer} />
         </div>
         {inspector && <Inspector />}
       </div>

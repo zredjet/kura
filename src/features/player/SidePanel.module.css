@@ -1,0 +1,183 @@
+/*
+ * Player.dc.html の右パネル「次に再生」：余白 16px 10px 12px、項目の間隔 12px。
+ * 行は高さ 54px・角丸 12px、サムネイル 40px。再生済みの行は 0.55 の濃さ。下に設定のスイッチ。
+ */
+
+.panel {
+  flex: none;
+  width: var(--w-queue);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-2-5) var(--space-3);
+}
+
+.head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  padding: 0 var(--space-1-5);
+}
+
+.heading {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+}
+
+.summary {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+}
+
+.tabs {
+  display: flex;
+  gap: var(--space-0-5);
+  margin: 0 var(--space-1-5);
+  padding: var(--space-0-5);
+  border-radius: var(--space-2-5);
+  background: var(--fill-1);
+}
+
+.tab {
+  flex: 1;
+  height: 28px;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.tab[aria-selected='true'] {
+  background: var(--fill-pressed);
+  color: var(--text-on-media);
+  font-weight: var(--weight-semibold);
+}
+
+.list {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.sizer {
+  position: relative;
+}
+
+.row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2-5);
+  height: 54px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-lg);
+  color: var(--text-primary);
+  text-align: left;
+}
+
+button.row:hover {
+  background: var(--fill-1);
+}
+
+.row[data-current] {
+  background: var(--fill-selected);
+}
+
+.row[data-played] {
+  opacity: 0.55;
+}
+
+.thumb {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--fill-2);
+  color: var(--text-tertiary);
+}
+
+.thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+}
+
+.rowTitle {
+  font-size: var(--text-md);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row[data-current] .rowTitle {
+  font-weight: var(--weight-semibold);
+}
+
+.rowSub {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.rowSub[data-accent] {
+  color: var(--accent);
+}
+
+.nowPlaying {
+  display: flex;
+  flex: none;
+  color: var(--accent);
+}
+
+.empty {
+  margin: var(--space-6) var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
+.footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: auto;
+  padding: var(--space-2-5) var(--space-1-5) 0;
+  border-top: 1px solid var(--stroke-1);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.switchRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+/* 情報（インスペクタ）：Main.dc.html のインスペクタと同じ間隔 */
+.info {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: 0 var(--space-1);
+  overflow-y: auto;
+}

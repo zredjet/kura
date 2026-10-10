@@ -1,0 +1,254 @@
+/*
+ * Player.dc.html：黒地（--bg-theater）に余白 10px・間隔 10px。メディアの面は角丸 16px、
+ * 上 76px・左右 24px・下 176px をあけて中央に置く。右にキュー（--w-queue）。
+ * ライブラリより上、ダイアログ（20）・通知（30）・メニュー（40）より下に重ねる。
+ */
+
+.theater {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+  display: flex;
+  gap: var(--space-2-5);
+  padding: var(--space-2-5);
+  background: var(--bg-theater);
+}
+
+.theater[hidden] {
+  display: none;
+}
+
+.stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 76px var(--space-6) 176px;
+  border-radius: var(--radius-xl);
+  overflow: hidden;
+  background: var(--bg-media);
+}
+
+/* 上部：戻る・見出し・切り替え。左は信号機の分をあける */
+.top {
+  position: absolute;
+  top: var(--space-3);
+  left: calc(var(--space-6) * 3 + var(--space-1));
+  right: var(--space-3);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.back {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-pill);
+  background: var(--fill-3);
+  color: var(--text-primary);
+}
+
+.back:hover {
+  background: var(--fill-pressed);
+}
+
+.heading {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.title {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.position {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.segments {
+  display: flex;
+  flex: none;
+  gap: var(--space-0-5);
+  padding: 3px;
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-pill);
+  background: var(--fill-3);
+}
+
+.segment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 28px;
+  border-radius: var(--radius-pill);
+  color: var(--text-primary);
+}
+
+.segment:hover {
+  background: var(--fill-3);
+}
+
+.segment[aria-pressed='true'] {
+  background: var(--fill-pressed);
+  color: var(--text-on-media);
+}
+
+/* メディア：上下左右の余白の中で、縦横比を保って最大に */
+.media {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.video,
+.image {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 6px;
+  box-shadow: var(--shadow-media);
+  object-fit: contain;
+  animation: appear var(--dur-base) var(--ease-out);
+}
+
+.video[hidden] {
+  display: none;
+}
+
+@keyframes appear {
+  from {
+    opacity: 0;
+  }
+}
+
+.audio {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-5);
+  max-height: 100%;
+}
+
+.art,
+.artEmpty {
+  width: min(360px, 100%);
+  aspect-ratio: 1;
+  min-height: 0;
+  border-radius: 6px;
+  box-shadow: var(--shadow-media);
+  object-fit: cover;
+}
+
+.artEmpty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--fill-2);
+  color: var(--text-tertiary);
+}
+
+.waveform {
+  width: min(520px, 90%);
+  height: 56px;
+  color: var(--text-secondary);
+}
+
+/* プロキシの作成中・再生できない・終わり */
+.status {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: min(420px, 100%);
+  height: fit-content;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-5) var(--space-6);
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-2xl);
+  background: var(--glass-capsule);
+  box-shadow: var(--shadow-capsule);
+  text-align: center;
+}
+
+.statusTitle {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+}
+
+.statusHint {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+  color: var(--text-tertiary);
+}
+
+.statusActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.statusButton {
+  height: 30px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.statusButton:hover {
+  background: var(--fill-3);
+}
+
+/* 画像の間に流している音楽（下から 150px） */
+.bgm {
+  position: absolute;
+  bottom: 150px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: calc(100% - var(--space-6) * 2);
+  height: 30px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-pill);
+  background: var(--scrim);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bgmIcon {
+  display: flex;
+  flex: none;
+  color: var(--accent);
+}
