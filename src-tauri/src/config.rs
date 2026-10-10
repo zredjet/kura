@@ -10,6 +10,47 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     /// 前回開いたライブラリ。
     pub last_library: Option<PathBuf>,
+    /// 再生の設定。
+    pub player: PlayerPrefs,
+}
+
+/// 再生の設定（docs/playlists.md §5.3・§6.2）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PlayerPrefs {
+    /// 音量（0〜100）。
+    pub volume: u32,
+    /// 画像の間も直前の音楽を流す。
+    pub bgm_through_images: bool,
+    /// 画像の間に音楽が終わったら、その曲をループする。
+    pub bgm_loop: bool,
+    /// 画像の表示時間の既定値。
+    pub image_duration_ms: i64,
+}
+
+/// 画像の表示時間として受け付ける範囲（1〜60 秒）。
+pub const IMAGE_DURATION_RANGE: std::ops::RangeInclusive<i64> = 1000..=60_000;
+
+impl Default for PlayerPrefs {
+    fn default() -> Self {
+        Self {
+            volume: 80,
+            bgm_through_images: true,
+            bgm_loop: false,
+            image_duration_ms: kura_core::unit::DEFAULT_IMAGE_DURATION_MS,
+        }
+    }
+}
+
+impl PlayerPrefs {
+    /// 範囲外の値を丸める。
+    pub fn clamped(mut self) -> Self {
+        self.volume = self.volume.min(100);
+        self.image_duration_ms = self
+            .image_duration_ms
+            .clamp(*IMAGE_DURATION_RANGE.start(), *IMAGE_DURATION_RANGE.end());
+        self
+    }
 }
 
 /// 読む。なければ、または壊れていれば既定値。
@@ -50,11 +91,31 @@ mod tests {
 
         let config = AppConfig {
             last_library: Some(PathBuf::from("/Users/me/Pictures/Kura Library.kuralib")),
+            player: PlayerPrefs {
+                volume: 40,
+                bgm_loop: true,
+                ..PlayerPrefs::default()
+            },
         };
         save(&path, &config).unwrap();
         assert_eq!(load(&path), config);
 
+        // M4 までの設定（player がない）も読める
+        std::fs::write(&path, r#"{"lastLibrary": "/a.kuralib"}"#).unwrap();
+        assert_eq!(load(&path).player, PlayerPrefs::default());
+
         std::fs::write(&path, "{ broken").unwrap();
         assert_eq!(load(&path), AppConfig::default());
+    }
+
+    #[test]
+    fn clamps_player_prefs() {
+        let prefs = PlayerPrefs {
+            volume: 300,
+            image_duration_ms: 0,
+            ..PlayerPrefs::default()
+        }
+        .clamped();
+        assert_eq!((prefs.volume, prefs.image_duration_ms), (100, 1000));
     }
 }

@@ -111,6 +111,20 @@ export const commands = {
 	smartFolderUpdate: (id: number, name: string | null, query: string | null) => typedError<null, AppError>(__TAURI_INVOKE("smart_folder_update", { id, name, query })),
 	/**  スマートフォルダを消す（アイテムはそのまま）。 */
 	smartFolderDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("smart_folder_delete", { id })),
+	/**  起動時に作った再生可否の表を受け取る（表が変わっていればプロキシの判定をやり直す）。 */
+	playbackSupportSet: (entries: SupportEntryDto[]) => typedError<null, AppError>(__TAURI_INVOKE("playback_support_set", { entries })),
+	/**  選択（アイテムと、まとめて表示したユニット）を並び順のまま再生キューにする。 */
+	playerQueue: (entries: number[]) => typedError<QueueDto, AppError>(__TAURI_INVOKE("player_queue", { entries })),
+	/**  スロットを離れたときの報告。再生済みなら記録して true。 */
+	playbackReport: (report: PlayReportDto) => typedError<boolean, AppError>(__TAURI_INVOKE("playback_report", { report })),
+	/**  再生キューの今と次のアイテムのプロキシを先に作る。`force` なら、元のまま再生できなかったものを作り直す。 */
+	proxyRequest: (ids: number[], force: boolean) => typedError<null, AppError>(__TAURI_INVOKE("proxy_request", { ids, force })),
+	/**  元のファイルを外部プレイヤー（mpv、なければ QuickTime Player）で開く。 */
+	openExternal: (hash: string) => typedError<ExternalPlayerDto, AppError>(__TAURI_INVOKE("open_external", { hash })),
+	/**  再生の設定。 */
+	playerPrefsGet: () => __TAURI_INVOKE<PlayerPrefsDto>("player_prefs_get"),
+	/**  再生の設定を変えて保存する（範囲外の値は丸めて返す）。 */
+	playerPrefsSet: (prefs: PlayerPrefsDto) => typedError<PlayerPrefsDto, AppError>(__TAURI_INVOKE("player_prefs_set", { prefs })),
 };
 
 /** Events */
@@ -146,6 +160,9 @@ export type ClauseDto = {
 	field: string | null,
 };
 
+/**  入れ物（`kura_core::playback::Container`）。 */
+export type ContainerDto = "mp4" | "webm" | "ogg" | "mp3" | "flac" | "wav" | "aiff" | "aac" | "other";
+
 /**  ユニットの表紙。 */
 export type CoverDto = {
 	itemId: number,
@@ -158,6 +175,9 @@ export type CoverDto = {
 
 /**  重複の扱い。 */
 export type DuplicatePolicyDto = "addMemberships" | "ignore";
+
+/**  外部プレイヤー。 */
+export type ExternalPlayerDto = "mpv" | "quickTime";
 
 /**  フォルダと、入っている件数。 */
 export type FolderCountDto = {
@@ -281,6 +301,7 @@ export type ItemSummaryDto = {
 	capturedAt: number | null,
 	/**  `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。 */
 	thumbState: string,
+	proxyState: string,
 };
 
 /**  一覧の種類（`items_query_ids` の引数。生バイトのコマンドなので TS の型は `src/ipc/items.ts` に書く）。 */
@@ -374,11 +395,45 @@ export type ParseErrorDto = {
 	message: string,
 };
 
+/**  1 スロット分の再生の報告（docs/playlists.md §6.4）。 */
+export type PlayReportDto = {
+	itemId: number,
+	unitId: number | null,
+	unitStart: boolean,
+	playedMs: number,
+	completed: boolean,
+	durationMs: number | null,
+};
+
+/**  再生の設定。 */
+export type PlayerPrefsDto = {
+	/**  音量（0〜100）。 */
+	volume: number,
+	bgmThroughImages: boolean,
+	bgmLoop: boolean,
+	imageDurationMs: number,
+};
+
 /**  パレットに出す解析の結果。 */
 export type QueryCheckDto = {
 	error: ParseErrorDto | null,
 	clauses: ClauseDto[],
 	counts: KindCountsDto | null,
+};
+
+/**  再生キュー（docs/playlists.md §5.1 の Slot 列）。件数が多くても軽いよう、列ごとの配列で送る。 */
+export type QueueDto = {
+	itemIds: number[],
+	/**  ユニットとして再生するスロットのユニット（単体は null）。 */
+	unitIds: (number | null)[],
+	/**  まとまりの中の位置（0 から）。 */
+	indexInUnit: number[],
+	/**  まとまりの件数（単体は 1）。 */
+	unitLen: number[],
+	/**  画像の表示時間（音楽・動画は null）。 */
+	imageDurationMs: (number | null)[],
+	/**  キュー全体の長さ（長さのわからないものは 0 として）。 */
+	totalMs: number,
 };
 
 /**  ドロップされたもの。 */
@@ -425,6 +480,14 @@ export type SuggestionDto = {
 
 /**  候補の種類。 */
 export type SuggestionKindDto = "tag" | "field" | "value" | "saved";
+
+/**  再生可否の表の 1 行（フロントの `canPlayType` の結果）。 */
+export type SupportEntryDto = {
+	container: ContainerDto,
+	/**  ffprobe のコーデック名。 */
+	codec: string,
+	playable: boolean,
+};
 
 /**  タグと、付いている件数。 */
 export type TagCountDto = {

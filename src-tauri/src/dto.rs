@@ -13,7 +13,12 @@ use kura_core::jobs::{JobEvent, JobFilter, JobKind, JobRecord, JobState};
 use kura_core::library::{
     IntegrityReport, LibraryInfo, LocationCheck, LocationStatus, TrashEmptied,
 };
+use kura_core::playback::{Container, PlayReport, SupportEntry};
 use kura_core::query::QueryCheck;
+use kura_core::queue::{Slot, UnitKey};
+use kura_mac::ExternalPlayer;
+
+use crate::config::PlayerPrefs;
 use kura_core::query::suggest::{Suggestion, SuggestionKind};
 use kura_core::tags::{TagDetail, TagPatch, TagSuggestion};
 use kura_core::unit::{Cover, OrderMode, UnitDetail, UnitKind, UnitPatch, UnitSummary};
@@ -382,6 +387,7 @@ pub struct ItemSummaryDto {
     pub captured_at: Option<i64>,
     /// `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。
     pub thumb_state: String,
+    pub proxy_state: String,
 }
 
 impl From<ItemSummary> for ItemSummaryDto {
@@ -401,6 +407,7 @@ impl From<ItemSummary> for ItemSummaryDto {
             imported_at: i.imported_at,
             captured_at: i.captured_at,
             thumb_state: i.thumb_state,
+            proxy_state: i.proxy_state,
         }
     }
 }
@@ -1157,5 +1164,172 @@ mod tests {
         assert_eq!(json["kind"], "import");
         assert_eq!(json["state"], "running");
         assert_eq!(json["resultJson"], serde_json::Value::Null);
+    }
+}
+
+// ===== 再生（M5） =====
+
+/// 入れ物（`kura_core::playback::Container`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerDto {
+    Mp4,
+    Webm,
+    Ogg,
+    Mp3,
+    Flac,
+    Wav,
+    Aiff,
+    Aac,
+    Other,
+}
+
+impl From<ContainerDto> for Container {
+    fn from(c: ContainerDto) -> Self {
+        match c {
+            ContainerDto::Mp4 => Self::Mp4,
+            ContainerDto::Webm => Self::Webm,
+            ContainerDto::Ogg => Self::Ogg,
+            ContainerDto::Mp3 => Self::Mp3,
+            ContainerDto::Flac => Self::Flac,
+            ContainerDto::Wav => Self::Wav,
+            ContainerDto::Aiff => Self::Aiff,
+            ContainerDto::Aac => Self::Aac,
+            ContainerDto::Other => Self::Other,
+        }
+    }
+}
+
+/// 再生可否の表の 1 行（フロントの `canPlayType` の結果）。
+#[derive(Debug, Clone, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportEntryDto {
+    pub container: ContainerDto,
+    /// ffprobe のコーデック名。
+    pub codec: String,
+    pub playable: bool,
+}
+
+impl From<SupportEntryDto> for SupportEntry {
+    fn from(e: SupportEntryDto) -> Self {
+        Self {
+            container: e.container.into(),
+            codec: e.codec,
+            playable: e.playable,
+        }
+    }
+}
+
+/// 再生キュー（docs/playlists.md §5.1 の Slot 列）。件数が多くても軽いよう、列ごとの配列で送る。
+#[derive(Debug, Clone, Default, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueDto {
+    pub item_ids: Vec<i64>,
+    /// ユニットとして再生するスロットのユニット（単体は null）。
+    pub unit_ids: Vec<Option<i64>>,
+    /// まとまりの中の位置（0 から）。
+    pub index_in_unit: Vec<u32>,
+    /// まとまりの件数（単体は 1）。
+    pub unit_len: Vec<u32>,
+    /// 画像の表示時間（音楽・動画は null）。
+    pub image_duration_ms: Vec<Option<i64>>,
+    /// キュー全体の長さ（長さのわからないものは 0 として）。
+    pub total_ms: i64,
+}
+
+impl QueueDto {
+    /// スロット列と全体の長さから作る。
+    pub fn new(slots: Vec<Slot>, total_ms: i64) -> Self {
+        let mut q = Self {
+            total_ms,
+            ..Self::default()
+        };
+        for slot in slots {
+            q.item_ids.push(slot.item_id);
+            q.unit_ids.push(match slot.unit_key {
+                Some(UnitKey::Unit(id)) => Some(id),
+                _ => None,
+            });
+            q.index_in_unit.push(slot.index_in_unit);
+            q.unit_len.push(slot.unit_len);
+            q.image_duration_ms.push(slot.image_duration_ms);
+        }
+        q
+    }
+}
+
+/// 1 スロット分の再生の報告（docs/playlists.md §6.4）。
+#[derive(Debug, Clone, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayReportDto {
+    pub item_id: i64,
+    pub unit_id: Option<i64>,
+    pub unit_start: bool,
+    pub played_ms: i64,
+    pub completed: bool,
+    pub duration_ms: Option<i64>,
+}
+
+impl From<PlayReportDto> for PlayReport {
+    fn from(r: PlayReportDto) -> Self {
+        Self {
+            item_id: r.item_id,
+            unit_id: r.unit_id,
+            unit_start: r.unit_start,
+            playlist_id: None,
+            played_ms: r.played_ms,
+            completed: r.completed,
+            duration_ms: r.duration_ms,
+        }
+    }
+}
+
+/// 再生の設定。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerPrefsDto {
+    /// 音量（0〜100）。
+    pub volume: u32,
+    pub bgm_through_images: bool,
+    pub bgm_loop: bool,
+    pub image_duration_ms: i64,
+}
+
+impl From<PlayerPrefs> for PlayerPrefsDto {
+    fn from(p: PlayerPrefs) -> Self {
+        Self {
+            volume: p.volume,
+            bgm_through_images: p.bgm_through_images,
+            bgm_loop: p.bgm_loop,
+            image_duration_ms: p.image_duration_ms,
+        }
+    }
+}
+
+impl From<PlayerPrefsDto> for PlayerPrefs {
+    fn from(p: PlayerPrefsDto) -> Self {
+        Self {
+            volume: p.volume,
+            bgm_through_images: p.bgm_through_images,
+            bgm_loop: p.bgm_loop,
+            image_duration_ms: p.image_duration_ms,
+        }
+    }
+}
+
+/// 外部プレイヤー。
+#[derive(Debug, Clone, Copy, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum ExternalPlayerDto {
+    Mpv,
+    QuickTime,
+}
+
+impl From<ExternalPlayer> for ExternalPlayerDto {
+    fn from(p: ExternalPlayer) -> Self {
+        match p {
+            ExternalPlayer::Mpv => Self::Mpv,
+            ExternalPlayer::QuickTime => Self::QuickTime,
+        }
     }
 }

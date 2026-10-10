@@ -7,6 +7,7 @@ pub mod import;
 pub mod items;
 pub mod jobs;
 pub mod library;
+pub mod player;
 pub mod search;
 pub mod tags;
 pub mod units;

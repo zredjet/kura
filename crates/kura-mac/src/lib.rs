@@ -3,8 +3,13 @@
 //! - `reduce_transparency`：「透明度を下げる」の設定
 //! - `MacBackend`：`MediaBackend` の macOS 実装（ImageIO / AVFoundation）
 //! - `media_backend`：macOS の実装で扱えない形式を ffmpeg に回す組み合わせ
+//! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
 //!
 //! macOS 以外では同じ関数・型が「扱えない」を返すだけの空の実装になり、ワークスペース全体がビルドできる。
+
+mod external;
+
+pub use external::{ExternalPlayer, open_in_player};
 
 use std::path::Path;
 use std::sync::Arc;

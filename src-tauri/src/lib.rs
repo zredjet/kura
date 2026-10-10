@@ -99,6 +99,13 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::search::smart_folder_save,
             commands::search::smart_folder_update,
             commands::search::smart_folder_delete,
+            commands::player::playback_support_set,
+            commands::player::player_queue,
+            commands::player::playback_report,
+            commands::player::proxy_request,
+            commands::player::open_external,
+            commands::player::player_prefs_get,
+            commands::player::player_prefs_set,
         ])
         .events(collect_events![dto::JobProgress])
         // ジョブの結果（resultJson）を読むための型
