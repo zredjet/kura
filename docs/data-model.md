@@ -66,6 +66,7 @@ CREATE INDEX idx_items_kind     ON items(kind, imported_at DESC) WHERE trashed_a
 CREATE INDEX idx_items_rating   ON items(rating) WHERE trashed_at IS NULL;
 CREATE INDEX idx_items_played   ON items(last_played_at);
 CREATE INDEX idx_items_trashed  ON items(trashed_at) WHERE trashed_at IS NOT NULL;
+CREATE INDEX idx_items_size     ON items(size_bytes);                       -- 取り込みの重複の見込み（サイズで候補を絞る）
 
 -- ===== 仮想フォルダ =====
 CREATE TABLE folders (
@@ -290,7 +291,7 @@ CREATE VIRTUAL TABLE items_fts USING fts5(
   content = 'items', content_rowid = 'id',
   tokenize = 'trigram'
 );
--- items の INSERT / UPDATE / DELETE に合わせて items_fts を更新するトリガーを同じマイグレーションで作る
+-- items の INSERT / UPDATE / DELETE に合わせて items_fts を更新するトリガー（items_fts_ai / _ad / _au）を同じマイグレーションで作る
 ```
 
 ## 4. クエリ方針

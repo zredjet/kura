@@ -38,11 +38,13 @@
 
 ## 3. IPC コマンド一覧（初期）
 
-戻り値はすべて `Result<T, AppError>`。`AppError { code: string, message: string }`。code の例：`NotFound`、`InvalidQuery`、`ToolMissing`、`Io`、`Db`、`Conflict`。
+戻り値はすべて `Result<T, AppError>`。`AppError { code: string, message: string }`。code の例：`NotFound`、`InvalidQuery`、`Invalid`、`ToolMissing`、`Io`、`Db`、`Conflict`、`Internal`。
 
 | 領域 | コマンド | 説明 |
 |---|---|---|
 | ライブラリ | `library_create(path)` / `library_open(path)` / `library_info()` | ライブラリの作成・オープン・概要 |
+| | `library_restore()` → `{ info, lastPath }` | 起動時に前回のライブラリを開く。開けなければ `info` は空で前回の場所を返す |
+| | `library_check_location(path)` → `{ path, status, syncService }` | 置き場所の確認（`.kuralib` の補完、`new` / `existingLibrary` / `occupied`、同期フォルダの中か） |
 | 取り込み | `import_preview(paths)` | 種類別件数・合計サイズ・重複の見込み・フォルダ木を返す |
 | | `import_start(paths, options)` → `JobId` | 取り込みジョブを開始 |
 | 一覧 | `items_query_ids(query, sort)` → 生バイト | 条件に合う ID と縦横比を並び順で（`[件数 u32][id u32 × N][縦横比×1000 u16 × N]`、LE） |
@@ -93,32 +95,45 @@
 ## 5. ジョブ
 
 - `jobs` テーブルに記録し、アプリ再起動後も `queued` / `paused` を再開できるようにする（`running` で終わっていたものは `queued` に戻す）。
+- アプリの終了・ライブラリの切り替えでは、実行中のジョブを区切りで止めて `queued` に戻す（次回の起動で自動で再開）。ユーザーが一時停止したものは `paused` のまま。
+- 再開に必要な途中経過は、ジョブ自身が作業と同じトランザクションで `result_json` に保存する。
+- ライブラリを開くときは、staging の掃除 → 整合性チェック → ジョブの開始、の順にする（チェック中に取り込みが進むと食い違いを誤って数えるため）。
 - 種類ごとの同時実行数：import 1、thumbnail = CPU コア数、proxy 1、download 2、capture 1。
 - 各ジョブはキャンセルトークンを持つ。外部プロセスはキャンセル時に SIGTERM、5 秒後に SIGKILL。
-- 進捗は `job://progress` イベント（`{ id, state, progress, message }`）を 200ms 以上の間隔で間引いて送る。
+- 進捗は `job://progress` イベント（`{ id, kind, state, progress, message, resultJson }`）を 200ms 以上の間隔で間引いて送る（状態の変わり目は間引かない）。
 - ログは `logs/job-<id>.log` に書き、UI の「ログ」から開ける。
 
 ## 6. 取り込みパイプライン
 
 ```text
-import_preview:  走査（jwalk）→ 対応拡張子で絞る → 種類別件数・合計サイズ
-                 重複の見込み：(サイズ, 先頭と末尾 64KB の BLAKE3) で既存と照合
+import_preview:  走査（walkdir）→ 対応拡張子で絞る → 種類別件数・合計サイズ
+                 重複の見込み：(サイズ, 先頭と末尾 64KB の BLAKE3) で既存と照合（同じ取り込みの中の重なりも数える）
 import_start:    ジョブとして実行
-  1. 走査
-  2. 各ファイル（SSD は並列 = コア数、HDD は 2）
-     a. BLAKE3 で全体ハッシュ（大きいファイルは mmap）
-     b. 既存なら：オプションのフォルダ・タグ・ユニットへの所属だけ追加して「重複」と数える
-     c. 新規なら：staging/<uuid> へ reflink（APFS クローン、異なるボリュームなら通常コピー）
-        → files/ab/cd/<hash>.<ext> へ rename（原子的）
-     d. メディア情報（MediaBackend::probe）：幅・高さ・長さ・撮影日時・コーデック
-  3. 500 件ごとにトランザクションで items と所属を挿入
-  4. サムネイル・プロキシ判定のジョブを積む
-  5. 結果（追加数・重複数・失敗一覧）を result_json に
+  1. 走査（隠しファイル、*.kuralib・*.photoslibrary などのパッケージ、シンボリックリンクは除く。
+     名前の自然順に並べるので、再開しても同じ順になる）
+  2. 500 件（または合計 1GB）ずつ、最大 6 並列で（ADR-21）
+     a. staging/import-<job>-<n>.<ext> へ reflink（APFS クローン、異なるボリュームなら通常コピー）
+     b. コピーした側の BLAKE3（1MB 以上は mmap で並列）。コピー後に取るので、名前と中身が必ず一致する（ADR-19）
+     c. files/ab/cd/<hash>.<ext> へ rename（原子的。同じものがすでにあればコピーを消す）
+     d. メディア情報（MediaBackend::probe）：幅・高さ・長さ・撮影日時・コーデック（M2 で追加）
+  3. バッチごとに 1 トランザクションで：
+     - 既存（同じハッシュ）なら、オプションのフォルダ・タグ・ユニットへの所属だけ追加して「重複」と数える
+       （「何もしない」を選んだら所属も足さない。ゴミ箱にあれば戻す）
+     - 新規なら items と所属を挿入
+     - 再開位置と途中の件数を jobs.result_json に保存
+  4. サムネイル・プロキシ判定のジョブを積む（M2）
+  5. 結果（追加数・重複数・失敗数と明細）を result_json に
 ```
 
 - 対応拡張子：画像 `jpg jpeg png gif webp heic heif avif tif tiff bmp`、動画 `mp4 m4v mov webm mkv avi`、音楽 `mp3 m4a aac flac wav aif aiff ogg opus`。それ以外はスキップして件数を報告する。
-- オプション：取り込み先フォルダ、フォルダ構成の再現、フォルダ名をタグに、ファイル情報からタグ（撮影日・撮影地・アーティスト・アルバム）、全件に付けるタグ、フォルダごとにユニット作成。
+- オプション：取り込み先フォルダ、フォルダ構成の再現、フォルダ名をタグに、ファイル情報からタグ（撮影日・撮影地・アーティスト・アルバム。M2）、全件に付けるタグ、フォルダごとにユニット作成。
+  - フォルダ構成の再現：ドロップしたフォルダを取り込み先に対応させ、その下にサブフォルダを作る（旅行2026/鎌倉 → 写真/2026 旅行/鎌倉）。取り込み先がなければ、ドロップしたフォルダ名でいちばん上に作る（ADR-24）。
+  - フォルダ名をタグに：ドロップしたフォルダからファイルの親までの各フォルダ名（ADR-24）。
+  - フォルダごとにユニット：末端フォルダ（下にフォルダを持たないもの）ごとに set ユニット（origin = import、並びはファイル名の自然順）。
+  - ファイル名・フォルダ名・タグは NFC に正規化する（ADR-25）。
 - 起動時の整合性チェック：`staging/` の残骸を削除。DB にあってファイルがないもの、ファイルがあって DB にないものを数えて設定画面に出す（自動では消さない）。
+  - 取り込み中に落ちた場合、配置済みで DB に入る前のファイルは「DB にないファイル」として残るが、再開した取り込みがそのまま使う（内容アドレスなので置き直しは不要）。
+- 動作確認：`cargo run -p kura-devtools -- import --library <path> [--create] <src>...` でコマンドラインから取り込める（強制終了の試験用。`check --library <path>` で件数と食い違いを表示）。
 
 ## 7. サムネイルとメディア情報（kura-mac）
 
