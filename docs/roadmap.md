@@ -48,13 +48,13 @@
 
 ## M2　サムネイルとグリッド
 
-- [ ] `MediaBackend` trait と `kura-mac` の実装（ImageIO / AVFoundation）、ffmpeg へのフォールバック
-- [ ] サムネイル生成ジョブ（s / l の 2 サイズ）、音楽のジャケット
-- [ ] `kura://` プロトコル（thumb / art / file / play、Range 対応）
-- [ ] `items_query_ids`（ID と縦横比の生バイト）と `items_get`
-- [ ] ジャスティファイ配置の計算（純粋関数＋テスト）と仮想スクロールのグリッド、日付見出し
-- [ ] インスペクタ（表示のみ）、クイックルック
-- [ ] `kura-devtools seed`（10 万件のダミーライブラリ）
+- [x] `MediaBackend` trait と `kura-mac` の実装（ImageIO / AVFoundation）、ffmpeg へのフォールバック
+- [x] サムネイル生成ジョブ（s / l の 2 サイズ）、音楽のジャケット
+- [x] `kura://` プロトコル（thumb / art / file / play、Range 対応）
+- [x] `items_query_ids`（ID と縦横比の生バイト）と `items_get`
+- [x] ジャスティファイ配置の計算（純粋関数＋テスト）と仮想スクロールのグリッド、日付見出し
+- [x] インスペクタ（表示のみ）、クイックルック
+- [x] `kura-devtools seed`（10 万件のダミーライブラリ）
 
 **完了条件**：10 万件のダミーで起動 1.5 秒以内・スクロール 60fps（Instruments か Safari の Web インスペクタで確認）／HEIC・MOV・FLAC のサムネイルが出る／動画のシークが効く（Range）
 

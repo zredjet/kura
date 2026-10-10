@@ -30,11 +30,11 @@
 | クレート | 責務 | 依存してよいもの |
 |---|---|---|
 | `kura-core` | DB、マイグレーション、取り込み、ハッシュ、検索言語の解析と SQL 生成、ユニット、プレイリスト（純粋関数）、ジョブ管理、ダウンロード・キャプチャの手順 | rusqlite, blake3, reflink-copy, rand_chacha, serde, thiserror, tracing, tokio |
-| `kura-mac` | `MediaBackend` trait の macOS 実装（サムネイル生成、メディア情報、音楽のジャケット取得、WKWebView のスナップショット、「透明度を下げる」設定の取得） | kura-core, swift-rs |
-| `kura-devtools` | ダミーライブラリの生成、ベンチマーク | kura-core |
+| `kura-mac` | `MediaBackend` trait の macOS 実装（サムネイル生成、メディア情報、音楽のジャケット取得、WKWebView のスナップショット、「透明度を下げる」設定の取得）と、ffmpeg との振り分け | kura-core, serde_json, swift-rs（ビルド時のリンクのみ） |
+| `kura-devtools` | ダミーライブラリの生成、ベンチマーク、コマンドラインからの取り込みと確認（§13） | kura-core, kura-mac |
 | `src-tauri`（`kura-app`） | コマンド、kura:// プロトコル、ウィンドウ、イベント、状態の保持 | すべて |
 
-`kura-core` は `MediaBackend` trait（`thumbnail_image`、`thumbnail_video`、`audio_artwork`、`probe`）だけを知り、実装は起動時に注入します。テストでは偽物の実装を使います。Linux 上でも `kura-core` のテストが通るようにします。
+`kura-core` は `MediaBackend` trait（`probe`、`image_thumbnails`、`video_thumbnails`、`audio_artwork`）だけを知り、実装（`kura_mac::media_backend()`）はライブラリを開くときに注入します。テストでは偽物の実装（`media::fake::FakeBackend`）を使います。Linux 上でも `kura-core` のテストが通るようにします。
 
 ## 3. IPC コマンド一覧（初期）
 
@@ -47,9 +47,9 @@
 | | `library_check_location(path)` → `{ path, status, syncService }` | 置き場所の確認（`.kuralib` の補完、`new` / `existingLibrary` / `occupied`、同期フォルダの中か） |
 | 取り込み | `import_preview(paths)` | 種類別件数・合計サイズ・重複の見込み・フォルダ木を返す |
 | | `import_start(paths, options)` → `JobId` | 取り込みジョブを開始 |
-| 一覧 | `items_query_ids(query, sort)` → 生バイト | 条件に合う ID と縦横比を並び順で（`[件数 u32][id u32 × N][縦横比×1000 u16 × N]`、LE） |
+| 一覧 | `items_query_ids(utcOffsetMinutes, trashed?)` → 生バイト | 条件に合う ID と縦横比を並び順で、日付見出しのグループ付きで返す。`[件数 u32][id u32 × N][縦横比×1000 u16 × N][グループ数 u32][開始位置 u32 × G][日 i32 × G]`（LE）。縦横比が分からないもの（音楽など）は 1000。日は `utcOffsetMinutes` の時差で区切った 1970-01-01 からの日数。M2 は追加日の新しい順だけで、検索条件 `query` と並び順 `sort` は M4 で足す。tauri-specta を通さず `tauri::ipc::Response` で返す（フロントには ArrayBuffer で届く。ラッパーは `src/ipc/items.ts`。ADR-33） |
 | | （`items_query_ids` の `collapse_units` が true のとき） | set ユニットに属するアイテムを、最初に一致したメンバーの位置で 1 件のユニットにまとめる。ユニットは `0x8000_0000 | unit_id` で表し、縦横比は表紙のもの |
-| | `items_get(ids)` → `ItemSummary[]` / `units_get(ids)` → `UnitSummary[]` | 最大 200 件 |
+| | `items_get(ids)` → `ItemSummary[]` / `units_get(ids)` → `UnitSummary[]` | 最大 200 件。要求した順で返し、ないものは省く |
 | | `item_detail(id)` → `ItemDetail` | タグ・フォルダ・ユニット・取得元を含む |
 | 編集 | `items_update(ids, patch)` | タイトル・評価・メモ（複数選択対応） |
 | | `items_trash(ids)` / `items_restore(ids)` / `trash_empty()` | ゴミ箱 |
@@ -72,6 +72,7 @@
 | ツール | `tools_status()` / `tools_update(tool)` / `tools_set_path(tool, path)` | |
 | 設定 | `settings_get(keys)` / `settings_set(map)` | |
 | 外観 | `appearance_get()` → `Appearance` | OS の表示設定（「透明度を下げる」）。起動時に `<html data-reduce-transparency>` へ反映する（§11） |
+| 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測の結果をログに書く（§13） |
 
 コマンドの追加は `.claude/skills/add-command` の手順で行い、この表に追記します。
 
@@ -87,7 +88,11 @@
 | `/file/{hash}` | 元ファイル | `Accept-Ranges: bytes`、Range があれば 206 と `Content-Range` |
 | `/play/{hash}` | 再生用：プロキシがあればプロキシ、なければ元ファイル | 同上 |
 
-- Range は 1 区間だけ対応（`bytes=start-end` / `bytes=start-`）。不正な Range は 416。応答本体は最大 4MB ずつ返す。
+- Range は 1 区間だけ対応（`bytes=start-end` / `bytes=start-` / `bytes=-末尾の長さ`）。範囲外・不正な Range は 416。応答本体は最大 4MB ずつ返す（`bytes=start-` には先頭から 4MB だけ）。
+- `{hash}` は 64 桁の小文字 16 進だけを受け付ける。それ以外とファイルがないものは 404、ライブラリが開かれていなければ 503。
+- 実際の置き場所：`thumbs/ab/<hash>_s.jpg`・`_l.jpg`、`art/ab/<hash>.jpg`、`proxies/ab/<hash>.mp4`、`files/ab/cd/<hash>.<ext>`（`/file`・`/play` は拡張子が分からないので `files/ab/cd/` の中を探す）。
+- WKWebView の `<video>` はサンプル単位の小さな Range（数百バイト）を多数送ってくる（60 秒・1.4MB の MOV の再生で約 3,000 回）。今は 1 回ごとにファイルを開いて読む。大きな動画での負荷は M5 で測る。
+- `RUST_LOG=kura_app_lib=debug` で要求ごとに uri・range・status・bytes をログに出す。
 - `Content-Type` は拡張子から決める。
 - ファイルを開く処理は `spawn_blocking` で行う。
 - `tauri.conf.json` の CSP（目安）：`default-src 'self' ipc: http://ipc.localhost; img-src 'self' kura:; media-src 'self' kura:; style-src 'self' 'unsafe-inline'`。外部のフォントや CDN は読み込まない（書体は SF Pro とヒラギノのみ）。
@@ -98,7 +103,8 @@
 - アプリの終了・ライブラリの切り替えでは、実行中のジョブを区切りで止めて `queued` に戻す（次回の起動で自動で再開）。ユーザーが一時停止したものは `paused` のまま。
 - 再開に必要な途中経過は、ジョブ自身が作業と同じトランザクションで `result_json` に保存する。
 - ライブラリを開くときは、staging の掃除 → 整合性チェック → ジョブの開始、の順にする（チェック中に取り込みが進むと食い違いを誤って数えるため）。
-- 種類ごとの同時実行数：import 1、thumbnail = CPU コア数、proxy 1、download 2、capture 1。
+- 種類ごとの同時実行数：import 1、thumbnail 1（ジョブの中で CPU コア数の並列。ADR-31）、proxy 1、download 2、capture 1。
+- 後続のジョブは `ensure_queued(kind, input)` で積む（同じ種類が `queued` ならもう積まない）。サムネイルのジョブは、取り込みのバッチを書いたあとと、ライブラリを開いたとき（`pending` が残っていれば）に積む。
 - 各ジョブはキャンセルトークンを持つ。外部プロセスはキャンセル時に SIGTERM、5 秒後に SIGKILL。
 - 進捗は `job://progress` イベント（`{ id, kind, state, progress, message, resultJson }`）を 200ms 以上の間隔で間引いて送る（状態の変わり目は間引かない）。
 - ログは `logs/job-<id>.log` に書き、UI の「ログ」から開ける。
@@ -115,18 +121,18 @@ import_start:    ジョブとして実行
      a. staging/import-<job>-<n>.<ext> へ reflink（APFS クローン、異なるボリュームなら通常コピー）
      b. コピーした側の BLAKE3（1MB 以上は mmap で並列）。コピー後に取るので、名前と中身が必ず一致する（ADR-19）
      c. files/ab/cd/<hash>.<ext> へ rename（原子的。同じものがすでにあればコピーを消す）
-     d. メディア情報（MediaBackend::probe）：幅・高さ・長さ・撮影日時・コーデック（M2 で追加）
+     d. メディア情報（MediaBackend::probe）：幅・高さ・長さ・撮影日時・コーデック、音楽はアーティスト・アルバム・曲名
   3. バッチごとに 1 トランザクションで：
      - 既存（同じハッシュ）なら、オプションのフォルダ・タグ・ユニットへの所属だけ追加して「重複」と数える
        （「何もしない」を選んだら所属も足さない。ゴミ箱にあれば戻す）
      - 新規なら items と所属を挿入
      - 再開位置と途中の件数を jobs.result_json に保存
-  4. サムネイル・プロキシ判定のジョブを積む（M2）
+  4. 新しいアイテムがあればサムネイルのジョブを積む（`ensure_queued`。プロキシの判定は M5）
   5. 結果（追加数・重複数・失敗数と明細）を result_json に
 ```
 
 - 対応拡張子：画像 `jpg jpeg png gif webp heic heif avif tif tiff bmp`、動画 `mp4 m4v mov webm mkv avi`、音楽 `mp3 m4a aac flac wav aif aiff ogg opus`。それ以外はスキップして件数を報告する。
-- オプション：取り込み先フォルダ、フォルダ構成の再現、フォルダ名をタグに、ファイル情報からタグ（撮影日・撮影地・アーティスト・アルバム。M2）、全件に付けるタグ、フォルダごとにユニット作成。
+- オプション：取り込み先フォルダ、フォルダ構成の再現、フォルダ名をタグに、ファイル情報からタグ（`アーティスト:`・`アルバム:`。撮影日・撮影地は付けない。ADR-30）、全件に付けるタグ、フォルダごとにユニット作成。
   - フォルダ構成の再現：ドロップしたフォルダを取り込み先に対応させ、その下にサブフォルダを作る（旅行2026/鎌倉 → 写真/2026 旅行/鎌倉）。取り込み先がなければ、ドロップしたフォルダ名でいちばん上に作る（ADR-24）。
   - フォルダ名をタグに：ドロップしたフォルダからファイルの親までの各フォルダ名（ADR-24）。
   - フォルダごとにユニット：末端フォルダ（下にフォルダを持たないもの）ごとに set ユニット（origin = import、並びはファイル名の自然順）。
@@ -137,14 +143,17 @@ import_start:    ジョブとして実行
 
 ## 7. サムネイルとメディア情報（kura-mac）
 
-- Swift ヘルパー（swift-rs）で C 互換関数を公開する：
-  - `kura_thumb_image(path, max_px, out_path)`：ImageIO の `CGImageSourceCreateThumbnailAtIndex`（HEIC・RAW・AVIF も扱える）→ JPEG（品質 0.82）
-  - `kura_thumb_video(path, at_sec, max_px, out_path)`：AVFoundation の `AVAssetImageGenerator`（長さの 10% 地点）
-  - `kura_audio_artwork(path, out_path)`：AVAsset のメタデータからジャケット
-  - `kura_probe(path)` → JSON：幅・高さ・長さ・撮影日時・コーデック
+- Swift ヘルパー（`crates/kura-mac/swift`、Swift 5 の言語モード）が C 互換関数を公開し、Rust から `extern "C"` で呼ぶ（swift-rs はビルド時のリンクにだけ使う）。戻り値は 0 成功・1 扱えない形式・2 失敗・3 ジャケットなし：
+  - `kura_image_thumbnails(path, out_l, out_s, 1600, 512)`：ImageIO の `CGImageSourceCreateThumbnailAtIndex`（HEIC・RAW・AVIF も扱える。向きを反映）→ JPEG（品質 0.82）
+  - `kura_video_thumbnails(path, at_sec, out_l, out_s, 1600, 512)`：AVFoundation の `AVAssetImageGenerator`（長さの 10% 地点。長さが分からなければ 1 秒）
+  - `kura_audio_artwork(path, out_art, out_l, out_s, 1600, 512)`：AVAsset のメタデータからジャケット（元の画像を `art/`、縮小を `thumbs/` に）
+  - `kura_probe(path, kind)` → JSON（`kura_free_string` で解放）：幅・高さ・長さ・撮影日時・コーデック・アーティスト・アルバム・曲名
   - `kura_reduce_transparency()` → bool
-- macOS で扱えない形式（mkv など）は ffmpeg / ffprobe にフォールバックする。
-- 目標：画像サムネイル 50 枚/秒以上（M1、SSD）。
+- Swift のランタイムは OS のもの（`/usr/lib/swift`）を使う。リンクする実行ファイル（kura-mac のテスト、src-tauri、kura-devtools）の build.rs で rpath を足す。
+- 形式ごとの試す順（`kura_mac::media_backend()`）：flac・ogg・opus・mkv・webm・avi は ffmpeg / ffprobe を先に、それ以外は macOS を先に。前の実装が「扱えない形式」と答えたときだけ次を試す（ADR-32）。
+- ffmpeg / ffprobe は `/opt/homebrew/bin` → `/usr/local/bin` → PATH の順で探す（`kura_core::tools`。設定での上書きは M8）。外部プロセスは時間制限付きで動かす。
+- サムネイルのジョブ：`thumb_state = 'pending'` を新しい順に 64 件ずつ取り出し（`idx_items_thumb_pending`）、CPU コア数の並列で作って 1 トランザクションで書く。M1 で取り込んだものは、ここで probe して幅・高さなどの空欄を埋める。ジャケットのない音楽は `failed`（グリッドでは音楽の絵を出す。ADR-34）。
+- 目標：画像サムネイル 50 枚/秒以上（NFR-04）。実測は §13。
 
 ## 8. 再生とプロキシ
 
@@ -192,6 +201,29 @@ import_start:    ジョブとして実行
 
 ## 12. 状態管理（フロント）
 
-- Zustand のストアを機能ごとに分ける：`libraryStore`（現在のビュー・検索結果の ID 列・選択）、`itemCache`（ID → 詳細の LRU）、`playerStore`（キュー・現在位置・再生状態）、`jobsStore`（イベントで更新）。
+- Zustand のストアを機能ごとに分ける：`libraryStore`（開いているライブラリ・検索結果の ID 列）、`viewStore`（選択・表示の設定）、`itemCache`（ID → 詳細の LRU）、`playerStore`（キュー・現在位置・再生状態）、`jobsStore`（イベントで更新）。
 - 検索結果の ID 列は `Uint32Array` で保持する。
 - ジャスティファイ配置は「行の高さ目標・コンテナ幅・各アイテムの縦横比」から行分割を計算する純粋関数（`src/features/library/layout/justify.ts`）にし、テストする。縦横比は `items_query_ids` が ID と一緒に全件分返すので、詳細を取得する前に全体の高さと行分割が決まる（音楽は 1.0、不明は 1.0 として扱う）。
+- `itemCache` は 4,000 件の LRU。見えている行の ID を 200 件ずつまとめて `items_get` する。取り込み中の一覧の取り直しは 1 秒、サムネイルのイベントでの取り直しは 0.5 秒にまとめる。
+- `viewStore` は選択中の ID・サムネイルの大きさ（行の高さ 110 / 140 / 180 / 230 / 300px の 5 段階）・インスペクタの開閉・クイックルックを持つ。大きさとインスペクタの開閉だけを `localStorage`（`kura.view`）に残す。
+
+## 13. 開発用のツールと計測
+
+| コマンド・環境変数 | 用途 |
+|---|---|
+| `cargo run --release -p kura-devtools -- seed --items 100000 --out <path>` | ダミーライブラリを作る（画像 7・動画 2・音楽 1、2,000 タグ、60 フォルダ、ひな形 JPEG をクローンで配置、シード付き ChaCha8）。10 万件で約 28 秒 |
+| `kura-devtools bench query --library <path>` | 開く・`query_ids`・`items_get`（200 件）・`item_detail` の中央値 |
+| `kura-devtools bench thumbs --src <dir> [--threads N]` | 画像サムネイルの生成速度（枚/秒） |
+| `kura-devtools import` / `check` | コマンドラインからの取り込みと整合性の確認（§6） |
+| `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない） |
+| `VITE_KURA_BENCH=1` | グリッドを自動でスクロールし、フレーム時間を `bench_report` でログに書く |
+
+M2 の実測（Apple Silicon・16 コア、リリースビルド、10 万件）：
+
+| 項目 | 結果 | 目標 |
+|---|---|---|
+| `query_ids` | 18ms（606KB） | — |
+| `items_get`（200 件） | 0.16ms | — |
+| 起動から最初の `items_get` まで | 628ms | NFR-01：1.5 秒以内 |
+| スクロール（601 フレーム） | p50 17ms・p99 18ms、20ms 超え 0 | NFR-02：60fps |
+| 画像サムネイル（4000×3000 の JPEG・HEIC） | 1 並列 27・4 並列 101・8 並列 185・16 並列 211 枚/秒 | NFR-04：50 枚/秒以上 |
