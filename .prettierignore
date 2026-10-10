@@ -1,0 +1,13 @@
+# 手で書く文書と生成物は整形しない
+docs/
+*.md
+.claude/
+crates/
+target/
+dist/
+pnpm-lock.yaml
+src-tauri/gen/
+src-tauri/icons/
+src/ipc/bindings.ts
+# docs/design/tokens.css のそのままのコピー（テストで一致を確認する）
+src/styles/tokens.css

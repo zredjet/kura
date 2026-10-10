@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/kura-core", "crates/kura-mac", "crates/kura-devtools", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+kura-core = { path = "crates/kura-core" }
+kura-mac = { path = "crates/kura-mac" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+tauri = "2.12"
+tauri-build = "2.7"
+# tauri-specta はまだ RC のため版を固定する（ADR-16）
+specta = "=2.0.0-rc.25"
+specta-typescript = "=0.0.12"
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
+swift-rs = "1.0.9"
+
+[workspace.lints.clippy]
+# 本番コードで unwrap / expect / panic / println を使わない（テストは clippy.toml で許可）
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
