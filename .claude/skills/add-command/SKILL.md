@@ -12,7 +12,7 @@ description: 新しい Tauri コマンド（フロントから呼ぶ Rust 関数
    - 引数・戻り値の型には `serde` と `specta::Type` を derive する。
 3. **登録**：`src-tauri/src/lib.rs` の `collect_commands![]` に追加する。
 4. **権限**：必要なら `src-tauri/capabilities/default.json` を更新する。
-5. **型定義**：`pnpm tauri dev` を一度起動して `src/ipc/bindings.ts` を再生成する（起動できない環境なら手順だけ報告）。
+5. **型定義**：`cargo test -p kura-app` で `src/ipc/bindings.ts` を再生成する（`pnpm tauri dev` の起動時にも再生成される）。生成されたファイルは手で編集しない。
 6. **フロント**：`src/ipc/<領域>.ts` にラッパーを追加し、エラーは `AppError.code` で分岐する。
 7. **ドキュメント**：`docs/architecture.md` のコマンド一覧に 1 行追加する。
 8. `/verify` を実行する。

@@ -15,13 +15,13 @@
 
 ## M0　土台づくり
 
-- [ ] cargo workspace（`kura-core` / `kura-mac` / `kura-devtools` / `src-tauri`）と pnpm ＋ Vite ＋ React ＋ TypeScript
-- [ ] Tauri 2 のウィンドウ設定（オーバーレイのタイトルバー、信号機の位置、最小サイズ）
-- [ ] `src/styles/tokens.css`（`docs/design/tokens.css` をコピー）とリセット CSS、`src/i18n/ja.ts`
-- [ ] 3 ペインの空の骨組み（サイドバー・ツールバー・グリッド領域・インスペクタ）をモックどおりの寸法で
-- [ ] tauri-specta による型生成、`AppError`、ログ（tracing）
-- [ ] package.json のスクリプト：`format` / `format:check` / `lint` / `typecheck` / `test`
-- [ ] Swift ヘルパーの雛形（`kura_reduce_transparency` を 1 つだけ実装して呼べることを確認）
+- [x] cargo workspace（`kura-core` / `kura-mac` / `kura-devtools` / `src-tauri`）と pnpm ＋ Vite ＋ React ＋ TypeScript
+- [x] Tauri 2 のウィンドウ設定（オーバーレイのタイトルバー、信号機の位置、最小サイズ）
+- [x] `src/styles/tokens.css`（`docs/design/tokens.css` をコピー）とリセット CSS、`src/i18n/ja.ts`
+- [x] 3 ペインの空の骨組み（サイドバー・ツールバー・グリッド領域・インスペクタ）をモックどおりの寸法で
+- [x] tauri-specta による型生成、`AppError`、ログ（tracing）
+- [x] package.json のスクリプト：`format` / `format:check` / `lint` / `typecheck` / `test`
+- [x] Swift ヘルパーの雛形（`kura_reduce_transparency` を 1 つだけ実装して呼べることを確認）
 
 **完了条件**：`pnpm tauri dev` で空の 3 ペインがモックと同じ配置で表示される／`/verify` が通る／`cargo test -p kura-core` が macOS 以外でも通る構成になっている
 
