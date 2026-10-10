@@ -165,3 +165,268 @@
 .mono {
   font-family: var(--font-mono);
 }
+
+.previewWave {
+  width: 70%;
+  height: 30%;
+  color: var(--text-secondary);
+}
+
+/* タイトル：押すとその場で変えられる（見た目は見出しのまま） */
+.titleButton {
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  border-radius: var(--radius-sm);
+}
+
+.titleButton:hover {
+  background: var(--fill-1);
+}
+
+.titleButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.titleInput {
+  height: 30px;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+}
+
+.sectionHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* design.md §4 の kbd */
+.kbd {
+  padding: 0 var(--space-1-5);
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--stroke-kbd);
+  font-family: inherit;
+  font-size: var(--text-2xs);
+  color: var(--text-tertiary);
+}
+
+.trashed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.folderPath {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.partialCount {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 行の右の「外す」：16px の丸 */
+.remove {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-4);
+  height: var(--space-4);
+  border-radius: var(--radius-pill);
+  color: var(--text-tertiary);
+}
+
+.remove:not(:disabled):hover {
+  background: var(--fill-3);
+  color: var(--text-primary);
+}
+
+.remove:disabled {
+  visibility: hidden;
+}
+
+.remove:focus-visible,
+.addLink:focus-visible,
+.unitLink:focus-visible,
+.moreButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.addLink {
+  align-self: flex-start;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+}
+
+.addLink:hover {
+  color: var(--text-primary);
+}
+
+.unitLink {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+}
+
+.unitLink svg {
+  color: var(--text-secondary);
+}
+
+.unitLink:hover {
+  text-decoration: underline;
+}
+
+.source {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-1-5);
+}
+
+.source svg {
+  flex: none;
+  margin-top: 1px;
+  color: var(--text-secondary);
+}
+
+/* メモ（Main.dc.html：2 行、角丸 8px、--bg-input の地） */
+.note {
+  resize: none;
+  padding: var(--space-2) var(--space-2-5);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke-3);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+
+.note:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* 下の「その他の操作」：34px の丸（Main.dc.html） */
+.actions {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.moreButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--h-button);
+  height: var(--h-button);
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--stroke-3);
+  background: var(--fill-2);
+  color: var(--text-primary);
+}
+
+.moreButton:hover {
+  background: var(--fill-3);
+}
+
+/* 複数選択：最初の 3 件のサムネイルを少しずつずらして重ねる */
+.stack {
+  position: relative;
+  flex: none;
+  height: 160px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-media);
+}
+
+.stackCard {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 120px;
+  height: 120px;
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  background: var(--fill-3);
+  box-shadow: var(--shadow-panel);
+}
+
+.stackCard[data-index='0'] {
+  z-index: 3;
+  transform: translate(-50%, -50%);
+}
+
+.stackCard[data-index='1'] {
+  z-index: 2;
+  transform: translate(-42%, -56%) rotate(5deg);
+}
+
+.stackCard[data-index='2'] {
+  z-index: 1;
+  transform: translate(-58%, -44%) rotate(-5deg);
+}
+
+.stackImage {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ユニットの設定の行：左に名前、右に操作 */
+.fieldRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-height: 30px;
+}
+
+.fieldLabel {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.numberInput {
+  width: 120px;
+  height: 30px;
+  padding: 0 var(--space-2-5);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke-3);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.numberInput:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.refFolder {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+  padding-bottom: var(--space-1);
+}
+
+.unitActions {
+  margin-top: auto;
+  display: flex;
+  gap: var(--space-2);
+}
+
+.unitActions > * {
+  flex: 1;
+}

@@ -1,4 +1,7 @@
-/* Sidebar.dc.html：幅 248px、余白 上下 12px・左右 8px、項目の間隔 14px */
+/*
+ * Sidebar.dc.html：幅 248px、余白 上下 12px・左右 8px、項目の間隔 14px。
+ * 行は高さ 32px・左右 10px・角丸 8px、アイコン 16px と文字の間 10px、件数は右寄せ 12px（design.md §4）。
+ */
 
 .sidebar {
   flex: none;
@@ -7,6 +10,7 @@
   flex-direction: column;
   gap: var(--space-3-5);
   padding: var(--space-3) var(--space-2);
+  min-height: 0;
 }
 
 /*
@@ -16,4 +20,322 @@
 .titlebar {
   flex: none;
   height: var(--space-6);
+}
+
+/* ライブラリの切り替え：高さ 40px、縁 --stroke-2、角丸 10px、--fill-1 の地 */
+.switcher {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2-5);
+  height: 40px;
+  padding: 0 var(--space-2-5);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--space-2-5);
+  background: var(--fill-1);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  text-align: left;
+}
+
+.switcher:hover {
+  background: var(--fill-2);
+}
+
+.switcherBadge {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.switcherName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.switcherChevron {
+  display: flex;
+  color: var(--text-tertiary);
+}
+
+.scroll {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3-5);
+  margin: 0 calc(var(--space-1) * -1);
+  padding: 0 var(--space-1);
+  overflow-y: auto;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* 見出し：高さ 22px、11px semibold tertiary */
+.sectionTitle {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 var(--space-2-5);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  color: var(--text-tertiary);
+}
+
+.sectionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-right: var(--space-1);
+  border-radius: var(--radius-md);
+}
+
+.sectionHeader[data-drop='inside'] {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+
+.sectionHeader .sectionTitle {
+  flex: 1;
+}
+
+.addButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--space-1-5);
+  color: var(--text-tertiary);
+}
+
+.addButton:hover {
+  background: var(--fill-2);
+  color: var(--text-primary);
+}
+
+/* ---- 行 ---- */
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2-5);
+  height: var(--h-sidebar-row);
+  padding: 0 var(--space-2-5);
+  border-radius: var(--radius-md);
+  font-size: var(--text-md);
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.row:hover {
+  background: var(--fill-1);
+}
+
+.row[aria-current='page'] {
+  background: var(--fill-selected);
+  color: var(--text-primary);
+  font-weight: var(--weight-semibold);
+}
+
+.rowIcon {
+  display: flex;
+  color: var(--text-tertiary);
+}
+
+.row[aria-current='page'] .rowIcon {
+  color: var(--accent);
+}
+
+.rowLabel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.count {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.row:focus-visible,
+.folderButton:focus-visible,
+.switcher:focus-visible,
+.addButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* ---- フォルダの木（いちばん上：左 4px・▾ 12px・間隔 6px、子：1 段ごとに 18px 下げる）---- */
+
+.folderItem {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.folderRow {
+  --folder-color: var(--text-tertiary);
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  height: var(--h-sidebar-row);
+  border-radius: var(--radius-md);
+  font-size: var(--text-md);
+  color: var(--text-secondary);
+}
+
+.folderRow:hover {
+  background: var(--fill-1);
+}
+
+.folderRow:has(> .folderButton[aria-current='page']) {
+  background: var(--fill-selected);
+  color: var(--text-primary);
+  font-weight: var(--weight-semibold);
+}
+
+.folderRow[data-color='blue'] {
+  --folder-color: var(--folder-blue);
+}
+
+.folderRow[data-color='violet'] {
+  --folder-color: var(--folder-violet);
+}
+
+.folderRow[data-color='amber'] {
+  --folder-color: var(--folder-amber);
+}
+
+.folderRow[data-color='teal'] {
+  --folder-color: var(--folder-teal);
+}
+
+.disclosure {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-3);
+  height: var(--space-3);
+  color: var(--text-tertiary);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.disclosure:disabled {
+  visibility: hidden;
+}
+
+.disclosure[data-open='true'] {
+  transform: rotate(90deg);
+}
+
+.folderButton {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2-5);
+  height: 100%;
+  padding-right: var(--space-2-5);
+  border-radius: var(--radius-md);
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+.folderIcon {
+  display: flex;
+  flex: none;
+  color: var(--folder-color);
+}
+
+/* いちばん上のフォルダは薄く塗る（Sidebar.dc.html） */
+.folderIcon[data-top='true'] path {
+  fill: color-mix(in srgb, var(--folder-color) 18%, transparent);
+}
+
+.unitMark {
+  display: flex;
+  color: var(--text-tertiary);
+}
+
+.editing {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2-5);
+  padding-right: var(--space-1-5);
+}
+
+/* ドラッグで落とす位置：中なら枠、上下なら線 */
+.folderRow[data-drop='inside'] {
+  background: var(--fill-pressed);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+
+.folderRow[data-drop='before']::before,
+.folderRow[data-drop='after']::after {
+  content: '';
+  position: absolute;
+  left: var(--space-2);
+  right: var(--space-2);
+  height: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+}
+
+.folderRow[data-drop='before']::before {
+  top: -1px;
+}
+
+.folderRow[data-drop='after']::after {
+  bottom: -1px;
+}
+
+/* メニューの色見本 */
+.swatch {
+  display: block;
+  width: var(--space-2-5);
+  height: var(--space-2-5);
+  border-radius: var(--radius-pill);
+  border: 1px dashed var(--stroke-dashed);
+}
+
+.swatch[data-color] {
+  border: 0;
+}
+
+.swatch[data-color='blue'] {
+  background: var(--folder-blue);
+}
+
+.swatch[data-color='violet'] {
+  background: var(--folder-violet);
+}
+
+.swatch[data-color='amber'] {
+  background: var(--folder-amber);
+}
+
+.swatch[data-color='teal'] {
+  background: var(--folder-teal);
 }

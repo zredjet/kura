@@ -1,16 +1,27 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
+import { openMenuAt } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
+import { isUnitEntry, type ListView, unitIdOf } from '../../ipc/items';
 import { dayLabel, localDay } from '../../lib/dates';
 import { formatCount } from '../../lib/format';
-import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
+import {
+  getCached,
+  getCachedUnit,
+  requestItems,
+  requestUnits,
+  useItemCacheVersion,
+} from '../../stores/itemCache';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { ROW_HEIGHTS, useViewStore } from '../../stores/viewStore';
 import { runScrollBench } from './bench';
+import { setOrderSource, useDragStore, watchDrag } from './dragState';
 import styles from './Grid.module.css';
+import { itemMenu } from './itemMenu';
 import { justify, rowOfItem, tileWidths, type TileRow } from './layout/justify';
-import { Tile } from './Tile';
+import { extendTo, selectOne, toggle } from './selection';
+import { type TileHandlers, Tile, UnitTile } from './Tile';
 
 /** タイルの間隔・見出しの行の高さ（Main.dc.html）。 */
 const GAP = 6;
@@ -20,10 +31,13 @@ const HEADING_HEIGHT = 30;
 export function Grid() {
   const list = useLibraryStore((s) => s.list);
   const thumbSize = useViewStore((s) => s.thumbSize);
-  const selectedId = useViewStore((s) => s.selectedId);
-  const select = useViewStore((s) => s.select);
-  const setQuickLook = useViewStore((s) => s.setQuickLook);
+  const selection = useViewStore((s) => s.selection);
+  const view = useViewStore((s) => s.view);
   useItemCacheVersion((s) => s.version);
+  const selected = useMemo(() => new Set(selection.ids), [selection.ids]);
+  const focusId = selection.focus;
+  const dropTarget = useDragStore((s) => s.target);
+  const dropHint = dropTarget?.kind === 'entry' ? dropTarget : null;
 
   const scrollRef = useRef<HTMLElement>(null);
   const [width, setWidth] = useState(0);
@@ -83,28 +97,42 @@ export function Grid() {
     if (!ids) {
       return;
     }
-    const wanted: number[] = [];
+    const items: number[] = [];
+    const units: number[] = [];
     for (const v of virtualizer.getVirtualItems()) {
       const row = rows[v.index];
       if (row?.kind === 'tiles') {
         for (let i = row.start; i < row.end; i += 1) {
-          wanted.push(ids[i] ?? 0);
+          const id = ids[i] ?? 0;
+          if (isUnitEntry(id)) {
+            units.push(unitIdOf(id));
+          } else {
+            items.push(id);
+          }
         }
       }
     }
-    requestItems(wanted);
+    requestItems(items);
+    requestUnits(units);
   }, [visibleKey, ids, rows, virtualizer]);
 
-  // 選んだアイテムが見えるようにスクロールする（←→ で選んだときなど）
+  // ユニットの中を開いたら、そのユニットの概要（種類・名前）も取る
   useEffect(() => {
-    if (selectedId === null || !ids || !layout) {
+    if (view.kind === 'unit') {
+      requestUnits([view.id]);
+    }
+  }, [view]);
+
+  // 注目しているものが見えるようにスクロールする（←→ で選んだときなど）
+  useEffect(() => {
+    if (focusId === null || !ids || !layout) {
       return;
     }
-    const row = rowOfItem(layout, ids.indexOf(selectedId));
+    const row = rowOfItem(layout, ids.indexOf(focusId));
     if (row >= 0) {
       virtualizer.scrollToIndex(row, { align: 'auto' });
     }
-  }, [selectedId, ids, layout, virtualizer]);
+  }, [focusId, ids, layout, virtualizer]);
 
   // 開発時の計測（VITE_KURA_BENCH=1）
   useEffect(() => {
@@ -113,13 +141,63 @@ export function Grid() {
     }
   }, [rows.length]);
 
-  const open = useCallback(
-    (id: number) => {
-      select(id);
-      setQuickLook(true);
-    },
-    [select, setQuickLook],
-  );
+  // ユニットの中の並べ替えで使う、いまの並び
+  useEffect(() => {
+    setOrderSource(() => Array.from(useLibraryStore.getState().list?.ids ?? []));
+  }, []);
+
+  const handlers = useMemo<TileHandlers>(() => {
+    const store = useViewStore.getState;
+    const order = () => useLibraryStore.getState().list?.ids ?? new Uint32Array();
+    return {
+      onClick: (id, e) => {
+        // WebKit ではボタンを押してもフォーカスが移らないので、キー操作がこのタイルに届くよう移す
+        (e.currentTarget as HTMLElement).focus({ preventScroll: true });
+        const { selection: current, setSelection } = store();
+        if (e.metaKey) {
+          setSelection(toggle(current, id));
+        } else if (e.shiftKey) {
+          setSelection(extendTo(current, id, order()));
+        } else {
+          setSelection(selectOne(id));
+        }
+      },
+      onOpen: (id) => {
+        const s = store();
+        if (isUnitEntry(id)) {
+          s.openUnit(unitIdOf(id));
+        } else {
+          s.setSelection(selectOne(id));
+          s.setQuickLook(true);
+        }
+      },
+      onContextMenu: (id, e) => {
+        e.preventDefault();
+        const s = store();
+        const entries = s.selection.ids.includes(id) ? s.selection.ids : [id];
+        if (!s.selection.ids.includes(id)) {
+          s.setSelection(selectOne(id));
+        }
+        openMenuAt(e.clientX, e.clientY, ja.itemMenu.label, itemMenu(entries));
+      },
+      onPointerDown: (id, e) => {
+        if (e.metaKey || e.shiftKey) {
+          return;
+        }
+        watchDrag(e, () => {
+          const s = store();
+          const entries = s.selection.ids.includes(id) ? [...s.selection.ids] : [id];
+          if (!s.selection.ids.includes(id)) {
+            s.setSelection(selectOne(id));
+          }
+          return {
+            payload: { kind: 'entries', ids: entries },
+            label: ja.library.itemCount(formatCount(entries.length)),
+          };
+        });
+      },
+    };
+  }, []);
 
   const today = localDay(Date.now());
   const empty = list !== null && list.ids.length === 0;
@@ -127,10 +205,7 @@ export function Grid() {
   return (
     <section ref={scrollRef} className={styles.grid} aria-label={ja.library.gridLabel}>
       {empty ? (
-        <div className={styles.empty}>
-          <p className={styles.emptyTitle}>{ja.library.emptyTitle}</p>
-          <p className={styles.emptyHint}>{ja.library.emptyHint}</p>
-        </div>
+        <EmptyView view={view} />
       ) : (
         <div className={styles.canvas} style={{ height: virtualizer.getTotalSize() }}>
           {virtualRows.map((v) => {
@@ -160,9 +235,9 @@ export function Grid() {
                 start={v.start}
                 width={width}
                 list={list}
-                selectedId={selectedId}
-                onSelect={select}
-                onOpen={open}
+                selected={selected}
+                dropHint={dropHint}
+                handlers={handlers}
               />
             );
           })}
@@ -177,23 +252,36 @@ function TileRowView({
   start,
   width,
   list,
-  selectedId,
-  onSelect,
-  onOpen,
+  selected,
+  dropHint,
+  handlers,
 }: {
   row: TileRow;
   start: number;
   width: number;
   list: { ids: Uint32Array; aspects: Uint16Array };
-  selectedId: number | null;
-  onSelect: (id: number) => void;
-  onOpen: (id: number) => void;
+  selected: ReadonlySet<number>;
+  dropHint: { id: number; side: 'before' | 'after' } | null;
+  handlers: TileHandlers;
 }) {
   const widths = tileWidths(row, list.aspects, width, GAP);
   return (
     <div className={styles.row} style={{ transform: `translateY(${start}px)`, height: row.height }}>
       {widths.map((w, k) => {
         const id = list.ids[row.start + k] ?? 0;
+        if (isUnitEntry(id)) {
+          return (
+            <UnitTile
+              key={id}
+              id={id}
+              unit={getCachedUnit(unitIdOf(id))}
+              width={w}
+              height={row.height}
+              selected={selected.has(id)}
+              handlers={handlers}
+            />
+          );
+        }
         return (
           <Tile
             key={id}
@@ -201,12 +289,36 @@ function TileRowView({
             item={getCached(id)}
             width={w}
             height={row.height}
-            selected={id === selectedId}
-            onSelect={onSelect}
-            onOpen={onOpen}
+            selected={selected.has(id)}
+            dropSide={dropHint?.id === id ? dropHint.side : undefined}
+            handlers={handlers}
           />
         );
       })}
+    </div>
+  );
+}
+
+/** 一覧が空のときの案内（一覧の種類ごと）。 */
+function EmptyView({ view }: { view: ListView }) {
+  const t = ja.library.emptyView;
+  let title: string = t.other;
+  let hint: string | null = null;
+  if (view.kind === 'all') {
+    title = ja.library.emptyTitle;
+    hint = ja.library.emptyHint;
+  } else if (view.kind === 'folder') {
+    title = t.folder;
+    hint = t.folderHint;
+  } else if (view.kind === 'trash') {
+    title = t.trash;
+  } else if (view.kind === 'unit') {
+    title = t.unit;
+  }
+  return (
+    <div className={styles.empty}>
+      <p className={styles.emptyTitle}>{title}</p>
+      {hint && <p className={styles.emptyHint}>{hint}</p>}
     </div>
   );
 }

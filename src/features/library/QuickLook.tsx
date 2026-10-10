@@ -4,6 +4,7 @@ import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
 import { CloseIcon } from '../../components/icons/CloseIcon';
 import { ja } from '../../i18n/ja';
+import { isUnitEntry } from '../../ipc/items';
 import { fileUrl, playUrl, thumbUrl } from '../../ipc/media';
 import { formatCount } from '../../lib/format';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
@@ -16,7 +17,7 @@ const t = ja.quickLook;
 /** クイックルック（design.md §3.1：黒地の全画面、上に名前と「3 / 128」、左右に移動、esc で閉じる）。 */
 export function QuickLook() {
   const open = useViewStore((s) => s.quickLook);
-  const selectedId = useViewStore((s) => s.selectedId);
+  const selectedId = useViewStore((s) => s.selection.focus);
   const select = useViewStore((s) => s.select);
   const setQuickLook = useViewStore((s) => s.setQuickLook);
   const ids = useLibraryStore((s) => s.list?.ids);
@@ -35,8 +36,18 @@ export function QuickLook() {
   if (!open || selectedId === null || !ids || index < 0) {
     return null;
   }
+  // ユニットのタイルは飛ばして、前後のアイテムへ
+  const neighbor = (delta: number): number | undefined => {
+    for (let i = index + delta; i >= 0 && i < ids.length; i += delta) {
+      const id = ids[i];
+      if (id !== undefined && !isUnitEntry(id)) {
+        return id;
+      }
+    }
+    return undefined;
+  };
   const go = (delta: number) => {
-    const next = ids[index + delta];
+    const next = neighbor(delta);
     if (next !== undefined) {
       select(next);
     }
@@ -101,7 +112,7 @@ export function QuickLook() {
         type="button"
         className={`${styles.nav} ${styles.prev}`}
         aria-label={t.previous}
-        disabled={index === 0}
+        disabled={neighbor(-1) === undefined}
         onClick={() => go(-1)}
       >
         <ChevronLeftIcon size={22} strokeWidth={2} />
@@ -110,7 +121,7 @@ export function QuickLook() {
         type="button"
         className={`${styles.nav} ${styles.next}`}
         aria-label={t.next}
-        disabled={index === ids.length - 1}
+        disabled={neighbor(1) === undefined}
         onClick={() => go(1)}
       >
         <ChevronRightIcon size={22} strokeWidth={2} />

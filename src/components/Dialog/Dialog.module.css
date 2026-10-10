@@ -29,3 +29,9 @@
 .dialog:focus {
   outline: none;
 }
+
+/* 名前の入力・確認など小さなシート（design.md §3.1「ユニット作成のダイアログ」） */
+.small {
+  width: min(420px, calc(100% - var(--space-4) * 2));
+  gap: var(--space-4);
+}

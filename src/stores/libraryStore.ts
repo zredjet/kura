@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 
+import { prune } from '../features/library/selection';
 import { type IdList, queryIds } from '../ipc/items';
 import {
   createLibrary,
@@ -8,7 +9,10 @@ import {
   openLibrary,
   restoreLibrary,
 } from '../ipc/library';
+import { isIpcError } from '../ipc/result';
 import { clearItems } from './itemCache';
+import { useSidebarStore } from './sidebarStore';
+import { useViewStore } from './viewStore';
 
 type Status = 'loading' | 'none' | 'open';
 
@@ -37,9 +41,22 @@ export const useLibraryStore = create<LibraryState>((set) => ({
   missingPath: null,
   list: null,
   loadList: async () => {
+    const { view, collapseUnits } = useViewStore.getState();
     try {
-      set({ list: await queryIds() });
+      const list = await queryIds(view, collapseUnits);
+      // 読んでいるあいだに一覧を切り替えていたら捨てる
+      const now = useViewStore.getState();
+      if (now.view !== view || now.collapseUnits !== collapseUnits) {
+        return;
+      }
+      set({ list });
+      now.setSelection(prune(now.selection, list.ids));
     } catch (error) {
+      if (isIpcError(error, 'NotFound')) {
+        // 開いていたフォルダ・ユニットがなくなったら「すべて」に戻る
+        useViewStore.getState().setView({ kind: 'all' });
+        return;
+      }
       console.warn('一覧を取得できませんでした', error);
     }
   },
@@ -58,12 +75,12 @@ export const useLibraryStore = create<LibraryState>((set) => ({
   },
   create: async (path) => {
     const info = await createLibrary(path);
-    clearItems();
+    resetForLibrary();
     set({ status: 'open', info, missingPath: null, list: null });
   },
   open: async (path) => {
     const info = await openLibrary(path);
-    clearItems();
+    resetForLibrary();
     set({ status: 'open', info, missingPath: null, list: null });
   },
   refresh: async () => {
@@ -74,3 +91,10 @@ export const useLibraryStore = create<LibraryState>((set) => ({
     }
   },
 }));
+
+/** ライブラリを切り替えたときに、前のライブラリの表示を捨てる。 */
+function resetForLibrary(): void {
+  clearItems();
+  useSidebarStore.getState().clear();
+  useViewStore.getState().setView({ kind: 'all' });
+}

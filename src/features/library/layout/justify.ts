@@ -7,7 +7,7 @@
 export interface JustifyInput {
   /** 縦横比×1000（音楽と不明は 1000）。 */
   aspects: ArrayLike<number>;
-  /** 日付のグループの開始位置（昇順。先頭は 0）。空なら全体で 1 グループ。 */
+  /** 日付のグループの開始位置（昇順。先頭は 0）。空なら見出しなしで全体を 1 グループにする（ランダム・ユニットの中）。 */
   groupStarts: readonly number[];
   /** タイルを並べる幅（px）。 */
   width: number;
@@ -61,7 +61,8 @@ export function ratioOf(aspect: number): number {
 export function justify(input: JustifyInput): Layout {
   const { aspects, width, targetHeight, gap, headingHeight } = input;
   const count = aspects.length;
-  const starts = input.groupStarts.length > 0 ? input.groupStarts : [0];
+  const headings = input.groupStarts.length > 0;
+  const starts = headings ? input.groupStarts : [0];
   const rows: LayoutRow[] = [];
   let y = 0;
   if (count === 0 || width <= 0) {
@@ -74,14 +75,16 @@ export function justify(input: JustifyInput): Layout {
     if (groupEnd <= groupStart) {
       continue;
     }
-    rows.push({
-      kind: 'heading',
-      group: g,
-      count: groupEnd - groupStart,
-      y,
-      height: headingHeight,
-    });
-    y += headingHeight + gap;
+    if (headings) {
+      rows.push({
+        kind: 'heading',
+        group: g,
+        count: groupEnd - groupStart,
+        y,
+        height: headingHeight,
+      });
+      y += headingHeight + gap;
+    }
 
     let rowStart = groupStart;
     let ratioSum = 0;

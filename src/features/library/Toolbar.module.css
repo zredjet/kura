@@ -21,9 +21,33 @@
 }
 
 .title {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1-5);
   font-size: var(--text-3xl);
   font-weight: var(--weight-bold);
   letter-spacing: -0.01em;
+}
+
+/* パンくず（design.md §3.1「すべて › 鎌倉」）：戻り先は押せる tertiary の文字 */
+.crumb {
+  font: inherit;
+  color: var(--text-tertiary);
+  border-radius: var(--radius-sm);
+}
+
+.crumb:hover {
+  color: var(--text-secondary);
+}
+
+.crumb:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.crumbSeparator {
+  color: var(--text-tertiary);
+  font-weight: var(--weight-regular);
 }
 
 .subtitle {
@@ -62,6 +86,10 @@
 .iconButton:hover,
 .iconButton[aria-pressed='true'] {
   color: var(--text-primary);
+}
+
+.iconButton[aria-pressed='true'] {
+  background: var(--fill-pressed);
 }
 
 .iconButton:hover {

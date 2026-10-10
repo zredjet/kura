@@ -1,11 +1,16 @@
 import { isTauri } from '@tauri-apps/api/core';
 import { useEffect } from 'react';
 
+import { Menu } from '../components/Menu/Menu';
+import { Notice } from '../components/Notice/Notice';
+import { Overlays } from '../components/Overlay/Overlays';
 import { DropOverlay } from '../features/import/DropOverlay';
 import { ImportSheet } from '../features/import/ImportSheet';
+import { DragGhost } from '../features/library/DragGhost';
 import { useFileDrop, useImportShortcut } from '../features/import/useFileDrop';
 import { LibraryView } from '../features/library/LibraryView';
 import { Sidebar } from '../features/sidebar/Sidebar';
+import { TagDialog } from '../features/tags/TagDialog';
 import { Welcome } from '../features/welcome/Welcome';
 import { startJobEvents, useJobsStore } from '../stores/jobsStore';
 import { useLibraryStore } from '../stores/libraryStore';
@@ -45,6 +50,11 @@ function LibraryScreen() {
       </AppShell>
       <ImportSheet />
       <DropOverlay />
+      <TagDialog />
+      <Overlays />
+      <Menu />
+      <Notice />
+      <DragGhost />
     </>
   );
 }

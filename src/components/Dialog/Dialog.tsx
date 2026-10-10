@@ -7,14 +7,16 @@ interface DialogProps {
   labelledBy: string;
   /** esc で閉じるときに呼ぶ。 */
   onClose: () => void;
+  /** 小さいシート（名前の入力・確認など。幅 420px）。 */
+  size?: 'md' | 'sm';
   children: ReactNode;
 }
 
 const FOCUSABLE =
-  'button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])';
+  'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])';
 
 /** 暗幕＋中央上部のシート（design.md §4 のダイアログ）。esc で閉じ、Tab はシートの中を回る。 */
-export function Dialog({ labelledBy, onClose, children }: DialogProps) {
+export function Dialog({ labelledBy, onClose, size = 'md', children }: DialogProps) {
   const ref = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   useEffect(() => {
@@ -60,14 +62,14 @@ export function Dialog({ labelledBy, onClose, children }: DialogProps) {
   }, []);
 
   return (
-    <div className={styles.scrim}>
+    <div className={styles.scrim} data-sheet="">
       <div
         ref={ref}
         role="dialog"
         aria-modal="true"
         aria-labelledby={labelledBy}
         tabIndex={-1}
-        className={styles.dialog}
+        className={size === 'sm' ? `${styles.dialog} ${styles.small}` : styles.dialog}
       >
         {children}
       </div>

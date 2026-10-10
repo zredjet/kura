@@ -94,10 +94,10 @@ describe('例の文', () => {
 describe('folderChoices', () => {
   it('木の順に並べてパスを付ける', () => {
     const choices = folderChoices([
-      { id: 3, parentId: null, name: 'イラスト', color: null, pos: 2 },
-      { id: 2, parentId: 1, name: '2026 旅行', color: null, pos: 1 },
-      { id: 1, parentId: null, name: '写真', color: null, pos: 1 },
-      { id: 4, parentId: 1, name: '家族', color: null, pos: 2 },
+      { id: 3, parentId: null, name: 'イラスト', color: null, pos: 2, count: null, unitId: null },
+      { id: 2, parentId: 1, name: '2026 旅行', color: null, pos: 1, count: null, unitId: null },
+      { id: 1, parentId: null, name: '写真', color: null, pos: 1, count: null, unitId: null },
+      { id: 4, parentId: 1, name: '家族', color: null, pos: 2, count: null, unitId: null },
     ]);
     expect(choices.map((c) => c.path.join(' / '))).toEqual([
       '写真',

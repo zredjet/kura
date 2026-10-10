@@ -1,0 +1,86 @@
+/* タグの編集（小さなシート）。色見本は 22px の丸、選んでいるものは --focus-ring と同じ輪 */
+
+.header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.usage {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: var(--space-2);
+}
+
+.swatches {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.swatch {
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-pill);
+  border: 1px dashed var(--stroke-dashed);
+}
+
+.swatch[data-color] {
+  border: 0;
+}
+
+.swatch[data-color='blue'] {
+  background: var(--folder-blue);
+}
+
+.swatch[data-color='violet'] {
+  background: var(--folder-violet);
+}
+
+.swatch[data-color='amber'] {
+  background: var(--folder-amber);
+}
+
+.swatch[data-color='teal'] {
+  background: var(--folder-teal);
+}
+
+.swatch[aria-pressed='true'] {
+  box-shadow:
+    0 0 0 2px var(--bg-window),
+    0 0 0 4px var(--text-primary);
+}
+
+.swatch:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.hint {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.secondary {
+  display: flex;
+  gap: var(--space-1-5);
+}
+
+/* 折り返しても「キャンセル」「保存」は右に寄せる */
+.footer > :last-child {
+  margin-left: auto;
+}

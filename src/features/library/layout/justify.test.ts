@@ -84,4 +84,10 @@ describe('rowOfItem', () => {
     expect(rowOfItem(layout, 4)).toBe(3);
     expect(rowOfItem(layout, 9)).toBe(-1);
   });
+
+  it('lays out ungrouped lists without headings', () => {
+    const layout = justify({ ...base, aspects: [1500, 1500, 1500], groupStarts: [] });
+    expect(layout.rows.every((r) => r.kind === 'tiles')).toBe(true);
+    expect(layout.rows[0]?.y).toBe(0);
+  });
 });

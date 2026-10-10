@@ -1,0 +1,38 @@
+/* 浮いている部品なのでガラスのカプセル（再生バーと同じ面）。取り込みの進捗より上に出す */
+
+.region {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--space-6) * 4);
+  z-index: 30;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.notice {
+  max-width: 480px;
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-pill);
+  background: var(--glass-capsule);
+  border: 1px solid var(--stroke-3);
+  box-shadow: var(--shadow-capsule);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  backdrop-filter: var(--glass-blur-strong);
+  font-size: var(--text-md);
+  color: var(--text-primary);
+  text-align: center;
+  animation: notice-in var(--dur-base) var(--ease-out);
+}
+
+@keyframes notice-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notice {
+    animation: none;
+  }
+}

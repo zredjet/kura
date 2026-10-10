@@ -3,6 +3,7 @@ import { create } from 'zustand';
 import { listJobs, type JobProgress, onJobProgress, progressFromJob } from '../ipc/jobs';
 import { refreshPending } from './itemCache';
 import { useLibraryStore } from './libraryStore';
+import { useSidebarStore } from './sidebarStore';
 
 /** 取り込み中に一覧を読み直す間隔・サムネイルのでき具合を反映する間隔（ms）。 */
 const LIST_RELOAD_MS = 1000;
@@ -24,6 +25,7 @@ function coalesce(ms: number, run: () => void): () => void {
 const reloadList = coalesce(LIST_RELOAD_MS, () => {
   void useLibraryStore.getState().loadList();
   void useLibraryStore.getState().refresh();
+  void useSidebarStore.getState().load();
 });
 const refreshThumbs = coalesce(THUMB_REFRESH_MS, refreshPending);
 

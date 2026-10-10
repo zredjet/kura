@@ -1,0 +1,33 @@
+/* Main.dc.html：26px の正方形のボタン、間隔 2px、星 16px。オンは --accent */
+
+.stars {
+  display: flex;
+  gap: var(--space-0-5);
+}
+
+.star {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--space-1-5);
+  color: var(--text-tertiary);
+}
+
+.star:hover {
+  background: var(--fill-2);
+}
+
+.star[data-on='true'] {
+  color: var(--accent);
+}
+
+.stars[data-mixed='true'] .star {
+  opacity: 0.6;
+}
+
+.star:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}

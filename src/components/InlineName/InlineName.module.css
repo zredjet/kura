@@ -1,0 +1,18 @@
+/* design.md §4 の入力（--bg-input の地、縁 --stroke-3、角丸 8px） */
+
+.input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke-3);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: var(--text-md);
+}
+
+.input:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}

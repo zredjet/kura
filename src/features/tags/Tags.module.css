@@ -1,0 +1,170 @@
+/*
+ * タグ（design.md §4：高さ 24px、角丸 6px、--fill-2 の地、名前空間は tertiary で前置）と、
+ * 入力欄（Main.dc.html：高さ 30px、角丸 8px、--bg-input の地）。
+ */
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1-5);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chip {
+  --tag-color: transparent;
+  display: flex;
+  align-items: center;
+  height: 24px;
+  border-radius: var(--space-1-5);
+  background: var(--fill-2);
+  border: 1px solid var(--stroke-2);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+}
+
+.chip[data-color='blue'] {
+  --tag-color: var(--folder-blue);
+}
+
+.chip[data-color='violet'] {
+  --tag-color: var(--folder-violet);
+}
+
+.chip[data-color='amber'] {
+  --tag-color: var(--folder-amber);
+}
+
+.chip[data-color='teal'] {
+  --tag-color: var(--folder-teal);
+}
+
+.chipName {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 100%;
+  padding: 0 var(--space-1) 0 var(--space-2);
+  border-radius: var(--space-1-5) 0 0 var(--space-1-5);
+  color: inherit;
+}
+
+.chipRemove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 100%;
+  border-radius: 0 var(--space-1-5) var(--space-1-5) 0;
+  color: var(--text-tertiary);
+}
+
+.chipName:hover,
+.chipRemove:hover {
+  background: var(--fill-3);
+  color: var(--text-primary);
+}
+
+.chipName:focus-visible,
+.chipRemove:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.dot {
+  width: var(--space-1-5);
+  height: var(--space-1-5);
+  border-radius: var(--radius-pill);
+  background: var(--tag-color);
+}
+
+.namespace {
+  color: var(--text-tertiary);
+}
+
+/* 一部にだけ付いているタグ（複数選択）：点線の縁、押すとすべてに付ける */
+.partial {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--stroke-dashed);
+  color: var(--text-secondary);
+}
+
+.partialCount {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.field {
+  position: relative;
+}
+
+.input {
+  width: 100%;
+  height: 30px;
+  padding: 0 var(--space-2-5);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke-3);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.input:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* 候補：入力欄の下に浮かぶガラスの面 */
+.suggestions {
+  position: absolute;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: var(--space-1);
+  list-style: none;
+  border-radius: var(--radius-lg);
+  background: var(--glass-dialog);
+  border: 1px solid var(--stroke-3);
+  box-shadow: var(--shadow-dialog);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  backdrop-filter: var(--glass-blur-strong);
+}
+
+.suggestion {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--h-chip);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  cursor: default;
+}
+
+.suggestion[aria-selected='true'] {
+  background: var(--fill-selected);
+}
+
+.suggestionName {
+  display: flex;
+  gap: var(--space-1);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.suggestionNote,
+.suggestionCount {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}

@@ -1,0 +1,27 @@
+/* ドラッグ中の印：ガラスのカプセル（浮いている部品） */
+
+.ghost {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 50;
+  padding: var(--space-1) var(--space-2-5);
+  border-radius: var(--radius-pill);
+  background: var(--glass-capsule);
+  border: 1px solid var(--stroke-3);
+  box-shadow: var(--shadow-capsule);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  backdrop-filter: var(--glass-blur-strong);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text-primary);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* ドラッグ中は文字を選ばない */
+:global(html[data-dragging]) {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}

@@ -81,3 +81,65 @@
   left: var(--space-1-5);
   top: var(--space-1-5);
 }
+
+/* ドラッグで並べ替えるときの差し込み位置（タイルは描画を枠で切るので内側の端に出す） */
+.tile[data-drop='before']::before,
+.tile[data-drop='after']::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  z-index: 1;
+}
+
+.tile[data-drop='before']::before {
+  left: 0;
+}
+
+.tile[data-drop='after']::before {
+  right: 0;
+}
+
+/* ユニット：表紙の奥に 2 枚の板（--fill-3、上に 3px と 6px ずらす）。タイルの枠の中に収める */
+.unit {
+  background: transparent;
+}
+
+.plate {
+  position: absolute;
+  bottom: 0;
+  border-radius: var(--radius-md);
+  background: var(--fill-3);
+}
+
+.plateBack {
+  top: 0;
+  left: var(--space-3);
+  right: var(--space-3);
+}
+
+.plateMiddle {
+  top: 3px;
+  left: var(--space-1-5);
+  right: var(--space-1-5);
+  background: color-mix(in srgb, var(--fill-3) 100%, var(--bg-window) 40%);
+}
+
+.cover {
+  position: absolute;
+  top: 6px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  background: var(--fill-2);
+  box-shadow: 0 -1px 0 var(--stroke-2);
+}
+
+.unit[aria-pressed='true']::after {
+  top: 6px;
+}
