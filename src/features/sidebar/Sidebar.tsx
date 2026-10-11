@@ -14,6 +14,7 @@ import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import { FolderTree } from './FolderTree';
 import { LibrarySwitcher } from './LibrarySwitcher';
+import { PlaylistList } from './PlaylistList';
 import { SmartFolderList } from './SmartFolderList';
 import styles from './Sidebar.module.css';
 
@@ -46,7 +47,7 @@ function viewFor(kind: LibraryKind): ListView {
 
 /**
  * サイドバー（Sidebar.dc.html）。先頭の行にはネイティブの信号機が重なる。
- * ライブラリの切り替え・ライブラリの項目・スマートフォルダ・フォルダの木。プレイリスト（M6）・
+ * ライブラリの切り替え・ライブラリの項目・スマートフォルダ・フォルダの木・プレイリスト。
  * 取得（M7）・容量と設定（M9）は、その機能を入れるときに足す。
  */
 export function Sidebar() {
@@ -54,7 +55,9 @@ export function Sidebar() {
   const view = useViewStore((s) => s.view);
   const parent = useViewStore((s) => s.parent);
   const setView = useViewStore((s) => s.setView);
-  const current = view.kind === 'unit' ? parent : view;
+  const playlistOpen = useViewStore((s) => s.playlist !== null);
+  // プレイリストを開いているあいだは、ライブラリ・フォルダの行を選んでいる表示にしない
+  const current = playlistOpen ? null : view.kind === 'unit' ? parent : view;
 
   useEffect(() => {
     void useSidebarStore.getState().load();
@@ -104,7 +107,7 @@ export function Sidebar() {
                 {...{ [ROW_ATTR]: '' }}
                 onClick={(e) => {
                   e.currentTarget.focus();
-                  if (!selected || row.kind === 'random') {
+                  if (!selected || row.kind === 'random' || playlistOpen) {
                     setView(viewFor(row.kind));
                   }
                 }}
@@ -118,6 +121,7 @@ export function Sidebar() {
         </section>
         <SmartFolderList current={current} />
         <FolderTree current={current} />
+        <PlaylistList />
       </div>
     </nav>
   );

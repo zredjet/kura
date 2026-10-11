@@ -24,6 +24,22 @@
   animation: notice-in var(--dur-base) var(--ease-out);
 }
 
+/* 「元に戻す」：知らせの右に、アクセントの文字のボタン（押せるようにここだけポインタを受ける） */
+.action {
+  margin-left: var(--space-3);
+  padding: 0;
+  color: var(--accent);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  pointer-events: auto;
+}
+
+.action:focus-visible {
+  outline: none;
+  border-radius: var(--radius-xs);
+  box-shadow: var(--focus-ring);
+}
+
 @keyframes notice-in {
   from {
     opacity: 0;

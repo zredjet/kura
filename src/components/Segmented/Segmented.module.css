@@ -1,0 +1,40 @@
+/* セグメント（Main.dc.html：角丸 15px の枠に高さ 26px のボタン。オンは --fill-pressed＋白） */
+
+.segment {
+  display: inline-flex;
+  flex: none;
+  gap: var(--space-0-5);
+  padding: var(--space-0-5);
+  border-radius: 15px;
+  background: var(--fill-1);
+  border: 1px solid var(--stroke-1);
+}
+
+.button {
+  display: flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 var(--space-2-5);
+  border-radius: 13px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.button:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+.button[aria-pressed='true'] {
+  background: var(--fill-pressed);
+  color: var(--text-on-media);
+  font-weight: var(--weight-semibold);
+}
+
+.button:disabled {
+  opacity: 0.5;
+}
+
+.button:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}

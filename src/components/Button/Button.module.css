@@ -44,3 +44,10 @@
   padding: 0 var(--space-2-5);
   border-radius: var(--radius-md);
 }
+
+/* Playlist.dc.html の「再生」「作り直す」：高さ 38px、左右 18px、14px */
+.large {
+  height: var(--h-button-lg);
+  padding: 0 var(--space-4);
+  font-size: var(--text-lg);
+}

@@ -67,6 +67,8 @@ function save(state: Saved) {
 interface ViewState extends Saved {
   /** いま開いている一覧（サイドバーの項目、またはユニットの中）。 */
   view: ListView;
+  /** プレイリストの画面を開いていればその ID（一覧の代わりに出す）。 */
+  playlist: number | null;
   /** ユニットを開いているときの戻り先。 */
   parent: ListView | null;
   /** 検索の条件（チップの列。docs/search-query.md）。一覧を切り替えると外す（ADR-53）。 */
@@ -75,8 +77,10 @@ interface ViewState extends Saved {
   parentFilter: string[];
   selection: Selection;
   quickLook: boolean;
-  /** 一覧を切り替える（選択は外す）。 */
+  /** 一覧を切り替える（選択は外す。プレイリストの画面は閉じる）。 */
   setView: (view: ListView) => void;
+  /** プレイリストの画面を開く。 */
+  openPlaylist: (id: number) => void;
   /** ユニットの中を開く（戻り先は今の一覧）。 */
   openUnit: (unitId: number) => void;
   /** ユニットの中から戻る。 */
@@ -97,6 +101,7 @@ interface ViewState extends Saved {
 export const useViewStore = create<ViewState>((set, get) => ({
   ...load(),
   view: { kind: 'all' },
+  playlist: null,
   parent: null,
   filter: [],
   parentFilter: [],
@@ -105,17 +110,20 @@ export const useViewStore = create<ViewState>((set, get) => ({
   setView: (view) =>
     set({
       view,
+      playlist: null,
       parent: null,
       filter: [],
       parentFilter: [],
       selection: EMPTY_SELECTION,
       quickLook: false,
     }),
+  openPlaylist: (id) => set({ playlist: id, selection: EMPTY_SELECTION, quickLook: false }),
   openUnit: (unitId) => {
     const { view, parent, filter, parentFilter } = get();
     const fromUnit = view.kind === 'unit';
     set({
       view: { kind: 'unit', id: unitId },
+      playlist: null,
       parent: fromUnit ? parent : view,
       filter: [],
       parentFilter: fromUnit ? parentFilter : filter,

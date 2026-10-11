@@ -2,6 +2,7 @@ import { create } from 'zustand';
 
 import { type FolderNodeDto, foldersTree } from '../ipc/folders';
 import { libraryCounts, type LibraryCountsDto } from '../ipc/items';
+import { listPlaylists, type PlaylistSummaryDto } from '../ipc/playlists';
 import { type SmartFolderDto, smartFolders } from '../ipc/search';
 
 const STORAGE_KEY = 'kura.sidebar';
@@ -37,12 +38,14 @@ export type SidebarEditing =
   | { kind: 'rename'; id: number }
   | { kind: 'create'; parentId: number | null }
   | { kind: 'renameSmart'; id: number }
+  | { kind: 'renamePlaylist'; id: number }
   | null;
 
 interface SidebarState {
   counts: LibraryCountsDto | null;
   folders: FolderNodeDto[];
   smartFolders: SmartFolderDto[];
+  playlists: PlaylistSummaryDto[];
   expanded: Record<number, true>;
   editing: SidebarEditing;
   /** 件数とフォルダを読み直す。 */
@@ -59,6 +62,7 @@ export const useSidebarStore = create<SidebarState>((set, get) => ({
   counts: null,
   folders: [],
   smartFolders: [],
+  playlists: [],
   expanded: loadExpanded(),
   editing: null,
   load: () => {
@@ -69,12 +73,13 @@ export const useSidebarStore = create<SidebarState>((set, get) => ({
     }
     loading = (async () => {
       try {
-        const [counts, folders, smart] = await Promise.all([
+        const [counts, folders, smart, playlists] = await Promise.all([
           libraryCounts(),
           foldersTree(true),
           smartFolders(true),
+          listPlaylists(),
         ]);
-        set({ counts, folders, smartFolders: smart });
+        set({ counts, folders, smartFolders: smart, playlists });
       } catch (error) {
         console.warn('サイドバーの内容を読めませんでした', error);
       } finally {
@@ -98,5 +103,5 @@ export const useSidebarStore = create<SidebarState>((set, get) => ({
     saveExpanded(expanded);
   },
   setEditing: (editing) => set({ editing }),
-  clear: () => set({ counts: null, folders: [], smartFolders: [], editing: null }),
+  clear: () => set({ counts: null, folders: [], smartFolders: [], playlists: [], editing: null }),
 }));

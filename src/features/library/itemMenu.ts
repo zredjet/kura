@@ -4,6 +4,7 @@ import { isUnitEntry, unitIdOf } from '../../ipc/items';
 import { getCachedUnit } from '../../stores/itemCache';
 import { useViewStore } from '../../stores/viewStore';
 import { playSelection } from '../player/playSelection';
+import { pickPlaylistFor } from '../playlists/playlistActions';
 import {
   dissolveUnits,
   groupEntries,
@@ -76,6 +77,11 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
     label: ja.itemMenu.addToFolder,
     shortcut: 'F',
     onSelect: () => void pickFolderFor(entries),
+  });
+  out.push({
+    label: ja.itemMenu.addToPlaylist,
+    shortcut: 'P',
+    onSelect: () => void pickPlaylistFor(entries),
   });
   if (kind === 'folder') {
     out.push({

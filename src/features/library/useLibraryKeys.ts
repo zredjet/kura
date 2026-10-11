@@ -9,6 +9,7 @@ import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import { playSelection } from '../player/playSelection';
+import { pickPlaylistFor } from '../playlists/playlistActions';
 import {
   dissolveUnits,
   groupEntries,
@@ -154,6 +155,10 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
   }
   if (key === 'f') {
     void pickFolderFor(entries);
+    return true;
+  }
+  if (key === 'p') {
+    void pickPlaylistFor(entries);
     return true;
   }
   if (key === 'Backspace') {

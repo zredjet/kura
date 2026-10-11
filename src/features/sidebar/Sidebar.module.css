@@ -286,8 +286,9 @@
   padding-right: var(--space-1-5);
 }
 
-/* ドラッグで落とす位置：中なら枠、上下なら線 */
-.folderRow[data-drop='inside'] {
+/* ドラッグで落とす位置：中なら枠、上下なら線（プレイリストの行は中だけ） */
+.folderRow[data-drop='inside'],
+.row[data-drop='inside'] {
   background: var(--fill-pressed);
   box-shadow: inset 0 0 0 1.5px var(--accent);
 }

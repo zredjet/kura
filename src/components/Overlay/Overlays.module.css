@@ -102,3 +102,30 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* 入力の下の補足 */
+.note {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+  color: var(--text-tertiary);
+}
+
+/* 選び方（ラジオ・チェックボックスの行） */
+.choices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.choice {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-md);
+  color: var(--text-primary);
+}
+
+.choice input {
+  accent-color: var(--accent);
+}

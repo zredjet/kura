@@ -37,7 +37,37 @@ interface PickerOverlay {
   resolve: (option: PickerOption | null) => void;
 }
 
-export type Overlay = PromptOverlay | ConfirmOverlay | PickerOverlay;
+/** 新しいプレイリストの入力（名前・手動かスマートか・単位）。 */
+export interface NewPlaylistValue {
+  name: string;
+  kind: 'manual' | 'smart';
+  granularity: 'file' | 'unit';
+}
+
+interface NewPlaylistOverlay {
+  kind: 'newPlaylist';
+  initial: NewPlaylistValue;
+  resolve: (value: NewPlaylistValue | null) => void;
+}
+
+/** ユニット単位のプレイリストに複数のアイテムを入れるときの選び方（docs/playlists.md §3.5）。 */
+export interface AddModeValue {
+  mode: 'group' | 'each';
+  /** まとめるときのユニットの名前。 */
+  name: string;
+  /** 「次回も同じ」。 */
+  remember: boolean;
+}
+
+interface AddModeOverlay {
+  kind: 'addMode';
+  count: number;
+  initial: AddModeValue;
+  resolve: (value: AddModeValue | null) => void;
+}
+
+export type Overlay =
+  PromptOverlay | ConfirmOverlay | PickerOverlay | NewPlaylistOverlay | AddModeOverlay;
 
 interface OverlayState {
   overlay: Overlay | null;
@@ -58,9 +88,7 @@ export function cancelOverlay(): void {
     return;
   }
   useOverlayStore.setState({ overlay: null });
-  if (current.kind === 'prompt') {
-    current.resolve(null);
-  } else if (current.kind === 'confirm') {
+  if (current.kind === 'confirm') {
     current.resolve(false);
   } else {
     current.resolve(null);
@@ -109,6 +137,35 @@ export function askPick<T>(
       resolve: (option) => {
         useOverlayStore.setState({ overlay: null });
         resolve(option as PickerOption<T> | null);
+      },
+    }),
+  );
+}
+
+/** 新しいプレイリストの名前・種類・単位を入れてもらう（キャンセルなら null）。 */
+export function askNewPlaylist(initial: NewPlaylistValue): Promise<NewPlaylistValue | null> {
+  return new Promise((resolve) =>
+    show({
+      kind: 'newPlaylist',
+      initial,
+      resolve: (value) => {
+        useOverlayStore.setState({ overlay: null });
+        resolve(value);
+      },
+    }),
+  );
+}
+
+/** ユニット単位のプレイリストに複数のアイテムをどう入れるか選んでもらう（キャンセルなら null）。 */
+export function askAddMode(count: number, initial: AddModeValue): Promise<AddModeValue | null> {
+  return new Promise((resolve) =>
+    show({
+      kind: 'addMode',
+      count,
+      initial,
+      resolve: (value) => {
+        useOverlayStore.setState({ overlay: null });
+        resolve(value);
       },
     }),
   );

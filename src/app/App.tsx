@@ -9,6 +9,7 @@ import { ImportSheet } from '../features/import/ImportSheet';
 import { DragGhost } from '../features/library/DragGhost';
 import { useFileDrop, useImportShortcut } from '../features/import/useFileDrop';
 import { LibraryView } from '../features/library/LibraryView';
+import { PlaylistView } from '../features/playlists/PlaylistView';
 import { Sidebar } from '../features/sidebar/Sidebar';
 import { SearchPalette } from '../features/search/SearchPalette';
 import { TagDialog } from '../features/tags/TagDialog';
@@ -18,6 +19,7 @@ import { reportPlaybackSupport } from '../features/player/support';
 import { Theater } from '../features/player/Theater';
 import { startJobEvents, useJobsStore } from '../stores/jobsStore';
 import { useLibraryStore } from '../stores/libraryStore';
+import { useViewStore } from '../stores/viewStore';
 import { AppShell } from './AppShell';
 import styles from './App.module.css';
 
@@ -56,6 +58,7 @@ function LibraryScreen() {
     void useJobsStore.getState().load();
     void loadPlayerPrefs();
   }, []);
+  const playlist = useViewStore((s) => s.playlist);
   // ライブラリを替えたら再生をやめる
   const libraryPath = useLibraryStore((s) => s.info?.path);
   useEffect(() => closePlayer, [libraryPath]);
@@ -63,7 +66,7 @@ function LibraryScreen() {
   return (
     <>
       <AppShell sidebar={<Sidebar />}>
-        <LibraryView />
+        {playlist !== null ? <PlaylistView key={playlist} id={playlist} /> : <LibraryView />}
       </AppShell>
       <Theater />
       <ImportSheet />
