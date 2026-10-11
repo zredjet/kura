@@ -9,17 +9,22 @@ import { CloseIcon } from '../../../components/icons/CloseIcon';
 import { FolderIcon } from '../../../components/icons/FolderIcon';
 import { Waveform } from '../../../components/icons/Waveform';
 import { ja } from '../../../i18n/ja';
-import { unitEntry } from '../../../ipc/items';
+import { selectionInfo, unitEntry } from '../../../ipc/items';
 import { thumbUrl } from '../../../ipc/media';
+import { tagLabel } from '../../../ipc/tags';
 import { getUnitDetail, type OrderModeDto, type UnitFolderDto } from '../../../ipc/units';
 import { formatCount, formatDuration } from '../../../lib/format';
 import { useViewStore } from '../../../stores/viewStore';
 import { TagChips } from '../../tags/TagChips';
 import { TagField } from '../../tags/TagField';
+import { splitTags } from '../../tags/splitTags';
 import {
-  changeUnitTags,
+  changeTags,
   dissolveUnits,
+  expandEntries,
   pickRefFolder,
+  setNote,
+  setRating,
   setUnitFolderRefs,
   updateUnitWith,
 } from '../actions';
@@ -39,13 +44,23 @@ const ORDER_MODES: OrderModeDto[] = ['manual', 'name', 'imported', 'captured', '
 /**
  * ユニットのインスペクタ（design.md §3.1）：表紙、名前、種類、件数・合計時間、並び順、
  * ユニット内シャッフル、画像の表示時間、評価、タグ、参照フォルダ（フォルダ群のとき）、メモ。
+ * 評価・タグ・メモはユニット自体とメンバー全員に付け、タグはメンバーに付いているものも件数付きで出す
+ * （docs/playlists.md §2.1）。
  */
 export function UnitInspector({ unitId, opened }: { unitId: number; opened: boolean }) {
+  const entry = unitEntry(unitId);
   const detail = useLoaded(`unit-${unitId}`, () => getUnitDetail(unitId));
+  const members = useLoaded(`unit-members-${unitId}`, async () =>
+    selectionInfo(await expandEntries([entry])),
+  );
   const openUnit = useViewStore((s) => s.openUnit);
   const [editingName, setEditingName] = useState(false);
   const durationId = useId();
-  const tagIds = useMemo(() => new Set(detail?.tags.map((tag) => tag.id) ?? []), [detail]);
+  const tags = useMemo(
+    () => (detail && members ? splitTags(members.tags, members.count, detail.tags) : null),
+    [detail, members],
+  );
+  const tagIds = useMemo(() => new Set(tags?.full.map((tag) => tag.id) ?? []), [tags]);
 
   if (!detail) {
     return null;
@@ -98,7 +113,7 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
           value={unit.ownRating}
           label={ja.inspector.ratingGroup}
           starLabel={ja.inspector.setRating}
-          onChange={(rating) => void updateUnitWith(unitId, { rating })}
+          onChange={(rating) => void setRating([entry], rating)}
         />
       </div>
 
@@ -156,16 +171,21 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
           <h3 className={styles.label}>{ja.inspector.tags}</h3>
           <kbd className={styles.kbd}>T</kbd>
         </div>
-        <TagChips
-          tags={detail.tags}
-          onRemove={(tag) => void changeUnitTags(unitId, [], [tag.id])}
-        />
+        {tags && (
+          <TagChips
+            tags={tags.full}
+            partial={tags.partial}
+            total={members?.count ?? 0}
+            onRemove={(tag) => void changeTags([entry], [], [tag.id])}
+            onApplyAll={(tag) => void changeTags([entry], [tagLabel(tag)], [])}
+          />
+        )}
         <TagField
           placeholder={ja.inspector.addTag}
           label={ja.inspector.addTagLabel}
           exclude={tagIds}
           focusKey={TAG_FOCUS_KEY}
-          onAdd={(name) => void changeUnitTags(unitId, [name], [])}
+          onAdd={(name) => void changeTags([entry], [name], [])}
         />
       </section>
 
@@ -223,7 +243,7 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
         key={`${unitId}-${detail.note ?? ''}`}
         initial={detail.note ?? ''}
         placeholder={ja.inspector.notePlaceholder}
-        onSave={(note) => void updateUnitWith(unitId, { note })}
+        onSave={(note) => void setNote([entry], note)}
       />
 
       <div className={styles.unitActions}>
@@ -232,9 +252,7 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
             {t.open}
           </Button>
         )}
-        <Button onClick={() => void dissolveUnits(opened ? [] : [unitEntry(unitId)])}>
-          {t.dissolve}
-        </Button>
+        <Button onClick={() => void dissolveUnits(opened ? [] : [entry])}>{t.dissolve}</Button>
       </div>
     </>
   );

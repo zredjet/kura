@@ -74,11 +74,6 @@ export function setUnitFolders(id: number, folders: UnitFolderDto[]): Promise<nu
   return unwrap(commands.unitSetFolders(id, folders));
 }
 
-/** ユニット自体にタグを付け外しする。 */
-export function applyUnitTags(id: number, add: string[], remove: number[]): Promise<null> {
-  return unwrap(commands.unitTagsApply(id, add, remove));
-}
-
 /** ユニットを解除する（アイテムは残る）。 */
 export function deleteUnit(id: number): Promise<null> {
   return unwrap(commands.unitDelete(id));

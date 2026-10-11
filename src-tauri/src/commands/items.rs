@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use kura_core::entries::{self, EntryPatch};
 use kura_core::items::{
     self, ItemPatch, ItemQuery, ItemView, detail, query_ids, recent_since, summaries,
 };
@@ -12,8 +13,8 @@ use tauri::ipc::Response;
 
 use super::blocking;
 use crate::dto::{
-    ItemDetailDto, ItemPatchDto, ItemSortDto, ItemSummaryDto, ItemViewDto, LibraryCountsDto,
-    SelectionInfoDto, TrashEmptiedDto,
+    EntriesUpdatedDto, EntryPatchDto, ItemDetailDto, ItemPatchDto, ItemSortDto, ItemSummaryDto,
+    ItemViewDto, LibraryCountsDto, SelectionInfoDto, TrashEmptiedDto,
 };
 use crate::error::{AppError, AppErrorCode};
 use crate::state::AppState;
@@ -149,6 +150,28 @@ pub async fn items_update(
             .library()
             .db()
             .write(move |tx| items::update(tx, &ids, &patch, now))?)
+    })
+    .await
+}
+
+/// アイテムとユニットに評価・メモ・タグをまとめて付け外しする（ユニットはメンバー全員にも）。
+#[tauri::command]
+#[specta::specta]
+pub async fn entries_update(
+    state: State<'_, AppState>,
+    item_ids: Vec<i64>,
+    unit_ids: Vec<i64>,
+    patch: EntryPatchDto,
+) -> Result<EntriesUpdatedDto, AppError> {
+    let session = state.session()?;
+    let patch: EntryPatch = patch.into();
+    blocking(move || {
+        let now = now_ms();
+        let done = session
+            .library()
+            .db()
+            .write(move |tx| entries::update(tx, &item_ids, &unit_ids, &patch, now))?;
+        Ok(done.into())
     })
     .await
 }

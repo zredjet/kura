@@ -14,6 +14,7 @@ import { getCached, getCachedUnit } from '../../../stores/itemCache';
 import { useViewStore } from '../../../stores/viewStore';
 import { TagChips } from '../../tags/TagChips';
 import { TagField } from '../../tags/TagField';
+import { splitTags } from '../../tags/splitTags';
 import {
   changeTags,
   expandEntries,
@@ -40,7 +41,10 @@ function thumbOf(entry: number): string | null {
   return item?.thumbState === 'ready' ? thumbUrl(item.hash, 's') : null;
 }
 
-/** 複数選択のインスペクタ。評価・タグ・フォルダ・メモをまとめて変える（タイトルは 1 件ずつ）。 */
+/**
+ * 複数選択のインスペクタ。評価・タグ・フォルダ・メモをまとめて変える（タイトルは 1 件ずつ）。
+ * ユニットのタイルは、ユニット自体とメンバー全員に付ける（docs/playlists.md §2.1）。
+ */
 export function MultiInspector({ entries }: { entries: number[] }) {
   const key = useMemo(() => entries.join(','), [entries]);
   const trash = useViewStore((s) => s.view.kind === 'trash');
@@ -48,12 +52,8 @@ export function MultiInspector({ entries }: { entries: number[] }) {
     const ids = await expandEntries(entries);
     return { ids, info: await selectionInfo(ids) };
   });
-  const full = useMemo(
-    () => data?.info.tags.filter((t) => t.count === data.info.count).map((t) => t.tag) ?? [],
-    [data],
-  );
-  const partial = useMemo(
-    () => data?.info.tags.filter((t) => t.count < data.info.count) ?? [],
+  const { full, partial } = useMemo(
+    () => (data ? splitTags(data.info.tags, data.info.count) : { full: [], partial: [] }),
     [data],
   );
   const tagIds = useMemo(() => new Set(full.map((tag) => tag.id)), [full]);
@@ -79,7 +79,7 @@ export function MultiInspector({ entries }: { entries: number[] }) {
             value={data.info.rating}
             label={t.ratingGroup}
             starLabel={t.setRating}
-            onChange={(rating) => void setRating(data.ids, rating)}
+            onChange={(rating) => void setRating(entries, rating)}
           />
         )}
         {data && data.info.rating === null && <p className={styles.sub}>{t.mixed}</p>}
@@ -96,15 +96,15 @@ export function MultiInspector({ entries }: { entries: number[] }) {
               tags={full}
               partial={partial}
               total={data.info.count}
-              onRemove={(tag) => void changeTags(data.ids, [], [tag.id])}
-              onApplyAll={(tag) => void changeTags(data.ids, [tagLabel(tag)], [])}
+              onRemove={(tag) => void changeTags(entries, [], [tag.id])}
+              onApplyAll={(tag) => void changeTags(entries, [tagLabel(tag)], [])}
             />
             <TagField
               placeholder={t.addTag}
               label={t.addTagLabel}
               exclude={tagIds}
               focusKey={TAG_FOCUS_KEY}
-              onAdd={(name) => void changeTags(data.ids, [name], [])}
+              onAdd={(name) => void changeTags(entries, [name], [])}
             />
           </section>
 
@@ -152,7 +152,7 @@ export function MultiInspector({ entries }: { entries: number[] }) {
             key={`${key}-${data.info.sameNote ? (data.info.note ?? '') : '*'}`}
             initial={data.info.sameNote ? (data.info.note ?? '') : ''}
             placeholder={data.info.sameNote ? t.notePlaceholder : t.mixed}
-            onSave={(note) => void setNote(data.ids, note)}
+            onSave={(note) => void setNote(entries, note)}
           />
         </>
       )}

@@ -1,6 +1,5 @@
 //! ユニット（管理単位）：要約・詳細・作成・編集・メンバーの変更・解除。
 
-use kura_core::tags;
 use kura_core::time::now_ms;
 use kura_core::unit::{self, UnitKind, UnitPatch};
 use tauri::State;
@@ -207,27 +206,6 @@ pub async fn unit_set_folders(
             .library()
             .db()
             .write(move |tx| unit::set_folders(tx, id, &refs, now))?)
-    })
-    .await
-}
-
-/// ユニット自体にタグを付け外しする。
-#[tauri::command]
-#[specta::specta]
-pub async fn unit_tags_apply(
-    state: State<'_, AppState>,
-    id: i64,
-    add: Vec<String>,
-    remove: Vec<i64>,
-) -> Result<(), AppError> {
-    let session = state.session()?;
-    blocking(move || {
-        let now = now_ms();
-        session
-            .library()
-            .db()
-            .write(move |tx| tags::apply_to_units(tx, &[id], &add, &remove, now))?;
-        Ok(())
     })
     .await
 }

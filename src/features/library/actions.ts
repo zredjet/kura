@@ -27,12 +27,12 @@ import {
   trashItems,
   unitEntry,
   unitIdOf,
+  type EntryPatchDto,
+  updateEntries,
   updateItems,
 } from '../../ipc/items';
-import { applyTags } from '../../ipc/tags';
 import {
   addUnitItems,
-  applyUnitTags,
   createFolderUnit,
   createSetUnit,
   deleteUnit,
@@ -106,23 +106,32 @@ export async function expandEntries(entries: readonly number[]): Promise<number[
   return out;
 }
 
-// ---- 評価・タイトル・メモ ----
+// ---- 評価・タイトル・メモ・タグ ----
 
-/** 評価を付ける（ユニットのタイルを 1 つだけ選んでいればユニットの評価）。 */
-export function setRating(entries: readonly number[], rating: number): Promise<void> {
+/**
+ * 評価・メモ・タグを付け外しする。ユニットのタイルはユニット自体とメンバー全員に付け、
+ * メンバーにも付けたことを知らせる（docs/playlists.md §2.1、ADR-129）。
+ */
+function updateWith(
+  entries: readonly number[],
+  patch: EntryPatchDto,
+  listIn: readonly ViewKind[],
+): Promise<void> {
   return attempt(async () => {
-    const only = entries.length === 1 ? entries[0] : undefined;
-    if (only !== undefined && isUnitEntry(only)) {
-      await updateUnit(unitIdOf(only), { rating });
-      await refresh([], []);
+    if (entries.length === 0) {
       return;
     }
-    const ids = await expandEntries(entries);
-    if (ids.length > 0) {
-      await updateItems(ids, { rating });
-      await refresh(ids, []);
+    const done = await updateEntries(entries, patch);
+    if (done.members > 0) {
+      notify(ja.notice.appliedToMembers(formatCount(done.members)));
     }
+    await refresh(done.itemIds, listIn);
   });
+}
+
+/** 評価を付ける。 */
+export function setRating(entries: readonly number[], rating: number): Promise<void> {
+  return updateWith(entries, { rating }, []);
 }
 
 /** タイトルを変える（1 件）。 */
@@ -134,14 +143,9 @@ export function setTitle(id: number, title: string): Promise<void> {
 }
 
 /** メモを書き換える（空ならメモを消す）。 */
-export function setNote(ids: readonly number[], note: string): Promise<void> {
-  return attempt(async () => {
-    await updateItems([...ids], { note });
-    await refresh(ids, []);
-  });
+export function setNote(entries: readonly number[], note: string): Promise<void> {
+  return updateWith(entries, { note }, []);
 }
-
-// ---- タグ ----
 
 /** タグを付け外しする（名前で付け、ID で外す）。 */
 export function changeTags(
@@ -149,14 +153,7 @@ export function changeTags(
   add: readonly string[],
   remove: readonly number[],
 ): Promise<void> {
-  return attempt(async () => {
-    const ids = await expandEntries(entries);
-    if (ids.length === 0) {
-      return;
-    }
-    await applyTags(ids, [...add], [...remove]);
-    await refresh(ids, ['untagged']);
-  });
+  return updateWith(entries, { addTags: [...add], removeTags: [...remove] }, ['untagged']);
 }
 
 // ---- ゴミ箱 ----
@@ -573,24 +570,12 @@ export function stopUnit(unitId: number): Promise<void> {
   });
 }
 
-/** ユニットの設定を変える（インスペクタ）。 */
+/** ユニットの設定を変える（インスペクタ。評価・メモ・タグは `setRating` などで）。 */
 export function updateUnitWith(unitId: number, patch: UnitPatchDto): Promise<void> {
   return attempt(async () => {
     await updateUnit(unitId, patch);
     // 並び順を変えたら、開いているユニットの中の並びも変わる
     await refresh([], patch.orderMode ? ['unit'] : []);
-  });
-}
-
-/** ユニット自体のタグを付け外しする。 */
-export function changeUnitTags(
-  unitId: number,
-  add: readonly string[],
-  remove: readonly number[],
-): Promise<void> {
-  return attempt(async () => {
-    await applyUnitTags(unitId, [...add], [...remove]);
-    await refresh([], []);
   });
 }
 

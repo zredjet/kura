@@ -1,7 +1,6 @@
-//! タグ：候補・付け外し・編集・統合・削除。
+//! タグ：候補・一覧・編集・統合・削除（付け外しは `entries_update`）。
 
 use kura_core::tags::{self, TagPatch};
-use kura_core::time::now_ms;
 use tauri::State;
 
 use super::blocking;
@@ -44,26 +43,6 @@ pub async fn tags_list(state: State<'_, AppState>) -> Result<Vec<TagListEntryDto
             .into_iter()
             .map(Into::into)
             .collect())
-    })
-    .await
-}
-
-/// アイテムに `add`（名前。なければ作る）を付け、`remove`（ID）を外す。付けたタグの ID を返す。
-#[tauri::command]
-#[specta::specta]
-pub async fn tags_apply(
-    state: State<'_, AppState>,
-    item_ids: Vec<i64>,
-    add: Vec<String>,
-    remove: Vec<i64>,
-) -> Result<Vec<i64>, AppError> {
-    let session = state.session()?;
-    blocking(move || {
-        let now = now_ms();
-        Ok(session
-            .library()
-            .db()
-            .write(move |tx| tags::apply(tx, &item_ids, &add, &remove, now))?)
     })
     .await
 }

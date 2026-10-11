@@ -410,6 +410,7 @@ export const ja = {
     removedFromUnit: (n: string, name: string) => `${n} 項目を「${name}」から外しました`,
     folderUnit: (name: string) => `フォルダ「${name}」をユニットとして使います`,
     merged: (from: string, into: string) => `「${from}」を「${into}」に統合しました`,
+    appliedToMembers: (n: string) => `メンバー ${n} 件にも反映しました`,
   },
   group: {
     title: 'ユニットにまとめる',

@@ -20,11 +20,6 @@ export function suggestTags(prefix: string, limit = 8): Promise<TagSuggestionDto
   return unwrap(commands.tagsSuggest(prefix, limit));
 }
 
-/** アイテムに `add`（名前。なければ作る）を付け、`remove`（ID）を外す。 */
-export function applyTags(itemIds: number[], add: string[], remove: number[]): Promise<number[]> {
-  return unwrap(commands.tagsApply(itemIds, add, remove));
-}
-
 /** タグの編集画面の内容。 */
 export function tagDetail(id: number): Promise<TagDetailDto> {
   return unwrap(commands.tagDetail(id));

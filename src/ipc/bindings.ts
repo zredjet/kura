@@ -48,6 +48,8 @@ export const commands = {
 	itemsSelectionInfo: (ids: number[]) => typedError<SelectionInfoDto, AppError>(__TAURI_INVOKE("items_selection_info", { ids })),
 	/**  タイトル（1 件のとき）・評価・メモを変える。 */
 	itemsUpdate: (ids: number[], patch: ItemPatchDto) => typedError<null, AppError>(__TAURI_INVOKE("items_update", { ids, patch })),
+	/**  アイテムとユニットに評価・メモ・タグをまとめて付け外しする（ユニットはメンバー全員にも）。 */
+	entriesUpdate: (itemIds: number[], unitIds: number[], patch: EntryPatchDto) => typedError<EntriesUpdatedDto, AppError>(__TAURI_INVOKE("entries_update", { itemIds, unitIds, patch })),
 	/**  ゴミ箱に入れる。入れた件数を返す。 */
 	itemsTrash: (ids: number[]) => typedError<number, AppError>(__TAURI_INVOKE("items_trash", { ids })),
 	/**  ゴミ箱から戻す。戻した件数を返す。 */
@@ -145,8 +147,6 @@ export const commands = {
 	tagsSuggest: (prefix: string, limit: number) => typedError<TagSuggestionDto[], AppError>(__TAURI_INVOKE("tags_suggest", { prefix, limit })),
 	/**  すべてのタグと、付いている数（タグの一覧の画面）。 */
 	tagsList: () => typedError<TagListEntryDto[], AppError>(__TAURI_INVOKE("tags_list")),
-	/**  アイテムに `add`（名前。なければ作る）を付け、`remove`（ID）を外す。付けたタグの ID を返す。 */
-	tagsApply: (itemIds: number[], add: string[], remove: number[]) => typedError<number[], AppError>(__TAURI_INVOKE("tags_apply", { itemIds, add, remove })),
 	/**  タグの編集画面の内容（別名・親・子を含む）。 */
 	tagDetail: (id: number) => typedError<TagDetailDto, AppError>(__TAURI_INVOKE("tag_detail", { id })),
 	/**  名前空間・名前・色・別名・親タグを変える。 */
@@ -175,8 +175,6 @@ export const commands = {
 	unitReorder: (id: number, itemIds: number[]) => typedError<null, AppError>(__TAURI_INVOKE("unit_reorder", { id, itemIds })),
 	/**  folder ユニットの参照フォルダを置き換える。 */
 	unitSetFolders: (id: number, folders: UnitFolderDto[]) => typedError<null, AppError>(__TAURI_INVOKE("unit_set_folders", { id, folders })),
-	/**  ユニット自体にタグを付け外しする。 */
-	unitTagsApply: (id: number, add: string[], remove: number[]) => typedError<null, AppError>(__TAURI_INVOKE("unit_tags_apply", { id, add, remove })),
 	/**  ユニットを解除する（アイテムは残る）。 */
 	unitDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("unit_delete", { id })),
 	/**  入力を解析し、開いている一覧の中で一致する件数を数える（パレットの「一致 186 項目」）。 */
@@ -439,6 +437,12 @@ export type DownloadRuleDto = {
 /**  重複の扱い。 */
 export type DuplicatePolicyDto = "addMemberships" | "ignore";
 
+/**  まとめて変えた結果：変えたアイテムと、そのうちユニットのメンバーの数。 */
+export type EntriesUpdatedDto = {
+	itemIds: number[],
+	members: number,
+};
+
 /**  エントリ（「ファイルに固定」の取り消しに使う）。 */
 export type EntryDto = {
 	id: number,
@@ -447,6 +451,14 @@ export type EntryDto = {
 	imageDurationMs: number | null,
 	startMs: number | null,
 	endMs: number | null,
+};
+
+/**  選択（アイテムとユニット）にまとめて付ける評価・メモ・タグ（`note` の空文字はメモを消す）。 */
+export type EntryPatchDto = {
+	rating?: number | null,
+	note?: string | null,
+	addTags?: string[],
+	removeTags?: number[],
 };
 
 /**  一覧の 1 行（エントリ）。 */
@@ -1102,15 +1114,16 @@ export type UnitKindDto = "set" | "folder";
 
 export type UnitMatchDto = "any" | "all" | "unitOnly";
 
-/**  ユニットの変更（省略した項目は変えない。`imageDurationMs` の 0 は既定に戻す。`note` の空文字はメモを消す）。 */
+/**
+ *  ユニットの変更（省略した項目は変えない。`imageDurationMs` の 0 は既定に戻す）。
+ *  評価・メモ・タグはメンバーにも付けるので `entries_update` で変える（ADR-129）。
+ */
 export type UnitPatchDto = {
 	name?: string | null,
 	coverItemId?: number | null,
 	orderMode?: OrderModeDto | null,
 	innerShuffle?: boolean | null,
 	imageDurationMs?: number | null,
-	rating?: number | null,
-	note?: string | null,
 };
 
 /**  所属するユニット。 */

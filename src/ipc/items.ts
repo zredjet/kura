@@ -2,6 +2,8 @@ import { invoke } from '@tauri-apps/api/core';
 
 import {
   commands,
+  type EntriesUpdatedDto,
+  type EntryPatchDto,
   type ItemDetailDto,
   type ItemPatchDto,
   type ItemSummaryDto,
@@ -13,6 +15,8 @@ import {
 import { unwrap } from './result';
 
 export type {
+  EntriesUpdatedDto,
+  EntryPatchDto,
   ItemDetailDto,
   ItemPatchDto,
   ItemSummaryDto,
@@ -157,6 +161,32 @@ export function selectionInfo(ids: number[]): Promise<SelectionInfoDto> {
 /** タイトル（1 件のとき）・評価・メモを変える。メモの空文字は消す。 */
 export function updateItems(ids: number[], patch: ItemPatchDto): Promise<null> {
   return unwrap(commands.itemsUpdate(ids, patch));
+}
+
+/** 一覧の ID（ユニットのタイルを含む）を、アイテムの ID とユニットの ID に分ける。 */
+export function splitEntries(entries: readonly number[]): { itemIds: number[]; unitIds: number[] } {
+  const itemIds: number[] = [];
+  const unitIds: number[] = [];
+  for (const id of entries) {
+    if (isUnitEntry(id)) {
+      unitIds.push(unitIdOf(id));
+    } else {
+      itemIds.push(id);
+    }
+  }
+  return { itemIds, unitIds };
+}
+
+/**
+ * 評価・メモ・タグをまとめて付け外しする。ユニットのタイルはユニット自体とメンバー全員に付ける
+ * （docs/playlists.md §2.1）。メモの空文字は消す。
+ */
+export function updateEntries(
+  entries: readonly number[],
+  patch: EntryPatchDto,
+): Promise<EntriesUpdatedDto> {
+  const { itemIds, unitIds } = splitEntries(entries);
+  return unwrap(commands.entriesUpdate(itemIds, unitIds, patch));
 }
 
 /** ゴミ箱に入れる。入れた件数を返す。 */

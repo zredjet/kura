@@ -5,6 +5,7 @@
 pub mod capture;
 pub mod db;
 pub mod download;
+pub mod entries;
 pub mod error;
 pub mod export;
 pub mod folders;

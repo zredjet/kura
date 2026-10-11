@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+use kura_core::entries::{EntryPatch, EntryUpdate};
 use kura_core::folders::{FolderNode, FolderPatch};
 use kura_core::import::{DuplicatePolicy, ImportOptions, ImportPreview, ScanRoot};
 use kura_core::items::{
@@ -880,6 +881,44 @@ impl From<ItemPatchDto> for ItemPatch {
     }
 }
 
+/// 選択（アイテムとユニット）にまとめて付ける評価・メモ・タグ（`note` の空文字はメモを消す）。
+#[derive(Debug, Clone, Default, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct EntryPatchDto {
+    pub rating: Option<i64>,
+    pub note: Option<String>,
+    pub add_tags: Vec<String>,
+    pub remove_tags: Vec<i64>,
+}
+
+impl From<EntryPatchDto> for EntryPatch {
+    fn from(p: EntryPatchDto) -> Self {
+        Self {
+            rating: p.rating,
+            note: clearable(p.note),
+            add_tags: p.add_tags,
+            remove_tags: p.remove_tags,
+        }
+    }
+}
+
+/// まとめて変えた結果：変えたアイテムと、そのうちユニットのメンバーの数。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EntriesUpdatedDto {
+    pub item_ids: Vec<i64>,
+    pub members: u32,
+}
+
+impl From<EntryUpdate> for EntriesUpdatedDto {
+    fn from(u: EntryUpdate) -> Self {
+        Self {
+            item_ids: u.item_ids,
+            members: u32::try_from(u.members).unwrap_or(u32::MAX),
+        }
+    }
+}
+
 /// タグと、付いている件数。
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -1233,7 +1272,8 @@ impl From<UnitDetail> for UnitDetailDto {
     }
 }
 
-/// ユニットの変更（省略した項目は変えない。`imageDurationMs` の 0 は既定に戻す。`note` の空文字はメモを消す）。
+/// ユニットの変更（省略した項目は変えない。`imageDurationMs` の 0 は既定に戻す）。
+/// 評価・メモ・タグはメンバーにも付けるので `entries_update` で変える（ADR-129）。
 #[derive(Debug, Clone, Default, Deserialize, Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct UnitPatchDto {
@@ -1242,8 +1282,6 @@ pub struct UnitPatchDto {
     pub order_mode: Option<OrderModeDto>,
     pub inner_shuffle: Option<bool>,
     pub image_duration_ms: Option<i64>,
-    pub rating: Option<i64>,
-    pub note: Option<String>,
 }
 
 impl From<UnitPatchDto> for UnitPatch {
@@ -1254,8 +1292,7 @@ impl From<UnitPatchDto> for UnitPatch {
             order_mode: p.order_mode.map(Into::into),
             inner_shuffle: p.inner_shuffle,
             image_duration_ms: p.image_duration_ms.map(|ms| (ms != 0).then_some(ms)),
-            rating: p.rating,
-            note: clearable(p.note),
+            ..UnitPatch::default()
         }
     }
 }
