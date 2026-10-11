@@ -15,6 +15,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0003_proxy_todo_index",
         include_str!("../../migrations/0003_proxy_todo_index.sql"),
     ),
+    (
+        "0004_playlist_generation",
+        include_str!("../../migrations/0004_playlist_generation.sql"),
+    ),
 ];
 
 /// 未適用のマイグレーションを順に適用する。DB の方が新しければエラー。
@@ -168,6 +172,43 @@ mod tests {
             assert!(plan.contains(index), "{plan}");
             assert!(!plan.contains("TEMP B-TREE"), "{plan}");
         }
+    }
+
+    #[test]
+    fn playlist_generation_columns_keep_existing_playlists() {
+        // 0003 までの DB にプレイリストと再開の状態を入れてから 0004 を適用する
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_until(&mut conn, 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO playlists (id, name, kind, rule_json, pos, created_at, updated_at)
+             VALUES (1, '夜の作業', 'manual', NULL, 1, 10, 10);
+             INSERT INTO playlist_state (playlist_id, seed, slot_index, position_ms, updated_at)
+             VALUES (1, 7, 3, 1500, 20);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+
+        let row: (String, Option<i64>, String, i64) = conn
+            .query_row(
+                "SELECT name, generated_at, sort_key, sort_desc FROM playlists WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("夜の作業".into(), None, "imported".into(), 1));
+        let state: (i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT seed, slot_index, item_id FROM playlist_state WHERE playlist_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (7, 3, None));
+        // 並び順は決まった値だけ
+        assert!(
+            conn.execute("UPDATE playlists SET sort_key = 'color' WHERE id = 1", [])
+                .is_err()
+        );
     }
 
     #[test]

@@ -37,6 +37,7 @@ Kura Library.kuralib/
 | `0001_init` | 初期スキーマ |
 | `0002_thumb_pending_index` | `idx_items_thumb_pending`（サムネイル未作成を新しい順に取り出す部分索引） |
 | `0003_proxy_todo_index` | 画像の `proxy_state` を `not_needed` にし、`idx_items_proxy_unknown` / `idx_items_proxy_pending`（プロキシの判定・作成を待つものを新しい順に取り出す部分索引）を足す |
+| `0004_playlist_generation` | `playlists.generated_at` / `sort_key` / `sort_desc`（スマートの並びを作った日時と、シャッフルしないときの並び順）と `playlist_state.item_id`（再開するアイテム）を足す |
 
 ```sql
 -- ===== アイテム =====
@@ -192,17 +193,21 @@ CREATE TABLE playlists (
   image_duration_ms    INTEGER NOT NULL DEFAULT 8000,
   bgm_through_images   INTEGER NOT NULL DEFAULT 1,
   repeat_mode          TEXT    NOT NULL DEFAULT 'off' CHECK (repeat_mode IN ('off','all','one')),
-  rule_json            TEXT,                        -- smart のみ。検索 AST の JSON
+  rule_json            TEXT,                        -- smart のみ。{"match":"all|any","clauses":["検索の文字列", …]}（ADR-78）
   limit_kind           TEXT    CHECK (limit_kind IN ('count','duration')),
   limit_value          INTEGER,
   unit_match           TEXT    NOT NULL DEFAULT 'any' CHECK (unit_match IN ('any','all','unit_only')),
   include_loose_items  INTEGER NOT NULL DEFAULT 0,
   pos                  REAL    NOT NULL,
   created_at           INTEGER NOT NULL,
-  updated_at           INTEGER NOT NULL
+  updated_at           INTEGER NOT NULL,
+  generated_at         INTEGER,                     -- 0004：smart の並びを最後に作った日時（ADR-79）
+  sort_key             TEXT    NOT NULL DEFAULT 'imported'   -- 0004：smart でシャッフルしないときの並び順
+                       CHECK (sort_key IN ('imported','captured','name','rating','duration','size')),
+  sort_desc            INTEGER NOT NULL DEFAULT 1   -- 0004：1 なら降順
 );
 
-CREATE TABLE playlist_entries (
+CREATE TABLE playlist_entries (                    -- 手動のエントリと、smart が作った並び（ADR-79）
   id                 INTEGER PRIMARY KEY,
   playlist_id        INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
   pos                REAL    NOT NULL,
@@ -227,7 +232,8 @@ CREATE TABLE playlist_state (                       -- 再開用
   seed          INTEGER NOT NULL,
   slot_index    INTEGER NOT NULL,
   position_ms   INTEGER NOT NULL DEFAULT 0,
-  updated_at    INTEGER NOT NULL
+  updated_at    INTEGER NOT NULL,
+  item_id       INTEGER                             -- 0004：その時のアイテム。スロットがずれていたらこのアイテムから（ADR-86）
 );
 
 CREATE TABLE play_events (                          -- 再生済みになったスロットごとに 1 行（playlists.md §6.4）
