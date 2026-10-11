@@ -12,8 +12,12 @@ use crate::Result;
 /// 重複の見込みに使う、先頭と末尾の大きさ。
 pub const PARTIAL_CHUNK: u64 = 64 * 1024;
 
-/// これ以上の大きさのファイルは mmap して並列にハッシュを取る。
-const MMAP_THRESHOLD: u64 = 1024 * 1024;
+/// これ以上の大きさのファイルは、まとめて読んで並列にハッシュを取る。
+const PARALLEL_THRESHOLD: u64 = 1024 * 1024;
+
+/// 大きいファイルを読む単位。mmap（ページフォールトで少しずつ読む）より、まとめて read する方が
+/// ディスクの速度に近づく（M9 の実測で 1GB のファイルが 1.2 → 5.2 GB/s。ADR-113）。
+const READ_CHUNK: u64 = 8 * 1024 * 1024;
 
 /// staging に置いたコピー。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,15 +77,37 @@ pub fn place(staged: &Staged, final_path: &Path) -> Result<Placed> {
 /// ファイル全体の BLAKE3。
 pub fn hash_file(path: &Path) -> Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
-    let size = std::fs::metadata(path)?.len();
-    if size < MMAP_THRESHOLD {
-        // 小さいファイルは mmap とスレッド分割の手間の方が大きいので普通に読む
-        let mut file = File::open(path)?;
-        std::io::copy(&mut file, &mut hasher)?;
-    } else {
-        hasher.update_mmap_rayon(path)?;
+    let mut file = File::open(path)?;
+    let size = file.metadata()?.len();
+    // 小さいファイルも 1 回で読む（8KB ずつ読むと、キャッシュにないファイルで倍ほど遅い）
+    let mut buf = vec![0u8; usize::try_from(size.clamp(1, READ_CHUNK)).unwrap_or(1)];
+    loop {
+        let filled = read_full(&mut file, &mut buf)?;
+        if filled == 0 {
+            break;
+        }
+        if size < PARALLEL_THRESHOLD {
+            // 小さいファイルはスレッド分割の手間の方が大きい
+            hasher.update(&buf[..filled]);
+        } else {
+            hasher.update_rayon(&buf[..filled]);
+        }
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+/// `buf` が埋まるか終わりまで読む（読めた大きさ）。
+fn read_full(file: &mut File, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(filled)
 }
 
 /// 重複の見込み用のハッシュ（先頭と末尾 64KB。小さいファイルは全体）。
@@ -166,6 +192,27 @@ mod tests {
         std::fs::write(&staging, b"old leftover").unwrap();
         let staged = stage(&src, &staging).unwrap();
         assert_eq!(std::fs::read(&staged.path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn hash_file_matches_blake3_across_read_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        // 空、1MB 未満（1 回で読む）、ちょうど 1 単位、単位の境目をまたぐ大きさ
+        for size in [
+            0,
+            10_000usize,
+            READ_CHUNK as usize,
+            READ_CHUNK as usize * 2 + 12_345,
+        ] {
+            let data: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+            let path = dir.path().join(format!("{size}.bin"));
+            std::fs::write(&path, &data).unwrap();
+            assert_eq!(
+                hash_file(&path).unwrap(),
+                *blake3::hash(&data).as_bytes(),
+                "{size}"
+            );
+        }
     }
 
     #[test]
