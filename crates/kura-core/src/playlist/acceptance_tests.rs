@@ -73,6 +73,7 @@ impl Lib {
                 def: UnitDef {
                     kind: UnitKind::Set,
                     order_mode: OrderMode::Manual,
+                    reverse: false,
                     items: members
                         .iter()
                         .enumerate()

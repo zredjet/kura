@@ -574,8 +574,9 @@ export function stopUnit(unitId: number): Promise<void> {
 export function updateUnitWith(unitId: number, patch: UnitPatchDto): Promise<void> {
   return attempt(async () => {
     await updateUnit(unitId, patch);
-    // 並び順を変えたら、開いているユニットの中の並びも変わる
-    await refresh([], patch.orderMode ? ['unit'] : []);
+    // 並び順・逆順を変えたら、開いているユニットの中の並びも変わる
+    const reordered = patch.orderMode !== undefined || patch.orderReverse !== undefined;
+    await refresh([], reordered ? ['unit'] : []);
   });
 }
 

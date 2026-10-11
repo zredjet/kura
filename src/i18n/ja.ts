@@ -537,6 +537,7 @@ export const ja = {
       captured: '撮影日の古い順',
       duration: '長さの短い順',
     },
+    orderReverse: '逆順',
     innerShuffle: 'ユニット内シャッフル',
     imageDuration: '画像の表示時間（秒）',
     imageDurationDefault: (s: string) => `既定（${s}）`,

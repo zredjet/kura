@@ -44,6 +44,7 @@ struct UnitRow {
     name: String,
     cover_item_id: Option<i64>,
     order_mode: OrderMode,
+    order_reverse: bool,
     inner_shuffle: bool,
     image_duration_ms: Option<i64>,
     rating: i64,
@@ -58,7 +59,7 @@ struct UnitRow {
 fn load_row(conn: &Connection, id: i64) -> Result<UnitRow> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, kind, name, cover_item_id, order_mode, inner_shuffle, image_duration_ms, rating, note,
-                origin, source_url, created_at, play_count, last_played_at
+                origin, source_url, created_at, play_count, last_played_at, order_reverse
          FROM units WHERE id = ?1",
     )?;
     let row = stmt
@@ -74,6 +75,7 @@ fn load_row(conn: &Connection, id: i64) -> Result<UnitRow> {
                     name: row.get(2)?,
                     cover_item_id: row.get(3)?,
                     order_mode: OrderMode::Manual,
+                    order_reverse: row.get::<_, i64>(14)? != 0,
                     inner_shuffle: row.get::<_, i64>(5)? != 0,
                     image_duration_ms: row.get(6)?,
                     rating: row.get(7)?,
@@ -101,6 +103,7 @@ fn load_def(conn: &Connection, row: &UnitRow) -> Result<UnitDef> {
     let mut def = UnitDef {
         kind: row.kind,
         order_mode: row.order_mode,
+        reverse: row.order_reverse,
         items: Vec::new(),
         folders: Vec::new(),
     };
@@ -297,11 +300,17 @@ pub struct UnitSummary {
 }
 
 fn cover_of(conn: &Connection, row: &UnitRow, members: &[i64]) -> Result<Option<Cover>> {
-    // 表紙に選んだものがメンバーにいなければ（ゴミ箱など）先頭のメンバー
+    // 表紙に選んだものがメンバーにいなければ（ゴミ箱など）先頭のメンバー。
+    // 逆順でも表紙は変えない（逆にする前の並びの先頭）
+    let first = if row.order_reverse {
+        members.last()
+    } else {
+        members.first()
+    };
     let id = row
         .cover_item_id
         .filter(|c| members.contains(c))
-        .or_else(|| members.first().copied());
+        .or_else(|| first.copied());
     let Some(id) = id else {
         return Ok(None);
     };
@@ -373,6 +382,7 @@ pub struct UnitFolderInfo {
 pub struct UnitDetail {
     pub summary: UnitSummary,
     pub order_mode: OrderMode,
+    pub order_reverse: bool,
     pub inner_shuffle: bool,
     pub image_duration_ms: Option<i64>,
     pub note: Option<String>,
@@ -420,6 +430,7 @@ pub fn detail(conn: &Connection, id: i64) -> Result<UnitDetail> {
     Ok(UnitDetail {
         summary,
         order_mode: row.order_mode,
+        order_reverse: row.order_reverse,
         inner_shuffle: row.inner_shuffle,
         image_duration_ms: row.image_duration_ms,
         note: row.note,
@@ -531,6 +542,7 @@ pub struct UnitPatch {
     pub name: Option<String>,
     pub cover_item_id: Option<Option<i64>>,
     pub order_mode: Option<OrderMode>,
+    pub order_reverse: Option<bool>,
     pub inner_shuffle: Option<bool>,
     pub image_duration_ms: Option<Option<i64>>,
     pub rating: Option<i64>,
@@ -569,6 +581,12 @@ pub fn update(conn: &Connection, id: i64, patch: &UnitPatch, now: i64) -> Result
         conn.execute(
             "UPDATE units SET order_mode = ?2 WHERE id = ?1",
             params![id, mode.as_str()],
+        )?;
+    }
+    if let Some(reverse) = patch.order_reverse {
+        conn.execute(
+            "UPDATE units SET order_reverse = ?2 WHERE id = ?1",
+            params![id, i64::from(reverse)],
         )?;
     }
     if let Some(shuffle) = patch.inner_shuffle {
@@ -666,7 +684,8 @@ pub fn remove_items(conn: &Connection, id: i64, item_ids: &[i64], now: i64) -> R
     touch(conn, id, now)
 }
 
-/// set ユニットのメンバーを `ordered` の順に並べ直し、並び順を手動にする。
+/// set ユニットのメンバーを `ordered`（見えている並び）の順に並べ直し、並び順を手動にする。
+/// 逆順のユニットは逆にして記録する（逆順のまま、見えている並びが `ordered` になる）。
 /// `ordered` にないメンバー（ゴミ箱のものなど）は、元の順のまま後ろに回す。
 pub fn reorder(conn: &Connection, id: i64, ordered: &[i64], now: i64) -> Result<()> {
     let row = require_set(conn, id)?;
@@ -678,6 +697,9 @@ pub fn reorder(conn: &Connection, id: i64, ordered: &[i64], now: i64) -> Result<
         .into_iter()
         .filter(|i| existing.contains(i))
         .collect();
+    if row.order_reverse {
+        order.reverse();
+    }
     let placed: HashSet<i64> = order.iter().copied().collect();
     order.extend(
         current
@@ -1086,6 +1108,47 @@ mod tests {
         delete(&conn, unit).unwrap();
         assert!(matches!(members(&conn, unit), Err(CoreError::NotFound(_))));
         assert_eq!(members(&conn, set).unwrap(), vec![2, 4]);
+    }
+
+    #[test]
+    fn reverse_flips_members_but_keeps_the_cover_and_manual_moves() {
+        let conn = test_conn();
+        items(&conn);
+        let reverse = |on: bool| UnitPatch {
+            order_reverse: Some(on),
+            ..UnitPatch::default()
+        };
+        let cover = |unit: i64| {
+            summaries(&conn, &[unit]).unwrap()[0]
+                .cover
+                .as_ref()
+                .unwrap()
+                .item_id
+        };
+
+        // フォルダ群（表紙を選んでいない）：表紙は逆にする前の先頭のまま
+        let photos = folders::create(&conn, None, "写真", 0).unwrap();
+        folders::set_items(&conn, &[3, 1, 2], &[photos], &[]).unwrap();
+        let folder = create_folder(&conn, "写真", &[(photos, false)], 0).unwrap();
+        update(&conn, folder, &reverse(true), 1).unwrap();
+        assert_eq!(members(&conn, folder).unwrap(), vec![3, 2, 1]);
+        assert!(detail(&conn, folder).unwrap().order_reverse);
+        assert_eq!(cover(folder), 1);
+
+        // ファイル群：見えている並びで並べ替えると、逆順のままその並びになる
+        let set = create_set(&conn, "u", &[1, 2, 3], 0).unwrap();
+        update(&conn, set, &reverse(true), 1).unwrap();
+        assert_eq!(members(&conn, set).unwrap(), vec![3, 2, 1]);
+        reorder(&conn, set, &[1, 3, 2], 2).unwrap();
+        assert_eq!(members(&conn, set).unwrap(), vec![1, 3, 2]);
+        assert!(detail(&conn, set).unwrap().order_reverse);
+        // 加えたものは逆にする前の最後、つまり見えている並びの先頭に出る
+        add_items(&conn, set, &[4], 3).unwrap();
+        assert_eq!(members(&conn, set).unwrap(), vec![4, 1, 3, 2]);
+        // 戻すと元の向き
+        update(&conn, set, &reverse(false), 4).unwrap();
+        assert_eq!(members(&conn, set).unwrap(), vec![2, 3, 1, 4]);
+        assert_eq!(cover(set), 1);
     }
 
     #[test]

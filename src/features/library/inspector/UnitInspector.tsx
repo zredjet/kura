@@ -42,7 +42,7 @@ const DEFAULT_IMAGE_SECONDS = 8;
 const ORDER_MODES: OrderModeDto[] = ['manual', 'name', 'imported', 'captured', 'duration'];
 
 /**
- * ユニットのインスペクタ（design.md §3.1）：表紙、名前、種類、件数・合計時間、並び順、
+ * ユニットのインスペクタ（design.md §3.1）：表紙、名前、種類、件数・合計時間、並び順と逆順、
  * ユニット内シャッフル、画像の表示時間、評価、タグ、参照フォルダ（フォルダ群のとき）、メモ。
  * 評価・タグ・メモはユニット自体とメンバー全員に付け、タグはメンバーに付いているものも件数付きで出す
  * （docs/playlists.md §2.1）。
@@ -124,6 +124,13 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
             value={detail.orderMode}
             options={modes.map((m) => ({ value: m, label: t.orderModes[m] }))}
             onChange={(value) => void updateUnitWith(unitId, { orderMode: value as OrderModeDto })}
+          />
+        </label>
+        <label className={styles.fieldRow}>
+          <span className={styles.fieldLabel}>{t.orderReverse}</span>
+          <Switch
+            checked={detail.orderReverse}
+            onChange={(orderReverse) => void updateUnitWith(unitId, { orderReverse })}
           />
         </label>
         <label className={styles.fieldRow}>

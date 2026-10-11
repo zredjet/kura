@@ -41,6 +41,7 @@ Kura Library.kuralib/
 | `0003_proxy_todo_index` | 画像の `proxy_state` を `not_needed` にし、`idx_items_proxy_unknown` / `idx_items_proxy_pending`（プロキシの判定・作成を待つものを新しい順に取り出す部分索引）を足す |
 | `0004_playlist_generation` | `playlists.generated_at` / `sort_key` / `sort_desc`（スマートの並びを作った日時と、シャッフルしないときの並び順）と `playlist_state.item_id`（再開するアイテム）を足す |
 | `0005_export_job` | `jobs.kind` に `export`（書き出し。FR-SYS-02）を足す。CHECK を変えるため `jobs` を作り直して中身を移す |
+| `0006_unit_order_reverse` | `units.order_reverse`（並びを逆にする。ADR-130）を足す。今あるユニットは 0 |
 
 ```sql
 -- ===== アイテム =====
@@ -135,6 +136,7 @@ CREATE TABLE units (
   name               TEXT    NOT NULL,
   cover_item_id      INTEGER REFERENCES items(id) ON DELETE SET NULL,
   order_mode         TEXT    NOT NULL CHECK (order_mode IN ('manual','name','imported','captured','duration')),
+  order_reverse      INTEGER NOT NULL DEFAULT 0 CHECK (order_reverse IN (0, 1)),  -- 0006：1 なら並び全体を逆にする（ADR-130）
   inner_shuffle      INTEGER NOT NULL DEFAULT 0,
   image_duration_ms  INTEGER,
   rating             INTEGER NOT NULL DEFAULT 0 CHECK (rating BETWEEN 0 AND 5),

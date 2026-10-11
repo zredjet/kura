@@ -1236,6 +1236,8 @@ pub struct UnitFolderDto {
 pub struct UnitDetailDto {
     pub unit: UnitSummaryDto,
     pub order_mode: OrderModeDto,
+    /// 並びを逆にしているか。
+    pub order_reverse: bool,
     pub inner_shuffle: bool,
     /// 画像の表示時間（なしはプレイリストや既定の値）。
     pub image_duration_ms: Option<i64>,
@@ -1252,6 +1254,7 @@ impl From<UnitDetail> for UnitDetailDto {
         Self {
             unit: d.summary.into(),
             order_mode: d.order_mode.into(),
+            order_reverse: d.order_reverse,
             inner_shuffle: d.inner_shuffle,
             image_duration_ms: d.image_duration_ms,
             note: d.note,
@@ -1280,6 +1283,7 @@ pub struct UnitPatchDto {
     pub name: Option<String>,
     pub cover_item_id: Option<i64>,
     pub order_mode: Option<OrderModeDto>,
+    pub order_reverse: Option<bool>,
     pub inner_shuffle: Option<bool>,
     pub image_duration_ms: Option<i64>,
 }
@@ -1290,6 +1294,7 @@ impl From<UnitPatchDto> for UnitPatch {
             name: p.name,
             cover_item_id: p.cover_item_id.map(Some),
             order_mode: p.order_mode.map(Into::into),
+            order_reverse: p.order_reverse,
             inner_shuffle: p.inner_shuffle,
             image_duration_ms: p.image_duration_ms.map(|ms| (ms != 0).then_some(ms)),
             ..UnitPatch::default()

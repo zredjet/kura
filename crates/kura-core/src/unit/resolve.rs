@@ -86,6 +86,8 @@ pub struct UnitFolder {
 pub struct UnitDef {
     pub kind: UnitKind,
     pub order_mode: OrderMode,
+    /// 並びを逆にするか（`order_reverse`）。
+    pub reverse: bool,
     /// set のメンバー（アイテム ID と pos）。
     pub items: Vec<(i64, f64)>,
     /// folder の参照フォルダ。
@@ -150,7 +152,17 @@ impl MemberSnapshot {
 ///
 /// - set：`manual` なら pos の順、それ以外は `order_mode` の順。
 /// - folder：参照フォルダを pos の順に、フォルダごとに集めて `order_mode` で並べてからつなげる（重複は最初の 1 回だけ）。
+/// - `reverse` なら、そうして決めた並び全体を逆にする。
 pub fn resolve_members(unit: &UnitDef, snap: &MemberSnapshot) -> Vec<i64> {
+    let mut members = base_order(unit, snap);
+    if unit.reverse {
+        members.reverse();
+    }
+    members
+}
+
+/// 逆にする前の並び。
+fn base_order(unit: &UnitDef, snap: &MemberSnapshot) -> Vec<i64> {
     match unit.kind {
         UnitKind::Set => {
             let mut members: Vec<(i64, f64)> = unit
@@ -311,6 +323,7 @@ mod tests {
         UnitDef {
             kind: UnitKind::Set,
             order_mode,
+            reverse: false,
             items: items.to_vec(),
             folders: Vec::new(),
         }
@@ -350,6 +363,29 @@ mod tests {
         assert_eq!(order(OrderMode::Duration), vec![3, 1, 2]);
     }
 
+    #[test]
+    fn reverse_flips_the_whole_order_for_every_mode() {
+        let mut s = snap(&[
+            (1, info("p10", "image", 1)),
+            (2, info("p2", "image", 3)),
+            (3, info("p1", "video", 2)),
+            (4, info("p3", "image", 4)),
+        ]);
+        s.items.get_mut(&4).unwrap().trashed = true;
+        let items = [(1, 2.0), (2, 1.0), (3, 3.0), (4, 0.5)];
+        let order = |mode| {
+            let unit = UnitDef {
+                reverse: true,
+                ..set(mode, &items)
+            };
+            resolve_members(&unit, &s)
+        };
+        // ゴミ箱を除いてから逆にする
+        assert_eq!(order(OrderMode::Manual), vec![3, 1, 2]);
+        assert_eq!(order(OrderMode::Name), vec![1, 2, 3]);
+        assert_eq!(order(OrderMode::Imported), vec![2, 3, 1]);
+    }
+
     /// 写真(10) ─ 旅行(11) ─ 鎌倉(12)、別に 音楽(20)
     fn folder_snapshot() -> MemberSnapshot {
         let mut s = snap(&[
@@ -375,6 +411,7 @@ mod tests {
         UnitDef {
             kind: UnitKind::Folder,
             order_mode,
+            reverse: false,
             items: Vec::new(),
             folders: refs
                 .iter()
@@ -413,6 +450,12 @@ mod tests {
         assert_eq!(resolve_members(&unit, &s), vec![4, 5, 1, 3]);
         let unit = folder_unit(OrderMode::Name, &[(20, false, 2.0), (11, false, 1.0)]);
         assert_eq!(resolve_members(&unit, &s), vec![1, 3, 4, 5]);
+        // 逆順は、フォルダの順も含めた並び全体を逆にする
+        let unit = UnitDef {
+            reverse: true,
+            ..folder_unit(OrderMode::Name, &[(20, false, 1.0), (11, false, 2.0)])
+        };
+        assert_eq!(resolve_members(&unit, &s), vec![3, 1, 5, 4]);
     }
 
     #[test]

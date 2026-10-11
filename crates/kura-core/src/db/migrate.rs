@@ -23,6 +23,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0005_export_job",
         include_str!("../../migrations/0005_export_job.sql"),
     ),
+    (
+        "0006_unit_order_reverse",
+        include_str!("../../migrations/0006_unit_order_reverse.sql"),
+    ),
 ];
 
 /// 未適用のマイグレーションを順に適用する。DB の方が新しければエラー。
@@ -256,6 +260,37 @@ mod tests {
 
         conn.execute("DELETE FROM items WHERE id = 1", []).unwrap();
         assert_eq!(hits("港の朝"), 0);
+    }
+
+    #[test]
+    fn unit_order_reverse_defaults_to_off_for_existing_units() {
+        // 0005 までの DB にユニットを入れてから 0006 を適用する
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_until(&mut conn, 5).unwrap();
+        conn.execute_batch(
+            "INSERT INTO units (id, kind, name, order_mode, inner_shuffle, rating, note, created_at, updated_at)
+             VALUES (3, 'set', '鎌倉', 'name', 1, 4, 'メモ', 10, 20);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+
+        let row: (String, String, i64, i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT name, order_mode, inner_shuffle, rating, note, order_reverse FROM units WHERE id = 3",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("鎌倉".into(), "name".into(), 1, 4, Some("メモ".into()), 0)
+        );
+        conn.execute("UPDATE units SET order_reverse = 1 WHERE id = 3", [])
+            .unwrap();
+        assert!(
+            conn.execute("UPDATE units SET order_reverse = 2 WHERE id = 3", [])
+                .is_err()
+        );
     }
 
     #[test]

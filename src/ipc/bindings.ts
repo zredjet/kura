@@ -1090,6 +1090,8 @@ export type TrashEmptiedDto = {
 export type UnitDetailDto = {
 	unit: UnitSummaryDto,
 	orderMode: OrderModeDto,
+	/**  並びを逆にしているか。 */
+	orderReverse: boolean,
 	innerShuffle: boolean,
 	/**  画像の表示時間（なしはプレイリストや既定の値）。 */
 	imageDurationMs: number | null,
@@ -1122,6 +1124,7 @@ export type UnitPatchDto = {
 	name?: string | null,
 	coverItemId?: number | null,
 	orderMode?: OrderModeDto | null,
+	orderReverse?: boolean | null,
 	innerShuffle?: boolean | null,
 	imageDurationMs?: number | null,
 };

@@ -80,6 +80,7 @@ pub fn expand(snap: &Snapshot, target: EntryTarget) -> (Option<UnitKey>, Vec<i64
             let def = UnitDef {
                 kind: UnitKind::Folder,
                 order_mode: OrderMode::Name,
+                reverse: false,
                 items: Vec::new(),
                 folders: vec![UnitFolder {
                     folder_id,
