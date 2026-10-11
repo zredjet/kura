@@ -143,6 +143,8 @@ export function appMenuItems(run: RunMenuAction, view: ViewItems): MenuItems {
         keyItem(run, t.newFolder, { key: 'n', code: 'KeyN', meta: true, shift: true }),
         { text: t.newPlaylist, action: () => run({ kind: 'command', id: 'newPlaylist' }) },
         { item: 'Separator' },
+        keyItem(run, t.export, { key: 'e', code: 'KeyE', meta: true, shift: true }),
+        { item: 'Separator' },
         { item: 'CloseWindow', text: t.closeWindow },
       ],
     },

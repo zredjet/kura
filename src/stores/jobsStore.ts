@@ -44,7 +44,7 @@ export function reactToJob(event: JobProgress): void {
 }
 
 interface JobsState {
-  /** 取り込みジョブの最新の状態（ID ごと）。 */
+  /** 取り込み・書き出しのジョブの最新の状態（ID ごと）。 */
   imports: Record<number, JobProgress>;
   /** 画面から消したジョブ。 */
   dismissed: Record<number, true>;
@@ -52,7 +52,7 @@ interface JobsState {
   apply: (event: JobProgress) => void;
   /** 表示から消す。 */
   dismiss: (id: number) => void;
-  /** 終わっていない取り込みジョブを読み込む（起動時に再開したもの）。 */
+  /** 終わっていない取り込み・書き出しのジョブを読み込む（起動時に再開したもの）。 */
   load: () => Promise<void>;
 }
 
@@ -60,7 +60,8 @@ export const useJobsStore = create<JobsState>((set) => ({
   imports: {},
   dismissed: {},
   apply: (event) => {
-    if (event.kind !== 'import') {
+    // 進捗のカプセルに出すのは取り込みと書き出し
+    if (event.kind !== 'import' && event.kind !== 'export') {
       return;
     }
     set((state) => {
@@ -78,7 +79,10 @@ export const useJobsStore = create<JobsState>((set) => ({
   dismiss: (id) => set((state) => ({ dismissed: { ...state.dismissed, [id]: true } })),
   load: async () => {
     try {
-      const jobs = await listJobs({ kinds: ['import'], states: ['queued', 'running', 'paused'] });
+      const jobs = await listJobs({
+        kinds: ['import', 'export'],
+        states: ['queued', 'running', 'paused'],
+      });
       const apply = useJobsStore.getState().apply;
       jobs.forEach((job) => apply(progressFromJob(job)));
     } catch (error) {
@@ -87,7 +91,7 @@ export const useJobsStore = create<JobsState>((set) => ({
   },
 }));
 
-/** 画面に出す取り込みジョブ（消していないもののうち新しいもの）。 */
+/** 画面に出す取り込み・書き出しのジョブ（消していないもののうち新しいもの）。 */
 export function selectCurrentImport(state: JobsState): JobProgress | null {
   const candidates = Object.values(state.imports)
     .filter((job) => !state.dismissed[job.id])

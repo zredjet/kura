@@ -55,3 +55,8 @@ export async function pickImportFiles(title: string, filterName: string): Promis
 export function pickToolFile(title: string): Promise<string | null> {
   return open({ title, directory: false, multiple: false, defaultPath: '/opt/homebrew/bin' });
 }
+
+/** 書き出し先のフォルダを選ぶ（新しいフォルダも作れる）。キャンセルなら null。 */
+export function pickExportFolder(title: string): Promise<string | null> {
+  return open({ title, directory: true, multiple: false, canCreateDirectories: true });
+}

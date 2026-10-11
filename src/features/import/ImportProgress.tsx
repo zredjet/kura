@@ -1,48 +1,63 @@
 import { useEffect } from 'react';
 
+import { ExportIcon } from '../../components/icons/ExportIcon';
+import { FolderIcon } from '../../components/icons/FolderIcon';
 import { ImportIcon } from '../../components/icons/ImportIcon';
 import { CloseIcon } from '../../components/icons/CloseIcon';
 import { PauseIcon } from '../../components/icons/PauseIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
 import { ProgressBar } from '../../components/ProgressBar/ProgressBar';
 import { ja } from '../../i18n/ja';
+import { parseExportResult } from '../../ipc/export';
 import { cancelJob, pauseJob, resumeJob } from '../../ipc/jobs';
 import { selectCurrentImport, useJobsStore } from '../../stores/jobsStore';
+import { revealExport } from '../library/exportActions';
 import { useLibraryStore } from '../../stores/libraryStore';
 import styles from './ImportProgress.module.css';
 import { type ProgressAction, progressView } from './progressView';
 
-/** 完了・中止の表示を消すまでの時間。 */
+/** 完了・中止の表示を消すまでの時間（書き出しは「Finder で表示」を押せるよう長め）。 */
 const AUTO_HIDE_MS = 6000;
+const AUTO_HIDE_EXPORT_MS = 15000;
 
 const t = ja.progress;
 
-/** 取り込みの進捗（グリッドの下中央に浮かぶカプセル）。 */
+/** 取り込み・書き出しの進捗（グリッドの下中央に浮かぶカプセル）。 */
 export function ImportProgress({ raised = false }: { raised?: boolean }) {
   const job = useJobsStore(selectCurrentImport);
   const dismiss = useJobsStore((s) => s.dismiss);
   const refresh = useLibraryStore((s) => s.refresh);
   const id = job?.id;
   const state = job?.state;
+  const exporting = job?.kind === 'export';
 
-  // 終わったら件数を読み直し、完了・中止は少ししてから消す
+  // 終わったら件数を読み直し（取り込み）、完了・中止は少ししてから消す
   useEffect(() => {
     if (id === undefined || (state !== 'done' && state !== 'failed' && state !== 'canceled')) {
       return;
     }
-    void refresh();
+    if (!exporting) {
+      void refresh();
+    }
     if (state === 'failed') {
       return;
     }
-    const timer = setTimeout(() => dismiss(id), AUTO_HIDE_MS);
+    const timer = setTimeout(() => dismiss(id), exporting ? AUTO_HIDE_EXPORT_MS : AUTO_HIDE_MS);
     return () => clearTimeout(timer);
-  }, [id, state, refresh, dismiss]);
+  }, [id, state, exporting, refresh, dismiss]);
 
   if (!job) {
     return null;
   }
   const view = progressView(job);
   const run = (action: ProgressAction) => {
+    if (action === 'reveal') {
+      const result = parseExportResult(job.resultJson);
+      if (result) {
+        revealExport(result);
+      }
+      return;
+    }
     const call =
       action === 'pause'
         ? pauseJob(job.id)
@@ -62,11 +77,11 @@ export function ImportProgress({ raised = false }: { raised?: boolean }) {
     <div
       className={styles.capsule}
       data-raised={raised || undefined}
-      aria-label={t.label}
+      aria-label={exporting ? ja.exporting.label : t.label}
       role="group"
     >
       <span className={styles.icon}>
-        <ImportIcon size={18} />
+        {exporting ? <ExportIcon size={18} /> : <ImportIcon size={18} />}
       </span>
       <div className={styles.text}>
         <span className={styles.title} role="status">
@@ -75,7 +90,7 @@ export function ImportProgress({ raised = false }: { raised?: boolean }) {
         {view.detail && <span className={styles.detail}>{view.detail}</span>}
         {view.progress !== undefined && (
           <div className={styles.bar}>
-            <ProgressBar value={view.progress} label={t.label} />
+            <ProgressBar value={view.progress} label={exporting ? ja.exporting.label : t.label} />
           </div>
         )}
       </div>
@@ -93,6 +108,7 @@ export function ImportProgress({ raised = false }: { raised?: boolean }) {
             {(action === 'cancel' || action === 'close') && (
               <CloseIcon size={12} strokeWidth={2.6} />
             )}
+            {action === 'reveal' && <FolderIcon size={13} strokeWidth={2} />}
           </button>
         ))}
       </div>

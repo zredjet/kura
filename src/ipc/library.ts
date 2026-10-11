@@ -1,4 +1,5 @@
 import {
+  type BackupDto,
   commands,
   type LibraryInfoDto,
   type LibraryRestoreDto,
@@ -6,7 +7,7 @@ import {
 } from './bindings';
 import { unwrap } from './result';
 
-export type { LibraryInfoDto, LibraryRestoreDto, LocationCheckDto };
+export type { BackupDto, LibraryInfoDto, LibraryRestoreDto, LocationCheckDto };
 
 /** ライブラリを置く場所を確かめる（拡張子の補完、既存のライブラリか、同期フォルダの中か）。 */
 export function checkLocation(path: string): Promise<LocationCheckDto> {
@@ -31,4 +32,19 @@ export function restoreLibrary(): Promise<LibraryRestoreDto> {
 /** 開いているライブラリの概要。 */
 export function libraryInfo(): Promise<LibraryInfoDto> {
   return unwrap(commands.libraryInfo());
+}
+
+/** DB のバックアップの一覧（新しい順）。 */
+export function listBackups(): Promise<BackupDto[]> {
+  return unwrap(commands.backupsList());
+}
+
+/** いまのバックアップを作る。 */
+export function backupNow(): Promise<BackupDto> {
+  return unwrap(commands.backupNow());
+}
+
+/** Finder で見せる。 */
+export function revealPath(path: string): Promise<null> {
+  return unwrap(commands.revealPath(path));
 }

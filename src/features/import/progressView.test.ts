@@ -57,3 +57,33 @@ describe('progressView', () => {
     );
   });
 });
+
+describe('progressView（書き出し）', () => {
+  const exported = (n: number, failed: number, manifest: string | null) =>
+    JSON.stringify({ dest: '/Users/me/out', total: n + failed, exported: n, failed, manifest });
+
+  it('実行中・完了・中止の言い方と、終わったら「Finder で表示」', () => {
+    expect(progressView(job({ kind: 'export', message: '3 / 10 件' }))).toMatchObject({
+      title: '書き出し中',
+      detail: '3 / 10 件',
+      actions: ['pause', 'cancel'],
+    });
+    expect(
+      progressView(
+        job({ kind: 'export', state: 'done', resultJson: exported(12, 1, 'kura-export.json') }),
+      ),
+    ).toMatchObject({
+      title: '12 項目を書き出しました',
+      detail: '失敗 1',
+      actions: ['reveal', 'close'],
+      finished: true,
+    });
+    expect(
+      progressView(job({ kind: 'export', state: 'canceled', resultJson: exported(4, 0, null) })),
+    ).toMatchObject({ detail: '4 項目は書き出し済みです', actions: ['reveal', 'close'] });
+    expect(
+      progressView(job({ kind: 'export', state: 'canceled', resultJson: exported(0, 0, null) }))
+        .actions,
+    ).toEqual(['close']);
+  });
+});

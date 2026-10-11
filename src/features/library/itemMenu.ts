@@ -5,6 +5,7 @@ import { getCachedUnit } from '../../stores/itemCache';
 import { useViewStore } from '../../stores/viewStore';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
+import { exportEntries } from './exportActions';
 import {
   dissolveUnits,
   groupEntries,
@@ -125,6 +126,11 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
     });
   }
   out.push('separator');
+  out.push({
+    label: ja.itemMenu.export,
+    shortcut: '⌘⇧E',
+    onSelect: () => void exportEntries(entries),
+  });
   out.push({
     label: ja.itemMenu.trash,
     shortcut: '⌘⌫',

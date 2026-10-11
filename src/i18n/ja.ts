@@ -28,6 +28,7 @@ export const ja = {
     import: '取り込む…',
     newFolder: '新しいフォルダ',
     newPlaylist: '新しいプレイリスト…',
+    export: '書き出す…',
     addTag: 'タグを追加',
     putInFolder: 'フォルダに入れる…',
     addToPlaylist: 'プレイリストに追加…',
@@ -377,6 +378,7 @@ export const ja = {
   itemMenu: {
     label: '項目の操作',
     play: '再生',
+    export: '書き出す…',
     quickLook: 'クイックルック',
     openUnit: 'ユニットを開く',
     addToFolder: 'フォルダに入れる…',
@@ -884,6 +886,18 @@ export const ja = {
       saved: '規則を保存しました',
     },
   },
+  exporting: {
+    nothing: '書き出す項目を選んでください',
+    pickTitle: '書き出し先のフォルダを選ぶ',
+    label: '書き出しの進捗',
+    queued: '書き出しの順番を待っています',
+    running: '書き出し中',
+    done: (n: string) => `${n} 項目を書き出しました`,
+    failed: '書き出しに失敗しました',
+    canceled: '書き出しを中止しました',
+    canceledDetail: (n: string) => `${n} 項目は書き出し済みです`,
+    reveal: 'Finder で表示',
+  },
   progress: {
     label: '取り込みの進捗',
     queued: '取り込みの順番を待っています',
@@ -899,5 +913,6 @@ export const ja = {
     resume: '再開',
     cancel: '中止',
     close: '閉じる',
+    reveal: 'Finder で表示',
   },
 } as const;
