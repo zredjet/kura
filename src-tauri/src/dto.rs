@@ -2263,7 +2263,7 @@ impl From<CaptureRuleInputDto> for kura_core::capture::RuleInput {
     }
 }
 
-/// 見たままキャプチャの結果。
+/// 見たままキャプチャ・ログイン用の Chrome の撮影の結果。
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotResultDto {
@@ -2271,4 +2271,8 @@ pub struct SnapshotResultDto {
     pub url: String,
     pub item_ids: Vec<i64>,
     pub added: u64,
+    /// 使ったキャプチャのルール（URL が一致したとき）。
+    pub rule_name: Option<String>,
+    /// 長いページのため途中まで。
+    pub truncated: bool,
 }

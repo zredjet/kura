@@ -87,6 +87,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::capture::capture_rules_reorder,
             commands::capture::capture_run,
             commands::capture::capture_login,
+            commands::capture::capture_login_status,
+            commands::capture::capture_login_snapshot,
+            commands::capture::capture_login_close,
             commands::capture::browser_open,
             commands::capture::browser_status,
             commands::capture::browser_close,
@@ -225,6 +228,8 @@ pub fn run() -> ExitCode {
                 if let tauri::RunEvent::Exit = event {
                     // 実行中のジョブを止めて DB を閉じる（取り込みは次回の起動で続きから）
                     if let Some(state) = handle.try_state::<AppState>() {
+                        // ログイン用の Chrome も閉じる（DevTools のポートを開いたままにしない。ADR-111）
+                        state.close_login();
                         state.close();
                     }
                 }

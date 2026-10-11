@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use kura_core::capture::LoginBrowser;
 use kura_core::library::{EventSink, LibrarySession};
 use kura_core::playback::PlaybackSupport;
 
@@ -16,6 +17,8 @@ pub struct AppState {
     config: Mutex<AppConfig>,
     /// フロントが起動時に作る再生可否の表（ライブラリを開き直したら渡し直す）。
     support: RwLock<Option<PlaybackSupport>>,
+    /// アプリが開いたログイン用の Chrome（DevTools でつないでいる。ADR-111）。
+    login: Arc<Mutex<Option<LoginBrowser>>>,
 }
 
 impl AppState {
@@ -28,7 +31,19 @@ impl AppState {
             config_path,
             config: Mutex::new(config),
             support: RwLock::new(None),
+            login: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// ログイン用の Chrome の置き場所。
+    pub fn login_slot(&self) -> Arc<Mutex<Option<LoginBrowser>>> {
+        self.login.clone()
+    }
+
+    /// ログイン用の Chrome を閉じる（アプリを終えるとき。DevTools のポートを開いたままにしない）。
+    pub fn close_login(&self) {
+        let browser = self.login.lock().ok().and_then(|mut slot| slot.take());
+        drop(browser);
     }
 
     /// 開いているライブラリ。なければ NotFound。

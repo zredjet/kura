@@ -85,8 +85,20 @@ export const commands = {
 	captureRulesReorder: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("capture_rules_reorder", { ids })),
 	/**  URL をルールのとおりに撮るジョブを積む。 */
 	captureRun: (url: string, ruleId: number) => typedError<number, AppError>(__TAURI_INVOKE("capture_run", { url, ruleId })),
-	/**  ログイン用に、キャプチャと同じプロファイルの Chrome を画面ありで開く。 */
+	/**
+	 *  ログイン用に、キャプチャと同じプロファイルの Chrome を画面ありで開く（DevTools でつなぐ。ADR-111）。
+	 *  すでに開いていれば、URL を新しいタブで開く。
+	 */
 	captureLogin: (url: string | null) => typedError<null, AppError>(__TAURI_INVOKE("capture_login", { url })),
+	/**  ログイン用の Chrome が開いているか（撮影中で手が離せなければ開いているとみなす）。 */
+	captureLoginStatus: () => __TAURI_INVOKE<boolean>("capture_login_status"),
+	/**
+	 *  ログイン用の Chrome の前面のタブを、見ている表示のまま撮って入れる。URL がルールに一致すれば、その撮り方
+	 *  （要素のみ・隠す要素）を使う。`full_page` ならページ全体（隠す要素はルールのもの）。
+	 */
+	captureLoginSnapshot: (fullPage: boolean) => typedError<SnapshotResultDto, AppError>(__TAURI_INVOKE("capture_login_snapshot", { fullPage })),
+	/**  ログイン用の Chrome を閉じる。 */
+	captureLoginClose: () => typedError<null, AppError>(__TAURI_INVOKE("capture_login_close")),
 	/**  アプリ内ブラウザで URL を開く（開いていればそのウィンドウで移動する）。 */
 	browserOpen: (url: string) => typedError<null, AppError>(__TAURI_INVOKE("browser_open", { url })),
 	/**  アプリ内ブラウザで開いているページの URL（開いていなければ None）。 */
@@ -862,12 +874,16 @@ export type SmartRuleDto = {
 	clauses: string[],
 };
 
-/**  見たままキャプチャの結果。 */
+/**  見たままキャプチャ・ログイン用の Chrome の撮影の結果。 */
 export type SnapshotResultDto = {
 	title: string,
 	url: string,
 	itemIds: number[],
 	added: number,
+	/**  使ったキャプチャのルール（URL が一致したとき）。 */
+	ruleName: string | null,
+	/**  長いページのため途中まで。 */
+	truncated: boolean,
 };
 
 /**  並べる基準。 */

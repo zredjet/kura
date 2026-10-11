@@ -6,7 +6,8 @@
 use std::time::Duration;
 
 use kura_core::capture::{
-    self, CHROME_TOOL, CaptureInput, capture_meta, open_for_login, register_png, start_capture,
+    self, CHROME_TOOL, CaptureInput, CaptureMode, LoginBrowser, capture_meta, register_png,
+    start_capture,
 };
 use kura_core::jobs::JobKind;
 use kura_core::time::now_ms;
@@ -133,7 +134,8 @@ pub async fn capture_run(
     .await
 }
 
-/// ログイン用に、キャプチャと同じプロファイルの Chrome を画面ありで開く。
+/// ログイン用に、キャプチャと同じプロファイルの Chrome を画面ありで開く（DevTools でつなぐ。ADR-111）。
+/// すでに開いていれば、URL を新しいタブで開く。
 #[tauri::command]
 #[specta::specta]
 pub async fn capture_login(
@@ -145,11 +147,123 @@ pub async fn capture_login(
         None => None,
     };
     let profile = state.capture_profile_dir();
+    let slot = state.login_slot();
     blocking(move || {
+        let mut guard = slot
+            .lock()
+            .map_err(|_| AppError::internal("ログイン用の Chrome の状態を読めません"))?;
+        if let Some(browser) = guard.as_mut()
+            && browser.alive()
+        {
+            if let Some(url) = &url {
+                browser.open_url(url)?;
+            }
+            return Ok(());
+        }
+        // 閉じられていたものは片付けてから開き直す
+        *guard = None;
         let chrome = find(CHROME_TOOL).ok_or_else(|| {
             AppError::new(AppErrorCode::ToolMissing, "Google Chrome が見つかりません")
         })?;
-        Ok(open_for_login(&chrome, &profile, url.as_deref())?)
+        *guard = Some(LoginBrowser::launch(&chrome, &profile, url.as_deref())?);
+        Ok(())
+    })
+    .await
+}
+
+/// ログイン用の Chrome が開いているか（撮影中で手が離せなければ開いているとみなす）。
+#[tauri::command]
+#[specta::specta]
+pub fn capture_login_status(state: State<'_, AppState>) -> bool {
+    let slot = state.login_slot();
+    match slot.try_lock() {
+        Ok(mut guard) => guard.as_mut().is_some_and(LoginBrowser::alive),
+        Err(std::sync::TryLockError::WouldBlock) => true,
+        Err(_) => false,
+    }
+}
+
+/// ログイン用の Chrome の前面のタブを、見ている表示のまま撮って入れる。URL がルールに一致すれば、その撮り方
+/// （要素のみ・隠す要素）を使う。`full_page` ならページ全体（隠す要素はルールのもの）。
+#[tauri::command]
+#[specta::specta]
+pub async fn capture_login_snapshot(
+    state: State<'_, AppState>,
+    full_page: bool,
+) -> Result<SnapshotResultDto, AppError> {
+    let session = state.session()?;
+    let slot = state.login_slot();
+    blocking(move || {
+        let mut guard = slot
+            .lock()
+            .map_err(|_| AppError::internal("ログイン用の Chrome の状態を読めません"))?;
+        let closed = || {
+            AppError::new(
+                AppErrorCode::NotFound,
+                "ログイン用の Chrome が開いていません",
+            )
+        };
+        let browser = guard.as_mut().ok_or_else(closed)?;
+        if !browser.alive() {
+            return Err(closed());
+        }
+        let page = browser.front_page()?;
+        let rule = session
+            .library()
+            .db()
+            .read(|conn| capture::rules::find_for_url(conn, &page.url))?;
+        let (mode, target, hide) = match (&rule, full_page) {
+            (Some(r), false) => (r.mode, r.target_selector.clone(), r.hide_selectors.clone()),
+            (Some(r), true) => (CaptureMode::FullPage, None, r.hide_selectors.clone()),
+            (None, true) => (CaptureMode::FullPage, None, Vec::new()),
+            (None, false) => (CaptureMode::Viewport, None, Vec::new()),
+        };
+        let shot = browser.shoot(&page, mode, target.as_deref(), &hide)?;
+        drop(guard);
+        if capture::job::host_of(&shot.url).is_none() {
+            return Err(AppError::new(
+                AppErrorCode::Invalid,
+                "http / https のページだけ撮れます",
+            ));
+        }
+        let staging = session.library().layout().staging_dir();
+        std::fs::create_dir_all(&staging).map_err(|e| AppError::internal(e.to_string()))?;
+        let path = staging.join(format!("login-{}.png", now_ms()));
+        std::fs::write(&path, &shot.png).map_err(|e| AppError::internal(e.to_string()))?;
+        let backend = kura_mac::media_backend();
+        let result = register_png(
+            session.library(),
+            backend.as_ref(),
+            &path,
+            capture_meta(&shot.url, &shot.title, now_ms()),
+            rule.as_ref().and_then(|r| r.dest_folder_id),
+            rule.as_ref().map(|r| r.id),
+            None,
+        );
+        let _ = std::fs::remove_file(&path);
+        let result = result?;
+        session.jobs().ensure_queued(JobKind::Thumbnail, "{}")?;
+        Ok(SnapshotResultDto {
+            title: result.title.unwrap_or_default(),
+            url: shot.url,
+            item_ids: result.item_ids,
+            added: result.added,
+            rule_name: rule.map(|r| r.name),
+            truncated: shot.truncated,
+        })
+    })
+    .await
+}
+
+/// ログイン用の Chrome を閉じる。
+#[tauri::command]
+#[specta::specta]
+pub async fn capture_login_close(state: State<'_, AppState>) -> Result<(), AppError> {
+    let slot = state.login_slot();
+    blocking(move || {
+        let browser = slot.lock().ok().and_then(|mut guard| guard.take());
+        drop(browser);
+        Ok(())
     })
     .await
 }
@@ -254,6 +368,8 @@ pub async fn browser_snapshot(
                 url: info.url,
                 item_ids: result.item_ids,
                 added: result.added,
+                rule_name: None,
+                truncated: false,
             })
         });
         let _ = std::fs::remove_file(&path);

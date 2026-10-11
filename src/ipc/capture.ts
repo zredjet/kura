@@ -42,6 +42,21 @@ export function openCaptureLogin(url: string | null): Promise<null> {
   return unwrap(commands.captureLogin(url));
 }
 
+/** ログイン用の Chrome が開いているか。 */
+export function captureLoginStatus(): Promise<boolean> {
+  return commands.captureLoginStatus();
+}
+
+/** ログイン用の Chrome の前面のタブを撮って入れる（`fullPage` ならページ全体）。 */
+export function snapshotLoginPage(fullPage: boolean): Promise<SnapshotResultDto> {
+  return unwrap(commands.captureLoginSnapshot(fullPage));
+}
+
+/** ログイン用の Chrome を閉じる。 */
+export function closeCaptureLogin(): Promise<null> {
+  return unwrap(commands.captureLoginClose());
+}
+
 /** アプリ内ブラウザで開く。 */
 export function openBrowser(url: string): Promise<null> {
   return unwrap(commands.browserOpen(url));
