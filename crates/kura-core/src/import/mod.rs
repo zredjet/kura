@@ -8,7 +8,9 @@ mod preview;
 mod scan;
 pub(crate) mod store;
 
-pub use job::{ImportFailure, ImportHandler, ImportInput, ImportResult, start_import};
+pub use job::{
+    ImportFailure, ImportHandler, ImportInput, ImportResult, MAX_IMPORT_THREADS, start_import,
+};
 pub use kind::{MediaKind, classify, mime_for};
 pub use place::{hash_file, partial_hash};
 pub use plan::{DuplicatePolicy, ImportOptions, TagName, parse_tag};

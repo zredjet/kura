@@ -83,6 +83,8 @@ pub struct ImportResult {
 pub struct ImportHandler {
     batch_files: usize,
     batch_bytes: u64,
+    /// コピー・ハッシュ・配置の並列数。
+    threads: usize,
     /// メディア情報（幅・高さ・長さ・撮影日時など）を読む実装。
     backend: Arc<dyn MediaBackend>,
     /// テスト用：この番号のバッチを配置したところで、DB に入れずに失敗する（強制終了の再現）。
@@ -96,10 +98,20 @@ impl ImportHandler {
         Self {
             batch_files: BATCH_FILES,
             batch_bytes: BATCH_BYTES,
+            threads: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(MAX_IMPORT_THREADS),
             backend,
             #[cfg(test)]
             abort_before_commit: None,
         }
+    }
+
+    /// 並列数を変える（計測用）。
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads.max(1);
+        self
     }
 }
 
@@ -137,12 +149,8 @@ impl JobHandler for ImportHandler {
         state.total = total as u64;
         state.skipped = scan.skipped;
 
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(MAX_IMPORT_THREADS);
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
+            .num_threads(self.threads)
             .thread_name(|i| format!("kura-import-{i}"))
             .build()
             .map_err(|err| CoreError::Invalid(format!("取り込みのスレッドを作れません: {err}")))?;

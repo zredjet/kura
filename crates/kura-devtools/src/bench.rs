@@ -11,25 +11,30 @@ use kura_core::library::Library;
 use kura_core::query::{QueryContext, parse};
 use kura_core::time::now_ms;
 
-/// `bench query --library <path>` / `bench thumbs --src <dir> [--threads N]`。
+/// `bench query --library <path>` / `bench thumbs --src <dir> [--threads N]` /
+/// `bench import --src <dir> [--threads N] [--out <dir>]`。
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut library = None;
     let mut src = None;
     let mut threads = None;
+    let mut out = None;
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--library" => library = it.next().map(PathBuf::from),
             "--src" => src = it.next().map(PathBuf::from),
             "--threads" => threads = it.next().and_then(|n| n.parse().ok()),
+            "--out" => out = it.next().map(PathBuf::from),
             _ => {}
         }
     }
     match args.first().map(String::as_str) {
         Some("query") => query(&library.ok_or("--library を指定してください")?),
         Some("thumbs") => thumbs(&src.ok_or("--src を指定してください")?, threads),
+        Some("import") => import(&src.ok_or("--src を指定してください")?, threads, out),
         _ => Err(
-            "使い方: kura-devtools bench query --library <path> | thumbs --src <dir> [--threads N]"
+            "使い方: kura-devtools bench query --library <path> | thumbs --src <dir> [--threads N] \
+             | import --src <dir> [--threads N] [--out <dir>]"
                 .into(),
         ),
     }
@@ -85,6 +90,94 @@ fn thumbs(src: &std::path::Path, threads: Option<usize>) -> Result<(), String> {
         elapsed_ms = elapsed.as_secs_f64() * 1000.0,
         per_second = images.len() as f64 / elapsed.as_secs_f64(),
         "画像サムネイル（目標 50 枚/秒以上）"
+    );
+    Ok(())
+}
+
+/// 取り込みの速さ（NFR-05：ディスクの速度が上限になり、ハッシュが詰まらないこと）。
+///
+/// 新しいライブラリを `--out`（既定は `--src` と同じ場所。同じボリュームならクローン）に作り、`--src` を
+/// アプリと同じ取り込みのジョブで入れる。同じファイルをハッシュだけした速さも出す。測り終えたらライブラリを消す。
+fn import(
+    src: &std::path::Path,
+    threads: Option<usize>,
+    out: Option<PathBuf>,
+) -> Result<(), String> {
+    use kura_core::import::{
+        ImportHandler, ImportInput, ImportOptions, classify, hash_file, start_import,
+    };
+    use kura_core::jobs::{JobKind, JobManager, JobState};
+    use rayon::prelude::*;
+    use std::sync::Arc;
+
+    let files: Vec<(PathBuf, u64)> = std::fs::read_dir(src)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| classify(&p.extension().unwrap_or_default().to_string_lossy()).is_some())
+        .filter_map(|p| std::fs::metadata(&p).ok().map(|m| (p, m.len())))
+        .collect();
+    if files.is_empty() {
+        return Err("取り込めるファイルがありません".into());
+    }
+    let bytes: u64 = files.iter().map(|(_, len)| len).sum();
+    let mb = bytes as f64 / 1_000_000.0;
+    let base = out.unwrap_or_else(|| src.parent().map(PathBuf::from).unwrap_or_default());
+    let path = base.join(format!("kura-bench-import-{}.kuralib", std::process::id()));
+
+    let library = Arc::new(kura_core::library::Library::create(&path).map_err(|e| e.to_string())?);
+    let mut handler = ImportHandler::new(kura_mac::media_backend());
+    if let Some(n) = threads {
+        handler = handler.with_threads(n);
+    }
+    let jobs = JobManager::new(
+        library,
+        vec![(JobKind::Import, Arc::new(handler))],
+        Arc::new(|_| {}),
+    )
+    .map_err(|e| e.to_string())?;
+    let input = ImportInput {
+        paths: vec![src.to_path_buf()],
+        options: ImportOptions::default(),
+    };
+    let started = Instant::now();
+    let id = start_import(&jobs, &input).map_err(|e| e.to_string())?;
+    jobs.start().map_err(|e| e.to_string())?;
+    if !jobs.wait_idle(Duration::from_secs(3600)) {
+        return Err("1 時間待っても終わりませんでした".into());
+    }
+    let elapsed = started.elapsed();
+    let job = jobs.get(id).map_err(|e| e.to_string())?;
+    jobs.shutdown();
+    drop(jobs);
+    std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+    if job.state != JobState::Done {
+        return Err(job.message.unwrap_or_default());
+    }
+
+    // 同じファイルをハッシュだけする（読み込みはキャッシュに載っている前提で、CPU の上限を見る）
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.unwrap_or(kura_core::import::MAX_IMPORT_THREADS))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let hashed = Instant::now();
+    pool.install(|| {
+        files
+            .par_iter()
+            .try_for_each(|(p, _)| hash_file(p).map(|_| ()))
+    })
+    .map_err(|e| e.to_string())?;
+    let hash_elapsed = hashed.elapsed();
+
+    tracing::info!(
+        files = files.len(),
+        mb,
+        threads = threads.unwrap_or(0),
+        elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+        import_mb_per_s = mb / elapsed.as_secs_f64(),
+        files_per_s = files.len() as f64 / elapsed.as_secs_f64(),
+        hash_only_mb_per_s = mb / hash_elapsed.as_secs_f64(),
+        result = job.result_json.as_deref().unwrap_or(""),
+        "取り込み（NFR-05：ディスクの速度が上限）"
     );
     Ok(())
 }
