@@ -64,7 +64,7 @@ describe('selectAllCommand', () => {
       list: { ids, aspects: new Uint16Array(3), groups: [] },
     });
     useImportStore.setState({ phase: 'idle' });
-    useViewStore.setState({ selection: EMPTY_SELECTION });
+    useViewStore.setState({ selection: EMPTY_SELECTION, playlist: null });
   });
 
   afterEach(() => {
@@ -139,6 +139,14 @@ describe('selectAllCommand', () => {
     useImportStore.setState({ phase: 'idle' });
     useLibraryStore.setState({ status: 'none' });
     selectAllCommand();
+    expect(useViewStore.getState().selection).toEqual(EMPTY_SELECTION);
+  });
+
+  it('プレイリストを開いているあいだは、見えていない一覧を選ばない', () => {
+    useViewStore.setState({ playlist: 7 });
+
+    selectAllCommand();
+
     expect(useViewStore.getState().selection).toEqual(EMPTY_SELECTION);
   });
 });
