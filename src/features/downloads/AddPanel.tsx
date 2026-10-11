@@ -1,6 +1,7 @@
 import { type FormEvent, type MouseEvent, useEffect, useState } from 'react';
 
 import { type MenuEntry, openMenuBelow } from '../../components/Menu/menuStore';
+import { CameraIcon } from '../../components/icons/CameraIcon';
 import { CheckIcon } from '../../components/icons/CheckIcon';
 import { ChevronDownIcon } from '../../components/icons/ChevronDownIcon';
 import { LinkIcon } from '../../components/icons/LinkIcon';
@@ -15,6 +16,7 @@ import {
   type QualityDto,
   toolCommand,
 } from '../../ipc/downloads';
+import { runCapture } from '../../ipc/capture';
 import { useDownloadsStore } from '../../stores/downloadsStore';
 import { notify } from '../../stores/noticeStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
@@ -136,12 +138,14 @@ export function AddPanel() {
   const update = (patch: Partial<DownloadOptionsDto>) =>
     setOptions((o) => (o ? { ...o, ...patch } : o));
 
-  // 判定を待たずに積める（URL は Rust でもう一度判定する）。ツールがないとわかっているときと、
+  // 判定を待たずに積める（終わっていなければ、押したときに判定する）。ツールがないとわかっているときと、
   // URL として読めないときだけ止める
-  const toolMissing = detection !== null && !detection.toolFound;
+  const toolMissing =
+    detection !== null &&
+    (detection.capture ? !detection.capture.chromeFound : !detection.toolFound);
   const ready = options !== null && text !== '' && !toolMissing && error === null && !sending;
 
-  const submit = (e: FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (error) {
       notify(error);
@@ -151,13 +155,31 @@ export function AddPanel() {
       return;
     }
     setSending(true);
-    enqueueDownload(text, options)
-      .then(() => {
-        setUrl('');
+    try {
+      const d = detection ?? (await detectDownload(text));
+      if (d.capture) {
+        // キャプチャのルールに一致したら撮る（ダウンロードより先。ADR）
+        if (!d.capture.chromeFound) {
+          notify(t.capture.chromeMissing);
+          return;
+        }
+        await runCapture(d.url, d.capture.ruleId);
+        notify(t.capture.queued);
+      } else {
+        if (!d.toolFound) {
+          notify(t.toolMissing(toolCommand(d.tool)));
+          return;
+        }
+        await enqueueDownload(d.url, options);
         notify(t.added);
-        return useDownloadsStore.getState().load();
-      }, fail)
-      .finally(() => setSending(false));
+      }
+      setUrl('');
+      await useDownloadsStore.getState().load();
+    } catch (err) {
+      fail(err);
+    } finally {
+      setSending(false);
+    }
   };
 
   const chooseDest = (e: MouseEvent<HTMLButtonElement>) => {
@@ -183,7 +205,7 @@ export function AddPanel() {
   const video = detection === null || detection.tool === 'ytDlp';
 
   return (
-    <form className={styles.panel} onSubmit={submit} noValidate>
+    <form className={styles.panel} onSubmit={(e) => void submit(e)} noValidate>
       <div className={styles.urlRow}>
         <label className={styles.urlField}>
           <LinkIcon size={16} strokeWidth={1.9} />
@@ -207,7 +229,20 @@ export function AddPanel() {
       <div className={styles.optionRow}>
         {checking && <span className={styles.hint}>{t.detecting}</span>}
         {!checking && error && <span className={styles.warning}>{error}</span>}
-        {!checking && detection && detection.toolFound && (
+        {!checking && detection?.capture && detection.capture.chromeFound && (
+          <span className={styles.detected}>
+            <CameraIcon size={13} strokeWidth={2} />
+            {t.capture.detected(detection.capture.ruleName)} ·{' '}
+            <code className={styles.mono}>Chrome</code>
+          </span>
+        )}
+        {!checking && detection?.capture && !detection.capture.chromeFound && (
+          <span className={styles.warning}>
+            <WarningIcon size={14} strokeWidth={2} />
+            {t.capture.chromeMissing}
+          </span>
+        )}
+        {!checking && detection && !detection.capture && detection.toolFound && (
           <span className={styles.detected}>
             <CheckIcon size={12} strokeWidth={3} />
             {t.detected(detection.siteLabel)} ·{' '}
@@ -215,13 +250,13 @@ export function AddPanel() {
             {detection.rule && <span className={styles.hint}>（{t.byRule(detection.rule)}）</span>}
           </span>
         )}
-        {!checking && detection && !detection.toolFound && (
+        {!checking && detection && !detection.capture && !detection.toolFound && (
           <span className={styles.warning}>
             <WarningIcon size={14} strokeWidth={2} />
             {t.toolMissing(toolCommand(detection.tool))}
           </span>
         )}
-        {options && (
+        {options && !detection?.capture && (
           <>
             {video && (
               <>

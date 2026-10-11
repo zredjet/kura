@@ -629,3 +629,137 @@
 .toolRow {
   display: contents;
 }
+
+/* ===== キャプチャ ===== */
+
+.sideText {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  line-height: var(--leading-body);
+}
+
+.ruleCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+  width: 100%;
+  padding: var(--space-3);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-lg);
+  background: var(--fill-1);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ruleCard:hover {
+  background: var(--fill-2);
+}
+
+.ruleCard[data-disabled='true'] {
+  opacity: 0.55;
+}
+
+.ruleHead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+
+.badge {
+  padding: var(--space-0-5) var(--space-1-5);
+  border-radius: var(--radius-xs);
+  background: var(--fill-2);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+}
+
+.pattern {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.ruleFacts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-1) var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.ruleFacts code {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.addRule {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1-5);
+  height: var(--h-button);
+  border: 1px dashed var(--stroke-dashed);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.browserRow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2-5);
+  border-radius: var(--radius-lg);
+  background: var(--fill-2);
+  font-size: var(--text-sm);
+}
+
+.browserUrl {
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.browserActions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.ruleForm {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-2-5) var(--space-3);
+}
+
+.destRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: var(--text-md);
+  color: var(--text-secondary);
+}
+
+.pushLeft {
+  margin-right: auto;
+}
+
+.dangerText {
+  color: var(--danger-text);
+}

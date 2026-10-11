@@ -118,7 +118,8 @@ export const useDownloadsStore = create<DownloadsState>((set, get) => ({
     }
   },
   apply: (event) => {
-    if (event.kind !== 'download') {
+    // ダウンロードとキャプチャの一覧（docs/design.md §3.1）
+    if (event.kind !== 'download' && event.kind !== 'capture') {
       return;
     }
     const jobs = get().jobs;

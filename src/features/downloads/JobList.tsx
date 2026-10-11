@@ -7,7 +7,7 @@ import { PauseIcon } from '../../components/icons/PauseIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
 import { ProgressBar } from '../../components/ProgressBar/ProgressBar';
 import { ja } from '../../i18n/ja';
-import { type DownloadJobDto, toolCommand } from '../../ipc/downloads';
+import type { DownloadJobDto } from '../../ipc/downloads';
 import { cancelJob, jobLog, pauseJob, prioritizeJob, resumeJob, retryJob } from '../../ipc/jobs';
 import { thumbUrl } from '../../ipc/media';
 import { formatCount } from '../../lib/format';
@@ -66,7 +66,10 @@ function JobRow({ job, onLog }: { job: DownloadJobDto; onLog: (job: DownloadJobD
         </span>
         <span className={styles.meta}>
           <span>{job.siteLabel}</span>
-          <code className={styles.tool}>{toolCommand(job.tool)}</code>
+          <code className={styles.tool}>{job.toolLabel}</code>
+          {job.kind === 'capture' && job.ruleName && (
+            <span>{t.capture.detected(job.ruleName)}</span>
+          )}
           <span className={styles.state} data-state={state}>
             {t.states[state]}
             {percent && ` ${percent}`}

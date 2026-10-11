@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { DownloadJobDto } from '../ipc/downloads';
 import type { JobProgress } from '../ipc/jobs';
-import { countJobs, filterJobs, mergeEvent } from './downloadsStore';
+import { countJobs, filterJobs, mergeEvent, useDownloadsStore } from './downloadsStore';
 
 function job(
   id: number,
@@ -16,8 +16,10 @@ function job(
     message: null,
     errorCode: null,
     url: `https://example.org/${id}`,
+    kind: 'download',
     siteLabel: 'YouTube',
-    tool: 'ytDlp',
+    toolLabel: 'yt-dlp',
+    ruleName: null,
     audioOnly: false,
     title: null,
     files: 0,
@@ -43,6 +45,19 @@ function event(id: number, patch: Partial<JobProgress>): JobProgress {
     ...patch,
   };
 }
+
+describe('useDownloadsStore.apply', () => {
+  it('follows download and capture jobs but not others', () => {
+    useDownloadsStore.setState({
+      jobs: [job(1, 'running'), { ...job(2, 'running'), kind: 'capture' }],
+    });
+    const apply = useDownloadsStore.getState().apply;
+    apply(event(2, { kind: 'capture', progress: 0.5 }));
+    apply(event(1, { kind: 'import', progress: 0.9 }));
+    const [a, b] = useDownloadsStore.getState().jobs;
+    expect([a?.progress, b?.progress]).toEqual([null, 0.5]);
+  });
+});
 
 describe('mergeEvent', () => {
   it('keeps values the event does not carry', () => {

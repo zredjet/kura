@@ -23,7 +23,8 @@ function coalesce(ms: number, run: () => void): () => void {
   };
 }
 
-const reloadList = coalesce(LIST_RELOAD_MS, () => {
+/** 一覧・件数を読み直す（取り込み・取得・撮影でアイテムが増えたとき。続けて呼ばれても 1 回）。 */
+export const reloadList = coalesce(LIST_RELOAD_MS, () => {
   void useLibraryStore.getState().loadList();
   void useLibraryStore.getState().refresh();
   void useSidebarStore.getState().load();
@@ -34,8 +35,8 @@ const refreshThumbs = coalesce(THUMB_REFRESH_MS, refreshPending);
 export function reactToJob(event: JobProgress): void {
   if (event.kind === 'import' && (event.state === 'running' || event.state === 'done')) {
     reloadList();
-  } else if (event.kind === 'download' && event.state === 'done') {
-    // 取得したものがライブラリに入った
+  } else if ((event.kind === 'download' || event.kind === 'capture') && event.state === 'done') {
+    // 取得・撮影したものがライブラリに入った
     reloadList();
   } else if (event.kind === 'thumbnail') {
     refreshThumbs();

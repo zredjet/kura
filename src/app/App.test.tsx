@@ -26,7 +26,14 @@ vi.mock(import('../ipc/items'), async (importOriginal) => ({
   queryIds: vi.fn(async () => ({ ids: new Uint32Array(), aspects: new Uint16Array(), groups: [] })),
   getItems: vi.fn(async () => []),
   getItemDetail: vi.fn(),
-  libraryCounts: vi.fn(async () => ({ all: 12480, recent: 0, unsorted: 0, untagged: 0, trash: 0 })),
+  libraryCounts: vi.fn(async () => ({
+    all: 12480,
+    recent: 0,
+    unsorted: 0,
+    untagged: 0,
+    trash: 0,
+    captures: 0,
+  })),
 }));
 vi.mock('../ipc/folders', () => ({
   foldersTree: vi.fn(async () => []),

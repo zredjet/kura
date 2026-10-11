@@ -2,6 +2,7 @@ import { type KeyboardEvent, type ReactNode, useEffect } from 'react';
 
 import glass from '../../components/glass/glass.module.css';
 import { AllItemsIcon } from '../../components/icons/AllItemsIcon';
+import { CameraIcon } from '../../components/icons/CameraIcon';
 import { ClockIcon } from '../../components/icons/ClockIcon';
 import { DiceIcon } from '../../components/icons/DiceIcon';
 import { DownloadIcon } from '../../components/icons/DownloadIcon';
@@ -19,6 +20,9 @@ import { LibrarySwitcher } from './LibrarySwitcher';
 import { PlaylistList } from './PlaylistList';
 import { SmartFolderList } from './SmartFolderList';
 import styles from './Sidebar.module.css';
+
+/** サイドバーの「キャプチャ」で開く絞り込み（キャプチャで取り込んだもの。docs/search-query.md）。 */
+export const CAPTURE_FILTER = '取得元:capture';
 
 /** 行のボタンに付ける印（↑↓ でたどるため）。 */
 export const ROW_ATTR = 'data-sidebar-row';
@@ -61,6 +65,10 @@ export function Sidebar() {
   const downloadsOpen = useViewStore((s) => s.downloads);
   const otherScreen = playlistOpen || downloadsOpen;
   const activeDownloads = useDownloadsStore(selectActiveCount);
+  const filter = useViewStore((s) => s.filter);
+  // 「キャプチャ」はすべての一覧をキャプチャで絞り込んだもの
+  const capturesOpen =
+    !otherScreen && view.kind === 'all' && filter.length === 1 && filter[0] === CAPTURE_FILTER;
   // プレイリスト・ダウンロードを開いているあいだは、ライブラリ・フォルダの行を選んでいる表示にしない
   const current = otherScreen ? null : view.kind === 'unit' ? parent : view;
 
@@ -101,7 +109,7 @@ export function Sidebar() {
         <section className={styles.section} aria-label={ja.sidebar.librarySection}>
           <h2 className={styles.sectionTitle}>{ja.sidebar.librarySection}</h2>
           {LIBRARY_ROWS.map((row) => {
-            const selected = current?.kind === row.kind;
+            const selected = current?.kind === row.kind && !capturesOpen;
             const count = row.kind === 'random' ? null : (counts?.[row.kind] ?? null);
             return (
               <button
@@ -146,6 +154,23 @@ export function Sidebar() {
             {activeDownloads > 0 && (
               <span className={styles.count}>{formatCount(activeDownloads)}</span>
             )}
+          </button>
+          <button
+            type="button"
+            className={styles.row}
+            aria-current={capturesOpen ? 'page' : undefined}
+            {...{ [ROW_ATTR]: '' }}
+            onClick={(e) => {
+              e.currentTarget.focus();
+              useViewStore.getState().setView({ kind: 'all' });
+              useViewStore.getState().setFilter([CAPTURE_FILTER]);
+            }}
+          >
+            <span className={styles.rowIcon}>
+              <CameraIcon size={16} strokeWidth={1.8} />
+            </span>
+            <span className={styles.rowLabel}>{ja.sidebar.captures}</span>
+            {counts && <span className={styles.count}>{formatCount(counts.captures)}</span>}
           </button>
         </section>
       </div>

@@ -20,6 +20,7 @@ vi.mock('../../ipc/downloads', () => ({
     tool('deno', null),
     tool('ffmpeg', '/opt/homebrew/bin/ffmpeg'),
     tool('ffprobe', '/opt/homebrew/bin/ffprobe'),
+    tool('chrome', null),
     tool('mpv', null),
   ]),
   getDownloadPrefs: vi.fn(async () => ({ cookies: 'firefox', rules: [] })),
@@ -33,11 +34,12 @@ describe('ToolsPanel', () => {
     render(<ToolsPanel />);
     const t = ja.downloads;
     expect(await screen.findByText('gallery-dl')).toBeTruthy();
-    expect(screen.getAllByText(t.tools.missing)).toHaveLength(3);
+    expect(screen.getAllByText(t.tools.missing)).toHaveLength(4);
     expect(screen.getByText(t.cookies.firefox)).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: t.tools.install }));
     expect(screen.getByText(t.tools.installHint)).toBeTruthy();
-    // 要るものだけ（任意の mpv は入れない）
-    expect(screen.getByText('brew install gallery-dl deno')).toBeTruthy();
+    // 要るものだけ（任意の mpv は入れない）。Chrome は cask
+    const code = document.querySelector('pre')?.textContent ?? '';
+    expect(code).toBe(`brew install gallery-dl deno\n${t.tools.chromeInstall}`);
   });
 });

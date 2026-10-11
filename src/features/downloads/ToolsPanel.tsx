@@ -25,8 +25,21 @@ import { TextSheet } from './TextSheet';
 
 const t = ja.downloads;
 
-/** 取得に要るツール（ないと入れ方を案内する）。ffprobe は ffmpeg と一緒に入る。 */
-const REQUIRED = ['yt-dlp', 'gallery-dl', 'deno', 'ffmpeg'];
+/** 取得・キャプチャに要るツール（ないと入れ方を案内する）。ffprobe は ffmpeg と一緒に入る。 */
+const REQUIRED = ['yt-dlp', 'gallery-dl', 'deno', 'ffmpeg', 'chrome'];
+
+/** 足りないツールを入れるコマンド（Chrome はアプリなので cask）。 */
+export function installCommands(missing: readonly string[]): string {
+  const formulae = missing.filter((m) => m !== 'chrome');
+  const lines = [];
+  if (formulae.length > 0) {
+    lines.push(`brew install ${formulae.join(' ')}`);
+  }
+  if (missing.includes('chrome')) {
+    lines.push(t.tools.chromeInstall);
+  }
+  return lines.join('\n');
+}
 
 const COOKIES: CookieSourceDto[] = ['none', 'firefox', 'safari', 'chrome'];
 
@@ -125,7 +138,7 @@ export function ToolsPanel() {
           return (
             <div key={tool.name} className={styles.toolRow}>
               <span className={styles.toolName} title={tool.path ?? undefined}>
-                <code className={styles.mono}>{tool.name}</code>
+                <code className={styles.mono}>{t.tools.names[tool.name] ?? tool.name}</code>
                 {note && <span className={styles.toolNote}>{note}</span>}
               </span>
               <span
@@ -157,7 +170,7 @@ export function ToolsPanel() {
         <div className={styles.sideRow}>
           <span className={styles.warning}>
             <WarningIcon size={13} strokeWidth={2} />
-            {missing.join('・')}
+            {missing.map((m) => t.tools.names[m] ?? m).join('・')}
           </span>
           <button
             type="button"
@@ -166,7 +179,7 @@ export function ToolsPanel() {
               setSheet({
                 title: t.tools.installTitle,
                 intro: t.tools.installHint,
-                text: `brew install ${missing.join(' ')}`,
+                text: installCommands(missing),
               })
             }
           >

@@ -5,13 +5,14 @@ import { formatCount } from '../../lib/format';
 import { countJobs, useDownloadsStore } from '../../stores/downloadsStore';
 import { MiniPlayer } from '../player/MiniPlayer';
 import { AddPanel } from './AddPanel';
+import { CapturePanel, refreshCaptureRules } from './CapturePanel';
 import styles from './Downloads.module.css';
 import { JobList } from './JobList';
 import { ToolsPanel } from './ToolsPanel';
 
 const t = ja.downloads;
 
-/** ダウンロードの画面（Downloads.dc.html）。キャプチャの欄は M8 で足す。 */
+/** ダウンロードとキャプチャの画面（Downloads.dc.html）。 */
 export function DownloadsView() {
   const jobs = useDownloadsStore((s) => s.jobs);
   // 「今日の完了」の区切りが変わるので、ときどき時刻を取り直す
@@ -22,6 +23,14 @@ export function DownloadsView() {
     return () => clearInterval(timer);
   }, []);
   const counts = countJobs(jobs, now);
+  // キャプチャが終わったら、ルールの最終実行を読み直す
+  const captureKey = jobs
+    .filter((j) => j.kind === 'capture')
+    .map((j) => `${j.id}:${j.state}`)
+    .join(',');
+  useEffect(() => {
+    refreshCaptureRules();
+  }, [captureKey]);
 
   return (
     <div className={styles.view}>
@@ -42,6 +51,7 @@ export function DownloadsView() {
             <JobList failedCount={counts.failed} />
           </div>
           <aside className={styles.side}>
+            <CapturePanel />
             <ToolsPanel />
           </aside>
         </div>
