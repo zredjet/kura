@@ -55,16 +55,16 @@
 | | `items_selection_info(ids)` → `SelectionInfo` | 複数選択のインスペクタ用：評価とメモ（全件が同じときだけ）、タグとフォルダ（付いている件数付き） |
 | | `library_counts()` → `{ all, recent, unsorted, untagged, trash, captures }` | サイドバーの件数。グリッドを出したあとに別に取る（NFR-01 に響かないように） |
 | 編集 | `items_update(ids, patch)` | タイトル（1 件のときだけ）・評価・メモ（全件に同じ値）。メモの空文字は消す |
+| | `entries_update(itemIds, unitIds, { rating?, note?, addTags?, removeTags? })` → `{ itemIds, members }` | 選択（アイテムとユニット）に評価・メモ・タグをまとめて付け外しする。ユニットはユニット自体とメンバー全員に（docs/playlists.md §2.1）。1 つのトランザクション。返すのは変えたアイテム（重複なし）と、そのうちメンバーの数。タグの名前は「名前」か「名前空間:名前」（全角の「：」も可、NFC）で、なければ作り、別名なら正式タグに置き換える |
 | | `items_trash(ids)` / `items_restore(ids)` → 件数 / `trash_empty()` → `{ items, bytes, failed }` | ゴミ箱。空にするときは DB の行を先に消し、そのあと実ファイル・サムネイル・ジャケット・プロキシを消す（ADR-46） |
 | タグ | `tags_suggest(prefix, limit)` → `{ tag, count, alias }[]` | 前方一致 → 部分一致、使われている数の多い順。「名前空間:名前」なら名前空間で絞る。別名でも一致する |
-| | `tags_apply(itemIds, add: 名前[], remove: id[])` → 付けたタグの ID | 名前は「名前」か「名前空間:名前」（全角の「：」も可、NFC）。なければ作り、別名なら正式タグに置き換える |
 | | `tag_detail(id)` / `tag_update(id, patch)` / `tag_merge(from, into)` / `tag_delete(id)` | 名前空間・名前・色・別名・親タグ（`aliases`・`parents` は置き換え、循環は不可）。統合すると `from` の名前は別名として残る |
 | フォルダ | `folders_tree(withCounts?)` | すべてのフォルダ（木はフロントで組む）。件数は子孫フォルダの分を含み、同じアイテムは 1 回（ADR-40）。参照する folder ユニットの ID も返す |
 | | `folder_create(parentId, name)` / `folder_update(id, { name?, color? })` / `folder_move(id, parentId, beforeId)` / `folder_delete(id)` | 同じ親の下で名前は重複不可（`Conflict`）、「/」は不可。自分の中へは移せない。削除は中のフォルダごと（アイテムは残る。参照がなくなった folder ユニットも消す） |
 | | `items_set_folders(itemIds, add, remove)` | フォルダへの所属の付け外し |
 | ユニット | `unit_detail(id)` / `units_list(filter, kind?, limit)` | インスペクタ用の詳細、選ぶための一覧（更新の新しい順） |
 | | `unit_create_set(name, itemIds)` / `unit_create_folder(name, folders)` | set は渡した順＝manual、表紙は先頭。folder は名前順 |
-| | `unit_update(id, patch)` / `unit_tags_apply(id, add, remove)` | 名前・表紙・並び順・ユニット内シャッフル・画像の表示時間（0 で既定）・評価・メモ（空文字で消す）。folder は manual にできない |
+| | `unit_update(id, patch)` | 名前・表紙・並び順・ユニット内シャッフル・画像の表示時間（0 で既定）。folder は manual にできない。評価・メモ・タグは `entries_update` で（メンバーにも付ける） |
 | | `unit_add_items(id, itemIds)` / `unit_remove_items(id, itemIds)` / `unit_reorder(id, itemIds)` / `unit_set_folders(id, folders)` / `unit_delete(id)` | set のメンバーの追加・削除・並べ替え（並べ替えると manual になる）、folder の参照フォルダの置き換え、解除（アイテムは残る）。`docs/playlists.md` §2 |
 | スマートフォルダ | `smart_folders_list(withCounts?, utcOffsetMinutes)` / `smart_folder_save(name, query)` / `smart_folder_update(id, name?, query?)` / `smart_folder_delete(id)` | 条件は検索の文字列のまま保存（解析できない条件は保存しない）。件数は一致するアイテムの数 |
 | 検索 | `query_parse(text, view?, utcOffsetMinutes)` → `{ error?, clauses, counts? }` | ⌘K のチップ・件数・エラー表示用。`error` は位置（UTF-16）と理由、`clauses` はいちばん外側の AND の条件、`counts` は開いている一覧の中で一致する種類ごとの件数 |
