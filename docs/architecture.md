@@ -267,6 +267,9 @@ import_start:    ジョブとして実行
 - `backgroundThrottling: "disabled"`（M5）：既定では、ウィンドウがほかのウィンドウに隠れると WebKit が動画の再生開始や CSS アニメーションを止め、再生キューが動画のところで止まる。メディアプレーヤーなので隠れていても再生を続ける（ADR-72）。
 - メニューバーはフロントで組む（`src/app/appMenu.ts`）。文言は ja.ts。「すべてを選択」（⌘A）だけは自前の項目で、入力欄なら文字、それ以外は一覧のすべてを選ぶ（ADR-76）。Kura の操作の項目は、押すとそのキーのイベントをフォーカスのある要素から送る（`replayKey`）ので、キーの処理と同じ条件で動く。表示形式・まとめて表示のチェックとサイドバーの項目の文字は、表示の設定に合わせて書き換える（ADR-116）。アプリの言語は `src-tauri/Info.plist` で日本語と宣言し、OS が出す文言も日本語にする（ADR-77）。
 - 署名は個人利用なのでアドホック署名（`bundle.macOS.signingIdentity: "-"`）。App Store には出さない。
+  - リリース（M9。ADR-123）：`pnpm tauri build` で `target/release/bundle/macos/Kura.app` と `bundle/dmg/Kura_<版>_aarch64.dmg` ができる。`codesign -dv` は `Signature=adhoc`（flags adhoc,runtime）、`codesign --verify --deep --strict` は通る。公証はしないので `spctl --assess` は rejected になる。
+  - 自分の Mac でビルドしたものは隔離の属性が付かないので、`/Applications` にコピー（`ditto`）すればそのまま開ける。ほかの Mac へ dmg で渡すと Gatekeeper に止められるので、システム設定 › プライバシーとセキュリティの「このまま開く」で開く。
+  - 新しい版で既存のライブラリを開くと、足りないマイグレーションを当てる（M9 は 0005）。当てたあとは前の版では開けない（「新しい版の Kura で作られています」）。
 - 書類・デスクトップ・ダウンロードを「ファイルを選択」で開くと macOS の許可ダイアログが出る。ドラッグ＆ドロップした項目は許可なしで読める。
 
 ## 12. 状態管理（フロント）
