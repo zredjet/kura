@@ -89,6 +89,7 @@
 | 書き出し | `export_start(dest, entries)` → JobId | 選んだもの（一覧の ID。ユニットは印付き）を書き出すジョブを積む。書き出し先はあるフォルダで、ライブラリの中は受け付けない（§14） |
 | バックアップ | `backups_list()` → `Backup[]` / `backup_now()` → `Backup` | DB のバックアップの一覧（新しい順）と、今すぐ作る（§14） |
 | | `reveal_path(path)` | Finder で見せる（書き出したもの・バックアップ・ライブラリ） |
+| タグ | `tags_list()` → `TagListEntry[]` | すべてのタグと、付いているアイテムの数（ゴミ箱を除く）・そのうち自動で付いた数（`item_tags.source` が download / capture）・ユニットの数・絞り込みの条件。名前空間なしを後ろに、名前空間ごとに付いている数の多い順（ADR-126） |
 | 設定 | `library_usage()` → `{ libraryBytes, volumeTotalBytes?, volumeAvailableBytes? }` / `library_check()` → `Integrity` | ライブラリのファイルの合計（ゴミ箱を含む）とボリュームの容量・空き、整合性チェックをいま行う（M9） |
 | | `download_archives()` → `ArchiveStatus[]` / `download_archive_clear(tool)` | 取得済みの記録の件数と、消す（`archives/` のツールごとの 1 ファイル。M9） |
 | ダウンロード | `download_detect(url)` → `{ url, site, siteLabel, tool, rule?, playlist, toolFound }` | URL の取得方法（規則 → サイトの表 → yt-dlp の汎用）。§9 |
@@ -293,7 +294,7 @@ import_start:    ジョブとして実行
 | コマンド・環境変数 | 用途 |
 |---|---|
 | `cargo run --release -p kura-devtools -- seed --items 100000 --out <path>` | ダミーライブラリを作る（画像 7・動画 2・音楽 1、2,000 タグ、60 フォルダ、200 件ごとに 10 件の set ユニット、ひな形 JPEG をクローンで配置、シード付き ChaCha8）。10 万件で約 28 秒 |
-| `kura-devtools bench query --library <path>` | 開く・`query_ids`・`items_get`（200 件）・`item_detail`、サイドバーの一覧の種類・件数・タグの候補の中央値 |
+| `kura-devtools bench query --library <path>` | 開く・`query_ids`・`items_get`（200 件）・`item_detail`、サイドバーの一覧の種類・件数・タグの候補・タグの一覧の中央値（タグの一覧は 10 万件・タグ 2,000 個で 19〜22ms） |
 | `kura-devtools bench thumbs --src <dir> [--threads N]` | 画像サムネイルの生成速度（枚/秒） |
 | `kura-devtools bench import --src <dir> [--threads N] [--out <dir>]` | 取り込みの速さ（MB/秒・件/秒）と、同じファイルをハッシュだけした速さ。新しいライブラリを `--out`（既定は `--src` と同じ場所）に作って入れ、測り終えたら消す（M9） |
 | `kura-devtools bench backup --library <path>` | DB のバックアップを 1 つ作る速さ（10 万件・58MB で 0.25 秒。M9） |
