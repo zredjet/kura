@@ -57,13 +57,13 @@ export const commands = {
 	jobPrioritize: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("job_prioritize", { id })),
 	/**  ジョブのログ（末尾 256KB）。 */
 	jobLog: (id: number) => typedError<string, AppError>(__TAURI_INVOKE("job_log", { id })),
-	/**  URL の取得方法を判定する（規則 → サイトの表）。 */
+	/**  URL の取得方法を判定する（キャプチャのルール → 取得の規則 → サイトの表）。 */
 	downloadDetect: (url: string) => typedError<DetectionDto, AppError>(__TAURI_INVOKE("download_detect", { url })),
 	/**  前回の選択（ライブラリごと。なければ既定値）。 */
 	downloadDefaults: () => typedError<DownloadOptionsDto, AppError>(__TAURI_INVOKE("download_defaults")),
 	/**  ダウンロードを積む。選んだ内容は次回の既定にする。 */
 	downloadEnqueue: (url: string, options: DownloadOptionsDto) => typedError<number, AppError>(__TAURI_INVOKE("download_enqueue", { url, options })),
-	/**  ダウンロードを新しい順に一覧する。 */
+	/**  ダウンロードとキャプチャのジョブを新しい順に一覧する。 */
 	downloadsList: (limit: number | null) => typedError<DownloadJobDto[], AppError>(__TAURI_INVOKE("downloads_list", { limit })),
 	/**  ダウンロードの設定（Cookie の読み込み元・規則）。 */
 	downloadPrefsGet: () => __TAURI_INVOKE<DownloadPrefsDto>("download_prefs_get"),
@@ -75,6 +75,26 @@ export const commands = {
 	toolsSetPath: (tool: string, path: string | null) => typedError<ToolInfoDto, AppError>(__TAURI_INVOKE("tools_set_path", { tool, path })),
 	/**  「更新を確認」：Homebrew 版は `brew upgrade` のコマンドを返し、単体版の yt-dlp は自分で更新する。 */
 	toolsUpdate: () => typedError<ToolsUpdateDto, AppError>(__TAURI_INVOKE("tools_update")),
+	/**  ルールを並び順に一覧する。 */
+	captureRulesList: () => typedError<CaptureRuleDto[], AppError>(__TAURI_INVOKE("capture_rules_list")),
+	/**  ルールを作る（`id` が None）か変える。 */
+	captureRuleSave: (id: number | null, rule: CaptureRuleInputDto) => typedError<CaptureRuleDto, AppError>(__TAURI_INVOKE("capture_rule_save", { id, rule })),
+	/**  ルールを消す。 */
+	captureRuleDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("capture_rule_delete", { id })),
+	/**  ルールを並べ替える。 */
+	captureRulesReorder: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("capture_rules_reorder", { ids })),
+	/**  URL をルールのとおりに撮るジョブを積む。 */
+	captureRun: (url: string, ruleId: number) => typedError<number, AppError>(__TAURI_INVOKE("capture_run", { url, ruleId })),
+	/**  ログイン用に、キャプチャと同じプロファイルの Chrome を画面ありで開く。 */
+	captureLogin: (url: string | null) => typedError<null, AppError>(__TAURI_INVOKE("capture_login", { url })),
+	/**  アプリ内ブラウザで URL を開く（開いていればそのウィンドウで移動する）。 */
+	browserOpen: (url: string) => typedError<null, AppError>(__TAURI_INVOKE("browser_open", { url })),
+	/**  アプリ内ブラウザで開いているページの URL（開いていなければ None）。 */
+	browserStatus: () => __TAURI_INVOKE<string | null>("browser_status"),
+	/**  アプリ内ブラウザを閉じる。 */
+	browserClose: () => typedError<null, AppError>(__TAURI_INVOKE("browser_close")),
+	/**  アプリ内ブラウザの表示範囲を撮って、キャプチャとしてライブラリに入れる（見たままキャプチャ）。 */
+	browserSnapshot: () => typedError<SnapshotResultDto, AppError>(__TAURI_INVOKE("browser_snapshot")),
 	/**  すべての仮想フォルダ（木はフロントで組み立てる）。`with_counts` なら件数も数える。 */
 	foldersTree: (withCounts: boolean | null) => typedError<FolderNodeDto[], AppError>(__TAURI_INVOKE("folders_tree", { withCounts })),
 	/**  フォルダを作る（`parent_id` がなければいちばん上）。作ったフォルダの ID を返す。 */
@@ -224,6 +244,49 @@ export type Appearance = {
 	reduceTransparency: boolean,
 };
 
+/**  URL に一致したキャプチャのルール。 */
+export type CaptureMatchDto = {
+	ruleId: number,
+	ruleName: string,
+	mode: CaptureModeDto,
+	/**  Google Chrome が見つかるか。 */
+	chromeFound: boolean,
+};
+
+export type CaptureModeDto = "element" | "fullPage" | "viewport";
+
+/**  キャプチャのルール。 */
+export type CaptureRuleDto = {
+	id: number,
+	name: string,
+	urlPattern: string,
+	mode: CaptureModeDto,
+	targetSelector: string | null,
+	hideSelectors: string[],
+	viewportWidth: number,
+	scrollTimes: number,
+	waitMs: number,
+	destFolderId: number | null,
+	enabled: boolean,
+	lastRunAt: number | null,
+	/**  `ok` / `failed`。 */
+	lastStatus: string | null,
+};
+
+/**  ルールを作る・変えるときの内容。 */
+export type CaptureRuleInputDto = {
+	name: string,
+	urlPattern: string,
+	mode: CaptureModeDto,
+	targetSelector: string | null,
+	hideSelectors: string[],
+	viewportWidth: number,
+	scrollTimes: number,
+	waitMs: number,
+	destFolderId: number | null,
+	enabled: boolean,
+};
+
 /**  チップに分けた条件。 */
 export type ClauseDto = {
 	start: number,
@@ -261,18 +324,25 @@ export type DetectionDto = {
 	playlist: boolean,
 	/**  ツールが見つかるか。 */
 	toolFound: boolean,
+	/**  キャプチャのルールに一致したら、そのルール（ダウンロードより先に撮る。ADR）。 */
+	capture: CaptureMatchDto | null,
 };
 
 /**  ダウンロードの一覧の 1 件（ジョブの入力と結果を読んだもの）。 */
 export type DownloadJobDto = {
 	id: number,
+	/**  `download` か `capture`。 */
+	kind: JobKindDto,
 	state: JobStateDto,
 	progress: number | null,
 	message: string | null,
 	errorCode: string | null,
 	url: string,
 	siteLabel: string,
-	tool: ToolDto,
+	/**  使うツールの表示（`yt-dlp`・`gallery-dl`・`Chrome`）。 */
+	toolLabel: string,
+	/**  キャプチャのルールの名前。 */
+	ruleName: string | null,
 	audioOnly: boolean,
 	/**  取得したものの題名（わかるまでは None）。 */
 	title: string | null,
@@ -542,6 +612,8 @@ export type LibraryCountsDto = {
 	unsorted: number,
 	untagged: number,
 	trash: number,
+	/**  キャプチャで取り込んだもの。 */
+	captures: number,
 };
 
 /**  ライブラリの概要。 */
@@ -788,6 +860,14 @@ export type SmartFolderDto = {
 export type SmartRuleDto = {
 	match: RuleMatchDto,
 	clauses: string[],
+};
+
+/**  見たままキャプチャの結果。 */
+export type SnapshotResultDto = {
+	title: string,
+	url: string,
+	itemIds: number[],
+	added: number,
 };
 
 /**  並べる基準。 */

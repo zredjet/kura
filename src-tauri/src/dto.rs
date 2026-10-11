@@ -574,6 +574,8 @@ pub struct LibraryCountsDto {
     pub unsorted: i64,
     pub untagged: i64,
     pub trash: i64,
+    /// キャプチャで取り込んだもの。
+    pub captures: i64,
 }
 
 impl From<LibraryCounts> for LibraryCountsDto {
@@ -584,6 +586,7 @@ impl From<LibraryCounts> for LibraryCountsDto {
             unsorted: c.unsorted,
             untagged: c.untagged,
             trash: c.trash,
+            captures: c.captures,
         }
     }
 }
@@ -1959,6 +1962,19 @@ pub struct DetectionDto {
     pub playlist: bool,
     /// ツールが見つかるか。
     pub tool_found: bool,
+    /// キャプチャのルールに一致したら、そのルール（ダウンロードより先に撮る。ADR）。
+    pub capture: Option<CaptureMatchDto>,
+}
+
+/// URL に一致したキャプチャのルール。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureMatchDto {
+    pub rule_id: i64,
+    pub rule_name: String,
+    pub mode: CaptureModeDto,
+    /// Google Chrome が見つかるか。
+    pub chrome_found: bool,
 }
 
 /// URL の規則。
@@ -2024,13 +2040,18 @@ impl From<DownloadPrefsDto> for crate::config::DownloadPrefs {
 #[serde(rename_all = "camelCase")]
 pub struct DownloadJobDto {
     pub id: i64,
+    /// `download` か `capture`。
+    pub kind: JobKindDto,
     pub state: JobStateDto,
     pub progress: Option<f64>,
     pub message: Option<String>,
     pub error_code: Option<String>,
     pub url: String,
     pub site_label: String,
-    pub tool: ToolDto,
+    /// 使うツールの表示（`yt-dlp`・`gallery-dl`・`Chrome`）。
+    pub tool_label: String,
+    /// キャプチャのルールの名前。
+    pub rule_name: Option<String>,
     pub audio_only: bool,
     /// 取得したものの題名（わかるまでは None）。
     pub title: Option<String>,
@@ -2046,8 +2067,16 @@ pub struct DownloadJobDto {
 }
 
 impl DownloadJobDto {
-    /// ジョブの行から作る（ダウンロードでなければ None）。
+    /// ジョブの行から作る（ダウンロード・キャプチャでなければ None）。
     pub fn from_record(r: JobRecord) -> Option<Self> {
+        match r.kind {
+            JobKind::Download => Self::from_download(r),
+            JobKind::Capture => Self::from_capture(r),
+            _ => None,
+        }
+    }
+
+    fn from_download(r: JobRecord) -> Option<Self> {
         let input: kura_core::download::DownloadInput = serde_json::from_str(&r.input_json).ok()?;
         let result: kura_core::download::DownloadResult = r
             .result_json
@@ -2056,13 +2085,15 @@ impl DownloadJobDto {
             .unwrap_or_default();
         Some(Self {
             id: r.id,
+            kind: r.kind.into(),
             state: r.state.into(),
             progress: r.progress,
             message: r.message,
             error_code: r.error_code,
             url: input.detection.url,
             site_label: input.detection.site_label,
-            tool: input.detection.tool.into(),
+            tool_label: input.detection.tool.command().to_string(),
+            rule_name: input.detection.rule,
             audio_only: input.options.audio_only,
             title: result.title,
             files: result.files,
@@ -2072,6 +2103,39 @@ impl DownloadJobDto {
             tags: result.tags,
             item_ids: result.item_ids,
             unit_ids: result.unit_ids,
+            created_at: r.created_at,
+            finished_at: r.finished_at,
+        })
+    }
+
+    fn from_capture(r: JobRecord) -> Option<Self> {
+        let input: kura_core::capture::CaptureInput = serde_json::from_str(&r.input_json).ok()?;
+        let result: kura_core::capture::CaptureResult = r
+            .result_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        let site = kura_core::capture::job::host_of(&input.url).unwrap_or_default();
+        Some(Self {
+            id: r.id,
+            kind: r.kind.into(),
+            state: r.state.into(),
+            progress: r.progress,
+            message: r.message,
+            error_code: r.error_code,
+            url: input.url,
+            site_label: site,
+            tool_label: "Chrome".into(),
+            rule_name: Some(input.rule.name),
+            audio_only: false,
+            title: result.title,
+            files: result.added + result.duplicates,
+            added: result.added,
+            duplicates: result.duplicates,
+            skipped: 0,
+            tags: result.tags,
+            item_ids: result.item_ids,
+            unit_ids: Vec::new(),
             created_at: r.created_at,
             finished_at: r.finished_at,
         })
@@ -2120,4 +2184,91 @@ pub struct ToolUpdateOutputDto {
     pub tool: String,
     pub ok: bool,
     pub text: String,
+}
+
+// ===== キャプチャ（docs/architecture.md §10） =====
+
+simple_enum!(CaptureModeDto, kura_core::capture::CaptureMode, { Element, FullPage, Viewport });
+
+/// キャプチャのルール。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureRuleDto {
+    pub id: i64,
+    pub name: String,
+    pub url_pattern: String,
+    pub mode: CaptureModeDto,
+    pub target_selector: Option<String>,
+    pub hide_selectors: Vec<String>,
+    pub viewport_width: i64,
+    pub scroll_times: i64,
+    pub wait_ms: i64,
+    pub dest_folder_id: Option<i64>,
+    pub enabled: bool,
+    pub last_run_at: Option<i64>,
+    /// `ok` / `failed`。
+    pub last_status: Option<String>,
+}
+
+impl From<kura_core::capture::CaptureRule> for CaptureRuleDto {
+    fn from(r: kura_core::capture::CaptureRule) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            url_pattern: r.url_pattern,
+            mode: r.mode.into(),
+            target_selector: r.target_selector,
+            hide_selectors: r.hide_selectors,
+            viewport_width: r.viewport_width,
+            scroll_times: r.scroll_times,
+            wait_ms: r.wait_ms,
+            dest_folder_id: r.dest_folder_id,
+            enabled: r.enabled,
+            last_run_at: r.last_run_at,
+            last_status: r.last_status,
+        }
+    }
+}
+
+/// ルールを作る・変えるときの内容。
+#[derive(Debug, Clone, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureRuleInputDto {
+    pub name: String,
+    pub url_pattern: String,
+    pub mode: CaptureModeDto,
+    pub target_selector: Option<String>,
+    pub hide_selectors: Vec<String>,
+    pub viewport_width: i64,
+    pub scroll_times: i64,
+    pub wait_ms: i64,
+    pub dest_folder_id: Option<i64>,
+    pub enabled: bool,
+}
+
+impl From<CaptureRuleInputDto> for kura_core::capture::RuleInput {
+    fn from(r: CaptureRuleInputDto) -> Self {
+        Self {
+            name: r.name,
+            url_pattern: r.url_pattern,
+            mode: r.mode.into(),
+            target_selector: r.target_selector,
+            hide_selectors: r.hide_selectors,
+            viewport_width: r.viewport_width,
+            scroll_times: r.scroll_times,
+            wait_ms: r.wait_ms,
+            dest_folder_id: r.dest_folder_id,
+            enabled: r.enabled,
+        }
+    }
+}
+
+/// 見たままキャプチャの結果。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotResultDto {
+    pub title: String,
+    pub url: String,
+    pub item_ids: Vec<i64>,
+    pub added: u64,
 }

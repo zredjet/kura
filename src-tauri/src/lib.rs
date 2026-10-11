@@ -81,6 +81,16 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::downloads::tools_status,
             commands::downloads::tools_set_path,
             commands::downloads::tools_update,
+            commands::capture::capture_rules_list,
+            commands::capture::capture_rule_save,
+            commands::capture::capture_rule_delete,
+            commands::capture::capture_rules_reorder,
+            commands::capture::capture_run,
+            commands::capture::capture_login,
+            commands::capture::browser_open,
+            commands::capture::browser_status,
+            commands::capture::browser_close,
+            commands::capture::browser_snapshot,
             commands::folders::folders_tree,
             commands::folders::folder_create,
             commands::folders::folder_update,
@@ -200,6 +210,10 @@ pub fn run() -> ExitCode {
             builder.mount_events(app);
             let config_path = app.path().app_config_dir()?.join("app.json");
             app.manage(AppState::new(config_path));
+            // キャプチャ用の Google Chrome は PATH にないので、アプリの場所を既定にする
+            if let Some(chrome) = kura_mac::find_chrome() {
+                kura_core::tools::set_default_location(kura_core::capture::CHROME_TOOL, chrome);
+            }
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "Kura を起動しました");
             Ok(())
         })

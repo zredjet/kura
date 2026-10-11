@@ -122,6 +122,16 @@ impl AppState {
         Ok(prefs)
     }
 
+    /// キャプチャ用の Chrome のプロファイル（アプリの設定のフォルダの中。docs/architecture.md §10）。
+    pub fn capture_profile_dir(&self) -> PathBuf {
+        let base = self
+            .config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        kura_core::capture::profile_dir(&base)
+    }
+
     /// 外部ツールの場所を指定する（None で指定をやめる）。
     pub fn set_tool_path(&self, tool: &str, path: Option<PathBuf>) -> Result<(), AppError> {
         let tools = self.update_config(|c| {

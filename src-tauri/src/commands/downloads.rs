@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kura_core::capture;
 use kura_core::download::{self, DownloadInput, DownloadOptions};
 use kura_core::jobs::{JobFilter, JobKind};
 use kura_core::settings;
@@ -11,13 +12,13 @@ use tauri::State;
 
 use super::blocking;
 use crate::dto::{
-    DetectionDto, DownloadJobDto, DownloadOptionsDto, DownloadPrefsDto, ToolInfoDto,
-    ToolUpdateOutputDto, ToolsUpdateDto,
+    CaptureMatchDto, DetectionDto, DownloadJobDto, DownloadOptionsDto, DownloadPrefsDto,
+    ToolInfoDto, ToolUpdateOutputDto, ToolsUpdateDto,
 };
 use crate::error::{AppError, AppErrorCode};
 use crate::state::AppState;
 
-/// URL の取得方法を判定する（規則 → サイトの表）。
+/// URL の取得方法を判定する（キャプチャのルール → 取得の規則 → サイトの表）。
 #[tauri::command]
 #[specta::specta]
 pub async fn download_detect(
@@ -25,9 +26,25 @@ pub async fn download_detect(
     url: String,
 ) -> Result<DetectionDto, AppError> {
     let rules = state.download_prefs().rules;
+    let session = state.current();
     blocking(move || {
         let d = download::detect(&url, &rules)?;
+        // キャプチャのルールに一致すれば、ダウンロードより先に撮る（ADR）
+        let capture = match &session {
+            Some(session) => session
+                .library()
+                .db()
+                .read(|conn| capture::rules::find_for_url(conn, &d.url))?
+                .map(|rule| CaptureMatchDto {
+                    rule_id: rule.id,
+                    rule_name: rule.name,
+                    mode: rule.mode.into(),
+                    chrome_found: find(capture::CHROME_TOOL).is_some(),
+                }),
+            None => None,
+        };
         Ok(DetectionDto {
+            capture,
             tool_found: find(d.tool.command()).is_some(),
             url: d.url,
             site: d.site,
@@ -83,7 +100,7 @@ pub async fn download_enqueue(
     .await
 }
 
-/// ダウンロードを新しい順に一覧する。
+/// ダウンロードとキャプチャのジョブを新しい順に一覧する。
 #[tauri::command]
 #[specta::specta]
 pub async fn downloads_list(
@@ -93,7 +110,7 @@ pub async fn downloads_list(
     let session = state.session()?;
     blocking(move || {
         let filter = JobFilter {
-            kinds: vec![JobKind::Download],
+            kinds: vec![JobKind::Download, JobKind::Capture],
             states: Vec::new(),
             limit: Some(limit.unwrap_or(300)),
         };

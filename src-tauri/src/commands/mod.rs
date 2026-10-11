@@ -2,6 +2,7 @@
 
 pub mod appearance;
 pub mod bench;
+pub mod capture;
 pub mod downloads;
 pub mod folders;
 pub mod import;
