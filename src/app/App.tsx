@@ -15,6 +15,7 @@ import { LibraryView } from '../features/library/LibraryView';
 import { PlaylistView } from '../features/playlists/PlaylistView';
 import { Sidebar } from '../features/sidebar/Sidebar';
 import { SearchPalette } from '../features/search/SearchPalette';
+import { SettingsSheet } from '../features/settings/SettingsSheet';
 import { TagDialog } from '../features/tags/TagDialog';
 import { Welcome } from '../features/welcome/Welcome';
 import { closePlayer, loadPlayerPrefs } from '../features/player/playerActions';
@@ -88,6 +89,7 @@ function LibraryScreen() {
       <DropOverlay />
       <TagDialog />
       <SearchPalette />
+      <SettingsSheet />
       <Overlays />
       <Menu />
       <Notice />

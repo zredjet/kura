@@ -17,6 +17,7 @@ import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import { FolderTree } from './FolderTree';
 import { LibrarySwitcher } from './LibrarySwitcher';
+import { SidebarFooter } from './SidebarFooter';
 import { PlaylistList } from './PlaylistList';
 import { SmartFolderList } from './SmartFolderList';
 import styles from './Sidebar.module.css';
@@ -174,6 +175,7 @@ export function Sidebar() {
           </button>
         </section>
       </div>
+      <SidebarFooter />
     </nav>
   );
 }

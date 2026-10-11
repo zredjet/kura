@@ -345,3 +345,66 @@
 .swatch[data-color='teal'] {
   background: var(--folder-teal);
 }
+
+/* 下の段（Sidebar.dc.html：上に区切り線、余白 10・10・0、間隔 8px。容量の文字 11px、バーは高さ 4px） */
+.footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2-5) var(--space-2-5) 0;
+  border-top: 1px solid var(--stroke-1);
+}
+
+.usage {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.usageText {
+  display: flex;
+  justify-content: space-between;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.usageValue {
+  font-variant-numeric: tabular-nums;
+}
+
+.usageTrack {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--fill-2);
+  overflow: hidden;
+}
+
+.usageFill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--text-secondary);
+}
+
+.footerButton {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+}
+
+.footerButton:hover {
+  background: var(--fill-2);
+  color: var(--text-primary);
+}
+
+.footerButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}

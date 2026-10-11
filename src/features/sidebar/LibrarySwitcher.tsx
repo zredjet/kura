@@ -13,7 +13,8 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function openOther(): Promise<void> {
+/** 別のライブラリを選んで開く（サイドバーの切り替え・設定画面）。 */
+export async function openOther(): Promise<void> {
   const picked = await pickExistingLibrary(ja.welcome.openTitle);
   if (!picked) {
     return;
@@ -27,7 +28,8 @@ async function openOther(): Promise<void> {
   }
 }
 
-async function createNew(): Promise<void> {
+/** 新しいライブラリを作って開く（サイドバーの切り替え・設定画面）。 */
+export async function createNew(): Promise<void> {
   const picked = await pickNewLibraryLocation(ja.welcome.newLocationTitle, ja.welcome.defaultName);
   if (!picked) {
     return;

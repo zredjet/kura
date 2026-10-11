@@ -1,13 +1,22 @@
 import {
   type BackupDto,
   commands,
+  type IntegrityDto,
+  type LibraryUsageDto,
   type LibraryInfoDto,
   type LibraryRestoreDto,
   type LocationCheckDto,
 } from './bindings';
 import { unwrap } from './result';
 
-export type { BackupDto, LibraryInfoDto, LibraryRestoreDto, LocationCheckDto };
+export type {
+  BackupDto,
+  IntegrityDto,
+  LibraryInfoDto,
+  LibraryRestoreDto,
+  LibraryUsageDto,
+  LocationCheckDto,
+};
 
 /** ライブラリを置く場所を確かめる（拡張子の補完、既存のライブラリか、同期フォルダの中か）。 */
 export function checkLocation(path: string): Promise<LocationCheckDto> {
@@ -47,4 +56,14 @@ export function backupNow(): Promise<BackupDto> {
 /** Finder で見せる。 */
 export function revealPath(path: string): Promise<null> {
   return unwrap(commands.revealPath(path));
+}
+
+/** ライブラリの容量と、あるボリュームの容量・空き。 */
+export function libraryUsage(): Promise<LibraryUsageDto> {
+  return unwrap(commands.libraryUsage());
+}
+
+/** 整合性チェックをいま行う。 */
+export function checkLibrary(): Promise<IntegrityDto> {
+  return unwrap(commands.libraryCheck());
 }

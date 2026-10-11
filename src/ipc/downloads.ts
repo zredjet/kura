@@ -1,4 +1,5 @@
 import {
+  type ArchiveStatusDto,
   commands,
   type CookieSourceDto,
   type DetectionDto,
@@ -14,6 +15,7 @@ import {
 import { unwrap } from './result';
 
 export type {
+  ArchiveStatusDto,
   CookieSourceDto,
   DetectionDto,
   DownloadJobDto,
@@ -74,4 +76,14 @@ export function updateTools(): Promise<ToolsUpdateDto> {
 /** ツールのコマンド名（`yt-dlp` など）。 */
 export function toolCommand(tool: ToolDto): string {
   return tool === 'ytDlp' ? 'yt-dlp' : 'gallery-dl';
+}
+
+/** 取得済みの記録の状態（yt-dlp・gallery-dl）。 */
+export function downloadArchives(): Promise<ArchiveStatusDto[]> {
+  return unwrap(commands.downloadArchives());
+}
+
+/** 取得済みの記録を消す。 */
+export function clearDownloadArchive(tool: ToolDto): Promise<null> {
+  return unwrap(commands.downloadArchiveClear(tool));
 }

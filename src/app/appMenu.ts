@@ -11,6 +11,7 @@ import {
 import { selectAllEntries } from '../features/library/useLibraryKeys';
 import { createPlaylistInteractive } from '../features/playlists/playlistActions';
 import { ja } from '../i18n/ja';
+import { useSettingsStore } from '../stores/settingsStore';
 import { type LayoutMode, useViewStore } from '../stores/viewStore';
 
 /** Tauri が macOS の「ウインドウ」「ヘルプ」メニューとして扱う ID（`WINDOW_SUBMENU_ID`・`HELP_SUBMENU_ID`）。 */
@@ -30,7 +31,7 @@ export interface KeySpec {
 }
 
 /** メニューから呼ぶ、キーではない操作。 */
-export type MenuCommandId = 'newPlaylist' | 'collapseUnits';
+export type MenuCommandId = 'newPlaylist' | 'collapseUnits' | 'settings';
 
 /** メニューの項目を押したときにすること。 */
 export type MenuAction =
@@ -127,6 +128,12 @@ export function appMenuItems(run: RunMenuAction, view: ViewItems): MenuItems {
       text: app,
       items: [
         { item: { About: null }, text: t.about(app) },
+        { item: 'Separator' },
+        {
+          text: t.settings,
+          accelerator: 'CmdOrCtrl+,',
+          action: () => run({ kind: 'command', id: 'settings' }),
+        },
         { item: 'Separator' },
         { item: 'Services', text: t.services },
         { item: 'Separator' },
@@ -281,6 +288,8 @@ export function runMenuAction(action: MenuAction): void {
     void createPlaylistInteractive();
   } else if (action.id === 'collapseUnits') {
     useViewStore.getState().toggleCollapseUnits();
+  } else if (action.id === 'settings') {
+    useSettingsStore.getState().show();
   }
 }
 

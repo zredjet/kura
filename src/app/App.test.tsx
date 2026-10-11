@@ -12,6 +12,11 @@ vi.mock('../ipc/library', () => ({
   createLibrary: vi.fn(),
   openLibrary: vi.fn(),
   checkLocation: vi.fn(async (path: string) => ({ path, status: 'new', syncService: null })),
+  libraryUsage: vi.fn(async () => ({
+    libraryBytes: 0,
+    volumeTotalBytes: null,
+    volumeAvailableBytes: null,
+  })),
 }));
 vi.mock('../ipc/jobs', () => ({
   listJobs: vi.fn(async () => []),
