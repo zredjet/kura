@@ -69,19 +69,21 @@
 | スマートフォルダ | `smart_folders_list(withCounts?, utcOffsetMinutes)` / `smart_folder_save(name, query)` / `smart_folder_update(id, name?, query?)` / `smart_folder_delete(id)` | 条件は検索の文字列のまま保存（解析できない条件は保存しない）。件数は一致するアイテムの数 |
 | 検索 | `query_parse(text, view?, utcOffsetMinutes)` → `{ error?, clauses, counts? }` | ⌘K のチップ・件数・エラー表示用。`error` は位置（UTF-16）と理由、`clauses` はいちばん外側の AND の条件、`counts` は開いている一覧の中で一致する種類ごとの件数 |
 | | `query_suggest(word, limit)` → `Suggestion[]` | 入力中の語の候補：タグ → フィールド名・値 → 保存済みの検索（`kind` / `insert` / `prefix` / `label` / `count` / `id`） |
-| プレイリスト | `playlists_list()` / `playlist_create(name, kind, granularity)` / `playlist_update(id, patch)` / `playlist_delete(id)` | |
-| | `playlist_entries(id)` / `playlist_add(id, targets, at, mode)` / `playlist_move(entry_ids, before_entry_id)` / `playlist_remove(entry_ids)` | `mode` は `auto` / `expand` / `keep`（§3.5） |
-| | `playlist_set_granularity(id, granularity)` | 非破壊（§3.4） |
-| | `playlist_snapshot_to_files(id, entry_ids?)` | 「ファイルに固定」 |
-| | `playlist_build_queue(id, options)` → `Queue` | シード・開始位置を含む |
-| | `quick_queue(query, granularity, shuffle)` → `Queue` | ⌘K の ⇧↵「結果をランダム再生」 |
+| プレイリスト | `playlists_list()` → `PlaylistSummary[]` / `playlist_get(id)` → `Playlist` | サイドバーの一覧（並び順・件数）と、画面用の設定一式（保存した再開の位置 `resume` を含む） |
+| | `playlist_create(name, kind, granularity)` / `playlist_update(id, patch)` / `playlist_delete(id)` | smart は作るとき シャッフル・条件なし（すべて）・上限 50 件で始める。`patch` は名前・設定・条件（`rule`：`{ match, clauses }`、解析できなければ `InvalidQuery`）・上限・並び順。画像の表示時間は 1〜60 秒 |
+| | `playlist_set_granularity(id, granularity)` | 非破壊（§3.4）。値を変えるだけ |
+| | `playlist_contents(id)` → `{ rows, flatItemIds, itemCount, images, audios, videos, totalMs }` | 画面の一覧：エントリごとの行（名前・表紙・件数・長さ・種類、unit / folder は中身のアイテム）と、展開後の件数・合計 |
+| | `playlist_add(id, sources, invert, groupName?, before?)` → `{ entryIds, unitId? }` | §3.5 の表どおりに追加する（`invert` は ⌥、`groupName` は「1 つのユニットにまとめて追加」で set ユニットを作る）。`before` のエントリの前に、なければ末尾に |
+| | `playlist_move(id, entryIds, before?)` / `playlist_remove(id, entryIds)` | 並べ替え（pos の中間値、差が 1e-9 未満なら振り直す）・削除 |
+| | `playlist_snapshot_to_files(id, entryIds?)` → 元のエントリ / `playlist_restore_entries(id, entries)` | 「ファイルに固定」（省けば全体）と、その取り消し（ADR-82） |
+| | `playlist_regenerate(id, utcOffsetMinutes)` | smart の並びを新しいシードで作り直す（「作り直す」。ADR-79） |
+| | `playlist_save_state(id, state?)` | 再開の位置（シード・スロット番号・アイテム・再生位置）を保存する。null で消す（§6.5、ADR-86） |
 | 再生 | `playback_support_set(entries)` | 起動時にフロントが `canPlayType` で作った「入れ物 × コーデック」の表（§8）。表が前回と変わっていれば、作り済み以外のプロキシの判定をやり直す |
-| | `player_queue(entries)` → `Queue` | 選択（アイテムと `0x8000_0000 \| unit_id`）を一覧の並び順のままキューにする（M5。ユニットはメンバー順に展開）。`Queue` は Slot 列を列ごとの配列で持つ：`itemIds` / `unitIds` / `indexInUnit` / `unitLen` / `imageDurationMs`（音楽・動画は null）と `totalMs` |
-| | `playback_report({ itemId, unitId, unitStart, playedMs, completed, durationMs })` → 記録したか | スロットを離れたときに送る。再生済みの判定（playlists.md §6.4）は Rust がし、再生済みなら `play_events` と回数・日時を更新する |
+| | `play_queue(source, request, utcOffsetMinutes)` → `Queue` | 再生するキューを作る（M6 で `player_queue` を置き換え）。`source` は `playlist { id }`（その設定どおり。シード・smart の並びを保存する）、`selection { entries }`（アイテムと `0x8000_0000 \| unit_id` を並び順のまま。ユニットを含めばユニット単位）、`view { view, query, collapseUnits }`（⌘K の ⇧↵：開いている一覧の中で条件に合うもの）。`request` は `resume`・`shuffle`（S で切り替え）・`reseed`（並べ直す）・`startItem`（そのアイテムのユニットを先頭に）・`fromItem`（並びはそのままでそこから）・`seed`。`Queue` は Slot 列を列ごとの配列で持つ：`itemIds` / `unitIds` / `indexInUnit` / `unitLen` / `imageDurationMs`（音楽・動画は null）と、ユニット単位のときのまとまり `groups`・`groupIndex`、`seed`（16 進）・`startIndex`・`startPositionMs`・`totalMs`、プレイリストならその設定 `playlist`（ADR-84） |
+| | `playback_report({ itemId, unitId, unitStart, playlistId, playedMs, completed, durationMs })` → 記録したか | スロットを離れたときに送る。再生済みの判定（playlists.md §6.4）は Rust がし、再生済みなら `play_events` と回数・日時を更新する |
 | | `proxy_request(ids, force)` | 再生キューの今と次のプロキシを先に作ってもらう。`force` は元のまま再生できなかったものを作成待ちに戻す（§8） |
 | | `open_external(hash)` → `mpv` \| `quickTime` | 元のファイルを外部プレイヤーで開く（mpv があれば mpv） |
 | | `player_prefs_get()` / `player_prefs_set(prefs)` | 再生の設定（音量・画像の間も直前の音楽を流す・BGM をループ・画像の表示時間の既定値）。app.json に保存 |
-| | `playback_save_state(playlist_id, state)` | 再開（M6） |
 | ジョブ | `jobs_list(filter)` / `job_cancel(id)` / `job_pause(id)` / `job_resume(id)` / `job_retry(id)` / `job_log(id)` | 進捗はイベント `job://progress` |
 | ダウンロード | `download_detect(url)` → `DetectedSource` / `download_enqueue(url, options)` → `JobId` | |
 | キャプチャ | `capture_rules_*` / `capture_run(url, rule_id?)` → `JobId` / `browser_open(url)` / `browser_snapshot(label)` | |
@@ -192,6 +194,12 @@ import_start:    ジョブとして実行
 - **配信**：`/play/{hash}` はプロキシがあればプロキシ、なければ元ファイル。作り直したプロキシは `?a=<回数>` を付けて読み直す。`.opus` は `audio/ogg` で配る（ADR-73）。
 - **再生**（`src/features/player/engine/PlaybackController.ts`）：キューを順に再生するだけ（playlists.md §6）。`<video>` はシアターに置いたものを使い、BGM 用の `<audio>` 2 つと先読み用の要素はコントローラが作る。シアターは再生中ずっと DOM に残し、ミニプレーヤーのときは隠す（ADR-71）。ウィンドウが隠れても止まらないよう、WebView のバックグラウンドの抑制を切る（§11、ADR-72）。
 
+### 8.2 プレイリストの再生（M6）
+
+- **キュー**（`kura_core::playlist`）：`play_queue` がプレイリスト・選択・開いている一覧からエントリを作り、`resolve`（DB から読んだスナップショットを展開）→ `build_queue`（純粋関数、playlists.md §5）でスロット列にする。プレイリストはシードと smart の並びを保存するので書き込みのトランザクションで作る（ADR-79・84）。
+- **フロント**：`PlaybackController` は受け取ったキューを順に再生するだけ。シャッフル（S）・並べ直す・リピートの全体で先頭に戻るときは、`play_queue` にもう一度頼んで作り直す（`startItem` で今のアイテムを先頭に、`reseed` で新しいシード）。ユニット単位のときはキューの `groups` / `groupIndex` で「ユニット 3 / 12 · 2 / 10」・⇧← ⇧→・キューの折りたたみを出す。
+- **再開**：プレイリストの再生中は位置を 5 秒ごと・スロットが変わったとき・閉じたときに `playlist_save_state` で保存する（ADR-86）。
+
 ## 9. ダウンロード
 
 | 段階 | 内容 |
@@ -298,3 +306,10 @@ M5 の実測（同じ環境）：
 | 10 万件の選択からキューを作る（`player_queue` の中身） | 25ms＋合計の長さ 13ms（`cargo test --release -p kura-core queue -- --ignored`） |
 | 起動から判定とプロキシの作成まで（動画・音楽 8 件、mkv 2 件の入れ替え・avi 1 件の変換） | 0.5 秒 |
 | 混在キュー 12 件（mkv×2・webm・ogg・opus・flac・avi・mp4・画像 4、ウィンドウは隠した状態） | 途中で止まらず全件を「最後まで再生」で記録。スロットの切り替えは画像 0〜0.1 秒・音楽と動画 0.5〜1.4 秒（読み込み） |
+
+M6 の実測（同じ環境、リリースビルド。`cargo test --release -p kura-core t15 -- --ignored --nocapture`、3 回の幅）：
+
+| 項目 | 結果 | 目標 |
+|---|---|---|
+| 1 万エントリ・5 万アイテムの `resolve + build_queue`（ファイル単位、シャッフル・重み付き・連続制限） | 11〜14ms | playlists.md §5.6：50ms 以内 |
+| 同じ（ユニット単位） | 6〜9ms | 同上 |
