@@ -1865,3 +1865,259 @@ impl PlayQueueDto {
         dto
     }
 }
+
+// ===== ダウンロード（docs/architecture.md §9） =====
+
+simple_enum!(ToolDto, kura_core::download::Tool, { YtDlp, GalleryDl });
+simple_enum!(CookieSourceDto, kura_core::download::CookieSource, { None, Firefox, Safari, Chrome });
+
+/// 画質（`best` / `1080` / `720` / `480`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub enum QualityDto {
+    #[serde(rename = "best")]
+    Best,
+    #[serde(rename = "1080")]
+    P1080,
+    #[serde(rename = "720")]
+    P720,
+    #[serde(rename = "480")]
+    P480,
+}
+
+impl From<QualityDto> for kura_core::download::Quality {
+    fn from(q: QualityDto) -> Self {
+        match q {
+            QualityDto::Best => Self::Best,
+            QualityDto::P1080 => Self::P1080,
+            QualityDto::P720 => Self::P720,
+            QualityDto::P480 => Self::P480,
+        }
+    }
+}
+
+impl From<kura_core::download::Quality> for QualityDto {
+    fn from(q: kura_core::download::Quality) -> Self {
+        use kura_core::download::Quality;
+        match q {
+            Quality::Best => Self::Best,
+            Quality::P1080 => Self::P1080,
+            Quality::P720 => Self::P720,
+            Quality::P480 => Self::P480,
+        }
+    }
+}
+
+/// 1 件のダウンロードの選択（画質・音声のみ・保存先・自動タグ）。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadOptionsDto {
+    pub quality: QualityDto,
+    pub audio_only: bool,
+    pub dest_folder_id: Option<i64>,
+    pub tag_uploader: bool,
+    pub tag_site_tags: bool,
+    pub playlist_unit: bool,
+}
+
+impl From<DownloadOptionsDto> for kura_core::download::DownloadOptions {
+    fn from(o: DownloadOptionsDto) -> Self {
+        Self {
+            quality: o.quality.into(),
+            audio_only: o.audio_only,
+            dest_folder_id: o.dest_folder_id,
+            tag_uploader: o.tag_uploader,
+            tag_site_tags: o.tag_site_tags,
+            playlist_unit: o.playlist_unit,
+        }
+    }
+}
+
+impl From<kura_core::download::DownloadOptions> for DownloadOptionsDto {
+    fn from(o: kura_core::download::DownloadOptions) -> Self {
+        Self {
+            quality: o.quality.into(),
+            audio_only: o.audio_only,
+            dest_folder_id: o.dest_folder_id,
+            tag_uploader: o.tag_uploader,
+            tag_site_tags: o.tag_site_tags,
+            playlist_unit: o.playlist_unit,
+        }
+    }
+}
+
+/// URL の判定の結果。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectionDto {
+    pub url: String,
+    pub site: String,
+    pub site_label: String,
+    pub tool: ToolDto,
+    /// 一致した規則の名前。
+    pub rule: Option<String>,
+    /// 再生リスト・まとめのページ。
+    pub playlist: bool,
+    /// ツールが見つかるか。
+    pub tool_found: bool,
+}
+
+/// URL の規則。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadRuleDto {
+    pub name: String,
+    pub pattern: String,
+    pub tool: ToolDto,
+    pub args: Vec<String>,
+}
+
+impl From<DownloadRuleDto> for kura_core::download::DownloadRule {
+    fn from(r: DownloadRuleDto) -> Self {
+        Self {
+            name: r.name,
+            pattern: r.pattern,
+            tool: r.tool.into(),
+            args: r.args,
+        }
+    }
+}
+
+impl From<kura_core::download::DownloadRule> for DownloadRuleDto {
+    fn from(r: kura_core::download::DownloadRule) -> Self {
+        Self {
+            name: r.name,
+            pattern: r.pattern,
+            tool: r.tool.into(),
+            args: r.args,
+        }
+    }
+}
+
+/// ダウンロードの設定（この Mac で共通）。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadPrefsDto {
+    pub cookies: CookieSourceDto,
+    pub rules: Vec<DownloadRuleDto>,
+}
+
+impl From<crate::config::DownloadPrefs> for DownloadPrefsDto {
+    fn from(p: crate::config::DownloadPrefs) -> Self {
+        Self {
+            cookies: p.cookies.into(),
+            rules: p.rules.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<DownloadPrefsDto> for crate::config::DownloadPrefs {
+    fn from(p: DownloadPrefsDto) -> Self {
+        Self {
+            cookies: p.cookies.into(),
+            rules: p.rules.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// ダウンロードの一覧の 1 件（ジョブの入力と結果を読んだもの）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadJobDto {
+    pub id: i64,
+    pub state: JobStateDto,
+    pub progress: Option<f64>,
+    pub message: Option<String>,
+    pub error_code: Option<String>,
+    pub url: String,
+    pub site_label: String,
+    pub tool: ToolDto,
+    pub audio_only: bool,
+    /// 取得したものの題名（わかるまでは None）。
+    pub title: Option<String>,
+    pub files: u64,
+    pub added: u64,
+    pub duplicates: u64,
+    pub skipped: u64,
+    pub tags: u64,
+    pub item_ids: Vec<i64>,
+    pub unit_ids: Vec<i64>,
+    pub created_at: i64,
+    pub finished_at: Option<i64>,
+}
+
+impl DownloadJobDto {
+    /// ジョブの行から作る（ダウンロードでなければ None）。
+    pub fn from_record(r: JobRecord) -> Option<Self> {
+        let input: kura_core::download::DownloadInput = serde_json::from_str(&r.input_json).ok()?;
+        let result: kura_core::download::DownloadResult = r
+            .result_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        Some(Self {
+            id: r.id,
+            state: r.state.into(),
+            progress: r.progress,
+            message: r.message,
+            error_code: r.error_code,
+            url: input.detection.url,
+            site_label: input.detection.site_label,
+            tool: input.detection.tool.into(),
+            audio_only: input.options.audio_only,
+            title: result.title,
+            files: result.files,
+            added: result.added,
+            duplicates: result.duplicates,
+            skipped: result.skipped,
+            tags: result.tags,
+            item_ids: result.item_ids,
+            unit_ids: result.unit_ids,
+            created_at: r.created_at,
+            finished_at: r.finished_at,
+        })
+    }
+}
+
+/// 外部ツールの状態。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolInfoDto {
+    pub name: String,
+    pub path: Option<String>,
+    pub version: Option<String>,
+    /// Homebrew で入れたもの（更新は `brew upgrade`）。
+    pub homebrew: bool,
+    /// 設定で場所を指定している。
+    pub overridden: bool,
+}
+
+impl From<kura_core::tools::ToolInfo> for ToolInfoDto {
+    fn from(t: kura_core::tools::ToolInfo) -> Self {
+        Self {
+            name: t.name,
+            path: t.path.map(|p| p.to_string_lossy().into_owned()),
+            version: t.version,
+            homebrew: t.homebrew,
+            overridden: t.overridden,
+        }
+    }
+}
+
+/// 「更新を確認」の結果。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsUpdateDto {
+    /// Homebrew で入れたものを更新するコマンド（ターミナルで実行してもらう）。
+    pub brew_command: Option<String>,
+    /// 自分で更新できるツール（単体版の yt-dlp など）を実行した結果。
+    pub outputs: Vec<ToolUpdateOutputDto>,
+}
+
+/// 1 つのツールの更新の結果。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolUpdateOutputDto {
+    pub tool: String,
+    pub ok: bool,
+    pub text: String,
+}

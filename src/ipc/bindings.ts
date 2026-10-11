@@ -51,6 +51,30 @@ export const commands = {
 	jobPause: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("job_pause", { id })),
 	/**  一時停止したジョブを再開する。 */
 	jobResume: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("job_resume", { id })),
+	/**  失敗・中止したジョブをもう一度動かす（途中経過から続ける）。 */
+	jobRetry: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("job_retry", { id })),
+	/**  待っているジョブを先に動かす。 */
+	jobPrioritize: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("job_prioritize", { id })),
+	/**  ジョブのログ（末尾 256KB）。 */
+	jobLog: (id: number) => typedError<string, AppError>(__TAURI_INVOKE("job_log", { id })),
+	/**  URL の取得方法を判定する（規則 → サイトの表）。 */
+	downloadDetect: (url: string) => typedError<DetectionDto, AppError>(__TAURI_INVOKE("download_detect", { url })),
+	/**  前回の選択（ライブラリごと。なければ既定値）。 */
+	downloadDefaults: () => typedError<DownloadOptionsDto, AppError>(__TAURI_INVOKE("download_defaults")),
+	/**  ダウンロードを積む。選んだ内容は次回の既定にする。 */
+	downloadEnqueue: (url: string, options: DownloadOptionsDto) => typedError<number, AppError>(__TAURI_INVOKE("download_enqueue", { url, options })),
+	/**  ダウンロードを新しい順に一覧する。 */
+	downloadsList: (limit: number | null) => typedError<DownloadJobDto[], AppError>(__TAURI_INVOKE("downloads_list", { limit })),
+	/**  ダウンロードの設定（Cookie の読み込み元・規則）。 */
+	downloadPrefsGet: () => __TAURI_INVOKE<DownloadPrefsDto>("download_prefs_get"),
+	/**  ダウンロードの設定を保存する（規則の正規表現・引数を確かめる）。 */
+	downloadPrefsSet: (prefs: DownloadPrefsDto) => typedError<DownloadPrefsDto, AppError>(__TAURI_INVOKE("download_prefs_set", { prefs })),
+	/**  外部ツールの状態（場所・版・Homebrew 版か）。 */
+	toolsStatus: () => typedError<ToolInfoDto[], AppError>(__TAURI_INVOKE("tools_status")),
+	/**  外部ツールの場所を指定する（`path` が None なら指定をやめて自動で探す）。 */
+	toolsSetPath: (tool: string, path: string | null) => typedError<ToolInfoDto, AppError>(__TAURI_INVOKE("tools_set_path", { tool, path })),
+	/**  「更新を確認」：Homebrew 版は `brew upgrade` のコマンドを返し、単体版の yt-dlp は自分で更新する。 */
+	toolsUpdate: () => typedError<ToolsUpdateDto, AppError>(__TAURI_INVOKE("tools_update")),
 	/**  すべての仮想フォルダ（木はフロントで組み立てる）。`with_counts` なら件数も数える。 */
 	foldersTree: (withCounts: boolean | null) => typedError<FolderNodeDto[], AppError>(__TAURI_INVOKE("folders_tree", { withCounts })),
 	/**  フォルダを作る（`parent_id` がなければいちばん上）。作ったフォルダの ID を返す。 */
@@ -188,7 +212,9 @@ export type AppError = {
 };
 
 /**  エラーの種類。フロントはこの値で分岐する（`docs/architecture.md` §3）。 */
-export type AppErrorCode = "NotFound" | "InvalidQuery" | "Invalid" | "ToolMissing" | "Io" | "Db" | "Conflict" | 
+export type AppErrorCode = "NotFound" | "InvalidQuery" | "Invalid" | "ToolMissing" | 
+/**  外部ツールが失敗した。 */
+"ToolFailed" | "Io" | "Db" | "Conflict" | 
 /**  アプリ内部の想定外の失敗。 */
 "Internal";
 
@@ -211,6 +237,8 @@ export type ClauseDto = {
 /**  入れ物（`kura_core::playback::Container`）。 */
 export type ContainerDto = "mp4" | "webm" | "ogg" | "mp3" | "flac" | "wav" | "aiff" | "aac" | "other";
 
+export type CookieSourceDto = "none" | "firefox" | "safari" | "chrome";
+
 /**  ユニットの表紙。 */
 export type CoverDto = {
 	itemId: number,
@@ -219,6 +247,68 @@ export type CoverDto = {
 	thumbState: string,
 	width: number | null,
 	height: number | null,
+};
+
+/**  URL の判定の結果。 */
+export type DetectionDto = {
+	url: string,
+	site: string,
+	siteLabel: string,
+	tool: ToolDto,
+	/**  一致した規則の名前。 */
+	rule: string | null,
+	/**  再生リスト・まとめのページ。 */
+	playlist: boolean,
+	/**  ツールが見つかるか。 */
+	toolFound: boolean,
+};
+
+/**  ダウンロードの一覧の 1 件（ジョブの入力と結果を読んだもの）。 */
+export type DownloadJobDto = {
+	id: number,
+	state: JobStateDto,
+	progress: number | null,
+	message: string | null,
+	errorCode: string | null,
+	url: string,
+	siteLabel: string,
+	tool: ToolDto,
+	audioOnly: boolean,
+	/**  取得したものの題名（わかるまでは None）。 */
+	title: string | null,
+	files: number,
+	added: number,
+	duplicates: number,
+	skipped: number,
+	tags: number,
+	itemIds: number[],
+	unitIds: number[],
+	createdAt: number,
+	finishedAt: number | null,
+};
+
+/**  1 件のダウンロードの選択（画質・音声のみ・保存先・自動タグ）。 */
+export type DownloadOptionsDto = {
+	quality: QualityDto,
+	audioOnly: boolean,
+	destFolderId: number | null,
+	tagUploader: boolean,
+	tagSiteTags: boolean,
+	playlistUnit: boolean,
+};
+
+/**  ダウンロードの設定（この Mac で共通）。 */
+export type DownloadPrefsDto = {
+	cookies: CookieSourceDto,
+	rules: DownloadRuleDto[],
+};
+
+/**  URL の規則。 */
+export type DownloadRuleDto = {
+	name: string,
+	pattern: string,
+	tool: ToolDto,
+	args: string[],
 };
 
 /**  重複の扱い。 */
@@ -652,6 +742,9 @@ export type PlaylistSummaryDto = {
 	itemCount: number,
 };
 
+/**  画質（`best` / `1080` / `720` / `480`）。 */
+export type QualityDto = "best" | "1080" | "720" | "480";
+
 /**  パレットに出す解析の結果。 */
 export type QueryCheckDto = {
 	error: ParseErrorDto | null,
@@ -764,6 +857,34 @@ export type TagSuggestionDto = {
 	count: number,
 	/**  別名で一致したときの別名。 */
 	alias: string | null,
+};
+
+export type ToolDto = "ytDlp" | "galleryDl";
+
+/**  外部ツールの状態。 */
+export type ToolInfoDto = {
+	name: string,
+	path: string | null,
+	version: string | null,
+	/**  Homebrew で入れたもの（更新は `brew upgrade`）。 */
+	homebrew: boolean,
+	/**  設定で場所を指定している。 */
+	overridden: boolean,
+};
+
+/**  1 つのツールの更新の結果。 */
+export type ToolUpdateOutputDto = {
+	tool: string,
+	ok: boolean,
+	text: string,
+};
+
+/**  「更新を確認」の結果。 */
+export type ToolsUpdateDto = {
+	/**  Homebrew で入れたものを更新するコマンド（ターミナルで実行してもらう）。 */
+	brewCommand: string | null,
+	/**  自分で更新できるツール（単体版の yt-dlp など）を実行した結果。 */
+	outputs: ToolUpdateOutputDto[],
 };
 
 /**  ゴミ箱を空にした結果。 */

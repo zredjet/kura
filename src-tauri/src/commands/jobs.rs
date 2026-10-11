@@ -50,3 +50,27 @@ pub async fn job_resume(state: State<'_, AppState>, id: i64) -> Result<(), AppEr
     let session = state.session()?;
     blocking(move || Ok(session.jobs().resume(id)?)).await
 }
+
+/// 失敗・中止したジョブをもう一度動かす（途中経過から続ける）。
+#[tauri::command]
+#[specta::specta]
+pub async fn job_retry(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    let session = state.session()?;
+    blocking(move || Ok(session.jobs().retry(id)?)).await
+}
+
+/// 待っているジョブを先に動かす。
+#[tauri::command]
+#[specta::specta]
+pub async fn job_prioritize(state: State<'_, AppState>, id: i64) -> Result<(), AppError> {
+    let session = state.session()?;
+    blocking(move || Ok(session.jobs().prioritize(id)?)).await
+}
+
+/// ジョブのログ（末尾 256KB）。
+#[tauri::command]
+#[specta::specta]
+pub async fn job_log(state: State<'_, AppState>, id: i64) -> Result<String, AppError> {
+    let session = state.session()?;
+    blocking(move || Ok(session.jobs().log_text(id, 256 * 1024)?)).await
+}

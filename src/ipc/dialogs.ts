@@ -50,3 +50,8 @@ export async function pickImportFiles(title: string, filterName: string): Promis
   });
   return picked ?? [];
 }
+
+/** 外部ツールの実行ファイルを選ぶ。キャンセルなら null。 */
+export function pickToolFile(title: string): Promise<string | null> {
+  return open({ title, directory: false, multiple: false, defaultPath: '/opt/homebrew/bin' });
+}

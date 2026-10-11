@@ -1,7 +1,9 @@
 //! アプリ全体の設定（`~/Library/Application Support/<bundle id>/app.json`）。ライブラリごとの設定は DB の settings に置く。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use kura_core::download::{CookieSource, DownloadRule};
 use serde::{Deserialize, Serialize};
 
 /// アプリ全体の設定。
@@ -12,6 +14,20 @@ pub struct AppConfig {
     pub last_library: Option<PathBuf>,
     /// 再生の設定。
     pub player: PlayerPrefs,
+    /// 外部ツールの場所の指定（ツール名 → 実行ファイル）。指定がなければ Homebrew・PATH から探す。
+    pub tools: BTreeMap<String, PathBuf>,
+    /// ダウンロードの設定（この Mac で共通）。
+    pub download: DownloadPrefs,
+}
+
+/// ダウンロードの設定。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DownloadPrefs {
+    /// ログインが要るサイトの Cookie を読むブラウザ。
+    pub cookies: CookieSource,
+    /// URL の規則（上から順に見る）。
+    pub rules: Vec<DownloadRule>,
 }
 
 /// 再生の設定（docs/playlists.md §5.3・§6.2）。
@@ -95,6 +111,11 @@ mod tests {
                 volume: 40,
                 bgm_loop: true,
                 ..PlayerPrefs::default()
+            },
+            tools: BTreeMap::from([("yt-dlp".into(), PathBuf::from("/opt/tools/yt-dlp"))]),
+            download: DownloadPrefs {
+                cookies: CookieSource::Firefox,
+                rules: vec![],
             },
         };
         save(&path, &config).unwrap();

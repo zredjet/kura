@@ -23,6 +23,21 @@ export function resumeJob(id: number): Promise<null> {
   return unwrap(commands.jobResume(id));
 }
 
+/** 失敗・中止したジョブをもう一度動かす。 */
+export function retryJob(id: number): Promise<null> {
+  return unwrap(commands.jobRetry(id));
+}
+
+/** 待っているジョブを先に動かす。 */
+export function prioritizeJob(id: number): Promise<null> {
+  return unwrap(commands.jobPrioritize(id));
+}
+
+/** ジョブのログ（末尾）。 */
+export function jobLog(id: number): Promise<string> {
+  return unwrap(commands.jobLog(id));
+}
+
 /** 進捗イベント（`job://progress`）を受け取る。戻り値で受け取りをやめる。 */
 export function onJobProgress(handler: (event: JobProgress) => void): Promise<() => void> {
   return events.jobProgress.listen((e) => handler(e.payload));

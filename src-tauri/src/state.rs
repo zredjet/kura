@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use kura_core::library::{EventSink, LibrarySession};
 use kura_core::playback::PlaybackSupport;
 
-use crate::config::{self, AppConfig, PlayerPrefs};
+use crate::config::{self, AppConfig, DownloadPrefs, PlayerPrefs};
 use crate::error::{AppError, AppErrorCode};
 
 /// Tauri の状態として持つもの。
@@ -22,6 +22,7 @@ impl AppState {
     /// 設定ファイルの場所を受け取って作る。
     pub fn new(config_path: PathBuf) -> Self {
         let config = config::load(&config_path);
+        kura_core::tools::set_overrides(config.tools.clone());
         Self {
             session: RwLock::new(None),
             config_path,
@@ -102,6 +103,48 @@ impl AppState {
         config::save(&self.config_path, &config)
             .map_err(|err| AppError::internal(format!("設定を保存できませんでした: {err}")))?;
         Ok(prefs)
+    }
+
+    /// ダウンロードの設定。
+    pub fn download_prefs(&self) -> DownloadPrefs {
+        self.config
+            .lock()
+            .map(|c| c.download.clone())
+            .unwrap_or_default()
+    }
+
+    /// ダウンロードの設定を変えて保存する（規則は確かめてから）。
+    pub fn set_download_prefs(&self, prefs: DownloadPrefs) -> Result<DownloadPrefs, AppError> {
+        for rule in &prefs.rules {
+            kura_core::download::validate_rule(rule)?;
+        }
+        self.update_config(|c| c.download = prefs.clone())?;
+        Ok(prefs)
+    }
+
+    /// 外部ツールの場所を指定する（None で指定をやめる）。
+    pub fn set_tool_path(&self, tool: &str, path: Option<PathBuf>) -> Result<(), AppError> {
+        let tools = self.update_config(|c| {
+            match &path {
+                Some(path) => c.tools.insert(tool.to_string(), path.clone()),
+                None => c.tools.remove(tool),
+            };
+            c.tools.clone()
+        })?;
+        kura_core::tools::set_overrides(tools);
+        Ok(())
+    }
+
+    /// 設定を変えて保存する。
+    fn update_config<T>(&self, change: impl FnOnce(&mut AppConfig) -> T) -> Result<T, AppError> {
+        let mut config = self
+            .config
+            .lock()
+            .map_err(|_| AppError::internal("設定を読めません"))?;
+        let out = change(&mut config);
+        config::save(&self.config_path, &config)
+            .map_err(|err| AppError::internal(format!("設定を保存できませんでした: {err}")))?;
+        Ok(out)
     }
 
     /// 開いているライブラリを閉じる（実行中のジョブは次回の起動で再開する）。
