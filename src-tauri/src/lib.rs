@@ -110,6 +110,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::folders::folder_delete,
             commands::folders::items_set_folders,
             commands::tags::tags_suggest,
+            commands::tags::tags_list,
             commands::tags::tags_apply,
             commands::tags::tag_detail,
             commands::tags::tag_update,

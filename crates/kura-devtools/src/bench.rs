@@ -314,6 +314,21 @@ fn query(path: &std::path::Path) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         suggest_runs.push(started.elapsed());
     }
+    let mut tag_runs = Vec::new();
+    let mut tag_count = 0;
+    for _ in 0..5 {
+        let started = Instant::now();
+        tag_count = db
+            .read(kura_core::tags::list_all)
+            .map_err(|e| e.to_string())?
+            .len();
+        tag_runs.push(started.elapsed());
+    }
+    tracing::info!(
+        tags = tag_count,
+        tags_list_ms = median(tag_runs).as_secs_f64() * 1000.0,
+        "タグの一覧（中央値）"
+    );
     tracing::info!(
         recent_ms,
         unsorted_ms,

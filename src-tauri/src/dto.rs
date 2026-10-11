@@ -978,6 +978,34 @@ impl From<TagSuggestion> for TagSuggestionDto {
     }
 }
 
+/// タグの一覧の 1 行（タグの一覧の画面）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TagListEntryDto {
+    pub tag: TagRefDto,
+    /// 付いているアイテムの数（ゴミ箱を除く）。
+    pub items: i64,
+    /// そのうち、ダウンロード・キャプチャで自動で付いたもの。
+    pub auto: i64,
+    /// 付いているユニットの数。
+    pub units: i64,
+    /// このタグで絞り込む検索の条件（「作者:KR」など）。
+    pub clause: String,
+}
+
+impl From<kura_core::tags::TagListEntry> for TagListEntryDto {
+    fn from(e: kura_core::tags::TagListEntry) -> Self {
+        let clause = kura_core::query::suggest::tag_clause(&e.tag.namespace, &e.tag.name);
+        Self {
+            tag: e.tag.into(),
+            items: e.items,
+            auto: e.auto,
+            units: e.units,
+            clause,
+        }
+    }
+}
+
 /// タグの編集画面の内容。
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]

@@ -143,6 +143,8 @@ export const commands = {
 	itemsSetFolders: (itemIds: number[], add: number[], remove: number[]) => typedError<null, AppError>(__TAURI_INVOKE("items_set_folders", { itemIds, add, remove })),
 	/**  入力に合うタグの候補（前方一致 → 部分一致、使われている数の多い順）。 */
 	tagsSuggest: (prefix: string, limit: number) => typedError<TagSuggestionDto[], AppError>(__TAURI_INVOKE("tags_suggest", { prefix, limit })),
+	/**  すべてのタグと、付いている数（タグの一覧の画面）。 */
+	tagsList: () => typedError<TagListEntryDto[], AppError>(__TAURI_INVOKE("tags_list")),
 	/**  アイテムに `add`（名前。なければ作る）を付け、`remove`（ID）を外す。付けたタグの ID を返す。 */
 	tagsApply: (itemIds: number[], add: string[], remove: number[]) => typedError<number[], AppError>(__TAURI_INVOKE("tags_apply", { itemIds, add, remove })),
 	/**  タグの編集画面の内容（別名・親・子を含む）。 */
@@ -996,6 +998,19 @@ export type TagDetailDto = {
 	aliases: string[],
 	parents: TagRefDto[],
 	children: TagRefDto[],
+};
+
+/**  タグの一覧の 1 行（タグの一覧の画面）。 */
+export type TagListEntryDto = {
+	tag: TagRefDto,
+	/**  付いているアイテムの数（ゴミ箱を除く）。 */
+	items: number,
+	/**  そのうち、ダウンロード・キャプチャで自動で付いたもの。 */
+	auto: number,
+	/**  付いているユニットの数。 */
+	units: number,
+	/**  このタグで絞り込む検索の条件（「作者:KR」など）。 */
+	clause: string,
 };
 
 /**  タグの変更（省略した項目は変えない。`color` の空文字は色を外す。`aliases`・`parents` は置き換え）。 */

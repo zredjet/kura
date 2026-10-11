@@ -5,7 +5,7 @@ use kura_core::time::now_ms;
 use tauri::State;
 
 use super::blocking;
-use crate::dto::{TagDetailDto, TagPatchDto, TagSuggestionDto};
+use crate::dto::{TagDetailDto, TagListEntryDto, TagPatchDto, TagSuggestionDto};
 use crate::error::AppError;
 use crate::state::AppState;
 
@@ -24,6 +24,23 @@ pub async fn tags_suggest(
             .library()
             .db()
             .read(|conn| tags::suggest(conn, &prefix, limit))?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    })
+    .await
+}
+
+/// すべてのタグと、付いている数（タグの一覧の画面）。
+#[tauri::command]
+#[specta::specta]
+pub async fn tags_list(state: State<'_, AppState>) -> Result<Vec<TagListEntryDto>, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        Ok(session
+            .library()
+            .db()
+            .read(tags::list_all)?
             .into_iter()
             .map(Into::into)
             .collect())
