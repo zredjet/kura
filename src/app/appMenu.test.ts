@@ -10,38 +10,54 @@ import { ja } from '../i18n/ja';
 import { useImportStore } from '../stores/importStore';
 import { useLibraryStore } from '../stores/libraryStore';
 import { useViewStore } from '../stores/viewStore';
-import { HELP_MENU_ID, WINDOW_MENU_ID, appMenuItems, selectAllCommand } from './appMenu';
+import {
+  HELP_MENU_ID,
+  type MenuAction,
+  WINDOW_MENU_ID,
+  acceleratorOf,
+  appMenuItems,
+  replayKey,
+  selectAllCommand,
+  viewItemOptions,
+} from './appMenu';
 
 type Item = MenuItemOptions | PredefinedMenuItemOptions | SubmenuOptions;
 
-function submenu(text: string): SubmenuOptions {
-  const found = (appMenuItems(() => {}) as Item[]).find((m) => 'text' in m && m.text === text);
+const STATE = { layout: 'justify', collapseUnits: false, sidebar: true } as const;
+
+function items(run: (action: MenuAction) => void = () => {}): Item[] {
+  return appMenuItems(run, viewItemOptions(run, STATE, 'test')) as Item[];
+}
+
+function submenu(text: string, run?: (action: MenuAction) => void): SubmenuOptions {
+  const found = items(run).find((m) => 'text' in m && m.text === text);
   if (!found || !('items' in found)) {
     throw new Error(`メニュー「${text}」がない`);
   }
   return found as SubmenuOptions;
 }
 
+function entry(menu: SubmenuOptions, text: string): MenuItemOptions {
+  const found = (menu.items as Item[]).find((i) => 'text' in i && i.text === text);
+  if (!found) {
+    throw new Error(`項目「${text}」がない`);
+  }
+  return found as MenuItemOptions;
+}
+
 describe('appMenuItems', () => {
-  it('編集の「すべてを選択」は ⌘A の自前の項目で、押すと渡した処理を呼ぶ', () => {
-    const onSelectAll = vi.fn();
-    const edit = (appMenuItems(onSelectAll) as Item[]).find(
-      (m) => 'text' in m && m.text === ja.appMenu.edit,
-    ) as SubmenuOptions;
-    const selectAll = (edit.items as Item[]).find(
-      (i) => 'text' in i && i.text === ja.appMenu.selectAll,
-    ) as MenuItemOptions;
+  it('編集の「すべてを選択」は ⌘A の自前の項目で、押すと selectAll を呼ぶ', () => {
+    const run = vi.fn();
+    const selectAll = entry(submenu(ja.appMenu.edit, run), ja.appMenu.selectAll);
 
     expect(selectAll.accelerator).toBe('CmdOrCtrl+A');
     expect('item' in selectAll).toBe(false);
     selectAll.action?.('');
-    expect(onSelectAll).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledWith({ kind: 'selectAll' });
   });
 
   it('既定の「すべてを選択」（selectAll:）はどこにも置かない', () => {
-    const all = (appMenuItems(() => {}) as Item[]).flatMap((m) =>
-      'items' in m ? ((m.items ?? []) as Item[]) : [m],
-    );
+    const all = items().flatMap((m) => ('items' in m ? ((m.items ?? []) as Item[]) : [m]));
     expect(all.some((i) => 'item' in i && i.item === 'SelectAll')).toBe(false);
     // 文字の編集に要る項目は既定のまま
     for (const kind of ['Undo', 'Redo', 'Cut', 'Copy', 'Paste'] as const) {
@@ -52,6 +68,66 @@ describe('appMenuItems', () => {
   it('ウインドウ・ヘルプのメニューは Tauri がそれと分かる ID を持つ', () => {
     expect(submenu(ja.appMenu.window).id).toBe(WINDOW_MENU_ID);
     expect(submenu(ja.appMenu.help).id).toBe(HELP_MENU_ID);
+  });
+
+  it('⌘ の付く操作はアクセラレータにし、押すとそのキーを押したことにする', () => {
+    const run = vi.fn();
+    const trash = entry(submenu(ja.appMenu.items, run), ja.appMenu.trash);
+    expect(trash.accelerator).toBe('CmdOrCtrl+Backspace');
+    trash.action?.('');
+    expect(run).toHaveBeenCalledWith({
+      kind: 'key',
+      spec: { key: 'Backspace', code: 'Backspace', meta: true },
+    });
+  });
+
+  it('1 文字のキーは表記だけ添えて、文字の入力を奪わない', () => {
+    const tag = entry(submenu(ja.appMenu.edit), `${ja.appMenu.addTag}（T）`);
+    expect(tag.accelerator).toBeUndefined();
+  });
+
+  it('表示形式は ⌘1〜⌘3 のチェック項目で、いまの形式にチェックが付く', () => {
+    const view = viewItemOptions(() => {}, { ...STATE, layout: 'grid' }, 'test');
+    expect(view.layouts.justify).toMatchObject({ accelerator: 'CmdOrCtrl+1', checked: false });
+    expect(view.layouts.grid).toMatchObject({ accelerator: 'CmdOrCtrl+2', checked: true });
+    expect(view.layouts.list).toMatchObject({ accelerator: 'CmdOrCtrl+3', checked: false });
+    expect(view.sidebar).toMatchObject({
+      text: ja.appMenu.hideSidebar,
+      accelerator: 'CmdOrCtrl+Alt+S',
+    });
+  });
+});
+
+describe('acceleratorOf', () => {
+  it('修飾キーの順に並べ、修飾キーがなければ付けない', () => {
+    expect(acceleratorOf({ key: 'g', code: 'KeyG', meta: true, shift: true })).toBe(
+      'CmdOrCtrl+Shift+G',
+    );
+    expect(acceleratorOf({ key: 'Enter', code: 'Enter', meta: true })).toBe('CmdOrCtrl+Enter');
+    expect(acceleratorOf({ key: '=', code: 'Equal', meta: true })).toBe('CmdOrCtrl+=');
+    expect(acceleratorOf({ key: 't', code: 'KeyT' })).toBeUndefined();
+  });
+});
+
+describe('replayKey', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('フォーカスのある要素からキーのイベントを送り、window まで届く', () => {
+    const button = document.createElement('button');
+    document.body.append(button);
+    button.focus();
+    const seen: KeyboardEvent[] = [];
+    const listener = (e: KeyboardEvent) => seen.push(e);
+    window.addEventListener('keydown', listener);
+
+    replayKey({ key: 's', code: 'KeyS', meta: true, alt: true });
+
+    window.removeEventListener('keydown', listener);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ key: 's', code: 'KeyS', metaKey: true, altKey: true });
+    expect(seen[0]?.target).toBe(button);
   });
 });
 
