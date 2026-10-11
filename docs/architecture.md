@@ -64,7 +64,7 @@
 | | `items_set_folders(itemIds, add, remove)` | フォルダへの所属の付け外し |
 | ユニット | `unit_detail(id)` / `units_list(filter, kind?, limit)` | インスペクタ用の詳細、選ぶための一覧（更新の新しい順） |
 | | `unit_create_set(name, itemIds)` / `unit_create_folder(name, folders)` | set は渡した順＝manual、表紙は先頭。folder は名前順 |
-| | `unit_update(id, patch)` | 名前・表紙・並び順・ユニット内シャッフル・画像の表示時間（0 で既定）。folder は manual にできない。評価・メモ・タグは `entries_update` で（メンバーにも付ける） |
+| | `unit_update(id, patch)` | 名前・表紙・並び順・逆順・ユニット内シャッフル・画像の表示時間（0 で既定）。folder は manual にできない。評価・メモ・タグは `entries_update` で（メンバーにも付ける） |
 | | `unit_add_items(id, itemIds)` / `unit_remove_items(id, itemIds)` / `unit_reorder(id, itemIds)` / `unit_set_folders(id, folders)` / `unit_delete(id)` | set のメンバーの追加・削除・並べ替え（並べ替えると manual になる）、folder の参照フォルダの置き換え、解除（アイテムは残る）。`docs/playlists.md` §2 |
 | スマートフォルダ | `smart_folders_list(withCounts?, utcOffsetMinutes)` / `smart_folder_save(name, query)` / `smart_folder_update(id, name?, query?)` / `smart_folder_delete(id)` | 条件は検索の文字列のまま保存（解析できない条件は保存しない）。件数は一致するアイテムの数 |
 | 検索 | `query_parse(text, view?, utcOffsetMinutes)` → `{ error?, clauses, counts? }` | ⌘K のチップ・件数・エラー表示用。`error` は位置（UTF-16）と理由、`clauses` はいちばん外側の AND の条件、`counts` は開いている一覧の中で一致する種類ごとの件数 |

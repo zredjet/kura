@@ -38,6 +38,7 @@
 | kind | `set` / `folder` | 必須 | 作成後は変更不可 |
 | cover_item_id | item? | 先頭メンバー | 表紙 |
 | order_mode | `manual` / `name` / `imported` / `captured` / `duration` | set: `manual`、folder: `name` | メンバーの並び順。`name` は自然順ソート（「2」<「10」） |
+| order_reverse | bool | false | 並び（`order_mode` で決めたもの）を逆にする（§2.2） |
 | inner_shuffle | bool | false | 再生時にユニット内をシャッフルするか |
 | image_duration_ms | int? | なし | このユニット内の画像の表示時間（漫画は長め、など） |
 | rating | 0–5 | 0 | ユニット自体の評価（0 は未評価） |
@@ -53,6 +54,7 @@
 - **set**：`unit_items` に登録されたアイテムを `order_mode` で並べる。`manual` のときは `unit_items.pos` の昇順。
 - **folder**：`unit_folders` に登録された各フォルダについて、`recursive = true` なら子孫フォルダも含めてメンバーを集め、和集合を取って重複を除き、`order_mode` で並べる。複数フォルダのときは、`unit_folders.pos` の順にフォルダごとに並べてからつなげる。
 - 並び順はいずれも昇順：`name` は名前（タイトル）の自然順、`imported` / `captured` は古い順、`duration` は短い順。不明は後ろ、同じなら ID の順。folder ユニットは `manual` を選べない（ADR-45）。
+- `order_reverse` なら、上で決めた並び全体を逆にする（folder の複数の参照フォルダは、フォルダの順も逆になる）。一覧・再生・書き出しのすべてで同じ並びを使う。逆にしても表紙は変えない（表紙を選んでいなければ、逆にする前の先頭）。逆順のまま手で並べ替えると、見えている並びのまま逆にして記録する（スイッチを戻すと、その並びの逆になる）。set に加えたメンバーは逆にする前の最後、つまり見えている並びの先頭に出る（ADR-130）。
 - ゴミ箱に入ったアイテムは常にメンバーから除く。
 - 1 つのアイテムが複数の set ユニットに属してもよい。
 - ユニットの中にユニットは入れられない（v1 ではネストなし。階層は folder ユニットの `recursive` で表す）。
