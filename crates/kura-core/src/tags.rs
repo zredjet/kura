@@ -541,6 +541,68 @@ pub fn delete(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// タグの一覧の 1 行（タグの一覧の画面）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagListEntry {
+    pub tag: TagRef,
+    /// 付いているアイテムの数（ゴミ箱を除く。押したときの絞り込みの件数と合う）。
+    pub items: i64,
+    /// そのうち、ダウンロード・キャプチャで自動で付いたもの（`item_tags.source`）。
+    pub auto: i64,
+    /// 付いているユニットの数。
+    pub units: i64,
+}
+
+/// すべてのタグと、付いている数（名前空間なしを後ろに、名前空間ごとに付いている数の多い順）。
+pub fn list_all(conn: &Connection) -> Result<Vec<TagListEntry>> {
+    // すべてのタグを数えるので、item_tags を 1 回まとめて読み（意図した全件の集計）、ゴミ箱の分だけ引く。
+    // ゴミ箱の分は、ゴミ箱のアイテムから先に引く（CROSS JOIN で順を決める。そうしないと item_tags を全部読む）。
+    // 10 万件・タグ 2,000 個で、items と突き合わせて数えると 158ms（ADR-126）
+    let mut stmt = conn.prepare_cached(
+        "SELECT t.id, t.namespace, t.name, t.color,
+                coalesce(c.items, 0) - coalesce(x.items, 0),
+                coalesce(c.auto, 0) - coalesce(x.auto, 0),
+                coalesce(u.units, 0)
+         FROM tags t
+         LEFT JOIN (
+           SELECT tag_id, count(*) AS items, sum(source IN ('download', 'capture')) AS auto
+           FROM item_tags GROUP BY tag_id
+         ) c ON c.tag_id = t.id
+         LEFT JOIN (
+           SELECT m.tag_id, count(*) AS items, sum(m.source IN ('download', 'capture')) AS auto
+           FROM items i CROSS JOIN item_tags m ON m.item_id = i.id
+           WHERE i.trashed_at IS NOT NULL
+           GROUP BY m.tag_id
+         ) x ON x.tag_id = t.id
+         LEFT JOIN (SELECT tag_id, count(*) AS units FROM unit_tags GROUP BY tag_id) u
+           ON u.tag_id = t.id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(TagListEntry {
+            tag: TagRef {
+                id: row.get(0)?,
+                namespace: row.get(1)?,
+                name: row.get(2)?,
+                color: row.get(3)?,
+            },
+            items: row.get(4)?,
+            auto: row.get(5)?,
+            units: row.get(6)?,
+        })
+    })?;
+    let mut out = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    out.sort_by(|a, b| {
+        a.tag
+            .namespace
+            .is_empty()
+            .cmp(&b.tag.namespace.is_empty())
+            .then_with(|| natural_cmp(&a.tag.namespace, &b.tag.namespace))
+            .then_with(|| b.items.cmp(&a.items))
+            .then_with(|| natural_cmp(&a.tag.name, &b.tag.name))
+    });
+    Ok(out)
+}
+
 /// 名前空間なしを後ろに、名前空間 → 名前の自然順で並べる（インスペクタの表示順）。
 pub fn display_order(a: &TagRef, b: &TagRef) -> Ordering {
     a.namespace
@@ -577,6 +639,52 @@ mod tests {
         .unwrap()
         .map(|r| r.unwrap())
         .collect()
+    }
+
+    #[test]
+    fn lists_every_tag_with_counts_and_auto_tags() {
+        let conn = test_conn();
+        for id in 1..=4 {
+            item(&conn, id);
+        }
+        conn.execute("UPDATE items SET trashed_at = 9 WHERE id = 4", [])
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO tags (id, namespace, name, created_at) VALUES
+               (1, '', '夕景', 0), (2, '作者', 'もりの', 0), (3, '作者', 'KR', 0),
+               (4, '', '使われていない', 0), (5, '場所', '鎌倉', 0);
+             INSERT INTO item_tags (tag_id, item_id, source) VALUES
+               (1, 1, 'download'), (1, 2, 'user'), (1, 4, 'download'),
+               (2, 1, 'download'), (3, 1, 'download'), (3, 2, 'capture'), (3, 3, 'user'),
+               (5, 2, 'import');
+             INSERT INTO units (id, kind, name, order_mode, created_at, updated_at) VALUES (1, 'set', 'u', 'manual', 0, 0);
+             INSERT INTO unit_tags (tag_id, unit_id) VALUES (5, 1);",
+        )
+        .unwrap();
+
+        let all = list_all(&conn).unwrap();
+        let rows: Vec<(String, i64, i64, i64)> = all
+            .iter()
+            .map(|e| {
+                (
+                    display(&e.tag.namespace, &e.tag.name),
+                    e.items,
+                    e.auto,
+                    e.units,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                // 名前空間ごとに、付いている数の多い順。名前空間なしは後ろ。ゴミ箱は数えない
+                ("作者:KR".to_string(), 3, 2, 0),
+                ("作者:もりの".to_string(), 1, 1, 0),
+                ("場所:鎌倉".to_string(), 1, 0, 1),
+                ("夕景".to_string(), 2, 1, 0),
+                ("使われていない".to_string(), 0, 0, 0),
+            ]
+        );
     }
 
     #[test]

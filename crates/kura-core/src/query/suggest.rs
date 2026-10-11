@@ -49,10 +49,24 @@ impl Suggestion {
 }
 
 /// 空白や記号を含む値は引用符で囲む。
+/// タグ 1 つを検索の条件にする（「作者:KR」「"夕方の 海"」。タグの一覧から絞り込むとき）。
+pub fn tag_clause(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        quote_if_needed(name)
+    } else {
+        format!("{namespace}:{}", quote_if_needed(name))
+    }
+}
+
 fn quote_if_needed(value: &str) -> String {
-    if value
-        .chars()
-        .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | '|' | '"'))
+    if value.starts_with('-')
+        || value.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '(' | ')' | '|' | '"' | ':' | '：' | '=' | '<' | '>' | '!'
+                )
+        })
     {
         format!("\"{}\"", value.replace('"', ""))
     } else {
@@ -343,5 +357,37 @@ mod tests {
             vec![(SuggestionKind::Value, "-ユニット:鎌倉".to_string())]
         );
         assert_eq!(inserts(&conn, "名前:"), vec![]);
+    }
+
+    #[test]
+    fn tag_clause_quotes_names_the_parser_would_misread() {
+        assert_eq!(tag_clause("", "夕景"), "夕景");
+        assert_eq!(tag_clause("作者", "KR"), "作者:KR");
+        assert_eq!(tag_clause("", "夕方の 海"), "\"夕方の 海\"");
+        assert_eq!(tag_clause("", "-逆"), "\"-逆\"");
+        assert_eq!(tag_clause("", "評価:5"), "\"評価:5\"");
+        // 名前空間付きなら、記号や空白を含む名前でもそのタグ 1 つの条件として読める
+        for name in ["a b", "Re:ゼロ", "-逆", "x=y"] {
+            let clause = tag_clause("作者", name);
+            match crate::query::parse(&clause).unwrap().expr {
+                crate::query::Expr::Tag(term) => {
+                    assert_eq!(
+                        (term.ns.as_str(), term.name.as_str()),
+                        ("作者", name),
+                        "{clause}"
+                    );
+                }
+                other => panic!("{clause} はタグの条件ではない: {other:?}"),
+            }
+        }
+        // 名前空間なしの普通の名前はそのまま語になる。記号や空白を含む名前は引用符で囲み、
+        // 解析は通る（引用符の語はいまは全文検索として読む）
+        assert!(matches!(
+            crate::query::parse(&tag_clause("", "夕景")).unwrap().expr,
+            crate::query::Expr::Tag(_)
+        ));
+        for name in ["夕方の 海", "Re:ゼロ", "-逆", "x=y"] {
+            assert!(crate::query::parse(&tag_clause("", name)).is_ok(), "{name}");
+        }
     }
 }
