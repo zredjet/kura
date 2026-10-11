@@ -4,6 +4,7 @@ import { useEffect } from 'react';
 import { Menu } from '../components/Menu/Menu';
 import { Notice } from '../components/Notice/Notice';
 import { Overlays } from '../components/Overlay/Overlays';
+import { startLoginShotEvents } from '../features/downloads/captureShot';
 import { DownloadsView } from '../features/downloads/DownloadsView';
 import { useDownloadsShortcut } from '../features/downloads/useDownloadsShortcut';
 import { DropOverlay } from '../features/import/DropOverlay';
@@ -34,6 +35,7 @@ export function App() {
   }, []);
 
   useEffect(() => (isTauri() ? startJobEvents() : undefined), []);
+  useEffect(() => (isTauri() ? startLoginShotEvents() : undefined), []);
 
   // 再生できる形式の表を Rust に渡す（プロキシの要否の判定に使う。docs/architecture.md §8）
   useEffect(() => {

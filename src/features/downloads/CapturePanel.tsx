@@ -17,10 +17,10 @@ import {
   snapshotLoginPage,
 } from '../../ipc/capture';
 import { formatCount } from '../../lib/format';
-import { reloadList } from '../../stores/jobsStore';
 import { notify } from '../../stores/noticeStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { relativeDateTime } from '../../lib/dates';
+import { reportSnapshot } from './captureShot';
 import { CaptureRuleSheet } from './CaptureRuleSheet';
 import { destLabel, fail } from './downloadActions';
 import styles from './Downloads.module.css';
@@ -171,20 +171,11 @@ export function CapturePanel() {
     }, fail);
   };
 
-  /** 撮ったら知らせて、一覧と件数を読み直す（ジョブを通らないので）。 */
+  /** 撮ったら知らせて、一覧と件数を読み直す。 */
   const shoot = (run: () => Promise<SnapshotResultDto>) => {
     setTaking(true);
     run()
-      .then((result) => {
-        const message =
-          result.added === 0
-            ? t.takenDuplicate(result.title)
-            : result.ruleName
-              ? t.takenWithRule(result.title, result.ruleName)
-              : t.taken(result.title);
-        notify(result.truncated ? `${message}${t.takenTruncated}` : message);
-        reloadList();
-      }, fail)
+      .then(reportSnapshot, fail)
       .finally(() => setTaking(false));
   };
   const take = () => shoot(snapshotBrowser);
@@ -226,6 +217,7 @@ export function CapturePanel() {
         <div className={styles.browserRow}>
           <span className={styles.browserUrl}>{t.loginRunning}</span>
           <span className={styles.sideText}>{t.loginHint}</span>
+          <span className={styles.sideText}>{t.loginShortcut}</span>
           <span className={styles.browserActions}>
             <button
               type="button"

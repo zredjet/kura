@@ -3,11 +3,19 @@ import {
   type CaptureRuleDto,
   type CaptureRuleInputDto,
   commands,
+  events,
+  type LoginShotEvent,
   type SnapshotResultDto,
 } from './bindings';
 import { unwrap } from './result';
 
-export type { CaptureModeDto, CaptureRuleDto, CaptureRuleInputDto, SnapshotResultDto };
+export type {
+  CaptureModeDto,
+  CaptureRuleDto,
+  CaptureRuleInputDto,
+  LoginShotEvent,
+  SnapshotResultDto,
+};
 
 /** キャプチャのルールを並び順に。 */
 export function listCaptureRules(): Promise<CaptureRuleDto[]> {
@@ -50,6 +58,11 @@ export function captureLoginStatus(): Promise<boolean> {
 /** ログイン用の Chrome の前面のタブを撮って入れる（`fullPage` ならページ全体）。 */
 export function snapshotLoginPage(fullPage: boolean): Promise<SnapshotResultDto> {
   return unwrap(commands.captureLoginSnapshot(fullPage));
+}
+
+/** ⌃⌥⌘C で撮った結果（`capture://login-shot`）を受け取る。戻り値で受け取りをやめる。 */
+export function onLoginShot(handler: (event: LoginShotEvent) => void): Promise<() => void> {
+  return events.captureLoginShot.listen((e) => handler(e.payload));
 }
 
 /** ログイン用の Chrome を閉じる。 */

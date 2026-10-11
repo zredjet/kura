@@ -764,6 +764,7 @@ export const ja = {
       loginRunning: 'ログイン用の Chrome を開いています（DevTools 接続中）',
       loginHint:
         '前面のタブを撮ります。URL がルールに一致すれば、その撮り方を使います。使い終わったら閉じてください。',
+      loginShortcut: '⌃⌥⌘C でも撮れます（ログイン用の Chrome を前面にして押します）',
       loginTake: 'このページを撮る',
       loginTakeFull: 'ページ全体を撮る',
       loginClose: '閉じる',
