@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 
 import { setRating } from '../library/actions';
 import { IMAGE_STEP_MS } from './PlayBar';
-import { cycleRepeat, playerController, toggleShuffle } from './playerActions';
+import { cycleRepeat, playerController, toggleFullscreen, toggleShuffle } from './playerActions';
 import { usePlayerStore } from './playerStore';
 
 /** 文字を入力している場所ではキー操作を奪わない。 */
@@ -76,8 +76,16 @@ export function handlePlayerKey(e: KeyboardEvent): boolean {
     case 'r':
       cycleRepeat();
       return true;
+    case 'f':
+      toggleFullscreen();
+      return true;
     case 'Escape':
-      store.setMode('mini');
+      // フルスクリーンならまずフルスクリーンを抜け、もう一度でライブラリへ（ADR-128）
+      if (store.fullscreen) {
+        toggleFullscreen();
+      } else {
+        store.setMode('mini');
+      }
       return true;
     default:
       break;

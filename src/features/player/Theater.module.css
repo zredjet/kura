@@ -1,6 +1,7 @@
 /*
- * Player.dc.html：黒地（--bg-theater）に余白 10px・間隔 10px。メディアの面は角丸 16px、
- * 上 76px・左右 24px・下 176px をあけて中央に置く。右にキュー（--w-queue）。
+ * Player.dc.html：黒地（--bg-theater）に余白 10px・間隔 10px。メディアの面は角丸 16px。右にキュー（--w-queue）。
+ * メディアは面いっぱいに置き、上の操作と再生バーはその上に重ねる。再生中にマウスを動かさなければ操作を隠し、
+ * フルスクリーンでは余白と角丸もなくす（ADR-128。モックの上 76px・下 176px の余白はやめた）。
  * ライブラリより上、ダイアログ（20）・通知（30）・メニュー（40）より下に重ねる。
  */
 
@@ -24,13 +25,51 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  padding: 76px var(--space-6) 176px;
   border-radius: var(--radius-xl);
   overflow: hidden;
   background: var(--bg-media);
 }
 
-/* 上部：戻る・見出し・切り替え。左は信号機の分をあける */
+.theater[data-fullscreen] {
+  padding: 0;
+}
+
+.theater[data-fullscreen] .stage {
+  border-radius: 0;
+}
+
+/* 上の操作の文字が明るいメディアの上でも読めるよう、上端に薄い暗幕 */
+.shade {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: calc(var(--space-6) * 5);
+  background: linear-gradient(var(--scrim), transparent);
+  pointer-events: none;
+}
+
+/* 再生中にマウスを動かさなければ、操作と暗幕を消し、ポインタも隠す（「視差効果を減らす」では動かさず切り替える） */
+.shade,
+.top,
+.bgm,
+.chrome {
+  transition: opacity var(--dur-base) var(--ease-out);
+}
+
+.stage[data-idle] {
+  cursor: none;
+}
+
+.stage[data-idle] .shade,
+.stage[data-idle] .top,
+.stage[data-idle] .bgm,
+.stage[data-idle] .chrome {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* 上部：戻る・見出し・フルスクリーン・切り替え。左は信号機の分をあける（フルスクリーンでは信号機がない） */
 .top {
   position: absolute;
   top: var(--space-3);
@@ -39,6 +78,10 @@
   display: flex;
   align-items: center;
   gap: var(--space-3);
+}
+
+.theater[data-fullscreen] .top {
+  left: var(--space-3);
 }
 
 .back {
@@ -109,7 +152,7 @@
   color: var(--text-on-media);
 }
 
-/* メディア：上下左右の余白の中で、縦横比を保って最大に */
+/* メディア：面いっぱいに、縦横比を保って最大に */
 .media {
   position: relative;
   flex: 1;

@@ -19,6 +19,8 @@ import { useSidebarStore } from '../../stores/sidebarStore';
 import { PlaybackController } from './engine/PlaybackController';
 import { type PlayerSnapshot, type Queue, realClock, type RepeatMode } from './engine/types';
 import { usePlayerStore } from './playerStore';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 /** 設定（音量など）を保存するまで待つ時間。 */
 const SAVE_DELAY_MS = 500;
@@ -302,4 +304,52 @@ export function updatePlayerPrefs(patch: Partial<PlayerPrefsDto>): void {
       console.warn('再生の設定を保存できませんでした', error),
     );
   }, SAVE_DELAY_MS);
+}
+
+/**
+ * ウィンドウのフルスクリーンを見張る（シアターのボタン・F・緑のボタン・メニューのどれで変えても）。
+ * 入ったらシアターの右のパネルを閉じ、出たら戻す（ADR-128）。戻り値で止める。
+ */
+export function watchFullscreen(): () => void {
+  const win = getCurrentWindow();
+  let stopped = false;
+  let unlisten: (() => void) | null = null;
+  const sync = () => {
+    win.isFullscreen().then(
+      (on) => {
+        const changed = usePlayerStore.getState().fullscreen !== on;
+        usePlayerStore.getState().setFullscreen(on);
+        // フルスクリーンを抜けると、キーボードのフォーカスが WebView から外れる（esc が届かない）ので戻す
+        if (changed) {
+          getCurrentWebview()
+            .setFocus()
+            .catch(() => undefined);
+        }
+      },
+      () => undefined,
+    );
+  };
+  sync();
+  win
+    .onResized(sync)
+    .then((stop) => {
+      if (stopped) {
+        stop();
+      } else {
+        unlisten = stop;
+      }
+    })
+    .catch((error: unknown) => console.warn('ウィンドウの大きさを見張れませんでした', error));
+  return () => {
+    stopped = true;
+    unlisten?.();
+  };
+}
+
+/** フルスクリーンを切り替える（シアターのボタン・F）。 */
+export function toggleFullscreen(): void {
+  const on = !usePlayerStore.getState().fullscreen;
+  getCurrentWindow()
+    .setFullscreen(on)
+    .catch((error: unknown) => notify(error instanceof Error ? error.message : String(error)));
 }

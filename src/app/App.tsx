@@ -19,7 +19,7 @@ import { SettingsSheet } from '../features/settings/SettingsSheet';
 import { TagDialog } from '../features/tags/TagDialog';
 import { TagsView } from '../features/tags/TagsView';
 import { Welcome } from '../features/welcome/Welcome';
-import { closePlayer, loadPlayerPrefs } from '../features/player/playerActions';
+import { closePlayer, loadPlayerPrefs, watchFullscreen } from '../features/player/playerActions';
 import { reportPlaybackSupport } from '../features/player/support';
 import { Theater } from '../features/player/Theater';
 import { useDownloadsStore } from '../stores/downloadsStore';
@@ -38,6 +38,7 @@ export function App() {
 
   useEffect(() => (isTauri() ? startJobEvents() : undefined), []);
   useEffect(() => (isTauri() ? startLoginShotEvents() : undefined), []);
+  useEffect(() => (isTauri() ? watchFullscreen() : undefined), []);
 
   // 再生できる形式の表を Rust に渡す（プロキシの要否の判定に使う。docs/architecture.md §8）
   useEffect(() => {

@@ -1,9 +1,11 @@
-import { type ReactNode, useCallback, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
+import { ExpandIcon } from '../../components/icons/ExpandIcon';
 import { InfoIcon } from '../../components/icons/InfoIcon';
 import { InspectorIcon } from '../../components/icons/InspectorIcon';
 import { MusicIcon } from '../../components/icons/MusicIcon';
+import { ShrinkIcon } from '../../components/icons/ShrinkIcon';
 import { TagIcon } from '../../components/icons/TagIcon';
 import { Waveform } from '../../components/icons/Waveform';
 import { ja } from '../../i18n/ja';
@@ -11,46 +13,138 @@ import type { ItemSummaryDto } from '../../ipc/items';
 import { playUrl, thumbUrl } from '../../ipc/media';
 import { formatCount, formatDuration } from '../../lib/format';
 import { PlayBar } from './PlayBar';
-import { closePlayer, openCurrentExternally, playerController } from './playerActions';
+import {
+  closePlayer,
+  openCurrentExternally,
+  playerController,
+  toggleFullscreen,
+} from './playerActions';
 import { usePlayerStore } from './playerStore';
 import { SidePanel } from './SidePanel';
+import { canHideControls, HIDE_AFTER_MS } from './theaterChrome';
 import styles from './Theater.module.css';
 import { usePlayerKeys } from './usePlayerKeys';
 
 const t = ja.player;
 
+/** 文字を入力している場所か。 */
+function isTyping(el: Element | null): boolean {
+  return (
+    el instanceof HTMLElement &&
+    (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName))
+  );
+}
+
 /**
- * シアター（Player.dc.html）：黒地にメディアを中央に置き、上に戻る・見出し、下に再生バー、右にキュー。
+ * 再生中にマウスを 3 秒動かさなければ操作を隠す（ADR-128）。マウス・キー・ホイールで戻す。
+ * 隠してよいかは、一時停止・ポインタやフォーカスが操作の上・メニュー・入力中を見て決める（`canHideControls`）。
+ */
+function useControlsIdle(visible: boolean): {
+  idle: boolean;
+  onPointerEnter: () => void;
+  onPointerLeave: () => void;
+} {
+  const playing = usePlayerStore((s) => s.snapshot.playing);
+  const [idle, setIdle] = useState(false);
+  const hovering = useRef(false);
+  useEffect(() => {
+    if (!visible || !playing) {
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const focused = document.activeElement;
+        const hide = canHideControls({
+          playing: true,
+          hovering: hovering.current,
+          focusInControls:
+            focused instanceof HTMLElement && focused.closest('[data-chrome]') !== null,
+          menuOpen: document.querySelector('[data-sheet], [role="menu"]') !== null,
+          typing: isTyping(focused),
+        });
+        if (hide) {
+          setIdle(true);
+        } else {
+          schedule();
+        }
+      }, HIDE_AFTER_MS);
+    };
+    const wake = () => {
+      setIdle(false);
+      schedule();
+    };
+    schedule();
+    const events = ['mousemove', 'pointerdown', 'keydown', 'wheel'] as const;
+    events.forEach((name) => window.addEventListener(name, wake, { passive: true }));
+    return () => {
+      clearTimeout(timer);
+      events.forEach((name) => window.removeEventListener(name, wake));
+      // 一時停止・閉じたら出し直す
+      setIdle(false);
+    };
+  }, [visible, playing]);
+  return {
+    idle: idle && visible && playing,
+    onPointerEnter: () => {
+      hovering.current = true;
+    },
+    onPointerLeave: () => {
+      hovering.current = false;
+    },
+  };
+}
+
+/**
+ * シアター（Player.dc.html）：黒地にメディアを置き、上に戻る・見出し、下に再生バー、右にキュー。
+ * 操作はメディアの上に重ね、再生中はマウスを動かさなければ隠す。フルスクリーンでは右のパネルを閉じる（ADR-128）。
  * 再生キューがあるあいだは隠しても残しておく（`<video>` を DOM から外すと再生が止まるため）。
  */
 export function Theater() {
   const active = usePlayerStore((s) => s.active);
   const mode = usePlayerStore((s) => s.mode);
   const panel = usePlayerStore((s) => s.panel);
+  const fullscreen = usePlayerStore((s) => s.fullscreen);
   const visible = active && mode === 'theater';
   usePlayerKeys(visible);
+  const { idle, onPointerEnter, onPointerLeave } = useControlsIdle(visible);
+  const chrome = { 'data-chrome': '', onPointerEnter, onPointerLeave };
 
   return (
     <div
       className={styles.theater}
       hidden={!visible}
       data-theater={visible ? '' : undefined}
+      data-fullscreen={fullscreen || undefined}
       aria-label={t.label}
       role="region"
     >
-      <section className={styles.stage} aria-label={t.label}>
-        {visible && <TopBar />}
+      <section className={styles.stage} aria-label={t.label} data-idle={idle || undefined}>
         <Stage />
+        {visible && <div className={styles.shade} aria-hidden="true" />}
+        {visible && <TopBar chrome={chrome} />}
         {visible && <BgmPill />}
-        {visible && <PlayBar />}
+        {visible && (
+          <div className={styles.chrome} {...chrome}>
+            <PlayBar />
+          </div>
+        )}
       </section>
       {visible && panel !== null && <SidePanel panel={panel} />}
     </div>
   );
 }
 
-/** 上部：戻る・見出し・右パネルの切り替え。 */
-function TopBar() {
+interface ChromeProps {
+  'data-chrome': string;
+  onPointerEnter: () => void;
+  onPointerLeave: () => void;
+}
+
+/** 上部：戻る・見出し・フルスクリーン・右パネルの切り替え。 */
+function TopBar({ chrome }: { chrome: ChromeProps }) {
+  const fullscreen = usePlayerStore((s) => s.fullscreen);
   const title = usePlayerStore((s) => s.title);
   const snapshot = usePlayerStore((s) => s.snapshot);
   const shuffle = usePlayerStore((s) => s.queue?.playlist?.shuffle ?? s.shuffle);
@@ -61,7 +155,7 @@ function TopBar() {
   const setMode = usePlayerStore((s) => s.setMode);
 
   return (
-    <div className={styles.top} data-tauri-drag-region>
+    <div className={styles.top} data-tauri-drag-region {...chrome}>
       <button
         type="button"
         className={styles.back}
@@ -88,6 +182,19 @@ function TopBar() {
             .join(' · ')}
         </span>
       </div>
+      <button
+        type="button"
+        className={styles.back}
+        aria-label={fullscreen ? t.exitFullscreen : t.fullscreen}
+        title={`${fullscreen ? t.exitFullscreen : t.fullscreen}（F）`}
+        onClick={toggleFullscreen}
+      >
+        {fullscreen ? (
+          <ShrinkIcon size={15} strokeWidth={2} />
+        ) : (
+          <ExpandIcon size={15} strokeWidth={2} />
+        )}
+      </button>
       <div className={styles.segments} role="group" aria-label={t.panels}>
         <button
           type="button"

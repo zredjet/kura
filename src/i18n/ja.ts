@@ -660,6 +660,8 @@ export const ja = {
     pickFilter: '画像・動画・音楽',
   },
   player: {
+    fullscreen: 'フルスクリーンにする',
+    exitFullscreen: 'フルスクリーンを解除',
     label: '再生中',
     miniLabel: 'ミニプレーヤー',
     play: '再生',

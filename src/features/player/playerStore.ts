@@ -2,6 +2,7 @@ import { create } from 'zustand';
 
 import type { PlayerPrefsDto, PlaySourceDto } from '../../ipc/player';
 import type { PlayerSnapshot, Queue } from './engine/types';
+import { onFullscreenChange } from './theaterChrome';
 
 /** シアター（全画面）か、ライブラリの上のミニプレーヤーか。 */
 export type PlayerMode = 'theater' | 'mini';
@@ -56,6 +57,10 @@ interface PlayerState {
   prefs: PlayerPrefsDto;
   /** タグの入力に移るよう頼まれたか（シアターの T・「タグを編集」）。 */
   focusTags: number;
+  /** ウィンドウがフルスクリーンか（シアターの操作とパネルの出し方に使う。ADR-128）。 */
+  fullscreen: boolean;
+  /** フルスクリーンに入る前のパネル（出たら戻す）。 */
+  panelBeforeFullscreen: PlayerPanel | undefined;
   open: (queue: Queue, title: string, source: PlaySourceDto, shuffle: boolean) => void;
   /** キューを作り直した（同じ元から）。 */
   replaceQueue: (queue: Queue, shuffle: boolean) => void;
@@ -67,6 +72,8 @@ interface PlayerState {
   addHistory: (itemId: number) => void;
   setPrefs: (prefs: PlayerPrefsDto) => void;
   requestTagFocus: () => void;
+  /** ウィンドウのフルスクリーンが変わった（入ったらパネルを閉じ、出たら戻す）。 */
+  setFullscreen: (on: boolean) => void;
 }
 
 export const usePlayerStore = create<PlayerState>((set) => ({
@@ -82,6 +89,8 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   history: [],
   prefs: DEFAULT_PREFS,
   focusTags: 0,
+  fullscreen: false,
+  panelBeforeFullscreen: undefined,
   open: (queue, title, source, shuffle) =>
     set({ active: true, mode: 'theater', title, source, shuffle, queue, history: [] }),
   replaceQueue: (queue, shuffle) => set({ queue, shuffle }),
@@ -96,4 +105,15 @@ export const usePlayerStore = create<PlayerState>((set) => ({
     })),
   setPrefs: (prefs) => set({ prefs }),
   requestTagFocus: () => set((s) => ({ panel: 'info', focusTags: s.focusTags + 1 })),
+  setFullscreen: (on) =>
+    set((s) => {
+      const next = onFullscreenChange(s, on);
+      return next === s
+        ? {}
+        : {
+            fullscreen: next.fullscreen,
+            panel: next.panel,
+            panelBeforeFullscreen: next.panelBeforeFullscreen,
+          };
+    }),
 }));
