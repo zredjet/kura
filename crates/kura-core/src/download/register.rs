@@ -133,6 +133,27 @@ fn is_format_fragment(stem: &str) -> bool {
     })
 }
 
+/// どこから来たか（`item_tags.source` と、まとめたときの `units.origin`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Download,
+    Capture,
+}
+
+impl Origin {
+    fn tag_source(self) -> &'static str {
+        match self {
+            Self::Download => "download",
+            Self::Capture => "capture",
+        }
+    }
+
+    /// units.origin（キャプチャはユニットを作らないので、作るときはダウンロード扱い）。
+    fn unit_origin(self) -> &'static str {
+        "download"
+    }
+}
+
 /// 入れたときの数。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Registered {
@@ -192,6 +213,7 @@ pub fn write_entries(
     tx: &Connection,
     entries: Vec<(Downloaded, PlaceOutcome)>,
     dest_folder_id: Option<i64>,
+    origin: Origin,
 ) -> Result<Registered> {
     let now = crate::time::now_ms();
     let mut out = Registered::default();
@@ -265,7 +287,7 @@ pub fn write_entries(
                     id
                 }
             };
-            add_tag(tx, tag_id, item_id, "download")?;
+            add_tag(tx, tag_id, item_id, origin.tag_source())?;
         }
         let mut unit_id = None;
         if let Some(group) = &meta.group {
@@ -282,7 +304,7 @@ pub fn write_entries(
                         _ => create_unit(
                             tx,
                             &nfc(&group.name),
-                            "download",
+                            origin.unit_origin(),
                             group.source_url.as_deref(),
                             now,
                         )?,
@@ -463,6 +485,7 @@ mod tests {
                 entry(2, meta("100", 2, true)),
             ],
             Some(9),
+            Origin::Download,
         )
         .unwrap();
         assert_eq!((out.added, out.duplicates, out.tags), (2, 0, 2));
@@ -540,6 +563,7 @@ mod tests {
                 entry(3, meta("100", 3, true)),
             ],
             None,
+            Origin::Download,
         )
         .unwrap();
         assert_eq!((again.added, again.duplicates), (1, 1));
@@ -571,7 +595,13 @@ mod tests {
         .unwrap();
         conn.execute("UPDATE items SET trashed_at = 2 WHERE id = ?1", [id])
             .unwrap();
-        let out = write_entries(&conn, vec![entry(5, meta("7", 1, false))], None).unwrap();
+        let out = write_entries(
+            &conn,
+            vec![entry(5, meta("7", 1, false))],
+            None,
+            Origin::Download,
+        )
+        .unwrap();
         assert_eq!(
             (out.added, out.duplicates, out.item_ids.clone()),
             (0, 1, vec![id])

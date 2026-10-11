@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use super::Library;
 use super::integrity::{IntegrityReport, check_files, clean_staging};
 use crate::Result;
+use crate::capture::CaptureHandler;
 use crate::download::{DownloadHandler, work_dir_name};
 use crate::import::ImportHandler;
 use crate::jobs::{JobKind, JobManager};
@@ -71,6 +72,10 @@ impl LibrarySession {
                 (
                     JobKind::Download,
                     Arc::new(DownloadHandler::new(backend.clone())),
+                ),
+                (
+                    JobKind::Capture,
+                    Arc::new(CaptureHandler::new(backend.clone())),
                 ),
                 (JobKind::Thumbnail, Arc::new(ThumbnailHandler::new(backend))),
                 (

@@ -541,6 +541,8 @@ pub struct LibraryCounts {
     pub unsorted: i64,
     pub untagged: i64,
     pub trash: i64,
+    /// キャプチャで取り込んだもの（ゴミ箱を除く）。
+    pub captures: i64,
 }
 
 /// サイドバーの件数（`recent_since` 以降の追加を「最近の取り込み」と数える）。
@@ -553,7 +555,8 @@ pub fn counts(conn: &Connection, recent_since: i64) -> Result<LibraryCounts> {
               AND NOT EXISTS (SELECT 1 FROM item_folders m WHERE m.item_id = items.id)),
            (SELECT count(*) FROM items WHERE trashed_at IS NULL
               AND NOT EXISTS (SELECT 1 FROM item_tags m WHERE m.item_id = items.id)),
-           (SELECT count(*) FROM items WHERE trashed_at IS NOT NULL)",
+           (SELECT count(*) FROM items WHERE trashed_at IS NOT NULL),
+           (SELECT count(*) FROM items WHERE trashed_at IS NULL AND source_site = 'capture')",
     )?;
     Ok(stmt.query_row([recent_since], |row| {
         Ok(LibraryCounts {
@@ -562,6 +565,7 @@ pub fn counts(conn: &Connection, recent_since: i64) -> Result<LibraryCounts> {
             unsorted: row.get(2)?,
             untagged: row.get(3)?,
             trash: row.get(4)?,
+            captures: row.get(5)?,
         })
     })?)
 }
@@ -1245,7 +1249,8 @@ mod tests {
                 recent: 2,
                 unsorted: 2,
                 untagged: 4,
-                trash: 1
+                trash: 1,
+                captures: 0
             }
         );
     }

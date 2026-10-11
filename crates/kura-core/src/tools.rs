@@ -16,12 +16,33 @@ use serde::Serialize;
 /// 探す場所（Apple Silicon と Intel の Homebrew）。
 pub const SEARCH_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 
-/// 状態を表示するツール（docs/architecture.md §9。deno は yt-dlp が YouTube で使う）。
-pub const KNOWN_TOOLS: [&str; 6] = ["yt-dlp", "gallery-dl", "deno", "ffmpeg", "ffprobe", "mpv"];
+/// 状態を表示するツール（docs/architecture.md §9・§10。deno は yt-dlp が YouTube で使う。
+/// chrome はキャプチャ用の Google Chrome）。
+pub const KNOWN_TOOLS: [&str; 7] = [
+    "yt-dlp",
+    "gallery-dl",
+    "deno",
+    "ffmpeg",
+    "ffprobe",
+    "chrome",
+    "mpv",
+];
 
 /// ツールの場所の指定を変えるテストを順に動かすための錠（指定はアプリ全体で 1 つ）。
 #[cfg(test)]
 pub(crate) static TEST_TOOLS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn defaults() -> &'static RwLock<BTreeMap<String, PathBuf>> {
+    static DEFAULTS: OnceLock<RwLock<BTreeMap<String, PathBuf>>> = OnceLock::new();
+    DEFAULTS.get_or_init(|| RwLock::new(BTreeMap::new()))
+}
+
+/// PATH にないツールの既定の場所（Google Chrome のアプリの中など。kura-mac が見つけて渡す）。
+pub fn set_default_location(name: &str, path: PathBuf) {
+    if let Ok(mut map) = defaults().write() {
+        map.insert(name.to_string(), path);
+    }
+}
 
 fn overrides() -> &'static RwLock<BTreeMap<String, PathBuf>> {
     static OVERRIDES: OnceLock<RwLock<BTreeMap<String, PathBuf>>> = OnceLock::new();
@@ -40,9 +61,17 @@ pub fn override_for(name: &str) -> Option<PathBuf> {
     overrides().read().ok()?.get(name).cloned()
 }
 
-/// ツールを探す（設定での指定 → Homebrew の場所 → PATH の順）。見つからなければ None。
+/// ツールを探す（設定での指定 → 既定の場所 → Homebrew の場所 → PATH の順）。見つからなければ None。
 pub fn find(name: &str) -> Option<PathBuf> {
     if let Some(path) = override_for(name).filter(|p| is_executable(p)) {
+        return Some(path);
+    }
+    if let Some(path) = defaults()
+        .read()
+        .ok()
+        .and_then(|m| m.get(name).cloned())
+        .filter(|p| is_executable(p))
+    {
         return Some(path);
     }
     let from_path = std::env::var_os("PATH")
@@ -133,8 +162,8 @@ fn parse_version(name: &str, line: &str) -> Option<String> {
     }
     let words: Vec<&str> = line.split_whitespace().collect();
     let version = match name {
-        // 「ffmpeg version 8.0.1 Copyright …」
-        "ffmpeg" | "ffprobe" => words.get(2).copied(),
+        // 「ffmpeg version 8.0.1 Copyright …」「Google Chrome 155.0.8059.39」
+        "ffmpeg" | "ffprobe" | "chrome" => words.get(2).copied(),
         // 「deno 2.9.7 (stable, …)」「mpv v0.40.0 Copyright …」
         "deno" | "mpv" => words.get(1).copied(),
         _ => words.first().copied(),
@@ -290,8 +319,9 @@ fn read_lines(
     })
 }
 
-/// プロセスグループに SIGTERM を送り、5 秒待っても終わらなければ SIGKILL にする。
-fn terminate_group(child: &mut Child) {
+/// プロセスグループに SIGTERM を送り、5 秒待っても終わらなければ SIGKILL にする
+/// （`process_group(0)` で起動したものに使う）。
+pub fn terminate_group(child: &mut Child) {
     let group = format!("-{}", child.id());
     let signal = |sig: &str| {
         let _ = Command::new("kill")

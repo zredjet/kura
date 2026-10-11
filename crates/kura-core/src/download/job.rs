@@ -20,7 +20,7 @@ use super::args::{
 use super::detect::{Detection, Tool};
 use super::meta::TagPolicy;
 use super::progress::{Progress, parse_line};
-use super::register::{Collect, collect, place_all, write_entries};
+use super::register::{Collect, Origin, collect, place_all, write_entries};
 use crate::jobs::{
     Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, save_partial,
 };
@@ -214,7 +214,7 @@ impl JobHandler for DownloadHandler {
             let dest = input.options.dest_folder_id;
             let (id, before) = (ctx.id(), state.clone());
             let (state_after, registered) = ctx.library().db().write(move |tx| {
-                let registered = write_entries(tx, entries, dest)?;
+                let registered = write_entries(tx, entries, dest, Origin::Download)?;
                 let mut state = before;
                 state.files += registered.added + registered.duplicates;
                 state.added += registered.added;
