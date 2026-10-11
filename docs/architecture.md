@@ -53,7 +53,7 @@
 | | `items_get(ids)` → `ItemSummary[]` / `units_get(ids)` → `UnitSummary[]` | 最大 200 件。要求した順で返し、ないものは省く |
 | | `item_detail(id)` → `ItemDetail` | タグ・フォルダ・ユニット（set のメンバー、または参照フォルダに入っている folder ユニット）・取得元を含む |
 | | `items_selection_info(ids)` → `SelectionInfo` | 複数選択のインスペクタ用：評価とメモ（全件が同じときだけ）、タグとフォルダ（付いている件数付き） |
-| | `library_counts()` → `{ all, recent, unsorted, untagged, trash }` | サイドバーの件数。グリッドを出したあとに別に取る（NFR-01 に響かないように） |
+| | `library_counts()` → `{ all, recent, unsorted, untagged, trash, captures }` | サイドバーの件数。グリッドを出したあとに別に取る（NFR-01 に響かないように） |
 | 編集 | `items_update(ids, patch)` | タイトル（1 件のときだけ）・評価・メモ（全件に同じ値）。メモの空文字は消す |
 | | `items_trash(ids)` / `items_restore(ids)` → 件数 / `trash_empty()` → `{ items, bytes, failed }` | ゴミ箱。空にするときは DB の行を先に消し、そのあと実ファイル・サムネイル・ジャケット・プロキシを消す（ADR-46） |
 | タグ | `tags_suggest(prefix, limit)` → `{ tag, count, alias }[]` | 前方一致 → 部分一致、使われている数の多い順。「名前空間:名前」なら名前空間で絞る。別名でも一致する |
@@ -90,7 +90,9 @@
 | | `downloads_list(limit?)` → `DownloadJob[]` | ダウンロードのジョブを新しい順に（URL・サイト・ツール・題名・件数・入れたアイテムとユニット） |
 | | `download_prefs_get()` / `download_prefs_set(prefs)` | Cookie の読み込み元と規則（app.json。規則の正規表現と引数を確かめる。ADR-99） |
 | ジョブ | `job_retry(id)` / `job_prioritize(id)` / `job_log(id)` → 文字 | 再試行・先に取得・ログの末尾 256KB（ADR-103） |
-| キャプチャ | `capture_rules_*` / `capture_run(url, rule_id?)` → `JobId` / `browser_open(url)` / `browser_snapshot(label)` | |
+| キャプチャ | `capture_rules_list()` / `capture_rule_save(id?, rule)` / `capture_rule_delete(id)` / `capture_rules_reorder(ids)` | ルール（名前・URL パターン・撮り方・対象・非表示・幅・スクロール・待ち・保存先・有効）。保存のときに確かめる（http(s) のパターン、要素のみなら対象が要る、幅 320〜3840） |
+| | `capture_run(url, ruleId)` → JobId / `capture_login(url?)` | 撮影のジョブを積む（`download_detect` の `capture` に一致したルールが入る）。ログイン用に同じプロファイルの Chrome を開く |
+| | `browser_open(url)` / `browser_status()` → URL? / `browser_close()` / `browser_snapshot()` → `{ title, url, itemIds, added }` | 見たままキャプチャ（アプリ内ブラウザ。ADR-109） |
 | ツール | `tools_status()` → `ToolInfo[]` / `tools_set_path(tool, path?)` / `tools_update()` → `{ brewCommand?, outputs }` | 版・場所・Homebrew 版か。場所の指定（app.json）。「更新を確認」（ADR-100） |
 | 設定 | `settings_get(keys)` / `settings_set(map)` | |
 | 外観 | `appearance_get()` → `Appearance` | OS の表示設定（「透明度を下げる」）。起動時に `<html data-reduce-transparency>` へ反映する（§11） |
@@ -229,14 +231,22 @@ import_start:    ジョブとして実行
 
 ## 10. キャプチャ
 
-- **ルールで自動キャプチャ**：chromiumoxide（Rust の CDP クライアント）でインストール済みの Google Chrome をヘッドレス起動する。プロファイルは `~/Library/Application Support/<bundle id>/capture-profile`。
+- **ルールで自動キャプチャ**：インストール済みの Google Chrome をアプリ専用のプロファイル（`~/Library/Application Support/<bundle id>/capture-profile`）でヘッドレス起動し、DevTools（CDP）で操作する。CDP のクライアントは tungstenite で作った小さなもの（ADR-104。当初は chromiumoxide）。
   1. ルールの `viewport_width` で開く → `wait_ms` 待つ（または対象セレクタの出現）
-  2. `hide_selectors` を CSS で非表示にする
+  2. `hide_selectors` を非表示にする
   3. `scroll_times` 回スクロールして遅延読み込みを発火させ、先頭に戻す
   4. `element`：対象要素の範囲を clip して撮影。`full_page`：`captureBeyondViewport` でページ全体。`viewport`：表示範囲
   5. PNG を staging に保存 → 取り込み（タグ `キャプチャ`、`サイト:<ホスト>`、source_url）
 - **ログイン**：「ログイン用に開く」で同じプロファイルの Chrome を画面ありで起動し、ユーザーにログインしてもらう。
 - **見たままキャプチャ**：アプリ内の別ウィンドウ（WebviewWindow）でページを開き、ボタンで WKWebView の `takeSnapshot` を呼んで表示範囲を保存する（v1 は表示範囲のみ）。
+
+### 10.1 実装（M8）
+
+- **ルール**（`kura_core::capture::rules`）：`capture_rules` の CRUD と並べ替え。URL パターンの `*` は `/` を含む任意の文字列（大文字小文字は区別しない）。URL の欄ではキャプチャのルールをダウンロードより先に見る（ADR-105）。
+- **ジョブ**（`kind = 'capture'`、同時に 1 つ）：Chrome を `--headless --remote-debugging-port=0` で起動 → プロファイルの `DevToolsActivePort` の 127.0.0.1 に接続 → 新しいページを作って手順 1〜4（`capture::shoot`。ADR-108）→ Chrome をプロセスグループごと止める → PNG を取り込みと同じ方法で配置して登録（`item_tags.source = 'capture'`、`source_site = 'capture'`）。ルールの `last_run_at` / `last_status`（`ok` / `failed`）も記録する。ログイン用の Chrome がプロファイルを使っていれば撮らない。
+- **見たままキャプチャ**：`browser_open` でラベル `capture-browser` のウィンドウを開く（アプリの権限なし、http / https だけ）。`browser_snapshot` で Swift の `kura_snapshot_webview` が PNG を書き、その場で登録する（ADR-109）。
+- **セキュリティ**：ADR-107。
+- **確認**：`cargo test -p kura-core capture -- --ignored` で、127.0.0.1 の小さなページを本物の Chrome で撮る（要素のみ・ページ全体・表示範囲）。
 
 ## 11. ウィンドウと macOS 固有の設定
 

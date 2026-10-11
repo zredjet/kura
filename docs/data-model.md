@@ -291,7 +291,7 @@ CREATE TABLE capture_rules (
   dest_folder_id    INTEGER REFERENCES folders(id) ON DELETE SET NULL,
   enabled           INTEGER NOT NULL DEFAULT 1,
   last_run_at       INTEGER,
-  last_status       TEXT,
+  last_status       TEXT,                           -- 'ok' / 'failed'（M8）
   pos               REAL    NOT NULL
 );
 
