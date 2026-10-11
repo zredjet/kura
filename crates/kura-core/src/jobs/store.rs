@@ -200,6 +200,25 @@ pub fn save_partial(
     Ok(())
 }
 
+/// 失敗・中止したジョブを `queued` に戻す（再試行）。戻したら true。
+pub fn requeue(conn: &Connection, id: JobId) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(
+        "UPDATE jobs SET state = 'queued', error_code = NULL, finished_at = NULL, message = NULL
+         WHERE id = ?1 AND state IN ('failed', 'canceled')",
+    )?;
+    Ok(stmt.execute([id])? > 0)
+}
+
+/// 待っているジョブの優先度を、同じ種類のどれよりも高くする。変えたら true。
+pub fn raise_priority(conn: &Connection, id: JobId) -> Result<bool> {
+    let mut stmt = conn.prepare_cached(
+        "UPDATE jobs SET priority = 1 + (SELECT coalesce(max(priority), 0) FROM jobs
+                                         WHERE kind = (SELECT kind FROM jobs WHERE id = ?1))
+         WHERE id = ?1 AND state = 'queued'",
+    )?;
+    Ok(stmt.execute([id])? > 0)
+}
+
 /// 前回 `running` のまま終わったジョブを `queued` に戻す。戻した数を返す。
 pub fn recover_running(conn: &Connection) -> Result<usize> {
     let mut stmt =
@@ -211,6 +230,37 @@ pub fn recover_running(conn: &Connection) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::db::{query_plan, test_conn};
+
+    #[test]
+    fn requeues_and_raises_priority() {
+        let conn = test_conn();
+        let a = insert(&conn, JobKind::Download, "{}", 10).unwrap();
+        let b = insert(&conn, JobKind::Download, "{}", 20).unwrap();
+        insert(&conn, JobKind::Import, "{}", 5).unwrap();
+        assert!(raise_priority(&conn, b).unwrap());
+        let next = claim_next(&conn, JobKind::Download, 30, |id| format!("{id}")).unwrap();
+        assert_eq!(next.map(|r| r.id), Some(b));
+        // 動いているものは優先度を変えない
+        assert!(!raise_priority(&conn, b).unwrap());
+
+        assert!(!requeue(&conn, a).unwrap(), "待っているものは戻さない");
+        finish(
+            &conn,
+            a,
+            JobState::Failed,
+            None,
+            Some("だめ"),
+            Some("ToolFailed"),
+            Some("{}"),
+            40,
+        )
+        .unwrap();
+        assert!(requeue(&conn, a).unwrap());
+        let record = get(&conn, a).unwrap().unwrap();
+        assert_eq!(record.state, JobState::Queued);
+        assert_eq!((record.error_code, record.finished_at), (None, None));
+        assert_eq!(record.result_json.as_deref(), Some("{}"));
+    }
 
     #[test]
     fn insert_claim_finish() {

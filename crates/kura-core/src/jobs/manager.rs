@@ -118,6 +118,24 @@ impl JobContext {
         }
     }
 
+    /// 途中経過を保存し、結果ごと画面へ送る（題名がわかったときなど。間引かない）。
+    pub fn checkpoint(&self, result_json: &str, progress: f64, message: &str) -> Result<()> {
+        let (id, json, text) = (self.record.id, result_json.to_string(), message.to_string());
+        let progress = progress.clamp(0.0, 1.0);
+        self.library
+            .db()
+            .write(move |tx| store::save_partial(tx, id, &json, progress, &text))?;
+        (self.sink)(JobEvent {
+            id,
+            kind: self.record.kind,
+            state: JobState::Running,
+            progress: Some(progress),
+            message: Some(message.to_string()),
+            result_json: Some(result_json.to_string()),
+        });
+        Ok(())
+    }
+
     /// `kind` のジョブが待ち行列になければ積む（取り込みのあとにサムネイルを作る、など）。
     pub fn ensure_queued(&self, kind: JobKind, input_json: &str) -> Result<Option<JobId>> {
         self.inner.ensure_queued(kind, input_json)
@@ -303,6 +321,62 @@ impl JobManager {
             self.inner.wake.notify_all();
         }
         Ok(())
+    }
+
+    /// 失敗・中止したジョブを待ち行列に戻す（再試行）。途中経過（result_json）は残し、続きから動かす。
+    pub fn retry(&self, id: JobId) -> Result<()> {
+        let event = {
+            let _sched = self.lock()?;
+            let changed = self
+                .inner
+                .library
+                .db()
+                .write(move |tx| store::requeue(tx, id))?;
+            if changed { Some(self.get(id)?) } else { None }
+        };
+        if let Some(record) = event {
+            self.emit(event_from(&record));
+            self.inner.wake.notify_all();
+        }
+        Ok(())
+    }
+
+    /// 待っているジョブを、同じ種類の中でいちばん先に動かす。
+    pub fn prioritize(&self, id: JobId) -> Result<()> {
+        let changed = self
+            .inner
+            .library
+            .db()
+            .write(move |tx| store::raise_priority(tx, id))?;
+        if changed {
+            self.emit(event_from(&self.get(id)?));
+            self.inner.wake.notify_all();
+        }
+        Ok(())
+    }
+
+    /// ジョブのログ（`logs/job-<id>.log`）の末尾 `max_bytes` バイト。まだなければ空。
+    pub fn log_text(&self, id: JobId, max_bytes: u64) -> Result<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = self.inner.library.layout().job_log_path(id);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(max_bytes);
+        file.seek(SeekFrom::Start(start))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        // 途中から読んだときは、最初の欠けた行を除く
+        Ok(if start > 0 {
+            text.split_once('\n')
+                .map_or(text.clone(), |(_, rest)| rest.to_string())
+        } else {
+            text
+        })
     }
 
     /// 止める。実行中のジョブには一時停止を指示し（次回 `queued` から再開）、終わるのを待つ。
