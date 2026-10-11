@@ -265,6 +265,7 @@ import_start:    ジョブとして実行
 - ガラス表現は CSS の `backdrop-filter` で行う（`docs/decisions.md` ADR-12）。ウィンドウの透明化・private API は使わない。ネイティブの `NSGlassEffectView` は M9 で試作して見送った（ADR-124）。
 - 「透明度を下げる」がオンなら `<html data-reduce-transparency="true">` を付け、ガラスを不透明な面に置き換える。
 - ファイルのドラッグ＆ドロップは `getCurrentWebview().onDragDropEvent` で受ける（`enter` で重ね表示、`drop` で取り込みシート）。
+- フルスクリーン（M9 のあと。ADR-128）：シアターのボタン・F・緑のボタン・メニューのどれでも、ウィンドウの大きさの変化で状態を読み（`watchFullscreen`）、シアターの右のパネルを閉じる・戻す。出入りが終わったら kura-mac の `keep_webview_focus_on_fullscreen` が WKWebView にキーボードのフォーカスを戻す（そうしないと esc などが届かない）。
 - `backgroundThrottling: "disabled"`（M5）：既定では、ウィンドウがほかのウィンドウに隠れると WebKit が動画の再生開始や CSS アニメーションを止め、再生キューが動画のところで止まる。メディアプレーヤーなので隠れていても再生を続ける（ADR-72）。
 - メニューバーはフロントで組む（`src/app/appMenu.ts`）。文言は ja.ts。「すべてを選択」（⌘A）だけは自前の項目で、入力欄なら文字、それ以外は一覧のすべてを選ぶ（ADR-76）。Kura の操作の項目は、押すとそのキーのイベントをフォーカスのある要素から送る（`replayKey`）ので、キーの処理と同じ条件で動く。表示形式・まとめて表示のチェックとサイドバーの項目の文字は、表示の設定に合わせて書き換える（ADR-116）。アプリの言語は `src-tauri/Info.plist` で日本語と宣言し、OS が出す文言も日本語にする（ADR-77）。
 - 署名は個人利用なのでアドホック署名（`bundle.macOS.signingIdentity: "-"`）。App Store には出さない。

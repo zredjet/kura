@@ -19,7 +19,6 @@ import { useSidebarStore } from '../../stores/sidebarStore';
 import { PlaybackController } from './engine/PlaybackController';
 import { type PlayerSnapshot, type Queue, realClock, type RepeatMode } from './engine/types';
 import { usePlayerStore } from './playerStore';
-import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
 /** 設定（音量など）を保存するまで待つ時間。 */
@@ -316,16 +315,7 @@ export function watchFullscreen(): () => void {
   let unlisten: (() => void) | null = null;
   const sync = () => {
     win.isFullscreen().then(
-      (on) => {
-        const changed = usePlayerStore.getState().fullscreen !== on;
-        usePlayerStore.getState().setFullscreen(on);
-        // フルスクリーンを抜けると、キーボードのフォーカスが WebView から外れる（esc が届かない）ので戻す
-        if (changed) {
-          getCurrentWebview()
-            .setFocus()
-            .catch(() => undefined);
-        }
-      },
+      (on) => usePlayerStore.getState().setFullscreen(on),
       () => undefined,
     );
   };

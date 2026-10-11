@@ -1,4 +1,5 @@
-//! Finder で見せる・ボリュームの容量（書き出し・バックアップ・サイドバーの容量）。
+//! Finder で見せる・ボリュームの容量（書き出し・バックアップ・サイドバーの容量）と、
+//! フルスクリーンの出入りのあとの WebView のフォーカス。
 
 use std::path::Path;
 
@@ -22,6 +23,18 @@ pub fn reveal_in_finder(path: &Path) -> bool {
     {
         let _ = path;
         false
+    }
+}
+
+/// フルスクリーンの出入りが終わったら、WebView にキーボードのフォーカスを戻すようにする（アプリの起動時に 1 回。ADR-128）。
+pub fn keep_webview_focus_on_fullscreen() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn kura_keep_webview_focus_on_fullscreen();
+        }
+        // SAFETY: 引数のない C 関数。通知の受け取りをメインスレッドで登録するだけ
+        unsafe { kura_keep_webview_focus_on_fullscreen() };
     }
 }
 

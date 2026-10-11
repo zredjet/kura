@@ -17,7 +17,9 @@ pub use browser::{
     SnapshotDone, SnapshotInfo, find_chrome, frontmost_pid, play_capture_sound, snapshot_webview,
 };
 pub use external::{ExternalPlayer, open_in_player};
-pub use files::{VolumeCapacity, reveal_in_finder, volume_capacity};
+pub use files::{
+    VolumeCapacity, keep_webview_focus_on_fullscreen, reveal_in_finder, volume_capacity,
+};
 
 use std::path::Path;
 use std::sync::Arc;

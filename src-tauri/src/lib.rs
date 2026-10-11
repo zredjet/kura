@@ -230,6 +230,8 @@ pub fn run() -> ExitCode {
             if let Some(chrome) = kura_mac::find_chrome() {
                 kura_core::tools::set_default_location(kura_core::capture::CHROME_TOOL, chrome);
             }
+            // フルスクリーンを抜けたあとも、キー（シアターの esc など）が WebView に届くように（ADR-128）
+            kura_mac::keep_webview_focus_on_fullscreen();
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "Kura を起動しました");
             Ok(())
         })
