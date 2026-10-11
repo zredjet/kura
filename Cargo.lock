@@ -1825,6 +1825,7 @@ dependencies = [
  "rand_chacha",
  "rayon",
  "reflink-copy",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

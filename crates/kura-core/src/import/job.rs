@@ -328,6 +328,9 @@ impl BatchCommit {
                             original_name: &file.name,
                             original_path: &file.path.to_string_lossy(),
                             info: placed.info.as_ref(),
+                            source_site: "local",
+                            source_url: None,
+                            captured_at: None,
                             now,
                         },
                     )?;
@@ -933,7 +936,7 @@ mod tests {
         assert_eq!(orphans, 10);
 
         // 開き直す：staging を掃除し、running を queued に戻して再開する
-        assert_eq!(clean_staging(env.library.layout()).unwrap(), 1);
+        assert_eq!(clean_staging(env.library.layout(), &[]).unwrap(), 1);
         let jobs = env.manager(ImportHandler {
             batch_files: 10,
             ..ImportHandler::default()

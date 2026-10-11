@@ -10,6 +10,8 @@ pub enum AppErrorCode {
     InvalidQuery,
     Invalid,
     ToolMissing,
+    /// 外部ツールが失敗した。
+    ToolFailed,
     Io,
     Db,
     Conflict,
@@ -48,6 +50,8 @@ impl From<CoreError> for AppError {
             CoreError::Invalid(_) => AppErrorCode::Invalid,
             CoreError::Io(_) => AppErrorCode::Io,
             CoreError::Db(_) | CoreError::Json(_) | CoreError::DbClosed => AppErrorCode::Db,
+            CoreError::ToolMissing(_) => AppErrorCode::ToolMissing,
+            CoreError::Tool(_) => AppErrorCode::ToolFailed,
         };
         Self::new(code, err.to_string())
     }

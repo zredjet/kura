@@ -2,11 +2,11 @@
 
 mod job;
 mod kind;
-mod place;
+pub(crate) mod place;
 mod plan;
 mod preview;
 mod scan;
-mod store;
+pub(crate) mod store;
 
 pub use job::{ImportFailure, ImportHandler, ImportInput, ImportResult, start_import};
 pub use kind::{MediaKind, classify, mime_for};

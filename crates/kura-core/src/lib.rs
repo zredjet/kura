@@ -3,6 +3,7 @@
 //! macOS 固有の処理は `kura-mac` に置き、このクレートには `cfg(target_os)` を書かない。
 
 pub mod db;
+pub mod download;
 pub mod error;
 pub mod folders;
 pub mod import;
@@ -16,6 +17,7 @@ pub mod query;
 pub mod queue;
 pub mod random;
 pub mod serve;
+pub mod settings;
 pub mod smart;
 pub mod tags;
 pub mod text;

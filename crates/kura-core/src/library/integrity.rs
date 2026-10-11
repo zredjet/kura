@@ -20,8 +20,9 @@ pub struct IntegrityReport {
     pub orphan_files: u64,
 }
 
-/// `staging/` の中身をすべて消す（取り込み・ダウンロードの書きかけ）。ジョブを動かす前に呼ぶ。
-pub fn clean_staging(layout: &Layout) -> Result<u64> {
+/// `staging/` の中身を消す（取り込み・ダウンロードの書きかけ）。ジョブを動かす前に呼ぶ。
+/// `keep` の名前のもの（待機中・一時停止中のダウンロードの作業フォルダ）は続きに使うので残す。
+pub fn clean_staging(layout: &Layout, keep: &[String]) -> Result<u64> {
     let dir = layout.staging_dir();
     let mut removed = 0;
     let entries = match std::fs::read_dir(&dir) {
@@ -31,6 +32,12 @@ pub fn clean_staging(layout: &Layout) -> Result<u64> {
     };
     for entry in entries {
         let path = entry?.path();
+        if path
+            .file_name()
+            .is_some_and(|n| keep.iter().any(|k| n == k.as_str()))
+        {
+            continue;
+        }
         if path.is_dir() {
             std::fs::remove_dir_all(&path)?;
         } else {
@@ -106,8 +113,15 @@ mod tests {
         std::fs::create_dir(staging.join("dl-2")).unwrap();
         std::fs::write(staging.join("dl-2").join("a.part"), "x").unwrap();
 
-        assert_eq!(clean_staging(lib.layout()).unwrap(), 2);
-        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+        std::fs::create_dir(staging.join("dl-3")).unwrap();
+        std::fs::write(staging.join("dl-3").join("b.part"), "x").unwrap();
+
+        assert_eq!(clean_staging(lib.layout(), &["dl-3".into()]).unwrap(), 2);
+        let left: Vec<_> = std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("dl-3")]);
     }
 
     #[test]

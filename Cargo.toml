@@ -26,6 +26,8 @@ reflink-copy = "0.1"
 # jwalk は開発終了のため walkdir を使う（docs/decisions.md）
 walkdir = "2.5"
 unicode-normalization = "0.1"
+# ダウンロードの規則（URL の正規表現。docs/decisions.md）
+regex = "1.13"
 tempfile = "3"
 rand_chacha = "0.10"
 jpeg-encoder = "0.7"

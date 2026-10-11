@@ -28,6 +28,11 @@ pub struct NewItem<'a> {
     pub original_path: &'a str,
     /// 読めたメディア情報。
     pub info: Option<&'a MediaInfo>,
+    /// 取得元のサイト（取り込みは `local`）と URL。
+    pub source_site: &'a str,
+    pub source_url: Option<&'a str>,
+    /// 投稿日時など、メディア情報より優先する撮影・投稿日時。
+    pub captured_at: Option<i64>,
     pub now: i64,
 }
 
@@ -47,14 +52,15 @@ pub fn find_by_hash(conn: &Connection, hash: &[u8; 32]) -> Result<Option<Existin
 }
 
 /// アイテムを追加して ID を返す。画像はプロキシを作らないので proxy_state は not_needed。
+/// `original_path` が空なら NULL にする（ダウンロードしたもの）。
 pub fn insert_item(conn: &Connection, item: &NewItem<'_>) -> Result<i64> {
     let size = i64::try_from(item.size)
         .map_err(|_| CoreError::Invalid(format!("ファイルが大きすぎます: {}", item.size)))?;
     let mut stmt = conn.prepare_cached(
         "INSERT INTO items (hash, ext, kind, mime, size_bytes, title, original_name, original_path,
-                            source_site, imported_at, updated_at,
+                            source_site, source_url, imported_at, updated_at,
                             width, height, duration_ms, captured_at, codec_info, proxy_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'local', ?9, ?9, ?10, ?11, ?12, ?13, ?14,
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULLIF(?8, ''), ?15, ?16, ?9, ?9, ?10, ?11, ?12, ?13, ?14,
                  CASE ?3 WHEN 'image' THEN 'not_needed' ELSE 'unknown' END)",
     )?;
     stmt.execute(params![
@@ -70,8 +76,11 @@ pub fn insert_item(conn: &Connection, item: &NewItem<'_>) -> Result<i64> {
         item.info.and_then(|i| i.width),
         item.info.and_then(|i| i.height),
         item.info.and_then(|i| i.duration_ms),
-        item.info.and_then(|i| i.captured_at),
+        item.captured_at
+            .or_else(|| item.info.and_then(|i| i.captured_at)),
         item.info.and_then(MediaInfo::codec_json),
+        item.source_site,
+        item.source_url,
     ])?;
     Ok(conn.last_insert_rowid())
 }
@@ -179,11 +188,22 @@ pub fn unit_exists(conn: &Connection, id: i64) -> Result<bool> {
 
 /// 取り込みで作る set ユニット（origin = import、並びは manual）。
 pub fn create_import_unit(conn: &Connection, name: &str, now: i64) -> Result<i64> {
+    create_unit(conn, name, "import", None, now)
+}
+
+/// 取り込み・ダウンロードで作る set ユニット（並びは manual）。`origin` は `import` / `download`。
+pub fn create_unit(
+    conn: &Connection,
+    name: &str,
+    origin: &str,
+    source_url: Option<&str>,
+    now: i64,
+) -> Result<i64> {
     let mut stmt = conn.prepare_cached(
-        "INSERT INTO units (kind, name, order_mode, origin, created_at, updated_at)
-         VALUES ('set', ?1, 'manual', 'import', ?2, ?2)",
+        "INSERT INTO units (kind, name, order_mode, origin, source_url, created_at, updated_at)
+         VALUES ('set', ?1, 'manual', ?2, ?3, ?4, ?4)",
     )?;
-    stmt.execute(params![name, now])?;
+    stmt.execute(params![name, origin, source_url, now])?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -217,6 +237,9 @@ mod tests {
             original_name: name,
             original_path: "/src/x.jpg",
             info: None,
+            source_site: "local",
+            source_url: None,
+            captured_at: None,
             now: 100,
         }
     }

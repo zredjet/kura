@@ -138,6 +138,9 @@ mod tests {
                         original_name: "x.jpg",
                         original_path: "/x.jpg",
                         info: None,
+                        source_site: "local",
+                        source_url: None,
+                        captured_at: None,
                         now: 0,
                     },
                 )

@@ -24,6 +24,12 @@ pub enum CoreError {
     /// DB の書き込みスレッドが止まっている。
     #[error("データベースが閉じられています")]
     DbClosed,
+    /// 外部ツールが見つからない（名前）。
+    #[error("{0} が見つかりません。外部ツールの欄の案内に従って入れてください")]
+    ToolMissing(String),
+    /// 外部ツールが失敗した（画面に出す説明）。
+    #[error("{0}")]
+    Tool(String),
 }
 
 impl CoreError {
@@ -35,6 +41,8 @@ impl CoreError {
             Self::Invalid(_) => "Invalid",
             Self::Io(_) => "Io",
             Self::Db(_) | Self::Json(_) | Self::DbClosed => "Db",
+            Self::ToolMissing(_) => "ToolMissing",
+            Self::Tool(_) => "ToolFailed",
         }
     }
 }

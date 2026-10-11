@@ -1,6 +1,7 @@
 //! 開発用ツール。
 //!
 //! - `import --library <path> [--create] [<src>...]`：取り込む（<src> を省くと、中断していた取り込みの再開だけ待つ）
+//! - `download --library <path> <url>...`：アプリと同じジョブで取得してライブラリに入れる（M7 の確認用）
 //! - `check --library <path>`：件数と整合性（DB とファイルの食い違い）を表示する
 //! - `seed --items <件数> --out <path>`：ダミーライブラリを作る（グリッドと起動時間の計測用）
 //! - `bench query --library <path>`：一覧の取得の速さを測る
@@ -14,12 +15,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kura_core::download::{CookieSource, DownloadInput, DownloadOptions, detect, start_download};
 use kura_core::import::{ImportInput, ImportOptions, start_import};
 use kura_core::jobs::{EventSink, JobFilter, JobKind, JobState};
 use kura_core::library::{LibrarySession, check_files};
 
-const USAGE: &str =
-    "使い方: kura-devtools import --library <path> [--create] [<src>...] | check --library <path>";
+const USAGE: &str = "使い方: kura-devtools import --library <path> [--create] [<src>...] | \
+                     download --library <path> <url>... | check --library <path>";
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -30,6 +32,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("import") => import(&args[1..]),
+        Some("download") => download(&args[1..]),
         Some("check") => check(&args[1..]),
         Some("seed") => seed::run(&args[1..]),
         Some("bench") => bench::run(&args[1..]),
@@ -78,6 +81,52 @@ fn progress_sink() -> EventSink {
             message = event.message.as_deref().unwrap_or(""),
         );
     })
+}
+
+/// URL を取得してライブラリに入れる（アプリと同じダウンロードのジョブ。既定の選択で）。
+fn download(args: &[String]) -> Result<(), String> {
+    let args = parse(args)?;
+    let session = LibrarySession::open(&args.library, progress_sink(), kura_mac::media_backend())
+        .map_err(|e| e.to_string())?;
+    session.wait_ready();
+    for url in &args.sources {
+        let detection = detect(&url.to_string_lossy(), &[]).map_err(|e| e.to_string())?;
+        let input = DownloadInput {
+            detection,
+            options: DownloadOptions::default(),
+            cookies: CookieSource::None,
+        };
+        let id = start_download(session.jobs(), &input).map_err(|e| e.to_string())?;
+        tracing::info!(id, url = %url.display(), "ダウンロードを積みました");
+    }
+    if !session.jobs().wait_idle(Duration::from_secs(3600)) {
+        return Err("1 時間待っても終わりませんでした".into());
+    }
+    let jobs = session
+        .jobs()
+        .list(&JobFilter {
+            kinds: vec![JobKind::Download],
+            states: vec![],
+            limit: Some(args.sources.len().max(1) as u32),
+        })
+        .map_err(|e| e.to_string())?;
+    let mut failed = None;
+    for job in jobs {
+        tracing::info!(
+            id = job.id,
+            state = job.state.as_str(),
+            message = job.message.as_deref().unwrap_or(""),
+            result = job.result_json.as_deref().unwrap_or(""),
+            "ダウンロード"
+        );
+        if job.state == JobState::Failed {
+            failed = job.message;
+        }
+    }
+    match failed {
+        Some(message) => Err(message),
+        None => report(&session),
+    }
 }
 
 fn import(args: &[String]) -> Result<(), String> {

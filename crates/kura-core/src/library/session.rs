@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use super::Library;
 use super::integrity::{IntegrityReport, check_files, clean_staging};
 use crate::Result;
+use crate::download::{DownloadHandler, work_dir_name};
 use crate::import::ImportHandler;
 use crate::jobs::{JobKind, JobManager};
 use crate::media::{MediaBackend, ThumbnailHandler};
@@ -47,8 +48,18 @@ impl LibrarySession {
 
     fn start(library: Library, sink: EventSink, backend: Arc<dyn MediaBackend>) -> Result<Self> {
         let library = Arc::new(library);
-        // ジョブを動かす前に書きかけを消す（再開するジョブは最初からコピーし直す）
-        let staging_removed = clean_staging(library.layout())?;
+        // ジョブを動かす前に書きかけを消す（再開する取り込みは最初からコピーし直す）。
+        // 待機中・一時停止中のダウンロードの作業フォルダは、続きから取るので残す
+        let keep: Vec<String> = library.db().read(|conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id FROM jobs WHERE kind = 'download' AND state IN ('queued', 'running', 'paused')",
+            )?;
+            let ids = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+            Ok(ids
+                .map(|id| id.map(work_dir_name))
+                .collect::<std::result::Result<_, _>>()?)
+        })?;
+        let staging_removed = clean_staging(library.layout(), &keep)?;
         let proxy = Arc::new(ProxyShared::default());
         let jobs = Arc::new(JobManager::new(
             library.clone(),
@@ -56,6 +67,10 @@ impl LibrarySession {
                 (
                     JobKind::Import,
                     Arc::new(ImportHandler::new(backend.clone())),
+                ),
+                (
+                    JobKind::Download,
+                    Arc::new(DownloadHandler::new(backend.clone())),
                 ),
                 (JobKind::Thumbnail, Arc::new(ThumbnailHandler::new(backend))),
                 (
