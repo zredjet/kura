@@ -4,11 +4,14 @@
 //! - `MacBackend`：`MediaBackend` の macOS 実装（ImageIO / AVFoundation）
 //! - `media_backend`：macOS の実装で扱えない形式を ffmpeg に回す組み合わせ
 //! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
+//! - `find_chrome`・`snapshot_webview`：キャプチャ用の Google Chrome の場所と、WKWebView の表示範囲の撮影
 //!
 //! macOS 以外では同じ関数・型が「扱えない」を返すだけの空の実装になり、ワークスペース全体がビルドできる。
 
+mod browser;
 mod external;
 
+pub use browser::{SnapshotDone, SnapshotInfo, find_chrome, snapshot_webview};
 pub use external::{ExternalPlayer, open_in_player};
 
 use std::path::Path;
