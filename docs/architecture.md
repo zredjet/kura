@@ -233,6 +233,7 @@ import_start:    ジョブとして実行
 - 「透明度を下げる」がオンなら `<html data-reduce-transparency="true">` を付け、ガラスを不透明な面に置き換える。
 - ファイルのドラッグ＆ドロップは `getCurrentWebview().onDragDropEvent` で受ける（`enter` で重ね表示、`drop` で取り込みシート）。
 - `backgroundThrottling: "disabled"`（M5）：既定では、ウィンドウがほかのウィンドウに隠れると WebKit が動画の再生開始や CSS アニメーションを止め、再生キューが動画のところで止まる。メディアプレーヤーなので隠れていても再生を続ける（ADR-72）。
+- メニューバーはフロントで組む（`src/app/appMenu.ts`）。項目は Tauri の既定のメニューと同じで、文言は ja.ts。「すべてを選択」（⌘A）だけは自前の項目で、入力欄なら文字、それ以外は一覧のすべてを選ぶ（ADR-76）。アプリの言語は `src-tauri/Info.plist` で日本語と宣言し、OS が出す文言も日本語にする（ADR-77）。
 - 署名は個人利用なのでアドホック署名（`bundle.macOS.signingIdentity: "-"`）。App Store には出さない。
 - 書類・デスクトップ・ダウンロードを「ファイルを選択」で開くと macOS の許可ダイアログが出る。ドラッグ＆ドロップした項目は許可なしで読める。
 
