@@ -85,9 +85,13 @@
 | | `open_external(hash)` → `mpv` \| `quickTime` | 元のファイルを外部プレイヤーで開く（mpv があれば mpv） |
 | | `player_prefs_get()` / `player_prefs_set(prefs)` | 再生の設定（音量・画像の間も直前の音楽を流す・BGM をループ・画像の表示時間の既定値）。app.json に保存 |
 | ジョブ | `jobs_list(filter)` / `job_cancel(id)` / `job_pause(id)` / `job_resume(id)` / `job_retry(id)` / `job_log(id)` | 進捗はイベント `job://progress` |
-| ダウンロード | `download_detect(url)` → `DetectedSource` / `download_enqueue(url, options)` → `JobId` | |
+| ダウンロード | `download_detect(url)` → `{ url, site, siteLabel, tool, rule?, playlist, toolFound }` | URL の取得方法（規則 → サイトの表 → yt-dlp の汎用）。§9 |
+| | `download_defaults()` / `download_enqueue(url, options)` → JobId | 前回の選択（ライブラリの settings）と、取得を積む（選んだ内容を次回の既定にする）。`options` は画質（best / 1080 / 720 / 480）・音声のみ・保存先のフォルダ・自動タグ（投稿者・サイトのタグ）・再生リストをユニットに |
+| | `downloads_list(limit?)` → `DownloadJob[]` | ダウンロードのジョブを新しい順に（URL・サイト・ツール・題名・件数・入れたアイテムとユニット） |
+| | `download_prefs_get()` / `download_prefs_set(prefs)` | Cookie の読み込み元と規則（app.json。規則の正規表現と引数を確かめる。ADR-99） |
+| ジョブ | `job_retry(id)` / `job_prioritize(id)` / `job_log(id)` → 文字 | 再試行・先に取得・ログの末尾 256KB（ADR-103） |
 | キャプチャ | `capture_rules_*` / `capture_run(url, rule_id?)` → `JobId` / `browser_open(url)` / `browser_snapshot(label)` | |
-| ツール | `tools_status()` / `tools_update(tool)` / `tools_set_path(tool, path)` | |
+| ツール | `tools_status()` → `ToolInfo[]` / `tools_set_path(tool, path?)` / `tools_update()` → `{ brewCommand?, outputs }` | 版・場所・Homebrew 版か。場所の指定（app.json）。「更新を確認」（ADR-100） |
 | 設定 | `settings_get(keys)` / `settings_set(map)` | |
 | 外観 | `appearance_get()` → `Appearance` | OS の表示設定（「透明度を下げる」）。起動時に `<html data-reduce-transparency>` へ反映する（§11） |
 | 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測の結果をログに書く（§13） |
@@ -214,6 +218,15 @@ import_start:    ジョブとして実行
 | ツールの場所 | `/opt/homebrew/bin` → `/usr/local/bin` → 設定値の順に探す。見つからなければ `brew install yt-dlp gallery-dl deno ffmpeg` を案内 |
 | 更新 | 「更新を確認」で `yt-dlp -U`（Homebrew 版なら `brew upgrade` を案内） |
 
+### 9.1 実装（M7）
+
+- **判定**（`kura_core::download::detect`、純粋関数）：規則（正規表現）→ ホストの表（youtube・niconico・soundcloud・vimeo・twitch・bilibili・tiktok・bandcamp は yt-dlp、pixiv・fanbox・x・bluesky・misskey・instagram・tumblr・deviantart・artstation・imgur・reddit・各種 booru は gallery-dl）→ 表にないホストは yt-dlp の汎用。YouTube の再生リストのページは中の動画をまとめて、再生リストの中の 1 本の URL は `--no-playlist`。
+- **ジョブ**（`kind = 'download'`、同時に 2 つ）：`staging/dl-<job>/` にツールで取得し、終わったら作業フォルダのメディアのファイルを取り込みと同じ方法で配置して、1 つのトランザクションで登録する（ADR-92）。進捗は `KURA` のタブ区切りの行（ADR-93）。一時停止・中止はプロセスグループごと止める（ADR-94）。子プロセスの PATH には指定した場所と Homebrew の場所を足す（yt-dlp が ffmpeg・deno を、gallery-dl がうごイラの変換に ffmpeg を見つけられるように）。
+- **yt-dlp の引数**：`--newline --color never --progress --progress-delta 0.5 --no-mtime --write-info-json --progress-template … --print before_dl:… --print after_move:… -o %(id)s.%(ext)s -P <作業フォルダ> --download-archive archives/yt-dlp.txt --ffmpeg-location <ffmpeg> --js-runtimes deno:<deno> -S res,ext:mp4:m4a`（画質・音声のみは ADR-97）、Cookie は `--cookies-from-browser`。
+- **gallery-dl の引数**：`--no-colors --write-metadata --no-mtime --ugoira mp4 -D <作業フォルダ> --download-archive archives/gallery-dl.sqlite3 --Print prepare:… --Print after:… --Print skip:…`、Cookie は `--cookies-from-browser`。pixiv は `gallery-dl oauth:pixiv` を一度ターミナルで実行してもらう。
+- **登録**（`download::meta`・`register`）：ADR-96。タグは `item_tags.source = 'download'`、ユニットは `units.origin = 'download'` と URL、`remote_sources` にサイト・ID・ページ番号。
+- **ツールの場所**：`kura_core::tools::find` は app.json の指定 → `/opt/homebrew/bin` → `/usr/local/bin` → PATH の順。ffmpeg・ffprobe・mpv の場所の指定もプロキシ・外部プレイヤーに効く。
+
 ## 10. キャプチャ
 
 - **ルールで自動キャプチャ**：chromiumoxide（Rust の CDP クライアント）でインストール済みの Google Chrome をヘッドレス起動する。プロファイルは `~/Library/Application Support/<bundle id>/capture-profile`。
@@ -261,6 +274,7 @@ import_start:    ジョブとして実行
 | `kura-devtools bench query --library <path>` | 開く・`query_ids`・`items_get`（200 件）・`item_detail`、サイドバーの一覧の種類・件数・タグの候補の中央値 |
 | `kura-devtools bench thumbs --src <dir> [--threads N]` | 画像サムネイルの生成速度（枚/秒） |
 | `kura-devtools import` / `check` | コマンドラインからの取り込みと整合性の確認（§6） |
+| `kura-devtools download --library <path> <url>...` | アプリと同じダウンロードのジョブで取得して入れる（§9。既定の選択・Cookie なし） |
 | `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない） |
 | `VITE_KURA_BENCH=1` | グリッドを自動でスクロールし、フレーム時間を `bench_report` でログに書く |
 

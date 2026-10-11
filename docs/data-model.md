@@ -265,7 +265,7 @@ CREATE TABLE jobs (
 );
 CREATE INDEX idx_jobs_queue ON jobs(state, priority DESC, created_at);
 
--- ===== ダウンロード元とアイテムの対応 =====
+-- ===== ダウンロード元とアイテムの対応（M7。取得したファイルごとに 1 行。同じ投稿を取り直すと unit_id のユニットへ足す。ADR-96）=====
 CREATE TABLE remote_sources (
   site          TEXT    NOT NULL,                   -- 'youtube','pixiv' など
   remote_id     TEXT    NOT NULL,                   -- 動画 ID・作品 ID
@@ -301,6 +301,7 @@ CREATE TABLE settings (
   value  TEXT NOT NULL                              -- JSON
 );
 -- キー：'playback.support' = プロキシの判定に使った再生可否の表の指紋（文字列。変われば判定をやり直す。M5）
+--       'download.defaults' = ダウンロードの前回の選択（画質・音声のみ・保存先・自動タグ・再生リストをユニットに。M7、ADR-98）
 
 -- ===== 全文検索（外部コンテンツ FTS5、trigram）=====
 CREATE VIRTUAL TABLE items_fts USING fts5(
