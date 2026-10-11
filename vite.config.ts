@@ -1,5 +1,5 @@
 import react from '@vitejs/plugin-react';
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 // Tauri 向けの設定（https://v2.tauri.app/start/frontend/vite/）
 export default defineConfig({
@@ -9,7 +9,7 @@ export default defineConfig({
     // 1420（Tauri の既定）は他のプロジェクトとぶつかりやすいので変えている
     port: 1430,
     strictPort: true,
-    watch: { ignored: ['**/src-tauri/**', '**/crates/**', '**/target/**'] },
+    watch: { ignored: ['**/src-tauri/**', '**/crates/**', '**/target/**', '**/.claude/**'] },
   },
   envPrefix: ['VITE_', 'TAURI_ENV_'],
   build: {
@@ -21,5 +21,7 @@ export default defineConfig({
     setupFiles: ['./src/test/setup.ts'],
     // CSS を実際に処理する（CSS Modules の `?raw` を文字列として読むため。styles.test.ts）
     css: true,
+    // 別の作業の worktree（.claude/worktrees）のテストは拾わない
+    exclude: [...configDefaults.exclude, '.claude/**'],
   },
 });
