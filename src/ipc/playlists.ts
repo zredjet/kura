@@ -63,6 +63,11 @@ export function updatePlaylist(id: number, patch: PlaylistPatchDto): Promise<nul
   return unwrap(commands.playlistUpdate(id, patch));
 }
 
+/** サイドバーの並びを変える（`ids` の順）。 */
+export function reorderPlaylists(ids: number[]): Promise<null> {
+  return unwrap(commands.playlistsReorder(ids));
+}
+
 export function deletePlaylist(id: number): Promise<null> {
   return unwrap(commands.playlistDelete(id));
 }

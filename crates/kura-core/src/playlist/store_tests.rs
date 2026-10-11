@@ -557,3 +557,21 @@ fn adds_by_the_table_and_groups_items_into_a_unit() {
         vec![EntryTarget::Unit(unit), EntryTarget::Unit(created)]
     );
 }
+
+#[test]
+fn reorders_playlists_in_the_sidebar() {
+    let conn = test_conn();
+    let a = playlist(&conn, PlaylistKind::Manual, Granularity::File);
+    let b = playlist(&conn, PlaylistKind::Smart, Granularity::File);
+    let c = playlist(&conn, PlaylistKind::Manual, Granularity::Unit);
+    let order = |conn: &Connection| -> Vec<i64> {
+        store::list(conn).unwrap().iter().map(|p| p.id).collect()
+    };
+    assert_eq!(order(&conn), vec![a, b, c]);
+
+    store::reorder(&conn, &[c, a, b]).unwrap();
+    assert_eq!(order(&conn), vec![c, a, b]);
+    // 渡さなかったもの・重ねて渡したもの・ないものがあっても、全部を 1 回ずつ並べる
+    store::reorder(&conn, &[b, b, 999]).unwrap();
+    assert_eq!(order(&conn), vec![b, c, a]);
+}

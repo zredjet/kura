@@ -200,6 +200,8 @@ export const commands = {
 	playlistUpdate: (id: number, patch: PlaylistPatchDto) => typedError<null, AppError>(__TAURI_INVOKE("playlist_update", { id, patch })),
 	/**  削除する。 */
 	playlistDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("playlist_delete", { id })),
+	/**  サイドバーの並びを変える（`ids` の順。ADR-90）。 */
+	playlistsReorder: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("playlists_reorder", { ids })),
 	/**  単位を切り替える（エントリは変えない）。 */
 	playlistSetGranularity: (id: number, granularity: GranularityDto) => typedError<null, AppError>(__TAURI_INVOKE("playlist_set_granularity", { id, granularity })),
 	/**  中身：エントリごとの行と、展開したアイテムの列。 */

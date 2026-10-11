@@ -137,6 +137,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::playlists::playlist_create,
             commands::playlists::playlist_update,
             commands::playlists::playlist_delete,
+            commands::playlists::playlists_reorder,
             commands::playlists::playlist_set_granularity,
             commands::playlists::playlist_contents,
             commands::playlists::playlist_add,

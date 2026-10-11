@@ -100,6 +100,20 @@ pub async fn playlist_update(
     .await
 }
 
+/// サイドバーの並びを変える（`ids` の順。ADR-90）。
+#[tauri::command]
+#[specta::specta]
+pub async fn playlists_reorder(state: State<'_, AppState>, ids: Vec<i64>) -> Result<(), AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        Ok(session
+            .library()
+            .db()
+            .write(move |tx| store::reorder(tx, &ids))?)
+    })
+    .await
+}
+
 /// 削除する。
 #[tauri::command]
 #[specta::specta]

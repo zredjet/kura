@@ -10,10 +10,11 @@ import type { PlaylistSummaryDto } from '../../ipc/playlists';
 import { formatCount } from '../../lib/format';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
-import { useDragStore } from '../library/dragState';
+import { useDragStore, watchDrag } from '../library/dragState';
 import {
   createPlaylistInteractive,
   deletePlaylistWithConfirm,
+  movePlaylist,
   playPlaylist,
   renamePlaylist,
 } from '../playlists/playlistActions';
@@ -23,6 +24,7 @@ import styles from './Sidebar.module.css';
 /**
  * サイドバーのプレイリスト（Sidebar.dc.html）。＋ で新しく作り、右クリックで再生・改名・削除。
  * 手動のプレイリストには、グリッドのタイル・フォルダをドラッグして入れられる。
+ * 行をドラッグするか ⌥⌘↑↓ で並べ替える（ADR-90）。
  */
 export function PlaylistList() {
   const playlists = useSidebarStore((s) => s.playlists);
@@ -59,6 +61,16 @@ export function PlaylistList() {
       openMenuBelow(e.currentTarget, t.label(playlist.name), menuFor(playlist));
     } else if (e.key === 'Backspace' && e.metaKey) {
       void deletePlaylistWithConfirm(playlist);
+    } else if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && e.metaKey && e.altKey) {
+      const index = playlists.findIndex((p) => p.id === playlist.id);
+      const up = e.key === 'ArrowUp';
+      const neighbor = playlists[index + (up ? -1 : 1)];
+      if (neighbor) {
+        const row = e.currentTarget;
+        void movePlaylist(playlist.id, neighbor.id, up ? 'before' : 'after').then(() =>
+          row.focus(),
+        );
+      }
     } else {
       handled = false;
     }
@@ -121,10 +133,19 @@ export function PlaylistList() {
             aria-current={selected ? 'page' : undefined}
             {...{ [ROW_ATTR]: '' }}
             data-drop-playlist={droppable ? playlist.id : undefined}
+            data-playlist-row={playlist.id}
             data-drop={
               dropTarget?.kind === 'playlist' && dropTarget.id === playlist.id
                 ? 'inside'
-                : undefined
+                : dropTarget?.kind === 'playlistOrder' && dropTarget.id === playlist.id
+                  ? dropTarget.side
+                  : undefined
+            }
+            onPointerDown={(e) =>
+              watchDrag(e, () => ({
+                payload: { kind: 'playlist', id: playlist.id },
+                label: playlist.name,
+              }))
             }
             onClick={(e) => {
               e.currentTarget.focus();

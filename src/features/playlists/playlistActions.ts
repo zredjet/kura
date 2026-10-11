@@ -18,6 +18,7 @@ import {
   type PlaylistSummaryDto,
   regeneratePlaylist,
   removeEntries,
+  reorderPlaylists,
   restoreEntries,
   setGranularity,
   snapshotToFiles,
@@ -42,6 +43,43 @@ function fail(error: unknown): void {
 function refreshPlaylists(): void {
   bumpRevision();
   void useSidebarStore.getState().load();
+}
+
+/**
+ * `moving` を `target` の前（`before`）か後ろに移した並び（純粋関数）。
+ * どちらかが並びになければ元のまま。
+ */
+export function movedOrder(
+  ids: readonly number[],
+  moving: number,
+  target: number,
+  side: 'before' | 'after',
+): number[] {
+  if (moving === target || !ids.includes(moving) || !ids.includes(target)) {
+    return [...ids];
+  }
+  const rest = ids.filter((id) => id !== moving);
+  const at = rest.indexOf(target) + (side === 'after' ? 1 : 0);
+  return [...rest.slice(0, at), moving, ...rest.slice(at)];
+}
+
+/** サイドバーのプレイリストを並べ替える（ドラッグ・⌥⌘↑↓。ADR-90）。 */
+export async function movePlaylist(
+  moving: number,
+  target: number,
+  side: 'before' | 'after',
+): Promise<void> {
+  const ids = useSidebarStore.getState().playlists.map((p) => p.id);
+  const next = movedOrder(ids, moving, target, side);
+  if (next.every((id, i) => id === ids[i])) {
+    return;
+  }
+  try {
+    await reorderPlaylists(next);
+    refreshPlaylists();
+  } catch (error) {
+    fail(error);
+  }
 }
 
 /** 新しいプレイリストを作って開く。 */

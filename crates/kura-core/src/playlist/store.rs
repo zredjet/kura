@@ -135,6 +135,26 @@ pub fn list(conn: &Connection) -> Result<Vec<Playlist>> {
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// サイドバーの並びを変える（`ids` の順にする。含まれないものは後ろに今の順で。ADR-90）。
+pub fn reorder(conn: &Connection, ids: &[i64]) -> Result<()> {
+    let mut order: Vec<i64> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !order.contains(id) {
+            order.push(*id);
+        }
+    }
+    for playlist in list(conn)? {
+        if !order.contains(&playlist.id) {
+            order.push(playlist.id);
+        }
+    }
+    let mut stmt = conn.prepare_cached("UPDATE playlists SET pos = ?2 WHERE id = ?1")?;
+    for (i, id) in order.iter().enumerate() {
+        stmt.execute(params![id, (i + 1) as f64])?;
+    }
+    Ok(())
+}
+
 /// 新しいプレイリスト。
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewPlaylist {

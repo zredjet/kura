@@ -6,7 +6,8 @@
  * 落とす先は要素の data 属性で見つける：
  * - `data-drop-folder="<id>"`：フォルダの行
  * - `data-drop-folders-root`：フォルダの見出し（いちばん上へ）
- * - `data-drop-entry="<id>"`：ユニットの中のタイル（並べ替え）
+ * - `data-playlist-row="<id>"`：サイドバーのプレイリストの行（並べ替え）
+ * - `data-drop-entry="<id>"`：ユニットの中のタイル・リストの行（並べ替え。`data-drop-axis="y"` なら上下で判定）
  * - `data-drop-playlist="<id>"`：サイドバーの手動プレイリスト（アイテム・ユニット・フォルダを入れる。⌥ で展開を逆に）
  * - `data-drop-playlist-entry="<id>"`：プレイリストの画面の行（並べ替え）
  */
@@ -17,21 +18,28 @@ import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import { type DropPosition, dropPositionAt, moveTarget } from '../sidebar/tree';
 import { moveEntries } from '../../ipc/playlists';
-import { addEntriesToPlaylist, addFolderToPlaylist } from '../playlists/playlistActions';
+import {
+  addEntriesToPlaylist,
+  addFolderToPlaylist,
+  movePlaylist,
+} from '../playlists/playlistActions';
 import { addToFolder, dropWithinUnit, moveFolderTo } from './actions';
 import { viewedSetUnit } from './itemMenu';
 
 export type DragPayload =
   | { kind: 'entries'; ids: number[] }
   | { kind: 'folder'; id: number }
-  | { kind: 'playlistEntries'; playlistId: number; ids: number[] };
+  | { kind: 'playlistEntries'; playlistId: number; ids: number[] }
+  /** サイドバーのプレイリストの行（並べ替え）。 */
+  | { kind: 'playlist'; id: number };
 
 export type DropTarget =
   | { kind: 'folder'; id: number; position: DropPosition }
   | { kind: 'root' }
   | { kind: 'entry'; id: number; side: 'before' | 'after' }
   | { kind: 'playlist'; id: number }
-  | { kind: 'playlistEntry'; id: number; side: 'before' | 'after' };
+  | { kind: 'playlistEntry'; id: number; side: 'before' | 'after' }
+  | { kind: 'playlistOrder'; id: number; side: 'before' | 'after' };
 
 interface DragState {
   payload: DragPayload | null;
@@ -58,6 +66,15 @@ export function findTarget(payload: DragPayload, x: number, y: number): DropTarg
   const element = document.elementFromPoint(x, y);
   if (!(element instanceof HTMLElement)) {
     return null;
+  }
+  if (payload.kind === 'playlist') {
+    const row = element.closest<HTMLElement>('[data-playlist-row]');
+    const id = Number(row?.dataset.playlistRow);
+    if (!row || id === payload.id) {
+      return null;
+    }
+    const rect = row.getBoundingClientRect();
+    return { kind: 'playlistOrder', id, side: y - rect.top < rect.height / 2 ? 'before' : 'after' };
   }
   if (payload.kind === 'playlistEntries') {
     const row = element.closest<HTMLElement>('[data-drop-playlist-entry]');
@@ -97,13 +114,24 @@ export function findTarget(payload: DragPayload, x: number, y: number): DropTarg
       return null;
     }
     const rect = tile.getBoundingClientRect();
-    return { kind: 'entry', id, side: x - rect.left < rect.width / 2 ? 'before' : 'after' };
+    // リストの行は上下、タイルは左右の半分で前か後ろかを決める
+    const before =
+      tile.dataset.dropAxis === 'y'
+        ? y - rect.top < rect.height / 2
+        : x - rect.left < rect.width / 2;
+    return { kind: 'entry', id, side: before ? 'before' : 'after' };
   }
   return null;
 }
 
 /** 落とした先に合わせて操作する（`alt` は ⌥ を押していたか）。 */
 export function performDrop(payload: DragPayload, target: DropTarget, alt = false): void {
+  if (payload.kind === 'playlist') {
+    if (target.kind === 'playlistOrder') {
+      void movePlaylist(payload.id, target.id, target.side);
+    }
+    return;
+  }
   if (target.kind === 'playlist') {
     const playlist = useSidebarStore.getState().playlists.find((p) => p.id === target.id);
     if (playlist && payload.kind === 'entries') {

@@ -129,6 +129,7 @@
 /* ---- 行 ---- */
 
 .row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-2-5);
@@ -294,7 +295,9 @@
 }
 
 .folderRow[data-drop='before']::before,
-.folderRow[data-drop='after']::after {
+.folderRow[data-drop='after']::after,
+.row[data-drop='before']::before,
+.row[data-drop='after']::after {
   content: '';
   position: absolute;
   left: var(--space-2);
@@ -304,11 +307,13 @@
   background: var(--accent);
 }
 
-.folderRow[data-drop='before']::before {
+.folderRow[data-drop='before']::before,
+.row[data-drop='before']::before {
   top: -1px;
 }
 
-.folderRow[data-drop='after']::after {
+.folderRow[data-drop='after']::after,
+.row[data-drop='after']::after {
   bottom: -1px;
 }
 
