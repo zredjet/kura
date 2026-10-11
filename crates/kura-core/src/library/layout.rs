@@ -40,8 +40,8 @@ impl ThumbSize {
 }
 
 /// ライブラリの中に作るフォルダ。
-pub const SUBDIRS: [&str; 7] = [
-    "files", "thumbs", "art", "proxies", "staging", "archives", "logs",
+pub const SUBDIRS: [&str; 8] = [
+    "files", "thumbs", "art", "proxies", "staging", "archives", "logs", "backups",
 ];
 
 /// ライブラリ内の各パスを組み立てる。
@@ -79,6 +79,11 @@ impl Layout {
     /// ジョブのログの置き場所（`logs/`）。
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
+    }
+
+    /// DB のバックアップの置き場所（`backups/`。FR-SYS-03）。
+    pub fn backups_dir(&self) -> PathBuf {
+        self.root.join("backups")
     }
 
     /// ジョブのログファイル。

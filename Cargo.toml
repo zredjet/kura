@@ -19,7 +19,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 
-rusqlite = { version = "0.40", features = ["bundled"] }
+# backup：DB の定期バックアップ（FR-SYS-03。SQLite の backup API）
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 blake3 = { version = "1.8", features = ["rayon"] }
 rayon = "1.12"
 reflink-copy = "0.1"

@@ -5,10 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use super::Library;
+use super::backup;
 use super::integrity::{IntegrityReport, check_files, clean_staging};
 use crate::Result;
 use crate::capture::CaptureHandler;
 use crate::download::{DownloadHandler, work_dir_name};
+use crate::export::ExportHandler;
 use crate::import::ImportHandler;
 use crate::jobs::{JobKind, JobManager};
 use crate::media::{MediaBackend, ThumbnailHandler};
@@ -33,6 +35,8 @@ pub struct LibrarySession {
     jobs: Arc<JobManager>,
     proxy: Arc<ProxyShared>,
     integrity: Arc<Mutex<Option<IntegrityReport>>>,
+    /// DB の定期バックアップ（閉じると止める）。
+    backup: Mutex<backup::Scheduler>,
     startup: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -78,6 +82,7 @@ impl LibrarySession {
                     Arc::new(CaptureHandler::new(backend.clone())),
                 ),
                 (JobKind::Thumbnail, Arc::new(ThumbnailHandler::new(backend))),
+                (JobKind::Export, Arc::new(ExportHandler)),
                 (
                     JobKind::Proxy,
                     Arc::new(ProxyHandler::new(ProxyTools::detect(), proxy.clone())),
@@ -131,11 +136,13 @@ impl LibrarySession {
                 }
             })?;
 
+        let backup = Mutex::new(backup::Scheduler::start(library.layout().clone()));
         Ok(Self {
             library,
             jobs,
             proxy,
             integrity,
+            backup,
             startup: Mutex::new(Some(startup)),
         })
     }
@@ -209,6 +216,14 @@ impl LibrarySession {
     pub fn close(&self) {
         self.wait_ready();
         self.jobs.shutdown();
+        if let Ok(mut backup) = self.backup.lock() {
+            backup.stop();
+        }
+    }
+
+    /// いまのバックアップを作る（設定画面の「今すぐバックアップ」）。
+    pub fn backup_now(&self) -> Result<backup::BackupInfo> {
+        backup::create(self.library.layout(), crate::time::now_ms())
     }
 }
 

@@ -25,6 +25,11 @@ pub fn format_utc(ms: i64) -> String {
     )
 }
 
+/// ISO 8601 の UTC（「2026-10-10T16:00:00.123Z」。書き出しの JSON など、ほかのアプリが読むもの）。
+pub fn format_iso8601(ms: i64) -> String {
+    format_utc(ms).replacen(' ', "T", 1)
+}
+
 /// ISO 8601 の日時（`2026-08-30T09:22:01.5Z`、`2026-08-30 18:22:01+09:00` など）を UTC ミリ秒にする。
 /// 時差がなければ UTC とみなす。読めなければ None。
 pub fn parse_iso8601_ms(text: &str) -> Option<i64> {
@@ -108,6 +113,10 @@ mod tests {
         assert_eq!(format_utc(1_791_648_418_942), "2026-10-10 16:06:58.942Z");
         // うるう日
         assert_eq!(format_utc(951_782_400_000), "2000-02-29 00:00:00.000Z");
+        assert_eq!(
+            format_iso8601(1_791_648_418_942),
+            "2026-10-10T16:06:58.942Z"
+        );
     }
 
     #[test]

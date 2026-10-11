@@ -26,6 +26,8 @@ pub enum JobKind {
     Proxy,
     Download,
     Capture,
+    /// 書き出し（FR-SYS-02）。
+    Export,
 }
 
 impl JobKind {
@@ -37,6 +39,7 @@ impl JobKind {
             Self::Proxy => "proxy",
             Self::Download => "download",
             Self::Capture => "capture",
+            Self::Export => "export",
         }
     }
 
@@ -48,6 +51,7 @@ impl JobKind {
             "proxy" => Self::Proxy,
             "download" => Self::Download,
             "capture" => Self::Capture,
+            "export" => Self::Export,
             _ => return None,
         })
     }
@@ -57,7 +61,7 @@ impl JobKind {
     pub fn concurrency(self) -> usize {
         match self {
             Self::Download => 2,
-            Self::Import | Self::Thumbnail | Self::Proxy | Self::Capture => 1,
+            Self::Import | Self::Thumbnail | Self::Proxy | Self::Capture | Self::Export => 1,
         }
     }
 }
@@ -133,6 +137,7 @@ mod tests {
             JobKind::Proxy,
             JobKind::Download,
             JobKind::Capture,
+            JobKind::Export,
         ] {
             assert_eq!(JobKind::parse(kind.as_str()), Some(kind));
         }
