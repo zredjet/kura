@@ -91,8 +91,9 @@
 | | `download_prefs_get()` / `download_prefs_set(prefs)` | Cookie の読み込み元と規則（app.json。規則の正規表現と引数を確かめる。ADR-99） |
 | ジョブ | `job_retry(id)` / `job_prioritize(id)` / `job_log(id)` → 文字 | 再試行・先に取得・ログの末尾 256KB（ADR-103） |
 | キャプチャ | `capture_rules_list()` / `capture_rule_save(id?, rule)` / `capture_rule_delete(id)` / `capture_rules_reorder(ids)` | ルール（名前・URL パターン・撮り方・対象・非表示・幅・スクロール・待ち・保存先・有効）。保存のときに確かめる（http(s) のパターン、要素のみなら対象が要る、幅 320〜3840） |
-| | `capture_run(url, ruleId)` → JobId / `capture_login(url?)` | 撮影のジョブを積む（`download_detect` の `capture` に一致したルールが入る）。ログイン用に同じプロファイルの Chrome を開く |
-| | `browser_open(url)` / `browser_status()` → URL? / `browser_close()` / `browser_snapshot()` → `{ title, url, itemIds, added }` | 見たままキャプチャ（アプリ内ブラウザ。ADR-109） |
+| | `capture_run(url, ruleId)` → JobId | 撮影のジョブを積む（`download_detect` の `capture` に一致したルールが入る） |
+| | `capture_login(url?)` / `capture_login_status()` → bool / `capture_login_snapshot(fullPage)` → `{ title, url, itemIds, added, ruleName?, truncated }` / `capture_login_close()` | ログイン用の Chrome を開く（開いていれば新しいタブで URL）、開いているか、前面のタブを撮る、閉じる（ADR-111） |
+| | `browser_open(url)` / `browser_status()` → URL? / `browser_close()` / `browser_snapshot()` → 同上 | 見たままキャプチャ（アプリ内ブラウザ。ADR-109） |
 | ツール | `tools_status()` → `ToolInfo[]` / `tools_set_path(tool, path?)` / `tools_update()` → `{ brewCommand?, outputs }` | 版・場所・Homebrew 版か。場所の指定（app.json）。「更新を確認」（ADR-100） |
 | 設定 | `settings_get(keys)` / `settings_set(map)` | |
 | 外観 | `appearance_get()` → `Appearance` | OS の表示設定（「透明度を下げる」）。起動時に `<html data-reduce-transparency>` へ反映する（§11） |
@@ -237,16 +238,17 @@ import_start:    ジョブとして実行
   3. `scroll_times` 回スクロールして遅延読み込みを発火させ、先頭に戻す
   4. `element`：対象要素の範囲を clip して撮影。`full_page`：`captureBeyondViewport` でページ全体。`viewport`：表示範囲
   5. PNG を staging に保存 → 取り込み（タグ `キャプチャ`、`サイト:<ホスト>`、source_url）
-- **ログイン**：「ログイン用に開く」で同じプロファイルの Chrome を画面ありで起動し、ユーザーにログインしてもらう。
+- **ログイン**：「ログイン用に開く」で同じプロファイルの Chrome を画面ありで起動し、ユーザーにログインしてもらう。開いているページはそのまま撮れる（ADR-111）。
 - **見たままキャプチャ**：アプリ内の別ウィンドウ（WebviewWindow）でページを開き、ボタンで WKWebView の `takeSnapshot` を呼んで表示範囲を保存する（v1 は表示範囲のみ）。
 
 ### 10.1 実装（M8）
 
 - **ルール**（`kura_core::capture::rules`）：`capture_rules` の CRUD と並べ替え。URL パターンの `*` は `/` を含む任意の文字列（大文字小文字は区別しない）。URL の欄ではキャプチャのルールをダウンロードより先に見る（ADR-105）。
 - **ジョブ**（`kind = 'capture'`、同時に 1 つ）：Chrome を `--headless --remote-debugging-port=0` で起動 → プロファイルの `DevToolsActivePort` の 127.0.0.1 に接続 → 新しいページを作って手順 1〜4（`capture::shoot`。ADR-108）→ Chrome をプロセスグループごと止める → PNG を取り込みと同じ方法で配置して登録（`item_tags.source = 'capture'`、`source_site = 'capture'`）。ルールの `last_run_at` / `last_status`（`ok` / `failed`）も記録する。ログイン用の Chrome がプロファイルを使っていれば撮らない。
+- **ログイン用の Chrome**（`capture::login`）：DevTools を 127.0.0.1 の空いているポートで開いて起動し、アプリがつないだまま持つ（`AppState`）。前面のタブを `shoot_live`（読み込み・画面の大きさを変えず、隠す要素は撮るあいだだけ）で撮り、その場で登録する。アプリを終えるとき・「閉じる」で閉じる（ADR-111）。
 - **見たままキャプチャ**：`browser_open` でラベル `capture-browser` のウィンドウを開く（アプリの権限なし、http / https だけ）。`browser_snapshot` で Swift の `kura_snapshot_webview` が PNG を書き、その場で登録する（ADR-109）。
 - **セキュリティ**：ADR-107。
-- **確認**：`cargo test -p kura-core capture -- --ignored` で、127.0.0.1 の小さなページを本物の Chrome で撮る（要素のみ・ページ全体・表示範囲）。
+- **確認**：`cargo test -p kura-core capture -- --ignored` で、127.0.0.1 の小さなページを本物の Chrome で撮る（ヘッドレスの要素のみ・ページ全体・表示範囲と、ログイン用の Chrome の開いているタブ）。
 
 ## 11. ウィンドウと macOS 固有の設定
 
