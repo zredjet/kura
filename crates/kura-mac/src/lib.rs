@@ -5,16 +5,19 @@
 //! - `media_backend`：macOS の実装で扱えない形式を ffmpeg に回す組み合わせ
 //! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
 //! - `find_chrome`・`snapshot_webview`：キャプチャ用の Google Chrome の場所と、WKWebView の表示範囲の撮影
+//! - `reveal_in_finder`・`volume_capacity`：Finder で見せる、ボリュームの容量
 //!
 //! macOS 以外では同じ関数・型が「扱えない」を返すだけの空の実装になり、ワークスペース全体がビルドできる。
 
 mod browser;
 mod external;
+mod files;
 
 pub use browser::{
     SnapshotDone, SnapshotInfo, find_chrome, frontmost_pid, play_capture_sound, snapshot_webview,
 };
 pub use external::{ExternalPlayer, open_in_player};
+pub use files::{VolumeCapacity, reveal_in_finder, volume_capacity};
 
 use std::path::Path;
 use std::sync::Arc;
