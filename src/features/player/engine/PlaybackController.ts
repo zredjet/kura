@@ -8,6 +8,7 @@ import type {
   MediaPort,
   PlayerSnapshot,
   Queue,
+  RepeatMode,
   SlotKind,
   SlotPhase,
 } from './types';
@@ -59,7 +60,11 @@ export class PlaybackController {
   private volume = 0.8;
   private prefs: ControllerPrefs = { throughImages: true, loop: false, imageMs: 8000 };
   private imageOverride: number | null = null;
-  private repeat = false;
+  private repeat: RepeatMode = 'off';
+  /** キューの終わりで「全体を繰り返す」とき、作り直しを頼む先（なければ先頭へ戻る）。 */
+  private wrapHandler: (() => void) | null = null;
+  /** 始める位置（再開・トリム）。 */
+  private pendingStartMs = 0;
 
   // 今のスロットの数え方
   private positionMs = 0;
@@ -156,18 +161,31 @@ export class PlaybackController {
       imageOverridden: this.imageOverride !== null,
       bgm: this.bgmInfo(item?.kind as SlotKind | undefined),
       repeat: this.repeat,
+      groupIndex: queue?.groups.length ? (queue.groupIndex[this.index] ?? null) : null,
+      groupCount: queue?.groups.length ?? 0,
+      indexInUnit: queue?.indexInUnit[this.index] ?? 0,
+      unitLen: queue?.unitLen[this.index] ?? 1,
     };
   }
 
-  /** キューを読み込んで `index` から再生する。 */
-  start(queue: Queue, index = 0): void {
+  /** キューを読み込んで `index` から（`positionMs` の位置から）再生する。 */
+  start(queue: Queue, index = 0, positionMs = 0): void {
     this.leave();
     this.stopAll();
     this.queue = queue;
     this.playing = true;
-    this.imageOverride = null;
     this.startTicker();
-    this.enter(Math.min(Math.max(0, index), queue.itemIds.length - 1));
+    this.enter(Math.min(Math.max(0, index), queue.itemIds.length - 1), positionMs);
+  }
+
+  /** 画像の表示時間をこのセッションで変えた分を戻す（新しいキューを始めるとき）。 */
+  resetImageOverride(): void {
+    this.imageOverride = null;
+  }
+
+  /** キューの終わりで全体を繰り返すとき、キューの作り直しを頼む先（シャッフルでシードを固定していないとき）。 */
+  onWrap(handler: (() => void) | null): void {
+    this.wrapHandler = handler;
   }
 
   /** 再生を終える（今のスロットを報告して、すべて止める）。 */
@@ -220,7 +238,43 @@ export class PlaybackController {
 
   /** 次のスロット（終わりならリピートで先頭、でなければ終える）。 */
   next(): void {
+    this.completed = false;
     this.advance();
+  }
+
+  /** 次のまとまりの先頭（ユニット単位。ファイル単位では次のスロット。§6.3 の ⇧→）。 */
+  nextUnit(): void {
+    const queue = this.queue;
+    const group = this.groupAt(this.index);
+    if (!queue || !group) {
+      this.next();
+      return;
+    }
+    const target = group.start + group.len;
+    if (target < queue.itemIds.length) {
+      this.enter(target);
+    } else if (this.repeat === 'all') {
+      this.completed = false;
+      this.advanceFrom(queue.itemIds.length - 1);
+    } else {
+      this.finish();
+    }
+  }
+
+  /** 今のまとまりの先頭（すでに先頭なら前のまとまりの先頭。ファイル単位では前のスロット。§6.3 の ⇧←）。 */
+  prevUnit(): void {
+    const queue = this.queue;
+    const group = this.groupAt(this.index);
+    if (!queue || !group) {
+      this.prev();
+      return;
+    }
+    if (this.index > group.start) {
+      this.enter(group.start);
+      return;
+    }
+    const previous = this.groupAt(group.start - 1);
+    this.enter(previous ? previous.start : group.start);
   }
 
   /** 前へ：再生位置が 3 秒以上なら頭に戻し、未満なら前のスロット（docs/playlists.md §6.3）。 */
@@ -278,7 +332,7 @@ export class PlaybackController {
     this.emit();
   }
 
-  setRepeat(repeat: boolean): void {
+  setRepeat(repeat: RepeatMode): void {
     this.repeat = repeat;
     this.emit();
   }
@@ -301,7 +355,7 @@ export class PlaybackController {
 
   // ===== スロットの出入り =====
 
-  private enter(index: number): void {
+  private enter(index: number, positionMs = 0): void {
     const queue = this.queue;
     if (!queue) {
       return;
@@ -309,6 +363,7 @@ export class PlaybackController {
     this.leave();
     const token = ++this.enterToken;
     this.index = index;
+    this.pendingStartMs = Math.max(positionMs, queue.startMs[index] ?? 0);
     this.positionMs = 0;
     this.durationMs = null;
     this.playedMs = 0;
@@ -361,6 +416,7 @@ export class PlaybackController {
     }
     if (kind === 'image') {
       this.durationMs = this.imageMs();
+      this.positionMs = Math.min(this.pendingStartMs, this.durationMs);
       this.phase = 'playing';
       this.lastTick = this.deps.clock.now();
     } else if (item.proxyState === 'pending') {
@@ -385,6 +441,7 @@ export class PlaybackController {
     const report = {
       itemId,
       unitId,
+      playlistId: queue.playlist?.id ?? null,
       unitStart: unitId !== null && queue.indexInUnit[this.index] === 0,
       playedMs: Math.round(this.playedMs),
       completed: this.completed,
@@ -407,16 +464,41 @@ export class PlaybackController {
 
   /** 今のスロットが終わった・次へ：次のスロットへ。終わりなら止める。 */
   private advance(): void {
+    // 1 曲リピートは、最後まで再生したときだけ同じスロットをもう一度
+    if (this.repeat === 'one' && this.completed) {
+      this.enter(this.index);
+      return;
+    }
+    this.advanceFrom(this.index);
+  }
+
+  private advanceFrom(index: number): void {
     const queue = this.queue;
     if (!queue) {
       return;
     }
-    const next = nextIndex(this.index, queue.itemIds.length, this.repeat);
+    const atEnd = index + 1 >= queue.itemIds.length;
+    if (atEnd && this.repeat === 'all' && this.wrapHandler) {
+      this.leave();
+      this.wrapHandler();
+      return;
+    }
+    const next = nextIndex(index, queue.itemIds.length, this.repeat === 'all');
     if (next === null) {
       this.finish();
     } else {
       this.enter(next);
     }
+  }
+
+  /** `index` のスロットが入っているまとまり（ユニット単位のときだけ）。 */
+  private groupAt(index: number): { start: number; len: number } | null {
+    const queue = this.queue;
+    if (!queue || queue.groups.length === 0 || index < 0) {
+      return null;
+    }
+    const group = queue.groups[queue.groupIndex[index] ?? -1];
+    return group ? { start: group.start, len: group.len } : null;
   }
 
   /** キューの終わり。 */
@@ -443,6 +525,10 @@ export class PlaybackController {
       }
       video.src = url;
       video.volume = clampVolume(this.volume);
+      if (this.pendingStartMs > 0) {
+        video.currentTime = this.pendingStartMs / 1000;
+        this.lastMediaSec = this.pendingStartMs / 1000;
+      }
       if (this.playing) {
         playSafely(video);
       }
@@ -458,6 +544,10 @@ export class PlaybackController {
     const next = this.tracks[target];
     next.fader.cancel();
     next.el.src = url;
+    if (this.pendingStartMs > 0) {
+      next.el.currentTime = this.pendingStartMs / 1000;
+      this.lastMediaSec = this.pendingStartMs / 1000;
+    }
     const audible = this.bgmStatus === 'playing' && this.playing;
     if (audible) {
       next.fader.set(0);
@@ -701,6 +791,13 @@ export class PlaybackController {
         this.lastMediaSec = sec;
         this.positionMs = sec * 1000;
         this.durationMs = finiteMs(media.duration) ?? this.durationMs;
+        // トリムの終わり
+        const endMs = this.queue.endMs[this.index];
+        if (endMs !== null && endMs !== undefined && this.positionMs >= endMs) {
+          this.completed = true;
+          this.advance();
+          return;
+        }
       }
     }
     this.emit();

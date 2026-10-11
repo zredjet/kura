@@ -13,11 +13,14 @@ import { SearchIcon } from '../../components/icons/SearchIcon';
 import { SparkleIcon } from '../../components/icons/SparkleIcon';
 import { TagIcon } from '../../components/icons/TagIcon';
 import { ja } from '../../i18n/ja';
-import type { ListView } from '../../ipc/items';
+import { type ListView, utcOffsetMinutes } from '../../ipc/items';
 import { type QueryCheckDto, querySuggest, queryParse, type SuggestionDto } from '../../ipc/search';
 import { formatCount } from '../../lib/format';
 import { useSearchStore } from '../../stores/searchStore';
+import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
+import { viewTitle } from '../library/viewTitle';
+import { startPlayback } from '../player/playerActions';
 import { clauseParts, currentWord, isComplete, joinClauses } from './clauses';
 import styles from './SearchPalette.module.css';
 import { saveAsSmartFolder, updateSmartQuery } from './searchActions';
@@ -181,6 +184,30 @@ function PaletteBody() {
     close();
   };
 
+  /** ⇧↵：開いている一覧の中で条件に合うものを、ランダムな順で再生する（docs/search-query.md §6）。 */
+  const randomPlay = async () => {
+    const text = finalText();
+    const parsed = await queryParse(text, scope).catch(() => null);
+    if (parsed?.error) {
+      setCheck(parsed);
+      return;
+    }
+    close();
+    const { collapseUnits } = useViewStore.getState();
+    const { folders, smartFolders } = useSidebarStore.getState();
+    void startPlayback(
+      {
+        kind: 'view',
+        view: scope,
+        query: text,
+        collapseUnits,
+        utcOffsetMinutes: utcOffsetMinutes(),
+      },
+      viewTitle(scope, folders, smartFolders),
+      { shuffle: true },
+    );
+  };
+
   const save = async () => {
     const text = finalText();
     const parsed = await queryParse(text, scope).catch(() => null);
@@ -227,6 +254,8 @@ function PaletteBody() {
       e.preventDefault();
       if (e.metaKey) {
         void save();
+      } else if (e.shiftKey && !editing && !createSmart) {
+        void randomPlay();
       } else if (active >= 0 && suggestions[active]) {
         accept(suggestions[active]);
       } else {
@@ -446,6 +475,12 @@ function PaletteBody() {
             <kbd className={styles.kbd}>↵</kbd>
             {editing ? t.keys.update(editing.name) : createSmart ? t.keys.save : t.keys.apply}
           </span>
+          {!editing && !createSmart && (
+            <span className={styles.hint}>
+              <kbd className={styles.kbd}>⇧↵</kbd>
+              {t.keys.randomPlay}
+            </span>
+          )}
           {!editing && !createSmart && (
             <span className={styles.hint}>
               <kbd className={styles.kbd}>⌘↵</kbd>

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-import type { PlayerPrefsDto } from '../../ipc/player';
+import type { PlayerPrefsDto, PlaySourceDto } from '../../ipc/player';
 import type { PlayerSnapshot, Queue } from './engine/types';
 
 /** シアター（全画面）か、ライブラリの上のミニプレーヤーか。 */
@@ -30,15 +30,23 @@ const IDLE: PlayerSnapshot = {
   imageMs: DEFAULT_PREFS.imageDurationMs,
   imageOverridden: false,
   bgm: null,
-  repeat: false,
+  repeat: 'off',
+  groupIndex: null,
+  groupCount: 0,
+  indexInUnit: 0,
+  unitLen: 1,
 };
 
 interface PlayerState {
   /** 再生キューがあるか（ミニプレーヤー・シアターを出すか）。 */
   active: boolean;
   mode: PlayerMode;
-  /** どこから再生したか（「すべて」・フォルダ名など）。 */
+  /** どこから再生したか（「すべて」・フォルダ名・プレイリスト名など）。 */
   title: string;
+  /** キューの元（シャッフルの切り替え・並べ直す・リピートで作り直すときに使う）。 */
+  source: PlaySourceDto | null;
+  /** その場のキュー（選択・一覧）でシャッフルしているか（プレイリストはプレイリストの設定）。 */
+  shuffle: boolean;
   queue: Queue | null;
   snapshot: PlayerSnapshot;
   panel: PlayerPanel;
@@ -48,7 +56,9 @@ interface PlayerState {
   prefs: PlayerPrefsDto;
   /** タグの入力に移るよう頼まれたか（シアターの T・「タグを編集」）。 */
   focusTags: number;
-  open: (queue: Queue, title: string) => void;
+  open: (queue: Queue, title: string, source: PlaySourceDto, shuffle: boolean) => void;
+  /** キューを作り直した（同じ元から）。 */
+  replaceQueue: (queue: Queue, shuffle: boolean) => void;
   close: () => void;
   setMode: (mode: PlayerMode) => void;
   setPanel: (panel: PlayerPanel) => void;
@@ -63,6 +73,8 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   active: false,
   mode: 'theater',
   title: '',
+  source: null,
+  shuffle: false,
   queue: null,
   snapshot: IDLE,
   panel: 'queue',
@@ -70,8 +82,10 @@ export const usePlayerStore = create<PlayerState>((set) => ({
   history: [],
   prefs: DEFAULT_PREFS,
   focusTags: 0,
-  open: (queue, title) => set({ active: true, mode: 'theater', title, queue, history: [] }),
-  close: () => set({ active: false, queue: null, snapshot: IDLE, history: [] }),
+  open: (queue, title, source, shuffle) =>
+    set({ active: true, mode: 'theater', title, source, shuffle, queue, history: [] }),
+  replaceQueue: (queue, shuffle) => set({ queue, shuffle }),
+  close: () => set({ active: false, queue: null, source: null, snapshot: IDLE, history: [] }),
   setMode: (mode) => set({ mode }),
   setPanel: (panel) => set({ panel }),
   togglePanel: (panel) => set((s) => ({ panel: s.panel === panel ? null : panel })),

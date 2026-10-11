@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 
 import { setRating } from '../library/actions';
 import { IMAGE_STEP_MS } from './PlayBar';
-import { playerController } from './playerActions';
+import { cycleRepeat, playerController, toggleShuffle } from './playerActions';
 import { usePlayerStore } from './playerStore';
 
 /** 文字を入力している場所ではキー操作を奪わない。 */
@@ -47,11 +47,22 @@ export function handlePlayerKey(e: KeyboardEvent): boolean {
       controller.togglePlay();
       return true;
     case 'ArrowRight':
-      // ファイル単位のキューでは ⇧→ も次のスロット（ユニット単位は M6）
-      controller.next();
+      // ⇧→ はユニット単位なら次のユニットの先頭（ファイル単位では次のスロット）
+      if (e.shiftKey) {
+        controller.nextUnit();
+      } else {
+        controller.next();
+      }
       return true;
     case 'ArrowLeft':
-      controller.prev();
+      if (e.shiftKey) {
+        controller.prevUnit();
+      } else {
+        controller.prev();
+      }
+      return true;
+    case 's':
+      void toggleShuffle();
       return true;
     case '[':
       controller.stepImage(-IMAGE_STEP_MS);
@@ -63,7 +74,7 @@ export function handlePlayerKey(e: KeyboardEvent): boolean {
       store.requestTagFocus();
       return true;
     case 'r':
-      controller.setRepeat(!store.snapshot.repeat);
+      cycleRepeat();
       return true;
     case 'Escape':
       store.setMode('mini');

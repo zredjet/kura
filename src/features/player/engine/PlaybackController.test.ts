@@ -60,6 +60,7 @@ function item(id: number, kind: string, extra: Partial<ItemSummaryDto> = {}): It
     capturedAt: null,
     thumbState: 'ready',
     proxyState: kind === 'image' ? 'not_needed' : 'ready',
+    lastPlayedAt: null,
     ...extra,
   };
 }
@@ -71,8 +72,44 @@ function queueOf(ids: number[], imageMs: (number | null)[] = []): Queue {
     indexInUnit: ids.map(() => 0),
     unitLen: ids.map(() => 1),
     imageDurationMs: ids.map((_, i) => imageMs[i] ?? null),
+    startMs: ids.map(() => null),
+    endMs: ids.map(() => null),
+    groupIndex: [],
+    groups: [],
     totalMs: 0,
+    seed: '0000000000000001',
+    granularity: 'file',
+    startIndex: 0,
+    startPositionMs: 0,
+    playlist: null,
   };
+}
+
+/** ユニット単位のキュー（`sizes` 件ずつのまとまり）。 */
+function unitQueue(ids: number[], sizes: number[]): Queue {
+  const queue = queueOf(
+    ids,
+    ids.map(() => 1000),
+  );
+  let start = 0;
+  queue.granularity = 'unit';
+  sizes.forEach((len, g) => {
+    queue.groups.push({
+      entryId: g + 1,
+      target: { kind: 'unit', id: g + 1 },
+      name: `u${g + 1}`,
+      start,
+      len,
+    });
+    for (let i = 0; i < len; i++) {
+      queue.groupIndex.push(g);
+      queue.indexInUnit[start + i] = i;
+      queue.unitLen[start + i] = len;
+      queue.unitIds[start + i] = g + 1;
+    }
+    start += len;
+  });
+  return queue;
 }
 
 interface Harness {
@@ -353,7 +390,7 @@ describe('スロットの進み方', () => {
     expect(h.last().phase).toBe('ended');
     expect(h.last().playing).toBe(false);
 
-    h.controller.setRepeat(true);
+    h.controller.setRepeat('all');
     h.controller.play();
     await advance(0);
     h.video.fire('ended');
@@ -405,5 +442,103 @@ describe('プロキシ', () => {
     await advance(POLL_MS);
     h.video.fire('error');
     expect(h.last().phase).toBe('failed');
+  });
+});
+
+describe('プレイリスト（M6）', () => {
+  it('⇧→ は次のユニットの先頭、⇧← は今のユニットの先頭（先頭なら前のユニット）', async () => {
+    const ids = [1, 2, 3, 4, 5, 6];
+    const h = setup(ids.map((id) => item(id, 'image')));
+    h.controller.start(unitQueue(ids, [3, 2, 1]));
+    await advance(0);
+    h.controller.next();
+    await advance(0);
+    expect(h.last().index).toBe(1);
+    expect([h.last().groupIndex, h.last().groupCount, h.last().indexInUnit]).toEqual([0, 3, 1]);
+    h.controller.nextUnit();
+    await advance(0);
+    expect(h.last().index).toBe(3);
+    h.controller.next();
+    await advance(0);
+    h.controller.prevUnit();
+    await advance(0);
+    expect(h.last().index).toBe(3);
+    h.controller.prevUnit();
+    await advance(0);
+    expect(h.last().index).toBe(0);
+    // ファイル単位では次・前のスロットと同じ
+    const f = setup(ids.map((id) => item(id, 'image')));
+    f.controller.start(queueOf(ids));
+    await advance(0);
+    f.controller.nextUnit();
+    await advance(0);
+    expect(f.last().index).toBe(1);
+    expect(f.last().groupIndex).toBeNull();
+  });
+
+  it('1 曲リピートは最後まで再生したら同じスロット、次へは次のスロット', async () => {
+    const h = setup([item(1, 'video'), item(2, 'video')]);
+    h.controller.start(queueOf([1, 2]));
+    h.controller.setRepeat('one');
+    await advance(0);
+    h.video.fire('ended');
+    await advance(0);
+    expect(h.last().index).toBe(0);
+    expect(h.reports.at(-1)).toMatchObject({ itemId: 1, completed: true });
+    h.controller.next();
+    await advance(0);
+    expect(h.last().index).toBe(1);
+  });
+
+  it('全体リピートの終わりで作り直しを頼む', async () => {
+    const h = setup([item(1, 'video')]);
+    let wraps = 0;
+    h.controller.onWrap(() => {
+      wraps += 1;
+    });
+    h.controller.start(queueOf([1]));
+    h.controller.setRepeat('all');
+    await advance(0);
+    h.video.fire('ended');
+    expect(wraps).toBe(1);
+    expect(h.reports).toHaveLength(1);
+  });
+
+  it('トリムの始まりから再生し、終わりで次へ。再開の位置からも始められる', async () => {
+    const h = setup([item(1, 'video'), item(2, 'image')]);
+    const queue = queueOf([1, 2], [null, 8000]);
+    queue.startMs[0] = 2000;
+    queue.endMs[0] = 4000;
+    h.controller.start(queue);
+    await advance(0);
+    expect(h.video.currentTime).toBe(2);
+    h.video.currentTime = 4.1;
+    await advance(TICK_MS);
+    expect(h.last().index).toBe(1);
+
+    const r = setup([item(1, 'image')]);
+    r.controller.start(queueOf([1], [8000]), 0, 5000);
+    await advance(0);
+    expect(r.last().positionMs).toBe(5000);
+    await advance(3000 + TICK_MS);
+    expect(r.last().phase).toBe('ended');
+  });
+
+  it('プレイリストから再生したら、報告にプレイリストを付ける', async () => {
+    const h = setup([item(1, 'image'), item(2, 'image')]);
+    const queue = queueOf([1, 2], [1000, 1000]);
+    queue.playlist = {
+      id: 9,
+      name: '夜の作業',
+      kind: 'manual',
+      shuffle: false,
+      seedLocked: false,
+      repeatMode: 'off',
+      bgmThroughImages: true,
+      maxSameKindRun: 2,
+    };
+    h.controller.start(queue);
+    await advance(1000 + TICK_MS);
+    expect(h.reports[0]).toMatchObject({ itemId: 1, playlistId: 9 });
   });
 });

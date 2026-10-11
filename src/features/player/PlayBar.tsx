@@ -3,6 +3,8 @@ import type { CSSProperties } from 'react';
 import { PauseIcon } from '../../components/icons/PauseIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
 import { RepeatIcon } from '../../components/icons/RepeatIcon';
+import { RepeatOneIcon } from '../../components/icons/RepeatOneIcon';
+import { ShuffleIcon } from '../../components/icons/ShuffleIcon';
 import { SkipBackIcon } from '../../components/icons/SkipBackIcon';
 import { SkipForwardIcon } from '../../components/icons/SkipForwardIcon';
 import { VolumeIcon } from '../../components/icons/VolumeIcon';
@@ -10,7 +12,7 @@ import { ja } from '../../i18n/ja';
 import { getItemDetail } from '../../ipc/items';
 import { formatDuration } from '../../lib/format';
 import { useLoaded } from '../library/inspector/useLoaded';
-import { playerController, updatePlayerPrefs } from './playerActions';
+import { cycleRepeat, playerController, toggleShuffle, updatePlayerPrefs } from './playerActions';
 import { usePlayerStore } from './playerStore';
 import styles from './PlayBar.module.css';
 
@@ -21,11 +23,12 @@ export const IMAGE_STEP_MS = 1000;
 
 /**
  * 再生バー（Player.dc.html の下のガラスのカプセル）：再生位置、題名と「種類 · タグ」、
- * 前・再生／一時停止・次・リピート、画像の表示時間、音量。シャッフルはプレイリストと一緒に M6 で足す。
+ * シャッフル・前・再生／一時停止・次・リピート（オフ → 全体 → 1 曲）、画像の表示時間、音量。
  */
 export function PlayBar() {
   const snapshot = usePlayerStore((s) => s.snapshot);
   const volume = usePlayerStore((s) => s.prefs.volume);
+  const shuffle = usePlayerStore((s) => s.queue?.playlist?.shuffle ?? s.shuffle);
   const controller = playerController();
   const item = snapshot.itemId !== null ? controller.item(snapshot.itemId) : undefined;
   const duration = snapshot.durationMs ?? item?.durationMs ?? null;
@@ -60,6 +63,15 @@ export function PlayBar() {
         <div className={styles.transport}>
           <button
             type="button"
+            className={styles.toggle}
+            aria-label={t.shuffle}
+            aria-pressed={shuffle}
+            onClick={() => void toggleShuffle()}
+          >
+            <ShuffleIcon size={17} strokeWidth={2} />
+          </button>
+          <button
+            type="button"
             className={styles.small}
             aria-label={t.previous}
             onClick={() => controller.prev()}
@@ -85,11 +97,15 @@ export function PlayBar() {
           <button
             type="button"
             className={styles.toggle}
-            aria-label={t.repeat}
-            aria-pressed={snapshot.repeat}
-            onClick={() => controller.setRepeat(!snapshot.repeat)}
+            aria-label={snapshot.repeat === 'one' ? t.repeatOne : t.repeat}
+            aria-pressed={snapshot.repeat !== 'off'}
+            onClick={cycleRepeat}
           >
-            <RepeatIcon size={17} strokeWidth={2} />
+            {snapshot.repeat === 'one' ? (
+              <RepeatOneIcon size={17} strokeWidth={2} />
+            ) : (
+              <RepeatIcon size={17} strokeWidth={2} />
+            )}
           </button>
         </div>
         <div className={styles.side}>

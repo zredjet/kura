@@ -15,9 +15,40 @@
 
 .head {
   display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 0 var(--space-1-5);
+}
+
+.headText {
+  display: flex;
   flex-direction: column;
   gap: var(--space-0-5);
-  padding: 0 var(--space-1-5);
+  min-width: 0;
+}
+
+/* 並べ直す（Player.dc.html：高さ 30px のカプセル） */
+.reshuffle {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1-5);
+  height: 30px;
+  padding: 0 var(--space-2-5);
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-pill);
+  background: var(--fill-1);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.reshuffle:hover:not(:disabled) {
+  background: var(--fill-2);
+}
+
+.reshuffle:disabled {
+  opacity: 0.45;
 }
 
 .heading {
@@ -90,6 +121,66 @@ button.row:hover {
 
 .row[data-played] {
   opacity: 0.55;
+}
+
+/* ユニットの中のスロットは少し下げる */
+.indented {
+  padding-left: var(--space-6);
+}
+
+/* ユニットの見出し（ユニット単位のキュー）：押すと開閉、ダブルクリックでその先頭から */
+.groupRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  height: 32px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-align: left;
+}
+
+.groupRow:hover {
+  background: var(--fill-1);
+}
+
+.groupRow[data-current] {
+  color: var(--accent);
+  font-weight: var(--weight-semibold);
+}
+
+.groupRow[data-played] {
+  opacity: 0.55;
+}
+
+.chevron {
+  display: flex;
+  flex: none;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.chevron[data-open] {
+  transform: rotate(90deg);
+}
+
+.groupName {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.groupCount {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
 }
 
 .thumb {

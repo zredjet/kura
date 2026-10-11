@@ -52,8 +52,9 @@ export function Theater() {
 /** 上部：戻る・見出し・右パネルの切り替え。 */
 function TopBar() {
   const title = usePlayerStore((s) => s.title);
-  const index = usePlayerStore((s) => s.snapshot.index);
-  const length = usePlayerStore((s) => s.snapshot.length);
+  const snapshot = usePlayerStore((s) => s.snapshot);
+  const shuffle = usePlayerStore((s) => s.queue?.playlist?.shuffle ?? s.shuffle);
+  const seed = usePlayerStore((s) => s.queue?.seed ?? '');
   const panel = usePlayerStore((s) => s.panel);
   const togglePanel = usePlayerStore((s) => s.togglePanel);
   const requestTagFocus = usePlayerStore((s) => s.requestTagFocus);
@@ -72,7 +73,19 @@ function TopBar() {
       <div className={styles.heading} data-tauri-drag-region>
         <span className={styles.title}>{title}</span>
         <span className={styles.position}>
-          {t.position(formatCount(index + 1), formatCount(length))}
+          {[
+            snapshot.groupIndex !== null
+              ? t.unitPosition(
+                  formatCount(snapshot.groupIndex + 1),
+                  formatCount(snapshot.groupCount),
+                  formatCount(snapshot.indexInUnit + 1),
+                  formatCount(snapshot.unitLen),
+                )
+              : t.position(formatCount(snapshot.index + 1), formatCount(snapshot.length)),
+            shuffle ? t.shuffleSeed(seed.slice(-4).toUpperCase()) : null,
+          ]
+            .filter(Boolean)
+            .join(' · ')}
         </span>
       </div>
       <div className={styles.segments} role="group" aria-label={t.panels}>

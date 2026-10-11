@@ -1,11 +1,14 @@
 import type { ItemSummaryDto } from '../../../ipc/items';
-import type { QueueDto } from '../../../ipc/player';
+import type { PlayQueueDto } from '../../../ipc/player';
 
 /** スロットの種類。 */
 export type SlotKind = 'image' | 'video' | 'audio';
 
 /** 再生キュー（Rust の Slot 列を列ごとの配列で持つ。docs/playlists.md §5.1）。 */
-export type Queue = QueueDto;
+export type Queue = PlayQueueDto;
+
+/** 繰り返し（オフ・全体・1 曲）。 */
+export type RepeatMode = 'off' | 'all' | 'one';
 
 /** 再生に使う要素の共通部分（HTMLMediaElement をそのまま渡せる。テストでは偽物）。 */
 export type MediaPort = Pick<
@@ -47,6 +50,8 @@ export interface SlotReport {
   playedMs: number;
   completed: boolean;
   durationMs: number | null;
+  /** プレイリストから再生したとき。 */
+  playlistId: number | null;
 }
 
 /** 今のスロットの状態。 */
@@ -85,7 +90,13 @@ export interface PlayerSnapshot {
   imageOverridden: boolean;
   /** 背景で流している音楽（今のスロットが画像のときだけ）。 */
   bgm: BgmInfo | null;
-  repeat: boolean;
+  repeat: RepeatMode;
+  /** ユニット単位のとき、今のまとまりの番号と数（「ユニット 3 / 12」）。ファイル単位では null。 */
+  groupIndex: number | null;
+  groupCount: number;
+  /** まとまりの中の位置と件数（「2 / 10」）。 */
+  indexInUnit: number;
+  unitLen: number;
 }
 
 /** コントローラが外とやり取りするもの（テストでは偽物）。 */
