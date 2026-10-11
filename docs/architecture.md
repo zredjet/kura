@@ -89,6 +89,8 @@
 | 書き出し | `export_start(dest, entries)` → JobId | 選んだもの（一覧の ID。ユニットは印付き）を書き出すジョブを積む。書き出し先はあるフォルダで、ライブラリの中は受け付けない（§14） |
 | バックアップ | `backups_list()` → `Backup[]` / `backup_now()` → `Backup` | DB のバックアップの一覧（新しい順）と、今すぐ作る（§14） |
 | | `reveal_path(path)` | Finder で見せる（書き出したもの・バックアップ・ライブラリ） |
+| 設定 | `library_usage()` → `{ libraryBytes, volumeTotalBytes?, volumeAvailableBytes? }` / `library_check()` → `Integrity` | ライブラリのファイルの合計（ゴミ箱を含む）とボリュームの容量・空き、整合性チェックをいま行う（M9） |
+| | `download_archives()` → `ArchiveStatus[]` / `download_archive_clear(tool)` | 取得済みの記録の件数と、消す（`archives/` のツールごとの 1 ファイル。M9） |
 | ダウンロード | `download_detect(url)` → `{ url, site, siteLabel, tool, rule?, playlist, toolFound }` | URL の取得方法（規則 → サイトの表 → yt-dlp の汎用）。§9 |
 | | `download_defaults()` / `download_enqueue(url, options)` → JobId | 前回の選択（ライブラリの settings）と、取得を積む（選んだ内容を次回の既定にする）。`options` は画質（best / 1080 / 720 / 480）・音声のみ・保存先のフォルダ・自動タグ（投稿者・サイトのタグ）・再生リストをユニットに |
 | | `downloads_list(limit?)` → `DownloadJob[]` | ダウンロードのジョブを新しい順に（URL・サイト・ツール・題名・件数・入れたアイテムとユニット） |
