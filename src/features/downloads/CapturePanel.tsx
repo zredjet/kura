@@ -5,12 +5,16 @@ import { PlusIcon } from '../../components/icons/PlusIcon';
 import { ja } from '../../i18n/ja';
 import {
   browserStatus,
+  captureLoginStatus,
   type CaptureRuleDto,
   closeBrowser,
+  closeCaptureLogin,
   listCaptureRules,
   openBrowser,
   openCaptureLogin,
   snapshotBrowser,
+  type SnapshotResultDto,
+  snapshotLoginPage,
 } from '../../ipc/capture';
 import { formatCount } from '../../lib/format';
 import { reloadList } from '../../stores/jobsStore';
@@ -93,6 +97,7 @@ export function CapturePanel() {
   const [rules, setRules] = useState<CaptureRuleDto[]>([]);
   const [editing, setEditing] = useState<CaptureRuleDto | 'new' | null>(null);
   const [browserUrl, setBrowserUrl] = useState<string | null>(null);
+  const [loginOpen, setLoginOpen] = useState(false);
   const [taking, setTaking] = useState(false);
   // 保存先の表示をフォルダの名前の変更に合わせる
   useSidebarStore((s) => s.folders);
@@ -108,7 +113,7 @@ export function CapturePanel() {
     };
   }, [load]);
 
-  // アプリ内ブラウザで開いているページ（閉じられたら消す）
+  // アプリ内ブラウザで開いているページと、ログイン用の Chrome が開いているか（閉じられたら消す）
   useEffect(() => {
     let alive = true;
     const check = () => {
@@ -116,6 +121,14 @@ export function CapturePanel() {
         (url) => {
           if (alive) {
             setBrowserUrl(url);
+          }
+        },
+        () => undefined,
+      );
+      captureLoginStatus().then(
+        (open) => {
+          if (alive) {
+            setLoginOpen(open);
           }
         },
         () => undefined,
@@ -152,19 +165,29 @@ export function CapturePanel() {
       return;
     }
     const target = url.trim() === '' || url.trim() === 'https://' ? null : url;
-    openCaptureLogin(target).then(() => notify(t.loginOpened), fail);
+    openCaptureLogin(target).then(() => {
+      setLoginOpen(true);
+      notify(t.loginOpened);
+    }, fail);
   };
 
-  const take = () => {
+  /** 撮ったら知らせて、一覧と件数を読み直す（ジョブを通らないので）。 */
+  const shoot = (run: () => Promise<SnapshotResultDto>) => {
     setTaking(true);
-    snapshotBrowser()
+    run()
       .then((result) => {
-        notify(t.taken(result.title));
-        // 見たままキャプチャはジョブを通らないので、ここで一覧と件数を読み直す
+        const message =
+          result.added === 0
+            ? t.takenDuplicate(result.title)
+            : result.ruleName
+              ? t.takenWithRule(result.title, result.ruleName)
+              : t.taken(result.title);
+        notify(result.truncated ? `${message}${t.takenTruncated}` : message);
         reloadList();
       }, fail)
       .finally(() => setTaking(false));
   };
+  const take = () => shoot(snapshotBrowser);
 
   return (
     <section className={styles.sidePanel} aria-label={t.title}>
@@ -195,6 +218,39 @@ export function CapturePanel() {
               }}
             >
               {t.closeBrowser}
+            </button>
+          </span>
+        </div>
+      )}
+      {loginOpen && (
+        <div className={styles.browserRow}>
+          <span className={styles.browserUrl}>{t.loginRunning}</span>
+          <span className={styles.sideText}>{t.loginHint}</span>
+          <span className={styles.browserActions}>
+            <button
+              type="button"
+              className={`${styles.pillButton} ${styles.pillPrimary}`}
+              disabled={taking}
+              onClick={() => shoot(() => snapshotLoginPage(false))}
+            >
+              {taking ? t.taking : t.loginTake}
+            </button>
+            <button
+              type="button"
+              className={styles.pillButton}
+              disabled={taking}
+              onClick={() => shoot(() => snapshotLoginPage(true))}
+            >
+              {t.loginTakeFull}
+            </button>
+            <button
+              type="button"
+              className={styles.pillButton}
+              onClick={() => {
+                closeCaptureLogin().then(() => setLoginOpen(false), fail);
+              }}
+            >
+              {t.loginClose}
             </button>
           </span>
         </div>

@@ -760,8 +760,16 @@ export const ja = {
       loginTitle: 'ログイン用に開く',
       loginLabel: 'ログインするページの URL（空なら空白のページ）',
       loginOpen: '開く',
-      loginOpened:
-        'Chrome を開きました。ログインしたら閉じてください（開いているあいだは撮影できません）',
+      loginOpened: 'Chrome を開きました。ログインしたら、開いているページをこの欄から撮れます',
+      loginRunning: 'ログイン用の Chrome を開いています（DevTools 接続中）',
+      loginHint:
+        '前面のタブを撮ります。URL がルールに一致すれば、その撮り方を使います。使い終わったら閉じてください。',
+      loginTake: 'このページを撮る',
+      loginTakeFull: 'ページ全体を撮る',
+      loginClose: '閉じる',
+      takenWithRule: (title: string, rule: string) => `「${title}」をルール「${rule}」で撮りました`,
+      takenTruncated: '（長いページのため途中まで）',
+      takenDuplicate: (title: string) => `「${title}」と同じ画像がすでにライブラリにあります`,
       browserOpen: (url: string) => `見たまま：${url}`,
       take: 'このページを撮る',
       taking: '撮影中…',
