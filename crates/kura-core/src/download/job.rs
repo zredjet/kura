@@ -90,7 +90,7 @@ impl JobHandler for DownloadHandler {
         };
         let layout = ctx.library().layout().clone();
         let work = layout.staging_dir().join(work_dir_name(ctx.id()));
-        let archives = layout.root().join("archives");
+        let archives = layout.archives_dir();
         std::fs::create_dir_all(&work)?;
         std::fs::create_dir_all(&archives)?;
 

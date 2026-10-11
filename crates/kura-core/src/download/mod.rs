@@ -1,6 +1,7 @@
 //! ダウンロード（docs/architecture.md §9）。URL の判定・引数・進捗・メタデータの読み取りは純粋関数に分け、
 //! ジョブがそれらを順に使う。
 
+pub mod archive;
 pub mod args;
 pub mod detect;
 pub mod job;

@@ -81,6 +81,11 @@ impl Layout {
         self.root.join("logs")
     }
 
+    /// 取得済みの記録の置き場所（`archives/`。ADR-95）。
+    pub fn archives_dir(&self) -> PathBuf {
+        self.root.join("archives")
+    }
+
     /// DB のバックアップの置き場所（`backups/`。FR-SYS-03）。
     pub fn backups_dir(&self) -> PathBuf {
         self.root.join("backups")

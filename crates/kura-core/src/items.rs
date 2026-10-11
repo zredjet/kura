@@ -757,6 +757,13 @@ pub fn detail(conn: &Connection, id: i64) -> Result<ItemDetail> {
     })
 }
 
+/// ライブラリのファイルの合計サイズ（ゴミ箱を含む。ファイルはゴミ箱を空にするまで残るので）。
+pub fn total_size(conn: &Connection) -> Result<u64> {
+    let mut stmt = conn.prepare_cached("SELECT coalesce(sum(size_bytes), 0) FROM items")?;
+    let total: i64 = stmt.query_row([], |row| row.get(0))?;
+    Ok(u64::try_from(total).unwrap_or(0))
+}
+
 /// 複数選択のインスペクタに出す集計。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectionInfo {
@@ -982,6 +989,17 @@ mod tests {
             rusqlite::params![id, vec![id as u8; 32], w, h, format!("t{id}"), at],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn total_size_counts_every_item_including_the_trash() {
+        let conn = test_conn();
+        assert_eq!(total_size(&conn).unwrap(), 0);
+        insert(&conn, 1, None, None, 1);
+        insert(&conn, 2, None, None, 2);
+        conn.execute("UPDATE items SET trashed_at = 5 WHERE id = 2", [])
+            .unwrap();
+        assert_eq!(total_size(&conn).unwrap(), 20);
     }
 
     #[test]
