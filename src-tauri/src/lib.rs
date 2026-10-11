@@ -56,6 +56,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::library::library_open,
             commands::library::library_restore,
             commands::library::library_info,
+            commands::library::backups_list,
+            commands::library::backup_now,
+            commands::library::reveal_path,
+            commands::export::export_start,
             commands::import::import_preview,
             commands::import::import_start,
             commands::items::items_get,
@@ -151,6 +155,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .events(collect_events![dto::JobProgress, dto::LoginShotEvent])
         // ジョブの結果（resultJson）を読むための型
         .typ::<dto::ImportResultDto>()
+        .typ::<dto::ExportResultDto>()
         // ID・ミリ秒・バイト数は 2^53 を超えないので number として扱う
         .dangerously_cast_bigints_to_number()
 }

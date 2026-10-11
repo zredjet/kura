@@ -201,6 +201,40 @@ impl From<ImportOptionsDto> for ImportOptions {
     }
 }
 
+/// 書き出しの結果（`JobProgress.resultJson` を読むときの型。ADR-120）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResultDto {
+    /// 書き出し先のフォルダ。
+    pub dest: String,
+    pub total: u64,
+    pub exported: u64,
+    pub failed: u64,
+    /// 書いた JSON の名前（終わったとき）。
+    pub manifest: Option<String>,
+}
+
+/// DB のバックアップ 1 つ（FR-SYS-03。ADR-121）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupDto {
+    pub name: String,
+    pub path: String,
+    pub created_at: i64,
+    pub size_bytes: u64,
+}
+
+impl From<kura_core::library::backup::BackupInfo> for BackupDto {
+    fn from(b: kura_core::library::backup::BackupInfo) -> Self {
+        Self {
+            name: b.name,
+            path: b.path.display().to_string(),
+            created_at: b.created_at,
+            size_bytes: b.size_bytes,
+        }
+    }
+}
+
 /// 取り込みの結果（`JobProgress.resultJson` を読むときの型）。
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +265,7 @@ pub enum JobKindDto {
     Proxy,
     Download,
     Capture,
+    Export,
 }
 
 impl From<JobKind> for JobKindDto {
@@ -241,6 +276,7 @@ impl From<JobKind> for JobKindDto {
             JobKind::Proxy => Self::Proxy,
             JobKind::Download => Self::Download,
             JobKind::Capture => Self::Capture,
+            JobKind::Export => Self::Export,
         }
     }
 }
@@ -253,6 +289,7 @@ impl From<JobKindDto> for JobKind {
             JobKindDto::Proxy => Self::Proxy,
             JobKindDto::Download => Self::Download,
             JobKindDto::Capture => Self::Capture,
+            JobKindDto::Export => Self::Export,
         }
     }
 }

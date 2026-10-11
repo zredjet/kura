@@ -4,6 +4,7 @@ pub mod appearance;
 pub mod bench;
 pub mod capture;
 pub mod downloads;
+pub mod export;
 pub mod folders;
 pub mod import;
 pub mod items;

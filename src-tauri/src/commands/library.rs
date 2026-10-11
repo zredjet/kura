@@ -2,12 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use kura_core::library::{LibrarySession, check_location, is_library};
+use kura_core::library::{LibrarySession, backup, check_location, is_library};
 use tauri::{AppHandle, Manager, State};
 
 use super::blocking;
-use crate::dto::{LibraryInfoDto, LibraryRestoreDto, LocationCheckDto};
-use crate::error::AppError;
+use crate::dto::{BackupDto, LibraryInfoDto, LibraryRestoreDto, LocationCheckDto};
+use crate::error::{AppError, AppErrorCode};
 use crate::state::{AppState, event_sink};
 
 /// 計測などで、設定を書き換えずに開くライブラリを指定する環境変数。
@@ -114,4 +114,43 @@ pub async fn library_restore(app: AppHandle) -> Result<LibraryRestoreDto, AppErr
 pub async fn library_info(state: State<'_, AppState>) -> Result<LibraryInfoDto, AppError> {
     let session = state.session()?;
     blocking(move || Ok(session.info()?.into())).await
+}
+
+/// DB のバックアップの一覧（新しい順。FR-SYS-03）。
+#[tauri::command]
+#[specta::specta]
+pub async fn backups_list(state: State<'_, AppState>) -> Result<Vec<BackupDto>, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        Ok(backup::list(session.library().layout())?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    })
+    .await
+}
+
+/// いまのバックアップを作る（古いものは新しい 7 個を残して消す）。
+#[tauri::command]
+#[specta::specta]
+pub async fn backup_now(state: State<'_, AppState>) -> Result<BackupDto, AppError> {
+    let session = state.session()?;
+    blocking(move || Ok(session.backup_now()?.into())).await
+}
+
+/// Finder で見せる（書き出したフォルダ・バックアップ・ライブラリ）。
+#[tauri::command]
+#[specta::specta]
+pub async fn reveal_path(path: String) -> Result<(), AppError> {
+    blocking(move || {
+        if kura_mac::reveal_in_finder(Path::new(&path)) {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                AppErrorCode::NotFound,
+                "見つかりません（移動・削除されたかもしれません）",
+            ))
+        }
+    })
+    .await
 }

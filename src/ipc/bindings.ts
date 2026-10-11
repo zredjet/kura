@@ -19,6 +19,17 @@ export const commands = {
 	libraryRestore: () => typedError<LibraryRestoreDto, AppError>(__TAURI_INVOKE("library_restore")),
 	/**  開いているライブラリの概要。 */
 	libraryInfo: () => typedError<LibraryInfoDto, AppError>(__TAURI_INVOKE("library_info")),
+	/**  DB のバックアップの一覧（新しい順。FR-SYS-03）。 */
+	backupsList: () => typedError<BackupDto[], AppError>(__TAURI_INVOKE("backups_list")),
+	/**  いまのバックアップを作る（古いものは新しい 7 個を残して消す）。 */
+	backupNow: () => typedError<BackupDto, AppError>(__TAURI_INVOKE("backup_now")),
+	/**  Finder で見せる（書き出したフォルダ・バックアップ・ライブラリ）。 */
+	revealPath: (path: string) => typedError<null, AppError>(__TAURI_INVOKE("reveal_path", { path })),
+	/**
+	 *  選んだもの（一覧の ID。ユニットは印付き）を `dest` に書き出すジョブを積む。
+	 *  書き出し先はあるフォルダで、ライブラリの中は受け付けない。
+	 */
+	exportStart: (dest: string, entries: number[]) => typedError<number, AppError>(__TAURI_INVOKE("export_start", { dest, entries })),
 	/**  取り込み前の確認（種類別件数・合計サイズ・重複の見込み・フォルダの概要）。 */
 	importPreview: (paths: string[]) => typedError<ImportPreviewDto, AppError>(__TAURI_INVOKE("import_preview", { paths })),
 	/**  取り込みジョブを積み、ジョブの ID を返す。進捗は `job://progress` で届く。 */
@@ -262,6 +273,14 @@ export type Appearance = {
 	reduceTransparency: boolean,
 };
 
+/**  DB のバックアップ 1 つ（FR-SYS-03。ADR-121）。 */
+export type BackupDto = {
+	name: string,
+	path: string,
+	createdAt: number,
+	sizeBytes: number,
+};
+
 /**  URL に一致したキャプチャのルール。 */
 export type CaptureMatchDto = {
 	ruleId: number,
@@ -427,6 +446,17 @@ export type EntryRowDto = {
 
 /**  エントリが参照するもの。 */
 export type EntryTargetDto = { kind: "item"; id: number } | { kind: "unit"; id: number } | { kind: "folder"; id: number; recursive: boolean };
+
+/**  書き出しの結果（`JobProgress.resultJson` を読むときの型。ADR-120）。 */
+export type ExportResultDto = {
+	/**  書き出し先のフォルダ。 */
+	dest: string,
+	total: number,
+	exported: number,
+	failed: number,
+	/**  書いた JSON の名前（終わったとき）。 */
+	manifest: string | null,
+};
 
 /**  外部プレイヤー。 */
 export type ExternalPlayerDto = "mpv" | "quickTime";
@@ -600,7 +630,7 @@ export type JobFilterDto = {
 };
 
 /**  ジョブの種類。 */
-export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture";
+export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export";
 
 /**  ジョブの進捗（イベント `job://progress`）。 */
 export type JobProgress = {
