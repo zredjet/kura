@@ -70,6 +70,7 @@
 | 検索 | `query_parse(text, view?, utcOffsetMinutes)` → `{ error?, clauses, counts? }` | ⌘K のチップ・件数・エラー表示用。`error` は位置（UTF-16）と理由、`clauses` はいちばん外側の AND の条件、`counts` は開いている一覧の中で一致する種類ごとの件数 |
 | | `query_suggest(word, limit)` → `Suggestion[]` | 入力中の語の候補：タグ → フィールド名・値 → 保存済みの検索（`kind` / `insert` / `prefix` / `label` / `count` / `id`） |
 | プレイリスト | `playlists_list()` → `PlaylistSummary[]` / `playlist_get(id)` → `Playlist` | サイドバーの一覧（並び順・件数）と、画面用の設定一式（保存した再開の位置 `resume` を含む） |
+| | `playlists_reorder(ids)` | サイドバーの並びを変える（`ids` の順。含まれないものは後ろに今の順で。M9） |
 | | `playlist_create(name, kind, granularity)` / `playlist_update(id, patch)` / `playlist_delete(id)` | smart は作るとき シャッフル・条件なし（すべて）・上限 50 件で始める。`patch` は名前・設定・条件（`rule`：`{ match, clauses }`、解析できなければ `InvalidQuery`）・上限・並び順。画像の表示時間は 1〜60 秒 |
 | | `playlist_set_granularity(id, granularity)` | 非破壊（§3.4）。値を変えるだけ |
 | | `playlist_contents(id)` → `{ rows, flatItemIds, itemCount, images, audios, videos, totalMs }` | 画面の一覧：エントリごとの行（名前・表紙・件数・長さ・種類、unit / folder は中身のアイテム）と、展開後の件数・合計 |
@@ -259,7 +260,7 @@ import_start:    ジョブとして実行
 - 「透明度を下げる」がオンなら `<html data-reduce-transparency="true">` を付け、ガラスを不透明な面に置き換える。
 - ファイルのドラッグ＆ドロップは `getCurrentWebview().onDragDropEvent` で受ける（`enter` で重ね表示、`drop` で取り込みシート）。
 - `backgroundThrottling: "disabled"`（M5）：既定では、ウィンドウがほかのウィンドウに隠れると WebKit が動画の再生開始や CSS アニメーションを止め、再生キューが動画のところで止まる。メディアプレーヤーなので隠れていても再生を続ける（ADR-72）。
-- メニューバーはフロントで組む（`src/app/appMenu.ts`）。項目は Tauri の既定のメニューと同じで、文言は ja.ts。「すべてを選択」（⌘A）だけは自前の項目で、入力欄なら文字、それ以外は一覧のすべてを選ぶ（ADR-76）。アプリの言語は `src-tauri/Info.plist` で日本語と宣言し、OS が出す文言も日本語にする（ADR-77）。
+- メニューバーはフロントで組む（`src/app/appMenu.ts`）。文言は ja.ts。「すべてを選択」（⌘A）だけは自前の項目で、入力欄なら文字、それ以外は一覧のすべてを選ぶ（ADR-76）。Kura の操作の項目は、押すとそのキーのイベントをフォーカスのある要素から送る（`replayKey`）ので、キーの処理と同じ条件で動く。表示形式・まとめて表示のチェックとサイドバーの項目の文字は、表示の設定に合わせて書き換える（ADR-116）。アプリの言語は `src-tauri/Info.plist` で日本語と宣言し、OS が出す文言も日本語にする（ADR-77）。
 - 署名は個人利用なのでアドホック署名（`bundle.macOS.signingIdentity: "-"`）。App Store には出さない。
 - 書類・デスクトップ・ダウンロードを「ファイルを選択」で開くと macOS の許可ダイアログが出る。ドラッグ＆ドロップした項目は許可なしで読める。
 
