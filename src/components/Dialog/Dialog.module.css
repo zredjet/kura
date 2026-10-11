@@ -35,3 +35,8 @@
   width: min(420px, calc(100% - var(--space-4) * 2));
   gap: var(--space-4);
 }
+
+/* 設定画面（タブと、外部ツールの表が入るので広め） */
+.large {
+  width: min(760px, calc(100% - var(--space-4) * 2));
+}

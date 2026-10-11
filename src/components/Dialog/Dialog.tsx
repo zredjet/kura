@@ -7,9 +7,23 @@ interface DialogProps {
   labelledBy: string;
   /** esc で閉じるときに呼ぶ。 */
   onClose: () => void;
-  /** 小さいシート（名前の入力・確認など。幅 420px）。 */
-  size?: 'md' | 'sm';
+  /** 小さいシート（名前の入力・確認など。幅 420px）か、広いシート（設定画面。幅 760px）。 */
+  size?: 'md' | 'sm' | 'lg';
   children: ReactNode;
+}
+
+/** 開いているシート（開いた順）。esc・Tab はいちばん上のシートだけが受ける（シートの上にシートを重ねたとき）。 */
+const stack: HTMLElement[] = [];
+
+/**
+ * いちばん上のシートか：中に開いているシートがなく、入れ子でないシートのうちあとに開いたもの。
+ * 一緒に描いた入れ子のシートは、子の effect が先に動いて親より先に積まれるので、入れ子は DOM で見る。
+ */
+function isTop(dialog: HTMLElement): boolean {
+  if (stack.some((other) => other !== dialog && dialog.contains(other))) {
+    return false;
+  }
+  return !stack.slice(stack.indexOf(dialog) + 1).some((other) => !other.contains(dialog));
 }
 
 const FOCUSABLE =
@@ -30,8 +44,12 @@ export function Dialog({ labelledBy, onClose, size = 'md', children }: DialogPro
     }
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     dialog.focus();
+    stack.push(dialog);
 
     const onKeyDown = (e: KeyboardEvent) => {
+      if (!isTop(dialog)) {
+        return;
+      }
       if (e.key === 'Escape') {
         e.preventDefault();
         onCloseRef.current();
@@ -57,6 +75,10 @@ export function Dialog({ labelledBy, onClose, size = 'md', children }: DialogPro
     document.addEventListener('keydown', onKeyDown);
     return () => {
       document.removeEventListener('keydown', onKeyDown);
+      const index = stack.indexOf(dialog);
+      if (index >= 0) {
+        stack.splice(index, 1);
+      }
       previous?.focus();
     };
   }, []);
@@ -69,7 +91,13 @@ export function Dialog({ labelledBy, onClose, size = 'md', children }: DialogPro
         aria-modal="true"
         aria-labelledby={labelledBy}
         tabIndex={-1}
-        className={size === 'sm' ? `${styles.dialog} ${styles.small}` : styles.dialog}
+        className={
+          size === 'sm'
+            ? `${styles.dialog} ${styles.small}`
+            : size === 'lg'
+              ? `${styles.dialog} ${styles.large}`
+              : styles.dialog
+        }
       >
         {children}
       </div>
