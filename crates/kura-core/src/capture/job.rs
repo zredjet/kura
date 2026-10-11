@@ -232,7 +232,7 @@ impl CaptureHandler {
             .unwrap_or_else(|_| input.rule.clone());
         if profile_in_use(&input.profile_dir) {
             return Err(CoreError::Tool(
-                "ログイン用に開いた Chrome が同じプロファイルを使っています。閉じてから再試行してください".into(),
+                "ログイン用の Chrome が開いているあいだは、裏での撮影ができません。キャプチャの欄の「このページを撮る」を使うか、閉じてから再試行してください".into(),
             ));
         }
         let chrome =

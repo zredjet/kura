@@ -30,6 +30,8 @@ const SCROLL_PAUSE: Duration = Duration::from_millis(800);
 pub struct Shot {
     pub png: Vec<u8>,
     pub title: String,
+    /// 撮ったページの URL。
+    pub url: String,
     /// 高さが上限を超えて途中までになったか。
     pub truncated: bool,
 }
@@ -230,8 +232,137 @@ pub fn shoot(page: &mut dyn Page, url: &str, rule: &CaptureRule, pace: &dyn Pace
     Ok(Shot {
         png,
         title,
+        url: url.to_string(),
         truncated,
     })
+}
+
+/// 隠す要素を、取り外せるスタイルシートで隠すスクリプト（開いているページ用。撮ったあと `unhide_script` で戻す）。
+/// 規則は 1 つずつ `insertRule` で足すので、読めないセレクタ・規則を抜け出すような文字列は足されない。
+pub fn hide_style_script(selectors: &[String]) -> String {
+    let list = serde_json::to_string(selectors).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        "(() => {{ const st = document.createElement('style'); st.id = '{HIDE_STYLE_ID}'; \
+         document.documentElement.appendChild(st); for (const s of {list}) {{ \
+         try {{ st.sheet.insertRule(s + ' {{ display: none !important; }}', st.sheet.cssRules.length); }} catch (e) {{}} }} \
+         return st.sheet.cssRules.length; }})()"
+    )
+}
+
+/// `hide_style_script` で足したスタイルシートを外すスクリプト。
+pub fn unhide_script() -> String {
+    format!(
+        "(() => {{ const st = document.getElementById('{HIDE_STYLE_ID}'); if (st) st.remove(); return true; }})()"
+    )
+}
+
+const HIDE_STYLE_ID: &str = "kura-capture-hide";
+
+/// 開いているページを、見ている表示のまま撮る（ログイン用の Chrome。ADR-111）。
+/// 読み込み・画面の大きさ・スクロールは変えない。隠す要素は撮るあいだだけ隠して戻す。
+pub fn shoot_live(
+    page: &mut dyn Page,
+    mode: CaptureMode,
+    target: Option<&str>,
+    hide: &[String],
+) -> Result<Shot> {
+    let dpr = evaluate(page, "window.devicePixelRatio")?
+        .as_f64()
+        .filter(|d| d.is_finite() && *d > 0.0)
+        .unwrap_or(1.0);
+    if !hide.is_empty() {
+        evaluate(page, &hide_style_script(hide))?;
+    }
+    let shot = live_capture(page, mode, target, dpr);
+    if !hide.is_empty() {
+        // 撮れなくても、隠したものは戻す
+        let _ = evaluate(page, &unhide_script());
+    }
+    let (png, truncated) = shot?;
+    let info = evaluate(page, "[document.title, location.href]")?;
+    let text = |i: usize| {
+        info.get(i)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    Ok(Shot {
+        png,
+        title: text(0),
+        url: text(1),
+        truncated,
+    })
+}
+
+fn live_capture(
+    page: &mut dyn Page,
+    mode: CaptureMode,
+    target: Option<&str>,
+    dpr: f64,
+) -> Result<(Vec<u8>, bool)> {
+    let mut params = json!({ "format": "png", "fromSurface": true });
+    let mut truncated = false;
+    let area = match mode {
+        // 見えている範囲をそのまま（画面の解像度で）
+        CaptureMode::Viewport => None,
+        CaptureMode::FullPage => {
+            let metrics = page.call("Page.getLayoutMetrics", json!({}))?;
+            let size = metrics
+                .get("cssContentSize")
+                .or_else(|| metrics.get("contentSize"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let width = size.get("width").and_then(Value::as_f64).unwrap_or(1.0);
+            let height = size.get("height").and_then(Value::as_f64).unwrap_or(1.0);
+            Some(clip(0.0, 0.0, width, height))
+        }
+        CaptureMode::Element => {
+            let selector = target.unwrap_or("");
+            let rect = evaluate(page, &rect_script(selector))?;
+            let (Some(x), Some(y), Some(w), Some(h)) = (
+                rect.get("x").and_then(Value::as_f64),
+                rect.get("y").and_then(Value::as_f64),
+                rect.get("width").and_then(Value::as_f64),
+                rect.get("height").and_then(Value::as_f64),
+            ) else {
+                return Err(CoreError::Tool(format!(
+                    "対象の要素（{selector}）が見つかりませんでした"
+                )));
+            };
+            if w < 1.0 || h < 1.0 {
+                return Err(CoreError::Tool(format!(
+                    "対象の要素（{selector}）の大きさが 0 です"
+                )));
+            }
+            Some(clip(x, y, w, h))
+        }
+    };
+    if let Some(mut area) = area {
+        // 画面の解像度（dpr）で撮る。上限を超えるなら 1 倍に、それでも超えるなら途中まで
+        let height = area["height"].as_f64().unwrap_or(0.0);
+        let scale = if height * dpr <= MAX_PIXELS {
+            1.0
+        } else {
+            1.0 / dpr
+        };
+        if height * dpr * scale > MAX_PIXELS {
+            area["height"] = json!(MAX_PIXELS / (dpr * scale));
+            truncated = true;
+        }
+        area["scale"] = json!(scale);
+        params["clip"] = area;
+        params["captureBeyondViewport"] = json!(true);
+    }
+    let shot = page.call("Page.captureScreenshot", params)?;
+    let data = shot
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoreError::Tool("撮影の結果がありません".into()))?;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| CoreError::Tool(format!("撮影の結果を読めませんでした: {e}")))?;
+    Ok((png, truncated))
 }
 
 fn clip(x: f64, y: f64, width: f64, height: f64) -> Value {
@@ -512,9 +643,77 @@ mod tests {
     }
 
     #[test]
+    fn live_capture_keeps_the_view_and_restores_hidden_elements() {
+        let mut page = FakePage {
+            calls: vec![],
+            // dpr、隠す、（撮る）、戻す、題名と URL
+            values: VecDeque::from(vec![
+                json!(2.0),
+                json!(1),
+                json!(true),
+                json!(["ログイン後のページ", "https://example.com/home"]),
+            ]),
+            layout_height: 0.0,
+        };
+        let shot = shoot_live(&mut page, CaptureMode::Viewport, None, &[".ad".into()]).unwrap();
+        assert_eq!(
+            (shot.title.as_str(), shot.url.as_str()),
+            ("ログイン後のページ", "https://example.com/home")
+        );
+        // 読み込み・画面の大きさは変えない
+        assert!(!methods(&page).contains(&"Page.navigate"));
+        assert!(!methods(&page).contains(&"Emulation.setDeviceMetricsOverride"));
+        let params = capture_params(&page);
+        assert!(params.get("clip").is_none());
+        assert!(
+            page.calls[3].1["expression"]
+                .as_str()
+                .unwrap()
+                .contains("remove()")
+        );
+
+        // ページ全体は画面の解像度（dpr 2）で、長すぎれば 1 倍・途中まで
+        let mut page = FakePage {
+            calls: vec![],
+            values: VecDeque::from(vec![json!(2.0)]),
+            layout_height: 50_000.0,
+        };
+        let shot = shoot_live(&mut page, CaptureMode::FullPage, None, &[]).unwrap();
+        assert!(shot.truncated);
+        let clip = &capture_params(&page)["clip"];
+        assert_eq!(clip["scale"].as_f64(), Some(0.5));
+        assert_eq!(clip["height"].as_f64(), Some(MAX_PIXELS));
+    }
+
+    #[test]
+    fn live_capture_restores_even_when_the_element_is_missing() {
+        let mut page = FakePage {
+            calls: vec![],
+            values: VecDeque::from(vec![json!(1.0), json!(1), json!(null), json!(true)]),
+            layout_height: 0.0,
+        };
+        let err = shoot_live(
+            &mut page,
+            CaptureMode::Element,
+            Some("article"),
+            &["header".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("article"), "{err}");
+        let last = page.calls.last().unwrap().1["expression"].as_str().unwrap();
+        assert!(last.contains("remove()"), "{last}");
+    }
+
+    #[test]
     fn scripts_escape_selectors() {
         let s = hide_script(&["a'); alert(1); ('".into()]);
         assert!(s.contains(r#"["a'); alert(1); ('"]"#), "{s}");
+        let h = hide_style_script(&["a{} b".into()]);
+        assert!(
+            h.contains(r#"["a{} b"]"#) && h.contains("insertRule"),
+            "{h}"
+        );
         let r = rect_script("</script>\"x");
         assert!(
             r.contains(r#"document.querySelector("</script>\"x")"#),

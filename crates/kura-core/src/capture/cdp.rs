@@ -1,9 +1,10 @@
-//! Chrome DevTools Protocol の小さなクライアント（docs/decisions.md の ADR：chromiumoxide の代わり）。
+//! Chrome DevTools Protocol の小さなクライアント（docs/decisions.md の ADR-104：chromiumoxide の代わり）。
 //!
-//! - 接続先は Chrome が自分のプロファイルに書いた `DevToolsActivePort` の 127.0.0.1 のポートだけ。
-//! - 1 本の WebSocket で、ブラウザに新しいページを作り（`Target.createTarget`）、そのページに
-//!   `flatten` で付いたセッションへ命令を送る。イベントは読み捨てる（読み込みの完了などは問い合わせで確かめる）。
-//! - 同期の WebSocket（tungstenite）なので、ジョブのスレッドからそのまま使える。
+//! - 通り道は 127.0.0.1 の WebSocket。接続先は Chrome が自分のプロファイルに書いた `DevToolsActivePort` だけ
+//!   （撮影用のヘッドレスも、ログイン用の画面ありの Chrome も同じ。ADR-111）。
+//! - 1 本の通り道で、ページに `flatten` で付いたセッションへ命令を送る。イベントは読み捨てる
+//!   （読み込みの完了などは問い合わせで確かめる）。
+//! - 同期の API なので、ジョブ・コマンドのスレッドからそのまま使える。
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
@@ -42,15 +43,64 @@ fn local_port(url: &str) -> Option<u16> {
     port.parse().ok()
 }
 
+/// 命令と返事の通り道。
+pub trait Transport: Send {
+    /// 1 つの命令（JSON の文）を送る。
+    fn send(&mut self, text: &str) -> Result<()>;
+    /// 次の文を `wait` まで待つ。来なければ None。
+    fn recv(&mut self, wait: Duration) -> Result<Option<String>>;
+}
+
+/// 127.0.0.1 の WebSocket。
+struct WsTransport(WebSocket<TcpStream>);
+
+impl Transport for WsTransport {
+    fn send(&mut self, text: &str) -> Result<()> {
+        self.0
+            .send(Message::text(text.to_string()))
+            .map_err(|e| CoreError::Tool(format!("DevTools に送れませんでした: {e}")))
+    }
+
+    fn recv(&mut self, _wait: Duration) -> Result<Option<String>> {
+        // 読み取りは 250ms で区切ってある（connect で設定）
+        match self.0.read() {
+            Ok(Message::Text(text)) => Ok(Some(text.as_str().to_string())),
+            Ok(Message::Close(_)) => Err(CoreError::Tool("DevTools の接続が切れました".into())),
+            Ok(_) => Ok(None),
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(CoreError::Tool(format!(
+                "DevTools から読めませんでした: {e}"
+            ))),
+        }
+    }
+}
+
 /// DevTools への接続。
 pub struct Cdp {
-    socket: WebSocket<TcpStream>,
+    transport: Box<dyn Transport>,
     next_id: u64,
     session: Option<String>,
     timeout: Duration,
 }
 
 impl Cdp {
+    /// 通り道から作る。
+    pub fn new(transport: Box<dyn Transport>, timeout: Duration) -> Self {
+        Self {
+            transport,
+            next_id: 1,
+            session: None,
+            timeout,
+        }
+    }
+
     /// `ws://127.0.0.1:<port>/devtools/browser/<id>` に接続する。
     pub fn connect(url: &str, timeout: Duration) -> Result<Self> {
         let port = local_port(url).ok_or_else(|| {
@@ -66,12 +116,7 @@ impl Cdp {
         socket
             .get_ref()
             .set_read_timeout(Some(Duration::from_millis(250)))?;
-        Ok(Self {
-            socket,
-            next_id: 1,
-            session: None,
-            timeout,
-        })
+        Ok(Self::new(Box::new(WsTransport(socket)), timeout))
     }
 
     /// `DevToolsActivePort` が書かれるのを待って接続する。
@@ -103,16 +148,20 @@ impl Cdp {
 
     /// 新しい空のページを作って、以後の命令の送り先にする。
     pub fn open_page(&mut self) -> Result<()> {
-        let created = self.send(None, "Target.createTarget", json!({ "url": "about:blank" }))?;
+        let created = self.browser_call("Target.createTarget", json!({ "url": "about:blank" }))?;
         let target = created
             .get("targetId")
             .and_then(Value::as_str)
             .ok_or_else(|| CoreError::Tool("ページを作れませんでした".into()))?
             .to_string();
-        let attached = self.send(
-            None,
+        self.attach(&target)
+    }
+
+    /// 既存のページ（タブ）に付いて、以後の命令の送り先にする。
+    pub fn attach(&mut self, target_id: &str) -> Result<()> {
+        let attached = self.browser_call(
             "Target.attachToTarget",
-            json!({ "targetId": target, "flatten": true }),
+            json!({ "targetId": target_id, "flatten": true }),
         )?;
         let session = attached
             .get("sessionId")
@@ -120,6 +169,19 @@ impl Cdp {
             .ok_or_else(|| CoreError::Tool("ページに接続できませんでした".into()))?;
         self.session = Some(session.to_string());
         Ok(())
+    }
+
+    /// 付いているページから離れる。
+    pub fn detach(&mut self) -> Result<()> {
+        if let Some(session) = self.session.take() {
+            self.browser_call("Target.detachFromTarget", json!({ "sessionId": session }))?;
+        }
+        Ok(())
+    }
+
+    /// ブラウザ全体への命令（ページのセッションを付けない）。
+    pub fn browser_call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.send(None, method, params)
     }
 
     /// 命令を送り、同じ ID の返事を待つ（その間のイベントは読み捨てる）。
@@ -130,34 +192,17 @@ impl Cdp {
         if let Some(session) = session {
             message["sessionId"] = Value::String(session);
         }
-        self.socket
-            .send(Message::text(message.to_string()))
-            .map_err(|e| CoreError::Tool(format!("DevTools に送れませんでした: {e}")))?;
+        self.transport.send(&message.to_string())?;
         let deadline = Instant::now() + self.timeout;
         loop {
-            match self.socket.read() {
-                Ok(Message::Text(text)) => {
-                    if let Some(result) = response_for(id, method, text.as_str())? {
-                        return Ok(result);
-                    }
-                }
-                Ok(Message::Close(_)) => {
-                    return Err(CoreError::Tool("DevTools の接続が切れました".into()));
-                }
-                Ok(_) => {}
-                Err(tungstenite::Error::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(e) => {
-                    return Err(CoreError::Tool(format!(
-                        "DevTools から読めませんでした: {e}"
-                    )));
-                }
-            }
-            if Instant::now() >= deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return Err(CoreError::Tool(format!("{method} の返事がありません")));
+            }
+            if let Some(text) = self.transport.recv(left.min(Duration::from_millis(250)))?
+                && let Some(result) = response_for(id, method, &text)?
+            {
+                return Ok(result);
             }
         }
     }

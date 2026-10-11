@@ -2,7 +2,8 @@
 //!
 //! どちらもアプリ専用のプロファイル（`capture-profile`）を使い、ふだんの Chrome のプロファイルには触れない。
 //! サンドボックスは切らない。Cookie の暗号化（キーチェーン）も Chrome の既定のまま。
-//! DevTools は `--remote-debugging-port=0`（127.0.0.1 の空いているポート）で、撮影のあいだだけ開く。
+//! DevTools は `--remote-debugging-port=0`（127.0.0.1 の空いているポート）で開く。ヘッドレスは撮影のあいだだけ、
+//! ログイン用はアプリが開いているあいだだけ（ADR-107・111）。
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
@@ -49,9 +50,11 @@ pub fn headless_args(profile: &Path) -> Vec<OsString> {
     args
 }
 
-/// ログイン用（画面あり。DevTools は開かない）の引数。
+/// ログイン用（画面あり。開いているタブを撮れるよう、DevTools は 127.0.0.1 の空いているポート）の引数。
 pub fn login_args(profile: &Path, url: Option<&str>) -> Vec<OsString> {
     let mut args = common_args(profile);
+    args.push("--remote-debugging-port=0".into());
+    args.push("--remote-debugging-address=127.0.0.1".into());
     if let Some(url) = url {
         args.push("--".into());
         args.push(url.into());
@@ -137,19 +140,6 @@ impl Drop for ChromeProcess {
     }
 }
 
-/// ログイン用に画面ありで開く（終わるのは待たない）。
-pub fn open_for_login(chrome: &Path, profile: &Path, url: Option<&str>) -> Result<()> {
-    std::fs::create_dir_all(profile)?;
-    Command::new(chrome)
-        .args(login_args(profile, url))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| CoreError::Tool(format!("Chrome を起動できませんでした: {e}")))?;
-    Ok(())
-}
-
 /// アプリ専用のプロファイルの場所（アプリの設定のフォルダの中）。
 pub fn profile_dir(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join("capture-profile")
@@ -182,7 +172,17 @@ mod tests {
             assert!(!args.iter().any(|a| a.starts_with(weak)), "{weak}");
         }
         let login = strings(&login_args(Path::new("/p"), Some("https://x.test/login")));
-        assert!(!login.iter().any(|a| a.contains("remote-debugging")));
+        assert!(login.contains(&"--remote-debugging-port=0".to_string()));
+        assert!(login.contains(&"--remote-debugging-address=127.0.0.1".to_string()));
+        assert!(!login.contains(&"--headless".to_string()));
+        for weak in [
+            "--no-sandbox",
+            "--disable-web-security",
+            "--use-mock-keychain",
+            "--remote-allow-origins",
+        ] {
+            assert!(!login.iter().any(|a| a.starts_with(weak)), "{weak}");
+        }
         assert_eq!(&login[login.len() - 2..], ["--", "https://x.test/login"]);
     }
 
