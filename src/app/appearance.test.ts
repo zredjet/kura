@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { applyAppearance, syncAppearance } from './appearance';
+import { applyAppearance, syncAppearance, watchAppearance } from './appearance';
 
 describe('applyAppearance', () => {
   it('「透明度を下げる」がオンなら data-reduce-transparency を付け、オフなら外す', () => {
@@ -32,5 +32,24 @@ describe('syncAppearance', () => {
     expect(warn).toHaveBeenCalledOnce();
 
     warn.mockRestore();
+  });
+});
+
+describe('watchAppearance', () => {
+  it('ウィンドウが前面に戻ったら読み直し、やめたら読まない', async () => {
+    const root = document.createElement('html');
+    let reduce = false;
+    const fetch = vi.fn(() => Promise.resolve({ reduceTransparency: reduce }));
+    const stop = watchAppearance(root, fetch);
+
+    reduce = true;
+    window.dispatchEvent(new Event('focus'));
+    await vi.waitFor(() => expect(root.getAttribute('data-reduce-transparency')).toBe('true'));
+
+    stop();
+    reduce = false;
+    window.dispatchEvent(new Event('focus'));
+    await Promise.resolve();
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });
