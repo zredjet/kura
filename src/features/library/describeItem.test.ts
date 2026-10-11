@@ -19,6 +19,7 @@ const base: ItemSummaryDto = {
   capturedAt: null,
   thumbState: 'ready',
   proxyState: 'not_needed',
+  lastPlayedAt: null,
 };
 
 describe('itemMeta', () => {

@@ -14,8 +14,15 @@ use kura_core::library::{
     IntegrityReport, LibraryInfo, LocationCheck, LocationStatus, TrashEmptied,
 };
 use kura_core::playback::{Container, PlayReport, SupportEntry};
+use kura_core::playlist::add::AddSource;
+use kura_core::playlist::play::{PlayQueue, PlayRequest, QueueInfo};
+use kura_core::playlist::smart::{RuleMatch, SmartRule};
+use kura_core::playlist::store::{EntryRow, PlayState, Playlist, PlaylistPatch};
+use kura_core::playlist::{
+    Entry, EntryTarget, Granularity, LimitKind, PlaylistKind, RepeatMode, UnitMatch,
+};
 use kura_core::query::QueryCheck;
-use kura_core::queue::{Slot, UnitKey};
+use kura_core::queue::UnitKey;
 use kura_mac::ExternalPlayer;
 
 use crate::config::PlayerPrefs;
@@ -388,6 +395,7 @@ pub struct ItemSummaryDto {
     /// `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。
     pub thumb_state: String,
     pub proxy_state: String,
+    pub last_played_at: Option<i64>,
 }
 
 impl From<ItemSummary> for ItemSummaryDto {
@@ -408,6 +416,7 @@ impl From<ItemSummary> for ItemSummaryDto {
             captured_at: i.captured_at,
             thumb_state: i.thumb_state,
             proxy_state: i.proxy_state,
+            last_played_at: i.last_played_at,
         }
     }
 }
@@ -594,8 +603,8 @@ pub enum ItemViewDto {
     Smart { id: i64 },
 }
 
-/// 並び順（`items_query_ids` の引数）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// 並び順（`items_query_ids` の引数、プレイリストの並び順）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemSortDto {
     pub key: SortKeyDto,
@@ -603,7 +612,7 @@ pub struct ItemSortDto {
 }
 
 /// 並べる基準。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub enum SortKeyDto {
     Imported,
@@ -612,6 +621,22 @@ pub enum SortKeyDto {
     Rating,
     Duration,
     Size,
+}
+
+impl From<ItemSort> for ItemSortDto {
+    fn from(s: ItemSort) -> Self {
+        Self {
+            key: match s.key {
+                SortKey::Imported => SortKeyDto::Imported,
+                SortKey::Captured => SortKeyDto::Captured,
+                SortKey::Name => SortKeyDto::Name,
+                SortKey::Rating => SortKeyDto::Rating,
+                SortKey::Duration => SortKeyDto::Duration,
+                SortKey::Size => SortKeyDto::Size,
+            },
+            desc: s.desc,
+        }
+    }
 }
 
 impl From<ItemSortDto> for ItemSort {
@@ -1034,6 +1059,7 @@ pub struct UnitSummaryDto {
     /// `user` / `import` / `download`。
     pub origin: String,
     pub created_at: i64,
+    pub last_played_at: Option<i64>,
 }
 
 impl From<UnitSummary> for UnitSummaryDto {
@@ -1050,6 +1076,7 @@ impl From<UnitSummary> for UnitSummaryDto {
             own_rating: u.own_rating,
             origin: u.origin,
             created_at: u.created_at,
+            last_played_at: u.last_played_at,
         }
     }
 }
@@ -1220,44 +1247,6 @@ impl From<SupportEntryDto> for SupportEntry {
     }
 }
 
-/// 再生キュー（docs/playlists.md §5.1 の Slot 列）。件数が多くても軽いよう、列ごとの配列で送る。
-#[derive(Debug, Clone, Default, Serialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct QueueDto {
-    pub item_ids: Vec<i64>,
-    /// ユニットとして再生するスロットのユニット（単体は null）。
-    pub unit_ids: Vec<Option<i64>>,
-    /// まとまりの中の位置（0 から）。
-    pub index_in_unit: Vec<u32>,
-    /// まとまりの件数（単体は 1）。
-    pub unit_len: Vec<u32>,
-    /// 画像の表示時間（音楽・動画は null）。
-    pub image_duration_ms: Vec<Option<i64>>,
-    /// キュー全体の長さ（長さのわからないものは 0 として）。
-    pub total_ms: i64,
-}
-
-impl QueueDto {
-    /// スロット列と全体の長さから作る。
-    pub fn new(slots: Vec<Slot>, total_ms: i64) -> Self {
-        let mut q = Self {
-            total_ms,
-            ..Self::default()
-        };
-        for slot in slots {
-            q.item_ids.push(slot.item_id);
-            q.unit_ids.push(match slot.unit_key {
-                Some(UnitKey::Unit(id)) => Some(id),
-                _ => None,
-            });
-            q.index_in_unit.push(slot.index_in_unit);
-            q.unit_len.push(slot.unit_len);
-            q.image_duration_ms.push(slot.image_duration_ms);
-        }
-        q
-    }
-}
-
 /// 1 スロット分の再生の報告（docs/playlists.md §6.4）。
 #[derive(Debug, Clone, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -1268,6 +1257,8 @@ pub struct PlayReportDto {
     pub played_ms: i64,
     pub completed: bool,
     pub duration_ms: Option<i64>,
+    /// プレイリストから再生したとき。
+    pub playlist_id: Option<i64>,
 }
 
 impl From<PlayReportDto> for PlayReport {
@@ -1276,7 +1267,7 @@ impl From<PlayReportDto> for PlayReport {
             item_id: r.item_id,
             unit_id: r.unit_id,
             unit_start: r.unit_start,
-            playlist_id: None,
+            playlist_id: r.playlist_id,
             played_ms: r.played_ms,
             completed: r.completed,
             duration_ms: r.duration_ms,
@@ -1331,5 +1322,546 @@ impl From<ExternalPlayer> for ExternalPlayerDto {
             ExternalPlayer::Mpv => Self::Mpv,
             ExternalPlayer::QuickTime => Self::QuickTime,
         }
+    }
+}
+
+// ===== プレイリスト（M6） =====
+
+/// シードを JS に渡す形（u64 は number では精度が落ちるので 16 進の文字列）。
+pub fn seed_to_string(seed: u64) -> String {
+    format!("{seed:016x}")
+}
+
+/// 16 進の文字列からシードへ（読めなければ None）。
+pub fn seed_from_string(text: &str) -> Option<u64> {
+    u64::from_str_radix(text, 16).ok()
+}
+
+macro_rules! simple_enum {
+    ($dto:ident, $core:ty, { $($variant:ident),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+        #[serde(rename_all = "camelCase")]
+        pub enum $dto {
+            $($variant),+
+        }
+
+        impl From<$dto> for $core {
+            fn from(v: $dto) -> Self {
+                match v {
+                    $($dto::$variant => Self::$variant),+
+                }
+            }
+        }
+
+        impl From<$core> for $dto {
+            fn from(v: $core) -> Self {
+                match v {
+                    $(<$core>::$variant => Self::$variant),+
+                }
+            }
+        }
+    };
+}
+
+simple_enum!(PlaylistKindDto, PlaylistKind, { Manual, Smart });
+simple_enum!(GranularityDto, Granularity, { File, Unit });
+simple_enum!(RepeatModeDto, RepeatMode, { Off, All, One });
+simple_enum!(UnitMatchDto, UnitMatch, { Any, All, UnitOnly });
+simple_enum!(LimitKindDto, LimitKind, { Count, Duration });
+simple_enum!(RuleMatchDto, RuleMatch, { All, Any });
+
+/// スマートの条件（検索の文字列を条件ごとに。docs/playlists.md §3.1・ADR）。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartRuleDto {
+    #[serde(rename = "match")]
+    pub match_mode: RuleMatchDto,
+    pub clauses: Vec<String>,
+}
+
+impl From<SmartRule> for SmartRuleDto {
+    fn from(r: SmartRule) -> Self {
+        Self {
+            match_mode: r.match_mode.into(),
+            clauses: r.clauses,
+        }
+    }
+}
+
+impl From<SmartRuleDto> for SmartRule {
+    fn from(r: SmartRuleDto) -> Self {
+        Self {
+            match_mode: r.match_mode.into(),
+            clauses: r.clauses,
+        }
+    }
+}
+
+/// 上限（`kind` が null なら上限なし）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitDto {
+    pub kind: Option<LimitKindDto>,
+    pub value: i64,
+}
+
+/// サイドバーの 1 行。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistSummaryDto {
+    pub id: i64,
+    pub name: String,
+    pub kind: PlaylistKindDto,
+    pub granularity: GranularityDto,
+    /// 展開したアイテムの数。
+    pub item_count: u32,
+}
+
+/// 再開できる位置。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayStateDto {
+    pub seed: String,
+    pub slot_index: u32,
+    pub item_id: Option<i64>,
+    pub position_ms: i64,
+}
+
+impl From<PlayState> for PlayStateDto {
+    fn from(s: PlayState) -> Self {
+        Self {
+            seed: seed_to_string(s.seed),
+            slot_index: s.slot_index,
+            item_id: s.item_id,
+            position_ms: s.position_ms,
+        }
+    }
+}
+
+/// プレイリストの設定。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistDto {
+    pub id: i64,
+    pub name: String,
+    pub kind: PlaylistKindDto,
+    pub granularity: GranularityDto,
+    pub shuffle: bool,
+    pub seed: Option<String>,
+    pub seed_locked: bool,
+    pub regenerate_on_play: bool,
+    pub weight_by_rating: bool,
+    pub max_same_kind_run: u32,
+    pub dedup_items: bool,
+    pub image_duration_ms: i64,
+    pub bgm_through_images: bool,
+    pub repeat_mode: RepeatModeDto,
+    pub rule: Option<SmartRuleDto>,
+    pub limit: LimitDto,
+    pub unit_match: UnitMatchDto,
+    pub include_loose_items: bool,
+    pub sort: ItemSortDto,
+    pub generated_at: Option<i64>,
+    /// 続きから再生できる位置（なければ null）。
+    pub resume: Option<PlayStateDto>,
+}
+
+impl PlaylistDto {
+    /// プレイリストと再開の状態から作る。
+    pub fn new(p: Playlist, resume: Option<PlayState>) -> Self {
+        Self {
+            id: p.id,
+            name: p.name,
+            kind: p.kind.into(),
+            granularity: p.granularity.into(),
+            shuffle: p.shuffle,
+            seed: p.shuffle_seed.map(seed_to_string),
+            seed_locked: p.seed_locked,
+            regenerate_on_play: p.regenerate_on_play,
+            weight_by_rating: p.weight_by_rating,
+            max_same_kind_run: p.max_same_kind_run,
+            dedup_items: p.dedup_items,
+            image_duration_ms: p.image_duration_ms,
+            bgm_through_images: p.bgm_through_images,
+            repeat_mode: p.repeat_mode.into(),
+            rule: p.rule.map(Into::into),
+            limit: LimitDto {
+                kind: p.limit.map(|(k, _)| k.into()),
+                value: p.limit.map_or(0, |(_, v)| v),
+            },
+            unit_match: p.unit_match.into(),
+            include_loose_items: p.include_loose_items,
+            sort: p.sort.into(),
+            generated_at: p.generated_at,
+            resume: resume.map(Into::into),
+        }
+    }
+}
+
+/// 変える項目（省いた項目は変えない）。
+#[derive(Debug, Clone, Default, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PlaylistPatchDto {
+    pub name: Option<String>,
+    pub shuffle: Option<bool>,
+    pub seed_locked: Option<bool>,
+    pub regenerate_on_play: Option<bool>,
+    pub weight_by_rating: Option<bool>,
+    pub max_same_kind_run: Option<u32>,
+    pub dedup_items: Option<bool>,
+    pub image_duration_ms: Option<i64>,
+    pub bgm_through_images: Option<bool>,
+    pub repeat_mode: Option<RepeatModeDto>,
+    pub rule: Option<SmartRuleDto>,
+    pub limit: Option<LimitDto>,
+    pub unit_match: Option<UnitMatchDto>,
+    pub include_loose_items: Option<bool>,
+    pub sort: Option<ItemSortDto>,
+}
+
+impl From<PlaylistPatchDto> for PlaylistPatch {
+    fn from(p: PlaylistPatchDto) -> Self {
+        Self {
+            name: p.name,
+            shuffle: p.shuffle,
+            seed_locked: p.seed_locked,
+            regenerate_on_play: p.regenerate_on_play,
+            weight_by_rating: p.weight_by_rating,
+            max_same_kind_run: p.max_same_kind_run,
+            dedup_items: p.dedup_items,
+            image_duration_ms: p.image_duration_ms,
+            bgm_through_images: p.bgm_through_images,
+            repeat_mode: p.repeat_mode.map(Into::into),
+            rule: p.rule.map(Into::into),
+            limit: p
+                .limit
+                .map(|l| l.kind.map(|k| (LimitKind::from(k), l.value))),
+            unit_match: p.unit_match.map(Into::into),
+            include_loose_items: p.include_loose_items,
+            sort: p.sort.map(Into::into),
+        }
+    }
+}
+
+/// エントリが参照するもの。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum EntryTargetDto {
+    Item { id: i64 },
+    Unit { id: i64 },
+    Folder { id: i64, recursive: bool },
+}
+
+impl From<EntryTarget> for EntryTargetDto {
+    fn from(t: EntryTarget) -> Self {
+        match t {
+            EntryTarget::Item(id) => Self::Item { id },
+            EntryTarget::Unit(id) => Self::Unit { id },
+            EntryTarget::Folder {
+                folder_id,
+                recursive,
+            } => Self::Folder {
+                id: folder_id,
+                recursive,
+            },
+        }
+    }
+}
+
+impl From<EntryTargetDto> for EntryTarget {
+    fn from(t: EntryTargetDto) -> Self {
+        match t {
+            EntryTargetDto::Item { id } => Self::Item(id),
+            EntryTargetDto::Unit { id } => Self::Unit(id),
+            EntryTargetDto::Folder { id, recursive } => Self::Folder {
+                folder_id: id,
+                recursive,
+            },
+        }
+    }
+}
+
+/// エントリ（「ファイルに固定」の取り消しに使う）。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryDto {
+    pub id: i64,
+    pub pos: f64,
+    pub target: EntryTargetDto,
+    pub image_duration_ms: Option<i64>,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+}
+
+impl From<Entry> for EntryDto {
+    fn from(e: Entry) -> Self {
+        Self {
+            id: e.id,
+            pos: e.pos,
+            target: e.target.into(),
+            image_duration_ms: e.image_duration_ms,
+            start_ms: e.start_ms,
+            end_ms: e.end_ms,
+        }
+    }
+}
+
+impl From<EntryDto> for Entry {
+    fn from(e: EntryDto) -> Self {
+        Self {
+            id: e.id,
+            pos: e.pos,
+            target: e.target.into(),
+            image_duration_ms: e.image_duration_ms,
+            start_ms: e.start_ms,
+            end_ms: e.end_ms,
+        }
+    }
+}
+
+/// 一覧の 1 行（エントリ）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryRowDto {
+    pub entry_id: i64,
+    pub target: EntryTargetDto,
+    pub name: String,
+    pub item_count: u32,
+    pub duration_ms: i64,
+    pub kinds: Vec<String>,
+    /// 表紙にするアイテム（先頭のメンバー）。
+    pub cover_item_id: Option<i64>,
+    pub image_duration_ms: Option<i64>,
+}
+
+/// プレイリストの中身。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistContentsDto {
+    pub rows: Vec<EntryRowDto>,
+    /// ファイル単位の一覧：展開したアイテムとそのエントリ（並び順）。
+    pub flat_entry_ids: Vec<i64>,
+    pub flat_item_ids: Vec<i64>,
+    pub item_count: u32,
+    pub total_ms: i64,
+    pub images: u32,
+    pub videos: u32,
+    pub audios: u32,
+}
+
+impl PlaylistContentsDto {
+    /// エントリの行から作る。
+    pub fn new(rows: Vec<EntryRow>) -> Self {
+        let mut dto = Self {
+            rows: Vec::with_capacity(rows.len()),
+            flat_entry_ids: Vec::new(),
+            flat_item_ids: Vec::new(),
+            item_count: 0,
+            total_ms: 0,
+            images: 0,
+            videos: 0,
+            audios: 0,
+        };
+        for row in rows {
+            for item in &row.items {
+                dto.flat_entry_ids.push(row.entry.id);
+                dto.flat_item_ids.push(*item);
+            }
+            dto.images += row.kind_counts[0];
+            dto.videos += row.kind_counts[1];
+            dto.audios += row.kind_counts[2];
+            dto.total_ms += row.duration_ms;
+            dto.rows.push(EntryRowDto {
+                entry_id: row.entry.id,
+                target: row.entry.target.into(),
+                name: row.name,
+                item_count: u32::try_from(row.items.len()).unwrap_or(u32::MAX),
+                duration_ms: row.duration_ms,
+                kinds: row.kinds.iter().map(|k| (*k).to_string()).collect(),
+                cover_item_id: row.items.first().copied(),
+                image_duration_ms: row.entry.image_duration_ms,
+            });
+        }
+        dto.item_count = u32::try_from(dto.flat_item_ids.len()).unwrap_or(u32::MAX);
+        dto
+    }
+}
+
+/// 追加するもの。
+#[derive(Debug, Clone, Copy, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AddSourceDto {
+    Item { id: i64 },
+    Unit { id: i64 },
+    Folder { id: i64 },
+}
+
+impl From<AddSourceDto> for AddSource {
+    fn from(s: AddSourceDto) -> Self {
+        match s {
+            AddSourceDto::Item { id } => Self::Item(id),
+            AddSourceDto::Unit { id } => Self::Unit(id),
+            AddSourceDto::Folder { id } => Self::Folder(id),
+        }
+    }
+}
+
+/// 追加した結果。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AddedDto {
+    pub entry_ids: Vec<i64>,
+    pub unit_id: Option<i64>,
+}
+
+/// 再生するもの。
+#[derive(Debug, Clone, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PlaySourceDto {
+    /// 保存したプレイリスト。
+    Playlist { id: i64 },
+    /// ライブラリの選択（アイテムと `0x8000_0000 | unit_id`、並び順）。
+    Selection { entries: Vec<i64> },
+    /// 開いている一覧（⌘K の ⇧↵：結果をランダム再生）。
+    View {
+        view: ItemViewDto,
+        query: Option<String>,
+        #[serde(rename = "collapseUnits")]
+        collapse_units: bool,
+        #[serde(rename = "utcOffsetMinutes")]
+        utc_offset_minutes: i32,
+    },
+}
+
+/// 再生の依頼（省いた項目は既定値）。
+#[derive(Debug, Clone, Default, Deserialize, Type)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PlayRequestDto {
+    pub resume: bool,
+    pub shuffle: Option<bool>,
+    pub reseed: bool,
+    pub start_item: Option<i64>,
+    /// 並びはそのままで、このアイテムから始める（一覧の「ここから再生」）。
+    pub from_item: Option<i64>,
+    /// その場のキューを同じシードで作り直すとき（16 進）。
+    pub seed: Option<String>,
+}
+
+impl From<&PlayRequestDto> for PlayRequest {
+    fn from(r: &PlayRequestDto) -> Self {
+        Self {
+            resume: r.resume,
+            shuffle: r.shuffle,
+            reseed: r.reseed,
+            start_item: r.start_item,
+            from_item: r.from_item,
+        }
+    }
+}
+
+/// キューのまとまり（ユニット単位で再生するときのユニット・フォルダ・単体）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupDto {
+    pub entry_id: i64,
+    pub target: EntryTargetDto,
+    pub name: String,
+    /// キューの何番目から何件か。
+    pub start: u32,
+    pub len: u32,
+}
+
+/// 再生しているプレイリストの設定（シアターで使う・変えるもの）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistPlayDto {
+    pub id: i64,
+    pub name: String,
+    pub kind: PlaylistKindDto,
+    pub shuffle: bool,
+    pub seed_locked: bool,
+    pub repeat_mode: RepeatModeDto,
+    pub bgm_through_images: bool,
+    pub max_same_kind_run: u32,
+}
+
+/// 再生するキュー（docs/playlists.md §5.1 の Slot 列を列ごとの配列で）。
+#[derive(Debug, Clone, Default, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayQueueDto {
+    pub item_ids: Vec<i64>,
+    /// ユニットとして再生するスロットのユニット（ファイル単位・単体は null。再生回数に使う）。
+    pub unit_ids: Vec<Option<i64>>,
+    /// まとまりの中の位置（0 から）と件数。
+    pub index_in_unit: Vec<u32>,
+    pub unit_len: Vec<u32>,
+    /// 画像の表示時間（音楽・動画は null）。
+    pub image_duration_ms: Vec<Option<i64>>,
+    /// トリム（item エントリの start_ms / end_ms）。
+    pub start_ms: Vec<Option<i64>>,
+    pub end_ms: Vec<Option<i64>>,
+    /// ユニット単位のとき、スロットのまとまりの番号（`groups` の添字）。ファイル単位では空。
+    pub group_index: Vec<u32>,
+    pub groups: Vec<GroupDto>,
+    pub total_ms: i64,
+    pub seed: String,
+    pub granularity: Option<GranularityDto>,
+    pub start_index: u32,
+    pub start_position_ms: i64,
+    pub playlist: Option<PlaylistPlayDto>,
+}
+
+impl PlayQueueDto {
+    /// キューと、そのまとまり・合計の長さから作る。
+    pub fn new(queue: PlayQueue, info: QueueInfo, playlist: Option<Playlist>) -> Self {
+        let by_unit = queue.granularity == Granularity::Unit;
+        let mut dto = Self {
+            total_ms: info.total_ms,
+            seed: seed_to_string(queue.seed),
+            granularity: Some(queue.granularity.into()),
+            start_index: u32::try_from(queue.start_index).unwrap_or(0),
+            start_position_ms: queue.start_ms,
+            group_index: info
+                .group_index
+                .iter()
+                .map(|g| u32::try_from(*g).unwrap_or(0))
+                .collect(),
+            groups: info
+                .groups
+                .into_iter()
+                .map(|g| GroupDto {
+                    entry_id: g.entry_id,
+                    target: g.target.into(),
+                    name: g.name,
+                    start: u32::try_from(g.start).unwrap_or(0),
+                    len: u32::try_from(g.len).unwrap_or(0),
+                })
+                .collect(),
+            playlist: playlist.map(|p| PlaylistPlayDto {
+                id: p.id,
+                name: p.name,
+                kind: p.kind.into(),
+                shuffle: p.shuffle,
+                seed_locked: p.seed_locked,
+                repeat_mode: p.repeat_mode.into(),
+                bgm_through_images: p.bgm_through_images,
+                max_same_kind_run: p.max_same_kind_run,
+            }),
+            ..Self::default()
+        };
+        for slot in queue.slots {
+            dto.item_ids.push(slot.item_id);
+            // ユニットとして再生したスロットだけ、ユニットの再生回数に数える
+            dto.unit_ids.push(match slot.unit_key {
+                Some(UnitKey::Unit(id)) if by_unit => Some(id),
+                _ => None,
+            });
+            dto.index_in_unit.push(slot.index_in_unit);
+            dto.unit_len.push(slot.unit_len);
+            dto.image_duration_ms.push(slot.image_duration_ms);
+            dto.start_ms.push(slot.start_ms);
+            dto.end_ms.push(slot.end_ms);
+        }
+        dto
     }
 }

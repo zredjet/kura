@@ -113,8 +113,14 @@ export const commands = {
 	smartFolderDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("smart_folder_delete", { id })),
 	/**  起動時に作った再生可否の表を受け取る（表が変わっていればプロキシの判定をやり直す）。 */
 	playbackSupportSet: (entries: SupportEntryDto[]) => typedError<null, AppError>(__TAURI_INVOKE("playback_support_set", { entries })),
-	/**  選択（アイテムと、まとめて表示したユニット）を並び順のまま再生キューにする。 */
-	playerQueue: (entries: number[]) => typedError<QueueDto, AppError>(__TAURI_INVOKE("player_queue", { entries })),
+	/**
+	 *  再生するキューを作る（プレイリスト・ライブラリの選択・開いている一覧）。
+	 * 
+	 *  - プレイリスト：設定どおり（シャッフル・シード・スマートの作り直し・再開）。シードなどを保存する。
+	 *  - 選択：並び順のまま。ユニットを含めばユニット単位。`request.shuffle` でシャッフル。
+	 *  - 一覧：⌘K の ⇧↵（結果をランダム再生）。既定でシャッフル。
+	 */
+	playQueue: (source: PlaySourceDto, request: PlayRequestDto, utcOffsetMinutes: number) => typedError<PlayQueueDto, AppError>(__TAURI_INVOKE("play_queue", { source, request, utcOffsetMinutes })),
 	/**  スロットを離れたときの報告。再生済みなら記録して true。 */
 	playbackReport: (report: PlayReportDto) => typedError<boolean, AppError>(__TAURI_INVOKE("playback_report", { report })),
 	/**  再生キューの今と次のアイテムのプロキシを先に作る。`force` なら、元のまま再生できなかったものを作り直す。 */
@@ -125,6 +131,39 @@ export const commands = {
 	playerPrefsGet: () => __TAURI_INVOKE<PlayerPrefsDto>("player_prefs_get"),
 	/**  再生の設定を変えて保存する（範囲外の値は丸めて返す）。 */
 	playerPrefsSet: (prefs: PlayerPrefsDto) => typedError<PlayerPrefsDto, AppError>(__TAURI_INVOKE("player_prefs_set", { prefs })),
+	/**  すべてのプレイリスト（サイドバー。件数は展開したアイテムの数）。 */
+	playlistsList: () => typedError<PlaylistSummaryDto[], AppError>(__TAURI_INVOKE("playlists_list")),
+	/**  1 つのプレイリストの設定と、続きから再生できる位置。 */
+	playlistGet: (id: number) => typedError<PlaylistDto, AppError>(__TAURI_INVOKE("playlist_get", { id })),
+	/**  プレイリストを作る。ID を返す。 */
+	playlistCreate: (name: string, kind: PlaylistKindDto, granularity: GranularityDto) => typedError<number, AppError>(__TAURI_INVOKE("playlist_create", { name, kind, granularity })),
+	/**  設定を変える。 */
+	playlistUpdate: (id: number, patch: PlaylistPatchDto) => typedError<null, AppError>(__TAURI_INVOKE("playlist_update", { id, patch })),
+	/**  削除する。 */
+	playlistDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("playlist_delete", { id })),
+	/**  単位を切り替える（エントリは変えない）。 */
+	playlistSetGranularity: (id: number, granularity: GranularityDto) => typedError<null, AppError>(__TAURI_INVOKE("playlist_set_granularity", { id, granularity })),
+	/**  中身：エントリごとの行と、展開したアイテムの列。 */
+	playlistContents: (id: number) => typedError<PlaylistContentsDto, AppError>(__TAURI_INVOKE("playlist_contents", { id })),
+	/**  追加する（docs/playlists.md §3.5。`invert` は ⌥、`groupName` はユニットにまとめるときの名前）。 */
+	playlistAdd: (id: number, sources: AddSourceDto[], invert: boolean, groupName: string | null, before: number | null) => typedError<AddedDto, AppError>(__TAURI_INVOKE("playlist_add", { id, sources, invert, groupName, before })),
+	/**  エントリを `before` の前（null なら末尾）へ移す。 */
+	playlistMove: (id: number, entryIds: number[], before: number | null) => typedError<null, AppError>(__TAURI_INVOKE("playlist_move", { id, entryIds, before })),
+	/**  エントリを外す。 */
+	playlistRemove: (id: number, entryIds: number[]) => typedError<null, AppError>(__TAURI_INVOKE("playlist_remove", { id, entryIds })),
+	/**  「ファイルに固定」（`entryIds` を省けば全部）。取り消し用に、置き換える前のエントリを返す。 */
+	playlistSnapshotToFiles: (id: number, entryIds: number[] | null) => typedError<EntryDto[], AppError>(__TAURI_INVOKE("playlist_snapshot_to_files", { id, entryIds })),
+	/**  エントリを前の状態に戻す（「ファイルに固定」の取り消し）。 */
+	playlistRestoreEntries: (id: number, entries: EntryDto[]) => typedError<null, AppError>(__TAURI_INVOKE("playlist_restore_entries", { id, entries })),
+	/**  スマートの並びを作り直す（新しいシード。「作り直す」）。 */
+	playlistRegenerate: (id: number, utcOffsetMinutes: number) => typedError<null, AppError>(__TAURI_INVOKE("playlist_regenerate", { id, utcOffsetMinutes })),
+	/**  再開の位置を保存する（§6.5）。`state` が null なら消す（最後まで再生した）。 */
+	playlistSaveState: (id: number, playState: {
+	seed: string,
+	slotIndex: number,
+	itemId: number | null,
+	positionMs: number,
+} | null) => typedError<null, AppError>(__TAURI_INVOKE("playlist_save_state", { id, playState })),
 };
 
 /** Events */
@@ -133,6 +172,15 @@ export const events = {
 };
 
 /* Types */
+/**  追加するもの。 */
+export type AddSourceDto = { kind: "item"; id: number } | { kind: "unit"; id: number } | { kind: "folder"; id: number };
+
+/**  追加した結果。 */
+export type AddedDto = {
+	entryIds: number[],
+	unitId: number | null,
+};
+
 /**  コマンドが返すエラー。JSON では `{ code, message }` になる。 */
 export type AppError = {
 	code: AppErrorCode,
@@ -176,6 +224,32 @@ export type CoverDto = {
 /**  重複の扱い。 */
 export type DuplicatePolicyDto = "addMemberships" | "ignore";
 
+/**  エントリ（「ファイルに固定」の取り消しに使う）。 */
+export type EntryDto = {
+	id: number,
+	pos: number | null,
+	target: EntryTargetDto,
+	imageDurationMs: number | null,
+	startMs: number | null,
+	endMs: number | null,
+};
+
+/**  一覧の 1 行（エントリ）。 */
+export type EntryRowDto = {
+	entryId: number,
+	target: EntryTargetDto,
+	name: string,
+	itemCount: number,
+	durationMs: number,
+	kinds: string[],
+	/**  表紙にするアイテム（先頭のメンバー）。 */
+	coverItemId: number | null,
+	imageDurationMs: number | null,
+};
+
+/**  エントリが参照するもの。 */
+export type EntryTargetDto = { kind: "item"; id: number } | { kind: "unit"; id: number } | { kind: "folder"; id: number; recursive: boolean };
+
 /**  外部プレイヤー。 */
 export type ExternalPlayerDto = "mpv" | "quickTime";
 
@@ -208,6 +282,18 @@ export type FolderPatchDto = {
 export type FolderRefDto = {
 	id: number,
 	path: string[],
+};
+
+export type GranularityDto = "file" | "unit";
+
+/**  キューのまとまり（ユニット単位で再生するときのユニット・フォルダ・単体）。 */
+export type GroupDto = {
+	entryId: number,
+	target: EntryTargetDto,
+	name: string,
+	/**  キューの何番目から何件か。 */
+	start: number,
+	len: number,
 };
 
 /**  取り込みに失敗したファイル。 */
@@ -282,6 +368,12 @@ export type ItemPatchDto = {
 	note?: string | null,
 };
 
+/**  並び順（`items_query_ids` の引数、プレイリストの並び順）。 */
+export type ItemSortDto = {
+	key: SortKeyDto,
+	desc: boolean,
+};
+
 /**  一覧の 1 件（グリッドのタイル）。 */
 export type ItemSummaryDto = {
 	id: number,
@@ -302,6 +394,7 @@ export type ItemSummaryDto = {
 	/**  `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。 */
 	thumbState: string,
 	proxyState: string,
+	lastPlayedAt: number | null,
 };
 
 /**  一覧の種類（`items_query_ids` の引数。生バイトのコマンドなので TS の型は `src/ipc/items.ts` に書く）。 */
@@ -375,6 +468,14 @@ export type LibraryRestoreDto = {
 	lastPath: string | null,
 };
 
+/**  上限（`kind` が null なら上限なし）。 */
+export type LimitDto = {
+	kind: LimitKindDto | null,
+	value: number,
+};
+
+export type LimitKindDto = "count" | "duration";
+
 /**  ライブラリを置く場所の確認結果。 */
 export type LocationCheckDto = {
 	path: string,
@@ -395,6 +496,30 @@ export type ParseErrorDto = {
 	message: string,
 };
 
+/**  再生するキュー（docs/playlists.md §5.1 の Slot 列を列ごとの配列で）。 */
+export type PlayQueueDto = {
+	itemIds: number[],
+	/**  ユニットとして再生するスロットのユニット（ファイル単位・単体は null。再生回数に使う）。 */
+	unitIds: (number | null)[],
+	/**  まとまりの中の位置（0 から）と件数。 */
+	indexInUnit: number[],
+	unitLen: number[],
+	/**  画像の表示時間（音楽・動画は null）。 */
+	imageDurationMs: (number | null)[],
+	/**  トリム（item エントリの start_ms / end_ms）。 */
+	startMs: (number | null)[],
+	endMs: (number | null)[],
+	/**  ユニット単位のとき、スロットのまとまりの番号（`groups` の添字）。ファイル単位では空。 */
+	groupIndex: number[],
+	groups: GroupDto[],
+	totalMs: number,
+	seed: string,
+	granularity: GranularityDto | null,
+	startIndex: number,
+	startPositionMs: number,
+	playlist: PlaylistPlayDto | null,
+};
+
 /**  1 スロット分の再生の報告（docs/playlists.md §6.4）。 */
 export type PlayReportDto = {
 	itemId: number,
@@ -403,6 +528,37 @@ export type PlayReportDto = {
 	playedMs: number,
 	completed: boolean,
 	durationMs: number | null,
+	/**  プレイリストから再生したとき。 */
+	playlistId: number | null,
+};
+
+/**  再生の依頼（省いた項目は既定値）。 */
+export type PlayRequestDto = {
+	resume?: boolean,
+	shuffle?: boolean | null,
+	reseed?: boolean,
+	startItem?: number | null,
+	/**  並びはそのままで、このアイテムから始める（一覧の「ここから再生」）。 */
+	fromItem?: number | null,
+	/**  その場のキューを同じシードで作り直すとき（16 進）。 */
+	seed?: string | null,
+};
+
+/**  再生するもの。 */
+export type PlaySourceDto = 
+/**  保存したプレイリスト。 */
+{ kind: "playlist"; id: number } | 
+/**  ライブラリの選択（アイテムと `0x8000_0000 | unit_id`、並び順）。 */
+{ kind: "selection"; entries: number[] } | 
+/**  開いている一覧（⌘K の ⇧↵：結果をランダム再生）。 */
+{ kind: "view"; view: ItemViewDto; query: string | null; collapseUnits: boolean; utcOffsetMinutes: number };
+
+/**  再開できる位置。 */
+export type PlayStateDto = {
+	seed: string,
+	slotIndex: number,
+	itemId: number | null,
+	positionMs: number,
 };
 
 /**  再生の設定。 */
@@ -414,6 +570,88 @@ export type PlayerPrefsDto = {
 	imageDurationMs: number,
 };
 
+/**  プレイリストの中身。 */
+export type PlaylistContentsDto = {
+	rows: EntryRowDto[],
+	/**  ファイル単位の一覧：展開したアイテムとそのエントリ（並び順）。 */
+	flatEntryIds: number[],
+	flatItemIds: number[],
+	itemCount: number,
+	totalMs: number,
+	images: number,
+	videos: number,
+	audios: number,
+};
+
+/**  プレイリストの設定。 */
+export type PlaylistDto = {
+	id: number,
+	name: string,
+	kind: PlaylistKindDto,
+	granularity: GranularityDto,
+	shuffle: boolean,
+	seed: string | null,
+	seedLocked: boolean,
+	regenerateOnPlay: boolean,
+	weightByRating: boolean,
+	maxSameKindRun: number,
+	dedupItems: boolean,
+	imageDurationMs: number,
+	bgmThroughImages: boolean,
+	repeatMode: RepeatModeDto,
+	rule: SmartRuleDto | null,
+	limit: LimitDto,
+	unitMatch: UnitMatchDto,
+	includeLooseItems: boolean,
+	sort: ItemSortDto,
+	generatedAt: number | null,
+	/**  続きから再生できる位置（なければ null）。 */
+	resume: PlayStateDto | null,
+};
+
+export type PlaylistKindDto = "manual" | "smart";
+
+/**  変える項目（省いた項目は変えない）。 */
+export type PlaylistPatchDto = {
+	name?: string | null,
+	shuffle?: boolean | null,
+	seedLocked?: boolean | null,
+	regenerateOnPlay?: boolean | null,
+	weightByRating?: boolean | null,
+	maxSameKindRun?: number | null,
+	dedupItems?: boolean | null,
+	imageDurationMs?: number | null,
+	bgmThroughImages?: boolean | null,
+	repeatMode?: RepeatModeDto | null,
+	rule?: SmartRuleDto | null,
+	limit?: LimitDto | null,
+	unitMatch?: UnitMatchDto | null,
+	includeLooseItems?: boolean | null,
+	sort?: ItemSortDto | null,
+};
+
+/**  再生しているプレイリストの設定（シアターで使う・変えるもの）。 */
+export type PlaylistPlayDto = {
+	id: number,
+	name: string,
+	kind: PlaylistKindDto,
+	shuffle: boolean,
+	seedLocked: boolean,
+	repeatMode: RepeatModeDto,
+	bgmThroughImages: boolean,
+	maxSameKindRun: number,
+};
+
+/**  サイドバーの 1 行。 */
+export type PlaylistSummaryDto = {
+	id: number,
+	name: string,
+	kind: PlaylistKindDto,
+	granularity: GranularityDto,
+	/**  展開したアイテムの数。 */
+	itemCount: number,
+};
+
 /**  パレットに出す解析の結果。 */
 export type QueryCheckDto = {
 	error: ParseErrorDto | null,
@@ -421,20 +659,9 @@ export type QueryCheckDto = {
 	counts: KindCountsDto | null,
 };
 
-/**  再生キュー（docs/playlists.md §5.1 の Slot 列）。件数が多くても軽いよう、列ごとの配列で送る。 */
-export type QueueDto = {
-	itemIds: number[],
-	/**  ユニットとして再生するスロットのユニット（単体は null）。 */
-	unitIds: (number | null)[],
-	/**  まとまりの中の位置（0 から）。 */
-	indexInUnit: number[],
-	/**  まとまりの件数（単体は 1）。 */
-	unitLen: number[],
-	/**  画像の表示時間（音楽・動画は null）。 */
-	imageDurationMs: (number | null)[],
-	/**  キュー全体の長さ（長さのわからないものは 0 として）。 */
-	totalMs: number,
-};
+export type RepeatModeDto = "off" | "all" | "one";
+
+export type RuleMatchDto = "all" | "any";
 
 /**  ドロップされたもの。 */
 export type ScanRootDto = {
@@ -463,6 +690,15 @@ export type SmartFolderDto = {
 	/**  一致する件数（`withCounts` のときだけ）。 */
 	count: number | null,
 };
+
+/**  スマートの条件（検索の文字列を条件ごとに。docs/playlists.md §3.1・ADR）。 */
+export type SmartRuleDto = {
+	match: RuleMatchDto,
+	clauses: string[],
+};
+
+/**  並べる基準。 */
+export type SortKeyDto = "imported" | "captured" | "name" | "rating" | "duration" | "size";
 
 /**  パレットの候補。 */
 export type SuggestionDto = {
@@ -563,6 +799,8 @@ export type UnitFolderDto = {
 /**  ユニットの種類（`set` = ファイル群、`folder` = フォルダ群）。 */
 export type UnitKindDto = "set" | "folder";
 
+export type UnitMatchDto = "any" | "all" | "unitOnly";
+
 /**  ユニットの変更（省略した項目は変えない。`imageDurationMs` の 0 は既定に戻す。`note` の空文字はメモを消す）。 */
 export type UnitPatchDto = {
 	name?: string | null,
@@ -599,6 +837,7 @@ export type UnitSummaryDto = {
 	/**  `user` / `import` / `download`。 */
 	origin: string,
 	createdAt: number,
+	lastPlayedAt: number | null,
 };
 
 /* Tauri Specta runtime */
