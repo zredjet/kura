@@ -11,6 +11,7 @@ pub mod jobs;
 pub mod library;
 pub mod media;
 pub mod playback;
+pub mod playlist;
 pub mod query;
 pub mod queue;
 pub mod random;

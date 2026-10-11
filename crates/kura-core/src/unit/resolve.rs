@@ -101,6 +101,8 @@ pub struct MemberInfo {
     pub captured_at: Option<i64>,
     pub duration_ms: Option<i64>,
     pub rating: i64,
+    /// 最終再生（シャッフルの重み付けに使う。docs/playlists.md §5.4）。
+    pub last_played_at: Option<i64>,
     pub trashed: bool,
 }
 
@@ -293,6 +295,7 @@ mod tests {
             captured_at: None,
             duration_ms: None,
             rating: 0,
+            last_played_at: None,
             trashed: false,
         }
     }

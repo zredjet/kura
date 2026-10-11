@@ -109,6 +109,38 @@ fn within(column: &str, start: Option<i64>, end: Option<i64>, out: &mut SqlCond)
     }
 }
 
+/// 日付の指定が表す期間（[start, end)。どちらかがなければ開いた区間）。今日・昨日・日付は端末の時差で区切る。
+pub fn date_range(spec: &DateSpec, ctx: &QueryContext) -> (Option<i64>, Option<i64>) {
+    let offset = i64::from(ctx.utc_offset_minutes) * 60_000;
+    let start_of = |date: CivilDate| -> i64 {
+        days_from_civil(i64::from(date.y), i64::from(date.m), i64::from(date.d)) * DAY_MS - offset
+    };
+    let today = (ctx.now_ms + offset).div_euclid(DAY_MS) * DAY_MS - offset;
+    match spec {
+        DateSpec::Today => (Some(today), Some(today + DAY_MS)),
+        DateSpec::Yesterday => (Some(today - DAY_MS), Some(today)),
+        DateSpec::WithinDays(n) => (Some(ctx.now_ms - i64::from(*n) * DAY_MS), None),
+        DateSpec::OlderThanDays(n) => (None, Some(ctx.now_ms - i64::from(*n) * DAY_MS)),
+        DateSpec::Range { from, to } => (Some(start_of(*from)), Some(start_of(*to) + DAY_MS)),
+    }
+}
+
+/// 日付の条件を値で判定する（SQL にした `date` と同じ意味。スマート × ユニットで使う）。
+pub fn date_matches(value: Option<i64>, op: Op, spec: &DateSpec, ctx: &QueryContext) -> bool {
+    let (start, end) = date_range(spec, ctx);
+    let inside = |v: i64| start.is_none_or(|s| v >= s) && end.is_none_or(|e| v < e);
+    match (op, value) {
+        (Op::Has | Op::Eq, Some(v)) => inside(v),
+        (Op::Ne, Some(v)) => !inside(v),
+        (Op::Ne, None) => true,
+        (Op::Gt, Some(v)) => end.is_some_and(|e| v >= e),
+        (Op::Ge, Some(v)) => start.is_none_or(|s| v >= s),
+        (Op::Lt, Some(v)) => start.is_some_and(|s| v < s),
+        (Op::Le, Some(v)) => end.is_none_or(|e| v < e),
+        (_, None) => false,
+    }
+}
+
 fn sql_op(op: Op) -> &'static str {
     match op {
         Op::Has | Op::Eq => "=",
@@ -260,21 +292,8 @@ impl Compiler<'_> {
         ));
     }
 
-    /// 期間（[start, end)。どちらかがなければ開いた区間）。
     fn range(&self, spec: &DateSpec) -> (Option<i64>, Option<i64>) {
-        let offset = i64::from(self.ctx.utc_offset_minutes) * 60_000;
-        let start_of = |date: CivilDate| -> i64 {
-            days_from_civil(i64::from(date.y), i64::from(date.m), i64::from(date.d)) * DAY_MS
-                - offset
-        };
-        let today = (self.ctx.now_ms + offset).div_euclid(DAY_MS) * DAY_MS - offset;
-        match spec {
-            DateSpec::Today => (Some(today), Some(today + DAY_MS)),
-            DateSpec::Yesterday => (Some(today - DAY_MS), Some(today)),
-            DateSpec::WithinDays(n) => (Some(self.ctx.now_ms - i64::from(*n) * DAY_MS), None),
-            DateSpec::OlderThanDays(n) => (None, Some(self.ctx.now_ms - i64::from(*n) * DAY_MS)),
-            DateSpec::Range { from, to } => (Some(start_of(*from)), Some(start_of(*to) + DAY_MS)),
-        }
+        date_range(spec, self.ctx)
     }
 
     fn date(&self, column: &str, op: Op, spec: &DateSpec, out: &mut SqlCond) {

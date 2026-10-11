@@ -128,14 +128,76 @@ fn load_def(conn: &Connection, row: &UnitRow) -> Result<UnitDef> {
     Ok(def)
 }
 
+/// プレイリストのキューを作るのに要るユニットの情報（docs/playlists.md §5）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PlayInfo {
+    pub def: UnitDef,
+    pub name: String,
+    pub image_duration_ms: Option<i64>,
+    pub inner_shuffle: bool,
+    pub rating: i64,
+    pub last_played_at: Option<i64>,
+    pub play_count: i64,
+    pub created_at: i64,
+    pub source_url: Option<String>,
+    pub note: Option<String>,
+}
+
+/// ユニットの再生用の情報。なければ None。
+pub(crate) fn play_info(conn: &Connection, id: i64) -> Result<Option<PlayInfo>> {
+    let row = match load_row(conn, id) {
+        Ok(row) => row,
+        Err(CoreError::NotFound(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let def = load_def(conn, &row)?;
+    Ok(Some(PlayInfo {
+        def,
+        name: row.name,
+        image_duration_ms: row.image_duration_ms,
+        inner_shuffle: row.inner_shuffle,
+        rating: row.rating,
+        last_played_at: row.last_played_at,
+        play_count: row.play_count,
+        created_at: row.created_at,
+        source_url: row.source_url,
+        note: row.note,
+    }))
+}
+
+/// すべてのユニットの ID（作成順）。
+pub(crate) fn all_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached("SELECT id FROM units ORDER BY id")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// ユニット自体のタグ。
+pub(crate) fn own_tag_ids(conn: &Connection, id: i64) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached("SELECT tag_id FROM unit_tags WHERE unit_id = ?1")?;
+    let rows = stmt.query_map([id], |r| r.get(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 /// いくつかのユニットの解決に必要なデータを読む。
 fn load_snapshot(conn: &Connection, defs: &[&UnitDef]) -> Result<MemberSnapshot> {
-    let mut snap = MemberSnapshot::default();
     let mut item_ids: HashSet<i64> = HashSet::new();
+    let mut folders: Vec<(i64, bool)> = Vec::new();
     for def in defs {
         item_ids.extend(def.items.iter().map(|(id, _)| *id));
+        folders.extend(def.folders.iter().map(|r| (r.folder_id, r.recursive)));
     }
-    if defs.iter().any(|d| !d.folders.is_empty()) {
+    load_member_snapshot(conn, item_ids, &folders)
+}
+
+/// アイテムとフォルダ（`(folder_id, recursive)`）の中身を解決するためのデータを読む（プレイリストでも使う）。
+pub(crate) fn load_member_snapshot(
+    conn: &Connection,
+    mut item_ids: HashSet<i64>,
+    folders: &[(i64, bool)],
+) -> Result<MemberSnapshot> {
+    let mut snap = MemberSnapshot::default();
+    if !folders.is_empty() {
         let mut stmt = conn.prepare_cached("SELECT id, parent_id FROM folders")?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
@@ -146,20 +208,21 @@ fn load_snapshot(conn: &Connection, defs: &[&UnitDef]) -> Result<MemberSnapshot>
                 snap.children.entry(parent).or_default().push(id);
             }
         }
-        // 参照フォルダ（recursive なら子孫も）の中身だけを読む
+        // 参照フォルダ（recursive なら子孫も）の中身だけを読む。たどるのは参照ごと、読むのは 1 回ずつ
         let mut wanted: Vec<i64> = Vec::new();
-        let mut visited: HashSet<i64> = HashSet::new();
-        for def in defs {
-            for r in &def.folders {
-                let mut stack = vec![r.folder_id];
-                while let Some(f) = stack.pop() {
-                    if !visited.insert(f) {
-                        continue;
-                    }
+        let mut loaded: HashSet<i64> = HashSet::new();
+        for &(folder_id, recursive) in folders {
+            let mut visited: HashSet<i64> = HashSet::new();
+            let mut stack = vec![folder_id];
+            while let Some(f) = stack.pop() {
+                if !visited.insert(f) {
+                    continue;
+                }
+                if loaded.insert(f) {
                     wanted.push(f);
-                    if r.recursive {
-                        stack.extend(snap.children.get(&f).into_iter().flatten().copied());
-                    }
+                }
+                if recursive {
+                    stack.extend(snap.children.get(&f).into_iter().flatten().copied());
                 }
             }
         }
@@ -173,7 +236,8 @@ fn load_snapshot(conn: &Connection, defs: &[&UnitDef]) -> Result<MemberSnapshot>
         }
     }
     let mut stmt = conn.prepare_cached(
-        "SELECT title, kind, imported_at, captured_at, duration_ms, rating, trashed_at IS NOT NULL
+        "SELECT title, kind, imported_at, captured_at, duration_ms, rating, last_played_at,
+                trashed_at IS NOT NULL
          FROM items WHERE id = ?1",
     )?;
     for id in item_ids {
@@ -186,7 +250,8 @@ fn load_snapshot(conn: &Connection, defs: &[&UnitDef]) -> Result<MemberSnapshot>
                     captured_at: r.get(3)?,
                     duration_ms: r.get(4)?,
                     rating: r.get(5)?,
-                    trashed: r.get(6)?,
+                    last_played_at: r.get(6)?,
+                    trashed: r.get(7)?,
                 })
             })
             .optional()?;
@@ -228,6 +293,7 @@ pub struct UnitSummary {
     pub own_rating: i64,
     pub origin: String,
     pub created_at: i64,
+    pub last_played_at: Option<i64>,
 }
 
 fn cover_of(conn: &Connection, row: &UnitRow, members: &[i64]) -> Result<Option<Cover>> {
@@ -270,6 +336,7 @@ fn summary_of(conn: &Connection, row: &UnitRow) -> Result<(UnitSummary, Vec<i64>
         own_rating: row.rating,
         origin: row.origin.clone(),
         created_at: row.created_at,
+        last_played_at: row.last_played_at,
     };
     Ok((summary, members))
 }

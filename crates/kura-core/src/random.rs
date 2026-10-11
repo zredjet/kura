@@ -32,6 +32,19 @@ pub fn below(rng: &mut ChaCha8Rng, n: usize) -> usize {
     ((u128::from(rng.next_u64()) * n as u128) >> 64) as usize
 }
 
+/// (0, 1] の一様な実数（重み付きシャッフルの u。docs/playlists.md §5.4）。
+pub fn open_unit(rng: &mut ChaCha8Rng) -> f64 {
+    // 上位 53 ビットで [0, 1) を作り、1 から引いて 0 を除く
+    1.0 - (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+/// FNV-1a（64 ビット）。ユニット内シャッフルのシードを作るのに使う（§5.5）。
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, b| {
+        (hash ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// Fisher–Yates でシャッフルする。
 pub fn shuffle<T>(items: &mut [T], rng: &mut ChaCha8Rng) {
     for i in (1..items.len()).rev() {
@@ -70,6 +83,18 @@ mod tests {
             seen[below(&mut r, 7)] += 1;
         }
         assert!(seen.iter().all(|&n| n > 800), "{seen:?}");
+    }
+
+    #[test]
+    fn open_unit_excludes_zero_and_fnv_matches_reference() {
+        let mut r = rng(5);
+        for _ in 0..10_000 {
+            let u = open_unit(&mut r);
+            assert!(u > 0.0 && u <= 1.0, "{u}");
+        }
+        // FNV-1a の既知の値
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
     }
 
     #[test]

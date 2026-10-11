@@ -48,6 +48,33 @@ pub enum SortKey {
     Size,
 }
 
+impl SortKey {
+    /// DB・JSON での名前（`playlists.sort_key`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Imported => "imported",
+            Self::Captured => "captured",
+            Self::Name => "name",
+            Self::Rating => "rating",
+            Self::Duration => "duration",
+            Self::Size => "size",
+        }
+    }
+
+    /// 名前から。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "imported" => Some(Self::Imported),
+            "captured" => Some(Self::Captured),
+            "name" => Some(Self::Name),
+            "rating" => Some(Self::Rating),
+            "duration" => Some(Self::Duration),
+            "size" => Some(Self::Size),
+            _ => None,
+        }
+    }
+}
+
 /// 並び順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ItemSort {
@@ -558,12 +585,13 @@ pub struct ItemSummary {
     pub thumb_state: String,
     /// 再生用プロキシの状態（unknown / not_needed / pending / ready / failed）。
     pub proxy_state: String,
+    pub last_played_at: Option<i64>,
 }
 
 const SUMMARY_COLUMNS: &str = "id, hash, ext, kind, width, height, duration_ms, size_bytes, title, \
-                               rating, source_site, imported_at, captured_at, thumb_state, proxy_state";
+                               rating, source_site, imported_at, captured_at, thumb_state, proxy_state, last_played_at";
 /// `SUMMARY_COLUMNS` の列数（続けて読む列の位置に使う）。
-const SUMMARY_LEN: usize = 15;
+const SUMMARY_LEN: usize = 16;
 
 fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ItemSummary> {
     let hash: Vec<u8> = row.get(1)?;
@@ -583,6 +611,7 @@ fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ItemSummary> {
         captured_at: row.get(12)?,
         thumb_state: row.get(13)?,
         proxy_state: row.get(14)?,
+        last_played_at: row.get(15)?,
     })
 }
 
