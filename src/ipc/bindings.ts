@@ -25,6 +25,10 @@ export const commands = {
 	backupNow: () => typedError<BackupDto, AppError>(__TAURI_INVOKE("backup_now")),
 	/**  Finder で見せる（書き出したフォルダ・バックアップ・ライブラリ）。 */
 	revealPath: (path: string) => typedError<null, AppError>(__TAURI_INVOKE("reveal_path", { path })),
+	/**  ライブラリの容量と、あるボリュームの容量・空き。 */
+	libraryUsage: () => typedError<LibraryUsageDto, AppError>(__TAURI_INVOKE("library_usage")),
+	/**  整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数える）。 */
+	libraryCheck: () => typedError<IntegrityDto, AppError>(__TAURI_INVOKE("library_check")),
 	/**
 	 *  選んだもの（一覧の ID。ユニットは印付き）を `dest` に書き出すジョブを積む。
 	 *  書き出し先はあるフォルダで、ライブラリの中は受け付けない。
@@ -86,6 +90,10 @@ export const commands = {
 	toolsSetPath: (tool: string, path: string | null) => typedError<ToolInfoDto, AppError>(__TAURI_INVOKE("tools_set_path", { tool, path })),
 	/**  「更新を確認」：Homebrew 版は `brew upgrade` のコマンドを返し、単体版の yt-dlp は自分で更新する。 */
 	toolsUpdate: () => typedError<ToolsUpdateDto, AppError>(__TAURI_INVOKE("tools_update")),
+	/**  取得済みの記録の状態（yt-dlp・gallery-dl。設定画面）。 */
+	downloadArchives: () => typedError<ArchiveStatusDto[], AppError>(__TAURI_INVOKE("download_archives")),
+	/**  取得済みの記録を消す（そのツールで同じものを取り直せるようになる）。 */
+	downloadArchiveClear: (tool: ToolDto) => typedError<null, AppError>(__TAURI_INVOKE("download_archive_clear", { tool })),
 	/**  ルールを並び順に一覧する。 */
 	captureRulesList: () => typedError<CaptureRuleDto[], AppError>(__TAURI_INVOKE("capture_rules_list")),
 	/**  ルールを作る（`id` が None）か変える。 */
@@ -271,6 +279,14 @@ export type AppErrorCode = "NotFound" | "InvalidQuery" | "Invalid" | "ToolMissin
 export type Appearance = {
 	/**  「透明度を下げる」がオンか。オンならガラスを不透明な面に置き換える。 */
 	reduceTransparency: boolean,
+};
+
+/**  取得済みの記録の状態（設定画面。ADR-95）。 */
+export type ArchiveStatusDto = {
+	tool: ToolDto,
+	/**  記録の件数（読めなければ空）。 */
+	entries: number | null,
+	sizeBytes: number,
 };
 
 /**  DB のバックアップ 1 つ（FR-SYS-03。ADR-121）。 */
@@ -676,6 +692,15 @@ export type LibraryInfoDto = {
 export type LibraryRestoreDto = {
 	info: LibraryInfoDto | null,
 	lastPath: string | null,
+};
+
+/**  ライブラリの容量（サイドバーの下・設定画面）。 */
+export type LibraryUsageDto = {
+	/**  ライブラリのファイルの合計（ゴミ箱を含む）。 */
+	libraryBytes: number,
+	/**  ライブラリのあるボリュームの容量と空き（読めなければ空）。 */
+	volumeTotalBytes: number | null,
+	volumeAvailableBytes: number | null,
 };
 
 /**  上限（`kind` が null なら上限なし）。 */

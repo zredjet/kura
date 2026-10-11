@@ -2,11 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use kura_core::library::{LibrarySession, backup, check_location, is_library};
+use kura_core::library::{LibrarySession, backup, check_files, check_location, is_library};
 use tauri::{AppHandle, Manager, State};
 
 use super::blocking;
-use crate::dto::{BackupDto, LibraryInfoDto, LibraryRestoreDto, LocationCheckDto};
+use crate::dto::{
+    BackupDto, IntegrityDto, LibraryInfoDto, LibraryRestoreDto, LibraryUsageDto, LocationCheckDto,
+};
 use crate::error::{AppError, AppErrorCode};
 use crate::state::{AppState, event_sink};
 
@@ -151,6 +153,40 @@ pub async fn reveal_path(path: String) -> Result<(), AppError> {
                 "見つかりません（移動・削除されたかもしれません）",
             ))
         }
+    })
+    .await
+}
+
+/// ライブラリの容量と、あるボリュームの容量・空き。
+#[tauri::command]
+#[specta::specta]
+pub async fn library_usage(state: State<'_, AppState>) -> Result<LibraryUsageDto, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        let library_bytes = session.library().db().read(kura_core::items::total_size)?;
+        let volume = kura_mac::volume_capacity(session.library().layout().root());
+        Ok(LibraryUsageDto {
+            library_bytes,
+            volume_total_bytes: volume.map(|v| v.total_bytes),
+            volume_available_bytes: volume.map(|v| v.available_bytes),
+        })
+    })
+    .await
+}
+
+/// 整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数える）。
+#[tauri::command]
+#[specta::specta]
+pub async fn library_check(state: State<'_, AppState>) -> Result<IntegrityDto, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        let library = session.library();
+        let (missing_files, orphan_files) = check_files(library.db(), library.layout())?;
+        Ok(IntegrityDto {
+            staging_removed: 0,
+            missing_files,
+            orphan_files,
+        })
     })
     .await
 }

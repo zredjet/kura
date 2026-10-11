@@ -214,6 +214,37 @@ pub struct ExportResultDto {
     pub manifest: Option<String>,
 }
 
+/// ライブラリの容量（サイドバーの下・設定画面）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryUsageDto {
+    /// ライブラリのファイルの合計（ゴミ箱を含む）。
+    pub library_bytes: u64,
+    /// ライブラリのあるボリュームの容量と空き（読めなければ空）。
+    pub volume_total_bytes: Option<u64>,
+    pub volume_available_bytes: Option<u64>,
+}
+
+/// 取得済みの記録の状態（設定画面。ADR-95）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveStatusDto {
+    pub tool: ToolDto,
+    /// 記録の件数（読めなければ空）。
+    pub entries: Option<u64>,
+    pub size_bytes: u64,
+}
+
+impl From<kura_core::download::archive::ArchiveStatus> for ArchiveStatusDto {
+    fn from(a: kura_core::download::archive::ArchiveStatus) -> Self {
+        Self {
+            tool: a.tool.into(),
+            entries: a.entries,
+            size_bytes: a.size_bytes,
+        }
+    }
+}
+
 /// DB のバックアップ 1 つ（FR-SYS-03。ADR-121）。
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]

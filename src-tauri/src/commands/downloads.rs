@@ -237,3 +237,36 @@ pub async fn tools_update() -> Result<ToolsUpdateDto, AppError> {
     })
     .await
 }
+
+/// 取得済みの記録の状態（yt-dlp・gallery-dl。設定画面）。
+#[tauri::command]
+#[specta::specta]
+pub async fn download_archives(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::dto::ArchiveStatusDto>, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        Ok(
+            kura_core::download::archive::status(session.library().layout())
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        )
+    })
+    .await
+}
+
+/// 取得済みの記録を消す（そのツールで同じものを取り直せるようになる）。
+#[tauri::command]
+#[specta::specta]
+pub async fn download_archive_clear(
+    state: State<'_, AppState>,
+    tool: crate::dto::ToolDto,
+) -> Result<(), AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        kura_core::download::archive::clear(session.library().layout(), tool.into())?;
+        Ok(())
+    })
+    .await
+}
