@@ -250,7 +250,11 @@ pub fn to_unit_cond(conn: &Connection, expr: &Expr, ctx: &QueryContext) -> Resul
                 .collect::<Result<_>>()?,
         ),
         Expr::Not(inner) => UnitCond::Not(Box::new(to_unit_cond(conn, inner, ctx)?)),
-        Expr::Tag(term) => {
+        // 語（引用符で囲んだ語も。search-query.md §2）
+        Expr::Tag(_) | Expr::Text(_) => {
+            let Some(term) = expr.tag_term() else {
+                return Ok(UnitCond::Tags(HashSet::new()));
+            };
             let ids = if term.ns.is_empty() {
                 resolver.word_tags(&term.name)?
             } else {
@@ -263,7 +267,6 @@ pub fn to_unit_cond(conn: &Connection, expr: &Expr, ctx: &QueryContext) -> Resul
                 None => UnitCond::Tags(HashSet::new()),
             }
         }
-        Expr::Text(text) => UnitCond::Text(text.clone()),
         Expr::Field(field) => match field {
             FieldCond::Type { .. }
             | FieldCond::Rating { .. }

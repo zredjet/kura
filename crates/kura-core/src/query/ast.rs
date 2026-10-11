@@ -260,6 +260,21 @@ impl FieldCond {
     }
 }
 
+impl Expr {
+    /// タグとして判定する語（素の語・名前空間付きの語と、引用符で囲んだ語）。引用符で囲んだ語も
+    /// 名前空間なしの語として、別名 → 正式タグ → 全文検索の順に判定する（search-query.md §2。ADR-127）。
+    pub fn tag_term(&self) -> Option<std::borrow::Cow<'_, TagTerm>> {
+        match self {
+            Expr::Tag(term) => Some(std::borrow::Cow::Borrowed(term)),
+            Expr::Text(text) => Some(std::borrow::Cow::Owned(TagTerm {
+                ns: String::new(),
+                name: text.clone(),
+            })),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

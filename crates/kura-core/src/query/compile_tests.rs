@@ -375,3 +375,33 @@ fn tag_intersection_uses_the_primary_key() {
     let plan = query_plan(&conn, &sql);
     assert!(!plan.contains("SCAN item_tags"), "{plan}");
 }
+
+#[test]
+fn quoted_words_resolve_tags_before_searching_the_text() {
+    let conn = library();
+    // 空白や「:」を含む、名前空間なしのタグ（pixiv の「Re:ゼロ…」など）
+    conn.execute_batch(
+        "INSERT INTO tags (id, namespace, name, created_at) VALUES (7, '', 'Re:ゼロ', 0), (8, '', '夕方の 海', 0);
+         INSERT INTO tag_aliases (alias, tag_id) VALUES ('リゼロ 外伝', 7);
+         INSERT INTO item_tags (tag_id, item_id) VALUES (7, 3), (8, 4);",
+    )
+    .unwrap();
+    // 引用符の語も、別名 → 正式タグ → 全文検索の順（search-query.md §2）
+    assert_eq!(ids(&conn, "\"Re:ゼロ\""), vec![3]);
+    assert_eq!(ids(&conn, "\"夕方の 海\""), vec![4]);
+    assert_eq!(ids(&conn, "\"リゼロ 外伝\""), vec![3]);
+    assert_eq!(ids(&conn, "-\"Re:ゼロ\" 種類:動画"), vec![4]);
+    // 同名のタグがなければ今までどおり全文検索
+    assert_eq!(ids(&conn, "\"駅前 夜\""), vec![2]);
+    // タグの一覧から入れる条件は、そのタグだけに一致する
+    for (ns, name, expected) in [
+        ("", "Re:ゼロ", vec![3]),
+        ("", "夕方の 海", vec![4]),
+        ("作者", "もりの", vec![1, 5]),
+    ] {
+        let clause = super::suggest::tag_clause(ns, name);
+        assert_eq!(ids(&conn, &clause), expected, "{clause}");
+    }
+    // AND の中でもタグとしてまとめて絞る
+    assert_eq!(ids(&conn, "\"Re:ゼロ\" 海"), vec![3]);
+}

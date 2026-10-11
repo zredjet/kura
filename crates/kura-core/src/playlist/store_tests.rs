@@ -575,3 +575,31 @@ fn reorders_playlists_in_the_sidebar() {
     store::reorder(&conn, &[b, b, 999]).unwrap();
     assert_eq!(order(&conn), vec![b, c, a]);
 }
+
+#[test]
+fn smart_units_resolve_quoted_tag_names() {
+    // 「:」を含むタグは引用符で囲んで書き、タグとして判定する（search-query.md §2。ADR-127）
+    let conn = test_conn();
+    tag(&conn, 1, "Re:ゼロ");
+    let a = item(&conn, "a", "image", 0);
+    let b = item(&conn, "b", "image", 0);
+    tag_item(&conn, 1, a);
+    let unit = set_unit(&conn, "外伝", &[a, b]);
+    let pl = playlist(&conn, PlaylistKind::Smart, Granularity::Unit);
+    store::update(
+        &conn,
+        pl,
+        &PlaylistPatch {
+            rule: Some(SmartRule {
+                match_mode: RuleMatch::All,
+                clauses: vec!["\"Re:ゼロ\"".into()],
+            }),
+            unit_match: Some(UnitMatch::Any),
+            ..PlaylistPatch::default()
+        },
+        1,
+    )
+    .unwrap();
+    playlist_queue(&conn, pl, &PlayRequest::default(), &ctx()).unwrap();
+    assert_eq!(targets(&conn, pl), vec![EntryTarget::Unit(unit)]);
+}

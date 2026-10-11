@@ -177,27 +177,29 @@ impl Compiler<'_> {
                 out.sql.push_str(", 0)");
                 Ok(())
             }
-            Expr::Tag(term) => match self.tag_ids(term)? {
-                Some(ids) => {
-                    let marks = placeholders(out, &ids);
-                    out.sql.push_str(&format!(
-                        "EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = i.id AND t.tag_id IN ({marks}))"
-                    ));
-                    Ok(())
+            // 語（引用符で囲んだ語も）：別名 → 正式タグ。名前空間なしで同名のタグがなければ全文検索、
+            // 名前空間付きなら一致なし
+            Expr::Tag(_) | Expr::Text(_) => {
+                let Some(term) = expr.tag_term() else {
+                    return Ok(());
+                };
+                match self.tag_ids(&term)? {
+                    Some(ids) => {
+                        let marks = placeholders(out, &ids);
+                        out.sql.push_str(&format!(
+                            "EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = i.id AND t.tag_id IN ({marks}))"
+                        ));
+                        Ok(())
+                    }
+                    None if term.ns.is_empty() => {
+                        self.full_text(&term.name, out);
+                        Ok(())
+                    }
+                    None => {
+                        out.sql.push('0');
+                        Ok(())
+                    }
                 }
-                // 名前空間なしの語で同名のタグがなければ全文検索、名前空間付きなら一致なし
-                None if term.ns.is_empty() => {
-                    self.full_text(&term.name, out);
-                    Ok(())
-                }
-                None => {
-                    out.sql.push('0');
-                    Ok(())
-                }
-            },
-            Expr::Text(text) => {
-                self.full_text(text, out);
-                Ok(())
             }
             Expr::Field(cond) => self.field(cond, out),
         }
@@ -220,12 +222,12 @@ impl Compiler<'_> {
         let mut tag_sets: Vec<Vec<i64>> = Vec::new();
         let mut rest: Vec<&Expr> = Vec::new();
         for item in items {
-            match item {
-                Expr::Tag(term) => match self.tag_ids(term)? {
+            match item.tag_term() {
+                Some(term) => match self.tag_ids(&term)? {
                     Some(ids) => tag_sets.push(ids),
                     None => rest.push(item),
                 },
-                _ => rest.push(item),
+                None => rest.push(item),
             }
         }
         if tag_sets.len() < 2 {
