@@ -19,6 +19,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "0004_playlist_generation",
         include_str!("../../migrations/0004_playlist_generation.sql"),
     ),
+    (
+        "0005_export_job",
+        include_str!("../../migrations/0005_export_job.sql"),
+    ),
 ];
 
 /// 未適用のマイグレーションを順に適用する。DB の方が新しければエラー。
@@ -252,5 +256,76 @@ mod tests {
 
         conn.execute("DELETE FROM items WHERE id = 1", []).unwrap();
         assert_eq!(hits("港の朝"), 0);
+    }
+
+    #[test]
+    fn export_job_kind_keeps_existing_jobs() {
+        // 0004 までの DB にジョブを入れてから 0005 を適用する
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_until(&mut conn, 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO jobs (id, kind, state, priority, input_json, progress, message, result_json, created_at, started_at)
+             VALUES (7, 'download', 'paused', 2, '{\"url\":\"https://example.com\"}', 0.5, '途中', '{}', 100, 110),
+                    (8, 'import', 'done', 0, '{}', 1.0, NULL, NULL, 200, 210);",
+        )
+        .unwrap();
+        // 前の版では書き出しのジョブは入らない
+        assert!(
+            conn.execute(
+                "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('export', 'queued', '{}', 1)",
+                [],
+            )
+            .is_err()
+        );
+        migrate(&mut conn).unwrap();
+
+        type JobRow = (
+            i64,
+            String,
+            String,
+            i64,
+            String,
+            Option<f64>,
+            Option<String>,
+        );
+        let rows: Vec<JobRow> = conn
+            .prepare("SELECT id, kind, state, priority, input_json, progress, message FROM jobs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            (
+                7,
+                "download".into(),
+                "paused".into(),
+                2,
+                "{\"url\":\"https://example.com\"}".into(),
+                Some(0.5),
+                Some("途中".into())
+            )
+        );
+        conn.execute(
+            "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('export', 'queued', '{}', 300)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('other', 'queued', '{}', 1)",
+                [],
+            )
+            .is_err()
+        );
+        let plan = crate::db::query_plan(
+            &conn,
+            "SELECT id FROM jobs WHERE state = 'queued' ORDER BY priority DESC, created_at LIMIT 1",
+        );
+        assert!(plan.contains("idx_jobs_queue"), "{plan}");
     }
 }
