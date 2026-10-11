@@ -12,7 +12,7 @@ use kura_core::query::{QueryContext, parse};
 use kura_core::time::now_ms;
 
 /// `bench query --library <path>` / `bench thumbs --src <dir> [--threads N]` /
-/// `bench import --src <dir> [--threads N] [--out <dir>]`。
+/// `bench import --src <dir> [--threads N] [--out <dir>]` / `bench backup --library <path>`。
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut library = None;
     let mut src = None;
@@ -32,9 +32,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Some("query") => query(&library.ok_or("--library を指定してください")?),
         Some("thumbs") => thumbs(&src.ok_or("--src を指定してください")?, threads),
         Some("import") => import(&src.ok_or("--src を指定してください")?, threads, out),
+        Some("backup") => backup(&library.ok_or("--library を指定してください")?),
         _ => Err(
             "使い方: kura-devtools bench query --library <path> | thumbs --src <dir> [--threads N] \
-             | import --src <dir> [--threads N] [--out <dir>]"
+             | import --src <dir> [--threads N] [--out <dir>] | backup --library <path>"
                 .into(),
         ),
     }
@@ -178,6 +179,25 @@ fn import(
         hash_only_mb_per_s = mb / hash_elapsed.as_secs_f64(),
         result = job.result_json.as_deref().unwrap_or(""),
         "取り込み（NFR-05：ディスクの速度が上限）"
+    );
+    Ok(())
+}
+
+/// DB のバックアップを作る速さ（`backups/` に 1 つ作る。新しい 7 個を残す）。
+fn backup(path: &std::path::Path) -> Result<(), String> {
+    let library = Library::open(path).map_err(|e| e.to_string())?;
+    let db_bytes = std::fs::metadata(library.layout().db_path())
+        .map_err(|e| e.to_string())?
+        .len();
+    let started = Instant::now();
+    let info = kura_core::library::backup::create(library.layout(), now_ms())
+        .map_err(|e| e.to_string())?;
+    tracing::info!(
+        db_mb = db_bytes as f64 / 1_000_000.0,
+        backup_mb = info.size_bytes as f64 / 1_000_000.0,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        path = %info.path.display(),
+        "DB のバックアップ"
     );
     Ok(())
 }
