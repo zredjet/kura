@@ -37,6 +37,24 @@ function isBlocked(): boolean {
   return document.querySelector('[data-sheet], [role="menu"], [data-theater]') !== null;
 }
 
+/** ライブラリのキー操作を受け付けるか（取り込みのシート・入力欄・ダイアログ・メニュー・シアターの上では受け付けない）。 */
+function acceptsKeys(target: EventTarget | null): boolean {
+  return useImportStore.getState().phase === 'idle' && !isTyping(target) && !isBlocked();
+}
+
+/**
+ * 一覧のすべてを選ぶ。メニューの「すべてを選択」（⌘A）から呼ぶ。
+ * ライブラリを開いていないときや、キー操作を受け付けないときは何もせず false。
+ */
+export function selectAllEntries(target: EventTarget | null): boolean {
+  const { status, list } = useLibraryStore.getState();
+  if (status !== 'open' || !acceptsKeys(target)) {
+    return false;
+  }
+  useViewStore.getState().setSelection(selectAll(list?.ids ?? new Uint32Array()));
+  return true;
+}
+
 /** インスペクタのタグの入力欄に移る（T）。 */
 function focusTagInput(): void {
   useViewStore.getState().showInspector();
@@ -47,12 +65,7 @@ function focusTagInput(): void {
 
 /** ライブラリ画面のキー操作（design.md §6）。 */
 export function handleLibraryKey(e: KeyboardEvent): boolean {
-  if (
-    e.defaultPrevented ||
-    useImportStore.getState().phase !== 'idle' ||
-    isTyping(e.target) ||
-    isBlocked()
-  ) {
+  if (e.defaultPrevented || !acceptsKeys(e.target)) {
     return false;
   }
   const view = useViewStore.getState();
@@ -72,6 +85,7 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
     } else if (key === '-') {
       view.setThumbSize(view.thumbSize - 1);
     } else if (key === 'a' && !e.shiftKey) {
+      // ふだんはメニューの「すべてを選択」が先に受ける（selectAllEntries）。ページに届いたときだけここ
       view.setSelection(selectAll(ids));
     } else if (key === 'Enter' && entries.length > 0 && kind !== 'trash') {
       playSelection(entries);
