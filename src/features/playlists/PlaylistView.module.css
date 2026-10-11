@@ -17,7 +17,7 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--space-5) var(--space-6) calc(var(--space-6) * 4);
+  padding: calc(var(--space-5) + var(--traffic-top, 0px)) var(--space-6) calc(var(--space-6) * 4);
 }
 
 .stack {

@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { justify, ratioOf, rowOfItem, tileWidths, type TileRow } from './justify';
+import {
+  justify,
+  ratioOf,
+  rowOfItem,
+  squareGrid,
+  tileWidths,
+  type TileRow,
+  verticalNeighbor,
+} from './justify';
 
 const base = { width: 1000, targetHeight: 200, gap: 6, headingHeight: 32 };
 
@@ -89,5 +97,66 @@ describe('rowOfItem', () => {
     const layout = justify({ ...base, aspects: [1500, 1500, 1500], groupStarts: [] });
     expect(layout.rows.every((r) => r.kind === 'tiles')).toBe(true);
     expect(layout.rows[0]?.y).toBe(0);
+  });
+});
+
+describe('squareGrid', () => {
+  it('目標の大きさから列の数を決め、幅いっぱいの正方形で並べる', () => {
+    // 1000 + 6 を 200 + 6 で割ると 4 列。一辺は (1000 - 18) / 4 = 245
+    const layout = squareGrid({
+      count: 10,
+      groupStarts: [0, 6],
+      width: 1000,
+      targetSize: 200,
+      gap: 6,
+      headingHeight: 32,
+    });
+    const kinds = layout.rows.map((r) =>
+      r.kind === 'heading' ? `h${r.count}` : `${r.start}-${r.end}`,
+    );
+    expect(kinds).toEqual(['h6', '0-4', '4-6', 'h4', '6-10']);
+    const row = layout.rows[1] as TileRow;
+    expect(row).toMatchObject({ height: 245, cell: 245, y: 38 });
+    expect(tileWidths(layout.rows[2] as TileRow, [], 1000, 6)).toEqual([245, 245]);
+    expect(layout.totalHeight).toBe(32 + 6 + 245 + 6 + 245 + 6 + 32 + 6 + 245);
+  });
+
+  it('幅が目標より狭くても 1 列は出す', () => {
+    const layout = squareGrid({
+      count: 2,
+      groupStarts: [],
+      width: 120,
+      targetSize: 200,
+      gap: 6,
+      headingHeight: 32,
+    });
+    expect(layout.rows).toHaveLength(2);
+    expect(layout.rows[0]).toMatchObject({ start: 0, end: 1, cell: 120 });
+  });
+});
+
+describe('verticalNeighbor', () => {
+  const grid = squareGrid({
+    count: 7,
+    groupStarts: [0, 5],
+    width: 630,
+    targetSize: 200,
+    gap: 6,
+    headingHeight: 32,
+  });
+  const widthsOf = (row: TileRow) => tileWidths(row, [], 630, 6);
+
+  it('上下の行の同じ横位置へ移り、見出しは飛ばす', () => {
+    // 3 列：0-3、3-5、（見出し）、5-7
+    expect(verticalNeighbor(grid, 1, 1, widthsOf, 6)).toBe(4);
+    // 下の行に 3 列目がなければ、いちばん近いもの
+    expect(verticalNeighbor(grid, 2, 1, widthsOf, 6)).toBe(4);
+    expect(verticalNeighbor(grid, 4, 1, widthsOf, 6)).toBe(6);
+    expect(verticalNeighbor(grid, 5, -1, widthsOf, 6)).toBe(3);
+  });
+
+  it('いちばん上・下では null', () => {
+    expect(verticalNeighbor(grid, 0, -1, widthsOf, 6)).toBeNull();
+    expect(verticalNeighbor(grid, 6, 1, widthsOf, 6)).toBeNull();
   });
 });

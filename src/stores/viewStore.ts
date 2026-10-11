@@ -8,9 +8,17 @@ export const ROW_HEIGHTS = [110, 140, 180, 230, 300] as const;
 const DEFAULT_SIZE = 2;
 const STORAGE_KEY = 'kura.view';
 
+/** 一覧の表示形式（⌘1 ジャスティファイ・⌘2 グリッド・⌘3 リスト。design.md §6）。 */
+export type LayoutMode = 'justify' | 'grid' | 'list';
+export const LAYOUT_MODES: readonly LayoutMode[] = ['justify', 'grid', 'list'];
+
 interface Saved {
   thumbSize: number;
   inspector: boolean;
+  /** 表示形式。 */
+  layout: LayoutMode;
+  /** サイドバーを出しているか（⌘⌥S）。 */
+  sidebar: boolean;
   /** set ユニットを 1 枚のタイルにまとめる（「ユニットをまとめて表示」）。 */
   collapseUnits: boolean;
   /** 並び順。 */
@@ -44,20 +52,31 @@ function load(): Saved {
       thumbSize:
         Number.isInteger(size) && size >= 0 && size < ROW_HEIGHTS.length ? size : DEFAULT_SIZE,
       inspector: parsed.inspector !== false,
+      layout: LAYOUT_MODES.includes(parsed.layout as LayoutMode)
+        ? (parsed.layout as LayoutMode)
+        : 'justify',
+      sidebar: parsed.sidebar !== false,
       collapseUnits: parsed.collapseUnits === true,
       sort: loadSort(parsed.sort),
     };
   } catch {
-    return { thumbSize: DEFAULT_SIZE, inspector: true, collapseUnits: false, sort: DEFAULT_SORT };
+    return {
+      thumbSize: DEFAULT_SIZE,
+      inspector: true,
+      layout: 'justify',
+      sidebar: true,
+      collapseUnits: false,
+      sort: DEFAULT_SORT,
+    };
   }
 }
 
 function save(state: Saved) {
   try {
-    const { thumbSize, inspector, collapseUnits, sort } = state;
+    const { thumbSize, inspector, layout, sidebar, collapseUnits, sort } = state;
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify({ thumbSize, inspector, collapseUnits, sort }),
+      JSON.stringify({ thumbSize, inspector, layout, sidebar, collapseUnits, sort }),
     );
   } catch {
     // 保存できなくても表示はそのまま続ける
@@ -99,6 +118,8 @@ interface ViewState extends Saved {
   /** インスペクタを出す（T でタグの入力に移るときなど）。 */
   showInspector: () => void;
   toggleCollapseUnits: () => void;
+  setLayout: (layout: LayoutMode) => void;
+  toggleSidebar: () => void;
   setQuickLook: (open: boolean) => void;
 }
 
@@ -182,6 +203,15 @@ export const useViewStore = create<ViewState>((set, get) => ({
     const collapseUnits = !get().collapseUnits;
     set({ collapseUnits });
     save({ ...get(), collapseUnits });
+  },
+  setLayout: (layout) => {
+    set({ layout });
+    save({ ...get(), layout });
+  },
+  toggleSidebar: () => {
+    const sidebar = !get().sidebar;
+    set({ sidebar });
+    save({ ...get(), sidebar });
   },
   setQuickLook: (open) => set({ quickLook: open && get().selection.focus !== null }),
 }));

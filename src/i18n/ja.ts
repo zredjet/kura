@@ -421,6 +421,25 @@ export const ja = {
     emptyTitle: 'ここにファイルやフォルダをドロップ',
     emptyHint: '⌘O でファイルを選んで取り込むこともできます',
   },
+  table: {
+    columns: {
+      name: '名前',
+      kind: '種類',
+      duration: '長さ',
+      rating: '評価',
+      imported: '追加日',
+      captured: '撮影日',
+      size: 'サイズ',
+    },
+    sortBy: (column: string) => `${column}で並べ替え`,
+    unitKind: (n: string) => `ユニット · ${n}`,
+  },
+  layouts: {
+    label: '表示形式',
+    justify: 'ジャスティファイ表示',
+    grid: 'グリッド表示',
+    list: 'リスト表示',
+  },
   tile: {
     unit: (name: string, n: string) => `ユニット「${name}」、${n} 項目`,
     music: '音楽',

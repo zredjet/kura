@@ -38,6 +38,8 @@ export interface TileRow {
   height: number;
   /** 行の幅いっぱいに広げたか（グループの最後の行は広げない）。 */
   justified: boolean;
+  /** グリッド表示のとき、すべてのタイルの幅（正方形の一辺）。 */
+  cell?: number;
 }
 
 export type LayoutRow = HeadingRow | TileRow;
@@ -158,6 +160,9 @@ export function tileWidths(
   gap: number,
 ): number[] {
   const widths: number[] = [];
+  if (row.cell !== undefined) {
+    return Array.from({ length: row.end - row.start }, () => row.cell ?? 0);
+  }
   for (let i = row.start; i < row.end; i += 1) {
     widths.push(Math.round(ratioOf(aspects[i] ?? 1000) * row.height));
   }
@@ -197,4 +202,99 @@ export function rowOfItem(layout: Layout, index: number): number {
     }
   }
   return -1;
+}
+
+export interface GridInput {
+  /** 並べる件数。 */
+  count: number;
+  /** 日付のグループの開始位置（`JustifyInput` と同じ）。 */
+  groupStarts: readonly number[];
+  width: number;
+  /** タイルの一辺の目標（px）。 */
+  targetSize: number;
+  gap: number;
+  headingHeight: number;
+}
+
+/**
+ * グリッド表示（正方形のタイル）の行を決める。列の数は目標の大きさから決め、タイルは幅いっぱいに広げる。
+ * グループの最後の行も同じ大きさで左に寄せる。
+ */
+export function squareGrid(input: GridInput): Layout {
+  const { count, width, targetSize, gap, headingHeight } = input;
+  const rows: LayoutRow[] = [];
+  if (count === 0 || width <= 0) {
+    return { rows, totalHeight: 0 };
+  }
+  const columns = Math.max(1, Math.floor((width + gap) / (targetSize + gap)));
+  const cell = Math.floor((width - gap * (columns - 1)) / columns);
+  const headings = input.groupStarts.length > 0;
+  const starts = headings ? input.groupStarts : [0];
+  let y = 0;
+  for (let g = 0; g < starts.length; g += 1) {
+    const groupStart = starts[g] ?? 0;
+    const groupEnd = starts[g + 1] ?? count;
+    if (groupEnd <= groupStart) {
+      continue;
+    }
+    if (headings) {
+      rows.push({
+        kind: 'heading',
+        group: g,
+        count: groupEnd - groupStart,
+        y,
+        height: headingHeight,
+      });
+      y += headingHeight + gap;
+    }
+    for (let start = groupStart; start < groupEnd; start += columns) {
+      const end = Math.min(groupEnd, start + columns);
+      rows.push({ kind: 'tiles', start, end, y, height: cell, justified: false, cell });
+      y += cell + gap;
+    }
+  }
+  return { rows, totalHeight: Math.max(0, y - gap) };
+}
+
+/**
+ * ↑↓ で移る先：`index` の行の上（`dir` = -1）か下（+1）のタイルの行で、横の位置がいちばん近いもの。
+ * 見出しは飛ばす。上・下に行がなければ null。`widthsOf` は行の中の各タイルの幅。
+ */
+export function verticalNeighbor(
+  layout: Layout,
+  index: number,
+  dir: -1 | 1,
+  widthsOf: (row: TileRow) => number[],
+  gap: number,
+): number | null {
+  const rowIndex = rowOfItem(layout, index);
+  const row = layout.rows[rowIndex];
+  if (!row || row.kind !== 'tiles') {
+    return null;
+  }
+  let target: TileRow | null = null;
+  for (let r = rowIndex + dir; r >= 0 && r < layout.rows.length; r += dir) {
+    const candidate = layout.rows[r];
+    if (candidate?.kind === 'tiles') {
+      target = candidate;
+      break;
+    }
+  }
+  if (!target) {
+    return null;
+  }
+  const center = (widths: number[], k: number) =>
+    widths.slice(0, k).reduce((sum, w) => sum + w + gap, 0) + (widths[k] ?? 0) / 2;
+  const x = center(widthsOf(row), index - row.start);
+  const widths = widthsOf(target);
+  let best = 0;
+  let bestDistance = Infinity;
+  for (let k = 0; k < widths.length; k += 1) {
+    const distance = Math.abs(center(widths, k) - x);
+    if (distance < bestDistance) {
+      best = k;
+      bestDistance = distance;
+    }
+  }
+  return target.start + best;
 }

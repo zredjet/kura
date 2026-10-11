@@ -7,7 +7,7 @@ import { useImportStore } from '../../stores/importStore';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
-import { useViewStore } from '../../stores/viewStore';
+import { LAYOUT_MODES, useViewStore } from '../../stores/viewStore';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
 import {
@@ -23,6 +23,7 @@ import {
 } from './actions';
 import { TAG_FOCUS_KEY } from './inspector/ItemInspector';
 import { itemMenu, viewedSetUnit } from './itemMenu';
+import { verticalTarget } from './navigation';
 import { extendBy, moveFocus, selectAll } from './selection';
 
 /** 文字を入力している場所ではキー操作を奪わない。 */
@@ -79,7 +80,13 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
 
   if (e.metaKey) {
-    if ((key === 'k' || key === 'f') && !e.shiftKey) {
+    const layout = LAYOUT_MODES[Number(key) - 1];
+    if (/^[1-3]$/.test(key) && layout && !e.shiftKey && !e.altKey) {
+      view.setLayout(layout);
+    } else if (e.altKey && e.code === 'KeyS') {
+      // ⌥ を押すと e.key は「ß」になるので、キーの位置で見る
+      view.toggleSidebar();
+    } else if ((key === 'k' || key === 'f') && !e.shiftKey) {
       useSearchStore.getState().openPalette();
     } else if (key === 'i') {
       view.toggleInspector();
@@ -137,6 +144,22 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
     view.setSelection(
       e.shiftKey ? extendBy(view.selection, delta, ids) : moveFocus(view.selection, delta, ids),
     );
+    return true;
+  }
+  if (key === 'ArrowDown' || key === 'ArrowUp') {
+    if (ids.length === 0) {
+      return false;
+    }
+    const dir = key === 'ArrowDown' ? 1 : -1;
+    const current = focus === null ? -1 : ids.indexOf(focus);
+    // 何も選んでいなければ先頭から
+    const target = current < 0 ? 0 : verticalTarget(current, dir);
+    if (target !== null) {
+      const delta = target - Math.max(0, current);
+      view.setSelection(
+        e.shiftKey ? extendBy(view.selection, delta, ids) : moveFocus(view.selection, delta, ids),
+      );
+    }
     return true;
   }
   if (key === ' ') {

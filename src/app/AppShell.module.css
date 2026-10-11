@@ -1,6 +1,7 @@
 /* Main.dc.html の外枠：ウィンドウの余白 8px、ペインの間隔 8px */
 
 .shell {
+  position: relative;
   display: flex;
   gap: var(--space-2);
   height: 100%;
@@ -12,4 +13,21 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
+}
+
+/*
+ * サイドバーを隠したとき：信号機（x=25〜85、y=26〜40。architecture.md §11）を避けるよう、
+ * ツールバーは左を、ほかの画面は上をあける。信号機のまわりはウィンドウのドラッグ領域にする
+ */
+.shell[data-sidebar='hidden'] .main {
+  --traffic-inset: calc(var(--space-6) * 3 + var(--space-1));
+  --traffic-top: calc(var(--space-6) + var(--space-3));
+}
+
+.dragStrip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: calc(var(--space-6) * 4);
+  height: calc(var(--space-6) * 2);
 }

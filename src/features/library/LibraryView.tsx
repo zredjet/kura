@@ -78,6 +78,8 @@ export function LibraryView() {
   const toggleInspector = useViewStore((s) => s.toggleInspector);
   const collapseUnits = useViewStore((s) => s.collapseUnits);
   const toggleCollapseUnits = useViewStore((s) => s.toggleCollapseUnits);
+  const layout = useViewStore((s) => s.layout);
+  const setLayout = useViewStore((s) => s.setLayout);
   useItemCacheVersion((s) => s.version);
   useLibraryKeys();
 
@@ -132,6 +134,8 @@ export function LibraryView() {
         onClearSearch={() => setFilter([])}
         sortLabel={sortable ? ja.sort.keys[sort.key] : null}
         onSortMenu={sortMenu}
+        layout={layout}
+        onLayout={setLayout}
       />
       <FilterBar />
       <div className={styles.content}>

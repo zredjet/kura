@@ -10,7 +10,8 @@
   align-items: center;
   gap: var(--space-2-5);
   min-height: calc(52px + var(--space-2) + var(--space-1-5));
-  padding: var(--space-2) var(--space-1) var(--space-1-5) var(--space-3);
+  padding: var(--space-2) var(--space-1) var(--space-1-5)
+    calc(var(--space-3) + var(--traffic-inset, 0px));
 }
 
 .heading {
@@ -190,4 +191,41 @@
 
 .pillButton:hover {
   background: var(--fill-3);
+}
+
+/* 表示形式（Main.dc.html：高さ 36px のカプセルに 36×28 のボタン 3 つ。オンは --fill-pressed＋白） */
+.segment {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-0-5);
+  height: var(--h-toolbar);
+  padding: 3px;
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  border: 1px solid var(--stroke-2);
+}
+
+.segmentButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--h-toolbar);
+  height: 100%;
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+}
+
+.segmentButton:hover {
+  color: var(--text-primary);
+}
+
+.segmentButton[aria-pressed='true'] {
+  background: var(--fill-pressed);
+  color: var(--text-on-media);
+}
+
+.segmentButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }

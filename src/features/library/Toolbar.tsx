@@ -1,12 +1,18 @@
 import { Button } from '../../components/Button/Button';
 import { CloseIcon } from '../../components/icons/CloseIcon';
+import { GridIcon } from '../../components/icons/GridIcon';
 import { InspectorIcon } from '../../components/icons/InspectorIcon';
+import { JustifyIcon } from '../../components/icons/JustifyIcon';
+import { ListIcon } from '../../components/icons/ListIcon';
 import { PlusIcon } from '../../components/icons/PlusIcon';
 import { SearchIcon } from '../../components/icons/SearchIcon';
 import { SortIcon } from '../../components/icons/SortIcon';
 import { UnitIcon } from '../../components/icons/UnitIcon';
 import { ja } from '../../i18n/ja';
+import { LAYOUT_MODES, type LayoutMode } from '../../stores/viewStore';
 import styles from './Toolbar.module.css';
+
+const LAYOUT_ICONS = { justify: JustifyIcon, grid: GridIcon, list: ListIcon } as const;
 
 interface ToolbarProps {
   title: string;
@@ -30,11 +36,13 @@ interface ToolbarProps {
   /** 並び順のボタンの文字（null なら並び順を切り替えない一覧）。 */
   sortLabel: string | null;
   onSortMenu: (anchor: HTMLElement) => void;
+  /** 表示形式（⌘1〜⌘3）。 */
+  layout: LayoutMode;
+  onLayout: (layout: LayoutMode) => void;
 }
 
 /**
  * 画面上部のツールバー（Main.dc.html）。ウィンドウのドラッグ領域を兼ねる。
- * 検索欄（M4）・表示形式の切り替え（M9）はその機能を入れるときに足す。
  */
 export function Toolbar({
   title,
@@ -53,6 +61,8 @@ export function Toolbar({
   onClearSearch,
   sortLabel,
   onSortMenu,
+  layout,
+  onLayout,
 }: ToolbarProps) {
   return (
     <header className={styles.toolbar} data-tauri-drag-region>
@@ -103,6 +113,24 @@ export function Toolbar({
             <CloseIcon size={10} strokeWidth={3} />
           </button>
         )}
+      </div>
+      <div className={styles.segment} role="group" aria-label={ja.layouts.label}>
+        {LAYOUT_MODES.map((mode, i) => {
+          const ModeIcon = LAYOUT_ICONS[mode];
+          return (
+            <button
+              key={mode}
+              type="button"
+              className={styles.segmentButton}
+              aria-label={ja.layouts[mode]}
+              aria-pressed={layout === mode}
+              title={`${ja.layouts[mode]}（⌘${i + 1}）`}
+              onClick={() => onLayout(mode)}
+            >
+              <ModeIcon size={16} strokeWidth={1.8} />
+            </button>
+          );
+        })}
       </div>
       {sortLabel !== null && (
         <button

@@ -16,7 +16,8 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--space-3-5) var(--space-5) calc(var(--space-6) * 4) var(--space-4);
+  padding: calc(var(--space-3-5) + var(--traffic-top, 0px)) var(--space-5) calc(var(--space-6) * 4)
+    var(--space-4);
 }
 
 .layout {

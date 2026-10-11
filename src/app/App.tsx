@@ -67,13 +67,14 @@ function LibraryScreen() {
   }, []);
   const playlist = useViewStore((s) => s.playlist);
   const downloads = useViewStore((s) => s.downloads);
+  const sidebarVisible = useViewStore((s) => s.sidebar);
   // ライブラリを替えたら再生をやめる
   const libraryPath = useLibraryStore((s) => s.info?.path);
   useEffect(() => closePlayer, [libraryPath]);
 
   return (
     <>
-      <AppShell sidebar={<Sidebar />}>
+      <AppShell sidebar={<Sidebar />} sidebarVisible={sidebarVisible}>
         {downloads ? (
           <DownloadsView />
         ) : playlist !== null ? (
