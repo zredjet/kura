@@ -90,6 +90,8 @@ interface ViewState extends Saved {
   playlist: number | null;
   /** ダウンロードの画面を開いているか（一覧の代わりに出す）。 */
   downloads: boolean;
+  /** タグの一覧の画面を開いているか（一覧の代わりに出す）。 */
+  tags: boolean;
   /** ユニットを開いているときの戻り先。 */
   parent: ListView | null;
   /** 検索の条件（チップの列。docs/search-query.md）。一覧を切り替えると外す（ADR-53）。 */
@@ -104,6 +106,8 @@ interface ViewState extends Saved {
   openPlaylist: (id: number) => void;
   /** ダウンロードの画面を開く。 */
   openDownloads: () => void;
+  /** タグの一覧の画面を開く。 */
+  openTags: () => void;
   /** ユニットの中を開く（戻り先は今の一覧）。 */
   openUnit: (unitId: number) => void;
   /** ユニットの中から戻る。 */
@@ -128,6 +132,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
   view: { kind: 'all' },
   playlist: null,
   downloads: false,
+  tags: false,
   parent: null,
   filter: [],
   parentFilter: [],
@@ -138,6 +143,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
       view,
       playlist: null,
       downloads: false,
+      tags: false,
       parent: null,
       filter: [],
       parentFilter: [],
@@ -145,9 +151,29 @@ export const useViewStore = create<ViewState>((set, get) => ({
       quickLook: false,
     }),
   openPlaylist: (id) =>
-    set({ playlist: id, downloads: false, selection: EMPTY_SELECTION, quickLook: false }),
+    set({
+      playlist: id,
+      downloads: false,
+      tags: false,
+      selection: EMPTY_SELECTION,
+      quickLook: false,
+    }),
   openDownloads: () =>
-    set({ downloads: true, playlist: null, selection: EMPTY_SELECTION, quickLook: false }),
+    set({
+      downloads: true,
+      playlist: null,
+      tags: false,
+      selection: EMPTY_SELECTION,
+      quickLook: false,
+    }),
+  openTags: () =>
+    set({
+      tags: true,
+      downloads: false,
+      playlist: null,
+      selection: EMPTY_SELECTION,
+      quickLook: false,
+    }),
   openUnit: (unitId) => {
     const { view, parent, filter, parentFilter } = get();
     const fromUnit = view.kind === 'unit';
@@ -155,6 +181,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
       view: { kind: 'unit', id: unitId },
       playlist: null,
       downloads: false,
+      tags: false,
       parent: fromUnit ? parent : view,
       filter: [],
       parentFilter: fromUnit ? parentFilter : filter,

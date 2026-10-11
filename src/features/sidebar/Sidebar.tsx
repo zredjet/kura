@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type ReactNode, useEffect } from 'react';
+import { Fragment, type KeyboardEvent, type ReactNode, useEffect } from 'react';
 
 import glass from '../../components/glass/glass.module.css';
 import { AllItemsIcon } from '../../components/icons/AllItemsIcon';
@@ -6,6 +6,7 @@ import { CameraIcon } from '../../components/icons/CameraIcon';
 import { ClockIcon } from '../../components/icons/ClockIcon';
 import { DiceIcon } from '../../components/icons/DiceIcon';
 import { DownloadIcon } from '../../components/icons/DownloadIcon';
+import { TagIcon } from '../../components/icons/TagIcon';
 import { TrashIcon } from '../../components/icons/TrashIcon';
 import { UnsortedIcon } from '../../components/icons/UnsortedIcon';
 import { UntaggedIcon } from '../../components/icons/UntaggedIcon';
@@ -55,7 +56,7 @@ function viewFor(kind: LibraryKind): ListView {
 /**
  * サイドバー（Sidebar.dc.html）。先頭の行にはネイティブの信号機が重なる。
  * ライブラリの切り替え・ライブラリの項目・スマートフォルダ・フォルダの木・プレイリスト。
- * 取得のキャプチャ（M8）・容量と設定（M9）は、その機能を入れるときに足す。
+ * 「タグなし」の下に「タグ」（タグの一覧の画面）、いちばん下に容量と設定（M9）。
  */
 export function Sidebar() {
   const counts = useSidebarStore((s) => s.counts);
@@ -64,7 +65,8 @@ export function Sidebar() {
   const setView = useViewStore((s) => s.setView);
   const playlistOpen = useViewStore((s) => s.playlist !== null);
   const downloadsOpen = useViewStore((s) => s.downloads);
-  const otherScreen = playlistOpen || downloadsOpen;
+  const tagsOpen = useViewStore((s) => s.tags);
+  const otherScreen = playlistOpen || downloadsOpen || tagsOpen;
   const activeDownloads = useDownloadsStore(selectActiveCount);
   const filter = useViewStore((s) => s.filter);
   // 「キャプチャ」はすべての一覧をキャプチャで絞り込んだもの
@@ -113,23 +115,42 @@ export function Sidebar() {
             const selected = current?.kind === row.kind && !capturesOpen;
             const count = row.kind === 'random' ? null : (counts?.[row.kind] ?? null);
             return (
-              <button
-                key={row.kind}
-                type="button"
-                className={styles.row}
-                aria-current={selected ? 'page' : undefined}
-                {...{ [ROW_ATTR]: '' }}
-                onClick={(e) => {
-                  e.currentTarget.focus();
-                  if (!selected || row.kind === 'random' || otherScreen) {
-                    setView(viewFor(row.kind));
-                  }
-                }}
-              >
-                <span className={styles.rowIcon}>{row.icon}</span>
-                <span className={styles.rowLabel}>{row.label}</span>
-                {count !== null && <span className={styles.count}>{formatCount(count)}</span>}
-              </button>
+              <Fragment key={row.kind}>
+                <button
+                  type="button"
+                  className={styles.row}
+                  aria-current={selected ? 'page' : undefined}
+                  {...{ [ROW_ATTR]: '' }}
+                  onClick={(e) => {
+                    e.currentTarget.focus();
+                    if (!selected || row.kind === 'random' || otherScreen) {
+                      setView(viewFor(row.kind));
+                    }
+                  }}
+                >
+                  <span className={styles.rowIcon}>{row.icon}</span>
+                  <span className={styles.rowLabel}>{row.label}</span>
+                  {count !== null && <span className={styles.count}>{formatCount(count)}</span>}
+                </button>
+                {/* タグの一覧（「タグなし」の下） */}
+                {row.kind === 'untagged' && (
+                  <button
+                    type="button"
+                    className={styles.row}
+                    aria-current={tagsOpen ? 'page' : undefined}
+                    {...{ [ROW_ATTR]: '' }}
+                    onClick={(e) => {
+                      e.currentTarget.focus();
+                      useViewStore.getState().openTags();
+                    }}
+                  >
+                    <span className={styles.rowIcon}>
+                      <TagIcon size={16} strokeWidth={1.8} />
+                    </span>
+                    <span className={styles.rowLabel}>{ja.sidebar.tags}</span>
+                  </button>
+                )}
+              </Fragment>
             );
           })}
         </section>

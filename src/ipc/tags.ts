@@ -1,13 +1,19 @@
 import {
   commands,
   type TagDetailDto,
+  type TagListEntryDto,
   type TagPatchDto,
   type TagRefDto,
   type TagSuggestionDto,
 } from './bindings';
 import { unwrap } from './result';
 
-export type { TagDetailDto, TagPatchDto, TagRefDto, TagSuggestionDto };
+export type { TagDetailDto, TagListEntryDto, TagPatchDto, TagRefDto, TagSuggestionDto };
+
+/** すべてのタグと、付いている数（名前空間なしを後ろに、名前空間ごとに付いている数の多い順）。 */
+export function listTags(): Promise<TagListEntryDto[]> {
+  return unwrap(commands.tagsList());
+}
 
 /** 入力に合うタグの候補。 */
 export function suggestTags(prefix: string, limit = 8): Promise<TagSuggestionDto[]> {
