@@ -22,6 +22,7 @@ import {
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
 import { setOrderSource, useDragStore } from './dragState';
+import { spokenLabel } from './describeItem';
 import { EmptyView } from './EmptyView';
 import styles from './ItemTable.module.css';
 import { focusEntry, setVerticalNavigator } from './navigation';
@@ -238,14 +239,17 @@ const TableRow = memo(function TableRow({
   const rating = unit ? unit.rating : (item?.rating ?? 0);
   const date = unit ? unit.createdAt : (item?.importedAt ?? null);
   const thumb = unit ? unit.cover : item;
-  const label = [name, kindLabel, duration, ja.inspector.rating(Math.round(rating))]
-    .filter(Boolean)
-    .join('、');
+  const label = item
+    ? spokenLabel(item)
+    : [name, kindLabel, duration, rating > 0 ? ja.inspector.rating(Math.round(rating)) : '']
+        .filter(Boolean)
+        .join('、');
   return (
     <button
       type="button"
       className={styles.row}
-      style={{ transform: `translateY(${start}px)` }}
+      // transform で置くと、アクセシビリティの枠が一覧の先頭から伸びてしまう（VoiceOver の枠がずれる）
+      style={{ top: start }}
       aria-pressed={selected}
       aria-label={label}
       data-entry={id}

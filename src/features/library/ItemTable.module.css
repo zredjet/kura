@@ -72,7 +72,6 @@
   font-size: var(--text-sm);
   color: var(--text-secondary);
   text-align: left;
-  will-change: transform;
 }
 
 .row:hover {

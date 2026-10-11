@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ItemSummaryDto } from '../../ipc/items';
-import { itemMeta } from './describeItem';
+import { itemMeta, spokenLabel } from './describeItem';
 
 const base: ItemSummaryDto = {
   id: 1,
@@ -47,5 +47,14 @@ describe('itemMeta', () => {
         sizeBytes: 98_000_000,
       }),
     ).toBe('音楽 · FLAC · 4:18 · 98.0 MB');
+  });
+});
+
+describe('spokenLabel', () => {
+  it('名前・種類・長さ・評価を読点でつなぎ、評価がなければ言わない', () => {
+    expect(spokenLabel(base)).toBe('夕方の海、画像、評価 4');
+    expect(spokenLabel({ ...base, kind: 'video', durationMs: 80_000, rating: 0 })).toBe(
+      '夕方の海、動画、1:20',
+    );
   });
 });

@@ -11,6 +11,7 @@ import type { ItemSummaryDto } from '../../ipc/items';
 import { thumbUrl } from '../../ipc/media';
 import type { UnitSummaryDto } from '../../ipc/units';
 import { formatCount, formatDuration } from '../../lib/format';
+import { spokenLabel } from './describeItem';
 import styles from './Tile.module.css';
 
 /** ダウンロードで取得したものの取得元。 */
@@ -55,7 +56,7 @@ export const Tile = memo(function Tile({
       className={styles.tile}
       style={{ width, height }}
       aria-pressed={selected}
-      aria-label={item?.title ?? ''}
+      aria-label={item ? spokenLabel(item) : ''}
       data-kind={kind}
       data-entry={id}
       data-drop-entry={id}
