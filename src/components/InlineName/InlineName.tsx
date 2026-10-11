@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import styles from './InlineName.module.css';
+import { isImeKey } from '../../lib/ime';
 
 interface InlineNameProps {
   initial: string;
@@ -45,7 +46,7 @@ export function InlineName({ initial, label, onCommit, onCancel, className }: In
       onBlur={() => finish(true)}
       onKeyDown={(e) => {
         e.stopPropagation();
-        if (e.nativeEvent.isComposing) {
+        if (isImeKey(e)) {
           return;
         }
         if (e.key === 'Enter') {

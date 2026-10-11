@@ -14,6 +14,7 @@ import {
   useOverlayStore,
 } from './overlayStore';
 import styles from './Overlays.module.css';
+import { isImeKey } from '../../lib/ime';
 
 /** 名前の入力・確認・候補から選ぶダイアログ（`askText`・`askConfirm`・`askPick` で開く）。 */
 export function Overlays() {
@@ -66,7 +67,7 @@ function NewPlaylistDialog({ overlay }: { overlay: Extract<Overlay, { kind: 'new
           value={value.name}
           onChange={(e) => setValue({ ...value, name: e.target.value })}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+            if (e.key === 'Enter' && !isImeKey(e)) {
               e.preventDefault();
               submit();
             }
@@ -148,7 +149,7 @@ function AddModeDialog({ overlay }: { overlay: Extract<Overlay, { kind: 'addMode
             value={value.name}
             onChange={(e) => setValue({ ...value, name: e.target.value })}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+              if (e.key === 'Enter' && !isImeKey(e)) {
                 e.preventDefault();
                 submit();
               }
@@ -208,7 +209,7 @@ function PromptDialog({ overlay }: { overlay: Extract<Overlay, { kind: 'prompt' 
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+            if (e.key === 'Enter' && !isImeKey(e)) {
               e.preventDefault();
               submit();
             }
@@ -278,7 +279,7 @@ function PickerDialog({ overlay }: { overlay: Extract<Overlay, { kind: 'picker' 
   }, [query, overlay]);
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.nativeEvent.isComposing) {
+    if (isImeKey(e)) {
       return;
     }
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {

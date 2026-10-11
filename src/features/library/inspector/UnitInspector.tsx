@@ -27,6 +27,7 @@ import styles from './Inspector.module.css';
 import { TAG_FOCUS_KEY } from './ItemInspector';
 import { NoteField } from './NoteField';
 import { useLoaded } from './useLoaded';
+import { isImeKey } from '../../../lib/ime';
 
 const t = ja.unitInspector;
 
@@ -134,7 +135,7 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
             placeholder={t.imageDurationDefault(t.seconds(String(DEFAULT_IMAGE_SECONDS)))}
             onKeyDown={(e) => {
               e.stopPropagation();
-              if (e.key === 'Enter') {
+              if (e.key === 'Enter' && !isImeKey(e)) {
                 e.currentTarget.blur();
               }
             }}

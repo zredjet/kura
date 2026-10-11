@@ -2,6 +2,7 @@ import { useId, useRef, useState } from 'react';
 
 import { ja } from '../../../i18n/ja';
 import styles from './Inspector.module.css';
+import { isImeKey } from '../../../lib/ime';
 
 interface NoteFieldProps {
   initial: string;
@@ -36,6 +37,10 @@ export function NoteField({ initial, placeholder, onSave }: NoteFieldProps) {
         }}
         onKeyDown={(e) => {
           e.stopPropagation();
+          // 変換中の Esc は変換の取り消しで、メモの取り消しではない
+          if (isImeKey(e)) {
+            return;
+          }
           if (e.key === 'Enter' && e.metaKey) {
             e.preventDefault();
             e.currentTarget.blur();

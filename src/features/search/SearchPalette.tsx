@@ -24,6 +24,7 @@ import { startPlayback } from '../player/playerActions';
 import { clauseParts, currentWord, isComplete, joinClauses } from './clauses';
 import styles from './SearchPalette.module.css';
 import { saveAsSmartFolder, updateSmartQuery } from './searchActions';
+import { isImeKey } from '../../lib/ime';
 
 const t = ja.search;
 
@@ -225,7 +226,7 @@ function PaletteBody() {
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     e.stopPropagation();
-    if (e.nativeEvent.isComposing) {
+    if (isImeKey(e)) {
       return;
     }
     const caretAtEnd = e.currentTarget.selectionStart === draft.length;

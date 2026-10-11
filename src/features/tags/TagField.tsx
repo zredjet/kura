@@ -3,6 +3,7 @@ import { type KeyboardEvent, useEffect, useId, useState } from 'react';
 import { ja } from '../../i18n/ja';
 import { suggestTags, tagLabel, type TagRefDto, type TagSuggestionDto } from '../../ipc/tags';
 import styles from './Tags.module.css';
+import { isImeKey } from '../../lib/ime';
 
 /** 候補を探すまでの待ち時間（ms）。 */
 const DELAY = 60;
@@ -74,7 +75,7 @@ export function TagField({
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     e.stopPropagation();
-    if (e.nativeEvent.isComposing) {
+    if (isImeKey(e)) {
       return;
     }
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {

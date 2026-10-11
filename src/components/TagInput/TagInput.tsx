@@ -2,6 +2,7 @@ import { type KeyboardEvent, useState } from 'react';
 
 import { CloseIcon } from '../icons/CloseIcon';
 import styles from './TagInput.module.css';
+import { isImeKey } from '../../lib/ime';
 
 interface TagInputProps {
   tags: readonly string[];
@@ -30,7 +31,7 @@ export function TagInput({ tags, onChange, placeholder, inputLabel, removeLabel 
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     // 日本語入力の変換中の Enter は確定に使わない
-    if (e.nativeEvent.isComposing) {
+    if (isImeKey(e)) {
       return;
     }
     if (e.key === 'Enter' || SEPARATORS.has(e.key)) {

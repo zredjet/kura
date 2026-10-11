@@ -1,5 +1,6 @@
 import { type ReactNode, useEffect, useRef } from 'react';
 
+import { isImeKey } from '../../lib/ime';
 import styles from './Dialog.module.css';
 
 interface DialogProps {
@@ -47,7 +48,8 @@ export function Dialog({ labelledBy, onClose, size = 'md', children }: DialogPro
     stack.push(dialog);
 
     const onKeyDown = (e: KeyboardEvent) => {
-      if (!isTop(dialog)) {
+      // 重ねたシートの下のシートと、変換中の Esc（変換の取り消し）では何もしない
+      if (!isTop(dialog) || isImeKey(e)) {
         return;
       }
       if (e.key === 'Escape') {

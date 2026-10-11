@@ -31,4 +31,18 @@ describe('Dialog', () => {
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(onOuterClose).toHaveBeenCalledOnce();
   });
+
+  it('変換中の Esc（変換の取り消し）ではシートを閉じない', () => {
+    const onClose = vi.fn();
+    render(
+      <Dialog labelledBy="t" onClose={onClose}>
+        <h2 id="t">シート</h2>
+      </Dialog>,
+    );
+    fireEvent.keyDown(document, { key: 'Escape', keyCode: 229 });
+    fireEvent.keyDown(document, { key: 'Escape', isComposing: true });
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(document, { key: 'Escape', keyCode: 27 });
+    expect(onClose).toHaveBeenCalledOnce();
+  });
 });

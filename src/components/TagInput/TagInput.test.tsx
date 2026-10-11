@@ -45,6 +45,17 @@ describe('TagInput', () => {
     expect(input).toHaveValue('かまくら');
   });
 
+  it('変換を確定する Enter（WebKit では keyCode 229）でも確定せず、次の Enter で確定する', () => {
+    render(<Harness />);
+    const input = screen.getByRole('textbox', { name: 'タグを追加' });
+    fireEvent.change(input, { target: { value: '鎌倉' } });
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 229 });
+    expect(value()).toBe('');
+    expect(input).toHaveValue('鎌倉');
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 13 });
+    expect(value()).toBe('鎌倉');
+  });
+
   it('× と空のときの Backspace で外す', () => {
     render(<Harness initial={['旅行', '2026', '海']} />);
     fireEvent.click(screen.getByRole('button', { name: 'タグ「2026」を外す' }));
