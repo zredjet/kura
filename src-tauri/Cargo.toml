@@ -23,6 +23,7 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true
+tauri-plugin-global-shortcut.workspace = true
 specta.workspace = true
 specta-typescript.workspace = true
 tauri-specta.workspace = true

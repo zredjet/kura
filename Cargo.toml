@@ -38,6 +38,8 @@ jpeg-encoder = "0.7"
 tauri = "2.12"
 tauri-build = "2.7"
 tauri-plugin-dialog = "2.8"
+# ログイン用の Chrome を見ながら撮るキー（⌃⌥⌘C。出たばかりの版は避けて固定する。docs/decisions.md）
+tauri-plugin-global-shortcut = "=2.4.0"
 # tauri-specta はまだ RC のため版を固定する（ADR-16）
 specta = "=2.0.0-rc.25"
 specta-typescript = "=0.0.12"

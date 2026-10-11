@@ -12,6 +12,39 @@ pub fn find_chrome() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+/// 前面のアプリのプロセス ID。
+pub fn frontmost_pid() -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn kura_frontmost_pid() -> i32;
+        }
+        // SAFETY: 引数のない C 関数。前面のアプリがなければ -1
+        let pid = unsafe { kura_frontmost_pid() };
+        u32::try_from(pid).ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 撮れたらスクリーンショットと同じシャッター音、失敗したらエラーの音を鳴らす（Kura が裏にいるときの知らせ）。
+pub fn play_capture_sound(ok: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn kura_play_capture_sound(ok: bool);
+        }
+        // SAFETY: 音を鳴らすだけ（メインスレッドへ回す）
+        unsafe { kura_play_capture_sound(ok) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ok;
+    }
+}
+
 /// 撮った画像の情報。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotInfo {
@@ -91,6 +124,14 @@ pub unsafe fn snapshot_webview(_webview: *mut std::ffi::c_void, _out: &Path, don
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_frontmost_app() {
+        // テストを動かしている環境に前面のアプリがあれば、その ID は 0 より大きい
+        if let Some(pid) = frontmost_pid() {
+            assert!(pid > 0);
+        }
+    }
 
     #[test]
     fn finds_chrome_when_installed() {

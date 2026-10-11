@@ -11,7 +11,9 @@
 mod browser;
 mod external;
 
-pub use browser::{SnapshotDone, SnapshotInfo, find_chrome, snapshot_webview};
+pub use browser::{
+    SnapshotDone, SnapshotInfo, find_chrome, frontmost_pid, play_capture_sound, snapshot_webview,
+};
 pub use external::{ExternalPlayer, open_in_player};
 
 use std::path::Path;
