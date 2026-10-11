@@ -69,6 +69,11 @@ impl LoginBrowser {
         }
     }
 
+    /// Chrome のプロセス ID（前面のアプリかどうかを確かめるのに使う）。
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// まだ開いているか（ユーザーが閉じたら false）。
     pub fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))

@@ -2264,7 +2264,7 @@ impl From<CaptureRuleInputDto> for kura_core::capture::RuleInput {
 }
 
 /// 見たままキャプチャ・ログイン用の Chrome の撮影の結果。
-#[derive(Debug, Clone, Serialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotResultDto {
     pub title: String,
@@ -2275,4 +2275,15 @@ pub struct SnapshotResultDto {
     pub rule_name: Option<String>,
     /// 長いページのため途中まで。
     pub truncated: bool,
+}
+
+/// ⌃⌥⌘C（ログイン用の Chrome を見ながら撮る）の結果（イベント `capture://login-shot`。ADR-112）。
+#[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+#[tauri_specta(event_name = "capture://login-shot")]
+pub struct LoginShotEvent {
+    pub ok: bool,
+    /// 撮れなかったときの理由。
+    pub message: String,
+    pub result: Option<SnapshotResultDto>,
 }

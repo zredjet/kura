@@ -6,6 +6,7 @@ mod dto;
 mod error;
 mod logging;
 mod protocol;
+mod shortcut;
 mod state;
 
 pub use error::{AppError, AppErrorCode};
@@ -146,7 +147,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::playlists::playlist_regenerate,
             commands::playlists::playlist_save_state,
         ])
-        .events(collect_events![dto::JobProgress])
+        .events(collect_events![dto::JobProgress, dto::LoginShotEvent])
         // ジョブの結果（resultJson）を読むための型
         .typ::<dto::ImportResultDto>()
         // ID・ミリ秒・バイト数は 2^53 を超えないので number として扱う
@@ -196,6 +197,7 @@ pub fn run() -> ExitCode {
     let raw = raw_handler();
     let app = tauri::Builder::<tauri::Wry>::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
             if RAW_COMMANDS.contains(&invoke.message.command()) {
                 raw(invoke)

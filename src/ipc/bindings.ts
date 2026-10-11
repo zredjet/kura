@@ -90,7 +90,10 @@ export const commands = {
 	 *  すでに開いていれば、URL を新しいタブで開く。
 	 */
 	captureLogin: (url: string | null) => typedError<null, AppError>(__TAURI_INVOKE("capture_login", { url })),
-	/**  ログイン用の Chrome が開いているか（撮影中で手が離せなければ開いているとみなす）。 */
+	/**
+	 *  ログイン用の Chrome が開いているか（撮影中で手が離せなければ開いているとみなす）。
+	 *  ユーザーが Chrome を閉じていたら片付けて、撮るキーも外す。
+	 */
 	captureLoginStatus: () => __TAURI_INVOKE<boolean>("capture_login_status"),
 	/**
 	 *  ログイン用の Chrome の前面のタブを、見ている表示のまま撮って入れる。URL がルールに一致すれば、その撮り方
@@ -224,6 +227,7 @@ export const commands = {
 
 /** Events */
 export const events = {
+	captureLoginShot: makeEvent<LoginShotEvent>("capture://login-shot"),
 	jobProgress: makeEvent<JobProgress>("job://progress"),
 };
 
@@ -659,6 +663,14 @@ export type LocationCheckDto = {
 
 /**  場所の状態。 */
 export type LocationStatusDto = "new" | "existingLibrary" | "occupied";
+
+/**  ⌃⌥⌘C（ログイン用の Chrome を見ながら撮る）の結果（イベント `capture://login-shot`。ADR-112）。 */
+export type LoginShotEvent = {
+	ok: boolean,
+	/**  撮れなかったときの理由。 */
+	message: string,
+	result: SnapshotResultDto | null,
+};
 
 /**  ユニットのメンバーの並び順。 */
 export type OrderModeDto = "manual" | "name" | "imported" | "captured" | "duration";
