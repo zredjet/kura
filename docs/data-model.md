@@ -16,11 +16,13 @@ Kura Library.kuralib/
   staging/                      # 取り込み・ダウンロード・キャプチャの一時置き場
   archives/                     # yt-dlp / gallery-dl の download-archive
   logs/                         # ジョブのログ
+  backups/library-YYYYMMDD-HHMMSS.sqlite  # DB のバックアップ（UTC。新しい 7 個。FR-SYS-03・ADR-121）
 ```
 
 - `files/` のファイル名はハッシュなので、元のファイル名は DB（`original_name`）にだけ残る。
 - 既定の場所は初回起動時にユーザーが選ぶ（候補：`~/Pictures/Kura Library.kuralib`）。外付けディスクも可。
 - iCloud Drive など同期フォルダの中は非推奨（SQLite の WAL と相性が悪い）。選ばれたら警告する。
+- **バックアップから戻す**（アプリには入れない。ADR-121）：Kura を終了し、`library.sqlite`・`library.sqlite-wal`・`library.sqlite-shm` を別の場所へ移してから、`backups/` の戻したいファイルを `library.sqlite` という名前でライブラリのフォルダへコピーして開く。バックアップより後に取り込んだファイルは `files/` に残り、開いたときの整合性チェックで「DB にないファイル」として数えられる（消えはしない）。
 
 ## 2. 共通方針
 
@@ -38,6 +40,7 @@ Kura Library.kuralib/
 | `0002_thumb_pending_index` | `idx_items_thumb_pending`（サムネイル未作成を新しい順に取り出す部分索引） |
 | `0003_proxy_todo_index` | 画像の `proxy_state` を `not_needed` にし、`idx_items_proxy_unknown` / `idx_items_proxy_pending`（プロキシの判定・作成を待つものを新しい順に取り出す部分索引）を足す |
 | `0004_playlist_generation` | `playlists.generated_at` / `sort_key` / `sort_desc`（スマートの並びを作った日時と、シャッフルしないときの並び順）と `playlist_state.item_id`（再開するアイテム）を足す |
+| `0005_export_job` | `jobs.kind` に `export`（書き出し。FR-SYS-02）を足す。CHECK を変えるため `jobs` を作り直して中身を移す |
 
 ```sql
 -- ===== アイテム =====
@@ -250,7 +253,7 @@ CREATE INDEX idx_play_events_item ON play_events(item_id, played_at DESC);
 -- ===== ジョブ =====
 CREATE TABLE jobs (
   id            INTEGER PRIMARY KEY,
-  kind          TEXT    NOT NULL CHECK (kind IN ('import','thumbnail','proxy','download','capture')),
+  kind          TEXT    NOT NULL CHECK (kind IN ('import','thumbnail','proxy','download','capture','export')),  -- 0005：export
   state         TEXT    NOT NULL CHECK (state IN ('queued','running','paused','done','failed','canceled')),
   priority      INTEGER NOT NULL DEFAULT 0,
   input_json    TEXT    NOT NULL,

@@ -86,6 +86,9 @@
 | | `open_external(hash)` → `mpv` \| `quickTime` | 元のファイルを外部プレイヤーで開く（mpv があれば mpv） |
 | | `player_prefs_get()` / `player_prefs_set(prefs)` | 再生の設定（音量・画像の間も直前の音楽を流す・BGM をループ・画像の表示時間の既定値）。app.json に保存 |
 | ジョブ | `jobs_list(filter)` / `job_cancel(id)` / `job_pause(id)` / `job_resume(id)` / `job_retry(id)` / `job_log(id)` | 進捗はイベント `job://progress` |
+| 書き出し | `export_start(dest, entries)` → JobId | 選んだもの（一覧の ID。ユニットは印付き）を書き出すジョブを積む。書き出し先はあるフォルダで、ライブラリの中は受け付けない（§14） |
+| バックアップ | `backups_list()` → `Backup[]` / `backup_now()` → `Backup` | DB のバックアップの一覧（新しい順）と、今すぐ作る（§14） |
+| | `reveal_path(path)` | Finder で見せる（書き出したもの・バックアップ・ライブラリ） |
 | ダウンロード | `download_detect(url)` → `{ url, site, siteLabel, tool, rule?, playlist, toolFound }` | URL の取得方法（規則 → サイトの表 → yt-dlp の汎用）。§9 |
 | | `download_defaults()` / `download_enqueue(url, options)` → JobId | 前回の選択（ライブラリの settings）と、取得を積む（選んだ内容を次回の既定にする）。`options` は画質（best / 1080 / 720 / 480）・音声のみ・保存先のフォルダ・自動タグ（投稿者・サイトのタグ）・再生リストをユニットに |
 | | `downloads_list(limit?)` → `DownloadJob[]` | ダウンロードのジョブを新しい順に（URL・サイト・ツール・題名・件数・入れたアイテムとユニット） |
@@ -131,7 +134,7 @@
 - アプリの終了・ライブラリの切り替えでは、実行中のジョブを区切りで止めて `queued` に戻す（次回の起動で自動で再開）。ユーザーが一時停止したものは `paused` のまま。
 - 再開に必要な途中経過は、ジョブ自身が作業と同じトランザクションで `result_json` に保存する。
 - ライブラリを開くときは、staging の掃除 → 整合性チェック → ジョブの開始、の順にする（チェック中に取り込みが進むと食い違いを誤って数えるため）。
-- 種類ごとの同時実行数：import 1、thumbnail 1（ジョブの中で CPU コア数の並列。ADR-31）、proxy 1、download 2、capture 1。
+- 種類ごとの同時実行数：import 1、thumbnail 1（ジョブの中で CPU コア数の並列。ADR-31）、proxy 1、download 2、capture 1、export 1。
 - 後続のジョブは `ensure_queued(kind, input)` で積む（同じ種類が `queued` ならもう積まない）。サムネイルのジョブは、取り込みのバッチを書いたあとと、ライブラリを開いたとき（`pending` が残っていれば）に積む。
 - 各ジョブはキャンセルトークンを持つ。外部プロセスはキャンセル時に SIGTERM、5 秒後に SIGKILL。
 - 進捗は `job://progress` イベント（`{ id, kind, state, progress, message, resultJson }`）を 200ms 以上の間隔で間引いて送る（状態の変わり目は間引かない）。
@@ -288,6 +291,7 @@ import_start:    ジョブとして実行
 | `kura-devtools bench query --library <path>` | 開く・`query_ids`・`items_get`（200 件）・`item_detail`、サイドバーの一覧の種類・件数・タグの候補の中央値 |
 | `kura-devtools bench thumbs --src <dir> [--threads N]` | 画像サムネイルの生成速度（枚/秒） |
 | `kura-devtools bench import --src <dir> [--threads N] [--out <dir>]` | 取り込みの速さ（MB/秒・件/秒）と、同じファイルをハッシュだけした速さ。新しいライブラリを `--out`（既定は `--src` と同じ場所）に作って入れ、測り終えたら消す（M9） |
+| `kura-devtools bench backup --library <path>` | DB のバックアップを 1 つ作る速さ（10 万件・58MB で 0.25 秒。M9） |
 | `kura-devtools import` / `check` | コマンドラインからの取り込みと整合性の確認（§6） |
 | `kura-devtools download --library <path> <url>...` | アプリと同じダウンロードのジョブで取得して入れる（§9。既定の選択・Cookie なし） |
 | `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない） |
@@ -360,3 +364,16 @@ M9 の実測（NFR-01〜07。Apple M4 Max（高性能 12・高効率 4 コア）
 - NFR-04 の HEIC：`CGImageSourceCreateThumbnailAtIndex` を通さずにデコードだけしても同じ速さで、縮小しながらのデコード（`kCGImageSourceSubsampleFactor`）も速くならない。HEVC のデコードが上限なので、アプリ側では変えない。
 - NFR-05 の小さいファイル：並列数 6 と 8 は誤差の範囲、16 は遅い（APFS のクローンと rename の取り合い）。ADR-21 の 6 並列のままにする（ADR-114）。HDD はこの環境にないので測っていない。
 - 乱数のデータで作った画像・動画は、メディア情報の読み取りが ffprobe へのフォールバック（プロセスの起動）になり、1 件ごとに遅くなる。取り込みの計測には中身の正しいファイルを使う。
+
+## 14. 書き出しとバックアップ（M9）
+
+- **書き出し**（`kura_core::export`、ジョブ `kind = 'export'`。ADR-120）：
+  - 選んだアイテム（重ねて選んだものは 1 回）を書き出し先のフォルダへ、ユニットはユニット名のフォルダの中に並び順でコピーする。読むのはライブラリの `files/` だけで、同じボリュームならクローン。
+  - ファイル名は元のファイル名（`/`・`:`・制御文字は `_`、先頭の `.` は `_`、255 バイトまで）。書き出し先の既存のファイル・フォルダは上書きしない：一時ファイル（`.kura-export-<job>-<n>.part`）にコピーしてから、すでにあれば失敗するハードリンクで名前を付ける（あれば「名前 2.jpg」）。ハードリンクが使えないボリュームでは、ないことを確かめて名前を変える。ユニットのフォルダは `create_dir`（あれば「鎌倉 2」）。
+  - 最後に `kura-export.json`（あれば「kura-export 2.json」）を書く：`{ app, version, exportedAt, items: [{ file, originalName, title, kind, hash, sizeBytes, width, height, durationMs, rating, note, tags, folders, units, sourceSite, sourceUrl, capturedAt, importedAt }] }`。日時は ISO 8601 の UTC、タグは「名前空間:名前」、フォルダはいちばん上からの名前の列。
+  - 一時停止・再開できる（位置・書いたファイル・ユニットのフォルダの名前を `result_json` に保存）。中止しても書いたファイルは消さない。ライブラリのファイルがないものは失敗として数えて続ける。
+  - 入口：ファイル › 書き出す…（⌘⇧E）、項目のメニュー。進捗は取り込みと同じカプセルに出し、終わったら「Finder で表示」。
+- **バックアップ**（`kura_core::library::backup`。ADR-121）：
+  - SQLite の backup API で、読み取り専用の別の接続から `backups/library-YYYYMMDD-HHMMSS.sqlite`（UTC）へ少しずつ写す（書き込みは止めない）。一時ファイルに写してから名前を変え、1 つのファイルで開けるよう `journal_mode = DELETE` にする。
+  - 開いて 20 秒後と、そのあと 1 時間ごとに確かめ、前回から 24 時間以上たっていれば作る。新しい 7 個を残し、`backups/` の中のこの形の名前のものだけ消す。設定画面から今すぐ作れる。
+  - 戻すのはアプリの外で手で行う（docs/data-model.md §1）。
