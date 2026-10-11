@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
 import { listJobs, type JobProgress, onJobProgress, progressFromJob } from '../ipc/jobs';
+import { useDownloadsStore } from './downloadsStore';
 import { refreshPending } from './itemCache';
 import { useLibraryStore } from './libraryStore';
 import { useSidebarStore } from './sidebarStore';
@@ -32,6 +33,9 @@ const refreshThumbs = coalesce(THUMB_REFRESH_MS, refreshPending);
 /** ジョブの進みに合わせて画面のデータを更新する（取り込み → 一覧、サムネイル → タイル）。 */
 export function reactToJob(event: JobProgress): void {
   if (event.kind === 'import' && (event.state === 'running' || event.state === 'done')) {
+    reloadList();
+  } else if (event.kind === 'download' && event.state === 'done') {
+    // 取得したものがライブラリに入った
     reloadList();
   } else if (event.kind === 'thumbnail') {
     refreshThumbs();
@@ -96,6 +100,7 @@ export function startJobEvents(): () => void {
   let stopped = false;
   onJobProgress((event) => {
     useJobsStore.getState().apply(event);
+    useDownloadsStore.getState().apply(event);
     reactToJob(event);
   })
     .then((unlisten) => {

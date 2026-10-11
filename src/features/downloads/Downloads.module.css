@@ -1,0 +1,631 @@
+/*
+ * Downloads.dc.html：左に取得の欄と一覧（最小 520px）、右に外部ツール（300〜380px）。間隔 20px。
+ * 面は角丸 16px・--fill-1 の地（コンテンツ領域なのでガラスは使わない）。
+ */
+
+.view {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-3-5) var(--space-5) calc(var(--space-6) * 4) var(--space-4);
+}
+
+.layout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-5);
+}
+
+.main {
+  flex: 999 1 520px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.side {
+  flex: 1 1 300px;
+  max-width: 380px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3-5);
+}
+
+/* ===== 見出し ===== */
+
+.head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0-5);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--text-3xl);
+  font-weight: var(--weight-bold);
+}
+
+.summary {
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== 取得の欄 ===== */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3-5);
+  border-radius: var(--radius-xl);
+  background: var(--fill-1);
+  border: 1px solid var(--stroke-1);
+}
+
+.urlRow {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.urlField {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 40px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--stroke-3);
+  background: var(--bg-input);
+  color: var(--text-tertiary);
+}
+
+.urlField:focus-within {
+  box-shadow: var(--focus-ring);
+}
+
+.urlInput {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-md);
+}
+
+/* 枠（.urlField）のほうに印を出すので、入力欄そのものの印は消す */
+.urlInput:focus-visible {
+  box-shadow: none;
+}
+
+.urlInput::placeholder {
+  color: var(--text-tertiary);
+}
+
+.addButton {
+  flex: none;
+  height: 40px;
+  padding: 0 var(--space-4);
+  border: 0;
+  border-radius: var(--radius-lg);
+  background: var(--accent);
+  color: var(--on-accent);
+  font: inherit;
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+}
+
+.addButton:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.optionRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--h-chip);
+  font-size: var(--text-sm);
+}
+
+.detected {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  height: var(--h-chip);
+  padding: 0 var(--space-2-5);
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  color: var(--text-primary);
+}
+
+.detected svg {
+  color: var(--accent);
+}
+
+.hint {
+  color: var(--text-tertiary);
+}
+
+.warning {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  color: var(--warning);
+}
+
+.chip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  height: var(--h-chip);
+  padding: 0 var(--space-2-5);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.chip[aria-pressed='true'] {
+  background: var(--fill-pressed);
+  border-color: transparent;
+  color: var(--text-on-media);
+}
+
+.chipLabel {
+  color: var(--text-tertiary);
+}
+
+.chip[aria-pressed='true'] .chipLabel {
+  color: inherit;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* ===== タブと一覧 ===== */
+
+.tabs {
+  display: flex;
+  gap: var(--space-0-5);
+  align-self: flex-start;
+  padding: var(--space-0-5);
+  border-radius: var(--radius-lg);
+  background: var(--fill-1);
+}
+
+.tab {
+  height: var(--h-chip);
+  padding: 0 var(--space-3-5);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.tab[aria-selected='true'] {
+  background: var(--fill-pressed);
+  color: var(--text-on-media);
+  font-weight: var(--weight-semibold);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius-xl);
+  background: var(--fill-1);
+  border: 1px solid var(--stroke-1);
+  overflow: hidden;
+}
+
+.empty {
+  margin: 0;
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: var(--text-md);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3-5);
+  min-height: 76px;
+  padding: var(--space-3) var(--space-3-5);
+}
+
+.row + .row {
+  border-top: 1px solid var(--stroke-1);
+}
+
+.thumb {
+  position: relative;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 44px;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--fill-2);
+  color: var(--text-tertiary);
+}
+
+.thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.jobTitle {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.tool {
+  padding: var(--space-0-5) var(--space-1-5);
+  border-radius: var(--radius-xs);
+  background: var(--fill-2);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+
+.state {
+  font-weight: var(--weight-semibold);
+  color: var(--text-secondary);
+}
+
+.state[data-state='running'] {
+  color: var(--accent);
+}
+
+.state[data-state='failed'] {
+  color: var(--danger-text);
+}
+
+.detail {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.detail[data-state='failed'] {
+  color: var(--danger-text);
+}
+
+.actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.roundButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.pillButton {
+  height: 30px;
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.pillPrimary {
+  background: var(--text-primary);
+  color: var(--bg-window);
+  font-weight: var(--weight-semibold);
+}
+
+.roundButton:hover,
+.pillButton:hover,
+.chip:hover,
+.tab:hover {
+  filter: brightness(1.15);
+}
+
+/* ===== 右の欄 ===== */
+
+.sidePanel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2-5);
+  padding: var(--space-4);
+  border-radius: var(--radius-xl);
+  background: var(--fill-1);
+  border: 1px solid var(--stroke-1);
+}
+
+.sideHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.sideTitle {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+}
+
+.smallButton {
+  height: var(--h-chip);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.smallButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.tools {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-2) var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.toolName {
+  min-width: 0;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toolNote {
+  color: var(--text-tertiary);
+}
+
+.toolState {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.toolState svg {
+  color: var(--accent);
+}
+
+.toolState[data-missing='true'],
+.toolState[data-missing='true'] svg {
+  color: var(--warning);
+}
+
+.toolMenu {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.sideRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding-top: var(--space-2-5);
+  border-top: 1px solid var(--stroke-1);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.menuButton {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  height: var(--h-chip);
+  padding: 0 var(--space-2-5);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-md);
+  background: var(--fill-2);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+/* ===== シート（ログ・入れ方・規則） ===== */
+
+.sheet {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-5);
+}
+
+.sheetTitle {
+  margin: 0;
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-semibold);
+}
+
+.sheetText {
+  margin: 0;
+  font-size: var(--text-md);
+  color: var(--text-secondary);
+  line-height: var(--leading-body);
+}
+
+.code {
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  padding: var(--space-3);
+  border-radius: var(--radius-lg);
+  background: var(--bg-input);
+  border: 1px solid var(--stroke-2);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.sheetActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.rules {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.rule {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-radius: var(--radius-lg);
+  background: var(--fill-1);
+  border: 1px solid var(--stroke-1);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.fieldWide {
+  grid-column: 1 / 3;
+}
+
+.input {
+  height: 30px;
+  padding: 0 var(--space-2-5);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke-3);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-md);
+}
+
+.input:focus,
+.select:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+.select {
+  height: 30px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke-3);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-md);
+}
+
+.ruleRemove {
+  align-self: end;
+}
+
+.error {
+  margin: 0;
+  color: var(--danger-text);
+  font-size: var(--text-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .roundButton:hover,
+  .pillButton:hover,
+  .chip:hover,
+  .tab:hover {
+    filter: none;
+  }
+}
+
+.toolRow {
+  display: contents;
+}

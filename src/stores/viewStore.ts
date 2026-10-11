@@ -69,6 +69,8 @@ interface ViewState extends Saved {
   view: ListView;
   /** プレイリストの画面を開いていればその ID（一覧の代わりに出す）。 */
   playlist: number | null;
+  /** ダウンロードの画面を開いているか（一覧の代わりに出す）。 */
+  downloads: boolean;
   /** ユニットを開いているときの戻り先。 */
   parent: ListView | null;
   /** 検索の条件（チップの列。docs/search-query.md）。一覧を切り替えると外す（ADR-53）。 */
@@ -81,6 +83,8 @@ interface ViewState extends Saved {
   setView: (view: ListView) => void;
   /** プレイリストの画面を開く。 */
   openPlaylist: (id: number) => void;
+  /** ダウンロードの画面を開く。 */
+  openDownloads: () => void;
   /** ユニットの中を開く（戻り先は今の一覧）。 */
   openUnit: (unitId: number) => void;
   /** ユニットの中から戻る。 */
@@ -102,6 +106,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
   ...load(),
   view: { kind: 'all' },
   playlist: null,
+  downloads: false,
   parent: null,
   filter: [],
   parentFilter: [],
@@ -111,19 +116,24 @@ export const useViewStore = create<ViewState>((set, get) => ({
     set({
       view,
       playlist: null,
+      downloads: false,
       parent: null,
       filter: [],
       parentFilter: [],
       selection: EMPTY_SELECTION,
       quickLook: false,
     }),
-  openPlaylist: (id) => set({ playlist: id, selection: EMPTY_SELECTION, quickLook: false }),
+  openPlaylist: (id) =>
+    set({ playlist: id, downloads: false, selection: EMPTY_SELECTION, quickLook: false }),
+  openDownloads: () =>
+    set({ downloads: true, playlist: null, selection: EMPTY_SELECTION, quickLook: false }),
   openUnit: (unitId) => {
     const { view, parent, filter, parentFilter } = get();
     const fromUnit = view.kind === 'unit';
     set({
       view: { kind: 'unit', id: unitId },
       playlist: null,
+      downloads: false,
       parent: fromUnit ? parent : view,
       filter: [],
       parentFilter: fromUnit ? parentFilter : filter,

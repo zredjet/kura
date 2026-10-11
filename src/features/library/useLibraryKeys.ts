@@ -45,12 +45,13 @@ function acceptsKeys(target: EventTarget | null): boolean {
 
 /**
  * 一覧のすべてを選ぶ。メニューの「すべてを選択」（⌘A）から呼ぶ。
- * 一覧が出ていないとき（ライブラリを開いていない・プレイリストを開いている）や、
+ * 一覧が出ていないとき（ライブラリを開いていない・プレイリストやダウンロードを開いている）や、
  * キー操作を受け付けないときは何もせず false。
  */
 export function selectAllEntries(target: EventTarget | null): boolean {
   const { status, list } = useLibraryStore.getState();
-  if (status !== 'open' || useViewStore.getState().playlist !== null || !acceptsKeys(target)) {
+  const { playlist, downloads } = useViewStore.getState();
+  if (status !== 'open' || playlist !== null || downloads || !acceptsKeys(target)) {
     return false;
   }
   useViewStore.getState().setSelection(selectAll(list?.ids ?? new Uint32Array()));

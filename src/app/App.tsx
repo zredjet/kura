@@ -4,6 +4,8 @@ import { useEffect } from 'react';
 import { Menu } from '../components/Menu/Menu';
 import { Notice } from '../components/Notice/Notice';
 import { Overlays } from '../components/Overlay/Overlays';
+import { DownloadsView } from '../features/downloads/DownloadsView';
+import { useDownloadsShortcut } from '../features/downloads/useDownloadsShortcut';
 import { DropOverlay } from '../features/import/DropOverlay';
 import { ImportSheet } from '../features/import/ImportSheet';
 import { DragGhost } from '../features/library/DragGhost';
@@ -17,6 +19,7 @@ import { Welcome } from '../features/welcome/Welcome';
 import { closePlayer, loadPlayerPrefs } from '../features/player/playerActions';
 import { reportPlaybackSupport } from '../features/player/support';
 import { Theater } from '../features/player/Theater';
+import { useDownloadsStore } from '../stores/downloadsStore';
 import { startJobEvents, useJobsStore } from '../stores/jobsStore';
 import { useLibraryStore } from '../stores/libraryStore';
 import { useViewStore } from '../stores/viewStore';
@@ -54,11 +57,14 @@ export function App() {
 function LibraryScreen() {
   useFileDrop();
   useImportShortcut();
+  useDownloadsShortcut();
   useEffect(() => {
     void useJobsStore.getState().load();
+    void useDownloadsStore.getState().load();
     void loadPlayerPrefs();
   }, []);
   const playlist = useViewStore((s) => s.playlist);
+  const downloads = useViewStore((s) => s.downloads);
   // ライブラリを替えたら再生をやめる
   const libraryPath = useLibraryStore((s) => s.info?.path);
   useEffect(() => closePlayer, [libraryPath]);
@@ -66,7 +72,13 @@ function LibraryScreen() {
   return (
     <>
       <AppShell sidebar={<Sidebar />}>
-        {playlist !== null ? <PlaylistView key={playlist} id={playlist} /> : <LibraryView />}
+        {downloads ? (
+          <DownloadsView />
+        ) : playlist !== null ? (
+          <PlaylistView key={playlist} id={playlist} />
+        ) : (
+          <LibraryView />
+        )}
       </AppShell>
       <Theater />
       <ImportSheet />

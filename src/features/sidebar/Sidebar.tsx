@@ -4,12 +4,14 @@ import glass from '../../components/glass/glass.module.css';
 import { AllItemsIcon } from '../../components/icons/AllItemsIcon';
 import { ClockIcon } from '../../components/icons/ClockIcon';
 import { DiceIcon } from '../../components/icons/DiceIcon';
+import { DownloadIcon } from '../../components/icons/DownloadIcon';
 import { TrashIcon } from '../../components/icons/TrashIcon';
 import { UnsortedIcon } from '../../components/icons/UnsortedIcon';
 import { UntaggedIcon } from '../../components/icons/UntaggedIcon';
 import { ja } from '../../i18n/ja';
 import type { ListView } from '../../ipc/items';
 import { formatCount } from '../../lib/format';
+import { selectActiveCount, useDownloadsStore } from '../../stores/downloadsStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import { FolderTree } from './FolderTree';
@@ -48,7 +50,7 @@ function viewFor(kind: LibraryKind): ListView {
 /**
  * サイドバー（Sidebar.dc.html）。先頭の行にはネイティブの信号機が重なる。
  * ライブラリの切り替え・ライブラリの項目・スマートフォルダ・フォルダの木・プレイリスト。
- * 取得（M7）・容量と設定（M9）は、その機能を入れるときに足す。
+ * 取得のキャプチャ（M8）・容量と設定（M9）は、その機能を入れるときに足す。
  */
 export function Sidebar() {
   const counts = useSidebarStore((s) => s.counts);
@@ -56,8 +58,11 @@ export function Sidebar() {
   const parent = useViewStore((s) => s.parent);
   const setView = useViewStore((s) => s.setView);
   const playlistOpen = useViewStore((s) => s.playlist !== null);
-  // プレイリストを開いているあいだは、ライブラリ・フォルダの行を選んでいる表示にしない
-  const current = playlistOpen ? null : view.kind === 'unit' ? parent : view;
+  const downloadsOpen = useViewStore((s) => s.downloads);
+  const otherScreen = playlistOpen || downloadsOpen;
+  const activeDownloads = useDownloadsStore(selectActiveCount);
+  // プレイリスト・ダウンロードを開いているあいだは、ライブラリ・フォルダの行を選んでいる表示にしない
+  const current = otherScreen ? null : view.kind === 'unit' ? parent : view;
 
   useEffect(() => {
     void useSidebarStore.getState().load();
@@ -107,7 +112,7 @@ export function Sidebar() {
                 {...{ [ROW_ATTR]: '' }}
                 onClick={(e) => {
                   e.currentTarget.focus();
-                  if (!selected || row.kind === 'random' || playlistOpen) {
+                  if (!selected || row.kind === 'random' || otherScreen) {
                     setView(viewFor(row.kind));
                   }
                 }}
@@ -122,6 +127,27 @@ export function Sidebar() {
         <SmartFolderList current={current} />
         <FolderTree current={current} />
         <PlaylistList />
+        <section className={styles.section} aria-label={ja.sidebar.fetchSection}>
+          <h2 className={styles.sectionTitle}>{ja.sidebar.fetchSection}</h2>
+          <button
+            type="button"
+            className={styles.row}
+            aria-current={downloadsOpen ? 'page' : undefined}
+            {...{ [ROW_ATTR]: '' }}
+            onClick={(e) => {
+              e.currentTarget.focus();
+              useViewStore.getState().openDownloads();
+            }}
+          >
+            <span className={styles.rowIcon}>
+              <DownloadIcon size={16} strokeWidth={1.8} />
+            </span>
+            <span className={styles.rowLabel}>{ja.sidebar.downloads}</span>
+            {activeDownloads > 0 && (
+              <span className={styles.count}>{formatCount(activeDownloads)}</span>
+            )}
+          </button>
+        </section>
       </div>
     </nav>
   );
