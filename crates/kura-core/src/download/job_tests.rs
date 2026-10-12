@@ -60,16 +60,25 @@ impl Env {
     }
 
     fn enqueue(&self, url: &str) -> JobId {
+        self.enqueue_with(url, false)
+    }
+
+    fn enqueue_with(&self, url: &str, redownload: bool) -> JobId {
         let input = DownloadInput {
             detection: detect(url, &[]).unwrap(),
             options: DownloadOptions::default(),
             cookies: CookieSource::None,
+            redownload,
         };
         start_download(&self.jobs, &input).unwrap()
     }
 
     fn finish(&self, url: &str) -> (JobRecord, DownloadResult) {
-        let id = self.enqueue(url);
+        self.finish_with(url, false)
+    }
+
+    fn finish_with(&self, url: &str, redownload: bool) -> (JobRecord, DownloadResult) {
+        let id = self.enqueue_with(url, redownload);
         assert!(self.jobs.wait_idle(WAIT));
         let record = self.jobs.get(id).unwrap();
         let result = record
@@ -220,6 +229,67 @@ fn gallerydl_multi_page_work_becomes_a_unit() {
         Some("取得済みの 2 件はスキップしました")
     );
     assert_eq!(env.query::<i64>("SELECT count(*) FROM items"), vec![2]);
+}
+
+/// 取得済みの記録（テキスト）を見て、記録にあれば飛ばす yt-dlp の代わり。
+const FAKE_YTDLP_ARCHIVE: &str = r##"
+dir=""; url=""; archive=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -P) dir="$2"; shift 2;;
+    --download-archive) archive="$2"; shift 2;;
+    --) url="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+if [ -f "$archive" ] && grep -qx "youtube vid1" "$archive"; then
+  echo "[download] vid1: has already been recorded in the archive"
+  exit 0
+fi
+printf 'KURA\tplan\tvid1\tNA\tNA\t[100]\tNA\tNA\t"テスト動画"\n'
+printf 'video' > "$dir/vid1.mp4"
+printf '{"id":"vid1","title":"テスト動画","webpage_url":"%s"}' "$url" > "$dir/vid1.info.json"
+echo "youtube vid1" >> "$archive"
+printf 'KURA\tfile\t%s/vid1.mp4\n' "$dir"
+"##;
+
+#[test]
+fn redownload_ignores_the_archive_and_records_again() {
+    let _guard = lock_tools();
+    let env = Env::new("yt-dlp", FAKE_YTDLP_ARCHIVE);
+    let url = "https://www.youtube.com/watch?v=vid1";
+    let archive = env.library.layout().archives_dir().join("yt-dlp.txt");
+    let (_, result) = env.finish(url);
+    assert_eq!(result.added, 1);
+    assert_eq!(std::fs::read_to_string(&archive).unwrap(), "youtube vid1\n");
+
+    // ゴミ箱に入れて空にすると、ふつうのダウンロードでは記録にあるので取り直さない
+    env.library
+        .db()
+        .write(|tx| {
+            tx.execute("UPDATE items SET trashed_at = 1", [])?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(env.library.empty_trash().unwrap().items, 1);
+    let (_, result) = env.finish(url);
+    assert_eq!((result.files, result.skipped), (0, 1));
+
+    // 再ダウンロードは記録にあっても取り直す。記録は増やさない
+    let (record, result) = env.finish_with(url, true);
+    assert_eq!(record.state, JobState::Done, "{:?}", record.message);
+    assert_eq!((result.files, result.added, result.skipped), (1, 1, 0));
+    assert_eq!(env.query::<i64>("SELECT count(*) FROM items"), vec![1]);
+    assert_eq!(std::fs::read_to_string(&archive).unwrap(), "youtube vid1\n");
+    assert!(!env.work(record.id).exists());
+    let log = env.jobs.log_text(record.id, 64 * 1024).unwrap();
+    assert!(log.contains("再ダウンロード"), "{log}");
+
+    // 記録を消したあとの再ダウンロードは、取ったものを記録に戻す
+    std::fs::remove_file(&archive).unwrap();
+    let (_, result) = env.finish_with(url, true);
+    assert_eq!((result.files, result.duplicates), (1, 1));
+    assert_eq!(std::fs::read_to_string(&archive).unwrap(), "youtube vid1\n");
 }
 
 #[test]

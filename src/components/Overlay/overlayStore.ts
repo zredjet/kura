@@ -28,6 +28,22 @@ interface ConfirmOverlay {
   resolve: (ok: boolean) => void;
 }
 
+/** 選択肢のダイアログのボタン（並べた順に、キャンセルの右へ置く）。 */
+export interface Choice {
+  value: string;
+  label: string;
+  /** 主ボタン（いちばん右に 1 つ）。 */
+  primary?: boolean;
+}
+
+interface ChoiceOverlay {
+  kind: 'choice';
+  title: string;
+  message: string;
+  choices: Choice[];
+  resolve: (value: string | null) => void;
+}
+
 interface PickerOverlay {
   kind: 'picker';
   title: string;
@@ -67,7 +83,12 @@ interface AddModeOverlay {
 }
 
 export type Overlay =
-  PromptOverlay | ConfirmOverlay | PickerOverlay | NewPlaylistOverlay | AddModeOverlay;
+  | PromptOverlay
+  | ConfirmOverlay
+  | ChoiceOverlay
+  | PickerOverlay
+  | NewPlaylistOverlay
+  | AddModeOverlay;
 
 interface OverlayState {
   overlay: Overlay | null;
@@ -118,6 +139,24 @@ export function askConfirm(options: Omit<ConfirmOverlay, 'kind' | 'resolve'>): P
       resolve: (ok) => {
         useOverlayStore.setState({ overlay: null });
         resolve(ok);
+      },
+    }),
+  );
+}
+
+/** メッセージを見せて、ボタンのどれかを選んでもらう（キャンセルなら null）。 */
+export function askChoice<T extends string>(
+  options: Omit<ChoiceOverlay, 'kind' | 'resolve' | 'choices'> & {
+    choices: (Choice & { value: T })[];
+  },
+): Promise<T | null> {
+  return new Promise((resolve) =>
+    show({
+      kind: 'choice',
+      ...options,
+      resolve: (value) => {
+        useOverlayStore.setState({ overlay: null });
+        resolve(value as T | null);
       },
     }),
   );

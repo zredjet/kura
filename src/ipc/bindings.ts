@@ -74,12 +74,15 @@ export const commands = {
 	jobPrioritize: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("job_prioritize", { id })),
 	/**  ジョブのログ（末尾 256KB）。 */
 	jobLog: (id: number) => typedError<string, AppError>(__TAURI_INVOKE("job_log", { id })),
-	/**  URL の取得方法を判定する（キャプチャのルール → 取得の規則 → サイトの表）。 */
+	/**
+	 *  URL の取得方法を判定する（キャプチャのルール → 取得の規則 → サイトの表）。
+	 *  前に同じものをダウンロードしていれば、そのときのことも返す（ADR-132）。
+	 */
 	downloadDetect: (url: string) => typedError<DetectionDto, AppError>(__TAURI_INVOKE("download_detect", { url })),
 	/**  前回の選択（ライブラリごと。なければ既定値）。 */
 	downloadDefaults: () => typedError<DownloadOptionsDto, AppError>(__TAURI_INVOKE("download_defaults")),
-	/**  ダウンロードを積む。選んだ内容は次回の既定にする。 */
-	downloadEnqueue: (url: string, options: DownloadOptionsDto) => typedError<number, AppError>(__TAURI_INVOKE("download_enqueue", { url, options })),
+	/**  ダウンロードを積む。選んだ内容は次回の既定にする。`redownload` なら取得済みの記録にあるものも取り直す。 */
+	downloadEnqueue: (url: string, options: DownloadOptionsDto, redownload: boolean) => typedError<number, AppError>(__TAURI_INVOKE("download_enqueue", { url, options, redownload })),
 	/**  ダウンロードとキャプチャのジョブを新しい順に一覧する。 */
 	downloadsList: (limit: number | null) => typedError<DownloadJobDto[], AppError>(__TAURI_INVOKE("downloads_list", { limit })),
 	/**  ダウンロードの設定（Cookie の読み込み元・規則）。 */
@@ -379,6 +382,8 @@ export type DetectionDto = {
 	toolFound: boolean,
 	/**  キャプチャのルールに一致したら、そのルール（ダウンロードより先に撮る。ADR）。 */
 	capture: CaptureMatchDto | null,
+	/**  前に同じものをダウンロードしていれば、そのとき（「再ダウンロード」を選べるようにする。ADR-132）。 */
+	previous: PreviousDownloadDto | null,
 };
 
 /**  ダウンロードの一覧の 1 件（ジョブの入力と結果を読んだもの）。 */
@@ -397,6 +402,8 @@ export type DownloadJobDto = {
 	/**  キャプチャのルールの名前。 */
 	ruleName: string | null,
 	audioOnly: boolean,
+	/**  再ダウンロード（取得済みの記録にあるものも取り直す）。 */
+	redownload: boolean,
 	/**  取得したものの題名（わかるまでは None）。 */
 	title: string | null,
 	files: number,
@@ -907,6 +914,18 @@ export type PlaylistSummaryDto = {
 	granularity: GranularityDto,
 	/**  展開したアイテムの数。 */
 	itemCount: number,
+};
+
+/**  前に取得したダウンロード。 */
+export type PreviousDownloadDto = {
+	jobId: number,
+	title: string | null,
+	/**  取得した日時（Unix ミリ秒）。 */
+	at: number,
+	/**  そのときライブラリに入れたアイテムの数（取得済みとして飛ばしただけなら 0）。 */
+	items: number,
+	/**  そのうち今もライブラリにある数（ゴミ箱を除く）。 */
+	inLibrary: number,
 };
 
 /**  画質（`best` / `1080` / `720` / `480`）。 */

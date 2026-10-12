@@ -2102,6 +2102,34 @@ pub struct DetectionDto {
     pub tool_found: bool,
     /// キャプチャのルールに一致したら、そのルール（ダウンロードより先に撮る。ADR）。
     pub capture: Option<CaptureMatchDto>,
+    /// 前に同じものをダウンロードしていれば、そのとき（「再ダウンロード」を選べるようにする。ADR-132）。
+    pub previous: Option<PreviousDownloadDto>,
+}
+
+/// 前に取得したダウンロード。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviousDownloadDto {
+    pub job_id: i64,
+    pub title: Option<String>,
+    /// 取得した日時（Unix ミリ秒）。
+    pub at: i64,
+    /// そのときライブラリに入れたアイテムの数（取得済みとして飛ばしただけなら 0）。
+    pub items: u64,
+    /// そのうち今もライブラリにある数（ゴミ箱を除く）。
+    pub in_library: u64,
+}
+
+impl From<kura_core::download::history::PreviousDownload> for PreviousDownloadDto {
+    fn from(p: kura_core::download::history::PreviousDownload) -> Self {
+        Self {
+            job_id: p.job_id,
+            title: p.title,
+            at: p.at,
+            items: p.items,
+            in_library: p.in_library,
+        }
+    }
 }
 
 /// URL に一致したキャプチャのルール。
@@ -2191,6 +2219,8 @@ pub struct DownloadJobDto {
     /// キャプチャのルールの名前。
     pub rule_name: Option<String>,
     pub audio_only: bool,
+    /// 再ダウンロード（取得済みの記録にあるものも取り直す）。
+    pub redownload: bool,
     /// 取得したものの題名（わかるまでは None）。
     pub title: Option<String>,
     pub files: u64,
@@ -2233,6 +2263,7 @@ impl DownloadJobDto {
             tool_label: input.detection.tool.command().to_string(),
             rule_name: input.detection.rule,
             audio_only: input.options.audio_only,
+            redownload: input.redownload,
             title: result.title,
             files: result.files,
             added: result.added,
@@ -2266,6 +2297,7 @@ impl DownloadJobDto {
             tool_label: "Chrome".into(),
             rule_name: Some(input.rule.name),
             audio_only: false,
+            redownload: false,
             title: result.title,
             files: result.added + result.duplicates,
             added: result.added,

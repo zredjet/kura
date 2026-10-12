@@ -19,6 +19,7 @@ use crate::error::{AppError, AppErrorCode};
 use crate::state::AppState;
 
 /// URL の取得方法を判定する（キャプチャのルール → 取得の規則 → サイトの表）。
+/// 前に同じものをダウンロードしていれば、そのときのことも返す（ADR-132）。
 #[tauri::command]
 #[specta::specta]
 pub async fn download_detect(
@@ -30,21 +31,26 @@ pub async fn download_detect(
     blocking(move || {
         let d = download::detect(&url, &rules)?;
         // キャプチャのルールに一致すれば、ダウンロードより先に撮る（ADR）
-        let capture = match &session {
-            Some(session) => session
-                .library()
-                .db()
-                .read(|conn| capture::rules::find_for_url(conn, &d.url))?
-                .map(|rule| CaptureMatchDto {
-                    rule_id: rule.id,
-                    rule_name: rule.name,
-                    mode: rule.mode.into(),
-                    chrome_found: find(capture::CHROME_TOOL).is_some(),
-                }),
-            None => None,
+        let (capture, previous) = match &session {
+            Some(session) => session.library().db().read(|conn| {
+                let capture =
+                    capture::rules::find_for_url(conn, &d.url)?.map(|rule| CaptureMatchDto {
+                        rule_id: rule.id,
+                        rule_name: rule.name,
+                        mode: rule.mode.into(),
+                        chrome_found: find(capture::CHROME_TOOL).is_some(),
+                    });
+                let previous = match capture {
+                    Some(_) => None,
+                    None => download::history::find_previous(conn, &d.url)?.map(Into::into),
+                };
+                Ok((capture, previous))
+            })?,
+            None => (None, None),
         };
         Ok(DetectionDto {
             capture,
+            previous,
             tool_found: find(d.tool.command()).is_some(),
             url: d.url,
             site: d.site,
@@ -72,13 +78,14 @@ pub async fn download_defaults(state: State<'_, AppState>) -> Result<DownloadOpt
     .await
 }
 
-/// ダウンロードを積む。選んだ内容は次回の既定にする。
+/// ダウンロードを積む。選んだ内容は次回の既定にする。`redownload` なら取得済みの記録にあるものも取り直す。
 #[tauri::command]
 #[specta::specta]
 pub async fn download_enqueue(
     state: State<'_, AppState>,
     url: String,
     options: DownloadOptionsDto,
+    redownload: bool,
 ) -> Result<i64, AppError> {
     let session = state.session()?;
     let prefs = state.download_prefs();
@@ -94,6 +101,7 @@ pub async fn download_enqueue(
             detection,
             options,
             cookies: prefs.cookies,
+            redownload,
         };
         Ok(download::start_download(session.jobs(), &input)?)
     })

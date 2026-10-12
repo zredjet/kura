@@ -7,6 +7,7 @@ import {
   type DownloadOptionsDto,
   type DownloadPrefsDto,
   type DownloadRuleDto,
+  type PreviousDownloadDto,
   type QualityDto,
   type ToolDto,
   type ToolInfoDto,
@@ -22,13 +23,14 @@ export type {
   DownloadOptionsDto,
   DownloadPrefsDto,
   DownloadRuleDto,
+  PreviousDownloadDto,
   QualityDto,
   ToolDto,
   ToolInfoDto,
   ToolsUpdateDto,
 };
 
-/** URL の取得方法を判定する（サイト・ツール・ツールがあるか）。 */
+/** URL の取得方法を判定する（サイト・ツール・ツールがあるか・前にダウンロードしたか）。 */
 export function detectDownload(url: string): Promise<DetectionDto> {
   return unwrap(commands.downloadDetect(url));
 }
@@ -38,9 +40,13 @@ export function downloadDefaults(): Promise<DownloadOptionsDto> {
   return unwrap(commands.downloadDefaults());
 }
 
-/** ダウンロードを積む。ジョブの ID を返す。 */
-export function enqueueDownload(url: string, options: DownloadOptionsDto): Promise<number> {
-  return unwrap(commands.downloadEnqueue(url, options));
+/** ダウンロードを積む。`redownload` なら取得済みの記録にあるものも取り直す。ジョブの ID を返す。 */
+export function enqueueDownload(
+  url: string,
+  options: DownloadOptionsDto,
+  redownload = false,
+): Promise<number> {
+  return unwrap(commands.downloadEnqueue(url, options, redownload));
 }
 
 /** ダウンロードを新しい順に一覧する。 */

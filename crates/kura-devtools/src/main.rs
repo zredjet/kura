@@ -95,6 +95,7 @@ fn download(args: &[String]) -> Result<(), String> {
             detection,
             options: DownloadOptions::default(),
             cookies: CookieSource::None,
+            redownload: false,
         };
         let id = start_download(session.jobs(), &input).map_err(|e| e.to_string())?;
         tracing::info!(id, url = %url.display(), "ダウンロードを積みました");

@@ -4,6 +4,7 @@
 pub mod archive;
 pub mod args;
 pub mod detect;
+pub mod history;
 pub mod job;
 pub mod meta;
 pub mod progress;

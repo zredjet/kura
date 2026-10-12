@@ -1,6 +1,7 @@
 import { type FormEvent, type MouseEvent, useEffect, useState } from 'react';
 
 import { type MenuEntry, openMenuBelow } from '../../components/Menu/menuStore';
+import { askChoice } from '../../components/Overlay/overlayStore';
 import { CameraIcon } from '../../components/icons/CameraIcon';
 import { CheckIcon } from '../../components/icons/CheckIcon';
 import { ChevronDownIcon } from '../../components/icons/ChevronDownIcon';
@@ -22,6 +23,7 @@ import { notify } from '../../stores/noticeStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { destLabel, fail, pickDestFolder } from './downloadActions';
 import styles from './Downloads.module.css';
+import { previousMessage } from './previous';
 
 const t = ja.downloads;
 
@@ -170,8 +172,24 @@ export function AddPanel() {
           notify(t.toolMissing(toolCommand(d.tool)));
           return;
         }
-        await enqueueDownload(d.url, options);
-        notify(t.added);
+        // 前にダウンロードしたものは、取得済みの記録にあるので取り直さない。取り直すかを選んでもらう（ADR-132）
+        let redownload = false;
+        if (d.previous) {
+          const choice = await askChoice({
+            title: t.previous.title,
+            message: previousMessage(d.previous),
+            choices: [
+              { value: 'skip', label: t.previous.skip },
+              { value: 'redownload', label: t.previous.redownload, primary: true },
+            ],
+          });
+          if (choice === null) {
+            return;
+          }
+          redownload = choice === 'redownload';
+        }
+        await enqueueDownload(d.url, options, redownload);
+        notify(redownload ? t.redownloadAdded : t.added);
       }
       setUrl('');
       await useDownloadsStore.getState().load();

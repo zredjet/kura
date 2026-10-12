@@ -211,6 +211,15 @@ pub fn archive_file(archives_dir: &Path, tool: Tool) -> PathBuf {
     })
 }
 
+/// 再ダウンロードで使う空の記録（作業フォルダの中。`.` で始まるので取り込みの対象にならない）。
+/// 一時停止から再開したときは、ここまでに取ったものを飛ばす。
+pub fn redownload_archive_file(work_dir: &Path, tool: Tool) -> PathBuf {
+    work_dir.join(match tool {
+        Tool::YtDlp => ".kura-archive.txt",
+        Tool::GalleryDl => ".kura-archive.sqlite3",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

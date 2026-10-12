@@ -729,6 +729,23 @@ export const ja = {
     urlPlaceholder: 'URL を貼り付け（YouTube・pixiv・X など）',
     add: '追加',
     added: 'ダウンロードを追加しました',
+    redownloadAdded: '再ダウンロードを追加しました',
+    /** 前に同じものをダウンロードした URL を追加するとき（ADR-132）。 */
+    previous: {
+      title: 'ダウンロード済みの URL です',
+      fetched: (title: string, when: string) => `「${title}」は ${when} にダウンロードしています。`,
+      fetchedUntitled: (when: string) => `この URL は ${when} にダウンロードしています。`,
+      skippedOnly: (title: string) => `「${title}」は取得済みです。`,
+      skippedOnlyUntitled: 'この URL は取得済みです。',
+      allInLibrary: '取得したものはライブラリにあります。',
+      noneInLibrary: '取得したものはライブラリにありません。',
+      someInLibrary: (items: string, inLibrary: string) =>
+        `取得した ${items} 件のうち ${inLibrary} 件がライブラリにあります。`,
+      explain:
+        'そのまま追加すると、取得済みのものはスキップします。再ダウンロードすると、取得済みのものも取り直します。',
+      skip: 'スキップして追加',
+      redownload: '再ダウンロード',
+    },
     detecting: '判定中…',
     detected: (site: string) => `${site} を検出`,
     byRule: (name: string) => `規則「${name}」`,
@@ -772,6 +789,7 @@ export const ja = {
     showInLibrary: 'ライブラリで表示',
     log: 'ログ',
     retry: '再試行',
+    redownload: '再ダウンロード',
     empty: 'まだダウンロードはありません。URL を貼り付けて「追加」を押してください。',
     emptyTab: 'この表示に当てはまるものはありません。',
     logTitle: 'ログ',

@@ -16,7 +16,7 @@ import {
 import styles from './Overlays.module.css';
 import { isImeKey } from '../../lib/ime';
 
-/** 名前の入力・確認・候補から選ぶダイアログ（`askText`・`askConfirm`・`askPick` で開く）。 */
+/** 名前の入力・確認・選択肢・候補から選ぶダイアログ（`askText`・`askConfirm`・`askChoice`・`askPick` で開く）。 */
 export function Overlays() {
   const overlay = useOverlayStore((s) => s.overlay);
   if (!overlay) {
@@ -27,6 +27,8 @@ export function Overlays() {
       return <PromptDialog overlay={overlay} />;
     case 'confirm':
       return <ConfirmDialog overlay={overlay} />;
+    case 'choice':
+      return <ChoiceDialog overlay={overlay} />;
     case 'picker':
       return <PickerDialog overlay={overlay} />;
     case 'newPlaylist':
@@ -239,6 +241,30 @@ function ConfirmDialog({ overlay }: { overlay: Extract<Overlay, { kind: 'confirm
         <Button variant="primary" onClick={() => overlay.resolve(true)}>
           {overlay.confirm}
         </Button>
+      </footer>
+    </Dialog>
+  );
+}
+
+function ChoiceDialog({ overlay }: { overlay: Extract<Overlay, { kind: 'choice' }> }) {
+  const titleId = useId();
+  return (
+    <Dialog labelledBy={titleId} onClose={cancelOverlay} size="sm">
+      <h2 id={titleId} className={styles.title}>
+        {overlay.title}
+      </h2>
+      <p className={styles.message}>{overlay.message}</p>
+      <footer className={styles.actions}>
+        <Button onClick={cancelOverlay}>{ja.common.cancel}</Button>
+        {overlay.choices.map((choice) => (
+          <Button
+            key={choice.value}
+            variant={choice.primary ? 'primary' : 'secondary'}
+            onClick={() => overlay.resolve(choice.value)}
+          >
+            {choice.label}
+          </Button>
+        ))}
       </footer>
     </Dialog>
   );

@@ -315,7 +315,7 @@ fn option_key_forbidden(arg: &str) -> bool {
 }
 
 /// `scheme://[user@]host[:port]/...` のホスト（小文字）。http(s) でなければ None。
-fn host_of(url: &str) -> Option<String> {
+pub(crate) fn host_of(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
@@ -329,7 +329,7 @@ fn host_of(url: &str) -> Option<String> {
 }
 
 /// URL のパス（`/watch` など）。
-fn url_path(url: &str) -> &str {
+pub(crate) fn url_path(url: &str) -> &str {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
@@ -339,7 +339,7 @@ fn url_path(url: &str) -> &str {
     path.split(['?', '#']).next().unwrap_or(path)
 }
 
-fn host_matches(host: &str, domain: &str) -> bool {
+pub(crate) fn host_matches(host: &str, domain: &str) -> bool {
     host == domain
         || host
             .strip_suffix(domain)

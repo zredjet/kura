@@ -21,6 +21,7 @@ function job(
     toolLabel: 'yt-dlp',
     ruleName: null,
     audioOnly: false,
+    redownload: false,
     title: null,
     files: 0,
     added: 0,

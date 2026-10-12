@@ -6,6 +6,9 @@
 //! 2. 終わったら、作業フォルダにできたファイルを取り込みと同じ方法で配置し、1 つのトランザクションで
 //!    アイテム・タグ・ユニット・`remote_sources` と途中経過を書く。
 //! 3. ツールが失敗で終わっても、できたファイルは入れてから失敗にする（再試行で残りを取る）。
+//!
+//! 再ダウンロード（`redownload`）は、取得済みの記録の代わりに作業フォルダの中の空の記録を使い、
+//! 記録にあるものも取り直す。ツールが終わったら、その記録をふだんの記録に足す（ADR-132）。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,8 +17,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::archive;
 use super::args::{
-    CookieSource, DownloadOptions, RunPaths, archive_file, gallerydl_args, ytdlp_args,
+    CookieSource, DownloadOptions, RunPaths, archive_file, gallerydl_args, redownload_archive_file,
+    ytdlp_args,
 };
 use super::detect::{Detection, Tool};
 use super::meta::TagPolicy;
@@ -42,6 +47,9 @@ pub struct DownloadInput {
     pub options: DownloadOptions,
     #[serde(default)]
     pub cookies: CookieSource,
+    /// 取得済みの記録にあるものも取り直す（再ダウンロード）。
+    #[serde(default)]
+    pub redownload: bool,
 }
 
 /// ダウンロードの結果・途中経過（jobs.result_json）。再試行すると数は足していく。
@@ -97,12 +105,20 @@ impl JobHandler for DownloadHandler {
         let tool = input.detection.tool;
         let program = find(tool.command())
             .ok_or_else(|| CoreError::ToolMissing(tool.command().to_string()))?;
+        let main_archive = archive_file(&archives, tool);
         let paths = RunPaths {
             work_dir: work.clone(),
-            archive: archive_file(&archives, tool),
+            archive: if input.redownload {
+                redownload_archive_file(&work, tool)
+            } else {
+                main_archive.clone()
+            },
             ffmpeg: find("ffmpeg"),
             deno: find("deno"),
         };
+        if input.redownload {
+            ctx.log("再ダウンロード: 取得済みの記録を使わずに取得します");
+        }
         let args = match tool {
             Tool::YtDlp => ytdlp_args(&input.detection, &input.options, input.cookies, &paths),
             Tool::GalleryDl => gallerydl_args(&input.detection, input.cookies, &paths),
@@ -184,6 +200,16 @@ impl JobHandler for DownloadHandler {
             }
             StreamEnd::Exited(status) => status,
         };
+        if input.redownload {
+            // 取ったものをふだんの記録にも残す（次のふつうのダウンロードでは飛ばす）
+            match archive::merge(&paths.archive, &main_archive, tool) {
+                Ok(n) => ctx.log(&format!("取得済みの記録に {n} 件を足しました")),
+                Err(err) => {
+                    tracing::warn!(%err, "再ダウンロードの記録を足せませんでした");
+                    ctx.log(&format!("取得済みの記録に足せませんでした: {err}"));
+                }
+            }
+        }
 
         // できたファイルを入れる（失敗で終わったときも、できた分は入れる）
         let policy = TagPolicy {

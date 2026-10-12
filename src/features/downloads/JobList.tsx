@@ -70,6 +70,7 @@ function JobRow({ job, onLog }: { job: DownloadJobDto; onLog: (job: DownloadJobD
           {job.kind === 'capture' && job.ruleName && (
             <span>{t.capture.detected(job.ruleName)}</span>
           )}
+          {job.redownload && <span>{t.redownload}</span>}
           <span className={styles.state} data-state={state}>
             {t.states[state]}
             {percent && ` ${percent}`}
