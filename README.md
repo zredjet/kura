@@ -1,63 +1,122 @@
-# Kura 開発キット
+# Kura
 
-Claude Code で Kura（仮称）を開発するための初期ファイル一式です。新しいリポジトリの直下にこのまま置いて使います。
+画像・音楽・動画をひとつのライブラリで管理し、種類を混ぜたプレイリストで再生する、個人用の macOS アプリです。
+Tauri 2（Rust）と React / TypeScript で作っています。名前の「Kura」は仮称です。
 
-## 中身
+![ライブラリ画面：ジャスティファイ表示のグリッドと、タグ・フォルダ・取得元・メモを表示するインスペクタ](docs/images/library.jpg)
 
-```text
-CLAUDE.md                     # Claude Code が毎回読むプロジェクトの指示（200 行未満）
-.claude/
-  settings.json               # 許可するコマンド・確認するコマンド・禁止するコマンド
-  rules/                      # ファイルの種類ごとに自動で読み込まれるルール
-    rust.md  frontend.md  database.md  playlist.md
-  skills/                     # /コマンドで呼べる手順
-    verify/        # /verify：整形・lint・型・テストを一括実行
-    add-command/   # /add-command <名前>：Tauri コマンドを一通り追加
-    add-migration/ # /add-migration <内容>：DB スキーマ変更
-docs/
-  requirements.md             # 機能要件・非機能要件・対象外
-  architecture.md             # 構成・IPC・kura:// ・ジョブ・取り込み・再生・DL・キャプチャ
-  data-model.md               # SQLite スキーマ
-  playlists.md                # ユニット（管理単位）とプレイリストの仕様、受け入れテスト
-  search-query.md             # 検索言語と ⌘K パレット
-  design.md                   # デザイン方針・部品・キーボード・アクセシビリティ
-  design/tokens.css           # デザイントークン（src/styles/ にコピーして使う）
-  design/mockups/*.dc.html    # 画面ごとのモック（値の参照用）
-  decisions.md                # 設計判断の記録
-  roadmap.md                  # マイルストーン M0〜M9、完了条件、Claude Code への依頼文
+## 特長
+
+- **元のファイルを壊さない取り込み**：ファイルはライブラリへコピーし（同じボリュームなら APFS クローンで容量を使わない）、取り込み元は移動も変更もしない。内容のハッシュ（BLAKE3）で重複を見分ける。
+- **整理**：仮想フォルダ（1 つのアイテムを複数のフォルダに入れられる）、名前空間・別名・親子関係を持つタグ、評価・メモ、まとめて扱う「ユニット」、スマートフォルダ（保存した検索）。
+- **検索**：⌘K のパレットで、`夜景 種類:画像 評価>=4` のような検索言語で絞り込む。
+- **混ぜて再生**：画像・音楽・動画を 1 つのプレイリストに並べ、画像の間も直前の音楽を流し続けられる。ファイル単位とユニット単位を切り替えられ、シャッフルはシードを固定して再現できる。
+- **取得**：URL を貼ると yt-dlp / gallery-dl で取得して取り込み、投稿者・タグなどのメタデータも反映する。Web ページのキャプチャもできる。
+- **速さ**：10 万件のライブラリで、起動から操作できるまで 1.5 秒以内、グリッドのスクロール 60fps を目標に作っている。重い処理は Rust 側で行う。
+
+## 画面
+
+| シアター再生と「次に再生」 | ⌘K 検索パレット |
+| --- | --- |
+| ![シアター再生：動画を再生中のプレーヤーと、画像・音楽・動画が混ざったキュー](docs/images/player.jpg) | ![⌘K 検索パレット：検索条件のチップ、一致件数、保存済みの検索、書き方の例](docs/images/search.jpg) |
+
+画面に写っている画像・動画・音楽は、すべてこのリポジトリのために図形と合成音で生成したダミーです。
+
+## 動作環境
+
+- macOS 26 以降、Apple Silicon
+- 配布用のビルドはまだありません。下の手順でソースからビルドしてください。
+
+### 外部ツール（任意）
+
+ダウンロード・再生用プロキシ・キャプチャなどの機能は、次のツールを呼び出して動きます。
+Kura にはどれも同梱しておらず、利用者が入れたものを別のプロセスとして実行するだけです。
+`/opt/homebrew/bin` と `/usr/local/bin` から探し、見つからないときは設定で場所を指定できます。
+
+```bash
+brew install yt-dlp gallery-dl deno ffmpeg
 ```
 
-## 事前に入れておくもの
-
-| もの | 入れ方 | 用途 |
+| ツール | 使う機能 | ライセンス（参考） |
 |---|---|---|
-| Xcode | App Store | Swift ヘルパーのビルド、Instruments での性能計測 |
-| Rust | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` | Tauri・コア |
-| Node.js（LTS）と pnpm | 公式インストーラか Homebrew、`corepack enable` | フロント |
-| 外部ツール | `brew install yt-dlp gallery-dl deno ffmpeg` | ダウンロード・プロキシ・メディア情報 |
-| Google Chrome | 公式サイト | キャプチャ（M8） |
-| mpv（任意） | `brew install mpv` | 「外部プレイヤーで開く」 |
-| Claude Code | 公式の手順 | 開発 |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | 動画・音楽のダウンロード | Unlicense |
+| [gallery-dl](https://github.com/mikf/gallery-dl) | 画像のダウンロード | GPL-2.0 |
+| [deno](https://deno.com/) | yt-dlp が一部のサイトで使う JavaScript の実行 | MIT |
+| [FFmpeg](https://ffmpeg.org/)（ffmpeg / ffprobe） | 再生用プロキシの作成、メディア情報 | LGPL-2.1 以降または GPL（ビルドによる） |
+| [Google Chrome](https://www.google.com/chrome/) | Web ページのキャプチャ | Google の利用規約 |
+| [mpv](https://mpv.io/) | 外部プレイヤーで開く | GPL-2.0 以降 / LGPL-2.1 以降 |
 
-## 始め方
+ダウンロード・キャプチャは、自分に権利があるか利用が許されたコンテンツに対して、各サイトの利用規約に従って使ってください。
 
-1. 空のフォルダを作って `git init` する。
-2. このキットの中身（`CLAUDE.md`、`.claude/`、`docs/`、この README）をフォルダの直下に置いて最初のコミットをする。
-3. そのフォルダで `claude` を起動する（フォルダを信頼するか聞かれたら許可。許可しないと `.claude/settings.json` の allow が効かない）。
-4. `docs/roadmap.md` の **M0 の依頼文**を貼る。計画が出たら確認して承認する。
-5. 以降、M1、M2…と順に進める。
+## ビルド
 
-## 進めるときのコツ
+必要なもの：
 
-- **1 マイルストーン＝新しいセッション**。前の話題を引きずらないよう、区切りで `/clear` するか新しく起動する。
-- **計画を先に**。大きめの変更はプランモードで計画を出させ、ファイル構成と手順を確認してから実装させる。
-- **仕様を変えたくなったら docs から**。「docs/playlists.md の §3.5 をこう変えたい。docs を更新してから実装して」のように頼むと、実装と仕様がずれない。
-- **完了の判断は /verify と完了条件**。「できました」だけで終わらせず、完了条件を 1 つずつ確認した結果を出してもらう。
-- **画面は自分で触る**。`pnpm tauri dev` を起動して見た目と操作感を確かめ、気になった点をそのまま伝える。モックと比べるときは、このチャットのデザインキャンバスを横に開く。
-- **指示ファイルの点検**。CLAUDE.md や rules が増えてきたら、Claude Code の `/doctor prompt-audit` で矛盾や古い記述を点検できる。
+- Xcode（Swift ヘルパーのビルド）
+- Rust 1.88 以降（`rustup`）
+- Node.js（LTS）と pnpm（`corepack enable`）
+- [cargo-about](https://github.com/EmbarkStudios/cargo-about)（依存ライブラリのライセンス一覧の生成。`cargo install --locked cargo-about`）
 
-## まだ決めていないこと（必要になったら決める）
+```bash
+pnpm install
+```
 
-- アプリ名（「Kura」は仮称）。バンドル ID は `dev.kura.Kura` に決めた（`docs/decisions.md` ADR-18）
+```bash
+pnpm tauri dev
+```
+
+配布用のビルドは `pnpm tauri build` です。`target/release/bundle/` に `Kura.app` と `.dmg` ができます（署名・公証はしていません）。
+
+## 開発
+
+| 目的 | コマンド |
+|---|---|
+| 開発起動 | `pnpm tauri dev` |
+| Rust のテスト | `cargo test --workspace` |
+| Rust の lint | `cargo clippy --workspace --all-targets -- -D warnings` |
+| 整形 | `cargo fmt --all` と `pnpm run format` |
+| 型チェック | `pnpm run typecheck` |
+| フロントのテスト | `pnpm test` |
+| 依存ライブラリのライセンス一覧 | `pnpm run licenses`（確認だけなら `pnpm run licenses:check`） |
+| ダミーライブラリの生成 | `cargo run -p kura-devtools -- seed --items 100000 --out /tmp/bench.kuralib` |
+
+開発は [Claude Code](https://claude.com/claude-code) で進めています。プロジェクトの指示は [`CLAUDE.md`](CLAUDE.md)、ファイルの種類ごとのルールと手順（`/verify` など）は [`.claude/`](.claude) にあります。
+作業は [`docs/roadmap.md`](docs/roadmap.md) のマイルストーン単位で進め、M0〜M9 まで終わっています。
+
+### リポジトリ構成
+
+```text
+crates/kura-core/      OS に依存しないドメインロジック（DB、取り込み、検索、ユニット、プレイリスト、ジョブ）
+crates/kura-mac/       macOS 専用の機能（サムネイル、メディア情報、スナップショット。Swift ヘルパー）
+crates/kura-devtools/  ダミーライブラリの生成とベンチマーク
+src-tauri/             Tauri アプリ本体（コマンド、kura:// プロトコル、ウィンドウ）
+src/                   React のフロントエンド
+docs/                  仕様と設計
+```
+
+### ドキュメント
+
+- [`docs/requirements.md`](docs/requirements.md)：機能要件・非機能要件・対象外
+- [`docs/architecture.md`](docs/architecture.md)：構成、IPC、`kura://` プロトコル、ジョブ、外部ツール
+- [`docs/data-model.md`](docs/data-model.md)：SQLite のスキーマ
+- [`docs/playlists.md`](docs/playlists.md)：ユニットとプレイリスト、シャッフル、再生
+- [`docs/search-query.md`](docs/search-query.md)：検索言語と ⌘K パレット
+- [`docs/design.md`](docs/design.md)：デザインの方針と部品（モックは [`docs/design/mockups/`](docs/design/mockups)）
+- [`docs/decisions.md`](docs/decisions.md)：設計判断の記録
+
+### まだ決めていないこと
+
+- アプリ名（「Kura」は仮称。バンドル ID は `dev.kura.Kura` に決めた。ADR-18）
 - ライトモードの有無（v1 はダークのみ）
-- ユニットの UI 上の呼び名（「ユニット」で仮置き。「まとまり」なども可）
+- ユニットの画面上の呼び名（「ユニット」で仮置き）
+
+## ライセンス
+
+Kura は次のどちらかのライセンスを選んで利用できます（二重ライセンス）。
+
+- MIT License（[LICENSE-MIT](LICENSE-MIT)）
+- Apache License 2.0（[LICENSE-APACHE](LICENSE-APACHE)）
+
+このリポジトリに送られた貢献は、明示しない限り、Apache License 2.0 の定義に従い、追加の条件なしに上と同じ二重ライセンスで提供されるものとします。
+
+配布する `Kura.app` に含まれる第三者のライブラリのライセンス表記は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) にまとめています（`pnpm run licenses` で生成し、アプリの `Contents/Resources` にも入ります）。
