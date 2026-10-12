@@ -92,8 +92,8 @@
 | タグ | `tags_list()` → `TagListEntry[]` | すべてのタグと、付いているアイテムの数（ゴミ箱を除く）・そのうち自動で付いた数（`item_tags.source` が download / capture）・ユニットの数・絞り込みの条件。名前空間なしを後ろに、名前空間ごとに付いている数の多い順（ADR-126） |
 | 設定 | `library_usage()` → `{ libraryBytes, volumeTotalBytes?, volumeAvailableBytes? }` / `library_check()` → `Integrity` | ライブラリのファイルの合計（ゴミ箱を含む）とボリュームの容量・空き、整合性チェックをいま行う（M9） |
 | | `download_archives()` → `ArchiveStatus[]` / `download_archive_clear(tool)` | 取得済みの記録の件数と、消す（`archives/` のツールごとの 1 ファイル。M9） |
-| ダウンロード | `download_detect(url)` → `{ url, site, siteLabel, tool, rule?, playlist, toolFound }` | URL の取得方法（規則 → サイトの表 → yt-dlp の汎用）。§9 |
-| | `download_defaults()` / `download_enqueue(url, options)` → JobId | 前回の選択（ライブラリの settings）と、取得を積む（選んだ内容を次回の既定にする）。`options` は画質（best / 1080 / 720 / 480）・音声のみ・保存先のフォルダ・自動タグ（投稿者・サイトのタグ）・再生リストをユニットに |
+| ダウンロード | `download_detect(url)` → `{ url, site, siteLabel, tool, rule?, playlist, toolFound, capture?, previous? }` | URL の取得方法（規則 → サイトの表 → yt-dlp の汎用）。`previous` は前に同じものをダウンロードしたとき（ジョブ・題名・日時・入れた数・今ライブラリにある数。ADR-132）。§9 |
+| | `download_defaults()` / `download_enqueue(url, options, redownload)` → JobId | 前回の選択（ライブラリの settings）と、取得を積む（選んだ内容を次回の既定にする）。`options` は画質（best / 1080 / 720 / 480）・音声のみ・保存先のフォルダ・自動タグ（投稿者・サイトのタグ）・再生リストをユニットに。`redownload` は取得済みの記録にあるものも取り直す（ADR-132） |
 | | `downloads_list(limit?)` → `DownloadJob[]` | ダウンロードのジョブを新しい順に（URL・サイト・ツール・題名・件数・入れたアイテムとユニット） |
 | | `download_prefs_get()` / `download_prefs_set(prefs)` | Cookie の読み込み元と規則（app.json。規則の正規表現と引数を確かめる。ADR-99） |
 | ジョブ | `job_retry(id)` / `job_prioritize(id)` / `job_log(id)` → 文字 | 再試行・先に取得・ログの末尾 256KB（ADR-103） |
@@ -236,6 +236,7 @@ import_start:    ジョブとして実行
 - **gallery-dl の引数**：`--no-colors --write-metadata --no-mtime --ugoira mp4 -D <作業フォルダ> --download-archive archives/gallery-dl.sqlite3 --Print prepare:… --Print after:… --Print skip:…`、Cookie は `--cookies-from-browser`。pixiv は `gallery-dl oauth:pixiv` を一度ターミナルで実行してもらう。
 - **登録**（`download::meta`・`register`）：ADR-96。タグは `item_tags.source = 'download'`、ユニットは `units.origin = 'download'` と URL、`remote_sources` にサイト・ID・ページ番号。
 - **ツールの場所**：`kura_core::tools::find` は app.json の指定 → `/opt/homebrew/bin` → `/usr/local/bin` → PATH の順。ffmpeg・ffprobe・mpv の場所の指定もプロキシ・外部プレイヤーに効く。
+- **再ダウンロード**（ADR-132）：`download_detect` が `download::history::find_previous` でダウンロードのジョブの履歴から同じものを指す URL を探す（`target_key`：YouTube は動画・再生リストの ID、ほかはホスト（`www.`・`m.` を除く）・パス・追跡用を除いたクエリ。twitter.com は x.com）。ライブラリに入れたことのあるジョブのいちばん新しいもの、なければ取得済みとして飛ばしたジョブ。見つかれば画面が「スキップして追加」「再ダウンロード」を聞く。再ダウンロードのジョブ（入力の `redownload`）は、`--download-archive` に作業フォルダの中の空の記録（`.kura-archive.txt`・`.kura-archive.sqlite3`）を渡し、ツールが終わったら（失敗でも）その中身をふだんの記録に足す（`archive::merge`。重複は足さない）。一時停止から再開したときは、その記録で取り終えたものを飛ばす。
 
 ## 10. キャプチャ
 
