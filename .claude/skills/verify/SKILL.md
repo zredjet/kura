@@ -12,6 +12,7 @@ description: Rust とフロントの整形・lint・型チェック・テスト�
 5. `pnpm run lint`
 6. `pnpm run typecheck`
 7. `pnpm test`
+8. `pnpm run licenses:check`（失敗したら `pnpm run licenses` で `THIRD_PARTY_LICENSES.md` を作り直す。cargo-about がなければ `cargo install --locked cargo-about`）
 
 macOS 以外の環境で `kura-mac` や `src-tauri` がビルドできない場合は、`cargo test -p kura-core` と `cargo test -p kura-devtools` だけ実行し、その旨を明記する。
 
@@ -20,7 +21,7 @@ macOS 以外の環境で `kura-mac` や `src-tauri` がビルドできない場�
 ```
 verify: OK / NG
 Rust: fmt ✓ clippy ✓ test ✓（N 件）
-Front: format ✓ lint ✓ typecheck ✓ test ✓（N 件）
+Front: format ✓ lint ✓ typecheck ✓ test ✓（N 件） licenses ✓
 修正したこと: …
 残課題: …
 ```

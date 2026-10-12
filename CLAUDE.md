@@ -43,6 +43,7 @@ docs/                      # 仕様・設計（下記）
 | 整形 | `cargo fmt --all` と `pnpm run format` |
 | 型チェック | `pnpm run typecheck` |
 | フロントのテスト | `pnpm test` |
+| 依存のライセンス一覧 | `pnpm run licenses`（依存を変えたら実行。`THIRD_PARTY_LICENSES.md` を作り直す。要 cargo-about） |
 | ダミーデータ生成 | `cargo run -p kura-devtools -- seed --items 100000 --out /tmp/bench.kuralib` |
 | リリースビルド | `pnpm tauri build` |
 

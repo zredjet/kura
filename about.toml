@@ -1,0 +1,22 @@
+# 配布する .app に入る Rust の依存のライセンス。`pnpm run licenses` が THIRD_PARTY_LICENSES.md を作るときに使う。
+# 二重ライセンスの依存は、この並びの先にあるものを選ぶ。ここにない（コピーレフトの強い）ライセンスの依存が入ると生成が失敗する。
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "MIT-0",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "IJG",
+    "MPL-2.0",
+]
+targets = ["aarch64-apple-darwin"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
