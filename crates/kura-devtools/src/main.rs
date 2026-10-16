@@ -6,8 +6,10 @@
 //! - `seed --items <件数> --out <path>`：ダミーライブラリを作る（グリッドと起動時間の計測用）
 //! - `bench query --library <path>`：一覧の取得の速さを測る
 //! - `bench thumbs --src <画像のフォルダ> [--threads N]`：画像サムネイルの速さを測る（NFR-04）
+//! - `edit shape --in <file>` / `edit render --doc <文書.json> --in <file> --out <file>`：編集のエンジンを手で確かめる（docs/editing.md）
 
 mod bench;
+mod edit;
 mod seed;
 
 use std::path::PathBuf;
@@ -36,6 +38,7 @@ fn main() -> ExitCode {
         Some("check") => check(&args[1..]),
         Some("seed") => seed::run(&args[1..]),
         Some("bench") => bench::run(&args[1..]),
+        Some("edit") => edit::run(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     match result {
