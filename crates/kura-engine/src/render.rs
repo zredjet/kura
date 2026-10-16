@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::determinism;
-use crate::digest::{Digest, canonical_json};
+use crate::digest::Digest;
 use crate::doc::{self, Graph, InputId, InputRole, NodeId, OutputId, PortRef};
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 use crate::geom::Size;
@@ -20,7 +20,7 @@ use crate::op::{
     AnyParams, ApplyCx, DynOp, InferCx, Inferred, Lift, MetaAccess, Registry, Resolved,
 };
 use crate::shape::{Dim, Fullness, Shape, ValueKind};
-use crate::value::{Frames, Image, Value};
+use crate::value::{Frames, Image, Raster, Value};
 
 /// 操作エンジン。登録表と上限を持つ。
 pub struct Engine {
@@ -48,6 +48,8 @@ struct PlannedNode {
 
 /// 検証と推論を済ませた計画。
 pub struct Plan {
+    /// 文書の全体の規則の版（メタデータの写し方を選ぶ。§8.4）。
+    rules: u32,
     inputs: BTreeMap<InputId, Shape>,
     nodes: Vec<PlannedNode>,
     outputs: Vec<(OutputId, PortRef, Shape)>,
@@ -119,6 +121,11 @@ impl Engine {
         Ok(Self { registry, limits })
     }
 
+    /// 登録表を指定したエンジン（版の契約のテストで、試験用の操作を入れるときに使う）。
+    pub fn with_registry(registry: Registry, limits: Limits) -> Self {
+        Self { registry, limits }
+    }
+
     /// 登録表。
     pub fn registry(&self) -> &Registry {
         &self.registry
@@ -176,22 +183,11 @@ impl Engine {
         for node in &g.nodes {
             let at = |i: Issues| i.at(node.id);
             let one = |code: IssueCode, msg: &str| Issues::one(Issue::error(code, msg).at(node.id));
+            // 引数は resolve の中で正規の JSON に往復させてある（migrate にも往復させたものが渡る）
             let (op, raw) = match self.registry.resolve(&node.op, node.v, &node.params) {
-                Ok(Resolved::Direct(op)) => (op, node.params.clone()),
-                Ok(Resolved::Migrated(op, moved)) => (op, moved),
+                Ok(Resolved::Direct(op, params) | Resolved::Migrated(op, params)) => (op, params),
                 Err(issue) => return Err(Issues::one(issue.at(node.id))),
             };
-            // 引数を正規の JSON に往復させてから読む。メモリ上の文書（16.0・-0.0）と、保存して読み直した文書（16・0）で、
-            // 文書のハッシュが同じなら同じ引数になる
-            let raw = canonical_json(&raw)
-                .ok()
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .ok_or_else(|| {
-                    one(
-                        IssueCode::BadParams,
-                        "引数を正規の形にできません（有限でない数など）",
-                    )
-                })?;
             let params = op.parse(&raw).map_err(at)?;
             let in_shapes: Vec<Shape> = node
                 .inputs
@@ -297,6 +293,7 @@ impl Engine {
             .find(|i| i.role == InputRole::Primary)
             .map(|i| i.id);
         Ok(Plan {
+            rules: g.rules,
             inputs,
             nodes,
             outputs,
@@ -350,7 +347,7 @@ impl Engine {
                     seed: determinism::seed(node.seed, &source.0, node.op.id()),
                     warnings: Vec::new(),
                 };
-                let (out, mut mapped) = self.apply_node(node, &ins, &mut cx)?;
+                let (out, mut mapped) = self.apply_node(plan.rules, node, &ins, &mut cx)?;
                 let mut all = cx.warnings;
                 all.append(&mut mapped);
                 (out, all)
@@ -393,6 +390,7 @@ impl Engine {
     /// ノード 1 つを実行し、メタデータを写す。返すのは値と、写したときの警告。
     fn apply_node(
         &self,
+        rules: u32,
         node: &PlannedNode,
         ins: &[Value],
         cx: &mut ApplyCx<'_>,
@@ -411,7 +409,7 @@ impl Engine {
                     "トリムしたフレームの列には、この操作を当てられません",
                 ));
             }
-            let mut out = Vec::with_capacity(frames.frames().len());
+            let mut out: Vec<(Raster, u32)> = Vec::with_capacity(frames.frames().len());
             let mut space = None;
             for f in frames.frames() {
                 cx.check()?;
@@ -435,16 +433,25 @@ impl Engine {
                     applied.space,
                     &SpaceMap::Unknown,
                 )?;
-                // フレームはどれも同じ大きさなので、写し方は 1 つに決まる
+                // 結果は 1 つのキャンバスにそろう必要がある。フレームごとに大きさや写し方が変わる操作は当てられない
+                // （推論で大きさが決まらない入力では、描くまで分からない）
                 match &space {
                     None => space = Some(actual),
                     Some(s) if *s == actual => {}
                     Some(_) => {
-                        return Err(EngineError::Internal(format!(
-                            "{} の写し方がフレームごとに違います",
+                        return Err(bad_input(format!(
+                            "{} の結果がフレームごとに違う形になるので、フレームの列には当てられません",
                             node.op.id()
                         )));
                     }
+                }
+                if let Some((first, _)) = out.first()
+                    && (first.width() != img.px.width() || first.height() != img.px.height())
+                {
+                    return Err(bad_input(format!(
+                        "{} の結果がフレームごとに違う大きさになるので、フレームの列には当てられません",
+                        node.op.id()
+                    )));
                 }
                 out.push((img.px.clone(), f.duration_ms));
             }
@@ -480,7 +487,7 @@ impl Engine {
             return Ok((value, Vec::new()));
         }
         match ins.first() {
-            Some(input) => Ok(with_mapped_meta(value, input, &space, &time)),
+            Some(input) => with_mapped_meta(rules, value, input, &space, &time),
             None => Ok((value, Vec::new())),
         }
     }
@@ -521,8 +528,26 @@ fn image_meta_and_size(v: &Value) -> Option<(&crate::value::ImageMeta, Size)> {
     }
 }
 
-/// 入力 0 のメタデータを写して出力に付ける。
+/// 入力 0 のメタデータを、文書の規則の版の写し方で写して出力に付ける。
+/// 規則の版を上げたら、古い版の写し方も残して、ここで版ごとに選ぶ（§8.4）。
 fn with_mapped_meta(
+    rules: u32,
+    out: Value,
+    input: &Value,
+    space: &SpaceMap,
+    time: &TimeMap,
+) -> Result<(Value, Vec<Issue>), EngineError> {
+    match rules {
+        1 => Ok(with_mapped_meta_r1(out, input, space, time)),
+        // 形の確かめで知らない版は断っているので、ここには来ない
+        other => Err(EngineError::Internal(format!(
+            "規則の版 {other} の写し方がありません"
+        ))),
+    }
+}
+
+/// 規則 1 のメタデータの写し方。
+fn with_mapped_meta_r1(
     out: Value,
     input: &Value,
     space: &SpaceMap,

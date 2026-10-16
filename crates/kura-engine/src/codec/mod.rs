@@ -46,7 +46,7 @@ pub enum Tier {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecodeStamp {
-    /// 使ったデコーダ（例 `png-rs/1`）。
+    /// 使ったデコーダ（例 `png-rs-dec/1`）。作り直しでは `CodecSet::decode_with` でこのデコーダを選ぶ。
     pub codec: String,
     pub tier: Tier,
     /// 読み取った値のダイジェスト（作り直しで照らす。E29）。
@@ -69,12 +69,13 @@ pub struct EncodedStamp {
 
 /// デコーダ。
 pub trait Decoder: Send + Sync {
-    /// 識別子（例 `png-rs/1`。約束の版を含む）。
+    /// 識別子（例 `png-rs-dec/1`。約束の版を含む）。読む値が変わる変更は版を上げ、旧版を `add_legacy_decoder` で残す（§9.1）。
     fn id(&self) -> &'static str;
     fn tier(&self) -> Tier;
     /// この形式を読めるか。
     fn can_decode(&self, format: &str) -> bool;
-    /// ヘッダだけ読んで形を返す（描く前の上限の判断に使う）。
+    /// ヘッダだけ読んで形を返す（描く前の上限の判断に使う）。扱えない変種は、ここか `decode` で `Unsupported` を返す
+    /// （次の段のデコーダへ回る）。
     fn shape(
         &self,
         src: &mut dyn ReadSeek,
@@ -95,6 +96,7 @@ pub trait Decoder: Send + Sync {
 
 /// エンコーダ。
 pub trait Encoder: Send + Sync {
+    /// 識別子（例 `png-rs-enc/1`。約束の版を含む）。書くバイト列が変わる変更は版を上げる（R2。旧版は残さなくてよい）。
     fn id(&self) -> &'static str;
     fn tier(&self) -> Tier;
     /// この形式・この形の値を書けるか。
@@ -146,6 +148,8 @@ pub fn contain<T>(
 #[derive(Clone, Default)]
 pub struct CodecSet {
     decoders: Vec<Arc<dyn Decoder>>,
+    /// 旧版のデコーダ（ふつうの読み取りでは選ばない。記録した識別子で作り直すときだけ使う）。
+    legacy_decoders: Vec<Arc<dyn Decoder>>,
     encoders: Vec<Arc<dyn Encoder>>,
 }
 
@@ -156,8 +160,27 @@ impl CodecSet {
         let wav: Arc<wav::WavCodec> = Arc::new(wav::WavCodec);
         Self {
             decoders: vec![png.clone(), wav.clone()],
+            legacy_decoders: Vec::new(),
             encoders: vec![png, wav],
         }
+    }
+
+    /// 旧版のデコーダを足す（読む値を変えた版を上げたとき、前の版を残す。ふつうの読み取りでは選ばない）。
+    pub fn add_legacy_decoder(&mut self, d: Arc<dyn Decoder>) {
+        self.legacy_decoders.push(d);
+    }
+
+    /// 識別子でデコーダを探す（今の版と旧版の両方から）。
+    pub fn decoder_by_id(&self, id: &str) -> Option<&Arc<dyn Decoder>> {
+        self.decoders
+            .iter()
+            .chain(self.legacy_decoders.iter())
+            .find(|d| d.id() == id)
+    }
+
+    /// 識別子でエンコーダを探す。
+    pub fn encoder_by_id(&self, id: &str) -> Option<&Arc<dyn Encoder>> {
+        self.encoders.iter().find(|e| e.id() == id)
     }
 
     /// デコーダを足す（Platform・External。段の順に並べ直す。同じ段なら足した順）。
@@ -219,7 +242,8 @@ impl CodecSet {
         Ok((shape, d.id()))
     }
 
-    /// 読む。形を上限で確かめてから中身を読み、読み取りの記録を返す。
+    /// 読む。段の順に試し、`shape` か `decode` で扱えないと答えたもの（`Unsupported`）は次の段へ回す。
+    /// 形を上限で確かめてから中身を読み、読み取りの記録を返す。
     pub fn decode(
         &self,
         src: &mut dyn ReadSeek,
@@ -228,27 +252,33 @@ impl CodecSet {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<(Value, DecodeStamp), EngineError> {
-        let (d, shape) = self.pick(src, format, opts, limits)?;
-        limits.check(&shape).map_err(EngineError::Limit)?;
-        src.rewind()?;
-        let value = contain(d.id(), Stage::Decode, || {
-            d.decode(src, format, opts, limits, mon)
-        })?;
-        if !shape.admits(&value.shape()) {
-            return Err(EngineError::Decode {
-                codec: d.id().to_string(),
-                message: "ヘッダと中身の大きさが合いません".into(),
-            });
+        let mut last = EngineError::Unsupported(format!("{format} を読めません"));
+        for d in self.decoders_for(format) {
+            match decode_one(d, src, format, opts, limits, mon) {
+                Err(e @ EngineError::Unsupported(_)) => last = e,
+                other => return other,
+            }
         }
-        let value_digest = value.digest()?;
-        Ok((
-            value,
-            DecodeStamp {
-                codec: d.id().to_string(),
-                tier: d.tier(),
-                value_digest,
-            },
-        ))
+        Err(last)
+    }
+
+    /// 記録した識別子のデコーダ（旧版を含む）で読む。作り直しで、版の記録と同じ読み方をするときに使う（§8.4・§9.1）。
+    pub fn decode_with(
+        &self,
+        id: &str,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<(Value, DecodeStamp), EngineError> {
+        let d = self
+            .decoder_by_id(id)
+            .filter(|d| d.can_decode(format))
+            .ok_or_else(|| {
+                EngineError::Unsupported(format!("{format} を読むデコーダ {id} がありません"))
+            })?;
+        decode_one(d, src, format, opts, limits, mon)
     }
 
     /// ファイルを読む。
@@ -299,6 +329,39 @@ impl CodecSet {
             },
         ))
     }
+}
+
+/// 1 つのデコーダで読む：形を上限で確かめてから中身を読み、ヘッダと中身が合うか確かめる。
+fn decode_one(
+    d: &Arc<dyn Decoder>,
+    src: &mut dyn ReadSeek,
+    format: &str,
+    opts: &DecodeOptions,
+    limits: &Limits,
+    mon: &dyn Monitor,
+) -> Result<(Value, DecodeStamp), EngineError> {
+    src.rewind()?;
+    let shape = contain(d.id(), Stage::Decode, || d.shape(src, format, opts, limits))?;
+    limits.check(&shape).map_err(EngineError::Limit)?;
+    src.rewind()?;
+    let value = contain(d.id(), Stage::Decode, || {
+        d.decode(src, format, opts, limits, mon)
+    })?;
+    if !shape.admits(&value.shape()) {
+        return Err(EngineError::Decode {
+            codec: d.id().to_string(),
+            message: "ヘッダと中身の大きさが合いません".into(),
+        });
+    }
+    let value_digest = value.digest()?;
+    Ok((
+        value,
+        DecodeStamp {
+            codec: d.id().to_string(),
+            tier: d.tier(),
+            value_digest,
+        },
+    ))
 }
 
 /// 外から来た大きさで確保するときの補助（足りなければ落ちずにエラー）。
@@ -489,5 +552,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stamp.tier, Tier::Pinned);
+    }
+
+    /// 形は読めても中身で扱えないと分かった（`decode` が `Unsupported`）ときも、次の段へ回す。
+    /// 旧版のデコーダはふつうの読み取りでは選ばれず、記録した識別子でだけ選べる。
+    #[test]
+    fn decode_stage_unsupported_falls_through_and_legacy_is_only_by_id() {
+        struct Picky(&'static str, Tier, bool);
+        impl Decoder for Picky {
+            fn id(&self) -> &'static str {
+                self.0
+            }
+            fn tier(&self) -> Tier {
+                self.1
+            }
+            fn can_decode(&self, format: &str) -> bool {
+                format == "raw"
+            }
+            fn shape(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+            ) -> Result<Shape, EngineError> {
+                Ok(Shape::Audio {
+                    rate: 8_000,
+                    channels: 1,
+                    frames: Dim::Exact(1),
+                })
+            }
+            fn decode(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+                _: &dyn Monitor,
+            ) -> Result<Value, EngineError> {
+                if !self.2 {
+                    return Err(EngineError::Unsupported("この変種は読めません".into()));
+                }
+                Ok(Value::Audio(Arc::new(Audio::new(
+                    8_000,
+                    vec![Arc::new(vec![0.0])],
+                    AudioMeta::default(),
+                )?)))
+            }
+        }
+        let mut set = CodecSet::default();
+        set.add_decoder(Arc::new(Picky("pinned-dec/2", Tier::Pinned, false)));
+        set.add_decoder(Arc::new(Picky("platform-dec/1", Tier::Platform, true)));
+        set.add_legacy_decoder(Arc::new(Picky("pinned-dec/1", Tier::Pinned, true)));
+        let read = |set: &CodecSet, id: Option<&str>| {
+            let mut src = Cursor::new(vec![0u8; 4]);
+            let opts = DecodeOptions::default();
+            let limits = Limits::default();
+            match id {
+                Some(id) => set.decode_with(id, &mut src, "raw", &opts, &limits, &NoMonitor),
+                None => set.decode(&mut src, "raw", &opts, &limits, &NoMonitor),
+            }
+        };
+        assert_eq!(read(&set, None).unwrap().1.codec, "platform-dec/1");
+        assert_eq!(
+            read(&set, Some("pinned-dec/1")).unwrap().1.codec,
+            "pinned-dec/1"
+        );
+        assert!(matches!(
+            read(&set, Some("pinned-dec/2")),
+            Err(EngineError::Unsupported(_))
+        ));
+        assert!(matches!(
+            read(&set, Some("missing-dec/1")),
+            Err(EngineError::Unsupported(_))
+        ));
+        assert!(set.decoder_by_id("pinned-dec/1").is_some());
+        let pinned = CodecSet::pinned();
+        assert!(pinned.decoder_by_id("png-rs-dec/1").is_some());
+        assert!(pinned.encoder_by_id("png-rs-enc/1").is_some());
+        assert!(pinned.decoder_by_id("png-rs-enc/1").is_none());
     }
 }

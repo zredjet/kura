@@ -1,7 +1,9 @@
 //! 決定性の補助（docs/editing.md §8.2）。
 //!
-//! - 並列は、仕事を固定の大きさのブロックに分けて添字の順に集める `par_blocks` だけを使う。
+//! - 並列は、仕事をブロックに分けて添字の順に集める `par_blocks` だけを使う（rayon などのほかの口は clippy.toml で禁止）。
 //!   スレッド数によらず、同じブロックの分け方・同じ足し合わせの順になる。
+//! - 並列の分け方（`BAND_ROWS`・`AUDIO_BLOCK`・`TILE`）は速さのためだけの値で、変えても結果は変わらないように書く。
+//!   結果に効く区切り（浮動小数の部分和）は、凍結した `SUM_BLOCK` で取る（`sum_blocks`）。
 //! - 乱数は ChaCha8 だけ。種はノードの種・元のハッシュ・用途から `seed` で作る。
 //! - 乱数の流れは**絶対位置**で決める（画像は行、音声はチャンネルを流れにして、列の位置へシークする。`rng_at`）。
 //!   タイル・ブロック・フレームの番号を流れに使わない。分け方（TILE・AUDIO_BLOCK）を変えても、範囲だけ描いても同じ値になる。
@@ -14,10 +16,13 @@ use rayon::prelude::*;
 use crate::error::EngineError;
 use crate::monitor::Monitor;
 
-/// 画像を帯に分けるときの行数（結果はこの値に依存しない）。
+/// 画像を帯に分けるときの行数（並列の分け方だけ。結果に効く区切りに使わない）。
 pub const BAND_ROWS: u32 = 64;
-/// 音声を分けるときのフレーム数（結果はこの値に依存しない）。
+/// 音声を分けるときのフレーム数（並列の分け方だけ。結果に効く区切りに使わない）。
 pub const AUDIO_BLOCK: usize = 4096;
+/// 浮動小数の総和の区切り（要素数）。部分和はこの大きさの固定の区間（先頭から）ごとに取り、区間の順に足す。
+/// **凍結する**：変えると総和の値が変わるので、変えるなら使う操作の版を上げる（§8.2）。
+pub const SUM_BLOCK: usize = 4096;
 
 /// splitmix64（kura-core の `random::splitmix64` と同じ値を返す）。
 pub fn splitmix64(x: u64) -> u64 {
@@ -80,8 +85,10 @@ where
     T: Send,
     F: Fn(usize) -> Result<T, EngineError> + Sync + Send,
 {
-    (0..count)
-        .into_par_iter()
+    // 並列の口はここだけ（clippy.toml で、ほかの場所の into_par_iter などを禁じている）
+    #[allow(clippy::disallowed_methods)]
+    let blocks = (0..count).into_par_iter();
+    blocks
         .map(|i| {
             if mon.canceled() {
                 Err(EngineError::Canceled)
@@ -95,6 +102,20 @@ where
 /// ブロックごとの部分和を添字の順に足す（浮動小数の総和の順序を固定する）。
 pub fn sum_ordered(parts: &[f64]) -> f64 {
     parts.iter().fold(0.0, |acc, x| acc + x)
+}
+
+/// `term(0)` から `term(len - 1)` までの総和。`SUM_BLOCK` ずつの区間の部分和を並列に取り、区間の順に足す。
+/// 区間の中は添字の順に足す。スレッド数・並列の分け方によらず同じ値になる。
+pub fn sum_blocks<F>(len: usize, mon: &dyn Monitor, term: F) -> Result<f64, EngineError>
+where
+    F: Fn(usize) -> f64 + Sync + Send,
+{
+    let parts = par_blocks(block_count(len, SUM_BLOCK), mon, |b| {
+        let start = b * SUM_BLOCK;
+        let end = start.saturating_add(SUM_BLOCK).min(len);
+        Ok((start..end).fold(0.0, |acc, i| acc + term(i)))
+    })?;
+    Ok(sum_ordered(&parts))
 }
 
 /// `len` を `block` ずつに分けたときのブロック数。
@@ -203,6 +224,36 @@ mod tests {
         flag.cancel();
         let r = par_blocks(10, &flag, Ok);
         assert!(matches!(r, Err(EngineError::Canceled)));
+    }
+
+    /// 総和は SUM_BLOCK ずつの区間で取り、スレッド数によらない。区間の切り方は凍結した値（先頭から SUM_BLOCK ずつ）。
+    #[test]
+    fn sum_blocks_is_thread_independent_and_uses_the_frozen_split() {
+        let term = |i: usize| {
+            (i as f64 * 0.37).sqrt() * 1e-3 + 1e10 * f64::from(u8::from(i.is_multiple_of(7)))
+        };
+        let len = SUM_BLOCK * 3 + 123;
+        let mut results = Vec::new();
+        for threads in [1, 3, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            results.push(
+                pool.install(|| sum_blocks(len, &NoMonitor, term))
+                    .unwrap()
+                    .to_bits(),
+            );
+        }
+        assert!(results.windows(2).all(|w| w[0] == w[1]));
+        // 参照：先頭から SUM_BLOCK ずつの部分和を、区間の順に足す
+        let reference = (0..len)
+            .collect::<Vec<_>>()
+            .chunks(SUM_BLOCK)
+            .map(|c| c.iter().fold(0.0, |acc, i| acc + term(*i)))
+            .fold(0.0, |acc, x| acc + x);
+        assert_eq!(results[0], reference.to_bits());
+        assert_eq!(sum_blocks(0, &NoMonitor, term).unwrap(), 0.0);
     }
 
     #[test]

@@ -25,18 +25,21 @@ use crate::value::{Image, ImageMeta, Palette, PixelFormat, Raster, Value};
 /// PNG の読み書き。
 pub struct PngCodec;
 
-const ID: &str = "png-rs/1";
+/// 読み取りの約束の版（読む値が変わる変更は上げ、旧版を残す。§9.1）。
+const DEC_ID: &str = "png-rs-dec/1";
+/// 書き出しの約束の版（書くバイト列が変わる変更は上げる。§9.1）。
+const ENC_ID: &str = "png-rs-enc/1";
 
 fn err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Decode {
-        codec: ID.to_string(),
+        codec: DEC_ID.to_string(),
         message: e.to_string(),
     }
 }
 
 fn enc_err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Encode {
-        codec: ID.to_string(),
+        codec: ENC_ID.to_string(),
         message: e.to_string(),
     }
 }
@@ -85,7 +88,7 @@ fn reader<'a>(
 
 impl Decoder for PngCodec {
     fn id(&self) -> &'static str {
-        ID
+        DEC_ID
     }
 
     fn tier(&self) -> Tier {
@@ -286,7 +289,7 @@ fn read_meta(info: &png::Info<'_>) -> ImageMeta {
 
 impl Encoder for PngCodec {
     fn id(&self) -> &'static str {
-        ID
+        ENC_ID
     }
 
     fn tier(&self) -> Tier {
@@ -460,7 +463,7 @@ mod tests {
                 &NoMonitor,
             )
             .unwrap();
-        assert_eq!(dstamp.codec, ID);
+        assert_eq!(dstamp.codec, DEC_ID);
         back
     }
 

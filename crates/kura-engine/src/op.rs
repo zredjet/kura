@@ -440,12 +440,25 @@ pub struct OpDescriptor {
     pub schema: ParamSchema,
 }
 
-/// 版の解決の結果。
+/// 版の解決の結果。どちらも、正規の JSON に往復させた引数を持つ。
 pub enum Resolved {
     /// その版の実装がある（今の版か旧版）。
-    Direct(Arc<dyn DynOp>),
+    Direct(Arc<dyn DynOp>, serde_json::Value),
     /// 実装のない古い版：すぐ上の実装のある版（旧版のこともある）へ移した引数と、その版の実装。
     Migrated(Arc<dyn DynOp>, serde_json::Value),
+}
+
+/// 引数を正規の JSON に往復させる（有限でない数などはエラー）。
+pub fn canonical_params(raw: &serde_json::Value) -> Result<serde_json::Value, Issue> {
+    crate::digest::canonical_json(raw)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .ok_or_else(|| {
+            Issue::error(
+                IssueCode::BadParams,
+                "引数を正規の形にできません（有限でない数など）",
+            )
+        })
 }
 
 /// 操作の登録表。（操作 ID, 版）→ 実装。旧版（legacy）も入れる。
@@ -471,6 +484,17 @@ impl Registry {
 
     /// 結果を変えた旧版の操作を足す（新しく作れないが、作り直しに使う）。
     pub fn add_legacy<O: Op>(&mut self) -> Result<(), String> {
+        self.insert::<O>()
+    }
+
+    /// なくした操作の最後の版を足す（カタログに出さず新しく作れないが、作り直しには使い、古い版の移行先にもなる。§8.4）。
+    pub fn add_retired<O: Op>(&mut self) -> Result<(), String> {
+        if self.current.contains_key(O::ID) {
+            return Err(format!(
+                "{} は今の版があるので、なくした操作にできません",
+                O::ID
+            ));
+        }
         self.insert::<O>()
     }
 
@@ -515,39 +539,40 @@ impl Registry {
     }
 
     /// ノードの（操作, 版, 引数）を実装に結び付ける（docs/editing.md §8.4）。
+    /// - 引数はまず正規の JSON に往復させる（メモリ上の 16.0・-0.0 と、保存して読み直した 16・0 を同じ引数にする。`migrate` にもこれを渡す）。
     /// - その版の実装（今の版か旧版）があればそれを使う。
     /// - なければ、すぐ上の実装のある版の `migrate` で引数を移し、その版の実装で描く（旧版を経由する鎖も表せる）。
-    /// - 知らない操作・今の版より新しい版・移せない版はエラー。
+    /// - 知らない操作・実装のある最新の版より新しい版・移せない版はエラー（なくした操作も、実装が残っていれば作り直せる）。
     pub fn resolve(&self, op: &str, v: u16, params: &serde_json::Value) -> Result<Resolved, Issue> {
+        let params = canonical_params(params)?;
         if let Some(imp) = self.get(op, v) {
-            return Ok(Resolved::Direct(imp));
+            return Ok(Resolved::Direct(imp, params));
         }
-        let Some(cur) = self.current_version(op) else {
+        let versions = self.versions(op);
+        let Some(max) = versions.iter().max().copied() else {
             return Err(Issue::error(
                 IssueCode::UnknownOp,
                 format!("知らない操作です（{op}）"),
             ));
         };
-        if v > cur {
+        if v > max {
             return Err(Issue::error(
                 IssueCode::UnknownVersion,
                 format!("{op} の版 {v} はこの版の Kura より新しい"),
             ));
         }
-        let Some(next) = self.versions(op).into_iter().find(|ver| *ver > v) else {
+        let Some(imp) = versions
+            .into_iter()
+            .find(|ver| *ver > v)
+            .and_then(|next| self.get(op, next))
+        else {
             return Err(Issue::error(
                 IssueCode::UnknownOp,
                 format!("知らない操作です（{op}）"),
             ));
         };
-        let Some(imp) = self.get(op, next) else {
-            return Err(Issue::error(
-                IssueCode::UnknownOp,
-                format!("知らない操作です（{op}）"),
-            ));
-        };
-        match imp.migrate(v, params.clone()) {
-            Ok(moved) => Ok(Resolved::Migrated(imp, moved)),
+        match imp.migrate(v, params) {
+            Ok(moved) => Ok(Resolved::Migrated(imp, canonical_params(&moved)?)),
             Err(why) => Err(Issue::error(
                 IssueCode::UnknownVersion,
                 format!("{op} の版 {v} を移せません: {why}"),
@@ -707,10 +732,10 @@ mod tests {
             _ => panic!("v1 は v2（旧版）へ移るはず"),
         }
         assert!(
-            matches!(r.resolve("test.dummy", 2, &serde_json::json!({})), Ok(Resolved::Direct(i)) if i.version() == 2)
+            matches!(r.resolve("test.dummy", 2, &serde_json::json!({})), Ok(Resolved::Direct(i, _)) if i.version() == 2)
         );
         assert!(
-            matches!(r.resolve("test.dummy", 3, &serde_json::json!({})), Ok(Resolved::Direct(i)) if i.version() == 3)
+            matches!(r.resolve("test.dummy", 3, &serde_json::json!({})), Ok(Resolved::Direct(i, _)) if i.version() == 3)
         );
         assert!(
             matches!(r.resolve("test.dummy", 4, &serde_json::json!({})), Err(i) if i.code == IssueCode::UnknownVersion)
@@ -721,6 +746,42 @@ mod tests {
         assert!(
             matches!(r.resolve("test.none", 1, &serde_json::json!({})), Err(i) if i.code == IssueCode::UnknownOp)
         );
+    }
+
+    /// なくした操作：今の版を外しても、なくした版（v3）と移行（v1 → v2 旧版）で作り直せる。カタログには出ない。
+    #[test]
+    fn retired_ops_still_replay() {
+        let mut r = Registry::empty();
+        r.add_retired::<V3>().unwrap();
+        r.add_legacy::<V2>().unwrap();
+        assert!(r.catalog().iter().all(|d| d.id != "test.dummy"));
+        assert!(
+            matches!(r.resolve("test.dummy", 3, &serde_json::json!({ "x": 1 })), Ok(Resolved::Direct(i, _)) if i.version() == 3)
+        );
+        assert!(
+            matches!(r.resolve("test.dummy", 1, &serde_json::json!({ "old": 2 })), Ok(Resolved::Migrated(i, _)) if i.version() == 2)
+        );
+        assert!(
+            matches!(r.resolve("test.dummy", 4, &serde_json::json!({})), Err(i) if i.code == IssueCode::UnknownVersion)
+        );
+        let mut both = Registry::empty();
+        both.add_current::<V3>().unwrap();
+        assert!(both.add_retired::<V3>().is_err());
+    }
+
+    /// 引数は正規の形に往復してから移行に渡る（16.0 と 16 で同じ結果）。
+    #[test]
+    fn params_are_canonical_before_migration() {
+        let r = table();
+        let a = r.resolve("test.dummy", 1, &serde_json::json!({ "old": 4.0 }));
+        let b = r.resolve("test.dummy", 1, &serde_json::json!({ "old": 4 }));
+        match (a, b) {
+            (Ok(Resolved::Migrated(_, x)), Ok(Resolved::Migrated(_, y))) => {
+                assert_eq!(x, y);
+                assert_eq!(x, serde_json::json!({ "x": 4 }));
+            }
+            _ => panic!(),
+        }
     }
 
     struct Bad;

@@ -9,9 +9,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::digest::{Digest, hash_canonical};
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 
-/// 今の文書のスキーマの版。全体の規則（メタデータの写し方・丸めなど）を変えたとき、文書の型に項目を足したときに上げる（§8.4）。
+/// 今の文書のスキーマの版。文書の型（項目）を変えたときに上げ、`SCHEMA_STEPS` に移行を 1 つ足す（§8.4）。
 /// 文書の型は知らない項目を受け付けないので、新しい版の文書を古い版の Kura が黙って別の意味で読むことはない。
-pub const SCHEMA: u32 = 1;
+/// - 2：`rules`（全体の規則の版）を足した。1 の文書は `rules: 1` として読む。
+pub const SCHEMA: u32 = 2;
+
+/// 今の全体の規則の版（メタデータの写し方・丸め・量子化など、どの操作にも効く約束。§8.4）。
+/// 全体の規則を変えたら上げ、古い規則の実装も残す（`render` が文書の `rules` で選ぶ）。
+/// スキーマの移行は文書の形だけを移し、この値は変えない（古い文書は古い規則で作り直す）。
+pub const RULES: u32 = 1;
 
 /// ノードの ID。文書の中で一意。消しても使い回さない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -133,6 +139,8 @@ pub struct OutputSpec {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Graph {
     pub schema: u32,
+    /// この文書を作ったときの全体の規則の版。
+    pub rules: u32,
     pub inputs: Vec<InputSlot>,
     pub nodes: Vec<Node>,
     pub outputs: Vec<OutputSpec>,
@@ -145,6 +153,7 @@ impl Graph {
     pub fn new_single() -> Self {
         Self {
             schema: SCHEMA,
+            rules: RULES,
             inputs: vec![InputSlot {
                 id: InputId(0),
                 role: InputRole::Primary,
@@ -200,6 +209,13 @@ impl Graph {
     pub fn check_structure(&self, max_nodes: u64) -> Issues {
         let mut issues = Issues::none();
         let bad = |msg: String| Issue::error(IssueCode::BadGraph, msg);
+        if self.rules == 0 || self.rules > RULES {
+            issues.push(Issue::error(
+                IssueCode::SchemaTooNew,
+                format!("この版の Kura が知らない規則の版です（{}）", self.rules),
+            ));
+            return issues;
+        }
         if self.nodes.len() as u64 > max_nodes {
             issues.push(Issue::error(
                 IssueCode::TooLarge,
@@ -214,7 +230,7 @@ impl Graph {
         }
         let mut seen: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
         let known = |r: &PortRef, seen: &[NodeId]| match r {
-            PortRef::Input { id } => input_ids.binary_search(id).is_ok(),
+            PortRef::Input { id } => input_ids.contains(id),
             PortRef::Node { id } => seen.contains(id),
         };
         for node in &self.nodes {
@@ -300,15 +316,125 @@ pub fn load(raw: &[u8]) -> Result<Graph, EngineError> {
     })
 }
 
+/// スキーマを 1 段移す関数。
+pub type SchemaStep = fn(serde_json::Value) -> Result<serde_json::Value, EngineError>;
+
+/// スキーマの移行の表：`SCHEMA_STEPS[i]` はスキーマ `i + 1` の文書を `i + 2` へ移す。スキーマを上げたら 1 つ足す（消さない）。
+const SCHEMA_STEPS: &[SchemaStep] = &[schema_1_to_2];
+
+/// 1 → 2：`rules` を足す（1 の文書はすべて規則 1 で作った）。
+fn schema_1_to_2(mut value: serde_json::Value) -> Result<serde_json::Value, EngineError> {
+    if let Some(map) = value.as_object_mut()
+        && !map.contains_key("rules")
+    {
+        map.insert("rules".into(), serde_json::Value::from(1));
+    }
+    Ok(value)
+}
+
 /// 古いスキーマの文書を今のスキーマへ移す。結果（出力）を変える移行は作らない（§8.4）。
 fn migrate_schema(value: serde_json::Value, from: u32) -> Result<serde_json::Value, EngineError> {
-    match from {
-        SCHEMA => Ok(value),
-        _ => Err(EngineError::Invalid(Issues::one(Issue::error(
-            IssueCode::BadGraph,
-            format!("スキーマ {from} の文書は読めません"),
-        )))),
+    migrate_with(value, from, SCHEMA, SCHEMA_STEPS)
+}
+
+/// `from` から `to` まで、表の関数で 1 段ずつ移す（段ごとに `schema` も書き換える）。
+pub fn migrate_with(
+    mut value: serde_json::Value,
+    from: u32,
+    to: u32,
+    steps: &[SchemaStep],
+) -> Result<serde_json::Value, EngineError> {
+    let bad =
+        |msg: String| EngineError::Invalid(Issues::one(Issue::error(IssueCode::BadGraph, msg)));
+    if from == 0 || from > to {
+        return Err(bad(format!("スキーマ {from} の文書は読めません")));
     }
+    for v in from..to {
+        let step = steps
+            .get((v - 1) as usize)
+            .ok_or_else(|| bad(format!("スキーマ {v} から移す方法がありません")))?;
+        value = step(value)?;
+        match value.as_object_mut() {
+            Some(map) => {
+                map.insert("schema".into(), serde_json::Value::from(v + 1));
+            }
+            None => return Err(bad("文書がオブジェクトではありません".into())),
+        }
+    }
+    Ok(value)
+}
+
+/// 編集済みの文書（`base`）の出力 0 の後ろに、レシピ（`recipe`）の操作をつなぐ（docs/editing.md §4.3。一括加工の継ぎ足し）。
+/// - レシピは入力 1 つ（Primary）の文書。その入力を `base` の出力 0 に結び付ける。
+/// - レシピのノード ID は `base.next_id` だけずらす。種はそのまま（元のハッシュと合わせて乱数が決まるので、結果は継ぎ足しても変わらない）。
+/// - 出力はレシピの出力（形式・展開もレシピのもの）。`base` のほかの出力は捨てる。
+pub fn compose(base: &Graph, recipe: &Graph) -> Result<Graph, EngineError> {
+    let bad = |msg: &str| EngineError::Invalid(Issues::one(Issue::error(IssueCode::BadGraph, msg)));
+    if base.schema != SCHEMA || recipe.schema != SCHEMA {
+        return Err(bad("今のスキーマに移してからつなぎます"));
+    }
+    // 1 つの文書は 1 つの規則で描くので、規則の版の違う文書はつなげない
+    if base.rules != recipe.rules {
+        return Err(bad("規則の版の違う文書はつなげません"));
+    }
+    let [slot] = recipe.inputs.as_slice() else {
+        return Err(bad("レシピの入力は 1 つだけです"));
+    };
+    if slot.role != InputRole::Primary {
+        return Err(bad("レシピの入力は対象（Primary）です"));
+    }
+    let attach = base
+        .outputs
+        .first()
+        .map(|o| o.from)
+        .ok_or_else(|| bad("つなぐ先の出力がありません"))?;
+    let offset = base.next_id;
+    let shift = |id: NodeId| {
+        id.0.checked_add(offset)
+            .map(NodeId)
+            .ok_or_else(|| bad("ノードの ID を使い切りました"))
+    };
+    let remap = |r: PortRef| -> Result<PortRef, EngineError> {
+        match r {
+            PortRef::Input { id } if id == slot.id => Ok(attach),
+            PortRef::Input { .. } => Err(bad("レシピがない入力を参照しています")),
+            PortRef::Node { id } => Ok(PortRef::Node { id: shift(id)? }),
+        }
+    };
+    let mut nodes = base.nodes.clone();
+    for n in &recipe.nodes {
+        let inputs = n
+            .inputs
+            .iter()
+            .map(|r| remap(*r))
+            .collect::<Result<Vec<_>, _>>()?;
+        nodes.push(Node {
+            id: shift(n.id)?,
+            inputs,
+            ..n.clone()
+        });
+    }
+    let outputs = recipe
+        .outputs
+        .iter()
+        .map(|o| {
+            Ok(OutputSpec {
+                from: remap(o.from)?,
+                ..o.clone()
+            })
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    let next_id = offset
+        .checked_add(recipe.next_id)
+        .ok_or_else(|| bad("ノードの ID を使い切りました"))?;
+    Ok(Graph {
+        schema: SCHEMA,
+        rules: base.rules,
+        inputs: base.inputs.clone(),
+        nodes,
+        outputs,
+        next_id,
+    })
 }
 
 /// u64 を 10 進の文字列で書く（JS の数で精度が落ちないように）。読むときは数でも受け付ける。
@@ -408,11 +534,102 @@ mod tests {
         assert!(load(&serde_json::to_vec(&v).unwrap()).is_err());
     }
 
+    /// スキーマ 1 の文書は規則 1 として読む。知らない規則の版は形の確かめで断る。
+    #[test]
+    fn schema_1_documents_get_rules_1_and_unknown_rules_are_rejected() {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&sample().to_canonical_json().unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("rules");
+        // rules のないスキーマ 2 の文書は形が正しくない
+        assert!(load(&serde_json::to_vec(&v).unwrap()).is_err());
+        v["schema"] = json!(1);
+        let g = load(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!((g.schema, g.rules), (SCHEMA, 1));
+        assert_eq!(g, sample());
+        let mut g2 = g.clone();
+        g2.rules = RULES + 1;
+        assert!(g2.check_structure(100).has_errors());
+        g2.rules = 0;
+        assert!(g2.check_structure(100).has_errors());
+    }
+
     #[test]
     fn node_ids_do_not_overflow() {
         let mut g = Graph::new_single();
         g.next_id = u32::MAX;
         assert!(g.push_linear("image.flip", 1, json!({}), 0).is_err());
+    }
+
+    /// スキーマの移行は 1 段ずつ、表の関数で行う（E7 の文書の側）。
+    #[test]
+    fn schema_migrations_chain_step_by_step() {
+        fn v1_to_v2(mut v: serde_json::Value) -> Result<serde_json::Value, EngineError> {
+            if let Some(m) = v.as_object_mut()
+                && let Some(x) = m.remove("old")
+            {
+                m.insert("mid".into(), x);
+            }
+            Ok(v)
+        }
+        fn v2_to_v3(mut v: serde_json::Value) -> Result<serde_json::Value, EngineError> {
+            if let Some(m) = v.as_object_mut()
+                && let Some(x) = m.remove("mid")
+            {
+                m.insert("new".into(), x);
+            }
+            Ok(v)
+        }
+        let steps: &[SchemaStep] = &[v1_to_v2, v2_to_v3];
+        let moved = migrate_with(json!({ "schema": 1, "old": 7 }), 1, 3, steps).unwrap();
+        assert_eq!(moved, json!({ "schema": 3, "new": 7 }));
+        assert_eq!(
+            migrate_with(json!({ "schema": 2, "mid": 7 }), 2, 3, steps).unwrap(),
+            json!({ "schema": 3, "new": 7 })
+        );
+        assert!(migrate_with(json!({}), 1, 4, steps).is_err());
+        assert!(migrate_with(json!({}), 0, 1, steps).is_err());
+        assert_eq!(
+            migrate_with(json!({ "schema": 1 }), 1, 1, steps).unwrap(),
+            json!({ "schema": 1 })
+        );
+    }
+
+    /// 継ぎ足し：レシピのノードは ID をずらして base の出力 0 につながり、出力はレシピのもの。
+    #[test]
+    fn compose_appends_recipe_after_base() {
+        let base = sample();
+        let mut recipe = Graph::new_single();
+        recipe
+            .push_linear("image.flip", 1, json!({ "axis": "vertical" }), 9)
+            .unwrap();
+        recipe.outputs[0].format = FormatChoice::To {
+            format: "png".into(),
+            options: json!({}),
+        };
+        let g = compose(&base, &recipe).unwrap();
+        assert_eq!(g.nodes.len(), 3);
+        assert_eq!(g.nodes[2].id, NodeId(base.next_id + 1));
+        assert_eq!(g.nodes[2].inputs, vec![PortRef::Node { id: NodeId(2) }]);
+        assert_eq!(g.nodes[2].seed, 9);
+        assert_eq!(
+            g.outputs[0].from,
+            PortRef::Node {
+                id: NodeId(base.next_id + 1)
+            }
+        );
+        assert!(matches!(g.outputs[0].format, FormatChoice::To { .. }));
+        assert!(g.check_structure(100).is_empty());
+        // 空の文書にレシピをつなぐと、レシピと同じ形
+        let empty = Graph::new_single();
+        let g2 = compose(&empty, &recipe).unwrap();
+        assert_eq!(g2.nodes[0].inputs, vec![PortRef::Input { id: InputId(0) }]);
+        let mut two_inputs = recipe.clone();
+        two_inputs.inputs.push(InputSlot {
+            id: InputId(1),
+            role: InputRole::Selection,
+            decode: DecodeOptions::default(),
+        });
+        assert!(compose(&base, &two_inputs).is_err());
     }
 
     #[test]

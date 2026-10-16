@@ -1,9 +1,14 @@
-//! コーデックのゴールデン（docs/editing.md §8.5・R2）。固定のエンコーダが書くバイト列と、読み直した値のダイジェストを凍結する。
+//! コーデックのゴールデン（docs/editing.md §8.5）。固定のエンコーダが書くバイト列（R2）と、固定のデコーダが読む値（R1）を凍結する。
 //!
-//! - ファイルは `goldens-codecs/<コーデックの ID の / を @ にしたもの>.jsonl`（例 `png-rs@1.jsonl`）。
-//!   1 行に `{"file","format","input","name","options","value"}`（file は書いたバイト列、value は読み直した値のダイジェスト）。
-//! - **追記だけ**（scripts/check-goldens-append-only.sh が見る）。値が変わったら、コーデックの約束の版を上げる（ID の `/1` を `/2` に）。
-//!   png クレートやその依存（fdeflate・flate2・miniz_oxide）を上げて書くバイト列が変わったときも、ここで気づく。
+//! - ファイルは `goldens-codecs/<コーデックの ID の / を @ にしたもの>.jsonl`。ID は読み取り（`-dec`）と書き出し（`-enc`）で別。
+//!   - `png-rs-enc@1.jsonl`：1 行に `{"decoder","file","format","input","name","options","value"}`。
+//!     file は書いたバイト列のダイジェスト、value はそれを `decoder` で読み直した値のダイジェスト。
+//!   - `png-rs-dec@1.jsonl`：1 行に `{"name","source","value"}`。下の層で組んだファイル（source）を読んだ値のダイジェスト。
+//! - **追記だけ**（scripts/check-goldens-append-only.sh が見る）。
+//!   - 書くバイト列が変わったら、エンコーダの約束の版を上げる（`-enc/1` → `-enc/2`）。旧版のエンコーダは残さなくてよい
+//!     （そのファイルは照らさなくなる）。png クレートや依存（fdeflate・flate2・miniz_oxide）を上げたときも、ここで気づく。
+//!   - 読む値は変えない。どうしても変えるなら、デコーダの約束の版を上げ、旧版を `CodecSet::add_legacy_decoder` で残す。
+//!     デコーダのファイルは、その ID のデコーダ（今の版か旧版）がないと失敗にする（作り直しが記録の識別子で読むため。§9.1）。
 //! - 足りない行は `KURA_BLESS=1 cargo test -p kura-engine --test codec_golden` で足せる。
 
 // テストの補助関数は #[test] の外にあるので、テストと同じく unwrap などを許す（clippy.toml の allow-*-in-tests が届かない）
@@ -33,6 +38,8 @@ struct Line {
     options: serde_json::Value,
     input: InputGen,
     file: String,
+    /// 読み直したデコーダ（`value` はこのデコーダで照らす）。
+    decoder: String,
     value: String,
 }
 
@@ -199,6 +206,81 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("goldens-codecs")
 }
 
+/// ゴールデンのファイルの種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    Enc,
+    Dec,
+}
+
+/// `goldens-codecs/` のファイルを種類ごとに読む：（種類, ID）→ 中身の行。名前の形が違うファイルは失敗にする。
+fn read_dir() -> BTreeMap<(Kind, String), (PathBuf, String)> {
+    let mut out = BTreeMap::new();
+    let Ok(dir) = std::fs::read_dir(root()) else {
+        return out;
+    };
+    for f in dir {
+        let path = f.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let stem = name
+            .strip_suffix(".jsonl")
+            .unwrap_or_else(|| panic!("goldens-codecs/ には .jsonl だけ置けます: {name}"));
+        let (base, ver) = stem
+            .split_once('@')
+            .unwrap_or_else(|| panic!("ファイル名は <ID の / を @ に>.jsonl: {name}"));
+        assert!(
+            ver.parse::<u16>().is_ok_and(|v| v.to_string() == ver),
+            "ファイル名の版は数字だけ: {name}"
+        );
+        let kind = if base.ends_with("-enc") {
+            Kind::Enc
+        } else if base.ends_with("-dec") {
+            Kind::Dec
+        } else {
+            panic!("コーデックの ID は -enc か -dec で終わる: {name}")
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        out.insert((kind, stem.replace('@', "/")), (path, text));
+    }
+    out
+}
+
+fn parse<T: serde::de::DeserializeOwned>(path: &std::path::Path, text: &str) -> Vec<T> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+        .collect()
+}
+
+fn decode_value(
+    codecs: &CodecSet,
+    decoder: &str,
+    bytes: &[u8],
+    format: &str,
+) -> Result<String, String> {
+    codecs
+        .decode_with(
+            decoder,
+            &mut Cursor::new(bytes),
+            format,
+            &DecodeOptions::default(),
+            &Limits::default(),
+            &NoMonitor,
+        )
+        .map(|(_, stamp)| stamp.value_digest.to_hex())
+        .map_err(|e| e.to_string())
+}
+
+/// 同じ名前の行が 2 つあれば失敗に足す。
+fn check_unique<'a>(key: &str, names: impl Iterator<Item = &'a str>, failures: &mut String) {
+    let mut seen: BTreeMap<&str, ()> = BTreeMap::new();
+    for n in names {
+        if seen.insert(n, ()).is_some() {
+            let _ = writeln!(failures, "{key} {n}：同じ例の行が 2 つあります");
+        }
+    }
+}
+
 fn same<T: Serialize>(a: &T, b: &T) -> bool {
     canonical(a).unwrap() == canonical(b).unwrap()
 }
@@ -210,24 +292,13 @@ fn codec_goldens_match_and_are_complete() {
     let codecs = CodecSet::pinned();
     let mut failures = String::new();
     let mut to_append: BTreeMap<String, String> = BTreeMap::new();
+    // エンコーダの ID → 行。今ないエンコーダ（版を上げた旧版）のファイルは照らさない（R2 の版上げ）
     let mut frozen: BTreeMap<String, Vec<Line>> = BTreeMap::new();
-    if let Ok(dir) = std::fs::read_dir(root()) {
-        for f in dir {
-            let path = f.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if name.ends_with(".decode.jsonl") {
-                continue;
-            }
-            let codec = path.file_stem().unwrap().to_string_lossy().to_string();
-            let lines: Vec<Line> = std::fs::read_to_string(&path)
-                .unwrap()
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| {
-                    serde_json::from_str(l).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-                })
-                .collect();
-            frozen.insert(codec, lines);
+    for ((kind, id), (path, text)) in read_dir() {
+        if kind == Kind::Enc {
+            let lines: Vec<Line> = parse(&path, &text);
+            check_unique(&id, lines.iter().map(|l| l.name.as_str()), &mut failures);
+            frozen.insert(id, lines);
         }
     }
     for (name, format, options, input) in examples() {
@@ -244,6 +315,7 @@ fn codec_goldens_match_and_are_complete() {
                 &NoMonitor,
             )
             .unwrap();
+        let key = stamp.codec.clone();
         // 書いて読み直した値は、元の値と同じ形（可逆）
         assert_eq!(back.shape(), value.shape(), "{name}");
         let file = Hasher::new("kura-file-v1")
@@ -256,9 +328,9 @@ fn codec_goldens_match_and_are_complete() {
             options,
             input,
             file,
+            decoder: dstamp.codec.clone(),
             value: dstamp.value_digest.to_hex(),
         };
-        let key = file_name(&stamp.codec);
         match frozen
             .get(&key)
             .and_then(|ls| ls.iter().find(|l| l.name == name))
@@ -273,14 +345,31 @@ fn codec_goldens_match_and_are_complete() {
                     "{key} {name}：凍結した例と設定・入力が違います（例は変えずに新しい名前で足す）"
                 );
             }
-            Some(old) if old.file != line.file || old.value != line.value => {
+            Some(old) if old.file != line.file => {
                 let _ = writeln!(
                     failures,
-                    "{key} {name}：凍結した値と違う（file {} → {}、value {} → {}）。コーデックの約束の版を上げる",
-                    old.file, line.file, old.value, line.value
+                    "{key} {name}：書いたバイト列が凍結した値と違う（{} → {}）。エンコーダの約束の版を上げる（-enc/N）",
+                    old.file, line.file
                 );
             }
-            Some(_) => {}
+            // 読み直しは、凍結したときのデコーダ（旧版を含む）で照らす
+            Some(old) => match decode_value(&codecs, &old.decoder, &bytes, format) {
+                Ok(v) if v == old.value => {}
+                Ok(v) => {
+                    let _ = writeln!(
+                        failures,
+                        "{key} {name}：{} で読み直した値が凍結した値と違う（{} → {v}）。読む値は変えない（変えるならデコーダの版を上げて旧版を残す）",
+                        old.decoder, old.value
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        failures,
+                        "{key} {name}：凍結したときのデコーダ {} で読めません（旧版のデコーダを残す）: {e}",
+                        old.decoder
+                    );
+                }
+            },
             None => {
                 let text = String::from_utf8(canonical(&line).unwrap()).unwrap();
                 to_append.entry(key).or_default().push_str(&(text + "\n"));
@@ -300,7 +389,7 @@ fn codec_goldens_match_and_are_complete() {
         if bless && failures.is_empty() {
             std::fs::create_dir_all(root()).unwrap();
             for (key, text) in to_append {
-                let path = root().join(format!("{key}.jsonl"));
+                let path = root().join(format!("{}.jsonl", file_name(&key)));
                 let mut all = std::fs::read_to_string(&path).unwrap_or_default();
                 all.push_str(&text);
                 std::fs::write(&path, all).unwrap();
@@ -427,24 +516,38 @@ fn decoder_goldens_match_and_are_complete() {
     let bless = std::env::var("KURA_BLESS").is_ok_and(|v| v == "1");
     let codecs = CodecSet::pinned();
     let mut failures = String::new();
+    // デコーダの ID → 行。凍結した行は、その ID のデコーダ（今の版か旧版）で読み、照らす
     let mut frozen: BTreeMap<String, Vec<DecodeLine>> = BTreeMap::new();
-    if let Ok(dir) = std::fs::read_dir(root()) {
-        for f in dir {
-            let path = f.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let Some(codec) = name.strip_suffix(".decode.jsonl") else {
-                continue;
-            };
-            let lines = std::fs::read_to_string(&path)
-                .unwrap()
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(|l| {
-                    serde_json::from_str(l).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-                })
-                .collect();
-            frozen.insert(codec.to_string(), lines);
+    for ((kind, id), (path, text)) in read_dir() {
+        if kind != Kind::Dec {
+            continue;
         }
+        let lines: Vec<DecodeLine> = parse(&path, &text);
+        check_unique(&id, lines.iter().map(|l| l.name.as_str()), &mut failures);
+        if codecs.decoder_by_id(&id).is_none() {
+            let _ = writeln!(
+                failures,
+                "{id}：デコーダがありません。読む値を変えるときは、旧版のデコーダを残す（docs/editing.md §9.1）"
+            );
+        } else {
+            for l in &lines {
+                let bytes = l.source.bytes().unwrap();
+                match decode_value(&codecs, &id, &bytes, l.source.format()) {
+                    Ok(v) if v == l.value => {}
+                    Ok(v) => {
+                        let _ = writeln!(
+                            failures,
+                            "{id} {}：読み取りの値が凍結した値と違う（{} → {v}）。読む値は変えない（変えるならデコーダの版を上げて旧版を残す）",
+                            l.name, l.value
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(failures, "{id} {}：読めません: {e}", l.name);
+                    }
+                }
+            }
+        }
+        frozen.insert(id, lines);
     }
     let mut to_append: BTreeMap<String, String> = BTreeMap::new();
     for (name, source) in decode_examples() {
@@ -458,7 +561,7 @@ fn decoder_goldens_match_and_are_complete() {
                 &NoMonitor,
             )
             .unwrap_or_else(|e| panic!("{name}: {e}"));
-        let key = file_name(&stamp.codec);
+        let key = stamp.codec.clone();
         let line = DecodeLine {
             name: name.into(),
             source,
@@ -474,13 +577,7 @@ fn decoder_goldens_match_and_are_complete() {
                     "{key} {name}：凍結した作り方と違います（例は変えずに新しい名前で足す）"
                 );
             }
-            Some(old) if old.value != line.value => {
-                let _ = writeln!(
-                    failures,
-                    "{key} {name}：読み取りの値が凍結した値と違う（{} → {}）。デコーダの約束の版を上げる",
-                    old.value, line.value
-                );
-            }
+            // 値は、凍結した行を読むところで照らした
             Some(_) => {}
             None => {
                 let text = String::from_utf8(canonical(&line).unwrap()).unwrap();
@@ -500,7 +597,7 @@ fn decoder_goldens_match_and_are_complete() {
         if bless && failures.is_empty() {
             std::fs::create_dir_all(root()).unwrap();
             for (key, text) in to_append {
-                let path = root().join(format!("{key}.decode.jsonl"));
+                let path = root().join(format!("{}.jsonl", file_name(&key)));
                 let mut all = std::fs::read_to_string(&path).unwrap_or_default();
                 all.push_str(&text);
                 std::fs::write(&path, all).unwrap();

@@ -34,6 +34,53 @@ pub fn cos(x: f64) -> f64 {
     libm::cos(x)
 }
 
+/// 大きいほう（IEEE 754-2019 の maximumNumber）。NaN は捨ててもう一方を返す。-0 < +0 として扱う
+/// （std の `f64::max` は ±0 のどちらを返すか決まっていないので使わない）。
+pub fn max(a: f64, b: f64) -> f64 {
+    // 等しい（±0）なら +0 を選ぶ
+    if a.is_nan() {
+        b
+    } else if b.is_nan() || a > b || (a == b && a.is_sign_positive()) {
+        a
+    } else {
+        b
+    }
+}
+
+/// 小さいほう（IEEE 754-2019 の minimumNumber）。NaN は捨ててもう一方を返す。-0 < +0 として扱う。
+pub fn min(a: f64, b: f64) -> f64 {
+    // 等しい（±0）なら -0 を選ぶ
+    if a.is_nan() {
+        b
+    } else if b.is_nan() || a < b || (a == b && a.is_sign_negative()) {
+        a
+    } else {
+        b
+    }
+}
+
+/// `max` の f32 版。
+pub fn max32(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() || a > b || (a == b && a.is_sign_positive()) {
+        a
+    } else {
+        b
+    }
+}
+
+/// `min` の f32 版。
+pub fn min32(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() || a < b || (a == b && a.is_sign_negative()) {
+        a
+    } else {
+        b
+    }
+}
+
 /// デシベルを振幅の倍率にする（10 の dB/20 乗）。
 pub fn db_to_gain(db: f64) -> f64 {
     pow(10.0, db / 20.0)
@@ -51,6 +98,26 @@ pub fn gain_to_db(gain: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ±0 と NaN の扱いを決めた max・min（引数の順によらない）。
+    #[test]
+    fn max_min_define_signed_zero_and_nan() {
+        let bits = |x: f64| x.to_bits();
+        for (a, b) in [(0.0, -0.0), (-0.0, 0.0)] {
+            assert_eq!(bits(max(a, b)), bits(0.0));
+            assert_eq!(bits(min(a, b)), bits(-0.0));
+            assert_eq!(max32(a as f32, b as f32).to_bits(), 0.0f32.to_bits());
+            assert_eq!(min32(a as f32, b as f32).to_bits(), (-0.0f32).to_bits());
+        }
+        assert_eq!(max(f64::NAN, 1.0), 1.0);
+        assert_eq!(max(1.0, f64::NAN), 1.0);
+        assert_eq!(min(f64::NAN, -1.0), -1.0);
+        assert!(max(f64::NAN, f64::NAN).is_nan());
+        assert_eq!((max(1.0, 2.0), max(2.0, 1.0)), (2.0, 2.0));
+        assert_eq!((min(1.0, 2.0), min(2.0, 1.0)), (1.0, 1.0));
+        assert_eq!(max(f64::NEG_INFINITY, -1.0), -1.0);
+        assert_eq!(max32(f32::NAN, 3.0), 3.0);
+    }
 
     /// 実装を凍結する：この値が変わったら、libm の版を上げたか実装を変えたということ（ADR-136）。
     /// 値はこの実装で一度計算して書き写したもの。真の値との差が 1 ULP 以内であることも確かめる。

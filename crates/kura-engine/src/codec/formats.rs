@@ -407,9 +407,9 @@ mod tests {
             .flat_map(|f| f.exts.iter().copied())
             .collect();
         let (n_ids, n_exts) = (ids.len(), exts.len());
-        ids.sort_unstable();
+        ids.sort();
         ids.dedup();
-        exts.sort_unstable();
+        exts.sort();
         exts.dedup();
         assert_eq!((ids.len(), exts.len()), (n_ids, n_exts));
         assert!(exts.iter().all(|e| {

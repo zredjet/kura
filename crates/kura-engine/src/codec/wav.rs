@@ -23,13 +23,16 @@ use crate::value::{Audio, AudioMeta, AudioSource, LoopRange, Marker, Value};
 /// WAV の読み書き。
 pub struct WavCodec;
 
-const ID: &str = "wav-kura/1";
+/// 読み取りの約束の版（読む値が変わる変更は上げ、旧版を残す。§9.1）。
+const DEC_ID: &str = "wav-kura-dec/1";
+/// 書き出しの約束の版（書くバイト列が変わる変更は上げる。§9.1）。
+const ENC_ID: &str = "wav-kura-enc/1";
 /// メタデータのチャンクとして読む大きさの上限。
 const META_CHUNK_MAX: u32 = 1 << 20;
 
 fn err(message: impl Into<String>) -> EngineError {
     EngineError::Decode {
-        codec: ID.to_string(),
+        codec: DEC_ID.to_string(),
         message: message.into(),
     }
 }
@@ -76,9 +79,32 @@ fn text_of(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).trim().to_string()
 }
 
+/// labl の名前を 1 つ足す（同じ ID は最初のもの）。数はマーカーの上限、バイトは予算（1 項目ごとの固定の重さを含む）で抑える。
+/// cue を先に読んでいれば（`cues` が Some）、cue にない ID の名前は予算を使わずに捨てる。
+fn add_label(
+    labels: &mut std::collections::BTreeMap<u32, String>,
+    cues: Option<&std::collections::BTreeMap<u32, u64>>,
+    budget: &mut Budget,
+    id: u32,
+    text: String,
+) {
+    if labels.contains_key(&id)
+        || labels.len() as u64 >= budget.markers
+        || cues.is_some_and(|c| !c.contains_key(&id))
+    {
+        return;
+    }
+    if budget.take(text.len() + ITEM_COST) {
+        labels.insert(id, text);
+    }
+}
+
 /// チャンクを順に読み、ヘッダとメタデータを集める（標本は読まない）。
 /// 名前・タグとして読む 1 つの文字列の長さの上限（バイト）。
 const TEXT_MAX: usize = 4_096;
+
+/// メタデータの 1 項目（タグ・名前）ごとに予算から引く固定の重さ（バイト）。空の名前でも数だけで予算を使い切れるように。
+const ITEM_COST: usize = 32;
 
 /// メタデータの読み取りの予算（マーカーの数とバイト数）。
 struct Budget {
@@ -118,6 +144,7 @@ fn parse(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Header, EngineError>
     // cue の ID → 位置（同じ ID は最初のもの）と、ID → 名前（最初のもの）
     let mut cues: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
     let mut labels: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
+    let mut cues_seen = false;
     let mut pos = 12u64;
     while pos.saturating_add(8) <= file_len {
         src.seek(SeekFrom::Start(pos))?;
@@ -190,6 +217,7 @@ fn parse(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Header, EngineError>
             b"cue " if (4..=META_CHUNK_MAX).contains(&size) && u64::from(size) <= available => {
                 let mut b = try_vec(size as usize, 0u8)?;
                 read_exact_or(src, &mut b, "cue チャンク")?;
+                cues_seen = true;
                 let count = (u32_at(&b, 0) as usize).min((b.len() - 4) / 24);
                 for i in 0..count {
                     if cues.len() as u64 >= budget.markers {
@@ -220,16 +248,20 @@ fn parse(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Header, EngineError>
                         let text = text_of(&content[..content.len().min(TEXT_MAX)]);
                         if !text.is_empty()
                             && !meta.tags.contains_key(&key)
-                            && budget.take(key.len() + text.len())
+                            && budget.take(key.len() + text.len() + ITEM_COST)
                         {
                             meta.tags.insert(key, text);
                         }
                     } else if kind == b"adtl" && sub == b"labl" && content.len() >= 4 {
                         let id = u32_at(content, 0);
                         let text = text_of(&content[4..content.len().min(4 + TEXT_MAX)]);
-                        if !labels.contains_key(&id) && budget.take(text.len()) {
-                            labels.insert(id, text);
-                        }
+                        add_label(
+                            &mut labels,
+                            cues_seen.then_some(&cues),
+                            &mut budget,
+                            id,
+                            text,
+                        );
                     }
                     o = start.saturating_add(len).saturating_add(len & 1);
                 }
@@ -277,7 +309,7 @@ fn parse(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Header, EngineError>
 
 impl Decoder for WavCodec {
     fn id(&self) -> &'static str {
-        ID
+        DEC_ID
     }
 
     fn tier(&self) -> Tier {
@@ -380,7 +412,7 @@ fn quantize(s: f32, bits: u16) -> i64 {
 
 impl Encoder for WavCodec {
     fn id(&self) -> &'static str {
-        ID
+        ENC_ID
     }
 
     fn tier(&self) -> Tier {
@@ -897,6 +929,43 @@ mod tests {
         let total: usize = a.meta.markers.iter().map(|m| m.name.len()).sum();
         // 名前は上限の長さで切り、同じ ID は 1 回だけ
         assert!(total <= TEXT_MAX + 10, "{total}");
+    }
+
+    /// 空の名前の labl を大量に並べても、数はマーカーの上限で止まり、1 つごとに予算を使う。cue を読んだ後なら、cue にない ID は捨てる。
+    #[test]
+    fn empty_label_floods_are_bounded() {
+        let mut labels = std::collections::BTreeMap::new();
+        let mut budget = Budget {
+            markers: 1_000,
+            bytes: 1 << 20,
+        };
+        for id in 0..200_000u32 {
+            add_label(&mut labels, None, &mut budget, id, String::new());
+        }
+        assert_eq!(labels.len(), 1_000);
+        assert_eq!(budget.bytes, (1 << 20) - 1_000 * ITEM_COST as u64);
+        // 予算が尽きれば、数の上限の前でも止まる
+        let mut labels = std::collections::BTreeMap::new();
+        let mut budget = Budget {
+            markers: 1_000_000,
+            bytes: 10 * ITEM_COST as u64,
+        };
+        for id in 0..200_000u32 {
+            add_label(&mut labels, None, &mut budget, id, String::new());
+        }
+        assert_eq!(labels.len(), 10);
+        // cue にない ID は予算を使わない
+        let cues = std::collections::BTreeMap::from([(7u32, 0u64)]);
+        let mut labels = std::collections::BTreeMap::new();
+        let mut budget = Budget {
+            markers: 1_000,
+            bytes: 1 << 20,
+        };
+        for id in 0..200_000u32 {
+            add_label(&mut labels, Some(&cues), &mut budget, id, "x".into());
+        }
+        assert_eq!(labels.keys().copied().collect::<Vec<_>>(), vec![7]);
+        assert_eq!(budget.bytes, (1 << 20) - 1 - ITEM_COST as u64);
     }
 
     /// 浮動小数の元に bits だけを指定すると整数で書き、設定がなければ元の形式・ビット数のまま元のバイト列に戻る（E17）。
