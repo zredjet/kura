@@ -1,0 +1,29 @@
+[package]
+name = "kura-engine"
+description = "Kura の編集の操作エンジン（OS・DB 非依存。docs/editing.md）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# 結果に効く依存は `=` で版を固定する（docs/editing.md §8.2、ADR-136）。上げるのはゴールデンが通るときだけ。
+# - blake3：すべてのダイジェスト
+# - rand_chacha：乱数（ChaCha8）。鍵は determinism::key_from_seed で自前に作るので rand_core の実装には頼らない
+# - libm：超越関数（ワークスペースで固定）
+# serde_json は固定しない：正規の JSON は自前で書き（digest.rs）、読み込みは float_roundtrip で正しく丸めるので、結果は版によらない。
+[dependencies]
+blake3 = { version = "=1.8.7", features = ["rayon"] }
+libm.workspace = true
+rand_chacha = "=0.10.0"
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

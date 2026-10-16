@@ -1,0 +1,4 @@
+{"digest":"2f5d6f7d115f6aa16817fd1c8dd1a4b9b24750bbfb42a15ac17159d79d9ace92","inputs":[{"fmt":"rgba8","h":300,"seed":5,"type":"noise","w":517}],"name":"horizontal-rgba-across-tiles","params":{"axis":"horizontal"},"target":"*"}
+{"digest":"9b1c37c5b98bd04fd43f2e4b19ef9864ca761a257b839d160f935df4ee5f5da9","inputs":[{"fmt":"rgb16","h":263,"seed":6,"type":"noise","w":31}],"name":"vertical-rgb16-odd","params":{"axis":"vertical"},"target":"*"}
+{"digest":"70067908a2fc427dbb7d3737746da6a84efceee7b17f9a9be7f7784e576ddc2c","inputs":[{"cell":16,"cols":3,"rows":2,"type":"sheet"}],"name":"sheet-keeps-grid","params":{"axis":"horizontal"},"target":"*"}
+{"digest":"3ed0e7a27e3e649083dc694af666022c6af7555f819884496e36424aef6d257a","inputs":[{"count":2,"fmt":"indexed8","h":5,"seed":7,"type":"noiseFrames","w":7}],"name":"indexed-frames","params":{"axis":"vertical"},"target":"*"}

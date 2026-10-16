@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/kura-core", "crates/kura-mac", "crates/kura-devtools", "src-tauri"]
+members = ["crates/kura-core", "crates/kura-engine", "crates/kura-mac", "crates/kura-devtools", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,10 +12,12 @@ repository = "https://github.com/zredjet/kura"
 
 [workspace.dependencies]
 kura-core = { path = "crates/kura-core" }
+kura-engine = { path = "crates/kura-engine" }
 kura-mac = { path = "crates/kura-mac" }
 
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip：小数を正しく丸めて読む。既定の速い読み方は 1 ULP ずれることがあり、保存した編集の文書を読み直すと引数が変わる（ADR-136）
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -37,6 +39,10 @@ base64 = "0.22"
 tempfile = "3"
 rand_chacha = "0.10"
 jpeg-encoder = "0.7"
+# 編集のエンジンの超越関数（OS の libm に頼らない。arch を外して CPU の命令にも頼らない。ADR-136・138）
+libm = { version = "=0.2.16", default-features = false }
+# 性質テスト（dev のみ）
+proptest = "1.12"
 
 tauri = "2.12"
 tauri-build = "2.7"
