@@ -314,6 +314,116 @@ impl Raster {
     }
 }
 
+/// 行を上から順に受け取ってタイルを組む。読み取りの作業領域を 1 タイル行（256 行）ぶんに抑えるので、
+/// 大きな画像でも、値の大きさに加えて 1 タイル行ぶんのメモリで読める（docs/editing.md §13）。
+pub struct RasterBuilder {
+    w: u32,
+    h: u32,
+    fmt: PixelFormat,
+    palette: Option<Palette>,
+    /// いま組んでいるタイル行（幅いっぱい × 最大 TILE 行）。
+    band: Vec<u8>,
+    /// 受け取った行の数。
+    rows: u32,
+    tiles: Vec<Arc<Vec<u8>>>,
+}
+
+impl RasterBuilder {
+    /// 大きさ・形式・パレットを決めて始める。
+    pub fn new(
+        w: u32,
+        h: u32,
+        fmt: PixelFormat,
+        palette: Option<Palette>,
+    ) -> Result<Self, EngineError> {
+        Raster::check_header(w, h, fmt, palette.as_ref())?;
+        let (tx_n, ty_n) = Raster::tiles_of(w, h);
+        let band_len = (w as usize)
+            .checked_mul(TILE.min(h) as usize)
+            .and_then(|n| n.checked_mul(fmt.bytes_per_pixel()))
+            .ok_or_else(|| EngineError::Limit("画像が大きすぎます".into()))?;
+        let band = alloc_zeroed(band_len)?;
+        let mut tiles = Vec::new();
+        tiles
+            .try_reserve_exact(tx_n as usize * ty_n as usize)
+            .map_err(|_| EngineError::Limit("タイルの表を確保できません".into()))?;
+        Ok(Self {
+            w,
+            h,
+            fmt,
+            palette,
+            band,
+            rows: 0,
+            tiles,
+        })
+    }
+
+    /// 1 行の長さ（バイト）。
+    pub fn row_len(&self) -> usize {
+        self.w as usize * self.fmt.bytes_per_pixel()
+    }
+
+    /// 次の行を足す。
+    pub fn push_row(&mut self, row: &[u8]) -> Result<(), EngineError> {
+        let row_len = self.row_len();
+        if row.len() != row_len {
+            return Err(EngineError::Internal("行の長さが合いません".into()));
+        }
+        if self.rows >= self.h {
+            return Err(EngineError::Internal("行が多すぎます".into()));
+        }
+        if let Some(p) = &self.palette
+            && row.iter().any(|b| usize::from(*b) >= p.colors.len())
+        {
+            return Err(EngineError::Internal(
+                "パレットにない番号の画素があります".into(),
+            ));
+        }
+        let r = (self.rows % TILE) as usize;
+        self.band[r * row_len..(r + 1) * row_len].copy_from_slice(row);
+        self.rows += 1;
+        if self.rows.is_multiple_of(TILE) || self.rows == self.h {
+            self.flush_band()?;
+        }
+        Ok(())
+    }
+
+    fn flush_band(&mut self) -> Result<(), EngineError> {
+        let ty = (self.rows - 1) / TILE;
+        let bpp = self.fmt.bytes_per_pixel();
+        let row_len = self.row_len();
+        for tx in 0..self.w.div_ceil(TILE) {
+            let rect = tile_rect(self.w, self.h, tx, ty);
+            let tile_row = rect.w as usize * bpp;
+            let mut buf = alloc_zeroed(tile_row * rect.h as usize)?;
+            for r in 0..rect.h as usize {
+                let src = r * row_len + rect.x as usize * bpp;
+                buf[r * tile_row..(r + 1) * tile_row]
+                    .copy_from_slice(&self.band[src..src + tile_row]);
+            }
+            self.tiles.push(Arc::new(buf));
+        }
+        Ok(())
+    }
+
+    /// すべての行を受け取ったら画像にする。
+    pub fn finish(self) -> Result<Raster, EngineError> {
+        if self.rows != self.h {
+            return Err(EngineError::Internal(format!(
+                "行が足りません（{} / {}）",
+                self.rows, self.h
+            )));
+        }
+        Ok(Raster {
+            w: self.w,
+            h: self.h,
+            fmt: self.fmt,
+            palette: self.palette.map(Arc::new),
+            tiles: self.tiles,
+        })
+    }
+}
+
 impl PartialEq for Raster {
     fn eq(&self, other: &Self) -> bool {
         self.w == other.w
@@ -337,6 +447,35 @@ pub fn tile_rect(w: u32, h: u32, tx: u32, ty: u32) -> IRect {
 
 #[cfg(test)]
 mod tests {
+    /// 行を順に足して組んだ画像は、行を並べたバイト列から作ったものと同じ（タイルの境目をまたぐ大きさで）。
+    #[test]
+    fn builder_matches_from_rows() {
+        for (w, h) in [(1u32, 1u32), (300, 257), (256, 512), (513, 3)] {
+            let bpp = 3usize;
+            let data: Vec<u8> = (0..w as usize * h as usize * bpp)
+                .map(|i| (i * 7 % 251) as u8)
+                .collect();
+            let mut b = RasterBuilder::new(w, h, PixelFormat::Rgb8, None).unwrap();
+            for row in data.chunks_exact(w as usize * bpp) {
+                b.push_row(row).unwrap();
+            }
+            let built = b.finish().unwrap();
+            assert_eq!(
+                built,
+                Raster::from_rows(w, h, PixelFormat::Rgb8, None, &data).unwrap()
+            );
+        }
+        let mut short = RasterBuilder::new(2, 2, PixelFormat::Gray8, None).unwrap();
+        short.push_row(&[1, 2]).unwrap();
+        assert!(short.push_row(&[1]).is_err());
+        assert!(short.finish().is_err());
+        let palette = Palette {
+            colors: vec![[0, 0, 0, 255]; 2],
+        };
+        let mut idx = RasterBuilder::new(2, 1, PixelFormat::Indexed8, Some(palette)).unwrap();
+        assert!(idx.push_row(&[0, 2]).is_err());
+    }
+
     use super::*;
     use crate::digest::Hasher;
 

@@ -1,0 +1,3 @@
+{"name":"fixture-webp-lossy.webp","source":{"path":"webp-lossy.webp","type":"fixture"},"value":"9895d1bfbd3ef328c14599d5caff8a4deee48fad66a31fa74e4d72a5ffe1c895"}
+{"name":"fixture-webp-lossy-alpha.webp","source":{"path":"webp-lossy-alpha.webp","type":"fixture"},"value":"348a6837ccd4d24e35e4e4bb5f6fd27f0f74add8fb4c55eab405ba1679287d1b"}
+{"name":"fixture-webp-anim.webp","source":{"path":"webp-anim.webp","type":"fixture"},"value":"d833067d95dab6f28cfce52581e72ef3d32402930e94898f7f67439315288203"}

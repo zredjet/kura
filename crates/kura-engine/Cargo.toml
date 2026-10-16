@@ -13,18 +13,32 @@ repository.workspace = true
 # - rand_chacha：乱数（ChaCha8）。鍵は determinism::key_from_seed で自前に作るので rand_core の実装には頼らない
 # - libm：超越関数（ワークスペースで固定）
 # - png：PNG の読み書き（R2 は Cargo.lock の fdeflate・flate2・miniz_oxide の版にも依存する。コーデックのゴールデンで見張る）
+# - zune-jpeg：JPEG の読み取り。SIMD を外して（default-features = false）、どのターゲットでも同じ整数の経路にする
+# - jpeg-encoder：JPEG の書き出し（SIMD の feature は入れない）
+# - gif：GIF の読み書き（R2 は Cargo.lock の weezl の版にも依存する）
+# - miniz_oxide：aseprite・PSD の zlib の展開（上限付き）
+# - image-webp：WebP の読み取り（可逆・非可逆・アニメ）と可逆の書き出し
+# - resvg：SVG の描画。中で std の三角関数（OS の libm）を使うので、結果は環境に依存する（R1 を約束しない。§9.4 のアンカーを作る）
 # serde_json は固定しない：正規の JSON は自前で書き（digest.rs）、読み込みは float_roundtrip で正しく丸めるので、結果は版によらない。
 [dependencies]
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 libm.workspace = true
+miniz_oxide = "=0.8.9"
+gif = { version = "=0.14.2", default-features = false, features = ["std", "raii_no_panic"] }
+image-webp = "=0.2.4"
+jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
 png = "=0.18.1"
 rand_chacha = "=0.10.0"
 rayon.workspace = true
+resvg = { version = "=0.48.1", default-features = false, features = ["text"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# asefile：aseprite の合成の照合相手（Aseprite の blend_funcs.cpp の移植。tests/aseprite_ref.rs）
+asefile = "=0.3.8"
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 proptest.workspace = true
 

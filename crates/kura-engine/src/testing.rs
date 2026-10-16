@@ -122,3 +122,124 @@ pub fn example_digest(
     )?;
     out.digest()
 }
+
+thread_local! {
+    /// `catch_own_panic` の中で起きた panic の場所（ファイル）。
+    static PANIC_AT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static IN_CATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+static HOOK: std::sync::Once = std::sync::Once::new();
+
+/// テスト用：`f` を呼ぶ。panic したら場所を調べ、kura-engine の自前のコード（`crates/kura-engine/src`）の panic なら
+/// `Err(場所)`、第三者のクレートの panic なら `Ok(Err(Decode))` にする（本番の `codec::contain` と同じく受け止める）。
+/// 壊れた入力のテストで、自前のコードの panic を見逃さないために使う。
+pub fn catch_own_panic<T>(
+    f: impl FnOnce() -> Result<T, EngineError>,
+) -> Result<Result<T, EngineError>, String> {
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if IN_CATCH.with(std::cell::Cell::get) {
+                let at = info
+                    .location()
+                    .map(|l| format!("{}:{}", l.file(), l.line()));
+                PANIC_AT.with(|p| *p.borrow_mut() = at);
+            } else {
+                previous(info);
+            }
+        }));
+    });
+    IN_CATCH.with(|c| c.set(true));
+    PANIC_AT.with(|p| *p.borrow_mut() = None);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    IN_CATCH.with(|c| c.set(false));
+    match r {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            let at = PANIC_AT.with(|p| p.borrow_mut().take()).unwrap_or_default();
+            if at.contains("kura-engine/src") || at.starts_with("src/") {
+                Err(at)
+            } else {
+                Ok(Err(EngineError::Decode {
+                    codec: "third-party".into(),
+                    message: format!("第三者のクレートの panic（{at}）"),
+                }))
+            }
+        }
+    }
+}
+
+/// ファズで読むときの上限（小さく絞って、1 回を速くする）。
+pub fn fuzz_limits() -> crate::Limits {
+    crate::Limits {
+        max_dim: 4_096,
+        max_pixels: 1 << 20,
+        max_frames: 64,
+        max_value_bytes: 64 << 20,
+        max_audio_frames: 1 << 20,
+        max_meta_bytes: 1 << 20,
+        ..crate::Limits::default()
+    }
+}
+
+/// ファズの対象（`fuzz/` の cargo-fuzz と `tests/fuzz_smoke.rs` が使う）：`data` を `format` の各デコーダ（旧版を含む）で、
+/// 上限を絞って形と中身を読む。見つけたい不具合（自前のコードの panic・形と中身の食い違い・`Internal`）は `Err`、
+/// 壊れたファイルとしてのエラーと第三者のクレートの panic は `Ok`。
+pub fn fuzz_decode(format: &str, data: &[u8]) -> Result<(), String> {
+    use std::io::Cursor;
+    let limits = fuzz_limits();
+    let set = crate::codec::CodecSet::pinned();
+    let opts = crate::doc::DecodeOptions::default();
+    for d in set.all_decoders_for(format) {
+        let r = catch_own_panic(|| {
+            let s = d.shape(&mut Cursor::new(data), format, &opts, &limits)?;
+            limits.check(&s).map_err(EngineError::Limit)?;
+            let v = d.decode(&mut Cursor::new(data), format, &opts, &limits, &NoMonitor)?;
+            if !s.admits(&v.shape()) {
+                return Err(EngineError::Internal(format!(
+                    "{}: 形と中身が違う（{s:?} と {:?}）",
+                    d.id(),
+                    v.shape()
+                )));
+            }
+            v.digest()?;
+            Ok(())
+        });
+        match r {
+            Err(at) => return Err(format!("{}: 自前のコードの panic（{at}）", d.id())),
+            Ok(Err(EngineError::Internal(m))) => return Err(format!("{}: {m}", d.id())),
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// ファズの対象：文書の JSON を読み、形を確かめ、エンジンで読み込んで計画を作る（入力は小さな画像と音声の形）。
+pub fn fuzz_document(data: &[u8]) -> Result<(), String> {
+    let r = catch_own_panic(|| {
+        let engine = Engine::new()?;
+        let g = engine.load(data)?;
+        let _ = g.check_structure(1_000);
+        for shape in [
+            crate::shape::Shape::Image {
+                w: crate::shape::Dim::Exact(64),
+                h: crate::shape::Dim::Exact(48),
+                fmt: crate::value::PixelFormat::Rgba8,
+            },
+            crate::shape::Shape::Audio {
+                rate: 44_100,
+                channels: 2,
+                frames: crate::shape::Dim::Exact(1_000),
+            },
+        ] {
+            let _ = engine.compile(&g, &BTreeMap::from([(InputId(0), shape)]));
+        }
+        Ok(())
+    });
+    match r {
+        Err(at) => Err(format!("自前のコードの panic（{at}）")),
+        Ok(Err(EngineError::Internal(m))) => Err(m),
+        Ok(_) => Ok(()),
+    }
+}

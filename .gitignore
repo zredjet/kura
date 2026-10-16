@@ -16,3 +16,10 @@ node_modules/
 .vscode/*
 !.vscode/extensions.json
 .idea/
+
+# cargo-fuzz（fuzz/README.md）
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/Cargo.lock

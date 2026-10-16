@@ -24,7 +24,9 @@ use kura_engine::NoMonitor;
 use kura_engine::codec::CodecSet;
 use kura_engine::digest::{Hasher, canonical};
 use kura_engine::doc::DecodeOptions;
-use kura_engine::testfiles::FileGen;
+use kura_engine::testfiles::{
+    ApngFrame, AseCel, AseFrame, AseLayer, AseSlice, FileGen, GifFrame, PsdGen,
+};
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::value::{LoopRange, PixelFormat};
 use serde::{Deserialize, Serialize};
@@ -195,6 +197,145 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
             meta: audio_meta,
         },
     ));
+    // 段 4：JPEG・GIF・WebP・APNG・EXIF
+    let exif = kura_engine::codec::exif::minimal(1, false);
+    let noise = |w, h, fmt, seed| InputGen::Noise { w, h, fmt, seed };
+    v.push((
+        "jpeg-rgb-q90",
+        "jpeg",
+        json!({}),
+        noise(37, 23, PixelFormat::Rgb8, 11),
+    ));
+    v.push((
+        "jpeg-gray-q75",
+        "jpeg",
+        json!({ "quality": 75 }),
+        noise(33, 17, PixelFormat::Gray8, 12),
+    ));
+    v.push((
+        "jpeg-progressive-422",
+        "jpeg",
+        json!({ "progressive": true, "chroma": "422", "quality": 80 }),
+        noise(40, 24, PixelFormat::Rgb8, 13),
+    ));
+    v.push((
+        "jpeg-meta",
+        "jpeg",
+        json!({ "quality": 95, "chroma": "420" }),
+        InputGen::WithMeta {
+            base: Box::new(noise(16, 16, PixelFormat::Rgb8, 14)),
+            meta: MetaGen {
+                dpi: Some((300, 300)),
+                icc: Some((0..=255u8).collect()),
+                exif: Some(exif.clone()),
+                ..MetaGen::default()
+            },
+        },
+    ));
+    v.push((
+        "gif-indexed-frames",
+        "gif",
+        json!({}),
+        InputGen::NoiseFrames {
+            w: 21,
+            h: 13,
+            fmt: PixelFormat::Indexed8,
+            count: 3,
+            seed: 15,
+        },
+    ));
+    v.push((
+        "gif-sprite",
+        "gif",
+        json!({ "alphaThreshold": 1 }),
+        InputGen::Sprite {
+            w: 16,
+            h: 12,
+            rect: kura_engine::geom::IRect::new(3, 2, 7, 6),
+        },
+    ));
+    v.push((
+        "gif-quantized",
+        "gif",
+        json!({}),
+        noise(30, 20, PixelFormat::Rgb8, 16),
+    ));
+    v.push((
+        "webp-rgba",
+        "webp",
+        json!({}),
+        noise(29, 19, PixelFormat::Rgba8, 17),
+    ));
+    v.push((
+        "webp-gray",
+        "webp",
+        json!({}),
+        noise(19, 11, PixelFormat::Gray8, 18),
+    ));
+    v.push((
+        "webp-meta",
+        "webp",
+        json!({}),
+        InputGen::WithMeta {
+            base: Box::new(noise(9, 7, PixelFormat::Rgb8, 19)),
+            meta: MetaGen {
+                icc: Some(vec![3; 40]),
+                exif: Some(exif.clone()),
+                ..MetaGen::default()
+            },
+        },
+    ));
+    v.push((
+        "apng-rgba16",
+        "png",
+        json!({}),
+        InputGen::NoiseFrames {
+            w: 11,
+            h: 9,
+            fmt: PixelFormat::Rgba16,
+            count: 3,
+            seed: 20,
+        },
+    ));
+    v.push((
+        "apng-indexed",
+        "png",
+        json!({ "compression": "fast" }),
+        InputGen::NoiseFrames {
+            w: 13,
+            h: 7,
+            fmt: PixelFormat::Indexed8,
+            count: 2,
+            seed: 21,
+        },
+    ));
+    // 1 フレームの列（APNG は acTL、GIF は繰り返しの拡張があるので、読んでもフレームの列のまま）
+    for (name, format) in [("apng-one-frame", "png"), ("gif-one-frame", "gif")] {
+        v.push((
+            name,
+            format,
+            json!({}),
+            InputGen::NoiseFrames {
+                w: 6,
+                h: 5,
+                fmt: PixelFormat::Indexed8,
+                count: 1,
+                seed: 23,
+            },
+        ));
+    }
+    v.push((
+        "png-exif",
+        "png",
+        json!({}),
+        InputGen::WithMeta {
+            base: Box::new(noise(5, 4, PixelFormat::Rgb8, 22)),
+            meta: MetaGen {
+                exif: Some(exif),
+                ..MetaGen::default()
+            },
+        },
+    ));
     v
 }
 
@@ -316,8 +457,18 @@ fn codec_goldens_match_and_are_complete() {
             )
             .unwrap();
         let key = stamp.codec.clone();
-        // 書いて読み直した値は、元の値と同じ形（可逆）
-        assert_eq!(back.shape(), value.shape(), "{name}");
+        // 書いて読み直した値は、元の値と同じ大きさ・種類（PNG・WAV は形式まで同じ。GIF・JPEG・WebP は形式が変わりうる）
+        let size = |sh: &kura_engine::Shape| match sh {
+            kura_engine::Shape::Image { w, h, .. } | kura_engine::Shape::Frames { w, h, .. } => {
+                (w.max(), h.max())
+            }
+            kura_engine::Shape::Audio { frames, .. } => (frames.max(), 0),
+        };
+        assert_eq!(back.kind(), value.kind(), "{name}");
+        assert_eq!(size(&back.shape()), size(&value.shape()), "{name}");
+        if matches!(format, "png" | "wav") {
+            assert_eq!(back.shape(), value.shape(), "{name}");
+        }
         let file = Hasher::new("kura-file-v1")
             .bytes_with_len(&bytes)
             .finish()
@@ -421,6 +572,7 @@ fn decode_examples() -> Vec<(&'static str, FileGen)> {
             icc: None,
             phys: None,
             seed,
+            exif: None,
         };
     let wav = |tag, bits, channels, extensible, unknown_size, seed| FileGen::Wav {
         tag,
@@ -440,7 +592,7 @@ fn decode_examples() -> Vec<(&'static str, FileGen)> {
         unknown_size,
         seed,
     };
-    vec![
+    let mut v = vec![
         ("gray1", png(13, 7, 0, 1, false, 0, None, 1)),
         (
             "gray2-trns",
@@ -492,6 +644,7 @@ fn decode_examples() -> Vec<(&'static str, FileGen)> {
                 icc: Some((0..200u8).collect()),
                 phys: Some((3_780, 2_835, 1)),
                 seed: 14,
+                exif: None,
             },
         ),
         ("wav-pcm8", wav(1, 8, 2, false, false, 20)),
@@ -499,7 +652,361 @@ fn decode_examples() -> Vec<(&'static str, FileGen)> {
         ("wav-float64", wav(3, 64, 2, false, false, 22)),
         ("wav-ext-float32", wav(3, 32, 3, true, false, 23)),
         ("wav-ext-pcm24-unknown-size", wav(1, 24, 2, true, true, 24)),
-    ]
+    ];
+    // 段 4：PNG の eXIf と APNG
+    v.push((
+        "png-exif-orient6",
+        FileGen::Png {
+            w: 7,
+            h: 3,
+            color: 2,
+            depth: 8,
+            interlace: false,
+            palette_len: 0,
+            trns: None,
+            text: vec![],
+            icc: None,
+            phys: None,
+            seed: 30,
+            exif: Some(kura_engine::codec::exif::minimal(6, true)),
+        },
+    ));
+    let fr = |x, y, w, h, dispose, blend| ApngFrame {
+        x,
+        y,
+        w,
+        h,
+        delay: (3, 50),
+        dispose,
+        blend,
+    };
+    let apng = |color, palette_len, trns: Option<Vec<u8>>, separate, frames, seed| FileGen::Apng {
+        w: 10,
+        h: 8,
+        color,
+        palette_len,
+        trns,
+        separate_default: separate,
+        plays: 2,
+        frames,
+        exif: None,
+        seed,
+        interlace: false,
+    };
+    let ops = vec![
+        fr(0, 0, 10, 8, 0, 0),
+        fr(2, 1, 5, 4, 1, 0),
+        fr(1, 2, 6, 5, 2, 1),
+        fr(0, 0, 10, 8, 0, 1),
+    ];
+    v.push(("apng-rgba-ops", apng(6, 0, None, false, ops.clone(), 31)));
+    v.push(("apng-rgb-separate", apng(2, 0, None, true, ops.clone(), 32)));
+    v.push((
+        "apng-indexed-exact",
+        apng(3, 8, Some(vec![255, 0]), false, ops.clone(), 33),
+    ));
+    v.push((
+        "apng-indexed-to-rgba",
+        apng(3, 8, Some(vec![0, 128]), false, ops.clone(), 34),
+    ));
+    let mut interlaced = apng(6, 0, None, false, ops, 44);
+    if let FileGen::Apng { interlace, .. } = &mut interlaced {
+        *interlace = true;
+    }
+    v.push(("apng-interlaced-subframes", interlaced));
+    v.push((
+        "apng-one-frame",
+        apng(2, 0, None, false, vec![fr(0, 0, 10, 8, 0, 0)], 45),
+    ));
+    // GIF
+    let gf = |left, top, w, h, local_len, transparent, dispose, interlaced| GifFrame {
+        left,
+        top,
+        w,
+        h,
+        local_len,
+        transparent,
+        dispose,
+        delay: 7,
+        interlaced,
+    };
+    v.push((
+        "gif-global-dispose",
+        FileGen::Gif {
+            w: 12,
+            h: 9,
+            global_len: 16,
+            repeat: Some(0),
+            frames: vec![
+                gf(0, 0, 12, 9, 0, None, 1, false),
+                gf(2, 1, 5, 4, 0, Some(3), 2, true),
+                gf(6, 5, 8, 6, 0, Some(1), 3, false),
+            ],
+            seed: 35,
+        },
+    ));
+    v.push((
+        "gif-local-palettes",
+        FileGen::Gif {
+            w: 10,
+            h: 7,
+            global_len: 4,
+            repeat: Some(2),
+            frames: vec![
+                gf(0, 0, 10, 7, 8, None, 1, false),
+                gf(3, 2, 4, 4, 0, Some(0), 2, false),
+            ],
+            seed: 36,
+        },
+    ));
+    v.push((
+        "gif-still-indexed",
+        FileGen::Gif {
+            w: 9,
+            h: 9,
+            global_len: 32,
+            repeat: None,
+            frames: vec![gf(0, 0, 9, 9, 0, Some(2), 0, true)],
+            seed: 37,
+        },
+    ));
+    // aseprite
+    let layer = |flags, kind, level, blend, opacity| AseLayer {
+        flags,
+        kind,
+        level,
+        blend,
+        opacity,
+    };
+    let cel = |layer: u16, x: i16, y: i16, kind: u16, w: u16, h: u16| AseCel {
+        layer,
+        x,
+        y,
+        opacity: 200,
+        z: 0,
+        kind,
+        w,
+        h,
+        link: 0,
+        flip: false,
+    };
+    let ase = |depth, flags, layers, frames, tileset, seed| FileGen::Aseprite {
+        w: 16,
+        h: 12,
+        depth,
+        flags,
+        transparent: 1,
+        palette_len: 24,
+        layers,
+        frames,
+        tileset,
+        tags: vec![("idle".into(), 0, 1)],
+        slices: vec![AseSlice {
+            name: "body".into(),
+            rect: (2, 3, 8, 6),
+            center: Some((1, 1, 6, 4)),
+            pivot: Some((4, 5)),
+        }],
+        seed,
+        opaque_palette: false,
+    };
+    let modes = vec![
+        layer(1, 0, 0, 0, 255),
+        layer(1, 0, 0, 1, 200),
+        layer(1, 0, 0, 9, 255),
+        layer(1, 0, 0, 12, 128),
+        layer(1, 0, 0, 18, 255),
+    ];
+    let frames2 = vec![
+        AseFrame {
+            duration: 90,
+            cels: (0..5)
+                .map(|l| cel(l, l as i16 - 2, 1 - l as i16, 2, 12, 10))
+                .collect(),
+        },
+        AseFrame {
+            duration: 60,
+            cels: vec![
+                AseCel {
+                    kind: 1,
+                    link: 0,
+                    ..cel(0, 0, 0, 1, 1, 1)
+                },
+                cel(3, 3, 3, 0, 6, 6),
+            ],
+        },
+    ];
+    v.push((
+        "ase-rgba-modes",
+        ase(32, 1, modes.clone(), frames2.clone(), None, 38),
+    ));
+    v.push((
+        "ase-gray-modes",
+        ase(16, 1, modes.clone(), frames2.clone(), None, 39),
+    ));
+    v.push((
+        "ase-indexed-rgba",
+        ase(8, 1, modes, frames2.clone(), None, 40),
+    ));
+    v.push((
+        "ase-indexed-exact",
+        ase(
+            8,
+            1,
+            vec![layer(1 | 8, 0, 0, 0, 255), layer(1, 0, 0, 0, 255)],
+            vec![AseFrame {
+                duration: 100,
+                cels: vec![
+                    AseCel {
+                        opacity: 255,
+                        ..cel(0, 0, 0, 2, 16, 12)
+                    },
+                    AseCel {
+                        opacity: 255,
+                        ..cel(1, 2, 2, 0, 9, 7)
+                    },
+                ],
+            }],
+            None,
+            41,
+        ),
+    ));
+    v.push((
+        "ase-groups-separate",
+        ase(
+            32,
+            1 | 2,
+            vec![
+                layer(1, 0, 0, 0, 255),
+                layer(1, 1, 0, 2, 150),
+                layer(1, 0, 1, 0, 255),
+                layer(1, 0, 1, 3, 255),
+            ],
+            vec![AseFrame {
+                duration: 100,
+                cels: vec![
+                    cel(0, 0, 0, 2, 16, 12),
+                    cel(2, 2, 2, 2, 9, 7),
+                    AseCel {
+                        z: -1,
+                        ..cel(3, 4, 1, 0, 6, 9)
+                    },
+                ],
+            }],
+            None,
+            42,
+        ),
+    ));
+    v.push((
+        "ase-tilemap",
+        ase(
+            32,
+            1,
+            vec![layer(1, 0, 0, 0, 255), layer(1, 2, 0, 0, 255)],
+            vec![AseFrame {
+                duration: 100,
+                cels: vec![
+                    cel(0, 0, 0, 2, 16, 12),
+                    AseCel {
+                        kind: 3,
+                        ..cel(1, 1, -2, 3, 4, 3)
+                    },
+                ],
+            }],
+            Some((4, 5, 5)),
+            43,
+        ),
+    ));
+    // PSD（自前の書き手で作る形）
+    let pb = PsdGen {
+        w: 11,
+        h: 7,
+        mode: 3,
+        depth: 8,
+        extra_channels: 0,
+        psb: false,
+        compression: 1,
+        layer_count: 0,
+        merged_key: false,
+        matted: false,
+        real_merged: None,
+        transparent_index: None,
+        resolution: None,
+        exif: None,
+        seed: 46,
+    };
+    for (name, g) in [
+        ("psd-gen-rgb8-rle", pb.clone()),
+        (
+            "psd-gen-rgb16-raw-psb",
+            PsdGen {
+                depth: 16,
+                compression: 0,
+                psb: true,
+                ..pb.clone()
+            },
+        ),
+        (
+            "psd-gen-bitmap",
+            PsdGen {
+                mode: 0,
+                depth: 1,
+                ..pb.clone()
+            },
+        ),
+        (
+            "psd-gen-indexed-transparent",
+            PsdGen {
+                mode: 2,
+                transparent_index: Some(2),
+                ..pb.clone()
+            },
+        ),
+        (
+            "psd-gen-rgba-matted",
+            PsdGen {
+                extra_channels: 1,
+                merged_key: true,
+                matted: true,
+                resolution: Some((100 << 16, 2)),
+                ..pb.clone()
+            },
+        ),
+        (
+            "psd-gen-graya16-straight",
+            PsdGen {
+                mode: 1,
+                depth: 16,
+                extra_channels: 1,
+                layer_count: -1,
+                ..pb
+            },
+        ),
+    ] {
+        v.push((name, FileGen::Psd(g)));
+    }
+    // 他のツールで作ったフィクスチャ（作り方は fixtures/README.md）
+    for path in [
+        "jpeg-progressive.jpg",
+        "jpeg-gray.jpg",
+        "jpeg-422.jpg",
+        "jpeg-restart.jpg",
+        "webp-lossy.webp",
+        "webp-lossy-alpha.webp",
+        "webp-anim.webp",
+        "psd-rgb8.psd",
+        "psd-rgb8-raw.psd",
+        "psd-rgba8.psd",
+        "psd-gray8.psd",
+        "psd-indexed.psd",
+        "psd-rgb16.psd",
+        "psb-rgb8.psb",
+        "psb-rgba8.psb",
+    ] {
+        let name: &'static str = Box::leak(format!("fixture-{path}").into_boxed_str());
+        v.push((name, FileGen::Fixture { path: path.into() }));
+    }
+    v
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

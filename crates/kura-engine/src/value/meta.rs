@@ -30,6 +30,27 @@ pub struct Slice {
     pub pivot: Option<IPoint>,
 }
 
+/// アニメのタグの再生の向き（aseprite）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TagDirection {
+    Forward,
+    Reverse,
+    PingPong,
+    PingPongReverse,
+}
+
+/// アニメのタグ（aseprite）。フレームの番号の範囲（両端を含む）。`repeat` は 0 が無限。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimTag {
+    pub name: String,
+    pub from: u32,
+    pub to: u32,
+    pub direction: TagDirection,
+    pub repeat: u32,
+}
+
 /// 画像のメタデータ。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,9 +62,15 @@ pub struct ImageMeta {
     pub dpi: Option<(u32, u32)>,
     /// PNG のテキストなど（そのまま運ぶ）。
     pub text: BTreeMap<String, String>,
+    /// アニメのタグ（aseprite）。空なら正規の JSON に書かない（足す前の値のダイジェストを変えない）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<AnimTag>,
     /// ICC プロファイル（そのまま運ぶ。ダイジェストには中身のハッシュを入れる）。
     #[serde(skip)]
     pub icc: Option<Arc<Vec<u8>>>,
+    /// EXIF（TIFF の形のバイト列。先頭の `Exif\0\0` は付けない）。読むときに向き（Orientation）を画素に当て、ここでは 1（そのまま）にしてある。
+    #[serde(skip)]
+    pub exif: Option<Arc<Vec<u8>>>,
 }
 
 /// 音声のループ区間（フレーム。`end` は含まない）。

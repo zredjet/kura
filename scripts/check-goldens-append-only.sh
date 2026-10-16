@@ -1,6 +1,7 @@
 #!/bin/sh
 # 編集のゴールデンは追記だけ（docs/editing.md §8.5、ADR-136）。
-# 基準のコミットからの差分で、crates/kura-engine/goldens/・goldens-codecs/・goldens-replay/ の既存の行が消えた・変わったものがあれば失敗する。
+# 基準のコミットからの差分で、crates/kura-engine/goldens/・goldens-codecs/・goldens-replay/ の既存の行が消えた・変わったもの、
+# fixtures/ のファイルが消えた・変わったものがあれば失敗する。
 # 使い方：scripts/check-goldens-append-only.sh [基準]（既定は origin/main。なければ main）
 set -eu
 
@@ -22,6 +23,13 @@ deleted=$(git diff --no-renames --name-only --diff-filter=D "$merge_base" HEAD -
 if [ -n "$deleted" ]; then
   echo "ゴールデンのファイルが消えた・改名されています（追記だけにしてください）:"
   echo "$deleted"
+  exit 1
+fi
+# フィクスチャ（他のツールで作った入力）は、消すのも変えるのも認めない（README.md は除く）
+changed=$(git diff --no-renames --name-only --diff-filter=DM "$merge_base" HEAD -- crates/kura-engine/fixtures ':!crates/kura-engine/fixtures/README.md')
+if [ -n "$changed" ]; then
+  echo "フィクスチャが消えた・変わっています（新しい名前で足してください）:"
+  echo "$changed"
   exit 1
 fi
 # shellcheck disable=SC2086

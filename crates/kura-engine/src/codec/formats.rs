@@ -17,15 +17,32 @@ pub enum ItemKind {
     Model,
 }
 
-/// 形式が保存できるメタデータ（書き出しで失うものを先に知らせる）。
+/// 透明をどこまで保存できるか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AlphaCaps {
+    /// 透明を持てない。
+    None,
+    /// 透明か不透明かの 2 値だけ（GIF）。
+    Binary,
+    /// 半透明まで。
+    Full,
+}
+
+/// 保存できるもの（書き出しで失うものを先に知らせる。docs/editing.md §6）。形式の表の値は形式の能力、
+/// エンコーダの `caps` の値は、そのエンコーダがその設定で実際に書けるもの。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetaCaps {
+    /// ほかの項目（透明・色の数・深さ）の範囲の中の値なら、そのまま戻るか。
     pub lossless: bool,
-    pub alpha: bool,
+    pub alpha: AlphaCaps,
     pub palette: bool,
+    /// 色の数の上限（GIF は 256。超えると減色する）。
+    pub max_colors: Option<u32>,
     pub high_bit_depth: bool,
     pub icc: bool,
+    pub exif: bool,
     pub dpi: bool,
     pub text: bool,
     pub animation: bool,
@@ -34,12 +51,15 @@ pub struct MetaCaps {
     pub tags: bool,
 }
 
-const NONE: MetaCaps = MetaCaps {
+/// 何も保存できない（形式の表にない形式）。
+pub const NONE: MetaCaps = MetaCaps {
     lossless: false,
-    alpha: false,
+    alpha: AlphaCaps::None,
     palette: false,
+    max_colors: None,
     high_bit_depth: false,
     icc: false,
+    exif: false,
     dpi: false,
     text: false,
     animation: false,
@@ -77,10 +97,11 @@ pub const FORMATS: &[FormatDesc] = &[
         decodes_to: IMG_ANIM,
         caps: MetaCaps {
             lossless: true,
-            alpha: true,
+            alpha: AlphaCaps::Full,
             palette: true,
             high_bit_depth: true,
             icc: true,
+            exif: true,
             dpi: true,
             text: true,
             animation: true,
@@ -95,6 +116,7 @@ pub const FORMATS: &[FormatDesc] = &[
         decodes_to: IMG,
         caps: MetaCaps {
             icc: true,
+            exif: true,
             dpi: true,
             ..NONE
         },
@@ -107,7 +129,8 @@ pub const FORMATS: &[FormatDesc] = &[
         decodes_to: IMG_ANIM,
         caps: MetaCaps {
             lossless: true,
-            alpha: true,
+            alpha: AlphaCaps::Binary,
+            max_colors: Some(256),
             palette: true,
             animation: true,
             ..NONE
@@ -121,8 +144,9 @@ pub const FORMATS: &[FormatDesc] = &[
         decodes_to: IMG_ANIM,
         caps: MetaCaps {
             lossless: true,
-            alpha: true,
+            alpha: AlphaCaps::Full,
             icc: true,
+            exif: true,
             animation: true,
             ..NONE
         },
@@ -137,7 +161,7 @@ pub const FORMATS: &[FormatDesc] = &[
     },
     FormatDesc {
         id: "psd",
-        exts: &["psd"],
+        exts: &["psd", "psb"],
         mime: "image/vnd.adobe.photoshop",
         item_kind: ItemKind::Image,
         decodes_to: IMG,
@@ -183,7 +207,7 @@ pub const FORMATS: &[FormatDesc] = &[
         decodes_to: IMG,
         caps: MetaCaps {
             lossless: true,
-            alpha: true,
+            alpha: AlphaCaps::Full,
             high_bit_depth: true,
             icc: true,
             dpi: true,
@@ -393,6 +417,11 @@ pub fn format_by_ext(ext: &str) -> Option<&'static FormatDesc> {
 /// 形式の ID から引く。
 pub fn format_by_id(id: &str) -> Option<&'static FormatDesc> {
     FORMATS.iter().find(|f| f.id == id)
+}
+
+/// 形式の保存できるメタデータ（表にない形式は何も保存できないとする）。
+pub fn caps_of(id: &str) -> MetaCaps {
+    format_by_id(id).map(|f| f.caps).unwrap_or(NONE)
 }
 
 #[cfg(test)]

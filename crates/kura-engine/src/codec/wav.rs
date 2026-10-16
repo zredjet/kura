@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, format_by_id, try_vec};
+use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
 use crate::limits::Limits;
@@ -441,23 +441,8 @@ impl Encoder for WavCodec {
         }
     }
 
-    fn caps(&self, format: &str) -> MetaCaps {
-        format_by_id(format)
-            .or_else(|| format_by_id("wav"))
-            .map(|f| f.caps)
-            .unwrap_or(MetaCaps {
-                lossless: true,
-                alpha: false,
-                palette: false,
-                high_bit_depth: true,
-                icc: false,
-                dpi: false,
-                text: false,
-                animation: false,
-                loop_points: true,
-                markers: true,
-                tags: true,
-            })
+    fn caps(&self, format: &str, _opts: &serde_json::Value) -> MetaCaps {
+        caps_of(format)
     }
 
     fn encode(

@@ -1,0 +1,79 @@
+# kura-engine のファズの対象（cargo-fuzz。nightly で回す）。docs/editing.md §13、fuzz/README.md。
+# ルートのワークスペースには入れない（nightly の依存を通常のビルドに混ぜない）。
+[package]
+name = "kura-engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kura-engine = { path = "../crates/kura-engine" }
+
+[workspace]
+
+[[bin]]
+name = "decode_png"
+path = "fuzz_targets/decode_png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_jpeg"
+path = "fuzz_targets/decode_jpeg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_gif"
+path = "fuzz_targets/decode_gif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_webp"
+path = "fuzz_targets/decode_webp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_aseprite"
+path = "fuzz_targets/decode_aseprite.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_psd"
+path = "fuzz_targets/decode_psd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_svg"
+path = "fuzz_targets/decode_svg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_wav"
+path = "fuzz_targets/decode_wav.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "document"
+path = "fuzz_targets/document.rs"
+test = false
+doc = false
+bench = false

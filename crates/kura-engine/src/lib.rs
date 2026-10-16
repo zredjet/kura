@@ -12,6 +12,7 @@ pub mod digest;
 pub mod doc;
 pub mod error;
 pub mod geom;
+pub mod imaging;
 pub mod limits;
 pub mod mapping;
 pub mod math;

@@ -6,9 +6,11 @@ pub mod raster;
 
 use std::sync::Arc;
 
-pub use meta::{AudioMeta, AudioSource, Grid, ImageMeta, LoopRange, Marker, Slice};
+pub use meta::{
+    AnimTag, AudioMeta, AudioSource, Grid, ImageMeta, LoopRange, Marker, Slice, TagDirection,
+};
 pub use pixel::{Palette, PixelFormat};
-pub use raster::{Raster, TILE};
+pub use raster::{Raster, RasterBuilder, TILE};
 
 use crate::digest::{Digest, Hasher, canonical};
 use crate::error::EngineError;
@@ -289,6 +291,10 @@ impl Value {
     }
 }
 
+/// 画像のメタデータをダイジェストに足す：正規の JSON ‖ ICC ‖ 拡張。
+/// 拡張は、あるものだけを番号の順に（番号 u8 ‖ 長さ付きのバイト列）書く。ないときは何も書かないので、
+/// 拡張を足す前の値のダイジェストは変わらない（ICC までは長さで区切れるので、後ろの有無で区別できる）。
+/// - 1：EXIF
 fn image_meta_into(meta: &ImageMeta, h: &mut Hasher) -> Result<(), EngineError> {
     h.bytes_with_len(&canonical(meta)?);
     match &meta.icc {
@@ -298,6 +304,9 @@ fn image_meta_into(meta: &ImageMeta, h: &mut Hasher) -> Result<(), EngineError> 
         None => {
             h.u8(0);
         }
+    }
+    if let Some(exif) = &meta.exif {
+        h.u8(1).bytes_with_len(exif);
     }
     Ok(())
 }
@@ -367,6 +376,24 @@ mod tests {
         h.bytes_with_len(br#"{"dpi":null,"grid":null,"pivot":null,"slices":[],"text":{}}"#)
             .u8(0);
         assert_eq!(img.digest().unwrap(), h.finish());
+        // 拡張（EXIF）は、あるときだけ後ろに足す
+        let Value::Image(base) = &img else { panic!() };
+        let mut with_exif = (**base).clone();
+        with_exif.meta.exif = Some(Arc::new(vec![9, 8, 7]));
+        let mut h = Hasher::new("kura-img-v1");
+        h.u32(2)
+            .u32(1)
+            .u8(PixelFormat::Rgba8.code())
+            .u8(0)
+            .raw(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        h.bytes_with_len(br#"{"dpi":null,"grid":null,"pivot":null,"slices":[],"text":{}}"#)
+            .u8(0)
+            .u8(1)
+            .bytes_with_len(&[9, 8, 7]);
+        assert_eq!(
+            Value::Image(Arc::new(with_exif)).digest().unwrap(),
+            h.finish()
+        );
     }
 
     #[test]

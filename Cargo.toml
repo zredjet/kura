@@ -38,7 +38,7 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 base64 = "0.22"
 tempfile = "3"
 rand_chacha = "0.10"
-jpeg-encoder = "0.7"
+jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
 # 編集のエンジンの超越関数（OS の libm に頼らない。arch を外して CPU の命令にも頼らない。ADR-136・138）
 libm = { version = "=0.2.16", default-features = false }
 # 性質テスト（dev のみ）

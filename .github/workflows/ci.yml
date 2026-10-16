@@ -27,6 +27,8 @@ jobs:
       - run: cargo test -p kura-engine -p kura-core
       - name: ゴールデンは追記だけ
         run: scripts/check-goldens-append-only.sh "${{ github.event.pull_request.base.sha || github.event.before }}"
+      - name: エンジンの依存に SIMD の feature がない
+        run: scripts/check-engine-features.sh
 
   macos:
     name: macOS（kura-engine・kura-core・kura-mac・kura-devtools）

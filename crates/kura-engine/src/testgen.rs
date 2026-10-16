@@ -78,6 +78,9 @@ pub struct MetaGen {
     pub loop_range: Option<LoopRange>,
     pub markers: Vec<(u64, String)>,
     pub tags: Vec<(String, String)>,
+    /// EXIF（TIFF の形）。ないときは書かない（足す前に凍結した入力の書き方を変えない）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exif: Option<Vec<u8>>,
 }
 
 impl MetaGen {
@@ -86,6 +89,9 @@ impl MetaGen {
         meta.text.extend(self.text.iter().cloned());
         if let Some(icc) = &self.icc {
             meta.icc = Some(Arc::new(icc.clone()));
+        }
+        if let Some(exif) = &self.exif {
+            meta.exif = Some(Arc::new(exif.clone()));
         }
     }
 

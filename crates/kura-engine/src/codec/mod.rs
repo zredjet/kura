@@ -4,9 +4,16 @@
 //!   → 外部の ffmpeg（`External`。kura-core が注入）の順に試し、使ったものの識別子を記録する。
 //! - 外から来たファイルを読むので、確保の前に上限で判断し、第三者のデコーダの境界では panic を受け止めてエラーにする。
 
+pub mod aseprite;
+pub mod exif;
 pub mod formats;
+pub mod gif;
+pub mod jpeg;
 pub mod png;
+pub mod psd;
+pub mod svg;
 pub mod wav;
+pub mod webp;
 
 use std::io::{BufReader, Read, Seek};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -15,7 +22,9 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-pub use formats::{FormatDesc, ItemKind, MetaCaps, format_by_ext, format_by_id};
+pub use formats::{
+    AlphaCaps, FormatDesc, ItemKind, MetaCaps, caps_of, format_by_ext, format_by_id,
+};
 
 use crate::digest::{Digest, Hasher, canonical_json};
 use crate::doc::DecodeOptions;
@@ -49,6 +58,8 @@ pub struct DecodeStamp {
     /// 使ったデコーダ（例 `png-rs-dec/1`）。作り直しでは `CodecSet::decode_with` でこのデコーダを選ぶ。
     pub codec: String,
     pub tier: Tier,
+    /// 同じ識別子のデコーダなら、どの環境でも同じ値を読むか（偽なら、初めて編集するときにアンカーを作る。§9.4）。
+    pub reproducible: bool,
     /// 読み取った値のダイジェスト（作り直しで照らす。E29）。
     pub value_digest: Digest,
 }
@@ -72,6 +83,11 @@ pub trait Decoder: Send + Sync {
     /// 識別子（例 `png-rs-dec/1`。約束の版を含む）。読む値が変わる変更は版を上げ、旧版を `add_legacy_decoder` で残す（§9.1）。
     fn id(&self) -> &'static str;
     fn tier(&self) -> Tier;
+    /// 同じ識別子なら、どの環境でも同じ値を読むか。既定は固定の段なら真（OS の機能・外部のツールは偽）。
+    /// 固定の段でも、中で OS の libm を使うもの（SVG）は偽にする。
+    fn reproducible(&self) -> bool {
+        self.tier() == Tier::Pinned
+    }
     /// この形式を読めるか。
     fn can_decode(&self, format: &str) -> bool;
     /// ヘッダだけ読んで形を返す（描く前の上限の判断に使う）。扱えない変種は、ここか `decode` で `Unsupported` を返す
@@ -103,8 +119,8 @@ pub trait Encoder: Send + Sync {
     fn can_encode(&self, format: &str, shape: &Shape) -> bool;
     /// 書き出しの設定の記述（UI と検証）。
     fn options(&self, format: &str) -> ParamSchema;
-    /// 保存できるメタデータ（失うものを先に知らせる）。
-    fn caps(&self, format: &str) -> MetaCaps;
+    /// この設定で実際に保存できるもの（失うものを先に知らせる。§6）。形式の表の能力ではなく、このエンコーダの能力。
+    fn caps(&self, format: &str, opts: &serde_json::Value) -> MetaCaps;
     /// 書く。`out` に書き、書いたバイト数を返す。
     fn encode(
         &self,
@@ -144,6 +160,13 @@ pub fn contain<T>(
     }
 }
 
+/// 固定の段のコーデックの設定。
+#[derive(Clone, Default)]
+pub struct PinnedOptions {
+    /// SVG の文字を描くフォント（kura-mac が OS のフォントを読んで渡す）。ないときは文字を含む SVG を読まない。
+    pub svg_fonts: Option<Arc<resvg::usvg::fontdb::Database>>,
+}
+
 /// 形式ごとに、段の順に試すコーデックの組。
 #[derive(Clone, Default)]
 pub struct CodecSet {
@@ -154,20 +177,53 @@ pub struct CodecSet {
 }
 
 impl CodecSet {
-    /// Kura のバイナリに入る Rust のコーデックだけの組。
+    /// Kura のバイナリに入る Rust のコーデックだけの組（既定の設定）。
     pub fn pinned() -> Self {
+        Self::pinned_with(&PinnedOptions::default())
+    }
+
+    /// 固定の段のコーデックを、設定（SVG の文字のフォントなど）を付けて組む。kura-mac・kura-core はここから組み、
+    /// Platform・External のものを `add_decoder`・`add_encoder` で足す。
+    pub fn pinned_with(opts: &PinnedOptions) -> Self {
         let png: Arc<png::PngCodec> = Arc::new(png::PngCodec);
+        let jpeg: Arc<jpeg::JpegCodec> = Arc::new(jpeg::JpegCodec);
+        let gif: Arc<gif::GifCodec> = Arc::new(gif::GifCodec);
+        let webp: Arc<webp::WebpCodec> = Arc::new(webp::WebpCodec);
         let wav: Arc<wav::WavCodec> = Arc::new(wav::WavCodec);
+        let svg = match &opts.svg_fonts {
+            Some(fonts) => svg::SvgCodec::with_fonts(fonts.clone()),
+            None => svg::SvgCodec::default(),
+        };
         Self {
-            decoders: vec![png.clone(), wav.clone()],
-            legacy_decoders: Vec::new(),
-            encoders: vec![png, wav],
+            decoders: vec![
+                png.clone(),
+                jpeg.clone(),
+                gif.clone(),
+                webp.clone(),
+                Arc::new(aseprite::AsepriteCodec),
+                Arc::new(psd::PsdCodec),
+                Arc::new(svg),
+                wav.clone(),
+            ],
+            legacy_decoders: png::legacy_decoders(),
+            encoders: vec![png, jpeg, gif, webp, wav],
         }
     }
 
-    /// 旧版のデコーダを足す（読む値を変えた版を上げたとき、前の版を残す。ふつうの読み取りでは選ばない）。
-    pub fn add_legacy_decoder(&mut self, d: Arc<dyn Decoder>) {
+    /// 旧版のデコーダを足す（読む値を変えた版を上げたとき、前の版を残す。ふつうの読み取りでは選ばない）。同じ識別子は断る。
+    pub fn add_legacy_decoder(&mut self, d: Arc<dyn Decoder>) -> Result<(), EngineError> {
+        self.check_new_decoder(d.id())?;
         self.legacy_decoders.push(d);
+        Ok(())
+    }
+
+    fn check_new_decoder(&self, id: &str) -> Result<(), EngineError> {
+        if self.decoder_by_id(id).is_some() {
+            return Err(EngineError::Internal(format!(
+                "同じ識別子のデコーダがあります（{id}）。記録の識別子で読み直すときに選べなくなります"
+            )));
+        }
+        Ok(())
     }
 
     /// 識別子でデコーダを探す（今の版と旧版の両方から）。
@@ -183,22 +239,40 @@ impl CodecSet {
         self.encoders.iter().find(|e| e.id() == id)
     }
 
-    /// デコーダを足す（Platform・External。段の順に並べ直す。同じ段なら足した順）。
-    pub fn add_decoder(&mut self, d: Arc<dyn Decoder>) {
+    /// デコーダを足す（Platform・External。段の順に並べ直す。同じ段なら足した順）。同じ識別子は断る。
+    pub fn add_decoder(&mut self, d: Arc<dyn Decoder>) -> Result<(), EngineError> {
+        self.check_new_decoder(d.id())?;
         self.decoders.push(d);
         self.decoders.sort_by_key(|d| d.tier());
+        Ok(())
     }
 
-    /// エンコーダを足す（段の順に並べ直す）。
-    pub fn add_encoder(&mut self, e: Arc<dyn Encoder>) {
+    /// エンコーダを足す（段の順に並べ直す）。同じ識別子は断る。
+    pub fn add_encoder(&mut self, e: Arc<dyn Encoder>) -> Result<(), EngineError> {
+        if self.encoder_by_id(e.id()).is_some() {
+            return Err(EngineError::Internal(format!(
+                "同じ識別子のエンコーダがあります（{}）",
+                e.id()
+            )));
+        }
         self.encoders.push(e);
         self.encoders.sort_by_key(|e| e.tier());
+        Ok(())
     }
 
     /// この形式を読むデコーダ（段の順）。
     pub fn decoders_for(&self, format: &str) -> Vec<&Arc<dyn Decoder>> {
         self.decoders
             .iter()
+            .filter(|d| d.can_decode(format))
+            .collect()
+    }
+
+    /// この形式を読むデコーダ（今の版の段の順に続けて、旧版も）。ファズと照合で使う。
+    pub fn all_decoders_for(&self, format: &str) -> Vec<&Arc<dyn Decoder>> {
+        self.decoders
+            .iter()
+            .chain(self.legacy_decoders.iter())
             .filter(|d| d.can_decode(format))
             .collect()
     }
@@ -359,6 +433,7 @@ fn decode_one(
         DecodeStamp {
             codec: d.id().to_string(),
             tier: d.tier(),
+            reproducible: d.reproducible(),
             value_digest,
         },
     ))
@@ -511,7 +586,7 @@ mod tests {
             Err(EngineError::Unsupported(_))
         ));
         let mut set = CodecSet::pinned();
-        set.add_decoder(Arc::new(Fake));
+        set.add_decoder(Arc::new(Fake)).unwrap();
         let (_, stamp) = set
             .decode(
                 &mut Cursor::new(adpcm),
@@ -601,9 +676,12 @@ mod tests {
             }
         }
         let mut set = CodecSet::default();
-        set.add_decoder(Arc::new(Picky("pinned-dec/2", Tier::Pinned, false)));
-        set.add_decoder(Arc::new(Picky("platform-dec/1", Tier::Platform, true)));
-        set.add_legacy_decoder(Arc::new(Picky("pinned-dec/1", Tier::Pinned, true)));
+        set.add_decoder(Arc::new(Picky("pinned-dec/2", Tier::Pinned, false)))
+            .unwrap();
+        set.add_decoder(Arc::new(Picky("platform-dec/1", Tier::Platform, true)))
+            .unwrap();
+        set.add_legacy_decoder(Arc::new(Picky("pinned-dec/1", Tier::Pinned, true)))
+            .unwrap();
         let read = |set: &CodecSet, id: Option<&str>| {
             let mut src = Cursor::new(vec![0u8; 4]);
             let opts = DecodeOptions::default();
@@ -631,5 +709,64 @@ mod tests {
         assert!(pinned.decoder_by_id("png-rs-dec/1").is_some());
         assert!(pinned.encoder_by_id("png-rs-enc/1").is_some());
         assert!(pinned.decoder_by_id("png-rs-enc/1").is_none());
+    }
+
+    /// 同じ識別子のコーデックは重ねて登録できない（記録の識別子で読み直すときに選べなくなるため）。
+    #[test]
+    fn duplicate_ids_are_refused() {
+        let mut set = CodecSet::pinned();
+        assert!(set.add_decoder(Arc::new(svg::SvgCodec::default())).is_err());
+        assert!(set.add_legacy_decoder(Arc::new(png::PngDecoderV1)).is_err());
+        assert!(set.add_encoder(Arc::new(png::PngCodec)).is_err());
+        let with = CodecSet::pinned_with(&PinnedOptions {
+            svg_fonts: Some(Arc::new(resvg::usvg::fontdb::Database::new())),
+        });
+        assert_eq!(with.decoders_for("svg").len(), 1);
+    }
+
+    /// エンコーダの caps は、そのエンコーダが書けるものと食い違わない（アニメ・透明）。
+    #[test]
+    fn encoder_caps_match_what_they_write() {
+        use crate::testgen::InputGen;
+        use crate::value::PixelFormat;
+        let set = CodecSet::pinned();
+        let frames = InputGen::NoiseFrames {
+            w: 8,
+            h: 8,
+            fmt: PixelFormat::Rgba8,
+            count: 2,
+            seed: 1,
+        }
+        .generate()
+        .unwrap();
+        let sprite = InputGen::Sprite {
+            w: 8,
+            h: 8,
+            rect: crate::geom::IRect::new(2, 2, 3, 3),
+        }
+        .generate()
+        .unwrap();
+        for format in ["png", "jpeg", "gif", "webp"] {
+            for e in set.encoders.iter().filter(|e| {
+                e.can_encode(format, &sprite.shape()) || e.can_encode(format, &frames.shape())
+            }) {
+                let caps = e.caps(format, &serde_json::json!({}));
+                assert_eq!(
+                    e.can_encode(format, &frames.shape()),
+                    caps.animation,
+                    "{format} {}",
+                    e.id()
+                );
+                let alpha_ok = set
+                    .encode_bytes(
+                        &sprite,
+                        format_by_id(format).map_or("", |f| f.id),
+                        &serde_json::json!({}),
+                        &NoMonitor,
+                    )
+                    .is_ok();
+                assert_eq!(alpha_ok, caps.alpha != AlphaCaps::None, "{format}");
+            }
+        }
     }
 }
