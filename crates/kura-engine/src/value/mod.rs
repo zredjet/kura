@@ -13,7 +13,7 @@ pub use raster::{Raster, TILE};
 use crate::digest::{Digest, Hasher, canonical};
 use crate::error::EngineError;
 use crate::geom::{IPoint, Size};
-use crate::shape::{Dim, Shape, ValueKind};
+use crate::shape::{Dim, Fullness, Shape, ValueKind};
 
 /// 1 枚の画像。
 #[derive(Debug, Clone, PartialEq)]
@@ -232,7 +232,11 @@ impl Value {
                 w: Dim::Exact(u64::from(fr.canvas().w)),
                 h: Dim::Exact(u64::from(fr.canvas().h)),
                 fmt: fr.first().px.format(),
-                full: fr.is_full(),
+                full: if fr.is_full() {
+                    Fullness::Full
+                } else {
+                    Fullness::Trimmed
+                },
             },
             Self::Audio(a) => Shape::Audio {
                 rate: a.rate(),

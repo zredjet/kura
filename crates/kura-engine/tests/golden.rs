@@ -170,13 +170,23 @@ fn goldens_match_and_are_complete() {
                 }
             }
         }
-        // 実装のある版なら、数値の申告と行のターゲットが合っていること
+        // 実装のある版なら、数値の申告と行のターゲットが合っていること、凍結した例がまだあること
         if let Some(imp) = engine
             .registry()
             .all()
             .into_iter()
             .find(|i| i.id() == op && i.version() == *v)
         {
+            let names: Vec<&str> = imp.examples().unwrap().iter().map(|e| e.name).collect();
+            for line in lines {
+                if !names.contains(&line.name.as_str()) {
+                    let _ = writeln!(
+                        failures,
+                        "{op} v{v} {}：凍結した例が実装から消えています（例は消さない）",
+                        line.name
+                    );
+                }
+            }
             let exact = imp.signature().numeric == Numeric::Exact;
             if lines.iter().any(|l| (l.target == "*") != exact) {
                 let _ = writeln!(

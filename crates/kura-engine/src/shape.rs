@@ -54,6 +54,25 @@ impl Dim {
     }
 }
 
+/// フレームの列が、どのフレームもキャンバスいっぱいか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Fullness {
+    /// どのフレームもキャンバスいっぱい（フレームごとに持ち上げられる）。
+    Full,
+    /// トリムしたフレームがある。
+    Trimmed,
+    /// 中身で決まる（推論の段階では分からない）。
+    Unknown,
+}
+
+impl Fullness {
+    /// 実際の値がこの推論と合うか（Unknown はどちらも受け入れる）。
+    pub fn admits(self, actual: Fullness) -> bool {
+        self == Fullness::Unknown || self == actual
+    }
+}
+
 /// 値の形。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
@@ -69,7 +88,7 @@ pub enum Shape {
         w: Dim,
         h: Dim,
         fmt: PixelFormat,
-        full: bool,
+        full: Fullness,
     },
     Audio {
         rate: u32,
@@ -116,7 +135,7 @@ impl Shape {
                 },
             ) => {
                 fmt == af
-                    && full == afull
+                    && full.admits(*afull)
                     && count.admits(ac.max())
                     && w.admits(aw.max())
                     && h.admits(ah.max())
@@ -137,14 +156,14 @@ impl Shape {
         }
     }
 
-    /// フレームの列なら、1 フレームの画像の形（持ち上げに使う）。
+    /// キャンバスいっぱい（か分からない）フレームの列なら、1 フレームの画像の形（持ち上げに使う）。
     pub fn frame_image(&self) -> Option<Shape> {
         match *self {
             Self::Frames {
                 w,
                 h,
                 fmt,
-                full: true,
+                full: Fullness::Full | Fullness::Unknown,
                 ..
             } => Some(Self::Image { w, h, fmt }),
             _ => None,

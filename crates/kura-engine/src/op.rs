@@ -90,7 +90,9 @@ impl ParamSchema {
         for spec in &self.params {
             let Some(v) = raw.get(spec.key) else { continue };
             let bad = match &spec.kind {
-                ParamKind::Int { min, max, .. } => v.as_i64().is_some_and(|n| n < *min || n > *max),
+                ParamKind::Int { min, max, step } => v.as_i64().is_some_and(|n| {
+                    n < *min || n > *max || (*step > 1 && (n - *min) % *step != 0)
+                }),
                 ParamKind::Float { min, max, .. } => v
                     .as_f64()
                     .is_some_and(|n| !n.is_finite() || n < *min || n > *max),
@@ -119,6 +121,44 @@ impl ParamSchema {
                 );
             }
         }
+        issues
+    }
+
+    /// 厳しく確かめる（書き出しの設定など、serde の型を通さない引数に使う）：知らないキー・型の違い・範囲の外。
+    pub fn validate(&self, raw: &serde_json::Value) -> Issues {
+        let mut issues = Issues::none();
+        let Some(map) = raw.as_object() else {
+            issues.push(Issue::error(
+                IssueCode::BadParams,
+                "設定はオブジェクトで書きます",
+            ));
+            return issues;
+        };
+        for key in map.keys() {
+            if !self.params.iter().any(|p| p.key == key) {
+                issues.push(
+                    Issue::error(IssueCode::BadParams, format!("知らない設定です（{key}）"))
+                        .param(key.clone()),
+                );
+            }
+        }
+        for spec in &self.params {
+            let Some(v) = map.get(spec.key) else { continue };
+            let typed = match &spec.kind {
+                ParamKind::Int { .. } => v.is_i64() || v.is_u64(),
+                ParamKind::Float { .. } => v.is_number(),
+                ParamKind::Bool => v.is_boolean(),
+                ParamKind::Enum { .. } => v.is_string(),
+                _ => v.is_object(),
+            };
+            if !typed {
+                issues.push(
+                    Issue::error(IssueCode::BadParams, format!("{} の型が違います", spec.key))
+                        .param(spec.key),
+                );
+            }
+        }
+        issues.extend(self.check_ranges(raw));
         issues
     }
 }
@@ -718,6 +758,55 @@ mod tests {
         assert!(r.add_legacy::<V2>().is_err());
         assert!(Registry::empty().add_current::<Bad>().is_err());
         assert!(crate::ops::registry().is_ok());
+    }
+
+    #[test]
+    fn strict_validation_rejects_unknown_keys_types_and_steps() {
+        let schema = ParamSchema {
+            params: vec![
+                spec(
+                    "bits",
+                    ParamKind::Int {
+                        min: 8,
+                        max: 32,
+                        step: 8,
+                    },
+                    Unit::None,
+                    serde_json::json!(16),
+                ),
+                spec(
+                    "float",
+                    ParamKind::Bool,
+                    Unit::None,
+                    serde_json::json!(false),
+                ),
+                spec(
+                    "mode",
+                    ParamKind::Enum {
+                        values: &["a", "b"],
+                    },
+                    Unit::None,
+                    serde_json::json!("a"),
+                ),
+            ],
+        };
+        assert!(schema.validate(&serde_json::json!({})).is_empty());
+        assert!(
+            schema
+                .validate(&serde_json::json!({ "bits": 24, "float": true, "mode": "b" }))
+                .is_empty()
+        );
+        for bad in [
+            serde_json::json!({ "bits": 12 }),
+            serde_json::json!({ "bits": "24" }),
+            serde_json::json!({ "bits": 24.0 }),
+            serde_json::json!({ "float": "true" }),
+            serde_json::json!({ "mode": "c" }),
+            serde_json::json!({ "mdoe": "a" }),
+            serde_json::json!([1]),
+        ] {
+            assert!(schema.validate(&bad).has_errors(), "{bad}");
+        }
     }
 
     #[test]

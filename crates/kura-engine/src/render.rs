@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::determinism;
-use crate::digest::Digest;
+use crate::digest::{Digest, canonical_json};
 use crate::doc::{self, Graph, InputId, InputRole, NodeId, OutputId, PortRef};
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 use crate::geom::Size;
@@ -19,7 +19,7 @@ use crate::monitor::Monitor;
 use crate::op::{
     AnyParams, ApplyCx, DynOp, InferCx, Inferred, Lift, MetaAccess, Registry, Resolved,
 };
-use crate::shape::{Dim, Shape, ValueKind};
+use crate::shape::{Dim, Fullness, Shape, ValueKind};
 use crate::value::{Frames, Image, Value};
 
 /// 操作エンジン。登録表と上限を持つ。
@@ -181,6 +181,17 @@ impl Engine {
                 Ok(Resolved::Migrated(op, moved)) => (op, moved),
                 Err(issue) => return Err(Issues::one(issue.at(node.id))),
             };
+            // 引数を正規の JSON に往復させてから読む。メモリ上の文書（16.0・-0.0）と、保存して読み直した文書（16・0）で、
+            // 文書のハッシュが同じなら同じ引数になる
+            let raw = canonical_json(&raw)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .ok_or_else(|| {
+                    one(
+                        IssueCode::BadParams,
+                        "引数を正規の形にできません（有限でない数など）",
+                    )
+                })?;
             let params = op.parse(&raw).map_err(at)?;
             let in_shapes: Vec<Shape> = node
                 .inputs
@@ -204,21 +215,33 @@ impl Engine {
                 let mut frame_inputs = in_shapes.clone();
                 frame_inputs[0] = frame;
                 let inner = op.infer(params.as_ref(), &frame_inputs, &cx).map_err(at)?;
-                let (Shape::Image { w, h, fmt }, Shape::Frames { count, .. }) =
-                    (inner.shape, in_shapes[0])
+                let (
+                    Shape::Image { w, h, fmt },
+                    Shape::Frames { count, .. },
+                    Shape::Image { w: fw, h: fh, .. },
+                ) = (inner.shape, in_shapes[0], frame)
                 else {
                     return Err(one(
                         IssueCode::BadInput,
                         "フレームの列に当てられない操作です",
                     ));
                 };
+                // 出力の大きさが中身で決まる操作（入力は決まっているのに出力が AtMost）は、フレームごとに大きさが変わりうるので持ち上げない
+                let content_dependent = (fw.exact().is_some() && w.exact().is_none())
+                    || (fh.exact().is_some() && h.exact().is_none());
+                if content_dependent {
+                    return Err(one(
+                        IssueCode::BadInput,
+                        "出力の大きさが中身で決まる操作は、フレームの列に当てられません",
+                    ));
+                }
                 Inferred {
                     shape: Shape::Frames {
                         count,
                         w,
                         h,
                         fmt,
-                        full: true,
+                        full: Fullness::Full,
                     },
                     cost: inner.cost.saturating_mul(count.max()),
                     ..inner
@@ -382,6 +405,12 @@ impl Engine {
                     "持ち上げの入力がフレームの列ではありません".into(),
                 ));
             };
+            // 推論で「分からない」だった列は、実行のときにキャンバスいっぱいか確かめる
+            if !frames.is_full() {
+                return Err(bad_input(
+                    "トリムしたフレームの列には、この操作を当てられません",
+                ));
+            }
             let mut out = Vec::with_capacity(frames.frames().len());
             let mut space = None;
             for f in frames.frames() {

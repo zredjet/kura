@@ -64,6 +64,40 @@ pub enum InputGen {
         frames: u64,
         seed: u64,
     },
+    /// 元の作り方の値にメタデータを付ける（コーデックのゴールデンでメタデータのチャンクを凍結する）。
+    WithMeta { base: Box<InputGen>, meta: MetaGen },
+}
+
+/// 付けるメタデータ。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct MetaGen {
+    pub dpi: Option<(u32, u32)>,
+    pub text: Vec<(String, String)>,
+    pub icc: Option<Vec<u8>>,
+    pub loop_range: Option<LoopRange>,
+    pub markers: Vec<(u64, String)>,
+    pub tags: Vec<(String, String)>,
+}
+
+impl MetaGen {
+    fn apply_image(&self, meta: &mut ImageMeta) {
+        meta.dpi = self.dpi.or(meta.dpi);
+        meta.text.extend(self.text.iter().cloned());
+        if let Some(icc) = &self.icc {
+            meta.icc = Some(Arc::new(icc.clone()));
+        }
+    }
+
+    fn apply_audio(&self, meta: &mut AudioMeta) {
+        meta.loop_range = self.loop_range.or(meta.loop_range);
+        meta.markers
+            .extend(self.markers.iter().map(|(pos, name)| crate::value::Marker {
+                pos: *pos,
+                name: name.clone(),
+            }));
+        meta.tags.extend(self.tags.iter().cloned());
+    }
 }
 
 fn palette16() -> Palette {
@@ -106,6 +140,28 @@ fn noise_raster(w: u32, h: u32, fmt: PixelFormat, seed: u64) -> Result<Raster, E
 impl InputGen {
     /// 値を作る。
     pub fn generate(&self) -> Result<Value, EngineError> {
+        // メタデータを付ける作り方は、元の作り方の値に付けて返す
+        if let Self::WithMeta { base, meta } = self {
+            {
+                return Ok(match base.generate()? {
+                    Value::Image(img) => {
+                        let mut img = Arc::unwrap_or_clone(img);
+                        meta.apply_image(&mut img.meta);
+                        Value::Image(Arc::new(img))
+                    }
+                    Value::Frames(fr) => {
+                        let mut fr = Arc::unwrap_or_clone(fr);
+                        meta.apply_image(&mut fr.meta);
+                        Value::Frames(Arc::new(fr))
+                    }
+                    Value::Audio(a) => {
+                        let mut a = Arc::unwrap_or_clone(a);
+                        meta.apply_audio(&mut a.meta);
+                        Value::Audio(Arc::new(a))
+                    }
+                });
+            }
+        }
         match *self {
             Self::Checker { w, h, fmt, cell } => {
                 let bpp = fmt.bytes_per_pixel();
@@ -278,6 +334,8 @@ impl InputGen {
                     AudioMeta::default(),
                 )?)))
             }
+            // 上で扱った
+            Self::WithMeta { .. } => Err(EngineError::Internal("WithMeta は上で扱う".into())),
         }
     }
 }

@@ -462,3 +462,174 @@ fn warnings_and_carried_metadata() {
     };
     assert_eq!(out.meta.tags, a.meta.tags);
 }
+
+/// すべての操作の引数が、知らない項目を拒む（文書の項目を黙って捨てない。ADR-143 (4)）。
+#[test]
+fn every_op_rejects_unknown_param_keys() {
+    each_example(|_, op, ex| {
+        let mut raw = ex.params.clone();
+        if let Some(map) = raw.as_object_mut() {
+            map.insert("unexpectedKey".into(), json!(1));
+        }
+        let issues = op
+            .parse(&raw)
+            .err()
+            .unwrap_or_else(|| panic!("{}：知らない項目を受け付けた", op.id()));
+        assert_eq!(issues.0[0].code, IssueCode::BadParams, "{}", op.id());
+    });
+}
+
+/// 中身の違うフレームの列でも、各フレームに当てた結果と同じになる。
+#[test]
+fn per_frame_lift_matches_on_distinct_frames() {
+    each_example(|engine, op, ex| {
+        if op.signature().lift != Lift::PerFrame {
+            return;
+        }
+        let input = ex.inputs[0].generate().unwrap();
+        let Value::Image(img) = &input else { return };
+        let (w, h, fmt) = (img.px.width(), img.px.height(), img.px.format());
+        let frames = InputGen::NoiseFrames {
+            w,
+            h,
+            fmt,
+            count: 3,
+            seed: 21,
+        }
+        .generate()
+        .unwrap();
+        let Value::Frames(fr) = &frames else { panic!() };
+        let g = graph(op, ex);
+        let Value::Frames(out) = render(engine, &g, &frames, ex).unwrap() else {
+            panic!()
+        };
+        for (i, f) in fr.frames().iter().enumerate() {
+            let single = Value::Image(Arc::new(Image {
+                px: f.px.clone(),
+                meta: ImageMeta::default(),
+            }));
+            let Value::Image(one) = render(engine, &g, &single, ex).unwrap() else {
+                panic!()
+            };
+            assert_eq!(
+                out.frames()[i].px,
+                one.px,
+                "{} {} フレーム {i}",
+                op.id(),
+                ex.name
+            );
+        }
+    });
+}
+
+/// トリムしたフレームの列には持ち上げられない（計画の段階で断る。推論で分からなかったときは実行で断る。ADR-143 (1)）。
+#[test]
+fn lifting_refuses_trimmed_frames() {
+    use kura_engine::geom::{IPoint, Size};
+    use kura_engine::shape::{Dim, Fullness, Shape};
+    use kura_engine::value::Frame;
+    let engine = engine();
+    let px = Raster::filled(2, 2, PixelFormat::Gray8, None, &[9]).unwrap();
+    let trimmed = Value::Frames(Arc::new(
+        Frames::new(
+            vec![Frame {
+                px,
+                offset: IPoint { x: 1, y: 1 },
+                duration_ms: 10,
+            }],
+            Size { w: 4, h: 4 },
+            ImageMeta::default(),
+            0,
+        )
+        .unwrap(),
+    ));
+    let g = single_node_graph("image.flip", 1, json!({ "axis": "horizontal" })).unwrap();
+    let issues = engine
+        .compile(&g, &BTreeMap::from([(InputId(0), trimmed.shape())]))
+        .err()
+        .unwrap();
+    assert_eq!(issues.0[0].code, IssueCode::BadInput);
+    // 推論では「分からない」とした計画に、実際はトリムした列を渡す
+    let unknown = Shape::Frames {
+        count: Dim::Exact(1),
+        w: Dim::Exact(4),
+        h: Dim::Exact(4),
+        fmt: PixelFormat::Gray8,
+        full: Fullness::Unknown,
+    };
+    let plan = engine
+        .compile(&g, &BTreeMap::from([(InputId(0), unknown)]))
+        .unwrap();
+    let r = engine.render(
+        &plan,
+        &BTreeMap::from([(
+            InputId(0),
+            InputValue {
+                value: trimmed,
+                source: Default::default(),
+            },
+        )]),
+        &NoMonitor,
+    );
+    assert!(matches!(r, Err(EngineError::Invalid(_))), "{r:?}");
+}
+
+/// メモリ上の文書（16.0・-0.0）と、保存して読み直した文書で、計画と結果が同じ（文書のハッシュが同じなら同じ引数）。
+#[test]
+fn in_memory_and_reloaded_documents_render_the_same() {
+    let engine = engine();
+    let input = InputGen::Noise {
+        w: 64,
+        h: 64,
+        fmt: PixelFormat::Rgba8,
+        seed: 3,
+    }
+    .generate()
+    .unwrap();
+    let mut g = Graph::new_single();
+    g.push_linear(
+        "image.crop",
+        1,
+        json!({ "rect": { "x": 16.0, "y": 16, "w": 32.0, "h": 32 } }),
+        0,
+    )
+    .unwrap();
+    let reloaded = engine.load(&g.to_canonical_json().unwrap()).unwrap();
+    assert_eq!(g.digest().unwrap(), reloaded.digest().unwrap());
+    let a = kura_engine::testing::render_with(
+        &engine,
+        &g,
+        input.clone(),
+        Default::default(),
+        &NoMonitor,
+    )
+    .unwrap();
+    let b = kura_engine::testing::render_with(
+        &engine,
+        &reloaded,
+        input,
+        Default::default(),
+        &NoMonitor,
+    )
+    .unwrap();
+    assert_eq!(a, b);
+    let snd = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 1,
+        frames: 100,
+        seed: 3,
+    }
+    .generate()
+    .unwrap();
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -0.0 }), 0)
+        .unwrap();
+    let reloaded = engine.load(&g.to_canonical_json().unwrap()).unwrap();
+    let a =
+        kura_engine::testing::render_with(&engine, &g, snd.clone(), Default::default(), &NoMonitor)
+            .unwrap();
+    let b =
+        kura_engine::testing::render_with(&engine, &reloaded, snd, Default::default(), &NoMonitor)
+            .unwrap();
+    assert_eq!(a.digest().unwrap(), b.digest().unwrap());
+}

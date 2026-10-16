@@ -19,6 +19,12 @@ pub struct Limits {
     pub max_channels: u64,
     /// 文書のノードの数。
     pub max_nodes: u64,
+    /// 音声のサンプルレート（Hz）。
+    pub max_sample_rate: u32,
+    /// 音声のマーカーの数（ファイルから読むとき）。
+    pub max_markers: u64,
+    /// メタデータ（ICC・テキスト・名前など）として読むバイト数の合計。
+    pub max_meta_bytes: u64,
 }
 
 impl Default for Limits {
@@ -32,6 +38,9 @@ impl Default for Limits {
             max_audio_frames: 48_000 * 60 * 60 * 3,
             max_channels: 32,
             max_nodes: 10_000,
+            max_sample_rate: 768_000,
+            max_markers: 10_000,
+            max_meta_bytes: 16 << 20,
         }
     }
 }
@@ -71,8 +80,16 @@ impl Limits {
                 Ok(())
             }
             Shape::Audio {
-                channels, frames, ..
+                rate,
+                channels,
+                frames,
             } => {
+                if *rate > self.max_sample_rate {
+                    return Err(format!(
+                        "サンプルレートが {} を超えます（{rate}）",
+                        self.max_sample_rate
+                    ));
+                }
                 let frames = frames.max();
                 if u64::from(*channels) > self.max_channels {
                     return Err(format!(
@@ -128,5 +145,11 @@ mod tests {
             frames: Dim::Exact(u64::MAX),
         };
         assert!(limits.check(&long).is_err());
+        let fast = Shape::Audio {
+            rate: 1_000_000,
+            channels: 1,
+            frames: Dim::Exact(1),
+        };
+        assert!(limits.check(&fast).is_err());
     }
 }

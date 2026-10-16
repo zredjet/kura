@@ -12,10 +12,12 @@ repository.workspace = true
 # - blake3：すべてのダイジェスト
 # - rand_chacha：乱数（ChaCha8）。鍵は determinism::key_from_seed で自前に作るので rand_core の実装には頼らない
 # - libm：超越関数（ワークスペースで固定）
+# - png：PNG の読み書き（R2 は Cargo.lock の fdeflate・flate2・miniz_oxide の版にも依存する。コーデックのゴールデンで見張る）
 # serde_json は固定しない：正規の JSON は自前で書き（digest.rs）、読み込みは float_roundtrip で正しく丸めるので、結果は版によらない。
 [dependencies]
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 libm.workspace = true
+png = "=0.18.1"
 rand_chacha = "=0.10.0"
 rayon.workspace = true
 serde.workspace = true
@@ -23,6 +25,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+blake3 = { version = "=1.8.7", features = ["rayon"] }
 proptest.workspace = true
 
 [lints]

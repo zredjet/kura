@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod codec;
 pub mod determinism;
 pub mod digest;
 pub mod doc;
@@ -19,6 +20,7 @@ pub mod op;
 pub mod ops;
 pub mod render;
 pub mod shape;
+pub mod testfiles;
 pub mod testgen;
 pub mod testing;
 pub mod value;
