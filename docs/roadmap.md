@@ -173,7 +173,7 @@
 
 - [x] 段 1 骨組みと決定性の土台（検証で直したこと ADR-143）：クレート（lints・`forbid(unsafe_code)`・clippy.toml の禁止の一覧）、math・determinism・digest、値（CoW のタイル・音声のブロック）、Shape・Meta・SpaceMap・TimeMap、Graph・compile・render、EngineError・Monitor・Limits、Op・ParamSchema・`register_ops!`、操作 3 つ（image.crop・image.flip・audio.gain）、適合テスト、ゴールデン（追記の検査）、性質テスト、ランダムな文書のテスト、GitHub Actions の CI（ADR-142）
 - [x] 段 2 最初の縦の通し（検証で直したこと ADR-144）：Decoder・Encoder・Tier・CodecSet・形式の表、PNG（png）と WAV（自作）、デコードのダイジェスト、`kura-devtools edit render / shape`
-- [ ] 段 3 版と作り直しの契約：legacy・migrate・スキーマの移行、作り直しの見本集、`kura-devtools edit golden`（E1〜E8）
+- [x] 段 3 版と作り直しの契約（検証で直したこと ADR-145）：legacy・retired・migrate・スキーマの移行（1 段ずつの表）・全体の規則の版（`rules`）、継ぎ足し（compose）、作り直しの見本集（goldens-replay）、コーデックの読み書きの識別子と旧版のデコーダ、試験用の操作での E3・E5〜E7（ゴールデンの追記は `KURA_BLESS=1`）
 - [ ] 段 4 画像のコーデック：JPEG・GIF（減色は自作）・WebP（可逆）・aseprite（自作）・PSD の合成（自作）・SVG、EXIF と ICC、上限と展開爆弾、ファズの対象
 - [ ] 段 5 画像の操作と描画：トリム・キャンバス・リサイズ（自前の重み）・回転と反転・変換（量子化・ディザ）・スプライトの分割と結合・パレット・メタの設定・`paint.actions`・スポイト、TS と共有するベクタ（E9〜E15・E21〜E23）
 - [ ] 段 6 音声の読み書きと操作：symphonia でのデコード、WAV・AIFF（自作）、FLAC（flacenc）、タグ（lofty）、トリム・フェード・ゲイン・正規化（自前の BS.1770）・SRC（自前）・モノラル化・ループ点・ディザ（E16〜E20）
