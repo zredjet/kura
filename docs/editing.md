@@ -199,7 +199,7 @@ pub enum TimeMap {
 | ライブラリの情報（タグ・評価など） | 値には入れない。読むのは明示の操作か、結び付けられた引数（M14）だけ。読んだ値は版の記録に残す |
 
 - 座標の計算はすべてあふれを確かめ、あふれたものは「範囲の外」として落とす（落ちない）。引数の座標は ±2^31 まで（`geom::COORD_LIMIT`。読み込みで確かめる）。
-- 書き出し先で失うものは、エンコーダの `MetaCaps` と照らして、保存する前に一覧で出す（例：「jpg ではアルファが失われます」「mp3 ではループ点を保存できません」）。
+- 書き出し先で失うものは、エンコーダの `MetaCaps` と照らして、保存する前に一覧で出す（例：「jpg ではアルファが失われます」「mp3 ではループ点を保存できません」）。`MetaCaps` は、可逆か（`lossless`：ほかの項目の範囲の中の値ならそのまま戻るか）・透明（`alpha`：`None`・`Binary`（GIF のように 0 か 255）・`Full`）・パレット・色の数の上限（`max_colors`：GIF は 256。超えると減色）・16 ビット・ICC・EXIF・DPI・テキスト・アニメ・ループ点・マーカー・タグを持つ。形式の表の `caps` は形式として保存できるもの、エンコーダの `caps(format, options)` はそのエンコーダがその設定で実際に書けるもの（例：固定の WebP のエンコーダはアニメを書けない）で、事前の警告はエンコーダのほうを見る。
 - ループ点の入れ物：WAV は `smpl`（と `cue `）、AIFF は `MARK` と `INST`、Ogg・FLAC は `LOOPSTART`・`LOOPLENGTH` のコメント。
 
 ## 7. 操作
@@ -289,7 +289,7 @@ register_ops! {
 3. 乱数は ChaCha8 だけ。種は `determinism::seed(node.seed, 元のハッシュ, 用途)`（kura-core の `splitmix64`・`fnv1a64` と同じ値）で作り、鍵は `key_from_seed`（splitmix64 で 32 バイトに広げる。rand_core の `seed_from_u64`・`from_rng` は禁止）。乱数の流れは**絶対位置**で決める（`rng_at`：画像は行、音声はチャンネルを流れにして、列の中の位置へシークする）。タイル・ブロック・フレームの番号を流れに使わない。アニメのフレームはどれも同じ乱数になる（ディザのちらつきを防ぐ）。種がノード ID・画面の操作の順・一括の並びに依存しないので、エディタと一括で同じになる（E4・E5）。
 4. 出力に効く場所で `HashMap`・`HashSet`・`RandomState`・`DefaultHasher` を使わない（`BTreeMap` か並べた `Vec`）。
 5. 描画の中で時刻・環境変数・引数（`env::var*`・`vars*`・`args*`）を読まない。`#![forbid(unsafe_code)]`。
-6. 結果に効く依存は Cargo.toml で `=` で版を固定する（libm・blake3・rand_chacha）。上げるのは、ゴールデンが通るときだけ。serde_json は固定しない（正規の JSON は自前で書き、読み込みは `float_roundtrip` で正しく丸めるので、結果は版によらない）。
+6. 結果に効く依存は Cargo.toml で `=` で版を固定する（libm・blake3・rand_chacha、コーデックの png・zune-jpeg・jpeg-encoder・gif・image-webp・resvg・miniz_oxide）。上げるのは、ゴールデンが通るときだけ。SIMD の経路がターゲットで値を変えうる依存は、SIMD の feature を外す（zune-jpeg の neon・x86、jpeg-encoder の simd）。ほかの依存（dev 依存を含む）がついでに有効にしていないかを `scripts/check-engine-features.sh` が確かめ、CI でも回す。serde_json は固定しない（正規の JSON は自前で書き、読み込みは `float_roundtrip` で正しく丸めるので、結果は版によらない）。
 
 ### 8.3 数値計算は自前で書く
 
@@ -318,7 +318,7 @@ register_ops! {
 
 ### 8.5 ゴールデン
 
-- `crates/kura-engine/goldens/<操作>/v<版>.jsonl` に、1 行に 1 つ、正規の JSON で `{"digest","inputs","name","params","rules","target"}` を並べる（`rules` は描いたときの全体の規則の版。1 のときは書かない）。ファイル名は `v<版>.jsonl` ちょうど（`v01` などの別名は失敗）。例の引数と入力の作り方（`testgen`。市松模様、乱数の画素、スプライトシート、乱数の音声など）も凍結するので、実装を消して移行した版（E7）や旧版（E6）も、今の登録表で解決して描き、凍結した値と照らす。バイナリのフィクスチャは原則として置かない。
+- `crates/kura-engine/goldens/<操作>/v<版>.jsonl` に、1 行に 1 つ、正規の JSON で `{"digest","inputs","name","params","rules","target"}` を並べる（`rules` は描いたときの全体の規則の版。1 のときは書かない）。ファイル名は `v<版>.jsonl` ちょうど（`v01` などの別名は失敗）。例の引数と入力の作り方（`testgen`。市松模様、乱数の画素、スプライトシート、乱数の音声など）も凍結するので、実装を消して移行した版（E7）や旧版（E6）も、今の登録表で解決して描き、凍結した値と照らす。バイナリのフィクスチャは原則として置かない（例外は下の「フィクスチャ」）。
 - `target` は、整数だけの操作（`Numeric::Exact`）は `*`（すべてのターゲットで同じ値）、浮動小数を使う操作は `aarch64-macos` など。浮動小数の操作の行は主なターゲット（aarch64-macos）にだけ必須で、ほかのターゲットでは、あれば照らす。数値の申告と行のターゲットが食い違えば失敗にする（申告を変えて照合を逃れられないように）。
 - **ゴールデンは追記だけ**。既存の値を書き換えたら、その変更は通さない（マイグレーションと同じ扱い。CLAUDE.md の「やってはいけないこと」）。`scripts/check-goldens-append-only.sh` が基準のコミットからの差分で消えた・変わった行を見つけ、CI でも回す。
 - 足りない行は `KURA_BLESS=1 cargo test -p kura-engine --test golden` で追記できる（既存の行は変えない。すべての操作を照らし終えてから、どこにも食い違いがないときだけ追記する）。例を消す・変える、同じ例・ターゲット・規則の行が 2 つある、今の登録表で描けない版のファイルがある、のどれも失敗にする（例は変えずに、新しい名前の例を足す）。
@@ -328,13 +328,15 @@ register_ops! {
 - **コーデックのゴールデン**（`tests/codec_golden.rs`）：`goldens-codecs/<コーデックの ID（/ は @）>.jsonl`。ID は読み取り（`-dec`）と書き出し（`-enc`）で別にする（片方の版上げで、もう片方の照合が外れないように）。
   - エンコーダ（R2）`png-rs-enc@1.jsonl`：書いたバイト列のダイジェスト（`file`）と、それを読み直したデコーダの ID（`decoder`）・値のダイジェスト（`value`）。読み直しは、記録したデコーダ（旧版を含む）で照らす。バイト列が変わったら、エンコーダの約束の版を上げる。今ないエンコーダのファイルは照らさない（版を上げた旧版）。依存のクレート（png・fdeflate・flate2・miniz_oxide など）を上げてバイト列が変わったときも、ここで気づく。
   - デコーダ（R1 のうちデコーダだけの経路）`png-rs-dec@1.jsonl`：下の層で組んだファイル（`testfiles::FileGen`：1/2/4 ビット・tRNS・インターレース・64 ビットの浮動小数・拡張形式・他のツールのメタデータ・大きさの分からない data など）を読んだ値のダイジェスト。凍結した行は、その ID のデコーダ（今の版か旧版）で読んで照らし、その ID のデコーダがなければ失敗にする。
-  - どちらも追記だけの検査の対象。
+  - どちらも追記だけの検査の対象。再現を約束しないデコーダ（`reproducible()` が偽。SVG）は、デコーダのゴールデンに入れない。
+- **フィクスチャ**：自前のエンコーダでは作れない形（非可逆の WebP、libjpeg のプログレッシブ、他のツールの PSD など）は、他のツールで作った小さなファイルを `crates/kura-engine/fixtures/` に置く（作り方・道具の版は fixtures/README.md）。`tests/fixtures.rs` が他の実装の読み取り（sips・dwebp・djpeg・ImageMagick の PNG）と照らし、`FileGen::Fixture` でデコーダのゴールデンにも入れる。フィクスチャは消す・変えるのを認めない（追記だけの検査が見る）。
 
 ### 8.6 ダイジェストと作り直しの確認
 
 - 値のダイジェスト（`Value::digest`。凍結する）：BLAKE3 に、ドメイン（長さ u64 ＋文字列）に続けて次を書く。数はすべて固定の幅のリトルエンディアン、可変長のものは長さ（u64）を前に付ける。
-  - 画像 `kura-img-v1`：幅 u32 ‖ 高さ u32 ‖ 形式の番号 u8 ‖ パレット（あれば 1 ‖ 色の数 u32 ‖ RGBA の並び、なければ 0）‖ 行を上から詰めた画素 ‖ 正規の JSON のメタデータ（長さ付き）‖ ICC（あれば 1 ‖ 長さ付きのバイト列、なければ 0）。
-  - フレームの列 `kura-frames-v1`：フレームの数 u32 ‖ 繰り返し u32 ‖ キャンバスの幅・高さ u32 ‖ 各フレーム（表示時間 u32 ‖ 位置 x・y i64 ‖ 画像と同じ画素の部分）‖ メタデータ ‖ ICC。
+  - 画像 `kura-img-v1`：幅 u32 ‖ 高さ u32 ‖ 形式の番号 u8 ‖ パレット（あれば 1 ‖ 色の数 u32 ‖ RGBA の並び、なければ 0）‖ 行を上から詰めた画素 ‖ 正規の JSON のメタデータ（長さ付き）‖ ICC（あれば 1 ‖ 長さ付きのバイト列、なければ 0）‖ 拡張。
+  - 拡張は、あるものだけを番号の順に（番号 u8 ‖ 長さ付きのバイト列）書く。ないときは何も書かないので、拡張を足す前の値のダイジェストは変わらない。番号 1 は EXIF。メタデータの JSON の項目を足すときも、空なら書かない（`#[serde(skip_serializing_if)]`）ようにして、前の値のダイジェストを変えない（例：アニメのタグ `tags`）。
+  - フレームの列 `kura-frames-v1`：フレームの数 u32 ‖ 繰り返し u32 ‖ キャンバスの幅・高さ u32 ‖ 各フレーム（表示時間 u32 ‖ 位置 x・y i64 ‖ 画像と同じ画素の部分）‖ メタデータ ‖ ICC ‖ 拡張。
   - 音声 `kura-pcm-v1`：レート u32 ‖ チャンネル数 u32 ‖ フレーム数 u64 ‖ 各チャンネルの f32 のビット列（NaN は 0x7fc00000 にそろえる。-0.0 と +0.0 はそろえず、別の値として扱う）‖ 正規の JSON のメタデータ（長さ付き）。
   - 画素の並び・ダイジェストはタイルの分け方によらない。式は `value::tests::digest_formula_is_frozen` で凍結している。
 - 版ごとに、値のダイジェスト・元のデコードのダイジェスト・使ったコーデックの識別子を記録する。
@@ -350,8 +352,9 @@ register_ops! {
 ```rust
 pub enum Tier { Pinned, Platform, External }
 pub trait Decoder: Send + Sync {
-    fn id(&self) -> &'static str;   // "png-rs-dec/1"（約束の版を含む。エンコーダは "png-rs-enc/1"）
+    fn id(&self) -> &'static str;   // "png-rs-dec/2"（約束の版を含む。エンコーダは "png-rs-enc/1"）
     fn tier(&self) -> Tier;
+    fn reproducible(&self) -> bool { self.tier() == Tier::Pinned }   // どの環境でも同じ値を読むか（偽ならアンカー。§9.4）
     fn can_decode(&self, format: &str) -> bool;
     fn shape(&self, src: &mut dyn ReadSeek, format: &str, o: &DecodeOptions, limits: &Limits) -> Result<Shape, EngineError>;  // ヘッダだけ
     fn decode(&self, src: &mut dyn ReadSeek, format: &str, o: &DecodeOptions, limits: &Limits, mon: &dyn Monitor) -> Result<Value, EngineError>;
@@ -361,15 +364,17 @@ pub trait Encoder: Send + Sync {
     fn tier(&self) -> Tier;
     fn can_encode(&self, format: &str, s: &Shape) -> bool;
     fn options(&self, format: &str) -> ParamSchema;
-    fn caps(&self, format: &str) -> MetaCaps;   // 保存できるメタデータ
+    fn caps(&self, format: &str, o: &serde_json::Value) -> MetaCaps;   // この設定で実際に保存できるもの（§6）
     fn encode(&self, v: &Value, format: &str, o: &serde_json::Value, out: &mut dyn Write, mon: &dyn Monitor) -> Result<u64, EngineError>;
 }
 ```
 
-- `CodecSet` が形式ごとに `Pinned → Platform → External` の順に試し、扱えないと答えた（`shape` か `decode` が `Unsupported`）ものは次の段へ回し、実際に読んだものを記録する（`MediaBackend` の `ChainBackend` と同じ考え方。例：固定の WAV のデコーダが扱わない IMA ADPCM は macOS に回す）。書き出しの設定は、正規の JSON に直してからエンコーダの記述（`options()`）で厳しく確かめる（知らないキー・型の違い・範囲の外はエラー。黙って既定に落とさない）。確かめた設定は `EncodedStamp.options` に残す。読むときは、ヘッダの形を上限で確かめてから中身を読み、中身の形がヘッダと合うかも確かめる。読み取りの記録（`DecodeStamp`：コーデック・段・値のダイジェスト）と書き出しの記録（`EncodedStamp`：コーデック・段・形式・バイト数・ファイルのダイジェスト）を版の記録に使う。第三者のコーデックの呼び出しは `codec::contain` で panic を受け止める。
+- `CodecSet` が形式ごとに `Pinned → Platform → External` の順に試し、扱えないと答えた（`shape` か `decode` が `Unsupported`）ものは次の段へ回し、実際に読んだものを記録する（`MediaBackend` の `ChainBackend` と同じ考え方。例：固定の WAV のデコーダが扱わない IMA ADPCM は macOS に回す）。書き出しの設定は、正規の JSON に直してからエンコーダの記述（`options()`）で厳しく確かめる（知らないキー・型の違い・範囲の外はエラー。黙って既定に落とさない）。確かめた設定は `EncodedStamp.options` に残す。読むときは、ヘッダの形を上限で確かめてから中身を読み、中身の形がヘッダと合うかも確かめる。読み取りの記録（`DecodeStamp`：コーデック・段・再現できるか・値のダイジェスト）と書き出しの記録（`EncodedStamp`：コーデック・段・形式・バイト数・ファイルのダイジェスト）を版の記録に使う。第三者のコーデックの呼び出しは `codec::contain` で panic を受け止める。
 - 読む値を変えたデコーダの旧版は `CodecSet::add_legacy_decoder` で残す。ふつうの読み取りでは選ばず、作り直しで記録の識別子（`DecodeStamp.codec`）から `decoder_by_id`・`decode_with` で選ぶ。
+- 組み立て：`CodecSet::pinned()`（固定のコーデックと旧版）か `CodecSet::pinned_with(&PinnedOptions { svg_fonts })`（kura-mac が OS のフォントを渡す。渡さなければ文字を含む SVG は `Unsupported`）に、kura-mac・ffmpeg の段を `add_decoder`・`add_encoder` で足す。識別子はデコーダ（旧版を含む）・エンコーダのそれぞれで重ならないこと（重なれば `Err`。記録の識別子から 1 つに決まらなくなるため）。`all_decoders_for(format)` は旧版を含めて、その形式を読めるデコーダを返す（ファズ・照合のため）。
 - WAV のメタデータ（cue・labl・INFO）は、数をマーカーの上限で、大きさを `max_meta_bytes` で抑える。1 項目ごとに文字の長さに 32 バイトを足して予算から引く（空の名前でも数だけで予算を使い切れるように）。cue を先に読んでいれば、cue にない ID の labl は予算を使わずに捨てる。
 - 段 2 で入れたもの：PNG（`png` クレート `=0.18.1`。1/2/4 ビットは 8 ビットへ、tRNS はアルファへ、ICC・pHYs・テキストを運ぶ。圧縮したテキストは読まない）と WAV（自作。PCM 8/16/24/32・浮動小数 32/64・拡張形式、smpl・cue・adtl・INFO）。
+- 段 4 で入れたもの：§9.5。
 - `Platform` は kura-mac が実装して注入する（`MediaBackend` と同じ形）。Swift とのあいだは C の型だけでやり取りし、画素や PCM は Rust が確保したバッファのポインタと長さで受け渡す（ADR-37 の改訂。M10 の段 9）。
 - `External` は ffmpeg（同梱しない・任意）。PCM は標準入出力で流す。引数には `-fflags +bitexact -protocol_whitelist file,pipe` を付ける。
 
@@ -379,13 +384,13 @@ pub trait Encoder: Send + Sync {
 
 | 形式 | items.kind | 読む | 書く |
 |---|---|---|---|
-| PNG（APNG・16 ビット・PNG-8） | image | png | png |
-| JPEG | image | zune-jpeg | jpeg-encoder |
-| GIF | image | gif | gif（減色は自作） |
-| WebP | image | image-webp | image-webp（可逆のみ） |
-| aseprite | image | 自作 | — |
-| PSD | image | 自作（合成済みの画像） | — |
-| SVG | image | resvg・usvg（外部の参照は拒否。テキストを含むものはアンカー） | — |
+| PNG（APNG・16 ビット・PNG-8） | image | png（`png-rs-dec/2`。旧版 `/1`） | png（`png-rs-enc/1`。APNG・eXIf を含む） |
+| JPEG | image | zune-jpeg（`jpeg-zune-dec/1`。CMYK・YCCK は次の段へ） | jpeg-encoder（`jpeg-rs-enc/1`） |
+| GIF | image | gif（`gif-rs-dec/1`） | gif（`gif-rs-enc/1`。減色は自作） |
+| WebP | image | image-webp（`webp-rs-dec/1`。非可逆・可逆・アニメ） | image-webp（`webp-rs-enc/1`。可逆の 1 枚だけ） |
+| aseprite | image | 自作（`aseprite-kura-dec/1`。合成した各フレーム） | — |
+| PSD・PSB | image | 自作（`psd-kura-dec/1`。合成済みの画像。ZIP は次の段へ） | — |
+| SVG | image | resvg・usvg（`svg-resvg-dec/1`。再現は約束しない → アンカー。外部の参照は読まない。`<image>` と、フォントを渡していないときの文字は次の段へ） | — |
 | HEIC・HEIF・AVIF・RAW | image | ImageIO（Platform。アンカー） | — |
 | WAV・AIFF | audio | 自作（RIFF・smpl・cue・LIST・MARK・INST） | 自作 |
 | FLAC | audio | symphonia | flacenc |
@@ -401,15 +406,29 @@ pub trait Encoder: Send + Sync {
 - C のライブラリは同梱しない。C か ffmpeg がないと書けない形式は、エンコーダを Rust で自作する（Ogg Vorbis を最優先。MP3・不可逆 WebP・Opus は必要になった段で。ADR-137）。
 - 音声のタグは lofty で書く。EXIF・ICC は運ぶ。PNG の tIME・MP4 の作成日時など、時刻は書かない（R2 のため）。
 
+- EXIF の向き（Orientation）：JPEG・PNG（eXIf）・WebP は、読むときに向きを画素に当て、運ぶ EXIF の向きを 1 にする（同じ向きを 2 回当てない）。形（`shape`）も向きを当てた大きさを返す。PSD は画素が表示のとおりなので向きは当てず、EXIF の向きだけ 1 にする。
+
 ### 9.3 能力
 
 `capabilities(env) -> Vec<FormatCaps>` が、今の環境で読める・書ける形式と、可逆か・アルファ・ICC・アニメ・ループ点を保存できるか・再現できるか（R2）・選べる設定を返す。macOS の能力は kura-mac が問い合わせ（`kura_codec_caps`）、ffmpeg は `-encoders` を調べる。エディタの「保存の形式」と一括加工の事前チェックはここを見る。
 
 ### 9.4 アンカー
 
-- Platform・External でしか読めない元（HEIC・RAW・AVIF・HE-AAC・Opus、テキストを含む SVG）は、初めて編集するときに、読み取った結果を可逆形式で残す（画像は ICC 付きの PNG、音声は FLAC か f32 の WAV、SVG はテキストをパスにした SVG）。OS の更新で読み取り結果が変わっても、途中の版を作り直せるようにするため（ADR-135）。
+- 再現を約束しないデコーダ（`reproducible()` が偽：Platform・External と、固定の段でも OS の libm を使う SVG）で読んだ元（HEIC・RAW・AVIF・HE-AAC・Opus・SVG など）は、初めて編集するときに、読み取った結果を可逆形式で残す（画像は ICC 付きの PNG、音声は FLAC か f32 の WAV）。OS の更新で読み取り結果が変わっても、途中の版を作り直せるようにするため（ADR-135）。
 - アンカーがあれば、作り直し・エディタはアンカーを元として読む（RAW・HEIC より速い）。
 - アンカーは実ファイルの台帳（M12）に載せ、整合性チェックの対象にする。
+
+### 9.5 段 4 の画像のコーデックの約束
+
+詳しい約束は各コーデックのソースの冒頭（`crates/kura-engine/src/codec/*.rs`）に書き、ここは要点だけ。どれも、形（`shape`）と中身（`decode`）が必ず一致するように、形式やフレームの数を決める判断は画素を展開しない読み取りで先に行う。書いたフレームの列を読み直すと、フレームが 1 つでもフレームの列に戻る（APNG は acTL、GIF は NETSCAPE の拡張が印になる）。
+
+- **PNG**（`png-rs-dec/2`）：acTL と fcTL があれば、フレームが 1 つでもフレームの列（acTL のフレームの数と fcTL の数が違えば壊れたファイル）。キャンバスに fcTL の blend（SOURCE・OVER。OVER は `imaging::composite::over` の整数の式）で重ね、dispose（NONE・BACKGROUND・PREVIOUS）を当てたキャンバスいっぱいのフレームの列にする。インターレースのフレームは、フレームの大きさで Adam7 を展開する。パレットの APNG は、番号のまま重ねられるとき（半透明の色を OVER で重ねない・消すときに透明な色がある）だけ Indexed8。そのとき消した画素は消す色の番号（パレットの RGB でアルファ 0）になり、広げた色の RGB は仕様の「透明な黒」と違うが見えない（Rgba8 の経路と見える画素は同じ）。色・深さ・パレット・tRNS は png クレートが読んだものを使い（奇数長の tRNS・PLTE より前の tRNS などは png クレートに従う）、チャンクの並びは前から順に読む（acTL・fcTL・eXIf のほかは中身を読まずに飛ばす）。eXIf は IDAT より前のものだけで、その大きさはテキスト・ICC と合わせて `max_meta_bytes` に数える。インターレースでない 1 枚の画像は行ごとに読む（作業領域は 1 行と 1 タイル行）。`png-rs-dec/1`（APNG は既定の画像だけ、eXIf を読まない）は旧版として残す。書き出しは、キャンバスいっぱいのフレームの列を APNG（表示時間は 65,535 ms まで ms のまま）、EXIF を eXIf に書く。
+- **JPEG**：zune-jpeg を SIMD なしで使い、どのターゲットでも同じ整数の経路。JFIF の解像度は自前で読む（zune-jpeg は読まない。マーカーを前から順に読む）。プログレッシブは係数を全部持つので、値の 3 倍が上限を超えれば断る。書き出しの設定は `quality`・`chroma`・`progressive`。透明な画素のある画像・16 ビットは書かない（先に背景の合成・8 ビットへの変換）。
+- **GIF**：ブラウザと同じ合成（透明の番号は描かない、Background は透明、Previous は戻す、背景色は使わない）。フレームが 2 つ以上か NETSCAPE の拡張があればフレームの列（繰り返しは、拡張がなければ 1 回、0 なら無限、n なら n + 1 回）。局所パレットがなく大域パレットがあれば Indexed8（消す色が要れば透明な色をパレットの後ろに足す。256 色で足せなければ Rgba8）。書き出しは `alphaThreshold`（既定 128）で 2 値の透明にし、色が収まらなければ自作のメディアンカット（`imaging::quantize`。整数だけ）で減色、フレームの列は 1 つの大域パレット。1 回だけ再生するフレームの列は NETSCAPE の拡張を書かないので、1 フレームで 1 回の列は読み直すと 1 枚の画像になってしまう。そこで書かずに `Unsupported` にする（先に 1 枚の画像にする）。
+- **WebP**：image-webp の合成（四則演算だけ）を、背景を透明にして使う。ICC と EXIF の合計を `max_meta_bytes` で抑える。書き出しは可逆の 1 枚だけ（不可逆・アニメは自作のエンコーダを作る段で。エンコーダの `caps` もアニメを書けないと答える）。
+- **aseprite**：自作。層を下から合成（見えない層・参照層は描かない、ヘッダの印でグループを別に合成、層の不透明度の印、z-index）。ブレンドは `imaging::blend`（Aseprite の `blend_funcs.cpp` の式）で、asefile と 300 個のランダムな絵で一致を確かめている（`tests/aseprite_ref.rs`）。パレットの絵は、すべて通常・不透明度 255 で、パレットの色がどれも不透明（背景の層がないときの透明の番号を除く）なら番号のまま Indexed8、ほかは Rgba8。グレーは RGBA で合成して Rgba8。スライス（キャンバスの座標）・タグ（`ImageMeta.tags`）・ICC を運ぶ。タイルの反転と外部のタイルセットは段 4 では読まない（`Unsupported`）。グループの入れ子は 64 段まで。セルはキャンバスの範囲に切って描き、タイルマップはキャンバスに重なるタイルだけを描く（どちらも 64 行ごとに中止を確かめる）。1 フレームを描くあいだに展開するセル・タイルセットは合計 `max_value_bytes` まで（タイルの爆弾を断る）。フレームをまたいで使い回す展開済みのキャッシュも合計 `max_value_bytes` までで、超える分は持たずに描くたびに展開する。
+- **PSD・PSB**：自作。合成済みの画像だけ（層があって合成済みの画像が本物でないものは `Unsupported`）。ビットマップ・グレー・インデックス・RGB の 8/16 ビット、圧縮なし・RLE。合成済みの画像の ZIP はツールによって流れの分け方が違い、確かめる相手もないので `Unsupported`（次の段へ）。PSB は長さの欄が広がる所（層とマスクの情報の長さは 8 バイト、RLE の行の長さは 4 バイト）を読み分け、どの長さもファイルの残りの長さと照らしてから使う。透明は、層の数が負か Mtrn などがあるときだけ。Photoshop の白の下塗りは、下塗りでしか成り立たない条件がすべての画素で成り立つときだけ戻す（ImageMagick などは下塗りしない）。CMYK・Lab・32 ビットは次の段へ。拡張子は psd・psb。
+- **SVG**：resvg。結果は OS の libm に依存しうるので `reproducible()` は偽（アンカーを作る）。`<image>`（外部のファイル・data: のラスター画像・入れ子の SVG。pattern・mask などの中も）を含むものは `Unsupported`（resvg の raster-images は zune-jpeg の SIMD を有効にするので入れない）。文字は `PinnedOptions.svg_fonts` で渡したフォントだけで描き、渡していなければ `Unsupported`。usvg に渡す前に、ファイルの大きさ（16 MiB）・DTD の実体の展開（64 MiB）・要素の数（2²¹）・`<use>` の展開・marker の頂点ごとの複製（頂点の数 × marker の中の要素の数）を見積もって断る。DTD は引用符・注釈・PI を区別してバイト列のまま読み、パラメタ実体・外部の実体・マークアップや参照を含む実体は断る。入れ子の marker も断る。
 
 ## 10. 描画の道具
 
@@ -510,8 +529,15 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   - ヘッダから大きさを読み、`u64` の `checked_mul` で見積もり、上限と予算で判断してから `try_reserve_exact` で確保する。
   - zlib の展開は期待する大きさ（aseprite の cel なら幅 × 高さ × 画素の大きさちょうど）の上限付きの領域にだけ行う。超えたり余ったりしたら壊れたファイルとして扱う。第三者のデコーダの上限（png の `Limits` など）も予算から設定する。
   - 第三者のデコーダの境界では `catch_unwind` してエラーに変える（自分のコードでは panic を禁じたまま）。
-  - SVG の外部の参照（file・http）は拒否する（NFR-10）。
-  - パーサー（aseprite・PSD・WAV・AIFF・Ogg・文書の読み込み）はファズにかける（`fuzz/` は workspace の外、nightly）。通常の `cargo test` にも、ChaCha8 でランダムな文書と壊れたファイルを作るテストを入れる。
+  - SVG の外部の参照（file・http）は拒否する（NFR-10）。DTD の実体の展開（入れ子を含む）と `<use>` の展開は、usvg に渡す前に見積もって上限で断る。SVG のファイルは 16 MiB まで。
+  - 段 4 の各デコーダの上限：PNG のフレームの数は fcTL を数える段階で、eXIf はテキスト・ICC と合わせて `max_meta_bytes` で、GIF は 1 フレームの作業領域（`max_pixels`）とフレームの数を LZW を展開しない走査で、WebP の ICC と EXIF の合計は `max_meta_bytes` で、aseprite はファイル全体を `max_value_bytes` で、セル・タイルセットの展開をそれぞれの大きさちょうどで、1 フレームを描く作業領域を `max_value_bytes` の予算で、グループの入れ子を 64 段で、PSD は層とマスクの情報・RLE の行の長さ・圧縮なしの画素をファイルの残りの長さと照らして抑える。
+  - 大きな画像：16384² の RGBA（値 1 GiB）を PNG に書いて読み直すテスト（`tests/large.rs`、release で 3.8 秒）のピークのメモリは 3.3 GB（元の値と読んだ値の 2 GiB を含む）。PNG の書き出しは行を詰めた写しを 1 つ作る（値と同じ大きさ。行ごとに書くとバイト列が変わるので、エンコーダの版を上げる段 10 のメモリの予算で扱う）。
+  - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・文書の読み込み。段 6 から AIFF・Ogg など）はファズにかける。
+    - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_document` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
+    - `tests/fuzz_smoke.rs` は同じ口を stable で回す変異のファズ。種（各形式の小さなファイル・フィクスチャ・文書）をバイトの書き換え・挿入・削除・つなぎ合わせで崩す。ふだんの `cargo test` で対象ごとに 150 回（`quick`）、`KURA_FUZZ_SECS=<秒> cargo test --release -p kura-engine --test fuzz_smoke long -- --ignored` で長く回す（`KURA_FUZZ_ONLY=svg,wav` で対象を選べる）。見つけた入力は `target/fuzz-smoke/` に残し、`replay` で流し直す。
+    - どちらも、上限を絞って（`testing::fuzz_limits`）その形式のすべてのデコーダ（旧版を含む）で形と中身を読み、自分のコードの panic（panic の場所が `crates/kura-engine/src/` のもの。`testing::catch_own_panic` が panic のフックで見分ける）・形と中身の食い違い・`Internal` を見つけたものとして扱う。壊れたファイルとしてのエラーと第三者のクレートの panic（`codec::contain` がエラーに変える）は正しい振る舞い。文書は読み込みと計画の作成までを流す。
+    - 段 4 の長い実行（release で対象ごとに 40〜60 秒、合わせて約 2 億回）で、SVG の DTD の走査が多バイト文字の途中で文字列を切る panic を見つけて直した（`multibyte_text_around_the_dtd`）。直したあとの実行では何も見つかっていない。SVG と文書は、変異の多くが最初の検査（UTF-8・JSON）で断られるので回数ほど深くは試せていない。深い所はカバレッジを見る `fuzz/` に任せる。
+    - 通常の `cargo test` にも、ChaCha8 でランダムな文書と壊れたファイルを作るテスト（形式ごとの `broken_files_are_errors` など）を入れる。
 
 ## 14. 保存と版（M12 以降。意味だけを決める。表は data-model.md に各段で書く）
 
