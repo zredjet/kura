@@ -34,6 +34,11 @@ pub fn cos(x: f64) -> f64 {
     libm::cos(x)
 }
 
+/// 正接。
+pub fn tan(x: f64) -> f64 {
+    libm::tan(x)
+}
+
 /// 大きいほう（IEEE 754-2019 の maximumNumber）。NaN は捨ててもう一方を返す。-0 < +0 として扱う
 /// （std の `f64::max` は ±0 のどちらを返すか決まっていないので使わない）。
 pub fn max(a: f64, b: f64) -> f64 {

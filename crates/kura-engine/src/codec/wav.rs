@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use crate::codec::pcm::{self, quantize};
 use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -146,8 +147,13 @@ fn parse(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Header, EngineError>
     let mut labels: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
     let mut cues_seen = false;
     let mut pos = 12u64;
+    let mut chunks = 0usize;
     while pos.saturating_add(8) <= file_len {
-        src.seek(SeekFrom::Start(pos))?;
+        chunks += 1;
+        if chunks > crate::codec::MAX_CHUNKS {
+            return Err(err("チャンクが多すぎます"));
+        }
+        crate::codec::seek_to(src, pos)?;
         let mut head = [0u8; 8];
         read_exact_or(src, &mut head, "チャンクのヘッダ")?;
         let id: [u8; 4] = [head[0], head[1], head[2], head[3]];
@@ -384,30 +390,17 @@ impl Decoder for WavCodec {
     }
 }
 
-/// 1 標本（リトルエンディアン）を -1〜1 の f32 にする。
+/// 1 標本（リトルエンディアン）を -1〜1 の f32 にする（式は `pcm::int_to_f32`。8 ビットは符号なし）。
 fn to_f32(s: &[u8], bits: u16, float: bool) -> f32 {
     match (bits, float) {
-        (8, false) => (f32::from(s[0]) - 128.0) / 128.0,
-        (16, false) => f32::from(i16::from_le_bytes([s[0], s[1]])) / 32_768.0,
-        (24, false) => {
-            let v = i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8;
-            v as f32 / 8_388_608.0
-        }
-        (32, false) => {
-            (f64::from(i32::from_le_bytes([s[0], s[1], s[2], s[3]])) / 2_147_483_648.0) as f32
-        }
+        (8, false) => pcm::int_to_f32(i32::from(s[0]) - 128, 8),
+        (16, false) => pcm::int_to_f32(i32::from(i16::from_le_bytes([s[0], s[1]])), 16),
+        (24, false) => pcm::int_to_f32(i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8, 24),
+        (32, false) => pcm::int_to_f32(i32::from_le_bytes([s[0], s[1], s[2], s[3]]), 32),
         (32, true) => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
         (64, true) => f64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32,
         _ => 0.0,
     }
-}
-
-/// -1〜1 の f32 を整数の標本にする（偶数への丸め、範囲で止める）。
-fn quantize(s: f32, bits: u16) -> i64 {
-    let scale = (1i64 << (bits - 1)) as f64;
-    let v = (f64::from(s) * scale).round_ties_even();
-    let v = if v.is_nan() { 0.0 } else { v };
-    (v as i64).clamp(-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1)
 }
 
 impl Encoder for WavCodec {
@@ -458,43 +451,8 @@ impl Encoder for WavCodec {
                 "WAV には音声だけを書けます".into(),
             ));
         };
-        let source = a.meta.source;
         // float を指定すればそれ、bits だけを指定すれば整数、どちらもなければ元の形式（docs/editing.md §5.3）
-        let float = match (
-            opts.get("float").and_then(serde_json::Value::as_bool),
-            opts.get("bits"),
-        ) {
-            (Some(f), _) => f,
-            (None, Some(_)) => false,
-            (None, None) => source.is_some_and(|s| s.float),
-        };
-        if float
-            && opts
-                .get("bits")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|b| b != 32)
-        {
-            return Err(EngineError::Unsupported(
-                "浮動小数の WAV は 32 ビットだけを書けます".into(),
-            ));
-        }
-        let bits = if float {
-            32
-        } else {
-            let wanted = opts
-                .get("bits")
-                .and_then(serde_json::Value::as_u64)
-                .or_else(|| source.filter(|s| !s.float).map(|s| u64::from(s.bits)))
-                .unwrap_or(16);
-            match wanted {
-                8 | 16 | 24 | 32 => wanted as u16,
-                _ => {
-                    return Err(EngineError::Unsupported(format!(
-                        "{wanted} ビットの WAV は書けません"
-                    )));
-                }
-            }
-        };
+        let (bits, float) = pcm::target(opts, a.meta.source, &[8, 16, 24, 32], true, "WAV")?;
         let channels = u16::try_from(a.channels())
             .map_err(|_| EngineError::Unsupported("チャンネルが多すぎます".into()))?;
         let block_align = u32::from(channels) * u32::from(bits / 8);

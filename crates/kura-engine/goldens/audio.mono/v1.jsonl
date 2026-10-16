@@ -1,0 +1,2 @@
+{"digest":"6e3a73ab55578c77eb84fc7c5c715011654e9319585312cccc58360e13f3e683","inputs":[{"channels":2,"frames":9000,"rate":44100,"seed":51,"type":"audioNoise"}],"name":"stereo-average","params":{},"target":"aarch64-macos"}
+{"digest":"6a64ee687bbcd9b3a0e8d60b9652f5edd234d23e2d1ccb6539ad2400dd56d160","inputs":[{"channels":6,"frames":5000,"rate":48000,"seed":52,"type":"audioNoise"}],"name":"six-channels","params":{},"target":"aarch64-macos"}

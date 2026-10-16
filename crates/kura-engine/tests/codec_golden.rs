@@ -336,6 +336,72 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
             },
         },
     ));
+    // 段 6：AIFF・FLAC（自作の書き出し）
+    let audio_meta6 = MetaGen {
+        loop_range: Some(LoopRange {
+            start: 100,
+            end: 4_500,
+        }),
+        markers: vec![(7, "attack".into()), (4_200, "終わり".into())],
+        tags: vec![
+            ("title".into(), "効果音".into()),
+            ("artist".into(), "kura".into()),
+        ],
+        ..MetaGen::default()
+    };
+    for (name, format, options, channels, frames, seed) in [
+        ("aiff-pcm8", "aiff", json!({ "bits": 8 }), 1, 300, 40),
+        ("aiff-pcm16", "aiff", json!({ "bits": 16 }), 2, 777, 41),
+        ("aiff-pcm24", "aiff", json!({ "bits": 24 }), 3, 500, 42),
+        ("aiff-float32", "aiff", json!({ "float": true }), 2, 400, 43),
+        ("flac-pcm8-mono", "flac", json!({ "bits": 8 }), 1, 1_000, 44),
+        (
+            "flac-pcm16-stereo",
+            "flac",
+            json!({ "bits": 16 }),
+            2,
+            10_000,
+            45,
+        ),
+        (
+            "flac-pcm24-6ch",
+            "flac",
+            json!({ "bits": 24 }),
+            6,
+            5_000,
+            46,
+        ),
+    ] {
+        v.push((
+            name,
+            format,
+            options,
+            InputGen::AudioNoise {
+                rate: 44_100,
+                channels,
+                frames,
+                seed,
+            },
+        ));
+    }
+    // 予測の効く形（正弦波）とメタデータ（ループ点・マーカー・タグ）
+    for (name, format) in [("aiff-meta-sine", "aiff"), ("flac-meta-sine", "flac")] {
+        v.push((
+            name,
+            format,
+            json!({ "bits": 16 }),
+            InputGen::WithMeta {
+                base: Box::new(InputGen::Sine {
+                    rate: 48_000,
+                    channels: 2,
+                    frames: 9_000,
+                    freq: 440,
+                    loop_range: None,
+                }),
+                meta: audio_meta6.clone(),
+            },
+        ));
+    }
     v
 }
 
@@ -466,7 +532,7 @@ fn codec_goldens_match_and_are_complete() {
         };
         assert_eq!(back.kind(), value.kind(), "{name}");
         assert_eq!(size(&back.shape()), size(&value.shape()), "{name}");
-        if matches!(format, "png" | "wav") {
+        if matches!(format, "png" | "wav" | "aiff" | "flac") {
             assert_eq!(back.shape(), value.shape(), "{name}");
         }
         let file = Hasher::new("kura-file-v1")
@@ -1002,6 +1068,18 @@ fn decode_examples() -> Vec<(&'static str, FileGen)> {
         "psd-rgb16.psd",
         "psb-rgb8.psb",
         "psb-rgba8.psb",
+        // 段 6：音声（再現できるデコーダだけ。Vorbis・AAC は値が環境に依存するので凍結しない）
+        "flac-16.flac",
+        "flac-24.flac",
+        "alac-16.m4a",
+        "alac-24.m4a",
+        "aiff-24.aiff",
+        "aifc-f32.aif",
+        "mp3-lame.mp3",
+        "mp3-notag.mp3",
+        "mp3-mpeg2-mono.mp3",
+        "mp3-free.mp3",
+        "mp3-info-frames0.mp3",
     ] {
         let name: &'static str = Box::leak(format!("fixture-{path}").into_boxed_str());
         v.push((name, FileGen::Fixture { path: path.into() }));
@@ -1069,6 +1147,13 @@ fn decoder_goldens_match_and_are_complete() {
             )
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         let key = stamp.codec.clone();
+        if !stamp.reproducible {
+            let _ = writeln!(
+                failures,
+                "{key} {name}：値を再現できないデコーダはゴールデンに入れません"
+            );
+            continue;
+        }
         let line = DecodeLine {
             name: name.into(),
             source,

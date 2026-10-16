@@ -40,6 +40,10 @@ pub enum IssueCode {
     MetadataDropped,
     /// sRGB でない（と見える）色空間の画像を、sRGB とみなして混色した（警告。v1 は色の変換をしない。§5.2）。
     ColorSpaceAssumed,
+    /// ラウドネスを計れない（無音・400 ms より短い）ので、正規化しなかった（警告）。
+    LoudnessUnmeasurable,
+    /// ピークの上限に当たるので、利得を抑えた（警告。目標より小さく仕上がる）。
+    GainLimited,
 }
 
 /// 検証の指摘 1 つ。

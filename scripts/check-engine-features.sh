@@ -4,6 +4,8 @@
 # feature が合わさって解決されるので、パッケージごとに見る。
 # - zune-jpeg の neon・x86・portable_simd（既定の feature に入っている）、jpeg-encoder の simd（SIMD の経路）
 # - flate2 の zlib 系（miniz_oxide より優先されて、PNG の書くバイト列が変わる）、png の zlib-rs
+# - symphonia-core の opt-simd（rustfft。AAC・Vorbis の値が変わる）、symphonia-metadata の id3 系（スタックのあふれ）、
+#   nanomp3 の SIMD（wide）。md-5 は FLAC の MD5 を書くだけで、値はどの実装でも同じなので見張らない
 set -eu
 
 check() {
@@ -23,6 +25,9 @@ for pkg in kura-engine kura-devtools kura-app; do
   bad="$bad$(check "$pkg" jpeg-encoder 'simd')"
   bad="$bad$(check "$pkg" flate2 'zlib|zlib-default|zlib-ng|zlib-ng-compat|zlib-rs|cloudflare_zlib|any_zlib|any_c_zlib')"
   bad="$bad$(check "$pkg" png 'zlib-rs')"
+  bad="$bad$(check "$pkg" symphonia-core 'opt-simd|opt-simd-sse|opt-simd-avx|opt-simd-neon')"
+  bad="$bad$(check "$pkg" symphonia-metadata 'id3v1|id3v2|ape|riff-id3')"
+  bad="$bad$(check "$pkg" nanomp3 'default|wide')"
 done
 if [ -n "$bad" ]; then
   echo "kura-engine の結果を変えうる feature が有効になっています:"

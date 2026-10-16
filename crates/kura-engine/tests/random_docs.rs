@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use kura_engine::doc::{Graph, InputId};
-use kura_engine::op::{ParamKind, ParamSchema};
+use kura_engine::op::{ParamKind, ParamSchema, Unit};
 use kura_engine::render::Engine;
 use kura_engine::testgen::InputGen;
 use kura_engine::value::PixelFormat;
@@ -24,9 +24,23 @@ fn random_params(r: &mut ChaCha8Rng, schema: &ParamSchema) -> J {
     for spec in &schema.params {
         let v = match &spec.kind {
             // ときどき範囲の外も混ぜる
+            // フレームの数は音声の長さのあたりを中心に（ときどき端の値）
+            ParamKind::Int { min, max, .. } if spec.unit == Unit::Samples => match below(r, 10) {
+                0 => json!(*max + 1),
+                1 => J::Null,
+                _ => json!(*min + below(r, 12_000) as i64),
+            },
             ParamKind::Int { min, max, .. } => {
                 json!(*min - 2 + below(r, (*max - *min + 5) as u64) as i64)
             }
+            ParamKind::FrameRange => match below(r, 6) {
+                0 => J::Null,
+                1 => json!({ "start": u64::MAX, "end": 1 }),
+                _ => {
+                    let start = below(r, 8_000);
+                    json!({ "start": start, "end": start + below(r, 8_000) })
+                }
+            },
             ParamKind::Float { min, max, .. } => {
                 json!(*min - 1.0 + (max - min + 2.0) * (below(r, 1_000_001) as f64 / 1_000_000.0))
             }
@@ -203,8 +217,16 @@ fn random_documents_never_panic_and_repeat() {
             continue;
         };
         let mut g = Graph::new_single();
+        let audio = matches!(input, kura_engine::Value::Audio(_));
         for _ in 0..1 + below(&mut r, 4) {
-            let op = &catalog[below(&mut r, catalog.len() as u64) as usize];
+            // 4 回に 3 回は入力の種類（音声か画像か）に合う操作から選ぶ（合わない組み合わせも残す）
+            let mut op = &catalog[below(&mut r, catalog.len() as u64) as usize];
+            for _ in 0..8 {
+                if op.id.starts_with("audio.") == audio || below(&mut r, 4) == 0 {
+                    break;
+                }
+                op = &catalog[below(&mut r, catalog.len() as u64) as usize];
+            }
             let params = random_params(&mut r, &op.schema);
             g.push_linear(op.id, op.version, params, r.next_u64())
                 .unwrap();

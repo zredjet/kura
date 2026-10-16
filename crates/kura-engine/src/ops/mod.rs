@@ -44,6 +44,12 @@ register_ops! {
         meta::set_pivot::SetPivot,
         paint::actions::Actions,
         audio::gain::Gain,
+        audio::trim::Trim,
+        audio::fade::Fade,
+        audio::mono::Mono,
+        audio::set_loop::SetLoop,
+        audio::normalize::Normalize,
+        audio::resample::Resample,
     ],
     legacy: [],
     // なくした操作の最後の版（新しく作れないが、作り直しに使う。§8.4）

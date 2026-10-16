@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::determinism::{AUDIO_BLOCK, block_count, par_blocks};
+use crate::audio::{AudioKernel, copy_from, render_all};
 use crate::error::{EngineError, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::math;
@@ -13,6 +13,7 @@ use crate::op::{
     Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
+use crate::ops::util::audio_of;
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Audio, LoopRange, Value};
@@ -44,6 +45,43 @@ impl OpParams for GainParams {
 
 /// 音量。
 pub struct Gain;
+
+/// 音量の核：標本ごとに `(f64 × 倍率) as f32`（1 標本ごとに独立した計算）。`audio.normalize` も使う。
+pub struct GainKernel {
+    audio: Arc<Audio>,
+    factor: f64,
+}
+
+impl GainKernel {
+    /// `db` だけ音量を変える核（倍率は `math::db_to_gain`）。
+    pub fn new(audio: Arc<Audio>, db: f64) -> Self {
+        Self {
+            audio,
+            factor: math::db_to_gain(db),
+        }
+    }
+}
+
+impl AudioKernel for GainKernel {
+    fn rate(&self) -> u32 {
+        self.audio.rate()
+    }
+
+    fn channels(&self) -> usize {
+        self.audio.channels()
+    }
+
+    fn frames(&self) -> u64 {
+        self.audio.frames() as u64
+    }
+
+    fn render(&self, ch: usize, start: u64, out: &mut [f32]) {
+        copy_from(&self.audio.planes()[ch], start, out);
+        for s in out.iter_mut() {
+            *s = (f64::from(*s) * self.factor) as f32;
+        }
+    }
+}
 
 impl Op for Gain {
     const ID: &'static str = "audio.gain";
@@ -84,35 +122,25 @@ impl Op for Gain {
         inputs: &[&Value],
         cx: &mut ApplyCx<'_>,
     ) -> Result<Applied, EngineError> {
-        let Value::Audio(audio) = inputs[0] else {
-            return Err(EngineError::Internal(
-                "audio.gain の入力が音声ではありません".into(),
-            ));
-        };
+        let audio = audio_of(inputs[0], Self::ID)?;
         cx.check()?;
         if p.db == 0.0 {
             // 何も変えない（同じ実体を返す）
             return Ok(Applied::value(Value::Audio(audio.clone())));
         }
-        let factor = math::db_to_gain(p.db);
-        let mut planes = Vec::with_capacity(audio.channels());
-        for plane in audio.planes() {
-            let blocks = par_blocks(block_count(plane.len(), AUDIO_BLOCK), cx.mon, |b| {
-                let start = b * AUDIO_BLOCK;
-                let end = (start + AUDIO_BLOCK).min(plane.len());
-                // 1 サンプルごとに独立した計算なので、分け方によらず同じ結果になる
-                Ok(plane[start..end]
-                    .iter()
-                    .map(|s| (f64::from(*s) * factor) as f32)
-                    .collect::<Vec<f32>>())
-            })?;
-            planes.push(Arc::new(blocks.concat()));
-        }
-        Ok(Applied::value(Value::Audio(Arc::new(Audio::new(
-            audio.rate(),
-            planes,
-            audio.meta.clone(),
-        )?))))
+        let k = GainKernel::new(audio.clone(), p.db);
+        Ok(Applied::value(render_all(&k, audio.meta.clone(), cx.mon)?))
+    }
+
+    fn audio_kernel(
+        p: &GainParams,
+        inputs: &[&Value],
+        _cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Box<dyn AudioKernel>, EngineError>> {
+        Some(
+            audio_of(inputs[0], Self::ID)
+                .map(|a| Box::new(GainKernel::new(a.clone(), p.db)) as Box<dyn AudioKernel>),
+        )
     }
 
     fn examples() -> Vec<Example<GainParams>> {

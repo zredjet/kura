@@ -13,6 +13,7 @@ use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::audio::AudioKernel;
 use crate::determinism;
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 use crate::limits::Limits;
@@ -55,6 +56,8 @@ pub enum ParamKind {
     Grid,
     /// パレットの色の置き換え（番号と色の組）。
     PaletteEntries,
+    /// 音声の区間（フレーム。`{start, end}`、end は含まない。null で消す）。
+    FrameRange,
 }
 
 /// 引数の単位。
@@ -115,6 +118,18 @@ impl ParamSchema {
                     .as_f64()
                     .is_some_and(|n| !n.is_finite() || n < *min || n > *max),
                 ParamKind::Enum { values } => v.as_str().is_some_and(|s| !values.contains(&s)),
+                // 区間は 0 ≤ start < end ≤ 2^40（後の計算であふれないよう読み込みで断る）
+                ParamKind::FrameRange => {
+                    !v.is_null() && {
+                        let get = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+                        match (get("start"), get("end")) {
+                            (Some(s), Some(e)) => {
+                                s >= e || e > crate::ops::util::MAX_FRAME_PARAM as u64
+                            }
+                            _ => false,
+                        }
+                    }
+                }
                 // 座標は ±2^31 まで（それより大きい値は、後の計算であふれないよう読み込みで断る）
                 ParamKind::Rect | ParamKind::Point => {
                     ["x", "y"].iter().any(|k| {
@@ -351,6 +366,16 @@ pub trait Op: Send + Sync + 'static {
     ) -> Option<Result<Applied, EngineError>> {
         None
     }
+    /// 音声を出す操作の「核」：前計算を 1 度だけして、出力の区間を描く純粋な関数にしたもの（docs/editing.md §5.3）。
+    /// 音声を出す操作は実装し、`apply` もこれを `audio::render_all` で描く。区間ごとに描いても値が同じ（E18）。
+    /// 音声を出さない操作は None。
+    fn audio_kernel(
+        _p: &Self::Params,
+        _inputs: &[&Value],
+        _cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Box<dyn AudioKernel>, EngineError>> {
+        None
+    }
 }
 
 /// 型を消した引数。
@@ -393,6 +418,13 @@ pub trait DynOp: Send + Sync {
         p: &AnyParams,
         cx: &mut ApplyCx<'_>,
     ) -> Option<Result<Applied, EngineError>>;
+    /// 音声の核（`Op::audio_kernel`）。
+    fn audio_kernel(
+        &self,
+        p: &AnyParams,
+        inputs: &[&Value],
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Box<dyn AudioKernel>, EngineError>>;
 }
 
 /// `Op` を `DynOp` にする包み。
@@ -481,6 +513,18 @@ impl<O: Op> DynOp for OpEntry<O> {
             (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
         };
         O::apply_appended(prev, prev_out, p, cx)
+    }
+
+    fn audio_kernel(
+        &self,
+        p: &AnyParams,
+        inputs: &[&Value],
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Box<dyn AudioKernel>, EngineError>> {
+        match self.params(p) {
+            Ok(p) => O::audio_kernel(p, inputs, cx),
+            Err(e) => Some(Err(e)),
+        }
     }
 
     fn examples(&self) -> Result<Vec<DynExample>, EngineError> {

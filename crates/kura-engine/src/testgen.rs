@@ -66,6 +66,12 @@ pub enum InputGen {
         freq: u32,
         loop_range: Option<LoopRange>,
     },
+    /// 区間ごとに大きさの違う 1 チャンネルの正弦波：区間は（フレームの数, dBFS の振幅）。正規化の絶対ゲートをまたぐ形を作る。
+    SineLevels {
+        rate: u32,
+        freq: u32,
+        segments: Vec<(u64, i32)>,
+    },
     /// -1〜1 の乱数の音声。
     AudioNoise {
         rate: u32,
@@ -364,6 +370,31 @@ impl InputGen {
                     ..AudioMeta::default()
                 };
                 Ok(Value::Audio(Arc::new(Audio::new(rate, planes, meta)?)))
+            }
+            Self::SineLevels {
+                rate,
+                freq,
+                ref segments,
+            } => {
+                let step = 2.0 * std::f64::consts::PI * f64::from(freq) / f64::from(rate);
+                let total = segments.iter().map(|s| s.0).sum::<u64>();
+                let mut plane = Vec::new();
+                plane
+                    .try_reserve_exact(usize::try_from(total).unwrap_or(usize::MAX))
+                    .map_err(|_| EngineError::Limit("長すぎます".into()))?;
+                let mut i = 0u64;
+                for &(n, db) in segments {
+                    let amp = math::db_to_gain(f64::from(db));
+                    for _ in 0..n {
+                        plane.push((amp * math::sin(step * i as f64)) as f32);
+                        i += 1;
+                    }
+                }
+                Ok(Value::Audio(Arc::new(Audio::new(
+                    rate,
+                    vec![Arc::new(plane)],
+                    AudioMeta::default(),
+                )?)))
             }
             Self::AudioNoise {
                 rate,

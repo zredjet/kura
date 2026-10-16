@@ -12,7 +12,11 @@ use crate::error::{EngineError, Issue, IssueCode, Issues};
 /// 今の文書のスキーマの版。文書の型（項目）を変えたときに上げ、`SCHEMA_STEPS` に移行を 1 つ足す（§8.4）。
 /// 文書の型は知らない項目を受け付けないので、新しい版の文書を古い版の Kura が黙って別の意味で読むことはない。
 /// - 2：`rules`（全体の規則の版）を足した。1 の文書は `rules: 1` として読む。
-pub const SCHEMA: u32 = 2;
+/// - 3：出力の量子化（`OutputSpec.quantize`。整数への丸めとディザ）を足した。2 の文書は量子化なしとして読む。
+pub const SCHEMA: u32 = 3;
+
+/// 出力の量子化の今の約束の版（`Quantize.v`。式は `audio::quantize`。変えるなら上げ、旧版の式を残す）。
+pub const QUANTIZE_VERSION: u16 = 1;
 
 /// 今の全体の規則の版（メタデータの写し方・丸め・量子化など、どの操作にも効く約束。§8.4）。
 /// 全体の規則を変えたら上げ、古い規則の実装も残す（`render` が文書の `rules` で選ぶ）。
@@ -122,6 +126,30 @@ pub enum Expand {
     PerElement { name: String },
 }
 
+/// ディザの種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Dither {
+    /// 足さない（偶数への丸めだけ）。
+    None,
+    /// ±1 LSB の三角分布の雑音（TPDF）。
+    Tpdf,
+}
+
+/// 出力の量子化（整数への丸めとディザ。docs/editing.md §4.1）。音声の出力だけに付けられる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Quantize {
+    /// 約束の版（`QUANTIZE_VERSION`。知らない版は計画を作るときに断る）。
+    pub v: u16,
+    /// ビット数（8・16・24）。
+    pub bits: u16,
+    pub dither: Dither,
+    /// ディザの乱数の種（作るときに決め、変えない）。
+    #[serde(with = "u64_text")]
+    pub seed: u64,
+}
+
 /// 文書の出力。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -130,6 +158,9 @@ pub struct OutputSpec {
     pub from: PortRef,
     #[serde(default)]
     pub format: FormatChoice,
+    /// 整数への丸めとディザ（音声だけ）。なければ書かない（スキーマ 2 までの文書の正規の形を変えない）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantize: Option<Quantize>,
     #[serde(default)]
     pub expand: Expand,
 }
@@ -164,6 +195,7 @@ impl Graph {
                 id: OutputId(0),
                 from: PortRef::Input { id: InputId(0) },
                 format: FormatChoice::Keep,
+                quantize: None,
                 expand: Expand::One,
             }],
             next_id: 1,
@@ -351,7 +383,7 @@ pub fn load(raw: &[u8]) -> Result<Graph, EngineError> {
 pub type SchemaStep = fn(serde_json::Value) -> Result<serde_json::Value, EngineError>;
 
 /// スキーマの移行の表：`SCHEMA_STEPS[i]` はスキーマ `i + 1` の文書を `i + 2` へ移す。スキーマを上げたら 1 つ足す（消さない）。
-const SCHEMA_STEPS: &[SchemaStep] = &[schema_1_to_2];
+const SCHEMA_STEPS: &[SchemaStep] = &[schema_1_to_2, schema_2_to_3];
 
 /// 1 → 2：`rules` を足す（1 の文書はすべて規則 1 で作った）。
 fn schema_1_to_2(mut value: serde_json::Value) -> Result<serde_json::Value, EngineError> {
@@ -360,6 +392,11 @@ fn schema_1_to_2(mut value: serde_json::Value) -> Result<serde_json::Value, Engi
     {
         map.insert("rules".into(), serde_json::Value::from(1));
     }
+    Ok(value)
+}
+
+/// 2 → 3：形は変わらない（`quantize` がないのは量子化なし）。
+fn schema_2_to_3(value: serde_json::Value) -> Result<serde_json::Value, EngineError> {
     Ok(value)
 }
 
@@ -609,7 +646,11 @@ mod tests {
         let base = sample().to_canonical_json().unwrap();
         let mut v: serde_json::Value = serde_json::from_slice(&base).unwrap();
         assert!(load(&serde_json::to_vec(&v).unwrap()).is_ok());
-        v["outputs"][0]["quantize"] = json!({ "bits": 8 });
+        v["outputs"][0]["quantize"] =
+            json!({ "v": 1, "bits": 16, "dither": "tpdf", "seed": "1", "noise": 1 });
+        assert!(load(&serde_json::to_vec(&v).unwrap()).is_err());
+        let mut v: serde_json::Value = serde_json::from_slice(&base).unwrap();
+        v["outputs"][0]["future"] = json!(1);
         assert!(load(&serde_json::to_vec(&v).unwrap()).is_err());
         let mut v: serde_json::Value = serde_json::from_slice(&base).unwrap();
         v["inputs"][0]["decode"] = json!({ "scale": 2 });

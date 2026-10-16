@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod analysis;
+pub mod audio;
 pub mod codec;
 pub mod determinism;
 pub mod digest;

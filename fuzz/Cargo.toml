@@ -72,6 +72,48 @@ doc = false
 bench = false
 
 [[bin]]
+name = "decode_aiff"
+path = "fuzz_targets/decode_aiff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_flac"
+path = "fuzz_targets/decode_flac.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_mp3"
+path = "fuzz_targets/decode_mp3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_ogg"
+path = "fuzz_targets/decode_ogg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_m4a"
+path = "fuzz_targets/decode_m4a.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_aac"
+path = "fuzz_targets/decode_aac.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "document"
 path = "fuzz_targets/document.rs"
 test = false

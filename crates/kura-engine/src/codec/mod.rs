@@ -4,14 +4,20 @@
 //!   → 外部の ffmpeg（`External`。kura-core が注入）の順に試し、使ったものの識別子を記録する。
 //! - 外から来たファイルを読むので、確保の前に上限で判断し、第三者のデコーダの境界では panic を受け止めてエラーにする。
 
+pub mod aiff;
 pub mod aseprite;
 pub mod exif;
+pub mod flac;
 pub mod formats;
 pub mod gif;
 pub mod jpeg;
+pub mod lossy;
+pub mod mp3;
+pub mod pcm;
 pub mod png;
 pub mod psd;
 pub mod svg;
+pub(crate) mod symph;
 pub mod wav;
 pub mod webp;
 
@@ -38,6 +44,34 @@ use crate::value::Value;
 /// 読める・シークできる入力。
 pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
+
+/// 文字の境目で `max` バイト以下に切り詰める（AIFF・FLAC の書き出しで、タグを読み取りの上限 4,096 バイトにそろえ、
+/// 書いて読み直したものが同じになるようにする）。
+pub(crate) fn clip_text(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// RIFF・IFF のチャンクの数の上限（WAV・AIFF。ふつうのファイルは数十まで。小さなチャンクを並べた走査で止まらないように）。
+pub(crate) const MAX_CHUNKS: usize = 1 << 16;
+
+/// `pos` へ移る。今の位置と同じなら何もせず、違えば `seek_relative`（`BufReader` はバッファの中ならバッファを捨てない）。
+pub(crate) fn seek_to(src: &mut dyn ReadSeek, pos: u64) -> std::io::Result<()> {
+    let cur = src.stream_position()?;
+    if cur == pos {
+        return Ok(());
+    }
+    match i64::try_from(i128::from(pos) - i128::from(cur)) {
+        Ok(d) => src.seek_relative(d),
+        Err(_) => src.seek(std::io::SeekFrom::Start(pos)).map(|_| ()),
+    }
+}
 
 /// コーデックの段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -190,6 +224,8 @@ impl CodecSet {
         let gif: Arc<gif::GifCodec> = Arc::new(gif::GifCodec);
         let webp: Arc<webp::WebpCodec> = Arc::new(webp::WebpCodec);
         let wav: Arc<wav::WavCodec> = Arc::new(wav::WavCodec);
+        let aiff: Arc<aiff::AiffCodec> = Arc::new(aiff::AiffCodec);
+        let flac: Arc<flac::FlacCodec> = Arc::new(flac::FlacCodec);
         let svg = match &opts.svg_fonts {
             Some(fonts) => svg::SvgCodec::with_fonts(fonts.clone()),
             None => svg::SvgCodec::default(),
@@ -204,9 +240,16 @@ impl CodecSet {
                 Arc::new(psd::PsdCodec),
                 Arc::new(svg),
                 wav.clone(),
+                aiff.clone(),
+                flac.clone(),
+                Arc::new(mp3::Mp3Codec),
+                Arc::new(lossy::SymphoniaDecoder::ogg_vorbis()),
+                Arc::new(lossy::SymphoniaDecoder::m4a_alac()),
+                Arc::new(lossy::SymphoniaDecoder::m4a_aac()),
+                Arc::new(lossy::SymphoniaDecoder::adts_aac()),
             ],
             legacy_decoders: png::legacy_decoders(),
-            encoders: vec![png, jpeg, gif, webp, wav],
+            encoders: vec![png, jpeg, gif, webp, wav, aiff, flac],
         }
     }
 

@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 use crate::geom::Size;
 use crate::monitor::Monitor;
-use crate::shape::Dim;
-use crate::value::{Frame, Frames, Grid, Image, Raster, Value};
+use crate::shape::{Dim, Shape};
+use crate::value::{Audio, Frame, Frames, Grid, Image, Raster, Value};
 
 /// 格子の引数（`sprite.split_grid`・`meta.set_grid`）。JSON の形はメタデータの格子と同じだが、型を分けておく
 /// （メタデータの格子に項目を足しても、引数の形と版が変わらないように）。知らない項目は拒む。
@@ -73,6 +73,31 @@ pub fn image_of<'a>(v: &'a Value, op: &str) -> Result<&'a Arc<Image>, EngineErro
         ))),
     }
 }
+
+/// 入力が音声であること（違えば内部の誤り。推論で種類を確かめてあるので、ここには来ない）。
+pub fn audio_of<'a>(v: &'a Value, op: &str) -> Result<&'a Arc<Audio>, EngineError> {
+    match v {
+        Value::Audio(a) => Ok(a),
+        _ => Err(EngineError::Internal(format!(
+            "{op} の入力が音声ではありません"
+        ))),
+    }
+}
+
+/// 音声の形 (レート, チャンネル数, 長さ)。音声でなければ None。
+pub fn audio_shape(s: &Shape) -> Option<(u32, u16, Dim)> {
+    match *s {
+        Shape::Audio {
+            rate,
+            channels,
+            frames,
+        } => Some((rate, channels, frames)),
+        _ => None,
+    }
+}
+
+/// フレームの数の引数の上限（2^40。読み込みで断り、後の計算であふれないようにする）。
+pub const MAX_FRAME_PARAM: i64 = 1 << 40;
 
 /// 決まっている大きさ（どちらかが `AtMost` なら None）。
 pub fn exact_size(w: Dim, h: Dim) -> Option<Size> {

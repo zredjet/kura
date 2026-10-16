@@ -2,7 +2,7 @@
 
 kura-engine の外から来る入力を読むコード（デコーダと文書の読み込み・描画）を、カバレッジを見ながら変異させて試す。
 対象の本体は `kura_engine::testing::fuzz_decode`・`fuzz_document`（自前のコードの panic・形と中身の食い違い・`Internal` を見つける）。
-対象は `fuzz_targets/` のファイル名（`decode_png`・`decode_jpeg`・`decode_gif`・`decode_webp`・`decode_aseprite`・`decode_psd`・`decode_svg`・`decode_wav`・`document`）。
+対象は `fuzz_targets/` のファイル名（`decode_png`・`decode_jpeg`・`decode_gif`・`decode_webp`・`decode_aseprite`・`decode_psd`・`decode_svg`・`decode_wav`・`decode_aiff`・`decode_flac`・`decode_mp3`・`decode_ogg`・`decode_m4a`・`decode_aac`・`document`）。
 
 ## 用意
 

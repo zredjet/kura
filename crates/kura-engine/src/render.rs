@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use crate::determinism;
 use crate::digest::Digest;
-use crate::doc::{self, Graph, InputId, InputRole, NodeId, OutputId, PortRef};
+use crate::doc::{
+    self, Graph, InputId, InputRole, NodeId, OutputId, PortRef, QUANTIZE_VERSION, Quantize,
+};
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 use crate::geom::Size;
 use crate::limits::Limits;
@@ -52,14 +54,14 @@ pub struct Plan {
     rules: u32,
     inputs: BTreeMap<InputId, Shape>,
     nodes: Vec<PlannedNode>,
-    outputs: Vec<(OutputId, PortRef, Shape)>,
+    outputs: Vec<(OutputId, PortRef, Shape, Option<Quantize>)>,
     primary: Option<InputId>,
 }
 
 impl Plan {
     /// 出力の形（描かずに分かる）。
     pub fn output_shapes(&self) -> Vec<(OutputId, Shape)> {
-        self.outputs.iter().map(|(id, _, s)| (*id, *s)).collect()
+        self.outputs.iter().map(|(id, _, s, _)| (*id, *s)).collect()
     }
 
     /// ノードの推論の結果（エディタの表示用）。
@@ -302,11 +304,34 @@ impl Engine {
         let outputs = g
             .outputs
             .iter()
-            .map(|o| lookup(&shapes, &inputs, &o.from).map(|s| (o.id, o.from, s)))
+            .map(|o| lookup(&shapes, &inputs, &o.from).map(|s| (o.id, o.from, s, o.quantize)))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
                 Issues::one(Issue::error(IssueCode::BadGraph, "出力の形が分かりません"))
             })?;
+        // 量子化は音声の出力だけ、知っている版・ビット数だけ
+        for (_, _, shape, q) in &outputs {
+            let Some(q) = q else { continue };
+            let bad = |code, m: &str| Issues::one(Issue::error(code, m));
+            if q.v != QUANTIZE_VERSION {
+                return Err(bad(
+                    IssueCode::UnknownVersion,
+                    "出力の量子化の版を知りません",
+                ));
+            }
+            if !matches!(q.bits, 8 | 16 | 24) {
+                return Err(bad(
+                    IssueCode::OutOfRange,
+                    "出力の量子化のビット数は 8・16・24 です",
+                ));
+            }
+            if !matches!(shape, Shape::Audio { .. }) {
+                return Err(bad(
+                    IssueCode::BadInput,
+                    "量子化できるのは音声の出力だけです",
+                ));
+            }
+        }
         let primary = g
             .inputs
             .iter()
@@ -402,9 +427,12 @@ impl Engine {
         let outputs = plan
             .outputs
             .iter()
-            .map(|(id, from, _)| {
-                let value = lookup(&values, &input_values, from)
+            .map(|(id, from, _, quantize)| {
+                let mut value = lookup(&values, &input_values, from)
                     .ok_or_else(|| EngineError::Internal("出力の値がありません".into()))?;
+                if let (Some(q), Value::Audio(a)) = (quantize, &value) {
+                    value = crate::audio::quantize(a, q, &source, mon)?;
+                }
                 let digest = value.digest()?;
                 Ok(RenderedOutput {
                     id: *id,

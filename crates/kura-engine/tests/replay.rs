@@ -202,6 +202,59 @@ fn examples() -> Vec<(&'static str, bool, Graph, Vec<InputGen>)> {
                 seed: 11,
             }],
         ),
+        // スキーマ 3（出力の量子化 `quantize` を持つ文書）で凍結する見本。段 6 の音声の操作を通す
+        (
+            "schema3-audio-chain-quantize",
+            false,
+            {
+                let mut g = chain(&[
+                    (
+                        "audio.trim",
+                        1,
+                        json!({ "start": 300, "end": 9_000 }),
+                        0,
+                        true,
+                    ),
+                    (
+                        "audio.fade",
+                        1,
+                        json!({ "fadeIn": 500, "fadeOut": 800, "curve": "equalPower" }),
+                        0,
+                        true,
+                    ),
+                    ("audio.resample", 1, json!({ "rate": 48_000 }), 0, true),
+                    (
+                        "audio.normalize",
+                        1,
+                        json!({ "target": -18.0, "peakLimit": -1.0 }),
+                        0,
+                        true,
+                    ),
+                ]);
+                g.outputs[0].quantize = Some(kura_engine::doc::Quantize {
+                    v: 1,
+                    bits: 16,
+                    dither: kura_engine::doc::Dither::Tpdf,
+                    seed: 42,
+                });
+                g
+            },
+            vec![InputGen::WithMeta {
+                base: Box::new(InputGen::AudioNoise {
+                    rate: 44_100,
+                    channels: 2,
+                    frames: 10_000,
+                    seed: 13,
+                }),
+                meta: MetaGen {
+                    loop_range: Some(LoopRange {
+                        start: 1_000,
+                        end: 8_000,
+                    }),
+                    ..MetaGen::default()
+                },
+            }],
+        ),
     ]
 }
 

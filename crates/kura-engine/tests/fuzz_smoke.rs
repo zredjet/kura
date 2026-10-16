@@ -405,6 +405,46 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 encoded("wav", &wav_meta, json!({ "float": true })),
             ],
         ),
+        // 段 6 の音声の読み取り（自作の AIFF・FLAC の書き出しと、他のツールで作ったフィクスチャ）
+        (
+            "aiff",
+            vec![
+                encoded("aiff", &wav_meta, json!({ "bits": 24 })),
+                encoded("aiff", &wav_meta, json!({ "float": true })),
+                fixture("aifc-f32.aif"),
+            ],
+        ),
+        (
+            "flac",
+            vec![
+                encoded("flac", &wav_meta, json!({ "bits": 16 })),
+                encoded("flac", &wav_meta, json!({ "bits": 24 })),
+                fixture("flac-24.flac"),
+            ],
+        ),
+        (
+            "mp3",
+            vec![
+                fixture("mp3-mpeg2-mono.mp3"),
+                fixture("mp3-lame.mp3"),
+                fixture("mp3-free.mp3"),
+                fixture("mp2-layer2.mp3"),
+            ],
+        ),
+        (
+            "ogg",
+            vec![fixture("ogg-vorbis-loop.ogg"), fixture("ogg-opus.ogg")],
+        ),
+        (
+            "m4a",
+            vec![
+                fixture("alac-24.m4a"),
+                fixture("aac-lc-afconvert.m4a"),
+                fixture("aac-lc-ffmpeg.m4a"),
+                fixture("aac-he.m4a"),
+            ],
+        ),
+        ("aac", vec![fixture("aac-lc.aac")]),
         (
             "document",
             vec![
