@@ -59,7 +59,7 @@ src-tauri   コマンドと kura:// の /edit・/peaks（feature "specta" で TS
 
 ```rust
 pub struct Graph {
-    pub schema: u32,               // 文書の型（項目）の版。今は 2（§8.4）
+    pub schema: u32,               // 文書の型（項目）の版。今は 3（§8.4）
     pub rules: u32,                // 作ったときの全体の規則（§6 の写し方・丸めなど）の版。今は 1（§8.4）
     pub inputs: Vec<InputSlot>,
     pub nodes: Vec<Node>,          // 位相順。入力は前のノードだけを指せる（循環しない）
@@ -85,7 +85,7 @@ pub struct OutputSpec {
     pub id: OutputId,
     pub from: PortRef,
     pub format: FormatChoice,      // Keep（元と同じ形式）か To { format, options }
-    pub quantize: Option<Quantize>,// 整数への丸めとディザ。版を持つ
+    pub quantize: Option<Quantize>,// 音声の整数への丸めとディザ（v・bits・dither・seed）。スキーマ 3 から
     pub expand: Expand,            // One か PerElement { name }（例 "{stem}_{index:03}"）
 }
 ```
@@ -93,6 +93,7 @@ pub struct OutputSpec {
 - 線形の操作の列は、どのノードも 1 つ前を入力にする特別な場合。エディタは出力からさかのぼった 1 本の鎖を操作のスタックとして見せ、入力が複数の操作のときだけ別の入力を選ぶ欄を出す。
 - 出力が複数になる操作（スプライトの分割、マーカーでの分割）は、`Frames` や `Clips` の値を 1 つ返す。何個のファイルにするかは `OutputSpec.expand` が決める。口の数が入力によらず決まるので、同じレシピを 100 件に当てても形が崩れない。
 - `DecodeOptions`（SVG のラスタ化の倍率、aseprite を合成で読むかレイヤーで読むか）は出力に効くので、文書に入れる。
+- `Quantize`（段 6。`QUANTIZE_VERSION` = 1）は、音声の出力を書き出す前に整数の格子へ丸める約束：`{ v, bits（8・16・24）, dither（none・tpdf）, seed }`。s = 2^(bits−1)、x = 標本 · s（f64）、TPDF なら x に u1 + u2 − 1 を足し（u は `rng_at(seed', チャンネル, 2·フレーム)` から順に取った 2 つの u32 の (u + 0.5)/2³²、seed' = `determinism::seed(seed, 元のハッシュ, "audio.dither")`）、round_ties_even を [−s, s−1] で止めて q / s にする。WAV・AIFF・FLAC の書き出しの丸めと同じ格子なので、書き出すと q がそのまま書かれる。乱数の流れは絶対位置なので区間の切り方によらない（E18）。知らない版・範囲の外のビット数・音声でない出力は計画を作るときに断る。文書の型の項目なのでスキーマを 3 に上げた（2 → 3 は形を変えない移行）。
 
 ### 4.2 元に対する累積
 
@@ -153,8 +154,10 @@ pub enum Value {
 - planar f32（チャンネルごとの配列）で持つ。並列のブロックは 4,096 フレーム（`determinism::AUDIO_BLOCK`。並列の分け方だけで、結果に効く区切りには使わない。§8.2）。位置は絶対フレーム（`u64`）で表す。
 - int16 / int24 → f32 → 元のビット数の往復は、ちょうど元に戻る（24 ビットは f32 で正確に表せる）。手を加えていない経路の出力はビット一致させる。
 - 操作は「絶対フレーム位置の関数」か「状態を順に運ぶフィルタ」のどちらかにし、区間ごとに描けるようにする。チャンクの切り方を変えても結果は同じ（E18）。
-- 2 パスが要る操作（正規化）は、必要な解析（`Loudness(上流)`）を申告し、実行器が先に解く（§12）。
-- 元のビット深度・サンプルレートは `AudioMeta.source` に残し、書き出しの既定値に使う。
+  - 段 6 から、音声を出す操作は「核」（`audio::AudioKernel`：`rate`・`channels`・`frames`・`render(ch, start, out)`）を `Op::audio_kernel` で返す。前計算（ラウドネスの計測・フィルタの表）は核を作るときに 1 度だけ行い、`render` は出力の区間を描く純粋な関数にする。`apply` は同じ核を `audio::render_all`（`AUDIO_BLOCK` ずつ `par_blocks`）で描くだけ。E18 は、登録されたすべての音声の操作の例で、核をチャンク 1・7・4,096・全体で描いた値（全体の長さ）が `apply` と同じか、レート・チャンネル数・長さが同じかを照らす。音声を出すのに核を返さない操作は失敗にする。
+  - 状態を運ぶフィルタ（K 特性の IIR）は核にせず、解析の側で全体を順に流す（`analysis::loudness`）。
+- 2 パスが要る操作（正規化）は、段 6 では `apply`（核を作るとき）の中で計測する。必要な解析を申告し、実行器が先に解く口（§12）は解析の段 8 で足す。計測は段 8 の解析と同じ関数なので、表示する値と正規化で使う値が一致する（E26）。
+- 元のビット深度・サンプルレートは `AudioMeta.source` に残し、書き出しの既定値に使う。整数の PCM と f32 の変換は WAV・AIFF・FLAC で同じ式（`codec::pcm`：読みは v / 2^(幅−1)、書きは round_ties_even を範囲で止める。NaN は 0、ディザはしない）。左詰めの 32 ビットで出す FLAC・ALAC のデコーダの値も 32 ビットの式で読むと元の幅の式と同じ値になる。書き出しのビット数は、設定（`float` > `bits`）→ 元の形式 → 16 の順で決める（`codec::pcm::target`）。元の形式から決めるとき、浮動小数を書ける形式（WAV・AIFF）は元が浮動小数なら浮動小数（`float: false` を指定すれば 16 ビット）、書けない形式（FLAC）は整数の最大の幅（24）。元の幅が書けない形式では、それ以下の最大の幅にする（32 ビットの整数の元を FLAC に書くと 24）。指定した幅が書けなければ `Unsupported`。
 
 ### 5.4 形の推論
 
@@ -204,7 +207,7 @@ pub enum TimeMap {
 
 - 座標の計算はすべてあふれを確かめ、あふれたものは「範囲の外」として落とす（落ちない）。引数の座標は ±2^31 まで（`geom::COORD_LIMIT`。読み込みで確かめる）。
 - 書き出し先で失うものは、エンコーダの `MetaCaps` と照らして、保存する前に一覧で出す（例：「jpg ではアルファが失われます」「mp3 ではループ点を保存できません」）。`MetaCaps` は、可逆か（`lossless`：ほかの項目の範囲の中の値ならそのまま戻るか）・透明（`alpha`：`None`・`Binary`（GIF のように 0 か 255）・`Full`）・パレット・色の数の上限（`max_colors`：GIF は 256。超えると減色）・16 ビット・ICC・EXIF・DPI・テキスト・アニメ・ループ点・マーカー・タグを持つ。形式の表の `caps` は形式として保存できるもの、エンコーダの `caps(format, options)` はそのエンコーダがその設定で実際に書けるもの（例：固定の WebP のエンコーダはアニメを書けない）で、事前の警告はエンコーダのほうを見る。
-- ループ点の入れ物：WAV は `smpl`（と `cue `）、AIFF は `MARK` と `INST`、Ogg・FLAC は `LOOPSTART`・`LOOPLENGTH` のコメント。
+- ループ点の入れ物：WAV は `smpl`（と `cue `）、AIFF は `MARK` と `INST` の sustainLoop、Ogg・FLAC は `LOOPSTART`・`LOOPLENGTH` の Vorbis コメント（終わり = LOOPSTART + LOOPLENGTH。含まない）。MP3・m4a・AAC のループ点は読まない（`MetaCaps` も持たない）。FLAC はマーカーを持てない（`MetaCaps.markers` が偽なので、保存の前の一覧（上）に「マーカーを保存できません」と出る。エンコーダは黙って書かない）。
 
 ## 7. 操作
 
@@ -230,6 +233,8 @@ pub trait Op: Send + Sync + 'static {
     fn numeric_for(p: &Self::Params) -> Numeric;
     /// 追記だけの引数（描画）の差分の適用：前の引数の出力に、追記した分だけを当てる（全体を当て直したものとビット単位で同じ）
     fn apply_appended(prev: &Self::Params, prev_out: &Value, p: &Self::Params, cx: &mut ApplyCx<'_>) -> Option<Result<Applied, EngineError>>;
+    /// 音声を出す操作の核（§5.3）：前計算を 1 度だけして、出力の区間を描く純粋な関数にしたもの。apply も同じ核で描く
+    fn audio_kernel(p: &Self::Params, inputs: &[&Value], cx: &mut ApplyCx<'_>) -> Option<Result<Box<dyn AudioKernel>, EngineError>>;
 
 }
 ```
@@ -276,7 +281,15 @@ register_ops! {
   - `image.resize`：幅・高さは画素・比・自動（縦横比を保つ）。大きさが決まらない入力の自動の軸は、もう一方の軸から求めた上限（`max_dim` で切る）を推論にする。
   - `image.convert`：フレームの列は 1 つのパレットにそろえるので、持ち上げずに全フレームを扱う。
   - `sprite.split_grid`：格子は引数で渡す（推論で数が分かるように。エディタはメタデータの格子を初期値にする）。`skipEmpty` で透明なセルを除く。メタデータは最初のセルの座標に写し、格子は消す。`sprite.pack_grid`：キャンバスをセルにして並べ、格子を書く。分割してから同じ格子で結合すると元に戻る（E14）。
-- `layers.flatten` は、レイヤーの値（`Layered`）を出すデコーダを作る段で足す（今の aseprite・PSD のデコーダは合成済みの画像を出す）。`audio.set_loop` と音声の操作は段 6。
+- `layers.flatten` は、レイヤーの値（`Layered`）を出すデコーダを作る段で足す（今の aseprite・PSD のデコーダは合成済みの画像を出す）。
+- 段 6 で、`audio.trim`・`audio.fade`・`audio.mono`・`audio.set_loop`・`audio.normalize`・`audio.resample` を入れ、`audio.gain` を核に書き直した（値は同じ。ゴールデンは変わらない）。約束はソースの冒頭に書く。
+  - `audio.trim`：`[start, end)`（フレーム。end が null なら終わりまで）。標本はそのまま写す（整数だけ）。ループ点・マーカーは `TimeMap::Segments`。空・長さを超える区間は断る。
+  - `audio.fade`：`fadeIn`・`fadeOut`（フレーム）と `curve`（`linear`・`equalPower` = sin(πt/2)）。フレーム i の倍率は、イン c(i/a)・アウト c((N−1−i)/b) の積。長さ 0 は何も変えない（E17）。長さを超えるものは断る。
+  - `audio.gain`：`(f64(x) · 10^(dB/20)) as f32`。0 dB は何も変えない。
+  - `audio.mono`：チャンネルの順に f64 で足してチャンネルの数で割る。1 チャンネルはそのまま。
+  - `audio.set_loop`：`loop`（`{start, end}`、end は含まない、0 ≤ start < end ≤ 長さ）か null（消す）。メタデータを書く操作。
+  - `audio.normalize`：`target`（−69〜0 LUFS、既定 −23。ゲートは厳密な「>」なので −70 ちょうどには届かない）と `peakLimit`（−30〜0 dBTP、任意）。利得は、利得をかけたあとの積分ラウドネスがちょうど目標になる値で、`audio.gain` と同じ式で当てる（同じ dB のゲインとビット単位で同じ）。利得をかけると絶対ゲートをまたぐブロックが入れ替わるので、1 回の計測の差（目標 − 積分ラウドネス）では届かないことがある（静かな区間がゲートを越える入力で 1.6〜3.3 LU ずれた）。そこで計測したブロックのパワーを大きい順に並べ、上から m 個が絶対ゲートを通る利得の区間ごとに、相対ゲートは利得によらないので積分ラウドネスが「利得 + 定数」の直線になることを使い、区間の中に入る解を厳密に求める（`Measured::gain_to`。O(n log n)。|利得| が最小の解）。ブロックが 1 つでもあれば、−70 LKFS より静かな入力も含めて −69〜0 のどの目標にも届く（ChaCha8 で作った多区間の入力と、反復では届かなかった 81 段の階段の形で確かめる）。トゥルーピークが上限を超えるなら上限にちょうど届くまで下げて `GainLimited` の警告、計れない（ブロックのパワーがすべて 0（無音）・4 区間（⌊(fs + 5)/10⌋ 標本の 4 倍。約 400 ms）に満たない・3,363 Hz 以下・NaN や ∞ の標本）ときは何も変えずに `LoudnessUnmeasurable` の警告。
+  - `audio.resample`：`rate`（1,000〜768,000 Hz）。多相 FIR（§8.3）。出力の長さは round_half_even(frames · to / from) で、ループ点・マーカーは `TimeMap::Rate`。同じレートなら何もしない。係数の表が `min(max_value_bytes, 256 MiB)` を超える組み合わせと、出力が 0 フレームになる入力は断る。
 
 ## 8. 決定性と版
 
@@ -304,11 +317,16 @@ register_ops! {
 3. 乱数は ChaCha8 だけ。種は `determinism::seed(node.seed, 元のハッシュ, 用途)`（kura-core の `splitmix64`・`fnv1a64` と同じ値）で作り、鍵は `key_from_seed`（splitmix64 で 32 バイトに広げる。rand_core の `seed_from_u64`・`from_rng` は禁止）。乱数の流れは**絶対位置**で決める（`rng_at`：画像は行、音声はチャンネルを流れにして、列の中の位置へシークする）。タイル・ブロック・フレームの番号を流れに使わない。アニメのフレームはどれも同じ乱数になる（ディザのちらつきを防ぐ）。種がノード ID・画面の操作の順・一括の並びに依存しないので、エディタと一括で同じになる（E4・E5）。
 4. 出力に効く場所で `HashMap`・`HashSet`・`RandomState`・`DefaultHasher` を使わない（`BTreeMap` か並べた `Vec`）。
 5. 描画の中で時刻・環境変数・引数（`env::var*`・`vars*`・`args*`）を読まない。`#![forbid(unsafe_code)]`。
-6. 結果に効く依存は Cargo.toml で `=` で版を固定する（libm・blake3・rand_chacha、コーデックの png・zune-jpeg・jpeg-encoder・gif・image-webp・resvg・miniz_oxide）。上げるのは、ゴールデンが通るときだけ。SIMD の経路がターゲットで値を変えうる依存は、SIMD の feature を外す（zune-jpeg の neon・x86、jpeg-encoder の simd）。ほかの依存（dev 依存を含む）がついでに有効にしていないかを `scripts/check-engine-features.sh` が確かめ、CI でも回す。serde_json は固定しない（正規の JSON は自前で書き、読み込みは `float_roundtrip` で正しく丸めるので、結果は版によらない）。
+6. 結果に効く依存は Cargo.toml で `=` で版を固定する（libm・blake3・rand_chacha、コーデックの png・zune-jpeg・jpeg-encoder・gif・image-webp・resvg・miniz_oxide、段 6 の symphonia の部品のクレート・nanomp3・md-5）。上げるのは、ゴールデンが通るときだけ。SIMD の経路がターゲットで値を変えうる依存は、SIMD の feature を外す（zune-jpeg の neon・x86、jpeg-encoder の simd、symphonia-core の opt-simd、nanomp3 の wide。md-5 は FLAC の MD5 を書くだけで値は実装によらない）。ほかの依存（dev 依存を含む）がついでに有効にしていないかを `scripts/check-engine-features.sh` が確かめ、CI でも回す。serde_json は固定しない（正規の JSON は自前で書き、読み込みは `float_roundtrip` で正しく丸めるので、結果は版によらない）。
 
 ### 8.3 数値計算は自前で書く
 
 ラウドネス（ITU-R BS.1770-4 とトゥルーピーク）・サンプルレート変換（窓付き sinc の多相フィルタ）・リサイズの重み・ディザ・減色は、`math` を通して自分で書く（ADR-138）。第三者のクレート（ebur128・rubato・fast_image_resize など）は OS の libm を呼ぶことがあるので、dev 依存の照合相手とベンチの比較にだけ使う。
+
+段 6 で凍結した式（詳しくはソースの冒頭。ADR-148）：
+
+- **ラウドネス**（`analysis::loudness`）：K 特性は 2 次の直接形 I を 2 段、状態は f64。係数は libebur128 の式（`math::tan` で事前に歪めた双一次変換）で、2 段目の分子に `d(48 kHz) / d(fs)` を掛けて、どのレートでも BS.1770 の 48 kHz の表と同じ周波数特性にする（libebur128 は掛けないので 192 kHz で 0.03 dB ほど違う）。ゲーティングは S = ⌊(fs + 5)/10⌋ 標本ずつの二乗和の区間から 400 ms のブロックを `((q0 + q1) + q2) + q3` の順に作り、−70 LKFS と −10 LU のゲートをエネルギーで厳密な「>」で比べる。チャンネルの重みはチャンネルの数で決める（L・R・C は 1、4・5・6 チャンネルのサラウンド（Ls・Rs）と 8 チャンネルの側方は 1.41、8 チャンネルの後方は 1、LFE は計らない）。標本に NaN・∞ があれば、どの値も NaN（計れない）。トゥルーピークは Annex 2 の 48 タップ（12 タップ × 4 相）で、どのレートでも 4 倍にして、サンプルピークとの大きいほう。EBU Tech 3341 の試験信号 1〜6（と 44.1 kHz）で ±0.1 LU、トゥルーピークの 15〜19 で +0.2／−0.4 dB に入ることを確かめる（E19）。
+- **サンプルレート変換**（`audio::resample`）：g = gcd(from, to)、L = to/g・M = from/g の多相 FIR。タップは K = 256 · from / min(from, to)（偶数に切り上げ）、遮断 0.963 × 低いほうのナイキスト、Kaiser 窓 β = 14.8（I0 は級数）。係数は相ごとに和で割って直流をちょうど通す。積和は f64 で k の順、最後に 1 回だけ f32 に丸める。位置は u128 で正確に。入力の範囲の外は 0。阻止域は −142 dB 以下、−0.1 dB の点は 0.942 × ナイキスト。係数の表はダイジェストで凍結している（`table_is_frozen`）。
 
 ### 8.4 版の方針
 
@@ -343,7 +361,7 @@ register_ops! {
 - **コーデックのゴールデン**（`tests/codec_golden.rs`）：`goldens-codecs/<コーデックの ID（/ は @）>.jsonl`。ID は読み取り（`-dec`）と書き出し（`-enc`）で別にする（片方の版上げで、もう片方の照合が外れないように）。
   - エンコーダ（R2）`png-rs-enc@1.jsonl`：書いたバイト列のダイジェスト（`file`）と、それを読み直したデコーダの ID（`decoder`）・値のダイジェスト（`value`）。読み直しは、記録したデコーダ（旧版を含む）で照らす。バイト列が変わったら、エンコーダの約束の版を上げる。今ないエンコーダのファイルは照らさない（版を上げた旧版）。依存のクレート（png・fdeflate・flate2・miniz_oxide など）を上げてバイト列が変わったときも、ここで気づく。
   - デコーダ（R1 のうちデコーダだけの経路）`png-rs-dec@1.jsonl`：下の層で組んだファイル（`testfiles::FileGen`：1/2/4 ビット・tRNS・インターレース・64 ビットの浮動小数・拡張形式・他のツールのメタデータ・大きさの分からない data など）を読んだ値のダイジェスト。凍結した行は、その ID のデコーダ（今の版か旧版）で読んで照らし、その ID のデコーダがなければ失敗にする。
-  - どちらも追記だけの検査の対象。再現を約束しないデコーダ（`reproducible()` が偽。SVG）は、デコーダのゴールデンに入れない。
+  - どちらも追記だけの検査の対象。再現を約束しないデコーダ（`reproducible()` が偽。SVG と段 6 の Vorbis・AAC）は、デコーダのゴールデンに入れない（入れようとすると失敗にする）。それらは他のデコーダの読み取りとの照合（`tests/fixtures.rs`）で確かめ、編集するときはアンカーを作る（§9.4）。
 - **共有のテストベクタ**（`crates/kura-engine/tests/vectors/`）：Rust と TS で同じ規則を実装するもの（描画の筆・ピクセルパーフェクト・点の列の詰め方・重ねる式）の入出力を、エンジンが JSON で凍結する（`tests/paint_vectors.rs`。足りなければ `KURA_BLESS=1`）。フロントは `src/lib/paint.test.ts` が同じファイルを読んで照らす。フィクスチャと同じく、消す・変えるのを認めない（追記だけの検査が見る）。
 - **フィクスチャ**：自前のエンコーダでは作れない形（非可逆の WebP、libjpeg のプログレッシブ、他のツールの PSD など）は、他のツールで作った小さなファイルを `crates/kura-engine/fixtures/` に置く（作り方・道具の版は fixtures/README.md）。`tests/fixtures.rs` が他の実装の読み取り（sips・dwebp・djpeg・ImageMagick の PNG）と照らし、`FileGen::Fixture` でデコーダのゴールデンにも入れる。フィクスチャは消す・変えるのを認めない（追記だけの検査が見る）。
 
@@ -390,7 +408,7 @@ pub trait Encoder: Send + Sync {
 - 組み立て：`CodecSet::pinned()`（固定のコーデックと旧版）か `CodecSet::pinned_with(&PinnedOptions { svg_fonts })`（kura-mac が OS のフォントを渡す。渡さなければ文字を含む SVG は `Unsupported`）に、kura-mac・ffmpeg の段を `add_decoder`・`add_encoder` で足す。識別子はデコーダ（旧版を含む）・エンコーダのそれぞれで重ならないこと（重なれば `Err`。記録の識別子から 1 つに決まらなくなるため）。`all_decoders_for(format)` は旧版を含めて、その形式を読めるデコーダを返す（ファズ・照合のため）。
 - WAV のメタデータ（cue・labl・INFO）は、数をマーカーの上限で、大きさを `max_meta_bytes` で抑える。1 項目ごとに文字の長さに 32 バイトを足して予算から引く（空の名前でも数だけで予算を使い切れるように）。cue を先に読んでいれば、cue にない ID の labl は予算を使わずに捨てる。
 - 段 2 で入れたもの：PNG（`png` クレート `=0.18.1`。1/2/4 ビットは 8 ビットへ、tRNS はアルファへ、ICC・pHYs・テキストを運ぶ。圧縮したテキストは読まない）と WAV（自作。PCM 8/16/24/32・浮動小数 32/64・拡張形式、smpl・cue・adtl・INFO）。
-- 段 4 で入れたもの：§9.5。
+- 段 4 で入れたもの：§9.5。段 6 で入れたもの：§9.6。
 - `Platform` は kura-mac が実装して注入する（`MediaBackend` と同じ形）。Swift とのあいだは C の型だけでやり取りし、画素や PCM は Rust が確保したバッファのポインタと長さで受け渡す（ADR-37 の改訂。M10 の段 9）。
 - `External` は ffmpeg（同梱しない・任意）。PCM は標準入出力で流す。引数には `-fflags +bitexact -protocol_whitelist file,pipe` を付ける。
 
@@ -408,19 +426,20 @@ pub trait Encoder: Send + Sync {
 | PSD・PSB | image | 自作（`psd-kura-dec/1`。合成済みの画像。ZIP は次の段へ） | — |
 | SVG | image | resvg・usvg（`svg-resvg-dec/1`。再現は約束しない → アンカー。外部の参照は読まない。`<image>` と、フォントを渡していないときの文字は次の段へ） | — |
 | HEIC・HEIF・AVIF・RAW | image | ImageIO（Platform。アンカー） | — |
-| WAV・AIFF | audio | 自作（RIFF・smpl・cue・LIST・MARK・INST） | 自作 |
-| FLAC | audio | symphonia | flacenc |
-| MP3・AAC-LC・Vorbis・ALAC | audio | symphonia（AAC の priming は自作） | — |
-| Ogg Vorbis | audio | symphonia | **自作のエンコーダと Ogg の多重化**（ADR-137） |
-| AAC（m4a） | audio | symphonia | AudioToolbox（Platform） |
-| MP3 | audio | symphonia | 自作のエンコーダができるまでは ffmpeg（External）。なければ形式を変えて保存する |
+| WAV | audio | 自作（`wav-kura-dec/1`。RIFF・smpl・cue・LIST） | 自作（`wav-kura-enc/1`） |
+| AIFF・AIFF-C | audio | 自作（`aiff-kura-dec/1`。MARK・INST・NAME など） | 自作（`aiff-kura-enc/1`。整数は AIFF、浮動小数は AIFF-C の fl32） |
+| FLAC | audio | symphonia（`flac-symphonia-dec/1`。MD5 を照らす） | 自作（`flac-kura-enc/1`。ADR-148） |
+| MP3 | audio | nanomp3（`mp3-nanomp3-dec/1`。minimp3 とビット一致、libm を使わない。LAME の gapless） | 自作のエンコーダができるまでは ffmpeg（External）。なければ形式を変えて保存する |
+| ALAC（m4a） | audio | symphonia（`m4a-alac-symphonia-dec/1`。整数だけ） | — |
+| AAC-LC（m4a・ADTS） | audio | symphonia（`m4a-aac-symphonia-dec/1`・`aac-adts-symphonia-dec/1`。再現を約束しない → アンカー。priming は自作で切る） | AudioToolbox（Platform） |
+| Ogg Vorbis | audio | symphonia（`ogg-vorbis-symphonia-dec/1`。再現を約束しない → アンカー） | **自作のエンコーダと Ogg の多重化**（段 7。ADR-137） |
 | HE-AAC・Opus | audio | AVFoundation（Platform。アンカー） | — |
 | ttf・otf・woff・woff2 | font | —（解析だけ。M11） | — |
 | glb ほか 1 ファイルの 3D | model | —（解析だけ。M11） | — |
 | 動画 | video | —（編集しない） | — |
 
 - C のライブラリは同梱しない。C か ffmpeg がないと書けない形式は、エンコーダを Rust で自作する（Ogg Vorbis を最優先。MP3・不可逆 WebP・Opus は必要になった段で。ADR-137）。
-- 音声のタグは lofty で書く。EXIF・ICC は運ぶ。PNG の tIME・MP4 の作成日時など、時刻は書かない（R2 のため）。
+- 音声のタグは、各コーデックが自前で読み書きする（WAV の INFO、AIFF の NAME・AUTH・`(c) `・ANNO、FLAC・Ogg の Vorbis コメント、m4a の iTunes のタグは読みだけ）。lofty は段 6 では入れない（ID3v2・MP4 のタグを書く段で選び直す。ADR-148）。MP3 の ID3 は段 6 では読まない。EXIF・ICC は運ぶ。PNG の tIME・MP4 の作成日時など、時刻は書かない（R2 のため）。
 
 - EXIF の向き（Orientation）：JPEG・PNG（eXIf）・WebP は、読むときに向きを画素に当て、運ぶ EXIF の向きを 1 にする（同じ向きを 2 回当てない）。形（`shape`）も向きを当てた大きさを返す。PSD は画素が表示のとおりなので向きは当てず、EXIF の向きだけ 1 にする。
 
@@ -430,7 +449,7 @@ pub trait Encoder: Send + Sync {
 
 ### 9.4 アンカー
 
-- 再現を約束しないデコーダ（`reproducible()` が偽：Platform・External と、固定の段でも OS の libm を使う SVG）で読んだ元（HEIC・RAW・AVIF・HE-AAC・Opus・SVG など）は、初めて編集するときに、読み取った結果を可逆形式で残す（画像は ICC 付きの PNG、音声は FLAC か f32 の WAV）。OS の更新で読み取り結果が変わっても、途中の版を作り直せるようにするため（ADR-135）。
+- 再現を約束しないデコーダ（`reproducible()` が偽：Platform・External と、固定の段でも OS の libm を使う SVG・Vorbis・AAC）で読んだ元（HEIC・RAW・AVIF・HE-AAC・Opus・SVG・Ogg Vorbis・AAC など）は、初めて編集するときに、読み取った結果を可逆形式で残す（画像は ICC 付きの PNG、音声は FLAC か f32 の WAV）。OS の更新で読み取り結果が変わっても、途中の版を作り直せるようにするため（ADR-135）。
 - アンカーがあれば、作り直し・エディタはアンカーを元として読む（RAW・HEIC より速い）。
 - アンカーは実ファイルの台帳（M12）に載せ、整合性チェックの対象にする。
 
@@ -446,6 +465,22 @@ pub trait Encoder: Send + Sync {
 - **PSD・PSB**：自作。合成済みの画像だけ（層があって合成済みの画像が本物でないものは `Unsupported`）。ビットマップ・グレー・インデックス・RGB の 8/16 ビット、圧縮なし・RLE。合成済みの画像の ZIP はツールによって流れの分け方が違い、確かめる相手もないので `Unsupported`（次の段へ）。PSB は長さの欄が広がる所（層とマスクの情報の長さは 8 バイト、RLE の行の長さは 4 バイト）を読み分け、どの長さもファイルの残りの長さと照らしてから使う。透明は、層の数が負か Mtrn などがあるときだけ。Photoshop の白の下塗りは、下塗りでしか成り立たない条件がすべての画素で成り立つときだけ戻す（ImageMagick などは下塗りしない）。CMYK・Lab・32 ビットは次の段へ。拡張子は psd・psb。
 - **SVG**：resvg。結果は OS の libm に依存しうるので `reproducible()` は偽（アンカーを作る）。`<image>`（外部のファイル・data: のラスター画像・入れ子の SVG。pattern・mask などの中も）を含むものは `Unsupported`（resvg の raster-images は zune-jpeg の SIMD を有効にするので入れない）。文字は `PinnedOptions.svg_fonts` で渡したフォントだけで描き、渡していなければ `Unsupported`。usvg に渡す前に、ファイルの大きさ（16 MiB）・DTD の実体の展開（64 MiB）・要素の数（2²¹）・`<use>` の展開・marker の頂点ごとの複製（頂点の数 × marker の中の要素の数）を見積もって断る。DTD は引用符・注釈・PI を区別してバイト列のまま読み、パラメタ実体・外部の実体・マークアップや参照を含む実体は断る。入れ子の marker も断る。roxmltree・usvg・resvg は入れ子の深さだけ再帰し、スタックを使い切ると受け止められずに落ちるので、XML を読む前に生のバイト列で入れ子の深さを数えて 64 段で断り（2 MiB のスタックのデバッグのビルドで、重い形が 96 段まで動くことを測った）、参照（`<use>`・`url(#…)`・祖先から受け継ぐ fill・stroke・marker・CSS の規則）を展開した高さも 64 段で断る。参照の輪（pattern の中身が受け継いだ fill で自分を描き直す、など。ファズで見つけた）も断る。CSS の規則は、要素名・`.class`・`#id` の単純なセレクタだけ当たる要素を決め、それより複雑なセレクタはどの要素にも当たりうるとみなす。見積もりは再帰せずにたどり、手間（要素ごとの参照と辺の数の合計）は 2²⁴ まで。usvg はすべてのセレクタをすべての要素に照らし、子孫・`~` の結合子では祖先・兄弟をさかのぼって後戻りし（試す並びは、文書の深さ・兄弟の数から結合子の数だけ順に選ぶ組み合わせの数）、当たった規則と style 属性の宣言を宣言の数の 2 乗の手間で書き込むので、CSS のセレクタの数 × 要素の数と、これらの手間の合計（当たる要素の数は要素名・クラス・id ごとに数え、複雑なセレクタはすべての要素とする）をそれぞれ 2²⁷ までにする。セレクタの部分の数は 32 まで（simplecss は結合子の数だけ再帰する）。受け継ぐ参照は、受け継がないと分かっているもの（clip-path・mask・filter）のほかはすべて受け継ぐとみなす（`*fill` のような古い書き方の名前も usvg は fill として読む）。usvg は単位が objectBoundingBox の pattern・clipPath・mask と filter を、参照する要素ごとに中身ごと複製する（入れ子で指数に増える）ので、受け継いだ fill・stroke も使う図形ごとに数え、複製で作る要素の数を 2¹⁷ までにする。usvg は弧・円・楕円・角丸を半径に応じた数の曲線に直す（半径 10³⁰ の弧 1 つで 6 秒を超えた）ので、図形の属性・style・CSS の宣言の数の絶対値は 10⁹ まで（色・id・参照・名前の中の数字は数として読まない）。
   描く前に、resvg の描き方に合わせて木（mask・clipPath・フィルタの feImage・文字の輪郭・pattern の中身も）をたどり、資源を見積もる（`check_render`。超えたら `Unsupported`）：(1) 根からの道筋ごとに同時に生きる一時の画像の合計（層は 1 枚がキャンバスの 25 倍まで広がり入れ子の層は同時に生きる、mask と clip は層ごとに画像とマスク、フィルタはプリミティブの結果をすべて持つ、pattern のタイルは外側のタイルを持ったまま中身を描く）を絶対の予算 `max_value_bytes` まで、(2) 描く手間（画素の数。図形の外接矩形と描く面の小さい方・層の合成・プリミティブごとの式：feMorphology は層の画素 × 半径の矩形、feTurbulence はオクターブの数、feConvolveMatrix は行列の大きさ、ぼかしは半径の分）を 2³² とキャンバスの 64 倍の大きい方まで（resvg の描画は途中で止められないので、手間で時間を抑える）、(3) 変形のあとの座標が ±10⁸ 画素を超える図形を断る。いずれも検証とファズで見つけた形（pattern のタイルの 209 GB の確保・半径 10³⁷ の楕円の遅い入力など）。
+
+### 9.6 段 6 の音声のコーデックの約束
+
+詳しい約束は各コーデックのソースの冒頭（`crates/kura-engine/src/codec/{aiff,flac,mp3,lossy,symph,pcm}.rs`）に書き、ここは要点だけ。どれも形（`shape`）と中身（`decode`）が必ず一致するように、長さはデコードせずに決める。形がちょうどの長さ（`Exact`）の形式は、デコードした長さが違えば壊れたファイル、上限（`AtMost`。MP3・AAC）の形式は、上限を超えれば壊れたファイルで、短いものは短く読む。
+
+- **AIFF・AIFF-C**（自作）：AIFF の整数と、AIFF-C の `NONE`・`twos`・`in24`・`in32`・`raw `・`fl32`・`fl64`・`sowt`（16 ビットと、バイトの順によらない 8 ビット）。ほかの圧縮は `Unsupported`（次の段へ）。チャンクの数は 65,536 まで（WAV も同じ。小さなチャンクを並べたファイルの走査で止まらないように）、次のチャンクが今の位置なら seek しない（`BufReader` のバッファを捨てない）。フレーム数は SSND の長さで決め、COMM の numSampleFrames は使わない（CoreAudio・ffmpeg・libsndfile と同じ。ADR-148）。80 ビットのサンプルレートは整数だけで最も近い整数（偶数への丸め）に読む。INST の sustainLoop をループ点にし、その 2 つのマーカーはマーカーの一覧から除く。NAME・AUTH・`(c) `・ANNO をタグに。メタデータの数と大きさは WAV と同じ予算。書き出しは整数を AIFF、浮動小数（32 ビット）を AIFF-C の fl32 に。タグは読み取りと同じ形（4,096 バイトまで文字の境目で切り詰め、NUL まで、前後の空白なし）にして書く（書いて読み直したものが同じになるように。FLAC も 4,096 バイトに切り詰める）。
+- **FLAC**：読みは symphonia（STREAMINFO の MD5 を照らす）。長さは STREAMINFO の総フレーム数（0 ならパケットの長さの和）で、違えば壊れたファイル（MD5 も照らすので、途中で切れた FLAC は読まない）。書きは自作（`flac-kura-enc/1`。ADR-148）：8・16・24 ビット、1〜8 チャンネル、4,096 フレームの固定ブロック、サブフレームは定数・生・固定の予測子 0〜4 から最小のもの（wasted bits を含む）、残差は分割ライス（次数 0〜8）、ステレオは 4 通りの組から最小、STREAMINFO の MD5、タグかループ点があれば VORBIS_COMMENT（vendor "kura"）にタグと LOOPSTART・LOOPLENGTH。どれも整数だけで決まるので、すべてのターゲットで同じバイト列。フレームは並列に作って番号の順に並べる。LPC は使わない（フィクスチャの掃引で元の 44%。flac 1.5.0 の `-0` は 49%、`-8` は 33%。LPC を足すならエンコーダの版を上げる）。空の音声は `Unsupported`（総フレーム数 0 は「不明」の意味で読み直せない。flac も空の入力は書かない）。出力は `flac -t`・metaflac・ffprobe で読め、標本が元と一致することを確かめた。
+- **MP3**（nanomp3 `=0.2.0`、`alloc` だけ）：minimp3 とビット一致の純 Rust で、libm を使わないので値を再現できる（`reproducible()` は真）。layer 3 の MPEG-1・2・2.5 だけで、最初のフレームが layer 1・2（.mp3 の拡張子の MP2 など）なら `Unsupported`（nanomp3 は layer 1・2 の feature を入れないと、標本を出さずにエラーにもしない）。長さは開くときに決め、形はその上限（`AtMost`）：見つかったフレーム（`nanomp3::frames`）の標本の数の和（中身から出うる長さ）と、Xing・Info（LAME・Lavc）のタグの値（エンコーダの遅延と詰め物を切った長さ。nanomp3 はこのとき走査しない）の小さいほう。タグのフレームの数が 0（途中で止まった ffmpeg の出力の形）なら長さは分からないものとして全部読み、タグがなければ nanomp3 の全体の走査の値。最後の完全なフレームの終わりまでを読むので、途中で切れたファイルは短く読む（nanomp3 は切れた最後のフレームや末尾のゴミを「形式が変わった」エラーにする）。free format（ビットレート 0）は、`nanomp3::frames` が最後の 2 フレームを見つけられないので切らず、上限にその分を足す。途中でチャンネルの数・レートが変わるものは読まない。ID3 のタグは読まない。
+- **symphonia**（部品のクレートを `=0.6.1`、既定の feature なし）：Probe を通さず、形式の表で読み口とデコーダを選ぶ。ファイルは `max_value_bytes` まで読み込んでから渡し、読み口は `read` のたびに、パケットごとにも中止を確かめる。壊れたパケットは飛ばさずエラーにする。
+  - **Vorbis・AAC は値を再現できない**（デコーダの中で std の超越関数が表を作る）ので `reproducible()` は偽で、編集するときはアンカーを作る（§9.4）。FLAC・ALAC は整数だけで再現できる。m4a は中身で再現の可否が違うので ALAC 用と AAC 用のデコーダを分け、扱わない中身は `Unsupported` で次へ回す。
+  - 長さ：ALAC・Vorbis はパケットの長さ（遅延・詰め物を除いた数）の和を `Exact` にする（Vorbis は最後のグラニュールで切る）。デコードした長さが形と違えば（長いときも）壊れたファイル。AAC は priming を自前で切る：iTunSMPB（Apple）があればその priming と長さ、なければ MP4 の elst（ffmpeg）の最初の空でない編集、どちらもなければ切らない（ADTS は常に切らない）。切るときは、切る前の長さ（パケットの長さの和）まで読んでから切る（編集リストが中身の後ろを大きく切るファイルも読む）。形は上限（`AtMost`。切り取りの長さは、中身から出うる長さで抑える）。
+  - デコードする量：パケットの長さを数えるとき、切り取る前の長さ（`dur` と前後の切り取り。デコーダが実際に作る量）の和も `max_audio_frames`・`max_value_bytes` で確かめる（Ogg のページのグラニュールで長さを 0 近くまで詰めると、形は小さいまま大量のパケットのデコードを通せてしまう。検証で見つけた。2,000 パケット・4 KB のファイルで確かめる）。
+  - HE-AAC：AudioSpecificConfig の明示の印（オブジェクトの種類 5・29、GASpecificConfig のあとの同期の拡張 0x2B7・種類 5・sbrPresentFlag = 1）があれば `Unsupported`（symphonia は半分のレートで読んでしまう。次の段の AVFoundation へ）。ffmpeg は SBR がないことを同期の拡張（sbrPresentFlag = 0）で明示するので、旗まで読む。帯域の中だけの暗黙の SBR は外から見分けられない。
+  - Vorbis：デコーダを作る前に、setup ヘッダの codebook ごとに symphonia が確保する大きさ（VQ の表、項目ごとの配列、探索表）を見積もり、合計が `min(max_value_bytes, 256 MiB)` を超えれば `Unsupported`。探索表は B = clamp(最長, 4, 8) ビットずつ読むブロックの木で、symphonia は完全な木でなければ表を作る前に断るので、深さ d = kB のブロックの数はちょうど 2^d − Σ_{長さ ≤ d} 数 · 2^(d − 長さ)（`Vec` の伸びを見込んで 1 要素 16 バイト）。検証で、長さ 17 の符号語 131,072 個の codebook（約 20 バイト）1 つで 143 MB、8 つ（約 300 バイトの Ogg）で 1 GB を確保させられると分かったので、表まで数えるようにした（そのファイルは今は確保の前に断り、ピークのメモリは 2.5 MB。乱数の形 9,000 個・codebook 1〜255 個の形 1,500 個で、見積もりが symphonia の実際の確保を下回らないことを確かめた）。floor0 の表・residue の作業領域・DSP の固定の確保（symphonia の上限で、最大でおよそ 14 MiB）は予算の外。Ogg の中の Opus は `Unsupported`（次の段へ）。
+  - タグ：Vorbis コメント（FLAC・Ogg）と MP4 の iTunes のタグから title・artist・album・comment・date・genre・copyright、FLAC・Ogg のほかのキーは `vorbis:<KEY>` のまま運ぶ（FLAC に書き戻せる）。ALAC の元のビット数は magic cookie から読む。
+- 他のツールで作ったフィクスチャ（sox・flac・lame・afconvert・ffmpeg・libvorbis）で照らした（`tests/fixtures.rs`、作り方は fixtures/README.md）：FLAC・ALAC・AIFF は元とちょうど同じ値、MP3・AAC・Vorbis は他のデコーダ（ffmpeg・afconvert・lewton）と長さがちょうど同じで、信号と誤差の比が 3.4×10⁸ 以上（参照の 16 ビットの丸めの大きさ）。MP3 の free format は ffmpeg が読めないので LAME のデコーダと照らす。
 
 ## 10. 描画の道具
 
@@ -558,7 +593,8 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   - SVG の外部の参照（file・http）は拒否する（NFR-10）。DTD の実体の展開（入れ子を含む）と `<use>` の展開は、usvg に渡す前に見積もって上限で断る。SVG のファイルは 16 MiB まで。
   - 段 4 の各デコーダの上限：PNG のフレームの数は fcTL を数える段階で、eXIf はテキスト・ICC と合わせて `max_meta_bytes` で、GIF は 1 フレームの作業領域（`max_pixels`）とフレームの数を LZW を展開しない走査で、WebP の ICC と EXIF の合計は `max_meta_bytes` で、aseprite はファイル全体を `max_value_bytes` で、セル・タイルセットの展開をそれぞれの大きさちょうどで、1 フレームを描く作業領域を `max_value_bytes` の予算で、グループの入れ子を 64 段で、PSD は層とマスクの情報・RLE の行の長さ・圧縮なしの画素をファイルの残りの長さと照らして抑える。
   - 大きな画像：16384² の RGBA（値 1 GiB）を PNG に書いて読み直すテスト（`tests/large.rs`、release で 3.8 秒）のピークのメモリは 3.3 GB（元の値と読んだ値の 2 GiB を含む）。PNG の書き出しは行を詰めた写しを 1 つ作る（値と同じ大きさ。行ごとに書くとバイト列が変わるので、エンコーダの版を上げる段 10 のメモリの予算で扱う）。
-  - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・文書の読み込み。段 6 から AIFF・Ogg など）はファズにかける。
+  - 段 6 の音声のデコーダの上限：symphonia・nanomp3 に渡すファイルは `max_value_bytes` まで読み込む。長さはデコードせずに数え（パケットの長さの和・MP3 のフレームの走査）、形を上限（`max_audio_frames`・`max_value_bytes`・`max_channels`・`max_sample_rate`）で確かめてから確保する。デコードの途中でも形の上限を超えたら止める。Vorbis は codebook の表の大きさを渡す前に見積もって断る。AIFF の COMM は 279 バイトまで、MARK・INST・テキストは WAV と同じ予算（マーカーの上限・`max_meta_bytes`）。symphonia の panic は `codec::contain` が受け止める。
+  - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・AIFF・FLAC・MP3・Ogg・m4a・AAC・文書の読み込み）はファズにかける。
     - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_document` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
     - `tests/fuzz_smoke.rs` は同じ口を stable で回す変異のファズ。種（各形式の小さなファイル・フィクスチャ・文書）をバイトの書き換え・挿入・削除・つなぎ合わせで崩す。ふだんの `cargo test` で対象ごとに 150 回（`quick`）、`KURA_FUZZ_SECS=<秒> cargo test --release -p kura-engine --test fuzz_smoke long -- --ignored` で長く回す（`KURA_FUZZ_ONLY=svg,wav` で対象を選べる）。見つけた入力は `target/fuzz-smoke/` に残し、`replay` で流し直す。
     - 文書のファズは、上限を絞ったエンジンで読み込み、小さな入力（画像・パレットの画像・フレームの列・音声、格子・ピボット・スライス付きのシート、ループ点・マーカー付きの音声）で計画を作って描くところまで流す（段 5 から。新しい操作の実行の経路とメタデータの写し方にも届く）。追記だけの引数（`actions` の列）を持つノードは、途中で切って差分の適用（`Op::apply_appended`）が全体を当て直したものと同じかも照らす（E21。実行器が差分を使う段 10 までは、ファズでここを照らす）。
@@ -566,6 +602,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
     - 段 4 の長い実行（release で対象ごとに 40〜60 秒、合わせて約 2 億回）で、SVG の DTD の走査が多バイト文字の途中で文字列を切る panic を見つけて直した（`multibyte_text_around_the_dtd`）。直したあとの実行では何も見つかっていない。SVG と文書は、変異の多くが最初の検査（UTF-8・JSON）で断られるので回数ほど深くは試せていない。深い所はカバレッジを見る `fuzz/` に任せる。
     - 段 5 で、nightly の cargo-fuzz（libFuzzer。release ＋デバッグの検査 ＋ AddressSanitizer、`-fork` で並べて落ちても続ける）を 9 つの対象で回した。各 30 分を 2 回、直したあとに SVG・文書・aseprite を 10〜20 分ずつ、合わせて約 2.7 億回。見つけたのは SVG と自前の新しい検査だけで、どれも直した：参照の輪と深い入れ子によるスタックのあふれ（受け止められずにプロセスごと落ちる）、resvg の pattern のタイルの上限のない確保（209 GB）、巨大な半径の楕円の遅い描画、数の検査の無限ループ。最後の実行（SVG 約 1,360 万回・文書 約 200 万回）では何も見つかっていない。見つけた入力は `replay` で流し直せる形で残す（`fuzz/README.md`）。
     - カバレッジ（育った種で数えた行の割合。同じファイルのエンコーダと、テストの例を作る関数は除く）：PNG 92%・JPEG 84%・GIF 90%・WebP 84%・WAV 92%・aseprite 95%・PSD 94%・SVG 83%。文書は、操作 78〜99%・メタデータの写し方 80%・実行器 72%・描画 70〜93%。届いていないのは主に、中止・あふれ・確保の失敗の枝と、識別子を返す関数。カバレッジで、aseprite のパレットの番号のまま描く経路・メタデータの写し方・差分の適用に届いていないと分かったので、種・入力・照らし合わせを足した。
+    - 段 6 で音声の 6 つの対象（`decode_aiff`・`decode_flac`・`decode_mp3`・`decode_ogg`・`decode_m4a`・`decode_aac`）を足した。種は自作の AIFF・FLAC の書き出しと、他のツールで作ったフィクスチャ（MP3・Ogg Vorbis・Opus・ALAC・AAC・HE-AAC）。stable の変異で対象ごとに 60 秒（合わせて約 980 万回）、cargo-fuzz で対象ごとに 15 分（合わせて約 2,360 万回）回し、何も見つかっていない。検証のあとの修正（MP3・AIFF・Ogg・m4a）のあとにも、WAV を含む 7 対象を stable の変異で 40 秒ずつ（合わせて約 1,170 万回）回し、何も見つかっていない。ファズで届かない形（巨大な codebook を名乗る Vorbis・グラニュールで詰めた Ogg・切れた MP3 など）は、検証で組んだ入力を単体のテストとフィクスチャに残した。カバレッジ（読み取りの関数の行。同じファイルのエンコーダ・テストを除く）：AIFF 90%・FLAC 90%・MP3 89%・Ogg・m4a・ADTS の読み取り（`lossy.rs`）93%・symphonia の共通の部品（`symph.rs`）81%。届いていないのは主に、中止・途中でチャンネルの数が変わる枝と、ファズでは組めない形（巨大な codebook を名乗る Vorbis。単体のテストで確かめる）。
     - 通常の `cargo test` にも、ChaCha8 でランダムな文書と壊れたファイルを作るテスト（形式ごとの `broken_files_are_errors` など）を入れる。
 
 ## 14. 保存と版（M12 以降。意味だけを決める。表は data-model.md に各段で書く）
@@ -639,7 +676,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 | E17 | ゲイン 0dB と長さ 0 のフェードは何も変えない。int16・int24 → f32 → 元のビット数の往復はビット一致 |
 | E18 | 区間ごとに描いても（チャンク 1・7・4,096・全体）値が同じ |
 | E19 | ラウドネスの計測が EBU Tech 3341 の試験信号で ±0.1 LU。正規化したあとの積分ラウドネスが目標の ±0.1 LU |
-| E20 | WAV の smpl・cue、AIFF の MARK・INST、Ogg の LOOPSTART・LOOPLENGTH を読んで書いても保たれる |
+| E20 | WAV の smpl・cue、AIFF の MARK・INST、Ogg の LOOPSTART・LOOPLENGTH を読んで書いても保たれる（Ogg は段 6 では読みだけを確かめ、書き出しは段 7 の E28 で。FLAC の LOOPSTART・LOOPLENGTH も往復を確かめる） |
 | E21 | 同じ点の列からは同じ画素ができる。差分で当てても全体を当て直しても同じ。ピクセルパーフェクトの規則どおり。TS と共有するベクタと一致する |
 | E22 | 塗りつぶしは 4 連結・8 連結・許容差の定義どおりで、たどる順に左右されない |
 | E23 | スポイトが返す色とインデックスが、描画結果の画素と一致する |
