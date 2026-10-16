@@ -431,13 +431,13 @@ impl Encoder for GifCodec {
             .iter()
             .flat_map(|f| f.chunks_exact(4).filter(|p| p[3] == 255).flatten().copied())
             .collect();
-        let hist = quantize::histogram(&opaque)?;
+        let hist = quantize::histogram(&opaque, mon)?;
         drop(opaque);
         let room = if any_transparent { 255 } else { 256 };
         let mut palette = if hist.is_empty() {
             Vec::new()
         } else {
-            quantize::palette_for(&hist, room)?
+            quantize::palette_for(&hist, room, mon)?
         };
         let transparent = any_transparent.then_some(palette.len() as u8);
         if any_transparent {
@@ -463,7 +463,7 @@ impl Encoder for GifCodec {
                 gif::DisposalMethod::Keep
             };
             for (rgba, (_, ms)) in rgba_frames.iter().zip(&rasters) {
-                let fh = quantize::histogram(rgba)?;
+                let fh = quantize::histogram(rgba, mon)?;
                 // 透明は透明の番号へ、ほかはいちばん近いパレットの色へ
                 let opaque_palette: Vec<[u8; 4]> =
                     palette.iter().copied().filter(|c| c[3] == 255).collect();

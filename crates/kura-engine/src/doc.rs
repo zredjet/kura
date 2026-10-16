@@ -267,8 +267,15 @@ impl Graph {
     }
 
     /// 正規の JSON（キーを並べ、空白なし）。
+    /// 大きさの上限（`MAX_DOC_BYTES`）を超える文書は、読み直せなくなるので書かずに `Limit` にする
+    /// （エディタが追記した文書を保存して、開けなくなるのを防ぐ）。
     pub fn to_canonical_json(&self) -> Result<Vec<u8>, EngineError> {
-        crate::digest::canonical(self)
+        crate::digest::canonical_within(self, MAX_DOC_BYTES).map_err(too_large)
+    }
+
+    /// 正規の JSON の大きさ（バイト）。エディタが上限に近づいたことを知らせるのに使う（書き出さずに数える）。
+    pub fn encoded_len(&self) -> Result<usize, EngineError> {
+        crate::digest::canonical_len_within(self, usize::MAX)
     }
 
     /// 文書のハッシュ。
@@ -284,8 +291,30 @@ impl Node {
     }
 }
 
-/// 文書を読む。スキーマが新しすぎればエラー、古ければ今のスキーマへ移す。
+/// 文書の大きさの上限（バイト）。筆 1,000 本（各 50 点）の文書が約 0.3 MB なので、その 50 倍ほどの余裕を見る（ADR-147）。
+pub const MAX_DOC_BYTES: usize = 16 << 20;
+
+/// 保存の形（正規の JSON）で測った上限の誤りに、文書のことだと分かる文言を付ける。
+fn too_large(e: EngineError) -> EngineError {
+    match e {
+        EngineError::Limit(m) => {
+            EngineError::Limit(format!("文書を保存の形（正規の JSON）にできません：{m}"))
+        }
+        other => other,
+    }
+}
+
+/// 文書を読む。大きすぎる・スキーマが新しすぎればエラー、古ければ今のスキーマへ移す。
+/// 大きさは、読んだバイト列と、保存の形（正規の JSON。移行と既定値を入れたあと）の両方で確かめる。保存の形の大きさと
+/// 入れ子の深さ（`digest::MAX_DEPTH`）は、保存（`to_canonical_json`）と同じ数え方なので、読めた文書は必ず保存でき、
+/// 保存できた文書は必ず読める。
 pub fn load(raw: &[u8]) -> Result<Graph, EngineError> {
+    if raw.len() > MAX_DOC_BYTES {
+        return Err(EngineError::Limit(format!(
+            "文書が大きすぎます（{} バイト。上限 {MAX_DOC_BYTES}）",
+            raw.len()
+        )));
+    }
     let value: serde_json::Value = serde_json::from_slice(raw).map_err(|e| {
         EngineError::Invalid(Issues::one(Issue::error(
             IssueCode::BadGraph,
@@ -308,12 +337,14 @@ pub fn load(raw: &[u8]) -> Result<Graph, EngineError> {
         ))));
     }
     let value = migrate_schema(value, schema as u32)?;
-    serde_json::from_value(value).map_err(|e| {
+    let graph: Graph = serde_json::from_value(value).map_err(|e| {
         EngineError::Invalid(Issues::one(Issue::error(
             IssueCode::BadGraph,
             format!("文書の形が正しくありません: {e}"),
         )))
-    })
+    })?;
+    crate::digest::canonical_len_within(&graph, MAX_DOC_BYTES).map_err(too_large)?;
+    Ok(graph)
 }
 
 /// スキーマを 1 段移す関数。
@@ -462,7 +493,64 @@ mod u64_text {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 上限を超える文書は保存の形にもしない（作れても読み直せなくなるため）。
+    #[test]
+    fn huge_documents_are_not_written() {
+        let mut g = Graph::new_single();
+        let big = "a".repeat(MAX_DOC_BYTES);
+        g.push_linear("image.flip", 1, json!({ "axis": big }), 0)
+            .unwrap();
+        assert!(matches!(g.to_canonical_json(), Err(EngineError::Limit(_))));
+        assert!(g.encoded_len().unwrap() > MAX_DOC_BYTES);
+    }
+
+    #[test]
+    fn huge_documents_are_refused_before_parsing() {
+        let mut raw = br#"{"schema":2,"rules":1,"pad":""#.to_vec();
+        raw.resize(MAX_DOC_BYTES + 1, b'a');
+        assert!(matches!(load(&raw), Err(EngineError::Limit(_))));
+    }
+
+    /// 保存の形で何十倍にも膨らむ文書（1e300 は正規の形で 301 桁）も、読むときに断る。読めた文書は必ず保存できる。
+    #[test]
+    fn documents_that_grow_when_written_are_refused() {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&sample().to_canonical_json().unwrap()).unwrap();
+        let pad = format!("[{}]", vec!["1e300"; 60_000].join(","));
+        v["nodes"][0]["params"]["pad"] = serde_json::from_str(&pad).unwrap();
+        let raw = serde_json::to_vec(&v).unwrap();
+        assert!(raw.len() < MAX_DOC_BYTES);
+        assert!(matches!(load(&raw), Err(EngineError::Limit(_))));
+        // 少なければ読めて、保存もできる
+        let pad = format!("[{}]", vec!["1e300"; 100].join(","));
+        v["nodes"][0]["params"]["pad"] = serde_json::from_str(&pad).unwrap();
+        let g = load(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert!(g.to_canonical_json().is_ok());
+    }
     use serde_json::json;
+
+    /// 入れ子の深さも、保存と読み込みで同じ数え方：保存できない深さの文書は読まない（serde_json の 128 段より浅くても）。
+    #[test]
+    fn deep_documents_are_refused_on_both_sides() {
+        let mut deep = json!(1);
+        for _ in 0..crate::digest::MAX_DEPTH {
+            deep = json!([deep]);
+        }
+        let mut g = sample();
+        g.nodes[0].params["pad"] = deep;
+        assert!(matches!(g.to_canonical_json(), Err(EngineError::Limit(_))));
+        let raw = serde_json::to_vec(&serde_json::to_value(&g).unwrap()).unwrap();
+        assert!(matches!(load(&raw), Err(EngineError::Limit(_))));
+        // 数段浅ければ、保存も読み込みもできる
+        let mut shallow = json!(1);
+        for _ in 0..crate::digest::MAX_DEPTH - 10 {
+            shallow = json!([shallow]);
+        }
+        g.nodes[0].params["pad"] = shallow;
+        let bytes = g.to_canonical_json().unwrap();
+        assert_eq!(load(&bytes).unwrap().to_canonical_json().unwrap(), bytes);
+    }
 
     fn sample() -> Graph {
         let mut g = Graph::new_single();

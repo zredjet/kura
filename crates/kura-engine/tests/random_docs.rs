@@ -55,6 +55,50 @@ fn random_params(r: &mut ChaCha8Rng, schema: &ParamSchema) -> J {
                 };
                 json!({ "x": x, "y": y, "w": w, "h": below(r, 40) })
             }
+            ParamKind::Length => match below(r, 6) {
+                0 => json!("auto"),
+                1 => json!({ "scale": { "num": below(r, 6), "den": below(r, 6) } }),
+                2 => json!({ "px": u32::MAX }),
+                _ => json!({ "px": below(r, 400) }),
+            },
+            ParamKind::Grid => {
+                if below(r, 8) == 0 {
+                    J::Null
+                } else {
+                    let edge = |r: &mut ChaCha8Rng, n: u64| {
+                        if below(r, 16) == 0 {
+                            u64::from(u32::MAX)
+                        } else {
+                            below(r, n)
+                        }
+                    };
+                    json!({
+                        "cellW": edge(r, 20), "cellH": edge(r, 20),
+                        "offsetX": edge(r, 10), "offsetY": edge(r, 10),
+                        "gapX": edge(r, 4), "gapY": edge(r, 4),
+                    })
+                }
+            }
+            ParamKind::PaletteEntries => J::Array(
+                (0..below(r, 4))
+                    .map(|_| json!({ "index": below(r, 24), "color": random_color(r, true) }))
+                    .collect(),
+            ),
+            ParamKind::Color { alpha } => {
+                if *alpha && below(r, 3) == 0 {
+                    J::Null
+                } else {
+                    random_color(r, *alpha)
+                }
+            }
+            ParamKind::Point => {
+                if below(r, 4) == 0 {
+                    J::Null
+                } else {
+                    json!({ "x": below(r, 70) as i64 - 10, "y": below(r, 70) as i64 - 10 })
+                }
+            }
+            ParamKind::Strokes => J::Array((0..below(r, 4)).map(|_| random_action(r)).collect()),
             _ => spec.default.clone(),
         };
         map.insert(spec.key.to_string(), v);
@@ -63,6 +107,57 @@ fn random_params(r: &mut ChaCha8Rng, schema: &ParamSchema) -> J {
         map.insert("unexpected".into(), json!(1));
     }
     J::Object(map)
+}
+
+fn random_color(r: &mut ChaCha8Rng, alpha: bool) -> J {
+    // 灰色・不透明もそれなりに出す（形式の制約を通るものを混ぜる）
+    let gray = below(r, 3) == 0;
+    let v = below(r, 256);
+    let c: Vec<u64> = (0..3)
+        .map(|_| if gray { v } else { below(r, 256) })
+        .collect();
+    if alpha {
+        let a = if below(r, 2) == 0 { 255 } else { below(r, 256) };
+        json!([c[0], c[1], c[2], a])
+    } else {
+        json!([c[0], c[1], c[2]])
+    }
+}
+
+fn random_action(r: &mut ChaCha8Rng) -> J {
+    let color = match below(r, 4) {
+        0 => J::Null,
+        1 => json!({ "index": below(r, 20) }),
+        _ => json!({ "rgba": random_color(r, true) }),
+    };
+    let frame = below(r, 3);
+    if below(r, 3) == 0 {
+        return json!({
+            "type": "fill",
+            "at": { "x": below(r, 60) as i64 - 5, "y": below(r, 60) as i64 - 5 },
+            "color": if color.is_null() { json!({ "rgba": [0, 0, 0, 0] }) } else { color },
+            "tolerance": below(r, 50),
+            "connectivity": if below(r, 2) == 0 { "four" } else { "eight" },
+            "contiguous": below(r, 2) == 0,
+            "frame": frame,
+        });
+    }
+    let points: Vec<kura_engine::geom::IPoint> = (0..1 + below(r, 6))
+        .map(|_| kura_engine::geom::IPoint {
+            x: below(r, 80) as i64 - 10,
+            y: below(r, 80) as i64 - 10,
+        })
+        .collect();
+    json!({
+        "type": "stroke",
+        "tool": if below(r, 4) == 0 { "eraser" } else { "pen" },
+        "color": color,
+        "blend": if below(r, 3) == 0 { "over" } else { "replace" },
+        "brush": { "shape": if below(r, 2) == 0 { "square" } else { "circle" }, "size": below(r, 12) },
+        "pixelPerfect": below(r, 2) == 0,
+        "frame": frame,
+        "points": kura_engine::paint::PointList(points).pack(),
+    })
 }
 
 fn random_input(r: &mut ChaCha8Rng) -> InputGen {

@@ -233,6 +233,59 @@ impl Raster {
         Self::from_tile_fn(w, h, self.fmt, self.palette.as_deref().cloned(), mon, f)
     }
 
+    /// `pick` が真のタイルだけを、並列に書き換える。ほかと共有しているタイルだけを複製し（CoW）、
+    /// この画像だけが持つタイルはその場で書き換える。`f` はタイルの矩形と中身を受け取って書き換える。
+    /// 結果はスレッド数によらない。
+    pub fn update_tiles<P, F>(
+        &mut self,
+        mon: &dyn Monitor,
+        pick: P,
+        f: F,
+    ) -> Result<(), EngineError>
+    where
+        P: Fn(IRect) -> bool + Sync + Send,
+        F: Fn(IRect, &mut [u8]) -> Result<(), EngineError> + Sync + Send,
+    {
+        let (w, h) = (self.w, self.h);
+        let tx_n = self.tiles_x();
+        let palette_len = self.palette.as_ref().map(|p| p.colors.len());
+        // 各タイルを 1 つのスレッドだけが触るように、タイルごとの鍵に入れて渡す（鍵の取り合いは起きない）
+        let cells: Vec<std::sync::Mutex<Arc<Vec<u8>>>> = std::mem::take(&mut self.tiles)
+            .into_iter()
+            .map(std::sync::Mutex::new)
+            .collect();
+        let result = par_blocks(cells.len(), mon, |i| {
+            let (tx, ty) = (i as u32 % tx_n, i as u32 / tx_n);
+            let rect = tile_rect(w, h, tx, ty);
+            if !pick(rect) {
+                return Ok(());
+            }
+            let mut guard = cells[i]
+                .lock()
+                .map_err(|_| EngineError::Internal("タイルの鍵が壊れています".into()))?;
+            let buf = Arc::make_mut(&mut guard);
+            f(rect, buf)?;
+            if let Some(n) = palette_len
+                && buf.iter().any(|b| usize::from(*b) >= n)
+            {
+                return Err(EngineError::Internal(
+                    "パレットにない番号の画素があります".into(),
+                ));
+            }
+            Ok(())
+        });
+        let mut tiles = Vec::with_capacity(cells.len());
+        for c in cells {
+            tiles.push(
+                c.into_inner()
+                    .map_err(|_| EngineError::Internal("タイルの鍵が壊れています".into()))?,
+            );
+        }
+        // 途中で失敗しても、タイルは元の位置に戻す（書きかけのタイルが残るので、呼ぶ側は失敗した画像を捨てる）
+        self.tiles = tiles;
+        result.map(|_| ())
+    }
+
     /// 矩形（画像の中に収まるもの）の画素を、行を詰めて `out` に写す。
     pub fn read_rect(&self, rect: IRect, out: &mut [u8]) -> Result<(), EngineError> {
         if !rect.inside(self.w, self.h) {
@@ -535,6 +588,25 @@ mod tests {
         let mut h3 = Hasher::new("t");
         b.digest_into(&mut h3);
         assert_ne!(h2.finish(), h3.finish());
+    }
+
+    #[test]
+    fn update_tiles_copies_only_picked_tiles() {
+        let a = Raster::filled(600, 300, PixelFormat::Gray8, None, &[9]).unwrap();
+        let mut b = a.clone();
+        b.update_tiles(
+            &crate::monitor::NoMonitor,
+            |r| r.x == 256,
+            |_, buf| {
+                buf.fill(1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(b.shares_tile(&a, 0, 0) && b.shares_tile(&a, 2, 1));
+        assert!(!b.shares_tile(&a, 1, 0) && !b.shares_tile(&a, 1, 1));
+        assert_eq!(b.pixel(300, 299), Some(&[1u8][..]));
+        assert_eq!(b.pixel(255, 0), Some(&[9u8][..]));
     }
 
     #[test]

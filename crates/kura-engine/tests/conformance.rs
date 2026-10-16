@@ -463,19 +463,60 @@ fn warnings_and_carried_metadata() {
     assert_eq!(out.meta.tags, a.meta.tags);
 }
 
-/// すべての操作の引数が、知らない項目を拒む（文書の項目を黙って捨てない。ADR-143 (4)）。
+/// すべての操作の引数が、どの層でも知らない項目を拒む（入れ子の点・矩形・比・格子・描画の動作も。文書の項目を黙って捨てない。ADR-143 (4)）。
 #[test]
 fn every_op_rejects_unknown_param_keys() {
-    each_example(|_, op, ex| {
-        let mut raw = ex.params.clone();
-        if let Some(map) = raw.as_object_mut() {
-            map.insert("unexpectedKey".into(), json!(1));
+    // 引数の JSON の中のすべてのオブジェクト（配列の中も、入れ子も）の場所
+    fn objects(v: &serde_json::Value, path: Vec<String>, out: &mut Vec<Vec<String>>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                out.push(path.clone());
+                for (k, child) in map {
+                    let mut p = path.clone();
+                    p.push(k.clone());
+                    objects(child, p, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    let mut p = path.clone();
+                    p.push(i.to_string());
+                    objects(child, p, out);
+                }
+            }
+            _ => {}
         }
-        let issues = op
-            .parse(&raw)
-            .err()
-            .unwrap_or_else(|| panic!("{}：知らない項目を受け付けた", op.id()));
-        assert_eq!(issues.0[0].code, IssueCode::BadParams, "{}", op.id());
+    }
+    each_example(|_, op, ex| {
+        let mut places = Vec::new();
+        objects(&ex.params, Vec::new(), &mut places);
+        for place in places {
+            let mut raw = ex.params.clone();
+            let mut at = &mut raw;
+            for k in &place {
+                at = match at {
+                    serde_json::Value::Object(m) => m.get_mut(k).unwrap(),
+                    serde_json::Value::Array(a) => a.get_mut(k.parse::<usize>().unwrap()).unwrap(),
+                    _ => unreachable!(),
+                };
+            }
+            at.as_object_mut()
+                .unwrap()
+                .insert("unexpectedKey".into(), json!(1));
+            let issues = op.parse(&raw).err().unwrap_or_else(|| {
+                panic!(
+                    "{} {}：{} の知らない項目を受け付けた",
+                    op.id(),
+                    ex.name,
+                    if place.is_empty() {
+                        "引数".to_string()
+                    } else {
+                        place.join(".")
+                    }
+                )
+            });
+            assert_eq!(issues.0[0].code, IssueCode::BadParams, "{}", op.id());
+        }
     });
 }
 

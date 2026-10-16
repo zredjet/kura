@@ -26,17 +26,35 @@ use crate::value::Value;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum ParamKind {
-    Int { min: i64, max: i64, step: i64 },
-    Float { min: f64, max: f64, step: f64 },
+    Int {
+        min: i64,
+        max: i64,
+        step: i64,
+    },
+    Float {
+        min: f64,
+        max: f64,
+        step: f64,
+    },
     Bool,
-    Enum { values: &'static [&'static str] },
+    Enum {
+        values: &'static [&'static str],
+    },
     Rect,
     Point,
     Size,
     Ratio,
-    Color { alpha: bool },
+    Color {
+        alpha: bool,
+    },
     TimePos,
     Strokes,
+    /// 長さ（画素・入力に対する比・縦横比を保つ自動）。
+    Length,
+    /// スプライトの格子（セルの大きさ・左上・間隔）。
+    Grid,
+    /// パレットの色の置き換え（番号と色の組）。
+    PaletteEntries,
 }
 
 /// 引数の単位。
@@ -258,6 +276,9 @@ pub struct ApplyCx<'a> {
     pub limits: &'a Limits,
     /// この操作の種（ノードの種・元のハッシュ・操作の ID から作ったもの）。
     pub seed: u64,
+    /// 文書の全体の規則の版（`doc::Graph::rules`）。メタデータを自分で書く操作（`MetaAccess::Write`）が座標を写すときは、
+    /// `mapping::map_image_meta_for` にこれを渡して、文書の規則の写し方を使う（§8.4）。
+    pub rules: u32,
     pub warnings: Vec<Issue>,
 }
 
@@ -314,6 +335,22 @@ pub trait Op: Send + Sync + 'static {
     }
     /// 適合テストとゴールデンの例（1 つ以上）。
     fn examples() -> Vec<Example<Self::Params>>;
+    /// この引数で描くときの数値の性質（既定は `signature().numeric`）。最近傍のリサイズのように、
+    /// 引数によって整数だけで済む操作が `Exact` を返すと、その例のゴールデンはすべてのターゲットで照らす。
+    fn numeric_for(_p: &Self::Params) -> Numeric {
+        Self::signature().numeric
+    }
+    /// 追記だけの引数（描画）の差分の適用：`prev_out` が引数 `prev` の出力のとき、引数 `p` の出力を返す。
+    /// `p` が `prev` に追記したものでなければ None（全体を当て直す）。結果は `apply` で全体を当て直したものと
+    /// ビット単位で同じであること（E21。docs/editing.md §10）。
+    fn apply_appended(
+        _prev: &Self::Params,
+        _prev_out: &Value,
+        _p: &Self::Params,
+        _cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        None
+    }
 }
 
 /// 型を消した引数。
@@ -346,6 +383,16 @@ pub trait DynOp: Send + Sync {
     ) -> Result<Applied, EngineError>;
     fn migrate(&self, from: u16, raw: serde_json::Value) -> Result<serde_json::Value, String>;
     fn examples(&self) -> Result<Vec<DynExample>, EngineError>;
+    /// この引数（JSON）で描くときの数値の性質。
+    fn numeric(&self, raw: &serde_json::Value) -> Result<Numeric, Issues>;
+    /// 追記だけの引数の差分の適用（`Op::apply_appended`）。
+    fn apply_appended(
+        &self,
+        prev: &AnyParams,
+        prev_out: &Value,
+        p: &AnyParams,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>>;
 }
 
 /// `Op` を `DynOp` にする包み。
@@ -412,6 +459,28 @@ impl<O: Op> DynOp for OpEntry<O> {
 
     fn migrate(&self, from: u16, raw: serde_json::Value) -> Result<serde_json::Value, String> {
         O::migrate(from, raw)
+    }
+
+    fn numeric(&self, raw: &serde_json::Value) -> Result<Numeric, Issues> {
+        let p = self.parse(raw)?;
+        let p = self
+            .params(p.as_ref())
+            .map_err(|e| Issues::one(Issue::error(IssueCode::BadParams, e.to_string())))?;
+        Ok(O::numeric_for(p))
+    }
+
+    fn apply_appended(
+        &self,
+        prev: &AnyParams,
+        prev_out: &Value,
+        p: &AnyParams,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        let (prev, p) = match (self.params(prev), self.params(p)) {
+            (Ok(prev), Ok(p)) => (prev, p),
+            (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
+        };
+        O::apply_appended(prev, prev_out, p, cx)
     }
 
     fn examples(&self) -> Result<Vec<DynExample>, EngineError> {
@@ -531,7 +600,8 @@ impl Registry {
             .collect()
     }
 
-    fn get(&self, id: &str, v: u16) -> Option<Arc<dyn DynOp>> {
+    /// その操作のその版の実装。
+    pub(crate) fn get(&self, id: &str, v: u16) -> Option<Arc<dyn DynOp>> {
         self.ops
             .iter()
             .find(|((op, ver), _)| *op == id && *ver == v)

@@ -59,6 +59,56 @@ pub fn expand_into(
     Ok(())
 }
 
+/// 1 画素を別の形式にする（Indexed8 へは扱わない。Indexed8 からはパレットの色で広げる）。整数だけで、式を凍結する。
+/// 順番は ① グレーへ（元の深さで `pixels::luma`）② アルファを外す（元の深さで、下地 `matte` に `pixels::flatten`。
+/// グレーへ行くときは下地もグレーにする）③ 深さを変える（`pixels::up8`・`pixels::down16`）。
+pub fn convert_pixel(
+    src_fmt: PixelFormat,
+    palette: Option<&[[u8; 4]]>,
+    src: &[u8],
+    dst_fmt: PixelFormat,
+    matte: [u8; 3],
+    out: &mut [u8],
+) -> Result<(), EngineError> {
+    use crate::imaging::pixels::{channel_max, down16, flatten, is_gray, luma, read_rgba, up8};
+    if dst_fmt == PixelFormat::Indexed8 {
+        return Err(EngineError::Internal(
+            "Indexed8 への変換は減色の経路で行います".into(),
+        ));
+    }
+    let max_s = channel_max(src_fmt);
+    let [mut r, mut g, mut b, mut a] = read_rgba(src_fmt, palette, src)?;
+    let to_gray = is_gray(dst_fmt);
+    if to_gray {
+        let y = luma(r, g, b);
+        (r, g, b) = (y, y, y);
+    }
+    if !dst_fmt.has_alpha() && a != max_s {
+        let wide = |v: u8| {
+            if max_s == 255 {
+                u32::from(v)
+            } else {
+                up8(u32::from(v))
+            }
+        };
+        let (mut mr, mut mg, mut mb) = (wide(matte[0]), wide(matte[1]), wide(matte[2]));
+        if to_gray {
+            let y = luma(mr, mg, mb);
+            (mr, mg, mb) = (y, y, y);
+        }
+        r = flatten(r, a, mr, max_s);
+        g = flatten(g, a, mg, max_s);
+        b = flatten(b, a, mb, max_s);
+        a = max_s;
+    }
+    let max_d = channel_max(dst_fmt);
+    if max_s != max_d {
+        let f: fn(u32) -> u32 = if max_d > max_s { up8 } else { down16 };
+        (r, g, b, a) = (f(r), f(g), f(b), f(a));
+    }
+    crate::imaging::pixels::write_rgba(dst_fmt, [r, g, b, a], out)
+}
+
 fn too_large() -> EngineError {
     EngineError::Limit("画像が大きすぎます".into())
 }
@@ -90,5 +140,85 @@ mod tests {
             to_rgba8_rows(&r16),
             Err(EngineError::Unsupported(_))
         ));
+    }
+
+    fn conv(src: PixelFormat, px: &[u8], dst: PixelFormat) -> Vec<u8> {
+        let mut out = vec![0u8; dst.bytes_per_pixel()];
+        convert_pixel(
+            src,
+            Some(&[[10, 20, 30, 128]]),
+            px,
+            dst,
+            [255, 255, 255],
+            &mut out,
+        )
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn converts_between_formats_with_the_frozen_formulas() {
+        // 深さ
+        assert_eq!(
+            conv(PixelFormat::Rgb8, &[1, 2, 255], PixelFormat::Rgb16),
+            [1, 1, 2, 2, 255, 255]
+        );
+        assert_eq!(
+            conv(PixelFormat::Gray16, &[128, 0], PixelFormat::Gray8),
+            [0]
+        );
+        assert_eq!(
+            conv(PixelFormat::Gray16, &[129, 0], PixelFormat::Gray8),
+            [1]
+        );
+        // グレーへ（Rec. 709）・グレーから
+        assert_eq!(
+            conv(PixelFormat::Rgb8, &[255, 0, 0], PixelFormat::Gray8),
+            [54]
+        );
+        assert_eq!(
+            conv(PixelFormat::Gray8, &[7], PixelFormat::Rgba8),
+            [7, 7, 7, 255]
+        );
+        // アルファを外すときは白に重ねる
+        assert_eq!(
+            conv(PixelFormat::Rgba8, &[0, 0, 0, 0], PixelFormat::Rgb8),
+            [255, 255, 255]
+        );
+        assert_eq!(
+            conv(PixelFormat::Rgba8, &[0, 0, 0, 128], PixelFormat::Rgb8),
+            [127, 127, 127]
+        );
+        assert_eq!(
+            conv(PixelFormat::Rgba8, &[9, 8, 7, 255], PixelFormat::Rgb8),
+            [9, 8, 7]
+        );
+        // パレットから
+        assert_eq!(
+            conv(PixelFormat::Indexed8, &[0], PixelFormat::Rgba8),
+            [10, 20, 30, 128]
+        );
+        // 同じ形式はそのまま
+        for fmt in PixelFormat::ALL {
+            if fmt == PixelFormat::Indexed8 {
+                continue;
+            }
+            let px: Vec<u8> = (0..fmt.bytes_per_pixel() as u8)
+                .map(|i| i * 13 + 3)
+                .collect();
+            assert_eq!(conv(fmt, &px, fmt), px, "{fmt:?}");
+        }
+        let mut out = [0u8];
+        assert!(
+            convert_pixel(
+                PixelFormat::Gray8,
+                None,
+                &[0],
+                PixelFormat::Indexed8,
+                [0; 3],
+                &mut out
+            )
+            .is_err()
+        );
     }
 }

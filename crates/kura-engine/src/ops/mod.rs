@@ -6,6 +6,11 @@
 
 pub mod audio;
 pub mod image;
+pub mod meta;
+pub mod paint;
+pub mod palette;
+pub mod sprite;
+pub mod util;
 
 use crate::op::Registry;
 
@@ -27,6 +32,17 @@ register_ops! {
     current: [
         image::crop::Crop,
         image::flip::Flip,
+        image::canvas::Canvas,
+        image::trim_alpha::TrimAlpha,
+        image::rotate90::Rotate90,
+        image::resize::Resize,
+        image::convert::Convert,
+        palette::replace::Replace,
+        sprite::split_grid::SplitGrid,
+        sprite::pack_grid::PackGrid,
+        meta::set_grid::SetGrid,
+        meta::set_pivot::SetPivot,
+        paint::actions::Actions,
         audio::gain::Gain,
     ],
     legacy: [],

@@ -38,6 +38,8 @@ pub enum IssueCode {
     TooLarge,
     /// メタデータを落とした（警告）。
     MetadataDropped,
+    /// sRGB でない（と見える）色空間の画像を、sRGB とみなして混色した（警告。v1 は色の変換をしない。§5.2）。
+    ColorSpaceAssumed,
 }
 
 /// 検証の指摘 1 つ。
@@ -160,6 +162,13 @@ pub enum EngineError {
     Io(#[from] std::io::Error),
     #[error("内部の誤り: {0}")]
     Internal(String),
+    /// 描くときに、あるノードで起きたエラー（`Unsupported`・`Limit`・`Decode`・`Encode` を包む。
+    /// `Invalid` は指摘にノードを付けるので包まない）。エディタはこのノードを強調する。
+    #[error("ノード {}：{source}", node.0)]
+    AtNode {
+        node: NodeId,
+        source: Box<EngineError>,
+    },
 }
 
 impl EngineError {
@@ -173,6 +182,40 @@ impl EngineError {
             Self::Decode { .. } | Self::Encode { .. } | Self::Io(_) => "Io",
             Self::CodecMissing { .. } => "ToolMissing",
             Self::Internal(_) => "Internal",
+            Self::AtNode { source, .. } => source.code(),
+        }
+    }
+
+    /// 包みを外した元のエラー。
+    pub fn root(&self) -> &EngineError {
+        match self {
+            Self::AtNode { source, .. } => source.root(),
+            other => other,
+        }
+    }
+
+    /// どのノードで起きたか（分かるとき）。
+    pub fn node(&self) -> Option<NodeId> {
+        match self {
+            Self::AtNode { node, .. } => Some(*node),
+            Self::Invalid(issues) => issues.0.iter().find_map(|i| i.node),
+            _ => None,
+        }
+    }
+
+    /// 描くときのエラーにノードを付ける（`Invalid` は指摘に、`Unsupported`・`Limit`・読み書きは包む。
+    /// 中止・内部の誤り・入出力はそのまま）。
+    pub fn at(self, node: NodeId) -> Self {
+        match self {
+            Self::Invalid(issues) => Self::Invalid(issues.at(node)),
+            e @ (Self::Unsupported(_)
+            | Self::Limit(_)
+            | Self::Decode { .. }
+            | Self::Encode { .. }) => Self::AtNode {
+                node,
+                source: Box::new(e),
+            },
+            other => other,
         }
     }
 }

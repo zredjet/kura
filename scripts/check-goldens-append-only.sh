@@ -1,7 +1,7 @@
 #!/bin/sh
 # 編集のゴールデンは追記だけ（docs/editing.md §8.5、ADR-136）。
 # 基準のコミットからの差分で、crates/kura-engine/goldens/・goldens-codecs/・goldens-replay/ の既存の行が消えた・変わったもの、
-# fixtures/ のファイルが消えた・変わったものがあれば失敗する。
+# fixtures/・tests/vectors/ のファイルが消えた・変わったものがあれば失敗する。
 # 使い方：scripts/check-goldens-append-only.sh [基準]（既定は origin/main。なければ main）
 set -eu
 
@@ -29,6 +29,13 @@ fi
 changed=$(git diff --no-renames --name-only --diff-filter=DM "$merge_base" HEAD -- crates/kura-engine/fixtures ':!crates/kura-engine/fixtures/README.md')
 if [ -n "$changed" ]; then
   echo "フィクスチャが消えた・変わっています（新しい名前で足してください）:"
+  echo "$changed"
+  exit 1
+fi
+# TS と共有するテストベクタ（描画の規則など）も、消すのも変えるのも認めない
+changed=$(git diff --no-renames --name-only --diff-filter=DM "$merge_base" HEAD -- crates/kura-engine/tests/vectors)
+if [ -n "$changed" ]; then
+  echo "共有のテストベクタが消えた・変わっています（規則を変えるなら操作の版を上げて、新しいファイルを足してください）:"
   echo "$changed"
   exit 1
 fi

@@ -19,6 +19,7 @@ pub mod math;
 pub mod monitor;
 pub mod op;
 pub mod ops;
+pub mod paint;
 pub mod render;
 pub mod shape;
 pub mod testfiles;

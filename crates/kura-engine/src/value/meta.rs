@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::geom::{IPoint, IRect};
 
 /// スプライトの格子。左上の `offset` から、`cell + gap` の間隔でセルが並ぶ。端の欠けたセルは数えない。
+/// 値のメタデータの型。操作の引数には `ops::util::GridParam` を使う（メタデータに項目を足しても引数の形が変わらないように）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Grid {

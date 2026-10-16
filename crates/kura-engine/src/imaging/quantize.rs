@@ -23,30 +23,116 @@ pub fn unpack(v: u32) -> [u8; 4] {
     v.to_be_bytes()
 }
 
-/// 色と出現数の表（色の小さい順）。`pixels` は RGBA8 を詰めたもの。
-pub fn histogram(pixels: &[u8]) -> Result<Vec<(u32, u64)>, EngineError> {
+fn no_room(what: &str) -> EngineError {
+    EngineError::Limit(format!("{what}を確保できません"))
+}
+
+/// 中止を確かめながら並べる（ブロックごとに並べてから、2 つずつ併合する。u32 の並べ替えは結果が 1 つに決まる）。
+fn sort_cancelable(v: &mut Vec<u32>, mon: &dyn Monitor) -> Result<(), EngineError> {
+    const CHUNK: usize = 1 << 20;
+    for c in v.chunks_mut(CHUNK) {
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
+        c.sort();
+    }
+    let mut width = CHUNK;
+    let mut buf: Vec<u32> = Vec::new();
+    while width < v.len() {
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
+        buf.clear();
+        buf.try_reserve_exact(v.len())
+            .map_err(|_| no_room("色の表"))?;
+        for pair in v.chunks(width * 2) {
+            let (a, b) = pair.split_at(width.min(pair.len()));
+            let (mut i, mut j) = (0, 0);
+            while i < a.len() && j < b.len() {
+                if a[i] <= b[j] {
+                    buf.push(a[i]);
+                    i += 1;
+                } else {
+                    buf.push(b[j]);
+                    j += 1;
+                }
+            }
+            buf.extend_from_slice(&a[i..]);
+            buf.extend_from_slice(&b[j..]);
+        }
+        std::mem::swap(v, &mut buf);
+        width *= 2;
+    }
+    Ok(())
+}
+
+/// 色と出現数の表（色の小さい順）。`pixels` は RGBA8 を詰めたもの。並べ替えの途中でも中止を確かめる。
+pub fn histogram(pixels: &[u8], mon: &dyn Monitor) -> Result<Vec<(u32, u64)>, EngineError> {
     let mut colors: Vec<u32> = Vec::new();
     colors
         .try_reserve_exact(pixels.len() / 4)
-        .map_err(|_| EngineError::Limit("色の表を確保できません".into()))?;
+        .map_err(|_| no_room("色の表"))?;
     colors.extend(
         pixels
             .chunks_exact(4)
             .map(|c| pack([c[0], c[1], c[2], c[3]])),
     );
-    colors.sort();
+    sort_cancelable(&mut colors, mon)?;
     let mut out: Vec<(u32, u64)> = Vec::new();
     for c in colors {
         match out.last_mut() {
             Some((last, n)) if *last == c => *n += 1,
-            _ => out.push((c, 1)),
+            _ => {
+                out.try_reserve(1).map_err(|_| no_room("色の表"))?;
+                out.push((c, 1));
+            }
         }
     }
     Ok(out)
 }
 
+/// 2 つの色の表を併合する（同じ色は数を足す。結果も色の小さい順）。フレームごとの表をまとめるのに使う。
+pub fn merge_histograms(
+    a: &[(u32, u64)],
+    b: &[(u32, u64)],
+) -> Result<Vec<(u32, u64)>, EngineError> {
+    let mut out: Vec<(u32, u64)> = Vec::new();
+    out.try_reserve_exact(a.len() + b.len())
+        .map_err(|_| no_room("色の表"))?;
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        let next = match (a.get(i), b.get(j)) {
+            (Some(x), Some(y)) if x.0 == y.0 => {
+                i += 1;
+                j += 1;
+                (x.0, x.1 + y.1)
+            }
+            (Some(x), Some(y)) if x.0 < y.0 => {
+                i += 1;
+                *x
+            }
+            (Some(_), Some(y)) | (None, Some(y)) => {
+                j += 1;
+                *y
+            }
+            (Some(x), None) => {
+                i += 1;
+                *x
+            }
+            (None, None) => break,
+        };
+        out.push(next);
+    }
+    Ok(out)
+}
+
 /// `max` 色以下のパレットを作る（`max` は 1〜256）。
-pub fn palette_for(hist: &[(u32, u64)], max: usize) -> Result<Vec<[u8; 4]>, EngineError> {
+/// 分ける 1 回ごとに中止を確かめる。
+pub fn palette_for(
+    hist: &[(u32, u64)],
+    max: usize,
+    mon: &dyn Monitor,
+) -> Result<Vec<[u8; 4]>, EngineError> {
     if !(1..=256).contains(&max) {
         return Err(EngineError::Internal(format!(
             "パレットの色の数が範囲の外です（{max}）"
@@ -55,8 +141,16 @@ pub fn palette_for(hist: &[(u32, u64)], max: usize) -> Result<Vec<[u8; 4]>, Engi
     if hist.len() <= max {
         return Ok(hist.iter().map(|(c, _)| unpack(*c)).collect());
     }
-    let mut boxes: Vec<Vec<(u32, u64)>> = vec![hist.to_vec()];
+    let mut first: Vec<(u32, u64)> = Vec::new();
+    first
+        .try_reserve_exact(hist.len())
+        .map_err(|_| no_room("減色の箱"))?;
+    first.extend_from_slice(hist);
+    let mut boxes: Vec<Vec<(u32, u64)>> = vec![first];
     while boxes.len() < max {
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
         // 分ける箱を選ぶ
         let mut best: Option<(usize, u32, u64)> = None;
         for (i, b) in boxes.iter().enumerate() {
@@ -148,9 +242,8 @@ pub fn nearest(c: [u8; 4], palette: &[[u8; 4]]) -> u8 {
     best.0 as u8
 }
 
-/// 各画素（RGBA8 を詰めたもの）をパレットの番号にする。色ごとに 1 回だけ探す。
-pub fn map_to_palette(
-    pixels: &[u8],
+/// 色の表の各色の、いちばん近いパレットの番号（並列。結果は位置で決まる）。フレームの列では 1 回だけ作って使い回す。
+pub fn palette_lookup(
     hist: &[(u32, u64)],
     palette: &[[u8; 4]],
     mon: &dyn Monitor,
@@ -160,7 +253,6 @@ pub fn map_to_palette(
             "パレットの色の数が範囲の外です".into(),
         ));
     }
-    // 色の表の順に、いちばん近い番号を求める（並列。結果は位置で決まる）
     const BLOCK: usize = 4_096;
     let blocks = par_blocks(hist.len().div_ceil(BLOCK), mon, |b| {
         let end = (b * BLOCK + BLOCK).min(hist.len());
@@ -169,11 +261,23 @@ pub fn map_to_palette(
             .map(|(c, _)| nearest(unpack(*c), palette))
             .collect::<Vec<u8>>())
     })?;
-    let lookup: Vec<u8> = blocks.concat();
+    Ok(blocks.concat())
+}
+
+/// 各画素（RGBA8 を詰めたもの）を、`palette_lookup` の表でパレットの番号にする。
+pub fn map_with_lookup(
+    pixels: &[u8],
+    hist: &[(u32, u64)],
+    lookup: &[u8],
+    mon: &dyn Monitor,
+) -> Result<Vec<u8>, EngineError> {
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(pixels.len() / 4)
         .map_err(|_| EngineError::Limit("番号の表を確保できません".into()))?;
-    for c in pixels.chunks_exact(4) {
+    for (k, c) in pixels.chunks_exact(4).enumerate() {
+        if k % 65_536 == 65_535 && mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
         let v = pack([c[0], c[1], c[2], c[3]]);
         let i = hist.partition_point(|(h, _)| *h < v);
         let idx = lookup
@@ -185,20 +289,79 @@ pub fn map_to_palette(
     Ok(out)
 }
 
+/// 各画素（RGBA8 を詰めたもの）をパレットの番号にする。色ごとに 1 回だけ探す。
+pub fn map_to_palette(
+    pixels: &[u8],
+    hist: &[(u32, u64)],
+    palette: &[[u8; 4]],
+    mon: &dyn Monitor,
+) -> Result<Vec<u8>, EngineError> {
+    let lookup = palette_lookup(hist, palette, mon)?;
+    map_with_lookup(pixels, hist, &lookup, mon)
+}
+
+/// 色の表をまとめて併合する（2 つずつの木の形で併合するので、手間は色の数 × log(表の数)）。
+pub fn merge_all(
+    mut hists: Vec<Vec<(u32, u64)>>,
+    mon: &dyn Monitor,
+) -> Result<Vec<(u32, u64)>, EngineError> {
+    while hists.len() > 1 {
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
+        let mut next = Vec::with_capacity(hists.len().div_ceil(2));
+        let mut it = hists.into_iter();
+        while let Some(a) = it.next() {
+            match it.next() {
+                Some(b) => next.push(merge_histograms(&a, &b)?),
+                None => next.push(a),
+            }
+        }
+        hists = next;
+    }
+    Ok(hists.pop().unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ブロックに分けた並べ替えと併合は、ふつうの並べ替えと同じ。フレームごとの表を併合しても同じ。
+    #[test]
+    fn chunked_sort_and_merge_match_a_plain_sort() {
+        let mut r = crate::determinism::rng(5);
+        use rand_chacha::rand_core::Rng;
+        let n = (1 << 20) * 3 + 12_345;
+        let v: Vec<u32> = (0..n).map(|_| r.next_u32() % 50_000).collect();
+        let mut a = v.clone();
+        sort_cancelable(&mut a, &NoMonitor).unwrap();
+        let mut b = v.clone();
+        b.sort();
+        assert_eq!(a, b);
+        let px: Vec<u8> = v.iter().flat_map(|c| c.to_be_bytes()).collect();
+        let whole = histogram(&px, &NoMonitor).unwrap();
+        let (x, y) = px.split_at(px.len() / 3 / 4 * 4);
+        let parts = merge_histograms(
+            &histogram(x, &NoMonitor).unwrap(),
+            &histogram(y, &NoMonitor).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parts, whole);
+        let flag = crate::monitor::CancelFlag::default();
+        flag.cancel();
+        assert!(matches!(histogram(&px, &flag), Err(EngineError::Canceled)));
+    }
     use crate::monitor::NoMonitor;
 
     #[test]
     fn few_colors_are_kept_exactly() {
         let px = [9, 9, 9, 255, 1, 2, 3, 255, 9, 9, 9, 255];
-        let hist = histogram(&px).unwrap();
+        let hist = histogram(&px, &NoMonitor).unwrap();
         assert_eq!(
             hist,
             vec![(pack([1, 2, 3, 255]), 1), (pack([9, 9, 9, 255]), 2)]
         );
-        let pal = palette_for(&hist, 256).unwrap();
+        let pal = palette_for(&hist, 256, &NoMonitor).unwrap();
         assert_eq!(pal, vec![[1, 2, 3, 255], [9, 9, 9, 255]]);
         assert_eq!(
             map_to_palette(&px, &hist, &pal, &NoMonitor).unwrap(),
@@ -218,12 +381,12 @@ mod tests {
                 255,
             ]);
         }
-        let hist = histogram(&px).unwrap();
-        let pal = palette_for(&hist, 16).unwrap();
+        let hist = histogram(&px, &NoMonitor).unwrap();
+        let pal = palette_for(&hist, 16, &NoMonitor).unwrap();
         assert_eq!(pal.len(), 16);
         let mut reversed: Vec<u8> = px.chunks_exact(4).rev().flatten().copied().collect();
-        let hist_r = histogram(&reversed).unwrap();
-        assert_eq!(palette_for(&hist_r, 16).unwrap(), pal);
+        let hist_r = histogram(&reversed, &NoMonitor).unwrap();
+        assert_eq!(palette_for(&hist_r, 16, &NoMonitor).unwrap(), pal);
         let idx = map_to_palette(&px, &hist, &pal, &NoMonitor).unwrap();
         assert!(idx.iter().all(|i| usize::from(*i) < 16));
         // 凍結：パレットのダイジェスト

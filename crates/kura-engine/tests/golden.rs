@@ -208,13 +208,16 @@ fn goldens_match_and_are_complete() {
                     );
                 }
             }
-            let exact = imp.signature().numeric == Numeric::Exact;
-            if lines.iter().any(|l| (l.target == "*") != exact) {
-                let _ = writeln!(
-                    failures,
-                    "{op} v{v}：数値の申告（{:?}）と行のターゲットが合いません",
-                    imp.signature().numeric
-                );
+            // 数値の性質は引数で変わりうる（最近傍のリサイズは整数だけ）ので、行ごとにその引数で確かめる
+            for line in lines {
+                let numeric = imp.numeric(&line.params).unwrap();
+                if (line.target == "*") != (numeric == Numeric::Exact) {
+                    let _ = writeln!(
+                        failures,
+                        "{op} v{v} {}：数値の申告（{numeric:?}）と行のターゲットが合いません",
+                        line.name
+                    );
+                }
             }
         }
     }
@@ -227,10 +230,10 @@ fn goldens_match_and_are_complete() {
             .get(&(op.to_string(), v))
             .cloned()
             .unwrap_or_default();
-        let exact = imp.signature().numeric == Numeric::Exact;
-        let want = if exact { "*".to_string() } else { here.clone() };
         let mut to_append = Vec::new();
         for ex in imp.examples().unwrap() {
+            let exact = imp.numeric(&ex.params).unwrap() == Numeric::Exact;
+            let want = if exact { "*".to_string() } else { here.clone() };
             let same_name: Vec<&Line> = lines.iter().filter(|l| l.name == ex.name).collect();
             if same_name
                 .iter()
@@ -254,7 +257,7 @@ fn goldens_match_and_are_complete() {
                 .unwrap_or_else(|e| panic!("{op} {}: {e}", ex.name));
             to_append.push(Line {
                 name: ex.name.to_string(),
-                target: want.clone(),
+                target: want,
                 rules: RULES,
                 params: ex.params,
                 inputs: ex.inputs,

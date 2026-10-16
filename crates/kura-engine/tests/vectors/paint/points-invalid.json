@@ -1,0 +1,49 @@
+{
+  "cases": [
+    {
+      "name": "length-mod-4-is-1",
+      "packed": "A"
+    },
+    {
+      "name": "leftover-bits",
+      "packed": "AAB"
+    },
+    {
+      "name": "truncated-varint",
+      "packed": "gA"
+    },
+    {
+      "name": "bad-character",
+      "packed": "A*A"
+    },
+    {
+      "name": "padding",
+      "packed": "AA=="
+    },
+    {
+      "name": "odd-number-of-values",
+      "packed": "AA"
+    },
+    {
+      "name": "non-canonical-zero",
+      "packed": "gAAA"
+    },
+    {
+      "name": "varint-longer-than-10-bytes",
+      "packed": "gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAAAA"
+    },
+    {
+      "name": "x-out-of-range",
+      "packed": "gICAgCAA"
+    },
+    {
+      "name": "y-out-of-range",
+      "packed": "AIGAgIAQ"
+    },
+    {
+      "name": "delta-leaves-range",
+      "packed": "gICAgBAAAgA"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,2 @@
+{"digest":"d3f3b3b28ad02987f0f4602ac7aa32bb6fd86390bac3bc7168c884a811738e09","inputs":[{"fmt":"indexed8","h":20,"seed":61,"type":"noise","w":300}],"name":"two-colors","params":{"entries":[{"color":[255,0,255,255],"index":0},{"color":[1,2,3,0],"index":15}]},"target":"*"}
+{"digest":"c2eb550372639f8e10e4a3b9bc36167e5cc6deaa964118295eaf303bd8bac8af","inputs":[{"count":2,"fmt":"indexed8","h":4,"seed":62,"type":"noiseFrames","w":5}],"name":"frames-share-the-palette","params":{"entries":[{"color":[9,9,9,255],"index":3}]},"target":"*"}

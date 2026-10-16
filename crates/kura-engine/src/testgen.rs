@@ -49,6 +49,15 @@ pub enum InputGen {
         count: u32,
         seed: u64,
     },
+    /// トリムしたフレームの列：`w × h` のキャンバスに、大きさと位置の違う乱数のフレームを置く
+    /// （フレーム i は 幅 `w/2 + i % (w/2)`・高さ `h/2` を、左上 `(i % (w/2), i % (h/2))` に置く）。
+    TrimmedFrames {
+        w: u32,
+        h: u32,
+        fmt: PixelFormat,
+        count: u32,
+        seed: u64,
+    },
     /// 正弦波（振幅 0.5）。チャンネルごとに周波数を 1.5 倍ずつ上げる。
     Sine {
         rate: u32,
@@ -81,6 +90,9 @@ pub struct MetaGen {
     /// EXIF（TIFF の形）。ないときは書かない（足す前に凍結した入力の書き方を変えない）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exif: Option<Vec<u8>>,
+    /// スライス（画像だけ）。ないときは書かない（同上）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<crate::value::Slice>,
 }
 
 impl MetaGen {
@@ -93,6 +105,7 @@ impl MetaGen {
         if let Some(exif) = &self.exif {
             meta.exif = Some(Arc::new(exif.clone()));
         }
+        meta.slices.extend(self.slices.iter().cloned());
     }
 
     fn apply_audio(&self, meta: &mut AudioMeta) {
@@ -289,6 +302,41 @@ impl InputGen {
                     .collect::<Result<Vec<_>, EngineError>>()?;
                 Ok(Value::Frames(Arc::new(Frames::full(
                     frames,
+                    ImageMeta::default(),
+                    0,
+                )?)))
+            }
+            Self::TrimmedFrames {
+                w,
+                h,
+                fmt,
+                count,
+                seed,
+            } => {
+                let (hw, hh) = ((w / 2).max(1), (h / 2).max(1));
+                let frames = (0..count.max(1))
+                    .map(|i| {
+                        let (fw, fh) = ((hw + i % hw).min(w), hh);
+                        let (ox, oy) = (i % hw, i % hh);
+                        let (ox, oy) = (ox.min(w - fw), oy.min(h - fh));
+                        Ok(crate::value::Frame {
+                            px: noise_raster(
+                                fw,
+                                fh,
+                                fmt,
+                                determinism::splitmix64(seed ^ u64::from(i)),
+                            )?,
+                            offset: IPoint {
+                                x: i64::from(ox),
+                                y: i64::from(oy),
+                            },
+                            duration_ms: 50 + 10 * i,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, EngineError>>()?;
+                Ok(Value::Frames(Arc::new(Frames::new(
+                    frames,
+                    crate::geom::Size { w, h },
                     ImageMeta::default(),
                     0,
                 )?)))

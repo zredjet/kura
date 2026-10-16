@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Issue, IssueCode};
+use crate::error::{EngineError, Issue, IssueCode};
 use crate::geom::{IPoint, IRect, Ratio, Size, div_round_half_even};
 use crate::value::{AudioMeta, Grid, ImageMeta, LoopRange, Marker, Slice};
 
@@ -173,7 +173,39 @@ fn dropped(what: &str) -> Issue {
     )
 }
 
-/// 画像のメタデータを写す。`input` は入力の大きさ。返すのは写したものと警告。
+/// 文書の全体の規則の版 `rules` の写し方で、画像のメタデータを写す（§8.4）。規則の版を上げたら、古い版の写し方も残して、
+/// ここで版ごとに選ぶ。実行器と、メタデータを自分で書く操作（`MetaAccess::Write`）の両方がこれを使う。
+pub fn map_image_meta_for(
+    rules: u32,
+    meta: &ImageMeta,
+    input: Size,
+    map: &SpaceMap,
+) -> Result<(ImageMeta, Vec<Issue>), EngineError> {
+    match rules {
+        1 => Ok(map_image_meta(meta, input, map)),
+        // 文書の形の確かめで知らない版は断っているので、ここには来ない
+        other => Err(EngineError::Internal(format!(
+            "規則の版 {other} の写し方がありません"
+        ))),
+    }
+}
+
+/// 文書の全体の規則の版 `rules` の写し方で、音声のメタデータを写す。
+pub fn map_audio_meta_for(
+    rules: u32,
+    meta: &AudioMeta,
+    map: &TimeMap,
+    out_frames: u64,
+) -> Result<(AudioMeta, Vec<Issue>), EngineError> {
+    match rules {
+        1 => Ok(map_audio_meta(meta, map, out_frames)),
+        other => Err(EngineError::Internal(format!(
+            "規則の版 {other} の写し方がありません"
+        ))),
+    }
+}
+
+/// 規則 1 の画像のメタデータの写し方。`input` は入力の大きさ。返すのは写したものと警告。
 pub fn map_image_meta(meta: &ImageMeta, input: Size, map: &SpaceMap) -> (ImageMeta, Vec<Issue>) {
     let mut out = meta.clone();
     let mut warnings = Vec::new();
@@ -400,7 +432,7 @@ impl TimeMap {
     }
 }
 
-/// 音声のメタデータを写す。`out_frames` は出力の長さ（これより後ろに出たものは詰めるか落とす）。返すのは写したものと警告。
+/// 規則 1 の音声のメタデータの写し方。`out_frames` は出力の長さ（これより後ろに出たものは詰めるか落とす）。返すのは写したものと警告。
 pub fn map_audio_meta(meta: &AudioMeta, map: &TimeMap, out_frames: u64) -> (AudioMeta, Vec<Issue>) {
     let mut out = meta.clone();
     let mut warnings = Vec::new();

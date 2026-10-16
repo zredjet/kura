@@ -168,6 +168,49 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
         .bytes()
         .unwrap()
     };
+    // パレットの番号のまま描ける形（合成は通常・不透明度はすべて 255・パレットは不透明）。カバレッジで、ほかの種からは
+    // この経路（index_mode）に届いていなかった
+    let ase_indexed = || {
+        let opaque = |c: AseCel| AseCel { opacity: 255, ..c };
+        FileGen::Aseprite {
+            w: 12,
+            h: 10,
+            depth: 8,
+            flags: 3,
+            transparent: 1,
+            palette_len: 16,
+            layers: vec![
+                lay(1, 0, 0, 0, 255),
+                lay(1, 1, 0, 0, 255),
+                lay(1, 0, 1, 0, 255),
+                lay(1, 2, 0, 0, 255),
+            ],
+            frames: vec![
+                AseFrame {
+                    duration: 40,
+                    cels: vec![
+                        opaque(cel(0, 2, 12, 10)),
+                        opaque(cel(2, 0, 6, 5)),
+                        opaque(cel(3, 3, 3, 2)),
+                    ],
+                },
+                AseFrame {
+                    duration: 60,
+                    cels: vec![opaque(AseCel {
+                        kind: 1,
+                        ..cel(0, 1, 1, 1)
+                    })],
+                },
+            ],
+            tileset: Some((4, 4, 3)),
+            tags: vec![],
+            slices: vec![],
+            seed: 6,
+            opaque_palette: true,
+        }
+        .bytes()
+        .unwrap()
+    };
     let psd = |g: PsdGen| FileGen::Psd(g).bytes().unwrap();
     let psd_base = PsdGen {
         w: 11,
@@ -214,6 +257,79 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
     )
     .unwrap();
     doc.push_linear("image.flip", 1, json!({ "axis": "vertical" }), 0)
+        .unwrap();
+    // 段 5 の画像の操作と描画
+    let mut paint_doc = Graph::new_single();
+    paint_doc
+        .push_linear(
+            "paint.actions",
+            1,
+            json!({ "actions": [
+                { "type": "stroke", "tool": "pen", "color": { "rgba": [255, 0, 0, 200] }, "blend": "over",
+                  "brush": { "shape": "circle", "size": 3 }, "pixelPerfect": true, "frame": 0,
+                  "points": kura_engine::paint::PointList(vec![
+                      kura_engine::geom::IPoint { x: 1, y: 1 },
+                      kura_engine::geom::IPoint { x: 20, y: 9 },
+                  ]).pack() },
+                { "type": "fill", "at": { "x": 3, "y": 3 }, "color": { "rgba": [0, 0, 0, 0] }, "tolerance": 30,
+                  "connectivity": "eight", "contiguous": true, "frame": 0 }
+            ] }),
+            0,
+        )
+        .unwrap();
+    paint_doc
+        .push_linear(
+            "image.trim_alpha",
+            1,
+            json!({ "threshold": 0, "mode": "union" }),
+            0,
+        )
+        .unwrap();
+    let mut chain_doc = Graph::new_single();
+    chain_doc
+        .push_linear(
+            "image.canvas",
+            1,
+            json!({ "rect": { "x": -2, "y": -2, "w": 30, "h": 20 }, "fill": null }),
+            0,
+        )
+        .unwrap();
+    chain_doc
+        .push_linear(
+            "image.resize",
+            1,
+            json!({ "width": { "scale": { "num": 3, "den": 2 } }, "height": "auto", "filter": "lanczos3" }),
+            0,
+        )
+        .unwrap();
+    chain_doc
+        .push_linear("image.rotate90", 1, json!({ "turn": "ccw" }), 0)
+        .unwrap();
+    chain_doc
+        .push_linear(
+            "image.convert",
+            1,
+            json!({ "format": "indexed8", "colors": 7, "dither": "errorDiffusion", "matte": [255, 255, 255] }),
+            0,
+        )
+        .unwrap();
+    let mut sprite_doc = Graph::new_single();
+    sprite_doc
+        .push_linear(
+            "sprite.split_grid",
+            1,
+            json!({ "grid": { "cellW": 4, "cellH": 4, "offsetX": 0, "offsetY": 0, "gapX": 1, "gapY": 0 },
+                    "durationMs": 100, "skipEmpty": true }),
+            0,
+        )
+        .unwrap();
+    sprite_doc
+        .push_linear(
+            "sprite.pack_grid",
+            1,
+            json!({ "columns": 2, "gapX": 1, "gapY": 1, "fill": [1, 2, 3, 255] }),
+            0,
+        )
         .unwrap();
     let mut audio_doc = Graph::new_single();
     audio_doc
@@ -263,7 +379,7 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 fixture("webp-anim.webp"),
             ],
         ),
-        ("aseprite", vec![ase(32), ase(8), ase(16)]),
+        ("aseprite", vec![ase(32), ase(8), ase(16), ase_indexed()]),
         (
             "psd",
             vec![
@@ -278,6 +394,8 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
             vec![
                 br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="20"><defs><g id="a"><rect width="3" height="3" fill="#f00"/></g><marker id="m"><circle r="1"/></marker></defs><use xlink:href="#a" x="4"/><path d="M0 0 L5 5 L9 2" stroke="#000" marker-mid="url(#m)"/></svg>"##.to_vec(),
                 br#"<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY ns "http://www.w3.org/2000/svg"><!-- c --><!ATTLIST svg x CDATA "1">]><svg xmlns="&ns;" width="4" height="4"><circle cx="2" cy="2" r="1" opacity="0.5"/></svg>"#.to_vec(),
+                br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="12" viewBox="0 0 8 6"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#f00"/><stop offset="1" stop-color="#00f" stop-opacity="0.3"/></linearGradient><clipPath id="c"><rect width="6" height="4"/></clipPath><pattern id="p" width="2" height="2" patternUnits="userSpaceOnUse"><rect width="1" height="1"/></pattern></defs><g clip-path="url(#c)" transform="rotate(10 4 3)"><rect width="8" height="6" fill="url(#g)"/><ellipse cx="4" cy="3" rx="3" ry="1.5" fill="url(#p)" stroke="#0a0" stroke-width="0.5" stroke-dasharray="1 0.5"/></g><polyline points="0,0 2,5 4,1 7,6" fill="none" stroke="black" style="marker-end:url(#m)"/></svg>"##.to_vec(),
+                br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><style>.a{fill:#123456;opacity:.5}</style><filter id="f"><feGaussianBlur stdDeviation="1"/></filter><mask id="k"><rect width="10" height="5" fill="#fff"/></mask><path class="a" d="M1 1h8v8H1zM3 3l4 4m0-4q-2 3-4 0c1-1 2 2 3 0a2 2 0 1 1 1 1z" mask="url(#k)" filter="url(#f)"/><text x="1" y="9">x</text></svg>"##.to_vec(),
             ],
         ),
         (
@@ -287,7 +405,16 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 encoded("wav", &wav_meta, json!({ "float": true })),
             ],
         ),
-        ("document", vec![doc.to_canonical_json().unwrap(), audio_doc.to_canonical_json().unwrap()]),
+        (
+            "document",
+            vec![
+                doc.to_canonical_json().unwrap(),
+                audio_doc.to_canonical_json().unwrap(),
+                paint_doc.to_canonical_json().unwrap(),
+                chain_doc.to_canonical_json().unwrap(),
+                sprite_doc.to_canonical_json().unwrap(),
+            ],
+        ),
     ]
 }
 
@@ -434,6 +561,64 @@ fn long() {
     assert!(found.is_empty(), "\n{}", found.join("\n"));
 }
 
+/// 種を cargo-fuzz の種の置き場（`fuzz/corpus/<対象>/`。git には入れない）に書き出す（fuzz/README.md）。
+/// 対象の名前は、デコーダは `decode_<形式>`、文書は `document`。
+#[test]
+#[ignore]
+fn export_seeds() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus");
+    let mut n = 0;
+    for (target, seeds) in targets() {
+        let name = if target == "document" {
+            target.to_string()
+        } else {
+            format!("decode_{target}")
+        };
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, s) in seeds.iter().enumerate() {
+            std::fs::write(dir.join(format!("seed-{i:03}")), s).unwrap();
+            n += 1;
+        }
+    }
+    // 登録されたすべての操作の例を、1 ノードの文書にして種にする（引数の形の種類が多い）
+    let engine = kura_engine::Engine::new().unwrap();
+    let dir = root.join("document");
+    for op in engine.registry().all() {
+        for ex in op.examples().unwrap() {
+            let mut g = Graph::new_single();
+            g.push_linear(op.id(), op.version(), ex.params.clone(), 0)
+                .unwrap();
+            let file = format!("op-{}-v{}-{}", op.id(), op.version(), ex.name);
+            std::fs::write(dir.join(file), g.to_canonical_json().unwrap()).unwrap();
+            n += 1;
+        }
+    }
+    // デコーダのゴールデンに凍結した作り方（`FileGen`）のファイルも種にする（形の種類が多い）
+    let goldens = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("goldens-codecs");
+    for entry in std::fs::read_dir(&goldens).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.contains("-dec@") {
+            continue;
+        }
+        for (i, line) in std::fs::read_to_string(&path).unwrap().lines().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let file: FileGen = serde_json::from_value(v["source"].clone()).unwrap();
+            let Ok(bytes) = file.bytes() else { continue };
+            let dir = root.join(format!("decode_{}", file.format()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("golden-{}-{i:03}", name.trim_end_matches(".jsonl"))),
+                bytes,
+            )
+            .unwrap();
+            n += 1;
+        }
+    }
+    eprintln!("{n} 個の種を {} に書きました", root.display());
+}
+
 /// 見つけた入力（`target/fuzz-smoke/<対象>-<回>.bin`）を読み直して流す。直したあとに確かめる。
 #[test]
 #[ignore]
@@ -456,4 +641,31 @@ fn replay() {
     }
     eprintln!("{n} 件を流しました");
     assert!(found.is_empty(), "\n{}", found.join("\n"));
+}
+
+/// 種が、デコーダの主な経路に届く（カバレッジで見つけた穴：aseprite のパレットの番号のまま描く経路には、どの種も届いていなかった）。
+#[test]
+fn seeds_reach_indexed_aseprite() {
+    let (_, seeds) = targets()
+        .into_iter()
+        .find(|(f, _)| *f == "aseprite")
+        .unwrap();
+    let indexed = seeds.iter().any(|b| {
+        let v = CodecSet::pinned().decode(
+            &mut std::io::Cursor::new(b.clone()),
+            "aseprite",
+            &Default::default(),
+            &Default::default(),
+            &NoMonitor,
+        );
+        match v {
+            Ok((Value::Frames(f), _)) => f
+                .frames()
+                .iter()
+                .all(|x| x.px.format() == PixelFormat::Indexed8),
+            Ok((Value::Image(i), _)) => i.px.format() == PixelFormat::Indexed8,
+            _ => false,
+        }
+    });
+    assert!(indexed);
 }

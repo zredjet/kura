@@ -2,8 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 点。
+/// 点。引数として読むときは知らない項目を拒む（文書の型は知らない項目を黙って捨てない。ADR-143 (4)）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IPoint {
     pub x: i64,
     pub y: i64,
@@ -11,6 +12,7 @@ pub struct IPoint {
 
 /// 大きさ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Size {
     pub w: u32,
     pub h: u32,
@@ -18,6 +20,7 @@ pub struct Size {
 
 /// 矩形（左上と大きさ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IRect {
     pub x: i64,
     pub y: i64,
@@ -72,6 +75,7 @@ pub fn coord_ok(v: i64) -> bool {
 
 /// 整数の比（`num / den`）。大きさの引数に使い、浮動小数を使わずに丸めを一意にする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ratio {
     pub num: u32,
     pub den: u32,
@@ -82,6 +86,18 @@ impl Ratio {
     pub fn apply_i64(&self, x: i64) -> Option<i64> {
         div_round_half_even(i128::from(x) * i128::from(self.num), i128::from(self.den))
     }
+}
+
+/// 長さの引数（docs/editing.md §5.4）。JSON は `{"px": n}`・`{"scale": {"num", "den"}}`・`"auto"`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Length {
+    /// 画素。
+    Px(u32),
+    /// 入力に対する比（「幅の 50%」は `Scale(1/2)`）。
+    Scale(Ratio),
+    /// もう一方の軸の倍率で縦横比を保つ。
+    Auto,
 }
 
 /// `n / d` を最も近い整数に丸める（ちょうど半分なら偶数へ）。d が 0 なら None。

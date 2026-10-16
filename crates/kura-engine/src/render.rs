@@ -14,7 +14,7 @@ use crate::doc::{self, Graph, InputId, InputRole, NodeId, OutputId, PortRef};
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 use crate::geom::Size;
 use crate::limits::Limits;
-use crate::mapping::{SpaceMap, TimeMap, map_audio_meta, map_image_meta};
+use crate::mapping::{SpaceMap, TimeMap, map_audio_meta_for, map_image_meta_for};
 use crate::monitor::Monitor;
 use crate::op::{
     AnyParams, ApplyCx, DynOp, InferCx, Inferred, Lift, MetaAccess, Registry, Resolved,
@@ -222,9 +222,29 @@ impl Engine {
                         "フレームの列に当てられない操作です",
                     ));
                 };
-                // 出力の大きさが中身で決まる操作（入力は決まっているのに出力が AtMost）は、フレームごとに大きさが変わりうるので持ち上げない
-                let content_dependent = (fw.exact().is_some() && w.exact().is_none())
-                    || (fh.exact().is_some() && h.exact().is_none());
+                // 出力の大きさが中身で決まる操作は、フレームごとに大きさが変わりうるので持ち上げない。
+                // 判定は「入力の大きさを決めた形（上限の値）で推論し直しても、出力に AtMost が残るか」で行う
+                // （軸ごとに比べると、軸を入れ替える回転や、もう一方の軸で決まる自動の軸を誤って断るため）
+                let content_dependent = if fw.exact().is_some() && fh.exact().is_some() {
+                    w.exact().is_none() || h.exact().is_none()
+                } else {
+                    let mut fixed = frame_inputs.clone();
+                    if let Shape::Image { fmt: ffmt, .. } = frame {
+                        fixed[0] = Shape::Image {
+                            w: Dim::Exact(fw.max()),
+                            h: Dim::Exact(fh.max()),
+                            fmt: ffmt,
+                        };
+                    }
+                    match op.infer(params.as_ref(), &fixed, &cx) {
+                        Ok(again) => match again.shape {
+                            Shape::Image { w, h, .. } => w.exact().is_none() || h.exact().is_none(),
+                            _ => true,
+                        },
+                        // 上限の大きさでは断られる操作は、実行で各フレームの大きさがそろうかを確かめる
+                        Err(_) => false,
+                    }
+                };
                 if content_dependent {
                     return Err(one(
                         IssueCode::BadInput,
@@ -345,9 +365,12 @@ impl Engine {
                     mon,
                     limits: &self.limits,
                     seed: determinism::seed(node.seed, &source.0, node.op.id()),
+                    rules: plan.rules,
                     warnings: Vec::new(),
                 };
-                let (out, mut mapped) = self.apply_node(plan.rules, node, &ins, &mut cx)?;
+                let (out, mut mapped) = self
+                    .apply_node(plan.rules, node, &ins, &mut cx)
+                    .map_err(|e| e.at(node.id))?;
                 let mut all = cx.warnings;
                 all.append(&mut mapped);
                 (out, all)
@@ -367,7 +390,13 @@ impl Engine {
                     out.shape()
                 )));
             }
-            warnings.extend(node_warnings.into_iter().map(|w| w.at(node.id)));
+            // 持ち上げた操作はフレームごとに同じ警告を出すので、ノードごとに同じものは 1 つにする（出た順は保つ）
+            for w in node_warnings {
+                let w = w.at(node.id);
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
             values.insert(node.id, out);
         }
         let outputs = plan
@@ -528,8 +557,7 @@ fn image_meta_and_size(v: &Value) -> Option<(&crate::value::ImageMeta, Size)> {
     }
 }
 
-/// 入力 0 のメタデータを、文書の規則の版の写し方で写して出力に付ける。
-/// 規則の版を上げたら、古い版の写し方も残して、ここで版ごとに選ぶ（§8.4）。
+/// 入力 0 のメタデータを、文書の規則の版の写し方で写して出力に付ける（版の選び方は `mapping::map_*_for`）。
 fn with_mapped_meta(
     rules: u32,
     out: Value,
@@ -537,43 +565,27 @@ fn with_mapped_meta(
     space: &SpaceMap,
     time: &TimeMap,
 ) -> Result<(Value, Vec<Issue>), EngineError> {
-    match rules {
-        1 => Ok(with_mapped_meta_r1(out, input, space, time)),
-        // 形の確かめで知らない版は断っているので、ここには来ない
-        other => Err(EngineError::Internal(format!(
-            "規則の版 {other} の写し方がありません"
-        ))),
-    }
-}
-
-/// 規則 1 のメタデータの写し方。
-fn with_mapped_meta_r1(
-    out: Value,
-    input: &Value,
-    space: &SpaceMap,
-    time: &TimeMap,
-) -> (Value, Vec<Issue>) {
-    match (out, image_meta_and_size(input), input) {
+    Ok(match (out, image_meta_and_size(input), input) {
         (Value::Image(img), Some((meta, size)), _) => {
-            let (meta, warnings) = map_image_meta(meta, size, space);
+            let (meta, warnings) = map_image_meta_for(rules, meta, size, space)?;
             let mut img = Arc::unwrap_or_clone(img);
             img.meta = meta;
             (Value::Image(Arc::new(img)), warnings)
         }
         (Value::Frames(fr), Some((meta, size)), _) => {
-            let (meta, warnings) = map_image_meta(meta, size, space);
+            let (meta, warnings) = map_image_meta_for(rules, meta, size, space)?;
             let mut fr = Arc::unwrap_or_clone(fr);
             fr.meta = meta;
             (Value::Frames(Arc::new(fr)), warnings)
         }
         (Value::Audio(a), _, Value::Audio(src)) => {
-            let (meta, warnings) = map_audio_meta(&src.meta, time, a.frames() as u64);
+            let (meta, warnings) = map_audio_meta_for(rules, &src.meta, time, a.frames() as u64)?;
             let mut a = Arc::unwrap_or_clone(a);
             a.meta = meta;
             (Value::Audio(Arc::new(a)), warnings)
         }
         (other, _, _) => (other, Vec::new()),
-    }
+    })
 }
 
 /// 形の推論の段階で `Dim` が決まっているかを確かめる補助。
