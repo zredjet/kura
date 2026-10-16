@@ -304,6 +304,7 @@ import_start:    ジョブとして実行
 | `kura-devtools bench backup --library <path>` | DB のバックアップを 1 つ作る速さ（10 万件・58MB で 0.25 秒。M9） |
 | `kura-devtools import` / `check` | コマンドラインからの取り込みと整合性の確認（§6） |
 | `kura-devtools download --library <path> <url>...` | アプリと同じダウンロードのジョブで取得して入れる（§9。既定の選択・Cookie なし） |
+| `kura-devtools edit shape --in <file>` / `edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]` | 編集のエンジンを手で確かめる（形式と形の表示、文書を当てて書き出し、ダイジェスト・記録・警告を表示。docs/editing.md） |
 | `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない） |
 | `VITE_KURA_BENCH=1` | グリッドを自動でスクロールし、フレーム時間を `bench_report` でログに書く |
 

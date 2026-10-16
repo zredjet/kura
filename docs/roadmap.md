@@ -172,7 +172,7 @@
 正本は `docs/editing.md`。`crates/kura-engine` を作り、決定性・版・テストの契約を固める。M11 以降はすべてこの上に載せる（ADR-133・134）。各段の終わりに `/verify` と、複数のエージェントによる検証（決定性・テストの抜け・docs との食い違い・安全・拡張性）を回し、確かめられた指摘を直してからコミットする。
 
 - [x] 段 1 骨組みと決定性の土台（検証で直したこと ADR-143）：クレート（lints・`forbid(unsafe_code)`・clippy.toml の禁止の一覧）、math・determinism・digest、値（CoW のタイル・音声のブロック）、Shape・Meta・SpaceMap・TimeMap、Graph・compile・render、EngineError・Monitor・Limits、Op・ParamSchema・`register_ops!`、操作 3 つ（image.crop・image.flip・audio.gain）、適合テスト、ゴールデン（追記の検査）、性質テスト、ランダムな文書のテスト、GitHub Actions の CI（ADR-142）
-- [ ] 段 2 最初の縦の通し：Decoder・Encoder・Tier・CodecSet・形式の表、PNG（png）と WAV（自作）、デコードのダイジェスト、`kura-devtools edit render / shape`
+- [x] 段 2 最初の縦の通し（検証で直したこと ADR-144）：Decoder・Encoder・Tier・CodecSet・形式の表、PNG（png）と WAV（自作）、デコードのダイジェスト、`kura-devtools edit render / shape`
 - [ ] 段 3 版と作り直しの契約：legacy・migrate・スキーマの移行、作り直しの見本集、`kura-devtools edit golden`（E1〜E8）
 - [ ] 段 4 画像のコーデック：JPEG・GIF（減色は自作）・WebP（可逆）・aseprite（自作）・PSD の合成（自作）・SVG、EXIF と ICC、上限と展開爆弾、ファズの対象
 - [ ] 段 5 画像の操作と描画：トリム・キャンバス・リサイズ（自前の重み）・回転と反転・変換（量子化・ディザ）・スプライトの分割と結合・パレット・メタの設定・`paint.actions`・スポイト、TS と共有するベクタ（E9〜E15・E21〜E23）

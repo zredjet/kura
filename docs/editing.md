@@ -157,7 +157,7 @@ pub enum Value {
 pub enum Dim { Exact(u64), AtMost(u64) }  // 中身で決まる操作（透明・無音のトリム）は AtMost
 pub enum Shape {
     Image  { w: Dim, h: Dim, fmt: PixelFormat },
-    Frames { count: Dim, w: Dim, h: Dim, fmt: PixelFormat, full: bool },  // w・h はキャンバス
+    Frames { count: Dim, w: Dim, h: Dim, fmt: PixelFormat, full: Fullness },  // w・h はキャンバス。Fullness は Full / Trimmed / Unknown
     Audio  { rate: u32, channels: u16, frames: Dim },
     // Layered・Clips はその値を作る段で足す
 }
@@ -228,7 +228,7 @@ pub trait Op: Send + Sync + 'static {
 
 - `Lift::PerFrame` と申告した画像の操作は、アニメやスプライトの集まりにもそのまま使える。透明のトリムのように「全フレームの外接の合併で切るか、フレームごとか」で意味が変わる操作は、`Lift::None` にして引数で扱う。
 - `apply` が受け取る値にはメタデータも付いているが、出力のメタデータはエンジンが入力 0 のものを写して付け直す（§6）。格子・ループ点を設定する操作だけが、メタデータを書く権限（`MetaAccess::Write`）を申告する。フレームに持ち上げる操作は書く権限を持てない（登録で断る）。
-- 持ち上げのとき、各フレームはフレームの列のメタデータを持った 1 枚の画像として渡す（単体の画像と同じ見え方）。持ち上げられるのは、キャンバスいっぱいのフレームの列だけ。出力の大きさが決まらない（`AtMost`）入力でも、出力の大きさが入力で決まる操作なら持ち上げられ、写し方は実行で決まる。
+- 持ち上げのとき、各フレームはフレームの列のメタデータを持った 1 枚の画像として渡す（単体の画像と同じ見え方）。持ち上げられるのは、キャンバスいっぱいのフレームの列だけ（推論で `Trimmed` なら計画の段階で、`Unknown` なら実行のときに確かめて断る）。出力の大きさが決まらない（`AtMost`）入力でも、出力の大きさが入力で決まる操作なら持ち上げられ、写し方は実行で決まる。入力の大きさが決まっているのに出力が `AtMost` になる操作（中身で大きさが決まる）は、フレームごとに大きさが変わりうるので持ち上げない。
 - `Applied` の `space`・`time` は実際の写し方。推論が `Unknown` なら必ず返し、そうでなければ返さないか推論と同じものを返す。実行器が確かめ、食い違えば内部の誤りにする（E9）。
 
 ### 7.2 引数の記述
@@ -273,7 +273,8 @@ register_ops! {
 | 浮動小数の操作 | ゴールデンをターゲットごとに持つ | — |
 | 環境依存 | 同じ macOS・同じ ffmpeg なら一致する。コーデックの識別子と版を記録し、画面に「環境に依存」と出す | ImageIO・AudioToolbox・AVFoundation・ffmpeg を通るとき |
 
-- 可逆形式（PNG・WAV・FLAC・GIF）は R1 で足りる。中身が同じなら、圧縮後のバイト列の違いは問わない。
+- 版の作り直しの照合（§8.6）は値のダイジェスト（R1）で行う。可逆形式（PNG・WAV・FLAC・GIF）は、中身が同じならバイト列の違いで作り直しを失敗にしない。
+- バイト列（R2）はコーデックのゴールデン（§8.5）で見張る。依存の更新などで固定のエンコーダのバイト列が変わったら、コーデックの約束の版を上げる（同じ版のまま黙って変えない）。
 
 ### 8.2 規則（`crates/kura-engine/clippy.toml` で機械的に強制する）
 
@@ -312,6 +313,8 @@ register_ops! {
 - **ゴールデンは追記だけ**。既存の値を書き換えたら、その変更は通さない（マイグレーションと同じ扱い。CLAUDE.md の「やってはいけないこと」）。`scripts/check-goldens-append-only.sh` が基準のコミットからの差分で消えた・変わった行を見つけ、CI でも回す。
 - 足りない行は `KURA_BLESS=1 cargo test -p kura-engine --test golden` で追記できる（既存の行は変えず、ほかに食い違いがあれば追記もしない）。例を消す・変える、同じ例とターゲットの行が 2 つある、今の登録表で描けない版のファイルがある、のどれも失敗にする（例は変えずに、新しい名前の例を足す）。
 - bless は今の出力をそのまま凍結するだけなので、凍結する前に、画素や標本を直接確かめるテストで正しさを確かめておく。
+- **デコーダのゴールデン**（R1 のうちデコーダだけの経路）：`goldens-codecs/<デコーダの ID>.decode.jsonl` に、下の層で組んだファイル（`testfiles::FileGen`：1/2/4 ビット・tRNS・インターレース・64 ビットの浮動小数・拡張形式・他のツールのメタデータ・大きさの分からない data など）を読んだ値のダイジェストを凍結する。
+- **コーデックのゴールデン**（R2）：`crates/kura-engine/goldens-codecs/<コーデックの ID（/ は @）>.jsonl` に、固定のエンコーダが書くバイト列のダイジェスト（`file`）と、読み直した値のダイジェスト（`value`）を例ごとに凍結する（`tests/codec_golden.rs`）。値が変わったら、コーデックの約束の版を上げる（`png-rs/1` → `png-rs/2`）。依存のクレート（png・fdeflate・flate2・miniz_oxide など）を上げてバイト列が変わったときも、ここで気づく。追記だけの検査の対象。
 
 ### 8.6 ダイジェストと作り直しの確認
 
@@ -333,23 +336,24 @@ register_ops! {
 ```rust
 pub enum Tier { Pinned, Platform, External }
 pub trait Decoder: Send + Sync {
-    fn id(&self) -> CodecId;     // "png-rs/1"
+    fn id(&self) -> &'static str;   // "png-rs/1"（約束の版を含む）
     fn tier(&self) -> Tier;
-    fn can_decode(&self, f: FormatId) -> bool;
-    fn shape(&self, src: &Path, f: FormatId, o: &DecodeOptions) -> Result<Shape, EngineError>;  // ヘッダだけ
-    fn decode(&self, src: &Path, f: FormatId, o: &DecodeOptions, mon: &dyn Monitor) -> Result<Value, EngineError>;
+    fn can_decode(&self, format: &str) -> bool;
+    fn shape(&self, src: &mut dyn ReadSeek, format: &str, o: &DecodeOptions, limits: &Limits) -> Result<Shape, EngineError>;  // ヘッダだけ
+    fn decode(&self, src: &mut dyn ReadSeek, format: &str, o: &DecodeOptions, limits: &Limits, mon: &dyn Monitor) -> Result<Value, EngineError>;
 }
 pub trait Encoder: Send + Sync {
-    fn id(&self) -> CodecId;
+    fn id(&self) -> &'static str;
     fn tier(&self) -> Tier;
-    fn can_encode(&self, f: FormatId, s: &Shape) -> bool;
-    fn options(&self, f: FormatId) -> ParamSchema;
-    fn caps(&self, f: FormatId) -> MetaCaps;   // 保存できるメタデータ
-    fn encode(&self, v: &Value, f: FormatId, o: &RawParams, out: &Path, mon: &dyn Monitor) -> Result<EncodedStamp, EngineError>;
+    fn can_encode(&self, format: &str, s: &Shape) -> bool;
+    fn options(&self, format: &str) -> ParamSchema;
+    fn caps(&self, format: &str) -> MetaCaps;   // 保存できるメタデータ
+    fn encode(&self, v: &Value, format: &str, o: &serde_json::Value, out: &mut dyn Write, mon: &dyn Monitor) -> Result<u64, EngineError>;
 }
 ```
 
-- `CodecSet` が形式ごとに `Pinned → Platform → External` の順で試し、選んだものを記録する（`MediaBackend` の `ChainBackend` と同じ考え方）。
+- `CodecSet` が形式ごとに `Pinned → Platform → External` の順に試し、扱えないと答えた（`Unsupported`）ものは次の段へ回し、実際に読んだものを記録する（`MediaBackend` の `ChainBackend` と同じ考え方。例：固定の WAV のデコーダが扱わない IMA ADPCM は macOS に回す）。書き出しの設定は、正規の JSON に直してからエンコーダの記述（`options()`）で厳しく確かめる（知らないキー・型の違い・範囲の外はエラー。黙って既定に落とさない）。確かめた設定は `EncodedStamp.options` に残す。読むときは、ヘッダの形を上限で確かめてから中身を読み、中身の形がヘッダと合うかも確かめる。読み取りの記録（`DecodeStamp`：コーデック・段・値のダイジェスト）と書き出しの記録（`EncodedStamp`：コーデック・段・形式・バイト数・ファイルのダイジェスト）を版の記録に使う。第三者のコーデックの呼び出しは `codec::contain` で panic を受け止める。
+- 段 2 で入れたもの：PNG（`png` クレート `=0.18.1`。1/2/4 ビットは 8 ビットへ、tRNS はアルファへ、ICC・pHYs・テキストを運ぶ。圧縮したテキストは読まない）と WAV（自作。PCM 8/16/24/32・浮動小数 32/64・拡張形式、smpl・cue・adtl・INFO）。
 - `Platform` は kura-mac が実装して注入する（`MediaBackend` と同じ形）。Swift とのあいだは C の型だけでやり取りし、画素や PCM は Rust が確保したバッファのポインタと長さで受け渡す（ADR-37 の改訂。M10 の段 9）。
 - `External` は ffmpeg（同梱しない・任意）。PCM は標準入出力で流す。引数には `-fflags +bitexact -protocol_whitelist file,pipe` を付ける。
 
@@ -470,14 +474,15 @@ pub enum EngineError {
     Unsupported(String),             // 扱えない形式など
     Limit(String),                   // 上限（推論の段階でも、描くときの入力の照合でも出す）
     Canceled,
-    Decode { codec: String, message: String },   // 入力の ID は段 2 で足す
+    Decode { codec: String, message: String },   // どの入力かは、読む側（kura-core のジョブ）が付ける
     Encode { codec: String, message: String },
     CodecMissing { tool: String },   // kura-core の ToolMissing へ
     Io(std::io::Error),
     Internal(String),                // 不変条件が破れた・操作の推論と実際が違う（panic しない）
 }
 pub trait Monitor: Sync { fn canceled(&self) -> bool; fn progress(&self, done: u64, total: u64) {} }
-pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_frames, max_channels, max_nodes }
+pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_frames, max_channels, max_nodes,
+                    max_sample_rate /* 768kHz */, max_markers /* 1 万 */, max_meta_bytes /* 16MiB：ICC・テキスト・名前の合計 */ }
 ```
 
 - 警告（メタデータを落とした、16 ビットを 8 ビットにした）は `Rendered.warnings` に入れ、保存の確認に出す。
