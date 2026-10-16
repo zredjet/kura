@@ -119,21 +119,23 @@ pub struct OutputSpec {
 ```rust
 pub enum Value {
     Image(Arc<Image>),     // 1 枚の画像
-    Frames(Arc<Frames>),   // アニメーション・スプライトの集まり（フレームごとに大きさが違ってよい）
+    Frames(Arc<Frames>),   // アニメーション・スプライトの集まり（共通のキャンバスの中に置く。フレームごとに大きさ・位置が違ってよい）
     Layered(Arc<Layered>), // psd・aseprite のレイヤー。合成すると Image か Frames になる
     Audio(Arc<Audio>),
     Clips(Arc<Clips>),     // 分割した音声
 }
 ```
 
-- 将来の `Video`・`Model` は、中身を展開しない参照の値として足す（§15）。
+- 将来の `Video`・`Model` は、中身を展開しない参照の値として足す（§15）。`Layered`・`Clips` は、その値を使う操作を作る段で足す。
+- `Frames` は、すべてのフレームを共通のキャンバス（`canvas: Size`）の中の `offset` の位置に置く。形式・パレットはそろえる。フレームごとに大きさ・位置が違ってよい（トリムしたスプライト）。メタデータ（格子・ピボット・スライス）はキャンバスの座標。どのフレームもキャンバスいっぱいのときだけ「いっぱい」（`full`）で、フレームごとの持ち上げ（§7.1）はいっぱいのフレームの列にだけ当てる。
+- `Audio` のチャンネル数は 1〜65,535。
 
 ### 5.2 画素
 
 - アルファは常にストレートで持つ。乗算済み（premultiplied）にするのは、色を混ぜる計算の帯の中だけ。ドット絵では α=0 の画素の色も保つ必要があるため。
 - 形式：`Indexed8 + Palette（256 色まで、RGBA8）`、`Gray8`、`GrayA8`、`Rgb8`、`Rgba8`、`Gray16`、`Rgba16`。チャンネル数は元のまま持つ（JPEG を RGBA にすると 33% 増えるため）。
 - f32 と線形光は、フィルタ（平滑なリサイズ・任意角の回転）の行の帯の中だけで使う。画像全体を f32 にしない。
-- 実体は 256×256 の CoW タイル（`Arc<[u8]>`）で持つ。
+- 実体は 256×256 の CoW タイル（`Arc<Vec<u8>>`）で持つ。Indexed8 の番号はパレットの色の数より小さいこと（作るときに確かめる）。
   - ペン・塗りつぶしでは、触れたタイルだけを複製する。取り消しの履歴とキャッシュがタイルを共有するので、メモリが増えにくい。
   - プレビューは範囲（ROI）とタイル単位で描ける。
   - 操作の部品には、タイル単位と行の帯（64 行）単位の 2 つの口を用意する。
@@ -143,7 +145,7 @@ pub enum Value {
 
 ### 5.3 音声
 
-- planar f32（チャンネルごとの配列）で持つ。内部のブロックは 16,384 フレーム。位置は絶対フレーム（`u64`）で表す。
+- planar f32（チャンネルごとの配列）で持つ。並列のブロックは 4,096 フレーム（`determinism::AUDIO_BLOCK`。結果はこの値に依存しない）。位置は絶対フレーム（`u64`）で表す。
 - int16 / int24 → f32 → 元のビット数の往復は、ちょうど元に戻る（24 ビットは f32 で正確に表せる）。手を加えていない経路の出力はビット一致させる。
 - 操作は「絶対フレーム位置の関数」か「状態を順に運ぶフィルタ」のどちらかにし、区間ごとに描けるようにする。チャンクの切り方を変えても結果は同じ（E18）。
 - 2 パスが要る操作（正規化）は、必要な解析（`Loudness(上流)`）を申告し、実行器が先に解く（§12）。
@@ -152,13 +154,12 @@ pub enum Value {
 ### 5.4 形の推論
 
 ```rust
-pub enum Dim { Exact(u32), AtMost(u32) }  // 中身で決まる操作（透明・無音のトリム）は AtMost
+pub enum Dim { Exact(u64), AtMost(u64) }  // 中身で決まる操作（透明・無音のトリム）は AtMost
 pub enum Shape {
     Image  { w: Dim, h: Dim, fmt: PixelFormat },
-    Frames { count: Dim, canvas: Option<(Dim, Dim)>, fmt: PixelFormat },
-    Layered{ w: u32, h: u32, layers: u32, frames: u32 },
-    Audio  { rate: u32, channels: u16, frames: Dim64 },
-    Clips  { count: Dim, rate: u32, channels: u16 },
+    Frames { count: Dim, w: Dim, h: Dim, fmt: PixelFormat, full: bool },  // w・h はキャンバス
+    Audio  { rate: u32, channels: u16, frames: Dim },
+    // Layered・Clips はその値を作る段で足す
 }
 ```
 
@@ -173,14 +174,14 @@ pub enum Shape {
 ```rust
 pub enum SpaceMap {
     Identity,
-    Affine { m: IntAffine, clip: IRect },          // 90° 回転・反転・整数倍・平行移動（整数で正確）
-    Scale  { sx: Ratio, sy: Ratio, clip: IRect },  // 任意の倍率（丸めは全体の規則に従う）
+    Affine { m: IntAffine, out: Size },            // 90° 回転・反転・整数倍・平行移動（整数で正確）。out は出力の大きさ
+    Scale  { sx: Ratio, sy: Ratio, out: Size },    // 任意の倍率（丸めは偶数への丸め）
     Unknown,   // 推論の段階では分からない（透明のトリム）。apply が実際の写像を返す
     Reset,     // 座標を持つメタデータを捨てる（警告を出す）
 }
 pub enum TimeMap {
     Identity,
-    Segments(Vec<Seg>),            // トリム・結合：区間ごとの平行移動と切り取り
+    Segments { segs: Vec<Seg> },   // トリム・結合：区間ごとの平行移動と切り取り
     Rate { from: u32, to: u32 },   // リサンプル：pos' = round_half_even(pos × to / from)（整数で計算）
     Unknown, Reset,
 }
@@ -189,13 +190,14 @@ pub enum TimeMap {
 | メタデータ | 規則 |
 |---|---|
 | スプライトの格子・ピボット・スライス | `SpaceMap` で写す。範囲からはみ出したものは警告を出して落とす。格子は、写したあとでセルが整数にならなければ落とす |
-| ループ区間・マーカー（音声） | `TimeMap` で写す。一部がはみ出たら切り詰め、空になったら落として警告 |
+| ループ区間・マーカー（音声） | `TimeMap` で写し、出力の長さで詰める。一部がはみ出たら切り詰めて警告、空になったら落として警告 |
 | ICC・DPI | そのまま運ぶ。保存できない形式なら落とす |
 | EXIF の向き | デコードのときに画素へ反映し、印は持たない |
 | そのほかの EXIF・PNG のテキスト・音声のタグ | そのまま運ぶ。書き出しの設定で残すかを決める |
 | アニメのタイミング・aseprite のタグ | フレームを並べ替える・選ぶ操作が写す |
 | ライブラリの情報（タグ・評価など） | 値には入れない。読むのは明示の操作か、結び付けられた引数（M14）だけ。読んだ値は版の記録に残す |
 
+- 座標の計算はすべてあふれを確かめ、あふれたものは「範囲の外」として落とす（落ちない）。引数の座標は ±2^31 まで（`geom::COORD_LIMIT`。読み込みで確かめる）。
 - 書き出し先で失うものは、エンコーダの `MetaCaps` と照らして、保存する前に一覧で出す（例：「jpg ではアルファが失われます」「mp3 ではループ点を保存できません」）。
 - ループ点の入れ物：WAV は `smpl`（と `cue `）、AIFF は `MARK` と `INST`、Ogg・FLAC は `LOOPSTART`・`LOOPLENGTH` のコメント。
 
@@ -213,19 +215,21 @@ pub trait Op: Send + Sync + 'static {
     fn signature() -> Signature;
     /// 形の推論とメタデータの写し方。描かない。
     fn infer(p: &Self::Params, inputs: &[Shape], cx: &InferCx) -> Result<Inferred, Issues>;
-    /// 実際に計算する。中止の確認と進捗は cx の補助関数を通す。
-    fn apply(p: &Self::Params, inputs: &[&Payload], cx: &mut ApplyCx<'_>) -> Result<Applied, EngineError>;
-    /// 旧版の引数を、結果を変えずに今の版へ移す。結果が変わる移行は作らない（§8.4）。
-    fn migrate(from: u16, raw: RawParams) -> Result<RawParams, MigrateError>;
+    /// 実際に計算する。中止の確認・乱数・警告は cx を通す。
+    fn apply(p: &Self::Params, inputs: &[&Value], cx: &mut ApplyCx<'_>) -> Result<Applied, EngineError>;
+    /// 実装を消した古い版 `from` の引数を、結果を変えずにこの版へ移す（§8.4）。
+    fn migrate(from: u16, raw: serde_json::Value) -> Result<serde_json::Value, String>;
     /// 適合テスト（E9）とゴールデンの例。
     fn examples() -> Vec<Example<Self::Params>>;
-    /// 追記だけの引数（描画）は、前の出力に差分だけ当てられる。
-    fn incremental() -> Option<&'static dyn Incremental<Self::Params>>;
+    // 追記だけの引数（描画）の差分の適用は、段 5 で足す
+
 }
 ```
 
 - `Lift::PerFrame` と申告した画像の操作は、アニメやスプライトの集まりにもそのまま使える。透明のトリムのように「全フレームの外接の合併で切るか、フレームごとか」で意味が変わる操作は、`Lift::None` にして引数で扱う。
-- `Payload` はメタデータを除いた中身。メタデータはエンジンが写す（§6）。格子・ループ点を設定する操作だけが、メタデータを書く権限を申告する。
+- `apply` が受け取る値にはメタデータも付いているが、出力のメタデータはエンジンが入力 0 のものを写して付け直す（§6）。格子・ループ点を設定する操作だけが、メタデータを書く権限（`MetaAccess::Write`）を申告する。フレームに持ち上げる操作は書く権限を持てない（登録で断る）。
+- 持ち上げのとき、各フレームはフレームの列のメタデータを持った 1 枚の画像として渡す（単体の画像と同じ見え方）。持ち上げられるのは、キャンバスいっぱいのフレームの列だけ。出力の大きさが決まらない（`AtMost`）入力でも、出力の大きさが入力で決まる操作なら持ち上げられ、写し方は実行で決まる。
+- `Applied` の `space`・`time` は実際の写し方。推論が `Unknown` なら必ず返し、そうでなければ返さないか推論と同じものを返す。実行器が確かめ、食い違えば内部の誤りにする（E9）。
 
 ### 7.2 引数の記述
 
@@ -274,11 +278,11 @@ register_ops! {
 ### 8.2 規則（`crates/kura-engine/clippy.toml` で機械的に強制する）
 
 1. 超越関数（`powf`・`exp`・`ln`・`log10`・`sin`・`cos` など）は `kura_engine::math` だけを使う。中身は `libm` クレート（版を `=` で固定）。OS の libm は版や OS で結果が変わるため。`sqrt`・`mul_add`・`round_ties_even`・飽和する `as` の変換は IEEE で一意なので使ってよい。
-2. 並列はスレッドの数によらない分け方だけにする。出力を固定の大きさ（画像はタイル・64 行の帯、音声は 4,096 フレーム）に分けた `par_tiles` を使う。集計は `reduce_blocks` でブロックごとに出して添字の順に足す。浮動小数を rayon の `sum`・`reduce` で畳まない。
-3. 乱数は ChaCha8 だけ。種は `mix(node.seed, 元のハッシュ, 用途)`（kura-core の `splitmix64`・`fnv1a64` と同じ値）で作り、タイルやチャンネルごとに流れを分ける。種がノード ID・画面の操作の順・一括の並びに依存しないので、エディタと一括で同じになる（E4・E5）。
-4. 出力に効く場所で `HashMap`・`HashSet` を使わない（`BTreeMap` か並べた `Vec`）。
-5. 描画の中で時刻を読まない。`#![forbid(unsafe_code)]`。
-6. 結果に効く依存は Cargo.toml で `=` で版を固定する。上げるのは、デコード・エンコードのゴールデンが通るときだけ。
+2. 並列はスレッドの数によらない分け方だけにする。仕事を固定の大きさ（画像はタイル、音声は 4,096 フレーム）のブロックに分けて添字の順に集める `determinism::par_blocks` を使い、浮動小数の部分和は `sum_ordered` で添字の順に足す。rayon の `sum`・`reduce`・`fold`・`try_*`・`min_by`・`max_by`・`find_any`・`par_bridge`、`current_num_threads` などは使わない。
+3. 乱数は ChaCha8 だけ。種は `determinism::seed(node.seed, 元のハッシュ, 用途)`（kura-core の `splitmix64`・`fnv1a64` と同じ値）で作り、鍵は `key_from_seed`（splitmix64 で 32 バイトに広げる。rand_core の `seed_from_u64` に頼らない）。乱数の流れは**絶対位置**で決める（`rng_at`：画像は行、音声はチャンネルを流れにして、列の中の位置へシークする）。タイル・ブロック・フレームの番号を流れに使わない。アニメのフレームはどれも同じ乱数になる（ディザのちらつきを防ぐ）。種がノード ID・画面の操作の順・一括の並びに依存しないので、エディタと一括で同じになる（E4・E5）。
+4. 出力に効く場所で `HashMap`・`HashSet`・`RandomState`・`DefaultHasher` を使わない（`BTreeMap` か並べた `Vec`）。
+5. 描画の中で時刻・環境変数を読まない。`#![forbid(unsafe_code)]`。
+6. 結果に効く依存は Cargo.toml で `=` で版を固定する（libm・blake3・rand_chacha）。上げるのは、ゴールデンが通るときだけ。serde_json は固定しない（正規の JSON は自前で書き、読み込みは `float_roundtrip` で正しく丸めるので、結果は版によらない）。
 
 ### 8.3 数値計算は自前で書く
 
@@ -292,23 +296,30 @@ register_ops! {
 |---|---|---|
 | 速くする（結果は同じ） | そのまま変える。ゴールデンと、遅い参照実装との差分テストが通ること | 同じ |
 | 結果を変える（不具合の修正・改良） | 操作の版を上げ、旧版の実装を `legacy` に残す。旧版は新しく作れないが作り直しには使う。エディタは「古い版の操作です。更新すると結果が変わります」と出し、利用者が選んだときだけ書き換える | 旧版の実装で同じ |
-| 引数の形だけ変える | 版を上げて `migrate` を書く。旧版のゴールデンの例を移行して流すと旧版の値になるなら、旧版の実装は消してよい | 同じ |
-| 全体の規則（メタデータの写し方・丸め・量子化・デコードの約束） | 文書の `schema` を上げる。古いスキーマの文書は古い規則で作り直す | 同じ |
+| 引数の形だけ変える | 版を上げて `migrate` を書く。旧版のゴールデン（例の引数・入力も凍結してある）を移行して描くと旧版の値になるなら、旧版の実装は消してよい（ゴールデンのテストが自動で確かめる） | 同じ |
+| 全体の規則（メタデータの写し方・丸め・量子化・デコードの約束）・文書の型の項目 | 文書の `schema` を上げ、古いスキーマの文書を移す。文書の型は知らない項目を受け付けないので、項目を足したら必ず上げる | 同じ |
 | 固定のコーデックの依存を上げる | ゴールデンが通るときだけ | 同じ |
 | 操作をなくす | なくさない。新しく作れないようにするだけ | 作り直せる |
 
 - エンジンの版（semver）は記録するだけで、作り直しに使う実装の選択には使わない。選ぶのは `schema`・`(op, v)`・コーデックの識別子（`"png-rs/1"` のように約束の版を含む）だけ。
-- 未知の操作・新しすぎる版・新しすぎるスキーマは、読み込みでエラーにする（E8）。
+- 実装のない古い版は、すぐ上の実装のある版（旧版のこともある）の `migrate` で移し、その版の実装で描く。v1（消した）→ v2（旧版）→ v3（今）のように、旧版を経由する鎖も表せる。
+- 未知の操作・新しすぎる版・移せない版・新しすぎるスキーマ・知らない項目は、読み込み（`Engine::load`）でエラーにする（E8）。
 
 ### 8.5 ゴールデン
 
-- `crates/kura-engine/goldens/<op>/v<N>.toml` に `{ 例の名前, 入力の作り方, 引数, 期待するダイジェスト }` を並べる。入力はシード付きで作り（市松模様、透明な余白付きのスプライト、サイン波など）、バイナリのフィクスチャは原則として置かない。
-- **ゴールデンは追記だけ**。既存の値を書き換えたら、その変更は通さない（マイグレーションと同じ扱い。CLAUDE.md の「やってはいけないこと」）。`kura-devtools edit golden --bless` は新しい行を足すだけで、既存の行の変更は拒む。
-- 浮動小数を含む操作の値は、ターゲットごとの節（`[aarch64-apple-darwin]` など）に持つ。
+- `crates/kura-engine/goldens/<操作>/v<版>.jsonl` に、1 行に 1 つ、正規の JSON で `{"digest","inputs","name","params","target"}` を並べる。例の引数と入力の作り方（`testgen`。市松模様、乱数の画素、スプライトシート、乱数の音声など）も凍結するので、実装を消して移行した版（E7）や旧版（E6）も、今の登録表で解決して描き、凍結した値と照らす。バイナリのフィクスチャは原則として置かない。
+- `target` は、整数だけの操作（`Numeric::Exact`）は `*`（すべてのターゲットで同じ値）、浮動小数を使う操作は `aarch64-macos` など。浮動小数の操作の行は主なターゲット（aarch64-macos）にだけ必須で、ほかのターゲットでは、あれば照らす。数値の申告と行のターゲットが食い違えば失敗にする（申告を変えて照合を逃れられないように）。
+- **ゴールデンは追記だけ**。既存の値を書き換えたら、その変更は通さない（マイグレーションと同じ扱い。CLAUDE.md の「やってはいけないこと」）。`scripts/check-goldens-append-only.sh` が基準のコミットからの差分で消えた・変わった行を見つけ、CI でも回す。
+- 足りない行は `KURA_BLESS=1 cargo test -p kura-engine --test golden` で追記できる（既存の行は変えず、ほかに食い違いがあれば追記もしない）。例を消す・変える、同じ例とターゲットの行が 2 つある、今の登録表で描けない版のファイルがある、のどれも失敗にする（例は変えずに、新しい名前の例を足す）。
+- bless は今の出力をそのまま凍結するだけなので、凍結する前に、画素や標本を直接確かめるテストで正しさを確かめておく。
 
 ### 8.6 ダイジェストと作り直しの確認
 
-- 値のダイジェスト：`blake3("kura-img-v1" ‖ 幅 ‖ 高さ ‖ 形式 ‖ ICC のハッシュ ‖ 詰めた行（LE）‖ パレット ‖ 正規化したメタデータ)`。音声は `"kura-pcm-v1" ‖ rate ‖ ch ‖ frames ‖ 各チャンネルの f32 のビット列`（NaN は 1 つの値にそろえる）。
+- 値のダイジェスト（`Value::digest`。凍結する）：BLAKE3 に、ドメイン（長さ u64 ＋文字列）に続けて次を書く。数はすべて固定の幅のリトルエンディアン、可変長のものは長さ（u64）を前に付ける。
+  - 画像 `kura-img-v1`：幅 u32 ‖ 高さ u32 ‖ 形式の番号 u8 ‖ パレット（あれば 1 ‖ 色の数 u32 ‖ RGBA の並び、なければ 0）‖ 行を上から詰めた画素 ‖ 正規の JSON のメタデータ（長さ付き）‖ ICC（あれば 1 ‖ 長さ付きのバイト列、なければ 0）。
+  - フレームの列 `kura-frames-v1`：フレームの数 u32 ‖ 繰り返し u32 ‖ キャンバスの幅・高さ u32 ‖ 各フレーム（表示時間 u32 ‖ 位置 x・y i64 ‖ 画像と同じ画素の部分）‖ メタデータ ‖ ICC。
+  - 音声 `kura-pcm-v1`：レート u32 ‖ チャンネル数 u32 ‖ フレーム数 u64 ‖ 各チャンネルの f32 のビット列（NaN は 0x7fc00000 にそろえる）‖ 正規の JSON のメタデータ（長さ付き）。
+  - 画素の並び・ダイジェストはタイルの分け方によらない。式は `value::tests::digest_formula_is_frozen` で凍結している。
 - 版ごとに、値のダイジェスト・元のデコードのダイジェスト・使ったコーデックの識別子を記録する。
 - 作り直しは 3 重に確かめる。
   1. CI：操作ごとのゴールデンと、作り直しの見本集（`tests/replay`：文書・作り方を決めた入力・期待するダイジェスト）を、macOS と ubuntu で流す。
@@ -455,22 +466,23 @@ impl Engine {
 
 ```rust
 pub enum EngineError {
-    Invalid(Issues),                 // 検証（ノード・引数・理由）
-    Unsupported(Unsupported),        // 形式・入力の種類・未知の操作・新しすぎる版
-    Limit(LimitExceeded),            // 推論の段階で出す
+    Invalid(Issues),                 // 検証（ノード・引数・理由。未知の操作・新しすぎる版もここ）
+    Unsupported(String),             // 扱えない形式など
+    Limit(String),                   // 上限（推論の段階でも、描くときの入力の照合でも出す）
     Canceled,
-    Decode { input: InputId, codec: CodecId, message: String },
-    Encode { codec: CodecId, message: String },
-    CodecMissing { tool: &'static str },  // kura-core の ToolMissing へ
+    Decode { codec: String, message: String },   // 入力の ID は段 2 で足す
+    Encode { codec: String, message: String },
+    CodecMissing { tool: String },   // kura-core の ToolMissing へ
     Io(std::io::Error),
-    Internal(String),                // 不変条件が破れた（panic しない）
+    Internal(String),                // 不変条件が破れた・操作の推論と実際が違う（panic しない）
 }
-pub trait Monitor: Sync { fn canceled(&self) -> bool; fn progress(&self, p: Progress); }
-pub struct Limits { max_dim, max_pixels, max_live_bytes, max_frames, max_audio_frames, max_points, max_nodes }
+pub trait Monitor: Sync { fn canceled(&self) -> bool; fn progress(&self, done: u64, total: u64) {} }
+pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_frames, max_channels, max_nodes }
 ```
 
 - 警告（メタデータを落とした、16 ビットを 8 ビットにした）は `Rendered.warnings` に入れ、保存の確認に出す。
-- 中止：`par_tiles` と `reduce_blocks` がタイルの合間で `canceled()` を見るので、ほとんどの操作は自動で中止に対応する。
+- 中止：`par_blocks` がブロックの合間で `canceled()` を見るので、ほとんどの操作は自動で中止に対応する。操作は最初に `cx.check()` を呼ぶ（何もしない近道でも）。適合テストは、操作の中の 1〜4 回目の確認で中止できることを確かめる（E24）。
+- 描くときの入力の値は、計画を作ったときの形と上限に照らしてから使う（ヘッダの形と実際のデコードの結果が食い違う場合に、上限を超えた値を描かない）。
 - 進捗：ジョブ（kura-core）が `Monitor` を実装し、既存の `JobContext::progress` につなぐ。
 - 上限の既定：1 辺 32,768px、画素数 2²⁸、ノード数・点の数・音声の長さも上限を持つ。設定で変えられる。
 - **安全**（ダウンロードしたファイルも読むので）：
