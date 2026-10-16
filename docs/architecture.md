@@ -14,6 +14,7 @@
 ├────────┼────────────────────────────────────────────────────────────────────┤
 │ kura-core（OS 非依存・テスト容易）                                             │
 │   db/  import/  query/（検索言語）  unit/  playlist/  jobs/  download/  capture/ │
+│        │  kura-engine（編集の操作エンジン。OS 非依存。§15・docs/editing.md）    │
 │        │                           │                                         │
 │ kura-mac（macOS 専用）              │ 外部プロセス                             │
 │   Swift ヘルパー：ImageIO,          │   yt-dlp（+ deno, ffmpeg）               │
@@ -30,6 +31,7 @@
 | クレート | 責務 | 依存してよいもの |
 |---|---|---|
 | `kura-core` | DB、マイグレーション、取り込み、ハッシュ、検索言語の解析と SQL 生成、ユニット、プレイリスト（純粋関数）、ジョブ管理、ダウンロード・キャプチャの手順 | rusqlite, blake3, reflink-copy, rand_chacha, serde, thiserror, tracing, tokio |
+| `kura-engine` | 編集の操作エンジン：文書・値・形・メタデータの写し方・操作と登録・描画・解析・コーデック（固定の Rust のもの）・実行とプレビュー・エディタの履歴。DB・ジョブ・Tauri を知らない（ADR-134、§15） | serde, serde_json, thiserror, blake3, rayon, rand_chacha, libm と、版を固定したコーデックのクレート（docs/editing.md §9）。specta は feature |
 | `kura-mac` | `MediaBackend` trait の macOS 実装（サムネイル生成、メディア情報、音楽のジャケット取得、WKWebView のスナップショット、「透明度を下げる」設定の取得）と、ffmpeg との振り分け | kura-core, serde_json, swift-rs（ビルド時のリンクのみ） |
 | `kura-devtools` | ダミーライブラリの生成、ベンチマーク、コマンドラインからの取り込みと確認（§13） | kura-core, kura-mac |
 | `src-tauri`（`kura-app`） | コマンド、kura:// プロトコル、ウィンドウ、イベント、状態の保持 | すべて |
@@ -386,3 +388,12 @@ M9 の実測（NFR-01〜07。Apple M4 Max（高性能 12・高効率 4 コア）
   - SQLite の backup API で、読み取り専用の別の接続から `backups/library-YYYYMMDD-HHMMSS.sqlite`（UTC）へ少しずつ写す（書き込みは止めない）。一時ファイルに写してから名前を変え、1 つのファイルで開けるよう `journal_mode = DELETE` にする。
   - 開いて 20 秒後と、そのあと 1 時間ごとに確かめ、前回から 24 時間以上たっていれば作る。新しい 7 個を残し、`backups/` の中のこの形の名前のものだけ消す。設定画面から今すぐ作れる。
   - 戻すのはアプリの外で手で行う（docs/data-model.md §1）。
+
+## 15. 編集（M10〜。正本は docs/editing.md）
+
+- **クレート**：`kura-engine` がエンジン本体（ADR-134）。kura-core は保存・版・GC・解析と一括加工のジョブと DB（M11 以降）、kura-mac は ImageIO・AudioToolbox・AVFoundation によるコーデック（Platform の段）、src-tauri はコマンドと kura:// の `/edit`・`/peaks`（M11・M12）を受け持つ。
+- **文書**：元に対する累積の操作のノードの並び（docs/editing.md §4、ADR-135）。エディタとの通信で送るのは文書だけで、画素・波形は Rust が描いて kura:// で配る。
+- **決定性と版**：docs/editing.md §8（ADR-136・138）。kura-engine の `clippy.toml` で禁じる API を機械的に強制し、ゴールデンは追記だけにする。
+- **コーデック**：Pinned（Rust）→ Platform（kura-mac）→ External（ffmpeg）の順。C のライブラリは同梱せず、足りないエンコーダは自作する（ADR-137）。
+- **CI**：`.github/workflows/ci.yml` で ubuntu と macOS のテストを回す（ADR-142）。
+- 実装の進み具合は docs/roadmap.md の M10 を見る。実測は §13 に足す。
