@@ -177,7 +177,7 @@
 - [x] 段 4 画像のコーデック（検証で直したこと ADR-146）：JPEG・GIF（減色は自作）・WebP（可逆）・aseprite（自作）・PSD・PSB の合成（自作）・SVG、APNG、EXIF と ICC、上限と展開爆弾、他のツールのフィクスチャ、ファズ（`fuzz/` と stable の `fuzz_smoke`）
 - [x] 段 5 画像の操作と描画（検証で直したこと ADR-147）：トリム・キャンバス・リサイズ（自前の重み）・回転と反転・変換（量子化・ディザ）・スプライトの分割と結合・パレット・メタの設定・`paint.actions`・スポイト、TS と共有するベクタ（E9〜E15・E21〜E23）、nightly の cargo-fuzz をカバレッジ付きで回す手順
 - [x] 段 6 音声の読み書きと操作（ADR-148）：symphonia でのデコード（FLAC・ALAC、AAC-LC・Vorbis はアンカー、AAC の priming は自作）、MP3（nanomp3）、WAV・AIFF（自作）、FLAC の書き出し（自作）、タグ（各コーデックで自前。lofty は ID3v2・MP4 を書く段へ）、トリム・フェード・ゲイン・正規化（自前の BS.1770）・SRC（自前）・モノラル化・ループ点・出力の量子化とディザ、区間ごとの描画（E16〜E20。E20 の Ogg の書き出しは段 7）
-- [x] 段 7 自作の Ogg Vorbis エンコーダ（ADR-149）：aoTuV b6.03（前増幅を除く）の移植と照合用のエンコーダとのビット一致、Ogg の多重化（自作の切り方）、ループ点のコメント、1〜8 チャンネル・8〜192 kHz・品質 −1〜10、表のクレート `vorbis-tables`、symphonia の Vorbis の修正（`third_party/`）、品質の記録（`kura-devtools vorbis-quality`）、ファズ（E28・E20）。Godot での読み込みはユーザーが確かめる（未確認）
+- [x] 段 7 自作の Ogg Vorbis エンコーダ（ADR-149）：aoTuV b6.03（前増幅を除く）の移植と照合用のエンコーダとのビット一致、Ogg の多重化（自作の切り方）、ループ点のコメント、1〜8 チャンネル・8〜192 kHz・品質 −1〜10、表のクレート `vorbis-tables`、symphonia の Vorbis の修正（`third_party/`）、品質の記録（`kura-devtools vorbis-quality`）、ファズ（E28・E20）。Godot 4.7.2 での読み込み・再生・ループをユーザーが確かめた（長さ 0 の音声だけは取り込めない）
 - [ ] 段 8 解析：透過・不透明な範囲・色数・ドット絵の倍率・格子の推定・波形の段・ラウドネス・無音・ループ点（E26・E27）
 - [ ] 段 9 macOS と外部ツール：FFI でのバッファの受け渡し（ADR-37 の改訂）、ImageIO・AudioToolbox・AVFoundation、`kura_codec_caps`、ffmpeg の段、アンカー（E29）
 - [ ] 段 10 実行器・プレビュー・セッション・ベンチ：ノードのキャッシュ、プレビューの段、範囲とタイルの描画、変わった範囲の推論、`EditSession`、メモリの予算、`kura-devtools bench edit`（E30、NFR-11〜17 の実測を architecture.md §13 に）
