@@ -14,11 +14,17 @@ kura-engine.workspace = true
 kura-mac.workspace = true
 blake3.workspace = true
 jpeg-encoder.workspace = true
+# vorbis-quality：Ogg Vorbis の独立したデコーダ（長さと値の照合。純 Rust。kura-engine の dev 依存と同じ版・同じ feature）
+lewton = { version = "=0.10.2", default-features = false }
+# vorbis-quality：指標の超越関数（ワークスペースと同じ版。結果を機械によらず同じにする）
+libm.workspace = true
 rand_chacha.workspace = true
 rayon.workspace = true
 reflink-copy.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+# vorbis-quality：試験の音・参照のファイルの SHA-256（記録の頭書き。Cargo.lock に既にある版）
+sha2 = "0.10"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

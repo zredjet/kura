@@ -7,10 +7,13 @@
 //! - `bench query --library <path>`：一覧の取得の速さを測る
 //! - `bench thumbs --src <画像のフォルダ> [--threads N]`：画像サムネイルの速さを測る（NFR-04）
 //! - `edit shape --in <file>` / `edit render --doc <文書.json> --in <file> --out <file>`：編集のエンジンを手で確かめる（docs/editing.md）
+//! - `vorbis-quality --out <dir> [--quick] [--input <file>]... [--reference <音>/<ラベル>=<ogg>]...`：
+//!   自作の Ogg Vorbis のエンコーダの品質を記録する（M10 段 7。`vorbis_quality` の冒頭）
 
 mod bench;
 mod edit;
 mod seed;
+mod vorbis_quality;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,7 +26,8 @@ use kura_core::jobs::{EventSink, JobFilter, JobKind, JobState};
 use kura_core::library::{LibrarySession, check_files};
 
 const USAGE: &str = "使い方: kura-devtools import --library <path> [--create] [<src>...] | \
-                     download --library <path> <url>... | check --library <path>";
+                     download --library <path> <url>... | check --library <path> | \
+                     vorbis-quality --out <dir> [--quick] [--input <file>]... [--reference <音>/<ラベル>=<ogg>]...";
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -39,6 +43,7 @@ fn main() -> ExitCode {
         Some("seed") => seed::run(&args[1..]),
         Some("bench") => bench::run(&args[1..]),
         Some("edit") => edit::run(&args[1..]),
+        Some("vorbis-quality") => vorbis_quality::run(&args[1..]),
         _ => Err(USAGE.to_string()),
     };
     match result {
