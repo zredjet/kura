@@ -20,6 +20,7 @@
 | 文書（Graph） | 元に当てる操作のノードの並び。JSON で保存する |
 | ノード（Node） | 操作 1 つ。操作の名前・版・引数・入力・種を持つ |
 | 操作（Op） | `image.crop` のような処理の種類。版を持つ |
+| 解析（Analysis） | `image.alpha` のような、値から事実を求める処理。版を持ち、結果は正規の形。操作が申告して使うこともある（§11） |
 | 元 | アイテムを最初に取り込んだときのファイル。編集しても変えない |
 | 今 | アイテムの今のファイル（`items.hash`）。編集していなければ元と同じ |
 | 版 | 保存した 1 回分。元に対する文書と、その出力のハッシュなどを持つ |
@@ -39,7 +40,7 @@ kura-engine（OS・DB・Tauri を知らない。Linux でもテストが通る�
   value/     画素（CoW のタイル）・音声（ブロック）・メタデータ
   shape      形と推論
   op, ops/   操作の trait・登録・各操作（image/ sprite/ paint/ audio/ meta/）
-  analyze/   解析（透過・ラウドネス・波形など）
+  analysis/  解析（透過・ラウドネス・波形など。§11）
   codec/     読み書きの trait・固定のコーデック・形式の表・能力
   render/    実行・キャッシュ・プレビューの段・範囲の描画
   session    エディタの履歴（純粋な構造）
@@ -111,7 +112,7 @@ pub struct OutputSpec {
 
 ### 4.4 正規の符号化とハッシュ
 
-- 文書・ノードのハッシュは、自前の正規化 JSON（キーを並べる、数値は最短の表記、空白なし。RFC 8785 に準じる）の BLAKE3 で取る。`serde_json::Value` の並びには頼らない（依存の feature で変わりうる）。
+- 文書・ノードのハッシュは、自前の正規化 JSON（キーを並べる、数値は最短の表記、空白なし。RFC 8785 に準じる）の BLAKE3 で取る。非有限の小数（NaN・±∞）は正規の JSON にできないので、エラー（`Internal`）にする（段 8 で、黙って `null` にしていたのを直した。解析の結果は `Real` か理由付きの列挙で持つ。§11.1）。`serde_json::Value` の並びには頼らない（依存の feature で変わりうる）。
 - 文書を DB に置くとき（M12）は、ノードを内容アドレスで分けて持つ。筆の点の多い文書を版ごとに丸ごと持つと、容量が保存回数に比例して増えるため。
 
 ## 5. 値と形
@@ -156,7 +157,7 @@ pub enum Value {
 - 操作は「絶対フレーム位置の関数」か「状態を順に運ぶフィルタ」のどちらかにし、区間ごとに描けるようにする。チャンクの切り方を変えても結果は同じ（E18）。
   - 段 6 から、音声を出す操作は「核」（`audio::AudioKernel`：`rate`・`channels`・`frames`・`render(ch, start, out)`）を `Op::audio_kernel` で返す。前計算（ラウドネスの計測・フィルタの表）は核を作るときに 1 度だけ行い、`render` は出力の区間を描く純粋な関数にする。`apply` は同じ核を `audio::render_all`（`AUDIO_BLOCK` ずつ `par_blocks`）で描くだけ。E18 は、登録されたすべての音声の操作の例で、核をチャンク 1・7・4,096・全体で描いた値（全体の長さ）が `apply` と同じか、レート・チャンネル数・長さが同じかを照らす。音声を出すのに核を返さない操作は失敗にする。
   - 状態を運ぶフィルタ（K 特性の IIR）は核にせず、解析の側で全体を順に流す（`analysis::loudness`）。
-- 2 パスが要る操作（正規化）は、段 6 では `apply`（核を作るとき）の中で計測する。必要な解析を申告し、実行器が先に解く口（§12）は解析の段 8 で足す。計測は段 8 の解析と同じ関数なので、表示する値と正規化で使う値が一致する（E26）。
+- 2 パスが要る操作（正規化）は、段 6 では `apply`（核を作るとき）の中で計測する。段 8 で、必要な解析を申告し、実行器が先に解く口（§11.2）を足し、正規化は内部用の解析 `audio.loudness_gating` を申告して使う形に移した。表示の `audio.loudness` と同じ関数なので、表示する値と正規化で使う値が一致する（E26）。
 - 元のビット深度・サンプルレートは `AudioMeta.source` に残し、書き出しの既定値に使う。整数の PCM と f32 の変換は WAV・AIFF・FLAC で同じ式（`codec::pcm`：読みは v / 2^(幅−1)、書きは round_ties_even を範囲で止める。NaN は 0、ディザはしない）。左詰めの 32 ビットで出す FLAC・ALAC のデコーダの値も 32 ビットの式で読むと元の幅の式と同じ値になる。書き出しのビット数は、設定（`float` > `bits`）→ 元の形式 → 16 の順で決める（`codec::pcm::target`）。元の形式から決めるとき、浮動小数を書ける形式（WAV・AIFF）は元が浮動小数なら浮動小数（`float: false` を指定すれば 16 ビット）、書けない形式（FLAC）は整数の最大の幅（24）。元の幅が書けない形式では、それ以下の最大の幅にする（32 ビットの整数の元を FLAC に書くと 24）。指定した幅が書けなければ `Unsupported`。
 
 ### 5.4 形の推論
@@ -235,7 +236,9 @@ pub trait Op: Send + Sync + 'static {
     fn apply_appended(prev: &Self::Params, prev_out: &Value, p: &Self::Params, cx: &mut ApplyCx<'_>) -> Option<Result<Applied, EngineError>>;
     /// 音声を出す操作の核（§5.3）：前計算を 1 度だけして、出力の区間を描く純粋な関数にしたもの。apply も同じ核で描く
     fn audio_kernel(p: &Self::Params, inputs: &[&Value], cx: &mut ApplyCx<'_>) -> Option<Result<Box<dyn AudioKernel>, EngineError>>;
-
+    /// 申告しうる解析（ID, 版）の一覧と、この引数・入力で実際に申告するもの（§11.2）。apply は cx.analysis で受け取る
+    const NEEDS: &'static [(&'static str, u16)] = &[];
+    fn needs(p: &Self::Params, inputs: &[Shape]) -> Result<Vec<Need>, Issues>;
 }
 ```
 
@@ -342,6 +345,7 @@ register_ops! {
 | 固定のエンコーダのバイト列（依存の更新を含む） | エンコーダの約束の版を上げる（`png-rs-enc/1` → `/2`）。旧版は残さなくてよい（照合は値で行う。§8.1） | 値は同じ |
 | 固定のデコーダが読む値 | 変えない。どうしても変えるなら、デコーダの約束の版を上げ、旧版を `CodecSet::add_legacy_decoder` で残す。作り直しは記録した識別子のデコーダで読む（`decode_with`） | 旧版のデコーダで同じ |
 | 操作をなくす | なくさない。最後の版を `retired` に移す（カタログに出さず新しく作れないが、作り直しには使う） | 作り直せる |
+| 解析の結果を変える | 解析の版を上げる。操作が申告する解析は旧版を `legacy` に残し、申告する操作の版も上げる（申告は操作の版ごとに固定する。今の版の操作は解析の今の版を申告していなければならず、`Engine::new` が確かめる）。表示だけの解析は旧版の実装を消して `dropped` に載せてよい（§11.1） | 操作が使う解析は旧版で同じ |
 
 - エンジンの版（semver）は記録するだけで、作り直しに使う実装の選択には使わない。選ぶのは `schema`・`rules`・`(op, v)`・コーデックの識別子（`"png-rs-dec/1"` のように読み書きを分け、約束の版を含む）だけ。
 - 文書のスキーマの移行は、表（`doc::SCHEMA_STEPS`）の関数で 1 段ずつ行う（スキーマ n → n+1。上げたら 1 つ足し、消さない）。スキーマ 1 → 2 は `rules: 1` を足す。
@@ -362,7 +366,9 @@ register_ops! {
   - エンコーダ（R2）`png-rs-enc@1.jsonl`：書いたバイト列のダイジェスト（`file`）と、それを読み直したデコーダの ID（`decoder`）・値のダイジェスト（`value`）。読み直しは、記録したデコーダ（旧版を含む）で照らす。バイト列が変わったら、エンコーダの約束の版を上げる。今ないエンコーダのファイルは照らさない（版を上げた旧版）。依存のクレート（png・fdeflate・flate2・miniz_oxide など）を上げてバイト列が変わったときも、ここで気づく。読み直しのデコーダが値の再現を約束しない行（段 7 の `ogg-vorbis-kura-enc@1.jsonl` は symphonia の Vorbis で読み直す）は `value` を持たず、書いたバイト列と、読み直した形（長さ・レート・チャンネル）だけを照らす。再現できるデコーダなのに `value` がない行、再現できないデコーダなのに `value` がある行は失敗にする。自作の Ogg Vorbis のバイト列は浮動小数の計算で決まるが、照合で aarch64 と x86_64 の一致を確かめたので、ほかのターゲットでも同じ行を照らす。CI は照合用の C なしで回るので、`ogg-vorbis-kura-enc@1.jsonl` は kura の範囲で選ばれる 16 のテンプレート（8 つのレートの族 × stereo・uncoupled。X は 96・192 kHz）と 9 レートそれぞれの stereo・uncoupled・1〜8 チャンネル・q −1 と 10・26 kHz 以上の衝撃（`bursts`。aoTuV の M3）・大きくなっていくトーン（`swell`。M9）を短い長さで覆い（35 行。44.1 kHz・品質 0 の衝撃の 2 行は aoTuV の M2 にも届く）、`ogg_templates_are_covered` が覆いの抜けを失敗にする（心理モデルの係数・M2・M3・M9 の定数を 1 つ変えると、2〜8 行が落ちることを確かめた。M2 の前の判定（`postnoise_detection` の閾値）の変更には、照合のテストを含めてまだどのテストも気づかない）。
   - デコーダ（R1 のうちデコーダだけの経路）`png-rs-dec@1.jsonl`：下の層で組んだファイル（`testfiles::FileGen`：1/2/4 ビット・tRNS・インターレース・64 ビットの浮動小数・拡張形式・他のツールのメタデータ・大きさの分からない data など）を読んだ値のダイジェスト。凍結した行は、その ID のデコーダ（今の版か旧版）で読んで照らし、その ID のデコーダがなければ失敗にする。
   - どちらも追記だけの検査の対象。再現を約束しないデコーダ（`reproducible()` が偽。SVG と段 6 の Vorbis・AAC）は、デコーダのゴールデンに入れない（入れようとすると失敗にする）。それらは他のデコーダの読み取りとの照合（`tests/fixtures.rs`）で確かめ、編集するときはアンカーを作る（§9.4）。
+- **解析のゴールデン**（`goldens-analysis/<ID>/v<版>.jsonl`。§11.5）：例ごとに正規の結果（2 KiB 以下のとき）とダイジェスト。追記だけの検査の対象。
 - **共有のテストベクタ**（`crates/kura-engine/tests/vectors/`）：Rust と TS で同じ規則を実装するもの（描画の筆・ピクセルパーフェクト・点の列の詰め方・重ねる式）の入出力を、エンジンが JSON で凍結する（`tests/paint_vectors.rs`。足りなければ `KURA_BLESS=1`）。フロントは `src/lib/paint.test.ts` が同じファイルを読んで照らす。フィクスチャと同じく、消す・変えるのを認めない（追記だけの検査が見る）。
+- 入力の作り方（`testgen::InputGen`）は凍結する（例の値が変わるため）。足すだけ。段 7・8 で、`bursts`・`swell`（Ogg Vorbis のゴールデン）、`upscale`・`crop`・`spriteSheet`・`swatches`（`count` 色を `clear` 未満の番号だけアルファ 0 で）・`pixels`（画素を 1 つずつ）・`nonFinite`（指定の位置の標本を NaN・±∞ に）を足した。NaN を含む入力の値のダイジェストは、§8.6 のとおり NaN のビット列をそろえるので安定する。
 - **フィクスチャ**：自前のエンコーダでは作れない形（非可逆の WebP、libjpeg のプログレッシブ、他のツールの PSD など）は、他のツールで作った小さなファイルを `crates/kura-engine/fixtures/` に置く（作り方・道具の版は fixtures/README.md）。`tests/fixtures.rs` が他の実装の読み取り（sips・dwebp・djpeg・ImageMagick の PNG）と照らし、`FileGen::Fixture` でデコーダのゴールデンにも入れる。フィクスチャは消す・変えるのを認めない（追記だけの検査が見る）。
 
 ### 8.6 ダイジェストと作り直しの確認
@@ -531,46 +537,111 @@ pub enum PaintAction {
 
 ## 11. 解析
 
+段 8 で入れた（ADR-152）。詳しい定義は各解析のソースの冒頭（`crates/kura-engine/src/analysis/{image,audio}/*.rs`）に書き、ここは要点だけ。
+
+### 11.1 trait と登録
+
 ```rust
 pub trait Analysis: Send + Sync + 'static {
-    const ID: &'static str;            // "image.alpha" など
-    const VERSION: u16;                // 上がったら保存した結果を作り直す
-    type Output: Serialize + DeserializeOwned + Debug + PartialEq;
-    fn accepts(kind: ValueKind) -> bool;
-    fn run(v: &Value, cx: &mut AnalyzeCx) -> Result<Self::Output, EngineError>;
+    const ID: &'static str;            // "image.alpha"（<種類>.<名前>。英小文字・数字・_）
+    const VERSION: u16;                // 結果が変わる変更で上げる（1 から）
+    const ACCEPTS: &'static [ValueKind];
+    const NUMERIC: Numeric;            // 整数だけ（Exact。全ターゲットで同じ）か浮動小数（Float）か
+    const INTERNAL: bool = false;      // 内部用（カタログ・DB に出さず、操作の申告だけに使う）
+    type Params: OpParams;             // 既定値つきの引数（知らない項目・範囲の外は拒む）
+    type Output: AnalysisOutput;       // 結果の正規の形（正規の JSON か、決めたバイナリ）
+    fn run(p: &Self::Params, v: &Value, cx: &AnalyzeCx<'_>) -> Result<Self::Output, EngineError>;
+    fn examples() -> Vec<AnalysisExample<Self::Params>>;   // 適合テストとゴールデンの種
+    fn numeric_for(p: &Self::Params) -> Numeric;
+    fn estimate(p: &Self::Params, input: &Shape) -> Estimate;  // 結果の大きさと手間の見積もり（上限で断る）
 }
 ```
 
-| 解析 | 中身 | 使い手 |
-|---|---|---|
-| `image.alpha` | none / binary（0 か 255 だけ）/ partial、透明な画素の数 | 市松模様の表示、JPEG に書き出すときの警告 |
-| `image.opaque_bounds` | 不透明な範囲の外接矩形 | トリム |
-| `image.colors` | 257 色まで数える（並べた集合）→ パレットの候補 | PNG-8・GIF、ドット絵の判定 |
-| `image.pixel_scale` | 同じ色の連続の長さの最大公約数 → 拡大の整数倍 | 表示を最近傍にするか、「1/4 に戻す」 |
-| `image.sprite_grid` | 透明な溝と規則的な格子の推定 | 分割の候補 |
-| `audio.peaks` | 1 ビンあたり 256・1,024・4,096・16,384・65,536 フレームの min/max（i16）の段 | 波形の表示 |
-| `audio.loudness` | 積分ラウドネス・LRA・サンプルピーク・トゥルーピーク | 正規化、表示 |
-| `audio.silence` | 前後の無音の範囲、クリップの数 | 自動トリム、警告 |
-| `audio.loop` | ファイルに書かれたループ点 | ループの表示と試聴 |
+- 登録は `register_analyses!`（`current`・`legacy`・`dropped`）。画像は `analysis/image/mod.rs`、音声は `analysis/audio/mod.rs` の一覧に 1 行足す。解析を 1 つ足すのに触るのは、`analysis/<種類>/<名前>.rs`、一覧（`<種類>/mod.rs`）の `mod` と `current` の行、E26 の表（下）の 1 行、ゴールデン `goldens-analysis/<ID>/v1.jsonl`（`KURA_BLESS=1` で作る）だけ。
+- `AnalyzeCx`：中止（`check`）・上限（`reserve`）・並列（`par_blocks`）。乱数は渡さない。決定性の規則（§8.2）は操作と同じ。
+- **結果の正規の形**：正規の JSON（§4.4）。非有限の数は持たない（JSON に書けず、「無音」と「計れない」が同じ形になるため）。浮動小数の値は `Real`（有限なら数、NaN・±∞ は `"nan"`・`"inf"`・`"-inf"`）か、理由付きの列挙 `Reasoned<T, R>`（`{"kind":"value","v":…}` か `{"kind":"<理由>"}`）で持つ。波形の段だけは決めたバイナリ（`kura-peaks`）。
+- **ダイジェスト**：`kura-analysis-v1` = BLAKE3（ID（長さ付き）‖ 版 u32 ‖ 正規の引数（長さ付き）‖ 形の種類 u8（JSON 0・バイナリ 1）‖ 結果（長さ付き））。ゴールデンは結果だけの `kura-analysis-out-v1` で照らす。
+- **版の契約**：操作が申告する解析（下の 11.2）は操作と同じく凍結し、結果を変えるなら版を上げて旧版を `legacy` に残す（申告されている版を `dropped` にするとエンジンを作れない。`Engine::new` の `check_needs`）。表示だけの解析（どの操作も申告しない解析。今は申告されるのが `image.opaque_bounds`・`audio.loudness_gating` だけなので、ほかの 8 つ）は、版を上げたら旧版の実装を消して `dropped` に載せてよい（凍結したゴールデンのファイルは残し、照らさない）。操作が新しく申告するようになったら、その版から凍結する。実装も `dropped` もない版のゴールデンは失敗。
+- **フレームの列**：フレームの外（覆われない部分）の扱いは解析ごとに決め、各ソースの冒頭と下の表に書く（alpha は透明として数え、colors は数えず、pixel_scale はフレームの中だけで比べ、opaque_bounds は外を透明とみなすが、アルファのない形式では union をキャンバス全体にする（frames は各フレームの矩形のまま））。
+- **結果のキー**（M11 で使う）：中身 × ID × 版 × 正規の引数。中身を元のファイルのハッシュにするか値のダイジェストにするか（再現を約束しないデコーダの元をどう扱うか）は M11 で決める。
 
-- 結果のキーは「中身のハッシュ × 解析の ID × 版」。ライブラリのアイテムの結果は DB に置く（M11）。
-- 操作も同じ関数を使う。画面に出る「余白」とトリムで切り取る量、表示するラウドネスと正規化で使う値が必ず一致する（E26）。
-- フォント・3D の情報（書体名・字数、頂点数・大きさ）は値を持たない解析で、kura-mac か軽いパーサーで読む（M11）。
+```rust
+impl Engine {
+    pub fn analyze<A: Analysis>(&self, v: &Value, p: &A::Params, mon: &dyn Monitor) -> Result<A::Output, EngineError>;
+    pub fn analyze_dyn(&self, req: &AnalysisRequest, v: &Value, mon: &dyn Monitor) -> Result<Analyzed, EngineError>;   // ID・版・引数の JSON から
+    pub fn analyze_many(&self, v: &Value, reqs: &[AnalysisRequest], mon: &dyn Monitor) -> Vec<Result<Analyzed, EngineError>>;
+    pub fn analysis_catalog(&self) -> Vec<AnalysisDescriptor>;   // 内部用を除く
+}
+```
+
+値だけを受ける（ファイルを読むのは kura-core。読んだときの `DecodeStamp` を一緒に記録する）。型付きの `analyze` も `analyze_dyn` と同じ道（引数の正規化と範囲 → 受け付ける種類 → 値の上限 → 見積もり）で確かめ、正規の形から読み直した引数で解くので、同じ要求なら同じ結果・同じエラーになる。`Estimate` の `bytes` は解く前に上限と照らす（`cost` は本番では使わず、ファズで重い解析を飛ばす目安と E24 の中止の回数の下限に使う）。
+
+### 11.2 操作が解析を申告する口
+
+- 操作は `Op::NEEDS`（申告しうる (ID, 版) の一覧）と `Op::needs(p, 入力の形) -> Vec<Need>`（どの入力にどの解析を、どの引数で）を申告する。実行器は `compile` で申告を確かめ（`NEEDS` にある・登録済み・入力の種類を受け付ける・引数が正規・見積もりが上限内）、描くときに各ノードの `apply` の前に解いて、`ApplyCx::analysis::<A>(入力, 値, 引数)` で `Arc<A::Output>` を渡す。申告していない解析を使うと `Internal`。描く前に解いていない解析をその場で解いたときも `Internal`（申告と使い方の食い違い）。外したノードは解かない。`Lift::PerFrame` の操作は申告できない（登録で断る）。申告は操作の版ごとに固定し、今の版の操作は解析の今の版を申告していなければならない（`Engine::new` の `check_current_needs`。旧版・退役した版の操作は除く。試験用の `with_registries` は確かめない）。申告される解析の版を上げるときは、申告する操作の版も上げて、新しい版で今の版の解析を申告する（§8.4）。
+- 段 8 で、`audio.normalize` v1 は内部用の `audio.loudness_gating` を、`image.trim_alpha` v1 は `image.opaque_bounds` を申告して使う形に移した（値は同じで、操作の版・ゴールデンは変えていない）。表示する値（`audio.loudness`・`image.opaque_bounds`）と操作が使う値は、同じ関数を通るので必ず一致する（E26）。
+- 実行器は解いた結果を `Solver` で受け渡す。段 10 のキャッシュはここに「入力の指紋 × ID × 版 × 引数」で入る。操作が使うのはメモリ上で解いた結果だけで、DB に置いた結果は使わない。
+
+### 11.3 画像の解析（どれも整数だけ。タイルごとに数えて和・和集合でまとめるので、スレッド・タイルの分け方によらない）
+
+| 解析 | 引数 | 結果 | 使い手 |
+|---|---|---|---|
+| `image.alpha` | なし | `kind`（none / binary / partial）、透明・半透明・不透明の画素数、フレームの列で覆われない画素数 `uncovered`（kind に効く） | 市松模様の表示、保存の前の警告（`AlphaOutput::loss_in(MetaCaps.alpha)`：二値になる・消える）、検索 |
+| `image.opaque_bounds` | `threshold`（0〜254、既定 0。トリムと同じ） | `canvas`・`union`（全部透明なら null。アルファのない形式のフレームの列はキャンバス全体：トリムが何もしないことに合わせる）・`frames`（フレームごとの矩形） | トリム（申告して使う）、余白の表示 |
+| `image.colors` | なし | 色の数（257 で打ち切り）、256 色以下なら色の並び、`visible`（α = 0 をひとつにまとめた数）、`paletteLossless`、Indexed8 のパレットの `len`・`used` | PNG-8・GIF の候補、検索 |
+| `image.pixel_scale` | なし | 軸ごとの `k`（倍率）・`phase`（位相）・`lines`、`lossless` | ドット絵の表示（最近傍）、「1/k に戻す」 |
+| `image.sprite_grid`（推定） | なし | 背景（透明か四隅の色）、`best`（`sprite.split_grid` にそのまま渡せる `GridParam`、列・行・中身のあるセルの数・当てはまり方）、候補 3 つまで | 分割の候補 |
+
+- **alpha**：16 ビットは元の深さで数える。Indexed8 は使われている番号のパレットの α だけを見る。全部不透明な RGBA は none（形式でなく中身で決める）。
+- **colors**：`image.convert` が Indexed8 にするときと同じ 8 ビットの色で数える（速い読み手 `imaging::convert::for_each_rgba8_key` を使い、convert の `convert_pixel` と同じ色になることを単体・E26・素朴な参照で照らす）。256 色以下なら、色は詰めた値の小さい順で、convert が作るパレットと同じ。フレームに覆われない部分は数えない（alpha は数えるので、同じ値で「透明あり・透明な色なし」になりうる）。タイルごとに固定の大きさの表で数え、最後に並べ直す。
+- **pixel_scale**（ユーザーの決定）：全行・全列の色の変わり目の位置（合併）の差の最大公約数を倍率 `k`、変わり目の位置の余りを位相 `phase` とする（端の欠けたブロックは数えない）。位相をずらして切り抜いた絵でも倍率が出る。同じ色の連続の長さの最大公約数（以前の定義）は、切り抜きで 1 に落ち、レンガ積みの模様を倍率と取り違える。厳密な定義だけで、JPEG・平滑な拡大・あとから書き足した 1 点では 1 に落ちる（許容差つきの推定は、それを使う機能を作る段で別の解析にする）。最近傍で k 倍すると `k`・`phase` がちょうど k 倍になり、`lines`・`lossless` は変わらない。変わり目が 1 本以下の軸は null。フレームの列は各フレームの中だけで比べ、キャンバスの座標で合併する（フレームの縁と覆われない部分の境は変わり目に数えないので、同じ見え方の 1 枚の画像と結果が違いうる。例：キャンバスの (1, 1) に置いた 4×4 の赤のフレームは null、同じ見え方の画像は k 4・位相 1）。
+- **sprite_grid**：透明（なければ四隅と同じ背景色）を空とし、軸ごとに周期で畳んで「詰めた格子・周期の格子」を作り、整数の順位（中身のあるセルの多さ、セルの数、余白の整い方、空の割合、当てはまり方、位置、幅、周期）で 1 つ選ぶ。中身のあるセルが 2 つ以上の格子だけ。周期の上限 4,096・候補 3 つは版に凍結する定数。推定（合成のシートで確かめた。ラベル入り・はみ出しなどの実物では外れうる。中身がセルの縁に届かないシートでは、セルの大きさが画素から決まらない）。背景色のシートでは `split_grid` の `skipEmpty`（透明しか見ない）が背景だけのセルを残す。フレームの列は受けない（1 枚の画像だけ）。
+- **ドット絵かどうか**の判定は解析に入れない（倍率・色数・アルファの事実から M11 が決める）。
+- フォント・3D の情報（書体名・字数、頂点数・大きさ）は kura-engine の解析（値を受ける）ではなく、M11 で kura-core・kura-mac か軽いパーサーで読む（§9.2 の「解析だけ」）。
+- 速さ（16384²、release・16 コア、負荷のある中の目安）：alpha 15〜41 ms、opaque_bounds 約 33 ms、colors 5〜82 ms（最悪は画素ごとに色が違う形）、pixel_scale 53〜168 ms、sprite_grid 139〜218 ms。値の大きさに比例する確保はしない。
+
+### 11.4 音声の解析
+
+| 解析 | 引数 | 結果 | 使い手 |
+|---|---|---|---|
+| `audio.loudness` | なし | `integrated`・`range`（LRA）・`samplePeak`・`truePeak`・`momentaryMax`・`shortTermMax`。どれも `Level`（計れた値か、計れない理由） | 表示・検索、正規化の値と一致（E26） |
+| `audio.loudness_gating`（内部用） | なし | 積分・ピーク・ブロックのパワーの列・計れるか | 正規化（申告して使う） |
+| `audio.peaks` | `finest`・`coarsest`（256・1,024・4,096・16,384・65,536 から。既定は 5 段とも） | 1 ビンあたりのフレーム数ごとの min/max（i16）の段（バイナリ `kura-peaks`） | 波形の表示（M11 の kura:// /peaks） |
+| `audio.silence` | `thresholdDb`（−120〜0、既定 −60） | 音のある範囲 `content`（全部無音なら null）・前後の無音の長さ・クリップの列の数・1 を超える標本の数・NaN と ∞ の標本の数 | 自動トリム、警告 |
+| `audio.loop` | なし | ループ点（書き出しと同じ判定）・マーカー（位置の順、1,024 個・名前 256 バイトまで）・落とした数 | ループの表示と試聴 |
+
+- **loudness_gating**：見積もりは、計れないレート（3,363 Hz 以下。`loudness::measurable_rate`、K 特性を作れる境と同じ関数）ではブロック 0 個として数える（段 6 で描けた低いレートの長い音声の正規化を、計画で断らないため。描くと入力のまま `LoudnessUnmeasurable`）。
+- **loudness**：段 6 の `loudness::analyze`（BS.1770。正規化と同じ関数）に、LRA・最大のモーメンタリ・最大の短期を足した。理由は優先の順に nonFinite（NaN・∞ を含む）・lowRate・tooShort・silent（計るチャンネルのブロックのパワーがすべて 0）・belowGate。積分と最大のモーメンタリは 4 区間（400 ms）、LRA と最大の短期は 30 区間（3 秒）より短いと tooShort（区間は ⌊(fs + 5)/10⌋ 標本）。400 ms より短い効果音は、規格どおり積分ラウドネスを出さず、ピークだけを出す（ユーザーの決定。正規化 v1 が何もしない条件と一致する）。最大のモーメンタリ・短期はゲートなしの最大。
+- **LRA**（EBU Tech 3342 v4。ユーザーの決定で規格どおり 0.1 秒ごと）：短期ラウドネスを 30 区間（3 秒）の窓で 1 区間（0.1 秒）ずつずらして取り、−70 LUFS の絶対ゲートと「平均 −20 LU」の相対ゲート（どちらも「≥」。積分ラウドネスのゲートは BS.1770 の「>」のまま）を通した値の、10 と 95 パーセンタイル（順位は補間なしの ⌊((n − 1)·p + 50)/100⌋）の差。EBU の試験 1〜4（10・5・20・15 LU）は 48 kHz・44.1 kHz でちょうどの値。libebur128・ebur128 クレート・ffmpeg の `loudnorm`（libebur128 の移植）は短期を 1 秒ごとに取るので（規格の「2.9 秒以上の重なり」を満たさない）、音楽では 0.1〜0.4 LU 違う。ffmpeg の `ebur128` フィルタは 10 Hz で取り、kura と同じ値になる（1 秒ごとにした内部の関数は、dev 依存の ebur128 クレート（=0.1.10。libebur128 の移植）と 1e-6 LU で一致する）。EBU の試験 5・6 は実際の番組の音声なので、テストにない。
+- 段 8 で `loudness::analyze` を値を変えずに速くした（K 特性・トゥルーピーク・サンプルピーク・有限の確かめを 1 つの `par_blocks` で。段 6 の実装をテストの参照に残し、ビット一致を確かめる）。5 分の 44.1 kHz ステレオで 0.109 → 0.061 秒（16 スレッド）。IIR を時間で割る並列化はしない（値が変わる）。
+- **peaks**：16 ビットで書き出すときと同じ格子（`pcm::quantize(x, 16)`）で i16 の min/max を取る。標本から作るのは最も細かい段だけで、上の段は下の段 4 つから作る（整数なので並列・ターゲットで変わらない）。NaN は 0 として含め、ビンの数は ⌈N / B⌉。`kura-peaks` 版 1：ヘッダ 32 バイト＋段の表（1 段 24 バイト）、データはビンが外側・チャンネルが内側の [min, max] の i16（リトルエンディアン）、段の間は 8 バイト境界まで 0 で詰める。5 分の 44.1 kHz ステレオで、5 段 550,872 バイト・4,096 以上の 3 段 34,024 バイト。読み手（`from_canonical`）はファズにかける（`decode_peaks`）。
+- **silence**：どれかのチャンネルで |x| が閾値を超える最初と最後のフレーム（NaN は無音、±∞ は音あり）。クリップは 16 ビットの格子の同じ端に 3 標本以上続く列（Audacity の既定と同じ）。閾値の dB を倍率に直すのが浮動小数なので、数値の性質は Float。将来の無音のトリムは同じ解析を同じ閾値で申告する（E26：解析の範囲でトリムすると、余白が 0 になる）。
+- **loop**：`writable_loop`（`start < end ≤ 長さ`。書き出しと同じ判定）を通したループ点。表示するループ点と保存されるループ点が一致する。
+- 速さ（5 分の 44.1 kHz ステレオ、release・16 コア）：波形の段 1.8 ms・ラウドネス 45 ms・無音 18 ms、4 つで 66 ms（1 スレッドで 0.47 秒）。WAV の読み取りを含めて 0.19 秒、FLAC で 0.42 秒（§16 の「5 分の曲の解析 2 秒」）。解析は値を丸ごと受けるので、値の上限（`max_value_bytes`）を超える長さ（48 kHz ステレオで約 3 時間）は解析できない。
+
+### 11.5 テスト
+
+- 適合（`tests/analysis_conformance.rs`）：登録されたすべての解析の例で、スレッド 1・3・16 で同じ結果（E1）、中止で `Canceled`（E24）、上限（E25）、正規の形の往復、引数の検証、受け付けない種類。
+- ゴールデン：`goldens-analysis/<ID>/v<版>.jsonl`（1 行に `{"digest","input","name","output"?,"params","target"}`。`output` は JSON で 2 KiB 以下のときだけ書く。`target` は `numeric_for`）。追記だけ（`scripts/check-goldens-append-only.sh` が見る）。足りない行は `KURA_BLESS=1 cargo test -p kura-engine --test analysis_golden`。
+- E26（`tests/analysis_ops.rs`）：(a) 登録されたすべての操作の例で、申告した解析を実行器が渡した値と `Engine::analyze_dyn` で別に求めた値が一致し、偽の値を渡すと出力が変わる（申告した解析を実際に使っている）。偽の値は欄ごと（`FAKES`。JSON は欄を書き換え、バイナリは型付きの値を `Perturb::Typed` で変える）で、操作が読むと申告した欄（対の表の `reads`）はどれかの例で出力を変え、読まない欄はどの例でも変えない。偽の値が読めない・元と同じなら、テストの誤りとして止める。`NEEDS` の各 (ID, 版) は、どれかの例の計画に載らなければならず、`NEEDS` のある操作で計画が空になる例は、理由つきの許可の一覧 `EMPTY_PLAN` に載せる（今は `image.trim_alpha` の `rgb-is-untouched`：アルファのない形式は解かない。一覧にない空の計画も、空でない計画の古い行も失敗）。音声の操作は核（`audio_kernel`）の経路も同じ偽の値で照らす（`kernel_registry`）。`src/ops/**` が申告で受け取るべき計算（解析の `run`・`analysis::loudness`・`imaging::bounds` の範囲・`Engine` と `analyze`・`analyze_many`）を直接呼ばないこと、`analysis` を別名にする `use` がないことを、ソースの走査で確かめる（関数の名前は呼び出し・`use`・パスのときだけ断り、変数・欄の名前は断らない。型の名前はどこでも断る。テストのモジュールは属性を挟んでも名前が何でも除く。部品として使うものは理由つきの許可の一覧 `DIRECT_OK`）。(b) 意味の対の表（`tests/analysis/pairs_{image,audio}.rs`）：トリム ↔ opaque_bounds、正規化 ↔ loudness・loudness_gating、convert ↔ colors（パレットが同じ）、convert ↔ alpha（形式の能力）、最近傍の resize ↔ pixel_scale、split_grid ↔ sprite_grid（推定した格子で分けると中身を落とさない）、trim ↔ silence、set_loop ↔ loop。(c) 覆いの検査：登録されたすべての解析は、対の表か「対のない解析」の表（今は `audio.peaks`）に載る（どちらにもなければ失敗）。対の表の行は (操作, 版, 解析, 版, reads, 検査) で、操作の今の版と申告のある旧版をすべて照らし、解析は登録表で引く（型の名前で引かない）。
+- 境目のテスト：ゲートの「ちょうど」（LRA の相対ゲートの「≥」、積分の絶対ゲートと相対ゲートの「>」と `gain_to` の区間の端）、LRA の相対ゲートの平均が絶対ゲートを通ったブロックだけで取られること、colors の 256 色ちょうど・257 色ちょうど（1 タイル・タイルをまたぐ）、`kura-analysis-v1` の式の凍結（`analysis::tests::digest_formula_is_frozen`）、型付きと ID からの口の一致と低いレートの正規化（`tests/analysis_core.rs`）。境目の例（pixel_scale の lossless 偽・片方の軸だけ null、colors の visible < count、NaN・∞ を含む音声、逆向き・範囲の外のループ点など）もゴールデンに凍結した。
+- ファズ：`testing::fuzz_decode` は読めた値に、見積もりの手間が 2²⁴ 以下のすべての解析を当て、結果が見積もり以下であることを確かめる。
 
 ## 12. 実行・プレビュー・セッション
 
 ```rust
-impl Engine {
+impl Engine {   // 段 8 までにあるもの
     pub fn load(&self, raw: &[u8]) -> Result<Graph, EngineError>;               // 読み込みとスキーマの移行
-    pub fn compile(&self, g: &Graph, inputs: &InputShapes) -> Result<Plan, Issues>; // 版の解決・引数の移行と検証・形の推論・資源の見積もり
-    pub fn render(&self, plan: &Plan, inputs: &InputValues, cache: &dyn NodeCache, mon: &dyn Monitor) -> Result<Rendered, EngineError>;
-    pub fn encode(&self, v: &Value, out: &OutputSpec, path: &Path, mon: &dyn Monitor) -> Result<EncodedStamp, EngineError>;
-    pub fn analyze<A: Analysis>(&self, v: &Value, mon: &dyn Monitor) -> Result<A::Output, EngineError>;
+    pub fn compile(&self, g: &Graph, input_shapes: &BTreeMap<InputId, Shape>) -> Result<Plan, Issues>; // 版の解決・引数の移行と検証・形の推論・解析の申告・資源の見積もり
+    pub fn render(&self, plan: &Plan, inputs: &BTreeMap<InputId, InputValue>, mon: &dyn Monitor) -> Result<Rendered, EngineError>;
+    pub fn render_with_solver(&self, plan: &Plan, inputs: &BTreeMap<InputId, InputValue>, mon: &dyn Monitor, solver: &dyn Solver) -> Result<Rendered, EngineError>;   // 申告した解析を解く口（§11.2）
+    pub fn analyze<A: Analysis>(&self, v: &Value, p: &A::Params, mon: &dyn Monitor) -> Result<A::Output, EngineError>;   // §11.1（analyze_dyn・analyze_many も）
 }
+// 書き出しは今は CodecSet::encode_bytes（§9.1。EncodedStamp を返す）。ノードのキャッシュ（NodeCache）を渡す render は段 10 で足す。
 ```
 
 - **キャッシュ**：ノードの指紋（`blake3(親の指紋 ‖ 操作 ‖ 版 ‖ 正規化した引数 ‖ 解像度の段)`）で途中の値を覚える。正しさには関わらない。編集中のノードの入力は固定して、引数を動かしても前段を計算し直さない。指紋は版をまたいで保つ必要はない（種は `Node.seed` に別に持つ）。
-- **プレビューの段**：写真は縮小した段で描く（操作が引数を縮める）。ドット絵（`image.pixel_scale` が 1 以上、または利用者の指定）は常に等倍で描き、拡大は CSS の `image-rendering: pixelated` に任せる。大きなシートは範囲（ROI）を等倍で描く。
+- **プレビューの段**：写真は縮小した段で描く（操作が引数を縮める）。ドット絵（`image.pixel_scale` の倍率が 2 以上、M11 の判定、または利用者の指定）は常に等倍で描き、拡大は CSS の `image-rendering: pixelated` に任せる。大きなシートは範囲（ROI）を等倍で描く。
 - **変わった範囲**：推論で変わった範囲を求め、フロントは変わったタイルだけを取り直す。
 - **予約**：最新の要求だけを生かし、古い描画はタイルの合間で中止する。プレビュー用と一括加工用のスレッドプールを分ける。
 - **メモリの予算**：重み付きのセマフォ（バイト）で管理する。既定は物理メモリの 1/4、上限 4GiB。エディタと一括加工で共有し、一括加工はヘッダから見積もった量を描く前に確保する。
@@ -612,7 +683,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   - 大きな画像：16384² の RGBA（値 1 GiB）を PNG に書いて読み直すテスト（`tests/large.rs`、release で 3.8 秒）のピークのメモリは 3.3 GB（元の値と読んだ値の 2 GiB を含む）。PNG の書き出しは行を詰めた写しを 1 つ作る（値と同じ大きさ。行ごとに書くとバイト列が変わるので、エンコーダの版を上げる段 10 のメモリの予算で扱う）。
   - 段 6 の音声のデコーダの上限：symphonia・nanomp3 に渡すファイルは `max_value_bytes` まで読み込む。長さはデコードせずに数え（パケットの長さの和・MP3 のフレームの走査）、形を上限（`max_audio_frames`・`max_value_bytes`・`max_channels`・`max_sample_rate`）で確かめてから確保する。デコードの途中でも形の上限を超えたら止める。Vorbis は codebook の表の大きさを渡す前に見積もって断る。AIFF の COMM は 279 バイトまで、MARK・INST・テキストは WAV と同じ予算（マーカーの上限・`max_meta_bytes`）。symphonia の panic は `codec::contain` が受け止める。
   - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・AIFF・FLAC・MP3・Ogg・m4a・AAC・文書の読み込み）はファズにかける。
-    - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_document` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
+    - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_peaks`・`fuzz_document` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
     - `tests/fuzz_smoke.rs` は同じ口を stable で回す変異のファズ。種（各形式の小さなファイル・フィクスチャ・文書）をバイトの書き換え・挿入・削除・つなぎ合わせで崩す。ふだんの `cargo test` で対象ごとに 150 回（`quick`）、`KURA_FUZZ_SECS=<秒> cargo test --release -p kura-engine --test fuzz_smoke long -- --ignored` で長く回す（`KURA_FUZZ_ONLY=svg,wav` で対象を選べる）。見つけた入力は `target/fuzz-smoke/` に残し、`replay` で流し直す。
     - 文書のファズは、上限を絞ったエンジンで読み込み、小さな入力（画像・パレットの画像・フレームの列・音声、格子・ピボット・スライス付きのシート、ループ点・マーカー付きの音声）で計画を作って描くところまで流す（段 5 から。新しい操作の実行の経路とメタデータの写し方にも届く）。追記だけの引数（`actions` の列）を持つノードは、途中で切って差分の適用（`Op::apply_appended`）が全体を当て直したものと同じかも照らす（E21。実行器が差分を使う段 10 までは、ファズでここを照らす）。
     - デコーダのファズは、上限を絞って（`testing::fuzz_limits`）その形式のすべてのデコーダ（旧版を含む）で形と中身を読み、自分のコードの panic（panic の場所が `crates/kura-engine/src/` のもの。`testing::catch_own_panic` が panic のフックで見分ける）・形と中身の食い違い・`Internal` を見つけたものとして扱う。壊れたファイルとしてのエラーと第三者のクレートの panic（`codec::contain` がエラーに変える）は正しい振る舞い。
@@ -621,6 +692,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
     - カバレッジ（育った種で数えた行の割合。同じファイルのエンコーダと、テストの例を作る関数は除く）：PNG 92%・JPEG 84%・GIF 90%・WebP 84%・WAV 92%・aseprite 95%・PSD 94%・SVG 83%。文書は、操作 78〜99%・メタデータの写し方 80%・実行器 72%・描画 70〜93%。届いていないのは主に、中止・あふれ・確保の失敗の枝と、識別子を返す関数。カバレッジで、aseprite のパレットの番号のまま描く経路・メタデータの写し方・差分の適用に届いていないと分かったので、種・入力・照らし合わせを足した。
     - 段 6 で音声の 6 つの対象（`decode_aiff`・`decode_flac`・`decode_mp3`・`decode_ogg`・`decode_m4a`・`decode_aac`）を足した。種は自作の AIFF・FLAC の書き出しと、他のツールで作ったフィクスチャ（MP3・Ogg Vorbis・Opus・ALAC・AAC・HE-AAC）。stable の変異で対象ごとに 60 秒（合わせて約 980 万回）、cargo-fuzz で対象ごとに 15 分（合わせて約 2,360 万回）回し、何も見つかっていない。検証のあとの修正（MP3・AIFF・Ogg・m4a）のあとにも、WAV を含む 7 対象を stable の変異で 40 秒ずつ（合わせて約 1,170 万回）回し、何も見つかっていない。ファズで届かない形（巨大な codebook を名乗る Vorbis・グラニュールで詰めた Ogg・切れた MP3 など）は、検証で組んだ入力を単体のテストとフィクスチャに残した。カバレッジ（読み取りの関数の行。同じファイルのエンコーダ・テストを除く）：AIFF 90%・FLAC 90%・MP3 89%・Ogg・m4a・ADTS の読み取り（`lossy.rs`）93%・symphonia の共通の部品（`symph.rs`）81%。届いていないのは主に、中止・途中でチャンネルの数が変わる枝と、ファズでは組めない形（巨大な codebook を名乗る Vorbis。単体のテストで確かめる）。
     - 段 7 で自前のエンコーダの対象 `encode_ogg`（`testing::fuzz_encode`）を足した。先頭の 19 バイト（`FUZZ_ENCODE_HEADER`）で品質（−1〜10）・レート・チャンネル（1〜9）・長さ（0〜16,384 フレーム）・ループ点（なし・範囲の中・u64 の端に近い始まり／終わり）・タグ（0〜4 個。別名・大文字小文字違い・書けない名前、空・`=`・NUL・4,096 バイト前後・70,000 バイトの値）を決め、残りを f32 のビット列（NaN・∞・巨大な値を含む）として標本にする。書けない形（レート・チャンネルの範囲の外）は断ること、書けると答えた形は断らないこと、すべての ogg のデコーダ（旧版を含む）で読み直した長さ・レート・チャンネルが元と同じこと、コメントのループ点が範囲の中だけ正しい値で書かれ、名前が重ならず、読み直して書き直すと同じコメントになることを確かめる。検証で cargo-fuzz の `encode_ogg` を 31 分（約 6.9 万回）、`decode_ogg`（kura の出力 672 本を種に足して）を 7 分（約 220 万回）、stable の変異の `encode_ogg` を 300 秒（約 7.8 万回）回し、何も見つかっていない。メタデータを足したあとも、stable で 90 秒（約 2.8 万回）と cargo-fuzz で 5 分（約 1.1 万回）回して何も見つかっていない（エンコーダは 1 回が重いので回数は少ない）。カバレッジ（行）：psy 94%・envelope 92%・floor1 88%・res0 86%・block 82%・ogg 79%。届かないのはエラーの枝と、設定のテンプレートでは届かない枝（M7 の短い窓の範囲の外・5.1 の coupling など）。
+    - 段 8 で、`fuzz_decode` が読めた値に登録されたすべての解析（見積もりの手間が 2²⁴ 以下のもの）を当て、結果が見積もり以下であることを確かめるようにした。波形の段のバイナリの読み手の対象 `decode_peaks`（`testing::fuzz_peaks`）を足した。release の stable の変異で各 20 秒（peaks 約 6,000 万回、wav・aiff・flac は解析込みで約 4〜23 万回）回し、何も見つかっていない。
     - 通常の `cargo test` にも、ChaCha8 でランダムな文書と壊れたファイルを作るテスト（形式ごとの `broken_files_are_errors` など）を入れる。
 
 ## 14. 保存と版（M12 以降。意味だけを決める。表は data-model.md に各段で書く）
@@ -673,6 +745,8 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 
 段 7 の実測（`cargo test --release -p kura-engine --lib vorbis_bench -- --ignored --nocapture`、16 コア）：Ogg Vorbis の書き出しは、3 分の 44.1 kHz ステレオで q5 が 0.27〜0.30 秒・q0 が 0.26〜0.30 秒・q10 が 0.30〜0.33 秒（1 スレッドで 1.45〜1.56・1.46〜1.57・1.61〜1.71 秒。2 回の測定の幅）。直列で残るのは、ブロックの計画（envelope。q5 で約 0.08 秒）がほとんど。
 
+段 8 の実測（release・16 コア、負荷のある中の目安。§11.3・§11.4）：5 分の 44.1 kHz ステレオの解析（波形の段・ラウドネス・無音・ループ）は 66 ms（1 スレッドで 0.47 秒）、WAV の読み取りを含めて 0.19 秒、FLAC で 0.42 秒（「5 分の曲の解析 2 秒」を満たす）。60 分の 48 kHz ステレオのラウドネスは 0.69 秒。画像の解析は 16384² で 15〜218 ms（最も重いのは sprite_grid）。正規化の描画全体（計測を先に解く＋利得、5 分 48 kHz ステレオ）は 0.21 秒、トリムの描画（8192²）は 47 ms。
+
 ## 17. 受け入れテスト（`kura-engine` のテストとして実装する）
 
 | ID | 内容 |
@@ -695,15 +769,15 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 | E16 | 音声のトリムを 2 回するのは、合成した 1 回のトリムと同じ |
 | E17 | ゲイン 0dB と長さ 0 のフェードは何も変えない。int16・int24 → f32 → 元のビット数の往復はビット一致 |
 | E18 | 区間ごとに描いても（チャンク 1・7・4,096・全体）値が同じ |
-| E19 | ラウドネスの計測が EBU Tech 3341 の試験信号で ±0.1 LU。正規化したあとの積分ラウドネスが目標の ±0.1 LU |
+| E19 | ラウドネスの計測が EBU Tech 3341 の試験信号で ±0.1 LU。正規化したあとの積分ラウドネスが目標の ±0.1 LU。LRA が EBU Tech 3342 の試験 1〜4 で 10・5・20・15 LU（段 8） |
 | E20 | WAV の smpl・cue、AIFF の MARK・INST、Ogg の LOOPSTART・LOOPLENGTH を読んで書いても保たれる（FLAC の LOOPSTART・LOOPLENGTH も往復を確かめる。Ogg の書き出しは段 7 で足した。他のツールで書いた Ogg のループ点も読む）。範囲の外・長さ 0・逆向きのループ点はどの形式も書かない。名前の重なるタグは 1 つだけ書き、書いて・読んで・書き直すと同じコメント（FLAC はバイト列も同じ、Ogg はシリアル番号と CRC を除いて同じ） |
 | E21 | 同じ点の列からは同じ画素ができる。差分で当てても全体を当て直しても同じ。ピクセルパーフェクトの規則どおり。TS と共有するベクタと一致する |
 | E22 | 塗りつぶしは 4 連結・8 連結・許容差の定義どおりで、たどる順に左右されない |
 | E23 | スポイトが返す色とインデックスが、描画結果の画素と一致する |
 | E24 | 中止すると `Canceled` になり、途中までの値もファイルも出ない |
 | E25 | 上限を超える出力は推論の段階で `Limit` になり、描かない。壊れたファイル・展開爆弾で落ちない |
-| E26 | 解析と操作が一致する（不透明な範囲とトリムで切り取る範囲、ラウドネスの値と正規化で使う値） |
-| E27 | aseprite の合成が、Aseprite で書き出したフィクスチャと一致する |
+| E26 | 解析と操作が一致する。申告した解析を実行器が渡した値と別に求めた値が同じで、操作はその値を使う（登録されたすべての操作の例）。意味の対：不透明な範囲とトリムで切り取る範囲、ラウドネスの値と正規化で使う値、色数とパレットへの変換、倍率と最近傍のリサイズ、格子と分割、無音とトリム、ループ点とループの設定、透過と形式の能力。登録されたすべての解析が対の表か「対のない解析」の表に載る（§11.5） |
+| E27 | aseprite の合成が、照合相手の実装と一致する。段 4 の asefile との照合（300 個のランダムな絵。`tests/aseprite_ref.rs`）で満たす（段 8 でユーザーが決めた。Aseprite 本体で書き出したフィクスチャとは照らさない。ADR-152） |
 | E28 | 自作の Ogg Vorbis の出力が、独立したデコーダ 2 つ以上（symphonia・lewton）で読め、長さ・位置・ループのコメントが保たれる。ページが §9.7 の規則に従い（「長・次は短」が途中と最後の前に来る実際の出力でも）、品質の段・スレッド数・チャンネルとレートの範囲が約束どおり。NaN・±∞ を含む入力が 0・±1 に置き換えた入力と同じバイト列（シリアル番号と CRC を除く）、3〜8 チャンネルの並びを lewton と仕様の表で確かめる（`tests/ogg_vorbis.rs` と `codec::vorbis::encoder` のテスト） |
 | E29 | Platform・External のコーデックを通った版は、デコードのダイジェストとコーデックの識別子が記録され、変わったら検出される。アンカーがあればアンカーから作り直す |
 | E30 | §16 の性能（`#[ignore]` 付きのベンチテストと `kura-devtools bench edit`） |
