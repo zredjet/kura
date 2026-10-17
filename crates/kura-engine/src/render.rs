@@ -8,6 +8,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::analysis::{
+    Analysis, AnalysisDescriptor, AnalysisRegistry, AnalysisRequest, AnalyzeCx, Analyzed,
+    DynAnalysis, Need, Solve, Solver,
+};
 use crate::determinism;
 use crate::digest::Digest;
 use crate::doc::{
@@ -24,9 +28,10 @@ use crate::op::{
 use crate::shape::{Dim, Fullness, Shape, ValueKind};
 use crate::value::{Frames, Image, Raster, Value};
 
-/// 操作エンジン。登録表と上限を持つ。
+/// 操作エンジン。操作と解析の登録表と、上限を持つ。
 pub struct Engine {
     registry: Registry,
+    analyses: AnalysisRegistry,
     limits: Limits,
 }
 
@@ -46,6 +51,8 @@ struct PlannedNode {
     enabled: bool,
     lifted: bool,
     inferred: Inferred,
+    /// 描く前に解く解析（操作の申告。§11.2）。外したノードと持ち上げたノードは空。
+    needs: Vec<Need>,
 }
 
 /// 検証と推論を済ませた計画。
@@ -70,6 +77,14 @@ impl Plan {
             .iter()
             .find(|n| n.id == id)
             .map(|n| n.inferred.shape)
+    }
+
+    /// ノードが描く前に解く解析（操作の申告）。
+    pub fn node_needs(&self, id: NodeId) -> Option<&[Need]> {
+        self.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.needs.as_slice())
     }
 
     /// 見積もりの手間の合計。
@@ -117,20 +132,206 @@ impl Engine {
         Self::with_limits(Limits::default())
     }
 
-    /// 上限を指定したエンジン。
+    /// 上限を指定したエンジン。`with_registries` の確かめに加えて、今の版の操作が申告する解析が、どれもその解析の
+    /// 今の版であることを確かめる（`check_current_needs`）。
     pub fn with_limits(limits: Limits) -> Result<Self, EngineError> {
         let registry = crate::ops::registry().map_err(EngineError::Internal)?;
-        Ok(Self { registry, limits })
+        let analyses = crate::analysis::registry().map_err(EngineError::Internal)?;
+        check_current_needs(&registry, &analyses).map_err(EngineError::Internal)?;
+        Self::with_registries(registry, analyses, limits)
     }
 
-    /// 登録表を指定したエンジン（版の契約のテストで、試験用の操作を入れるときに使う）。
+    /// 登録表を指定したエンジン（版の契約のテストで、試験用の操作を入れるときに使う）。解析はすべてのもの。
+    /// 操作の申告は確かめない（計画を作るときに、申告した解析が登録されているかを確かめる）。
     pub fn with_registry(registry: Registry, limits: Limits) -> Self {
-        Self { registry, limits }
+        Self {
+            registry,
+            analyses: crate::analysis::registry().unwrap_or_default(),
+            limits,
+        }
+    }
+
+    /// 操作と解析の登録表を指定したエンジン。操作が申告しうる解析（`Op::NEEDS`）がすべて登録されていること
+    /// （旧版の操作が使う旧版の解析を含む）を確かめる。今の版の操作が解析の今の版を申告しているか
+    /// （`check_current_needs`）は確かめない（試験用の登録表は、申告の誤りを試すために旧版を申告する操作を入れる）。
+    pub fn with_registries(
+        registry: Registry,
+        analyses: AnalysisRegistry,
+        limits: Limits,
+    ) -> Result<Self, EngineError> {
+        check_needs(&registry, &analyses).map_err(EngineError::Internal)?;
+        Ok(Self {
+            registry,
+            analyses,
+            limits,
+        })
     }
 
     /// 登録表。
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// 解析の登録表。
+    pub fn analyses(&self) -> &AnalysisRegistry {
+        &self.analyses
+    }
+
+    /// 解析のカタログ（今の版で、内部用でないもの）。
+    pub fn analysis_catalog(&self) -> Vec<AnalysisDescriptor> {
+        self.analyses.catalog()
+    }
+
+    /// 解析する（型付き）。`analyze_dyn` と同じ道で確かめる：引数を正規の形にして記述の範囲を確かめ（範囲の外・
+    /// 読めない引数は `Invalid`）、受け付けない種類は `Invalid`、上限を超える値・結果は解く前に `Limit`。解くのは
+    /// 正規の形から読み直した引数（`analyze_dyn`・操作の申告と同じ値）。
+    pub fn analyze<A: Analysis>(
+        &self,
+        v: &Value,
+        p: &A::Params,
+        mon: &dyn Monitor,
+    ) -> Result<A::Output, EngineError> {
+        let raw = crate::analysis::params_json(p).map_err(EngineError::Invalid)?;
+        let params = self.prepare(&crate::analysis::erased::<A>(), &raw, v)?;
+        let p = crate::analysis::typed_params::<A>(&params).map_err(EngineError::Invalid)?;
+        A::run(
+            &p,
+            v,
+            &AnalyzeCx {
+                mon,
+                limits: &self.limits,
+            },
+        )
+    }
+
+    /// 解析する（ID・版・引数の JSON から。kura-core のジョブ・ゴールデン・devtools）。結果は正規の形。
+    pub fn analyze_dyn(
+        &self,
+        req: &AnalysisRequest,
+        v: &Value,
+        mon: &dyn Monitor,
+    ) -> Result<Analyzed, EngineError> {
+        let a = self
+            .analyses
+            .resolve(&req.id, req.v)
+            .map_err(|i| EngineError::Invalid(Issues::one(i)))?;
+        let params = self.prepare(a.as_ref(), &req.params, v)?;
+        let cx = AnalyzeCx {
+            mon,
+            limits: &self.limits,
+        };
+        let out = a.run_any(&params, v, &cx)?;
+        let output = a.encode_any(&out)?;
+        if output.len() as u64 > self.limits.max_value_bytes {
+            return Err(EngineError::Limit(format!(
+                "{} の結果が大きすぎます",
+                a.id()
+            )));
+        }
+        Ok(Analyzed {
+            id: a.id(),
+            version: a.version(),
+            params,
+            encoding: a.encoding(),
+            output,
+        })
+    }
+
+    /// 1 つの値に複数の解析（取り込みのあとのジョブ）。要求ごとの結果を要求の順に返す（1 つの失敗はほかに効かない）。
+    /// 進捗は済んだ要求の数。中止したら、残りの要求は `Canceled`。
+    pub fn analyze_many(
+        &self,
+        v: &Value,
+        reqs: &[AnalysisRequest],
+        mon: &dyn Monitor,
+    ) -> Vec<Result<Analyzed, EngineError>> {
+        let total = reqs.len() as u64;
+        let mut out = Vec::with_capacity(reqs.len());
+        for (i, req) in reqs.iter().enumerate() {
+            let r = if mon.canceled() {
+                Err(EngineError::Canceled)
+            } else {
+                self.analyze_dyn(req, v, mon)
+            };
+            out.push(r);
+            mon.progress(i as u64 + 1, total);
+        }
+        out
+    }
+
+    /// 解く前の確かめ（`analyze`・`analyze_dyn` が同じ順に通る）：引数を読んで正規の形にし（既定値・範囲・知らない
+    /// 項目）、受け付ける種類か、値が上限に収まるか、結果が上限に収まる見込みかを見る。返すのは正規の引数。
+    fn prepare(
+        &self,
+        a: &dyn DynAnalysis,
+        raw: &serde_json::Value,
+        v: &Value,
+    ) -> Result<serde_json::Value, EngineError> {
+        let params = a.check_params(raw).map_err(EngineError::Invalid)?;
+        if !a.accepts().contains(&v.kind()) {
+            return Err(bad_input(format!(
+                "{} は {:?} を解析できません",
+                a.id(),
+                v.kind()
+            )));
+        }
+        let shape = v.shape();
+        self.limits.check(&shape).map_err(EngineError::Limit)?;
+        let bytes = a
+            .estimate(&params, &shape)
+            .map_err(EngineError::Invalid)?
+            .bytes;
+        if bytes > self.limits.max_value_bytes {
+            return Err(EngineError::Limit(format!(
+                "{} の結果が上限を超える見込みです（{bytes} バイト）",
+                a.id()
+            )));
+        }
+        Ok(params)
+    }
+
+    /// 操作の申告（`Op::needs`）を確かめる：`NEEDS` にあり、登録されていて、その入力の種類を受け付け、引数が正規の形で、
+    /// 結果が上限に収まる見込みであること。
+    fn plan_needs(
+        &self,
+        op: &dyn DynOp,
+        params: &AnyParams,
+        in_shapes: &[Shape],
+    ) -> Result<Vec<Need>, Issues> {
+        let needs = op.needs(params, in_shapes)?;
+        for n in &needs {
+            let bad = |code: IssueCode, why: &str| {
+                Issues::one(Issue::error(
+                    code,
+                    format!(
+                        "{} が申告した解析 {} v{} を解けません（{why}）",
+                        op.id(),
+                        n.id,
+                        n.v
+                    ),
+                ))
+            };
+            if !op.static_needs().contains(&(n.id, n.v)) {
+                return Err(bad(IssueCode::BadInput, "Op::NEEDS にありません"));
+            }
+            let Some(a) = self.analyses.get(n.id, n.v) else {
+                return Err(bad(IssueCode::UnknownVersion, "登録されていません"));
+            };
+            let Some(shape) = in_shapes.get(n.input) else {
+                return Err(bad(IssueCode::BadInput, "その番号の入力がありません"));
+            };
+            if !a.accepts().contains(&shape.kind()) {
+                return Err(bad(IssueCode::BadInput, "その種類の値を受け付けません"));
+            }
+            if a.check_params(&n.params).ok().as_ref() != Some(&n.params) {
+                return Err(bad(IssueCode::BadParams, "引数が正規の形ではありません"));
+            }
+            let estimate = a.estimate(&n.params, shape)?;
+            if estimate.bytes > self.limits.max_value_bytes {
+                return Err(bad(IssueCode::TooLarge, "結果が上限を超える見込みです"));
+            }
+        }
+        Ok(needs)
     }
 
     /// 上限。
@@ -289,8 +490,16 @@ impl Engine {
                     Issue::error(IssueCode::TooLarge, why).at(node.id),
                 ));
             }
+            // 申告した解析（外したノードは描かないので解かない。持ち上げる操作は申告できない）
+            let needs = if node.enabled && !lifted {
+                self.plan_needs(op.as_ref(), params.as_ref(), &in_shapes)
+                    .map_err(at)?
+            } else {
+                Vec::new()
+            };
             shapes.insert(node.id, inferred.shape);
             nodes.push(PlannedNode {
+                needs,
                 id: node.id,
                 op,
                 params,
@@ -346,12 +555,23 @@ impl Engine {
         })
     }
 
-    /// 計画を入力に当てて描く。入力の値は計画の形と上限に照らしてから使う。
+    /// 計画を入力に当てて描く。入力の値は計画の形と上限に照らしてから使う。操作が申告した解析は、各ノードを描く前に解く。
     pub fn render(
         &self,
         plan: &Plan,
         inputs: &BTreeMap<InputId, InputValue>,
         mon: &dyn Monitor,
+    ) -> Result<Rendered, EngineError> {
+        self.render_with_solver(plan, inputs, mon, &Solve)
+    }
+
+    /// 描く（申告された解析を `solver` で解く。段 10 のキャッシュ・テストの記録と差し替えに使う）。
+    pub fn render_with_solver(
+        &self,
+        plan: &Plan,
+        inputs: &BTreeMap<InputId, InputValue>,
+        mon: &dyn Monitor,
+        solver: &dyn Solver,
     ) -> Result<Rendered, EngineError> {
         if inputs.len() != plan.inputs.len() {
             return Err(bad_input("入力の数が計画と違います"));
@@ -386,16 +606,37 @@ impl Engine {
                 .collect::<Option<_>>()
                 .ok_or_else(|| EngineError::Internal("入力の値がありません".into()))?;
             let (out, node_warnings) = if node.enabled {
-                let mut cx = ApplyCx {
+                let mut cx = ApplyCx::new(
                     mon,
-                    limits: &self.limits,
-                    seed: determinism::seed(node.seed, &source.0, node.op.id()),
-                    rules: plan.rules,
-                    warnings: Vec::new(),
-                };
+                    &self.limits,
+                    determinism::seed(node.seed, &source.0, node.op.id()),
+                    plan.rules,
+                );
+                // 申告した解析を先に解く（段 10 で、入力の指紋 × ID × 版 × 引数をキーにしたキャッシュから引く）
+                for need in &node.needs {
+                    let a = self.solvable(need)?;
+                    let v = ins.get(need.input).ok_or_else(|| {
+                        EngineError::Internal("解析する入力の値がありません".into())
+                    })?;
+                    let acx = AnalyzeCx {
+                        mon,
+                        limits: &self.limits,
+                    };
+                    let out = solver
+                        .solve(node.id, need, v, a.as_ref(), &acx)
+                        .map_err(|e| e.at(node.id))?;
+                    cx.preload(need, v, out)?;
+                }
                 let (out, mut mapped) = self
                     .apply_node(plan.rules, node, &ins, &mut cx)
                     .map_err(|e| e.at(node.id))?;
+                // 申告（needs）と、操作が実際に使った解析が食い違えば操作の不具合（キャッシュの鍵が作れない）
+                if cx.analyses_solved_in_place() != 0 {
+                    return Err(EngineError::Internal(format!(
+                        "{} が先に解いていない解析を使いました（needs と apply の食い違い）",
+                        node.op.id()
+                    )));
+                }
                 let mut all = cx.warnings;
                 all.append(&mut mapped);
                 (out, all)
@@ -442,6 +683,13 @@ impl Engine {
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
         Ok(Rendered { outputs, warnings })
+    }
+
+    /// 申告した解析の実装（計画を作ったときに確かめてある）。
+    fn solvable(&self, need: &Need) -> Result<Arc<dyn DynAnalysis>, EngineError> {
+        self.analyses.get(need.id, need.v).ok_or_else(|| {
+            EngineError::Internal(format!("解析 {} v{} がありません", need.id, need.v))
+        })
     }
 
     /// ノード 1 つを実行し、メタデータを写す。返すのは値と、写したときの警告。
@@ -550,6 +798,46 @@ impl Engine {
     }
 }
 
+/// 操作が申告しうる解析（`Op::NEEDS`）が、すべて登録されていること（旧版・退役した操作が使う解析の旧版も含む）。
+fn check_needs(ops: &Registry, analyses: &AnalysisRegistry) -> Result<(), String> {
+    for op in ops.all() {
+        for (id, v) in op.static_needs() {
+            if analyses.get(id, *v).is_none() {
+                return Err(format!(
+                    "{} v{} が申告する解析 {id} v{v} が登録されていません",
+                    op.id(),
+                    op.version()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 今の版の操作が申告しうる解析（`Op::NEEDS`）が、どれもその解析の今の版であること（旧版・退役した操作は除く。
+/// それらは申告した旧版の解析で描き続ける）。申告される解析の版を上げて旧版を `legacy` に残したのに、操作の版を
+/// 上げずに旧版を申告し続けると、カタログ・`analyze_dyn` の既定（今の版）で表示する値と、操作が使う値が黙って
+/// ずれる（§11.2・E26）。操作の版を上げて、新しい版で今の版の解析を申告する（旧い版の操作は `legacy` に）。
+fn check_current_needs(ops: &Registry, analyses: &AnalysisRegistry) -> Result<(), String> {
+    for op in ops.current() {
+        for (id, v) in op.static_needs() {
+            match analyses.current_version(id) {
+                Some(cur) if cur == *v => {}
+                cur => {
+                    let cur = cur.map_or_else(|| "なし".to_string(), |c| format!("v{c}"));
+                    return Err(format!(
+                        "今の版の操作 {} v{} が申告する解析 {id} v{v} は、その解析の今の版（{cur}）ではありません\
+                         （解析の版を上げたら、操作の版も上げて今の版を申告する）",
+                        op.id(),
+                        op.version()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 推論の写し方と、実行が返した写し方を合わせる（E9）。推論が Unknown なら実行の値が必要。
 /// そうでなければ、実行の値は無いか推論と同じであること。
 fn settle<T: Clone + PartialEq + std::fmt::Debug>(
@@ -622,4 +910,94 @@ pub fn exact_size(w: Dim, h: Dim) -> Option<Size> {
         w: u32::try_from(w.exact()?).ok()?,
         h: u32::try_from(h.exact()?).ok()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::audio::loudness_gating::LoudnessGating;
+    use crate::analysis::image::opaque_bounds::{
+        OpaqueBounds, OpaqueBoundsOutput, OpaqueBoundsParams,
+    };
+    use crate::analysis::{AnalysisExample, Estimate};
+    use crate::op::Numeric;
+
+    /// 試験用：`image.opaque_bounds` の版を上げたもの（docs の手順で解析の版を上げた形。値は v1 と同じでよい。
+    /// 版の検査だけに使う）。
+    struct OpaqueBoundsV2;
+
+    impl Analysis for OpaqueBoundsV2 {
+        const ID: &'static str = OpaqueBounds::ID;
+        const VERSION: u16 = 2;
+        const ACCEPTS: &'static [ValueKind] = OpaqueBounds::ACCEPTS;
+        const NUMERIC: Numeric = OpaqueBounds::NUMERIC;
+        type Params = OpaqueBoundsParams;
+        type Output = OpaqueBoundsOutput;
+
+        fn run(
+            p: &OpaqueBoundsParams,
+            v: &Value,
+            cx: &AnalyzeCx<'_>,
+        ) -> Result<OpaqueBoundsOutput, EngineError> {
+            OpaqueBounds::run(p, v, cx)
+        }
+
+        fn examples() -> Vec<AnalysisExample<OpaqueBoundsParams>> {
+            OpaqueBounds::examples()
+        }
+
+        fn estimate(p: &OpaqueBoundsParams, input: &Shape) -> Estimate {
+            OpaqueBounds::estimate(p, input)
+        }
+    }
+
+    /// 今の版の操作は、申告する解析の今の版を指す（検証で、opaque_bounds の版を上げて v1 を legacy に残すと、
+    /// 今の版の image.trim_alpha v1 が旧版で切り続け、表示（v2）とずれても、どのテストも落ちなかった）。
+    #[test]
+    fn current_ops_declare_the_current_analyses() {
+        let ops = crate::ops::registry().unwrap();
+        let analyses = crate::analysis::registry().unwrap();
+        check_needs(&ops, &analyses).unwrap();
+        check_current_needs(&ops, &analyses).unwrap();
+        assert!(Engine::new().is_ok());
+        // 申告している今の版の操作がある（検査が空回りしていない）
+        assert!(
+            ops.current()
+                .iter()
+                .any(|o| o.static_needs().contains(&("image.opaque_bounds", 1)))
+        );
+        // 解析の版を上げて旧版を legacy に残す：登録はそろっている（check_needs は通る）が、今の版の操作が
+        // 旧版を申告し続けるので断る
+        let mut bumped = AnalysisRegistry::empty();
+        bumped.add_current::<OpaqueBoundsV2>().unwrap();
+        bumped.add_legacy::<OpaqueBounds>().unwrap();
+        bumped.add_current::<LoudnessGating>().unwrap();
+        check_needs(&ops, &bumped).unwrap();
+        let err = check_current_needs(&ops, &bumped).unwrap_err();
+        assert!(
+            err.contains("image.trim_alpha v1") && err.contains("image.opaque_bounds v1"),
+            "{err}"
+        );
+        assert!(err.contains("（v2）"), "{err}");
+        // 申告される解析に今の版がない（旧版だけ）ときも断る
+        let mut only_legacy = AnalysisRegistry::empty();
+        only_legacy.add_legacy::<OpaqueBounds>().unwrap();
+        only_legacy.add_current::<LoudnessGating>().unwrap();
+        check_needs(&ops, &only_legacy).unwrap();
+        let err = check_current_needs(&ops, &only_legacy).unwrap_err();
+        assert!(err.contains("（なし）"), "{err}");
+        // 旧版・退役した操作は旧版の解析を申告してよい（同じ操作を旧版・退役として入れると通る）
+        let mut old_ops = Registry::empty();
+        old_ops
+            .add_legacy::<crate::ops::image::trim_alpha::TrimAlpha>()
+            .unwrap();
+        old_ops
+            .add_retired::<crate::ops::audio::normalize::Normalize>()
+            .unwrap();
+        check_needs(&old_ops, &only_legacy).unwrap();
+        check_current_needs(&old_ops, &bumped).unwrap();
+        check_current_needs(&old_ops, &only_legacy).unwrap();
+        // 確かめは Engine::new の道（with_limits）でだけ行う。試験用の登録表を渡す with_registries は通す
+        assert!(Engine::with_registries(ops, bumped, Limits::default()).is_ok());
+    }
 }

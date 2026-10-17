@@ -1,6 +1,7 @@
 #!/bin/sh
 # 編集のゴールデンは追記だけ（docs/editing.md §8.5、ADR-136）。
-# 基準のコミットからの差分で、crates/kura-engine/goldens/・goldens-codecs/・goldens-replay/ の既存の行が消えた・変わったもの、
+# 基準のコミットからの差分で、crates/kura-engine/goldens/・goldens-codecs/・goldens-replay/・goldens-analysis/ の既存の行が
+# 消えた・変わったもの、
 # fixtures/・tests/vectors/ のファイルが消えた・変わったものがあれば失敗する。
 # 使い方：scripts/check-goldens-append-only.sh [基準]（既定は origin/main。なければ main）
 set -eu
@@ -16,7 +17,7 @@ if [ -z "$base" ] || [ "$base" = "$zero" ] || ! git cat-file -e "$base^{commit}"
 fi
 
 merge_base=$(git merge-base "$base" HEAD 2>/dev/null || echo "$base")
-dirs="crates/kura-engine/goldens crates/kura-engine/goldens-codecs crates/kura-engine/goldens-replay"
+dirs="crates/kura-engine/goldens crates/kura-engine/goldens-codecs crates/kura-engine/goldens-replay crates/kura-engine/goldens-analysis"
 # 改名（git mv）も、旧いパスの削除として見る（--no-renames）。ファイルごと消したものは名前で知らせる
 # shellcheck disable=SC2086
 deleted=$(git diff --no-renames --name-only --diff-filter=D "$merge_base" HEAD -- $dirs)

@@ -35,13 +35,7 @@ fn render_value(
     };
     let p = op.parse(&params).unwrap();
     let limits = Limits::default();
-    let mut cx = ApplyCx {
-        mon: &NoMonitor,
-        limits: &limits,
-        seed: 0,
-        rules: kura_engine::doc::RULES,
-        warnings: Vec::new(),
-    };
+    let mut cx = ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
     Ok(op.apply(p.as_ref(), &[&input], &mut cx)?.value)
 }
 
@@ -190,13 +184,7 @@ fn bench_paint() {
             actions: actions.clone(),
         };
         let limits = Limits::default();
-        let mut cx = ApplyCx {
-            mon: &NoMonitor,
-            limits: &limits,
-            seed: 0,
-            rules: kura_engine::doc::RULES,
-            warnings: Vec::new(),
-        };
+        let mut cx = ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
         use kura_engine::op::Op;
         let prev_out = kura_engine::ops::paint::actions::Actions::apply(&prev, &[&canvas], &mut cx)
             .unwrap()

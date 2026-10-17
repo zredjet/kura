@@ -29,6 +29,7 @@ pub mod testgen;
 pub mod testing;
 pub mod value;
 
+pub use analysis::{Analysis, AnalysisRequest, Analyzed};
 pub use digest::Digest;
 pub use doc::{Graph, Node, NodeId};
 pub use error::{EngineError, Issue, IssueCode, Issues, Severity};

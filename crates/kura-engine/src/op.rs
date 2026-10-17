@@ -13,6 +13,7 @@ use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::analysis::{Analysis, AnalyzeCx, AnyOutput, Need, Solved};
 use crate::audio::AudioKernel;
 use crate::determinism;
 use crate::error::{EngineError, Issue, IssueCode, Issues};
@@ -285,7 +286,7 @@ pub struct InferCx<'a> {
     pub limits: &'a Limits,
 }
 
-/// 実行に渡す文脈。中止の確認・乱数・警告はここを通す。
+/// 実行に渡す文脈。中止の確認・乱数・警告・申告した解析の結果はここを通す。作るのは `ApplyCx::new`。
 pub struct ApplyCx<'a> {
     pub mon: &'a dyn Monitor,
     pub limits: &'a Limits,
@@ -295,9 +296,68 @@ pub struct ApplyCx<'a> {
     /// `mapping::map_image_meta_for` にこれを渡して、文書の規則の写し方を使う（§8.4）。
     pub rules: u32,
     pub warnings: Vec<Issue>,
+    /// 実行器が先に解いた解析と、その場で解いた解析（§11.2）。
+    analyses: Solved,
+    /// 今の操作が申告しうる解析（`Op::NEEDS`。`DynOp` が操作を呼ぶ前に入れる）。
+    declared: &'static [(&'static str, u16)],
 }
 
-impl ApplyCx<'_> {
+impl<'a> ApplyCx<'a> {
+    /// 文脈を作る（先に解いた解析は空）。
+    pub fn new(mon: &'a dyn Monitor, limits: &'a Limits, seed: u64, rules: u32) -> Self {
+        Self {
+            mon,
+            limits,
+            seed,
+            rules,
+            warnings: Vec::new(),
+            analyses: Solved::default(),
+            declared: &[],
+        }
+    }
+
+    /// 申告した解析の結果（入力 `input` の値 `v` を、引数 `p` で解いたもの）。実行器が先に解いていればそれを、
+    /// なければその場で同じ関数で解いて覚える（操作を直接呼ぶテスト・核の照合でも同じ値になる）。
+    /// （ID, 版）が操作の `NEEDS` になければ内部の誤り（申告せずに使うと、解析の版上げで操作の結果が黙って変わるため）。
+    pub fn analysis<A: Analysis>(
+        &mut self,
+        input: usize,
+        v: &Value,
+        p: &A::Params,
+    ) -> Result<Arc<A::Output>, EngineError> {
+        if !self.declared.contains(&(A::ID, A::VERSION)) {
+            return Err(EngineError::Internal(format!(
+                "申告していない解析 {} v{} を使おうとしました（Op::NEEDS に足す）",
+                A::ID,
+                A::VERSION
+            )));
+        }
+        let cx = AnalyzeCx {
+            mon: self.mon,
+            limits: self.limits,
+        };
+        self.analyses.get_or_run::<A>(input, v, p, &cx)
+    }
+
+    /// 実行器が先に解いた結果を入れる。
+    pub(crate) fn preload(
+        &mut self,
+        need: &Need,
+        v: &Value,
+        out: AnyOutput,
+    ) -> Result<(), EngineError> {
+        self.analyses.insert(need, v, out)
+    }
+
+    /// 先に解いた結果がなく、その場で解いた解析の数（実行器が描いたあとに確かめる）。
+    pub fn analyses_solved_in_place(&self) -> usize {
+        self.analyses.in_place()
+    }
+
+    /// 今の操作が申告しうる解析を入れる（`DynOp` が操作を呼ぶ前に）。
+    fn declare(&mut self, needs: &'static [(&'static str, u16)]) {
+        self.declared = needs;
+    }
     /// 中止を頼まれていればエラーにする。
     pub fn check(&self) -> Result<(), EngineError> {
         if self.mon.canceled() {
@@ -332,6 +392,11 @@ pub trait Op: Send + Sync + 'static {
     const ID: &'static str;
     const VERSION: u16;
     type Params: OpParams;
+    /// 申告しうる解析の（ID, 版）（§11.2）。操作の版ごとに固定する（申告する解析の版を上げるなら操作の版も上げる）。
+    /// `Engine::new` が、すべてが登録されている（旧版の操作が使う旧版の解析を含む）ことと、今の版の操作の申告が
+    /// どれも解析の今の版であることを確かめる。
+    /// フレームに持ち上げる操作（`Lift::PerFrame`）は申告できない。
+    const NEEDS: &'static [(&'static str, u16)] = &[];
 
     /// 入力の種類と数、持ち上げ方、数値の性質、メタデータの扱い。
     fn signature() -> Signature;
@@ -343,6 +408,11 @@ pub trait Op: Send + Sync + 'static {
         inputs: &[&Value],
         cx: &mut ApplyCx<'_>,
     ) -> Result<Applied, EngineError>;
+    /// この引数・入力の形で、実行器に先に解いてほしい解析（描かない。`NEEDS` にあるものだけ）。`apply` は
+    /// `ApplyCx::analysis` で、ここで返したのと同じ（入力・ID・版・引数）の結果を受け取る。食い違うと実行器が内部の誤りにする。
+    fn needs(_p: &Self::Params, _inputs: &[Shape]) -> Result<Vec<Need>, Issues> {
+        Ok(Vec::new())
+    }
     /// 実装を消した古い版 `from` の引数を、結果を変えずにこの版へ移す。移せなければ理由を返す。
     /// 呼ばれるのは、`from` より新しい実装のある版のうち、この版がいちばん古いとき（すぐ上の版）。
     fn migrate(from: u16, _raw: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -395,6 +465,10 @@ pub trait DynOp: Send + Sync {
     fn version(&self) -> u16;
     fn signature(&self) -> Signature;
     fn schema(&self) -> ParamSchema;
+    /// 申告しうる解析（`Op::NEEDS`）。
+    fn static_needs(&self) -> &'static [(&'static str, u16)];
+    /// この引数・入力の形で先に解く解析（`Op::needs`）。
+    fn needs(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Vec<Need>, Issues>;
     /// 引数を読み、範囲を確かめる。
     fn parse(&self, raw: &serde_json::Value) -> Result<Box<AnyParams>, Issues>;
     /// 読んだ引数を JSON に戻す（往復のテスト用）。
@@ -454,6 +528,17 @@ impl<O: Op> DynOp for OpEntry<O> {
         O::Params::schema()
     }
 
+    fn static_needs(&self) -> &'static [(&'static str, u16)] {
+        O::NEEDS
+    }
+
+    fn needs(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Vec<Need>, Issues> {
+        let p = self
+            .params(p)
+            .map_err(|e| Issues::one(Issue::error(IssueCode::BadParams, e.to_string())))?;
+        O::needs(p, inputs)
+    }
+
     fn parse(&self, raw: &serde_json::Value) -> Result<Box<AnyParams>, Issues> {
         // 範囲・列挙を先に見る（どの引数がおかしいかを示せる）
         let ranges = O::Params::schema().check_ranges(raw);
@@ -486,6 +571,7 @@ impl<O: Op> DynOp for OpEntry<O> {
         inputs: &[&Value],
         cx: &mut ApplyCx<'_>,
     ) -> Result<Applied, EngineError> {
+        cx.declare(O::NEEDS);
         O::apply(self.params(p)?, inputs, cx)
     }
 
@@ -512,6 +598,7 @@ impl<O: Op> DynOp for OpEntry<O> {
             (Ok(prev), Ok(p)) => (prev, p),
             (Err(e), _) | (_, Err(e)) => return Some(Err(e)),
         };
+        cx.declare(O::NEEDS);
         O::apply_appended(prev, prev_out, p, cx)
     }
 
@@ -521,6 +608,7 @@ impl<O: Op> DynOp for OpEntry<O> {
         inputs: &[&Value],
         cx: &mut ApplyCx<'_>,
     ) -> Option<Result<Box<dyn AudioKernel>, EngineError>> {
+        cx.declare(O::NEEDS);
         match self.params(p) {
             Ok(p) => O::audio_kernel(p, inputs, cx),
             Err(e) => Some(Err(e)),
@@ -617,6 +705,13 @@ impl Registry {
         if sig.lift == Lift::PerFrame && sig.meta == MetaAccess::Write {
             return Err(format!(
                 "{}：フレームに持ち上げる操作はメタデータを書けません",
+                O::ID
+            ));
+        }
+        // 持ち上げた各フレームの値は計画の段階でないので、先に解く解析を申告できない
+        if sig.lift == Lift::PerFrame && !O::NEEDS.is_empty() {
+            return Err(format!(
+                "{}：フレームに持ち上げる操作は解析を申告できません",
                 O::ID
             ));
         }

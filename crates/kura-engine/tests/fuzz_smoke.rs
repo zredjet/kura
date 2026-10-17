@@ -1,6 +1,7 @@
 //! stable で回す、変異によるファズ（docs/editing.md §13）。`fuzz/`（cargo-fuzz、nightly）と同じ対象
-//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。カバレッジは見ない。
-//! 対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、文書は `document`。
+//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_peaks`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
+//! カバレッジは見ない。対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、
+//! 文書は `document`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）。
 //!
 //! - ふだんの `cargo test` では、対象ごとに決めた回数だけ回す（`quick`）。
 //! - `KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test fuzz_smoke -- --ignored` で、対象ごとに決めた秒数だけ回す。
@@ -24,7 +25,7 @@ use kura_engine::testfiles::{ApngFrame, AseCel, AseFrame, AseLayer, FileGen, Gif
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::{
     FuzzEncodeMeta, fuzz_decode, fuzz_document, fuzz_encode, fuzz_encode_input,
-    fuzz_encode_input_meta,
+    fuzz_encode_input_meta, fuzz_peaks,
 };
 use kura_engine::value::{LoopRange, PixelFormat};
 use kura_engine::{NoMonitor, Value};
@@ -585,7 +586,49 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 sprite_doc.to_canonical_json().unwrap(),
             ],
         ),
+        // 波形の段のバイナリ（kura-peaks。解析 audio.peaks の正規の形。cargo-fuzz の対象は decode_peaks）
+        ("peaks", peak_seeds()),
     ]
+}
+
+/// 波形の段のバイナリの種：5 段・一部の段・1 段・長さ 0。
+fn peak_seeds() -> Vec<Vec<u8>> {
+    let engine = kura_engine::Engine::new().unwrap();
+    let audio = |frames, channels| {
+        InputGen::AudioNoise {
+            rate: 22_050,
+            channels,
+            frames,
+            seed: 5,
+        }
+        .generate()
+        .unwrap()
+    };
+    [
+        (audio(70_001, 2), json!({})),
+        (
+            audio(9_000, 1),
+            json!({ "finest": 4_096, "coarsest": 16_384 }),
+        ),
+        (audio(300, 3), json!({ "finest": 1_024, "coarsest": 1_024 })),
+        (audio(0, 1), json!({})),
+    ]
+    .into_iter()
+    .map(|(v, params)| {
+        engine
+            .analyze_dyn(
+                &kura_engine::analysis::AnalysisRequest {
+                    id: "audio.peaks".into(),
+                    v: None,
+                    params,
+                },
+                &v,
+                &NoMonitor,
+            )
+            .unwrap()
+            .output
+    })
+    .collect()
 }
 
 const INTERESTING: [u32; 8] = [
@@ -657,6 +700,8 @@ fn mutate(r: &mut ChaCha8Rng, seeds: &[Vec<u8>]) -> Vec<u8> {
 fn run(target: &str, input: &[u8]) -> Result<(), String> {
     if target == "document" {
         fuzz_document(input)
+    } else if target == "peaks" {
+        fuzz_peaks(input)
     } else if let Some(format) = target.strip_prefix("encode_") {
         fuzz_encode(format, input)
     } else {

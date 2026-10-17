@@ -198,8 +198,8 @@ pub fn fuzz_limits() -> crate::Limits {
 }
 
 /// ファズの対象（`fuzz/` の cargo-fuzz と `tests/fuzz_smoke.rs` が使う）：`data` を `format` の各デコーダ（旧版を含む）で、
-/// 上限を絞って形と中身を読む。見つけたい不具合（自前のコードの panic・形と中身の食い違い・`Internal`）は `Err`、
-/// 壊れたファイルとしてのエラーと第三者のクレートの panic は `Ok`。
+/// 上限を絞って形と中身を読み、読めた値に受け付けるすべての解析を当てる（`fuzz_analyses`）。見つけたい不具合（自前のコードの
+/// panic・形と中身の食い違い・`Internal`）は `Err`、壊れたファイルとしてのエラーと第三者のクレートの panic は `Ok`。
 pub fn fuzz_decode(format: &str, data: &[u8]) -> Result<(), String> {
     use std::io::Cursor;
     let limits = fuzz_limits();
@@ -218,12 +218,94 @@ pub fn fuzz_decode(format: &str, data: &[u8]) -> Result<(), String> {
                 )));
             }
             v.digest()?;
-            Ok(())
+            fuzz_analyses(&v)
         });
         match r {
             Err(at) => return Err(format!("{}: 自前のコードの panic（{at}）", d.id())),
             Ok(Err(EngineError::Internal(m))) => return Err(format!("{}: {m}", d.id())),
             Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// ファズの対象（`fuzz/` の `decode_peaks` と `tests/fuzz_smoke.rs` の `peaks`）：波形の段のバイナリ（`kura-peaks`。
+/// kura-core がキャッシュから読み直すときのパーサー）を読む。読めたなら正規の形（書き直すと同じバイト列）であること。
+/// 見つけたい不具合（自前のコードの panic・往復しない・`Internal`）は `Err`、壊れたバイト列としてのエラーは `Ok`。
+pub fn fuzz_peaks(data: &[u8]) -> Result<(), String> {
+    use crate::analysis::AnalysisOutput;
+    use crate::analysis::audio::peaks::Peaks;
+    let r = catch_own_panic(|| match Peaks::from_canonical(data) {
+        Ok(p) => {
+            if p.to_canonical()? == data {
+                Ok(())
+            } else {
+                Err(EngineError::Internal(
+                    "kura-peaks: 読めたのに正規の形に戻らない".into(),
+                ))
+            }
+        }
+        Err(e @ EngineError::Internal(_)) => Err(e),
+        Err(_) => Ok(()),
+    });
+    match r {
+        Err(at) => Err(format!("kura-peaks: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(())) => Ok(()),
+    }
+}
+
+/// ファズで、読めた値に解析を当てる手間の上限（`Estimate::cost`。1 回を速くする）。
+const FUZZ_ANALYSIS_COST: u64 = 1 << 24;
+
+/// ファズ：読めた値に、受け付けるすべての解析（今の版・旧版。既定の引数と例の引数）を上限を絞って当てる。
+/// 見つけたいのは自前のコードの panic・`Internal`・見積もりを超える結果・往復しない正規の形（どれも `Internal` にする）。
+/// 上限・中止などのエラーは壊れた入力としてのエラーと同じく通す。
+fn fuzz_analyses(v: &Value) -> Result<(), EngineError> {
+    let engine = Engine::with_limits(fuzz_limits())?;
+    let shape = v.shape();
+    for a in engine.analyses().all() {
+        if !a.accepts().contains(&v.kind()) {
+            continue;
+        }
+        let mut params = std::collections::BTreeSet::new();
+        let mut raws = vec![a.schema().defaults()];
+        raws.extend(a.examples()?.into_iter().map(|e| e.params));
+        for raw in raws {
+            let p = a.check_params(&raw).map_err(|i| {
+                EngineError::Internal(format!("{} の例の引数が読めない: {i}", a.id()))
+            })?;
+            if !params.insert(crate::digest::canonical_json(&p)?) {
+                continue;
+            }
+            let estimate = a.estimate(&p, &shape).map_err(EngineError::Invalid)?;
+            if estimate.cost > FUZZ_ANALYSIS_COST {
+                continue;
+            }
+            let req = crate::analysis::AnalysisRequest {
+                id: a.id().to_string(),
+                v: Some(a.version()),
+                params: p,
+            };
+            let out = match engine.analyze_dyn(&req, v, &NoMonitor) {
+                Ok(out) => out,
+                Err(e @ EngineError::Internal(_)) => return Err(e),
+                Err(_) => continue,
+            };
+            if out.output.len() as u64 > estimate.bytes {
+                return Err(EngineError::Internal(format!(
+                    "{}: 結果 {} バイトが見積もり {} を超えた",
+                    a.id(),
+                    out.output.len(),
+                    estimate.bytes
+                )));
+            }
+            if !a.round_trip(&out.output)? {
+                return Err(EngineError::Internal(format!(
+                    "{}: 正規の形が往復しない",
+                    a.id()
+                )));
+            }
         }
     }
     Ok(())
@@ -727,13 +809,7 @@ fn check_appended(
             Ok(plan) if plan.cost() <= 1 << 22 => {}
             _ => continue,
         }
-        let mut cx = crate::op::ApplyCx {
-            mon: &NoMonitor,
-            limits: &limits,
-            seed: 0,
-            rules: crate::doc::RULES,
-            warnings: Vec::new(),
-        };
+        let mut cx = crate::op::ApplyCx::new(&NoMonitor, &limits, 0, crate::doc::RULES);
         let Ok(prev_out) = op.apply(prev.as_ref(), &[&value], &mut cx) else {
             continue;
         };

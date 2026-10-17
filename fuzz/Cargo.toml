@@ -131,3 +131,10 @@ path = "fuzz_targets/document.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decode_peaks"
+path = "fuzz_targets/decode_peaks.rs"
+test = false
+doc = false
+bench = false

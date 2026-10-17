@@ -58,6 +58,37 @@ pub enum InputGen {
         count: u32,
         seed: u64,
     },
+    /// 元の作り方の画像（フレームの列なら各フレームと位置・キャンバス）を、最近傍で横 `kx`・縦 `ky` 倍にしたもの
+    /// （ドット絵の整数倍の拡大）。倍率は 1 以上（0 は 1 とみなす）。メタデータは持たない。
+    Upscale {
+        base: Box<InputGen>,
+        kx: u32,
+        ky: u32,
+    },
+    /// 元の作り方の画像（1 枚）から矩形 `rect`（画像の中に収まるもの）を切り抜いたもの。メタデータは持たない。
+    Crop { base: Box<InputGen>, rect: IRect },
+    /// 格子に並べたスプライトシート（Rgba8）。大きさは 横 `marginX + cols·cellW + (cols − 1)·gapX + padRight`・
+    /// 縦 `marginY + rows·cellH + (rows − 1)·gapY + padBottom`。地は `background`（null は透明 [0,0,0,0]）。
+    /// セル（行ごとに左から番号を振る。`empty` の番号は描かない）の中身は、`full` ならセルいっぱい、そうでなければ
+    /// セルの縁の 1 画素を空けた矩形（幅 `max(⌊cellW/2⌋, 1)〜cellW − 2`・左端 1〜。セルの番号を流れにした ChaCha8 で
+    /// 決める。3 画素より小さいセルはいっぱい）。中身の色は画素の位置から決め（不透明。地の色と同じなら赤の 2 の位を
+    /// 反転）、`full` でなければ矩形の縁を除く内側の 11 画素に 1 つほどを地のまま残す（穴）。
+    SpriteSheet {
+        cols: u32,
+        rows: u32,
+        cell_w: u32,
+        cell_h: u32,
+        gap_x: u32,
+        gap_y: u32,
+        margin_x: u32,
+        margin_y: u32,
+        pad_right: u32,
+        pad_bottom: u32,
+        background: Option<[u8; 4]>,
+        full: bool,
+        empty: Vec<u32>,
+        seed: u64,
+    },
     /// 正弦波（振幅 0.5）。チャンネルごとに周波数を 1.5 倍ずつ上げる。
     Sine {
         rate: u32,
@@ -102,6 +133,52 @@ pub enum InputGen {
         from_db: i32,
         to_db: i32,
     },
+    /// 色の見本（Rgba8）：画素の番号 i（行の順。i = y·w + x）を `count` で割った余り k の色
+    /// [k の下位 8 ビット, 次の 8 ビット, その次の 8 ビット, a] で塗る。a は k < `clear` なら 0（RGB の違う透明な色）、
+    /// ほかは 255。`count` は 1 以上（0 は 1 とみなす）。`count` ≤ w·h かつ `count` ≤ 2²⁴ なら、違う色がちょうど
+    /// `count` 個（そのうち透明な色が min(`clear`, `count`) 個）。色の数の境（256・257 色）を作る。
+    Swatches {
+        w: u32,
+        h: u32,
+        count: u32,
+        clear: u32,
+    },
+    /// 画素を 1 つずつ書いた小さな画像（Rgba8）：`index`（行の順に w·h 個）は `colors`（ストレートの RGBA8）の番号。
+    /// 数が合わない・番号が範囲の外なら誤り。透明で RGB の違う画素など、ほかの作り方で作れない並びを書く。
+    Pixels {
+        w: u32,
+        h: u32,
+        colors: Vec<[u8; 4]>,
+        index: Vec<u8>,
+    },
+    /// 元の作り方の音声の、指定の位置の標本を NaN・±∞ にしたもの：`at` の（チャンネル, フレーム, 値）ごとに置き換える
+    /// （同じ位置は後のものが勝つ）。範囲の外の位置・音声でない元は誤り。レート・メタデータはそのまま。
+    NonFinite {
+        base: Box<InputGen>,
+        at: Vec<(u16, u64, NonFiniteSample)>,
+    },
+}
+
+/// `InputGen::NonFinite` で置く値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NonFiniteSample {
+    /// NaN（`f32::NAN`）。
+    Nan,
+    /// +∞。
+    Inf,
+    /// −∞。
+    NegInf,
+}
+
+impl NonFiniteSample {
+    fn value(self) -> f32 {
+        match self {
+            Self::Nan => f32::NAN,
+            Self::Inf => f32::INFINITY,
+            Self::NegInf => f32::NEG_INFINITY,
+        }
+    }
 }
 
 /// 付けるメタデータ。
@@ -181,6 +258,131 @@ fn noise_raster(w: u32, h: u32, fmt: PixelFormat, seed: u64) -> Result<Raster, E
             Ok(())
         },
     )
+}
+
+/// 最近傍の整数倍の拡大（出力の (x, y) は入力の (⌊x/kx⌋, ⌊y/ky⌋)）。形式・パレットはそのまま。
+fn upscale(px: &Raster, kx: u32, ky: u32) -> Result<Raster, EngineError> {
+    let too_large = || EngineError::Limit("大きすぎます".into());
+    let (w, h) = (
+        px.width().checked_mul(kx).ok_or_else(too_large)?,
+        px.height().checked_mul(ky).ok_or_else(too_large)?,
+    );
+    let bpp = px.bpp();
+    px.derive(w, h, &crate::monitor::NoMonitor, |t, out| {
+        let (x0, y0) = (t.x as u32, t.y as u32);
+        let (sx0, sy0) = (x0 / kx, y0 / ky);
+        let (sx1, sy1) = ((x0 + t.w - 1) / kx + 1, (y0 + t.h - 1) / ky + 1);
+        let sw = (sx1 - sx0) as usize;
+        let mut src = vec![0u8; sw * (sy1 - sy0) as usize * bpp];
+        px.read_rect(
+            IRect::new(i64::from(sx0), i64::from(sy0), sx1 - sx0, sy1 - sy0),
+            &mut src,
+        )?;
+        for (i, dst) in out.chunks_exact_mut(bpp).enumerate() {
+            let (x, y) = (x0 + i as u32 % t.w, y0 + i as u32 / t.w);
+            let at = (((y / ky - sy0) as usize) * sw + (x / kx - sx0) as usize) * bpp;
+            let s = src
+                .get(at..at + bpp)
+                .ok_or_else(|| EngineError::Internal("拡大の読み元が範囲の外です".into()))?;
+            dst.copy_from_slice(s);
+        }
+        Ok(())
+    })
+}
+
+/// `InputGen::SpriteSheet` を作る（`cells` は (cols, rows, cellW, cellH)、`space` は (gapX, gapY, marginX, marginY,
+/// padRight, padBottom)）。
+fn sprite_sheet(
+    cells: (u32, u32, u32, u32),
+    space: (u32, u32, u32, u32, u32, u32),
+    background: Option<[u8; 4]>,
+    full: bool,
+    empty: &[u32],
+    seed: u64,
+) -> Result<Value, EngineError> {
+    let (cols, rows, cw, ch) = cells;
+    let (gx, gy, mx, my, pr, pb) = space;
+    if cols == 0 || rows == 0 || cw == 0 || ch == 0 {
+        return Err(EngineError::Internal(
+            "スプライトシートのセルの数・大きさは 1 以上".into(),
+        ));
+    }
+    let len = |m: u32, n: u32, c: u32, g: u32, p: u32| {
+        u64::from(m) + u64::from(n) * u64::from(c) + u64::from(n - 1) * u64::from(g) + u64::from(p)
+    };
+    let too_large = |_| EngineError::Limit("大きすぎます".into());
+    let w = u32::try_from(len(mx, cols, cw, gx, pr)).map_err(too_large)?;
+    let h = u32::try_from(len(my, rows, ch, gy, pb)).map_err(too_large)?;
+    let bg = background.unwrap_or([0, 0, 0, 0]);
+    // セルごとの中身の矩形（セルの中の座標）。描かないセルは None
+    let rects: Vec<Option<(u32, u32, u32, u32)>> = (0..u64::from(cols) * u64::from(rows))
+        .map(|n| {
+            if empty.iter().any(|e| u64::from(*e) == n) {
+                return None;
+            }
+            if full {
+                return Some((0, 0, cw, ch));
+            }
+            let mut r = determinism::rng_stream(seed, n);
+            // セルの縁の 1 画素は空けておく（3 画素より小さいセルはいっぱい）
+            let mut pick = |c: u32| {
+                if c < 3 {
+                    return (c, 0);
+                }
+                let lo = (c / 2).max(1);
+                let s = lo + r.next_u32() % (c - 2 - lo + 1);
+                let o = 1 + r.next_u32() % (c - 2 - s + 1);
+                (s, o)
+            };
+            let (sw, ox) = pick(cw);
+            let (sh, oy) = pick(ch);
+            Some((ox, oy, sw, sh))
+        })
+        .collect();
+    let (period_x, period_y) = (u64::from(cw) + u64::from(gx), u64::from(ch) + u64::from(gy));
+    // 軸の位置 v から (セルの番号, セルの中の位置)。セルの外（余白・間隔・余り）は None
+    let cell = |v: u64, m: u32, period: u64, c: u32, n: u32| {
+        let v = v.checked_sub(u64::from(m))?;
+        let (k, at) = (v / period, v % period);
+        (k < u64::from(n) && at < u64::from(c)).then_some((k, at as u32))
+    };
+    let px = Raster::from_tile_fn(
+        w,
+        h,
+        PixelFormat::Rgba8,
+        None,
+        &crate::monitor::NoMonitor,
+        |t, out| {
+            for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
+                let x = t.x as u64 + u64::from(i as u32 % t.w);
+                let y = t.y as u64 + u64::from(i as u32 / t.w);
+                let mut color = bg;
+                if let (Some((ci, lx)), Some((cj, ly))) = (
+                    cell(x, mx, period_x, cw, cols),
+                    cell(y, my, period_y, ch, rows),
+                ) && let Some(Some((ox, oy, sw, sh))) =
+                    rects.get((cj * u64::from(cols) + ci) as usize)
+                    && (*ox..ox + sw).contains(&lx)
+                    && (*oy..oy + sh).contains(&ly)
+                {
+                    let v = determinism::splitmix64(seed ^ (y << 32 | x));
+                    let edge = lx == *ox || ly == *oy || lx + 1 == ox + sw || ly + 1 == oy + sh;
+                    if full || edge || !v.is_multiple_of(11) {
+                        color = [(v >> 8) as u8 | 1, (v >> 16) as u8, (v >> 24) as u8, 255];
+                        if color == bg {
+                            color[0] ^= 2;
+                        }
+                    }
+                }
+                chunk.copy_from_slice(&color);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(Value::Image(Arc::new(Image {
+        px,
+        meta: ImageMeta::default(),
+    })))
 }
 
 impl InputGen {
@@ -368,6 +570,91 @@ impl InputGen {
                     0,
                 )?)))
             }
+            Self::Upscale { ref base, kx, ky } => {
+                let (kx, ky) = (kx.max(1), ky.max(1));
+                match base.generate()? {
+                    Value::Image(img) => Ok(Value::Image(Arc::new(Image {
+                        px: upscale(&img.px, kx, ky)?,
+                        meta: ImageMeta::default(),
+                    }))),
+                    Value::Frames(fr) => {
+                        let frames = fr
+                            .frames()
+                            .iter()
+                            .map(|f| {
+                                Ok(crate::value::Frame {
+                                    px: upscale(&f.px, kx, ky)?,
+                                    offset: IPoint {
+                                        x: f.offset.x.saturating_mul(i64::from(kx)),
+                                        y: f.offset.y.saturating_mul(i64::from(ky)),
+                                    },
+                                    duration_ms: f.duration_ms,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, EngineError>>()?;
+                        let canvas = fr.canvas();
+                        let size = |v: u32, k: u32| {
+                            v.checked_mul(k)
+                                .ok_or_else(|| EngineError::Limit("大きすぎます".into()))
+                        };
+                        Ok(Value::Frames(Arc::new(Frames::new(
+                            frames,
+                            crate::geom::Size {
+                                w: size(canvas.w, kx)?,
+                                h: size(canvas.h, ky)?,
+                            },
+                            ImageMeta::default(),
+                            fr.loop_count,
+                        )?)))
+                    }
+                    Value::Audio(_) => Err(EngineError::Internal("音声は拡大できません".into())),
+                }
+            }
+            Self::Crop { ref base, rect } => {
+                let Value::Image(img) = base.generate()? else {
+                    return Err(EngineError::Internal(
+                        "切り抜けるのは 1 枚の画像だけです".into(),
+                    ));
+                };
+                if !rect.inside(img.px.width(), img.px.height()) {
+                    return Err(EngineError::Internal(format!(
+                        "切り抜く範囲が画像の外です（{rect:?}）"
+                    )));
+                }
+                let px = img
+                    .px
+                    .derive(rect.w, rect.h, &crate::monitor::NoMonitor, |t, out| {
+                        img.px
+                            .read_rect(IRect::new(rect.x + t.x, rect.y + t.y, t.w, t.h), out)
+                    })?;
+                Ok(Value::Image(Arc::new(Image {
+                    px,
+                    meta: ImageMeta::default(),
+                })))
+            }
+            Self::SpriteSheet {
+                cols,
+                rows,
+                cell_w,
+                cell_h,
+                gap_x,
+                gap_y,
+                margin_x,
+                margin_y,
+                pad_right,
+                pad_bottom,
+                background,
+                full,
+                ref empty,
+                seed,
+            } => sprite_sheet(
+                (cols, rows, cell_w, cell_h),
+                (gap_x, gap_y, margin_x, margin_y, pad_right, pad_bottom),
+                background,
+                full,
+                empty,
+                seed,
+            ),
             Self::Sine {
                 rate,
                 channels,
@@ -519,6 +806,80 @@ impl InputGen {
                     AudioMeta::default(),
                 )?)))
             }
+            Self::Swatches { w, h, count, clear } => {
+                let count = u64::from(count.max(1));
+                let px = Raster::from_tile_fn(
+                    w,
+                    h,
+                    PixelFormat::Rgba8,
+                    None,
+                    &crate::monitor::NoMonitor,
+                    |t, out| {
+                        for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
+                            let x = t.x as u64 + u64::from(i as u32 % t.w);
+                            let y = t.y as u64 + u64::from(i as u32 / t.w);
+                            let k = (y * u64::from(w) + x) % count;
+                            let a = if k < u64::from(clear) { 0 } else { 255 };
+                            chunk.copy_from_slice(&[k as u8, (k >> 8) as u8, (k >> 16) as u8, a]);
+                        }
+                        Ok(())
+                    },
+                )?;
+                Ok(Value::Image(Arc::new(Image {
+                    px,
+                    meta: ImageMeta::default(),
+                })))
+            }
+            Self::Pixels {
+                w,
+                h,
+                ref colors,
+                ref index,
+            } => {
+                if u64::from(w) * u64::from(h) != index.len() as u64 {
+                    return Err(EngineError::Internal(
+                        "画素の番号の数が大きさと合いません".into(),
+                    ));
+                }
+                let mut data = Vec::new();
+                data.try_reserve_exact(index.len().saturating_mul(4))
+                    .map_err(|_| EngineError::Limit("大きすぎます".into()))?;
+                for i in index {
+                    let c = colors.get(usize::from(*i)).ok_or_else(|| {
+                        EngineError::Internal(format!("色の番号 {i} が範囲の外です"))
+                    })?;
+                    data.extend_from_slice(c);
+                }
+                Ok(Value::Image(Arc::new(Image {
+                    px: Raster::from_rows(w, h, PixelFormat::Rgba8, None, &data)?,
+                    meta: ImageMeta::default(),
+                })))
+            }
+            Self::NonFinite { ref base, ref at } => {
+                let Value::Audio(a) = base.generate()? else {
+                    return Err(EngineError::Internal(
+                        "NaN・∞ を置けるのは音声だけです".into(),
+                    ));
+                };
+                let mut planes = a.planes().to_vec();
+                for &(ch, frame, v) in at {
+                    let slot = planes
+                        .get_mut(usize::from(ch))
+                        .map(Arc::make_mut)
+                        .and_then(|p| usize::try_from(frame).ok().and_then(|f| p.get_mut(f)))
+                        .ok_or_else(|| {
+                            EngineError::Internal(format!(
+                                "NaN・∞ を置く位置（チャンネル {ch}・フレーム {frame}）が範囲の外です"
+                            ))
+                        })?;
+                    *slot = v.value();
+                }
+                Ok(Value::Audio(Arc::new(Audio::new(
+                    a.rate(),
+                    planes,
+                    a.meta.clone(),
+                )?)))
+            }
             // 上で扱った
             Self::WithMeta { .. } => Err(EngineError::Internal("WithMeta は上で扱う".into())),
         }
@@ -619,6 +980,140 @@ mod tests {
                 "seed": 7
             })
         );
+    }
+
+    /// 色の見本：画素の番号を `count` で割った余りの色。`clear` より小さい番号は透明（RGB は違う）。タイルをまたいでも
+    /// 番号は行の順。JSON の形は `{"type":"swatches",…}`。
+    #[test]
+    fn swatches_number_the_pixels() {
+        let g = InputGen::Swatches {
+            w: 300,
+            h: 2,
+            count: 257,
+            clear: 3,
+        };
+        let Value::Image(img) = g.generate().unwrap() else {
+            panic!("画像ではありません");
+        };
+        let rows = img.px.to_rows().unwrap();
+        let px = |i: usize| <[u8; 4]>::try_from(&rows[i * 4..i * 4 + 4]).unwrap();
+        assert_eq!(px(0), [0, 0, 0, 0]);
+        assert_eq!(px(2), [2, 0, 0, 0]);
+        assert_eq!(px(3), [3, 0, 0, 255]);
+        assert_eq!(px(256), [0, 1, 0, 255]);
+        assert_eq!(px(257), [0, 0, 0, 0]);
+        // 2 行目の左端（タイルの外の列から続く番号）：300 mod 257 = 43
+        assert_eq!(px(300), [43, 0, 0, 255]);
+        let mut all: Vec<[u8; 4]> = (0..600).map(px).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 257);
+        assert_eq!(all.iter().filter(|c| c[3] == 0).count(), 3);
+        assert_eq!(
+            serde_json::to_value(&g).unwrap(),
+            serde_json::json!({"type": "swatches", "w": 300, "h": 2, "count": 257, "clear": 3})
+        );
+    }
+
+    /// 画素を書いた画像：番号の色が行の順に並ぶ。数が合わない・番号が範囲の外は誤り。
+    #[test]
+    fn pixels_are_written_as_given() {
+        let g = InputGen::Pixels {
+            w: 2,
+            h: 2,
+            colors: vec![[1, 2, 3, 0], [9, 9, 9, 255]],
+            index: vec![1, 0, 0, 1],
+        };
+        let Value::Image(img) = g.generate().unwrap() else {
+            panic!("画像ではありません");
+        };
+        assert_eq!(
+            img.px.to_rows().unwrap(),
+            [9, 9, 9, 255, 1, 2, 3, 0, 1, 2, 3, 0, 9, 9, 9, 255]
+        );
+        assert_eq!(
+            serde_json::to_value(&g).unwrap(),
+            serde_json::json!({
+                "type": "pixels",
+                "w": 2,
+                "h": 2,
+                "colors": [[1, 2, 3, 0], [9, 9, 9, 255]],
+                "index": [1, 0, 0, 1]
+            })
+        );
+        for (w, index) in [(3, vec![0, 0, 0, 0]), (2, vec![0, 2, 0, 0])] {
+            let bad = InputGen::Pixels {
+                w,
+                h: 2,
+                colors: vec![[0; 4], [1; 4]],
+                index,
+            };
+            assert!(bad.generate().is_err());
+        }
+    }
+
+    /// NaN・±∞ を置く：指定の位置だけが変わり（後のものが勝つ）、ほかの標本・レート・メタデータは元のまま。同じ記述なら
+    /// 同じ値（NaN は == で比べられないのでダイジェストで）。範囲の外・音声でない元は誤り。
+    #[test]
+    fn non_finite_samples_are_placed() {
+        let base = InputGen::WithMeta {
+            base: Box::new(InputGen::AudioNoise {
+                rate: 8_000,
+                channels: 2,
+                frames: 100,
+                seed: 4,
+            }),
+            meta: MetaGen {
+                loop_range: Some(LoopRange { start: 1, end: 50 }),
+                ..MetaGen::default()
+            },
+        };
+        let g = InputGen::NonFinite {
+            base: Box::new(base.clone()),
+            at: vec![
+                (0, 5, NonFiniteSample::Inf),
+                (1, 99, NonFiniteSample::NegInf),
+                (0, 5, NonFiniteSample::Nan),
+            ],
+        };
+        let (Value::Audio(a), Value::Audio(b)) = (g.generate().unwrap(), base.generate().unwrap())
+        else {
+            panic!("音声ではありません");
+        };
+        assert_eq!(
+            g.generate().unwrap().digest().unwrap(),
+            Value::Audio(a.clone()).digest().unwrap()
+        );
+        assert_eq!((a.rate(), a.meta.clone()), (b.rate(), b.meta.clone()));
+        assert!(a.planes()[0][5].is_nan());
+        assert_eq!(a.planes()[1][99], f32::NEG_INFINITY);
+        for (c, (p, q)) in a.planes().iter().zip(b.planes()).enumerate() {
+            for (i, (x, y)) in p.iter().zip(q.iter()).enumerate() {
+                if (c, i) != (0, 5) && (c, i) != (1, 99) {
+                    assert_eq!(x.to_bits(), y.to_bits(), "{c} {i}");
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&g).unwrap()["at"],
+            serde_json::json!([[0, 5, "inf"], [1, 99, "negInf"], [0, 5, "nan"]])
+        );
+        for at in [(2, 0), (0, 100)] {
+            let bad = InputGen::NonFinite {
+                base: Box::new(base.clone()),
+                at: vec![(at.0, at.1, NonFiniteSample::Nan)],
+            };
+            assert!(bad.generate().is_err());
+        }
+        let image = InputGen::NonFinite {
+            base: Box::new(InputGen::Sheet {
+                cols: 1,
+                rows: 1,
+                cell: 2,
+            }),
+            at: vec![],
+        };
+        assert!(image.generate().is_err());
     }
 
     /// だんだん大きくなる音：振幅は `from_db` から `to_db` まで増え（区間ごとの最大が増える）、最大は `to_db` を超えない。

@@ -113,6 +113,107 @@ fn too_large() -> EngineError {
     EngineError::Limit("画像が大きすぎます".into())
 }
 
+/// 画素を詰めた `src`（`fmt` の画素の並び）の各画素を、`convert_pixel(fmt → Rgba8)` と同じ 8 ビットの色にして、
+/// `quantize::pack` の形（`r<<24 | g<<16 | b<<8 | a`）で順に `f` に渡す（`image.convert` が Indexed8 へ減色するときの色。
+/// 解析 `image.colors` が同じ色で数える。E26）。`f` が false を返したらそこで止める。
+/// グレーは [y, y, y, a]、アルファのない形式のアルファは 255、16 ビットは各チャンネルを四捨五入（`pixels::down16`）、
+/// Indexed8 はパレットの色。画素ごとに `convert_pixel` を呼ぶより速い（形式の分岐を外に出す）。
+pub fn for_each_rgba8_key(
+    fmt: PixelFormat,
+    palette: Option<&[[u8; 4]]>,
+    src: &[u8],
+    mut f: impl FnMut(u32) -> bool,
+) -> Result<(), EngineError> {
+    use crate::imaging::pixels::down16;
+    let bpp = fmt.bytes_per_pixel();
+    if !src.len().is_multiple_of(bpp) {
+        return Err(EngineError::Internal(
+            "画素の並びの大きさが合いません".into(),
+        ));
+    }
+    let key = |r: u8, g: u8, b: u8, a: u8| u32::from_be_bytes([r, g, b, a]);
+    // 16 ビットの値（リトルエンディアン）を 8 ビットに四捨五入（結果は 0〜255）
+    let d = |lo: u8, hi: u8| down16(u32::from(u16::from_le_bytes([lo, hi]))) as u8;
+    match fmt {
+        PixelFormat::Gray8 => {
+            for p in src {
+                if !f(key(*p, *p, *p, 255)) {
+                    break;
+                }
+            }
+        }
+        PixelFormat::GrayA8 => {
+            for p in src.chunks_exact(2) {
+                if !f(key(p[0], p[0], p[0], p[1])) {
+                    break;
+                }
+            }
+        }
+        PixelFormat::Rgb8 => {
+            for p in src.chunks_exact(3) {
+                if !f(key(p[0], p[1], p[2], 255)) {
+                    break;
+                }
+            }
+        }
+        PixelFormat::Rgba8 => {
+            for p in src.chunks_exact(4) {
+                if !f(key(p[0], p[1], p[2], p[3])) {
+                    break;
+                }
+            }
+        }
+        PixelFormat::Gray16 => {
+            for p in src.chunks_exact(2) {
+                let y = d(p[0], p[1]);
+                if !f(key(y, y, y, 255)) {
+                    break;
+                }
+            }
+        }
+        PixelFormat::GrayA16 => {
+            for p in src.chunks_exact(4) {
+                let y = d(p[0], p[1]);
+                if !f(key(y, y, y, d(p[2], p[3]))) {
+                    break;
+                }
+            }
+        }
+        PixelFormat::Rgb16 => {
+            for p in src.chunks_exact(6) {
+                if !f(key(d(p[0], p[1]), d(p[2], p[3]), d(p[4], p[5]), 255)) {
+                    break;
+                }
+            }
+        }
+        PixelFormat::Rgba16 => {
+            for p in src.chunks_exact(8) {
+                if !f(key(
+                    d(p[0], p[1]),
+                    d(p[2], p[3]),
+                    d(p[4], p[5]),
+                    d(p[6], p[7]),
+                )) {
+                    break;
+                }
+            }
+        }
+        PixelFormat::Indexed8 => {
+            let palette = palette
+                .ok_or_else(|| EngineError::Internal("Indexed8 にパレットがありません".into()))?;
+            for p in src {
+                let c = palette.get(usize::from(*p)).ok_or_else(|| {
+                    EngineError::Internal("パレットにない番号の画素があります".into())
+                })?;
+                if !f(u32::from_be_bytes(*c)) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +321,74 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// 速い読み手（`for_each_rgba8_key`）が、すべての形式で `convert_pixel(→ Rgba8)` を pack したものと同じ。
+    /// 1・2 バイトの形式は全数、ほかは ChaCha8 の標本（16 ビットの丸めの境目 128・129 の倍数の近くを含む）。
+    #[test]
+    fn rgba8_keys_match_convert_pixel() {
+        use crate::imaging::quantize::pack;
+        use rand_chacha::rand_core::Rng;
+        let palette: Vec<[u8; 4]> = (0..=255u8)
+            .map(|i| [i, i.wrapping_mul(7), 255 - i, i.wrapping_mul(13)])
+            .collect();
+        let mut r = crate::determinism::rng(8);
+        for fmt in PixelFormat::ALL {
+            let bpp = fmt.bytes_per_pixel();
+            let samples: Vec<Vec<u8>> = if bpp <= 2 {
+                (0..1usize << (8 * bpp))
+                    .map(|v| v.to_le_bytes()[..bpp].to_vec())
+                    .collect()
+            } else {
+                (0..20_000)
+                    .map(|i| {
+                        (0..bpp)
+                            .map(|b| {
+                                let v = r.next_u32();
+                                // 16 ビットの丸めの境目の近く（257 の倍数 ± 128）を多めに
+                                if i % 3 == 0 && b % 2 == 0 {
+                                    ((v % 256) * 257 + 128) as u8
+                                } else {
+                                    v as u8
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let src: Vec<u8> = samples.concat();
+            let mut keys = Vec::new();
+            for_each_rgba8_key(fmt, Some(&palette), &src, |k| {
+                keys.push(k);
+                true
+            })
+            .unwrap();
+            assert_eq!(keys.len(), samples.len(), "{fmt:?}");
+            for (s, k) in samples.iter().zip(&keys) {
+                let mut out = [0u8; 4];
+                convert_pixel(
+                    fmt,
+                    Some(&palette),
+                    s,
+                    PixelFormat::Rgba8,
+                    [9, 9, 9],
+                    &mut out,
+                )
+                .unwrap();
+                assert_eq!(*k, pack(out), "{fmt:?} {s:?}");
+            }
+        }
+        // 止める・パレットにない番号
+        let mut n = 0;
+        for_each_rgba8_key(PixelFormat::Gray8, None, &[1, 2, 3], |_| {
+            n += 1;
+            n < 2
+        })
+        .unwrap();
+        assert_eq!(n, 2);
+        assert!(
+            for_each_rgba8_key(PixelFormat::Indexed8, Some(&palette[..2]), &[2], |_| true).is_err()
+        );
+        assert!(for_each_rgba8_key(PixelFormat::Rgb8, None, &[1, 2], |_| true).is_err());
     }
 }

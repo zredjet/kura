@@ -565,13 +565,8 @@ mod tests {
                 let prev = PaintParams {
                     actions: all[..k].to_vec(),
                 };
-                let mut cx = ApplyCx {
-                    mon: &NoMonitor,
-                    limits: &crate::Limits::default(),
-                    seed: 0,
-                    rules: crate::doc::RULES,
-                    warnings: Vec::new(),
-                };
+                let limits = crate::Limits::default();
+                let mut cx = ApplyCx::new(&NoMonitor, &limits, 0, crate::doc::RULES);
                 let prev_out = Actions::apply(&prev, &[&input], &mut cx).unwrap().value;
                 let inc = Actions::apply_appended(&prev, &prev_out, &ex.params, &mut cx)
                     .unwrap()
@@ -586,13 +581,8 @@ mod tests {
                 let other = PaintParams {
                     actions: vec![all[1].clone()],
                 };
-                let mut cx = ApplyCx {
-                    mon: &NoMonitor,
-                    limits: &crate::Limits::default(),
-                    seed: 0,
-                    rules: crate::doc::RULES,
-                    warnings: Vec::new(),
-                };
+                let limits = crate::Limits::default();
+                let mut cx = ApplyCx::new(&NoMonitor, &limits, 0, crate::doc::RULES);
                 assert!(Actions::apply_appended(&other, &input, &ex.params, &mut cx).is_none());
             }
         }

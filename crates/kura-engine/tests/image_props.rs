@@ -880,13 +880,7 @@ fn appended_paint_through_the_registry() {
         let all = ex.params["actions"].as_array().unwrap().clone();
         let input = ex.inputs[0].generate().unwrap();
         let limits = kura_engine::Limits::default();
-        let mut cx = kura_engine::op::ApplyCx {
-            mon: &NoMonitor,
-            limits: &limits,
-            seed: 0,
-            rules: kura_engine::doc::RULES,
-            warnings: Vec::new(),
-        };
+        let mut cx = kura_engine::op::ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
         let prev_raw = json!({ "actions": all[..all.len() / 2].to_vec() });
         let prev = op.parse(&prev_raw).unwrap();
         let full = op.parse(&ex.params).unwrap();

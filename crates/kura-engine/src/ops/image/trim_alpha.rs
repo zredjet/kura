@@ -1,7 +1,8 @@
 //! `image.trim_alpha` v1：透明な余白を切り落とす（画素は動かすだけなので、ビット単位で正確）。
 //!
-//! - アルファが `threshold` 以下の画素を透明とみなし、残りを囲む最小の矩形で切る（`imaging::bounds::opaque_bounds`。
-//!   段 8 の解析 `image.opaque_bounds` も同じ関数を使う。E26）。
+//! - アルファが `threshold` 以下の画素を透明とみなし、残りを囲む最小の矩形で切る。矩形は解析 `image.opaque_bounds` v1
+//!   （同じしきい値）を `NEEDS`・`needs` で申告し、実行器が描く前に解いたものを `ApplyCx::analysis` で受け取る（§11.2。
+//!   E26）。解析の中身は段 5 と同じ関数（`imaging::bounds`）なので、結果は変わらない（版は 1 のまま）。
 //! - 全部が透明なら、左上の 1×1 にする（ADR-147）。`union` で合併と重ならないフレーム（全部が透明とみなす画素）も、
 //!   そのフレームの左上の 1 画素を新しいキャンバスの左上に置く（パレットに透明な色がなくても、パレットを変えずに済む）。
 //! - 透明を表せない形式（アルファのない形式）は何もしない。
@@ -14,9 +15,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::analysis::Need;
+use crate::analysis::image::opaque_bounds::{OpaqueBounds, OpaqueBoundsParams};
 use crate::error::{EngineError, Issues};
 use crate::geom::{IPoint, IRect, Size};
-use crate::imaging::bounds::opaque_bounds;
 use crate::imaging::pixels::can_be_transparent;
 use crate::mapping::{IntAffine, SpaceMap, TimeMap};
 use crate::monitor::Monitor;
@@ -77,11 +79,6 @@ impl OpParams for TrimParams {
 /// 透明な余白のトリム。
 pub struct TrimAlpha;
 
-/// 切る矩形（全部が透明なら左上の 1×1）。
-pub fn trim_rect(px: &Raster, threshold: u8, mon: &dyn Monitor) -> Result<IRect, EngineError> {
-    Ok(opaque_bounds(px, threshold, mon)?.unwrap_or(IRect::new(0, 0, 1, 1)))
-}
-
 fn crop(px: &Raster, r: IRect, mon: &dyn Monitor) -> Result<Raster, EngineError> {
     if r == IRect::new(0, 0, px.width(), px.height()) {
         return Ok(px.clone());
@@ -89,17 +86,6 @@ fn crop(px: &Raster, r: IRect, mon: &dyn Monitor) -> Result<Raster, EngineError>
     px.derive(r.w, r.h, mon, |t, out| {
         px.read_rect(IRect::new(r.x + t.x, r.y + t.y, t.w, t.h), out)
     })
-}
-
-fn union(a: Option<IRect>, b: IRect) -> IRect {
-    match a {
-        None => b,
-        Some(a) => {
-            let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
-            let (x1, y1) = (a.right().max(b.right()), a.bottom().max(b.bottom()));
-            IRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32)
-        }
-    }
 }
 
 fn intersect(a: IRect, b: IRect) -> Option<IRect> {
@@ -112,6 +98,24 @@ impl Op for TrimAlpha {
     const ID: &'static str = "image.trim_alpha";
     const VERSION: u16 = 1;
     type Params = TrimParams;
+    const NEEDS: &'static [(&'static str, u16)] = &[("image.opaque_bounds", 1)];
+
+    /// 透明を表せる形式のときだけ、同じしきい値の `image.opaque_bounds` を申告する（ほかは何もしないので解かない）。
+    fn needs(p: &TrimParams, inputs: &[Shape]) -> Result<Vec<Need>, Issues> {
+        let fmt = match inputs.first() {
+            Some(Shape::Image { fmt, .. } | Shape::Frames { fmt, .. }) => *fmt,
+            _ => return Ok(Vec::new()),
+        };
+        if !can_be_transparent(fmt) {
+            return Ok(Vec::new());
+        }
+        Ok(vec![Need::of::<OpaqueBounds>(
+            0,
+            &OpaqueBoundsParams {
+                threshold: p.threshold,
+            },
+        )?])
+    }
 
     fn signature() -> Signature {
         Signature {
@@ -224,9 +228,18 @@ impl Op for TrimAlpha {
         if !can_be_transparent(fmt) {
             return Ok(Applied::value(input.clone()));
         }
+        // 不透明な範囲（キャンバスの座標）。全部が透明なら左上の 1×1
+        let bounds = cx.analysis::<OpaqueBounds>(
+            0,
+            input,
+            &OpaqueBoundsParams {
+                threshold: p.threshold,
+            },
+        )?;
+        let clear = IRect::new(0, 0, 1, 1);
         match input {
             Value::Image(img) => {
-                let r = trim_rect(&img.px, p.threshold, cx.mon)?;
+                let r = bounds.union.unwrap_or(clear);
                 let px = crop(&img.px, r, cx.mon)?;
                 Ok(Applied {
                     value: Value::Image(Arc::new(Image {
@@ -243,17 +256,7 @@ impl Op for TrimAlpha {
             Value::Frames(fr) => match p.mode {
                 TrimMode::Union => {
                     // キャンバスの座標で、各フレームの不透明な範囲の合併
-                    let mut all: Option<IRect> = None;
-                    for f in fr.frames() {
-                        cx.check()?;
-                        if let Some(b) = opaque_bounds(&f.px, p.threshold, cx.mon)? {
-                            all = Some(union(
-                                all,
-                                IRect::new(f.offset.x + b.x, f.offset.y + b.y, b.w, b.h),
-                            ));
-                        }
-                    }
-                    let r = all.unwrap_or(IRect::new(0, 0, 1, 1));
+                    let r = bounds.union.unwrap_or(clear);
                     let mut frames = Vec::with_capacity(fr.frames().len());
                     for f in fr.frames() {
                         cx.check()?;
@@ -300,9 +303,17 @@ impl Op for TrimAlpha {
                 }
                 TrimMode::PerFrame => {
                     let mut frames = Vec::with_capacity(fr.frames().len());
-                    for f in fr.frames() {
+                    for (i, f) in fr.frames().iter().enumerate() {
                         cx.check()?;
-                        let b = trim_rect(&f.px, p.threshold, cx.mon)?;
+                        // 解析はキャンバスの座標。フレームの中の座標に戻す（全部が透明なら左上の 1×1）
+                        let b = bounds.frames.get(i).copied().flatten().map_or(clear, |b| {
+                            IRect::new(
+                                b.x.saturating_sub(f.offset.x),
+                                b.y.saturating_sub(f.offset.y),
+                                b.w,
+                                b.h,
+                            )
+                        });
                         frames.push(Frame {
                             px: crop(&f.px, b, cx.mon)?,
                             offset: IPoint {

@@ -1,4 +1,5 @@
-//! `audio.normalize` v1：積分ラウドネス（BS.1770。`analysis::loudness::measure`）を目標に合わせる。
+//! `audio.normalize` v1：積分ラウドネス（BS.1770）を目標に合わせる。計測は解析 `audio.loudness_gating` を申告して
+//! 受け取る（下記。計測の関数を直接呼ばない）。
 //!
 //! 利得（dB）は、利得をかけたあとの積分ラウドネスがちょうど目標になる値（`Measured::gain_to`）。利得をかけると
 //! 絶対ゲート（−70 LKFS）をまたぐブロックが入れ替わるので、1 回の計測の差（目標 − 積分ラウドネス）では届かないことが
@@ -9,13 +10,15 @@
 //! `GainLimited` の警告を出す（目標より小さく仕上がる）。計れない（ブロックのパワーがすべて 0（無音）・4 区間
 //! （⌊(fs + 5)/10⌋ 標本の 4 倍。約 400 ms）に満たない・3,363 Hz 以下・NaN や ∞ の標本）ときは何も変えずに
 //! `LoudnessUnmeasurable` の警告を出す。目標は −69〜0 LUFS（ゲートは厳密な「>」なので −70 ちょうどには届かない）。
-//! 計測は、段 8 の解析（`audio.loudness`）と同じ関数なので、表示するラウドネスと正規化で使う値が一致する（E26）。
-//! 2 パスの計測は、段 6 では apply の中で行う（申告の口は段 8）。
+//! 計測は内部用の解析 `audio.loudness_gating` v1（`analysis::loudness::analyze`。表示のラウドネスと同じ関数）を
+//! `NEEDS`・`needs` で申告し、実行器が描く前に解いたものを `ApplyCx::analysis` で受け取る（§11.2。E26）。
+//! 申告の口に移しても計測の関数と引数は同じなので、結果は段 6 と変わらない（版は 1 のまま。ゴールデンが見張る）。
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::analysis::loudness;
+use crate::analysis::audio::loudness_gating::LoudnessGating;
+use crate::analysis::{Need, NoParams};
 use crate::audio::{AudioKernel, Identity, render_all};
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
@@ -71,13 +74,13 @@ impl OpParams for NormalizeParams {
 /// 正規化。
 pub struct Normalize;
 
-/// 計測して利得（dB）を決める。計れなければ None（警告を足す）。
+/// 計測（申告した `audio.loudness_gating`）から利得（dB）を決める。計れなければ None（警告を足す）。
 fn gain_db(
     p: &NormalizeParams,
-    a: &crate::value::Audio,
+    input: &Value,
     cx: &mut ApplyCx<'_>,
 ) -> Result<Option<f64>, EngineError> {
-    let m = loudness::analyze(a, cx.mon)?;
+    let m = cx.analysis::<LoudnessGating>(0, input, &NoParams {})?;
     let Some(mut db) = m.gain_to(p.target) else {
         cx.warn(Issue::warning(
             IssueCode::LoudnessUnmeasurable,
@@ -104,6 +107,11 @@ impl Op for Normalize {
     const ID: &'static str = "audio.normalize";
     const VERSION: u16 = 1;
     type Params = NormalizeParams;
+    const NEEDS: &'static [(&'static str, u16)] = &[("audio.loudness_gating", 1)];
+
+    fn needs(_p: &NormalizeParams, _inputs: &[Shape]) -> Result<Vec<Need>, Issues> {
+        Ok(vec![Need::of::<LoudnessGating>(0, &NoParams {})?])
+    }
 
     fn signature() -> Signature {
         Signature {
@@ -145,7 +153,7 @@ impl Op for Normalize {
     ) -> Result<Applied, EngineError> {
         cx.check()?;
         let audio = audio_of(inputs[0], Self::ID)?;
-        let Some(db) = gain_db(p, audio, cx)? else {
+        let Some(db) = gain_db(p, inputs[0], cx)? else {
             return Ok(Applied::value(Value::Audio(audio.clone())));
         };
         let k = GainKernel::new(audio.clone(), db);
@@ -160,7 +168,7 @@ impl Op for Normalize {
         let run = |cx: &mut ApplyCx<'_>| -> Result<Box<dyn AudioKernel>, EngineError> {
             let audio = audio_of(inputs[0], Self::ID)?;
             // 計れなければ apply と同じく入力のまま
-            Ok(match gain_db(p, audio, cx)? {
+            Ok(match gain_db(p, inputs[0], cx)? {
                 Some(db) => Box::new(GainKernel::new(audio.clone(), db)),
                 None => Box::new(Identity(audio.clone())),
             })
@@ -230,6 +238,7 @@ impl Op for Normalize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::loudness;
     use crate::monitor::NoMonitor;
     use crate::testing::render_value;
 

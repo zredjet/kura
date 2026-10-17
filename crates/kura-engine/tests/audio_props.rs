@@ -195,13 +195,8 @@ fn e18_chunked_rendering_matches() {
             let refs: Vec<&Value> = inputs.iter().collect();
             let params = op.parse(&ex.params).unwrap();
             let limits = Limits::default();
-            let mut cx = kura_engine::op::ApplyCx {
-                mon: &NoMonitor,
-                limits: &limits,
-                seed: 0,
-                rules: kura_engine::doc::RULES,
-                warnings: Vec::new(),
-            };
+            let mut cx =
+                kura_engine::op::ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
             let whole = op.apply(params.as_ref(), &refs, &mut cx).unwrap().value;
             let Value::Audio(whole) = &whole else {
                 continue;
