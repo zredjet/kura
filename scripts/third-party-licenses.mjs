@@ -8,7 +8,12 @@
 // crates.io の同じ版と見分けられるよう、名前に改変したことと改変後のソースの在り処（リポジトリの URL と場所）を添える
 // （`crateLabel`）。kura の自前のクレート（kura- で始まるもの）は、kura 自身のライセンスの表示は載せず、第三者のコードを
 // 移した部分の表示だけを、どの部分かの説明を付けて載せる（`rustGroups`・`KURA_PORTED`）。
+//
+// 著作権者の欄が空の SPDX の雛形は載せない。cargo-about は、クレートの LICENSE を見つけられない・判定できないと雛形を
+// 出すので、パッケージに本文があれば about.toml の clarify で指し、なければ上流のリポジトリの本文の写し
+// （licenses/upstream/、`UPSTREAM_TEXTS`）を使う。どちらもなく雛形が残ったら生成を止める（ADR-151）。
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -111,6 +116,132 @@ export const KURA_PORTED = {
   },
 };
 
+/**
+ * crates.io のパッケージにライセンスの本文がなく、about.toml の clarify で指せないクレートに載せる、上流のリポジトリの
+ * ファイルの写し（ADR-151）。`licenses/upstream/` からの場所 → 出どころ（リポジトリとコミット）と SHA-256。
+ * cargo-about の clarify の git（上流から取ってくる）はネットが要り、オフラインで回す `licenses:check` に使えないので、
+ * 写しをリポジトリに置く。写しは上流のファイルのバイト列そのまま（手で書き換えない）。
+ */
+export const UPSTREAM_FILES = {
+  // objc2 の一族：公開したコミットの LICENSE.md はライセンスの説明だけで、本文も著作権表示もない（2025-01 から）。
+  // 作者が 2026-03 にリポジトリの根に足した MIT の本文（madsmtm/objc2#826。古い版も license の欄のとおりと作者が答えた）
+  'objc2-ee9a7ada/LICENSE-MIT.txt': {
+    repo: 'https://github.com/madsmtm/objc2',
+    commit: 'ee9a7ada2131f5944b8750428e265c15632f2a19',
+    sha256: 'f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070',
+  },
+  // LICENSE.md に置き換える前のリポジトリの LICENSE.txt（Steven Sheldon の objc・block・objc-encode・objc-foundation の
+  // 表示）。MIT だけのクレートは、それらから来た部分の貢献者の許しがなく三択に変えられていない（madsmtm/objc2#23）
+  'objc2-757cd841/LICENSE.txt': {
+    repo: 'https://github.com/madsmtm/objc2',
+    commit: '757cd841d0293341dbefd9b99d7548dec244ffde',
+    sha256: 'e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5',
+  },
+  // 以下は、各クレートを公開したコミット（パッケージの .cargo_vcs_info.json）のリポジトリの根の本文
+  'specta-e7fd23f5/LICENSE': {
+    repo: 'https://github.com/specta-rs/specta',
+    commit: 'e7fd23f586b9bd58de39002dabe49b1f978bf971',
+    sha256: '9ec86f39e235fcd35e6d91ef3fd4d6b88e5763f3ce1e296c222969986b6f6475',
+  },
+  'tauri-specta-e5e578fb/LICENSE': {
+    repo: 'https://github.com/specta-rs/tauri-specta',
+    commit: 'e5e578fb339fc2b0d6c676b3031c3dafcec88083',
+    sha256: '79b0c7d284efc4c2dc8da73c01a6d10c19caf61e70fca813e642dc010049eee7',
+  },
+  'inflector-a4a95eac/LICENSE.md': {
+    repo: 'https://github.com/whatisinternet/inflector',
+    commit: 'a4a95eac75043f4bffb127c7c8ec886b5b106053',
+    sha256: '03d1bd5bfbee8d44651e7f57faf9e5b4eda4233f0d4eda36a716f2f0533d230b',
+  },
+  'rust-alloc-no-stdlib-0a81fd69/LICENSE': {
+    repo: 'https://github.com/dropbox/rust-alloc-no-stdlib',
+    commit: '0a81fd6928ea3b33c8cd484aa4575d50ffb98012',
+    sha256: 'c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae',
+  },
+};
+
+const OBJC2 = ['objc2-ee9a7ada/LICENSE-MIT.txt'];
+const OBJC2_MIT_ONLY = ['objc2-757cd841/LICENSE.txt', ...OBJC2];
+const SPECTA = ['specta-e7fd23f5/LICENSE'];
+const TAURI_SPECTA = ['tauri-specta-e5e578fb/LICENSE'];
+
+/**
+ * `名前 版` → { ライセンス: [`UPSTREAM_FILES` の場所, …] }。cargo-about がそのライセンスを雛形で出したクレートだけを、
+ * ここのファイルの本文の節に移す（`rustGroups`）。版で指すので、依存の版を上げたら、その版を公開したコミットの上流の
+ * ファイルを確かめ直して書き換える（ない版は雛形のまま残って生成が止まり、使われなくなった行も止まる）。
+ */
+export const UPSTREAM_TEXTS = {
+  'Inflector 0.11.4': { 'BSD-2-Clause': ['inflector-a4a95eac/LICENSE.md'] },
+  'alloc-stdlib 0.3.0': { 'BSD-3-Clause': ['rust-alloc-no-stdlib-0a81fd69/LICENSE'] },
+  'block2 0.6.2': { MIT: OBJC2_MIT_ONLY },
+  'objc2 0.6.5': { MIT: OBJC2_MIT_ONLY },
+  'objc2-encode 4.1.0': { MIT: OBJC2_MIT_ONLY },
+  'objc2-foundation 0.3.2': { MIT: OBJC2_MIT_ONLY },
+  'dispatch2 0.3.1': { MIT: OBJC2 },
+  'objc2-app-kit 0.3.2': { MIT: OBJC2 },
+  'objc2-core-foundation 0.3.2': { MIT: OBJC2 },
+  'objc2-exception-helper 0.1.1': { MIT: OBJC2 },
+  'objc2-quartz-core 0.3.2': { MIT: OBJC2 },
+  'objc2-web-kit 0.3.2': { MIT: OBJC2 },
+  'specta 2.0.0-rc.25': { MIT: SPECTA },
+  'specta-macros 2.0.0-rc.25': { MIT: SPECTA },
+  'specta-serde 0.0.12': { MIT: SPECTA },
+  'specta-typescript 0.0.12': { MIT: SPECTA },
+  'specta-util 0.0.12': { MIT: SPECTA },
+  'tauri-specta 2.0.0-rc.25': { MIT: TAURI_SPECTA },
+  'tauri-specta-macros 2.0.0-rc.25': { MIT: TAURI_SPECTA },
+};
+
+/**
+ * `UPSTREAM_TEXTS` の場所をファイルの本文に置き換えた、`rustGroups` の `upstream`。ファイルがない・SHA-256 が合わない・
+ * `UPSTREAM_FILES` にない場所を指していたら止める（写しを書き換えた、指す先を誤った、など）。
+ */
+export function upstreamTexts(repoRoot, files = UPSTREAM_FILES, texts = UPSTREAM_TEXTS) {
+  const read = new Map();
+  const text = (path) => {
+    if (!read.has(path)) {
+      if (!Object.hasOwn(files, path)) {
+        throw new Error(`UPSTREAM_TEXTS が UPSTREAM_FILES にない ${path} を指しています`);
+      }
+      const file = join(repoRoot, 'licenses', 'upstream', path);
+      if (!existsSync(file)) throw new Error(`licenses/upstream/${path} がありません`);
+      const body = readFileSync(file);
+      const sha256 = createHash('sha256').update(body).digest('hex');
+      if (sha256 !== files[path].sha256) {
+        throw new Error(
+          `licenses/upstream/${path} の SHA-256（${sha256}）が UPSTREAM_FILES と合いません。` +
+            `写しは ${files[path].repo} の ${files[path].commit} のファイルのまま置いてください`,
+        );
+      }
+      read.set(path, body.toString('utf8'));
+    }
+    return read.get(path);
+  };
+  return Object.fromEntries(
+    Object.entries(texts).map(([crate, byId]) => [
+      crate,
+      Object.fromEntries(Object.entries(byId).map(([id, paths]) => [id, paths.map(text)])),
+    ]),
+  );
+}
+
+/** SPDX の雛形のまま残った著作権者の欄（MIT の `<year> <copyright holders>`、BSD の `<year> <owner>` など）。 */
+const PLACEHOLDER = /<(?:year|copyright holders?|owner)>/i;
+
+/**
+ * 載せる本文に雛形の欄が残っていたら止める。cargo-about の雛形は `rustGroups` が先に止めるので、これは本文のファイル
+ * そのものが欄を埋めていない（Rust でも JavaScript でも）ときの備え。
+ */
+export function assertFilledIn(groups) {
+  const left = groups.filter((g) => PLACEHOLDER.test(g.text));
+  if (left.length > 0) {
+    throw new Error(
+      `${left.map((g) => `${g.id}（${g.usedBy.join('・')}）`).join('、')} の本文に、雛形の著作権者の欄` +
+        '（`<year>`・`<copyright holders>`・`<owner>`）が残っています。著作権表示のある本文を載せてください',
+    );
+  }
+}
+
 /** 1 つのライセンスの節に、`crate` を何という名前で載せるか（載せないなら空）。 */
 function rustUser(id, crate, repoRoot, workspace) {
   if (!crate.name.startsWith('kura-')) return [crateLabel(crate, repoRoot, workspace.repository)];
@@ -130,29 +261,86 @@ function rustUser(id, crate, repoRoot, workspace) {
  * cargo-about の JSON（`licenses`）を { ライセンス, 本文, 使っているもの } の並びにする。
  *
  * - 使っているものの名前は `crateLabel`。kura- のクレートは `rustUser` の規則で載せる・載せないを決める。
- * - about.toml で本文を指定した（clarify した）クレートが、指定した本文でなく SPDX の雛形（`source_path` がない。
- *   著作権者の欄が `<year> <copyright holders>` のまま）で出てきたら止める。cargo-about は、clarify の checksum が
- *   合わない（依存の版を上げて LICENSE が変わった、など）と警告を出すだけで雛形に戻すため。
+ * - cargo-about が本文を見つけられず SPDX の雛形（`source_path` がない。著作権者の欄が `<year> <copyright holders>` の
+ *   まま）を出した節は、載せるクレートを `upstream`（`upstreamTexts`。上流の本文の写し）の節に移す。写しのない
+ *   クレートが残ったら止める。about.toml で本文を指定した（clarify した）クレートでも起きる：cargo-about は、clarify の
+ *   checksum が合わない（依存の版を上げて LICENSE が変わった、など）と警告を出すだけで雛形に戻すため。
+ * - `upstream` のうち使われなかったものがあっても止める（依存の版が変わった、cargo-about が本文を見つけるように
+ *   なった、など）。
+ * - ライセンスと書き出す本文（`printed`）が同じ節は 1 つにまとめる（写しの節も。cargo-about は末尾の改行だけが違う
+ *   本文を別の節にする）。
  *
- * `options`：`repoRoot`（リポジトリの根）、`workspace`（`workspacePackage` の結果）、`clarified`（`clarifiedCrates`）。
+ * `options`：`repoRoot`（リポジトリの根）、`workspace`（`workspacePackage` の結果）、`clarified`（`clarifiedCrates`）、
+ * `upstream`（`upstreamTexts`。省くと写しを使わない）。
  */
-export function rustGroups(about, { repoRoot, workspace, clarified }) {
-  return about.licenses.map((l) => {
-    if (l.source_path == null) {
-      const lost = l.used_by.map((u) => u.crate.name).filter((name) => clarified.has(name));
-      if (lost.length > 0) {
-        throw new Error(
-          `${lost.join('・')} の ${l.id} が、about.toml で指定した本文でなく雛形で出ました。` +
-            'clarify の checksum が LICENSE と合っているか確かめてください（cargo-about の警告を見る）',
-        );
+export function rustGroups(about, { repoRoot, workspace, clarified, upstream = {} }) {
+  const groups = [];
+  const add = (id, text, usedBy) => {
+    const shown = printed(text);
+    const group = groups.find((g) => g.id === id && printed(g.text) === shown);
+    if (group) group.usedBy.push(...usedBy);
+    else groups.push({ id, text, usedBy: [...usedBy] });
+  };
+  const copies = [];
+  const templated = [];
+  const used = new Set();
+  for (const l of about.licenses) {
+    const usedBy = [];
+    for (const u of l.used_by) {
+      const names = rustUser(l.id, u.crate, repoRoot, workspace);
+      if (l.source_path != null || names.length === 0) {
+        usedBy.push(...names);
+        continue;
       }
+      const key = `${u.crate.name} ${u.crate.version}`;
+      const texts =
+        Object.hasOwn(upstream, key) && Object.hasOwn(upstream[key], l.id)
+          ? upstream[key][l.id]
+          : undefined;
+      if (texts === undefined) {
+        templated.push({ name: u.crate.name, label: `${key} の ${l.id}` });
+        continue;
+      }
+      used.add(`${key}\n${l.id}`);
+      for (const text of texts) copies.push({ id: l.id, text, usedBy: names });
     }
-    return {
-      id: l.id,
-      text: l.text,
-      usedBy: l.used_by.flatMap((u) => rustUser(l.id, u.crate, repoRoot, workspace)),
-    };
-  });
+    add(l.id, l.text, usedBy);
+  }
+
+  if (templated.length > 0) {
+    const lost = templated.filter((t) => clarified.has(t.name)).map((t) => t.label);
+    const other = templated.filter((t) => !clarified.has(t.name)).map((t) => t.label);
+    throw new Error(
+      [
+        '著作権者の欄が空の SPDX の雛形で出たライセンスがあります（cargo-about が本文を見つけられなかった）。',
+        lost.length > 0 &&
+          `${lost.join('・')}：about.toml で本文を指定したのに雛形に戻りました。clarify の checksum が LICENSE と合っているか確かめてください（cargo-about の警告を見る）。`,
+        other.length > 0 &&
+          `${other.join('・')}：パッケージに本文があれば about.toml の clarify で指し、なければ上流のリポジトリの本文を licenses/upstream/ に写して UPSTREAM_TEXTS に足してください（ADR-151）。`,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+  }
+  const unused = Object.entries(upstream).flatMap(([key, byId]) =>
+    Object.keys(byId)
+      .filter((id) => !used.has(`${key}\n${id}`))
+      .map((id) => `${key} の ${id}`),
+  );
+  if (unused.length > 0) {
+    throw new Error(
+      `UPSTREAM_TEXTS の ${unused.join('・')} が使われませんでした（依存の版が変わったか、cargo-about が本文を` +
+        '見つけるようになった）。上流を確かめ直して書き換えてください',
+    );
+  }
+
+  for (const copy of copies) add(copy.id, copy.text, copy.usedBy);
+  return groups;
+}
+
+/** 一覧に書き出すときの本文（`section`）。これが同じ節は 1 つにまとめる。 */
+function printed(text) {
+  return text.replace(/\r\n/g, '\n').trimEnd();
 }
 
 /** cargo-about を src-tauri（配布する .app）について回し、`rustGroups` の並びにする。 */
@@ -180,6 +368,7 @@ function rustLicenses() {
     repoRoot: root,
     workspace: workspacePackage(readFileSync(join(root, 'Cargo.toml'), 'utf8')),
     clarified: clarifiedCrates(readFileSync(join(root, 'about.toml'), 'utf8')),
+    upstream: upstreamTexts(root),
   });
 }
 
@@ -262,7 +451,7 @@ function section(title, groups) {
   const lines = [`## ${title}`, ''];
   for (const g of groups) {
     lines.push(`### ${g.id}`, '', `対象：${g.usedBy.join('、')}`, '', '````text');
-    lines.push(g.text.replace(/\r\n/g, '\n').trimEnd(), '````', '');
+    lines.push(printed(g.text), '````', '');
   }
   return lines;
 }
@@ -278,6 +467,7 @@ function main() {
   const check = process.argv.includes('--check');
   const rust = sortGroups(rustLicenses());
   const js = sortGroups(jsLicenses());
+  assertFilledIn([...rust, ...js]);
   const doc = [
     '# 第三者のソフトウェアのライセンス',
     '',

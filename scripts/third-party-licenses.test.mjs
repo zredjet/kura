@@ -1,14 +1,18 @@
 // scripts/third-party-licenses.mjs の Rust の部分（第三者のライセンスの一覧に載せる依存の名前と節）。
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import {
+  UPSTREAM_FILES,
+  UPSTREAM_TEXTS,
+  assertFilledIn,
   clarifiedCrates,
   crateLabel,
   rustGroups,
   sortGroups,
+  upstreamTexts,
   workspacePackage,
 } from './third-party-licenses.mjs';
 
@@ -150,8 +154,74 @@ describe('clarifiedCrates', () => {
     expect([...clarifiedCrates(toml)]).toEqual(['libm', 'ring_x-y']);
   });
 
-  it('リポジトリの about.toml は libm の本文を指定している', () => {
-    expect(clarifiedCrates(readFileSync(join(root, 'about.toml'), 'utf8')).has('libm')).toBe(true);
+  it('リポジトリの about.toml は libm と、本文を拾われないクレートの本文を指定している', () => {
+    const names = clarifiedCrates(readFileSync(join(root, 'about.toml'), 'utf8'));
+    for (const name of ['libm', 'tauri-plugin-dialog', 'blake3', 'dpi', 'dunce']) {
+      expect(names.has(name)).toBe(true);
+    }
+  });
+});
+
+describe('upstreamTexts', () => {
+  it('リポジトリの写しは SHA-256 が合い、UPSTREAM_TEXTS のすべての版の本文を返す', () => {
+    const texts = upstreamTexts(root);
+    expect(Object.keys(texts)).toEqual(Object.keys(UPSTREAM_TEXTS));
+    // objc2 の MIT だけのクレートには、Steven Sheldon の表示と作者の表示の 2 つの本文を載せる
+    const objc2 = texts['objc2 0.6.5'].MIT;
+    expect(objc2).toHaveLength(2);
+    expect(objc2[0]).toContain('Copyright (c) Steven Sheldon');
+    expect(objc2[1]).toContain('Copyright 2026 Mads Marquart');
+    expect(texts['dispatch2 0.3.1'].MIT).toEqual([objc2[1]]);
+    expect(texts['specta 2.0.0-rc.25'].MIT[0]).toContain('Copyright (c) 2022 Oscar Beaumont');
+  });
+
+  it('licenses/upstream/ のファイルはすべて UPSTREAM_FILES にあり、UPSTREAM_TEXTS から使われる', () => {
+    const dir = join(root, 'licenses', 'upstream');
+    const onDisk = readdirSync(dir, { recursive: true, withFileTypes: true })
+      .filter((e) => e.isFile())
+      .map((e) => relative(dir, join(e.parentPath, e.name)).split(sep).join('/'))
+      .sort();
+    expect(onDisk).toEqual(Object.keys(UPSTREAM_FILES).sort());
+    const usedPaths = new Set(
+      Object.values(UPSTREAM_TEXTS).flatMap((byId) => Object.values(byId).flat()),
+    );
+    expect([...usedPaths].sort()).toEqual(Object.keys(UPSTREAM_FILES).sort());
+  });
+
+  it('写しの SHA-256 が合わない・ファイルがない・UPSTREAM_FILES にない場所なら止める', () => {
+    const path = 'objc2-ee9a7ada/LICENSE-MIT.txt';
+    const texts = { 'objc2 0.6.5': { MIT: [path] } };
+    const wrong = { [path]: { ...UPSTREAM_FILES[path], sha256: '0'.repeat(64) } };
+    expect(() => upstreamTexts(root, wrong, texts)).toThrow('SHA-256');
+    const missing = { 'no-such/LICENSE': UPSTREAM_FILES[path] };
+    expect(() => upstreamTexts(root, missing, { 'x 1.0.0': { MIT: ['no-such/LICENSE'] } })).toThrow(
+      'licenses/upstream/no-such/LICENSE',
+    );
+    expect(() => upstreamTexts(root, {}, texts)).toThrow('UPSTREAM_FILES');
+  });
+});
+
+describe('assertFilledIn', () => {
+  const group = (id, text) => ({ id, text, usedBy: ['x 1.0.0'] });
+
+  it('雛形の著作権者の欄が残った本文は止める', () => {
+    expect(() =>
+      assertFilledIn([group('MIT', 'MIT License\n\nCopyright (c) <year> <copyright holders>\n')]),
+    ).toThrow('MIT（x 1.0.0）');
+    expect(() => assertFilledIn([group('BSD-3-Clause', 'Copyright (c) <year> <owner>. ')])).toThrow(
+      'BSD-3-Clause',
+    );
+  });
+
+  it('著作権表示のある本文と、Apache-2.0 の付録の書き方の例は通す', () => {
+    const apache =
+      'APPENDIX: How to apply the Apache License\n\nCopyright [yyyy] [name of copyright owner]\n';
+    expect(() =>
+      assertFilledIn([
+        group('MIT', 'Copyright (c) 2022 Oscar Beaumont'),
+        group('Apache-2.0', apache),
+      ]),
+    ).not.toThrow();
   });
 });
 
@@ -226,9 +296,78 @@ describe('rustGroups', () => {
 
   it('本文を指定したクレートが雛形（source_path がない）で出たら止める', () => {
     const fellBack = { licenses: [license('MIT', 'template', [dep('libm', '0.2.16')], null)] };
-    expect(() => rustGroups(fellBack, options)).toThrow('libm');
-    // 指定していないクレートの雛形は今までどおり載せる
+    expect(() => rustGroups(fellBack, options)).toThrow(
+      'libm 0.2.16 の MIT：about.toml で本文を指定したのに',
+    );
+  });
+
+  it('本文を指定していないクレートの雛形も、写しがなければ止める', () => {
     const other = { licenses: [license('MIT', 'template', [dep('specta', '2.0.0')], null)] };
-    expect(shape(rustGroups(other, options))).toEqual([['MIT', 'template', ['specta 2.0.0']]]);
+    expect(() => rustGroups(other, options)).toThrow('specta 2.0.0 の MIT：');
+    expect(() => rustGroups(other, options)).toThrow('UPSTREAM_TEXTS');
+    // 写しはライセンスごと：同じクレートでもほかのライセンスの写ししかなければ止める
+    const otherId = { ...options, upstream: { 'specta 2.0.0': { 'Apache-2.0': ['apache'] } } };
+    expect(() => rustGroups(other, otherId)).toThrow('specta 2.0.0 の MIT：');
+  });
+
+  it('kura- のクレートの、載せない（kura 自身のライセンスの）雛形では止めない', () => {
+    const about = { licenses: [license('MIT', 'template', [own('kura-core')], null)] };
+    expect(shape(sortGroups(rustGroups(about, options)))).toEqual([]);
+  });
+
+  it('雛形の節のクレートを、上流の本文の写しの節に移す（1 つのクレートに写しが 2 つなら 2 つの節）', () => {
+    const about = {
+      licenses: [
+        license(
+          'MIT',
+          'template',
+          [own('kura-core'), dep('objc2', '0.6.5'), dep('dispatch2', '0.3.1')],
+          null,
+        ),
+      ],
+    };
+    const upstream = {
+      'objc2 0.6.5': { MIT: ['sheldon', 'marquart'] },
+      'dispatch2 0.3.1': { MIT: ['marquart'] },
+    };
+    expect(shape(sortGroups(rustGroups(about, { ...options, upstream })))).toEqual([
+      ['MIT', 'marquart', ['dispatch2 0.3.1', 'objc2 0.6.5']],
+      ['MIT', 'sheldon', ['objc2 0.6.5']],
+    ]);
+  });
+
+  it('写しの本文と書き出す本文が同じ節があれば、そこにまとめる', () => {
+    const about = {
+      licenses: [
+        license('BSD-3-Clause', 'dropbox', [dep('alloc-no-stdlib', '3.0.0')]),
+        license('BSD-3-Clause', 'template', [dep('alloc-stdlib', '0.3.0')], null),
+      ],
+    };
+    const upstream = { 'alloc-stdlib 0.3.0': { 'BSD-3-Clause': ['dropbox\r\n'] } };
+    expect(shape(sortGroups(rustGroups(about, { ...options, upstream })))).toEqual([
+      ['BSD-3-Clause', 'dropbox', ['alloc-no-stdlib 3.0.0', 'alloc-stdlib 0.3.0']],
+    ]);
+  });
+
+  it('書き出す本文が同じ節は、cargo-about が分けても 1 つにまとめる（CRLF・末尾の改行だけの違い）', () => {
+    const about = {
+      licenses: [
+        license('MIT', 'mit\r\ntext\n', [dep('tauri', '2.12.2')]),
+        license('MIT', 'mit\ntext', [dep('tauri-plugin-fs', '2.6.0')]),
+        license('Apache-2.0', 'mit\ntext', [dep('other', '1.0.0')]),
+      ],
+    };
+    expect(shape(sortGroups(rustGroups(about, options)))).toEqual([
+      ['Apache-2.0', 'mit\ntext', ['other 1.0.0']],
+      ['MIT', 'mit\r\ntext\n', ['tauri 2.12.2', 'tauri-plugin-fs 2.6.0']],
+    ]);
+  });
+
+  it('使われなかった写しがあれば止める（依存の版が変わった、cargo-about が本文を見つけた）', () => {
+    const upstream = { 'objc2 0.6.4': { MIT: ['marquart'] } };
+    const bumped = { licenses: [license('MIT', 'mit', [dep('blake3', '1.8.7')])] };
+    expect(() => rustGroups(bumped, { ...options, upstream })).toThrow('objc2 0.6.4 の MIT');
+    const found = { licenses: [license('MIT', 'mit', [dep('objc2', '0.6.4')])] };
+    expect(() => rustGroups(found, { ...options, upstream })).toThrow('UPSTREAM_TEXTS');
   });
 });
