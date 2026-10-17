@@ -112,14 +112,15 @@ impl Hasher {
     }
 }
 
-/// JSON の値を正規の形のバイト列にする（キーを並べ、空白なし）。NaN・無限大は値にできない。
+/// JSON の値を正規の形のバイト列にする（キーを並べ、空白なし）。NaN・無限大は値にできない（`serde_json::Value` は持てない）。
 pub fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>, EngineError> {
     let mut out = Vec::new();
     write_canonical(value, &mut out, usize::MAX)?;
     Ok(out)
 }
 
-/// 直列化できる値を正規の JSON にする。入れ子は `MAX_DEPTH` 段まで。
+/// 直列化できる値を正規の JSON にする。入れ子は `MAX_DEPTH` 段まで。有限でない小数（NaN・±∞）を含めば
+/// `Internal`（serde_json のように黙って null にしない。NaN・±∞ を持ちうる欄は `analysis::Real` で持つ）。
 pub fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, EngineError> {
     canonical_within(value, usize::MAX)
 }
@@ -166,7 +167,261 @@ pub fn canonical_len_within<T: Serialize>(value: &T, max: usize) -> Result<usize
         )));
     }
     result.map_err(|e| EngineError::Internal(format!("JSON にできません: {e}")))?;
+    // serde_json は有限でない小数を黙って null に書く（数えるときも、値にするときも）。正規の JSON では値にできないので、
+    // 深さを確かめたあとで（入れ子は MAX_DEPTH 段まで）別に走査して断る。NaN・±∞ を持ちうる欄は `analysis::Real` を使う
+    value
+        .serialize(FiniteCheck)
+        .map_err(|e| EngineError::Internal(format!("正規の JSON にできません: {}", e.0)))?;
     Ok(count.n)
+}
+
+/// 有限でない小数を見つけたときの誤り。
+#[derive(Debug)]
+struct NonFinite(String);
+
+impl std::fmt::Display for NonFinite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NonFinite {}
+
+impl serde::ser::Error for NonFinite {
+    fn custom<T: fmt::Display>(msg: T) -> Self {
+        Self(msg.to_string())
+    }
+}
+
+/// 値を走査して、有限でない小数（NaN・±∞）があれば誤りにするだけの直列化器（何も書かない）。
+struct FiniteCheck;
+
+fn finite(v: f64) -> Result<(), NonFinite> {
+    if v.is_finite() {
+        Ok(())
+    } else {
+        Err(NonFinite(format!(
+            "有限でない数（{v}）は正規の JSON にできません"
+        )))
+    }
+}
+
+impl serde::Serializer for FiniteCheck {
+    type Ok = ();
+    type Error = NonFinite;
+    type SerializeSeq = Self;
+    type SerializeTuple = Self;
+    type SerializeTupleStruct = Self;
+    type SerializeTupleVariant = Self;
+    type SerializeMap = Self;
+    type SerializeStruct = Self;
+    type SerializeStructVariant = Self;
+
+    fn serialize_bool(self, _: bool) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_i8(self, _: i8) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_i16(self, _: i16) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_i32(self, _: i32) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_i64(self, _: i64) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_i128(self, _: i128) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_u8(self, _: u8) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_u16(self, _: u16) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_u32(self, _: u32) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_u64(self, _: u64) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_u128(self, _: u128) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_f32(self, v: f32) -> Result<(), NonFinite> {
+        finite(f64::from(v))
+    }
+    fn serialize_f64(self, v: f64) -> Result<(), NonFinite> {
+        finite(v)
+    }
+    fn serialize_char(self, _: char) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_str(self, _: &str) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_bytes(self, _: &[u8]) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_none(self) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_some<T: ?Sized + Serialize>(self, v: &T) -> Result<(), NonFinite> {
+        v.serialize(self)
+    }
+    fn serialize_unit(self) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_unit_struct(self, _: &'static str) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_unit_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+    ) -> Result<(), NonFinite> {
+        Ok(())
+    }
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(
+        self,
+        _: &'static str,
+        v: &T,
+    ) -> Result<(), NonFinite> {
+        v.serialize(self)
+    }
+    fn serialize_newtype_variant<T: ?Sized + Serialize>(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        v: &T,
+    ) -> Result<(), NonFinite> {
+        v.serialize(self)
+    }
+    fn serialize_seq(self, _: Option<usize>) -> Result<Self, NonFinite> {
+        Ok(self)
+    }
+    fn serialize_tuple(self, _: usize) -> Result<Self, NonFinite> {
+        Ok(self)
+    }
+    fn serialize_tuple_struct(self, _: &'static str, _: usize) -> Result<Self, NonFinite> {
+        Ok(self)
+    }
+    fn serialize_tuple_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+    ) -> Result<Self, NonFinite> {
+        Ok(self)
+    }
+    fn serialize_map(self, _: Option<usize>) -> Result<Self, NonFinite> {
+        Ok(self)
+    }
+    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self, NonFinite> {
+        Ok(self)
+    }
+    fn serialize_struct_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+    ) -> Result<Self, NonFinite> {
+        Ok(self)
+    }
+}
+
+impl serde::ser::SerializeSeq for FiniteCheck {
+    type Ok = ();
+    type Error = NonFinite;
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), NonFinite> {
+        v.serialize(FiniteCheck)
+    }
+    fn end(self) -> Result<(), NonFinite> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTuple for FiniteCheck {
+    type Ok = ();
+    type Error = NonFinite;
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), NonFinite> {
+        v.serialize(FiniteCheck)
+    }
+    fn end(self) -> Result<(), NonFinite> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTupleStruct for FiniteCheck {
+    type Ok = ();
+    type Error = NonFinite;
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), NonFinite> {
+        v.serialize(FiniteCheck)
+    }
+    fn end(self) -> Result<(), NonFinite> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTupleVariant for FiniteCheck {
+    type Ok = ();
+    type Error = NonFinite;
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), NonFinite> {
+        v.serialize(FiniteCheck)
+    }
+    fn end(self) -> Result<(), NonFinite> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeMap for FiniteCheck {
+    type Ok = ();
+    type Error = NonFinite;
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, k: &T) -> Result<(), NonFinite> {
+        k.serialize(FiniteCheck)
+    }
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), NonFinite> {
+        v.serialize(FiniteCheck)
+    }
+    fn end(self) -> Result<(), NonFinite> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeStruct for FiniteCheck {
+    type Ok = ();
+    type Error = NonFinite;
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        _: &'static str,
+        v: &T,
+    ) -> Result<(), NonFinite> {
+        v.serialize(FiniteCheck)
+    }
+    fn end(self) -> Result<(), NonFinite> {
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeStructVariant for FiniteCheck {
+    type Ok = ();
+    type Error = NonFinite;
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        _: &'static str,
+        v: &T,
+    ) -> Result<(), NonFinite> {
+        v.serialize(FiniteCheck)
+    }
+    fn end(self) -> Result<(), NonFinite> {
+        Ok(())
+    }
 }
 
 /// 書いたバイト数を数えるだけの書き込み先。`max` を超えたら書き込みの誤りにして直列化を止める。
@@ -542,6 +797,44 @@ mod tests {
                 String::from_utf8_lossy(&bytes)
             );
         }
+    }
+
+    /// 有限でない小数は、黙って null にせずエラーにする（入れ子・Option・f32 の中でも）。有限の値と null はそのまま。
+    #[test]
+    fn non_finite_numbers_are_refused() {
+        #[derive(Serialize)]
+        struct S {
+            a: Option<f64>,
+            b: Vec<(u8, f32)>,
+        }
+        for bad in [
+            S {
+                a: Some(f64::NAN),
+                b: vec![],
+            },
+            S {
+                a: None,
+                b: vec![(1, f32::NEG_INFINITY)],
+            },
+            S {
+                a: Some(f64::INFINITY),
+                b: vec![],
+            },
+        ] {
+            assert!(matches!(canonical(&bad), Err(EngineError::Internal(_))));
+            assert!(canonical_len_within(&bad, usize::MAX).is_err());
+            assert!(hash_canonical("d", &bad).is_err());
+        }
+        let ok = S {
+            a: None,
+            b: vec![(1, -0.0), (2, 1.5)],
+        };
+        assert_eq!(
+            String::from_utf8(canonical(&ok).unwrap()).unwrap(),
+            r#"{"a":null,"b":[[1,0],[2,1.5]]}"#
+        );
+        let map = std::collections::BTreeMap::from([("x", f64::NAN)]);
+        assert!(canonical(&map).is_err());
     }
 
     #[test]
