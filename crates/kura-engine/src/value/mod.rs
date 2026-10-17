@@ -272,24 +272,44 @@ impl Value {
                 image_meta_into(&fr.meta, &mut h)?;
                 Ok(h.finish())
             }
-            Self::Audio(a) => {
-                let mut h = Hasher::new("kura-pcm-v1");
-                h.u32(a.rate())
-                    .u32(a.channels() as u32)
-                    .u64(a.frames() as u64);
-                for plane in a.planes() {
-                    for s in plane.iter() {
-                        // NaN は 1 つの値にそろえる
-                        let bits = if s.is_nan() { 0x7fc0_0000 } else { s.to_bits() };
-                        h.raw(&bits.to_le_bytes());
-                    }
-                }
-                h.bytes_with_len(&canonical(&a.meta)?);
-                Ok(h.finish())
-            }
+            Self::Audio(a) => audio_digest(a, &mut || Ok(())),
         }
     }
 }
+
+/// 音声の値のダイジェスト（[`Value::digest`] の `kura-pcm-v1` の式そのもの。`Value::digest` は止めない確かめでこれを
+/// 呼ぶ）。標本を [`DIGEST_CHUNK`] 個ずつ足し、各チャンネルの各塊を足す前に `check` を呼ぶ。`check` が `Err` を返したら
+/// そこで止めてそのエラーを返す。長い音声のダイジェスト（ステレオ 3 時間で 2 秒ほど）の途中でも呼び手が中止を確かめる
+/// ための口で、`check` は値に効かない。`check` を呼ぶ数は Σ_チャンネル ceil(フレーム数 / [`DIGEST_CHUNK`])。
+pub(crate) fn audio_digest(
+    a: &Audio,
+    check: &mut dyn FnMut() -> Result<(), EngineError>,
+) -> Result<Digest, EngineError> {
+    let mut h = Hasher::new("kura-pcm-v1");
+    h.u32(a.rate())
+        .u32(a.channels() as u32)
+        .u64(a.frames() as u64);
+    // 標本のビット列を DIGEST_CHUNK 個ずつまとめて足す（BLAKE3 は流れのハッシュなので、まとめ方で値は
+    // 変わらない。4 バイトずつ足すと 3 分のステレオで 0.15 秒かかっていた）
+    let mut buf = Vec::with_capacity(DIGEST_CHUNK * 4);
+    for plane in a.planes() {
+        for chunk in plane.chunks(DIGEST_CHUNK) {
+            check()?;
+            buf.clear();
+            for s in chunk {
+                // NaN は 1 つの値にそろえる
+                let bits = if s.is_nan() { 0x7fc0_0000 } else { s.to_bits() };
+                buf.extend_from_slice(&bits.to_le_bytes());
+            }
+            h.raw(&buf);
+        }
+    }
+    h.bytes_with_len(&canonical(&a.meta)?);
+    Ok(h.finish())
+}
+
+/// 音声のダイジェストで標本をまとめて足す数（速さと、[`audio_digest`] が確かめを呼ぶ間隔のためだけ。値に効かない）。
+pub(crate) const DIGEST_CHUNK: usize = 16 * 1024;
 
 /// 画像のメタデータをダイジェストに足す：正規の JSON ‖ ICC ‖ 拡張。
 /// 拡張は、あるものだけを番号の順に（番号 u8 ‖ 長さ付きのバイト列）書く。ないときは何も書かないので、
@@ -394,6 +414,87 @@ mod tests {
             Value::Image(Arc::new(with_exif)).digest().unwrap(),
             h.finish()
         );
+    }
+
+    /// 音声のダイジェストの式（docs/editing.md §8.6）：標本を 1 つずつ足したものと同じ（まとめる区切りをまたぐ長さで）。
+    #[test]
+    fn audio_digest_formula_is_frozen() {
+        let planes: Vec<Vec<f32>> = (0..2)
+            .map(|c| {
+                (0..DIGEST_CHUNK * 2 + 37)
+                    .map(|i| {
+                        if i == 5 {
+                            f32::NAN
+                        } else {
+                            (i * (c + 1)) as f32 * 1e-3 - 0.5
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let a = Audio::new(
+            44_100,
+            planes.iter().cloned().map(Arc::new).collect(),
+            AudioMeta::default(),
+        )
+        .unwrap();
+        let mut h = Hasher::new("kura-pcm-v1");
+        h.u32(44_100).u32(2).u64(planes[0].len() as u64);
+        for p in &planes {
+            for s in p {
+                let bits = if s.is_nan() {
+                    0x7fc0_0000_u32
+                } else {
+                    s.to_bits()
+                };
+                h.raw(&bits.to_le_bytes());
+            }
+        }
+        h.bytes_with_len(&canonical(&a.meta).unwrap());
+        assert_eq!(Value::Audio(Arc::new(a)).digest().unwrap(), h.finish());
+    }
+
+    /// 確かめを呼ぶ口（[`audio_digest`]）：値は [`Value::digest`] と同じ（確かめは値に効かない）。確かめはチャンネルごとに
+    /// 塊（[`DIGEST_CHUNK`] 個）の数だけ呼ばれ、`Err` を返すとそこで止まってそのエラーを返す（残りの塊は読まない）。
+    #[test]
+    fn audio_digest_checks_between_chunks_without_changing_the_value() {
+        for (channels, frames) in [
+            (1usize, 0usize),
+            (2, 1),
+            (3, DIGEST_CHUNK),
+            (2, DIGEST_CHUNK * 2 + 37),
+        ] {
+            let planes: Vec<Arc<Vec<f32>>> = (0..channels)
+                .map(|c| Arc::new((0..frames).map(|i| (i + c) as f32 * 1e-4).collect()))
+                .collect();
+            let a = Audio::new(48_000, planes, AudioMeta::default()).unwrap();
+            let mut calls = 0usize;
+            let got = audio_digest(&a, &mut || {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(got, Value::Audio(Arc::new(a.clone())).digest().unwrap());
+            assert_eq!(
+                calls,
+                channels * frames.div_ceil(DIGEST_CHUNK),
+                "{channels} ch・{frames}"
+            );
+            // 途中（最後の塊の前）で Err を返すと、そこで止まる
+            if calls >= 2 {
+                let mut n = 0usize;
+                let r = audio_digest(&a, &mut || {
+                    n += 1;
+                    if n == calls {
+                        Err(EngineError::Canceled)
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert!(matches!(r, Err(EngineError::Canceled)));
+                assert_eq!(n, calls);
+            }
+        }
     }
 
     #[test]

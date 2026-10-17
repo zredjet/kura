@@ -1,8 +1,11 @@
 # ファズ（cargo-fuzz）
 
 kura-engine の外から来る入力を読むコード（デコーダと文書の読み込み・描画）を、カバレッジを見ながら変異させて試す。
-対象の本体は `kura_engine::testing::fuzz_decode`・`fuzz_document`（自前のコードの panic・形と中身の食い違い・`Internal` を見つける）。
-対象は `fuzz_targets/` のファイル名（`decode_png`・`decode_jpeg`・`decode_gif`・`decode_webp`・`decode_aseprite`・`decode_psd`・`decode_svg`・`decode_wav`・`decode_aiff`・`decode_flac`・`decode_mp3`・`decode_ogg`・`decode_m4a`・`decode_aac`・`document`）。
+自前のエンコーダの書き出し（外から来た値の標本を書く）も試す。
+対象の本体は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`（自前のコードの panic・形と中身の食い違い・`Internal` を見つける）。
+対象は `fuzz_targets/` のファイル名（`decode_png`・`decode_jpeg`・`decode_gif`・`decode_webp`・`decode_aseprite`・`decode_psd`・`decode_svg`・`decode_wav`・`decode_aiff`・`decode_flac`・`decode_mp3`・`decode_ogg`・`decode_m4a`・`decode_aac`・`encode_ogg`・`document`）。
+
+- `encode_ogg`：先頭の 19 バイト（`kura_engine::testing::FUZZ_ENCODE_HEADER`）で設定（品質 −1〜10・レート・チャンネル 1〜9・長さ 0〜16,384 フレーム）とメタデータ（ループ点：なし・(a, b)・始まりか終わりが u64 の端に近いもの。長さの外・長さ 0・逆向きを含む。タグ：0〜4 個。既知の名前とその別名（DESCRIPTION・小文字ちょうどの `cprt`）・大文字と小文字だけが違う名前・書けない名前と、空・`=` を含む・NUL・4,096 バイトの前後・70,000 バイトの値）を決め、残りを f32 のビット列（NaN・∞・巨大な値を含む）として標本にし、自作の Ogg Vorbis のエンコーダで書いて、すべての ogg のデコーダで読み直す（長さ・レート・チャンネルが元と同じか）。書けない形（レート・チャンネルの範囲の外）は断ること、書けると答えた形は断らないことも確かめる。メタデータは、書いたコメントヘッダを読んで、LOOPSTART・LOOPLENGTH が `start < end ≤ 長さ` のときだけ正しい値で書かれること、読み取りが同じタグにまとめる名前（大文字と小文字だけの違い・DESCRIPTION と COMMENT・小文字ちょうどの `cprt` と COPYRIGHT）が重複しないこと、`ENCODER=ogg-vorbis-kura-enc/1` があること、読み直したループ点が書いたものと同じこと、読み直したタグを書き直したときのコメントが書いたものと同じこと（読み取りが同じタグにまとめる名前の違いを除いて）を確かめる。見出しの並びは `kura_engine::testing::fuzz_encode` の説明、種の作り方は `fuzz_encode_input`・`fuzz_encode_input_meta`。
 
 ## 用意
 
@@ -16,7 +19,7 @@ rustup toolchain install nightly --profile minimal --component llvm-tools-previe
 cargo install --locked cargo-fuzz
 ```
 
-- 種：`crates/kura-engine/tests/fuzz_smoke.rs` の `targets()`（各形式の小さなファイル・`fixtures/`）、デコーダのゴールデンに凍結した作り方（`FileGen`）、登録されたすべての操作の例（1 ノードの文書）。`fuzz/corpus/<対象>/` に書き出す（git には入れない）：
+- 種：`crates/kura-engine/tests/fuzz_smoke.rs` の `targets()`（各形式の小さなファイル・`fixtures/`・自作のエンコーダの出力・`encode_ogg` の見出しと標本）、デコーダのゴールデンに凍結した作り方（`FileGen`）、登録されたすべての操作の例（1 ノードの文書）。`fuzz/corpus/<対象>/` に書き出す（git には入れない）：
 
 ```bash
 cargo test -p kura-engine --test fuzz_smoke export_seeds -- --ignored

@@ -39,6 +39,21 @@ pub fn tan(x: f64) -> f64 {
     libm::tan(x)
 }
 
+/// 逆正接（Vorbis のエンコーダの Bark の写像 `toBARK` が使う。libvorbis の scales.h:78）。
+pub fn atan(x: f64) -> f64 {
+    libm::atan(x)
+}
+
+/// √(x² + y²)（途中であふれない）。
+pub fn hypot(x: f64, y: f64) -> f64 {
+    libm::hypot(x, y)
+}
+
+/// x · 2^n（正確。Vorbis の codebook の `_float32_unpack` が使う。libvorbis の sharedbook.c:79）。
+pub fn ldexp(x: f64, n: i32) -> f64 {
+    libm::ldexp(x, n)
+}
+
 /// 大きいほう（IEEE 754-2019 の maximumNumber）。NaN は捨ててもう一方を返す。-0 < +0 として扱う
 /// （std の `f64::max` は ±0 のどちらを返すか決まっていないので使わない）。
 pub fn max(a: f64, b: f64) -> f64 {
@@ -128,7 +143,7 @@ mod tests {
     /// 値はこの実装で一度計算して書き写したもの。真の値との差が 1 ULP 以内であることも確かめる。
     #[test]
     fn frozen_bits() {
-        let cases: [(&str, f64, f64, u64); 6] = [
+        let cases: [(&str, f64, f64, u64); 9] = [
             (
                 "exp(1)",
                 exp(1.0),
@@ -164,6 +179,24 @@ mod tests {
                 db_to_gain(-6.0),
                 0.501_187_233_627_272_2,
                 0x3fe0_09b9_cf33_4252,
+            ),
+            (
+                "atan(0.5)",
+                atan(0.5),
+                0.463_647_609_000_806_1,
+                0x3fdd_ac67_0561_bb4f,
+            ),
+            (
+                "hypot(1, 2)",
+                hypot(1.0, 2.0),
+                2.236_067_977_499_79,
+                0x4001_e377_9b97_f4a8,
+            ),
+            (
+                "ldexp(1.5, -3)",
+                ldexp(1.5, -3),
+                0.1875,
+                0x3fc8_0000_0000_0000,
             ),
         ];
         let mut report = String::new();

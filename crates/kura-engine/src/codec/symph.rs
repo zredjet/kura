@@ -13,8 +13,12 @@
 //! - タグ：Vorbis コメント（FLAC・Ogg）と MP4 の iTunes のタグから、title・artist・album・comment・date・genre・
 //!   copyright を読み、FLAC・Ogg のほかのキーは `vorbis:<KEY>` のまま運ぶ（FLAC に書き戻せる）。
 //!   `LOOPSTART`・`LOOPLENGTH`（Vorbis コメント）をループ点にする（終わり = LOOPSTART + LOOPLENGTH。含まない）。
+//! - 書き出し（FLAC・Ogg の Vorbis コメント。[`vorbis_comments_for`]）は読み取りの逆：ループ点は `start < end ≤ 長さ` の
+//!   ときだけ書き、読み取りが同じタグにまとめる名前（大文字と小文字だけの違い・DESCRIPTION と COMMENT・`cprt` と
+//!   COPYRIGHT）が重なれば先の 1 つだけを書く（既知の名前を優先）。名前の扱いは読み取りと書き出しで 1 つの表
+//!   （`KNOWN_TAGS`・[`comment_name`]）から決める。
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use symphonia_core::audio::{Audio as _, GenericAudioBufferRef};
@@ -309,8 +313,105 @@ impl Budget {
     }
 }
 
+/// 既知のタグの名前の表の 1 行。読み取り（[`comment_name`]）と書き出し（[`vorbis_comments_for`]）が同じ表を使う
+/// （読み取りが同じ名前にまとめるコメントを、書き出しが 2 つ書かないように）。
+struct KnownTag {
+    /// kura の名前（`AudioMeta::tags` のキー）。
+    name: &'static str,
+    /// Vorbis コメントに書く名前。読み取りは、大文字にした名前がこれと同じコメントをこの名前にする。
+    vorbis: &'static str,
+    /// 読み取りが同じ名前にする別の Vorbis コメントの名前（大文字にした名前と比べる）。
+    aliases: &'static [&'static str],
+    /// 読み取りが同じ名前にするキー（MP4 の iTunes のタグの箱の名前。大文字と小文字を区別して比べる。Vorbis コメントにも
+    /// 当てるので、小文字の `cprt` という名前のコメントも copyright になる）。
+    exact: &'static str,
+}
+
+/// 既知のタグの名前（読み取りは上から順に照らし、最初に合った行の名前にする）。
+const KNOWN_TAGS: [KnownTag; 7] = [
+    KnownTag {
+        name: "title",
+        vorbis: "TITLE",
+        aliases: &[],
+        exact: "\u{a9}nam",
+    },
+    KnownTag {
+        name: "artist",
+        vorbis: "ARTIST",
+        aliases: &[],
+        exact: "\u{a9}ART",
+    },
+    KnownTag {
+        name: "album",
+        vorbis: "ALBUM",
+        aliases: &[],
+        exact: "\u{a9}alb",
+    },
+    KnownTag {
+        name: "comment",
+        vorbis: "COMMENT",
+        aliases: &["DESCRIPTION"],
+        exact: "\u{a9}cmt",
+    },
+    KnownTag {
+        name: "date",
+        vorbis: "DATE",
+        aliases: &[],
+        exact: "\u{a9}day",
+    },
+    KnownTag {
+        name: "genre",
+        vorbis: "GENRE",
+        aliases: &[],
+        exact: "\u{a9}gen",
+    },
+    KnownTag {
+        name: "copyright",
+        vorbis: "COPYRIGHT",
+        aliases: &[],
+        exact: "cprt",
+    },
+];
+
+/// 読み取りがコメントの名前に付ける意味（[`comment_name`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommentName {
+    /// ループ点の始まり（LOOPSTART。大文字と小文字を区別しない）。
+    LoopStart,
+    /// ループ点の長さ（LOOPLENGTH。大文字と小文字を区別しない）。
+    LoopLength,
+    /// タグ：kura の名前（既知の名前か `vorbis:<大文字の名前>`）。
+    Tag(String),
+}
+
+/// Vorbis コメントの名前として書ける形（空でなく、0x20〜0x7D の ASCII で `=` を含まない。Vorbis I の規則）。
+fn vorbis_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| (0x20..=0x7D).contains(&b) && b != b'=')
+}
+
+/// 読み取り（[`meta_from_tags`]）がコメントの名前 `key` をどう扱うか。運ばない名前は None。`vorbis` なら、既知の名前と
+/// ループ点の名前のほかも `vorbis:<大文字の名前>` で運ぶ（Vorbis コメントとして書ける形のときだけ）。
+pub(crate) fn comment_name(key: &str, vorbis: bool) -> Option<CommentName> {
+    let upper = key.to_ascii_uppercase();
+    match upper.as_str() {
+        "LOOPSTART" => return Some(CommentName::LoopStart),
+        "LOOPLENGTH" => return Some(CommentName::LoopLength),
+        _ => {}
+    }
+    if let Some(t) = KNOWN_TAGS
+        .iter()
+        .find(|t| upper == t.vorbis || t.aliases.contains(&upper.as_str()) || key == t.exact)
+    {
+        return Some(CommentName::Tag(t.name.to_string()));
+    }
+    (vorbis && vorbis_name_ok(&upper)).then(|| CommentName::Tag(format!("vorbis:{upper}")))
+}
+
 /// 生のタグを kura のメタデータにする（タグとループ点）。`frames` は音声の長さ（ループ点の確かめ）。
-/// `vorbis` なら知らないキーも `vorbis:<KEY>` で運ぶ。
+/// `vorbis` なら知らないキーも `vorbis:<KEY>` で運ぶ。名前の扱いは [`comment_name`]。
 pub(crate) fn meta_from_tags(
     raw: &[(String, String)],
     frames: u64,
@@ -323,37 +424,18 @@ pub(crate) fn meta_from_tags(
     let mut meta = AudioMeta::default();
     let (mut loop_start, mut loop_len) = (None, None);
     for (key, value) in raw {
-        let upper = key.to_ascii_uppercase();
-        match upper.as_str() {
-            "LOOPSTART" => {
+        let name = match comment_name(key, vorbis) {
+            Some(CommentName::LoopStart) => {
                 loop_start = loop_start.or_else(|| value.trim().parse::<u64>().ok());
                 continue;
             }
-            "LOOPLENGTH" => {
+            Some(CommentName::LoopLength) => {
                 loop_len = loop_len.or_else(|| value.trim().parse::<u64>().ok());
                 continue;
             }
-            _ => {}
-        }
-        let name = match (upper.as_str(), key.as_str()) {
-            ("TITLE", _) | (_, "\u{a9}nam") => Some("title".to_string()),
-            ("ARTIST", _) | (_, "\u{a9}ART") => Some("artist".to_string()),
-            ("ALBUM", _) | (_, "\u{a9}alb") => Some("album".to_string()),
-            ("COMMENT" | "DESCRIPTION", _) | (_, "\u{a9}cmt") => Some("comment".to_string()),
-            ("DATE", _) | (_, "\u{a9}day") => Some("date".to_string()),
-            ("GENRE", _) | (_, "\u{a9}gen") => Some("genre".to_string()),
-            ("COPYRIGHT", _) | (_, "cprt") => Some("copyright".to_string()),
-            _ if vorbis
-                && !upper.is_empty()
-                && upper
-                    .bytes()
-                    .all(|b| (0x20..=0x7D).contains(&b) && b != b'=') =>
-            {
-                Some(format!("vorbis:{upper}"))
-            }
-            _ => None,
+            Some(CommentName::Tag(name)) => name,
+            None => continue,
         };
-        let Some(name) = name else { continue };
         if meta.tags.contains_key(&name) || value.len() > TEXT_MAX {
             continue;
         }
@@ -371,36 +453,48 @@ pub(crate) fn meta_from_tags(
     meta
 }
 
-/// FLAC・Ogg に書く Vorbis コメント（タグとループ点）の (キー, 値)。`meta_from_tags` の逆。
-pub(crate) fn vorbis_comments(meta: &AudioMeta) -> Vec<(String, String)> {
+/// 書き出しで運ぶループ点：`start < end ≤ frames` のときだけ（WAV・AIFF の書き出しと同じ。`meta_from_tags` が読み直せる
+/// 範囲）。範囲の外・長さ 0・逆向きのループ点は書かない。
+pub(crate) fn writable_loop(l: Option<LoopRange>, frames: u64) -> Option<LoopRange> {
+    l.filter(|l| l.start < l.end && l.end <= frames)
+}
+
+/// FLAC・Ogg に書く Vorbis コメント（タグとループ点）の (キー, 値)。`meta_from_tags` の逆。`frames` は音声の長さ。
+///
+/// - ループ点は [`writable_loop`] の範囲のときだけ LOOPSTART・LOOPLENGTH（終わり − 始まり）を書く。
+/// - タグは既知の名前（title など）を先に、次に `vorbis:<KEY>` を、それぞれ `tags` の順に書く。書くのは、読み取りが
+///   タグとして読む名前（[`comment_name`] が `Tag` を返す、Vorbis コメントとして書ける名前）だけ。読み取りが先に書いた
+///   項目と同じタグにまとめる名前（大文字と小文字だけが違う名前、DESCRIPTION と COMMENT、`cprt` と COPYRIGHT）は書かない。
+///   読み取りは同じ名前の 2 つめ以降を捨てるので、重複を書くと、書いて・読んで・書き直したときにコメントが変わる。
+pub(crate) fn vorbis_comments_for(meta: &AudioMeta, frames: u64) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if let Some(l) = meta.loop_range {
+    if let Some(l) = writable_loop(meta.loop_range, frames) {
         out.push(("LOOPSTART".to_string(), l.start.to_string()));
         out.push(("LOOPLENGTH".to_string(), (l.end - l.start).to_string()));
     }
-    let known: BTreeMap<&str, &str> = [
-        ("title", "TITLE"),
-        ("artist", "ARTIST"),
-        ("album", "ALBUM"),
-        ("comment", "COMMENT"),
-        ("date", "DATE"),
-        ("genre", "GENRE"),
-        ("copyright", "COPYRIGHT"),
-    ]
-    .into_iter()
-    .collect();
-    for (key, value) in &meta.tags {
-        let name = known
-            .get(key.as_str())
-            .map(|k| (*k).to_string())
-            .or_else(|| key.strip_prefix("vorbis:").map(str::to_string))
-            .filter(|k| {
-                !k.is_empty()
-                    && k.bytes().all(|b| (0x20..=0x7D).contains(&b) && b != b'=')
-                    && !matches!(k.to_ascii_uppercase().as_str(), "LOOPSTART" | "LOOPLENGTH")
-            });
-        if let Some(name) = name {
-            out.push((name, crate::codec::clip_text(value, TEXT_MAX).to_string()));
+    // 書いた名前を読み取りが付ける kura の名前（重複を除く）。既知の名前の段を先に回す（tags の順では既知の名前が
+    // `vorbis:` より前に来るので、重複のない入力の並びは 1 段で回したときと同じ）
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for known_pass in [true, false] {
+        for (key, value) in &meta.tags {
+            let name = if known_pass {
+                KNOWN_TAGS
+                    .iter()
+                    .find(|t| t.name == key)
+                    .map(|t| t.vorbis.to_string())
+            } else {
+                key.strip_prefix("vorbis:").map(str::to_string)
+            };
+            // 書けない名前とループ点の名前は書かない
+            let Some(name) = name.filter(|k| vorbis_name_ok(k)) else {
+                continue;
+            };
+            let Some(CommentName::Tag(same)) = comment_name(&name, true) else {
+                continue;
+            };
+            if seen.insert(same) {
+                out.push((name, crate::codec::clip_text(value, TEXT_MAX).to_string()));
+            }
         }
     }
     out
@@ -911,12 +1005,283 @@ mod tests {
             Some("x")
         );
         assert_eq!(meta.tags.len(), 2);
-        let back = meta_from_tags(&vorbis_comments(&meta), 1_000, true, &Limits::default());
+        let back = meta_from_tags(
+            &vorbis_comments_for(&meta, 1_000),
+            1_000,
+            true,
+            &Limits::default(),
+        );
         assert_eq!(back, meta);
         // 長さを超えるループは読まない
         assert_eq!(
             meta_from_tags(&raw, 120, true, &Limits::default()).loop_range,
             None
         );
+    }
+
+    /// 読み取りの名前の扱い（`comment_name`）：既知の名前と別名（DESCRIPTION）は大文字と小文字を区別しない。MP4 の鍵
+    /// （`©nam` など・`cprt`）は大文字と小文字を区別して、ちょうど同じときだけ（Vorbis コメントにも当てる）。ほかは
+    /// `vorbis` のときだけ `vorbis:<大文字>`（書ける形のときだけ）。書き出しは既知の名前を表の名前で書き、読み取りはそれを
+    /// 同じ名前に読む。
+    #[test]
+    fn comment_names_follow_one_table() {
+        use CommentName::{LoopLength, LoopStart, Tag};
+        let tag = |s: &str| Some(Tag(s.to_string()));
+        for (key, vorbis, want) in [
+            ("TITLE", true, tag("title")),
+            ("title", true, tag("title")),
+            ("\u{a9}nam", false, tag("title")),
+            ("\u{a9}NAM", true, None),
+            ("\u{a9}ART", false, tag("artist")),
+            ("Album", true, tag("album")),
+            ("description", true, tag("comment")),
+            ("DESCRIPTION", false, tag("comment")),
+            ("\u{a9}cmt", false, tag("comment")),
+            ("date", true, tag("date")),
+            ("\u{a9}gen", true, tag("genre")),
+            ("copyright", true, tag("copyright")),
+            ("cprt", true, tag("copyright")),
+            ("cprt", false, tag("copyright")),
+            ("CPRT", true, tag("vorbis:CPRT")),
+            ("Cprt", true, tag("vorbis:CPRT")),
+            ("CPRT", false, None),
+            ("LoopStart", true, Some(LoopStart)),
+            ("LOOPLENGTH", false, Some(LoopLength)),
+            ("foo", true, tag("vorbis:FOO")),
+            ("A B", true, tag("vorbis:A B")),
+            ("foo", false, None),
+            ("a=b", true, None),
+            ("", true, None),
+            ("~", true, None),
+        ] {
+            assert_eq!(comment_name(key, vorbis), want, "{key:?} {vorbis}");
+        }
+        for t in &KNOWN_TAGS {
+            let meta = AudioMeta {
+                tags: [(t.name.to_string(), "v".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..AudioMeta::default()
+            };
+            let written = vorbis_comments_for(&meta, 0);
+            assert_eq!(written, vec![(t.vorbis.to_string(), "v".to_string())]);
+            assert_eq!(meta_from_tags(&written, 0, true, &Limits::default()), meta);
+        }
+    }
+
+    fn with_loop(start: u64, end: u64) -> AudioMeta {
+        AudioMeta {
+            loop_range: Some(LoopRange { start, end }),
+            ..AudioMeta::default()
+        }
+    }
+
+    /// ループ点は `start < end ≤ frames` のときだけ書く（WAV・AIFF と同じ）。逆向きでも引き算があふれない。
+    #[test]
+    fn loop_points_are_written_only_in_range() {
+        let frames = 30_000;
+        let pair = |s: &str, n: &str| {
+            vec![
+                ("LOOPSTART".to_string(), s.to_string()),
+                ("LOOPLENGTH".to_string(), n.to_string()),
+            ]
+        };
+        for (s, e) in [(0, 30_000), (0, 1), (29_999, 30_000), (100, 200)] {
+            let got = vorbis_comments_for(&with_loop(s, e), frames);
+            assert_eq!(got, pair(&s.to_string(), &(e - s).to_string()), "{s}..{e}");
+            // 読み直すと同じループ点
+            let back = meta_from_tags(&got, frames, true, &Limits::default());
+            assert_eq!(back.loop_range, Some(LoopRange { start: s, end: e }));
+        }
+        for (s, e) in [
+            (30_000, 30_005),
+            (100, 30_100),
+            (0, u64::MAX),
+            (u64::MAX, u64::MAX),
+        ] {
+            assert_eq!(
+                vorbis_comments_for(&with_loop(s, e), frames),
+                vec![],
+                "{s}..{e}"
+            );
+            assert_eq!(
+                writable_loop(Some(LoopRange { start: s, end: e }), frames),
+                None
+            );
+        }
+        for (s, e) in [(5, 5), (10, 5), (200, 100), (u64::MAX, 0), (0, 0)] {
+            assert_eq!(
+                vorbis_comments_for(&with_loop(s, e), frames),
+                vec![],
+                "{s}..{e}"
+            );
+        }
+        assert_eq!(writable_loop(None, frames), None);
+    }
+
+    /// 読み取りが同じタグにまとめる名前の重複は先の 1 つだけ（既知の名前を優先し、大文字と小文字だけの違い・DESCRIPTION と
+    /// COMMENT・小文字ちょうどの `cprt` と COPYRIGHT を同じとみなす）。読み取りが別の名前にするもの（`CPRT` と `cprt`）は
+    /// 両方書く。読み取りが作る形（既知の名前は小文字、ほかは大文字の `vorbis:KEY`）は、重複を除く前と同じ並び。
+    #[test]
+    fn duplicate_tag_names_are_written_once() {
+        let tags = |kv: &[(&str, &str)]| AudioMeta {
+            tags: kv
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            ..AudioMeta::default()
+        };
+        let kv = |list: Vec<(String, String)>| -> Vec<String> {
+            list.into_iter().map(|(k, v)| format!("{k}={v}")).collect()
+        };
+        for (input, want) in [
+            (
+                vec![("artist", "A"), ("vorbis:ARTIST", "B")],
+                vec!["ARTIST=A"],
+            ),
+            (
+                vec![("vorbis:foo", "x"), ("vorbis:FOO", "y")],
+                vec!["FOO=y"],
+            ),
+            (
+                vec![("title", "T"), ("vorbis:title", "t"), ("vorbis:Title", "u")],
+                vec!["TITLE=T"],
+            ),
+            // vorbis:TITLE だけなら TITLE として書く（読み直すと title）
+            (vec![("vorbis:TITLE", "t")], vec!["TITLE=t"]),
+            (
+                vec![("comment", "c"), ("vorbis:DESCRIPTION", "d")],
+                vec!["COMMENT=c"],
+            ),
+            (
+                vec![("vorbis:COMMENT", "c"), ("vorbis:description", "d")],
+                vec!["COMMENT=c"],
+            ),
+            // 小文字ちょうどの cprt は、読み取りが copyright にする（MP4 の鍵と同じ照らし方）
+            (
+                vec![("copyright", "X"), ("vorbis:cprt", "Y")],
+                vec!["COPYRIGHT=X"],
+            ),
+            (
+                vec![("vorbis:COPYRIGHT", "X"), ("vorbis:cprt", "Y")],
+                vec!["COPYRIGHT=X"],
+            ),
+            // 大文字の CPRT は読み取りが vorbis:CPRT にするので、cprt とは別の名前（両方書く）
+            (
+                vec![("vorbis:CPRT", "Z"), ("vorbis:cprt", "Y")],
+                vec!["CPRT=Z", "cprt=Y"],
+            ),
+            (
+                vec![
+                    ("copyright", "X"),
+                    ("vorbis:CPRT", "Z"),
+                    ("vorbis:cprt", "Y"),
+                ],
+                vec!["COPYRIGHT=X", "CPRT=Z"],
+            ),
+            // 読み取りが作る形はそのまま（既知の名前のあとに vorbis:KEY、tags の順）
+            (
+                vec![
+                    ("title", "曲"),
+                    ("artist", "誰か"),
+                    ("vorbis:ZZZ", "z"),
+                    ("vorbis:ENCODER", "e"),
+                    ("vorbis:A B", "sp"),
+                    ("vorbis:K", "a=b"),
+                ],
+                vec![
+                    "ARTIST=誰か",
+                    "TITLE=曲",
+                    "A B=sp",
+                    "ENCODER=e",
+                    "K=a=b",
+                    "ZZZ=z",
+                ],
+            ),
+        ] {
+            assert_eq!(kv(vorbis_comments_for(&tags(&input), 0)), want, "{input:?}");
+        }
+    }
+
+    /// 書いて・読んで・書き直すと同じコメント（ChaCha8 で選んだ名前の組。重複・別名・範囲の外を含むループ点）。読み取りが
+    /// 作らない形のうち、名前が変わるものは組に入れない：小文字の `vorbis:foo` は大文字の `vorbis:FOO` がある組だけ（`foo`
+    /// だけなら読み直すと `FOO`）、既知の名前の別名（`vorbis:TITLE`・`vorbis:DESCRIPTION`・小文字ちょうどの `vorbis:cprt`
+    /// など）は既知の名前がある組だけ（別名だけなら読み直すと既知の名前になり、並びと DESCRIPTION・cprt の名前が変わる）。
+    /// どれも値は保たれる。
+    #[test]
+    fn comments_are_stable_through_a_round_trip() {
+        use rand_chacha::rand_core::Rng;
+        let names = [
+            "title",
+            "artist",
+            "comment",
+            "date",
+            "copyright",
+            "vorbis:TITLE",
+            "vorbis:ARTIST",
+            "vorbis:DESCRIPTION",
+            "vorbis:COMMENT",
+            "vorbis:COPYRIGHT",
+            "vorbis:CPRT",
+            "vorbis:cprt",
+            "vorbis:FOO",
+            "vorbis:BAR",
+            "vorbis:ENCODER",
+            "vorbis:LOOPSTART",
+            "vorbis:A=B",
+            "vorbis:",
+            "riff:ISBJ",
+        ];
+        let values = ["", "x", "a=b=c", "効果音", " sp "];
+        let mut r = crate::determinism::rng(0x76);
+        for case in 0..500 {
+            let mut meta = AudioMeta::default();
+            for _ in 0..(r.next_u32() % 6) {
+                let name = names[r.next_u32() as usize % names.len()];
+                let value = values[r.next_u32() as usize % values.len()];
+                meta.tags.insert(name.to_string(), value.to_string());
+                // 大文字の項目があるときだけ、小文字の別名を足す
+                if r.next_u32().is_multiple_of(3)
+                    && let Some(key) = name.strip_prefix("vorbis:")
+                    && !key.is_empty()
+                    && !matches!(key, "DESCRIPTION")
+                {
+                    meta.tags
+                        .insert(format!("vorbis:{}", key.to_ascii_lowercase()), "low".into());
+                }
+            }
+            // 既知の名前の別名（vorbis:TITLE・vorbis:DESCRIPTION・vorbis:cprt など）は、既知の名前があるときだけ残す（別名
+            // だけだと、読み直すと既知の名前になり、書き直すと並び（と DESCRIPTION・cprt の名前）が変わる。値は保たれる）
+            let has = meta.tags.clone();
+            meta.tags.retain(|k, _| {
+                let Some(key) = k.strip_prefix("vorbis:") else {
+                    return true;
+                };
+                let known = match (key.to_ascii_uppercase().as_str(), key) {
+                    ("TITLE", _) => "title",
+                    ("ARTIST", _) => "artist",
+                    ("COMMENT" | "DESCRIPTION", _) => "comment",
+                    ("DATE", _) => "date",
+                    ("COPYRIGHT", _) | (_, "cprt") => "copyright",
+                    _ => return true,
+                };
+                has.contains_key(known)
+            });
+            let frames = u64::from(r.next_u32() % 100);
+            let (s, e) = (u64::from(r.next_u32() % 120), u64::from(r.next_u32() % 120));
+            meta.loop_range = r
+                .next_u32()
+                .is_multiple_of(2)
+                .then_some(LoopRange { start: s, end: e });
+            let first = vorbis_comments_for(&meta, frames);
+            let back = meta_from_tags(&first, frames, true, &Limits::default());
+            let again = vorbis_comments_for(&back, frames);
+            assert_eq!(again, first, "{case}: {meta:?}");
+            assert_eq!(
+                back.loop_range,
+                writable_loop(meta.loop_range, frames),
+                "{case}"
+            );
+        }
     }
 }

@@ -5,7 +5,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-license.workspace = true
+# codec/vorbis/ は aoTuV・libvorbis（BSD-3-Clause）を移したもの（ADR-149。表示は src/codec/vorbis/LICENSE）。
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
 repository.workspace = true
 
 # 結果に効く依存は `=` で版を固定する（docs/editing.md §8.2、ADR-136）。上げるのはゴールデンが通るときだけ。
@@ -24,6 +25,8 @@ repository.workspace = true
 #   feature（opt-simd の rustfft は AAC・Vorbis の値を変える）と id3v2（スタックのあふれ #562）を入れない
 # - nanomp3：MP3 の読み取り（minimp3 とビット一致の純 Rust。libm を使わない）。SIMD（wide）は外す
 # - md-5：FLAC の STREAMINFO の MD5（入力の標本だけで決まる）
+# - vorbis-tables：Ogg Vorbis の書き出しの表（aoTuV b6.03 から生成してコミットしたもの。ワークスペースの中のクレート。
+#   中身を変えるとテストの凍結した値が合わなくなり、エンコーダの版を上げる）
 # serde_json は固定しない：正規の JSON は自前で書き（digest.rs）、読み込みは float_roundtrip で正しく丸めるので、結果は版によらない。
 [dependencies]
 blake3 = { version = "=1.8.7", features = ["rayon"] }
@@ -48,11 +51,14 @@ symphonia-core = { version = "=0.6.1", default-features = false }
 symphonia-format-isomp4 = { version = "=0.6.1", default-features = false }
 symphonia-format-ogg = { version = "=0.6.1", default-features = false }
 thiserror.workspace = true
+vorbis-tables.workspace = true
 zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # asefile：aseprite の合成の照合相手（Aseprite の blend_funcs.cpp の移植。tests/aseprite_ref.rs）
 asefile = "=0.3.8"
+# lewton：Ogg Vorbis の独立したデコーダ（E28 で自作のエンコーダの出力を読む。純 Rust。ogg・非同期の feature は入れない）
+lewton = { version = "=0.10.2", default-features = false }
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 proptest.workspace = true
 

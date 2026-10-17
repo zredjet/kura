@@ -3,6 +3,9 @@
 //! - ファイルは `goldens-codecs/<コーデックの ID の / を @ にしたもの>.jsonl`。ID は読み取り（`-dec`）と書き出し（`-enc`）で別。
 //!   - `png-rs-enc@1.jsonl`：1 行に `{"decoder","file","format","input","name","options","value"}`。
 //!     file は書いたバイト列のダイジェスト、value はそれを `decoder` で読み直した値のダイジェスト。
+//!     読み直しのデコーダが値の再現を約束しない（`reproducible()` が偽。symphonia の Vorbis など）行は value を書かず、
+//!     書いたバイト列（file）と、読み直した形（長さ・レート・チャンネル）が元の値と同じことだけを照らす。値を持たないのに
+//!     読み直しのデコーダが再現できる行、値を持つのに再現できない行は失敗にする。
 //!   - `png-rs-dec@1.jsonl`：1 行に `{"name","source","value"}`。下の層で組んだファイル（source）を読んだ値のダイジェスト。
 //! - **追記だけ**（scripts/check-goldens-append-only.sh が見る）。
 //!   - 書くバイト列が変わったら、エンコーダの約束の版を上げる（`-enc/1` → `-enc/2`）。旧版のエンコーダは残さなくてよい
@@ -42,7 +45,9 @@ struct Line {
     file: String,
     /// 読み直したデコーダ（`value` はこのデコーダで照らす）。
     decoder: String,
-    value: String,
+    /// 読み直した値のダイジェスト。`decoder` が値の再現を約束しないときは持たない（形だけを照らす）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
 }
 
 /// 例：（名前、形式、設定、入力の作り方）。例は消さない・変えない（新しい名前で足す）。
@@ -402,6 +407,195 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
             },
         ));
     }
+    // 段 7：Ogg Vorbis（自作の書き出し）。読み直しのデコーダ（symphonia の Vorbis）は値の再現を約束しないので、
+    // 行は value を持たず、書いたバイト列と読み直した形（長さ・レート・チャンネル）だけを照らす
+    let sine = |rate, channels, frames| InputGen::Sine {
+        rate,
+        channels,
+        frames,
+        freq: 440,
+        loop_range: None,
+    };
+    let audio_noise = |rate, channels, frames, seed| InputGen::AudioNoise {
+        rate,
+        channels,
+        frames,
+        seed,
+    };
+    for (name, options, input) in [
+        ("ogg-sine-44k-stereo", json!({}), sine(44_100, 2, 30_000)),
+        (
+            "ogg-noise-48k-mono-q0",
+            json!({ "quality": 0 }),
+            audio_noise(48_000, 1, 20_000, 50),
+        ),
+        (
+            "ogg-noise-8k-mono-qm1",
+            json!({ "quality": -1 }),
+            audio_noise(8_000, 1, 9_000, 51),
+        ),
+        (
+            "ogg-sine-22k-stereo-q10",
+            json!({ "quality": 10 }),
+            sine(22_050, 2, 15_000),
+        ),
+        (
+            "ogg-noise-96k-stereo-q5",
+            json!({ "quality": 5 }),
+            audio_noise(96_000, 2, 20_000, 52),
+        ),
+        ("ogg-sine-44k-3ch", json!({}), sine(44_100, 3, 12_000)),
+        (
+            "ogg-noise-48k-6ch-q3",
+            json!({ "quality": 3 }),
+            audio_noise(48_000, 6, 10_000, 53),
+        ),
+        (
+            "ogg-meta-loop-tags",
+            json!({ "quality": 4 }),
+            InputGen::WithMeta {
+                base: Box::new(sine(44_100, 2, 20_000)),
+                meta: MetaGen {
+                    loop_range: Some(LoopRange {
+                        start: 1_000,
+                        end: 15_000,
+                    }),
+                    tags: vec![
+                        ("title".into(), "効果音".into()),
+                        ("artist".into(), "kura".into()),
+                    ],
+                    ..MetaGen::default()
+                },
+            },
+        ),
+        ("ogg-noise-short", json!({}), audio_noise(44_100, 2, 37, 54)),
+        ("ogg-empty", json!({}), audio_noise(44_100, 1, 0, 55)),
+    ] {
+        v.push((name, "ogg", options, input));
+    }
+    // 段 7 の検証で足した行：エンコーダの 16 のテンプレート（8 つのレートの族 × stereo・uncoupled）と 9 つのレートの
+    // stereo・uncoupled（`ogg_templates_are_covered` が確かめる）、4・5・7・8 チャンネル、品質の端（−1・10）、26 kHz 以上の
+    // 衝撃の入力（短い窓と aoTuV の M3）、44.1 kHz・品質 0 の衝撃の入力（aoTuV の M2）、だんだん大きくなるトーン（aoTuV の
+    // M9）。
+    // CI は照合用の C を持たないので、書くバイト列の変化に気づけるのはここだけ（ほかの設定はテストが値の近さしか見ない）
+    let bursts = |rate: u32, channels, frames, seed| InputGen::Bursts {
+        rate,
+        channels,
+        frames,
+        period: u64::from(rate / 8),
+        seed,
+    };
+    // だんだん大きくなるトーン（0.5 秒。stereo の長い窓で、前のブロックより大きくなる。aoTuV の M9 の epeak が point stereo の
+    // 域で効く。周波数と大きさは、M9 を切る変更と閾値（1 dB）を変える変更でバイト列が変わるものを選んだ）
+    let swell = |rate: u32, freqs: &[u32], from_db, to_db| InputGen::Swell {
+        rate,
+        channels: 2,
+        frames: u64::from(rate / 2),
+        freqs: freqs.to_vec(),
+        from_db,
+        to_db,
+    };
+    for (name, quality, input) in [
+        (
+            "ogg-noise-8k-stereo-q2",
+            2,
+            audio_noise(8_000, 2, 4_000, 60),
+        ),
+        (
+            "ogg-noise-11k-stereo-q10",
+            10,
+            audio_noise(11_025, 2, 4_000, 61),
+        ),
+        (
+            "ogg-noise-11k-mono-q1",
+            1,
+            audio_noise(11_025, 1, 4_000, 62),
+        ),
+        (
+            "ogg-noise-16k-stereo-qm1",
+            -1,
+            audio_noise(16_000, 2, 6_000, 63),
+        ),
+        ("ogg-noise-16k-4ch-q6", 6, audio_noise(16_000, 4, 4_000, 64)),
+        (
+            "ogg-noise-22k-mono-q7",
+            7,
+            audio_noise(22_050, 1, 6_000, 65),
+        ),
+        ("ogg-noise-22k-5ch-q2", 2, audio_noise(22_050, 5, 4_000, 66)),
+        (
+            "ogg-noise-32k-stereo-q4",
+            4,
+            audio_noise(32_000, 2, 8_000, 67),
+        ),
+        (
+            "ogg-noise-32k-mono-q8",
+            8,
+            audio_noise(32_000, 1, 8_000, 68),
+        ),
+        (
+            "ogg-noise-44k-stereo-qm1",
+            -1,
+            audio_noise(44_100, 2, 6_000, 69),
+        ),
+        (
+            "ogg-noise-44k-stereo-q10",
+            10,
+            audio_noise(44_100, 2, 6_000, 70),
+        ),
+        ("ogg-noise-44k-7ch-q1", 1, audio_noise(44_100, 7, 4_000, 71)),
+        (
+            "ogg-noise-48k-stereo-q9",
+            9,
+            audio_noise(48_000, 2, 8_000, 72),
+        ),
+        (
+            "ogg-noise-96k-mono-q6",
+            6,
+            audio_noise(96_000, 1, 10_000, 73),
+        ),
+        (
+            "ogg-noise-192k-stereo-q10",
+            10,
+            audio_noise(192_000, 2, 12_000, 74),
+        ),
+        (
+            "ogg-noise-192k-8ch-qm1",
+            -1,
+            audio_noise(192_000, 8, 6_000, 75),
+        ),
+        ("ogg-bursts-48k-stereo-q0", 0, bursts(48_000, 2, 24_000, 76)),
+        ("ogg-bursts-32k-mono-qm1", -1, bursts(32_000, 1, 16_000, 77)),
+        ("ogg-bursts-96k-3ch-q5", 5, bursts(96_000, 3, 36_000, 78)),
+        (
+            "ogg-swell-32k-stereo-qm1",
+            -1,
+            swell(32_000, &[2_000, 6_000, 10_000], -50, -3),
+        ),
+        (
+            "ogg-swell-44k-stereo-qm1",
+            -1,
+            swell(44_100, &[9_000, 12_000], -40, -10),
+        ),
+        (
+            "ogg-swell-48k-stereo-q0",
+            0,
+            swell(48_000, &[2_000, 6_000, 10_000], -50, -3),
+        ),
+        (
+            "ogg-swell-96k-stereo-q0",
+            0,
+            swell(96_000, &[9_000, 12_000], -30, -3),
+        ),
+        // aoTuV の M2（後エコーの補正）に届く衝撃の入力。M2 の上限（`poste` と `no1 + 30` の 30 dB）を変える変更、M2 を
+        // 切る変更、npeak を −1 にしない変更のどれでもバイト列が変わる行を選んだ（上の 3 つの衝撃の行は M2 の変更で
+        // 変わらない。届くかはレート・品質・種による）。M2 の前の判定（`postnoise_detection` の閾値）を変える変更では、
+        // どの行も変わらない
+        ("ogg-bursts-44k-mono-q0", 0, bursts(44_100, 1, 22_050, 79)),
+        ("ogg-bursts-44k-stereo-q0", 0, bursts(44_100, 2, 22_050, 80)),
+    ] {
+        v.push((name, "ogg", json!({ "quality": quality }), input));
+    }
     v
 }
 
@@ -465,6 +659,16 @@ fn decode_value(
     bytes: &[u8],
     format: &str,
 ) -> Result<String, String> {
+    decode_stamped(codecs, decoder, bytes, format).map(|(_, stamp)| stamp.value_digest.to_hex())
+}
+
+/// 識別子のデコーダで読み、値と記録を返す。
+fn decode_stamped(
+    codecs: &CodecSet,
+    decoder: &str,
+    bytes: &[u8],
+    format: &str,
+) -> Result<(kura_engine::Value, kura_engine::codec::DecodeStamp), String> {
     codecs
         .decode_with(
             decoder,
@@ -474,8 +678,62 @@ fn decode_value(
             &Limits::default(),
             &NoMonitor,
         )
-        .map(|(_, stamp)| stamp.value_digest.to_hex())
         .map_err(|e| e.to_string())
+}
+
+/// 凍結した行の読み直しを、凍結したときのデコーダ（旧版を含む）で照らす。値を持つ行は値のダイジェストを、持たない行
+/// （デコーダが値の再現を約束しない）は読み直した形が元の値の形（長さ・レート・チャンネル）と同じことを照らす。
+fn check_reread(
+    codecs: &CodecSet,
+    key: &str,
+    old: &Line,
+    bytes: &[u8],
+    want_shape: &kura_engine::Shape,
+    failures: &mut String,
+) {
+    let (name, decoder) = (&old.name, &old.decoder);
+    let (back, stamp) = match decode_stamped(codecs, decoder, bytes, &old.format) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(
+                failures,
+                "{key} {name}：凍結したときのデコーダ {decoder} で読めません（旧版のデコーダを残す）: {e}"
+            );
+            return;
+        }
+    };
+    match (&old.value, stamp.reproducible) {
+        (Some(want), true) => {
+            let got = stamp.value_digest.to_hex();
+            if &got != want {
+                let _ = writeln!(
+                    failures,
+                    "{key} {name}：{decoder} で読み直した値が凍結した値と違う（{want} → {got}）。読む値は変えない（変えるならデコーダの版を上げて旧版を残す）"
+                );
+            }
+        }
+        (Some(_), false) => {
+            let _ = writeln!(
+                failures,
+                "{key} {name}：{decoder} は値の再現を約束しないので、読み直した値（value）を凍結できません"
+            );
+        }
+        (None, true) => {
+            let _ = writeln!(
+                failures,
+                "{key} {name}：{decoder} は値を再現できるのに、行が読み直した値（value）を持っていません"
+            );
+        }
+        (None, false) => {
+            if &back.shape() != want_shape {
+                let _ = writeln!(
+                    failures,
+                    "{key} {name}：{decoder} で読み直した形が元の値と違う（{want_shape:?} → {:?}）",
+                    back.shape()
+                );
+            }
+        }
+    }
 }
 
 /// 同じ名前の行が 2 つあれば失敗に足す。
@@ -532,7 +790,7 @@ fn codec_goldens_match_and_are_complete() {
         };
         assert_eq!(back.kind(), value.kind(), "{name}");
         assert_eq!(size(&back.shape()), size(&value.shape()), "{name}");
-        if matches!(format, "png" | "wav" | "aiff" | "flac") {
+        if matches!(format, "png" | "wav" | "aiff" | "flac" | "ogg") {
             assert_eq!(back.shape(), value.shape(), "{name}");
         }
         let file = Hasher::new("kura-file-v1")
@@ -546,7 +804,8 @@ fn codec_goldens_match_and_are_complete() {
             input,
             file,
             decoder: dstamp.codec.clone(),
-            value: dstamp.value_digest.to_hex(),
+            // 値を再現できないデコーダで読み直す行は、値を書かない（形だけを照らす）
+            value: dstamp.reproducible.then(|| dstamp.value_digest.to_hex()),
         };
         match frozen
             .get(&key)
@@ -570,23 +829,7 @@ fn codec_goldens_match_and_are_complete() {
                 );
             }
             // 読み直しは、凍結したときのデコーダ（旧版を含む）で照らす
-            Some(old) => match decode_value(&codecs, &old.decoder, &bytes, format) {
-                Ok(v) if v == old.value => {}
-                Ok(v) => {
-                    let _ = writeln!(
-                        failures,
-                        "{key} {name}：{} で読み直した値が凍結した値と違う（{} → {v}）。読む値は変えない（変えるならデコーダの版を上げて旧版を残す）",
-                        old.decoder, old.value
-                    );
-                }
-                Err(e) => {
-                    let _ = writeln!(
-                        failures,
-                        "{key} {name}：凍結したときのデコーダ {} で読めません（旧版のデコーダを残す）: {e}",
-                        old.decoder
-                    );
-                }
-            },
+            Some(old) => check_reread(&codecs, &key, old, &bytes, &value.shape(), &mut failures),
             None => {
                 let text = String::from_utf8(canonical(&line).unwrap()).unwrap();
                 to_append.entry(key).or_default().push_str(&(text + "\n"));
@@ -621,6 +864,127 @@ fn codec_goldens_match_and_are_complete() {
         }
     }
     assert!(failures.is_empty(), "\n{failures}");
+}
+
+/// Ogg Vorbis のエンコーダ（aoTuV の `setup_list`。kura の範囲で選ばれる 16 個）のテンプレートの名前：レートの範囲
+/// （`samplerate_min_restriction`〜`max` の両端を含む。表の先頭（48・44・32・22・16・11・8・X の順）から最初に合うもの
+/// なので、境目のレートは前の族になる）とチャンネル（2 は stereo、ほかは uncoupled）から。8 kHz 以下の XX は、8 kHz の
+/// テンプレートと品質の範囲が同じなので選ばれない。
+fn ogg_template(rate: u32, channels: usize) -> String {
+    let family = match rate {
+        45_000..=50_000 => "48",
+        40_000..=44_999 => "44",
+        26_000..=39_999 => "32",
+        19_000..=25_999 => "22",
+        15_000..=18_999 => "16",
+        9_000..=14_999 => "11",
+        8_000..=8_999 => "8",
+        _ => "X",
+    };
+    let coupling = if channels == 2 { "stereo" } else { "uncoupled" };
+    format!("{family}_{coupling}")
+}
+
+/// コーデックのゴールデンの `ogg-vorbis-kura-enc/1` の行が、エンコーダの書き方の分かれ目を覆う（抜けたら落ちる。
+/// 照合用の C のない CI で、書くバイト列の変化に気づくため）：16 のテンプレート（8 つのレートの族 ×
+/// stereo・uncoupled）と 9 つのレート（X は 96・192 kHz）の stereo・uncoupled、1〜8 チャンネル、品質 −1 と 10、
+/// 26 kHz 以上の衝撃の入力（`bursts`。stereo と uncoupled。aoTuV の M3）、44.1 kHz・品質 0 の衝撃の入力（stereo と
+/// uncoupled。aoTuV の M2。M2 の変更でバイト列が変わることを確かめた行）、26 kHz 以上の stereo の低い品質のだんだん大きく
+/// なるトーン（`swell`。aoTuV の M9 の epeak は point stereo の域でだけ効く）。
+#[test]
+fn ogg_templates_are_covered() {
+    let dir = read_dir();
+    let (path, text) = dir
+        .get(&(Kind::Enc, "ogg-vorbis-kura-enc/1".to_string()))
+        .expect("ogg-vorbis-kura-enc@1.jsonl がありません");
+    let lines: Vec<Line> = parse(path, text);
+    let mut templates = BTreeMap::new();
+    let mut rates = BTreeMap::new();
+    let mut channels = BTreeMap::new();
+    let mut qualities = BTreeMap::new();
+    let mut bursts = BTreeMap::new();
+    let mut m2_bursts = BTreeMap::new();
+    let mut swells = 0;
+    for l in &lines {
+        let kura_engine::Value::Audio(a) = l.input.generate().unwrap() else {
+            panic!("{}：音声ではありません", l.name);
+        };
+        let (rate, ch) = (a.rate(), a.channels());
+        let q = l
+            .options
+            .get("quality")
+            .and_then(|q| q.as_i64())
+            .unwrap_or(5);
+        let coupling = if ch == 2 { "stereo" } else { "uncoupled" };
+        templates.insert(ogg_template(rate, ch), ());
+        rates.insert((rate, coupling), ());
+        channels.insert(ch, ());
+        qualities.insert(q, ());
+        if matches!(l.input, InputGen::Bursts { .. }) && rate >= 26_000 && a.frames() > 0 {
+            bursts.insert(coupling, ());
+        }
+        if matches!(l.input, InputGen::Bursts { .. }) && rate == 44_100 && q == 0 && a.frames() > 0
+        {
+            m2_bursts.insert(coupling, ());
+        }
+        if matches!(l.input, InputGen::Swell { .. }) && rate >= 26_000 && ch == 2 && q <= 0 {
+            swells += 1;
+        }
+    }
+    let mut missing = Vec::new();
+    for family in ["8", "11", "16", "22", "32", "44", "48", "X"] {
+        for coupling in ["stereo", "uncoupled"] {
+            let t = format!("{family}_{coupling}");
+            if !templates.contains_key(&t) {
+                missing.push(format!("テンプレート {t}"));
+            }
+        }
+    }
+    for rate in [
+        8_000u32, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000, 192_000,
+    ] {
+        for coupling in ["stereo", "uncoupled"] {
+            if !rates.contains_key(&(rate, coupling)) {
+                missing.push(format!("{rate} Hz の {coupling}"));
+            }
+        }
+    }
+    for ch in 1..=8usize {
+        if !channels.contains_key(&ch) {
+            missing.push(format!("{ch} チャンネル"));
+        }
+    }
+    for q in [-1i64, 10] {
+        if !qualities.contains_key(&q) {
+            missing.push(format!("品質 {q}"));
+        }
+    }
+    for coupling in ["stereo", "uncoupled"] {
+        if !bursts.contains_key(coupling) {
+            missing.push(format!("26 kHz 以上の衝撃の入力（{coupling}）"));
+        }
+        if !m2_bursts.contains_key(coupling) {
+            missing.push(format!(
+                "44.1 kHz・品質 0 の衝撃の入力（aoTuV の M2。{coupling}）"
+            ));
+        }
+    }
+    if swells == 0 {
+        missing.push("26 kHz 以上・stereo・品質 0 以下のだんだん大きくなるトーン".into());
+    }
+    assert!(
+        missing.is_empty(),
+        "ogg-vorbis-kura-enc@1.jsonl に行がありません（新しい名前の行を足す）: {missing:?}"
+    );
+    // テンプレートの表の端（範囲の境目と kura の範囲の端）
+    assert_eq!(ogg_template(8_000, 1), "8_uncoupled");
+    assert_eq!(ogg_template(9_000, 2), "11_stereo");
+    assert_eq!(ogg_template(26_000, 2), "32_stereo");
+    assert_eq!(ogg_template(40_000, 2), "44_stereo");
+    assert_eq!(ogg_template(45_000, 2), "48_stereo");
+    assert_eq!(ogg_template(50_000, 1), "48_uncoupled");
+    assert_eq!(ogg_template(50_001, 3), "X_uncoupled");
+    assert_eq!(ogg_template(192_000, 8), "X_uncoupled");
 }
 
 /// 読み取りだけの例：（名前、作り方）。自前のエンコーダが書かない形を、下の層で組んだファイルから読む（R1 のうちデコーダだけの経路）。

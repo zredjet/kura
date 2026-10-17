@@ -728,7 +728,7 @@ impl Encoder for FlacCodec {
         for b in digest.iter() {
             si.put(u64::from(*b), 8);
         }
-        let comments = symph::vorbis_comments(&a.meta);
+        let comments = symph::vorbis_comments_for(&a.meta, total64);
         let mut head = b"fLaC".to_vec();
         meta_block(comments.is_empty(), 0, &si.buf, &mut head)?;
         if !comments.is_empty() {

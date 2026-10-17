@@ -229,6 +229,473 @@ pub fn fuzz_decode(format: &str, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// 書き出しのファズの見出しの大きさ（設定を決める先頭のバイト）。並びは [`fuzz_encode`] の説明のとおり。
+pub const FUZZ_ENCODE_HEADER: usize = 19;
+
+/// 書き出しのファズで試すサンプルレート（範囲の端と外を含む。7,999・192,001 は書けない）。
+const FUZZ_ENCODE_RATES: [u32; 20] = [
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 50_000, 64_000, 88_200,
+    96_000, 176_400, 192_000, 9_999, 26_000, 49_999, 7_999, 192_001,
+];
+
+/// 書き出しのファズの長さの上限（フレーム。1 回を速くする）。
+const FUZZ_ENCODE_MAX_FRAMES: u64 = 16_384;
+
+/// 書き出しのファズのタグの数の上限（見出しに 2 バイトずつ置く）。
+const FUZZ_ENCODE_MAX_TAGS: usize = 4;
+
+/// 書き出しのファズで試すタグの名前：既知の名前、その別名（大文字・小文字・DESCRIPTION・小文字ちょうどの `cprt`）、
+/// 同じ名前の大文字と小文字（読み取りが別の名前にする `CPRT` と `cprt` を含む）、ENCODER・ループの名前、書けない名前
+/// （`=`・空・ASCII の外）、書かない名前（`vorbis:` でない）。新しい名前は末尾に足す（種の番号の意味を変えない）。
+const FUZZ_TAG_KEYS: [&str; 30] = [
+    "title",
+    "artist",
+    "album",
+    "comment",
+    "date",
+    "genre",
+    "copyright",
+    "vorbis:TITLE",
+    "vorbis:title",
+    "vorbis:ARTIST",
+    "vorbis:DESCRIPTION",
+    "vorbis:description",
+    "vorbis:COMMENT",
+    "vorbis:FOO",
+    "vorbis:foo",
+    "vorbis:Foo",
+    "vorbis:ENCODER",
+    "vorbis:encoder",
+    "vorbis:LOOPSTART",
+    "vorbis:looplength",
+    "vorbis:A=B",
+    "vorbis:",
+    "vorbis:KEY WITH SPACE",
+    "vorbis:\u{e9}",
+    "vorbis:~",
+    "riff:ISBJ",
+    "aiff:NAME",
+    "Title",
+    "vorbis:cprt",
+    "vorbis:CPRT",
+];
+
+/// 書き出しのファズで試すタグの値の数（[`fuzz_tag_value`] の番号の範囲）。
+const FUZZ_TAG_VALUES: usize = 13;
+
+/// 書き出しのファズで試すタグの値：空・`=` を含む・非 ASCII・NUL・前後の空白、読み取りの上限（4,096 バイト）の前後と、
+/// 切り詰めが文字の途中・空白の直後に来る長い値、とても長い値。
+fn fuzz_tag_value(i: usize) -> String {
+    match i % FUZZ_TAG_VALUES {
+        0 => String::new(),
+        1 => "x".into(),
+        2 => "a=b".into(),
+        3 => "=".into(),
+        4 => "効果音".into(),
+        5 => "LOOPSTART=1".into(),
+        6 => " sp ".into(),
+        7 => "\u{0}".into(),
+        8 => "あ".repeat(1_400),
+        9 => "é ".repeat(2_048),
+        10 => "a".repeat(4_096),
+        11 => "a".repeat(4_097),
+        _ => "x".repeat(70_000),
+    }
+}
+
+/// 書き出しのファズのメタデータ（見出しの 5〜18 バイト目）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FuzzEncodeMeta {
+    /// ループ点の形：0 なし、1 は (a, b)、2 は (u64::MAX − a, b)、3 は (a, u64::MAX − b)（4 以上は 4 の余り）。
+    pub loop_mode: u8,
+    /// ループ点の a（見出しの 6〜7 バイト目）。
+    pub loop_a: u16,
+    /// ループ点の b（見出しの 8〜9 バイト目）。
+    pub loop_b: u16,
+    /// タグ：（名前の番号, 値の番号）。4 つまで（5 つめからは書かない）。
+    pub tags: Vec<(u8, u8)>,
+}
+
+/// 書き出しのファズの入力を、見出しと標本から組む（種を作るときに使う）。`quality` は −1〜10、`rate` は
+/// [`FUZZ_ENCODE_RATES`] の番号、`channels` は 1〜9、`frames` は 16,384 まで（大きいものは余りにされる）。メタデータはなし。
+pub fn fuzz_encode_input(
+    quality: i64,
+    rate: u8,
+    channels: u8,
+    frames: u16,
+    samples: &[f32],
+) -> Vec<u8> {
+    fuzz_encode_input_meta(
+        quality,
+        rate,
+        channels,
+        frames,
+        &FuzzEncodeMeta::default(),
+        samples,
+    )
+}
+
+/// [`fuzz_encode_input`] にメタデータ（ループ点・タグ）を付けたもの。
+pub fn fuzz_encode_input_meta(
+    quality: i64,
+    rate: u8,
+    channels: u8,
+    frames: u16,
+    meta: &FuzzEncodeMeta,
+    samples: &[f32],
+) -> Vec<u8> {
+    let q = u8::try_from(quality.saturating_add(1).clamp(0, 11)).unwrap_or(0);
+    let mut out = vec![q, rate, channels.saturating_sub(1)];
+    out.extend_from_slice(&frames.to_le_bytes());
+    out.push(meta.loop_mode);
+    out.extend_from_slice(&meta.loop_a.to_le_bytes());
+    out.extend_from_slice(&meta.loop_b.to_le_bytes());
+    let tags = &meta.tags[..meta.tags.len().min(FUZZ_ENCODE_MAX_TAGS)];
+    out.push(u8::try_from(tags.len()).unwrap_or(0));
+    for i in 0..FUZZ_ENCODE_MAX_TAGS {
+        let (k, v) = tags.get(i).copied().unwrap_or((0, 0));
+        out.extend_from_slice(&[k, v]);
+    }
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// 見出しの 5〜18 バイト目から、入力の値に付けるメタデータを作る。
+fn fuzz_meta_of(byte: &dyn Fn(usize) -> u8) -> crate::value::AudioMeta {
+    use crate::value::{AudioMeta, LoopRange};
+    let word = |i: usize| u64::from(u16::from_le_bytes([byte(i), byte(i + 1)]));
+    let (a, b) = (word(6), word(8));
+    let loop_range = match byte(5) % 4 {
+        0 => None,
+        1 => Some((a, b)),
+        2 => Some((u64::MAX - a, b)),
+        _ => Some((a, u64::MAX - b)),
+    }
+    .map(|(start, end)| LoopRange { start, end });
+    let mut meta = AudioMeta {
+        loop_range,
+        ..AudioMeta::default()
+    };
+    for t in 0..usize::from(byte(10)) % (FUZZ_ENCODE_MAX_TAGS + 1) {
+        let key = FUZZ_TAG_KEYS[usize::from(byte(11 + 2 * t)) % FUZZ_TAG_KEYS.len()];
+        meta.tags.insert(
+            key.to_string(),
+            fuzz_tag_value(usize::from(byte(12 + 2 * t))),
+        );
+    }
+    meta
+}
+
+/// `p` の `pos` から `len` バイトを取って `pos` を進める（足りなければ `Err`）。
+fn take<'a>(p: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], String> {
+    let end = pos
+        .checked_add(len)
+        .ok_or("コメントヘッダの長さがあふれます")?;
+    let s = p
+        .get(*pos..end)
+        .ok_or("コメントヘッダが途中で切れています")?;
+    *pos = end;
+    Ok(s)
+}
+
+/// `p` の `pos` から小さいエンディアンの u32 を取る。
+fn take_u32(p: &[u8], pos: &mut usize) -> Result<usize, String> {
+    let b = take(p, pos, 4)?;
+    usize::try_from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])).map_err(|e| e.to_string())
+}
+
+/// Ogg Vorbis のコメントヘッダ（2 つめのパケット）の項目を、書いたバイト列から読む（Vorbis I §5.2.1。ページは RFC 3533）。
+/// 項目は最初の `=` で名前と値に分ける。形が違えば `Err`。
+fn ogg_comment_entries(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    // 最初の 2 つのパケット
+    let mut packets: Vec<Vec<u8>> = Vec::new();
+    let mut cur = Vec::new();
+    let mut at = 0usize;
+    'pages: while at < bytes.len() && packets.len() < 2 {
+        let head = bytes
+            .get(at..at + 27)
+            .ok_or("ページの見出しが途中で切れています")?;
+        if &head[..4] != b"OggS" {
+            return Err(format!("ページの印がありません（{at}）"));
+        }
+        let n = usize::from(head[26]);
+        let lacing = bytes
+            .get(at + 27..at + 27 + n)
+            .ok_or("lacing が途中で切れています")?;
+        let mut off = at + 27 + n;
+        for &l in lacing {
+            let seg = bytes
+                .get(off..off + usize::from(l))
+                .ok_or("ページの本体が途中で切れています")?;
+            cur.extend_from_slice(seg);
+            off += usize::from(l);
+            if l < 255 {
+                packets.push(std::mem::take(&mut cur));
+                if packets.len() == 2 {
+                    break 'pages;
+                }
+            }
+        }
+        at = off;
+    }
+    let p = packets.get(1).ok_or("コメントヘッダがありません")?;
+    if p.get(..7) != Some(b"\x03vorbis".as_slice()) {
+        return Err("コメントヘッダの印がありません".into());
+    }
+    let mut pos = 7usize;
+    let vendor = take_u32(p, &mut pos)?;
+    take(p, &mut pos, vendor)?;
+    let count = take_u32(p, &mut pos)?;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let len = take_u32(p, &mut pos)?;
+        let entry = std::str::from_utf8(take(p, &mut pos, len)?)
+            .map_err(|e| format!("コメントが UTF-8 でない: {e}"))?;
+        let (k, v) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("コメントに = がありません: {entry:?}"))?;
+        out.push((k.to_string(), v.to_string()));
+    }
+    if take(p, &mut pos, 1)? != [1] {
+        return Err("コメントヘッダの framing bit がありません".into());
+    }
+    Ok(out)
+}
+
+/// エラーの文に載せるコメントの並び（長い値は先頭 32 文字とバイト数だけ）。
+fn show_comments(entries: &[(String, String)]) -> String {
+    let items: Vec<String> = entries
+        .iter()
+        .map(|(k, v)| {
+            if v.chars().count() > 32 {
+                let head: String = v.chars().take(32).collect();
+                format!("{k}={head:?}…（{} バイト）", v.len())
+            } else {
+                format!("{k}={v:?}")
+            }
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// コメントの名前を、読み取りが同じものとみなす形にする：読み取りの表（`codec::symph::comment_name`）が付ける kura の
+/// 名前（大文字と小文字だけの違い・DESCRIPTION と COMMENT・小文字ちょうどの `cprt` と COPYRIGHT は同じ名前になる）。
+/// ループ点の名前と、読み取りがタグにしない名前は大文字にしたもの。
+fn same_tag_name(name: &str) -> String {
+    use crate::codec::symph::{CommentName, comment_name};
+    match comment_name(name, true) {
+        Some(CommentName::Tag(n)) => n,
+        _ => name.to_ascii_uppercase(),
+    }
+}
+
+/// 書いたコメントの、ENCODER を除いた（読み取りが同じとみなす名前, 値）を並べたもの。
+fn comment_set(entries: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = entries
+        .iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("ENCODER"))
+        .map(|(k, v)| (same_tag_name(k), v.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// ファズの対象（`fuzz/` の cargo-fuzz と `tests/fuzz_smoke.rs` が使う）：自前のエンコーダの書き出し（今は `ogg` だけ）。
+///
+/// 先頭の [`FUZZ_ENCODE_HEADER`] バイトで設定とメタデータを決める（足りない見出しは 0 で埋める）：
+///
+/// | バイト | 意味 |
+/// |---|---|
+/// | 0 | 品質（12 の余り − 1：−1〜10） |
+/// | 1 | レート（[`FUZZ_ENCODE_RATES`] の番号。範囲の外を含む） |
+/// | 2 | チャンネル（9 の余り + 1：1〜9） |
+/// | 3〜4 | 長さ（u16、16,385 の余り：0〜16,384 フレーム） |
+/// | 5 | ループ点の形（4 の余り。0 なし・1 (a, b)・2 (u64::MAX − a, b)・3 (a, u64::MAX − b)） |
+/// | 6〜7・8〜9 | ループ点の a・b（u16。長さの外・長さ 0・逆向きも作る） |
+/// | 10 | タグの数（5 の余り：0〜4） |
+/// | 11〜18 | タグ 4 つ分の（名前の番号, 値の番号）（`FUZZ_TAG_KEYS`・`fuzz_tag_value`。重複する名前・長い値・`=` を含む値） |
+///
+/// 残りを f32 のビット列（小さいエンディアン。NaN・∞・非正規化数・巨大な値を含む）として、インターリーブの標本を順に
+/// 繰り返して埋める。`catch_own_panic` の中で書き、すべてのデコーダ（旧版を含む）で読み直して、長さ・レート・チャンネルが
+/// 元と同じかを確かめる。メタデータは、書いたコメントヘッダを読んで次を確かめる：LOOPSTART・LOOPLENGTH は
+/// `start < end ≤ 長さ` のときだけ正しい値で書く、読み取りが同じタグにまとめる名前（大文字と小文字だけの違い・
+/// DESCRIPTION と COMMENT・小文字ちょうどの `cprt` と COPYRIGHT）が重複しない、ENCODER は `ogg-vorbis-kura-enc/1` が
+/// 1 つだけ、読み直したループ点は書いたものと同じ、読み直したタグを書き直したときのコメントが書いたものと同じ（読み取りが
+/// 同じタグにまとめる名前の違いを除いて）。
+/// 見つけたいもの（自前のコードの panic・`Internal`・書けると答えた形を断る・書けない形を書く・自分の出力を読めない・
+/// 読み直しの形の違い・メタデータの約束の破れ）は `Err`。
+pub fn fuzz_encode(format: &str, data: &[u8]) -> Result<(), String> {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use crate::codec::Encoder as _;
+    use crate::codec::symph::{vorbis_comments_for, writable_loop};
+    use crate::value::Audio;
+
+    // 足りない見出しは 0 で埋めて読む
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0);
+    let (encoder, opts) = match format {
+        "ogg" => (
+            crate::codec::vorbis::OggVorbisEncoder,
+            serde_json::json!({ "quality": i64::from(byte(0) % 12) - 1 }),
+        ),
+        _ => return Err(format!("{format} の書き出しのファズはありません")),
+    };
+    let rate = FUZZ_ENCODE_RATES[usize::from(byte(1)) % FUZZ_ENCODE_RATES.len()];
+    let channels = 1 + usize::from(byte(2) % 9);
+    let frames = u64::from(u16::from_le_bytes([byte(3), byte(4)])) % (FUZZ_ENCODE_MAX_FRAMES + 1);
+    let frames64 = frames;
+    let frames = usize::try_from(frames).map_err(|e| e.to_string())?;
+    let meta = fuzz_meta_of(&byte);
+    let samples: Vec<f32> = data
+        .get(FUZZ_ENCODE_HEADER..)
+        .unwrap_or(&[])
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let mut planes = vec![Vec::with_capacity(frames); channels];
+    for f in 0..frames {
+        for (ch, p) in planes.iter_mut().enumerate() {
+            let k = f * channels + ch;
+            p.push(if samples.is_empty() {
+                0.0
+            } else {
+                samples[k % samples.len()]
+            });
+        }
+    }
+    let audio = Audio::new(
+        rate,
+        planes.into_iter().map(Arc::new).collect(),
+        meta.clone(),
+    )
+    .map_err(|e| format!("入力を組めません: {e}"))?;
+    let value = Value::Audio(Arc::new(audio));
+    let shape = value.shape();
+    let writable = encoder.can_encode(format, &shape);
+    let name = format!(
+        "{}（{opts}・{rate} Hz・{channels} ch・{frames} フレーム・ループ {:?}・タグ {:?}）",
+        encoder.id(),
+        meta.loop_range,
+        meta.tags.keys().collect::<Vec<_>>()
+    );
+
+    let mut bytes = Vec::new();
+    let r = catch_own_panic(|| encoder.encode(&value, format, &opts, &mut bytes, &NoMonitor));
+    match r {
+        Err(at) => return Err(format!("{name}: 自前のコードの panic（{at}）")),
+        Ok(Err(EngineError::Internal(m))) => return Err(format!("{name}: {m}")),
+        Ok(Err(e)) if writable => {
+            return Err(format!("{name}: 書けると答えた形を断りました: {e}"));
+        }
+        Ok(Err(_)) => return Ok(()),
+        Ok(Ok(_)) if !writable => {
+            return Err(format!("{name}: 書けないと答えた形を書きました"));
+        }
+        Ok(Ok(_)) => {}
+    }
+
+    // 書いたコメント：ループ点は範囲の中だけ、名前は重複しない、ENCODER は 1 つ
+    let entries = ogg_comment_entries(&bytes).map_err(|e| format!("{name}: {e}"))?;
+    let want_loop = writable_loop(meta.loop_range, frames64);
+    let loop_entries: Vec<&(String, String)> = entries
+        .iter()
+        .filter(|(k, _)| matches!(k.to_ascii_uppercase().as_str(), "LOOPSTART" | "LOOPLENGTH"))
+        .collect();
+    let want_entries: Vec<(String, String)> = want_loop
+        .map(|l| {
+            vec![
+                ("LOOPSTART".to_string(), l.start.to_string()),
+                ("LOOPLENGTH".to_string(), (l.end - l.start).to_string()),
+            ]
+        })
+        .unwrap_or_default();
+    if loop_entries.into_iter().cloned().collect::<Vec<_>>() != want_entries {
+        return Err(format!(
+            "{name}: ループ点のコメントが違う（書いたもの {}、期待 {}）",
+            show_comments(&entries),
+            show_comments(&want_entries)
+        ));
+    }
+    let mut seen = BTreeMap::new();
+    for (k, _) in &entries {
+        if seen.insert(same_tag_name(k), ()).is_some() {
+            return Err(format!(
+                "{name}: 同じ名前のコメントを 2 つ書いた（{k}）: {}",
+                show_comments(&entries)
+            ));
+        }
+    }
+    let encoder_id = crate::codec::vorbis::ENC_ID;
+    if !entries
+        .iter()
+        .any(|(k, v)| k == "ENCODER" && v == encoder_id)
+    {
+        return Err(format!(
+            "{name}: ENCODER={encoder_id} がない: {}",
+            show_comments(&entries)
+        ));
+    }
+
+    let set = crate::codec::CodecSet::pinned();
+    let limits = crate::Limits::default();
+    let dopts = crate::doc::DecodeOptions::default();
+    for d in set.all_decoders_for(format) {
+        let r = catch_own_panic(|| {
+            let s = d.shape(&mut Cursor::new(&bytes), format, &dopts, &limits)?;
+            let v = d.decode(
+                &mut Cursor::new(&bytes),
+                format,
+                &dopts,
+                &limits,
+                &NoMonitor,
+            )?;
+            Ok((s, v))
+        });
+        match r {
+            Err(at) => {
+                return Err(format!(
+                    "{name} を {} で読む: 自前のコードの panic（{at}）",
+                    d.id()
+                ));
+            }
+            Ok(Err(e)) => return Err(format!("{name} を {} で読めません: {e}", d.id())),
+            Ok(Ok((s, v))) => {
+                let got = v.shape();
+                if got != shape || !s.admits(&got) {
+                    return Err(format!(
+                        "{name} を {} で読み直した形が違う（ヘッダ {s:?}・中身 {got:?}）",
+                        d.id()
+                    ));
+                }
+                let Value::Audio(back) = &v else {
+                    return Err(format!("{name} を {} で読むと音声でない", d.id()));
+                };
+                if back.meta.loop_range != want_loop {
+                    return Err(format!(
+                        "{name} を {} で読み直したループ点が違う（{:?}）",
+                        d.id(),
+                        back.meta.loop_range
+                    ));
+                }
+                // 読み直したメタデータを書き直すときのコメント（ENCODER を除く）が、書いたものと同じ
+                let again = vorbis_comments_for(&back.meta, frames64);
+                if comment_set(&again) != comment_set(&entries) {
+                    return Err(format!(
+                        "{name} を {} で読み直したメタデータを書き直すとコメントが変わる（{} → {}）",
+                        d.id(),
+                        show_comments(&entries),
+                        show_comments(&again)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 追記だけの引数（`actions` の列）を持つノードを途中で切り、差分の適用（`Op::apply_appended`）が全体を当て直したものと
 /// 同じかを確かめる（E21。実行器が差分を使うのは段 10 からなので、ファズではここで照らす）。違えば `Internal`。
 fn check_appended(
@@ -431,6 +898,138 @@ mod tests {
             }
         }
         assert!(checked > 0);
+    }
+
+    /// 書き出しのファズ：種の見出しは読み方と合い、書ける形・書けない形（レート・チャンネルの範囲の外）・空の入力・
+    /// 標本のない入力・NaN と ∞ を含む入力のどれも見つけたものにならない。知らない形式は `Err`。
+    #[test]
+    fn encode_fuzz_accepts_valid_and_out_of_range_shapes() {
+        let input = fuzz_encode_input(-1, 3, 9, 40_000, &[0.5]);
+        assert_eq!(
+            input[..FUZZ_ENCODE_HEADER],
+            [
+                0, 3, 8, 0x40, 0x9C, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+        assert_eq!(input[FUZZ_ENCODE_HEADER..], 0.5f32.to_le_bytes());
+        assert_eq!(fuzz_encode_input(10, 0, 1, 0, &[])[0], 11);
+        let meta = FuzzEncodeMeta {
+            loop_mode: 2,
+            loop_a: 0x1234,
+            loop_b: 7,
+            tags: vec![(1, 2), (3, 4), (5, 6), (7, 8), (9, 10)],
+        };
+        assert_eq!(
+            fuzz_encode_input_meta(0, 1, 2, 3, &meta, &[]),
+            [
+                1, 1, 1, 3, 0, 2, 0x34, 0x12, 7, 0, 4, 1, 2, 3, 4, 5, 6, 7, 8
+            ]
+        );
+        let odd = [0.25, f32::NAN, -f32::INFINITY, 1e30, -1e-40];
+        for (q, rate, ch, frames, samples) in [
+            (5, 7, 2, 3_000u16, &odd[..]),
+            (10, 14, 8, 600, &odd[..]),
+            (0, 0, 1, 0, &[][..]),
+            (3, 12, 3, 100, &[][..]),
+            // 9 ch・7,999 Hz・192,001 Hz は書けない（断ればよい）
+            (5, 7, 9, 100, &odd[..]),
+            (5, 18, 1, 100, &odd[..]),
+            (5, 19, 2, 100, &odd[..]),
+        ] {
+            let data = fuzz_encode_input(q, rate, ch, frames, samples);
+            assert_eq!(
+                fuzz_encode("ogg", &data),
+                Ok(()),
+                "{q} {rate} {ch} {frames}"
+            );
+        }
+        // 見出しが足りない入力も、0 で埋めて読む
+        assert_eq!(fuzz_encode("ogg", &[]), Ok(()));
+        assert_eq!(fuzz_encode("ogg", &[7, 7]), Ok(()));
+        assert!(fuzz_encode("png", &[0; 8]).is_err());
+    }
+
+    /// 書き出しのファズのメタデータ：見出しの読み方（ループ点の 4 つの形・タグの数と番号）と、範囲の中・外のループ点、
+    /// 長さ 0・逆向き・u64 の端のループ点、重複する名前・長い値・`=` を含む値のタグのどれも見つけたものにならない
+    /// （書いたコメントのループ点・重複・ENCODER、読み直したループ点、書き直したときのコメントを `fuzz_encode` が照らす）。
+    #[test]
+    fn encode_fuzz_checks_metadata() {
+        use crate::value::LoopRange;
+        let meta_of = |data: &[u8]| fuzz_meta_of(&|i: usize| data.get(i).copied().unwrap_or(0));
+        let mk = |loop_mode, loop_a, loop_b, tags: Vec<(u8, u8)>| FuzzEncodeMeta {
+            loop_mode,
+            loop_a,
+            loop_b,
+            tags,
+        };
+        let data = fuzz_encode_input_meta(0, 0, 1, 100, &mk(1, 10, 20, vec![]), &[]);
+        assert_eq!(
+            meta_of(&data).loop_range,
+            Some(LoopRange { start: 10, end: 20 })
+        );
+        let data = fuzz_encode_input_meta(0, 0, 1, 100, &mk(2, 10, 20, vec![]), &[]);
+        assert_eq!(
+            meta_of(&data).loop_range,
+            Some(LoopRange {
+                start: u64::MAX - 10,
+                end: 20
+            })
+        );
+        let data = fuzz_encode_input_meta(0, 0, 1, 100, &mk(7, 10, 20, vec![]), &[]);
+        assert_eq!(
+            meta_of(&data).loop_range,
+            Some(LoopRange {
+                start: 10,
+                end: u64::MAX - 20
+            })
+        );
+        let data = fuzz_encode_input_meta(0, 0, 1, 100, &mk(4, 10, 20, vec![(0, 1), (13, 2)]), &[]);
+        let m = meta_of(&data);
+        assert_eq!(m.loop_range, None);
+        assert_eq!(
+            m.tags.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("title".to_string(), "x".to_string()),
+                ("vorbis:FOO".to_string(), "a=b".to_string())
+            ]
+        );
+        let sine: Vec<f32> = (0..64)
+            .map(|i| (0.5 * crate::math::sin(f64::from(i) * 0.3)) as f32)
+            .collect();
+        let dup = vec![(1, 4), (9, 1), (13, 2), (14, 3)];
+        let long = vec![(0, 8), (3, 9), (10, 12), (11, 11)];
+        let odd_keys = vec![(16, 1), (18, 1), (20, 1), (21, 7)];
+        let aliases = vec![(7, 6), (8, 5), (15, 0), (17, 10)];
+        // copyright と、読み取りが copyright にする小文字ちょうどの cprt（と、別の名前にする CPRT）
+        let cprt = vec![(6, 1), (28, 2)];
+        let cprt_upper = vec![(6, 1), (29, 3), (28, 2)];
+        for (frames, meta) in [
+            // 範囲の中
+            (3_000u16, mk(1, 100, 2_000, dup.clone())),
+            (3_000, mk(1, 0, 3_000, long.clone())),
+            (3_000, mk(1, 2_999, 3_000, vec![])),
+            // 範囲の外・長さ 0・逆向き・u64 の端
+            (3_000, mk(1, 3_000, 3_005, odd_keys.clone())),
+            (3_000, mk(1, 100, 3_100, aliases.clone())),
+            (3_000, mk(1, 5, 5, dup)),
+            (3_000, mk(1, 20, 10, long)),
+            (3_000, mk(2, 0, 0, odd_keys)),
+            (3_000, mk(3, 0, 0, aliases)),
+            (3_000, mk(0, 0, 0, cprt)),
+            (3_000, mk(0, 0, 0, cprt_upper)),
+            (3_000, mk(0, 0, 0, vec![(28, 1)])),
+            (3_000, mk(0, 0, 0, vec![(29, 1), (28, 2)])),
+            (0, mk(1, 0, 1, vec![(2, 12)])),
+        ] {
+            for (q, rate, ch) in [(3, 7, 2), (-1, 0, 1), (10, 12, 3)] {
+                let data = fuzz_encode_input_meta(q, rate, ch, frames, &meta, &sine);
+                assert_eq!(
+                    fuzz_encode("ogg", &data),
+                    Ok(()),
+                    "{q} {rate} {ch} {frames} {meta:?}"
+                );
+            }
+        }
     }
 
     /// 並列の作業スレッドで起きた自前の panic も、自前の panic として見分ける（stable のファズが見逃さないように）。

@@ -2158,6 +2158,7 @@ dependencies = [
  "gif",
  "image-webp",
  "jpeg-encoder",
+ "lewton",
  "libm",
  "md-5",
  "miniz_oxide 0.8.9",
@@ -2177,6 +2178,7 @@ dependencies = [
  "symphonia-format-isomp4",
  "symphonia-format-ogg",
  "thiserror 2.0.21",
+ "vorbis-tables",
  "zune-jpeg",
 ]
 
@@ -2207,6 +2209,16 @@ name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
+
+[[package]]
+name = "lewton"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "777b48df9aaab155475a83a7df3070395ea1ac6902f5cd062b8f2b028075c030"
+dependencies = [
+ "byteorder",
+ "tinyvec",
+]
 
 [[package]]
 name = "libappindicator"

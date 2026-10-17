@@ -400,21 +400,71 @@ fn e19_true_peak_matches_ebu_3341() {
     }
 }
 
-/// E20：WAV の smpl・cue、AIFF の MARK・INST、FLAC の LOOPSTART・LOOPLENGTH を読んで書いても保たれる。
+/// 音声の書き出しの設定（可逆の形式は 24 ビット、Ogg Vorbis は既定の品質）。
+fn audio_opts(format: &str) -> serde_json::Value {
+    if format == "ogg" {
+        json!({})
+    } else {
+        json!({ "bits": 24 })
+    }
+}
+
+/// Ogg のページのシリアル番号と CRC を 0 にしたもの（シリアル番号は値のダイジェストから決まるので、メタデータが変わると
+/// 変わる。それ以外のバイト列を比べる）。
+fn without_serial(ogg: &[u8]) -> Vec<u8> {
+    let mut b = ogg.to_vec();
+    let mut at = 0usize;
+    while at < b.len() {
+        assert_eq!(&b[at..at + 4], b"OggS", "ページの印（{at}）");
+        let n = usize::from(b[at + 26]);
+        let body: usize = b[at + 27..at + 27 + n]
+            .iter()
+            .map(|l| usize::from(*l))
+            .sum();
+        b[at + 14..at + 18].fill(0);
+        b[at + 22..at + 26].fill(0);
+        at += 27 + n + body;
+    }
+    b
+}
+
+/// 値の標本はそのままに、メタデータだけを `meta` に替える。
+fn with_meta_of(v: &Value, meta: &AudioMeta) -> Value {
+    let mut a = (**audio(v)).clone();
+    a.meta = meta.clone();
+    Value::Audio(Arc::new(a))
+}
+
+/// E20：WAV の smpl・cue、AIFF の MARK・INST、FLAC・Ogg Vorbis の LOOPSTART・LOOPLENGTH を読んで書いても保たれる
+/// （マーカーを持たないのは FLAC と Ogg Vorbis）。
 #[test]
 fn e20_loop_points_round_trip() {
     let input = noise_with_meta(30_000);
-    for format in ["wav", "aiff", "flac"] {
-        let bytes = encode(&input, format, json!({ "bits": 24 }));
+    for format in ["wav", "aiff", "flac", "ogg"] {
+        let bytes = encode(&input, format, audio_opts(format));
         let back = decode(&bytes, format);
         let (src, got) = (&audio(&input).meta, &audio(&back).meta);
         assert_eq!(got.loop_range, src.loop_range, "{format} のループ点");
-        if format != "flac" {
+        if !matches!(format, "flac" | "ogg") {
             assert_eq!(got.markers, src.markers, "{format} のマーカー");
         }
-        // 書き直しても同じ
-        let again = encode(&back, format, json!({ "bits": 24 }));
-        assert_eq!(bytes, again, "{format} の書き直し");
+        if format == "ogg" {
+            // 非可逆なので標本は変わる：読んだメタデータを元の標本に付けて書くと、シリアル番号（値のダイジェストから
+            // 決まる）のほかは同じバイト列。読んだ値を書き直して読んでもループ点は同じ
+            let again = encode(&with_meta_of(&input, got), format, audio_opts(format));
+            assert_eq!(
+                without_serial(&bytes),
+                without_serial(&again),
+                "{format} の書き直し（メタデータ）"
+            );
+            let twice = decode(&encode(&back, format, audio_opts(format)), format);
+            assert_eq!(audio(&twice).meta.loop_range, src.loop_range, "{format}");
+            assert_eq!(audio(&twice).frames(), audio(&input).frames(), "{format}");
+        } else {
+            // 書き直しても同じ
+            let again = encode(&back, format, audio_opts(format));
+            assert_eq!(bytes, again, "{format} の書き直し");
+        }
     }
     // ループの端：先頭から、終わりまで、1 フレームだけ
     for (start, end) in [
@@ -430,8 +480,8 @@ fn e20_loop_points_round_trip() {
             name: "zero".into(),
         }];
         let v = Value::Audio(Arc::new(a));
-        for format in ["wav", "aiff", "flac"] {
-            let back = decode(&encode(&v, format, json!({ "bits": 24 })), format);
+        for format in ["wav", "aiff", "flac", "ogg"] {
+            let back = decode(&encode(&v, format, audio_opts(format)), format);
             assert_eq!(
                 audio(&back).meta.loop_range,
                 Some(LoopRange { start, end }),
@@ -441,7 +491,7 @@ fn e20_loop_points_round_trip() {
     }
 }
 
-/// E20：他のツール（ffmpeg）で書いた Ogg Vorbis の LOOPSTART・LOOPLENGTH を読む（書くのは段 7）。
+/// E20：他のツール（vorbis_rs）で書いた Ogg Vorbis の LOOPSTART・LOOPLENGTH を読む。
 #[test]
 fn e20_ogg_loop_comments_are_read() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -458,8 +508,148 @@ fn e20_ogg_loop_comments_are_read() {
     );
 }
 
-/// 読み取りの上限（4,096 バイト）より長いタグは、AIFF・FLAC の書き出しが文字の境目で切り詰める。書いて読み直した値を
-/// 書き直すと同じバイト列になる（検証で見つけた：切り詰めずに書くと、自分の読み取りがタグを丸ごと捨てていた）。
+/// E20：範囲の外・長さ 0・逆向きのループ点は、どの形式も書かない（WAV・AIFF はループのチャンクを、FLAC・Ogg Vorbis は
+/// LOOPSTART・LOOPLENGTH を。`start < end ≤ 長さ` だけを書く）。書き出しは落ちず（逆向きでも引き算があふれない）、
+/// ループ点のない入力と同じバイト列になる（Ogg Vorbis はシリアル番号と CRC を除く。シリアル番号は値のダイジェストから決まる）。
+#[test]
+fn e20_invalid_loop_points_are_not_written() {
+    let frames = 12_000u64;
+    let base = noise(44_100, 2, frames, 9);
+    let plain: Vec<(&str, Vec<u8>)> = ["wav", "aiff", "flac", "ogg"]
+        .into_iter()
+        .map(|f| (f, encode(&base, f, audio_opts(f))))
+        .collect();
+    for (start, end) in [
+        // 始まりが長さ以上・終わりが長さを超える
+        (frames, frames + 5),
+        (100, frames + 100),
+        (0, frames + 1),
+        (0, u64::MAX),
+        // 長さ 0
+        (5, 5),
+        (0, 0),
+        (frames, frames),
+        // 逆向き
+        (10, 5),
+        (frames, 0),
+        (u64::MAX, 0),
+    ] {
+        let mut a = (**audio(&base)).clone();
+        a.meta.loop_range = Some(LoopRange { start, end });
+        let v = Value::Audio(Arc::new(a));
+        for (format, want) in &plain {
+            let bytes = CodecSet::pinned()
+                .encode_bytes(&v, format, &audio_opts(format), &NoMonitor)
+                .unwrap_or_else(|e| panic!("{format} {start}..{end}: {e}"))
+                .0;
+            assert!(
+                !bytes.windows(9).any(|w| w == b"LOOPSTART")
+                    && !bytes.windows(10).any(|w| w == b"LOOPLENGTH"),
+                "{format} {start}..{end}：LOOPSTART・LOOPLENGTH を書いた"
+            );
+            if *format == "ogg" {
+                assert_eq!(
+                    without_serial(&bytes),
+                    without_serial(want),
+                    "{format} {start}..{end}"
+                );
+            } else {
+                assert_eq!(&bytes, want, "{format} {start}..{end}");
+            }
+            assert_eq!(
+                audio(&decode(&bytes, format)).meta.loop_range,
+                None,
+                "{format} {start}..{end}"
+            );
+        }
+    }
+}
+
+/// タグの別名（既知の名前と同じ名前の `vorbis:KEY`、大文字と小文字だけが違う `vorbis:KEY`、COMMENT と DESCRIPTION、
+/// COPYRIGHT と小文字ちょうどの `cprt`）は、FLAC・Ogg Vorbis に先の 1 つだけを書く（既知の名前を優先。読み取りは同じ名前の
+/// 2 つめ以降を捨てる）。読み取りが別の名前にする `CPRT`（`vorbis:CPRT` と読む）は消さない。書いて読んだメタデータを
+/// 書き直すと同じバイト列（Ogg Vorbis は元の標本に付けて、シリアル番号と CRC を除いて比べる）。
+#[test]
+fn duplicate_tag_names_are_written_once() {
+    for (tags, want) in [
+        (
+            vec![("artist", "A"), ("vorbis:ARTIST", "B")],
+            vec![("artist", "A")],
+        ),
+        (
+            vec![("vorbis:foo", "x"), ("vorbis:FOO", "y")],
+            vec![("vorbis:FOO", "y")],
+        ),
+        (
+            vec![
+                ("comment", "c"),
+                ("vorbis:DESCRIPTION", "d"),
+                ("vorbis:description", "e"),
+            ],
+            vec![("comment", "c")],
+        ),
+        (
+            vec![
+                ("title", "T"),
+                ("vorbis:title", "t"),
+                ("vorbis:BAR", "b"),
+                ("vorbis:bar", "c"),
+                ("vorbis:Bar", "d"),
+            ],
+            vec![("title", "T"), ("vorbis:BAR", "b")],
+        ),
+        (
+            vec![("copyright", "X"), ("vorbis:cprt", "Y")],
+            vec![("copyright", "X")],
+        ),
+        (
+            vec![
+                ("copyright", "X"),
+                ("vorbis:CPRT", "Z"),
+                ("vorbis:cprt", "Y"),
+            ],
+            vec![("copyright", "X"), ("vorbis:CPRT", "Z")],
+        ),
+    ] {
+        let mut a = (**audio(&noise(8_000, 1, 2_000, 3))).clone();
+        for (k, val) in &tags {
+            a.meta.tags.insert((*k).into(), (*val).into());
+        }
+        let v = Value::Audio(Arc::new(a));
+        for format in ["flac", "ogg"] {
+            let opts = if format == "ogg" {
+                json!({})
+            } else {
+                json!({ "bits": 16 })
+            };
+            let bytes = encode(&v, format, opts.clone());
+            let back = decode(&bytes, format);
+            let mut got: Vec<(String, String)> = audio(&back)
+                .meta
+                .tags
+                .iter()
+                .filter(|(k, _)| k.as_str() != "vorbis:ENCODER")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            got.sort();
+            let want: Vec<(String, String)> = want
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            assert_eq!(got, want, "{format} {tags:?}");
+            let again = encode(&with_meta_of(&v, &audio(&back).meta), format, opts);
+            if format == "ogg" {
+                assert_eq!(without_serial(&again), without_serial(&bytes), "{tags:?}");
+            } else {
+                assert_eq!(again, bytes, "{format} {tags:?}");
+            }
+        }
+    }
+}
+
+/// 読み取りの上限（4,096 バイト）より長いタグは、AIFF・FLAC・Ogg Vorbis の書き出しが文字の境目で切り詰める。書いて読み直した
+/// 値を書き直すと同じバイト列になる（検証で見つけた：切り詰めずに書くと、自分の読み取りがタグを丸ごと捨てていた）。
+/// Ogg Vorbis は非可逆なので、読み直したメタデータを元の標本に付けて書き直し、シリアル番号のほかを比べる。
 #[test]
 fn long_tags_are_clipped_when_written() {
     let mut a = (**audio(&noise(8_000, 1, 300, 5))).clone();
@@ -470,8 +660,13 @@ fn long_tags_are_clipped_when_written() {
     // 切り詰めると空白で終わる値（AIFF の読み取りは前後の空白を取るので、書くときにもそろえる。検証で見つけた）
     a.meta.tags.insert("comment".into(), "é ".repeat(2_048));
     let v = Value::Audio(Arc::new(a));
-    for format in ["aiff", "flac"] {
-        let bytes = encode(&v, format, json!({ "bits": 16 }));
+    for format in ["aiff", "flac", "ogg"] {
+        let opts = if format == "ogg" {
+            json!({})
+        } else {
+            json!({ "bits": 16 })
+        };
+        let bytes = encode(&v, format, opts.clone());
         let back = decode(&bytes, format);
         let title = audio(&back).meta.tags.get("title").cloned().unwrap();
         assert_eq!(title, "あ".repeat(4_096 / 3), "{format}");
@@ -484,15 +679,17 @@ fn long_tags_are_clipped_when_written() {
             comment.len() <= 4_096 && comment.starts_with("é é"),
             "{format}"
         );
-        assert_eq!(
-            encode(&back, format, json!({ "bits": 16 })),
-            bytes,
-            "{format}"
-        );
+        if format == "ogg" {
+            let again = encode(&with_meta_of(&v, &audio(&back).meta), format, opts);
+            assert_eq!(without_serial(&again), without_serial(&bytes), "{format}");
+        } else {
+            assert_eq!(encode(&back, format, opts), bytes, "{format}");
+        }
     }
 }
 
-/// 空の音声は FLAC に書かない（総フレーム数 0 は「不明」の意味で、読み直せない）。WAV・AIFF は書いて読める。
+/// 空の音声は FLAC に書かない（総フレーム数 0 は「不明」の意味で、読み直せない）。WAV・AIFF・Ogg Vorbis は書いて読める
+/// （Ogg Vorbis は libvorbis と同じく短いブロックの音声パケット 1 つで、最後のグラニュールが 0）。
 #[test]
 fn empty_audio_is_refused_by_flac() {
     let empty = Value::Audio(Arc::new(
@@ -503,9 +700,19 @@ fn empty_audio_is_refused_by_flac() {
         matches!(r, Err(kura_engine::EngineError::Unsupported(_))),
         "{r:?}"
     );
-    for format in ["wav", "aiff"] {
-        let back = decode(&encode(&empty, format, json!({ "bits": 16 })), format);
+    for format in ["wav", "aiff", "ogg"] {
+        let opts = if format == "ogg" {
+            json!({})
+        } else {
+            json!({ "bits": 16 })
+        };
+        let back = decode(&encode(&empty, format, opts), format);
         assert_eq!(audio(&back).frames(), 0, "{format}");
+        assert_eq!(
+            (audio(&back).rate(), audio(&back).channels()),
+            (8_000, 1),
+            "{format}"
+        );
     }
 }
 

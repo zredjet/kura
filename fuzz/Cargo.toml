@@ -119,6 +119,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "encode_ogg"
+path = "fuzz_targets/encode_ogg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "document"
 path = "fuzz_targets/document.rs"
 test = false

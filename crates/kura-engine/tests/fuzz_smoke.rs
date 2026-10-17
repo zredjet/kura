@@ -1,5 +1,6 @@
 //! stable で回す、変異によるファズ（docs/editing.md §13）。`fuzz/`（cargo-fuzz、nightly）と同じ対象
-//! （`testing::fuzz_decode`・`fuzz_document`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。カバレッジは見ない。
+//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。カバレッジは見ない。
+//! 対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、文書は `document`。
 //!
 //! - ふだんの `cargo test` では、対象ごとに決めた回数だけ回す（`quick`）。
 //! - `KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test fuzz_smoke -- --ignored` で、対象ごとに決めた秒数だけ回す。
@@ -21,7 +22,10 @@ use kura_engine::codec::CodecSet;
 use kura_engine::doc::Graph;
 use kura_engine::testfiles::{ApngFrame, AseCel, AseFrame, AseLayer, FileGen, GifFrame, PsdGen};
 use kura_engine::testgen::{InputGen, MetaGen};
-use kura_engine::testing::{fuzz_decode, fuzz_document};
+use kura_engine::testing::{
+    FuzzEncodeMeta, fuzz_decode, fuzz_document, fuzz_encode, fuzz_encode_input,
+    fuzz_encode_input_meta,
+};
 use kura_engine::value::{LoopRange, PixelFormat};
 use kura_engine::{NoMonitor, Value};
 use rand_chacha::ChaCha8Rng;
@@ -331,6 +335,124 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
             0,
         )
         .unwrap();
+    // 段 7：自作の Ogg Vorbis の書き出し（見出しの 19 バイトで設定とメタデータ、残りは f32 の標本。testing::fuzz_encode）
+    let sine_samples = |n: usize, step: f64| -> Vec<f32> {
+        (0..n)
+            .map(|i| (0.5 * kura_engine::math::sin(i as f64 * step)) as f32)
+            .collect()
+    };
+    let mut noise_rng = kura_engine::determinism::rng(0x0E7C);
+    let noise_samples: Vec<f32> = (0..256)
+        .map(|_| (f64::from(noise_rng.next_u32()) / f64::from(u32::MAX) * 2.0 - 1.0) as f32)
+        .collect();
+    let mut odd_samples = sine_samples(64, 0.3);
+    odd_samples.extend([
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        1e30,
+        -1e-40,
+        3.0,
+        -0.0,
+        f32::MIN_POSITIVE,
+    ]);
+    let encode_ogg = vec![
+        // 44.1 kHz・2 ch・q5・4,410 フレーム（正弦波）
+        fuzz_encode_input(5, 7, 2, 4_410, &sine_samples(400, 0.0628)),
+        // 8 kHz・1 ch・q−1・3,000 フレーム（雑音）
+        fuzz_encode_input(-1, 0, 1, 3_000, &noise_samples),
+        // 96 kHz・6 ch・q10・2,000 フレーム（NaN・∞・巨大な値・非正規化数を含む）
+        fuzz_encode_input(10, 12, 6, 2_000, &odd_samples),
+        // 22.05 kHz・3 ch・q3・37 フレーム（短い）
+        fuzz_encode_input(3, 4, 3, 37, &noise_samples[..90]),
+        // メタデータ：範囲の中のループ点と、別名で重複する名前・= を含む値・長い値のタグ
+        fuzz_encode_input_meta(
+            4,
+            7,
+            2,
+            3_000,
+            &FuzzEncodeMeta {
+                loop_mode: 1,
+                loop_a: 100,
+                loop_b: 2_900,
+                tags: vec![(1, 4), (9, 2), (13, 3), (14, 12)],
+            },
+            &sine_samples(300, 0.05),
+        ),
+        // 範囲の外のループ点（終わりが長さを超える）と、DESCRIPTION・ENCODER・書けない名前・空・NUL の値
+        fuzz_encode_input_meta(
+            0,
+            8,
+            1,
+            2_000,
+            &FuzzEncodeMeta {
+                loop_mode: 1,
+                loop_a: 1_000,
+                loop_b: 2_005,
+                tags: vec![(3, 1), (10, 5), (16, 0), (21, 7)],
+            },
+            &noise_samples,
+        ),
+        // 逆向きで u64 の端に近いループ点と、小文字の別名・LOOPSTART の名前・ASCII の外の名前・4,096 バイトを超える値
+        fuzz_encode_input_meta(
+            -1,
+            16,
+            3,
+            1_500,
+            &FuzzEncodeMeta {
+                loop_mode: 2,
+                loop_a: 0,
+                loop_b: 10,
+                tags: vec![(8, 8), (18, 1), (23, 9), (17, 11)],
+            },
+            &odd_samples,
+        ),
+        // 空の音声（0 フレーム）に、終わりが u64 の端のループ点と 4,096 バイトちょうどの値
+        fuzz_encode_input_meta(
+            10,
+            12,
+            2,
+            0,
+            &FuzzEncodeMeta {
+                loop_mode: 3,
+                loop_a: 0,
+                loop_b: 0,
+                tags: vec![(0, 10)],
+            },
+            &[],
+        ),
+        // copyright と、読み取りが copyright に読む小文字の cprt・大文字の CPRT（別の名前）
+        fuzz_encode_input_meta(
+            0,
+            3,
+            1,
+            1_000,
+            &FuzzEncodeMeta {
+                loop_mode: 0,
+                loop_a: 0,
+                loop_b: 0,
+                tags: vec![(6, 1), (28, 2), (29, 3)],
+            },
+            &noise_samples,
+        ),
+    ];
+    let ogg_sine3 = InputGen::Sine {
+        rate: 44_100,
+        channels: 3,
+        frames: 2_000,
+        freq: 440,
+        loop_range: None,
+    }
+    .generate()
+    .unwrap();
+    let ogg_one = InputGen::AudioNoise {
+        rate: 48_000,
+        channels: 1,
+        frames: 1,
+        seed: 9,
+    }
+    .generate()
+    .unwrap();
     let mut audio_doc = Graph::new_single();
     audio_doc
         .push_linear("audio.gain", 1, json!({ "db": -3.5 }), 0)
@@ -433,8 +555,16 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
         ),
         (
             "ogg",
-            vec![fixture("ogg-vorbis-loop.ogg"), fixture("ogg-opus.ogg")],
+            vec![
+                fixture("ogg-vorbis-loop.ogg"),
+                fixture("ogg-opus.ogg"),
+                // 自作の書き出し（段 7。短いもの）
+                encoded("ogg", &wav_meta, json!({})),
+                encoded("ogg", &ogg_sine3, json!({ "quality": 0 })),
+                encoded("ogg", &ogg_one, json!({ "quality": 10 })),
+            ],
         ),
+        ("encode_ogg", encode_ogg),
         (
             "m4a",
             vec![
@@ -527,6 +657,8 @@ fn mutate(r: &mut ChaCha8Rng, seeds: &[Vec<u8>]) -> Vec<u8> {
 fn run(target: &str, input: &[u8]) -> Result<(), String> {
     if target == "document" {
         fuzz_document(input)
+    } else if let Some(format) = target.strip_prefix("encode_") {
+        fuzz_encode(format, input)
     } else {
         fuzz_decode(target, input)
     }
@@ -602,14 +734,14 @@ fn long() {
 }
 
 /// 種を cargo-fuzz の種の置き場（`fuzz/corpus/<対象>/`。git には入れない）に書き出す（fuzz/README.md）。
-/// 対象の名前は、デコーダは `decode_<形式>`、文書は `document`。
+/// 対象の名前は、デコーダは `decode_<形式>`、自前のエンコーダは `encode_<形式>`、文書は `document`。
 #[test]
 #[ignore]
 fn export_seeds() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus");
     let mut n = 0;
     for (target, seeds) in targets() {
-        let name = if target == "document" {
+        let name = if target == "document" || target.starts_with("encode_") {
             target.to_string()
         } else {
             format!("decode_{target}")

@@ -2104,11 +2104,13 @@ mod tests {
     #[allow(clippy::disallowed_methods)] // 断るまでの時間（usvg に渡さずに断ること）を確かめるだけ
     fn css_costs_are_bounded() {
         let x = r#"xmlns="http://www.w3.org/2000/svg" width="8" height="8""#;
+        // 上限で断る形は単独のデバッグのビルドで 1 つ 0.5 秒ほど。同じテストのバイナリの重いテスト（段 7 の Vorbis の照合など）と
+        // 並ぶと数倍に延びるので、閾値は 10 秒にする。断らなかったときの形（宣言の数の 2 乗・組み合わせの数の後戻り）は数分かかる。
         let quick = |svg: &str| {
             let t = std::time::Instant::now();
             let r = decode(svg);
             assert!(
-                t.elapsed() < std::time::Duration::from_secs(2),
+                t.elapsed() < std::time::Duration::from_secs(10),
                 "{:?}",
                 t.elapsed()
             );

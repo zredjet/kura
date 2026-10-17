@@ -13,11 +13,13 @@ pub mod gif;
 pub mod jpeg;
 pub mod lossy;
 pub mod mp3;
+pub(crate) mod ogg;
 pub mod pcm;
 pub mod png;
 pub mod psd;
 pub mod svg;
 pub(crate) mod symph;
+pub mod vorbis;
 pub mod wav;
 pub mod webp;
 
@@ -249,7 +251,16 @@ impl CodecSet {
                 Arc::new(lossy::SymphoniaDecoder::adts_aac()),
             ],
             legacy_decoders: png::legacy_decoders(),
-            encoders: vec![png, jpeg, gif, webp, wav, aiff, flac],
+            encoders: vec![
+                png,
+                jpeg,
+                gif,
+                webp,
+                wav,
+                aiff,
+                flac,
+                Arc::new(vorbis::OggVorbisEncoder),
+            ],
         }
     }
 
