@@ -39,7 +39,7 @@ pub struct SymphoniaDecoder {
 }
 
 impl SymphoniaDecoder {
-    /// Ogg Vorbis（`ogg-vorbis-symphonia-dec/1`）。
+    /// Ogg Vorbis（`ogg-vorbis-symphonia-dec/2`）。
     pub fn ogg_vorbis() -> Self {
         Self {
             kind: Kind::OggVorbis,
@@ -165,7 +165,7 @@ impl SymphoniaDecoder {
 impl Decoder for SymphoniaDecoder {
     fn id(&self) -> &'static str {
         match self.kind {
-            Kind::OggVorbis => "ogg-vorbis-symphonia-dec/1",
+            Kind::OggVorbis => "ogg-vorbis-symphonia-dec/2",
             Kind::Mp4Alac => "m4a-alac-symphonia-dec/1",
             Kind::Mp4Aac => "m4a-aac-symphonia-dec/1",
             Kind::AdtsAac => "aac-adts-symphonia-dec/1",

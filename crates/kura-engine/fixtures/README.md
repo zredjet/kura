@@ -67,9 +67,22 @@ ALAC・AIFF・MP3）の値は `tests/codec_golden.rs` で凍結する。
 | `mp3-info-frames0.mp3` | `mp3-lame.mp3` の Info のフレームの数（`Info` の 8 バイト後ろの 4 バイト）を 0 に書き換えたもの（途中で止まった ffmpeg の出力の形） | `mp3-info-frames0.ffmpeg.flac`（末尾を切らずに 44,975） |
 | `mp2-layer2.mp3` | `ffmpeg -i audio-src16.wav -c:a mp2 -b:a 128k -f mp2`（.mp3 の拡張子の MPEG layer II） | MP3 のデコーダでは読めない（`Unsupported`）こと |
 | `ogg-vorbis-granule-trim.ogg` | 段 6 の検証で作ったもの（作業用のプログラム）：8 ch・ブロック 8192 の Vorbis で、1 バイトの音声パケットが 2,000 個、最後のグラニュールが 1 | 形は小さいが、切り取る前のデコードの量（約 262 MB）を上限 64 MiB で断ること |
+| `ogg-vorbis-3ch.ogg` | 段 7：vorbis_rs（品質 0.5、serial 1、コメント `TITLE=Channels`）。作業用のプログラム（`vorbis-enc` の写しで、チャンネル数を引数で受ける。`vorbis-enc-mc 3 ogg-vorbis-3ch.ogg`）が下の音を作り、f32 のまま 1,024 フレームずつ渡す。2 チャンネル以外なので coupling なし・全チャンネルで residue 1 | `ogg-vorbis-3ch.lewton.flac`（22,050。lewton の出力の並び（Vorbis の並び：L・C・R）のまま保存。比べるときに kura の WAV の並びに直す） |
+| `ogg-vorbis-5ch.ogg` | 同上（`vorbis-enc-mc 5 ogg-vorbis-5ch.ogg`。チャンネル 3 は無音） | `ogg-vorbis-5ch.lewton.flac`（22,050。Vorbis の並び：L・C・R・Ls・Rs のまま） |
 
 - 参照の `*.ffmpeg.flac`・`*.lewton.flac`・`*.afconvert.flac` は、そのデコーダの出力を 16 ビットに（ディザなしで）丸め、
   `flac -8` で保存したもの。端（±1）に張り付いた標本は比べない。
+- 段 7 の `ogg-vorbis-3ch.ogg`・`ogg-vorbis-5ch.ogg`（symphonia-codec-vorbis 0.6.1 の 3 ch 以上の不具合の回帰の試験。
+  `third_party/symphonia-codec-vorbis/KURA.md`）：
+  - 音（0.5 秒・44.1 kHz。t = n / 44100、n = 0〜22,049。チャンネル k は Vorbis の並びで 0 始まり）：k = 0 は 0.4·sin(2π·300·t)、
+    k = 1 は 0.2·sin(2π·1000·t) + 0.1·雑音、k = 2 は 0.3·sin(2π·(200·t + 3900·t²))（200 Hz → 8,000 Hz の掃引）、k = 3 は無音、
+    k = 4 は 0.3·雑音。雑音は 32 ビットの LCG（x ← 1664525·x + 1013904223、種 1。上位 24 ビットを −1〜1 に）の 1 本の列から、
+    フレームごとにチャンネルの順に引く。sin は作業用のプログラムの f64（OS の libm）。
+  - 参照：lewton 0.10.2 の `OggStreamReader`（作業用の `lewton-probe`。最後のグラニュールで切って 22,050 フレーム）の f32 を、
+    `round(x·32768)`（偶数への丸め、−32768〜32767。端に張り付いた標本はなし）で 16 ビットにし、
+    `flac -8 --force-raw-format --endian=little --sign=signed --channels=N --bps=16 --sample-rate=44100` で保存した。
+  - 照らした結果（`tests/fixtures.rs` の `multichannel_vorbis_matches_lewton`）：長さはちょうど同じ、信号と誤差の比はチャンネルごとに
+    3.0×10⁸〜1.0×10⁹（無音のチャンネルは無音）。直す前の symphonia-codec-vorbis 0.6.1 では失敗する。
 - `ogg-vorbis-ffmpeg.ogg` は、FFmpeg 自身のデコーダだけが右のチャンネルを違う値に読む（symphonia と lewton は一致する）。
   そのため Vorbis の参照は lewton にした。
 - 照らした結果（`tests/fixtures.rs`）：FLAC・ALAC・AIFF はちょうど同じ。信号と誤差の比は MP3 が 3.4〜7.4×10⁸（free format は

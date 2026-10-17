@@ -317,7 +317,7 @@ fn lossy_audio_matches_other_decoders() {
         (
             "ogg-vorbis-loop.ogg",
             "ogg",
-            "ogg-vorbis-symphonia-dec/1",
+            "ogg-vorbis-symphonia-dec/2",
             "ogg-vorbis-loop.lewton.flac",
             44_100,
             false,
@@ -325,7 +325,7 @@ fn lossy_audio_matches_other_decoders() {
         (
             "ogg-vorbis-ffmpeg.ogg",
             "ogg",
-            "ogg-vorbis-symphonia-dec/1",
+            "ogg-vorbis-symphonia-dec/2",
             "ogg-vorbis-ffmpeg.lewton.flac",
             44_160,
             false,
@@ -389,6 +389,50 @@ fn lossy_audio_matches_other_decoders() {
         }
     }
     assert!(bad.is_empty(), "{bad:?}");
+}
+
+/// 3・5 チャンネルの Ogg Vorbis（libvorbis の aoTuV が書いたもの。2 チャンネル以外は coupling なしで、residue 1 を全チャンネルで
+/// 使う）は、lewton の読み取りと長さがちょうど同じで、値はチャンネルごとに 60 dB 以上の比で近い（無音のチャンネルは無音）。
+/// 参照は lewton の出力をそのままの並び（Vorbis の並び）で保存したので、kura の WAV の並びに直して比べる。チャンネルごとに
+/// 違う音にしてあるので、並びの誤りも見つかる。symphonia-codec-vorbis 0.6.1 の不具合（residue 0/1 を 2 チャンネル以上で使うと、
+/// 次のチャンネルの分類を上書きする。third_party/symphonia-codec-vorbis/KURA.md）の回帰の試験。
+#[test]
+fn multichannel_vorbis_matches_lewton() {
+    // Vorbis のチャンネル i は kura の planes[ORDER[n - 1][i]]（Vorbis I §4.3.9。codec::vorbis::ORDER と同じ表を、ここでは独立に書く）
+    const ORDER: [&[usize]; 5] = [&[0], &[0, 1], &[0, 2, 1], &[0, 1, 2, 3], &[0, 2, 1, 3, 4]];
+    for (file, reference, channels) in [
+        ("ogg-vorbis-3ch.ogg", "ogg-vorbis-3ch.lewton.flac", 3usize),
+        ("ogg-vorbis-5ch.ogg", "ogg-vorbis-5ch.lewton.flac", 5),
+    ] {
+        let (codec, rep, meta, rate, ours) = audio(file, "ogg");
+        let (_, _, _, ref_rate, raw) = audio(reference, "flac");
+        assert_eq!(codec, "ogg-vorbis-symphonia-dec/2", "{file}");
+        assert!(!rep, "{file}");
+        assert_eq!((rate, ref_rate), (44_100, 44_100), "{file}");
+        assert_eq!(meta.tags.get("title").map(String::as_str), Some("Channels"));
+        assert_eq!((ours.len(), raw.len()), (channels, channels), "{file}");
+        let mut theirs = vec![Vec::new(); channels];
+        for (i, p) in raw.into_iter().enumerate() {
+            theirs[ORDER[channels - 1][i]] = p;
+        }
+        for ch in 0..channels {
+            let (a, b) = (&ours[ch], &theirs[ch]);
+            assert_eq!((a.len(), b.len()), (22_050, 22_050), "{file} の長さ");
+            if b.iter().all(|s| *s == 0.0) {
+                assert!(
+                    a.iter().all(|s| s.abs() < 1.0 / 65_536.0),
+                    "{file}：チャンネル {ch} は無音"
+                );
+                continue;
+            }
+            let ratio = signal_to_error(&ours[ch..=ch], &theirs[ch..=ch]);
+            eprintln!("{file}：チャンネル {ch} の信号/誤差 {ratio:.3e}");
+            assert!(
+                ratio >= 1e6,
+                "{file}：チャンネル {ch} の信号/誤差 {ratio:.3e}"
+            );
+        }
+    }
 }
 
 /// 扱わない変種（HE-AAC・Ogg の中の Opus・MP2）は `Unsupported`（次の段のデコーダへ回る）。

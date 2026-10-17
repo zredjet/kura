@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/kura-core", "crates/kura-engine", "crates/kura-mac", "crates/kura-devtools", "src-tauri"]
+# 第三者のクレートの写し（[patch.crates-io] で差し替える）。ワークスペースの lint・整形・テストの対象にしない
+exclude = ["third_party/symphonia-codec-vorbis"]
 
 [workspace.package]
 version = "0.1.0"
@@ -68,3 +70,8 @@ dbg_macro = "deny"
 codegen-units = 1
 lto = "thin"
 strip = true
+
+# symphonia-codec-vorbis 0.6.1 の 1 行の修正（residue 0/1 を 2 チャンネル以上で使うとき、次のチャンネルの分類を上書きする
+# 不具合。ADR-149・third_party/symphonia-codec-vorbis/KURA.md）。上流が直した版を出したら外す
+[patch.crates-io]
+symphonia-codec-vorbis = { path = "third_party/symphonia-codec-vorbis" }

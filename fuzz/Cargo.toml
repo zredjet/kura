@@ -15,6 +15,11 @@ kura-engine = { path = "../crates/kura-engine" }
 
 [workspace]
 
+# ルートのワークスペースと同じ差し替え（symphonia-codec-vorbis 0.6.1 の 3 ch 以上の不具合の 1 行の修正。
+# third_party/symphonia-codec-vorbis/KURA.md）。ここは別のワークスペースなので、ルートの [patch] が届かない
+[patch.crates-io]
+symphonia-codec-vorbis = { path = "../third_party/symphonia-codec-vorbis" }
+
 [[bin]]
 name = "decode_png"
 path = "fuzz_targets/decode_png.rs"
