@@ -1,4 +1,5 @@
-# CI（ADR-142）。ubuntu で kura-engine と kura-core（Linux でも通ること・整数のゴールデンがターゲットをまたいで一致すること）、
+# CI（ADR-142）。ubuntu で kura-engine・kura-core・vorbis-tables（Linux でも通ること・整数のゴールデンと Ogg Vorbis の書くバイト列が
+# ターゲットをまたいで一致すること）、
 # macOS で Swift ヘルパーを含むクレートを確かめる。src-tauri はフロントのビルドが要るので、ここでは回さない。
 name: CI
 
@@ -11,7 +12,7 @@ env:
 
 jobs:
   linux:
-    name: Linux（kura-engine・kura-core）
+    name: Linux（kura-engine・kura-core・vorbis-tables）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,15 +24,15 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p kura-engine -p kura-core --all-targets -- -D warnings
-      - run: cargo test -p kura-engine -p kura-core
+      - run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables --all-targets -- -D warnings
+      - run: cargo test -p kura-engine -p kura-core -p vorbis-tables
       - name: ゴールデンは追記だけ
         run: scripts/check-goldens-append-only.sh "${{ github.event.pull_request.base.sha || github.event.before }}"
       - name: エンジンの依存に SIMD の feature がない
         run: scripts/check-engine-features.sh
 
   macos:
-    name: macOS（kura-engine・kura-core・kura-mac・kura-devtools）
+    name: macOS（kura-engine・kura-core・vorbis-tables・kura-mac・kura-devtools）
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
@@ -40,5 +41,5 @@ jobs:
           toolchain: '1.93.0'
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p kura-engine -p kura-core -p kura-mac -p kura-devtools --all-targets -- -D warnings
-      - run: cargo test -p kura-engine -p kura-core -p kura-mac -p kura-devtools
+      - run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables -p kura-mac -p kura-devtools --all-targets -- -D warnings
+      - run: cargo test -p kura-engine -p kura-core -p vorbis-tables -p kura-mac -p kura-devtools

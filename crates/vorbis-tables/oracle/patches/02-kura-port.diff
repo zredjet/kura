@@ -1,0 +1,369 @@
+--- a/vorbis_vendor/lib/floor1.c
++++ b/vorbis_vendor/lib/floor1.c
+@@ -24,6 +24,7 @@
+ #include "codebook.h"
+ #include "misc.h"
+ #include "scales.h"
++#include "kura_port.h"
+ #ifdef __SSE__												/* SSE Optimize */
+ #include "xmmlib.h"
+ #endif														/* SSE Optimize */
+@@ -851,6 +852,9 @@
+       }
+     }
+ 
++#ifdef KURA_PORT
++    if(KD1)kd_i32("FOUT",kura_dump_ch,out,posts);
++#endif
+     /* we have everything we need. pack it out */
+     /* mark nontrivial floor */
+     oggpack_write(opb,1,1);
+--- a/vorbis_vendor/lib/info.c
++++ b/vorbis_vendor/lib/info.c
+@@ -526,7 +526,14 @@
+ }
+ 
+ static int _vorbis_pack_comment(oggpack_buffer *opb,vorbis_comment *vc){
+-  int bytes = strlen(ENCODE_VENDOR_STRING);
++#ifdef KURA_PORT
++  /* KURA_PORT：vendor は vc->vendor（呼び出し側が決める。NULL なら空）。
++     照合用のエンコーダの既定は空（長さ 0）。 */
++  const char *vendor = vc->vendor ? vc->vendor : "";
++#else
++  const char *vendor = ENCODE_VENDOR_STRING;
++#endif
++  int bytes = strlen(vendor);
+ 
+   /* preamble */
+   oggpack_write(opb,0x03,8);
+@@ -534,7 +541,7 @@
+ 
+   /* vendor */
+   oggpack_write(opb,bytes,32);
+-  _v_writestring(opb,ENCODE_VENDOR_STRING, bytes);
++  _v_writestring(opb,vendor, bytes);
+ 
+   /* comments */
+ 
+--- a/vorbis_vendor/lib/mapping0.c
++++ b/vorbis_vendor/lib/mapping0.c
+@@ -157,6 +157,7 @@
+ #include "mdct.h"
+ #include "psy.h"
+ #include "scales.h"
++#include "kura_port.h"
+ 
+ #ifdef ANALYSIS
+ static long seq=0;
+@@ -773,6 +774,13 @@
+      3=Long             */
+   block_mode=blocktype;
+   block_mode|=(modenumber << 1);
++#ifdef KURA_PORT
++  if(KD1){
++    int64_t h[10]={kura_dump_seq,vb->W,vb->lW,vb->nW,blocktype,block_mode,
++                   vb->granulepos,vb->sequence,n,vb->eofflag};
++    kd_i64("BLCK",KD_NOCH,h,10);
++  }
++#endif
+   
+   /* prepare lowpass filter of residue */
+   if(modenumber)lowpass_residue=ci->block_lowpassr[1];
+@@ -818,11 +826,17 @@
+     }
+ #endif
+ 
++#ifdef KURA_PORT
++    if(KD2)kd_f32("PCM0",i,pcm,n);
++#endif
+     /* set postnoise flag */
+     poste[i] = _postnoise_detection(pcm, n, block_mode, b->lW_block_mode);
+ 
+     /* window the PCM data */
+     _vorbis_apply_window(pcm,b->window,ci->blocksizes,vb->lW,vb->W,vb->nW);
++#ifdef KURA_PORT
++    if(KD2)kd_f32("PCMW",i,pcm,n);
++#endif
+ 
+ #if 0
+     if(vi->channels==2){
+@@ -842,6 +856,9 @@
+ #else														/* SSE Optimize */
+     mdct_forward(b->transform[vb->W][0],pcm,gmdct[i]);
+ #endif														/* SSE Optimize */
++#ifdef KURA_PORT
++    if(KD2)kd_f32("MDCT",i,gmdct[i],n/2);
++#endif
+ 
+     /* FFT yields more accurate tonal estimation (not phase sensitive) */
+     drft_forward(&b->fft_look[vb->W],pcm);
+@@ -886,6 +903,9 @@
+ 
+     if(local_ampmax[i]>0.f)local_ampmax[i]=0.f;
+     if(local_ampmax[i]>global_ampmax)global_ampmax=local_ampmax[i];
++#ifdef KURA_PORT
++    if(KD2){ kd_f32("LFFT",i,logfft,n/2); kd_f32("AMPL",i,&local_ampmax[i],1); }
++#endif
+ 
+ #if 0
+     if(vi->channels==2){
+@@ -901,6 +921,9 @@
+ 
+   }
+ 
++#ifdef KURA_PORT
++  if(KD2)kd_f32("AMPG",KD_NOCH,&global_ampmax,1);
++#endif
+   {
+     float   *noise        = _vorbis_block_alloc(vb,n/2*sizeof(*noise));
+     float   *tone         = _vorbis_block_alloc(vb,n/2*sizeof(*tone));
+@@ -967,6 +990,9 @@
+          us a tonality estimate (the larger the value in the
+          'noise_depth' vector, the more tonal that area is) */
+ 
++#ifdef KURA_PORT
++      if(KD2)kd_f32("LMDC",i,logmdct,n/2);
++#endif
+       *lowcomp=
+         lb_loudnoise_fix(psy_look,
+                          *lowcomp,
+@@ -984,6 +1010,14 @@
+                                bias applied yet */
+                     poste[i],
+                     block_mode);
++#ifdef KURA_PORT
++      if(KD2){
++        kd_f32("LCMP",i,lowcomp,1);
++        kd_f32("NOIS",i,noise,n/2);
++        kd_f32("EPEK",i,enpeak,n/2);
++        kd_f32("NPEK",i,nepeak,n/2/partition);
++      }
++#endif
+ 
+ 
+ // for _vp_noisemask
+@@ -1019,6 +1053,9 @@
+                    tone,
+                    global_ampmax,
+                    local_ampmax[i]);
++#ifdef KURA_PORT
++      if(KD2)kd_f32("TONE",i,tone,n/2);
++#endif
+ 
+ #if 0
+       if(vi->channels==2){
+@@ -1087,10 +1124,17 @@
+          broken the encode setup lib.  Guard it anyway. */
+       if(ci->floor_type[info->floorsubmap[submap]]!=1)return(-1);
+ 
++#ifdef KURA_PORT
++      if(KD2){ kd_f32("MASK",i,logmask,n/2); kd_f32("MDC1",i,mdct,n/2); }
++#endif
+       floor_posts[i][PACKETBLOBS/2]=
+         floor1_fit(vb,b->flr[info->floorsubmap[submap]],
+                    logmdct,
+                    logmask);
++#ifdef KURA_PORT
++      if(KD1)kd_i32("FFIT",i,floor_posts[i][PACKETBLOBS/2],
++                    ((vorbis_look_floor1 *)b->flr[info->floorsubmap[submap]])->posts);
++#endif
+ 
+       /* are we managing bitrate?  If so, perform two more fits for
+          later rate tweaking (fits represent hi/lo) */
+@@ -1222,9 +1266,20 @@
+         int submap=info->chmuxlist[i];
+         int *ilogmask=iwork[i];
+ 
++#ifdef KURA_PORT
++        kura_dump_ch=i;
++#endif
+         nonzero[i]=floor1_encode(opb,vb,b->flr[info->floorsubmap[submap]],
+                                  floor_posts[i][k],
+                                  ilogmask);
++#ifdef KURA_PORT
++        if(KD1){
++          kd_i32("FPST",i,floor_posts[i][k],
++                 ((vorbis_look_floor1 *)b->flr[info->floorsubmap[submap]])->posts);
++          kd_i32("NZ  ",i,&nonzero[i],1);
++          kd_i32("ILOG",i,ilogmask,n/2);
++        }
++#endif
+ #if 0
+         {
+           char buf[80];
+@@ -1255,6 +1310,14 @@
+                                     ci->psy_g_param.sliding_lowpass[vb->W][k],
+                                     vi->channels,
+                                     lowpass_residue);
++#ifdef KURA_PORT
++      if(KD1){
++        for(i=0;i<vi->channels;i++){
++          kd_i32("RQPO",i,iwork[i],n/2);
++          kd_i32("NZC ",i,&nonzero[i],1);
++        }
++      }
++#endif
+ 
+ #if 0
+       for(i=0;i<vi->channels;i++){
+@@ -1281,6 +1344,9 @@
+           }
+         }
+ 
++#ifdef KURA_PORT
++        kura_dump_ch=i;
++#endif
+         classifications=_residue_P[ci->residue_type[resnum]]->
+           class(vb,b->residue[resnum],couple_bundle,zerobundle,ch_in_bundle);
+ 
+@@ -1303,6 +1369,13 @@
+       if(b->lW_block_mode==block_mode) b->lW_no++;
+       else b->lW_no = 1;
+       b->lW_block_mode = block_mode;
++#ifdef KURA_PORT
++      if(KD1){
++        int64_t e[2]={oggpack_bytes(opb),oggpack_bits(opb)};
++        kd_i64("BEND",KD_NOCH,e,2);
++      }
++      kura_dump_seq++;
++#endif
+       /* ok, done encoding.  Next protopacket. */
+ 
+       // check block type
+--- a/vorbis_vendor/lib/psy.c
++++ b/vorbis_vendor/lib/psy.c
+@@ -31,6 +31,7 @@
+ #include "scales.h"
+ #include "misc.h"
+ #include "abl.h"
++#include "kura_port.h"
+ #define NEGINF -9999.f
+ 
+ #define existe(x,y) (x<-y || x>=y) // !existe(x,0.5f) is faster than (rint(x)==0.f). (By the same result)
+@@ -4938,6 +4939,12 @@
+   // set phase ratio for M6
+   if(vi->coupling_steps==1) prae=0.34;
+   else prae=0.825;
++
++#ifdef KURA_PORT
++  /* KURA_PORT のダンプ：partition ごとの「coupling の前」の整数を集める（lowpassr より上は 0） */
++  int *kd_pre=NULL;
++  if(KD1) kd_pre=calloc((size_t)ch*n,sizeof(*kd_pre));
++#endif
+ 
+ 
+   // processing by every partition
+@@ -4987,6 +4994,10 @@
+       track++;
+     }
+ 
++#ifdef KURA_PORT
++    if(kd_pre)
++      for(k=0;k<ch;k++) memcpy(kd_pre+(size_t)k*n+i,&iwork[k][i],jn*sizeof(int));
++#endif
+     /* coupling */
+     for(step=0;step<vi->coupling_steps;step++){
+       int Mi = vi->coupling_mag[step];
+@@ -5137,6 +5148,12 @@
+       memset(iwork[j]+lowpassr, 0, sizeof(**iwork)*block);
+     }
+   }
++#ifdef KURA_PORT
++  if(kd_pre){
++    for(i=0;i<ch;i++)kd_i32("RQPR",i,kd_pre+(size_t)i*n,n);
++    free(kd_pre);
++  }
++#endif
+ 
+   for(i=0;i<vi->coupling_steps;i++){
+     /* make sure coupling a zero and a nonzero channel results in two
+--- a/vorbis_vendor/lib/res0.c
++++ b/vorbis_vendor/lib/res0.c
+@@ -28,6 +28,7 @@
+ #include "registry.h"
+ #include "codebook.h"
+ #include "misc.h"
++#include "kura_port.h"
+ #include "os.h"
+ 
+ #if defined(TRAIN_RES) || defined (TRAIN_RESAUX)
+@@ -445,7 +446,13 @@
+ 
+       partword[j][i]=k;
+     }
++  }
++#ifdef KURA_PORT
++  if(KD1){
++    /* ch は「この submap で nonzero のチャンネルを詰めた番号」。上位 8 ビットに submap */
++    for(j=0;j<ch;j++)kd_long("RCLS",(kura_dump_ch<<8)|(int)j,partword[j],partvals);
+   }
++#endif
+ 
+ #ifdef TRAIN_RESAUX
+   {
+@@ -510,6 +517,9 @@
+     partword[0][i]=j;
+ 
+   }
++#ifdef KURA_PORT
++  if(KD1)kd_long("RCLS",(kura_dump_ch<<8),partword[0],partvals);
++#endif
+ 
+ #ifdef TRAIN_RESAUX
+   sprintf(buffer,"resaux_%d.vqd",look->train_seq);
+--- a/vorbis_vendor/lib/vorbisenc.c
++++ b/vorbis_vendor/lib/vorbisenc.c
+@@ -678,6 +678,11 @@
+   if(q_or_bitrate)req/=ch;
+ 
+   while(setup_list[i]){
++#ifdef KURA_PORT
++    /* KURA_PORT：5.1 の専用のテンプレート（coupling_restriction==6、aoTuV の 6 ch 用）は使わない。
++       6 ch も uncoupled のテンプレートで書く（ADR-149）。 */
++    if(setup_list[i]->coupling_restriction==6){ i++; continue; }
++#endif
+     if(setup_list[i]->coupling_restriction==-1 ||
+        setup_list[i]->coupling_restriction==ch){
+       if(srate>=setup_list[i]->samplerate_min_restriction &&
+@@ -1271,4 +1276,41 @@
+     return(OV_EIMPL);
+   }
+   return(OV_EINVAL);
++}
++
++#ifdef KURA_PORT
++/* KURA_PORT：codebook の名前とポインタの対応（oracle_setup が book_param を名前で出すため）。
++   books は static なので、同じ翻訳単位に置く。生成は oracle/scripts/gen_booknames.py。 */
++#include "kura_booknames.h"
++#endif
++
++#ifdef KURA_PORT
++/* KURA_PORT：選ばれたテンプレートの名前と制約（oracle_setup 用） */
++#define KURA_T(x) { &x, #x }
++static const struct { const ve_setup_data_template *t; const char *name; } kura_templates[]={
++  KURA_T(ve_setup_44_51), KURA_T(ve_setup_48_stereo), KURA_T(ve_setup_44_stereo),
++  KURA_T(ve_setup_48_uncoupled), KURA_T(ve_setup_44_uncoupled),
++  KURA_T(ve_setup_32_stereo), KURA_T(ve_setup_32_uncoupled),
++  KURA_T(ve_setup_22_stereo), KURA_T(ve_setup_22_uncoupled),
++  KURA_T(ve_setup_16_stereo), KURA_T(ve_setup_16_uncoupled),
++  KURA_T(ve_setup_11_stereo), KURA_T(ve_setup_11_uncoupled),
++  KURA_T(ve_setup_8_stereo), KURA_T(ve_setup_8_uncoupled),
++  KURA_T(ve_setup_X_stereo), KURA_T(ve_setup_X_uncoupled),
++  KURA_T(ve_setup_XX_stereo), KURA_T(ve_setup_XX_uncoupled),
++  { 0, 0 }
++};
++const char *kura_setup_template(const void *setup, int *coupling_restriction,
++                                long *rate_min, long *rate_max, int *mappings){
++  int i;
++  for(i=0;kura_templates[i].t;i++){
++    if((const void *)kura_templates[i].t==setup){
++      if(coupling_restriction)*coupling_restriction=kura_templates[i].t->coupling_restriction;
++      if(rate_min)*rate_min=kura_templates[i].t->samplerate_min_restriction;
++      if(rate_max)*rate_max=kura_templates[i].t->samplerate_max_restriction;
++      if(mappings)*mappings=kura_templates[i].t->mappings;
++      return kura_templates[i].name;
++    }
++  }
++  return "?";
+ }
++#endif

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/kura-core", "crates/kura-engine", "crates/kura-mac", "crates/kura-devtools", "src-tauri"]
+members = ["crates/kura-core", "crates/kura-engine", "crates/kura-mac", "crates/kura-devtools", "crates/vorbis-tables", "src-tauri"]
 # 第三者のクレートの写し（[patch.crates-io] で差し替える）。ワークスペースの lint・整形・テストの対象にしない
 exclude = ["third_party/symphonia-codec-vorbis"]
 
@@ -16,6 +16,8 @@ repository = "https://github.com/zredjet/kura"
 kura-core = { path = "crates/kura-core" }
 kura-engine = { path = "crates/kura-engine" }
 kura-mac = { path = "crates/kura-mac" }
+# aoTuV の Vorbis のエンコーダの表（BSD-3-Clause。第三者のライセンスの一覧に、移植の kura-engine と同じ節で載る）
+vorbis-tables = { path = "crates/vorbis-tables" }
 
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip：小数を正しく丸めて読む。既定の速い読み方は 1 ULP ずれることがあり、保存した編集の文書を読み直すと引数が変わる（ADR-136）

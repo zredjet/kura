@@ -1,0 +1,26 @@
+[package]
+name = "rlibm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "照合用の C エンコーダに、Rust の libm =0.2.16（arch なし。kura-engine の crate::math と同じ）の超越関数を出す"
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# kura のワークスペース（根の Cargo.toml の [workspace.dependencies] の libm）と同じ指定。arch を外して CPU 固有の実装を使わない。
+libm = { version = "=0.2.16", default-features = false }
+
+[profile.release]
+opt-level = 2
+debug = false
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+# kura のワークスペースから独立させる（ワークスペースの lint・整形・テスト・第三者のライセンスの一覧の対象にしない）。
+# 組むのは ../build.py（出力は既定で <リポジトリ>/target/vorbis-oracle/rlibm-target）。
+[workspace]

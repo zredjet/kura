@@ -1,0 +1,20 @@
+[package]
+name = "vorbis-tables"
+description = "aoTuV（libvorbis）の Ogg Vorbis のエンコーダの表（テンプレート・codebook・窓など）。kura-engine の自作のエンコーダが使う"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+# 中身は aoTuV（Aoyumi）と Xiph.org の表なので、その条件（BSD-3-Clause）で配る。本文は LICENSE（aoTuV の COPYING）。
+# 名前を kura- で始めないのは、aoTuV と Xiph.org の表のクレートだと名前で分かるようにするため（一覧では kura-engine の移植と同じ BSD-3-Clause の節に載る）。
+license = "BSD-3-Clause"
+repository.workspace = true
+
+# 依存なし（生成物をコミットし、ビルドのときには生成しない。生成の手順は gen/README.md）。
+[dev-dependencies]
+# テストで、生成したデータのバイト列の SHA-256 を、gen.py（Python の hashlib）が C の値から計算したものと照らす。
+# blake3 は Python の標準にないので SHA-256 にした。Cargo.lock にすでにある版（tauri の依存）に固定する。
+sha2 = "=0.10.9"
+
+[lints]
+workspace = true

@@ -23,3 +23,6 @@ node_modules/
 /fuzz/artifacts/
 /fuzz/coverage/
 /fuzz/Cargo.lock
+
+# 照合用のエンコーダ（crates/vorbis-tables/oracle/README.md）：出力は既定で /target/vorbis-oracle/。rlibm を直に cargo で組んだときの target
+/crates/vorbis-tables/oracle/rlibm/target/
