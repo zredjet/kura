@@ -117,6 +117,11 @@ Kura は次のどちらかのライセンスを選んで利用できます（二
 - MIT License（[LICENSE-MIT](LICENSE-MIT)）
 - Apache License 2.0（[LICENSE-APACHE](LICENSE-APACHE)）
 
+例外として、次のものは元のライセンスに従います。
+
+- `crates/vorbis-tables/` と `crates/kura-engine/src/codec/vorbis/`・`crates/kura-engine/src/codec/ogg.rs`（aoTuV・libvorbis・libogg のエンコーダを移したもの）：BSD-3-Clause（aoTuV の Aoyumi と Xiph.org Foundation の著作権表示。[crates/vorbis-tables/LICENSE](crates/vorbis-tables/LICENSE)）。そのため `kura-engine` のライセンスは `(MIT OR Apache-2.0) AND BSD-3-Clause`。
+- `third_party/` の各クレート（不具合を直した写し）：それぞれの元のライセンス（`symphonia-codec-vorbis` は MPL-2.0。変更は各ディレクトリの `KURA.md`）。
+
 このリポジトリに送られた貢献は、明示しない限り、Apache License 2.0 の定義に従い、追加の条件なしに上と同じ二重ライセンスで提供されるものとします。
 
 配布する `Kura.app` に含まれる第三者のライブラリのライセンス表記は [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) にまとめています（`pnpm run licenses` で生成し、アプリの `Contents/Resources` にも入ります）。

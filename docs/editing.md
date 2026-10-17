@@ -207,7 +207,7 @@ pub enum TimeMap {
 
 - 座標の計算はすべてあふれを確かめ、あふれたものは「範囲の外」として落とす（落ちない）。引数の座標は ±2^31 まで（`geom::COORD_LIMIT`。読み込みで確かめる）。
 - 書き出し先で失うものは、エンコーダの `MetaCaps` と照らして、保存する前に一覧で出す（例：「jpg ではアルファが失われます」「mp3 ではループ点を保存できません」）。`MetaCaps` は、可逆か（`lossless`：ほかの項目の範囲の中の値ならそのまま戻るか）・透明（`alpha`：`None`・`Binary`（GIF のように 0 か 255）・`Full`）・パレット・色の数の上限（`max_colors`：GIF は 256。超えると減色）・16 ビット・ICC・EXIF・DPI・テキスト・アニメ・ループ点・マーカー・タグを持つ。形式の表の `caps` は形式として保存できるもの、エンコーダの `caps(format, options)` はそのエンコーダがその設定で実際に書けるもの（例：固定の WebP のエンコーダはアニメを書けない）で、事前の警告はエンコーダのほうを見る。
-- ループ点の入れ物：WAV は `smpl`（と `cue `）、AIFF は `MARK` と `INST` の sustainLoop、Ogg・FLAC は `LOOPSTART`・`LOOPLENGTH` の Vorbis コメント（終わり = LOOPSTART + LOOPLENGTH。含まない）。MP3・m4a・AAC のループ点は読まない（`MetaCaps` も持たない）。FLAC はマーカーを持てない（`MetaCaps.markers` が偽なので、保存の前の一覧（上）に「マーカーを保存できません」と出る。エンコーダは黙って書かない）。
+- ループ点の入れ物：WAV は `smpl`（と `cue `）、AIFF は `MARK` と `INST` の sustainLoop、Ogg・FLAC は `LOOPSTART`・`LOOPLENGTH` の Vorbis コメント（終わり = LOOPSTART + LOOPLENGTH。含まない）。どの形式も、ループ点は `start < end ≤ 長さ` のときだけ書く（範囲の外・長さ 0・逆向きは書かない。正規の作り手は作らないが、`AudioMeta` を直接組む呼び手のため）。MP3・m4a・AAC のループ点は読まない（`MetaCaps` も持たない）。FLAC はマーカーを持てない（`MetaCaps.markers` が偽なので、保存の前の一覧（上）に「マーカーを保存できません」と出る。エンコーダは黙って書かない）。
 
 ## 7. 操作
 
@@ -317,7 +317,7 @@ register_ops! {
 3. 乱数は ChaCha8 だけ。種は `determinism::seed(node.seed, 元のハッシュ, 用途)`（kura-core の `splitmix64`・`fnv1a64` と同じ値）で作り、鍵は `key_from_seed`（splitmix64 で 32 バイトに広げる。rand_core の `seed_from_u64`・`from_rng` は禁止）。乱数の流れは**絶対位置**で決める（`rng_at`：画像は行、音声はチャンネルを流れにして、列の中の位置へシークする）。タイル・ブロック・フレームの番号を流れに使わない。アニメのフレームはどれも同じ乱数になる（ディザのちらつきを防ぐ）。種がノード ID・画面の操作の順・一括の並びに依存しないので、エディタと一括で同じになる（E4・E5）。
 4. 出力に効く場所で `HashMap`・`HashSet`・`RandomState`・`DefaultHasher` を使わない（`BTreeMap` か並べた `Vec`）。
 5. 描画の中で時刻・環境変数・引数（`env::var*`・`vars*`・`args*`）を読まない。`#![forbid(unsafe_code)]`。
-6. 結果に効く依存は Cargo.toml で `=` で版を固定する（libm・blake3・rand_chacha、コーデックの png・zune-jpeg・jpeg-encoder・gif・image-webp・resvg・miniz_oxide、段 6 の symphonia の部品のクレート・nanomp3・md-5）。上げるのは、ゴールデンが通るときだけ。SIMD の経路がターゲットで値を変えうる依存は、SIMD の feature を外す（zune-jpeg の neon・x86、jpeg-encoder の simd、symphonia-core の opt-simd、nanomp3 の wide。md-5 は FLAC の MD5 を書くだけで値は実装によらない）。ほかの依存（dev 依存を含む）がついでに有効にしていないかを `scripts/check-engine-features.sh` が確かめ、CI でも回す。serde_json は固定しない（正規の JSON は自前で書き、読み込みは `float_roundtrip` で正しく丸めるので、結果は版によらない）。
+6. 結果に効く依存は Cargo.toml で `=` で版を固定する（libm・blake3・rand_chacha、コーデックの png・zune-jpeg・jpeg-encoder・gif・image-webp・resvg・miniz_oxide、段 6 の symphonia の部品のクレート（Vorbis は `third_party/` の直した写し。§9.7）・nanomp3・md-5）。段 7 の Ogg Vorbis の表はワークスペースの `vorbis-tables`（生成物を SHA-256 で凍結）。上げるのは、ゴールデンが通るときだけ。SIMD の経路がターゲットで値を変えうる依存は、SIMD の feature を外す（zune-jpeg の neon・x86、jpeg-encoder の simd、symphonia-core の opt-simd、nanomp3 の wide。md-5 は FLAC の MD5 を書くだけで値は実装によらない）。ほかの依存（dev 依存を含む）がついでに有効にしていないかを `scripts/check-engine-features.sh` が確かめ、CI でも回す。serde_json は固定しない（正規の JSON は自前で書き、読み込みは `float_roundtrip` で正しく丸めるので、結果は版によらない）。
 
 ### 8.3 数値計算は自前で書く
 
@@ -359,7 +359,7 @@ register_ops! {
 - bless は今の出力をそのまま凍結するだけなので、凍結する前に、画素や標本を直接確かめるテストで正しさを確かめておく。
 - **作り直しの見本集**（§8.6 の 1）：`goldens-replay/replay.jsonl` に、複数のノードの文書（保存した JSON）・入力の作り方・値のダイジェストを凍結し、`Engine::load` で読み直して描いて照らす（`tests/replay.rs`）。凍結した `doc` が正本で、凍結したときのスキーマのまま読む（スキーマ 1 の見本はスキーマの移行を通る）。見本の定義（`examples()`）は、凍結した文書を今のスキーマへ移したものと一致すること、まだ凍結していない見本を足すことだけに使う。スキーマを上げたら、今のスキーマの見本を新しい名前で足す。`goldens-replay/` には `replay.jsonl` のほかのファイルを置けない。
 - **コーデックのゴールデン**（`tests/codec_golden.rs`）：`goldens-codecs/<コーデックの ID（/ は @）>.jsonl`。ID は読み取り（`-dec`）と書き出し（`-enc`）で別にする（片方の版上げで、もう片方の照合が外れないように）。
-  - エンコーダ（R2）`png-rs-enc@1.jsonl`：書いたバイト列のダイジェスト（`file`）と、それを読み直したデコーダの ID（`decoder`）・値のダイジェスト（`value`）。読み直しは、記録したデコーダ（旧版を含む）で照らす。バイト列が変わったら、エンコーダの約束の版を上げる。今ないエンコーダのファイルは照らさない（版を上げた旧版）。依存のクレート（png・fdeflate・flate2・miniz_oxide など）を上げてバイト列が変わったときも、ここで気づく。
+  - エンコーダ（R2）`png-rs-enc@1.jsonl`：書いたバイト列のダイジェスト（`file`）と、それを読み直したデコーダの ID（`decoder`）・値のダイジェスト（`value`）。読み直しは、記録したデコーダ（旧版を含む）で照らす。バイト列が変わったら、エンコーダの約束の版を上げる。今ないエンコーダのファイルは照らさない（版を上げた旧版）。依存のクレート（png・fdeflate・flate2・miniz_oxide など）を上げてバイト列が変わったときも、ここで気づく。読み直しのデコーダが値の再現を約束しない行（段 7 の `ogg-vorbis-kura-enc@1.jsonl` は symphonia の Vorbis で読み直す）は `value` を持たず、書いたバイト列と、読み直した形（長さ・レート・チャンネル）だけを照らす。再現できるデコーダなのに `value` がない行、再現できないデコーダなのに `value` がある行は失敗にする。自作の Ogg Vorbis のバイト列は浮動小数の計算で決まるが、照合で aarch64 と x86_64 の一致を確かめたので、ほかのターゲットでも同じ行を照らす。CI は照合用の C なしで回るので、`ogg-vorbis-kura-enc@1.jsonl` は kura の範囲で選ばれる 16 のテンプレート（8 つのレートの族 × stereo・uncoupled。X は 96・192 kHz）と 9 レートそれぞれの stereo・uncoupled・1〜8 チャンネル・q −1 と 10・26 kHz 以上の衝撃（`bursts`。aoTuV の M3）・大きくなっていくトーン（`swell`。M9）を短い長さで覆い（35 行。44.1 kHz・品質 0 の衝撃の 2 行は aoTuV の M2 にも届く）、`ogg_templates_are_covered` が覆いの抜けを失敗にする（心理モデルの係数・M2・M3・M9 の定数を 1 つ変えると、2〜8 行が落ちることを確かめた。M2 の前の判定（`postnoise_detection` の閾値）の変更には、照合のテストを含めてまだどのテストも気づかない）。
   - デコーダ（R1 のうちデコーダだけの経路）`png-rs-dec@1.jsonl`：下の層で組んだファイル（`testfiles::FileGen`：1/2/4 ビット・tRNS・インターレース・64 ビットの浮動小数・拡張形式・他のツールのメタデータ・大きさの分からない data など）を読んだ値のダイジェスト。凍結した行は、その ID のデコーダ（今の版か旧版）で読んで照らし、その ID のデコーダがなければ失敗にする。
   - どちらも追記だけの検査の対象。再現を約束しないデコーダ（`reproducible()` が偽。SVG と段 6 の Vorbis・AAC）は、デコーダのゴールデンに入れない（入れようとすると失敗にする）。それらは他のデコーダの読み取りとの照合（`tests/fixtures.rs`）で確かめ、編集するときはアンカーを作る（§9.4）。
 - **共有のテストベクタ**（`crates/kura-engine/tests/vectors/`）：Rust と TS で同じ規則を実装するもの（描画の筆・ピクセルパーフェクト・点の列の詰め方・重ねる式）の入出力を、エンジンが JSON で凍結する（`tests/paint_vectors.rs`。足りなければ `KURA_BLESS=1`）。フロントは `src/lib/paint.test.ts` が同じファイルを読んで照らす。フィクスチャと同じく、消す・変えるのを認めない（追記だけの検査が見る）。
@@ -408,7 +408,7 @@ pub trait Encoder: Send + Sync {
 - 組み立て：`CodecSet::pinned()`（固定のコーデックと旧版）か `CodecSet::pinned_with(&PinnedOptions { svg_fonts })`（kura-mac が OS のフォントを渡す。渡さなければ文字を含む SVG は `Unsupported`）に、kura-mac・ffmpeg の段を `add_decoder`・`add_encoder` で足す。識別子はデコーダ（旧版を含む）・エンコーダのそれぞれで重ならないこと（重なれば `Err`。記録の識別子から 1 つに決まらなくなるため）。`all_decoders_for(format)` は旧版を含めて、その形式を読めるデコーダを返す（ファズ・照合のため）。
 - WAV のメタデータ（cue・labl・INFO）は、数をマーカーの上限で、大きさを `max_meta_bytes` で抑える。1 項目ごとに文字の長さに 32 バイトを足して予算から引く（空の名前でも数だけで予算を使い切れるように）。cue を先に読んでいれば、cue にない ID の labl は予算を使わずに捨てる。
 - 段 2 で入れたもの：PNG（`png` クレート `=0.18.1`。1/2/4 ビットは 8 ビットへ、tRNS はアルファへ、ICC・pHYs・テキストを運ぶ。圧縮したテキストは読まない）と WAV（自作。PCM 8/16/24/32・浮動小数 32/64・拡張形式、smpl・cue・adtl・INFO）。
-- 段 4 で入れたもの：§9.5。段 6 で入れたもの：§9.6。
+- 段 4 で入れたもの：§9.5。段 6 で入れたもの：§9.6。段 7 で入れたもの：§9.7。
 - `Platform` は kura-mac が実装して注入する（`MediaBackend` と同じ形）。Swift とのあいだは C の型だけでやり取りし、画素や PCM は Rust が確保したバッファのポインタと長さで受け渡す（ADR-37 の改訂。M10 の段 9）。
 - `External` は ffmpeg（同梱しない・任意）。PCM は標準入出力で流す。引数には `-fflags +bitexact -protocol_whitelist file,pipe` を付ける。
 
@@ -432,14 +432,14 @@ pub trait Encoder: Send + Sync {
 | MP3 | audio | nanomp3（`mp3-nanomp3-dec/1`。minimp3 とビット一致、libm を使わない。LAME の gapless） | 自作のエンコーダができるまでは ffmpeg（External）。なければ形式を変えて保存する |
 | ALAC（m4a） | audio | symphonia（`m4a-alac-symphonia-dec/1`。整数だけ） | — |
 | AAC-LC（m4a・ADTS） | audio | symphonia（`m4a-aac-symphonia-dec/1`・`aac-adts-symphonia-dec/1`。再現を約束しない → アンカー。priming は自作で切る） | AudioToolbox（Platform） |
-| Ogg Vorbis | audio | symphonia（`ogg-vorbis-symphonia-dec/1`。再現を約束しない → アンカー） | **自作のエンコーダと Ogg の多重化**（段 7。ADR-137） |
+| Ogg Vorbis | audio | symphonia（`ogg-vorbis-symphonia-dec/2`。3 チャンネル以上の residue 0/1 を直した写し。再現を約束しない → アンカー。§9.7） | 自作（`ogg-vorbis-kura-enc/1`。aoTuV b6.03 の移植と Ogg の多重化。1〜8 チャンネル・8〜192 kHz。§9.7。ADR-149） |
 | HE-AAC・Opus | audio | AVFoundation（Platform。アンカー） | — |
 | ttf・otf・woff・woff2 | font | —（解析だけ。M11） | — |
 | glb ほか 1 ファイルの 3D | model | —（解析だけ。M11） | — |
 | 動画 | video | —（編集しない） | — |
 
 - C のライブラリは同梱しない。C か ffmpeg がないと書けない形式は、エンコーダを Rust で自作する（Ogg Vorbis を最優先。MP3・不可逆 WebP・Opus は必要になった段で。ADR-137）。
-- 音声のタグは、各コーデックが自前で読み書きする（WAV の INFO、AIFF の NAME・AUTH・`(c) `・ANNO、FLAC・Ogg の Vorbis コメント、m4a の iTunes のタグは読みだけ）。lofty は段 6 では入れない（ID3v2・MP4 のタグを書く段で選び直す。ADR-148）。MP3 の ID3 は段 6 では読まない。EXIF・ICC は運ぶ。PNG の tIME・MP4 の作成日時など、時刻は書かない（R2 のため）。
+- 音声のタグは、各コーデックが自前で読み書きする（WAV の INFO、AIFF の NAME・AUTH・`(c) `・ANNO、FLAC・Ogg の Vorbis コメント、m4a の iTunes のタグは読みだけ）。Vorbis コメントは、既知の名前（title など）を先に、`vorbis:<KEY>` をあとに書き、読み取りが同じ名前にまとめるもの（大文字小文字だけの違い・DESCRIPTION と COMMENT・小文字ちょうどの `cprt` と COPYRIGHT）が重なれば先の 1 つだけを書く（読み取りと書き出しは `codec/symph.rs` の 1 つの表 `KNOWN_TAGS`・`comment_name` で決める。読み取りは同じ名前の 2 つめ以降を捨てるので、書いて・読んで・書き直すと同じコメントになるように。FLAC はバイト列も同じ、Ogg はシリアル番号と CRC を除いて同じ）。外のファイルの同じキーの複数の値は、最初の値だけを運ぶ。読み取りが作らない形（`vorbis:foo` だけ・`vorbis:TITLE` のような別名だけ・`vorbis:DESCRIPTION` だけ・`vorbis:cprt` だけ）は、値は保たれるが、書き直すと名前か並びが変わる。`vorbis:CPRT` と `vorbis:cprt` は読み取りが別の名前にするので両方書く。symphonia がタグでなく章・画像として読む名前（CHAPTER…・METADATA_BLOCK_PICTURE・COVERART）を `vorbis:<KEY>` で書くと、読み直したときに値はタグに残らない。lofty は段 6 では入れない（ID3v2・MP4 のタグを書く段で選び直す。ADR-148）。MP3 の ID3 は段 6 では読まない。EXIF・ICC は運ぶ。PNG の tIME・MP4 の作成日時など、時刻は書かない（R2 のため）。
 
 - EXIF の向き（Orientation）：JPEG・PNG（eXIf）・WebP は、読むときに向きを画素に当て、運ぶ EXIF の向きを 1 にする（同じ向きを 2 回当てない）。形（`shape`）も向きを当てた大きさを返す。PSD は画素が表示のとおりなので向きは当てず、EXIF の向きだけ 1 にする。
 
@@ -481,6 +481,23 @@ pub trait Encoder: Send + Sync {
   - Vorbis：デコーダを作る前に、setup ヘッダの codebook ごとに symphonia が確保する大きさ（VQ の表、項目ごとの配列、探索表）を見積もり、合計が `min(max_value_bytes, 256 MiB)` を超えれば `Unsupported`。探索表は B = clamp(最長, 4, 8) ビットずつ読むブロックの木で、symphonia は完全な木でなければ表を作る前に断るので、深さ d = kB のブロックの数はちょうど 2^d − Σ_{長さ ≤ d} 数 · 2^(d − 長さ)（`Vec` の伸びを見込んで 1 要素 16 バイト）。検証で、長さ 17 の符号語 131,072 個の codebook（約 20 バイト）1 つで 143 MB、8 つ（約 300 バイトの Ogg）で 1 GB を確保させられると分かったので、表まで数えるようにした（そのファイルは今は確保の前に断り、ピークのメモリは 2.5 MB。乱数の形 9,000 個・codebook 1〜255 個の形 1,500 個で、見積もりが symphonia の実際の確保を下回らないことを確かめた）。floor0 の表・residue の作業領域・DSP の固定の確保（symphonia の上限で、最大でおよそ 14 MiB）は予算の外。Ogg の中の Opus は `Unsupported`（次の段へ）。
   - タグ：Vorbis コメント（FLAC・Ogg）と MP4 の iTunes のタグから title・artist・album・comment・date・genre・copyright、FLAC・Ogg のほかのキーは `vorbis:<KEY>` のまま運ぶ（FLAC に書き戻せる）。ALAC の元のビット数は magic cookie から読む。
 - 他のツールで作ったフィクスチャ（sox・flac・lame・afconvert・ffmpeg・libvorbis）で照らした（`tests/fixtures.rs`、作り方は fixtures/README.md）：FLAC・ALAC・AIFF は元とちょうど同じ値、MP3・AAC・Vorbis は他のデコーダ（ffmpeg・afconvert・lewton）と長さがちょうど同じで、信号と誤差の比が 3.4×10⁸ 以上（参照の 16 ビットの丸めの大きさ）。MP3 の free format は ffmpeg が読めないので LAME のデコーダと照らす。
+
+### 9.7 段 7 の Ogg Vorbis の書き出しの約束
+
+詳しい約束は `crates/kura-engine/src/codec/vorbis/mod.rs`（全体の地図・移植の規則・ブロックをまたぐ状態の表）、各ファイルの冒頭（どの C の関数・行を移したか）、`codec/ogg.rs`（ページ）に書き、ここは要点だけ（ADR-149）。
+
+- **作り方**：aoTuV b6.03（libvorbis 1.3.7 が土台。crates.io の `aotuv_lancer_vorbis_sys` 0.1.6 に入っている C）のエンコーダの流れと表を Rust に移した（`ogg-vorbis-kura-enc/1`、`Tier::Pinned`）。aoTuV の独自の機能（M1〜M9・12 帯域の envelope・aoTuV の ATH と hypot）はすべて移し、**前増幅（`pre_amplitude`。音量を変える）だけを除く**。ビットレートの管理（bitrate.c の管理の枝）と SSE の枝は移さない（品質の VBR だけ）。表（テンプレート 18 個・codebook 598 冊・窓・ATH・マスク・aoTuV の M3・M7・M9 の表など）は `crates/vorbis-tables`（BSD-3-Clause。C のヘッダから `gen/` の道具で作ってコミットし、入力の C と生成物を SHA-256 で凍結）に置く。
+- **正しさの基準**：前増幅だけを切った aoTuV の C を、FMA なし（`-ffp-contract=off`）・符号付き整数のあふれを 2 の補数で折り返す（`-fwrapv`）・SSE なし・超越関数を `libm =0.2.16` に差し替え・入力を一度に渡す形で組んだ「照合用のエンコーダ」（`crates/vorbis-tables/oracle/`。組み方は README。C の写しはコミットせず、crates.io の源に差分を当てて組む）と、識別・setup・すべての音声パケット・グラニュールがビット単位で一致する（コメントは vendor とタグが違うので除く）。照合のテストは `KURA_VORBIS_ORACLE=<組んだ場所>` のときだけ回る（`codec::vorbis` の回るテスト 136 件のうち 53 件。ffmpeg で長さを確かめる 1 件は `KURA_FFMPEG` も要る）。音声パケットを照らす範囲は、9 レート × 1・2・3・6・8 チャンネル × q −1・0・3・5・10、4・5・7 チャンネルとテンプレートの境のレートで 8 件、端の長さ、数秒の入力、NaN が途中に出る入力、aoTuV の衝撃の入力、極端な振幅（1e9〜`f32::MAX`）24 件、区間とスレッドの組、モジュールごとの中間値と導出の表。setup とヘッダは q −1〜10 のすべてで照らす（q 1・2・4・6〜9 の音声パケットは作業の記録で 312 本を照らした）。aarch64 の kura と x86_64 の kura（Rosetta）のどちらでも一致する。C の符号付き整数のあふれ（標本の絶対値がおよそ 1e9 を超えると residue の量子化で起きる）は未定義動作で、`-fwrapv` なしの `-O2` は `-O0` と違う出力を出すので、照合の基準は `-fwrapv` で定める（移植は wrapping の演算で写す）。float → int の範囲の外の変換は C では未定義のままで、aarch64 の飽和（Rust の `as` と同じ）に頼っている。
+- **移植の規則**（mod.rs の 12 か条）：C の型（float → f32・double → f64・int → i32・long → i64）、暗黙の型変換、演算の順をそのまま写す。FMA（`mul_add`・`fma`）を使わない（モジュールのテスト `no_fused_multiply_add` が `vorbis/` のすべてのファイルと `ogg.rs` を読み、注釈とリテラルを除いたコードで呼び出しを探す）。超越関数は `math` だけで、使うのは初期化（表・窓・Bark）だけ。todB はビットの式、`rint` は `round_ties_even`、C の `max`・`min` マクロは比較の形のまま、aoTuV の部分的な選択ソート（`ssort`）はそのまま写す。C が範囲の外を読む所（`noiseoff[j][17]`、M7 の短い窓の `spectral[n]`）は、結果に効かないか設定のテンプレートでは届かないことを確かめて、読まない形にした。
+- **範囲と設定**：1〜8 チャンネル、8,000〜192,000 Hz、2³⁰ − 2¹⁶ フレームまで（C の `int` の作業長があふれない範囲。48 kHz で約 6 時間）。`can_encode` はこの 3 つ（長さは形の最大）を見て、範囲の外は次の段へ回す。2 チャンネルは stereo のテンプレート（coupling・residue 2）、ほかは uncoupled（residue 1。5.1 の専用のテンプレートは使わない）。設定は `quality`（整数 −1〜10、既定 5。libvorbis の品質は `q / 10`）。元の品質から推定した値を渡すのは kura-core（M12 以降）。
+- **入力**：WAV の並びの planes を Vorbis I §4.3.9 の並び（symphonia の `map_vorbis_channel` と同じ表）に直して渡す。NaN は 0、±∞ は ±1 にする（NaN のビットの形がターゲットで違い、todB がビットを値にするため）。1 を超える有限の値はそのまま。全体を一度に渡す（`vorbis_analysis_buffer(N)`・`wrote(N)`・`wrote(0)`）ので、1,024 フレームずつ渡す libvorbis の使い方とは、最初の外挿と envelope の先読みの差で最初の数ブロックの窓の長短が変わり、そのあとのブロックの位置がずれることがある（同じ入力なら常に同じバイト列）。
+- **コメント**：vendor は `kura`。項目は LOOPSTART・LOOPLENGTH（`start < end ≤ 長さ` のときだけ）、`ENCODER=ogg-vorbis-kura-enc/1`、タグ（`symph::vorbis_comments_for`。名前の重なりを除く。§9.2）の順。元の `ENCODER`（`vorbis:ENCODER`）は運ばない（RPG ツクール MV/MZ は LOOPLENGTH の次の項目の長さの下位バイトまで数字として読みうるので、決まった ENCODER を番兵にする）。コメントのパケットが 16 MiB 以上なら `Unsupported`（symphonia の Ogg の読み口が読めるパケットの大きさ）。
+- **Ogg のページ**（`codec/ogg.rs`。凍結。変えるとエンコーダの版を上げる）：1 ページ目は識別ヘッダだけ（BOS・グラニュール 0）、コメントと setup は 2 ページ目から（setup で閉じる）、最初の音声パケットだけのページ（グラニュール 0）、「長いブロックで次が短い」パケットの直後では閉じない、本体が 4,096 バイト以上になったパケットで閉じる、最後の音声パケットだけの最後のページ（直前のパケットが「長・次は短」ならその 2 つ）に EOS、各ページのグラニュールはそこで終わる最後のパケットの窓の中心（最後のページは総フレーム数）。音声が 1 ページだけのストリームは lewton・ffmpeg が末尾を切らず（最初の音声パケットだけのページはそのため）、「長・次は短」の直後で閉じたページは lewton が数え誤る（そのため閉じない）。最後の音声パケットだけの最後のページは、検証で外しても長さが変わらなかったが、規則を単純に保つために凍結した。lewton の `OggStreamReader` は、最後が「長・次は短」のあとの短いブロックで終わる形で末尾を切りきれないことがある（192 kHz・8 チャンネル・q10 の正弦 1,000 フレームを 1,152 と読む。lewton の数え方の不具合で、ページの切り方では避けられない。symphonia・ffmpeg・libvorbis は正しい）。シリアル番号は `BLAKE3("kura-ogg-serial-v1" ‖ 値のダイジェスト ‖ 設定の正規の JSON)` の先頭 4 バイト（乱数・時刻を使わない）。空の音声も書く（libvorbis と同じく短いブロックの 1 パケット）。
+- **並列と速さ**：ブロックの計画（envelope。直列）→ 区間（2²¹ 標本ぶんのブロック）ごとに、aoTuV の窓の状態（直列）→ 窓・MDCT・FFT（`par_blocks`）→ ampmax・M5 の lowcomp・M3 の lastmdct（直列）→ 心理モデル・floor・residue・パケット（`par_blocks`。M3 の tempmdct を前から引き継ぐ続いた衝撃のブロックは 1 つの仕事の中で順に）。結果はスレッド数・区間の大きさによらない（照合とテストで確かめる）。中止は、PCM の確保の前、入力の写しの 2¹⁷ フレームごと、前の外挿（仕事ごとと 2¹⁷ 標本ごと）、envelope の探索の 2,048 歩ごと、計画 32 個ごと、ブロックの解析のブロックごと、シリアル番号のダイジェストの前後と 16,384 標本ごと、Ogg の多重化の 512 パケットごとに確かめる（48 kHz・ステレオで、最初から頼んだ中止は 1 ms 未満で戻り、確かめの間隔の最大は PCM の確保で 30 分なら約 35 ms、3 時間なら約 0.2 秒）。3 分の 44.1 kHz ステレオの q5 で 0.27〜0.30 秒、1 スレッドで 1.45〜1.56 秒（`vorbis_bench_three_minutes_stereo`、16 コア。測るたびの揺れ）。26 kHz 以上で衝撃の多い入力（クリックの列など）は、続いた衝撃のブロックが 1 つの仕事になるので段 3 がほぼ直列になる（10 分のステレオで約 9 秒。負荷のある機械で測った）。メモリは、書き出しのあいだ入力全体の f32 の写し（C の `vorbis_analysis_buffer`。値と同じ大きさ）を持ち、ピークは値の約 2.1〜2.8 倍（44.1 kHz ステレオ 3 分で値 64 MB に対して 168 MB）。段 10 のメモリの予算（§12）で、エンコーダごとの倍率として扱う。
+- **品質と互換**（数字は ADR-149）：同じ q で、素の aoTuV b6.03（vorbis_rs）とビットレート・NMR が中央値でほぼ同じ（違いは入力の渡し方と前増幅の分だけ）。kura の出力 1,200 本（1・2・3・6・8 チャンネル × 8・22.05・44.1・48・96・192 kHz × q −1・3・5・10 × 長さ 0〜数秒）を symphonia・lewton・ffmpeg・libvorbis（sox）で読み、長さはすべて元とちょうど同じ。検証では、端の長さ 405 本（1〜8 チャンネル・8〜192 kHz）と約 33 万本の掃引も、symphonia と lewton の `OggStreamReader` で長さが元どおりだった（上の lewton の例外を除く）。チャンネルの並びは 1〜8 チャンネルで symphonia・ffmpeg（WAV の並びで出す）と lewton・sox（Vorbis の並びで出す）が期待どおり。品質の記録の道具は `kura-devtools vorbis-quality`（合成の音と手元の音で、ビットレート・帯域・NMR・LSD・長さを測る。ViSQOL・Zimtohrli は作業の環境だけで使い、リポジトリには入れない）。
+- **symphonia の Vorbis の修正**：symphonia-codec-vorbis 0.6.1 は residue 0/1 を 2 チャンネル以上で読むとき、チャンネルの分類を次のチャンネルの範囲まで書いてしまい、1 チャンネルあたりの partition の数が分類の codebook の次元の倍数でない uncoupled の 3〜8 チャンネル（aoTuV b6.03 の q5、Xiph 1.3.7 の q3 など。品質（テンプレート）で起きたり起きなかったりする）を誤って読む。1 行を直した写しを `third_party/symphonia-codec-vorbis/`（MPL-2.0 のまま公開。`KURA.md` に変更・理由・確かめたこと）に置き、ワークスペース（と `fuzz/`）の `[patch.crates-io]` で使う。読む値が変わったので識別子を `ogg-vorbis-symphonia-dec/2` にした（公開前で、再現を約束しないデコーダの作り直しはアンカーから読むので、旧版の `/1` は残さない）。上流で直った版が出たら写しをやめる。
+- **dev 依存**：lewton `=0.10.2`（読み直しの照合だけ。E28（`tests/ogg_vorbis.rs`）と `codec::vorbis::encoder` の照合のテスト。aoTuV で作った 3・5 チャンネルのフィクスチャは、lewton の出力を保存した参照と照らす（`tests/fixtures.rs`））。
+- **Godot**：Godot 4 は libvorbis で読む。LOOPSTART・LOOPLENGTH は読まず、ループは取り込みの設定の `loop`・`loop_offset`（秒）で決め、ファイルの終わりからループする。つなぎ目なしにループさせるには、ループの終わりで切ったファイルに `loop_offset` を `(LOOPSTART + 0.5) / rate` 秒にする（Godot は秒を標本に切り捨てで直すため。Godot の再生を写したシミュレーションで確かめた）。M15 の持ち出しで使う。Godot での読み込みはユーザーが確かめる（roadmap の段 7）。
 
 ## 10. 描画の道具
 
@@ -595,7 +612,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   - 大きな画像：16384² の RGBA（値 1 GiB）を PNG に書いて読み直すテスト（`tests/large.rs`、release で 3.8 秒）のピークのメモリは 3.3 GB（元の値と読んだ値の 2 GiB を含む）。PNG の書き出しは行を詰めた写しを 1 つ作る（値と同じ大きさ。行ごとに書くとバイト列が変わるので、エンコーダの版を上げる段 10 のメモリの予算で扱う）。
   - 段 6 の音声のデコーダの上限：symphonia・nanomp3 に渡すファイルは `max_value_bytes` まで読み込む。長さはデコードせずに数え（パケットの長さの和・MP3 のフレームの走査）、形を上限（`max_audio_frames`・`max_value_bytes`・`max_channels`・`max_sample_rate`）で確かめてから確保する。デコードの途中でも形の上限を超えたら止める。Vorbis は codebook の表の大きさを渡す前に見積もって断る。AIFF の COMM は 279 バイトまで、MARK・INST・テキストは WAV と同じ予算（マーカーの上限・`max_meta_bytes`）。symphonia の panic は `codec::contain` が受け止める。
   - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・AIFF・FLAC・MP3・Ogg・m4a・AAC・文書の読み込み）はファズにかける。
-    - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_document` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
+    - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_document` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
     - `tests/fuzz_smoke.rs` は同じ口を stable で回す変異のファズ。種（各形式の小さなファイル・フィクスチャ・文書）をバイトの書き換え・挿入・削除・つなぎ合わせで崩す。ふだんの `cargo test` で対象ごとに 150 回（`quick`）、`KURA_FUZZ_SECS=<秒> cargo test --release -p kura-engine --test fuzz_smoke long -- --ignored` で長く回す（`KURA_FUZZ_ONLY=svg,wav` で対象を選べる）。見つけた入力は `target/fuzz-smoke/` に残し、`replay` で流し直す。
     - 文書のファズは、上限を絞ったエンジンで読み込み、小さな入力（画像・パレットの画像・フレームの列・音声、格子・ピボット・スライス付きのシート、ループ点・マーカー付きの音声）で計画を作って描くところまで流す（段 5 から。新しい操作の実行の経路とメタデータの写し方にも届く）。追記だけの引数（`actions` の列）を持つノードは、途中で切って差分の適用（`Op::apply_appended`）が全体を当て直したものと同じかも照らす（E21。実行器が差分を使う段 10 までは、ファズでここを照らす）。
     - デコーダのファズは、上限を絞って（`testing::fuzz_limits`）その形式のすべてのデコーダ（旧版を含む）で形と中身を読み、自分のコードの panic（panic の場所が `crates/kura-engine/src/` のもの。`testing::catch_own_panic` が panic のフックで見分ける）・形と中身の食い違い・`Internal` を見つけたものとして扱う。壊れたファイルとしてのエラーと第三者のクレートの panic（`codec::contain` がエラーに変える）は正しい振る舞い。
@@ -603,6 +620,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
     - 段 5 で、nightly の cargo-fuzz（libFuzzer。release ＋デバッグの検査 ＋ AddressSanitizer、`-fork` で並べて落ちても続ける）を 9 つの対象で回した。各 30 分を 2 回、直したあとに SVG・文書・aseprite を 10〜20 分ずつ、合わせて約 2.7 億回。見つけたのは SVG と自前の新しい検査だけで、どれも直した：参照の輪と深い入れ子によるスタックのあふれ（受け止められずにプロセスごと落ちる）、resvg の pattern のタイルの上限のない確保（209 GB）、巨大な半径の楕円の遅い描画、数の検査の無限ループ。最後の実行（SVG 約 1,360 万回・文書 約 200 万回）では何も見つかっていない。見つけた入力は `replay` で流し直せる形で残す（`fuzz/README.md`）。
     - カバレッジ（育った種で数えた行の割合。同じファイルのエンコーダと、テストの例を作る関数は除く）：PNG 92%・JPEG 84%・GIF 90%・WebP 84%・WAV 92%・aseprite 95%・PSD 94%・SVG 83%。文書は、操作 78〜99%・メタデータの写し方 80%・実行器 72%・描画 70〜93%。届いていないのは主に、中止・あふれ・確保の失敗の枝と、識別子を返す関数。カバレッジで、aseprite のパレットの番号のまま描く経路・メタデータの写し方・差分の適用に届いていないと分かったので、種・入力・照らし合わせを足した。
     - 段 6 で音声の 6 つの対象（`decode_aiff`・`decode_flac`・`decode_mp3`・`decode_ogg`・`decode_m4a`・`decode_aac`）を足した。種は自作の AIFF・FLAC の書き出しと、他のツールで作ったフィクスチャ（MP3・Ogg Vorbis・Opus・ALAC・AAC・HE-AAC）。stable の変異で対象ごとに 60 秒（合わせて約 980 万回）、cargo-fuzz で対象ごとに 15 分（合わせて約 2,360 万回）回し、何も見つかっていない。検証のあとの修正（MP3・AIFF・Ogg・m4a）のあとにも、WAV を含む 7 対象を stable の変異で 40 秒ずつ（合わせて約 1,170 万回）回し、何も見つかっていない。ファズで届かない形（巨大な codebook を名乗る Vorbis・グラニュールで詰めた Ogg・切れた MP3 など）は、検証で組んだ入力を単体のテストとフィクスチャに残した。カバレッジ（読み取りの関数の行。同じファイルのエンコーダ・テストを除く）：AIFF 90%・FLAC 90%・MP3 89%・Ogg・m4a・ADTS の読み取り（`lossy.rs`）93%・symphonia の共通の部品（`symph.rs`）81%。届いていないのは主に、中止・途中でチャンネルの数が変わる枝と、ファズでは組めない形（巨大な codebook を名乗る Vorbis。単体のテストで確かめる）。
+    - 段 7 で自前のエンコーダの対象 `encode_ogg`（`testing::fuzz_encode`）を足した。先頭の 19 バイト（`FUZZ_ENCODE_HEADER`）で品質（−1〜10）・レート・チャンネル（1〜9）・長さ（0〜16,384 フレーム）・ループ点（なし・範囲の中・u64 の端に近い始まり／終わり）・タグ（0〜4 個。別名・大文字小文字違い・書けない名前、空・`=`・NUL・4,096 バイト前後・70,000 バイトの値）を決め、残りを f32 のビット列（NaN・∞・巨大な値を含む）として標本にする。書けない形（レート・チャンネルの範囲の外）は断ること、書けると答えた形は断らないこと、すべての ogg のデコーダ（旧版を含む）で読み直した長さ・レート・チャンネルが元と同じこと、コメントのループ点が範囲の中だけ正しい値で書かれ、名前が重ならず、読み直して書き直すと同じコメントになることを確かめる。検証で cargo-fuzz の `encode_ogg` を 31 分（約 6.9 万回）、`decode_ogg`（kura の出力 672 本を種に足して）を 7 分（約 220 万回）、stable の変異の `encode_ogg` を 300 秒（約 7.8 万回）回し、何も見つかっていない。メタデータを足したあとも、stable で 90 秒（約 2.8 万回）と cargo-fuzz で 5 分（約 1.1 万回）回して何も見つかっていない（エンコーダは 1 回が重いので回数は少ない）。カバレッジ（行）：psy 94%・envelope 92%・floor1 88%・res0 86%・block 82%・ogg 79%。届かないのはエラーの枝と、設定のテンプレートでは届かない枝（M7 の短い窓の範囲の外・5.1 の coupling など）。
     - 通常の `cargo test` にも、ChaCha8 でランダムな文書と壊れたファイルを作るテスト（形式ごとの `broken_files_are_errors` など）を入れる。
 
 ## 14. 保存と版（M12 以降。意味だけを決める。表は data-model.md に各段で書く）
@@ -653,6 +671,8 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 | 1024² の乱数の画素を 256 色に（なし・組織的・誤差拡散） | 353 ms・316 ms・496 ms（全画素の色が違う最悪の形。色の表の並べ替えと、色ごとの最近傍の探索が大半） |
 | 文書の大きさ（筆 1,000 本・各 50 点） | 約 0.3 MB |
 
+段 7 の実測（`cargo test --release -p kura-engine --lib vorbis_bench -- --ignored --nocapture`、16 コア）：Ogg Vorbis の書き出しは、3 分の 44.1 kHz ステレオで q5 が 0.27〜0.30 秒・q0 が 0.26〜0.30 秒・q10 が 0.30〜0.33 秒（1 スレッドで 1.45〜1.56・1.46〜1.57・1.61〜1.71 秒。2 回の測定の幅）。直列で残るのは、ブロックの計画（envelope。q5 で約 0.08 秒）がほとんど。
+
 ## 17. 受け入れテスト（`kura-engine` のテストとして実装する）
 
 | ID | 内容 |
@@ -676,7 +696,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 | E17 | ゲイン 0dB と長さ 0 のフェードは何も変えない。int16・int24 → f32 → 元のビット数の往復はビット一致 |
 | E18 | 区間ごとに描いても（チャンク 1・7・4,096・全体）値が同じ |
 | E19 | ラウドネスの計測が EBU Tech 3341 の試験信号で ±0.1 LU。正規化したあとの積分ラウドネスが目標の ±0.1 LU |
-| E20 | WAV の smpl・cue、AIFF の MARK・INST、Ogg の LOOPSTART・LOOPLENGTH を読んで書いても保たれる（Ogg は段 6 では読みだけを確かめ、書き出しは段 7 の E28 で。FLAC の LOOPSTART・LOOPLENGTH も往復を確かめる） |
+| E20 | WAV の smpl・cue、AIFF の MARK・INST、Ogg の LOOPSTART・LOOPLENGTH を読んで書いても保たれる（FLAC の LOOPSTART・LOOPLENGTH も往復を確かめる。Ogg の書き出しは段 7 で足した。他のツールで書いた Ogg のループ点も読む）。範囲の外・長さ 0・逆向きのループ点はどの形式も書かない。名前の重なるタグは 1 つだけ書き、書いて・読んで・書き直すと同じコメント（FLAC はバイト列も同じ、Ogg はシリアル番号と CRC を除いて同じ） |
 | E21 | 同じ点の列からは同じ画素ができる。差分で当てても全体を当て直しても同じ。ピクセルパーフェクトの規則どおり。TS と共有するベクタと一致する |
 | E22 | 塗りつぶしは 4 連結・8 連結・許容差の定義どおりで、たどる順に左右されない |
 | E23 | スポイトが返す色とインデックスが、描画結果の画素と一致する |
@@ -684,6 +704,6 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 | E25 | 上限を超える出力は推論の段階で `Limit` になり、描かない。壊れたファイル・展開爆弾で落ちない |
 | E26 | 解析と操作が一致する（不透明な範囲とトリムで切り取る範囲、ラウドネスの値と正規化で使う値） |
 | E27 | aseprite の合成が、Aseprite で書き出したフィクスチャと一致する |
-| E28 | 自作の Ogg Vorbis の出力が、独立したデコーダ 2 つ以上で読め、長さ・ループのコメントが保たれる |
+| E28 | 自作の Ogg Vorbis の出力が、独立したデコーダ 2 つ以上（symphonia・lewton）で読め、長さ・位置・ループのコメントが保たれる。ページが §9.7 の規則に従い（「長・次は短」が途中と最後の前に来る実際の出力でも）、品質の段・スレッド数・チャンネルとレートの範囲が約束どおり。NaN・±∞ を含む入力が 0・±1 に置き換えた入力と同じバイト列（シリアル番号と CRC を除く）、3〜8 チャンネルの並びを lewton と仕様の表で確かめる（`tests/ogg_vorbis.rs` と `codec::vorbis::encoder` のテスト） |
 | E29 | Platform・External のコーデックを通った版は、デコードのダイジェストとコーデックの識別子が記録され、変わったら検出される。アンカーがあればアンカーから作り直す |
 | E30 | §16 の性能（`#[ignore]` 付きのベンチテストと `kura-devtools bench edit`） |

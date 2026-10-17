@@ -27,8 +27,10 @@ Cargo.toml                 # workspace
 crates/kura-core/          # OS 非依存のドメインロジック（DB, 取り込み, 検索, ユニット, プレイリスト, ジョブ）
 crates/kura-core/migrations/  # SQL マイグレーション（連番、既存は編集禁止）
 crates/kura-engine/        # 編集の操作エンジン：文書・操作・描画・解析・コーデック（OS・DB 非依存）
+crates/vorbis-tables/      # Ogg Vorbis のエンコーダの表（aoTuV から生成。BSD-3）と照合用の C の組み方（oracle/）
 crates/kura-mac/           # macOS 専用：サムネイル, メディア情報, スナップショット（Swift ヘルパー）
 crates/kura-devtools/      # ダミーライブラリ生成・ベンチマーク
+third_party/               # 不具合を直した第三者のクレートの写し（[patch.crates-io]。元のライセンスのまま）
 src-tauri/                 # Tauri アプリ本体：commands/, protocol/（kura://）, events, window
 src/                       # React フロント：features/, components/, styles/, ipc/, stores/
 docs/                      # 仕様・設計（下記）
