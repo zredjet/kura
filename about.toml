@@ -20,3 +20,25 @@ accepted = [
 targets = ["aarch64-apple-darwin"]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+
+# libm（kura-engine の超越関数）：LICENSE.txt は MIT と Apache-2.0 の本文に、著作権の表示（Jorge Aparicio、musl の
+# Rich Felker ほか、musl の数学の部分の Sun Microsystems ほか）を足した 1 つのファイルで、cargo-about はこれを MIT の本文と
+# 認められず、著作権者の欄が空の雛形（`Copyright (c) <year> <copyright holders>`）を載せてしまう。MIT の許諾の本文と著作権の表示の
+# 2 か所を切り出して載せる（一覧には libm の MIT の節が 2 つ並ぶ）。checksum は切り出した範囲（start の始まりから end の
+# 終わりまで）の SHA-256。libm の版を上げて LICENSE.txt が変わると cargo-about は警告だけで雛形に戻すので、
+# scripts/third-party-licenses.mjs がそれを止める。kura-engine が .app に入るまでは libm が依存のグラフになく、
+# cargo-about が「config found for a crate not present in the graph」と警告する（害はない）。
+[libm.clarify]
+license = "MIT"
+
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+start = "rust-lang/libm as a whole is available for use under the MIT license:"
+end = "SOFTWARE."
+checksum = "88abfa952aa119ec3671f35fa0dc52589721f7f93982bd90f9649528f8fd74f8"
+
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+start = "This Rust library contains the following copyrights:"
+end = "Copyright notices are retained in src/* files where relevant."
+checksum = "cbdcdbb2c9a9da2ebdebfc9d0ef3349bac1cc4ddd78b7256a8150e515e52b5b8"
