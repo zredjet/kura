@@ -1,24 +1,28 @@
 //! 編集のエンジンを手で確かめる（docs/editing.md）。
 //!
 //! - `edit shape --in <file>`：形式と形（ヘッダだけ）を表示する
+//! - `edit caps`：今の環境で読める・書ける形式の表（固定の段・macOS・ffmpeg。docs/editing.md §9.3）を JSON で表示する
 //! - `edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]`：
 //!   文書を当てて書き出し、値のダイジェスト・読み取りと書き出しの記録・警告を表示する
+//!
+//! コーデックはアプリと同じ組（`kura_mac::full_codec_set`：固定の段 → macOS → ffmpeg）で選ぶ。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use kura_engine::codec::{CodecSet, format_by_ext};
+use kura_engine::codec::{CodecSet, PinnedOptions, format_by_ext};
 use kura_engine::doc::{DecodeOptions, InputId};
 use kura_engine::render::{Engine, InputValue};
 use kura_engine::{Digest, NoMonitor};
 
-const USAGE: &str = "使い方: kura-devtools edit shape --in <file> | edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]";
+const USAGE: &str = "使い方: kura-devtools edit shape --in <file> | edit caps | edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]";
 
 /// `edit` の入口。
 pub fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("shape") => shape(&args[1..]),
         Some("render") => render(&args[1..]),
+        Some("caps") => caps(),
         _ => Err(USAGE.to_string()),
     }
 }
@@ -39,11 +43,27 @@ fn format_of(path: &Path) -> Result<&'static str, String> {
         .ok_or_else(|| format!("{} の形式が分かりません", path.display()))
 }
 
+/// アプリと同じコーデックの組。ffmpeg の一時ファイルは OS の一時フォルダの下に置く。
+fn codecs() -> CodecSet {
+    let work = std::env::temp_dir().join("kura-devtools-codec");
+    kura_mac::full_codec_set(&PinnedOptions::default(), &work)
+}
+
+fn caps() -> Result<(), String> {
+    let table = codecs().capabilities();
+    let text = serde_json::to_string_pretty(&table).map_err(|e| e.to_string())?;
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.write_all(b"\n"))
+        .map_err(|e| e.to_string())
+}
+
 fn shape(args: &[String]) -> Result<(), String> {
     let input = PathBuf::from(opt(args, "--in").ok_or(USAGE)?);
     let format = format_of(&input)?;
     let engine = Engine::new().map_err(|e| e.to_string())?;
-    let (shape, codec) = CodecSet::pinned()
+    let (shape, codec) = codecs()
         .shape_path(&input, format, &DecodeOptions::default(), engine.limits())
         .map_err(|e| e.to_string())?;
     tracing::info!(format, codec, ?shape, "形");
@@ -68,7 +88,7 @@ fn render(args: &[String]) -> Result<(), String> {
         None => serde_json::json!({}),
     };
     let engine = Engine::new().map_err(|e| e.to_string())?;
-    let codecs = CodecSet::pinned();
+    let codecs = codecs();
     let graph = engine
         .load(&std::fs::read(&doc).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;

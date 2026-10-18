@@ -148,7 +148,7 @@ fn header(out: &mut String, ctx: &Context, sounds: &[Sound], refs: &[Reference])
     );
     line!(
         out,
-        "- デコーダ：指標は `{}`（symphonia。中で OS の libm を使うので、別の機械では小数の末尾が変わりうる）で読んだ値、長さと値の照合に {LEWTON_ID}（最後のページのグラニュールで切る）",
+        "- デコーダ：指標は `{}`（symphonia。超越関数を libm に差し替えた写しで、どの機械でも同じ値）で読んだ値、長さと値の照合に {LEWTON_ID}（最後のページのグラニュールで切る）",
         ctx.decoder_id
     );
     line!(
