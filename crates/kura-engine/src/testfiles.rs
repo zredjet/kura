@@ -112,6 +112,10 @@ pub enum FileGen {
         unknown_size: bool,
         seed: u64,
     },
+    /// アンカー（`codec::anchor`。段 9）：`input` の値を、偽の Platform のデコーダ（`fake-platform-dec/1`・既定の環境）で
+    /// 読んだ記録として書いたもの。形式は `anchor`。その場の書き手で書いて読み直すので、読んだ値は作り方の値と必ず同じ
+    /// （デコーダのゴールデンは値の作り方を守るだけ。決まったバイト列からの読み取りは凍結したアンカーのフィクスチャで守る）。
+    Anchor { input: crate::testgen::InputGen },
 }
 
 /// aseprite の層。
@@ -239,6 +243,7 @@ impl FileGen {
                 .and_then(crate::codec::format_by_ext)
                 .map_or("", |f| f.id),
             Self::Wav { .. } => "wav",
+            Self::Anchor { .. } => crate::codec::anchor::FORMAT,
         }
     }
 
@@ -376,8 +381,30 @@ impl FileGen {
                 *unknown_size,
                 *seed,
             )),
+            Self::Anchor { input } => anchor_bytes(input),
         }
     }
+}
+
+/// アンカーのバイト列（`FileGen::Anchor`）。書いて読み直して照らしたもの。
+fn anchor_bytes(input: &crate::testgen::InputGen) -> Result<Vec<u8>, EngineError> {
+    use crate::codec::anchor::{AnchorContext, write_verified};
+    let v = input.generate()?;
+    let stamp = crate::codec::DecodeStamp {
+        codec: "fake-platform-dec/1".into(),
+        tier: crate::codec::Tier::Platform,
+        reproducible: false,
+        value_digest: v.digest()?,
+        env: Some(crate::testing::FakePlatformDecoder::default_env()),
+    };
+    write_verified(
+        &v,
+        &stamp,
+        &AnchorContext::default(),
+        &crate::limits::Limits::default(),
+        &crate::monitor::NoMonitor,
+    )
+    .map(|(b, _)| b)
 }
 
 /// CRC-32（PNG のチャンク）。

@@ -43,6 +43,12 @@ resolver = "2"
 name = "symphonia_codec_vorbis"
 path = "src/lib.rs"
 
+# kura：窓・floor 0・codebook の sin・cos・atan・exp・ldexp を OS の libm でなくこのクレート（純 Rust。arch の
+# feature を外す）で計算する。kura-engine と同じ版に固定する（KURA.md）
+[dependencies.libm]
+version = "=0.2.16"
+default-features = false
+
 [dependencies.log]
 version = "0.4"
 

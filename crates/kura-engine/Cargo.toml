@@ -20,8 +20,8 @@ repository.workspace = true
 # - miniz_oxide：aseprite・PSD の zlib の展開（上限付き）
 # - image-webp：WebP の読み取り（可逆・非可逆・アニメ）と可逆の書き出し
 # - resvg：SVG の描画。中で std の三角関数（OS の libm）を使うので、結果は環境に依存する（R1 を約束しない。§9.4 のアンカーを作る）
-# - symphonia-*：FLAC・ALAC（整数だけ。値を再現できる）と AAC-LC・Vorbis（中で std の超越関数（OS の libm）を使うので
-#   R1 を約束しない。§9.4 のアンカーを作る）の読み取り、MP4・Ogg の読み口。部品のクレートを直接 `=` で固定し、既定の
+# - symphonia-*：FLAC・ALAC（整数だけ）と AAC-LC・Vorbis（段 9 から、超越関数を libm に差し替えた third_party の写しで
+#   値を再現できる。ADR-153）の読み取り、MP4・Ogg の読み口。部品のクレートを直接 `=` で固定し、既定の
 #   feature（opt-simd の rustfft は AAC・Vorbis の値を変える）と id3v2（スタックのあふれ #562）を入れない
 # - nanomp3：MP3 の読み取り（minimp3 とビット一致の純 Rust。libm を使わない）。SIMD（wide）は外す
 # - md-5：FLAC の STREAMINFO の MD5（入力の標本だけで決まる）

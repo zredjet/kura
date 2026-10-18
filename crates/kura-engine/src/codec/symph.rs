@@ -9,7 +9,7 @@
 //!   （形と中身が必ず一致する。形より長く出てきたものも `Decode`）。AAC は priming を自前で切るので（`lossy.rs`）、
 //!   形は上限（`AtMost`）。壊れたパケットは飛ばさずエラーにする（長さが形と食い違わないように）。
 //! - 標本：FLAC・ALAC は 32 ビットに左詰めした整数を `pcm::int_to_f32(v, 32)`（元の幅の式と同じ値。WAV・AIFF と一致）、
-//!   AAC・Vorbis は f32 のまま。
+//!   AAC・Vorbis は f32 のまま（NaN だけは `0x7fc00000` にそろえる。[`canonical_nan`]）。
 //! - タグ：Vorbis コメント（FLAC・Ogg）と MP4 の iTunes のタグから、title・artist・album・comment・date・genre・
 //!   copyright を読み、FLAC・Ogg のほかのキーは `vorbis:<KEY>` のまま運ぶ（FLAC に書き戻せる）。
 //!   `LOOPSTART`・`LOOPLENGTH`（Vorbis コメント）をループ点にする（終わり = LOOPSTART + LOOPLENGTH。含まない）。
@@ -163,10 +163,9 @@ pub(crate) fn open<'a>(
         .as_ref()
         .map(|c| c.count())
         .filter(|n| *n > 0)
-        .ok_or_else(|| EngineError::Decode {
-            codec: id.to_string(),
-            message: "チャンネルの数がありません".into(),
-        })?;
+        // チャンネルの数を読めない（4・7 チャンネルの AAC の m4a など、symphonia が配置を知らない）ものは、このデコーダでは
+        // 扱えない形として次の段（macOS）へ回す。壊れたファイルなら、どの段も読めずに読み取りの失敗になる
+        .ok_or_else(|| EngineError::Unsupported(format!("{id}: チャンネルの数がありません")))?;
     if channels as u64 > limits.max_channels {
         return Err(EngineError::Limit("チャンネルが多すぎます".into()));
     }
@@ -281,7 +280,8 @@ impl Opened<'_> {
                         out.extend(src.iter().map(|s| pcm::int_to_f32(*s, 32)));
                     }
                     GenericAudioBufferRef::F32(b) => {
-                        out.extend_from_slice(b.plane(ch).ok_or_else(missing)?);
+                        let src = b.plane(ch).ok_or_else(missing)?;
+                        out.extend(src.iter().map(|s| canonical_nan(*s)));
                     }
                     _ => {
                         return Err(EngineError::Unsupported(format!(
@@ -292,6 +292,20 @@ impl Opened<'_> {
             }
         }
         Ok(planes)
+    }
+}
+
+/// NaN を 1 つのビット列（`0x7fc00000`。値のダイジェスト `kura-pcm-v1` がそろえる形と同じ）にする。ほかの値はそのまま。
+///
+/// 壊れた Vorbis・AAC では、デコードの途中で inf − inf・0 · inf などが起きて NaN が出る。そのビット列（符号・ペイロード）は
+/// CPU の既定の NaN（x86 の SSE は `0xffc00000`、ARM は `0x7fc00000`）と演算の順で決まり、arm64 と x86_64 で違う
+/// （値のダイジェストは同じでも、f32 の WAV に書いたバイト列が違った。段 9 の検証）。値に入れる前にそろえて、読んだ値を
+/// ビット単位でどの環境でも同じにする。ダイジェストはもともと NaN をそろえるので、デコーダの識別子は変えない。
+pub(crate) fn canonical_nan(s: f32) -> f32 {
+    if s.is_nan() {
+        f32::from_bits(0x7fc0_0000)
+    } else {
+        s
     }
 }
 
@@ -508,7 +522,9 @@ pub(crate) fn decoder_options() -> AudioDecoderOptions {
 /// AudioSpecificConfig を見て、HE-AAC（SBR・PS）なら true（symphonia は半分のレートで読んでしまう。次の段へ回す）。
 /// 明示の印だけを見る：オブジェクトの種類 5・29、または GASpecificConfig のあとの同期の拡張（0x2B7・種類 5・
 /// sbrPresentFlag = 1）。ffmpeg は「SBR なし」を同期の拡張（sbrPresentFlag = 0）で明示するので、旗まで読む。
-/// 帯域の中だけの SBR（暗黙の印）は外から見分けられない。チャンネルの構成 0（PCE）は読まない（LC とみなす）。
+/// 帯域の中だけの SBR（暗黙の印。ADTS はいつもこれ）は ASC では見分けられないので、`lossy.rs` が先頭のパケットを
+/// デコードして fill 要素の SBR の拡張を見る（写しの `AacDecoder::sbr_seen`）。チャンネルの構成 0（PCE）は読まない
+/// （LC とみなす）。
 pub(crate) fn is_he_aac(asc: &[u8]) -> bool {
     let bit = |i: usize| -> Option<u32> {
         let b = asc.get(i / 8)?;
@@ -829,6 +845,42 @@ impl Bits<'_> {
 mod tests {
     use super::*;
 
+    /// NaN はどのビット列でも `0x7fc00000` にそろえ（符号・ペイロードを捨てる）、ほかの値（-0・±∞・非正規化数）は
+    /// ビット単位でそのまま。
+    #[test]
+    fn canonical_nan_keeps_everything_but_nan() {
+        for bits in [
+            0x7fc0_0000u32,
+            0xffc0_0000,
+            0x7f80_0001,
+            0xff80_0001,
+            0x7fff_ffff,
+            0xffff_ffff,
+        ] {
+            assert_eq!(
+                canonical_nan(f32::from_bits(bits)).to_bits(),
+                0x7fc0_0000,
+                "{bits:#x}"
+            );
+        }
+        for bits in [
+            0u32,
+            0x8000_0000,
+            0x7f80_0000,
+            0xff80_0000,
+            1,
+            0x8000_0001,
+            0x3f80_0000,
+            0xbf7f_ffff,
+        ] {
+            assert_eq!(
+                canonical_nan(f32::from_bits(bits)).to_bits(),
+                bits,
+                "{bits:#x}"
+            );
+        }
+    }
+
     #[test]
     fn itunsmpb_and_asc() {
         assert_eq!(
@@ -843,6 +895,9 @@ mod tests {
         assert!(is_he_aac(&[0x13, 0x90, 0x56, 0xE5, 0xA0]));
         assert!(!is_he_aac(&[0x12, 0x10, 0x56, 0xE5, 0x00]));
         assert!(!is_he_aac(&[]));
+        // 暗黙の SBR（ADTS から写した m4a の ASC：LC・22,050 Hz・2 チャンネルだけ）は ASC では見分けられない
+        // （lossy.rs が帯域の中を見る。tests/symphonia_copies.rs）
+        assert!(!is_he_aac(&[0x13, 0x90]));
         assert_eq!(alac_bits(&[0, 0, 16, 0, 0, 24, 0]), Some(24));
         let mut boxed = b"\0\0\0\x0cfrma\0\0\0\0\0\0\0\x24alac\0\0\0\0".to_vec();
         boxed.extend_from_slice(&[0, 0, 16, 0, 0, 20, 0]);

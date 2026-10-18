@@ -22,7 +22,10 @@ fn float32_unpack(x: u32) -> f32 {
     let mantissa = x & 0x1fffff;
     let sign = x & 0x80000000;
     let exponent = (x & 0x7fe00000) >> 21;
-    let value = (mantissa as f32) * 2.0f32.powi(exponent as i32 - 788);
+    // kura：mantissa · 2^(exponent − 788) を libm クレートの ldexpf で正確に求める（仕様・libvorbis の ldexp と同じ）。
+    // 元の `2.0f32.powi(n)` は LLVM の展開（__powisf2 の呼び出しか ldexp への書き換え）で、2^n が f32 で表せない
+    // 端（n < −126・n > 127）の値が変わりうる。2^n を表せる範囲では元と同じ値
+    let value = libm::ldexpf(mantissa as f32, exponent as i32 - 788);
     if sign == 0 { value } else { -value }
 }
 
@@ -37,14 +40,33 @@ fn lookup1_values(entries: u32, dimensions: u16) -> u32 {
         return 0;
     }
 
-    // (value ^ dimensions) <= entries
-    // [(value ^ dimensions) ^ (1 / dimensions)] = lower[entries ^ (1 / dimensions)]
-    // value = lower[entries ^ (1 / dimensions)]
-    let value = (entries as f32).powf(1.0f32 / f32::from(dimensions)).floor() as u32;
+    // kura：浮動小数の powf（OS の libm）で見当を付けて切り捨てる元の実装は、entries が 2^17 を超えると丸めで 1 大きく
+    // なる組があり（上流の assert で panic する）、その組は OS・CPU で違う（KURA.md）。仕様の定義どおり、整数だけで
+    // value^dimensions ≤ entries となる最大の value を二分探索で求める（libvorbis も整数で確かめ直す）
+    lookup1_values_exact(entries, dimensions)
+}
 
-    assert!(value.pow(u32::from(dimensions)) <= entries);
-
-    value
+/// kura：value^dimensions ≤ entries となる最大の value（整数だけ）。
+fn lookup1_values_exact(entries: u32, dimensions: u16) -> u32 {
+    let entries = u64::from(entries);
+    // v^dimensions ≤ entries か（途中で entries を超えたら打ち切る。v ≥ 2 なら 33 回以内）
+    let fits = |v: u64| -> bool {
+        let mut acc = 1u64;
+        for _ in 0..dimensions {
+            acc = acc.saturating_mul(v);
+            if acc > entries {
+                return false;
+            }
+        }
+        true
+    };
+    let (mut lo, mut hi) = (0u64, entries);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) { lo = mid } else { hi = mid - 1 }
+    }
+    // lo ≤ entries ≤ u32::MAX
+    lo as u32
 }
 
 /// As defined in section 3.2.1 of the Vorbis I specification.
@@ -466,6 +488,37 @@ mod tests {
         assert_eq!(lookup1_values(0, u16::MAX), naive_lookup1_values(0, u16::MAX));
         assert_eq!(lookup1_values(1, u16::MAX), naive_lookup1_values(1, u16::MAX));
         assert_eq!(lookup1_values(0xff_ffff, u16::MAX), naive_lookup1_values(0xff_ffff, u16::MAX));
+    }
+
+    /// kura：整数の lookup1_values は、powf で見当を付けると 1 大きくなる組（k^d の 1 つ手前など。上流は assert で
+    /// panic した）でも、素朴な数え上げと同じ値になる。
+    #[test]
+    fn kura_lookup1_values_is_exact() {
+        // 素朴な数え上げは value まで 1 つずつ数えるので、dims = 1 は小さい範囲だけ
+        for dims in 1..=4u16 {
+            let max = if dims == 1 { 3_000 } else { 70_000 };
+            for entries in 0..=max {
+                assert_eq!(lookup1_values(entries, dims), naive_lookup1_values(entries, dims));
+            }
+        }
+        // k^d の前後（d = 1 は上で見た。2 以上なら k は 4,096 まで）
+        for dims in 2..=24u16 {
+            let mut k = 1u64;
+            while let Some(p) = k.checked_pow(u32::from(dims)).filter(|p| *p <= 0xff_ffff + 1) {
+                for e in [p - 1, p, p + 1] {
+                    if let Ok(e) = u32::try_from(e) {
+                        if e <= 0xff_ffff {
+                            assert_eq!(lookup1_values(e, dims), naive_lookup1_values(e, dims));
+                        }
+                    }
+                }
+                k += 1;
+            }
+        }
+        // powf の切り捨てで 1 大きくなった組（手元の macOS の arm64 で見つけたもの）
+        assert_eq!(lookup1_values(1_953_124, 3), 124);
+        assert_eq!(lookup1_values(16_687_224, 2), 4084);
+        assert_eq!(lookup1_values(3_442_950, 3), 150);
     }
 
     #[test]

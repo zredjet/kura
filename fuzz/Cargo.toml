@@ -15,10 +15,14 @@ kura-engine = { path = "../crates/kura-engine" }
 
 [workspace]
 
-# ルートのワークスペースと同じ差し替え（symphonia-codec-vorbis 0.6.1 の 3 ch 以上の不具合の 1 行の修正。
-# third_party/symphonia-codec-vorbis/KURA.md）。ここは別のワークスペースなので、ルートの [patch] が届かない
+# ルートのワークスペースと同じ差し替え（symphonia 0.6.1 の写し：Vorbis の 3 ch 以上の不具合の修正、Vorbis・AAC の
+# 超越関数の libm への差し替え、lookup1_values の整数化。third_party/<クレート>/KURA.md）。ここは別のワークスペース
+# なので、ルートの [patch] が届かない
 [patch.crates-io]
+symphonia-codec-aac = { path = "../third_party/symphonia-codec-aac" }
 symphonia-codec-vorbis = { path = "../third_party/symphonia-codec-vorbis" }
+symphonia-core = { path = "../third_party/symphonia-core" }
+symphonia-format-ogg = { path = "../third_party/symphonia-format-ogg" }
 
 [[bin]]
 name = "decode_png"
@@ -135,6 +139,13 @@ bench = false
 [[bin]]
 name = "decode_peaks"
 path = "fuzz_targets/decode_peaks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_anchor"
+path = "fuzz_targets/decode_anchor.rs"
 test = false
 doc = false
 bench = false

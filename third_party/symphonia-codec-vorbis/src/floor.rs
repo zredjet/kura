@@ -257,7 +257,8 @@ impl Floor for Floor0 {
 
             // Pre-compute the 2 times the cosine of all coefficients.
             for coeff in self.coeffs[..order].iter_mut() {
-                *coeff = 2.0 * coeff.cos();
+                // kura：OS の libm に頼らない cos・atan・exp（crate::kura_math と libm クレート。環境で値を変えない。この節の 3 か所も）
+                *coeff = 2.0 * crate::kura_math::cosf(*coeff);
             }
         }
 
@@ -293,7 +294,7 @@ impl Floor for Floor0 {
             let iter_cond = map[i];
 
             let omega = omega_step * iter_cond as f32;
-            let cos_omega = omega.cos();
+            let cos_omega = crate::kura_math::cosf(omega);
             let two_cos_omega = 2.0 * cos_omega;
 
             let mut p = 1.0;
@@ -356,7 +357,7 @@ impl Floor for Floor0 {
 /// Vorbis I specification, section 6.2.3.
 #[inline(always)]
 fn bark(x: f64) -> f64 {
-    (13.1 * (0.00074 * x).atan()) + (2.24 * (0.0000000185 * x * x).atan()) + (0.0001 * x)
+    (13.1 * libm::atan(0.00074 * x)) + (2.24 * libm::atan(0.0000000185 * x * x)) + (0.0001 * x)
 }
 
 fn bark_map(n: u32, floor0_rate: u16, floor0_bark_map_size: u16) -> Vec<i32> {
@@ -393,7 +394,7 @@ fn linear_floor0_value(
     let a = amplitude.wrapping_mul(u64::from(amplitude_offset)) as f32;
     let b = (p + q).sqrt() * ((1u64 << amplitude_bits) - 1) as f32;
 
-    (0.11512925 * ((a / b) - f32::from(amplitude_offset))).exp()
+    crate::kura_math::expf(0.11512925 * ((a / b) - f32::from(amplitude_offset)))
 }
 
 #[derive(Debug, Default)]

@@ -26,8 +26,7 @@ ignore-dev-dependencies = true
 # 認められず、著作権者の欄が空の雛形（`Copyright (c) <year> <copyright holders>`）を載せてしまう。MIT の許諾の本文と著作権の表示の
 # 2 か所を切り出して載せる（一覧には libm の MIT の節が 2 つ並ぶ）。checksum は切り出した範囲（start の始まりから end の
 # 終わりまで）の SHA-256。libm の版を上げて LICENSE.txt が変わると cargo-about は警告だけで雛形に戻すので、
-# scripts/third-party-licenses.mjs がそれを止める。kura-engine が .app に入るまでは libm が依存のグラフになく、
-# cargo-about が「config found for a crate not present in the graph」と警告する（害はない）。
+# scripts/third-party-licenses.mjs がそれを止める。段 9 から kura-core・kura-mac が kura-engine に依存し、libm は .app の依存に入った。
 [libm.clarify]
 license = "MIT"
 
@@ -122,3 +121,24 @@ license = "CC0-1.0"
 [[dunce.clarify.files]]
 path = "LICENSE"
 checksum = "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+
+# jpeg-encoder（kura-engine の JPEG の書き出し。kura-mac と kura-core が kura-engine に依存して .app に入った。M10 段 9）：
+# `(MIT OR Apache-2.0) AND IJG` の IJG の本文が LICENSE-IJG にあるが、前置き（どの部分が IJG の移植か）があるので IJG と
+# 判定されない。MIT・Apache-2.0 の本文と一緒に指定する。
+[jpeg-encoder.clarify]
+license = "(MIT OR Apache-2.0) AND IJG"
+
+[[jpeg-encoder.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "4d022727ea392ebba2fe5e9a5f78c610a0eae506b491f3db29c78b6d430d6503"
+
+[[jpeg-encoder.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "85a884980abd6032fc6b5439ba918ab16db9ac9051b5cf18db9c27c587df07c0"
+
+[[jpeg-encoder.clarify.files]]
+path = "LICENSE-IJG"
+license = "IJG"
+checksum = "a21e92ec88aefc6823f0c51994783571a849e8d9b43d9ade61ec9d886776721e"

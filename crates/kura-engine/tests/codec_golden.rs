@@ -3,9 +3,12 @@
 //! - ファイルは `goldens-codecs/<コーデックの ID の / を @ にしたもの>.jsonl`。ID は読み取り（`-dec`）と書き出し（`-enc`）で別。
 //!   - `png-rs-enc@1.jsonl`：1 行に `{"decoder","file","format","input","name","options","value"}`。
 //!     file は書いたバイト列のダイジェスト、value はそれを `decoder` で読み直した値のダイジェスト。
-//!     読み直しのデコーダが値の再現を約束しない（`reproducible()` が偽。symphonia の Vorbis など）行は value を書かず、
+//!     読み直しのデコーダが値の再現を約束しない（`reproducible()` が偽）行は value を書かず、
 //!     書いたバイト列（file）と、読み直した形（長さ・レート・チャンネル）が元の値と同じことだけを照らす。値を持たないのに
 //!     読み直しのデコーダが再現できる行、値を持つのに再現できない行は失敗にする。
+//!     例外は、再現を約束しなかったデコーダの版を上げて旧版を残さなかったとき（`SUPERSEDED`。段 9 の
+//!     `ogg-vorbis-symphonia-dec/2` → `/3`）：旧版の識別子の行（value なし）は書き換えず、後の版で読み直して形だけを照らし、
+//!     後の版で読み直した値は、同じ例を新しい名前（`<名前>-dec3`）で足した行が凍結する。
 //!   - `png-rs-dec@1.jsonl`：1 行に `{"name","source","value"}`。下の層で組んだファイル（source）を読んだ値のダイジェスト。
 //! - **追記だけ**（scripts/check-goldens-append-only.sh が見る）。
 //!   - 書くバイト列が変わったら、エンコーダの約束の版を上げる（`-enc/1` → `-enc/2`）。旧版のエンコーダは残さなくてよい
@@ -407,8 +410,9 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
             },
         ));
     }
-    // 段 7：Ogg Vorbis（自作の書き出し）。読み直しのデコーダ（symphonia の Vorbis）は値の再現を約束しないので、
-    // 行は value を持たず、書いたバイト列と読み直した形（長さ・レート・チャンネル）だけを照らす
+    // 段 7：Ogg Vorbis（自作の書き出し）。段 7・8 の読み直しのデコーダ（`ogg-vorbis-symphonia-dec/2`）は値の再現を
+    // 約束しなかったので、この名前の行は value を持たず、書いたバイト列と読み直した形（長さ・レート・チャンネル）だけを
+    // 照らす（段 9 からは `/3` で読み直す。`SUPERSEDED`）。`/3` で読み直した値は、関数の終わりで足す `<名前>-dec3` の行が凍結する
     let sine = |rate, channels, frames| InputGen::Sine {
         rate,
         channels,
@@ -596,8 +600,31 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
     ] {
         v.push((name, "ogg", json!({ "quality": quality }), input));
     }
+    // 段 9：上の Ogg Vorbis の例を、同じ設定・入力のまま `<名前>-dec3` の名前でもう一度並べる。読み直しのデコーダが
+    // 値を再現できる `ogg-vorbis-symphonia-dec/3` になったので、この行が読み直した値（value）を凍結する（元の名前の行は
+    // `/2` の識別子のまま value を持たず、書き換えないため。`SUPERSEDED`）。書いたバイト列は元の名前の行と同じ
+    let ogg: Vec<_> = v
+        .iter()
+        .filter(|e| e.1 == "ogg" && !e.0.ends_with(REREAD_SUFFIX))
+        .cloned()
+        .collect();
+    for (name, format, options, input) in ogg {
+        let twin: &'static str = Box::leak(format!("{name}{REREAD_SUFFIX}").into_boxed_str());
+        v.push((twin, format, options, input));
+    }
     v
 }
+
+/// 段 9 で、読み直した値を凍結するために同じ Ogg Vorbis の例を足し直した行の名前の接尾辞。
+const REREAD_SUFFIX: &str = "-dec3";
+
+/// 再現を約束しなかったデコーダの版を上げ、旧版を残さなかったもの：（凍結した行の識別子, 今の版の識別子）。
+/// 凍結した行（value なし）は書き換えないので、今の版で読み直して形だけを照らす（値は `REREAD_SUFFIX` の行が凍結する）。
+/// 足すのは、旧版が値の再現を約束しなかった（行が value を持たない）ときだけ。
+const SUPERSEDED: &[(&str, &str)] = &[
+    // 段 9：symphonia の表の超越関数を libm クレートにして、値を再現できるようにした（公開前なので旧版は残さない）
+    ("ogg-vorbis-symphonia-dec/2", "ogg-vorbis-symphonia-dec/3"),
+];
 
 fn file_name(codec: &str) -> String {
     codec.replace('/', "@")
@@ -691,7 +718,46 @@ fn check_reread(
     want_shape: &kura_engine::Shape,
     failures: &mut String,
 ) {
-    let (name, decoder) = (&old.name, &old.decoder);
+    let name = &old.name;
+    // 旧版を残さなかったデコーダの行は、今の版で読み直して形だけを照らす（`SUPERSEDED`）
+    if let Some(&(_, now)) = SUPERSEDED.iter().find(|(gone, _)| *gone == old.decoder) {
+        if old.value.is_some() {
+            let _ = writeln!(
+                failures,
+                "{key} {name}：{} の行が値を持っています（旧版を残さずに版を上げてよいのは、値の再現を約束しなかったデコーダだけ）",
+                old.decoder
+            );
+            return;
+        }
+        if codecs.decoder_by_id(&old.decoder).is_some() {
+            let _ = writeln!(
+                failures,
+                "{key} {name}：{} はまだあります（SUPERSEDED から外す）",
+                old.decoder
+            );
+            return;
+        }
+        match decode_stamped(codecs, now, bytes, &old.format) {
+            Ok((back, _)) if &back.shape() == want_shape => {}
+            Ok((back, _)) => {
+                let _ = writeln!(
+                    failures,
+                    "{key} {name}：{now}（{} の後の版）で読み直した形が元の値と違う（{want_shape:?} → {:?}）",
+                    old.decoder,
+                    back.shape()
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    failures,
+                    "{key} {name}：{now}（{} の後の版）で読めません: {e}",
+                    old.decoder
+                );
+            }
+        }
+        return;
+    }
+    let decoder = &old.decoder;
     let (back, stamp) = match decode_stamped(codecs, decoder, bytes, &old.format) {
         Ok(r) => r,
         Err(e) => {
@@ -766,11 +832,20 @@ fn codec_goldens_match_and_are_complete() {
             frozen.insert(id, lines);
         }
     }
+    // 同じ設定・入力の例（`REREAD_SUFFIX` の行）は、書いたものを使い回す（書くバイト列は同じ。時間を倍にしない）
+    let mut written: BTreeMap<Vec<u8>, (Vec<u8>, kura_engine::codec::EncodedStamp)> =
+        BTreeMap::new();
     for (name, format, options, input) in examples() {
         let value = input.generate().unwrap();
-        let (bytes, stamp) = codecs
-            .encode_bytes(&value, format, &options, &NoMonitor)
-            .unwrap();
+        let memo = canonical(&(format, &options, &input)).unwrap();
+        let (bytes, stamp) = written
+            .entry(memo)
+            .or_insert_with(|| {
+                codecs
+                    .encode_bytes(&value, format, &options, &NoMonitor)
+                    .unwrap()
+            })
+            .clone();
         let (back, dstamp) = codecs
             .decode(
                 &mut Cursor::new(&bytes),
@@ -985,6 +1060,110 @@ fn ogg_templates_are_covered() {
     assert_eq!(ogg_template(50_000, 1), "48_uncoupled");
     assert_eq!(ogg_template(50_001, 3), "X_uncoupled");
     assert_eq!(ogg_template(192_000, 8), "X_uncoupled");
+}
+
+/// 旧版を残さなかったデコーダ（`SUPERSEDED`）の行には、今の版で読み直した値を凍結した `<名前>-dec3` の行が必ずある：
+/// 同じ設定・入力・書いたバイト列で、読み直しのデコーダが今の版、value を持つ。今の版は登録されていて値を再現できる。
+#[test]
+fn superseded_rows_have_frozen_rereads() {
+    let codecs = CodecSet::pinned();
+    for &(gone, now) in SUPERSEDED {
+        assert!(
+            codecs.decoder_by_id(gone).is_none(),
+            "{gone} はまだあります"
+        );
+        let d = codecs
+            .decoder_by_id(now)
+            .unwrap_or_else(|| panic!("{now} がありません"));
+        assert!(d.reproducible(), "{now} は値を再現できるはず");
+    }
+    let mut seen = 0;
+    for ((kind, id), (path, text)) in read_dir() {
+        if kind != Kind::Enc {
+            continue;
+        }
+        let lines: Vec<Line> = parse(&path, &text);
+        for old in lines.iter() {
+            let Some(&(_, now)) = SUPERSEDED.iter().find(|(gone, _)| *gone == old.decoder) else {
+                continue;
+            };
+            seen += 1;
+            let twin = format!("{}{REREAD_SUFFIX}", old.name);
+            let t = lines
+                .iter()
+                .find(|l| l.name == twin)
+                .unwrap_or_else(|| panic!("{id} {}：{twin} の行がありません", old.name));
+            assert_eq!(
+                (&t.format, &t.file, t.decoder.as_str()),
+                (&old.format, &old.file, now),
+                "{id} {twin}"
+            );
+            assert!(
+                same(&t.options, &old.options) && same(&t.input, &old.input),
+                "{id} {twin}"
+            );
+            assert!(t.value.is_some(), "{id} {twin}：読み直した値がありません");
+        }
+    }
+    // 段 7 の Ogg Vorbis の 35 行
+    assert_eq!(seen, 35);
+}
+
+/// 値を凍結する symphonia の Vorbis・AAC の経路（`third_party/` の写し）は、std の超越関数（OS の libm）と `mul_add`
+/// を呼ばない（段 9。上流の版を上げて写しを作り直したとき、差し替えを当て忘れると、OS によっては値が変わってもこの
+/// 機械のゴールデンが通ってしまう（手元の macOS では Vorbis の値が OS の libm でも同じだった）ので、ソースで見張る）。
+/// 超越関数は libm クレート（`libm::`）か、各写しの `kura_math` を使う。`sqrt`・`floor` などの IEEE で決まるものはよい。
+#[test]
+fn symphonia_copies_do_not_call_os_libm() {
+    const BANNED: &[&str] = &[
+        "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh",
+        "acosh", "atanh", "exp", "exp2", "exp_m1", "ln", "log", "log2", "log10", "ln_1p", "powf",
+        "powi", "cbrt", "hypot", "sin_cos", "mul_add",
+    ];
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party");
+    let mut files = 0;
+    let mut bad = Vec::new();
+    for krate in [
+        "symphonia-core",
+        "symphonia-codec-aac",
+        "symphonia-codec-vorbis",
+        "symphonia-format-ogg",
+    ] {
+        // 再帰せず、積み上げで src/ の下をたどる
+        let mut dirs = vec![root.join(krate).join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in
+                std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                files += 1;
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (no, line) in text.lines().enumerate() {
+                    // 行の注釈は見ない（文字列の中の // は、この写しにはない）
+                    let code = line.split("//").next().unwrap_or("");
+                    for f in BANNED {
+                        let calls = [format!(".{f}("), format!("f32::{f}("), format!("f64::{f}(")];
+                        if calls.iter().any(|c| code.contains(c.as_str())) {
+                            bad.push(format!("{}:{}: {}", path.display(), no + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(files > 50, "写しのソースが見つかりません（{files} 個）");
+    assert!(
+        bad.is_empty(),
+        "OS の libm を呼んでいます:\n{}",
+        bad.join("\n")
+    );
 }
 
 /// 読み取りだけの例：（名前、作り方）。自前のエンコーダが書かない形を、下の層で組んだファイルから読む（R1 のうちデコーダだけの経路）。
@@ -1432,7 +1611,7 @@ fn decode_examples() -> Vec<(&'static str, FileGen)> {
         "psd-rgb16.psd",
         "psb-rgb8.psb",
         "psb-rgba8.psb",
-        // 段 6：音声（再現できるデコーダだけ。Vorbis・AAC は値が環境に依存するので凍結しない）
+        // 段 6：音声（再現できるデコーダだけ。段 6〜8 の Vorbis・AAC は値が環境に依存したので凍結しなかった）
         "flac-16.flac",
         "flac-24.flac",
         "alac-16.m4a",
@@ -1444,10 +1623,141 @@ fn decode_examples() -> Vec<(&'static str, FileGen)> {
         "mp3-mpeg2-mono.mp3",
         "mp3-free.mp3",
         "mp3-info-frames0.mp3",
+        // 段 9：Vorbis・AAC（symphonia の表の超越関数を libm クレートにして値を再現できるようにした。
+        // `ogg-vorbis-symphonia-dec/3`・`m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`）。libvorbis（aoTuV）・
+        // ffmpeg・afconvert が書いたもの。3・5 チャンネルは residue 1 の uncoupled（段 7 の不具合の修正の経路）
+        "ogg-vorbis-loop.ogg",
+        "ogg-vorbis-ffmpeg.ogg",
+        "ogg-vorbis-3ch.ogg",
+        "ogg-vorbis-5ch.ogg",
+        "aac-lc-afconvert.m4a",
+        "aac-lc-ffmpeg.m4a",
+        "aac-lc.aac",
     ] {
         let name: &'static str = Box::leak(format!("fixture-{path}").into_boxed_str());
         v.push((name, FileGen::Fixture { path: path.into() }));
     }
+    // 段 9：アンカー（anchor-kura-dec/1）。画素の形式・ICC・向き 6 の EXIF・テキスト・スライス・格子・ピボット、
+    // フレームの列（パレット・16 ビット）、音声（拡張形式・ループ点・マーカー・タグ・NaN と ±∞）。
+    // `FileGen::Anchor` はその場の書き手で書いて読み直す（`write_verified`）ので、ここの値は作り方の値のダイジェストと必ず
+    // 同じで、守るのは値の作り方だけ（書き手と読み手をそろえて変えても動かない）。決まったバイト列から読めることは、同じ形を
+    // 凍結したアンカー（fixtures/anchor-v1-*。tests/anchor.rs の frozen_v1_anchors_still_read）で守る。
+    let anchor = |input: InputGen| FileGen::Anchor { input };
+    let rich = MetaGen {
+        dpi: Some((1, 300)),
+        text: vec![
+            ("".into(), "空のキー".into()),
+            ("Title".into(), "ドット絵\0終わり".into()),
+        ],
+        icc: Some((0..=255u8).rev().collect()),
+        exif: Some(kura_engine::codec::exif::minimal(6, true)),
+        slices: vec![kura_engine::value::Slice {
+            name: "9 分割".into(),
+            rect: kura_engine::geom::IRect::new(1, 1, 5, 3),
+            center: Some(kura_engine::geom::IRect::new(2, 2, 3, 1)),
+            pivot: Some(kura_engine::geom::IPoint { x: -1, y: 2 }),
+        }],
+        ..MetaGen::default()
+    };
+    for (name, fmt) in [
+        ("anchor-gray8", PixelFormat::Gray8),
+        ("anchor-rgba8", PixelFormat::Rgba8),
+        ("anchor-rgb16", PixelFormat::Rgb16),
+        ("anchor-indexed8", PixelFormat::Indexed8),
+    ] {
+        v.push((
+            name,
+            anchor(InputGen::WithMeta {
+                base: Box::new(InputGen::Noise {
+                    w: 19,
+                    h: 70,
+                    fmt,
+                    seed: 31,
+                }),
+                meta: rich.clone(),
+            }),
+        ));
+    }
+    v.push((
+        "anchor-sheet",
+        anchor(InputGen::Sheet {
+            cols: 3,
+            rows: 2,
+            cell: 8,
+        }),
+    ));
+    v.push((
+        "anchor-frames-indexed8",
+        anchor(InputGen::NoiseFrames {
+            w: 12,
+            h: 9,
+            fmt: PixelFormat::Indexed8,
+            count: 3,
+            seed: 32,
+        }),
+    ));
+    v.push((
+        "anchor-frames-rgba16",
+        anchor(InputGen::WithMeta {
+            base: Box::new(InputGen::NoiseFrames {
+                w: 7,
+                h: 5,
+                fmt: PixelFormat::Rgba16,
+                count: 2,
+                seed: 33,
+            }),
+            meta: rich,
+        }),
+    ));
+    v.push((
+        "anchor-audio-meta",
+        anchor(InputGen::WithMeta {
+            base: Box::new(InputGen::AudioNoise {
+                rate: 44_100,
+                channels: 2,
+                frames: 3_000,
+                seed: 34,
+            }),
+            meta: MetaGen {
+                loop_range: Some(LoopRange {
+                    start: 10,
+                    end: 2_990,
+                }),
+                markers: vec![(0, "".into()), (2_999, "終わり".into())],
+                tags: vec![
+                    ("title".into(), "効果音".into()),
+                    ("vorbis:ENCODER".into(), "aoTuV".into()),
+                ],
+                ..MetaGen::default()
+            },
+        }),
+    ));
+    v.push((
+        "anchor-audio-6ch",
+        anchor(InputGen::Sine {
+            rate: 48_000,
+            channels: 6,
+            frames: 1_000,
+            freq: 440,
+            loop_range: None,
+        }),
+    ));
+    v.push((
+        "anchor-audio-nonfinite",
+        anchor(InputGen::NonFinite {
+            base: Box::new(InputGen::AudioNoise {
+                rate: 8_000,
+                channels: 1,
+                frames: 64,
+                seed: 35,
+            }),
+            at: vec![
+                (0, 1, kura_engine::testgen::NonFiniteSample::Nan),
+                (0, 2, kura_engine::testgen::NonFiniteSample::Inf),
+                (0, 3, kura_engine::testgen::NonFiniteSample::NegInf),
+            ],
+        }),
+    ));
     v
 }
 

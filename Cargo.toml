@@ -2,7 +2,12 @@
 resolver = "3"
 members = ["crates/kura-core", "crates/kura-engine", "crates/kura-mac", "crates/kura-devtools", "crates/vorbis-tables", "src-tauri"]
 # 第三者のクレートの写し（[patch.crates-io] で差し替える）。ワークスペースの lint・整形・テストの対象にしない
-exclude = ["third_party/symphonia-codec-vorbis"]
+exclude = [
+    "third_party/symphonia-codec-aac",
+    "third_party/symphonia-codec-vorbis",
+    "third_party/symphonia-core",
+    "third_party/symphonia-format-ogg",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -73,7 +78,15 @@ codegen-units = 1
 lto = "thin"
 strip = true
 
-# symphonia-codec-vorbis 0.6.1 の 1 行の修正（residue 0/1 を 2 チャンネル以上で使うとき、次のチャンネルの分類を上書きする
-# 不具合。ADR-149・third_party/symphonia-codec-vorbis/KURA.md）。上流が直した版を出したら外す
+# symphonia 0.6.1 の写し（どれも third_party/<クレート>/KURA.md に変更と理由）。fuzz/Cargo.toml にも同じものを書く
+# - symphonia-codec-vorbis：residue 0/1 を 2 チャンネル以上で使うとき、次のチャンネルの分類を上書きする不具合の 1 行の
+#   修正（ADR-149。上流が直した版を出したら、この修正は外す）と、下の超越関数の差し替え
+# - symphonia-core（MDCT・FFT の表）・symphonia-codec-aac（窓・TNS・逆量子化・スケールファクターの表）・
+#   symphonia-codec-vorbis（窓・floor 0・codebook）：OS の libm の超越関数を libm クレート（kura-engine と同じ =0.2.16）に
+#   差し替え、Vorbis・AAC の読み取りの値をどの環境でも同じにする（再現できるデコーダにしてアンカーを作らない。段 9 の D2）
+# - symphonia-format-ogg・symphonia-codec-vorbis：lookup1_values を powf でなく整数で求める（OS・CPU で panic する組が違った）
 [patch.crates-io]
+symphonia-codec-aac = { path = "third_party/symphonia-codec-aac" }
 symphonia-codec-vorbis = { path = "third_party/symphonia-codec-vorbis" }
+symphonia-core = { path = "third_party/symphonia-core" }
+symphonia-format-ogg = { path = "third_party/symphonia-format-ogg" }

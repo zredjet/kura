@@ -588,7 +588,35 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
         ),
         // 波形の段のバイナリ（kura-peaks。解析 audio.peaks の正規の形。cargo-fuzz の対象は decode_peaks）
         ("peaks", peak_seeds()),
+        // 段 9：アンカー（PNG・APNG・f32 の WAV ＋私用のチャンク。cargo-fuzz の対象は decode_anchor）
+        ("anchor", anchor_seeds(&with_exif, &frames, &wav_meta)),
     ]
+}
+
+/// アンカーの種：EXIF と ICC 付きの画像・パレットのフレームの列・メタデータ付きの音声。
+fn anchor_seeds(image: &Value, frames: &Value, audio: &Value) -> Vec<Vec<u8>> {
+    use kura_engine::codec::anchor::{AnchorContext, write_verified};
+    [image, frames, audio]
+        .into_iter()
+        .map(|v| {
+            let stamp = kura_engine::codec::DecodeStamp {
+                codec: "fake-platform-dec/1".into(),
+                tier: kura_engine::codec::Tier::Platform,
+                reproducible: false,
+                value_digest: v.digest().unwrap(),
+                env: Some(kura_engine::testing::FakePlatformDecoder::default_env()),
+            };
+            write_verified(
+                v,
+                &stamp,
+                &AnchorContext::default(),
+                &kura_engine::Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap()
+            .0
+        })
+        .collect()
 }
 
 /// 波形の段のバイナリの種：5 段・一部の段・1 段・長さ 0。

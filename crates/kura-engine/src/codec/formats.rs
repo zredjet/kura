@@ -175,12 +175,14 @@ pub const FORMATS: &[FormatDesc] = &[
         decodes_to: IMG,
         caps: NONE,
     },
+    // HEIC・HEIF・AVIF は ImageIO（Platform）で読む。静止画とシーケンス（HEICS・AVIS。キャンバスいっぱいのフレームの列）。
+    // 拡張子 heics・avis は取り込みの判定（kura-core）にないので足していない
     FormatDesc {
         id: "heic",
         exts: &["heic"],
         mime: "image/heic",
         item_kind: ItemKind::Image,
-        decodes_to: IMG,
+        decodes_to: IMG_ANIM,
         caps: NONE,
     },
     FormatDesc {
@@ -188,7 +190,7 @@ pub const FORMATS: &[FormatDesc] = &[
         exts: &["heif"],
         mime: "image/heif",
         item_kind: ItemKind::Image,
-        decodes_to: IMG,
+        decodes_to: IMG_ANIM,
         caps: NONE,
     },
     FormatDesc {
@@ -196,7 +198,7 @@ pub const FORMATS: &[FormatDesc] = &[
         exts: &["avif"],
         mime: "image/avif",
         item_kind: ItemKind::Image,
-        decodes_to: IMG,
+        decodes_to: IMG_ANIM,
         caps: NONE,
     },
     FormatDesc {
@@ -445,6 +447,40 @@ mod tests {
             e.chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         }));
+    }
+
+    /// 段 9 の Platform・External のコーデックが受ける行がある：ImageIO の画像（HEIC・HEIF・AVIF は静止画とシーケンス、
+    /// 固定のデコーダのない TIFF・BMP、固定の段が断った変種を回す JPEG・PSD）、AudioToolbox・ffmpeg の音声
+    /// （m4a・aac・ogg・opus・wav・aiff・mp3）、AAC（m4a）と MP3 の書き出し。RAW は段 9 では扱わない。
+    #[test]
+    fn rows_for_platform_and_external_codecs() {
+        use ValueKind::{Audio, Frames, Image};
+        for (id, kinds) in [
+            ("heic", &[Image, Frames][..]),
+            ("heif", &[Image, Frames]),
+            ("avif", &[Image, Frames]),
+            ("tiff", &[Image]),
+            ("bmp", &[Image]),
+            ("jpeg", &[Image]),
+            ("psd", &[Image]),
+            ("m4a", &[Audio]),
+            ("aac", &[Audio]),
+            ("ogg", &[Audio]),
+            ("opus", &[Audio]),
+            ("wav", &[Audio]),
+            ("aiff", &[Audio]),
+            ("mp3", &[Audio]),
+        ] {
+            let f = format_by_id(id).unwrap_or_else(|| panic!("{id} がない"));
+            assert_eq!(f.decodes_to, kinds, "{id}");
+        }
+        assert!(
+            [
+                "raw", "dng", "cr2", "nef", "arw", "jxl", "heics", "avis", "caf", "wma"
+            ]
+            .iter()
+            .all(|e| format_by_ext(e).is_none())
+        );
     }
 
     /// 今の kura-core の取り込みの拡張子（import::kind の classify・mime_for）と食い違わない。

@@ -40,6 +40,8 @@ mod dsp;
 mod floor;
 mod residue;
 mod window;
+// kura：OS の libm に頼らない f32 の超越関数（KURA.md）
+mod kura_math;
 
 use codebook::VorbisCodebook;
 use common::*;
@@ -47,6 +49,11 @@ use dsp::*;
 use floor::*;
 use residue::*;
 use window::Windows;
+
+/// kura: marks this crate as kura's patched copy (see `KURA.md`; not present in the crates.io release).
+/// kura-engine refers to it, so the build fails if the upstream crate is linked instead of this copy
+/// (for example when a `[patch.crates-io]` entry is missing or no longer matches the required version).
+pub const KURA_PATCHED: u32 = 1;
 
 /// Vorbis decoder.
 pub struct VorbisDecoder {

@@ -314,45 +314,46 @@ fn lossy_audio_matches_other_decoders() {
             22_050,
             true,
         ),
+        // Vorbis・AAC：段 9 から値を再現できる（symphonia の写しで表の超越関数を libm クレートにした）
         (
             "ogg-vorbis-loop.ogg",
             "ogg",
-            "ogg-vorbis-symphonia-dec/2",
+            "ogg-vorbis-symphonia-dec/3",
             "ogg-vorbis-loop.lewton.flac",
             44_100,
-            false,
+            true,
         ),
         (
             "ogg-vorbis-ffmpeg.ogg",
             "ogg",
-            "ogg-vorbis-symphonia-dec/2",
+            "ogg-vorbis-symphonia-dec/3",
             "ogg-vorbis-ffmpeg.lewton.flac",
             44_160,
-            false,
+            true,
         ),
         (
             "aac-lc-afconvert.m4a",
             "m4a",
-            "m4a-aac-symphonia-dec/1",
+            "m4a-aac-symphonia-dec/2",
             "aac-lc-afconvert.afconvert.flac",
             44_100,
-            false,
+            true,
         ),
         (
             "aac-lc-ffmpeg.m4a",
             "m4a",
-            "m4a-aac-symphonia-dec/1",
+            "m4a-aac-symphonia-dec/2",
             "aac-lc-ffmpeg.ffmpeg.flac",
             44_100,
-            false,
+            true,
         ),
         (
             "aac-lc.aac",
             "aac",
-            "aac-adts-symphonia-dec/1",
+            "aac-adts-symphonia-dec/2",
             "aac-lc.ffmpeg.flac",
             46_080,
-            false,
+            true,
         ),
         // free format（ffmpeg は読めないので LAME のデコーダと照らす。最後の 2 フレームも読む）
         (
@@ -406,8 +407,8 @@ fn multichannel_vorbis_matches_lewton() {
     ] {
         let (codec, rep, meta, rate, ours) = audio(file, "ogg");
         let (_, _, _, ref_rate, raw) = audio(reference, "flac");
-        assert_eq!(codec, "ogg-vorbis-symphonia-dec/2", "{file}");
-        assert!(!rep, "{file}");
+        assert_eq!(codec, "ogg-vorbis-symphonia-dec/3", "{file}");
+        assert!(rep, "{file}");
         assert_eq!((rate, ref_rate), (44_100, 44_100), "{file}");
         assert_eq!(meta.tags.get("title").map(String::as_str), Some("Channels"));
         assert_eq!((ours.len(), raw.len()), (channels, channels), "{file}");
@@ -435,17 +436,44 @@ fn multichannel_vorbis_matches_lewton() {
     }
 }
 
-/// 扱わない変種（HE-AAC・Ogg の中の Opus・MP2）は `Unsupported`（次の段のデコーダへ回る）。
+/// 扱わない変種（HE-AAC・Ogg の中の Opus・MP2）は `Unsupported`（次の段のデコーダへ回る）。HE-AAC は、ASC の明示の印
+/// （`aac-he.m4a`）でも、帯域の中だけの印（ADTS の `aac-he.aac`、ADTS から写した m4a の `aac-he-implicit.m4a`）でも断る
+/// （tests/symphonia_copies.rs）。
 #[test]
 fn unsupported_audio_variants_fall_through() {
-    assert!(matches!(
-        decode("aac-he.m4a", "m4a"),
-        Err(EngineError::Unsupported(_))
-    ));
+    for (file, format) in [
+        ("aac-he.m4a", "m4a"),
+        ("aac-he.aac", "aac"),
+        ("aac-he-implicit.m4a", "m4a"),
+    ] {
+        assert!(
+            matches!(decode(file, format), Err(EngineError::Unsupported(_))),
+            "{file}"
+        );
+    }
     assert!(matches!(
         decode("ogg-opus.ogg", "ogg"),
         Err(EngineError::Unsupported(_))
     ));
+    // 3 チャンネル以上の AAC-LC（symphonia の AAC は 1・2 チャンネルだけ）は、チャンネルの構成があっても、形の段階で
+    // 断って後の段（AudioToolbox・ffmpeg）へ回す（形と読みを同じ段が答えるように）
+    for (file, format) in [("aac-lc-6ch.aac", "aac"), ("aac-lc-5ch.m4a", "m4a")] {
+        let bytes = std::fs::read(dir().join(file)).unwrap();
+        let shape = CodecSet::pinned().shape(
+            &mut Cursor::new(bytes),
+            format,
+            &DecodeOptions::default(),
+            &Limits::default(),
+        );
+        assert!(
+            matches!(shape, Err(EngineError::Unsupported(_))),
+            "{file}: {shape:?}"
+        );
+        assert!(
+            matches!(decode(file, format), Err(EngineError::Unsupported(_))),
+            "{file}"
+        );
+    }
     // MPEG layer II（.mp3 の拡張子の MP2）は空の音声にせず、次の段へ
     assert!(matches!(
         decode("mp2-layer2.mp3", "mp3"),

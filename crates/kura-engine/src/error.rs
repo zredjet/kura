@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::Serialize;
 
+use crate::digest::Digest;
 use crate::doc::NodeId;
 
 /// 指摘の重さ。
@@ -145,6 +146,42 @@ impl fmt::Display for Issues {
     }
 }
 
+/// 作り直しの入力が、版の記録と食い違った（E29。docs/editing.md §9.4・§17）。読み書きの失敗（`Decode`・`Io`・`Internal`）
+/// とは分けて返す：呼び手（kura-core）は、版のファイルを残す・アンカーを作り直す・利用者に知らせる、を決める。
+/// 種類ごとに `code()` が違う。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+pub enum Mismatch {
+    /// 記録の識別子のデコーダで元を読み直した値が、記録の値と違う（OS・ツールの更新、元のファイルの変化）。
+    #[error("元を読み直した値が記録と違います（{codec}）")]
+    SourceChanged {
+        codec: String,
+        expected: Digest,
+        got: Digest,
+    },
+    /// 記録の識別子のデコーダが、この環境にない（Platform・External は旧版を残さないので、識別子を上げると起きる）。
+    #[error("記録のデコーダ {codec} がありません")]
+    DecoderGone { codec: String },
+    /// アンカーが壊れている・ない・別の値（元）のもの。
+    #[error("アンカーが使えません: {reason}")]
+    AnchorBroken { reason: String },
+}
+
+impl Mismatch {
+    /// 種類を表す短い名前（AppError の code に使う）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::SourceChanged { .. } => "SourceChanged",
+            Self::DecoderGone { .. } => "DecoderGone",
+            Self::AnchorBroken { .. } => "AnchorBroken",
+        }
+    }
+}
+
 /// エンジンのエラー。kura-core の `CoreError` へは code で変換する。
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -166,6 +203,9 @@ pub enum EngineError {
     Io(#[from] std::io::Error),
     #[error("内部の誤り: {0}")]
     Internal(String),
+    /// 作り直しの入力が版の記録と食い違った・アンカーが使えない（E29）。描くときのノードは付けない（入力を読む段階のもの）。
+    #[error("記録と食い違います: {0}")]
+    Mismatch(Mismatch),
     /// 描くときに、あるノードで起きたエラー（`Unsupported`・`Limit`・`Decode`・`Encode` を包む。
     /// `Invalid` は指摘にノードを付けるので包まない）。エディタはこのノードを強調する。
     #[error("ノード {}：{source}", node.0)]
@@ -186,6 +226,7 @@ impl EngineError {
             Self::Decode { .. } | Self::Encode { .. } | Self::Io(_) => "Io",
             Self::CodecMissing { .. } => "ToolMissing",
             Self::Internal(_) => "Internal",
+            Self::Mismatch(m) => m.code(),
             Self::AtNode { source, .. } => source.code(),
         }
     }

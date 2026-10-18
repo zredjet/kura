@@ -17,7 +17,10 @@ fn generate_win_curve(bs: usize) -> Vec<f32> {
     for (i, s) in slope.iter_mut().enumerate() {
         let num = f64::from(i as u32) + 0.5;
         let frac = consts::FRAC_PI_2 * (num / denom);
-        *s = (consts::FRAC_PI_2 * frac.sin().powi(2)).sin() as f32
+        // kura：OS の libm でなく libm クレート（純 Rust）の sin（環境で値を変えない）。2 乗は powi(2) でなく
+        // 掛け算で書く（LLVM は powi(x, 2) を x * x に展開するので値は同じ。powi の呼び出しを残さない）
+        let sin_frac = libm::sin(frac);
+        *s = libm::sin(consts::FRAC_PI_2 * (sin_frac * sin_frac)) as f32
     }
 
     slope

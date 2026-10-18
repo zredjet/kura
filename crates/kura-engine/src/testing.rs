@@ -1,5 +1,9 @@
 //! テスト・ゴールデン・devtools で使う補助：操作 1 つの文書を作って描く。
 
+pub mod platform;
+
+pub use platform::{FakePlatformDecoder, FakePlatformEncoder};
+
 use std::collections::BTreeMap;
 
 use crate::digest::{Digest, Hasher};
