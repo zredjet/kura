@@ -1,6 +1,6 @@
 [package]
 name = "kura-mac"
-description = "Kura の macOS 専用機能（Swift ヘルパー経由の ImageIO / AVFoundation / AppKit）"
+description = "Kura の macOS 専用機能（Swift ヘルパー経由の ImageIO / AVFoundation / AudioToolbox / AppKit）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,14 +9,22 @@ license.workspace = true
 repository.workspace = true
 build = "build.rs"
 
+# - kura-engine：Platform のコーデック（ImageIO・AudioToolbox）を、エンジンの backend の trait（codec::platform）として実装する
+# - serde：kura_codec_caps の JSON を読む
+# - tracing：Platform のコーデックを登録できなかった理由（ABI の食い違いなど）をログに出す
 [dependencies]
 kura-core.workspace = true
+kura-engine.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 
 [build-dependencies]
 swift-rs = { workspace = true, features = ["build"] }
 
 [dev-dependencies]
+# rand_chacha：壊れた入力のテストの変異（ChaCha8。kura-engine の determinism::rng の生成器の trait を使う）
+rand_chacha.workspace = true
 tempfile.workspace = true
 
 [lints]

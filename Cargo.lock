@@ -2219,9 +2219,13 @@ name = "kura-mac"
 version = "0.1.0"
 dependencies = [
  "kura-core",
+ "kura-engine",
+ "rand_chacha",
+ "serde",
  "serde_json",
  "swift-rs",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

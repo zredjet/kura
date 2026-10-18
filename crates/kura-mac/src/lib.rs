@@ -6,15 +6,25 @@
 //! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
 //! - `find_chrome`・`snapshot_webview`：キャプチャ用の Google Chrome の場所と、WKWebView の表示範囲の撮影
 //! - `reveal_in_finder`・`volume_capacity`：Finder で見せる、ボリュームの容量
+//! - `codec`：編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し）と
+//!   `codec_set`（固定の段に足した組）・`full_codec_set`（さらに ffmpeg の段を足したアプリの組）・`codec_caps`（能力と環境）
 //!
 //! macOS 以外では同じ関数・型が「扱えない」を返すだけの空の実装になり、ワークスペース全体がビルドできる。
 
+mod abi;
+#[cfg(target_os = "macos")]
+mod bridge;
 mod browser;
+pub mod codec;
 mod external;
 mod files;
 
 pub use browser::{
     SnapshotDone, SnapshotInfo, find_chrome, frontmost_pid, play_capture_sound, snapshot_webview,
+};
+pub use codec::{
+    MacCaps, codec_caps, codec_set, full_codec_set, platform_decoders, platform_encoders,
+    platform_status,
 };
 pub use external::{ExternalPlayer, open_in_player};
 pub use files::{
