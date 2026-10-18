@@ -11,6 +11,8 @@ repository.workspace = true
 [dependencies]
 base64.workspace = true
 blake3.workspace = true
+# 編集のエンジン（ffmpeg の段のコーデック：Decoder・Encoder を実装して CodecSet に足す。M10 段 9。M11 の前倒し）
+kura-engine.workspace = true
 rand_chacha.workspace = true
 rayon.workspace = true
 reflink-copy.workspace = true
