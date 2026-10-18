@@ -1,8 +1,10 @@
 #!/bin/sh
 # 編集のゴールデンは追記だけ（docs/editing.md §8.5、ADR-136）。
-# 基準のコミットからの差分で、crates/kura-engine/goldens/・goldens-codecs/・goldens-replay/・goldens-analysis/ の既存の行が
+# 基準のコミットからの差分で、crates/kura-engine/goldens/・goldens-codecs/・goldens-replay/・goldens-analysis/ と
+# crates/kura-core/goldens-ffmpeg-args/ の既存の行が
 # 消えた・変わったもの、
-# fixtures/・tests/vectors/ のファイルが消えた・変わったものがあれば失敗する。
+# crates/kura-engine/fixtures/・crates/kura-mac/fixtures/（README.md と作る道具の tools/ は除く）・tests/vectors/ の
+# ファイルが消えた・変わったものがあれば失敗する。基準にないファイル（このブランチで足したもの）は見ない。
 # 使い方：scripts/check-goldens-append-only.sh [基準]（既定は origin/main。なければ main）
 set -eu
 
@@ -17,7 +19,7 @@ if [ -z "$base" ] || [ "$base" = "$zero" ] || ! git cat-file -e "$base^{commit}"
 fi
 
 merge_base=$(git merge-base "$base" HEAD 2>/dev/null || echo "$base")
-dirs="crates/kura-engine/goldens crates/kura-engine/goldens-codecs crates/kura-engine/goldens-replay crates/kura-engine/goldens-analysis"
+dirs="crates/kura-engine/goldens crates/kura-engine/goldens-codecs crates/kura-engine/goldens-replay crates/kura-engine/goldens-analysis crates/kura-core/goldens-ffmpeg-args"
 # 改名（git mv）も、旧いパスの削除として見る（--no-renames）。ファイルごと消したものは名前で知らせる
 # shellcheck disable=SC2086
 deleted=$(git diff --no-renames --name-only --diff-filter=D "$merge_base" HEAD -- $dirs)
@@ -26,8 +28,11 @@ if [ -n "$deleted" ]; then
   echo "$deleted"
   exit 1
 fi
-# フィクスチャ（他のツールで作った入力）は、消すのも変えるのも認めない（README.md は除く）
-changed=$(git diff --no-renames --name-only --diff-filter=DM "$merge_base" HEAD -- crates/kura-engine/fixtures ':!crates/kura-engine/fixtures/README.md')
+# フィクスチャ（他のツールで作った入力。kura-mac のものは CI の仮想マシンでは作り直せないことがある）は、消すのも
+# 変えるのも認めない（README.md と、フィクスチャを足すときに書き足す作る道具 tools/ は除く）
+changed=$(git diff --no-renames --name-only --diff-filter=DM "$merge_base" HEAD -- \
+  crates/kura-engine/fixtures ':!crates/kura-engine/fixtures/README.md' \
+  crates/kura-mac/fixtures ':!crates/kura-mac/fixtures/README.md' ':!crates/kura-mac/fixtures/tools')
 if [ -n "$changed" ]; then
   echo "フィクスチャが消えた・変わっています（新しい名前で足してください）:"
   echo "$changed"

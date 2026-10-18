@@ -1,6 +1,7 @@
 # CI（ADR-142）。ubuntu で kura-engine・kura-core・vorbis-tables（Linux でも通ること・整数のゴールデンと Ogg Vorbis の書くバイト列が
 # ターゲットをまたいで一致すること）、
-# macOS で Swift ヘルパーを含むクレートを確かめる。src-tauri はフロントのビルドが要るので、ここでは回さない。
+# macOS で Swift ヘルパーを含むクレートと、ffmpeg の段の実物のテスト（Homebrew の ffmpeg）を確かめる。src-tauri はフロントの
+# ビルドが要るので、ここでは回さない。
 name: CI
 
 on:
@@ -42,4 +43,16 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables -p kura-mac -p kura-devtools --all-targets -- -D warnings
+      # ffmpeg の段の実物のテスト（real_ffmpeg_*）は ffmpeg がないと何も確かめずに通るので、入れたうえで
+      # KURA_FFMPEG_REQUIRED=1 にして、見つからなければ落とす（Linux の job は見送る。real_tools() が見るのは
+      # KURA_FFMPEG_DIR か /opt/homebrew/bin だけ）。brew install は依存を含めて 15 個ほどの瓶で、1 分前後
+      - name: ffmpeg を入れる（Homebrew）
+        run: brew install ffmpeg
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: '1'
+      - run: /opt/homebrew/bin/ffmpeg -hide_banner -version
       - run: cargo test -p kura-engine -p kura-core -p vorbis-tables -p kura-mac -p kura-devtools
+        env:
+          KURA_FFMPEG_REQUIRED: '1'
