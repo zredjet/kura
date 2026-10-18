@@ -30,9 +30,9 @@
 
 | クレート | 責務 | 依存してよいもの |
 |---|---|---|
-| `kura-core` | DB、マイグレーション、取り込み、ハッシュ、検索言語の解析と SQL 生成、ユニット、プレイリスト（純粋関数）、ジョブ管理、ダウンロード・キャプチャの手順 | rusqlite, blake3, reflink-copy, rand_chacha, serde, thiserror, tracing, tokio |
+| `kura-core` | DB、マイグレーション、取り込み、ハッシュ、検索言語の解析と SQL 生成、ユニット、プレイリスト（純粋関数）、ジョブ管理、ダウンロード・キャプチャの手順、編集の ffmpeg の段（`codec_ext::ffmpeg`。段 9） | kura-engine, rusqlite, blake3, reflink-copy, rand_chacha, serde, thiserror, tracing, tokio |
 | `kura-engine` | 編集の操作エンジン：文書・値・形・メタデータの写し方・操作と登録・描画・解析・コーデック（固定の Rust のもの）・実行とプレビュー・エディタの履歴。DB・ジョブ・Tauri を知らない（ADR-134、§15） | serde, serde_json, thiserror, blake3, rayon, rand_chacha, libm と、版を固定したコーデックのクレート（docs/editing.md §9）。specta は feature |
-| `kura-mac` | `MediaBackend` trait の macOS 実装（サムネイル生成、メディア情報、音楽のジャケット取得、WKWebView のスナップショット、「透明度を下げる」設定の取得）と、ffmpeg との振り分け | kura-core, serde_json, swift-rs（ビルド時のリンクのみ） |
+| `kura-mac` | `MediaBackend` trait の macOS 実装（サムネイル生成、メディア情報、音楽のジャケット取得、WKWebView のスナップショット、「透明度を下げる」設定の取得）と、ffmpeg との振り分け。編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し、`kura_codec_caps`。段 9、ADR-153）と、アプリのコーデックの組 `full_codec_set` | kura-core, kura-engine, serde, serde_json, tracing, swift-rs（ビルド時のリンクのみ） |
 | `kura-devtools` | ダミーライブラリの生成、ベンチマーク、コマンドラインからの取り込みと確認（§13） | kura-core, kura-mac |
 | `src-tauri`（`kura-app`） | コマンド、kura:// プロトコル、ウィンドウ、イベント、状態の保持 | すべて |
 
@@ -141,7 +141,7 @@
 - ライブラリを開くときは、staging の掃除 → 整合性チェック → ジョブの開始、の順にする（チェック中に取り込みが進むと食い違いを誤って数えるため）。
 - 種類ごとの同時実行数：import 1、thumbnail 1（ジョブの中で CPU コア数の並列。ADR-31）、proxy 1、download 2、capture 1、export 1。
 - 後続のジョブは `ensure_queued(kind, input)` で積む（同じ種類が `queued` ならもう積まない）。サムネイルのジョブは、取り込みのバッチを書いたあとと、ライブラリを開いたとき（`pending` が残っていれば）に積む。
-- 各ジョブはキャンセルトークンを持つ。外部プロセスはキャンセル時に SIGTERM、5 秒後に SIGKILL。
+- 各ジョブはキャンセルトークンを持つ。外部プロセスはキャンセル時に SIGTERM、5 秒後に SIGKILL（編集のコーデックの ffmpeg（`tools::run_binary`）は 2 秒後に 1 回。docs/editing.md §9.8）。
 - 進捗は `job://progress` イベント（`{ id, kind, state, progress, message, resultJson }`）を 200ms 以上の間隔で間引いて送る（状態の変わり目は間引かない）。
 - ログは `logs/job-<id>.log` に書き、UI の「ログ」から開ける。
 
@@ -185,6 +185,7 @@ import_start:    ジョブとして実行
   - `kura_audio_artwork(path, out_art, out_l, out_s, 1600, 512)`：AVAsset のメタデータからジャケット（元の画像を `art/`、縮小を `thumbs/` に）
   - `kura_probe(path, kind)` → JSON（`kura_free_string` で解放）：幅・高さ・長さ・撮影日時・コーデック・アーティスト・アルバム・曲名
   - `kura_reduce_transparency()` → bool
+- 編集の Platform の段のコーデック（段 9。ADR-153）は、上の C 文字列の関数とは別の口（`swift/Sources/KuraMacC/include/kura_mac_ffi.h`、ABI の版 1）で呼ぶ：不透明なハンドルと 2 段の呼び出し（Swift が開いて形を返す → Rust が上限を確かめて確保 → Swift がそこへ書く）、状態の番号 0〜6（OK・扱えない・失敗・中止・誤った呼び出し・食い違い・上限。kura-engine の `codec::platform` と同じ値）、Rust が渡す文言のバッファ、中止のコールバック。Platform のコーデックの unsafe は `src/bridge.rs` だけ。詳しくは docs/editing.md §9.8。
 - Swift のランタイムは OS のもの（`/usr/lib/swift`）を使う。リンクする実行ファイル（kura-mac のテスト、src-tauri、kura-devtools）の build.rs で rpath を足す。
 - 形式ごとの試す順（`kura_mac::media_backend()`）：flac・ogg・opus・mkv・webm・avi は ffmpeg / ffprobe を先に、それ以外は macOS を先に。前の実装が「扱えない形式」と答えたときだけ次を試す（ADR-32）。
 - ffmpeg / ffprobe は `/opt/homebrew/bin` → `/usr/local/bin` → PATH の順で探す（`kura_core::tools`。設定での上書きは M8）。外部プロセスは時間制限付きで動かす。
@@ -304,7 +305,7 @@ import_start:    ジョブとして実行
 | `kura-devtools bench backup --library <path>` | DB のバックアップを 1 つ作る速さ（10 万件・58MB で 0.25 秒。M9） |
 | `kura-devtools import` / `check` | コマンドラインからの取り込みと整合性の確認（§6） |
 | `kura-devtools download --library <path> <url>...` | アプリと同じダウンロードのジョブで取得して入れる（§9。既定の選択・Cookie なし） |
-| `kura-devtools edit shape --in <file>` / `edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]` | 編集のエンジンを手で確かめる（形式と形の表示、文書を当てて書き出し、ダイジェスト・記録・警告を表示。docs/editing.md） |
+| `kura-devtools edit shape --in <file>` / `edit caps` / `edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]` | 編集のエンジンを手で確かめる（形式と形の表示、今の環境の能力の表、文書を当てて書き出し、ダイジェスト・記録・警告を表示。コーデックはアプリと同じ `full_codec_set`（固定の段 → macOS → ffmpeg）。docs/editing.md） |
 | `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない） |
 | `VITE_KURA_BENCH=1` | グリッドを自動でスクロールし、フレーム時間を `bench_report` でログに書く |
 
@@ -392,7 +393,7 @@ M9 の実測（NFR-01〜07。Apple M4 Max（高性能 12・高効率 4 コア）
 
 ## 15. 編集（M10〜。正本は docs/editing.md）
 
-- **クレート**：`kura-engine` がエンジン本体（ADR-134）。kura-core は保存・版・GC・解析と一括加工のジョブと DB（M11 以降）、kura-mac は ImageIO・AudioToolbox・AVFoundation によるコーデック（Platform の段）、src-tauri はコマンドと kura:// の `/edit`・`/peaks`（M11・M12）を受け持つ。
+- **クレート**：`kura-engine` がエンジン本体（ADR-134）。kura-core は保存・版・GC・解析と一括加工のジョブと DB（M11 以降）と ffmpeg の段（段 9）、kura-mac は ImageIO・AudioToolbox によるコーデック（Platform の段。段 9）、src-tauri はコマンドと kura:// の `/edit`・`/peaks`（M11・M12）を受け持つ。
 - **文書**：元に対する累積の操作のノードの並び（docs/editing.md §4、ADR-135）。エディタとの通信で送るのは文書だけで、画素・波形は Rust が描いて kura:// で配る。
 - **決定性と版**：docs/editing.md §8（ADR-136・138）。kura-engine の `clippy.toml` で禁じる API を機械的に強制し、ゴールデンは追記だけにする。
 - **コーデック**：Pinned（Rust）→ Platform（kura-mac）→ External（ffmpeg）の順。C のライブラリは同梱せず、足りないエンコーダは自作する（ADR-137）。

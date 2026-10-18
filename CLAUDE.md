@@ -14,7 +14,7 @@
 
 - アプリ：Tauri 2.x（最新安定版）、macOS 専用（Apple Silicon、macOS 26 以降を想定）
 - Rust：cargo workspace。rusqlite（bundled, WAL）、tokio、rayon、blake3、reflink-copy、thiserror、tracing、rand_chacha
-- macOS ネイティブ：Swift ヘルパー（ImageIO / AVFoundation / WebKit）を swift-rs 経由で呼ぶ（`crates/kura-mac`）
+- macOS ネイティブ：Swift ヘルパー（ImageIO / AVFoundation / AudioToolbox / WebKit）を C の口（`extern "C"`。編集のコーデックは `kura_mac_ffi.h`）で呼ぶ。swift-rs はビルド時のリンクだけ（`crates/kura-mac`）
 - 編集の操作エンジン：`crates/kura-engine`（OS・DB 非依存。正本は `docs/editing.md`、規則は `.claude/rules/engine.md`）
 - フロント：React + TypeScript + Vite、状態は Zustand、仮想スクロールは TanStack Virtual、スタイルは CSS Modules + CSS 変数
 - 型付き IPC：tauri-specta（デバッグ起動時に `src/ipc/bindings.ts` を自動出力）
@@ -24,13 +24,13 @@
 
 ```
 Cargo.toml                 # workspace
-crates/kura-core/          # OS 非依存のドメインロジック（DB, 取り込み, 検索, ユニット, プレイリスト, ジョブ）
+crates/kura-core/          # OS 非依存のドメインロジック（DB, 取り込み, 検索, ユニット, プレイリスト, ジョブ, 編集の ffmpeg の段）
 crates/kura-core/migrations/  # SQL マイグレーション（連番、既存は編集禁止）
 crates/kura-engine/        # 編集の操作エンジン：文書・操作・描画・解析・コーデック（OS・DB 非依存）
 crates/vorbis-tables/      # Ogg Vorbis のエンコーダの表（aoTuV から生成。BSD-3）と照合用の C の組み方（oracle/）
-crates/kura-mac/           # macOS 専用：サムネイル, メディア情報, スナップショット（Swift ヘルパー）
+crates/kura-mac/           # macOS 専用：サムネイル, メディア情報, スナップショット, 編集の Platform のコーデック（Swift ヘルパー）
 crates/kura-devtools/      # ダミーライブラリ生成・ベンチマーク
-third_party/               # 不具合を直した第三者のクレートの写し（[patch.crates-io]。元のライセンスのまま）
+third_party/               # 不具合を直した、または kura の要件（libm への差し替え）で手を入れた第三者のクレートの写し（[patch.crates-io]。元のライセンスのまま）
 src-tauri/                 # Tauri アプリ本体：commands/, protocol/（kura://）, events, window
 src/                       # React フロント：features/, components/, styles/, ipc/, stores/
 docs/                      # 仕様・設計（下記）
