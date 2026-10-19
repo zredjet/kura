@@ -616,7 +616,22 @@ impl Run<'_> {
             })?;
         }
         let started = Instant::now();
-        let step = self.decode_and_solve(item, format, &path, &hash_hex)?;
+        let step = match self.decode_and_solve(item, format, &path, &hash_hex) {
+            Ok(step) => step,
+            Err(err) => {
+                // 落ちたのではない（波形の段を書けないなど）ので、処理中の印は消してからジョブを失敗にする
+                if platform
+                    && let Err(clear) = self
+                        .ctx
+                        .library()
+                        .db()
+                        .write(|tx| store::clear_inflight(tx))
+                {
+                    tracing::warn!(%clear, "解析の処理中の印を消せませんでした");
+                }
+                return Err(err);
+            }
+        };
         self.counts
             .read_ms
             .push(started.elapsed().as_secs_f64() * 1000.0);

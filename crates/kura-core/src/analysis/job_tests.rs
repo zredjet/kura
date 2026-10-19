@@ -794,6 +794,54 @@ fn os_decoder_marks_the_item_before_reading_and_a_crash_fails_it() {
     );
 }
 
+/// OS のデコーダで読んだあとに落ちずに失敗した（波形の段を書けない）ときは、処理中の印を消してジョブを失敗にする
+/// （次に動いたときに crashed と取り違えない。アイテムは pending のまま）。
+#[test]
+fn an_error_after_marking_clears_the_mark() {
+    let env = Env::with(
+        |log, _| {
+            let fake = FakePlatformDecoder::new(
+                "fake-audiotoolbox-dec/1",
+                &["opus"],
+                InputGen::Sine {
+                    rate: 8_000,
+                    channels: 1,
+                    frames: 4_000,
+                    freq: 440,
+                    loop_range: None,
+                },
+            );
+            watched_set(log, None, vec![Arc::new(fake)])
+        },
+        64 << 20,
+    );
+    let song = env.add(1, "audio", "opus", b"OggS fake opus");
+    // 波形の段の置き場を塞ぐ
+    let peaks_dir = env
+        .library
+        .layout()
+        .peaks_path(&song)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::create_dir_all(peaks_dir.parent().unwrap()).unwrap();
+    std::fs::write(&peaks_dir, b"not a dir").unwrap();
+    let record = env.run();
+    assert_eq!(record.state, JobState::Failed);
+    assert_eq!(env.state(1), "pending");
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.inflight'"),
+        0
+    );
+    std::fs::remove_file(&peaks_dir).unwrap();
+    env.run();
+    assert_eq!(env.state(1), "ready", "crashed にしない");
+    assert_eq!(
+        env.fact::<String>(&song, "decoder"),
+        "fake-audiotoolbox-dec/1"
+    );
+}
+
 /// 読み取りの記録は結果の表に kura.read として残り、読まずに計画を立てるのに使う。
 #[test]
 fn read_record_is_kept_with_the_results() {
