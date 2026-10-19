@@ -179,12 +179,15 @@ import_start:    ジョブとして実行
 
 ## 7. サムネイルとメディア情報（kura-mac）
 
-- Swift ヘルパー（`crates/kura-mac/swift`、Swift 5 の言語モード）が C 互換関数を公開し、Rust から `extern "C"` で呼ぶ（swift-rs はビルド時のリンクにだけ使う）。戻り値は 0 成功・1 扱えない形式・2 失敗・3 ジャケットなし：
-  - `kura_image_thumbnails(path, out_l, out_s, 1600, 512)`：ImageIO の `CGImageSourceCreateThumbnailAtIndex`（HEIC・RAW・AVIF も扱える。向きを反映）→ JPEG（品質 0.82）
+- Swift ヘルパー（`crates/kura-mac/swift`、Swift 5 の言語モード）が C 互換関数を公開し、Rust から `extern "C"` で呼ぶ（swift-rs はビルド時のリンクにだけ使う）。戻り値は 0 成功（サムネイルは JPEG を書いた）・1 扱えない形式・2 失敗・3 ジャケットなし・4 PNG を書いた：
+  - `kura_image_thumbnails(path, out_l_stem, out_s_stem, 1600, 512, keep_alpha)`：ImageIO の `CGImageSourceCreateThumbnailAtIndex`（HEIC・RAW・AVIF も扱える。向きを反映）。書き先は拡張子のない stem で、書いた形式の拡張子を足す。`keep_alpha` が 0 でなく、元がアルファを持ち（`kCGImagePropertyHasAlpha` かアルファの列）、sRGB の premultipliedLast に描き直した長辺 1600 に透明な画素（α < 255）が 1 つでもあれば PNG を書いて 4 を返す（M11 の決定 3・4。`kura_mac::image_thumbnails_keep_alpha`）。そうでなければ JPEG（品質 0.82）で 0。今の `MediaBackend` の道は `keep_alpha = 0`（M11 の段 3 でサムネイルの形式を持つ口に替える）
+  - `kura_font_thumbnails(path, samples, out_l_stem, out_s_stem, 1600, 512)`（M11）：CoreText。先頭のバイトで ttf・otf・ttc・woff・woff2 だけを読む。見本の字は `samples`（改行で区切った候補「永あAa」「Aa」）のうち書体がすべての字を持つもの（なければ字の番号 1 から形のある字を 4 つ）。正方形の透明の地に、形の範囲が幅の 80%・高さの 70% に収まる大きさで真ん中に、字の形だけのアルファ（グレーとアルファ、字は黒）で描いた PNG を書いて 4 を返す。色は表示の側が CSS の mask-image で付ける（`kura_mac::font_thumbnails`）
   - `kura_video_thumbnails(path, at_sec, out_l, out_s, 1600, 512)`：AVFoundation の `AVAssetImageGenerator`（長さの 10% 地点。長さが分からなければ 1 秒）
   - `kura_audio_artwork(path, out_art, out_l, out_s, 1600, 512)`：AVAsset のメタデータからジャケット（元の画像を `art/`、縮小を `thumbs/` に）
-  - `kura_probe(path, kind)` → JSON（`kura_free_string` で解放）：幅・高さ・長さ・撮影日時・コーデック・アーティスト・アルバム・曲名
+  - `kura_probe(path, kind)` → JSON（`kura_free_string` で解放）：幅・高さ・長さ・撮影日時・コーデック・アーティスト・アルバム・曲名。`kind` は 0 画像・1 動画・2 音楽・3 フォント（M11。`{"codec": 形式, "font": {"family","style","fullName","postscriptName","glyphs","faces","variable"}}`。`kura_mac::probe_font`）。知らない種類は NULL
   - `kura_reduce_transparency()` → bool
+- 3D モデル（glb）の情報とサムネイルは kura-mac ではなく kura-engine の `model`（自前の読み手とソフトウェアの描画。M11 の決定 9。docs/editing.md §9.10）。
+- SVG の文字を描くフォント（M11 の決定 12）：`kura_mac::pinned_options()` が、`/System/Library/Fonts` と `Supplemental` の ttf・otf・ttc を読み取り専用のボリュームなら mmap してエンジンの `SvgFonts` に渡す（文字を含む SVG を初めて読むときに作る。プロセスで 1 つを共通に使う。370 ファイル・787 書体で物理フットプリント +2.6 MiB）。`codec_set`・`full_codec_set` にはこれを渡す。unsafe は `src/fonts.rs` の写像の中だけ。
 - 編集の Platform の段のコーデック（段 9。ADR-153）は、上の C 文字列の関数とは別の口（`swift/Sources/KuraMacC/include/kura_mac_ffi.h`、ABI の版 1）で呼ぶ：不透明なハンドルと 2 段の呼び出し（Swift が開いて形を返す → Rust が上限を確かめて確保 → Swift がそこへ書く）、状態の番号 0〜6（OK・扱えない・失敗・中止・誤った呼び出し・食い違い・上限。kura-engine の `codec::platform` と同じ値）、Rust が渡す文言のバッファ、中止のコールバック。Platform のコーデックの unsafe は `src/bridge.rs` だけ。詳しくは docs/editing.md §9.8。
 - Swift のランタイムは OS のもの（`/usr/lib/swift`）を使う。リンクする実行ファイル（kura-mac のテスト、src-tauri、kura-devtools）の build.rs で rpath を足す。
 - 形式ごとの試す順（`kura_mac::media_backend()`）：flac・ogg・opus・mkv・webm・avi は ffmpeg / ffprobe を先に、それ以外は macOS を先に。前の実装が「扱えない形式」と答えたときだけ次を試す（ADR-32）。
