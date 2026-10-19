@@ -14,6 +14,7 @@ import { SparkleIcon } from '../../components/icons/SparkleIcon';
 import { TagIcon } from '../../components/icons/TagIcon';
 import { ja } from '../../i18n/ja';
 import { type ListView, utcOffsetMinutes } from '../../ipc/items';
+import { kindBreakdown } from '../../ipc/kinds';
 import { type QueryCheckDto, querySuggest, queryParse, type SuggestionDto } from '../../ipc/search';
 import { formatCount } from '../../lib/format';
 import { useSearchStore } from '../../stores/searchStore';
@@ -285,15 +286,8 @@ function PaletteBody() {
 
   const counts = check?.counts ?? null;
   const breakdown = counts
-    ? (
-        [
-          [ja.kinds.image, counts.image],
-          [ja.kinds.video, counts.video],
-          [ja.kinds.audio, counts.audio],
-        ] as const
-      )
-        .filter(([, n]) => n > 0)
-        .map(([label, n]) => `${label} ${formatCount(n)}`)
+    ? kindBreakdown(counts)
+        .map(({ label, count }) => `${label} ${formatCount(count)}`)
         .join(' · ')
     : '';
 

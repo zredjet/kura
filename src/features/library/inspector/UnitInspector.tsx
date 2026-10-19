@@ -8,8 +8,10 @@ import { Switch } from '../../../components/Switch/Switch';
 import { CloseIcon } from '../../../components/icons/CloseIcon';
 import { FolderIcon } from '../../../components/icons/FolderIcon';
 import { Waveform } from '../../../components/icons/Waveform';
+import { KindArt } from '../../../components/KindArt/KindArt';
 import { ja } from '../../../i18n/ja';
 import { selectionInfo, unitEntry } from '../../../ipc/items';
+import { isPlayable } from '../../../ipc/kinds';
 import { thumbUrl } from '../../../ipc/media';
 import { tagLabel } from '../../../ipc/tags';
 import { getUnitDetail, type OrderModeDto, type UnitFolderDto } from '../../../ipc/units';
@@ -79,6 +81,9 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
         )}
         {cover?.kind === 'audio' && cover.thumbState !== 'ready' && (
           <Waveform className={styles.previewWave} />
+        )}
+        {cover && !isPlayable(cover.kind) && cover.thumbState !== 'ready' && (
+          <KindArt kind={cover.kind} />
         )}
       </div>
 

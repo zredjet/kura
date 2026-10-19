@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ItemSummaryDto } from '../../../ipc/items';
+import type { ItemKind } from '../../../ipc/kinds';
 import { bgmOnEnter } from './bgm';
 import { FADE_MS } from './fade';
 import { prevTarget, stepImageMs } from './nav';
@@ -43,15 +44,24 @@ class FakeMedia {
   }
 }
 
-function item(id: number, kind: string, extra: Partial<ItemSummaryDto> = {}): ItemSummaryDto {
+const EXT: Record<ItemKind, string> = {
+  image: 'jpg',
+  video: 'mkv',
+  audio: 'ogg',
+  font: 'ttf',
+  model: 'glb',
+};
+
+function item(id: number, kind: ItemKind, extra: Partial<ItemSummaryDto> = {}): ItemSummaryDto {
+  const media = kind === 'video' || kind === 'audio';
   return {
     id,
     hash: `h${id}`,
-    ext: kind === 'image' ? 'jpg' : kind === 'video' ? 'mkv' : 'ogg',
+    ext: EXT[kind],
     kind,
     width: null,
     height: null,
-    durationMs: kind === 'image' ? null : 180_000,
+    durationMs: media ? 180_000 : null,
     sizeBytes: 1,
     title: `t${id}`,
     rating: 0,
@@ -59,7 +69,7 @@ function item(id: number, kind: string, extra: Partial<ItemSummaryDto> = {}): It
     importedAt: 0,
     capturedAt: null,
     thumbState: 'ready',
-    proxyState: kind === 'image' ? 'not_needed' : 'ready',
+    proxyState: media ? 'ready' : 'not_needed',
     lastPlayedAt: null,
     ...extra,
   };
@@ -117,6 +127,8 @@ interface Harness {
   video: FakeMedia;
   /** BGM 用の 2 つ（作られた順）。 */
   tracks: FakeMedia[];
+  /** 作られた要素すべて（BGM の 2 つと先読みの 2 つ）。 */
+  created: FakeMedia[];
   reports: SlotReport[];
   requests: { ids: number[]; force: boolean }[];
   items: Map<number, ItemSummaryDto>;
@@ -165,6 +177,7 @@ function setup(rows: ItemSummaryDto[]): Harness {
     controller,
     video,
     tracks: created.slice(0, 2),
+    created,
     reports,
     requests,
     items,
@@ -411,6 +424,35 @@ describe('スロットの進み方', () => {
       [1, 7, true],
       [2, 7, false],
     ]);
+  });
+});
+
+describe('再生しない種類（フォント・3D。docs/playlists.md §1.1）', () => {
+  it('キューに入っていても鳴らさず、先読みもせずに次のスロットへ進む', async () => {
+    const h = setup([item(1, 'image'), item(2, 'font'), item(3, 'model'), item(4, 'audio')]);
+    h.controller.start(queueOf([1, 2, 3, 4], [1000]));
+    await advance(0);
+    // 次のスロット（フォント）を音楽・動画の要素に読ませない
+    expect(h.created.map((m) => m.src).filter((src) => /h[23]$/.test(src))).toEqual([]);
+    await advance(1000 + TICK_MS);
+    expect(h.last().index).toBe(3);
+    expect(h.last().kind).toBe('audio');
+    expect(h.created.map((m) => m.src).filter((src) => /h[23]$/.test(src))).toEqual([]);
+    await advance(0);
+    // 飛ばしたスロットは報告しない（再生済みにしない）
+    expect(h.reports.map((r) => r.itemId)).toEqual([1]);
+    expect(h.requests.flatMap((r) => r.ids)).not.toContain(2);
+    expect(h.requests.flatMap((r) => r.ids)).not.toContain(3);
+  });
+
+  it('最後なら終わりにする（全体の繰り返しでも、飛ばすものだけのときは回り続けない）', async () => {
+    const h = setup([item(1, 'font'), item(2, 'model')]);
+    h.controller.setRepeat('all');
+    h.controller.start(queueOf([1, 2]));
+    await advance(0);
+    expect(h.last().phase).toBe('ended');
+    expect(h.last().kind).toBeNull();
+    expect(h.reports).toEqual([]);
   });
 });
 

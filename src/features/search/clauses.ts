@@ -4,6 +4,8 @@
  * ここではフィルタバーが自分のフィールドの条件を見つけて差し替えられるよう、先頭のフィールド名だけを読む。
  */
 
+import { type ItemKind, kindFromWord } from '../../ipc/kinds';
+
 /** フィールドの日本語名・英語名 → 英語名（docs/search-query.md §3）。 */
 const FIELDS: Record<string, string> = {
   種類: 'type',
@@ -125,17 +127,8 @@ export function findField(clauses: readonly string[], field: string): ClausePart
   return null;
 }
 
-const KINDS: Record<string, 'image' | 'video' | 'audio'> = {
-  画像: 'image',
-  image: 'image',
-  動画: 'video',
-  video: 'video',
-  音楽: 'audio',
-  audio: 'audio',
-};
-
 /** 種類の条件が 1 種類だけならその種類（フィルタバーのセグメント）。 */
-export function singleKind(clauses: readonly string[]): 'image' | 'video' | 'audio' | null {
+export function singleKind(clauses: readonly string[]): ItemKind | null {
   const parts = findField(clauses, 'type');
   if (!parts || (parts.op !== ':' && parts.op !== '=')) {
     return null;
@@ -147,7 +140,7 @@ export function singleKind(clauses: readonly string[]): 'image' | 'video' | 'aud
   if (values.length !== 1) {
     return null;
   }
-  return KINDS[values[0]?.toLowerCase() ?? ''] ?? null;
+  return kindFromWord(values[0] ?? '');
 }
 
 /** 入力の途中で、ここで区切ってチップにしてよいか（引用符・かっこが閉じていて、記号で終わっていない）。 */

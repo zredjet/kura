@@ -478,14 +478,16 @@ export const ja = {
   },
   tile: {
     unit: (name: string, n: string) => `ユニット「${name}」、${n} 項目`,
-    music: '音楽',
     downloaded: 'ダウンロードしたもの',
     captured: 'キャプチャしたもの',
   },
+  /** 種類のラベル（並び・述語は src/ipc/kinds.ts。種類を足したらここにも足す）。 */
   kinds: {
     image: '画像',
     video: '動画',
     audio: '音楽',
+    font: 'フォント',
+    model: '3D',
   },
   inspector: {
     empty: '項目を選ぶと、ここに詳細が出ます',

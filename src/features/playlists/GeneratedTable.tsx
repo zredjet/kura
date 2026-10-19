@@ -2,6 +2,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { type RefObject, useEffect, useRef } from 'react';
 
 import { ja } from '../../i18n/ja';
+import { kindLabel } from '../../ipc/kinds';
 import type { PlaylistContentsDto, PlaylistDto } from '../../ipc/playlists';
 import { agoLabel } from '../../lib/dates';
 import { formatCount, formatDuration } from '../../lib/format';
@@ -91,7 +92,7 @@ export function GeneratedTable({
               const cover = row.coverItemId !== null ? getCached(row.coverItemId) : undefined;
               const unit = row.target.kind === 'unit' ? getCachedUnit(row.target.id) : undefined;
               const isItem = row.target.kind === 'item';
-              const kinds = row.kinds.map((k) => ja.kinds[k as 'image' | 'video' | 'audio'] ?? k);
+              const kinds = row.kinds.map(kindLabel);
               const length =
                 isItem && cover?.kind === 'image'
                   ? t.seconds(String(Math.round(playlist.imageDurationMs / 1000)))

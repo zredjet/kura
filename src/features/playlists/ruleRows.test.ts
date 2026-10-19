@@ -36,6 +36,19 @@ describe('ルールの行と検索の文字列', () => {
     expect(toClause(newRow('folder'))).toBe('');
   });
 
+  it('種類の行は再生できる種類（画像・動画・音楽）だけで、並びは種類の表の順', () => {
+    expect(toClause(newRow('kind'))).toBe('種類:画像,動画,音楽');
+    // 前の版で保存した並びも行に戻る
+    expect(fromClause('種類:画像,音楽,動画')).toEqual({
+      field: 'kind',
+      op: 'has',
+      value: ['image', 'video', 'audio'],
+    });
+    // フォント・3D はスマートの候補にならないので、行にせず検索式のまま
+    expect(fromClause('種類:フォント')).toEqual({ field: 'query', text: '種類:フォント' });
+    expect(fromClause('種類=画像,3D')).toEqual({ field: 'query', text: '種類=画像,3D' });
+  });
+
   it('決まった形でない条件は検索式の行', () => {
     expect(fromClause('評価>=4 海')).toEqual({ field: 'query', text: '評価>=4 海' });
     expect(fromClause('(海 | 評価>=3)')).toEqual({ field: 'query', text: '(海 | 評価>=3)' });
