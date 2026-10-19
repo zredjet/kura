@@ -40,7 +40,7 @@
 
 ## 3. IPC コマンド一覧（初期）
 
-戻り値はすべて `Result<T, AppError>`。`AppError { code: string, message: string }`。code の例：`NotFound`、`InvalidQuery`、`Invalid`、`ToolMissing`、`Io`、`Db`、`Conflict`、`Internal`。ライブラリを新しい版にできずに開けないときは `LibraryTooNew`（新しい版の Kura で作られた）・`NoSpace`（空き容量）・`BackupFailed`（当てる前のバックアップ）・`UpgradeFailed`（当てる失敗。戻した）で、フロントは code で文言を選び、`message` を説明に出す（M11。docs/data-model.md §5）。
+戻り値はすべて `Result<T, AppError>`。`AppError { code: string, message: string }`。code の例：`NotFound`、`InvalidQuery`、`Invalid`、`ToolMissing`、`Io`、`Db`、`Conflict`、`Internal`。ライブラリを新しい版にできずに開けないときは `LibraryTooNew`（新しい版の Kura で作られた）・`NoSpace`（空き容量）・`BackupFailed`（当てる前のバックアップ）・`UpgradeFailed`（当てる失敗。戻した）で、フロントは code で文言を選び、`message` を説明に出す（M11。docs/data-model.md §5）。その場で用意する表示（アニメの帯）が大きすぎるときは `TooLarge`（1 辺 8,192・16M 画素・メモリの予算の全体を超える。やり直しても同じ）、メモリの予算が空いていないときは `Busy`（少し待てば通る。画面は「混んでいます。もう一度押してください」）（M11）。
 
 | 領域 | コマンド | 説明 |
 |---|---|---|
@@ -55,6 +55,9 @@
 | | （`collapseUnits` が true のとき） | set ユニットに属するアイテムを、最初に一致したメンバーの位置で 1 件のユニットにまとめる。ユニットは `0x8000_0000 \| unit_id` で表し、縦横比は表紙のもの。ゴミ箱とユニットの中ではまとめない |
 | | `items_get(ids)` → `ItemSummary[]` / `units_get(ids)` → `UnitSummary[]` | 最大 200 件。要求した順で返し、ないものは省く |
 | | `item_detail(id)` → `ItemDetail` | タグ・フォルダ・ユニット（set のメンバー、または参照フォルダに入っている folder ユニット）・取得元を含む |
+| 素材（M11） | `item_asset_get(itemId)` → `AssetDto` | インスペクタの素材の欄：解析の進み具合（`analysisState`。DB の綴り）、解析の事実（`facts`：画像は透過・色数・ドット絵の倍率と自動の判定・コマの数、音声はラウドネス・ピーク・ループ点・レート・チャンネル・ビット。台帳の行を経て `media_facts` から。未解析は null）、利用者の設定（`settings`：ドット絵・倍率・格子・コマの長さ・ピボット・タグ。`asset_settings`）、実効値（`effective`：ドット絵は「設定 ?? 自動 ?? 偽」、アニメとして回せるか、コマの数）、フォントの情報（`font`：書体名・スタイル・字の数・形式）、3D の情報（`model`：頂点・三角形・材質・範囲・描けない拡張）。DB だけを読む |
+| | `item_asset_settings_set(ids, patch)` → 変えた数 | 右クリックの複数の選択にも使う。画像だけに付ける（ほかの種類・ない ID は飛ばす）。`patch` は省いた項目を変えない：`pixelArt`（`auto`・`yes`・`no`）、`pixelScale`・`frameMs`（0 は自動）、`grid`・`pivot`（`"clear"` か `{ set }`）、`animTag`（空文字は自動）。セルが 1 つもできない格子・セルの数を超えるコマの数があれば、どれも変えずに `Invalid`。すべて自動に戻れば行を消す |
+| | `item_anim_get(itemId)` → `AnimDto` | アニメの帯の情報（`hash`・`version`・`rev`・`canvasW`・`canvasH`・`cols`・`frameCount`・`durations`（ms。0 はそのまま）・`tags`（`name`・`from`・`to`・`direction`（`forward`・`reverse`・`pingPong`・`pingPongReverse`）・`repeat`））。帯がなければその場で作って `anim/ab/<hash>-1.png` に書く（ジョブにしない。§4）。コマ f の左上は `((f % cols) × canvasW, ⌊f / cols⌋ × canvasH)`。帯は `/anim/{hash}/{version}`、`rev` が 0 でなければ `?r={rev}` を付ける（格子を変えると変わる）。1 枚の画像で格子もなければ `Invalid`、大きすぎれば `TooLarge`、混んでいれば `Busy` |
 | | `items_selection_info(ids)` → `SelectionInfo` | 複数選択のインスペクタ用：評価とメモ（全件が同じときだけ）、タグとフォルダ（付いている件数付き） |
 | | `library_counts()` → `{ all, recent, unsorted, untagged, trash, captures }` | サイドバーの件数。グリッドを出したあとに別に取る（NFR-01 に響かないように） |
 | 編集 | `items_update(ids, patch)` | タイトル（1 件のときだけ）・評価・メモ（全件に同じ値）。メモの空文字は消す |
@@ -87,7 +90,7 @@
 | | `playback_report({ itemId, unitId, unitStart, playlistId, playedMs, completed, durationMs })` → 記録したか | スロットを離れたときに送る。再生済みの判定（playlists.md §6.4）は Rust がし、再生済みなら `play_events` と回数・日時を更新する |
 | | `proxy_request(ids, force)` | 再生キューの今と次のプロキシを先に作ってもらう。`force` は元のまま再生できなかったものを作成待ちに戻す（§8） |
 | | `open_external(hash)` → `mpv` \| `quickTime` | 元のファイルを外部プレイヤーで開く（mpv があれば mpv） |
-| | `player_prefs_get()` / `player_prefs_set(prefs)` | 再生の設定（音量・画像の間も直前の音楽を流す・BGM をループ・画像の表示時間の既定値）。app.json に保存 |
+| | `player_prefs_get()` / `player_prefs_set(prefs)` | 再生の設定（音量・画像の間も直前の音楽を流す・BGM をループ・画像の表示時間の既定値・選んだ短い音声をすぐ鳴らす `sfxAudition`（M11。既定でオン。前の app.json にない場合もオン））。app.json に保存 |
 | ジョブ | `jobs_list(filter)` / `job_cancel(id)` / `job_pause(id)` / `job_resume(id)` / `job_retry(id)` / `job_log(id)` | 進捗はイベント `job://progress` |
 | 書き出し | `export_start(dest, entries)` → JobId | 選んだもの（一覧の ID。ユニットは印付き）を書き出すジョブを積む。書き出し先はあるフォルダで、ライブラリの中は受け付けない（§14） |
 | バックアップ | `backups_list()` → `Backup[]` / `backup_now()` → `Backup` | DB のバックアップの一覧（新しい順）と、今すぐ作る（§14） |
@@ -119,19 +122,22 @@
 
 | パス | 返すもの | ヘッダ |
 |---|---|---|
-| `/thumb/{hash}/s` | 長辺 512px サムネイル | `Cache-Control: public, max-age=31536000, immutable` |
+| `/thumb/{hash}/s` | 長辺 512px サムネイル（`png`、`jpg` の順に探す。M11） | `Cache-Control: public, max-age=31536000, immutable` |
 | `/thumb/{hash}/l` | 長辺 1600px サムネイル | 同上 |
 | `/art/{hash}` | 音楽のジャケット | 同上 |
 | `/file/{hash}` | 元ファイル | `Accept-Ranges: bytes`、Range があれば 206 と `Content-Range` |
 | `/play/{hash}` | 再生用：プロキシがあればプロキシ、なければ元ファイル | 同上 |
-| `/peaks/{hash}` | 波形の段（`kura-peaks` 版 1。`peaks/ab/<hash>.peaks`。M11） | `immutable`。解析していなければ 404 |
-| `/pcm/{hash}/{start}-{end}` | 試聴用の PCM（WAV。フレーム `[start, end)`。M11） | キャッシュしない（`no-store`） |
-| `/anim/{hash}/{版}` | アニメの帯の PNG（`anim/ab/<hash>-<版>.png`。M11） | `immutable` |
+| `/peaks/{hash}` | 波形の段（`kura-peaks` 版 1。`peaks/ab/<hash>.peaks`。解析のジョブが書く。M11） | `immutable`。解析していなければ 404 |
+| `/pcm/{hash}/{start}-{end}` | 試聴用の PCM（WAV。フレーム `[start, end)`。その場で作る。M11） | キャッシュしない（`no-store`）。Range は見ない |
+| `/anim/{hash}/{版}` | アニメの帯の PNG（`anim/ab/<hash>-<版>.png`。`item_anim_get` が書く。今の版は 1。M11） | `immutable`（格子の帯は `?r={rev}` で区別する） |
 
 - Range は 1 区間だけ対応（`bytes=start-end` / `bytes=start-` / `bytes=-末尾の長さ`）。範囲外・不正な Range は 416。応答本体は最大 4MB ずつ返す（`bytes=start-` には先頭から 4MB だけ）。
 - `{hash}` は 64 桁の小文字 16 進だけを受け付ける。それ以外とファイルがないものは 404、ライブラリが開かれていなければ 503。`/pcm` の `{start}-{end}` は `start < end` の 10 進（u64 にあふれるもの・逆の範囲・片側だけは 404）。
-- `/peaks`・`/pcm`・`/anim` は M11 の段 1 では経路だけを持ち、404 を返す（中身は段 3。`/pcm`・`/anim` はその場で作る）。
-- 実際の置き場所：`thumbs/ab/<hash>_s.jpg`・`_l.jpg`、`art/ab/<hash>.jpg`、`proxies/ab/<hash>.mp4`、`files/ab/cd/<hash>.<ext>`（`/file`・`/play` は拡張子が分からないので `files/ab/cd/` の中を探す）。
+- 実際の置き場所：`thumbs/ab/<hash>_s.{png,jpg}`・`_l.{png,jpg}`（透明のあるものは PNG。両方あれば PNG を返す）、`art/ab/<hash>.jpg`、`proxies/ab/<hash>.mp4`、`peaks/ab/<hash>.peaks`、`anim/ab/<hash>-1.png`、`files/ab/cd/<hash>.<ext>`（`/file`・`/play` は拡張子が分からないので `files/ab/cd/` の中を探す）。帯の版が今のもの（1）でなければ 404。
+- **`/pcm`（試聴の PCM。kura-core の `asset::pcm`）**：files/ の音声のファイルを、ライブラリのエンジンのコーデックの組（解析と同じ）で読み、区間を WAV にする。並びは `RIFF`・`fmt `（16 バイト。形式 1 = 16 ビット整数か 3 = 32 ビット浮動小数）・`kura`・`data` の順で、`kura` チャンク（版 1）に開始フレーム・元のフレーム数・ループ点・デコーダの識別子を入れる（同じ読み取りの値。試聴は DB ではなくこれを使う。正は `crates/kura-core/tests/vectors/pcm/wav.json`、TS は `src/lib/asset/wav.ts`）。元が 16 ビット以下の整数で、区間の標本がすべて 16 ビットの格子の上にあれば 16 ビット、ほかは浮動小数（非可逆の形式は浮動小数）。ループ点は「始まり < 終わり ≤ 長さ」のものだけ。
+  - 読んだ結果は (ライブラリ, ハッシュ, デコーダの識別子) で直近の 1 件だけ覚える（前奏と本体・継ぎ目の前後を続けて取るので、2 回目からは読まない。読むのは 1 つずつ）。覚えている間は値の分の予算（対話）を持ち、60 秒使わなければ捨てる。
+  - 音声でない・ファイルがなければ 404、範囲が音声の外か、浮動小数で 64 MiB を超える長さは 416、エンジンがない・予算（対話。待たない）が空いていなければ 503、読めなければ 500。どれも §4.1 の 4 つのヘッダを付ける。
+- **`/pcm` と `item_anim_get` をジョブにしない理由**（M11 の決定 8）：利用者がその場で待つ短い表示の用意で、長くても 0.4 秒ほど（release・M4 Max の実測：3 分の 44.1kHz ステレオの最初の要求が WAV 91ms・FLAC 177ms・Ogg Vorbis 144ms、2 回目から 0.1〜0.6ms。帯は GIF 64 コマ 128² が 25ms、APNG 64 コマ 256² が 80ms、上限いっぱいの 8,192 × 2,048 が 189ms、すでにあれば 0.1ms 未満）。`spawn_blocking` で読み、予算は対話（`Class::Interactive`。待たない）で確保し、足りなければ 503 か `Busy`・`TooLarge` で返す。ジョブの列に並べると、解析・サムネイルのジョブの後ろで待たされる。例外：ffmpeg でしか読めない形式（Opus など）は、3 分で約 0.8 秒かかる（形を数える回と読む回）。
 - WKWebView の `<video>` はサンプル単位の小さな Range（数百バイト）を多数送ってくる（60 秒・1.4MB の MOV の再生で約 3,000 回）。今は 1 回ごとにファイルを開いて読む。大きな動画での負荷は M5 で測る。
 - `RUST_LOG=kura_app_lib=debug` で要求ごとに label・method・uri・Origin・range・status・bytes をログに出す。
 - `Content-Type` は拡張子から決める。`nosniff` を付けるので、`<img>` で出す SVG は `image/svg+xml` で返す（`application/octet-stream` では表示されない）。
@@ -182,7 +188,7 @@ object-src 'none'; frame-src 'none'
 | | 読み方 | 期待する結果 | 効く CSP の行・ヘッダ |
 |---|---|---|---|
 | P1 | `<img>`（crossorigin なし）で `/thumb/{hash}/s`（JPEG）と `/file/{hash}`（アルファ付き PNG・`<script>` 入りの SVG） | `load` し、`naturalWidth` > 0 | `img-src kura:`。SVG は `image/svg+xml` |
-| P2 | `fetch`：`/file/{hash}` の全体と `Range: bytes=0-99`、`/peaks/{hash}` | 全体は 200 で長さと先頭のマジック（`RIFF`・`glTF`）が合う。Range は 206 で `Content-Range` を読める。`/peaks` は 200 なら先頭が `kurapeak`（段 3 まで 404） | `connect-src kura:`、ACAO・ACEH |
+| P2 | `fetch`：`/file/{hash}` の全体と `Range: bytes=0-99`、`/peaks/{hash}` | 全体は 200 で長さと先頭のマジック（`RIFF`・`glTF`）が合う。Range は 206 で `Content-Range` を読める。`/peaks` は 200 なら先頭が `kurapeak`（解析していなければ 404） | `connect-src kura:`、ACAO・ACEH |
 | P3 | `fetch`：ない中身の `/file/{hash}` と、経路の外 | 状態 404 を読める（TypeError にならない） | `connect-src kura:`、エラーにも ACAO |
 | P4 | `new FontFace(name, 'url(kura://…/file/{ttf})')` を `load` して `document.fonts` に足す | `loaded` になり、代わりの書体と字の幅が変わる | `font-src kura:` |
 | P5 | `fetch` した WAV を `decodeAudioData`、`<audio crossorigin="anonymous">` で `/play/{hash}` | 長さ（フレーム数）が合う。`loadedmetadata` で長さが合う | `connect-src kura:`・`media-src kura:`、ACAO |
