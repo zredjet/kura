@@ -34,8 +34,14 @@ pub struct Db {
     path: PathBuf,
     writer: Mutex<Option<mpsc::Sender<WriteJob>>>,
     writer_thread: Mutex<Option<JoinHandle<()>>>,
-    readers: Mutex<Vec<Connection>>,
+    readers: Mutex<Readers>,
     reader_returned: Condvar,
+}
+
+/// 読み取りの接続の置き場（閉じたら空にして、もう貸さない）。
+struct Readers {
+    conns: Vec<Connection>,
+    closed: bool,
 }
 
 impl Db {
@@ -88,7 +94,10 @@ impl Db {
             path: path.to_path_buf(),
             writer: Mutex::new(Some(tx)),
             writer_thread: Mutex::new(Some(writer_thread)),
-            readers: Mutex::new(readers),
+            readers: Mutex::new(Readers {
+                conns: readers,
+                closed: false,
+            }),
             reader_returned: Condvar::new(),
         })
     }
@@ -134,7 +143,10 @@ impl Db {
         let conn = {
             let mut pool = self.readers.lock().map_err(|_| CoreError::DbClosed)?;
             loop {
-                if let Some(conn) = pool.pop() {
+                if pool.closed {
+                    return Err(CoreError::DbClosed);
+                }
+                if let Some(conn) = pool.conns.pop() {
                     break conn;
                 }
                 pool = self
@@ -144,15 +156,24 @@ impl Db {
             }
         };
         let result = f(&conn);
-        if let Ok(mut pool) = self.readers.lock() {
-            pool.push(conn);
+        if let Ok(mut pool) = self.readers.lock()
+            && !pool.closed
+        {
+            pool.conns.push(conn);
             self.reader_returned.notify_one();
         }
         result
     }
 
-    /// 書き込みスレッドを止める（未処理の書き込みは実行してから止まる）。
+    /// 閉じる：読み取りの接続を閉じてから、書き込みスレッドを止める（未処理の書き込みは実行してから止まる）。
+    /// 最後に閉じた接続が WAL を本体へ移して消すので、書き込みの接続を最後にする（読み取り専用の接続が最後だと
+    /// WAL が残り、次に開くときに読み直して約 40ms かかる）。
     pub fn close(&self) {
+        if let Ok(mut pool) = self.readers.lock() {
+            pool.closed = true;
+            pool.conns.clear();
+        }
+        self.reader_returned.notify_all();
         if let Ok(mut sender) = self.writer.lock() {
             sender.take();
         }
@@ -367,6 +388,31 @@ mod tests {
         let (_dir, db) = open_temp();
         db.close();
         assert!(matches!(db.write(|_| Ok(())), Err(CoreError::DbClosed)));
+        assert!(matches!(db.read(|_| Ok(())), Err(CoreError::DbClosed)));
+    }
+
+    #[test]
+    fn closing_the_db_leaves_no_wal() {
+        // 最後に閉じる接続が WAL を本体へ移して消す。読み取り専用の接続が最後だと WAL が残り、次に開くときに読み直す
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.sqlite");
+        let db = Db::open(&path).unwrap();
+        db.write(|tx| {
+            tx.execute("INSERT INTO settings (key, value) VALUES ('a', '1')", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let n: i64 = db
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM settings", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(wal_len(&path) > 0, "書いている間は WAL がある");
+        drop(db);
+        assert!(
+            !Path::new(&format!("{}-wal", path.display())).exists(),
+            "閉じたあとに WAL が残った（{} バイト）",
+            wal_len(&path)
+        );
     }
 
     // ===== 開くときのマイグレーション（当てる前のフック・WAL・失敗の言葉。docs/data-model.md §5）=====
