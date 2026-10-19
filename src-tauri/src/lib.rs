@@ -62,6 +62,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::library::backup_now,
             commands::library::reveal_path,
             commands::library::library_usage,
+            commands::library::library_cache_usage,
             commands::library::library_check,
             commands::export::export_start,
             commands::import::import_preview,

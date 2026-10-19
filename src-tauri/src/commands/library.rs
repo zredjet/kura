@@ -7,7 +7,8 @@ use tauri::{AppHandle, Manager, State};
 
 use super::blocking;
 use crate::dto::{
-    BackupDto, IntegrityDto, LibraryInfoDto, LibraryRestoreDto, LibraryUsageDto, LocationCheckDto,
+    BackupDto, IntegrityDto, LibraryCacheUsageDto, LibraryInfoDto, LibraryRestoreDto,
+    LibraryUsageDto, LocationCheckDto,
 };
 use crate::error::{AppError, AppErrorCode};
 use crate::state::{AppState, event_sink};
@@ -205,6 +206,17 @@ pub async fn library_usage(state: State<'_, AppState>) -> Result<LibraryUsageDto
         })
     })
     .await
+}
+
+/// サムネイル・波形・アニメのキャッシュの大きさ（設定の「容量」の行。ファイルを数えるので、設定の画面を開いたときだけ呼ぶ）。
+#[tauri::command]
+#[specta::specta]
+pub async fn library_cache_usage(
+    state: State<'_, AppState>,
+) -> Result<LibraryCacheUsageDto, AppError> {
+    let session = state.session()?;
+    blocking(move || Ok(kura_core::media::usage::cache_usage(session.library().layout())?.into()))
+        .await
 }
 
 /// 整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数える）。

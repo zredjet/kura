@@ -4,7 +4,8 @@
 //! 置き場の大きさを知れるように、サムネイル（`thumbs/` と音楽のジャケット `art/`）・波形の段（`peaks/`）・アニメの帯（`anim/`）を
 //! 別々に数える。ファイルを数えるので、ライブラリの容量（台帳の合計）とは別のコマンドで、設定の画面を開いたときにだけ呼ぶ。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::Result;
 use crate::library::Layout;
@@ -48,29 +49,86 @@ pub fn cache_usage(layout: &Layout) -> Result<CacheUsage> {
     })
 }
 
-/// フォルダの下のファイルの大きさの合計（再帰しない積み上げでたどる。シンボリックリンクはたどらない。フォルダがなければ 0）。
+/// 並べて数えるスレッドの数の上限（ファイルの属性を読む待ちが主なので、コアの数より多くても速くならない）。
+const WORKERS: usize = 8;
+
+/// フォルダの下のファイルの大きさの合計（シンボリックリンクはたどらない。フォルダがなければ 0）。1 段目のフォルダ
+/// （`ab/`。256 個）を数本のスレッドで分けて数える（10 万件のライブラリのサムネイル 21 万個で、1 本では数秒かかった）。
 fn dir_usage(dir: &Path) -> Result<DirUsage> {
+    let (mut out, subdirs) = scan(dir)?;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, WORKERS)
+        .min(subdirs.len());
+    let next = AtomicUsize::new(0);
+    let walk_all = || -> std::io::Result<DirUsage> {
+        let mut sum = DirUsage::default();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(dir) = subdirs.get(i) else {
+                return Ok(sum);
+            };
+            sum.add(walk(dir)?);
+        }
+    };
+    let parts = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for i in 1..workers {
+            // 作れなければ、残りはこのスレッドが数える
+            if let Ok(h) = std::thread::Builder::new()
+                .name(format!("kura-usage-{i}"))
+                .spawn_scoped(scope, walk_all)
+            {
+                handles.push(h);
+            }
+        }
+        let mut parts = vec![walk_all()];
+        for h in handles {
+            parts.push(h.join().unwrap_or_else(|_| {
+                Err(std::io::Error::other("容量を数えるスレッドが止まりました"))
+            }));
+        }
+        parts
+    });
+    for part in parts {
+        out.add(part?);
+    }
+    Ok(out)
+}
+
+/// 1 つのフォルダの直下：ファイルを数え、下のフォルダを返す（フォルダがなければ空）。
+fn scan(dir: &Path) -> std::io::Result<(DirUsage, Vec<PathBuf>)> {
+    let mut out = DirUsage::default();
+    let mut dirs = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((out, dirs)),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            dirs.push(entry.path());
+        } else if kind.is_file() {
+            // 数えている間に消えたもの（作り直し・ゴミ箱を空にした）は数えない
+            if let Ok(meta) = entry.metadata() {
+                out.bytes = out.bytes.saturating_add(meta.len());
+                out.files += 1;
+            }
+        }
+    }
+    Ok((out, dirs))
+}
+
+/// フォルダの下をすべて（再帰しない積み上げで）たどる。
+fn walk(dir: &Path) -> std::io::Result<DirUsage> {
     let mut out = DirUsage::default();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.into()),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                stack.push(entry.path());
-            } else if kind.is_file() {
-                // 数えている間に消えたもの（作り直し・ゴミ箱を空にした）は数えない
-                if let Ok(meta) = entry.metadata() {
-                    out.bytes = out.bytes.saturating_add(meta.len());
-                    out.files += 1;
-                }
-            }
-        }
+        let (files, dirs) = scan(&dir)?;
+        out.add(files);
+        stack.extend(dirs);
     }
     Ok(out)
 }
