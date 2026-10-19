@@ -42,6 +42,8 @@ pub struct PlayerPrefs {
     pub bgm_loop: bool,
     /// 画像の表示時間の既定値。
     pub image_duration_ms: i64,
+    /// 選んだ短い音声（10 秒以下）をすぐ鳴らす（M11 の決定 13。既定でオン。前の app.json にない場合もオン）。
+    pub sfx_audition: bool,
 }
 
 /// 画像の表示時間として受け付ける範囲（1〜60 秒）。
@@ -54,6 +56,7 @@ impl Default for PlayerPrefs {
             bgm_through_images: true,
             bgm_loop: false,
             image_duration_ms: kura_core::unit::DEFAULT_IMAGE_DURATION_MS,
+            sfx_audition: true,
         }
     }
 }
@@ -127,6 +130,36 @@ mod tests {
 
         std::fs::write(&path, "{ broken").unwrap();
         assert_eq!(load(&path), AppConfig::default());
+    }
+
+    /// 効果音の即再生は既定でオン（決定 13）。M11 より前の設定（sfxAudition がない）も読め、オンになる。切れば保存される。
+    #[test]
+    fn sfx_audition_defaults_on_and_old_files_still_load() {
+        assert!(PlayerPrefs::default().sfx_audition);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.json");
+        std::fs::write(
+            &path,
+            r#"{"player": {"volume": 40, "bgmThroughImages": false, "bgmLoop": true, "imageDurationMs": 5000}}"#,
+        )
+        .unwrap();
+        let prefs = load(&path).player;
+        assert_eq!((prefs.volume, prefs.bgm_loop), (40, true));
+        assert!(prefs.sfx_audition, "古い設定ではオン");
+        let config = AppConfig {
+            player: PlayerPrefs {
+                sfx_audition: false,
+                ..prefs
+            },
+            ..AppConfig::default()
+        };
+        save(&path, &config).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""sfxAudition": false"#)
+        );
+        assert!(!load(&path).player.sfx_audition);
     }
 
     #[test]

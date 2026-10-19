@@ -1587,6 +1587,8 @@ pub struct PlayerPrefsDto {
     pub bgm_through_images: bool,
     pub bgm_loop: bool,
     pub image_duration_ms: i64,
+    /// 選んだ短い音声をすぐ鳴らす（M11。既定でオン）。
+    pub sfx_audition: bool,
 }
 
 impl From<PlayerPrefs> for PlayerPrefsDto {
@@ -1596,6 +1598,7 @@ impl From<PlayerPrefs> for PlayerPrefsDto {
             bgm_through_images: p.bgm_through_images,
             bgm_loop: p.bgm_loop,
             image_duration_ms: p.image_duration_ms,
+            sfx_audition: p.sfx_audition,
         }
     }
 }
@@ -1607,6 +1610,7 @@ impl From<PlayerPrefsDto> for PlayerPrefs {
             bgm_through_images: p.bgm_through_images,
             bgm_loop: p.bgm_loop,
             image_duration_ms: p.image_duration_ms,
+            sfx_audition: p.sfx_audition,
         }
     }
 }

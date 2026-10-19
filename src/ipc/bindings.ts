@@ -49,6 +49,15 @@ export const commands = {
 	itemsGet: (ids: number[]) => typedError<ItemSummaryDto[], AppError>(__TAURI_INVOKE("items_get", { ids })),
 	/**  インスペクタ用の詳細（タグ・フォルダ・ユニットを含む）。 */
 	itemDetail: (id: number) => typedError<ItemDetailDto, AppError>(__TAURI_INVOKE("item_detail", { id })),
+	/**  素材の欄の中身（DB だけを読む）。 */
+	itemAssetGet: (itemId: number) => typedError<AssetDto, AppError>(__TAURI_INVOKE("item_asset_get", { itemId })),
+	/**
+	 *  素材の設定を変える（右クリックの複数の選択にも使う。画像だけに付け、ほかは飛ばす）。変えた数を返す。格子が合わない画像が
+	 *  あれば、どれも変えずに `Invalid`。
+	 */
+	itemAssetSettingsSet: (ids: number[], patch: AssetSettingsPatchDto) => typedError<number, AppError>(__TAURI_INVOKE("item_asset_settings_set", { ids, patch })),
+	/**  アニメの帯の情報。帯がまだなければ、その場で作って `anim/ab/<hash>-1.png` に書く（長くても 0.4 秒ほど。ジョブにしない）。 */
+	itemAnimGet: (itemId: number) => typedError<AnimDto, AppError>(__TAURI_INVOKE("item_anim_get", { itemId })),
 	/**  サイドバーの「ライブラリ」の件数。 */
 	libraryCounts: () => typedError<LibraryCountsDto, AppError>(__TAURI_INVOKE("library_counts")),
 	/**  複数選択のインスペクタに出す集計（評価・メモ・タグ・フォルダ）。 */
@@ -276,6 +285,37 @@ export type AddedDto = {
 	unitId: number | null,
 };
 
+/**  タグの再生の向き（`src/lib/asset/timeline.ts` の `Direction`）。 */
+export type AnimDirectionDto = "forward" | "reverse" | "pingPong" | "pingPongReverse";
+
+/**
+ *  アニメの帯の情報。帯は `/anim/{hash}/{version}`（`rev` が 0 でなければ `?r={rev}`）。帯の中のコマ f の左上は
+ *  `((f % cols) × canvasW, ⌊f / cols⌋ × canvasH)`。
+ */
+export type AnimDto = {
+	hash: string,
+	/**  帯の並べ方の版（今は 1）。 */
+	version: number,
+	/**  格子の帯なら 1 以上（格子を変えると変わる）、ファイルのコマなら 0。 */
+	rev: number,
+	canvasW: number,
+	canvasH: number,
+	cols: number,
+	frameCount: number,
+	/**  コマの長さ（ms。0 はそのまま。フロントが 100ms にする）。 */
+	durations: number[],
+	tags: AnimTagDto[],
+};
+
+/**  アニメのタグ（`timeline.ts` の `AnimTag`。`from`・`to` は両端を含む。`repeat` の 0 は無限）。 */
+export type AnimTagDto = {
+	name: string,
+	from: number,
+	to: number,
+	direction: AnimDirectionDto,
+	repeat: number,
+};
+
 /**  コマンドが返すエラー。JSON では `{ code, message }` になる。 */
 export type AppError = {
 	code: AppErrorCode,
@@ -298,7 +338,11 @@ export type AppErrorCode = "NotFound" | "InvalidQuery" | "Invalid" | "ToolMissin
 /**  ライブラリを新しい版にする前のバックアップを作れない（ライブラリは変えていない）。 */
 "BackupFailed" | 
 /**  ライブラリを新しい版にできない（戻した。ライブラリは前の版のまま）。 */
-"UpgradeFailed";
+"UpgradeFailed" | 
+/**  大きすぎてその場で用意できない（アニメの帯の 1 辺・画素の数・メモリの予算の全体。やり直しても同じ。M11）。 */
+"TooLarge" | 
+/**  混んでいる（メモリの予算が空いていない。少し待ってやり直せば通りうる。M11）。 */
+"Busy";
 
 /**  OS の表示設定。 */
 export type Appearance = {
@@ -312,6 +356,187 @@ export type ArchiveStatusDto = {
 	/**  記録の件数（読めなければ空）。 */
 	entries: number | null,
 	sizeBytes: number,
+};
+
+/**  透過。 */
+export type AssetAlphaDto = 
+/**  透明な画素がない。 */
+"none" | 
+/**  透明か不透明だけ。 */
+"binary" | 
+/**  半透明がある。 */
+"partial";
+
+/**  解析の進み具合（DB の `items.analysis_state` と同じ綴り）。 */
+export type AssetAnalysisStateDto = "pending" | "ready" | "failed" | "not_needed";
+
+/**  音声の事実。 */
+export type AssetAudioFactsDto = {
+	/**  積分ラウドネス（LUFS）。計れなければ null で `loudnessReason`。 */
+	loudness: number | null,
+	loudnessReason: string | null,
+	/**  LRA（LU）。 */
+	loudnessRange: number | null,
+	/**  dBTP。 */
+	truePeak: number | null,
+	samplePeak: number | null,
+	hasLoop: boolean | null,
+	/**  ループ点（解析のときの読み取り。試聴は /pcm の kura チャンクの値を使う）。 */
+	loopRange: AssetSpanDto | null,
+	sampleRate: number | null,
+	channels: number | null,
+	/**  非可逆の形式は null。 */
+	bits: number | null,
+	clipRuns: number | null,
+};
+
+/**  3D の範囲。 */
+export type AssetBoundsDto = {
+	min: [(number | null), (number | null), (number | null)],
+	max: [(number | null), (number | null), (number | null)],
+};
+
+/**  「ドット絵として表示」の 3 択。 */
+export type AssetChoiceDto = "auto" | "yes" | "no";
+
+/**  素材の欄の中身。 */
+export type AssetDto = {
+	itemId: number,
+	hash: string,
+	kind: ItemKindDto,
+	ext: string,
+	width: number | null,
+	height: number | null,
+	analysisState: AssetAnalysisStateDto,
+	/**  解析の事実（まだなければ null）。 */
+	facts: AssetFactsDto | null,
+	settings: AssetSettingsDto,
+	effective: AssetEffectiveDto,
+	/**  フォントのときだけ。 */
+	font: AssetFontDto | null,
+	/**  3D のときだけ。 */
+	model: AssetModelDto | null,
+};
+
+/**  実効値（表示と検索の値）。 */
+export type AssetEffectiveDto = {
+	/**  ドット絵として表示するか（設定 ?? 自動の判定 ?? 偽）。 */
+	pixelArt: boolean,
+	/**  アニメとして回せるか（コマが 2 つ以上か、格子がある）。 */
+	animated: boolean,
+	/**  コマの数（格子があれば帯で使う数）。 */
+	frameCount: number | null,
+};
+
+/**  解析の事実（`media_facts`）。 */
+export type AssetFactsDto = {
+	/**  解析できたか（false なら `errorCode`：`unsupported`・`too_large`・`decode`）。 */
+	ok: boolean,
+	errorCode: string | null,
+	/**  読んだデコーダ（形式だけで決めたときは null）。 */
+	decoder: string | null,
+	factsVersion: number,
+	analyzedAt: number,
+	image: AssetImageFactsDto,
+	audio: AssetAudioFactsDto,
+};
+
+/**  フォントの情報。 */
+export type AssetFontDto = {
+	family: string | null,
+	style: string | null,
+	fullName: string | null,
+	postscriptName: string | null,
+	glyphs: number | null,
+	faces: number | null,
+	variable: boolean | null,
+	/**  形式（`ttf`・`otf`・`ttc`・`woff`・`woff2`）。 */
+	format: string | null,
+};
+
+/**  格子の変え方（`"clear"` か `{ set: … }`）。 */
+export type AssetGridChangeDto = "clear" | { set: AssetGridDto };
+
+/**  スプライトシートの格子（`count` は使うコマの数。null はすべて）。 */
+export type AssetGridDto = {
+	cellW: number,
+	cellH: number,
+	offsetX: number,
+	offsetY: number,
+	gapX: number,
+	gapY: number,
+	count: number | null,
+};
+
+/**  画像の事実（計っていないものは null）。 */
+export type AssetImageFactsDto = {
+	alpha: AssetAlphaDto | null,
+	/**  1〜257（257 は 256 色を超える）。 */
+	colors: number | null,
+	visibleColors: number | null,
+	pixelKx: number | null,
+	pixelKy: number | null,
+	pixelLossless: boolean | null,
+	/**  ドット絵の自動の判定。 */
+	pixelArt: boolean | null,
+	pixelRule: number | null,
+	frameCount: number | null,
+};
+
+/**  3D モデルの情報。 */
+export type AssetModelDto = {
+	vertices: number | null,
+	triangles: number | null,
+	materials: number | null,
+	textures: number | null,
+	meshes: number | null,
+	bounds: AssetBoundsDto | null,
+	/**  描けない理由（必須の Draco・meshopt・知らない拡張の名前、`skin`）。空なら描ける。 */
+	unsupported: string[],
+};
+
+/**  ピボットの変え方（`"clear"` か `{ set: … }`）。 */
+export type AssetPivotChangeDto = "clear" | { set: AssetPivotDto };
+
+/**  ピボット（画素の座標）。 */
+export type AssetPivotDto = {
+	x: number | null,
+	y: number | null,
+};
+
+/**  利用者の設定（null は自動・設定なし）。 */
+export type AssetSettingsDto = {
+	/**  ドット絵として表示（null は自動）。 */
+	pixelArt: boolean | null,
+	pixelScale: number | null,
+	grid: AssetGridDto | null,
+	/**  格子のアニメのコマの長さ（ms）。 */
+	frameMs: number | null,
+	pivot: AssetPivotDto | null,
+	/**  試聴のループ（M13 で書く）。 */
+	loopRange: AssetSpanDto | null,
+	animTag: string | null,
+	updatedAt: number | null,
+};
+
+/**  素材の設定の変更（省いた項目は変えない）。数の 0 と文字の空は「自動に戻す」。ループ点は M13 で書くのでここにはない。 */
+export type AssetSettingsPatchDto = {
+	/**  ドット絵として表示（自動・はい・いいえ）。 */
+	pixelArt?: AssetChoiceDto | null,
+	/**  倍率（1〜64。0 は自動）。 */
+	pixelScale?: number | null,
+	grid?: AssetGridChangeDto | null,
+	/**  格子のアニメのコマの長さ（ms。0 は自動 = ファイルの長さか 100ms）。 */
+	frameMs?: number | null,
+	pivot?: AssetPivotChangeDto | null,
+	/**  再生するタグ（空文字は自動）。 */
+	animTag?: string | null,
+};
+
+/**  フレームの半開区間 [start, end)。 */
+export type AssetSpanDto = {
+	start: number,
+	end: number,
 };
 
 /**  DB のバックアップ 1 つ（FR-SYS-03。ADR-121）。 */
@@ -914,6 +1139,8 @@ export type PlayerPrefsDto = {
 	bgmThroughImages: boolean,
 	bgmLoop: boolean,
 	imageDurationMs: number,
+	/**  選んだ短い音声をすぐ鳴らす（M11。既定でオン）。 */
+	sfxAudition: boolean,
 };
 
 /**  プレイリストの中身。 */
