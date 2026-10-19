@@ -128,8 +128,9 @@ pub fn register_png(
     );
     let entries: Vec<_> = vec![file].into_iter().zip(placed).collect();
     let title = meta.title.clone();
+    let layout = library.layout().clone();
     let (result, _) = library.db().write(move |tx| {
-        let registered = write_entries(tx, entries, dest_folder_id, Origin::Capture)?;
+        let registered = write_entries(tx, &layout, entries, dest_folder_id, Origin::Capture)?;
         if registered.failed > 0 {
             return Err(CoreError::Tool(
                 "撮った画像をライブラリに入れられませんでした".into(),

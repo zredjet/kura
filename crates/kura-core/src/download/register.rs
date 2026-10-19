@@ -209,8 +209,10 @@ pub fn place_all(
 
 /// 配置したファイルを DB に入れる（アイテム・フォルダ・タグ・ユニット・`remote_sources`）。
 /// 同じ中身がすでにあれば、そのアイテムに所属とタグを足し、空いている取得元と投稿日だけ埋める。
+/// 同じ中身で拡張子だけ違うコピー（台帳の拡張子と違う `files/` のファイル）は、どの行も使わないのでここで消す。
 pub fn write_entries(
     tx: &Connection,
+    layout: &Layout,
     entries: Vec<(Downloaded, PlaceOutcome)>,
     dest_folder_id: Option<i64>,
     origin: Origin,
@@ -233,6 +235,7 @@ pub fn write_entries(
         let item_id = match find_by_hash(tx, &placed.hash)? {
             Some(existing) => {
                 out.duplicates += 1;
+                remove_other_ext_copy(tx, layout, &placed.hash, &file.ext)?;
                 if existing.trashed {
                     restore_item(tx, existing.id, now)?;
                 }
@@ -341,6 +344,31 @@ pub fn write_entries(
 }
 
 /// 同じ取得元（サイト・ID）のアイテムが入っているユニット。
+/// 同じ中身で拡張子だけ違うコピー（`files/<hash>.<ext>` で、台帳の拡張子と違うもの）を消す。どの行も使わない
+/// （CLAUDE.md の「files/ を DB を通さずに消さない」に沿って、書き込みのトランザクションの中で台帳を見てから消す）。
+fn remove_other_ext_copy(
+    conn: &Connection,
+    layout: &Layout,
+    hash: &[u8; 32],
+    ext: &str,
+) -> Result<()> {
+    let Some(kept) = crate::library::ledger::ext_of(conn, hash)? else {
+        return Ok(());
+    };
+    if kept == ext {
+        return Ok(());
+    }
+    let path = layout.content_path(hash, ext);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(%err, path = %path.display(), "拡張子だけ違うコピーを消せませんでした");
+        }
+    }
+    Ok(())
+}
+
 fn unit_of_remote(conn: &Connection, site: &str, remote_id: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare_cached(
         "SELECT unit_id FROM remote_sources
@@ -480,6 +508,7 @@ mod tests {
         .unwrap();
         let out = write_entries(
             &conn,
+            &Layout::new("/kura-test-no-library"),
             vec![
                 entry(1, meta("100", 1, true)),
                 entry(2, meta("100", 2, true)),
@@ -558,6 +587,7 @@ mod tests {
         // 同じ作品を取り直すと、既存のアイテムとユニットを使う
         let again = write_entries(
             &conn,
+            &Layout::new("/kura-test-no-library"),
             vec![
                 entry(1, meta("100", 1, true)),
                 entry(3, meta("100", 3, true)),
@@ -597,6 +627,7 @@ mod tests {
             .unwrap();
         let out = write_entries(
             &conn,
+            &Layout::new("/kura-test-no-library"),
             vec![entry(5, meta("7", 1, false))],
             None,
             Origin::Download,
@@ -638,5 +669,74 @@ mod tests {
         assert!(layout.content_path(&hash, "jpg").is_file());
         // 元のファイル（作業フォルダ）はクローンでコピーしただけなので残る
         assert!(good.is_file());
+    }
+
+    #[test]
+    fn download_duplicate_with_other_ext_leaves_no_orphan() {
+        // 同じ中身を別の拡張子で取ると、place_all が files/ に置いたコピーをどの行も使わない。
+        // 台帳の拡張子と違うファイルだけを、書き込みのトランザクションの中で消す（同じ拡張子なら消さない）
+        let dir = tempfile::tempdir().unwrap();
+        let lib = crate::library::Library::create(&dir.path().join("L")).unwrap();
+        let layout = lib.layout().clone();
+        let put = |hash: [u8; 32], ext: &str| {
+            let path = layout.content_path(&hash, ext);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "abc").unwrap();
+        };
+        for (hash, ext) in [([5u8; 32], "jpeg"), ([6u8; 32], "jpg")] {
+            lib.db()
+                .write(move |tx| {
+                    insert_item(
+                        tx,
+                        &NewItem {
+                            hash: &hash,
+                            ext,
+                            kind: MediaKind::Image,
+                            mime: None,
+                            size: 3,
+                            title: "手元",
+                            original_name: "a",
+                            original_path: "/a",
+                            info: None,
+                            source_site: "local",
+                            source_url: None,
+                            captured_at: None,
+                            now: 1,
+                        },
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            put(hash, ext);
+        }
+        // 取得したファイル（どちらも jpg）を place_all が置いたところ
+        put([5u8; 32], "jpg");
+        let written = layout.clone();
+        let out = lib
+            .db()
+            .write(move |tx| {
+                write_entries(
+                    tx,
+                    &written,
+                    vec![entry(5, meta("7", 1, false)), entry(6, meta("8", 1, false))],
+                    None,
+                    Origin::Download,
+                )
+            })
+            .unwrap();
+        assert_eq!((out.added, out.duplicates), (0, 2));
+        assert!(
+            !layout.content_path(&[5u8; 32], "jpg").exists(),
+            "拡張子だけ違うコピーが残った"
+        );
+        assert!(layout.content_path(&[5u8; 32], "jpeg").exists());
+        assert!(
+            layout.content_path(&[6u8; 32], "jpg").exists(),
+            "同じ拡張子の重複は消さない"
+        );
+        assert_eq!(
+            crate::library::check_files(lib.db(), lib.layout()).unwrap(),
+            (0, 0)
+        );
     }
 }

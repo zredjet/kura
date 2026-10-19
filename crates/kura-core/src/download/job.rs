@@ -241,8 +241,9 @@ impl JobHandler for DownloadHandler {
             let entries = files.into_iter().zip(placed).collect();
             let dest = input.options.dest_folder_id;
             let (id, before) = (ctx.id(), state.clone());
+            let written = layout.clone();
             let (state_after, registered) = ctx.library().db().write(move |tx| {
-                let registered = write_entries(tx, entries, dest, Origin::Download)?;
+                let registered = write_entries(tx, &written, entries, dest, Origin::Download)?;
                 let mut state = before;
                 state.files += registered.added + registered.duplicates;
                 state.added += registered.added;

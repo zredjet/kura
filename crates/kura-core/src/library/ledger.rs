@@ -48,6 +48,12 @@ pub fn candidates_by_size(conn: &Connection, size: u64) -> Result<Vec<([u8; 32],
     Ok(out)
 }
 
+/// 台帳にある中身の拡張子（`files/<hash>.<ext>` の ext。なければ None）。
+pub fn ext_of(conn: &Connection, hash: &[u8; 32]) -> Result<Option<String>> {
+    let mut stmt = conn.prepare_cached("SELECT ext FROM blobs WHERE hash = ?1")?;
+    Ok(stmt.query_row([&hash[..]], |row| row.get(0)).optional()?)
+}
+
 /// `files/` にあるはずのファイル（`files/` からの相対パス `ab/cd/<hash>.<ext>`）。整合性チェックに使う。
 pub fn expected_paths(conn: &Connection) -> Result<HashSet<String>> {
     // すべての行を確かめるので全件を読む（意図した全件の走査）
@@ -144,6 +150,8 @@ mod tests {
         );
         assert!(candidates_by_size(&conn, 43).unwrap().is_empty());
         assert!(candidates_by_size(&conn, u64::MAX).unwrap().is_empty());
+        assert_eq!(ext_of(&conn, &[1u8; 32]).unwrap().as_deref(), Some("jpg"));
+        assert_eq!(ext_of(&conn, &[9u8; 32]).unwrap(), None);
         let plan = query_plan(&conn, "SELECT hash, ext FROM blobs WHERE size_bytes = 42");
         assert!(plan.contains("idx_blobs_size"), "{plan}");
     }
