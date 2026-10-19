@@ -525,7 +525,12 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
 `Library::open` が `Db::open_with` で当てる。版は `PRAGMA user_version`（当てたマイグレーションの数）。
 
 1. **DB の方が新しい**（版がこの Kura の知るより大きい）なら、当てずに開くのを失敗にする。
-2. **当てる前のバックアップ**：未適用のマイグレーションがある既存の DB（版 1 以上）では、書き込みの接続から backup API で
+2. **空き容量の確かめ**：未適用のマイグレーションがある既存の DB（版 1 以上）では、まず要る空きを DB の大きさ（頁の数 × 頁の大きさ）
+   から見積もり（`library::upgrade::space_needed`：バックアップ 1 ＋ 作り直す表を DB の中と WAL に 1 つずつで、DB の 3 倍 ＋ 64MiB）、
+   ボリュームの空き（アプリが渡す。macOS は kura-mac の `volume_capacity` の「使用可能」）が足りなければ、バックアップも取らずに断る
+   （`UpgradeError::NoSpace`。ライブラリは変えない）。10 万件の seed（DB 51.8MB）で測った増え方の最大は 119.6MB（DB の 2.31 倍：
+   バックアップ 51.8MB、DB の伸び 34.1MB、WAL の伸び 33.7MB）で、見積もり（約 222MB）に収まる。
+   **当てる前のバックアップ**：続けて、書き込みの接続から backup API で
    `backups/library-YYYYMMDD-HHMMSS.sqlite`（いつもの名前・DELETE モード）へ一度に写し、7 個の保持に乗せる。
    失敗したら（空き容量など）当てずに開くのを失敗にする。新しいライブラリ（版 0）では作らない。
 3. **当てる**：1 つずつ、それぞれ 1 つのトランザクションで当てる。
@@ -537,9 +542,15 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
    - 作り直しの SQL は「新しい表を作る → 移す → 古い表を DROP → 新しい表を RENAME」。古い表を先に改名しない。
 4. **WAL を空にする**：1 つでも当てたら `PRAGMA wal_checkpoint(TRUNCATE)`（しないと次に開くときに WAL を読み直す）。
 5. 当てられなかったら、版は前のまま（失敗したマイグレーションのトランザクションは戻る。それより前に当てたものは残る）。
-   理由は `CoreError::Upgrade`（新しい版・空き容量・バックアップ・当てる失敗）の言葉で返す。開く前に当てるかどうかは
-   `library::needs_upgrade` で分かる（「ライブラリを更新しています」を出すのに使う）。
-6. アプリの中では `quick_check`・FTS の照合・VACUUM をしない。照合はテストと `kura-devtools bench migrate` で行う。
+   理由は `CoreError::Upgrade`（新しい版・空き容量・バックアップ・当てる失敗）の言葉で返す。アプリはこれを `AppError` の code
+   `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` にし、`library_open` は失敗として、`library_restore` は
+   `error` に入れて返す（docs/architecture.md §3）。開く前に当てるかどうかは `library::needs_upgrade` で分かる。
+7. **知らせ**：当て始めたら（空きの確かめの前）`UpgradeEvent::Started`、終わったら `Finished`、当てられなかったら `Failed` を、
+   アプリが渡した受け手（`library::UpgradeHooks`）に知らせる。アプリはイベント `library://upgrade` にしてフロントへ送り、フロントは
+   300ms を超えたら「ライブラリを更新しています」を出す。新しいライブラリ・当てるものがないとき・新しい版の DB では知らせない。
+   開いたことのログ（「起動から前回のライブラリを開くまで」「起動から最初のタイルの詳細を返すまで」）に `upgraded`（この起動で
+   新しい版にした）と `upgrade_ms` を付け、更新後の初回を NFR-01 の外として 2 回目以降と分けて記録できるようにする。
+8. アプリの中では `quick_check`・FTS の照合・VACUUM をしない。照合はテストと `kura-devtools bench migrate` で行う。
 
 **10 万件の時間**（2026-10-20、M4 Max、同梱の SQLite 3.53、ページキャッシュは温まった状態、ほかの作業でロードアベレージ 9〜12。
 `bench migrate --runs 3`。開くところから数えた時間）：
