@@ -589,6 +589,8 @@ export type IntegrityDto = {
 	stagingRemoved: number,
 	missingFiles: number,
 	orphanFiles: number,
+	/**  どの表からも参照されない台帳の行の数（M11。docs/data-model.md §4）。 */
+	unreferencedBlobs: number,
 };
 
 /**  インスペクタ用の詳細。 */
