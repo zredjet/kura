@@ -842,6 +842,25 @@ fn an_error_after_marking_clears_the_mark() {
     );
 }
 
+/// 知らない種類（DB の CHECK を外して入れたもの）・知らない拡張子は読まずに failed（unsupported）にし、ほかは止めずに解く。
+#[test]
+fn unknown_kinds_and_formats_fail_without_stopping() {
+    let env = Env::new();
+    env.exec("ALTER TABLE items DROP CONSTRAINT items_kind");
+    let sticker = env.add(1, "sticker", "png", &sprite(1));
+    let odd = env.add(2, "image", "xyz", b"odd");
+    env.add(3, "image", "png", &sprite(3));
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    assert_eq!(
+        (env.state(1), env.state(2), env.state(3)),
+        ("failed".into(), "failed".into(), "ready".into())
+    );
+    assert_eq!(env.fact::<String>(&sticker, "error_code"), "unsupported");
+    assert_eq!(env.fact::<String>(&odd, "error_code"), "unsupported");
+    assert_eq!(env.reads().len(), 1);
+}
+
 /// 読み取りの記録は結果の表に kura.read として残り、読まずに計画を立てるのに使う。
 #[test]
 fn read_record_is_kept_with_the_results() {

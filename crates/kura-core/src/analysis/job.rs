@@ -518,10 +518,10 @@ impl Run<'_> {
 
     /// 1 件を解く（DB には書かない。書くものを返す）。
     fn analyze(&mut self, item: &Pending) -> Result<Step> {
-        let Some(format) = format_id(&item.ext) else {
+        let (Some(format), Some(kind)) = (format_id(&item.ext), item.kind) else {
             return Ok(failed("unsupported"));
         };
-        match plan_for(item.kind, format) {
+        match plan_for(kind, format) {
             Plan::NotNeeded => Ok(Step::Write {
                 write: Write::NotNeeded,
                 platform: false,

@@ -32,7 +32,8 @@ pub struct Pending {
     pub id: i64,
     pub hash: [u8; 32],
     pub ext: String,
-    pub kind: MediaKind,
+    /// 種類（DB の CHECK が外れていて知らない値なら None。解析せずに failed にする）。
+    pub kind: Option<MediaKind>,
 }
 
 fn pending_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Pending>> {
@@ -44,7 +45,7 @@ fn pending_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Pending>
         id: row.get(0)?,
         hash,
         ext: row.get(2)?,
-        kind: row.get(3)?,
+        kind: MediaKind::parse(&row.get::<_, String>(3)?),
     }))
 }
 
