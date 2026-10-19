@@ -230,6 +230,8 @@ impl JobHandler for DownloadHandler {
                 1.0,
                 &format!("{} 件をライブラリに入れています", files.len()),
             );
+            // files/ に置いてから DB に書き終えるまで、ゴミ箱を空にする処理を待たせる（同じ中身を消されないように）
+            let ingest = ctx.library().ingest_guard();
             let placed = place_all(&layout, self.backend.as_ref(), ctx.id(), &files);
             for (file, outcome) in files.iter().zip(&placed) {
                 if let Err(reason) = outcome {
@@ -239,8 +241,9 @@ impl JobHandler for DownloadHandler {
             let entries = files.into_iter().zip(placed).collect();
             let dest = input.options.dest_folder_id;
             let (id, before) = (ctx.id(), state.clone());
+            let written = layout.clone();
             let (state_after, registered) = ctx.library().db().write(move |tx| {
-                let registered = write_entries(tx, entries, dest, Origin::Download)?;
+                let registered = write_entries(tx, &written, entries, dest, Origin::Download)?;
                 let mut state = before;
                 state.files += registered.added + registered.duplicates;
                 state.added += registered.added;
@@ -265,6 +268,7 @@ impl JobHandler for DownloadHandler {
                 )?;
                 Ok((state, registered))
             })?;
+            drop(ingest);
             state = state_after;
             if registered.added > 0 {
                 ctx.ensure_queued(JobKind::Thumbnail, "{}")?;

@@ -1,10 +1,9 @@
-//! 起動時の整合性チェック。staging の残骸を消し、DB とファイルの食い違いを数える（自動では消さない）。
-
-use std::collections::HashSet;
+//! 起動時の整合性チェック。staging の残骸を消し、台帳とファイルの食い違いを数える（自動では消さない）。
 
 use serde::Serialize;
 
-use super::layout::{Layout, content_rel_path, hex};
+use super::layout::Layout;
+use super::ledger;
 use crate::Result;
 use crate::db::Db;
 
@@ -18,6 +17,8 @@ pub struct IntegrityReport {
     pub missing_files: u64,
     /// ファイルがあって DB にないものの数。
     pub orphan_files: u64,
+    /// どの表からも参照されない台帳の行の数（ゴミ箱を空にする途中で落ちたなど）。
+    pub unreferenced_blobs: u64,
 }
 
 /// `staging/` の中身を消す（取り込み・ダウンロードの書きかけ）。ジョブを動かす前に呼ぶ。
@@ -48,18 +49,10 @@ pub fn clean_staging(layout: &Layout, keep: &[String]) -> Result<u64> {
     Ok(removed)
 }
 
-/// DB と `files/` を突き合わせ、(ファイルがないアイテム数, DB にないファイル数) を返す。
+/// 台帳 `blobs` と `files/` を突き合わせ、(ファイルがない台帳の行の数, 台帳にないファイルの数) を返す。
+/// どの表からも参照されない台帳の行は `ledger::unreferenced` で数える。
 pub fn check_files(db: &Db, layout: &Layout) -> Result<(u64, u64)> {
-    // すべてのアイテムを確かめるので全件を読む（意図した全件スキャン）
-    let mut expected: HashSet<String> = db.read(|conn| {
-        let mut stmt = conn.prepare_cached("SELECT hash, ext FROM items")?;
-        let rows = stmt.query_map([], |row| {
-            let hash: Vec<u8> = row.get(0)?;
-            let ext: String = row.get(1)?;
-            Ok(content_rel_path(&hex(&hash), &ext))
-        })?;
-        Ok(rows.collect::<std::result::Result<HashSet<_>, _>>()?)
-    })?;
+    let mut expected = db.read(ledger::expected_paths)?;
 
     let files_dir = layout.files_dir();
     let mut orphans = 0;
@@ -136,6 +129,31 @@ mod tests {
         insert_item(&lib, missing);
         put_file(&lib, &orphan);
 
+        assert_eq!(check_files(lib.db(), lib.layout()).unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn integrity_counts_from_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::create(&dir.path().join("L")).unwrap();
+        let (ok, unreferenced, orphan) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        for hash in [ok, unreferenced] {
+            insert_item(&lib, hash);
+            put_file(&lib, &hash);
+        }
+        put_file(&lib, &orphan);
+        // アイテムの行だけが消え、台帳の行は残った（ゴミ箱を空にする途中で落ちたのと同じ形）。
+        // 台帳にある間はファイルがあるはずなので「DB にないファイル」には数えず、参照されない行として数える
+        lib.db()
+            .write(move |tx| {
+                tx.execute("DELETE FROM items WHERE hash = ?1", [&unreferenced[..]])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(check_files(lib.db(), lib.layout()).unwrap(), (0, 1));
+        assert_eq!(lib.db().read(ledger::unreferenced).unwrap(), 1);
+        // 台帳の行があってファイルがないもの
+        std::fs::remove_file(lib.layout().content_path(&ok, "jpg")).unwrap();
         assert_eq!(check_files(lib.db(), lib.layout()).unwrap(), (1, 1));
     }
 }

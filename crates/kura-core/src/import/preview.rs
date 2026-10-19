@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use super::kind::MediaKind;
 use super::place::partial_hash;
 use super::scan::{ScanRoot, ScannedFile, scan};
-use super::store::hashes_by_size;
 use crate::Result;
 use crate::library::Library;
 
@@ -63,7 +62,7 @@ pub fn preview(library: &Library, paths: &[PathBuf]) -> Result<ImportPreview> {
     let layout = library.layout();
     preview.duplicates = library.db().read(|conn| {
         estimate_duplicates(&scan.files, |size| {
-            Ok(hashes_by_size(conn, size)?
+            Ok(crate::library::ledger::candidates_by_size(conn, size)?
                 .into_iter()
                 .map(|(hash, ext)| layout.content_path(&hash, &ext))
                 .collect())

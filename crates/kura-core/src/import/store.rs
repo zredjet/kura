@@ -51,17 +51,19 @@ pub fn find_by_hash(conn: &Connection, hash: &[u8; 32]) -> Result<Option<Existin
         .optional()?)
 }
 
-/// アイテムを追加して ID を返す。画像はプロキシを作らないので proxy_state は not_needed。
-/// `original_path` が空なら NULL にする（ダウンロードしたもの）。
+/// アイテムを追加して ID を返す。プロキシを作るのは動画・音声だけなので、ほかの種類の proxy_state は not_needed。
+/// 解析するのは画像・音声だけなので、ほかの種類の analysis_state は not_needed（docs/data-model.md §3）。
+/// 台帳 `blobs` にはトリガが載せる。`original_path` が空なら NULL にする（ダウンロードしたもの）。
 pub fn insert_item(conn: &Connection, item: &NewItem<'_>) -> Result<i64> {
     let size = i64::try_from(item.size)
         .map_err(|_| CoreError::Invalid(format!("ファイルが大きすぎます: {}", item.size)))?;
     let mut stmt = conn.prepare_cached(
         "INSERT INTO items (hash, ext, kind, mime, size_bytes, title, original_name, original_path,
                             source_site, source_url, imported_at, updated_at,
-                            width, height, duration_ms, captured_at, codec_info, proxy_state)
+                            width, height, duration_ms, captured_at, codec_info, proxy_state, analysis_state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULLIF(?8, ''), ?15, ?16, ?9, ?9, ?10, ?11, ?12, ?13, ?14,
-                 CASE ?3 WHEN 'image' THEN 'not_needed' ELSE 'unknown' END)",
+                 CASE WHEN ?3 IN ('video', 'audio') THEN 'unknown' ELSE 'not_needed' END,
+                 CASE WHEN ?3 IN ('image', 'audio') THEN 'pending' ELSE 'not_needed' END)",
     )?;
     stmt.execute(params![
         &item.hash[..],
@@ -91,25 +93,6 @@ pub fn restore_item(conn: &Connection, id: i64, now: i64) -> Result<()> {
         conn.prepare_cached("UPDATE items SET trashed_at = NULL, updated_at = ?2 WHERE id = ?1")?;
     stmt.execute(params![id, now])?;
     Ok(())
-}
-
-/// 同じサイズのアイテムの (ハッシュ, 拡張子)。重複の見込みに使う。
-pub fn hashes_by_size(conn: &Connection, size: u64) -> Result<Vec<([u8; 32], String)>> {
-    let Ok(size) = i64::try_from(size) else {
-        return Ok(Vec::new());
-    };
-    let mut stmt = conn.prepare_cached("SELECT hash, ext FROM items WHERE size_bytes = ?1")?;
-    let rows = stmt.query_map([size], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (hash, ext) = row?;
-        if let Ok(hash) = <[u8; 32]>::try_from(hash.as_slice()) {
-            out.push((hash, ext));
-        }
-    }
-    Ok(out)
 }
 
 /// 仮想フォルダがあるか。
@@ -277,11 +260,16 @@ mod tests {
         restore_item(&conn, id, 200).unwrap();
         assert!(!find_by_hash(&conn, &hash).unwrap().unwrap().trashed);
 
+        // 台帳にも載る（重複の見込みは台帳から引く。library::ledger::candidates_by_size）
         assert_eq!(
-            hashes_by_size(&conn, 42).unwrap(),
+            crate::library::ledger::candidates_by_size(&conn, 42).unwrap(),
             vec![(hash, "jpg".into())]
         );
-        assert!(hashes_by_size(&conn, 41).unwrap().is_empty());
+        assert!(
+            crate::library::ledger::candidates_by_size(&conn, 41)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

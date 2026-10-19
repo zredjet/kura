@@ -409,8 +409,9 @@ fn insert_items(
                 let mut item_stmt = tx.prepare_cached(
                     "INSERT INTO items (hash, ext, kind, mime, size_bytes, width, height, duration_ms,
                                         title, original_name, original_path, source_site, rating,
-                                        captured_at, imported_at, updated_at, thumb_state, proxy_state)
-                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, 'ready', 'not_needed')",
+                                        captured_at, imported_at, updated_at, thumb_state, proxy_state, analysis_state)
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, 'ready', 'not_needed',
+                             CASE WHEN ?3 IN ('image', 'audio') THEN 'pending' ELSE 'not_needed' END)",
                 )?;
                 let mut tag_stmt =
                     tx.prepare_cached("INSERT OR IGNORE INTO item_tags (tag_id, item_id, source) VALUES (?1, ?2, 'user')")?;
@@ -491,6 +492,20 @@ mod tests {
             .unwrap();
         assert_eq!(items, 1200);
         assert_eq!(pending, 0);
+        // 解析するのは画像・音声だけ（動画は not_needed）。台帳にも 1 件ずつ載る
+        let (video_pending, ledger) = library
+            .db()
+            .read(|c| {
+                let count = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0));
+                Ok((
+                    count(
+                        "SELECT count(*) FROM items WHERE kind = 'video' AND analysis_state <> 'not_needed'",
+                    )?,
+                    count("SELECT count(*) FROM blobs")?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((video_pending, ledger), (0, 1200));
         assert!(tagged > 600, "tagged {tagged}");
         assert!(filed > 400, "filed {filed}");
         assert_eq!(tags, TAGS as i64);

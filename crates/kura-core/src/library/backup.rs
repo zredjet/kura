@@ -130,6 +130,33 @@ pub fn create(layout: &Layout, now: i64) -> Result<BackupInfo> {
     })
 }
 
+/// マイグレーションを当てる前のバックアップ（docs/data-model.md §5）。いつもの名前で作り、新しい `KEEP` 個を残す。
+/// 開くのを待たせるので、書き込みの接続から休まずに一度に写す。
+pub fn before_migration(layout: &Layout, conn: &Connection, now: i64) -> Result<BackupInfo> {
+    let dir = layout.backups_dir();
+    std::fs::create_dir_all(&dir)?;
+    let name = name_for(now);
+    let path = dir.join(&name);
+    let temp = dir.join(format!(".{name}.part"));
+    let _ = std::fs::remove_file(&temp);
+    // rusqlite は 0 以下の pages_per_step で panic するので、一度に写すには i32::MAX を渡す
+    if let Err(err) = copy_conn(conn, &temp, i32::MAX, Duration::ZERO) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    // 同じ秒の定期のバックアップがあっても、当てる直前の中身で置き換える
+    std::fs::rename(&temp, &path)?;
+    prune(layout, KEEP)?;
+    let size_bytes = std::fs::metadata(&path)?.len();
+    tracing::info!(path = %path.display(), size_bytes, "マイグレーションの前に DB のバックアップを作りました");
+    Ok(BackupInfo {
+        created_at: parse_name(&name).unwrap_or(now),
+        name,
+        path,
+        size_bytes,
+    })
+}
+
 /// 古いバックアップを消して、新しい `keep` 個を残す。消した数を返す（`backups/` の中の、この形の名前のものだけ）。
 pub fn prune(layout: &Layout, keep: usize) -> Result<usize> {
     let mut removed = 0;
@@ -147,9 +174,14 @@ fn copy_db(src: &Path, dest: &Path) -> Result<()> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     from.busy_timeout(Duration::from_secs(5))?;
+    copy_conn(&from, dest, 512, Duration::from_millis(5))
+}
+
+/// 開いている接続 `from` の DB を `dest` に写す（`pages` ページずつ、間に `pause` 休む）。
+fn copy_conn(from: &Connection, dest: &Path, pages: i32, pause: Duration) -> Result<()> {
     let mut to = Connection::open(dest)?;
-    let backup = rusqlite::backup::Backup::new(&from, &mut to)?;
-    backup.run_to_completion(512, Duration::from_millis(5), None)?;
+    let backup = rusqlite::backup::Backup::new(from, &mut to)?;
+    backup.run_to_completion(pages.max(1), pause, None)?;
     drop(backup);
     // 写したものだけで開けるように、WAL ではなく 1 つのファイルにする
     to.pragma_update(None, "journal_mode", "DELETE")?;
@@ -287,6 +319,178 @@ mod tests {
         // 同じ秒に重ねて作っても、1 つのまま
         create(&layout, T + 8 * INTERVAL_MS).unwrap();
         assert_eq!(list(&layout).unwrap().len(), KEEP);
+    }
+
+    /// 1 つ前の版の DB を持つライブラリのフォルダを作る（アイテム 1 件・タグ 1 件）。
+    fn previous_library(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        let mut conn = Connection::open(root.join(crate::library::DB_FILE)).unwrap();
+        crate::db::apply_pragmas(&conn).unwrap();
+        crate::db::migrate_until(&mut conn, crate::db::MIGRATIONS.len() - 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+             VALUES (1, x'0101010101010101010101010101010101010101010101010101010101010101', 'jpg', 'image', 3, '夕方', 'a.jpg', 1, 1);
+             INSERT INTO tags (id, name, created_at) VALUES (1, '海', 1);
+             INSERT INTO item_tags (tag_id, item_id) VALUES (1, 1);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn backup_is_taken_before_migrating_an_existing_library_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        previous_library(&root);
+        let previous = crate::db::MIGRATIONS.len() - 1;
+
+        assert!(crate::library::needs_upgrade(&root).unwrap());
+        let lib = Library::open(&root).unwrap();
+        assert!(!crate::library::needs_upgrade(&root).unwrap());
+        assert!(!crate::library::needs_upgrade(&dir.path().join("none")).unwrap());
+        assert_eq!(lib.migration().from, previous);
+        assert_eq!(lib.migration().to, crate::db::MIGRATIONS.len());
+        let all = list(lib.layout()).unwrap();
+        assert_eq!(all.len(), 1, "いつもの名前で 1 つ");
+        assert!(parse_name(&all[0].name).is_some());
+        // 当てる前の中身を、1 つのファイル（DELETE モード）で残す。書きかけは残らない
+        let copy = Connection::open(&all[0].path).unwrap();
+        assert_eq!(crate::db::applied(&copy).unwrap(), previous);
+        let mode: String = copy
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        let tags: i64 = copy
+            .query_row("SELECT count(*) FROM item_tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tags, 1);
+        let names: Vec<String> = std::fs::read_dir(lib.layout().backups_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![all[0].name.clone()]);
+        drop(lib);
+
+        // 当て済みのライブラリ・新しいライブラリでは作らない
+        let lib = Library::open(&root).unwrap();
+        assert!(lib.migration().applied.is_empty());
+        assert_eq!(list(lib.layout()).unwrap().len(), 1);
+        let fresh = Library::create(&dir.path().join("New")).unwrap();
+        assert!(list(fresh.layout()).unwrap().is_empty());
+    }
+
+    /// 0006 の DB（すべての表に行がある）を持つライブラリのフォルダを作る。
+    fn v6_library(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        let mut conn = Connection::open(root.join(crate::library::DB_FILE)).unwrap();
+        crate::db::apply_pragmas(&conn).unwrap();
+        crate::db::migrate_until(&mut conn, 6).unwrap();
+        crate::db::testing::fill_v6(&conn);
+    }
+
+    #[test]
+    fn upgrading_a_v6_library_backs_it_up_and_keeps_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        v6_library(&root);
+        let want =
+            crate::db::testing::snapshot(&Connection::open(root.join("library.sqlite")).unwrap());
+
+        let lib = Library::open(&root).unwrap();
+        let report = lib.migration().clone();
+        assert_eq!((report.from, report.to), (6, crate::db::MIGRATIONS.len()));
+        assert_eq!(
+            report.applied.iter().map(|a| a.name).collect::<Vec<_>>(),
+            [
+                "0007_blobs_and_kinds",
+                "0008_jobs_named_checks",
+                "0009_analysis"
+            ]
+        );
+        // 当てたあとの WAL は空
+        let wal = std::fs::metadata(root.join("library.sqlite-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(wal, 0);
+        let backup = &list(lib.layout()).unwrap()[0];
+        let copy = Connection::open(&backup.path).unwrap();
+        assert_eq!(crate::db::applied(&copy).unwrap(), 6);
+        assert_eq!(
+            crate::db::testing::snapshot(&copy),
+            want,
+            "バックアップは当てる前の中身"
+        );
+        let tags: i64 = lib
+            .db()
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM item_tags", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(tags, 3);
+    }
+
+    #[test]
+    fn a_failed_migration_keeps_the_old_version_and_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        v6_library(&root);
+        // 0007 が途中で失敗する DB（同じ名前の表がすでにある）
+        Connection::open(root.join("library.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE blobs (x);")
+            .unwrap();
+        let err = Library::open(&root).err().unwrap();
+        match &err {
+            crate::CoreError::Upgrade(crate::UpgradeError::Apply { migration, detail }) => {
+                assert_eq!(migration, "0007_blobs_and_kinds");
+                assert!(detail.contains("already exists"), "{detail}");
+            }
+            other => panic!("{other}"),
+        }
+        let conn = Connection::open(root.join("library.sqlite")).unwrap();
+        assert_eq!(crate::db::applied(&conn).unwrap(), 6);
+        let tags: i64 = conn
+            .query_row("SELECT count(*) FROM item_tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tags, 3, "子の行は残る");
+        assert_eq!(
+            list(&Layout::new(&root)).unwrap().len(),
+            1,
+            "バックアップは残る"
+        );
+    }
+
+    #[test]
+    fn backup_before_migrating_keeps_the_newest_seven() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        previous_library(&root);
+        let layout = Layout::new(&root);
+        std::fs::create_dir_all(layout.backups_dir()).unwrap();
+        // 2020 年の古いバックアップが 7 つ
+        let old = 1_577_836_800_000; // 2020-01-01 00:00:00 UTC
+        for day in 0..7 {
+            std::fs::write(
+                layout.backups_dir().join(name_for(old + day * INTERVAL_MS)),
+                "x",
+            )
+            .unwrap();
+        }
+        let lib = Library::open(&root).unwrap();
+        let all = list(lib.layout()).unwrap();
+        assert_eq!(all.len(), KEEP);
+        assert!(
+            all[0].created_at > old + 6 * INTERVAL_MS,
+            "当てる前のものが最新"
+        );
+        assert_eq!(all[KEEP - 1].name, name_for(old + INTERVAL_MS));
+    }
+
+    #[test]
+    fn backup_before_migrating_fails_when_it_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        // backups がフォルダでなくファイル
+        std::fs::write(layout.backups_dir(), "x").unwrap();
+        let conn = crate::db::test_conn();
+        assert!(before_migration(&layout, &conn, T).is_err());
     }
 
     #[test]

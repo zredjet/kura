@@ -1,366 +1,288 @@
-//! スキーマのマイグレーション。`PRAGMA user_version` に適用済みの数を記録する。
+//! スキーマのマイグレーション。`PRAGMA user_version` に適用済みの数を記録する（docs/data-model.md §5）。
+//!
+//! - `Plain`：1 つのトランザクションで当てる。
+//! - `Rebuild`：ほかの表から外部キーで参照される表を作り直す。トランザクションの外で `foreign_keys` を切り、
+//!   1 つのトランザクションで当て、`PRAGMA foreign_key_check` に新しい違反がないことを確かめてからコミットし、
+//!   成功しても失敗しても `foreign_keys` を必ず戻す。違反があったときだけ、いったん戻して「当てる前からあった違反」を数え、
+//!   新しい違反がなければ当て直す（前からの違反は許して警告を出す）。
 
-use rusqlite::Connection;
+use std::time::Instant;
+
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::{CoreError, Result};
 
+/// マイグレーションの当て方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// 1 つのトランザクションで当てる。
+    Plain,
+    /// 参照される表の作り直し（外部キーを切って当て、違反を確かめる）。
+    Rebuild,
+}
+
+/// マイグレーション 1 つ。
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    pub name: &'static str,
+    pub sql: &'static str,
+    pub kind: Kind,
+}
+
+const fn plain(name: &'static str, sql: &'static str) -> Migration {
+    Migration {
+        name,
+        sql,
+        kind: Kind::Plain,
+    }
+}
+
+const fn rebuild(name: &'static str, sql: &'static str) -> Migration {
+    Migration {
+        name,
+        sql,
+        kind: Kind::Rebuild,
+    }
+}
+
 /// マイグレーションの一覧（連番順）。適用済みのファイルは編集しない。
-pub const MIGRATIONS: &[(&str, &str)] = &[
-    ("0001_init", include_str!("../../migrations/0001_init.sql")),
-    (
+pub const MIGRATIONS: &[Migration] = &[
+    plain("0001_init", include_str!("../../migrations/0001_init.sql")),
+    plain(
         "0002_thumb_pending_index",
         include_str!("../../migrations/0002_thumb_pending_index.sql"),
     ),
-    (
+    plain(
         "0003_proxy_todo_index",
         include_str!("../../migrations/0003_proxy_todo_index.sql"),
     ),
-    (
+    plain(
         "0004_playlist_generation",
         include_str!("../../migrations/0004_playlist_generation.sql"),
     ),
-    (
+    plain(
         "0005_export_job",
         include_str!("../../migrations/0005_export_job.sql"),
     ),
-    (
+    plain(
         "0006_unit_order_reverse",
         include_str!("../../migrations/0006_unit_order_reverse.sql"),
     ),
+    rebuild(
+        "0007_blobs_and_kinds",
+        include_str!("../../migrations/0007_blobs_and_kinds.sql"),
+    ),
+    plain(
+        "0008_jobs_named_checks",
+        include_str!("../../migrations/0008_jobs_named_checks.sql"),
+    ),
+    plain(
+        "0009_analysis",
+        include_str!("../../migrations/0009_analysis.sql"),
+    ),
 ];
 
-/// 未適用のマイグレーションを順に適用する。DB の方が新しければエラー。
-pub fn migrate(conn: &mut Connection) -> Result<()> {
-    migrate_until(conn, MIGRATIONS.len())
+/// 当てたマイグレーション 1 つ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedMigration {
+    pub name: &'static str,
+    /// かかった時間（ミリ秒）。
+    pub ms: f64,
 }
 
-/// `count` 番目までのマイグレーションを適用する（テストで前の版のスキーマを作るのにも使う）。
-pub(crate) fn migrate_until(conn: &mut Connection, count: usize) -> Result<()> {
-    let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let latest = i64::try_from(MIGRATIONS.len()).unwrap_or(i64::MAX);
+/// マイグレーションを当てた結果。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MigrationReport {
+    /// 当てる前の版（user_version）。
+    pub from: usize,
+    /// 当てたあとの版。
+    pub to: usize,
+    /// 当てたもの（順に）。
+    pub applied: Vec<AppliedMigration>,
+    /// Rebuild で許した、当てる前からあった外部キーの違反の数。
+    pub tolerated_violations: usize,
+    /// 当てる前のフック（バックアップ）にかかった時間（ミリ秒。`Db::open_with` だけが入れる）。
+    pub before_ms: f64,
+    /// 当てたあとに WAL を空にする（`wal_checkpoint(TRUNCATE)`）のにかかった時間（ミリ秒。`Db::open_with` だけが入れる）。
+    pub checkpoint_ms: f64,
+}
+
+/// 適用済みの数（user_version）。
+pub fn applied(conn: &Connection) -> Result<usize> {
+    let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    Ok(usize::try_from(v).unwrap_or(0))
+}
+
+/// 未適用のマイグレーションがあるか。DB の方が新しければ Conflict。
+pub fn pending(conn: &Connection) -> Result<bool> {
+    let current = applied(conn)?;
+    newer_check(current, MIGRATIONS.len())?;
+    Ok(current < MIGRATIONS.len())
+}
+
+fn newer_check(current: usize, latest: usize) -> Result<()> {
     if current > latest {
         return Err(CoreError::Conflict(format!(
             "このライブラリは新しい版の Kura で作られています（スキーマ {current}、対応 {latest}）"
         )));
     }
-    for (index, (name, sql)) in MIGRATIONS.iter().enumerate().take(count) {
-        let version = i64::try_from(index).unwrap_or(i64::MAX) + 1;
-        if version <= current {
-            continue;
-        }
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", version)?;
-        tx.commit()?;
-        tracing::info!(migration = name, "マイグレーションを適用しました");
-    }
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn table_names(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
-            .unwrap();
-        stmt.query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap()
-    }
-
-    #[test]
-    fn applies_all_migrations_to_empty_db() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-
-        let version: i64 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, MIGRATIONS.len() as i64);
-
-        let tables = table_names(&conn);
-        for expected in [
-            "items",
-            "folders",
-            "item_folders",
-            "tags",
-            "tag_aliases",
-            "tag_parents",
-            "item_tags",
-            "units",
-            "unit_items",
-            "unit_folders",
-            "unit_tags",
-            "smart_folders",
-            "playlists",
-            "playlist_entries",
-            "playlist_state",
-            "play_events",
-            "jobs",
-            "remote_sources",
-            "capture_rules",
-            "settings",
-            "items_fts",
-        ] {
-            assert!(tables.iter().any(|t| t == expected), "{expected} がない");
-        }
-    }
-
-    #[test]
-    fn thumb_pending_index_keeps_existing_items() {
-        // 0001 だけの DB にアイテムを入れてから 0002 を適用する
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_until(&mut conn, 1).unwrap();
-        conn.execute(
-            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
-             VALUES (1, x'01', 'jpg', 'image', 1, 'a', 'a.jpg', 10, 10)",
-            [],
-        )
-        .unwrap();
-        migrate(&mut conn).unwrap();
-
-        let (count, state): (i64, String) = conn
-            .query_row("SELECT COUNT(*), max(thumb_state) FROM items", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!((count, state.as_str()), (1, "pending"));
-        let plan = crate::db::query_plan(
-            &conn,
-            "SELECT id FROM items WHERE thumb_state = 'pending'
-             ORDER BY imported_at DESC, id DESC LIMIT 64",
-        );
-        assert!(plan.contains("idx_items_thumb_pending"), "{plan}");
-        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
-    }
-
-    #[test]
-    fn proxy_todo_index_settles_images_and_keeps_items() {
-        // 0002 までの DB に画像・動画を入れてから 0003 を適用する
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_until(&mut conn, 2).unwrap();
-        conn.execute_batch(
-            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
-             VALUES (1, x'01', 'jpg', 'image', 1, 'a', 'a.jpg', 10, 10),
-                    (2, x'02', 'mkv', 'video', 1, 'b', 'b.mkv', 20, 20),
-                    (3, x'03', 'ogg', 'audio', 1, 'c', 'c.ogg', 30, 30);",
-        )
-        .unwrap();
-        migrate(&mut conn).unwrap();
-
-        let states: Vec<(i64, String)> = conn
-            .prepare("SELECT id, proxy_state FROM items ORDER BY id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        assert_eq!(
-            states,
-            vec![
-                (1, "not_needed".to_string()),
-                (2, "unknown".to_string()),
-                (3, "unknown".to_string())
-            ]
-        );
-        for (state, index) in [
-            ("unknown", "idx_items_proxy_unknown"),
-            ("pending", "idx_items_proxy_pending"),
-        ] {
-            let plan = crate::db::query_plan(
-                &conn,
-                &format!(
-                    "SELECT id FROM items WHERE proxy_state = '{state}' AND kind != 'image'
-                     ORDER BY imported_at DESC, id DESC LIMIT 16"
-                ),
-            );
-            assert!(plan.contains(index), "{plan}");
-            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
-        }
-    }
-
-    #[test]
-    fn playlist_generation_columns_keep_existing_playlists() {
-        // 0003 までの DB にプレイリストと再開の状態を入れてから 0004 を適用する
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_until(&mut conn, 3).unwrap();
-        conn.execute_batch(
-            "INSERT INTO playlists (id, name, kind, rule_json, pos, created_at, updated_at)
-             VALUES (1, '夜の作業', 'manual', NULL, 1, 10, 10);
-             INSERT INTO playlist_state (playlist_id, seed, slot_index, position_ms, updated_at)
-             VALUES (1, 7, 3, 1500, 20);",
-        )
-        .unwrap();
-        migrate(&mut conn).unwrap();
-
-        let row: (String, Option<i64>, String, i64) = conn
-            .query_row(
-                "SELECT name, generated_at, sort_key, sort_desc FROM playlists WHERE id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(row, ("夜の作業".into(), None, "imported".into(), 1));
-        let state: (i64, i64, Option<i64>) = conn
-            .query_row(
-                "SELECT seed, slot_index, item_id FROM playlist_state WHERE playlist_id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(state, (7, 3, None));
-        // 並び順は決まった値だけ
-        assert!(
-            conn.execute("UPDATE playlists SET sort_key = 'color' WHERE id = 1", [])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn running_twice_is_a_no_op() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-        migrate(&mut conn).unwrap();
-    }
-
-    #[test]
-    fn refuses_newer_schema() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", 99).unwrap();
-        assert!(matches!(migrate(&mut conn), Err(CoreError::Conflict(_))));
-    }
-
-    #[test]
-    fn fts_follows_item_changes() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
-        conn.execute(
-            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
-             VALUES (1, x'00', 'jpg', 'image', 1, '夕方の海', '夕方の海.jpg', 0, 0)",
-            [],
-        )
-        .unwrap();
-        let hits = |q: &str| -> i64 {
-            conn.query_row(
-                "SELECT COUNT(*) FROM items_fts WHERE items_fts MATCH ?1",
-                [q],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(hits("夕方の"), 1);
-
-        conn.execute("UPDATE items SET title = '港の朝' WHERE id = 1", [])
-            .unwrap();
-        assert_eq!(hits("港の朝"), 1);
-        assert_eq!(hits("title:夕方の"), 0);
-
-        conn.execute("DELETE FROM items WHERE id = 1", []).unwrap();
-        assert_eq!(hits("港の朝"), 0);
-    }
-
-    #[test]
-    fn unit_order_reverse_defaults_to_off_for_existing_units() {
-        // 0005 までの DB にユニットを入れてから 0006 を適用する
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_until(&mut conn, 5).unwrap();
-        conn.execute_batch(
-            "INSERT INTO units (id, kind, name, order_mode, inner_shuffle, rating, note, created_at, updated_at)
-             VALUES (3, 'set', '鎌倉', 'name', 1, 4, 'メモ', 10, 20);",
-        )
-        .unwrap();
-        migrate(&mut conn).unwrap();
-
-        let row: (String, String, i64, i64, Option<String>, i64) = conn
-            .query_row(
-                "SELECT name, order_mode, inner_shuffle, rating, note, order_reverse FROM units WHERE id = 3",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            row,
-            ("鎌倉".into(), "name".into(), 1, 4, Some("メモ".into()), 0)
-        );
-        conn.execute("UPDATE units SET order_reverse = 1 WHERE id = 3", [])
-            .unwrap();
-        assert!(
-            conn.execute("UPDATE units SET order_reverse = 2 WHERE id = 3", [])
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn export_job_kind_keeps_existing_jobs() {
-        // 0004 までの DB にジョブを入れてから 0005 を適用する
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_until(&mut conn, 4).unwrap();
-        conn.execute_batch(
-            "INSERT INTO jobs (id, kind, state, priority, input_json, progress, message, result_json, created_at, started_at)
-             VALUES (7, 'download', 'paused', 2, '{\"url\":\"https://example.com\"}', 0.5, '途中', '{}', 100, 110),
-                    (8, 'import', 'done', 0, '{}', 1.0, NULL, NULL, 200, 210);",
-        )
-        .unwrap();
-        // 前の版では書き出しのジョブは入らない
-        assert!(
-            conn.execute(
-                "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('export', 'queued', '{}', 1)",
-                [],
-            )
-            .is_err()
-        );
-        migrate(&mut conn).unwrap();
-
-        type JobRow = (
-            i64,
-            String,
-            String,
-            i64,
-            String,
-            Option<f64>,
-            Option<String>,
-        );
-        let rows: Vec<JobRow> = conn
-            .prepare("SELECT id, kind, state, priority, input_json, progress, message FROM jobs ORDER BY id")
-            .unwrap()
-            .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
-            })
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0],
-            (
-                7,
-                "download".into(),
-                "paused".into(),
-                2,
-                "{\"url\":\"https://example.com\"}".into(),
-                Some(0.5),
-                Some("途中".into())
-            )
-        );
-        conn.execute(
-            "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('export', 'queued', '{}', 300)",
-            [],
-        )
-        .unwrap();
-        assert!(
-            conn.execute(
-                "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('other', 'queued', '{}', 1)",
-                [],
-            )
-            .is_err()
-        );
-        let plan = crate::db::query_plan(
-            &conn,
-            "SELECT id FROM jobs WHERE state = 'queued' ORDER BY priority DESC, created_at LIMIT 1",
-        );
-        assert!(plan.contains("idx_jobs_queue"), "{plan}");
-    }
+/// 未適用のマイグレーションを順に適用する。DB の方が新しければエラー。
+pub fn migrate(conn: &mut Connection) -> Result<MigrationReport> {
+    migrate_until(conn, MIGRATIONS.len())
 }
+
+/// `count` 番目までのマイグレーションを適用する（テストと kura-devtools の bench で前の版のスキーマを作るのにも使う）。
+#[doc(hidden)]
+pub fn migrate_until(conn: &mut Connection, count: usize) -> Result<MigrationReport> {
+    run(conn, MIGRATIONS, count).map_err(|(_, err)| err)
+}
+
+/// `list` の `count` 番目までを当てる。失敗したら、失敗したマイグレーションの番号とエラーを返す。
+pub(super) fn run(
+    conn: &mut Connection,
+    list: &[Migration],
+    count: usize,
+) -> std::result::Result<MigrationReport, (Option<usize>, CoreError)> {
+    let current = applied(conn).map_err(|e| (None, e))?;
+    newer_check(current, list.len()).map_err(|e| (None, e))?;
+    let mut report = MigrationReport {
+        from: current,
+        to: current,
+        ..MigrationReport::default()
+    };
+    for (index, m) in list.iter().enumerate().take(count) {
+        let version = index + 1;
+        if version <= current {
+            continue;
+        }
+        let started = Instant::now();
+        let result = match m.kind {
+            Kind::Plain => apply_plain(conn, m, version).map(|()| 0),
+            Kind::Rebuild => apply_rebuild(conn, m, version),
+        };
+        report.tolerated_violations += result.map_err(|e| (Some(index), e))?;
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(migration = m.name, ms, "マイグレーションを適用しました");
+        report.applied.push(AppliedMigration { name: m.name, ms });
+        report.to = version;
+    }
+    Ok(report)
+}
+
+fn user_version(version: usize) -> i64 {
+    i64::try_from(version).unwrap_or(i64::MAX)
+}
+
+fn apply_plain(conn: &mut Connection, m: &Migration, version: usize) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(m.sql)?;
+    tx.pragma_update(None, "user_version", user_version(version))?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// `PRAGMA foreign_key_check` の行（表, rowid, 親の表, 外部キーの番号）。
+pub type Violation = (String, Option<i64>, String, i64);
+
+/// 外部キーの違反の一覧（並べたもの）。
+pub fn violations(conn: &Connection) -> Result<Vec<Violation>> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    let mut v: Vec<Violation> = rows.collect::<std::result::Result<_, _>>()?;
+    v.sort();
+    Ok(v)
+}
+
+/// 参照される表を作り直す（モジュールの冒頭）。許した前からの違反の数を返す。
+pub(crate) fn apply_rebuild(conn: &mut Connection, m: &Migration, version: usize) -> Result<usize> {
+    if !conn.is_autocommit() {
+        return Err(CoreError::Invalid(format!(
+            "{}：トランザクションの中では作り直せません",
+            m.name
+        )));
+    }
+    // 古い名前を参照し続ける古い ALTER の振る舞いでは、子の REFERENCES が書き換わってしまう
+    let legacy: bool = conn.pragma_query_value(None, "legacy_alter_table", |r| r.get(0))?;
+    if legacy {
+        return Err(CoreError::Invalid(format!(
+            "{}：legacy_alter_table が有効なので作り直せません",
+            m.name
+        )));
+    }
+    let was_on: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = rebuild_without_foreign_keys(conn, m, version);
+    // 成功しても失敗しても戻す（失敗したトランザクションはロールバック済み）
+    let restored = conn.pragma_update(None, "foreign_keys", was_on);
+    let tolerated = result?;
+    restored?;
+    Ok(tolerated)
+}
+
+fn rebuild_without_foreign_keys(
+    conn: &mut Connection,
+    m: &Migration,
+    version: usize,
+) -> Result<usize> {
+    let off: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+    if off {
+        return Err(CoreError::Invalid(format!(
+            "{}：外部キーを切れませんでした",
+            m.name
+        )));
+    }
+    let after = {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(m.sql)?;
+        let after = violations(&tx)?;
+        if after.is_empty() {
+            tx.pragma_update(None, "user_version", user_version(version))?;
+            tx.commit()?;
+            return Ok(0);
+        }
+        // 違反があるときだけ：いったん戻して、当てる前からあったものかを数える
+        tx.rollback()?;
+        after
+    };
+    let new = new_violations(&violations(conn)?, &after);
+    if let Some(first) = new.first() {
+        return Err(CoreError::Conflict(format!(
+            "{}：外部キーの食い違いが {} 件できるので当てません（例：{} の行 {:?} が {} を参照）",
+            m.name,
+            new.len(),
+            first.0,
+            first.1,
+            first.2
+        )));
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(m.sql)?;
+    tx.pragma_update(None, "user_version", user_version(version))?;
+    tx.commit()?;
+    tracing::warn!(
+        migration = m.name,
+        violations = after.len(),
+        "当てる前からあった外部キーの食い違いを残したまま当てました"
+    );
+    Ok(after.len())
+}
+
+/// `after` のうち `before` になかったもの（同じ行が複数あれば数で比べる。どちらも並べたもの）。
+fn new_violations<'a>(before: &[Violation], after: &'a [Violation]) -> Vec<&'a Violation> {
+    let mut rest = before.iter().peekable();
+    let mut new = Vec::new();
+    for v in after {
+        while rest.next_if(|b| *b < v).is_some() {}
+        if rest.next_if(|b| *b == v).is_none() {
+            new.push(v);
+        }
+    }
+    new
+}
+
+#[cfg(test)]
+#[path = "migrate_tests.rs"]
+mod tests;

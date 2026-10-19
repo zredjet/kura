@@ -30,4 +30,4 @@ pub mod time;
 pub mod tools;
 pub mod unit;
 
-pub use error::{CoreError, Result};
+pub use error::{CoreError, Result, UpgradeError};

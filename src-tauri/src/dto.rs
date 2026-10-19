@@ -59,6 +59,8 @@ pub struct IntegrityDto {
     pub staging_removed: u64,
     pub missing_files: u64,
     pub orphan_files: u64,
+    /// どの表からも参照されない台帳の行の数（M11。docs/data-model.md §4）。
+    pub unreferenced_blobs: u64,
 }
 
 impl From<IntegrityReport> for IntegrityDto {
@@ -67,6 +69,7 @@ impl From<IntegrityReport> for IntegrityDto {
             staging_removed: r.staging_removed,
             missing_files: r.missing_files,
             orphan_files: r.orphan_files,
+            unreferenced_blobs: r.unreferenced_blobs,
         }
     }
 }

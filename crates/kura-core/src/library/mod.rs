@@ -3,25 +3,49 @@
 pub mod backup;
 mod integrity;
 mod layout;
+pub mod ledger;
 mod location;
 mod session;
 
 pub use integrity::{IntegrityReport, check_files, clean_staging};
-pub use layout::{DB_FILE, Layout, SUBDIRS, ThumbSize, content_rel_path, hex, parse_hex32};
+pub use layout::{
+    ANIM_V, DB_FILE, Layout, SUBDIRS, ThumbFormat, ThumbSize, content_rel_path, hex, parse_hex32,
+};
 pub use location::{
     LIBRARY_EXT, LocationCheck, LocationStatus, check_location, is_library, normalize_library_path,
 };
 pub use session::{EventSink, LibraryInfo, LibrarySession};
 
 use std::path::Path;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard};
 
-use crate::db::Db;
+use crate::db::{Db, MigrationReport};
 use crate::{CoreError, Result};
+
+/// `path` のライブラリを開くとマイグレーションを当てるか（開く前に「ライブラリを更新しています」を出すのに使う）。
+/// DB がなければ false。読み取り専用で版（user_version）だけを読む。
+pub fn needs_upgrade(path: &Path) -> Result<bool> {
+    let db = path.join(DB_FILE);
+    if !db.is_file() {
+        return Ok(false);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let version = crate::db::applied(&conn)?;
+    Ok(version > 0 && version < crate::db::MIGRATIONS.len())
+}
 
 /// 開いているライブラリ。フォルダ構成と DB を持つ。
 pub struct Library {
     layout: Layout,
     db: Db,
+    /// 開いたときに当てたマイグレーション。
+    migration: MigrationReport,
+    /// 取り込み（files/ に置いてから DB に書くまで）とゴミ箱を空にする処理を直列にする鍵。
+    /// 取り込みどうしは並べてよい（読み取りの側）。ゴミ箱を空にする処理は 1 つだけ（書き込みの側）。
+    ingest: RwLock<()>,
 }
 
 impl Library {
@@ -63,8 +87,28 @@ impl Library {
         for dir in SUBDIRS {
             std::fs::create_dir_all(layout.root().join(dir))?;
         }
-        let db = Db::open(&layout.db_path())?;
-        Ok(Self { layout, db })
+        // 未適用のマイグレーションがある既存の DB は、当てる前にバックアップを取る（失敗したら当てずに開くのを失敗にする）
+        let (db, migration) = Db::open_with(&layout.db_path(), |conn, _from| {
+            backup::before_migration(&layout, conn, crate::time::now_ms()).map(|_| ())
+        })?;
+        Ok(Self {
+            layout,
+            db,
+            migration,
+            ingest: RwLock::new(()),
+        })
+    }
+
+    /// 取り込みの鍵：files/ にファイルを置いてから DB に書き終えるまで持つ（取り込み・ダウンロード・キャプチャ）。
+    /// 持っている間はゴミ箱を空にする処理が待つので、同じ中身を置いたファイルを消されない（docs/data-model.md §4）。
+    /// 同じスレッドで重ねて取らないこと。
+    pub fn ingest_guard(&self) -> RwLockReadGuard<'_, ()> {
+        self.ingest.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 開いたときに当てたマイグレーション（当てていなければ `applied` が空）。
+    pub fn migration(&self) -> &MigrationReport {
+        &self.migration
     }
 
     /// フォルダ構成。
@@ -96,20 +140,17 @@ impl Library {
         })
     }
 
-    /// ゴミ箱を空にする。DB の行を先に消し、そのあと実ファイル・サムネイル・ジャケット・プロキシを消す
-    /// （途中で落ちてもファイルが残るだけで、整合性チェックで「DB にないファイル」として数えられる）。
+    /// ゴミ箱を空にする。DB の行を消して、使われなくなった台帳の行を同じトランザクションで解放し、コミットのあとで
+    /// 解放した中身の実ファイルと派生のファイル（サムネイル・ジャケット・プロキシ・波形・アニメの帯）を消す
+    /// （ADR-46。途中で落ちてもファイルが残るだけで、整合性チェックで「DB にないファイル」として数えられる）。
+    /// 取り込みの鍵を書き込みの側で持つので、置いたばかりの同じ中身のファイルを消さない。
     pub fn empty_trash(&self) -> Result<TrashEmptied> {
-        let removed = self.db.write(|tx| crate::items::delete_trashed(tx))?;
+        let _ingest = self.ingest.write().unwrap_or_else(PoisonError::into_inner);
+        let deleted = self.db.write(|tx| crate::items::delete_trashed(tx))?;
         let mut result = TrashEmptied::default();
-        for item in &removed {
-            let hash_hex = hex(&item.hash);
-            let paths = [
-                self.layout.content_path(&item.hash, &item.ext),
-                self.layout.thumb_path(&hash_hex, ThumbSize::Small),
-                self.layout.thumb_path(&hash_hex, ThumbSize::Large),
-                self.layout.art_path(&hash_hex),
-                self.layout.proxy_path(&hash_hex),
-            ];
+        for blob in &deleted.released {
+            let mut paths = self.layout.derived_paths(&hex(&blob.hash));
+            paths.insert(0, self.layout.content_path(&blob.hash, &blob.ext));
             for path in paths {
                 match std::fs::remove_file(&path) {
                     Ok(()) => {}
@@ -120,6 +161,8 @@ impl Library {
                     }
                 }
             }
+        }
+        for item in &deleted.items {
             result.items += 1;
             result.bytes += u64::try_from(item.size_bytes).unwrap_or(0);
         }
@@ -187,6 +230,99 @@ mod tests {
         assert!(lib.layout().content_path(&kept, "jpg").exists());
         assert_eq!(lib.item_count().unwrap(), 1);
         assert_eq!(lib.empty_trash().unwrap(), TrashEmptied::default());
+    }
+
+    #[test]
+    fn empty_trash_releases_ledger_rows_facts_and_peaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::create(&dir.path().join("L")).unwrap();
+        let (gone, kept) = ([1u8; 32], [2u8; 32]);
+        let put = |path: std::path::PathBuf| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        };
+        for (id, hash) in [(1, gone), (2, kept)] {
+            put(lib.layout().content_path(&hash, "png"));
+            for path in lib.layout().derived_paths(&hex(&hash)) {
+                put(path);
+            }
+            lib.db()
+                .write(move |tx| {
+                    tx.execute(
+                        "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+                         VALUES (?1, ?2, 'png', 'image', 10, 't', 't', 0, 0)",
+                        rusqlite::params![id, &hash[..]],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO media_facts (blob_id, state, facts_v, alpha, analyzed_at)
+                         SELECT id, 'ok', 1, 2, 1 FROM blobs WHERE hash = ?1",
+                        [&hash[..]],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO analysis_results (blob_id, analysis, version, params, encoding, output_len, digest, created_at)
+                         SELECT id, 'audio.peaks', 1, '{}', 'binary', 0, x'00', 1 FROM blobs WHERE hash = ?1",
+                        [&hash[..]],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO asset_settings (item_id, pixel_art, updated_at) VALUES (?1, 1, 1)",
+                        [id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        lib.db()
+            .write(|tx| crate::items::trash(tx, &[1], 5))
+            .unwrap();
+
+        let result = lib.empty_trash().unwrap();
+        assert_eq!((result.items, result.bytes, result.failed), (1, 10, 0));
+        // 台帳の行が解放され、中身ごとの事実と結果、アイテムごとの設定も消える
+        let counts: (i64, i64, i64, i64) = lib
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT (SELECT count(*) FROM blobs), (SELECT count(*) FROM media_facts),
+                            (SELECT count(*) FROM analysis_results), (SELECT count(*) FROM asset_settings)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1, 1));
+        // 実ファイルと、png・jpg のサムネイル・ジャケット・プロキシ・波形・アニメの帯を消す。残すものは残す
+        assert!(!lib.layout().content_path(&gone, "png").exists());
+        for path in lib.layout().derived_paths(&hex(&gone)) {
+            assert!(!path.exists(), "{} が残った", path.display());
+        }
+        assert!(lib.layout().content_path(&kept, "png").exists());
+        for path in lib.layout().derived_paths(&hex(&kept)) {
+            assert!(path.exists(), "{} が消えた", path.display());
+        }
+        let (missing, orphans) = check_files(lib.db(), lib.layout()).unwrap();
+        assert_eq!((missing, orphans), (0, 0));
+    }
+
+    #[test]
+    fn empty_trash_waits_for_an_ingest_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = std::sync::Arc::new(Library::create(&dir.path().join("L")).unwrap());
+        let guard = lib.ingest_guard();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lib2 = lib.clone();
+        let handle = std::thread::spawn(move || {
+            let result = lib2.empty_trash();
+            tx.send(()).unwrap();
+            result.map(|_| ())
+        });
+        // 取り込みが鍵を持っている間は始まらない
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+        );
+        drop(guard);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]

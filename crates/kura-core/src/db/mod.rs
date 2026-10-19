@@ -1,8 +1,15 @@
 //! SQLite へのアクセス。書き込みは専用スレッド 1 本に集約し、読み取りは読み取り専用の接続を使い回す。
 
 mod migrate;
+#[cfg(test)]
+pub(crate) mod testing;
 
-pub use migrate::{MIGRATIONS, migrate};
+pub use migrate::{
+    AppliedMigration, Kind, MIGRATIONS, Migration, MigrationReport, Violation, applied, migrate,
+    migrate_until, pending, violations,
+};
+
+use crate::UpgradeError;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -27,17 +34,48 @@ pub struct Db {
     path: PathBuf,
     writer: Mutex<Option<mpsc::Sender<WriteJob>>>,
     writer_thread: Mutex<Option<JoinHandle<()>>>,
-    readers: Mutex<Vec<Connection>>,
+    readers: Mutex<Readers>,
     reader_returned: Condvar,
 }
 
+/// 読み取りの接続の置き場（閉じたら空にして、もう貸さない）。
+struct Readers {
+    conns: Vec<Connection>,
+    closed: bool,
+}
+
 impl Db {
-    /// DB を開き（なければ作り）、マイグレーションを適用する。
+    /// DB を開き（なければ作り）、マイグレーションを適用する（当てる前のバックアップは取らない。テストと新しい DB 用）。
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, |_, _| Ok(())).map(|(db, _)| db)
+    }
+
+    /// DB を開き、マイグレーションを適用する（docs/data-model.md §5）。未適用のマイグレーションがある既存の DB
+    /// （user_version が 1 以上）では、当てる前に `before_migrating(書き込みの接続, 今の版)` を呼ぶ（当てる前のバックアップ）。
+    /// それが失敗したら当てずに失敗する。当てたら WAL を本体へ移して空にする。失敗はどれも `CoreError::Upgrade`。
+    pub fn open_with<F>(path: &Path, before_migrating: F) -> Result<(Self, MigrationReport)>
+    where
+        F: FnOnce(&Connection, usize) -> Result<()>,
+    {
+        Self::open_list(path, MIGRATIONS, before_migrating)
+    }
+
+    fn open_list<F>(
+        path: &Path,
+        list: &[Migration],
+        before_migrating: F,
+    ) -> Result<(Self, MigrationReport)>
+    where
+        F: FnOnce(&Connection, usize) -> Result<()>,
+    {
         let mut conn = Connection::open(path)?;
         apply_pragmas(&conn)?;
-        migrate(&mut conn)?;
+        let report = upgrade(&mut conn, list, before_migrating)?;
+        Ok((Self::start(path, conn)?, report))
+    }
 
+    /// 書き込みのスレッドと読み取りの接続を用意する。
+    fn start(path: &Path, conn: Connection) -> Result<Self> {
         let readers = (0..READERS)
             .map(|_| open_reader(path))
             .collect::<Result<Vec<_>>>()?;
@@ -56,7 +94,10 @@ impl Db {
             path: path.to_path_buf(),
             writer: Mutex::new(Some(tx)),
             writer_thread: Mutex::new(Some(writer_thread)),
-            readers: Mutex::new(readers),
+            readers: Mutex::new(Readers {
+                conns: readers,
+                closed: false,
+            }),
             reader_returned: Condvar::new(),
         })
     }
@@ -102,7 +143,10 @@ impl Db {
         let conn = {
             let mut pool = self.readers.lock().map_err(|_| CoreError::DbClosed)?;
             loop {
-                if let Some(conn) = pool.pop() {
+                if pool.closed {
+                    return Err(CoreError::DbClosed);
+                }
+                if let Some(conn) = pool.conns.pop() {
                     break conn;
                 }
                 pool = self
@@ -112,15 +156,24 @@ impl Db {
             }
         };
         let result = f(&conn);
-        if let Ok(mut pool) = self.readers.lock() {
-            pool.push(conn);
+        if let Ok(mut pool) = self.readers.lock()
+            && !pool.closed
+        {
+            pool.conns.push(conn);
             self.reader_returned.notify_one();
         }
         result
     }
 
-    /// 書き込みスレッドを止める（未処理の書き込みは実行してから止まる）。
+    /// 閉じる：読み取りの接続を閉じてから、書き込みスレッドを止める（未処理の書き込みは実行してから止まる）。
+    /// 最後に閉じた接続が WAL を本体へ移して消すので、書き込みの接続を最後にする（読み取り専用の接続が最後だと
+    /// WAL が残り、次に開くときに読み直して約 40ms かかる）。
     pub fn close(&self) {
+        if let Ok(mut pool) = self.readers.lock() {
+            pool.closed = true;
+            pool.conns.clear();
+        }
+        self.reader_returned.notify_all();
         if let Ok(mut sender) = self.writer.lock() {
             sender.take();
         }
@@ -137,6 +190,62 @@ impl Drop for Db {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// 未適用のマイグレーションを当てる（Db::open_with の手順）。
+fn upgrade<F>(
+    conn: &mut Connection,
+    list: &[Migration],
+    before_migrating: F,
+) -> Result<MigrationReport>
+where
+    F: FnOnce(&Connection, usize) -> Result<()>,
+{
+    let from = applied(conn)?;
+    if from > list.len() {
+        return Err(UpgradeError::Newer {
+            found: from,
+            supported: list.len(),
+        }
+        .into());
+    }
+    if from == list.len() {
+        return Ok(MigrationReport {
+            from,
+            to: from,
+            ..MigrationReport::default()
+        });
+    }
+    let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
+    let started = std::time::Instant::now();
+    // 新しい DB（版 0）には残すものがないので、フックは既存の DB だけ
+    if from > 0 {
+        before_migrating(conn, from).map_err(|err| UpgradeError::backup(&err))?;
+    }
+    let before_ms = ms(started);
+    let mut report = migrate::run(conn, list, list.len()).map_err(|(index, err)| {
+        let name = index
+            .and_then(|i| list.get(i))
+            .map_or("マイグレーション", |m| m.name);
+        UpgradeError::apply(name, &err)
+    })?;
+    // 当てた分の WAL を本体へ移して空にする（残すと次に開くときに WAL を読み直して約 40ms かかる）
+    let checkpoint = std::time::Instant::now();
+    if let Err(err) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+        tracing::warn!(%err, "マイグレーションのあとの WAL を空にできませんでした");
+    }
+    report.before_ms = before_ms;
+    report.checkpoint_ms = ms(checkpoint);
+    tracing::info!(
+        from = report.from,
+        to = report.to,
+        tolerated_violations = report.tolerated_violations,
+        before_ms = report.before_ms,
+        checkpoint_ms = report.checkpoint_ms,
+        ms = ms(started),
+        "ライブラリの DB を新しい版にしました"
+    );
+    Ok(report)
 }
 
 /// 書き込み用の接続の PRAGMA（docs/data-model.md §2）。
@@ -286,5 +395,159 @@ mod tests {
         let (_dir, db) = open_temp();
         db.close();
         assert!(matches!(db.write(|_| Ok(())), Err(CoreError::DbClosed)));
+        assert!(matches!(db.read(|_| Ok(())), Err(CoreError::DbClosed)));
+    }
+
+    #[test]
+    fn closing_the_db_leaves_no_wal() {
+        // 最後に閉じる接続が WAL を本体へ移して消す。読み取り専用の接続が最後だと WAL が残り、次に開くときに読み直す
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.sqlite");
+        let db = Db::open(&path).unwrap();
+        db.write(|tx| {
+            tx.execute("INSERT INTO settings (key, value) VALUES ('a', '1')", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let n: i64 = db
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM settings", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(wal_len(&path) > 0, "書いている間は WAL がある");
+        drop(db);
+        assert!(
+            !Path::new(&format!("{}-wal", path.display())).exists(),
+            "閉じたあとに WAL が残った（{} バイト）",
+            wal_len(&path)
+        );
+    }
+
+    // ===== 開くときのマイグレーション（当てる前のフック・WAL・失敗の言葉。docs/data-model.md §5）=====
+
+    use crate::db::testing::one;
+
+    /// 1 つ前の版の DB をファイルに作り、子のある行を入れる（WAL に書いたまま閉じない形にはしない）。
+    fn previous_version(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("library.sqlite");
+        let mut conn = Connection::open(&path).unwrap();
+        apply_pragmas(&conn).unwrap();
+        migrate_until(&mut conn, MIGRATIONS.len() - 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+             VALUES (1, x'0101010101010101010101010101010101010101010101010101010101010101', 'jpg', 'image', 3, '夕方', 'a.jpg', 1, 1);
+             INSERT INTO tags (id, name, created_at) VALUES (1, '海', 1);
+             INSERT INTO item_tags (tag_id, item_id) VALUES (1, 1);",
+        )
+        .unwrap();
+        path
+    }
+
+    fn version_of(path: &Path) -> usize {
+        applied(&Connection::open(path).unwrap()).unwrap()
+    }
+
+    fn wal_len(path: &Path) -> u64 {
+        let wal = format!("{}-wal", path.display());
+        std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn hook_runs_only_before_migrating_an_existing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = previous_version(dir.path());
+        let mut seen = None;
+        let (db, report) = Db::open_with(&path, |conn, from| {
+            // 当てる前の状態が見える
+            seen = Some((from, applied(conn)?));
+            Ok(())
+        })
+        .unwrap();
+        let previous = MIGRATIONS.len() - 1;
+        assert_eq!(seen, Some((previous, previous)));
+        assert_eq!((report.from, report.to), (previous, MIGRATIONS.len()));
+        assert_eq!(report.applied.len(), 1);
+        // 当てたら WAL を本体へ移して空にする（次に開くときに読み直さない）
+        assert_eq!(wal_len(&path), 0);
+        drop(db);
+        // 当て済みの DB と、新しい DB では呼ばない
+        let (_db, report) =
+            Db::open_with(&path, |_, _| panic!("当て済みの DB でフックを呼んだ")).unwrap();
+        assert!(report.applied.is_empty());
+        let fresh = dir.path().join("fresh.sqlite");
+        let (_db, report) =
+            Db::open_with(&fresh, |_, _| panic!("新しい DB でフックを呼んだ")).unwrap();
+        assert_eq!(report.to, MIGRATIONS.len());
+    }
+
+    #[test]
+    fn a_failed_backup_leaves_the_library_unmigrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = previous_version(dir.path());
+        let full = || CoreError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        let err = Db::open_with(&path, |_, _| Err(full())).err().unwrap();
+        assert!(
+            matches!(err, CoreError::Upgrade(UpgradeError::BackupNoSpace { .. })),
+            "{err}"
+        );
+        assert_eq!(version_of(&path), MIGRATIONS.len() - 1);
+        let err = Db::open_with(&path, |_, _| Err(CoreError::Invalid("x".into())))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, CoreError::Upgrade(UpgradeError::Backup { .. })),
+            "{err}"
+        );
+        assert_eq!(version_of(&path), MIGRATIONS.len() - 1);
+    }
+
+    #[test]
+    fn a_failed_migration_keeps_the_old_version_and_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = previous_version(dir.path());
+        let failing = Migration {
+            name: "9999_fails",
+            sql: "DELETE FROM item_tags; SELECT * FROM no_such_table;",
+            kind: Kind::Plain,
+        };
+        let list: Vec<Migration> = MIGRATIONS.iter().copied().chain([failing]).collect();
+        let mut hooked = false;
+        let err = Db::open_list(&path, &list, |_, _| {
+            hooked = true;
+            Ok(())
+        })
+        .err()
+        .unwrap();
+        assert!(hooked, "当てる前のフックは呼ぶ");
+        match &err {
+            CoreError::Upgrade(UpgradeError::Apply { migration, .. }) => {
+                assert_eq!(migration, "9999_fails");
+            }
+            other => panic!("{other}"),
+        }
+        // 途中まで当てた分（1 つ前の版からの最新）は残り、失敗した分は戻る
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(applied(&conn).unwrap(), MIGRATIONS.len());
+        assert_eq!(one::<i64>(&conn, "SELECT count(*) FROM item_tags"), 1);
+    }
+
+    #[test]
+    fn newer_schema_is_refused_in_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.sqlite");
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 99)
+            .unwrap();
+        let err = Db::open_with(&path, |_, _| panic!("新しい版の DB でフックを呼んだ"))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                err,
+                CoreError::Upgrade(UpgradeError::Newer { found: 99, .. })
+            ),
+            "{err}"
+        );
+        assert_eq!(version_of(&path), 99);
     }
 }
