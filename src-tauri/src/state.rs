@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use kura_core::capture::LoginBrowser;
-use kura_core::library::{EventSink, LibrarySession};
+use kura_core::edit::EngineFactory;
+use kura_core::library::{
+    EventSink, LibrarySession, Services, UpgradeEvent, UpgradeHooks, upgrade::UpgradeNotifyFn,
+};
 use kura_core::playback::PlaybackSupport;
 
 use crate::config::{self, AppConfig, DownloadPrefs, PlayerPrefs};
@@ -19,11 +22,18 @@ pub struct AppState {
     support: RwLock<Option<PlaybackSupport>>,
     /// アプリが開いたログイン用の Chrome（DevTools でつないでいる。ADR-111）。
     login: Arc<Mutex<Option<LoginBrowser>>>,
+    /// エンジンの部品を作る口。ライブラリを開くたびに渡し、ライブラリごとの部品を作らせる。
+    engine: Arc<dyn EngineFactory>,
 }
 
 impl AppState {
-    /// 設定ファイルの場所を受け取って作る。
+    /// 設定ファイルの場所を受け取って作る（エンジンの部品は macOS の実装で作る）。
     pub fn new(config_path: PathBuf) -> Self {
+        Self::with_engine(config_path, Arc::new(crate::engine::MacEngineFactory))
+    }
+
+    /// 設定ファイルの場所と、エンジンの部品を作る口から作る。
+    pub fn with_engine(config_path: PathBuf, engine: Arc<dyn EngineFactory>) -> Self {
         let config = config::load(&config_path);
         kura_core::tools::set_overrides(config.tools.clone());
         Self {
@@ -32,7 +42,21 @@ impl AppState {
             config: Mutex::new(config),
             support: RwLock::new(None),
             login: Arc::new(Mutex::new(None)),
+            engine,
         }
+    }
+
+    /// ライブラリを開く・作るときに渡すもの：メディアの実装（macOS と ffmpeg）、エンジンの部品を作る口、DB を新しい版に
+    /// するときの空きの確かめ（kura-mac の `volume_capacity`）とイベント `library://upgrade`。
+    pub fn services(&self, app: &tauri::AppHandle) -> Services {
+        Services::new(kura_mac::media_backend())
+            .with_engine(self.engine.clone())
+            .with_upgrade(UpgradeHooks {
+                free_space: Some(Arc::new(|path: &Path| {
+                    kura_mac::volume_capacity(path).map(|v| v.available_bytes)
+                })),
+                notify: Some(upgrade_notify(app.clone())),
+            })
     }
 
     /// ログイン用の Chrome の置き場所。
@@ -157,6 +181,10 @@ impl AppState {
             c.tools.clone()
         })?;
         kura_core::tools::set_overrides(tools);
+        // 開いているライブラリのエンジンのコーデックの組を、次に使うときに作り直す（ffmpeg を探し直す）
+        if let Some(session) = self.current() {
+            session.reload_tools();
+        }
         Ok(())
     }
 
@@ -191,6 +219,16 @@ impl AppState {
     }
 }
 
+/// DB を新しい版にする知らせを、イベント `library://upgrade` にしてフロントへ送る。
+pub fn upgrade_notify(app: tauri::AppHandle) -> Arc<UpgradeNotifyFn> {
+    Arc::new(move |event: &UpgradeEvent| {
+        let payload = crate::dto::LibraryUpgradeEvent::from(event);
+        if let Err(err) = tauri_specta::Event::emit(&payload, &app) {
+            tracing::warn!(%err, "ライブラリの更新の知らせを送れませんでした");
+        }
+    })
+}
+
 /// 進捗イベントの送り先を作る。
 pub fn event_sink(app: tauri::AppHandle) -> EventSink {
     Arc::new(move |event| {
@@ -199,4 +237,64 @@ pub fn event_sink(app: tauri::AppHandle) -> EventSink {
             tracing::warn!(%err, "進捗イベントを送れませんでした");
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use kura_core::edit::{CodecSet, RuntimeConfig};
+    use kura_core::media::NoBackend;
+
+    use super::*;
+
+    /// コーデックの組を作った回数を数える偽のファクトリ。
+    #[derive(Default)]
+    struct Counting(AtomicUsize);
+
+    impl EngineFactory for Counting {
+        fn runtime_config(&self) -> RuntimeConfig {
+            RuntimeConfig {
+                cores: Some(2),
+                ..RuntimeConfig::default()
+            }
+        }
+
+        fn codecs(&self, _work_dir: &Path) -> CodecSet {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            CodecSet::default()
+        }
+    }
+
+    /// 外部ツールの場所を変えると（tools_set_path）、開いているライブラリのエンジンのコーデックの組を作り直す。
+    #[test]
+    fn setting_a_tool_path_rebuilds_the_engine_codecs() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = Arc::new(Counting::default());
+        let state = AppState::with_engine(dir.path().join("app.json"), factory.clone());
+        let session = state
+            .replace_session(
+                || {
+                    LibrarySession::create(
+                        &dir.path().join("L"),
+                        Arc::new(|_| {}),
+                        Services::new(Arc::new(NoBackend)).with_engine(factory.clone()),
+                    )
+                },
+                false,
+            )
+            .unwrap();
+        let engine = session.engine().unwrap().clone();
+        let before = engine.codecs();
+        assert_eq!(factory.0.load(Ordering::SeqCst), 1);
+
+        let tool = dir.path().join("mpv");
+        std::fs::write(&tool, "").unwrap();
+        state.set_tool_path("mpv", Some(tool)).unwrap();
+        let after = engine.codecs();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(factory.0.load(Ordering::SeqCst), 2);
+        state.set_tool_path("mpv", None).unwrap();
+        state.close();
+    }
 }

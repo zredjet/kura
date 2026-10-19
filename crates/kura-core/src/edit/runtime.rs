@@ -54,8 +54,8 @@ pub struct RuntimeConfig {
     pub limits: Option<Limits>,
 }
 
-/// エンジン 1 つと、プレビュー・一括の 2 つのプール、メモリの予算。アプリに 1 つ持つ（ノードのキャッシュは作った
-/// エンジンに縛られるので、エンジンを作り直さない）。
+/// エンジン 1 つと、プレビュー・一括の 2 つのプール、メモリの予算。開いているライブラリに 1 つ持つ（[`super::EngineServices`]。
+/// 最初に使うときに作る）。ノードのキャッシュは作ったエンジンに縛られるので、ライブラリを開いている間は作り直さない。
 pub struct EngineRuntime {
     engine: Engine,
     preview: ThreadPool,

@@ -6,6 +6,7 @@ mod layout;
 pub mod ledger;
 mod location;
 mod session;
+pub mod upgrade;
 
 pub use integrity::{IntegrityReport, check_files, clean_staging};
 pub use layout::{
@@ -14,10 +15,13 @@ pub use layout::{
 pub use location::{
     LIBRARY_EXT, LocationCheck, LocationStatus, check_location, is_library, normalize_library_path,
 };
-pub use session::{EventSink, LibraryInfo, LibrarySession};
+pub use session::{EventSink, LibraryInfo, LibrarySession, Services};
+pub use upgrade::{UpgradeEvent, UpgradeHooks};
 
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::{PoisonError, RwLock, RwLockReadGuard};
+use std::time::Instant;
 
 use crate::db::{Db, MigrationReport};
 use crate::{CoreError, Result};
@@ -68,29 +72,67 @@ impl Library {
             }
         }
         std::fs::create_dir_all(&path)?;
-        Self::open_dir(&path)
+        // 新しい DB（版 0）には当てる前の手順がないので、空きの確かめと知らせは要らない
+        Self::open_dir(&path, &UpgradeHooks::default())
     }
 
     /// 既存のライブラリを開く。足りないフォルダは作り直し、マイグレーションを適用する。
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, &UpgradeHooks::default())
+    }
+
+    /// 既存のライブラリを開く。新しい版にするときは、当てる前に空きを確かめ（`hooks.free_space`）、始まり・終わり・失敗を
+    /// 知らせる（`hooks.notify`。`upgrade` の冒頭）。
+    pub fn open_with(path: &Path, hooks: &UpgradeHooks) -> Result<Self> {
         if !is_library(path) {
             return Err(CoreError::NotFound(format!(
                 "ライブラリが見つかりません: {}",
                 path.display()
             )));
         }
-        Self::open_dir(path)
+        Self::open_dir(path, hooks)
     }
 
-    fn open_dir(path: &Path) -> Result<Self> {
+    fn open_dir(path: &Path, hooks: &UpgradeHooks) -> Result<Self> {
         let layout = Layout::new(path);
         for dir in SUBDIRS {
             std::fs::create_dir_all(layout.root().join(dir))?;
         }
-        // 未適用のマイグレーションがある既存の DB は、当てる前にバックアップを取る（失敗したら当てずに開くのを失敗にする）
-        let (db, migration) = Db::open_with(&layout.db_path(), |conn, _from| {
+        let to = crate::db::MIGRATIONS.len();
+        // 当て始めた時刻と版（フックが呼ばれた = 既存の DB に未適用のものがある）
+        let started: Cell<Option<(Instant, usize)>> = Cell::new(None);
+        // 未適用のマイグレーションがある既存の DB は、空きを確かめ、当てる前にバックアップを取る（どちらかが失敗したら
+        // 当てずに開くのを失敗にする）
+        let opened = Db::open_with(&layout.db_path(), |conn, from| {
+            started.set(Some((Instant::now(), from)));
+            let db_bytes = upgrade::db_bytes(conn)?;
+            hooks.notify(&UpgradeEvent::Started {
+                path: layout.root().to_path_buf(),
+                from,
+                to,
+                db_bytes,
+            });
+            hooks.ensure_space(layout.root(), db_bytes)?;
             backup::before_migration(&layout, conn, crate::time::now_ms()).map(|_| ())
-        })?;
+        });
+        if let Some((at, from)) = started.get() {
+            let (path, ms) = (
+                layout.root().to_path_buf(),
+                at.elapsed().as_secs_f64() * 1000.0,
+            );
+            match &opened {
+                Err(CoreError::Upgrade(error)) => hooks.notify(&UpgradeEvent::Failed {
+                    path,
+                    from,
+                    to,
+                    ms,
+                    error: error.clone(),
+                }),
+                // 当てたあとの失敗（読み取りの接続・書き込みのスレッドの用意）は、更新は終わっている。理由は戻り値で返る
+                Ok(_) | Err(_) => hooks.notify(&UpgradeEvent::Finished { path, from, to, ms }),
+            }
+        }
+        let (db, migration) = opened?;
         Ok(Self {
             layout,
             db,

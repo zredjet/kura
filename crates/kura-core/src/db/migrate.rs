@@ -107,6 +107,18 @@ pub struct MigrationReport {
     pub checkpoint_ms: f64,
 }
 
+impl MigrationReport {
+    /// 既存の DB（版 1 以上）を新しい版にした（更新後の初回。NFR-01 の外として記録する）。
+    pub fn upgraded(&self) -> bool {
+        self.from > 0 && !self.applied.is_empty()
+    }
+
+    /// バックアップ・各マイグレーション・WAL を空にするまでの時間の合計（ミリ秒）。
+    pub fn total_ms(&self) -> f64 {
+        self.before_ms + self.applied.iter().map(|a| a.ms).sum::<f64>() + self.checkpoint_ms
+    }
+}
+
 /// 適用済みの数（user_version）。
 pub fn applied(conn: &Connection) -> Result<usize> {
     let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;

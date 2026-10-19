@@ -12,7 +12,7 @@ use kura_core::items::{
 };
 use kura_core::jobs::{JobEvent, JobFilter, JobKind, JobRecord, JobState};
 use kura_core::library::{
-    IntegrityReport, LibraryInfo, LocationCheck, LocationStatus, TrashEmptied,
+    IntegrityReport, LibraryInfo, LocationCheck, LocationStatus, TrashEmptied, UpgradeEvent,
 };
 use kura_core::playback::{Container, PlayReport, SupportEntry};
 use kura_core::playlist::add::AddSource;
@@ -74,12 +74,91 @@ impl From<IntegrityReport> for IntegrityDto {
     }
 }
 
-/// 前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかった。
+/// 前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかったか（`error` が空）、
+/// 開けなかった（`error` に理由。`code` は `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` など）。
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryRestoreDto {
     pub info: Option<LibraryInfoDto>,
     pub last_path: Option<String>,
+    /// 前回のライブラリ（か `KURA_LIBRARY`）を開けなかった理由。
+    #[specta(optional)]
+    pub error: Option<crate::error::AppError>,
+}
+
+/// ライブラリの DB を新しい版にする段階（イベント `library://upgrade`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum LibraryUpgradePhase {
+    /// 当て始めた（空きの確かめとバックアップの前）。
+    Started,
+    /// 当て終えた。
+    Finished,
+    /// 当てられなかった（ライブラリは前の版のまま。理由は `error`。開く IPC も同じ理由で失敗を返す）。
+    Failed,
+}
+
+/// ライブラリの DB を新しい版にする知らせ（イベント `library://upgrade`。M11 の決定 1）。開く IPC（`library_restore`・
+/// `library_open`）が終わる前に、同じライブラリについて `started` のあと `finished` か `failed` が 1 つ来る。フロントは
+/// `started` から 300ms を超えたら「ライブラリを更新しています」を出す。当てるものがない・新しいライブラリでは来ない。
+#[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+#[tauri_specta(event_name = "library://upgrade")]
+pub struct LibraryUpgradeEvent {
+    pub phase: LibraryUpgradePhase,
+    /// ライブラリのフォルダ。
+    pub path: String,
+    /// 当てる前のスキーマの版（user_version）。
+    pub from_version: u32,
+    /// 当てたあとの版。
+    pub to_version: u32,
+    /// DB の大きさ（バイト。`started` だけ）。
+    pub db_bytes: Option<u64>,
+    /// 始まりからの時間（ミリ秒。`finished`・`failed` だけ）。
+    pub elapsed_ms: Option<f64>,
+    /// 当てられなかった理由（`failed` だけ）。
+    pub error: Option<crate::error::AppError>,
+}
+
+impl From<&UpgradeEvent> for LibraryUpgradeEvent {
+    fn from(event: &UpgradeEvent) -> Self {
+        let version = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+        let base = |phase, path: &std::path::Path, from, to| Self {
+            phase,
+            path: path.to_string_lossy().into_owned(),
+            from_version: version(from),
+            to_version: version(to),
+            db_bytes: None,
+            elapsed_ms: None,
+            error: None,
+        };
+        match event {
+            UpgradeEvent::Started {
+                path,
+                from,
+                to,
+                db_bytes,
+            } => Self {
+                db_bytes: Some(*db_bytes),
+                ..base(LibraryUpgradePhase::Started, path, *from, *to)
+            },
+            UpgradeEvent::Finished { path, from, to, ms } => Self {
+                elapsed_ms: Some(*ms),
+                ..base(LibraryUpgradePhase::Finished, path, *from, *to)
+            },
+            UpgradeEvent::Failed {
+                path,
+                from,
+                to,
+                ms,
+                error,
+            } => Self {
+                elapsed_ms: Some(*ms),
+                error: Some(kura_core::CoreError::Upgrade(error.clone()).into()),
+                ..base(LibraryUpgradePhase::Failed, path, *from, *to)
+            },
+        }
+    }
 }
 
 /// 場所の状態。
@@ -1335,6 +1414,53 @@ mod tests {
         assert_eq!(json["kind"], "import");
         assert_eq!(json["state"], "running");
         assert_eq!(json["resultJson"], serde_json::Value::Null);
+    }
+
+    /// 更新の知らせは、段階・版・時間・理由（失敗のとき AppError の形）を camelCase で送る。
+    #[test]
+    fn upgrade_events_serialize_for_the_front() {
+        let path = std::path::PathBuf::from("/L.kuralib");
+        let started = LibraryUpgradeEvent::from(&UpgradeEvent::Started {
+            path: path.clone(),
+            from: 6,
+            to: 9,
+            db_bytes: 51_834_880,
+        });
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            serde_json::json!({
+                "phase": "started", "path": "/L.kuralib", "fromVersion": 6, "toVersion": 9,
+                "dbBytes": 51_834_880, "elapsedMs": null, "error": null
+            })
+        );
+        let finished = LibraryUpgradeEvent::from(&UpgradeEvent::Finished {
+            path: path.clone(),
+            from: 6,
+            to: 9,
+            ms: 812.5,
+        });
+        let json = serde_json::to_value(&finished).unwrap();
+        assert_eq!(json["phase"], "finished");
+        assert_eq!(json["elapsedMs"], 812.5);
+        let failed = LibraryUpgradeEvent::from(&UpgradeEvent::Failed {
+            path,
+            from: 6,
+            to: 9,
+            ms: 3.0,
+            error: kura_core::UpgradeError::NoSpace {
+                needed: 300_000_000,
+                available: 1,
+            },
+        });
+        let json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(json["phase"], "failed");
+        assert_eq!(json["error"]["code"], "NoSpace");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("空き容量")
+        );
     }
 }
 

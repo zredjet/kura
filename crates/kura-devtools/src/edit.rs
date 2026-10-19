@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use kura_engine::codec::{CodecSet, PinnedOptions, format_by_ext};
+use kura_engine::codec::{CodecSet, format_by_ext};
 use kura_engine::doc::{DecodeOptions, InputId};
 use kura_engine::render::{Engine, InputValue};
 use kura_engine::{Digest, NoMonitor};
@@ -43,10 +43,10 @@ fn format_of(path: &Path) -> Result<&'static str, String> {
         .ok_or_else(|| format!("{} の形式が分かりません", path.display()))
 }
 
-/// アプリと同じコーデックの組。ffmpeg の一時ファイルは OS の一時フォルダの下に置く。
+/// アプリと同じコーデックの組（SVG の文字はシステムのフォントで描く）。ffmpeg の一時ファイルは OS の一時フォルダの下に置く。
 fn codecs() -> CodecSet {
     let work = std::env::temp_dir().join("kura-devtools-codec");
-    kura_mac::full_codec_set(&PinnedOptions::default(), &work)
+    kura_mac::full_codec_set(&kura_mac::pinned_options(), &work)
 }
 
 fn caps() -> Result<(), String> {

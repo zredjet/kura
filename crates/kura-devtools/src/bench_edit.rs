@@ -37,7 +37,7 @@ use std::time::Instant;
 
 use kura_core::edit::{EngineRuntime, RuntimeConfig};
 use kura_engine::budget::{default_reserved, default_total};
-use kura_engine::codec::{CodecSet, PinnedOptions, format_by_ext};
+use kura_engine::codec::{CodecSet, format_by_ext};
 use kura_engine::doc::DecodeOptions;
 use kura_engine::testgen::InputGen;
 use kura_engine::testing::bench::cases::save_jpeg;
@@ -507,7 +507,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
 }
 
 fn run_all(opts: Opts, tmp: &Path) -> Result<(), String> {
-    let codecs = kura_mac::full_codec_set(&PinnedOptions::default(), &tmp.join("codec"));
+    // アプリと同じ組（SVG の文字はシステムのフォントで描く）
+    let codecs = kura_mac::full_codec_set(&kura_mac::pinned_options(), &tmp.join("codec"));
     let real = match &opts.photo {
         Some(p) => Some(load_photo(&codecs, p)?),
         None => None,
