@@ -216,26 +216,33 @@ where
             ..MigrationReport::default()
         });
     }
+    let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
     let started = std::time::Instant::now();
     // 新しい DB（版 0）には残すものがないので、フックは既存の DB だけ
     if from > 0 {
         before_migrating(conn, from).map_err(|err| UpgradeError::backup(&err))?;
     }
-    let report = migrate::run(conn, list, list.len()).map_err(|(index, err)| {
+    let before_ms = ms(started);
+    let mut report = migrate::run(conn, list, list.len()).map_err(|(index, err)| {
         let name = index
             .and_then(|i| list.get(i))
             .map_or("マイグレーション", |m| m.name);
         UpgradeError::apply(name, &err)
     })?;
     // 当てた分の WAL を本体へ移して空にする（残すと次に開くときに WAL を読み直して約 40ms かかる）
+    let checkpoint = std::time::Instant::now();
     if let Err(err) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
         tracing::warn!(%err, "マイグレーションのあとの WAL を空にできませんでした");
     }
+    report.before_ms = before_ms;
+    report.checkpoint_ms = ms(checkpoint);
     tracing::info!(
         from = report.from,
         to = report.to,
         tolerated_violations = report.tolerated_violations,
-        ms = started.elapsed().as_secs_f64() * 1000.0,
+        before_ms = report.before_ms,
+        checkpoint_ms = report.checkpoint_ms,
+        ms = ms(started),
         "ライブラリの DB を新しい版にしました"
     );
     Ok(report)

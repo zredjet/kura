@@ -101,6 +101,10 @@ pub struct MigrationReport {
     pub applied: Vec<AppliedMigration>,
     /// Rebuild で許した、当てる前からあった外部キーの違反の数。
     pub tolerated_violations: usize,
+    /// 当てる前のフック（バックアップ）にかかった時間（ミリ秒。`Db::open_with` だけが入れる）。
+    pub before_ms: f64,
+    /// 当てたあとに WAL を空にする（`wal_checkpoint(TRUNCATE)`）のにかかった時間（ミリ秒。`Db::open_with` だけが入れる）。
+    pub checkpoint_ms: f64,
 }
 
 /// 適用済みの数（user_version）。

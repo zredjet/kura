@@ -6,6 +6,8 @@
 //! - `seed --items <件数> --out <path>`：ダミーライブラリを作る（グリッドと起動時間の計測用）
 //! - `bench query --library <path>`：一覧の取得の速さを測る
 //! - `bench thumbs --src <画像のフォルダ> [--threads N]`：画像サムネイルの速さを測る（NFR-04）
+//! - `bench migrate (--library <path> | --items <件数> [--history]) [--runs 3]`：マイグレーションの時間と照合
+//!   （docs/data-model.md §5。`bench_migrate` の冒頭）
 //! - `bench edit [--quick] [--threads 3,4,16] [--photo <file>] [--json <file>] [--markdown <file>] …`：編集の性能
 //!   （NFR-11〜17。`bench_edit` の冒頭）
 //! - `edit shape --in <file>` / `edit render --doc <文書.json> --in <file> --out <file>`：編集のエンジンを手で確かめる（docs/editing.md）
@@ -14,6 +16,7 @@
 
 mod bench;
 mod bench_edit;
+mod bench_migrate;
 mod edit;
 mod mem_smoke;
 mod seed;

@@ -14,10 +14,13 @@ use kura_core::time::now_ms;
 
 /// `bench query --library <path>` / `bench thumbs --src <dir> [--threads N]` /
 /// `bench import --src <dir> [--threads N] [--out <dir>]` / `bench backup --library <path>` /
-/// `bench edit …`（編集のベンチ。`bench_edit`）。
+/// `bench edit …`（編集のベンチ。`bench_edit`）/ `bench migrate …`（マイグレーション。`bench_migrate`）。
 pub fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("edit") {
         return crate::bench_edit::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("migrate") {
+        return crate::bench_migrate::run(&args[1..]);
     }
     let mut library = None;
     let mut src = None;
@@ -40,7 +43,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Some("backup") => backup(&library.ok_or("--library を指定してください")?),
         _ => Err(
             "使い方: kura-devtools bench query --library <path> | thumbs --src <dir> [--threads N] \
-             | import --src <dir> [--threads N] [--out <dir>] | backup --library <path> | edit [--quick] …"
+             | import --src <dir> [--threads N] [--out <dir>] | backup --library <path> | edit [--quick] … \
+             | migrate (--library <path> | --items <件数> [--history]) [--runs 3] [--work <dir>] [--json <file>]"
                 .into(),
         ),
     }
