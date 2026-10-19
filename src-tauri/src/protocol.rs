@@ -34,15 +34,15 @@ pub fn gate(label: &str, request: &Request<Vec<u8>>, origin: &AppOrigin) -> Gate
         .headers()
         .get(header::ORIGIN)
         .map(|v| v.to_str().unwrap_or("<invalid>"));
-    match admit(label, method, request_origin, origin) {
-        Admit::Serve { head } => Gate::Serve { head },
+    let response = match admit(label, method, request_origin, origin) {
+        Admit::Serve { head } => return Gate::Serve { head },
         Admit::Preflight => {
             let mut response = empty(StatusCode::NO_CONTENT);
             for (name, value) in preflight_headers() {
                 insert(&mut response, name, value);
             }
             decorate(&mut response, origin);
-            Gate::Done(response)
+            response
         }
         Admit::Reject { status, cors } => {
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
@@ -53,17 +53,28 @@ pub fn gate(label: &str, request: &Request<Vec<u8>>, origin: &AppOrigin) -> Gate
             if cors {
                 decorate(&mut response, origin);
             }
-            tracing::debug!(
-                label,
-                method,
-                uri = %request.uri(),
-                origin = request_origin.unwrap_or("-"),
-                status,
-                "kura:// を断りました"
-            );
-            Gate::Done(response)
+            response
         }
-    }
+    };
+    tracing::debug!(
+        label,
+        method,
+        uri = %request.uri(),
+        origin = request_origin.unwrap_or("-"),
+        status = response.status().as_u16(),
+        acao = acao_of(&response),
+        "kura://（受け付けで答えました）"
+    );
+    Gate::Done(response)
+}
+
+/// ログに出す ACAO（なければ `-`）。
+fn acao_of(response: &Response<Vec<u8>>) -> &str {
+    response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
 }
 
 /// 受け付けた要求（main から）に答える（ファイルを開くのでブロックする。呼ぶ側で spawn_blocking する）。
@@ -88,6 +99,7 @@ pub fn respond(
         range = range_of(request).unwrap_or("-"),
         status = response.status().as_u16(),
         bytes = response.body().len(),
+        acao = acao_of(&response),
         "kura://"
     );
     response

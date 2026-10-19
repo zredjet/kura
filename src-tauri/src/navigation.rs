@@ -29,7 +29,10 @@ fn allow(origin: &AppOrigin, url: &Url) -> bool {
     if !ok {
         // data: の URL などは長いので、先頭だけを残す（Url の文字列は ASCII）
         let shown = url.as_str().get(..200).unwrap_or(url.as_str());
-        tracing::warn!(url = shown, "main の WebView の移動を止めました");
+        tracing::warn!(
+            url = shown,
+            "main の WebView（中の枠を含む）の移動を止めました"
+        );
     }
     ok
 }
