@@ -180,17 +180,21 @@ mod mac {
         })
     }
 
-    fn kind_code(kind: MediaKind) -> i32 {
+    /// `kura_probe` の種類の番号。フォント（3）の情報は `MediaInfo` に入らないので、段 3 で `probe_font` から
+    /// codec_info に入れる。3D は Rust の glb の読み手で読む。どちらもここでは扱わない（次の実装に回す）。
+    fn kind_code(kind: MediaKind) -> Option<i32> {
         match kind {
-            MediaKind::Image => 0,
-            MediaKind::Video => 1,
-            MediaKind::Audio => 2,
+            MediaKind::Image => Some(0),
+            MediaKind::Video => Some(1),
+            MediaKind::Audio => Some(2),
+            MediaKind::Font | MediaKind::Model => None,
         }
     }
 
     impl MediaBackend for MacBackend {
         fn probe(&self, path: &Path, kind: MediaKind) -> Result<MediaInfo, MediaError> {
-            let json = probe_json(path, kind_code(kind))?;
+            let code = kind_code(kind).ok_or(MediaError::Unsupported)?;
+            let json = probe_json(path, code)?;
             serde_json::from_str(&json).map_err(|e| MediaError::Failed(e.to_string()))
         }
 
@@ -441,6 +445,25 @@ mod tests {
         assert!((1900..=2100).contains(&audio.duration_ms.unwrap()));
         assert_eq!(audio.artist.as_deref(), Some("灯野"));
         assert_eq!(audio.album.as_deref(), Some("夜の作業"));
+    }
+
+    /// フォント・3D は `MediaBackend::probe` では読まない（音楽や画像として読まない。ffmpeg にも回さない）。
+    #[test]
+    fn fonts_and_models_are_not_probed_as_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let font = Path::new("/System/Library/Fonts/Geneva.ttf");
+        let glb = dir.path().join("x.glb");
+        std::fs::write(&glb, b"glTF\x02\0\0\0\x0c\0\0\0").unwrap();
+        for (path, kind) in [(font, MediaKind::Font), (glb.as_path(), MediaKind::Model)] {
+            assert!(matches!(
+                MacBackend.probe(path, kind),
+                Err(MediaError::Unsupported)
+            ));
+            assert!(matches!(
+                media_backend().probe(path, kind),
+                Err(MediaError::Unsupported)
+            ));
+        }
     }
 
     /// 完了条件：HEIC・MOV・FLAC のサムネイルが出る。

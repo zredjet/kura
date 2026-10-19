@@ -22,6 +22,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::support::{
     Container, PlaybackSupport, ProxyPlan, StreamAction, Streams, forced_plan, parse_streams, plan,
 };
+use crate::import::MediaKind;
 use crate::jobs::{Control, JobContext, JobEnd, JobHandler};
 use crate::library::{Layout, hex};
 use crate::time::now_ms;
@@ -207,7 +208,7 @@ struct Todo {
     id: i64,
     hash: [u8; 32],
     ext: String,
-    kind: String,
+    kind: MediaKind,
 }
 
 /// 次にすること。
@@ -218,11 +219,11 @@ enum Work {
     Nothing,
 }
 
-fn todo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Vec<u8>, String, String)> {
+fn todo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Vec<u8>, String, MediaKind)> {
     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
 }
 
-fn to_todo((id, hash, ext, kind): (i64, Vec<u8>, String, String)) -> Option<Todo> {
+fn to_todo((id, hash, ext, kind): (i64, Vec<u8>, String, MediaKind)) -> Option<Todo> {
     let hash = <[u8; 32]>::try_from(hash.as_slice()).ok()?;
     Some(Todo {
         id,
@@ -372,7 +373,7 @@ fn decide(tools: &ProxyTools, layout: &Layout, support: &PlaybackSupport, todo: 
                 ProxyPlan::Make { .. } => "pending",
                 ProxyPlan::Unplayable => "failed",
             };
-            let main = if todo.kind == "video" {
+            let main = if todo.kind == MediaKind::Video {
                 streams.video.clone()
             } else {
                 streams.audio.clone()

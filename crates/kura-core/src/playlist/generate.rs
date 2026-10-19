@@ -16,7 +16,8 @@ use crate::query::{DbResolver, QueryContext, Resolver, compile};
 use crate::random::rng;
 use crate::text::natural_cmp;
 use crate::unit::{
-    aggregate, all_ids, load_member_snapshot, own_tag_ids, play_info, resolve_members,
+    aggregate, all_ids, load_member_snapshot, member_duration_ms, own_tag_ids, play_info,
+    resolve_members,
 };
 
 /// 候補 1 つ（ユニットか、単独のアイテム）。
@@ -89,7 +90,8 @@ fn take_limit(ordered: Vec<Candidate>, limit: Option<(LimitKind, i64)>) -> Vec<C
     }
 }
 
-/// 条件に合うアイテム（ゴミ箱以外）を、プレイリストの並び順で。`exclude` に入っているものは除く。
+/// 条件に合うアイテム（ゴミ箱以外）を、プレイリストの並び順で。`exclude` に入っているものと、再生しない種類
+/// （フォント・3D）は除く（件数の上限をフォントが食わないよう、上限を取る前に除く）。
 fn item_candidates(
     conn: &Connection,
     expr: &Expr,
@@ -117,19 +119,14 @@ fn item_candidates(
     Ok(ids
         .into_iter()
         .filter_map(|id| {
-            let info = snap.items.get(&id)?;
-            let duration_ms = if info.kind == "image" {
-                playlist.image_duration_ms
-            } else {
-                info.duration_ms.unwrap_or(0)
-            };
+            let info = snap.items.get(&id).filter(|i| i.kind.is_playable())?;
             Some(Candidate {
                 target: EntryTarget::Item(id),
                 name: info.title.clone(),
-                kind: kind_code(&info.kind),
+                kind: kind_code(info.kind),
                 rating: info.rating,
                 last_played_at: info.last_played_at,
-                duration_ms,
+                duration_ms: member_duration_ms(info, playlist.image_duration_ms),
                 created_at: info.imported_at,
                 count: 1,
             })
@@ -138,6 +135,8 @@ fn item_candidates(
 }
 
 /// 条件に合うユニット（と、`include_loose_items` ならどのユニットにも属さないアイテム）。
+/// ユニットは再生できるメンバー（フォント・3D を除いたもの）だけで判定・集計し、それが空のユニットは候補にしない
+/// （`種類=画像`・件数・代表種類にフォント・3D を数えない。M11 の決定 11）。
 fn unit_candidates(
     conn: &Connection,
     expr: &Expr,
@@ -160,8 +159,9 @@ fn unit_candidates(
     let mut in_units: HashSet<i64> = HashSet::new();
     let mut out = Vec::new();
     for (id, info) in infos {
-        let members = resolve_members(&info.def, &snap);
+        let mut members = resolve_members(&info.def, &snap);
         in_units.extend(members.iter().copied());
+        members.retain(|m| snap.is_playable(*m));
         if members.is_empty() {
             continue;
         }
@@ -175,7 +175,7 @@ fn unit_candidates(
         let facts = UnitFacts {
             own_tags: own_tag_ids(conn, id)?.into_iter().collect(),
             member_tags,
-            kinds: stats.kinds.iter().map(|k| (*k).to_string()).collect(),
+            kinds: stats.kinds.iter().copied().collect(),
             rating: stats.rating,
             duration_ms: stats.duration_ms,
             play_count: info.play_count,
@@ -197,7 +197,7 @@ fn unit_candidates(
                 members
                     .iter()
                     .filter_map(|m| snap.items.get(m))
-                    .map(|m| m.kind.as_str()),
+                    .map(|m| m.kind),
             ),
             rating: stats.rating,
             last_played_at: info.last_played_at,

@@ -255,6 +255,9 @@ export const events = {
 	jobProgress: makeEvent<JobProgress>("job://progress"),
 };
 
+/* Constants */
+export const ITEM_KINDS = [{"hasDuration":false,"kind":"image","needsProxy":false,"playable":true},{"hasDuration":true,"kind":"video","needsProxy":true,"playable":true},{"hasDuration":true,"kind":"audio","needsProxy":true,"playable":true},{"hasDuration":false,"kind":"font","needsProxy":false,"playable":false},{"hasDuration":false,"kind":"model","needsProxy":false,"playable":false}] as const;
+
 /* Types */
 /**  追加するもの。 */
 export type AddSourceDto = { kind: "item"; id: number } | { kind: "unit"; id: number } | { kind: "folder"; id: number };
@@ -362,7 +365,7 @@ export type CookieSourceDto = "none" | "firefox" | "safari" | "chrome";
 export type CoverDto = {
 	itemId: number,
 	hash: string,
-	kind: string,
+	kind: ItemKindDto,
 	thumbState: string,
 	width: number | null,
 	height: number | null,
@@ -475,7 +478,8 @@ export type EntryRowDto = {
 	name: string,
 	itemCount: number,
 	durationMs: number,
-	kinds: string[],
+	/**  メンバーの種類（`ITEM_KINDS` の順。フォント・3D も出す）。 */
+	kinds: ItemKindDto[],
 	/**  表紙にするアイテム（先頭のメンバー）。 */
 	coverItemId: number | null,
 	imageDurationMs: number | null,
@@ -564,6 +568,8 @@ export type ImportPreviewDto = {
 	images: number,
 	videos: number,
 	audios: number,
+	fonts: number,
+	models: number,
 	totalBytes: number,
 	duplicates: number,
 	skipped: number,
@@ -579,9 +585,15 @@ export type ImportResultDto = {
 	total: number,
 	added: number,
 	duplicates: number,
+	/**  対応していない形式・空のファイルの数（`rejected` を含む）。 */
 	skipped: number,
 	failed: number,
 	failures: ImportFailureDto[],
+	/**
+	 *  拡張子は対応しているが中身が違うので取り込まなかったもの（Aseprite でない `.ase` など）と理由。
+	 *  M11 より前の結果にはない。
+	 */
+	rejected?: ImportFailureDto[],
 };
 
 /**  起動時の整合性チェックの結果。 */
@@ -608,6 +620,19 @@ export type ItemDetailDto = {
 	units: UnitRefDto[],
 };
 
+export type ItemKindDto = "image" | "video" | "audio" | "font" | "model";
+
+/**  種類の表の 1 行（bindings の定数 `ITEM_KINDS`。フロントの種類の型と述語はこの表から作る）。 */
+export type ItemKindInfoDto = {
+	kind: ItemKindDto,
+	/**  再生のキュー・スマートの候補に入るか（画像・動画・音楽。フォント・3D は入らない）。 */
+	playable: boolean,
+	/**  再生用プロキシの対象か（動画・音楽）。 */
+	needsProxy: boolean,
+	/**  長さを持つか（動画・音楽）。 */
+	hasDuration: boolean,
+};
+
 /**  アイテムの変更（省略した項目は変えない。`note` の空文字はメモを消す）。 */
 export type ItemPatchDto = {
 	title?: string | null,
@@ -627,8 +652,7 @@ export type ItemSummaryDto = {
 	/**  BLAKE3 の 16 進（`kura://localhost/thumb/{hash}/s` などに使う）。 */
 	hash: string,
 	ext: string,
-	/**  `image` / `video` / `audio`。 */
-	kind: string,
+	kind: ItemKindDto,
 	width: number | null,
 	height: number | null,
 	durationMs: number | null,
@@ -689,6 +713,8 @@ export type KindCountsDto = {
 	image: number,
 	video: number,
 	audio: number,
+	font: number,
+	model: number,
 	total: number,
 };
 
@@ -847,6 +873,9 @@ export type PlaylistContentsDto = {
 	images: number,
 	videos: number,
 	audios: number,
+	/**  フォント・3D（一覧には出すが、キューには入らない）。 */
+	fonts: number,
+	models: number,
 };
 
 /**  プレイリストの設定。 */
@@ -1166,8 +1195,8 @@ export type UnitSummaryDto = {
 	count: number,
 	/**  音楽・動画は長さ、画像は表示時間の合計（ミリ秒）。 */
 	durationMs: number,
-	/**  メンバーの種類（`image` / `video` / `audio`）。 */
-	kinds: string[],
+	/**  メンバーの種類（`ITEM_KINDS` の順）。 */
+	kinds: ItemKindDto[],
 	/**  集計した評価（ユニットの評価、なければメンバーの平均）。 */
 	rating: number,
 	/**  ユニット自体の評価（0 は未評価）。 */

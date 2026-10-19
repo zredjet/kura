@@ -1,6 +1,8 @@
 //! 形式の表（docs/editing.md §9.2）。拡張子 → items.kind → 値の型 → 保存できるメタデータを 1 か所で決める。
 //!
-//! M11 で取り込みの判定（kura-core の `import::kind`）もこの表を見る。今の kura-core の拡張子・MIME と食い違わないこと。
+//! 取り込みの判定（kura-core の `import::kind` の `classify`・`mime_for`・`format_id`）と kura:// の MIME もこの表から
+//! 作る（M11）。行を足すと取り込める形式が増える。照合のテストは kura-core の
+//! `classify_and_mime_follow_the_engine_format_table`。
 
 use serde::Serialize;
 
@@ -384,6 +386,15 @@ pub const FORMATS: &[FormatDesc] = &[
         decodes_to: &[],
         caps: NONE,
     },
+    // TrueType・OpenType のコレクション（複数の書体を 1 つのファイルに持つ）
+    FormatDesc {
+        id: "ttc",
+        exts: &["ttc"],
+        mime: "font/collection",
+        item_kind: ItemKind::Font,
+        decodes_to: &[],
+        caps: NONE,
+    },
     FormatDesc {
         id: "woff",
         exts: &["woff"],
@@ -483,43 +494,40 @@ mod tests {
         );
     }
 
-    /// 今の kura-core の取り込みの拡張子（import::kind の classify・mime_for）と食い違わない。
+    /// 拡張子は大文字・小文字を問わずに引く（取り込みの表との照合は kura-core の
+    /// `classify_and_mime_follow_the_engine_format_table`）。
     #[test]
-    fn matches_the_current_import_table() {
-        let current: [(&str, ItemKind, &str); 26] = [
-            ("jpg", ItemKind::Image, "image/jpeg"),
-            ("jpeg", ItemKind::Image, "image/jpeg"),
-            ("png", ItemKind::Image, "image/png"),
-            ("gif", ItemKind::Image, "image/gif"),
-            ("webp", ItemKind::Image, "image/webp"),
-            ("heic", ItemKind::Image, "image/heic"),
-            ("heif", ItemKind::Image, "image/heif"),
-            ("avif", ItemKind::Image, "image/avif"),
-            ("tif", ItemKind::Image, "image/tiff"),
-            ("tiff", ItemKind::Image, "image/tiff"),
-            ("bmp", ItemKind::Image, "image/bmp"),
-            ("mp4", ItemKind::Video, "video/mp4"),
-            ("m4v", ItemKind::Video, "video/x-m4v"),
-            ("mov", ItemKind::Video, "video/quicktime"),
-            ("webm", ItemKind::Video, "video/webm"),
-            ("mkv", ItemKind::Video, "video/x-matroska"),
-            ("avi", ItemKind::Video, "video/x-msvideo"),
-            ("mp3", ItemKind::Audio, "audio/mpeg"),
-            ("m4a", ItemKind::Audio, "audio/mp4"),
-            ("aac", ItemKind::Audio, "audio/aac"),
-            ("flac", ItemKind::Audio, "audio/flac"),
-            ("wav", ItemKind::Audio, "audio/wav"),
-            ("aif", ItemKind::Audio, "audio/aiff"),
-            ("aiff", ItemKind::Audio, "audio/aiff"),
-            ("ogg", ItemKind::Audio, "audio/ogg"),
-            ("opus", ItemKind::Audio, "audio/ogg"),
-        ];
-        for (ext, kind, mime) in current {
-            let f = format_by_ext(ext).unwrap_or_else(|| panic!("{ext} がない"));
-            assert_eq!((f.item_kind, f.mime), (kind, mime), "{ext}");
-        }
+    fn looks_up_extensions_case_insensitively() {
         assert_eq!(format_by_ext("PNG").map(|f| f.id), Some("png"));
         assert_eq!(format_by_ext("ase").map(|f| f.id), Some("aseprite"));
+        assert_eq!(format_by_ext("TTC").map(|f| f.id), Some("ttc"));
         assert!(format_by_ext("txt").is_none());
+    }
+
+    /// フォント・3D の行は取り込みと配信のためだけにあり、値に読まない（編集しない。デコーダを付けない）。
+    #[test]
+    fn font_and_model_rows_decode_to_nothing() {
+        let rows: Vec<(&str, ItemKind)> = FORMATS
+            .iter()
+            .filter(|f| matches!(f.item_kind, ItemKind::Font | ItemKind::Model))
+            .map(|f| (f.id, f.item_kind))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("ttf", ItemKind::Font),
+                ("otf", ItemKind::Font),
+                ("ttc", ItemKind::Font),
+                ("woff", ItemKind::Font),
+                ("woff2", ItemKind::Font),
+                ("glb", ItemKind::Model),
+            ]
+        );
+        for (id, _) in rows {
+            assert!(
+                format_by_id(id).is_some_and(|f| f.decodes_to.is_empty()),
+                "{id}"
+            );
+        }
     }
 }

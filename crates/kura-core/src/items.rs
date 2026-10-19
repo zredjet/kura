@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
+use crate::import::MediaKind;
 use crate::library::hex;
 use crate::query::{DbResolver, Expr, QueryContext, compile};
 use crate::text::{natural_cmp, nfc};
@@ -425,29 +426,13 @@ fn unit_rows(conn: &Connection, members: &[i64]) -> Result<Vec<ListRow>> {
 }
 
 /// 種類ごとの件数（⌘K パレットの「一致 186 項目 — 画像 142 · 動画 44」）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KindCounts {
-    pub image: i64,
-    pub video: i64,
-    pub audio: i64,
-}
+pub use crate::import::KindCounts;
 
-impl KindCounts {
-    /// 合計。
-    pub fn total(&self) -> i64 {
-        self.image + self.video + self.audio
-    }
-}
-
-/// 一覧と同じ条件で、種類ごとに数える。
+/// 一覧と同じ条件で、種類ごとに数える（フォント・3D も分けて数える）。
 pub fn count_kinds(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> Result<KindCounts> {
     let scope = where_clause(conn, query, ctx)?;
     let mut counts = KindCounts::default();
-    let mut add = |kind: &str, n: i64| match kind {
-        "image" => counts.image += n,
-        "video" => counts.video += n,
-        _ => counts.audio += n,
-    };
+    let mut add = |kind: MediaKind, n: i64| counts.add(kind, u64::try_from(n).unwrap_or(0));
     if let ItemView::Unit { id } = query.view {
         let members: HashSet<i64> = unit::members(conn, id)?.into_iter().collect();
         let mut stmt = conn.prepare(&format!(
@@ -455,12 +440,12 @@ pub fn count_kinds(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> 
             scope.sql
         ))?;
         let rows = stmt.query_map(params_from_iter(scope.params.iter()), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, MediaKind>(1)?))
         })?;
         for row in rows {
             let (id, kind) = row?;
             if members.contains(&id) {
-                add(&kind, 1);
+                add(kind, 1);
             }
         }
         return Ok(counts);
@@ -470,11 +455,11 @@ pub fn count_kinds(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> 
         scope.sql
     ))?;
     let rows = stmt.query_map(params_from_iter(scope.params.iter()), |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        Ok((r.get::<_, MediaKind>(0)?, r.get::<_, i64>(1)?))
     })?;
     for row in rows {
         let (kind, n) = row?;
-        add(&kind, n);
+        add(kind, n);
     }
     Ok(counts)
 }
@@ -576,7 +561,7 @@ pub struct ItemSummary {
     pub id: i64,
     pub hash: String,
     pub ext: String,
-    pub kind: String,
+    pub kind: MediaKind,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -1603,5 +1588,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!((counts.image, counts.video, counts.audio), (1, 0, 1));
+    }
+
+    /// フォント・3D を音楽に数えない（`_ =>` の枝で音楽に落ちていた退行を防ぐ）。
+    #[test]
+    fn kind_counts_include_font_and_model() {
+        let conn = library();
+        conn.execute("UPDATE items SET kind = 'font' WHERE id IN (2, 3)", [])
+            .unwrap();
+        conn.execute("UPDATE items SET kind = 'model' WHERE id = 6", [])
+            .unwrap();
+        let query = ItemQuery::default();
+        let counts = count_kinds(&conn, &query, &ctx(0)).unwrap();
+        let c = counts;
+        assert_eq!(
+            (c.image, c.video, c.audio, c.font, c.model),
+            (3, 0, 0, 2, 1)
+        );
+        assert_eq!(counts.total(), 6);
+        let unit = crate::unit::create_set(&conn, "u", &[2, 6, 1], 0).unwrap();
+        let counts = count_kinds(
+            &conn,
+            &ItemQuery {
+                view: ItemView::Unit { id: unit },
+                ..ItemQuery::default()
+            },
+            &ctx(0),
+        )
+        .unwrap();
+        let c = counts;
+        assert_eq!(
+            (c.image, c.video, c.audio, c.font, c.model),
+            (1, 0, 0, 1, 1)
+        );
+        // 検索の語で種類を選べる
+        let only = |text: &str| {
+            count_kinds(
+                &conn,
+                &ItemQuery {
+                    filter: Some(crate::query::parse(text).unwrap().expr),
+                    ..ItemQuery::default()
+                },
+                &ctx(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(only("種類:フォント").total(), 2);
+        assert_eq!(only("種類:3D").model, 1);
+        assert_eq!(only("-種類:フォント,3D").total(), 3);
     }
 }

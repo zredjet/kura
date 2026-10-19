@@ -75,6 +75,8 @@ pub struct ImportResult {
     pub failed: u64,
     /// 失敗の明細（上限あり）。
     pub failures: Vec<ImportFailure>,
+    /// 拡張子は対応しているが中身が違うので取り込まなかったもの（`.ase` の色見本など。`skipped` に含む）と理由（上限あり）。
+    pub rejected: Vec<ImportFailure>,
     /// 作ったユニット（末端フォルダ → unit_id）。再開のときに同じユニットへ足すため。
     pub units: BTreeMap<String, i64>,
 }
@@ -148,6 +150,14 @@ impl JobHandler for ImportHandler {
         let total = files.len();
         state.total = total as u64;
         state.skipped = scan.skipped;
+        state.rejected.clear();
+        for (path, reason) in scan.rejected.iter().take(MAX_FAILURE_DETAILS) {
+            ctx.log(&format!("取り込みません: {} ({reason})", path.display()));
+            state.rejected.push(ImportFailure {
+                path: path.to_string_lossy().into_owned(),
+                reason: reason.clone(),
+            });
+        }
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads)
@@ -1095,6 +1105,67 @@ mod tests {
         assert_eq!(
             env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'thumbnail' AND state = 'queued'"),
             1
+        );
+    }
+
+    /// フォント・3D・Aseprite を取り込み、プロキシ・解析の対象にしない。Aseprite でない `.ase` は取り込まず、
+    /// 理由を取り込みの結果に出す。
+    #[test]
+    fn imports_fonts_and_models_and_reports_rejected_ase() {
+        let env = Env::new();
+        let src = env.src();
+        write(&src.join("a.otf"), b"OTTO font");
+        write(&src.join("b.glb"), b"glTF model");
+        write(&src.join("c.ase"), &[0x80, 0, 0, 0, 0xE0, 0xA5, 1, 0]);
+        write(&src.join("colors.ase"), b"ASEF\x00\x01\x00\x00");
+        let jobs = env.manager(ImportHandler::new(Arc::new(
+            crate::media::fake::FakeBackend,
+        )));
+        let id = start_import(
+            &jobs,
+            &ImportInput {
+                paths: vec![src.clone()],
+                options: ImportOptions::default(),
+            },
+        )
+        .unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(WAIT));
+        let record = jobs.get(id).unwrap();
+        assert_eq!(record.state, JobState::Done);
+        let result: ImportResult =
+            serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
+        assert_eq!((result.added, result.skipped, result.failed), (3, 1, 0));
+        assert_eq!(result.rejected.len(), 1);
+        assert_eq!(
+            result.rejected[0].path,
+            src.join("colors.ase").to_string_lossy()
+        );
+        assert!(result.rejected[0].reason.contains("Aseprite"));
+
+        let rows: Vec<(String, String, String, String)> = env
+            .library
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT ext, kind, proxy_state, analysis_state FROM items ORDER BY ext",
+                )?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            })
+            .unwrap();
+        let rows: Vec<(&str, &str, &str, &str)> = rows
+            .iter()
+            .map(|(a, b, c, d)| (a.as_str(), b.as_str(), c.as_str(), d.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("ase", "image", "not_needed", "pending"),
+                ("glb", "model", "not_needed", "not_needed"),
+                ("otf", "font", "not_needed", "not_needed"),
+            ]
         );
     }
 

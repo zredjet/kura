@@ -241,21 +241,36 @@ fn parse_int(value: &str) -> Option<i64> {
     value.trim().parse().ok()
 }
 
+/// 種類の値の語（日本語の語・英語の名前）。候補（suggest）もこの順に出す。
+pub const KIND_WORDS: [(&str, KindValue); 5] = [
+    ("画像", KindValue::Image),
+    ("動画", KindValue::Video),
+    ("音楽", KindValue::Audio),
+    ("フォント", KindValue::Font),
+    ("3D", KindValue::Model),
+];
+
+/// 種類の語を読む：日本語の語（`3D` は大文字・小文字を問わない）か、英語の名前（`image`・`font`・`model` など）。
+fn parse_kind(word: &str) -> Option<KindValue> {
+    let lower = word.to_lowercase();
+    KIND_WORDS
+        .iter()
+        .find(|(ja, _)| ja.to_lowercase() == lower)
+        .map(|(_, kind)| *kind)
+        .or_else(|| KindValue::parse(&lower))
+}
+
 fn parse_kinds(value: &str) -> Result<Vec<KindValue>, String> {
+    const MESSAGE: &str = "種類は 画像・動画・音楽・フォント・3D のどれかです（「,」で複数）";
     let mut kinds = Vec::new();
     for part in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let kind = match part.to_lowercase().as_str() {
-            "画像" | "image" => KindValue::Image,
-            "動画" | "video" => KindValue::Video,
-            "音楽" | "audio" => KindValue::Audio,
-            _ => return Err("種類は 画像・動画・音楽 のどれかです（「,」で複数）".into()),
-        };
+        let kind = parse_kind(part).ok_or(MESSAGE)?;
         if !kinds.contains(&kind) {
             kinds.push(kind);
         }
     }
     if kinds.is_empty() {
-        return Err("種類は 画像・動画・音楽 のどれかです（「,」で複数）".into());
+        return Err(MESSAGE.into());
     }
     Ok(kinds)
 }

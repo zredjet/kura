@@ -9,6 +9,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use super::names::{numbered_dir, numbered_file, safe_name};
+use crate::import::MediaKind;
 use crate::items::detail;
 use crate::jobs::{
     Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, save_partial,
@@ -342,7 +343,7 @@ pub(super) struct ManifestRecord {
     pub file: String,
     pub original_name: String,
     pub title: String,
-    pub kind: String,
+    pub kind: MediaKind,
     pub hash: String,
     pub size_bytes: i64,
     pub width: Option<i64>,

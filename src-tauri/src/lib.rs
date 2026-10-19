@@ -161,6 +161,9 @@ fn specta_builder() -> Builder<tauri::Wry> {
         // ジョブの結果（resultJson）を読むための型
         .typ::<dto::ImportResultDto>()
         .typ::<dto::ExportResultDto>()
+        // 種類の表（順・キューに入るか・プロキシ・長さ）。フロントの src/ipc/kinds.ts はこれを読む
+        .typ::<dto::ItemKindInfoDto>()
+        .constant("ITEM_KINDS", dto::item_kinds())
         // ID・ミリ秒・バイト数は 2^53 を超えないので number として扱う
         .dangerously_cast_bigints_to_number()
 }

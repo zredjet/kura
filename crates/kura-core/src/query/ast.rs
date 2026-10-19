@@ -84,25 +84,8 @@ impl Op {
     }
 }
 
-/// アイテムの種類。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum KindValue {
-    Image,
-    Video,
-    Audio,
-}
-
-impl KindValue {
-    /// DB の `items.kind` の値。
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Image => "image",
-            Self::Video => "video",
-            Self::Audio => "audio",
-        }
-    }
-}
+/// アイテムの種類（`種類:`・`type:` の値）。種類の表は 1 つ（`import::MediaKind`）で、JSON の名前は `items.kind` と同じ。
+pub use crate::import::MediaKind as KindValue;
 
 /// 年月日（端末の時差での日付）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

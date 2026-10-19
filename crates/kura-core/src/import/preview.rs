@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
-use super::kind::MediaKind;
+use super::kind::KindCounts;
 use super::place::partial_hash;
 use super::scan::{ScanRoot, ScannedFile, scan};
 use crate::Result;
@@ -16,9 +16,8 @@ use crate::library::Library;
 pub struct ImportPreview {
     /// 取り込む候補の数。
     pub total: u64,
-    pub images: u64,
-    pub videos: u64,
-    pub audios: u64,
+    /// 種類ごとの数。
+    pub kinds: KindCounts,
     pub total_bytes: u64,
     /// 内容が同一のものがすでにある（または同じ取り込みの中で重なる）見込みの数。
     pub duplicates: u64,
@@ -44,11 +43,7 @@ pub fn preview(library: &Library, paths: &[PathBuf]) -> Result<ImportPreview> {
         ..ImportPreview::default()
     };
     for file in &scan.files {
-        match file.kind {
-            MediaKind::Image => preview.images += 1,
-            MediaKind::Video => preview.videos += 1,
-            MediaKind::Audio => preview.audios += 1,
-        }
+        preview.kinds.add(file.kind, 1);
         preview.total_bytes += file.size;
     }
     preview.sample_dirs = scan
@@ -108,6 +103,7 @@ pub fn estimate_duplicates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::import::MediaKind;
     use crate::import::place::hash_file;
     use crate::import::store::{NewItem, insert_item};
 
@@ -161,13 +157,20 @@ mod tests {
         write(&src.join("鎌倉/clip.mov"), b"movie!");
         write(&src.join("song.flac"), b"flac");
         write(&src.join("notes.txt"), b"skip");
+        write(&src.join("font.woff2"), b"wOF2");
+        write(&src.join("ship.glb"), b"glTF");
+        write(&src.join("swatch.ase"), b"ASEF"); // Aseprite でない .ase は対象外
 
         let p = preview(&library, &[src]).unwrap();
-        assert_eq!(p.total, 6);
-        assert_eq!((p.images, p.videos, p.audios), (4, 1, 1));
-        assert_eq!(p.total_bytes, 18 + 4 + 4 + 4 + 6 + 4);
+        assert_eq!(p.total, 8);
+        let k = p.kinds;
+        assert_eq!(
+            (k.image, k.video, k.audio, k.font, k.model),
+            (4, 1, 1, 1, 1)
+        );
+        assert_eq!(p.total_bytes, 18 + 4 + 4 + 4 + 6 + 4 + 4 + 4);
         assert_eq!(p.duplicates, 2);
-        assert_eq!(p.skipped, 1);
+        assert_eq!(p.skipped, 2);
         assert_eq!(p.subfolders, 1);
         assert_eq!(p.roots.len(), 1);
         assert_eq!(
