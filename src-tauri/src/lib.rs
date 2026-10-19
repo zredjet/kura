@@ -5,6 +5,7 @@ mod config;
 mod dto;
 mod error;
 mod logging;
+mod navigation;
 mod protocol;
 mod shortcut;
 mod state;
@@ -205,6 +206,18 @@ pub fn run() -> ExitCode {
 
     let typed = builder.invoke_handler();
     let raw = raw_handler();
+    // kura:// の ACAO と main の移動の制限に使う、アプリのページの origin（docs/architecture.md §4.1・§11）
+    let origin = kura_core::serve::AppOrigin::new(
+        tauri::is_dev(),
+        context
+            .config()
+            .build
+            .dev_url
+            .as_ref()
+            .map(tauri::Url::as_str),
+    );
+    let main_origin = origin.clone();
+    tracing::debug!(origin = origin.as_str(), "アプリの origin");
     let app = tauri::Builder::<tauri::Wry>::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -215,10 +228,19 @@ pub fn run() -> ExitCode {
                 typed(invoke)
             }
         })
-        .register_asynchronous_uri_scheme_protocol("kura", |ctx, request, responder| {
+        .register_asynchronous_uri_scheme_protocol("kura", move |ctx, request, responder| {
+            // ラベル・Origin・メソッドの判定は、ファイルに触る前（スレッドを起こす前）に行う
+            let head = match protocol::gate(ctx.webview_label(), &request, &origin) {
+                protocol::Gate::Done(response) => {
+                    responder.respond(response);
+                    return;
+                }
+                protocol::Gate::Serve { head } => head,
+            };
             let app = ctx.app_handle().clone();
+            let origin = origin.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                responder.respond(protocol::respond(&app, &request));
+                responder.respond(protocol::respond(&app, &request, &origin, head));
             });
         })
         .setup(move |app| {
@@ -231,6 +253,9 @@ pub fn run() -> ExitCode {
             }
             // フルスクリーンを抜けたあとも、キー（シアターの esc など）が WebView に届くように（ADR-128）
             kura_mac::keep_webview_focus_on_fullscreen();
+            // main の窓は tauri.conf.json では作らず（create: false）、移動の制限を付けてここで作る（§11）。
+            // 状態を manage したあとなので、ページの最初の invoke から AppState がある
+            navigation::create_main_window(app, main_origin)?;
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "Kura を起動しました");
             Ok(())
         })

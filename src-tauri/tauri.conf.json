@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Kura",
         "width": 1440,
         "height": 960,
@@ -27,7 +28,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' kura:; media-src 'self' kura:; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' kura:; media-src 'self' kura:; connect-src 'self' ipc: http://ipc.localhost kura:; font-src 'self' kura:; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-src 'none'"
     }
   },
   "bundle": {
