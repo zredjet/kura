@@ -15,6 +15,8 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{bad_param, exact_size};
+use crate::render::preview::{Preview, image_bounds, scale_point};
+use crate::render::region::{Area, FrameTiles, Reach, splice_value};
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{PixelFormat, Value};
@@ -147,5 +149,56 @@ impl Op for SetPivot {
                 }],
             },
         ]
+    }
+
+    // 段 10：画素は入力のまま（範囲は同じ位置。描くタイルは入力のタイルを共有する）
+    const REGION: bool = true;
+
+    fn reach(_p: &SetPivotParams, _inputs: &[Shape]) -> Reach {
+        Reach::Same
+    }
+
+    fn param_change(_old: &SetPivotParams, _new: &SetPivotParams, _inputs: &[Shape]) -> Area {
+        // 画素は変わらない（メタデータだけ）
+        Area::Empty
+    }
+
+    fn effect(_p: &SetPivotParams, _inputs: &[Shape]) -> Area {
+        Area::Empty
+    }
+
+    fn apply_region(
+        p: &SetPivotParams,
+        inputs: &[&Value],
+        tiles: &FrameTiles,
+        base: Option<&Value>,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        // 画素を読まない（メタデータ・パレットだけを変える）ので、描くタイルを入力から共有した値に `apply` を当てる
+        Some(splice_value(inputs[0], tiles, base).and_then(|v| Self::apply(p, &[&v], cx)))
+    }
+
+    // 段 10：プレビューの段。画素は描かず、ピボットを段の座標で書く（段の入力に収める。docs/editing.md §12.7）
+    fn preview(_p: &SetPivotParams) -> Preview {
+        Preview::Skip
+    }
+
+    fn preview_params(
+        p: &SetPivotParams,
+        level: u8,
+        inputs: &[Shape],
+        _full: &[Shape],
+    ) -> SetPivotParams {
+        let pivot = p.pivot.map(|pt| {
+            let q = scale_point(pt, level);
+            match inputs.first().and_then(image_bounds) {
+                Some((w, h)) => IPoint {
+                    x: q.x.clamp(0, i64::from(w)),
+                    y: q.y.clamp(0, i64::from(h)),
+                },
+                None => q,
+            }
+        });
+        SetPivotParams { pivot }
     }
 }

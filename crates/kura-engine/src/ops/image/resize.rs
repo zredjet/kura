@@ -18,16 +18,21 @@ use crate::error::IssueCode;
 use crate::error::{EngineError, Issues};
 pub use crate::geom::Length;
 use crate::geom::{Ratio, Size, div_round_half_even};
-use crate::imaging::resample::{Filter, resize_nearest, resize_smooth, smooth_format};
+use crate::imaging::resample::{
+    Filter, resize_nearest, resize_nearest_picked, resize_smooth, resize_smooth_picked,
+    smooth_format, smooth_work,
+};
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::op::{
     Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
-    ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
+    ParamKind, ParamSchema, PortSpec, Signature, Unit, Work, expect_inputs, spec,
 };
 use crate::ops::util::{bad_param, exact_size, image_of, param_issue};
+use crate::render::preview::{Preview, level_size, scale_len};
+use crate::render::region::{FrameTiles, Reach, Tiles, base_image, exact_image_size, pick_of};
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::InputGen;
-use crate::value::{Image, PixelFormat, Value};
+use crate::value::{Image, PixelFormat, Raster, Value};
 
 /// フィルタ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +163,84 @@ fn out_dim(p: &ResizeParams, w: Dim, h: Dim, max_dim: u64) -> (Dim, Dim) {
     (axis(p.width, w, p.height), axis(p.height, h, p.width))
 }
 
+/// 全体の描画と範囲の描画（`region` のタイルだけ）の本体。値・警告・写し方は同じ。
+fn resize_value(
+    p: &ResizeParams,
+    inputs: &[&Value],
+    cx: &mut ApplyCx<'_>,
+    region: Option<(&FrameTiles, Option<&Value>)>,
+) -> Result<Applied, EngineError> {
+    cx.check()?;
+    let img = image_of(inputs[0], Resize::ID)?;
+    let (iw, ih) = (img.px.width(), img.px.height());
+    let (ow, oh) = out_size(p, u64::from(iw), u64::from(ih));
+    if ow > cx.limits.max_dim || oh > cx.limits.max_dim {
+        return Err(EngineError::Limit("出力が大きすぎます".into()));
+    }
+    let (ow, oh) = (
+        u32::try_from(ow).map_err(|_| EngineError::Limit("出力が大きすぎます".into()))?,
+        u32::try_from(oh).map_err(|_| EngineError::Limit("出力が大きすぎます".into()))?,
+    );
+    let region: Option<(Tiles, Option<&Raster>)> = match region {
+        Some((tiles, base)) => Some((pick_of(tiles, 0, ow, oh), base_image(base)?)),
+        None => None,
+    };
+    let px = match (p.filter, &region) {
+        (ResizeFilter::Nearest, None) => resize_nearest(&img.px, ow, oh, cx.mon)?,
+        (ResizeFilter::Nearest, Some((pick, base))) => {
+            resize_nearest_picked(&img.px, ow, oh, cx.mon, pick, *base)?
+        }
+        // 大きさが変わらないときは混ぜずにそのまま通す（α = 0 の画素の色も保つ。Indexed8 は推論どおり Rgba8 に広げる）
+        _ if (ow, oh) == (iw, ih) => {
+            let fmt = smooth_format(img.px.format());
+            match &region {
+                None => {
+                    crate::ops::image::convert::convert_raster(&img.px, fmt, [0, 0, 0], cx.mon)?
+                }
+                Some((pick, base)) => crate::ops::image::convert::convert_raster_picked(
+                    &img.px,
+                    fmt,
+                    [0, 0, 0],
+                    cx.mon,
+                    pick,
+                    *base,
+                )?,
+            }
+        }
+        (f, _) => {
+            // v1 は色の変換をしないので、sRGB でない ICC の画像は sRGB とみなして混ぜたことを知らせる（§5.2）
+            if img
+                .meta
+                .icc
+                .as_deref()
+                .is_some_and(|icc| !crate::imaging::icc::is_srgb(icc))
+            {
+                cx.warn(
+                    crate::error::Issue::warning(
+                        IssueCode::ColorSpaceAssumed,
+                        "sRGB でない色空間の画像を、sRGB とみなして混ぜました",
+                    )
+                    .param("filter"),
+                );
+            }
+            match &region {
+                None => resize_smooth(&img.px, ow, oh, f.imaging(), cx.mon)?,
+                Some((pick, base)) => {
+                    resize_smooth_picked(&img.px, ow, oh, f.imaging(), cx.mon, pick, *base)?
+                }
+            }
+        }
+    };
+    Ok(Applied {
+        value: Value::Image(Arc::new(Image {
+            px,
+            meta: img.meta.clone(),
+        })),
+        space: Some(space(iw, ih, ow, oh)),
+        time: None,
+    })
+}
+
 fn space(iw: u32, ih: u32, ow: u32, oh: u32) -> SpaceMap {
     SpaceMap::Scale {
         sx: Ratio { num: ow, den: iw },
@@ -226,51 +309,7 @@ impl Op for Resize {
         inputs: &[&Value],
         cx: &mut ApplyCx<'_>,
     ) -> Result<Applied, EngineError> {
-        cx.check()?;
-        let img = image_of(inputs[0], Self::ID)?;
-        let (iw, ih) = (img.px.width(), img.px.height());
-        let (ow, oh) = out_size(p, u64::from(iw), u64::from(ih));
-        if ow > cx.limits.max_dim || oh > cx.limits.max_dim {
-            return Err(EngineError::Limit("出力が大きすぎます".into()));
-        }
-        let (ow, oh) = (
-            u32::try_from(ow).map_err(|_| EngineError::Limit("出力が大きすぎます".into()))?,
-            u32::try_from(oh).map_err(|_| EngineError::Limit("出力が大きすぎます".into()))?,
-        );
-        let px = match p.filter {
-            ResizeFilter::Nearest => resize_nearest(&img.px, ow, oh, cx.mon)?,
-            // 大きさが変わらないときは混ぜずにそのまま通す（α = 0 の画素の色も保つ。Indexed8 は推論どおり Rgba8 に広げる）
-            _ if (ow, oh) == (iw, ih) => {
-                let fmt = smooth_format(img.px.format());
-                crate::ops::image::convert::convert_raster(&img.px, fmt, [0, 0, 0], cx.mon)?
-            }
-            f => {
-                // v1 は色の変換をしないので、sRGB でない ICC の画像は sRGB とみなして混ぜたことを知らせる（§5.2）
-                if img
-                    .meta
-                    .icc
-                    .as_deref()
-                    .is_some_and(|icc| !crate::imaging::icc::is_srgb(icc))
-                {
-                    cx.warn(
-                        crate::error::Issue::warning(
-                            IssueCode::ColorSpaceAssumed,
-                            "sRGB でない色空間の画像を、sRGB とみなして混ぜました",
-                        )
-                        .param("filter"),
-                    );
-                }
-                resize_smooth(&img.px, ow, oh, f.imaging(), cx.mon)?
-            }
-        };
-        Ok(Applied {
-            value: Value::Image(Arc::new(Image {
-                px,
-                meta: img.meta.clone(),
-            })),
-            space: Some(space(iw, ih, ow, oh)),
-            time: None,
-        })
+        resize_value(p, inputs, cx, None)
     }
 
     fn numeric_for(p: &ResizeParams) -> Numeric {
@@ -279,6 +318,36 @@ impl Op for Resize {
         } else {
             Numeric::Float
         }
+    }
+
+    fn work_bytes(p: &ResizeParams, inputs: &[Shape], out: &Shape) -> Work {
+        // 持ち上げたフレームの列は 1 フレームずつ順に当てるので、1 フレームぶん
+        let (Some(input), Some(out)) = (
+            inputs.first().and_then(|s| s.frame_image().or(Some(*s))),
+            out.frame_image().or(Some(*out)),
+        ) else {
+            return Work::ZERO;
+        };
+        let (Shape::Image { w: iw, h: ih, fmt }, Shape::Image { w: ow, h: oh, .. }) = (input, out)
+        else {
+            return Work::ZERO;
+        };
+        // 大きさが変わらない平滑なフィルタは、混ぜずに形式を写すだけ
+        if (iw.max(), ih.max()) == (ow.max(), oh.max())
+            && iw.exact().is_some()
+            && ih.exact().is_some()
+        {
+            return Work::ZERO;
+        }
+        let (shared, per_task) = smooth_work(
+            iw.max(),
+            ih.max(),
+            fmt.bytes_per_pixel() as u64,
+            ow.max(),
+            oh.max(),
+            p.filter.imaging(),
+        );
+        Work { shared, per_task }
     }
 
     fn examples() -> Vec<Example<ResizeParams>> {
@@ -361,6 +430,80 @@ impl Op for Resize {
                 },
             ),
         ]
+    }
+
+    // 段 10：範囲（最近傍の位置・平滑な重みの範囲の逆写し）と範囲の描画
+    const REGION: bool = true;
+
+    fn reach(p: &ResizeParams, inputs: &[Shape]) -> Reach {
+        let Some(in_size) = inputs.first().and_then(exact_image_size) else {
+            return Reach::Global;
+        };
+        let (ow, oh) = out_size(p, u64::from(in_size.w), u64::from(in_size.h));
+        let (Ok(w), Ok(h)) = (u32::try_from(ow), u32::try_from(oh)) else {
+            return Reach::Global;
+        };
+        let out_size = Size { w, h };
+        match p.filter {
+            // 大きさが変わらない平滑なフィルタは、画素ごとに形式を写すだけ
+            ResizeFilter::Box | ResizeFilter::Bilinear | ResizeFilter::Lanczos3
+                if out_size == in_size =>
+            {
+                Reach::Same
+            }
+            f => Reach::Resample {
+                filter: f.imaging(),
+                in_size,
+                out_size,
+            },
+        }
+    }
+
+    fn apply_region(
+        p: &ResizeParams,
+        inputs: &[&Value],
+        tiles: &FrameTiles,
+        base: Option<&Value>,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        Some(resize_value(p, inputs, cx, Some((tiles, base))))
+    }
+
+    // 段 10：プレビューの段。等倍の入力の大きさが決まっていれば、等倍の出力の大きさの ⌈n/2^k⌉ を画素で指す（比・自動の丸めが
+    // 段の入力の大きさの丸めで広がらないように）。決まっていなければ、画素の長さを ⌈n/2^k⌉ にし、比・自動はそのまま。
+    fn preview(_p: &ResizeParams) -> Preview {
+        Preview::Scaled
+    }
+
+    fn preview_params(
+        p: &ResizeParams,
+        level: u8,
+        _inputs: &[Shape],
+        full: &[Shape],
+    ) -> ResizeParams {
+        if let Some(Shape::Image {
+            w: Dim::Exact(iw),
+            h: Dim::Exact(ih),
+            ..
+        }) = full.first()
+        {
+            let (ow, oh) = out_size(p, *iw, *ih);
+            let px = |n: u64| Length::Px(u32::try_from(level_size(n, level)).unwrap_or(u32::MAX));
+            return ResizeParams {
+                width: px(ow),
+                height: px(oh),
+                filter: p.filter,
+            };
+        }
+        let len = |l: Length| match l {
+            Length::Px(n) => Length::Px(scale_len(n, level)),
+            other => other,
+        };
+        ResizeParams {
+            width: len(p.width),
+            height: len(p.height),
+            filter: p.filter,
+        }
     }
 }
 

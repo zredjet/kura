@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::audio::resample::{Filter, design, out_frames, table_len, taps};
+use crate::audio::resample::{Filter, design, out_frames, ratio, table_len, taps};
 use crate::audio::{AudioKernel, render_all};
 use crate::error::{EngineError, IssueCode, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
@@ -18,6 +18,7 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{audio_of, audio_shape, bad_param, param_issue};
+use crate::render::region::Reach;
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Audio, LoopRange, Value};
@@ -197,6 +198,10 @@ impl Op for Resample {
         )?))
     }
 
+    fn work_bytes(_p: &Self::Params, _inputs: &[Shape], out: &Shape) -> crate::op::Work {
+        crate::audio::render_all_work(out)
+    }
+
     fn audio_kernel(
         p: &ResampleParams,
         inputs: &[&Value],
@@ -242,6 +247,22 @@ impl Op for Resample {
                 }],
             },
         ]
+    }
+
+    // 段 10：範囲（多相 FIR の窓）
+    fn reach(p: &ResampleParams, inputs: &[Shape]) -> Reach {
+        let Some((from, _, _)) = inputs.first().and_then(audio_shape) else {
+            return Reach::Global;
+        };
+        if from == p.rate {
+            return Reach::SameTime;
+        }
+        let (l, m) = ratio(from, p.rate);
+        Reach::Rate {
+            l,
+            m,
+            h: taps(from, p.rate) / 2,
+        }
     }
 }
 

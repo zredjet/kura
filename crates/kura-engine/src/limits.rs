@@ -49,7 +49,7 @@ impl Limits {
     /// 形が上限に収まるか。収まらなければ理由を返す。
     pub fn check(&self, shape: &Shape) -> Result<(), String> {
         match shape {
-            Shape::Image { w, h, fmt } | Shape::Frames { w, h, fmt, .. } => {
+            Shape::Image { w, h, .. } | Shape::Frames { w, h, .. } => {
                 let (w, h) = (w.max(), h.max());
                 if w > self.max_dim || h > self.max_dim {
                     return Err(format!(
@@ -71,10 +71,7 @@ impl Limits {
                         self.max_frames
                     ));
                 }
-                let bytes = pixels
-                    .saturating_mul(fmt.bytes_per_pixel() as u64)
-                    .saturating_mul(frames);
-                if bytes > self.max_value_bytes {
+                if shape.value_bytes() > self.max_value_bytes {
                     return Err("値の大きさが上限を超えます".to_string());
                 }
                 Ok(())
@@ -100,10 +97,7 @@ impl Limits {
                 if frames > self.max_audio_frames {
                     return Err("音声が長すぎます".to_string());
                 }
-                let bytes = frames
-                    .saturating_mul(u64::from(*channels))
-                    .saturating_mul(4);
-                if bytes > self.max_value_bytes {
+                if shape.value_bytes() > self.max_value_bytes {
                     return Err("値の大きさが上限を超えます".to_string());
                 }
                 Ok(())

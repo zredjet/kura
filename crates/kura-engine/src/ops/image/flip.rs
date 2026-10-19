@@ -12,6 +12,8 @@ use crate::op::{
     Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
+use crate::render::preview::Preview;
+use crate::render::region::{FrameTiles, Reach, Tiles, base_image, exact_image_size, pick_of};
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Image, PixelFormat, Raster, Value};
@@ -64,8 +66,34 @@ fn space(axis: FlipAxis, w: u32, h: u32) -> SpaceMap {
 
 /// 反転した画素を作る（フレームの列からも使う）。
 pub fn flip_raster(px: &Raster, axis: FlipAxis, cx: &ApplyCx<'_>) -> Result<Raster, EngineError> {
+    px.derive(px.width(), px.height(), cx.mon, flip_tile(px, axis))
+}
+
+/// 反転した画素の、`pick` のタイルだけを描いたもの（段 10。範囲の描画。ほかは `base` のタイルか無効なタイル）。
+pub fn flip_raster_picked(
+    px: &Raster,
+    axis: FlipAxis,
+    cx: &ApplyCx<'_>,
+    pick: &Tiles,
+    base: Option<&Raster>,
+) -> Result<Raster, EngineError> {
+    px.derive_picked(
+        px.width(),
+        px.height(),
+        cx.mon,
+        pick,
+        base,
+        flip_tile(px, axis),
+    )
+}
+
+/// 出力のタイル 1 枚を描く閉包（全体の描画と範囲の描画が同じものを使う）。
+fn flip_tile(
+    px: &Raster,
+    axis: FlipAxis,
+) -> impl Fn(IRect, &mut [u8]) -> Result<(), EngineError> + Sync + Send + '_ {
     let (w, h, bpp) = (px.width(), px.height(), px.bpp());
-    px.derive(w, h, cx.mon, |t, out| {
+    move |t, out| {
         let src = match axis {
             FlipAxis::Horizontal => IRect::new(i64::from(w) - t.right(), t.y, t.w, t.h),
             FlipAxis::Vertical => IRect::new(t.x, i64::from(h) - t.bottom(), t.w, t.h),
@@ -94,7 +122,7 @@ pub fn flip_raster(px: &Raster, axis: FlipAxis, cx: &ApplyCx<'_>) -> Result<Rast
             }
         }
         Ok(())
-    })
+    }
 }
 
 impl Op for Flip {
@@ -206,6 +234,55 @@ impl Op for Flip {
                 }],
             },
         ]
+    }
+
+    // 段 10：範囲（鏡映の逆写し）と範囲の描画
+    const REGION: bool = true;
+
+    fn reach(p: &FlipParams, inputs: &[Shape]) -> Reach {
+        let Some(size) = inputs.first().and_then(exact_image_size) else {
+            return Reach::Global;
+        };
+        match space(p.axis, size.w, size.h) {
+            SpaceMap::Affine { m, out } => Reach::Affine {
+                m,
+                in_size: size,
+                out_size: out,
+            },
+            _ => Reach::Global,
+        }
+    }
+
+    fn apply_region(
+        p: &FlipParams,
+        inputs: &[&Value],
+        tiles: &FrameTiles,
+        base: Option<&Value>,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        Some((|| {
+            let Value::Image(img) = inputs[0] else {
+                return Err(EngineError::Internal(
+                    "image.flip の入力が画像ではありません".into(),
+                ));
+            };
+            let (w, h) = (img.px.width(), img.px.height());
+            let pick = pick_of(tiles, 0, w, h);
+            let px = flip_raster_picked(&img.px, p.axis, cx, &pick, base_image(base)?)?;
+            Ok(Applied {
+                value: Value::Image(Arc::new(Image {
+                    px,
+                    meta: img.meta.clone(),
+                })),
+                space: Some(space(p.axis, w, h)),
+                time: None,
+            })
+        })())
+    }
+
+    // 段 10：プレビューの段（引数はそのまま）
+    fn preview(_p: &FlipParams) -> Preview {
+        Preview::Scaled
     }
 }
 

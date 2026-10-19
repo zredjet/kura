@@ -14,6 +14,8 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::image_of;
+use crate::render::preview::Preview;
+use crate::render::region::{FrameTiles, Reach, Tiles, base_image, exact_image_size, pick_of};
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Image, PixelFormat, Raster, Value};
@@ -84,9 +86,29 @@ fn space(turn: Turn, w: u32, h: u32) -> SpaceMap {
 
 /// 回した画素（フレームの列からも使う）。
 pub fn rotate_raster(px: &Raster, turn: Turn, mon: &dyn Monitor) -> Result<Raster, EngineError> {
+    let (ow, oh) = out_size(turn, px.width(), px.height());
+    px.derive(ow, oh, mon, rotate_tile(px, turn))
+}
+
+/// 回した画素の、`pick` のタイルだけを描いたもの（段 10。範囲の描画。ほかは `base` のタイルか無効なタイル）。
+pub fn rotate_raster_picked(
+    px: &Raster,
+    turn: Turn,
+    mon: &dyn Monitor,
+    pick: &Tiles,
+    base: Option<&Raster>,
+) -> Result<Raster, EngineError> {
+    let (ow, oh) = out_size(turn, px.width(), px.height());
+    px.derive_picked(ow, oh, mon, pick, base, rotate_tile(px, turn))
+}
+
+/// 出力のタイル 1 枚を描く閉包（全体の描画と範囲の描画が同じものを使う）。
+fn rotate_tile(
+    px: &Raster,
+    turn: Turn,
+) -> impl Fn(IRect, &mut [u8]) -> Result<(), EngineError> + Sync + Send + '_ {
     let (w, h, bpp) = (px.width(), px.height(), px.bpp());
-    let (ow, oh) = out_size(turn, w, h);
-    px.derive(ow, oh, mon, |t, out| {
+    move |t, out| {
         // 出力の (x', y') の元の画素：cw は (y', h−1−x')、ccw は (w−1−y', x')、half は (w−1−x', h−1−y')
         let src = match turn {
             Turn::Cw => IRect::new(t.y, i64::from(h) - t.right(), t.h, t.w),
@@ -116,7 +138,7 @@ pub fn rotate_raster(px: &Raster, turn: Turn, mon: &dyn Monitor) -> Result<Raste
             }
         }
         Ok(())
-    })
+    }
 }
 
 impl Op for Rotate90 {
@@ -214,6 +236,53 @@ impl Op for Rotate90 {
                 }],
             },
         ]
+    }
+
+    // 段 10：範囲（回転の逆写し）と範囲の描画
+    const REGION: bool = true;
+
+    fn reach(p: &Rotate90Params, inputs: &[Shape]) -> Reach {
+        let Some(size) = inputs.first().and_then(exact_image_size) else {
+            return Reach::Global;
+        };
+        match space(p.turn, size.w, size.h) {
+            SpaceMap::Affine { m, out } => Reach::Affine {
+                m,
+                in_size: size,
+                out_size: out,
+            },
+            _ => Reach::Global,
+        }
+    }
+
+    fn apply_region(
+        p: &Rotate90Params,
+        inputs: &[&Value],
+        tiles: &FrameTiles,
+        base: Option<&Value>,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        Some((|| {
+            cx.check()?;
+            let img = image_of(inputs[0], Self::ID)?;
+            let (w, h) = (img.px.width(), img.px.height());
+            let (ow, oh) = out_size(p.turn, w, h);
+            let pick = pick_of(tiles, 0, ow, oh);
+            let px = rotate_raster_picked(&img.px, p.turn, cx.mon, &pick, base_image(base)?)?;
+            Ok(Applied {
+                value: Value::Image(Arc::new(Image {
+                    px,
+                    meta: img.meta.clone(),
+                })),
+                space: Some(space(p.turn, w, h)),
+                time: None,
+            })
+        })())
+    }
+
+    // 段 10：プレビューの段（引数はそのまま）
+    fn preview(_p: &Rotate90Params) -> Preview {
+        Preview::Scaled
     }
 }
 

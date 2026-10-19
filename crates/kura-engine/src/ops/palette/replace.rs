@@ -13,9 +13,11 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{bad_input, bad_param, map_rasters};
+use crate::render::preview::Preview;
+use crate::render::region::{FrameTiles, Reach, splice_value};
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
-use crate::value::{Palette, PixelFormat, Raster, Value};
+use crate::value::{Palette, PixelFormat, Value};
 
 /// 置き換える色 1 つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,19 +122,13 @@ impl Op for Replace {
     ) -> Result<Applied, EngineError> {
         cx.check()?;
         let mon = cx.mon;
+        // 画素の番号は変えないので、タイルを共有したままパレットだけを替える（値は行を作り直したものと同じ）
         let value = map_rasters(inputs[0], mon, |_, px| {
             let pal = px
                 .palette()
                 .ok_or_else(|| EngineError::Internal("パレットがありません".into()))?;
             let new = replaced(pal, &p.entries)?;
-            let rows = px.to_rows()?;
-            Raster::from_rows(
-                px.width(),
-                px.height(),
-                PixelFormat::Indexed8,
-                Some(new),
-                &rows,
-            )
+            px.with_palette(new, mon)
         })?;
         Ok(Applied::value(value))
     }
@@ -178,6 +174,29 @@ impl Op for Replace {
             },
         ]
     }
+
+    // 段 10：画素は入力のまま（範囲は同じ位置。描くタイルは入力のタイルを共有する）
+    const REGION: bool = true;
+
+    fn reach(_p: &ReplaceParams, _inputs: &[Shape]) -> Reach {
+        Reach::Same
+    }
+
+    fn apply_region(
+        p: &ReplaceParams,
+        inputs: &[&Value],
+        tiles: &FrameTiles,
+        base: Option<&Value>,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        // 画素を読まない（メタデータ・パレットだけを変える）ので、描くタイルを入力から共有した値に `apply` を当てる
+        Some(splice_value(inputs[0], tiles, base).and_then(|v| Self::apply(p, &[&v], cx)))
+    }
+
+    // 段 10：プレビューの段（引数はそのまま。入力は Indexed8 なので、段の計画はふつう段 0 に落ちる）
+    fn preview(_p: &ReplaceParams) -> Preview {
+        Preview::Scaled
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +231,57 @@ mod tests {
             panic!()
         };
         assert_eq!(img.px.palette().unwrap().colors[15], [0; 4]);
+    }
+
+    /// すべての例で、タイルを共有したまま替えた値が、行を作り直した旧い作り方と同じダイジェストになり、
+    /// 出力のタイルは入力と共有している。
+    #[test]
+    fn examples_share_tiles_and_keep_the_digest() {
+        use crate::value::Raster;
+        for ex in Replace::examples() {
+            let input = ex.inputs[0].generate().unwrap();
+            let out = crate::testing::render_with(
+                &crate::render::Engine::new().unwrap(),
+                &crate::testing::single_node_graph(
+                    Replace::ID,
+                    1,
+                    serde_json::to_value(&ex.params).unwrap(),
+                )
+                .unwrap(),
+                input.clone(),
+                crate::testing::source_of(&ex.inputs).unwrap(),
+                &crate::monitor::NoMonitor,
+            )
+            .unwrap();
+            let old = map_rasters(&input, &crate::monitor::NoMonitor, |_, px| {
+                let new = replaced(px.palette().unwrap(), &ex.params.entries)?;
+                Raster::from_rows(
+                    px.width(),
+                    px.height(),
+                    PixelFormat::Indexed8,
+                    Some(new),
+                    &px.to_rows()?,
+                )
+            })
+            .unwrap();
+            assert_eq!(out.digest().unwrap(), old.digest().unwrap(), "{}", ex.name);
+            let pairs: Vec<(Raster, Raster)> = match (&input, &out) {
+                (Value::Image(a), Value::Image(b)) => vec![(a.px.clone(), b.px.clone())],
+                (Value::Frames(a), Value::Frames(b)) => a
+                    .frames()
+                    .iter()
+                    .zip(b.frames())
+                    .map(|(x, y)| (x.px.clone(), y.px.clone()))
+                    .collect(),
+                _ => panic!("{}", ex.name),
+            };
+            for (a, b) in pairs {
+                for ty in 0..a.tiles_y() {
+                    for tx in 0..a.tiles_x() {
+                        assert!(b.shares_tile(&a, tx, ty), "{} ({tx}, {ty})", ex.name);
+                    }
+                }
+            }
+        }
     }
 }

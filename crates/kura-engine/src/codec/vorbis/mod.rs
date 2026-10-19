@@ -260,6 +260,11 @@ pub(crate) const ORDER: [&[usize]; 8] = [
     &[0, 2, 1, 6, 7, 4, 5, 3],
 ];
 
+/// 書き出しの作業領域のうち、値の大きさによらない分（§12 のメモリの予算。値は変えない）。段 10 の実測（44.1 kHz ステレオ
+/// 4 秒の乱数を q5 で。読む・音量・書くの通しの /usr/bin/time -l の peak memory footprint）で、値に比例する分を約 6.3 MiB
+/// 超えた（60 秒では比例の分に収まる）。
+const FIXED_WORK: u64 = 8 << 20;
+
 /// Ogg Vorbis のエンコーダ（自作。`ogg-vorbis-kura-enc/1`）。
 pub struct OggVorbisEncoder;
 
@@ -300,6 +305,17 @@ impl Encoder for OggVorbisEncoder {
     /// ループ点（LOOPSTART・LOOPLENGTH）とタグ（形式の表の ogg の行と同じ）。
     fn caps(&self, format: &str, _opts: &serde_json::Value) -> MetaCaps {
         caps_of(format)
+    }
+
+    /// 値の 1.8 倍 ＋ 8 MiB：書き出しのあいだ入力全体の f32 の写し（C の `vorbis_analysis_buffer`。値と同じ大きさ）と、
+    /// 区間ごとの窓・MDCT・心理モデルの作業を持つ。ピークは値の約 2.1〜2.8 倍（値を含む。§9.7：44.1 kHz ステレオ 3 分で値
+    /// 64 MB に対して 168 MB）なので、大きいほうから値の 1 倍を引いた分。段 10 の実測（3 分の 44.1 kHz ステレオを q5 で、
+    /// 捨てる書き出し先に書いたピークから値を引いたもの）：92 MiB（値 61 MiB の 1.5 倍）。値によらない分（[`FIXED_WORK`]）は、
+    /// 短い音声で比例の分を超えた量から置いた。
+    fn work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
+        let v = crate::budget::value_bytes(shape);
+        v.saturating_add(v.saturating_mul(4) / 5)
+            .saturating_add(FIXED_WORK)
     }
 
     fn encode(

@@ -70,6 +70,33 @@ pub fn out_frames(frames: u64, from: u32, to: u32) -> Option<u64> {
     u64::try_from(v).ok()
 }
 
+/// 出力の区間 `[n0, n1)` が読む入力の区間（段 10。範囲の逆写しに使う）。`(l, m)` は [`ratio`]、`h` はタップの数の半分。
+/// 出力 n は入力 `[⌊nM/L⌋ − h + 1, ⌊nM/L⌋ + h + 1)` を読む（[`Filter::output`]）。0 より前は切る。空なら `(0, 0)`。
+pub fn source_window(l: u64, m: u64, h: u64, n0: u64, n1: u64) -> (u64, u64) {
+    if n0 >= n1 || l == 0 {
+        return (0, 0);
+    }
+    let center = |n: u64| (u128::from(n) * u128::from(m) / u128::from(l)) as u64;
+    let lo = center(n0).saturating_sub(h.saturating_sub(1));
+    let hi = center(n1 - 1).saturating_add(h).saturating_add(1);
+    (lo, hi)
+}
+
+/// 入力の区間 `[a, b)` を読む出力の区間（段 10。変わった区間を前へ写すのに使う。保守的）。空なら `(0, 0)`。
+pub fn dest_window(l: u64, m: u64, h: u64, a: u64, b: u64) -> (u64, u64) {
+    if a >= b || m == 0 {
+        return (0, 0);
+    }
+    // 出力 n が読むのは ⌊nM/L⌋ ≥ a − h かつ ⌊nM/L⌋ < b + h − 1 のとき：n ≥ ⌈(a − h)·L/M⌉、n < ⌈(b + h − 1)·L/M⌉
+    let up = |x: u64| {
+        let v = (u128::from(x) * u128::from(l)).div_ceil(u128::from(m));
+        u64::try_from(v).unwrap_or(u64::MAX)
+    };
+    let first = up(a.saturating_sub(h));
+    let end = up(b.saturating_add(h).saturating_sub(1));
+    if first < end { (first, end) } else { (0, 0) }
+}
+
 /// 0 次の第 1 種変形ベッセル関数 I0（級数 Σ ((z/2)^k / k!)²。足しても変わらなくなるまで）。
 fn i0(z: f64) -> f64 {
     let q = z * z / 4.0;
@@ -165,6 +192,47 @@ impl Filter {
 mod tests {
     use super::*;
     use crate::monitor::NoMonitor;
+
+    /// 段 10：出力の区間が読む入力の窓（source_window）は `Filter::output` が読む位置をすべて含み、入力の区間を読む出力の
+    /// 区間（dest_window）は、その区間を読む出力をすべて含む。
+    #[test]
+    fn windows_cover_the_filter() {
+        for (from, to) in [
+            (44_100u32, 48_000u32),
+            (48_000, 44_100),
+            (8_000, 44_100),
+            (96_000, 8_000),
+        ] {
+            let (l, m) = ratio(from, to);
+            let h = taps(from, to) / 2;
+            // 出力 n が読む入力の範囲（Filter::output と同じ式）
+            let read = |n: u64| {
+                let i = (u128::from(n) * u128::from(m) / u128::from(l)) as i128;
+                (i - (h as i128 - 1), i - (h as i128 - 1) + 2 * h as i128)
+            };
+            for (n0, n1) in [(0u64, 1u64), (5, 9), (1_000, 1_300), (77, 78)] {
+                let (a, b) = source_window(l, m, h, n0, n1);
+                for n in n0..n1 {
+                    let (lo, hi) = read(n);
+                    assert!(
+                        lo.max(0) >= a as i128 && hi <= b as i128,
+                        "{from}→{to} n={n}"
+                    );
+                }
+            }
+            for (a, b) in [(0u64, 1u64), (500, 520), (3_000, 3_001)] {
+                let (d0, d1) = dest_window(l, m, h, a, b);
+                for n in 0..5_000u64 {
+                    let (lo, hi) = read(n);
+                    if lo < b as i128 && hi > a as i128 {
+                        assert!(n >= d0 && n < d1, "{from}→{to} [{a},{b}) n={n}");
+                    }
+                }
+            }
+        }
+        assert_eq!(source_window(1, 1, 4, 3, 3), (0, 0));
+        assert_eq!(dest_window(1, 1, 4, 3, 3), (0, 0));
+    }
 
     #[test]
     fn ratios_taps_and_lengths() {

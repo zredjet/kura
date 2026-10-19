@@ -15,6 +15,7 @@ use crate::op::{
     ParamSchema, PortSpec, Signature, expect_inputs,
 };
 use crate::ops::util::{audio_of, audio_shape};
+use crate::render::region::Reach;
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Audio, Value};
@@ -122,6 +123,10 @@ impl Op for Mono {
         Ok(Applied::value(render_all(&k, audio.meta.clone(), cx.mon)?))
     }
 
+    fn work_bytes(_p: &Self::Params, _inputs: &[Shape], out: &Shape) -> crate::op::Work {
+        crate::audio::render_all_work(out)
+    }
+
     fn audio_kernel(
         _p: &MonoParams,
         inputs: &[&Value],
@@ -156,6 +161,11 @@ impl Op for Mono {
                 }],
             },
         ]
+    }
+
+    // 段 10：範囲（同じ位置。全チャンネル）
+    fn reach(_p: &MonoParams, _inputs: &[Shape]) -> Reach {
+        Reach::SameTime
     }
 }
 

@@ -12,6 +12,7 @@
 //! - 座標はキャンバスの座標。トリムしたフレームでは、フレームの外の画素は描かない。
 
 pub mod fill;
+pub mod list;
 pub mod mask;
 pub mod points;
 pub mod stroke;
@@ -32,6 +33,7 @@ use crate::monitor::Monitor;
 use crate::value::{PixelFormat, Raster, Value};
 
 pub use fill::Connectivity;
+pub use list::ActionList;
 pub use mask::Mask;
 pub use points::PointList;
 pub use stroke::{Brush, BrushShape};
@@ -118,6 +120,20 @@ impl PaintAction {
                 stamp.saturating_add(area / 64).saturating_add(tiles)
             }
             Self::Fill { .. } => w.saturating_mul(h).max(1),
+        }
+    }
+
+    /// 動作 1 つを当てる間の作業領域の見積もり（値を除く。`w`・`h` は描く画像（フレームの列はキャンバス）の大きさの上限）。
+    /// - ストローク：画素の集合（外接矩形と画像の重なり。上限の画像全体で数える）＋ 筆の形の画素の列 ＋ 点の写し。
+    /// - 塗りつぶし：[`fill::fill_work`]（集合と、連結なら区間の待ち行列の上限）。
+    pub fn work_bytes(&self, w: u64, h: u64) -> u64 {
+        // 筆の形・点は (i64, i64) と IPoint（どちらも 16 バイト）
+        const POINT: u64 = 16;
+        match self {
+            Self::Stroke { brush, points, .. } => mask::mask_bytes(w, h)
+                .saturating_add(stroke::footprint_len(*brush).saturating_mul(POINT))
+                .saturating_add((points.0.len() as u64).saturating_mul(POINT)),
+            Self::Fill { contiguous, .. } => fill::fill_work(w, h, *contiguous),
         }
     }
 
@@ -399,9 +415,9 @@ fn apply_one(
 }
 
 /// 動作の列を値（画像かフレームの列）に順に当てる。
-pub fn apply_actions(
+pub fn apply_actions<'a>(
     v: &Value,
-    actions: &[PaintAction],
+    actions: impl IntoIterator<Item = &'a PaintAction>,
     mon: &dyn Monitor,
 ) -> Result<Value, EngineError> {
     apply_actions_from(v, actions, 0, mon)
@@ -422,16 +438,16 @@ fn at_action(i: usize, e: EngineError) -> EngineError {
 }
 
 /// 動作の列を当てる。`first` は最初の動作の番号（差分の適用で、引数の中の番号を誤りに付けるため）。
-pub fn apply_actions_from(
+pub fn apply_actions_from<'a>(
     v: &Value,
-    actions: &[PaintAction],
+    actions: impl IntoIterator<Item = &'a PaintAction>,
     first: usize,
     mon: &dyn Monitor,
 ) -> Result<Value, EngineError> {
     match v {
         Value::Image(img) => {
             let mut px = img.px.clone();
-            for (k, a) in actions.iter().enumerate() {
+            for (k, a) in actions.into_iter().enumerate() {
                 if mon.canceled() {
                     return Err(EngineError::Canceled);
                 }
@@ -447,7 +463,7 @@ pub fn apply_actions_from(
         }
         Value::Frames(fr) => {
             let mut frames = fr.frames().to_vec();
-            for (k, a) in actions.iter().enumerate() {
+            for (k, a) in actions.into_iter().enumerate() {
                 if mon.canceled() {
                     return Err(EngineError::Canceled);
                 }

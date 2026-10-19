@@ -160,6 +160,10 @@ impl Op for Normalize {
         Ok(Applied::value(render_all(&k, audio.meta.clone(), cx.mon)?))
     }
 
+    fn work_bytes(_p: &Self::Params, _inputs: &[Shape], out: &Shape) -> crate::op::Work {
+        crate::audio::render_all_work(out)
+    }
+
     fn audio_kernel(
         p: &NormalizeParams,
         inputs: &[&Value],

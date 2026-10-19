@@ -55,3 +55,74 @@ register_ops! {
     // なくした操作の最後の版（新しく作れないが、作り直しに使う。§8.4）
     retired: [],
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::limits::Limits;
+    use crate::op::{InferCx, Lift, Work};
+
+    /// 作業領域の見積もり（`Op::work_bytes`）は登録表から引け、値の数倍を持つ操作（Indexed8 への convert・平滑な resize・
+    /// `render_all` で描く音声・塗りつぶしの集合と待ち行列とストロークの集合を持つ paint.actions）だけが 0 でない。
+    #[test]
+    fn work_bytes_are_declared_where_values_are_multiplied() {
+        let reg = super::registry().unwrap();
+        let limits = Limits::default();
+        let cx = InferCx { limits: &limits };
+        let mut nonzero = Vec::new();
+        for op in reg.current() {
+            for ex in op.examples().unwrap() {
+                let mut shapes: Vec<_> = ex
+                    .inputs
+                    .iter()
+                    .map(|g| g.generate().unwrap().shape())
+                    .collect();
+                if op.signature().lift == Lift::PerFrame
+                    && let Some(frame) = shapes[0].frame_image()
+                {
+                    shapes[0] = frame;
+                }
+                let p = op.parse(&ex.params).unwrap();
+                let Ok(inferred) = op.infer(p.as_ref(), &shapes, &cx) else {
+                    continue;
+                };
+                let w = op.work_bytes(p.as_ref(), &shapes, &inferred.shape).unwrap();
+                if w != Work::ZERO && nonzero.last() != Some(&op.id()) {
+                    nonzero.push(op.id());
+                }
+            }
+        }
+        assert_eq!(
+            nonzero,
+            [
+                "audio.fade",
+                "audio.gain",
+                "audio.mono",
+                "audio.normalize",
+                "audio.resample",
+                "audio.trim",
+                "image.convert",
+                "image.resize",
+                "paint.actions",
+            ]
+        );
+    }
+
+    #[test]
+    fn work_totals_saturate() {
+        let w = Work {
+            shared: 10,
+            per_task: 3,
+        };
+        assert_eq!(w.total(0), 10);
+        assert_eq!(w.total(4), 22);
+        assert_eq!(w.total(u64::MAX), u64::MAX);
+        assert_eq!(
+            Work::shared(5),
+            Work {
+                shared: 5,
+                per_task: 0
+            }
+        );
+        assert_eq!(Work::default(), Work::ZERO);
+    }
+}

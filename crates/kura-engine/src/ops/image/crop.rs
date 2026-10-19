@@ -12,6 +12,8 @@ use crate::op::{
     Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
+use crate::render::preview::{Preview, clamp_rect, image_bounds, scale_rect};
+use crate::render::region::{FrameTiles, Reach, base_image, exact_image_size, pick_of};
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Image, PixelFormat, Value};
@@ -44,6 +46,55 @@ fn out_of_range() -> Issues {
     Issues::one(
         Issue::error(IssueCode::OutOfRange, "切り抜く範囲が画像の外に出ています").param("rect"),
     )
+}
+
+/// 出力のタイル 1 枚を描く閉包（全体の描画と範囲の描画が同じものを使う）。
+fn crop_tile(
+    img: &Image,
+    r: IRect,
+) -> impl Fn(IRect, &mut [u8]) -> Result<(), EngineError> + Sync + Send + '_ {
+    move |t, out| {
+        img.px
+            .read_rect(IRect::new(r.x + t.x, r.y + t.y, t.w, t.h), out)
+    }
+}
+
+/// 入力の画像（矩形が画像の外なら断る）。
+fn checked_input<'a>(p: &CropParams, inputs: &[&'a Value]) -> Result<&'a Image, EngineError> {
+    let Value::Image(img) = inputs[0] else {
+        return Err(EngineError::Internal(
+            "image.crop の入力が画像ではありません".into(),
+        ));
+    };
+    if !p.rect.inside(img.px.width(), img.px.height()) {
+        return Err(EngineError::Invalid(out_of_range()));
+    }
+    Ok(img)
+}
+
+/// 範囲の描画（`apply` と同じ閉包で、選んだタイルだけ）。
+fn crop_region(
+    p: &CropParams,
+    inputs: &[&Value],
+    tiles: &FrameTiles,
+    base: Option<&Value>,
+    cx: &ApplyCx<'_>,
+) -> Result<Applied, EngineError> {
+    let img = checked_input(p, inputs)?;
+    let r = p.rect;
+    let pick = pick_of(tiles, 0, r.w, r.h);
+    let px = img.px.derive_picked(
+        r.w,
+        r.h,
+        cx.mon,
+        &pick,
+        base_image(base)?,
+        crop_tile(img, r),
+    )?;
+    Ok(Applied::value(Value::Image(Arc::new(Image {
+        px,
+        meta: img.meta.clone(),
+    }))))
 }
 
 impl Op for Crop {
@@ -101,19 +152,9 @@ impl Op for Crop {
         inputs: &[&Value],
         cx: &mut ApplyCx<'_>,
     ) -> Result<Applied, EngineError> {
-        let Value::Image(img) = inputs[0] else {
-            return Err(EngineError::Internal(
-                "image.crop の入力が画像ではありません".into(),
-            ));
-        };
+        let img = checked_input(p, inputs)?;
         let r = p.rect;
-        if !r.inside(img.px.width(), img.px.height()) {
-            return Err(EngineError::Invalid(out_of_range()));
-        }
-        let px = img.px.derive(r.w, r.h, cx.mon, |t, out| {
-            img.px
-                .read_rect(IRect::new(r.x + t.x, r.y + t.y, t.w, t.h), out)
-        })?;
+        let px = img.px.derive(r.w, r.h, cx.mon, crop_tile(img, r))?;
         Ok(Applied::value(Value::Image(Arc::new(Image {
             px,
             meta: img.meta.clone(),
@@ -183,6 +224,48 @@ impl Op for Crop {
                 }],
             },
         ]
+    }
+
+    // 段 10：範囲（平行移動の逆写し）と範囲の描画
+    const REGION: bool = true;
+
+    fn reach(p: &CropParams, inputs: &[Shape]) -> Reach {
+        match inputs.first().and_then(exact_image_size) {
+            Some(in_size) => Reach::Affine {
+                m: IntAffine::translate(-p.rect.x, -p.rect.y),
+                in_size,
+                out_size: Size {
+                    w: p.rect.w,
+                    h: p.rect.h,
+                },
+            },
+            None => Reach::Global,
+        }
+    }
+
+    fn apply_region(
+        p: &CropParams,
+        inputs: &[&Value],
+        tiles: &FrameTiles,
+        base: Option<&Value>,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        Some(crop_region(p, inputs, tiles, base, cx))
+    }
+
+    // 段 10：プレビューの段（矩形を床・天井で縮め、段の入力に収める）
+    fn preview(_p: &CropParams) -> Preview {
+        Preview::Scaled
+    }
+
+    fn preview_params(p: &CropParams, level: u8, inputs: &[Shape], _full: &[Shape]) -> CropParams {
+        let r = scale_rect(p.rect, level);
+        CropParams {
+            rect: match inputs.first().and_then(image_bounds) {
+                Some((w, h)) => clamp_rect(r, w, h),
+                None => r,
+            },
+        }
     }
 }
 

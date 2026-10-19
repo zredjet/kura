@@ -234,6 +234,12 @@ impl<B: ImageBackend> Decoder for PlatformImageDecoder<B> {
         self.backend.can_decode(format)
     }
 
+    /// 値の 2 倍：ImageIO は全体を 1 回で展開し（HEIC は帯ごとに読むと値が変わる）、展開した行をここで値に写す。
+    /// メモリは値の約 3 倍（値を含む）を見込む（§9.8）。
+    fn work_bytes(&self, _format: &str, shape: &Shape) -> u64 {
+        crate::budget::value_bytes(shape).saturating_mul(2)
+    }
+
     fn shape(
         &self,
         src: &mut dyn ReadSeek,

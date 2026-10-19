@@ -182,6 +182,14 @@ impl Decoder for JpegCodec {
         format == "jpeg"
     }
 
+    /// 値の 3 倍：プログレッシブは全成分の係数（i16）を全部持ったまま、展開した行（値の 1 倍）に書く。ベースラインは
+    /// 展開した行だけ（1 倍）だが、形からは見分けられないので大きいほうにする。段 10 の実測（24MP の写真らしい合成を
+    /// q90 で書いたもの。/usr/bin/time -l の peak memory footprint から、ファイルと値を引いたもの）：ベースライン 70 MiB
+    /// （値の 1.0 倍）、プログレッシブ 208 MiB（値の 3.0 倍）。
+    fn work_bytes(&self, _format: &str, shape: &Shape) -> u64 {
+        crate::budget::value_bytes(shape).saturating_mul(3)
+    }
+
     fn shape(
         &self,
         src: &mut dyn ReadSeek,
@@ -295,6 +303,30 @@ impl Encoder for JpegCodec {
 
     fn caps(&self, format: &str, _opts: &serde_json::Value) -> MetaCaps {
         caps_of(format)
+    }
+
+    /// 画素あたり：エンコーダに渡す行を詰めた写し（Gray8 は 1、Rgb8 は 3、透明を持ちうる形式は RGBA8 にして 4）と、
+    /// 書いたバイト列（jpeg-encoder はメモリの `Vec` に書いてから `out` に写す。成分あたり 1 バイト以下で、伸ばすので
+    /// 容量は 2 倍まで）。プログレッシブは、さらに成分の平面（成分あたり 1）と全ブロックの係数（成分あたり 2。4:4:4 のとき）を
+    /// 同時に持つ。ベースラインは 16 行ずつ組むので小さい。書いた列の見積もりは縮まない画素（乱数）に合わせたもので、
+    /// 写真では大きめに出る。段 10 の実測（24MP の写真らしい合成の Rgb8 を q90 で捨てる書き出し先に書いたピークから値を
+    /// 引いたもの）：ベースライン 77 MiB（値の 1.1 倍。見積もりは 3 倍）、プログレッシブ 282 MiB（4.1 倍。見積もりは 6 倍）。
+    /// values 調査：乱数の Rgb8 4096² の q90 で、作業領域は値の約 2.3 倍。
+    fn work_bytes(&self, _format: &str, shape: &Shape, opts: &serde_json::Value) -> u64 {
+        let Shape::Image { w, h, fmt } = shape else {
+            return crate::budget::value_bytes(shape);
+        };
+        let (rows, comps): (u64, u64) = match fmt {
+            PixelFormat::Gray8 => (1, 1),
+            PixelFormat::Rgb8 => (3, 3),
+            _ => (4, 3),
+        };
+        let progressive = opts
+            .get("progressive")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let per_px = rows + 2 * comps + if progressive { 3 * comps } else { 0 };
+        w.max().saturating_mul(h.max()).saturating_mul(per_px)
     }
 
     fn encode(

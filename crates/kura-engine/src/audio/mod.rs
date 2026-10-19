@@ -56,6 +56,19 @@ pub fn render_all(
     Ok(Value::Audio(Arc::new(Audio::new(k.rate(), planes, meta)?)))
 }
 
+/// [`render_all`] が出力の値のほかに使う作業領域（`Op::work_bytes`）：チャンネルごとに、ブロックの列（1 チャンネルぶん）を
+/// 描いてから平面に写すので、描いている間は出力の 1 チャンネルぶんを余分に持つ（そのチャンネルは一時に 2 倍）。
+/// 核は大きな前計算を持たない（ラウドネスなどは解析の結果で、値に比べて小さい）。段 10 の実測（3 分の 44.1 kHz ステレオに
+/// audio.gain。ピークから入力と出力の値を引いたもの）：32 MiB（1 チャンネルは 30 MiB）。
+pub fn render_all_work(out: &crate::shape::Shape) -> crate::op::Work {
+    match out {
+        crate::shape::Shape::Audio { frames, .. } => {
+            crate::op::Work::shared(frames.max().saturating_mul(4))
+        }
+        _ => crate::op::Work::ZERO,
+    }
+}
+
 /// 入力をそのまま写す核（メタデータだけを書く操作が使う）。
 pub struct Identity(pub Arc<Audio>);
 

@@ -14,6 +14,7 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{audio_of, audio_shape, bad_param};
+use crate::render::region::{Area, Reach};
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Audio, LoopRange, Value};
@@ -154,6 +155,19 @@ impl Op for SetLoop {
                 inputs: vec![sine],
             },
         ]
+    }
+
+    // 段 10：範囲（同じ位置）。標本は変わらない（ループ点のメタデータだけ）
+    fn reach(_p: &SetLoopParams, _inputs: &[Shape]) -> Reach {
+        Reach::SameTime
+    }
+
+    fn param_change(_old: &SetLoopParams, _new: &SetLoopParams, _inputs: &[Shape]) -> Area {
+        Area::Empty
+    }
+
+    fn effect(_p: &SetLoopParams, _inputs: &[Shape]) -> Area {
+        Area::Empty
     }
 }
 

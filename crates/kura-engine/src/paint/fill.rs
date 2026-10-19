@@ -10,8 +10,30 @@ use crate::error::EngineError;
 use crate::geom::IRect;
 use crate::imaging::pixels::is_16;
 use crate::monitor::Monitor;
-use crate::paint::mask::{Mask, span_bits};
+use crate::paint::mask::{Mask, mask_bytes, span_bits};
 use crate::value::{PixelFormat, Raster};
+
+/// 区間の待ち行列の要素（行, 調べる範囲の左, 右）。
+type Span = (u32, u32, u32);
+
+/// 区間の待ち行列の要素の数の上限（`w`×`h` の画像。超えたら落ちずに `Limit`）。画素 2 つに 1 つ（6 バイト／画素）＋ 行の数の
+/// 2 倍 ＋ 65,536。待ち行列は、描く前にこの数ちょうどを確保する（伸ばさない。見積もり [`fill_work`] と同じ式で決まる）。
+pub fn queue_cap(w: u64, h: u64) -> u64 {
+    (w.saturating_mul(h) / 2)
+        .saturating_add(h.saturating_mul(2))
+        .saturating_add(1 << 16)
+}
+
+/// 塗りつぶし 1 つを `w`×`h` の画像に当てる間の作業領域（値を除く）：同じ色の画素の集合と、タイルごとに求めた語（集めて
+/// 写す間は両方）。連結なら、さらに塗った画素の集合と区間の待ち行列（上限の数ちょうど。[`queue_cap`]）。待ち行列は 1px の
+/// 市松を 8 連結で塗るような形で画素の数に比例して伸びるので、上限で数える（ふつうの形では確保だけで、触れる頁は少ない）。
+pub fn fill_work(w: u64, h: u64, contiguous: bool) -> u64 {
+    let masks = mask_bytes(w, h).saturating_mul(2);
+    if !contiguous {
+        return masks;
+    }
+    masks.saturating_add(queue_cap(w, h).saturating_mul(std::mem::size_of::<Span>() as u64))
+}
 
 /// 連結の仕方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -171,10 +193,14 @@ pub fn fill_mask(
     let last = w as usize - 1;
     // (行, 調べる範囲の左, 右)。積む前に、その範囲にまだ塗れる画素があるかを語で確かめる（無駄な要素を積まない）。
     // 要素は 12 バイト。山は、市松模様の 8 連結（区間が 1 画素ずつ）を中央から塗ると画素の約 0.3 になる（4×4 の周期の模様を
-    // すべて試した最悪。区間は 1 行に w/2 個までなので、積む数は画素の数＋2h を超えない）。画素 2 つに 1 つ（6 バイト／画素）
-    // ＋ 行の数の 2 倍を上限にし、超えたら落ちずに Limit にする
-    let cap = u64::from(w) * u64::from(h) / 2 + 2 * u64::from(h) + (1 << 16);
-    let mut queue: Vec<(u32, u32, u32)> = vec![(ay as u32, ax as u32, ax as u32)];
+    // すべて試した最悪。区間は 1 行に w/2 個までなので、積む数は画素の数＋2h を超えない）。上限（`queue_cap`）ちょうどを
+    // 先に確保し（倍々に伸ばすと上限の 2 倍近くまで確保しうる。見積もり `fill_work` と同じ式）、超えたら落ちずに Limit にする
+    let cap = queue_cap(u64::from(w), u64::from(h));
+    let mut queue: Vec<Span> = Vec::new();
+    queue
+        .try_reserve_exact(usize::try_from(cap).unwrap_or(usize::MAX))
+        .map_err(|_| EngineError::Limit("塗りつぶしの作業領域を確保できません".into()))?;
+    queue.push((ay as u32, ax as u32, ax as u32));
     let mut steps = 0u64;
     while let Some((y, lo, hi)) = queue.pop() {
         steps += 1;
@@ -198,9 +224,7 @@ pub fn fill_mask(
                         "塗りつぶしの作業領域が大きすぎます（区間の多すぎる形）".into(),
                     ));
                 }
-                queue.try_reserve(1).map_err(|_| {
-                    EngineError::Limit("塗りつぶしの作業領域を確保できません".into())
-                })?;
+                // 上限まで確保してあるので伸びない
                 queue.push((ny as u32, nl as u32, nr as u32));
             }
             x = r + 2;
@@ -321,6 +345,36 @@ mod tests {
             .filter(|(x, y)| inside[(y * w + x) as usize])
             .map(|(x, y)| (i64::from(x), i64::from(y)))
             .collect()
+    }
+
+    /// 作業領域の見積もり：集合 2 枚（同じ色・塗った画素。同じ色の集合を集める間のタイルごとの語も 1 枚ぶん）と、連結なら
+    /// 区間の待ち行列の上限ちょうど（要素 12 バイト）。上限は 1px の市松の 8 連結（区間の最も多い形）に足りる。
+    #[test]
+    fn work_counts_the_masks_and_the_whole_queue() {
+        let (w, h) = (300u32, 70u32);
+        let mask = Mask::new(IRect::new(0, 0, w, h)).unwrap();
+        let mask_len = (mask.words_per_row() * h as usize * 8) as u64;
+        assert_eq!(mask_bytes(u64::from(w), u64::from(h)), mask_len);
+        let cap = queue_cap(u64::from(w), u64::from(h));
+        assert_eq!(cap, 300 * 70 / 2 + 140 + 65_536);
+        assert_eq!(fill_work(u64::from(w), u64::from(h), false), 2 * mask_len);
+        assert_eq!(
+            fill_work(u64::from(w), u64::from(h), true),
+            2 * mask_len + cap * std::mem::size_of::<Span>() as u64
+        );
+        assert_eq!(std::mem::size_of::<Span>(), 12);
+        // あふれは飽和する
+        assert_eq!(fill_work(u64::MAX, u64::MAX, true), u64::MAX);
+        // 1px の市松の 8 連結は上限に当たらずに塗れる（最悪の形）
+        let n = 512u32;
+        let data: Vec<u8> = (0..n * n)
+            .map(|i| (((i % n) + (i / n)) % 2) as u8)
+            .collect();
+        let px = gray(n, n, &data);
+        let m = fill_mask(&px, (256, 256), 0, Connectivity::Eight, true, &NoMonitor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.count(), u64::from(n * n / 2));
     }
 
     proptest! {

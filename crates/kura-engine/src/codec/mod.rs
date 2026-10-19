@@ -199,6 +199,18 @@ pub trait Decoder: Send + Sync {
     }
     /// この形式を読めるか。
     fn can_decode(&self, format: &str) -> bool;
+    /// 形 `shape`（[`Decoder::shape`] の結果）の値を読む間に、読んだ値のほかに使う作業領域の見積もり（バイト。§12 の
+    /// メモリの予算。読む前に予算を確保するのに使う）。既定は値の 1 倍（展開した行・平面を値に写す実装が多いので、分からない
+    /// ものは写しを 1 つ持つとみなす）。それより多く持つデコーダ（JPEG のプログレッシブ・ImageIO）が上書きする。
+    fn work_bytes(&self, _format: &str, shape: &Shape) -> u64 {
+        crate::budget::value_bytes(shape)
+    }
+    /// 長さ `len` バイトのファイルから読むときの作業領域の見積もり（[`Decoder::work_bytes`] と同じ意味。呼び手がファイルの
+    /// 長さを知っているとき）。ファイル全体をメモリに読むデコーダ（aseprite）は長さを足す。既定は長さを見ない
+    /// [`Decoder::work_bytes`]。
+    fn file_work_bytes(&self, format: &str, shape: &Shape, _len: u64) -> u64 {
+        self.work_bytes(format, shape)
+    }
     /// ヘッダだけ読んで形を返す（描く前の上限の判断に使う）。扱えない変種は、ここか `decode` で `Unsupported` を返す
     /// （次の段のデコーダへ回る）。
     fn shape(
@@ -294,6 +306,12 @@ pub trait Encoder: Send + Sync {
     fn options(&self, format: &str) -> ParamSchema;
     /// この設定で実際に保存できるもの（失うものを先に知らせる。§6）。形式の表の能力ではなく、このエンコーダの能力。
     fn caps(&self, format: &str, opts: &serde_json::Value) -> MetaCaps;
+    /// 形 `shape` の値を設定 `opts` で書く間に、値のほかに使う作業領域の見積もり（バイト。§12 のメモリの予算。書き出し先
+    /// `out` に渡すバイト列は含めない）。既定は値の 1 倍（行を詰めた写しを 1 つ持つとみなす）。それより多く持つエンコーダ
+    /// （PNG・JPEG・Vorbis）が上書きする。
+    fn work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
+        crate::budget::value_bytes(shape)
+    }
     /// 書く。`out` に書き、書いたバイト数を返す。
     fn encode(
         &self,
@@ -486,6 +504,34 @@ impl CodecSet {
     /// この形式・形を書くエンコーダ（段の順で最初のもの）。
     pub fn encoder(&self, format: &str, shape: &Shape) -> Option<&Arc<dyn Encoder>> {
         self.encoders.iter().find(|e| e.can_encode(format, shape))
+    }
+
+    /// 形 `shape` の値を `format` から読む間の作業領域の見積もり（§12 のメモリの予算）：この形式を読むデコーダの
+    /// [`Decoder::work_bytes`] の最大（読む途中で `Unsupported` になると次の段へ回るので、どれが読むかは読むまで決まらない）。
+    /// 読めるデコーダがなければ 0。
+    pub fn decode_work_bytes(&self, format: &str, shape: &Shape) -> u64 {
+        self.decoders_for(format)
+            .iter()
+            .map(|d| d.work_bytes(format, shape))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// [`CodecSet::decode_work_bytes`] の、長さ `len` バイトのファイルから読むときのもの（[`Decoder::file_work_bytes`] の
+    /// 最大）。
+    pub fn decode_file_work_bytes(&self, format: &str, shape: &Shape, len: u64) -> u64 {
+        self.decoders_for(format)
+            .iter()
+            .map(|d| d.file_work_bytes(format, shape, len))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 形 `shape` の値を `format`・設定 `opts` で書く間の作業領域の見積もり：[`CodecSet::encoder`] が選ぶエンコーダの
+    /// [`Encoder::work_bytes`]。書けるエンコーダがなければ 0。
+    pub fn encode_work_bytes(&self, format: &str, shape: &Shape, opts: &serde_json::Value) -> u64 {
+        self.encoder(format, shape)
+            .map_or(0, |e| e.work_bytes(format, shape, opts))
     }
 
     /// 段の順に `shape` を試し、扱えないと答えたもの（`Unsupported`）は次へ回す。読めたデコーダと形を返す。
@@ -784,6 +830,96 @@ mod tests {
     use crate::value::{Audio, AudioMeta};
     use serde_json::json;
     use std::io::Cursor;
+
+    /// 作業領域の見積もりの倍率（§12。values 調査の実測と §9 の記述から置いたもの）。既定は値の 1 倍。
+    #[test]
+    fn work_bytes_follow_the_measured_multipliers() {
+        use crate::codec::platform::PlatformImageDecoder;
+        use crate::testing::platform::{FakeImage, FakeImageBackend};
+        use crate::value::PixelFormat;
+        let set = CodecSet::pinned();
+        let image = |fmt| Shape::Image {
+            w: Dim::Exact(600),
+            h: Dim::Exact(400),
+            fmt,
+        };
+        let rgb = image(PixelFormat::Rgb8);
+        let v = 600 * 400 * 3;
+        let audio = Shape::Audio {
+            rate: 44_100,
+            channels: 2,
+            frames: Dim::Exact(1_000),
+        };
+        // 読み：JPEG は 3 倍（プログレッシブを見込む）、PNG・WAV は既定の 1 倍
+        assert_eq!(set.decode_work_bytes("jpeg", &rgb), 3 * v);
+        assert_eq!(set.decode_work_bytes("png", &rgb), v);
+        assert_eq!(set.decode_work_bytes("wav", &audio), 8_000);
+        assert_eq!(set.decode_work_bytes("ない形式", &rgb), 0);
+        // ImageIO は 2 倍（値を含めて約 3 倍）
+        let px = InputGen::Noise {
+            w: 2,
+            h: 2,
+            fmt: PixelFormat::Rgb8,
+            seed: 1,
+        }
+        .generate()
+        .unwrap();
+        let Value::Image(img) = px else { panic!() };
+        let mut with_platform = CodecSet::pinned();
+        with_platform
+            .add_decoder(Arc::new(PlatformImageDecoder::new(FakeImageBackend::new(
+                FakeImage::still(&img.px, platform::PlatformAlpha::None),
+            ))))
+            .unwrap();
+        assert_eq!(with_platform.decode_work_bytes("heic", &rgb), 2 * v);
+        // 書き：PNG は 3 倍（fast は 4 倍）、APNG は 1 フレームぶん
+        assert_eq!(set.encode_work_bytes("png", &rgb, &json!({})), 3 * v);
+        assert_eq!(
+            set.encode_work_bytes("png", &rgb, &json!({ "compression": "fast" })),
+            4 * v
+        );
+        let apng = Shape::Frames {
+            count: Dim::Exact(10),
+            w: Dim::Exact(600),
+            h: Dim::Exact(400),
+            fmt: PixelFormat::Rgb8,
+            full: crate::shape::Fullness::Full,
+        };
+        assert_eq!(set.encode_work_bytes("png", &apng, &json!({})), 3 * v);
+        // JPEG：画素あたり 行 3 ＋ 書いた列 6（プログレッシブはさらに 9）。透明を持ちうる形式は RGBA8 の行
+        let px = 600 * 400;
+        assert_eq!(set.encode_work_bytes("jpeg", &rgb, &json!({})), 9 * px);
+        assert_eq!(
+            set.encode_work_bytes("jpeg", &rgb, &json!({ "progressive": true })),
+            18 * px
+        );
+        assert_eq!(
+            set.encode_work_bytes("jpeg", &image(PixelFormat::Gray8), &json!({})),
+            3 * px
+        );
+        assert_eq!(
+            set.encode_work_bytes("jpeg", &image(PixelFormat::Indexed8), &json!({})),
+            10 * px
+        );
+        // Vorbis は 1.8 倍（値を含めて 2.8 倍）＋ 値によらない 8 MiB、WAV は既定の 1 倍
+        assert_eq!(
+            set.encode_work_bytes("ogg", &audio, &json!({})),
+            14_400 + (8 << 20)
+        );
+        assert_eq!(set.encode_work_bytes("wav", &audio, &json!({})), 8_000);
+        // アンカー：読み直す値の 1 倍（値を含めて 2 倍）。APNG は 1 フレームの PNG（fast）の 4 倍と比べて大きいほう
+        assert_eq!(anchor::work_bytes(&rgb), v);
+        assert_eq!(anchor::work_bytes(&audio), 8_000);
+        assert_eq!(anchor::work_bytes(&apng), 10 * v);
+        let short = Shape::Frames {
+            count: Dim::Exact(2),
+            w: Dim::Exact(600),
+            h: Dim::Exact(400),
+            fmt: PixelFormat::Rgb8,
+            full: crate::shape::Fullness::Full,
+        };
+        assert_eq!(anchor::work_bytes(&short), 4 * v);
+    }
 
     /// 書き出しの設定は厳しく確かめる（知らないキー・型の違い・範囲の外はエラー）。正規の形に直してから確かめるので、24.0 は 24 と同じ。
     #[test]

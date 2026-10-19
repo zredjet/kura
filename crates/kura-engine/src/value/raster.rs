@@ -5,16 +5,27 @@
 //! 並び・ダイジェスト・等しさはタイルの分け方によらない（行を左から順に読んだもの）。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::determinism::par_blocks;
 use crate::digest::Hasher;
 use crate::error::EngineError;
 use crate::geom::IRect;
 use crate::monitor::Monitor;
+use crate::render::region::Tiles;
 use crate::value::pixel::{Palette, PixelFormat};
 
 /// タイルの 1 辺。
 pub const TILE: u32 = 256;
+
+/// ダイジェストで行を詰める帯の大きさの上限（バイト）。足し方だけを決め、値に効かない。幅が最大（32,768）の Rgba16 でも
+/// 一時の領域がこれを超えない（1 行がこれを超えるときだけ 1 行の帯）。
+pub const DIGEST_BAND_BYTES: usize = 4 << 20;
+
+/// ダイジェストの帯の行の数（max(1, 帯の上限 ÷ 行のバイト数)）。
+pub fn digest_band_rows(row_len: usize) -> usize {
+    (DIGEST_BAND_BYTES / row_len.max(1)).max(1)
+}
 
 /// 画素の実体。幅・高さは 1 以上。
 #[derive(Debug, Clone)]
@@ -25,6 +36,53 @@ pub struct Raster {
     palette: Option<Arc<Palette>>,
     /// タイルを行の順に並べたもの（`ty * tiles_x + tx`）。各タイルは行を詰めて並べる。
     tiles: Vec<Arc<Vec<u8>>>,
+    /// 範囲の描画（段 10。`render::region`）で描かなかった無効なタイル。全体を描いた値は None。
+    holes: Option<Arc<Holes>>,
+}
+
+/// 無効なタイルの集合（範囲の描画で描かなかったタイル）。中身は仮のもの（0 か古い値）で、読むと `read` が立つ
+/// （`read_rect` は失敗する）。範囲の描画が申告した依存（Reach）の外を読んだことを、実行器とテストが見つけるため。
+#[derive(Debug)]
+pub(crate) struct Holes {
+    /// タイルの番号（`ty * tiles_x + tx`）ごとのビット（1 が無効）。
+    bits: Vec<u64>,
+    /// 無効なタイルを読んだ（中身を見た）。
+    read: AtomicBool,
+}
+
+impl Holes {
+    fn new(count: usize) -> Self {
+        Self {
+            bits: vec![0; count.div_ceil(64)],
+            read: AtomicBool::new(false),
+        }
+    }
+
+    fn get(&self, i: usize) -> bool {
+        self.bits
+            .get(i / 64)
+            .is_some_and(|w| (w >> (i % 64)) & 1 == 1)
+    }
+
+    fn set(&mut self, i: usize) {
+        if let Some(w) = self.bits.get_mut(i / 64) {
+            *w |= 1 << (i % 64);
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.bits.iter().any(|w| *w != 0)
+    }
+
+    /// タイル i が無効なら、読んだことを記録して true。
+    fn touch(&self, i: usize) -> bool {
+        if self.get(i) {
+            self.read.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// 0 で埋めた領域を確保する。足りなければ落ちずにエラーにする。
@@ -106,15 +164,60 @@ impl Raster {
         tile_rect(self.w, self.h, tx, ty)
     }
 
-    /// タイルの中身（行を詰めたもの）。
+    /// タイルの中身（行を詰めたもの）。無効なタイル（範囲の描画で描かなかったもの）は仮の中身を返し、読んだことを記録する。
     pub fn tile(&self, tx: u32, ty: u32) -> &[u8] {
-        &self.tiles[(ty * self.tiles_x() + tx) as usize]
+        let i = (ty * self.tiles_x() + tx) as usize;
+        self.touch(i);
+        &self.tiles[i]
     }
 
     /// タイルを書き換える（共有していれば複製してから）。
     pub fn tile_mut(&mut self, tx: u32, ty: u32) -> &mut [u8] {
         let i = (ty * self.tiles_x() + tx) as usize;
+        self.touch(i);
         Arc::make_mut(&mut self.tiles[i]).as_mut_slice()
+    }
+
+    /// タイル i が無効なら、読んだことを記録して true。
+    fn touch(&self, i: usize) -> bool {
+        self.holes.as_ref().is_some_and(|h| h.touch(i))
+    }
+
+    /// すべてのタイルが有効（範囲の描画で作った値でない）なら true。
+    pub fn is_complete(&self) -> bool {
+        self.holes.is_none()
+    }
+
+    /// タイル (tx, ty) が無効（範囲の描画で描かなかったもの）なら true。範囲の外は false。
+    pub fn is_hole(&self, tx: u32, ty: u32) -> bool {
+        tx < self.tiles_x()
+            && ty < self.tiles_y()
+            && self
+                .holes
+                .as_ref()
+                .is_some_and(|h| h.get((ty * self.tiles_x() + tx) as usize))
+    }
+
+    /// 無効なタイルを読んだことがあれば true（範囲の描画が申告した依存の外を読んだ印）。
+    pub fn holes_read(&self) -> bool {
+        self.holes
+            .as_ref()
+            .is_some_and(|h| h.read.load(Ordering::Relaxed))
+    }
+
+    /// 有効なタイルの集合（タイルの 1 辺は [`TILE`]）。
+    pub fn valid_tiles(&self) -> Tiles {
+        let mut t = Tiles::all(self.w, self.h, TILE);
+        if let Some(h) = &self.holes {
+            for ty in 0..self.tiles_y() {
+                for tx in 0..self.tiles_x() {
+                    if h.get((ty * self.tiles_x() + tx) as usize) {
+                        t.remove(tx, ty);
+                    }
+                }
+            }
+        }
+        t
     }
 
     /// 同じタイルの実体を共有していれば true（複製が起きていないことのテスト用）。
@@ -222,6 +325,7 @@ impl Raster {
             fmt,
             palette: palette.map(Arc::new),
             tiles,
+            holes: None,
         })
     }
 
@@ -231,6 +335,203 @@ impl Raster {
         F: Fn(IRect, &mut [u8]) -> Result<(), EngineError> + Sync + Send,
     {
         Self::from_tile_fn(w, h, self.fmt, self.palette.as_deref().cloned(), mon, f)
+    }
+
+    /// [`Raster::derive`] の範囲の描画（段 10）：`pick` のタイルだけを `f` で作り、ほかは `base` のタイルか無効なタイルにする
+    /// （[`Raster::from_tiles_picked`]）。
+    pub fn derive_picked<F>(
+        &self,
+        w: u32,
+        h: u32,
+        mon: &dyn Monitor,
+        pick: &Tiles,
+        base: Option<&Raster>,
+        f: F,
+    ) -> Result<Self, EngineError>
+    where
+        F: Fn(IRect, &mut [u8]) -> Result<(), EngineError> + Sync + Send,
+    {
+        Self::from_tiles_picked(
+            w,
+            h,
+            self.fmt,
+            self.palette.as_deref().cloned(),
+            mon,
+            pick,
+            base,
+            f,
+        )
+    }
+
+    /// 範囲の描画（段 10）：`pick`（1 辺 [`TILE`] のこの大きさのタイルの集合）のタイルだけを `f` で並列に作る（`from_tile_fn`
+    /// と同じ閉包なら、同じタイルは同じ値）。ほかのタイルは `base`（大きさ・形式・パレットが同じ前の値）のタイルを共有するか、
+    /// 無効なタイル（0 の仮のタイルを大きさごとに 1 つ作って共有する）にする。`base` の無効なタイルは無効のまま。
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_tiles_picked<F>(
+        w: u32,
+        h: u32,
+        fmt: PixelFormat,
+        palette: Option<Palette>,
+        mon: &dyn Monitor,
+        pick: &Tiles,
+        base: Option<&Raster>,
+        f: F,
+    ) -> Result<Self, EngineError>
+    where
+        F: Fn(IRect, &mut [u8]) -> Result<(), EngineError> + Sync + Send,
+    {
+        Self::check_header(w, h, fmt, palette.as_ref())?;
+        Self::check_pick(w, h, pick)?;
+        let palette = palette.map(Arc::new);
+        if let Some(b) = base
+            && (b.w != w || b.h != h || b.fmt != fmt || b.palette != palette)
+        {
+            return Err(EngineError::Internal(
+                "範囲の描画の前の値の大きさ・形式・パレットが違います".into(),
+            ));
+        }
+        let (tx_n, _) = Self::tiles_of(w, h);
+        let bpp = fmt.bytes_per_pixel();
+        let picked: Vec<(u32, u32)> = pick.iter().collect();
+        let made = par_blocks(picked.len(), mon, |k| {
+            let (tx, ty) = picked[k];
+            let rect = tile_rect(w, h, tx, ty);
+            let mut buf = alloc_zeroed(rect.w as usize * rect.h as usize * bpp)?;
+            f(rect, &mut buf)?;
+            if let Some(p) = &palette
+                && buf.iter().any(|b| usize::from(*b) >= p.colors.len())
+            {
+                return Err(EngineError::Internal(
+                    "パレットにない番号の画素があります".into(),
+                ));
+            }
+            Ok(Arc::new(buf))
+        })?;
+        let mut made = made.into_iter();
+        Self::assemble(w, h, fmt, palette, tx_n, base, |tx, ty| {
+            if pick.contains(tx, ty) {
+                made.next()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 範囲の描画（段 10）：`pick` のタイルは `src`（中身をそのまま使う操作の入力）のタイルを共有し、ほかは `base`（大きさ・
+    /// 形式が同じ前の値）のタイルか無効なタイルにする。パレットは `src` のもの。`src` の選んだタイルが無効なら `Internal`。
+    pub fn splice(src: &Raster, pick: &Tiles, base: Option<&Raster>) -> Result<Self, EngineError> {
+        Self::check_pick(src.w, src.h, pick)?;
+        if let Some(b) = base
+            && (b.w != src.w || b.h != src.h || b.fmt != src.fmt)
+        {
+            return Err(EngineError::Internal(
+                "範囲の描画の前の値の大きさ・形式が違います".into(),
+            ));
+        }
+        let tx_n = src.tiles_x();
+        for (tx, ty) in pick.iter() {
+            if src.touch((ty * tx_n + tx) as usize) {
+                return Err(hole_error());
+            }
+        }
+        Self::assemble(
+            src.w,
+            src.h,
+            src.fmt,
+            src.palette.clone(),
+            tx_n,
+            base,
+            |tx, ty| {
+                pick.contains(tx, ty)
+                    .then(|| src.tiles[(ty * tx_n + tx) as usize].clone())
+            },
+        )
+    }
+
+    /// 同じ画素のまま、`tiles`（1 辺 [`TILE`]）のタイルを無効にした値（中身は共有したまま。読むと記録される）。
+    pub fn invalidate(&self, tiles: &Tiles) -> Self {
+        let mut holes = Holes::new(self.tiles.len());
+        if let Some(h) = &self.holes {
+            holes.bits.clone_from(&h.bits);
+        }
+        let tx_n = self.tiles_x();
+        for (tx, ty) in tiles.iter() {
+            if tx < tx_n && ty < self.tiles_y() {
+                holes.set((ty * tx_n + tx) as usize);
+            }
+        }
+        Self {
+            holes: holes.any().then(|| Arc::new(holes)),
+            ..self.clone()
+        }
+    }
+
+    /// 選んだタイルの集合が、この大きさのタイルの格子と合うか。
+    fn check_pick(w: u32, h: u32, pick: &Tiles) -> Result<(), EngineError> {
+        if pick.size() != TILE || pick.width() != w || pick.height() != h {
+            return Err(EngineError::Internal(format!(
+                "範囲の描画のタイルの格子が値と合いません（{}×{}、1 辺 {}）",
+                pick.width(),
+                pick.height(),
+                pick.size()
+            )));
+        }
+        Ok(())
+    }
+
+    /// タイルを並べて値にする：`made(tx, ty)` が返すタイルを使い、なければ `base` のタイル（`base` の無効は無効のまま）、
+    /// それもなければ無効な仮のタイル。
+    fn assemble(
+        w: u32,
+        h: u32,
+        fmt: PixelFormat,
+        palette: Option<Arc<Palette>>,
+        tx_n: u32,
+        base: Option<&Raster>,
+        mut made: impl FnMut(u32, u32) -> Option<Arc<Vec<u8>>>,
+    ) -> Result<Self, EngineError> {
+        let (_, ty_n) = Self::tiles_of(w, h);
+        let count = tx_n as usize * ty_n as usize;
+        let bpp = fmt.bytes_per_pixel();
+        let mut holes = Holes::new(count);
+        let mut blanks: Vec<(Blank, Arc<Vec<u8>>)> = Vec::new();
+        let mut tiles = Vec::with_capacity(count);
+        for ty in 0..ty_n {
+            for tx in 0..tx_n {
+                let i = (ty * tx_n + tx) as usize;
+                if let Some(t) = made(tx, ty) {
+                    tiles.push(t);
+                    continue;
+                }
+                if let Some(b) = base {
+                    tiles.push(b.tiles[i].clone());
+                    if b.holes.as_ref().is_some_and(|bh| bh.get(i)) {
+                        holes.set(i);
+                    }
+                    continue;
+                }
+                let rect = tile_rect(w, h, tx, ty);
+                let key = (rect.w, rect.h);
+                let blank = match blanks.iter().find(|(k, _)| *k == key) {
+                    Some((_, t)) => t.clone(),
+                    None => {
+                        let t = Arc::new(alloc_zeroed(rect.w as usize * rect.h as usize * bpp)?);
+                        blanks.push((key, t.clone()));
+                        t
+                    }
+                };
+                tiles.push(blank);
+                holes.set(i);
+            }
+        }
+        Ok(Self {
+            w,
+            h,
+            fmt,
+            palette,
+            tiles,
+            holes: holes.any().then(|| Arc::new(holes)),
+        })
     }
 
     /// `pick` が真のタイルだけを、並列に書き換える。ほかと共有しているタイルだけを複製し（CoW）、
@@ -249,6 +550,7 @@ impl Raster {
         let (w, h) = (self.w, self.h);
         let tx_n = self.tiles_x();
         let palette_len = self.palette.as_ref().map(|p| p.colors.len());
+        let holes = self.holes.clone();
         // 各タイルを 1 つのスレッドだけが触るように、タイルごとの鍵に入れて渡す（鍵の取り合いは起きない）
         let cells: Vec<std::sync::Mutex<Arc<Vec<u8>>>> = std::mem::take(&mut self.tiles)
             .into_iter()
@@ -259,6 +561,9 @@ impl Raster {
             let rect = tile_rect(w, h, tx, ty);
             if !pick(rect) {
                 return Ok(());
+            }
+            if let Some(h) = &holes {
+                h.touch(i);
             }
             let mut guard = cells[i]
                 .lock()
@@ -306,6 +611,9 @@ impl Raster {
             let mut x = x0;
             while x < x1 {
                 let tx = x / TILE;
+                if self.touch((ty * self.tiles_x() + tx) as usize) {
+                    return Err(hole_error());
+                }
                 let tr = self.tile_rect(tx, ty);
                 let tile_end = (tr.right() as u32).min(x1);
                 let tile = self.tile(tx, ty);
@@ -328,7 +636,7 @@ impl Raster {
         Ok(out)
     }
 
-    /// 1 画素（画像の中）。
+    /// 1 画素（画像の中）。無効なタイルの画素は仮の中身を返し、読んだことを記録する（`tile` を通る）。
     pub fn pixel(&self, x: u32, y: u32) -> Option<&[u8]> {
         if x >= self.w || y >= self.h {
             return None;
@@ -341,7 +649,54 @@ impl Raster {
     }
 
     /// ダイジェストに足す（タイルの分け方によらない：大きさ・形式・パレット・行を左から順に）。
+    ///
+    /// 足すバイト列は行を左から順に読んだもので、足し方（何バイトずつ渡すか）は値に効かない（BLAKE3 は流れのハッシュ）。
+    /// 速くするために、行を [`DIGEST_BAND_BYTES`] までの帯に詰めてからまとめて足す（細切れに渡すと BLAKE3 の SIMD の
+    /// 道に乗らない）。幅が 1 タイルに収まる画像は、タイルの中身が行を詰めたものなのでそのまま足す。
     pub fn digest_into(&self, h: &mut Hasher) {
+        // 無効なタイルのある値は、読んだことにする（`Value::digest` は先に断る）
+        if let Some(holes) = &self.holes {
+            holes.read.store(true, Ordering::Relaxed);
+        }
+        self.digest_header(h);
+        if self.tiles_x() == 1 {
+            for tile in &self.tiles {
+                h.raw(tile);
+            }
+            return;
+        }
+        let row_len = self.w as usize * self.bpp();
+        self.digest_bands_into(h, digest_band_rows(row_len));
+    }
+
+    /// 行を `rows` 行ずつの帯に詰めて足す（頭は足さない）。
+    fn digest_bands_into(&self, h: &mut Hasher, rows: usize) {
+        let row_len = self.w as usize * self.bpp();
+        let rows = rows.max(1);
+        let mut band = Vec::new();
+        // 帯の領域を取れなければ、行ごとに足す（値は同じ）
+        if band
+            .try_reserve_exact(row_len.saturating_mul(rows))
+            .is_err()
+        {
+            self.digest_rows_into(h, 0, self.h);
+            return;
+        }
+        let step = u32::try_from(rows).unwrap_or(u32::MAX);
+        let mut y = 0;
+        while y < self.h {
+            let end = self.h.min(y.saturating_add(step));
+            band.clear();
+            for row in y..end {
+                self.extend_row(&mut band, row);
+            }
+            h.raw(&band);
+            y = end;
+        }
+    }
+
+    /// ダイジェストの頭（大きさ・形式・パレット）。
+    fn digest_header(&self, h: &mut Hasher) {
         h.u32(self.w).u32(self.h).u8(self.fmt.code());
         match &self.palette {
             Some(p) => {
@@ -354,8 +709,12 @@ impl Raster {
                 h.u8(0);
             }
         }
+    }
+
+    /// 行 `y0..y1` を、タイルの行ごとに足す（帯に詰める前の足し方。帯を取れないときと、照合のテストに使う）。
+    fn digest_rows_into(&self, h: &mut Hasher, y0: u32, y1: u32) {
         let bpp = self.bpp();
-        for y in 0..self.h {
+        for y in y0..y1 {
             let ty = y / TILE;
             for tx in 0..self.tiles_x() {
                 let tr = self.tile_rect(tx, ty);
@@ -365,6 +724,62 @@ impl Raster {
             }
         }
     }
+
+    /// 行 `y` を左から順に `out` の後ろに足す。
+    fn extend_row(&self, out: &mut Vec<u8>, y: u32) {
+        let bpp = self.bpp();
+        let ty = y / TILE;
+        for tx in 0..self.tiles_x() {
+            let tr = self.tile_rect(tx, ty);
+            let stride = tr.w as usize * bpp;
+            let start = (y - tr.y as u32) as usize * stride;
+            out.extend_from_slice(&self.tile(tx, ty)[start..start + stride]);
+        }
+    }
+
+    /// タイルの実体ごとの（番地, バイト数）を `out` に足す。番地は `Arc` の指す先で、値には効かない（キャッシュが共有を
+    /// 数えるため）。番地は、そのタイルを持つ値が生きている間だけ意味を持つ。
+    pub(crate) fn chunks(&self, out: &mut Vec<(usize, u64)>) {
+        for t in &self.tiles {
+            out.push((Arc::as_ptr(t).addr(), t.len() as u64));
+        }
+    }
+
+    /// 同じ画素のまま、パレットだけを替えた画像（タイルはそのまま共有する）。Indexed8 で、番号がすべて新しい
+    /// パレットの色の数より小さいときだけ（そうでなければ `Internal`）。
+    pub fn with_palette(&self, palette: Palette, mon: &dyn Monitor) -> Result<Self, EngineError> {
+        Self::check_header(self.w, self.h, self.fmt, Some(&palette))?;
+        if palette.colors.len() < self.palette.as_ref().map_or(0, |p| p.colors.len()) {
+            // 色を減らすときは、使っている番号が収まるかを確かめる
+            let n = palette.colors.len();
+            let hole = |i: usize| self.holes.as_ref().is_some_and(|h| h.get(i));
+            par_blocks(self.tiles.len(), mon, |i| {
+                if !hole(i) && self.tiles[i].iter().any(|b| usize::from(*b) >= n) {
+                    Err(EngineError::Internal(
+                        "パレットにない番号の画素があります".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            })?;
+        }
+        Ok(Self {
+            w: self.w,
+            h: self.h,
+            fmt: self.fmt,
+            palette: Some(Arc::new(palette)),
+            tiles: self.tiles.clone(),
+            holes: self.holes.clone(),
+        })
+    }
+}
+
+/// 仮のタイルの大きさ（幅, 高さ）。
+type Blank = (u32, u32);
+
+/// 無効なタイルを読んだときの誤り。
+fn hole_error() -> EngineError {
+    EngineError::Internal("範囲の描画で、無効なタイル（申告した依存の外）を読みました".into())
 }
 
 /// 行を上から順に受け取ってタイルを組む。読み取りの作業領域を 1 タイル行（256 行）ぶんに抑えるので、
@@ -473,6 +888,7 @@ impl RasterBuilder {
             fmt: self.fmt,
             palette: self.palette.map(Arc::new),
             tiles: self.tiles,
+            holes: None,
         })
     }
 }
@@ -483,6 +899,7 @@ impl PartialEq for Raster {
             && self.h == other.h
             && self.fmt == other.fmt
             && self.palette == other.palette
+            && self.holes.as_ref().map(|h| &h.bits) == other.holes.as_ref().map(|h| &h.bits)
             && self
                 .tiles
                 .iter()
@@ -588,6 +1005,97 @@ mod tests {
         let mut h3 = Hasher::new("t");
         b.digest_into(&mut h3);
         assert_ne!(h2.finish(), h3.finish());
+    }
+
+    /// 帯に詰めて足しても、行をタイルごとに足した旧い足し方と同じダイジェスト（ChaCha8 で選んだ大きさ・形式・帯の行の数。
+    /// 端のタイル・1 タイルの幅・帯の端が画像の端と合わないものを含む）。
+    #[test]
+    fn banded_digest_equals_row_by_row() {
+        use rand_chacha::rand_core::Rng;
+        let mut r = crate::determinism::rng(36);
+        let old = |px: &Raster| {
+            let mut h = Hasher::new("t");
+            px.digest_header(&mut h);
+            px.digest_rows_into(&mut h, 0, px.h);
+            h.finish()
+        };
+        let mut cases: Vec<(u32, u32, PixelFormat)> = vec![
+            (1, 1, PixelFormat::Gray8),
+            (256, 3, PixelFormat::Rgba8),
+            (257, 1, PixelFormat::Rgba16),
+            (513, 300, PixelFormat::Rgb8),
+        ];
+        for _ in 0..24 {
+            let w = 1 + r.next_u32() % 800;
+            let h = 1 + r.next_u32() % 600;
+            let fmt = PixelFormat::ALL[(r.next_u32() % 8) as usize];
+            cases.push((w, h, fmt));
+        }
+        for (w, h, fmt) in cases {
+            let mut data = vec![0u8; w as usize * h as usize * fmt.bytes_per_pixel()];
+            r.fill_bytes(&mut data);
+            let px = Raster::from_rows(w, h, fmt, None, &data).unwrap();
+            let want = old(&px);
+            let mut got = Hasher::new("t");
+            px.digest_into(&mut got);
+            assert_eq!(got.finish(), want, "{w}x{h} {fmt:?}");
+            for rows in [1usize, 2, 7, 255, 256, 257, h as usize, h as usize + 3] {
+                let mut banded = Hasher::new("t");
+                px.digest_header(&mut banded);
+                px.digest_bands_into(&mut banded, rows);
+                assert_eq!(banded.finish(), want, "{w}x{h} {fmt:?} {rows} 行");
+            }
+        }
+        // パレットの画像も同じ
+        let pal = Palette {
+            colors: (0..=255u8).map(|i| [i, 0, 255 - i, 255]).collect(),
+        };
+        let mut data = vec![0u8; 700 * 9];
+        r.fill_bytes(&mut data);
+        let px = Raster::from_rows(700, 9, PixelFormat::Indexed8, Some(pal), &data).unwrap();
+        let mut got = Hasher::new("t");
+        px.digest_into(&mut got);
+        assert_eq!(got.finish(), old(&px));
+        // 帯の行の数：4 MiB ÷ 行のバイト数、最低 1 行
+        assert_eq!(digest_band_rows(4096 * 4), 256);
+        assert_eq!(digest_band_rows(32_768 * 8), 16);
+        assert_eq!(digest_band_rows(DIGEST_BAND_BYTES + 1), 1);
+        assert_eq!(digest_band_rows(0), DIGEST_BAND_BYTES);
+    }
+
+    /// パレットだけを替えた画像はタイルを共有し、行を作り直したものと等しい。色を減らすときは番号を確かめる。
+    #[test]
+    fn with_palette_shares_tiles() {
+        let pal = |n: u8| Palette {
+            colors: (0..n).map(|i| [i, i, i, 255]).collect(),
+        };
+        let data: Vec<u8> = (0..600 * 300).map(|i| (i % 7) as u8).collect();
+        let a = Raster::from_rows(600, 300, PixelFormat::Indexed8, Some(pal(8)), &data).unwrap();
+        let mut colors = pal(8);
+        colors.colors[3] = [1, 2, 3, 4];
+        let b = a
+            .with_palette(colors.clone(), &crate::monitor::NoMonitor)
+            .unwrap();
+        let rebuilt =
+            Raster::from_rows(600, 300, PixelFormat::Indexed8, Some(colors), &data).unwrap();
+        assert_eq!(b, rebuilt);
+        for (tx, ty) in [(0, 0), (2, 1)] {
+            assert!(b.shares_tile(&a, tx, ty));
+        }
+        let mut h1 = Hasher::new("t");
+        b.digest_into(&mut h1);
+        let mut h2 = Hasher::new("t");
+        rebuilt.digest_into(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+        // 番号 6 を使っているので 6 色には減らせない。7 色なら減らせる
+        assert!(a.with_palette(pal(6), &crate::monitor::NoMonitor).is_err());
+        assert!(a.with_palette(pal(7), &crate::monitor::NoMonitor).is_ok());
+        // パレットのない形式には付けられない
+        let rgb = Raster::filled(2, 2, PixelFormat::Rgb8, None, &[1, 2, 3]).unwrap();
+        assert!(
+            rgb.with_palette(pal(2), &crate::monitor::NoMonitor)
+                .is_err()
+        );
     }
 
     #[test]

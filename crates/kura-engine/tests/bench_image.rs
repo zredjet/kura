@@ -22,7 +22,8 @@ use kura_engine::value::PixelFormat;
 use kura_engine::{Limits, NoMonitor, Value};
 use serde_json::json;
 
-/// 操作そのものを当てる（文書の計画・メタデータの写し・出力のダイジェストを除く。ダイジェストは 64 MB で 20 ms ほどかかる）。
+/// 操作そのものを当てる（文書の計画・メタデータの写し・出力のダイジェストを除く。ダイジェストは 4096² RGBA8 の 64 MiB で
+/// 約 31 ms かかる。行を帯に詰めて足す前は約 55 ms。段 10、M4 Max の release。`tests/cache.rs` の `bench_cache`）。
 fn render_value(
     id: &str,
     v: u16,
@@ -178,10 +179,10 @@ fn bench_paint() {
         });
         // 差分の適用：999 本の結果に 1 本だけ足す
         let prev = kura_engine::ops::paint::actions::PaintParams {
-            actions: actions[..999].to_vec(),
+            actions: actions[..999].to_vec().into(),
         };
         let all = kura_engine::ops::paint::actions::PaintParams {
-            actions: actions.clone(),
+            actions: actions.clone().into(),
         };
         let limits = Limits::default();
         let mut cx = ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);

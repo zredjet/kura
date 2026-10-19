@@ -1,6 +1,10 @@
 //! テスト・ゴールデン・devtools で使う補助：操作 1 つの文書を作って描く。
 
+pub mod bench;
 pub mod platform;
+pub mod preview;
+pub mod region;
+mod snapshot;
 
 pub use platform::{FakePlatformDecoder, FakePlatformEncoder};
 
@@ -783,7 +787,7 @@ pub fn fuzz_encode(format: &str, data: &[u8]) -> Result<(), String> {
 }
 
 /// 追記だけの引数（`actions` の列）を持つノードを途中で切り、差分の適用（`Op::apply_appended`）が全体を当て直したものと
-/// 同じかを確かめる（E21。実行器が差分を使うのは段 10 からなので、ファズではここで照らす）。違えば `Internal`。
+/// 同じかを確かめる（E21。実行器の経路の照合は `testing::snapshot` と tests/e4.rs）。違えば `Internal`。
 fn check_appended(
     engine: &Engine,
     node: &crate::doc::Node,
@@ -836,9 +840,81 @@ fn check_appended(
     Ok(())
 }
 
+/// キャッシュの道（`Engine::render_cached`）を、冷えた・温まった（当たりを描き直して照らす）・小さい上限の 3 通りで描き、
+/// キャッシュなしの道（`plain`）と照らす（E4）。描けたかどうか・出力のダイジェスト・警告（順も）が同じでなければ `Internal`。
+fn check_cached(
+    engine: &Engine,
+    plan: &crate::render::Plan,
+    value: Value,
+    plain: &Result<crate::render::Rendered, EngineError>,
+) -> Result<(), EngineError> {
+    use crate::render::cache::{FingerprintedInput, NodeCache, RenderOptions};
+    let inputs = BTreeMap::from([(
+        InputId(0),
+        FingerprintedInput::new(value, Digest::default())?,
+    )]);
+    let cold = RenderOptions {
+        digests: true,
+        ..RenderOptions::default()
+    };
+    let verify = RenderOptions {
+        verify_hits: true,
+        ..cold
+    };
+    let mut big = NodeCache::new(1 << 30);
+    let mut small = NodeCache::new(16 << 10);
+    let runs = [
+        (
+            "冷えた",
+            engine.render_cached(plan, &inputs, &mut big, &cold, &NoMonitor),
+        ),
+        (
+            "温まった",
+            engine.render_cached(plan, &inputs, &mut big, &verify, &NoMonitor),
+        ),
+        (
+            "小さい上限",
+            engine.render_cached(plan, &inputs, &mut small, &cold, &NoMonitor),
+        ),
+        (
+            "小さい上限の 2 回目",
+            engine.render_cached(plan, &inputs, &mut small, &verify, &NoMonitor),
+        ),
+    ];
+    for (what, r) in runs {
+        match (plain, r) {
+            (_, Err(EngineError::Internal(m))) => {
+                return Err(EngineError::Internal(format!(
+                    "キャッシュの道（{what}）：{m}"
+                )));
+            }
+            (Ok(p), Ok(c)) => {
+                let want: Vec<Option<Digest>> = p.outputs.iter().map(|o| Some(o.digest)).collect();
+                let got: Vec<Option<Digest>> = c.outputs.iter().map(|o| o.digest).collect();
+                if want != got || p.warnings != c.warnings {
+                    return Err(EngineError::Internal(format!(
+                        "キャッシュの道（{what}）の値・警告がキャッシュなしと違います"
+                    )));
+                }
+            }
+            (Err(_), Err(_)) => {}
+            (p, c) => {
+                return Err(EngineError::Internal(format!(
+                    "キャッシュの道（{what}）とキャッシュなしで、描けたかどうかが違います（なし {}・あり {}）",
+                    p.is_ok(),
+                    c.is_ok()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// ファズの対象：文書の JSON を読み、形を確かめ、エンジン（上限を絞ったもの）で読み込んで、小さな入力（画像・パレットの画像・
 /// フレームの列・音声）で計画を作って描く。見つけたいのは自前のコードの panic と `Internal`（推論と実際の食い違い、
-/// 差分の適用と全体の食い違いを含む）。
+/// 差分の適用と全体の食い違い、キャッシュの道とキャッシュなしの食い違い・キャッシュの当たりと描き直しの食い違い、
+/// 範囲の描画と全体の食い違い・変わった範囲の推論の外の変化、プレビューの段の計画が作れない・等倍で描けるのに段で描けない・
+/// 段の値が道によって違うことを含む）。
 pub fn fuzz_document(data: &[u8]) -> Result<(), String> {
     use crate::geom::{IPoint, IRect};
     use crate::testgen::MetaGen;
@@ -931,17 +1007,34 @@ pub fn fuzz_document(data: &[u8]) -> Result<(), String> {
             let values = BTreeMap::from([(
                 InputId(0),
                 InputValue {
-                    value,
+                    value: value.clone(),
                     source: Digest::default(),
                 },
             )]);
-            if let Err(EngineError::Internal(m)) = engine.render(&plan, &values, &NoMonitor) {
+            let plain = engine.render(&plan, &values, &NoMonitor);
+            if let Err(EngineError::Internal(m)) = plain {
                 return Err(EngineError::Internal(m));
             }
+            // 段 10：範囲の描画と全体の描画の照合、変わった範囲の推論の保守性（種は文書のバイト列から）
+            region::check_region_and_delta(&engine, &g, &value, crate::determinism::fnv1a64(data))?;
+            // 段 10：プレビューの段の計画（作れるか段 0 に落ちる。等倍で描けるなら段でも描け、キャッシュの道と範囲の描画で同じ）
+            let fins = BTreeMap::from([(
+                InputId(0),
+                crate::render::cache::FingerprintedInput::new(value.clone(), Digest::default())?,
+            )]);
+            preview::check_levels(
+                &engine,
+                &plan,
+                &fins,
+                plain.is_ok(),
+                crate::determinism::fnv1a64(data),
+            )?;
+            check_cached(&engine, &plan, value, &plain)?;
         }
         for node in &g.nodes {
             check_appended(&engine, node, &inputs)?;
         }
+        snapshot::check_snapshot(&engine, &g, &inputs)?;
         Ok(())
     });
     match r {

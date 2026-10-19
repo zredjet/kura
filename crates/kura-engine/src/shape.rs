@@ -156,6 +156,30 @@ impl Shape {
         }
     }
 
+    /// 値の中身（画素・PCM）のバイト数の上の見積もり（`AtMost` は最大で数える。あふれたら `u64::MAX`）。
+    /// `Limits::check` の `max_value_bytes` の照らしと、キャッシュ・予算の見積もりが同じ式で数える。
+    pub fn value_bytes(&self) -> u64 {
+        match self {
+            Self::Image { w, h, fmt } => w
+                .max()
+                .saturating_mul(h.max())
+                .saturating_mul(fmt.bytes_per_pixel() as u64),
+            Self::Frames {
+                count, w, h, fmt, ..
+            } => w
+                .max()
+                .saturating_mul(h.max())
+                .saturating_mul(fmt.bytes_per_pixel() as u64)
+                .saturating_mul(count.max()),
+            Self::Audio {
+                channels, frames, ..
+            } => frames
+                .max()
+                .saturating_mul(u64::from(*channels))
+                .saturating_mul(4),
+        }
+    }
+
     /// キャンバスいっぱい（か分からない）フレームの列なら、1 フレームの画像の形（持ち上げに使う）。
     pub fn frame_image(&self) -> Option<Shape> {
         match *self {
@@ -174,6 +198,38 @@ impl Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 値のバイト数：画像は幅×高さ×画素、フレームの列はその数倍、音声は標本×チャンネル×4。AtMost は最大で数え、
+    /// あふれは u64::MAX に止める。
+    #[test]
+    fn value_bytes_counts_the_largest_value() {
+        let img = Shape::Image {
+            w: Dim::AtMost(300),
+            h: Dim::Exact(20),
+            fmt: PixelFormat::Rgba16,
+        };
+        assert_eq!(img.value_bytes(), 300 * 20 * 8);
+        let frames = Shape::Frames {
+            count: Dim::Exact(3),
+            w: Dim::Exact(5),
+            h: Dim::Exact(4),
+            fmt: PixelFormat::Indexed8,
+            full: Fullness::Full,
+        };
+        assert_eq!(frames.value_bytes(), 3 * 5 * 4);
+        let audio = Shape::Audio {
+            rate: 48_000,
+            channels: 2,
+            frames: Dim::AtMost(1_000),
+        };
+        assert_eq!(audio.value_bytes(), 1_000 * 2 * 4);
+        let huge = Shape::Image {
+            w: Dim::Exact(u64::MAX),
+            h: Dim::Exact(2),
+            fmt: PixelFormat::Rgb8,
+        };
+        assert_eq!(huge.value_bytes(), u64::MAX);
+    }
 
     #[test]
     fn admits_exact_and_at_most() {

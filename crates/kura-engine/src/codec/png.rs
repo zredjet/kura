@@ -870,6 +870,22 @@ impl Encoder for PngCodec {
         caps_of(format)
     }
 
+    /// フレームごとに順に書くので 1 フレームぶんの倍率：行を詰めた写し（1 倍。§13）と、圧縮した列（png クレートは IDAT を
+    /// まとめてメモリに組んでから書く。縮まない画素なら値と同じほどで、伸ばすので容量は 2 倍まで）で 3 倍。`fast` は、
+    /// 圧縮が無圧縮より大きければ無圧縮で組み直す（その間はもう 1 倍）ので 4 倍。段 10 の実測（4096² の乱数の Rgba8 を
+    /// 捨てる書き出し先に書いたピークから値を引いたもの）：`balanced` 131 MiB（値の 2.0 倍）、`fast` 219 MiB（3.4 倍）。
+    fn work_bytes(&self, _format: &str, shape: &Shape, opts: &serde_json::Value) -> u64 {
+        let frame = match *shape {
+            Shape::Frames { w, h, fmt, .. } => w
+                .max()
+                .saturating_mul(h.max())
+                .saturating_mul(fmt.bytes_per_pixel() as u64),
+            _ => crate::budget::value_bytes(shape),
+        };
+        let fast = opts.get("compression").and_then(serde_json::Value::as_str) == Some("fast");
+        frame.saturating_mul(if fast { 4 } else { 3 })
+    }
+
     fn encode(
         &self,
         value: &Value,

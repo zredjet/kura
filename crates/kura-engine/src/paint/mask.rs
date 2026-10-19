@@ -12,6 +12,11 @@ pub struct Mask {
     bits: Vec<u64>,
 }
 
+/// `w`×`h` の集合が持つバイト数（行ごとに 64 ビットの語にそろえる。あふれは `u64::MAX` に飽和する）。作業領域の見積もりに使う。
+pub fn mask_bytes(w: u64, h: u64) -> u64 {
+    w.div_ceil(64).saturating_mul(8).saturating_mul(h)
+}
+
 impl Mask {
     /// 空の集合。`rect` は空でないこと。
     pub fn new(rect: IRect) -> Result<Self, EngineError> {

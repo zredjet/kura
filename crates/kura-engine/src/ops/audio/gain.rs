@@ -14,6 +14,7 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::audio_of;
+use crate::render::region::Reach;
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Audio, LoopRange, Value};
@@ -132,6 +133,10 @@ impl Op for Gain {
         Ok(Applied::value(render_all(&k, audio.meta.clone(), cx.mon)?))
     }
 
+    fn work_bytes(_p: &Self::Params, _inputs: &[Shape], out: &Shape) -> crate::op::Work {
+        crate::audio::render_all_work(out)
+    }
+
     fn audio_kernel(
         p: &GainParams,
         inputs: &[&Value],
@@ -180,6 +185,11 @@ impl Op for Gain {
                 }],
             },
         ]
+    }
+
+    // 段 10：範囲（同じ位置。全チャンネル）
+    fn reach(_p: &GainParams, _inputs: &[Shape]) -> Reach {
+        Reach::SameTime
     }
 }
 

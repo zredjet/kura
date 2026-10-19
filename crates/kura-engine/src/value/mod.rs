@@ -248,8 +248,41 @@ impl Value {
         }
     }
 
-    /// エンコードする前の中身のダイジェスト（docs/editing.md §8.6 の式。凍結する）。
+    /// 中身の実体（画像のタイル・音声のチャンネル）ごとの（番地, バイト数）を `out` に足す（キャッシュが共有を 1 度だけ
+    /// 数えるため。同じ実体が 2 度出ることがある）。番地は値に効かず、その実体を持つ値が生きている間だけ意味を持つ。
+    pub(crate) fn chunks(&self, out: &mut Vec<(usize, u64)>) {
+        match self {
+            Self::Image(img) => img.px.chunks(out),
+            Self::Frames(fr) => {
+                for f in fr.frames() {
+                    f.px.chunks(out);
+                }
+            }
+            Self::Audio(a) => {
+                for p in a.planes() {
+                    out.push((Arc::as_ptr(p).addr(), (p.len() as u64).saturating_mul(4)));
+                }
+            }
+        }
+    }
+
+    /// すべての画素が有効なら true（範囲の描画で作った、無効なタイルのある値は false。段 10。音声はいつも true）。
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Self::Image(img) => img.px.is_complete(),
+            Self::Frames(fr) => fr.frames().iter().all(|f| f.px.is_complete()),
+            Self::Audio(_) => true,
+        }
+    }
+
+    /// エンコードする前の中身のダイジェスト（docs/editing.md §8.6 の式。凍結する）。範囲の描画で作った値（無効なタイルの
+    /// ある値）のダイジェストは取らない（`Internal`。保存・照合に部分の値を使わない）。
     pub fn digest(&self) -> Result<Digest, EngineError> {
+        if !self.is_complete() {
+            return Err(EngineError::Internal(
+                "範囲だけを描いた値（無効なタイルのある値）のダイジェストは取れません".into(),
+            ));
+        }
         match self {
             Self::Image(img) => {
                 let mut h = Hasher::new("kura-img-v1");

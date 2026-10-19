@@ -157,6 +157,19 @@ pub enum InputGen {
         base: Box<InputGen>,
         at: Vec<(u16, u64, NonFiniteSample)>,
     },
+    /// 写真らしい合成の画像（Rgb8。ベンチの入力。整数だけで作る）：粗い格子（間隔 `max(16, ⌊長辺/6⌋)`）の色を双一次で
+    /// 補間した大きな濃淡に、細かい格子（その 1/8。2 以上）の ±32 の揺らぎ、画素ごとの −6〜6 の雑音、縁のはっきりした
+    /// 12 個の円（色を −64〜64 ずらす）を足して 0〜255 に切る。格子の色と雑音は `splitmix64`、円は ChaCha8 で種から決める。
+    Photo { w: u32, h: u32, seed: u64 },
+    /// ドット絵のスプライト（`fmt` は Rgba8 か Indexed8。色は 16 色のパレットで、0 番は透明）：各辺に透明な余白
+    /// （1〜max(1, ⌊辺/4⌋) 画素）を残した内側の楕円を、2〜4 画素の塊ごとに 1〜15 番の色で塗る（余白と塊の大きさは
+    /// ChaCha8、塊の色は `splitmix64` で種から決める）。Rgba8 はパレットの色（透明は [0,0,0,0]）。
+    PixelSprite {
+        w: u32,
+        h: u32,
+        fmt: PixelFormat,
+        seed: u64,
+    },
 }
 
 /// `InputGen::NonFinite` で置く値。
@@ -288,6 +301,147 @@ fn upscale(px: &Raster, kx: u32, ky: u32) -> Result<Raster, EngineError> {
         }
         Ok(())
     })
+}
+
+/// `InputGen::Photo` を作る。
+fn photo(w: u32, h: u32, seed: u64) -> Result<Raster, EngineError> {
+    let coarse = (w.max(h) / 6).max(16);
+    let fine = (coarse / 8).max(2);
+    // 格子の点の色（層ごとに別の流れ。画素の位置から決まるので、タイルの分け方によらない）
+    let lattice = |layer: u64, gx: u32, gy: u32| -> [i64; 3] {
+        let v = determinism::splitmix64(
+            determinism::splitmix64(seed ^ layer) ^ (u64::from(gy) << 32 | u64::from(gx)),
+        );
+        [
+            (v & 0xff) as i64,
+            ((v >> 8) & 0xff) as i64,
+            ((v >> 16) & 0xff) as i64,
+        ]
+    };
+    // 間隔 g の格子を双一次で補間する（整数。四捨五入）
+    let bilinear = |layer: u64, g: u32, x: u32, y: u32| -> [i64; 3] {
+        let (gx, gy) = (x / g, y / g);
+        let (fx, fy) = (i64::from(x % g), i64::from(y % g));
+        let g = i64::from(g);
+        let (c00, c10) = (lattice(layer, gx, gy), lattice(layer, gx + 1, gy));
+        let (c01, c11) = (lattice(layer, gx, gy + 1), lattice(layer, gx + 1, gy + 1));
+        let mut out = [0i64; 3];
+        for (k, o) in out.iter_mut().enumerate() {
+            let s = c00[k] * (g - fx) * (g - fy)
+                + c10[k] * fx * (g - fy)
+                + c01[k] * (g - fx) * fy
+                + c11[k] * fx * fy;
+            *o = (s + g * g / 2) / (g * g);
+        }
+        out
+    };
+    // 縁のはっきりした円：(中心 x, 中心 y, 半径, 色のずれ)
+    let short = i64::from(w.min(h).max(1));
+    let mut r = determinism::rng_stream(seed, 1);
+    let discs: Vec<(i64, i64, i64, [i64; 3])> = (0..12)
+        .map(|_| {
+            let cx = i64::from(r.next_u32() % w.max(1));
+            let cy = i64::from(r.next_u32() % h.max(1));
+            let rad = short / 20 + 1 + i64::from(r.next_u32()) % (short / 5 + 1);
+            let mut shift = [0i64; 3];
+            for s in &mut shift {
+                *s = i64::from(r.next_u32() % 129) - 64;
+            }
+            (cx, cy, rad, shift)
+        })
+        .collect();
+    Raster::from_tile_fn(
+        w,
+        h,
+        PixelFormat::Rgb8,
+        None,
+        &crate::monitor::NoMonitor,
+        |t, out| {
+            for (i, px) in out.chunks_exact_mut(3).enumerate() {
+                let x = t.x as u32 + i as u32 % t.w;
+                let y = t.y as u32 + i as u32 / t.w;
+                let base = bilinear(0, coarse, x, y);
+                let detail = bilinear(1, fine, x, y);
+                let n = determinism::splitmix64(
+                    seed ^ 0x9e37_79b9 ^ (u64::from(y) << 32 | u64::from(x)),
+                );
+                let mut c = [0i64; 3];
+                for k in 0..3 {
+                    c[k] = base[k] + (detail[k] - 128) / 4 + ((n >> (8 * k)) % 13) as i64 - 6;
+                }
+                for (cx, cy, rad, shift) in &discs {
+                    let (dx, dy) = (i64::from(x) - cx, i64::from(y) - cy);
+                    if dx * dx + dy * dy <= rad * rad {
+                        for k in 0..3 {
+                            c[k] += shift[k];
+                        }
+                    }
+                }
+                for (o, v) in px.iter_mut().zip(c) {
+                    *o = v.clamp(0, 255) as u8;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+/// `InputGen::PixelSprite` を作る。
+fn pixel_sprite(w: u32, h: u32, fmt: PixelFormat, seed: u64) -> Result<Raster, EngineError> {
+    if !matches!(fmt, PixelFormat::Rgba8 | PixelFormat::Indexed8) {
+        return Err(EngineError::Internal(
+            "ドット絵のスプライトは Rgba8 か Indexed8 です".into(),
+        ));
+    }
+    let palette = palette16();
+    let mut r = determinism::rng(seed);
+    let mut margin = |side: u32| 1 + r.next_u32() % (side / 4).max(1);
+    let (ml, mr, mt, mb) = (margin(w), margin(w), margin(h), margin(h));
+    let block = 2 + r.next_u32() % 3;
+    let (x0, x1) = (i64::from(ml), i64::from(w) - i64::from(mr));
+    let (y0, y1) = (i64::from(mt), i64::from(h) - i64::from(mb));
+    let (cw, ch) = ((x1 - x0).max(0) as i128, (y1 - y0).max(0) as i128);
+    // 内側の矩形に内接する楕円の中か（画素の中心で、座標を 2 倍した整数で比べる）
+    let inside = |x: i64, y: i64| -> bool {
+        if cw == 0 || ch == 0 {
+            return false;
+        }
+        let dx = i128::from(2 * x + 1) - i128::from(x0 + x1);
+        let dy = i128::from(2 * y + 1) - i128::from(y0 + y1);
+        dx * dx * ch * ch + dy * dy * cw * cw <= cw * cw * ch * ch
+    };
+    let bpp = fmt.bytes_per_pixel();
+    let colors = palette.colors.clone();
+    Raster::from_tile_fn(
+        w,
+        h,
+        fmt,
+        (fmt == PixelFormat::Indexed8).then_some(palette),
+        &crate::monitor::NoMonitor,
+        |t, out| {
+            for (i, px) in out.chunks_exact_mut(bpp).enumerate() {
+                let x = t.x + i64::from(i as u32 % t.w);
+                let y = t.y + i64::from(i as u32 / t.w);
+                let idx = if inside(x, y) {
+                    let (bx, by) = (
+                        (x - x0) as u64 / u64::from(block),
+                        (y - y0) as u64 / u64::from(block),
+                    );
+                    1 + (determinism::splitmix64(seed ^ (by << 32 | bx)) % 15) as u8
+                } else {
+                    0
+                };
+                if fmt == PixelFormat::Indexed8 {
+                    px[0] = idx;
+                } else if idx == 0 {
+                    px.copy_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    px.copy_from_slice(&colors[usize::from(idx)]);
+                }
+            }
+            Ok(())
+        },
+    )
 }
 
 /// `InputGen::SpriteSheet` を作る（`cells` は (cols, rows, cellW, cellH)、`space` は (gapX, gapY, marginX, marginY,
@@ -880,6 +1034,14 @@ impl InputGen {
                     a.meta.clone(),
                 )?)))
             }
+            Self::Photo { w, h, seed } => Ok(Value::Image(Arc::new(Image {
+                px: photo(w, h, seed)?,
+                meta: ImageMeta::default(),
+            }))),
+            Self::PixelSprite { w, h, fmt, seed } => Ok(Value::Image(Arc::new(Image {
+                px: pixel_sprite(w, h, fmt, seed)?,
+                meta: ImageMeta::default(),
+            }))),
             // 上で扱った
             Self::WithMeta { .. } => Err(EngineError::Internal("WithMeta は上で扱う".into())),
         }
@@ -934,6 +1096,131 @@ mod tests {
             }
             assert!(digests.windows(2).all(|w| w[0] == w[1]), "{g:?}");
         }
+    }
+
+    /// ベンチの入力（写真・ドット絵）は凍結する：値のダイジェストが決めた値（どの機械・ubuntu の CI でも同じ）で、
+    /// スレッド数によらない。タイルの境（256）をまたぐ大きさで確かめる。
+    #[test]
+    fn bench_inputs_are_frozen() {
+        let cases = [
+            (
+                InputGen::Photo {
+                    w: 300,
+                    h: 260,
+                    seed: 1,
+                },
+                "e65c59ad9e75a6689215252c1feacb00686926d1d219598284d9c94b56e7a709",
+            ),
+            (
+                InputGen::PixelSprite {
+                    w: 270,
+                    h: 33,
+                    fmt: PixelFormat::Rgba8,
+                    seed: 2,
+                },
+                "db7d147cf39d1fab7869e1705b9168627ad7c8ca18b2f2419308b85686f4705c",
+            ),
+            (
+                InputGen::PixelSprite {
+                    w: 270,
+                    h: 33,
+                    fmt: PixelFormat::Indexed8,
+                    seed: 2,
+                },
+                "90d1ded7c9c2a0dd1f062dbff96213d587be468459e6ae357c96cbbb814c1c90",
+            ),
+        ];
+        for (g, want) in cases {
+            let mut digests = Vec::new();
+            for threads in [1, 3] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                digests.push(pool.install(|| g.generate().unwrap().digest().unwrap()));
+            }
+            assert_eq!(digests[0], digests[1], "{g:?}");
+            assert_eq!(digests[0].to_hex(), want, "{g:?}");
+        }
+    }
+
+    /// 写真は Rgb8 で、濃淡・円の縁・雑音がある（どの行も同じ色ではない）。ドット絵は縁が透明で、中に不透明な塊がある。
+    /// Rgba8 と Indexed8 は同じ絵（Indexed8 のパレットの色を引くと Rgba8 になる）。ほかの形式は断る。
+    #[test]
+    fn bench_inputs_have_the_described_shape() {
+        let Value::Image(p) = (InputGen::Photo {
+            w: 120,
+            h: 80,
+            seed: 3,
+        })
+        .generate()
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            (p.px.width(), p.px.height(), p.px.format()),
+            (120, 80, PixelFormat::Rgb8)
+        );
+        let rows = p.px.to_rows().unwrap();
+        assert!(
+            rows.chunks_exact(120 * 3)
+                .all(|r| r.chunks_exact(3).any(|c| c != &r[..3]))
+        );
+        let sprite = |fmt| {
+            let Value::Image(img) = (InputGen::PixelSprite {
+                w: 64,
+                h: 48,
+                fmt,
+                seed: 4,
+            })
+            .generate()
+            .unwrap() else {
+                panic!()
+            };
+            img
+        };
+        let (rgba, idx) = (sprite(PixelFormat::Rgba8), sprite(PixelFormat::Indexed8));
+        let rgba_rows = rgba.px.to_rows().unwrap();
+        let pal = idx.px.palette().unwrap().colors.clone();
+        let from_idx: Vec<u8> = idx
+            .px
+            .to_rows()
+            .unwrap()
+            .iter()
+            .flat_map(|i| {
+                if *i == 0 {
+                    [0, 0, 0, 0]
+                } else {
+                    pal[usize::from(*i)]
+                }
+            })
+            .collect();
+        assert_eq!(rgba_rows, from_idx);
+        let alpha = |x: usize, y: usize| rgba_rows[(y * 64 + x) * 4 + 3];
+        assert!((0..64).all(|x| alpha(x, 0) == 0 && alpha(x, 47) == 0));
+        assert!((0..48).all(|y| alpha(0, y) == 0 && alpha(63, y) == 0));
+        assert_eq!(alpha(32, 24), 255);
+        assert!(
+            InputGen::PixelSprite {
+                w: 8,
+                h: 8,
+                fmt: PixelFormat::Gray8,
+                seed: 0
+            }
+            .generate()
+            .is_err()
+        );
+        // 余白しかない小さなスプライトも作れる
+        assert!(
+            InputGen::PixelSprite {
+                w: 1,
+                h: 1,
+                fmt: PixelFormat::Rgba8,
+                seed: 0
+            }
+            .generate()
+            .is_ok()
+        );
     }
 
     /// 衝撃の繰り返し：周期ごとに 16 フレームの雑音（振幅 0.95 まで）、続く 700 Hz の音（振幅 0.3 まで）、残りは無音。

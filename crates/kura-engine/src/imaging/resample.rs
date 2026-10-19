@@ -25,6 +25,7 @@ use crate::geom::IRect;
 use crate::imaging::pixels::{channel_max, is_16, is_gray, read_rgba, write_rgba};
 use crate::math;
 use crate::monitor::Monitor;
+use crate::render::region::Tiles;
 use crate::value::{PixelFormat, Raster};
 
 /// リサイズのフィルタ。
@@ -37,6 +38,15 @@ pub enum Filter {
 }
 
 impl Filter {
+    /// 重みの範囲の幅 2R（box 1・bilinear 2・Lanczos3 6。作業領域の見積もりに使う整数）。
+    fn two_r(self) -> u64 {
+        match self {
+            Self::Nearest | Self::Box => 1,
+            Self::Bilinear => 2,
+            Self::Lanczos3 => 6,
+        }
+    }
+
     fn support(self) -> f64 {
         match self {
             Self::Nearest | Self::Box => 0.5,
@@ -82,6 +92,78 @@ pub fn nearest_index(x: u32, inn: u32, out: u32) -> u32 {
     (v as u32).min(inn - 1)
 }
 
+/// 平滑なフィルタで、出力の座標 `x` が読む入力の範囲（両端の重み 0 を落とす前の範囲。`taps` と同じ浮動小数の式なので、
+/// `taps(..)[x]` はいつもこの中に収まる）。大きさが変わらない軸は `[x, x + 1)`。
+fn tap_range(inn: u32, out: u32, filter: Filter, x: u32) -> (u32, u32) {
+    if inn == out {
+        return (x, x + 1);
+    }
+    let s = f64::from(inn) / f64::from(out);
+    let f = if s > 1.0 { s } else { 1.0 };
+    let support = filter.support() * f;
+    let c = (f64::from(x) + 0.5) * s;
+    let lo = (c - support).floor();
+    let hi = (c + support).ceil();
+    let lo = if lo < 0.0 { 0 } else { lo as u32 };
+    let hi = if hi > f64::from(inn) { inn } else { hi as u32 };
+    // 合計が 0 のときの「中心にいちばん近い画素」も、この範囲の中にある（lo ≤ ⌊c⌋ < hi）
+    let nearest = (c.floor() as u32).min(inn - 1);
+    (lo.min(nearest), hi.max(nearest + 1))
+}
+
+/// 単調に偽から真になる述語の、最初の真の位置（`0..n` になければ n）。
+fn first_true(n: u32, pred: impl Fn(u32) -> bool) -> u32 {
+    let (mut lo, mut hi) = (0u32, n);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// 出力の軸の区間 `[x0, x1)` が読む入力の軸の区間（段 10。範囲の逆写しに使う。保守的）。最近傍は `nearest_index` の
+/// 範囲、平滑は各座標の重みの範囲の和。区間は出力の大きさで切り、空なら `(0, 0)`。
+pub fn source_span(inn: u32, out: u32, filter: Filter, x0: u32, x1: u32) -> (u32, u32) {
+    let x1 = x1.min(out);
+    if x0 >= x1 || inn == 0 {
+        return (0, 0);
+    }
+    match filter {
+        Filter::Nearest => (
+            nearest_index(x0, inn, out),
+            nearest_index(x1 - 1, inn, out) + 1,
+        ),
+        _ => (
+            tap_range(inn, out, filter, x0).0,
+            tap_range(inn, out, filter, x1 - 1).1,
+        ),
+    }
+}
+
+/// 入力の軸の区間 `[a, b)` を読む出力の軸の区間（段 10。変わった範囲を前へ写すのに使う。保守的）。空なら `(0, 0)`。
+pub fn dest_span(inn: u32, out: u32, filter: Filter, a: u32, b: u32) -> (u32, u32) {
+    let b = b.min(inn);
+    if a >= b || out == 0 {
+        return (0, 0);
+    }
+    // 読む範囲の両端は出力の座標について単調に増えるので、端を 2 分探索で求める
+    let (first, end) = match filter {
+        Filter::Nearest => (
+            first_true(out, |x| nearest_index(x, inn, out) >= a),
+            first_true(out, |x| nearest_index(x, inn, out) >= b),
+        ),
+        _ => (
+            first_true(out, |x| tap_range(inn, out, filter, x).1 > a),
+            first_true(out, |x| tap_range(inn, out, filter, x).0 >= b),
+        ),
+    };
+    if first < end { (first, end) } else { (0, 0) }
+}
+
 /// 最近傍で大きさを変える（形式はそのまま）。
 pub fn resize_nearest(
     px: &Raster,
@@ -89,8 +171,30 @@ pub fn resize_nearest(
     h: u32,
     mon: &dyn Monitor,
 ) -> Result<Raster, EngineError> {
+    px.derive(w, h, mon, nearest_tile(px, w, h))
+}
+
+/// 最近傍で、`pick` のタイルだけを描いたもの（段 10。範囲の描画。ほかは `base` のタイルか無効なタイル）。
+/// 描いたタイルは [`resize_nearest`] と同じ値。
+pub fn resize_nearest_picked(
+    px: &Raster,
+    w: u32,
+    h: u32,
+    mon: &dyn Monitor,
+    pick: &Tiles,
+    base: Option<&Raster>,
+) -> Result<Raster, EngineError> {
+    px.derive_picked(w, h, mon, pick, base, nearest_tile(px, w, h))
+}
+
+/// 最近傍の出力のタイル 1 枚を描く閉包（全体の描画と範囲の描画が同じものを使う）。
+fn nearest_tile(
+    px: &Raster,
+    w: u32,
+    h: u32,
+) -> impl Fn(IRect, &mut [u8]) -> Result<(), EngineError> + Sync + Send + '_ {
     let (iw, ih, bpp) = (px.width(), px.height(), px.bpp());
-    px.derive(w, h, mon, |t, out| {
+    move |t, out| {
         let xs: Vec<u32> = (t.x as u32..t.right() as u32)
             .map(|x| nearest_index(x, iw, w))
             .collect();
@@ -114,7 +218,7 @@ pub fn resize_nearest(
             }
         }
         Ok(())
-    })
+    }
 }
 
 /// 出力の座標 1 つの重み。
@@ -248,6 +352,32 @@ pub fn resize_smooth(
     filter: Filter,
     mon: &dyn Monitor,
 ) -> Result<Raster, EngineError> {
+    smooth(px, w, h, filter, mon, None)
+}
+
+/// box・bilinear・Lanczos3 で、`pick` のタイルだけを描いたもの（段 10。範囲の描画。ほかは `base` のタイルか無効なタイル）。
+/// 描いたタイルは [`resize_smooth`] と同じ値（同じ閉包で描く）。
+pub fn resize_smooth_picked(
+    px: &Raster,
+    w: u32,
+    h: u32,
+    filter: Filter,
+    mon: &dyn Monitor,
+    pick: &Tiles,
+    base: Option<&Raster>,
+) -> Result<Raster, EngineError> {
+    smooth(px, w, h, filter, mon, Some((pick, base)))
+}
+
+/// [`resize_smooth`] の本体。`region` があれば、そのタイルだけを描く（同じ閉包）。
+fn smooth(
+    px: &Raster,
+    w: u32,
+    h: u32,
+    filter: Filter,
+    mon: &dyn Monitor,
+    region: Option<(&Tiles, Option<&Raster>)>,
+) -> Result<Raster, EngineError> {
     let src_fmt = px.format();
     let dst_fmt = smooth_format(src_fmt);
     let gray = is_gray(src_fmt);
@@ -264,7 +394,7 @@ pub fn resize_smooth(
     let ty = taps(px.height(), h, filter);
     let bpp = px.bpp();
     let out_bpp = dst_fmt.bytes_per_pixel();
-    Raster::from_tile_fn(w, h, dst_fmt, None, mon, |t, out| {
+    let tile = |t: IRect, out: &mut [u8]| -> Result<(), EngineError> {
         let xs = &tx[t.x as usize..t.right() as usize];
         let ys = &ty[t.y as usize..t.bottom() as usize];
         let cx0 = xs.iter().map(|k| k.start).min().unwrap_or(0);
@@ -340,13 +470,143 @@ pub fn resize_smooth(
             write_rgba(dst_fmt, c, o)?;
         }
         Ok(())
-    })
+    };
+    match region {
+        None => Raster::from_tile_fn(w, h, dst_fmt, None, mon, tile),
+        Some((pick, base)) => Raster::from_tiles_picked(w, h, dst_fmt, None, mon, pick, base, tile),
+    }
+}
+
+/// [`resize_smooth`] が値のほかに使う作業領域の見積もり（バイト）：(描く間に 1 つだけ持つ分, 出力のタイル 1 枚の仕事ごとの分)。
+/// 大きさが `in_w × in_h`（画素 `in_bpp` バイト）の入力を `out_w × out_h` にする。最近傍は (0, 0)（タイルの行だけ）。
+/// - 1 つだけ：縦横の重みの表（出力の座標ごとに `Taps` の 32 バイトと、重み 4 バイト × 幅。幅は 2R·max(1, ⌈in/out⌉) + 2 以下）。
+/// - タイルごと：縦に畳む acc（TILE² × 4 チャンネル × f32 = 1 MiB）、横に畳んだ 1 行（TILE × 16）、読んだ元の行と線形光の行
+///   （列の幅 × (画素のバイト数 + 16)。列の幅は (TILE + 2R)·⌈in/out⌉ + 2 以下で、入力の幅で頭打ち）。
+///
+/// 段 10 の実測（4096² の乱数の Rgba8 → 2048² の Lanczos3、16 スレッド。ピークから入力と出力の値を引いたもの）：20 MiB
+/// （見積もりは 16 スレッドで 17 MiB。差はプールのスレッドの立ち上げなど、操作に依らない分）。
+pub fn smooth_work(
+    in_w: u64,
+    in_h: u64,
+    in_bpp: u64,
+    out_w: u64,
+    out_h: u64,
+    filter: Filter,
+) -> (u64, u64) {
+    if filter == Filter::Nearest {
+        return (0, 0);
+    }
+    let two_r = filter.two_r();
+    let ratio = |inn: u64, out: u64| inn.div_ceil(out.max(1)).max(1);
+    let table = |inn: u64, out: u64| {
+        let width = two_r.saturating_mul(ratio(inn, out)).saturating_add(2);
+        out.saturating_mul(width.saturating_mul(4).saturating_add(32))
+    };
+    let shared = table(in_w, out_w).saturating_add(table(in_h, out_h));
+    let t = u64::from(crate::value::TILE);
+    let cols = t
+        .saturating_add(two_r)
+        .saturating_mul(ratio(in_w, out_w))
+        .saturating_add(2)
+        .min(in_w);
+    let per_tile = (t * t * 16)
+        .saturating_add(t * 16)
+        .saturating_add(cols.saturating_mul(in_bpp.saturating_add(16)));
+    (shared, per_tile)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::monitor::NoMonitor;
+
+    /// 段 10：軸ごとの逆写し（source_span）は、実際の重み・最近傍の位置をすべて含み、前へ写す（dest_span）は、区間を読む
+    /// 出力の座標をすべて含む（拡大・縮小・非整数・同じ大きさ・1 画素）。
+    #[test]
+    fn axis_spans_cover_the_taps() {
+        let sizes = [
+            (1u32, 7u32),
+            (7, 1),
+            (517, 333),
+            (333, 517),
+            (300, 300),
+            (256, 513),
+            (4096, 1024),
+            (10, 30),
+        ];
+        for (inn, out) in sizes {
+            for filter in [
+                Filter::Nearest,
+                Filter::Box,
+                Filter::Bilinear,
+                Filter::Lanczos3,
+            ] {
+                // 出力の座標ごとの実際の読み元
+                let reads: Vec<(u32, u32)> = match filter {
+                    Filter::Nearest => (0..out)
+                        .map(|x| {
+                            let i = nearest_index(x, inn, out);
+                            (i, i + 1)
+                        })
+                        .collect(),
+                    _ => taps(inn, out, filter)
+                        .iter()
+                        .map(|t| (t.start, t.end()))
+                        .collect(),
+                };
+                let mut r = crate::determinism::rng(u64::from(inn) * 31 + u64::from(out));
+                for _ in 0..40 {
+                    let x0 = (rand_chacha::rand_core::Rng::next_u32(&mut r) % out) as u32;
+                    let x1 = x0 + 1 + rand_chacha::rand_core::Rng::next_u32(&mut r) % (out - x0);
+                    let (s0, s1) = source_span(inn, out, filter, x0, x1);
+                    for (x, (a, b)) in reads.iter().enumerate().take(x1 as usize).skip(x0 as usize)
+                    {
+                        assert!(s0 <= *a && *b <= s1, "{inn}→{out} {filter:?} x={x}");
+                    }
+                    let a = rand_chacha::rand_core::Rng::next_u32(&mut r) % inn;
+                    let b = a + 1 + rand_chacha::rand_core::Rng::next_u32(&mut r) % (inn - a);
+                    let (d0, d1) = dest_span(inn, out, filter, a, b);
+                    for (x, (ra, rb)) in reads.iter().enumerate() {
+                        if *ra < b && *rb > a {
+                            assert!(
+                                d0 as usize <= x && x < d1 as usize,
+                                "{inn}→{out} {filter:?} [{a},{b}) x={x}"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(source_span(inn, out, filter, 5, 5), (0, 0));
+                assert_eq!(dest_span(inn, out, filter, inn, inn + 3), (0, 0));
+            }
+        }
+    }
+
+    /// 作業領域の見積もりは、実際に持つ重みの表と、タイルの読み元の列の幅以上。
+    #[test]
+    fn smooth_work_bounds_the_tables_and_columns() {
+        for (inn, out) in [(4096u32, 1024u32), (100, 333), (7, 1), (1, 50), (640, 640)] {
+            for filter in [Filter::Box, Filter::Bilinear, Filter::Lanczos3] {
+                let tx = taps(inn, out, filter);
+                let held: u64 = tx.iter().map(|k| 32 + 4 * k.weights.len() as u64).sum();
+                let (shared, per_tile) =
+                    smooth_work(u64::from(inn), 1, 4, u64::from(out), 1, filter);
+                assert!(shared >= held, "{inn}→{out} {filter:?}");
+                // タイル 1 枚の読み元の列の幅
+                let t = crate::value::TILE as usize;
+                for xs in tx.chunks(t) {
+                    let lo = xs.iter().map(|k| k.start).min().unwrap();
+                    let hi = xs.iter().map(Taps::end).max().unwrap();
+                    let cols = u64::from(hi - lo);
+                    assert!(per_tile >= 1 << 20);
+                    assert!(per_tile - (t * t * 16 + t * 16) as u64 >= cols * (4 + 16));
+                }
+            }
+        }
+        assert_eq!(smooth_work(10, 10, 4, 5, 5, Filter::Nearest), (0, 0));
+        // 極端な大きさでもあふれない
+        let (s, p) = smooth_work(u64::MAX, u64::MAX, 8, 1, 1, Filter::Lanczos3);
+        assert!(s > 0 && p > 0);
+    }
 
     #[test]
     fn nearest_round_trips_integer_scales() {

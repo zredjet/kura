@@ -39,7 +39,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{
-    DecodeStamp, Decoder, MAX_CHUNKS, ReadSeek, Stage, Tier, contain, png, seek_to, try_vec, wav,
+    DecodeStamp, Decoder, Encoder, MAX_CHUNKS, ReadSeek, Stage, Tier, contain, png, seek_to,
+    try_vec, wav,
 };
 use crate::digest::{Digest, Hasher, canonical};
 use crate::doc::DecodeOptions;
@@ -377,6 +378,23 @@ pub fn write_verified(
     let stamp = write(v, decoded, cx, limits, &mut out, mon)?;
     verify(&mut std::io::Cursor::new(&out), decoded, limits, mon)?;
     Ok((out, stamp))
+}
+
+/// アンカーを書いて読み直す（[`write`] → [`verify`]）間に、値のほかに使う作業領域の見積もり（バイト。§12 のメモリの予算。
+/// 書いたバイト列の置き場所は含めない）。読み直す間は読み直した値（値の 1 倍。§9.4 の「値の 2 倍」）を持つ。1 枚の画像と
+/// 音声は帯・塊ごとに流しながら書くので、書く間は小さい。APNG はフレームごとに PNG（`fast`）で組むので、1 フレームの
+/// 4 倍（`PngCodec` の `work_bytes`）のほうが大きくなりうる。
+pub fn work_bytes(shape: &Shape) -> u64 {
+    let value = crate::budget::value_bytes(shape);
+    match shape {
+        Shape::Frames { .. } => value.max(Encoder::work_bytes(
+            &png::PngCodec,
+            "png",
+            shape,
+            &serde_json::json!({ "compression": "fast" }),
+        )),
+        _ => value,
+    }
 }
 
 /// アンカーを読む。ヘッダの記録の値のダイジェストと照らし、合わなければ [`Mismatch::AnchorBroken`]。

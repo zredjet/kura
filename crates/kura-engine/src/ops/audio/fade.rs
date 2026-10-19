@@ -19,6 +19,7 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{MAX_FRAME_PARAM, audio_of, audio_shape, bad_param};
+use crate::render::region::{Area, Reach};
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Audio, Value};
@@ -203,6 +204,10 @@ impl Op for Fade {
         Ok(Applied::value(render_all(&k, meta, cx.mon)?))
     }
 
+    fn work_bytes(_p: &Self::Params, _inputs: &[Shape], out: &Shape) -> crate::op::Work {
+        crate::audio::render_all_work(out)
+    }
+
     fn audio_kernel(
         p: &FadeParams,
         inputs: &[&Value],
@@ -247,6 +252,43 @@ impl Op for Fade {
                 inputs: vec![noise(43)],
             },
         ]
+    }
+
+    // 段 10：範囲（同じ位置）と、引数を変えたとき・外すときの範囲（フェードの区間）
+    fn reach(_p: &FadeParams, _inputs: &[Shape]) -> Reach {
+        Reach::SameTime
+    }
+
+    fn param_change(old: &FadeParams, new: &FadeParams, inputs: &[Shape]) -> Area {
+        // 倍率はフェードの区間の外で 1 なので、新旧の区間の和だけが変わりうる（曲線を変えたら両方の区間）
+        let Some(n) = inputs
+            .first()
+            .and_then(audio_shape)
+            .and_then(|(_, _, f)| f.exact())
+        else {
+            return Area::All;
+        };
+        let curve = old.curve != new.curve;
+        let mut area = Area::Empty;
+        if curve || old.fade_in != new.fade_in {
+            area.union_with(&Area::span(0, old.fade_in.max(new.fade_in).min(n)));
+        }
+        if curve || old.fade_out != new.fade_out {
+            let len = old.fade_out.max(new.fade_out).min(n);
+            area.union_with(&Area::span(n - len, n));
+        }
+        area
+    }
+
+    fn effect(p: &FadeParams, inputs: &[Shape]) -> Area {
+        let Some(n) = inputs
+            .first()
+            .and_then(audio_shape)
+            .and_then(|(_, _, f)| f.exact())
+        else {
+            return Area::All;
+        };
+        Area::span(0, p.fade_in.min(n)).union(&Area::span(n - p.fade_out.min(n), n))
     }
 }
 

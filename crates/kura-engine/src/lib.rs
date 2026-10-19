@@ -8,6 +8,7 @@
 
 pub mod analysis;
 pub mod audio;
+pub mod budget;
 pub mod codec;
 pub mod determinism;
 pub mod digest;
@@ -23,6 +24,7 @@ pub mod op;
 pub mod ops;
 pub mod paint;
 pub mod render;
+pub mod session;
 pub mod shape;
 pub mod testfiles;
 pub mod testgen;

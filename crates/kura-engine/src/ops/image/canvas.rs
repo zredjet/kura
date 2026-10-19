@@ -21,6 +21,10 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{bad_param, image_of};
+use crate::render::preview::{Preview, scale_rect};
+use crate::render::region::{
+    Area, FrameTiles, Reach, Rects, Tiles, base_image, exact_image_size, pick_of,
+};
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Image, Palette, PixelFormat, Raster, Value};
@@ -99,6 +103,29 @@ pub fn place(
     fill: Option<[u8; 4]>,
     mon: &dyn crate::monitor::Monitor,
 ) -> Result<Raster, EngineError> {
+    place_in(px, rect, fill, mon, None)
+}
+
+/// [`place`] の、`pick` のタイルだけを描いたもの（段 10。範囲の描画。ほかは `base` のタイルか無効なタイル）。
+pub fn place_picked(
+    px: &Raster,
+    rect: IRect,
+    fill: Option<[u8; 4]>,
+    mon: &dyn crate::monitor::Monitor,
+    pick: &Tiles,
+    base: Option<&Raster>,
+) -> Result<Raster, EngineError> {
+    place_in(px, rect, fill, mon, Some((pick, base)))
+}
+
+/// [`place`] の本体。`region` があれば、そのタイルだけを描く（同じ閉包）。
+fn place_in(
+    px: &Raster,
+    rect: IRect,
+    fill: Option<[u8; 4]>,
+    mon: &dyn crate::monitor::Monitor,
+    region: Option<(&Tiles, Option<&Raster>)>,
+) -> Result<Raster, EngineError> {
     let in_fmt = px.format();
     let fmt = out_format(in_fmt, fill);
     let (fill_px, palette) = fill_pixel(fmt, px.palette().map(|p| p.as_ref()), fill)?;
@@ -106,7 +133,7 @@ pub fn place(
     let in_palette = px.palette().map(|p| p.colors.as_slice());
     let (iw, ih) = (i64::from(px.width()), i64::from(px.height()));
     let (in_bpp, bpp) = (px.bpp(), fmt.bytes_per_pixel());
-    Raster::from_tile_fn(rect.w, rect.h, fmt, palette, mon, |t, out| {
+    let tile = |t: IRect, out: &mut [u8]| -> Result<(), EngineError> {
         for p in out.chunks_exact_mut(bpp) {
             p.copy_from_slice(&fill_px);
         }
@@ -133,7 +160,38 @@ pub fn place(
             }
         }
         Ok(())
-    })
+    };
+    match region {
+        None => Raster::from_tile_fn(rect.w, rect.h, fmt, palette, mon, tile),
+        Some((pick, base)) => {
+            Raster::from_tiles_picked(rect.w, rect.h, fmt, palette, mon, pick, base, tile)
+        }
+    }
+}
+
+/// キャンバスのうち、入力の外の部分（`fill` で塗る部分。出力の座標の矩形 4 つまで）。
+fn outside_input(rect: IRect, input: Size) -> Rects {
+    let (w, h) = (i64::from(rect.w), i64::from(rect.h));
+    // 入力の左上は出力の (−x, −y)
+    let (ix0, iy0) = (-rect.x, -rect.y);
+    let (ix1, iy1) = (ix0 + i64::from(input.w), iy0 + i64::from(input.h));
+    let (cx0, cy0, cx1, cy1) = (
+        ix0.clamp(0, w),
+        iy0.clamp(0, h),
+        ix1.clamp(0, w),
+        iy1.clamp(0, h),
+    );
+    let mut out = Rects::new();
+    let mut push = |x0: i64, y0: i64, x1: i64, y1: i64| {
+        if x0 < x1 && y0 < y1 {
+            out.push(IRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32));
+        }
+    };
+    push(0, 0, w, cy0); // 上
+    push(0, cy1, w, h); // 下
+    push(0, cy0, cx0, cy1); // 左
+    push(cx1, cy0, w, cy1); // 右
+    out
 }
 
 impl Op for Canvas {
@@ -291,6 +349,92 @@ impl Op for Canvas {
                 }],
             },
         ]
+    }
+
+    // 段 10：範囲（平行移動の逆写し。入力の外は fill だけ）・引数を変えたときの範囲・範囲の描画
+    const REGION: bool = true;
+
+    fn reach(p: &CanvasParams, inputs: &[Shape]) -> Reach {
+        match inputs.first().and_then(exact_image_size) {
+            Some(in_size) => Reach::Affine {
+                m: IntAffine::translate(-p.rect.x, -p.rect.y),
+                in_size,
+                out_size: Size {
+                    w: p.rect.w,
+                    h: p.rect.h,
+                },
+            },
+            None => Reach::Global,
+        }
+    }
+
+    fn param_change(old: &CanvasParams, new: &CanvasParams, inputs: &[Shape]) -> Area {
+        // fill だけを変え、形式が変わらない（パレットの色を足すこともない）なら、入力の外の部分だけ
+        let (Some(Shape::Image { fmt, .. }), Some(size)) =
+            (inputs.first(), inputs.first().and_then(exact_image_size))
+        else {
+            return Area::All;
+        };
+        if old.rect != new.rect
+            || *fmt == PixelFormat::Indexed8
+            || out_format(*fmt, old.fill) != out_format(*fmt, new.fill)
+        {
+            return Area::All;
+        }
+        if old.fill == new.fill {
+            return Area::Empty;
+        }
+        Area::frame(0, outside_input(new.rect, size))
+    }
+
+    fn effect(p: &CanvasParams, inputs: &[Shape]) -> Area {
+        // 入力と同じ矩形・同じ形式なら、入力をそのまま写すだけ（Indexed8 はパレットに色を足しうるので全体）
+        match (inputs.first(), inputs.first().and_then(exact_image_size)) {
+            (Some(Shape::Image { fmt, .. }), Some(size))
+                if *fmt != PixelFormat::Indexed8
+                    && out_format(*fmt, p.fill) == *fmt
+                    && p.rect == IRect::new(0, 0, size.w, size.h) =>
+            {
+                Area::Empty
+            }
+            _ => Area::All,
+        }
+    }
+
+    fn apply_region(
+        p: &CanvasParams,
+        inputs: &[&Value],
+        tiles: &FrameTiles,
+        base: Option<&Value>,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        Some((|| {
+            cx.check()?;
+            let img = image_of(inputs[0], Self::ID)?;
+            let pick = pick_of(tiles, 0, p.rect.w, p.rect.h);
+            let px = place_picked(&img.px, p.rect, p.fill, cx.mon, &pick, base_image(base)?)?;
+            Ok(Applied::value(Value::Image(Arc::new(Image {
+                px,
+                meta: img.meta.clone(),
+            }))))
+        })())
+    }
+
+    // 段 10：プレビューの段（矩形を床・天井で縮める。入力の外に出てよいので収めない）
+    fn preview(_p: &CanvasParams) -> Preview {
+        Preview::Scaled
+    }
+
+    fn preview_params(
+        p: &CanvasParams,
+        level: u8,
+        _inputs: &[Shape],
+        _full: &[Shape],
+    ) -> CanvasParams {
+        CanvasParams {
+            rect: scale_rect(p.rect, level),
+            fill: p.fill,
+        }
     }
 }
 

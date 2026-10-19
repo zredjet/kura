@@ -16,6 +16,7 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{MAX_FRAME_PARAM, audio_of, audio_shape, bad_param};
+use crate::render::region::Reach;
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::{InputGen, MetaGen};
 use crate::value::{Audio, LoopRange, Value};
@@ -177,6 +178,10 @@ impl Op for Trim {
         Ok(Applied::value(render_all(&k, meta, cx.mon)?))
     }
 
+    fn work_bytes(_p: &Self::Params, _inputs: &[Shape], out: &Shape) -> crate::op::Work {
+        crate::audio::render_all_work(out)
+    }
+
     fn audio_kernel(
         p: &TrimParams,
         inputs: &[&Value],
@@ -233,6 +238,22 @@ impl Op for Trim {
                 }],
             },
         ]
+    }
+
+    // 段 10：範囲（区間をずらす）
+    fn reach(p: &TrimParams, inputs: &[Shape]) -> Reach {
+        // 長さが分からなければ上限の長さで区間を求める（その先には標本がないので保守的）
+        let Some((_, _, frames)) = inputs.first().and_then(audio_shape) else {
+            return Reach::Global;
+        };
+        match range(p, frames.max()) {
+            Some((start, end)) => Reach::Segments(vec![Seg {
+                src_start: start,
+                src_end: end,
+                dst_start: 0,
+            }]),
+            None => Reach::Global,
+        }
     }
 }
 

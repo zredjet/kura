@@ -121,6 +121,40 @@ impl IntAffine {
         (self.b == 0 && self.d == 0 && self.a != 0 && self.e != 0)
             || (self.a == 0 && self.e == 0 && self.b != 0 && self.d != 0)
     }
+
+    /// 逆の写像（段 10。範囲の逆写しに使う）。軸に沿った単位の写像（平行移動・反転・90° の回転。係数が 0 か ±1）だけで、
+    /// ほかの写像やあふれるときは None。
+    pub fn inverse(&self) -> Option<Self> {
+        let unit = |v: i64| (-1..=1).contains(&v);
+        if !self.axis_aligned() || ![self.a, self.b, self.d, self.e].into_iter().all(unit) {
+            return None;
+        }
+        // 係数の行列は直交で ±1 だけなので、逆は転置。平行移動は −(転置)·(c, f)
+        let (a, b, d, e) = (self.a, self.d, self.b, self.e);
+        let c = a
+            .checked_mul(self.c)?
+            .checked_add(b.checked_mul(self.f)?)?
+            .checked_neg()?;
+        let f = d
+            .checked_mul(self.c)?
+            .checked_add(e.checked_mul(self.f)?)?
+            .checked_neg()?;
+        Some(Self { a, b, c, d, e, f })
+    }
+
+    /// 矩形（画素の集合 `[x, x+w) × [y, y+h)`）を写した矩形。角を写して並べ直すので、軸に沿った写像では正確。
+    /// 空の矩形・あふれるときは None。
+    pub fn map_rect(&self, r: IRect) -> Option<IRect> {
+        if r.w == 0 || r.h == 0 {
+            return None;
+        }
+        let a = self.point(IPoint { x: r.x, y: r.y })?;
+        let b = self.point(IPoint {
+            x: r.x.checked_add(i64::from(r.w))?,
+            y: r.y.checked_add(i64::from(r.h))?,
+        })?;
+        IRect::from_corners(a, b)
+    }
 }
 
 /// 座標の写し方。
@@ -507,6 +541,61 @@ pub fn map_audio_meta(meta: &AudioMeta, map: &TimeMap, out_frames: u64) -> (Audi
 mod tests {
     use super::*;
     use crate::value::Marker;
+
+    /// 逆の写像は、写してから戻すと元の点・矩形になる（平行移動・反転・回転）。倍率や斜めの写像は None。
+    #[test]
+    fn inverse_and_map_rect_round_trip() {
+        let maps = [
+            IntAffine::translate(-7, 12),
+            IntAffine::flip_h(300),
+            IntAffine::flip_v(41),
+            IntAffine::rotate_cw(17),
+            IntAffine::rotate_ccw(23),
+            IntAffine {
+                a: -1,
+                b: 0,
+                c: 30,
+                d: 0,
+                e: -1,
+                f: 9,
+            },
+        ];
+        let rects = [
+            IRect::new(0, 0, 1, 1),
+            IRect::new(5, 3, 10, 7),
+            IRect::new(-4, 250, 300, 2),
+        ];
+        for m in maps {
+            let inv = m.inverse().unwrap();
+            for p in [IPoint { x: 0, y: 0 }, IPoint { x: 13, y: -5 }] {
+                assert_eq!(inv.point(m.point(p).unwrap()), Some(p), "{m:?}");
+            }
+            for r in rects {
+                let there = m.map_rect(r).unwrap();
+                assert_eq!(
+                    u64::from(there.w) * u64::from(there.h),
+                    u64::from(r.w) * u64::from(r.h)
+                );
+                assert_eq!(inv.map_rect(there), Some(r), "{m:?} {r:?}");
+            }
+        }
+        assert!(IntAffine::scale(2, 1).inverse().is_none());
+        let skew = IntAffine {
+            a: 1,
+            b: 1,
+            c: 0,
+            d: 0,
+            e: 1,
+            f: 0,
+        };
+        assert!(skew.inverse().is_none());
+        assert!(IntAffine::translate(i64::MIN, 0).inverse().is_none());
+        assert!(
+            IntAffine::translate(1, 1)
+                .map_rect(IRect::new(0, 0, 0, 3))
+                .is_none()
+        );
+    }
 
     fn grid() -> Grid {
         Grid {

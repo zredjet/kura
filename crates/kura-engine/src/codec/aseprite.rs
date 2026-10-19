@@ -17,7 +17,12 @@
 //! - スライスは、フレーム 0 の鍵（なければ最初の鍵）を、キャンバスの座標の矩形・9 分割の中央・ピボットにする。
 //!   タグはアニメのタグとして運ぶ。ICC（色のプロファイルのチャンク）を運ぶ。
 //! - 上限：ファイル全体を読む前に大きさを `max_value_bytes` で、セル・タイルセットの展開を、それぞれの大きさちょうどで抑える。
+//! - セルは、描く前にフレームごとの「層 → その層の最初のセル」の表を 1 度だけ作って引く（描く順・リンク・最後に使うフレーム
+//!   のどれも。セルの並びを層ごとに走査しないので、ない層のセルや層の多いファイルでもセルの数 × 層の数の手間にならない）。
+//!   表を作る・引く手間 4,096 ごとに中止を確かめる。描く層を毎フレームたどる手間（層 × フレームの数）は残る（中止は効く）。
 
+use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::io::SeekFrom;
 use std::sync::Arc;
 
@@ -650,6 +655,36 @@ impl Sprite {
     }
 }
 
+/// 読んだ値の形（`shape` と `decode` で共通）。
+fn shape_of(s: &Sprite, tree: &Tree) -> Shape {
+    let fmt = s.out_format(s.index_mode(tree));
+    let (w, h) = (Dim::Exact(u64::from(s.w)), Dim::Exact(u64::from(s.h)));
+    if s.frames.len() == 1 {
+        Shape::Image { w, h, fmt }
+    } else {
+        Shape::Frames {
+            count: Dim::Exact(s.frames.len() as u64),
+            w,
+            h,
+            fmt,
+            full: Fullness::Full,
+        }
+    }
+}
+
+/// 読む間の作業領域のうち、ファイル（全体を読んで持つ）を除いた分：持っておく展開したセル・タイルセット（値の大きさまで。
+/// `Caches`）と、RGBA のキャンバス 5 枚ぶん（合成のキャンバス・展開中のセル 1 つ・タイルマップとタイルセット・別に合成する
+/// グループの入れ子 2 段）。キャンバスより大きいセル・タイルセット、3 段より深いグループの入れ子、ファイルの構造（セルの数に
+/// 比例する）は数えない。
+fn work_besides_the_file(shape: &Shape) -> u64 {
+    let (w, h) = match *shape {
+        Shape::Image { w, h, .. } | Shape::Frames { w, h, .. } => (w.max(), h.max()),
+        Shape::Audio { .. } => return 0,
+    };
+    let canvas = w.saturating_mul(h).saturating_mul(4);
+    shape.value_bytes().saturating_add(canvas.saturating_mul(5))
+}
+
 /// 読み取りの準備（形と中身で共通）。
 fn prepare(
     src: &mut dyn ReadSeek,
@@ -674,6 +709,19 @@ impl Decoder for AsepriteCodec {
         format == "aseprite"
     }
 
+    /// ファイル全体を読んで持つ。長さが分からなければ、ファイルは値の大きさとみなす（圧縮した絵ならふつうはもっと小さい。
+    /// 縮まない画素の層が多いと超えるので、呼び手が長さを知っていれば [`Decoder::file_work_bytes`] を使う）。
+    fn work_bytes(&self, _format: &str, shape: &Shape) -> u64 {
+        shape
+            .value_bytes()
+            .saturating_add(work_besides_the_file(shape))
+    }
+
+    /// ファイルの長さ ＋ 持っておく展開したセル（値の大きさまで）＋ キャンバス 5 枚ぶん（`work_besides_the_file`）。
+    fn file_work_bytes(&self, _format: &str, shape: &Shape, len: u64) -> u64 {
+        len.saturating_add(work_besides_the_file(shape))
+    }
+
     fn shape(
         &self,
         src: &mut dyn ReadSeek,
@@ -682,19 +730,7 @@ impl Decoder for AsepriteCodec {
         limits: &Limits,
     ) -> Result<Shape, EngineError> {
         let (_, s, tree) = prepare(src, limits)?;
-        let fmt = s.out_format(s.index_mode(&tree));
-        let (w, h) = (Dim::Exact(u64::from(s.w)), Dim::Exact(u64::from(s.h)));
-        Ok(if s.frames.len() == 1 {
-            Shape::Image { w, h, fmt }
-        } else {
-            Shape::Frames {
-                count: Dim::Exact(s.frames.len() as u64),
-                w,
-                h,
-                fmt,
-                full: Fullness::Full,
-            }
-        })
+        Ok(shape_of(&s, &tree))
     }
 
     fn decode(
@@ -705,28 +741,98 @@ impl Decoder for AsepriteCodec {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
-        let (file, s, tree) = prepare(src, limits)?;
-        let index_mode = s.index_mode(&tree);
-        let fmt = s.out_format(index_mode);
-        let background = s.has_background(&tree);
-        let mut cx = RenderCx {
-            s: &s,
-            file: &file,
-            tree: &tree,
-            limits,
-            mon,
-            caches: Caches::default(),
-            frame_bytes: 0,
-        };
+        decode_counted(src, limits, mon).map(|(v, _)| v)
+    }
+}
+
+/// セルの表を作る・引く手間（[`Held::steps`]）の、中止を確かめる間隔。
+const CANCEL_EVERY: u64 = 4_096;
+
+/// 読む間に持ったものの量（テストで、作業領域の見積もりと照らす）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Held {
+    /// ファイルの長さ（全体を読んで持つ）。
+    file: u64,
+    /// 展開したセル・タイルセットを持っておいた量の最大。
+    retained: u64,
+    /// セルの表の手間（表を作るときに見たセルの数 ＋ 表を引いた回数。セルの数 ＋ 層 × フレームの数に比例する）。
+    steps: u64,
+}
+
+/// 読む。値と、持ったものの量を返す。
+fn decode_counted(
+    src: &mut dyn ReadSeek,
+    limits: &Limits,
+    mon: &dyn Monitor,
+) -> Result<(Value, Held), EngineError> {
+    let mut held = Held::default();
+    let v = decode_into(src, limits, mon, &mut held)?;
+    Ok((v, held))
+}
+
+/// 読む。持ったものの量を `held` に書く（誤り・中止のときも、そこまでの量）。
+fn decode_into(
+    src: &mut dyn ReadSeek,
+    limits: &Limits,
+    mon: &dyn Monitor,
+    held: &mut Held,
+) -> Result<Value, EngineError> {
+    let (file, s, tree) = prepare(src, limits)?;
+    let index_mode = s.index_mode(&tree);
+    let fmt = s.out_format(index_mode);
+    let background = s.has_background(&tree);
+    // 展開したセル・タイルセットを持っておくのは値の大きさまで（作業領域の見積もりと同じ。層 × フレームの数で増やさない）
+    let retain_cap = limits
+        .max_value_bytes
+        .min(shape_of(&s, &tree).value_bytes());
+    let mut cx = RenderCx {
+        s: &s,
+        file: &file,
+        tree: &tree,
+        limits,
+        mon,
+        caches: Caches::default(),
+        frame_bytes: 0,
+        frame: 0,
+        last_use: BTreeMap::new(),
+        retain_cap,
+        first: Vec::new(),
+        steps: Cell::new(0),
+    };
+    held.file = file.len() as u64;
+    let r = cx.render_frames(index_mode, background, fmt);
+    held.retained = cx.caches.peak;
+    held.steps = cx.steps.get();
+    let mut out = r?;
+    let meta = s.meta.clone();
+    if out.len() == 1 {
+        let (px, _) = out.remove(0);
+        return Ok(Value::Image(Arc::new(Image { px, meta })));
+    }
+    Ok(Value::Frames(Arc::new(Frames::full(out, meta, 0)?)))
+}
+
+impl RenderCx<'_> {
+    /// すべてのフレームを描く（先にセルの表と、セルを最後に使うフレームを求める）。
+    fn render_frames(
+        &mut self,
+        index_mode: bool,
+        background: bool,
+        fmt: PixelFormat,
+    ) -> Result<Vec<(Raster, u32)>, EngineError> {
+        let s = self.s;
+        self.first = self.index_cels()?;
+        self.last_use = self.last_uses()?;
         let mut out = Vec::with_capacity(s.frames.len());
         for f in 0..s.frames.len() {
-            if mon.canceled() {
+            if self.mon.canceled() {
                 return Err(EngineError::Canceled);
             }
-            cx.frame_bytes = 0;
+            self.frame_bytes = 0;
+            self.enter_frame(f);
             let px = if index_mode {
                 let mut canvas = try_vec(s.w as usize * s.h as usize, s.transparent)?;
-                cx.render_indexed(f, None, &mut canvas)?;
+                self.render_indexed(f, None, &mut canvas)?;
                 let mut colors = s.palette.clone();
                 if !background && let Some(c) = colors.get_mut(usize::from(s.transparent)) {
                     c[3] = 0;
@@ -737,26 +843,25 @@ impl Decoder for AsepriteCodec {
                 Raster::from_rows(s.w, s.h, fmt, Some(Palette { colors }), &canvas)?
             } else {
                 let mut canvas = try_vec(s.w as usize * s.h as usize * 4, 0u8)?;
-                cx.render_group(f, None, &mut canvas)?;
+                self.render_group(f, None, &mut canvas)?;
                 Raster::from_rows(s.w, s.h, fmt, None, &canvas)?
             };
             out.push((px, s.frames[f].0));
         }
-        let meta = s.meta.clone();
-        if out.len() == 1 {
-            let (px, _) = out.remove(0);
-            return Ok(Value::Image(Arc::new(Image { px, meta })));
-        }
-        Ok(Value::Frames(Arc::new(Frames::full(out, meta, 0)?)))
+        Ok(out)
     }
 }
 
-/// 展開したもの（タイルセットは ID ごと、セルは元のフレームと層ごと）。合計は `max_value_bytes` まで持ち、超えたら持たない。
+/// 展開したもの（タイルセットは ID ごと、セルは元のフレームと層ごと）。セルは、後のフレームのリンクが指すものだけを、最後に
+/// 使うフレームまで持つ（リンクのないセルは 1 度しか描かない）。合計は値の大きさ（と `max_value_bytes`）まで持ち、超えた分は
+/// 持たずに使うたびに展開し直す（値は同じ）。
 #[derive(Default)]
 struct Caches {
-    tiles: std::collections::BTreeMap<u32, Arc<Vec<u8>>>,
-    cels: std::collections::BTreeMap<(usize, usize), Arc<Vec<u8>>>,
+    tiles: BTreeMap<u32, Arc<Vec<u8>>>,
+    cels: BTreeMap<(usize, usize), Arc<Vec<u8>>>,
     bytes: u64,
+    /// `bytes` の最大。
+    peak: u64,
 }
 
 /// zlib を、上限で確保した `expect` バイトの領域にちょうど展開する（多くても少なくても壊れたファイル）。
@@ -792,6 +897,16 @@ struct RenderCx<'a> {
     caches: Caches,
     /// このフレームで展開したバイト（`max_value_bytes` まで）。
     frame_bytes: u64,
+    /// 描いているフレーム。
+    frame: usize,
+    /// セル（元のフレームと層）ごとの、それを描く最後のフレーム。
+    last_use: BTreeMap<(usize, usize), usize>,
+    /// 展開したものを持っておく量の上限。
+    retain_cap: u64,
+    /// フレームごとの、層 → その層の最初のセルの位置（`Sprite::frames` のセルの添字。木にある層だけ）。
+    first: Vec<BTreeMap<usize, usize>>,
+    /// セルの表の手間（[`Held::steps`]）。
+    steps: Cell<u64>,
 }
 
 impl<'a> RenderCx<'a> {
@@ -808,25 +923,95 @@ impl<'a> RenderCx<'a> {
 
     fn keep(&mut self, n: usize) -> bool {
         let next = self.caches.bytes.saturating_add(n as u64);
-        if next > self.limits.max_value_bytes {
+        if next > self.retain_cap {
             return false;
         }
         self.caches.bytes = next;
+        self.caches.peak = self.caches.peak.max(next);
         true
+    }
+
+    /// 手間を 1 つ数え、[`CANCEL_EVERY`] ごとに中止を確かめる。
+    fn step(&self) -> Result<(), EngineError> {
+        let n = self.steps.get().saturating_add(1);
+        self.steps.set(n);
+        if n.is_multiple_of(CANCEL_EVERY) && self.mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
+        Ok(())
+    }
+
+    /// セルの表（[`RenderCx::first`]）を作る。どの層の引きも、セルの並びを頭から走査しない（ない層のセル・層の多い
+    /// ファイルで、セルの数 × 層の数の手間にしない）。同じ層のセルが 2 つ以上あれば、最初のもの（描くのは最初のセル）。
+    fn index_cels(&self) -> Result<Vec<BTreeMap<usize, usize>>, EngineError> {
+        let s = self.s;
+        let mut first = Vec::with_capacity(s.frames.len());
+        for (_, cels) in &s.frames {
+            let mut map = BTreeMap::new();
+            for (i, c) in cels.iter().enumerate() {
+                self.step()?;
+                if c.layer < s.layers.len() {
+                    map.entry(c.layer).or_insert(i);
+                }
+            }
+            first.push(map);
+        }
+        Ok(first)
+    }
+
+    /// フレーム `f` の層 `layer` の最初のセル（リンクをたどらない）。
+    fn first_cel(&self, f: usize, layer: usize) -> Result<Option<&'a Cel>, EngineError> {
+        self.step()?;
+        let s: &'a Sprite = self.s;
+        Ok(self
+            .first
+            .get(f)
+            .and_then(|m| m.get(&layer))
+            .and_then(|i| s.frames.get(f).and_then(|(_, cels)| cels.get(*i))))
+    }
+
+    /// セル（元のフレームと層）ごとの、それを描く最後のフレーム（リンクをたどる。たどれないものは描くときに誤りになる）。
+    /// 木にある層だけ（ない層のセルは描かない）。
+    fn last_uses(&self) -> Result<BTreeMap<(usize, usize), usize>, EngineError> {
+        let mut last = BTreeMap::new();
+        for (f, layers) in self.first.iter().enumerate() {
+            for layer in layers.keys() {
+                self.step()?;
+                match self.cel_of(f, *layer) {
+                    Ok(Some((src, _))) => {
+                        last.insert((src, *layer), f);
+                    }
+                    Err(EngineError::Canceled) => return Err(EngineError::Canceled),
+                    Ok(None) | Err(_) => {}
+                }
+            }
+        }
+        Ok(last)
+    }
+
+    /// フレーム `f` を描き始める：もう描かないセルを手放す。
+    fn enter_frame(&mut self, f: usize) {
+        self.frame = f;
+        let last_use = &self.last_use;
+        let mut freed = 0u64;
+        self.caches.cels.retain(|k, v| {
+            let keep = last_use.get(k).is_some_and(|last| *last >= f);
+            if !keep {
+                freed = freed.saturating_add(v.len() as u64);
+            }
+            keep
+        });
+        self.caches.bytes = self.caches.bytes.saturating_sub(freed);
     }
 
     /// フレーム `f` の層 `layer` のセル（リンクをたどる）。元のフレームの番号も返す。
     fn cel_of(&self, f: usize, layer: usize) -> Result<Option<(usize, &'a Cel)>, EngineError> {
-        let s: &'a Sprite = self.s;
-        let Some(c) = s.frames[f].1.iter().find(|c| c.layer == layer) else {
+        let Some(c) = self.first_cel(f, layer)? else {
             return Ok(None);
         };
         if let Content::Linked(to) = c.content {
             let to = usize::from(to);
-            let target = s
-                .frames
-                .get(to)
-                .and_then(|(_, cels)| cels.iter().find(|c| c.layer == layer));
+            let target = self.first_cel(to, layer)?;
             return match target {
                 Some(t) if !matches!(t.content, Content::Linked(_)) => Ok(Some((to, t))),
                 Some(_) => Err(err("リンクしたセルがリンクを指しています")),
@@ -869,7 +1054,12 @@ impl<'a> RenderCx<'a> {
                 .map(<[u8]>::to_vec)
                 .ok_or_else(|| err("セルの画素が足りません"))?
         });
-        if self.keep(n) {
+        // 後のフレームで描くもの（リンクが指すもの）だけを持っておく
+        let later = self
+            .last_use
+            .get(&key)
+            .is_some_and(|last| *last > self.frame);
+        if later && self.keep(n) {
             self.caches.cels.insert(key, px.clone());
         }
         Ok(px)
@@ -1009,23 +1199,15 @@ impl<'a> RenderCx<'a> {
     }
 
     /// 子の描く順（位置 + z、同じなら z の小さい順）。グループの子は、グループの位置にまとめて描く。
-    fn children(&self, f: usize, parent: Option<usize>) -> Vec<usize> {
-        let s = self.s;
-        let list = &self.tree.kids[parent.unwrap_or(s.layers.len())];
-        let mut kids: Vec<(i64, i64, usize)> = list
-            .iter()
-            .enumerate()
-            .map(|(pos, &i)| {
-                let z = s.frames[f]
-                    .1
-                    .iter()
-                    .find(|c| c.layer == i)
-                    .map_or(0, |c| i64::from(c.z));
-                (pos as i64 + z, z, i)
-            })
-            .collect();
+    fn children(&self, f: usize, parent: Option<usize>) -> Result<Vec<usize>, EngineError> {
+        let list = &self.tree.kids[parent.unwrap_or(self.s.layers.len())];
+        let mut kids: Vec<(i64, i64, usize)> = Vec::with_capacity(list.len());
+        for (pos, &i) in list.iter().enumerate() {
+            let z = self.first_cel(f, i)?.map_or(0, |c| i64::from(c.z));
+            kids.push((pos as i64 + z, z, i));
+        }
         kids.sort();
-        kids.into_iter().map(|k| k.2).collect()
+        Ok(kids.into_iter().map(|k| k.2).collect())
     }
 
     /// RGBA8 で、`parent` の子を `canvas` に描く。
@@ -1037,7 +1219,7 @@ impl<'a> RenderCx<'a> {
     ) -> Result<(), EngineError> {
         let s = self.s;
         let cw = s.w as usize;
-        for i in self.children(f, parent) {
+        for i in self.children(f, parent)? {
             let l = &s.layers[i];
             if !l.visible || l.reference {
                 continue;
@@ -1098,7 +1280,7 @@ impl<'a> RenderCx<'a> {
     ) -> Result<(), EngineError> {
         let s = self.s;
         let cw = s.w as usize;
-        for i in self.children(f, parent) {
+        for i in self.children(f, parent)? {
             let l = &s.layers[i];
             if !l.visible || l.reference {
                 continue;
@@ -1498,6 +1680,168 @@ mod tests {
         .unwrap();
         let Value::Image(img) = &bg else { panic!() };
         assert_eq!(img.px.palette().unwrap().colors[0][3], 255);
+    }
+
+    /// 層 `layers` 枚・フレーム `frames` 個の w×h のスプライト（どのセルもキャンバスいっぱいの圧縮した画像）。`linked` なら
+    /// フレーム 1 からのセルはどれもフレーム 0 のセルを指す。`groups` なら、層を 2 段の入れ子のグループに入れて別に合成する。
+    fn layered(w: u16, h: u16, layers: u16, frames: u16, linked: bool, groups: bool) -> FileGen {
+        let mut ls = Vec::new();
+        if groups {
+            ls.push(layer(1, 1, 0, 0, 255));
+            ls.push(layer(1, 1, 1, 0, 200));
+        }
+        let level = if groups { 2 } else { 0 };
+        let first = ls.len() as u16;
+        ls.extend((0..layers).map(|_| layer(1, 0, level, 0, 255)));
+        let fs = (0..frames)
+            .map(|f| AseFrame {
+                duration: 10,
+                cels: (first..first + layers)
+                    .map(|l| {
+                        if linked && f > 0 {
+                            AseCel {
+                                kind: 1,
+                                link: 0,
+                                ..cel(l, 0, 0, w, h)
+                            }
+                        } else {
+                            cel(l, 0, 0, w, h)
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut g = sprite(32, if groups { 3 } else { 1 }, ls, fs);
+        if let FileGen::Aseprite { w: gw, h: gh, .. } = &mut g {
+            (*gw, *gh) = (w, h);
+        }
+        g
+    }
+
+    /// 作業領域（段 10 の検証の X2。docs/editing.md §9.9）：展開したセルは、後のフレームのリンクが指すものだけを、値の大きさまで持つ（層 × フレームの数で
+    /// 増えない）。見積もり（`work_bytes`・`file_work_bytes`）は、ファイル全体 ＋ 持っておくセルの上限（値の大きさ）＋ キャンバス
+    /// 5 枚ぶん（合成のキャンバス・展開中のセル・タイルマップ・2 段の入れ子のグループ）以上。
+    #[test]
+    fn work_covers_the_file_and_the_retained_cels() {
+        for (layers, frames, linked, groups) in [
+            (16, 1, false, false),
+            (16, 4, false, false),
+            (16, 4, true, false),
+            (3, 6, true, true),
+            (40, 2, true, false),
+        ] {
+            let g = layered(64, 48, layers, frames, linked, groups);
+            let bytes = g.bytes().unwrap();
+            let (v, held) = decode_counted(
+                &mut Cursor::new(bytes.clone()),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+            assert_eq!(v, decode(&g).unwrap());
+            let what =
+                format!("層 {layers}・フレーム {frames}・リンク {linked}・グループ {groups}");
+            let shape = v.shape();
+            let value = shape.value_bytes();
+            let canvas = 64 * 48 * 4;
+            assert_eq!(held.file, bytes.len() as u64);
+            if !linked {
+                assert_eq!(held.retained, 0, "{what}：リンクのないセルは持たない");
+            }
+            assert!(held.retained <= value, "{what}：{held:?} > 値 {value}");
+            let declared = AsepriteCodec.file_work_bytes("aseprite", &shape, held.file);
+            assert!(
+                declared >= held.file + value + 5 * canvas,
+                "{what}：{declared}"
+            );
+            // 長さが分からなければ、ファイルは値の大きさとみなす
+            assert!(AsepriteCodec.work_bytes("aseprite", &shape) >= 2 * value + 5 * canvas);
+        }
+    }
+
+    /// 層 `layers` 枚（層 0 だけ見える）・フレーム `frames` 個の 4×4 のスプライト。フレーム 0 の層 0 は生のセル、ほかの
+    /// フレームの層 0 はフレーム 0 へのリンク。どのフレームも、そのあとに、ない層（層の数から `distinct` 個）のリンクのセルを
+    /// 並べ、残りを最後のない層の番号で埋めて、セルを `cels` 個にする（段 10 の確認で、セルの数の 2 乗の手間になった形）。
+    fn crowded(layers: u16, frames: u16, distinct: u16, cels: usize) -> FileGen {
+        let link = |l: u16| AseCel {
+            kind: 1,
+            link: 0,
+            ..cel(l, 0, 0, 0, 0)
+        };
+        let fs = (0..frames)
+            .map(|f| {
+                let mut cs = vec![if f == 0 { cel(0, 0, 0, 4, 4) } else { link(0) }];
+                cs.extend((0..distinct).map(|i| link(layers + i)));
+                while cs.len() < cels {
+                    cs.push(link(layers + distinct - 1));
+                }
+                AseFrame {
+                    duration: 10,
+                    cels: cs,
+                }
+            })
+            .collect();
+        let ls = (0..layers)
+            .map(|i| layer(u16::from(i == 0), 0, 0, 0, 255))
+            .collect();
+        let mut g = sprite(32, 1, ls, fs);
+        if let FileGen::Aseprite { w, h, .. } = &mut g {
+            (*w, *h) = (4, 4);
+        }
+        g
+    }
+
+    /// 段 10 の確認（aseprite のセルの手間）：セルの表を引く手間は、セルの数 ＋ 層 × フレームの数に比例する（ない層の
+    /// セルが多いファイルも、層が多いファイルも、セルの並びを層ごとに頭から走査しない）。
+    #[test]
+    fn cel_lookups_grow_with_the_cels_and_layers() {
+        for (layers, frames, distinct, cels) in [
+            (1, 1, 3_000, 12_000),
+            (2, 3, 1_500, 6_000),
+            (3_000, 1, 1, 12_000),
+            (1_500, 3, 1, 3_000),
+        ] {
+            let g = crowded(layers, frames, distinct, cels);
+            let (v, held) = decode_counted(
+                &mut Cursor::new(g.bytes().unwrap()),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+            assert_eq!(v.shape().value_bytes(), 4 * 4 * 4 * u64::from(frames));
+            let size = (cels as u64 + u64::from(layers)) * u64::from(frames);
+            assert!(
+                held.steps <= 4 * size + 64,
+                "層 {layers}・フレーム {frames}・ない層 {distinct}・セル {cels}：手間 {}",
+                held.steps
+            );
+        }
+    }
+
+    /// 段 10 の確認（aseprite のセルの手間）：セルの表を作る間・層をたどる間に頼んだ中止は、すぐ `Canceled` になる（手間
+    /// `CANCEL_EVERY` ごとに確かめる）。
+    #[test]
+    fn cancel_while_walking_cels_and_layers() {
+        for (layers, distinct, cels) in [(1, 3_000, 12_000), (12_000, 1, 100)] {
+            let bytes = crowded(layers, 1, distinct, cels).bytes().unwrap();
+            for k in 1..=3 {
+                let mon = crate::monitor::CancelAfter::new(k);
+                let mut held = Held::default();
+                let r = decode_into(
+                    &mut Cursor::new(bytes.clone()),
+                    &Limits::default(),
+                    &mon,
+                    &mut held,
+                );
+                let what = format!("層 {layers}・ない層 {distinct}・セル {cels}・{k} 回目で中止");
+                assert!(matches!(r, Err(EngineError::Canceled)), "{what}：{r:?}");
+                assert!(
+                    held.steps <= k * CANCEL_EVERY,
+                    "{what}：中止までの手間 {}",
+                    held.steps
+                );
+            }
+        }
     }
 
     /// スライス・タグ・リンク・表示時間を読む。

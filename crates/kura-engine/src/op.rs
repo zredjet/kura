@@ -16,10 +16,13 @@ use serde::de::DeserializeOwned;
 use crate::analysis::{Analysis, AnalyzeCx, AnyOutput, Need, Solved};
 use crate::audio::AudioKernel;
 use crate::determinism;
+use crate::digest::{Digest, Hasher};
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 use crate::limits::Limits;
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::monitor::Monitor;
+use crate::render::preview::Preview;
+use crate::render::region::{Area, FrameTiles, Reach};
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::Value;
@@ -96,6 +99,17 @@ pub struct ParamSchema {
 }
 
 impl ParamSchema {
+    /// 追記だけの配列の引数（[`ParamKind::Strokes`]）の名前（段 10。セッションと実行器が、追記した分だけを読み・指紋を
+    /// 求め直し・差分で当てる）。ない、または 2 つ以上あれば `None`（差分の口を使わない）。
+    pub fn append_field(&self) -> Option<&'static str> {
+        let mut found = self
+            .params
+            .iter()
+            .filter(|p| matches!(p.kind, ParamKind::Strokes));
+        let first = found.next()?;
+        found.next().is_none().then_some(first.key)
+    }
+
     /// 既定値の引数（JSON のオブジェクト）。
     pub fn defaults(&self) -> serde_json::Value {
         let map: serde_json::Map<String, serde_json::Value> = self
@@ -261,6 +275,38 @@ pub struct Inferred {
     pub cost: u64,
 }
 
+/// 描く間に、入力と出力の値のほかに使う作業領域の見積もり（バイト。§12 のメモリの予算。[`Op::work_bytes`]）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Work {
+    /// 描く間に 1 つだけ持つ分（色の表・重みの表・描いている途中の平面など）。
+    pub shared: u64,
+    /// 並列の仕事（`par_blocks` の 1 ブロック・1 タイル）が 1 つごとに持つ分。同時に動く仕事の数（プールのスレッドの数。
+    /// 呼び手が知っている）を掛けて足す。
+    pub per_task: u64,
+}
+
+impl Work {
+    /// 作業領域なし（既定）。
+    pub const ZERO: Self = Self {
+        shared: 0,
+        per_task: 0,
+    };
+
+    /// 1 つだけ持つ分だけの作業領域。
+    pub fn shared(bytes: u64) -> Self {
+        Self {
+            shared: bytes,
+            per_task: 0,
+        }
+    }
+
+    /// 同時に `tasks` 個の仕事が動くときの合計（あふれは `u64::MAX` に飽和する）。
+    pub fn total(self, tasks: u64) -> u64 {
+        self.shared
+            .saturating_add(self.per_task.saturating_mul(tasks))
+    }
+}
+
 /// 実行の結果。`space`・`time` は実際の写し方：推論が `Unknown` なら必ず返し、そうでなければ返さないか、推論と同じものを返す
 /// （実行器が確かめ、食い違えば内部の誤りにする。E9）。
 #[derive(Debug, Clone)]
@@ -413,6 +459,12 @@ pub trait Op: Send + Sync + 'static {
     fn needs(_p: &Self::Params, _inputs: &[Shape]) -> Result<Vec<Need>, Issues> {
         Ok(Vec::new())
     }
+    /// 描く間に、入力と出力の値のほかに使う作業領域の見積もり（§12 のメモリの予算。描く前に予算を確保するのに使う）。
+    /// `inputs` は `infer` に渡すのと同じ形（持ち上げる操作はフレームの画像の形）、`out` は推論した出力の形。値を変えない。
+    /// 既定は 0（タイル・ブロック 1 つぶんの一時の領域は数えない）。値の数倍の領域を持つ操作だけが上書きする。
+    fn work_bytes(_p: &Self::Params, _inputs: &[Shape], _out: &Shape) -> Work {
+        Work::ZERO
+    }
     /// 実装を消した古い版 `from` の引数を、結果を変えずにこの版へ移す。移せなければ理由を返す。
     /// 呼ばれるのは、`from` より新しい実装のある版のうち、この版がいちばん古いとき（すぐ上の版）。
     fn migrate(from: u16, _raw: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -427,7 +479,9 @@ pub trait Op: Send + Sync + 'static {
     }
     /// 追記だけの引数（描画）の差分の適用：`prev_out` が引数 `prev` の出力のとき、引数 `p` の出力を返す。
     /// `p` が `prev` に追記したものでなければ None（全体を当て直す）。結果は `apply` で全体を当て直したものと
-    /// ビット単位で同じであること（E21。docs/editing.md §10）。
+    /// ビット単位で同じであること（E21。docs/editing.md §10）。警告は足した分だけを出す（前の分は実行器が前回の警告を
+    /// 前に足す）。実行器（`render_cached`）は、メタデータを写す操作（`MetaAccess::Map`）で写し方が恒等（`Identity`）の
+    /// ときだけ、前回の描画の出力（メタデータを写したあとの値。写す前の値と同じ）を `prev_out` に渡して使う。
     fn apply_appended(
         _prev: &Self::Params,
         _prev_out: &Value,
@@ -445,6 +499,82 @@ pub trait Op: Send + Sync + 'static {
         _cx: &mut ApplyCx<'_>,
     ) -> Option<Result<Box<dyn AudioKernel>, EngineError>> {
         None
+    }
+    /// 追記だけの引数の読み込み（段 10。`Engine::compile_snapshot` がセッションの追記に使う）：読んだ引数 `prev` の追記だけの
+    /// 配列 `field` に、正規の形の要素 `items` を足した引数を、足した分だけ読んで作る。結果（読めない要素の指摘も）は、
+    /// 足したあとの引数の JSON を `DynOp::parse` で読んだものと同じであること。足した分だけで読めなければ None（全体を読む）。
+    fn parse_appended(
+        _prev: &Self::Params,
+        _field: &str,
+        _items: &[&serde_json::Value],
+    ) -> Option<Result<Self::Params, Issues>> {
+        None
+    }
+    /// 追記だけの引数の推論（段 10）：`prev_inferred` が同じ入力の形での `prev` の推論の結果のとき、`p`（`prev` に追記したもの）の
+    /// 推論を、足した分だけで求める。結果（指摘も）は `infer` と同じであること。`p` が `prev` への追記でない、または足した分
+    /// だけで求められなければ None（全体を推論する）。
+    fn infer_appended(
+        _prev: &Self::Params,
+        _prev_inferred: &Inferred,
+        _p: &Self::Params,
+        _inputs: &[Shape],
+        _cx: &InferCx<'_>,
+    ) -> Option<Result<Inferred, Issues>> {
+        None
+    }
+
+    // 段 10：範囲と変わった範囲（render/region.rs・delta.rs・area.rs）。どれも既定のままで正しく、遅くなるだけ。
+
+    /// 範囲の描画（`apply_region`）を実装した操作は true。偽の操作と、`reach` が `Global` の引数では、実行器は全体を描く
+    /// （入力も全体で）。真の操作は、`reach` が `Global` でない引数で `apply_region` が必ず Some を返すこと。
+    const REGION: bool = false;
+    /// 出力が入力 0 のどこに依るか（範囲の描画の逆写しと、変わった範囲を前へ写すのに使う。保守的であること）。`inputs` は
+    /// `infer` に渡すのと同じ形（持ち上げる操作はフレームの画像の形）。2 つ目からの入力には、いつも全体で依るとみなす。
+    /// 既定は `Reach::Global`。
+    fn reach(_p: &Self::Params, _inputs: &[Shape]) -> Reach {
+        Reach::Global
+    }
+    /// 入力が同じとき、引数を `old` から `new` に変えて出力が変わりうる範囲（出力のキャンバスの座標。持ち上げる操作は
+    /// 1 フレームの画像の座標で、実行器が全フレームに広げる）。既定は `Area::All`。
+    fn param_change(_old: &Self::Params, _new: &Self::Params, _inputs: &[Shape]) -> Area {
+        Area::All
+    }
+    /// 出力が入力 0 と違いうる範囲（外す・入れるときの変わった範囲。出力と入力 0 の形が同じときだけ使う）。既定は `Area::All`。
+    fn effect(_p: &Self::Params, _inputs: &[Shape]) -> Area {
+        Area::All
+    }
+    /// 範囲の描画：`tiles` のタイル（フレームごと。値のタイル）だけを `apply` と同じ値で描き、ほかのタイルは `base`（前の出力。
+    /// 大きさ・形式・パレットが同じ）のタイルを共有するか、無効なタイル（読むと誤り）にする。入力は `reach` の逆写しで求めた
+    /// 範囲（`tiles` の矩形から）を覆うタイルだけが有効で、その外を読むと誤りになる。メタデータ・写し方・警告は `apply` と
+    /// 同じにする（範囲によらない）。持ち上げる操作は 1 フレームずつ呼ばれる。実装しない操作は None（既定）。
+    fn apply_region(
+        _p: &Self::Params,
+        _inputs: &[&Value],
+        _tiles: &FrameTiles,
+        _base: Option<&Value>,
+        _cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        None
+    }
+
+    // 段 10：プレビューの段（render/preview.rs）。既定のままで正しく、等倍で描く（鎖の継ぎ目になる）だけ。
+
+    /// プレビューの段での扱い（`Preview::Scaled`：引数を段に縮めて描ける、`Preview::Skip`：画素を描かずメタデータを段の座標で
+    /// 書く）。既定は `Preview::FullOnly`（等倍でしか描けない。ここまでを等倍で描き、出力を縮めてから後ろを段で描く）。
+    fn preview(_p: &Self::Params) -> Preview {
+        Preview::FullOnly
+    }
+    /// 引数を段 `level`（1〜3。各軸 1/2^level）に縮めたもの（`preview` が Scaled・Skip のときだけ呼ぶ）。`inputs` は段の入力の形、
+    /// `full` は等倍の計画での同じノードの入力の形（どちらも `infer` に渡すのと同じ形）。矩形を入力の中に収める必要のある操作は、
+    /// 段の入力に収める（clamp。docs/editing.md §7.1）。大きさを決める操作は、等倍の出力の大きさの ⌈n/2^level⌉ を目指す。
+    /// 結果は段の形で推論し直す（通らなければ Scaled は計画を段 0 に落とし、Skip はこのノードを外す）。既定は同じ引数。
+    fn preview_params(
+        p: &Self::Params,
+        _level: u8,
+        _inputs: &[Shape],
+        _full: &[Shape],
+    ) -> Self::Params {
+        p.clone()
     }
 }
 
@@ -469,6 +599,9 @@ pub trait DynOp: Send + Sync {
     fn static_needs(&self) -> &'static [(&'static str, u16)];
     /// この引数・入力の形で先に解く解析（`Op::needs`）。
     fn needs(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Vec<Need>, Issues>;
+    /// 描く間の作業領域の見積もり（`Op::work_bytes`）。
+    fn work_bytes(&self, p: &AnyParams, inputs: &[Shape], out: &Shape)
+    -> Result<Work, EngineError>;
     /// 引数を読み、範囲を確かめる。
     fn parse(&self, raw: &serde_json::Value) -> Result<Box<AnyParams>, Issues>;
     /// 読んだ引数を JSON に戻す（往復のテスト用）。
@@ -499,6 +632,54 @@ pub trait DynOp: Send + Sync {
         inputs: &[&Value],
         cx: &mut ApplyCx<'_>,
     ) -> Option<Result<Box<dyn AudioKernel>, EngineError>>;
+    /// 追記だけの引数の読み込み（`Op::parse_appended`）。
+    fn parse_appended(
+        &self,
+        prev: &AnyParams,
+        field: &str,
+        items: &[&serde_json::Value],
+    ) -> Option<Result<Box<AnyParams>, Issues>>;
+    /// 追記だけの引数の推論（`Op::infer_appended`）。
+    fn infer_appended(
+        &self,
+        prev: &AnyParams,
+        prev_inferred: &Inferred,
+        p: &AnyParams,
+        inputs: &[Shape],
+        cx: &InferCx<'_>,
+    ) -> Option<Result<Inferred, Issues>>;
+    /// 範囲の描画を実装しているか（`Op::REGION`）。
+    fn region(&self) -> bool;
+    /// 出力が入力 0 のどこに依るか（`Op::reach`）。
+    fn reach(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Reach, EngineError>;
+    /// 引数を変えたときに出力が変わりうる範囲（`Op::param_change`）。
+    fn param_change(
+        &self,
+        old: &AnyParams,
+        new: &AnyParams,
+        inputs: &[Shape],
+    ) -> Result<Area, EngineError>;
+    /// 出力が入力 0 と違いうる範囲（`Op::effect`）。
+    fn effect(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Area, EngineError>;
+    /// 範囲の描画（`Op::apply_region`）。
+    fn apply_region(
+        &self,
+        p: &AnyParams,
+        inputs: &[&Value],
+        tiles: &FrameTiles,
+        base: Option<&Value>,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>>;
+    /// プレビューの段での扱い（`Op::preview`）。
+    fn preview(&self, p: &AnyParams) -> Result<Preview, EngineError>;
+    /// 引数を段に縮めたもの（`Op::preview_params`）。
+    fn preview_params(
+        &self,
+        p: &AnyParams,
+        level: u8,
+        inputs: &[Shape],
+        full: &[Shape],
+    ) -> Result<Box<AnyParams>, EngineError>;
 }
 
 /// `Op` を `DynOp` にする包み。
@@ -539,18 +720,23 @@ impl<O: Op> DynOp for OpEntry<O> {
         O::needs(p, inputs)
     }
 
+    fn work_bytes(
+        &self,
+        p: &AnyParams,
+        inputs: &[Shape],
+        out: &Shape,
+    ) -> Result<Work, EngineError> {
+        Ok(O::work_bytes(self.params(p)?, inputs, out))
+    }
+
     fn parse(&self, raw: &serde_json::Value) -> Result<Box<AnyParams>, Issues> {
         // 範囲・列挙を先に見る（どの引数がおかしいかを示せる）
         let ranges = O::Params::schema().check_ranges(raw);
         if ranges.has_errors() {
             return Err(ranges);
         }
-        let typed: O::Params = serde_json::from_value(raw.clone()).map_err(|e| {
-            Issues::one(Issue::error(
-                IssueCode::BadParams,
-                format!("{} の引数が読めません: {e}", O::ID),
-            ))
-        })?;
+        let typed: O::Params =
+            serde_json::from_value(raw.clone()).map_err(|e| unreadable_params(O::ID, &e))?;
         Ok(Box::new(typed))
     }
 
@@ -629,6 +815,111 @@ impl<O: Op> DynOp for OpEntry<O> {
             })
             .collect()
     }
+
+    fn parse_appended(
+        &self,
+        prev: &AnyParams,
+        field: &str,
+        items: &[&serde_json::Value],
+    ) -> Option<Result<Box<AnyParams>, Issues>> {
+        let prev = match self.params(prev) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(bad_typed_params(e))),
+        };
+        O::parse_appended(prev, field, items).map(|r| r.map(|p| Box::new(p) as Box<AnyParams>))
+    }
+
+    fn infer_appended(
+        &self,
+        prev: &AnyParams,
+        prev_inferred: &Inferred,
+        p: &AnyParams,
+        inputs: &[Shape],
+        cx: &InferCx<'_>,
+    ) -> Option<Result<Inferred, Issues>> {
+        let (prev, p) = match (self.params(prev), self.params(p)) {
+            (Ok(prev), Ok(p)) => (prev, p),
+            (Err(e), _) | (_, Err(e)) => return Some(Err(bad_typed_params(e))),
+        };
+        O::infer_appended(prev, prev_inferred, p, inputs, cx)
+    }
+
+    fn region(&self) -> bool {
+        O::REGION
+    }
+
+    fn reach(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Reach, EngineError> {
+        Ok(O::reach(self.params(p)?, inputs))
+    }
+
+    fn param_change(
+        &self,
+        old: &AnyParams,
+        new: &AnyParams,
+        inputs: &[Shape],
+    ) -> Result<Area, EngineError> {
+        Ok(O::param_change(
+            self.params(old)?,
+            self.params(new)?,
+            inputs,
+        ))
+    }
+
+    fn effect(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Area, EngineError> {
+        Ok(O::effect(self.params(p)?, inputs))
+    }
+
+    fn apply_region(
+        &self,
+        p: &AnyParams,
+        inputs: &[&Value],
+        tiles: &FrameTiles,
+        base: Option<&Value>,
+        cx: &mut ApplyCx<'_>,
+    ) -> Option<Result<Applied, EngineError>> {
+        cx.declare(O::NEEDS);
+        match self.params(p) {
+            Ok(p) => O::apply_region(p, inputs, tiles, base, cx),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn preview(&self, p: &AnyParams) -> Result<Preview, EngineError> {
+        Ok(O::preview(self.params(p)?))
+    }
+
+    fn preview_params(
+        &self,
+        p: &AnyParams,
+        level: u8,
+        inputs: &[Shape],
+        full: &[Shape],
+    ) -> Result<Box<AnyParams>, EngineError> {
+        Ok(Box::new(O::preview_params(
+            self.params(p)?,
+            level,
+            inputs,
+            full,
+        )))
+    }
+}
+
+/// 操作を登録表の外で型を消した形にする（プレビューの段の継ぎ目の縮小など、実行器が計画の中にだけ置く操作）。
+pub(crate) fn entry<O: Op>() -> Arc<dyn DynOp> {
+    Arc::new(OpEntry::<O>(PhantomData))
+}
+
+/// 型の違う引数を渡された誤りを、推論・読み込みの指摘にする。
+fn bad_typed_params(e: EngineError) -> Issues {
+    Issues::one(Issue::error(IssueCode::BadParams, e.to_string()))
+}
+
+/// 引数の JSON を操作 `id` の型に読めなかったときの指摘（`DynOp::parse` と `Op::parse_appended` が同じ文言にする）。
+pub fn unreadable_params(id: &str, e: &dyn std::fmt::Display) -> Issues {
+    Issues::one(Issue::error(
+        IssueCode::BadParams,
+        format!("{id} の引数が読めません: {e}"),
+    ))
 }
 
 /// 操作の記述（UI のカタログ）。
@@ -660,6 +951,91 @@ pub fn canonical_params(raw: &serde_json::Value) -> Result<serde_json::Value, Is
                 "引数を正規の形にできません（有限でない数など）",
             )
         })
+}
+
+/// 引数の指紋のドメイン。
+const PARAMS_DOMAIN: &str = "kura-params-v1";
+/// 追記だけの配列の連鎖のドメイン。
+const APPEND_DOMAIN: &str = "kura-param-append-v1";
+
+/// 追記だけの配列の連鎖の始まり（要素が 0 個のとき）。
+pub fn append_chain_start() -> Digest {
+    Hasher::new(APPEND_DOMAIN).finish()
+}
+
+/// 追記だけの配列の連鎖に要素を 1 つ足す（`blake3(ドメイン ‖ 前 ‖ 要素の正規の JSON)`）。要素を足した分だけ求め直せる。
+pub fn append_chain(prev: Digest, item: &serde_json::Value) -> Result<Digest, EngineError> {
+    let bytes = crate::digest::canonical_json(item)?;
+    Ok(Hasher::new(APPEND_DOMAIN)
+        .raw(&prev.0)
+        .bytes_with_len(&bytes)
+        .finish())
+}
+
+/// 引数の指紋（段 10。ノードのキャッシュとセッションの鍵。メモリの中だけで使い、保存しない。版をまたいで保つ約束もない）。
+///
+/// `canonical` は正規の形の引数（`Registry::resolve` が返すもの）。追記だけの配列（[`ParamSchema::append_field`]）が
+/// あれば、その配列を要素ごとの連鎖（[`append_chain`]）にし、残りの項目の正規の JSON と、要素の数と合わせる。ほかは
+/// 正規の JSON をそのまま。同じ文書からは、実行器（compile）でもセッションでも同じ指紋になる。既定値を書いたかどうかの
+/// ような書き方の違いは別の指紋になる（キャッシュが外れるだけで、誤りにはならない）。
+pub fn params_digest(
+    schema: &ParamSchema,
+    canonical: &serde_json::Value,
+) -> Result<Digest, EngineError> {
+    let field = schema.append_field();
+    let items = field.and_then(|f| canonical.get(f)?.as_array());
+    let (Some(field), Some(items)) = (field, items) else {
+        let bytes = crate::digest::canonical_json(canonical)?;
+        return Ok(Hasher::new(PARAMS_DOMAIN)
+            .u8(0)
+            .bytes_with_len(&bytes)
+            .finish());
+    };
+    let mut chain = append_chain_start();
+    for item in items {
+        chain = append_chain(chain, item)?;
+    }
+    params_digest_with_chain(canonical, field, chain, items.len() as u64)
+}
+
+/// 追記だけの配列をすでに連鎖にしたときの引数の指紋（[`params_digest`] と同じ値。追記のたびに全部を求め直さないため）。
+/// `canonical` の `field` の中身は読まない。
+pub fn params_digest_with_chain(
+    canonical: &serde_json::Value,
+    field: &str,
+    chain: Digest,
+    count: u64,
+) -> Result<Digest, EngineError> {
+    let rest = match canonical {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .filter(|(k, _)| k.as_str() != field)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    };
+    let bytes = crate::digest::canonical_json(&rest)?;
+    Ok(Hasher::new(PARAMS_DOMAIN)
+        .u8(1)
+        .bytes_with_len(&bytes)
+        .bytes_with_len(field.as_bytes())
+        .raw(&chain.0)
+        .u64(count)
+        .finish())
+}
+
+/// ノードの鍵（段 10）：操作 ID・文書に書いた版・引数の指紋（[`params_digest`]。文書に書いた引数の正規の形から）・種・
+/// 有効か。ノード ID と入力は含めない（ID は継ぎ足しでずれ、入力は実行器の指紋が足す）。同じ登録表なら、鍵が同じノードは
+/// 同じ実装・同じ引数に解決される。セッションと実行器が同じ式で求める。メモリの中だけで使う。
+pub fn node_key(op: &str, v: u16, params: &Digest, seed: u64, enabled: bool) -> Digest {
+    Hasher::new("kura-node-key-v1")
+        .bytes_with_len(op.as_bytes())
+        .u32(u32::from(v))
+        .raw(&params.0)
+        .u64(seed)
+        .u8(u8::from(enabled))
+        .finish()
 }
 
 /// 操作の登録表。（操作 ID, 版）→ 実装。旧版（legacy）も入れる。
@@ -789,6 +1165,33 @@ impl Registry {
         }
     }
 
+    /// `resolve` が（操作, 版）に使う実装：その版の実装か、なければすぐ上の実装のある版のもの（引数は移さない）。
+    fn implementation(&self, op: &str, v: u16) -> Option<Arc<dyn DynOp>> {
+        self.get(op, v).or_else(|| {
+            let next = self.versions(op).into_iter().find(|ver| *ver > v)?;
+            self.get(op, next)
+        })
+    }
+
+    /// 追記だけの配列の引数の名前（[`ParamSchema::append_field`]。段 10）。`resolve` が使う実装の記述から引く
+    /// （セッションと実行器が同じ記述で引数の指紋を求めるため）。知らない操作・新しすぎる版は None。
+    pub fn append_field(&self, op: &str, v: u16) -> Option<&'static str> {
+        self.implementation(op, v)?.schema().append_field()
+    }
+
+    /// 文書のノードの鍵（[`node_key`]。引数の指紋は、文書に書いた引数の正規の形を `resolve` が使う実装の記述で
+    /// [`params_digest`] にしたもの）。セッション（`session`）と実行器の鍵の基準。知らない操作は記述なしで求める。
+    pub fn doc_node_key(&self, node: &crate::doc::Node) -> Result<Digest, EngineError> {
+        let canonical = canonical_params(&node.params)
+            .map_err(|i| EngineError::Invalid(Issues::one(i.at(node.id))))?;
+        let schema = self
+            .implementation(&node.op, node.v)
+            .map(|imp| imp.schema())
+            .unwrap_or_default();
+        let params = params_digest(&schema, &canonical)?;
+        Ok(node_key(&node.op, node.v, &params, node.seed, node.enabled))
+    }
+
     /// 今の版の操作。
     pub fn current(&self) -> Vec<Arc<dyn DynOp>> {
         self.ops
@@ -860,6 +1263,104 @@ pub fn expect_inputs(inputs: &[Shape], sig: &Signature) -> Result<(), Issues> {
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    fn strokes_schema(fields: usize) -> ParamSchema {
+        let mut params = vec![spec(
+            "size",
+            ParamKind::Int {
+                min: 1,
+                max: 255,
+                step: 1,
+            },
+            Unit::Px,
+            serde_json::json!(1),
+        )];
+        for k in ["actions", "more"].into_iter().take(fields) {
+            params.push(spec(
+                k,
+                ParamKind::Strokes,
+                Unit::None,
+                serde_json::json!([]),
+            ));
+        }
+        ParamSchema { params }
+    }
+
+    /// ノードの鍵は、操作・版・引数・種・有効かのどれを変えても変わる。
+    #[test]
+    fn node_key_covers_every_part() {
+        let p = append_chain_start();
+        let q = append_chain(p, &serde_json::json!(1)).unwrap();
+        let base = node_key("image.crop", 1, &p, 7, true);
+        assert_eq!(base, node_key("image.crop", 1, &p, 7, true));
+        for other in [
+            node_key("image.flip", 1, &p, 7, true),
+            node_key("image.crop", 2, &p, 7, true),
+            node_key("image.crop", 1, &q, 7, true),
+            node_key("image.crop", 1, &p, 8, true),
+            node_key("image.crop", 1, &p, 7, false),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    /// 追記だけの配列の名前は、Strokes がちょうど 1 つのときだけ。
+    #[test]
+    fn append_field_needs_exactly_one_strokes() {
+        assert_eq!(strokes_schema(0).append_field(), None);
+        assert_eq!(strokes_schema(1).append_field(), Some("actions"));
+        assert_eq!(strokes_schema(2).append_field(), None);
+    }
+
+    /// 引数の指紋：追記を連鎖で足しても全体から求めたものと同じ。要素・ほかの項目・要素の数で変わり、キーの順と空白では
+    /// 変わらない。追記の配列のない引数も、同じ JSON なら同じ。
+    #[test]
+    fn params_digest_chains_appended_items() {
+        let schema = strokes_schema(1);
+        let items: Vec<serde_json::Value> = (0..5)
+            .map(|i| serde_json::json!({"tool": "pen", "points": [[i, i + 1]], "color": i}))
+            .collect();
+        let full = |n: usize, size: i64| {
+            let p = serde_json::json!({"size": size, "actions": items[..n].to_vec()});
+            params_digest(&schema, &canonical_params(&p).unwrap()).unwrap()
+        };
+        let mut chain = append_chain_start();
+        for (n, item) in items.iter().enumerate() {
+            chain = append_chain(chain, item).unwrap();
+            let p = serde_json::json!({"size": 3, "actions": []});
+            let stepped = params_digest_with_chain(
+                &canonical_params(&p).unwrap(),
+                "actions",
+                chain,
+                n as u64 + 1,
+            )
+            .unwrap();
+            assert_eq!(stepped, full(n + 1, 3), "{n}");
+        }
+        assert_ne!(full(5, 3), full(4, 3));
+        assert_ne!(full(5, 3), full(5, 4));
+        assert_ne!(full(0, 3), full(1, 3));
+        let mut changed = items.clone();
+        changed[2] = serde_json::json!({"tool": "pen", "points": [[9, 9]], "color": 2});
+        let p = serde_json::json!({"size": 3, "actions": changed});
+        assert_ne!(
+            params_digest(&schema, &canonical_params(&p).unwrap()).unwrap(),
+            full(5, 3)
+        );
+        let reordered: serde_json::Value =
+            serde_json::from_str(r#"{ "actions": [], "size": 3 }"#).unwrap();
+        assert_eq!(
+            params_digest(&schema, &canonical_params(&reordered).unwrap()).unwrap(),
+            full(0, 3)
+        );
+        let plain = strokes_schema(0);
+        let a = serde_json::json!({"size": 3, "x": [1, 2]});
+        let b: serde_json::Value = serde_json::from_str(r#"{"x":[1,2],"size":3}"#).unwrap();
+        assert_eq!(
+            params_digest(&plain, &canonical_params(&a).unwrap()).unwrap(),
+            params_digest(&plain, &canonical_params(&b).unwrap()).unwrap()
+        );
+    }
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct P {
