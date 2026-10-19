@@ -44,17 +44,25 @@ pub struct Skipped {
     pub reason: String,
 }
 
-/// `assets --out <dir>` を実行する。
+/// `assets --out <dir> [--bench <N>]` を実行する。`--bench` は、形式の見本の代わりに、サムネイルのジョブを測る PNG の多い
+/// 組（`bench_set`）を書く。
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut out = None;
+    let mut bench = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--out" => out = it.next().map(PathBuf::from),
+            "--bench" => bench = it.next().and_then(|n| n.parse::<u32>().ok()),
             other => return Err(format!("不明な引数: {other}")),
         }
     }
     let out = out.ok_or("--out に見本を書くフォルダを指定してください")?;
+    if let Some(n) = bench {
+        let count = bench_set(&out, n)?;
+        tracing::info!(path = %out.display(), count, "サムネイルのジョブを測る組を書きました");
+        return Ok(());
+    }
     let (samples, skipped) = build(&out)?;
     for s in &samples {
         tracing::info!(name = %s.name, png = s.png, "見本");
@@ -69,6 +77,62 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "形式の見本を書きました"
     );
     Ok(())
+}
+
+/// サムネイルのジョブを測る PNG の多い組（NFR-04 の判定の範囲。M11 の決定 2）：大きなアルファ付きの PNG（2048²）と大きな
+/// 不透明な PNG（3000×2000）を `n` 枚ずつ、小さなスプライト（64²）を `4n` 枚、JPEG（1200×800）を `n` 枚。取り込みは中身で
+/// 重複を除くので、1 枚ずつ色を変える。書いた数を返す。
+pub fn bench_set(out: &Path, n: u32) -> Result<usize, String> {
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let codecs = CodecSet::pinned();
+    let encode = |v: &Value, format: &str| {
+        codecs
+            .encode_bytes(v, format, &serde_json::json!({}), &NoMonitor)
+            .map(|(b, _)| b)
+            .map_err(|e| format!("{format}: {e}"))
+    };
+    let write = |name: String, bytes: Vec<u8>| {
+        std::fs::write(out.join(&name), bytes).map_err(|e| format!("{name}: {e}"))
+    };
+    let tint = |rows: &mut [u8], bpp: usize, i: u32| {
+        for p in rows.chunks_exact_mut(bpp) {
+            p[2] = p[2].wrapping_add(i as u8);
+        }
+    };
+    let mut count = 0;
+    for i in 0..n {
+        let mut alpha = soft_circle(2048, 2048);
+        tint(&mut alpha, 4, i);
+        write(
+            format!("big-alpha-{i:03}.png"),
+            encode(&image(raster(2048, 2048, &alpha)?), "png")?,
+        )?;
+        let mut opaque = landscape(3000, 2000);
+        tint(&mut opaque, 3, i);
+        let rgb = |rows: &[u8], w, h| {
+            Raster::from_rows(w, h, PixelFormat::Rgb8, None, rows).map_err(|e| e.to_string())
+        };
+        write(
+            format!("big-opaque-{i:03}.png"),
+            encode(&image(rgb(&opaque, 3000, 2000)?), "png")?,
+        )?;
+        let mut photo = landscape(1200, 800);
+        tint(&mut photo, 3, i);
+        write(
+            format!("photo-{i:03}.jpg"),
+            encode(&image(rgb(&photo, 1200, 800)?), "jpeg")?,
+        )?;
+        for k in 0..4 {
+            let mut sprite = pixel_art(4);
+            tint(&mut sprite, 4, i * 4 + k);
+            write(
+                format!("sprite-{i:03}-{k}.png"),
+                encode(&image(raster(64, 64, &sprite)?), "png")?,
+            )?;
+        }
+        count += 7;
+    }
+    Ok(count)
 }
 
 /// 見本を `out` に書く（なければ作る）。

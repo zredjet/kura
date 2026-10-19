@@ -22,6 +22,7 @@ mod assets;
 mod bench;
 mod bench_edit;
 mod bench_migrate;
+mod bench_thumbs;
 mod edit;
 mod mem_smoke;
 mod seed;
