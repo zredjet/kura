@@ -6,7 +6,8 @@
 //! - `<image>`（外部のファイル・data: のラスター画像・入れ子の SVG）を含むものは、この段では `Unsupported`（次の段へ）。
 //!   手元のファイルは読まない。resvg の raster-images は zune-jpeg の SIMD を有効にするので入れない。入れ子の SVG は、
 //!   外側と同じ見積もりを通らないので読まない。
-//! - 文字は、渡したフォント（`SvgCodec::with_fonts`）だけで描く。フォントを渡していないのに文字があれば `Unsupported`。
+//! - 文字は、渡したフォント（`SvgCodec::with_svg_fonts`。`fonts::SvgFonts`）だけで描く。フォントを渡していないのに文字が
+//!   あれば `Unsupported`。遅れて作る集まり（`SvgFonts::lazy`）は、文字のある SVG を読むときに初めて作る。
 //! - 展開爆弾を避けるため、usvg に渡す前に、ファイルの大きさ・DTD の実体の展開の大きさ・要素の数・`<use>` の展開・
 //!   marker の頂点ごとの複製を見積もって断る。DTD は引用符・注釈を区別して読み、パラメタ実体・外部の実体・
 //!   マークアップや参照を含む実体は断る（`Unsupported`）。入れ子の marker も断る。
@@ -22,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use resvg::tiny_skia;
 use resvg::usvg;
 
+use crate::codec::fonts::SvgFonts;
 use crate::codec::{Decoder, ReadSeek, Tier, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -53,13 +55,35 @@ fn err(e: impl std::fmt::Display) -> EngineError {
 /// SVG の読み取り。文字を描くフォントを持てる。
 #[derive(Clone, Default)]
 pub struct SvgCodec {
-    fonts: Arc<usvg::fontdb::Database>,
+    fonts: Option<SvgFonts>,
 }
 
 impl SvgCodec {
-    /// 文字を描くフォントを渡す（kura-mac が OS のフォントを読んで渡す）。
+    /// 文字を描くフォントの集まりをそのまま渡す。
     pub fn with_fonts(fonts: Arc<usvg::fontdb::Database>) -> Self {
-        Self { fonts }
+        Self::with_svg_fonts(SvgFonts::from_database(fonts))
+    }
+
+    /// 文字を描くフォントの入れ物を渡す（kura-mac が OS のフォントのファイルを mmap して渡す）。
+    pub fn with_svg_fonts(fonts: SvgFonts) -> Self {
+        Self { fonts: Some(fonts) }
+    }
+
+    /// 文字を描くフォントの集まり。文字がなければ、遅れて作る集まりを作らずに空の集まりを使う。文字があるのに書体が
+    /// ひとつもなければ `Unsupported`。
+    fn fontdb(&self, has_text: bool) -> Result<Arc<usvg::fontdb::Database>, EngineError> {
+        if !has_text {
+            return Ok(match &self.fonts {
+                Some(f) if f.is_built() => f.database(),
+                _ => Arc::new(usvg::fontdb::Database::new()),
+            });
+        }
+        match self.fonts.as_ref().map(SvgFonts::database) {
+            Some(db) if !db.is_empty() => Ok(db),
+            _ => Err(EngineError::Unsupported(
+                "文字を含む SVG は、フォントを渡したときだけ読めます".into(),
+            )),
+        }
     }
 }
 
@@ -1296,11 +1320,7 @@ impl SvgCodec {
         check_entities(text)?;
         check_depth(text)?;
         let has_text = check_elements(text)?;
-        if has_text && self.fonts.is_empty() {
-            return Err(EngineError::Unsupported(
-                "文字を含む SVG は、フォントを渡したときだけ読めます".into(),
-            ));
-        }
+        let fontdb = self.fontdb(has_text)?;
         // <image> の参照（data でも外部でも）は、この段では描かない。見つけたら印を立てて、読み取りを断る
         let images = Arc::new(AtomicBool::new(false));
         let (a, b) = (images.clone(), images.clone());
@@ -1316,7 +1336,7 @@ impl SvgCodec {
                     None
                 }),
             },
-            fontdb: self.fonts.clone(),
+            fontdb,
             ..usvg::Options::default()
         };
         let tree = usvg::Tree::from_str(text, &opt).map_err(err)?;
@@ -1709,6 +1729,78 @@ mod tests {
         )));
         assert!(unsupported(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><text x="0" y="15">Kura</text></svg>"#
+        ));
+    }
+
+    fn decode_with(c: &SvgCodec, svg: &str) -> Result<Value, EngineError> {
+        c.decode(
+            &mut Cursor::new(svg.as_bytes().to_vec()),
+            "svg",
+            &DecodeOptions::default(),
+            &Limits::default(),
+            &NoMonitor,
+        )
+    }
+
+    fn tiny_fonts() -> Vec<crate::codec::fonts::FontSource> {
+        vec![crate::codec::fonts::FontSource {
+            name: "kura.ttf".into(),
+            data: Arc::new(crate::testfiles::tiny_ttf("KuraTest", &['A', 'B'])),
+        }]
+    }
+
+    /// 決定 12：フォントの入れ物（バイト列を共有で受ける）を渡すと、文字を含む SVG を描く。字は正方形（x 0.1〜0.7 em・
+    /// 高さ 0.7 em）なので、16px の「AB」は (2..11, 4..15) と (18..27, 4..15) あたりが塗られ、字の間は透明。
+    #[test]
+    fn text_is_drawn_with_font_sources() {
+        let c = SvgCodec::with_svg_fonts(SvgFonts::new(
+            tiny_fonts(),
+            crate::codec::fonts::GenericFamilies::default(),
+        ));
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><text x="0" y="16" font-family="KuraTest" font-size="16" fill="#000">AB</text></svg>"##;
+        let Value::Image(img) = decode_with(&c, svg).unwrap() else {
+            panic!()
+        };
+        let alpha = |x, y| img.px.pixel(x, y).unwrap()[3];
+        assert_eq!(alpha(6, 10), 255, "A の中");
+        assert_eq!(alpha(22, 10), 255, "B の中");
+        assert_eq!(alpha(14, 10), 0, "字の間");
+        assert_eq!(alpha(6, 1), 0, "字の上");
+        assert_eq!(alpha(36, 10), 0, "字の後ろ");
+        // 総称の書体名でも、名前のない書体でもなく、知らない書体名なら fontdb が最初の書体で代える（今の resvg の振る舞い）
+        assert!(decode_with(&c, &svg.replace("KuraTest", "NoSuchFont")).is_ok());
+    }
+
+    /// 遅れて作るフォントは、文字のない SVG では作らず、文字のある SVG を読むときに 1 度だけ作る。
+    #[test]
+    fn lazy_fonts_are_built_only_for_text() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let k = calls.clone();
+        let fonts = SvgFonts::lazy(crate::codec::fonts::GenericFamilies::default(), move || {
+            k.fetch_add(1, Ordering::SeqCst);
+            tiny_fonts()
+        });
+        let c = SvgCodec::with_svg_fonts(fonts.clone());
+        decode_with(
+            &c,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#f00"/></svg>"##,
+        )
+        .unwrap();
+        assert!(!fonts.is_built());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let text = r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><text y="16" font-family="KuraTest" font-size="16">A</text></svg>"#;
+        decode_with(&c, text).unwrap();
+        decode_with(&c, text).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // 入れ物がひとつも読めなければ、文字のある SVG は読まない
+        let empty = SvgCodec::with_svg_fonts(SvgFonts::lazy(
+            crate::codec::fonts::GenericFamilies::default(),
+            Vec::new,
+        ));
+        assert!(matches!(
+            decode_with(&empty, text),
+            Err(EngineError::Unsupported(_))
         ));
     }
 

@@ -5,6 +5,7 @@
 //! - `media_backend`：macOS の実装で扱えない形式を ffmpeg に回す組み合わせ
 //! - `image_thumbnails_keep_alpha`・`font_thumbnails`・`probe_font`：M11 の ImageIO のアルファを保つサムネイル、
 //!   CoreText のフォントの見本とフォントの情報（`thumbs`）
+//! - `pinned_options`・`system_svg_fonts`：SVG の文字を描くシステムのフォント（mmap して渡す。`fonts`）
 //! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
 //! - `find_chrome`・`snapshot_webview`：キャプチャ用の Google Chrome の場所と、WKWebView の表示範囲の撮影
 //! - `reveal_in_finder`・`volume_capacity`・`physical_memory`：Finder で見せる、ボリュームの容量、物理メモリ（編集のメモリの予算）
@@ -20,6 +21,7 @@ mod browser;
 pub mod codec;
 mod external;
 mod files;
+pub mod fonts;
 mod thumbs;
 
 pub use browser::{
@@ -34,6 +36,7 @@ pub use files::{
     VolumeCapacity, keep_webview_focus_on_fullscreen, physical_memory, reveal_in_finder,
     volume_capacity,
 };
+pub use fonts::{pinned_options, system_svg_fonts};
 pub use thumbs::{
     FONT_SAMPLES, FontInfo, FontProbe, ThumbFile, ThumbStems, font_thumbnails,
     image_thumbnails_keep_alpha, probe_font,

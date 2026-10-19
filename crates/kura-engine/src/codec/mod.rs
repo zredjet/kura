@@ -16,6 +16,7 @@ pub mod aseprite;
 pub mod caps;
 pub mod exif;
 pub mod flac;
+pub mod fonts;
 pub mod formats;
 pub mod gif;
 pub mod jpeg;
@@ -42,6 +43,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 pub use caps::{FormatCaps, ReadCap, WriteCap};
+pub use fonts::{FontBytes, FontLoadReport, FontSource, GenericFamilies, SvgFonts};
 pub use formats::{
     AlphaCaps, FormatDesc, ItemKind, MetaCaps, caps_of, format_by_ext, format_by_id,
 };
@@ -354,8 +356,9 @@ pub fn contain<T>(
 /// 固定の段のコーデックの設定。
 #[derive(Clone, Default)]
 pub struct PinnedOptions {
-    /// SVG の文字を描くフォント（kura-mac が OS のフォントを読んで渡す）。ないときは文字を含む SVG を読まない。
-    pub svg_fonts: Option<Arc<resvg::usvg::fontdb::Database>>,
+    /// SVG の文字を描くフォント（kura-mac が OS のフォントのファイルを mmap して渡す。`fonts::SvgFonts`）。ないときは
+    /// 文字を含む SVG を読まない（`Unsupported`）。
+    pub svg_fonts: Option<SvgFonts>,
 }
 
 /// 形式ごとに、段の順に試すコーデックの組。
@@ -384,7 +387,7 @@ impl CodecSet {
         let aiff: Arc<aiff::AiffCodec> = Arc::new(aiff::AiffCodec);
         let flac: Arc<flac::FlacCodec> = Arc::new(flac::FlacCodec);
         let svg = match &opts.svg_fonts {
-            Some(fonts) => svg::SvgCodec::with_fonts(fonts.clone()),
+            Some(fonts) => svg::SvgCodec::with_svg_fonts(fonts.clone()),
             None => svg::SvgCodec::default(),
         };
         Self {
@@ -1181,7 +1184,9 @@ mod tests {
         assert!(set.add_legacy_decoder(Arc::new(png::PngDecoderV1)).is_err());
         assert!(set.add_encoder(Arc::new(png::PngCodec)).is_err());
         let with = CodecSet::pinned_with(&PinnedOptions {
-            svg_fonts: Some(Arc::new(resvg::usvg::fontdb::Database::new())),
+            svg_fonts: Some(SvgFonts::from_database(Arc::new(
+                resvg::usvg::fontdb::Database::new(),
+            ))),
         });
         assert_eq!(with.decoders_for("svg").len(), 1);
     }
