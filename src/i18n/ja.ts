@@ -969,8 +969,11 @@ export const ja = {
     integrity: '整合性チェック',
     integrityPending: '確かめています…',
     integrityOk: 'DB とファイルは一致しています',
-    integrityIssues: (missing: string, orphans: string) =>
-      `ファイルがない項目 ${missing}・DB にないファイル ${orphans}`,
+    /** 整合性チェックで見つかったもの（0 でないものだけを「・」で並べる）。 */
+    integrityMissing: (n: string) => `ファイルがない項目 ${n}`,
+    integrityOrphans: (n: string) => `DB にないファイル ${n}`,
+    /** どの表からも参照されない台帳の行（ゴミ箱を空にする途中で止まったなど。M11。docs/data-model.md §4）。 */
+    integrityUnreferenced: (n: string) => `どの項目も使っていないファイル ${n}`,
     checkAgain: 'もう一度確かめる',
     checking: '確かめています…',
     backups: 'DB のバックアップ',
