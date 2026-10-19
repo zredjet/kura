@@ -139,6 +139,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::player::play_queue,
             commands::player::playback_report,
             commands::player::proxy_request,
+            commands::analysis::request_analysis,
+            commands::analysis::retry_analysis,
             commands::player::open_external,
             commands::player::player_prefs_get,
             commands::player::player_prefs_set,
