@@ -4,4 +4,10 @@
 //!   解析器で求めて `analysis_results`（正本。中身 × 解析 ID × 版 × 正規の引数）と `media_facts`（検索と表示の列）に置く。
 //! - 計画（[`plan`]）と投影（[`facts`]）は純粋な関数、読み書きは [`store`]、ジョブは [`job`]。
 pub mod facts;
+pub mod job;
+#[cfg(test)]
+mod job_tests;
 pub mod plan;
+pub mod store;
+
+pub use job::{AnalyzeHandler, AnalyzeShared};

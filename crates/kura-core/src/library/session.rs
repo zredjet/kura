@@ -10,6 +10,8 @@ use super::integrity::{IntegrityReport, check_files, clean_staging};
 use super::ledger;
 use super::upgrade::UpgradeHooks;
 use crate::Result;
+use crate::analysis::plan::PlanFingerprint;
+use crate::analysis::{AnalyzeHandler, AnalyzeShared, store as analysis_store};
 use crate::capture::CaptureHandler;
 use crate::download::{DownloadHandler, work_dir_name};
 use crate::edit::{ENGINE_WORK_DIR, EngineFactory, EngineServices};
@@ -72,6 +74,8 @@ pub struct LibrarySession {
     library: Arc<Library>,
     jobs: Arc<JobManager>,
     proxy: Arc<ProxyShared>,
+    /// 解析のジョブと共有する、先に解くアイテム。
+    analysis: Arc<AnalyzeShared>,
     /// このライブラリのエンジンの部品（中身は最初に使うときに作る）。
     engine: Option<Arc<EngineServices>>,
     integrity: Arc<Mutex<Option<IntegrityReport>>>,
@@ -120,34 +124,40 @@ impl LibrarySession {
         })?;
         let staging_removed = clean_staging(library.layout(), &keep)?;
         let proxy = Arc::new(ProxyShared::default());
-        let jobs = Arc::new(JobManager::new(
-            library.clone(),
-            vec![
-                (
-                    JobKind::Import,
-                    Arc::new(ImportHandler::new(backend.clone())),
-                ),
-                (
-                    JobKind::Download,
-                    Arc::new(DownloadHandler::new(backend.clone())),
-                ),
-                (
-                    JobKind::Capture,
-                    Arc::new(CaptureHandler::new(backend.clone())),
-                ),
-                (JobKind::Thumbnail, Arc::new(ThumbnailHandler::new(backend))),
-                (JobKind::Export, Arc::new(ExportHandler)),
-                (
-                    JobKind::Proxy,
-                    Arc::new(ProxyHandler::new(ProxyTools::detect(), proxy.clone())),
-                ),
-            ],
-            sink,
-        )?);
+        let analysis = Arc::new(AnalyzeShared::default());
+        let mut handlers: Vec<(JobKind, Arc<dyn crate::jobs::JobHandler>)> = vec![
+            (
+                JobKind::Import,
+                Arc::new(ImportHandler::new(backend.clone())),
+            ),
+            (
+                JobKind::Download,
+                Arc::new(DownloadHandler::new(backend.clone())),
+            ),
+            (
+                JobKind::Capture,
+                Arc::new(CaptureHandler::new(backend.clone())),
+            ),
+            (JobKind::Thumbnail, Arc::new(ThumbnailHandler::new(backend))),
+            (JobKind::Export, Arc::new(ExportHandler)),
+            (
+                JobKind::Proxy,
+                Arc::new(ProxyHandler::new(ProxyTools::detect(), proxy.clone())),
+            ),
+        ];
+        // 解析はエンジンの部品があるときだけ（ないときは積まない。JobManager::ensure_queued が登録のない種類を無視する）
+        if let Some(engine) = &engine {
+            handlers.push((
+                JobKind::Analyze,
+                Arc::new(AnalyzeHandler::new(engine.clone(), analysis.clone())),
+            ));
+        }
+        let jobs = Arc::new(JobManager::new(library.clone(), handlers, sink)?);
         let integrity = Arc::new(Mutex::new(None));
 
         // 整合性チェックが終わってからジョブを動かす（チェック中に取り込みが進むと食い違いを誤って数えるため）
         let (lib, jobs2, slot) = (library.clone(), jobs.clone(), integrity.clone());
+        let analyze = engine.is_some();
         let startup = std::thread::Builder::new()
             .name("kura-startup".into())
             .spawn(move || {
@@ -195,6 +205,9 @@ impl LibrarySession {
                 {
                     tracing::error!(%err, "サムネイルのジョブを積めませんでした");
                 }
+                if analyze {
+                    sync_analysis(&lib, &jobs2);
+                }
             })?;
 
         let backup = Mutex::new(backup::Scheduler::start(library.layout().clone()));
@@ -202,6 +215,7 @@ impl LibrarySession {
             library,
             jobs,
             proxy,
+            analysis,
             engine,
             integrity,
             backup,
@@ -224,11 +238,43 @@ impl LibrarySession {
         self.engine.as_ref()
     }
 
-    /// 外部ツールの場所が変わった：エンジンのコーデックの組を、次に使うときに作り直す（ffmpeg を探し直す）。
+    /// 外部ツールの場所が変わった：エンジンのコーデックの組を、次に使うときに作り直す（ffmpeg を探し直す）。解析のジョブを
+    /// 積み、作り直した組でデコーダの指紋を比べ直させる（読めるようになった形式の失敗を解き直す）。
     pub fn reload_tools(&self) {
         if let Some(engine) = &self.engine {
             engine.reload_codecs();
+            if let Err(err) = self.jobs.ensure_queued(JobKind::Analyze, "{}") {
+                tracing::warn!(%err, "解析のジョブを積めませんでした");
+            }
         }
+    }
+
+    /// インスペクタで選んだものを先に解析する（まだ解析していなければ解析のジョブを積む）。解析を待っていれば true。
+    /// 取り込み・サムネイルが動いている間は、それが終わるまで待つ（解析は譲る）。
+    pub fn request_analysis(&self, ids: Vec<i64>) -> Result<bool> {
+        let todo = self
+            .library
+            .db()
+            .read(|conn| analysis_store::any_pending(conn, &ids))?;
+        self.analysis.prioritize(ids);
+        if todo {
+            self.jobs.ensure_queued(JobKind::Analyze, "{}")?;
+        }
+        Ok(todo)
+    }
+
+    /// 解析できなかったものを、もう一度解析する（failed を pending に戻し、先に解く）。戻した数を返す。
+    pub fn retry_analysis(&self, ids: Vec<i64>) -> Result<usize> {
+        let retry = ids.clone();
+        let n = self
+            .library
+            .db()
+            .write(move |tx| analysis_store::retry_failed(tx, &retry))?;
+        if n > 0 {
+            self.analysis.prioritize(ids);
+            self.jobs.ensure_queued(JobKind::Analyze, "{}")?;
+        }
+        Ok(n)
     }
 
     /// 再生可否の表を受け取る。前回と変わっていれば判定をやり直し、判定・作成を待つものがあればプロキシのジョブを積む。
@@ -309,6 +355,28 @@ impl LibrarySession {
     /// いまのバックアップを作る（設定画面の「今すぐバックアップ」）。
     pub fn backup_now(&self) -> Result<backup::BackupInfo> {
         backup::create(self.library.layout(), crate::time::now_ms())
+    }
+}
+
+/// 起動のスレッドで、整合性チェックのあとに呼ぶ：解析の計画の指紋を比べ（変わった種類だけ pending に戻す）、解析を待つもの・
+/// 投影の古いものがあれば解析のジョブを積む。デコーダの指紋はジョブがコーデックの組を作ったときに比べる（起動の道で組を
+/// 作らない）。
+fn sync_analysis(lib: &Library, jobs: &JobManager) {
+    let synced = kura_engine::analysis::registry()
+        .map_err(|e| crate::CoreError::Invalid(format!("解析の登録表を作れません: {e}")))
+        .and_then(|registry| PlanFingerprint::current(&registry))
+        .and_then(|current| {
+            lib.db()
+                .write(move |tx| analysis_store::sync_plan(tx, &current))
+        });
+    match synced {
+        Ok(sync) if sync.todo => {
+            if let Err(err) = jobs.ensure_queued(JobKind::Analyze, "{}") {
+                tracing::error!(%err, "解析のジョブを積めませんでした");
+            }
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(%err, "解析の計画を確かめられませんでした"),
     }
 }
 
@@ -492,6 +560,118 @@ mod tests {
         session.wait_ready();
         assert_eq!(session.integrity().unwrap().staging_removed, 1);
         assert!(!work.exists());
+    }
+
+    fn analysis_state(session: &LibrarySession) -> String {
+        session
+            .library()
+            .db()
+            .read(|c| Ok(c.query_row("SELECT analysis_state FROM items", [], |r| r.get(0))?))
+            .unwrap()
+    }
+
+    /// エンジンのあるセッションでは、取り込みのあとに解析のジョブが積まれる（取り込み・サムネイルのあとで動く）。開き直すと、
+    /// 起動のスレッドで計画の指紋を比べて、待っているものがあれば積む。失敗したものは頼まれたら解き直す。
+    #[test]
+    fn analysis_runs_after_import_and_when_reopened() {
+        use kura_engine::NoMonitor;
+        use kura_engine::testgen::InputGen;
+        use kura_engine::value::PixelFormat;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let value = InputGen::PixelSprite {
+            w: 32,
+            h: 32,
+            fmt: PixelFormat::Rgba8,
+            seed: 4,
+        }
+        .generate()
+        .unwrap();
+        let (png, _) = crate::edit::CodecSet::pinned()
+            .encode_bytes(&value, "png", &serde_json::json!({}), &NoMonitor)
+            .unwrap();
+        std::fs::write(src.join("sprite.png"), &png).unwrap();
+        let factory = Arc::new(FakeEngineFactory::default());
+        let services = || services().with_engine(factory.clone());
+        let path = dir.path().join("L.kuralib");
+        {
+            let session = LibrarySession::create(&path, sink(), services()).unwrap();
+            start_import(
+                session.jobs(),
+                &ImportInput {
+                    paths: vec![src],
+                    options: ImportOptions::default(),
+                },
+            )
+            .unwrap();
+            session.wait_ready();
+            assert!(session.jobs().wait_idle(Duration::from_secs(30)));
+            assert_eq!(analysis_state(&session), "ready");
+            let plan: Option<String> = session
+                .library()
+                .db()
+                .read(|c| crate::settings::get(c, crate::analysis::plan::PLAN_KEY))
+                .unwrap()
+                .map(|v: serde_json::Value| v.to_string());
+            assert!(plan.is_some(), "起動のスレッドが計画の指紋を置く");
+            session
+                .library()
+                .db()
+                .write(|tx| {
+                    tx.execute("UPDATE items SET analysis_state = 'pending'", [])?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let session = LibrarySession::open(&path, sink(), services()).unwrap();
+        session.wait_ready();
+        assert!(session.jobs().wait_idle(Duration::from_secs(30)));
+        assert_eq!(
+            analysis_state(&session),
+            "ready",
+            "開き直すと待っているものを解く"
+        );
+
+        let id: i64 = session
+            .library()
+            .db()
+            .read(|c| Ok(c.query_row("SELECT id FROM items", [], |r| r.get(0))?))
+            .unwrap();
+        assert!(!session.request_analysis(vec![id]).unwrap(), "解析済み");
+        assert_eq!(
+            session.retry_analysis(vec![id]).unwrap(),
+            0,
+            "失敗していない"
+        );
+        session
+            .library()
+            .db()
+            .write(|tx| {
+                tx.execute("UPDATE items SET analysis_state = 'failed'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(session.retry_analysis(vec![id]).unwrap(), 1);
+        assert!(session.jobs().wait_idle(Duration::from_secs(30)));
+        assert_eq!(analysis_state(&session), "ready");
+    }
+
+    /// エンジンのないセッションでは解析のジョブを持たず、積まない（取り込みは今までどおり終わる）。
+    #[test]
+    fn without_an_engine_analysis_is_not_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = LibrarySession::create(&dir.path().join("L"), sink(), services()).unwrap();
+        session.wait_ready();
+        assert_eq!(
+            session
+                .jobs()
+                .ensure_queued(JobKind::Analyze, "{}")
+                .unwrap(),
+            None
+        );
+        assert!(!session.request_analysis(vec![1]).unwrap());
     }
 
     /// 開くときに、新しい版にするための確かめと知らせを Library に渡す。

@@ -273,6 +273,7 @@ impl JobHandler for DownloadHandler {
             if registered.added > 0 {
                 ctx.ensure_queued(JobKind::Thumbnail, "{}")?;
                 ctx.ensure_queued(JobKind::Proxy, "{}")?;
+                ctx.ensure_queued(JobKind::Analyze, "{}")?;
             }
             // 入れたファイルは作業フォルダから消す（再試行で同じものを入れ直さないように）
             for path in &registered.placed_paths {
