@@ -3,6 +3,8 @@
 //! - `reduce_transparency`：「透明度を下げる」の設定
 //! - `MacBackend`：`MediaBackend` の macOS 実装（ImageIO / AVFoundation）
 //! - `media_backend`：macOS の実装で扱えない形式を ffmpeg に回す組み合わせ
+//! - `image_thumbnails_keep_alpha`・`font_thumbnails`・`probe_font`：M11 の ImageIO のアルファを保つサムネイル、
+//!   CoreText のフォントの見本とフォントの情報（`thumbs`）
 //! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
 //! - `find_chrome`・`snapshot_webview`：キャプチャ用の Google Chrome の場所と、WKWebView の表示範囲の撮影
 //! - `reveal_in_finder`・`volume_capacity`・`physical_memory`：Finder で見せる、ボリュームの容量、物理メモリ（編集のメモリの予算）
@@ -18,6 +20,7 @@ mod browser;
 pub mod codec;
 mod external;
 mod files;
+mod thumbs;
 
 pub use browser::{
     SnapshotDone, SnapshotInfo, find_chrome, frontmost_pid, play_capture_sound, snapshot_webview,
@@ -30,6 +33,10 @@ pub use external::{ExternalPlayer, open_in_player};
 pub use files::{
     VolumeCapacity, keep_webview_focus_on_fullscreen, physical_memory, reveal_in_finder,
     volume_capacity,
+};
+pub use thumbs::{
+    FONT_SAMPLES, FontInfo, FontProbe, ThumbFile, ThumbStems, font_thumbnails,
+    image_thumbnails_keep_alpha, probe_font,
 };
 
 use std::path::Path;
@@ -50,13 +57,6 @@ mod ffi {
 
     unsafe extern "C" {
         pub fn kura_reduce_transparency() -> bool;
-        pub fn kura_image_thumbnails(
-            path: *const c_char,
-            out_large: *const c_char,
-            out_small: *const c_char,
-            large_px: i32,
-            small_px: i32,
-        ) -> i32;
         pub fn kura_video_thumbnails(
             path: *const c_char,
             at_sec: f64,
@@ -73,8 +73,6 @@ mod ffi {
             large_px: i32,
             small_px: i32,
         ) -> i32;
-        pub fn kura_probe(path: *const c_char, kind: i32) -> *mut c_char;
-        pub fn kura_free_string(pointer: *mut c_char);
     }
 }
 
@@ -157,27 +155,26 @@ pub struct MacBackend;
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use std::ffi::{CStr, CString};
-    use std::os::unix::ffi::OsStrExt;
-
     use super::*;
+    use crate::thumbs::mac::{NO_ARTWORK, c_path, check, probe_json};
+    use crate::thumbs::{ThumbFile, ThumbStems};
 
-    const OK: i32 = 0;
-    const UNSUPPORTED: i32 = 1;
-    const NO_ARTWORK: i32 = 3;
-
-    fn c_path(path: &Path) -> Result<CString, MediaError> {
-        CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            MediaError::Failed(format!("パスに NUL 文字があります: {}", path.display()))
+    /// 今の `ThumbTargets`（`.jpg` のパス）を拡張子のない書き先にする。`.jpg` でなければ断る。
+    fn jpeg_stems(out: &ThumbTargets) -> Result<ThumbStems, MediaError> {
+        let stem = |p: &Path| {
+            if p.extension().is_some_and(|e| e == "jpg") {
+                Ok(p.with_extension(""))
+            } else {
+                Err(MediaError::Failed(format!(
+                    "サムネイルの書き先が .jpg ではありません: {}",
+                    p.display()
+                )))
+            }
+        };
+        Ok(ThumbStems {
+            large: stem(&out.large)?,
+            small: stem(&out.small)?,
         })
-    }
-
-    fn check(code: i32) -> Result<(), MediaError> {
-        match code {
-            OK => Ok(()),
-            UNSUPPORTED => Err(MediaError::Unsupported),
-            _ => Err(MediaError::Failed("macOS での処理に失敗しました".into())),
-        }
     }
 
     fn kind_code(kind: MediaKind) -> i32 {
@@ -190,33 +187,18 @@ mod mac {
 
     impl MediaBackend for MacBackend {
         fn probe(&self, path: &Path, kind: MediaKind) -> Result<MediaInfo, MediaError> {
-            let path = c_path(path)?;
-            // SAFETY: path は NUL 終端。戻り値は NULL か strdup した文字列で、kura_free_string で解放する。
-            let pointer = unsafe { ffi::kura_probe(path.as_ptr(), kind_code(kind)) };
-            if pointer.is_null() {
-                return Err(MediaError::Unsupported);
-            }
-            // SAFETY: NULL でない戻り値は NUL 終端の UTF-8（JSON）。
-            let json = unsafe { CStr::from_ptr(pointer) }
-                .to_string_lossy()
-                .into_owned();
-            // SAFETY: kura_probe が返したポインタを一度だけ解放する。
-            unsafe { ffi::kura_free_string(pointer) };
+            let json = probe_json(path, kind_code(kind))?;
             serde_json::from_str(&json).map_err(|e| MediaError::Failed(e.to_string()))
         }
 
         fn image_thumbnails(&self, path: &Path, out: &ThumbTargets) -> Result<(), MediaError> {
-            let (src, large, small) = (c_path(path)?, c_path(&out.large)?, c_path(&out.small)?);
-            // SAFETY: すべて NUL 終端の文字列。Swift 側は読むだけ。
-            check(unsafe {
-                ffi::kura_image_thumbnails(
-                    src.as_ptr(),
-                    large.as_ptr(),
-                    small.as_ptr(),
-                    LARGE_PX,
-                    SMALL_PX,
-                )
-            })
+            // 今の道（ThumbTargets は .jpg）はアルファを保たずに JPEG だけを書く。PNG の道は image_thumbnails_keep_alpha
+            match crate::thumbs::mac::image_thumbnails(path, &jpeg_stems(out)?, false)? {
+                ThumbFile::Jpeg => Ok(()),
+                ThumbFile::Png => Err(MediaError::Failed(
+                    "JPEG を求めたのに PNG が書かれました".into(),
+                )),
+            }
         }
 
         fn video_thumbnails(

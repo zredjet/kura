@@ -17,6 +17,7 @@ CI の仮想マシンでは書けないことがある HEIC。消さない・変
 | `heic-gradient-300x200.heic` | HEIC（`public.heic`・品質 0.9）。300×200・不透明・sRGB。画素は r = x·255/300、g = y·255/200、b = 128 | HEIC を Platform の段で読む・元に近い（PSNR）・上限・中止・壊れた入力・同時の読み取り |
 | `tiff-premultiplied16.tif` | 関連付けたアルファの 16 ビットの TIFF（`premultipliedLast`・16 ビット LE）。RGBA16・8×8・sRGB。先頭の 37 画素の R は、vImage の戻し（`vImageConvert_AnyToAny` で premultipliedLast → last）が kura の式と 1 違う (c, a) の組（macOS 26.7 の vImage を乱数と総当たりで探した。mkfix.swift に表） | 16 ビットのプレマルチプライドを Rust の整数の式で戻す（vImage に任せると落ちる） |
 | `tiff-premultiplied16.rgba` | 上の TIFF に書いたプレマルチプライドの画素（RGBA16 の LE を行の順に 512 バイト） | 同上の照合の元 |
+| `heic-alpha-48x32.heic`・`tiff-alpha-48x32.tif` | アルファのある HEIC（品質 0.9）と TIFF（ストレートのアルファ）。48×32・sRGB。外周 8 画素は透明（α = 0）、内側は不透明（r = x·255/w、g = y·255/h、b = 200）。M11 で足した | ImageIO の道のサムネイルがアルファを保ち PNG を書く（`image_thumbnails_keep_alpha`） |
 | `heic-decode-hangs.heic` | `heics-3x24x16.heic` の 2 バイトを変えたもの（0x166 を 0x0c：主画像の hvcC の中、0x1128 を 0x02：moov の stsd の entry_count の上位）。開くと 24×16 の 1 枚の画像だが、展開（`CGDataProviderCopyData`）が VideoToolbox の XPC の返事を待ったまま戻らない（Apple 側の不具合。`sips` も止まる。段 9 の検証の変異のファズで見つけた） | 展開の時間切れ・中止でスレッドとハンドルを見捨てる |
 
 ## PNG のコーパス（`png-*.png`）

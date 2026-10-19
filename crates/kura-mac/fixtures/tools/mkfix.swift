@@ -145,3 +145,30 @@ do {
     print("premul16 tiff", CGImageDestinationFinalize(dest))
     try? data.write(to: out.appendingPathComponent("tiff-premultiplied16.rgba"))
 }
+
+// 6. アルファのある HEIC と TIFF（48×32・sRGB。M11：ImageIO の道のサムネイルがアルファを保つ）。外周 8 画素は透明（α = 0）、
+//    内側は不透明（r = x·255/w、g = y·255/h、b = 200）。HEIC は品質 0.9（CI の仮想マシンでは HEIC を書けないことがあるので、
+//    テストの中では作らない）。TIFF はストレートのアルファ（last）
+do {
+    let w = 48, h = 32, border = 8
+    var px = [UInt8](repeating: 0, count: w * h * 4)
+    for y in 0..<h {
+        for x in 0..<w {
+            let i = (y * w + x) * 4
+            let inside = x >= border && x < w - border && y >= border && y < h - border
+            px[i] = inside ? UInt8(x * 255 / w) : 0
+            px[i + 1] = inside ? UInt8(y * 255 / h) : 0
+            px[i + 2] = inside ? 200 : 0
+            px[i + 3] = inside ? 255 : 0
+        }
+    }
+    let heic = out.appendingPathComponent("heic-alpha-48x32.heic")
+    let hdest = CGImageDestinationCreateWithURL(heic as CFURL, "public.heic" as CFString, 1, nil)!
+    let props = [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary
+    CGImageDestinationAddImage(hdest, image(px, w, h, alpha: .last), props)
+    print("alpha heic", CGImageDestinationFinalize(hdest))
+    let tiff = out.appendingPathComponent("tiff-alpha-48x32.tif")
+    let tdest = CGImageDestinationCreateWithURL(tiff as CFURL, "public.tiff" as CFString, 1, nil)!
+    CGImageDestinationAddImage(tdest, image(px, w, h, alpha: .last), nil)
+    print("alpha tiff", CGImageDestinationFinalize(tdest))
+}
