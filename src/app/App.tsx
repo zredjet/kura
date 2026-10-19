@@ -18,6 +18,7 @@ import { SearchPalette } from '../features/search/SearchPalette';
 import { SettingsSheet } from '../features/settings/SettingsSheet';
 import { TagDialog } from '../features/tags/TagDialog';
 import { TagsView } from '../features/tags/TagsView';
+import { LibraryUpgrade } from '../features/welcome/LibraryUpgrade';
 import { Welcome } from '../features/welcome/Welcome';
 import { closePlayer, loadPlayerPrefs, watchFullscreen } from '../features/player/playerActions';
 import { reportPlaybackSupport } from '../features/player/support';
@@ -49,13 +50,19 @@ export function App() {
     }
   }, []);
 
-  if (status === 'loading') {
-    return <div className={styles.loading} data-tauri-drag-region />;
-  }
-  if (status === 'none') {
-    return <Welcome />;
-  }
-  return <LibraryScreen />;
+  return (
+    <>
+      {status === 'loading' ? (
+        <div className={styles.loading} data-tauri-drag-region />
+      ) : status === 'none' ? (
+        <Welcome />
+      ) : (
+        <LibraryScreen />
+      )}
+      {/* 開くときに DB を新しい版にするのが 300ms を超えたら、どの画面の上にも出す */}
+      <LibraryUpgrade />
+    </>
+  );
 }
 
 /** ライブラリを開いているときの画面。 */

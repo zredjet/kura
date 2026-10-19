@@ -607,6 +607,19 @@ export const ja = {
     notALibrary: 'ライブラリが見つかりません。名前が「.kuralib」で終わるフォルダを選んでください。',
     failed: (message: string) => `ライブラリを開けませんでした：${message}`,
   },
+  /** ライブラリを開くときの DB の更新（M11 の決定 1。design.md §3.1）。 */
+  libraryOpen: {
+    upgrading: 'ライブラリを更新しています',
+    /** 開けなかった理由の見出し（AppError の code ごと。説明は Rust の message をそのまま出す）。 */
+    failure: {
+      LibraryTooNew: '新しい版の Kura で作られたライブラリです',
+      NoSpace: 'ディスクの空き容量が足りません',
+      BackupFailed: 'バックアップを作れませんでした',
+      UpgradeFailed: 'ライブラリを新しい版にできませんでした',
+      other: 'ライブラリを開けませんでした',
+    },
+    place: (path: string) => `場所：${path}`,
+  },
   drop: {
     message: 'ここにドロップして取り込む',
   },

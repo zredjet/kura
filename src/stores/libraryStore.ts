@@ -4,6 +4,7 @@ import { prune } from '../features/library/selection';
 import { joinClauses } from '../features/search/clauses';
 import { type IdList, queryIds } from '../ipc/items';
 import {
+  type AppError,
   createLibrary,
   libraryInfo,
   type LibraryInfoDto,
@@ -14,6 +15,7 @@ import { isIpcError } from '../ipc/result';
 import { clearItems } from './itemCache';
 import { notify } from './noticeStore';
 import { useSidebarStore } from './sidebarStore';
+import { settleUpgrade, watchUpgrades } from './upgradeStore';
 import { useViewStore } from './viewStore';
 
 type Status = 'loading' | 'none' | 'open';
@@ -23,6 +25,11 @@ interface LibraryState {
   info: LibraryInfoDto | null;
   /** 前回のライブラリが見つからなかったときの場所。 */
   missingPath: string | null;
+  /**
+   * 前回のライブラリ（か `KURA_LIBRARY`）を開けなかった理由と場所（新しい版の Kura のライブラリ・空き容量・
+   * バックアップの失敗・新しい版にできない、など。M11）。
+   */
+  restoreError: { path: string | null; error: AppError } | null;
   /** 一覧（ID・縦横比・日付のグループ）。 */
   list: IdList | null;
   /** 一覧を読み直す。 */
@@ -41,6 +48,7 @@ export const useLibraryStore = create<LibraryState>((set) => ({
   status: 'loading',
   info: null,
   missingPath: null,
+  restoreError: null,
   list: null,
   loadList: async () => {
     const { view, collapseUnits, filter, sort } = useViewStore.getState();
@@ -74,27 +82,43 @@ export const useLibraryStore = create<LibraryState>((set) => ({
     }
   },
   restore: async () => {
+    // 開く途中で DB を新しい版にするときの知らせを落とさないよう、受け取りを始めてから開く
+    await watchUpgrades();
     try {
       const result = await restoreLibrary();
       if (result.info) {
-        set({ status: 'open', info: result.info, missingPath: null });
+        set({ status: 'open', info: result.info, missingPath: null, restoreError: null });
+      } else if (result.error) {
+        set({
+          status: 'none',
+          info: null,
+          missingPath: null,
+          restoreError: { path: result.lastPath, error: result.error },
+        });
       } else {
-        set({ status: 'none', info: null, missingPath: result.lastPath });
+        set({ status: 'none', info: null, missingPath: result.lastPath, restoreError: null });
       }
     } catch (error) {
       console.warn('前回のライブラリを開けませんでした', error);
-      set({ status: 'none', info: null, missingPath: null });
+      set({ status: 'none', info: null, missingPath: null, restoreError: null });
+    } finally {
+      settleUpgrade();
     }
   },
   create: async (path) => {
     const info = await createLibrary(path);
     resetForLibrary();
-    set({ status: 'open', info, missingPath: null, list: null });
+    set({ status: 'open', info, missingPath: null, restoreError: null, list: null });
   },
   open: async (path) => {
-    const info = await openLibrary(path);
-    resetForLibrary();
-    set({ status: 'open', info, missingPath: null, list: null });
+    await watchUpgrades();
+    try {
+      const info = await openLibrary(path);
+      resetForLibrary();
+      set({ status: 'open', info, missingPath: null, restoreError: null, list: null });
+    } finally {
+      settleUpgrade();
+    }
   },
   refresh: async () => {
     try {

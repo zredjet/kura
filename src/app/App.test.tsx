@@ -7,6 +7,7 @@ import { useLibraryStore } from '../stores/libraryStore';
 import { App } from './App';
 
 vi.mock('../ipc/library', () => ({
+  onLibraryUpgrade: vi.fn(async () => () => {}),
   restoreLibrary: vi.fn(),
   libraryInfo: vi.fn(),
   createLibrary: vi.fn(),
@@ -62,7 +63,12 @@ const info = {
 };
 
 beforeEach(() => {
-  useLibraryStore.setState({ status: 'loading', info: null, missingPath: null });
+  useLibraryStore.setState({
+    status: 'loading',
+    info: null,
+    missingPath: null,
+    restoreError: null,
+  });
   vi.mocked(restoreLibrary).mockReset();
 });
 
@@ -111,5 +117,20 @@ describe('App（ライブラリがないとき）', () => {
       await screen.findByRole('heading', { level: 1, name: ja.welcome.title }),
     ).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('/Volumes/SSD/Kura Library.kuralib');
+  });
+
+  it('前回のライブラリを新しい版にできなければ、初回の画面に理由を出す（M11）', async () => {
+    vi.mocked(restoreLibrary).mockResolvedValue({
+      info: null,
+      lastPath: '/Volumes/SSD/Kura Library.kuralib',
+      error: {
+        code: 'BackupFailed',
+        message: 'バックアップを作れませんでした（ライブラリは変えていません）',
+      },
+    });
+    render(<App />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(ja.libraryOpen.failure.BackupFailed);
+    expect(screen.queryByRole('status')).toBeNull();
   });
 });
