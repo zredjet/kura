@@ -4,6 +4,8 @@
 //! - `download --library <path> <url>...`：アプリと同じジョブで取得してライブラリに入れる（M7 の確認用）
 //! - `check --library <path>`：件数と整合性（DB とファイルの食い違い）を表示する
 //! - `seed --items <件数> --out <path>`：ダミーライブラリを作る（グリッドと起動時間の計測用）
+//! - `selftest-library --out <path> [--web <dir>] [--font <ttf>]`：kura:// と CSP を実機で確かめるライブラリ
+//!   （`VITE_KURA_SELFTEST=1` のフロントが試す。`selftest` の冒頭）
 //! - `bench query --library <path>`：一覧の取得の速さを測る
 //! - `bench thumbs --src <画像のフォルダ> [--threads N]`：画像サムネイルの速さを測る（NFR-04）
 //! - `bench edit [--quick] [--threads 3,4,16] [--photo <file>] [--json <file>] [--markdown <file>] …`：編集の性能
@@ -17,6 +19,7 @@ mod bench_edit;
 mod edit;
 mod mem_smoke;
 mod seed;
+mod selftest;
 mod vorbis_quality;
 
 use std::path::PathBuf;
@@ -45,6 +48,7 @@ fn main() -> ExitCode {
         Some("download") => download(&args[1..]),
         Some("check") => check(&args[1..]),
         Some("seed") => seed::run(&args[1..]),
+        Some("selftest-library") => selftest::run(&args[1..]),
         Some("bench") => bench::run(&args[1..]),
         Some("edit") => edit::run(&args[1..]),
         Some("vorbis-quality") => vorbis_quality::run(&args[1..]),
