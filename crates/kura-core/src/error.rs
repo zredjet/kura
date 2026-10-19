@@ -36,13 +36,21 @@ pub enum CoreError {
 }
 
 /// ライブラリの DB を新しい版にできなかった理由（docs/data-model.md §5）。どれでもライブラリは前の版のまま残る。
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum UpgradeError {
     /// DB の方が新しい（新しい版の Kura で作られた）。
     #[error(
         "このライブラリは新しい版の Kura で作られています（スキーマ {found}。この Kura が扱えるのは {supported} まで）。Kura を新しくしてから開いてください"
     )]
     Newer { found: usize, supported: usize },
+    /// 当てる前に確かめた空きが、見積もり（`library::upgrade::space_needed`）に足りない（バックアップも取っていない）。
+    #[error(
+        "ディスクの空き容量が足りないため、ライブラリを新しい版にできません。あと約 {} MB の空きを作ってから開き直してください（ライブラリは変えていません。要る空きは約 {} MB、いまの空きは約 {} MB）",
+        megabytes(.needed.saturating_sub(*.available)),
+        megabytes(*.needed),
+        megabytes(*.available)
+    )]
+    NoSpace { needed: u64, available: u64 },
     /// 当てる前のバックアップを作れなかった（ディスクの空きが足りない）。
     #[error(
         "ライブラリを新しい版にする前のバックアップを作れませんでした。ディスクの空き容量が足りません。空きを作ってから開き直してください（ライブラリは変えていません。{detail}）"
@@ -70,7 +78,9 @@ impl UpgradeError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Newer { .. } => "newer",
-            Self::BackupNoSpace { .. } | Self::ApplyNoSpace { .. } => "noSpace",
+            Self::NoSpace { .. } | Self::BackupNoSpace { .. } | Self::ApplyNoSpace { .. } => {
+                "noSpace"
+            }
             Self::Backup { .. } => "backup",
             Self::Apply { .. } => "apply",
         }
@@ -95,6 +105,11 @@ impl UpgradeError {
             Self::Apply { migration, detail }
         }
     }
+}
+
+/// バイト数を、切り上げた MB（10^6。Finder の表示と同じ）にする。
+fn megabytes(bytes: u64) -> u64 {
+    bytes.div_ceil(1_000_000)
 }
 
 impl CoreError {
@@ -183,6 +198,13 @@ mod tests {
             "{apply}"
         );
         assert!(apply.to_string().contains("前の版のまま"), "{apply}");
+        let short = UpgradeError::NoSpace {
+            needed: 300_000_000,
+            available: 120_500_000,
+        };
+        assert_eq!(short.kind(), "noSpace");
+        assert!(short.to_string().contains("あと約 180 MB"), "{short}");
+        assert!(short.to_string().contains("変えていません"), "{short}");
         let newer = CoreError::from(UpgradeError::Newer {
             found: 12,
             supported: 9,

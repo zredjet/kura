@@ -220,7 +220,11 @@ where
     let started = std::time::Instant::now();
     // 新しい DB（版 0）には残すものがないので、フックは既存の DB だけ
     if from > 0 {
-        before_migrating(conn, from).map_err(|err| UpgradeError::backup(&err))?;
+        // フックが理由を付けて断ったとき（空き容量が足りない）はそのまま返す。ほかの失敗はバックアップの失敗
+        before_migrating(conn, from).map_err(|err| match err {
+            CoreError::Upgrade(err) => err,
+            err => UpgradeError::backup(&err),
+        })?;
     }
     let before_ms = ms(started);
     let mut report = migrate::run(conn, list, list.len()).map_err(|(index, err)| {
@@ -495,6 +499,21 @@ mod tests {
             .unwrap();
         assert!(
             matches!(err, CoreError::Upgrade(UpgradeError::Backup { .. })),
+            "{err}"
+        );
+        assert_eq!(version_of(&path), MIGRATIONS.len() - 1);
+        // フックが理由を付けて断ったら（当てる前の空き容量の確かめ）、その理由のまま返す
+        let err = Db::open_with(&path, |_, _| {
+            Err(UpgradeError::NoSpace {
+                needed: 10,
+                available: 1,
+            }
+            .into())
+        })
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, CoreError::Upgrade(UpgradeError::NoSpace { .. })),
             "{err}"
         );
         assert_eq!(version_of(&path), MIGRATIONS.len() - 1);
