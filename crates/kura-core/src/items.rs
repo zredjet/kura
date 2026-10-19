@@ -1500,6 +1500,7 @@ mod tests {
         let conn = library();
         conn.execute_batch(
             "UPDATE items SET title = 'p' || ((7 - id) * 5) WHERE id <= 6;
+             UPDATE blobs SET size_bytes = (SELECT i.id * 10 FROM items i WHERE i.hash = blobs.hash);
              UPDATE items SET rating = id % 3, size_bytes = id * 10;
              UPDATE items SET duration_ms = 100 * id WHERE id IN (2, 4);
              UPDATE items SET captured_at = imported_at WHERE id IN (1, 3);",

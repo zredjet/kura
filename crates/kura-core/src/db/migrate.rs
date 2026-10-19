@@ -37,7 +37,6 @@ const fn plain(name: &'static str, sql: &'static str) -> Migration {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 const fn rebuild(name: &'static str, sql: &'static str) -> Migration {
     Migration {
         name,
@@ -68,6 +67,10 @@ pub const MIGRATIONS: &[Migration] = &[
     plain(
         "0006_unit_order_reverse",
         include_str!("../../migrations/0006_unit_order_reverse.sql"),
+    ),
+    rebuild(
+        "0007_blobs_and_kinds",
+        include_str!("../../migrations/0007_blobs_and_kinds.sql"),
     ),
 ];
 

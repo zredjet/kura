@@ -112,7 +112,7 @@ fn proxy_todo_index_settles_images_and_keeps_items() {
         let plan = crate::db::query_plan(
             &conn,
             &format!(
-                "SELECT id FROM items WHERE proxy_state = '{state}' AND kind != 'image'
+                "SELECT id FROM items WHERE proxy_state = '{state}' AND +kind IN ('video', 'audio')
                  ORDER BY imported_at DESC, id DESC LIMIT 16"
             ),
         );
@@ -315,7 +315,7 @@ fn export_job_kind_keeps_existing_jobs() {
 
 // ===== runner：Rebuild（docs/data-model.md §5）=====
 
-use crate::db::testing::{columns, fill_v6, one, snapshot, snapshot_cols, tables};
+use crate::db::testing::{columns, fill_v6, h, one, snapshot, snapshot_cols, tables};
 
 /// テスト専用の Rebuild：0006 の items を、列を 1 つ足して作り直す（索引 9 つと FTS のトリガ 3 つも作り直す）。
 const TEST_REBUILD_ITEMS: &str = "
@@ -596,4 +596,284 @@ fn reports_what_it_applied() {
     assert!(again.applied.is_empty());
     assert_eq!((again.from, again.to), (MIGRATIONS.len(), MIGRATIONS.len()));
     assert!(!pending(&conn).unwrap());
+}
+
+// ===== 0007（Rebuild）：台帳 blobs と items の作り直し =====
+
+/// 0007 の版。
+const V7: usize = 7;
+
+#[test]
+fn migration_0007_is_a_rebuild() {
+    assert_eq!(MIGRATIONS[V7 - 1].name, "0007_blobs_and_kinds");
+    assert_eq!(MIGRATIONS[V7 - 1].kind, Kind::Rebuild);
+}
+
+#[test]
+fn rebuild_0007_keeps_children_fts_indexes_and_triggers() {
+    let mut conn = filled_v6();
+    let cols = columns(&conn);
+    let before = snapshot_cols(&conn, &cols);
+    let report = migrate_until(&mut conn, V7).unwrap();
+    assert_eq!(report.tolerated_violations, 0);
+    let after = snapshot_cols(&conn, &cols);
+    for (key, value) in &before {
+        assert_eq!(after.get(key), Some(value), "{key} が変わった");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(
+        added,
+        vec![
+            "index idx_blobs_size",
+            "index idx_items_analysis_pending",
+            "index idx_items_thumb_stale",
+            "index sqlite_autoindex_blobs_1",
+            "table blobs",
+            "trigger items_blob_bi",
+            "trigger items_blob_bu",
+        ]
+    );
+    assert_eq!(before["fts integrity"], "Ok(())");
+    // 足した列：items の最後に analysis_state と thumb_rev（動画は解析しない）
+    let names: String = one(
+        &conn,
+        "SELECT group_concat(name, ',') FROM pragma_table_info('items')",
+    );
+    assert!(
+        names.ends_with("thumb_state,proxy_state,analysis_state,thumb_rev"),
+        "{names}"
+    );
+    let states: String = one(
+        &conn,
+        "SELECT group_concat(id || ':' || analysis_state || ':' || thumb_rev, ' ')
+           FROM (SELECT id, analysis_state, thumb_rev FROM items ORDER BY id)",
+    );
+    assert_eq!(states, "1:pending:0 2:not_needed:0 3:pending:0 4:pending:0");
+    // 外部キーは戻っていて、食い違いはない
+    assert_eq!(one::<i64>(&conn, "PRAGMA foreign_keys"), 1);
+    assert!(violations(&conn).unwrap().is_empty());
+    // 台帳：items の 1 行に 1 つ（ゴミ箱のものも）、拡張子・サイズが同じ。作った時刻は取り込んだ時刻
+    assert_eq!(
+        one::<i64>(
+            &conn,
+            "SELECT count(*) FROM items i JOIN blobs b
+                 ON b.hash = i.hash AND b.ext = i.ext AND b.size_bytes = i.size_bytes
+                AND b.created_at = i.imported_at"
+        ),
+        4
+    );
+    assert_eq!(one::<i64>(&conn, "SELECT count(*) FROM blobs"), 4);
+}
+
+#[test]
+fn inserting_an_item_registers_its_blob_and_rejects_a_mismatch() {
+    let conn = crate::db::test_conn();
+    let insert = |hash: &str, ext: &str, size: i64, at: i64| {
+        conn.execute_batch(&format!(
+            "INSERT INTO items (hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+             VALUES ({hash}, '{ext}', 'image', {size}, 't', 't.{ext}', {at}, {at})"
+        ))
+    };
+    insert(&h(9), "png", 5, 7).unwrap();
+    let (ext, size, at): (String, i64, i64) = conn
+        .query_row("SELECT ext, size_bytes, created_at FROM blobs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!((ext.as_str(), size, at), ("png", 5, 7));
+    // 台帳に残った行と拡張子・サイズが違う中身は断る（ゴミ箱を空にすると台帳の行も消すので、ふつうは起きない）
+    conn.execute("DELETE FROM items", []).unwrap();
+    for (ext, size) in [("jpg", 5), ("png", 6)] {
+        let err = insert(&h(9), ext, size, 8).unwrap_err().to_string();
+        assert!(err.contains("items_blob_mismatch"), "{err}");
+    }
+    // 同じ拡張子・サイズなら台帳の行を使い回す
+    insert(&h(9), "png", 5, 8).unwrap();
+    assert_eq!(one::<i64>(&conn, "SELECT count(*) FROM blobs"), 1);
+    assert_eq!(one::<i64>(&conn, "SELECT created_at FROM blobs"), 7);
+    // 参照されている台帳の行は消せない
+    assert!(conn.execute("DELETE FROM blobs", []).is_err());
+    // 外部キーを切った接続（テストの道具など）から入れても、トリガで台帳に載る
+    conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    insert(&h(10), "png", 1, 9).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    assert!(violations(&conn).unwrap().is_empty());
+    assert_eq!(one::<i64>(&conn, "SELECT count(*) FROM blobs"), 2);
+}
+
+#[test]
+fn changing_hash_ext_or_size_goes_through_the_ledger() {
+    let mut conn = filled_v6();
+    migrate(&mut conn).unwrap();
+    // M12 の保存はハッシュ・拡張子・サイズを 1 つの UPDATE で変える。台帳になければ載る
+    conn.execute_batch(&format!(
+        "UPDATE items SET hash = {}, ext = 'png', size_bytes = 99, updated_at = 50 WHERE id = 1",
+        h(11)
+    ))
+    .unwrap();
+    assert_eq!(
+        one::<i64>(
+            &conn,
+            &format!(
+                "SELECT count(*) FROM blobs WHERE hash = {} AND ext = 'png' AND size_bytes = 99 AND created_at = 50",
+                h(11)
+            )
+        ),
+        1
+    );
+    // 拡張子・サイズだけを台帳と違う値にはできない
+    for sql in [
+        "UPDATE items SET ext = 'jpeg' WHERE id = 1",
+        "UPDATE items SET size_bytes = 98 WHERE id = 1",
+    ] {
+        let err = conn.execute(sql, []).unwrap_err().to_string();
+        assert!(err.contains("items_blob_mismatch"), "{sql}: {err}");
+    }
+    // 台帳に先に同じ値を書けば通る（テストの準備で大きさを変える形）
+    conn.execute_batch(&format!(
+        "UPDATE blobs SET size_bytes = 98 WHERE hash = {h};
+         UPDATE items SET size_bytes = 98 WHERE hash = {h};",
+        h = h(11)
+    ))
+    .unwrap();
+    assert!(violations(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn kinds_font_and_model_are_accepted_and_the_named_check_rejects_others() {
+    let conn = crate::db::test_conn();
+    for (b, ext, kind) in [(1u8, "ttf", "font"), (2, "glb", "model")] {
+        conn.execute_batch(&format!(
+            "INSERT INTO items (hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at, proxy_state)
+             VALUES ({}, '{ext}', '{kind}', 1, 't', 't.{ext}', 1, 1, 'not_needed')",
+            h(b)
+        ))
+        .unwrap();
+    }
+    let err = conn
+        .execute("UPDATE items SET kind = 'other' WHERE id = 1", [])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("items_kind"), "{err}");
+    for (sql, name) in [
+        ("UPDATE items SET rating = 6 WHERE id = 1", "items_rating"),
+        (
+            "UPDATE items SET analysis_state = 'x' WHERE id = 1",
+            "items_analysis_state",
+        ),
+        (
+            "UPDATE items SET thumb_state = 'x' WHERE id = 1",
+            "items_thumb_state",
+        ),
+        (
+            "UPDATE items SET proxy_state = 'x' WHERE id = 1",
+            "items_proxy_state",
+        ),
+    ] {
+        let err = conn.execute(sql, []).unwrap_err().to_string();
+        assert!(err.contains(name), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn proxy_states_other_than_unknown_or_not_needed_are_only_for_video_and_audio() {
+    let conn = crate::db::test_conn();
+    // 既定（unknown）のままのフォントは入る（テストの準備で items に直接入れるもの）
+    conn.execute_batch(&format!(
+        "INSERT INTO items (hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+         VALUES ({}, 'ttf', 'font', 1, 't', 't.ttf', 1, 1)",
+        h(1)
+    ))
+    .unwrap();
+    for state in ["pending", "ready", "failed"] {
+        let err = conn
+            .execute("UPDATE items SET proxy_state = ?1 WHERE id = 1", [state])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("items_proxy_av"), "{state}: {err}");
+    }
+    conn.execute(
+        "UPDATE items SET proxy_state = 'not_needed' WHERE id = 1",
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
+fn proxy_states_that_make_no_sense_for_other_kinds_are_settled_by_0007() {
+    // v6 では画像に pending などを入れられる（今のコードは入れないが、0007 を失敗させてライブラリを開けなくしないため）
+    let mut conn = filled_v6();
+    conn.execute("UPDATE items SET proxy_state = 'failed' WHERE id = 1", [])
+        .unwrap();
+    conn.execute("UPDATE items SET proxy_state = 'ready' WHERE id = 4", [])
+        .unwrap();
+    migrate_until(&mut conn, V7).unwrap();
+    let states: String = one(
+        &conn,
+        "SELECT group_concat(id || ':' || proxy_state, ' ') FROM (SELECT id, proxy_state FROM items ORDER BY id)",
+    );
+    assert_eq!(states, "1:not_needed 2:unknown 3:pending 4:not_needed");
+}
+
+#[test]
+fn thumb_rev_and_stale_survive_and_stale_uses_its_index() {
+    let mut conn = filled_v6();
+    migrate(&mut conn).unwrap();
+    conn.execute(
+        "UPDATE items SET thumb_state = 'stale', thumb_rev = thumb_rev + 1 WHERE id = 1",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        one::<String>(
+            &conn,
+            "SELECT thumb_state || ':' || thumb_rev FROM items WHERE id = 1"
+        ),
+        "stale:1"
+    );
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT id, hash, ext, kind FROM items WHERE thumb_state = 'stale'
+         ORDER BY imported_at DESC, id DESC LIMIT 64",
+    );
+    assert!(
+        plan.contains("idx_items_thumb_stale") && !plan.contains("TEMP B-TREE"),
+        "{plan}"
+    );
+    // 解析のジョブの取り出しと数は部分索引だけを読む
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT id, hash, ext, kind FROM items WHERE analysis_state = 'pending'
+         ORDER BY imported_at DESC, id DESC LIMIT 16",
+    );
+    assert!(
+        plan.contains("idx_items_analysis_pending") && !plan.contains("TEMP B-TREE"),
+        "{plan}"
+    );
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT count(*) FROM items WHERE analysis_state = 'pending'",
+    );
+    assert!(plan.contains("idx_items_analysis_pending"), "{plan}");
+}
+
+#[test]
+fn named_checks_can_be_widened_without_a_rebuild() {
+    // 同梱の SQLite が 3.53 より古くなると、この構文が通らず失敗する（以後の値の追加の前提。docs/data-model.md §2）
+    let mut conn = filled_v6();
+    migrate(&mut conn).unwrap();
+    let before = snapshot(&conn);
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE items DROP CONSTRAINT items_kind;
+         ALTER TABLE items ADD CONSTRAINT items_kind CHECK (kind IN ('image','video','audio','font','model','doc'));
+         COMMIT;",
+    )
+    .unwrap();
+    assert_eq!(snapshot(&conn), before);
+    conn.execute("UPDATE items SET kind = 'doc' WHERE id = 4", [])
+        .unwrap();
+    let sqlite: String = one(&conn, "SELECT sqlite_version()");
+    let parts: Vec<u32> = sqlite.split('.').filter_map(|p| p.parse().ok()).collect();
+    assert!(parts >= vec![3, 53], "{sqlite}");
 }

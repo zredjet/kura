@@ -51,17 +51,19 @@ pub fn find_by_hash(conn: &Connection, hash: &[u8; 32]) -> Result<Option<Existin
         .optional()?)
 }
 
-/// アイテムを追加して ID を返す。画像はプロキシを作らないので proxy_state は not_needed。
-/// `original_path` が空なら NULL にする（ダウンロードしたもの）。
+/// アイテムを追加して ID を返す。プロキシを作るのは動画・音声だけなので、ほかの種類の proxy_state は not_needed。
+/// 解析するのは画像・音声だけなので、ほかの種類の analysis_state は not_needed（docs/data-model.md §3）。
+/// 台帳 `blobs` にはトリガが載せる。`original_path` が空なら NULL にする（ダウンロードしたもの）。
 pub fn insert_item(conn: &Connection, item: &NewItem<'_>) -> Result<i64> {
     let size = i64::try_from(item.size)
         .map_err(|_| CoreError::Invalid(format!("ファイルが大きすぎます: {}", item.size)))?;
     let mut stmt = conn.prepare_cached(
         "INSERT INTO items (hash, ext, kind, mime, size_bytes, title, original_name, original_path,
                             source_site, source_url, imported_at, updated_at,
-                            width, height, duration_ms, captured_at, codec_info, proxy_state)
+                            width, height, duration_ms, captured_at, codec_info, proxy_state, analysis_state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULLIF(?8, ''), ?15, ?16, ?9, ?9, ?10, ?11, ?12, ?13, ?14,
-                 CASE ?3 WHEN 'image' THEN 'not_needed' ELSE 'unknown' END)",
+                 CASE WHEN ?3 IN ('video', 'audio') THEN 'unknown' ELSE 'not_needed' END,
+                 CASE WHEN ?3 IN ('image', 'audio') THEN 'pending' ELSE 'not_needed' END)",
     )?;
     stmt.execute(params![
         &item.hash[..],

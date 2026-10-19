@@ -142,19 +142,49 @@ fn picks_prioritized_work_first() {
 
 #[test]
 fn todo_lookups_use_indexes() {
+    // `+kind` で種類の索引を使わせず、部分索引を新しい順に読む（素の `kind IN` は TEMP B-TREE に退行する）
     let conn = crate::db::test_conn();
     for state in ["unknown", "pending"] {
         let plan = crate::db::query_plan(
             &conn,
             &format!(
                 "SELECT id, hash, ext, kind FROM items
-                 WHERE proxy_state = '{state}' AND kind != 'image' AND trashed_at IS NULL
+                 WHERE proxy_state = '{state}' AND +kind IN ('video', 'audio') AND trashed_at IS NULL
                  ORDER BY imported_at DESC, id DESC LIMIT 16"
             ),
         );
         assert!(plan.contains(&format!("idx_items_proxy_{state}")), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
+}
+
+#[test]
+fn sync_support_and_force_pending_leave_fonts_alone() {
+    // プロキシを作るのは video・audio だけ（ADR-140）。フォント・3D は判定にも作成待ちにもならない
+    let conn = crate::db::test_conn();
+    insert(&conn, 1, "font", "ttf", "not_needed", 10);
+    insert(&conn, 2, "model", "glb", "unknown", 20);
+    insert(&conn, 3, "video", "mkv", "not_needed", 30);
+    let state = |id: i64| -> String {
+        conn.query_row("SELECT proxy_state FROM items WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert!(sync_support(&conn, "aaaa").unwrap());
+    assert_eq!(
+        (state(1), state(2), state(3)),
+        ("not_needed".into(), "unknown".into(), "unknown".into())
+    );
+    // 判定待ちのままの 3D（既定の unknown）も、判定・作成の対象にしない
+    assert_eq!(ids(&next_work(&conn, &[2, 1]).unwrap()), vec![3]);
+    assert_eq!(count_todo(&conn).unwrap(), 1);
+    assert!(force_pending(&conn, &[1, 2]).is_ok());
+    assert_eq!(
+        (state(1), state(2)),
+        ("not_needed".into(), "unknown".into())
+    );
+    assert!(!any_todo(&conn, &[1, 2]).unwrap());
 }
 
 #[test]

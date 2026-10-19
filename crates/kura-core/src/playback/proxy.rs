@@ -236,7 +236,7 @@ fn to_todo((id, hash, ext, kind): (i64, Vec<u8>, String, String)) -> Option<Todo
 fn next_work(conn: &Connection, priority: &[i64]) -> Result<Work> {
     let mut by_id = conn.prepare_cached(
         "SELECT id, hash, ext, kind, proxy_state FROM items
-         WHERE id = ?1 AND kind != 'image' AND trashed_at IS NULL",
+         WHERE id = ?1 AND +kind IN ('video', 'audio') AND trashed_at IS NULL",
     )?;
     let mut decide = Vec::new();
     let mut make = None;
@@ -261,7 +261,7 @@ fn next_work(conn: &Connection, priority: &[i64]) -> Result<Work> {
 
     let mut unknown = conn.prepare_cached(
         "SELECT id, hash, ext, kind FROM items
-         WHERE proxy_state = 'unknown' AND kind != 'image' AND trashed_at IS NULL
+         WHERE proxy_state = 'unknown' AND +kind IN ('video', 'audio') AND trashed_at IS NULL
          ORDER BY imported_at DESC, id DESC LIMIT ?1",
     )?;
     let batch: Vec<Todo> = unknown
@@ -275,7 +275,7 @@ fn next_work(conn: &Connection, priority: &[i64]) -> Result<Work> {
     }
     let mut pending = conn.prepare_cached(
         "SELECT id, hash, ext, kind FROM items
-         WHERE proxy_state = 'pending' AND kind != 'image' AND trashed_at IS NULL
+         WHERE proxy_state = 'pending' AND +kind IN ('video', 'audio') AND trashed_at IS NULL
          ORDER BY imported_at DESC, id DESC LIMIT 1",
     )?;
     let next = pending.query_row([], todo_from_row).optional()?;
@@ -285,8 +285,8 @@ fn next_work(conn: &Connection, priority: &[i64]) -> Result<Work> {
 /// 判定・作成を待っている数。
 fn count_todo(conn: &Connection) -> Result<u64> {
     let mut stmt = conn.prepare_cached(
-        "SELECT (SELECT COUNT(*) FROM items WHERE proxy_state = 'unknown' AND kind != 'image' AND trashed_at IS NULL)
-              + (SELECT COUNT(*) FROM items WHERE proxy_state = 'pending' AND kind != 'image' AND trashed_at IS NULL)",
+        "SELECT (SELECT COUNT(*) FROM items WHERE proxy_state = 'unknown' AND +kind IN ('video', 'audio') AND trashed_at IS NULL)
+              + (SELECT COUNT(*) FROM items WHERE proxy_state = 'pending' AND +kind IN ('video', 'audio') AND trashed_at IS NULL)",
     )?;
     let count: i64 = stmt.query_row([], |r| r.get(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
@@ -311,7 +311,7 @@ pub fn sync_support(tx: &Connection, fingerprint: &str) -> Result<bool> {
     if stored.as_deref() != Some(current.as_str()) {
         let reset = tx.execute(
             "UPDATE items SET proxy_state = 'unknown'
-             WHERE kind != 'image' AND proxy_state IN ('not_needed', 'pending', 'failed')",
+             WHERE +kind IN ('video', 'audio') AND proxy_state IN ('not_needed', 'pending', 'failed')",
             [],
         )?;
         tx.execute(
@@ -332,7 +332,7 @@ pub fn sync_support(tx: &Connection, fingerprint: &str) -> Result<bool> {
 pub fn force_pending(tx: &Connection, ids: &[i64]) -> Result<bool> {
     let mut update = tx.prepare_cached(
         "UPDATE items SET proxy_state = 'pending'
-         WHERE id = ?1 AND kind != 'image' AND proxy_state IN ('not_needed', 'unknown', 'failed')",
+         WHERE id = ?1 AND +kind IN ('video', 'audio') AND proxy_state IN ('not_needed', 'unknown', 'failed')",
     )?;
     for &id in ids {
         update.execute([id])?;
@@ -343,7 +343,7 @@ pub fn force_pending(tx: &Connection, ids: &[i64]) -> Result<bool> {
 /// `ids` に判定・作成を待っているものがあるか。
 pub fn any_todo(conn: &Connection, ids: &[i64]) -> Result<bool> {
     let mut stmt = conn.prepare_cached(
-        "SELECT EXISTS (SELECT 1 FROM items WHERE id = ?1 AND kind != 'image'
+        "SELECT EXISTS (SELECT 1 FROM items WHERE id = ?1 AND +kind IN ('video', 'audio')
                         AND proxy_state IN ('unknown', 'pending') AND trashed_at IS NULL)",
     )?;
     for &id in ids {
