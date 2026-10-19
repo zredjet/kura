@@ -52,6 +52,8 @@ impl From<CoreError> for AppError {
             CoreError::Db(_) | CoreError::Json(_) | CoreError::DbClosed => AppErrorCode::Db,
             CoreError::ToolMissing(_) => AppErrorCode::ToolMissing,
             CoreError::Tool(_) => AppErrorCode::ToolFailed,
+            // ライブラリを新しい版にできなかった（文言は CoreError が持つ。docs/data-model.md §5）
+            CoreError::Upgrade(_) => AppErrorCode::Db,
         };
         Self::new(code, err.to_string())
     }

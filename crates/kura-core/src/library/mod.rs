@@ -15,13 +15,30 @@ pub use session::{EventSink, LibraryInfo, LibrarySession};
 
 use std::path::Path;
 
-use crate::db::Db;
+use crate::db::{Db, MigrationReport};
 use crate::{CoreError, Result};
+
+/// `path` のライブラリを開くとマイグレーションを当てるか（開く前に「ライブラリを更新しています」を出すのに使う）。
+/// DB がなければ false。読み取り専用で版（user_version）だけを読む。
+pub fn needs_upgrade(path: &Path) -> Result<bool> {
+    let db = path.join(DB_FILE);
+    if !db.is_file() {
+        return Ok(false);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let version = crate::db::applied(&conn)?;
+    Ok(version > 0 && version < crate::db::MIGRATIONS.len())
+}
 
 /// 開いているライブラリ。フォルダ構成と DB を持つ。
 pub struct Library {
     layout: Layout,
     db: Db,
+    /// 開いたときに当てたマイグレーション。
+    migration: MigrationReport,
 }
 
 impl Library {
@@ -63,8 +80,20 @@ impl Library {
         for dir in SUBDIRS {
             std::fs::create_dir_all(layout.root().join(dir))?;
         }
-        let db = Db::open(&layout.db_path())?;
-        Ok(Self { layout, db })
+        // 未適用のマイグレーションがある既存の DB は、当てる前にバックアップを取る（失敗したら当てずに開くのを失敗にする）
+        let (db, migration) = Db::open_with(&layout.db_path(), |conn, _from| {
+            backup::before_migration(&layout, conn, crate::time::now_ms()).map(|_| ())
+        })?;
+        Ok(Self {
+            layout,
+            db,
+            migration,
+        })
+    }
+
+    /// 開いたときに当てたマイグレーション（当てていなければ `applied` が空）。
+    pub fn migration(&self) -> &MigrationReport {
+        &self.migration
     }
 
     /// フォルダ構成。
