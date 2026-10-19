@@ -499,8 +499,8 @@ pub trait Encoder: Send + Sync {
 | AAC-LC（m4a・ADTS） | audio | symphonia（`m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`。超越関数を libm に差し替えた写しで再現できる。priming は自作で切る。§9.8）。symphonia の AAC は 1・2 チャンネルだけ。3 チャンネル以上（形の段階で断る）と HE-AAC は AudioToolbox・ffmpeg へ（Platform・External なのでアンカー） | AudioToolbox（`aac-audiotoolbox-enc/1`。Platform。m4a だけ（ADTS は書かない）。LC・1〜6 チャンネル・既定 256 kbps。§9.8） |
 | Ogg Vorbis | audio | symphonia（`ogg-vorbis-symphonia-dec/3`。3 チャンネル以上の residue 0/1 を直し、超越関数を libm に差し替えた写しで再現できる。§9.7・§9.8） | 自作（`ogg-vorbis-kura-enc/1`。aoTuV b6.03 の移植と Ogg の多重化。1〜8 チャンネル・8〜192 kHz。§9.7。ADR-149） |
 | HE-AAC・Opus | audio | AudioToolbox（`audiotoolbox-dec/1`。Platform。アンカー。メモリから ExtAudioFile で読む。§9.8）。AudioToolbox が断るもの（多チャンネルの Opus など）と Ogg の FLAC・Speex、圧縮の WAV・AIFF、MP3 の layer 1・2 は ffmpeg（`opus-ffmpeg-dec/1` など。External。アンカー） | — |
-| ttf・otf・woff・woff2 | font | —（解析だけ。M11） | — |
-| glb ほか 1 ファイルの 3D | model | —（解析だけ。M11） | — |
+| ttf・otf・woff・woff2 | font | —（値にしない。情報とサムネイルは kura-mac の CoreText。M11） | — |
+| glb | model | —（値にしない。情報と描画は自前の `model`：JSON の塊だけから数える `read_info`（`glb-kura-read/1`）と、焼き込み・ソフトウェアの描画で Rgba8 の画像にする `load_scene`・`render`（`model-kura-render/1`）。M11 の決定 9。§9.10） | — |
 | 動画 | video | —（編集しない） | — |
 
 - C のライブラリは同梱しない。C か ffmpeg がないと書けない形式は、エンコーダを Rust で自作する（Ogg Vorbis を最優先。MP3・不可逆 WebP・Opus は必要になった段で。ADR-137）。
@@ -605,6 +605,20 @@ pub trait Encoder: Send + Sync {
 - 残したこと：JPEG のプログレッシブの読みの上限の照らし（§9.5：値の 3 倍で断る）は、実測のピークが値を含めて 4 倍だった。断る入力が変わるので段 10 では変えていない（版の扱いを含めて判断が要る）。
 - 残したこと（aseprite）：値より大きいタイルセットと持ちきれないリンクのセルは、使うたびに展開し直すので時間がかかりうる（値は同じ。段 10 の確認で、値の 17 倍の 4 MiB のタイルセットを 3 層・60 フレームで使う作った形が 1 回 11 ms → 1.7 s。展開し直す分も 1 フレームの展開の上限 `max_value_bytes` に数える）。描く層を毎フレームたどる手間（層 × フレームの数）も残る（中止は効く）。長さを渡さないと、ファイルは値の大きさとみなす（縮まない画素の層が多いファイルでは足りない）。キャンバスより大きいセル・タイルセット、3 段より深い別に合成するグループの入れ子、ファイルの構造（セルの数に比例する）は見積もりの外。形を読む `shape()` もファイル全体を読むが、予算の確保の前なので予算の外。ファイル全体を読むほかのデコーダ（FLAC・MP3・AAC・ImageIO）は、まだ長さを使っていない（値からの倍率だけ）。
 
+### 9.10 M11 の 3D モデル（glb）
+
+3D の素材は値にしない（形式の表で `decodes_to` は空）。情報とサムネイルのために、自前の読み手と描画を `kura_engine::model` に置く（M11 の決定 9：SceneKit などの OS の描画に頼らない。OS 非依存・決定性の規則・ファズの仕組みに載せる）。
+
+- **読み手**（`glb-kura-read/1`）：glb（glTF 2.0 のバイナリ）だけ。JSON の塊と、最初の BIN の塊。外部のファイル・data: の URI の buffer と画像・疎な accessor・点と線のプリミティブは読まずに飛ばす（`Scene::warnings`）。JSON は serde_json に渡す前に、生のバイト列で入れ子の深さ（64 段）とオブジェクトの数（`max_json_objects`。serde で作る構造体の数を抑える）を数えて断る。ノードの木は再帰せずにたどり、積むときに印を付けて同じノードを 2 度積まない（輪・共有の子・範囲の外の番号を断つ）。accessor は成分の型・正規化（KHR_mesh_quantization）・間隔・範囲を確かめてから、`try_reserve_exact` で確保して読む。
+- **情報**（`read_info`。インスペクタの素材の欄）：JSON の塊だけから数える。頂点・三角形（既定のシーンのノードの実体ごと）・範囲（POSITION の min・max の 8 つの角をノードの変換で写した和）・メッシュ・材質・テクスチャ・画像・アニメ・スキン・ノードの数・作った道具・使う／必須の拡張・描けない理由（`unsupported`：必須の Draco・meshopt・basisu など知らない拡張の名前と `skin`）。描くのに支障のない必須の拡張は KHR_mesh_quantization・KHR_texture_transform・KHR_materials_unlit・EXT_texture_webp・KHR_lights_punctual・KHR_materials_variants と `KHR_materials_` で始まる見た目の拡張（基本色で描く）。
+- **焼き込み**（`load_scene`）：ノードの変換（matrix か T·R·S。四元数は正規化）を頂点に掛け、法線は余因子の行列で写す（裏返す変換は行列式で向きを戻す）。三角形・帯（奇数番めの向きを戻す）・扇。範囲の外の索引を含む三角形は捨てる。材質は基本色（線形）・基本色のテクスチャ（埋め込みの PNG・JPEG・WebP を固定の段のデコーダで読み、16 ビットは丸めて 8 ビットに。長辺が `max_texture_dim` を超えるあいだ、アルファで重みを付けた 2×2 の平均で縮める）・サンプラー（最近傍・繰り返し・端で止める・鏡）・KHR_texture_transform・頂点の色・alphaMode（OPAQUE・MASK・BLEND）・両面・unlit・放射。
+- **描画**（`render`、`model-kura-render/1`）：正射影のカメラ（3/4 の眺め：右へ 30 度・上へ 20 度。正面の眺めもある）で、描く三角形の範囲を長辺 `size`（余白は長辺の 1/32）に収める（もう一辺は縦横の比）。走査は左上の規則、深さは手前（大きい値）を残す z バッファ。陰影は Lambert（環境 0.35 ＋ 向きのある光 0.65。光は左上の手前から）で、裏から見える面は見る側へ向ける。片面の材質の裏の面は描かない。BLEND は不透明と MASK のあとに、奥から手前へ（重心の深さ、同じなら番号の順）重ね、深さは書かない。超標本化（1 辺 1〜4）の標本を乗算済みで平均し、ストレートに戻して sRGB の 8 ビットにする（sRGB と線形の表は `math::pow` で作る）。背景は透明。値は Rgba8 の画像。出力の 16 行の帯ごとに `par_blocks` で並べ、帯の中は三角形の番号の順に描くので、どの標本も帯の分け方・スレッドの数によらない。描く手間（三角形の囲む矩形の標本の数の和）は、描く前に標本の数の `max_overdraw`（64）倍で断る。
+- **サムネイル**（`thumbnail`）：情報で描けるかを確かめ、焼き込み、3/4 の眺めで描く（長辺 512 以下は 3×3、それより大きければ 2×2 の超標本化）。描けないものは `Unsupported`（表示の側は種類のアイコン）。
+- **上限**（`ModelLimits`、既定）：ファイル 512 MiB・JSON 32 MiB・JSON のオブジェクト 2¹⁷・ノード 2¹⁶・プリミティブの実体 2¹⁶・頂点と三角形 2²²（実体ごとに数える）・テクスチャ 32 枚・テクスチャ 1 枚の画素 2²⁴・持つテクスチャの長辺 1,024・出力の長辺 4,096・手間 64 倍。見積もりは `ModelInfo::estimate_load_bytes`（焼き込み。glb のバイト列は含めない）と `Scene::estimate_render`（`shared` と帯ごとの `per_task`）。
+- **決定性**：超越関数は `crate::math`（3/4 の眺めの向き・テクスチャの回転・sRGB の表）、浮動小数の min・max は `math`、並列は `par_blocks` だけ。aarch64 と x86_64（Rosetta）で同じダイジェストになることを確かめた。
+- **テスト**：`tests/model.rs`（最小の glb の情報と三角形の画素・ノードの変換・輪と範囲の外の番号・テクスチャの最近傍・MASK と BLEND・片面の裏・見本の決定性・描けない印・上限・中止・見積もり、ChaCha8 の 1 万件の壊れた入力：でたらめ・バイトの変異・JSON の数の変異）、ゴールデン `goldens-model/model-kura-render@1.jsonl`（見本 `model::sample_glbs` × 2 つの眺めの、描いた値のダイジェストと情報。追記だけ）、ファズの対象 `model_glb`（`testing::fuzz_model`。情報と焼き込みの食い違い、描いた画像の形も見る）。
+- **実測**（M4 Max・release）：Khronos の Duck（2,399 頂点・4,212 三角形・テクスチャ 1 枚）は焼き込み 1.7 ms・512×3 の描画 8 ms・1600×2 の描画 25 ms。合成の格子（100 万頂点・200 万三角形・法線つき）は焼き込み 25 ms・描画 50 ms（512×3）／53 ms（1600×2）、焼き込みと 1600×2 の描画のピークは 223 MiB（glb の 46 MiB を含む。場面は 54 MiB）。
+
 ## 10. 描画の道具
 
 ```rust
@@ -698,7 +712,7 @@ impl Engine {
 - **pixel_scale**（ユーザーの決定）：全行・全列の色の変わり目の位置（合併）の差の最大公約数を倍率 `k`、変わり目の位置の余りを位相 `phase` とする（端の欠けたブロックは数えない）。位相をずらして切り抜いた絵でも倍率が出る。同じ色の連続の長さの最大公約数（以前の定義）は、切り抜きで 1 に落ち、レンガ積みの模様を倍率と取り違える。厳密な定義だけで、JPEG・平滑な拡大・あとから書き足した 1 点では 1 に落ちる（許容差つきの推定は、それを使う機能を作る段で別の解析にする）。最近傍で k 倍すると `k`・`phase` がちょうど k 倍になり、`lines`・`lossless` は変わらない。変わり目が 1 本以下の軸は null。フレームの列は各フレームの中だけで比べ、キャンバスの座標で合併する（フレームの縁と覆われない部分の境は変わり目に数えないので、同じ見え方の 1 枚の画像と結果が違いうる。例：キャンバスの (1, 1) に置いた 4×4 の赤のフレームは null、同じ見え方の画像は k 4・位相 1）。
 - **sprite_grid**：透明（なければ四隅と同じ背景色）を空とし、軸ごとに周期で畳んで「詰めた格子・周期の格子」を作り、整数の順位（中身のあるセルの多さ、セルの数、余白の整い方、空の割合、当てはまり方、位置、幅、周期）で 1 つ選ぶ。中身のあるセルが 2 つ以上の格子だけ。周期の上限 4,096・候補 3 つは版に凍結する定数。推定（合成のシートで確かめた。ラベル入り・はみ出しなどの実物では外れうる。中身がセルの縁に届かないシートでは、セルの大きさが画素から決まらない）。背景色のシートでは `split_grid` の `skipEmpty`（透明しか見ない）が背景だけのセルを残す。フレームの列は受けない（1 枚の画像だけ）。
 - **ドット絵かどうか**の判定は解析に入れない（倍率・色数・アルファの事実から M11 が決める）。
-- フォント・3D の情報（書体名・字数、頂点数・大きさ）は kura-engine の解析（値を受ける）ではなく、M11 で kura-core・kura-mac か軽いパーサーで読む（§9.2 の「解析だけ」）。
+- フォント・3D の情報（書体名・字数、頂点数・大きさ）は kura-engine の解析（値を受ける）ではない。フォントは kura-mac の CoreText（`kura_probe` の種類 3）、3D は kura-engine の `model::read_info`（glb の JSON の塊だけ。§9.10）で読む。
 - 速さ（16384²、release・16 コア、負荷のある中の目安）：alpha 15〜41 ms、opaque_bounds 約 33 ms、colors 5〜82 ms（最悪は画素ごとに色が違う形）、pixel_scale 53〜168 ms、sprite_grid 139〜218 ms。値の大きさに比例する確保はしない。
 
 ### 11.4 音声の解析
@@ -1019,7 +1033,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   - 段 6 の音声のデコーダの上限：symphonia・nanomp3 に渡すファイルは `max_value_bytes` まで読み込む。長さはデコードせずに数え（パケットの長さの和・MP3 のフレームの走査）、形を上限（`max_audio_frames`・`max_value_bytes`・`max_channels`・`max_sample_rate`）で確かめてから確保する。デコードの途中でも形の上限を超えたら止める。Vorbis は codebook の表の大きさを渡す前に見積もって断る。AIFF の COMM は 279 バイトまで、MARK・INST・テキストは WAV と同じ予算（マーカーの上限・`max_meta_bytes`）。symphonia の panic は `codec::contain` が受け止める。
   - 段 9 の外部のツールと OS の機能（詳しくは §9.8）：ffmpeg は入力をファイルのパスで渡し、分離器・デコーダ・プロトコルをホワイトリストで固定し、環境変数を消して新しいプロセスグループで動かし、見張りが中止・無出力・時間切れ・出力の上限でグループごと止める。出力（WAV）は上限で確かめてから確保する。ImageIO の展開は専用のスレッドで行い、時間切れで見捨てる（壊れた HEIC で戻らないことがある）。Swift の側は大きさをすべて確かめ、Rust が確保した領域にだけ書く。
   - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・AIFF・FLAC・MP3・Ogg・m4a・AAC・アンカー・文書の読み込み）はファズにかける。
-    - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_peaks`・`fuzz_document` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
+    - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_peaks`・`fuzz_document`・`fuzz_model` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
     - `tests/fuzz_smoke.rs` は同じ口を stable で回す変異のファズ。種（各形式の小さなファイル・フィクスチャ・文書）をバイトの書き換え・挿入・削除・つなぎ合わせで崩す。ふだんの `cargo test` で対象ごとに 150 回（`quick`）、`KURA_FUZZ_SECS=<秒> cargo test --release -p kura-engine --test fuzz_smoke long -- --ignored` で長く回す（`KURA_FUZZ_ONLY=svg,wav` で対象を選べる）。見つけた入力は `target/fuzz-smoke/` に残し、`replay` で流し直す。
     - 文書のファズは、上限を絞ったエンジンで読み込み、小さな入力（画像・パレットの画像・フレームの列・音声、格子・ピボット・スライス付きのシート、ループ点・マーカー付きの音声）で計画を作って描くところまで流す（段 5 から。新しい操作の実行の経路とメタデータの写し方にも届く）。追記だけの引数（`actions` の列）を持つノードは、途中で切って差分の適用（`Op::apply_appended`）が全体を当て直したものと同じかも照らす（E21）。段 10 から実行器も差分を使うので、実行器の経路（セッションで追記して `compile_snapshot` と `render_cached` の差分の適用で描く）も、文書のファズのセッションの道の照合（`testing::snapshot`）と `tests/e4.rs` の `appended_in_executor_equals_full` で照らす。
     - デコーダのファズは、上限を絞って（`testing::fuzz_limits`）その形式のすべてのデコーダ（旧版を含む）で形と中身を読み、自分のコードの panic（panic の場所が `crates/kura-engine/src/` のもの。`testing::catch_own_panic` が panic のフックで見分ける）・形と中身の食い違い・`Internal` を見つけたものとして扱う。壊れたファイルとしてのエラーと第三者のクレートの panic（`codec::contain` がエラーに変える）は正しい振る舞い。

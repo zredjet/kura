@@ -19,6 +19,7 @@ pub mod imaging;
 pub mod limits;
 pub mod mapping;
 pub mod math;
+pub mod model;
 pub mod monitor;
 pub mod op;
 pub mod ops;

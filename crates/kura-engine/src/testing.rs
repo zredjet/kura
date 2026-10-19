@@ -263,6 +263,66 @@ pub fn fuzz_peaks(data: &[u8]) -> Result<(), String> {
     }
 }
 
+/// ファズの対象（`fuzz/` の `model_glb` と `tests/fuzz_smoke.rs` の `model_glb`）：glb の情報を読み、焼き込み、2 つの向きで
+/// 小さく描く（上限は `ModelLimits::fuzz`）。見つけたい不具合（自前のコードの panic・`Internal`・情報と焼き込みの食い違い・
+/// 大きさの食い違い）は `Err`、壊れた glb としてのエラー・上限は `Ok`。
+pub fn fuzz_model(data: &[u8]) -> Result<(), String> {
+    use crate::model::{RenderOptions, ViewDir};
+    let limits = crate::model::ModelLimits::fuzz();
+    let r = catch_own_panic(|| {
+        let info = crate::model::read_info(data, &limits);
+        let scene = crate::model::load_scene(data, &limits, &NoMonitor);
+        match (&info, &scene) {
+            (Err(EngineError::Internal(m)), _) | (_, Err(EngineError::Internal(m))) => {
+                return Err(EngineError::Internal(m.clone()));
+            }
+            (Err(_), Ok(_)) => {
+                return Err(EngineError::Internal(
+                    "glb: 情報が読めないのに焼き込めた".into(),
+                ));
+            }
+            (Ok(i), Ok(_)) if !i.unsupported.is_empty() => {
+                return Err(EngineError::Internal(
+                    "glb: 描けない印があるのに焼き込めた".into(),
+                ));
+            }
+            _ => {}
+        }
+        let Ok(scene) = scene else {
+            return Ok(());
+        };
+        for view in [ViewDir::ThreeQuarter, ViewDir::Front] {
+            let opts = RenderOptions {
+                size: 24,
+                samples: 2,
+                view,
+            };
+            match crate::model::render(&scene, &opts, &limits, &NoMonitor) {
+                Ok(Value::Image(img)) => {
+                    let (w, h) = (img.px.width(), img.px.height());
+                    if w.max(h) > opts.size || img.px.format() != crate::value::PixelFormat::Rgba8 {
+                        return Err(EngineError::Internal(format!(
+                            "glb: 描いた画像の形が違う（{w}×{h}・{:?}）",
+                            img.px.format()
+                        )));
+                    }
+                }
+                Ok(_) => {
+                    return Err(EngineError::Internal("glb: 描いた値が画像でない".into()));
+                }
+                Err(e @ EngineError::Internal(_)) => return Err(e),
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    });
+    match r {
+        Err(at) => Err(format!("glb: 自前のコードの panic（{at}）")),
+        Ok(Err(EngineError::Internal(m))) => Err(m),
+        Ok(_) => Ok(()),
+    }
+}
+
 /// ファズで、読めた値に解析を当てる手間の上限（`Estimate::cost`。1 回を速くする）。
 const FUZZ_ANALYSIS_COST: u64 = 1 << 24;
 

@@ -1,6 +1,6 @@
 #!/bin/sh
 # 編集のゴールデンは追記だけ（docs/editing.md §8.5、ADR-136）。
-# 基準のコミットからの差分で、crates/kura-engine/goldens/・goldens-codecs/・goldens-replay/・goldens-analysis/ と
+# 基準のコミットからの差分で、crates/kura-engine/goldens/・goldens-codecs/・goldens-replay/・goldens-analysis/・goldens-model/ と
 # crates/kura-core/goldens-ffmpeg-args/ の既存の行が
 # 消えた・変わったもの、
 # crates/kura-engine/fixtures/・crates/kura-mac/fixtures/（README.md と作る道具の tools/ は除く）・tests/vectors/ の
@@ -19,7 +19,7 @@ if [ -z "$base" ] || [ "$base" = "$zero" ] || ! git cat-file -e "$base^{commit}"
 fi
 
 merge_base=$(git merge-base "$base" HEAD 2>/dev/null || echo "$base")
-dirs="crates/kura-engine/goldens crates/kura-engine/goldens-codecs crates/kura-engine/goldens-replay crates/kura-engine/goldens-analysis crates/kura-core/goldens-ffmpeg-args"
+dirs="crates/kura-engine/goldens crates/kura-engine/goldens-codecs crates/kura-engine/goldens-replay crates/kura-engine/goldens-analysis crates/kura-engine/goldens-model crates/kura-core/goldens-ffmpeg-args"
 # 改名（git mv）も、旧いパスの削除として見る（--no-renames）。ファイルごと消したものは名前で知らせる
 # shellcheck disable=SC2086
 deleted=$(git diff --no-renames --name-only --diff-filter=D "$merge_base" HEAD -- $dirs)
