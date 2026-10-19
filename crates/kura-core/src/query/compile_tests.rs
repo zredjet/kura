@@ -764,6 +764,48 @@ fn fact_conditions_are_list_subqueries_not_correlated() {
 }
 
 #[test]
+fn facts_in_one_and_share_one_subquery() {
+    let conn = asset_library();
+    let sql = |query: &str| {
+        let parsed = parse(query).unwrap();
+        compile(&parsed.expr, &DbResolver { conn: &conn }, &ctx())
+            .unwrap()
+            .sql
+    };
+    // 同じ AND の事実は 1 つの部分問い合わせにまとめ、種類の索引に引っ張られないよう `+i.kind` にする
+    let merged = sql("種類:画像 透過:あり 色数<=16");
+    assert_eq!(merged.matches("media_facts").count(), 1, "{merged}");
+    assert!(merged.contains("+i.kind"), "{merged}");
+    // 除外の中の事実は集合で引けないので、種類の索引を使ってよい
+    let excluded = sql("種類:音楽 -ループ:あり");
+    assert!(!excluded.contains("+i.kind"), "{excluded}");
+    // ドット絵（設定が勝つ）と OR の中はまとめない
+    assert_eq!(
+        sql("ドット絵:あり 透過:あり")
+            .matches("media_facts")
+            .count(),
+        2
+    );
+    assert_eq!(
+        sql("(透過:あり | ループ:あり) 色数<=16")
+            .matches("media_facts")
+            .count(),
+        3
+    );
+    // まとめても結果は同じ
+    assert_eq!(ids(&conn, "透過:あり 色数<=16 アニメ:なし"), vec![11, 14]);
+    assert_eq!(ids(&conn, "-(透過:あり 色数<=8)"), {
+        let mut all = vec![11, 12, 13, 15, 16, 17, 21, 22, 23, 24, 31, 41];
+        all.sort_unstable();
+        all
+    });
+    assert_eq!(
+        ids(&conn, "種類:画像 透過:あり 2のべき乗:あり"),
+        vec![11, 13, 14]
+    );
+}
+
+#[test]
 fn unanalyzed_count_reads_only_pending_items() {
     let conn = asset_library();
     let parsed = parse("透過:あり ラウドネス>-14 ドット絵:あり").unwrap();
