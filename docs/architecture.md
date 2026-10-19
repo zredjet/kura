@@ -403,6 +403,8 @@ import_start:    ジョブとして実行
 | `kura-devtools bench thumbs --src <dir> [--threads N]` | 画像サムネイルの生成速度（枚/秒） |
 | `kura-devtools bench import --src <dir> [--threads N] [--out <dir>]` | 取り込みの速さ（MB/秒・件/秒）と、同じファイルをハッシュだけした速さ。新しいライブラリを `--out`（既定は `--src` と同じ場所）に作って入れ、測り終えたら消す（M9） |
 | `kura-devtools bench backup --library <path>` | DB のバックアップを 1 つ作る速さ（10 万件・58MB で 0.25 秒。M9） |
+| `kura-devtools bench analyze --kind image\|audio [--limit N] [--src <dir>] [--work <dir>] [--json <file>]` | 解析のジョブの速さとメモリ（M11）：作業フォルダに見本のライブラリを作り（`--src` のファイルか、中身の違う合成の見本）、自分を子プロセスとして `/usr/bin/time -l` で起こして、アプリと同じエンジンの部品（物理メモリからの予算・`full_codec_set`）で解析のジョブを 1 本動かす。通しの件数/秒、読んで解いた 1 件の p50・p95・最大（ジョブの結果の `readMs`）、peak memory footprint を 1 行の JSON で出す |
+| `kura-devtools seed … --analysis ready` | 画像・音声に偽の事実（透過・色数・ドット絵・アニメ・ラウドネス・ループ）を解析のジョブと同じ書き込みで入れて解析済みにする（M11 の NFR-02・03・07 の計測用。既定の `pending` は解析待ちのまま） |
 | `kura-devtools import` / `check` | コマンドラインからの取り込みと整合性の確認（§6） |
 | `kura-devtools download --library <path> <url>...` | アプリと同じダウンロードのジョブで取得して入れる（§9。既定の選択・Cookie なし） |
 | `kura-devtools edit shape --in <file>` / `edit caps` / `edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]` | 編集のエンジンを手で確かめる（形式と形の表示、今の環境の能力の表、文書を当てて書き出し、ダイジェスト・記録・警告を表示。コーデックはアプリと同じ `full_codec_set`（固定の段 → macOS → ffmpeg）。docs/editing.md） |

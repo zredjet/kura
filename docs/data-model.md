@@ -13,7 +13,7 @@ Kura Library.kuralib/
   thumbs/ab/<blake3>_l.{jpg,png}  # サムネイル 長辺 1600px（インスペクタ・プレビュー用）
   art/ab/<blake3>.jpg           # 音楽のジャケット画像
   proxies/ab/<blake3>.mp4       # 再生用プロキシ（WKWebView で再生できない形式だけ）
-  peaks/ab/<blake3>.peaks       # 音声の波形の段（解析のジョブが書く。M11）
+  peaks/ab/<blake3>.peaks       # 音声の波形の段（解析のジョブが staging/peaks-<blake3>.part に書いてから改名する。M11）
   anim/ab/<blake3>-1.png        # アニメの帯（見たときにその場で作る。末尾は形式の版。M11）
   staging/                      # 取り込み・ダウンロード・キャプチャの一時置き場
   archives/                     # yt-dlp / gallery-dl の download-archive
@@ -364,14 +364,19 @@ CREATE TABLE settings (
 );
 -- キー：'playback.support' = プロキシの判定に使った再生可否の表の指紋（文字列。変われば判定をやり直す。M5）
 --       'download.defaults' = ダウンロードの前回の選択（画質・音声のみ・保存先・自動タグ・再生リストをユニットに。M7、ADR-98）
---       'analysis.plan'     = 解析の計画の指紋（版・解析 ID ごとの版と引数・形式ごとのデコーダ。変わった分だけ pending に戻す。M11）
+--       'analysis.plan'     = 解析の計画の指紋（計画・投影・ドット絵の規則・読み取りの記録の版と、種類ごとの解析 ID の版と既定の
+--                             引数の正規の形。起動のスレッドで比べ、解析の版・計画が変わった種類だけ pending に戻す。M11）
+--       'analysis.decoders' = 解析で読む形式ごとの、段の順のデコーダの識別子（解析のジョブがコーデックの組を作ったときに比べ、
+--                             今の組にないデコーダで読んだものと、並びが変わった形式で失敗していたものを pending に戻す。M11）
+--       'analysis.inflight' = 解析のジョブが OS のデコーダ（Platform の段）で読んでいるアイテム（{"id","hash"}。読む前に
+--                             コミットし、書いたら消す。次に動いたときに残っていれば、そのアイテムを failed（crashed）にする。M11）
 --       'thumbs.plan'       = サムネイルの道の指紋（形式ごとの作り方。変わった形式の ready を stale に、failed を pending に戻す。M11）
 
 -- ===== 中身ごとの事実（0009。検索と表示の列。台帳の 1 行に 1 行。解析の結果から純粋な関数で作る）=====
 CREATE TABLE media_facts (
   blob_id          INTEGER PRIMARY KEY REFERENCES blobs(id) ON DELETE CASCADE,
   state            TEXT    NOT NULL CONSTRAINT media_facts_state CHECK (state IN ('ok','failed')),
-  error_code       TEXT,                   -- failed：'unsupported'・'too_large'・'decode'
+  error_code       TEXT,                   -- failed：'unsupported'・'too_large'・'decode'・'crashed'（OS のデコーダで読んでいる途中で終わった）
   decoder          TEXT,                   -- 読んだデコーダの識別子。形式だけで決めたとき（JPEG・HEIC）は NULL
   reproducible     INTEGER,                -- 0/1
   value_digest     BLOB,                   -- 読んだ値のダイジェスト（32 バイト）
@@ -407,7 +412,7 @@ CREATE INDEX idx_media_facts_loop      ON media_facts(has_loop) WHERE has_loop =
 CREATE TABLE analysis_results (
   id          INTEGER PRIMARY KEY,
   blob_id     INTEGER NOT NULL REFERENCES blobs(id) ON DELETE CASCADE,
-  analysis    TEXT    NOT NULL,            -- 'image.alpha' など
+  analysis    TEXT    NOT NULL,            -- 'image.alpha' など。'kura.read' は kura-core の読み取りの記録（値の種類・大きさ・長さ）
   version     INTEGER NOT NULL,
   params      TEXT    NOT NULL,            -- 正規の引数（正規の JSON）
   encoding    TEXT    NOT NULL CONSTRAINT analysis_results_encoding CHECK (encoding IN ('json','binary')),
@@ -503,6 +508,33 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   テスト `release_sees_every_table_that_references_the_ledger` が落ちる。M12 の版・アンカーの行を消さないため）。
 - ダウンロード・キャプチャで、同じ中身を別の拡張子で取ったときに置いたコピーは、書き込みのトランザクションの中で台帳の拡張子と
   比べ、違う拡張子のファイルだけを消す。
+
+### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
+
+- **取り出し**：`SELECT id, hash, ext, kind FROM items WHERE analysis_state = 'pending' ORDER BY imported_at DESC, id DESC LIMIT 16`
+  （`idx_items_analysis_pending` だけを読む）。インスペクタで選んだもの（`request_analysis`）は ID で引いて先に解く。
+- **計画**：画像は透過・色数・倍率（段 1）と、1 枚の画像で透過があるか 256 色以下ならスプライトの格子の推定（段 2）。音声は
+  ラウドネス・ループ・無音・波形の段（最も細かい段はビンが 4,096 以下になる段、粗い方は 65,536 フレーム）。JPEG・HEIC・HEIF は
+  読まずに形式から事実を書く（透過なし・色数は計らない・ドット絵でない。`decoder` は NULL）。動画・フォント・3D は `not_needed`。
+- **結果の鍵**：台帳の行 × 解析 ID（`UNIQUE(blob_id, analysis)`）。版と正規の引数は列で、計画の要求と照らす。同じ中身の結果
+  （計画の要求の ID・版・正規の引数と、読み取りの記録 `kura.read`）がそろっていれば読まずに使う。再現を約束しないデコーダの
+  結果も「その環境で読んだ事実」として持ち、OS の更新では解き直さず、デコーダの識別子が変わったときだけ解き直す
+  （`analysis.decoders`）。
+- **書き込み**：16 件か 500 ms ごとに 1 つのトランザクションで、アイテムごとに
+  `UPDATE items SET analysis_state = ? WHERE id = ? AND hash = ? AND analysis_state = 'pending'` が 1 行変えたときだけ、
+  `blob_id` をそのトランザクションの中で `blobs.hash` から引いて、結果（`ON CONFLICT (blob_id, analysis) DO UPDATE`）と
+  事実（`ON CONFLICT (blob_id) DO UPDATE`）を書き、今の計画にない解析の行を消す。読まずに作ったときは、事実の読み取りの
+  記録の列（decoder・reproducible・value_digest・env）を変えない。
+- **波形の段**：結果の行は `output` が NULL（`output_len`・`digest` だけ）で、中身は `peaks/ab/<hash>.peaks`（kura-peaks 版 1。
+  `/peaks` でそのまま配る）。DB に書く前に置く（書き込みが失敗してもファイルが残るだけ。次に解くときに置き換える）。
+- **投影**：`facts_v`（投影の版）か `pixel_rule`（ドット絵の判定の版）が古い行は、読み直さずに結果の表から作り直す
+  （`media_facts` を `blob_id` の順に 500 件ずつ。`state = 'ok'` の行だけ）。
+- **失敗**：事実の行に `state = 'failed'` と `error_code` を書き、items は `failed`。計画・デコーダの指紋が変わるか、利用者が頼む
+  （`retry_analysis`：`failed` を `pending` に戻す）まで解き直さない。見積もり（値の 2 倍＋デコーダの作業領域）が
+  min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`。中止・一時停止・強制終了では、書くまでは `pending` のまま。
+- **一度きりの全件の走査**（例外）：計画の指紋が変わった種類を戻す `UPDATE items … WHERE kind = ? AND analysis_state IN ('ready','failed')`
+  と、デコーダの指紋で戻す `UPDATE … WHERE … hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …)` は全件を走査する
+  （指紋が変わったときだけ。テスト `sync_plan_reset_is_a_one_time_full_scan`）。
 
 ### 事実で引く（M11）
 
