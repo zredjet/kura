@@ -1,4 +1,4 @@
-//! Finder で見せる・ボリュームの容量（書き出し・バックアップ・サイドバーの容量）と、
+//! Finder で見せる・ボリュームの容量（書き出し・バックアップ・サイドバーの容量）・物理メモリ（編集のメモリの予算）と、
 //! フルスクリーンの出入りのあとの WebView のフォーカス。
 
 use std::path::Path;
@@ -76,9 +76,47 @@ pub fn volume_capacity(path: &Path) -> Option<VolumeCapacity> {
     }
 }
 
+/// 物理メモリのバイト数（`ProcessInfo.physicalMemory`）。編集のメモリの予算の既定（`kura_engine::budget::default_total`）に
+/// 渡す。読めなければ None（macOS 以外も None）。
+pub fn physical_memory() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn kura_physical_memory() -> u64;
+        }
+        // SAFETY: 引数のない C 関数。ProcessInfo の値を返すだけ
+        let bytes = unsafe { kura_physical_memory() };
+        (bytes > 0).then_some(bytes)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sysctl hw.memsize と同じ値（macOS）。
+    #[test]
+    fn physical_memory_matches_sysctl() {
+        if !cfg!(target_os = "macos") {
+            assert_eq!(physical_memory(), None);
+            return;
+        }
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .unwrap();
+        let want: u64 = String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(want > 0);
+        assert_eq!(physical_memory(), Some(want));
+    }
 
     #[test]
     fn reads_the_capacity_of_the_temp_volume() {

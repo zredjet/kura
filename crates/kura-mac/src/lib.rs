@@ -5,7 +5,7 @@
 //! - `media_backend`：macOS の実装で扱えない形式を ffmpeg に回す組み合わせ
 //! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
 //! - `find_chrome`・`snapshot_webview`：キャプチャ用の Google Chrome の場所と、WKWebView の表示範囲の撮影
-//! - `reveal_in_finder`・`volume_capacity`：Finder で見せる、ボリュームの容量
+//! - `reveal_in_finder`・`volume_capacity`・`physical_memory`：Finder で見せる、ボリュームの容量、物理メモリ（編集のメモリの予算）
 //! - `codec`：編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し）と
 //!   `codec_set`（固定の段に足した組）・`full_codec_set`（さらに ffmpeg の段を足したアプリの組）・`codec_caps`（能力と環境）
 //!
@@ -28,7 +28,8 @@ pub use codec::{
 };
 pub use external::{ExternalPlayer, open_in_player};
 pub use files::{
-    VolumeCapacity, keep_webview_focus_on_fullscreen, reveal_in_finder, volume_capacity,
+    VolumeCapacity, keep_webview_focus_on_fullscreen, physical_memory, reveal_in_finder,
+    volume_capacity,
 };
 
 use std::path::Path;

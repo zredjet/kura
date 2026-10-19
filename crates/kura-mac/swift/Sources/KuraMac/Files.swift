@@ -33,3 +33,9 @@ public func kuraVolumeCapacity(
     available.pointee = availableBytes
     return true
 }
+
+/// 物理メモリのバイト数（`ProcessInfo.physicalMemory`。編集のメモリの予算の既定に使う。docs/editing.md §12）。
+@_cdecl("kura_physical_memory")
+public func kuraPhysicalMemory() -> UInt64 {
+    return ProcessInfo.processInfo.physicalMemory
+}
