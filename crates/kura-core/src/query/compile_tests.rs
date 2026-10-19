@@ -405,3 +405,415 @@ fn quoted_words_resolve_tags_before_searching_the_text() {
     // AND の中でもタグとしてまとめて絞る
     assert_eq!(ids(&conn, "\"Re:ゼロ\" 海"), vec![3]);
 }
+
+// ---- 素材の事実のフィールド（M11。search-query.md §3・§4） ----
+
+/// 素材の 1 件：種類・幅・高さ・解析の進み・事実（`media_facts` の列と値。None なら事実の行なし）。
+struct Asset {
+    id: i64,
+    kind: &'static str,
+    size: (Option<i64>, Option<i64>),
+    analysis: &'static str,
+    facts: Option<&'static str>,
+}
+
+/// 事実の列（`facts` はこの順の値を書いた SQL の式の並び）。
+const FACT_COLUMNS: &str = "alpha, colors, pixel_art, frame_count, \
+     sample_rate, bits, channels, loudness, true_peak, has_loop";
+
+/// 画像・音声・動画・フォントを混ぜた小さなライブラリ。解析済み・未解析・失敗（計れない）・設定ありを含む。
+fn asset_library() -> Connection {
+    let conn = test_conn();
+    let n = now();
+    let assets = [
+        // 64×64 の二値の透過・16 色・自動でドット絵・1 コマ
+        Asset {
+            id: 11,
+            kind: "image",
+            size: (Some(64), Some(64)),
+            analysis: "ready",
+            facts: Some("1, 16, 1, 1, NULL, NULL, NULL, NULL, NULL, NULL"),
+        },
+        // 写真の JPEG：透過なし・色数は計らない・ドット絵でない（形式から）
+        Asset {
+            id: 12,
+            kind: "image",
+            size: (Some(4000), Some(3000)),
+            analysis: "ready",
+            facts: Some("0, NULL, 0, 1, NULL, NULL, NULL, NULL, NULL, NULL"),
+        },
+        // 半透明・200 色・8 コマのアニメ。自動ではドット絵でないが、設定で「はい」
+        Asset {
+            id: 13,
+            kind: "image",
+            size: (Some(128), Some(128)),
+            analysis: "ready",
+            facts: Some("2, 200, 0, 8, NULL, NULL, NULL, NULL, NULL, NULL"),
+        },
+        // 二値の透過・8 色。自動ではドット絵だが、設定で「いいえ」
+        Asset {
+            id: 14,
+            kind: "image",
+            size: (Some(32), Some(32)),
+            analysis: "ready",
+            facts: Some("1, 8, 1, 1, NULL, NULL, NULL, NULL, NULL, NULL"),
+        },
+        // まだ解析していない（幅・高さは 2 のべき乗）
+        Asset {
+            id: 15,
+            kind: "image",
+            size: (Some(256), Some(128)),
+            analysis: "pending",
+            facts: None,
+        },
+        // 解析に失敗（事実の行はあるが、値はすべて計れない）
+        Asset {
+            id: 16,
+            kind: "image",
+            size: (Some(100), Some(100)),
+            analysis: "failed",
+            facts: Some("NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL"),
+        },
+        // まだ解析していないが、設定で「ドット絵：はい」
+        Asset {
+            id: 17,
+            kind: "image",
+            size: (Some(512), Some(512)),
+            analysis: "pending",
+            facts: None,
+        },
+        // ゴミ箱の中（数えない）
+        Asset {
+            id: 18,
+            kind: "image",
+            size: (Some(16), Some(16)),
+            analysis: "ready",
+            facts: Some("1, 4, 1, 1, NULL, NULL, NULL, NULL, NULL, NULL"),
+        },
+        Asset {
+            id: 19,
+            kind: "image",
+            size: (Some(16), Some(16)),
+            analysis: "pending",
+            facts: None,
+        },
+        // 48kHz・24 ビット・ステレオ・−14.2 LUFS・−1.0 dBTP・ループあり
+        Asset {
+            id: 21,
+            kind: "audio",
+            size: (None, None),
+            analysis: "ready",
+            facts: Some("NULL, NULL, NULL, NULL, 48000, 24, 2, -14.2, -1.0, 1"),
+        },
+        // 44.1kHz・非可逆（ビットは計れない）・モノラル・−20 LUFS・−0.3 dBTP・ループなし
+        Asset {
+            id: 22,
+            kind: "audio",
+            size: (None, None),
+            analysis: "ready",
+            facts: Some("NULL, NULL, NULL, NULL, 44100, NULL, 1, -20.0, -0.3, 0"),
+        },
+        // まだ解析していない音声
+        Asset {
+            id: 23,
+            kind: "audio",
+            size: (None, None),
+            analysis: "pending",
+            facts: None,
+        },
+        // 短くてラウドネスを計れない（16 ビット・ステレオ・−6 dBTP・ループなし）
+        Asset {
+            id: 24,
+            kind: "audio",
+            size: (None, None),
+            analysis: "ready",
+            facts: Some("NULL, NULL, NULL, NULL, 44100, 16, 2, NULL, -6.0, 0"),
+        },
+        Asset {
+            id: 31,
+            kind: "video",
+            size: (Some(1024), Some(512)),
+            analysis: "not_needed",
+            facts: None,
+        },
+        Asset {
+            id: 41,
+            kind: "font",
+            size: (None, None),
+            analysis: "not_needed",
+            facts: None,
+        },
+    ];
+    for a in &assets {
+        conn.execute(
+            "INSERT INTO items (id, hash, ext, kind, size_bytes, width, height, title, original_name,
+                                imported_at, updated_at, analysis_state)
+             VALUES (?1, ?2, 'x', ?3, 1, ?4, ?5, ?6, ?6, ?7, ?7, ?8)",
+            params![
+                a.id,
+                vec![a.id as u8; 32],
+                a.kind,
+                a.size.0,
+                a.size.1,
+                format!("asset{}", a.id),
+                n - a.id * HOUR,
+                a.analysis
+            ],
+        )
+        .unwrap();
+        if let Some(values) = a.facts {
+            let state = if a.analysis == "failed" {
+                "failed"
+            } else {
+                "ok"
+            };
+            conn.execute(
+                &format!(
+                    "INSERT INTO media_facts (blob_id, state, facts_v, {FACT_COLUMNS}, analyzed_at)
+                     SELECT b.id, ?2, 1, {values}, 0 FROM blobs b WHERE b.hash = ?1"
+                ),
+                params![vec![a.id as u8; 32], state],
+            )
+            .unwrap();
+        }
+    }
+    conn.execute_batch(
+        "UPDATE items SET trashed_at = 1 WHERE id IN (18, 19);
+         INSERT INTO asset_settings (item_id, pixel_art, updated_at) VALUES (13, 1, 0), (14, 0, 0), (17, 1, 0);",
+    )
+    .unwrap();
+    conn
+}
+
+#[test]
+fn image_facts_match_only_known_values() {
+    let conn = asset_library();
+    let cases: &[(&str, &[i64])] = &[
+        ("透過:あり", &[11, 13, 14]),
+        ("透過:なし", &[12]),
+        ("透過:半透明", &[13]),
+        ("透過:二値", &[11, 14]),
+        // `!=` は「わかっていて違う」もの。未解析（15・17）・計れない（16）・音声などは入らない
+        ("透過!=あり", &[12]),
+        ("透過!=なし", &[11, 13, 14]),
+        // 除外だけが、未解析・計れないものを含む
+        ("-透過:あり", &[12, 15, 16, 17, 21, 22, 23, 24, 31, 41]),
+        // ドット絵は「設定 ?? 自動」。設定があれば未解析（17）でも決まる
+        ("ドット絵:あり", &[11, 13, 17]),
+        ("ドット絵:なし", &[12, 14]),
+        ("ドット絵!=あり", &[12, 14]),
+        ("-ドット絵:あり", &[12, 14, 15, 16, 21, 22, 23, 24, 31, 41]),
+        ("色数<=16", &[11, 14]),
+        ("色数>16", &[13]),
+        ("色数:8", &[14]),
+        // JPEG（12）の色数は計っていないので、`!=` にも入らない
+        ("色数!=16", &[13, 14]),
+        ("アニメ:あり", &[13]),
+        ("アニメ:なし", &[11, 12, 14]),
+        ("アニメ!=なし", &[13]),
+        // 2 のべき乗は幅・高さから（解析は要らない）。画像だけ
+        ("2のべき乗:あり", &[11, 13, 14, 15, 17]),
+        ("2のべき乗:なし", &[12, 16]),
+        ("2のべき乗!=あり", &[12, 16]),
+        ("種類:画像 透過:あり 色数<=16", &[11, 14]),
+    ];
+    for (query, expected) in cases {
+        assert_eq!(ids(&conn, query), *expected, "{query}");
+    }
+}
+
+#[test]
+fn audio_facts_match_only_known_values() {
+    let conn = asset_library();
+    let cases: &[(&str, &[i64])] = &[
+        ("レート:44.1k", &[22, 24]),
+        ("レート>=48kHz", &[21]),
+        ("レート!=44100", &[21]),
+        ("ビット:24", &[21]),
+        // 非可逆（22）はビットを計れないので `!=` にも入らない
+        ("ビット!=24", &[24]),
+        ("チャンネル:ステレオ", &[21, 24]),
+        ("チャンネル:モノラル", &[22]),
+        ("チャンネル>=1", &[21, 22, 24]),
+        ("ラウドネス>-16", &[21]),
+        ("ラウドネス<-14", &[21, 22]),
+        ("ラウドネス<=−14.2", &[21, 22]),
+        ("ラウドネス<-14.2", &[22]),
+        // 計れない（24）・未解析（23）はどの比較にも入らない
+        ("ラウドネス<0", &[21, 22]),
+        ("ピーク>-1", &[22]),
+        ("ピーク>=-1", &[21, 22]),
+        ("ピーク<-3", &[24]),
+        ("ループ:あり", &[21]),
+        ("ループ:なし", &[22, 24]),
+        ("ループ!=あり", &[22, 24]),
+        ("種類:音楽 -ループ:あり", &[22, 23, 24]),
+        ("ループ:あり | 透過:半透明", &[13, 21]),
+    ];
+    for (query, expected) in cases {
+        assert_eq!(ids(&conn, query), *expected, "{query}");
+    }
+}
+
+/// パレットの「未解析 N 件」：解析がまだで、解析が終わると一致が変わりうるもの。
+fn unanalyzed(conn: &Connection, query: &str) -> Option<u64> {
+    let check = super::check(conn, query, crate::items::ItemView::All, &ctx()).unwrap();
+    assert!(check.error.is_none(), "{query}: {:?}", check.error);
+    check.unanalyzed
+}
+
+#[test]
+fn unanalyzed_counts_items_whose_match_awaits_analysis() {
+    let conn = asset_library();
+    let cases: &[(&str, Option<u64>)] = &[
+        // 解析で決まるフィールドを使わなければ数えない
+        ("", None),
+        ("評価>=4", None),
+        ("2のべき乗:あり", None),
+        ("種類:画像", None),
+        // 未解析の画像は 15・17（ゴミ箱の 19 は数えない。失敗した 16 は計れないと決まっている）
+        ("透過:あり", Some(2)),
+        ("透過!=あり", Some(2)),
+        // 除外では、未解析の画像は今は含まれるが、解析が終わると外れうる
+        ("-透過:あり", Some(2)),
+        // 17 は設定で決まっている
+        ("ドット絵:あり", Some(1)),
+        ("-ドット絵:あり", Some(1)),
+        // 音声の事実は、未解析の音声（23）だけ
+        ("ラウドネス>-14", Some(1)),
+        ("-ループ:あり", Some(1)),
+        // ほかの条件で決まるものは数えない
+        ("種類:音楽 透過:あり", Some(0)),
+        ("透過:あり | 種類:音楽", Some(2)),
+        ("ループ:あり | 透過:あり", Some(3)),
+        ("名前:asset15 透過:あり", Some(1)),
+        ("-(透過:あり | 名前:asset15)", Some(1)),
+    ];
+    for (query, expected) in cases {
+        assert_eq!(unanalyzed(&conn, query), *expected, "{query}");
+    }
+    // 解析が終われば数えない
+    conn.execute_batch("UPDATE items SET analysis_state = 'ready' WHERE id IN (15, 17, 23)")
+        .unwrap();
+    assert_eq!(unanalyzed(&conn, "透過:あり"), Some(0));
+}
+
+#[test]
+fn unanalyzed_counts_follow_the_list() {
+    let conn = asset_library();
+    conn.execute_batch(
+        "INSERT INTO units (id, kind, name, order_mode, created_at, updated_at) VALUES (1, 'set', '素材', 'manual', 0, 0);
+         INSERT INTO unit_items (unit_id, item_id, pos) VALUES (1, 15, 1), (1, 11, 2);",
+    )
+    .unwrap();
+    let check = super::check(
+        &conn,
+        "透過:あり",
+        crate::items::ItemView::Unit { id: 1 },
+        &ctx(),
+    )
+    .unwrap();
+    assert_eq!(check.unanalyzed, Some(1));
+    let check = super::check(&conn, "透過:あり", crate::items::ItemView::Trash, &ctx()).unwrap();
+    assert_eq!(check.unanalyzed, Some(1));
+}
+
+/// EXPLAIN 用に、バインドする値を埋め込む（テストだけ）。
+fn explain(conn: &Connection, sql: &str, params: &[rusqlite::types::Value]) -> String {
+    use rusqlite::types::Value;
+    let mut sql = sql.to_string();
+    for p in params {
+        let literal = match p {
+            Value::Integer(v) => v.to_string(),
+            Value::Real(v) => format!("{v:?}"),
+            Value::Text(t) => format!("'{t}'"),
+            other => panic!("{other:?}"),
+        };
+        sql = sql.replacen('?', &literal, 1);
+    }
+    query_plan(conn, &sql)
+}
+
+#[test]
+fn fact_conditions_are_list_subqueries_not_correlated() {
+    let conn = asset_library();
+    for (query, index) in [
+        ("透過:あり", Some("idx_media_facts_alpha")),
+        ("透過!=あり", Some("idx_media_facts_alpha")),
+        ("色数<=16", Some("idx_media_facts_colors")),
+        ("ラウドネス>-14", Some("idx_media_facts_loudness")),
+        ("ループ:あり", Some("idx_media_facts_loop")),
+        ("ドット絵:あり", Some("idx_media_facts_pixel_art")),
+        ("レート:48k", None),
+        ("アニメ:あり", None),
+        ("-透過:あり ループ:あり", Some("idx_media_facts_loop")),
+    ] {
+        let parsed = parse(query).unwrap();
+        let cond = compile(&parsed.expr, &DbResolver { conn: &conn }, &ctx()).unwrap();
+        let sql = format!(
+            "SELECT i.id FROM items i WHERE i.trashed_at IS NULL AND ({}) ORDER BY i.imported_at DESC, i.id DESC",
+            cond.sql
+        );
+        let plan = explain(&conn, &sql, &cond.params);
+        assert!(plan.contains("LIST SUBQUERY"), "{query}\n{plan}");
+        assert!(!plan.contains("CORRELATED"), "{query}\n{plan}");
+        if let Some(index) = index {
+            assert!(plan.contains(index), "{query}\n{plan}");
+        }
+    }
+}
+
+#[test]
+fn unanalyzed_count_reads_only_pending_items() {
+    let conn = asset_library();
+    let parsed = parse("透過:あり ラウドネス>-14 ドット絵:あり").unwrap();
+    let cond = super::compile_unanalyzed(&parsed.expr, &DbResolver { conn: &conn }, &ctx())
+        .unwrap()
+        .unwrap();
+    // 事実の表は読まない（種類と素材の設定だけで決まる）
+    assert!(!cond.sql.contains("media_facts"), "{}", cond.sql);
+    let sql = format!(
+        "SELECT count(*) FROM items i WHERE i.trashed_at IS NULL AND ({})",
+        cond.sql
+    );
+    let plan = explain(&conn, &sql, &cond.params);
+    assert!(plan.contains("idx_items_analysis_pending"), "{plan}");
+    assert!(!plan.contains("CORRELATED"), "{plan}");
+}
+
+#[test]
+fn unit_smart_rules_judge_facts_by_any_member() {
+    use crate::playlist::UnitMatch;
+    use crate::playlist::generate::to_unit_cond;
+    use crate::playlist::smart::{UnitCond, UnitFacts, unit_matches};
+    let conn = asset_library();
+    let facts = |members: Vec<i64>| UnitFacts {
+        member_tags: vec![Default::default(); members.len()],
+        members,
+        ..UnitFacts::default()
+    };
+    for (query, members, expected) in [
+        ("透過:あり", vec![12, 13], true),
+        ("透過:あり", vec![12, 15], false),
+        ("ループ:あり", vec![21, 22], true),
+        ("ループ:あり", vec![22, 23], false),
+        ("-ループ:あり", vec![22, 23], true),
+        ("ラウドネス>-16", vec![21], true),
+        ("ドット絵:あり", vec![17], true),
+        ("2のべき乗:あり", vec![12, 15], true),
+    ] {
+        let expr = parse(query).unwrap().expr;
+        let cond = to_unit_cond(&conn, &expr, &ctx()).unwrap();
+        // 解析の事実はユニットの集計値ではないので、メンバーのどれかで判定する（playlists.md §4.2）
+        let leaf = match &cond {
+            UnitCond::Not(inner) => inner.as_ref(),
+            other => other,
+        };
+        assert!(matches!(leaf, UnitCond::AnyMember(_)), "{query}: {cond:?}");
+        assert_eq!(
+            unit_matches(&cond, &facts(members.clone()), UnitMatch::Any, &ctx()),
+            expected,
+            "{query} {members:?}"
+        );
+    }
+}
