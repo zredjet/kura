@@ -6,75 +6,17 @@
 //!   CSS の mask-image で付ける）。
 //! - `probe_font`：書体名・スタイル・字の数・形式（`kura_probe` の種類 3）。
 //!
-//! 書き先は拡張子のない stem（`ThumbStems`）で、Swift が書いた形式の拡張子を足す。macOS 以外はどれも `Unsupported`。
+//! 書き先は拡張子のない stem（kura-core の `ThumbTargets`）で、Swift が書いた形式（kura-core の `ThumbFormat`）の拡張子を足す。
+//! macOS 以外はどれも `Unsupported`。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use kura_core::media::MediaError;
+pub use kura_core::media::FontInfo;
+use kura_core::media::{MediaError, ThumbFormat, ThumbTargets};
 use serde::{Deserialize, Serialize};
-
-/// 拡張子のないサムネイルの書き先（長辺 1600 と 512）。書いた形式の拡張子（`.jpg`・`.png`）を足したファイルになる。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThumbStems {
-    pub large: PathBuf,
-    pub small: PathBuf,
-}
-
-impl ThumbStems {
-    /// `format` で書いたときのファイル（大・小）。
-    pub fn files(&self, format: ThumbFile) -> (PathBuf, PathBuf) {
-        (
-            with_ext(&self.large, format.ext()),
-            with_ext(&self.small, format.ext()),
-        )
-    }
-}
-
-/// stem に拡張子を足す（stem に `.` があっても置き換えない。Swift の `stemURL` と同じ）。
-fn with_ext(stem: &Path, ext: &str) -> PathBuf {
-    let mut s = stem.as_os_str().to_os_string();
-    s.push(".");
-    s.push(ext);
-    PathBuf::from(s)
-}
-
-/// 書いたサムネイルの形式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThumbFile {
-    Jpeg,
-    Png,
-}
-
-impl ThumbFile {
-    /// ファイルの拡張子。
-    pub fn ext(self) -> &'static str {
-        match self {
-            Self::Jpeg => "jpg",
-            Self::Png => "png",
-        }
-    }
-}
 
 /// フォントの見本の字の候補。先頭から、その書体がすべての字を持つものを使う（どれも持たなければ、字の番号 1 から順に描く）。
 pub const FONT_SAMPLES: [&str; 2] = ["永あAa", "Aa"];
-
-/// フォントの情報（`kura_probe` の種類 3 の `font`）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct FontInfo {
-    /// 書体名（ファミリー）。
-    pub family: Option<String>,
-    /// スタイル（Regular・Bold など）。
-    pub style: Option<String>,
-    pub full_name: Option<String>,
-    pub postscript_name: Option<String>,
-    /// 字（グリフ）の数。
-    pub glyphs: u32,
-    /// ファイルの中の書体の数（コレクションは 2 以上）。
-    pub faces: u32,
-    /// 可変フォント（変化の軸がある）か。
-    pub variable: bool,
-}
 
 /// フォントの probe の結果。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +28,10 @@ pub struct FontProbe {
 }
 
 /// 画像のサムネイル（ImageIO）。透明な画素があれば PNG、なければ JPEG を書き、書いた形式を返す。
-pub fn image_thumbnails_keep_alpha(path: &Path, out: &ThumbStems) -> Result<ThumbFile, MediaError> {
+pub fn image_thumbnails_keep_alpha(
+    path: &Path,
+    out: &ThumbTargets,
+) -> Result<ThumbFormat, MediaError> {
     #[cfg(target_os = "macos")]
     {
         mac::image_thumbnails(path, out, true)
@@ -98,8 +43,8 @@ pub fn image_thumbnails_keep_alpha(path: &Path, out: &ThumbStems) -> Result<Thum
     }
 }
 
-/// フォントのサムネイル（CoreText）。正方形の透明の地に、字の形だけのアルファで描いた PNG を書く。
-pub fn font_thumbnails(path: &Path, out: &ThumbStems) -> Result<(), MediaError> {
+/// フォントのサムネイル（CoreText）。正方形の透明の地に、字の形だけのアルファで描いた PNG を書く（いつも PNG）。
+pub fn font_thumbnails(path: &Path, out: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
     #[cfg(target_os = "macos")]
     {
         mac::font_thumbnails(path, out)
@@ -133,7 +78,7 @@ pub(crate) mod mac {
 
     use kura_core::media::MediaError;
 
-    use super::{FONT_SAMPLES, ThumbFile, ThumbStems};
+    use super::{FONT_SAMPLES, ThumbFormat, ThumbTargets};
     use crate::{LARGE_PX, SMALL_PX};
 
     /// Swift の戻り値（Common.swift）。
@@ -183,19 +128,19 @@ pub(crate) mod mac {
     }
 
     /// サムネイルの戻り値（0 = JPEG・4 = PNG・1・2）を、書いた形式にする。
-    fn written(code: i32) -> Result<ThumbFile, MediaError> {
+    fn written(code: i32) -> Result<ThumbFormat, MediaError> {
         match code {
-            PNG => Ok(ThumbFile::Png),
-            other => check(other).map(|()| ThumbFile::Jpeg),
+            PNG => Ok(ThumbFormat::Png),
+            other => check(other).map(|()| ThumbFormat::Jpeg),
         }
     }
 
     /// ImageIO のサムネイル。`keep_alpha` が偽なら、今までどおりいつも JPEG を書く。
     pub(crate) fn image_thumbnails(
         path: &Path,
-        out: &ThumbStems,
+        out: &ThumbTargets,
         keep_alpha: bool,
-    ) -> Result<ThumbFile, MediaError> {
+    ) -> Result<ThumbFormat, MediaError> {
         let (src, large, small) = (c_path(path)?, c_path(&out.large)?, c_path(&out.small)?);
         // SAFETY: すべて NUL 終端の文字列で、呼び出しのあいだ生きている。Swift 側は読むだけ。
         let code = unsafe {
@@ -212,7 +157,10 @@ pub(crate) mod mac {
     }
 
     /// CoreText のフォントのサムネイル（いつも PNG）。
-    pub(crate) fn font_thumbnails(path: &Path, out: &ThumbStems) -> Result<(), MediaError> {
+    pub(crate) fn font_thumbnails(
+        path: &Path,
+        out: &ThumbTargets,
+    ) -> Result<ThumbFormat, MediaError> {
         let (src, large, small) = (c_path(path)?, c_path(&out.large)?, c_path(&out.small)?);
         let samples = CString::new(FONT_SAMPLES.join("\n"))
             .map_err(|_| MediaError::Failed("見本の字に NUL 文字があります".into()))?;
@@ -228,8 +176,8 @@ pub(crate) mod mac {
             )
         };
         match written(code)? {
-            ThumbFile::Png => Ok(()),
-            ThumbFile::Jpeg => Err(MediaError::Failed(
+            ThumbFormat::Png => Ok(ThumbFormat::Png),
+            ThumbFormat::Jpeg => Err(MediaError::Failed(
                 "フォントのサムネイルが PNG で書かれていません".into(),
             )),
         }
@@ -255,22 +203,24 @@ pub(crate) mod mac {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
     fn stems_get_the_extension_of_the_written_format() {
-        let stems = ThumbStems {
+        let stems = ThumbTargets {
             large: PathBuf::from("/lib/thumbs/ab/abc.def_l"),
             small: PathBuf::from("/lib/thumbs/ab/abc.def_s"),
         };
         assert_eq!(
-            stems.files(ThumbFile::Png),
+            stems.files(ThumbFormat::Png),
             (
                 PathBuf::from("/lib/thumbs/ab/abc.def_l.png"),
                 PathBuf::from("/lib/thumbs/ab/abc.def_s.png")
             )
         );
-        assert_eq!(stems.files(ThumbFile::Jpeg).1.extension().unwrap(), "jpg");
+        assert_eq!(stems.files(ThumbFormat::Jpeg).1.extension().unwrap(), "jpg");
     }
 
     #[test]
@@ -316,8 +266,8 @@ mod mac_tests {
             .join(name)
     }
 
-    fn stems(dir: &Path) -> ThumbStems {
-        ThumbStems {
+    fn stems(dir: &Path) -> ThumbTargets {
+        ThumbTargets {
             large: dir.join("t/x_l"),
             small: dir.join("t/x_s"),
         }
@@ -349,9 +299,9 @@ mod mac_tests {
             let dir = tempfile::tempdir().unwrap();
             let out = stems(dir.path());
             let format = image_thumbnails_keep_alpha(&fixture(name), &out).unwrap();
-            assert_eq!(format, ThumbFile::Png, "{name}");
-            let (l, s) = out.files(ThumbFile::Png);
-            let (lj, sj) = out.files(ThumbFile::Jpeg);
+            assert_eq!(format, ThumbFormat::Png, "{name}");
+            let (l, s) = out.files(ThumbFormat::Png);
+            let (lj, sj) = out.files(ThumbFormat::Jpeg);
             assert!(!lj.exists() && !sj.exists(), "{name}: JPEG も書いた");
             for file in [&l, &s] {
                 let px = read_png(file);
@@ -403,13 +353,13 @@ mod mac_tests {
             );
             assert_eq!(
                 image_thumbnails_keep_alpha(src, &out).unwrap(),
-                ThumbFile::Jpeg,
+                ThumbFormat::Jpeg,
                 "{}",
                 src.display()
             );
-            let (l, s) = out.files(ThumbFile::Jpeg);
+            let (l, s) = out.files(ThumbFormat::Jpeg);
             assert!(l.is_file() && s.is_file());
-            assert!(!out.files(ThumbFile::Png).0.exists());
+            assert!(!out.files(ThumbFormat::Png).0.exists());
         }
     }
 
@@ -420,9 +370,9 @@ mod mac_tests {
         let dir = tempfile::tempdir().unwrap();
         let out = stems(dir.path());
         let format = mac::image_thumbnails(&fixture("heic-alpha-48x32.heic"), &out, false).unwrap();
-        assert_eq!(format, ThumbFile::Jpeg);
-        assert!(out.files(ThumbFile::Jpeg).0.is_file());
-        assert!(!out.files(ThumbFile::Png).0.exists());
+        assert_eq!(format, ThumbFormat::Jpeg);
+        assert!(out.files(ThumbFormat::Jpeg).0.is_file());
+        assert!(!out.files(ThumbFormat::Png).0.exists());
     }
 
     #[test]
@@ -526,7 +476,7 @@ mod mac_tests {
         {
             let out = stems(&dir.path().join(format!("out{k}")));
             font_thumbnails(src, &out).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
-            let (l, s) = out.files(ThumbFile::Png);
+            let (l, s) = out.files(ThumbFormat::Png);
             for (file, side) in [(&l, 1600), (&s, 512)] {
                 let px = read_png(file);
                 assert_eq!((px.0, px.1), (side, side), "{}", src.display());

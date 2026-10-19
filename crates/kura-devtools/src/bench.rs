@@ -83,9 +83,10 @@ fn thumbs(src: &std::path::Path, threads: Option<usize>) -> Result<(), String> {
             .par_iter()
             .enumerate()
             .filter(|(i, path)| {
+                // 書き先は拡張子のない stem（書いた形式の拡張子が付く）
                 let targets = ThumbTargets {
-                    large: out.join(format!("{i}_l.jpg")),
-                    small: out.join(format!("{i}_s.jpg")),
+                    large: out.join(format!("{i}_l")),
+                    small: out.join(format!("{i}_s")),
                 };
                 backend.image_thumbnails(path, &targets).is_err()
             })

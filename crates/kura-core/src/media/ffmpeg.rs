@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{MediaBackend, MediaError, MediaInfo, ThumbTargets};
+use super::{MediaBackend, MediaError, MediaInfo, ThumbFormat, ThumbTargets};
 use crate::import::MediaKind;
 use crate::time::parse_iso8601_ms;
 use crate::tools::{find, run_with_timeout};
@@ -63,9 +63,11 @@ impl FfmpegBackend {
         }
     }
 
-    /// 長辺 1600 の画像から 512 を作る。
-    fn small_from_large(&self, out: &ThumbTargets) -> Result<(), MediaError> {
-        self.frame(&out.large, &out.small, 512, None, None)
+    /// 長辺 1600 の画像から 512 を作る（どちらも JPEG）。
+    fn small_from_large(&self, out: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
+        let (large, small) = out.files(ThumbFormat::Jpeg);
+        self.frame(&large, &small, 512, None, None)?;
+        Ok(ThumbFormat::Jpeg)
     }
 }
 
@@ -103,8 +105,9 @@ impl MediaBackend for FfmpegBackend {
         parse_ffprobe(&String::from_utf8_lossy(&output.stdout), kind)
     }
 
-    fn image_thumbnails(&self, path: &Path, out: &ThumbTargets) -> Result<(), MediaError> {
-        self.frame(path, &out.large, 1600, None, None)?;
+    fn image_thumbnails(&self, path: &Path, out: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
+        // ffmpeg の道はいつも JPEG（透明は落ちる。macOS で読めない形式の受け皿）
+        self.frame(path, &out.files(ThumbFormat::Jpeg).0, 1600, None, None)?;
         self.small_from_large(out)
     }
 
@@ -113,13 +116,14 @@ impl MediaBackend for FfmpegBackend {
         path: &Path,
         at_sec: f64,
         out: &ThumbTargets,
-    ) -> Result<(), MediaError> {
+    ) -> Result<ThumbFormat, MediaError> {
+        let large = out.files(ThumbFormat::Jpeg).0;
         // 指定の地点が取れなければ先頭で作り直す
         if self
-            .frame(path, &out.large, 1600, Some(at_sec.max(0.0)), Some("0:v:0"))
+            .frame(path, &large, 1600, Some(at_sec.max(0.0)), Some("0:v:0"))
             .is_err()
         {
-            self.frame(path, &out.large, 1600, None, Some("0:v:0"))?;
+            self.frame(path, &large, 1600, None, Some("0:v:0"))?;
         }
         self.small_from_large(out)
     }
@@ -129,7 +133,7 @@ impl MediaBackend for FfmpegBackend {
         path: &Path,
         art: &Path,
         out: &ThumbTargets,
-    ) -> Result<bool, MediaError> {
+    ) -> Result<Option<ThumbFormat>, MediaError> {
         // 埋め込まれた画像（attached picture）は動画のストリームとして見える
         let info = self.probe(path, MediaKind::Audio);
         let has_picture = info.is_ok() && {
@@ -151,15 +155,20 @@ impl MediaBackend for FfmpegBackend {
             !String::from_utf8_lossy(&output.stdout).trim().is_empty()
         };
         if !has_picture {
-            return Ok(false);
+            return Ok(None);
         }
         self.frame(path, art, 1600, None, Some("0:v:0"))?;
-        if let Some(parent) = out.large.parent() {
+        let large = out.files(ThumbFormat::Jpeg).0;
+        if let Some(parent) = large.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(art, &out.large)?;
-        self.small_from_large(out)?;
-        Ok(true)
+        std::fs::copy(art, &large)?;
+        self.small_from_large(out).map(Some)
+    }
+
+    fn font_thumbnails(&self, _: &Path, _: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
+        // フォントの見本は CoreText（kura-mac）だけ
+        Err(MediaError::Unsupported)
     }
 }
 
@@ -336,13 +345,21 @@ mod tests {
         assert!(info.duration_ms.unwrap() >= 1900);
 
         let out = ThumbTargets {
-            large: dir.path().join("l.jpg"),
-            small: dir.path().join("s.jpg"),
+            large: dir.path().join("l"),
+            small: dir.path().join("s"),
         };
-        backend.video_thumbnails(&video, 0.2, &out).unwrap();
-        assert!(out.large.is_file() && out.small.is_file());
+        assert_eq!(
+            backend.video_thumbnails(&video, 0.2, &out).unwrap(),
+            ThumbFormat::Jpeg
+        );
+        let (large, small) = out.files(ThumbFormat::Jpeg);
+        assert!(large.is_file() && small.is_file());
 
         let art = dir.path().join("art.jpg");
-        assert!(!backend.audio_artwork(&video, &art, &out).unwrap() || art.is_file());
+        assert!(backend.audio_artwork(&video, &art, &out).unwrap().is_none() || art.is_file());
+        assert!(matches!(
+            backend.font_thumbnails(&video, &out),
+            Err(MediaError::Unsupported)
+        ));
     }
 }

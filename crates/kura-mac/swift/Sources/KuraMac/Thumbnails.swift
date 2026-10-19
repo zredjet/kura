@@ -42,10 +42,11 @@ public func kuraImageThumbnails(
 }
 
 /// 動画の `atSec` 秒の地点のサムネイル（AVAssetImageGenerator）。取れなければ先頭で作り直す。
+/// `outLargeStem`・`outSmallStem` は拡張子のない書き先で、いつも JPEG（`<stem>.jpg`）を書く（M11）。
 @_cdecl("kura_video_thumbnails")
 public func kuraVideoThumbnails(
-    _ path: UnsafePointer<CChar>, _ atSec: Double, _ outLarge: UnsafePointer<CChar>,
-    _ outSmall: UnsafePointer<CChar>, _ largePx: Int32, _ smallPx: Int32
+    _ path: UnsafePointer<CChar>, _ atSec: Double, _ outLargeStem: UnsafePointer<CChar>,
+    _ outSmallStem: UnsafePointer<CChar>, _ largePx: Int32, _ smallPx: Int32
 ) -> Int32 {
     let asset = AVURLAsset(url: fileURL(path))
     let tracks = waitFor { try await asset.loadTracks(withMediaType: .video) } ?? []
@@ -74,14 +75,17 @@ public func kuraVideoThumbnails(
     guard let large = frame(at: max(0, atSec)) ?? frame(at: 0) else {
         return kFailed
     }
-    return writeThumbnails(large, fileURL(outLarge), fileURL(outSmall), largePx, smallPx)
+    return writeThumbnails(
+        large, stemURL(outLargeStem, "jpg"), stemURL(outSmallStem, "jpg"), largePx, smallPx
+    )
 }
 
 /// 音楽のジャケット（メタデータの artwork）を `outArt` に書き、サムネイルも作る。
+/// `outLargeStem`・`outSmallStem` は拡張子のない書き先で、いつも JPEG（`<stem>.jpg`）を書く（M11）。
 @_cdecl("kura_audio_artwork")
 public func kuraAudioArtwork(
-    _ path: UnsafePointer<CChar>, _ outArt: UnsafePointer<CChar>, _ outLarge: UnsafePointer<CChar>,
-    _ outSmall: UnsafePointer<CChar>, _ largePx: Int32, _ smallPx: Int32
+    _ path: UnsafePointer<CChar>, _ outArt: UnsafePointer<CChar>, _ outLargeStem: UnsafePointer<CChar>,
+    _ outSmallStem: UnsafePointer<CChar>, _ largePx: Int32, _ smallPx: Int32
 ) -> Int32 {
     let asset = AVURLAsset(url: fileURL(path))
     let tracks = waitFor { try await asset.loadTracks(withMediaType: .audio) } ?? []
@@ -107,5 +111,7 @@ public func kuraAudioArtwork(
     else {
         return kFailed
     }
-    return writeThumbnails(art, fileURL(outLarge), fileURL(outSmall), largePx, smallPx)
+    return writeThumbnails(
+        art, stemURL(outLargeStem, "jpg"), stemURL(outSmallStem, "jpg"), largePx, smallPx
+    )
 }
