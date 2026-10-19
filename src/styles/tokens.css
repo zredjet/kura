@@ -18,6 +18,7 @@
   --text-2xl: 17px;   /* ダイアログの見出し */
   --text-3xl: 20px;   /* 画面の見出し */
   --text-4xl: 30px;   /* プレイリストのタイトル */
+  --text-specimen: 40px;  /* フォントの見本（インスペクタ・クイックルックのプレビュー。M11） */
 
   --weight-regular: 400;
   --weight-semibold: 600;
@@ -74,6 +75,12 @@
   --folder-amber: #FFB35C;
   --folder-teal: #5FD4C4;
 
+  /* ---- 素材の表示（M11）---- */
+  --checker-a: #2A2A2F;        /* 透過の下地の市松模様：地（--bg-media より少し明るい無彩色） */
+  --checker-b: #1E1E22;        /* 市松模様：マス */
+  --checker-size: 16px;        /* 市松模様の 2×2 の一辺（1 マス 8px。画面に固定で、拡大率で変えない） */
+  --loop-region: color-mix(in srgb, var(--accent) 22%, transparent);  /* 波形のループの区間 */
+
   /* ---- 角丸 ---- */
   --radius-xs: 5px;    /* kbd */
   --radius-sm: 7px;    /* タグ、トークン、小さなサムネ */
@@ -106,6 +113,7 @@
   --w-sidebar: 248px;
   --w-inspector: 300px;
   --w-queue: 340px;
+  --h-waveform: 48px;    /* インスペクタの波形（M11） */
 
   /* ---- 影 ---- */
   --shadow-panel: 0 10px 30px rgba(0, 0, 0, 0.32);
