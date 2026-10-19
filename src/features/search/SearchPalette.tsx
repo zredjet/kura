@@ -285,6 +285,8 @@ function PaletteBody() {
   });
 
   const counts = check?.counts ?? null;
+  // 解析で決まるフィールドを使っていて、解析がまだで一致が決まっていないものがあるときだけ（design.md §3.1）
+  const unanalyzed = check?.unanalyzed ?? 0;
   const breakdown = counts
     ? kindBreakdown(counts)
         .map(({ label, count }) => `${label} ${formatCount(count)}`)
@@ -403,7 +405,16 @@ function PaletteBody() {
               {error.message}
             </span>
           ) : (
-            suggestions.length > 0 && draft && <span className={styles.statusHint}>{t.typing}</span>
+            <span className={styles.statusEnd}>
+              {unanalyzed > 0 && (
+                <span className={styles.statusHint} title={t.unanalyzedHint}>
+                  {t.unanalyzed(formatCount(unanalyzed))}
+                </span>
+              )}
+              {suggestions.length > 0 && draft && (
+                <span className={styles.statusHint}>{t.typing}</span>
+              )}
+            </span>
           )}
         </div>
 
@@ -434,7 +445,8 @@ function PaletteBody() {
                       {s.prefix && <span className={styles.chipPrefix}>{s.prefix}</span>}
                       {s.label}
                     </span>
-                    {s.kind === 'saved' && s.detail && (
+                    {/* 保存済みの検索は条件、比較だけのフィールド（ラウドネスなど）は書き方の例 */}
+                    {(s.kind === 'saved' || s.kind === 'field') && s.detail && (
                       <span className={styles.optionQuery}>{s.detail}</span>
                     )}
                   </span>

@@ -167,6 +167,13 @@
   color: var(--text-tertiary);
 }
 
+/* 件数の行の右（「未解析 N 件」と入力中の候補の案内） */
+.statusEnd {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
 .error {
   color: var(--danger-text);
   text-align: right;
