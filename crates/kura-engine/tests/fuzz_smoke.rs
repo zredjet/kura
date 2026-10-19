@@ -1,7 +1,7 @@
 //! stable で回す、変異によるファズ（docs/editing.md §13）。`fuzz/`（cargo-fuzz、nightly）と同じ対象
-//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_peaks`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
+//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_peaks`・`fuzz_model`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
 //! カバレッジは見ない。対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、
-//! 文書は `document`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）。
+//! 文書は `document`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、3D モデル（glb）は `model_glb`。
 //!
 //! - ふだんの `cargo test` では、対象ごとに決めた回数だけ回す（`quick`）。
 //! - `KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test fuzz_smoke -- --ignored` で、対象ごとに決めた秒数だけ回す。
@@ -25,7 +25,7 @@ use kura_engine::testfiles::{ApngFrame, AseCel, AseFrame, AseLayer, FileGen, Gif
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::{
     FuzzEncodeMeta, fuzz_decode, fuzz_document, fuzz_encode, fuzz_encode_input,
-    fuzz_encode_input_meta, fuzz_peaks,
+    fuzz_encode_input_meta, fuzz_model, fuzz_peaks,
 };
 use kura_engine::value::{LoopRange, PixelFormat};
 use kura_engine::{NoMonitor, Value};
@@ -590,6 +590,15 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
         ("peaks", peak_seeds()),
         // 段 9：アンカー（PNG・APNG・f32 の WAV ＋私用のチャンク。cargo-fuzz の対象は decode_anchor）
         ("anchor", anchor_seeds(&with_exif, &frames, &wav_meta)),
+        // M11：3D モデル（glb の情報・焼き込み・描画。cargo-fuzz の対象も model_glb）
+        (
+            "model_glb",
+            kura_engine::model::sample_glbs()
+                .unwrap()
+                .into_iter()
+                .map(|(_, b)| b)
+                .collect(),
+        ),
     ]
 }
 
@@ -730,6 +739,8 @@ fn run(target: &str, input: &[u8]) -> Result<(), String> {
         fuzz_document(input)
     } else if target == "peaks" {
         fuzz_peaks(input)
+    } else if target == "model_glb" {
+        fuzz_model(input)
     } else if let Some(format) = target.strip_prefix("encode_") {
         fuzz_encode(format, input)
     } else {
@@ -807,14 +818,15 @@ fn long() {
 }
 
 /// 種を cargo-fuzz の種の置き場（`fuzz/corpus/<対象>/`。git には入れない）に書き出す（fuzz/README.md）。
-/// 対象の名前は、デコーダは `decode_<形式>`、自前のエンコーダは `encode_<形式>`、文書は `document`。
+/// 対象の名前は、デコーダは `decode_<形式>`、自前のエンコーダは `encode_<形式>`、文書は `document`、3D モデルは `model_glb`。
 #[test]
 #[ignore]
 fn export_seeds() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus");
     let mut n = 0;
     for (target, seeds) in targets() {
-        let name = if target == "document" || target.starts_with("encode_") {
+        let name = if target == "document" || target == "model_glb" || target.starts_with("encode_")
+        {
             target.to_string()
         } else {
             format!("decode_{target}")

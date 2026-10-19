@@ -149,3 +149,10 @@ path = "fuzz_targets/decode_anchor.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "model_glb"
+path = "fuzz_targets/model_glb.rs"
+test = false
+doc = false
+bench = false

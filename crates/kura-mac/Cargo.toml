@@ -19,6 +19,11 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 
+# libc：SVG の文字を描くシステムのフォントのファイルを mmap する（fonts.rs。M11 の決定 12）。Cargo.lock にすでにある版
+# （tauri などが使う）で、新しいクレートは増えない
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 swift-rs = { workspace = true, features = ["build"] }
 

@@ -433,6 +433,204 @@ fn adler32(bytes: &[u8]) -> u32 {
     (b << 16) | a
 }
 
+/// 小さな TrueType のフォント（SVG の文字のテスト用。M11）。`chars`（BMP の字）のそれぞれに、送り幅 1,000・
+/// 塗りつぶした正方形（x 100〜700・y 0〜700。1 em = 1,000）の字を当てる。表は cmap（形式 4）・glyf・head・hhea・hmtx・
+/// loca・maxp・name（書体名 `family`・スタイル Regular）・post。`chars` は重ならないこと（並べ替えて使う）。
+pub fn tiny_ttf(family: &str, chars: &[char]) -> Vec<u8> {
+    let be16 = |v: &mut Vec<u8>, x: u16| v.extend_from_slice(&x.to_be_bytes());
+    let be32 = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_be_bytes());
+    let mut codes: Vec<u16> = chars
+        .iter()
+        .filter_map(|c| u16::try_from(u32::from(*c)).ok())
+        .collect();
+    codes.sort();
+    codes.dedup();
+    let glyphs = codes.len() as u16 + 1;
+    // glyf：0 番（.notdef）は空、ほかは正方形 1 つ（4 点・座標は int16 の差分）
+    let mut glyf = Vec::new();
+    // 0 番は空（始まりと終わりがどちらも 0）
+    let mut loca = vec![0u16, 0];
+    let square = {
+        let mut g = Vec::new();
+        for x in [1i16, 100, 0, 700, 700] {
+            be16(&mut g, x as u16); // 輪郭の数・xMin・yMin・xMax・yMax
+        }
+        be16(&mut g, 3); // 輪郭の終わりの点
+        be16(&mut g, 0); // 命令の長さ
+        g.extend_from_slice(&[1, 1, 1, 1]); // 曲線の上の点・座標は int16
+        for dx in [100i16, 0, 600, 0] {
+            be16(&mut g, dx as u16);
+        }
+        for dy in [0i16, 700, 0, -700] {
+            be16(&mut g, dy as u16);
+        }
+        g
+    };
+    for _ in &codes {
+        glyf.extend_from_slice(&square);
+        loca.push((glyf.len() / 2) as u16);
+    }
+    let mut loca_b = Vec::new();
+    for o in &loca {
+        be16(&mut loca_b, *o);
+    }
+    let mut head = Vec::new();
+    be32(&mut head, 0x0001_0000);
+    be32(&mut head, 0x0001_0000);
+    be32(&mut head, 0);
+    be32(&mut head, 0x5F0F_3CF5);
+    be16(&mut head, 0x000B);
+    be16(&mut head, 1000);
+    head.extend_from_slice(&[0; 16]);
+    for v in [0i16, 0, 1000, 1000] {
+        be16(&mut head, v as u16);
+    }
+    for v in [0u16, 8, 2, 0, 0] {
+        be16(&mut head, v); // macStyle・lowestRecPPEM・fontDirectionHint・indexToLocFormat（短い）・glyphDataFormat
+    }
+    let mut hhea = Vec::new();
+    be32(&mut hhea, 0x0001_0000);
+    for v in [800i16, -200, 0] {
+        be16(&mut hhea, v as u16);
+    }
+    be16(&mut hhea, 1000);
+    for v in [0i16, 0, 1000, 1, 0, 0, 0, 0, 0, 0, 0] {
+        be16(&mut hhea, v as u16);
+    }
+    be16(&mut hhea, glyphs);
+    let mut hmtx = Vec::new();
+    for _ in 0..glyphs {
+        be16(&mut hmtx, 1000);
+        be16(&mut hmtx, 100);
+    }
+    let mut maxp = Vec::new();
+    be32(&mut maxp, 0x0001_0000);
+    be16(&mut maxp, glyphs);
+    for v in [4u16, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0] {
+        be16(&mut maxp, v);
+    }
+    // cmap：Windows の Unicode BMP（3, 1）の形式 4。字ごとに 1 つの区間と、終わりの 0xFFFF
+    let seg = codes.len() as u16 + 1;
+    let mut sub = Vec::new();
+    let mut ends: Vec<u16> = codes.clone();
+    ends.push(0xFFFF);
+    let mut starts = codes.clone();
+    starts.push(0xFFFF);
+    let deltas: Vec<u16> = codes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i as u16 + 1).wrapping_sub(*c))
+        .chain(std::iter::once(1))
+        .collect();
+    let mut pow = 1u16;
+    let mut log = 0u16;
+    while pow * 2 <= seg {
+        pow *= 2;
+        log += 1;
+    }
+    be16(&mut sub, 4);
+    be16(&mut sub, 16 + 8 * seg);
+    be16(&mut sub, 0);
+    be16(&mut sub, seg * 2);
+    be16(&mut sub, pow * 2);
+    be16(&mut sub, log);
+    be16(&mut sub, seg * 2 - pow * 2);
+    for e in &ends {
+        be16(&mut sub, *e);
+    }
+    be16(&mut sub, 0);
+    for s in &starts {
+        be16(&mut sub, *s);
+    }
+    for d in &deltas {
+        be16(&mut sub, *d);
+    }
+    for _ in 0..seg {
+        be16(&mut sub, 0);
+    }
+    let mut cmap = Vec::new();
+    be16(&mut cmap, 0);
+    be16(&mut cmap, 1);
+    be16(&mut cmap, 3);
+    be16(&mut cmap, 1);
+    be32(&mut cmap, 12);
+    cmap.extend_from_slice(&sub);
+    // name：書体名（1）・スタイル（2）・フルネーム（4）・PostScript 名（6）を UTF-16BE で
+    let names = [
+        (1u16, family.to_string()),
+        (2, "Regular".to_string()),
+        (4, format!("{family} Regular")),
+        (6, format!("{family}-Regular")),
+    ];
+    let mut strings = Vec::new();
+    let mut name = Vec::new();
+    be16(&mut name, 0);
+    be16(&mut name, names.len() as u16);
+    be16(&mut name, 6 + 12 * names.len() as u16);
+    for (id, text) in &names {
+        let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        for v in [
+            3u16,
+            1,
+            0x409,
+            *id,
+            utf16.len() as u16,
+            strings.len() as u16,
+        ] {
+            be16(&mut name, v);
+        }
+        strings.extend_from_slice(&utf16);
+    }
+    name.extend_from_slice(&strings);
+    let mut post = Vec::new();
+    be32(&mut post, 0x0003_0000);
+    be32(&mut post, 0);
+    be16(&mut post, (-100i16) as u16);
+    be16(&mut post, 50);
+    post.extend_from_slice(&[0; 20]);
+    // 表の並びは名前の順
+    let tables: [(&[u8; 4], Vec<u8>); 9] = [
+        (b"cmap", cmap),
+        (b"glyf", glyf),
+        (b"head", head),
+        (b"hhea", hhea),
+        (b"hmtx", hmtx),
+        (b"loca", loca_b),
+        (b"maxp", maxp),
+        (b"name", name),
+        (b"post", post),
+    ];
+    let mut out = Vec::new();
+    be32(&mut out, 0x0001_0000);
+    be16(&mut out, tables.len() as u16);
+    for v in [128u16, 3, 16] {
+        be16(&mut out, v); // searchRange・entrySelector・rangeShift（9 表）
+    }
+    let mut offset = 12 + 16 * tables.len() as u32;
+    let mut body = Vec::new();
+    for (tag, data) in &tables {
+        let checksum = data
+            .chunks(4)
+            .map(|c| {
+                let mut w = [0u8; 4];
+                w[..c.len()].copy_from_slice(c);
+                u32::from_be_bytes(w)
+            })
+            .fold(0u32, u32::wrapping_add);
+        out.extend_from_slice(*tag);
+        be32(&mut out, checksum);
+        be32(&mut out, offset);
+        be32(&mut out, data.len() as u32);
+        body.extend_from_slice(data);
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        offset = 12 + 16 * tables.len() as u32 + body.len() as u32;
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
 /// 無圧縮の deflate（stored ブロック）で包んだ zlib のバイト列。
 pub fn zlib_stored(data: &[u8]) -> Vec<u8> {
     let mut out = vec![0x78, 0x01];
