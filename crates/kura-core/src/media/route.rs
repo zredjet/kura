@@ -154,6 +154,7 @@ pub struct PlanSync {
 /// 指紋が変わったときだけの一度きりの全件の走査（`SCAN items`。`ready`・`failed` には索引がない。
 /// テスト `plan_updates_scan_items_only_when_the_plan_changes` に例外として書く）。
 pub fn sync_plan(tx: &Connection) -> Result<PlanSync> {
+    let started = std::time::Instant::now();
     let now = plan();
     let before: Plan = settings::get(tx, PLAN_KEY)?.unwrap_or_else(legacy_plan);
     if before == now {
@@ -178,6 +179,7 @@ pub fn sync_plan(tx: &Connection) -> Result<PlanSync> {
     tracing::info!(
         stale = out.stale,
         retried = out.retried,
+        ms = started.elapsed().as_secs_f64() * 1000.0,
         ?exts,
         "サムネイルの作り方が変わった形式を作り直します"
     );
