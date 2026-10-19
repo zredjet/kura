@@ -22,6 +22,8 @@ const PREVIEW: ImportPreviewDto = {
   images: 96,
   videos: 24,
   audios: 8,
+  fonts: 0,
+  models: 0,
   totalBytes: 18_400_000_000,
   duplicates: 6,
   skipped: 0,

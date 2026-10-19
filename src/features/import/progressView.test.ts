@@ -46,6 +46,25 @@ describe('progressView', () => {
     expect(progressView(job({ state: 'done', resultJson: result(3, 0, 0) })).detail).toBeNull();
   });
 
+  it('中身が違うので取り込まなかったもの（Aseprite でない .ase など。M11）は対象外として数える', () => {
+    const rejected = JSON.stringify({
+      cursor: 0,
+      total: 0,
+      added: 3,
+      duplicates: 1,
+      skipped: 2,
+      failed: 0,
+      failures: [],
+      rejected: [
+        { path: '/a/swatch.ase', reason: 'Aseprite のファイルではありません' },
+        { path: '/a/b.ase', reason: 'Aseprite のファイルではありません' },
+      ],
+    });
+    expect(progressView(job({ state: 'done', resultJson: rejected })).detail).toBe(
+      '重複 1・対象外 2',
+    );
+  });
+
   it('失敗・中止', () => {
     expect(progressView(job({ state: 'failed', message: '書き込めません' }))).toMatchObject({
       title: '取り込みに失敗しました',

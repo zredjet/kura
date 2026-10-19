@@ -616,7 +616,7 @@ export const ja = {
     title: (n: string) => `${n} 項目を取り込み`,
     nothing: '取り込めるファイルがありません',
     nothingDetail:
-      '対応している形式は、画像（JPEG・PNG・HEIC など）、動画（MP4・MOV・MKV など）、音楽（MP3・FLAC・M4A など）です。',
+      '対応している形式は、画像（JPEG・PNG・HEIC など）、動画（MP4・MOV・MKV など）、音楽（MP3・FLAC・M4A など）、フォント（TTF・OTF・WOFF など）、3D（GLB）です。',
     failed: (message: string) => `取り込む項目を確認できませんでした：${message}`,
     sources: {
       others: (first: string, n: string, unit: string) => `${first} ほか ${n} ${unit}`,
@@ -627,9 +627,6 @@ export const ja = {
       skipped: (n: string) => `対象外 ${n} 件`,
     },
     stats: {
-      images: '画像',
-      videos: '動画',
-      audios: '音楽',
       total: '合計',
     },
     duplicates: (n: string) => `${n} 項目はすでにライブラリにあります（内容が同一）`,
@@ -661,7 +658,7 @@ export const ja = {
     confirm: (n: string) => `${n} 項目を取り込む`,
     confirmPlain: '取り込む',
     pickTitle: '取り込むファイルを選ぶ',
-    pickFilter: '画像・動画・音楽',
+    pickFilter: '画像・動画・音楽・フォント・3D',
   },
   player: {
     fullscreen: 'フルスクリーンにする',
@@ -1006,6 +1003,7 @@ export const ja = {
     done: (n: string) => `${n} 項目を取り込みました`,
     duplicates: (n: string) => `重複 ${n}`,
     failures: (n: string) => `失敗 ${n}`,
+    rejected: (n: string) => `対象外 ${n}`,
     failed: '取り込みに失敗しました',
     canceled: '取り込みを中止しました',
     canceledDetail: (n: string) => `${n} 項目は取り込み済みです`,

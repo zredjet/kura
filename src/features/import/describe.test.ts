@@ -4,6 +4,7 @@ import type { ImportPreviewDto } from '../../ipc/import';
 import {
   confirmLabel,
   describeSources,
+  kindStats,
   folderChoices,
   folderTagExample,
   reproduceExample,
@@ -16,6 +17,8 @@ function preview(over: Partial<ImportPreviewDto> = {}): ImportPreviewDto {
     images: 96,
     videos: 24,
     audios: 8,
+    fonts: 0,
+    models: 0,
     totalBytes: 18_400_000_000,
     duplicates: 6,
     skipped: 0,
@@ -26,6 +29,23 @@ function preview(over: Partial<ImportPreviewDto> = {}): ImportPreviewDto {
     ...over,
   };
 }
+
+describe('kindStats', () => {
+  it('画像・動画・音楽は 0 件でも出し、フォント・3D は 1 件以上のときだけ出す', () => {
+    expect(kindStats(preview({ videos: 0 }))).toEqual([
+      { kind: 'image', label: '画像', count: 96 },
+      { kind: 'video', label: '動画', count: 0 },
+      { kind: 'audio', label: '音楽', count: 8 },
+    ]);
+    expect(kindStats(preview({ fonts: 3, models: 1 })).map((s) => [s.label, s.count])).toEqual([
+      ['画像', 96],
+      ['動画', 24],
+      ['音楽', 8],
+      ['フォント', 3],
+      ['3D', 1],
+    ]);
+  });
+});
 
 describe('describeSources', () => {
   it('モックと同じ形にする', () => {
