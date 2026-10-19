@@ -1212,6 +1212,92 @@ mod tests {
         assert!(get(&engine, &layout, &anim).is_ok());
     }
 
+    /// aseprite（タグとコマの長さ）とアニメの WebP（他のツールで作ったフィクスチャ）も、ファイルから帯にできる。
+    #[test]
+    fn get_reads_aseprite_tags_and_animated_webp() {
+        use kura_engine::testfiles::{AseCel, AseFrame, AseLayer, FileGen};
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let engine = engine(64 << 20);
+        let put = |b: u8, ext: &str, bytes: &[u8]| -> AnimRequest {
+            let hash = format!("{b:02x}").repeat(32);
+            let path = layout.content_path(&parse_hex32(&hash).unwrap(), ext);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            AnimRequest {
+                hash,
+                ext: ext.into(),
+                kind: MediaKind::Image,
+                grid: None,
+                frame_ms: None,
+            }
+        };
+        let ase = FileGen::Aseprite {
+            w: 8,
+            h: 6,
+            depth: 32,
+            flags: 1,
+            transparent: 0,
+            palette_len: 4,
+            layers: vec![AseLayer {
+                flags: 1,
+                kind: 0,
+                level: 0,
+                blend: 0,
+                opacity: 255,
+            }],
+            frames: (0..3u16)
+                .map(|i| AseFrame {
+                    duration: 50 * (i + 1),
+                    cels: vec![AseCel {
+                        layer: 0,
+                        x: i as i16,
+                        y: 1,
+                        opacity: 255,
+                        z: 0,
+                        kind: 0,
+                        w: 3,
+                        h: 2,
+                        link: 0,
+                        flip: false,
+                    }],
+                })
+                .collect(),
+            tileset: None,
+            tags: vec![("歩く".into(), 0, 2)],
+            slices: vec![],
+            seed: 7,
+            opaque_palette: true,
+        }
+        .bytes()
+        .unwrap();
+        let info = get(&engine, &layout, &put(1, "aseprite", &ase)).unwrap();
+        assert_eq!((info.canvas_w, info.canvas_h, info.frame_count), (8, 6, 3));
+        assert_eq!(info.durations, [50, 100, 150]);
+        assert_eq!(info.tags.len(), 1);
+        assert_eq!(
+            (
+                info.tags[0].name.as_str(),
+                info.tags[0].from,
+                info.tags[0].to
+            ),
+            ("歩く", 0, 2)
+        );
+        let (w, _, rows) = decode_png(&std::fs::read(layout.anim_path(&info.hash)).unwrap());
+        assert_eq!(at(&rows, w, 0, 0)[3], 0, "セルの外は透明");
+
+        let webp = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../kura-engine/fixtures/webp-anim.webp"),
+        )
+        .unwrap();
+        let info = get(&engine, &layout, &put(2, "webp", &webp)).unwrap();
+        assert_eq!(info.frame_count, 3);
+        assert_eq!(info.durations.len(), 3);
+        assert!(layout.anim_path(&info.hash).is_file());
+    }
+
     /// アイテムの帯の元：ハッシュ・拡張子・種類と、格子・コマの長さの設定。
     #[test]
     fn request_of_reads_the_item_and_its_grid() {
@@ -1273,8 +1359,8 @@ mod tests {
                                 })
                             })
                             .collect();
-                        let px = Raster::from_rows(cell, cell, PixelFormat::Rgba8, None, &data)
-                            .unwrap();
+                        let px =
+                            Raster::from_rows(cell, cell, PixelFormat::Rgba8, None, &data).unwrap();
                         (px, (0, 0), 80)
                     })
                     .collect(),
@@ -1283,21 +1369,42 @@ mod tests {
             )
         };
         let cases: Vec<(&str, &str, Value, Option<GridSetting>)> = vec![
-            ("GIF 64 コマ 128²（乱数）", "gif", noise(64, 128, 128, 1), None),
-            ("APNG 64 コマ 256²（乱数）", "png", noise(64, 256, 256, 2), None),
+            (
+                "GIF 64 コマ 128²（乱数）",
+                "gif",
+                noise(64, 128, 128, 1),
+                None,
+            ),
+            (
+                "APNG 64 コマ 256²（乱数）",
+                "png",
+                noise(64, 256, 256, 2),
+                None,
+            ),
             ("GIF 96 コマ 64²（スプライト）", "gif", sprite(96, 64), None),
-            ("格子 1024² を 32² で 1024 コマ", "png", coords(1024, 1024), Some(grid(32, 0, None))),
-            ("上限 4,096 コマ 64²（8192 × 2048。APNG）", "png", sprite(4_096, 64), None),
+            (
+                "格子 1024² を 32² で 1024 コマ",
+                "png",
+                coords(1024, 1024),
+                Some(grid(32, 0, None)),
+            ),
+            (
+                "上限 4,096 コマ 64²（8192 × 2048。APNG）",
+                "png",
+                sprite(4_096, 64),
+                None,
+            ),
         ];
         // アニメの WebP はエンジンに書き手がない（読むだけ）ので測っていない
         for (b, (what, format, value, grid)) in (1u8..).zip(cases) {
-            let (bytes, _) = match CodecSet::pinned().encode_bytes(&value, format, &json!({}), &NoMonitor) {
-                Ok(v) => v,
-                Err(err) => {
-                    eprintln!("{what}: 書けません（{err}）");
-                    continue;
-                }
-            };
+            let (bytes, _) =
+                match CodecSet::pinned().encode_bytes(&value, format, &json!({}), &NoMonitor) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!("{what}: 書けません（{err}）");
+                        continue;
+                    }
+                };
             let hash = format!("{b:02x}").repeat(32);
             let ext = if format == "png" { "png" } else { format };
             let path = layout.content_path(&parse_hex32(&hash).unwrap(), ext);
@@ -1316,7 +1423,9 @@ mod tests {
             let started = std::time::Instant::now();
             let again = get(&engine, &layout, &req);
             let second_ms = started.elapsed().as_secs_f64() * 1000.0;
-            let strip = std::fs::metadata(layout.anim_path(&hash)).map(|m| m.len()).unwrap_or(0);
+            let strip = std::fs::metadata(layout.anim_path(&hash))
+                .map(|m| m.len())
+                .unwrap_or(0);
             eprintln!(
                 "{what}: 元 {} バイト、最初 {first_ms:.1} ms、2 回目 {second_ms:.2} ms、帯 {strip} バイト、{:?}",
                 bytes.len(),

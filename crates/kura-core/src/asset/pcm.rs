@@ -926,7 +926,16 @@ mod tests {
             let intro = serve(&cache, &engine, dir.path(), &h, &source, 0, 44_100).unwrap();
             let second_ms = started.elapsed().as_secs_f64() * 1000.0;
             let started = std::time::Instant::now();
-            let seam = serve(&cache, &engine, dir.path(), &h, &source, total - 176_400, total).unwrap();
+            let seam = serve(
+                &cache,
+                &engine,
+                dir.path(),
+                &h,
+                &source,
+                total - 176_400,
+                total,
+            )
+            .unwrap();
             let seam_ms = started.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
                 "{format}: ファイル {} バイト、最初（読む＋本体 {} バイト）{first_ms:.1} ms、2 回目（前奏 {} バイト）{second_ms:.1} ms、継ぎ目 4 秒 {} バイト {seam_ms:.1} ms、デコーダ {:?}",
