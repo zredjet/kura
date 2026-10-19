@@ -2,13 +2,13 @@
 //!
 //! | パス | 返すもの |
 //! |---|---|
-//! | `/thumb/{hash}/s`・`/thumb/{hash}/l` | サムネイル（長辺 512 / 1600） |
+//! | `/thumb/{hash}/s`・`/thumb/{hash}/l` | サムネイル（長辺 512 / 1600。png、jpg の順に探す） |
 //! | `/art/{hash}` | 音楽のジャケット |
 //! | `/file/{hash}` | 元ファイル |
 //! | `/play/{hash}` | 再生用：プロキシがあればプロキシ、なければ元ファイル |
-//! | `/peaks/{hash}` | 波形の段（M11 段 3 で中身。今は 404） |
-//! | `/pcm/{hash}/{start}-{end}` | 試聴用の PCM（M11 段 3 で中身。今は 404） |
-//! | `/anim/{hash}/{版}` | アニメの帯（M11 段 3 で中身。今は 404） |
+//! | `/peaks/{hash}` | 波形の段（`peaks/ab/<hash>.peaks`。解析のジョブが書く） |
+//! | `/pcm/{hash}/{start}-{end}` | 試聴用の PCM（WAV。その場で作る。[`crate::asset::pcm`]。元は [`pcm_source`]） |
+//! | `/anim/{hash}/{版}` | アニメの帯（`anim/ab/<hash>-<版>.png`。`item_anim_get` が書く。[`crate::asset::anim`]） |
 //!
 //! 受け付け（WebView のラベル・Origin・メソッド）と応答のヘッダ・CSP の確かめは [`access`]。
 
@@ -21,8 +21,8 @@ pub use access::{
 
 use std::path::{Path, PathBuf};
 
-use crate::import::mime_for;
-use crate::library::{Layout, ThumbSize};
+use crate::import::{MediaKind, classify, format_id, mime_for};
+use crate::library::{ANIM_V, Layout, ThumbFormat, ThumbSize};
 
 /// 1 回の応答で返す最大の大きさ（Range のとき）。
 pub const MAX_CHUNK: u64 = 4 * 1024 * 1024;
@@ -130,14 +130,22 @@ fn is_hash(text: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// パスに対応するファイル（なければ None）。
+/// パスに対応するファイル（なければ None）。PCM はファイルではなくその場で作るので None（元は [`pcm_source`]）。
 pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
     let path = match route {
-        Route::Thumb { hash, size } => layout.thumb_path(hash, *size),
+        // 透明のあるものは PNG、ないものは JPEG（作り直して形式が変わったら、サムネイルのジョブが古い形式を消す）。
+        // 消し損ねが残っても、新しい PNG を先に出す
+        Route::Thumb { hash, size } => [ThumbFormat::Png, ThumbFormat::Jpeg]
+            .into_iter()
+            .map(|format| layout.thumb_path_as(hash, *size, format))
+            .find(|path| path.is_file())?,
         Route::Art { hash } => layout.art_path(hash),
         Route::File { hash } => find_content(layout, hash)?,
-        // 中身は M11 の段 3（波形は解析のジョブ、PCM・帯はその場で作る）。それまでは 404
-        Route::Peaks { .. } | Route::Pcm { .. } | Route::Anim { .. } => return None,
+        // 波形の段（解析のジョブが書く）。解析していなければ 404
+        Route::Peaks { hash } => layout.peaks_path(hash),
+        // アニメの帯（item_anim_get が書く）。並べ方の版が今のものだけ（古い版は残さない）
+        Route::Anim { hash, version } if *version == ANIM_V => layout.anim_path(hash),
+        Route::Anim { .. } | Route::Pcm { .. } => return None,
         Route::Play { hash } => {
             let proxy = layout.proxy_path(hash);
             if proxy.is_file() {
@@ -148,6 +156,26 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
         }
     };
     path.is_file().then_some(path)
+}
+
+/// 試聴の PCM の元（files/ の中の音声のファイルと、コーデックの形式の ID）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PcmSource {
+    pub path: PathBuf,
+    pub format: &'static str,
+}
+
+/// `/pcm/{hash}/…` の元を探す（files/ になければ、音声の形式でなければ None）。
+pub fn pcm_source(layout: &Layout, hash: &str) -> Option<PcmSource> {
+    let path = find_content(layout, hash)?;
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if classify(&ext) != Some(MediaKind::Audio) {
+        return None;
+    }
+    Some(PcmSource {
+        format: format_id(&ext)?,
+        path,
+    })
 }
 
 /// `files/ab/cd/<hash>.<ext>` を探す（拡張子は URL に含めないので、フォルダの中から探す）。
@@ -330,18 +358,84 @@ mod tests {
         }
     }
 
+    fn put(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// 波形の段と帯は、作ってあれば派生のファイルを返す（作るのは解析のジョブと item_anim_get）。帯は今の版だけ。
+    /// PCM はファイルではない（その場で作る。[`pcm_source`]）。
     #[test]
-    fn new_routes_are_not_found_until_their_handlers_land() {
+    fn peaks_and_anim_resolve_to_their_derived_files() {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::new(dir.path());
-        for path in [
-            format!("/peaks/{HASH}"),
-            format!("/pcm/{HASH}/0-1"),
-            format!("/anim/{HASH}/1"),
-        ] {
-            let route = parse_route(&path).unwrap();
-            assert_eq!(resolve(&layout, &route), None, "{path}");
+        let peaks = parse_route(&format!("/peaks/{HASH}")).unwrap();
+        let anim = parse_route(&format!("/anim/{HASH}/1")).unwrap();
+        let pcm = parse_route(&format!("/pcm/{HASH}/0-1")).unwrap();
+        // まだ作っていない
+        for route in [&peaks, &anim, &pcm] {
+            assert_eq!(resolve(&layout, route), None, "{route:?}");
         }
+        put(&layout.peaks_path(HASH), b"kurapeak");
+        put(&layout.anim_path(HASH), b"png");
+        assert_eq!(resolve(&layout, &peaks), Some(layout.peaks_path(HASH)));
+        assert_eq!(resolve(&layout, &anim), Some(layout.anim_path(HASH)));
+        assert_eq!(resolve(&layout, &pcm), None, "PCM はファイルから返さない");
+        // 帯の版が違えば（古い・新しい並べ方）404
+        let other = parse_route(&format!("/anim/{HASH}/2")).unwrap();
+        assert_eq!(resolve(&layout, &other), None);
+        assert_eq!(
+            content_type(&layout.anim_path(HASH)),
+            "image/png",
+            "帯は PNG"
+        );
+    }
+
+    /// サムネイルは png、jpg の順に探す（透明のあるものは PNG、ないものは JPEG。作り直して形式が変わっても古い形式を
+    /// 出さない。書いたら別の形式の古いファイルを消すのはサムネイルのジョブ）。
+    #[test]
+    fn resolve_prefers_png_thumb_then_jpg() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        for size in [ThumbSize::Small, ThumbSize::Large] {
+            let route = Route::Thumb {
+                hash: HASH.into(),
+                size,
+            };
+            let jpg = layout.thumb_path_as(HASH, size, ThumbFormat::Jpeg);
+            let png = layout.thumb_path_as(HASH, size, ThumbFormat::Png);
+            assert_eq!(resolve(&layout, &route), None);
+            put(&jpg, b"jpg");
+            assert_eq!(resolve(&layout, &route), Some(jpg.clone()));
+            assert_eq!(content_type(&jpg), "image/jpeg");
+            put(&png, b"png");
+            assert_eq!(resolve(&layout, &route), Some(png.clone()), "PNG が先");
+            assert_eq!(content_type(&png), "image/png");
+            std::fs::remove_file(&jpg).unwrap();
+            assert_eq!(resolve(&layout, &route), Some(png));
+        }
+    }
+
+    /// 試聴の PCM の元：files/ の中の音声のファイルだけ（画像・動画・ないものは None）。
+    #[test]
+    fn pcm_source_is_an_audio_file_in_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let hash: [u8; 32] = crate::library::parse_hex32(HASH).unwrap();
+        assert_eq!(pcm_source(&layout, HASH), None);
+        let png = layout.content_path(&hash, "png");
+        put(&png, b"png");
+        assert_eq!(pcm_source(&layout, HASH), None, "画像は試聴しない");
+        std::fs::remove_file(&png).unwrap();
+        let ogg = layout.content_path(&hash, "ogg");
+        put(&ogg, b"ogg");
+        assert_eq!(
+            pcm_source(&layout, HASH),
+            Some(PcmSource {
+                path: ogg,
+                format: "ogg"
+            })
+        );
     }
 
     #[test]
