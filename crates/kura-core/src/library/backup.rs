@@ -378,6 +378,85 @@ mod tests {
         assert!(list(fresh.layout()).unwrap().is_empty());
     }
 
+    /// 0006 の DB（すべての表に行がある）を持つライブラリのフォルダを作る。
+    fn v6_library(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        let mut conn = Connection::open(root.join(crate::library::DB_FILE)).unwrap();
+        crate::db::apply_pragmas(&conn).unwrap();
+        crate::db::migrate_until(&mut conn, 6).unwrap();
+        crate::db::testing::fill_v6(&conn);
+    }
+
+    #[test]
+    fn upgrading_a_v6_library_backs_it_up_and_keeps_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        v6_library(&root);
+        let want =
+            crate::db::testing::snapshot(&Connection::open(root.join("library.sqlite")).unwrap());
+
+        let lib = Library::open(&root).unwrap();
+        let report = lib.migration().clone();
+        assert_eq!((report.from, report.to), (6, crate::db::MIGRATIONS.len()));
+        assert_eq!(
+            report.applied.iter().map(|a| a.name).collect::<Vec<_>>(),
+            [
+                "0007_blobs_and_kinds",
+                "0008_jobs_named_checks",
+                "0009_analysis"
+            ]
+        );
+        // 当てたあとの WAL は空
+        let wal = std::fs::metadata(root.join("library.sqlite-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(wal, 0);
+        let backup = &list(lib.layout()).unwrap()[0];
+        let copy = Connection::open(&backup.path).unwrap();
+        assert_eq!(crate::db::applied(&copy).unwrap(), 6);
+        assert_eq!(
+            crate::db::testing::snapshot(&copy),
+            want,
+            "バックアップは当てる前の中身"
+        );
+        let tags: i64 = lib
+            .db()
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM item_tags", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(tags, 3);
+    }
+
+    #[test]
+    fn a_failed_migration_keeps_the_old_version_and_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        v6_library(&root);
+        // 0007 が途中で失敗する DB（同じ名前の表がすでにある）
+        Connection::open(root.join("library.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE blobs (x);")
+            .unwrap();
+        let err = Library::open(&root).err().unwrap();
+        match &err {
+            crate::CoreError::Upgrade(crate::UpgradeError::Apply { migration, detail }) => {
+                assert_eq!(migration, "0007_blobs_and_kinds");
+                assert!(detail.contains("already exists"), "{detail}");
+            }
+            other => panic!("{other}"),
+        }
+        let conn = Connection::open(root.join("library.sqlite")).unwrap();
+        assert_eq!(crate::db::applied(&conn).unwrap(), 6);
+        let tags: i64 = conn
+            .query_row("SELECT count(*) FROM item_tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tags, 3, "子の行は残る");
+        assert_eq!(
+            list(&Layout::new(&root)).unwrap().len(),
+            1,
+            "バックアップは残る"
+        );
+    }
+
     #[test]
     fn backup_before_migrating_keeps_the_newest_seven() {
         let dir = tempfile::tempdir().unwrap();

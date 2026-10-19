@@ -59,6 +59,21 @@ pub(crate) fn fill_v6(conn: &Connection) {
     conn.execute_batch(&sql).unwrap();
 }
 
+/// 最新の版で足した表（0009 の media_facts・analysis_results・asset_settings）にも行を入れる。`fill_v6` のあとに使う
+/// （表を足したらここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
+pub(crate) fn fill_latest(conn: &Connection) {
+    conn.execute_batch(
+        "INSERT INTO media_facts (blob_id, state, decoder, reproducible, facts_v, alpha, colors, has_loop, loudness, analyzed_at)
+           SELECT id, 'ok', 'png-rs-dec/1', 1, 1, 2, 16, 0, NULL, 1 FROM blobs;
+         INSERT INTO analysis_results (blob_id, analysis, version, params, encoding, output, output_len, digest, created_at)
+           SELECT id, 'image.alpha', 1, '{}', 'json', '{}', 2, x'00', 1 FROM blobs;
+         INSERT INTO asset_settings (item_id, pixel_art, pixel_scale, grid_json, frame_ms, loop_start, loop_end, anim_tag, updated_at)
+           VALUES (1, 1, 4, '{\"v\":1}', 100, NULL, NULL, 'idle', 1), (2, 0, NULL, NULL, NULL, NULL, NULL, NULL, 1),
+                  (3, NULL, NULL, NULL, NULL, 10, 20, NULL, 1);",
+    )
+    .unwrap();
+}
+
 /// 名前の一覧を読む。
 fn names(conn: &Connection, sql: &str) -> Vec<String> {
     let mut stmt = conn.prepare(sql).unwrap();

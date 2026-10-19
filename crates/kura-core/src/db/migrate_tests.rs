@@ -867,13 +867,257 @@ fn named_checks_can_be_widened_without_a_rebuild() {
         "BEGIN;
          ALTER TABLE items DROP CONSTRAINT items_kind;
          ALTER TABLE items ADD CONSTRAINT items_kind CHECK (kind IN ('image','video','audio','font','model','doc'));
+         ALTER TABLE jobs DROP CONSTRAINT jobs_kind;
+         ALTER TABLE jobs ADD CONSTRAINT jobs_kind
+           CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit'));
          COMMIT;",
     )
     .unwrap();
     assert_eq!(snapshot(&conn), before);
     conn.execute("UPDATE items SET kind = 'doc' WHERE id = 4", [])
         .unwrap();
+    conn.execute(
+        "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('edit', 'queued', '{}', 1)",
+        [],
+    )
+    .unwrap();
     let sqlite: String = one(&conn, "SELECT sqlite_version()");
     let parts: Vec<u32> = sqlite.split('.').filter_map(|p| p.parse().ok()).collect();
     assert!(parts >= vec![3, 53], "{sqlite}");
+}
+
+// ===== 0008（Plain）：jobs の名前付きの CHECK と analyze =====
+
+#[test]
+fn jobs_0008_keeps_rows_and_accepts_analyze() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, 7).unwrap();
+    let before = snapshot(&conn);
+    migrate_until(&mut conn, 8).unwrap();
+    assert_eq!(MIGRATIONS[7].name, "0008_jobs_named_checks");
+    assert_eq!(snapshot(&conn), before);
+    conn.execute(
+        "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('analyze', 'queued', '{}', 1)",
+        [],
+    )
+    .unwrap();
+    for (sql, name) in [
+        (
+            "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('edit', 'queued', '{}', 1)",
+            "jobs_kind",
+        ),
+        (
+            "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('import', 'x', '{}', 1)",
+            "jobs_state",
+        ),
+    ] {
+        let err = conn.execute(sql, []).unwrap_err().to_string();
+        assert!(err.contains(name), "{sql}: {err}");
+    }
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT id FROM jobs WHERE state = 'queued' ORDER BY priority DESC, created_at LIMIT 1",
+    );
+    assert!(plan.contains("idx_jobs_queue"), "{plan}");
+}
+
+// ===== 0009（Plain）：media_facts・analysis_results・asset_settings =====
+
+#[test]
+fn analysis_0009_adds_tables_and_keeps_everything_else() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, 8).unwrap();
+    let before = snapshot(&conn);
+    migrate_until(&mut conn, 9).unwrap();
+    assert_eq!(MIGRATIONS[8].name, "0009_analysis");
+    let after = snapshot(&conn);
+    for (key, value) in &before {
+        assert_eq!(after.get(key), Some(value), "{key} が変わった");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(
+        added,
+        vec![
+            "index idx_asset_settings_loop",
+            "index idx_asset_settings_pixel_art",
+            "index idx_media_facts_alpha",
+            "index idx_media_facts_colors",
+            "index idx_media_facts_loop",
+            "index idx_media_facts_loudness",
+            "index idx_media_facts_pixel_art",
+            "index sqlite_autoindex_analysis_results_1",
+            "table analysis_results",
+            "table asset_settings",
+            "table media_facts",
+        ]
+    );
+    assert!(violations(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn fixture_fills_every_table_at_the_latest_version() {
+    // 新しい表も、準備で行を入れる（次に items や blobs を作り直すとき、子が残ることを確かめられるように）
+    let mut conn = filled_v6();
+    migrate(&mut conn).unwrap();
+    crate::db::testing::fill_latest(&conn);
+    for t in tables(&conn) {
+        let n: i64 = one(&conn, &format!("SELECT count(*) FROM \"{t}\""));
+        assert!(n > 0, "{t} が空");
+    }
+    assert!(violations(&conn).unwrap().is_empty());
+}
+
+#[test]
+fn facts_and_results_follow_the_blob_and_settings_follow_the_item() {
+    let mut conn = filled_v6();
+    migrate(&mut conn).unwrap();
+    crate::db::testing::fill_latest(&conn);
+    conn.execute("UPDATE items SET trashed_at = 99 WHERE id IN (1, 3)", [])
+        .unwrap();
+    // ゴミ箱を空にする順（items → 使われなくなった台帳の行。同じトランザクション）
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TEMP TABLE gone AS SELECT hash FROM items WHERE trashed_at IS NOT NULL;
+         DELETE FROM items WHERE trashed_at IS NOT NULL;
+         DELETE FROM blobs WHERE hash IN (SELECT hash FROM gone)
+           AND NOT EXISTS (SELECT 1 FROM items i WHERE i.hash = blobs.hash);
+         DROP TABLE gone;
+         COMMIT;",
+    )
+    .unwrap();
+    assert_eq!(one::<i64>(&conn, "SELECT count(*) FROM blobs"), 2);
+    // 中身ごとの事実と結果は台帳の行に付いて消え、アイテムごとの設定はアイテムに付いて消える
+    assert_eq!(one::<i64>(&conn, "SELECT count(*) FROM media_facts"), 2);
+    assert_eq!(
+        one::<i64>(&conn, "SELECT count(*) FROM analysis_results"),
+        2
+    );
+    assert_eq!(
+        one::<i64>(
+            &conn,
+            "SELECT count(*) FROM asset_settings WHERE item_id IN (1, 3)"
+        ),
+        0
+    );
+    assert!(violations(&conn).unwrap().is_empty());
+    // 試聴のループは start < end。片方だけ NULL は断る（NULL を含む比較は CHECK を通ってしまうので明示する）
+    for sql in [
+        "INSERT INTO asset_settings (item_id, loop_start, loop_end, updated_at) VALUES (4, 5, 5, 1)",
+        "INSERT INTO asset_settings (item_id, loop_start, updated_at) VALUES (4, 5, 1)",
+        "INSERT INTO asset_settings (item_id, loop_end, updated_at) VALUES (4, 5, 1)",
+        "INSERT INTO asset_settings (item_id, loop_start, loop_end, updated_at) VALUES (4, -1, 5, 1)",
+    ] {
+        let err = conn.execute(sql, []).unwrap_err().to_string();
+        assert!(err.contains("asset_settings_loop"), "{sql}: {err}");
+    }
+    for (sql, name) in [
+        (
+            "INSERT INTO asset_settings (item_id, pixel_art, updated_at) VALUES (4, 2, 1)",
+            "asset_settings_pixel_art",
+        ),
+        (
+            "INSERT INTO asset_settings (item_id, pixel_scale, updated_at) VALUES (4, 65, 1)",
+            "asset_settings_pixel_scale",
+        ),
+        (
+            "INSERT INTO asset_settings (item_id, frame_ms, updated_at) VALUES (4, 0, 1)",
+            "asset_settings_frame_ms",
+        ),
+        ("UPDATE media_facts SET state = 'x'", "media_facts_state"),
+        (
+            "UPDATE analysis_results SET encoding = 'x'",
+            "analysis_results_encoding",
+        ),
+    ] {
+        let err = conn.execute(sql, []).unwrap_err().to_string();
+        assert!(err.contains(name), "{sql}: {err}");
+    }
+    conn.execute(
+        "INSERT INTO asset_settings (item_id, loop_start, loop_end, updated_at) VALUES (4, 0, 5, 1)",
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
+fn ledger_and_facts_queries_use_their_indexes() {
+    let conn = crate::db::test_conn();
+    for (sql, want) in [
+        (
+            "SELECT coalesce(sum(size_bytes), 0) FROM blobs",
+            "COVERING INDEX idx_blobs_size",
+        ),
+        (
+            "SELECT hash, ext FROM blobs WHERE size_bytes = 10",
+            "idx_blobs_size",
+        ),
+        (
+            "SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE f.alpha > 0",
+            "idx_media_facts_alpha",
+        ),
+        (
+            "SELECT blob_id FROM media_facts WHERE alpha = 2",
+            "idx_media_facts_alpha",
+        ),
+        (
+            "SELECT blob_id FROM media_facts WHERE colors <= 16",
+            "idx_media_facts_colors",
+        ),
+        (
+            "SELECT blob_id FROM media_facts WHERE has_loop = 1",
+            "idx_media_facts_loop",
+        ),
+        (
+            "SELECT blob_id FROM media_facts WHERE pixel_art = 1",
+            "idx_media_facts_pixel_art",
+        ),
+        (
+            "SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id
+              WHERE f.loudness BETWEEN -20 AND -10",
+            "idx_media_facts_loudness",
+        ),
+        (
+            "SELECT item_id FROM asset_settings WHERE pixel_art = 1",
+            "idx_asset_settings_pixel_art",
+        ),
+        (
+            "SELECT item_id FROM asset_settings WHERE loop_start IS NOT NULL",
+            "idx_asset_settings_loop",
+        ),
+        (
+            "SELECT analysis, version FROM analysis_results WHERE blob_id = 1",
+            "sqlite_autoindex_analysis_results_1",
+        ),
+    ] {
+        let plan = crate::db::query_plan(&conn, sql);
+        assert!(plan.contains(want), "{sql}\n{plan}");
+    }
+    // 検索の条件（docs/data-model.md §4）：items の並びの索引を読み、事実は部分索引から作った集合で引く
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT i.id FROM items i WHERE i.trashed_at IS NULL
+           AND i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE f.alpha > 0)
+         ORDER BY i.imported_at DESC, i.id DESC",
+    );
+    assert!(
+        plan.contains("idx_media_facts_alpha") && !plan.contains("SCAN f"),
+        "{plan}"
+    );
+    assert!(!plan.contains("CORRELATED"), "{plan}");
+}
+
+#[test]
+fn tile_details_join_facts_and_settings_without_scanning() {
+    let conn = crate::db::test_conn();
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT i.id, i.analysis_state, i.thumb_rev, f.alpha, coalesce(s.pixel_art, f.pixel_art), f.frame_count,
+                f.has_loop OR s.loop_start IS NOT NULL
+           FROM items i
+           LEFT JOIN blobs b ON b.hash = i.hash
+           LEFT JOIN media_facts f ON f.blob_id = b.id
+           LEFT JOIN asset_settings s ON s.item_id = i.id
+          WHERE i.id IN (1, 2, 3)",
+    );
+    assert!(!plan.contains("SCAN"), "{plan}");
 }
