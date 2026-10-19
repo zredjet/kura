@@ -55,8 +55,8 @@ impl Pending {
     /// メディア情報を読み直す必要があるか（取り込みのときに読めなかった、M1 で取り込んだ、フォント・3D の情報がない、など）。
     fn needs_probe(&self) -> bool {
         match self.kind {
-            MediaKind::Image => self.width.is_none() || self.height.is_none(),
-            MediaKind::Video => self.width.is_none() || self.duration_ms.is_none(),
+            MediaKind::Image => unknown(self.width) || unknown(self.height),
+            MediaKind::Video => unknown(self.width) || self.duration_ms.is_none(),
             MediaKind::Audio => self.duration_ms.is_none(),
             MediaKind::Font | MediaKind::Model => !self.has_codec_info,
         }
@@ -65,6 +65,11 @@ impl Pending {
     fn route(&self) -> ThumbRoute {
         thumb_route(self.kind, &self.ext)
     }
+}
+
+/// 幅・高さが分からないか（空。ImageIO は SVG を 0×0 と読むので 0 も分からないとする）。
+fn unknown(v: Option<i64>) -> bool {
+    v.is_none_or(|v| v <= 0)
 }
 
 /// 1 件の終わり方。
@@ -599,7 +604,7 @@ fn apply(tx: &Connection, outcomes: &[Outcome]) -> Result<()> {
     let now = now_ms();
     let mut stmt = tx.prepare_cached(
         "UPDATE items SET
-           width = coalesce(width, ?3), height = coalesce(height, ?4),
+           width = coalesce(nullif(width, 0), ?3), height = coalesce(nullif(height, 0), ?4),
            duration_ms = coalesce(duration_ms, ?5), captured_at = coalesce(captured_at, ?6),
            codec_info = coalesce(codec_info, ?7), thumb_state = ?8, thumb_rev = thumb_rev + ?9,
            updated_at = ?10
@@ -945,8 +950,8 @@ mod tests {
         assert_eq!(proxy, vec!["not_needed"; 3]);
     }
 
-    /// エンジンの道：png は kura-engine で描き（透明があれば PNG）、読めた幅・高さを空欄に入れる。エンジンで読めないものは
-    /// ImageIO の道（偽物は JPEG）へ回し、理由をログに残す。
+    /// エンジンの道：png は kura-engine で描き（透明があれば PNG）、読めた幅・高さを空欄（と 0。ImageIO は SVG を 0×0 と読む）
+    /// に入れる。エンジンで読めないものは ImageIO の道（偽物は JPEG）へ回し、理由をログに残す。
     #[test]
     fn engine_route_fills_the_size_and_falls_back_to_imageio() {
         let dir = tempfile::tempdir().unwrap();
@@ -956,7 +961,7 @@ mod tests {
             1,
             "image",
             "png",
-            None,
+            Some(0),
             None,
             &test_png(300, 200, true),
         );
@@ -965,7 +970,7 @@ mod tests {
             2,
             "image",
             "png",
-            None,
+            Some(0),
             None,
             b"\x89PNG\r\n\x1a\n broken",
         );
