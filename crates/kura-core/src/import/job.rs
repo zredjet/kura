@@ -175,6 +175,8 @@ impl JobHandler for ImportHandler {
             }
             let end = batch_end(&files, cursor, self.batch_files, self.batch_bytes);
             let job_id = ctx.id();
+            // files/ に置いてから DB に書き終えるまで、ゴミ箱を空にする処理を待たせる（同じ中身を消されないように）
+            let ingest = library.ingest_guard();
             // コピー・ハッシュ・配置・メディア情報の読み取りは並列に（DB には触らない）
             let backend = self.backend.as_ref();
             let outcomes: Vec<(usize, PlaceOutcome)> = pool.install(|| {
@@ -236,6 +238,7 @@ impl JobHandler for ImportHandler {
                     tracing::warn!(%err, path = %path.display(), "不要なコピーを消せませんでした");
                 }
             }
+            drop(ingest);
             state = next;
             cursor = end;
             ctx.progress(fraction(cursor, total), &progress_message(cursor, total));

@@ -163,7 +163,10 @@ pub async fn reveal_path(path: String) -> Result<(), AppError> {
 pub async fn library_usage(state: State<'_, AppState>) -> Result<LibraryUsageDto, AppError> {
     let session = state.session()?;
     blocking(move || {
-        let library_bytes = session.library().db().read(kura_core::items::total_size)?;
+        let library_bytes = session
+            .library()
+            .db()
+            .read(kura_core::library::ledger::total_size)?;
         let volume = kura_mac::volume_capacity(session.library().layout().root());
         Ok(LibraryUsageDto {
             library_bytes,
@@ -182,10 +185,14 @@ pub async fn library_check(state: State<'_, AppState>) -> Result<IntegrityDto, A
     blocking(move || {
         let library = session.library();
         let (missing_files, orphan_files) = check_files(library.db(), library.layout())?;
+        let unreferenced_blobs = library
+            .db()
+            .read(kura_core::library::ledger::unreferenced)?;
         Ok(IntegrityDto {
             staging_removed: 0,
             missing_files,
             orphan_files,
+            unreferenced_blobs,
         })
     })
     .await

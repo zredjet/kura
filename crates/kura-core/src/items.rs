@@ -757,13 +757,6 @@ pub fn detail(conn: &Connection, id: i64) -> Result<ItemDetail> {
     })
 }
 
-/// ライブラリのファイルの合計サイズ（ゴミ箱を含む。ファイルはゴミ箱を空にするまで残るので）。
-pub fn total_size(conn: &Connection) -> Result<u64> {
-    let mut stmt = conn.prepare_cached("SELECT coalesce(sum(size_bytes), 0) FROM items")?;
-    let total: i64 = stmt.query_row([], |row| row.get(0))?;
-    Ok(u64::try_from(total).unwrap_or(0))
-}
-
 /// 複数選択のインスペクタに出す集計。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectionInfo {
@@ -926,7 +919,7 @@ pub fn restore(conn: &Connection, ids: &[i64], now: i64) -> Result<usize> {
     Ok(n)
 }
 
-/// ゴミ箱を空にするときに消したアイテム（実ファイルを消すのに使う）。
+/// ゴミ箱を空にするときに消したアイテム。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedItem {
     pub hash: [u8; 32],
@@ -934,8 +927,25 @@ pub struct RemovedItem {
     pub size_bytes: i64,
 }
 
-/// ゴミ箱のアイテムの行を消し、消したものを返す（実ファイルは `Library::empty_trash` が消す）。
-pub fn delete_trashed(conn: &Connection) -> Result<Vec<RemovedItem>> {
+/// ゴミ箱を空にした DB の側の結果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrashDeleted {
+    /// 消したアイテム。
+    pub items: Vec<RemovedItem>,
+    /// 使われなくなって解放した台帳の行（このファイルと派生のファイルを、コミットのあとで消す）。
+    pub released: Vec<crate::library::ledger::ReleasedBlob>,
+}
+
+/// ゴミ箱のアイテムの行を消し、使われなくなった台帳の行を同じトランザクションで解放する（docs/data-model.md §4。
+/// 中身ごとの事実・結果は CASCADE で消える）。実ファイルと派生のファイルは `Library::empty_trash` がコミットのあとで消す。
+pub fn delete_trashed(conn: &Connection) -> Result<TrashDeleted> {
+    let items = delete_trashed_rows(conn)?;
+    let hashes: Vec<[u8; 32]> = items.iter().map(|item| item.hash).collect();
+    let released = crate::library::ledger::release(conn, &hashes)?;
+    Ok(TrashDeleted { items, released })
+}
+
+fn delete_trashed_rows(conn: &Connection) -> Result<Vec<RemovedItem>> {
     let removed: Vec<RemovedItem> = {
         let mut stmt = conn.prepare_cached(
             "SELECT hash, ext, size_bytes FROM items WHERE trashed_at IS NOT NULL",
@@ -989,17 +999,6 @@ mod tests {
             rusqlite::params![id, vec![id as u8; 32], w, h, format!("t{id}"), at],
         )
         .unwrap();
-    }
-
-    #[test]
-    fn total_size_counts_every_item_including_the_trash() {
-        let conn = test_conn();
-        assert_eq!(total_size(&conn).unwrap(), 0);
-        insert(&conn, 1, None, None, 1);
-        insert(&conn, 2, None, None, 2);
-        conn.execute("UPDATE items SET trashed_at = 5 WHERE id = 2", [])
-            .unwrap();
-        assert_eq!(total_size(&conn).unwrap(), 20);
     }
 
     #[test]
@@ -1346,8 +1345,19 @@ mod tests {
         assert_eq!(detail(&conn, 1).unwrap().trashed_at, Some(5));
 
         let removed = delete_trashed(&conn).unwrap();
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].hash, [1u8; 32]);
+        assert_eq!(removed.items.len(), 1);
+        assert_eq!(removed.items[0].hash, [1u8; 32]);
+        // 使われなくなった台帳の行も同じトランザクションで解放する
+        assert_eq!(removed.released.len(), 1);
+        assert_eq!(removed.released[0].hash, [1u8; 32]);
+        let ledger: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM blobs WHERE hash = ?1",
+                [&[1u8; 32][..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledger, 0);
         assert!(matches!(detail(&conn, 1), Err(CoreError::NotFound(_))));
         // 所属（フォルダ・タグ・ユニット）も消え、ユニットには残りがいる
         let left: i64 = conn

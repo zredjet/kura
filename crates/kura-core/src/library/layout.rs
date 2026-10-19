@@ -39,9 +39,32 @@ impl ThumbSize {
     }
 }
 
+/// サムネイルの入れ物（透明のないものは JPEG、透明のあるものは PNG。docs/data-model.md §1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ThumbFormat {
+    Jpeg,
+    Png,
+}
+
+impl ThumbFormat {
+    /// すべての入れ物（ゴミ箱を空にするときに、どちらも消す）。
+    pub const ALL: [Self; 2] = [Self::Jpeg, Self::Png];
+
+    /// 拡張子（`jpg` / `png`）。
+    pub fn ext(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Png => "png",
+        }
+    }
+}
+
+/// アニメの帯の形式の版（`anim/ab/<hash>-<版>.png`。形を変えたら上げる）。
+pub const ANIM_V: u32 = 1;
+
 /// ライブラリの中に作るフォルダ。
-pub const SUBDIRS: [&str; 8] = [
-    "files", "thumbs", "art", "proxies", "staging", "archives", "logs", "backups",
+pub const SUBDIRS: [&str; 10] = [
+    "files", "thumbs", "art", "proxies", "peaks", "anim", "staging", "archives", "logs", "backups",
 ];
 
 /// ライブラリ内の各パスを組み立てる。
@@ -110,13 +133,53 @@ impl Layout {
         )
     }
 
-    /// サムネイル（`thumbs/ab/<hash>_s.jpg`・`_l.jpg`）。
+    /// JPEG のサムネイル（`thumbs/ab/<hash>_s.jpg`・`_l.jpg`）。
     pub fn thumb_path(&self, hash_hex: &str, size: ThumbSize) -> PathBuf {
+        self.thumb_path_as(hash_hex, size, ThumbFormat::Jpeg)
+    }
+
+    /// `format` のサムネイル（`thumbs/ab/<hash>_{s,l}.{jpg,png}`）。
+    pub fn thumb_path_as(&self, hash_hex: &str, size: ThumbSize, format: ThumbFormat) -> PathBuf {
+        let a = hash_hex.get(0..2).unwrap_or("00");
+        self.root.join("thumbs").join(a).join(format!(
+            "{hash_hex}_{}.{}",
+            size.suffix(),
+            format.ext()
+        ))
+    }
+
+    /// 音声の波形の段（`peaks/ab/<hash>.peaks`。解析のジョブが書く）。
+    pub fn peaks_path(&self, hash_hex: &str) -> PathBuf {
         let a = hash_hex.get(0..2).unwrap_or("00");
         self.root
-            .join("thumbs")
+            .join("peaks")
             .join(a)
-            .join(format!("{hash_hex}_{}.jpg", size.suffix()))
+            .join(format!("{hash_hex}.peaks"))
+    }
+
+    /// アニメの帯（`anim/ab/<hash>-1.png`。見たときにその場で作る）。
+    pub fn anim_path(&self, hash_hex: &str) -> PathBuf {
+        let a = hash_hex.get(0..2).unwrap_or("00");
+        self.root
+            .join("anim")
+            .join(a)
+            .join(format!("{hash_hex}-{ANIM_V}.png"))
+    }
+
+    /// 中身から作ったファイルのすべて（サムネイルの jpg・png、ジャケット、プロキシ、波形、アニメの帯）。
+    /// 台帳の行を解放したら、実ファイルと一緒に消す。派生のファイルを足したら、ここにも足す。
+    pub fn derived_paths(&self, hash_hex: &str) -> Vec<PathBuf> {
+        let mut out = Vec::with_capacity(8);
+        for size in [ThumbSize::Small, ThumbSize::Large] {
+            for format in ThumbFormat::ALL {
+                out.push(self.thumb_path_as(hash_hex, size, format));
+            }
+        }
+        out.push(self.art_path(hash_hex));
+        out.push(self.proxy_path(hash_hex));
+        out.push(self.peaks_path(hash_hex));
+        out.push(self.anim_path(hash_hex));
+        out
     }
 
     /// 音楽のジャケット（`art/ab/<hash>.jpg`）。
@@ -208,6 +271,40 @@ mod tests {
         );
         assert_eq!(ThumbSize::parse("l"), Some(ThumbSize::Large));
         assert_eq!(ThumbSize::Small.max_px(), 512);
+    }
+
+    #[test]
+    fn derived_paths_cover_every_file_made_from_the_content() {
+        let layout = Layout::new("/lib/L.kuralib");
+        let hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let rel: Vec<String> = layout
+            .derived_paths(hex)
+            .iter()
+            .map(|p| {
+                p.strip_prefix("/lib/L.kuralib")
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            rel,
+            vec![
+                format!("thumbs/ab/{hex}_s.jpg"),
+                format!("thumbs/ab/{hex}_s.png"),
+                format!("thumbs/ab/{hex}_l.jpg"),
+                format!("thumbs/ab/{hex}_l.png"),
+                format!("art/ab/{hex}.jpg"),
+                format!("proxies/ab/{hex}.mp4"),
+                format!("peaks/ab/{hex}.peaks"),
+                format!("anim/ab/{hex}-1.png"),
+            ]
+        );
+        // どれもライブラリの中に作るフォルダの下にある
+        for p in &rel {
+            let top = p.split('/').next().unwrap();
+            assert!(SUBDIRS.contains(&top), "{p}");
+        }
     }
 
     #[test]

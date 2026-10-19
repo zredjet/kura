@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use super::Library;
 use super::backup;
 use super::integrity::{IntegrityReport, check_files, clean_staging};
+use super::ledger;
 use crate::Result;
 use crate::capture::CaptureHandler;
 use crate::download::{DownloadHandler, work_dir_name};
@@ -97,11 +98,15 @@ impl LibrarySession {
         let startup = std::thread::Builder::new()
             .name("kura-startup".into())
             .spawn(move || {
-                let report = match check_files(lib.db(), lib.layout()) {
-                    Ok((missing_files, orphan_files)) => IntegrityReport {
+                let checked = check_files(lib.db(), lib.layout()).and_then(|(missing, orphans)| {
+                    Ok((missing, orphans, lib.db().read(ledger::unreferenced)?))
+                });
+                let report = match checked {
+                    Ok((missing_files, orphan_files, unreferenced_blobs)) => IntegrityReport {
                         staging_removed,
                         missing_files,
                         orphan_files,
+                        unreferenced_blobs,
                     },
                     Err(err) => {
                         tracing::warn!(%err, "整合性チェックに失敗しました");
@@ -111,7 +116,10 @@ impl LibrarySession {
                         }
                     }
                 };
-                if report.missing_files > 0 || report.orphan_files > 0 {
+                if report.missing_files > 0
+                    || report.orphan_files > 0
+                    || report.unreferenced_blobs > 0
+                {
                     tracing::warn!(?report, "DB とファイルに食い違いがあります");
                 } else {
                     tracing::info!(?report, "整合性チェックが終わりました");

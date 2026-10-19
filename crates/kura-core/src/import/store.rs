@@ -95,25 +95,6 @@ pub fn restore_item(conn: &Connection, id: i64, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// 同じサイズのアイテムの (ハッシュ, 拡張子)。重複の見込みに使う。
-pub fn hashes_by_size(conn: &Connection, size: u64) -> Result<Vec<([u8; 32], String)>> {
-    let Ok(size) = i64::try_from(size) else {
-        return Ok(Vec::new());
-    };
-    let mut stmt = conn.prepare_cached("SELECT hash, ext FROM items WHERE size_bytes = ?1")?;
-    let rows = stmt.query_map([size], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (hash, ext) = row?;
-        if let Ok(hash) = <[u8; 32]>::try_from(hash.as_slice()) {
-            out.push((hash, ext));
-        }
-    }
-    Ok(out)
-}
-
 /// 仮想フォルダがあるか。
 pub fn folder_exists(conn: &Connection, id: i64) -> Result<bool> {
     let mut stmt = conn.prepare_cached("SELECT 1 FROM folders WHERE id = ?1")?;
@@ -279,11 +260,16 @@ mod tests {
         restore_item(&conn, id, 200).unwrap();
         assert!(!find_by_hash(&conn, &hash).unwrap().unwrap().trashed);
 
+        // 台帳にも載る（重複の見込みは台帳から引く。library::ledger::candidates_by_size）
         assert_eq!(
-            hashes_by_size(&conn, 42).unwrap(),
+            crate::library::ledger::candidates_by_size(&conn, 42).unwrap(),
             vec![(hash, "jpg".into())]
         );
-        assert!(hashes_by_size(&conn, 41).unwrap().is_empty());
+        assert!(
+            crate::library::ledger::candidates_by_size(&conn, 41)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

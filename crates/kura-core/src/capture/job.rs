@@ -118,6 +118,8 @@ pub fn register_png(
         meta: meta.clone(),
     };
     let job_id = job.as_ref().map_or(0, |(id, _)| *id);
+    // files/ に置いてから DB に書き終えるまで、ゴミ箱を空にする処理を待たせる（同じ中身を消されないように）
+    let _ingest = library.ingest_guard();
     let placed = place_all(
         library.layout(),
         backend,
