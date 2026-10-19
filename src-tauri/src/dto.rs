@@ -389,6 +389,8 @@ pub enum JobKindDto {
     Download,
     Capture,
     Export,
+    /// 解析（M11。画像・音声の事実と波形。取り込み・サムネイルに譲る）。
+    Analyze,
 }
 
 impl From<JobKind> for JobKindDto {
@@ -400,6 +402,7 @@ impl From<JobKind> for JobKindDto {
             JobKind::Download => Self::Download,
             JobKind::Capture => Self::Capture,
             JobKind::Export => Self::Export,
+            JobKind::Analyze => Self::Analyze,
         }
     }
 }
@@ -413,6 +416,7 @@ impl From<JobKindDto> for JobKind {
             JobKindDto::Download => Self::Download,
             JobKindDto::Capture => Self::Capture,
             JobKindDto::Export => Self::Export,
+            JobKindDto::Analyze => Self::Analyze,
         }
     }
 }
