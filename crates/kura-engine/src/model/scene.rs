@@ -391,7 +391,7 @@ pub fn load_scene(
 ) -> Result<Scene, EngineError> {
     let glb = gltf::parse(bytes, limits)?;
     let root = &glb.root;
-    let info = info_of(root)?;
+    let info = info_of(root, limits)?;
     if !info.unsupported.is_empty() {
         return Err(EngineError::Unsupported(format!(
             "描けない 3D モデルです（{}）",
@@ -408,12 +408,6 @@ pub fn load_scene(
         return Err(EngineError::Limit(format!(
             "三角形が多すぎます（{}）",
             info.triangles
-        )));
-    }
-    if info.parts > limits.max_parts {
-        return Err(EngineError::Limit(format!(
-            "プリミティブが多すぎます（{}）",
-            info.parts
         )));
     }
     let mut scene = Scene::default();
@@ -539,15 +533,17 @@ fn add_primitive(
         .saturating_sub(scene.positions.len() as u64);
     let positions = gltf::read_floats::<3>(root, bin, pos_index, [0.0; 3], room)?;
     let count = positions.len();
+    // 属性は頂点と同じ数だけ（多いものは確保の前に断って、属性なしとして扱う）
+    let same = count as u64;
     let read_opt = |name: &str| p.attributes.get(name).copied();
     let normals = match read_opt("NORMAL") {
-        Some(i) => gltf::read_floats::<3>(root, bin, i, [0.0; 3], room)
+        Some(i) => gltf::read_floats::<3>(root, bin, i, [0.0; 3], same)
             .ok()
             .filter(|n| n.len() == count),
         None => None,
     };
     let colors = match read_opt("COLOR_0") {
-        Some(i) => gltf::read_floats::<4>(root, bin, i, [1.0; 4], room)
+        Some(i) => gltf::read_floats::<4>(root, bin, i, [1.0; 4], same)
             .ok()
             .filter(|c| c.len() == count),
         None => None,
@@ -562,7 +558,7 @@ fn add_primitive(
         .copied()
         .unwrap_or_default();
     let uvs = match (mat.texture, read_opt(&format!("TEXCOORD_{}", mat.uv_set))) {
-        (Some(_), Some(i)) => gltf::read_floats::<2>(root, bin, i, [0.0; 2], room)
+        (Some(_), Some(i)) => gltf::read_floats::<2>(root, bin, i, [0.0; 2], same)
             .ok()
             .filter(|u| u.len() == count),
         _ => None,

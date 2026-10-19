@@ -319,6 +319,28 @@ fn limits_are_checked_before_allocating() {
         ..limits.clone()
     };
     assert!(matches!(read_info(&many, &few), Err(EngineError::Limit(_))));
+    // 同じメッシュを指すノードが多いと、実体 × プリミティブの数を数える手間で断る（数え終える前に）
+    let mut b = GlbBuilder::new();
+    let pos = b.floats(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], "VEC3");
+    let mesh = b.mesh(vec![json!({ "attributes": { "POSITION": pos } }); 10]);
+    for _ in 0..300 {
+        let n = b.node(json!({ "mesh": mesh }));
+        b.root(n);
+    }
+    let shared = b.build();
+    assert_eq!(read_info(&shared, &limits).unwrap().parts, 3_000);
+    let parts = ModelLimits {
+        max_parts: 1_000,
+        ..limits.clone()
+    };
+    assert!(matches!(
+        read_info(&shared, &parts),
+        Err(EngineError::Limit(_))
+    ));
+    assert!(matches!(
+        load_scene(&shared, &parts, &NoMonitor),
+        Err(EngineError::Limit(_))
+    ));
     // ファイルの大きさ・頂点・三角形
     let tiny = ModelLimits {
         max_file_bytes: 64,

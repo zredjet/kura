@@ -104,10 +104,12 @@ pub(crate) fn triangle_count(mode: u32, n: u64) -> u64 {
 /// glb の情報を読む（JSON の塊だけ）。
 pub fn read_info(bytes: &[u8], limits: &ModelLimits) -> Result<ModelInfo, EngineError> {
     let glb = gltf::parse(bytes, limits)?;
-    info_of(&glb.root)
+    info_of(&glb.root, limits)
 }
 
-pub(crate) fn info_of(root: &Root) -> Result<ModelInfo, EngineError> {
+/// 情報を数える。描くプリミティブの実体（ノードの実体 × プリミティブ）が `max_parts` を超えたら、数える手間が大きすぎる
+/// ので `Limit`（同じメッシュを指すノードが多いと、ノードとプリミティブの数の積になる）。
+pub(crate) fn info_of(root: &Root, limits: &ModelLimits) -> Result<ModelInfo, EngineError> {
     let mut info = ModelInfo {
         meshes: count(root.meshes.len()),
         materials: count(root.materials.len()),
@@ -149,6 +151,12 @@ pub(crate) fn info_of(root: &Root) -> Result<ModelInfo, EngineError> {
                 continue;
             };
             info.parts = info.parts.saturating_add(1);
+            if info.parts > limits.max_parts {
+                return Err(EngineError::Limit(format!(
+                    "描くプリミティブの実体が多すぎます（{} を超える）",
+                    limits.max_parts
+                )));
+            }
             info.vertices = info.vertices.saturating_add(pos.count);
             let n = p
                 .indices
