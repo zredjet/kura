@@ -31,9 +31,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kura_core::download::{CookieSource, DownloadInput, DownloadOptions, detect, start_download};
+use kura_core::edit::{CodecSet, EngineFactory, RuntimeConfig};
 use kura_core::import::{ImportInput, ImportOptions, start_import};
 use kura_core::jobs::{EventSink, JobFilter, JobKind, JobState};
-use kura_core::library::{LibrarySession, check_files};
+use kura_core::library::{LibrarySession, Services, UpgradeEvent, UpgradeHooks, check_files};
 
 const USAGE: &str = "使い方: kura-devtools import --library <path> [--create] [<src>...] | \
                      download --library <path> <url>... | check --library <path> | \
@@ -91,6 +92,37 @@ fn parse(args: &[String]) -> Result<Args, String> {
     })
 }
 
+/// アプリ（src-tauri の `MacEngineFactory`）と同じエンジンの部品の作り方：物理メモリは kura-mac、コーデックの組は固定の段
+/// （SVG の文字はシステムのフォント）→ macOS → ffmpeg。
+struct MacEngineFactory;
+
+impl EngineFactory for MacEngineFactory {
+    fn runtime_config(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            physical_memory: kura_mac::physical_memory(),
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn codecs(&self, work_dir: &std::path::Path) -> CodecSet {
+        kura_mac::full_codec_set(&kura_mac::pinned_options(), work_dir)
+    }
+}
+
+/// アプリと同じ渡しもの（メディアの実装・エンジンの部品・DB を新しい版にするときの空きの確かめ）。知らせはログに出す。
+fn services() -> Services {
+    Services::new(kura_mac::media_backend())
+        .with_engine(Arc::new(MacEngineFactory))
+        .with_upgrade(UpgradeHooks {
+            free_space: Some(Arc::new(|path: &std::path::Path| {
+                kura_mac::volume_capacity(path).map(|v| v.available_bytes)
+            })),
+            notify: Some(Arc::new(|event: &UpgradeEvent| {
+                tracing::info!(?event, "ライブラリの DB の更新");
+            })),
+        })
+}
+
 fn progress_sink() -> EventSink {
     Arc::new(|event| {
         tracing::info!(
@@ -105,7 +137,7 @@ fn progress_sink() -> EventSink {
 /// URL を取得してライブラリに入れる（アプリと同じダウンロードのジョブ。既定の選択で）。
 fn download(args: &[String]) -> Result<(), String> {
     let args = parse(args)?;
-    let session = LibrarySession::open(&args.library, progress_sink(), kura_mac::media_backend())
+    let session = LibrarySession::open(&args.library, progress_sink(), services())
         .map_err(|e| e.to_string())?;
     session.wait_ready();
     for url in &args.sources {
@@ -152,9 +184,9 @@ fn download(args: &[String]) -> Result<(), String> {
 fn import(args: &[String]) -> Result<(), String> {
     let args = parse(args)?;
     let session = if args.create {
-        LibrarySession::create(&args.library, progress_sink(), kura_mac::media_backend())
+        LibrarySession::create(&args.library, progress_sink(), services())
     } else {
-        LibrarySession::open(&args.library, progress_sink(), kura_mac::media_backend())
+        LibrarySession::open(&args.library, progress_sink(), services())
     }
     .map_err(|e| e.to_string())?;
 
@@ -194,7 +226,7 @@ fn import(args: &[String]) -> Result<(), String> {
 
 fn check(args: &[String]) -> Result<(), String> {
     let args = parse(args)?;
-    let session = LibrarySession::open(&args.library, progress_sink(), kura_mac::media_backend())
+    let session = LibrarySession::open(&args.library, progress_sink(), services())
         .map_err(|e| e.to_string())?;
     session.wait_ready();
     report(&session)
@@ -216,4 +248,63 @@ fn report(session: &LibrarySession) -> Result<(), String> {
         "ライブラリの状態"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use kura_engine::doc::DecodeOptions;
+    use kura_engine::{Limits, NoMonitor, Value};
+
+    use super::*;
+
+    /// 開く道はアプリと同じ部品を渡す：エンジンはライブラリごとに、使うまで作らない。作ると、予算は物理メモリから決まり、
+    /// コーデックの組は macOS の段と、システムのフォント（文字を含む SVG を読める）を持つ。
+    #[test]
+    fn sessions_get_the_same_engine_as_the_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = LibrarySession::create(&dir.path().join("L"), progress_sink(), services())
+            .expect("ライブラリを作る");
+        session.wait_ready();
+        let engine = session.engine().expect("エンジンの部品");
+        assert_eq!(
+            engine.work_dir(),
+            dir.path().join("L.kuralib/staging/engine")
+        );
+        assert!(engine.runtime_if_built().is_none());
+        assert!(engine.codecs_if_built().is_none());
+
+        let runtime = engine.runtime().unwrap();
+        assert_eq!(
+            runtime.budget().total(),
+            kura_engine::budget::default_total(kura_mac::physical_memory())
+        );
+        let codecs = engine.codecs();
+        if cfg!(target_os = "macos") {
+            let heic = codecs
+                .capabilities()
+                .into_iter()
+                .find(|c| c.format == "heic")
+                .unwrap();
+            assert!(
+                heic.read
+                    .iter()
+                    .any(|r| r.codec == kura_mac::codec::IMAGEIO_DEC),
+                "{:?}",
+                heic.read
+            );
+            let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40"><text x="4" y="30" font-family="sans-serif" font-size="24">Kq</text></svg>"##;
+            let (value, _) = codecs
+                .decode(
+                    &mut Cursor::new(svg.as_bytes().to_vec()),
+                    "svg",
+                    &DecodeOptions::default(),
+                    &Limits::default(),
+                    &NoMonitor,
+                )
+                .expect("文字を含む SVG を読める");
+            assert!(matches!(value, Value::Image(_)));
+        }
+    }
 }

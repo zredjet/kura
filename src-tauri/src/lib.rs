@@ -3,6 +3,7 @@
 mod commands;
 mod config;
 mod dto;
+mod engine;
 mod error;
 mod logging;
 mod navigation;
@@ -157,7 +158,11 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::playlists::playlist_regenerate,
             commands::playlists::playlist_save_state,
         ])
-        .events(collect_events![dto::JobProgress, dto::LoginShotEvent])
+        .events(collect_events![
+            dto::JobProgress,
+            dto::LoginShotEvent,
+            dto::LibraryUpgradeEvent
+        ])
         // ジョブの結果（resultJson）を読むための型
         .typ::<dto::ImportResultDto>()
         .typ::<dto::ExportResultDto>()

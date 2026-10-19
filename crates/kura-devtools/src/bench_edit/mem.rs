@@ -293,7 +293,7 @@ pub(super) fn child(opts: &Opts, spec: &str) -> Result<(), String> {
         "base-codecs" => {
             // 保存の子と同じ準備（アプリのコーデックの組を作る）まで
             let codecs = kura_mac::full_codec_set(
-                &kura_engine::codec::PinnedOptions::default(),
+                &kura_mac::pinned_options(),
                 &std::env::temp_dir().join("kura-bench-edit-codec"),
             );
             report(case, "base", 0, budget, "");
@@ -312,7 +312,7 @@ pub(super) fn child(opts: &Opts, spec: &str) -> Result<(), String> {
                 None => "jpeg",
             };
             let codecs = kura_mac::full_codec_set(
-                &kura_engine::codec::PinnedOptions::default(),
+                &kura_mac::pinned_options(),
                 &std::env::temp_dir().join("kura-bench-edit-codec"),
             );
             let graph = save_doc("lanczos3").map_err(|e| e.to_string())?;

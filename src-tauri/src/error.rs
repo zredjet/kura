@@ -1,10 +1,10 @@
 //! フロントへ返すエラー（`AppError`）。
 
-use kura_core::CoreError;
-use serde::Serialize;
+use kura_core::{CoreError, UpgradeError};
+use serde::{Deserialize, Serialize};
 
 /// エラーの種類。フロントはこの値で分岐する（`docs/architecture.md` §3）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub enum AppErrorCode {
     NotFound,
     InvalidQuery,
@@ -17,10 +17,19 @@ pub enum AppErrorCode {
     Conflict,
     /// アプリ内部の想定外の失敗。
     Internal,
+    /// ライブラリが新しい版の Kura で作られている（開けない。Kura を新しくする）。
+    LibraryTooNew,
+    /// ディスクの空きが足りず、ライブラリを新しい版にできない（当てる前の見積もり・バックアップ・当てる途中）。
+    /// ライブラリは前の版のまま。
+    NoSpace,
+    /// ライブラリを新しい版にする前のバックアップを作れない（ライブラリは変えていない）。
+    BackupFailed,
+    /// ライブラリを新しい版にできない（戻した。ライブラリは前の版のまま）。
+    UpgradeFailed,
 }
 
 /// コマンドが返すエラー。JSON では `{ code, message }` になる。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type, thiserror::Error)]
 #[error("{code:?}: {message}")]
 pub struct AppError {
     pub code: AppErrorCode,
@@ -52,10 +61,22 @@ impl From<CoreError> for AppError {
             CoreError::Db(_) | CoreError::Json(_) | CoreError::DbClosed => AppErrorCode::Db,
             CoreError::ToolMissing(_) => AppErrorCode::ToolMissing,
             CoreError::Tool(_) => AppErrorCode::ToolFailed,
-            // ライブラリを新しい版にできなかった（文言は CoreError が持つ。docs/data-model.md §5）
-            CoreError::Upgrade(_) => AppErrorCode::Db,
+            // ライブラリを新しい版にできなかった（種類でフロントが文言を選ぶ。説明は CoreError が持つ。docs/data-model.md §5）
+            CoreError::Upgrade(err) => upgrade_code(err),
         };
         Self::new(code, err.to_string())
+    }
+}
+
+/// ライブラリを新しい版にできなかった理由の種類。
+fn upgrade_code(err: &UpgradeError) -> AppErrorCode {
+    match err {
+        UpgradeError::Newer { .. } => AppErrorCode::LibraryTooNew,
+        UpgradeError::NoSpace { .. }
+        | UpgradeError::BackupNoSpace { .. }
+        | UpgradeError::ApplyNoSpace { .. } => AppErrorCode::NoSpace,
+        UpgradeError::Backup { .. } => AppErrorCode::BackupFailed,
+        UpgradeError::Apply { .. } => AppErrorCode::UpgradeFailed,
     }
 }
 
@@ -83,6 +104,62 @@ mod tests {
         assert_eq!(err.code, AppErrorCode::Invalid);
         let err: AppError = CoreError::DbClosed.into();
         assert_eq!(err.code, AppErrorCode::Db);
+    }
+
+    /// ライブラリを新しい版にできなかった理由は、フロントが文言を選べる種類と、分かる説明で返す。
+    #[test]
+    fn upgrade_errors_have_their_own_codes() {
+        let cases = [
+            (
+                UpgradeError::Newer {
+                    found: 12,
+                    supported: 9,
+                },
+                AppErrorCode::LibraryTooNew,
+                "新しい版の Kura",
+            ),
+            (
+                UpgradeError::NoSpace {
+                    needed: 300_000_000,
+                    available: 1,
+                },
+                AppErrorCode::NoSpace,
+                "空き容量",
+            ),
+            (
+                UpgradeError::BackupNoSpace { detail: "x".into() },
+                AppErrorCode::NoSpace,
+                "空き容量",
+            ),
+            (
+                UpgradeError::ApplyNoSpace {
+                    migration: "0007_blobs_and_kinds".into(),
+                    detail: "x".into(),
+                },
+                AppErrorCode::NoSpace,
+                "前の版のまま",
+            ),
+            (
+                UpgradeError::Backup { detail: "x".into() },
+                AppErrorCode::BackupFailed,
+                "バックアップ",
+            ),
+            (
+                UpgradeError::Apply {
+                    migration: "0007_blobs_and_kinds".into(),
+                    detail: "x".into(),
+                },
+                AppErrorCode::UpgradeFailed,
+                "0007_blobs_and_kinds",
+            ),
+        ];
+        for (err, code, words) in cases {
+            let app: AppError = CoreError::Upgrade(err).into();
+            assert_eq!(app.code, code);
+            assert!(app.message.contains(words), "{}", app.message);
+        }
+        let json = serde_json::to_value(AppErrorCode::NoSpace).unwrap();
+        assert_eq!(json, serde_json::json!("NoSpace"));
     }
 
     #[test]

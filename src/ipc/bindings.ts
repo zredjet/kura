@@ -13,9 +13,16 @@ export const commands = {
 	libraryCheckLocation: (path: string) => typedError<LocationCheckDto, AppError>(__TAURI_INVOKE("library_check_location", { path })),
 	/**  新しいライブラリを作って開く。 */
 	libraryCreate: (path: string) => typedError<LibraryInfoDto, AppError>(__TAURI_INVOKE("library_create", { path })),
-	/**  既存のライブラリを開く。 */
+	/**
+	 *  既存のライブラリを開く。新しい版にするときは、始まり・終わり・失敗をイベント `library://upgrade` で知らせる。開けなければ
+	 *  理由の種類（`LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` など）と説明を返す。
+	 */
 	libraryOpen: (path: string) => typedError<LibraryInfoDto, AppError>(__TAURI_INVOKE("library_open", { path })),
-	/**  起動時に前回のライブラリを開く。開けなければ `info` は空で、前回の場所だけ返す。 */
+	/**
+	 *  起動時に前回のライブラリ（`KURA_LIBRARY` があればそれ）を開く。前回の場所が見つからなければ `info` も `error` も空で、
+	 *  前回の場所だけ返す。開けなければ `error` に理由（`library_open` と同じ種類）を入れて返す（失敗にはしない）。
+	 *  新しい版にするときは、始まり・終わり・失敗をイベント `library://upgrade` で知らせる。
+	 */
 	libraryRestore: () => typedError<LibraryRestoreDto, AppError>(__TAURI_INVOKE("library_restore")),
 	/**  開いているライブラリの概要。 */
 	libraryInfo: () => typedError<LibraryInfoDto, AppError>(__TAURI_INVOKE("library_info")),
@@ -253,6 +260,7 @@ export const commands = {
 export const events = {
 	captureLoginShot: makeEvent<LoginShotEvent>("capture://login-shot"),
 	jobProgress: makeEvent<JobProgress>("job://progress"),
+	libraryUpgrade: makeEvent<LibraryUpgradeEvent>("library://upgrade"),
 };
 
 /* Types */
@@ -276,7 +284,18 @@ export type AppErrorCode = "NotFound" | "InvalidQuery" | "Invalid" | "ToolMissin
 /**  外部ツールが失敗した。 */
 "ToolFailed" | "Io" | "Db" | "Conflict" | 
 /**  アプリ内部の想定外の失敗。 */
-"Internal";
+"Internal" | 
+/**  ライブラリが新しい版の Kura で作られている（開けない。Kura を新しくする）。 */
+"LibraryTooNew" | 
+/**
+ *  ディスクの空きが足りず、ライブラリを新しい版にできない（当てる前の見積もり・バックアップ・当てる途中）。
+ *  ライブラリは前の版のまま。
+ */
+"NoSpace" | 
+/**  ライブラリを新しい版にする前のバックアップを作れない（ライブラリは変えていない）。 */
+"BackupFailed" | 
+/**  ライブラリを新しい版にできない（戻した。ライブラリは前の版のまま）。 */
+"UpgradeFailed";
 
 /**  OS の表示設定。 */
 export type Appearance = {
@@ -711,11 +730,46 @@ export type LibraryInfoDto = {
 	integrity: IntegrityDto | null,
 };
 
-/**  前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかった。 */
+/**
+ *  前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかったか（`error` が空）、
+ *  開けなかった（`error` に理由。`code` は `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` など）。
+ */
 export type LibraryRestoreDto = {
 	info: LibraryInfoDto | null,
 	lastPath: string | null,
+	/**  前回のライブラリ（か `KURA_LIBRARY`）を開けなかった理由。 */
+	error?: AppError | null,
 };
+
+/**
+ *  ライブラリの DB を新しい版にする知らせ（イベント `library://upgrade`。M11 の決定 1）。開く IPC（`library_restore`・
+ *  `library_open`）が終わる前に、同じライブラリについて `started` のあと `finished` か `failed` が 1 つ来る。フロントは
+ *  `started` から 300ms を超えたら「ライブラリを更新しています」を出す。当てるものがない・新しいライブラリでは来ない。
+ */
+export type LibraryUpgradeEvent = {
+	phase: LibraryUpgradePhase,
+	/**  ライブラリのフォルダ。 */
+	path: string,
+	/**  当てる前のスキーマの版（user_version）。 */
+	fromVersion: number,
+	/**  当てたあとの版。 */
+	toVersion: number,
+	/**  DB の大きさ（バイト。`started` だけ）。 */
+	dbBytes: number | null,
+	/**  始まりからの時間（ミリ秒。`finished`・`failed` だけ）。 */
+	elapsedMs: number | null,
+	/**  当てられなかった理由（`failed` だけ）。 */
+	error: AppError | null,
+};
+
+/**  ライブラリの DB を新しい版にする段階（イベント `library://upgrade`）。 */
+export type LibraryUpgradePhase = 
+/**  当て始めた（空きの確かめとバックアップの前）。 */
+"started" | 
+/**  当て終えた。 */
+"finished" | 
+/**  当てられなかった（ライブラリは前の版のまま。理由は `error`。開く IPC も同じ理由で失敗を返す）。 */
+"failed";
 
 /**  ライブラリの容量（サイドバーの下・設定画面）。 */
 export type LibraryUsageDto = {

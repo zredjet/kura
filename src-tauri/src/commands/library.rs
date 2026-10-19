@@ -32,8 +32,10 @@ pub async fn library_check_location(
 pub async fn library_create(app: AppHandle, path: String) -> Result<LibraryInfoDto, AppError> {
     blocking(move || {
         let sink = event_sink(app.clone());
-        let session = app.state::<AppState>().replace_session(
-            || LibrarySession::create(Path::new(&path), sink, kura_mac::media_backend()),
+        let state = app.state::<AppState>();
+        let services = state.services(&app);
+        let session = state.replace_session(
+            || LibrarySession::create(Path::new(&path), sink, services),
             true,
         )?;
         Ok(session.info()?.into())
@@ -41,22 +43,28 @@ pub async fn library_create(app: AppHandle, path: String) -> Result<LibraryInfoD
     .await
 }
 
-/// 既存のライブラリを開く。
+/// 既存のライブラリを開く。新しい版にするときは、始まり・終わり・失敗をイベント `library://upgrade` で知らせる。開けなければ
+/// 理由の種類（`LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` など）と説明を返す。
 #[tauri::command]
 #[specta::specta]
 pub async fn library_open(app: AppHandle, path: String) -> Result<LibraryInfoDto, AppError> {
     blocking(move || {
         let sink = event_sink(app.clone());
-        let session = app.state::<AppState>().replace_session(
-            || LibrarySession::open(Path::new(&path), sink, kura_mac::media_backend()),
+        let state = app.state::<AppState>();
+        let services = state.services(&app);
+        let session = state.replace_session(
+            || LibrarySession::open(Path::new(&path), sink, services),
             true,
         )?;
+        log_opened(&session, "ライブラリを開きました");
         Ok(session.info()?.into())
     })
     .await
 }
 
-/// 起動時に前回のライブラリを開く。開けなければ `info` は空で、前回の場所だけ返す。
+/// 起動時に前回のライブラリ（`KURA_LIBRARY` があればそれ）を開く。前回の場所が見つからなければ `info` も `error` も空で、
+/// 前回の場所だけ返す。開けなければ `error` に理由（`library_open` と同じ種類）を入れて返す（失敗にはしない）。
+/// 新しい版にするときは、始まり・終わり・失敗をイベント `library://upgrade` で知らせる。
 #[tauri::command]
 #[specta::specta]
 pub async fn library_restore(app: AppHandle) -> Result<LibraryRestoreDto, AppError> {
@@ -65,15 +73,7 @@ pub async fn library_restore(app: AppHandle) -> Result<LibraryRestoreDto, AppErr
         // 計測用：環境変数 KURA_LIBRARY のライブラリを、設定を書き換えずに開く
         if let Some(path) = std::env::var_os(LIBRARY_ENV).filter(|_| state.current().is_none()) {
             let path = PathBuf::from(path);
-            let sink = event_sink(app.clone());
-            let session = state.replace_session(
-                || LibrarySession::open(&path, sink, kura_mac::media_backend()),
-                false,
-            )?;
-            return Ok(LibraryRestoreDto {
-                info: Some(session.info()?.into()),
-                last_path: Some(path.to_string_lossy().into_owned()),
-            });
+            return restore_from(&app, &state, path, false);
         }
         let last = state.last_library();
         let last_path = last.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -81,33 +81,63 @@ pub async fn library_restore(app: AppHandle) -> Result<LibraryRestoreDto, AppErr
             return Ok(LibraryRestoreDto {
                 info: Some(session.info()?.into()),
                 last_path,
+                error: None,
             });
         }
         let Some(last) = last.filter(|p| is_library(p)) else {
             return Ok(LibraryRestoreDto {
                 info: None,
                 last_path,
+                error: None,
             });
         };
-        let sink = event_sink(app.clone());
-        match state.replace_session(
-            || LibrarySession::open(&last, sink, kura_mac::media_backend()),
-            true,
-        ) {
-            Ok(session) => Ok(LibraryRestoreDto {
-                info: Some(session.info()?.into()),
-                last_path,
-            }),
-            Err(err) => {
-                tracing::warn!(%err, path = %last.display(), "前回のライブラリを開けませんでした");
-                Ok(LibraryRestoreDto {
-                    info: None,
-                    last_path,
-                })
-            }
-        }
+        restore_from(&app, &state, last, true)
     })
     .await
+}
+
+/// 起動時に `path` のライブラリを開く。開けなければ理由を `error` に入れて返す。
+fn restore_from(
+    app: &AppHandle,
+    state: &AppState,
+    path: PathBuf,
+    remember: bool,
+) -> Result<LibraryRestoreDto, AppError> {
+    let last_path = Some(path.to_string_lossy().into_owned());
+    let sink = event_sink(app.clone());
+    let services = state.services(app);
+    match state.replace_session(|| LibrarySession::open(&path, sink, services), remember) {
+        Ok(session) => {
+            log_opened(&session, "起動から前回のライブラリを開くまで");
+            Ok(LibraryRestoreDto {
+                info: Some(session.info()?.into()),
+                last_path,
+                error: None,
+            })
+        }
+        Err(err) => {
+            tracing::warn!(code = ?err.code, message = %err.message, path = %path.display(), "前回のライブラリを開けませんでした");
+            Ok(LibraryRestoreDto {
+                info: None,
+                last_path,
+                error: Some(err),
+            })
+        }
+    }
+}
+
+/// 開いたことをログに残す。DB を新しい版にした回（更新後の初回）は `upgraded` と時間を付ける（NFR-01 は 2 回目以降で
+/// 測り、初回はその外として分けて記録する。docs/requirements.md）。
+fn log_opened(session: &LibrarySession, what: &str) {
+    let report = session.library().migration();
+    tracing::info!(
+        since_start_ms = crate::since_start_ms(),
+        upgraded = report.upgraded(),
+        from = report.from,
+        to = report.to,
+        upgrade_ms = report.total_ms(),
+        "{what}"
+    );
 }
 
 /// 開いているライブラリの概要。

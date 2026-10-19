@@ -15,7 +15,7 @@ pub use layout::{
 pub use location::{
     LIBRARY_EXT, LocationCheck, LocationStatus, check_location, is_library, normalize_library_path,
 };
-pub use session::{EventSink, LibraryInfo, LibrarySession};
+pub use session::{EventSink, LibraryInfo, LibrarySession, Services};
 pub use upgrade::{UpgradeEvent, UpgradeHooks};
 
 use std::cell::Cell;

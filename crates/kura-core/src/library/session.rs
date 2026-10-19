@@ -8,9 +8,11 @@ use super::Library;
 use super::backup;
 use super::integrity::{IntegrityReport, check_files, clean_staging};
 use super::ledger;
+use super::upgrade::UpgradeHooks;
 use crate::Result;
 use crate::capture::CaptureHandler;
 use crate::download::{DownloadHandler, work_dir_name};
+use crate::edit::{ENGINE_WORK_DIR, EngineFactory, EngineServices};
 use crate::export::ExportHandler;
 use crate::import::ImportHandler;
 use crate::jobs::{JobKind, JobManager};
@@ -18,6 +20,41 @@ use crate::media::{MediaBackend, ThumbnailHandler};
 use crate::playback::{PlaybackSupport, ProxyHandler, ProxyShared, ProxyTools, proxy};
 
 pub use crate::jobs::EventSink;
+
+/// ライブラリを開くときにアプリから渡す、OS に依る実装（kura-core は OS を知らない。macOS は kura-mac で作る）。
+#[derive(Clone)]
+pub struct Services {
+    /// メディア情報とサムネイル。
+    pub media: Arc<dyn MediaBackend>,
+    /// エンジンの部品（解析・エンジンのサムネイル・試聴の PCM・アニメの帯が使う実行の場とコーデックの組）を作る口。部品は
+    /// 開いたライブラリごとに作り（[`LibrarySession::engine`]）、最初に使うときまで作らない。None ならエンジンを使わない。
+    pub engine: Option<Arc<dyn EngineFactory>>,
+    /// DB を新しい版にするときの、空き容量の確かめと始まり・終わり・失敗の知らせ。
+    pub upgrade: UpgradeHooks,
+}
+
+impl Services {
+    /// メディアの実装だけ（エンジンなし、空きを確かめず、知らせない）。
+    pub fn new(media: Arc<dyn MediaBackend>) -> Self {
+        Self {
+            media,
+            engine: None,
+            upgrade: UpgradeHooks::default(),
+        }
+    }
+
+    /// エンジンの部品を作る口を付ける。
+    pub fn with_engine(mut self, factory: Arc<dyn EngineFactory>) -> Self {
+        self.engine = Some(factory);
+        self
+    }
+
+    /// DB を新しい版にするときの確かめと知らせを付ける。
+    pub fn with_upgrade(mut self, hooks: UpgradeHooks) -> Self {
+        self.upgrade = hooks;
+        self
+    }
+}
 
 /// ライブラリの概要。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +72,8 @@ pub struct LibrarySession {
     library: Arc<Library>,
     jobs: Arc<JobManager>,
     proxy: Arc<ProxyShared>,
+    /// このライブラリのエンジンの部品（中身は最初に使うときに作る）。
+    engine: Option<Arc<EngineServices>>,
     integrity: Arc<Mutex<Option<IntegrityReport>>>,
     /// DB の定期バックアップ（閉じると止める）。
     backup: Mutex<backup::Scheduler>,
@@ -42,18 +81,32 @@ pub struct LibrarySession {
 }
 
 impl LibrarySession {
-    /// 既存のライブラリを開く。メディア情報とサムネイルは `backend` で作る。
-    pub fn open(path: &Path, sink: EventSink, backend: Arc<dyn MediaBackend>) -> Result<Self> {
-        Self::start(Library::open(path)?, sink, backend)
+    /// 既存のライブラリを開く（新しい版にするときは `services.upgrade` で空きを確かめて知らせる）。
+    pub fn open(path: &Path, sink: EventSink, services: Services) -> Result<Self> {
+        let library = Library::open_with(path, &services.upgrade)?;
+        Self::start(library, sink, services)
     }
 
     /// 新しいライブラリを作って開く。
-    pub fn create(path: &Path, sink: EventSink, backend: Arc<dyn MediaBackend>) -> Result<Self> {
-        Self::start(Library::create(path)?, sink, backend)
+    pub fn create(path: &Path, sink: EventSink, services: Services) -> Result<Self> {
+        Self::start(Library::create(path)?, sink, services)
     }
 
-    fn start(library: Library, sink: EventSink, backend: Arc<dyn MediaBackend>) -> Result<Self> {
+    fn start(library: Library, sink: EventSink, services: Services) -> Result<Self> {
+        let Services {
+            media: backend,
+            engine,
+            ..
+        } = services;
         let library = Arc::new(library);
+        // エンジンの部品はこのライブラリのもの（ffmpeg の一時ファイルは staging/engine。下の掃除で前回の残りが消える）。
+        // 実行の場とコーデックの組は、ジョブ・IPC が最初に使うときに作る（起動の道に載せない）
+        let engine = engine.map(|factory| {
+            Arc::new(EngineServices::new(
+                factory,
+                library.layout().staging_dir().join(ENGINE_WORK_DIR),
+            ))
+        });
         // ジョブを動かす前に書きかけを消す（再開する取り込みは最初からコピーし直す）。
         // 待機中・一時停止中のダウンロードの作業フォルダは、続きから取るので残す
         let keep: Vec<String> = library.db().read(|conn| {
@@ -149,6 +202,7 @@ impl LibrarySession {
             library,
             jobs,
             proxy,
+            engine,
             integrity,
             backup,
             startup: Mutex::new(Some(startup)),
@@ -163,6 +217,18 @@ impl LibrarySession {
     /// ジョブ。
     pub fn jobs(&self) -> &JobManager {
         &self.jobs
+    }
+
+    /// このライブラリのエンジンの部品（エンジンを使わないときは None）。ライブラリを開き直すと別物になる。
+    pub fn engine(&self) -> Option<&Arc<EngineServices>> {
+        self.engine.as_ref()
+    }
+
+    /// 外部ツールの場所が変わった：エンジンのコーデックの組を、次に使うときに作り直す（ffmpeg を探し直す）。
+    pub fn reload_tools(&self) {
+        if let Some(engine) = &self.engine {
+            engine.reload_codecs();
+        }
     }
 
     /// 再生可否の表を受け取る。前回と変わっていれば判定をやり直し、判定・作成を待つものがあればプロキシのジョブを積む。
@@ -227,6 +293,17 @@ impl LibrarySession {
         if let Ok(mut backup) = self.backup.lock() {
             backup.stop();
         }
+        // ffmpeg の一時ファイルの置き場が空なら消す（次に開くときの掃除で「書きかけ」に数えないように）。中身が残っていれば
+        // 次に開くときの掃除で消す
+        if let Some(engine) = &self.engine {
+            match std::fs::remove_dir(engine.work_dir()) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::debug!(%err, "エンジンの一時ファイルの置き場を残しました");
+                }
+            }
+        }
     }
 
     /// いまのバックアップを作る（設定画面の「今すぐバックアップ」）。
@@ -244,7 +321,9 @@ impl Drop for LibrarySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edit::services::fake::FakeEngineFactory;
     use crate::import::{ImportInput, ImportOptions, start_import};
+    use crate::library::UpgradeEvent;
     use crate::media::fake::FakeBackend;
     use std::time::Duration;
 
@@ -252,8 +331,8 @@ mod tests {
         Arc::new(|_| {})
     }
 
-    fn backend() -> Arc<dyn MediaBackend> {
-        Arc::new(FakeBackend)
+    fn services() -> Services {
+        Services::new(Arc::new(FakeBackend))
     }
 
     #[test]
@@ -261,7 +340,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Kura Library");
         {
-            let session = LibrarySession::create(&path, sink(), backend()).unwrap();
+            let session = LibrarySession::create(&path, sink(), services()).unwrap();
             session.wait_ready();
             let info = session.info().unwrap();
             assert_eq!(info.name, "Kura Library");
@@ -270,7 +349,7 @@ mod tests {
         }
         let path = dir.path().join("Kura Library.kuralib");
         std::fs::write(path.join("staging/leftover"), "x").unwrap();
-        let session = LibrarySession::open(&path, sink(), backend()).unwrap();
+        let session = LibrarySession::open(&path, sink(), services()).unwrap();
         session.wait_ready();
         assert_eq!(session.integrity().unwrap().staging_removed, 1);
     }
@@ -281,7 +360,7 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.jpg"), "a").unwrap();
-        let session = LibrarySession::create(&dir.path().join("L"), sink(), backend()).unwrap();
+        let session = LibrarySession::create(&dir.path().join("L"), sink(), services()).unwrap();
         start_import(
             session.jobs(),
             &ImportInput {
@@ -300,5 +379,149 @@ mod tests {
             .read(|c| Ok(c.query_row("SELECT thumb_state FROM items", [], |r| r.get(0))?))
             .unwrap();
         assert_eq!(state, "ready");
+    }
+
+    /// エンジンの部品はライブラリごとに作り、開いただけ（整合性チェック・ジョブの開始まで）では中身を作らない。
+    /// ライブラリを切り替えると別物になり、ffmpeg の一時ファイルはそのライブラリの staging/engine に置く。
+    #[test]
+    fn the_engine_is_per_library_and_built_on_first_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = Arc::new(FakeEngineFactory::default());
+        let a = LibrarySession::create(
+            &dir.path().join("A"),
+            sink(),
+            services().with_engine(factory.clone()),
+        )
+        .unwrap();
+        a.wait_ready();
+        assert!(a.jobs().wait_idle(Duration::from_secs(10)));
+        let engine_a = a.engine().unwrap().clone();
+        assert_eq!((factory.runtimes(), factory.codec_builds()), (0, 0));
+        assert!(engine_a.runtime_if_built().is_none());
+        assert!(engine_a.codecs_if_built().is_none());
+        let staging_a = dir.path().join("A.kuralib/staging/engine");
+        assert_eq!(engine_a.work_dir(), staging_a);
+
+        engine_a.runtime().unwrap();
+        engine_a.codecs();
+        assert_eq!((factory.runtimes(), factory.codec_builds()), (1, 1));
+        drop(a);
+
+        let b = LibrarySession::create(
+            &dir.path().join("B"),
+            sink(),
+            services().with_engine(factory.clone()),
+        )
+        .unwrap();
+        b.wait_ready();
+        let engine_b = b.engine().unwrap();
+        assert!(!Arc::ptr_eq(&engine_a, engine_b));
+        assert!(engine_b.runtime_if_built().is_none());
+        assert!(engine_b.codecs_if_built().is_none());
+        engine_b.codecs();
+        assert_eq!(
+            factory.work_dirs(),
+            [staging_a, dir.path().join("B.kuralib/staging/engine")]
+        );
+        drop(b);
+
+        // 同じライブラリを開き直しても、前の部品は使わない
+        let again = LibrarySession::open(
+            &dir.path().join("A.kuralib"),
+            sink(),
+            services().with_engine(factory.clone()),
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&engine_a, again.engine().unwrap()));
+        assert!(again.engine().unwrap().runtime_if_built().is_none());
+    }
+
+    /// 外部ツールの場所を変えたら、開いているライブラリのコーデックの組を作り直す（ffmpeg を探し直す）。
+    #[test]
+    fn reloading_tools_rebuilds_the_codec_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = Arc::new(FakeEngineFactory::default());
+        let session = LibrarySession::create(
+            &dir.path().join("L"),
+            sink(),
+            services().with_engine(factory.clone()),
+        )
+        .unwrap();
+        let engine = session.engine().unwrap();
+        let runtime = engine.runtime().unwrap().clone();
+        let before = engine.codecs();
+        session.reload_tools();
+        let after = engine.codecs();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(factory.codec_builds(), 2);
+        assert!(Arc::ptr_eq(engine.runtime().unwrap(), &runtime));
+    }
+
+    #[test]
+    fn without_a_factory_there_is_no_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = LibrarySession::create(&dir.path().join("L"), sink(), services()).unwrap();
+        assert!(session.engine().is_none());
+        session.reload_tools();
+    }
+
+    /// ffmpeg の一時ファイルの置き場は、閉じるときに空なら消し（次に開くときに書きかけと数えない）、残っていれば次に開くときの
+    /// 掃除で消す。
+    #[test]
+    fn the_engine_work_dir_is_removed_when_empty_and_cleaned_when_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = Arc::new(FakeEngineFactory::default());
+        let services = || services().with_engine(factory.clone());
+        let path = dir.path().join("L.kuralib");
+        let session = LibrarySession::create(&path, sink(), services()).unwrap();
+        let work = session.engine().unwrap().work_dir().to_path_buf();
+        std::fs::create_dir_all(&work).unwrap();
+        session.close();
+        assert!(!work.exists());
+        drop(session);
+
+        let session = LibrarySession::open(&path, sink(), services()).unwrap();
+        session.wait_ready();
+        assert_eq!(session.integrity().unwrap().staging_removed, 0);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("ffmpeg-1.wav"), "x").unwrap();
+        drop(session);
+        assert!(work.join("ffmpeg-1.wav").exists());
+
+        let session = LibrarySession::open(&path, sink(), services()).unwrap();
+        session.wait_ready();
+        assert_eq!(session.integrity().unwrap().staging_removed, 1);
+        assert!(!work.exists());
+    }
+
+    /// 開くときに、新しい版にするための確かめと知らせを Library に渡す。
+    #[test]
+    fn opening_passes_the_upgrade_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let mut conn = rusqlite::Connection::open(root.join(crate::library::DB_FILE)).unwrap();
+            crate::db::apply_pragmas(&conn).unwrap();
+            crate::db::migrate_until(&mut conn, crate::db::MIGRATIONS.len() - 1).unwrap();
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = events.clone();
+        let hooks = UpgradeHooks {
+            free_space: None,
+            notify: Some(Arc::new(move |e: &UpgradeEvent| {
+                seen.lock().unwrap().push(e.clone());
+            })),
+        };
+        let session = LibrarySession::open(&root, sink(), services().with_upgrade(hooks)).unwrap();
+        let events = events.lock().unwrap();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [UpgradeEvent::Started { .. }, UpgradeEvent::Finished { .. }]
+            ),
+            "{events:?}"
+        );
+        assert!(session.library().migration().upgraded());
     }
 }

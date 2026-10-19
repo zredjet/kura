@@ -99,9 +99,13 @@ pub async fn items_get(
     blocking(move || {
         let items = session.library().db().read(|conn| summaries(conn, &ids))?;
         if FIRST_GET.swap(false, Ordering::Relaxed) {
+            // upgraded：この起動で DB を新しい版にした（更新後の初回。NFR-01 の外として分けて記録する）
+            let migration = session.library().migration();
             tracing::info!(
                 items = items.len(),
                 since_start_ms = crate::since_start_ms(),
+                upgraded = migration.upgraded(),
+                upgrade_ms = migration.total_ms(),
                 "起動から最初のタイルの詳細を返すまで"
             );
         }
