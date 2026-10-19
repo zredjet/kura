@@ -6,7 +6,8 @@
 //! - `seed --items <件数> --out <path>`：ダミーライブラリを作る（グリッドと起動時間の計測用）
 //! - `selftest-library --out <path> [--web <dir>] [--font <ttf>]`：kura:// と CSP を実機で確かめるライブラリ
 //!   （`VITE_KURA_SELFTEST=1` のフロントが試す。`selftest` の冒頭）
-//! - `bench query --library <path>`：一覧の取得の速さを測る
+//! - `bench query --library <path> [--fake-facts]`：一覧の取得の速さを測る（`--fake-facts` は素材の事実の擬似の行を
+//!   入れて、透過・ループ・ラウドネスなどの検索も測り、終わったら消す。`bench_facts` の冒頭）
 //! - `bench thumbs --src <画像のフォルダ> [--threads N]`：画像サムネイルの速さを測る（NFR-04）
 //! - `bench migrate (--library <path> | --items <件数> [--history]) [--runs 3]`：マイグレーションの時間と照合
 //!   （docs/data-model.md §5。`bench_migrate` の冒頭）
@@ -18,6 +19,7 @@
 
 mod bench;
 mod bench_edit;
+mod bench_facts;
 mod bench_migrate;
 mod edit;
 mod mem_smoke;

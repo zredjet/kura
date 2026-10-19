@@ -26,6 +26,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut src = None;
     let mut threads = None;
     let mut out = None;
+    let mut fake_facts = false;
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -33,16 +34,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--src" => src = it.next().map(PathBuf::from),
             "--threads" => threads = it.next().and_then(|n| n.parse().ok()),
             "--out" => out = it.next().map(PathBuf::from),
+            "--fake-facts" => fake_facts = true,
             _ => {}
         }
     }
     match args.first().map(String::as_str) {
-        Some("query") => query(&library.ok_or("--library を指定してください")?),
+        Some("query") => query(&library.ok_or("--library を指定してください")?, fake_facts),
         Some("thumbs") => thumbs(&src.ok_or("--src を指定してください")?, threads),
         Some("import") => import(&src.ok_or("--src を指定してください")?, threads, out),
         Some("backup") => backup(&library.ok_or("--library を指定してください")?),
         _ => Err(
-            "使い方: kura-devtools bench query --library <path> | thumbs --src <dir> [--threads N] \
+            "使い方: kura-devtools bench query --library <path> [--fake-facts] | thumbs --src <dir> [--threads N] \
              | import --src <dir> [--threads N] [--out <dir>] | backup --library <path> | edit [--quick] … \
              | migrate (--library <path> | --items <件数> [--history]) [--runs 3] [--work <dir>] [--json <file>]"
                 .into(),
@@ -223,7 +225,8 @@ fn median(mut runs: Vec<Duration>) -> Duration {
     runs[runs.len() / 2]
 }
 
-fn query(path: &std::path::Path) -> Result<(), String> {
+/// `fake_facts`：素材の事実の擬似の行を入れて、事実のフィールドの検索も測る（終わったら消す。`bench_facts`）。
+fn query(path: &std::path::Path, fake_facts: bool) -> Result<(), String> {
     let opened = Instant::now();
     let library = Library::open(path).map_err(|e| e.to_string())?;
     let open_time = opened.elapsed();
@@ -232,6 +235,20 @@ fn query(path: &std::path::Path) -> Result<(), String> {
         now_ms: now_ms(),
         utc_offset_minutes: 540,
     };
+    if fake_facts {
+        let started = Instant::now();
+        let (images, audios, settings) = crate::bench_facts::insert(db)?;
+        tracing::info!(
+            images,
+            audios,
+            settings,
+            ms = started.elapsed().as_secs_f64() * 1000.0,
+            "擬似の事実を入れました（測り終えたら消します）"
+        );
+        let measured = crate::bench_facts::search(db, &ctx);
+        crate::bench_facts::remove(db)?;
+        measured?;
+    }
 
     let mut list_runs = Vec::new();
     let mut bytes = 0;
