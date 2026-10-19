@@ -4,11 +4,11 @@
  * - 種類の一覧と性質は Rust が正本（`MediaKind`）。bindings.ts の定数 `ITEM_KINDS` を読むだけにし、
  *   種類の型・並び・述語はここから作る（`'image' | 'video' | 'audio'` のような型や並びを画面ごとに書かない）。
  * - ラベルは `ja.kinds`、アイコンは `components/icons/KindIcon.tsx`。
- * - 検索の語（`種類:フォント` の「フォント」）はラベルと別に持つ（Rust の `query::fields::KIND_WORDS` と同じ。
- *   kinds.test.ts で照らす）。今はラベルと同じ語だが、ラベルを変えても式が壊れないようにする。
+ * - 検索の語（`種類:フォント` の「フォント」）はラベルと別に持つ（Rust の `query::KIND_WORDS` を bindings の定数
+ *   `QUERY_KIND_WORDS` で読む）。今はラベルと同じ語だが、ラベルを変えても式が壊れないようにする。
  */
 import { ja } from '../i18n/ja';
-import { ITEM_KINDS, type ItemKindDto } from './bindings';
+import { ITEM_KINDS, type ItemKindDto, QUERY_KIND_WORDS } from './bindings';
 
 type KindRow = (typeof ITEM_KINDS)[number];
 
@@ -34,14 +34,11 @@ const ROWS = new Map<string, KindRow>(ITEM_KINDS.map((row) => [row.kind, row]));
 /** ラベル（`ja.kinds`。種類を足して文言を書き忘れると型で落ちる）。 */
 const LABELS: Readonly<Record<ItemKind, string>> = ja.kinds;
 
-/** 検索の語（Rust の `KIND_WORDS` と同じ。英語の名前は `kind` そのもの）。 */
-const WORDS: Readonly<Record<ItemKind, string>> = {
-  image: '画像',
-  video: '動画',
-  audio: '音楽',
-  font: 'フォント',
-  model: '3D',
-};
+/** 検索の語（Rust の `KIND_WORDS`。英語の名前は `kind` そのもの）。語のない種類は英語の名前で書く。 */
+const WORD_OF = new Map<string, string>(QUERY_KIND_WORDS.map(({ kind, word }) => [kind, word]));
+const WORDS: Readonly<Record<ItemKind, string>> = Object.fromEntries(
+  ITEM_KINDS.map(({ kind }) => [kind, WORD_OF.get(kind) ?? kind]),
+) as Record<ItemKind, string>;
 
 /** 種類の値か（DTO の文字列を確かめる。知らない値は偽）。 */
 export function isItemKind(value: string | null | undefined): value is ItemKind {

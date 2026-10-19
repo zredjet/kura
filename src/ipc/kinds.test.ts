@@ -2,10 +2,9 @@ import { render } from '@testing-library/react';
 import { createElement } from 'react';
 import { describe, expect, it } from 'vitest';
 
-import fieldsRs from '../../crates/kura-core/src/query/fields.rs?raw';
 import { KIND_ICONS, KindIcon } from '../components/icons/KindIcon';
 import { ja } from '../i18n/ja';
-import { ITEM_KINDS } from './bindings';
+import { ITEM_KINDS, QUERY_KIND_WORDS } from './bindings';
 import {
   countsFromPlural,
   hasDuration,
@@ -19,17 +18,6 @@ import {
   needsProxy,
   PLAYABLE_KINDS,
 } from './kinds';
-
-/** Rust の `query::fields::KIND_WORDS`（`("画像", KindValue::Image)` の並び）を読む。 */
-function rustKindWords(): Map<string, string> {
-  const block = fieldsRs.match(/pub const KIND_WORDS[^=]*=\s*\[([\s\S]*?)\];/);
-  expect(block, 'fields.rs に KIND_WORDS がありません').not.toBeNull();
-  const words = new Map<string, string>();
-  for (const m of (block?.[1] ?? '').matchAll(/\("([^"]+)",\s*KindValue::(\w+)\)/g)) {
-    words.set((m[2] ?? '').toLowerCase(), m[1] ?? '');
-  }
-  return words;
-}
 
 describe('種類の表（ITEM_KINDS）', () => {
   it('並びは bindings の ITEM_KINDS のまま（画像・動画・音楽・フォント・3D）', () => {
@@ -83,12 +71,13 @@ describe('種類の表（ITEM_KINDS）', () => {
 });
 
 describe('検索の語', () => {
-  it('Rust の KIND_WORDS と同じ語', () => {
-    const rust = rustKindWords();
-    expect([...rust.keys()].sort()).toEqual([...KIND_ORDER].sort());
-    for (const kind of KIND_ORDER) {
-      expect(kindWord(kind)).toBe(rust.get(kind));
+  it('語は Rust の表（bindings の QUERY_KIND_WORDS）のまま。どの種類にも語がある', () => {
+    expect(QUERY_KIND_WORDS.map((w) => w.kind).sort()).toEqual([...KIND_ORDER].sort());
+    for (const { kind, word } of QUERY_KIND_WORDS) {
+      expect(kindWord(kind)).toBe(word);
     }
+    expect(kindWord('font')).toBe('フォント');
+    expect(kindWord('model')).toBe('3D');
   });
 
   it('語から種類に戻る（日本語の語は大文字・小文字を問わず、英語は種類の名前）', () => {

@@ -870,6 +870,9 @@ pub struct QueryCheckDto {
     pub error: Option<ParseErrorDto>,
     pub clauses: Vec<ClauseDto>,
     pub counts: Option<KindCountsDto>,
+    /// 解析の事実（透過・ループ・ラウドネスなど）を使う条件のとき、解析がまだで一致が決まっていない件数
+    /// （パレットの「未解析 N 件」）。使わない条件・解析できない入力では null。
+    pub unanalyzed: Option<u64>,
 }
 
 fn to_u32(n: usize) -> u32 {
@@ -896,8 +899,69 @@ impl From<QueryCheck> for QueryCheckDto {
                 })
                 .collect(),
             counts: c.counts.map(Into::into),
+            unanalyzed: c.unanalyzed,
         }
     }
+}
+
+/// 検索のフィールドの名前（bindings の定数 `QUERY_FIELD_NAMES`。docs/search-query.md §3）。
+/// フロントの clauses.ts・ruleRows.ts はこの表で「フィールドの条件か、名前空間付きのタグか」を見分ける。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryFieldNameDto {
+    /// 英語名（AST の `field`・`ClauseDto.field`）。
+    pub field: String,
+    /// 入力で使える名前（日本語・英語。英語は大文字小文字を問わない）。
+    pub names: Vec<String>,
+}
+
+/// フィールドの名前の表（`kura_core::query::FIELDS` の順）。
+pub fn query_field_names() -> Vec<QueryFieldNameDto> {
+    kura_core::query::FIELDS
+        .iter()
+        .map(|f| QueryFieldNameDto {
+            field: f.key.to_string(),
+            names: f.names.iter().map(|n| (*n).to_string()).collect(),
+        })
+        .collect()
+}
+
+/// 種類の検索の語（bindings の定数 `QUERY_KIND_WORDS`。`種類:フォント` の「フォント」）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryKindWordDto {
+    pub kind: ItemKindDto,
+    pub word: String,
+}
+
+/// 種類の検索の語の表（`kura_core::query::KIND_WORDS` の順）。
+pub fn query_kind_words() -> Vec<QueryKindWordDto> {
+    kura_core::query::KIND_WORDS
+        .iter()
+        .map(|(word, kind)| QueryKindWordDto {
+            kind: (*kind).into(),
+            word: (*word).to_string(),
+        })
+        .collect()
+}
+
+/// 半角と同じに扱う記号（bindings の定数 `QUERY_SYMBOLS`。字句解析の表）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QuerySymbolDto {
+    pub from: String,
+    pub to: String,
+}
+
+/// 記号の表（`kura_core::query::SYMBOLS` の順）。
+pub fn query_symbols() -> Vec<QuerySymbolDto> {
+    kura_core::query::SYMBOLS
+        .iter()
+        .map(|(from, to)| QuerySymbolDto {
+            from: from.to_string(),
+            to: to.to_string(),
+        })
+        .collect()
 }
 
 /// 候補の種類。
@@ -1494,6 +1558,59 @@ mod tests {
             assert_eq!(serde_json::to_value(dto).unwrap(), kind.as_str());
             assert_eq!(MediaKind::from(dto), kind);
         }
+    }
+
+    /// 検索の表（`QUERY_FIELD_NAMES`・`QUERY_KIND_WORDS`・`QUERY_SYMBOLS`）は kura-core の表をそのまま出す。
+    #[test]
+    fn query_tables_follow_the_core_tables() {
+        let fields = serde_json::to_value(query_field_names()).unwrap();
+        assert_eq!(
+            fields[0],
+            serde_json::json!({ "field": "type", "names": ["種類", "type"] })
+        );
+        let alpha = fields
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["field"] == "alpha")
+            .unwrap();
+        assert_eq!(alpha["names"], serde_json::json!(["透過", "alpha"]));
+        assert_eq!(query_field_names().len(), kura_core::query::FIELDS.len());
+        assert_eq!(
+            serde_json::to_value(query_kind_words()).unwrap(),
+            serde_json::json!([
+                { "kind": "image", "word": "画像" },
+                { "kind": "video", "word": "動画" },
+                { "kind": "audio", "word": "音楽" },
+                { "kind": "font", "word": "フォント" },
+                { "kind": "model", "word": "3D" },
+            ])
+        );
+        let symbols = serde_json::to_value(query_symbols()).unwrap();
+        assert!(
+            symbols
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!({ "from": "、", "to": "," }))
+        );
+        assert!(
+            symbols
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!({ "from": "−", "to": "-" }))
+        );
+    }
+
+    #[test]
+    fn query_check_carries_the_unanalyzed_count() {
+        let dto = QueryCheckDto::from(QueryCheck {
+            error: None,
+            clauses: Vec::new(),
+            counts: None,
+            unanalyzed: Some(3),
+        });
+        let json = serde_json::to_value(dto).unwrap();
+        assert_eq!(json["unanalyzed"], 3);
     }
 }
 

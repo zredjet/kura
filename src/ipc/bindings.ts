@@ -266,6 +266,12 @@ export const events = {
 /* Constants */
 export const ITEM_KINDS = [{"hasDuration":false,"kind":"image","needsProxy":false,"playable":true},{"hasDuration":true,"kind":"video","needsProxy":true,"playable":true},{"hasDuration":true,"kind":"audio","needsProxy":true,"playable":true},{"hasDuration":false,"kind":"font","needsProxy":false,"playable":false},{"hasDuration":false,"kind":"model","needsProxy":false,"playable":false}] as const;
 
+export const QUERY_FIELD_NAMES = [{"field":"type","names":["種類","type"]},{"field":"rating","names":["評価","rating"]},{"field":"dur","names":["長さ","dur"]},{"field":"added","names":["追加","added"]},{"field":"taken","names":["撮影","taken"]},{"field":"played","names":["再生","played"]},{"field":"plays","names":["再生回数","plays"]},{"field":"folder","names":["フォルダ","folder"]},{"field":"unit","names":["ユニット","unit"]},{"field":"source","names":["取得元","source"]},{"field":"name","names":["名前","name"]},{"field":"url","names":["url"]},{"field":"note","names":["メモ","note"]},{"field":"tags","names":["タグ数","tags"]},{"field":"w","names":["幅","w"]},{"field":"h","names":["高さ","h"]},{"field":"orient","names":["向き","orient"]},{"field":"alpha","names":["透過","alpha"]},{"field":"pixel","names":["ドット絵","pixel"]},{"field":"colors","names":["色数","colors"]},{"field":"pot","names":["2のべき乗","２のべき乗","pot"]},{"field":"rate","names":["レート","rate"]},{"field":"bits","names":["ビット","bits"]},{"field":"ch","names":["チャンネル","ch"]},{"field":"lufs","names":["ラウドネス","lufs"]},{"field":"peak","names":["ピーク","peak"]},{"field":"loop","names":["ループ","loop"]},{"field":"anim","names":["アニメ","anim"]}] as const;
+
+export const QUERY_KIND_WORDS = [{"kind":"image","word":"画像"},{"kind":"video","word":"動画"},{"kind":"audio","word":"音楽"},{"kind":"font","word":"フォント"},{"kind":"model","word":"3D"}] as const;
+
+export const QUERY_SYMBOLS = [{"from":"｜","to":"|"},{"from":"－","to":"-"},{"from":"−","to":"-"},{"from":"＞","to":">"},{"from":"＜","to":"<"},{"from":"＝","to":"="},{"from":"：","to":":"},{"from":"！","to":"!"},{"from":"（","to":"("},{"from":"）","to":")"},{"from":"“","to":"\""},{"from":"”","to":"\""},{"from":"＂","to":"\""},{"from":"，","to":","},{"from":"、","to":","},{"from":"　","to":" "}] as const;
+
 /* Types */
 /**  追加するもの。 */
 export type AddSourceDto = { kind: "item"; id: number } | { kind: "unit"; id: number } | { kind: "folder"; id: number };
@@ -1021,6 +1027,34 @@ export type QueryCheckDto = {
 	error: ParseErrorDto | null,
 	clauses: ClauseDto[],
 	counts: KindCountsDto | null,
+	/**
+	 *  解析の事実（透過・ループ・ラウドネスなど）を使う条件のとき、解析がまだで一致が決まっていない件数
+	 *  （パレットの「未解析 N 件」）。使わない条件・解析できない入力では null。
+	 */
+	unanalyzed: number | null,
+};
+
+/**
+ *  検索のフィールドの名前（bindings の定数 `QUERY_FIELD_NAMES`。docs/search-query.md §3）。
+ *  フロントの clauses.ts・ruleRows.ts はこの表で「フィールドの条件か、名前空間付きのタグか」を見分ける。
+ */
+export type QueryFieldNameDto = {
+	/**  英語名（AST の `field`・`ClauseDto.field`）。 */
+	field: string,
+	/**  入力で使える名前（日本語・英語。英語は大文字小文字を問わない）。 */
+	names: string[],
+};
+
+/**  種類の検索の語（bindings の定数 `QUERY_KIND_WORDS`。`種類:フォント` の「フォント」）。 */
+export type QueryKindWordDto = {
+	kind: ItemKindDto,
+	word: string,
+};
+
+/**  半角と同じに扱う記号（bindings の定数 `QUERY_SYMBOLS`。字句解析の表）。 */
+export type QuerySymbolDto = {
+	from: string,
+	to: string,
 };
 
 export type RepeatModeDto = "off" | "all" | "one";
