@@ -1,8 +1,9 @@
 import type { ItemSummaryDto } from '../../../ipc/items';
+import type { PlayableKind, TimedKind } from '../../../ipc/kinds';
 import type { PlayQueueDto } from '../../../ipc/player';
 
-/** スロットの種類。 */
-export type SlotKind = 'image' | 'video' | 'audio';
+/** スロットの種類（再生できる種類だけ。フォント・3D はキューに入らない。docs/playlists.md §1.1）。 */
+export type SlotKind = PlayableKind;
 
 /** 再生キュー（Rust の Slot 列を列ごとの配列で持つ。docs/playlists.md §5.1）。 */
 export type Queue = PlayQueueDto;
@@ -102,8 +103,8 @@ export interface PlayerSnapshot {
 /** コントローラが外とやり取りするもの（テストでは偽物）。 */
 export interface ControllerDeps {
   clock: Clock;
-  /** BGM 用・先読み用の要素を作る。 */
-  createMedia: (kind: 'audio' | 'video') => MediaPort;
+  /** BGM 用・先読み用の要素を作る（動画・音楽の要素。タグの名前は種類と同じ）。 */
+  createMedia: (kind: TimedKind) => MediaPort;
   /** アイテムの概要を取る。 */
   fetchItems: (ids: number[]) => Promise<ItemSummaryDto[]>;
   /** 再生の報告。再生済みとして記録したら true。 */

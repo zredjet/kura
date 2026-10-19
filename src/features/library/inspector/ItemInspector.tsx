@@ -9,8 +9,10 @@ import { FolderIcon } from '../../../components/icons/FolderIcon';
 import { LinkIcon } from '../../../components/icons/LinkIcon';
 import { MoreIcon } from '../../../components/icons/MoreIcon';
 import { UnitIcon } from '../../../components/icons/UnitIcon';
+import { KindArt } from '../../../components/KindArt/KindArt';
 import { ja } from '../../../i18n/ja';
 import { getItemDetail } from '../../../ipc/items';
+import { isPlayable } from '../../../ipc/kinds';
 import { thumbUrl } from '../../../ipc/media';
 import { dateTimeLabel } from '../../../lib/dates';
 import { shortHash } from '../../../lib/format';
@@ -55,6 +57,8 @@ export function ItemInspector({ id }: { id: number }) {
       <div className={styles.preview}>
         {item.thumbState === 'ready' ? (
           <img className={styles.previewImage} src={thumbUrl(item.hash, 'l')} alt="" />
+        ) : !isPlayable(item.kind) ? (
+          <KindArt kind={item.kind} />
         ) : (
           <span className={styles.previewNote}>
             {item.thumbState === 'pending' ? t.noThumbnail : ''}

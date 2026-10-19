@@ -7,16 +7,10 @@ import { TagInput } from '../../components/TagInput/TagInput';
 import { ja } from '../../i18n/ja';
 import { type PlaylistDto, type PlaylistPatchDto, updatePlaylist } from '../../ipc/playlists';
 import type { SortKey } from '../../ipc/items';
+import { kindLabel } from '../../ipc/kinds';
 import { regenerate, updatePlaylistSettings } from './playlistActions';
 import { Choice, PlaylistOptions } from './PlaylistSettings';
-import {
-  type KindValue,
-  fromClause,
-  newRow,
-  type RuleField,
-  type RuleRow,
-  toClause,
-} from './ruleRows';
+import { fromClause, newRow, RULE_KINDS, type RuleField, type RuleRow, toClause } from './ruleRows';
 import styles from './PlaylistView.module.css';
 
 const t = ja.playlist;
@@ -75,8 +69,6 @@ const OPS: { [F in RuleField]: readonly { value: string; label: string }[] } = {
   query: [],
 };
 
-const KINDS: KindValue[] = ['image', 'audio', 'video'];
-
 function NumberField({
   value,
   onChange,
@@ -118,7 +110,7 @@ function RowValue({ row, onChange }: { row: RuleRow; onChange: (row: RuleRow) =>
     case 'kind':
       return (
         <>
-          {KINDS.map((kind) => {
+          {RULE_KINDS.map((kind) => {
             const on = row.value.includes(kind);
             return (
               <button
@@ -134,7 +126,7 @@ function RowValue({ row, onChange }: { row: RuleRow; onChange: (row: RuleRow) =>
                 }
               >
                 {on && <CheckIcon size={11} strokeWidth={3} />}
-                {ja.kinds[kind]}
+                {kindLabel(kind)}
               </button>
             );
           })}

@@ -59,6 +59,10 @@ describe('clauses', () => {
   it('finds a single kind for the segment', () => {
     expect(singleKind(['種類:動画'])).toBe('video');
     expect(singleKind(['type=image'])).toBe('image');
+    expect(singleKind(['種類:フォント'])).toBe('font');
+    expect(singleKind(['種類:3d'])).toBe('model');
+    expect(singleKind(['type:model'])).toBe('model');
+    expect(singleKind(['種類:写真'])).toBeNull();
     expect(singleKind(['種類:画像,動画'])).toBeNull();
     expect(singleKind(['-種類:動画'])).toBeNull();
     expect(singleKind(['種類!=動画'])).toBeNull();

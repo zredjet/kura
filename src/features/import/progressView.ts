@@ -58,6 +58,10 @@ export function progressView(job: JobProgress): ProgressView {
       if (result && result.failed > 0) {
         parts.push(t.failures(formatCount(result.failed)));
       }
+      // 拡張子は対応しているが中身が違うもの（Aseprite でない .ase など。M11 より前の結果にはない）
+      if (result?.rejected && result.rejected.length > 0) {
+        parts.push(t.rejected(formatCount(result.rejected.length)));
+      }
       return {
         title: t.done(formatCount(result?.added ?? 0)),
         detail: parts.length > 0 ? parts.join('・') : null,

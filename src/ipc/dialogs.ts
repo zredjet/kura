@@ -1,33 +1,53 @@
 import { open, save } from '@tauri-apps/plugin-dialog';
 
-/** 取り込める拡張子（docs/architecture.md §6）。 */
+/**
+ * 取り込める拡張子（docs/architecture.md §6。kura-engine の形式の表 `FORMATS` と同じ。dialogs.test.ts で照らす）。
+ * `.ase` は選べるが、Aseprite でない中身（Adobe の色見本）は取り込みで対象外になる。
+ */
 export const MEDIA_EXTENSIONS = [
+  // 画像
+  'png',
+  'apng',
   'jpg',
   'jpeg',
-  'png',
   'gif',
   'webp',
+  'aseprite',
+  'ase',
+  'psd',
+  'psb',
+  'svg',
   'heic',
   'heif',
   'avif',
   'tif',
   'tiff',
   'bmp',
+  // 動画
   'mp4',
   'm4v',
   'mov',
   'webm',
   'mkv',
   'avi',
-  'mp3',
-  'm4a',
-  'aac',
-  'flac',
+  // 音楽
   'wav',
   'aif',
   'aiff',
+  'flac',
+  'mp3',
+  'm4a',
+  'aac',
   'ogg',
   'opus',
+  // フォント
+  'ttf',
+  'otf',
+  'ttc',
+  'woff',
+  'woff2',
+  // 3D
+  'glb',
 ];
 
 /** 新しいライブラリの場所を選ぶ（保存のダイアログ）。キャンセルなら null。 */

@@ -478,14 +478,16 @@ export const ja = {
   },
   tile: {
     unit: (name: string, n: string) => `ユニット「${name}」、${n} 項目`,
-    music: '音楽',
     downloaded: 'ダウンロードしたもの',
     captured: 'キャプチャしたもの',
   },
+  /** 種類のラベル（並び・述語は src/ipc/kinds.ts。種類を足したらここにも足す）。 */
   kinds: {
     image: '画像',
     video: '動画',
     audio: '音楽',
+    font: 'フォント',
+    model: '3D',
   },
   inspector: {
     empty: '項目を選ぶと、ここに詳細が出ます',
@@ -605,6 +607,19 @@ export const ja = {
     notALibrary: 'ライブラリが見つかりません。名前が「.kuralib」で終わるフォルダを選んでください。',
     failed: (message: string) => `ライブラリを開けませんでした：${message}`,
   },
+  /** ライブラリを開くときの DB の更新（M11 の決定 1。design.md §3.1）。 */
+  libraryOpen: {
+    upgrading: 'ライブラリを更新しています',
+    /** 開けなかった理由の見出し（AppError の code ごと。説明は Rust の message をそのまま出す）。 */
+    failure: {
+      LibraryTooNew: '新しい版の Kura で作られたライブラリです',
+      NoSpace: 'ディスクの空き容量が足りません',
+      BackupFailed: 'バックアップを作れませんでした',
+      UpgradeFailed: 'ライブラリを新しい版にできませんでした',
+      other: 'ライブラリを開けませんでした',
+    },
+    place: (path: string) => `場所：${path}`,
+  },
   drop: {
     message: 'ここにドロップして取り込む',
   },
@@ -614,7 +629,7 @@ export const ja = {
     title: (n: string) => `${n} 項目を取り込み`,
     nothing: '取り込めるファイルがありません',
     nothingDetail:
-      '対応している形式は、画像（JPEG・PNG・HEIC など）、動画（MP4・MOV・MKV など）、音楽（MP3・FLAC・M4A など）です。',
+      '対応している形式は、画像（JPEG・PNG・HEIC など）、動画（MP4・MOV・MKV など）、音楽（MP3・FLAC・M4A など）、フォント（TTF・OTF・WOFF など）、3D（GLB）です。',
     failed: (message: string) => `取り込む項目を確認できませんでした：${message}`,
     sources: {
       others: (first: string, n: string, unit: string) => `${first} ほか ${n} ${unit}`,
@@ -625,9 +640,6 @@ export const ja = {
       skipped: (n: string) => `対象外 ${n} 件`,
     },
     stats: {
-      images: '画像',
-      videos: '動画',
-      audios: '音楽',
       total: '合計',
     },
     duplicates: (n: string) => `${n} 項目はすでにライブラリにあります（内容が同一）`,
@@ -659,7 +671,7 @@ export const ja = {
     confirm: (n: string) => `${n} 項目を取り込む`,
     confirmPlain: '取り込む',
     pickTitle: '取り込むファイルを選ぶ',
-    pickFilter: '画像・動画・音楽',
+    pickFilter: '画像・動画・音楽・フォント・3D',
   },
   player: {
     fullscreen: 'フルスクリーンにする',
@@ -957,8 +969,11 @@ export const ja = {
     integrity: '整合性チェック',
     integrityPending: '確かめています…',
     integrityOk: 'DB とファイルは一致しています',
-    integrityIssues: (missing: string, orphans: string) =>
-      `ファイルがない項目 ${missing}・DB にないファイル ${orphans}`,
+    /** 整合性チェックで見つかったもの（0 でないものだけを「・」で並べる）。 */
+    integrityMissing: (n: string) => `ファイルがない項目 ${n}`,
+    integrityOrphans: (n: string) => `DB にないファイル ${n}`,
+    /** どの表からも参照されない台帳の行（ゴミ箱を空にする途中で止まったなど。M11。docs/data-model.md §4）。 */
+    integrityUnreferenced: (n: string) => `どの項目も使っていないファイル ${n}`,
     checkAgain: 'もう一度確かめる',
     checking: '確かめています…',
     backups: 'DB のバックアップ',
@@ -1004,6 +1019,7 @@ export const ja = {
     done: (n: string) => `${n} 項目を取り込みました`,
     duplicates: (n: string) => `重複 ${n}`,
     failures: (n: string) => `失敗 ${n}`,
+    rejected: (n: string) => `対象外 ${n}`,
     failed: '取り込みに失敗しました',
     canceled: '取り込みを中止しました',
     canceledDetail: (n: string) => `${n} 項目は取り込み済みです`,

@@ -2,12 +2,14 @@ import { type MouseEvent, type PointerEvent, memo } from 'react';
 
 import { CameraIcon } from '../../components/icons/CameraIcon';
 import { DownloadIcon } from '../../components/icons/DownloadIcon';
-import { MusicIcon } from '../../components/icons/MusicIcon';
+import { KindIcon } from '../../components/icons/KindIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
 import { UnitIcon } from '../../components/icons/UnitIcon';
 import { Waveform } from '../../components/icons/Waveform';
+import { KindArt } from '../../components/KindArt/KindArt';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
+import { hasDuration, isItemKind, isPlayable, type ItemKind, kindLabel } from '../../ipc/kinds';
 import { thumbUrl } from '../../ipc/media';
 import type { UnitSummaryDto } from '../../ipc/units';
 import { formatCount, formatDuration } from '../../lib/format';
@@ -16,6 +18,16 @@ import styles from './Tile.module.css';
 
 /** ダウンロードで取得したものの取得元。 */
 const DOWNLOAD_SITES = new Set(['youtube', 'pixiv', 'x', 'nicovideo', 'soundcloud']);
+
+/** 再生しない素材（フォント・3D）か。サムネイルがなければ種類の絵を出す（design.md §3.1）。 */
+function isAsset(kind: string | undefined): kind is ItemKind {
+  return isItemKind(kind) && !isPlayable(kind);
+}
+
+/** 左下に種類のバッジを出す種類（音楽と、フォント・3D。design.md §4 のタイル）。 */
+function hasKindBadge(kind: string | undefined): kind is ItemKind {
+  return kind === 'audio' || isAsset(kind);
+}
 
 /** タイルのマウス・ドラッグの受け口（グリッドが持つ）。 */
 export interface TileHandlers {
@@ -75,16 +87,15 @@ export const Tile = memo(function Tile({
           draggable={false}
         />
       )}
-      {kind === 'audio' && (
-        <>
-          {item?.thumbState !== 'ready' && <Waveform className={styles.waveform} />}
-          <span className={`${styles.badge} ${styles.bottomLeft}`}>
-            <MusicIcon size={10} strokeWidth={2.4} />
-            {ja.tile.music}
-          </span>
-        </>
+      {isAsset(kind) && item?.thumbState !== 'ready' && <KindArt kind={kind} />}
+      {kind === 'audio' && item?.thumbState !== 'ready' && <Waveform className={styles.waveform} />}
+      {hasKindBadge(kind) && (
+        <span className={`${styles.badge} ${styles.bottomLeft}`}>
+          <KindIcon kind={kind} size={10} strokeWidth={2.4} />
+          {kindLabel(kind)}
+        </span>
       )}
-      {(kind === 'audio' || kind === 'video') && duration !== null && (
+      {hasDuration(kind) && duration !== null && (
         <span className={`${styles.badge} ${styles.bottomRight}`}>
           {kind === 'video' && <PlayIcon size={8} />}
           {formatDuration(duration)}
@@ -155,6 +166,9 @@ export const UnitTile = memo(function UnitTile({
         )}
         {cover?.kind === 'audio' && cover.thumbState !== 'ready' && (
           <Waveform className={styles.waveform} />
+        )}
+        {cover && isAsset(cover.kind) && cover.thumbState !== 'ready' && (
+          <KindArt kind={cover.kind} />
         )}
         <span className={`${styles.badge} ${styles.bottomRight}`}>
           {formatCount(count)}

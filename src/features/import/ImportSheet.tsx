@@ -19,6 +19,7 @@ import {
   describeSources,
   folderChoices,
   folderTagExample,
+  kindStats,
   reproduceExample,
   unitExample,
 } from './describe';
@@ -138,9 +139,9 @@ function SheetBody({ titleId, preview }: { titleId: string; preview: ImportPrevi
       </header>
 
       <dl className={styles.stats}>
-        <Stat label={t.stats.images} value={formatCount(preview.images)} />
-        <Stat label={t.stats.videos} value={formatCount(preview.videos)} />
-        <Stat label={t.stats.audios} value={formatCount(preview.audios)} />
+        {kindStats(preview).map((s) => (
+          <Stat key={s.kind} label={s.label} value={formatCount(s.count)} />
+        ))}
         <Stat label={t.stats.total} value={formatBytes(preview.totalBytes)} />
       </dl>
 

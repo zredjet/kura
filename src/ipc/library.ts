@@ -1,19 +1,24 @@
 import {
+  type AppError,
   type BackupDto,
   commands,
+  events,
   type IntegrityDto,
   type LibraryUsageDto,
   type LibraryInfoDto,
   type LibraryRestoreDto,
+  type LibraryUpgradeEvent,
   type LocationCheckDto,
 } from './bindings';
 import { unwrap } from './result';
 
 export type {
+  AppError,
   BackupDto,
   IntegrityDto,
   LibraryInfoDto,
   LibraryRestoreDto,
+  LibraryUpgradeEvent,
   LibraryUsageDto,
   LocationCheckDto,
 };
@@ -33,7 +38,17 @@ export function openLibrary(path: string): Promise<LibraryInfoDto> {
   return unwrap(commands.libraryOpen(path));
 }
 
-/** 起動時に前回のライブラリを開く。 */
+/**
+ * ライブラリの DB を新しい版にする知らせ（`library://upgrade`）を受け取る。戻り値で受け取りをやめる。
+ * 開く IPC（`restoreLibrary`・`openLibrary`）の中で来るので、それより先に受け取りを始めておく。
+ */
+export function onLibraryUpgrade(
+  handler: (event: LibraryUpgradeEvent) => void,
+): Promise<() => void> {
+  return events.libraryUpgrade.listen((e) => handler(e.payload));
+}
+
+/** 起動時に前回のライブラリを開く。開けなかった理由は `error`（例外にしない）。 */
 export function restoreLibrary(): Promise<LibraryRestoreDto> {
   return unwrap(commands.libraryRestore());
 }

@@ -14,11 +14,10 @@ import {
 import { type MenuEntry, openMenuAt } from '../../components/Menu/menuStore';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
 import { GripIcon } from '../../components/icons/GripIcon';
-import { ImageIcon } from '../../components/icons/ImageIcon';
-import { MusicIcon } from '../../components/icons/MusicIcon';
-import { VideoIcon } from '../../components/icons/VideoIcon';
+import { KindIcon } from '../../components/icons/KindIcon';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
+import { hasDuration, kindLabel } from '../../ipc/kinds';
 import { thumbUrl } from '../../ipc/media';
 import type { EntryRowDto, PlaylistContentsDto, PlaylistDto } from '../../ipc/playlists';
 import { formatCount, formatDuration } from '../../lib/format';
@@ -30,18 +29,6 @@ import { type ListRow, listRows, rowHeight } from './rows';
 import styles from './PlaylistView.module.css';
 
 const t = ja.playlist;
-
-type Kind = 'image' | 'video' | 'audio';
-
-function KindIcon({ kind, size = 18 }: { kind: string | undefined; size?: number }) {
-  if (kind === 'audio') {
-    return <MusicIcon size={size} />;
-  }
-  if (kind === 'video') {
-    return <VideoIcon size={size} />;
-  }
-  return <ImageIcon size={size} />;
-}
 
 /** サムネイル（なければ種類の絵）。 */
 export function Thumb({
@@ -56,22 +43,22 @@ export function Thumb({
       {item?.thumbState === 'ready' ? (
         <img src={thumbUrl(item.hash, 's')} alt="" loading="lazy" />
       ) : (
-        <KindIcon kind={item?.kind} />
+        <KindIcon kind={item?.kind} size={18} />
       )}
     </span>
   );
 }
 
-/** 「動画 · 0:45」「画像 · 8秒」。 */
+/** 「動画 · 0:45」「画像 · 8秒」「フォント」（フォント・3D は再生しないので長さを出さない）。 */
 export function itemSub(item: ItemSummaryDto | undefined, imageMs: number): string {
   if (!item) {
     return '';
   }
-  const kind = ja.kinds[item.kind as Kind] ?? '';
+  const kind = kindLabel(item.kind);
   const length =
     item.kind === 'image'
       ? ja.player.seconds(String(Math.round(imageMs / 1000)))
-      : item.durationMs !== null
+      : hasDuration(item.kind) && item.durationMs !== null
         ? formatDuration(item.durationMs)
         : '';
   return length ? `${kind} · ${length}` : kind;
@@ -385,7 +372,7 @@ export function EntryList({
           );
         }
         const open = opened.has(entry.entryId);
-        const kinds = entry.kinds.map((k) => ja.kinds[k as Kind] ?? k).join('・');
+        const kinds = entry.kinds.map(kindLabel).join('・');
         const cover = entry.coverItemId !== null ? getCached(entry.coverItemId) : undefined;
         return (
           <div

@@ -1,4 +1,5 @@
 import type { ItemSummaryDto } from '../../../ipc/items';
+import { hasDuration, isPlayable, needsProxy, type TimedKind } from '../../../ipc/kinds';
 import { type BgmAction, type BgmStatus, bgmOnEnter, bgmOnTrackEnd } from './bgm';
 import { FADE_MS, Fader } from './fade';
 import { nextIndex, playedDelta, prevTarget, stepImageMs } from './nav';
@@ -55,7 +56,7 @@ export class PlaybackController {
   private bgmItem: number | null = null;
   /** BGM の曲が自分のスロット（音楽のスロット）として流れているときのスロット番号。 */
   private bgmSlot: number | null = null;
-  private readonly preloaders: Record<'audio' | 'video', MediaPort>;
+  private readonly preloaders: Record<TimedKind, MediaPort>;
   private readonly preloadedImages: string[] = [];
   private volume = 0.8;
   private prefs: ControllerPrefs = { throughImages: true, loop: false, imageMs: 8000 };
@@ -147,19 +148,19 @@ export class PlaybackController {
   snapshot(): PlayerSnapshot {
     const queue = this.queue;
     const itemId = queue ? (queue.itemIds[this.index] ?? null) : null;
-    const item = itemId !== null ? this.items.get(itemId) : undefined;
+    const kind = slotKindOf(itemId !== null ? this.items.get(itemId) : undefined);
     return {
       index: this.index,
       length: queue?.itemIds.length ?? 0,
       playing: this.playing,
       phase: this.phase,
-      kind: item ? (item.kind as SlotKind) : null,
+      kind,
       itemId,
       positionMs: this.positionMs,
       durationMs: this.durationMs,
       imageMs: this.imageMs(),
       imageOverridden: this.imageOverride !== null,
-      bgm: this.bgmInfo(item?.kind as SlotKind | undefined),
+      bgm: this.bgmInfo(kind),
       repeat: this.repeat,
       groupIndex: queue?.groups.length ? (queue.groupIndex[this.index] ?? null) : null,
       groupCount: queue?.groups.length ?? 0,
@@ -407,7 +408,11 @@ export class PlaybackController {
       this.emit();
       return;
     }
-    const kind = item.kind as SlotKind;
+    const kind = slotKindOf(item);
+    if (kind === null) {
+      this.skipUnplayable();
+      return;
+    }
     if (kind !== 'video' && this.video) {
       stopMedia(this.video);
     }
@@ -427,6 +432,20 @@ export class PlaybackController {
     this.preloadAhead();
     this.requestAhead();
     this.emit();
+  }
+
+  /**
+   * 再生しない種類（フォント・3D）のスロットを飛ばす。キューは Rust が除いて作るので、ここに来るのは万一のときだけ。
+   * 鳴らさず・報告せずに次のスロットへ進み、最後なら終わりにする（全体の繰り返しでも折り返さない。
+   * 飛ばすものだけのキューで回り続けないため）。
+   */
+  private skipUnplayable(): void {
+    const length = this.queue?.itemIds.length ?? 0;
+    if (this.index + 1 < length) {
+      this.enter(this.index + 1);
+    } else {
+      this.finish();
+    }
   }
 
   /** 今のスロットを離れる：再生した時間を報告する（判定は Rust）。 */
@@ -835,8 +854,8 @@ export class PlaybackController {
           this.preloadedImages.splice(0, Math.max(0, this.preloadedImages.length - 8));
           this.deps.preloadImage(url);
         }
-      } else if (i === this.index + 1 && item.kind !== 'image' && item.proxyState !== 'pending') {
-        const preloader = this.preloaders[item.kind === 'video' ? 'video' : 'audio'];
+      } else if (i === this.index + 1 && hasDuration(item.kind) && item.proxyState !== 'pending') {
+        const preloader = this.preloaders[item.kind];
         if (preloader.src !== url) {
           preloader.src = url;
         }
@@ -850,7 +869,7 @@ export class PlaybackController {
     const want: number[] = [];
     for (let i = this.index; i <= this.index + LOOKAHEAD && i < ids.length; i++) {
       const item = this.items.get(ids[i] ?? -1);
-      if (item && item.kind !== 'image' && ['unknown', 'pending'].includes(item.proxyState)) {
+      if (item && needsProxy(item.kind) && ['unknown', 'pending'].includes(item.proxyState)) {
         want.push(item.id);
       }
     }
@@ -867,8 +886,7 @@ export class PlaybackController {
   }
 
   private currentKind(): SlotKind | null {
-    const item = this.currentItem();
-    return item ? (item.kind as SlotKind) : null;
+    return slotKindOf(this.currentItem());
   }
 
   /** 今のスロットの音楽・動画を鳴らしている要素。 */
@@ -887,7 +905,7 @@ export class PlaybackController {
     return this.imageOverride ?? this.queue?.imageDurationMs[this.index] ?? this.prefs.imageMs;
   }
 
-  private bgmInfo(kind: SlotKind | undefined): BgmInfo | null {
+  private bgmInfo(kind: SlotKind | null): BgmInfo | null {
     if (kind !== 'image' || this.bgmStatus !== 'playing' || this.bgmItem === null) {
       return null;
     }
@@ -921,6 +939,11 @@ export class PlaybackController {
 
 function clampVolume(v: number): number {
   return Math.min(1, Math.max(0, v));
+}
+
+/** スロットの種類（再生しない種類・概要がまだないものは null）。 */
+function slotKindOf(item: ItemSummaryDto | undefined): SlotKind | null {
+  return item && isPlayable(item.kind) ? item.kind : null;
 }
 
 /** 秒をミリ秒の整数にする（Rust には整数で渡す）。長さがわからなければ null。 */

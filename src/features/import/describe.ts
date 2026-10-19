@@ -1,6 +1,13 @@
 import { ja } from '../../i18n/ja';
 import type { FolderNodeDto } from '../../ipc/folders';
 import type { ImportPreviewDto } from '../../ipc/import';
+import {
+  countsFromPlural,
+  isPlayable,
+  type ItemKind,
+  KIND_ORDER,
+  kindLabel,
+} from '../../ipc/kinds';
 import { formatCount } from '../../lib/format';
 
 const t = ja.import;
@@ -28,6 +35,21 @@ export function describeSources(preview: ImportPreviewDto): string {
     parts.push(t.sources.skipped(formatCount(preview.skipped)));
   }
   return parts.join(' · ');
+}
+
+/**
+ * 種類別の件数の欄（Import.dc.html）：画像・動画・音楽は 0 件でも出し（モックの並び）、
+ * フォント・3D は 1 件以上のときだけ出す（design.md §3.1）。
+ */
+export function kindStats(
+  preview: ImportPreviewDto,
+): { kind: ItemKind; label: string; count: number }[] {
+  const counts = countsFromPlural(preview);
+  return KIND_ORDER.filter((kind) => isPlayable(kind) || counts[kind] > 0).map((kind) => ({
+    kind,
+    label: kindLabel(kind),
+    count: counts[kind],
+  }));
 }
 
 /** 取り込むボタンの文言（重複の見込みを除いた数）。 */

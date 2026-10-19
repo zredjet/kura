@@ -11,23 +11,35 @@ import { checkLocation, type LocationCheckDto } from '../../ipc/library';
 import { isIpcError } from '../../ipc/result';
 import { tildePath } from '../../lib/format';
 import { useLibraryStore } from '../../stores/libraryStore';
+import { type OpenFailure, openFailure, openFailureOf } from './openFailure';
 import styles from './Welcome.module.css';
 
 const t = ja.welcome;
 
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/** 開けなかった理由（見出しと説明。場所が分かれば場所も）。 */
+function Failure({ failure, path }: { failure: OpenFailure; path?: string | null }) {
+  return (
+    <div className={styles.failure} role="alert">
+      <p className={styles.failureTitle}>
+        <WarningIcon size={14} strokeWidth={2} />
+        {failure.title}
+      </p>
+      {failure.detail && <p className={styles.failureDetail}>{failure.detail}</p>}
+      {path && <p className={styles.failurePath}>{ja.libraryOpen.place(path)}</p>}
+    </div>
+  );
 }
 
 /** ライブラリがまだないときの画面（初回起動）。新しく作るか、既存のものを開く。 */
 export function Welcome() {
   const missingPath = useLibraryStore((s) => s.missingPath);
+  const restoreError = useLibraryStore((s) => s.restoreError);
   const createLibrary = useLibraryStore((s) => s.create);
   const openLibrary = useLibraryStore((s) => s.open);
   const [home, setHome] = useState<string | null>(null);
   const [location, setLocation] = useState<LocationCheckDto | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<OpenFailure | null>(null);
   const titleId = useId();
 
   useEffect(() => {
@@ -55,7 +67,7 @@ export function Welcome() {
     }
   };
 
-  const run = async (action: () => Promise<void>, describe: (err: unknown) => string) => {
+  const run = async (action: () => Promise<void>, describe: (err: unknown) => OpenFailure) => {
     setBusy(true);
     setError(null);
     try {
@@ -76,7 +88,7 @@ export function Welcome() {
         location.status === 'existingLibrary'
           ? openLibrary(location.path)
           : createLibrary(location.path),
-      (err) => t.failed(messageOf(err)),
+      openFailureOf,
     );
   };
 
@@ -85,7 +97,8 @@ export function Welcome() {
     if (picked) {
       await run(
         () => openLibrary(picked),
-        (err) => (isIpcError(err, 'NotFound') ? t.notALibrary : t.failed(messageOf(err))),
+        (err) =>
+          isIpcError(err, 'NotFound') ? { title: t.notALibrary, detail: '' } : openFailureOf(err),
       );
     }
   };
@@ -104,6 +117,12 @@ export function Welcome() {
           <p className={styles.lead}>{t.lead}</p>
         </div>
 
+        {restoreError && (
+          <Failure
+            failure={openFailure(restoreError.error)}
+            path={restoreError.path && tildePath(restoreError.path, home)}
+          />
+        )}
         {missingPath && (
           <p className={styles.notice} role="status">
             {t.missing(tildePath(missingPath, home))}
@@ -154,11 +173,7 @@ export function Welcome() {
           {t.openExisting}
         </Button>
 
-        {error && (
-          <p className={styles.error} role="alert">
-            {error}
-          </p>
-        )}
+        {error && <Failure failure={error} />}
       </section>
     </div>
   );

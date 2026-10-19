@@ -2,14 +2,13 @@ import type { CSSProperties } from 'react';
 
 import { CloseIcon } from '../../components/icons/CloseIcon';
 import { ExpandIcon } from '../../components/icons/ExpandIcon';
-import { ImageIcon } from '../../components/icons/ImageIcon';
-import { MusicIcon } from '../../components/icons/MusicIcon';
+import { KindIcon } from '../../components/icons/KindIcon';
 import { PauseIcon } from '../../components/icons/PauseIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
 import { SkipBackIcon } from '../../components/icons/SkipBackIcon';
 import { SkipForwardIcon } from '../../components/icons/SkipForwardIcon';
-import { VideoIcon } from '../../components/icons/VideoIcon';
 import { ja } from '../../i18n/ja';
+import { hasDuration, kindLabel } from '../../ipc/kinds';
 import { thumbUrl } from '../../ipc/media';
 import { formatCount, formatDuration } from '../../lib/format';
 import { closePlayer, playerController } from './playerActions';
@@ -45,13 +44,15 @@ export function MiniPlayer() {
 
   let upNext: string = t.lastItem;
   if (next) {
-    const kind = ja.kinds[next.kind as 'image' | 'video' | 'audio'] ?? '';
+    const kind = kindLabel(next.kind);
     const ms =
       next.kind === 'image'
         ? snapshot.imageOverridden
           ? snapshot.imageMs
           : (queue.imageDurationMs[snapshot.index + 1] ?? snapshot.imageMs)
-        : next.durationMs;
+        : hasDuration(next.kind)
+          ? next.durationMs
+          : null;
     const length =
       ms === null
         ? ''
@@ -67,12 +68,8 @@ export function MiniPlayer() {
       <span className={styles.art} aria-hidden="true">
         {item?.thumbState === 'ready' ? (
           <img src={thumbUrl(item.hash, 's')} alt="" />
-        ) : item?.kind === 'audio' ? (
-          <MusicIcon size={18} />
-        ) : item?.kind === 'video' ? (
-          <VideoIcon size={18} />
         ) : (
-          <ImageIcon size={18} />
+          <KindIcon kind={item?.kind} size={18} />
         )}
       </span>
       <span className={styles.text}>

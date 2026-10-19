@@ -10,6 +10,7 @@ import { ReshuffleIcon } from '../../components/icons/ReshuffleIcon';
 import { SparkleIcon } from '../../components/icons/SparkleIcon';
 import { Segmented } from '../../components/Segmented/Segmented';
 import { ja } from '../../i18n/ja';
+import { countsFromPlural, kindBreakdown } from '../../ipc/kinds';
 import {
   getPlaylist,
   type PlaylistContentsDto,
@@ -98,14 +99,8 @@ function Header({ playlist, contents }: { playlist: PlaylistDto; contents: Playl
     .slice(0, 4);
 
   const parts = [t.items(formatCount(contents.itemCount))];
-  for (const [kind, n] of [
-    [ja.kinds.image, contents.images],
-    [ja.kinds.audio, contents.audios],
-    [ja.kinds.video, contents.videos],
-  ] as const) {
-    if (n > 0) {
-      parts.push(t.kindCount(kind, formatCount(n)));
-    }
+  for (const { label, count } of kindBreakdown(countsFromPlural(contents))) {
+    parts.push(t.kindCount(label, formatCount(count)));
   }
   if (contents.totalMs > 0) {
     parts.push(t.approx(formatLongDuration(contents.totalMs)));

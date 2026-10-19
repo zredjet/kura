@@ -3,8 +3,10 @@ import { useEffect, useId } from 'react';
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
 import { CloseIcon } from '../../components/icons/CloseIcon';
+import { KindArt } from '../../components/KindArt/KindArt';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry } from '../../ipc/items';
+import { isPlayable } from '../../ipc/kinds';
 import { fileUrl, playUrl, thumbUrl } from '../../ipc/media';
 import { formatCount } from '../../lib/format';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
@@ -105,6 +107,10 @@ export function QuickLook() {
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             <audio src={playUrl(item.hash)} controls autoPlay />
           </div>
+        )}
+        {/* フォント・3D：見本・描いたサムネイルは段 3。それまでは種類の絵 */}
+        {item && !isPlayable(item.kind) && (
+          <KindArt key={item.id} kind={item.kind} className={styles.kindArt} />
         )}
       </div>
 

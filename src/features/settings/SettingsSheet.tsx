@@ -35,6 +35,7 @@ import { ToolsPanel } from '../downloads/ToolsPanel';
 import { updatePlayerPrefs } from '../player/playerActions';
 import { usePlayerStore } from '../player/playerStore';
 import { createNew, openOther } from '../sidebar/LibrarySwitcher';
+import { integritySummary } from './integrity';
 import styles from './Settings.module.css';
 
 const t = ja.settings;
@@ -167,7 +168,6 @@ function LibraryTab() {
   const reveal = (path: string) => {
     revealPath(path).catch(fail);
   };
-  const healthy = integrity && integrity.missingFiles === 0 && integrity.orphanFiles === 0;
 
   return (
     <>
@@ -205,14 +205,7 @@ function LibraryTab() {
       <section className={styles.group} aria-label={t.integrity}>
         <h3 className={styles.groupTitle}>{t.integrity}</h3>
         <p className={styles.text} role="status">
-          {integrity === null
-            ? t.integrityPending
-            : healthy
-              ? t.integrityOk
-              : t.integrityIssues(
-                  formatCount(integrity.missingFiles),
-                  formatCount(integrity.orphanFiles),
-                )}
+          {integrity === null ? t.integrityPending : integritySummary(integrity).text}
         </p>
         <div className={styles.buttons}>
           <Button size="sm" disabled={checking} onClick={check}>

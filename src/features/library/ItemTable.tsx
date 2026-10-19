@@ -1,13 +1,12 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
-import { ImageIcon } from '../../components/icons/ImageIcon';
-import { MusicIcon } from '../../components/icons/MusicIcon';
+import { KindIcon } from '../../components/icons/KindIcon';
 import { StarIcon } from '../../components/icons/StarIcon';
 import { UnitIcon } from '../../components/icons/UnitIcon';
-import { VideoIcon } from '../../components/icons/VideoIcon';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry, type ItemSummaryDto, type SortKey, unitIdOf } from '../../ipc/items';
+import { hasDuration, kindLabel } from '../../ipc/kinds';
 import { thumbUrl } from '../../ipc/media';
 import type { UnitSummaryDto } from '../../ipc/units';
 import { relativeDateTime } from '../../lib/dates';
@@ -226,14 +225,10 @@ const TableRow = memo(function TableRow({
   const t = ja.table;
   const kind = item?.kind;
   const name = unit ? unit.name : (item?.title ?? '');
-  const kindLabel = unit
-    ? t.unitKind(formatCount(unit.count))
-    : kind
-      ? (ja.kinds[kind as keyof typeof ja.kinds] ?? '')
-      : '';
+  const kindText = unit ? t.unitKind(formatCount(unit.count)) : kindLabel(kind);
   const durationMs = unit ? unit.durationMs : (item?.durationMs ?? null);
   const duration =
-    durationMs !== null && durationMs > 0 && (unit || kind !== 'image')
+    durationMs !== null && durationMs > 0 && (unit || hasDuration(kind))
       ? formatDuration(durationMs)
       : '';
   const rating = unit ? unit.rating : (item?.rating ?? 0);
@@ -241,7 +236,7 @@ const TableRow = memo(function TableRow({
   const thumb = unit ? unit.cover : item;
   const label = item
     ? spokenLabel(item)
-    : [name, kindLabel, duration, rating > 0 ? ja.inspector.rating(Math.round(rating)) : '']
+    : [name, kindText, duration, rating > 0 ? ja.inspector.rating(Math.round(rating)) : '']
         .filter(Boolean)
         .join('、');
   return (
@@ -272,7 +267,11 @@ const TableRow = memo(function TableRow({
           />
         ) : (
           <span className={styles.kindIcon}>
-            <KindIcon kind={unit ? 'unit' : kind} />
+            {unit ? (
+              <UnitIcon size={14} strokeWidth={1.9} />
+            ) : (
+              <KindIcon kind={kind} size={14} strokeWidth={1.9} />
+            )}
           </span>
         )}
       </span>
@@ -280,7 +279,7 @@ const TableRow = memo(function TableRow({
         {name}
         {unit && <UnitIcon size={12} strokeWidth={2} />}
       </span>
-      <span className={`${styles.cell} ${styles.kind}`}>{kindLabel}</span>
+      <span className={`${styles.cell} ${styles.kind}`}>{kindText}</span>
       <span className={`${styles.cell} ${styles.duration}`}>{duration}</span>
       <span className={`${styles.cell} ${styles.rating}`}>
         {[1, 2, 3, 4, 5].map((n) => (
@@ -296,16 +295,3 @@ const TableRow = memo(function TableRow({
     </button>
   );
 });
-
-function KindIcon({ kind }: { kind: string | undefined }) {
-  if (kind === 'unit') {
-    return <UnitIcon size={14} strokeWidth={1.9} />;
-  }
-  if (kind === 'video') {
-    return <VideoIcon size={14} strokeWidth={1.9} />;
-  }
-  if (kind === 'audio') {
-    return <MusicIcon size={14} strokeWidth={1.9} />;
-  }
-  return <ImageIcon size={14} strokeWidth={1.9} />;
-}
