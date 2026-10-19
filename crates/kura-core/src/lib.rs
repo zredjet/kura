@@ -6,6 +6,7 @@ pub mod capture;
 pub mod codec_ext;
 pub mod db;
 pub mod download;
+pub mod edit;
 pub mod entries;
 pub mod error;
 pub mod export;
