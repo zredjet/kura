@@ -8,11 +8,18 @@ paths:
 - 色・余白・角丸・文字サイズは `src/styles/tokens.css` の CSS 変数だけを使う。色コードの直書き禁止。
 - コンポーネントは `src/components/`（汎用部品）と `src/features/<機能>/`（画面）に分ける。
 - IPC は `src/ipc/bindings.ts`（自動生成、手で編集しない）を `src/ipc/` のラッパー経由で呼ぶ。
-- 画像・動画・音声の URL は `src/ipc/media.ts` の `thumbUrl()` / `playUrl()` で組み立てる（`kura://localhost/...`）。
+- 画像・動画・音声とその派生（サムネイル・ジャケット・波形・試聴の PCM・アニメの帯）の URL は `src/ipc/media.ts` の関数だけで組み立てる（`kura://localhost/...`。`kura://` の文字列をほかに書かない）。
+  - `thumbUrl(hash, size, rev)`：`/thumb/{hash}/{s|l}`。`rev`（`thumbRev`）が 0 より大きいときだけ `?r={rev}` を付ける（作り直したサムネイルを WebKit のメモリのキャッシュから出さないため。`rev` を渡し忘れない）。
+  - `artUrl(hash)`・`fileUrl(hash)`・`playUrl(hash)`：ジャケット・元のファイル・再生用（Range 対応）。
+  - `peaksUrl(hash)`：`/peaks/{hash}`（波形の段 `kura-peaks`。immutable）。`fetch` して `src/lib/asset/peaks.ts` の `parsePeaks` で読む。
+  - `pcmUrl(hash, start, end)`：`/pcm/{hash}/{start}-{end}`（試聴の PCM。フレームの半開区間で、0 以上の整数・`start < end`。キャッシュしない）。`fetch` して `src/lib/asset/wav.ts` の `readPcmWav` で読む（`decodeAudioData` は使わない。文脈のレートに直されてループ点が標本で合わなくなる）。
+  - `animUrl(hash)`：`/anim/{hash}/1`（アニメの帯の PNG。immutable。帯の並べ方を変えたら番号を上げる）。
+- ループの試聴は `src/lib/assetAudio.ts` の `Audition` を通す。`AudioBufferSourceNode` の `loopStart`・`loopEnd` を使わない（秒に直すと標本がずれる。本体だけのバッファを `loop` で回す）。文脈は `ContextPool` から元のレートで取る。
 - 一覧・グリッド・キューは必ず仮想スクロール。1 万件を DOM に並べない。
 - 検索結果は ID 配列（`Int32Array` など）で保持し、詳細は見えている範囲だけ取得してキャッシュする。
 - ドメインデータを `localStorage` に置かない（サイドバーの開閉など見た目の設定だけ可）。
 - インタラクティブ要素は `<button>` / `<a>` / `<input>`。`div` に `onClick` を付けない。アイコンだけのボタンには `aria-label`。
-- アニメーションは 120〜200ms の ease-out。`prefers-reduced-motion` のときは切る。
+- アニメーション（画面の移り変わり）は 120〜200ms の ease-out。`prefers-reduced-motion` のときは切る。
+- 素材のアニメ・スプライトのコマ送りは上の規則の外で、ファイルのコマの長さ（0ms は 100ms）で描く（canvas の `drawImage`。経過時間から `src/lib/asset/timeline.ts` の `frameAt` でコマを決め、タイマーの刻みに頼らない）。ただし `prefers-reduced-motion` のときは自動で再生しない（先頭のコマと再生ボタンを出し、押したときだけ回す）。
 - UI 文言は `src/i18n/ja.ts` から参照する。
 - テストは Vitest + Testing Library。ロジック（キュー操作、検索トークン化）はフックや純粋関数に切り出してテストする。
