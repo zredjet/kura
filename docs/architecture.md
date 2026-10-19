@@ -106,7 +106,7 @@
 | ツール | `tools_status()` → `ToolInfo[]` / `tools_set_path(tool, path?)` / `tools_update()` → `{ brewCommand?, outputs }` | 版・場所・Homebrew 版か。場所の指定（app.json）。「更新を確認」（ADR-100） |
 | 設定 | `settings_get(keys)` / `settings_set(map)` | |
 | 外観 | `appearance_get()` → `Appearance` | OS の表示設定（「透明度を下げる」）。起動時に `<html data-reduce-transparency>` へ反映する（§11） |
-| 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測の結果をログに書く（§13） |
+| 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測と、`VITE_KURA_SELFTEST=1` の自己点検（§4.2）の結果をログに書く（§13） |
 
 変更（patch）の型は、省いた項目を変えない。色・メモの空文字は「消す」の意味（`Option<Option<T>>` を JSON で表しにくいため）。
 
@@ -123,15 +123,103 @@
 | `/art/{hash}` | 音楽のジャケット | 同上 |
 | `/file/{hash}` | 元ファイル | `Accept-Ranges: bytes`、Range があれば 206 と `Content-Range` |
 | `/play/{hash}` | 再生用：プロキシがあればプロキシ、なければ元ファイル | 同上 |
+| `/peaks/{hash}` | 波形の段（`kura-peaks` 版 1。`peaks/ab/<hash>.peaks`。M11） | `immutable`。解析していなければ 404 |
+| `/pcm/{hash}/{start}-{end}` | 試聴用の PCM（WAV。フレーム `[start, end)`。M11） | キャッシュしない（`no-store`） |
+| `/anim/{hash}/{版}` | アニメの帯の PNG（`anim/ab/<hash>-<版>.png`。M11） | `immutable` |
 
 - Range は 1 区間だけ対応（`bytes=start-end` / `bytes=start-` / `bytes=-末尾の長さ`）。範囲外・不正な Range は 416。応答本体は最大 4MB ずつ返す（`bytes=start-` には先頭から 4MB だけ）。
-- `{hash}` は 64 桁の小文字 16 進だけを受け付ける。それ以外とファイルがないものは 404、ライブラリが開かれていなければ 503。
+- `{hash}` は 64 桁の小文字 16 進だけを受け付ける。それ以外とファイルがないものは 404、ライブラリが開かれていなければ 503。`/pcm` の `{start}-{end}` は `start < end` の 10 進（u64 にあふれるもの・逆の範囲・片側だけは 404）。
+- `/peaks`・`/pcm`・`/anim` は M11 の段 1 では経路だけを持ち、404 を返す（中身は段 3。`/pcm`・`/anim` はその場で作る）。
 - 実際の置き場所：`thumbs/ab/<hash>_s.jpg`・`_l.jpg`、`art/ab/<hash>.jpg`、`proxies/ab/<hash>.mp4`、`files/ab/cd/<hash>.<ext>`（`/file`・`/play` は拡張子が分からないので `files/ab/cd/` の中を探す）。
 - WKWebView の `<video>` はサンプル単位の小さな Range（数百バイト）を多数送ってくる（60 秒・1.4MB の MOV の再生で約 3,000 回）。今は 1 回ごとにファイルを開いて読む。大きな動画での負荷は M5 で測る。
-- `RUST_LOG=kura_app_lib=debug` で要求ごとに uri・range・status・bytes をログに出す。
-- `Content-Type` は拡張子から決める。
-- ファイルを開く処理は `spawn_blocking` で行う。
-- `tauri.conf.json` の CSP（目安）：`default-src 'self' ipc: http://ipc.localhost; img-src 'self' kura:; media-src 'self' kura:; style-src 'self' 'unsafe-inline'`。外部のフォントや CDN は読み込まない（書体は SF Pro とヒラギノのみ）。
+- `RUST_LOG=kura_app_lib=debug` で要求ごとに label・method・uri・Origin・range・status・bytes をログに出す。
+- `Content-Type` は拡張子から決める。`nosniff` を付けるので、`<img>` で出す SVG は `image/svg+xml` で返す（`application/octet-stream` では表示されない）。
+- ファイルを開く処理は `spawn_blocking` で行う。受け付けの判定はその前に行う。
+
+### 4.1 受け付けと応答のヘッダ（M11）
+
+判定と付けるヘッダは `kura-core` の `serve`（`admit`・`response_headers`・`AppOrigin`）に純粋な関数として置き、CI（Linux）で回す。src-tauri はそれを HTTP の型に写すだけ。
+
+| 要求 | 応答 | CORS のヘッダ |
+|---|---|---|
+| main 以外の WebView（`capture-browser` など。`UriSchemeContext::webview_label()`。ページから偽れない） | 403。ファイルに触れない（`spawn_blocking` の前に返す） | 付けない |
+| main から、`Origin` があってアプリの origin と違う（`null` を含む） | 403 | 付ける |
+| main から `OPTIONS` | 204（`Access-Control-Allow-Methods: GET, HEAD, OPTIONS`・`Access-Control-Allow-Headers: Range`・`Access-Control-Max-Age: 600`）。WebKit は独自の scheme に事前確認を送らないが、来ても害がないように答える | 付ける |
+| main から `GET`・`HEAD`・`OPTIONS` 以外 | 405（`Allow: GET, HEAD, OPTIONS`）。kura:// は読むだけ | 付ける |
+| main から `GET`・`HEAD`（`Origin` なし、またはアプリの origin） | 200・206・404・416・500・503（`HEAD` は本体なし） | 付ける |
+
+main への応答には、エラーを含めてすべて次を付ける（エラーに ACAO がないと、fetch が状態を読めず TypeError になる）。
+
+| ヘッダ | 値 | 理由 |
+|---|---|---|
+| `Access-Control-Allow-Origin` | アプリの origin（起動時に 1 回決める固定の値。`tauri dev` なら devUrl の `scheme://host:port`、それ以外は `tauri://localhost`）。`*` は使わない | fetch・`crossorigin` の要素・`getImageData`・`decodeAudioData`・CSS の `mask-image` が読める。`*` だとどの origin からでも読める |
+| `Access-Control-Expose-Headers` | `Content-Range, Accept-Ranges, Content-Length` | Range の fetch で位置を読む |
+| `Content-Security-Policy` | `sandbox` | kura:// の SVG が文書として開かれても、スクリプトが動かない（`<img>`・fetch・フォント・音声・動画・デコードには効かないことを確かめた） |
+| `X-Content-Type-Options` | `nosniff` | 中身から型を推測させない |
+
+アプリの origin は `url::Url::origin()` に任せない（`tauri:` に対して opaque を返すので、Tauri と同じく手で組む）。
+
+**CSP**（`tauri.conf.json` の `app.security.csp`。`csp_problems` が足りない点を返し、tauri.conf.json を読むテストが CI で見張る）：
+
+```
+default-src 'self' ipc: http://ipc.localhost; img-src 'self' kura:; media-src 'self' kura:;
+connect-src 'self' ipc: http://ipc.localhost kura:; font-src 'self' kura:; style-src 'self' 'unsafe-inline';
+object-src 'none'; frame-src 'none'
+```
+
+- `connect-src` は `default-src` を上書きするので、`ipc: http://ipc.localhost` を書き直す（書かないと invoke が止まる）。
+- `blob:`・`data:`・`*` は足さない（メディアの base64 を禁じるのと同じ向き）。`script-src`（なければ `default-src`）に `kura:` を入れない。
+- 外部のフォントや CDN は読み込まない（書体は SF Pro とヒラギノのみ）。例外は、ライブラリのフォントを試し表示するときの kura:// の `FontFace`（`font-src kura:`）。
+- `pnpm tauri dev` では CSP が付かない（devUrl から読むため。実測）。CSP は `pnpm tauri build --debug --no-bundle` で確かめる。
+
+### 4.2 WebKit での合否の基準（selftest。M11）
+
+`kura-devtools selftest-library` で作ったライブラリを `KURA_LIBRARY` で開き、`VITE_KURA_SELFTEST=1` のフロント（`src/dev/selftest.ts`）が次を順に試して `bench_report('selftest', …)` でログに書く（§13）。`build`＝`pnpm tauri build --debug --no-bundle`（tauri://localhost から読み、CSP が付く）、`dev`＝`pnpm tauri dev`（http://localhost:1430、CSP なし）。合格の条件は、P1〜P8 が両方で通り、F1〜F4 が両方で止まり、予期しない CSP の違反（`securitypolicyviolation`）が 0 件で、main への応答のログすべてに ACAO があること。1 つでも外れたら種類の追加に進まない。
+
+**通るべきもの**
+
+| | 読み方 | 期待する結果 | 効く CSP の行・ヘッダ |
+|---|---|---|---|
+| P1 | `<img>`（crossorigin なし）で `/thumb/{hash}/s`（JPEG）と `/file/{hash}`（アルファ付き PNG・`<script>` 入りの SVG） | `load` し、`naturalWidth` > 0 | `img-src kura:`。SVG は `image/svg+xml` |
+| P2 | `fetch`：`/file/{hash}` の全体と `Range: bytes=0-99`、`/peaks/{hash}` | 全体は 200 で長さと先頭のマジック（`RIFF`・`glTF`）が合う。Range は 206 で `Content-Range` を読める。`/peaks` は 200 なら先頭が `kurapeak`（段 3 まで 404） | `connect-src kura:`、ACAO・ACEH |
+| P3 | `fetch`：ない中身の `/file/{hash}` と、経路の外 | 状態 404 を読める（TypeError にならない） | `connect-src kura:`、エラーにも ACAO |
+| P4 | `new FontFace(name, 'url(kura://…/file/{ttf})')` を `load` して `document.fonts` に足す | `loaded` になり、代わりの書体と字の幅が変わる | `font-src kura:` |
+| P5 | `fetch` した WAV を `decodeAudioData`、`<audio crossorigin="anonymous">` で `/play/{hash}` | 長さ（フレーム数）が合う。`loadedmetadata` で長さが合う | `connect-src kura:`・`media-src kura:`、ACAO |
+| P6 | `<img crossOrigin="anonymous">` で PNG を読み、canvas の `getImageData` | 汚れずに読め、左上の画素が [255, 0, 0, 128] | `img-src kura:`、ACAO |
+| P7 | CSS の `mask-image: url(kura://…/file/{png})`（フォントのサムネイルの色付けと同じ形） | 違反がなく、要求が `Origin` 付きで 200・ACAO がアプリの origin（ログの `p=P7`。CSS の画像の読み込みはページから見えず、WebKit は kura:// の Resource Timing を残さない） | `img-src kura:`、ACAO（mask の画像は CORS で読む） |
+| P8 | 既存の invoke（`appearance_get`）と、結果の報告（`bench_report`） | 通る | `connect-src ipc: http://ipc.localhost` |
+
+**止まるべきもの**
+
+| | 読み方 | 期待する結果 | 効くもの |
+|---|---|---|---|
+| F1 | よその origin：`sandbox="allow-scripts"` の `srcdoc` の iframe（`Origin: null`）から kura:// を fetch | 読めない（枠が開かないか、403） | 移動の制限（§11。`about:srcdoc` を止める）、`admit` の Origin の判定 |
+| F2 | ほかの WebView：アプリ内ブラウザ（`capture-browser`）で開いた http のページから kura:// の `<img>` と fetch | 403・CORS のヘッダなし（ログに `label=capture-browser`）。`<img>` は `error`、fetch は TypeError | `admit` のラベルの判定 |
+| F3 | `GET`・`HEAD`・`OPTIONS` 以外：main から `POST`・`PUT`・`DELETE` の fetch | 405 を読める（中身を返さない）。`OPTIONS` は 204、`HEAD` は 200 で本体なし（`Content-Length` は読める） | `admit` のメソッドの判定 |
+| F4 | main の外への移動：main を kura:// の SVG と https のページへ移す、iframe に kura:// の SVG | 移動は `on_navigation` が止め（ログ）、ページはそのまま。iframe は `frame-src` の違反（build）か移動の制限（dev）で開かず、SVG のスクリプトは動かない | `frame-src 'none'`、移動の制限（§11）、応答の `CSP: sandbox` |
+
+**結果**（M11 の段 1。macOS 26.7・tauri 2.12.2・wry 0.57.0。`kura-devtools selftest-library` のライブラリ。両方とも合格）
+
+| | build（tauri://localhost、CSP あり） | dev（http://localhost:1430、CSP なし） |
+|---|---|---|
+| P1 | 通る（サムネイル 64・PNG 4・SVG 32px） | 同じ |
+| P2 | 通る（WAV 200・44,144 バイト・`RIFF`、glb 200・`glTF`、Range 206・`bytes 0-99/44144`、`/peaks` は段 3 まで 404） | 同じ |
+| P3 | 通る（ない中身・経路の外とも 404 を読める） | 同じ |
+| P4 | 通る（`loaded`、字の幅 244.34 → 240.04） | 同じ |
+| P5 | 通る（`decodeAudioData` 22,050 フレーム、`<audio crossorigin>` 0.5 秒。Range で 206 が 11 回） | 同じ |
+| P6 | 通る（[255, 0, 0, 128]） | 同じ |
+| P7 | 通る（違反なし。ログで `Origin: tauri://localhost`・200・ACAO 一致） | 通る（`Origin: http://localhost:1430`・200・ACAO 一致） |
+| P8 | 通る | 同じ |
+| F1 | 止まる（`about:srcdoc` を `on_navigation` が止め、枠が開かない） | 同じ |
+| F2 | 止まる（`<img>`・fetch とも 403・ACAO なし。ページでは `error`・TypeError） | 同じ |
+| F3 | 止まる（POST・PUT・DELETE は 405、OPTIONS は 204、HEAD は 200・本体 0） | 同じ |
+| F4 | 止まる（iframe は `frame-src` の違反。main の kura:// と https への移動は `on_navigation` が止め、ページはそのまま。SVG のスクリプトは一度も動かない） | 止まる（iframe も `on_navigation` が止める。ほかは同じ） |
+| 予期しない違反 | 0 件（予期したものは F4 の `frame-src` の 1 件） | 0 件 |
+| main への応答のログ | 33 件すべてに ACAO（`tauri://localhost`） | 33 件すべてに ACAO（`http://localhost:1430`） |
+
+- WKWebView は iframe の読み込みにも移動の判定（`decidePolicyForNavigationAction`）を呼ぶので、`on_navigation` は枠にも効く（wry は main の枠かどうかを見ずに渡す）。
+- 独自の scheme には事前確認（OPTIONS）を送らない（POST・PUT・DELETE もそのまま届いた。M11 の調べと同じ）。OPTIONS が来るのはページが自分で送ったときだけ。
+- 通常のビルド（`VITE_KURA_SELFTEST` なし）の出力には selftest のコードが入らない（条件の中の動的 import が消える）。
 
 ## 5. ジョブ
 
@@ -266,6 +354,7 @@ import_start:    ジョブとして実行
 
 - `tauri.conf.json` のウィンドウ：`titleBarStyle: "Overlay"`、`hiddenTitle: true`、`trafficLightPosition: { "x": 25, "y": 35 }`（サイドバーの中に信号機を置く）、`minWidth: 960`、`minHeight: 600`。
   - 信号機の位置は macOS 26 で実測して決めた。ネイティブの信号機は直径 14px・間隔 23px で、モックの絵（12px・20px）と寸法が違うため、1 つ目の左端（x=25）と縦の中心（y=33、サイドバー先頭の 24px 行の中央）をモックに合わせている。`y` と実際の上端の関係は「上端 = y − 9」。
+- **main の移動の制限**（M11）：main を kura:// の SVG などへ移すと、そのページのスクリプトから invoke が通ってしまう（M11 の調べで実測）。そこで main の窓は `tauri.conf.json` では `"create": false` にし、setup の最後（`AppState` を manage したあと）で `navigation::create_main_window` が `WebviewWindowBuilder::from_config`（Tauri が設定の窓を作るときと同じ口なので、上の属性はそのまま）に `on_navigation` を付けて作る。許すのはアプリの origin の中だけ（`tauri build` は `tauri://localhost`、`tauri dev` は devUrl の origin。判定は kura-core の `AppOrigin::allows_navigation`）で、kura:// ・ほかの http(s)・`about:`・`data:`・`blob:`・`file:` は止めてログ（warn）に残す。WKWebView は iframe の読み込みにも同じ判定を呼ぶので、枠も開かない（`frame-src 'none'` と重ねる）。アプリ内ブラウザ（`capture-browser`）は別の窓で、http(s) だけを許す（§10.1）。
 - ガラス表現は CSS の `backdrop-filter` で行う（`docs/decisions.md` ADR-12）。ウィンドウの透明化・private API は使わない。ネイティブの `NSGlassEffectView` は M9 で試作して見送った（ADR-124）。
 - 「透明度を下げる」がオンなら `<html data-reduce-transparency="true">` を付け、ガラスを不透明な面に置き換える。
 - ファイルのドラッグ＆ドロップは `getCurrentWebview().onDragDropEvent` で受ける（`enter` で重ね表示、`drop` で取り込みシート）。
@@ -310,6 +399,8 @@ import_start:    ジョブとして実行
 | `cargo test -p kura-devtools mem_smoke` | 編集のメモリの見積もりの煙のテスト（段 10）：固定の小さな入力（プログレッシブの JPEG → 回転・縮小 → PNG、PNG → Indexed8 → PNG、WAV → 音量 → Ogg Vorbis、層の多いアニメの aseprite（256²・8 層・4 フレーム・リンクあり）→ 反転 → APNG、1px の市松の 2048² の PNG → 8 連結の塗りつぶし → PNG）を子プロセスで回し、peak memory footprint から基準（同じ子で、ファイルに触れる前に終えるもの）を引いた量がエンジンの見積もり（`Engine::estimate`。読むファイルの長さも渡す）× 1.25 ＋ 4 MiB 以下かを確かめる（読む段だけの量も）。macOS の CI で回る（`/usr/bin/time -l` のない Linux では見送る） |
 | `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない） |
 | `VITE_KURA_BENCH=1` | グリッドを自動でスクロールし、フレーム時間を `bench_report` でログに書く |
+| `kura-devtools selftest-library --out <path> [--web <dir>] [--font <ttf>]` | kura:// と CSP の自己点検用のライブラリを作る（M11。§4.2）。アルファ付き PNG・JPEG・WAV は DB に入れ、`<script>` 入りの SVG・ttf（システムのフォントの写し）・glb は `files/` に直に置き、WAV の `kura-peaks` と、中身のハッシュの目録（決まった名前 `5e1f7e57…` で `/file` から読める）も置く。`--web` には F2 のページ `f2.html` を書く。整合性の確かめでは、DB にないファイルが 4 つ孤立して数えられる |
+| `VITE_KURA_SELFTEST=1`（と任意の `VITE_KURA_SELFTEST_F2=<f2.html の URL>`） | 起動時に §4.2 の P1〜P8・F1〜F4 を試し、`bench_report('selftest')` と `selftest-nav` でログに書く。selftest のライブラリを `KURA_LIBRARY` で開き、`RUST_LOG=info,kura_app_lib=debug` で要求ごとのログ（label・Origin・status・ACAO）も出す。CSP は `VITE_KURA_SELFTEST=1 pnpm tauri build --debug --no-bundle` で作った `target/debug/kura-app` で確かめる（`pnpm tauri dev` には CSP が付かない）。F2 のページは `python3 -m http.server 18432 --bind 127.0.0.1 -d <dir>` などで配る |
 
 M2 の実測（Apple Silicon・16 コア、リリースビルド、10 万件）：
 

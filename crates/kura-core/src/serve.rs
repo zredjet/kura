@@ -6,6 +6,18 @@
 //! | `/art/{hash}` | 音楽のジャケット |
 //! | `/file/{hash}` | 元ファイル |
 //! | `/play/{hash}` | 再生用：プロキシがあればプロキシ、なければ元ファイル |
+//! | `/peaks/{hash}` | 波形の段（M11 段 3 で中身。今は 404） |
+//! | `/pcm/{hash}/{start}-{end}` | 試聴用の PCM（M11 段 3 で中身。今は 404） |
+//! | `/anim/{hash}/{版}` | アニメの帯（M11 段 3 で中身。今は 404） |
+//!
+//! 受け付け（WebView のラベル・Origin・メソッド）と応答のヘッダ・CSP の確かめは [`access`]。
+
+pub mod access;
+
+pub use access::{
+    ALLOWED_METHODS, Admit, AppOrigin, MAIN_WEBVIEW, RELEASE_ORIGIN, admit, csp_problems,
+    origin_of, preflight_headers, response_headers,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -18,16 +30,57 @@ pub const MAX_CHUNK: u64 = 4 * 1024 * 1024;
 /// パスの種類。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    Thumb { hash: String, size: ThumbSize },
-    Art { hash: String },
-    File { hash: String },
-    Play { hash: String },
+    Thumb {
+        hash: String,
+        size: ThumbSize,
+    },
+    Art {
+        hash: String,
+    },
+    File {
+        hash: String,
+    },
+    Play {
+        hash: String,
+    },
+    /// 波形の段（`kura-peaks`）。
+    Peaks {
+        hash: String,
+    },
+    /// 試聴用の PCM。フレーム `[start, end)`（`start < end`）。
+    Pcm {
+        hash: String,
+        start: u64,
+        end: u64,
+    },
+    /// アニメの帯の PNG。`version` は帯の並べ方の版（1 から）。
+    Anim {
+        hash: String,
+        version: u32,
+    },
 }
 
+/// 中身が変わらないものの `Cache-Control`。
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
 impl Route {
-    /// 中身が変わらないもの（ハッシュ名のサムネイル・ジャケット）。長くキャッシュしてよい。
+    /// 中身が変わらないもの（ハッシュ名のサムネイル・ジャケット・波形の段・アニメの帯）。長くキャッシュしてよい。
     pub fn immutable(&self) -> bool {
-        matches!(self, Self::Thumb { .. } | Self::Art { .. })
+        matches!(
+            self,
+            Self::Thumb { .. } | Self::Art { .. } | Self::Peaks { .. } | Self::Anim { .. }
+        )
+    }
+
+    /// `Cache-Control` の値（付けないなら None）。PCM はその場で作るので残させない。
+    pub fn cache_control(&self) -> Option<&'static str> {
+        match self {
+            Self::Thumb { .. } | Self::Art { .. } | Self::Peaks { .. } | Self::Anim { .. } => {
+                Some(IMMUTABLE)
+            }
+            Self::Pcm { .. } => Some("no-store"),
+            Self::File { .. } | Self::Play { .. } => None,
+        }
     }
 }
 
@@ -48,8 +101,26 @@ pub fn parse_route(path: &str) -> Option<Route> {
         ("art", None) => Some(Route::Art { hash }),
         ("file", None) => Some(Route::File { hash }),
         ("play", None) => Some(Route::Play { hash }),
+        ("peaks", None) => Some(Route::Peaks { hash }),
+        ("pcm", Some(span)) => {
+            let (start, end) = span.split_once('-')?;
+            let (start, end) = (parse_decimal(start)?, parse_decimal(end)?);
+            (start < end).then_some(Route::Pcm { hash, start, end })
+        }
+        ("anim", Some(version)) => {
+            let version = u32::try_from(parse_decimal(version)?).ok()?;
+            (version >= 1).then_some(Route::Anim { hash, version })
+        }
         _ => None,
     }
+}
+
+/// 符号・空白のない 10 進（u64 にあふれたら None）。
+fn parse_decimal(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 fn is_hash(text: &str) -> bool {
@@ -65,6 +136,8 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
         Route::Thumb { hash, size } => layout.thumb_path(hash, *size),
         Route::Art { hash } => layout.art_path(hash),
         Route::File { hash } => find_content(layout, hash)?,
+        // 中身は M11 の段 3（波形は解析のジョブ、PCM・帯はその場で作る）。それまでは 404
+        Route::Peaks { .. } | Route::Pcm { .. } | Route::Anim { .. } => return None,
         Route::Play { hash } => {
             let proxy = layout.proxy_path(hash);
             if proxy.is_file() {
@@ -87,13 +160,30 @@ fn find_content(layout: &Layout, hash: &str) -> Option<PathBuf> {
         .map(|entry| entry.path())
 }
 
-/// 拡張子から Content-Type を決める。
+/// 拡張子から Content-Type を決める。応答に `nosniff` を付けるので、`<img>` で出す SVG は `image/svg+xml` にする。
 pub fn content_type(path: &Path) -> &'static str {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    mime_for(&ext).unwrap_or("application/octet-stream")
+    mime_for(&ext)
+        .or_else(|| served_mime(&ext))
+        .unwrap_or("application/octet-stream")
+}
+
+/// 取り込みの種類の表（`import::mime_for`）にまだない、kura:// で配る形式の MIME（M11 の種類の追加で
+/// `mime_for` が持てば、そちらが先に効く）。
+fn served_mime(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "svg" => "image/svg+xml",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "glb" => "model/gltf-binary",
+        "psd" | "psb" => "image/vnd.adobe.photoshop",
+        _ => return None,
+    })
 }
 
 /// Range ヘッダの解釈。
@@ -184,6 +274,112 @@ mod tests {
                 .immutable()
         );
         assert!(!parse_route(&format!("/play/{HASH}")).unwrap().immutable());
+    }
+
+    #[test]
+    fn parses_peaks_pcm_anim_routes() {
+        assert_eq!(
+            parse_route(&format!("/peaks/{HASH}")),
+            Some(Route::Peaks { hash: HASH.into() })
+        );
+        assert_eq!(
+            parse_route(&format!("/pcm/{HASH}/0-100")),
+            Some(Route::Pcm {
+                hash: HASH.into(),
+                start: 0,
+                end: 100
+            })
+        );
+        assert_eq!(
+            parse_route(&format!("/pcm/{HASH}/44100-{}", u64::MAX)),
+            Some(Route::Pcm {
+                hash: HASH.into(),
+                start: 44100,
+                end: u64::MAX
+            })
+        );
+        assert_eq!(
+            parse_route(&format!("/anim/{HASH}/1")),
+            Some(Route::Anim {
+                hash: HASH.into(),
+                version: 1
+            })
+        );
+        // 逆の範囲・空の範囲・片側だけ・あふれ・符号・空白・余分な区切り
+        for bad in [
+            format!("/pcm/{HASH}/100-0"),
+            format!("/pcm/{HASH}/5-5"),
+            format!("/pcm/{HASH}/0-"),
+            format!("/pcm/{HASH}/-100"),
+            format!("/pcm/{HASH}/0-18446744073709551616"),
+            format!("/pcm/{HASH}/+1-2"),
+            format!("/pcm/{HASH}/1 -2"),
+            format!("/pcm/{HASH}/1-2-3"),
+            format!("/pcm/{HASH}"),
+            format!("/pcm/{HASH}/0-100/x"),
+            format!("/peaks/{HASH}/x"),
+            format!("/anim/{HASH}"),
+            format!("/anim/{HASH}/0"),
+            format!("/anim/{HASH}/4294967296"),
+            format!("/anim/{HASH}/x"),
+            "/peaks/abc".to_string(),
+        ] {
+            assert_eq!(parse_route(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn cache_control_by_route() {
+        let immutable = Some("public, max-age=31536000, immutable");
+        for (path, expected) in [
+            (format!("/thumb/{HASH}/s"), immutable),
+            (format!("/art/{HASH}"), immutable),
+            (format!("/peaks/{HASH}"), immutable),
+            (format!("/anim/{HASH}/1"), immutable),
+            (format!("/pcm/{HASH}/0-1"), Some("no-store")),
+            (format!("/file/{HASH}"), None),
+            (format!("/play/{HASH}"), None),
+        ] {
+            let route = parse_route(&path).unwrap();
+            assert_eq!(route.cache_control(), expected, "{path}");
+            assert_eq!(route.immutable(), expected == immutable, "{path}");
+        }
+    }
+
+    #[test]
+    fn new_routes_are_not_found_until_their_handlers_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        for path in [
+            format!("/peaks/{HASH}"),
+            format!("/pcm/{HASH}/0-1"),
+            format!("/anim/{HASH}/1"),
+        ] {
+            let route = parse_route(&path).unwrap();
+            assert_eq!(resolve(&layout, &route), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn content_types_for_new_kinds() {
+        for (name, mime) in [
+            ("x.svg", "image/svg+xml"),
+            ("x.SVG", "image/svg+xml"),
+            ("x.ttf", "font/ttf"),
+            ("x.otf", "font/otf"),
+            ("x.woff", "font/woff"),
+            ("x.woff2", "font/woff2"),
+            ("x.glb", "model/gltf-binary"),
+            ("x.psd", "image/vnd.adobe.photoshop"),
+            ("x.psb", "image/vnd.adobe.photoshop"),
+            ("x.peaks", "application/octet-stream"),
+            ("x.aseprite", "application/octet-stream"),
+            ("x.png", "image/png"),
+            ("x.wav", "audio/wav"),
+            ("x", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type(Path::new(name)), mime, "{name}");
+        }
     }
 
     #[test]

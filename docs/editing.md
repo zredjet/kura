@@ -979,7 +979,8 @@ impl Engine {   // 段 10 で足したもの
 
 - `kura://localhost/edit/{session}/{rev}/…`（画像のタイル・全体、音声の WAV・PCM・波形）と `/peaks/{hash}`。`{rev}` は中身から決まる番号ではない（同じ中身に別の番号が付くこともある）が、セッションの中で番号を使い回さないので、同じ（セッション, rev）の中身は変わらない（応答を覚えてよい）。undo・redo は戻った先の手の番号を返すので、前に取ったタイルがそのまま使える。`/peaks/{hash}` は中身から決まる。
 - 手のあとは、変わったタイル（`render_view` の `changed`。§12.6・§12.8）だけを取り直す。タイルを最後に変わった rev で指すかなど、URL の形は M12 で決める。
-- CORS はアプリの origin だけ、受け付けるのは main の WebView だけにする。
+- CORS はアプリの origin だけ、受け付けるのは main の WebView だけにする。この受け口（ラベル・Origin・メソッドの判定と、ACAO・`CSP: sandbox`・`nosniff`）と CSP の `connect-src`・`font-src` は M11 で入れた（architecture.md §4.1）。`/edit/…` も同じ受け口を通る。
+- ライブラリのファイル（元の中身）の試聴の PCM は M11 の `/pcm/{hash}/{start}-{end}`、編集中のもの（文書を当てた値）は `/edit/{session}/{rev}/…` で配る（architecture.md §4）。
 
 ## 13. エラー・中止・上限・安全
 

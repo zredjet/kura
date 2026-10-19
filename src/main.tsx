@@ -13,6 +13,11 @@ void syncAppearance();
 watchAppearance();
 void installAppMenu();
 
+// 開発時の自己点検（VITE_KURA_SELFTEST=1。kura:// と CSP。docs/architecture.md §4.2）
+if (import.meta.env.VITE_KURA_SELFTEST === '1') {
+  void import('./dev/selftest').then((m) => m.startSelftest());
+}
+
 const container = document.getElementById('root');
 if (container) {
   createRoot(container).render(
