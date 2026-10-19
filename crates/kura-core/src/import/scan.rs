@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use super::kind::{MediaKind, classify};
+use super::kind::{MediaKind, Rejected, classify_file};
 use crate::text::{natural_cmp, nfc};
 
 /// 中を見ないフォルダの拡張子（ライブラリや他のアプリのパッケージ）。
@@ -53,8 +53,10 @@ pub struct ScanResult {
     pub roots: Vec<ScanRoot>,
     /// 取り込む候補（決まった順。再開のときに同じ順になる）。
     pub files: Vec<ScannedFile>,
-    /// 対応していない形式・空のファイルの数。
+    /// 対応していない形式・空のファイルの数（`rejected` を含む）。
     pub skipped: u64,
+    /// 拡張子は対応しているが中身がその形式でないので取り込まないもの（`.ase` の色見本など）と理由。
+    pub rejected: Vec<(PathBuf, String)>,
     /// ドロップされたフォルダの下にあるフォルダの数。
     pub subfolders: u64,
     /// 下にフォルダを持つフォルダ（`(root, dirs)`）。これに含まれないフォルダが「末端」。
@@ -158,22 +160,42 @@ fn parent_chain(root_name: &str, root_path: &Path, path: &Path) -> Vec<String> {
 }
 
 fn add_file(result: &mut ScanResult, root: usize, path: &Path, dirs: Vec<String>, size: u64) {
-    let ext = lowercase_ext(path);
-    match classify(&ext) {
-        Some(kind) if size > 0 => result.files.push(ScannedFile {
-            path: path.to_path_buf(),
-            root,
-            dirs,
-            name: path
-                .file_name()
-                .map(|n| nfc(&n.to_string_lossy()))
-                .unwrap_or_default(),
-            ext,
-            kind,
-            size,
-        }),
-        _ => result.skipped += 1,
+    if size == 0 {
+        result.skipped += 1;
+        return;
     }
+    let ext = lowercase_ext(path);
+    // 先頭のバイトで見分ける形式（`.ase`）だけ、ここで先頭を読む
+    let kind = match classify_file(path, &ext) {
+        Ok(kind) => kind,
+        Err(Rejected::Unsupported) => {
+            result.skipped += 1;
+            return;
+        }
+        Err(rejected @ Rejected::NotThisFormat(_)) => {
+            result.skipped += 1;
+            result
+                .rejected
+                .push((path.to_path_buf(), rejected.reason()));
+            return;
+        }
+        Err(rejected @ Rejected::Unreadable(_)) => {
+            result.errors.push((path.to_path_buf(), rejected.reason()));
+            return;
+        }
+    };
+    result.files.push(ScannedFile {
+        path: path.to_path_buf(),
+        root,
+        dirs,
+        name: path
+            .file_name()
+            .map(|n| nfc(&n.to_string_lossy()))
+            .unwrap_or_default(),
+        ext,
+        kind,
+        size,
+    });
 }
 
 fn should_skip(entry: &walkdir::DirEntry) -> bool {
@@ -347,6 +369,47 @@ mod tests {
             result.files[0].dirs,
             vec!["root".to_string(), "ガイド".to_string()]
         );
+    }
+
+    /// フォント・3D も取り込む。`.ase` は Aseprite のものだけ取り込み、Adobe の色見本は理由を付けて対象外にする。
+    #[test]
+    fn takes_fonts_models_and_only_real_aseprite_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("素材");
+        write(&root.join("a.ttf"), b"\x00\x01\x00\x00");
+        write(&root.join("b.woff2"), b"wOF2");
+        write(&root.join("c.glb"), b"glTF");
+        write(&root.join("d.ase"), &[0x80, 0, 0, 0, 0xE0, 0xA5, 1, 0]);
+        write(&root.join("e.ase"), b"ASEF\x00\x01\x00\x00");
+        write(&root.join("f.aseprite"), b"ASEF\x00\x01\x00\x00");
+        write(&root.join("g.svg"), b"<svg/>");
+        let result = scan(std::slice::from_ref(&root));
+        let found: Vec<(&str, MediaKind)> = result
+            .files
+            .iter()
+            .map(|f| (f.name.as_str(), f.kind))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("a.ttf", MediaKind::Font),
+                ("b.woff2", MediaKind::Font),
+                ("c.glb", MediaKind::Model),
+                ("d.ase", MediaKind::Image),
+                ("g.svg", MediaKind::Image),
+            ]
+        );
+        assert_eq!(result.skipped, 2);
+        let rejected: Vec<(PathBuf, bool)> = result
+            .rejected
+            .iter()
+            .map(|(p, why)| (p.clone(), why.contains("Aseprite")))
+            .collect();
+        assert_eq!(
+            rejected,
+            vec![(root.join("e.ase"), true), (root.join("f.aseprite"), true)]
+        );
+        assert!(result.errors.is_empty());
     }
 
     #[cfg(unix)]

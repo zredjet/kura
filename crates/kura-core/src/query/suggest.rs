@@ -3,7 +3,7 @@
 
 use rusqlite::Connection;
 
-use super::fields::{FIELDS, FieldDef, FieldKind, find_field};
+use super::fields::{FIELDS, FieldDef, FieldKind, KIND_WORDS, find_field};
 use super::parser::split_op;
 use crate::{Result, folders, smart, tags, unit};
 
@@ -194,7 +194,7 @@ fn values(
         words.iter().map(|w| ((*w).to_string(), None)).collect()
     };
     let candidates: Vec<(String, Option<i64>)> = match def.kind {
-        FieldKind::Type => fixed(&["画像", "動画", "音楽"]),
+        FieldKind::Type => fixed(&KIND_WORDS.map(|(word, _)| word)),
         FieldKind::Played => fixed(&["未", "7日以内", "30日以上前"]),
         FieldKind::Added | FieldKind::Taken => {
             fixed(&["今日", "昨日", "7日以内", "30日以内", "30日以上前"])
@@ -330,12 +330,22 @@ mod tests {
             vec![
                 (SuggestionKind::Value, "種類:画像".to_string()),
                 (SuggestionKind::Value, "種類:動画".to_string()),
-                (SuggestionKind::Value, "種類:音楽".to_string())
+                (SuggestionKind::Value, "種類:音楽".to_string()),
+                (SuggestionKind::Value, "種類:フォント".to_string()),
+                (SuggestionKind::Value, "種類:3D".to_string())
             ]
         );
         assert_eq!(
             inserts(&conn, "種類:画像,動"),
             vec![(SuggestionKind::Value, "種類:画像,動画".to_string())]
+        );
+        assert_eq!(
+            inserts(&conn, "種類:フォ"),
+            vec![(SuggestionKind::Value, "種類:フォント".to_string())]
+        );
+        assert_eq!(
+            inserts(&conn, "種類:画像,3d"),
+            vec![(SuggestionKind::Value, "種類:画像,3D".to_string())]
         );
         let sources = suggest(&conn, "取得元：", 8).unwrap();
         assert_eq!(

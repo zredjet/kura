@@ -16,7 +16,7 @@ use super::rules::{CaptureRule, record_run};
 use super::shoot::{Pace, shoot};
 use crate::download::meta::FileMeta;
 use crate::download::register::{Downloaded, Origin, place_all, write_entries};
-use crate::import::MediaKind;
+use crate::import::classify_file;
 use crate::jobs::{
     Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, save_partial,
 };
@@ -109,12 +109,17 @@ pub fn register_png(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "capture.png".into());
+    // 取り込み・ダウンロードと同じ表で種類を決める（png は画像）
+    let ext = "png";
+    let kind = classify_file(png, ext).map_err(|rejected| {
+        CoreError::Tool(format!("撮った画像を読めません: {}", rejected.reason()))
+    })?;
     let file = Downloaded {
         path: png.to_path_buf(),
         sidecar: None,
         name,
-        ext: "png".into(),
-        kind: MediaKind::Image,
+        ext: ext.into(),
+        kind,
         meta: meta.clone(),
     };
     let job_id = job.as_ref().map_or(0, |(id, _)| *id);

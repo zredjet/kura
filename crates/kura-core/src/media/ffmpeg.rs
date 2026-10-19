@@ -80,6 +80,10 @@ fn stderr_line(stderr: &[u8]) -> String {
 
 impl MediaBackend for FfmpegBackend {
     fn probe(&self, path: &Path, kind: MediaKind) -> Result<MediaInfo, MediaError> {
+        // フォント・3D は ffprobe では読まない（段 3 の専用の道で読む）
+        if !reads_with_ffprobe(kind) {
+            return Err(MediaError::Unsupported);
+        }
         let output = run_with_timeout(
             Command::new(&self.ffprobe)
                 .args([
@@ -159,7 +163,16 @@ impl MediaBackend for FfmpegBackend {
     }
 }
 
+/// ffprobe で情報を読む種類か（画像・動画・音楽）。
+fn reads_with_ffprobe(kind: MediaKind) -> bool {
+    match kind {
+        MediaKind::Image | MediaKind::Video | MediaKind::Audio => true,
+        MediaKind::Font | MediaKind::Model => false,
+    }
+}
+
 /// ffprobe の JSON（`-show_format -show_streams`）からメディア情報を取り出す。
+/// 映像の大きさは画像・動画で、主なコーデックは画像・動画は映像、音楽は音声から、長さは動画・音楽で読む。
 pub fn parse_ffprobe(json: &str, kind: MediaKind) -> Result<MediaInfo, MediaError> {
     let root: Value = serde_json::from_str(json).map_err(|e| MediaError::Failed(e.to_string()))?;
     let streams = root["streams"].as_array().cloned().unwrap_or_default();
@@ -169,8 +182,14 @@ pub fn parse_ffprobe(json: &str, kind: MediaKind) -> Result<MediaInfo, MediaErro
         .find(|s| s["codec_type"] == "video" && !is_picture(s));
     let audio = streams.iter().find(|s| s["codec_type"] == "audio");
 
+    // (映像の大きさ・コーデックを読む, 音声のコーデックを読む)
+    let (picture, sound) = match kind {
+        MediaKind::Image | MediaKind::Video => (true, false),
+        MediaKind::Audio => (false, true),
+        MediaKind::Font | MediaKind::Model => (false, false),
+    };
     let mut info = MediaInfo::default();
-    if let Some(v) = video.filter(|_| kind != MediaKind::Audio) {
+    if let Some(v) = video.filter(|_| picture) {
         let (w, h) = (v["width"].as_i64(), v["height"].as_i64());
         let rotation = v["side_data_list"]
             .as_array()
@@ -181,12 +200,12 @@ pub fn parse_ffprobe(json: &str, kind: MediaKind) -> Result<MediaInfo, MediaErro
         (info.width, info.height) = if quarter { (h, w) } else { (w, h) };
         info.codec = v["codec_name"].as_str().map(str::to_string);
     }
-    if kind == MediaKind::Audio {
+    if sound {
         info.codec = audio
             .and_then(|a| a["codec_name"].as_str())
             .map(str::to_string);
     }
-    if kind != MediaKind::Image {
+    if kind.has_duration() {
         info.duration_ms = root["format"]["duration"]
             .as_str()
             .and_then(|d| d.parse::<f64>().ok())
@@ -261,6 +280,32 @@ mod tests {
             (Some(800), Some(600), None)
         );
         assert!(parse_ffprobe("not json", MediaKind::Image).is_err());
+    }
+
+    /// フォント・3D は ffprobe を起動せずに断る（次の実装か、段 3 の専用の道に回す）。
+    #[test]
+    fn fonts_and_models_are_not_probed_with_ffprobe() {
+        let backend = FfmpegBackend {
+            ffmpeg: PathBuf::from("/nonexistent/ffmpeg"),
+            ffprobe: PathBuf::from("/nonexistent/ffprobe"),
+        };
+        for kind in [MediaKind::Font, MediaKind::Model] {
+            assert!(matches!(
+                backend.probe(Path::new("x.ttf"), kind),
+                Err(MediaError::Unsupported)
+            ));
+        }
+        // 起動しようとした種類は、ないファイルの失敗になる（Unsupported ではない）
+        assert!(!matches!(
+            backend.probe(Path::new("x.jpg"), MediaKind::Image),
+            Err(MediaError::Unsupported)
+        ));
+        let json = r#"{"streams": [{"codec_type": "video", "codec_name": "png", "width": 8, "height": 8}],
+                       "format": {"duration": "1.0"}}"#;
+        assert_eq!(
+            parse_ffprobe(json, MediaKind::Font).unwrap(),
+            MediaInfo::default()
+        );
     }
 
     /// ffmpeg があれば実際に動かす（ない環境では何もしない）。

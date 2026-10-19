@@ -5,7 +5,7 @@ mod resolve;
 
 pub use resolve::{
     MemberInfo, MemberSnapshot, MemberStats, OrderMode, UnitDef, UnitFolder, UnitKind, aggregate,
-    resolve_members,
+    member_duration_ms, resolve_members,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::folders;
+use crate::import::MediaKind;
 use crate::items::aspect_code;
 use crate::library::hex;
 use crate::tags::{TagRef, display_order};
@@ -278,7 +279,7 @@ pub fn members(conn: &Connection, id: i64) -> Result<Vec<i64>> {
 pub struct Cover {
     pub item_id: i64,
     pub hash: String,
-    pub kind: String,
+    pub kind: MediaKind,
     pub thumb_state: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
@@ -1034,7 +1035,10 @@ mod tests {
         assert_eq!((d.summary.own_rating, d.summary.stats.rating), (4, 4));
         assert_eq!(d.note, None);
         assert_eq!(d.summary.stats.duration_ms, 15_000 + 1000);
-        assert_eq!(d.summary.stats.kinds, vec!["image", "audio"]);
+        assert_eq!(
+            d.summary.stats.kinds,
+            vec![MediaKind::Image, MediaKind::Audio]
+        );
 
         let bad = |patch: UnitPatch| update(&conn, unit, &patch, 2).is_err();
         assert!(bad(UnitPatch {

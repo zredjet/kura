@@ -184,6 +184,7 @@ pub(crate) mod fake {
                 return Err(MediaError::Failed("壊れています".into()));
             }
             Ok(match kind {
+                MediaKind::Font | MediaKind::Model => return Err(MediaError::Unsupported),
                 MediaKind::Image => MediaInfo {
                     width: Some(1600),
                     height: Some(900),

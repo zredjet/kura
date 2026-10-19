@@ -89,6 +89,28 @@ fn example_type_list() {
     );
 }
 
+/// フォント・3D（M11）。日本語の語は「フォント」「3D」（`3d` も）、英語は `font`・`model`。
+#[test]
+fn type_field_accepts_font_and_model() {
+    let kinds = |value: Vec<KindValue>| field(FieldCond::Type { op: Op::Has, value });
+    assert_eq!(ok("種類:フォント"), kinds(vec![KindValue::Font]));
+    assert_eq!(ok("種類:3D"), kinds(vec![KindValue::Model]));
+    assert_eq!(ok("種類:3d"), kinds(vec![KindValue::Model]));
+    assert_eq!(ok("type:font"), kinds(vec![KindValue::Font]));
+    assert_eq!(ok("TYPE:Model"), kinds(vec![KindValue::Model]));
+    assert_eq!(
+        ok("種類:画像,フォント,3D"),
+        kinds(vec![KindValue::Image, KindValue::Font, KindValue::Model])
+    );
+    // AST の JSON の名前は items.kind と同じ
+    assert_eq!(
+        serde_json::to_value(ok("種類:フォント,3D")).unwrap(),
+        serde_json::json!({ "field": "type", "op": "has", "value": ["font", "model"] })
+    );
+    let err = parse("種類:3Dモデル").unwrap_err();
+    assert!(err.message.contains("フォント・3D"), "{}", err.message);
+}
+
 #[test]
 fn example_rating_comparison() {
     assert_eq!(

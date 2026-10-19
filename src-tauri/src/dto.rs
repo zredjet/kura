@@ -5,7 +5,7 @@ use specta::Type;
 
 use kura_core::entries::{EntryPatch, EntryUpdate};
 use kura_core::folders::{FolderNode, FolderPatch};
-use kura_core::import::{DuplicatePolicy, ImportOptions, ImportPreview, ScanRoot};
+use kura_core::import::{DuplicatePolicy, ImportOptions, ImportPreview, MediaKind, ScanRoot};
 use kura_core::items::{
     FolderRef, ItemDetail, ItemPatch, ItemSort, ItemSummary, KindCounts, LibraryCounts,
     SelectionInfo, SortKey, TagRef, UnitRef,
@@ -218,6 +218,8 @@ pub struct ImportPreviewDto {
     pub images: u64,
     pub videos: u64,
     pub audios: u64,
+    pub fonts: u64,
+    pub models: u64,
     pub total_bytes: u64,
     pub duplicates: u64,
     pub skipped: u64,
@@ -231,9 +233,11 @@ impl From<ImportPreview> for ImportPreviewDto {
     fn from(p: ImportPreview) -> Self {
         Self {
             total: p.total,
-            images: p.images,
-            videos: p.videos,
-            audios: p.audios,
+            images: p.kinds.image,
+            videos: p.kinds.video,
+            audios: p.kinds.audio,
+            fonts: p.kinds.font,
+            models: p.kinds.model,
             total_bytes: p.total_bytes,
             duplicates: p.duplicates,
             skipped: p.skipped,
@@ -357,9 +361,14 @@ pub struct ImportResultDto {
     pub total: u64,
     pub added: u64,
     pub duplicates: u64,
+    /// 対応していない形式・空のファイルの数（`rejected` を含む）。
     pub skipped: u64,
     pub failed: u64,
     pub failures: Vec<ImportFailureDto>,
+    /// 拡張子は対応しているが中身が違うので取り込まなかったもの（Aseprite でない `.ase` など）と理由。
+    /// M11 より前の結果にはない。
+    #[specta(optional)]
+    pub rejected: Vec<ImportFailureDto>,
 }
 
 /// 取り込みに失敗したファイル。
@@ -532,8 +541,7 @@ pub struct ItemSummaryDto {
     /// BLAKE3 の 16 進（`kura://localhost/thumb/{hash}/s` などに使う）。
     pub hash: String,
     pub ext: String,
-    /// `image` / `video` / `audio`。
-    pub kind: String,
+    pub kind: ItemKindDto,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -555,7 +563,7 @@ impl From<ItemSummary> for ItemSummaryDto {
             id: i.id,
             hash: i.hash,
             ext: i.ext,
-            kind: i.kind,
+            kind: i.kind.into(),
             width: i.width,
             height: i.height,
             duration_ms: i.duration_ms,
@@ -834,10 +842,12 @@ pub struct ClauseDto {
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct KindCountsDto {
-    pub image: i64,
-    pub video: i64,
-    pub audio: i64,
-    pub total: i64,
+    pub image: u64,
+    pub video: u64,
+    pub audio: u64,
+    pub font: u64,
+    pub model: u64,
+    pub total: u64,
 }
 
 impl From<KindCounts> for KindCountsDto {
@@ -846,6 +856,8 @@ impl From<KindCounts> for KindCountsDto {
             image: c.image,
             video: c.video,
             audio: c.audio,
+            font: c.font,
+            model: c.model,
             total: c.total(),
         }
     }
@@ -1240,7 +1252,7 @@ impl From<OrderModeDto> for OrderMode {
 pub struct CoverDto {
     pub item_id: i64,
     pub hash: String,
-    pub kind: String,
+    pub kind: ItemKindDto,
     pub thumb_state: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
@@ -1251,7 +1263,7 @@ impl From<Cover> for CoverDto {
         Self {
             item_id: c.item_id,
             hash: c.hash,
-            kind: c.kind,
+            kind: c.kind.into(),
             thumb_state: c.thumb_state,
             width: c.width,
             height: c.height,
@@ -1270,8 +1282,8 @@ pub struct UnitSummaryDto {
     pub count: i64,
     /// 音楽・動画は長さ、画像は表示時間の合計（ミリ秒）。
     pub duration_ms: i64,
-    /// メンバーの種類（`image` / `video` / `audio`）。
-    pub kinds: Vec<String>,
+    /// メンバーの種類（`ITEM_KINDS` の順）。
+    pub kinds: Vec<ItemKindDto>,
     /// 集計した評価（ユニットの評価、なければメンバーの平均）。
     pub rating: i64,
     /// ユニット自体の評価（0 は未評価）。
@@ -1291,7 +1303,7 @@ impl From<UnitSummary> for UnitSummaryDto {
             cover: u.cover.map(Into::into),
             count: i64::try_from(u.stats.count).unwrap_or(i64::MAX),
             duration_ms: u.stats.duration_ms,
-            kinds: u.stats.kinds.into_iter().map(str::to_string).collect(),
+            kinds: u.stats.kinds.into_iter().map(Into::into).collect(),
             rating: u.stats.rating,
             own_rating: u.own_rating,
             origin: u.origin,
@@ -1461,6 +1473,27 @@ mod tests {
                 .unwrap()
                 .contains("空き容量")
         );
+    }
+
+    /// `ITEM_KINDS` は `MediaKind::ALL` の順で、名前は items.kind と同じ。キューに入るのは画像・動画・音楽だけ。
+    #[test]
+    fn item_kinds_table_follows_the_core_kinds() {
+        let json = serde_json::to_value(item_kinds()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                { "kind": "image", "playable": true, "needsProxy": false, "hasDuration": false },
+                { "kind": "video", "playable": true, "needsProxy": true, "hasDuration": true },
+                { "kind": "audio", "playable": true, "needsProxy": true, "hasDuration": true },
+                { "kind": "font", "playable": false, "needsProxy": false, "hasDuration": false },
+                { "kind": "model", "playable": false, "needsProxy": false, "hasDuration": false },
+            ])
+        );
+        for kind in MediaKind::ALL {
+            let dto = ItemKindDto::from(kind);
+            assert_eq!(serde_json::to_value(dto).unwrap(), kind.as_str());
+            assert_eq!(MediaKind::from(dto), kind);
+        }
     }
 }
 
@@ -1638,6 +1671,33 @@ simple_enum!(GranularityDto, Granularity, { File, Unit });
 simple_enum!(RepeatModeDto, RepeatMode, { Off, All, One });
 simple_enum!(UnitMatchDto, UnitMatch, { Any, All, UnitOnly });
 simple_enum!(LimitKindDto, LimitKind, { Count, Duration });
+simple_enum!(ItemKindDto, MediaKind, { Image, Video, Audio, Font, Model });
+
+/// 種類の表の 1 行（bindings の定数 `ITEM_KINDS`。フロントの種類の型と述語はこの表から作る）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemKindInfoDto {
+    pub kind: ItemKindDto,
+    /// 再生のキュー・スマートの候補に入るか（画像・動画・音楽。フォント・3D は入らない）。
+    pub playable: bool,
+    /// 再生用プロキシの対象か（動画・音楽）。
+    pub needs_proxy: bool,
+    /// 長さを持つか（動画・音楽）。
+    pub has_duration: bool,
+}
+
+/// 種類の表（`MediaKind::ALL` の順。グリッド・集計・フィルタの並びもこの順）。
+pub fn item_kinds() -> Vec<ItemKindInfoDto> {
+    MediaKind::ALL
+        .into_iter()
+        .map(|k| ItemKindInfoDto {
+            kind: k.into(),
+            playable: k.is_playable(),
+            needs_proxy: k.needs_proxy(),
+            has_duration: k.has_duration(),
+        })
+        .collect()
+}
 simple_enum!(RuleMatchDto, RuleMatch, { All, Any });
 
 /// スマートの条件（検索の文字列を条件ごとに。docs/playlists.md §3.1・ADR）。
@@ -1898,7 +1958,8 @@ pub struct EntryRowDto {
     pub name: String,
     pub item_count: u32,
     pub duration_ms: i64,
-    pub kinds: Vec<String>,
+    /// メンバーの種類（`ITEM_KINDS` の順。フォント・3D も出す）。
+    pub kinds: Vec<ItemKindDto>,
     /// 表紙にするアイテム（先頭のメンバー）。
     pub cover_item_id: Option<i64>,
     pub image_duration_ms: Option<i64>,
@@ -1917,6 +1978,9 @@ pub struct PlaylistContentsDto {
     pub images: u32,
     pub videos: u32,
     pub audios: u32,
+    /// フォント・3D（一覧には出すが、キューには入らない）。
+    pub fonts: u32,
+    pub models: u32,
 }
 
 impl PlaylistContentsDto {
@@ -1931,15 +1995,20 @@ impl PlaylistContentsDto {
             images: 0,
             videos: 0,
             audios: 0,
+            fonts: 0,
+            models: 0,
         };
         for row in rows {
             for item in &row.items {
                 dto.flat_entry_ids.push(row.entry.id);
                 dto.flat_item_ids.push(*item);
             }
-            dto.images += row.kind_counts[0];
-            dto.videos += row.kind_counts[1];
-            dto.audios += row.kind_counts[2];
+            let n = |kind: MediaKind| u32::try_from(row.kind_counts.get(kind)).unwrap_or(u32::MAX);
+            dto.images = dto.images.saturating_add(n(MediaKind::Image));
+            dto.videos = dto.videos.saturating_add(n(MediaKind::Video));
+            dto.audios = dto.audios.saturating_add(n(MediaKind::Audio));
+            dto.fonts = dto.fonts.saturating_add(n(MediaKind::Font));
+            dto.models = dto.models.saturating_add(n(MediaKind::Model));
             dto.total_ms += row.duration_ms;
             dto.rows.push(EntryRowDto {
                 entry_id: row.entry.id,
@@ -1947,7 +2016,7 @@ impl PlaylistContentsDto {
                 name: row.name,
                 item_count: u32::try_from(row.items.len()).unwrap_or(u32::MAX),
                 duration_ms: row.duration_ms,
-                kinds: row.kinds.iter().map(|k| (*k).to_string()).collect(),
+                kinds: row.kinds.iter().map(|k| (*k).into()).collect(),
                 cover_item_id: row.items.first().copied(),
                 image_duration_ms: row.entry.image_duration_ms,
             });

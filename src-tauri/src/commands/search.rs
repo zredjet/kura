@@ -84,7 +84,9 @@ pub async fn smart_folders_list(
                         ..ItemQuery::default()
                     };
                     // 条件が壊れていても一覧は出す（件数なし）
-                    count_kinds(conn, &query, &ctx).ok().map(|c| c.total())
+                    count_kinds(conn, &query, &ctx)
+                        .ok()
+                        .map(|c| i64::try_from(c.total()).unwrap_or(i64::MAX))
                 } else {
                     None
                 };

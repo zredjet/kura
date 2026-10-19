@@ -227,6 +227,44 @@ mod tests {
         }
     }
 
+    /// フォント・3D はプロキシを作らず（not_needed）、解析もしない（not_needed）。種類ごとの状態は `MediaKind` の
+    /// 性質と同じ（`items_proxy_av` に当たらない）。
+    #[test]
+    fn fonts_and_models_are_not_proxied() {
+        let conn = test_conn();
+        for (i, kind) in MediaKind::ALL.into_iter().enumerate() {
+            let hash = [i as u8 + 1; 32];
+            let id = insert_item(
+                &conn,
+                &NewItem {
+                    kind,
+                    ..new_item(&hash, kind.as_str())
+                },
+            )
+            .unwrap();
+            let (stored, proxy, analysis): (MediaKind, String, String) = conn
+                .query_row(
+                    "SELECT kind, proxy_state, analysis_state FROM items WHERE id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, kind);
+            let expected_proxy = if kind.needs_proxy() {
+                "unknown"
+            } else {
+                "not_needed"
+            };
+            assert_eq!(proxy, expected_proxy, "{kind:?}");
+            let analyzed = matches!(kind, MediaKind::Image | MediaKind::Audio);
+            assert_eq!(
+                analysis,
+                if analyzed { "pending" } else { "not_needed" },
+                "{kind:?}"
+            );
+        }
+    }
+
     #[test]
     fn inserts_and_finds_items_by_hash() {
         let conn = test_conn();

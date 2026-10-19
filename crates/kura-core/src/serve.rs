@@ -166,24 +166,8 @@ pub fn content_type(path: &Path) -> &'static str {
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    mime_for(&ext)
-        .or_else(|| served_mime(&ext))
-        .unwrap_or("application/octet-stream")
-}
-
-/// 取り込みの種類の表（`import::mime_for`）にまだない、kura:// で配る形式の MIME（M11 の種類の追加で
-/// `mime_for` が持てば、そちらが先に効く）。
-fn served_mime(ext: &str) -> Option<&'static str> {
-    Some(match ext {
-        "svg" => "image/svg+xml",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "glb" => "model/gltf-binary",
-        "psd" | "psb" => "image/vnd.adobe.photoshop",
-        _ => return None,
-    })
+    // 形式の表（kura-engine の FORMATS）の MIME。表にない派生のファイル（`.peaks` など）はバイト列として配る
+    mime_for(&ext).unwrap_or("application/octet-stream")
 }
 
 /// Range ヘッダの解釈。
@@ -369,11 +353,14 @@ mod tests {
             ("x.otf", "font/otf"),
             ("x.woff", "font/woff"),
             ("x.woff2", "font/woff2"),
+            ("x.ttc", "font/collection"),
             ("x.glb", "model/gltf-binary"),
             ("x.psd", "image/vnd.adobe.photoshop"),
             ("x.psb", "image/vnd.adobe.photoshop"),
             ("x.peaks", "application/octet-stream"),
-            ("x.aseprite", "application/octet-stream"),
+            // 形式の表の MIME（WebKit は描かないが、nosniff と CSP: sandbox で文書としても開かない）
+            ("x.aseprite", "image/x-aseprite"),
+            ("x.ase", "image/x-aseprite"),
             ("x.png", "image/png"),
             ("x.wav", "audio/wav"),
             ("x", "application/octet-stream"),

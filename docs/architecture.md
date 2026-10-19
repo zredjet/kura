@@ -256,7 +256,10 @@ import_start:    ジョブとして実行
   5. 結果（追加数・重複数・失敗数と明細）を result_json に
 ```
 
-- 対応拡張子：画像 `jpg jpeg png gif webp heic heif avif tif tiff bmp`、動画 `mp4 m4v mov webm mkv avi`、音楽 `mp3 m4a aac flac wav aif aiff ogg opus`。それ以外はスキップして件数を報告する。
+- 対応拡張子：画像 `jpg jpeg png apng gif webp aseprite ase psd psb svg heic heif avif tif tiff bmp`、動画 `mp4 m4v mov webm mkv avi`、音楽 `mp3 m4a aac flac wav aif aiff ogg opus`、フォント `ttf otf ttc woff woff2`、3D `glb`（M11）。それ以外はスキップして件数を報告する。
+  - 拡張子・種類・MIME は kura-engine の形式の表（`codec::formats::FORMATS`）が正で、`import::kind` の `classify`・`mime_for`・`format_id` と kura:// の Content-Type はそこから引く（行を足すと取り込める形式が増える）。取り込み・ダウンロード・キャプチャは同じ `classify_file` を通す。
+  - `.ase`・`.aseprite` は先頭のバイト（4 バイト目からのマジック 0xA5E0）で Aseprite かを見分け、違えば取り込まない（`.ase` は Adobe の色見本と拡張子が重なる）。スキップの件数に含め、理由を result_json の `rejected` とジョブのログに出す。
+  - 種類の文字列（`items.kind`）は `MediaKind`（`FromSql`・`parse`）で読み、知らない値を既定の種類に落とさない。種類の表はフロントにも bindings の定数 `ITEM_KINDS`（順・キューに入るか・プロキシ・長さ）で出す。
 - オプション：取り込み先フォルダ、フォルダ構成の再現、フォルダ名をタグに、ファイル情報からタグ（`アーティスト:`・`アルバム:`。撮影日・撮影地は付けない。ADR-30）、全件に付けるタグ、フォルダごとにユニット作成。
   - フォルダ構成の再現：ドロップしたフォルダを取り込み先に対応させ、その下にサブフォルダを作る（旅行2026/鎌倉 → 写真/2026 旅行/鎌倉）。取り込み先がなければ、ドロップしたフォルダ名でいちばん上に作る（ADR-24）。
   - フォルダ名をタグに：ドロップしたフォルダからファイルの親までの各フォルダ名（ADR-24）。

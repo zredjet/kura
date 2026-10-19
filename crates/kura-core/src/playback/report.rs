@@ -5,6 +5,7 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::import::MediaKind;
 use crate::{CoreError, Result};
 
 /// 音楽・動画を「再生済み」とする再生時間（4 分）。
@@ -31,16 +32,20 @@ pub struct PlayReport {
 
 /// 再生済みか（純粋関数）。音楽・動画は再生時間の 50% 以上か 4 分以上、
 /// 画像は表示時間を最後まで表示したか、2 秒以上表示してから次へ進んだか。
-pub fn judge(kind: &str, played_ms: i64, duration_ms: Option<i64>, completed: bool) -> bool {
-    if kind == "image" {
-        return completed || played_ms >= PLAYED_IMAGE_MS;
+/// フォント・3D はキューに入らないので、報告が来ても再生済みにしない。
+pub fn judge(kind: MediaKind, played_ms: i64, duration_ms: Option<i64>, completed: bool) -> bool {
+    match kind {
+        MediaKind::Image => completed || played_ms >= PLAYED_IMAGE_MS,
+        MediaKind::Video | MediaKind::Audio => {
+            played_ms >= PLAYED_MEDIA_MS || duration_ms.is_some_and(|d| d > 0 && played_ms * 2 >= d)
+        }
+        MediaKind::Font | MediaKind::Model => false,
     }
-    played_ms >= PLAYED_MEDIA_MS || duration_ms.is_some_and(|d| d > 0 && played_ms * 2 >= d)
 }
 
 /// 判定して、再生済みなら記録する。記録したら true。
 pub fn record(tx: &Connection, report: &PlayReport, now: i64) -> Result<bool> {
-    let row: Option<(String, Option<i64>)> = tx
+    let row: Option<(MediaKind, Option<i64>)> = tx
         .query_row(
             "SELECT kind, duration_ms FROM items WHERE id = ?1",
             [report.item_id],
@@ -51,12 +56,7 @@ pub fn record(tx: &Connection, report: &PlayReport, now: i64) -> Result<bool> {
         return Err(CoreError::NotFound(format!("アイテム {}", report.item_id)));
     };
     let duration_ms = duration_ms.or(report.duration_ms);
-    if !judge(
-        &kind,
-        report.played_ms.max(0),
-        duration_ms,
-        report.completed,
-    ) {
+    if !judge(kind, report.played_ms.max(0), duration_ms, report.completed) {
         return Ok(false);
     }
     // ユニット・プレイリストが消えていたら、つながりは付けずに記録する
@@ -101,25 +101,33 @@ mod tests {
     #[test]
     fn judges_media_by_half_or_four_minutes() {
         // 3 分の曲：1 分 30 秒で再生済み
-        assert!(!judge("audio", 89_999, Some(180_000), false));
-        assert!(judge("audio", 90_000, Some(180_000), false));
+        assert!(!judge(MediaKind::Audio, 89_999, Some(180_000), false));
+        assert!(judge(MediaKind::Audio, 90_000, Some(180_000), false));
         // 1 時間の動画：4 分で再生済み
-        assert!(!judge("video", 239_999, Some(3_600_000), false));
-        assert!(judge("video", 240_000, Some(3_600_000), false));
+        assert!(!judge(MediaKind::Video, 239_999, Some(3_600_000), false));
+        assert!(judge(MediaKind::Video, 240_000, Some(3_600_000), false));
         // 最後までシークして終わっただけでは再生済みにしない
-        assert!(!judge("video", 5_000, Some(3_600_000), true));
+        assert!(!judge(MediaKind::Video, 5_000, Some(3_600_000), true));
         // 長さがわからなければ 4 分
-        assert!(!judge("audio", 200_000, None, true));
-        assert!(judge("audio", 240_000, None, false));
+        assert!(!judge(MediaKind::Audio, 200_000, None, true));
+        assert!(judge(MediaKind::Audio, 240_000, None, false));
     }
 
     #[test]
     fn judges_images_by_completion_or_two_seconds() {
-        assert!(judge("image", 8_000, None, true));
+        assert!(judge(MediaKind::Image, 8_000, None, true));
         // 表示時間を 1 秒にしていても、最後まで表示すれば再生済み
-        assert!(judge("image", 1_000, None, true));
-        assert!(judge("image", 2_000, None, false));
-        assert!(!judge("image", 1_999, None, false));
+        assert!(judge(MediaKind::Image, 1_000, None, true));
+        assert!(judge(MediaKind::Image, 2_000, None, false));
+        assert!(!judge(MediaKind::Image, 1_999, None, false));
+    }
+
+    /// フォント・3D はキューに入らないので、報告が来ても再生済みにしない。
+    #[test]
+    fn fonts_and_models_are_never_played() {
+        for kind in [MediaKind::Font, MediaKind::Model] {
+            assert!(!judge(kind, 240_000, Some(1_000), true), "{kind:?}");
+        }
     }
 
     fn library() -> Connection {

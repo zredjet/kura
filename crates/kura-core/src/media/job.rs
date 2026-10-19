@@ -32,11 +32,13 @@ struct Pending {
 
 impl Pending {
     /// メディア情報を読み直す必要があるか（取り込みのときに読めなかった、M1 で取り込んだ、など）。
+    /// フォント・3D の情報は段 3 で専用の道（CoreText・glb の読み手）で読むので、ここでは読まない。
     fn needs_probe(&self) -> bool {
         match self.kind {
             MediaKind::Image => self.width.is_none() || self.height.is_none(),
             MediaKind::Video => self.width.is_none() || self.duration_ms.is_none(),
             MediaKind::Audio => self.duration_ms.is_none(),
+            MediaKind::Font | MediaKind::Model => false,
         }
     }
 }
@@ -95,17 +97,18 @@ impl JobHandler for ThumbnailHandler {
                     });
                 }
             }
-            let batch = library.db().read(|conn| pending_batch(conn, THUMB_BATCH))?;
-            if batch.is_empty() {
+            let (batch, unknown) = library.db().read(|conn| pending_batch(conn, THUMB_BATCH))?;
+            if batch.is_empty() && unknown.is_empty() {
                 break;
             }
             let backend = self.backend.as_ref();
-            let outcomes: Vec<Outcome> = pool.install(|| {
+            let mut outcomes: Vec<Outcome> = pool.install(|| {
                 batch
                     .par_iter()
                     .map(|item| process(&layout, backend, item))
                     .collect()
             });
+            outcomes.extend(unknown);
             for outcome in &outcomes {
                 if let Some(error) = &outcome.error {
                     ctx.log(&format!("アイテム {}: {error}", outcome.id));
@@ -136,7 +139,8 @@ fn summary(done: u64, failed: u64) -> String {
 }
 
 /// サムネイル未作成のものを新しい順に取り出す（idx_items_thumb_pending を使う）。
-fn pending_batch(conn: &Connection, limit: usize) -> Result<Vec<Pending>> {
+/// 知らない種類（DB の CHECK が外れていたなど）は画像として描かず、失敗の結果にして返す（同じ行を拾い直さない）。
+fn pending_batch(conn: &Connection, limit: usize) -> Result<(Vec<Pending>, Vec<Outcome>)> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, hash, ext, kind, width, height, duration_ms FROM items
          WHERE thumb_state = 'pending' ORDER BY imported_at DESC, id DESC LIMIT ?1",
@@ -154,13 +158,19 @@ fn pending_batch(conn: &Connection, limit: usize) -> Result<Vec<Pending>> {
             row.get(6)?,
         ))
     })?;
-    let mut out = Vec::new();
+    let (mut out, mut unknown) = (Vec::new(), Vec::new());
     for row in rows {
         let (id, hash, ext, kind, width, height, duration_ms) = row?;
-        let kind = match kind.as_str() {
-            "video" => MediaKind::Video,
-            "audio" => MediaKind::Audio,
-            _ => MediaKind::Image,
+        let Some(kind) = MediaKind::parse(&kind) else {
+            unknown.push(Outcome {
+                id,
+                info: None,
+                ready: false,
+                error: Some(format!(
+                    "知らない種類「{kind}」なので、サムネイルを作りません"
+                )),
+            });
+            continue;
         };
         let Ok(hash) = <[u8; 32]>::try_from(hash.as_slice()) else {
             continue;
@@ -175,7 +185,7 @@ fn pending_batch(conn: &Connection, limit: usize) -> Result<Vec<Pending>> {
             duration_ms,
         });
     }
-    Ok(out)
+    Ok((out, unknown))
 }
 
 /// サムネイル未作成の数。
@@ -212,6 +222,14 @@ fn process(layout: &Layout, backend: &dyn MediaBackend, item: &Pending) -> Outco
         }
         // ジャケットがなければサムネイルなし（グリッドは音楽の表示にする）
         MediaKind::Audio => backend.audio_artwork(&src, &layout.art_path(&hash_hex), &targets),
+        // 画像として描かない。段 3 で専用の道（フォントは CoreText、3D は glb の読み手と描画）を作り、
+        // 'thumbs.plan' の指紋で failed を pending に戻す
+        MediaKind::Font => Err(MediaError::Failed(
+            "フォントのサムネイルはまだ作れません".into(),
+        )),
+        MediaKind::Model => Err(MediaError::Failed(
+            "3D モデルのサムネイルはまだ作れません".into(),
+        )),
     };
     match result {
         Ok(ready) => Outcome {
@@ -383,6 +401,88 @@ mod tests {
         );
         assert!(!unsupported.ready);
         assert!(unsupported.error.is_some());
+    }
+
+    /// 最後のサムネイルのジョブの記録。
+    fn last_log(jobs: &JobManager) -> String {
+        let last = jobs
+            .list(&crate::jobs::JobFilter {
+                kinds: vec![JobKind::Thumbnail],
+                states: vec![],
+                limit: Some(1),
+            })
+            .unwrap();
+        jobs.log_text(last[0].id, 1 << 16).unwrap()
+    }
+
+    /// 知らない種類（DB の CHECK を外して入れたもの）を画像として描かない。失敗にして理由を残し、同じ行を拾い直さない。
+    #[test]
+    fn unknown_kind_is_not_treated_as_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Arc::new(Library::create(&dir.path().join("L")).unwrap());
+        lib.db()
+            .write(|tx| {
+                tx.execute_batch("ALTER TABLE items DROP CONSTRAINT items_kind")?;
+                Ok(())
+            })
+            .unwrap();
+        add(&lib, 1, "sticker", "png", None, None);
+        add(&lib, 2, "image", "jpg", None, None);
+
+        let jobs = run(&lib);
+        assert_eq!(row(&lib, 1).0, "failed");
+        assert_eq!(row(&lib, 1).1, None, "画像として読んだ幅を書かない");
+        let hex1 = hex(&[1u8; 32]);
+        assert!(!lib.layout().thumb_path(&hex1, ThumbSize::Large).exists());
+        assert!(!lib.layout().thumb_path(&hex1, ThumbSize::Small).exists());
+        // ほかの行は止めずに作る
+        assert_eq!(row(&lib, 2).0, "ready");
+        assert_eq!(lib.db().read(count_pending).unwrap(), 0);
+        assert!(last_log(&jobs).contains("sticker"), "{}", last_log(&jobs));
+    }
+
+    /// フォント・3D は画像として描かない（段 3 で専用の道を作る）。失敗にして理由を残し、同じ行を拾い直さない。
+    /// プロキシも作らない（proxy_state は not_needed のまま）。
+    #[test]
+    fn fonts_and_models_are_not_drawn_as_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Arc::new(Library::create(&dir.path().join("L")).unwrap());
+        add(&lib, 1, "font", "ttf", None, None);
+        add(&lib, 2, "model", "glb", None, None);
+        lib.db()
+            .write(|tx| {
+                tx.execute("UPDATE items SET proxy_state = 'not_needed'", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let jobs = run(&lib);
+        for id in [1u8, 2] {
+            let (state, width, _, codec) = row(&lib, i64::from(id));
+            assert_eq!(
+                (state.as_str(), width, codec),
+                ("failed", None, None),
+                "{id}"
+            );
+            let h = hex(&[id; 32]);
+            assert!(!lib.layout().thumb_path(&h, ThumbSize::Large).exists());
+            assert!(!lib.layout().art_path(&h).exists());
+        }
+        assert_eq!(lib.db().read(count_pending).unwrap(), 0);
+        let proxy: Vec<String> = lib
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT proxy_state FROM items ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(proxy, vec!["not_needed", "not_needed"]);
+        let log = last_log(&jobs);
+        assert!(
+            log.contains("アイテム 1") && log.contains("アイテム 2"),
+            "{log}"
+        );
     }
 
     #[test]

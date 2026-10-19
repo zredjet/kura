@@ -10,6 +10,7 @@ use super::resolve::{ResolvedEntry, Snapshot, UnitData, resolve};
 use super::smart::{UnitCond, UnitFacts, unit_matches};
 use super::store::{self, NewEntry, NewPlaylist};
 use crate::db::test_conn;
+use crate::import::MediaKind;
 use crate::query::QueryContext;
 use crate::queue::{Slot, UnitKey};
 use crate::unit::{MemberInfo, OrderMode, UnitDef, UnitKind};
@@ -32,7 +33,7 @@ impl Lib {
             id,
             MemberInfo {
                 title: format!("i{id}"),
-                kind: kind.into(),
+                kind: MediaKind::parse(kind).unwrap_or_else(|| panic!("種類 {kind}")),
                 imported_at: id,
                 captured_at: None,
                 duration_ms: (kind != "image").then_some(60_000),
@@ -635,6 +636,53 @@ fn t15_resolve_and_build_queue_are_fast() {
         assert_eq!(queue.len(), 50_000);
         if !cfg!(debug_assertions) {
             assert!(elapsed.as_millis() <= 50, "{elapsed:?}");
+        }
+    }
+}
+
+/// フォント・3D はエントリ・ユニットに入れられるが、キューには入らない（§5.2 の 1。M11 の決定 11）。
+/// item エントリのフォントは捨て、混ざったユニットは再生できるものだけを残し、フォント・3D だけのエントリは捨てる。
+#[test]
+fn fonts_and_models_never_reach_the_queue() {
+    let mut lib = Lib::default();
+    lib.item(1, "image")
+        .item(2, "font")
+        .item(3, "audio")
+        .item(4, "model")
+        .item(5, "font")
+        .item(6, "model")
+        .item(7, "video")
+        .item(8, "font")
+        .set_unit(A, &[1, 2, 3, 4])
+        .set_unit(B, &[5, 6])
+        .entry(EntryTarget::Item(8))
+        .entry(EntryTarget::Unit(A))
+        .entry(EntryTarget::Unit(B))
+        .entry(EntryTarget::Item(7));
+    let resolved = lib.resolved();
+    assert_eq!(
+        resolved
+            .iter()
+            .map(|r| (r.entry_id, r.items.clone()))
+            .collect::<Vec<_>>(),
+        vec![(2, vec![1, 3]), (4, vec![7])]
+    );
+    for granularity in [Granularity::File, Granularity::Unit] {
+        for shuffle in [false, true] {
+            let queue = lib.queue(
+                &QueueOptions {
+                    max_same_kind_run: 1,
+                    ..options(granularity, shuffle)
+                },
+                7,
+            );
+            let mut got = items(&queue);
+            got.sort_unstable();
+            assert_eq!(got, vec![1, 3, 7], "{granularity:?} {shuffle}");
+            // ユニットの件数は再生できるメンバーの数
+            for slot in queue.iter().filter(|s| s.unit_key.is_some()) {
+                assert_eq!(slot.unit_len, 2);
+            }
         }
     }
 }

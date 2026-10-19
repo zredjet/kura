@@ -19,7 +19,7 @@ use crate::import::store::{
     NewItem, add_tag, add_to_folder, add_unit_member, create_unit, ensure_tag, find_by_hash,
     folder_exists, insert_item, restore_item, unit_exists,
 };
-use crate::import::{MediaKind, classify, mime_for};
+use crate::import::{MediaKind, Rejected, classify_file, mime_for};
 use crate::library::Layout;
 use crate::media::{MediaBackend, MediaInfo};
 use crate::tags::TagName;
@@ -47,7 +47,7 @@ pub struct Collect<'a> {
     pub job_url: &'a str,
 }
 
-/// 作業フォルダからメディアのファイルを集める（対応していない形式・書きかけ・メタデータは除く）。
+/// 作業フォルダからメディアのファイルを集める（対応していない形式・中身が拡張子と違うもの・書きかけ・メタデータは除く）。
 /// 並びはまとまり（ユニット）の中の順、次にファイル名の自然順。
 pub fn collect(dir: &Path, how: &Collect<'_>) -> Result<(Vec<Downloaded>, u64)> {
     let mut files = Vec::new();
@@ -76,9 +76,16 @@ pub fn collect(dir: &Path, how: &Collect<'_>) -> Result<(Vec<Downloaded>, u64)> 
         if ext == "ytdl" || ext == "temp" || is_format_fragment(stem) {
             continue;
         }
-        let Some(kind) = classify(&ext) else {
-            unsupported += 1;
-            continue;
+        // 取り込みと同じ判定（`.ase` は先頭のバイトで Aseprite かを見分ける）
+        let kind = match classify_file(&path, &ext) {
+            Ok(kind) => kind,
+            Err(rejected) => {
+                if !matches!(rejected, Rejected::Unsupported) {
+                    tracing::warn!(path = %path.display(), reason = rejected.reason(), "取り込みません");
+                }
+                unsupported += 1;
+                continue;
+            }
         };
         let sidecar = match how.tool {
             Tool::YtDlp => dir.join(format!("{stem}.info.json")),
@@ -426,6 +433,30 @@ mod tests {
         );
         assert_eq!(files[0].meta.title, "作品（1/2）");
         assert!(files[0].sidecar.is_some());
+    }
+
+    /// 種類の判定は取り込みと同じ：フォント・3D は取り、Aseprite でない `.ase` は対象外にする。
+    #[test]
+    fn collects_fonts_and_models_and_skips_swatch_ase() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |name: &str, body: &[u8]| std::fs::write(dir.path().join(name), body).unwrap();
+        w("a.woff2", b"wOF2");
+        w("b.glb", b"glTF");
+        w("c.ase", &[0x80, 0, 0, 0, 0xE0, 0xA5, 1, 0]);
+        w("d.ase", b"ASEF\x00\x01\x00\x00");
+        let (files, unsupported) = collect(dir.path(), &how(Tool::GalleryDl)).unwrap();
+        assert_eq!(unsupported, 1);
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| (f.name.as_str(), f.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("a.woff2", MediaKind::Font),
+                ("b.glb", MediaKind::Model),
+                ("c.ase", MediaKind::Image)
+            ]
+        );
     }
 
     #[test]

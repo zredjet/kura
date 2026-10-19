@@ -8,6 +8,7 @@ use super::play::{PlayRequest, playlist_queue};
 use super::smart::{RuleMatch, SmartRule};
 use super::store::{self, NewEntry, NewPlaylist, PlayState, PlaylistPatch};
 use crate::db::test_conn;
+use crate::import::MediaKind;
 use crate::items::{ItemSort, SortKey};
 use crate::query::QueryContext;
 
@@ -602,4 +603,114 @@ fn smart_units_resolve_quoted_tag_names() {
     .unwrap();
     playlist_queue(&conn, pl, &PlayRequest::default(), &ctx()).unwrap();
     assert_eq!(targets(&conn, pl), vec![EntryTarget::Unit(unit)]);
+}
+
+/// 手動のプレイリストの中身の集計：フォント・3D を音楽に数えず、長さにも足さない。一覧と件数には出す
+/// （入れられるが再生しないだけ。M11 の決定 11）。
+#[test]
+fn kind_counts_include_font_and_model() {
+    let conn = test_conn();
+    let image = item(&conn, "a", "image", 0);
+    let font = item(&conn, "b", "font", 0);
+    let model = item(&conn, "c", "model", 0);
+    let audio = item(&conn, "d", "audio", 0);
+    let loose_font = item(&conn, "e", "font", 0);
+    let unit = set_unit(&conn, "素材", &[image, font, model, audio]);
+    let pl = playlist(&conn, PlaylistKind::Manual, Granularity::Unit);
+    store::add_entries(
+        &conn,
+        pl,
+        &[
+            NewEntry::from(EntryTarget::Unit(unit)),
+            NewEntry::from(EntryTarget::Item(loose_font)),
+        ],
+        None,
+        1,
+    )
+    .unwrap();
+    let rows = store::contents(&conn, pl).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].items, vec![image, font, model, audio]);
+    // 画像 8 秒 + 音楽 60 秒。フォント・3D は足さない
+    assert_eq!(rows[0].duration_ms, 68_000);
+    let k = rows[0].kind_counts;
+    assert_eq!(
+        (k.image, k.video, k.audio, k.font, k.model),
+        (1, 0, 1, 1, 1)
+    );
+    assert_eq!(
+        rows[0].kinds,
+        vec![
+            MediaKind::Image,
+            MediaKind::Audio,
+            MediaKind::Font,
+            MediaKind::Model
+        ]
+    );
+    assert_eq!(rows[1].kinds, vec![MediaKind::Font]);
+    assert_eq!(rows[1].items, vec![loose_font]);
+    assert_eq!(rows[1].duration_ms, 0);
+    assert_eq!(store::item_count(&conn, pl).unwrap(), 5);
+}
+
+/// スマートの候補にフォント・3D を入れない（M11 の決定 11）。件数の上限をフォントが食わず、ユニット単位の
+/// `種類=画像` はフォント・3D のメンバーを数えずに判定し、フォント・3D だけのユニットは候補にならない。
+#[test]
+fn smart_candidates_skip_unplayable_kinds() {
+    let conn = test_conn();
+    // 名前順ではフォントが先に来る
+    let fonts: Vec<i64> = (0..10)
+        .map(|i| item(&conn, &format!("a{i}"), "font", 5))
+        .collect();
+    let model = item(&conn, "b", "model", 5);
+    let images: Vec<i64> = (1..=3)
+        .map(|i| item(&conn, &format!("p{i}"), "image", 0))
+        .collect();
+    let set = |conn: &Connection, pl: i64, clauses: &[&str]| {
+        store::update(
+            conn,
+            pl,
+            &PlaylistPatch {
+                shuffle: Some(false),
+                rule: Some(SmartRule {
+                    match_mode: RuleMatch::All,
+                    clauses: clauses.iter().map(|c| c.to_string()).collect(),
+                }),
+                sort: Some(ItemSort {
+                    key: SortKey::Name,
+                    desc: false,
+                }),
+                limit: Some(Some((LimitKind::Count, 3))),
+                include_loose_items: Some(false),
+                ..PlaylistPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        playlist_queue(conn, pl, &PlayRequest::default(), &ctx()).unwrap();
+        targets(conn, pl)
+    };
+    let as_items = |ids: &[i64]| {
+        ids.iter()
+            .map(|i| EntryTarget::Item(*i))
+            .collect::<Vec<_>>()
+    };
+    let files = playlist(&conn, PlaylistKind::Smart, Granularity::File);
+    assert_eq!(set(&conn, files, &[]), as_items(&images));
+    assert_eq!(set(&conn, files, &["評価>=0"]), as_items(&images));
+    // 種類で選んでも、フォント・3D は候補にならない
+    assert_eq!(set(&conn, files, &["種類:フォント"]), vec![]);
+    assert_eq!(set(&conn, files, &["種類:3D"]), vec![]);
+
+    set_unit(&conn, "フォント集", &fonts[..3]);
+    let mixed = set_unit(&conn, "素材", &[images[0], fonts[3], model, images[1]]);
+    let units = playlist(&conn, PlaylistKind::Smart, Granularity::Unit);
+    // フォントだけのユニットは候補にならない
+    assert_eq!(set(&conn, units, &[]), vec![EntryTarget::Unit(mixed)]);
+    // `種類=画像`（メンバーが画像だけ）はフォント・3D を数えない
+    assert_eq!(
+        set(&conn, units, &["種類=画像"]),
+        vec![EntryTarget::Unit(mixed)]
+    );
+    assert_eq!(set(&conn, units, &["種類:フォント"]), vec![]);
 }
