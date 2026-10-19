@@ -37,18 +37,33 @@
 ```text
 kura-engine（OS・DB・Tauri を知らない。Linux でもテストが通る）
   doc/       文書の型・読み込み・正規の符号化・スキーマの移行
-  value/     画素（CoW のタイル）・音声（ブロック）・メタデータ
+  value/     画素（CoW のタイル）・音声（チャンネルごとの Arc<Vec<f32>>）・メタデータ
   shape      形と推論
-  op, ops/   操作の trait・登録・各操作（image/ sprite/ paint/ audio/ meta/）
+  op, ops/   操作の trait・登録・各操作（image/ sprite/ paint/ palette/ audio/ meta/）
+  paint/     描画の規則（筆・塗りつぶし・点の列）と動作の列（ActionList。§10）
   analysis/  解析（透過・ラウドネス・波形など。§11）
   codec/     読み書きの trait・固定のコーデック・形式の表・能力・Platform の受け口・アンカー・作り直しの記録
-  render/    実行・キャッシュ・プレビューの段・範囲の描画
-  session    エディタの履歴（純粋な構造）
+  render/    実行（§12）
+    mod          compile・render（キャッシュなしの正）・最後の使い手・進捗
+    cache        指紋・NodeCache・render_cached
+    incremental  compile_snapshot・差分の適用
+    estimate     メモリの見積もりと予算の確保（estimate・admit・admit_cached・CacheLease）
+    region       範囲（Area・Reach・Tiles・PartialValue）
+    delta        変わった範囲（delta・refine・Changed）
+    area         範囲の描画（render_area・spoit）
+    preview      プレビューの段（choose_level・downscale・plan_level）
+    view         エディタの表示の経路（render_view・ViewRequest・View・ViewRender。§12.8）
+  session/   エディタの履歴（純粋な構造。EditSession・Snapshot・AppendLog）
+  budget     メモリの予算（MemoryBudget・Lease・Class）
+  monitor    中止・進捗・予約（Latest・Ticket）
+  testing/   テスト・ファズ・ベンチの補助（bench・region・snapshot・preview・platform）
   determinism, math, digest, error, limits
      ↑
-kura-core   保存・版・GC・解析・一括加工のジョブ、DB（M11 以降）、ffmpeg の段（codec_ext::ffmpeg。段 9）
-kura-mac    ImageIO・AudioToolbox によるコーデック（Platform の段。段 9）
-src-tauri   コマンドと kura:// の /edit・/peaks（feature "specta" で TS の型を出す）
+kura-core      保存・版・GC・解析・一括加工のジョブ、DB（M11 以降）、ffmpeg の段（codec_ext::ffmpeg。段 9）、
+               エンジンの実行の場（edit::EngineRuntime：2 つのプールと予算。段 10）
+kura-mac       ImageIO・AudioToolbox によるコーデック（Platform の段。段 9）、物理メモリ（physical_memory。段 10）
+kura-devtools  bench edit（§16）・見積もりの煙のテスト（mem_smoke。段 10）
+src-tauri      コマンドと kura:// の /edit・/peaks（feature "specta" で TS の型を出す）
 ```
 
 - エンジンは 1 つのクレートにまとめる。操作の旧版を凍結するとき（§8.4）、その操作が使う計算の部品も一緒に凍結できるようにするため（ADR-134）。
@@ -95,6 +110,7 @@ pub struct OutputSpec {
 - 出力が複数になる操作（スプライトの分割、マーカーでの分割）は、`Frames` や `Clips` の値を 1 つ返す。何個のファイルにするかは `OutputSpec.expand` が決める。口の数が入力によらず決まるので、同じレシピを 100 件に当てても形が崩れない。
 - `DecodeOptions`（SVG のラスタ化の倍率、aseprite を合成で読むかレイヤーで読むか）は出力に効くので、文書に入れる。
 - `Quantize`（段 6。`QUANTIZE_VERSION` = 1）は、音声の出力を書き出す前に整数の格子へ丸める約束：`{ v, bits（8・16・24）, dither（none・tpdf）, seed }`。s = 2^(bits−1)、x = 標本 · s（f64）、TPDF なら x に u1 + u2 − 1 を足し（u は `rng_at(seed', チャンネル, 2·フレーム)` から順に取った 2 つの u32 の (u + 0.5)/2³²、seed' = `determinism::seed(seed, 元のハッシュ, "audio.dither")`）、round_ties_even を [−s, s−1] で止めて q / s にする。WAV・AIFF・FLAC の書き出しの丸めと同じ格子なので、書き出すと q がそのまま書かれる。乱数の流れは絶対位置なので区間の切り方によらない（E18）。知らない版・範囲の外のビット数・音声でない出力は計画を作るときに断る。文書の型の項目なのでスキーマを 3 に上げた（2 → 3 は形を変えない移行）。
+- 新しいノードの種（段 10。ADR-154）：エディタでノードを足すとき（`EditSession` の `Edit::AddNode`）、種を指定しなければ、払い出したノード ID の値（`next_id`）にする。種は文書に書くので、そのあとは ID によらない。§8.2(3) の「種がノード ID に依存しない」は、描くときに ID を読まないという意味で、足すときに種の初期値を ID から決めることとは別。レシピの継ぎ足し（§4.3）で ID をずらしても、種はそのまま。
 
 ### 4.2 元に対する累積
 
@@ -138,10 +154,16 @@ pub enum Value {
 - アルファは常にストレートで持つ。乗算済み（premultiplied）にするのは、色を混ぜる計算の帯の中だけ。ドット絵では α=0 の画素の色も保つ必要があるため。
 - 形式：`Indexed8 + Palette（256 色まで、RGBA8）`、`Gray8`、`GrayA8`、`Rgb8`、`Rgba8`、`Gray16`、`Rgba16`。チャンネル数は元のまま持つ（JPEG を RGBA にすると 33% 増えるため）。
 - f32 と線形光は、フィルタ（平滑なリサイズ・任意角の回転）の行の帯の中だけで使う。画像全体を f32 にしない。
-- 実体は 256×256 の CoW タイル（`Arc<Vec<u8>>`）で持つ。Indexed8 の番号はパレットの色の数より小さいこと（作るときに確かめる）。
+- 実体は 256×256 の CoW タイル（`Arc<Vec<u8>>`。`value::TILE`）で持つ。Indexed8 の番号はパレットの色の数より小さいこと（作るときに確かめる）。
   - ペン・塗りつぶしでは、触れたタイルだけを複製する。取り消しの履歴とキャッシュがタイルを共有するので、メモリが増えにくい。
-  - プレビューは範囲（ROI）とタイル単位で描ける。
-  - 操作の部品には、タイル単位と行の帯（64 行）単位の 2 つの口を用意する。
+  - 操作の部品の口はタイル単位だけ（`Raster::update_tiles`、段 10 の `from_tiles_picked`・`derive_picked`：選んだタイルだけを `par_blocks` で作り、ほかは前の値のタイルを共有するか無効なタイルにする）。以前の「タイルと行の帯（64 行）の 2 つの口」の帯の口は作っていない（使う操作がない。`determinism::BAND_ROWS` は並列の分け方の定数として残っている）。行の帯を使うのは、平滑なフィルタの f32 の作業（下）と、ダイジェストの帯（§8.6）の中だけ。
+  - プレビューは範囲（タイル）と縮小の段で描ける（§12.5・§12.7）。
+- 範囲の描画の約束（段 10）：等倍で範囲を描いた値の有効なタイル（valid）の中は、全体を描いた値と同じ。次の 3 つで守る。
+  1. 各タイルを `apply` と同じ閉包で作る。浮動小数の足す順は出力の画素ごとに決まる（タイル・帯の分け方によらない）。
+  2. 乱数は絶対位置（`rng_at`。§8.2(3)）。
+  3. 入力は、操作が申告した依存（`Op::reach` の逆写し）の中だけを読む。依存の外のタイルは無効なタイル（仮の中身と「読んだ」印を持つ。読むと記録され、`read_rect` は `Internal`）にしておくので、外を読めば失敗する形になる（実行器は捨てて全体で描き直す。§12.5）。申告の正しさは性質テスト（`reach_is_sound`：依存の外を壊しても範囲の中が変わらない）で見張る。
+- タイルの 1 辺は 2 つの定数で持つ：`value::TILE`（値の実体と並列の分け方）と `render::region::VIEW_TILE`（配信と変わった範囲の報告の単位）。値はどちらも 256 だが意味が別なので、別の定数にする（片方を変えても、もう片方に効かない）。
+- 範囲の座標系：画素はキャンバスの座標で持つ（1 枚の画像はその画像の座標、フレームの列は共通のキャンバスの座標。トリムしたフレームの画素 (x, y) はキャンバスの (offset.x + x, offset.y + y)）。範囲はフレームの番号（画像は 0）ごとの矩形の集合（64 個を超えたら外接矩形に畳む）。音声は全チャンネルに共通のフレームの区間。変わったタイルの報告（§12.6）だけは、フレームの画像の座標のタイル。
 - 画素を動かすだけの操作（切り抜き・キャンバス・反転・90° 回転・最近傍の整数倍・トリム・分割・結合・描画）は、画素の形式によらないコードで書き、ビット単位で正確に動かす。Indexed8 はパレットのまま扱う。
 - 色を計算する操作（平滑なリサイズ・フェード・色の置き換え）は、RGB(A) の 8/16 ビットだけを受ける。Indexed8 を渡すと、推論の段階で「RGBA8 になる」と分かるので、エディタはパレットが失われることを先に知らせられる。
 - ICC は値に付けて運ぶ。v1 では色の変換をしない（sRGB 以外なら警告する）。線形光の計算は sRGB の伝達関数で行う。EXIF の向きは、デコードのときに画素へ反映して印を消す。
@@ -239,6 +261,22 @@ pub trait Op: Send + Sync + 'static {
     /// 申告しうる解析（ID, 版）の一覧と、この引数・入力で実際に申告するもの（§11.2）。apply は cx.analysis で受け取る
     const NEEDS: &'static [(&'static str, u16)] = &[];
     fn needs(p: &Self::Params, inputs: &[Shape]) -> Result<Vec<Need>, Issues>;
+
+    // 段 10 で足したもの。どれも既定のままで正しい（遅いだけ）
+    /// 描く間の作業領域（入力と出力の値のほか。§12.10）。既定は Work::ZERO
+    fn work_bytes(p: &Self::Params, inputs: &[Shape], out: &Shape) -> Work;
+    /// 追記だけの引数の読み込みと推論（§12.4）。既定は None（全体で読む・推論する）
+    fn parse_appended(prev: &Self::Params, field: &str, items: &[&serde_json::Value]) -> Option<Result<Self::Params, Issues>>;
+    fn infer_appended(prev: &Self::Params, prev_inferred: &Inferred, p: &Self::Params, inputs: &[Shape], cx: &InferCx) -> Option<Result<Inferred, Issues>>;
+    /// 範囲と変わった範囲（§12.5・§12.6）。既定は false・Global・All・All・None（全体を描く・全体が変わったとみなす）
+    const REGION: bool = false;
+    fn reach(p: &Self::Params, inputs: &[Shape]) -> Reach;
+    fn param_change(old: &Self::Params, new: &Self::Params, inputs: &[Shape]) -> Area;
+    fn effect(p: &Self::Params, inputs: &[Shape]) -> Area;
+    fn apply_region(p: &Self::Params, inputs: &[&Value], tiles: &FrameTiles, base: Option<&Value>, cx: &mut ApplyCx<'_>) -> Option<Result<Applied, EngineError>>;
+    /// プレビューの段（§12.7）。既定は FullOnly（等倍で描く。鎖の継ぎ目になる）・同じ引数
+    fn preview(p: &Self::Params) -> Preview;
+    fn preview_params(p: &Self::Params, level: u8, inputs: &[Shape], full: &[Shape]) -> Self::Params;
 }
 ```
 
@@ -246,6 +284,19 @@ pub trait Op: Send + Sync + 'static {
 - `apply` が受け取る値にはメタデータも付いているが、出力のメタデータはエンジンが入力 0 のものを写して付け直す（§6）。メタデータを書く権限（`MetaAccess::Write`）を申告できるのは、メタデータを設定・消す操作（`meta.set_grid`・`meta.set_pivot`・`audio.set_loop`）と、値の種類を変えて格子を書く・消す操作（`sprite.split_grid`・`sprite.pack_grid`）だけ。Write の操作が座標を持つメタデータを写すときは、`ApplyCx::rules`（文書の全体の規則の版）を `mapping::map_image_meta_for` に渡して、文書の規則の写し方を使う（規則の版を上げても、古い文書を古い写し方で描けるように）。フレームに持ち上げる操作は書く権限を持てない（登録で断る）。
 - 持ち上げのとき、各フレームはフレームの列のメタデータを持った 1 枚の画像として渡す（単体の画像と同じ見え方）。持ち上げられるのは、キャンバスいっぱいのフレームの列だけ（推論で `Trimmed` なら計画の段階で、`Unknown` なら実行のときに確かめて断る）。出力の大きさが決まらない（`AtMost`）入力でも、出力の大きさが入力で決まる操作なら持ち上げられ、写し方は実行で決まる。入力の大きさが決まっているのに出力が `AtMost` になる操作（中身で大きさが決まる）は、フレームごとに大きさが変わりうるので持ち上げない。
 - `Applied` の `space`・`time` は実際の写し方。推論が `Unknown` なら必ず返し、そうでなければ返さないか推論と同じものを返す。実行器が確かめ、食い違えば内部の誤りにする（E9）。
+- **段 10 で足したメソッド**（ADR-154）は、どれも既定のままで正しい（遅いだけ）。既定では、実行器は引数を全体で読み・推論し・当て直し、範囲の描画を使わずに全体を描き、変わった範囲を全体とみなし、プレビューでは等倍で描く（そこが継ぎ目になる）。等倍の値に効くのは `apply`（と `apply_appended`・`apply_region`・`audio_kernel`。どれも `apply` と同じ値を返す約束）だけ。
+- `apply_appended`（段 5 からある口）を実行器（`render_cached` と、`render_area`・`render_view` の全体で描くノード）が使う条件：持ち上げない・先に解く解析がない・メタデータを写す操作（`MetaAccess::Map`）で写し方が恒等（`space`・`time` が `Identity`。写す前と写したあとの値が同じ）・前回の描画と実装（ID・版）・規則・派生した種・段・入力の指紋が同じで鍵が違う・前回の出力（由来 `Exact`）がキャッシュにある（§12.4）。`prev_out` には前回の描画の出力（メタデータを写したあとの値）を渡す。警告は足した分だけを出す（前の分は実行器が前回の警告を前に足す）。追記でなければ None（全体を当て直す）。
+- `parse_appended`：読んだ引数 `prev` の追記だけの配列 `field` に、正規の形の要素 `items` を足した引数を、足した分だけ読んで作る。結果（読めない要素の指摘も）は、足したあとの JSON を全体で読んだものと同じ（文言は `op::unreadable_params` でそろえる）。`infer_appended`：同じ入力の形での `prev` の推論から、`p` の推論を足した分だけで求める。結果（指摘も）は `infer` と同じ。どちらも既定は None で、段 10 では `paint.actions` が実装する（全例のすべての切れ目で、全体と同じことを `parse_appended_equals_parse`・`infer_appended_equals_infer` が照らす）。5 万本の筆の文書でも、追記 1 回の推論が O(全点) にならない。
+- `REGION`・`apply_region`（範囲の描画。§12.5）：`REGION` が真で、`reach` が `Global` でない引数では、`apply_region` が必ず Some を返す（`region_declarations_match_the_implementation` が見張る）。偽か `Global` なら、実行器は全体を描く（入力も全体で）。`apply_region` は `tiles`（フレームごとの値のタイル）だけを `apply` と同じ値で描き、ほかのタイルは `base`（前の出力。大きさ・形式・パレットが同じ）のタイルを共有するか、無効なタイルにする。入力は逆写しで求めた範囲を覆うタイルだけが有効で、その外を読むと誤りになる。メタデータ・写し方・警告は `apply` と同じ（範囲によらない）。持ち上げる操作は 1 フレームずつ呼ばれる。段 10 で実装した操作：`image.crop`・`flip`・`rotate90`・`canvas`・`resize`（最近傍・平滑・同じ大きさ）・`convert`（Indexed8 以外）・`meta.set_grid`・`meta.set_pivot`・`palette.replace`（どれも `apply` の閉包を関数に切り出して使い回す。値は同じ）。
+- `reach`：出力が入力 0 のどこに依るか（`render::region::Reach`。§12.5）。保守的であること（大きめでよく、小さすぎてはいけない）。2 つ目からの入力には、いつも全体で依るとみなす。`param_change`：入力が同じとき、引数を `old` から `new` に変えて出力が変わりうる範囲。`effect`：出力が入力 0 と違いうる範囲（外す・入れるときに使う。出力と入力 0 の形が同じときだけ）。範囲はどれもキャンバスの座標（§5.2）で、持ち上げる操作は 1 フレームの画像の座標で返し、実行器が全フレームに広げる。段 10 の申告：`reach` は範囲の描画を持つ 9 つの操作と `paint.actions`（塗りつぶしがなければ `Same`）・`audio.gain`・`fade`・`mono`（`SameTime`）・`trim`（`Segments`）・`resample`（`Rate`）・`audio.set_loop`。`param_change`・`effect` は、`image.canvas`（`fill` だけを変えたら入力の外の部分）・`paint.actions`（`param_change` は共通の先頭と末尾を除いた違う動作の範囲の和、`effect` はすべての動作の範囲の和。ストローク 1 本の範囲は、点の列を 32 個までに区切り（1 区切り 8 点以上。境の点は両方の区切りに入れる）、区切りごとの外接矩形（`paint::stroke::stroke_bounds`。筆の広がりを足してキャンバスで切る）の和：道は隣り合う 2 点の外接矩形の中を通るので、和は押した画素をすべて覆い、1 つの外接矩形より締まる（`stroke_area_covers_long_strokes`）。塗りつぶしはそのフレーム全体（`param_change` では、違う動作のあるフレームなら、後ろの同じ塗りつぶしもそのフレーム全体））・`audio.fade`（区間）・`meta.*`・`audio.set_loop`（画素・標本が変わらない。`Empty`）と、`image.convert` の `effect`（同じ形式なら入力のまま）。`image.trim_alpha`・`sprite.split_grid`・`sprite.pack_grid`・`audio.normalize` は既定（`Global`）のまま。
+- `preview`・`preview_params`（プレビューの段。§12.7）：`Preview::Scaled`（引数を段に縮めて描ける）・`Preview::Skip`（画素を描かず、メタデータを段の座標で書く）・`Preview::FullOnly`（既定。等倍でしか描けない）。`preview_params` は段 `level`（1〜3）の引数を返す。`inputs` は段の入力の形、`full` は等倍の計画での同じノードの入力の形（縦横比を保つ自動の軸を段の形だけから求めると、丸めのずれが広がるため）。矩形を入力の中に収める必要のある操作は段の入力に収め（clamp）、大きさを決める操作は等倍の出力の ⌈n/2^level⌉ を目指す。実行器は結果を段の形で推論し直し、通らなければ Scaled は計画を段 0 に落とし、Skip はそのノードを外す。操作ごとの扱いは §12.7 の表。
+- `work_bytes` と `Work { shared, per_task }`（メモリの予算。§12.10）：描く間に、入力と出力の値のほかに使う作業領域の見積もり。`shared` は描く間に 1 つだけ持つ分（色の表・重みの表・途中の平面）、`per_task` は並列の仕事（`par_blocks` の 1 ブロック・1 タイル）ごとの分で、同時に動く仕事の数（プールのスレッドの数。呼び手が知っている）を `Work::total(tasks)` に渡して足す。`inputs` は `infer` と同じ形（持ち上げる操作はフレームの画像の形。フレームは順に当てるので 1 フレームぶん）。値を変えない。既定は 0（タイル・ブロック 1 つぶんの一時の領域は数えない）。値の数倍を持つ操作だけが上書きする：Indexed8 への `image.convert`（色の表）・平滑な `image.resize`（重みの表と列の作業。`imaging::resample::smooth_work`）・`render_all` で描く音声の 6 つ（`audio.gain`・`trim`・`fade`・`mono`・`normalize`・`resample`。出力 1 チャンネルぶん）・`paint.actions`（動作は順に当てるので、動作ごとの量の最大を `shared` で申告する。フレームの列はキャンバスの大きさで求める。差分の適用も全体の申告に収まる）。0 でない操作の一覧は `ops::tests::work_bytes_are_declared_where_values_are_multiplied` が見張る。
+  - `paint.actions` の動作ごとの量（`PaintAction::work_bytes`）：塗りつぶしは `paint::fill::fill_work`。画素の集合 2 枚ぶん（同じ色の画素の集合と、それを集める間のタイルごとの語。連結なら、集めたあとは塗った画素の集合。1 枚は行を 64 ビットの語にそろえた `paint::mask::mask_bytes`）で、連結ならさらに区間の待ち行列の上限ちょうど（`paint::fill::queue_cap`：画素 2 つに 1 要素 ＋ 行の数の 2 倍 ＋ 65,536。1 要素 12 バイト）。待ち行列は描く前に上限ちょうどを `try_reserve_exact` で確保して伸ばさない（倍々に伸ばすと上限の 2 倍近くまで確保しうる。申告と、上限を超えたときの `Limit` が同じ式から決まる）。1px の市松を 8 連結で塗ると区間が 1 画素ずつになって待ち行列が画素の数に比例するので、上限で数える（ふつうの形では確保だけで触れる頁は少なく、見積もりは大きめに出る）。ストロークは画素の集合 1 枚 ＋ 筆の形の画素の列 ＋ 点の写し（どれも 1 点 16 バイト）。実測は §9.9。確かめ：`ops::paint::actions` の `work_covers_the_fill_and_stroke_buffers`・`paint::fill` の `work_counts_the_masks_and_the_whole_queue`、kura-devtools の `mem_smoke` の `png-fill-png`。
+- 引数の指紋とノードの鍵（`op.rs`。段 10）：
+  - `ParamSchema::append_field()`：追記だけの配列の引数（`ParamKind::Strokes`）の名前。ちょうど 1 つのときだけ返し、ない・2 つ以上なら None（差分の口を使わない）。`Registry::append_field(op, v)` は、`resolve` が使う実装（その版か、すぐ上の実装のある版）の記述から引く。
+  - `params_digest(schema, 正規の引数)`：追記だけの配列があれば、その配列を要素ごとの連鎖（`append_chain`：blake3("kura-param-append-v1" ‖ 前 ‖ 要素の正規の JSON)）にし、残りの項目の正規の JSON と要素の数と合わせる。なければ正規の JSON そのまま（どちらもドメイン "kura-params-v1"）。追記した分だけ求め直せる（`params_digest_with_chain`）。既定値を書いたかどうかのような書き方の違いは別の指紋になる（キャッシュが外れるだけで、誤りにはならない）。
+  - `node_key(op, 文書に書いた版, 引数の指紋, seed, enabled)`（"kura-node-key-v1"）。ノード ID と入力は含めない（ID は継ぎ足しでずれ、入力は実行器の指紋が足す）。移行するノードは、移す前（文書に書いたまま）の引数で数える。セッション（`Registry::doc_node_key`）と実行器（`compile`）が同じ式・同じ実装の記述で求める（`session_keys_equal_compile_keys`）。
+  - どれもメモリの中だけで使い、保存しない。版をまたいで保つ約束もない。
 
 ### 7.2 引数の記述
 
@@ -317,9 +368,13 @@ register_ops! {
    - 浮動小数の総和は `determinism::sum_blocks` で取る：先頭から `SUM_BLOCK`（4,096 要素。**凍結**）ずつの区間の部分和を区間の順に足す。区間の切り方は結果に効くので、並列の分け方とは別の定数にしてある。変えるなら使う操作の版を上げる。`sum_ordered` は、ほかの決まった区切りで取った部分和を順に足すときに使う。
    - 浮動小数の `max`・`min` は `math::max`・`min`（IEEE 754-2019 の maximumNumber・minimumNumber。NaN は捨て、-0 < +0）を使う。std の `f64::max`・`min` は ±0 のどちらを返すかが決まっていない。
    - 等しい要素の扱いが std の版で変わりうる `sort_unstable*`・`select_nth_unstable*`・`binary_search*` は使わない（安定な `sort`・`sort_by`、`contains` などを使う）。
+   - エンジンはスレッドプールを作らない（段 10）。`par_blocks` は呼ばれたスレッドのプールで回り、プールは呼び手が作って、その `install` の中で描く（kura-core の `EngineRuntime`。§12.11）。`tests/rules.rs`（`engine_src_creates_no_pools`）が、src（テストのモジュールを除く）に `ThreadPoolBuilder`・`.install(`・`::install`（UFCS の `rayon::ThreadPool::install(&pool, ..)`・`<ThreadPool>::install`・関数として取り出す `ThreadPool::install`）・`build_global` がないことを走査で確かめる（テストはプールを作るので、clippy.toml では禁じない。走査の確かめは `pool_scan_sees_code_and_skips_tests`）。
+   - 段 10 で clippy.toml に足した禁止：rayon の `ThreadPool` の口（`join`・`scope`・`scope_fifo`・`in_place_scope*`・`spawn`・`spawn_fifo`・`spawn_broadcast`・`broadcast`・`current_num_threads`）、`rayon::scope_fifo`・`in_place_scope*`・`spawn_fifo`・`broadcast`・`spawn_broadcast`・`join_context`・`max_num_threads`、`par_sort*`（unstable を含む）・`par_chunks_exact*`・`par_rchunks*`・`par_windows`・`par_split*`・`par_chunk_by*`・`par_extend`、`std::thread::Builder::spawn`・`spawn_scoped`。
+   - 段 10 の検証で足した禁止（`into_par_iter`・`par_iter` を通さずに並列のイテレータを作る口。`collect`・`map` などの終端は禁じていないので、作る口で止める）：`rayon::iter` の `split`・`repeat`・`repeat_n`・`repeatn`・`once`・`empty`・`walk_tree`・`walk_tree_prefix`・`walk_tree_postfix`、`ParallelDrainRange::par_drain`・`ParallelDrainFull::par_drain`、`rayon::str::ParallelString` の `par_chars`・`par_char_indices`・`par_bytes`・`par_encode_utf16`・`par_split`・`par_split_inclusive`・`par_split_terminator`・`par_lines`・`par_split_whitespace`・`par_split_ascii_whitespace`・`par_matches`・`par_match_indices`、`ParallelSlice::par_split_inclusive`・`par_array_windows`、`ParallelSliceMut::par_split_inclusive_mut`（26 個）。
+   - 決定性の約束は値（ダイジェスト）だけ。複数のブロックが誤りを返したとき、`par_blocks` がどれを返すかはスケジュールで決まる（中止と上限が同時に起きたときに `Canceled` か `Limit` か、などは約束しない）。描けた値はスレッドの数によらない。
 3. 乱数は ChaCha8 だけ。種は `determinism::seed(node.seed, 元のハッシュ, 用途)`（kura-core の `splitmix64`・`fnv1a64` と同じ値）で作り、鍵は `key_from_seed`（splitmix64 で 32 バイトに広げる。rand_core の `seed_from_u64`・`from_rng` は禁止）。乱数の流れは**絶対位置**で決める（`rng_at`：画像は行、音声はチャンネルを流れにして、列の中の位置へシークする）。タイル・ブロック・フレームの番号を流れに使わない。アニメのフレームはどれも同じ乱数になる（ディザのちらつきを防ぐ）。種がノード ID・画面の操作の順・一括の並びに依存しないので、エディタと一括で同じになる（E4・E5）。
 4. 出力に効く場所で `HashMap`・`HashSet`・`RandomState`・`DefaultHasher` を使わない（`BTreeMap` か並べた `Vec`）。
-5. 描画の中で時刻・環境変数・引数（`env::var*`・`vars*`・`args*`）を読まない。`#![forbid(unsafe_code)]`。
+5. 描画の中で時刻・環境変数・引数（`env::var*`・`vars*`・`args*`）を読まない。`#![forbid(unsafe_code)]`。メモリの予算（§12.10）の一括の待ちは、中止を 2 ms ごとに見回るのに `Condvar::wait_timeout` を使う。待つのは描く前（プールの外）で、時刻を読まず、値にも効かないので、この規則に反しない。ベンチの時計は呼び手が渡す（`testing::bench::measure`）。
 6. 結果に効く依存は Cargo.toml で `=` で版を固定する（libm・blake3・rand_chacha、コーデックの png・zune-jpeg・jpeg-encoder・gif・image-webp・resvg・miniz_oxide、段 6 の symphonia の部品のクレート（Vorbis は `third_party/` の直した写し（§9.7）、段 9 から core・AAC・Vorbis は超越関数を libm に差し替え、Vorbis と Ogg は `lookup1_values` を整数で求めるようにした写し（§9.8））・nanomp3・md-5）。段 7 の Ogg Vorbis の表はワークスペースの `vorbis-tables`（生成物を SHA-256 で凍結）。上げるのは、ゴールデンが通るときだけ。SIMD の経路がターゲットで値を変えうる依存は、SIMD の feature を外す（zune-jpeg の neon・x86、jpeg-encoder の simd、symphonia-core の opt-simd、nanomp3 の wide。md-5 は FLAC の MD5 を書くだけで値は実装によらない）。ほかの依存（dev 依存を含む）がついでに有効にしていないかを `scripts/check-engine-features.sh` が確かめ、CI でも回す。serde_json は固定しない（正規の JSON は自前で書き、読み込みは `float_roundtrip` で正しく丸めるので、結果は版によらない）。
 
 ### 8.3 数値計算は自前で書く
@@ -380,6 +435,8 @@ register_ops! {
   - フレームの列 `kura-frames-v1`：フレームの数 u32 ‖ 繰り返し u32 ‖ キャンバスの幅・高さ u32 ‖ 各フレーム（表示時間 u32 ‖ 位置 x・y i64 ‖ 画像と同じ画素の部分）‖ メタデータ ‖ ICC ‖ 拡張。
   - 音声 `kura-pcm-v1`：レート u32 ‖ チャンネル数 u32 ‖ フレーム数 u64 ‖ 各チャンネルの f32 のビット列（NaN は 0x7fc00000 にそろえる。-0.0 と +0.0 はそろえず、別の値として扱う）‖ 正規の JSON のメタデータ（長さ付き）。
   - 画素の並び・ダイジェストはタイルの分け方によらない。式は `value::tests::digest_formula_is_frozen` で凍結している。
+  - 段 10 で足し方を速くした（値は同じ）：行を `DIGEST_BAND_BYTES`（4 MiB）までの帯に詰めてからまとめて足す（帯の行の数は max(1, 4 MiB ÷ 行のバイト数)。幅が 1 タイルに収まる画像はタイルをそのまま足す。帯の領域を取れなければ行ごとに足す）。足すバイト列は同じなので値は変わらない（`banded_digest_equals_row_by_row`：ChaCha8 で選んだ大きさ・形式・帯の行の数で、旧い足し方と同じ）。M4 Max で、4096² の RGBA8 が 55 → 31 ms、24MP の RGB8 が 61 → 36 ms。
+  - プレビューの道では取らない：`render_cached` は `RenderOptions.digests` が真のとき（保存・一括・照合）だけ取り、取ったものは出力の指紋ごとに覚えて取り直さない（§12.3）。縮小の段の計画でダイジェストを頼むと `Unsupported`、範囲の描画の値（無効なタイルのある値）は `Value::digest` が `Internal` で断る（§12.5・§12.7）。
 - 版ごとに、値のダイジェスト・元のデコードのダイジェスト・使ったコーデックの識別子を記録する。
 - 作り直しは 3 重に確かめる。
   1. CI：操作ごとのゴールデン（`goldens/`）、作り直しの見本集（`goldens-replay/`）、コーデックのゴールデン（`goldens-codecs/`）を、macOS と ubuntu で流す。
@@ -472,7 +529,7 @@ pub trait Encoder: Send + Sync {
 - **JPEG**：zune-jpeg を SIMD なしで使い、どのターゲットでも同じ整数の経路。JFIF の解像度は自前で読む（zune-jpeg は読まない。マーカーを前から順に読む）。プログレッシブは係数を全部持つので、値の 3 倍が上限を超えれば断る。書き出しの設定は `quality`・`chroma`・`progressive`。透明な画素のある画像・16 ビットは書かない（先に背景の合成・8 ビットへの変換）。
 - **GIF**：ブラウザと同じ合成（透明の番号は描かない、Background は透明、Previous は戻す、背景色は使わない）。フレームが 2 つ以上か NETSCAPE の拡張があればフレームの列（繰り返しは、拡張がなければ 1 回、0 なら無限、n なら n + 1 回）。局所パレットがなく大域パレットがあれば Indexed8（消す色が要れば透明な色をパレットの後ろに足す。256 色で足せなければ Rgba8）。書き出しは `alphaThreshold`（既定 128）で 2 値の透明にし、色が収まらなければ自作のメディアンカット（`imaging::quantize`。整数だけ）で減色、フレームの列は 1 つの大域パレット。1 回だけ再生するフレームの列は NETSCAPE の拡張を書かないので、1 フレームで 1 回の列は読み直すと 1 枚の画像になってしまう。そこで書かずに `Unsupported` にする（先に 1 枚の画像にする）。
 - **WebP**：image-webp の合成（四則演算だけ）を、背景を透明にして使う。ICC と EXIF の合計を `max_meta_bytes` で抑える。書き出しは可逆の 1 枚だけ（不可逆・アニメは自作のエンコーダを作る段で。エンコーダの `caps` もアニメを書けないと答える）。
-- **aseprite**：自作。層を下から合成（見えない層・参照層は描かない、ヘッダの印でグループを別に合成、層の不透明度の印、z-index）。ブレンドは `imaging::blend`（Aseprite の `blend_funcs.cpp` の式）で、asefile と 300 個のランダムな絵で一致を確かめている（`tests/aseprite_ref.rs`）。パレットの絵は、すべて通常・不透明度 255 で、パレットの色がどれも不透明（背景の層がないときの透明の番号を除く）なら番号のまま Indexed8、ほかは Rgba8。グレーは RGBA で合成して Rgba8。スライス（キャンバスの座標）・タグ（`ImageMeta.tags`）・ICC を運ぶ。タイルの反転と外部のタイルセットは段 4 では読まない（`Unsupported`）。グループの入れ子は 64 段まで。セルはキャンバスの範囲に切って描き、タイルマップはキャンバスに重なるタイルだけを描く（どちらも 64 行ごとに中止を確かめる）。1 フレームを描くあいだに展開するセル・タイルセットは合計 `max_value_bytes` まで（タイルの爆弾を断る）。フレームをまたいで使い回す展開済みのキャッシュも合計 `max_value_bytes` までで、超える分は持たずに描くたびに展開する。
+- **aseprite**：自作。層を下から合成（見えない層・参照層は描かない、ヘッダの印でグループを別に合成、層の不透明度の印、z-index）。ブレンドは `imaging::blend`（Aseprite の `blend_funcs.cpp` の式）で、asefile と 300 個のランダムな絵で一致を確かめている（`tests/aseprite_ref.rs`）。パレットの絵は、すべて通常・不透明度 255 で、パレットの色がどれも不透明（背景の層がないときの透明の番号を除く）なら番号のまま Indexed8、ほかは Rgba8。グレーは RGBA で合成して Rgba8。スライス（キャンバスの座標）・タグ（`ImageMeta.tags`）・ICC を運ぶ。タイルの反転と外部のタイルセットは段 4 では読まない（`Unsupported`）。グループの入れ子は 64 段まで。セルはキャンバスの範囲に切って描き、タイルマップはキャンバスに重なるタイルだけを描く（どちらも 64 行ごとに中止を確かめる）。1 フレームを描くあいだに展開するセル・タイルセットは合計 `max_value_bytes` まで（タイルの爆弾を断る）。フレームをまたいで使い回す展開済みのものは、タイルセットと、後のフレームのリンクが指すセル（それを描く最後のフレームまで）だけを、合計で値の大きさ（と `max_value_bytes`）まで持ち、超える分は持たずに使うたびに展開し直す（値は同じ。§9.9）。セルは、描く前にフレームごとの「層 → その層の最初のセル」の表を 1 度だけ作って引く（描く順の z・リンク・最後に使うフレームのどれも。ない層のセルや層の多いファイルでも、セルの数 × 層の数の手間にしない）。表を作る・引く手間 4,096 ごとに中止を確かめる。
 - **PSD・PSB**：自作。合成済みの画像だけ（層があって合成済みの画像が本物でないものは `Unsupported`）。ビットマップ・グレー・インデックス・RGB の 8/16 ビット、圧縮なし・RLE。合成済みの画像の ZIP はツールによって流れの分け方が違い、確かめる相手もないので `Unsupported`（次の段へ）。PSB は長さの欄が広がる所（層とマスクの情報の長さは 8 バイト、RLE の行の長さは 4 バイト）を読み分け、どの長さもファイルの残りの長さと照らしてから使う。透明は、層の数が負か Mtrn などがあるときだけ。Photoshop の白の下塗りは、下塗りでしか成り立たない条件がすべての画素で成り立つときだけ戻す（ImageMagick などは下塗りしない）。CMYK・Lab・32 ビットは次の段へ。拡張子は psd・psb。
 - **SVG**：resvg。結果は OS の libm に依存しうるので `reproducible()` は偽（アンカーを作る）。`<image>`（外部のファイル・data: のラスター画像・入れ子の SVG。pattern・mask などの中も）を含むものは `Unsupported`（resvg の raster-images は zune-jpeg の SIMD を有効にするので入れない）。文字は `PinnedOptions.svg_fonts` で渡したフォントだけで描き、渡していなければ `Unsupported`。usvg に渡す前に、ファイルの大きさ（16 MiB）・DTD の実体の展開（64 MiB）・要素の数（2²¹）・`<use>` の展開・marker の頂点ごとの複製（頂点の数 × marker の中の要素の数）を見積もって断る。DTD は引用符・注釈・PI を区別してバイト列のまま読み、パラメタ実体・外部の実体・マークアップや参照を含む実体は断る。入れ子の marker も断る。roxmltree・usvg・resvg は入れ子の深さだけ再帰し、スタックを使い切ると受け止められずに落ちるので、XML を読む前に生のバイト列で入れ子の深さを数えて 64 段で断り（2 MiB のスタックのデバッグのビルドで、重い形が 96 段まで動くことを測った）、参照（`<use>`・`url(#…)`・祖先から受け継ぐ fill・stroke・marker・CSS の規則）を展開した高さも 64 段で断る。参照の輪（pattern の中身が受け継いだ fill で自分を描き直す、など。ファズで見つけた）も断る。CSS の規則は、要素名・`.class`・`#id` の単純なセレクタだけ当たる要素を決め、それより複雑なセレクタはどの要素にも当たりうるとみなす。見積もりは再帰せずにたどり、手間（要素ごとの参照と辺の数の合計）は 2²⁴ まで。usvg はすべてのセレクタをすべての要素に照らし、子孫・`~` の結合子では祖先・兄弟をさかのぼって後戻りし（試す並びは、文書の深さ・兄弟の数から結合子の数だけ順に選ぶ組み合わせの数）、当たった規則と style 属性の宣言を宣言の数の 2 乗の手間で書き込むので、CSS のセレクタの数 × 要素の数と、これらの手間の合計（当たる要素の数は要素名・クラス・id ごとに数え、複雑なセレクタはすべての要素とする）をそれぞれ 2²⁷ までにする。セレクタの部分の数は 32 まで（simplecss は結合子の数だけ再帰する）。受け継ぐ参照は、受け継がないと分かっているもの（clip-path・mask・filter）のほかはすべて受け継ぐとみなす（`*fill` のような古い書き方の名前も usvg は fill として読む）。usvg は単位が objectBoundingBox の pattern・clipPath・mask と filter を、参照する要素ごとに中身ごと複製する（入れ子で指数に増える）ので、受け継いだ fill・stroke も使う図形ごとに数え、複製で作る要素の数を 2¹⁷ までにする。usvg は弧・円・楕円・角丸を半径に応じた数の曲線に直す（半径 10³⁰ の弧 1 つで 6 秒を超えた）ので、図形の属性・style・CSS の宣言の数の絶対値は 10⁹ まで（色・id・参照・名前の中の数字は数として読まない）。
   描く前に、resvg の描き方に合わせて木（mask・clipPath・フィルタの feImage・文字の輪郭・pattern の中身も）をたどり、資源を見積もる（`check_render`。超えたら `Unsupported`）：(1) 根からの道筋ごとに同時に生きる一時の画像の合計（層は 1 枚がキャンバスの 25 倍まで広がり入れ子の層は同時に生きる、mask と clip は層ごとに画像とマスク、フィルタはプリミティブの結果をすべて持つ、pattern のタイルは外側のタイルを持ったまま中身を描く）を絶対の予算 `max_value_bytes` まで、(2) 描く手間（画素の数。図形の外接矩形と描く面の小さい方・層の合成・プリミティブごとの式：feMorphology は層の画素 × 半径の矩形、feTurbulence はオクターブの数、feConvolveMatrix は行列の大きさ、ぼかしは半径の分）を 2³² とキャンバスの 64 倍の大きい方まで（resvg の描画は途中で止められないので、手間で時間を抑える）、(3) 変形のあとの座標が ±10⁸ 画素を超える図形を断る。いずれも検証とファズで見つけた形（pattern のタイルの 209 GB の確保・半径 10³⁷ の楕円の遅い入力など）。
@@ -504,7 +561,7 @@ pub trait Encoder: Send + Sync {
 - **入力**：WAV の並びの planes を Vorbis I §4.3.9 の並び（symphonia の `map_vorbis_channel` と同じ表）に直して渡す。NaN は 0、±∞ は ±1 にする（NaN のビットの形がターゲットで違い、todB がビットを値にするため）。1 を超える有限の値はそのまま。全体を一度に渡す（`vorbis_analysis_buffer(N)`・`wrote(N)`・`wrote(0)`）ので、1,024 フレームずつ渡す libvorbis の使い方とは、最初の外挿と envelope の先読みの差で最初の数ブロックの窓の長短が変わり、そのあとのブロックの位置がずれることがある（同じ入力なら常に同じバイト列）。
 - **コメント**：vendor は `kura`。項目は LOOPSTART・LOOPLENGTH（`start < end ≤ 長さ` のときだけ）、`ENCODER=ogg-vorbis-kura-enc/1`、タグ（`symph::vorbis_comments_for`。名前の重なりを除く。§9.2）の順。元の `ENCODER`（`vorbis:ENCODER`）は運ばない（RPG ツクール MV/MZ は LOOPLENGTH の次の項目の長さの下位バイトまで数字として読みうるので、決まった ENCODER を番兵にする）。コメントのパケットが 16 MiB 以上なら `Unsupported`（symphonia の Ogg の読み口が読めるパケットの大きさ）。
 - **Ogg のページ**（`codec/ogg.rs`。凍結。変えるとエンコーダの版を上げる）：1 ページ目は識別ヘッダだけ（BOS・グラニュール 0）、コメントと setup は 2 ページ目から（setup で閉じる）、最初の音声パケットだけのページ（グラニュール 0）、「長いブロックで次が短い」パケットの直後では閉じない、本体が 4,096 バイト以上になったパケットで閉じる、最後の音声パケットだけの最後のページ（直前のパケットが「長・次は短」ならその 2 つ）に EOS、各ページのグラニュールはそこで終わる最後のパケットの窓の中心（最後のページは総フレーム数）。音声が 1 ページだけのストリームは lewton・ffmpeg が末尾を切らず（最初の音声パケットだけのページはそのため）、「長・次は短」の直後で閉じたページは lewton が数え誤る（そのため閉じない）。最後の音声パケットだけの最後のページは、検証で外しても長さが変わらなかったが、規則を単純に保つために凍結した。lewton の `OggStreamReader` は、最後が「長・次は短」のあとの短いブロックで終わる形で末尾を切りきれないことがある（192 kHz・8 チャンネル・q10 の正弦 1,000 フレームを 1,152 と読む。lewton の数え方の不具合で、ページの切り方では避けられない。symphonia・ffmpeg・libvorbis は正しい）。シリアル番号は `BLAKE3("kura-ogg-serial-v1" ‖ 値のダイジェスト ‖ 設定の正規の JSON)` の先頭 4 バイト（乱数・時刻を使わない）。空の音声も書く（libvorbis と同じく短いブロックの 1 パケット）。
-- **並列と速さ**：ブロックの計画（envelope。直列）→ 区間（2²¹ 標本ぶんのブロック）ごとに、aoTuV の窓の状態（直列）→ 窓・MDCT・FFT（`par_blocks`）→ ampmax・M5 の lowcomp・M3 の lastmdct（直列）→ 心理モデル・floor・residue・パケット（`par_blocks`。M3 の tempmdct を前から引き継ぐ続いた衝撃のブロックは 1 つの仕事の中で順に）。結果はスレッド数・区間の大きさによらない（照合とテストで確かめる）。中止は、PCM の確保の前、入力の写しの 2¹⁷ フレームごと、前の外挿（仕事ごとと 2¹⁷ 標本ごと）、envelope の探索の 2,048 歩ごと、計画 32 個ごと、ブロックの解析のブロックごと、シリアル番号のダイジェストの前後と 16,384 標本ごと、Ogg の多重化の 512 パケットごとに確かめる（48 kHz・ステレオで、最初から頼んだ中止は 1 ms 未満で戻り、確かめの間隔の最大は PCM の確保で 30 分なら約 35 ms、3 時間なら約 0.2 秒）。3 分の 44.1 kHz ステレオの q5 で 0.27〜0.30 秒、1 スレッドで 1.45〜1.56 秒（`vorbis_bench_three_minutes_stereo`、16 コア。測るたびの揺れ）。26 kHz 以上で衝撃の多い入力（クリックの列など）は、続いた衝撃のブロックが 1 つの仕事になるので段 3 がほぼ直列になる（10 分のステレオで約 9 秒。負荷のある機械で測った）。メモリは、書き出しのあいだ入力全体の f32 の写し（C の `vorbis_analysis_buffer`。値と同じ大きさ）を持ち、ピークは値の約 2.1〜2.8 倍（44.1 kHz ステレオ 3 分で値 64 MB に対して 168 MB）。段 10 のメモリの予算（§12）で、エンコーダごとの倍率として扱う。
+- **並列と速さ**：ブロックの計画（envelope。直列）→ 区間（2²¹ 標本ぶんのブロック）ごとに、aoTuV の窓の状態（直列）→ 窓・MDCT・FFT（`par_blocks`）→ ampmax・M5 の lowcomp・M3 の lastmdct（直列）→ 心理モデル・floor・residue・パケット（`par_blocks`。M3 の tempmdct を前から引き継ぐ続いた衝撃のブロックは 1 つの仕事の中で順に）。結果はスレッド数・区間の大きさによらない（照合とテストで確かめる）。中止は、PCM の確保の前、入力の写しの 2¹⁷ フレームごと、前の外挿（仕事ごとと 2¹⁷ 標本ごと）、envelope の探索の 2,048 歩ごと、計画 32 個ごと、ブロックの解析のブロックごと、シリアル番号のダイジェストの前後と 16,384 標本ごと、Ogg の多重化の 512 パケットごとに確かめる（48 kHz・ステレオで、最初から頼んだ中止は 1 ms 未満で戻り、確かめの間隔の最大は PCM の確保で 30 分なら約 35 ms、3 時間なら約 0.2 秒）。3 分の 44.1 kHz ステレオの q5 で 0.27〜0.30 秒、1 スレッドで 1.45〜1.56 秒（`vorbis_bench_three_minutes_stereo`、16 コア。測るたびの揺れ）。26 kHz 以上で衝撃の多い入力（クリックの列など）は、続いた衝撃のブロックが 1 つの仕事になるので段 3 がほぼ直列になる（10 分のステレオで約 9 秒。負荷のある機械で測った）。メモリは、書き出しのあいだ入力全体の f32 の写し（C の `vorbis_analysis_buffer`。値と同じ大きさ）を持ち、ピークは値の約 2.1〜2.8 倍（44.1 kHz ステレオ 3 分で値 64 MB に対して 168 MB）。段 10 のメモリの予算（§12.10）で、エンコーダごとの倍率として扱う（§9.9）。
 - **品質と互換**（数字は ADR-149）：同じ q で、素の aoTuV b6.03（vorbis_rs）とビットレート・NMR が中央値でほぼ同じ（違いは入力の渡し方と前増幅の分だけ）。kura の出力 1,200 本（1・2・3・6・8 チャンネル × 8・22.05・44.1・48・96・192 kHz × q −1・3・5・10 × 長さ 0〜数秒）を symphonia・lewton・ffmpeg・libvorbis（sox）で読み、長さはすべて元とちょうど同じ。検証では、端の長さ 405 本（1〜8 チャンネル・8〜192 kHz）と約 33 万本の掃引も、symphonia と lewton の `OggStreamReader` で長さが元どおりだった（上の lewton の例外を除く）。チャンネルの並びは 1〜8 チャンネルで symphonia・ffmpeg（WAV の並びで出す）と lewton・sox（Vorbis の並びで出す）が期待どおり。品質の記録の道具は `kura-devtools vorbis-quality`（合成の音と手元の音で、ビットレート・帯域・NMR・LSD・長さを測る。ViSQOL・Zimtohrli は作業の環境だけで使い、リポジトリには入れない）。
 - **symphonia の Vorbis の修正**：symphonia-codec-vorbis 0.6.1 は residue 0/1 を 2 チャンネル以上で読むとき、チャンネルの分類を次のチャンネルの範囲まで書いてしまい、1 チャンネルあたりの partition の数が分類の codebook の次元の倍数でない uncoupled の 3〜8 チャンネル（aoTuV b6.03 の q5、Xiph 1.3.7 の q3 など。品質（テンプレート）で起きたり起きなかったりする）を誤って読む。1 行を直した写しを `third_party/symphonia-codec-vorbis/`（MPL-2.0 のまま公開。`KURA.md` に変更・理由・確かめたこと）に置き、ワークスペース（と `fuzz/`）の `[patch.crates-io]` で使う。読む値が変わったので識別子を `ogg-vorbis-symphonia-dec/2` にした（公開前で、再現を約束しないデコーダの作り直しはアンカーから読むので、旧版の `/1` は残さない）。上流で直った版が出たら写しをやめる。 段 9 で、さらに超越関数を libm に差し替えて値を再現できるようにし、識別子を `ogg-vorbis-symphonia-dec/3` に上げた（§9.8）。
 - **dev 依存**：lewton `=0.10.2`（読み直しの照合だけ。E28（`tests/ogg_vorbis.rs`）と `codec::vorbis::encoder` の照合のテスト。aoTuV で作った 3・5 チャンネルのフィクスチャは、lewton の出力を保存した参照と照らす（`tests/fixtures.rs`））。
@@ -527,10 +584,31 @@ pub trait Encoder: Send + Sync {
 - **アンカーのゴールデン**：`anchor-kura-dec@1.jsonl` はその場の書き手で書いて読むので、値の作り方を守るだけ。決まったバイト列から読めることは、凍結したアンカー `fixtures/anchor-v1-*`（17 本：9 つの画素の形式・パレット・ICC と EXIF のある・ない・シート・16 ビットと 8 ビットのフレームの列・ステレオとモノラルと 6 チャンネルの WAV）が守る。kura-mac のフィクスチャ（`crates/kura-mac/fixtures/`）も追記だけの検査の対象。
 - **後の段に回したもの**：HEIF の EXIF、RAW、HDR、ゲインマップ・プレマルチプライドの HEIF のアルファ（ImageIO が黙って捨てる）、アンカーの保存への結線（M12）、RF64（4 GiB を超える WAV）、ffmpeg のタグの表をエンジンの表と共有すること、Opus の書き出し。
 
+### 9.9 段 10 のコーデックの作業領域
+
+メモリの予算（§12.10）の見積もりのため、`Decoder::work_bytes(format, shape)` と `Encoder::work_bytes(format, shape, opts)` を足した。読む・書く間に、値のほかに使う作業領域（バイト）を形から返す。値は変えない。書き出し先に渡すバイト列は含めない（`CodecSet::encode_bytes` の `Vec` は、見積もりが値の 1 倍まで別に数える）。既定は値の 1 倍（展開した行・平面や、行を詰めた写しを 1 つ持つとみなす。分からないものは多めに見積もる側に倒す）。`CodecSet::decode_work_bytes` は、読む途中で次の段へ回りうるので、その形式を読むデコーダの最大を返す（`encode_work_bytes` は選ぶエンコーダのもの）。ファイル全体をメモリに読んで持つデコーダのために、`Decoder::file_work_bytes(format, shape, len)`（呼び手がファイルの長さ `len` を知っているときの見積もり。既定は長さを見ない `work_bytes`）と `CodecSet::decode_file_work_bytes`（その最大）も足した。見積もり（§12.10）は、`EstimateSpec` に読む入力のファイルの長さ（`lens`。`EstimateSpec::input_len(入力, 長さ)` で決める）があればこちらを使う。
+
+| 読み書き | 見積もり（値のほか） | 段 10 の実測（M4 Max・release。`/usr/bin/time -l` の peak memory footprint から入力・出力の値を引いた量） |
+|---|---|---|
+| 既定 | 値の 1 倍 | PNG の読み（値 3 MiB）：読む段の量（値を含む）が 7.2 MiB で、見積もり 6.0 MiB を値によらない分（約 1.2 MiB）だけ上回る |
+| JPEG の読み | 値の 3 倍（プログレッシブは全成分の係数を持ったまま行に書く。ベースラインは形からは見分けられないので同じ） | 24MP：ベースライン 70 MiB（1.0 倍）・プログレッシブ 208 MiB（3.0 倍）。ベースラインは約 2 倍の見積もり過大 |
+| ImageIO の読み | 値の 2 倍（全体を 1 回で展開し、行を値に写す。§9.8 の「値の約 3 倍（値を含む）」） | — |
+| PNG の書き | 1 フレームの 3 倍（行を詰めた写し ＋ png クレートがメモリに組む IDAT。`fast` は無圧縮で組み直すぶん 4 倍） | 4096² の乱数の Rgba8：`balanced` 131 MiB（2.0 倍）・`fast` 219 MiB（3.4 倍） |
+| JPEG の書き | 画素あたり「行の写し（Gray8 は 1・Rgb8 は 3・ほかは 4）＋ 2 × 成分」バイト。プログレッシブは ＋ 3 × 成分 | 24MP の写真らしい合成・q90：ベースライン 77 MiB（1.1 倍。見積もり 3 倍）・プログレッシブ 282 MiB（4.1 倍。見積もり 6 倍） |
+| Ogg Vorbis の書き | 値の 1.8 倍 ＋ 8 MiB（入力全体の f32 の写しと区間ごとの作業。8 MiB は短い音声で比例の分を超えた量から置いた） | 3 分の 44.1 kHz ステレオ・q5：92 MiB（1.5 倍） |
+| アンカーの書き・読み直し | 値の 1 倍（読み直した値。1 枚の画像と音声は帯・塊ごとに流して書く）。APNG は `fast` の PNG の 1 フレームの 4 倍と比べて大きいほう | — |
+| aseprite の読み | ファイル全体（`file_work_bytes` は長さ。長さを渡さない `work_bytes` は値の大きさとみなす）＋ 持っておく展開したセル・タイルセット（値の大きさまで）＋ RGBA のキャンバス 5 枚（合成のキャンバス・展開中のセル 1 つ・タイルマップとタイルセット・別に合成するグループの入れ子 2 段）。展開したセルは、後のフレームのリンクが指すものだけを、それを描く最後のフレームまで持つ（リンクのないセルは 1 度しか描かない）。合計は値の大きさ（と `max_value_bytes`）まで持ち、超えた分は持たずに使うたびに展開し直す（値は同じ） | 3 スレッド。読む段（値を含む）の数え上げの確保のピーク／footprint と、長さを渡した見積もり（値 ＋ 作業領域）、MiB：512²・16 層・1 フレーム 16.7／18.5（21.7）、同・4 フレーム・リンクあり 23.8／26.1（27.7）、1024²・32 層・1 フレーム 125.9／129.7（145.9）、256²・20 層・50 フレーム 243.3／243.6（256.6） |
+
+- 操作の作業領域（`Op::work_bytes`。§7.1）の実測（同じ測り方）：2048² の乱数を 256 色・誤差拡散に減色 381 MiB（見積もり 512 MiB）、Lanczos3 4096² → 2048²（16 スレッド）20 MiB（見積もり 17 MiB）、`audio.gain`（3 分ステレオ）32 MiB（見積もり 30 MiB）。Lanczos3 と gain で見積もりが実測を 2〜3 MiB 下回るのは、プールのスレッドの立ち上げなど、操作によらない分と見ている（推測）。
+  - 塗りつぶし（`paint.actions`。§7.1）は、1px の市松を中央から 8 連結で塗る最悪の形で測った（3 スレッド。入力は予算の外 `Source::Held`。描く段の数え上げの確保のピーク／peak memory footprint から描かない子を引いた量と、見積もりのピーク、MiB）：4096² の Gray8 100.8／76.9（116.8）、4096² の Rgba8 100.8／125.1（164.8）、8192² の Gray8 400.9／315.5（464.9）。ふつうの形（4096² の Gray8 を 4 連結で塗る 64px の市松）は footprint 6.2 MiB で、見積もり（116.8 MiB）が大きく出る（待ち行列の上限を確保しても、触れる頁が少ない）。
+- 予算の見積もりは、段をまたいで残る分（持ち越し）を足して、§12.10 の表の通しで実測の 1.09〜1.43 倍になった（形からは見分けられないベースラインの JPEG の行は 1.97 倍）。
+- 残したこと：JPEG のプログレッシブの読みの上限の照らし（§9.5：値の 3 倍で断る）は、実測のピークが値を含めて 4 倍だった。断る入力が変わるので段 10 では変えていない（版の扱いを含めて判断が要る）。
+- 残したこと（aseprite）：値より大きいタイルセットと持ちきれないリンクのセルは、使うたびに展開し直すので時間がかかりうる（値は同じ。段 10 の確認で、値の 17 倍の 4 MiB のタイルセットを 3 層・60 フレームで使う作った形が 1 回 11 ms → 1.7 s。展開し直す分も 1 フレームの展開の上限 `max_value_bytes` に数える）。描く層を毎フレームたどる手間（層 × フレームの数）も残る（中止は効く）。長さを渡さないと、ファイルは値の大きさとみなす（縮まない画素の層が多いファイルでは足りない）。キャンバスより大きいセル・タイルセット、3 段より深い別に合成するグループの入れ子、ファイルの構造（セルの数に比例する）は見積もりの外。形を読む `shape()` もファイル全体を読むが、予算の確保の前なので予算の外。ファイル全体を読むほかのデコーダ（FLAC・MP3・AAC・ImageIO）は、まだ長さを使っていない（値からの倍率だけ）。
+
 ## 10. 描画の道具
 
 ```rust
-pub struct PaintParams { pub actions: Vec<PaintAction> }  // 追記だけ
+pub struct PaintParams { pub actions: ActionList }  // 追記だけ。JSON では PaintAction の配列（段 9 までは Vec<PaintAction>）
 pub enum PaintAction {
     Stroke { tool: Pen | Eraser, color: Option<PaintColor /* {"rgba":[..]} | {"index":n} */>, blend: Replace | Over,
              brush: Brush { shape: Square | Circle, size: 1..=255 }, pixel_perfect: bool, frame: u32,
@@ -547,10 +625,11 @@ pub enum PaintAction {
 - **ストローク**：道の各点に筆の形を押した画素の和集合を求め、各画素に 1 回だけ色を置く。重なっても濃くならず、ストロークの中の順番に左右されない。
 - **ペン**：置き換えは色をそのまま置く。重ねるは `imaging::composite::over` の整数の式（`div255` 相当の四捨五入）で 1 回だけ重ねる（アルファのない形式は、アルファ付きにして重ねてから戻す）。
 - **消しゴム**：アルファを 0 にする（色はそのまま）。Indexed8 はパレットの透明な色（アルファ 0 の最初の色）の番号にし、なければ `Unsupported`。アルファのない形式では使えない。
-- **塗りつぶし**：起点の色と各チャンネルの差がすべて許容差以下（16 ビットは 257 倍）の画素のうち、起点から 4 連結か 8 連結でたどれるもの（`contiguous` が偽なら画像全体の同じ色）。連結成分として定義するので、たどる順番に左右されない（E22）。Indexed8 は番号で比べ、許容差は 0。起点が画像の外なら何もしない。起点の座標は ±2^31 まで（読み込みで断る）で、トリムしたフレームの位置を引いてあふれる場合も「外」として扱う。実装は行を 64 ビットの語にそろえたビットの表で、同じ色の続き（区間）ごとに広げる（4096² の全面で 7 ms）。区間の待ち行列は、まだ塗れる画素がある範囲だけを積み、「画素 2 つに 1 要素 ＋ 行の数の 2 倍 ＋ 65,536」までにする（市松模様の 8 連結を中央から塗ると山は画素の約 0.3。4×4 の周期の模様をすべて試した最悪。超えたら落ちずに `Limit`）。
+- **塗りつぶし**：起点の色と各チャンネルの差がすべて許容差以下（16 ビットは 257 倍）の画素のうち、起点から 4 連結か 8 連結でたどれるもの（`contiguous` が偽なら画像全体の同じ色）。連結成分として定義するので、たどる順番に左右されない（E22）。Indexed8 は番号で比べ、許容差は 0。起点が画像の外なら何もしない。起点の座標は ±2^31 まで（読み込みで断る）で、トリムしたフレームの位置を引いてあふれる場合も「外」として扱う。実装は行を 64 ビットの語にそろえたビットの表で、同じ色の続き（区間）ごとに広げる（4096² の全面で 7 ms）。区間の待ち行列は、まだ塗れる画素がある範囲だけを積み、「画素 2 つに 1 要素 ＋ 行の数の 2 倍 ＋ 65,536」（`paint::fill::queue_cap`）までにする（市松模様の 8 連結を中央から塗ると山は画素の約 0.3。4×4 の周期の模様をすべて試した最悪。超えたら落ちずに `Limit`）。段 10 から、待ち行列は描く前に上限ちょうどを確保する（伸ばさない。作業領域の申告と同じ式。§7.1）。
 - **色の引数**：Indexed8 は番号（置き換えだけ）、ほかは RGBA8。グレーの形式は灰色だけ、置き換えでアルファのない形式は不透明な色だけ。形式が分かる推論の段階で確かめる（パレットの番号の範囲は実行で確かめる）。
 - **フレーム**：`frame` はフレームの番号（画像は 0）。座標はキャンバスの座標で、トリムしたフレームではフレームの外は描かない。
-- **差分の適用**：引数が追記だけなので、前の出力に新しい動作だけを当てられる（`Op::apply_appended`）。全体を当て直した結果とビット単位で一致する（E21。`paint.actions` の例のすべての切れ目で確かめる）。
+- **差分の適用**：引数が追記だけなので、前の出力に新しい動作だけを当てられる（`Op::apply_appended`）。全体を当て直した結果とビット単位で一致する（E21。`paint.actions` の例のすべての切れ目で確かめる）。段 10 から実行器（`render_cached` と、`render_area`・`render_view` の全体で描くノード）が使う（条件は §12.4）。
+- **動作の列**（`paint::list::ActionList`。段 10）：動作を 1 つずつ `Arc` で持ち、64 個ずつの切れ目も `Arc` で持つ（最後の切れ目のほかは 64 個ちょうど）。追記した版は前の版の切れ目を共有するので、追記は O(足した分 ＋ 切れ目の数) で、前の動作（点の列）を写さない。前の版への追記かどうか（`appended_since`）は、共有している切れ目・動作を `Arc` の同一性で飛ばし、共有していないところだけ中身を比べる（追記で作った版どうしなら O(切れ目の数 ＋ 64)。別々に作った列は全部を比べ、答えは同じ）。JSON の書き方・読み方・誤りの文言は `Vec<PaintAction>` と同じ（文書の形は変わらない）。追記の読み込み（`parse_appended`）・推論（`infer_appended`）・変わった範囲（`param_change`）もこれで足した分だけになる（§15 の「点の多いペン」）。
 - **スポイト**：操作ではない。描画結果の 1 画素を返す問い合わせ（`paint::sample(value, frame, x, y) -> Option<Sample { rgba, index, raw }>`。16 ビットは四捨五入で 8 ビット）で、履歴に入らない。縮小したプレビューからは拾わない（E23）。
 - **描いている最中**：フロントが同じ規則で仮の画素を重ね描きし、確定したら Rust の描画結果に置き換える。両者を照らすテストベクタ（`crates/kura-engine/tests/vectors/paint/*.json`）を Rust と TS で共有する。
 - **前の操作との関係**：描画より前の操作（切り抜きの位置など）をあとから変えても、描画の座標は描画のノードの入力の座標のまま動かない。エディタは「後ろの描画の位置はそのままです」と知らせる。
@@ -602,7 +681,7 @@ impl Engine {
 
 - 操作は `Op::NEEDS`（申告しうる (ID, 版) の一覧）と `Op::needs(p, 入力の形) -> Vec<Need>`（どの入力にどの解析を、どの引数で）を申告する。実行器は `compile` で申告を確かめ（`NEEDS` にある・登録済み・入力の種類を受け付ける・引数が正規・見積もりが上限内）、描くときに各ノードの `apply` の前に解いて、`ApplyCx::analysis::<A>(入力, 値, 引数)` で `Arc<A::Output>` を渡す。申告していない解析を使うと `Internal`。描く前に解いていない解析をその場で解いたときも `Internal`（申告と使い方の食い違い）。外したノードは解かない。`Lift::PerFrame` の操作は申告できない（登録で断る）。申告は操作の版ごとに固定し、今の版の操作は解析の今の版を申告していなければならない（`Engine::new` の `check_current_needs`。旧版・退役した版の操作は除く。試験用の `with_registries` は確かめない）。申告される解析の版を上げるときは、申告する操作の版も上げて、新しい版で今の版の解析を申告する（§8.4）。
 - 段 8 で、`audio.normalize` v1 は内部用の `audio.loudness_gating` を、`image.trim_alpha` v1 は `image.opaque_bounds` を申告して使う形に移した（値は同じで、操作の版・ゴールデンは変えていない）。表示する値（`audio.loudness`・`image.opaque_bounds`）と操作が使う値は、同じ関数を通るので必ず一致する（E26）。
-- 実行器は解いた結果を `Solver` で受け渡す。段 10 のキャッシュはここに「入力の指紋 × ID × 版 × 引数」で入る。操作が使うのはメモリ上で解いた結果だけで、DB に置いた結果は使わない。
+- 実行器は解いた結果を `Solver` で受け渡す（既定の `Solve` はその場で解く。テストは記録・偽の値の差し替えに使う。E26）。段 10 のノードのキャッシュはこの口を使わず、`Engine::render_cached` の中で（入力の指紋, ID, 版, 正規の引数）の鍵（§12.2）で値と同じ表から引き、当たれば解かない（Solver の trait は変えていない。`render_with_solver` はキャッシュを使わない）。正規化の目標だけを変えると、2 回目からは計測を解き直さない（`analyses_are_reused_when_only_params_change`）。操作が使うのはメモリ上で解いた結果だけで、DB に置いた結果は使わない。
 
 ### 11.3 画像の解析（どれも整数だけ。タイルごとに数えて和・和集合でまとめるので、スレッド・タイルの分け方によらない）
 
@@ -651,6 +730,10 @@ impl Engine {
 
 ## 12. 実行・プレビュー・セッション
 
+段 10 で、ノードのキャッシュ・差分の計画・範囲・変わった範囲・プレビューの段・エディタの表示の経路・メモリの予算・予約の部品・セッションを入れた（ADR-154）。詳しい約束は各ソースの冒頭（`crates/kura-engine/src/render/*.rs`・`session/*.rs`・`budget.rs`・`monitor.rs`、`crates/kura-core/src/edit/runtime.rs`）に書き、ここは要点だけ。
+
+### 12.1 口の一覧
+
 ```rust
 impl Engine {   // 段 8 までにあるもの
     pub fn load(&self, raw: &[u8]) -> Result<Graph, EngineError>;               // 読み込みとスキーマの移行
@@ -659,16 +742,244 @@ impl Engine {   // 段 8 までにあるもの
     pub fn render_with_solver(&self, plan: &Plan, inputs: &BTreeMap<InputId, InputValue>, mon: &dyn Monitor, solver: &dyn Solver) -> Result<Rendered, EngineError>;   // 申告した解析を解く口（§11.2）
     pub fn analyze<A: Analysis>(&self, v: &Value, p: &A::Params, mon: &dyn Monitor) -> Result<A::Output, EngineError>;   // §11.1（analyze_dyn・analyze_many も）
 }
-// 書き出しは今は CodecSet::encode_bytes（§9.1。EncodedStamp を返す）。ノードのキャッシュ（NodeCache）を渡す render は段 10 で足す。
+impl Engine {   // 段 10 で足したもの
+    pub fn fingerprints(&self, plan: &Plan, inputs: &BTreeMap<InputId, FingerprintedInput>) -> Result<Fingerprints, EngineError>;   // §12.2
+    pub fn render_cached(&self, plan: &Plan, inputs: &BTreeMap<InputId, FingerprintedInput>, cache: &mut NodeCache, opts: &RenderOptions, mon: &dyn Monitor) -> Result<CachedRender, EngineError>;   // §12.3
+    pub fn compile_snapshot(&self, snap: &Snapshot, input_shapes: &BTreeMap<InputId, Shape>, prev: Option<&Plan>) -> Result<Plan, Issues>;   // §12.4
+    pub fn render_area(&self, plan: &Plan, inputs: &BTreeMap<InputId, FingerprintedInput>, cache: &mut NodeCache, req: &AreaRequest, base: Option<&Base<'_>>, mon: &dyn Monitor) -> Result<AreaRender, EngineError>;   // §12.5
+    pub fn render_view(&self, plan: &Plan, inputs: &BTreeMap<InputId, FingerprintedInput>, cache: &mut NodeCache, req: &ViewRequest, prev: Option<&View>, mon: &dyn Monitor) -> Result<ViewRender, EngineError>;   // §12.8（エディタの表示の経路）
+    pub fn spoit(&self, plan: &Plan, inputs: &BTreeMap<InputId, FingerprintedInput>, cache: &mut NodeCache, at: &SpoitAt, mon: &dyn Monitor) -> Result<Option<Sample>, EngineError>;   // §12.5（E23）
+    pub fn delta(&self, prev: &Plan, prev_inputs: &BTreeMap<InputId, FingerprintedInput>, next: &Plan, next_inputs: &BTreeMap<InputId, FingerprintedInput>) -> Result<Delta, EngineError>;   // §12.6
+    pub fn plan_level(&self, plan: &Plan, level: u8) -> Result<LevelPlan, EngineError>;   // §12.7（choose_level は関数）
+    pub fn estimate(&self, plan: &Plan, spec: &EstimateSpec<'_>, cache: Option<CacheProbe<'_>>) -> Result<MemoryEstimate, EngineError>;   // §12.10
+    pub fn admit(&self, plan: &Plan, spec: &EstimateSpec<'_>, budget: &Arc<MemoryBudget>, class: Class, mon: &dyn Monitor) -> Result<Admission, EngineError>;
+    pub fn admit_cached(&self, plan: &Plan, spec: &EstimateSpec<'_>, inputs: &BTreeMap<InputId, FingerprintedInput>, cache: &mut NodeCache, held: &mut CacheLease) -> Result<MemoryEstimate, EngineError>;
+}
+// CacheLease::open(budget, cache, want)・settle(cache)。書き出しは今は CodecSet::encode_bytes（§9.1。EncodedStamp を返す）。
 ```
 
-- **キャッシュ**：ノードの指紋（`blake3(親の指紋 ‖ 操作 ‖ 版 ‖ 正規化した引数 ‖ 解像度の段)`）で途中の値を覚える。正しさには関わらない。編集中のノードの入力は固定して、引数を動かしても前段を計算し直さない。指紋は版をまたいで保つ必要はない（種は `Node.seed` に別に持つ）。
-- **プレビューの段**：写真は縮小した段で描く（操作が引数を縮める）。ドット絵（`image.pixel_scale` の倍率が 2 以上、M11 の判定、または利用者の指定）は常に等倍で描き、拡大は CSS の `image-rendering: pixelated` に任せる。大きなシートは範囲（ROI）を等倍で描く。
-- **変わった範囲**：推論で変わった範囲を求め、フロントは変わったタイルだけを取り直す。
-- **予約**：最新の要求だけを生かし、古い描画はタイルの合間で中止する。プレビュー用と一括加工用のスレッドプールを分ける。
-- **メモリの予算**：重み付きのセマフォ（バイト）で管理する。既定は物理メモリの 1/4、上限 4GiB。エディタと一括加工で共有し、一括加工はヘッダから見積もった量を描く前に確保する。
-- **セッション**：`EditSession` は純粋な構造で、文書のスナップショットの列を持つ（逆操作は持たない）。スナップショットはノードを共有するので軽い。スライダーの連続した変更は 1 手にまとめ、ドラッグ中の値は履歴に残さない。エディタの中の ⌘Z・⇧⌘Z はこれで実現する（ADR-141）。
-- **配信**（M12）：`kura://localhost/edit/{session}/{rev}/…`（画像のタイル・全体、音声の WAV・PCM・波形）と `/peaks/{hash}`。中身から決まる URL なので変わらない。CORS はアプリの origin だけ、受け付けるのは main の WebView だけにする。
+- `render`・`render_with_solver` は値も型も段 8 のままで、キャッシュなしの正（保存・一括・作り直しの照合）として残す。エディタの道は、表示が `render_view`（§12.8。中で `delta`・`render_area`・`refine` を使う）、等倍の全体の値（照合のダイジェストなど）が `render_cached`、スポイトが `spoit`。どの道も値は `render` と同じ（E1・E4。表示の値は表示する範囲のタイルで）。
+- `render` は使い終えた中間の値を、最後の使い手（出力が使う値は落とさない）のあとで落とす。進捗（`Monitor::progress`）は、始めに (0, 合計) を出し、ノードごとに推論の手間（`Inferred::cost`）の累積を出す。
+- `Plan` は `Clone` で、ノードを `Arc` のまま共有する（版の違う計画・段の計画）。公開の口は `output_shapes`・`node_shape`・`node_needs`・`cost`・`node_key`・`level`・`released_after`・`node_ids`・`shares_node`・`node_inferred`。計画は作ったエンジンに縛られる（§12.3）。
+
+### 12.2 指紋
+
+- 入力の指紋は値のダイジェスト（§8.6）。読むときに必ず取っている `DecodeStamp.value_digest` を使い回す（`FingerprintedInput::decoded`。取り直さない）。テスト・合成の値は `Value::digest`（`FingerprintedInput::new`）。`InputValue` は変えていない。
+- 有効なノードの指紋：blake3("kura-fp-node-v1" ‖ ノードの鍵（`op::node_key`。§7.1）‖ 規則 u32 ‖ 派生した種 u64 ‖ 段 u8 ‖ 入力の数 u32 ‖ 入力の指紋（`PortRef` の順））。派生した種は操作に渡す種（`determinism::seed(ノードの種, 主の入力の元, 操作 ID)`。`render` と同じ式なので元のハッシュも入る）。段はノードの段（§12.7。継ぎ目までのノードは 0）。ノード ID は入れない（レシピの継ぎ足しでずれる）。
+- 外したノードの指紋は、入力 0 の指紋そのまま。
+- 量子化した出力の指紋：blake3("kura-fp-out-v1" ‖ 出力のノードの指紋 ‖ 量子化の版 u32 ‖ ビット u32 ‖ ディザ u8 ‖ 種 u64 ‖ 元のハッシュ)（ディザの乱数が元を直接使うので元を足す）。
+- 申告した解析の鍵：blake3("kura-fp-analysis-v1" ‖ 入力の指紋 ‖ 解析の ID（長さ付き）‖ 版 u32 ‖ 正規の引数（長さ付き））。
+- 派生の指紋：blake3("kura-fp-derived-v1" ‖ 用途（長さ付き）‖ 親の指紋 ‖ 引数（長さ付き））。プレビューの段の継ぎ目の縮小は `derive("level", 継ぎ目の指紋, [段 u8, 規則 u32])`（§12.7）。
+- 指紋はメモリの中だけで使い、保存しない。版をまたいで保つ約束もない（種は `Node.seed` に別に持つ）。`Engine::fingerprints` が、ノードと出力の指紋を描かずに返す。
+- 確かめ（`tests/cache.rs` の `fingerprint_components`）：種・元・入力の値・有効か・引数・実装の版・入力の順・規則・段・鍵のどれでも変わり、ノード ID の付け替え・継ぎ足し・JSON の空白とキーの順では変わらない。セッションの鍵と `compile` の鍵が同じ（`session_keys_equal_compile_keys`）。
+
+### 12.3 ノードのキャッシュ
+
+- `render::cache::NodeCache`（エディタのセッションごとに 1 つ。上限はバイト。0 なら何も覚えない）を `render_cached` に渡す。結果は `CachedRender { outputs（値・指紋・ダイジェスト）, warnings, stats, changed }`。値と警告は `render` と同じ。
+- 覚えるのは、等倍で全体を描いた値（由来 `Origin::Exact`）と、その警告（操作の警告と写しの警告を分けて）だけ。エラー・中止・部分の値は入れない（中止までに描き終えた前段の完全な値は残る）。無効なタイルのある値も入れない。当たり・差分の適用・解析・スポイトに使うのは `Exact` だけで、当たったら警告を同じ順で再生する。
+  - 由来は `Exact`・`Patched`（前の値に変わった範囲だけを描き直して継ぎはぎしたもの）・`Partial`（範囲だけを描いたもの）・`Scaled`（段の計画を範囲で描いたもの）。`Exact` のほかは配信にだけ使い、キャッシュに入れない。
+  - 段の計画のノードの値は、指紋の段で等倍と分かれるので `Exact` として入る（等倍の指紋に当たることはない）。
+- 申告した解析も、同じ表に（入力の指紋, ID, 版, 正規の引数）の鍵で入れ、当たれば解かない（§11.2）。大きさは解析の `estimate().bytes` で数える。量子化した出力も指紋で引く。
+- 出力のダイジェストは `RenderOptions.digests` のときだけ取り、出力の指紋ごとに覚える（出力の項目があるときだけ。入力をそのまま返す出力は毎回取る）。
+- 追い出しは使った順の番号（tick。時刻を使わない）の古い順で、表は `BTreeMap`。共有を除いた大きさが上限を超える値は入れない（`stats.refused`）。入れたものがいちばん新しいので、古い固定していないものから追い出す。
+- 数え方：共有したタイル・チャンネルは、実体の番地（`Arc`。`Value::chunks`）ごとに 1 度だけ数える。番地は、表がその実体を持っている間だけ数え、項目を消すのと同じ手で数を減らす（解放した番地の使い回しで数を誤らない）。同じ値を 100 回入れても 1 つぶん、筆は触れたタイルのぶんだけ増える。入力は自動では数えない：呼び手が `register_external` で数えに入れる（写しを持ち、追い出さない。それと共有する項目は数え直さない）。外すときは、1 つずつなら `unregister_external(&値)`（同じ実体（番地の列）の外の値のうち最後に登録したものを外して写しを手放し、数えなくなったバイト数を返す。ほかの外の値・項目と共有する分は残る。登録していなければ None）、すべてなら `clear_externals`。外した値の写しは手放し、その分は数えない（外した値は項目にならない。ほかの外の値・項目と共有する分は残り、項目の分はほかの項目と同じく追い出せる。追い出しは外の値を見ない）。
+- 固定：描く前は「当たる予定のもの」と focus（`RenderOptions.focus`。編集中のノード）の入力・出力を、描いたあと（エラー・中止のときも）は focus の入力・出力だけを固定する。固定したものは追い出さないので、引数を動かしても前段を描き直さない。
+- エンジンへの縛り：`Engine` ごとに通し番号を払い出し、キャッシュと計画を作ったエンジンに縛る。別のエンジンのキャッシュ・計画は `Internal`（登録表・上限の違う値を混ぜない）。`clear` は縛りも解く。`render` は計画を縛らない。
+- `verify_hits`（テストとファズ）：当たっても描き直してダイジェストと警告を照らし、違えば `Internal`（指紋の抜けを見つける。`verify_hits_detects_a_wrong_entry`）。
+- 前回の出力：ノードごとの前回の描画（`LastRun`：実装・型付きの引数・鍵・入力の指紋・規則・派生した種・段・出力の指紋・警告。差分の適用に使う。`render_cached` と、`render_area` の当たったノード・全体で描いたノードで更新する。範囲だけを描いたノードは更新しない）と、前回の `render_cached` の計画・入力の（指紋, 元）・出力の値（変わった範囲に使う。容量に数えず、上限 0 でも持つ）を持つ。
+- 当たったノードより前にある外れたノードは、値が要らなくても描き直す（警告を再生するため。強い上限で上流が先に追い出されると無駄が出る。改善の余地）。
+- 実測（M4 Max・release。`tests/cache.rs` の `bench_cache`。4096² の RGBA8 に反転 20 個の鎖）：キャッシュなし（ダイジェスト込み）65〜70 ms、冷えたキャッシュ 35〜41 ms（ダイジェストあり 67〜69 ms）、温まったキャッシュ 0.009 ms、10 番目を変えて 11 個を描き直す 24.8 ms、指紋だけ 0.004 ms。
+
+### 12.4 差分の計画と差分の適用
+
+- `Engine::compile_snapshot(snap, input_shapes, prev)`：セッションのスナップショット（§12.12）から計画を作る（描かない）。`prev` は前に作った計画で、同じエンジンの段 0 のものだけを使う。ノードごとに次の順で試す。
+  1. 鍵・入力・入力の形が前と同じ：前の計画のノードを `Arc` のまま共有する（形が前と同じになったところで、後ろの推論は打ち切られる）。
+  2. 鍵が同じで入力の形だけが違う：読んだ引数を使い回し、推論だけし直す。
+  3. 追記（前の計画の元のスナップショットとの違いが `NodeChange::Appended`）：足した要素だけを `Op::parse_appended` で読む。外していない・持ち上げていない・入力の形が前と同じなら、推論も `Op::infer_appended` で足した分だけ（使えなければ全体で推論する）。
+  4. ほか：`compile` と同じ道（resolve・parse・infer）。
+- どの道でも、計画（各ノードの形・写し方・手間・申告・鍵、出力の形、最後の使い手、指摘）は `compile(&snap.to_graph(), …)` と同じ（`compile_snapshot_equals_compile`）。
+- 追記の見分けは、前の計画が持つ元のスナップショット（`compile_snapshot` で作った計画だけが持つ）との `Snapshot::diff`（`Arc` の同一性）で行う。`compile` で作った計画を渡すと、共有と推論のやり直しは効くが、追記の速い道は効かない。移行したノード（実装の版が文書の版と違う）は全体で読む。セッションの鍵は、この登録表の `append_field` と食い違わないときだけ使い、食い違えば求め直す。
+- 差分の適用（`render_cached` の外れの道。`render_area`・`render_view` の全体で描くノードも同じ道。§12.5）：次のすべてが成り立つとき、前回の出力に `Op::apply_appended` を当て、`Exact` としてキャッシュに入れる（E21 で、全体を当て直したものとビット単位で同じ）。
+  - 持ち上げない・先に解く解析がない・メタデータの写しが恒等（`MetaAccess::Map` で `space`・`time` が `Identity`）。
+  - 前回の描画（`LastRun`）と、実装（ID・版）・規則・派生した種・段・入力の指紋が同じで、鍵が違う。
+  - 前回の出力（`Exact`）がキャッシュにある（引いても使った順は変えない。使えなかったときに追い出しの順を変えないため）。
+- 警告は [前回の操作の警告 ＋ 足した分の操作の警告 ＋ 写しの警告] で組み直す（全体を当て直したときの順と同じ。`appended_warnings_follow_the_full_order`）。`verify_hits` なら全体で描き直して照らす。描いた数は `CacheStats::appended`。
+- 描画のノードの引数を変える手・置き換えでは、引数を全体で読み直す（`compile` と同じ時間）。
+- 呼び手（M12）は、版ごとに計画を残すのがよい：5 万本の筆の文書の取り消しで、最新の計画だけを渡すと描画のノードを全体で読み直して 235／258 ms（p50／p95）、取り消した先の版の計画を渡すと 0.07／0.13 ms（`tests/bench_append.rs`）。
+- 実測（M4 Max・release・3 スレッド。`tests/bench_append.rs`）：4096² に筆 1 本（500 点）を足す差分の計画は 0.02〜0.04 ms、セッションの手は 0.01〜0.03 ms で、前の筆の本数（0・999・5 万本）によらない。5 万本の文書を最初に開いたときは、計画 255〜270 ms・描画 980 ms。
+
+### 12.5 範囲と範囲の描画
+
+- 範囲の型（`render::region`）：`Area`（`Empty`・`All`・`Pixels`（フレームの番号ごとの矩形の集合 `Rects`。64 個を超えたら外接矩形に畳む。外接矩形の幅・高さは u32 で頭打ちになるので、畳んだ矩形が元の矩形をすべて覆わなければ（遠く離れた矩形の並び）フレーム全体にする）・`Samples`（音声のフレームの区間 `Spans`。64 個を超えたら 1 つに畳む））。どれも保守的（大きめでよく、小さすぎてはいけない）。座標系は §5.2。タイルの集合は `Tiles`（1 辺を持つ格子）と、フレームごとの `FrameTiles`。トリムしたフレームの列はフレーム単位の全体で扱う（段 10）。
+- `Reach`（`Op::reach` の申告。出力が入力 0 のどこに依るか）：`Global`（既定）・`Same`（同じ位置の画素）・`Affine`（平行移動・反転・90° の回転。逆写しは m⁻¹。入力の外に写る出力の画素はどこにも依らない）・`Resample`（最近傍の番号、平滑な重みの範囲）・`SameTime`・`Segments`（トリムの区間のずらし）・`Rate`（多相 FIR の窓）。`backward`（出力の範囲 → 描くのに要る入力 0 の範囲）と `forward`（入力 0 の変わった範囲 → 出力の変わりうる範囲）を持つ。2 つ目からの入力には、いつも全体で依る。
+- `Engine::render_area(plan, inputs, cache, &AreaRequest { output, area }, base, mon) -> AreaRender { output, value: PartialValue, warnings, stats }`（エディタの表示の部品。表示の経路 §12.8 とスポイトが使う）：
+  1. 呼び手の範囲を、出力のキャンバス（画像・フレームの列は [0, 幅) × [0, 高さ) とフレームの数。大きさの決まっていない軸は上限で切る。音声は長さ。フレーム全体と `All` はそのまま）に切ってから使う（遠い座標の足し算があふれず、畳みで覆いが欠けない。`render_view` の表示する範囲・スポイトの位置も同じ道を通る）。後ろから、各ノードの要る範囲を集める。範囲の描画を持つノード（有効で、`REGION` が真、`reach` が `Global` でなく、申告した解析がない）は、要る範囲を値のタイルに広げて `Reach::backward` で入力 0 へ写す。持たないノードは入力を全体で要る。外したノードは入力 0 へそのまま渡す。キャッシュに `Exact` の値があるノードで止める。
+  2. 前から描く。当たりは値と警告を再生する。範囲を持つノードは、要るタイルだけを `apply_region` で描く（ほかは無効なタイル）。持たないノード（と、継ぎはぎをせず、すべてのタイルが要り、入力がどれも全体の値の範囲を持つノード）は全体を描く：入力がどれも等倍で全体を描いた値なら、`render_cached` の外れの道と同じ（継ぎ目の縮小の差分（§12.7）・差分の適用（§12.4）・申告した解析のキャッシュ・由来 `Exact` でキャッシュに入れる。cache.rs の `draw_miss`）で描き、当たったノードと合わせて描画を前回（`LastRun`）として覚える（次の差分の適用の前の出力になる）。そうでなければ（入力が範囲の描画で作った値）`apply` で素で描き、入れない。
+  3. 継ぎはぎ：`Base { value: 前の版の出力, changed: 変わりうる範囲（§12.6） }` を渡すと、出力のノードは「変わりうる範囲」と「前の値の無効なタイル」だけを描き、ほかは前の値のタイルを共有する（由来 `Patched`）。外したノードを通り抜けた先の、範囲を持つノードにだけ当てる。前の値の形が違うときと、共有できるタイルが 0 のとき（形式・パレットが違いうる）は使わない。それでも継ぎはぎの描画が、前の値の大きさ・形式・パレットが今と違うことで断ったら（範囲の描画の部品の内部の誤り。変わりうる範囲が小さすぎた印）、前の値なしで 1 回描き直す（遅いだけで正しい。数は `AreaStats::rebased`。前の値なしでも同じ誤りなら、そのとき返す）。
+- 範囲の描画が無効なタイル（申告した依存の外）を読んだら、その描画を捨てて、全体で描き直す（遅いだけで正しい。数は `AreaStats::fallbacks`）。テストは `fallbacks` と `rebased` が 0 であることを、ファズは `fallbacks` が 0 であることを確かめる。
+- 量子化した出力（音声）は、`render`・`render_cached` と同じく量子化を当てる：出力のノードを等倍で全体を描けた（由来 `Exact`）ときは量子化の指紋（§12.2）でキャッシュを引き、なければ量子化して `Exact` で入れる（`render_cached` と同じ部品 `quantized_output`）。そうでなければ量子化だけを当てる。入力をそのまま出す出力も同じ。`exact()` で取り出す値は `render` の出力と同じ（`tests/region.rs` の `quantized_outputs_match_render`）。
+- 範囲の値（`PartialValue`）はダイジェストを取れず、キャッシュに入らず、保存・一括・解析・スポイトに使わない（全体の値が要るときは `exact()` で、由来が `Exact` のものだけを取り出す）。範囲の描画は、全体の描画が失敗する入力でも通ることがある（範囲の外の中身で決まる誤り）ので、表示にだけ使う。警告は描いたノードと当たったノードの分だけ（`render` の警告の部分列で、順も同じ）。全体の警告は `render`・`render_cached` が正。
+- スポイト（`Engine::spoit`。E23）：等倍の計画の出力の 1 画素を、1×1 の範囲を描いて拾う（前の値は使わない）。画像の外・音声は None。段の計画からは拾わない（`Unsupported`）。
+- 範囲が効かない鎖：範囲は、範囲の描画を持つ局所の操作だけの鎖で効く（大きなシートの一部を等倍で描く、など）。範囲の描画を持たない操作は出力を全体で描き、入力も全体で要るので、それより前のノードも全体を描く。
+  - 全体に依る操作（`reach` が `Global`。範囲の描画でも、変わった範囲の推論でも全体）：`image.trim_alpha`（出力の大きさが中身で決まる。後ろからの絞り込みもしない）・`sprite.split_grid`・`sprite.pack_grid`（範囲は後の段）・Indexed8 への `image.convert`（全フレームの色の表に依る）・塗りつぶしを含む `paint.actions`・`audio.normalize`（全体の計測に依る）。
+  - `paint.actions` は、塗りつぶしがなくても範囲の描画を持たない（変わった範囲は筆の区切りの外接矩形の和で絞れるが（§7.1）、描くのは全体。追記は差分の適用が速い道で、`render_area`・`render_view` でも効く）。後ろに範囲を持つノードが続けば、それは変わったタイルだけを描く（§12.8）。
+  - 音声の区間の継ぎはぎは作らない（平面を写す手間が残るため）。音声は変わった区間の推論だけ。
+- 要る範囲をノードごとに値のタイルの格子へ広げるので、鎖が長いと描くタイルが増える（24MP の局所の鎖で 1 タイルを頼んで、全ノードで 47 枚）。内部のノードの前の版の部分の値（`Partial`）は使い回さず、キャッシュの `Exact` から描き直す（出力のタイルは、表示の経路（§12.8）が前回の表示から共有する）。
+- 実測（M4 Max・release。`tests/bench_region.rs`。キャッシュは空）：24MP の局所の鎖（crop → flip → rotate90 → bilinear 3/4 → convert。出力 4425×2925）で、1 タイル 4.3 ms・1920×1080 の範囲 54.8 ms・全体（ダイジェスト込み）240 ms（3 スレッド。16 スレッドで 3.9・15.0・77 ms）。
+
+### 12.6 変わった範囲
+
+- 2 段で求める（E31）。
+  1. 描く前の推論（`Engine::delta(前の計画, 前の入力, 今の計画, 今の入力) -> Delta { nodes, outputs }`）：前後の計画を NodeId で対応させ、ノードごとに変わりうる範囲を保守的に求める（前後を全体で描いた差は、必ずこの範囲に入る）。新しいノード、操作の ID・版、入力のつなぎ、種、持ち上げ、推論した形・入力の形が違えば全体。規則・段・エンジン・元（主の入力のハッシュ。すべての種に入る）が違えば全体。入力の値は指紋で比べる。外す・入れるは `effect` と入力 0 の差の和、引数の違いは `param_change`、上流の違いは `Reach::forward` で写す（引数と上流の両方が変われば和）。持ち上げる操作の範囲は全フレームに広げる。
+     - 上流の全体（`All`）を入力の矩形に開いてから写す（位置を写す申告で、広げたキャンバスの縁などを外す）のは、入力 0 が Indexed8 以外の形のときだけ。前後で形が同じ（`node_delta` が確かめる）Indexed8 以外の値は画素（標本）とメタデータでしか違えないが、Indexed8 はパレットだけが違いうる（パレットは形に現れない）ので、上流の全体を全体のまま運ぶ（上流でパレットだけが変わると、canvas の縁の番号・出力のパレットも変わる）。メタデータの違いは画素の範囲に入れない（`meta_changed` で別に報告する）。
+  2. 描いたあとの絞り込み（`delta::refine`）：手元に持っている前の出力の値と今の値のタイルを `Arc::ptr_eq` で比べ、共有したままのタイル（前の値で有効で、同じ実体）を外す（番地を覚えて比べない。前の値がなければ推論のまま）。無効にしたタイルも実体を残す（`Raster::invalidate`）ので、前の値で無効だったタイルは、同じ実体でも共有とみなさない（前回は配信していない）。形・形式・パレット・フレームの位置が違えば全体。
+- `render_cached` は前回の計画・入力の指紋・出力の値をキャッシュに持ち、結果に `Changed { level, per_output, meta_changed }` を付ける。`OutputChange` は `All`・`Tiles`（フレームごとの変わったタイル。1 辺 `VIEW_TILE`、フレームの画像の座標）・`Samples`（音声の区間）。`meta_changed` は、メタデータ（格子・ピボット・スライス・ループ点など）か、フレームの表示時間・繰り返しが変わったら真。前回がなければ全体。
+- 表示の経路（`render_view`。§12.8）は、前回の表示（`View`）を呼び手が持ち、同じ推論と絞り込みで変わったタイルを返す。
+- フロントは、変わったタイルだけを `kura://` で取り直す（§12.13）。
+- 実測（M4 Max・release。`tests/bench_region.rs`）：4096² の描画（筆 20 本）に筆 1 本を足すと、変わったタイルは 256 のうち 1〜4。推論と絞り込みは p95 0.013 ms。
+
+### 12.7 プレビューの段
+
+- 段 k（0〜3。`MAX_LEVEL`）の値は、等倍の大きさを各軸 ⌈n/2^k⌉ にした近似（24MP の段 2 は 1500×1000、段 3 は 750×500）。縮め方は `resize_smooth` の box（線形光・乗算済み）で、等倍から段ごとに直接作る（`downscale`）。
+- ドット絵は常に等倍で描き、拡大は CSS の `image-rendering: pixelated` に任せる。
+- 段の選び方（`choose_level(等倍の出力の形, 要る装置の画素, LevelHint)`。純粋な関数）：ドット絵の指定（`LevelHint.pixel_art`。M11 の判定か利用者の指定を呼び手が渡す。エンジンは中身を見て判定しない）・Indexed8・フレームの列・音声・大きさの決まっていない形は 0。ほかは、各軸が要る画素（CSS px × DPR × 拡大率）を下回らない最も粗い段。ドラッグ中は粗い段、止まったら細かい段か段 0 の範囲、といった方針は呼び手（M12）が持つ。
+- 段の計画（`Engine::plan_level(等倍の計画, k) -> LevelPlan { plan, seam, fallback }`）：線形の鎖で、最後の有効な `FullOnly` のノード（継ぎ目。なければ入力）までを等倍のまま共有する（キャッシュの指紋も値も等倍の計画と同じ）。その出力を縮めるノード（`kura.preview.downscale`。登録表に入れず、ID は `SEAM_NODE` = u32::MAX）を挟み、後ろを、引数を段に縮めて（`Op::preview_params`）段の形で推論し直したノードで描く。種は元の source のまま。大きさが中身で決まる継ぎ目（trim の出力）も、上限の大きさで推論して段にする（縮めた矩形は ⌈n/2^k⌉ に収まる）。Skip の操作の推論が段で通らなければ、そのノードを外す。段 0 を頼んだら等倍の計画の写しを返す。段の計画からは作らない（`Unsupported`）。
+- 操作ごとの扱い（`Op::preview`。ほかは既定の `FullOnly`）：
+
+| 操作 | 扱い | 段の引数 |
+|---|---|---|
+| `image.crop` | Scaled | 始まりは床・終わりは天井で縮め、段の入力に収める |
+| `image.flip`・`image.rotate90`・`palette.replace` | Scaled | そのまま |
+| `image.canvas` | Scaled | 床・天井で縮める（入力の外に出てよいので収めない） |
+| `image.resize` | Scaled | 等倍の出力の ⌈n/2^k⌉ を画素で指す |
+| `image.convert` | Indexed8 へは FullOnly、ほかは Scaled | そのまま |
+| `meta.set_grid` | Skip | 2^k で割り切れて段の入力に収まれば縮め、そうでなければ消す |
+| `meta.set_pivot` | Skip | 偶数への丸めで縮め、段の入力に収める |
+
+- 段 0 に落ちる 5 つの理由（`LevelFallback`。落ちたら等倍の計画の写しと理由を返す）：`NotLinear`（主の入力 1 つ・量子化しない出力 1 つ・各ノードの入力が直前の 1 つ、でない）・`NotImage`（継ぎ目か後ろの値が 1 枚の画像でない。フレームの列・音声）・`Indexed`（継ぎ目か後ろの値が Indexed8。パレットの番号の意味を等倍と同じに保つ）・`Analysis`（後ろのノードが解析を申告した）・`Infer`（段の形で推論が通らない Scaled の操作）。今の登録表の操作では、`Analysis`・`Infer` と「Skip の推論が通らなければ外す」道には届かない（crop・canvas・resize は引数を段の入力に収めて縮めるので推論が通り、`palette.replace` は Indexed8 を入力に取るので先に `Indexed` で落ち、解析を申告する Scaled の操作はなく、set_grid・set_pivot の段の引数はいつも推論を通る）。M11 で操作を足したときのために、試験用の操作で確かめる（`tests/preview.rs` の `fallback_reasons_of_level_nodes`）。
+- 指紋：ノードの指紋の段は、そのノードの段（継ぎ目までは 0）。継ぎ目の縮小の値は派生の指紋（§12.2）で、ほかの項目と同じくキャッシュに入る（数え、使った順で追い出す。`register_external` は使わない：外の値にすると、継ぎ目が変わるたびに呼び手が古い縮小を外す（`unregister_external`）手間が要り、外し忘れると数えたまま残る。計画の中のノードなら、`render_cached`・`render_area`・`estimate`・`admit_cached`・`delta` をそのまま使える）。後ろのノードの鍵は等倍の文書の鍵のまま（段の引数は、鍵・段・入力の指紋から決まる）。
+- 継ぎ目の縮小が外れたときは、等倍の値の変わったタイル（実体の同一性）から縮め直す段のタイルを `Reach::Resample` で求め、そのタイルだけを縮め直す（全体を縮め直したものとビット単位で同じ。数は `CacheStats::rescaled`）。後ろの引数だけを変えたときは縮め直さない。
+- メタデータ：継ぎ目の縮小は格子・ピボット・スライスを倍率で段の座標に写す（割り切れない格子は消す）。Skip の操作（`meta.*`）は画素を描かずに、メタデータを段の座標で書く。段の警告は約束しない（等倍の計画・描画の警告が正。継ぎ目の縮小は警告を出さない）。
+- 近似の約束：段の値は、保存・一括・スポイト・解析・ダイジェストに使わない。同じ文書・入力・段なら、スレッドの数によらず同じ値。版をまたいで保つ約束はしない（ゴールデンに入れず、縮め方を変えても操作の版は上げない）。
+- 段の値を断る場所：`render`・`render_with_solver`（段の計画は `Unsupported`）、ダイジェストを頼む `render_cached`（`Unsupported`）、`spoit`（`Unsupported`）、段 1 からのノードが解析を申告していれば `Internal`（計画の段階で `Analysis` に落ちるので、ふつうは来ない）。`render_area` で描いた段の値は由来 `Scaled`。`render_cached` の段の出力は `Value` のまま返るので、保存の道に渡さないのは呼び手の約束（保存・一括は `render` を通す）。
+- 近似の程度（`testgen` の Photo 640×424、段 1・2。等倍で描いて縮めたものとの差。設計の「最大の差 2」は、色を混ぜない操作でしか成り立たなかった）：
+
+| 操作 | 最大の差 | PSNR |
+|---|---|---|
+| flip・rotate90・揃えた crop と canvas・Rgba8 と Rgb8 への変換・box | 0〜1 | — |
+| Gray8 への変換 | 5〜6（輝度を符号化された値のまま取るため） | 54 dB |
+| bilinear・Lanczos | 11〜19（重みが広く、縮める順で鋭い境の値が変わるため） | 42.5〜48.7 dB |
+
+  E32 のテスト（`preview_approximates`）の上限は、最大の差 2・8・32 と PSNR 40 dB 以上。
+- 実測（M4 Max・release。`tests/bench_preview.rs`。3／4／16 スレッドの p50）：24MP を段 2 に縮める継ぎ目は 62.0／47.0／16.7 ms（段 1 は 93.4／70.6／22.9、段 3 は 56.0／54.5／29.5 ms）で、継ぎ目が変わったときだけかかる。24MP に描いてから段 2 で描く鎖に筆 1 本（500 点・8px）を足すと、9.6／9.5／9.3 ms（compile 込み。毎回、変わったタイルだけを縮め直した）。
+
+### 12.8 エディタの表示の経路
+
+- `Engine::render_view(plan, inputs, cache, &ViewRequest { output, area, focus }, prev: Option<&View>, mon) -> ViewRender { view, changed, meta_changed, inferred, warnings, stats, area }`（`render/view.rs`）：エディタが 1 手ごとに呼ぶ表示の道。
+  - `area` は表示する範囲（キャンバスの座標。全体は `Area::All`。`ViewRequest::whole`）、`focus` は編集中のノード（その入力と出力を固定する。`RenderOptions.focus` と同じ）。
+  - `View` は今回の表示（出力・計画・入力の（指紋, 元）・表示の値。`Plan` とタイルの `Arc` を共有して持つ）で、次の `render_view` の `prev` に渡す。入力の値は持たない（推論は入力を指紋と元で比べるので、`render_cached` の前回と同じく（指紋, 元）だけを持つ。入力を差し替えて手放せば、古い値は前回の表示に残らない。`tests/view.rs` の `view_keeps_only_the_input_stamps`）。キャッシュの外で持ち、容量に数えない（`render_cached` の前回の出力と同じ扱い。タイルの多くはキャッシュの項目と実体を共有する）。表示の値から `&Value` は取れない（保存の道に渡さないため。由来 `Exact` のときだけ `exact()` で取れる）ので、ふつうの 1 手の表示（由来 `Patched`・`Partial`・`Scaled`）は `register_external` で数えることもできない（§12.10 の数えないもの）。`ViewRender` は、`changed`（`OutputChange`。前回がなければ `All`）・`meta_changed`（前回がなければ真）・`inferred`（推論した変わりうる範囲）・警告・`stats`（この描画の `CacheStats`）・`area`（`AreaStats`）を返す。
+  - 描けなければ（誤り・中止）前回の表示はそのまま使える（キャッシュには描き終えたノードの値が残る）。別のエンジンの計画・キャッシュは `Internal`。
+- 流れ：
+  1. 推論：前回の表示の計画・入力から今の計画・入力への `Engine::delta`（§12.6）の、表示する出力の範囲。
+  2. 描画：`render_area`（§12.5）を、範囲 = 表示する範囲、`Base { value: 前回の表示の値, changed: 推論 }` で呼ぶ。出力のノードは、表示する範囲のタイルのうち推論に掛かるものと前回の値で無効なものだけを描き、ほかは前回の値のタイルを共有する（継ぎはぎ。由来 `Patched`）。前回の値で有効なタイルのうち推論に掛からないものは、表示する範囲の外でも持ち越し、推論に掛かるものは無効にする。
+     - 範囲を「変わった範囲」にしないのは、継ぎはぎが「要る範囲のうち、前の値で有効かつ推論の外のタイル」を共有する作りで、要る範囲を変わった範囲にすると共有するタイルが 0 になり、継ぎはぎされないため（`tests/delta.rs` と同じ使い方）。
+  3. 報告：`refine(前回の表示の値, 今回の値, 推論 ∪ 前回は無効で今回は有効なタイル)`（§12.6）で、変わったタイル（`VIEW_TILE`）の一覧を作る。`meta_changed` はメタデータ・フレームの表示時間・繰り返しを比べる。
+- 値の約束：表示する範囲のタイルは、`render` の同じタイルとビット単位で同じ（範囲の描画と継ぎはぎの約束。推論は保守的）。表示の値の由来は `Patched`・`Partial`・`Scaled`（段の計画）で、配信にだけ使う（継ぎはぎをせずに全体を描いたときだけ `Exact`）。保存・一括・解析・スポイト・ダイジェストは `render`・`render_cached`・`spoit` で。警告は `render_area` と同じ（描いたノードと当たったノードの分。全体の警告は `render_cached` が正）。
+- 変わったタイルの一覧：表示する範囲の中で中身の変わったタイルを必ず含み、推論の範囲と「前回は無効で今回描いたタイル」（表示する範囲を広げた・動かした分）の中にある。描き直したタイルは新しい実体なので、中身が同じでも報告する（多めに出ることがある。中身で比べ直すことはしない）。前回の表示の値で無効だったタイルは、今回同じ実体（入力のタイルの通り抜け・キャッシュの当たり）で有効になっても報告する（無効にしたタイルも実体を残すので、実体だけでは共有とみなせない。§12.6 の絞り込み）。推論に掛かって無効にした、表示する範囲の外のタイルも報告に入る。形・形式・パレット・フレームの位置が違えば `All`。
+- 配信の口（M12 が kura:// でタイル・メタデータを出すのに使う）：`View::value()` の `PartialValue` から、読むだけの口で取る。`format`（画素の形式）・`palette`（Indexed8 のパレット。`tile`・`read_rect` が返すパレットの番号を色にする）・`image_meta`（格子・ピボット・スライス・タグなど。キャンバスの座標）・`audio_meta`（ループ点・マーカーなど）・`frame_duration_ms(frame)`・`loop_count`、画素は `tile`・`read_rect`、有効なタイルは `valid`・`covers`。どれも保存の道に渡せる `&Value` は返さない。音声の平面は `exact()` で取る（音声は範囲の描画を持つ操作がなく、いつも等倍で全体を描くので由来 `Exact`）。確かめ：`tests/view.rs` の `view_values_expose_what_delivery_needs`（継ぎはぎ・範囲だけの表示でも `render` の値と同じものが取れる）。
+- 前回の表示を使わない場合：前回が別の出力なら使わない（前回がないのと同じ。`changed` は `All`）。推論が誤りになる計画（申告が引数を読めないなど）は、推論を `All` にする。段・エンジン・元が前回と違えば、`delta` が `All` を返して共有するタイルがなくなり、表示する範囲を描き直す（形が違えば報告も `All`）。
+- 範囲の描画を持たないノード（描画・塗りつぶし・`trim_alpha`・Indexed8 への `convert` など）は、`render_cached` の外れの道と同じに描く（キャッシュの当たり・差分の適用・申告した解析のキャッシュ・由来 `Exact` で入れる。§12.5）。筆を足すと、描画のノードは前の出力に足した分だけを描き（差分の適用）、後ろの範囲を持つノード（最近傍・canvas・convert など）は変わったタイルだけを描く。等倍の全体の値は作らない。
+- 段の計画：計画は等倍のほか、プレビューの段の計画（`plan_level`。§12.7）でもよい。継ぎ目の縮小は範囲の描画を持つ（`Reach::Resample`）ので、局所の変更では要るタイルだけを縮める（その値はキャッシュに入れず、`CacheStats::rescaled` も増えない）。全体が要るときは、`render_cached` と同じ外れの道（等倍の値の変わったタイルだけを縮め直す。§12.7）を通る。段を替えると全体を描き、報告は `All`。
+- 1 手の流れ（「エンジンの中」。§16）：
+  1. 手を当てる（`EditSession::preview`・`commit`。§12.12）→ 前の計画を渡して `compile_snapshot`（§12.4）→ 写真は `choose_level` と `plan_level`（§12.7）。
+  2. 確保（`admit_cached`。表示する計画（段の計画）で。待たない。§12.10）。確保だけはプールの外（プレビューの輪のスレッド）で行い、1 と 3 はプレビューのプールの中で行う（§12.11）。
+  3. `render_view`。
+  4. `settle` で確保を戻す。
+- フロント（M12）は、表示する範囲（ビューポート。キャンバスの座標）を `ViewRequest.area` で渡し、`changed` のタイルだけを `kura://` で取り直す（§12.13）。前回の表示（`View`）は Rust の側で持つ（値を IPC で送らない）。
+- `render_cached`（等倍の全体）は、照合のダイジェスト（NFR-16）の道として残る。ベンチ（`testing::bench::path::EditorPath`）は、NFR-11・12 を表示の経路（`show`・`render_preview`。表示する範囲は出力の全体）で測り、NFR-16 は同じエディタの経路で等倍の全体を描いたダイジェスト（`digests`）で照らす（§16.1）。
+- テスト（`tests/view.rs`。E21・E31）：ランダムな文書・手の列（1 手、構造の手、2〜3 手をまとめたもの、入力の値だけの変更。§17 の E31）で表示する範囲もときどき動かし、キャッシュの上限 0・1 MiB・1 GiB で、有効なタイルが `render` と同じ・報告が前後の差を含む・全体での描き直しと前の値なしの描き直しが 0 回・警告が全体の描画の部分列（`view_equals_render_on_random_edit_sequences`。段 10 の検証で報告の抜けを見つけた種でも回す：`view_equals_render_on_found_seeds`）。Indexed8 の上流でパレットだけが変わり、後ろに canvas（広げる）・反転・最近傍が続いても、描けて値が `render` と同じで報告が全体（`view_handles_palette_changes_upstream`）。筆のあとに最近傍・canvas・convert が続く鎖と上流に塗りつぶしのある鎖で、筆は差分の適用で描かれ、後ろの範囲を持つノードは継ぎはぎになり、1・3・16 スレッドで報告も同じ。手を 2 つ当ててから描く（間の表示を飛ばす）手順も照らす（`view_redraws_only_changed_tiles_after_strokes`）。段 1・2 の計画で値が段の計画の全体の描画と同じで、段を替えると `All`（`view_at_levels_equals_the_level_render`）。表示する範囲を動かすと、新しく見えたタイルだけを描いて報告する（`view_follows_a_moving_viewport`）。
+- 実測（§16.2）：筆のあとに最近傍 ×4 が続く文書（1024² → 4096²）の 8px の筆 1 本は、`render_cached` で等倍の全体を描くと p95 18〜19 ms、表示の経路で 1.9〜2.2 ms。描く最近傍のタイルは筆 1 本あたり平均 19 枚・最大 35 枚（paint の変わる範囲を 1 つの外接矩形にしていたときは 25・60 枚。§7.1）。
+- 残したこと：報告するタイルは、描き直したタイルを中身によらず数えるので多め。`render_area` は内部のノードの `Partial` の値を使い回さない（§12.5）。
+
+### 12.9 予約
+
+- `monitor::Latest`：要求ごとに世代の番号（1 から増える）を払い出し（`issue(親)` → `Ticket`）、`supersede(g)` で g より古い世代の描画を止める（床。下がらない）。`Ticket` は `Monitor` で、世代が床より古くなるか、親（ジョブ・エディタを閉じるときの中止）が中止を頼めば止まり、進捗は親へ流す。時刻を使わない。
+- 止められた描画は `Canceled` になり、キャッシュは汚れない（E24）。古い描画を止めるか、描き終えるのを待って最新を描くか（合流）の方針は、呼び手（M12 のエディタ）が持つ。
+
+### 12.10 メモリの予算
+
+- 1 つの予算（`budget::MemoryBudget`。バイトの重みのセマフォ）を、エディタ（対話。`Class::Interactive`）と一括（保存・一括加工のジョブ。`Class::Bulk`）で分け合う。macOS では大きな確保も失敗しない（1000 GiB の `try_reserve` が通る）ので、確保の失敗では予算を守れない。描く前の見積もりで確保し、確保した分（`Lease`）は落とすと返す（鍵が毒されていても返す）。
+- 予算の既定は min(物理メモリ/4, 4 GiB)（`default_total`）。物理メモリは呼び手（kura-mac の `physical_memory`）が渡し、分からなければ 2 GiB。
+- 振る舞い（ユーザーの決定：取り置き＋一括だけ待つ）：
+  - 予算の全体を超える要求は、計画の段階（見積もり）で `Limit`。操作は 1 つも動かない（E25）。
+  - 収まる要求なら、一括は描く前に確保を待つ（中止できる）。待つ順は来た順で、先に待っている一括（下の駐車したものを除く）を追い越さない（来た順と駐車は段 10 で決めた細部）。
+  - エディタは待たない：今すぐ確保できなければ、キャッシュの固定していないものを古い順に追い出してもう一度、それでも足りなければ `Limit`。待っている一括を追い越してよい。
+  - エディタを開いている間は min(1 GiB, 予算/2)（`default_reserved`）を取り置き（`set_reserved`）、一括は「予算 − max(取り置き, 対話の使用量)」までを使う。それを超える一括の要求は `Limit` にせず、収まるまで待つ（取り置きかエディタのキャッシュの確保のほうで超えるなら、エディタを閉じるまで）。取り置きは呼び手が決める。
+  - 駐車：「予算 − max(取り置き, 持ち続ける対話)」を超える一括の要求（今の取り置きとエディタのキャッシュの確保のもとでは通りえないもの）は、待ちの列に残したまま先頭の判定から外し、後ろの収まる一括（エディタを開いたままの保存など）を塞がない（待つ確保 `acquire` も、待たない `try_acquire`・`try_grow_to` の「追い越さない」の判定も、駐車していない待ちだけを見る）。持ち続ける対話は手の合間も持つ対話の確保で、`CacheLease` が `settle`（開くときも）のたびに確保の全体を `Lease::set_standing` で申告する（入力と固定した値でキャッシュの上限を超えると、取り置きを超えうる）。描く間だけ伸ばす分（`admit_cached` のピーク）とプレビューの確保は入れない（すぐ返るので、それで駐車させると大きな一括が追い越され続ける。描く間に来た「予算 − 対話の使用量」を超える一括は、駐車せずに来た順で待ち、`settle` のあとに判定し直す）。取り置きか持ち続ける対話が下がる（エディタを閉じる）と駐車でなくなり、来た順の位置のまま先頭の判定に戻る（後から来た一括は、今すぐ収まってもそれを追い越さない）。駐車している間も中止できる。
+  - `Usage`（全体・対話・一括・取り置き・持ち続ける対話 `standing`・待っている数（駐車したものを含む）・駐車している数 `parked`）は、ジョブの表示（予算を待っている理由。駐車はエディタを閉じるまで通らない）に使う。
+- 数えるもの：デコードした元の値（一括は見積もりに入れ、エディタは `NodeCache::register_external` で数えて `CacheLease` が覆う）、キャッシュ（`CacheLease` が上限と今の大きさの大きいほうを覆う）、描く間の値と作業領域、書き出しの作業領域と書いたバイト列。
+- 数えないもの：タイル・ブロック 1 つぶんの一時の領域、スレッドのスタック、計画・文書・セッションの履歴（履歴は `HistoryLimits` で別に抑える。予算には数えないが、NFR-17 の判定の実測には文書・履歴も入る：基準は実行の場を作るだけの子で、文書を開いたエディタの子との差を測る）。前回の表示（`View`。§12.8）と `render_cached` の前回の出力は、キャッシュの外で持ち、数えない（どちらも入力は（指紋, 元）だけで、入力の値は保たない。出力・表示の値のタイルの多くはキャッシュの項目と実体を共有する。表示の値からは由来 `Exact` のときのほか `&Value` を取れないので、`register_external` にも渡せない）。配信のために全体の値（`render_cached` の出力・`exact()` で取り出せる値）をキャッシュから追い出したあとも持つなら、M12 が `register_external` で数え、入れ替えるときに `unregister_external` で外す。
+- NFR-07 とは別に数える（ユーザーの決定）：NFR-07 はライブラリの表示の分。編集の値とキャッシュは NFR-17 の予算で数え、エディタを閉じたら捨てる。
+- 見積もり（`Engine::estimate`）：描かない純粋な関数。ヘッダから読んだ形で compile した計画で、読む前に呼べる。条件（`EstimateSpec`）は、入力の来し方（`Source::Held`（予算の外で数えている値。エディタの入力）・`Memory`・`Decode { codecs, format }`・`Decoder { decoder, format }`）、読む入力のファイルの長さ（`lens`。`EstimateSpec::input_len`。分かるものだけ）、書き出し（`Sink::Encode`・`Encoder`）、並列の数（`Work::total` に渡す）、ダイジェストを取るか。段ごとの量は、その段で生きている値と作業領域の最大。
+  - 読む：読み終えた入力 ＋ 読んでいる入力の値 ＋ max(デコーダの作業領域（§9.9。ファイルの長さがあれば `Decoder::file_work_bytes`：ファイル全体を読んで持つ aseprite は長さを足す。なければ `Decoder::work_bytes`）, 読み取りの記録のダイジェストの帯)。
+  - 描く：入力 ＋ 生きている途中の値（最後の使い手のあとで落ちる）＋ 今のノードの出力 ＋ 作業領域（`Op::work_bytes` の `Work::total(並列の数)`。持ち上げたノードはフレームの形で求める）＋ 申告した解析の結果（`estimate().bytes`）。量子化した値とダイジェストの帯（min(値, 4 MiB)）もここで数える。
+  - 書く：入力 ＋ 出力 ＋ エンコーダの作業領域 ＋ 書いたバイト列（値の 1 倍までとみなす）。
+  - 外したノードと、入力をそのまま返す出力は、元と同じ実体として数え直さない。キャッシュに当たるノードと量子化した出力は 0（描かない）。ほかは共有を見ずに新しい値として数える（多めに見積もる側）。
+- ピーク ＝ max(読む, 描く ＋ 読む持ち越し, 書く ＋ 読む持ち越し ＋ 描く持ち越し)。読む持ち越しは読む段の作業領域（値を除く）の和、描く持ち越しは描く段の最大から描き終えて残る値を引いた分（書くときだけ数える）。macOS のアロケータ（large cache）は、返した大きな領域を手元に置き、ほかの大きさ・ほかのスレッドの確保には使い回さない（段の中では使い回す）ため。下の表で、段の最大だけで見積もると 1〜3・6 行目で実測が見積もりを 27〜54% 上回り、この式では実測の 1.09〜1.43 倍になった（形からは見分けられないベースラインの JPEG の 4 行目は 1.97 倍）。
+- 照らし：
+  - 一括（`Engine::admit`）：見積もりのピークが予算の全体を超えれば、何も確保せずに `Limit`。収まれば `acquire` で待つ（中止で `Canceled`。使用量は変えない）。返した `Admission` を描き終えるまで持つ。
+  - エディタ（`Engine::admit_cached` と `CacheLease`）：開くとき `CacheLease::open(予算, キャッシュ, 望む上限)` でキャッシュの分を対話で確保する（空いていなければ、空いている分まで上限を下げる）。描くたびに、キャッシュの当たりを引いて見積もり、確保を「キャッシュの分 ＋ ピーク」まで待たずに伸ばす。伸ばせなければ、固定していないものを追い出して上限を下げ、見積もり直してもう一度（通ったら、確保を「下げた上限の分 ＋ ピーク」に合わせる）。追い出せるものがなくなっても足りなければ `Limit`（追い出した値は戻らないが、キャッシュの上限と確保は呼ぶ前のままに戻す。Limit のあとに `settle` を呼ばなくても、上限が下がったまま残らない。追い出したあとの見積もりが予算の全体を超えたときも同じ。最初の見積もりが予算の全体を超えるときは、何も変えずに `Limit`）。描いたあとは `settle` で伸ばした分を返し、予算が空いていれば上限を望む量に戻して、戻した確保を持ち続ける対話として申告する（上の駐車の条件）。
+- 流れ：エディタは `register_external`（入力。替えるときは `unregister_external` で外す）→ `CacheLease::open` →（手ごとに）`admit_cached`（表示する計画で）→ `render_view`（§12.8）か `render_cached` → `settle`。一括は、ヘッダから compile → `admit`（プールの外。読むファイルの長さが分かれば `input_len` で渡す）→ 一括のプールで読み・描き・書き → 確保を落とす。kura-core の `EngineRuntime::admit_bulk`・`open_cache`・`admit_preview` が同じ流れで、並列の数はそれぞれのプールのスレッドの数。
+- 判定の式（NFR-17。§16）：子プロセスの peak memory footprint − 基準（実行の場を作るだけの子。保存のケースはアプリのコーデックの組も作る子。文書・セッションの履歴は実測の側に入る）≤ 予算。macOS の CI の煙のテスト（kura-devtools の `mem_smoke`）は、実測 ≤ 見積もり × 1.25 ＋ 4 MiB（アロケータの断片・スレッドのスタック・タイル 1 枚ぶんの一時の領域の余裕）を確かめる。`mem_smoke` の基準は同じ子で、ファイルに触れる前（プール・エンジン・コーデックの組を作ったところ）まで回したもの（形を読むのにファイル全体を読む aseprite の分も読む段に入れる）。見積もりには読むファイルの長さを渡す。ケースは、プログレッシブの JPEG → 回転・Lanczos → PNG（`fast`）、PNG → Indexed8 → PNG、WAV → 音量 → Ogg Vorbis、層の多いアニメの aseprite（256²・8 層・4 フレーム・リンクあり）→ 反転 → APNG、1px の市松の 2048² の Gray8 の PNG → 8 連結の塗りつぶし → PNG。
+- 段 10 の実測（M4 Max・release。peak memory footprint から基準を引いた量、MiB）：
+
+| 通し（3 スレッド） | 実測 | 段の最大だけ | 今の式 |
+|---|---|---|---|
+| 24MP のプログレッシブ JPEG → 回転 → Lanczos 2000 → PNG（`fast`） | 406.3 | 274.7 | 449.8 |
+| 同じ・16 スレッド | 423.8 | 274.7 | 463.0 |
+| 同じ・読まずに合成の値から（16 スレッド） | 217.3 | 171.7 | 257.0 |
+| 24MP のベースライン JPEG → Lanczos 3000 → JPEG | 185.1 | 274.7 | 364.5 |
+| 1024² の PNG → Indexed8 → PNG | 103.4 | 132.0 | 139.0 |
+| WAV 4 秒 → 音量 → Ogg Vorbis | 12.6 | 9.2 | 17.2 |
+| WAV 60 秒 → 音量 → Ogg Vorbis | 94.4 | 117.1 | 135.2 |
+
+  1 行目の通しを `MallocLargeCache=0` で起こすと 252 MiB で、段の最大の見積もりに収まった。
+- 残したこと：エディタを開くときに読んだ作業領域の持ち越しは、まだ予算の外（開く読みも `admit` で確保するか、kura-mac に段の間で領域を OS へ返す口を足すかは後で決める）。JPEG のベースラインは、形だけでは見分けられないので約 2 倍に見積もる。前回の表示（`View`）と `render_cached` の前回の出力は数えていない（上の数えないもの）。aseprite の見積もりの外にあるもの（長さを渡さないとき・大きいセル・深いグループ・`shape()` の読み）と、まだ長さを使っていないデコーダは §9.9。
+
+### 12.11 プール
+
+- エンジンはスレッドプールを作らない（§8.2）。kura-core の `edit::EngineRuntime` が、エンジン 1 つ・プレビューと一括の 2 つのプール・予算を持ち、アプリに 1 つ置く（キャッシュは作ったエンジンに縛られるので、エンジンを作り直さない）。`Engine` には `preview(|e| …)`・`bulk(|e| …)` の閉包の中からだけ触れる（プールの `install` の中で描くので、グローバルのプールに漏れない）。閉包はプールの中から入れない（debug のビルドで止める）。
+- 大きさの既定（`pool_sizes`）：プレビュー max(1, ⌊コア/4⌋)・一括 max(1, コア − プレビュー)。16 コアで 4・12、8 コアで 2・6、4 コアで 1・3（1 コアだけは 1・1）。設定（`RuntimeConfig`）で変えられる。スレッドの名前は `kura-edit-preview-N`・`kura-edit-bulk-N`。
+- 分ける理由：一括を流している間も、プレビューのワーカーが空く（段 10 の調査：分けると p95 27.6 ms、相乗りすると 59 ms）。
+- 予算の確保（待つことがある）は、閉包に入る前（プールの外。ジョブのスレッド・プレビューの輪のスレッド）で行う。ワーカーの中で待つと、ほかの描画のワーカーを塞ぐ（試作で 2.3〜3 倍遅い）。
+- 値はプール・スレッドの数によらない（E1・NFR-16。kura-core の `two_pools_render_the_same_value_at_once`）。QoS（スレッドの優先度）は段 10 では試していない。
+
+### 12.12 セッション
+
+- `session::EditSession` は純粋な構造（OS・時刻・スレッドを使わず、描画・計画・キャッシュも持たない）。状態を変える関数は `&Engine` を受け取り、登録表（操作の版と追記だけの引数）と上限だけを読む。エディタの中の ⌘Z・⇧⌘Z はこれで実現する（ADR-141）。
+- 履歴は文書のスナップショット（`Snapshot`：`Arc<Head>` と `Arc<[Arc<SNode>]>`。写すのは `Arc` 2 つ）の列で、逆操作は持たない。ノードは手のあいだで `Arc` のまま共有する。追記だけの配列の引数は `AppendLog`（64 個ずつの切れ目を `Arc` で持ち、連鎖のダイジェストは `op::append_chain`。§7.1）。`Snapshot` は Send＋Sync で、写して描くスレッドへ渡す。ノードの鍵は `Registry::doc_node_key` と同じ値。
+- 手（`Edit`。9 種）：
+  - `AddNode`（線形の列の `at` 番目に足す。ID は `next_id` から払い出し、種は指定がなければ ID の値（§4.1）。2 つ目からの入力は文書の入力か、`at` より前のノード）・`RemoveNode`・`MoveNode`（前後をつなぎ直す）。
+  - `SetEnabled`・`SetParams`（引数をまとめて）・`SetParam`（項目 1 つ）・`AppendItems`（追記だけの配列に要素を足す）。
+  - `SetOutput`（形式・量子化・展開。つなぐ先は変えない）・`Replace`（文書を丸ごと。今のスキーマの文書）。
+- 構造の手（足す・消す・動かす）は線形の列だけで受ける：ノード i の入力 0 が 1 つ前のノード（最初のノードは文書の入力）で、出力 0 の from が最後のノード。線形でない文書への構造の手、範囲の外の位置、2 つ目からの入力の誤り、ほかのノードの 2 つ目からの入力に参照されているノードの削除は `Invalid`（`BadGraph`）。ノードの数の上限は `TooLarge`。
+- 検証は変えたところだけで行う：形（`check_structure` と同じ規則）→ 値の深さ・大きさ → 文書の大きさ（`MAX_DOC_BYTES`。差分で求める）→ 読み直せること（E8。移行するノードだけ `resolve` に通す）。誤りの順は、文書を写して全体を確かめる参照の実装と同じ。断った手は、仮の値も含めて状態を変えない。
+- まとめ方に時刻を使わない：
+  - `CommitMode::Step`（1 手）・`CommitMode::Merge`（同じ引数を続けて変える手を 1 手にまとめる。鍵は `SetParam` が（ノード, 名前）、`SetParams` が（ノード）。まとめられない手は Step と同じ）・`seal`（まとめを閉じる）。
+  - 仮の値（`preview`）は履歴に入らない（前の仮の値は捨てる）。`commit_preview`（番号を引き継ぐ）・`cancel_preview`。
+  - ドラッグは preview を繰り返して離したときに Step、キーボードの矢印・数値の入力は Merge、blur・Enter で seal。
+  - Merge で 1 つ前の手と同じ中身に戻ったら、その手を消してまとめを閉じる。土台になった手にはまとめない。何も変えない手は積まない（`noop`。16.0 と 16 は同じ）。
+- `Rev`：新しい中身の状態ごとに振る番号。単調に増え、中身の違う状態に同じ番号を振らない。undo・redo は戻った先の手の番号を返す（同じ手には同じ番号）。`snapshot(rev)` は、履歴の手・今の仮の値・直前に捨てた仮の値 4 つまでを引ける（描いている途中の要求のため）。
+- 上限（`HistoryLimits`）：1,000 手と、共有を除いた文書の 64 MiB の早いほうで、古い手から捨てる（カーソルは土台より前にならない）。バイトは「土台の文書の長さ ＋ 各手が 1 つ前の手と共有していない分」で、正規の JSON の長さで数える見積もり（決定的にするため、アロケータの値を使わない）。実メモリは、筆の追記で見積もりのほぼ 1 倍、引数の変更で約 10 倍、開いた文書は JSON の約 8 倍（serde_json の値。5 万本で 114 MB）。上限に実メモリの倍率を掛けるかは後で決める。
+- 保存の印：`mark_saved`・`is_dirty`（開いた文書は保存したものとみなす）。
+- 下書きの形式は作らない（M12）。頭の文書と土台の版から作り直す口（`open`・`open_json`。`open_json` は `Engine::load` を通して古いスキーマを移す）だけを持つ。作り直すと同じ文書・同じ鍵になる。
+- 実測（M4 Max・release。`tests/bench_session.rs`）：筆 1 本（500 点）の追記の手は p95 8.0〜12.5 µs（筆 999〜5 万本の文書）、引数の変更の手は p50 1.9 µs、undo・redo は約 1 ns、開くのは 3.1 ms（999 本）〜166 ms（5 万本）。5 万本の文書の `to_graph` は 24 ms、正規の JSON は 140 ms（保存・下書きの道。to_graph を通さずに直接書けば縮められる）。
+
+### 12.13 配信（M12）
+
+- `kura://localhost/edit/{session}/{rev}/…`（画像のタイル・全体、音声の WAV・PCM・波形）と `/peaks/{hash}`。`{rev}` は中身から決まる番号ではない（同じ中身に別の番号が付くこともある）が、セッションの中で番号を使い回さないので、同じ（セッション, rev）の中身は変わらない（応答を覚えてよい）。undo・redo は戻った先の手の番号を返すので、前に取ったタイルがそのまま使える。`/peaks/{hash}` は中身から決まる。
+- 手のあとは、変わったタイル（`render_view` の `changed`。§12.6・§12.8）だけを取り直す。タイルを最後に変わった rev で指すかなど、URL の形は M12 で決める。
+- CORS はアプリの origin だけ、受け付けるのは main の WebView だけにする。
 
 ## 13. エラー・中止・上限・安全
 
@@ -693,23 +1004,24 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 
 - 警告（メタデータを落とした、16 ビットを 8 ビットにした、sRGB とみなして混ぜた）は `Rendered.warnings` に入れ、保存の確認に出す。
 - 描くときのエラーには、どのノードで起きたかを付ける：`Invalid` は指摘の `node` に、`Unsupported`・`Limit`・`Decode`・`Encode` は `EngineError::AtNode { node, source }` で包む（`code()` は中身の種類、`root()` で中身、`node()` でノード）。中止と内部の誤りは包まない。上限を超える大きさの指摘は、どの操作でも `IssueCode::TooLarge`（原因の引数を `param` に）。配列の引数（描画の動作など）の誤りは、推論でも実行でも、文言の頭に何番目か（「動作 i：」）を付ける。
-- 中止：`par_blocks` がブロックの合間で `canceled()` を見るので、ほとんどの操作は自動で中止に対応する。操作は最初に `cx.check()` を呼ぶ（何もしない近道でも）。適合テストは、操作の中の 1〜4 回目の確認で中止できることを確かめる（E24）。
+- 中止：`par_blocks` がブロックの合間で `canceled()` を見るので、ほとんどの操作は自動で中止に対応する。操作は最初に `cx.check()` を呼ぶ（何もしない近道でも）。適合テストは、操作の中の 1〜4 回目の確認で中止できることを確かめる（E24）。段 10 から、キャッシュの道・範囲の描画・継ぎはぎ・継ぎ目の縮小の途中の中止も `Canceled` で、中止したノードの値はキャッシュに残らない（描き終えた前段の完全な値は残ってよい）。予約（§12.9）で新しい要求に取って代わられた描画も `Canceled`。
+- メモリの予算（§12.10。段 10）：足りないときは `Limit`（`code()` は `TooLarge`）。全体を超える見込みの計画は、描く前に「メモリの予算を超える見込みです（見積もり … バイト。予算は … バイト）」で断る。エディタでキャッシュを追い出しても足りなければ「メモリの予算が足りません（見積もり … バイト。キャッシュを追い出しても、固定した値と入力で … バイトを使っています。予算は … バイト）」。どちらも操作は 1 つも動かない（E25）。一括が予算を待っている間の中止は `Canceled`（2 ms ごとに見る）で、使用量と待ちの列は変えない。
 - 描くときの入力の値は、計画を作ったときの形と上限に照らしてから使う（ヘッダの形と実際のデコードの結果が食い違う場合に、上限を超えた値を描かない）。
 - 進捗：ジョブ（kura-core）が `Monitor` を実装し、既存の `JobContext::progress` につなぐ。
 - 上限の既定：1 辺 32,768px、画素数 2²⁸、ノード数・点の数・音声の長さも上限を持つ。設定で変えられる。
 - **安全**（ダウンロードしたファイルも読むので）：
-  - ヘッダから大きさを読み、`u64` の `checked_mul` で見積もり、上限と予算で判断してから `try_reserve_exact` で確保する。
-  - zlib の展開は期待する大きさ（aseprite の cel なら幅 × 高さ × 画素の大きさちょうど）の上限付きの領域にだけ行う。超えたり余ったりしたら壊れたファイルとして扱う。第三者のデコーダの上限（png の `Limits` など）も予算から設定する。
+  - ヘッダから大きさを読み、`u64` の `checked_mul` で見積もり、上限（`Limits`）で判断してから `try_reserve_exact` で確保する。メモリの予算（§12.10）は、デコーダの中ではなく読む前に、呼び手が形とデコーダの作業領域の倍率（§9.9）を含む見積もりで確保する（デコーダには `Limits` だけを渡す。macOS では大きな確保も失敗しないので、確保の失敗では予算を守れない）。
+  - zlib の展開は期待する大きさ（aseprite の cel なら幅 × 高さ × 画素の大きさちょうど）の上限付きの領域にだけ行う。超えたり余ったりしたら壊れたファイルとして扱う。第三者のデコーダの上限（png の `Limits` など）も `Limits` から設定する。
   - 第三者のデコーダの境界では `catch_unwind` してエラーに変える（自分のコードでは panic を禁じたまま）。
   - SVG の外部の参照（file・http）は拒否する（NFR-10）。DTD の実体の展開（入れ子を含む）と `<use>` の展開は、usvg に渡す前に見積もって上限で断る。SVG のファイルは 16 MiB まで。
-  - 段 4 の各デコーダの上限：PNG のフレームの数は fcTL を数える段階で、eXIf はテキスト・ICC と合わせて `max_meta_bytes` で、GIF は 1 フレームの作業領域（`max_pixels`）とフレームの数を LZW を展開しない走査で、WebP の ICC と EXIF の合計は `max_meta_bytes` で、aseprite はファイル全体を `max_value_bytes` で、セル・タイルセットの展開をそれぞれの大きさちょうどで、1 フレームを描く作業領域を `max_value_bytes` の予算で、グループの入れ子を 64 段で、PSD は層とマスクの情報・RLE の行の長さ・圧縮なしの画素をファイルの残りの長さと照らして抑える。
-  - 大きな画像：16384² の RGBA（値 1 GiB）を PNG に書いて読み直すテスト（`tests/large.rs`、release で 3.8 秒）のピークのメモリは 3.3 GB（元の値と読んだ値の 2 GiB を含む）。PNG の書き出しは行を詰めた写しを 1 つ作る（値と同じ大きさ。行ごとに書くとバイト列が変わるので、エンコーダの版を上げる段 10 のメモリの予算で扱う）。
+  - 段 4 の各デコーダの上限：PNG のフレームの数は fcTL を数える段階で、eXIf はテキスト・ICC と合わせて `max_meta_bytes` で、GIF は 1 フレームの作業領域（`max_pixels`）とフレームの数を LZW を展開しない走査で、WebP の ICC と EXIF の合計は `max_meta_bytes` で、aseprite はファイル全体を `max_value_bytes` で、セル・タイルセットの展開をそれぞれの大きさちょうどで、1 フレームを描く作業領域を `max_value_bytes` の予算で、持っておく展開したセル・タイルセットを値の大きさ（と `max_value_bytes`）まで（段 10。§9.9）で、グループの入れ子を 64 段で、PSD は層とマスクの情報・RLE の行の長さ・圧縮なしの画素をファイルの残りの長さと照らして抑える。
+  - 大きな画像：16384² の RGBA（値 1 GiB）を PNG に書いて読み直すテスト（`tests/large.rs`、release で 3.8 秒）のピークのメモリは 3.3 GB（元の値と読んだ値の 2 GiB を含む）。PNG の書き出しは行を詰めた写しを 1 つ作る（値と同じ大きさ）。行ごとに書くとバイト列が変わり、エンコーダの版を上げることになるので、写しは作ったままにし、段 10 のメモリの予算の見積もりに数える（PNG の書きの作業領域は 1 フレームの 3 倍、`fast` は 4 倍。§9.9）。エンコーダの版は上げていない。
   - 段 6 の音声のデコーダの上限：symphonia・nanomp3 に渡すファイルは `max_value_bytes` まで読み込む。長さはデコードせずに数え（パケットの長さの和・MP3 のフレームの走査）、形を上限（`max_audio_frames`・`max_value_bytes`・`max_channels`・`max_sample_rate`）で確かめてから確保する。デコードの途中でも形の上限を超えたら止める。Vorbis は codebook の表の大きさを渡す前に見積もって断る。AIFF の COMM は 279 バイトまで、MARK・INST・テキストは WAV と同じ予算（マーカーの上限・`max_meta_bytes`）。symphonia の panic は `codec::contain` が受け止める。
   - 段 9 の外部のツールと OS の機能（詳しくは §9.8）：ffmpeg は入力をファイルのパスで渡し、分離器・デコーダ・プロトコルをホワイトリストで固定し、環境変数を消して新しいプロセスグループで動かし、見張りが中止・無出力・時間切れ・出力の上限でグループごと止める。出力（WAV）は上限で確かめてから確保する。ImageIO の展開は専用のスレッドで行い、時間切れで見捨てる（壊れた HEIC で戻らないことがある）。Swift の側は大きさをすべて確かめ、Rust が確保した領域にだけ書く。
   - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・AIFF・FLAC・MP3・Ogg・m4a・AAC・アンカー・文書の読み込み）はファズにかける。
     - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_peaks`・`fuzz_document` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
     - `tests/fuzz_smoke.rs` は同じ口を stable で回す変異のファズ。種（各形式の小さなファイル・フィクスチャ・文書）をバイトの書き換え・挿入・削除・つなぎ合わせで崩す。ふだんの `cargo test` で対象ごとに 150 回（`quick`）、`KURA_FUZZ_SECS=<秒> cargo test --release -p kura-engine --test fuzz_smoke long -- --ignored` で長く回す（`KURA_FUZZ_ONLY=svg,wav` で対象を選べる）。見つけた入力は `target/fuzz-smoke/` に残し、`replay` で流し直す。
-    - 文書のファズは、上限を絞ったエンジンで読み込み、小さな入力（画像・パレットの画像・フレームの列・音声、格子・ピボット・スライス付きのシート、ループ点・マーカー付きの音声）で計画を作って描くところまで流す（段 5 から。新しい操作の実行の経路とメタデータの写し方にも届く）。追記だけの引数（`actions` の列）を持つノードは、途中で切って差分の適用（`Op::apply_appended`）が全体を当て直したものと同じかも照らす（E21。実行器が差分を使う段 10 までは、ファズでここを照らす）。
+    - 文書のファズは、上限を絞ったエンジンで読み込み、小さな入力（画像・パレットの画像・フレームの列・音声、格子・ピボット・スライス付きのシート、ループ点・マーカー付きの音声）で計画を作って描くところまで流す（段 5 から。新しい操作の実行の経路とメタデータの写し方にも届く）。追記だけの引数（`actions` の列）を持つノードは、途中で切って差分の適用（`Op::apply_appended`）が全体を当て直したものと同じかも照らす（E21）。段 10 から実行器も差分を使うので、実行器の経路（セッションで追記して `compile_snapshot` と `render_cached` の差分の適用で描く）も、文書のファズのセッションの道の照合（`testing::snapshot`）と `tests/e4.rs` の `appended_in_executor_equals_full` で照らす。
     - デコーダのファズは、上限を絞って（`testing::fuzz_limits`）その形式のすべてのデコーダ（旧版を含む）で形と中身を読み、自分のコードの panic（panic の場所が `crates/kura-engine/src/` のもの。`testing::catch_own_panic` が panic のフックで見分ける）・形と中身の食い違い・`Internal` を見つけたものとして扱う。壊れたファイルとしてのエラーと第三者のクレートの panic（`codec::contain` がエラーに変える）は正しい振る舞い。
     - 段 4 の長い実行（release で対象ごとに 40〜60 秒、合わせて約 2 億回）で、SVG の DTD の走査が多バイト文字の途中で文字列を切る panic を見つけて直した（`multibyte_text_around_the_dtd`）。直したあとの実行では何も見つかっていない。SVG と文書は、変異の多くが最初の検査（UTF-8・JSON）で断られるので回数ほど深くは試せていない。深い所はカバレッジを見る `fuzz/` に任せる。
     - 段 5 で、nightly の cargo-fuzz（libFuzzer。release ＋デバッグの検査 ＋ AddressSanitizer、`-fork` で並べて落ちても続ける）を 9 つの対象で回した。各 30 分を 2 回、直したあとに SVG・文書・aseprite を 10〜20 分ずつ、合わせて約 2.7 億回。見つけたのは SVG と自前の新しい検査だけで、どれも直した：参照の輪と深い入れ子によるスタックのあふれ（受け止められずにプロセスごと落ちる）、resvg の pattern のタイルの上限のない確保（209 GB）、巨大な半径の楕円の遅い描画、数の検査の無限ループ。最後の実行（SVG 約 1,360 万回・文書 約 200 万回）では何も見つかっていない。見つけた入力は `replay` で流し直せる形で残す（`fuzz/README.md`）。
@@ -718,6 +1030,10 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
     - 段 7 で自前のエンコーダの対象 `encode_ogg`（`testing::fuzz_encode`）を足した。先頭の 19 バイト（`FUZZ_ENCODE_HEADER`）で品質（−1〜10）・レート・チャンネル（1〜9）・長さ（0〜16,384 フレーム）・ループ点（なし・範囲の中・u64 の端に近い始まり／終わり）・タグ（0〜4 個。別名・大文字小文字違い・書けない名前、空・`=`・NUL・4,096 バイト前後・70,000 バイトの値）を決め、残りを f32 のビット列（NaN・∞・巨大な値を含む）として標本にする。書けない形（レート・チャンネルの範囲の外）は断ること、書けると答えた形は断らないこと、すべての ogg のデコーダ（旧版を含む）で読み直した長さ・レート・チャンネルが元と同じこと、コメントのループ点が範囲の中だけ正しい値で書かれ、名前が重ならず、読み直して書き直すと同じコメントになることを確かめる。検証で cargo-fuzz の `encode_ogg` を 31 分（約 6.9 万回）、`decode_ogg`（kura の出力 672 本を種に足して）を 7 分（約 220 万回）、stable の変異の `encode_ogg` を 300 秒（約 7.8 万回）回し、何も見つかっていない。メタデータを足したあとも、stable で 90 秒（約 2.8 万回）と cargo-fuzz で 5 分（約 1.1 万回）回して何も見つかっていない（エンコーダは 1 回が重いので回数は少ない）。カバレッジ（行）：psy 94%・envelope 92%・floor1 88%・res0 86%・block 82%・ogg 79%。届かないのはエラーの枝と、設定のテンプレートでは届かない枝（M7 の短い窓の範囲の外・5.1 の coupling など）。
     - 段 8 で、`fuzz_decode` が読めた値に登録されたすべての解析（見積もりの手間が 2²⁴ 以下のもの）を当て、結果が見積もり以下であることを確かめるようにした。波形の段のバイナリの読み手の対象 `decode_peaks`（`testing::fuzz_peaks`）を足した。release の stable の変異で各 20 秒（peaks 約 6,000 万回、wav・aiff・flac は解析込みで約 4〜23 万回）回し、何も見つかっていない。
     - 段 9 でアンカーの対象 `decode_anchor`（`tests/fuzz_smoke.rs` では `anchor`。種は EXIF 付きの画像・フレームの列・メタデータ付きの音声のアンカー）を足した。確認の回で、release の stable の変異で各 60 秒（anchor 約 1,224 万回・ogg 約 470 万回・m4a 約 29 万回・aac 約 14 万回）、cargo-fuzz（`-fork=4`）で各 10 分（decode_anchor 約 1,321 万回・decode_m4a 約 49 万回・decode_aac 約 20 万回）回し、何も見つかっていない（m4a・aac は、SBR の判定と多チャンネルの断り方を変えたあとの読み取りの経路）。
+    - 段 10 で、文書のファズ（`fuzz_document`）に、描けた計画ごとの照合を足した：キャッシュの道（冷えた・温まった＋当たりを描き直す照合・16 KiB の上限で 2 回）とキャッシュなしの道で、描けたか・ダイジェスト・警告（順も）が同じ。範囲の描画と全体の描画、変わった範囲の推論の保守性（`testing::region`）。プレビューの段（`testing::preview`：段 1〜3 の計画が作れるか段 0 に落ちる、等倍で描けるなら段でも描け、キャッシュの道と範囲の描画で同じ値、継ぎ目までが等倍と同じ指紋）。セッションの道（`testing::snapshot`：`compile_snapshot` の計画が `compile` と同じ、追記を前後に分けた差分の計画と描画が全体と同じ）。ファズの対象は足していない（下書きの形式を作らないため）。範囲の班の確認の回で、文書を release で 180 秒回し、見つかったのは照合の側の誤り（出力の ID を 0 と決め打ちしていた）だけだった（直した）。M10 の完了の前に、cargo-fuzz（`-fork`）で全対象を各 10 分、stable の変異で各 60 秒回した（ユーザーの決定）。どれも何も見つかっていない（crash・oom・timeout が 0）。
+      - cargo-fuzz（release ＋デバッグの検査 ＋ ASan、`-fork=4`、3 対象ずつ並べて 10 分。種は `export_seeds`）：decode_anchor 約 764 万回・decode_peaks 約 2,827 万回・decode_flac 約 70 万回・decode_ogg 約 62 万回・decode_png 約 49 万回・decode_aiff 約 28 万回・decode_m4a 約 26 万回・decode_wav 約 24 万回・decode_aac 約 19 万回・decode_webp 約 18 万回・decode_mp3 約 14 万回・decode_psd 約 12 万回・decode_svg 約 6 万回・decode_jpeg 約 4.5 万回・decode_gif 約 2.3 万回・decode_aseprite 約 2.2 万回（確認の直しのあと `-fork=8` で 10 分回し直して約 1.7 万回）・encode_ogg 約 1.6 万回。デコードの対象は読めた値に登録されたすべての解析を当てる（段 8）ので、画像の重い形式は 1 回が重い。
+      - 文書（`document`）は、段 10 の照合を足した種（約 3,400 個）を ASan の下で最初に流すだけで約 30 分かかり、10 分の枠ではほとんど変異に進まなかった（release では同じ種が全部で約 67 秒、重い種で 1 個 0.5 秒。段 10 の照合を外しても時間は変わらない）。そこで種を 8 個に 1 個（420 個）にして 15 分回し、最初の流しが 162 秒、そのあと約 81 万回で何も見つかっていない。重い種 3 個が slow-unit（ASan の下で 10 秒を超える。timeout の 30 秒には届かない）として残った。
+      - stable の変異（release、各 60 秒）：png 約 142 万回・jpeg 約 152 万回・gif 約 1,207 万回・webp 約 221 万回・aseprite 約 1,046 万回（直しのあと約 1,100 万回）・psd 約 390 万回・svg 約 1,165 万回・wav 約 21 万回・aiff 約 18 万回・flac 約 70 万回・mp3 約 16 万回・ogg 約 502 万回・encode_ogg 約 2 万回・m4a 約 28 万回・aac 約 13 万回・document 約 1,068 万回（直しのあと約 1,130 万回）・peaks 約 1 億 7,398 万回・anchor 約 1,237 万回。
     - 通常の `cargo test` にも、ChaCha8 でランダムな文書と壊れたファイルを作るテスト（形式ごとの `broken_files_are_errors` など）を入れる。
 
 ## 14. 保存と版（M12 以降。意味だけを決める。表は data-model.md に各段で書く）
@@ -741,19 +1057,26 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 | 新しい値の型「動画」でトリムだけ | `Value::Video(VideoRef { source, segments })`（展開しない参照）、`ops/video/trim.rs`（区間を書き換えるだけ）、kura-core の ffmpeg のエンコーダ。網羅的な `match` が扱いの要る場所を教える。結果は環境依存の段 |
 | 引数の意味を変える（resize の "smooth" を bilinear から Lanczos へ） | 旧版で表せるなら `migrate` を書いて旧版を消す。表せない修正なら旧版を `legacy` に残す |
 | 一括で「各アイテムの幅の 50%」 | 大きさの型（`Length::Scale`）で表す。キャンバス・ピボットの相対の指定（「上下左右に 2px」「下中央」）は、M14 の計画のときに、操作の版を上げるか別の操作にするかを決める。タグ由来の値などは M14 で `Bindable<T>`（結び付けの段で具体的な値にし、版に記録する） |
-| 点の多いペン | `PaintParams.actions` を Arc で区切って持ち、差分の適用で 1 本ごとに O(そのストローク)。画面に返すときは件数とダイジェストだけ |
+| 点の多いペン | 段 10 で実現した。型付きの引数は動作の列 `ActionList`（§10）、セッションの JSON は `AppendLog`（§12.12）で、どちらも 64 個ずつの切れ目を `Arc` で共有する。追記 1 回の読み込み・推論（`parse_appended`・`infer_appended`）・引数の指紋（追記の連鎖）・変わった範囲・描画（差分の適用）は O(足した分 ＋ 切れ目の数) で、前の筆の本数によらない（5 万本の文書でも、4096² に 1px の筆 1 本（500 点）で p95 0.29 ms 以下。§16）。画面に返すときは件数とダイジェストだけ |
 
-## 16. 性能の目標（M10 の段 10 で測って確定する。requirements.md の NFR-11〜17）
+## 16. 性能の目標（requirements.md の NFR-11〜17。M10 の段 10 で測った）
 
 | 項目 | 目標 |
 |---|---|
-| 引数を変えてからプレビューが更新されるまで（24MP は縮小の段、2048² までのドット絵は等倍） | p95 50ms（エンジンの中 25ms） |
-| 筆 1 本（500 点まで、4096² まで）の確定 | 8ms |
+| 引数を変えてからプレビューが更新されるまで（24MP は縮小の段 2、2048² までのドット絵は等倍。減色のプレビューは対象外） | p95 50ms（エンジンの中 25ms） |
+| 筆 1 本（500 点まで、32px まで、4096² まで）の確定 | 8ms |
 | 塗りつぶし（全面、4096²） | 30ms |
 | 保存：24MP の JPEG → 線形光で 50% → JPEG | 0.5 秒 |
 | 一括：ドット絵の PNG 1,000 件（トリム・4 倍） | 5 秒 |
 | 5 分の曲の解析（波形・ラウドネス・トゥルーピーク） | 2 秒 |
-| メモリ | 予算（既定は物理メモリの 1/4、上限 4GiB）を超えない。超える入力は落ちずにエラー |
+| メモリ | 予算（既定は min(物理メモリ/4, 4 GiB)。分からなければ 2 GiB）を超えない。超える入力は落ちずにエラー |
+
+段 10 で書き足した目標の範囲（ユーザーの決定。requirements.md にも書き足した）。範囲の外のケースは、測って「範囲外」として記録し、判定しない（§16.2・§16.3）。`kura-devtools bench edit` は、筆の太さが 32px（`testing::bench::STROKE_SIZE_LIMIT`）を超えるものと減色のプレビューを、判定の条件で測っても達成・未達にせず判定「範囲外」（JSON の `verdict` は `out_of_scope`）の記録にし、注を付ける（`testing::bench` の `OUT_OF_SCOPE_STROKE`・`OUT_OF_SCOPE_REDUCE`）：
+
+- 筆は 32px まで（64px の筆 1 本は操作そのものが約 23 ms かかる。§16.3）。
+- 減色（Indexed8 への `image.convert`）のプレビューは対象外。描けるまで古い結果を出したまま、描けたら差し替える（2048² の 16 色のスプライトなら p95 22.6〜22.8 ms で目標の中だが、色の多い最悪の形（1024² の乱数を 256 色に）は段 5 の実測で 316〜496 ms）。
+
+判定の条件として、24MP の写真は縮小の段 2（1500×1000）で判定する（段 1 は記録だけ。3 スレッドで Lanczos3・鎖の p95 64〜72 ms）。
 
 段 5 の実測（`cargo test --release -p kura-engine --test bench_image -- --ignored --nocapture`、Apple M 系の Mac。操作そのもので、文書の計画と出力のダイジェストを含まない）：
 
@@ -772,14 +1095,104 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 
 段 8 の実測（release・16 コア、負荷のある中の目安。§11.3・§11.4）：5 分の 44.1 kHz ステレオの解析（波形の段・ラウドネス・無音・ループ）は 66 ms（1 スレッドで 0.47 秒）、WAV の読み取りを含めて 0.19 秒、FLAC で 0.42 秒（「5 分の曲の解析 2 秒」を満たす）。60 分の 48 kHz ステレオのラウドネスは 0.69 秒。画像の解析は 16384² で 15〜218 ms（最も重いのは sprite_grid）。正規化の描画全体（計測を先に解く＋利得、5 分 48 kHz ステレオ）は 0.21 秒、トリムの描画（8192²）は 47 ms。
 
+### 16.1 段 10 の測り方
+
+- 判定の機械と条件（ユーザーの決定）：Apple M4 Max（高性能 12・高効率 4、128 GB）、release、プレビューのプールと一括のプールを 3 スレッドにして判定する。4・16 スレッドでも回して記録する（判定はしない。アプリの 16 コアの既定のプールは 4・12。§12.11）。
+- 「エンジンの中」（NFR-11・12）：編集（文書か `Edit`）を受けてから、プレビューの値と変わったタイルの一覧ができるまで。セッションの手・差分の計画（写真は段の計画）・予算の確保（`admit_cached`・`settle`。1 µs ほど）・表示の経路（`render_view`。§12.8。表示する範囲は出力の全体、ダイジェストなし）を含め、ダイジェスト・エンコード・IPC・WebKit を含めない。p95 50 ms の全体（WebKit の表示まで）は M12 で測る。
+- 回数と統計：NFR-11・12 は慣らし 10 回のあと 30 回（p50・p95）、NFR-13 は慣らし 2 回のあと 10 回・NFR-15 は慣らし 1 回のあと 5 回（中央値・最大）、NFR-14 は慣らし 1 回のあと通し 3 回（最大で判定）。百分位は最近順位法（昇順の ⌈p·n/100⌉ 番目）で、20 回より少なければ p95 を出さず最大で判定する（`testing::bench`）。
+- 毎回、引数を違う値にする（スライダーの i 段目。キャッシュに当てない）。測る前に、前の文書でキャッシュを温める（測らない）。
+- ロードアベレージ（`sysctl -n vm.loadavg`）を回の前後とケースごとに記録する。ほかの作業でロードアベレージが 12 を超える中では p95 が大きく跳ねた（筆 5 万本の文書で 8〜15 ms。負荷が下がってから測り直すと下の表の値に戻った）ので、判定に使う値は負荷の低いとき（ロードアベレージ 4〜6）に測る。
+- 入力は ChaCha8 と整数だけで作る（`InputGen::Photo`・`InputGen::PixelSprite`、`testing::bench` の `walk_stroke`・`program_audio`・`sprite_batch`。どれもダイジェストを凍結）。実写真は `--photo` で渡す（リポジトリに置かない・ダウンロードしない。段 10 では合成の写真だけで測った）。
+- NFR-16：判定の条件の最後の文書・結果を、別のエンジン・キャッシュなしの一括の経路（1・3・16 スレッド）で作り直し、値のダイジェストと、固定のコーデックで書いたバイト列を照らす。エディタの側のダイジェストは、表示の経路で測ったのと同じエディタの経路（セッション・キャッシュ）で等倍の全体を描いたもの（`render_cached`。`EditorPath::digests`）。表示の値が `render` と同じことは `tests/view.rs` が確かめる（§12.8）。
+- NFR-17：自分を子プロセスとして `/usr/bin/time -l` で起こし、peak memory footprint から基準を引いた量を予算と比べる（§12.10 の判定の式）。小さい予算では落ちずに `Limit` になること。
+- 道具：`kura-devtools bench edit`（表・`--json`・`--markdown`。architecture.md §13 の表の形。判定は達成 `pass`・未達 `fail`・範囲外 `out_of_scope`・記録 `record`・見送り `skip`）と、`tests/bench_*.rs`（`#[ignore]`。部品ごとの実測）。
+
+### 16.2 段 10 の実測
+
+M4 Max・release・3 スレッド。`kura-devtools bench edit --runs 3`（コミット d1ce160。ロードアベレージは各回の始めで 4.8〜6.4、ケースごとの記録で 3.6〜10.4）の 3 回の幅。NFR-11・12 は表示の経路（§12.8）で測った「エンジンの中」（§16.1）。写真（合成の 6000×4000）は段 2 の計画で判定し、段 1 は記録。時間は ms。
+
+| NFR | 項目 | p50 | p95 | 判定 |
+|---|---|---|---|---|
+| 11 | ドット絵 2048²：`palette.replace`（Indexed8） | 0.03 | 0.04 | 達成 |
+| 11 | ドット絵 2048²：`convert`（Rgba8 → Rgb8 の下地の色） | 9.54〜10.2 | 13.6〜14.6 | 達成 |
+| 11 | ドット絵 2048²：`canvas`（幅と高さを 1 ずつ） | 3.33〜3.34 | 3.60〜3.76 | 達成 |
+| 11 | ドット絵 2048²：最近傍の拡大（2 倍前後の幅） | 12.6〜13.4 | 13.9〜14.1 | 達成 |
+| 11 | ドット絵 2048²：`trim_alpha`（しきい値） | 1.37〜1.45 | 1.96〜2.05 | 達成 |
+| 11 | ドット絵 2048²：`split_grid`（セルの大きさ） | 1.65〜1.82 | 2.03〜2.70 | 達成 |
+| 11 | ドット絵 2048²：減色（Rgba8 → Indexed8、色の数を変える） | 21.5〜22.0 | 22.6〜22.8 | 範囲外 |
+| 11 | 音声 5 分：`gain`（0.1 dB ずつ） | 8.75〜9.51 | 10.3〜12.2 | 達成 |
+| 11 | 音声 5 分：`fade`（フェードインの長さ） | 12.4〜12.9 | 12.7〜14.7 | 達成 |
+| 11 | 音声 5 分：`normalize` の目標（解析はキャッシュに当たる） | 37.5〜38.8 | 38.4〜40.1 | 未達 |
+| 11 | 写真 24MP・段 2：`crop` の位置（1 画素ずつ） | 0.11〜0.19 | 0.16〜0.23 | 達成 |
+| 11 | 写真 24MP・段 2：Lanczos3 の縮小（40〜60%） | 16.2〜16.4 | 18.6〜19.2 | 達成 |
+| 11 | 写真 24MP・段 2：鎖（`crop` → Lanczos3 50% → Gray8）の `crop` | 16.5〜16.8 | 16.8〜17.2 | 達成 |
+| 11 | 同・段 1：`crop`・Lanczos3・鎖 | 0.35〜0.72・59.3〜59.8・65.2〜65.7 | 0.49〜0.79・64.0〜64.8・67.8〜72.2 | 記録 |
+| 12 | 筆 1 本（500 点）の確定、4096²、前の筆 0・999・5 万本：1px | 0.17〜0.21 | 0.20〜0.29 | 達成 |
+| 12 | 同：8px | 0.43〜0.48 | 0.48〜0.59 | 達成 |
+| 12 | 同：32px | 5.47〜5.78 | 5.74〜6.17 | 達成 |
+| 12 | 同：64px | 22.3〜23.4 | 23.3〜24.6 | 範囲外 |
+| 12 | 筆のあとに最近傍 ×4（1024² → 4096²・前の筆 999 本）：8px | 1.31〜1.37 | 1.86〜2.17 | 達成 |
+| 12 | 同：32px | 6.51〜6.61 | 7.62〜8.04 | 未達（3 回のうち 1 回。境目） |
+| 12 | 同（2048² → 8192²。参考）：8px・32px | 1.48〜1.51・6.79〜6.94 | 2.13〜2.15・7.73〜7.88 | 記録 |
+| 12 | 全面の塗りつぶし 4096²（4 連結・つながった全面） | 27.3〜28.0 | 33.2〜33.7 | 未達 |
+| 12 | 全面の塗りつぶし 4096²（画像全体の同じ色） | 26.4〜26.5 | 32.7〜33.1 | 未達 |
+
+| NFR | 項目 | 結果 | 目標 | 判定 |
+|---|---|---|---|---|
+| 13 | 保存：24MP の合成の写真の JPEG → Lanczos3 50% → JPEG q90（ファイルの読み書き・元のハッシュ・予算の確保・出力のダイジェストを含む） | 中央値 414〜420・最大 418〜426 ms | 0.5 秒 | 達成 |
+| 13 | 同・bilinear（参考） | 中央値 289〜294・最大 291〜314 ms | 0.5 秒 | 記録 |
+| 14 | 一括：ドット絵の PNG 1,000 件（トリム → 最近傍 ×4、メモリの中で読み書き） | 通し 468〜510 ms（各回の最大） | 5 秒 | 達成 |
+| 15 | 5 分の 44.1 kHz ステレオの読み取り ＋ 波形・ラウドネス（トゥルーピーク）：WAV・FLAC | 中央値 195〜198・336〜346 ms（最大 197〜198・337〜348 ms） | 2 秒 | 達成 |
+| 16 | 23 のケース（NFR-11〜15 の文書・結果）を、別のエンジン・キャッシュなしの一括の経路（1・3・16 スレッド）で作り直す | 値のダイジェストと PNG・JPEG・WAV のバイト列・解析の正規の形が一致 | 一致 | 達成 |
+| 17 | 保存の通し（24MP → Lanczos3 50% → JPEG q90、予算の確保つき） | 実測 187〜188 MiB・見積もり 364.5 MiB（予算 4 GiB） | 予算以内 | 達成 |
+| 17 | 筆の文書のエディタ（4096²・筆 999 本 ＋ 8px を 20 本、キャッシュの確保つき） | 実測 163.5〜163.8 MiB・見積もり 206.8 MiB（予算 4 GiB） | 予算以内 | 達成 |
+| 17 | 小さい予算での保存（128 MiB）・エディタを開く（64 MiB） | 落ちずに `Limit` | 超える入力は落ちずにエラー | 達成 |
+
+スレッドの数の記録（`--threads 4,16 --only 11,12,13,14,15`。p50／p95、ms。保存・解析は中央値、一括は通し。1 回、ロードアベレージ 4.1〜5.2（ケースごとの記録で 3.9〜5.4））：
+
+| 項目 | 3 | 4 | 16 |
+|---|---|---|---|
+| ドット絵 2048²：`convert` | 9.97／14.4 | 7.42／7.63 | 2.61／2.89 |
+| ドット絵 2048²：最近傍の拡大 | 12.6／13.8 | 9.53／10.1 | 3.20／3.56 |
+| ドット絵 2048²：減色 | 21.6／22.7 | 21.6／22.2 | 21.6／22.2 |
+| 音声 5 分：`normalize` の目標 | 38.3／39.7 | 37.5／37.9 | 35.8／36.3 |
+| 写真 24MP・段 2：Lanczos3・鎖 | 16.3／18.8・16.8／17.1 | 11.9／12.2・15.9／16.4 | 11.9／12.1・9.00／9.15 |
+| 写真 24MP・段 1：Lanczos3・鎖 | 59.6／64.5・65.8／68.3 | 54.8／56.5・50.4／51.4 | 17.8／20.2・18.5／20.8 |
+| 筆（前の筆 5 万本）：8px・32px・64px | 0.50／0.56・5.84／6.14・23.6／24.2 | 0.46／0.54・5.80／6.03・23.5／24.0 | 0.47／0.55・5.84／6.01・23.4／24.1 |
+| 筆のあとに最近傍 ×4（1024²）：8px・32px | 1.33／1.96・6.79／7.61 | 1.04／1.46・6.56／7.25 | 0.89／1.11・6.31／6.88 |
+| 同（2048²）：8px・32px | 1.52／2.14・7.08／7.78 | 1.23／1.55・6.70／7.45 | 0.95／1.11・6.38／6.65 |
+| 全面の塗りつぶし：連結・画像全体の同じ色 | 28.3／35.6・26.6／33.3 | 20.1／21.1・19.7／20.0 | 7.21／7.49・6.73／6.92 |
+| 保存（Lanczos3） | 420 | 358 | 227 |
+| 一括 1,000 件 | 503 | 365 | 119 |
+| 解析（WAV） | 199 | 171 | 136 |
+
+- 筆・正規化・減色は、スレッドの数でほぼ変わらない。
+- 段 10 の途中（コミット c8286e7。`render_cached` で等倍の全体を描いていたとき）との比較（p95）：筆のあとに最近傍 ×4 の 1024²・8px は 18.1〜19.3 → 1.86〜2.17 ms、32px は 23.0〜23.6 → 7.62〜8.04 ms、2048²（参考）は 60〜72 → 2.1〜7.9 ms。24MP の写真の鎖は、等倍で描いた仮の値 266〜268 ms → 段 2 で 16.8〜17.2 ms。
+
+### 16.3 未達・範囲外と理由（段 10）
+
+値を変えずに速くできるもの（ダイジェストを外す・差分の計画・差分の適用・縮小の段・キャッシュ・表示の経路・paint の変わる範囲の区切り）は段 10 で入れて測り、それでも外れるものを未達として理由つきで記録する（ユーザーの決定）。目標の範囲は §16 の頭の 2 つ（筆は 32px まで・減色のプレビューは対象外）だけで、その外のケース（64px の筆・減色）は「範囲外」として記録し、判定しない。
+
+- **音声の正規化の引数の変更**（NFR-11。p95 38.4〜40.1 ms）：ラウドネスの計測はキャッシュに当たる（解き直さない）が、利得を求める `analysis::loudness::Measured::gain_to` が、候補の区間ごとに積分ラウドネスを全ブロックで数え直す（O(ブロック²)。5 分で 2,997 ブロック、32〜38 ms。使い捨てのテストで測って確かめた）。操作そのものの時間で、スレッドの数でもほぼ縮まない（16 スレッドで p95 36.3 ms）。値を変えずに速くする手は、段 10 では入れていない。
+- **32px の筆のあとに最近傍 ×4 が続く文書**（NFR-12。1024² → 4096²。p95 7.62〜8.04 ms で、3 回のうち 1 回（負荷のいちばん低い回）が 8 ms を 0.04 ms 超えた。境目）：表示の経路（§12.8）で、筆は差分の適用、後ろの最近傍 ×4 は変わったタイル（筆 1 本あたり平均 19 枚）だけを描く。32px の筆そのものが 5.5〜5.9 ms、最近傍のタイルが 1〜2 ms。実行器の側で値を変えずに減らせるものは入れ終えた。さらに縮めるには、操作の実装（筆の描画か最近傍の範囲の描画）を速くする必要がある。4・16 スレッドでは p95 7.25・6.88 ms（1 回）。
+- **全面の塗りつぶし**（NFR-12。3 スレッドで p95 32.7〜33.7 ms。4 スレッドで 21.1・20.0 ms、16 スレッドで 7.5・6.9 ms（1 回））：4096² の全画素を書く操作そのものの時間と見ている（スレッドの数で縮む）。3 スレッドでの目標 30 ms に届かない。
+- **64px の筆**（NFR-12。範囲外。p95 23.3〜24.6 ms）：差分の計画と実行器はどちらも 0.1 ms 未満で、残りは筆を描く操作そのもの（前の筆の本数・スレッドの数によらない）。目標の範囲（筆は 32px まで）の外。
+- **減色のプレビュー**（NFR-11。範囲外）：目標の範囲の外（§16 の頭）。2048² の 16 色のスプライトでは p95 22.6〜22.8 ms（記録）。
+- 段 10 で解消したもの：8px の筆のあとに最近傍 ×4 が続く文書は、`render_cached` で等倍の全体を描いていたときは p95 18.1〜19.3 ms で未達だったが、表示の経路で 1.86〜2.17 ms になった。24MP の写真の引数の変更は、等倍で描くと p95 238〜268 ms（Lanczos3・鎖。段 10 の途中の値）だったが、段 2 の計画を表示の経路で描いて p95 0.16〜19.2 ms になった。
+
+### 16.4 段 10 の部品の実測
+
+- キャッシュ・差分の計画・範囲・変わった範囲・プレビューの段・セッション・メモリの見積もりの実測は、§12 の各項に書いた（§12.3〜§12.7・§12.10・§12.12）。
+- 値のダイジェストは、帯に詰めて 4096² の RGBA8 が 31 ms、24MP の RGB8 が 36 ms（§8.6。保存・一括の時間に入る）。
+
 ## 17. 受け入れテスト（`kura-engine` のテストとして実装する）
 
 | ID | 内容 |
 |---|---|
-| E1 | 同じ文書と入力で 2 回描くとダイジェストが一致する。スレッド数を 1・3・16 にしても一致する |
+| E1 | 同じ文書と入力で 2 回描くとダイジェストが一致する。スレッド数を 1・3・16 にしても一致する。ノードのキャッシュの有無（なし・冷えた・温まった・上限 0・小さい上限）でも、2 つのプール（4 と 12 スレッド）で別々のキャッシュを持って同時に描いても一致する（段 10。`tests/cache.rs` の `every_example_is_the_same_with_and_without_the_cache`・`two_pools_render_the_same`、kura-core の `two_pools_render_the_same_value_at_once`） |
 | E2 | 固定のコーデックだけの文書は、何度作り直しても値のダイジェスト（R1）が一致する。PNG と WAV は出力のバイト列（R2）も一致する |
 | E3 | 版 2 は「元＋版 1 と版 2 の操作」から作られ、版 1 の出力を経由しない。非可逆形式で 2 回保存しても、値は元から 1 回エンコードしたものと同じ |
-| E4 | 同じ文書を同じ元に当てると、エディタの経路（セッション）と一括の経路の出力がバイト単位で同じ |
+| E4 | 同じ文書を同じ元に当てると、エディタの経路（`EditSession`・差分の計画・ノードのキャッシュ・差分の適用。3 スレッド・キャッシュの上限 0〜1 GiB）と一括の経路（保存の JSON を別のエンジンで読み、キャッシュなしの `render`。1・16 スレッド）で、計画（指摘を含む）・出力の値・固定のコーデックで書いたバイト列（PNG・WAV）・警告が同じ。ランダムな編集の列（引数・追記・外す・置き換え・仮の値・まとめ方・取り消し・やり直し・中止・量子化を挟む）のどの時点でも（段 10 で書き換えた。`tests/e4.rs` の `random_edit_sequences_match_the_bulk_path`。差分の計画が `compile` と同じことは `compile_snapshot_equals_compile`、鍵が同じことは `session_keys_equal_compile_keys`、登録表の追記だけの配列の扱いが違うエンジンで `compile_snapshot` すると鍵を求め直してそのエンジンの `compile` と同じになることは `session_keys_follow_the_registry_of_the_engine`） |
 | E5 | 一括の対象の並びや件数を変えても、各アイテムの出力は変わらない |
 | E6 | 結果を変えた操作の旧版のノードは旧版の実装で描かれ、旧版のゴールデンと一致する |
 | E7 | 引数の形だけを変えた移行のあとも、旧版のゴールデンと一致する。文書のスキーマの移行も同じ |
@@ -793,16 +1206,19 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 | E15 | 格子・ピボット・スライス・ループ点・マーカーが §6 の表のとおりに写る。範囲の外に出たものは警告付きで落ちる |
 | E16 | 音声のトリムを 2 回するのは、合成した 1 回のトリムと同じ |
 | E17 | ゲイン 0dB と長さ 0 のフェードは何も変えない。int16・int24 → f32 → 元のビット数の往復はビット一致 |
-| E18 | 区間ごとに描いても（チャンク 1・7・4,096・全体）値が同じ |
+| E18 | 区間ごとに描いても（チャンク 1・7・4,096・全体）値が同じ。画像は、範囲（タイル）ごとに描いても、全体を描いたものの同じタイルと同じ。操作が申告した依存（`Reach`）の外の入力を変えても、範囲の中は変わらない。i64 の端に近い・負の大きな座標の要求も、出力のキャンバスに切ってあふれずに描け、遠い矩形を混ぜて畳んでも頼んだタイルを描く。量子化した出力も `render` と同じ（段 10。`tests/region.rs` の `reach_is_sound`・`region_equals_full_crop`・`render_area_matches_full`・`far_requests_are_clipped_to_the_canvas`・`quantized_outputs_match_render`、`render::region` の `rects_merge_cover_and_fold`） |
 | E19 | ラウドネスの計測が EBU Tech 3341 の試験信号で ±0.1 LU。正規化したあとの積分ラウドネスが目標の ±0.1 LU。LRA が EBU Tech 3342 の試験 1〜4 で 10・5・20・15 LU（段 8） |
 | E20 | WAV の smpl・cue、AIFF の MARK・INST、Ogg の LOOPSTART・LOOPLENGTH を読んで書いても保たれる（FLAC の LOOPSTART・LOOPLENGTH も往復を確かめる。Ogg の書き出しは段 7 で足した。他のツールで書いた Ogg のループ点も読む）。範囲の外・長さ 0・逆向きのループ点はどの形式も書かない。名前の重なるタグは 1 つだけ書き、書いて・読んで・書き直すと同じコメント（FLAC はバイト列も同じ、Ogg はシリアル番号と CRC を除いて同じ） |
-| E21 | 同じ点の列からは同じ画素ができる。差分で当てても全体を当て直しても同じ。ピクセルパーフェクトの規則どおり。TS と共有するベクタと一致する |
+| E21 | 同じ点の列からは同じ画素ができる。差分で当てても全体を当て直しても同じ。ピクセルパーフェクトの規則どおり。TS と共有するベクタと一致する。実行器の経路（セッションで追記し、キャッシュにある前の出力に差分を当てる `render_cached`）でも同じ。表示の経路（`render_view`。§12.8）でも、筆の追記は描画のノードを差分の適用で描き、表示の値が `render` と同じ（段 10。`tests/e4.rs` の `appended_in_executor_equals_full`、`tests/view.rs` の `view_redraws_only_changed_tiles_after_strokes`） |
 | E22 | 塗りつぶしは 4 連結・8 連結・許容差の定義どおりで、たどる順に左右されない |
-| E23 | スポイトが返す色とインデックスが、描画結果の画素と一致する |
-| E24 | 中止すると `Canceled` になり、途中までの値もファイルも出ない |
-| E25 | 上限を超える出力は推論の段階で `Limit` になり、描かない。壊れたファイル・展開爆弾で落ちない |
+| E23 | スポイトが返す色とインデックスが、描画結果の画素と一致する。スポイトは等倍の 1×1 の範囲を描いて拾い、縮小した段からは拾わない（段 10。`tests/region.rs` の `spoit_via_region`、`tests/preview.rs` の `level_values_are_not_for_saving`） |
+| E24 | 中止すると `Canceled` になり、途中までの値もファイルも出ない。キャッシュの道・範囲の描画・継ぎはぎ・予算の待ち・新しい要求（予約）による中止でも同じで、中止したノードの値はキャッシュに残らない（描き終えた前段の完全な値は残ってよい）（段 10。`tests/cache.rs` の `cancel_keeps_the_cache_consistent`、`tests/region.rs` の `cancel_in_region_and_patch`、`tests/budget.rs` の `cancel_while_waiting_for_the_budget`、`monitor::tests::superseded_renders_are_canceled`） |
+| E25 | 上限を超える出力は推論の段階で `Limit` になり、描かない。壊れたファイル・展開爆弾で落ちない。メモリの予算を超える計画は、見積もりの段階で `Limit` になり、操作が 1 つも動かない。見積もりは、描いた値で数えた生きている値以上（段 10。`tests/budget.rs` の `over_budget_plans_fail_before_rendering`・`estimate_bounds_every_example`・`estimate_bounds_chains`）。作業領域の申告は、データで量の変わる確保（塗りつぶしの集合と待ち行列・ストローク、aseprite のファイルと持っておくセル）を覆い、読むファイルの長さが見積もりに届く（`ops::paint::actions` の `work_covers_the_fill_and_stroke_buffers`・`paint::fill` の `work_counts_the_masks_and_the_whole_queue`・`codec::aseprite` の `work_covers_the_file_and_the_retained_cels`・`tests/budget.rs` の `file_lengths_reach_the_decoder_estimate`）。エディタが追い出しても足りずに `Limit` のときは、キャッシュの上限と確保を元に戻す（`interactive_fails_when_pinned_values_fill_the_budget`・`interactive_limit_after_eviction_restores_the_capacity_and_lease`）。今の取り置きとエディタのキャッシュの確保のもとで通りえない一括は駐車して、後ろの収まる一括を塞がない（`budget::tests::requests_over_the_reservation_park_and_do_not_block`・`standing_interactive_over_the_reservation_parks`・`tests/budget.rs` の `an_editor_lease_over_the_reservation_does_not_block_a_save`） |
 | E26 | 解析と操作が一致する。申告した解析を実行器が渡した値と別に求めた値が同じで、操作はその値を使う（登録されたすべての操作の例）。意味の対：不透明な範囲とトリムで切り取る範囲、ラウドネスの値と正規化で使う値、色数とパレットへの変換、倍率と最近傍のリサイズ、格子と分割、無音とトリム、ループ点とループの設定、透過と形式の能力。登録されたすべての解析が対の表か「対のない解析」の表に載る（§11.5） |
 | E27 | aseprite の合成が、照合相手の実装と一致する。段 4 の asefile との照合（300 個のランダムな絵。`tests/aseprite_ref.rs`）で満たす（段 8 でユーザーが決めた。Aseprite 本体で書き出したフィクスチャとは照らさない。ADR-152） |
 | E28 | 自作の Ogg Vorbis の出力が、独立したデコーダ 2 つ以上（symphonia・lewton）で読め、長さ・位置・ループのコメントが保たれる。ページが §9.7 の規則に従い（「長・次は短」が途中と最後の前に来る実際の出力でも）、品質の段・スレッド数・チャンネルとレートの範囲が約束どおり。NaN・±∞ を含む入力が 0・±1 に置き換えた入力と同じバイト列（シリアル番号と CRC を除く）、3〜8 チャンネルの並びを lewton と仕様の表で確かめる（`tests/ogg_vorbis.rs` と `codec::vorbis::encoder` のテスト） |
 | E29 | Platform・External のコーデックを通った版は、デコードのダイジェストとコーデックの識別子（と環境の版）が記録され、変わったら検出される（失敗ではなく食い違いとして返す）。アンカーがあればアンカーから作り直し、出力が記録と同じになる。壊れたアンカーは見分ける（`tests/e29.rs`。偽の Platform のデコーダで Linux でも回る） |
-| E30 | §16 の性能（`#[ignore]` 付きのベンチテストと `kura-devtools bench edit`） |
+| E30 | §16 の性能を、`tests/bench_edit.rs`（`#[ignore]`）と `kura-devtools bench edit` で測り、§16 と architecture.md §13 に判定つきで記録する。NFR-11・12 の時間は表示の経路（`EditorPath::show`・`render_preview` → `Engine::render_view`。写真は段 2 の計画で、段 1 も記録）で測り、NFR-16 は同じエディタの経路で等倍の全体を描いたダイジェスト（`render_cached`。`EditorPath::digests`）を一括の経路のものと照らす。テストが断言するのは正しさだけ（エディタの経路と一括の経路のダイジェストが同じ、予算を超える計画は描く前に `Limit`、見積もりが実際以上）で、時間は表に出すだけ（段 10 で書き換えた。`e30_preview`・`e30_stroke`・`e30_save_bulk_analysis`・`e30_memory`、kura-devtools の `quick_writes_a_record_for_every_nfr`。目標の範囲の外（32px を超える筆・減色のプレビュー）を達成・未達にしないことは `out_of_scope_records_are_not_judged`） |
+| E31 | 変わった範囲の推論は保守的：ランダムな文書へのランダムな編集の前後を全体で描いた差が、推論した範囲（`Engine::delta`）に入る。`render_cached` が報告する変わったタイル（`Arc` の同一性で絞ったもの）は、中身の変わったタイルを含み、推論の範囲の中にある（段 10。`tests/delta.rs` の `inferred_delta_contains_actual`・`changed_tiles_by_identity`。局所の編集が全体に落ちないことは `local_edits_do_not_fall_to_all`、継ぎはぎが毎回まっさらに描いたものと同じことは `incremental_equals_fresh`）。ランダムな手（`testing::region` の `random_edit`・`random_step`。種類は `EDIT_KINDS`・`STEP_KINDS`）は、ノード 1 つの引数・描画への追記・途中の動作の差し替え・有効の切り替え・フェードの長さ・ループ点・メタデータ・canvas の fill だけ・種だけと、線形の列の構造の手（置き換え・消す・動かす・足す）、2〜3 手をまとめて途中の版を飛ばすもの（`multi`）、入力の値だけの変更（`random_step_or_input`）。決まった場合：Indexed8 の上流でパレットだけが変わると後ろは全体（`palette_changes_upstream_stay_all`）、元・エンジン・段の違いで全体（`delta_falls_to_all_for_other_sources_engines_or_levels`）、持ち上げた canvas の fill だけの変更が全フレームに広がる（`lifted_param_change_spans_all_frames`）、前の値で無効だったタイルを同じ実体でも報告する（`refine_reports_tiles_that_were_holes`）、継ぎはぎが前の値のパレットの違いで断ったら前の値なしで描き直す（`render_area_redraws_without_a_base_of_another_palette`）。段 10 の検証で抜けを見つけた種でも回す（`inferred_delta_contains_actual_on_found_seeds`）。表示の経路（`render_view`。§12.8）の報告も、表示する範囲の中で中身の変わったタイルを含み、推論と「前回は無効で今回描いたタイル」の中にあり、表示する範囲のタイルは `render` と同じ（`tests/view.rs` の `view_equals_render_on_random_edit_sequences`・`view_equals_render_on_found_seeds`・`view_redraws_only_changed_tiles_after_strokes`・`view_at_levels_equals_the_level_render`・`view_follows_a_moving_viewport`・`view_handles_palette_changes_upstream`）。表示の値から配信に要るもの（形式・パレット・メタデータ・フレームの表示時間と繰り返し）が取れる（`view_values_expose_what_delivery_needs`） |
+| E32 | プレビューの段：段 0（と段 0 に落ちた計画）は `render` とビット単位で同じ。段 1〜3 はスレッドの数によらず同じで、縮めた引数が段の形で推論を通る（通らなければ段 0 に落ちる）。継ぎ目までのノードは、等倍の計画と同じ指紋・同じ値。段の値は保存・解析・スポイト・ダイジェストに使えない（段 10。`tests/preview.rs` の `level0_equals_render`・`preview_deterministic`・`scaled_params_infer`・`prefix_before_switch_is_exact`・`level_values_are_not_for_saving`・`fallback_reasons`・`choose_level_rules`。今の登録表の操作では届かない段 0 に落ちる理由（`Infer`・`Analysis`）と Skip の操作を外す道は、試験用の操作で `fallback_reasons_of_level_nodes`。近似の程度は `preview_approximates`） |
+| E33 | `EditSession`：素朴な参照の実装（文書を丸ごと写す）と、ランダムな編集の列のどの手のあとでも、同じ文書（正規の JSON）・Rev・取り消しの可否・履歴の長さ・誤りの種類・鍵になる。同じ列を 2 回当てると同じ Rev・鍵・文書。まとめ方・仮の値・上限・構造の手・検証（E8・E25）が約束どおりで、頭の文書から作り直すと同じ文書・同じ鍵になり、`to_graph` を compile・render すると素直に組んだ文書と同じ値（段 10。`tests/session.rs` の `matches_the_naive_model_on_random_sequences`・`same_sequence_gives_same_revs_keys_and_documents`・`reopening_from_the_head_gives_the_same_document_and_keys`・`to_graph_compiles_and_renders_like_the_plain_document` ほか） |

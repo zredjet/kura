@@ -24,9 +24,9 @@
 
 ```
 Cargo.toml                 # workspace
-crates/kura-core/          # OS 非依存のドメインロジック（DB, 取り込み, 検索, ユニット, プレイリスト, ジョブ, 編集の ffmpeg の段）
+crates/kura-core/          # OS 非依存のドメインロジック（DB, 取り込み, 検索, ユニット, プレイリスト, ジョブ, 編集の ffmpeg の段・実行の場）
 crates/kura-core/migrations/  # SQL マイグレーション（連番、既存は編集禁止）
-crates/kura-engine/        # 編集の操作エンジン：文書・操作・描画・解析・コーデック（OS・DB 非依存）
+crates/kura-engine/        # 編集の操作エンジン：文書・操作・描画・解析・コーデック・エディタのセッション（OS・DB 非依存）
 crates/vorbis-tables/      # Ogg Vorbis のエンコーダの表（aoTuV から生成。BSD-3）と照合用の C の組み方（oracle/）
 crates/kura-mac/           # macOS 専用：サムネイル, メディア情報, スナップショット, 編集の Platform のコーデック（Swift ヘルパー）
 crates/kura-devtools/      # ダミーライブラリ生成・ベンチマーク

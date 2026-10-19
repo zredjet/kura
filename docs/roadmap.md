@@ -180,9 +180,9 @@
 - [x] 段 7 自作の Ogg Vorbis エンコーダ（ADR-149）：aoTuV b6.03（前増幅を除く）の移植と照合用のエンコーダとのビット一致、Ogg の多重化（自作の切り方）、ループ点のコメント、1〜8 チャンネル・8〜192 kHz・品質 −1〜10、表のクレート `vorbis-tables`、symphonia の Vorbis の修正（`third_party/`）、品質の記録（`kura-devtools vorbis-quality`）、ファズ（E28・E20）。Godot 4.7.2 での読み込み・再生・ループをユーザーが確かめた（長さ 0 の音声だけは取り込めない）
 - [x] 段 8 解析（ADR-152）：解析の枠組み（版・正規の形・ゴールデン）、操作が解析を申告する口（正規化・トリムを移す）、透過・不透明な範囲・色数・ドット絵の倍率（変わり目の位置）・格子の推定・波形の段・ラウドネスと LRA・無音・ループ点（E26。E27 は asefile との照合で満たす）
 - [x] 段 9 macOS と外部ツール（ADR-153）：FFI でのバッファの受け渡し（ADR-37 の改訂）、ImageIO の読み取り・AudioToolbox の読み取りと AAC の書き出し、`kura_codec_caps` と能力の表、ffmpeg の段（読み取りと MP3 の書き出し）、Ogg Vorbis・AAC の値の再現（symphonia の libm への差し替え）、アンカー（E29）
-- [ ] 段 10 実行器・プレビュー・セッション・ベンチ：ノードのキャッシュ、プレビューの段、範囲とタイルの描画、変わった範囲の推論、`EditSession`、メモリの予算、`kura-devtools bench edit`（E30、NFR-11〜17 の実測を architecture.md §13 に）
+- [x] 段 10 実行器・プレビュー・セッション・ベンチ（ADR-154）：ノードのキャッシュ（指紋・`NodeCache`・`render_cached`）、差分の計画と差分の適用（`compile_snapshot`・`parse_appended`）、プレビューの段（`plan_level`。E32）、範囲とタイルの描画（`render_area`・スポイト）、変わった範囲の推論（E31）、エディタの表示の経路（`render_view`。前回の表示から変わったタイルだけを描き直す。E31。NFR-11・12 はこの経路で測る）、`EditSession`（E33）、メモリの予算と見積もり（`MemoryBudget`・`estimate`・作業領域の申告）、予約（`Latest`・`Ticket`）、kura-core の `EngineRuntime`（プレビューと一括の 2 つのプール）、`kura-devtools bench edit`（E30、NFR-11〜17 の実測を architecture.md §13 に）と `mem_smoke`
 
-**完了条件**：docs/editing.md §17 の E1〜E30 が macOS で通る／CI の ubuntu で整数のゴールデンが一致する／各ファズを決めた時間だけ回して落ちない／NFR-11〜17 の実測を記録する／`/verify` が通る
+**完了条件**：docs/editing.md §17 の E1〜E33 が macOS で通る／CI の ubuntu で整数のゴールデンが一致する／各ファズを決めた時間（cargo-fuzz の `-fork` で全対象を各 10 分、stable の変異で各 60 秒。ADR-154）だけ回して落ちない／NFR-11〜17 の実測を記録する／`/verify` が通る
 
 **依頼文**
 > docs/roadmap.md の M10 の次の段を進めてください。正本は docs/editing.md です。段ごとに、まず §17 の受け入れテストのうちその段の分を失敗する形で書き、実装して `/verify` を通したら、検証ワークフローを回してから直してコミットしてください。
@@ -218,7 +218,7 @@
 - [ ] 画像エディタ（汎用の引数パネル、切り抜きの枠、描画の道具、スポイト）、エディタの中の ⌘Z（ADR-141）、下書きからの回復
 - [ ] 書き出しの名前（拡張子が変わったとき）、整合性チェックの追加
 
-**完了条件**：保存の受け入れテスト（S1〜）が通る／各段階で強制終了しても食い違いが 0 件／NFR-11〜13 を満たす／エディタを開いても NFR-07 の範囲
+**完了条件**：保存の受け入れテスト（S1〜）が通る／各段階で強制終了しても食い違いが 0 件／NFR-11〜13 を満たす／エディタを開いてもライブラリの表示の分は NFR-07 の範囲（エディタの値とキャッシュは NFR-17 の予算で別に数え、閉じたら捨てる。ADR-154）
 
 **依頼文**
 > docs/roadmap.md の M12 を進めてください。正本は docs/editing.md §14 です。最初に保存の受け入れテストを docs/editing.md に足す案を出し、エディタの UI は docs/design.md §3.1 に沿って構成を文章で提案してから作ってください。
