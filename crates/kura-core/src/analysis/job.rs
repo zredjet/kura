@@ -113,16 +113,35 @@ struct Counts {
     reused: u64,
     reprojected: u64,
     skipped: u64,
+    /// 読んで解いた 1 件ごとの時間（ミリ秒。ヘッダの読み取りから結果を作るまで）。
+    read_ms: Vec<f64>,
+}
+
+/// 並べた列の p（0〜100）パーセンタイル（最も近い順位）。
+fn percentile(sorted: &[f64], p: usize) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (sorted.len() * p).div_ceil(100).clamp(1, sorted.len());
+    sorted[rank - 1]
 }
 
 impl Counts {
     fn summary(&self) -> String {
+        let mut ms = self.read_ms.clone();
+        ms.sort_by(f64::total_cmp);
         serde_json::json!({
             "done": self.done,
             "failed": self.failed,
             "reused": self.reused,
             "reprojected": self.reprojected,
             "skipped": self.skipped,
+            "readMs": {
+                "count": ms.len(),
+                "p50": percentile(&ms, 50),
+                "p95": percentile(&ms, 95),
+                "max": ms.last().copied().unwrap_or(0.0),
+            },
         })
         .to_string()
     }
@@ -596,7 +615,11 @@ impl Run<'_> {
                 hash: hash_hex.clone(),
             })?;
         }
+        let started = Instant::now();
         let step = self.decode_and_solve(item, format, &path, &hash_hex)?;
+        self.counts
+            .read_ms
+            .push(started.elapsed().as_secs_f64() * 1000.0);
         Ok(match step {
             Step::Write { write, reused, .. } => Step::Write {
                 write,
@@ -723,5 +746,19 @@ impl Run<'_> {
             platform: false,
             reused: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile;
+
+    #[test]
+    fn percentiles_use_the_nearest_rank() {
+        let v: Vec<f64> = (1..=100).map(f64::from).collect();
+        assert_eq!((percentile(&v, 50), percentile(&v, 95)), (50.0, 95.0));
+        assert_eq!(percentile(&[3.0], 95), 3.0);
+        assert_eq!(percentile(&[], 50), 0.0);
+        assert_eq!(percentile(&[1.0, 2.0], 50), 1.0);
     }
 }

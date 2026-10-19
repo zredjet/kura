@@ -3,13 +3,16 @@
 //! - `import --library <path> [--create] [<src>...]`：取り込む（<src> を省くと、中断していた取り込みの再開だけ待つ）
 //! - `download --library <path> <url>...`：アプリと同じジョブで取得してライブラリに入れる（M7 の確認用）
 //! - `check --library <path>`：件数と整合性（DB とファイルの食い違い）を表示する
-//! - `seed --items <件数> --out <path>`：ダミーライブラリを作る（グリッドと起動時間の計測用）
+//! - `seed --items <件数> --out <path> [--analysis pending|ready]`：ダミーライブラリを作る（グリッドと起動時間の計測用。
+//!   `--analysis ready` は画像・音声に偽の事実を入れて解析済みにする）
 //! - `selftest-library --out <path> [--web <dir>] [--font <ttf>]`：kura:// と CSP を実機で確かめるライブラリ
 //!   （`VITE_KURA_SELFTEST=1` のフロントが試す。`selftest` の冒頭）
 //! - `bench query --library <path>`：一覧の取得の速さを測る
 //! - `bench thumbs --src <画像のフォルダ> [--threads N]`：画像サムネイルの速さを測る（NFR-04）
 //! - `bench migrate (--library <path> | --items <件数> [--history]) [--runs 3]`：マイグレーションの時間と照合
 //!   （docs/data-model.md §5。`bench_migrate` の冒頭）
+//! - `bench analyze --kind image|audio [--limit N] [--src <dir>] [--json <file>]`：解析のジョブの件数/秒・1 件の
+//!   p50・p95・ピークのメモリ（`bench_analyze` の冒頭）
 //! - `bench edit [--quick] [--threads 3,4,16] [--photo <file>] [--json <file>] [--markdown <file>] …`：編集の性能
 //!   （NFR-11〜17。`bench_edit` の冒頭）
 //! - `edit shape --in <file>` / `edit render --doc <文書.json> --in <file> --out <file>`：編集のエンジンを手で確かめる（docs/editing.md）
@@ -17,6 +20,7 @@
 //!   自作の Ogg Vorbis のエンコーダの品質を記録する（M10 段 7。`vorbis_quality` の冒頭）
 
 mod bench;
+mod bench_analyze;
 mod bench_edit;
 mod bench_migrate;
 mod edit;
