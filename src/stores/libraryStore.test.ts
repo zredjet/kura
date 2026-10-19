@@ -45,6 +45,15 @@ describe('起動のときに前回のライブラリを開く', () => {
     expect(useLibraryStore.getState().status).toBe('open');
   });
 
+  it('続けて呼ばれても（開発時の StrictMode の 2 回の effect）、開くのは 1 回だけ', async () => {
+    // 同じライブラリを 2 つ並べて開くと、新しい版にする前のバックアップがぶつかって両方失敗する（実測）
+    vi.mocked(restoreLibrary).mockResolvedValue({ info, lastPath: info.path });
+    await Promise.all([useLibraryStore.getState().restore(), useLibraryStore.getState().restore()]);
+    await useLibraryStore.getState().restore();
+    expect(restoreLibrary).toHaveBeenCalledTimes(1);
+    expect(useLibraryStore.getState().status).toBe('open');
+  });
+
   it('開けなかった理由があれば、見つからないとは言わずに理由と場所を持つ', async () => {
     const error = {
       code: 'NoSpace',
