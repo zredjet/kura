@@ -1121,3 +1121,26 @@ fn tile_details_join_facts_and_settings_without_scanning() {
     );
     assert!(!plan.contains("SCAN"), "{plan}");
 }
+
+#[test]
+fn nothing_replaces_rows_of_items() {
+    // REPLACE は行を消してから入れるので、子の行が CASCADE で消える（.claude/rules/database.md）
+    let banned = concat!("REPLACE", " INTO ITEMS");
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for entry in walkdir::WalkDir::new(&src) {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(entry.path())
+                .unwrap()
+                .to_uppercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                !text.contains(banned),
+                "{} に {banned}",
+                entry.path().display()
+            );
+        }
+    }
+}
