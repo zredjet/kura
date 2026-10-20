@@ -939,7 +939,7 @@ impl Engine {   // 段 10 で足したもの
 - M11 の使い手（kura-core。M11 の決定 2・8）：エディタのほかに、解析・サムネイル・試聴の PCM・アニメの帯が、ライブラリごとの同じ予算とプール（§12.11）を使う。
   - 解析のジョブとエンジンの道のサムネイルは一括（`Class::Bulk`）。どちらもジョブのスレッド（プールの外）で形を読んで見積もり、確保を待ってから一括のプールの中で読む・描く。ジョブが動いている間のメモリは NFR-07 の外として別に記録する（NFR-07 は表示の分）。
   - サムネイル（`media::engine_thumbs`）：同時の確保は 256 MiB まで（`INFLIGHT_CAP`）。見積もりの和がこれに収まるように小分けにし、小分けごとに確保する。1 件で超えるものは 1 件だけの小分けにする（予算の全体を超えれば確保で `Limit`）。値が 1 GiB（`VALUE_CAP`）を超えるもの・`Limit`・読めないものは、画像なら ImageIO の道へ回し、3D は種類の絵にする。
-  - 解析（`analysis::job`）：1 件の見積もり（値の 2 倍 ＋ デコーダの作業領域）が min(予算/2, 1 GiB)（`ITEM_CAP`）を超えるものは、確保せずに失敗（`too_large`）にする。
+  - 解析（`analysis::job`）：1 件の見積もり（値の 2 倍 ＋ デコーダの作業領域）が min(予算/2, 1 GiB)（`ITEM_CAP`）を超えるものは、確保せずに失敗（`too_large`）にする。音声のデコーダは作業領域を値と同じに見積もるので音声は値の 3 倍になり、予算が 2 GiB 以上（物理メモリ 8 GB 以上）では 44.1 kHz ステレオで約 16.9 分・48 kHz ステレオで約 15.5 分を超える音声は解析しない（docs/requirements.md の「解析の長さの範囲」）。
   - 試聴の PCM（`/pcm`）とアニメの帯（`item_anim_get`）は対話（`Class::Interactive`）で、待たない（`try_acquire`）。利用者がその場で待つ短い表示の用意なのでジョブにしない。空いていなければ PCM は 503、帯は `Busy`。予算の全体を超える帯は `TooLarge`。読む・組むのはプレビューのプール。PCM は読んだ値を 1 件だけ覚え、その間は確保を持つ（60 秒使わなければ捨てる）。
 - 確保器（M11。ADR-163）：アプリと kura-devtools は、1 MiB 以上の確保を `mmap` で取り `munmap` ですぐ OS へ返す `kura_mac::ReturningAllocator` を `#[global_allocator]` にした（libmalloc の large cache が解析・サムネイルのあとも空の領域を 445 MB 抱え、NFR-07 に戻らなかったため。`MallocLargeCache` は文書にない設定なので使わない）。下の段 10 の実測と見積もりの式（持ち越し）は libmalloc のときのもので、式は変えていない。
 - 見積もり（`Engine::estimate`）：描かない純粋な関数。ヘッダから読んだ形で compile した計画で、読む前に呼べる。条件（`EstimateSpec`）は、入力の来し方（`Source::Held`（予算の外で数えている値。エディタの入力）・`Memory`・`Decode { codecs, format }`・`Decoder { decoder, format }`）、読む入力のファイルの長さ（`lens`。`EstimateSpec::input_len`。分かるものだけ）、書き出し（`Sink::Encode`・`Encoder`）、並列の数（`Work::total` に渡す）、ダイジェストを取るか。段ごとの量は、その段で生きている値と作業領域の最大。

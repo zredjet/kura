@@ -330,6 +330,20 @@ fn stamp_of(s: &DecodeStamp) -> ReadStamp {
     }
 }
 
+/// 1 件の見積もり：値の [`WORK_FACTOR`] 倍 ＋ デコーダの作業領域（音声のデコーダは作業領域を値と同じに見積もるので、音声は
+/// 値の 3 倍。値は フレーム数 × チャンネル数 × 4 バイト）。
+fn estimate(codecs: &CodecSet, format: &str, shape: &kura_engine::Shape, len: u64) -> u64 {
+    value_bytes(shape)
+        .saturating_mul(WORK_FACTOR)
+        .saturating_add(codecs.decode_file_work_bytes(format, shape, len))
+}
+
+/// 1 件の確保の上限：min(予算の全体/2, [`ITEM_CAP`])（決定 2）。予算は min(物理メモリ/4, 4 GiB) なので、物理メモリが 8 GB
+/// 以上なら 1 GiB。
+fn item_cap(total: u64) -> u64 {
+    (total / 2).min(ITEM_CAP)
+}
+
 /// 波形の段をファイルに置く（staging の一時ファイルに書いてから改名する。DB に書く前に呼ぶ）。
 fn write_peaks(layout: &Layout, hash_hex: &str, bytes: &[u8]) -> Result<()> {
     let dest = layout.peaks_path(hash_hex);
@@ -691,10 +705,8 @@ impl Run<'_> {
             }
         };
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let need = value_bytes(&shape)
-            .saturating_mul(WORK_FACTOR)
-            .saturating_add(self.codecs.decode_file_work_bytes(format, &shape, len));
-        let cap = (self.runtime.budget().total() / 2).min(ITEM_CAP);
+        let need = estimate(&self.codecs, format, &shape, len);
+        let cap = item_cap(self.runtime.budget().total());
         if need > cap {
             self.ctx.log(&format!(
                 "アイテム {}: 大きすぎるので解析しません（見積もり {need} バイト・上限 {cap} バイト）",
@@ -791,7 +803,37 @@ impl Run<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::percentile;
+    use super::{CodecSet, ITEM_CAP, estimate, item_cap, percentile};
+    use kura_engine::{Dim, Shape};
+
+    /// 解析しない長さの目安（docs/requirements.md の「NFR-07 の範囲」・ADR-158 (5)）：物理メモリが 8 GB 以上なら 1 件の上限は
+    /// 1 GiB で、音声の見積もりは値の 3 倍なので、44.1 kHz ステレオは約 16.9 分、48 kHz ステレオは約 15.5 分、96 kHz ステレオは
+    /// 約 7.8 分、44.1 kHz モノラルは約 33.8 分を超えると読まずに too_large になる（E4。docs の数を変えたらここも直す）。
+    #[test]
+    fn long_audio_is_too_large_beyond_the_documented_length() {
+        let codecs = CodecSet::pinned();
+        let audio = |rate: u32, channels: u16, secs: u64| Shape::Audio {
+            rate,
+            channels,
+            frames: Dim::Exact(u64::from(rate) * secs),
+        };
+        assert_eq!(item_cap(4 << 30), ITEM_CAP);
+        assert_eq!(item_cap(2 << 30), ITEM_CAP, "物理メモリ 8 GB");
+        assert_eq!(item_cap(1 << 30), 512 << 20);
+        let fits = |format: &str, rate, channels, secs| {
+            estimate(&codecs, format, &audio(rate, channels, secs), 0) <= ITEM_CAP
+        };
+        for format in ["wav", "flac", "aiff"] {
+            assert!(fits(format, 44_100, 2, 1014), "{format}");
+            assert!(!fits(format, 44_100, 2, 1015), "{format}");
+            assert!(fits(format, 48_000, 2, 932), "{format}");
+            assert!(!fits(format, 48_000, 2, 933), "{format}");
+            assert!(fits(format, 96_000, 2, 466), "{format}");
+            assert!(!fits(format, 96_000, 2, 467), "{format}");
+            assert!(fits(format, 44_100, 1, 2028), "{format}");
+            assert!(!fits(format, 44_100, 1, 2029), "{format}");
+        }
+    }
 
     #[test]
     fn percentiles_use_the_nearest_rank() {
