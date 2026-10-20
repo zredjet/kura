@@ -373,6 +373,87 @@ describe('ループの試聴', () => {
   });
 });
 
+// 長さ（フレーム）は DB にないので、/pcm の応答（同じ読み取り）で知ってから計画する（素材の欄・L のキー）
+describe('長さを知らないで始める試聴', () => {
+  function probing(truth: Parameters<typeof fakeSource>[0]) {
+    const log: string[] = [];
+    const factory = fakeFactory(log);
+    const src = fakeSource(truth);
+    const scheduled: { hash: string; mode: string; rate: number; frames: number[] }[] = [];
+    const audition = new Audition({
+      pool: new ContextPool(factory.create),
+      fetchPcm: async (h, a, b) => {
+        log.push(`fetch:${a}-${b}`);
+        return src.fetchPcm(h, a, b);
+      },
+      volume: () => 1,
+      onScheduled: (s) =>
+        scheduled.push({
+          hash: s.hash,
+          mode: s.plan.mode,
+          rate: s.rate,
+          frames: s.pcms.map((p) => p.frames),
+        }),
+    });
+    return { audition, factory, log, scheduled };
+  }
+
+  it('先頭の 1 フレームを取り、応答の長さ・ループ点で計画する（resume は取る前）', async () => {
+    const { audition, log, scheduled } = probing({
+      rate: R,
+      channels: 2,
+      total: R * 20,
+      loop: [R, R * 11],
+    });
+    const out = await audition.startProbed('h', { rate: R, channels: 2 });
+    expect(out.status).toBe('playing');
+    if (out.status === 'playing') {
+      expect(out.facts).toEqual({ frames: R * 20, rate: R, channels: 2, loop: [R, R * 11] });
+    }
+    expect(log).toEqual([`create:${R}`, 'resume', 'fetch:0-1', `fetch:${R}-${R * 11}`]);
+    expect(scheduled).toEqual([{ hash: 'h', mode: 'loop', rate: R, frames: [R * 10] }]);
+  });
+
+  it('ループ点がなければ全体を回す。応答のレート・チャンネルが違えば試聴しない', async () => {
+    const whole = probing({ rate: R, channels: 1, total: R * 2, loop: null });
+    const out = await whole.audition.startProbed('h', { rate: R, channels: 1 });
+    expect(out.status).toBe('playing');
+    expect(whole.log.slice(-1)).toEqual([`fetch:0-${R * 2}`]);
+
+    const rate = probing({ rate: R * 2, channels: 1, total: R * 2, loop: null });
+    expect((await rate.audition.startProbed('h', { rate: R, channels: 1 })).status).toBe(
+      'unsupported',
+    );
+    const ch = probing({ rate: R, channels: 2, total: R * 2, loop: null });
+    expect((await ch.audition.startProbed('h', { rate: R, channels: 1 })).status).toBe(
+      'unsupported',
+    );
+    expect(ch.scheduled).toEqual([]);
+  });
+
+  it('鳴っている位置を元のファイルのフレームで返す（止めたら null）', async () => {
+    const { audition, factory } = probing({
+      rate: R,
+      channels: 2,
+      total: R * 20,
+      loop: [R, R * 11],
+    });
+    expect(audition.position()).toBeNull();
+    await audition.startProbed('h', { rate: R, channels: 2 });
+    const ctx = factory.contexts[0] as { currentTime: number } | undefined;
+    const body = factory.contexts[0]?.sources[0];
+    if (!ctx || !body?.started) throw new Error('鳴らしていない');
+    const t0 = body.started[0];
+    // 継ぎ目の 3 秒前から：1 秒後は継ぎ目の 2 秒前、4 秒後は本体の始まりから 1 秒
+    ctx.currentTime = t0 + 1;
+    expect(audition.position()).toBe(R * 11 - R * 2);
+    ctx.currentTime = t0 + 4;
+    expect(audition.position()).toBe(R + R);
+    audition.stop();
+    expect(audition.position()).toBeNull();
+  });
+});
+
 describe('文脈の使い回し（元のレートごとに 1 つ）', () => {
   it('同じレートは使い回し、別のレートは別に作る。上限を超えたら古いものを閉じる', () => {
     const { create, contexts } = fakeFactory();

@@ -1,4 +1,4 @@
-import { useEffect, useId } from 'react';
+import { useCallback, useEffect, useId, useRef } from 'react';
 
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
@@ -13,6 +13,9 @@ import { formatCount } from '../../lib/format';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
+import { FontSpecimen, QuickLookAnim, useFontFace } from '../asset/AssetStage';
+import { useAssetData } from '../asset/useAssetData';
+import { WaveformView } from '../asset/WaveformView';
 import styles from './QuickLook.module.css';
 
 const t = ja.quickLook;
@@ -29,6 +32,13 @@ export function QuickLook() {
 
   const index = selectedId !== null && ids ? ids.indexOf(selectedId) : -1;
   const item = selectedId !== null ? getCached(selectedId) : undefined;
+  // 素材（M11）：アニメは帯を canvas で回し、音声は波形と再生の位置を出す
+  const assetData = useAssetData(open && item && item.kind !== 'video' ? item.id : null);
+  const asset = assetData.asset?.itemId === item?.id ? assetData.asset : null;
+  const anim = asset && assetData.anim.status === 'ready' ? assetData.anim.anim : null;
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const audioSeconds = useCallback(() => audioRef.current?.currentTime ?? null, []);
+  const specimen = useFontFace(open && item?.kind === 'font' ? item.hash : null);
 
   useEffect(() => {
     if (open && selectedId !== null && !item) {
@@ -76,7 +86,10 @@ export function QuickLook() {
       </header>
 
       <div className={styles.stage}>
-        {item?.kind === 'image' && (
+        {asset && anim && (
+          <QuickLookAnim key={`${anim.hash}:${anim.rev}`} asset={asset} anim={anim} />
+        )}
+        {item?.kind === 'image' && !anim && (
           // 元のファイル（ブラウザで表示できない形式は大きいサムネイル）。透過は市松模様、ドット絵は整数倍
           <MediaImage
             key={item.id}
@@ -103,11 +116,30 @@ export function QuickLook() {
             <MediaImage source={item} size="l" fit="cover" className={styles.art} />
             {/* 手元のメディアには字幕ファイルがない */}
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-            <audio src={playUrl(item.hash)} controls autoPlay />
+            <audio ref={audioRef} src={playUrl(item.hash)} controls autoPlay />
+            <WaveformView
+              hash={item.hash}
+              version={asset?.facts?.analyzedAt ?? null}
+              loop={
+                asset?.facts?.audio.loopRange
+                  ? [asset.facts.audio.loopRange.start, asset.facts.audio.loopRange.end]
+                  : null
+              }
+              positionSeconds={audioSeconds}
+              className={styles.wave}
+            />
           </div>
         )}
-        {/* フォント・3D：描いたサムネイル（フォントは字の形を mask にする）。なければ種類の絵 */}
-        {item && !isPlayable(item.kind) && (
+        {item?.kind === 'font' && specimen && (
+          <FontSpecimen
+            key={item.id}
+            family={specimen}
+            name={asset?.font?.family ?? item.title}
+            className={styles.specimen}
+          />
+        )}
+        {/* フォント（見本を読めるまで）・3D：描いたサムネイル（フォントは字の形を mask にする）。なければ種類の絵 */}
+        {item && !isPlayable(item.kind) && !(item.kind === 'font' && specimen) && (
           <MediaImage
             key={item.id}
             source={item}

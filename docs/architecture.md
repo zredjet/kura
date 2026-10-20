@@ -113,7 +113,7 @@
 | ツール | `tools_status()` → `ToolInfo[]` / `tools_set_path(tool, path?)` / `tools_update()` → `{ brewCommand?, outputs }` | 版・場所・Homebrew 版か。場所の指定（app.json）。「更新を確認」（ADR-100） |
 | 設定 | `settings_get(keys)` / `settings_set(map)` | |
 | 外観 | `appearance_get()` → `Appearance` | OS の表示設定（「透明度を下げる」）。起動時に `<html data-reduce-transparency>` へ反映する（§11） |
-| 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測と、`VITE_KURA_SELFTEST=1` の自己点検（§4.2）の結果をログに書く（§13） |
+| 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測と、`VITE_KURA_SELFTEST=1` の自己点検（§4.2）・`VITE_KURA_CHECK=1` の試聴の継ぎ目の自己点検（`audition-seam`）の結果をログに書く（§13） |
 
 変更（patch）の型は、省いた項目を変えない。色・メモの空文字は「消す」の意味（`Option<Option<T>>` を JSON で表しにくいため）。
 
@@ -138,7 +138,8 @@
 - `{hash}` は 64 桁の小文字 16 進だけを受け付ける。それ以外とファイルがないものは 404、ライブラリが開かれていなければ 503。`/pcm` の `{start}-{end}` は `start < end` の 10 進（u64 にあふれるもの・逆の範囲・片側だけは 404）。
 - 実際の置き場所：`thumbs/ab/<hash>_s.{png,jpg}`・`_l.{png,jpg}`（透明のあるものは PNG。両方あれば PNG を返す）、`art/ab/<hash>.jpg`、`proxies/ab/<hash>.mp4`、`peaks/ab/<hash>.peaks`、`anim/ab/<hash>-1.png`、`files/ab/cd/<hash>.<ext>`（`/file`・`/play` は拡張子が分からないので `files/ab/cd/` の中を探す）。帯の版が今のもの（1）でなければ 404。
 - **`/pcm`（試聴の PCM。kura-core の `asset::pcm`）**：files/ の音声のファイルを、ライブラリのエンジンのコーデックの組（解析と同じ）で読み、区間を WAV にする。並びは `RIFF`・`fmt `（16 バイト。形式 1 = 16 ビット整数か 3 = 32 ビット浮動小数）・`kura`・`data` の順で、`kura` チャンク（版 1）に開始フレーム・元のフレーム数・ループ点・デコーダの識別子を入れる（同じ読み取りの値。試聴は DB ではなくこれを使う。正は `crates/kura-core/tests/vectors/pcm/wav.json`、TS は `src/lib/asset/wav.ts`）。元が 16 ビット以下の整数で、区間の標本がすべて 16 ビットの格子の上にあれば 16 ビット、ほかは浮動小数（非可逆の形式は浮動小数）。ループ点は「始まり < 終わり ≤ 長さ」のものだけ。
-  - 読んだ結果は (ライブラリ, ハッシュ, デコーダの識別子) で直近の 1 件だけ覚える（前奏と本体・継ぎ目の前後を続けて取るので、2 回目からは読まない。読むのは 1 つずつ）。覚えている間は値の分の予算（対話）を持ち、60 秒使わなければ捨てる。
+  - 読んだ結果は (ライブラリ, ハッシュ, デコーダの識別子) で直近の 1 件だけ覚える（前奏と本体・継ぎ目の前後を続けて取るので、2 回目からは読まない。読むのは 1 つずつ）。
+  - フロント（`src/lib/assetAudio.ts` の `Audition.startProbed`）は、DB が長さをフレームで持たないので、まず `[0, 1)` を取って `kura` チャンクの長さ・ループ点を知り、それで計画した区間（本体・前奏・継ぎ目の前後）を取る。最初の要求で読んで覚えるので、続く要求は読まない（M11）。覚えている間は値の分の予算（対話）を持ち、60 秒使わなければ捨てる。
   - 音声でない・ファイルがなければ 404、範囲が音声の外か、浮動小数で 64 MiB を超える長さは 416、エンジンがない・予算（対話。待たない）が空いていなければ 503、読めなければ 500。どれも §4.1 の 4 つのヘッダを付ける。
 - **`/pcm` と `item_anim_get` をジョブにしない理由**（M11 の決定 8）：利用者がその場で待つ短い表示の用意で、長くても 0.4 秒ほど（release・M4 Max の実測：3 分の 44.1kHz ステレオの最初の要求が WAV 91ms・FLAC 177ms・Ogg Vorbis 144ms、2 回目から 0.1〜0.6ms。帯は GIF 64 コマ 128² が 25ms、APNG 64 コマ 256² が 80ms、上限いっぱいの 8,192 × 2,048 が 189ms、すでにあれば 0.1ms 未満）。`spawn_blocking` で読み、予算は対話（`Class::Interactive`。待たない）で確保し、足りなければ 503 か `Busy`・`TooLarge` で返す。ジョブの列に並べると、解析・サムネイルのジョブの後ろで待たされる。例外：ffmpeg でしか読めない形式（Opus など）は、3 分で約 0.8 秒かかる（形を数える回と読む回）。
 - WKWebView の `<video>` はサンプル単位の小さな Range（数百バイト）を多数送ってくる（60 秒・1.4MB の MOV の再生で約 3,000 回）。今は 1 回ごとにファイルを開いて読む。大きな動画での負荷は M5 で測る。
@@ -438,6 +439,7 @@ import_start:    ジョブとして実行
 | `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない） |
 | `VITE_KURA_BENCH=1` | グリッドを自動でスクロールし、フレーム時間を `bench_report` でログに書く |
 | `kura-devtools selftest-library --out <path> [--web <dir>] [--font <ttf>]` | kura:// と CSP の自己点検用のライブラリを作る（M11。§4.2）。アルファ付き PNG・JPEG・WAV は DB に入れ、`<script>` 入りの SVG・ttf（システムのフォントの写し）・glb は `files/` に直に置き、WAV の `kura-peaks` と、中身のハッシュの目録（決まった名前 `5e1f7e57…` で `/file` から読める）も置く。`--web` には F2 のページ `f2.html` を書く。整合性の確かめでは、DB にないファイルが 4 つ孤立して数えられる |
+| `VITE_KURA_CHECK=1` | ループの試聴の継ぎ目の自己点検（M11。`src/dev/seamCheck.ts`）。試聴を始めるたびに、同じ PCM と同じ組み立て（本体を loop・前奏のあとに本体・継ぎ目の前後を続けて。始める時刻はフレームの境、バッファの中の始まりは「フレーム ÷ レート」の秒）を OfflineAudioContext で描き、PCM を計画の順につないだ期待の標本と 1 標本ずつ照らして、`bench_report('audition-seam', {hash, mode, rate, channels, windows, seams, frames, mismatches, first, ms})` でログに書く。完了条件は `mismatches` が 0。本物との違い：始める時刻の起点は 0（本物は文脈の今の時刻の少し先）。描く長さは窓ごとに 30 秒まで（前奏と本体が長ければ、前奏の終わりの 1 秒前からの窓と本体の継ぎ目の 1 秒前からの窓に分ける）。通常のビルドには入らない（条件の中の動的 import が消える。`src/dev/seamCheck.test.ts` が読み込む所を見張る） |
 | `VITE_KURA_SELFTEST=1`（と任意の `VITE_KURA_SELFTEST_F2=<f2.html の URL>`） | 起動時に §4.2 の P1〜P8・F1〜F4 を試し、`bench_report('selftest')` と `selftest-nav` でログに書く。selftest のライブラリを `KURA_LIBRARY` で開き、`RUST_LOG=info,kura_app_lib=debug` で要求ごとのログ（label・Origin・status・ACAO）も出す。CSP は `VITE_KURA_SELFTEST=1 pnpm tauri build --debug --no-bundle` で作った `target/debug/kura-app` で確かめる（`pnpm tauri dev` には CSP が付かない）。F2 のページは `python3 -m http.server 18432 --bind 127.0.0.1 -d <dir>` などで配る |
 
 M2 の実測（Apple Silicon・16 コア、リリースビルド、10 万件）：

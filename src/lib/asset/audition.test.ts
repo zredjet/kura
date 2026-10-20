@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   type AuditionFacts,
+  auditionPosition,
   DEFAULT_AUDITION,
   SFX_MAX_MS,
   planAudition,
@@ -135,5 +136,43 @@ describe('効果音の即再生', () => {
     expect(shouldPlaySfx(short, { ...cx, quickLook: true })).toBe(false);
     expect(shouldPlaySfx(short, { ...cx, selectedCount: 2 })).toBe(false);
     expect(shouldPlaySfx(short, { ...cx, selectedCount: 0 })).toBe(false);
+  });
+});
+
+// docs/design.md §3.1「波形」：試聴中の位置は 1.5px の線（元のファイルのフレームで返す）
+describe('試聴中の位置', () => {
+  it('本体だけなら、始めた位置から本体の中を回る', () => {
+    const plan = planAudition(facts);
+    if (!plan) throw new Error('計画がない');
+    // 継ぎ目の 3 秒前（本体の中の R * 57）から
+    expect(auditionPosition(plan, 0)).toBe(R + R * 57);
+    expect(auditionPosition(plan, R * 3 - 1)).toBe(R * 61 - 1);
+    // 継ぎ目を越えたら本体の始まりへ
+    expect(auditionPosition(plan, R * 3)).toBe(R);
+    expect(auditionPosition(plan, R * 3 + R * 60)).toBe(R);
+    // 始まる前は始めた位置
+    expect(auditionPosition(plan, -5)).toBe(R + R * 57);
+  });
+
+  it('はじめからは前奏のあとに本体を回る', () => {
+    const plan = planAudition(facts, { fromStart: true });
+    if (!plan) throw new Error('計画がない');
+    expect(auditionPosition(plan, 0)).toBe(0);
+    expect(auditionPosition(plan, R - 1)).toBe(R - 1);
+    expect(auditionPosition(plan, R)).toBe(R);
+    expect(auditionPosition(plan, R + R * 60)).toBe(R);
+    expect(auditionPosition(plan, R + R * 60 + 7)).toBe(R + 7);
+  });
+
+  it('継ぎ目だけは手前から始まりへ 1 回だけ進み、終われば null', () => {
+    const plan = planAudition(facts, { capBytes: 1_000 });
+    if (plan?.mode !== 'seam') throw new Error('継ぎ目の計画でない');
+    const [t0, t1] = plan.tail;
+    const [h0, h1] = plan.head;
+    expect(auditionPosition(plan, 0)).toBe(t0);
+    expect(auditionPosition(plan, t1 - t0 - 1)).toBe(t1 - 1);
+    expect(auditionPosition(plan, t1 - t0)).toBe(h0);
+    expect(auditionPosition(plan, t1 - t0 + (h1 - h0) - 1)).toBe(h1 - 1);
+    expect(auditionPosition(plan, t1 - t0 + (h1 - h0))).toBeNull();
   });
 });

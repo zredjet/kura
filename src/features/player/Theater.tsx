@@ -13,6 +13,7 @@ import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { playUrl } from '../../ipc/media';
 import { formatCount, formatDuration } from '../../lib/format';
+import { WaveformView } from '../asset/WaveformView';
 import { PlayBar } from './PlayBar';
 import {
   closePlayer,
@@ -304,8 +305,9 @@ function ImageLayer({ item }: { item: ItemSummaryDto }) {
   );
 }
 
-/** 音楽：ジャケット（なければ音符）と波形の飾り。 */
+/** 音楽：ジャケット（なければ音符）と波形（解析の前は飾りの波形。M11）。 */
 function AudioArt({ item }: { item: ItemSummaryDto }) {
+  const positionMs = usePlayerStore((s) => s.snapshot.positionMs);
   return (
     <div className={styles.audio}>
       <MediaImage
@@ -319,7 +321,13 @@ function AudioArt({ item }: { item: ItemSummaryDto }) {
           </span>
         }
       />
-      <Waveform className={styles.waveform} />
+      <WaveformView
+        hash={item.hash}
+        loop={null}
+        positionMs={positionMs}
+        className={styles.waveform}
+        fallback={<Waveform />}
+      />
     </div>
   );
 }

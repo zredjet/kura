@@ -1,0 +1,351 @@
+/*
+ * 素材の欄・アニメのプレビュー・波形・ループの試聴（design.md §3.1「素材の表示」）。
+ * 欄の形はインスペクタの情報の表（Inspector.module.css の .info）と同じ：11px tertiary のラベル、secondary の値。
+ */
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.label {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  color: var(--text-tertiary);
+}
+
+.info {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-1) var(--space-3);
+  align-items: baseline;
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.info dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* 値の下の補足（自動の判定・標本の位置）：11px tertiary */
+.sub {
+  display: block;
+  margin-top: var(--space-0-5);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+/* セグメントや［設定…］を値の列に置く行 */
+.control {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+}
+
+.inline {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.status {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.textButton {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  text-decoration: underline;
+}
+
+.textButton:hover {
+  color: var(--text-primary);
+}
+
+.textButton:focus-visible,
+.roundButton:focus-visible,
+.stepButton:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* 描けない拡張（Draco・meshopt・スキン）：--warning の印と文字 */
+.warning {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--warning);
+}
+
+.warning svg {
+  flex: none;
+}
+
+/* ===== 波形（高さ --h-waveform、幅いっぱい。呼ぶ側の className が勝つよう :where で詳細度を 0 にする）===== */
+
+:where(.waveform) {
+  display: block;
+  width: 100%;
+  height: var(--h-waveform);
+  color: var(--text-secondary);
+}
+
+.waveform svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.wavePath {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1;
+}
+
+.loopRegion {
+  fill: var(--loop-region);
+}
+
+.loopEdge {
+  stroke: var(--accent);
+  stroke-width: 1px;
+}
+
+.playhead {
+  stroke: var(--accent);
+  stroke-width: 1.5px;
+}
+
+/* ===== ループの試聴 ===== */
+
+.audition {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.audition button {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.note {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+/* ===== プレビューの枠（インスペクタ 220px。Inspector.module.css の .preview と同じ形）===== */
+
+.stage {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1-5);
+}
+
+.frame {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 220px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-media);
+  overflow: hidden;
+}
+
+/* 親いっぱいに広げる枠（クイックルック。地はクイックルックの黒のまま） */
+.fill {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  background: none;
+  border-radius: 0;
+}
+
+/* クイックルックのアニメ（枠と操作の行を縦に） */
+.fillStage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 100%;
+}
+
+.canvas {
+  display: block;
+  flex: none;
+}
+
+/* 透過と分かったものの下地（マスは画面に固定で 8px） */
+.checker {
+  background: repeating-conic-gradient(var(--checker-b) 0 25%, var(--checker-a) 0 50%) 0 0 /
+    var(--checker-size) var(--checker-size);
+}
+
+/* アニメの操作の行（高さ 28px）：再生／一時停止・「3 / 8」・コマ送り・タグ */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  height: var(--h-chip);
+}
+
+.roundButton {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--h-chip);
+  height: var(--h-chip);
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  color: var(--text-primary);
+}
+
+.roundButton:hover {
+  background: var(--fill-3);
+}
+
+.stepButton {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+}
+
+.stepButton:hover {
+  background: var(--fill-2);
+  color: var(--text-primary);
+}
+
+.position {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.tagSelect {
+  margin-left: auto;
+  max-width: 50%;
+}
+
+/* ===== フォントの見本 ===== */
+
+.specimen {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 100%;
+  padding: var(--space-4);
+  overflow: hidden;
+}
+
+.specimenLarge {
+  font-size: var(--text-specimen);
+  line-height: var(--leading-tight);
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.specimenSmall {
+  font-size: var(--text-lg);
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ===== 格子のシート（シートの子の間隔は Dialog の gap に任せる）===== */
+
+.sheetTitle {
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-semibold);
+}
+
+.sheetPreview {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2) var(--space-3);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.field input {
+  height: 30px;
+  padding: 0 var(--space-2-5);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke-3);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.field input:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.sheetNote {
+  min-height: calc(var(--text-xs) * var(--leading-body));
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.sheetError {
+  color: var(--danger-text);
+}
+
+.sheetActions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sheetActions .spacer {
+  flex: 1;
+}

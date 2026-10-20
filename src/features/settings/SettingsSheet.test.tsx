@@ -7,6 +7,7 @@ import { useLibraryStore } from '../../stores/libraryStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useViewStore } from '../../stores/viewStore';
 import { updatePlayerPrefs } from '../player/playerActions';
+import { DEFAULT_PREFS, usePlayerStore } from '../player/playerStore';
 import { SettingsSheet } from './SettingsSheet';
 
 vi.mock('../player/playerActions', () => ({ updatePlayerPrefs: vi.fn() }));
@@ -59,6 +60,16 @@ describe('SettingsSheet', () => {
     expect(updatePlayerPrefs).toHaveBeenCalledWith({ imageDurationMs: 10_000 });
     fireEvent.click(screen.getByRole('switch', { name: ja.library.collapseUnits }));
     expect(useViewStore.getState().collapseUnits).toBe(true);
+  });
+
+  it('一般：選んだ短い音声をすぐ鳴らす（既定でオン。切ると sfxAudition を保存する。M11）', () => {
+    usePlayerStore.setState({ prefs: DEFAULT_PREFS });
+    render(<SettingsSheet />);
+    const sfx = screen.getByRole('switch', { name: ja.asset.sfx });
+    expect(sfx).toBeChecked();
+    expect(screen.getByText(ja.asset.sfxHint)).toBeInTheDocument();
+    fireEvent.click(sfx);
+    expect(updatePlayerPrefs).toHaveBeenCalledWith({ sfxAudition: false });
   });
 
   it('ダウンロード：外部ツールの欄と、取得済みの記録の件数', async () => {
