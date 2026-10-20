@@ -575,7 +575,10 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   （途中で止めたら印は残り、次の実行で初めから探す）。ふだんの起動・ジョブは事実の表を走査しない。
 - **失敗**：事実の行に `state = 'failed'` と `error_code` を書き、items は `failed`。計画・デコーダの指紋が変わるか、利用者が頼む
   （`retry_analysis`：`failed` を `pending` に戻す）まで解き直さない。見積もり（値の 2 倍＋デコーダの作業領域）が
-  min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`。中止・一時停止・強制終了では、書くまでは `pending` のまま。
+  min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`。中止・一時停止・強制終了（電源断・ほかの部品の異常終了を
+  含む）では、書くまでは `pending` のまま。ただし OS のデコーダ（Platform の段）で読んでいる 1 件は、読む前にコミットした処理中の
+  印（settings の `analysis.inflight`）が残るので、強制終了でも次にジョブが動いたときに `failed`（`crashed`）になる（印は落ちたのか
+  止められたのかを見分けない。`retry_analysis` で戻せる）。
 - **一度きりの全件の走査**（例外）：計画の指紋が変わった種類を戻す `UPDATE items … WHERE kind = ? AND analysis_state IN ('ready','failed')`
   と、デコーダの指紋で戻す `UPDATE … WHERE … hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …)` は全件を走査する
   （指紋が変わったときだけ。10 万件で約 70 ms）。投影の古い行を探す `stale_facts`（`media_facts` を主キーの範囲で読み、残りの
