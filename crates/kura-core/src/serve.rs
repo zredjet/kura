@@ -2,7 +2,7 @@
 //!
 //! | パス | 返すもの |
 //! |---|---|
-//! | `/thumb/{hash}/s`・`/thumb/{hash}/l` | サムネイル（長辺 512 / 1600） |
+//! | `/thumb/{hash}/s`・`/thumb/{hash}/l` | サムネイル（長辺 512 / 1600。png、jpg の順に探す。M11） |
 //! | `/art/{hash}` | 音楽のジャケット |
 //! | `/file/{hash}` | 元ファイル |
 //! | `/play/{hash}` | 再生用：プロキシがあればプロキシ、なければ元ファイル |
@@ -22,7 +22,7 @@ pub use access::{
 use std::path::{Path, PathBuf};
 
 use crate::import::mime_for;
-use crate::library::{Layout, ThumbSize};
+use crate::library::{Layout, ThumbFormat, ThumbSize};
 
 /// 1 回の応答で返す最大の大きさ（Range のとき）。
 pub const MAX_CHUNK: u64 = 4 * 1024 * 1024;
@@ -133,7 +133,7 @@ fn is_hash(text: &str) -> bool {
 /// パスに対応するファイル（なければ None）。
 pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
     let path = match route {
-        Route::Thumb { hash, size } => layout.thumb_path(hash, *size),
+        Route::Thumb { hash, size } => return thumb_file(layout, hash, *size),
         Route::Art { hash } => layout.art_path(hash),
         Route::File { hash } => find_content(layout, hash)?,
         // 中身は M11 の段 3（波形は解析のジョブ、PCM・帯はその場で作る）。それまでは 404
@@ -148,6 +148,14 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
         }
     };
     path.is_file().then_some(path)
+}
+
+/// サムネイルのファイル：png、jpg の順に探す（透明のあるものは PNG。M11 の決定 4。URL に形式を含めないので DB を引かない）。
+fn thumb_file(layout: &Layout, hash: &str, size: ThumbSize) -> Option<PathBuf> {
+    [ThumbFormat::Png, ThumbFormat::Jpeg]
+        .into_iter()
+        .map(|format| layout.thumb_path_as(hash, size, format))
+        .find(|path| path.is_file())
 }
 
 /// `files/ab/cd/<hash>.<ext>` を探す（拡張子は URL に含めないので、フォルダの中から探す）。
@@ -457,5 +465,34 @@ mod tests {
         std::fs::write(&path, b"jpg").unwrap();
         assert_eq!(resolve(&layout, &thumb), Some(path.clone()));
         assert_eq!(content_type(&path), "image/jpeg");
+    }
+
+    /// M11 の決定 4：透明のあるサムネイルは PNG。URL は変えずに png、jpg の順に探す（作り直しの途中で両方あれば、新しく書く
+    /// png を出す。古い形式は書いたあとに消す）。
+    #[test]
+    fn resolve_prefers_png_thumb_then_jpg() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let route = |size| Route::Thumb {
+            hash: HASH.into(),
+            size,
+        };
+        let png = layout.thumb_path_as(HASH, ThumbSize::Small, ThumbFormat::Png);
+        let jpg = layout.thumb_path_as(HASH, ThumbSize::Small, ThumbFormat::Jpeg);
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        std::fs::write(&png, b"png").unwrap();
+        assert_eq!(
+            resolve(&layout, &route(ThumbSize::Small)),
+            Some(png.clone())
+        );
+        assert_eq!(content_type(&png), "image/png");
+        std::fs::write(&jpg, b"jpg").unwrap();
+        assert_eq!(
+            resolve(&layout, &route(ThumbSize::Small)),
+            Some(png.clone())
+        );
+        std::fs::remove_file(&png).unwrap();
+        assert_eq!(resolve(&layout, &route(ThumbSize::Small)), Some(jpg));
+        assert_eq!(resolve(&layout, &route(ThumbSize::Large)), None);
     }
 }

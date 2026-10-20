@@ -15,10 +15,13 @@ use kura_core::time::now_ms;
 /// `bench query --library <path>` / `bench thumbs --src <dir> [--threads N]` /
 /// `bench import --src <dir> [--threads N] [--out <dir>]` / `bench backup --library <path>` /
 /// `bench edit …`（編集のベンチ。`bench_edit`）/ `bench migrate …`（マイグレーション。`bench_migrate`）/
-/// `bench analyze …`（解析のジョブ。`bench_analyze`）。
+/// `bench analyze …`（解析のジョブ。`bench_analyze`）/ `bench thumbs-job --src <dir> …`（サムネイルのジョブ。`bench_thumbs`）。
 pub fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("edit") {
         return crate::bench_edit::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("thumbs-job") {
+        return crate::bench_thumbs::run(&args[1..]);
     }
     if args.first().map(String::as_str) == Some("migrate") {
         return crate::bench_migrate::run(&args[1..]);
@@ -88,9 +91,10 @@ fn thumbs(src: &std::path::Path, threads: Option<usize>) -> Result<(), String> {
             .par_iter()
             .enumerate()
             .filter(|(i, path)| {
+                // 書き先は拡張子のない stem（書いた形式の拡張子が付く）
                 let targets = ThumbTargets {
-                    large: out.join(format!("{i}_l.jpg")),
-                    small: out.join(format!("{i}_s.jpg")),
+                    large: out.join(format!("{i}_l")),
+                    small: out.join(format!("{i}_s")),
                 };
                 backend.image_thumbnails(path, &targets).is_err()
             })

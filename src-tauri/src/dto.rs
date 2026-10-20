@@ -312,6 +312,65 @@ pub struct LibraryUsageDto {
     pub volume_available_bytes: Option<u64>,
 }
 
+/// 中身から作ったキャッシュの大きさ（設定の「容量」の行。M11 の決定 4 で ADR-122 を広げる）。ファイルを数えるので、
+/// サイドバーの `library_usage` とは別に、設定の画面を開いたときだけ読む。ゴミ箱のアイテムの分も含む。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryCacheUsageDto {
+    /// サムネイル（`thumbs/` の JPEG・PNG）と音楽のジャケット（`art/`）のバイト数とファイルの数。
+    pub thumbs_bytes: u64,
+    pub thumbs_files: u64,
+    /// 音声の波形の段（`peaks/`）。
+    pub peaks_bytes: u64,
+    pub peaks_files: u64,
+    /// アニメの帯（`anim/`）。
+    pub anim_bytes: u64,
+    pub anim_files: u64,
+}
+
+impl From<kura_core::media::usage::CacheUsage> for LibraryCacheUsageDto {
+    fn from(u: kura_core::media::usage::CacheUsage) -> Self {
+        Self {
+            thumbs_bytes: u.thumbs.bytes,
+            thumbs_files: u.thumbs.files,
+            peaks_bytes: u.peaks.bytes,
+            peaks_files: u.peaks.files,
+            anim_bytes: u.anim.bytes,
+            anim_files: u.anim.files,
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_usage_tests {
+    use kura_core::media::usage::{CacheUsage, DirUsage};
+
+    use super::LibraryCacheUsageDto;
+
+    /// フロント（設定の「容量」）へは camelCase の 6 つの数で送る。
+    #[test]
+    fn cache_usage_serializes_for_the_front() {
+        let dto = LibraryCacheUsageDto::from(CacheUsage {
+            thumbs: DirUsage {
+                bytes: 1_234,
+                files: 4,
+            },
+            peaks: DirUsage {
+                bytes: 56,
+                files: 1,
+            },
+            anim: DirUsage { bytes: 0, files: 0 },
+        });
+        assert_eq!(
+            serde_json::to_value(&dto).unwrap(),
+            serde_json::json!({
+                "thumbsBytes": 1_234, "thumbsFiles": 4, "peaksBytes": 56, "peaksFiles": 1,
+                "animBytes": 0, "animFiles": 0
+            })
+        );
+    }
+}
+
 /// 取得済みの記録の状態（設定画面。ADR-95）。
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]

@@ -5,6 +5,8 @@
 //! - `check --library <path>`：件数と整合性（DB とファイルの食い違い）を表示する
 //! - `seed --items <件数> --out <path> [--analysis pending|ready]`：ダミーライブラリを作る（グリッドと起動時間の計測用。
 //!   `--analysis ready` は画像・音声に偽の事実を入れて解析済みにする）
+//! - `assets --out <dir>`：形式の表の画像・フォント・3D の行ごとの見本と、動画・音声の見本を書く（M11 の形式の網羅。
+//!   `assets` の冒頭）
 //! - `selftest-library --out <path> [--web <dir>] [--font <ttf>]`：kura:// と CSP を実機で確かめるライブラリ
 //!   （`VITE_KURA_SELFTEST=1` のフロントが試す。`selftest` の冒頭）
 //! - `bench query --library <path>`：一覧の取得の速さを測る
@@ -19,10 +21,12 @@
 //! - `vorbis-quality --out <dir> [--quick] [--input <file>]... [--reference <音>/<ラベル>=<ogg>]...`：
 //!   自作の Ogg Vorbis のエンコーダの品質を記録する（M10 段 7。`vorbis_quality` の冒頭）
 
+mod assets;
 mod bench;
 mod bench_analyze;
 mod bench_edit;
 mod bench_migrate;
+mod bench_thumbs;
 mod edit;
 mod mem_smoke;
 mod seed;
@@ -56,6 +60,7 @@ fn main() -> ExitCode {
         Some("download") => download(&args[1..]),
         Some("check") => check(&args[1..]),
         Some("seed") => seed::run(&args[1..]),
+        Some("assets") => assets::run(&args[1..]),
         Some("selftest-library") => selftest::run(&args[1..]),
         Some("bench") => bench::run(&args[1..]),
         Some("edit") => edit::run(&args[1..]),

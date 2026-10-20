@@ -138,7 +138,10 @@ impl LibrarySession {
                 JobKind::Capture,
                 Arc::new(CaptureHandler::new(backend.clone())),
             ),
-            (JobKind::Thumbnail, Arc::new(ThumbnailHandler::new(backend))),
+            (
+                JobKind::Thumbnail,
+                Arc::new(ThumbnailHandler::new(backend).with_engine(engine.clone())),
+            ),
             (JobKind::Export, Arc::new(ExportHandler)),
             (
                 JobKind::Proxy,
@@ -161,6 +164,8 @@ impl LibrarySession {
         let startup = std::thread::Builder::new()
             .name("kura-startup".into())
             .spawn(move || {
+                // サムネイル：前回落ちたときの印を片付け、作り方の指紋を照らす（ジョブを動かす前に。media::prepare_on_open）
+                let thumbs_todo = crate::media::prepare_on_open(lib.db());
                 let checked = check_files(lib.db(), lib.layout()).and_then(|(missing, orphans)| {
                     Ok((missing, orphans, lib.db().read(ledger::unreferenced)?))
                 });
@@ -193,16 +198,8 @@ impl LibrarySession {
                 if let Err(err) = jobs2.start() {
                     tracing::error!(%err, "ジョブを開始できませんでした");
                 }
-                // サムネイルが未作成のもの（前回の続き・M1 で取り込んだものなど）があれば作る
-                let pending = lib.db().read(|conn| {
-                    let mut stmt = conn.prepare_cached(
-                        "SELECT EXISTS (SELECT 1 FROM items WHERE thumb_state = 'pending')",
-                    )?;
-                    Ok(stmt.query_row([], |row| row.get::<_, bool>(0))?)
-                });
-                if matches!(pending, Ok(true))
-                    && let Err(err) = jobs2.ensure_queued(JobKind::Thumbnail, "{}")
-                {
+                // サムネイルが未作成・作り直しのもの（前回の続き・M1 で取り込んだもの・作り方が変わったもの）があれば作る
+                if thumbs_todo && let Err(err) = jobs2.ensure_queued(JobKind::Thumbnail, "{}") {
                     tracing::error!(%err, "サムネイルのジョブを積めませんでした");
                 }
                 if analyze {

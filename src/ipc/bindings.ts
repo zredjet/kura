@@ -34,6 +34,8 @@ export const commands = {
 	revealPath: (path: string) => typedError<null, AppError>(__TAURI_INVOKE("reveal_path", { path })),
 	/**  ライブラリの容量と、あるボリュームの容量・空き。 */
 	libraryUsage: () => typedError<LibraryUsageDto, AppError>(__TAURI_INVOKE("library_usage")),
+	/**  サムネイル・波形・アニメのキャッシュの大きさ（設定の「容量」の行。ファイルを数えるので、設定の画面を開いたときだけ呼ぶ）。 */
+	libraryCacheUsage: () => typedError<LibraryCacheUsageDto, AppError>(__TAURI_INVOKE("library_cache_usage")),
 	/**  整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数える）。 */
 	libraryCheck: () => typedError<IntegrityDto, AppError>(__TAURI_INVOKE("library_check")),
 	/**
@@ -739,6 +741,22 @@ export type KindCountsDto = {
 	font: number,
 	model: number,
 	total: number,
+};
+
+/**
+ *  中身から作ったキャッシュの大きさ（設定の「容量」の行。M11 の決定 4 で ADR-122 を広げる）。ファイルを数えるので、
+ *  サイドバーの `library_usage` とは別に、設定の画面を開いたときだけ読む。ゴミ箱のアイテムの分も含む。
+ */
+export type LibraryCacheUsageDto = {
+	/**  サムネイル（`thumbs/` の JPEG・PNG）と音楽のジャケット（`art/`）のバイト数とファイルの数。 */
+	thumbsBytes: number,
+	thumbsFiles: number,
+	/**  音声の波形の段（`peaks/`）。 */
+	peaksBytes: number,
+	peaksFiles: number,
+	/**  アニメの帯（`anim/`）。 */
+	animBytes: number,
+	animFiles: number,
 };
 
 /**  サイドバーの「ライブラリ」の件数。 */
