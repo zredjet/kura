@@ -513,7 +513,9 @@ GROUP BY item_id HAVING COUNT(*) = 3;
    - M11：タイルの素材の表示（市松模様・ドット絵・アニメとループの印）のため、`items i LEFT JOIN blobs b ON b.hash = i.hash
      LEFT JOIN media_facts f ON f.blob_id = b.id LEFT JOIN asset_settings s ON s.item_id = i.id WHERE i.id IN (…)` で引く
      （主キーと `blobs.hash` の UNIQUE だけを引き、200 件でも全件を走査しない。`summaries_join_facts_and_settings_without_scanning`）。
-     ドット絵の実効値は「設定 ?? 自動 ?? 偽」（素材の欄・検索と同じ規則）。ユニットの表紙も同じ形で 1 件引く。
+     ドット絵の実効値は「設定 ?? 自動 ?? 偽」（素材の欄と同じ関数 `asset::effective_pixel_art`。表示のため、どちらもないものは偽）。
+     検索は「設定 ?? 自動」で比べ、どちらもないものは `ドット絵:なし`・`ドット絵!=あり` に入れず、除外にだけ入れる（下の「事実で引く」、
+     docs/search-query.md §4。`ドット絵:あり` の集合は表示の実効値が真のものと同じ）。ユニットの表紙も同じ形で 1 件引く。
 
 ### サイドバーの一覧（M3）
 
@@ -592,7 +594,9 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 
 - 事実の条件は `i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE …)` の形にする
   （部分索引から集合を作る。EXISTS の相関した問い合わせにしない）。
-- 実効値は「設定 ?? 自動」：ドット絵は `asset_settings.pixel_art` があればそれ、なければ `media_facts.pixel_art`。
+- 検索の実効値は「設定 ?? 自動」：ドット絵は `asset_settings.pixel_art` があればそれ、なければ `media_facts.pixel_art`。
+  どちらもない（未解析か、解析しても材料が足りず NULL）ものは決まっていないので、`:あり`・`:なし`・`!=` のどれにも入れない
+  （表示の実効値は「?? 偽」で偽にする。上の「一覧の取得」。テスト `pixel_art_search_follows_the_effective_value_of_the_asset_panel`）。
 - 2 のべき乗は列を持たず、`width & (width - 1) = 0` のビット演算で求める。
 - まだ解析していないもの・計れない値は、肯定・`!=`・大小の比較のどれにも入れない（除外だけが含む。docs/search-query.md §4）。
 
