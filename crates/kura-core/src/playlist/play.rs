@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension};
 use super::build::build_queue;
 use super::generate::generate;
 use super::model::{Entry, EntryTarget, Granularity, PlaylistKind, QueueOptions};
-use super::resolve::resolve;
+use super::resolve::{Snapshot, expand, resolve};
 use super::store::{self, PlayState, PlaylistPatch};
 use crate::Result;
 use crate::query::QueryContext;
@@ -28,7 +28,8 @@ pub struct PlayRequest {
     /// このアイテム（のユニット）を先頭にして、そこから始める。
     pub start_item: Option<i64>,
     /// 並びはそのままで、このアイテムのスロットから始める（一覧の「ここから再生」）。
-    /// スマートは表示している並びを使い、作り直さない。
+    /// スマートは表示している並びを使い、作り直さない。キューにない種類（フォント・3D）のアイテムなら、それを含むエントリの
+    /// 最初のスロットから（エントリが丸ごとキューになければ、その後ろで最初にキューにあるエントリから）。
     pub from_item: Option<i64>,
 }
 
@@ -110,7 +111,14 @@ pub fn playlist_queue(
         options.shuffle = false;
     }
     let slots = build_queue(&resolve(&snap), &snap, &options, seed);
-    Ok(finish(slots, seed, playlist.granularity, state, request))
+    Ok(finish(
+        slots,
+        seed,
+        playlist.granularity,
+        state,
+        request,
+        &snap,
+    ))
 }
 
 /// その場のキュー（ライブラリの選択・⌘K の結果）。保存はしない。
@@ -127,7 +135,14 @@ pub fn entries_queue(
     };
     let snap = store::snapshot_of(conn, entries)?;
     let slots = build_queue(&resolve(&snap), &snap, options, seed);
-    Ok(finish(slots, seed, options.granularity, None, request))
+    Ok(finish(
+        slots,
+        seed,
+        options.granularity,
+        None,
+        request,
+        &snap,
+    ))
 }
 
 /// 選択（アイテムと、まとめて表示したユニット）をエントリにする。ユニットを含めばユニット単位で再生する。
@@ -154,13 +169,14 @@ pub fn selection_entries(item_or_units: &[(bool, i64)]) -> (Vec<Entry>, Granular
 
 /// 始める位置を決める：再開ならそのスロット（アイテムが違えば同じアイテムの最初、なければ先頭）、
 /// `start_item` ならそのアイテム（ユニット単位ならそのユニット）を先頭に移してそこから、
-/// `from_item` なら並びはそのままでそのアイテムのスロットから。
+/// `from_item` なら並びはそのままでそのアイテムのスロットから（キューにない種類なら [`entry_start`]）。
 fn finish(
     mut slots: Vec<Slot>,
     seed: u64,
     granularity: Granularity,
     state: Option<PlayState>,
     request: &PlayRequest,
+    snap: &Snapshot,
 ) -> PlayQueue {
     let mut start_index = 0;
     let mut start_ms = 0;
@@ -178,7 +194,11 @@ fn finish(
     } else if let Some(item) = request.start_item {
         start_index = put_first(&mut slots, item, granularity);
     } else if let Some(item) = request.from_item {
-        start_index = slots.iter().position(|s| s.item_id == item).unwrap_or(0);
+        start_index = slots
+            .iter()
+            .position(|s| s.item_id == item)
+            .or_else(|| entry_start(&slots, snap, item))
+            .unwrap_or(0);
     }
     PlayQueue {
         slots,
@@ -187,6 +207,20 @@ fn finish(
         start_index,
         start_ms,
     }
+}
+
+/// キューにない種類（フォント・3D）の `item` から「ここから再生」するときに始めるスロット：`item` を含む最初のエントリ
+/// （`pos` の順。一覧の行が先頭のメンバーを渡す）の最初のスロット。そのエントリが丸ごとキューにない（フォント・3D だけ）なら、
+/// その後ろのエントリで最初にキューにあるものの最初のスロット。どれもなければ None（先頭から）。
+fn entry_start(slots: &[Slot], snap: &Snapshot, item: i64) -> Option<usize> {
+    let mut entries: Vec<_> = snap.entries.iter().collect();
+    entries.sort_by(|a, b| a.pos.total_cmp(&b.pos).then_with(|| a.id.cmp(&b.id)));
+    let at = entries
+        .iter()
+        .position(|e| expand(snap, e.target).1.contains(&item))?;
+    entries[at..]
+        .iter()
+        .find_map(|e| slots.iter().position(|s| s.entry_id == Some(e.id)))
 }
 
 /// `item` のスロット（ユニット単位ならそのグループ）を先頭に移し、始めるスロットの番号を返す。
@@ -346,6 +380,7 @@ mod tests {
             Granularity::File,
             Some(state(1, Some(2))),
             &PlayRequest::default(),
+            &Snapshot::default(),
         );
         assert_eq!((q.start_index, q.start_ms), (1, 5000));
         // エントリが変わってスロットがずれていても、同じアイテムから
@@ -355,6 +390,7 @@ mod tests {
             Granularity::File,
             Some(state(0, Some(3))),
             &PlayRequest::default(),
+            &Snapshot::default(),
         );
         assert_eq!((q.start_index, q.start_ms), (2, 5000));
         // 見つからなければ先頭から
@@ -365,6 +401,7 @@ mod tests {
             Granularity::File,
             Some(state(1, Some(9))),
             &none,
+            &Snapshot::default(),
         );
         assert_eq!((q.start_index, q.start_ms), (0, 0));
         // 一覧の「ここから再生」：並びはそのまま
@@ -372,7 +409,14 @@ mod tests {
             from_item: Some(3),
             ..PlayRequest::default()
         };
-        let q = finish(slots, 1, Granularity::File, None, &from);
+        let q = finish(
+            slots,
+            1,
+            Granularity::File,
+            None,
+            &from,
+            &Snapshot::default(),
+        );
         assert_eq!(q.start_index, 2);
         assert_eq!(q.slots[0].item_id, 1);
     }

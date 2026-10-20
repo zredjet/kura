@@ -714,3 +714,70 @@ fn smart_candidates_skip_unplayable_kinds() {
     );
     assert_eq!(set(&conn, units, &["種類:フォント"]), vec![]);
 }
+
+/// 一覧の「ここから再生」（T16・T17 の続き）：エントリの行は先頭のメンバー（`coverItemId`。フォント・3D でもある）を渡すので、
+/// 渡したアイテムがキューにない種類なら、そのアイテムを含むエントリの最初のスロットから始める（プレイリストの先頭からに
+/// しない）。エントリが丸ごとキューにない（フォント・3D だけ）なら、その後ろで最初にキューにあるエントリから。ファイル単位・
+/// ユニット単位、スマートの「今回の並び」でも同じ（Q1）。
+#[test]
+fn playing_from_a_row_whose_item_never_reaches_the_queue_starts_at_its_entry() {
+    let conn = test_conn();
+    let a = item(&conn, "a", "image", 0);
+    let f = item(&conn, "f", "font", 0);
+    let b = item(&conn, "b", "audio", 0);
+    let g = item(&conn, "g", "model", 0);
+    let c = item(&conn, "c", "video", 0);
+    let ux = set_unit(&conn, "X", &[a]);
+    let uy = set_unit(&conn, "Y", &[f, b]);
+    let uz = set_unit(&conn, "Z", &[g]);
+    let uw = set_unit(&conn, "W", &[c]);
+    let from = |pl: i64, item: i64| {
+        let q = playlist_queue(
+            &conn,
+            pl,
+            &PlayRequest {
+                from_item: Some(item),
+                ..PlayRequest::default()
+            },
+            &ctx(),
+        )
+        .unwrap();
+        q.slots[q.start_index].item_id
+    };
+    for granularity in [Granularity::Unit, Granularity::File] {
+        let pl = playlist(&conn, PlaylistKind::Manual, granularity);
+        store::add_entries(
+            &conn,
+            pl,
+            &[ux, uy, uz, uw].map(|u| NewEntry::from(EntryTarget::Unit(u))),
+            None,
+            1,
+        )
+        .unwrap();
+        // 行の先頭のメンバー（dto の coverItemId）はフォント
+        let rows = store::contents(&conn, pl).unwrap();
+        assert_eq!(rows[1].items.first().copied(), Some(f));
+        assert_eq!(from(pl, f), b, "{granularity:?}：ユニット Y から");
+        assert_eq!(
+            from(pl, g),
+            c,
+            "{granularity:?}：3D だけの Z は後ろの W から"
+        );
+        assert_eq!(from(pl, b), b, "{granularity:?}");
+    }
+    // スマート（ユニット単位、条件なし、シャッフルなし）の今回の並びの行でも
+    let smart = playlist(&conn, PlaylistKind::Smart, Granularity::Unit);
+    store::update(
+        &conn,
+        smart,
+        &PlaylistPatch {
+            shuffle: Some(false),
+            include_loose_items: Some(false),
+            ..PlaylistPatch::default()
+        },
+        1,
+    )
+    .unwrap();
+    playlist_queue(&conn, smart, &PlayRequest::default(), &ctx()).unwrap();
+    assert_eq!(from(smart, f), b);
+}
