@@ -14,6 +14,8 @@ const t = ja.asset;
 
 /** プレビューの枠の高さ（CSS px）。 */
 const PREVIEW_HEIGHT = 160;
+/** アニメの枠の下の操作の行（28px）と間隔（6px）。 */
+const CONTROLS_HEIGHT = 34;
 /** 枠の幅を測れないとき（シート 420px の中の 2 列の 1 つ）。 */
 const PREVIEW_WIDTH = 182;
 /** 格子がまだないときのセルの大きさの初め。 */
@@ -275,7 +277,7 @@ export function GridSheet({
                 source={gridSource(url, checked.cells, frameMs)}
                 pixelArt={asset.effective.pixelArt}
                 alpha={asset.facts?.image.alpha ?? null}
-                frameHeight={PREVIEW_HEIGHT - 32}
+                frameHeight={PREVIEW_HEIGHT - CONTROLS_HEIGHT}
                 draw={draw}
                 load={load}
                 clock={clock}
