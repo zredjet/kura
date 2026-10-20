@@ -148,4 +148,42 @@ describe('WaveformView（/peaks の波形）', () => {
     rerender(<WaveformView hash={HASH} version={2} loop={null} load={load} />);
     await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
   });
+
+  it('再生の位置は ms（シアター）か秒（クイックルックの <audio>）でも受け、段のレートでフレームにする', async () => {
+    // default-five-levels：48kHz・70,000 フレーム
+    const { buf } = vector('default-five-levels');
+    const ms = render(
+      <WaveformView hash={HASH} loop={null} positionMs={729.1666} load={async () => buf} dpr={1} />,
+    );
+    await waitFor(() => expect(ms.container.querySelector('[data-playhead]')).not.toBeNull());
+    expect(Number(ms.container.querySelector('[data-playhead]')?.getAttribute('x1'))).toBeCloseTo(
+      136,
+      1,
+    );
+    ms.unmount();
+    const f = fakeFrames();
+    const seconds = render(
+      <WaveformView
+        hash={HASH}
+        loop={null}
+        positionSeconds={() => 70_000 / 48_000 / 4}
+        load={async () => buf}
+        frames={f.clock}
+        dpr={1}
+      />,
+    );
+    await waitFor(() => expect(seconds.container.querySelector('svg')).not.toBeNull());
+    act(() => f.step());
+    expect(
+      Number(seconds.container.querySelector('[data-playhead]')?.getAttribute('x1')),
+    ).toBeCloseTo(68, 6);
+  });
+
+  it('段のファイルがなければ代わりのもの（シアターの飾りの波形）を出す', async () => {
+    const load = vi.fn(async () => null);
+    render(<WaveformView hash={HASH} loop={null} load={load} fallback={<span>飾りの波形</span>} />);
+    expect(screen.getByText('飾りの波形')).toBeInTheDocument();
+    await waitFor(() => expect(load).toHaveBeenCalled());
+    expect(screen.getByText('飾りの波形')).toBeInTheDocument();
+  });
 });

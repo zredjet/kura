@@ -86,6 +86,19 @@
   box-shadow: var(--shadow-media);
 }
 
+/* 音声の波形（M11。インスペクタと同じ部品を大きく） */
+.wave {
+  width: min(520px, 80vw);
+  height: 72px;
+  color: var(--text-secondary);
+}
+
+/* フォントの見本（M11。地はクイックルックの黒のまま） */
+.specimen {
+  width: min(720px, 80vw);
+  height: min(360px, 60vh);
+}
+
 /* フォント・3D の種類の絵（クイックルックでは大きめに） */
 .stage .kindArt svg {
   max-width: 120px;

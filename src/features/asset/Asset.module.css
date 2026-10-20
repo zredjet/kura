@@ -96,9 +96,9 @@
   flex: none;
 }
 
-/* ===== 波形（高さ --h-waveform、幅いっぱい）===== */
+/* ===== 波形（高さ --h-waveform、幅いっぱい。呼ぶ側の className が勝つよう :where で詳細度を 0 にする）===== */
 
-.waveform {
+:where(.waveform) {
   display: block;
   width: 100%;
   height: var(--h-waveform);
@@ -168,6 +168,25 @@
   border-radius: var(--radius-lg);
   background: var(--bg-media);
   overflow: hidden;
+}
+
+/* 親いっぱいに広げる枠（クイックルック。地はクイックルックの黒のまま） */
+.fill {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  background: none;
+  border-radius: 0;
+}
+
+/* クイックルックのアニメ（枠と操作の行を縦に） */
+.fillStage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 100%;
 }
 
 .canvas {
@@ -274,10 +293,6 @@
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: var(--space-2);
   margin-top: var(--space-3);
-}
-
-.sheetPreview .frame {
-  height: 160px;
 }
 
 .fields {

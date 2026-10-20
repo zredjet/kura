@@ -96,12 +96,15 @@ describe('useSfxOnSelect（効果音の即再生。決定 13）', () => {
     expect(fake.sfx.play).toHaveBeenCalledWith('h1');
   });
 
-  it('クイックルックを開いたら効果音を止める', () => {
+  it('クイックルックを開いたら効果音と試聴を止める（クイックルックは自分で鳴らす）', () => {
     renderHook(() => useSfxOnSelect());
     select(1);
+    useAuditionStore.setState({ itemId: 1, status: 'playing', mode: 'loop', fromStart: false });
     const stops = fake.sfx.stop.mock.calls.length;
     act(() => useViewStore.getState().setQuickLook(true));
     expect(fake.sfx.stop).toHaveBeenCalledTimes(stops + 1);
+    expect(fake.audition.stop).toHaveBeenCalled();
+    expect(useAuditionStore.getState().status).toBe('idle');
   });
 
   it('選ぶものが変わったら、ほかのアイテムの試聴を止める', () => {

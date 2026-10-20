@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 
 import { ja } from '../../i18n/ja';
 import { peaksUrl } from '../../ipc/media';
@@ -41,8 +41,14 @@ interface WaveformViewProps {
   loop: readonly [number, number] | null;
   /** 試聴中なら、鳴っている元のファイルの位置（フレーム）を返す。 */
   position?: (() => number | null) | null;
+  /** 再生している位置（秒）を返す（クイックルックの <audio> の currentTime。段のレートでフレームにする）。 */
+  positionSeconds?: (() => number | null) | null;
+  /** 再生している位置（ms。シアターのプレーヤーの位置。段のレートでフレームにする）。 */
+  positionMs?: number | null;
   /** 大きさを変えるとき（クイックルックなど。既定は高さ --h-waveform、幅いっぱい）。 */
   className?: string;
+  /** 段のファイルがない・読んでいる間に出すもの（シアターの飾りの波形）。既定は何も出さない。 */
+  fallback?: ReactNode;
   /** テスト用：段のファイルを読む口・描く時刻・装置の画素の比。 */
   load?: (url: string) => Promise<ArrayBuffer | null>;
   frames?: FrameClock;
@@ -59,7 +65,10 @@ export function WaveformView({
   version = null,
   loop,
   position = null,
+  positionSeconds = null,
+  positionMs = null,
   className,
+  fallback = null,
   load = fetchPeaks,
   frames: clock = realFrames,
   dpr = typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1,
@@ -102,14 +111,15 @@ export function WaveformView({
   }, []);
 
   // 試聴中の位置（描くたびに読む。変わったときだけ描き直す）
+  const read = position ?? positionSeconds;
   useEffect(() => {
-    if (!position) {
+    if (!read) {
       return;
     }
     let id = 0;
     let last: number | null = null;
     const step = () => {
-      const now = position();
+      const now = read();
       if (now !== last) {
         last = now;
         setPlayhead(now);
@@ -121,7 +131,7 @@ export function WaveformView({
       clock.cancel(id);
       setPlayhead(null);
     };
-  }, [position, clock]);
+  }, [read, clock]);
 
   const data = peaks?.key === key ? peaks.peaks : null;
   const n = Math.max(1, Math.round(width * dpr));
@@ -134,9 +144,16 @@ export function WaveformView({
 
   const total = data?.frames ?? 0;
   const region = data && loop ? regionX(loop[0], loop[1], 0, total, n) : null;
+  const rate = data?.rate ?? 0;
+  const at =
+    positionMs !== null
+      ? (positionMs * rate) / 1000
+      : playhead !== null && positionSeconds && !position
+        ? playhead * rate
+        : playhead;
   const head =
-    data && playhead !== null && total > 0
-      ? Math.min(n, Math.max(0, (playhead / total) * n))
+    data && at !== null && Number.isFinite(at) && total > 0
+      ? Math.min(n, Math.max(0, (at / total) * n))
       : null;
 
   return (
@@ -147,7 +164,9 @@ export function WaveformView({
       aria-label={ja.asset.waveform}
       data-loaded={data ? 'true' : 'false'}
     >
-      {path !== null && (
+      {path === null ? (
+        fallback
+      ) : (
         <svg viewBox={`0 0 ${n} ${VIEW_HEIGHT}`} preserveAspectRatio="none" aria-hidden="true">
           {region && (
             <>

@@ -60,18 +60,19 @@ export function ItemInspector({ id }: { id: number }) {
   const trashed = detail.trashedAt !== null;
   return (
     <>
-      <div className={styles.preview} data-replaced={assetStage ? 'true' : undefined}>
-        {item.thumbState === 'ready' ? (
-          <img className={styles.previewImage} src={thumbUrl(item.hash, 'l')} alt="" />
-        ) : !isPlayable(item.kind) ? (
-          <KindArt kind={item.kind} />
-        ) : (
-          <span className={styles.previewNote}>
-            {item.thumbState === 'pending' ? t.noThumbnail : ''}
-          </span>
-        )}
-      </div>
-      {assetStage}
+      {assetStage ?? (
+        <div className={styles.preview}>
+          {item.thumbState === 'ready' ? (
+            <img className={styles.previewImage} src={thumbUrl(item.hash, 'l')} alt="" />
+          ) : !isPlayable(item.kind) ? (
+            <KindArt kind={item.kind} />
+          ) : (
+            <span className={styles.previewNote}>
+              {item.thumbState === 'pending' ? t.noThumbnail : ''}
+            </span>
+          )}
+        </div>
+      )}
 
       <div className={styles.head}>
         {editingTitle ? (

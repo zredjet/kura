@@ -38,11 +38,12 @@ function animKey(asset: AssetDto): string | null {
 }
 
 /**
- * インスペクタの 1 件の素材の欄を読む（item_asset_get）。アニメなら帯（item_anim_get）も読む。
+ * 1 件の素材の欄を読む（item_asset_get。インスペクタ・クイックルック。null なら読まない）。アニメなら帯
+ * （item_anim_get）も読む。
  * - 選ぶものが変わった・ライブラリのデータが変わったら読み直す（読み直す間は前の内容を出したまま）。
  * - 解析を待っているものは先に解析してもらい（request_analysis）、解析のジョブが進むたびに読み直す。
  */
-export function useAssetData(itemId: number): AssetData {
+export function useAssetData(itemId: number | null): AssetData {
   const revision = useRevisionStore((s) => s.revision);
   const [tick, setTick] = useState(0);
   const [loaded, setLoaded] = useState<{ id: number; asset: AssetDto } | null>(null);
@@ -51,6 +52,9 @@ export function useAssetData(itemId: number): AssetData {
   const asset = loaded?.id === itemId ? loaded.asset : null;
 
   useEffect(() => {
+    if (itemId === null) {
+      return;
+    }
     let alive = true;
     getAsset(itemId).then(
       (value) => {
@@ -70,7 +74,7 @@ export function useAssetData(itemId: number): AssetData {
   const pending = asset?.analysisState === 'pending';
   const asked = useRef<number | null>(null);
   useEffect(() => {
-    if (!pending) {
+    if (!pending || itemId === null) {
       return;
     }
     if (asked.current !== itemId) {
@@ -104,7 +108,7 @@ export function useAssetData(itemId: number): AssetData {
   // アニメの帯：中身・格子・コマの長さが変わったときだけ作り直す
   const key = asset ? animKey(asset) : null;
   useEffect(() => {
-    if (key === null) {
+    if (key === null || itemId === null) {
       return;
     }
     let alive = true;

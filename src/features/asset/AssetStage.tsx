@@ -68,9 +68,18 @@ export function useFontFace(hash: string | null, loader: FontLoader = fontLoader
 }
 
 /** フォントの見本（上に「永あAa」を --text-specimen、下に「いろはにほへと ABCabc 0123」を --text-lg）。 */
-export function FontSpecimen({ family, name }: { family: string; name: string }) {
+export function FontSpecimen({
+  family,
+  name,
+  className,
+}: {
+  family: string;
+  name: string;
+  /** 枠を変えるとき（クイックルック）。既定はインスペクタの 220px の枠。 */
+  className?: string;
+}) {
   return (
-    <div className={styles.frame}>
+    <div className={className ?? styles.frame}>
       <div
         className={styles.specimen}
         style={{ fontFamily: `"${family}"` }}
@@ -98,6 +107,21 @@ export function AnimStage({ asset, anim }: { asset: AssetDto; anim: AnimDto }) {
         pixelArt={asset.effective.pixelArt}
         alpha={asset.facts?.image.alpha ?? null}
         initialTag={asset.settings.animTag}
+      />
+    </div>
+  );
+}
+
+/** クイックルックのアニメ（ステージいっぱいの枠と、その下の操作の行）。 */
+export function QuickLookAnim({ asset, anim }: { asset: AssetDto; anim: AnimDto }) {
+  return (
+    <div className={styles.fillStage}>
+      <AnimPlayer
+        source={stripSource(anim)}
+        pixelArt={asset.effective.pixelArt}
+        alpha={asset.facts?.image.alpha ?? null}
+        initialTag={asset.settings.animTag}
+        frameHeight="fill"
       />
     </div>
   );

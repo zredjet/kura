@@ -31,11 +31,6 @@
   overflow: hidden;
 }
 
-/* アニメ・フォントの見本が枠を置き換えている（M11。src/features/asset/AssetStage.tsx） */
-.preview[data-replaced] {
-  display: none;
-}
-
 .previewImage {
   max-width: 100%;
   max-height: 100%;

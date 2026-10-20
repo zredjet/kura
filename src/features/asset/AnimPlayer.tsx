@@ -26,6 +26,8 @@ const t = ja.asset;
 const FALLBACK_WIDTH = 272;
 /** インスペクタのプレビューの枠の高さ（Inspector.module.css の .preview と同じ）。 */
 const FRAME_HEIGHT = 220;
+/** 枠を広げる（クイックルック）ときに、高さを測れないときの高さ。 */
+const FALLBACK_FILL_HEIGHT = 480;
 
 /** 回すコマの元（帯の PNG か、格子を切る元の画像）。 */
 export interface AnimSource {
@@ -144,8 +146,8 @@ interface AnimPlayerProps {
   alpha: AlphaKind | null;
   /** 初めに選ぶタグ（素材の設定の animTag）。 */
   initialTag?: string | null;
-  /** 枠の高さ（CSS px）。 */
-  frameHeight?: number;
+  /** 枠の高さ（CSS px）。'fill' は親いっぱいに広げて測る（クイックルック）。 */
+  frameHeight?: number | 'fill';
   /** テスト用：時計・描く関数・画像を読む口・動きを減らす設定・装置の画素の比。 */
   clock?: AnimClock;
   draw?: DrawFrame;
@@ -174,7 +176,11 @@ export function AnimPlayer({
 }: AnimPlayerProps) {
   const frameRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [boxW, setBoxW] = useState(FALLBACK_WIDTH);
+  const fill = frameHeight === 'fill';
+  const [box, setBox] = useState({
+    w: FALLBACK_WIDTH,
+    h: fill ? FALLBACK_FILL_HEIGHT : frameHeight,
+  });
   const [image, setImage] = useState<{ url: string; image: CanvasImageSource | null } | null>(null);
   const [tagName, setTagName] = useState<string | null>(() =>
     source.tags.some((tag) => tag.name === initialTag) ? initialTag : null,
@@ -212,14 +218,15 @@ export function AnimPlayer({
     const el = frameRef.current;
     if (!el) return;
     const observer = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect.width;
-      if (w && w > 0) setBoxW(w);
+      const rect = entries[0]?.contentRect;
+      if (rect && rect.width > 0 && rect.height > 0) setBox({ w: rect.width, h: rect.height });
     });
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
 
-  const size = displaySize(source.canvasW, source.canvasH, boxW, frameHeight, dpr, pixelArt);
+  const boxH = fill ? box.h : frameHeight;
+  const size = displaySize(source.canvasW, source.canvasH, box.w, boxH, dpr, pixelArt);
   const paint = useCallback(
     (frame: number) => {
       const canvas = canvasRef.current;
@@ -300,7 +307,11 @@ export function AnimPlayer({
   ];
   return (
     <>
-      <div ref={frameRef} className={styles.frame} style={{ height: frameHeight }}>
+      <div
+        ref={frameRef}
+        className={fill ? `${styles.frame} ${styles.fill}` : styles.frame}
+        style={fill ? undefined : { height: frameHeight }}
+      >
         {ready === null ? (
           <p className={styles.note}>{t.animFailed}</p>
         ) : (

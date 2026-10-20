@@ -13,7 +13,7 @@ import { stopAudition, useAuditionStore } from './auditionStore';
  * - 効果音の即再生（決定 13。design.md §3.1）：10 秒以下の音声を 1 件だけ選んだら鳴らす。設定（sfxAudition）が
  *   オフ・プレーヤーの再生中・クイックルック中・複数選択では鳴らさない（shouldPlaySfx）。前の音は 10ms で下げて止める。
  * - ループの試聴は選んでいるものの操作なので、選ぶものが変わったら止める。
- * - クイックルックを開いたら効果音を止める（クイックルックは自分で鳴らす）。
+ * - クイックルックを開いたら効果音と試聴を止める（クイックルックは自分で鳴らす）。
  * 画面を離れるときは音を止めて、文脈をすべて閉じる。
  */
 export function useSfxOnSelect(): void {
@@ -25,6 +25,9 @@ export function useSfxOnSelect(): void {
         quickLook = view.quickLook;
         if (quickLook) {
           audioRuntime().sfx.stop();
+          if (useAuditionStore.getState().status !== 'idle') {
+            stopAudition();
+          }
         }
       }
       if (view.selection.focus === focus) {
