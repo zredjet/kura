@@ -175,6 +175,14 @@ fn specta_builder() -> Builder<tauri::Wry> {
         // 種類の表（順・キューに入るか・プロキシ・長さ）。フロントの src/ipc/kinds.ts はこれを読む
         .typ::<dto::ItemKindInfoDto>()
         .constant("ITEM_KINDS", dto::item_kinds())
+        // 検索の表（フィールドの名前・種類の語・半角と同じに扱う記号）。フロントの clauses.ts・ruleRows.ts・
+        // kinds.ts はこれを読み、`透過:あり` を名前空間付きのタグとして扱わない（docs/search-query.md §3）
+        .typ::<dto::QueryFieldNameDto>()
+        .constant("QUERY_FIELD_NAMES", dto::query_field_names())
+        .typ::<dto::QueryKindWordDto>()
+        .constant("QUERY_KIND_WORDS", dto::query_kind_words())
+        .typ::<dto::QuerySymbolDto>()
+        .constant("QUERY_SYMBOLS", dto::query_symbols())
         // ID・ミリ秒・バイト数は 2^53 を超えないので number として扱う
         .dangerously_cast_bigints_to_number()
 }

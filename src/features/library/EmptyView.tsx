@@ -1,17 +1,26 @@
 import { Button } from '../../components/Button/Button';
 import { ja } from '../../i18n/ja';
 import type { ListView } from '../../ipc/items';
+import { formatCount } from '../../lib/format';
 import { useViewStore } from '../../stores/viewStore';
+import { useUnanalyzedCount } from '../search/useUnanalyzed';
 import styles from './Grid.module.css';
 
-/** 空のときの見出しと案内（純粋関数。検索の条件が掛かっていれば、それを先に言う）。 */
+/**
+ * 空のときの見出しと案内（純粋関数。検索の条件が掛かっていれば、それを先に言う）。
+ * `unanalyzed` は解析がまだで一致が決まっていない件数（解析で決まるフィールドを使う条件のとき。design.md §3.1）。
+ */
 export function emptyMessage(
   view: ListView,
   filtered: boolean,
+  unanalyzed = 0,
 ): { title: string; hint: string | null } {
   const t = ja.library.emptyView;
   if (filtered) {
-    return { title: t.filtered, hint: t.filteredHint };
+    return {
+      title: t.filtered,
+      hint: unanalyzed > 0 ? t.filteredUnanalyzed(formatCount(unanalyzed)) : t.filteredHint,
+    };
   }
   switch (view.kind) {
     case 'all':
@@ -39,7 +48,8 @@ export function emptyMessage(
 export function EmptyView({ view }: { view: ListView }) {
   const filter = useViewStore((s) => s.filter);
   const setFilter = useViewStore((s) => s.setFilter);
-  const { title, hint } = emptyMessage(view, filter.length > 0);
+  const unanalyzed = useUnanalyzedCount(view, filter);
+  const { title, hint } = emptyMessage(view, filter.length > 0, unanalyzed);
   return (
     <div className={styles.empty}>
       <p className={styles.emptyTitle}>{title}</p>

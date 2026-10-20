@@ -5,6 +5,7 @@
  */
 
 import { kindWord, PLAYABLE_KINDS, type PlayableKind } from '../../ipc/kinds';
+import { clauseParts } from '../search/clauses';
 
 /**
  * ルールの行で選べる種類：再生できる種類だけ（スマートの候補にフォント・3D は入らない。docs/playlists.md §1.1）。
@@ -124,11 +125,12 @@ function splitTerms(text: string): string[] | null {
   return terms && terms.join(' ') === text.trim().replace(/\s+/g, ' ') ? terms : null;
 }
 
-/** タグとして読める語か（フィールドの条件・記号を含まない）。 */
+/**
+ * タグとして読める語か（フィールドの条件・記号を含まない）。フィールドかどうかは Rust の表
+ * （bindings の `QUERY_FIELD_NAMES`。clauses.ts の `clauseParts`）で見分ける（`透過:あり` はタグではない）。
+ */
 function isTagTerm(term: string): boolean {
-  const field =
-    /^(種類|評価|長さ|追加|撮影|再生|再生回数|フォルダ|ユニット|取得元|名前|url|メモ|タグ数|幅|高さ|向き|type|rating|dur|added|taken|played|plays|folder|unit|source|name|note|tags|w|h|orient)[:=<>!]/i;
-  return !field.test(term) && !/[()|]/.test(term) && !term.startsWith('-');
+  return clauseParts(term).field === null && !/[()|]/.test(term) && !term.startsWith('-');
 }
 
 function tagValue(term: string): string {

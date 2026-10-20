@@ -2,6 +2,8 @@
 //!
 //! できる条件は `items i` に対する式（`WHERE` の中身）。ゴミ箱の扱いは呼ぶ側（一覧の種類）が決める。
 
+use std::cell::Cell;
+
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::types::Value;
@@ -56,13 +58,36 @@ pub fn compile(expr: &Expr, resolver: &dyn Resolver, ctx: &QueryContext) -> Resu
         sql: String::new(),
         params: Vec::new(),
     };
-    Compiler { resolver, ctx }.expr(expr, &mut out)?;
+    Compiler {
+        resolver,
+        ctx,
+        facts: Facts::Known,
+        negated: Cell::new(false),
+        kind_unindexed: Cell::new(false),
+    }
+    .expr(expr, &mut out)?;
     Ok(out)
+}
+
+/// 解析の事実の条件をどう SQL にするか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Facts {
+    /// 事実で判定する（ふつうの検索）。
+    Known,
+    /// 事実を知らないものとして、一致しうるか（上限。未解析の件数）。
+    Upper,
+    /// 事実を知らないものとして、必ず一致するか（下限。未解析の件数）。
+    Lower,
 }
 
 struct Compiler<'a> {
     resolver: &'a dyn Resolver,
     ctx: &'a QueryContext,
+    facts: Facts,
+    /// いま否定（`-`）の中か（入れ子の数が奇数か）。上限・下限を入れ替えるのに使う。
+    negated: Cell<bool>,
+    /// いま事実の集合を引く AND の中か（種類の列に索引を使わせない。`kind_column`）。
+    kind_unindexed: Cell<bool>,
 }
 
 fn placeholders(out: &mut SqlCond, ids: &[i64]) -> String {
@@ -173,7 +198,10 @@ impl Compiler<'_> {
             }
             Expr::Not(inner) => {
                 out.sql.push_str("NOT coalesce(");
-                self.expr(inner, out)?;
+                self.negated.set(!self.negated.get());
+                let done = self.expr(inner, out);
+                self.negated.set(!self.negated.get());
+                done?;
                 out.sql.push_str(", 0)");
                 Ok(())
             }
@@ -234,6 +262,11 @@ impl Compiler<'_> {
             rest = items.iter().collect();
             tag_sets.clear();
         }
+        // 事実の条件（ドット絵を除く）は 1 つの部分問い合わせにまとめる。事実の行は中身ごとに 1 行なので、
+        // `hash IN A AND hash IN B` と `hash IN (A かつ B)` は同じ（集合が小さくなり、10 万件で数十 ms 縮む）
+        let (facts, rest): (Vec<&Expr>, Vec<&Expr>) = rest
+            .into_iter()
+            .partition(|item| self.mergeable_fact(item).is_some());
         out.sql.push('(');
         let mut first = true;
         if !tag_sets.is_empty() {
@@ -248,13 +281,39 @@ impl Compiler<'_> {
                 .push_str(&format!("i.id IN ({})", selects.join(" INTERSECT ")));
             first = false;
         }
+        if !facts.is_empty() {
+            if !first {
+                out.sql.push_str(" AND ");
+            }
+            first = false;
+            let wheres: Vec<String> = facts
+                .iter()
+                .filter_map(|item| self.mergeable_fact(item))
+                .map(|cond| {
+                    self.fact_where(cond, out)
+                        .unwrap_or_else(|| "0".to_string())
+                })
+                .collect();
+            out.sql.push_str(&facts_in(&wheres.join(" AND ")));
+        }
+        // 事実の集合から items をハッシュで引けるとき、種類の索引に引っ張られないようにする（`+i.kind`。
+        // `種類:画像 透過:あり 色数<=16` が 10 万件で 35ms → 3ms）
+        let unindexed = self
+            .kind_unindexed
+            .replace(self.kind_unindexed.get() || !facts.is_empty());
+        let mut done = Ok(());
         for item in rest {
             if !first {
                 out.sql.push_str(" AND ");
             }
             first = false;
-            self.expr(item, out)?;
+            done = self.expr(item, out);
+            if done.is_err() {
+                break;
+            }
         }
+        self.kind_unindexed.set(unindexed);
+        done?;
         out.sql.push(')');
         Ok(())
     }
@@ -358,7 +417,8 @@ impl Compiler<'_> {
                 let marks = vec!["?"; kinds.len()].join(", ");
                 out.params.extend(kinds);
                 let not = if *op == Op::Ne { "NOT " } else { "" };
-                out.sql.push_str(&format!("i.kind {not}IN ({marks})"));
+                out.sql
+                    .push_str(&format!("{} {not}IN ({marks})", self.kind_column()));
             }
             FieldCond::Rating { op, value } => self.compare("i.rating", *op, *value, out),
             FieldCond::Dur { op, value } => self.compare("i.duration_ms", *op, *value, out),
@@ -450,9 +510,245 @@ impl Compiler<'_> {
                 };
                 self.negate_if(*op, sql, out);
             }
+            FieldCond::Pot { op, value } => self.power_of_two(*op, *value, out),
+            FieldCond::Alpha { .. }
+            | FieldCond::Pixel { .. }
+            | FieldCond::Colors { .. }
+            | FieldCond::Rate { .. }
+            | FieldCond::Bits { .. }
+            | FieldCond::Ch { .. }
+            | FieldCond::Lufs { .. }
+            | FieldCond::Peak { .. }
+            | FieldCond::Loop { .. }
+            | FieldCond::Anim { .. } => match self.facts {
+                Facts::Known => self.fact(cond, out),
+                Facts::Upper | Facts::Lower => self.unknown_fact(cond, out),
+            },
         }
         Ok(())
     }
+
+    /// 幅と高さがどちらも 2 のべき乗か（画像。幅・高さがわからないものは、どちらにも入れない）。
+    fn power_of_two(&self, op: Op, value: bool, out: &mut SqlCond) {
+        let want = match op {
+            Op::Has | Op::Eq => value,
+            Op::Ne => !value,
+            _ => {
+                out.sql.push('0');
+                return;
+            }
+        };
+        let kind = push(out, KindValue::Image.as_str().to_string());
+        let both = "(i.width & (i.width - 1)) = 0 AND (i.height & (i.height - 1)) = 0";
+        let test = if want {
+            both.to_string()
+        } else {
+            format!("NOT ({both})")
+        };
+        out.sql.push_str(&format!(
+            "({} = {kind} AND i.width > 0 AND i.height > 0 AND {test})",
+            self.kind_column()
+        ));
+    }
+
+    /// 解析の事実の条件（`i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b … WHERE …)`。
+    /// 部分索引から集合を作り、相関した EXISTS にしない）。事実がない・計れない値（NULL）はどの比較にも入らない。
+    fn fact(&self, cond: &FieldCond, out: &mut SqlCond) {
+        if let FieldCond::Pixel { op, value } = cond {
+            return self.pixel(*op, *value, out);
+        }
+        match self.fact_where(cond, out) {
+            Some(sql) => out.sql.push_str(&facts_in(&sql)),
+            None => out.sql.push('0'),
+        }
+    }
+
+    /// AND の中で 1 つの事実の部分問い合わせにまとめられる条件（事実で判定するときだけ。ドット絵は設定が勝つので除く）。
+    fn mergeable_fact<'e>(&self, expr: &'e Expr) -> Option<&'e FieldCond> {
+        match expr {
+            Expr::Field(
+                cond @ (FieldCond::Alpha { .. }
+                | FieldCond::Colors { .. }
+                | FieldCond::Rate { .. }
+                | FieldCond::Bits { .. }
+                | FieldCond::Ch { .. }
+                | FieldCond::Lufs { .. }
+                | FieldCond::Peak { .. }
+                | FieldCond::Loop { .. }
+                | FieldCond::Anim { .. }),
+            ) if self.facts == Facts::Known => Some(cond),
+            _ => None,
+        }
+    }
+
+    /// 事実の条件の `media_facts f` に対する WHERE（値はバインドする）。一致しない指定（大小の比較の
+    /// できないフィールドの比較など）は None。
+    fn fact_where(&self, cond: &FieldCond, out: &mut SqlCond) -> Option<String> {
+        // あり・なしの列は部分索引（`WHERE x = 1`）を使えるよう、定数（利用者の値ではない）を SQL に書く
+        let wanted = |op: Op, value: bool| -> Option<bool> {
+            match op {
+                Op::Has | Op::Eq => Some(value),
+                Op::Ne => Some(!value),
+                _ => None,
+            }
+        };
+        match cond {
+            FieldCond::Alpha { op, value } => {
+                let not = match op {
+                    Op::Has | Op::Eq => "",
+                    Op::Ne => "NOT ",
+                    _ => return None,
+                };
+                let marks = placeholders(out, value.levels());
+                Some(format!("f.alpha IS NOT NULL AND f.alpha {not}IN ({marks})"))
+            }
+            FieldCond::Loop { op, value } => {
+                wanted(*op, *value).map(|want| format!("f.has_loop = {}", i64::from(want)))
+            }
+            FieldCond::Anim { op, value } => wanted(*op, *value).map(|want| {
+                if want {
+                    "f.frame_count > 1".to_string()
+                } else {
+                    "f.frame_count <= 1".to_string()
+                }
+            }),
+            FieldCond::Colors { op, value } => Some(fact_compare("f.colors", *op, *value, out)),
+            FieldCond::Rate { op, value } => Some(fact_compare("f.sample_rate", *op, *value, out)),
+            FieldCond::Bits { op, value } => Some(fact_compare("f.bits", *op, *value, out)),
+            FieldCond::Ch { op, value } => Some(fact_compare("f.channels", *op, *value, out)),
+            FieldCond::Lufs { op, value } => {
+                Some(fact_compare_milli("f.loudness", *op, *value, out))
+            }
+            FieldCond::Peak { op, value } => {
+                Some(fact_compare_milli("f.true_peak", *op, *value, out))
+            }
+            _ => None,
+        }
+    }
+
+    /// 種類の列。事実の集合から items を引く AND の中では索引を使わない（`+i.kind`）。
+    fn kind_column(&self) -> &'static str {
+        if self.kind_unindexed.get() {
+            "+i.kind"
+        } else {
+            "i.kind"
+        }
+    }
+
+    /// ドット絵の実効値「素材の設定 ?? 自動の判定」が `want` か。設定があればそれだけで決まる。
+    fn pixel(&self, op: Op, value: bool, out: &mut SqlCond) {
+        let Some(want) = pixel_target(op, value) else {
+            out.sql.push('0');
+            return;
+        };
+        let flag = i64::from(want);
+        out.sql.push_str(&format!(
+            "(i.id IN (SELECT item_id FROM asset_settings WHERE pixel_art = {flag}) \
+             OR ({} AND i.id NOT IN (SELECT item_id FROM asset_settings WHERE pixel_art IS NOT NULL)))",
+            facts_in(&format!("f.pixel_art = {flag}"))
+        ));
+    }
+
+    /// 事実を知らないものとしたときの条件（「未解析 N 件」）。否定の中かどうかで、一致しうる側（上限）と
+    /// 必ず一致する側（下限）を入れ替える。上限は「その事実を持ちうる種類」、下限は偽。ドット絵は設定があれば決まる。
+    fn unknown_fact(&self, cond: &FieldCond, out: &mut SqlCond) {
+        let upper = (self.facts == Facts::Upper) != self.negated.get();
+        if let FieldCond::Pixel { op, value } = cond {
+            let Some(want) = pixel_target(*op, *value) else {
+                out.sql.push('0');
+                return;
+            };
+            let set = format!(
+                "i.id IN (SELECT item_id FROM asset_settings WHERE pixel_art = {})",
+                i64::from(want)
+            );
+            if upper {
+                let kind = push(out, KindValue::Image.as_str().to_string());
+                out.sql.push_str(&format!(
+                    "({set} OR (i.kind = {kind} AND i.id NOT IN (SELECT item_id FROM asset_settings WHERE pixel_art IS NOT NULL)))"
+                ));
+            } else {
+                out.sql.push_str(&set);
+            }
+            return;
+        }
+        match cond.analyzed_kind() {
+            Some(kind) if upper => {
+                let mark = push(out, kind.as_str().to_string());
+                out.sql.push_str(&format!("i.kind = {mark}"));
+            }
+            _ => out.sql.push('0'),
+        }
+    }
+}
+
+/// ドット絵の条件が求める実効値（`!=` は逆。大小の比較は一致なし）。
+fn pixel_target(op: Op, value: bool) -> Option<bool> {
+    match op {
+        Op::Has | Op::Eq => Some(value),
+        Op::Ne => Some(!value),
+        _ => None,
+    }
+}
+
+/// 事実の条件を、アイテムのハッシュの集合にする。
+fn facts_in(cond: &str) -> String {
+    format!(
+        "i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE {cond})"
+    )
+}
+
+/// 事実の数の比較（NULL は `!=` を含むどの比較にも入らない）。
+fn fact_compare(column: &str, op: Op, value: i64, out: &mut SqlCond) -> String {
+    let mark = push(out, value);
+    format!("{column} IS NOT NULL AND {column} {} {mark}", sql_op(op))
+}
+
+/// 1/1000 の整数で持つ値（ラウドネス・ピーク）を、REAL の列と比べる。
+fn fact_compare_milli(column: &str, op: Op, milli: i64, out: &mut SqlCond) -> String {
+    let mark = push(out, milli as f64 / 1000.0);
+    format!("{column} IS NOT NULL AND {column} {} {mark}", sql_op(op))
+}
+
+/// 未解析の件数を数える条件（`items i` に対する式）。検索の条件が解析の事実を使わなければ None。
+///
+/// 解析がまだのアイテム（`analysis_state = 'pending'`）のうち、事実を知らないものとして「一致しうる」（上限）が
+/// 「必ず一致する」（下限）ではないもの、つまり解析が終わると一致が変わりうるものを数える（design.md §3.1）。
+/// 事実の部分問い合わせは使わない（種類と素材の設定だけで決まる）。
+pub fn compile_unanalyzed(
+    expr: &Expr,
+    resolver: &dyn Resolver,
+    ctx: &QueryContext,
+) -> Result<Option<SqlCond>> {
+    if !expr.uses_analysis() {
+        return Ok(None);
+    }
+    let bound = |facts: Facts| -> Result<SqlCond> {
+        let mut out = SqlCond {
+            sql: String::new(),
+            params: Vec::new(),
+        };
+        Compiler {
+            resolver,
+            ctx,
+            facts,
+            negated: Cell::new(false),
+            kind_unindexed: Cell::new(false),
+        }
+        .expr(expr, &mut out)?;
+        Ok(out)
+    };
+    let upper = bound(Facts::Upper)?;
+    let lower = bound(Facts::Lower)?;
+    let mut params = upper.params;
+    params.extend(lower.params);
+    Ok(Some(SqlCond {
+        sql: format!(
+            "i.analysis_state = 'pending' AND coalesce(({}), 0) AND NOT coalesce(({}), 0)",
+            upper.sql, lower.sql
+        ),
+        params,
+    }))
 }
 
 /// DB を見て名前を ID にする。

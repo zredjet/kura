@@ -4,6 +4,7 @@
 use rusqlite::Connection;
 
 use super::fields::{FIELDS, FieldDef, FieldKind, KIND_WORDS, find_field};
+use super::lexer;
 use super::parser::split_op;
 use crate::{Result, folders, smart, tags, unit};
 
@@ -74,18 +75,18 @@ fn quote_if_needed(value: &str) -> String {
     }
 }
 
+/// 全角の記号・読点を、字句解析と同じ表（`lexer::SYMBOLS`）で半角にする。
 fn normalize(word: &str) -> String {
-    word.chars()
-        .map(|c| match c {
-            '：' => ':',
-            '＝' => '=',
-            '＞' => '>',
-            '＜' => '<',
-            '！' => '!',
-            '－' => '-',
-            other => other,
-        })
-        .collect()
+    word.chars().map(lexer::normalize).collect()
+}
+
+/// 大小の比較だけのフィールド（ラウドネス・ピーク）なら、その書き方の例。候補は「:」ではなく「>=」で入れる。
+fn comparison_example(def: &FieldDef) -> Option<&'static str> {
+    match def.kind {
+        FieldKind::Lufs => Some("例：ラウドネス>=-14"),
+        FieldKind::Peak => Some("例：ピーク>-1"),
+        _ => None,
+    }
 }
 
 /// 入力中の語（`word`）の候補。空なら保存済みの検索だけ。
@@ -141,12 +142,16 @@ pub fn suggest(conn: &Connection, word: &str, limit: usize) -> Result<Vec<Sugges
                 .iter()
                 .find(|n| n.starts_with(lower.as_str()) || n.starts_with(body.as_str()))
             {
-                out.push(Suggestion::new(
+                let example = comparison_example(def);
+                let op = if example.is_some() { ">=" } else { ":" };
+                let mut s = Suggestion::new(
                     SuggestionKind::Field,
-                    format!("{minus}{name}:"),
+                    format!("{minus}{name}{op}"),
                     "",
-                    format!("{name}:"),
-                ));
+                    format!("{name}{op}"),
+                );
+                s.detail = example.map(str::to_string);
+                out.push(s);
             }
         }
     }
@@ -201,6 +206,14 @@ fn values(
         }
         FieldKind::Orient => fixed(&["縦", "横", "正方形"]),
         FieldKind::Rating => fixed(&["5", "4", "3", "2", "1", "0"]),
+        FieldKind::Alpha => fixed(&["あり", "なし", "半透明", "二値"]),
+        FieldKind::Pixel | FieldKind::Pot | FieldKind::Loop | FieldKind::Anim => {
+            fixed(&["あり", "なし"])
+        }
+        FieldKind::Colors => fixed(&["16", "64", "256"]),
+        FieldKind::Rate => fixed(&["44.1k", "48k", "96k"]),
+        FieldKind::Bits => fixed(&["16", "24", "32"]),
+        FieldKind::Ch => fixed(&["ステレオ", "モノラル"]),
         FieldKind::Source => {
             let mut stmt = conn.prepare_cached(
                 "SELECT source_site, count(*) FROM items WHERE trashed_at IS NULL AND source_site IS NOT NULL
@@ -367,6 +380,91 @@ mod tests {
             vec![(SuggestionKind::Value, "-ユニット:鎌倉".to_string())]
         );
         assert_eq!(inserts(&conn, "名前:"), vec![]);
+    }
+
+    #[test]
+    fn suggests_asset_field_values() {
+        let conn = library();
+        let values = |word: &str| -> Vec<String> {
+            suggest(&conn, word, 8)
+                .unwrap()
+                .into_iter()
+                .inspect(|s| assert_eq!(s.kind, SuggestionKind::Value, "{word}"))
+                .map(|s| s.insert)
+                .collect()
+        };
+        assert_eq!(
+            values("透過:"),
+            ["透過:あり", "透過:なし", "透過:半透明", "透過:二値"]
+        );
+        assert_eq!(values("-透過:半"), ["-透過:半透明"]);
+        for field in ["ドット絵", "2のべき乗", "ループ", "アニメ"] {
+            assert_eq!(
+                values(&format!("{field}:")),
+                [format!("{field}:あり"), format!("{field}:なし")]
+            );
+        }
+        assert_eq!(values("色数<="), ["色数<=16", "色数<=64", "色数<=256"]);
+        assert_eq!(
+            values("レート:"),
+            ["レート:44.1k", "レート:48k", "レート:96k"]
+        );
+        assert_eq!(
+            values("ビット>="),
+            ["ビット>=16", "ビット>=24", "ビット>=32"]
+        );
+        assert_eq!(
+            values("チャンネル："),
+            ["チャンネル:ステレオ", "チャンネル:モノラル"]
+        );
+        // ラウドネス・ピークは値の候補を出さない（数を書く）
+        assert!(values("ラウドネス>").is_empty());
+    }
+
+    #[test]
+    fn comparison_only_fields_suggest_a_comparison() {
+        let conn = library();
+        let found = suggest(&conn, "ラウ", 8).unwrap();
+        let field = found
+            .iter()
+            .find(|s| s.kind == SuggestionKind::Field)
+            .unwrap();
+        // 「:」では探せないので、比較の形で入れ、例を添える
+        assert_eq!(field.insert, "ラウドネス>=");
+        assert_eq!(field.label, "ラウドネス>=");
+        assert!(
+            field.detail.as_deref().is_some_and(|d| d.contains("-14")),
+            "{field:?}"
+        );
+        let found = suggest(&conn, "pe", 8).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|s| s.kind == SuggestionKind::Field && s.insert == "peak>="),
+            "{found:?}"
+        );
+        // ほかのフィールドは今までどおり「:」
+        assert!(
+            suggest(&conn, "透", 8)
+                .unwrap()
+                .iter()
+                .any(|s| s.kind == SuggestionKind::Field && s.insert == "透過:")
+        );
+    }
+
+    #[test]
+    fn values_follow_the_lexer_symbols() {
+        let conn = library();
+        // 読点「、」は「,」と同じ（字句解析と同じ表で直す）
+        assert_eq!(
+            inserts(&conn, "種類:画像、動"),
+            vec![(SuggestionKind::Value, "種類:画像,動画".to_string())]
+        );
+        // U+2212 の「−」の除外
+        assert_eq!(
+            inserts(&conn, "−種類:フォ"),
+            vec![(SuggestionKind::Value, "-種類:フォント".to_string())]
+        );
     }
 
     #[test]

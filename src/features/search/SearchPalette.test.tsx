@@ -31,7 +31,9 @@ vi.mock('../../ipc/search', () => ({
               negated: t.startsWith('-'),
               field: null,
             })),
-          counts: { image: 3, video: 1, audio: 0, total: 4 },
+          counts: { image: 3, video: 1, audio: 0, font: 0, model: 0, total: 4 },
+          // 解析で決まるフィールド（ここでは「透過」）を使うときだけ数が来る（0 もある）
+          unanalyzed: text.includes('透過:') ? (text.includes('種類:音楽') ? 0 : 1234) : null,
         },
   ),
   querySuggest: vi.fn(async (word: string) =>
@@ -105,6 +107,23 @@ describe('SearchPalette', () => {
     fireEvent.keyDown(input(), { key: 'Tab' });
     expect(screen.getByText('作者:もりの')).toBeInTheDocument();
     expect(input().value).toBe('');
+  });
+
+  it('shows how many items are not analyzed yet when asset fields are used', async () => {
+    render(<SearchPalette />);
+    type('夕景');
+    await waitFor(() => expect(screen.getByText('4')).toBeInTheDocument());
+    expect(screen.queryByText(ja.search.unanalyzed('1,234'))).not.toBeInTheDocument();
+
+    type('透過:あり');
+    expect(await screen.findByText(ja.search.unanalyzed('1,234'))).toBeInTheDocument();
+
+    // 0 件なら出さない
+    type('種類:音楽 透過:あり');
+    await waitFor(() =>
+      expect(screen.queryByText(ja.search.unanalyzed('1,234'))).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText(ja.search.unanalyzed('0'))).not.toBeInTheDocument();
   });
 
   it('closes with escape', () => {

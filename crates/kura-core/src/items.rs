@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
 use crate::import::MediaKind;
 use crate::library::hex;
-use crate::query::{DbResolver, Expr, QueryContext, compile};
+use crate::query::{DbResolver, Expr, QueryContext, compile, compile_unanalyzed};
 use crate::text::{natural_cmp, nfc};
 use crate::unit::{self, LIST_FLAG, SetIndex};
 use crate::{CoreError, Result, folders, random, smart};
@@ -462,6 +462,33 @@ pub fn count_kinds(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> 
         add(kind, n);
     }
     Ok(counts)
+}
+
+/// 検索の条件が解析の事実（透過・ループ・ラウドネスなど）を使うとき、一覧の中で解析がまだのために一致が
+/// 決まっていないアイテムの数（⌘K パレットの「未解析 N 件」。design.md §3.1）。事実を使わなければ None。
+pub fn count_unanalyzed(
+    conn: &Connection,
+    query: &ItemQuery,
+    ctx: &QueryContext,
+) -> Result<Option<u64>> {
+    let Some(filter) = &query.filter else {
+        return Ok(None);
+    };
+    let Some(cond) = compile_unanalyzed(filter, &DbResolver { conn }, ctx)? else {
+        return Ok(None);
+    };
+    let mut scope = scope(conn, query.view, ctx)?;
+    scope.sql = format!("{} AND ({})", scope.sql, cond.sql);
+    scope.params.extend(cond.params);
+    if let ItemView::Unit { id } = query.view {
+        let members: HashSet<i64> = unit::members(conn, id)?.into_iter().collect();
+        let matching = matching_ids(conn, &scope)?;
+        return Ok(Some(matching.intersection(&members).count() as u64));
+    }
+    let n: i64 = conn
+        .prepare(&format!("SELECT count(*) FROM items i WHERE {}", scope.sql))?
+        .query_row(params_from_iter(scope.params.iter()), |r| r.get(0))?;
+    Ok(Some(u64::try_from(n).unwrap_or(0)))
 }
 
 /// set ユニットに入っているアイテムを、最初に現れた位置の 1 件のユニット（`LIST_FLAG | unit_id`）にまとめる。

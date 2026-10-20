@@ -4,56 +4,41 @@
  * ここではフィルタバーが自分のフィールドの条件を見つけて差し替えられるよう、先頭のフィールド名だけを読む。
  */
 
+import { QUERY_FIELD_NAMES, QUERY_SYMBOLS } from '../../ipc/bindings';
 import { type ItemKind, kindFromWord } from '../../ipc/kinds';
 
-/** フィールドの日本語名・英語名 → 英語名（docs/search-query.md §3）。 */
-const FIELDS: Record<string, string> = {
-  種類: 'type',
-  type: 'type',
-  評価: 'rating',
-  rating: 'rating',
-  長さ: 'dur',
-  dur: 'dur',
-  追加: 'added',
-  added: 'added',
-  撮影: 'taken',
-  taken: 'taken',
-  再生: 'played',
-  played: 'played',
-  再生回数: 'plays',
-  plays: 'plays',
-  フォルダ: 'folder',
-  folder: 'folder',
-  ユニット: 'unit',
-  unit: 'unit',
-  取得元: 'source',
-  source: 'source',
-  名前: 'name',
-  name: 'name',
-  url: 'url',
-  メモ: 'note',
-  note: 'note',
-  タグ数: 'tags',
-  tags: 'tags',
-  幅: 'w',
-  w: 'w',
-  高さ: 'h',
-  h: 'h',
-  向き: 'orient',
-  orient: 'orient',
-};
+/**
+ * フィールドの名前（日本語・英語。英語は小文字で引く）→ 英語名（docs/search-query.md §3）。
+ * 表の正本は Rust（`query::FIELDS`。bindings の `QUERY_FIELD_NAMES`）。足し忘れると `透過:あり` がタグとして扱われる。
+ */
+const FIELDS = new Map<string, string>(
+  QUERY_FIELD_NAMES.flatMap(({ field, names }) =>
+    names.flatMap((name): [string, string][] => [
+      [name, field],
+      [name.toLowerCase(), field],
+    ]),
+  ),
+);
 
-const FULL_WIDTH: Record<string, string> = {
-  '：': ':',
-  '＝': '=',
-  '＞': '>',
-  '＜': '<',
-  '！': '!',
-  '－': '-',
-};
+/** 名前がフィールドなら英語名（`種類`・`TYPE` → `type`）。名前空間付きのタグの名前なら null。 */
+export function fieldOf(name: string): string | null {
+  return FIELDS.get(name) ?? FIELDS.get(name.toLowerCase()) ?? null;
+}
 
+/** 半角と同じに扱う記号（Rust の字句解析の表 `QUERY_SYMBOLS`：全角の記号・U+2212・読点など）。 */
+const SYMBOLS = new Map<string, string>(QUERY_SYMBOLS.map(({ from, to }) => [from, to]));
+
+/** 記号を Rust の字句解析と同じに直す（引用符の中はそのまま。引用符自身の全角は直す）。 */
 function normalize(text: string): string {
-  return text.replace(/[：＝＞＜！－]/g, (c) => FULL_WIDTH[c] ?? c);
+  let quoted = false;
+  return Array.from(text, (c) => {
+    const n = SYMBOLS.get(c) ?? c;
+    if (n === '"') {
+      quoted = !quoted;
+      return n;
+    }
+    return quoted ? c : n;
+  }).join('');
 }
 
 /** 条件 1 つの中身。 */
@@ -76,7 +61,7 @@ export function clauseParts(text: string): ClauseParts {
   const m = /^([^\s:=<>!()"|]+?)(!=|>=|<=|:|=|>|<)(.*)$/s.exec(body);
   if (m) {
     const [, name = '', op = '', value = ''] = m;
-    const field = FIELDS[name] ?? FIELDS[name.toLowerCase()] ?? null;
+    const field = fieldOf(name);
     if (field) {
       return { negated, field, name, op, value: value.replace(/^"(.*)"$/s, '$1') };
     }
@@ -133,8 +118,9 @@ export function singleKind(clauses: readonly string[]): ItemKind | null {
   if (!parts || (parts.op !== ':' && parts.op !== '=')) {
     return null;
   }
+  // 読点「、」・全角の「，」は normalize が「,」に直している（Rust と同じ）
   const values = parts.value
-    .split(/[,、，]/)
+    .split(',')
     .map((v) => v.trim())
     .filter(Boolean);
   if (values.length !== 1) {
