@@ -24,10 +24,9 @@
 //! - 元が 16 ビット以下の整数なら 16 ビット（値は同じ）、ほかは 32 ビット浮動小数で書く。
 //! - `tests/vectors/pcm/wav.json`：書く前の標本（`input`。f32 のビット）・読んで得る標本（`decoded`。f32 のビット）・
 //!   kura チャンクの値・書いたバイト列（16 進）。
-//!   - ここではテストの中の写し（`reference_wav`）で書き、エンジンの WAV のデコーダ（`wav-kura-dec/1`）が同じ標本・レート・
-//!     チャンネルに読むことを確かめる（kura チャンクは知らないチャンクとして読み飛ばされる）。
-//!   - `asset::pcm` の書き手を作ったら、そのテストでもこのファイルのバイト列と照らす（段 3。書き手はこの写しと同じバイト列を
-//!     書く）。
+//!   - kura-core の書き手（`asset::pcm::write_wav`。段 1 のテストの中の写しから段 3 で差し替えた）で書いたバイト列が
+//!     凍結したものと一致し、エンジンの WAV のデコーダ（`wav-kura-dec/1`）が同じ標本・レート・チャンネルに読むことを
+//!     確かめる（kura チャンクは知らないチャンクとして読み飛ばされる）。`asset::pcm` のテストも同じファイルと照らす。
 //!   - フロントは `src/lib/asset/wav.test.ts` が同じファイルを読み、`src/lib/asset/wav.ts` の `writePcmWav`・
 //!     `readPcmWav` と照らす。
 //! - ベクタは消す・変えるのを認めない（並びを変えるなら kura チャンクの版を上げ、新しいファイルを足す）。足りなければ
@@ -38,6 +37,7 @@
 use std::io::Cursor;
 use std::path::PathBuf;
 
+use kura_core::asset::pcm::{KuraChunk, SampleFormat, write_wav};
 use kura_engine::codec::CodecSet;
 use kura_engine::codec::pcm::quantize;
 use kura_engine::doc::DecodeOptions;
@@ -77,58 +77,25 @@ struct Case {
     planes: Vec<Vec<f32>>,
 }
 
-/// 並びの写し（モジュールの説明のとおり）。
-fn reference_wav(c: &Case) -> Vec<u8> {
-    let channels = c.planes.len() as u16;
-    let frames = c.planes[0].len();
-    let (tag, bits): (u16, u16) = match c.format {
-        Format::I16 => (1, 16),
-        Format::F32 => (3, 32),
+/// kura-core の書き手（`asset::pcm::write_wav`。kura:// の `/pcm` が返すもの）で書く。
+fn real_wav(c: &Case) -> Vec<u8> {
+    let planes: Vec<&[f32]> = c.planes.iter().map(Vec::as_slice).collect();
+    let format = match c.format {
+        Format::I16 => SampleFormat::I16,
+        Format::F32 => SampleFormat::F32,
     };
-    let block = channels * (bits / 8);
-    let mut kura = Vec::new();
-    kura.extend_from_slice(&1u16.to_le_bytes());
-    kura.extend_from_slice(&(c.decoder.len() as u16).to_le_bytes());
-    kura.extend_from_slice(&u32::from(c.looped.is_some()).to_le_bytes());
-    kura.extend_from_slice(&c.start.to_le_bytes());
-    kura.extend_from_slice(&c.total.to_le_bytes());
-    let (ls, le) = c.looped.unwrap_or((0, 0));
-    kura.extend_from_slice(&ls.to_le_bytes());
-    kura.extend_from_slice(&le.to_le_bytes());
-    kura.extend_from_slice(c.decoder.as_bytes());
-    let mut data = Vec::new();
-    for f in 0..frames {
-        for p in &c.planes {
-            match c.format {
-                Format::I16 => data.extend_from_slice(&(quantize(p[f], 16) as i16).to_le_bytes()),
-                Format::F32 => data.extend_from_slice(&p[f].to_le_bytes()),
-            }
-        }
-    }
-    let pad = kura.len() & 1;
-    let riff = 4 + (8 + 16) + (8 + kura.len() + pad) + (8 + data.len());
-    let mut out = Vec::new();
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(riff as u32).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&tag.to_le_bytes());
-    out.extend_from_slice(&channels.to_le_bytes());
-    out.extend_from_slice(&c.rate.to_le_bytes());
-    out.extend_from_slice(&(c.rate * u32::from(block)).to_le_bytes());
-    out.extend_from_slice(&block.to_le_bytes());
-    out.extend_from_slice(&bits.to_le_bytes());
-    out.extend_from_slice(b"kura");
-    out.extend_from_slice(&(kura.len() as u32).to_le_bytes());
-    out.extend_from_slice(&kura);
-    if pad == 1 {
-        out.push(0);
-    }
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    out.extend_from_slice(&data);
-    out
+    write_wav(
+        &planes,
+        c.rate,
+        format,
+        &KuraChunk {
+            start: c.start,
+            total: c.total,
+            loop_range: c.looped,
+            decoder: c.decoder,
+        },
+    )
+    .unwrap()
 }
 
 /// 読んで得る標本（整数は 16 ビットの格子に写した値 / 32768）。
@@ -267,7 +234,7 @@ fn vectors() -> Json {
                 "decoder": c.decoder,
                 "input": bits(&c.planes),
                 "decoded": bits(&decoded(c)),
-                "hex": hex(&reference_wav(c)),
+                "hex": hex(&real_wav(c)),
             })
         })
         .collect();
