@@ -22,6 +22,10 @@
 //! - `vorbis-quality --out <dir> [--quick] [--input <file>]... [--reference <音>/<ラベル>=<ogg>]...`：
 //!   自作の Ogg Vorbis のエンコーダの品質を記録する（M10 段 7。`vorbis_quality` の冒頭）
 
+/// アプリと同じ確保器（大きな確保を OS へすぐ返す。計測をアプリに合わせる）。
+#[global_allocator]
+static ALLOC: kura_mac::ReturningAllocator = kura_mac::ReturningAllocator;
+
 mod assets;
 mod bench;
 mod bench_analyze;

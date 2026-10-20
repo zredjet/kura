@@ -12,9 +12,13 @@
 //! - `codec`：編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し）と
 //!   `codec_set`（固定の段に足した組）・`full_codec_set`（さらに ffmpeg の段を足したアプリの組）・`codec_caps`（能力と環境）
 //!
+//! - `ReturningAllocator`：1 MiB 以上の確保を mmap で取り、解放したら OS へすぐ返す確保器（アプリと kura-devtools の
+//!   `#[global_allocator]`。libmalloc が大きな領域を抱えたままにして NFR-07 に戻らないため。`alloc`）
+//!
 //! macOS 以外では同じ関数・型が「扱えない」を返すだけの空の実装になり、ワークスペース全体がビルドできる。
 
 mod abi;
+pub mod alloc;
 #[cfg(target_os = "macos")]
 mod bridge;
 mod browser;
@@ -24,6 +28,7 @@ mod files;
 pub mod fonts;
 mod thumbs;
 
+pub use alloc::ReturningAllocator;
 pub use browser::{
     SnapshotDone, SnapshotInfo, find_chrome, frontmost_pid, play_capture_sound, snapshot_webview,
 };
