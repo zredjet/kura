@@ -655,6 +655,106 @@ fn audio_facts_match_only_known_values() {
     }
 }
 
+/// ドット絵の検索（この SQL）と素材の欄の実効値（`asset::effective_pixel_art`）が同じ規則であること。設定は素材の欄の
+/// 書き手（`asset::set_settings`）、自動の判定は解析の書き手（`analysis::store::write`）で入れ、設定 3 通り × 自動
+/// 4 通り（未解析・解析済みで材料が足りない・いいえ・はい）のすべてで照らす。
+/// - `ドット絵:あり` は実効値が真のもの、`-ドット絵:あり` はその補集合（画像のほかの種類も入る）。
+/// - `ドット絵:なし`・`ドット絵!=あり` は実効値が偽で、設定か自動の判定があるもの（どちらもなければ決まっていない
+///   ので入れない。search-query.md §4。素材の欄は表示のために偽とする）。
+/// - 「未解析 N 件」は、解析待ちで設定のないもの（設定があれば解析の前でも決まる）。
+#[test]
+fn pixel_art_search_follows_the_effective_value_of_the_asset_panel() {
+    use crate::analysis::facts::{FACTS_V, MediaFacts, PIXEL_RULE};
+    use crate::analysis::store::{ItemWrite, Write, write};
+    use crate::asset::{Change, SettingsPatch, TRISTATE, effective_pixel_art, set_settings};
+
+    // 自動の判定：None は未解析（pending）、Some(None) は解析済みで材料が足りない（NULL）
+    let autos: [Option<Option<bool>>; 4] = [None, Some(None), Some(Some(false)), Some(Some(true))];
+    let conn = test_conn();
+    let mut cases = Vec::new();
+    let mut id = 0_i64;
+    for setting in TRISTATE {
+        for auto in autos {
+            id += 1;
+            let hash = [u8::try_from(id).unwrap(); 32];
+            conn.execute(
+                "INSERT INTO items (id, hash, ext, kind, size_bytes, width, height, title, original_name,
+                                    imported_at, updated_at, analysis_state)
+                 VALUES (?1, ?2, 'png', 'image', 1, 64, 64, 't', 't', 0, 0, 'pending')",
+                params![id, hash.as_slice()],
+            )
+            .unwrap();
+            if let Some(auto) = auto {
+                let facts = MediaFacts {
+                    facts_v: FACTS_V,
+                    alpha: Some(1),
+                    pixel_art: auto,
+                    pixel_rule: Some(PIXEL_RULE),
+                    frame_count: Some(1),
+                    ..MediaFacts::default()
+                };
+                let ready = ItemWrite {
+                    id,
+                    hash,
+                    write: Write::Ready {
+                        results: Vec::new(),
+                        keep: None,
+                        facts: Box::new(facts),
+                        stamp: None,
+                    },
+                };
+                assert_eq!(write(&conn, &[ready], 0).unwrap().written, 1);
+            }
+            if let Some(value) = setting {
+                let patch = SettingsPatch {
+                    pixel_art: Some(Change::Set(value)),
+                    ..SettingsPatch::default()
+                };
+                assert_eq!(set_settings(&conn, &[id], &patch, 0).unwrap(), 1);
+            }
+            cases.push((id, setting, auto));
+        }
+    }
+    // 画像でないもの（除外にだけ入る）
+    conn.execute(
+        "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at,
+                            analysis_state)
+         VALUES (99, ?1, 'ogg', 'audio', 1, 't', 't', 0, 0, 'pending')",
+        params![[99_u8; 32].as_slice()],
+    )
+    .unwrap();
+
+    let effective = |s: Option<bool>, a: Option<Option<bool>>| effective_pixel_art(s, a.flatten());
+    let pick = |want: &dyn Fn(Option<bool>, Option<Option<bool>>) -> bool| -> Vec<i64> {
+        cases
+            .iter()
+            .filter(|(_, s, a)| want(*s, *a))
+            .map(|(id, _, _)| *id)
+            .collect()
+    };
+    let yes = pick(&|s, a| effective(s, a));
+    let no_known = pick(&|s, a| !effective(s, a) && (s.is_some() || a.flatten().is_some()));
+    let mut not_yes = pick(&|s, a| !effective(s, a));
+    not_yes.push(99);
+    assert_eq!(ids(&conn, "ドット絵:あり"), yes);
+    assert_eq!(ids(&conn, "ドット絵!=なし"), yes);
+    assert_eq!(ids(&conn, "ドット絵:なし"), no_known);
+    assert_eq!(ids(&conn, "ドット絵!=あり"), no_known);
+    assert_eq!(ids(&conn, "-ドット絵:あり"), not_yes);
+    // 素材の欄の実効値も同じ関数の値
+    for (id, setting, auto) in &cases {
+        let info = crate::asset::get(&conn, *id).unwrap();
+        assert_eq!(
+            info.effective.pixel_art,
+            effective(*setting, *auto),
+            "{id}: {setting:?} {auto:?}"
+        );
+    }
+    let waiting = pick(&|s, a| a.is_none() && s.is_none()).len() as u64;
+    assert_eq!(unanalyzed(&conn, "ドット絵:あり"), Some(waiting));
+    assert_eq!(unanalyzed(&conn, "ドット絵:なし"), Some(waiting));
+}
+
 /// パレットの「未解析 N 件」：解析がまだで、解析が終わると一致が変わりうるもの。
 fn unanalyzed(conn: &Connection, query: &str) -> Option<u64> {
     let check = super::check(conn, query, crate::items::ItemView::All, &ctx()).unwrap();
