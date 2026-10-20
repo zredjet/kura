@@ -17,6 +17,9 @@ import { thumbUrl } from '../../../ipc/media';
 import { dateTimeLabel } from '../../../lib/dates';
 import { shortHash } from '../../../lib/format';
 import { useViewStore } from '../../../stores/viewStore';
+import { AssetSection } from '../../asset/AssetSection';
+import { useAssetStage } from '../../asset/AssetStage';
+import { useAssetData } from '../../asset/useAssetData';
 import { TagChips } from '../../tags/TagChips';
 import { TagField } from '../../tags/TagField';
 import {
@@ -45,6 +48,9 @@ export function ItemInspector({ id }: { id: number }) {
   const openUnit = useViewStore((s) => s.openUnit);
   const [editingTitle, setEditingTitle] = useState(false);
   const tagIds = useMemo(() => new Set(detail?.tags.map((tag) => tag.id) ?? []), [detail]);
+  // 素材の欄（M11）：アニメ・フォントの見本はプレビューの枠を置き換える
+  const assetData = useAssetData(id);
+  const assetStage = useAssetStage(assetData);
 
   if (!detail) {
     return null;
@@ -54,7 +60,7 @@ export function ItemInspector({ id }: { id: number }) {
   const trashed = detail.trashedAt !== null;
   return (
     <>
-      <div className={styles.preview}>
+      <div className={styles.preview} data-replaced={assetStage ? 'true' : undefined}>
         {item.thumbState === 'ready' ? (
           <img className={styles.previewImage} src={thumbUrl(item.hash, 'l')} alt="" />
         ) : !isPlayable(item.kind) ? (
@@ -65,6 +71,7 @@ export function ItemInspector({ id }: { id: number }) {
           </span>
         )}
       </div>
+      {assetStage}
 
       <div className={styles.head}>
         {editingTitle ? (
@@ -100,6 +107,8 @@ export function ItemInspector({ id }: { id: number }) {
           />
         )}
       </div>
+
+      <AssetSection data={assetData} item={item} />
 
       {trashed && (
         <section className={styles.trashed}>
