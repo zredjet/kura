@@ -9,11 +9,13 @@ paths:
 - コンポーネントは `src/components/`（汎用部品）と `src/features/<機能>/`（画面）に分ける。
 - IPC は `src/ipc/bindings.ts`（自動生成、手で編集しない）を `src/ipc/` のラッパー経由で呼ぶ。
 - 画像・動画・音声とその派生（サムネイル・ジャケット・波形・試聴の PCM・アニメの帯）の URL は `src/ipc/media.ts` の関数だけで組み立てる（`kura://localhost/...`。`kura://` の文字列をほかに書かない）。
-  - `thumbUrl(hash, size, rev)`：`/thumb/{hash}/{s|l}`。`rev`（`thumbRev`）が 0 より大きいときだけ `?r={rev}` を付ける（作り直したサムネイルを WebKit のメモリのキャッシュから出さないため。`rev` を渡し忘れない）。
+  - `thumbUrl(hash, size, rev)`：`/thumb/{hash}/{s|l}`。`rev`（`thumbRev`）が 0 より大きいときだけ `?r={rev}` を付ける（作り直したサムネイルを WebKit のメモリのキャッシュから出さないため。`rev` は省けない）。呼ぶのは `src/components/MediaImage` だけ（市松模様・ドット絵の最近傍・フォントの mask をそこで当てる）。サムネイルを出す所はすべて `MediaImage` を通す。
+  - サムネイルがあるかは `hasThumb(thumbState)`（`ready` か、作り直すまで今の絵を出す `stale`）。`thumbState === 'ready'` で判定しない。
   - `artUrl(hash)`・`fileUrl(hash)`・`playUrl(hash)`：ジャケット・元のファイル・再生用（Range 対応）。
   - `peaksUrl(hash)`：`/peaks/{hash}`（波形の段 `kura-peaks`。immutable）。`fetch` して `src/lib/asset/peaks.ts` の `parsePeaks` で読む。
   - `pcmUrl(hash, start, end)`：`/pcm/{hash}/{start}-{end}`（試聴の PCM。フレームの半開区間で、0 以上の整数・`start < end`。キャッシュしない）。`fetch` して `src/lib/asset/wav.ts` の `readPcmWav` で読む（`decodeAudioData` は使わない。文脈のレートに直されてループ点が標本で合わなくなる）。
-  - `animUrl(hash)`：`/anim/{hash}/1`（アニメの帯の PNG。immutable。帯の並べ方を変えたら番号を上げる）。
+  - `animUrl(hash, rev)`：`/anim/{hash}/1`（アニメの帯の PNG。immutable。帯の並べ方を変えたら番号を上げる）。`rev` は `item_anim_get` の `AnimDto.rev`（格子の帯は格子ごとに変わる）で、0 より大きいときだけ `?r={rev}`。
+  - `media.test.ts` が、`kura://` の組み立て・`thumbUrl` の呼び出し・`thumbState` の `'ready'` だけの判定がほかのファイルにないことを見張る（注釈は除く。自己点検の `src/dev/selftest.ts` は壊れた URL をわざと組むので外す）。
 - ループの試聴は `src/lib/assetAudio.ts` の `Audition` を通す。`AudioBufferSourceNode` の `loopStart`・`loopEnd` を使わない（秒に直すと標本がずれる。本体だけのバッファを `loop` で回す）。文脈は `ContextPool` から元のレートで取る。
 - 一覧・グリッド・キューは必ず仮想スクロール。1 万件を DOM に並べない。
 - 検索結果は ID 配列（`Int32Array` など）で保持し、詳細は見えている範囲だけ取得してキャッシュする。

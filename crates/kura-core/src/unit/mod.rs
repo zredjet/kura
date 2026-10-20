@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::asset::{self, Alpha, AnalysisState};
 use crate::folders;
 use crate::import::MediaKind;
 use crate::items::aspect_code;
@@ -283,6 +284,14 @@ pub struct Cover {
     pub thumb_state: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    /// サムネイルを作り直した回数（URL の `?r=`。アイテムの概要と同じ）。
+    pub thumb_rev: i64,
+    /// 解析の進み具合（届いたら表紙を取り直す）。
+    pub analysis_state: AnalysisState,
+    /// 解析で分かった透過（市松模様を敷くか）。
+    pub alpha: Option<Alpha>,
+    /// ドット絵として表示するか（実効値。アイテムの概要と同じ規則）。
+    pub pixel_art: bool,
 }
 
 /// グリッドのタイル・一覧に出すユニットの要約。
@@ -300,6 +309,16 @@ pub struct UnitSummary {
     pub last_played_at: Option<i64>,
 }
 
+/// 表紙の問い合わせ（アイテムの概要と同じく、事実は台帳の行から、設定はアイテムの主キーから引く）。
+const COVER_SQL: &str =
+    "SELECT i.hash, i.kind, i.thumb_state, i.width, i.height, i.thumb_rev, i.analysis_state, f.alpha,
+            f.pixel_art, s.pixel_art
+     FROM items i
+     LEFT JOIN blobs b ON b.hash = i.hash
+     LEFT JOIN media_facts f ON f.blob_id = b.id
+     LEFT JOIN asset_settings s ON s.item_id = i.id
+     WHERE i.id = ?1";
+
 fn cover_of(conn: &Connection, row: &UnitRow, members: &[i64]) -> Result<Option<Cover>> {
     // 表紙に選んだものがメンバーにいなければ（ゴミ箱など）先頭のメンバー。
     // 逆順でも表紙は変えない（逆にする前の並びの先頭）
@@ -315,17 +334,31 @@ fn cover_of(conn: &Connection, row: &UnitRow, members: &[i64]) -> Result<Option<
     let Some(id) = id else {
         return Ok(None);
     };
-    let mut stmt = conn
-        .prepare_cached("SELECT hash, kind, thumb_state, width, height FROM items WHERE id = ?1")?;
+    let mut stmt = conn.prepare_cached(COVER_SQL)?;
     Ok(stmt
         .query_row([id], |r| {
+            let kind: MediaKind = r.get(1)?;
+            // ドット絵の実効値はアイテムの概要と同じ関数で決める（表紙はコマの数を使わないので格子は渡さない）
+            let effective = asset::effective(
+                kind,
+                (None, None),
+                asset::EffectiveInputs {
+                    auto_pixel_art: r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
+                    pixel_art_setting: r.get::<_, Option<i64>>(9)?.map(|v| v != 0),
+                    ..asset::EffectiveInputs::default()
+                },
+            );
             Ok(Cover {
                 item_id: id,
                 hash: hex(&r.get::<_, Vec<u8>>(0)?),
-                kind: r.get(1)?,
+                kind,
                 thumb_state: r.get(2)?,
                 width: r.get(3)?,
                 height: r.get(4)?,
+                thumb_rev: r.get(5)?,
+                analysis_state: AnalysisState::parse(&r.get::<_, String>(6)?),
+                alpha: r.get::<_, Option<i64>>(7)?.and_then(Alpha::from_code),
+                pixel_art: effective.pixel_art,
             })
         })
         .optional()?)
@@ -1199,5 +1232,83 @@ mod tests {
         assert_eq!(index.by_item.get(&1), None);
         assert_eq!(index.cover_aspect.get(&a), Some(&1778)); // 表紙（1）がゴミ箱なので 2
         assert_eq!(index.cover_aspect.get(&b), Some(&563));
+    }
+
+    /// 表紙もアイテムの概要（items.rs の SUMMARY）と同じく、サムネイルの作り直しの回数・解析の進み具合・透過・ドット絵の
+    /// 実効値を持つ（作り直したサムネイルを古いキャッシュから出さない、表紙にも市松模様と最近傍を当てる）。
+    #[test]
+    fn cover_carries_the_thumb_rev_and_the_tile_facts() {
+        use crate::analysis::facts::{FACTS_V, MediaFacts, PIXEL_RULE};
+        use crate::analysis::store::{ItemWrite, Write, write};
+        use crate::asset::{Change, SettingsPatch, set_settings};
+
+        let conn = test_conn();
+        items(&conn);
+        let ready = ItemWrite {
+            id: 1,
+            hash: [1; 32],
+            write: Write::Ready {
+                results: Vec::new(),
+                keep: None,
+                facts: Box::new(MediaFacts {
+                    facts_v: FACTS_V,
+                    alpha: Some(2),
+                    pixel_art: Some(true),
+                    pixel_rule: Some(PIXEL_RULE),
+                    frame_count: Some(1),
+                    ..MediaFacts::default()
+                }),
+                stamp: None,
+            },
+        };
+        assert_eq!(write(&conn, &[ready], 0).unwrap().written, 1);
+        conn.execute(
+            "UPDATE items SET thumb_state = 'stale', thumb_rev = 2 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let unit = create_set(&conn, "u", &[1, 2], 10).unwrap();
+        let cover = |conn: &Connection| summaries(conn, &[unit]).unwrap()[0].cover.clone().unwrap();
+        let item = |conn: &Connection| crate::items::summaries(conn, &[1]).unwrap().remove(0);
+
+        let c = cover(&conn);
+        assert_eq!(
+            (c.item_id, c.thumb_state.as_str(), c.thumb_rev),
+            (1, "stale", 2)
+        );
+        assert_eq!(
+            (c.analysis_state, c.alpha, c.pixel_art),
+            (AnalysisState::Ready, Some(Alpha::Partial), true)
+        );
+        // 設定が自動の判定に勝つ（アイテムの概要と同じ値）
+        let set = |value: Change<bool>| {
+            let patch = SettingsPatch {
+                pixel_art: Some(value),
+                ..SettingsPatch::default()
+            };
+            assert_eq!(set_settings(&conn, &[1], &patch, 0).unwrap(), 1);
+        };
+        set(Change::Set(false));
+        let (c, i) = (cover(&conn), item(&conn));
+        assert!(!c.pixel_art);
+        assert_eq!(
+            (c.thumb_rev, c.analysis_state, c.alpha, c.pixel_art),
+            (i.thumb_rev, i.analysis_state, i.alpha, i.pixel_art)
+        );
+        set(Change::Clear);
+        assert!(cover(&conn).pixel_art);
+        // 未解析の表紙（2）は透過も判定もない
+        let other = create_set(&conn, "v", &[2], 10).unwrap();
+        let c = summaries(&conn, &[other]).unwrap()[0]
+            .cover
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (c.analysis_state, c.alpha, c.pixel_art, c.thumb_rev),
+            (AnalysisState::Pending, None, false, 0)
+        );
+        // 表紙の問い合わせは主キーと台帳の索引で引く
+        let plan = crate::db::query_plan(&conn, &COVER_SQL.replace("?1", "1"));
+        assert!(!plan.contains("SCAN"), "{plan}");
     }
 }

@@ -1,7 +1,14 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { JobProgress } from '../ipc/jobs';
-import { selectCurrentImport, useJobsStore } from './jobsStore';
+import { refreshAnalyzing, refreshThumbnails } from './itemCache';
+import { reactToJob, selectCurrentImport, useJobsStore } from './jobsStore';
+
+vi.mock('./itemCache', async (original) => ({
+  ...(await original<typeof import('./itemCache')>()),
+  refreshAnalyzing: vi.fn(),
+  refreshThumbnails: vi.fn(),
+}));
 
 function event(over: Partial<JobProgress>): JobProgress {
   return {
@@ -39,5 +46,33 @@ describe('jobsStore', () => {
     expect(selectCurrentImport(useJobsStore.getState())?.id).toBe(3);
     dismiss(3);
     expect(selectCurrentImport(useJobsStore.getState())).toBeNull();
+  });
+});
+
+describe('reactToJob', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(refreshAnalyzing).mockClear();
+    vi.mocked(refreshThumbnails).mockClear();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('解析のジョブが進んだら、解析待ちのものをまとめて取り直す（透過・ドット絵・印が届く）', () => {
+    reactToJob(event({ id: 7, kind: 'analyze', progress: 0.1 }));
+    reactToJob(event({ id: 7, kind: 'analyze', progress: 0.2 }));
+    reactToJob(event({ id: 7, kind: 'analyze', state: 'done' }));
+    expect(refreshAnalyzing).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1000);
+    expect(refreshAnalyzing).toHaveBeenCalledTimes(1);
+    expect(refreshThumbnails).not.toHaveBeenCalled();
+  });
+
+  it('サムネイルのジョブが進んだら、まだのもの・作り直し中のものを取り直す', () => {
+    reactToJob(event({ id: 8, kind: 'thumbnail' }));
+    vi.advanceTimersByTime(500);
+    expect(refreshThumbnails).toHaveBeenCalledTimes(1);
+    expect(refreshAnalyzing).not.toHaveBeenCalled();
   });
 });

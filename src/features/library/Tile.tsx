@@ -6,11 +6,13 @@ import { KindIcon } from '../../components/icons/KindIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
 import { UnitIcon } from '../../components/icons/UnitIcon';
 import { Waveform } from '../../components/icons/Waveform';
+import { FramesIcon } from '../../components/icons/FramesIcon';
+import { RepeatIcon } from '../../components/icons/RepeatIcon';
 import { KindArt } from '../../components/KindArt/KindArt';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { hasDuration, isItemKind, isPlayable, type ItemKind, kindLabel } from '../../ipc/kinds';
-import { thumbUrl } from '../../ipc/media';
 import type { UnitSummaryDto } from '../../ipc/units';
 import { formatCount, formatDuration } from '../../lib/format';
 import { spokenLabel } from './describeItem';
@@ -27,6 +29,17 @@ function isAsset(kind: string | undefined): kind is ItemKind {
 /** 左下に種類のバッジを出す種類（音楽と、フォント・3D。design.md §4 のタイル）。 */
 function hasKindBadge(kind: string | undefined): kind is ItemKind {
   return kind === 'audio' || isAsset(kind);
+}
+
+/** ユニットの表紙を下げる分（Tile.module.css の .cover の top）。 */
+const UNIT_COVER_TOP = 6;
+
+/** サムネイルがないとき（まだ・作れなかった）の絵：音楽は波形の飾り、フォント・3D は種類の絵。 */
+function placeholderOf(kind: string) {
+  if (kind === 'audio') {
+    return <Waveform className={styles.waveform} />;
+  }
+  return isAsset(kind) ? <KindArt kind={kind} /> : null;
 }
 
 /** タイルのマウス・ドラッグの受け口（グリッドが持つ）。 */
@@ -78,17 +91,16 @@ export const Tile = memo(function Tile({
       onContextMenu={(e) => handlers.onContextMenu(id, e)}
       onPointerDown={(e) => handlers.onPointerDown(id, e)}
     >
-      {item?.thumbState === 'ready' && (
-        <img
+      {item && (
+        <MediaImage
+          source={item}
+          size="s"
+          fit="cover"
+          box={{ w: width, h: height }}
           className={styles.thumb}
-          src={thumbUrl(item.hash, 's')}
-          alt=""
-          decoding="async"
-          draggable={false}
+          fallback={placeholderOf(item.kind)}
         />
       )}
-      {isAsset(kind) && item?.thumbState !== 'ready' && <KindArt kind={kind} />}
-      {kind === 'audio' && item?.thumbState !== 'ready' && <Waveform className={styles.waveform} />}
       {hasKindBadge(kind) && (
         <span className={`${styles.badge} ${styles.bottomLeft}`}>
           <KindIcon kind={kind} size={10} strokeWidth={2.4} />
@@ -98,7 +110,21 @@ export const Tile = memo(function Tile({
       {hasDuration(kind) && duration !== null && (
         <span className={`${styles.badge} ${styles.bottomRight}`}>
           {kind === 'video' && <PlayIcon size={8} />}
+          {kind === 'audio' && item?.hasLoop && (
+            <span className={styles.badgeIcon} title={ja.mediaView.loop}>
+              <RepeatIcon size={10} strokeWidth={2.4} />
+            </span>
+          )}
           {formatDuration(duration)}
+        </span>
+      )}
+      {kind === 'image' && item?.animated && (
+        <span
+          className={`${styles.badge} ${styles.bottomRight}`}
+          title={item.frameCount === null ? ja.mediaView.animated : undefined}
+        >
+          <FramesIcon size={10} strokeWidth={2.4} />
+          {item.frameCount !== null && ja.mediaView.frames(formatCount(item.frameCount))}
         </span>
       )}
       {DOWNLOAD_SITES.has(site) && (
@@ -155,20 +181,15 @@ export const UnitTile = memo(function UnitTile({
       <span className={`${styles.plate} ${styles.plateBack}`} />
       <span className={`${styles.plate} ${styles.plateMiddle}`} />
       <span className={styles.cover} data-kind={cover?.kind}>
-        {cover?.thumbState === 'ready' && (
-          <img
+        {cover && (
+          <MediaImage
+            source={cover}
+            size="s"
+            fit="cover"
+            box={{ w: width, h: height - UNIT_COVER_TOP }}
             className={styles.thumb}
-            src={thumbUrl(cover.hash, 's')}
-            alt=""
-            decoding="async"
-            draggable={false}
+            fallback={placeholderOf(cover.kind)}
           />
-        )}
-        {cover?.kind === 'audio' && cover.thumbState !== 'ready' && (
-          <Waveform className={styles.waveform} />
-        )}
-        {cover && isAsset(cover.kind) && cover.thumbState !== 'ready' && (
-          <KindArt kind={cover.kind} />
         )}
         <span className={`${styles.badge} ${styles.bottomRight}`}>
           {formatCount(count)}

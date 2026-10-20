@@ -620,6 +620,14 @@ export type CoverDto = {
 	thumbState: string,
 	width: number | null,
 	height: number | null,
+	/**  サムネイルを作り直した回数（アイテムの概要の `thumbRev` と同じ）。 */
+	thumbRev: number,
+	/**  解析の進み具合（`pending` なら解析のジョブが進んだら取り直す）。 */
+	analysisState: AssetAnalysisStateDto,
+	/**  解析で分かった透過（市松模様）。 */
+	alpha: AssetAlphaDto | null,
+	/**  ドット絵として表示するか（実効値）。 */
+	pixelArt: boolean,
 };
 
 /**  URL の判定の結果。 */
@@ -913,10 +921,26 @@ export type ItemSummaryDto = {
 	sourceSite: string | null,
 	importedAt: number,
 	capturedAt: number | null,
-	/**  `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。 */
+	/**  `pending` / `ready` / `stale` / `failed`。`ready` と `stale`（作り直すまで今の絵を出す）のときサムネイルがある。 */
 	thumbState: string,
 	proxyState: string,
 	lastPlayedAt: number | null,
+	/**  サムネイルを作り直した回数（`thumbUrl` の `rev`。0 より大きければ URL に `?r=`）。 */
+	thumbRev: number,
+	/**  解析の進み具合（`pending` のものは、解析のジョブが進んだら取り直す）。 */
+	analysisState: AssetAnalysisStateDto,
+	/**  解析で分かった透過（未解析・画像でなければ null）。`binary`・`partial` なら市松模様を敷く。 */
+	alpha: AssetAlphaDto | null,
+	/**  ドット絵として表示するか（実効値：設定 ?? 自動の判定 ?? 偽）。広げるときだけ最近傍。 */
+	pixelArt: boolean,
+	/**  ドット絵の設定（null は自動）。右クリックの「ドット絵として表示」のチェックに使う。 */
+	pixelArtSetting: boolean | null,
+	/**  アニメとして回せるか（コマが 2 つ以上か、格子を設定してある）。 */
+	animated: boolean,
+	/**  コマの数（格子があれば帯で使う数）。タイルの「8 コマ」。 */
+	frameCount: number | null,
+	/**  ループ点がある音声か。 */
+	hasLoop: boolean,
 };
 
 /**  一覧の種類（`items_query_ids` の引数。生バイトのコマンドなので TS の型は `src/ipc/items.ts` に書く）。 */

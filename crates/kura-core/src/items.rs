@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
+use crate::asset::{self, Alpha, AnalysisState};
 use crate::import::MediaKind;
 use crate::library::hex;
 use crate::query::{DbResolver, Expr, QueryContext, compile, compile_unanalyzed};
@@ -602,22 +603,70 @@ pub struct ItemSummary {
     /// 再生用プロキシの状態（unknown / not_needed / pending / ready / failed）。
     pub proxy_state: String,
     pub last_played_at: Option<i64>,
+    /// サムネイルを作り直した回数（URL の `?r=`。WebKit のメモリのキャッシュから古い絵を出さないため）。
+    pub thumb_rev: i64,
+    /// 解析の進み具合（`items.analysis_state`）。
+    pub analysis_state: AnalysisState,
+    /// 解析で分かった透過（`media_facts.alpha`。未解析・画像でなければ None）。
+    pub alpha: Option<Alpha>,
+    /// ドット絵として表示するか（実効値。[`asset::effective`]）。
+    pub pixel_art: bool,
+    /// ドット絵の設定（`asset_settings.pixel_art`。None は自動）。右クリックのメニューのチェックに使う。
+    pub pixel_art_setting: Option<bool>,
+    /// アニメとして回せるか（実効値）。
+    pub animated: bool,
+    /// コマの数（実効値。格子があれば帯で使う数）。
+    pub frame_count: Option<u32>,
+    /// 解析で分かったループ点があるか（音声）。
+    pub has_loop: bool,
 }
 
-const SUMMARY_COLUMNS: &str = "id, hash, ext, kind, width, height, duration_ms, size_bytes, title, \
-                               rating, source_site, imported_at, captured_at, thumb_state, proxy_state, last_played_at";
+/// 概要の列。素材の表示（市松模様・ドット絵・アニメとループの印）のために、中身ごとの解析の事実（`media_facts`）と
+/// アイテムごとの設定（`asset_settings`）を [`SUMMARY_FROM`] の LEFT JOIN で引く（docs/data-model.md §4）。
+const SUMMARY_COLUMNS: &str = "i.id, i.hash, i.ext, i.kind, i.width, i.height, i.duration_ms, i.size_bytes, i.title, \
+                               i.rating, i.source_site, i.imported_at, i.captured_at, i.thumb_state, i.proxy_state, \
+                               i.last_played_at, i.thumb_rev, i.analysis_state, f.alpha, f.pixel_art, f.frame_count, \
+                               f.has_loop, s.pixel_art, s.grid_json";
 /// `SUMMARY_COLUMNS` の列数（続けて読む列の位置に使う）。
-const SUMMARY_LEN: usize = 16;
+const SUMMARY_LEN: usize = 24;
+/// 概要の表：アイテム（主キー）→ 台帳（hash の UNIQUE）→ 事実（blob_id の主キー）、設定（item_id の主キー）。
+const SUMMARY_FROM: &str = "items i
+     LEFT JOIN blobs b ON b.hash = i.hash
+     LEFT JOIN media_facts f ON f.blob_id = b.id
+     LEFT JOIN asset_settings s ON s.item_id = i.id";
+
+/// 0 以上で u32 に収まる整数（ほかは None）。
+fn u32_of(v: Option<i64>) -> Option<u32> {
+    v.and_then(|v| u32::try_from(v).ok())
+}
 
 fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ItemSummary> {
     let hash: Vec<u8> = row.get(1)?;
+    let kind: MediaKind = row.get(3)?;
+    let width: Option<i64> = row.get(4)?;
+    let height: Option<i64> = row.get(5)?;
+    let pixel_art_setting = row.get::<_, Option<i64>>(22)?.map(|v| v != 0);
+    let grid = row
+        .get::<_, Option<String>>(23)?
+        .as_deref()
+        .and_then(asset::grid_from_json);
+    let effective = asset::effective(
+        kind,
+        (u32_of(width), u32_of(height)),
+        asset::EffectiveInputs {
+            auto_pixel_art: row.get::<_, Option<i64>>(19)?.map(|v| v != 0),
+            frame_count: u32_of(row.get(20)?),
+            pixel_art_setting,
+            grid: grid.as_ref(),
+        },
+    );
     Ok(ItemSummary {
         id: row.get(0)?,
         hash: hex(&hash),
         ext: row.get(2)?,
-        kind: row.get(3)?,
-        width: row.get(4)?,
-        height: row.get(5)?,
+        kind,
+        width,
+        height,
         duration_ms: row.get(6)?,
         size_bytes: row.get(7)?,
         title: row.get(8)?,
@@ -628,7 +677,30 @@ fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ItemSummary> {
         thumb_state: row.get(13)?,
         proxy_state: row.get(14)?,
         last_played_at: row.get(15)?,
+        thumb_rev: row.get(16)?,
+        analysis_state: AnalysisState::parse(&row.get::<_, String>(17)?),
+        alpha: row.get::<_, Option<i64>>(18)?.and_then(Alpha::from_code),
+        pixel_art: effective.pixel_art,
+        pixel_art_setting,
+        animated: effective.animated,
+        frame_count: effective.frame_count,
+        has_loop: row.get::<_, Option<i64>>(21)?.is_some_and(|v| v != 0),
     })
+}
+
+/// `summaries` の SQL（`n` 個の `?`）。
+fn summaries_sql(n: usize) -> String {
+    let marks = vec!["?"; n].join(", ");
+    format!("SELECT {SUMMARY_COLUMNS} FROM {SUMMARY_FROM} WHERE i.id IN ({marks})")
+}
+
+/// `detail` の SQL（概要の列のあとにインスペクタの列）。
+fn detail_sql() -> String {
+    format!(
+        "SELECT {SUMMARY_COLUMNS}, i.mime, i.codec_info, i.original_name, i.original_path, i.source_url, i.note,
+                i.trashed_at
+         FROM {SUMMARY_FROM} WHERE i.id = ?1"
+    )
 }
 
 /// 見えている分の詳細を、渡した ID の順で返す（見つからない ID は飛ばす）。
@@ -642,10 +714,7 @@ pub fn summaries(conn: &Connection, ids: &[i64]) -> Result<Vec<ItemSummary>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let marks = vec!["?"; ids.len()].join(", ");
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {SUMMARY_COLUMNS} FROM items WHERE id IN ({marks})"
-    ))?;
+    let mut stmt = conn.prepare_cached(&summaries_sql(ids.len()))?;
     let rows = stmt.query_map(params_from_iter(ids.iter()), summary_from_row)?;
     let mut by_id: HashMap<i64, ItemSummary> = HashMap::with_capacity(ids.len());
     for row in rows {
@@ -680,10 +749,7 @@ pub struct ItemDetail {
 
 /// 1 件の詳細。
 pub fn detail(conn: &Connection, id: i64) -> Result<ItemDetail> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {SUMMARY_COLUMNS}, mime, codec_info, original_name, original_path, source_url, note, trashed_at
-         FROM items WHERE id = ?1"
-    ))?;
+    let mut stmt = conn.prepare_cached(&detail_sql())?;
     let found = stmt
         .query_row([id], |row| {
             Ok((
@@ -1086,6 +1152,247 @@ mod tests {
         assert_eq!(items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(items[0].hash, hex(&[3u8; 32]));
         assert!(summaries(&conn, &vec![1; MAX_SUMMARIES + 1]).is_err());
+    }
+
+    /// タイルの詳細（`summaries`・`detail`）は、事実を台帳の行（blobs）から、設定をアイテムの主キーから引く。
+    /// 200 件の IN でも items・blobs・media_facts・asset_settings のどれも全件走査しない。
+    #[test]
+    fn summaries_join_facts_and_settings_without_scanning() {
+        let conn = test_conn();
+        for n in [1, MAX_SUMMARIES] {
+            let marks = vec!["1"; n].join(", ");
+            let sql = summaries_sql(n).replace(&vec!["?"; n].join(", "), &marks);
+            let plan = query_plan(&conn, &sql);
+            assert!(!plan.contains("SCAN"), "{n} 件:\n{plan}");
+            for (table, how) in [
+                ("b", "sqlite_autoindex_blobs_1"),
+                ("f", "INTEGER PRIMARY KEY"),
+                ("s", "INTEGER PRIMARY KEY"),
+            ] {
+                assert!(
+                    plan.contains(&format!("SEARCH {table} USING")) && plan.contains(how),
+                    "{table} を {how} で引く:\n{plan}"
+                );
+            }
+        }
+        let plan = query_plan(&conn, &detail_sql().replace("?1", "1"));
+        assert!(!plan.contains("SCAN"), "{plan}");
+    }
+
+    /// 解析の事実（解析の書き手 `analysis::store::write` で入れる）と設定（素材の欄の書き手 `asset::set_settings`）を
+    /// 引き、実効値は素材の欄（`asset::get`）と同じ規則（`asset::effective_pixel_art`）で決まる。設定 3 通り ×
+    /// 自動 4 通り（未解析・材料が足りない・いいえ・はい）のすべてで照らし、`detail` の概要も同じ値。
+    #[test]
+    fn summaries_follow_the_effective_values_of_the_asset_panel() {
+        use crate::analysis::facts::{FACTS_V, MediaFacts, PIXEL_RULE};
+        use crate::analysis::store::{ItemWrite, Write, write};
+        use crate::asset::{
+            Change, GridSetting, SettingsPatch, TRISTATE, effective_pixel_art, set_settings,
+        };
+
+        let conn = test_conn();
+        let put = |id: i64, kind: &str, ext: &str, size: Option<(i64, i64)>| {
+            conn.execute(
+                "INSERT INTO items (id, hash, ext, kind, size_bytes, width, height, title, original_name,
+                                    imported_at, updated_at, analysis_state)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 't', 't', 0, 0, 'pending')",
+                params![
+                    id,
+                    vec![u8::try_from(id).unwrap(); 32],
+                    ext,
+                    kind,
+                    size.map(|s| s.0),
+                    size.map(|s| s.1)
+                ],
+            )
+            .unwrap();
+        };
+        let facts = |id: i64, facts: MediaFacts| {
+            let ready = ItemWrite {
+                id,
+                hash: [u8::try_from(id).unwrap(); 32],
+                write: Write::Ready {
+                    results: Vec::new(),
+                    keep: None,
+                    facts: Box::new(MediaFacts {
+                        facts_v: FACTS_V,
+                        ..facts
+                    }),
+                    stamp: None,
+                },
+            };
+            assert_eq!(write(&conn, &[ready], 0).unwrap().written, 1);
+        };
+        let patch = |ids: &[i64], patch: SettingsPatch| {
+            let n = u32::try_from(ids.len()).unwrap();
+            assert_eq!(set_settings(&conn, ids, &patch, 0).unwrap(), n);
+        };
+
+        // ドット絵：設定 3 通り × 自動 4 通り（None は未解析、Some(None) は解析済みで材料が足りない）
+        let autos: [Option<Option<bool>>; 4] =
+            [None, Some(None), Some(Some(false)), Some(Some(true))];
+        let mut cases = Vec::new();
+        let mut id = 0_i64;
+        for setting in TRISTATE {
+            for auto in autos {
+                id += 1;
+                put(id, "image", "png", Some((64, 64)));
+                if let Some(auto) = auto {
+                    facts(
+                        id,
+                        MediaFacts {
+                            alpha: Some(1),
+                            pixel_art: auto,
+                            pixel_rule: Some(PIXEL_RULE),
+                            frame_count: Some(1),
+                            ..MediaFacts::default()
+                        },
+                    );
+                }
+                if let Some(value) = setting {
+                    patch(
+                        &[id],
+                        SettingsPatch {
+                            pixel_art: Some(Change::Set(value)),
+                            ..SettingsPatch::default()
+                        },
+                    );
+                }
+                cases.push((id, setting, auto));
+            }
+        }
+        let ids: Vec<i64> = cases.iter().map(|c| c.0).collect();
+        let rows = summaries(&conn, &ids).unwrap();
+        assert_eq!(rows.len(), cases.len());
+        for (row, (id, setting, auto)) in rows.iter().zip(&cases) {
+            let want = effective_pixel_art(*setting, auto.flatten());
+            assert_eq!(row.pixel_art, want, "{id}: 設定 {setting:?}・自動 {auto:?}");
+            assert_eq!(row.pixel_art_setting, *setting, "{id}");
+            let panel = crate::asset::get(&conn, *id).unwrap();
+            assert_eq!(row.pixel_art, panel.effective.pixel_art, "{id}");
+            assert_eq!(row.animated, panel.effective.animated, "{id}");
+            assert_eq!(row.frame_count, panel.effective.frame_count, "{id}");
+            let analyzed = auto.is_some();
+            assert_eq!(row.alpha, analyzed.then_some(Alpha::Binary), "{id}");
+            assert_eq!(
+                row.analysis_state,
+                if analyzed {
+                    AnalysisState::Ready
+                } else {
+                    AnalysisState::Pending
+                },
+                "{id}"
+            );
+            assert_eq!(&detail(&conn, *id).unwrap().summary, row, "{id}");
+        }
+
+        // アニメ：解析のコマの数、格子（帯で使う数）。半透明。サムネイルの作り直しの回数
+        put(40, "image", "gif", Some((32, 32)));
+        facts(
+            40,
+            MediaFacts {
+                alpha: Some(2),
+                frame_count: Some(8),
+                ..MediaFacts::default()
+            },
+        );
+        put(41, "image", "png", Some((64, 32)));
+        facts(
+            41,
+            MediaFacts {
+                alpha: Some(0),
+                frame_count: Some(1),
+                ..MediaFacts::default()
+            },
+        );
+        patch(
+            &[41],
+            SettingsPatch {
+                grid: Some(Change::Set(GridSetting {
+                    cell_w: 16,
+                    cell_h: 16,
+                    offset_x: 0,
+                    offset_y: 0,
+                    gap_x: 0,
+                    gap_y: 0,
+                    count: Some(5),
+                })),
+                ..SettingsPatch::default()
+            },
+        );
+        conn.execute(
+            "UPDATE items SET thumb_state = 'stale', thumb_rev = 3 WHERE id = 40",
+            [],
+        )
+        .unwrap();
+        // 音声：ループ点。動画：解析しない
+        put(42, "audio", "ogg", None);
+        facts(
+            42,
+            MediaFacts {
+                has_loop: Some(true),
+                loop_start: Some(10),
+                loop_end: Some(20),
+                ..MediaFacts::default()
+            },
+        );
+        put(43, "audio", "wav", None);
+        facts(
+            43,
+            MediaFacts {
+                has_loop: Some(false),
+                ..MediaFacts::default()
+            },
+        );
+        put(44, "video", "mp4", Some((16, 9)));
+        conn.execute(
+            "UPDATE items SET analysis_state = 'not_needed' WHERE id = 44",
+            [],
+        )
+        .unwrap();
+
+        let rows = summaries(&conn, &[40, 41, 42, 43, 44]).unwrap();
+        let [gif, sheet, looped, plain, video] = rows.as_slice() else {
+            panic!("5 件: {rows:?}");
+        };
+        assert_eq!(
+            (gif.alpha, gif.animated, gif.frame_count),
+            (Some(Alpha::Partial), true, Some(8))
+        );
+        assert_eq!((gif.thumb_state.as_str(), gif.thumb_rev), ("stale", 3));
+        assert_eq!(
+            (sheet.alpha, sheet.animated, sheet.frame_count),
+            (Some(Alpha::None), true, Some(5)),
+            "格子のコマの数"
+        );
+        assert_eq!(
+            (looped.has_loop, looped.alpha, looped.animated),
+            (true, None, false)
+        );
+        assert!(!plain.has_loop);
+        assert_eq!(
+            (
+                video.analysis_state,
+                video.alpha,
+                video.pixel_art,
+                video.has_loop
+            ),
+            (AnalysisState::NotNeeded, None, false, false)
+        );
+        for row in &rows {
+            let panel = crate::asset::get(&conn, row.id).unwrap();
+            assert_eq!(
+                (row.pixel_art, row.animated, row.frame_count),
+                (
+                    panel.effective.pixel_art,
+                    panel.effective.animated,
+                    panel.effective.frame_count
+                ),
+                "{}",
+                row.id
+            );
+            assert_eq!(&detail(&conn, row.id).unwrap().summary, row);
+        }
     }
 
     #[test]

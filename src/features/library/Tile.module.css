@@ -146,3 +146,8 @@
 .unit[aria-pressed='true']::after {
   top: 6px;
 }
+
+/* バッジの中の小さな印（ループの繰り返しなど。読み上げはタイルの名前に含める） */
+.badgeIcon {
+  display: flex;
+}

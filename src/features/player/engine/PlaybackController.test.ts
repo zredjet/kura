@@ -71,6 +71,14 @@ function item(id: number, kind: ItemKind, extra: Partial<ItemSummaryDto> = {}): 
     thumbState: 'ready',
     proxyState: media ? 'ready' : 'not_needed',
     lastPlayedAt: null,
+    thumbRev: 0,
+    analysisState: 'ready',
+    alpha: null,
+    pixelArt: false,
+    pixelArtSetting: null,
+    animated: false,
+    frameCount: null,
+    hasLoop: false,
     ...extra,
   };
 }

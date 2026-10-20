@@ -1,0 +1,34 @@
+/* design.md §3.1「素材の表示」・§4 の市松模様。大きさ・置き方は呼ぶ側のクラスが決める */
+
+.media {
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* 透過と分かった画像の下地：<img> 自身の地に敷くので、透明な画素の下にだけ見える。マスは画面に固定（拡大率で変えない） */
+.media[data-checker] {
+  background-color: var(--checker-a);
+  background-image: repeating-conic-gradient(var(--checker-b) 0 25%, transparent 0 50%);
+  background-size: var(--checker-size) var(--checker-size);
+}
+
+/* ドット絵を広げるときだけ最近傍（縮めるときは補間のまま） */
+.media[data-render='pixelated'] {
+  image-rendering: pixelated;
+}
+
+/* フォント：字の形だけのアルファを mask にし、色は文字の色（明るい表示・暗い表示のどちらでも効く）。
+   既定は枠いっぱい（:where で弱くして、呼ぶ側のクラスの大きさが勝つようにする） */
+:where(.mask) {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.mask {
+  background-color: var(--text-primary);
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+}

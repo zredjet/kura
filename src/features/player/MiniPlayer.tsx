@@ -3,19 +3,22 @@ import type { CSSProperties } from 'react';
 import { CloseIcon } from '../../components/icons/CloseIcon';
 import { ExpandIcon } from '../../components/icons/ExpandIcon';
 import { KindIcon } from '../../components/icons/KindIcon';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { PauseIcon } from '../../components/icons/PauseIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
 import { SkipBackIcon } from '../../components/icons/SkipBackIcon';
 import { SkipForwardIcon } from '../../components/icons/SkipForwardIcon';
 import { ja } from '../../i18n/ja';
 import { hasDuration, kindLabel } from '../../ipc/kinds';
-import { thumbUrl } from '../../ipc/media';
 import { formatCount, formatDuration } from '../../lib/format';
 import { closePlayer, playerController } from './playerActions';
 import { usePlayerStore } from './playerStore';
 import styles from './MiniPlayer.module.css';
 
 const t = ja.player;
+
+/** 表紙の大きさ（MiniPlayer.module.css の `.art`。市松模様は敷かない大きさ）。 */
+const ART_BOX = { w: 40, h: 40 };
 
 /** ミニプレーヤーが出ているか（取り込みの進捗をその上に積むため）。 */
 export function useMiniPlayerVisible(): boolean {
@@ -66,10 +69,16 @@ export function MiniPlayer() {
   return (
     <div className={styles.capsule} role="region" aria-label={t.miniLabel}>
       <span className={styles.art} aria-hidden="true">
-        {item?.thumbState === 'ready' ? (
-          <img src={thumbUrl(item.hash, 's')} alt="" />
+        {item ? (
+          <MediaImage
+            source={item}
+            size="s"
+            fit="cover"
+            box={ART_BOX}
+            fallback={<KindIcon kind={item.kind} size={18} />}
+          />
         ) : (
-          <KindIcon kind={item?.kind} size={18} />
+          <KindIcon kind={undefined} size={18} />
         )}
       </span>
       <span className={styles.text}>

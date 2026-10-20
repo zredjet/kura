@@ -8,9 +8,10 @@ import { MusicIcon } from '../../components/icons/MusicIcon';
 import { ShrinkIcon } from '../../components/icons/ShrinkIcon';
 import { TagIcon } from '../../components/icons/TagIcon';
 import { Waveform } from '../../components/icons/Waveform';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
-import { playUrl, thumbUrl } from '../../ipc/media';
+import { playUrl } from '../../ipc/media';
 import { formatCount, formatDuration } from '../../lib/format';
 import { PlayBar } from './PlayBar';
 import {
@@ -287,20 +288,18 @@ function Stage() {
   );
 }
 
-/** 画像（ブラウザで表示できない形式は大きいサムネイルにする）。 */
+/**
+ * 画像（ブラウザで表示できない形式は大きいサムネイルにする）。透過と分かったものは市松模様、ドット絵は整数倍
+ * （design.md §3.1。アニメはシアターでは先頭のコマのまま）。
+ */
 function ImageLayer({ item }: { item: ItemSummaryDto }) {
-  const [fallback, setFallback] = useState(false);
-  const src = fallback ? thumbUrl(item.hash, 'l') : playUrl(item.hash);
   return (
-    <img
+    <MediaImage
+      source={item}
+      size="l"
+      fit="contain"
+      original={playUrl(item.hash)}
       className={styles.image}
-      src={src}
-      alt=""
-      onError={() => {
-        if (!fallback && item.thumbState === 'ready') {
-          setFallback(true);
-        }
-      }}
     />
   );
 }
@@ -309,13 +308,17 @@ function ImageLayer({ item }: { item: ItemSummaryDto }) {
 function AudioArt({ item }: { item: ItemSummaryDto }) {
   return (
     <div className={styles.audio}>
-      {item.thumbState === 'ready' ? (
-        <img className={styles.art} src={thumbUrl(item.hash, 'l')} alt="" />
-      ) : (
-        <span className={styles.artEmpty} aria-hidden="true">
-          <MusicIcon size={64} strokeWidth={1.4} />
-        </span>
-      )}
+      <MediaImage
+        source={item}
+        size="l"
+        fit="cover"
+        className={styles.art}
+        fallback={
+          <span className={styles.artEmpty} aria-hidden="true">
+            <MusicIcon size={64} strokeWidth={1.4} />
+          </span>
+        }
+      />
       <Waveform className={styles.waveform} />
     </div>
   );

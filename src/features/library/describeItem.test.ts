@@ -20,6 +20,14 @@ const base: ItemSummaryDto = {
   thumbState: 'ready',
   proxyState: 'not_needed',
   lastPlayedAt: null,
+  thumbRev: 0,
+  analysisState: 'ready',
+  alpha: null,
+  pixelArt: false,
+  pixelArtSetting: null,
+  animated: false,
+  frameCount: null,
+  hasLoop: false,
 };
 
 describe('itemMeta', () => {

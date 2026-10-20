@@ -9,11 +9,8 @@ import { FolderIcon } from '../../../components/icons/FolderIcon';
 import { LinkIcon } from '../../../components/icons/LinkIcon';
 import { MoreIcon } from '../../../components/icons/MoreIcon';
 import { UnitIcon } from '../../../components/icons/UnitIcon';
-import { KindArt } from '../../../components/KindArt/KindArt';
 import { ja } from '../../../i18n/ja';
 import { getItemDetail } from '../../../ipc/items';
-import { isPlayable } from '../../../ipc/kinds';
-import { thumbUrl } from '../../../ipc/media';
 import { dateTimeLabel } from '../../../lib/dates';
 import { shortHash } from '../../../lib/format';
 import { useViewStore } from '../../../stores/viewStore';
@@ -31,6 +28,7 @@ import {
 import { itemMenu } from '../itemMenu';
 import { itemMeta } from '../describeItem';
 import styles from './Inspector.module.css';
+import { ItemPreview } from './ItemPreview';
 import { NoteField } from './NoteField';
 import { useLoaded } from './useLoaded';
 
@@ -54,17 +52,7 @@ export function ItemInspector({ id }: { id: number }) {
   const trashed = detail.trashedAt !== null;
   return (
     <>
-      <div className={styles.preview}>
-        {item.thumbState === 'ready' ? (
-          <img className={styles.previewImage} src={thumbUrl(item.hash, 'l')} alt="" />
-        ) : !isPlayable(item.kind) ? (
-          <KindArt kind={item.kind} />
-        ) : (
-          <span className={styles.previewNote}>
-            {item.thumbState === 'pending' ? t.noThumbnail : ''}
-          </span>
-        )}
-      </div>
+      <ItemPreview item={item} />
 
       <div className={styles.head}>
         {editingTitle ? (

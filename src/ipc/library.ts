@@ -4,6 +4,7 @@ import {
   commands,
   events,
   type IntegrityDto,
+  type LibraryCacheUsageDto,
   type LibraryUsageDto,
   type LibraryInfoDto,
   type LibraryRestoreDto,
@@ -16,6 +17,7 @@ export type {
   AppError,
   BackupDto,
   IntegrityDto,
+  LibraryCacheUsageDto,
   LibraryInfoDto,
   LibraryRestoreDto,
   LibraryUpgradeEvent,
@@ -76,6 +78,14 @@ export function revealPath(path: string): Promise<null> {
 /** ライブラリの容量と、あるボリュームの容量・空き。 */
 export function libraryUsage(): Promise<LibraryUsageDto> {
   return unwrap(commands.libraryUsage());
+}
+
+/**
+ * 中身から作ったキャッシュ（サムネイルとジャケット・波形・アニメの帯）の大きさとファイルの数。ファイルを数えるので
+ * 設定の画面を開いたときだけ読む（冷えたディスクでは秒単位になりうる）。
+ */
+export function libraryCacheUsage(): Promise<LibraryCacheUsageDto> {
+  return unwrap(commands.libraryCacheUsage());
 }
 
 /** 整合性チェックをいま行う。 */

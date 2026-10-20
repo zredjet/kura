@@ -2,13 +2,14 @@ import { create } from 'zustand';
 
 import { listJobs, type JobProgress, onJobProgress, progressFromJob } from '../ipc/jobs';
 import { useDownloadsStore } from './downloadsStore';
-import { refreshPending } from './itemCache';
+import { refreshAnalyzing, refreshThumbnails } from './itemCache';
 import { useLibraryStore } from './libraryStore';
 import { useSidebarStore } from './sidebarStore';
 
-/** 取り込み中に一覧を読み直す間隔・サムネイルのでき具合を反映する間隔（ms）。 */
+/** 取り込み中に一覧を読み直す間隔・サムネイルのでき具合・解析の結果を反映する間隔（ms）。 */
 const LIST_RELOAD_MS = 1000;
 const THUMB_REFRESH_MS = 500;
+const ANALYSIS_REFRESH_MS = 1000;
 
 /** 呼ばれてから `ms` のあいだに何度呼ばれても 1 回にまとめる。 */
 function coalesce(ms: number, run: () => void): () => void {
@@ -29,9 +30,10 @@ export const reloadList = coalesce(LIST_RELOAD_MS, () => {
   void useLibraryStore.getState().refresh();
   void useSidebarStore.getState().load();
 });
-const refreshThumbs = coalesce(THUMB_REFRESH_MS, refreshPending);
+const refreshThumbs = coalesce(THUMB_REFRESH_MS, refreshThumbnails);
+const refreshAnalysis = coalesce(ANALYSIS_REFRESH_MS, refreshAnalyzing);
 
-/** ジョブの進みに合わせて画面のデータを更新する（取り込み → 一覧、サムネイル → タイル）。 */
+/** ジョブの進みに合わせて画面のデータを更新する（取り込み → 一覧、サムネイル・解析 → タイル）。 */
 export function reactToJob(event: JobProgress): void {
   if (event.kind === 'import' && (event.state === 'running' || event.state === 'done')) {
     reloadList();
@@ -40,6 +42,9 @@ export function reactToJob(event: JobProgress): void {
     reloadList();
   } else if (event.kind === 'thumbnail') {
     refreshThumbs();
+  } else if (event.kind === 'analyze') {
+    // 透過・ドット絵・アニメ・ループの印（市松模様・最近傍・タイルの印）が届く
+    refreshAnalysis();
   }
 }
 
