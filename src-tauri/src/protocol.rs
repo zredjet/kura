@@ -8,9 +8,9 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-use kura_core::asset::pcm::{self, PcmCache};
+use kura_core::asset::pcm;
 use kura_core::edit::EngineServices;
 use kura_core::library::Layout;
 use kura_core::serve::{
@@ -118,12 +118,6 @@ struct Served<'a> {
     engine: Option<&'a Arc<EngineServices>>,
 }
 
-/// 試聴の PCM の読んだ結果を 1 件だけ覚える置き場（アプリに 1 つ。ライブラリごとに分けて照らす）。
-fn pcm_cache() -> &'static Arc<PcmCache> {
-    static CACHE: OnceLock<Arc<PcmCache>> = OnceLock::new();
-    CACHE.get_or_init(|| PcmCache::new(pcm::CACHE_TTL))
-}
-
 /// ライブラリ（開いていなければ None で 503）から答え、main への応答のヘッダを付ける。
 fn reply(
     served: Option<&Served<'_>>,
@@ -184,15 +178,8 @@ fn pcm_response(
     let Some(engine) = served.engine else {
         return empty(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let body = match pcm::serve(
-        pcm_cache(),
-        engine,
-        served.layout.root(),
-        hash,
-        &source,
-        start,
-        end,
-    ) {
+    // 読んだ結果は、そのライブラリの置き場に覚える（閉じると手放す。M11 の検証 E2）
+    let body = match pcm::serve(engine, served.layout.root(), hash, &source, start, end) {
         Ok(body) => body,
         Err(err) => {
             tracing::debug!(%err, hash, start, end, "kura:// の試聴の PCM を返せません");

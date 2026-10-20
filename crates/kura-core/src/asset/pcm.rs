@@ -8,7 +8,9 @@
 //! - 元が 16 ビット以下の整数で、区間の標本がすべて 16 ビットの格子の上にあれば 16 ビット（値は同じ）、ほかは 32 ビット
 //!   浮動小数で書く（非可逆の形式は 16 ビットと名乗っても格子の上にないので浮動小数になる）。
 //! - 読んだ結果は (ライブラリ, ハッシュ, デコーダの識別子) で直近の 1 件だけ覚える（[`PcmCache`]。試聴は前奏と本体・継ぎ目の
-//!   前後を続けて取るので、2 回目からは読まない）。覚えている間は予算（対話）を持ち、使わずに 60 秒たつと捨てる。
+//!   前後を続けて取るので、2 回目からは読まない）。覚えている間は予算（対話）を持ち、使わずに 60 秒たつと捨てる。置き場は
+//!   ライブラリごと（[`EngineServices::pcm_cache`]。覚えた確保はそのライブラリの予算のもの）で、ライブラリを閉じると手放す
+//!   （M11 の検証 E2）。
 //! - ジョブにしない（利用者がその場で待つ短い表示の用意。決定 8）。呼び手が `spawn_blocking` で呼ぶ。予算は対話
 //!   （`Class::Interactive`。待たない）で、足りなければ 503。範囲が音声の外か、浮動小数で 64 MiB を超える長さは 416。
 //!   読むのはエンジンのプレビューのプールの中（`EngineRuntime::preview`）。
@@ -229,7 +231,7 @@ struct CacheState {
     reaper: bool,
 }
 
-/// 読んだ結果を 1 件だけ覚える置き場（アプリに 1 つ。ライブラリごとに分けて照らす）。
+/// 読んだ結果を 1 件だけ覚える置き場（ライブラリごとに 1 つ。[`EngineServices`] が持ち、閉じるときに空にする）。
 pub struct PcmCache {
     ttl: Duration,
     state: Mutex<CacheState>,
@@ -434,9 +436,21 @@ fn audio_of(
     Ok((audio, stamp.codec))
 }
 
-/// `/pcm/{hash}/{start}-{end}` の WAV を作る（ブロックする。呼び手が `spawn_blocking` で呼ぶ）。`root` はライブラリのフォルダ
-/// （覚えた結果をライブラリごとに分ける）。
+/// `/pcm/{hash}/{start}-{end}` の WAV を作る（ブロックする。呼び手が `spawn_blocking` で呼ぶ）。読んだ結果は、そのライブラリの
+/// 置き場（[`EngineServices::pcm_cache`]）に覚える。`root` はライブラリのフォルダ。
 pub fn serve(
+    engine: &EngineServices,
+    root: &Path,
+    hash: &str,
+    source: &PcmSource,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, PcmError> {
+    serve_with(engine.pcm_cache(), engine, root, hash, source, start, end)
+}
+
+/// [`serve`] を、置き場 `cache` を指定して（テストで TTL を変える）。
+pub(crate) fn serve_with(
     cache: &Arc<PcmCache>,
     engine: &EngineServices,
     root: &Path,
@@ -722,7 +736,7 @@ mod tests {
         let cache = PcmCache::new(CACHE_TTL);
         let engine = engine(64 << 20);
         let (h, source) = place(&layout, 1, ramp(48_000, 48_000, Some((1_000, 40_000))), 16);
-        let wav = serve(&cache, &engine, dir.path(), &h, &source, 100, 1_100).unwrap();
+        let wav = serve_with(&cache, &engine, dir.path(), &h, &source, 100, 1_100).unwrap();
         let p = parse(&wav);
         assert_eq!(
             (p.tag, p.channels, p.rate),
@@ -738,7 +752,7 @@ mod tests {
         assert_eq!(i16::from_le_bytes([p.data[2], p.data[3]]), -100);
         // 浮動小数の元は浮動小数（ビットそのまま）。ループ点がなければ印なし
         let (h2, source2) = place(&layout, 2, ramp(1_000, 22_050, None), 0);
-        let p = parse(&serve(&cache, &engine, dir.path(), &h2, &source2, 0, 1_000).unwrap());
+        let p = parse(&serve_with(&cache, &engine, dir.path(), &h2, &source2, 0, 1_000).unwrap());
         assert_eq!((p.tag, p.rate, p.looped), (3, 22_050, None));
         assert_eq!(
             f32::from_le_bytes(p.data[8 * 3..8 * 3 + 4].try_into().unwrap()),
@@ -755,20 +769,20 @@ mod tests {
         let small = engine(64 << 20);
         let (h, source) = place(&layout, 1, ramp(1_000, 8_000, None), 16);
         for (start, end) in [(0, 1_001), (1_000, 1_001), (5_000, 6_000)] {
-            let err = serve(&cache, &small, dir.path(), &h, &source, start, end).unwrap_err();
+            let err = serve_with(&cache, &small, dir.path(), &h, &source, start, end).unwrap_err();
             assert_eq!(err.status(), 416, "{start}-{end}: {err}");
             assert!(
                 matches!(err, PcmError::OutOfRange { total: 1_000, .. }),
                 "{err}"
             );
         }
-        assert!(serve(&cache, &small, dir.path(), &h, &source, 999, 1_000).is_ok());
+        assert!(serve_with(&cache, &small, dir.path(), &h, &source, 999, 1_000).is_ok());
         assert_eq!(cache.decodes(), 1);
         // 浮動小数で 64 MiB を超える長さ（2 チャンネル × 4 バイト × 8 Mi フレーム + 1）
         let frames = 8 * 1024 * 1024;
         let (h2, source2) = place(&layout, 2, ramp(frames + 1, 8_000, None), 16);
         let big = engine(512 << 20);
-        let err = serve(
+        let err = serve_with(
             &cache,
             &big,
             dir.path(),
@@ -780,7 +794,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.status(), 416, "{err}");
         assert!(matches!(err, PcmError::TooLong { .. }));
-        assert!(serve(&cache, &big, dir.path(), &h2, &source2, 0, frames as u64).is_ok());
+        assert!(serve_with(&cache, &big, dir.path(), &h2, &source2, 0, frames as u64).is_ok());
     }
 
     /// 同じ元は 1 回だけ読む（前奏と本体を続けて取っても）。別の元を読むと前のものを捨てる（覚えるのは 1 件だけ）。
@@ -793,13 +807,13 @@ mod tests {
         let (h1, s1) = place(&layout, 1, ramp(4_000, 8_000, Some((10, 20))), 16);
         let (h2, s2) = place(&layout, 2, ramp(4_000, 8_000, None), 16);
         assert_eq!(cache.cached(), None);
-        serve(&cache, &engine, dir.path(), &h1, &s1, 0, 10).unwrap();
-        serve(&cache, &engine, dir.path(), &h1, &s1, 10, 20).unwrap();
+        serve_with(&cache, &engine, dir.path(), &h1, &s1, 0, 10).unwrap();
+        serve_with(&cache, &engine, dir.path(), &h1, &s1, 10, 20).unwrap();
         assert_eq!(cache.decodes(), 1);
         assert_eq!(cache.cached(), Some((h1.clone(), "wav-kura-dec/1".into())));
         let used = engine.runtime().unwrap().budget().used().unwrap();
         assert_eq!(used, 4_000 * 2 * 4, "覚えている間は値の分の予算を持つ");
-        serve(&cache, &engine, dir.path(), &h2, &s2, 0, 10).unwrap();
+        serve_with(&cache, &engine, dir.path(), &h2, &s2, 0, 10).unwrap();
         assert_eq!(cache.decodes(), 2);
         assert_eq!(cache.cached(), Some((h2, "wav-kura-dec/1".into())));
         assert_eq!(
@@ -807,15 +821,51 @@ mod tests {
             used,
             "前のものは返した"
         );
-        serve(&cache, &engine, dir.path(), &h1, &s1, 0, 10).unwrap();
+        serve_with(&cache, &engine, dir.path(), &h1, &s1, 0, 10).unwrap();
         assert_eq!(cache.decodes(), 3);
         // 別のライブラリの同じハッシュは別物
         let other = tempfile::tempdir().unwrap();
         let other_layout = Layout::new(other.path());
         let (_, s3) = place(&other_layout, 1, ramp(2_000, 8_000, None), 16);
-        let p = parse(&serve(&cache, &engine, other.path(), &h1, &s3, 0, 10).unwrap());
+        let p = parse(&serve_with(&cache, &engine, other.path(), &h1, &s3, 0, 10).unwrap());
         assert_eq!(p.total, 2_000);
         assert_eq!(cache.decodes(), 4);
+    }
+
+    /// 検証 E2：試聴の PCM の置き場はライブラリごと。ライブラリを閉じたら（エンジンの部品を捨てたら）、覚えていた音声と
+    /// その予算の確保をすぐ手放し、次に開いたライブラリ（同じフォルダでも）は前のものを使わずに自分の予算で読み直す
+    /// （予算が 2 つにならない）。
+    #[test]
+    fn closing_the_library_releases_the_cached_pcm_and_its_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let (h, source) = place(&layout, 1, ramp(100_000, 8_000, None), 16);
+        let a = engine(64 << 20);
+        serve(&a, dir.path(), &h, &source, 0, 10).unwrap();
+        let budget_a = a.runtime().unwrap().budget().clone();
+        let cache_a = a.pcm_cache().clone();
+        assert_eq!(budget_a.used().unwrap(), 100_000 * 2 * 4);
+        assert!(cache_a.cached().is_some());
+        drop(a);
+        assert_eq!(
+            budget_a.used().unwrap(),
+            0,
+            "閉じたライブラリの予算を持ち続けた"
+        );
+        assert_eq!(cache_a.cached(), None, "閉じたライブラリの音声を持ち続けた");
+        // 同じフォルダを開き直す：前の置き場を使わず、自分の予算で読み直す
+        let a2 = engine(64 << 20);
+        assert_eq!(a2.pcm_cache().cached(), None);
+        serve(&a2, dir.path(), &h, &source, 0, 10).unwrap();
+        assert_eq!(a2.pcm_cache().decodes(), 1);
+        assert_eq!(
+            a2.runtime().unwrap().budget().used().unwrap(),
+            100_000 * 2 * 4
+        );
+        // 別のライブラリの部品は別の置き場
+        let b = engine(64 << 20);
+        assert!(!Arc::ptr_eq(a2.pcm_cache(), b.pcm_cache()));
+        assert_eq!(b.runtime().unwrap().budget().used().unwrap(), 0);
     }
 
     /// 予算（対話。待たない）が足りなければ 503。
@@ -826,7 +876,7 @@ mod tests {
         let cache = PcmCache::new(CACHE_TTL);
         let (h, source) = place(&layout, 1, ramp(48_000, 48_000, None), 16);
         // 値だけで 384,000 バイト要る
-        let err = serve(&cache, &engine(100_000), dir.path(), &h, &source, 0, 10).unwrap_err();
+        let err = serve_with(&cache, &engine(100_000), dir.path(), &h, &source, 0, 10).unwrap_err();
         assert_eq!(err.status(), 503, "{err}");
         assert!(matches!(err, PcmError::Busy(_)));
         assert_eq!(cache.decodes(), 0);
@@ -837,10 +887,10 @@ mod tests {
             .try_acquire(900_000, kura_engine::budget::Class::Interactive)
             .unwrap()
             .unwrap();
-        let err = serve(&cache, &engine, dir.path(), &h, &source, 0, 10).unwrap_err();
+        let err = serve_with(&cache, &engine, dir.path(), &h, &source, 0, 10).unwrap_err();
         assert_eq!(err.status(), 503);
         drop(held);
-        assert!(serve(&cache, &engine, dir.path(), &h, &source, 0, 10).is_ok());
+        assert!(serve_with(&cache, &engine, dir.path(), &h, &source, 0, 10).is_ok());
     }
 
     /// 使わずに TTL がたつと、覚えていたものと予算を手放す。
@@ -851,7 +901,7 @@ mod tests {
         let cache = PcmCache::new(Duration::from_millis(50));
         let engine = engine(64 << 20);
         let (h, source) = place(&layout, 1, ramp(1_000, 8_000, None), 16);
-        serve(&cache, &engine, dir.path(), &h, &source, 0, 10).unwrap();
+        serve_with(&cache, &engine, dir.path(), &h, &source, 0, 10).unwrap();
         assert!(cache.cached().is_some());
         let started = std::time::Instant::now();
         while cache.cached().is_some() {
@@ -859,7 +909,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(engine.runtime().unwrap().budget().used().unwrap(), 0);
-        serve(&cache, &engine, dir.path(), &h, &source, 0, 10).unwrap();
+        serve_with(&cache, &engine, dir.path(), &h, &source, 0, 10).unwrap();
         assert_eq!(cache.decodes(), 2);
     }
 
@@ -920,13 +970,13 @@ mod tests {
             let total = frames as u64;
             // 試聴の本体（ループの区間）：前奏のあとの全体（f32 で 2 × 4 × 7,938,000 = 63.5 MB ≤ 64 MiB）
             let started = std::time::Instant::now();
-            let first = serve(&cache, &engine, dir.path(), &h, &source, 44_100, total);
+            let first = serve_with(&cache, &engine, dir.path(), &h, &source, 44_100, total);
             let first_ms = started.elapsed().as_secs_f64() * 1000.0;
             let started = std::time::Instant::now();
-            let intro = serve(&cache, &engine, dir.path(), &h, &source, 0, 44_100).unwrap();
+            let intro = serve_with(&cache, &engine, dir.path(), &h, &source, 0, 44_100).unwrap();
             let second_ms = started.elapsed().as_secs_f64() * 1000.0;
             let started = std::time::Instant::now();
-            let seam = serve(
+            let seam = serve_with(
                 &cache,
                 &engine,
                 dir.path(),
