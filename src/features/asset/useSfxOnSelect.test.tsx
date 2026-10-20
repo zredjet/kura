@@ -7,7 +7,7 @@ import { getCached } from '../../stores/itemCache';
 import { useViewStore } from '../../stores/viewStore';
 import { EMPTY_SELECTION } from '../library/selection';
 import { DEFAULT_PREFS, usePlayerStore } from '../player/playerStore';
-import { type AudioRuntime, setAudioRuntimeForTest } from './audioRuntime';
+import { type AudioRuntime, IDLE_CLOSE_MS, setAudioRuntimeForTest } from './audioRuntime';
 import { useAuditionStore } from './auditionStore';
 import { summary } from './testAssets';
 import { useSfxOnSelect } from './useSfxOnSelect';
@@ -94,6 +94,22 @@ describe('useSfxOnSelect（効果音の即再生。決定 13）', () => {
     // 一時停止中のプレーヤーなら鳴らす
     select(1);
     expect(fake.sfx.play).toHaveBeenCalledWith('h1');
+  });
+
+  it('鳴らしてから 15 秒、何も鳴らさなければ文脈を閉じる（試聴をしない使い方でも開いたままにしない）', () => {
+    vi.useFakeTimers();
+    try {
+      const { unmount } = renderHook(() => useSfxOnSelect());
+      select(1);
+      expect(fake.sfx.play).toHaveBeenCalledWith('h1');
+      vi.advanceTimersByTime(IDLE_CLOSE_MS - 1);
+      expect(fake.pool.closeAll).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('クイックルックを開いたら効果音と試聴を止める（クイックルックは自分で鳴らす）', () => {
