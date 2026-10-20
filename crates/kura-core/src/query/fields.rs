@@ -402,7 +402,8 @@ fn positive(value: &str) -> Option<i64> {
 }
 
 /// 10 進の数（符号・小数点付き。指数・inf・NaN は受けない）を `10^digits` 倍の整数にする。
-/// 0 から遠い方へ丸め、丸めずに済んだか（exact）も返す。符号は `-`・`+`・U+2212 の `−`。
+/// `digits` 桁の次の桁で四捨五入し（5 以上なら絶対値を 1 上げる。0 から遠い方へ：`-23.0005` → `-23001`）、丸めずに
+/// 済んだか（exact）も返す。符号は `-`・`+`・U+2212 の `−`。
 fn scaled(value: &str, digits: u32) -> Option<(i64, bool)> {
     let v = value.trim();
     let (negative, body) = if let Some(rest) = v.strip_prefix(['-', '−']) {

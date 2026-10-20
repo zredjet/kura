@@ -377,7 +377,7 @@ describe('ループの試聴', () => {
   });
 });
 
-// 長さ（フレーム）は DB にないので、/pcm の応答（同じ読み取り）で知ってから計画する（素材の欄・L のキー）
+// 長さ（フレーム）は素材の欄の DTO・一覧の概要にないので、/pcm の応答（同じ読み取り）で知ってから計画する（素材の欄・L のキー）
 describe('長さを知らないで始める試聴', () => {
   function probing(truth: Parameters<typeof fakeSource>[0], honor = true) {
     const log: string[] = [];
