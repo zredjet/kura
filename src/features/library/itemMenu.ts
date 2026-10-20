@@ -6,6 +6,7 @@ import { useViewStore } from '../../stores/viewStore';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
 import { exportEntries } from './exportActions';
+import { pixelArtMenu } from './pixelArtMenu';
 import {
   dissolveUnits,
   groupEntries,
@@ -124,6 +125,12 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
       shortcut: '⌘⇧G',
       onSelect: () => void dissolveUnits(entries),
     });
+  }
+  // 素材の表示（M11）：画像を選んでいるときだけ
+  const pixelArt = pixelArtMenu(entries);
+  if (pixelArt) {
+    out.push('separator');
+    out.push(pixelArt);
   }
   out.push('separator');
   out.push({
