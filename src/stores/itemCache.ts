@@ -8,6 +8,11 @@ const LIMIT = 4000;
 /** 一度に取る件数（items_get・units_get の上限）。 */
 const CHUNK = 200;
 
+/** 同じ内容の行か（取り直して変わらなければ、前の行を使い続けて描き直さない）。 */
+function sameRow(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 /** ID → 概要のキャッシュ（古いものから捨てる）。アイテムとユニットで 1 つずつ持つ。 */
 class SummaryCache<T extends { id: number }> {
   private readonly cache = new Map<number, T>();
@@ -36,9 +41,13 @@ class SummaryCache<T extends { id: number }> {
       chunk.forEach((id) => this.inflight.add(id));
       this.fetch(chunk)
         .then((rows) => {
+          let changed = false;
           for (const row of rows) {
+            const before = this.cache.get(row.id);
+            const same = before !== undefined && sameRow(before, row);
+            changed ||= !same;
             this.cache.delete(row.id);
-            this.cache.set(row.id, row);
+            this.cache.set(row.id, same ? before : row);
           }
           while (this.cache.size > LIMIT) {
             const oldest = this.cache.keys().next().value;
@@ -47,7 +56,9 @@ class SummaryCache<T extends { id: number }> {
             }
             this.cache.delete(oldest);
           }
-          bump();
+          if (changed) {
+            bump();
+          }
         })
         .catch((error: unknown) => console.warn('詳細を取得できませんでした', error))
         .finally(() => chunk.forEach((id) => this.inflight.delete(id)));
@@ -89,10 +100,24 @@ export function requestUnits(unitIds: readonly number[]): void {
   units.request(unitIds);
 }
 
-/** サムネイルがまだのものを取り直す（サムネイルのジョブが進んだとき）。 */
-export function refreshPending(): void {
-  items.refresh((item) => item.thumbState === 'pending');
-  units.refresh((unit) => unit.cover?.thumbState === 'pending');
+/** サムネイルの絵が変わりうるもの：まだのもの（pending）と、作り直し中で今の絵を出しているもの（stale）。 */
+function thumbMayChange(thumbState: string | undefined): boolean {
+  return thumbState === 'pending' || thumbState === 'stale';
+}
+
+/**
+ * サムネイルがまだのもの・作り直し中のものを取り直す（サムネイルのジョブが進んだとき）。作り直したものは
+ * `thumbRev` が増えるので、URL が変わって新しい絵になる。
+ */
+export function refreshThumbnails(): void {
+  items.refresh((item) => thumbMayChange(item.thumbState));
+  units.refresh((unit) => thumbMayChange(unit.cover?.thumbState));
+}
+
+/** 解析を待っているものを取り直す（解析のジョブが進んだとき。透過・ドット絵・アニメ・ループが届く）。 */
+export function refreshAnalyzing(): void {
+  items.refresh((item) => item.analysisState === 'pending');
+  units.refresh((unit) => unit.cover?.analysisState === 'pending');
 }
 
 /** 編集したアイテムを取り直す。 */
