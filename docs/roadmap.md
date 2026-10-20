@@ -195,7 +195,7 @@
 - [x] 実ファイルの台帳 `blobs` と items の作り直し（kind に font・model、CHECK に名前を付ける。0007〜0009）。整合性チェック・容量・重複の見込みを台帳で数える（台帳の行を消すのは、どの表からも参照されない行だけ。ADR-157）
 - [x] kura:// の CORS（アプリの origin だけ）・WebView の制限・CSP（`connect-src`・`font-src`）を最初に試作して確かめる（architecture.md §4.2 の P1〜P8・F1〜F4 を build と dev で。ADR-155）
 - [x] 種類の追加（ADR-140・162）：形式の表で取り込みを判定（`.ase` は先頭のバイトで見分ける）、プロキシの条件を `+kind IN ('video','audio')` に、キューとスマートの候補から外す（docs/playlists.md の T16）、フロントの種類を `src/ipc/kinds.ts` に集める（bindings の定数 `ITEM_KINDS`）、フィルタバーを 6 つの区切りに
-- [x] 解析のジョブ（`analyze`。取り込み・サムネイルに譲る）と結果の表（中身ごと＝台帳の行 × 解析 ID。版と正規の引数は列）、素材の設定（アイテムごと）、ドット絵の自動の判定 v1、JPEG・HEIC・HEIF は読まずに形式から（ADR-158）
+- [x] 解析のジョブ（`analyze`。取り込み・サムネイルに譲る）と結果の表（中身ごと＝台帳の行 × 解析 ID。版と正規の引数は列）、素材の設定（アイテムごと）、ドット絵の自動の判定 v1、JPEG は読まずに形式から・HEIC・HEIF は見出しでアルファを持つものだけを読む（ADR-158。決定 15）
 - [x] サムネイル（ADR-159）：アルファ付きは PNG。エンジンの道（png・apng・gif・webp・aseprite・psd・psb・svg）、アルファを保つ ImageIO の道（jpeg・heic・heif・avif・tiff・bmp）、font（kura-mac の CoreText）、model（kura-engine の glb の読み手とソフトウェアの描画。SceneKit を使わない）。作り方の指紋で作り直す（`stale` の間も今の絵を出す）、作っている途中の印、設定の「容量」にキャッシュの行
 - [ ] 表示：市松模様、ドット絵の最近傍の拡大、スプライト・aseprite のアニメ、効果音の即再生、波形、ループの試聴（ADR-160。部品と、偽の文脈・canvas・時計でのテストまで済み。残り：WebKit でのインスペクタ・クイックルック・シアターの見た目（シアターの波形のループの区間を含む）、macOS のメニューバーの「ドット絵として表示 ▸」の無効とチェックの見た目、CSP のある build での `FontFace` と `/peaks`、ループの試聴の継ぎ目（`VITE_KURA_CHECK=1` の `mismatches` が 0 と、耳で）、画面の写真での利用者の確認（M11 の決定 14））
 - [x] 検索のフィールド（`種類:フォント`・`透過:あり`・`ループ:あり`・`ラウドネス` など。未解析・計れない値は除外にだけ入る。docs/search-query.md。ADR-161）

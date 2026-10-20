@@ -385,13 +385,17 @@ CREATE TABLE settings (
 -- キー：'playback.support' = プロキシの判定に使った再生可否の表の指紋（文字列。変われば判定をやり直す。M5）
 --       'download.defaults' = ダウンロードの前回の選択（画質・音声のみ・保存先・自動タグ・再生リストをユニットに。M7、ADR-98）
 --       'analysis.plan'     = 解析の計画の指紋（計画・投影・ドット絵の規則・読み取りの記録の版と、種類ごとの解析 ID の版と既定の
---                             引数の正規の形。起動のスレッドで比べ、解析の版・計画が変わった種類だけ pending に戻す。M11）
+--                             引数の正規の形、形式ごとの扱い（読む以外のもの：formats = {"jpeg":"fromFormat","heic":"byHeader",
+--                             "heif":"byHeader"}。決定 15）。起動のスレッドで比べ、解析の版・計画が変わった種類と、扱いが変わった
+--                             形式だけ pending に戻す。formats のない前の指紋は JPEG・HEIC・HEIF をすべて fromFormat と読む。M11）
 --       'analysis.reproject'= 投影の作り直しの印（true。'analysis.plan' の投影の版・ドット絵の規則が変わったときに起動のスレッドが
 --                             置き、解析のジョブが投影の古い事実の行を結果の表から作り直し終えたら消す。M11 の検証 D3）
---       'analysis.decoders' = 解析で読む形式ごとの、段の順のデコーダの識別子（解析のジョブがコーデックの組を作ったときに比べ、
---                             今の組にないデコーダで読んだものと、並びが変わった形式で失敗していたものを pending に戻す。M11）
+--       'analysis.decoders' = 解析で読む形式（見出しで決める HEIC・HEIF を含む）ごとの、段の順のデコーダの識別子（解析のジョブが
+--                             コーデックの組を作ったときに比べ、今の組にないデコーダで読んだものと、並びが変わった形式で失敗して
+--                             いたもの・読まずに形式から書いたもの（decoder が NULL）を pending に戻す。M11）
 --       'analysis.inflight' = 解析のジョブが OS のデコーダ（Platform の段）で読んでいるアイテム（{"id","hash"}。1 件ずつ解くので
---                             1 件だけ。Platform の段を通りうる形式だけ、読む前にコミットし、書いたら・落ちずに失敗したら消す。
+--                             1 件だけ。Platform の段を通りうる形式だけ、読む前（HEIC・HEIF の見出しを読む前も）にコミットし、
+--                             書いたら・落ちずに失敗したら消す。
 --                             解析のジョブが次に動いたときに残っていれば、そのアイテムを failed（crashed）にする。M11）
 --       'thumbs.plan'       = サムネイルの道の指紋（{"v":1,"formats":{形式の表の ID: 作り方の名前}}。作り方の名前は
 --                             'engine-thumbs/1'・'imageio-alpha/1'・'imageio/1'（jpeg）・'video/1'・'audio/1'・'coretext/1'・
@@ -416,7 +420,7 @@ CREATE TABLE media_facts (
   blob_id          INTEGER PRIMARY KEY REFERENCES blobs(id) ON DELETE CASCADE,
   state            TEXT    NOT NULL CONSTRAINT media_facts_state CHECK (state IN ('ok','failed')),
   error_code       TEXT,                   -- failed：'unsupported'・'too_large'・'decode'・'crashed'（OS のデコーダで読んでいる途中で終わった）。一覧は analysis::store::error_code::ALL（bindings の ANALYSIS_ERROR_CODES）
-  decoder          TEXT,                   -- 読んだデコーダの識別子。形式だけで決めたとき（JPEG・HEIC・HEIF）は NULL
+  decoder          TEXT,                   -- 読んだデコーダの識別子。形式だけで決めたとき（JPEG と、アルファのない HEIC・HEIF）は NULL
   reproducible     INTEGER,                -- 0/1
   value_digest     BLOB,                   -- 読んだ値のダイジェスト（32 バイト）
   env              TEXT,                   -- 再現を約束しないデコーダの環境（OS の版など）
@@ -428,8 +432,9 @@ CREATE TABLE media_facts (
   pixel_art        INTEGER,                -- 自動の判定（0/1。pixel_rule の版の規則で。材料が足りなければ NULL）
   pixel_rule       INTEGER,                -- ドット絵の判定の版（今は 1。上がれば読み直さずに作り直す）
   frame_count      INTEGER,                -- コマの数（1 枚の画像は 1。アニメの画像は 2 以上）
-  -- JPEG・HEIC・HEIF は読まずに形式から書く（決定 5）：alpha 0・colors と visible_colors は NULL（計らない）・pixel_art 0・
-  -- frame_count 1（静止画として扱う。HEIC の連続した画像も先頭だけ）・decoder NULL
+  -- JPEG は読まずに形式から書く（決定 5）：alpha 0・colors と visible_colors は NULL（計らない）・pixel_art 0・
+  -- frame_count 1（静止画として扱う）・decoder NULL。HEIC・HEIF は見出しでアルファを持つものだけを読んで解析し、ほか
+  -- （と見出しを読めないもの）は JPEG と同じく形式から書く（決定 15。HEIC の連続した画像も先頭だけ）
   loudness         REAL,                   -- 音声：積分ラウドネス（LUFS）。計れなければ NULL で loudness_reason
   loudness_reason  TEXT,
   loudness_range   REAL, true_peak REAL, sample_peak REAL,
@@ -564,8 +569,11 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - **取り出し**：`SELECT id, hash, ext, kind FROM items WHERE analysis_state = 'pending' ORDER BY imported_at DESC, id DESC LIMIT 16`
   （`idx_items_analysis_pending` だけを読む）。インスペクタで選んだもの（`request_analysis`）は ID で引いて先に解く。
 - **計画**：画像は透過・色数・倍率（段 1）と、1 枚の画像で透過があるか 256 色以下ならスプライトの格子の推定（段 2）。音声は
-  ラウドネス・ループ・無音・波形の段（最も細かい段はビンが 4,096 以下になる段、粗い方は 65,536 フレーム）。JPEG・HEIC・HEIF は
-  読まずに形式から事実を書く（透過なし・色数は計らない・ドット絵でない・1 コマ。`decoder` は NULL）。動画・フォント・3D は `not_needed`。
+  ラウドネス・ループ・無音・波形の段（最も細かい段はビンが 4,096 以下になる段、粗い方は 65,536 フレーム）。JPEG は
+  読まずに形式から事実を書く（透過なし・色数は計らない・ドット絵でない・1 コマ。`decoder` は NULL）。HEIC・HEIF は見出し
+  （Platform の段の形。ImageIO が開くだけで展開しない `CGImage` のアルファの扱い）を読み、アルファを持つものだけを読んで
+  ほかの画像と同じく解析し、ほかと見出しを読めないものは JPEG と同じく形式から書く（決定 15。見出しを読む前にも処理中の印を
+  付ける）。動画・フォント・3D は `not_needed`。
 - **結果の鍵**：台帳の行 × 解析 ID（`UNIQUE(blob_id, analysis)`）。版と正規の引数は列で、計画の要求と照らす。同じ中身の結果
   （計画の要求の ID・版・正規の引数と、読み取りの記録 `kura.read`）がそろい、それを読んだデコーダ（事実の `decoder`）が今の組で
   その形式を読むもののどれかなら、読まずに使う。再現を約束しないデコーダの結果も「その環境で読んだ事実」として持ち、OS の更新
@@ -579,7 +587,8 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - **波形の段**：結果の行は `output` が NULL（`output_len`・`digest` だけ）で、中身は `peaks/ab/<hash>.peaks`（kura-peaks 版 1。
   `/peaks` でそのまま配る）。DB に書く前に置く（書き込みが失敗してもファイルが残るだけ。次に解くときに置き換える）。
 - **投影**：`facts_v`（投影の版）か `pixel_rule`（ドット絵の判定の版）が古い行は、読み直さずに結果の表から作り直す
-  （`media_facts` を `blob_id` の順に 500 件ずつ。`state = 'ok'` の行だけ）。古い行を探すのは、計画の指紋の投影の版・ドット絵の
+  （`media_facts` を `blob_id` の順に 500 件ずつ。`state = 'ok'` の行だけ。読み取りの記録 `kura.read` のない JPEG・HEIC・HEIF は
+  形式から）。古い行を探すのは、計画の指紋の投影の版・ドット絵の
   規則が変わって起動のスレッドが作り直しの印（settings の `analysis.reproject`）を置いたときだけで、作り直し終えたら消す
   （途中で止めたら印は残り、次の実行で初めから探す）。ふだんの起動・ジョブは事実の表を走査しない。
 - **失敗**：事実の行に `state = 'failed'` と `error_code` を書き、items は `failed`。計画・デコーダの指紋が変わるか、利用者が頼む
@@ -589,7 +598,8 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   印（settings の `analysis.inflight`）が残るので、強制終了でも次にジョブが動いたときに `failed`（`crashed`）になる（印は落ちたのか
   止められたのかを見分けない。`retry_analysis` で戻せる）。
 - **一度きりの全件の走査**（例外）：計画の指紋が変わった種類を戻す `UPDATE items … WHERE kind = ? AND analysis_state IN ('ready','failed')`
-  と、デコーダの指紋で戻す `UPDATE … WHERE … hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …)` は全件を走査する
+  と扱いが変わった形式を戻す `UPDATE items … WHERE lower(ext) IN (…) AND analysis_state IN ('ready','failed')`（決定 15 の更新で、
+  形式から書いていた HEIC・HEIF を一度だけ見直す）、デコーダの指紋で戻す `UPDATE … WHERE … hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …)` は全件を走査する
   （指紋が変わったときだけ。10 万件で約 70 ms）。投影の古い行を探す `stale_facts`（`media_facts` を主キーの範囲で読み、残りの
   条件で絞る）も、古い行がなければ表の終わりまで読む（作り直しの印があるときだけ。8 万行で約 3〜7 ms）。テスト
   `sync_plan_reset_is_a_one_time_full_scan`。
