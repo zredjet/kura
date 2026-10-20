@@ -7,6 +7,9 @@
 //!   （版と正規の引数は列。defaults 9）。
 //! - 計画の指紋（[`sync_plan`]。起動のスレッド）とデコーダの指紋（[`sync_decoders`]。ジョブのスレッド）が変わったら、
 //!   影響のあるものだけ pending に戻す。どちらも一度きりの全件の走査（EXPLAIN のテストに例外として書く）。
+//! - 計画の指紋のうち投影の版・ドット絵の規則だけが変わったら、作り直しの印（settings の `analysis.reproject`）を置く。
+//!   ジョブは印があるときだけ投影の古い行を走査して作り直し（[`stale_facts`]。これも一度きりの全件の走査）、終えたら消す。
+//!   ふだんの起動・ジョブは事実の表を走査しない。
 //! - 処理中の印（[`set_inflight`]・[`take_inflight`]。settings の `analysis.inflight`）：OS のデコーダ（Platform の段）で読む前に
 //!   付け、書いたら消す。次に動いたときに残っていれば、そのアイテムで落ちたとみなして failed（`crashed`）にする（critic 8）。
 
@@ -25,6 +28,8 @@ use crate::settings;
 
 /// 処理中の印を置く settings のキー。
 pub const INFLIGHT_KEY: &str = "analysis.inflight";
+/// 投影の作り直しの印（計画の指紋の投影の版・ドット絵の規則が変わった）を置く settings のキー。
+pub const REPROJECT_KEY: &str = "analysis.reproject";
 
 /// 解析を待つアイテム。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,7 +363,8 @@ pub struct StaleFacts {
     pub results: BTreeMap<String, Vec<u8>>,
 }
 
-/// 投影の版かドット絵の規則が古い事実の行を、台帳の行の順に `after` の次から `limit` 件。
+/// 投影の版かドット絵の規則が古い事実の行を、台帳の行の順に `after` の次から `limit` 件。古い行がなければ事実の表の
+/// 終わりまで読むので、作り直しの印（[`reproject_due`]）があるときだけ呼ぶ（一度きりの全件の走査）。
 pub fn stale_facts(conn: &Connection, after: i64, limit: usize) -> Result<Vec<StaleFacts>> {
     let mut stmt = conn.prepare_cached(
         "SELECT f.blob_id, b.ext FROM media_facts f JOIN blobs b ON b.id = f.blob_id
@@ -394,13 +400,16 @@ pub fn stale_facts(conn: &Connection, after: i64, limit: usize) -> Result<Vec<St
     Ok(out)
 }
 
-/// 投影の古い事実の行があるか。
-pub fn any_stale_facts(conn: &Connection) -> Result<bool> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT EXISTS (SELECT 1 FROM media_facts
-                         WHERE state = 'ok' AND (facts_v <> ?1 OR pixel_rule <> ?2))",
-    )?;
-    Ok(stmt.query_row(params![FACTS_V, PIXEL_RULE], |r| r.get(0))?)
+/// 投影の作り直しの印があるか（計画の指紋の投影の版・ドット絵の規則が変わり、まだ作り直し終えていない）。
+pub fn reproject_due(conn: &Connection) -> Result<bool> {
+    Ok(settings::get::<bool>(conn, REPROJECT_KEY)?.unwrap_or(false))
+}
+
+/// 投影の作り直しの印を消す（古い行を作り直し終えた）。
+pub fn clear_reproject(tx: &Connection) -> Result<()> {
+    let mut stmt = tx.prepare_cached("DELETE FROM settings WHERE key = ?1")?;
+    stmt.execute([REPROJECT_KEY])?;
+    Ok(())
 }
 
 /// 作り直した事実を書く（読み取りの記録の列と状態は前のまま）。
@@ -448,15 +457,17 @@ pub fn write_projection(tx: &Connection, blob_id: i64, f: &MediaFacts, now: i64)
 pub struct PlanSync {
     /// pending に戻した数。
     pub reset: usize,
-    /// 解析のジョブを積むか（待っているもの・投影の古い行がある）。
+    /// 解析のジョブを積むか（待っているものか、投影の作り直しの印がある）。
     pub todo: bool,
 }
 
 /// 起動のスレッドで、整合性チェックのあとに呼ぶ：前に置いた計画の指紋と比べ、解析の版・計画が変わった種類の ready・failed を
-/// pending に戻し、今の指紋を置く。投影だけの変更は戻さない（ジョブが結果の表から作り直す）。
+/// pending に戻し、今の指紋を置く。投影（投影の版・ドット絵の規則）だけの変更は戻さず、作り直しの印を置く（ジョブが結果の表
+/// から作り直して印を消す）。
 ///
 /// 種類で戻す UPDATE は items の全件の走査になる（指紋が変わったときだけの一度きり。10 万件で約 70 ms。
-/// テスト `sync_plan_reset_is_a_one_time_full_scan` に例外として書く）。
+/// テスト `sync_plan_reset_is_a_one_time_full_scan` に例外として書く）。ふだん（指紋が同じ）は、待っているものの有無を
+/// 部分索引で、印を settings の主キーで見るだけで、事実の表は読まない。
 pub fn sync_plan(tx: &Connection, current: &PlanFingerprint) -> Result<PlanSync> {
     let stored: Option<PlanFingerprint> = settings::get(tx, PLAN_KEY)?;
     let mut reset = 0;
@@ -466,6 +477,10 @@ pub fn sync_plan(tx: &Connection, current: &PlanFingerprint) -> Result<PlanSync>
               WHERE kind = ?1 AND analysis_state IN ('ready', 'failed')",
         )?;
         reset += stmt.execute([kind.as_str()])?;
+    }
+    if current.projection_changed(stored.as_ref()) {
+        settings::set(tx, REPROJECT_KEY, &true)?;
+        tracing::info!("事実の投影が変わったので、結果の表から作り直します");
     }
     if stored.as_ref() != Some(current) {
         put_canonical(tx, PLAN_KEY, &current.to_canonical()?)?;
@@ -479,7 +494,7 @@ pub fn sync_plan(tx: &Connection, current: &PlanFingerprint) -> Result<PlanSync>
     let any_pending: bool = pending.query_row([], |r| r.get(0))?;
     Ok(PlanSync {
         reset,
-        todo: any_pending || any_stale_facts(tx)?,
+        todo: any_pending || reproject_due(tx)?,
     })
 }
 
@@ -937,6 +952,39 @@ mod tests {
         assert_eq!(sync_decoders(&conn, &now).unwrap(), 0);
     }
 
+    /// 投影の古い行を探す走査は、計画の指紋の投影の版・ドット絵の規則が変わったときだけ（一度きり）。ふだんの起動では
+    /// 事実の表を走査せず、待っているものがなければジョブを積まない（D3）。
+    #[test]
+    fn stale_projections_are_looked_for_only_when_the_projection_changes() {
+        let conn = test_conn();
+        add(&conn, 1, "image", "png", 1);
+        let current = PlanFingerprint::current(&registry().unwrap()).unwrap();
+        sync_plan(&conn, &current).unwrap();
+        write(&conn, &[ready(1, 1, vec![])], 1).unwrap();
+        // 指紋が同じなら、指紋と食い違う行があっても探さない
+        conn.execute("UPDATE media_facts SET facts_v = 0", [])
+            .unwrap();
+        assert_eq!(
+            sync_plan(&conn, &current).unwrap(),
+            PlanSync {
+                reset: 0,
+                todo: false
+            }
+        );
+        // 投影の版が変わった：読み直さずに作り直すので pending には戻さず、ジョブを積む
+        let mut older = current.clone();
+        older.facts_v -= 1;
+        put_canonical(&conn, PLAN_KEY, &older.to_canonical().unwrap()).unwrap();
+        let synced = PlanSync {
+            reset: 0,
+            todo: true,
+        };
+        assert_eq!(sync_plan(&conn, &current).unwrap(), synced);
+        assert_eq!(state(&conn, 1), "ready");
+        // 作り直し終えるまでは、次の起動でもジョブを積む
+        assert_eq!(sync_plan(&conn, &current).unwrap(), synced);
+    }
+
     /// 取り出しと数えるのは部分索引を使う。結果は台帳の UNIQUE と結果の UNIQUE で引く。
     #[test]
     fn analysis_queries_use_their_indexes() {
@@ -961,16 +1009,17 @@ mod tests {
               WHERE b.hash = x'00' ORDER BY r.analysis",
         );
         assert!(!plan.contains("SCAN"), "{plan}");
+        // ふだんの起動（sync_plan）は、待っているものを部分索引で、作り直しの印を settings の主キーで見るだけ
         let plan = query_plan(
             &conn,
-            "SELECT f.blob_id, b.ext FROM media_facts f JOIN blobs b ON b.id = f.blob_id
-              WHERE f.blob_id > 0 AND f.state = 'ok' AND (f.facts_v <> 1 OR f.pixel_rule <> 1)
-              ORDER BY f.blob_id LIMIT 500",
+            "SELECT EXISTS (SELECT 1 FROM items WHERE analysis_state = 'pending')",
         );
-        assert!(
-            plan.contains("USING INTEGER PRIMARY KEY") && !plan.contains("SCAN b"),
-            "{plan}"
+        assert!(plan.contains("idx_items_analysis_pending"), "{plan}");
+        let plan = query_plan(
+            &conn,
+            "SELECT value FROM settings WHERE key = 'analysis.reproject'",
         );
+        assert!(!plan.contains("SCAN") && plan.contains("INDEX"), "{plan}");
         let plan = query_plan(
             &conn,
             "SELECT id, hash, ext, kind FROM items WHERE id = 1 AND analysis_state = 'pending'",
@@ -980,7 +1029,9 @@ mod tests {
 
     /// 例外：指紋が変わったときに種類やデコーダで pending に戻す UPDATE は、items（と事実の表）の全件の走査になる。
     /// 指紋が変わったときだけの一度きり（起動のスレッド・ジョブのスレッド。10 万件で約 70 ms）なので許す
-    /// （.claude/rules/database.md）。
+    /// （.claude/rules/database.md）。投影の古い行を探す `stale_facts` も、古い行がなければ事実の表の終わりまで読む
+    /// （台帳の行の順に主キーの範囲で読み、残りの条件で絞る）。作り直しの印があるとき（投影の版・ドット絵の規則が変わった
+    /// とき）だけの一度きりなので許す。
     #[test]
     fn sync_plan_reset_is_a_one_time_full_scan() {
         let conn = test_conn();
@@ -999,6 +1050,18 @@ mod tests {
                     OR (f.state = 'failed' AND b.ext IN (SELECT value FROM json_each('[]'))))",
         );
         assert!(plan.contains("SCAN"), "{plan}");
+        let plan = query_plan(
+            &conn,
+            "SELECT f.blob_id, b.ext FROM media_facts f JOIN blobs b ON b.id = f.blob_id
+              WHERE f.blob_id > 0 AND f.state = 'ok' AND (f.facts_v <> 1 OR f.pixel_rule <> 1)
+              ORDER BY f.blob_id LIMIT 500",
+        );
+        assert!(
+            plan.contains("SEARCH f USING INTEGER PRIMARY KEY (rowid>?)")
+                && !plan.contains("SCAN b")
+                && !plan.contains("TEMP B-TREE"),
+            "{plan}"
+        );
     }
 
     /// 処理中の印は置いて取り出すと消える。失敗を戻すのは failed だけ。

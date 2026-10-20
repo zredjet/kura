@@ -386,6 +386,8 @@ CREATE TABLE settings (
 --       'download.defaults' = ダウンロードの前回の選択（画質・音声のみ・保存先・自動タグ・再生リストをユニットに。M7、ADR-98）
 --       'analysis.plan'     = 解析の計画の指紋（計画・投影・ドット絵の規則・読み取りの記録の版と、種類ごとの解析 ID の版と既定の
 --                             引数の正規の形。起動のスレッドで比べ、解析の版・計画が変わった種類だけ pending に戻す。M11）
+--       'analysis.reproject'= 投影の作り直しの印（true。'analysis.plan' の投影の版・ドット絵の規則が変わったときに起動のスレッドが
+--                             置き、解析のジョブが投影の古い事実の行を結果の表から作り直し終えたら消す。M11 の検証 D3）
 --       'analysis.decoders' = 解析で読む形式ごとの、段の順のデコーダの識別子（解析のジョブがコーデックの組を作ったときに比べ、
 --                             今の組にないデコーダで読んだものと、並びが変わった形式で失敗していたものを pending に戻す。M11）
 --       'analysis.inflight' = 解析のジョブが OS のデコーダ（Platform の段）で読んでいるアイテム（{"id","hash"}。1 件ずつ解くので
@@ -567,13 +569,17 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - **波形の段**：結果の行は `output` が NULL（`output_len`・`digest` だけ）で、中身は `peaks/ab/<hash>.peaks`（kura-peaks 版 1。
   `/peaks` でそのまま配る）。DB に書く前に置く（書き込みが失敗してもファイルが残るだけ。次に解くときに置き換える）。
 - **投影**：`facts_v`（投影の版）か `pixel_rule`（ドット絵の判定の版）が古い行は、読み直さずに結果の表から作り直す
-  （`media_facts` を `blob_id` の順に 500 件ずつ。`state = 'ok'` の行だけ）。
+  （`media_facts` を `blob_id` の順に 500 件ずつ。`state = 'ok'` の行だけ）。古い行を探すのは、計画の指紋の投影の版・ドット絵の
+  規則が変わって起動のスレッドが作り直しの印（settings の `analysis.reproject`）を置いたときだけで、作り直し終えたら消す
+  （途中で止めたら印は残り、次の実行で初めから探す）。ふだんの起動・ジョブは事実の表を走査しない。
 - **失敗**：事実の行に `state = 'failed'` と `error_code` を書き、items は `failed`。計画・デコーダの指紋が変わるか、利用者が頼む
   （`retry_analysis`：`failed` を `pending` に戻す）まで解き直さない。見積もり（値の 2 倍＋デコーダの作業領域）が
   min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`。中止・一時停止・強制終了では、書くまでは `pending` のまま。
 - **一度きりの全件の走査**（例外）：計画の指紋が変わった種類を戻す `UPDATE items … WHERE kind = ? AND analysis_state IN ('ready','failed')`
   と、デコーダの指紋で戻す `UPDATE … WHERE … hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …)` は全件を走査する
-  （指紋が変わったときだけ。10 万件で約 70 ms。テスト `sync_plan_reset_is_a_one_time_full_scan`）。
+  （指紋が変わったときだけ。10 万件で約 70 ms）。投影の古い行を探す `stale_facts`（`media_facts` を主キーの範囲で読み、残りの
+  条件で絞る）も、古い行がなければ表の終わりまで読む（作り直しの印があるときだけ。8 万行で約 3〜7 ms）。テスト
+  `sync_plan_reset_is_a_one_time_full_scan`。
 
 ### サムネイルの作り直し（M11。`crates/kura-core/src/media/`）
 

@@ -5,7 +5,8 @@
 //!    failed（`crashed`）にして先へ進む（同じファイルで落ち続けない。critic 8）。
 //! 2. エンジンの部品（実行の場とコーデックの組）を使う。最初に使うときにここ（ジョブのスレッド）で作られる。コーデックの組から
 //!    デコーダの指紋を作って比べ、変わった形式に関わるものを pending に戻す。
-//! 3. 投影の版・ドット絵の規則が古い事実の行を、結果の表から作り直す（読まない。500 件ずつ）。
+//! 3. 起動のスレッドが計画の指紋の変化で作り直しの印を置いていれば（投影の版・ドット絵の規則が変わった）、古い事実の行を
+//!    結果の表から作り直し（読まない。500 件ずつ）、終えたら印を消す。印がなければ事実の表を走査しない。
 //! 4. 優先の指定（`request_analysis`）のあるものを先に、なければ新しい順に、`pending` を 16 件ずつ取り出して 1 件ずつ解く：
 //!    - 同じ中身の結果（計画の要求の ID・版・正規の引数がすべてそろう）があれば読まずに使う。
 //!    - ヘッダだけ読んで形を出し、見積もり（値の 2 倍＋デコーダの作業領域）が min(予算/2, 1 GiB) を超えれば確保せずに
@@ -388,8 +389,12 @@ impl Run<'_> {
         Ok(end)
     }
 
-    /// 投影の版・ドット絵の規則が古い事実の行を、結果の表から作り直す（読まない）。
+    /// 投影の版・ドット絵の規則が古い事実の行を、結果の表から作り直す（読まない）。作り直しの印があるときだけ走査し
+    /// （一度きりの全件の走査）、終えたら印を消す。途中で止めたら印は残り、次の実行で初めから走査し直す。
     fn reproject(&mut self) -> Result<Option<JobEnd>> {
+        if !self.ctx.library().db().read(store::reproject_due)? {
+            return Ok(None);
+        }
         let mut after = 0;
         loop {
             if let Some(end) = self.stop()? {
@@ -401,6 +406,10 @@ impl Run<'_> {
                 .db()
                 .read(|c| store::stale_facts(c, after, REPROJECT_BATCH))?;
             let Some(last) = rows.last() else {
+                self.ctx
+                    .library()
+                    .db()
+                    .write(|tx| store::clear_reproject(tx))?;
                 return Ok(None);
             };
             after = last.blob_id;
