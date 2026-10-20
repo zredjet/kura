@@ -6,11 +6,21 @@ import {
   MenuItem,
   type MenuItemOptions,
   type MenuOptions,
+  Submenu,
+  type SubmenuOptions,
 } from '@tauri-apps/api/menu';
 
+import {
+  applyPixelArtToSelection,
+  PIXEL_ART_CHOICES,
+  PIXEL_ART_LABELS,
+  pixelArtMenuState,
+} from '../features/library/pixelArtMenu';
 import { selectAllEntries } from '../features/library/useLibraryKeys';
 import { createPlaylistInteractive } from '../features/playlists/playlistActions';
 import { ja } from '../i18n/ja';
+import type { AssetChoiceDto } from '../ipc/asset';
+import { useItemCacheVersion } from '../stores/itemCache';
 import { useSettingsStore } from '../stores/settingsStore';
 import { type LayoutMode, useViewStore } from '../stores/viewStore';
 
@@ -35,7 +45,11 @@ export type MenuCommandId = 'newPlaylist' | 'collapseUnits' | 'settings';
 
 /** メニューの項目を押したときにすること。 */
 export type MenuAction =
-  { kind: 'selectAll' } | { kind: 'key'; spec: KeySpec } | { kind: 'command'; id: MenuCommandId };
+  | { kind: 'selectAll' }
+  | { kind: 'key'; spec: KeySpec }
+  | { kind: 'command'; id: MenuCommandId }
+  /** 項目 › ドット絵として表示 ▸：一覧で選んでいる画像に当てる（キーがないので、キーを押したことにはしない）。 */
+  | { kind: 'pixelArt'; choice: AssetChoiceDto };
 
 export type RunMenuAction = (action: MenuAction) => void;
 
@@ -45,6 +59,18 @@ export interface ViewItems {
   collapseUnits: CheckMenuItemOptions | CheckMenuItem;
   sidebar: MenuItemOptions | MenuItem;
 }
+
+/** 「ドット絵として表示 ▸」の状態：使えるか（一覧で画像を選んでいるか）と、チェックを付ける値（そろっていなければ null）。 */
+export interface PixelArtState {
+  enabled: boolean;
+  current: AssetChoiceDto | null;
+}
+
+/** 「ドット絵として表示 ▸」の中身の型（選択肢は自動・はい・いいえのチェック項目）。 */
+export type PixelArtOptions = Omit<SubmenuOptions, 'items'> & {
+  id: string;
+  items: CheckMenuItemOptions[];
+};
 
 /** ⌘ などの付いたキーを Tauri のアクセラレータの書き方にする。修飾キーがなければ undefined（文字の入力を奪わない）。 */
 export function acceleratorOf(spec: KeySpec): string | undefined {
@@ -116,11 +142,38 @@ export function viewItemOptions(
 }
 
 /**
+ * 項目メニューの「ドット絵として表示 ▸ 自動・はい・いいえ」の中身（design.md §3.1・§6。M11）。右クリックの同じ項目と同じく、
+ * 一覧で選んでいる画像に当てる。画像を選んでいなければ ▸ ごと無効。ID は読み込み直しても前のメニューの片付けと
+ * 重ならないよう毎回変える。
+ */
+export function pixelArtItemOptions(
+  run: RunMenuAction,
+  state: PixelArtState,
+  idPrefix: string,
+): PixelArtOptions {
+  return {
+    id: `${idPrefix}-pixel-art`,
+    text: ja.mediaView.pixelArt,
+    enabled: state.enabled,
+    items: PIXEL_ART_CHOICES.map((choice) => ({
+      id: `${idPrefix}-pixel-art-${choice}`,
+      text: PIXEL_ART_LABELS[choice],
+      checked: state.current === choice,
+      action: () => run({ kind: 'pixelArt', choice }),
+    })),
+  };
+}
+
+/**
  * メニューバーの中身。Tauri の既定のメニューと同じ項目を日本語で並べ、Kura の操作を足す（design.md §6）。
  * - 「すべてを選択」は既定の項目（`selectAll:`）をやめて自前の項目にする（ADR-76）。
  * - Kura の操作は、そのキーを押したことにする（`run` の `key`）。キーの処理と同じ場所で、同じ条件で動く。
  */
-export function appMenuItems(run: RunMenuAction, view: ViewItems): MenuItems {
+export function appMenuItems(
+  run: RunMenuAction,
+  view: ViewItems,
+  pixelArt: SubmenuOptions | Submenu,
+): MenuItems {
   const t = ja.appMenu;
   const app = ja.app.name;
   return [
@@ -215,6 +268,7 @@ export function appMenuItems(run: RunMenuAction, view: ViewItems): MenuItems {
             ),
           ),
         },
+        pixelArt,
         { item: 'Separator' },
         keyItem(run, t.trash, { key: 'Backspace', code: 'Backspace', ...META }),
       ],
@@ -285,6 +339,8 @@ export function runMenuAction(action: MenuAction): void {
     selectAllCommand();
   } else if (action.kind === 'key') {
     replayKey(action.spec);
+  } else if (action.kind === 'pixelArt') {
+    applyPixelArtToSelection(action.choice);
   } else if (action.id === 'newPlaylist') {
     void createPlaylistInteractive();
   } else if (action.id === 'collapseUnits') {
@@ -292,6 +348,39 @@ export function runMenuAction(action: MenuAction): void {
   } else if (action.id === 'settings') {
     useSettingsStore.getState().show();
   }
+}
+
+/** 選択・キャッシュが続けて変わっても、「ドット絵として表示 ▸」を合わせ直すのはこの間隔に 1 回（ms）。 */
+const PIXEL_ART_SYNC_MS = 100;
+
+/** 「ドット絵として表示 ▸」のメニューの部品（▸ の行と、選択肢の 3 つのチェック項目）。 */
+export interface PixelArtMenuItems {
+  submenu: Pick<Submenu, 'setEnabled'>;
+  choices: readonly Pick<CheckMenuItem, 'setChecked'>[];
+}
+
+/**
+ * 「ドット絵として表示 ▸」を今の選択に合わせる関数を作る（`shown` は作ったときの状態）。選んでいる画像がなければ
+ * ▸ ごと無効、設定がそろっていればその値にチェック。変わっていなければ何もしない。チェック項目は押すと自分で
+ * チェックを反転するので、押したあとは変わっていなくても合わせ直す（`force`）。
+ */
+export function pixelArtSyncer(
+  items: PixelArtMenuItems,
+  shown: PixelArtState,
+  read: () => PixelArtState = pixelArtMenuState,
+): (force: boolean) => void {
+  let last = shown;
+  return (force) => {
+    const state = read();
+    if (!force && last.enabled === state.enabled && last.current === state.current) {
+      return;
+    }
+    last = state;
+    void items.submenu.setEnabled(state.enabled);
+    items.choices.forEach((item, i) => {
+      void item.setChecked(state.current === PIXEL_ART_CHOICES[i]);
+    });
+  };
 }
 
 /** メニューバーを差し替える。Tauri の外（ブラウザでの確認など）では何もしない。 */
@@ -305,6 +394,14 @@ export async function installAppMenu(): Promise<void> {
       collapseUnits: CheckMenuItem;
       sidebar: MenuItem;
     } | null = null;
+    let syncPixelArt: ((force: boolean) => void) | null = null;
+    let pixelArtTimer: ReturnType<typeof setTimeout> | null = null;
+    const schedulePixelArt = () => {
+      pixelArtTimer ??= setTimeout(() => {
+        pixelArtTimer = null;
+        syncPixelArt?.(false);
+      }, PIXEL_ART_SYNC_MS);
+    };
     // チェックの付く項目は押すと自分でチェックを反転するので、押したあとと設定が変わったときに設定に合わせ直す
     const sync = () => {
       if (!view) {
@@ -320,8 +417,12 @@ export async function installAppMenu(): Promise<void> {
     const run: RunMenuAction = (action) => {
       runMenuAction(action);
       sync();
+      if (action.kind === 'pixelArt') {
+        syncPixelArt?.(true);
+      }
     };
-    const options = viewItemOptions(run, useViewStore.getState(), `view-${Date.now()}`);
+    const idPrefix = `view-${Date.now()}`;
+    const options = viewItemOptions(run, useViewStore.getState(), idPrefix);
     view = {
       layouts: {
         justify: await CheckMenuItem.new(options.layouts.justify),
@@ -331,7 +432,12 @@ export async function installAppMenu(): Promise<void> {
       collapseUnits: await CheckMenuItem.new(options.collapseUnits),
       sidebar: await MenuItem.new(options.sidebar),
     };
-    const menu = await Menu.new({ items: appMenuItems(run, view) });
+    const pixelState = pixelArtMenuState();
+    const pixelOptions = pixelArtItemOptions(run, pixelState, idPrefix);
+    const choices = await Promise.all(pixelOptions.items.map((item) => CheckMenuItem.new(item)));
+    const pixelArt = await Submenu.new({ ...pixelOptions, items: choices });
+    syncPixelArt = pixelArtSyncer({ submenu: pixelArt, choices }, pixelState);
+    const menu = await Menu.new({ items: appMenuItems(run, view, pixelArt) });
     await menu.setAsAppMenu();
     useViewStore.subscribe((now, before) => {
       if (
@@ -341,7 +447,12 @@ export async function installAppMenu(): Promise<void> {
       ) {
         sync();
       }
+      if (now.selection !== before.selection || now.view !== before.view) {
+        schedulePixelArt();
+      }
     });
+    // 選んでいるものの概要が届いた・設定を変えて取り直したとき
+    useItemCacheVersion.subscribe(schedulePixelArt);
   } catch (error) {
     console.warn('メニューを設定できませんでした', error);
   }
