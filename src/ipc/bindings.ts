@@ -402,12 +402,6 @@ export type AssetAudioFactsDto = {
 	clipRuns: number | null,
 };
 
-/**  3D の範囲。 */
-export type AssetBoundsDto = {
-	min: [(number | null), (number | null), (number | null)],
-	max: [(number | null), (number | null), (number | null)],
-};
-
 /**  「ドット絵として表示」の 3 択。 */
 export type AssetChoiceDto = "auto" | "yes" | "no";
 
@@ -502,7 +496,8 @@ export type AssetModelDto = {
 	materials: number | null,
 	textures: number | null,
 	meshes: number | null,
-	bounds: AssetBoundsDto | null,
+	/**  大きさ（範囲の max − min。x・y・z の順。glb の単位はメートル）。 */
+	size: [(number | null), (number | null), (number | null)] | null,
 	/**  描けない理由（必須の Draco・meshopt・知らない拡張の名前、`skin`）。空なら描ける。 */
 	unsupported: string[],
 };

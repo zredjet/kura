@@ -280,14 +280,7 @@ pub struct FontFacts {
     pub format: Option<String>,
 }
 
-/// 3D の範囲（世界の座標）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
-pub struct ModelBounds {
-    pub min: [f64; 3],
-    pub max: [f64; 3],
-}
-
-/// 3D モデルの情報（`items.codec_info` の `model`。取り込みのあとの probe が入れる。kura-engine の `ModelInfo` の形）。
+/// 3D モデルの情報（`items.codec_info` の `model`。サムネイルのジョブが `media::ModelInfo` の形で入れる）。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ModelFacts {
@@ -296,7 +289,8 @@ pub struct ModelFacts {
     pub materials: Option<u32>,
     pub textures: Option<u32>,
     pub meshes: Option<u32>,
-    pub bounds: Option<ModelBounds>,
+    /// 大きさ（範囲の max − min。x・y・z の順。glb の単位はメートル）。数えられなければ None。
+    pub size: Option<[f64; 3]>,
     /// 描けない理由（必須の Draco・meshopt・知らない拡張の名前、`skin`）。空なら描ける。
     pub unsupported: Vec<String>,
 }
@@ -1029,7 +1023,7 @@ mod tests {
             "model",
             None,
             Some(
-                r#"{"codec":"glb","model":{"vertices":12480,"triangles":8320,"materials":3,"bounds":{"min":[0,0,0],"max":[1.2,0.8,0.45]},"unsupported":["KHR_draco_mesh_compression"],"generator":"x"}}"#,
+                r#"{"codec":"glb","model":{"vertices":12480,"triangles":8320,"materials":3,"size":[1.2,0.8,0.45],"unsupported":["KHR_draco_mesh_compression"],"generator":"x"}}"#,
             ),
         );
         item(&conn, 3, "font", None, Some("壊れた JSON"));
@@ -1044,11 +1038,73 @@ mod tests {
             (Some(12_480), Some(8_320))
         );
         assert_eq!(model.materials, Some(3));
-        assert_eq!(model.bounds.unwrap().max, [1.2, 0.8, 0.45]);
+        assert_eq!(model.size, Some([1.2, 0.8, 0.45]));
         assert_eq!(model.unsupported, ["KHR_draco_mesh_compression"]);
         // 壊れていても素材の欄は出す（情報なし）。形式は拡張子から
         let broken = get(&conn, 3).unwrap();
         assert_eq!(broken.font.map(|f| f.family), Some(None));
+    }
+
+    /// 書き手（取り込みの probe・サムネイルのジョブが `MediaInfo::codec_json` で書く codec_info）と読み手（素材の欄）が
+    /// 同じ形であること。3D の大きさは `size`（範囲の max − min）で書かれる。
+    #[test]
+    fn font_and_model_written_by_media_info_are_read_back() {
+        use crate::media::{FontInfo, MediaInfo, ModelInfo};
+        let conn = test_conn();
+        let font = MediaInfo {
+            codec: Some("ttc".into()),
+            font: Some(FontInfo {
+                family: Some("Kura Mono".into()),
+                style: Some("Italic".into()),
+                full_name: Some("Kura Mono Italic".into()),
+                postscript_name: Some("KuraMono-Italic".into()),
+                glyphs: 512,
+                faces: 3,
+                variable: true,
+            }),
+            ..MediaInfo::default()
+        };
+        let model = MediaInfo {
+            codec: Some("glb".into()),
+            model: Some(ModelInfo {
+                vertices: 24,
+                triangles: 12,
+                meshes: 1,
+                materials: 2,
+                textures: 1,
+                size: Some([1.0, 0.5, 0.25]),
+                unsupported: vec!["skin".into()],
+                ..ModelInfo::default()
+            }),
+            ..MediaInfo::default()
+        };
+        item(&conn, 1, "font", None, font.codec_json().as_deref());
+        item(&conn, 2, "model", None, model.codec_json().as_deref());
+        assert_eq!(
+            get(&conn, 1).unwrap().font,
+            Some(FontFacts {
+                family: Some("Kura Mono".into()),
+                style: Some("Italic".into()),
+                full_name: Some("Kura Mono Italic".into()),
+                postscript_name: Some("KuraMono-Italic".into()),
+                glyphs: Some(512),
+                faces: Some(3),
+                variable: Some(true),
+                format: Some("ttc".into()),
+            })
+        );
+        assert_eq!(
+            get(&conn, 2).unwrap().model,
+            Some(ModelFacts {
+                vertices: Some(24),
+                triangles: Some(12),
+                materials: Some(2),
+                textures: Some(1),
+                meshes: Some(1),
+                size: Some([1.0, 0.5, 0.25]),
+                unsupported: vec!["skin".into()],
+            })
+        );
     }
 
     /// 右クリックの複数の選択：画像だけに付け、ほかの種類とない ID は飛ばす。すべて自動に戻れば行を消す。変えた数を返す。

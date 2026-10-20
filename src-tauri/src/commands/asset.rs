@@ -200,14 +200,6 @@ pub struct AssetFontDto {
     pub format: Option<String>,
 }
 
-/// 3D の範囲。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct AssetBoundsDto {
-    pub min: [f64; 3],
-    pub max: [f64; 3],
-}
-
 /// 3D モデルの情報。
 #[derive(Debug, Clone, PartialEq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -217,7 +209,8 @@ pub struct AssetModelDto {
     pub materials: Option<u32>,
     pub textures: Option<u32>,
     pub meshes: Option<u32>,
-    pub bounds: Option<AssetBoundsDto>,
+    /// 大きさ（範囲の max − min。x・y・z の順。glb の単位はメートル）。
+    pub size: Option<[f64; 3]>,
     /// 描けない理由（必須の Draco・meshopt・知らない拡張の名前、`skin`）。空なら描ける。
     pub unsupported: Vec<String>,
 }
@@ -332,10 +325,7 @@ impl From<AssetInfo> for AssetDto {
                 materials: m.materials,
                 textures: m.textures,
                 meshes: m.meshes,
-                bounds: m.bounds.map(|b| AssetBoundsDto {
-                    min: b.min,
-                    max: b.max,
-                }),
+                size: m.size,
                 unsupported: m.unsupported,
             }),
         }
