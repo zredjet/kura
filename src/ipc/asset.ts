@@ -35,7 +35,7 @@ export function getAsset(itemId: number): Promise<AssetDto> {
   return unwrap(commands.itemAssetGet(itemId));
 }
 
-/** 素材の設定を変える（画像だけに付く。変えた数を返す。格子が合わなければ `Invalid` で何も変えない）。 */
+/** 素材の設定を変える（素材の欄・格子のシート・右クリックの「ドット絵として表示 ▸」から。画像だけに付く。変えた数を返す。格子が合わなければ `Invalid` で何も変えない）。 */
 export function setAssetSettings(ids: number[], patch: AssetSettingsPatchDto): Promise<number> {
   return unwrap(commands.itemAssetSettingsSet(ids, patch));
 }

@@ -1,6 +1,6 @@
 import type { MenuSubmenu } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
-import { type AssetChoiceDto, setPixelArt } from '../../ipc/assetSettings';
+import { type AssetChoiceDto, setAssetSettings } from '../../ipc/asset';
 import { isUnitEntry } from '../../ipc/items';
 import { getCached, invalidateItems, invalidateUnits } from '../../stores/itemCache';
 import { bumpRevision } from '../../stores/revisionStore';
@@ -23,7 +23,7 @@ function choiceOf(setting: boolean | null): AssetChoiceDto {
 /** 設定を変えて、タイル（とユニットの表紙・インスペクタ）を読み直す。 */
 async function apply(ids: number[], choice: AssetChoiceDto): Promise<void> {
   await attempt(async () => {
-    await setPixelArt(ids, choice);
+    await setAssetSettings(ids, { pixelArt: choice });
     invalidateItems(ids);
     invalidateUnits();
     bumpRevision();

@@ -2,14 +2,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { isSubmenu, type MenuEntry, type MenuSubmenu } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
-import { setPixelArt } from '../../ipc/assetSettings';
+import { setAssetSettings } from '../../ipc/asset';
 import { type ItemSummaryDto, unitEntry } from '../../ipc/items';
 import { getCached, invalidateItems, invalidateUnits } from '../../stores/itemCache';
 import { notify } from '../../stores/noticeStore';
 import { itemMenu } from './itemMenu';
 import { pixelArtMenu } from './pixelArtMenu';
 
-vi.mock('../../ipc/assetSettings', () => ({ setPixelArt: vi.fn(async () => 1) }));
+vi.mock('../../ipc/asset', () => ({ setAssetSettings: vi.fn(async () => 1) }));
 vi.mock('../../stores/noticeStore', () => ({ notify: vi.fn() }));
 vi.mock('../../stores/itemCache', () => ({
   getCached: vi.fn(),
@@ -55,7 +55,7 @@ const cache = new Map<number, ItemSummaryDto>();
 beforeEach(() => {
   cache.clear();
   vi.mocked(getCached).mockImplementation((id) => cache.get(id));
-  vi.mocked(setPixelArt).mockClear();
+  vi.mocked(setAssetSettings).mockClear();
   vi.mocked(invalidateItems).mockClear();
   vi.mocked(invalidateUnits).mockClear();
   vi.mocked(notify).mockClear();
@@ -94,7 +94,7 @@ describe('ドット絵として表示 ▸', () => {
     expect(menu?.label).toBe(t.pixelArt);
     menu?.submenu[1]?.onSelect();
     await vi.waitFor(() => expect(invalidateItems).toHaveBeenCalled());
-    expect(setPixelArt).toHaveBeenCalledWith([1, 3], 'yes');
+    expect(setAssetSettings).toHaveBeenCalledWith([1, 3], { pixelArt: 'yes' });
     expect(invalidateItems).toHaveBeenCalledWith([1, 3]);
     expect(invalidateUnits).toHaveBeenCalled();
 
@@ -104,7 +104,7 @@ describe('ドット絵として表示 ▸', () => {
 
   it('変えられなければ知らせる', async () => {
     cache.set(1, item(1, {}));
-    vi.mocked(setPixelArt).mockRejectedValueOnce(new Error('だめでした'));
+    vi.mocked(setAssetSettings).mockRejectedValueOnce(new Error('だめでした'));
     pixelArtMenu([1])?.submenu[0]?.onSelect();
     await vi.waitFor(() => expect(notify).toHaveBeenCalled());
     expect(vi.mocked(notify).mock.calls[0]?.[0]).toContain('だめでした');
