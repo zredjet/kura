@@ -261,7 +261,9 @@ import_start:    ジョブとして実行
      a. staging/import-<job>-<n>.<ext> へ reflink（APFS クローン、異なるボリュームなら通常コピー）
      b. コピーした側の BLAKE3（1MB 以上は mmap で並列）。コピー後に取るので、名前と中身が必ず一致する（ADR-19）
      c. files/ab/cd/<hash>.<ext> へ rename（原子的。同じものがすでにあればコピーを消す）
-     d. メディア情報（MediaBackend::probe）：幅・高さ・長さ・撮影日時・コーデック、音楽はアーティスト・アルバム・曲名
+     d. メディア情報（MediaBackend::probe）：幅・高さ・長さ・撮影日時・コーデック、音楽はアーティスト・アルバム・曲名、
+        フォントは書体名など。OS のデコーダで読むので、バッチの前に処理中の印を付けてから a〜d を続けて並列に行う
+        （§7 の「取り込み・ダウンロード・キャプチャの probe の印」。media::inflight::ProbeBatch。M11 の検証 S2）
   3. バッチごとに 1 トランザクションで：
      - 既存（同じハッシュ）なら、オプションのフォルダ・タグ・ユニットへの所属だけ追加して「重複」と数える
        （「何もしない」を選んだら所属も足さない。ゴミ箱にあれば戻す）
@@ -316,6 +318,7 @@ import_start:    ジョブとして実行
   - **書き方**：OS の道はサムネイルのプールで CPU コア数の並列。結果は 1 トランザクションで書き、書いたら `thumb_rev` を +1（URL の `?r=`）。UPDATE は `WHERE id = ? AND hash = ?`（読んだあとに中身が変わっていたら書かない）。書いたら別の形式の古いファイルを消す（`ThumbTargets::remove_others`）。`stale` を作り直せなかったときは、前の絵のまま `ready` に戻す（`thumb_rev` は変えない）。`kura://…/thumb/{hash}/{s,l}` は png、jpg の順に探す（§4）。
   - **作り方の指紋**（settings の `'thumbs.plan'`。`media::route::sync_plan`）：形式の表の行ごとの作り方の名前（`engine-thumbs/1`・`imageio-alpha/1`・`imageio/1`（jpeg）・`coretext/1`・`model-kura-render/1`・`video/1`・`audio/1`）。ライブラリを開くとき（ジョブを動かす前に）前回と比べ、変わった形式の `ready` を `stale` に、`failed` を `pending` に戻す。指紋のないライブラリ（M10 まで）は「画像はすべて ImageIO の JPEG、フォント・3D は作らない」と比べる（png・gif・webp・aseprite・psd・svg・heic・heif・avif・tiff・bmp とフォント・3D が作り直しになり、jpeg・動画・音楽は変わらない）。指紋が変わったときだけの全件の走査（10 万件の seed で png・heic の 46,860 件を stale にして 70ms）。
   - **作っている途中の印**（critic 8。`media::inflight`）：OS のデコーダ（ImageIO・CoreText・AVFoundation）とエンジンの Platform の段はアプリのプロセスの中で動くので、壊れたファイルでプロセスごと落ちうる。作る前に作っているアイテムを settings の `'thumbs.inflight'`（`{solo, ids}`）に書き、結果と同じトランザクションで消す。開くときに残っていれば、まとめての印（64 件）は疑わしいもの（`'thumbs.suspects'`）にして 1 件ずつ・1 件だけの印で作り直し、1 件だけの印のアイテムは `failed`（`stale` は前の絵のまま `ready`）にして先へ進む（同じファイルで落ちるのは多くても 2 回）。開く道は `media::prepare_on_open`（印の片付け → 指紋 → pending・stale があればジョブを積む）。
+  - **取り込み・ダウンロード・キャプチャの probe の印**（M11 の検証 S2。`media::inflight::ProbeBatch`）：取り込みの probe（CoreText のフォント・ImageIO・AVFoundation）も同じプロセスで読むので、印がないと、落ちたジョブが次の起動で同じ範囲をやり直して同じファイルで落ち続けた（CoreText の読み込みを abort に差し替えると、開くたびに落ちた）。ファイルはまだアイテムでないので取り込み元のパス（取り込みの再開・ダウンロードのやり直しで同じになる）で覚え、バッチ（500 件）の前に、まとめて読むファイルのパスをジョブごとの印として settings の `'probe.inflight'`（`[{job, solo, paths}]`）に書いてコミットし、コピー・ハッシュ・配置・読み取りを続けて並列に行い、結果を書くトランザクションで消す（`settle_probes`）。開くときに残っていれば（サムネイルの印と同じ `inflight::recover`）、まとめての印のファイルは `'probe.suspects'` にして次に 1 件ずつ・1 件だけの印で読み、1 件だけの印のファイルは `'probe.crashed'` にしてもう読まない（情報なしで入れ、サムネイルは `failed`。作り終えた絵は変えない）。同じ差し替えで、落ちるのは 2 回で止まり、3 回目からは開ける。同じファイルで落ちるのは多くても 2 回。印の書き込みはバッチごとに 1 回で、取り込みの速さは変わらない（4,000 件の JPEG で直す前 7,030〜7,270 件/秒・直したあと 7,050〜7,220 件/秒）。
   - **キャッシュの容量**（M11 の決定 4 で ADR-122 を広げる）：`library_cache_usage`（§3）がサムネイル（`thumbs/` と `art/`）・波形（`peaks/`）・アニメ（`anim/`）のファイルを別々に数える（`media::usage`。1 段目のフォルダを最大 8 本のスレッドで。10 万件の seed のサムネイル 21 万個で 251〜328ms（温まった状態））。
 - 目標：画像サムネイル 50 枚/秒以上（NFR-04）。実測は §13。M11（`bench thumbs-job`）：PNG の多い組（`assets --bench 24`：2048² のアルファ付き PNG・3000×2000 の不透明な PNG・JPEG を 24 枚ずつ、64² のスプライト 96 枚の 168 件）で 105〜112 枚/秒。大きな透過 PNG だけ（48 件）では 31 枚/秒（同時の確保 512 MiB なら 46 枚/秒）で、エンジンを使わない（M10 の ImageIO の JPEG）と 194 枚/秒。大きな透過 PNG の多いライブラリでは NFR-04 を下回る（M11 の決定 2。判定の範囲は requirements.md の NFR-04）。
 - **大きな確保を OS へすぐ返す確保器**（M11。ADR-163。`kura_mac::ReturningAllocator`）：アプリ（src-tauri）と kura-devtools の `#[global_allocator]`。1 MiB 以上の確保だけを `mmap` で取り、解放したら `munmap` ですぐ返す。それより小さいもの（エンジンの 256² のタイル・音声のブロックなど）と、ページより大きな揃えは今までどおり `System`（libmalloc）。どちらの道かは `Layout` の大きさと揃えだけで決まる（解放・取り直しでも同じ `Layout` が渡るので目印を持たない）。`mmap` の領域は 0 で埋まっているので、0 で埋めた確保は書かない。macOS 以外は `System` のまま。

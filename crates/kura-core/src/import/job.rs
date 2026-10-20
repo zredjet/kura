@@ -26,6 +26,7 @@ use crate::jobs::{
     Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, save_partial,
 };
 use crate::library::Layout;
+use crate::media::inflight::{self, ProbeWay};
 use crate::media::{MediaBackend, MediaInfo, NoBackend};
 use crate::time::now_ms;
 use crate::{CoreError, Result};
@@ -187,9 +188,15 @@ impl JobHandler for ImportHandler {
             let job_id = ctx.id();
             // files/ に置いてから DB に書き終えるまで、ゴミ箱を空にする処理を待たせる（同じ中身を消されないように）
             let ingest = library.ingest_guard();
-            // コピー・ハッシュ・配置・メディア情報の読み取りは並列に（DB には触らない）
+            // メディア情報（OS のデコーダ）は処理中の印を付けて読む（落ちても、次の起動で同じファイルで落ち続けない。
+            // media::inflight::ProbeBatch。M11 の検証 S2）。印はバッチの前に 1 回書き、コピー・ハッシュ・配置・読み取りは
+            // 続けて並列に（DB には触らない）。前回まとめて読んでいて落ちたものは、あとで 1 件ずつ印を付けて読む
+            let keys: Vec<String> = (cursor..end)
+                .map(|i| inflight::probe_key(&files[i].path))
+                .collect();
+            let probes = inflight::ProbeBatch::begin(library.db(), job_id, keys.clone())?;
             let backend = self.backend.as_ref();
-            let outcomes: Vec<(usize, PlaceOutcome)> = pool.install(|| {
+            let mut outcomes: Vec<(usize, PlaceOutcome)> = pool.install(|| {
                 (cursor..end)
                     .into_par_iter()
                     .map(|i| {
@@ -197,12 +204,46 @@ impl JobHandler for ImportHandler {
                         let staging = layout
                             .staging_dir()
                             .join(format!("import-{job_id}-{i}.{}", file.ext));
-                        let outcome = stage_and_place(&layout, backend, file, &staging)
+                        let key = &keys[i - cursor];
+                        let outcome = stage_and_place(&layout, file, &staging)
+                            .map(|(size, hash)| Placed {
+                                hash,
+                                size,
+                                info: probes.probe_together(
+                                    key,
+                                    backend,
+                                    &layout.content_path(&hash, &file.ext),
+                                    file.kind,
+                                ),
+                                crashed: probes.way(key) == ProbeWay::Skip,
+                            })
                             .map_err(|err| err.to_string());
                         (i, outcome)
                     })
                     .collect()
             });
+            for (i, outcome) in &mut outcomes {
+                let (file, key) = (&files[*i], &keys[*i - cursor]);
+                let Ok(placed) = outcome else {
+                    continue;
+                };
+                match probes.way(key) {
+                    ProbeWay::Together => {}
+                    ProbeWay::Alone => {
+                        placed.info = probes.probe_alone(
+                            library.db(),
+                            key,
+                            backend,
+                            &layout.content_path(&placed.hash, &file.ext),
+                            file.kind,
+                        )?;
+                    }
+                    ProbeWay::Skip => ctx.log(&format!(
+                        "前回、メディア情報を読んでいる途中でアプリが終わったファイルなので、読まずに入れます（サムネイルは作りません）: {}",
+                        file.path.display()
+                    )),
+                }
+            }
 
             #[cfg(test)]
             {
@@ -274,6 +315,8 @@ struct Placed {
     size: u64,
     /// 読めたメディア情報（読めなければサムネイルのジョブがあとで読む）。
     info: Option<MediaInfo>,
+    /// 前回このファイルのメディア情報を読んでいて落ちたので読まなかった（アイテムはサムネイルを作れなかったものにする）。
+    crashed: bool,
 }
 
 /// 1 ファイルを配置した結果、または失敗の理由。
@@ -307,6 +350,13 @@ impl BatchCommit {
         let mut extra_files = Vec::new();
         let mut folders: HashMap<FolderTarget, Option<i64>> = HashMap::new();
         let mut tags: HashMap<TagName, i64> = HashMap::new();
+        // 入れたファイル（probe の印と覚えを片付ける）
+        let done: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.outcome.is_ok())
+            .map(|e| inflight::probe_key(&e.file.path))
+            .collect();
 
         for entry in self.entries {
             let file = &entry.file;
@@ -361,6 +411,9 @@ impl BatchCommit {
                     id
                 }
             };
+            if placed.crashed {
+                inflight::fail_crashed_thumb(tx, item_id)?;
+            }
 
             if let Some(target) = &entry.assignment.folder {
                 let folder = match folders.get(target) {
@@ -405,6 +458,7 @@ impl BatchCommit {
             }
         }
 
+        inflight::settle_probes(tx, self.job_id, &done)?;
         state.cursor = self.end as u64;
         save_partial(
             tx,
@@ -417,22 +471,12 @@ impl BatchCommit {
     }
 }
 
-/// staging にコピーしてハッシュを取り、files/ に置いてからメディア情報を読む。
-fn stage_and_place(
-    layout: &Layout,
-    backend: &dyn MediaBackend,
-    file: &ScannedFile,
-    staging: &Path,
-) -> Result<Placed> {
+/// staging にコピーしてハッシュを取り、files/ に置く。(大きさ, ハッシュ) を返す（メディア情報は印を付けてから読む）。
+fn stage_and_place(layout: &Layout, file: &ScannedFile, staging: &Path) -> Result<(u64, [u8; 32])> {
     let staged = stage(&file.path, staging)?;
     let final_path = layout.content_path(&staged.hash, &file.ext);
     place(&staged, &final_path)?;
-    let info = backend.probe(&final_path, file.kind).ok();
-    Ok(Placed {
-        hash: staged.hash,
-        size: staged.size,
-        info,
-    })
+    Ok((staged.size, staged.hash))
 }
 
 /// 「ファイルの情報からタグ」：音楽のアーティストとアルバム（docs/decisions.md ADR-30）。
@@ -1197,6 +1241,210 @@ mod tests {
                 ("otf", "font", "not_needed", "not_needed"),
             ]
         );
+    }
+
+    /// probe を呼んだファイル（中身のハッシュの 16 進）と、そのときの settings の `probe.inflight` を記録する backend
+    /// （検証 S2）。幅と高さは 1 を返す。
+    struct ProbeLog {
+        library: Arc<Library>,
+        calls: Mutex<Vec<(String, Option<serde_json::Value>)>>,
+    }
+
+    impl MediaBackend for ProbeLog {
+        fn probe(
+            &self,
+            path: &Path,
+            _: crate::import::MediaKind,
+        ) -> std::result::Result<MediaInfo, crate::media::MediaError> {
+            let mark = self
+                .library
+                .db()
+                .read(|c| crate::settings::get::<serde_json::Value>(c, "probe.inflight"))
+                .unwrap();
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            self.calls.lock().unwrap().push((stem, mark));
+            Ok(MediaInfo {
+                width: Some(1),
+                height: Some(1),
+                ..MediaInfo::default()
+            })
+        }
+        fn image_thumbnails(
+            &self,
+            _: &Path,
+            _: &crate::media::ThumbTargets,
+        ) -> std::result::Result<crate::media::ThumbFormat, crate::media::MediaError> {
+            Err(crate::media::MediaError::Unsupported)
+        }
+        fn video_thumbnails(
+            &self,
+            _: &Path,
+            _: f64,
+            _: &crate::media::ThumbTargets,
+        ) -> std::result::Result<crate::media::ThumbFormat, crate::media::MediaError> {
+            Err(crate::media::MediaError::Unsupported)
+        }
+        fn audio_artwork(
+            &self,
+            _: &Path,
+            _: &Path,
+            _: &crate::media::ThumbTargets,
+        ) -> std::result::Result<Option<crate::media::ThumbFormat>, crate::media::MediaError>
+        {
+            Err(crate::media::MediaError::Unsupported)
+        }
+        fn font_thumbnails(
+            &self,
+            _: &Path,
+            _: &crate::media::ThumbTargets,
+        ) -> std::result::Result<crate::media::ThumbFormat, crate::media::MediaError> {
+            Err(crate::media::MediaError::Unsupported)
+        }
+    }
+
+    fn hex_of(path: &Path) -> String {
+        crate::library::hex(&hash_file(path).unwrap())
+    }
+
+    fn thumb_state_of(env: &Env, hex: &str) -> String {
+        env.library
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT thumb_state FROM items WHERE lower(hex(hash)) = ?1",
+                    [hex],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    fn setting(env: &Env, key: &str) -> Option<serde_json::Value> {
+        env.library
+            .db()
+            .read(|c| crate::settings::get::<serde_json::Value>(c, key))
+            .unwrap()
+    }
+
+    /// 検証 S2：probe（OS のデコーダ。CoreText のフォントなど）を 1 件だけで読んでいる途中で落ちた（1 件だけの印が
+    /// 残った）ファイルは、次に開いたあとの取り込みで読み直さず、サムネイルを作れなかったものとして入れる
+    /// （起動のたびに同じファイルで落ち続けない）。ほかのファイルはふつうに読む。
+    #[test]
+    fn a_file_that_crashed_the_probe_is_not_probed_again() {
+        let env = Env::new();
+        let src = env.src();
+        write(&src.join("a.otf"), b"crashes-coretext");
+        write(&src.join("b.png"), b"fine");
+        let (a, b) = (hex_of(&src.join("a.otf")), hex_of(&src.join("b.png")));
+        // 前の取り込み（ジョブ 99）が a を 1 件だけで読んでいて落ちた
+        let a_key = crate::media::inflight::probe_key(&src.join("a.otf"));
+        let mark = serde_json::json!([{ "job": 99, "solo": true, "paths": [a_key] }]);
+        env.library
+            .db()
+            .write(move |tx| crate::settings::set(tx, "probe.inflight", &mark))
+            .unwrap();
+        crate::media::prepare_on_open(env.library.db());
+        let log = Arc::new(ProbeLog {
+            library: env.library.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let jobs = env.manager(ImportHandler::new(log.clone()));
+        let id = start_import(
+            &jobs,
+            &ImportInput {
+                paths: vec![src.clone()],
+                options: ImportOptions::default(),
+            },
+        )
+        .unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(WAIT));
+        assert_eq!(jobs.get(id).unwrap().state, JobState::Done);
+        let probed: Vec<String> = log
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.0.clone())
+            .collect();
+        assert_eq!(probed, vec![b.clone()], "落ちたファイルは読み直さない");
+        assert_eq!(thumb_state_of(&env, &a), "failed");
+        assert_eq!(thumb_state_of(&env, &b), "pending");
+        assert_eq!(setting(&env, "probe.inflight"), None);
+        assert_eq!(
+            setting(&env, "probe.crashed"),
+            None,
+            "入れたら落ちた印は片付ける"
+        );
+    }
+
+    /// 検証 S2：まとめて読んでいる途中で落ちた（まとめての印が残った）ファイルは、どれが原因か分からないので、次の取り込みで
+    /// 1 件ずつ、1 件だけの印を付けて読む（ほかのファイルを巻き込まない）。印のないファイルはまとめての印の下で読む。
+    /// 読み終えたら印を片付ける。
+    #[test]
+    fn files_probed_together_before_a_crash_are_probed_one_at_a_time() {
+        let env = Env::new();
+        let src = env.src();
+        write(&src.join("a.otf"), b"suspect-a");
+        write(&src.join("b.ttf"), b"suspect-b");
+        write(&src.join("c.png"), b"never-seen");
+        let (a, b, c) = (
+            hex_of(&src.join("a.otf")),
+            hex_of(&src.join("b.ttf")),
+            hex_of(&src.join("c.png")),
+        );
+        let key = |name: &str| crate::media::inflight::probe_key(&src.join(name));
+        let mark =
+            serde_json::json!([{ "job": 7, "solo": false, "paths": [key("a.otf"), key("b.ttf")] }]);
+        env.library
+            .db()
+            .write(move |tx| crate::settings::set(tx, "probe.inflight", &mark))
+            .unwrap();
+        crate::media::prepare_on_open(env.library.db());
+        let log = Arc::new(ProbeLog {
+            library: env.library.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let jobs = env.manager(ImportHandler::new(log.clone()));
+        let id = start_import(
+            &jobs,
+            &ImportInput {
+                paths: vec![src.clone()],
+                options: ImportOptions::default(),
+            },
+        )
+        .unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(WAIT));
+        assert_eq!(jobs.get(id).unwrap().state, JobState::Done);
+        let calls = log.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        for (hash, mark) in &calls {
+            let mark = mark
+                .as_ref()
+                .unwrap_or_else(|| panic!("{hash} を印なしで読んだ"));
+            let ours = mark
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["job"] == serde_json::json!(id))
+                .unwrap_or_else(|| panic!("{hash}: このジョブの印がない（{mark}）"));
+            let paths: Vec<String> = serde_json::from_value(ours["paths"].clone()).unwrap();
+            if *hash == c {
+                assert_eq!(ours["solo"], serde_json::json!(false));
+                assert_eq!(paths, vec![key("c.png")]);
+            } else {
+                let name = if *hash == a { "a.otf" } else { "b.ttf" };
+                assert!(*hash == a || *hash == b);
+                assert_eq!(ours["solo"], serde_json::json!(true), "{hash}");
+                assert_eq!(paths, vec![key(name)]);
+            }
+        }
+        for h in [&a, &b, &c] {
+            assert_eq!(thumb_state_of(&env, h), "pending");
+        }
+        assert_eq!(setting(&env, "probe.inflight"), None);
+        assert_eq!(setting(&env, "probe.suspects"), None);
     }
 
     #[test]
