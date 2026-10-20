@@ -1,10 +1,12 @@
 import type {
+  CheckMenuItemOptions,
   MenuItemOptions,
   PredefinedMenuItemOptions,
   SubmenuOptions,
 } from '@tauri-apps/api/menu';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { applyPixelArtToSelection } from '../features/library/pixelArtMenu';
 import { EMPTY_SELECTION } from '../features/library/selection';
 import { ja } from '../i18n/ja';
 import { useImportStore } from '../stores/importStore';
@@ -16,17 +18,31 @@ import {
   WINDOW_MENU_ID,
   acceleratorOf,
   appMenuItems,
+  pixelArtItemOptions,
+  type PixelArtState,
+  pixelArtSyncer,
   replayKey,
+  runMenuAction,
   selectAllCommand,
   viewItemOptions,
 } from './appMenu';
 
+vi.mock('../features/library/pixelArtMenu', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../features/library/pixelArtMenu')>()),
+  applyPixelArtToSelection: vi.fn(),
+}));
+
 type Item = MenuItemOptions | PredefinedMenuItemOptions | SubmenuOptions;
 
 const STATE = { layout: 'justify', collapseUnits: false, sidebar: true } as const;
+const PIXEL_ART = { enabled: true, current: null } as const;
 
 function items(run: (action: MenuAction) => void = () => {}): Item[] {
-  return appMenuItems(run, viewItemOptions(run, STATE, 'test')) as Item[];
+  return appMenuItems(
+    run,
+    viewItemOptions(run, STATE, 'test'),
+    pixelArtItemOptions(run, PIXEL_ART, 'test'),
+  ) as Item[];
 }
 
 function submenu(text: string, run?: (action: MenuAction) => void): SubmenuOptions {
@@ -92,6 +108,71 @@ describe('appMenuItems', () => {
     expect(audition.accelerator).toBeUndefined();
     audition.action?.('');
     expect(run).toHaveBeenCalledWith({ kind: 'key', spec: { key: 'l', code: 'KeyL' } });
+  });
+
+  it('項目の「ドット絵として表示 ▸」は評価の次にあり、自動・はい・いいえのチェック項目で、押すとその選択肢を当てる（M11）', () => {
+    const run = vi.fn();
+    const menu = submenu(ja.appMenu.items, run).items as Item[];
+    const at = menu.findIndex((i) => 'text' in i && i.text === ja.mediaView.pixelArt);
+    const before = menu[at - 1];
+    expect(before && 'text' in before ? before.text : null).toBe(ja.appMenu.rating);
+    const pixel = menu[at] as SubmenuOptions;
+    const choices = pixel.items as CheckMenuItemOptions[];
+    expect(choices.map((c) => c.text)).toEqual([
+      ja.mediaView.pixelArtAuto,
+      ja.mediaView.pixelArtYes,
+      ja.mediaView.pixelArtNo,
+    ]);
+    expect(choices.every((c) => c.accelerator === undefined)).toBe(true);
+    choices[1]?.action?.('');
+    expect(run).toHaveBeenCalledWith({ kind: 'pixelArt', choice: 'yes' });
+  });
+
+  it('「ドット絵として表示 ▸」は画像を選んでいなければ無効、設定がそろっていればその値にチェック', () => {
+    const off = pixelArtItemOptions(() => {}, { enabled: false, current: null }, 'test');
+    expect(off.enabled).toBe(false);
+    expect(off.items.map((c) => c.checked)).toEqual([false, false, false]);
+    const on = pixelArtItemOptions(() => {}, { enabled: true, current: 'no' }, 'test');
+    expect(on.enabled).toBe(true);
+    expect(on.items.map((c) => c.checked)).toEqual([false, false, true]);
+    // ID は読み込み直しても前のメニューの片付けと重ならないよう、呼ぶ側の接頭辞を付ける
+    expect(on.id).toBe('test-pixel-art');
+    expect(new Set(on.items.map((c) => c.id)).size).toBe(3);
+  });
+
+  it('「ドット絵として表示 ▸」の選択肢は、一覧で選んでいる画像に当てる', () => {
+    runMenuAction({ kind: 'pixelArt', choice: 'auto' });
+    expect(applyPixelArtToSelection).toHaveBeenCalledWith('auto');
+  });
+
+  it('「ドット絵として表示 ▸」は選択が変わったら合わせ直し、押したあとは自分で反転したチェックを戻す', async () => {
+    const setEnabled = vi.fn<(enabled: boolean) => Promise<void>>(async () => {});
+    const checks = [0, 1, 2].map(() => vi.fn<(checked: boolean) => Promise<void>>(async () => {}));
+    let state: PixelArtState = { enabled: false, current: null };
+    const sync = pixelArtSyncer(
+      { submenu: { setEnabled }, choices: checks.map((setChecked) => ({ setChecked })) },
+      state,
+      () => state,
+    );
+    sync(false);
+    expect(setEnabled).not.toHaveBeenCalled();
+
+    state = { enabled: true, current: 'yes' };
+    sync(false);
+    expect(setEnabled).toHaveBeenLastCalledWith(true);
+    expect(checks.map((c) => c.mock.lastCall?.[0])).toEqual([false, true, false]);
+
+    // 押したあと（設定はまだ届いていない）：変わっていなくても今の値に戻す
+    checks.forEach((c) => c.mockClear());
+    sync(false);
+    expect(checks[1]).not.toHaveBeenCalled();
+    sync(true);
+    expect(checks.map((c) => c.mock.lastCall?.[0])).toEqual([false, true, false]);
+
+    state = { enabled: false, current: null };
+    sync(false);
+    expect(setEnabled).toHaveBeenLastCalledWith(false);
+    expect(checks.map((c) => c.mock.lastCall?.[0])).toEqual([false, false, false]);
   });
 
   it('表示形式は ⌘1〜⌘3 のチェック項目で、いまの形式にチェックが付く', () => {

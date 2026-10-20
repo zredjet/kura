@@ -194,10 +194,11 @@
   flex: none;
 }
 
-/* 透過と分かったものの下地（マスは画面に固定で 8px） */
+/* 透過と分かったものの下地（MediaImage の [data-checker] と同じ書き方。マスは画面に固定で 8px） */
 .checker {
-  background: repeating-conic-gradient(var(--checker-b) 0 25%, var(--checker-a) 0 50%) 0 0 /
-    var(--checker-size) var(--checker-size);
+  background-color: var(--checker-a);
+  background-image: repeating-conic-gradient(var(--checker-b) 0 25%, transparent 0 50%);
+  background-size: var(--checker-size) var(--checker-size);
 }
 
 /* アニメの操作の行（高さ 28px）：再生／一時停止・「3 / 8」・コマ送り・タグ */

@@ -9,7 +9,14 @@ import {
 
 import type { AssetAlphaDto } from '../../ipc/bindings';
 import { hasThumb, thumbUrl } from '../../ipc/media';
-import { type Fit, pixelFit, renderingFor, showChecker, type Size } from '../../lib/asset/pixel';
+import {
+  checkerFor,
+  type Fit,
+  pixelFit,
+  renderingFor,
+  showChecker,
+  type Size,
+} from '../../lib/asset/pixel';
 import styles from './MediaImage.module.css';
 
 /** 絵の元（アイテムの概要か、ユニットの表紙。どちらもこの形を持つ）。 */
@@ -179,8 +186,7 @@ export function MediaImage({
     devicePixelRatio(),
   );
   // 表示の大きさが分からないうちは敷かない（小さい行で一瞬だけ出ないように）
-  const checker =
-    checkerCandidate && shown !== null && showChecker(source.alpha, Math.min(shown.w, shown.h));
+  const checker = checkerFor(source.kind, source.alpha, shown);
 
   const onLoad = (e: SyntheticEvent<HTMLImageElement>) => {
     if (!needNatural) {

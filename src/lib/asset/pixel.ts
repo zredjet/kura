@@ -1,6 +1,6 @@
 /**
  * 画像の素材の表示の決め方（docs/design.md §3.1「素材の表示」）：透過の下地の市松模様と、ドット絵の最近傍の拡大。
- * DOM に触れない純粋な関数。部品（MediaImage）はこれを呼んで `data-checker`・`image-rendering`・大きさを決める。
+ * DOM に触れない純粋な関数。部品（MediaImage・AnimPlayer）はこれを呼んで `data-checker`・`image-rendering`・大きさを決める。
  */
 
 /** 解析の透過（media_facts.alpha）。 */
@@ -21,6 +21,19 @@ export function showChecker(alpha: AlphaKind | null | undefined, shortSidePx?: n
 export interface Size {
   w: number;
   h: number;
+}
+
+/**
+ * 表示の部品が市松模様を敷くか（MediaImage の `<img>`・AnimPlayer の canvas で同じ規則）。画像（`ItemKindDto`）で、
+ * 解析で透過と分かり、表示の大きさ `shown`（CSS px）が分かっていて短い辺が `CHECKER_MIN_PX` 以上のときだけ。
+ * 大きさが分からないうち（null：枠を測る前・絵を読む前）は敷かない（小さい所で一瞬だけ出ないように）。
+ */
+export function checkerFor(
+  kind: string,
+  alpha: AlphaKind | null | undefined,
+  shown: Size | null,
+): boolean {
+  return kind === 'image' && shown !== null && showChecker(alpha, Math.min(shown.w, shown.h));
 }
 
 /** 枠への収め方（タイルは cover、プレビューは contain）。 */

@@ -13,6 +13,7 @@ import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { playUrl } from '../../ipc/media';
 import { formatCount, formatDuration } from '../../lib/format';
+import { useLoopRange } from '../asset/useLoopRange';
 import { WaveformView } from '../asset/WaveformView';
 import { PlayBar } from './PlayBar';
 import {
@@ -305,9 +306,13 @@ function ImageLayer({ item }: { item: ItemSummaryDto }) {
   );
 }
 
-/** 音楽：ジャケット（なければ音符）と波形（解析の前は飾りの波形。M11）。 */
-function AudioArt({ item }: { item: ItemSummaryDto }) {
+/**
+ * 音楽：ジャケット（なければ音符）と波形（解析の前は飾りの波形。M11）。ループ点のあるものは、インスペクタと同じく
+ * ループの区間を出す。
+ */
+export function AudioArt({ item }: { item: ItemSummaryDto }) {
   const positionMs = usePlayerStore((s) => s.snapshot.positionMs);
+  const loop = useLoopRange(item.id, item.hasLoop);
   return (
     <div className={styles.audio}>
       <MediaImage
@@ -323,7 +328,7 @@ function AudioArt({ item }: { item: ItemSummaryDto }) {
       />
       <WaveformView
         hash={item.hash}
-        loop={null}
+        loop={loop}
         positionMs={positionMs}
         className={styles.waveform}
         fallback={<Waveform />}

@@ -44,6 +44,7 @@ import {
 } from './describe';
 import { GridSheet } from './GridSheet';
 import type { AssetData } from './useAssetData';
+import { loopOf } from './useLoopRange';
 import { WaveformView } from './WaveformView';
 
 const t = ja.asset;
@@ -157,7 +158,7 @@ function ImageRows({ data, onChanged }: { data: AssetData; onChanged: () => void
 function seamOnly(asset: AssetDto, durationMs: number | null): boolean {
   const audio = asset.facts?.audio;
   if (!audio?.sampleRate || !audio.channels) return false;
-  const loop = audio.loopRange ? ([audio.loopRange.start, audio.loopRange.end] as const) : null;
+  const loop = loopOf(asset);
   const estimate = Math.round(((durationMs ?? 0) * audio.sampleRate) / 1000);
   const frames = Math.max(estimate, loop?.[1] ?? 0);
   if (frames <= 0) return false;
@@ -195,8 +196,7 @@ function AuditionControls({ asset, durationMs }: { asset: AssetDto; durationMs: 
   const blocker = auditionBlocker(asset);
   const active = state.status !== 'idle' && state.itemId === asset.itemId;
   const playing = active && state.status === 'playing';
-  const audio = asset.facts?.audio;
-  const loop = audio?.loopRange ? ([audio.loopRange.start, audio.loopRange.end] as const) : null;
+  const loop = loopOf(asset);
   const seam = active && state.mode !== null ? state.mode === 'seam' : seamOnly(asset, durationMs);
   return (
     <>
