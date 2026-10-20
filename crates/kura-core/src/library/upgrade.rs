@@ -83,7 +83,7 @@ pub enum UpgradeEvent {
         to: usize,
         ms: f64,
     },
-    /// 当てられなかった（ライブラリは前の版のまま。`ms` は始まりからの時間）。
+    /// 当てられなかった（失敗した 1 つは戻り、それより前に当てたものは残る。今の版は `error` が持つ。`ms` は始まりからの時間）。
     Failed {
         path: PathBuf,
         from: usize,
@@ -236,6 +236,62 @@ mod tests {
         assert_eq!(backup::list(lib.layout()).unwrap().len(), 1);
     }
 
+    /// 後ろのマイグレーションで失敗したら、それより前に当てたものは残って版は途中まで上がる。言葉はそれを言い（前の版の
+    /// Kura では開けない・当てる前のバックアップがある）、「前の版のまま」と言わない。SQL の本文は入れない（D2）。原因を
+    /// 取り除けば、続きを当てて開ける。
+    #[test]
+    fn a_late_failure_says_the_library_is_now_at_a_middle_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        v6_library(&root);
+        // 0009 の CREATE TABLE media_facts を失敗させる（実際にはディスクの空きや I/O の誤り）
+        Connection::open(root.join(crate::library::DB_FILE))
+            .unwrap()
+            .execute_batch("CREATE TABLE media_facts (x);")
+            .unwrap();
+        let (hooks, events) = recording(None);
+        let err = Library::open_with(&root, &hooks).err().unwrap();
+        assert_eq!(version_of(&root), 8, "0007・0008 は残る");
+        let text = err.to_string();
+        assert!(!text.contains("前の版のまま"), "{text}");
+        assert!(text.contains("スキーマ 8"), "{text}");
+        assert!(text.contains("前の版の Kura"), "{text}");
+        assert!(text.contains("バックアップ"), "{text}");
+        assert!(text.contains("0009_analysis"), "{text}");
+        assert!(text.contains("media_facts already exists"), "{text}");
+        assert!(
+            !text.contains("CREATE TABLE"),
+            "SQL の本文を入れない：{text}"
+        );
+        assert!(text.chars().count() < 400, "{text}");
+        {
+            let events = events.lock().unwrap();
+            match events.as_slice() {
+                [
+                    UpgradeEvent::Started { from: 6, .. },
+                    UpgradeEvent::Failed { from: 6, error, .. },
+                ] => assert_eq!(error.to_string(), text),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            backup::list(&crate::library::Layout::new(&root))
+                .unwrap()
+                .len(),
+            1
+        );
+        // 原因を取り除けば、続き（0009）を当てて開ける
+        Connection::open(root.join(crate::library::DB_FILE))
+            .unwrap()
+            .execute_batch("DROP TABLE media_facts;")
+            .unwrap();
+        let lib = Library::open(&root).unwrap();
+        assert_eq!(
+            (lib.migration().from, lib.migration().to),
+            (8, crate::db::MIGRATIONS.len())
+        );
+    }
+
     /// 当てる途中の失敗も知らせる（理由はそのまま）。
     #[test]
     fn a_failed_migration_tells_failed() {
@@ -263,6 +319,57 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(version_of(&root), 6);
+    }
+
+    /// 別のプロセス（Kura を 2 つ動かした・開発版と本番版）が同じ前の版のライブラリを同時に開いても、どちらも開け、版は
+    /// 最新のまま（下がらない）で、次もふつうに開ける（D1。ここではスレッドごとの接続で 2 つのプロセスの代わりにする。
+    /// アプリの中の鍵 `AppState::opening` は通らない）。2 つ目を 0〜4 ms 遅らせ、先に開いた側が当てている途中に版を読ませる。
+    #[test]
+    fn two_processes_opening_the_same_library_at_once_both_open_and_keep_the_version() {
+        let latest = crate::db::MIGRATIONS.len();
+        for round in 0..40u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("L.kuralib");
+            v6_library(&root);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|i| {
+                    let (root, barrier) = (root.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if i == 1 {
+                            std::thread::sleep(std::time::Duration::from_millis(round % 5));
+                        }
+                        Library::open(&root)
+                            .map(|lib| lib.migration().to)
+                            .map_err(|e| e.to_string().chars().take(200).collect::<String>())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Ok(latest), "round {round}");
+            }
+            assert_eq!(version_of(&root), latest, "round {round}：版が下がった");
+            let lib = Library::open(&root).unwrap();
+            assert!(lib.migration().applied.is_empty(), "round {round}");
+            let tags: i64 = lib
+                .db()
+                .read(|c| Ok(c.query_row("SELECT count(*) FROM item_tags", [], |r| r.get(0))?))
+                .unwrap();
+            assert_eq!(tags, 3, "round {round}");
+            // 当てる前の中身（版 6）のバックアップが残る。遅れた側が先の側の当てている途中の版を読んだときは、秒がずれれば
+            // その版のバックアップも残る（同じ秒なら版 6 のものを置き換えない）
+            let versions: Vec<usize> = backup::list(lib.layout())
+                .unwrap()
+                .iter()
+                .map(|b| crate::db::applied(&Connection::open(&b.path).unwrap()).unwrap())
+                .collect();
+            assert!(versions.contains(&6), "round {round}: {versions:?}");
+            assert!(
+                versions.iter().all(|v| *v < latest),
+                "round {round}: {versions:?}"
+            );
+        }
     }
 
     /// 新しい版の Kura の DB は、当て始めないので知らせず、理由を戻り値で返す。

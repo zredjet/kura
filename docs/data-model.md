@@ -386,6 +386,8 @@ CREATE TABLE settings (
 --       'download.defaults' = ダウンロードの前回の選択（画質・音声のみ・保存先・自動タグ・再生リストをユニットに。M7、ADR-98）
 --       'analysis.plan'     = 解析の計画の指紋（計画・投影・ドット絵の規則・読み取りの記録の版と、種類ごとの解析 ID の版と既定の
 --                             引数の正規の形。起動のスレッドで比べ、解析の版・計画が変わった種類だけ pending に戻す。M11）
+--       'analysis.reproject'= 投影の作り直しの印（true。'analysis.plan' の投影の版・ドット絵の規則が変わったときに起動のスレッドが
+--                             置き、解析のジョブが投影の古い事実の行を結果の表から作り直し終えたら消す。M11 の検証 D3）
 --       'analysis.decoders' = 解析で読む形式ごとの、段の順のデコーダの識別子（解析のジョブがコーデックの組を作ったときに比べ、
 --                             今の組にないデコーダで読んだものと、並びが変わった形式で失敗していたものを pending に戻す。M11）
 --       'analysis.inflight' = 解析のジョブが OS のデコーダ（Platform の段）で読んでいるアイテム（{"id","hash"}。1 件ずつ解くので
@@ -556,9 +558,10 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   ラウドネス・ループ・無音・波形の段（最も細かい段はビンが 4,096 以下になる段、粗い方は 65,536 フレーム）。JPEG・HEIC・HEIF は
   読まずに形式から事実を書く（透過なし・色数は計らない・ドット絵でない・1 コマ。`decoder` は NULL）。動画・フォント・3D は `not_needed`。
 - **結果の鍵**：台帳の行 × 解析 ID（`UNIQUE(blob_id, analysis)`）。版と正規の引数は列で、計画の要求と照らす。同じ中身の結果
-  （計画の要求の ID・版・正規の引数と、読み取りの記録 `kura.read`）がそろっていれば読まずに使う。再現を約束しないデコーダの
-  結果も「その環境で読んだ事実」として持ち、OS の更新では解き直さず、デコーダの識別子が変わったときだけ解き直す
-  （`analysis.decoders`）。
+  （計画の要求の ID・版・正規の引数と、読み取りの記録 `kura.read`）がそろい、それを読んだデコーダ（事実の `decoder`）が今の組で
+  その形式を読むもののどれかなら、読まずに使う。再現を約束しないデコーダの結果も「その環境で読んだ事実」として持ち、OS の更新
+  では解き直さず、デコーダの識別子が変わったときだけ解き直す（`analysis.decoders`。戻したものは今の組にないデコーダで読んだ
+  ものなので、結果を使い回さずに読み直す。テスト `a_decoder_change_rereads_instead_of_reusing_old_results`）。
 - **書き込み**：16 件か 500 ms ごとに 1 つのトランザクションで、アイテムごとに
   `UPDATE items SET analysis_state = ? WHERE id = ? AND hash = ? AND analysis_state = 'pending'` が 1 行変えたときだけ、
   `blob_id` をそのトランザクションの中で `blobs.hash` から引いて、結果（`ON CONFLICT (blob_id, analysis) DO UPDATE`）と
@@ -567,13 +570,20 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - **波形の段**：結果の行は `output` が NULL（`output_len`・`digest` だけ）で、中身は `peaks/ab/<hash>.peaks`（kura-peaks 版 1。
   `/peaks` でそのまま配る）。DB に書く前に置く（書き込みが失敗してもファイルが残るだけ。次に解くときに置き換える）。
 - **投影**：`facts_v`（投影の版）か `pixel_rule`（ドット絵の判定の版）が古い行は、読み直さずに結果の表から作り直す
-  （`media_facts` を `blob_id` の順に 500 件ずつ。`state = 'ok'` の行だけ）。
+  （`media_facts` を `blob_id` の順に 500 件ずつ。`state = 'ok'` の行だけ）。古い行を探すのは、計画の指紋の投影の版・ドット絵の
+  規則が変わって起動のスレッドが作り直しの印（settings の `analysis.reproject`）を置いたときだけで、作り直し終えたら消す
+  （途中で止めたら印は残り、次の実行で初めから探す）。ふだんの起動・ジョブは事実の表を走査しない。
 - **失敗**：事実の行に `state = 'failed'` と `error_code` を書き、items は `failed`。計画・デコーダの指紋が変わるか、利用者が頼む
   （`retry_analysis`：`failed` を `pending` に戻す）まで解き直さない。見積もり（値の 2 倍＋デコーダの作業領域）が
-  min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`。中止・一時停止・強制終了では、書くまでは `pending` のまま。
+  min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`。中止・一時停止・強制終了（電源断・ほかの部品の異常終了を
+  含む）では、書くまでは `pending` のまま。ただし OS のデコーダ（Platform の段）で読んでいる 1 件は、読む前にコミットした処理中の
+  印（settings の `analysis.inflight`）が残るので、強制終了でも次にジョブが動いたときに `failed`（`crashed`）になる（印は落ちたのか
+  止められたのかを見分けない。`retry_analysis` で戻せる）。
 - **一度きりの全件の走査**（例外）：計画の指紋が変わった種類を戻す `UPDATE items … WHERE kind = ? AND analysis_state IN ('ready','failed')`
   と、デコーダの指紋で戻す `UPDATE … WHERE … hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …)` は全件を走査する
-  （指紋が変わったときだけ。10 万件で約 70 ms。テスト `sync_plan_reset_is_a_one_time_full_scan`）。
+  （指紋が変わったときだけ。10 万件で約 70 ms）。投影の古い行を探す `stale_facts`（`media_facts` を主キーの範囲で読み、残りの
+  条件で絞る）も、古い行がなければ表の終わりまで読む（作り直しの印があるときだけ。8 万行で約 3〜7 ms）。テスト
+  `sync_plan_reset_is_a_one_time_full_scan`。
 
 ### サムネイルの作り直し（M11。`crates/kura-core/src/media/`）
 
@@ -595,6 +605,8 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - 実効値は「設定 ?? 自動」：ドット絵は `asset_settings.pixel_art` があればそれ、なければ `media_facts.pixel_art`。
 - 2 のべき乗は列を持たず、`width & (width - 1) = 0` のビット演算で求める。
 - まだ解析していないもの・計れない値は、肯定・`!=`・大小の比較のどれにも入れない（除外だけが含む。docs/search-query.md §4）。
+  色数の打ち切りの 257 は、結果が決まる比較（`>`・`!=` は 256 以下、`>=` は 257 以下の値）のときだけ入れ、ほかは
+  `f.colors < 257` を足して除く。
 
 ### ユニットの集計
 
@@ -616,8 +628,12 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
    バックアップ 51.8MB、DB の伸び 34.1MB、WAL の伸び 33.7MB）で、見積もり（約 222MB）に収まる。
    **当てる前のバックアップ**：続けて、書き込みの接続から backup API で
    `backups/library-YYYYMMDD-HHMMSS.sqlite`（いつもの名前・DELETE モード）へ一度に写し、7 個の保持に乗せる。
-   失敗したら（空き容量など）当てずに開くのを失敗にする。新しいライブラリ（版 0）では作らない。
-3. **当てる**：1 つずつ、それぞれ 1 つのトランザクションで当てる。
+   失敗したら（空き容量など）当てずに開くのを失敗にする。新しいライブラリ（版 0）では作らない。書きかけの一時ファイルは
+   `.<名前>.<プロセス ID>-<通し番号>.part` で、同じ秒に同じライブラリを開くほかのプロセスと取り合わない。同じ秒の名前の
+   バックアップがあって版が違えば（同時に開いた別のプロセスが、先に当てる前の中身を残してから当て始めた）、それを置き換えない。
+3. **当てる**：1 つずつ、それぞれ 1 つのトランザクション（`BEGIN IMMEDIATE`）で当てる。トランザクションの中で版を読み直し、
+   もう当たっていれば飛ばし、1 つ前の版でなければ断る（別のプロセスが同じライブラリを同時に開くと、版を読んでから当てるまでの
+   間に先に当てていることがある。当て直して版を下げない。テスト `a_migration_another_connection_applied_is_skipped_without_lowering_the_version`）。
    - `Plain`：そのまま当てる。
    - `Rebuild`（ほかの表から参照される表の作り直し。0007）：トランザクションの中からは断る。トランザクションの外で `foreign_keys` を
      切り（読み直して確かめる）、`BEGIN IMMEDIATE` → SQL → `PRAGMA foreign_key_check` → 違反がなければ版を上げてコミット。
@@ -625,8 +641,12 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
      前からの違反だけなら当て直して警告を残す。成功しても失敗しても `foreign_keys` を戻す。事前の確かめはしない（10 万件で約 160ms を省く）。
    - 作り直しの SQL は「新しい表を作る → 移す → 古い表を DROP → 新しい表を RENAME」。古い表を先に改名しない。
 4. **WAL を空にする**：1 つでも当てたら `PRAGMA wal_checkpoint(TRUNCATE)`（しないと次に開くときに WAL を読み直す）。
-5. 当てられなかったら、版は前のまま（失敗したマイグレーションのトランザクションは戻る。それより前に当てたものは残る）。
-   理由は `CoreError::Upgrade`（新しい版・空き容量・バックアップ・当てる失敗）の言葉で返す。アプリはこれを `AppError` の code
+5. 当てられなかったら、失敗したマイグレーションのトランザクションは戻り、それより前に当てたものは残る（版はそこまで上がる。
+   0007・0008 が通って 0009 で失敗すれば版 8）。理由は `CoreError::Upgrade`（新しい版・空き容量・バックアップ・当てる失敗）の
+   言葉で返す。当てる失敗の言葉は、1 つも当てていなければ「前の版のまま」、途中の版まで当てていれば「途中の版（スキーマ N）まで
+   当てたので前の版の Kura ではもう開けない・原因を取り除いて開き直すと続きを当てる・当てる前のバックアップが backups にある」と
+   言う（`UpgradeError::Apply` の `from`・`reached`）。SQL の本文は言葉に入れず（SQLite の言葉と位置だけ。`CoreError::short`）、
+   ログに全文を残す（テスト `a_late_failure_says_the_library_is_now_at_a_middle_version`）。アプリはこれを `AppError` の code
    `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` にし、`library_open` は失敗として、`library_restore` は
    `error` に入れて返す（docs/architecture.md §3）。開く前に当てるかどうかは `library::needs_upgrade` で分かる。
 6. **知らせ**：当て始めたら（空きの確かめの前）`UpgradeEvent::Started`、終わったら `Finished`、当てられなかったら `Failed` を、
@@ -637,7 +657,10 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
 7. アプリの中では `quick_check`・FTS の照合・VACUUM をしない。照合はテストと `kura-devtools bench migrate` で行う。
 8. アプリはライブラリを開く・作る・戻すを 1 つの鍵（`AppState::opening`）で順に行う。起動の restore と開く操作が重なっても、
    新しい版にするのとその前のバックアップは 1 回だけ（2 回目は当て終えた版を開く。src-tauri の
-   `opening_the_same_library_in_parallel_upgrades_once`）。
+   `opening_the_same_library_in_parallel_upgrades_once`）。別のプロセス（Kura を 2 つ動かした・開発版と本番版）が同じライブラリを
+   同時に開いたときは、この鍵は効かないが、3 の読み直しとバックアップの一時ファイルの名前で、どちらも開け、版は下がらない
+   （`two_processes_opening_the_same_library_at_once_both_open_and_keep_the_version`。スレッドごとの接続で代わりに確かめる）。
+   遅れた側は、先の側の当てている途中の版から当てる前のバックアップを作ることがある（秒が同じなら作らない）。
 
 **10 万件の時間**（2026-10-20、M4 Max、同梱の SQLite 3.53、ページキャッシュは温まった状態、ほかの作業でロードアベレージ 9〜12。
 `bench migrate --runs 3`。開くところから数えた時間）：

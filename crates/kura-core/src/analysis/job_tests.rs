@@ -537,7 +537,47 @@ fn same_content_results_are_reused_without_decoding() {
     assert!(env.library.layout().peaks_path(&song).is_file());
 }
 
-/// 投影の版が上がったら（古い行）、読まずに結果の表から作り直す。
+/// 起動のスレッドの `sync_plan` で、前の指紋を置いてから今の指紋と比べる（前の版の Kura から更新した起動の代わり）。
+fn sync_from(env: &Env, older: PlanFingerprint) -> store::PlanSync {
+    let current = PlanFingerprint::current(&kura_engine::analysis::registry().unwrap()).unwrap();
+    let old_json = older.to_canonical().unwrap();
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![PLAN_KEY, old_json],
+            )?;
+            store::sync_plan(tx, &current)
+        })
+        .unwrap()
+}
+
+/// デコーダの識別子が変わって pending に戻したもの（前の組のデコーダで読んだもの）は、同じ中身の結果がそろっていても使い回さず、
+/// 今のデコーダで読み直す（E1。docs/data-model.md「解析の読み書き」の「デコーダの識別子が変わったときだけ解き直す」）。
+#[test]
+fn a_decoder_change_rereads_instead_of_reusing_old_results() {
+    let env = Env::new();
+    let img = env.add(1, "image", "png", &sprite(9));
+    env.run();
+    assert_eq!(env.reads().len(), 1);
+    let now: String = env.fact(&img, "decoder");
+    // 前の実行は、今の組にない古いデコーダ（png-rs-dec/0）で読んだことにする（kura の更新でデコーダの版を上げたとき）
+    env.exec(&format!(
+        "UPDATE media_facts SET decoder = 'png-rs-dec/0';
+         UPDATE settings SET value = replace(value, '{now}', 'png-rs-dec/0') WHERE key = 'analysis.decoders';"
+    ));
+    let record = env.run();
+    assert_eq!(env.reads().len(), 2, "デコーダが変わったので読み直す");
+    assert_eq!(result_json(&record)["reused"].as_u64(), Some(0));
+    assert_eq!(env.fact::<String>(&img, "decoder"), now);
+    assert_eq!(env.state(1), "ready");
+    env.run();
+    assert_eq!(env.reads().len(), 2, "読み直したあとは読まない");
+}
+
+/// 投影の版が上がったら（古い行）、読まずに結果の表から作り直し、作り直しの印を消す。
 #[test]
 fn facts_version_bump_reprojects_without_decoding() {
     let env = Env::new();
@@ -545,10 +585,23 @@ fn facts_version_bump_reprojects_without_decoding() {
     let photo = env.add(2, "image", "jpg", b"jpeg");
     env.run();
     assert_eq!(env.reads().len(), 1);
+    // 前の版の Kura の投影（facts_v 0）で書いた行
     env.exec("UPDATE media_facts SET facts_v = 0, pixel_art = NULL, alpha = NULL, colors = NULL, frame_count = NULL");
+    let current = PlanFingerprint::current(&kura_engine::analysis::registry().unwrap()).unwrap();
+    let mut older = current.clone();
+    older.facts_v = 0;
+    let synced = sync_from(&env, older);
+    assert_eq!((synced.reset, synced.todo), (0, true));
     let record = env.run();
     assert_eq!(env.reads().len(), 1, "読み直さない");
     assert_eq!(result_json(&record)["reprojected"].as_u64(), Some(2));
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.reproject'"),
+        0,
+        "作り直し終えたら印を消す"
+    );
+    let again = env.run();
+    assert_eq!(result_json(&again)["reprojected"].as_u64(), Some(0));
     assert_eq!(env.fact::<i64>(&img, "facts_v"), FACTS_V);
     assert_eq!(
         (
@@ -567,6 +620,19 @@ fn facts_version_bump_reprojects_without_decoding() {
         (0, 0)
     );
     assert_eq!(env.state(1), "ready");
+}
+
+/// 投影の古い行の走査は、起動のスレッドが計画の指紋（投影の版・ドット絵の規則）の変化を見たときだけ。変わっていなければ、
+/// ジョブは動くたびに事実の表を走査しない（D3）。
+#[test]
+fn reprojection_waits_for_the_projection_to_change() {
+    let env = Env::new();
+    let img = env.add(1, "image", "png", &sprite(6));
+    env.run();
+    env.exec("UPDATE media_facts SET facts_v = 0");
+    let record = env.run();
+    assert_eq!(result_json(&record)["reprojected"].as_u64(), Some(0));
+    assert_eq!(env.fact::<i64>(&img, "facts_v"), 0);
 }
 
 /// 読めないものは失敗を記録し、指紋が変わるか頼まれるまで読み直さない。

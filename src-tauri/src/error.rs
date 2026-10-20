@@ -20,11 +20,11 @@ pub enum AppErrorCode {
     /// ライブラリが新しい版の Kura で作られている（開けない。Kura を新しくする）。
     LibraryTooNew,
     /// ディスクの空きが足りず、ライブラリを新しい版にできない（当てる前の見積もり・バックアップ・当てる途中）。
-    /// ライブラリは前の版のまま。
+    /// 当てる前ならライブラリは前の版のまま。当てる途中なら、失敗した 1 つだけを戻し、それより前に当てたものは残る（説明が言う）。
     NoSpace,
     /// ライブラリを新しい版にする前のバックアップを作れない（ライブラリは変えていない）。
     BackupFailed,
-    /// ライブラリを新しい版にできない（戻した。ライブラリは前の版のまま）。
+    /// ライブラリを新しい版にできない（失敗した 1 つを戻した。それより前に当てたものは残り、途中の版なら説明がそう言う）。
     UpgradeFailed,
     /// 大きすぎてその場で用意できない（アニメの帯の 1 辺・画素の数・メモリの予算の全体。やり直しても同じ。M11）。
     TooLarge,
@@ -139,9 +139,21 @@ mod tests {
                 UpgradeError::ApplyNoSpace {
                     migration: "0007_blobs_and_kinds".into(),
                     detail: "x".into(),
+                    from: 6,
+                    reached: 6,
                 },
                 AppErrorCode::NoSpace,
                 "前の版のまま",
+            ),
+            (
+                UpgradeError::ApplyNoSpace {
+                    migration: "0009_analysis".into(),
+                    detail: "x".into(),
+                    from: 6,
+                    reached: 8,
+                },
+                AppErrorCode::NoSpace,
+                "前の版の Kura ではもう開けません",
             ),
             (
                 UpgradeError::Backup { detail: "x".into() },
@@ -152,9 +164,21 @@ mod tests {
                 UpgradeError::Apply {
                     migration: "0007_blobs_and_kinds".into(),
                     detail: "x".into(),
+                    from: 6,
+                    reached: 6,
                 },
                 AppErrorCode::UpgradeFailed,
                 "0007_blobs_and_kinds",
+            ),
+            (
+                UpgradeError::Apply {
+                    migration: "0009_analysis".into(),
+                    detail: "x".into(),
+                    from: 6,
+                    reached: 8,
+                },
+                AppErrorCode::UpgradeFailed,
+                "スキーマ 8",
             ),
         ];
         for (err, code, words) in cases {

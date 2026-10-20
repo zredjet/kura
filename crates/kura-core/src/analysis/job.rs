@@ -5,15 +5,20 @@
 //!    failed（`crashed`）にして先へ進む（同じファイルで落ち続けない。critic 8）。
 //! 2. エンジンの部品（実行の場とコーデックの組）を使う。最初に使うときにここ（ジョブのスレッド）で作られる。コーデックの組から
 //!    デコーダの指紋を作って比べ、変わった形式に関わるものを pending に戻す。
-//! 3. 投影の版・ドット絵の規則が古い事実の行を、結果の表から作り直す（読まない。500 件ずつ）。
+//! 3. 起動のスレッドが計画の指紋の変化で作り直しの印を置いていれば（投影の版・ドット絵の規則が変わった）、古い事実の行を
+//!    結果の表から作り直し（読まない。500 件ずつ）、終えたら印を消す。印がなければ事実の表を走査しない。
 //! 4. 優先の指定（`request_analysis`）のあるものを先に、なければ新しい順に、`pending` を 16 件ずつ取り出して 1 件ずつ解く：
-//!    - 同じ中身の結果（計画の要求の ID・版・正規の引数がすべてそろう）があれば読まずに使う。
+//!    - 同じ中身の結果（計画の要求の ID・版・正規の引数がすべてそろう）があり、それを読んだデコーダが今の組にあれば、読まずに
+//!      使う（デコーダの識別子が変わって pending に戻したものは読み直す）。
 //!    - ヘッダだけ読んで形を出し、見積もり（値の 2 倍＋デコーダの作業領域）が min(予算/2, 1 GiB) を超えれば確保せずに
 //!      failed（`too_large`）。収まれば一括の予算（Class::Bulk）をプールの外で確保し、一括のプールの中で読んで解く（決定 2）。
 //!    - 波形の段は `peaks/ab/<hash>.peaks` に一時ファイルから改名して置く（DB に書く前）。
 //!    - 16 件か 500 ms ごとに 1 つのトランザクションで書く（`store::write`。ハッシュと pending を条件にする）。
 //! 5. 取り込み・サムネイルが来たら（`should_yield`）書きためた分を書いて譲る。一時停止・中止・アプリの終了では、解いている
-//!    1 件を捨てて書きためた分を書いて返す（捨てた 1 件は pending のまま。強制終了でも書くまでは pending のまま）。
+//!    1 件を捨てて書きためた分を書いて返す（捨てた 1 件は pending のまま、処理中の印も消す）。強制終了（電源断・ほかの部品の
+//!    異常終了を含む）でも、書くまでは pending のまま。ただし OS のデコーダ（Platform の段）で読んでいた 1 件は処理中の印が
+//!    残るので、次に動いたときに 1 の手順で failed（`crashed`）になる（印は落ちたのか止められたのかを見分けない。
+//!    `retry_analysis` で戻せる）。
 //!
 //! 失敗（`unsupported`・`too_large`・`decode`・`crashed`）は事実の行に記録し、指紋が変わるか利用者が頼む（`retry_analysis`）まで
 //! 解き直さない。
@@ -325,6 +330,20 @@ fn stamp_of(s: &DecodeStamp) -> ReadStamp {
     }
 }
 
+/// 1 件の見積もり：値の [`WORK_FACTOR`] 倍 ＋ デコーダの作業領域（音声のデコーダは作業領域を値と同じに見積もるので、音声は
+/// 値の 3 倍。値は フレーム数 × チャンネル数 × 4 バイト）。
+fn estimate(codecs: &CodecSet, format: &str, shape: &kura_engine::Shape, len: u64) -> u64 {
+    value_bytes(shape)
+        .saturating_mul(WORK_FACTOR)
+        .saturating_add(codecs.decode_file_work_bytes(format, shape, len))
+}
+
+/// 1 件の確保の上限：min(予算の全体/2, [`ITEM_CAP`])（決定 2）。予算は min(物理メモリ/4, 4 GiB) なので、物理メモリが 8 GB
+/// 以上なら 1 GiB。
+fn item_cap(total: u64) -> u64 {
+    (total / 2).min(ITEM_CAP)
+}
+
 /// 波形の段をファイルに置く（staging の一時ファイルに書いてから改名する。DB に書く前に呼ぶ）。
 fn write_peaks(layout: &Layout, hash_hex: &str, bytes: &[u8]) -> Result<()> {
     let dest = layout.peaks_path(hash_hex);
@@ -388,8 +407,12 @@ impl Run<'_> {
         Ok(end)
     }
 
-    /// 投影の版・ドット絵の規則が古い事実の行を、結果の表から作り直す（読まない）。
+    /// 投影の版・ドット絵の規則が古い事実の行を、結果の表から作り直す（読まない）。作り直しの印があるときだけ走査し
+    /// （一度きりの全件の走査）、終えたら印を消す。途中で止めたら印は残り、次の実行で初めから走査し直す。
     fn reproject(&mut self) -> Result<Option<JobEnd>> {
+        if !self.ctx.library().db().read(store::reproject_due)? {
+            return Ok(None);
+        }
         let mut after = 0;
         loop {
             if let Some(end) = self.stop()? {
@@ -401,6 +424,10 @@ impl Run<'_> {
                 .db()
                 .read(|c| store::stale_facts(c, after, REPROJECT_BATCH))?;
             let Some(last) = rows.last() else {
+                self.ctx
+                    .library()
+                    .db()
+                    .write(|tx| store::clear_reproject(tx))?;
                 return Ok(None);
             };
             after = last.blob_id;
@@ -541,13 +568,25 @@ impl Run<'_> {
         }
     }
 
-    /// 結果の表に計画の要求がすべてそろっていれば、読まずに事実を作る。
+    /// 結果の表に計画の要求がすべてそろい、それを読んだデコーダが今の組でこの形式を読むもののどれかなら、読まずに事実を作る。
+    /// デコーダが今の組にない（デコーダの指紋で pending に戻したもの）・分からないものは読み直す（docs/data-model.md
+    /// 「解析の読み書き」の「デコーダの識別子が変わったときだけ解き直す」）。
     fn reuse(&self, item: &Pending, format: &str) -> Result<Option<MediaFacts>> {
-        let stored = self
-            .ctx
-            .library()
-            .db()
-            .read(|c| store::stored_results(c, &item.hash))?;
+        let (decoder, stored) = self.ctx.library().db().read(|c| {
+            Ok((
+                store::read_decoder(c, &item.hash)?,
+                store::stored_results(c, &item.hash)?,
+            ))
+        })?;
+        let current = decoder.is_some_and(|id| {
+            self.codecs
+                .decoders_for(format)
+                .iter()
+                .any(|d| d.id() == id)
+        });
+        if !current {
+            return Ok(None);
+        }
         let by_id: BTreeMap<&str, &store::StoredResult> =
             stored.iter().map(|r| (r.analysis.as_str(), r)).collect();
         let Some(read) = by_id
@@ -666,10 +705,8 @@ impl Run<'_> {
             }
         };
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let need = value_bytes(&shape)
-            .saturating_mul(WORK_FACTOR)
-            .saturating_add(self.codecs.decode_file_work_bytes(format, &shape, len));
-        let cap = (self.runtime.budget().total() / 2).min(ITEM_CAP);
+        let need = estimate(&self.codecs, format, &shape, len);
+        let cap = item_cap(self.runtime.budget().total());
         if need > cap {
             self.ctx.log(&format!(
                 "アイテム {}: 大きすぎるので解析しません（見積もり {need} バイト・上限 {cap} バイト）",
@@ -766,7 +803,37 @@ impl Run<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::percentile;
+    use super::{CodecSet, ITEM_CAP, estimate, item_cap, percentile};
+    use kura_engine::{Dim, Shape};
+
+    /// 解析しない長さの目安（docs/requirements.md の「NFR-07 の範囲」・ADR-158 (5)）：物理メモリが 8 GB 以上なら 1 件の上限は
+    /// 1 GiB で、音声の見積もりは値の 3 倍なので、44.1 kHz ステレオは約 16.9 分、48 kHz ステレオは約 15.5 分、96 kHz ステレオは
+    /// 約 7.8 分、44.1 kHz モノラルは約 33.8 分を超えると読まずに too_large になる（E4。docs の数を変えたらここも直す）。
+    #[test]
+    fn long_audio_is_too_large_beyond_the_documented_length() {
+        let codecs = CodecSet::pinned();
+        let audio = |rate: u32, channels: u16, secs: u64| Shape::Audio {
+            rate,
+            channels,
+            frames: Dim::Exact(u64::from(rate) * secs),
+        };
+        assert_eq!(item_cap(4 << 30), ITEM_CAP);
+        assert_eq!(item_cap(2 << 30), ITEM_CAP, "物理メモリ 8 GB");
+        assert_eq!(item_cap(1 << 30), 512 << 20);
+        let fits = |format: &str, rate, channels, secs| {
+            estimate(&codecs, format, &audio(rate, channels, secs), 0) <= ITEM_CAP
+        };
+        for format in ["wav", "flac", "aiff"] {
+            assert!(fits(format, 44_100, 2, 1014), "{format}");
+            assert!(!fits(format, 44_100, 2, 1015), "{format}");
+            assert!(fits(format, 48_000, 2, 932), "{format}");
+            assert!(!fits(format, 48_000, 2, 933), "{format}");
+            assert!(fits(format, 96_000, 2, 466), "{format}");
+            assert!(!fits(format, 96_000, 2, 467), "{format}");
+            assert!(fits(format, 44_100, 1, 2028), "{format}");
+            assert!(!fits(format, 44_100, 1, 2029), "{format}");
+        }
+    }
 
     #[test]
     fn percentiles_use_the_nearest_rank() {
