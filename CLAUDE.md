@@ -14,7 +14,7 @@
 
 - アプリ：Tauri 2.x（最新安定版）、macOS 専用（Apple Silicon、macOS 26 以降を想定）
 - Rust：cargo workspace。rusqlite（bundled, WAL）、tokio、rayon、blake3、reflink-copy、thiserror、tracing、rand_chacha
-- macOS ネイティブ：Swift ヘルパー（ImageIO / AVFoundation / AudioToolbox / WebKit）を C の口（`extern "C"`。編集のコーデックは `kura_mac_ffi.h`）で呼ぶ。swift-rs はビルド時のリンクだけ（`crates/kura-mac`）
+- macOS ネイティブ：Swift ヘルパー（ImageIO / AVFoundation / AudioToolbox / CoreText / WebKit）を C の口（`extern "C"`。編集のコーデックは `kura_mac_ffi.h`）で呼ぶ。swift-rs はビルド時のリンクだけ（`crates/kura-mac`）
 - 編集の操作エンジン：`crates/kura-engine`（OS・DB 非依存。正本は `docs/editing.md`、規則は `.claude/rules/engine.md`）
 - フロント：React + TypeScript + Vite、状態は Zustand、仮想スクロールは TanStack Virtual、スタイルは CSS Modules + CSS 変数
 - 型付き IPC：tauri-specta（デバッグ起動時に `src/ipc/bindings.ts` を自動出力）
@@ -26,9 +26,9 @@
 Cargo.toml                 # workspace
 crates/kura-core/          # OS 非依存のドメインロジック（DB, 取り込み, 検索, ユニット, プレイリスト, ジョブ, 編集の ffmpeg の段・実行の場）
 crates/kura-core/migrations/  # SQL マイグレーション（連番、既存は編集禁止）
-crates/kura-engine/        # 編集の操作エンジン：文書・操作・描画・解析・コーデック・エディタのセッション（OS・DB 非依存）
+crates/kura-engine/        # 編集の操作エンジン：文書・操作・描画・解析・コーデック・3D（glb）の読み手と描画・エディタのセッション（OS・DB 非依存）
 crates/vorbis-tables/      # Ogg Vorbis のエンコーダの表（aoTuV から生成。BSD-3）と照合用の C の組み方（oracle/）
-crates/kura-mac/           # macOS 専用：サムネイル, メディア情報, スナップショット, 編集の Platform のコーデック（Swift ヘルパー）
+crates/kura-mac/           # macOS 専用：サムネイル, メディア情報, スナップショット, 編集の Platform のコーデック（Swift ヘルパー）, 大きな確保を OS へすぐ返す確保器（アプリの global_allocator）
 crates/kura-devtools/      # ダミーライブラリ生成・ベンチマーク
 third_party/               # 不具合を直した、または kura の要件（libm への差し替え）で手を入れた第三者のクレートの写し（[patch.crates-io]。元のライセンスのまま）
 src-tauri/                 # Tauri アプリ本体：commands/, protocol/（kura://）, events, window
@@ -57,7 +57,7 @@ docs/                      # 仕様・設計（下記）
 - **IPC**：コマンドは `src-tauri/src/commands/` に薄く書き、ロジックは `kura-core` に置く。戻り値は `Result<T, AppError>`。
 - **メディアを IPC で送らない**：サムネイル・本体・再生用プロキシは `kura://localhost/...`（カスタムプロトコル、Range 対応）で配信する。base64 化は禁止。
 - **一覧は ID 先取り**：検索結果は ID 列だけを先に返し、画面に見えている分の詳細だけを取得する。全件の詳細を JS に載せない。
-- **長い処理はジョブ**：取り込み・サムネイル・プロキシ生成・ダウンロード・キャプチャ・解析・編集の保存・一括加工は `jobs` テーブル経由。進捗は Channel / イベントで送る。
+- **長い処理はジョブ**：取り込み・サムネイル・プロキシ生成・ダウンロード・キャプチャ・解析・編集の保存・一括加工は `jobs` テーブル経由。進捗は Channel / イベントで送る。ただし、利用者がその場で待つ短い表示の用意（試聴の PCM・アニメの帯）は除く（`spawn_blocking` と予算の対話の枠で作り、足りなければ断る。docs/architecture.md §4）。
 - **編集**：操作は `kura-engine` に置き、決定性と版の契約（`docs/editing.md` §8）を守る。エディタとの通信で送るのは文書（操作の列）だけ。
 - **ブロックしない**：SQLite・ハッシュ計算・ファイル I/O は専用スレッドか `spawn_blocking`。DB 書き込みは単一ライター。
 - **DB**：スキーマ変更は新しいマイグレーションの追加のみ。`docs/data-model.md` も同時に更新する。

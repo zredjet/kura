@@ -18,7 +18,7 @@
 │        │                           │                                         │
 │ kura-mac（macOS 専用）              │ 外部プロセス                             │
 │   Swift ヘルパー：ImageIO,          │   yt-dlp（+ deno, ffmpeg）               │
-│   AVFoundation, WebKit snapshot    │   gallery-dl                            │
+│   AVFoundation, CoreText, WebKit   │   gallery-dl                            │
 │                                     │   ffmpeg / ffprobe（プロキシ・情報）       │
 │                                     │   Google Chrome（headless, CDP）          │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -30,13 +30,13 @@
 
 | クレート | 責務 | 依存してよいもの |
 |---|---|---|
-| `kura-core` | DB、マイグレーション、取り込み、ハッシュ、検索言語の解析と SQL 生成、ユニット、プレイリスト（純粋関数）、ジョブ管理、ダウンロード・キャプチャの手順、編集の ffmpeg の段（`codec_ext::ffmpeg`。段 9）、編集のエンジンの実行の場（`edit::runtime` の `EngineRuntime`：エンジン 1 つ・プレビューと一括の 2 つのスレッドプール・メモリの予算。段 10、§15）と、それとコーデックの組をライブラリごとに持つ `edit::EngineServices`（M11） | kura-engine, rusqlite, blake3, reflink-copy, rand_chacha, rayon, serde, thiserror, tracing, tokio |
-| `kura-engine` | 編集の操作エンジン：文書・値・形・メタデータの写し方・操作と登録・描画・解析・コーデック（固定の Rust のもの）・実行とプレビュー・エディタの履歴。段 10 の部品は、実行器の `render/`（ノードのキャッシュ `cache`・差分の計画と差分の適用 `incremental`・範囲 `region`・範囲の描画とスポイト `area`・変わった範囲 `delta`・エディタの表示の経路 `view`（`Engine::render_view`）・プレビューの段 `preview`・メモリの見積もり `estimate`）、エディタのセッション `session/`（`EditSession`）、メモリの予算 `budget`、予約の部品（`monitor` の `Latest`・`Ticket`）、ベンチのワークロード `testing::bench`。スレッドプールは作らない（呼び手のプールの中で描く）。DB・ジョブ・Tauri を知らない（ADR-134・154、§15） | serde, serde_json, thiserror, blake3, rayon, rand_chacha, libm と、版を固定したコーデックのクレート（docs/editing.md §9）。specta は feature |
-| `kura-mac` | `MediaBackend` trait の macOS 実装（サムネイル生成、メディア情報、音楽のジャケット取得、WKWebView のスナップショット、「透明度を下げる」設定の取得）と、ffmpeg との振り分け。編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し、`kura_codec_caps`。段 9、ADR-153）と、アプリのコーデックの組 `full_codec_set`。物理メモリの大きさ `physical_memory`（編集のメモリの予算の既定に渡す。段 10） | kura-core, kura-engine, serde, serde_json, tracing, swift-rs（ビルド時のリンクのみ） |
-| `kura-devtools` | ダミーライブラリの生成、ベンチマーク（編集の `bench edit`。NFR-11〜17）、コマンドラインからの取り込みと確認、編集のメモリの見積もりの煙のテスト（`mem_smoke`）（§13） | kura-core, kura-engine, kura-mac |
-| `src-tauri`（`kura-app`） | コマンド、kura:// プロトコル、ウィンドウ、イベント、状態の保持 | すべて |
+| `kura-core` | DB、マイグレーション、取り込み、ハッシュ、検索言語の解析と SQL 生成、ユニット、プレイリスト（純粋関数）、ジョブ管理、ダウンロード・キャプチャの手順、編集の ffmpeg の段（`codec_ext::ffmpeg`。段 9）、編集のエンジンの実行の場（`edit::runtime` の `EngineRuntime`：エンジン 1 つ・プレビューと一括の 2 つのスレッドプール・メモリの予算。段 10、§15）と、それとコーデックの組をライブラリごとに持つ `edit::services` の `EngineServices`（M11）。M11 で足したもの：解析（`analysis`：計画・事実の投影・ドット絵の判定 v1・読み書き・ジョブ。§5）、素材の欄（`asset`：事実と設定と実効値、試聴の PCM `asset::pcm`、アニメの帯 `asset::anim`）、サムネイルの道と作り方の指紋（`media::route`）・エンジンの道（`media::engine_thumbs`）・作っている途中の印（`media::inflight`）・キャッシュの容量（`media::usage`）（§7）、台帳（`library::ledger`）、DB を新しい版にするときの空きの確かめと知らせ（`library::upgrade`。§14）、kura:// の経路と受け付けの判定（`serve`・`serve::access`。§4） | kura-engine, rusqlite, blake3, reflink-copy, rand_chacha, rayon, serde, thiserror, tracing, tokio |
+| `kura-engine` | 編集の操作エンジン：文書・値・形・メタデータの写し方・操作と登録・描画・解析・コーデック（固定の Rust のもの）・実行とプレビュー・エディタの履歴。段 10 の部品は、実行器の `render/`（ノードのキャッシュ `cache`・差分の計画と差分の適用 `incremental`・範囲 `region`・範囲の描画とスポイト `area`・変わった範囲 `delta`・エディタの表示の経路 `view`（`Engine::render_view`）・プレビューの段 `preview`・メモリの見積もり `estimate`）、エディタのセッション `session/`（`EditSession`）、メモリの予算 `budget`、予約の部品（`monitor` の `Latest`・`Ticket`）、ベンチのワークロード `testing::bench`。M11 で 3D（glb）の読み手とソフトウェアの描画 `model`（SceneKit を使わない。決定 9。ファズの対象 `model_glb`。docs/editing.md §9.10）と、SVG の文字を描くフォントの入れ物を受ける口（`codec::SvgFonts`。中身は kura-mac が渡す）を足した。スレッドプールは作らない（呼び手のプールの中で描く）。DB・ジョブ・Tauri を知らない（ADR-134・154、§15） | serde, serde_json, thiserror, blake3, rayon, rand_chacha, libm と、版を固定したコーデックのクレート（docs/editing.md §9）。specta は feature |
+| `kura-mac` | `MediaBackend` trait の macOS 実装（サムネイル生成、メディア情報、音楽のジャケット取得、WKWebView のスナップショット、「透明度を下げる」設定の取得）と、ffmpeg との振り分け。編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し、`kura_codec_caps`。段 9、ADR-153）と、アプリのコーデックの組 `full_codec_set`。物理メモリの大きさ `physical_memory`（編集のメモリの予算の既定に渡す。段 10）。M11 で足したもの：ImageIO のアルファを保つサムネイル・CoreText のフォントのサムネイルと情報（`thumbs`）、SVG の文字を描くシステムのフォント（`fonts`：mmap して `pinned_options` で渡す）、1 MiB 以上の確保を OS へすぐ返す確保器（`alloc` の `ReturningAllocator`。アプリと kura-devtools の `#[global_allocator]`。§7、ADR-163） | kura-core, kura-engine, serde, serde_json, tracing, libc（macOS のみ。mmap）, swift-rs（ビルド時のリンクのみ） |
+| `kura-devtools` | ダミーライブラリの生成、ベンチマーク（編集の `bench edit`。NFR-11〜17）、コマンドラインからの取り込みと確認、編集のメモリの見積もりの煙のテスト（`mem_smoke`）。M11 で形式の見本（`assets`）、kura:// と CSP の自己点検のライブラリ（`selftest-library`）、`bench thumbs-job`・`bench analyze`・`bench migrate`・`bench query --fake-facts`（§13） | kura-core, kura-engine, kura-mac |
+| `src-tauri`（`kura-app`） | コマンド、kura:// プロトコル、ウィンドウ（main の移動の制限 `navigation`。§11）、イベント、状態の保持（開く処理の鍵 `AppState::opening`）、エンジンの部品を作る口（`engine` の `MacEngineFactory`。§15） | すべて |
 
-`kura-core` は `MediaBackend` trait（`probe`、`image_thumbnails`、`video_thumbnails`、`audio_artwork`）だけを知り、実装（`kura_mac::media_backend()`）はライブラリを開くときに注入します。テストでは偽物の実装（`media::fake::FakeBackend`）を使います。Linux 上でも `kura-core` のテストが通るようにします。
+`kura-core` は `MediaBackend` trait（`probe`、`image_thumbnails`、`video_thumbnails`、`audio_artwork`、`font_thumbnails`（M11））と、エンジンの部品を作る口 `edit::EngineFactory`（M11。§15）だけを知り、実装（`kura_mac::media_backend()`・`MacEngineFactory`）はライブラリを開くときに注入します。テストでは偽物の実装（`media::fake::FakeBackend`）を使います。Linux 上でも `kura-core` のテストが通るようにします。
 
 ## 3. IPC コマンド一覧（初期）
 
@@ -46,7 +46,7 @@
 |---|---|---|
 | ライブラリ | `library_create(path)` / `library_open(path)` / `library_info()` | ライブラリの作成・オープン・概要 |
 | | `library_restore()` → `{ info, lastPath, error? }` | 起動時に前回のライブラリ（`KURA_LIBRARY` があればそれ）を開く。前回の場所が見つからなければ `info` も `error` も空で前回の場所を返し、開けなければ `error`（`AppError`。上の code）に理由を入れて返す（失敗にはしない） |
-| | イベント `library://upgrade`（`{ phase: started \| finished \| failed, path, fromVersion, toVersion, dbBytes, elapsedMs, error }`） | `library_restore`・`library_open` の中で DB を新しい版にするとき、`started` のあと `finished` か `failed` を 1 つ送る（当てるものがない・新しいライブラリでは送らない）。フロントは `started` から 300ms を超えたら「ライブラリを更新しています」を出す（M11 の決定 1） |
+| | イベント `library://upgrade`（`{ phase: started \| finished \| failed, path, fromVersion, toVersion, dbBytes, elapsedMs, error }`） | `library_restore`・`library_open` の中で DB を新しい版にするとき、`started` のあと `finished` か `failed` を 1 つ送る（当てるものがない・新しいライブラリでは送らない）。フロントは `started` から 300ms を超えたら「ライブラリを更新しています」を出す（M11 の決定 1。`stores/upgradeStore`）。知らせは開く IPC の中で来るので、フロントは開く IPC より先に購読し（`watchUpgrades`）、`library_restore` は起動の間に 1 回だけ呼ぶ（`libraryStore.restore`）。Rust は開く・作る・戻す処理を 1 つの鍵（`AppState::opening`）で直列にする |
 | | `library_check_location(path)` → `{ path, status, syncService }` | 置き場所の確認（`.kuralib` の補完、`new` / `existingLibrary` / `occupied`、同期フォルダの中か） |
 | 取り込み | `import_preview(paths)` | 種類別件数・合計サイズ・重複の見込み・フォルダ木を返す |
 | | `import_start(paths, options)` → `JobId` | 取り込みジョブを開始 |
@@ -116,6 +116,8 @@
 | 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測と、`VITE_KURA_SELFTEST=1` の自己点検（§4.2）・`VITE_KURA_CHECK=1` の試聴の継ぎ目の自己点検（`audition-seam`）の結果をログに書く（§13） |
 
 変更（patch）の型は、省いた項目を変えない。色・メモの空文字は「消す」の意味（`Option<Option<T>>` を JSON で表しにくいため）。
+
+bindings.ts には、コマンドとイベントのほかに Rust の表を定数で出す（`Builder::constant`。M11）：`ITEM_KINDS`（種類の順・キューに入るか・プロキシ・長さ。フロントは `src/ipc/kinds.ts` だけが読む）、`QUERY_FIELD_NAMES`（検索のフィールドの名前）・`QUERY_KIND_WORDS`（種類の語）・`QUERY_SYMBOLS`（半角と同じに扱う記号）（docs/search-query.md §3）。
 
 コマンドの追加は `.claude/skills/add-command` の手順で行い、この表に追記します。
 
@@ -231,6 +233,7 @@ object-src 'none'; frame-src 'none'
 - WKWebView は iframe の読み込みにも移動の判定（`decidePolicyForNavigationAction`）を呼ぶので、`on_navigation` は枠にも効く（wry は main の枠かどうかを見ずに渡す）。
 - 独自の scheme には事前確認（OPTIONS）を送らない（POST・PUT・DELETE もそのまま届いた。M11 の調べと同じ）。OPTIONS が来るのはページが自分で送ったときだけ。
 - 通常のビルド（`VITE_KURA_SELFTEST` なし）の出力には selftest のコードが入らない（条件の中の動的 import が消える）。
+- M11 の最後のコミットでも build（`VITE_KURA_SELFTEST=1 VITE_KURA_CHECK=1`）で確かめた：P1〜P8 が通り、F1・F3・F4 が止まり、予期しない違反 0 件、main への応答 34 件すべてに ACAO。F2 はビルドのときに `VITE_KURA_SELFTEST_F2` を渡さなかったので見送った（受け付けの判定は段 1 から変えていない）。
 
 ## 5. ジョブ
 
@@ -309,12 +312,15 @@ import_start:    ジョブとして実行
     | glb | kura-engine の `model`（ソフトウェアの描画。`media::engine_thumbs`） |
     | 動画・音楽 | 今までの道（AVFoundation・ffmpeg） |
 
-  - **エンジンの道**：ジョブのスレッド（プールの外）で 1 件ずつ形を読んで（`shape_path`、glb は見出しと JSON の塊）見積もり、同時の確保が 256 MiB（M11 の決定 2。予算の全体のほうが小さければそちら）に収まる小分けにして、一括の予算（`Class::Bulk`）から確保してから、実行の場（`EngineServices`）の一括のプール（`kura-edit-bulk-*`）の中でアイテムを並べて描く。サムネイルのプール（`kura-thumb-*`）の中ではエンジンを呼ばない。先頭のフレームをキャンバスに置き（offset の外は透明）、Box で長辺 1600・512 に縮める（拡大しない。ドット絵の拡大は表示の側）。長辺 1600 に透明な画素があれば PNG（`compression: fast`）、なければ JPEG（品質 82。Rgb8 に落として書く）。色の ICC は引き継ぐ（グレーのものは捨てる）。値が 1 GiB を超えるもの・`Limit`・`Unsupported`・読めないもの・予算に収まらないものは ImageIO の道へ回し、理由をジョブのログに残す（aseprite・svg は ImageIO も読めないので `failed`）。glb は描けなければ `failed`。見積もりの小分けは `media::engine_thumbs::{image_estimate, model_estimate}`。エンジンの部品はライブラリを開いただけでは作らず、エンジンの道のアイテムに最初に出会ったときに作る。
+  - **エンジンの道**：ジョブのスレッド（プールの外）で 1 件ずつ形を読んで（`shape_path`、glb は見出しと JSON の塊）見積もり、同時の確保が 256 MiB（M11 の決定 2。`INFLIGHT_CAP`。予算の全体のほうが小さければそちら）に収まる小分けにして（順は保つ。1 件で 256 MiB を超えるものは 1 件だけの小分けにし、同時の確保はその 1 件の分になる。予算の全体を超えるものは確保で断られて ImageIO の道へ回る）、一括の予算（`Class::Bulk`）から確保してから、実行の場（`EngineServices`）の一括のプール（`kura-edit-bulk-*`）の中でアイテムを並べて描く。サムネイルのプール（`kura-thumb-*`）の中ではエンジンを呼ばない。先頭のフレームをキャンバスに置き（offset の外は透明）、Box で長辺 1600・512 に縮める（拡大しない。ドット絵の拡大は表示の側）。長辺 1600 に透明な画素があれば PNG（`compression: fast`）、なければ JPEG（品質 82。Rgb8 に落として書く）。色の ICC は引き継ぐ（グレーのものは捨てる）。値が 1 GiB を超えるもの・`Limit`・`Unsupported`・読めないもの・予算に収まらないものは ImageIO の道へ回し、理由をジョブのログに残す（aseprite・svg は ImageIO も読めないので `failed`）。glb は描けなければ `failed`。見積もりの小分けは `media::engine_thumbs::{image_estimate, model_estimate}`。エンジンの部品はライブラリを開いただけでは作らず、エンジンの道のアイテムに最初に出会ったときに作る。
   - **書き方**：OS の道はサムネイルのプールで CPU コア数の並列。結果は 1 トランザクションで書き、書いたら `thumb_rev` を +1（URL の `?r=`）。UPDATE は `WHERE id = ? AND hash = ?`（読んだあとに中身が変わっていたら書かない）。書いたら別の形式の古いファイルを消す（`ThumbTargets::remove_others`）。`stale` を作り直せなかったときは、前の絵のまま `ready` に戻す（`thumb_rev` は変えない）。`kura://…/thumb/{hash}/{s,l}` は png、jpg の順に探す（§4）。
   - **作り方の指紋**（settings の `'thumbs.plan'`。`media::route::sync_plan`）：形式の表の行ごとの作り方の名前（`engine-thumbs/1`・`imageio-alpha/1`・`imageio/1`（jpeg）・`coretext/1`・`model-kura-render/1`・`video/1`・`audio/1`）。ライブラリを開くとき（ジョブを動かす前に）前回と比べ、変わった形式の `ready` を `stale` に、`failed` を `pending` に戻す。指紋のないライブラリ（M10 まで）は「画像はすべて ImageIO の JPEG、フォント・3D は作らない」と比べる（png・gif・webp・aseprite・psd・svg・heic・heif・avif・tiff・bmp とフォント・3D が作り直しになり、jpeg・動画・音楽は変わらない）。指紋が変わったときだけの全件の走査（10 万件の seed で png・heic の 46,860 件を stale にして 70ms）。
   - **作っている途中の印**（critic 8。`media::inflight`）：OS のデコーダ（ImageIO・CoreText・AVFoundation）とエンジンの Platform の段はアプリのプロセスの中で動くので、壊れたファイルでプロセスごと落ちうる。作る前に作っているアイテムを settings の `'thumbs.inflight'`（`{solo, ids}`）に書き、結果と同じトランザクションで消す。開くときに残っていれば、まとめての印（64 件）は疑わしいもの（`'thumbs.suspects'`）にして 1 件ずつ・1 件だけの印で作り直し、1 件だけの印のアイテムは `failed`（`stale` は前の絵のまま `ready`）にして先へ進む（同じファイルで落ちるのは多くても 2 回）。開く道は `media::prepare_on_open`（印の片付け → 指紋 → pending・stale があればジョブを積む）。
   - **キャッシュの容量**（M11 の決定 4 で ADR-122 を広げる）：`library_cache_usage`（§3）がサムネイル（`thumbs/` と `art/`）・波形（`peaks/`）・アニメ（`anim/`）のファイルを別々に数える（`media::usage`。1 段目のフォルダを最大 8 本のスレッドで。10 万件の seed のサムネイル 21 万個で 251〜328ms（温まった状態））。
-- 目標：画像サムネイル 50 枚/秒以上（NFR-04）。実測は §13。M11 の実測（`bench thumbs-job`。M4 Max・ロードアベレージ 7〜9）：PNG の多い組（`assets --bench 24`：2048² のアルファ付き PNG・3000×2000 の不透明な PNG・JPEG を 24 枚ずつ、64² のスプライト 96 枚）で 105 枚/秒・ピーク 282 MB。大きな PNG だけ（48 枚）では 31 枚/秒・187 MB（同時の確保 512 MiB なら 46 枚/秒・363 MB）で、エンジンを使わない（M10 の ImageIO の道）と 194 枚/秒・606 MB。大きな PNG の多いライブラリでは NFR-04 を下回る（M11 の決定 2 で判定の範囲として requirements.md に書く）。
+- 目標：画像サムネイル 50 枚/秒以上（NFR-04）。実測は §13。M11（`bench thumbs-job`）：PNG の多い組（`assets --bench 24`：2048² のアルファ付き PNG・3000×2000 の不透明な PNG・JPEG を 24 枚ずつ、64² のスプライト 96 枚の 168 件）で 105〜112 枚/秒。大きな透過 PNG だけ（48 件）では 31 枚/秒（同時の確保 512 MiB なら 46 枚/秒）で、エンジンを使わない（M10 の ImageIO の JPEG）と 194 枚/秒。大きな透過 PNG の多いライブラリでは NFR-04 を下回る（M11 の決定 2。判定の範囲は requirements.md の NFR-04）。
+- **大きな確保を OS へすぐ返す確保器**（M11。ADR-163。`kura_mac::ReturningAllocator`）：アプリ（src-tauri）と kura-devtools の `#[global_allocator]`。1 MiB 以上の確保だけを `mmap` で取り、解放したら `munmap` ですぐ返す。それより小さいもの（エンジンの 256² のタイル・音声のブロックなど）と、ページより大きな揃えは今までどおり `System`（libmalloc）。どちらの道かは `Layout` の大きさと揃えだけで決まる（解放・取り直しでも同じ `Layout` が渡るので目印を持たない）。`mmap` の領域は 0 で埋まっているので、0 で埋めた確保は書かない。macOS 以外は `System` のまま。
+  - 理由：解析・エンジンのサムネイルは数 MB〜数百 MB を確保しては捨てる。libmalloc は解放した大きな領域（large cache）を使い回し用に抱えたままにし、ジョブのあとも 150 秒たってアプリ 588 MB（うち空の MALLOC_LARGE 445 MB）・合計 712 MB のまま、NFR-07 の 500 MB に戻らなかった。`malloc_zone_pressure_relief` でも 48 KB しか返らない。large cache を切る設定（環境変数 `MallocLargeCache`）は文書にないので使わない。確保器を入れたあとは、ジョブのあとアプリ 124 MB・合計 253 MB に戻り、解析の速さは −1.6%（誤差の範囲。§13 の M11 の実測）。
+  - `#[global_allocator]` を置くのはアプリと kura-devtools の `main.rs` だけなので、kura-core・kura-engine・kura-mac などのテストは libmalloc のまま。メモリを測るもの（`bench analyze`・`bench thumbs-job`、kura-devtools のテストの `mem_smoke` の子）は kura-devtools の中なので、アプリと同じ確保器で測る。
 
 ## 8. 再生とプロキシ
 
@@ -400,7 +406,7 @@ import_start:    ジョブとして実行
 - 署名は個人利用なのでアドホック署名（`bundle.macOS.signingIdentity: "-"`）。App Store には出さない。
   - リリース（M9。ADR-123）：`pnpm tauri build` で `target/release/bundle/macos/Kura.app` と `bundle/dmg/Kura_<版>_aarch64.dmg` ができる。`codesign -dv` は `Signature=adhoc`（flags adhoc,runtime）、`codesign --verify --deep --strict` は通る。公証はしないので `spctl --assess` は rejected になる。
   - 自分の Mac でビルドしたものは隔離の属性が付かないので、`/Applications` にコピー（`ditto`）すればそのまま開ける。ほかの Mac へ dmg で渡すと Gatekeeper に止められるので、システム設定 › プライバシーとセキュリティの「このまま開く」で開く。
-  - 新しい版で既存のライブラリを開くと、足りないマイグレーションを当てる（M9 は 0005）。当てたあとは前の版では開けない（「新しい版の Kura で作られています」）。
+  - 新しい版で既存のライブラリを開くと、足りないマイグレーションを当てる（M9 は 0005、M11 は 0007〜0009）。当てる前に空きを確かめてバックアップを作り（§14）、300ms を超えたら「ライブラリを更新しています」を出す（§3）。当てたあとは前の版では開けない（「新しい版の Kura で作られています」）。
 - 書類・デスクトップ・ダウンロードを「ファイルを選択」で開くと macOS の許可ダイアログが出る。ドラッグ＆ドロップした項目は許可なしで読める。
 
 ## 12. 状態管理（フロント）
@@ -409,7 +415,10 @@ import_start:    ジョブとして実行
 - 検索結果の ID 列は `Uint32Array` で保持する。
 - ジャスティファイ配置は「行の高さ目標・コンテナ幅・各アイテムの縦横比」から行分割を計算する純粋関数（`src/features/library/layout/justify.ts`）にし、テストする。縦横比は `items_query_ids` が ID と一緒に全件分返すので、詳細を取得する前に全体の高さと行分割が決まる（音楽は 1.0、不明は 1.0 として扱う）。
 - `itemCache` は 4,000 件の LRU（アイテムとユニットで 1 つずつ）。見えている行の ID を 200 件ずつまとめて `items_get`・`units_get` する。編集したものは捨てずに取り直す（届くまで前の内容を出す）。取り込み中の一覧の取り直しは 1 秒、サムネイルのイベントでの取り直しは 0.5 秒（`pending` と作り直し中の `stale`）、解析のイベント（`analyze`）での取り直しは 1 秒（`analysisState` が `pending` のアイテムと表紙）にまとめる。取り直して中身が変わらなければ前の行のまま（描き直さない）。
-- サムネイルを出す所はすべて `components/MediaImage`（M11）：`thumbUrl` に `thumbRev` を付け、`stale` も今の絵を出し、解析で透過と分かった画像に市松模様、ドット絵を広げるときだけ最近傍（プレビューは装置の画素の整数倍）、フォントは mask で色を付ける（docs/design.md §3.1）。
+- サムネイルを出す所はすべて `components/MediaImage`（M11）：`thumbUrl` に `thumbRev` を付け、`stale` も今の絵を出し（あるかは `hasThumb`）、解析で透過と分かった画像に市松模様、ドット絵を広げるときだけ最近傍（プレビューは装置の画素の整数倍）、フォントは mask で色を付ける（docs/design.md §3.1）。`thumbUrl` を呼ぶのは MediaImage だけで、`media.test.ts` がほかのファイルでの呼び出し・`kura://` の組み立て・`thumbState === 'ready'` だけの判定を見張る（.claude/rules/frontend.md）。
+- **種類**（M11）：種類の型・並び・述語（キューに入るか・長さを持つか）は `src/ipc/kinds.ts` だけが bindings の定数 `ITEM_KINDS` から作る（画面ごとに `'image' | 'video' | 'audio'` を書かない）。ラベルは `ja.kinds`、検索の語は `QUERY_KIND_WORDS`。
+- **ライブラリの更新**（M11）：`upgradeStore` がイベント `library://upgrade` を受け、`started` から 300ms を超えたら「ライブラリを更新しています」を出す（§3）。開けなかった理由は知らせではなく開く IPC の戻り値（`libraryStore.restoreError`）で出す。
+- **試聴と効果音**（M11）：ループの試聴は `features/asset/auditionStore`（素材の欄のボタン・L のキー・メニューが同じ口を通す。一度に 1 つ。始めるとプレーヤーを一時停止し、効果音を止める）。鳴らし方は `src/lib/assetAudio.ts` の `Audition`（本体だけのバッファを `loop` で回す。`/pcm` の `kura` チャンクの長さ・ループ点を使う `startProbed`）。効果音の即再生は `useSfxOnSelect`（`PlayerPrefs.sfxAudition`）。どちらも `features/asset/audioRuntime` の文脈（元のレートごと、`ContextPool`。上限 3。15 秒鳴らさなければ閉じ、ライブラリの画面を離れたらすぐ閉じる）を分け合う。素材の欄の値は `useAssetData`（解析待ちなら `request_analysis` を 1 回、解析のジョブの知らせで 500ms にまとめて読み直す）。
 - 選択は「選んだ順の ID・範囲の基点・注目している ID」を持つ純粋関数（`src/features/library/selection.ts`）。選んだ順は ⌘G のユニットの並び順に使う。
 - 編集は `src/features/library/actions.ts` に集め、IPC のあとで画面のデータを読み直す：`revisionStore` を進める（インスペクタ・サイドバーが読み直す）、変わったアイテム・ユニットを取り直す、一覧はその変更で中身が変わる種類（未分類・タグなし・フォルダなど）を開いているときだけ読み直す。失敗は `noticeStore` の一行で知らせる。
 - サイドバーの件数とフォルダの木は `sidebarStore`（開いているフォルダだけ `localStorage` の `kura.sidebar`）。
@@ -424,19 +433,21 @@ import_start:    ジョブとして実行
 
 | コマンド・環境変数 | 用途 |
 |---|---|
-| `cargo run --release -p kura-devtools -- seed --items 100000 --out <path>` | ダミーライブラリを作る（画像 7・動画 2・音楽 1、2,000 タグ、60 フォルダ、200 件ごとに 10 件の set ユニット、ひな形 JPEG をクローンで配置、シード付き ChaCha8）。10 万件で約 28 秒 |
-| `kura-devtools bench query --library <path>` | 開く・`query_ids`・`items_get`（200 件）・`item_detail`、サイドバーの一覧の種類・件数・タグの候補・タグの一覧の中央値（タグの一覧は 10 万件・タグ 2,000 個で 19〜22ms） |
-| `kura-devtools bench thumbs --src <dir> [--threads N]` | 画像サムネイルの生成速度（枚/秒） |
+| `cargo run --release -p kura-devtools -- seed --items 100000 --out <path> [--analysis pending\|ready]` | ダミーライブラリを作る（画像 7・動画 2・音楽 1、2,000 タグ、60 フォルダ、200 件ごとに 10 件の set ユニット、ひな形 JPEG をクローンで配置、シード付き ChaCha8）。10 万件で約 28 秒。M11：今の作り方の指紋（サムネイルの `thumbs.plan`・解析の `analysis.plan`）をいつも置く（置かないと、初めて開いたときに M10 の作り方と比べて png・heic などの約 47% が作り直しになり、計測にジョブが混ざる）。`--analysis ready` は画像・音声に偽の事実（透過・色数・ドット絵・アニメ・ラウドネス・ループ）を解析のジョブと同じ書き込み（`analysis::store::write`）で入れて解析済みにする（NFR-02・03・07 の計測用。JPEG・HEIC は形式からの事実）。既定の `pending` は解析待ちのまま |
+| `kura-devtools bench query --library <path> [--fake-facts]` | 開く・`query_ids`・`items_get`（200 件）・`item_detail`、サイドバーの一覧の種類・件数・タグの候補・タグの一覧の中央値（タグの一覧は 10 万件・タグ 2,000 個で 19〜22ms）。`--fake-facts`（M11）は画像・音声に擬似の事実（`media_facts`。`decoder = 'kura-devtools-fake'`）と素材の設定を入れて、素材のフィールド（透過・ドット絵・色数・レート・ラウドネス・ループ・アニメなど）の一覧とパレットの件数も測り、終わったら消す（本物の事実のあるライブラリでは断る。`analysis_state` は pending のままなので、「未解析 N 件」はいちばん重い場合） |
+| `kura-devtools bench thumbs --src <dir> [--threads N]` | 画像サムネイルの生成速度（枚/秒。ジョブを通さず `kura_mac::media_backend()` の `image_thumbnails` を並べて呼ぶので、M11 ではいつも ImageIO の道。エンジンの道は `bench thumbs-job`） |
+| `kura-devtools bench thumbs-job --src <dir> [--threads N] [--engine-cap <MiB>] [--no-engine] [--out <dir>]` | サムネイルのジョブの速さ（M11。NFR-04）：`--src` を新しいライブラリにアプリと同じ渡しもので取り込み、できたサムネイルを消して pending に戻してから、サムネイルのジョブだけを動かす（道の割り振り・エンジンの一括の予算と一括のプールも本番と同じ）。道ごとの件数と作れなかった数を出す。`--engine-cap` は同時の確保の上限（既定 256 MiB）、`--no-engine` はエンジンの道を使わない（M10 の ImageIO の道と比べる）。メモリのピークは `/usr/bin/time -l` で外から測る。測り終えたらライブラリを消す |
+| `kura-devtools assets --out <dir> [--bench <N>]` | 形式の見本を書く（M11。形式の表の画像・フォント・3D の行ごとに 1 つ以上：アルファ付きの PNG・ドット絵・タグ付きの aseprite・アニメの WebP・GIF・APNG・PSD・PSB・文字のある SVG・JPEG、`sips` で作るアルファ付きの HEIC・HEIF・AVIF・TIFF・BMP、システムのフォントの写しと包み直した WOFF・WOFF2、見本の glb。動画・音声は ffmpeg（mp4・mp3・aac・flac・opus・aiff）と kura-engine の書き手（10 秒以下の効果音・ループ点付きの Ogg Vorbis・smpl 付きの WAV））。macOS のテスト `every_image_font_and_model_format_gets_a_thumbnail_and_probe` がこれを取り込んで、行ごとにサムネイルと情報ができることを確かめる。`--bench <N>` は代わりに `bench thumbs-job` 用の PNG の多い組（2048² のアルファ付き PNG・3000×2000 の不透明な PNG・JPEG を N 枚ずつ、64² のスプライトを 4N 枚）を書く。作れなかったもの（`sips` が HEIC を書けない環境・ffmpeg がない）は理由を出す |
+| `kura-devtools bench migrate (--library <path> \| --items <件数> [--history]) [--runs 3] [--work <dir>] [--json <file>]` | マイグレーションの時間と照合（M11。docs/data-model.md §5）：既存のライブラリの DB の写し（元には触らない）か、合成したスキーマ 6 の DB（`--history` で再生の記録・エントリ・取得元も）を `Library::open` で開き（当てる前のバックアップ → 当てる → TRUNCATE。空きの確かめはアプリが渡すものなので、ここではしない）、段ごとの時間・DB と WAL の大きさ・開き直す時間（更新後の 2 回目）を出す。最後の写しで、表ごとの行数が当てる前と同じ・`foreign_key_check` が空・FTS の照合・`quick_check`・台帳と items の 1 対 1 を確かめ、外れたら失敗にする |
 | `kura-devtools bench import --src <dir> [--threads N] [--out <dir>]` | 取り込みの速さ（MB/秒・件/秒）と、同じファイルをハッシュだけした速さ。新しいライブラリを `--out`（既定は `--src` と同じ場所）に作って入れ、測り終えたら消す（M9） |
 | `kura-devtools bench backup --library <path>` | DB のバックアップを 1 つ作る速さ（10 万件・58MB で 0.25 秒。M9） |
 | `kura-devtools bench analyze --kind image\|audio [--limit N] [--src <dir>] [--work <dir>] [--json <file>]` | 解析のジョブの速さとメモリ（M11）：作業フォルダに見本のライブラリを作り（`--src` のファイルか、中身の違う合成の見本）、自分を子プロセスとして `/usr/bin/time -l` で起こして、アプリと同じエンジンの部品（物理メモリからの予算・`full_codec_set`）で解析のジョブを 1 本動かす。通しの件数/秒、読んで解いた 1 件の p50・p95・最大（ジョブの結果の `readMs`）、peak memory footprint を 1 行の JSON で出す |
-| `kura-devtools seed … --analysis ready` | 画像・音声に偽の事実（透過・色数・ドット絵・アニメ・ラウドネス・ループ）を解析のジョブと同じ書き込みで入れて解析済みにする（M11 の NFR-02・03・07 の計測用。既定の `pending` は解析待ちのまま） |
 | `kura-devtools import` / `check` | コマンドラインからの取り込みと整合性の確認（§6） |
 | `kura-devtools download --library <path> <url>...` | アプリと同じダウンロードのジョブで取得して入れる（§9。既定の選択・Cookie なし） |
 | `kura-devtools edit shape --in <file>` / `edit caps` / `edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]` | 編集のエンジンを手で確かめる（形式と形の表示、今の環境の能力の表、文書を当てて書き出し、ダイジェスト・記録・警告を表示。コーデックはアプリと同じ `full_codec_set`（固定の段 → macOS → ffmpeg）。docs/editing.md） |
 | `kura-devtools bench edit [--preview-threads 3] [--bulk-threads 3] [--threads 4,16] [--budget 4GiB] [--photo <file>] [--quick] [--only 11,12] [--runs 3] [--json <file>] [--markdown <file\|->]` | 編集の性能（NFR-11〜17・E30。docs/editing.md §16）を、アプリと同じ `EngineRuntime`（§15）と `full_codec_set` で測る。判定はプレビュー・一括のプールを 3 スレッドにしたもの（ADR-154）で、`--threads` に並べた数は記録だけ。NFR-11・12 は表示の経路（`Engine::render_view`。24MP の写真は段 2 で判定し、段 1 も記録）で、慣らし 10 回のあと 30 回（p95 は最近順位法）、回の前後とケースごとにロードアベレージを記録する。NFR-16 は最後の文書・結果を別のエンジン・キャッシュなしの一括の経路（1・3・16 スレッド）で作り直して照らす。NFR-17 は自分を子プロセスとして `/usr/bin/time -l` で起こし、peak memory footprint から基準を引く。表（標準出力）・JSON・Markdown（下の M10 の表の形）で出す。判定は達成・未達・範囲外（決めた目標の範囲の外：太さ 32px を超える筆と減色のプレビュー。測っても達成・未達にしない。JSON の `verdict` は `out_of_scope`）・記録・見送り。`--quick` は極小の煙のテスト（debug でも回る。筆は 1・8・64px で、範囲外の記録の道も通す）。実写真は `--photo` で渡す（なければ合成の写真） |
 | `cargo test -p kura-devtools mem_smoke` | 編集のメモリの見積もりの煙のテスト（段 10）：固定の小さな入力（プログレッシブの JPEG → 回転・縮小 → PNG、PNG → Indexed8 → PNG、WAV → 音量 → Ogg Vorbis、層の多いアニメの aseprite（256²・8 層・4 フレーム・リンクあり）→ 反転 → APNG、1px の市松の 2048² の PNG → 8 連結の塗りつぶし → PNG）を子プロセスで回し、peak memory footprint から基準（同じ子で、ファイルに触れる前に終えるもの）を引いた量がエンジンの見積もり（`Engine::estimate`。読むファイルの長さも渡す）× 1.25 ＋ 4 MiB 以下かを確かめる（読む段だけの量も）。macOS の CI で回る（`/usr/bin/time -l` のない Linux では見送る） |
-| `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない） |
+| `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない）。まだコミットしていないマイグレーションのある dev・debug のビルドは、必ずこれで seed か写しのライブラリに向ける（identifier が release と同じで、なければ app.json の前回のライブラリ＝本物を開いて当ててしまう。当てたものは直しても当て直されず、前の版では開けなくなる） |
 | `VITE_KURA_BENCH=1` | グリッドを自動でスクロールし、フレーム時間を `bench_report` でログに書く |
 | `kura-devtools selftest-library --out <path> [--web <dir>] [--font <ttf>]` | kura:// と CSP の自己点検用のライブラリを作る（M11。§4.2）。アルファ付き PNG・JPEG・WAV は DB に入れ、`<script>` 入りの SVG・ttf（システムのフォントの写し）・glb は `files/` に直に置き、WAV の `kura-peaks` と、中身のハッシュの目録（決まった名前 `5e1f7e57…` で `/file` から読める）も置く。`--web` には F2 のページ `f2.html` を書く。整合性の確かめでは、DB にないファイルが 4 つ孤立して数えられる |
 | `VITE_KURA_CHECK=1` | ループの試聴の継ぎ目の自己点検（M11。`src/dev/seamCheck.ts`）。試聴を始めるたびに、同じ PCM と同じ組み立て（本体を loop・前奏のあとに本体・継ぎ目の前後を続けて。始める時刻はフレームの境、バッファの中の始まりは「フレーム ÷ レート」の秒）を OfflineAudioContext で描き、PCM を計画の順につないだ期待の標本と 1 標本ずつ照らして、`bench_report('audition-seam', {hash, mode, rate, channels, windows, seams, frames, mismatches, first, ms})` でログに書く。完了条件は `mismatches` が 0。本物との違い：始める時刻の起点は 0（本物は文脈の今の時刻の少し先）。描く長さは窓ごとに 30 秒まで（前奏と本体が長ければ、前奏の終わりの 1 秒前からの窓と本体の継ぎ目の 1 秒前からの窓に分ける）。通常のビルドには入らない（条件の中の動的 import が消える。`src/dev/seamCheck.test.ts` が読み込む所を見張る） |
@@ -568,6 +579,33 @@ M10 の実測（NFR-11〜17。`kura-devtools bench edit --runs 3`。Apple M4 Max
 - NFR-17 の判定は「実測 ≤ 予算」。実測が見積もり × 1.25 ＋ 4 MiB を超えたら注を出す（今回はなし）。基準は、実行の場を作るだけの子（保存のケースはアプリのコーデックの組 `full_codec_set` も作る子）で、保存で 8.3〜8.4 MiB、エディタで 2.5 MiB。エディタの実測には、開いた文書（筆 999 本）とセッションの履歴も入る。
 - 負荷：2 回目の途中でケースごとのロードアベレージが 10.4 まで上がった（正規化・写真・筆のケース）が、p95 は 1・3 回目と大きく変わらない（違いは最大で段 1 の鎖の約 4 ms）。32px の筆のあとに最近傍 ×4 の 8 ms 超えは、いちばん負荷の低い 1 回目（ケースのロードアベレージ 3.6）で出た。段 10 の最初の試し（ロードアベレージ 12.8〜16.3）では、5 万本の筆の p95 が 8〜15 ms に跳ねた。
 
+M11 の実測（NFR-01〜07 の測り直しと M11 の計測。2026-10-20。Apple M4 Max（高性能 12・高効率 4 コア）、128 GB、macOS 26.7、内蔵 SSD、リリースビルド、コミット fbd7580（確保器 `kura_mac::ReturningAllocator` を入れたあと。NFR-05 の M10 は d6edff9）。ほかのアプリが動いている状態（ロードアベレージ 3.4〜7）で測った。seed は 2 つ：更新後の初回は M10 の seed 10 万件（スキーマ 6。DB 51.8 MB ＋ WAL 10 MB）の APFS の写し、落ち着いた状態は M11 の seed 10 万件（`seed --items 100000 --analysis ready`。画像 70,151 件・音声 9,968 件に偽の事実、作り方の指紋あり））：
+
+| NFR | 項目 | 結果 | 目標 | 判定 |
+|---|---|---|---|---|
+| 01 | 起動から最初のタイルの詳細を返すまで（M11 の seed、4 回。1 回目は初めて開いたとき） | 0.40〜0.58 秒（0.581・0.401・0.410・0.397） | 1.5 秒以内 | 達成 |
+| 01 | 更新後の初回（M10 の seed の写し、3 回。スキーマ 6 → 9 を含む） | 1.39〜1.43 秒（うち更新 0.86〜0.90 秒：バックアップ・0007〜0009・TRUNCATE と、サムネイルの作り方の指紋で 46,860 件を stale にする 71 ms） | NFR-01 の外（M11 の決定 1） | 記録（1.5 秒にも収まった） |
+| 01 | 更新直後の 2 回目（同じ写し、3 回。サムネイルの作り直しと解析が走っている） | 0.39 秒（0.390・0.394・0.391） | 1.5 秒以内 | 達成 |
+| 02 | `VITE_KURA_BENCH=1` の自動スクロール（M11 の seed、601 フレーム、有効な 3 回） | 60〜60.1fps・p50 17ms・p95 17ms・p99 18ms、20ms 超え 0 | 60fps | 達成 |
+| 03 | 素材の事実のフィールドで一致が数千件まで（`bench query --fake-facts`。`透過:あり`・`ドット絵:あり`・`色数<=16`・`アニメ:あり`・`レート:48k`・`ビット:24`・`チャンネル:ステレオ`・`ラウドネス>-14`・`ピーク>-1`・`ループ:あり`・組み合わせ） | 一覧 0.6〜9.6 ms・パレット 10〜24 ms | 50 ms（計画の目安） | 達成 |
+| 03 | 素材の事実のフィールドで一致が 6〜9 万件（広い条件） | `-透過:あり` 43 ms（パレット 51 ms）、`透過!=あり` 72 ms（75 ms）、`ドット絵:なし` 91 ms（114 ms） | 50 ms（計画の目安） | 目安を超える（下の注） |
+| 03 | タグ 3 つの AND／全文検索 | 0.5〜0.9 ms／0.16〜19 ms | 50 ms／100 ms 以内 | 達成 |
+| 04 | サムネイルのジョブ（`bench thumbs-job`、`assets --bench 24` の 168 件：2048² のアルファ付き PNG・3000×2000 の不透明な PNG・JPEG を 24 枚ずつ、64² のスプライト 96 枚。エンジン 144・ImageIO 24） | 105〜112 枚/秒 | 50 枚/秒以上 | 達成 |
+| 04 | 大きな透過 PNG だけ（48 件。同時の確保 256 MiB） | 31 枚/秒（512 MiB なら 46 枚/秒）。エンジンを使わない（M10 の ImageIO の JPEG）と 194 枚/秒 | 50 枚/秒以上 | 下回る（判定の範囲。requirements.md の NFR-04） |
+| 05 | 取り込み（35 KB の JPEG 4,000 件、M10 と M11 を交互に 3 回ずつ） | M10 7,561〜7,880 件/秒、M11 7,450〜7,666 件/秒（−2%） | ディスクの速度が上限 | 達成（誤差の範囲。台帳のトリガで遅くならない） |
+| 07 | 10 万件を表示（自動スクロールのあと、アプリ＋WebContent＋GPU＋Networking の phys_footprint の合計、有効な 3 回） | 334〜339 MB（アプリ 53〜57・WebContent 248〜249・GPU 27〜28・Networking 5） | 500 MB 以内 | 達成 |
+| 07 | ジョブが動いている間（225 件のライブラリで、サムネイル 206 件と解析 217 件を GUI で走らせる。5 分の曲 5 本を含む） | 最大 553 MB（アプリ 150 MB）。ジョブのあとアプリ 124 MB・合計 253 MB に戻る | NFR-07 の外（NFR-17 の一括の予算で数える。M11 の決定 2） | 記録 |
+| 07 | 同じ、確保器を入れる前（libmalloc のまま） | 最大 956〜968 MB（アプリ 588 MB）。ジョブのあとも 150 秒たってアプリ 588 MB・合計 712 MB のまま（空の MALLOC_LARGE 445 MB を libmalloc が抱えたまま） | — | 確保器で直した（§7、ADR-163） |
+
+- **マイグレーション**（`bench migrate --runs 3`、M10 の seed 10 万件）：開く処理の全体 713〜715 ms（バックアップ 42〜43 ms、0007 667〜671 ms、0008 1 ms、0009 0.2 ms、TRUNCATE 0.7 ms）。21 表の行数 504,767 が当てる前と同じ、`foreign_key_check` 0 件、FTS の照合と `quick_check` は ok、台帳と items は 1 対 1（10 万行）。段 1 の値（ロードアベレージ 9〜12）は docs/data-model.md §5。
+- **NFR-01 の測り方**：開いたことのログ（「起動から前回のライブラリを開くまで」「起動から最初のタイルの詳細を返すまで」）の `upgraded`・`upgrade_ms` で、更新後の初回と 2 回目以降を分ける（docs/data-model.md §5）。
+- **NFR-03 の広い条件**：遅いのは、数万件の 32 バイトのハッシュで items を引くところ（一致する事実の集合を作るだけなら 5 ms）。整数の鍵で引けば約 13.5 ms の見込み（seed で台帳の ID と items の ID がたまたま一致することを使って測った値。列を足したときの値は推測）。比べると、既存の `種類:画像`（7 万件）は 9〜18 ms。
+- **一覧の概要**（`items_get` の 200 件。M11 の seed、素材の値を JOIN する）：0.25〜0.27 ms（M2 は 0.16 ms）。
+- **解析**（`bench analyze --src`。実ファイルの見本。確保器を入れたあと。予算 4 GiB・一括のプール 12）：画像 17 件（JPEG 2 件は読まない）で 136 件/秒・1 件の p50 3.0 ms・p95 38 ms（2048² の PSD・PNG）・ピーク 43 MB。音声 10 件（5 分の曲 5 本を含む）で 7.06 件/秒・p50 30 ms・p95 329 ms・ピーク 150 MB（確保器を入れる前は 483 MB。速さは −1.6% で誤差の範囲）。
+- **試聴の PCM・アニメの帯**：§4 の「`/pcm` と `item_anim_get` をジョブにしない理由」。
+- **kura:// と CSP の自己点検**：§4.2（最後のコミットでも build で確かめた）。
+- **形式の見本**（`assets`・`assets --bench 24` の出力と解析の計測の実ファイル、合わせて 227 件を `kura-devtools import`）：取り込み・サムネイル・解析が 5 秒で終わる。サムネイルを作れなかった 18 件はすべてジャケットのない音声（ADR-34）で、画像・フォント・3D はすべて作れた。透過があるのにサムネイルが JPEG のものは 0 件。
+
 ## 14. 書き出しとバックアップ（M9）
 
 - **書き出し**（`kura_core::export`、ジョブ `kind = 'export'`。ADR-120）：
@@ -580,6 +618,10 @@ M10 の実測（NFR-11〜17。`kura-devtools bench edit --runs 3`。Apple M4 Max
   - SQLite の backup API で、読み取り専用の別の接続から `backups/library-YYYYMMDD-HHMMSS.sqlite`（UTC）へ少しずつ写す（書き込みは止めない）。一時ファイルに写してから名前を変え、1 つのファイルで開けるよう `journal_mode = DELETE` にする。
   - 開いて 20 秒後と、そのあと 1 時間ごとに確かめ、前回から 24 時間以上たっていれば作る。新しい 7 個を残し、`backups/` の中のこの形の名前のものだけ消す。設定画面から今すぐ作れる。
   - 戻すのはアプリの外で手で行う（docs/data-model.md §1）。
+- **マイグレーションの前**（M11。docs/data-model.md §5、ADR-156）：未適用のマイグレーションがある既存のライブラリ（版 1 以上）を開くときは、当てる前に次の順で確かめる。
+  1. 空き：DB の大きさ（頁の数 × 頁の大きさ）から要る空きを見積もる（`library::upgrade::space_needed`＝DB の 3 倍 ＋ 64 MiB。当てる前のバックアップ 1 つと、作り直す表を DB の中と WAL に 1 つずつ）。ボリュームの空き（アプリが渡す `UpgradeHooks::free_space`。macOS は kura-mac の `volume_capacity` の「使用可能」）が足りなければ、バックアップも取らずに断る（`NoSpace`。ライブラリは変えない）。空きが読めなければ確かめずに進む（ログに warn）。10 万件の seed（DB 51.8 MB）で測った増え方の最大は 119.6 MB（DB の 2.31 倍）で、見積もり（約 222 MB）に収まる。
+  2. バックアップ：書き込みの接続から backup API で、いつもの名前（`backups/library-YYYYMMDD-HHMMSS.sqlite`・DELETE モード）に一度に写す。7 個の保持に乗る。失敗したら当てずに開くのを失敗にする（ディスクの空きが足りなければ `NoSpace`、ほかは `BackupFailed`。当てる途中で空きが尽きたときも `NoSpace`）。新しいライブラリ（版 0）では作らない。
+  - 当てる・知らせ・失敗の code は §3（`library://upgrade`・`LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed`）と docs/data-model.md §5。
 
 ## 15. 編集（M10〜。正本は docs/editing.md）
 
