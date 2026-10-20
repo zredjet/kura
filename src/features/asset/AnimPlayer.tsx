@@ -8,7 +8,7 @@ import { PlayIcon } from '../../components/icons/PlayIcon';
 import { ja } from '../../i18n/ja';
 import type { AnimDto } from '../../ipc/asset';
 import { animUrl } from '../../ipc/media';
-import { pixelFit, showChecker, type AlphaKind } from '../../lib/asset/pixel';
+import { type AlphaKind, checkerFor, pixelFit } from '../../lib/asset/pixel';
 import {
   type AnimTag,
   type Cell,
@@ -177,9 +177,11 @@ export function AnimPlayer({
   const frameRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fill = frameHeight === 'fill';
+  // 測る前は仮の大きさで描く（measured は偽。市松模様は測ってから敷く）
   const [box, setBox] = useState({
     w: FALLBACK_WIDTH,
     h: fill ? FALLBACK_FILL_HEIGHT : frameHeight,
+    measured: false,
   });
   const [image, setImage] = useState<{ url: string; image: CanvasImageSource | null } | null>(null);
   const [tagName, setTagName] = useState<string | null>(() =>
@@ -219,7 +221,9 @@ export function AnimPlayer({
     if (!el) return;
     const observer = new ResizeObserver((entries) => {
       const rect = entries[0]?.contentRect;
-      if (rect && rect.width > 0 && rect.height > 0) setBox({ w: rect.width, h: rect.height });
+      if (rect && rect.width > 0 && rect.height > 0) {
+        setBox({ w: rect.width, h: rect.height, measured: true });
+      }
     });
     observer.observe(el);
     return () => observer.disconnect();
@@ -301,7 +305,12 @@ export function AnimPlayer({
     setStep(0);
   };
 
-  const checker = showChecker(alpha, Math.min(size.width, size.height));
+  // MediaImage と同じ規則（アニメは画像だけ）。枠を測るまでは表示の大きさが分からないので敷かない
+  const checker = checkerFor(
+    'image',
+    alpha,
+    box.measured ? { w: size.width, h: size.height } : null,
+  );
   const tagOptions = [
     { value: '', label: t.allFrames },
     ...source.tags.map((x) => ({ value: x.name, label: x.name })),

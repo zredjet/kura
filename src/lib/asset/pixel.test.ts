@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { CHECKER_MIN_PX, isPowerOfTwo, pixelFit, renderingFor, showChecker } from './pixel';
+import {
+  CHECKER_MIN_PX,
+  checkerFor,
+  isPowerOfTwo,
+  pixelFit,
+  renderingFor,
+  showChecker,
+} from './pixel';
 
 // docs/design.md §3.1「素材の表示」：市松模様とドット絵の拡大
 describe('市松模様', () => {
@@ -20,6 +27,21 @@ describe('市松模様', () => {
     expect(showChecker('partial', 48)).toBe(true);
     expect(showChecker('binary', 220)).toBe(true);
     expect(showChecker('none', 220)).toBe(false);
+  });
+
+  it('表示の部品（MediaImage・AnimPlayer）の判定：画像だけ、表示の大きさが分かってから', () => {
+    const shown = { w: 272, h: 220 };
+    expect(checkerFor('image', 'binary', shown)).toBe(true);
+    expect(checkerFor('image', 'partial', { w: 300, h: 48 })).toBe(true);
+    // 大きさが分からないうち（測る前・読む前）は敷かない
+    expect(checkerFor('image', 'binary', null)).toBe(false);
+    expect(checkerFor('image', 'partial', { w: 300, h: 47 })).toBe(false);
+    expect(checkerFor('image', 'none', shown)).toBe(false);
+    expect(checkerFor('image', null, shown)).toBe(false);
+    // フォント（mask）・3D（描いたモデルの外は地のまま）・ほかの種類には敷かない
+    for (const kind of ['font', 'model', 'video', 'audio']) {
+      expect(checkerFor(kind, 'partial', shown)).toBe(false);
+    }
   });
 });
 

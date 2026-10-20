@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../../i18n/ja';
 import type { AnimDto } from '../../ipc/asset';
@@ -209,18 +209,90 @@ describe('AnimPlayer（canvas のアニメのプレビュー）', () => {
     });
   });
 
-  it('透過と分かったものだけ市松模様を敷く', async () => {
-    const c = fakeClock();
-    const { container } = player({
-      clock: c.clock,
-      draw: recorder().draw,
-      alpha: 'binary',
-      pixelArt: true,
+  describe('市松模様（MediaImage と同じ checkerFor を通す）', () => {
+    /** 測った大きさを知らせる ResizeObserver（jsdom にはないので差し替える）。 */
+    let observed: ResizeObserverCallback[] = [];
+    const Original = globalThis.ResizeObserver;
+    beforeEach(() => {
+      observed = [];
+      globalThis.ResizeObserver = class {
+        constructor(cb: ResizeObserverCallback) {
+          observed.push(cb);
+        }
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      } as unknown as typeof ResizeObserver;
     });
-    await waitFor(() => expect(c.pending()).toBe(1));
-    expect(container.querySelector('canvas')).toHaveAttribute('data-checker', 'true');
-    const none = player({ clock: fakeClock().clock, draw: recorder().draw, alpha: 'none' });
-    expect(none.container.querySelector('canvas')).not.toHaveAttribute('data-checker');
+    afterEach(() => {
+      globalThis.ResizeObserver = Original;
+    });
+    /** 枠の中身の大きさを測ったことにする。 */
+    function measure(width: number, height: number) {
+      act(() => {
+        for (const cb of observed) {
+          cb([{ contentRect: { width, height } } as ResizeObserverEntry], {} as ResizeObserver);
+        }
+      });
+    }
+    const checker = (container: HTMLElement) =>
+      container.querySelector('canvas')?.hasAttribute('data-checker') ?? false;
+
+    it('透過と分かったものに、枠の大きさを測ってから敷く（測る前の仮の大きさでは敷かない）', async () => {
+      const c = fakeClock();
+      const { container } = player({
+        clock: c.clock,
+        draw: recorder().draw,
+        alpha: 'binary',
+        pixelArt: true,
+      });
+      await waitFor(() => expect(c.pending()).toBe(1));
+      expect(checker(container)).toBe(false);
+      measure(272, 220);
+      // 16px を 13 倍（208px）
+      expect(container.querySelector('canvas')).toHaveAttribute('data-checker', 'true');
+    });
+
+    it('不透明・未解析には敷かない', async () => {
+      for (const alpha of ['none', null] as const) {
+        const c = fakeClock();
+        const { container, unmount } = player({
+          clock: c.clock,
+          draw: recorder().draw,
+          alpha,
+          pixelArt: true,
+        });
+        await waitFor(() => expect(c.pending()).toBe(1));
+        measure(272, 220);
+        expect(checker(container)).toBe(false);
+        unmount();
+      }
+    });
+
+    it('表示の短い辺が 48px 未満なら敷かない（広げない 16px・狭い枠の 2 倍）', async () => {
+      const c = fakeClock();
+      const small = player({ clock: c.clock, draw: recorder().draw, alpha: 'partial' });
+      await waitFor(() => expect(c.pending()).toBe(1));
+      measure(272, 220);
+      expect(checker(small.container)).toBe(false);
+      small.unmount();
+
+      const f = fakeClock();
+      const narrow = player({
+        clock: f.clock,
+        draw: recorder().draw,
+        alpha: 'partial',
+        pixelArt: true,
+        frameHeight: 'fill',
+      });
+      await waitFor(() => expect(f.pending()).toBe(1));
+      measure(40, 40);
+      // 40px の枠に 16px を 2 倍（32px）
+      expect(narrow.container.querySelector('canvas')).toHaveAttribute('width', '32');
+      expect(checker(narrow.container)).toBe(false);
+      measure(100, 100);
+      expect(checker(narrow.container)).toBe(true);
+    });
   });
 
   it('帯を読めなければ理由を出す', async () => {
