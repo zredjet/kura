@@ -522,7 +522,9 @@ GROUP BY item_id HAVING COUNT(*) = 3;
    - M11：タイルの素材の表示（市松模様・ドット絵・アニメとループの印）のため、`items i LEFT JOIN blobs b ON b.hash = i.hash
      LEFT JOIN media_facts f ON f.blob_id = b.id LEFT JOIN asset_settings s ON s.item_id = i.id WHERE i.id IN (…)` で引く
      （主キーと `blobs.hash` の UNIQUE だけを引き、200 件でも全件を走査しない。`summaries_join_facts_and_settings_without_scanning`）。
-     ドット絵の実効値は「設定 ?? 自動 ?? 偽」（素材の欄・検索と同じ規則）。ユニットの表紙も同じ形で 1 件引く。
+     ドット絵の実効値は「設定 ?? 自動 ?? 偽」（素材の欄と同じ関数 `asset::effective_pixel_art`。表示のため、どちらもないものは偽）。
+     検索は「設定 ?? 自動」で比べ、どちらもないものは `ドット絵:なし`・`ドット絵!=あり` に入れず、除外にだけ入れる（下の「事実で引く」、
+     docs/search-query.md §4。`ドット絵:あり` の集合は表示の実効値が真のものと同じ）。ユニットの表紙も同じ形で 1 件引く。
 
 ### サイドバーの一覧（M3）
 
@@ -609,7 +611,9 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 
 - 事実の条件は `i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE …)` の形にする
   （部分索引から集合を作る。EXISTS の相関した問い合わせにしない）。
-- 実効値は「設定 ?? 自動」：ドット絵は `asset_settings.pixel_art` があればそれ、なければ `media_facts.pixel_art`。
+- 検索の実効値は「設定 ?? 自動」：ドット絵は `asset_settings.pixel_art` があればそれ、なければ `media_facts.pixel_art`。
+  どちらもない（未解析か、解析しても材料が足りず NULL）ものは決まっていないので、`:あり`・`:なし`・`!=` のどれにも入れない
+  （表示の実効値は「?? 偽」で偽にする。上の「一覧の取得」。テスト `pixel_art_search_follows_the_effective_value_of_the_asset_panel`）。
 - 2 のべき乗は列を持たず、`width & (width - 1) = 0` のビット演算で求める。
 - まだ解析していないもの・計れない値は、肯定・`!=`・大小の比較のどれにも入れない（除外だけが含む。docs/search-query.md §4）。
   色数の打ち切りの 257 は、結果が決まる比較（`>`・`!=` は 256 以下、`>=` は 257 以下の値）のときだけ入れ、ほかは
@@ -683,5 +687,7 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
 確保器を入れたあとのコミット（fbd7580。ロードアベレージ 3.4〜7）で、seed 10 万件を測り直した（`bench migrate --runs 3`）：開く処理の全体
 713〜715ms（バックアップ 42〜43ms、0007 667〜671ms、0008 1ms、0009 0.2ms、TRUNCATE 0.7ms）。21 表の行数 504,767 が当てる前と同じ、
 `foreign_key_check` が空、FTS の照合と `quick_check` が ok、台帳と items が 1 対 1。アプリで更新後の初回を開くと、起動から最初の
-タイルの詳細を返すまで 1.39〜1.43 秒（うち更新 0.86〜0.90 秒。サムネイルの作り方の指紋で 46,860 件を stale にする 71ms を含む）、
-更新直後の 2 回目は 0.39 秒だった（docs/requirements.md の NFR-01）。
+タイルの詳細を返すまで 1.39〜1.43 秒（うち更新 0.86〜0.90 秒：当てる前の確かめとバックアップ約 0.15 秒・0007〜0009・TRUNCATE。
+ログの `upgrade_ms` で、`MigrationReport::total_ms`）、更新直後の 2 回目は 0.39 秒だった（docs/requirements.md の NFR-01）。
+サムネイルの作り方の指紋で 46,860 件を stale にする 71ms（§4「サムネイルの作り直し」）は、DB を開き終えたあとに起動のスレッド
+（`media::prepare_on_open`）で最初のタイルの詳細と並んで動くので、更新の時間には入らない。
