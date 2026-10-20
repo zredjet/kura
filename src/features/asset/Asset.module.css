@@ -281,7 +281,7 @@
   text-overflow: ellipsis;
 }
 
-/* ===== 格子のシート ===== */
+/* ===== 格子のシート（シートの子の間隔は Dialog の gap に任せる）===== */
 
 .sheetTitle {
   font-size: var(--text-2xl);
@@ -292,14 +292,18 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: var(--space-2);
-  margin-top: var(--space-3);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
 }
 
 .fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-2) var(--space-3);
-  margin-top: var(--space-3);
 }
 
 .field {
@@ -328,7 +332,6 @@
 
 .sheetNote {
   min-height: calc(var(--text-xs) * var(--leading-body));
-  margin-top: var(--space-2);
   font-size: var(--text-xs);
   color: var(--text-tertiary);
 }
@@ -341,7 +344,6 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  margin-top: var(--space-4);
 }
 
 .sheetActions .spacer {

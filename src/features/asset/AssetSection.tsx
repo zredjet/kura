@@ -1,4 +1,5 @@
 import { useId, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 import { Button } from '../../components/Button/Button';
 import { Segmented } from '../../components/Segmented/Segmented';
@@ -134,16 +135,19 @@ function ImageRows({ data, onChanged }: { data: AssetData; onChanged: () => void
         >
           {t.gridEdit}
         </button>
-        {grid && (
-          <GridSheet
-            asset={asset}
-            onClose={() => setGrid(false)}
-            onSaved={() => {
-              invalidateItems([asset.itemId]);
-              onChanged();
-            }}
-          />
-        )}
+        {grid &&
+          // インスペクタのガラス（backdrop-filter）は fixed の子の基準になるので、シートは body に出す
+          createPortal(
+            <GridSheet
+              asset={asset}
+              onClose={() => setGrid(false)}
+              onSaved={() => {
+                invalidateItems([asset.itemId]);
+                onChanged();
+              }}
+            />,
+            document.body,
+          )}
       </dd>
     </>
   );

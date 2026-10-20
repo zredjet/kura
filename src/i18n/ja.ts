@@ -580,7 +580,7 @@ export const ja = {
     gridValue: (w: string, h: string, frames: string) => `${w} × ${h} · ${frames} コマ`,
     gridNone: 'なし',
     gridEdit: '設定…',
-    gridEditLabel: '格子を設定',
+    gridEditLabel: '格子の設定…',
     // 音声
     format: '形式',
     rateValue: (khz: string) => `${khz} kHz`,

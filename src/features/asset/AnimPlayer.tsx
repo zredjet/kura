@@ -260,7 +260,8 @@ export function AnimPlayer({
     };
     id = clock.request(tick);
     return () => clock.cancel(id);
-  }, [ready, moving, tr, paint, clock]);
+    // 大きさが変わると canvas が消えるので、回し直して描き直す
+  }, [ready, moving, tr, paint, clock, size.width, size.height]);
 
   // 止めている間：選んでいる位置のコマ（大きさが変わったら描き直す）
   const shownFrame = tr.steps[step] ?? tr.steps[0] ?? 0;

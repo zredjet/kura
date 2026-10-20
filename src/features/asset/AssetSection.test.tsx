@@ -112,6 +112,16 @@ describe('AssetSection（インスペクタの素材の欄）', () => {
     expect(valueOf(t.anim)).toContain('8 コマ');
   });
 
+  it('［設定…］で格子のシートを body に開き、esc で閉じる', () => {
+    const { container } = render(<AssetSection data={data(imageAsset())} item={summary()} />);
+    fireEvent.click(screen.getByRole('button', { name: t.gridEditLabel }));
+    const sheet = screen.getByRole('dialog', { name: t.gridTitle });
+    // インスペクタのガラスの中ではなく body の直下（fixed の基準をずらさない）
+    expect(container.contains(sheet)).toBe(false);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
   it('音声：形式・ラウドネス（U+2212）・ピーク・ループと標本の位置、波形と試聴のボタン', () => {
     render(
       <AssetSection

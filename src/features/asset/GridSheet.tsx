@@ -289,22 +289,24 @@ export function GridSheet({
           </div>
         </div>
       ) : null}
-      <div className={styles.fields}>
-        {field('cellW', t.cellW)}
-        {field('cellH', t.cellH)}
-        {field('offsetX', t.offsetX)}
-        {field('offsetY', t.offsetY)}
-        {field('gapX', t.gapX)}
-        {field('gapY', t.gapY)}
-        {field('count', t.count, t.countPlaceholder)}
-        {field('frameMs', t.frameMs, t.frameMsPlaceholder)}
+      <div className={styles.form}>
+        <div className={styles.fields}>
+          {field('cellW', t.cellW)}
+          {field('cellH', t.cellH)}
+          {field('offsetX', t.offsetX)}
+          {field('offsetY', t.offsetY)}
+          {field('gapX', t.gapX)}
+          {field('gapY', t.gapY)}
+          {field('count', t.count, t.countPlaceholder)}
+          {field('frameMs', t.frameMs, t.frameMsPlaceholder)}
+        </div>
+        <p
+          className={[styles.sheetNote, note ? styles.sheetError : ''].filter(Boolean).join(' ')}
+          role={note ? 'alert' : undefined}
+        >
+          {note ?? (checked.cells.length > 0 ? t.gridCells(formatCount(checked.cells.length)) : '')}
+        </p>
       </div>
-      <p
-        className={[styles.sheetNote, note ? styles.sheetError : ''].filter(Boolean).join(' ')}
-        role={note ? 'alert' : undefined}
-      >
-        {note ?? (checked.cells.length > 0 ? t.gridCells(formatCount(checked.cells.length)) : '')}
-      </p>
       <div className={styles.sheetActions}>
         {asset.settings.grid && (
           <Button size="sm" disabled={saving} onClick={() => save({ grid: 'clear' })}>
