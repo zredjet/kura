@@ -279,6 +279,8 @@ export const events = {
 };
 
 /* Constants */
+export const ANALYSIS_ERROR_CODES = ["unsupported","too_large","decode","crashed"] as const;
+
 export const ITEM_KINDS = [{"hasDuration":false,"kind":"image","needsProxy":false,"playable":true},{"hasDuration":true,"kind":"video","needsProxy":true,"playable":true},{"hasDuration":true,"kind":"audio","needsProxy":true,"playable":true},{"hasDuration":false,"kind":"font","needsProxy":false,"playable":false},{"hasDuration":false,"kind":"model","needsProxy":false,"playable":false}] as const;
 
 export const QUERY_FIELD_NAMES = [{"field":"type","names":["種類","type"]},{"field":"rating","names":["評価","rating"]},{"field":"dur","names":["長さ","dur"]},{"field":"added","names":["追加","added"]},{"field":"taken","names":["撮影","taken"]},{"field":"played","names":["再生","played"]},{"field":"plays","names":["再生回数","plays"]},{"field":"folder","names":["フォルダ","folder"]},{"field":"unit","names":["ユニット","unit"]},{"field":"source","names":["取得元","source"]},{"field":"name","names":["名前","name"]},{"field":"url","names":["url"]},{"field":"note","names":["メモ","note"]},{"field":"tags","names":["タグ数","tags"]},{"field":"w","names":["幅","w"]},{"field":"h","names":["高さ","h"]},{"field":"orient","names":["向き","orient"]},{"field":"alpha","names":["透過","alpha"]},{"field":"pixel","names":["ドット絵","pixel"]},{"field":"colors","names":["色数","colors"]},{"field":"pot","names":["2のべき乗","２のべき乗","pot"]},{"field":"rate","names":["レート","rate"]},{"field":"bits","names":["ビット","bits"]},{"field":"ch","names":["チャンネル","ch"]},{"field":"lufs","names":["ラウドネス","lufs"]},{"field":"peak","names":["ピーク","peak"]},{"field":"loop","names":["ループ","loop"]},{"field":"anim","names":["アニメ","anim"]}] as const;
@@ -436,7 +438,10 @@ export type AssetEffectiveDto = {
 
 /**  解析の事実（`media_facts`）。 */
 export type AssetFactsDto = {
-	/**  解析できたか（false なら `errorCode`：`unsupported`・`too_large`・`decode`）。 */
+	/**
+	 *  解析できたか（false なら `errorCode`：`unsupported`・`too_large`・`decode`・`crashed`。一覧は bindings の
+	 *  定数 `ANALYSIS_ERROR_CODES`）。
+	 */
 	ok: boolean,
 	errorCode: string | null,
 	/**  読んだデコーダ（形式だけで決めたときは null）。 */

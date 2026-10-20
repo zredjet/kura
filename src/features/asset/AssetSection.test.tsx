@@ -162,6 +162,19 @@ describe('AssetSection（インスペクタの素材の欄）', () => {
     expect(startAudition).not.toHaveBeenCalled();
   });
 
+  it('欄が消えたら（シアターの情報のパネルを閉じた・次の曲へ進んだ）、この欄のアイテムの試聴を止める', () => {
+    const item = summary({ id: 2, kind: 'audio', durationMs: 92_000 });
+    useAuditionStore.setState({ itemId: 2, status: 'playing', mode: 'loop', fromStart: false });
+    const view = render(<AssetSection data={data(audioAsset())} item={item} />);
+    view.unmount();
+    expect(stopAudition).toHaveBeenCalledTimes(1);
+    // ほかのアイテムの試聴（L で始めたもの）は止めない
+    vi.mocked(stopAudition).mockClear();
+    useAuditionStore.setState({ itemId: 5, status: 'playing', mode: 'loop', fromStart: false });
+    render(<AssetSection data={data(audioAsset())} item={item} />).unmount();
+    expect(stopAudition).not.toHaveBeenCalled();
+  });
+
   it('ループ点のない音声でも［ループを試聴］を出す（全体を回す）。計れないラウドネスは理由', () => {
     const asset = audioAsset({
       facts: {

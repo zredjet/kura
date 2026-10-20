@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ja } from '../../i18n/ja';
 import { getAsset } from '../../ipc/asset';
 import type { AuditionOutcome } from '../../lib/assetAudio';
+import { IpcError } from '../../ipc/result';
 import { notify } from '../../stores/noticeStore';
+import { useViewStore } from '../../stores/viewStore';
 import { playerController } from '../player/playerActions';
 import { DEFAULT_PREFS, usePlayerStore } from '../player/playerStore';
 import { type AudioRuntime, MediaHttpError, setAudioRuntimeForTest } from './audioRuntime';
@@ -56,6 +58,7 @@ describe('試聴の状態と口', () => {
     setAudioRuntimeForTest(fake.runtime);
     useAuditionStore.setState({ itemId: null, status: 'idle', mode: null, fromStart: false });
     usePlayerStore.setState({ active: false, prefs: DEFAULT_PREFS });
+    useViewStore.setState({ quickLook: false });
   });
 
   afterEach(() => setAudioRuntimeForTest(null));
@@ -129,6 +132,31 @@ describe('試聴の状態と口', () => {
     expect(notify).toHaveBeenLastCalledWith(t.auditionUnsupported);
   });
 
+  it('/pcm が 2xx でなければ HTTP の番号を出さず、分かる言葉で知らせる（ファイルがない・範囲の外・ほか）', async () => {
+    const cases: [unknown, string][] = [
+      [new MediaHttpError(404), t.auditionFailed(t.auditionMissing)],
+      [new MediaHttpError(416), t.auditionFailed(t.auditionRange)],
+      [new MediaHttpError(500), t.auditionFailed(t.auditionUnreadable)],
+      // fetch そのものの失敗（WebKit の英語の message）・応答を読めない
+      [new TypeError('Load failed'), t.auditionFailed(t.auditionUnreadable)],
+      [new RangeError('レートが範囲の外です'), t.auditionFailed(t.auditionUnreadable)],
+    ];
+    for (const [error, text] of cases) {
+      fake.audition.startProbed.mockImplementationOnce(async () => ({ status: 'failed', error }));
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      expect(notify).toHaveBeenLastCalledWith(text);
+      expect(vi.mocked(notify).mock.lastCall?.[0]).not.toMatch(/HTTP|Load failed/);
+    }
+    // Rust の失敗（IpcError）は日本語の message をそのまま
+    vi.mocked(getAsset).mockRejectedValueOnce(
+      new IpcError({ code: 'Db', message: 'データベースを読めません' }),
+    );
+    toggleAuditionKey(11, 'audio');
+    await settle();
+    expect(notify).toHaveBeenLastCalledWith(t.auditionFailed('データベースを読めません'));
+  });
+
   it('待つ間に止めたら、あとから鳴り始めの知らせが来ても状態を戻さない', async () => {
     let resolve: (o: AuditionOutcome) => void = () => undefined;
     fake.audition.startProbed.mockImplementation(
@@ -181,5 +209,41 @@ describe('試聴の状態と口', () => {
     await settle();
     expect(notify).toHaveBeenCalledWith(t.auditionNoFacts);
     expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+  });
+
+  it('クイックルック中は L・メニューで始めない（クイックルックが自分で鳴らす。効果音と同じ条件）', async () => {
+    rememberAsset(audioAsset());
+    useViewStore.setState({ quickLook: true });
+    expect(toggleAuditionKey(2, 'audio')).toBe(false);
+    expect(fake.audition.startProbed).not.toHaveBeenCalled();
+    expect(useAuditionStore.getState().status).toBe('idle');
+    // 素材の欄を読んでいる間にクイックルックを開いた：読めても始めない
+    useViewStore.setState({ quickLook: false });
+    let resolve: (asset: ReturnType<typeof audioAsset>) => void = () => undefined;
+    vi.mocked(getAsset).mockImplementationOnce(() => new Promise((r) => (resolve = r)));
+    expect(toggleAuditionKey(9, 'audio')).toBe(true);
+    useViewStore.setState({ quickLook: true });
+    resolve(audioAsset({ itemId: 9 }));
+    await settle();
+    expect(fake.audition.startProbed).not.toHaveBeenCalled();
+    expect(useAuditionStore.getState().status).toBe('idle');
+  });
+
+  it('プレーヤーが鳴り始めたら試聴を止める（試聴とプレーヤーを重ねない。シアターの再生ボタンなど）', async () => {
+    usePlayerStore.setState({
+      active: true,
+      snapshot: { ...usePlayerStore.getState().snapshot, playing: false },
+    });
+    startAudition(auditionTarget(audioAsset())!);
+    await settle();
+    expect(useAuditionStore.getState().status).toBe('playing');
+    // 鳴っていないプレーヤーの変化（位置など）では止めない
+    usePlayerStore.setState({ snapshot: { ...usePlayerStore.getState().snapshot, positionMs: 5 } });
+    expect(fake.audition.stop).toHaveBeenCalledTimes(1);
+    usePlayerStore.setState({
+      snapshot: { ...usePlayerStore.getState().snapshot, playing: true },
+    });
+    expect(fake.audition.stop).toHaveBeenCalledTimes(2);
+    expect(useAuditionStore.getState().status).toBe('idle');
   });
 });

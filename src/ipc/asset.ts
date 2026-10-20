@@ -12,9 +12,17 @@ import {
   type AssetImageFactsDto,
   type AssetModelDto,
   type AssetSettingsPatchDto,
+  ANALYSIS_ERROR_CODES,
   commands,
 } from './bindings';
 import { unwrap } from './result';
+
+/**
+ * 解析の失敗の理由（`AssetFactsDto.errorCode`。Rust の `analysis::store::error_code::ALL`）。文言は
+ * `ja.asset.failureReasons` に 1 つずつ置く（describe.test.ts が照らす）。
+ */
+export { ANALYSIS_ERROR_CODES };
+export type AnalysisErrorCode = (typeof ANALYSIS_ERROR_CODES)[number];
 
 export type {
   AnimDto,

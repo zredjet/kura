@@ -41,7 +41,7 @@ use super::facts::{MediaFacts, ReadRecord, from_format, project};
 use super::plan::{
     DecoderFingerprint, Plan, READ_ID, READ_V, RequestKey, plan_for, request_key, stage1, stage2,
 };
-use super::store::{self, Inflight, ItemWrite, NewResult, Pending, ReadStamp, Write};
+use super::store::{self, Inflight, ItemWrite, NewResult, Pending, ReadStamp, Write, error_code};
 use crate::edit::{EngineRuntime, EngineServices};
 use crate::import::format_id;
 use crate::jobs::{Control, JobContext, JobEnd, JobHandler};
@@ -240,7 +240,7 @@ fn recover_crash(ctx: &JobContext, counts: &mut Counts) -> Result<()> {
                 id: mark.id,
                 hash,
                 write: Write::Failed {
-                    code: "crashed",
+                    code: error_code::CRASHED,
                     stamp: None,
                 },
             }],
@@ -267,15 +267,17 @@ fn recover_crash(ctx: &JobContext, counts: &mut Counts) -> Result<()> {
 fn failure_code(err: &EngineError) -> Option<&'static str> {
     match err {
         EngineError::Canceled => None,
-        EngineError::Unsupported(_) | EngineError::CodecMissing { .. } => Some("unsupported"),
-        EngineError::Limit(_) => Some("too_large"),
+        EngineError::Unsupported(_) | EngineError::CodecMissing { .. } => {
+            Some(error_code::UNSUPPORTED)
+        }
+        EngineError::Limit(_) => Some(error_code::TOO_LARGE),
         EngineError::AtNode { source, .. } => failure_code(source),
         EngineError::Invalid(_)
         | EngineError::Decode { .. }
         | EngineError::Encode { .. }
         | EngineError::Io(_)
         | EngineError::Internal(_)
-        | EngineError::Mismatch(_) => Some("decode"),
+        | EngineError::Mismatch(_) => Some(error_code::DECODE),
     }
 }
 
@@ -546,7 +548,7 @@ impl Run<'_> {
     /// 1 件を解く（DB には書かない。書くものを返す）。
     fn analyze(&mut self, item: &Pending) -> Result<Step> {
         let (Some(format), Some(kind)) = (format_id(&item.ext), item.kind) else {
-            return Ok(failed("unsupported"));
+            return Ok(failed(error_code::UNSUPPORTED));
         };
         match plan_for(kind, format) {
             Plan::NotNeeded => Ok(Step::Write {
@@ -712,7 +714,7 @@ impl Run<'_> {
                 "アイテム {}: 大きすぎるので解析しません（見積もり {need} バイト・上限 {cap} バイト）",
                 item.id
             ));
-            return Ok(failed("too_large"));
+            return Ok(failed(error_code::TOO_LARGE));
         }
         let mon = JobMonitor(self.ctx);
         let lease = match self.runtime.budget().acquire(need, Class::Bulk, &mon) {
@@ -803,8 +805,10 @@ impl Run<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodecSet, ITEM_CAP, estimate, item_cap, percentile};
-    use kura_engine::{Dim, Shape};
+    use kura_engine::{Dim, EngineError, Shape};
+
+    use super::store::error_code;
+    use super::{CodecSet, ITEM_CAP, estimate, failure_code, item_cap, percentile};
 
     /// 解析しない長さの目安（docs/requirements.md の「NFR-07 の範囲」・ADR-158 (5)）：物理メモリが 8 GB 以上なら 1 件の上限は
     /// 1 GiB で、音声の見積もりは値の 3 倍なので、44.1 kHz ステレオは約 16.9 分、48 kHz ステレオは約 15.5 分、96 kHz ステレオは
@@ -833,6 +837,27 @@ mod tests {
             assert!(fits(format, 44_100, 1, 2028), "{format}");
             assert!(!fits(format, 44_100, 1, 2029), "{format}");
         }
+    }
+
+    /// 失敗の分け方は、どれも bindings に出す理由の一覧（`error_code::ALL`）にある（フロントが文言を引く）。
+    #[test]
+    fn failure_codes_are_in_the_published_list() {
+        let errors = [
+            EngineError::Unsupported("x".into()),
+            EngineError::CodecMissing { tool: "x".into() },
+            EngineError::Limit("x".into()),
+            EngineError::Decode {
+                codec: "x".into(),
+                message: "x".into(),
+            },
+            EngineError::Internal("x".into()),
+        ];
+        for err in &errors {
+            let code = failure_code(err);
+            assert!(code.is_some_and(|c| error_code::ALL.contains(&c)), "{err}");
+        }
+        assert_eq!(failure_code(&EngineError::Canceled), None);
+        assert!(error_code::ALL.contains(&error_code::CRASHED));
     }
 
     #[test]

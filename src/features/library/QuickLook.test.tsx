@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AnimDto } from '../../ipc/asset';
 import type { ItemSummaryDto } from '../../ipc/items';
+import { fileUrl, thumbUrl } from '../../ipc/media';
 import { getCached } from '../../stores/itemCache';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
@@ -64,6 +65,38 @@ describe('QuickLook の素材（M11）', () => {
     const still = show(summary(), { asset: imageAsset(), anim: { status: 'tooLarge' } });
     expect(screen.queryByTestId('anim')).toBeNull();
     expect(still.container.querySelector('img')).not.toBeNull();
+  });
+
+  it('アニメの画像は、帯を待つ間・作れないときも元のファイルを <img> に置かない（先頭のコマのサムネイル）', () => {
+    // <img> に元の GIF・APNG・アニメの WebP を置くと WebKit が自分で回す（prefers-reduced-motion も見ない）
+    const gif = summary({ ext: 'gif', animated: true, frameCount: 8 });
+    const states: AssetData['anim'][] = [
+      { status: 'none' },
+      { status: 'loading' },
+      { status: 'tooLarge' },
+      { status: 'failed' },
+    ];
+    for (const anim of states) {
+      const view = show(gif, { asset: anim.status === 'none' ? null : imageAsset(), anim });
+      expect(view.container.querySelector('img')).toHaveAttribute(
+        'src',
+        thumbUrl(gif.hash, 'l', 0),
+      );
+      view.unmount();
+    }
+    // 一覧の概要が古くても、素材の欄でアニメと分かれば止める
+    const stale = show(summary({ ext: 'gif' }), {
+      asset: imageAsset(),
+      anim: { status: 'loading' },
+    });
+    expect(stale.container.querySelector('img')).toHaveAttribute('src', thumbUrl(gif.hash, 'l', 0));
+    stale.unmount();
+    // 動かない画像は今までどおり元のファイル
+    const png = summary({ ext: 'png' });
+    const still = show(png, {
+      asset: imageAsset({ effective: { pixelArt: false, animated: false, frameCount: 1 } }),
+    });
+    expect(still.container.querySelector('img')).toHaveAttribute('src', fileUrl(png.hash));
   });
 
   it('音声は波形（ループの区間つき）を出す', () => {

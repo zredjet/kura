@@ -5,6 +5,7 @@ import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
 import { CloseIcon } from '../../components/icons/CloseIcon';
 import { KindArt } from '../../components/KindArt/KindArt';
 import { MediaImage } from '../../components/MediaImage/MediaImage';
+import { stillOriginal } from '../../components/MediaImage/still';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry } from '../../ipc/items';
 import { isPlayable } from '../../ipc/kinds';
@@ -91,13 +92,14 @@ export function QuickLook() {
           <QuickLookAnim key={`${anim.hash}:${anim.rev}`} asset={asset} anim={anim} />
         )}
         {item?.kind === 'image' && !anim && (
-          // 元のファイル（ブラウザで表示できない形式は大きいサムネイル）。透過は市松模様、ドット絵は整数倍
+          // 元のファイル（ブラウザで表示できない形式は大きいサムネイル）。透過は市松模様、ドット絵は整数倍。
+          // アニメは帯を待つ間・作れないときも先頭のコマ（WebKit が <img> で回さないように大きいサムネイル）
           <MediaImage
             key={item.id}
             source={item}
             size="l"
             fit="contain"
-            original={fileUrl(item.hash)}
+            original={stillOriginal(item, fileUrl(item.hash), asset?.effective.animated)}
             className={styles.media}
           />
         )}

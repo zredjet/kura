@@ -209,6 +209,30 @@ describe('AnimPlayer（canvas のアニメのプレビュー）', () => {
     });
   });
 
+  it('箱に収まらないドット絵は縮めて補間する（最近傍は広げるときだけ。細い線が消えないように）', async () => {
+    const c = fakeClock();
+    const r = recorder();
+    const big = { ...ANIM, canvasW: 512, canvasH: 512 };
+    const { container } = player({
+      clock: c.clock,
+      draw: r.draw,
+      pixelArt: true,
+      source: stripSource(big),
+    });
+    await waitFor(() => expect(c.pending()).toBe(1));
+    act(() => c.advance(0));
+    const canvas = container.querySelector('canvas');
+    // 272 × 220 の箱に 512px を 220px へ縮める
+    expect(canvas).toHaveAttribute('width', '220');
+    expect(canvas).toHaveAttribute('data-render', 'auto');
+    expect(r.last()?.smoothing).toBe(true);
+    expect(displaySize(512, 512, 272, 220, 2, true)).toEqual({
+      width: 220,
+      height: 220,
+      smoothing: true,
+    });
+  });
+
   describe('市松模様（MediaImage と同じ checkerFor を通す）', () => {
     /** 測った大きさを知らせる ResizeObserver（jsdom にはないので差し替える）。 */
     let observed: ResizeObserverCallback[] = [];

@@ -15,6 +15,8 @@ import {
 interface FakeSource extends SourceLike {
   started: [number, number | undefined] | null;
   stopped: boolean;
+  /** stop に渡した時刻（すぐ止めたら undefined）。 */
+  stoppedAt: number | undefined;
 }
 
 interface FakeContext extends ContextLike {
@@ -55,13 +57,15 @@ function fakeFactory(log: string[] = [], honor = true) {
           onended: null,
           started: null,
           stopped: false,
+          stoppedAt: undefined,
           connect: () => undefined,
           disconnect: () => undefined,
           start(when: number, offset?: number) {
             s.started = [when, offset];
           },
-          stop() {
+          stop(when?: number) {
             s.stopped = true;
+            s.stoppedAt = when;
           },
         };
         for (const key of ['loopStart', 'loopEnd']) {
@@ -375,9 +379,9 @@ describe('ループの試聴', () => {
 
 // 長さ（フレーム）は DB にないので、/pcm の応答（同じ読み取り）で知ってから計画する（素材の欄・L のキー）
 describe('長さを知らないで始める試聴', () => {
-  function probing(truth: Parameters<typeof fakeSource>[0]) {
+  function probing(truth: Parameters<typeof fakeSource>[0], honor = true) {
     const log: string[] = [];
-    const factory = fakeFactory(log);
+    const factory = fakeFactory(log, honor);
     const src = fakeSource(truth);
     const scheduled: { hash: string; mode: string; rate: number; frames: number[] }[] = [];
     const audition = new Audition({
@@ -429,6 +433,16 @@ describe('長さを知らないで始める試聴', () => {
       'unsupported',
     );
     expect(ch.scheduled).toEqual([]);
+  });
+
+  it('元のレートの文脈を作れない環境では試聴しない（取りもしない。装置のレートでは補間になるので）', async () => {
+    const { audition, log, scheduled } = probing(
+      { rate: R, channels: 2, total: R * 20, loop: [R, R * 11] },
+      false,
+    );
+    expect((await audition.startProbed('h', { rate: R, channels: 2 })).status).toBe('unsupported');
+    expect(log).toEqual([`create:${R}`]);
+    expect(scheduled).toEqual([]);
   });
 
   it('鳴っている位置を元のファイルのフレームで返す（止めたら null）', async () => {
@@ -567,6 +581,8 @@ describe('効果音の即再生', () => {
     const [g0] = ctx?.gains ?? [];
     expect(g0?.ramps).toEqual([[0, (ctx?.currentTime ?? 0) + 0.01]]);
     expect(ctx?.sources[0]?.stopped).toBe(true);
+    // 下げ終わる時刻に止める（すぐ止めるとプツッと鳴る）
+    expect(ctx?.sources[0]?.stoppedAt).toBe((ctx?.currentTime ?? 0) + 0.01);
     expect(ctx?.sources[1]?.stopped).toBe(false);
   });
 

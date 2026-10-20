@@ -96,7 +96,8 @@ pub struct AssetAudioFactsDto {
 #[derive(Debug, Clone, PartialEq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetFactsDto {
-    /// 解析できたか（false なら `errorCode`：`unsupported`・`too_large`・`decode`）。
+    /// 解析できたか（false なら `errorCode`：`unsupported`・`too_large`・`decode`・`crashed`。一覧は bindings の
+    /// 定数 `ANALYSIS_ERROR_CODES`）。
     pub ok: bool,
     pub error_code: Option<String>,
     /// 読んだデコーダ（形式だけで決めたときは null）。

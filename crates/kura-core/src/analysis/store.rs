@@ -31,6 +31,21 @@ pub const INFLIGHT_KEY: &str = "analysis.inflight";
 /// 投影の作り直しの印（計画の指紋の投影の版・ドット絵の規則が変わった）を置く settings のキー。
 pub const REPROJECT_KEY: &str = "analysis.reproject";
 
+/// 解析の失敗の理由（事実の行の `error_code`。[`Write::Failed`]）。フロントは bindings の定数 `ANALYSIS_ERROR_CODES`
+/// （[`error_code::ALL`]）を読み、理由ごとの文言と照らす。理由を足したら `ALL` にも足す。
+pub mod error_code {
+    /// 読めない形式・コーデックがない。
+    pub const UNSUPPORTED: &str = "unsupported";
+    /// 大きすぎる（見積もりが 1 件の上限を超える・エンジンの上限）。
+    pub const TOO_LARGE: &str = "too_large";
+    /// 中身を読めない（壊れている・食い違う）。
+    pub const DECODE: &str = "decode";
+    /// OS のデコーダで読んでいる途中で落ちた（次に動いたときに処理中の印で見つける）。
+    pub const CRASHED: &str = "crashed";
+    /// すべての理由（この順で bindings に出す）。
+    pub const ALL: [&str; 4] = [UNSUPPORTED, TOO_LARGE, DECODE, CRASHED];
+}
+
 /// 解析を待つアイテム。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {

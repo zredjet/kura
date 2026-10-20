@@ -563,11 +563,12 @@ export const ja = {
     none: '—',
     analyzing: '解析しています…',
     analysisFailed: (reason: string) => `解析できませんでした（${reason}）`,
-    /** media_facts.error_code ごとの理由。 */
+    /** media_facts.error_code ごとの理由（bindings の ANALYSIS_ERROR_CODES と 1 つずつ。describe.test.ts が照らす）。 */
     failureReasons: {
       unsupported: 'この形式は読めません',
       too_large: '大きすぎます',
       decode: '中身を読めません',
+      crashed: '読んでいる途中でアプリが終了しました',
     } as Record<string, string>,
     failureUnknown: '理由が分かりません',
     retryAnalysis: 'もう一度解析する',
@@ -635,6 +636,10 @@ export const ja = {
     auditionUnsupported: 'この音声は試聴できません',
     auditionBusy: '混んでいます。もう一度押してください',
     auditionFailed: (message: string) => `試聴できませんでした：${message}`,
+    /** 試聴の PCM（/pcm）を取れなかった理由（HTTP の番号は出さない）。404・416・ほか。 */
+    auditionMissing: 'ファイルが見つかりません',
+    auditionRange: 'この範囲は試聴できません',
+    auditionUnreadable: '音声を読めませんでした',
     // フォント
     family: '書体名',
     style: 'スタイル',

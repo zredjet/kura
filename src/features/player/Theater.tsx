@@ -9,6 +9,7 @@ import { ShrinkIcon } from '../../components/icons/ShrinkIcon';
 import { TagIcon } from '../../components/icons/TagIcon';
 import { Waveform } from '../../components/icons/Waveform';
 import { MediaImage } from '../../components/MediaImage/MediaImage';
+import { stillOriginal } from '../../components/MediaImage/still';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { playUrl } from '../../ipc/media';
@@ -292,15 +293,16 @@ function Stage() {
 
 /**
  * 画像（ブラウザで表示できない形式は大きいサムネイルにする）。透過と分かったものは市松模様、ドット絵は整数倍
- * （design.md §3.1。アニメはシアターでは先頭のコマのまま）。
+ * （design.md §3.1）。アニメはシアターでは先頭のコマのまま（元のファイルを `<img>` に置くと WebKit が回すので、
+ * 大きいサムネイルを出す。`stillOriginal`）。
  */
-function ImageLayer({ item }: { item: ItemSummaryDto }) {
+export function ImageLayer({ item }: { item: ItemSummaryDto }) {
   return (
     <MediaImage
       source={item}
       size="l"
       fit="contain"
-      original={playUrl(item.hash)}
+      original={stillOriginal(item, playUrl(item.hash))}
       className={styles.image}
     />
   );

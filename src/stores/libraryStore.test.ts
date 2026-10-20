@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { onLibraryUpgrade, openLibrary, restoreLibrary } from '../ipc/library';
+import {
+  createLibrary,
+  libraryInfo,
+  onLibraryUpgrade,
+  openLibrary,
+  restoreLibrary,
+} from '../ipc/library';
 import { IpcError } from '../ipc/result';
 import { useLibraryStore } from './libraryStore';
 import { receiveUpgrade, useUpgradeStore } from './upgradeStore';
@@ -31,6 +37,8 @@ beforeEach(() => {
   });
   vi.mocked(restoreLibrary).mockReset();
   vi.mocked(openLibrary).mockReset();
+  vi.mocked(createLibrary).mockReset();
+  vi.mocked(libraryInfo).mockReset();
 });
 
 describe('起動のときに前回のライブラリを開く', () => {
@@ -112,5 +120,115 @@ describe('ライブラリを開く', () => {
     vi.mocked(openLibrary).mockResolvedValueOnce(info);
     await useLibraryStore.getState().open(info.path);
     expect(useLibraryStore.getState()).toMatchObject({ status: 'open', restoreError: null });
+  });
+
+  /** 開く IPC の中で「新しい版にし始めた」が届き、表示が出たことにする。 */
+  const startUpgrade = () => {
+    receiveUpgrade({
+      phase: 'started',
+      path: '/new.kuralib',
+      fromVersion: 6,
+      toVersion: 9,
+      dbBytes: 1,
+      elapsedMs: null,
+      error: null,
+    });
+    useUpgradeStore.setState({ visible: true });
+  };
+
+  it('開き終えたら・開けなくても「更新しています」を残さない（finished・failed の知らせが欠けても）', async () => {
+    useLibraryStore.setState({ status: 'none' });
+    vi.mocked(openLibrary).mockImplementationOnce(async () => {
+      startUpgrade();
+      return info;
+    });
+    await useLibraryStore.getState().open(info.path);
+    expect(useUpgradeStore.getState()).toMatchObject({ running: null, visible: false });
+
+    useLibraryStore.setState({ status: 'none' });
+    vi.mocked(openLibrary).mockImplementationOnce(async () => {
+      startUpgrade();
+      throw new IpcError({ code: 'UpgradeFailed', message: '戻しました' });
+    });
+    await expect(useLibraryStore.getState().open('/new.kuralib')).rejects.toMatchObject({
+      code: 'UpgradeFailed',
+    });
+    expect(useUpgradeStore.getState()).toMatchObject({ running: null, visible: false });
+  });
+
+  it('起動のときより先に開いても（ほかの道から）、更新の知らせを受け取り始めてから開く', async () => {
+    // 受け取りの登録は一度だけ（upgradeStore の watching）なので、まだ登録していないモジュールで確かめる
+    vi.resetModules();
+    const fresh = await import('./libraryStore');
+    const ipc = await import('../ipc/library');
+    order.length = 0;
+    vi.mocked(ipc.openLibrary).mockImplementationOnce(async () => {
+      order.push('open');
+      return info;
+    });
+    await fresh.useLibraryStore.getState().open(info.path);
+    expect(order).toEqual(['listen', 'open']);
+  });
+});
+
+// Rust は前のライブラリを閉じてから開く（src-tauri の AppState::replace_session）。開けなければ、どのライブラリも開いていない
+describe('開いているライブラリから別のライブラリを開く・作るのに失敗した', () => {
+  const list = { ids: Uint32Array.from([1]), aspects: new Uint16Array(1), groups: [] };
+  const closed = new IpcError({ code: 'NotFound', message: 'ライブラリが開かれていません' });
+
+  it('前のライブラリも閉じていれば、初回の画面に戻って理由と場所を出す（開くとき）', async () => {
+    useLibraryStore.setState({ status: 'open', info, list });
+    vi.mocked(openLibrary).mockRejectedValueOnce(
+      new IpcError({ code: 'LibraryTooNew', message: '新しい版の Kura で作られたライブラリです' }),
+    );
+    vi.mocked(libraryInfo).mockRejectedValueOnce(closed);
+    await expect(useLibraryStore.getState().open('/B.kuralib')).rejects.toMatchObject({
+      code: 'LibraryTooNew',
+    });
+    expect(useLibraryStore.getState()).toMatchObject({
+      status: 'none',
+      info: null,
+      list: null,
+      missingPath: null,
+      restoreError: {
+        path: '/B.kuralib',
+        error: { code: 'LibraryTooNew', message: '新しい版の Kura で作られたライブラリです' },
+      },
+    });
+  });
+
+  it('作るときも同じ', async () => {
+    useLibraryStore.setState({ status: 'open', info, list });
+    vi.mocked(createLibrary).mockRejectedValueOnce(
+      new IpcError({ code: 'Io', message: '書き込めません' }),
+    );
+    vi.mocked(libraryInfo).mockRejectedValueOnce(closed);
+    await expect(useLibraryStore.getState().create('/C.kuralib')).rejects.toMatchObject({
+      code: 'Io',
+    });
+    expect(useLibraryStore.getState()).toMatchObject({
+      status: 'none',
+      restoreError: { path: '/C.kuralib', error: { code: 'Io' } },
+    });
+  });
+
+  it('前のライブラリがまだ開いていれば（閉じる前に失敗した）、そのまま', async () => {
+    useLibraryStore.setState({ status: 'open', info, list });
+    vi.mocked(openLibrary).mockRejectedValueOnce(new Error('切れた'));
+    vi.mocked(libraryInfo).mockResolvedValueOnce(info);
+    await expect(useLibraryStore.getState().open('/B.kuralib')).rejects.toThrow('切れた');
+    expect(useLibraryStore.getState()).toMatchObject({ status: 'open', info, restoreError: null });
+  });
+
+  it('初回の画面から開けなかったときは画面が自分で理由を出す（状態を変えない・確かめない）', async () => {
+    useLibraryStore.setState({ status: 'none', info: null });
+    vi.mocked(openLibrary).mockRejectedValueOnce(
+      new IpcError({ code: 'NoSpace', message: '空きが足りません' }),
+    );
+    await expect(useLibraryStore.getState().open('/B.kuralib')).rejects.toMatchObject({
+      code: 'NoSpace',
+    });
+    expect(useLibraryStore.getState()).toMatchObject({ status: 'none', restoreError: null });
+    expect(libraryInfo).not.toHaveBeenCalled();
   });
 });
