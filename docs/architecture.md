@@ -94,6 +94,7 @@
 | | `reveal_path(path)` | Finder で見せる（書き出したもの・バックアップ・ライブラリ） |
 | タグ | `tags_list()` → `TagListEntry[]` | すべてのタグと、付いているアイテムの数（ゴミ箱を除く）・そのうち自動で付いた数（`item_tags.source` が download / capture）・ユニットの数・絞り込みの条件。名前空間なしを後ろに、名前空間ごとに付いている数の多い順（ADR-126） |
 | 設定 | `library_usage()` → `{ libraryBytes, volumeTotalBytes?, volumeAvailableBytes? }` / `library_check()` → `Integrity` | ライブラリのファイルの合計（ゴミ箱を含む）とボリュームの容量・空き、整合性チェックをいま行う（M9） |
+| | `library_cache_usage()` → `{ thumbsBytes, thumbsFiles, peaksBytes, peaksFiles, animBytes, animFiles }` | 中身から作ったキャッシュの大きさ：サムネイル（`thumbs/` と `art/`）・波形（`peaks/`）・アニメの帯（`anim/`）。ファイルを数えるので設定の画面を開いたときだけ呼ぶ（ゴミ箱の分を含む。M11 の決定 4。§7） |
 | | `download_archives()` → `ArchiveStatus[]` / `download_archive_clear(tool)` | 取得済みの記録の件数と、消す（`archives/` のツールごとの 1 ファイル。M9） |
 | ダウンロード | `download_detect(url)` → `{ url, site, siteLabel, tool, rule?, playlist, toolFound, capture?, previous? }` | URL の取得方法（規則 → サイトの表 → yt-dlp の汎用）。`previous` は前に同じものをダウンロードしたとき（ジョブ・題名・日時・入れた数・今ライブラリにある数。ADR-132）。§9 |
 | | `download_defaults()` / `download_enqueue(url, options, redownload)` → JobId | 前回の選択（ライブラリの settings）と、取得を積む（選んだ内容を次回の既定にする）。`options` は画質（best / 1080 / 720 / 480）・音声のみ・保存先のフォルダ・自動タグ（投稿者・サイトのタグ）・再生リストをユニットに。`redownload` は取得済みの記録にあるものも取り直す（ADR-132） |
@@ -269,23 +270,40 @@ import_start:    ジョブとして実行
   - 取り込み中に落ちた場合、配置済みで DB に入る前のファイルは「DB にないファイル」として残るが、再開した取り込みがそのまま使う（内容アドレスなので置き直しは不要）。
 - 動作確認：`cargo run -p kura-devtools -- import --library <path> [--create] <src>...` でコマンドラインから取り込める（強制終了の試験用。`check --library <path>` で件数と食い違いを表示）。
 
-## 7. サムネイルとメディア情報（kura-mac）
+## 7. サムネイルとメディア情報（kura-mac・kura-engine）
 
-- Swift ヘルパー（`crates/kura-mac/swift`、Swift 5 の言語モード）が C 互換関数を公開し、Rust から `extern "C"` で呼ぶ（swift-rs はビルド時のリンクにだけ使う）。戻り値は 0 成功（サムネイルは JPEG を書いた）・1 扱えない形式・2 失敗・3 ジャケットなし・4 PNG を書いた：
-  - `kura_image_thumbnails(path, out_l_stem, out_s_stem, 1600, 512, keep_alpha)`：ImageIO の `CGImageSourceCreateThumbnailAtIndex`（HEIC・RAW・AVIF も扱える。向きを反映）。書き先は拡張子のない stem で、書いた形式の拡張子を足す。`keep_alpha` が 0 でなく、元がアルファを持ち（`kCGImagePropertyHasAlpha` かアルファの列）、sRGB の premultipliedLast に描き直した長辺 1600 に透明な画素（α < 255）が 1 つでもあれば PNG を書いて 4 を返す（M11 の決定 3・4。`kura_mac::image_thumbnails_keep_alpha`）。そうでなければ JPEG（品質 0.82）で 0。今の `MediaBackend` の道は `keep_alpha = 0`（M11 の段 3 でサムネイルの形式を持つ口に替える）
-  - `kura_font_thumbnails(path, samples, out_l_stem, out_s_stem, 1600, 512)`（M11）：CoreText。先頭のバイトで ttf・otf・ttc・woff・woff2 だけを読む。見本の字は `samples`（改行で区切った候補「永あAa」「Aa」）のうち書体がすべての字を持つもの（なければ字の番号 1 から形のある字を 4 つ）。正方形の透明の地に、形の範囲が幅の 80%・高さの 70% に収まる大きさで真ん中に、字の形だけのアルファ（グレーとアルファ、字は黒）で描いた PNG を書いて 4 を返す。色は表示の側が CSS の mask-image で付ける（`kura_mac::font_thumbnails`）
-  - `kura_video_thumbnails(path, at_sec, out_l, out_s, 1600, 512)`：AVFoundation の `AVAssetImageGenerator`（長さの 10% 地点。長さが分からなければ 1 秒）
-  - `kura_audio_artwork(path, out_art, out_l, out_s, 1600, 512)`：AVAsset のメタデータからジャケット（元の画像を `art/`、縮小を `thumbs/` に）
-  - `kura_probe(path, kind)` → JSON（`kura_free_string` で解放）：幅・高さ・長さ・撮影日時・コーデック・アーティスト・アルバム・曲名。`kind` は 0 画像・1 動画・2 音楽・3 フォント（M11。`{"codec": 形式, "font": {"family","style","fullName","postscriptName","glyphs","faces","variable"}}`。`kura_mac::probe_font`）。知らない種類は NULL
+- Swift ヘルパー（`crates/kura-mac/swift`、Swift 5 の言語モード）が C 互換関数を公開し、Rust から `extern "C"` で呼ぶ（swift-rs はビルド時のリンクにだけ使う）。書き先はどれも拡張子のない stem（`thumbs/ab/<hash>_l`・`_s`。kura-core の `media::ThumbTargets`）で、書いた形式の拡張子を足す（M11）。戻り値は 0 成功（サムネイルは JPEG を書いた）・1 扱えない形式・2 失敗・3 ジャケットなし・4 PNG を書いた：
+  - `kura_image_thumbnails(path, out_l_stem, out_s_stem, 1600, 512, keep_alpha)`：ImageIO の `CGImageSourceCreateThumbnailAtIndex`（HEIC・RAW・AVIF も扱える。向きを反映）。`keep_alpha` が 0 でなく、元がアルファを持ち（`kCGImagePropertyHasAlpha` かアルファの列）、sRGB の premultipliedLast に描き直した長辺 1600 に透明な画素（α < 255）が 1 つでもあれば PNG を書いて 4 を返す（M11 の決定 3・4）。そうでなければ JPEG（品質 0.82）で 0。`MediaBackend::image_thumbnails`（`MacBackend`）はいつも `keep_alpha = 1`（`kura_mac::image_thumbnails_keep_alpha` と同じ）
+  - `kura_font_thumbnails(path, samples, out_l_stem, out_s_stem, 1600, 512)`（M11）：CoreText。先頭のバイトで ttf・otf・ttc・woff・woff2 だけを読む。見本の字は `samples`（改行で区切った候補「永あAa」「Aa」）のうち書体がすべての字を持つもの（なければ字の番号 1 から形のある字を 4 つ）。正方形の透明の地に、形の範囲が幅の 80%・高さの 70% に収まる大きさで真ん中に、字の形だけのアルファ（グレーとアルファ、字は黒）で描いた PNG を書いて 4 を返す。色は表示の側が CSS の mask-image で付ける（`MediaBackend::font_thumbnails`・`kura_mac::font_thumbnails`）
+  - `kura_video_thumbnails(path, at_sec, out_l_stem, out_s_stem, 1600, 512)`：AVFoundation の `AVAssetImageGenerator`（長さの 10% 地点。長さが分からなければ 1 秒）。いつも JPEG
+  - `kura_audio_artwork(path, out_art, out_l_stem, out_s_stem, 1600, 512)`：AVAsset のメタデータからジャケット（元の画像を `art/`、縮小を `thumbs/` に。いつも JPEG）
+  - `kura_probe(path, kind)` → JSON（`kura_free_string` で解放）：幅・高さ・長さ・撮影日時・コーデック・アーティスト・アルバム・曲名。`kind` は 0 画像・1 動画・2 音楽・3 フォント（M11。`{"codec": 形式, "font": {"family","style","fullName","postscriptName","glyphs","faces","variable"}}`。`MacBackend::probe(Font)`・`kura_mac::probe_font`）。知らない種類は NULL
   - `kura_reduce_transparency()` → bool
-- 3D モデル（glb）の情報とサムネイルは kura-mac ではなく kura-engine の `model`（自前の読み手とソフトウェアの描画。M11 の決定 9。docs/editing.md §9.10）。
+- `MediaBackend`（kura-core の trait。M11 の形）：`probe`・`image_thumbnails`（書いた形式 `ThumbFormat` を返す）・`video_thumbnails`（JPEG）・`audio_artwork`（`Option<ThumbFormat>`。ジャケットがなければ None）・`font_thumbnails`（PNG）。新しいメソッドには既定の実装を置かない（`ChainBackend`・`RoutedBackend`・`NoBackend`・`FfmpegBackend`・`MacBackend`・テストの偽物のすべてに書く。転送の書き忘れをコンパイルで見つける）。ffmpeg の道はいつも JPEG で、フォントは扱えない。
+- メディア情報（`media::MediaInfo`）はフォントの `font`（書体名・スタイル・字の数・書体の数・可変か）と 3D の `model`（頂点・三角形・メッシュ・材質・テクスチャ・アニメ・スキン・ノードの数、大きさ（範囲の max − min）、作った道具、必須の拡張、描けない理由 `unsupported`）を持ち、`items.codec_info` の JSON の `font`・`model` に入れる（M11 の既定。フォント・3D の幅・高さは空）。フォントは取り込みの probe（CoreText）で、3D はサムネイルのジョブが kura-engine の glb の読み手で、見出しと JSON の塊だけを読んで数える（BIN は読まない）。
+- 3D モデル（glb）の情報とサムネイルは kura-mac ではなく kura-engine の `model`（自前の読み手とソフトウェアの描画。SceneKit を使わない。M11 の決定 9。docs/editing.md §9.10）。描けないもの（必須の Draco・meshopt・知らない拡張・スキン）は情報だけ入れて `failed`（種類の絵）。
 - SVG の文字を描くフォント（M11 の決定 12）：`kura_mac::pinned_options()` が、`/System/Library/Fonts` と `Supplemental` の ttf・otf・ttc を読み取り専用のボリュームなら mmap してエンジンの `SvgFonts` に渡す（文字を含む SVG を初めて読むときに作る。プロセスで 1 つを共通に使う。370 ファイル・787 書体で物理フットプリント +2.6 MiB）。`codec_set`・`full_codec_set` にはこれを渡す。unsafe は `src/fonts.rs` の写像の中だけ。
 - 編集の Platform の段のコーデック（段 9。ADR-153）は、上の C 文字列の関数とは別の口（`swift/Sources/KuraMacC/include/kura_mac_ffi.h`、ABI の版 1）で呼ぶ：不透明なハンドルと 2 段の呼び出し（Swift が開いて形を返す → Rust が上限を確かめて確保 → Swift がそこへ書く）、状態の番号 0〜6（OK・扱えない・失敗・中止・誤った呼び出し・食い違い・上限。kura-engine の `codec::platform` と同じ値）、Rust が渡す文言のバッファ、中止のコールバック。Platform のコーデックの unsafe は `src/bridge.rs` だけ。詳しくは docs/editing.md §9.8。
 - Swift のランタイムは OS のもの（`/usr/lib/swift`）を使う。リンクする実行ファイル（kura-mac のテスト、src-tauri、kura-devtools）の build.rs で rpath を足す。
 - 形式ごとの試す順（`kura_mac::media_backend()`）：flac・ogg・opus・mkv・webm・avi は ffmpeg / ffprobe を先に、それ以外は macOS を先に。前の実装が「扱えない形式」と答えたときだけ次を試す（ADR-32）。
 - ffmpeg / ffprobe は `/opt/homebrew/bin` → `/usr/local/bin` → PATH の順で探す（`kura_core::tools`。設定での上書きは M8）。外部プロセスは時間制限付きで動かす。
-- サムネイルのジョブ：`thumb_state = 'pending'` を新しい順に 64 件ずつ取り出し（`idx_items_thumb_pending`）、CPU コア数の並列で作って 1 トランザクションで書く。M1 で取り込んだものは、ここで probe して幅・高さなどの空欄を埋める。ジャケットのない音楽は `failed`（グリッドでは音楽の絵を出す。ADR-34）。
-- 目標：画像サムネイル 50 枚/秒以上（NFR-04）。実測は §13。
+- サムネイルのジョブ（`media::ThumbnailHandler`）：`thumb_state = 'pending'` を新しい順に 64 件ずつ取り出し（`idx_items_thumb_pending`）、なくなったら `'stale'`（作り方が変わったので、今の絵を出したまま作り直すもの。`idx_items_thumb_stale`）を取り出す。M1 で取り込んだものは、ここで probe して幅・高さなどの空欄（と 0。ImageIO は SVG を 0×0 と読む）を埋める。ジャケットのない音楽は `failed`（グリッドでは音楽の絵を出す。ADR-34）。
+  - **道の割り振り**（M11 の決定 3。純粋な関数 `media::thumb_route`）：
+
+    | 形式 | 道 |
+    |---|---|
+    | png（apng）・gif・webp・aseprite（ase）・psd（psb）・svg | エンジン（`media::engine_thumbs`。kura-engine のコーデックの組で読む） |
+    | jpeg・heic・heif・avif・tiff・bmp（形式の表にない画像も） | ImageIO（アルファを保つ。`MediaBackend::image_thumbnails`） |
+    | ttf・otf・ttc・woff・woff2 | CoreText（`MediaBackend::font_thumbnails`） |
+    | glb | kura-engine の `model`（ソフトウェアの描画。`media::engine_thumbs`） |
+    | 動画・音楽 | 今までの道（AVFoundation・ffmpeg） |
+
+  - **エンジンの道**：ジョブのスレッド（プールの外）で 1 件ずつ形を読んで（`shape_path`、glb は見出しと JSON の塊）見積もり、同時の確保が 256 MiB（M11 の決定 2。予算の全体のほうが小さければそちら）に収まる小分けにして、一括の予算（`Class::Bulk`）から確保してから、実行の場（`EngineServices`）の一括のプール（`kura-edit-bulk-*`）の中でアイテムを並べて描く。サムネイルのプール（`kura-thumb-*`）の中ではエンジンを呼ばない。先頭のフレームをキャンバスに置き（offset の外は透明）、Box で長辺 1600・512 に縮める（拡大しない。ドット絵の拡大は表示の側）。長辺 1600 に透明な画素があれば PNG（`compression: fast`）、なければ JPEG（品質 82。Rgb8 に落として書く）。色の ICC は引き継ぐ（グレーのものは捨てる）。値が 1 GiB を超えるもの・`Limit`・`Unsupported`・読めないもの・予算に収まらないものは ImageIO の道へ回し、理由をジョブのログに残す（aseprite・svg は ImageIO も読めないので `failed`）。glb は描けなければ `failed`。見積もりの小分けは `media::engine_thumbs::{image_estimate, model_estimate}`。エンジンの部品はライブラリを開いただけでは作らず、エンジンの道のアイテムに最初に出会ったときに作る。
+  - **書き方**：OS の道はサムネイルのプールで CPU コア数の並列。結果は 1 トランザクションで書き、書いたら `thumb_rev` を +1（URL の `?r=`）。UPDATE は `WHERE id = ? AND hash = ?`（読んだあとに中身が変わっていたら書かない）。書いたら別の形式の古いファイルを消す（`ThumbTargets::remove_others`）。`stale` を作り直せなかったときは、前の絵のまま `ready` に戻す（`thumb_rev` は変えない）。`kura://…/thumb/{hash}/{s,l}` は png、jpg の順に探す（§4）。
+  - **作り方の指紋**（settings の `'thumbs.plan'`。`media::route::sync_plan`）：形式の表の行ごとの作り方の名前（`engine-thumbs/1`・`imageio-alpha/1`・`imageio/1`（jpeg）・`coretext/1`・`model-kura-render/1`・`video/1`・`audio/1`）。ライブラリを開くとき（ジョブを動かす前に）前回と比べ、変わった形式の `ready` を `stale` に、`failed` を `pending` に戻す。指紋のないライブラリ（M10 まで）は「画像はすべて ImageIO の JPEG、フォント・3D は作らない」と比べる（png・gif・webp・aseprite・psd・svg・heic・heif・avif・tiff・bmp とフォント・3D が作り直しになり、jpeg・動画・音楽は変わらない）。指紋が変わったときだけの全件の走査（10 万件の seed で png・heic の 46,860 件を stale にして 70ms）。
+  - **作っている途中の印**（critic 8。`media::inflight`）：OS のデコーダ（ImageIO・CoreText・AVFoundation）とエンジンの Platform の段はアプリのプロセスの中で動くので、壊れたファイルでプロセスごと落ちうる。作る前に作っているアイテムを settings の `'thumbs.inflight'`（`{solo, ids}`）に書き、結果と同じトランザクションで消す。開くときに残っていれば、まとめての印（64 件）は疑わしいもの（`'thumbs.suspects'`）にして 1 件ずつ・1 件だけの印で作り直し、1 件だけの印のアイテムは `failed`（`stale` は前の絵のまま `ready`）にして先へ進む（同じファイルで落ちるのは多くても 2 回）。開く道は `media::prepare_on_open`（印の片付け → 指紋 → pending・stale があればジョブを積む）。
+  - **キャッシュの容量**（M11 の決定 4 で ADR-122 を広げる）：`library_cache_usage`（§3）がサムネイル（`thumbs/` と `art/`）・波形（`peaks/`）・アニメ（`anim/`）のファイルを別々に数える（`media::usage`。1 段目のフォルダを最大 8 本のスレッドで。10 万件の seed のサムネイル 21 万個で 251〜328ms（温まった状態））。
+- 目標：画像サムネイル 50 枚/秒以上（NFR-04）。実測は §13。M11 の実測（`bench thumbs-job`。M4 Max・ロードアベレージ 7〜9）：PNG の多い組（`assets --bench 24`：2048² のアルファ付き PNG・3000×2000 の不透明な PNG・JPEG を 24 枚ずつ、64² のスプライト 96 枚）で 105 枚/秒・ピーク 282 MB。大きな PNG だけ（48 枚）では 31 枚/秒・187 MB（同時の確保 512 MiB なら 46 枚/秒・363 MB）で、エンジンを使わない（M10 の ImageIO の道）と 194 枚/秒・606 MB。大きな PNG の多いライブラリでは NFR-04 を下回る（M11 の決定 2 で判定の範囲として requirements.md に書く）。
 
 ## 8. 再生とプロキシ
 
@@ -299,7 +317,7 @@ import_start:    ジョブとして実行
 ### 8.1 実装（M5）
 
 - **再生可否の表**：フロント（`src/features/player/support.ts`）が「入れ物（mp4・webm・ogg・mp3・flac・wav・aiff・aac）× ffprobe のコーデック名」ごとに `canPlayType` を調べ、空でなければ再生できるとする。表はアプリのメモリに持ち、ライブラリを開くたびに渡す。表の指紋を `settings` の `playback.support` に記録し、変わっていれば `not_needed` / `pending` / `failed` の動画・音楽を `unknown` に戻す（ADR-61）。
-- **判定**（`kura_core::playback::support::plan`、純粋関数）：入れ物は拡張子で決める（mov・m4v・m4a は mp4、opus は ogg、mkv・avi などは「その他」）。元の入れ物で映像・音声とも再生できれば `not_needed`。そうでなければ `pending` で、プロキシ（mp4）では mp4 で再生できるストリームはコピー、できないストリームだけ変換する（ADR-63）。映像も音声もなければ `failed`。画像はプロキシを作らない（取り込み時に `not_needed`、ADR-65）。
+- **判定**（`kura_core::playback::support::plan`、純粋関数）：入れ物は拡張子で決める（mov・m4v・m4a は mp4、opus は ogg、mkv・avi などは「その他」）。元の入れ物で映像・音声とも再生できれば `not_needed`。そうでなければ `pending` で、プロキシ（mp4）では mp4 で再生できるストリームはコピー、できないストリームだけ変換する（ADR-63）。映像も音声もなければ `failed`。動画・音楽（`video`・`audio`）以外の種類（画像・フォント・3D）はプロキシを作らない（取り込み時に `not_needed`、ADR-65。M11 で種類を足したので「画像は」から広げた。プロキシの SQL は `+kind IN ('video','audio')`、表の制約 `items_proxy_av`）。
 - **プロキシのジョブ**（`kind = 'proxy'`、同時に 1 つ）：取り込みのあとに積む。`unknown` を新しい順に 16 件ずつ ffprobe（4 並列）で判定し、`pending` を 1 件ずつ作る。再生キューの今と次 3 件（`proxy_request`）を先に処理する。一時ファイル（`.mp4.part`）に書いてから置き換え、一時停止・中止・アプリの終了では ffmpeg を止める（`pending` のまま残り、次回に続きから）。ffmpeg の進み具合が 2 分止まったら失敗にする。ffmpeg がなければ何もしない（`unknown` のまま、元のファイルで再生を試す）。
 - **ffmpeg の引数**：`-map 0:<映像> -map 0:<音声>`（ジャケット・字幕・データは落とす）、コピーは `-c copy`（HEVC は `-tag:v hvc1`）、映像の変換は `h264_videotoolbox -b:v 5M/10M/30M（720p/1080p/それ以上）-pix_fmt yuv420p -allow_sw 1`、音声の変換は `aac -b:a 256k`、`-movflags +faststart -f mp4`。
 - **再生できなかったとき**：`not_needed` / `unknown` のものが再生エラーになったら `proxy_request(force)` で `pending` に戻し、判定が「不要」でもすべて変換する。プロキシでもだめなら「外部プレイヤーで開く」「もう一度変換する」を出す（ADR-64）。
