@@ -3,11 +3,13 @@ import { useEffect } from 'react';
 import { openMenuBelow } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry, unitIdOf } from '../../ipc/items';
+import { getCached } from '../../stores/itemCache';
 import { useImportStore } from '../../stores/importStore';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { LAYOUT_MODES, useViewStore } from '../../stores/viewStore';
+import { toggleAuditionKey } from '../asset/auditionStore';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
 import {
@@ -183,6 +185,11 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
       view.select(null);
     }
     return true;
+  }
+  if (key === 'l') {
+    // ループを試聴（もう一度で止める。選んでいなくても、試聴していれば止める。M11）
+    const item = focus !== null && !isUnitEntry(focus) ? getCached(focus) : undefined;
+    return toggleAuditionKey(item ? item.id : null, item?.kind);
   }
   if (entries.length === 0 || kind === 'trash') {
     return false;

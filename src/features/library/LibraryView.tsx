@@ -10,6 +10,7 @@ import { useLibraryStore } from '../../stores/libraryStore';
 import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
+import { useSfxOnSelect } from '../asset/useSfxOnSelect';
 import { ImportProgress } from '../import/ImportProgress';
 import { MiniPlayer, useMiniPlayerVisible } from '../player/MiniPlayer';
 import { pickAndImport } from '../import/useFileDrop';
@@ -82,6 +83,7 @@ export function LibraryView() {
   const setLayout = useViewStore((s) => s.setLayout);
   useItemCacheVersion((s) => s.version);
   useLibraryKeys();
+  useSfxOnSelect();
 
   useEffect(() => {
     void useLibraryStore.getState().loadList();

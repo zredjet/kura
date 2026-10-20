@@ -87,6 +87,7 @@ export function SettingsSheet() {
 /** 一般：画像の表示時間・ユニットをまとめて表示。 */
 function GeneralTab() {
   const imageMs = usePlayerStore((s) => s.prefs.imageDurationMs);
+  const sfxAudition = usePlayerStore((s) => s.prefs.sfxAudition);
   const collapseUnits = useViewStore((s) => s.collapseUnits);
   const toggleCollapseUnits = useViewStore((s) => s.toggleCollapseUnits);
   const seconds = Math.round(imageMs / 1000);
@@ -116,6 +117,17 @@ function GeneralTab() {
           checked={collapseUnits}
           aria-label={ja.library.collapseUnits}
           onChange={toggleCollapseUnits}
+        />
+      </div>
+      <div className={styles.row}>
+        <span className={styles.label}>
+          {ja.asset.sfx}
+          <span className={styles.hint}>{ja.asset.sfxHint}</span>
+        </span>
+        <Switch
+          checked={sfxAudition}
+          aria-label={ja.asset.sfx}
+          onChange={(on) => updatePlayerPrefs({ sfxAudition: on })}
         />
       </div>
     </>

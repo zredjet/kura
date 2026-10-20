@@ -86,6 +86,14 @@ describe('appMenuItems', () => {
     expect(tag.accelerator).toBeUndefined();
   });
 
+  it('項目の「ループを試聴（L）」は L を押したことにする（M11）', () => {
+    const run = vi.fn();
+    const audition = entry(submenu(ja.appMenu.items, run), `${ja.asset.menuAudition}（L）`);
+    expect(audition.accelerator).toBeUndefined();
+    audition.action?.('');
+    expect(run).toHaveBeenCalledWith({ kind: 'key', spec: { key: 'l', code: 'KeyL' } });
+  });
+
   it('表示形式は ⌘1〜⌘3 のチェック項目で、いまの形式にチェックが付く', () => {
     const view = viewItemOptions(() => {}, { ...STATE, layout: 'grid' }, 'test');
     expect(view.layouts.justify).toMatchObject({ accelerator: 'CmdOrCtrl+1', checked: false });

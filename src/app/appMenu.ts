@@ -199,6 +199,7 @@ export function appMenuItems(run: RunMenuAction, view: ViewItems): MenuItems {
       items: [
         keyItem(run, t.play, { key: 'Enter', code: 'Enter', ...META }),
         keyItem(run, t.quickLook, { key: ' ', code: 'Space' }, 'Space'),
+        keyItem(run, ja.asset.menuAudition, { key: 'l', code: 'KeyL' }, 'L'),
         { item: 'Separator' },
         keyItem(run, t.group, { key: 'g', code: 'KeyG', ...META }),
         keyItem(run, t.ungroup, { key: 'g', code: 'KeyG', meta: true, shift: true }),
