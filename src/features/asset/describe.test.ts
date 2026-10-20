@@ -1,13 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import { ja } from '../../i18n/ja';
-import type { AnimDto } from '../../ipc/asset';
+import { ANALYSIS_ERROR_CODES, type AnimDto } from '../../ipc/asset';
 import {
   alphaText,
   animText,
   audioFormatText,
   clockText,
   colorsText,
+  failureText,
   fontFormatText,
   gridText,
   khz,
@@ -142,5 +143,16 @@ describe('素材の欄の値', () => {
       '未対応：Draco 圧縮・スキン',
     );
     expect(unsupportedText(['EXT_foo'])).toBe('未対応：EXT_foo');
+  });
+
+  it('解析の失敗の理由：Rust の一覧（ANALYSIS_ERROR_CODES）のどれにも文言があり、一覧にないものはない', () => {
+    expect(ANALYSIS_ERROR_CODES).toContain('crashed');
+    expect(Object.keys(t.failureReasons).sort()).toEqual([...ANALYSIS_ERROR_CODES].sort());
+    for (const code of ANALYSIS_ERROR_CODES) {
+      expect(failureText(code)).not.toBe(t.failureUnknown);
+    }
+    expect(failureText('crashed')).toBe('読んでいる途中でアプリが終了しました');
+    expect(failureText('somethingNew')).toBe(t.failureUnknown);
+    expect(failureText(null)).toBe(t.failureUnknown);
   });
 });

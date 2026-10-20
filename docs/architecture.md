@@ -117,7 +117,7 @@
 
 変更（patch）の型は、省いた項目を変えない。色・メモの空文字は「消す」の意味（`Option<Option<T>>` を JSON で表しにくいため）。
 
-bindings.ts には、コマンドとイベントのほかに Rust の表を定数で出す（`Builder::constant`。M11）：`ITEM_KINDS`（種類の順・キューに入るか・プロキシ・長さ。フロントは `src/ipc/kinds.ts` だけが読む）、`QUERY_FIELD_NAMES`（検索のフィールドの名前）・`QUERY_KIND_WORDS`（種類の語）・`QUERY_SYMBOLS`（半角と同じに扱う記号）（docs/search-query.md §3）。
+bindings.ts には、コマンドとイベントのほかに Rust の表を定数で出す（`Builder::constant`。M11）：`ITEM_KINDS`（種類の順・キューに入るか・プロキシ・長さ。フロントは `src/ipc/kinds.ts` だけが読む）、`QUERY_FIELD_NAMES`（検索のフィールドの名前）・`QUERY_KIND_WORDS`（種類の語）・`QUERY_SYMBOLS`（半角と同じに扱う記号）（docs/search-query.md §3）、`ANALYSIS_ERROR_CODES`（解析の失敗の理由。`AssetFactsDto.errorCode` の値で、フロントは `src/ipc/asset.ts` から読み、理由ごとの文言と照らす）。
 
 コマンドの追加は `.claude/skills/add-command` の手順で行い、この表に追記します。
 

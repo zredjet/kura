@@ -563,11 +563,12 @@ export const ja = {
     none: '—',
     analyzing: '解析しています…',
     analysisFailed: (reason: string) => `解析できませんでした（${reason}）`,
-    /** media_facts.error_code ごとの理由。 */
+    /** media_facts.error_code ごとの理由（bindings の ANALYSIS_ERROR_CODES と 1 つずつ。describe.test.ts が照らす）。 */
     failureReasons: {
       unsupported: 'この形式は読めません',
       too_large: '大きすぎます',
       decode: '中身を読めません',
+      crashed: '読んでいる途中でアプリが終了しました',
     } as Record<string, string>,
     failureUnknown: '理由が分かりません',
     retryAnalysis: 'もう一度解析する',

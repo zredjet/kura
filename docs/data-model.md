@@ -406,7 +406,7 @@ CREATE TABLE settings (
 CREATE TABLE media_facts (
   blob_id          INTEGER PRIMARY KEY REFERENCES blobs(id) ON DELETE CASCADE,
   state            TEXT    NOT NULL CONSTRAINT media_facts_state CHECK (state IN ('ok','failed')),
-  error_code       TEXT,                   -- failed：'unsupported'・'too_large'・'decode'・'crashed'（OS のデコーダで読んでいる途中で終わった）
+  error_code       TEXT,                   -- failed：'unsupported'・'too_large'・'decode'・'crashed'（OS のデコーダで読んでいる途中で終わった）。一覧は analysis::store::error_code::ALL（bindings の ANALYSIS_ERROR_CODES）
   decoder          TEXT,                   -- 読んだデコーダの識別子。形式だけで決めたとき（JPEG・HEIC・HEIF）は NULL
   reproducible     INTEGER,                -- 0/1
   value_digest     BLOB,                   -- 読んだ値のダイジェスト（32 バイト）

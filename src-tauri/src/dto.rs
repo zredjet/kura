@@ -1073,6 +1073,15 @@ pub fn query_symbols() -> Vec<QuerySymbolDto> {
         .collect()
 }
 
+/// 解析の失敗の理由（bindings の定数 `ANALYSIS_ERROR_CODES`。`AssetFactsDto.errorCode` の値。
+/// `kura_core::analysis::store::error_code::ALL` の順）。フロントは理由ごとの文言（`ja.asset.failureReasons`）と照らす。
+pub fn analysis_error_codes() -> Vec<String> {
+    kura_core::analysis::store::error_code::ALL
+        .iter()
+        .map(|code| (*code).to_string())
+        .collect()
+}
+
 /// 候補の種類。
 #[derive(Debug, Clone, Copy, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -1679,6 +1688,15 @@ mod tests {
             assert_eq!(serde_json::to_value(dto).unwrap(), kind.as_str());
             assert_eq!(MediaKind::from(dto), kind);
         }
+    }
+
+    /// 解析の失敗の理由（`ANALYSIS_ERROR_CODES`）は kura-core の一覧をそのまま出す（`crashed` を含む）。
+    #[test]
+    fn analysis_error_codes_follow_the_core_list() {
+        assert_eq!(
+            analysis_error_codes(),
+            ["unsupported", "too_large", "decode", "crashed"]
+        );
     }
 
     /// 検索の表（`QUERY_FIELD_NAMES`・`QUERY_KIND_WORDS`・`QUERY_SYMBOLS`）は kura-core の表をそのまま出す。

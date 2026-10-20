@@ -183,6 +183,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .constant("QUERY_KIND_WORDS", dto::query_kind_words())
         .typ::<dto::QuerySymbolDto>()
         .constant("QUERY_SYMBOLS", dto::query_symbols())
+        // 解析の失敗の理由（`AssetFactsDto.errorCode`）。フロントの describe.test.ts が理由ごとの文言と照らす
+        .constant("ANALYSIS_ERROR_CODES", dto::analysis_error_codes())
         // ID・ミリ秒・バイト数は 2^53 を超えないので number として扱う
         .dangerously_cast_bigints_to_number()
 }
