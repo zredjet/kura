@@ -612,7 +612,7 @@ impl Compiler<'_> {
                     "f.frame_count <= 1".to_string()
                 }
             }),
-            FieldCond::Colors { op, value } => Some(fact_compare("f.colors", *op, *value, out)),
+            FieldCond::Colors { op, value } => Some(colors_compare(*op, *value, out)),
             FieldCond::Rate { op, value } => Some(fact_compare("f.sample_rate", *op, *value, out)),
             FieldCond::Bits { op, value } => Some(fact_compare("f.bits", *op, *value, out)),
             FieldCond::Ch { op, value } => Some(fact_compare("f.channels", *op, *value, out)),
@@ -702,6 +702,26 @@ fn facts_in(cond: &str) -> String {
 fn fact_compare(column: &str, op: Op, value: i64, out: &mut SqlCond) -> String {
     let mark = push(out, value);
     format!("{column} IS NOT NULL AND {column} {} {mark}", sql_op(op))
+}
+
+/// 色数の事実の打ち切り（`image.colors` の `COLOR_CAP`。この値の行は「256 より多い」で、数は計っていない）。
+const COLOR_CAP: i64 = kura_engine::analysis::image::colors::COLOR_CAP as i64;
+
+/// 色数の比較。打ち切った行（257 = 256 より多い）は数として比べず、256 より多いどの数でも結果が同じになる比較（`>`・`!=` は
+/// 256 以下の値と、`>=` は 257 以下の値と）だけに入れる。ほかの比較・一致には、計れない値と同じに入れない
+/// （docs/search-query.md §4。`色数<1000` に数万色の写真を入れず、`色数:257` を「ちょうど 257 色」と読まない）。
+fn colors_compare(op: Op, value: i64, out: &mut SqlCond) -> String {
+    let cmp = fact_compare("f.colors", op, value, out);
+    let decided = match op {
+        Op::Gt | Op::Ne => value < COLOR_CAP,
+        Op::Ge => value <= COLOR_CAP,
+        Op::Has | Op::Eq | Op::Lt | Op::Le => false,
+    };
+    if decided {
+        cmp
+    } else {
+        format!("{cmp} AND f.colors < {COLOR_CAP}")
+    }
 }
 
 /// 1/1000 の整数で持つ値（ラウドネス・ピーク）を、REAL の列と比べる。

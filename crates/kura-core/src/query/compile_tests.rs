@@ -622,6 +622,46 @@ fn image_facts_match_only_known_values() {
     }
 }
 
+/// 色数の事実は 257 で打ち切る（257 は「256 より多い」で、数は計っていない）。256 を超える値との比較は、256 より多いどの数でも
+/// 結果が同じになるもの（`>`・`!=` は 256 以下の値、`>=` は 257 以下の値）だけに 257 の行を入れ、ほかは計れない値と同じに
+/// どれにも入れない（除外は含む。search-query.md §3・§4。Q2）。
+#[test]
+fn colors_above_the_cap_match_only_comparisons_they_decide() {
+    let conn = asset_library();
+    // 数万色の写真の PNG（色数は打ち切りの 257）
+    conn.execute_batch(&format!(
+        "INSERT INTO items (id, hash, ext, kind, size_bytes, width, height, title, original_name,
+                            imported_at, updated_at, analysis_state)
+         VALUES (51, x'{hash}', 'png', 'image', 1, 3000, 2000, 'photo', 'photo', 1, 1, 'ready');
+         INSERT INTO media_facts (blob_id, state, facts_v, {FACT_COLUMNS}, analyzed_at)
+           SELECT id, 'ok', 1, 0, 257, 0, 1, NULL, NULL, NULL, NULL, NULL, NULL, 0 FROM blobs WHERE hash = x'{hash}';",
+        hash = "33".repeat(32)
+    ))
+    .unwrap();
+    let cases: &[(&str, &[i64])] = &[
+        // 結果が決まる比較
+        ("色数>256", &[51]),
+        ("色数>=257", &[51]),
+        ("色数>16", &[13, 51]),
+        ("色数!=16", &[13, 14, 51]),
+        ("色数>=200", &[13, 51]),
+        // 256 より多い値との比較・一致は、257 の行では決まらないので入れない（12 の JPEG は計っていない）
+        ("色数<1000", &[11, 13, 14]),
+        ("色数<=257", &[11, 13, 14]),
+        ("色数<=256", &[11, 13, 14]),
+        ("色数:257", &[]),
+        ("色数=300", &[]),
+        ("色数!=300", &[11, 13, 14]),
+        ("色数>=300", &[]),
+        ("色数>1000", &[]),
+        // 除外は補集合なので、決まらない行も含む
+        ("種類:画像 -色数<1000", &[12, 15, 16, 17, 51]),
+    ];
+    for (query, expected) in cases {
+        assert_eq!(ids(&conn, query), *expected, "{query}");
+    }
+}
+
 #[test]
 fn audio_facts_match_only_known_values() {
     let conn = asset_library();
@@ -878,6 +918,8 @@ fn fact_conditions_are_list_subqueries_not_correlated() {
         ("透過:あり", Some("idx_media_facts_alpha")),
         ("透過!=あり", Some("idx_media_facts_alpha")),
         ("色数<=16", Some("idx_media_facts_colors")),
+        ("色数<1000", Some("idx_media_facts_colors")),
+        ("色数>256", Some("idx_media_facts_colors")),
         ("ラウドネス>-14", Some("idx_media_facts_loudness")),
         ("ループ:あり", Some("idx_media_facts_loop")),
         ("ドット絵:あり", Some("idx_media_facts_pixel_art")),
