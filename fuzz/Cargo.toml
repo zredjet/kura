@@ -74,6 +74,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "decode_svg_text"
+path = "fuzz_targets/decode_svg_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "decode_wav"
 path = "fuzz_targets/decode_wav.rs"
 test = false

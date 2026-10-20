@@ -24,6 +24,7 @@ use resvg::tiny_skia;
 use resvg::usvg;
 
 use crate::codec::fonts::SvgFonts;
+use crate::codec::svg_text;
 use crate::codec::{Decoder, ReadSeek, Tier, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -817,14 +818,15 @@ impl Css {
     }
 }
 
-/// 要素の数（`<use>` の参照先と、marker の頂点ごとの複製を足したもの）・参照を展開した入れ子の高さ・参照の輪を見積もる。
-/// 文字の要素があるかも返す。木を再帰でたどらない（深い文書で自分のスタックを使い切らないように）。
+/// 要素の数（`<use>` の参照先と、marker の頂点ごとの複製を足したもの）・参照を展開した入れ子の高さ・参照の輪・文字の
+/// レイアウトの手間（`svg_text`）を見積もる。文字の要素があるかも返す。木を再帰でたどらない（深い文書で自分のスタックを
+/// 使い切らないように）。
 ///
 /// 辺は、子要素・`<use>` の参照先（数にも入れる）・ほかの href・`url(#…)` で参照する中身を持つ要素
 /// （pattern・marker・clipPath・mask・filter）。中身を持つ要素は、祖先の受け継がれる性質（fill・stroke・marker）の参照も辺にする
 /// （中身がその参照を受け継いで、自分を描き直し続けるため。usvg はこの輪を見つけられずにスタックを使い切る）。
 /// CSS の規則の参照は、当たる要素の属性と同じに扱う。
-fn check_elements(text: &str) -> Result<bool, EngineError> {
+fn check_elements(text: &str) -> Result<Facts, EngineError> {
     let opt = usvg::roxmltree::ParsingOptions {
         allow_dtd: true,
         nodes_limit: MAX_ELEMENTS as u32,
@@ -838,6 +840,17 @@ fn check_elements(text: &str) -> Result<bool, EngineError> {
 }
 
 type SvgNode<'a, 'i> = usvg::roxmltree::Node<'a, 'i>;
+
+/// usvg に渡す前に XML の木から分かったこと。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Facts {
+    /// 文字の要素（text・tspan・textPath）があるか。
+    has_text: bool,
+    /// 文字のレイアウトの手間の見積もり（`<use>` の展開・参照ごとの複製・marker の複製を掛けたもの。フォントを選ぶ分は除く）。
+    text_work: u64,
+    /// いちばん重い文字の塊を 1 度形にし直す手間（代わりのフォントが見つかったとき）。
+    reshape: u64,
+}
 
 /// href の値の参照先の id（前後の空白を除き、`#` のあと最初の空白まで。usvg が使う svgtypes の IRI と同じ読み方）。
 fn href_id(v: &str) -> Option<&str> {
@@ -1055,7 +1068,7 @@ impl<'a, 'i> Index<'a, 'i> {
     }
 }
 
-fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<bool, EngineError> {
+fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
     let mut index = Index {
         by_id: std::collections::BTreeMap::new(),
         css: Css::default(),
@@ -1066,6 +1079,8 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<bool, EngineError> {
     };
     let mut has_text = false;
     let mut css_markers = false;
+    // `<style>` に transform が書かれているか（どの要素の拡大にもなりうる。textPath の見積もり）
+    let mut css_transform = false;
     let mut count = 0usize;
     let mut elements = 0u64;
     // CSS の手間の見積もりに使う：要素名・クラスごとの数、文書の深さ・兄弟の最大数、style 属性の宣言の手間
@@ -1112,6 +1127,9 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<bool, EngineError> {
                 if let Some(t) = n.text() {
                     if t.contains("marker") {
                         css_markers = true;
+                    }
+                    if t.contains("transform") {
+                        css_transform = true;
                     }
                     index.css.add(t)?;
                 }
@@ -1225,8 +1243,45 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<bool, EngineError> {
             ));
         }
     }
-    // 帰りがけの順に、要素の数（use の展開と参照ごとの複製を含む）・複製で作る要素の数・高さ（参照の展開を含む）を求める。
-    // 輪は断る
+    // marker の中の textPath は断る（頂点ごとに複製され、拡大は線の太さで決まる）
+    let marker_text_path = doc
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "marker")
+        .any(|m| {
+            m.descendants()
+                .any(|d| d.is_element() && d.tag_name().name() == "textPath")
+        });
+    if marker_text_path {
+        return Err(EngineError::Unsupported(
+            "marker の中に textPath を含む SVG は読めません".into(),
+        ));
+    }
+    // `<text>` ごとの文字のレイアウトの手間（svg_text）。textPath の参照先は、同じ id の図形の区間の数のいちばん多いもの
+    let segments = |tp: &SvgNode<'_, '_>| -> u64 {
+        tp.attributes()
+            .filter(|a| a.name() == "href")
+            .filter_map(|a| href_id(a.value()))
+            .flat_map(|id| index.targets(id))
+            .map(|t| svg_text::path_segments(&t))
+            .max()
+            .unwrap_or(0)
+    };
+    let mut own_text = vec![0u64; count];
+    let mut reshape = 0u64;
+    for t in doc
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "text")
+    {
+        let c = svg_text::text_cost(&t, &segments);
+        if let Some(slot) = own_text.get_mut(t.id().get() as usize) {
+            *slot = c.work;
+        }
+        reshape = reshape.max(c.reshape);
+    }
+    // 帰りがけの順に、要素の数（use の展開と参照ごとの複製を含む）・複製で作る要素の数・高さ（参照の展開を含む）・文字の
+    // レイアウトの手間（同じ）・textPath に至る変形の拡大の上限（参照の先のいちばん大きいもの × 自分の拡大）を求める。輪は断る
+    let mut text_work = vec![0u64; count];
+    let mut path_scale = vec![0f64; count];
     let mut state = vec![0u8; count];
     let mut size = vec![0u64; count];
     let mut clones = vec![0u64; count];
@@ -1256,20 +1311,38 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<bool, EngineError> {
         }
         let i = at(n);
         let (mut total, mut h, mut cloned) = (1u64, 0usize, 0u64);
+        let mut tw = own_text[i];
+        let mut ps = if n.tag_name().name() == "textPath" {
+            1.0
+        } else {
+            0.0
+        };
         for (s, kind) in succ.iter() {
             if *kind >= EDGE_COUNT {
                 total = total.saturating_add(size[at(s)]);
                 cloned = cloned.saturating_add(clones[at(s)]);
+                tw = tw.saturating_add(text_work[at(s)]);
             }
             if *kind == EDGE_CLONE {
                 cloned = cloned.saturating_add(size[at(s)]);
             }
             h = h.max(height[at(s)]);
+            // 共有の参照（EDGE_LINK）の先も、参照する要素の拡大を受けるとみなす（多めに取る）
+            ps = crate::math::max(ps, path_scale[at(s)]);
         }
         size[i] = total;
         clones[i] = cloned;
         height[i] = h + 1;
+        text_work[i] = tw;
+        path_scale[i] = if ps > 0.0 {
+            ps * svg_text::own_scale(n, *n == root, css_transform)
+        } else {
+            0.0
+        };
         state[i] = 2;
+        if tw > svg_text::MAX_TEXT_WORK {
+            return Err(text_limit());
+        }
         if total > MAX_ELEMENTS {
             return Err(EngineError::Limit(
                 "use・参照を展開すると要素が多すぎます".into(),
@@ -1288,39 +1361,78 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<bool, EngineError> {
         stack.pop();
     }
     let mut total = size[at(&root)];
-    // marker の複製：頂点の数 × marker の中身の大きさ（CSS で付くものは、いちばん大きい marker とみなす）
-    let largest = doc
+    let mut total_text = text_work[at(&root)];
+    if path_scale[at(&root)] > svg_text::MAX_TEXT_PATH_SCALE {
+        return Err(EngineError::Limit(
+            "textPath を大きく拡大する SVG は読めません".into(),
+        ));
+    }
+    // marker の複製：頂点の数 × marker の中身の大きさ（CSS で付くものは、いちばん大きい marker とみなす）。文字の手間も同じ
+    let markers: Vec<SvgNode<'_, '_>> = doc
         .descendants()
         .filter(|n| n.is_element() && n.tag_name().name() == "marker")
-        .map(|m| size[at(&m)])
-        .max()
-        .unwrap_or(0);
+        .collect();
+    let largest = markers.iter().map(|m| size[at(m)]).max().unwrap_or(0);
+    let largest_text = markers.iter().map(|m| text_work[at(m)]).max().unwrap_or(0);
     for n in doc.descendants().filter(|n| n.is_element() && shapes(n)) {
-        let per_vertex: u64 = if css_markers {
-            largest
+        let (per_vertex, per_vertex_text): (u64, u64) = if css_markers {
+            (largest, largest_text)
         } else {
             marker_refs(&n)
                 .iter()
                 .flat_map(|id| index.targets(id))
-                .map(|m| size[at(&m)])
-                .fold(0u64, u64::saturating_add)
+                .map(|m| (size[at(&m)], text_work[at(&m)]))
+                .fold((0u64, 0u64), |(a, b), (x, y)| {
+                    (a.saturating_add(x), b.saturating_add(y))
+                })
         };
-        total = total.saturating_add(vertices(&n).saturating_mul(per_vertex));
+        let v = vertices(&n);
+        total = total.saturating_add(v.saturating_mul(per_vertex));
+        total_text = total_text.saturating_add(v.saturating_mul(per_vertex_text));
         if total > MAX_ELEMENTS {
             return Err(EngineError::Limit(
                 "marker を展開すると要素が多すぎます".into(),
             ));
         }
+        if total_text > svg_text::MAX_TEXT_WORK {
+            return Err(text_limit());
+        }
     }
-    Ok(has_text)
+    Ok(Facts {
+        has_text,
+        text_work: total_text,
+        reshape,
+    })
+}
+
+/// 文字のレイアウトの手間が上限を超えるときのエラー。
+fn text_limit() -> EngineError {
+    EngineError::Limit("文字が多すぎる（並べる手間が大きすぎる）SVG は読めません".into())
 }
 
 impl SvgCodec {
     fn tree(&self, text: &str) -> Result<usvg::Tree, EngineError> {
+        self.tree_within(text, svg_text::MAX_TEXT_WORK)
+    }
+
+    /// 文字のレイアウトの手間を `max_text_work` までにして木を作る（テストは小さな上限で、フォントを選ぶ分の見張りを確かめる）。
+    fn tree_within(&self, text: &str, max_text_work: u64) -> Result<usvg::Tree, EngineError> {
         check_entities(text)?;
         check_depth(text)?;
-        let has_text = check_elements(text)?;
-        let fontdb = self.fontdb(has_text)?;
+        let facts = check_elements(text)?;
+        if facts.text_work > max_text_work {
+            return Err(text_limit());
+        }
+        let fontdb = self.fontdb(facts.has_text)?;
+        // フォントを選ぶ・代わりを探す手間は書体の数で決まる。残りの手間から引き、尽きたら選ばずに断る（svg_text）
+        let guard = Arc::new(svg_text::TextGuard::new(
+            max_text_work.saturating_sub(facts.text_work),
+        ));
+        let font_resolver = if facts.has_text {
+            svg_text::font_resolver(guard.clone(), fontdb.len() as u64, facts.reshape)
+        } else {
+            usvg::FontResolver::default()
+        };
         // <image> の参照（data でも外部でも）は、この段では描かない。見つけたら印を立てて、読み取りを断る
         let images = Arc::new(AtomicBool::new(false));
         let (a, b) = (images.clone(), images.clone());
@@ -1337,9 +1449,13 @@ impl SvgCodec {
                 }),
             },
             fontdb,
+            font_resolver,
             ..usvg::Options::default()
         };
         let tree = usvg::Tree::from_str(text, &opt).map_err(err)?;
+        if guard.over() {
+            return Err(text_limit());
+        }
         if images.load(Ordering::Relaxed) {
             return Err(EngineError::Unsupported(
                 "画像（埋め込みの SVG・ラスター画像・外部のファイル）を含む SVG は、この段では読めません".into(),
@@ -1800,6 +1916,131 @@ mod tests {
         ));
         assert!(matches!(
             decode_with(&empty, text),
+            Err(EngineError::Unsupported(_))
+        ));
+    }
+
+    fn text_codec() -> SvgCodec {
+        SvgCodec::with_svg_fonts(SvgFonts::new(
+            tiny_fonts(),
+            crate::codec::fonts::GenericFamilies::default(),
+        ))
+    }
+
+    fn text_svg(body: &str) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" font-family="KuraTest" font-size="1">{body}</svg>"#
+        )
+    }
+
+    /// 検証 S1：文字の塊の長さの 2 乗でかかるレイアウト（usvg は中止を見ない）を、usvg に入る前に断る。1 つの長い塊・
+    /// 多くの text・use で増やした text・2 乗にならない形のどれでも、手間の合計で決める。ふつうの量の文字は読む。
+    #[test]
+    fn text_layout_work_is_refused_before_usvg() {
+        let c = text_codec();
+        let limit =
+            |body: &str| matches!(decode_with(&c, &text_svg(body)), Err(EngineError::Limit(_)));
+        // 1 つの塊（'a' で約 5,000 字まで）
+        assert!(limit(&format!(
+            "<text y=\"1\">{}</text>",
+            "A".repeat(6_000)
+        )));
+        // 100 字ずつの text（合わせて約 3.5 万字まで）
+        let line = format!("<text y=\"1\">{}</text>", "AB".repeat(50));
+        assert!(limit(&line.repeat(400)));
+        // defs の text を use で増やす
+        assert!(limit(&format!(
+            r##"<defs><text id="t" y="1">{}</text></defs>{}"##,
+            "A".repeat(1_000),
+            r##"<use href="#t"/>"##.repeat(400)
+        )));
+        // 1 字ずつの tspan（span ごとに塊を形にし直す）
+        assert!(limit(&format!(
+            "<text y=\"1\">{}</text>",
+            "<tspan>A</tspan>".repeat(1_000)
+        )));
+        // ふつうの量：100 字のラベル 200 個、位置を付けた行の長い段落
+        assert!(decode_with(&c, &text_svg(&line.repeat(200))).is_ok());
+        let para = format!(
+            "<text>{}</text>",
+            (0..300)
+                .map(|i| format!(r#"<tspan x="0" y="{i}">{}</tspan>"#, "AB".repeat(40)))
+                .collect::<String>()
+        );
+        assert!(decode_with(&c, &text_svg(&para)).is_ok());
+    }
+
+    /// 検証 S1：フォントを選ぶ・代わりのフォントを探す手間（書体の数で決まる）は、木を作りながら残りの手間から引き、尽きたら
+    /// 選ばずに `Limit` にする。
+    #[test]
+    fn font_selection_is_charged_while_building() {
+        let c = text_codec();
+        let svg = text_svg(&r#"<text y="1">AB</text>"#.repeat(10));
+        let facts = check_elements(&svg).unwrap();
+        assert!(facts.has_text && facts.text_work > 0);
+        assert_eq!(facts.reshape, 2 * 256);
+        assert!(matches!(
+            c.tree_within(&svg, facts.text_work),
+            Err(EngineError::Limit(_))
+        ));
+        assert!(c.tree_within(&svg, facts.text_work + 1_000_000).is_ok());
+        // 'C' は書体にない字：代わりを探す分（書体の数 × 160 ＋ 塊の字の数 × 256）も数える
+        let missing = text_svg(r#"<text y="1">ACCC</text>"#);
+        let facts = check_elements(&missing).unwrap();
+        assert!(matches!(
+            c.tree_within(&missing, facts.text_work + 9_000),
+            Err(EngineError::Limit(_))
+        ));
+        assert!(c.tree_within(&missing, facts.text_work + 20_000).is_ok());
+        // 同じ字・同じフォントで代わりを探すのは 1 度だけ数える（10 個の text：フォントを選ぶ 10 回 × 8,196 ＋ 代わりを
+        // 探す 1 回 1,184。覚えなければ 10 回で 93,800）
+        let ten = text_svg(&r#"<text y="1">ACCC</text>"#.repeat(10));
+        let facts = check_elements(&ten).unwrap();
+        assert!(c.tree_within(&ten, facts.text_work + 83_200).is_ok());
+        assert!(matches!(
+            c.tree_within(&ten, facts.text_work + 83_100),
+            Err(EngineError::Limit(_))
+        ));
+    }
+
+    /// 検証 S1：textPath は字ごとに path をたどり、拡大が大きいと弧長を求める精度が上がって止まらなくなる（10²¹ で区間
+    /// 1 つに 94 ms、曲線 4 つで 5 分を超えた）。区間の数 × 字の数を数え、textPath に至る変形の拡大の上限で断る。
+    #[test]
+    fn text_paths_are_bounded() {
+        let c = text_codec();
+        let tp = |scale: &str, d: &str, n: usize| {
+            text_svg(&format!(
+                r##"<defs><path id="p" d="{d}"/></defs><g transform="{scale}"><text><textPath href="#p">{}</textPath></text></g>"##,
+                "A".repeat(n)
+            ))
+        };
+        let curve = "M0 0 C1 2 3 4 5 6";
+        assert!(decode_with(&c, &tp("scale(2)", curve, 10)).is_ok());
+        // 1 つずつは 10⁹ までの数でも、重ねると 10¹⁸
+        assert!(matches!(
+            decode_with(&c, &tp("scale(1e9) scale(1e9)", curve, 10)),
+            Err(EngineError::Limit(_))
+        ));
+        // use と入れ子の svg の viewBox でも重なる
+        let nested = text_svg(&format!(
+            r##"<defs><path id="p" d="{curve}"/><g id="g" transform="scale(1e9)"><svg viewBox="0 0 0.001 0.001"><text><textPath href="#p">AB</textPath></text></svg></g></defs><use href="#g"/>"##
+        ));
+        assert!(matches!(
+            decode_with(&c, &nested),
+            Err(EngineError::Limit(_))
+        ));
+        // 区間の多い path に沿う長い文字
+        let d = format!("M0 0{}", " L1 1".repeat(20_000));
+        assert!(matches!(
+            decode_with(&c, &tp("", &d, 5_000)),
+            Err(EngineError::Limit(_))
+        ));
+        // marker の中の textPath は読まない
+        let marker = text_svg(&format!(
+            r##"<defs><path id="p" d="{curve}"/><marker id="m"><text><textPath href="#p">A</textPath></text></marker></defs><path d="M0 0 L1 1" marker-end="url(#m)"/>"##
+        ));
+        assert!(matches!(
+            decode_with(&c, &marker),
             Err(EngineError::Unsupported(_))
         ));
     }

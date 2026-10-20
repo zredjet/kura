@@ -237,6 +237,57 @@ pub fn fuzz_decode(format: &str, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// ファズとテストの SVG の文字のフォント：字の少ない小さなフォント 2 つ（`KuraTest` は A・B・C・あ、`KuraFallback` は D・E・ب。
+/// 書体にない字は代わりのフォントを探す）。集まりはプロセスで 1 度だけ作る。
+pub fn fuzz_svg_fonts() -> crate::codec::SvgFonts {
+    static FONTS: std::sync::OnceLock<crate::codec::SvgFonts> = std::sync::OnceLock::new();
+    FONTS
+        .get_or_init(|| {
+            let font = |name: &str, family: &str, chars: &[char]| crate::codec::FontSource {
+                name: name.into(),
+                data: std::sync::Arc::new(crate::testfiles::tiny_ttf(family, chars)),
+            };
+            crate::codec::SvgFonts::new(
+                vec![
+                    font("a.ttf", "KuraTest", &['A', 'B', 'C', 'あ']),
+                    font("b.ttf", "KuraFallback", &['D', 'E', 'ب']),
+                ],
+                crate::codec::GenericFamilies::default(),
+            )
+        })
+        .clone()
+}
+
+/// ファズの対象（`fuzz/` の `decode_svg_text` と `tests/fuzz_smoke.rs` の `svg_text`）：文字を含む SVG を、小さなフォント 2 つ
+/// （[`fuzz_svg_fonts`]）を渡した SVG のデコーダで、上限を絞って形と中身を読む。`fuzz_decode` の svg はフォントを渡さないので、
+/// 文字のレイアウト・代わりのフォント・レイアウトの手間の見積もり（M11 の検証 S1）の道を通らない。見つけたい不具合（自前の
+/// コードの panic・形と中身の食い違い・`Internal`）は `Err`、壊れたファイルとしてのエラーと第三者のクレートの panic は `Ok`。
+pub fn fuzz_svg_text(data: &[u8]) -> Result<(), String> {
+    use crate::codec::Decoder;
+    use std::io::Cursor;
+    let limits = fuzz_limits();
+    let d = crate::codec::svg::SvgCodec::with_svg_fonts(fuzz_svg_fonts());
+    let opts = crate::doc::DecodeOptions::default();
+    let r = catch_own_panic(|| {
+        let s = d.shape(&mut Cursor::new(data), "svg", &opts, &limits)?;
+        limits.check(&s).map_err(EngineError::Limit)?;
+        let v = d.decode(&mut Cursor::new(data), "svg", &opts, &limits, &NoMonitor)?;
+        if !s.admits(&v.shape()) {
+            return Err(EngineError::Internal(format!(
+                "{}: 形と中身が違う（{s:?} と {:?}）",
+                d.id(),
+                v.shape()
+            )));
+        }
+        v.digest().map(|_| ())
+    });
+    match r {
+        Err(at) => Err(format!("{}: 自前のコードの panic（{at}）", d.id())),
+        Ok(Err(EngineError::Internal(m))) => Err(m),
+        Ok(_) => Ok(()),
+    }
+}
+
 /// ファズの対象（`fuzz/` の `decode_peaks` と `tests/fuzz_smoke.rs` の `peaks`）：波形の段のバイナリ（`kura-peaks`。
 /// kura-core がキャッシュから読み直すときのパーサー）を読む。読めたなら正規の形（書き直すと同じバイト列）であること。
 /// 見つけたい不具合（自前のコードの panic・往復しない・`Internal`）は `Err`、壊れたバイト列としてのエラーは `Ok`。

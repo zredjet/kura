@@ -29,6 +29,7 @@ pub mod png;
 pub mod psd;
 pub mod recorded;
 pub mod svg;
+pub(crate) mod svg_text;
 pub(crate) mod symph;
 pub mod vorbis;
 pub mod wav;

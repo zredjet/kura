@@ -1,7 +1,8 @@
 //! stable で回す、変異によるファズ（docs/editing.md §13）。`fuzz/`（cargo-fuzz、nightly）と同じ対象
-//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_peaks`・`fuzz_model`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
+//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
 //! カバレッジは見ない。対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、
-//! 文書は `document`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、3D モデル（glb）は `model_glb`。
+//! 文書は `document`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、3D モデル（glb）は `model_glb`、
+//! フォントを渡した SVG の文字は `svg_text`（`fuzz/` では `decode_svg_text`）。
 //!
 //! - ふだんの `cargo test` では、対象ごとに決めた回数だけ回す（`quick`）。
 //! - `KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test fuzz_smoke -- --ignored` で、対象ごとに決めた秒数だけ回す。
@@ -25,7 +26,7 @@ use kura_engine::testfiles::{ApngFrame, AseCel, AseFrame, AseLayer, FileGen, Gif
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::{
     FuzzEncodeMeta, fuzz_decode, fuzz_document, fuzz_encode, fuzz_encode_input,
-    fuzz_encode_input_meta, fuzz_model, fuzz_peaks,
+    fuzz_encode_input_meta, fuzz_model, fuzz_peaks, fuzz_svg_text,
 };
 use kura_engine::value::{LoopRange, PixelFormat};
 use kura_engine::{NoMonitor, Value};
@@ -521,6 +522,15 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><style>.a{fill:#123456;opacity:.5}</style><filter id="f"><feGaussianBlur stdDeviation="1"/></filter><mask id="k"><rect width="10" height="5" fill="#fff"/></mask><path class="a" d="M1 1h8v8H1zM3 3l4 4m0-4q-2 3-4 0c1-1 2 2 3 0a2 2 0 1 1 1 1z" mask="url(#k)" filter="url(#f)"/><text x="1" y="9">x</text></svg>"##.to_vec(),
             ],
         ),
+        // M11 の検証 S1：フォントを渡した SVG の文字（塊・位置・span・代わりのフォント・use・textPath・textLength・拡大）
+        (
+            "svg_text",
+            vec![
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12" font-family="KuraTest" font-size="6"><text x="0 2 4" y="6">ABCあ<tspan x="1" y="10" font-weight="bold">DEب</tspan>AB</text></svg>"##.as_bytes().to_vec(),
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 12 12" font-family="KuraTest, KuraFallback" font-size="2"><defs><path id="p" d="M1 6 C3 1 9 1 11 6"/><text id="t" y="2" textLength="8">ABAB</text></defs><text><textPath href="#p" startOffset="10%">ABCD<tspan dy="1">E</tspan></textPath></text><use href="#t" transform="scale(2) rotate(10)"/><use href="#t" x="1"/></svg>"##.as_bytes().to_vec(),
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><style>text{font-family:KuraFallback;letter-spacing:1px} .r{direction:rtl}</style><g transform="matrix(1 0 0.5 1 0 0)"><text class="r" y="8" xml:space="preserve">  DE ب A  <tspan y="12">C</tspan></text></g><svg viewBox="0 0 4 4" width="8" height="8"><text y="3" font-size="3">A</text></svg></svg>"##.as_bytes().to_vec(),
+            ],
+        ),
         (
             "wav",
             vec![
@@ -741,6 +751,8 @@ fn run(target: &str, input: &[u8]) -> Result<(), String> {
         fuzz_peaks(input)
     } else if target == "model_glb" {
         fuzz_model(input)
+    } else if target == "svg_text" {
+        fuzz_svg_text(input)
     } else if let Some(format) = target.strip_prefix("encode_") {
         fuzz_encode(format, input)
     } else {
