@@ -15,6 +15,7 @@ paths:
   - `pcmUrl(hash, start, end)`：`/pcm/{hash}/{start}-{end}`（試聴の PCM。フレームの半開区間で、0 以上の整数・`start < end`。キャッシュしない）。`fetch` して `src/lib/asset/wav.ts` の `readPcmWav` で読む（`decodeAudioData` は使わない。文脈のレートに直されてループ点が標本で合わなくなる）。
   - `animUrl(hash)`：`/anim/{hash}/1`（アニメの帯の PNG。immutable。帯の並べ方を変えたら番号を上げる）。
 - ループの試聴は `src/lib/assetAudio.ts` の `Audition` を通す。`AudioBufferSourceNode` の `loopStart`・`loopEnd` を使わない（秒に直すと標本がずれる。本体だけのバッファを `loop` で回す）。文脈は `ContextPool` から元のレートで取る。
+  - 画面からは `src/features/asset/auditionStore.ts`（始める・止める・L のキー。プレーヤーを一時停止する）を通し、文脈の持ち主は `src/features/asset/audioRuntime.ts`（試聴と効果音で分け合い、ライブラリの画面を離れるときに閉じる）。長さ（フレーム）は DB にないので `Audition.startProbed`（/pcm の先頭の 1 フレームの応答で長さ・ループ点を知る）で始める。
 - 一覧・グリッド・キューは必ず仮想スクロール。1 万件を DOM に並べない。
 - 検索結果は ID 配列（`Int32Array` など）で保持し、詳細は見えている範囲だけ取得してキャッシュする。
 - ドメインデータを `localStorage` に置かない（サイドバーの開閉など見た目の設定だけ可）。
