@@ -81,8 +81,37 @@ export function onAuditionStopped(listener: () => void): void {
   auditionStopped = listener;
 }
 
+/** 最後に鳴らしてから、使っていない文脈を閉じるまでの時間（効果音は 10 秒以下なので鳴り終えている）。 */
+export const IDLE_CLOSE_MS = 15_000;
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * 鳴らしたことを知らせる（試聴を始めた・効果音を鳴らした）。そのあと IDLE_CLOSE_MS のあいだ何も鳴らさず、試聴も
+ * していなければ、文脈をすべて閉じる（使い終えたら閉じる。次に鳴らすときにまた作る）。
+ */
+export function touchAudio(): void {
+  if (idleTimer !== null) {
+    clearTimeout(idleTimer);
+  }
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    if (!runtime) {
+      return;
+    }
+    if (runtime.audition.playing) {
+      touchAudio();
+      return;
+    }
+    runtime.pool.closeAll();
+  }, IDLE_CLOSE_MS);
+}
+
 /** 音を止め、文脈をすべて閉じる（ライブラリの画面を離れるとき）。 */
 export function closeAudio(): void {
+  if (idleTimer !== null) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
   if (!runtime) {
     return;
   }

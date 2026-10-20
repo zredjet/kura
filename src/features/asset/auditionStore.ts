@@ -14,7 +14,7 @@ import { MAX_RATE, MIN_RATE } from '../../lib/asset/wav';
 import { notify } from '../../stores/noticeStore';
 import { playerController } from '../player/playerActions';
 import { usePlayerStore } from '../player/playerStore';
-import { audioRuntime, MediaHttpError, onAuditionStopped } from './audioRuntime';
+import { audioRuntime, MediaHttpError, onAuditionStopped, touchAudio } from './audioRuntime';
 
 const t = ja.asset;
 
@@ -121,6 +121,7 @@ export function startAudition(target: AuditionTarget, fromStart = false): void {
   sfx.stop();
   pausePlayer();
   useAuditionStore.setState({ itemId: target.itemId, status: 'loading', mode: null, fromStart });
+  touchAudio();
   const isCurrent = () => {
     const s = useAuditionStore.getState();
     return s.itemId === target.itemId && s.fromStart === fromStart && s.status === 'loading';

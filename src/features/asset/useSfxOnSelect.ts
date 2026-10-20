@@ -5,7 +5,7 @@ import { shouldPlaySfx } from '../../lib/asset/audition';
 import { getCached } from '../../stores/itemCache';
 import { useViewStore } from '../../stores/viewStore';
 import { usePlayerStore } from '../player/playerStore';
-import { audioRuntime, closeAudio } from './audioRuntime';
+import { audioRuntime, closeAudio, touchAudio } from './audioRuntime';
 import { stopAudition, useAuditionStore } from './auditionStore';
 
 /**
@@ -49,6 +49,7 @@ export function useSfxOnSelect(): void {
         selectedCount: view.selection.ids.length,
       });
       if (play && item) {
+        touchAudio();
         void sfx.play(item.hash);
       }
     });
