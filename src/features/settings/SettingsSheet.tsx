@@ -35,6 +35,7 @@ import { ToolsPanel } from '../downloads/ToolsPanel';
 import { updatePlayerPrefs } from '../player/playerActions';
 import { usePlayerStore } from '../player/playerStore';
 import { createNew, openOther } from '../sidebar/LibrarySwitcher';
+import { CacheUsage } from './CacheUsage';
 import { integritySummary } from './integrity';
 import styles from './Settings.module.css';
 
@@ -191,6 +192,7 @@ function LibraryTab() {
         <dl className={styles.facts}>
           <dt>{t.libraryBytes}</dt>
           <dd>{usage ? formatBytes(usage.libraryBytes) : '—'}</dd>
+          <CacheUsage />
           <dt>{t.diskFree}</dt>
           <dd>
             {usage?.volumeAvailableBytes != null && usage.volumeTotalBytes != null
