@@ -96,7 +96,8 @@ pub enum LibraryUpgradePhase {
     Started,
     /// 当て終えた。
     Finished,
-    /// 当てられなかった（ライブラリは前の版のまま。理由は `error`。開く IPC も同じ理由で失敗を返す）。
+    /// 当てられなかった（失敗した 1 つは戻り、それより前に当てたものは残る。理由と今の版は `error`。開く IPC も同じ理由で
+    /// 失敗を返す）。
     Failed,
 }
 

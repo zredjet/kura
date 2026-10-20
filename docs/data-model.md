@@ -629,8 +629,12 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
      前からの違反だけなら当て直して警告を残す。成功しても失敗しても `foreign_keys` を戻す。事前の確かめはしない（10 万件で約 160ms を省く）。
    - 作り直しの SQL は「新しい表を作る → 移す → 古い表を DROP → 新しい表を RENAME」。古い表を先に改名しない。
 4. **WAL を空にする**：1 つでも当てたら `PRAGMA wal_checkpoint(TRUNCATE)`（しないと次に開くときに WAL を読み直す）。
-5. 当てられなかったら、版は前のまま（失敗したマイグレーションのトランザクションは戻る。それより前に当てたものは残る）。
-   理由は `CoreError::Upgrade`（新しい版・空き容量・バックアップ・当てる失敗）の言葉で返す。アプリはこれを `AppError` の code
+5. 当てられなかったら、失敗したマイグレーションのトランザクションは戻り、それより前に当てたものは残る（版はそこまで上がる。
+   0007・0008 が通って 0009 で失敗すれば版 8）。理由は `CoreError::Upgrade`（新しい版・空き容量・バックアップ・当てる失敗）の
+   言葉で返す。当てる失敗の言葉は、1 つも当てていなければ「前の版のまま」、途中の版まで当てていれば「途中の版（スキーマ N）まで
+   当てたので前の版の Kura ではもう開けない・原因を取り除いて開き直すと続きを当てる・当てる前のバックアップが backups にある」と
+   言う（`UpgradeError::Apply` の `from`・`reached`）。SQL の本文は言葉に入れず（SQLite の言葉と位置だけ。`CoreError::short`）、
+   ログに全文を残す（テスト `a_late_failure_says_the_library_is_now_at_a_middle_version`）。アプリはこれを `AppError` の code
    `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` にし、`library_open` は失敗として、`library_restore` は
    `error` に入れて返す（docs/architecture.md §3）。開く前に当てるかどうかは `library::needs_upgrade` で分かる。
 6. **知らせ**：当て始めたら（空きの確かめの前）`UpgradeEvent::Started`、終わったら `Finished`、当てられなかったら `Failed` を、

@@ -548,9 +548,14 @@ fn rebuild_runs_through_the_runner_and_reports() {
     // 失敗したら、どのマイグレーションかを返す
     let mut conn = filled_v6();
     let bad = v6_then(rebuild("bad", "DELETE FROM folders;"));
-    let (index, err) = run(&mut conn, &bad, bad.len()).unwrap_err();
-    assert_eq!(index, Some(6));
-    assert!(matches!(err, CoreError::Conflict(_)), "{err}");
+    let failure = run(&mut conn, &bad, bad.len()).unwrap_err();
+    assert_eq!(failure.index, Some(6));
+    assert_eq!(failure.reached, 6, "失敗したときの版");
+    assert!(
+        matches!(failure.error, CoreError::Conflict(_)),
+        "{}",
+        failure.error
+    );
     assert_eq!(applied(&conn).unwrap(), 6);
 }
 

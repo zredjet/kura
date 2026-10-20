@@ -40,7 +40,7 @@
 
 ## 3. IPC コマンド一覧（初期）
 
-戻り値はすべて `Result<T, AppError>`。`AppError { code: string, message: string }`。code の例：`NotFound`、`InvalidQuery`、`Invalid`、`ToolMissing`、`Io`、`Db`、`Conflict`、`Internal`。ライブラリを新しい版にできずに開けないときは `LibraryTooNew`（新しい版の Kura で作られた）・`NoSpace`（空き容量）・`BackupFailed`（当てる前のバックアップ）・`UpgradeFailed`（当てる失敗。戻した）で、フロントは code で文言を選び、`message` を説明に出す（M11。docs/data-model.md §5）。その場で用意する表示（アニメの帯）が大きすぎるときは `TooLarge`（1 辺 8,192・16M 画素・メモリの予算の全体を超える。やり直しても同じ）、メモリの予算が空いていないときは `Busy`（少し待てば通る。画面は「混んでいます。もう一度押してください」）（M11）。
+戻り値はすべて `Result<T, AppError>`。`AppError { code: string, message: string }`。code の例：`NotFound`、`InvalidQuery`、`Invalid`、`ToolMissing`、`Io`、`Db`、`Conflict`、`Internal`。ライブラリを新しい版にできずに開けないときは `LibraryTooNew`（新しい版の Kura で作られた）・`NoSpace`（空き容量）・`BackupFailed`（当てる前のバックアップ）・`UpgradeFailed`（当てる失敗。失敗した 1 つを戻した。それより前に当てたものは残り、途中の版なら `message` がそう言う）で、フロントは code で文言を選び、`message` を説明に出す（M11。docs/data-model.md §5）。その場で用意する表示（アニメの帯）が大きすぎるときは `TooLarge`（1 辺 8,192・16M 画素・メモリの予算の全体を超える。やり直しても同じ）、メモリの予算が空いていないときは `Busy`（少し待てば通る。画面は「混んでいます。もう一度押してください」）（M11）。
 
 | 領域 | コマンド | 説明 |
 |---|---|---|

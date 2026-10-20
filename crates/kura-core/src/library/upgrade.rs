@@ -83,7 +83,7 @@ pub enum UpgradeEvent {
         to: usize,
         ms: f64,
     },
-    /// 当てられなかった（ライブラリは前の版のまま。`ms` は始まりからの時間）。
+    /// 当てられなかった（失敗した 1 つは戻り、それより前に当てたものは残る。今の版は `error` が持つ。`ms` は始まりからの時間）。
     Failed {
         path: PathBuf,
         from: usize,
@@ -234,6 +234,62 @@ mod tests {
         let lib = Library::open_with(&root, &hooks).unwrap();
         assert_eq!(lib.migration().from, 6);
         assert_eq!(backup::list(lib.layout()).unwrap().len(), 1);
+    }
+
+    /// 後ろのマイグレーションで失敗したら、それより前に当てたものは残って版は途中まで上がる。言葉はそれを言い（前の版の
+    /// Kura では開けない・当てる前のバックアップがある）、「前の版のまま」と言わない。SQL の本文は入れない（D2）。原因を
+    /// 取り除けば、続きを当てて開ける。
+    #[test]
+    fn a_late_failure_says_the_library_is_now_at_a_middle_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        v6_library(&root);
+        // 0009 の CREATE TABLE media_facts を失敗させる（実際にはディスクの空きや I/O の誤り）
+        Connection::open(root.join(crate::library::DB_FILE))
+            .unwrap()
+            .execute_batch("CREATE TABLE media_facts (x);")
+            .unwrap();
+        let (hooks, events) = recording(None);
+        let err = Library::open_with(&root, &hooks).err().unwrap();
+        assert_eq!(version_of(&root), 8, "0007・0008 は残る");
+        let text = err.to_string();
+        assert!(!text.contains("前の版のまま"), "{text}");
+        assert!(text.contains("スキーマ 8"), "{text}");
+        assert!(text.contains("前の版の Kura"), "{text}");
+        assert!(text.contains("バックアップ"), "{text}");
+        assert!(text.contains("0009_analysis"), "{text}");
+        assert!(text.contains("media_facts already exists"), "{text}");
+        assert!(
+            !text.contains("CREATE TABLE"),
+            "SQL の本文を入れない：{text}"
+        );
+        assert!(text.chars().count() < 400, "{text}");
+        {
+            let events = events.lock().unwrap();
+            match events.as_slice() {
+                [
+                    UpgradeEvent::Started { from: 6, .. },
+                    UpgradeEvent::Failed { from: 6, error, .. },
+                ] => assert_eq!(error.to_string(), text),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            backup::list(&crate::library::Layout::new(&root))
+                .unwrap()
+                .len(),
+            1
+        );
+        // 原因を取り除けば、続き（0009）を当てて開ける
+        Connection::open(root.join(crate::library::DB_FILE))
+            .unwrap()
+            .execute_batch("DROP TABLE media_facts;")
+            .unwrap();
+        let lib = Library::open(&root).unwrap();
+        assert_eq!(
+            (lib.migration().from, lib.migration().to),
+            (8, crate::db::MIGRATIONS.len())
+        );
     }
 
     /// 当てる途中の失敗も知らせる（理由はそのまま）。

@@ -153,17 +153,32 @@ pub fn migrate(conn: &mut Connection) -> Result<MigrationReport> {
 /// `count` 番目までのマイグレーションを適用する（テストと kura-devtools の bench で前の版のスキーマを作るのにも使う）。
 #[doc(hidden)]
 pub fn migrate_until(conn: &mut Connection, count: usize) -> Result<MigrationReport> {
-    run(conn, MIGRATIONS, count).map_err(|(_, err)| err)
+    run(conn, MIGRATIONS, count).map_err(|failure| failure.error)
 }
 
-/// `list` の `count` 番目までを当てる。失敗したら、失敗したマイグレーションの番号とエラーを返す。
+/// 当てる途中の失敗（[`run`]）。
+#[derive(Debug)]
+pub(super) struct RunFailure {
+    /// 失敗したマイグレーションの番号（版を読む前の失敗は None）。
+    pub index: Option<usize>,
+    pub error: CoreError,
+    /// 失敗したときの版（失敗した 1 つは戻り、それより前に当てたものは残る）。
+    pub reached: usize,
+}
+
+/// `list` の `count` 番目までを当てる。失敗したら、失敗したマイグレーションの番号・エラー・そのときの版を返す。
 pub(super) fn run(
     conn: &mut Connection,
     list: &[Migration],
     count: usize,
-) -> std::result::Result<MigrationReport, (Option<usize>, CoreError)> {
-    let current = applied(conn).map_err(|e| (None, e))?;
-    newer_check(current, list.len()).map_err(|e| (None, e))?;
+) -> std::result::Result<MigrationReport, RunFailure> {
+    let early = |error| RunFailure {
+        index: None,
+        error,
+        reached: 0,
+    };
+    let current = applied(conn).map_err(early)?;
+    newer_check(current, list.len()).map_err(early)?;
     let mut report = MigrationReport {
         from: current,
         to: current,
@@ -179,7 +194,12 @@ pub(super) fn run(
             Kind::Plain => apply_plain(conn, m, version),
             Kind::Rebuild => apply_rebuild(conn, m, version),
         };
-        match result.map_err(|e| (Some(index), e))? {
+        let outcome = result.map_err(|error| RunFailure {
+            index: Some(index),
+            error,
+            reached: report.to,
+        })?;
+        match outcome {
             Outcome::Applied { tolerated } => {
                 report.tolerated_violations += tolerated;
                 let ms = started.elapsed().as_secs_f64() * 1000.0;

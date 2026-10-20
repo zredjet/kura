@@ -489,7 +489,9 @@ mod tests {
             .unwrap();
         let err = Library::open(&root).err().unwrap();
         match &err {
-            crate::CoreError::Upgrade(crate::UpgradeError::Apply { migration, detail }) => {
+            crate::CoreError::Upgrade(crate::UpgradeError::Apply {
+                migration, detail, ..
+            }) => {
                 assert_eq!(migration, "0007_blobs_and_kinds");
                 assert!(detail.contains("already exists"), "{detail}");
             }

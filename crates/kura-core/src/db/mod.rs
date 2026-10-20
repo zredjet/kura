@@ -227,11 +227,20 @@ where
         })?;
     }
     let before_ms = ms(started);
-    let mut report = migrate::run(conn, list, list.len()).map_err(|(index, err)| {
-        let name = index
+    let mut report = migrate::run(conn, list, list.len()).map_err(|failure| {
+        let name = failure
+            .index
             .and_then(|i| list.get(i))
             .map_or("マイグレーション", |m| m.name);
-        UpgradeError::apply(name, &err)
+        // 画面の言葉には SQL の本文を入れないので、ログには全文を残す
+        tracing::warn!(
+            migration = name,
+            from,
+            reached = failure.reached,
+            error = %failure.error,
+            "ライブラリの DB を新しい版にできませんでした"
+        );
+        UpgradeError::apply(name, &failure.error, from, failure.reached.max(from))
     })?;
     // 同時に開いた新しい版の Kura が、この Kura の知らない版まで当てていたら開かない
     let now = applied(conn)?;
