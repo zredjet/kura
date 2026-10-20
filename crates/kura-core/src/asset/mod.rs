@@ -5,7 +5,10 @@
 //! - **表示の実効値の規則はここの関数だけ**：ドット絵は [`effective_pixel_art`]（設定 ?? 自動の判定 ?? 偽）。一覧の
 //!   タイルの SQL（items.rs の SUMMARY）は同じ規則であることを、検索の SQL（query の compile）は「設定 ?? 自動」で比べて
 //!   `ドット絵:あり` がこの関数の真と同じ集合になり、どちらもないものを `:あり`・`:なし`・`!=` に入れないことを、
-//!   テストでこの関数と照らす（設定 3 通り [`TRISTATE`] × 自動 4 通り：未解析・材料が足りない・いいえ・はい）。
+//!   テストでこの関数と照らす（設定 3 通り [`TRISTATE`] × 自動 4 通り：未解析・材料が足りない・いいえ・はい）。アニメは
+//!   [`effective_animated`]（格子の設定 ?? 解析のコマが 2 つ以上）。検索の SQL も「格子の設定 ?? 解析のコマ」で比べ
+//!   （[`grid_items_sql`]）、`アニメ:あり` がこの関数の真と同じ集合になることを、格子 4 通り（なし・あり・知らない版・壊れた
+//!   JSON）× コマ 4 通り（未解析・計れない・1・8）で照らす（M11 のユーザーの決定 16）。
 //! - 設定は画像だけに付ける（音声・動画・フォント・3D の ID は飛ばす。検索の「ドット絵:あり」に画像以外が入らないように）。
 //!   すべての欄が自動（NULL）に戻れば行を消す（「変えたアイテムにだけ行がある」）。
 //! - 格子は、セルが 1 つもできない値と、セルの数を超えるコマの数を断る（大きさの分からない画像は、セルの幅・高さが
@@ -34,7 +37,8 @@ pub fn effective_pixel_art(setting: Option<bool>, auto: Option<bool>) -> bool {
     setting.or(auto).unwrap_or(false)
 }
 
-/// アニメとして回せるか：コマが 2 つ以上あるか、格子を設定してあるか（[`anim`] が帯を作れる見込み）。
+/// アニメとして回せるか：格子を設定してあるか、なければコマが 2 つ以上あるか（[`anim`] が帯を作れる見込み）。表示（タイルの印・
+/// 素材の欄）と検索の「アニメ:あり」はこの規則で決める（「格子の設定 ?? 解析のコマ」。M11 のユーザーの決定 16）。
 pub fn effective_animated(frame_count: Option<u32>, has_grid: bool) -> bool {
     has_grid || frame_count.is_some_and(|n| n >= 2)
 }
@@ -374,6 +378,16 @@ struct GridJson {
 
 /// grid_json の版。
 const GRID_JSON_V: u32 = 1;
+
+/// 格子の設定があるアイテム（`asset_settings.item_id`）を選ぶ SQL。検索の「アニメ」（query の compile。[`effective_animated`] の
+/// 「格子がある」）に使う。[`grid_from_json`] と同じく、壊れた JSON と知らない版は格子なしとする（版 1 の中の欄の欠け・知らない欄
+/// までは見ない。書き手 [`set_settings`] は版 1 のそろった形だけを書く）。表は変えたアイテムにだけ行があるので、索引を使わずに読む。
+pub(crate) fn grid_items_sql() -> String {
+    format!(
+        "SELECT item_id FROM asset_settings WHERE grid_json IS NOT NULL \
+         AND CASE WHEN json_valid(grid_json) THEN json_extract(grid_json, '$.v') = {GRID_JSON_V} ELSE 0 END"
+    )
+}
 
 fn grid_to_json(g: &GridSetting) -> Result<String> {
     Ok(serde_json::to_string(&GridJson {

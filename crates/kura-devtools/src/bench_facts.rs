@@ -1,7 +1,8 @@
 //! `bench query --library <path> --fake-facts`：素材の事実のフィールド（透過・ループ・ラウドネスなど。M11）で
 //! 検索する速さを測る（NFR-03 の 50ms。docs/search-query.md §3）。
 //!
-//! - 画像・音声のアイテムに、擬似の事実（`media_facts`）と素材の設定（`asset_settings`）を入れてから測り、終わったら消す。
+//! - 画像・音声のアイテムに、擬似の事実（`media_facts`）と素材の設定（`asset_settings`。ドット絵と格子）を入れてから測り、
+//!   終わったら消す。
 //!   擬似の行は `media_facts.decoder = 'kura-devtools-fake'`・`asset_settings.updated_at = 1` で見分ける。
 //! - 本物の解析の結果・素材の設定があるライブラリでは断る（seed の写しに使う）。
 //! - 値はシード付きの ChaCha8 で決める（同じライブラリなら毎回同じ事実）。解析の進み（`analysis_state`）は変えないので、
@@ -19,6 +20,9 @@ use rand_chacha::rand_core::{Rng, SeedableRng};
 const FAKE_DECODER: &str = "kura-devtools-fake";
 /// 擬似の素材の設定の印（`asset_settings.updated_at`）。
 const FAKE_AT: i64 = 1;
+/// 擬似の格子の設定（`asset_settings.grid_json` の版 1。16px のセルをすべて使う）。
+const FAKE_GRID: &str =
+    r#"{"v":1,"cellW":16,"cellH":16,"offsetX":0,"offsetY":0,"gapX":0,"gapY":0,"count":null}"#;
 /// 1 トランザクションで入れる件数（.claude/rules/database.md）。
 const CHUNK: usize = 500;
 
@@ -137,14 +141,20 @@ pub fn insert(db: &Db) -> Result<(usize, usize, usize), String> {
         })
         .map_err(|e| e.to_string())?;
     }
-    // 素材の設定：画像の 1% に「ドット絵：はい／いいえ」
+    // 素材の設定：画像の 1% に「ドット絵：はい／いいえ」、別の 1% に格子（「アニメ:あり」に入る。M11 のユーザーの決定 16）
     let settings = db
         .write(|tx| {
-            Ok(tx.execute(
+            let pixel = tx.execute(
                 "INSERT INTO asset_settings (item_id, pixel_art, updated_at)
                  SELECT id, id % 2, ?1 FROM items WHERE kind = 'image' AND id % 100 = 0",
                 [FAKE_AT],
-            )?)
+            )?;
+            let grid = tx.execute(
+                "INSERT INTO asset_settings (item_id, grid_json, updated_at)
+                 SELECT id, ?2, ?1 FROM items WHERE kind = 'image' AND id % 100 = 50",
+                rusqlite::params![FAKE_AT, FAKE_GRID],
+            )?;
+            Ok(pixel + grid)
         })
         .map_err(|e| e.to_string())?;
     Ok((images, audios, settings))
@@ -196,6 +206,12 @@ pub fn search(db: &Db, ctx: &QueryContext) -> Result<(), String> {
         "色数<=16",
         "2のべき乗:あり",
         "アニメ:あり",
+        "アニメ:なし",
+        "-アニメ:あり",
+        "種類:画像 アニメ:あり",
+        "透過:あり アニメ:あり",
+        "透過:あり アニメ:なし",
+        "種類:画像 ドット絵:あり",
         "レート:48k",
         "ビット:24",
         "チャンネル:ステレオ",
@@ -320,6 +336,22 @@ mod tests {
                 .unwrap()
                 .is_some_and(|n| n > 0)
         );
+        // 格子を設定した画像（擬似の設定）は、コマが 1 つでも「アニメ:あり」に入る（M11 のユーザーの決定 16）
+        let grids: Vec<u32> = db
+            .read(|c| {
+                let mut stmt =
+                    c.prepare("SELECT item_id FROM asset_settings WHERE grid_json IS NOT NULL")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            })
+            .unwrap();
+        assert!(!grids.is_empty());
+        let query = ItemQuery {
+            filter: Some(parse("アニメ:あり").unwrap().expr),
+            ..ItemQuery::default()
+        };
+        let animated = db.read(|c| query_ids(c, &query, &ctx)).unwrap().ids;
+        assert!(grids.iter().all(|id| animated.contains(id)), "{grids:?}");
         remove(db).unwrap();
         assert_eq!(count(db, "SELECT count(*) FROM media_facts"), 0);
         assert_eq!(count(db, "SELECT count(*) FROM asset_settings"), 0);
