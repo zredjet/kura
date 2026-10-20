@@ -475,6 +475,10 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 
 1. `items_query_ids(query, sort)` で条件に合う ID と縦横比だけを並び順で返す（`tauri::ipc::Response` で生バイト。形式は `docs/architecture.md` §3）。縦横比は `width / height`、音楽と不明は 1.0。
 2. フロントは見えている範囲の ID だけ `items_get(ids)` で詳細を取る（最大 200 件ずつ）。
+   - M11：タイルの素材の表示（市松模様・ドット絵・アニメとループの印）のため、`items i LEFT JOIN blobs b ON b.hash = i.hash
+     LEFT JOIN media_facts f ON f.blob_id = b.id LEFT JOIN asset_settings s ON s.item_id = i.id WHERE i.id IN (…)` で引く
+     （主キーと `blobs.hash` の UNIQUE だけを引き、200 件でも全件を走査しない。`summaries_join_facts_and_settings_without_scanning`）。
+     ドット絵の実効値は「設定 ?? 自動 ?? 偽」（素材の欄・検索と同じ規則）。ユニットの表紙も同じ形で 1 件引く。
 
 ### サイドバーの一覧（M3）
 
