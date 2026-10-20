@@ -122,11 +122,25 @@ function quickLookOpen(): boolean {
   return useViewStore.getState().quickLook;
 }
 
+/**
+ * 試聴できなかった理由の知らせ。混んでいる（/pcm の 503・Busy）・Rust の失敗（日本語の message）のほかは、HTTP の番号や
+ * WebKit の英語の message を出さずに分かる言葉にする（/pcm の 404 はファイルがない、416 は範囲の外）。
+ */
 function failureText(error: unknown): string {
   if ((error instanceof MediaHttpError && error.status === 503) || isIpcError(error, 'Busy')) {
     return t.auditionBusy;
   }
-  return t.auditionFailed(error instanceof Error ? error.message : String(error));
+  if (isIpcError(error)) {
+    return t.auditionFailed(error.message);
+  }
+  if (error instanceof MediaHttpError && error.status === 404) {
+    return t.auditionFailed(t.auditionMissing);
+  }
+  if (error instanceof MediaHttpError && error.status === 416) {
+    return t.auditionFailed(t.auditionRange);
+  }
+  console.warn('試聴できませんでした', error);
+  return t.auditionFailed(t.auditionUnreadable);
 }
 
 /**

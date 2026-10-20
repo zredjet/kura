@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ja } from '../../i18n/ja';
 import { getAsset } from '../../ipc/asset';
 import type { AuditionOutcome } from '../../lib/assetAudio';
+import { IpcError } from '../../ipc/result';
 import { notify } from '../../stores/noticeStore';
 import { useViewStore } from '../../stores/viewStore';
 import { playerController } from '../player/playerActions';
@@ -129,6 +130,31 @@ describe('試聴の状態と口', () => {
     startAudition(auditionTarget(audioAsset())!);
     await settle();
     expect(notify).toHaveBeenLastCalledWith(t.auditionUnsupported);
+  });
+
+  it('/pcm が 2xx でなければ HTTP の番号を出さず、分かる言葉で知らせる（ファイルがない・範囲の外・ほか）', async () => {
+    const cases: [unknown, string][] = [
+      [new MediaHttpError(404), t.auditionFailed(t.auditionMissing)],
+      [new MediaHttpError(416), t.auditionFailed(t.auditionRange)],
+      [new MediaHttpError(500), t.auditionFailed(t.auditionUnreadable)],
+      // fetch そのものの失敗（WebKit の英語の message）・応答を読めない
+      [new TypeError('Load failed'), t.auditionFailed(t.auditionUnreadable)],
+      [new RangeError('レートが範囲の外です'), t.auditionFailed(t.auditionUnreadable)],
+    ];
+    for (const [error, text] of cases) {
+      fake.audition.startProbed.mockImplementationOnce(async () => ({ status: 'failed', error }));
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      expect(notify).toHaveBeenLastCalledWith(text);
+      expect(vi.mocked(notify).mock.lastCall?.[0]).not.toMatch(/HTTP|Load failed/);
+    }
+    // Rust の失敗（IpcError）は日本語の message をそのまま
+    vi.mocked(getAsset).mockRejectedValueOnce(
+      new IpcError({ code: 'Db', message: 'データベースを読めません' }),
+    );
+    toggleAuditionKey(11, 'audio');
+    await settle();
+    expect(notify).toHaveBeenLastCalledWith(t.auditionFailed('データベースを読めません'));
   });
 
   it('待つ間に止めたら、あとから鳴り始めの知らせが来ても状態を戻さない', async () => {
