@@ -124,6 +124,18 @@ pub fn stored_results(conn: &Connection, hash: &[u8; 32]) -> Result<Vec<StoredRe
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// 中身（ハッシュ）の事実の行の、読んだデコーダの識別子（読み取りの記録の `decoder`）。行がない・読まずに作った（形式から）
+/// ものは None。
+pub fn read_decoder(conn: &Connection, hash: &[u8; 32]) -> Result<Option<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT f.decoder FROM blobs b JOIN media_facts f ON f.blob_id = b.id WHERE b.hash = ?1",
+    )?;
+    Ok(stmt
+        .query_row([hash.as_slice()], |r| r.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten())
+}
+
 /// 書く結果 1 つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewResult {
@@ -1007,6 +1019,11 @@ mod tests {
             &conn,
             "SELECT r.analysis FROM blobs b JOIN analysis_results r ON r.blob_id = b.id
               WHERE b.hash = x'00' ORDER BY r.analysis",
+        );
+        assert!(!plan.contains("SCAN"), "{plan}");
+        let plan = query_plan(
+            &conn,
+            "SELECT f.decoder FROM blobs b JOIN media_facts f ON f.blob_id = b.id WHERE b.hash = x'00'",
         );
         assert!(!plan.contains("SCAN"), "{plan}");
         // ふだんの起動（sync_plan）は、待っているものを部分索引で、作り直しの印を settings の主キーで見るだけ

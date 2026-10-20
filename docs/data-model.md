@@ -558,9 +558,10 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   ラウドネス・ループ・無音・波形の段（最も細かい段はビンが 4,096 以下になる段、粗い方は 65,536 フレーム）。JPEG・HEIC・HEIF は
   読まずに形式から事実を書く（透過なし・色数は計らない・ドット絵でない・1 コマ。`decoder` は NULL）。動画・フォント・3D は `not_needed`。
 - **結果の鍵**：台帳の行 × 解析 ID（`UNIQUE(blob_id, analysis)`）。版と正規の引数は列で、計画の要求と照らす。同じ中身の結果
-  （計画の要求の ID・版・正規の引数と、読み取りの記録 `kura.read`）がそろっていれば読まずに使う。再現を約束しないデコーダの
-  結果も「その環境で読んだ事実」として持ち、OS の更新では解き直さず、デコーダの識別子が変わったときだけ解き直す
-  （`analysis.decoders`）。
+  （計画の要求の ID・版・正規の引数と、読み取りの記録 `kura.read`）がそろい、それを読んだデコーダ（事実の `decoder`）が今の組で
+  その形式を読むもののどれかなら、読まずに使う。再現を約束しないデコーダの結果も「その環境で読んだ事実」として持ち、OS の更新
+  では解き直さず、デコーダの識別子が変わったときだけ解き直す（`analysis.decoders`。戻したものは今の組にないデコーダで読んだ
+  ものなので、結果を使い回さずに読み直す。テスト `a_decoder_change_rereads_instead_of_reusing_old_results`）。
 - **書き込み**：16 件か 500 ms ごとに 1 つのトランザクションで、アイテムごとに
   `UPDATE items SET analysis_state = ? WHERE id = ? AND hash = ? AND analysis_state = 'pending'` が 1 行変えたときだけ、
   `blob_id` をそのトランザクションの中で `blobs.hash` から引いて、結果（`ON CONFLICT (blob_id, analysis) DO UPDATE`）と

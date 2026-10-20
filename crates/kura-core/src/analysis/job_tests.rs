@@ -554,6 +554,29 @@ fn sync_from(env: &Env, older: PlanFingerprint) -> store::PlanSync {
         .unwrap()
 }
 
+/// デコーダの識別子が変わって pending に戻したもの（前の組のデコーダで読んだもの）は、同じ中身の結果がそろっていても使い回さず、
+/// 今のデコーダで読み直す（E1。docs/data-model.md「解析の読み書き」の「デコーダの識別子が変わったときだけ解き直す」）。
+#[test]
+fn a_decoder_change_rereads_instead_of_reusing_old_results() {
+    let env = Env::new();
+    let img = env.add(1, "image", "png", &sprite(9));
+    env.run();
+    assert_eq!(env.reads().len(), 1);
+    let now: String = env.fact(&img, "decoder");
+    // 前の実行は、今の組にない古いデコーダ（png-rs-dec/0）で読んだことにする（kura の更新でデコーダの版を上げたとき）
+    env.exec(&format!(
+        "UPDATE media_facts SET decoder = 'png-rs-dec/0';
+         UPDATE settings SET value = replace(value, '{now}', 'png-rs-dec/0') WHERE key = 'analysis.decoders';"
+    ));
+    let record = env.run();
+    assert_eq!(env.reads().len(), 2, "デコーダが変わったので読み直す");
+    assert_eq!(result_json(&record)["reused"].as_u64(), Some(0));
+    assert_eq!(env.fact::<String>(&img, "decoder"), now);
+    assert_eq!(env.state(1), "ready");
+    env.run();
+    assert_eq!(env.reads().len(), 2, "読み直したあとは読まない");
+}
+
 /// 投影の版が上がったら（古い行）、読まずに結果の表から作り直し、作り直しの印を消す。
 #[test]
 fn facts_version_bump_reprojects_without_decoding() {

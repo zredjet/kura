@@ -8,7 +8,8 @@
 //! 3. 起動のスレッドが計画の指紋の変化で作り直しの印を置いていれば（投影の版・ドット絵の規則が変わった）、古い事実の行を
 //!    結果の表から作り直し（読まない。500 件ずつ）、終えたら印を消す。印がなければ事実の表を走査しない。
 //! 4. 優先の指定（`request_analysis`）のあるものを先に、なければ新しい順に、`pending` を 16 件ずつ取り出して 1 件ずつ解く：
-//!    - 同じ中身の結果（計画の要求の ID・版・正規の引数がすべてそろう）があれば読まずに使う。
+//!    - 同じ中身の結果（計画の要求の ID・版・正規の引数がすべてそろう）があり、それを読んだデコーダが今の組にあれば、読まずに
+//!      使う（デコーダの識別子が変わって pending に戻したものは読み直す）。
 //!    - ヘッダだけ読んで形を出し、見積もり（値の 2 倍＋デコーダの作業領域）が min(予算/2, 1 GiB) を超えれば確保せずに
 //!      failed（`too_large`）。収まれば一括の予算（Class::Bulk）をプールの外で確保し、一括のプールの中で読んで解く（決定 2）。
 //!    - 波形の段は `peaks/ab/<hash>.peaks` に一時ファイルから改名して置く（DB に書く前）。
@@ -550,13 +551,25 @@ impl Run<'_> {
         }
     }
 
-    /// 結果の表に計画の要求がすべてそろっていれば、読まずに事実を作る。
+    /// 結果の表に計画の要求がすべてそろい、それを読んだデコーダが今の組でこの形式を読むもののどれかなら、読まずに事実を作る。
+    /// デコーダが今の組にない（デコーダの指紋で pending に戻したもの）・分からないものは読み直す（docs/data-model.md
+    /// 「解析の読み書き」の「デコーダの識別子が変わったときだけ解き直す」）。
     fn reuse(&self, item: &Pending, format: &str) -> Result<Option<MediaFacts>> {
-        let stored = self
-            .ctx
-            .library()
-            .db()
-            .read(|c| store::stored_results(c, &item.hash))?;
+        let (decoder, stored) = self.ctx.library().db().read(|c| {
+            Ok((
+                store::read_decoder(c, &item.hash)?,
+                store::stored_results(c, &item.hash)?,
+            ))
+        })?;
+        let current = decoder.is_some_and(|id| {
+            self.codecs
+                .decoders_for(format)
+                .iter()
+                .any(|d| d.id() == id)
+        });
+        if !current {
+            return Ok(None);
+        }
         let by_id: BTreeMap<&str, &store::StoredResult> =
             stored.iter().map(|r| (r.analysis.as_str(), r)).collect();
         let Some(read) = by_id
