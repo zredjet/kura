@@ -11,6 +11,7 @@ import { SparkleIcon } from '../../components/icons/SparkleIcon';
 import { Segmented } from '../../components/Segmented/Segmented';
 import { ja } from '../../i18n/ja';
 import { countsFromPlural, kindBreakdown } from '../../ipc/kinds';
+import { hasThumb } from '../../ipc/media';
 import {
   getPlaylist,
   type PlaylistContentsDto,
@@ -40,6 +41,9 @@ import styles from './PlaylistView.module.css';
 import { SmartPanel } from './SmartPanel';
 
 const t = ja.playlist;
+
+/** 表紙のモザイクの 1 枠（PlaylistView.module.css の `.cover`：136px を 2 列、間 2px）。 */
+const COVER_CELL = { w: 67, h: 67 };
 
 /** プレイリストの画面（Playlist.dc.html）。手動は設定と中身の一覧、スマートはルールと「今回の並び」。 */
 export function PlaylistView({ id }: { id: number }) {
@@ -95,7 +99,7 @@ function Header({ playlist, contents }: { playlist: PlaylistDto; contents: Playl
   }, [coverIds]);
   const covers = coverIds
     .map((itemId) => getCached(itemId))
-    .filter((item) => item?.thumbState === 'ready')
+    .filter((item) => hasThumb(item?.thumbState))
     .slice(0, 4);
 
   const parts = [t.items(formatCount(contents.itemCount))];
@@ -135,7 +139,7 @@ function Header({ playlist, contents }: { playlist: PlaylistDto; contents: Playl
     <header className={styles.header}>
       <div className={styles.cover} aria-hidden="true">
         {[0, 1, 2, 3].map((i) => (
-          <Thumb key={i} item={covers[i]} className="" />
+          <Thumb key={i} item={covers[i]} className="" box={COVER_CELL} />
         ))}
       </div>
       <div className={styles.headText}>

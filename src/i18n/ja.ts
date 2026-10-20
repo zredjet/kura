@@ -490,6 +490,25 @@ export const ja = {
     downloaded: 'ダウンロードしたもの',
     captured: 'キャプチャしたもの',
   },
+  /** 素材の表示（M11。design.md §3.1・§4）：タイルの印・「ドット絵として表示」のメニュー・キャッシュの容量。 */
+  mediaView: {
+    /** アニメの画像のタイルの印（「8 コマ」）。 */
+    frames: (n: string) => `${n} コマ`,
+    /** コマの数が分からないアニメ（大きさの分からない格子）の印の説明。 */
+    animated: 'アニメ',
+    /** ループ点のある音声（タイルの印の説明・読み上げ）。 */
+    loop: 'ループあり',
+    pixelArt: 'ドット絵として表示',
+    pixelArtAuto: '自動',
+    pixelArtYes: 'はい',
+    pixelArtNo: 'いいえ',
+    /** 設定の「容量」の、中身から作ったキャッシュの行。 */
+    cacheThumbs: 'サムネイル',
+    cachePeaks: '波形',
+    cacheAnim: 'アニメ',
+    cacheValue: (bytes: string, files: string) => `${bytes}（${files} 個）`,
+    cacheCounting: '数えています…',
+  },
   /** 種類のラベル（並び・述語は src/ipc/kinds.ts。種類を足したらここにも足す）。 */
   kinds: {
     image: '画像',

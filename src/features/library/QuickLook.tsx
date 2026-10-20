@@ -4,10 +4,11 @@ import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
 import { CloseIcon } from '../../components/icons/CloseIcon';
 import { KindArt } from '../../components/KindArt/KindArt';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry } from '../../ipc/items';
 import { isPlayable } from '../../ipc/kinds';
-import { fileUrl, playUrl, thumbUrl } from '../../ipc/media';
+import { fileUrl, playUrl } from '../../ipc/media';
 import { formatCount } from '../../lib/format';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
 import { useLibraryStore } from '../../stores/libraryStore';
@@ -76,15 +77,14 @@ export function QuickLook() {
 
       <div className={styles.stage}>
         {item?.kind === 'image' && (
-          <img
+          // 元のファイル（ブラウザで表示できない形式は大きいサムネイル）。透過は市松模様、ドット絵は整数倍
+          <MediaImage
             key={item.id}
+            source={item}
+            size="l"
+            fit="contain"
+            original={fileUrl(item.hash)}
             className={styles.media}
-            src={fileUrl(item.hash)}
-            alt=""
-            // ブラウザで表示できない形式は大きいサムネイルにする
-            onError={(e) => {
-              e.currentTarget.src = thumbUrl(item.hash, 'l');
-            }}
           />
         )}
         {item?.kind === 'video' && (
@@ -100,17 +100,22 @@ export function QuickLook() {
         )}
         {item?.kind === 'audio' && (
           <div key={item.id} className={styles.audio}>
-            {item.thumbState === 'ready' && (
-              <img className={styles.art} src={thumbUrl(item.hash, 'l')} alt="" />
-            )}
+            <MediaImage source={item} size="l" fit="cover" className={styles.art} />
             {/* 手元のメディアには字幕ファイルがない */}
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
             <audio src={playUrl(item.hash)} controls autoPlay />
           </div>
         )}
-        {/* フォント・3D：見本・描いたサムネイルは段 3。それまでは種類の絵 */}
+        {/* フォント・3D：描いたサムネイル（フォントは字の形を mask にする）。なければ種類の絵 */}
         {item && !isPlayable(item.kind) && (
-          <KindArt key={item.id} kind={item.kind} className={styles.kindArt} />
+          <MediaImage
+            key={item.id}
+            source={item}
+            size="l"
+            fit="contain"
+            className={styles.asset}
+            fallback={<KindArt kind={item.kind} className={styles.kindArt} />}
+          />
         )}
       </div>
 

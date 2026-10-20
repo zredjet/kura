@@ -16,11 +16,17 @@ export function itemMeta(item: ItemSummaryDto): string {
   return parts.join(' · ');
 }
 
-/** 読み上げる名前（タイル・リストの行）：「IMG_0001、動画、1:20、評価 4」。評価がなければ言わない。 */
+/**
+ * 読み上げる名前（タイル・リストの行）：「IMG_0001、動画、1:20、評価 4」。評価がなければ言わない。
+ * ループ点のある音声は長さのあとに「ループあり」（タイルの繰り返しの印。design.md §4）。
+ */
 export function spokenLabel(item: ItemSummaryDto): string {
   const parts = [item.title, kindLabel(item.kind) || item.kind];
   if (item.durationMs !== null && hasDuration(item.kind)) {
     parts.push(formatDuration(item.durationMs));
+  }
+  if (item.hasLoop) {
+    parts.push(ja.mediaView.loop);
   }
   if (item.rating > 0) {
     parts.push(ja.inspector.rating(item.rating));

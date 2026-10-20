@@ -15,10 +15,10 @@ import { type MenuEntry, openMenuAt } from '../../components/Menu/menuStore';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
 import { GripIcon } from '../../components/icons/GripIcon';
 import { KindIcon } from '../../components/icons/KindIcon';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { hasDuration, kindLabel } from '../../ipc/kinds';
-import { thumbUrl } from '../../ipc/media';
 import type { EntryRowDto, PlaylistContentsDto, PlaylistDto } from '../../ipc/playlists';
 import { formatCount, formatDuration } from '../../lib/format';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
@@ -30,20 +30,26 @@ import styles from './PlaylistView.module.css';
 
 const t = ja.playlist;
 
-/** サムネイル（なければ種類の絵）。 */
+/** 行のサムネイルの大きさ（PlaylistView.module.css の `.thumb`。市松模様は敷かない大きさ）。 */
+const ROW_THUMB = { w: 40, h: 40 };
+
+/** サムネイル（なければ種類の絵）。`box` は表示の大きさ（表紙のモザイクは大きい）。 */
 export function Thumb({
   item,
   className,
+  box = ROW_THUMB,
 }: {
   item: ItemSummaryDto | undefined;
   className?: string;
+  box?: { w: number; h: number };
 }) {
+  const icon = <KindIcon kind={item?.kind} size={18} />;
   return (
     <span className={className ?? styles.thumb} aria-hidden="true">
-      {item?.thumbState === 'ready' ? (
-        <img src={thumbUrl(item.hash, 's')} alt="" loading="lazy" />
+      {item ? (
+        <MediaImage source={item} size="s" fit="cover" box={box} loading="lazy" fallback={icon} />
       ) : (
-        <KindIcon kind={item?.kind} size={18} />
+        icon
       )}
     </span>
   );
