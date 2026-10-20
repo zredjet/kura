@@ -486,7 +486,7 @@ pub trait Encoder: Send + Sync {
 | JPEG | image | zune-jpeg（`jpeg-zune-dec/1`。CMYK・YCCK は次の段の ImageIO へ） | jpeg-encoder（`jpeg-rs-enc/1`） |
 | GIF | image | gif（`gif-rs-dec/1`） | gif（`gif-rs-enc/1`。減色は自作） |
 | WebP | image | image-webp（`webp-rs-dec/1`。非可逆・可逆・アニメ） | image-webp（`webp-rs-enc/1`。可逆の 1 枚だけ） |
-| aseprite | image | 自作（`aseprite-kura-dec/1`。合成した各フレーム） | — |
+| aseprite | image | 自作（`aseprite-kura-dec/1`。合成した各フレーム）。`.ase` は Adobe の色見本と拡張子が重なるので、取り込みで先頭のバイト（0xA5E0）を見て、Aseprite でなければ取り込まない（`import::kind`。M11） | — |
 | PSD・PSB | image | 自作（`psd-kura-dec/1`。合成済みの画像。ZIP は次の段の ImageIO へ） | — |
 | SVG | image | resvg・usvg（`svg-resvg-dec/1`。再現は約束しない → アンカー。外部の参照は読まない。`<image>` と、フォントを渡していないときの文字は次の段へ） | — |
 | HEIC・HEIF・AVIF（静止画・シーケンス）・TIFF・BMP | image | ImageIO（`imageio-dec/1`。Platform。アンカー。§9.8） | — |
@@ -499,7 +499,7 @@ pub trait Encoder: Send + Sync {
 | AAC-LC（m4a・ADTS） | audio | symphonia（`m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`。超越関数を libm に差し替えた写しで再現できる。priming は自作で切る。§9.8）。symphonia の AAC は 1・2 チャンネルだけ。3 チャンネル以上（形の段階で断る）と HE-AAC は AudioToolbox・ffmpeg へ（Platform・External なのでアンカー） | AudioToolbox（`aac-audiotoolbox-enc/1`。Platform。m4a だけ（ADTS は書かない）。LC・1〜6 チャンネル・既定 256 kbps。§9.8） |
 | Ogg Vorbis | audio | symphonia（`ogg-vorbis-symphonia-dec/3`。3 チャンネル以上の residue 0/1 を直し、超越関数を libm に差し替えた写しで再現できる。§9.7・§9.8） | 自作（`ogg-vorbis-kura-enc/1`。aoTuV b6.03 の移植と Ogg の多重化。1〜8 チャンネル・8〜192 kHz。§9.7。ADR-149） |
 | HE-AAC・Opus | audio | AudioToolbox（`audiotoolbox-dec/1`。Platform。アンカー。メモリから ExtAudioFile で読む。§9.8）。AudioToolbox が断るもの（多チャンネルの Opus など）と Ogg の FLAC・Speex、圧縮の WAV・AIFF、MP3 の layer 1・2 は ffmpeg（`opus-ffmpeg-dec/1` など。External。アンカー） | — |
-| ttf・otf・woff・woff2 | font | —（値にしない。情報とサムネイルは kura-mac の CoreText。M11） | — |
+| ttf・otf・ttc・woff・woff2 | font | —（値にしない。情報とサムネイルは kura-mac の CoreText（`kura_probe` の種類 3 と、字の形だけのアルファの PNG の見本）。M11） | — |
 | glb | model | —（値にしない。情報と描画は自前の `model`：JSON の塊だけから数える `read_info`（`glb-kura-read/1`）と、焼き込み・ソフトウェアの描画で Rgba8 の画像にする `load_scene`・`render`（`model-kura-render/1`）。M11 の決定 9。§9.10） | — |
 | 動画 | video | —（編集しない） | — |
 
@@ -678,7 +678,9 @@ pub trait Analysis: Send + Sync + 'static {
 - **ダイジェスト**：`kura-analysis-v1` = BLAKE3（ID（長さ付き）‖ 版 u32 ‖ 正規の引数（長さ付き）‖ 形の種類 u8（JSON 0・バイナリ 1）‖ 結果（長さ付き））。ゴールデンは結果だけの `kura-analysis-out-v1` で照らす。
 - **版の契約**：操作が申告する解析（下の 11.2）は操作と同じく凍結し、結果を変えるなら版を上げて旧版を `legacy` に残す（申告されている版を `dropped` にするとエンジンを作れない。`Engine::new` の `check_needs`）。表示だけの解析（どの操作も申告しない解析。今は申告されるのが `image.opaque_bounds`・`audio.loudness_gating` だけなので、ほかの 8 つ）は、版を上げたら旧版の実装を消して `dropped` に載せてよい（凍結したゴールデンのファイルは残し、照らさない）。操作が新しく申告するようになったら、その版から凍結する。実装も `dropped` もない版のゴールデンは失敗。
 - **フレームの列**：フレームの外（覆われない部分）の扱いは解析ごとに決め、各ソースの冒頭と下の表に書く（alpha は透明として数え、colors は数えず、pixel_scale はフレームの中だけで比べ、opaque_bounds は外を透明とみなすが、アルファのない形式では union をキャンバス全体にする（frames は各フレームの矩形のまま））。
-- **結果のキー**（M11 で使う）：中身 × ID × 版 × 正規の引数。中身を元のファイルのハッシュにするか値のダイジェストにするか（再現を約束しないデコーダの元をどう扱うか）は M11 で決める。
+- **結果のキー**（M11 で決めた。ADR-158）：元のファイルの中身（台帳 `blobs` の行。値のダイジェストではない）× ID × 版 × 正規の引数。kura-core の表 `analysis_results` は `UNIQUE(blob_id, analysis)` で、版と正規の引数は列に持ち、計画の要求と照らす（docs/data-model.md §3・§4）。元の中身で引くので、同じ中身の結果（計画の要求の ID・版・正規の引数と、読み取りの記録 `kura.read`）がそろっていれば読まずに使える。M12 で中身が変わると別の台帳の行になり、自然に解き直しになる。
+  - 読んだときの記録（デコーダの識別子・再現の約束・値のダイジェスト・環境）は、事実の行（`media_facts`）に残す。
+  - 再現を約束しないデコーダ（Platform・External・resvg）の結果も「その環境で読んだ事実」として持ち、OS の更新では解き直さない。解き直すのは、形式ごとの段の順のデコーダの識別子が変わったとき（settings の `analysis.decoders`。今の組にないデコーダで読んだもの・並びが変わった形式で失敗していたもの）と、計画の指紋（`analysis.plan`：計画・投影・ドット絵の規則・読み取りの記録の版と、種類ごとの ID・版・既定の引数）が変わったときだけ。投影（事実の列の作り方）だけが変わったときは、読み直さずに結果の表から作り直す。
 
 ```rust
 impl Engine {
@@ -711,7 +713,7 @@ impl Engine {
 - **colors**：`image.convert` が Indexed8 にするときと同じ 8 ビットの色で数える（速い読み手 `imaging::convert::for_each_rgba8_key` を使い、convert の `convert_pixel` と同じ色になることを単体・E26・素朴な参照で照らす）。256 色以下なら、色は詰めた値の小さい順で、convert が作るパレットと同じ。フレームに覆われない部分は数えない（alpha は数えるので、同じ値で「透明あり・透明な色なし」になりうる）。タイルごとに固定の大きさの表で数え、最後に並べ直す。
 - **pixel_scale**（ユーザーの決定）：全行・全列の色の変わり目の位置（合併）の差の最大公約数を倍率 `k`、変わり目の位置の余りを位相 `phase` とする（端の欠けたブロックは数えない）。位相をずらして切り抜いた絵でも倍率が出る。同じ色の連続の長さの最大公約数（以前の定義）は、切り抜きで 1 に落ち、レンガ積みの模様を倍率と取り違える。厳密な定義だけで、JPEG・平滑な拡大・あとから書き足した 1 点では 1 に落ちる（許容差つきの推定は、それを使う機能を作る段で別の解析にする）。最近傍で k 倍すると `k`・`phase` がちょうど k 倍になり、`lines`・`lossless` は変わらない。変わり目が 1 本以下の軸は null。フレームの列は各フレームの中だけで比べ、キャンバスの座標で合併する（フレームの縁と覆われない部分の境は変わり目に数えないので、同じ見え方の 1 枚の画像と結果が違いうる。例：キャンバスの (1, 1) に置いた 4×4 の赤のフレームは null、同じ見え方の画像は k 4・位相 1）。
 - **sprite_grid**：透明（なければ四隅と同じ背景色）を空とし、軸ごとに周期で畳んで「詰めた格子・周期の格子」を作り、整数の順位（中身のあるセルの多さ、セルの数、余白の整い方、空の割合、当てはまり方、位置、幅、周期）で 1 つ選ぶ。中身のあるセルが 2 つ以上の格子だけ。周期の上限 4,096・候補 3 つは版に凍結する定数。推定（合成のシートで確かめた。ラベル入り・はみ出しなどの実物では外れうる。中身がセルの縁に届かないシートでは、セルの大きさが画素から決まらない）。背景色のシートでは `split_grid` の `skipEmpty`（透明しか見ない）が背景だけのセルを残す。フレームの列は受けない（1 枚の画像だけ）。
-- **ドット絵かどうか**の判定は解析に入れない（倍率・色数・アルファの事実から M11 が決める）。
+- **ドット絵かどうか**の判定は解析に入れない。M11 で kura-core の `analysis::facts::pixel_art_v1`（純粋な関数。版 `PIXEL_RULE` = 1）が、倍率（pixel_scale）・見える色の数（colors の `visible`）・半透明の画素の数（alpha の `partial`）と大きさから決める：svg・jpeg はいいえ、aseprite ははい。ほかは「拡大：可逆で、両方の軸が 2≤k≤64、元の大きさ（各辺 / k）が 4px 以上」か「等倍：見える色が 64 色以下・半透明の画素なし・長辺 512 以下」ならはい、どちらでもなければいいえ、材料が足りなければ決めない（NULL）。JPEG・HEIC・HEIF は読まずに形式から「いいえ」。規則・定数を変えたら `PIXEL_RULE` を上げる（読み直さずに結果の表から事実を作り直す）。表示と検索の実効値は「利用者の設定 ?? 自動の判定」（docs/data-model.md §4）。
 - フォント・3D の情報（書体名・字数、頂点数・大きさ）は kura-engine の解析（値を受ける）ではない。フォントは kura-mac の CoreText（`kura_probe` の種類 3）、3D は kura-engine の `model::read_info`（glb の JSON の塊だけ。§9.10）で読む。
 - 速さ（16384²、release・16 コア、負荷のある中の目安）：alpha 15〜41 ms、opaque_bounds 約 33 ms、colors 5〜82 ms（最悪は画素ごとに色が違う形）、pixel_scale 53〜168 ms、sprite_grid 139〜218 ms。値の大きさに比例する確保はしない。
 
@@ -934,6 +936,12 @@ impl Engine {   // 段 10 で足したもの
 - 数えるもの：デコードした元の値（一括は見積もりに入れ、エディタは `NodeCache::register_external` で数えて `CacheLease` が覆う）、キャッシュ（`CacheLease` が上限と今の大きさの大きいほうを覆う）、描く間の値と作業領域、書き出しの作業領域と書いたバイト列。
 - 数えないもの：タイル・ブロック 1 つぶんの一時の領域、スレッドのスタック、計画・文書・セッションの履歴（履歴は `HistoryLimits` で別に抑える。予算には数えないが、NFR-17 の判定の実測には文書・履歴も入る：基準は実行の場を作るだけの子で、文書を開いたエディタの子との差を測る）。前回の表示（`View`。§12.8）と `render_cached` の前回の出力は、キャッシュの外で持ち、数えない（どちらも入力は（指紋, 元）だけで、入力の値は保たない。出力・表示の値のタイルの多くはキャッシュの項目と実体を共有する。表示の値からは由来 `Exact` のときのほか `&Value` を取れないので、`register_external` にも渡せない）。配信のために全体の値（`render_cached` の出力・`exact()` で取り出せる値）をキャッシュから追い出したあとも持つなら、M12 が `register_external` で数え、入れ替えるときに `unregister_external` で外す。
 - NFR-07 とは別に数える（ユーザーの決定）：NFR-07 はライブラリの表示の分。編集の値とキャッシュは NFR-17 の予算で数え、エディタを閉じたら捨てる。
+- M11 の使い手（kura-core。M11 の決定 2・8）：エディタのほかに、解析・サムネイル・試聴の PCM・アニメの帯が、ライブラリごとの同じ予算とプール（§12.11）を使う。
+  - 解析のジョブとエンジンの道のサムネイルは一括（`Class::Bulk`）。どちらもジョブのスレッド（プールの外）で形を読んで見積もり、確保を待ってから一括のプールの中で読む・描く。ジョブが動いている間のメモリは NFR-07 の外として別に記録する（NFR-07 は表示の分）。
+  - サムネイル（`media::engine_thumbs`）：同時の確保は 256 MiB まで（`INFLIGHT_CAP`）。見積もりの和がこれに収まるように小分けにし、小分けごとに確保する。1 件で超えるものは 1 件だけの小分けにする（予算の全体を超えれば確保で `Limit`）。値が 1 GiB（`VALUE_CAP`）を超えるもの・`Limit`・読めないものは、画像なら ImageIO の道へ回し、3D は種類の絵にする。
+  - 解析（`analysis::job`）：1 件の見積もり（値の 2 倍 ＋ デコーダの作業領域）が min(予算/2, 1 GiB)（`ITEM_CAP`）を超えるものは、確保せずに失敗（`too_large`）にする。
+  - 試聴の PCM（`/pcm`）とアニメの帯（`item_anim_get`）は対話（`Class::Interactive`）で、待たない（`try_acquire`）。利用者がその場で待つ短い表示の用意なのでジョブにしない。空いていなければ PCM は 503、帯は `Busy`。予算の全体を超える帯は `TooLarge`。読む・組むのはプレビューのプール。PCM は読んだ値を 1 件だけ覚え、その間は確保を持つ（60 秒使わなければ捨てる）。
+- 確保器（M11。ADR-163）：アプリと kura-devtools は、1 MiB 以上の確保を `mmap` で取り `munmap` ですぐ OS へ返す `kura_mac::ReturningAllocator` を `#[global_allocator]` にした（libmalloc の large cache が解析・サムネイルのあとも空の領域を 445 MB 抱え、NFR-07 に戻らなかったため。`MallocLargeCache` は文書にない設定なので使わない）。下の段 10 の実測と見積もりの式（持ち越し）は libmalloc のときのもので、式は変えていない。
 - 見積もり（`Engine::estimate`）：描かない純粋な関数。ヘッダから読んだ形で compile した計画で、読む前に呼べる。条件（`EstimateSpec`）は、入力の来し方（`Source::Held`（予算の外で数えている値。エディタの入力）・`Memory`・`Decode { codecs, format }`・`Decoder { decoder, format }`）、読む入力のファイルの長さ（`lens`。`EstimateSpec::input_len`。分かるものだけ）、書き出し（`Sink::Encode`・`Encoder`）、並列の数（`Work::total` に渡す）、ダイジェストを取るか。段ごとの量は、その段で生きている値と作業領域の最大。
   - 読む：読み終えた入力 ＋ 読んでいる入力の値 ＋ max(デコーダの作業領域（§9.9。ファイルの長さがあれば `Decoder::file_work_bytes`：ファイル全体を読んで持つ aseprite は長さを足す。なければ `Decoder::work_bytes`）, 読み取りの記録のダイジェストの帯)。
   - 描く：入力 ＋ 生きている途中の値（最後の使い手のあとで落ちる）＋ 今のノードの出力 ＋ 作業領域（`Op::work_bytes` の `Work::total(並列の数)`。持ち上げたノードはフレームの形で求める）＋ 申告した解析の結果（`estimate().bytes`）。量子化した値とダイジェストの帯（min(値, 4 MiB)）もここで数える。
@@ -958,7 +966,7 @@ impl Engine {   // 段 10 で足したもの
 | WAV 60 秒 → 音量 → Ogg Vorbis | 94.4 | 117.1 | 135.2 |
 
   1 行目の通しを `MallocLargeCache=0` で起こすと 252 MiB で、段の最大の見積もりに収まった。
-- 残したこと：エディタを開くときに読んだ作業領域の持ち越しは、まだ予算の外（開く読みも `admit` で確保するか、kura-mac に段の間で領域を OS へ返す口を足すかは後で決める）。JPEG のベースラインは、形だけでは見分けられないので約 2 倍に見積もる。前回の表示（`View`）と `render_cached` の前回の出力は数えていない（上の数えないもの）。aseprite の見積もりの外にあるもの（長さを渡さないとき・大きいセル・深いグループ・`shape()` の読み）と、まだ長さを使っていないデコーダは §9.9。
+- 残したこと：エディタを開くときに読んだ作業領域の持ち越しは、まだ予算の外（開く読みも `admit` で確保するかは後で決める。OS へ返す側は、M11 で 1 MiB 以上の確保をすぐ返す確保器をアプリに入れた（上の「確保器」）。持ち越しの式は変えていない）。JPEG のベースラインは、形だけでは見分けられないので約 2 倍に見積もる。前回の表示（`View`）と `render_cached` の前回の出力は数えていない（上の数えないもの）。aseprite の見積もりの外にあるもの（長さを渡さないとき・大きいセル・深いグループ・`shape()` の読み）と、まだ長さを使っていないデコーダは §9.9。
 
 ### 12.11 プール
 
@@ -989,11 +997,12 @@ impl Engine {   // 段 10 で足したもの
 - 下書きの形式は作らない（M12）。頭の文書と土台の版から作り直す口（`open`・`open_json`。`open_json` は `Engine::load` を通して古いスキーマを移す）だけを持つ。作り直すと同じ文書・同じ鍵になる。
 - 実測（M4 Max・release。`tests/bench_session.rs`）：筆 1 本（500 点）の追記の手は p95 8.0〜12.5 µs（筆 999〜5 万本の文書）、引数の変更の手は p50 1.9 µs、undo・redo は約 1 ns、開くのは 3.1 ms（999 本）〜166 ms（5 万本）。5 万本の文書の `to_graph` は 24 ms、正規の JSON は 140 ms（保存・下書きの道。to_graph を通さずに直接書けば縮められる）。
 
-### 12.13 配信（M12）
+### 12.13 配信（M11・M12）
 
-- `kura://localhost/edit/{session}/{rev}/…`（画像のタイル・全体、音声の WAV・PCM・波形）と `/peaks/{hash}`。`{rev}` は中身から決まる番号ではない（同じ中身に別の番号が付くこともある）が、セッションの中で番号を使い回さないので、同じ（セッション, rev）の中身は変わらない（応答を覚えてよい）。undo・redo は戻った先の手の番号を返すので、前に取ったタイルがそのまま使える。`/peaks/{hash}` は中身から決まる。
+- M11 で入れたもの（ライブラリのファイル。どれも中身のハッシュから決まる。architecture.md §4）：波形の段 `/peaks/{hash}`（解析のジョブが置いた `kura-peaks`。immutable）、試聴の PCM `/pcm/{hash}/{start}-{end}`（元の中身をエンジンのコーデックの組で読み、フレームの半開区間を WAV にする。kura チャンクに同じ読み取りのループ点・長さ・デコーダの識別子。キャッシュしない）、アニメの帯 `/anim/{hash}/1`（`item_anim_get` が作った PNG。末尾は帯の並べ方の版。immutable で、格子の帯は `?r=`）。
+- M12：`kura://localhost/edit/{session}/{rev}/…`（画像のタイル・全体、音声の WAV・PCM・波形）。`{rev}` は中身から決まる番号ではない（同じ中身に別の番号が付くこともある）が、セッションの中で番号を使い回さないので、同じ（セッション, rev）の中身は変わらない（応答を覚えてよい）。undo・redo は戻った先の手の番号を返すので、前に取ったタイルがそのまま使える。
 - 手のあとは、変わったタイル（`render_view` の `changed`。§12.6・§12.8）だけを取り直す。タイルを最後に変わった rev で指すかなど、URL の形は M12 で決める。
-- CORS はアプリの origin だけ、受け付けるのは main の WebView だけにする。この受け口（ラベル・Origin・メソッドの判定と、ACAO・`CSP: sandbox`・`nosniff`）と CSP の `connect-src`・`font-src` は M11 で入れた（architecture.md §4.1）。`/edit/…` も同じ受け口を通る。
+- CORS はアプリの origin だけ、受け付けるのは main の WebView だけにする。この受け口（ラベル・Origin・メソッドの判定と、ACAO・`CSP: sandbox`・`nosniff`）と CSP の `connect-src`・`font-src` は M11 で入れた（判定は CI が回す kura-core の純粋な関数 `serve::access`。architecture.md §4.1・ADR-155）。`/edit/…` も同じ受け口を通る。
 - ライブラリのファイル（元の中身）の試聴の PCM は M11 の `/pcm/{hash}/{start}-{end}`、編集中のもの（文書を当てた値）は `/edit/{session}/{rev}/…` で配る（architecture.md §4）。
 
 ## 13. エラー・中止・上限・安全
@@ -1059,7 +1068,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   2. 消す直前に、その版を文書から作り直して照合する。一致しなければ、そのファイルを残す。
   3. Platform・External でしか読めない元には、初めて編集するときにアンカーを作る（§9.4）。
 - 上書きは「アイテム ID を保ったまま中身を差し替える」操作。タグ・フォルダ・ユニット・プレイリスト・再生の記録は変わらない。手順：staging に書く → ハッシュ → `files/` に配置 → 1 トランザクションで `items.hash` を比較して置き換え、版を足す → 古いファイルを GC の待ち行列へ。
-- `items.hash` を書き換えるのは保存の処理だけ。中身に依る列を書く UPDATE は、すべてハッシュを条件にする（古いハッシュで作ったサムネイルを書き込まないため）。
+- `items.hash` を書き換えるのは保存の処理だけ。中身に依る列を書く UPDATE は、すべてハッシュを条件にする（古いハッシュで作ったサムネイルを書き込まないため）。M11 で解析（`analysis_state` と結果・事実の書き込み。`WHERE id = ? AND hash = ? AND analysis_state = 'pending'`）とサムネイル（`thumb_state`・`thumb_rev` と読んだメディア情報。`WHERE id = ? AND hash = ?`）に入れた。結果・事実は中身ごと（台帳の行 `blob_id`）に持つので、保存で中身が変わると別の行になる（docs/data-model.md §2）。残りはプロキシ（`proxy_state`。今は ID と状態だけが条件）。
 - 取り込みで、あるアイテムの今・元・過去の版と同じ中身なら、そのアイテムの重複として扱う。
 - 上書きの結果が別のアイテムの今と同じ中身になったら保存しない（`Conflict`）。
 - 保存の受け入れテスト（S1〜）は M12 の計画で足す。

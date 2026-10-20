@@ -13,17 +13,24 @@ Kura Library.kuralib/
   thumbs/ab/<blake3>_l.{jpg,png}  # サムネイル 長辺 1600px（インスペクタ・プレビュー用）
   art/ab/<blake3>.jpg           # 音楽のジャケット画像
   proxies/ab/<blake3>.mp4       # 再生用プロキシ（WKWebView で再生できない形式だけ）
-  peaks/ab/<blake3>.peaks       # 音声の波形の段（解析のジョブが staging/peaks-<blake3>.part に書いてから改名する。M11）
-  anim/ab/<blake3>-1.png        # アニメの帯（見たときにその場で作る。末尾は形式の版。M11）
-  staging/                      # 取り込み・ダウンロード・キャプチャの一時置き場
+  peaks/ab/<blake3>.peaks       # 音声の波形の段（kura-peaks 版 1。解析のジョブが staging/peaks-<blake3>.part に書いてから改名する。M11）
+  anim/ab/<blake3>-1.png        # アニメの帯（見たときにその場で作る。末尾は帯の並べ方の版 ANIM_V。tEXt `kura-anim` に帯の情報と作った元の鍵。
+                                #   staging/anim-<pid>-<連番>.png.part に書いてから改名する。M11）
+  staging/                      # 取り込み・ダウンロード・キャプチャの一時置き場。M11 から、波形の段・アニメの帯の書きかけと、
+                                #   エンジンの ffmpeg の段の一時ファイル（staging/engine/）も置く。開くときに消す
   archives/                     # yt-dlp / gallery-dl の download-archive
   logs/                         # ジョブのログ
   backups/library-YYYYMMDD-HHMMSS.sqlite  # DB のバックアップ（UTC。新しい 7 個。FR-SYS-03・ADR-121。マイグレーションの前のものも同じ名前。§5）
 ```
 
 - `files/` のファイル名はハッシュなので、元のファイル名は DB（`original_name`）にだけ残る。
-- `thumbs/`・`art/`・`proxies/`・`peaks/`・`anim/` は中身から作った派生のファイル（`Layout::derived_paths`）。台帳の行を解放したとき
-  （ゴミ箱を空にしたとき）に、実ファイルと一緒に消す。派生のファイルは整合性チェックの対象の外。
+- `thumbs/`・`art/`・`proxies/`・`peaks/`・`anim/` は中身から作った派生のファイル（`Layout::derived_paths`：サムネイルは jpg・png の
+  両方の名前、ジャケット、プロキシ、波形の段、今の版のアニメの帯）。台帳の行を解放したとき（ゴミ箱を空にしたとき）に、実ファイルと
+  一緒に消す。派生のファイルは整合性チェックの対象の外。
+- サムネイルは 1 つの中身に 1 つの形式だけを置く（作り直して形式が変わったら、ほかの形式の古いファイルを消す）。書くたびに
+  `items.thumb_rev` を 1 上げ、URL の `?r=` にする（作り直すと同じ名前のファイルを書き換えるため。docs/architecture.md §4）。
+- `thumbs/`（`art/` を含む）・`peaks/`・`anim/` の大きさは、設定の容量にライブラリのファイルとは別の行で出す（ファイルを数える。
+  ゴミ箱のアイテムの分も含む。`media::usage`）。
 - 既定の場所は初回起動時にユーザーが選ぶ（候補：`~/Pictures/Kura Library.kuralib`）。外付けディスクも可。
 - iCloud Drive など同期フォルダの中は非推奨（SQLite の WAL と相性が悪い）。選ばれたら警告する。
 - マイグレーションを当てる前にも、いつもの名前でバックアップを作る（7 個の保持に乗る。§5）。
@@ -47,7 +54,9 @@ Kura Library.kuralib/
   子の行が CASCADE で消える）。
 - **中身ごととアイテムごと**：中身（ファイルのバイト列）から決まるもの（台帳・事実・解析の結果）は `blobs.id` を鍵にし、
   利用者がアイテムに決めたもの（素材の設定）は `items.id` を鍵にする。中身に依る書き込み（解析・サムネイル・プロキシの結果）は
-  `WHERE id = ? AND hash = ?` のようにハッシュを条件にする（読んだあとに中身が変わっていたら書かない）。
+  `WHERE id = ? AND hash = ?` のようにハッシュを条件にする（読んだあとに中身が変わっていたら書かない）。M11 で解析
+  （`analysis::store::write`）とサムネイル（`media::job` の結果の書き込み）に入れた。プロキシの書き込みはまだ ID と状態だけを
+  条件にしている（中身を変える保存が入る M12 で直す）。
 
 ## 3. スキーマ（`0001_init.sql` と、それ以降のマイグレーションを反映したもの）
 
@@ -85,7 +94,7 @@ CREATE TABLE items (
   width           INTEGER,
   height          INTEGER,
   duration_ms     INTEGER,                          -- 音楽・動画
-  codec_info      TEXT,                             -- ffprobe 要約 JSON：{"codec": 主なコーデック}、プロキシの判定後は {"codec", "video", "audio"}
+  codec_info      TEXT,                             -- 要約 JSON（下の「codec_info の形」）
   title           TEXT    NOT NULL,                 -- 表示名（初期値は元ファイル名から拡張子を除いたもの）
   original_name   TEXT    NOT NULL,
   original_path   TEXT,                             -- 取り込み元（参考情報。アクセスはしない）
@@ -137,6 +146,17 @@ CREATE TRIGGER items_blob_bi BEFORE INSERT ON items BEGIN
 END;
 -- items_blob_bu：BEFORE UPDATE OF hash, ext, size_bytes。同じ形で、作った時刻は new.updated_at
 -- （M12 の保存はハッシュ・拡張子・サイズを 1 つの UPDATE で変える）
+
+-- codec_info の形（JSON。`media::MediaInfo::codec_json`。どれもなければ NULL。読み手は知らない欄を無視する）：
+--   画像・動画・音楽：{"codec": 主なコーデック}（例 'h264'・'aac'・'jpeg'）。プロキシの判定後は {"codec", "video", "audio"}
+--   フォント（M11）：{"codec": 形式（'ttf'・'otf'・'ttc'・'woff'・'woff2'）, "font": {"family", "style", "fullName",
+--     "postscriptName", "glyphs"（字の数）, "faces"（ファイルの中の書体の数。コレクションは 2 以上）, "variable"}}
+--     （取り込みの probe が kura-mac の CoreText で読む。読めなかったものはサムネイルのジョブが読み直す）
+--   3D（M11）：{"codec": "glb", "model": {"vertices", "triangles", "meshes", "materials", "textures", "animations", "skins",
+--     "nodes", "size"（範囲の max − min。[x, y, z]。メートル。数えられなければ null）, "generator", "extensionsRequired",
+--     "unsupported"（描けない理由：必須の Draco・meshopt・知らない拡張の名前と 'skin'。空なら描ける）}}
+--     （サムネイルのジョブが kura-engine の glb の読み手で読む。docs/editing.md §9.10）
+--   フォント・3D の幅・高さ・長さは空。サムネイルのジョブは codec_info が空のときだけ書く（`coalesce(codec_info, ?)`）
 
 -- ===== 仮想フォルダ =====
 CREATE TABLE folders (
@@ -368,27 +388,39 @@ CREATE TABLE settings (
 --                             引数の正規の形。起動のスレッドで比べ、解析の版・計画が変わった種類だけ pending に戻す。M11）
 --       'analysis.decoders' = 解析で読む形式ごとの、段の順のデコーダの識別子（解析のジョブがコーデックの組を作ったときに比べ、
 --                             今の組にないデコーダで読んだものと、並びが変わった形式で失敗していたものを pending に戻す。M11）
---       'analysis.inflight' = 解析のジョブが OS のデコーダ（Platform の段）で読んでいるアイテム（{"id","hash"}。読む前に
---                             コミットし、書いたら消す。次に動いたときに残っていれば、そのアイテムを failed（crashed）にする。M11）
---       'thumbs.plan'       = サムネイルの道の指紋（形式ごとの作り方。変わった形式の ready を stale に、failed を pending に戻す。M11）
+--       'analysis.inflight' = 解析のジョブが OS のデコーダ（Platform の段）で読んでいるアイテム（{"id","hash"}。1 件ずつ解くので
+--                             1 件だけ。Platform の段を通りうる形式だけ、読む前にコミットし、書いたら・落ちずに失敗したら消す。
+--                             解析のジョブが次に動いたときに残っていれば、そのアイテムを failed（crashed）にする。M11）
+--       'thumbs.plan'       = サムネイルの道の指紋（{"v":1,"formats":{形式の表の ID: 作り方の名前}}。作り方の名前は
+--                             'engine-thumbs/1'・'imageio-alpha/1'・'imageio/1'（jpeg）・'video/1'・'audio/1'・'coretext/1'・
+--                             'model-kura-render/1'。開くたびに比べ、変わった形式の ready を stale に、failed を pending に戻す。
+--                             指紋のないライブラリ（M10 まで）は「画像はすべて ImageIO の JPEG、フォント・3D は作らない」と比べる。M11）
+--       'thumbs.inflight'   = サムネイルを作っている途中のアイテム（{"solo": 1 件だけか, "ids": [ID…]}。まとめて作る 64 件か、
+--                             疑わしいものの 1 件。作る前にコミットし、結果を書くトランザクションで消す。並べて作るので、まとめての
+--                             印ではどれで落ちたかは分からない。M11）
+--       'thumbs.suspects'   = 前回まとめて作っている途中で終わったときのアイテム（[ID…]）。次に開いたときに 'thumbs.inflight' から
+--                             移し、サムネイルのジョブが先に 1 件ずつ作る。1 件だけの印が残っていれば、そのアイテムで落ちたとみなし、
+--                             pending は failed に、stale は ready（前の絵のまま）に戻す（同じファイルで落ちるのは多くても 2 回。M11）
 
 -- ===== 中身ごとの事実（0009。検索と表示の列。台帳の 1 行に 1 行。解析の結果から純粋な関数で作る）=====
 CREATE TABLE media_facts (
   blob_id          INTEGER PRIMARY KEY REFERENCES blobs(id) ON DELETE CASCADE,
   state            TEXT    NOT NULL CONSTRAINT media_facts_state CHECK (state IN ('ok','failed')),
   error_code       TEXT,                   -- failed：'unsupported'・'too_large'・'decode'・'crashed'（OS のデコーダで読んでいる途中で終わった）
-  decoder          TEXT,                   -- 読んだデコーダの識別子。形式だけで決めたとき（JPEG・HEIC）は NULL
+  decoder          TEXT,                   -- 読んだデコーダの識別子。形式だけで決めたとき（JPEG・HEIC・HEIF）は NULL
   reproducible     INTEGER,                -- 0/1
   value_digest     BLOB,                   -- 読んだ値のダイジェスト（32 バイト）
   env              TEXT,                   -- 再現を約束しないデコーダの環境（OS の版など）
   facts_v          INTEGER NOT NULL,       -- 投影の版（上がれば analysis_results から作り直す。読み直さない）
-  alpha            INTEGER,                -- 画像：0 なし・1 二値・2 半透明あり。NULL は計っていない
-  colors           INTEGER,                -- 1〜257（257 は 256 を超える）
-  visible_colors   INTEGER,
-  pixel_kx         INTEGER, pixel_ky INTEGER, pixel_lossless INTEGER,
-  pixel_art        INTEGER,                -- 自動の判定（0/1。pixel_rule の版の規則で）
-  pixel_rule       INTEGER,
-  frame_count      INTEGER,
+  alpha            INTEGER,                -- 画像：0 なし・1 二値（透明か不透明だけ）・2 半透明あり。NULL は計っていない
+  colors           INTEGER,                -- 違う色の数 1〜257（257 は「257 色以上」。アルファ 0 の色も RGB が違えば別）
+  visible_colors   INTEGER,                -- アルファ 0 の色を 1 つにまとめた数（1〜257。ドット絵の判定に使う）
+  pixel_kx         INTEGER, pixel_ky INTEGER, pixel_lossless INTEGER,  -- 軸ごとの倍率 k と、可逆か（image.pixel_scale）
+  pixel_art        INTEGER,                -- 自動の判定（0/1。pixel_rule の版の規則で。材料が足りなければ NULL）
+  pixel_rule       INTEGER,                -- ドット絵の判定の版（今は 1。上がれば読み直さずに作り直す）
+  frame_count      INTEGER,                -- コマの数（1 枚の画像は 1。アニメの画像は 2 以上）
+  -- JPEG・HEIC・HEIF は読まずに形式から書く（決定 5）：alpha 0・colors と visible_colors は NULL（計らない）・pixel_art 0・
+  -- frame_count 1（静止画として扱う。HEIC の連続した画像も先頭だけ）・decoder NULL
   loudness         REAL,                   -- 音声：積分ラウドネス（LUFS）。計れなければ NULL で loudness_reason
   loudness_reason  TEXT,
   loudness_range   REAL, true_peak REAL, sample_peak REAL,
@@ -424,11 +456,14 @@ CREATE TABLE analysis_results (
 );
 
 -- ===== 素材の設定（0009。利用者の決定。アイテムごと、変えたアイテムにだけ行がある）=====
+-- 付けるのは画像だけ（`asset::set_settings` がほかの種類の ID を飛ばす）。すべての欄が自動（NULL）に戻れば行を消す。
 CREATE TABLE asset_settings (
   item_id      INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
   pixel_art    INTEGER CONSTRAINT asset_settings_pixel_art CHECK (pixel_art IN (0, 1)),   -- NULL は自動
   pixel_scale  INTEGER CONSTRAINT asset_settings_pixel_scale CHECK (pixel_scale BETWEEN 1 AND 64),
-  grid_json    TEXT,                       -- {"v":1,"cellW","cellH","offsetX","offsetY","gapX","gapY","count"}
+  grid_json    TEXT,                       -- スプライトシートの格子（版 1）：{"v":1,"cellW","cellH","offsetX","offsetY","gapX","gapY",
+                                           -- "count"}（画素の整数。count は使うコマの数で、null はすべて。セルの切り方は
+                                           -- sprite.split_grid と同じ）。知らない版・知らない欄・壊れたものは格子なしとして読む
   frame_ms     INTEGER CONSTRAINT asset_settings_frame_ms CHECK (frame_ms > 0),
   pivot_x      REAL, pivot_y REAL,
   loop_start   INTEGER, loop_end INTEGER,  -- 試聴のループ（標本）。ファイルは変えない（M11 では使わない。M13）
@@ -519,7 +554,7 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   （`idx_items_analysis_pending` だけを読む）。インスペクタで選んだもの（`request_analysis`）は ID で引いて先に解く。
 - **計画**：画像は透過・色数・倍率（段 1）と、1 枚の画像で透過があるか 256 色以下ならスプライトの格子の推定（段 2）。音声は
   ラウドネス・ループ・無音・波形の段（最も細かい段はビンが 4,096 以下になる段、粗い方は 65,536 フレーム）。JPEG・HEIC・HEIF は
-  読まずに形式から事実を書く（透過なし・色数は計らない・ドット絵でない。`decoder` は NULL）。動画・フォント・3D は `not_needed`。
+  読まずに形式から事実を書く（透過なし・色数は計らない・ドット絵でない・1 コマ。`decoder` は NULL）。動画・フォント・3D は `not_needed`。
 - **結果の鍵**：台帳の行 × 解析 ID（`UNIQUE(blob_id, analysis)`）。版と正規の引数は列で、計画の要求と照らす。同じ中身の結果
   （計画の要求の ID・版・正規の引数と、読み取りの記録 `kura.read`）がそろっていれば読まずに使う。再現を約束しないデコーダの
   結果も「その環境で読んだ事実」として持ち、OS の更新では解き直さず、デコーダの識別子が変わったときだけ解き直す
@@ -538,7 +573,20 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`。中止・一時停止・強制終了では、書くまでは `pending` のまま。
 - **一度きりの全件の走査**（例外）：計画の指紋が変わった種類を戻す `UPDATE items … WHERE kind = ? AND analysis_state IN ('ready','failed')`
   と、デコーダの指紋で戻す `UPDATE … WHERE … hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …)` は全件を走査する
-  （指紋が変わったときだけ。テスト `sync_plan_reset_is_a_one_time_full_scan`）。
+  （指紋が変わったときだけ。10 万件で約 70 ms。テスト `sync_plan_reset_is_a_one_time_full_scan`）。
+
+### サムネイルの作り直し（M11。`crates/kura-core/src/media/`）
+
+- **取り出し**：`thumb_state = 'pending'` を新しい順に 64 件（`idx_items_thumb_pending`）。pending がなくなったら `stale` を新しい順に
+  （`idx_items_thumb_stale`）。疑わしいもの（settings の `thumbs.suspects`）があれば、それを先に 1 件ずつ。
+- **書き込み**：64 件を 1 つのトランザクションで、`UPDATE items SET … thumb_state = ?, thumb_rev = thumb_rev + ? … WHERE id = ? AND hash = ?`。
+  作れたら ready で `thumb_rev` を 1 上げる。作り直し（stale）を作れなかったときは、前の絵のまま ready に戻す（rev は変えない）。
+  読んだメディア情報は空の列だけ埋める。
+- **作り方の指紋**（`media::route::sync_plan`。ライブラリを開くとき、ジョブを動かす前）：settings の `thumbs.plan` と今の作り方を
+  形式ごとに比べ、変わった形式の拡張子の `ready` を `stale`、`failed` を `pending` にする。
+- **一度きりの全件の走査**（例外）：この 2 つの `UPDATE items … WHERE thumb_state = 'ready'（'failed'） AND lower(ext) IN (…)` は
+  `ready`・`failed` に索引がないので全件を走査する（指紋が変わったときだけ。M10 の seed 10 万件で 46,860 件を stale にして 71 ms。
+  テスト `plan_updates_scan_items_only_when_the_plan_changes`）。
 
 ### 事実で引く（M11）
 
@@ -581,12 +629,15 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
    理由は `CoreError::Upgrade`（新しい版・空き容量・バックアップ・当てる失敗）の言葉で返す。アプリはこれを `AppError` の code
    `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` にし、`library_open` は失敗として、`library_restore` は
    `error` に入れて返す（docs/architecture.md §3）。開く前に当てるかどうかは `library::needs_upgrade` で分かる。
-7. **知らせ**：当て始めたら（空きの確かめの前）`UpgradeEvent::Started`、終わったら `Finished`、当てられなかったら `Failed` を、
+6. **知らせ**：当て始めたら（空きの確かめの前）`UpgradeEvent::Started`、終わったら `Finished`、当てられなかったら `Failed` を、
    アプリが渡した受け手（`library::UpgradeHooks`）に知らせる。アプリはイベント `library://upgrade` にしてフロントへ送り、フロントは
    300ms を超えたら「ライブラリを更新しています」を出す。新しいライブラリ・当てるものがないとき・新しい版の DB では知らせない。
    開いたことのログ（「起動から前回のライブラリを開くまで」「起動から最初のタイルの詳細を返すまで」）に `upgraded`（この起動で
    新しい版にした）と `upgrade_ms` を付け、更新後の初回を NFR-01 の外として 2 回目以降と分けて記録できるようにする。
-8. アプリの中では `quick_check`・FTS の照合・VACUUM をしない。照合はテストと `kura-devtools bench migrate` で行う。
+7. アプリの中では `quick_check`・FTS の照合・VACUUM をしない。照合はテストと `kura-devtools bench migrate` で行う。
+8. アプリはライブラリを開く・作る・戻すを 1 つの鍵（`AppState::opening`）で順に行う。起動の restore と開く操作が重なっても、
+   新しい版にするのとその前のバックアップは 1 回だけ（2 回目は当て終えた版を開く。src-tauri の
+   `opening_the_same_library_in_parallel_upgrades_once`）。
 
 **10 万件の時間**（2026-10-20、M4 Max、同梱の SQLite 3.53、ページキャッシュは温まった状態、ほかの作業でロードアベレージ 9〜12。
 `bench migrate --runs 3`。開くところから数えた時間）：
@@ -598,3 +649,9 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
 
 どちらも、すべての表の行数が当てる前と同じ、`foreign_key_check` が空、FTS の照合（rank=1）と `quick_check` が ok、台帳と items が
 1 対 1（10 万行）だった。更新後の初回の起動にだけ載る一度きりの作業で、NFR-01 の外として別に記録する（2 回目以降は 1.5 秒を保つ）。
+
+確保器を入れたあとのコミット（fbd7580。ロードアベレージ 3.4〜7）で、seed 10 万件を測り直した（`bench migrate --runs 3`）：開く処理の全体
+713〜715ms（バックアップ 42〜43ms、0007 667〜671ms、0008 1ms、0009 0.2ms、TRUNCATE 0.7ms）。21 表の行数 504,767 が当てる前と同じ、
+`foreign_key_check` が空、FTS の照合と `quick_check` が ok、台帳と items が 1 対 1。アプリで更新後の初回を開くと、起動から最初の
+タイルの詳細を返すまで 1.39〜1.43 秒（うち更新 0.86〜0.90 秒。サムネイルの作り方の指紋で 46,860 件を stale にする 71ms を含む）、
+更新直後の 2 回目は 0.39 秒だった（docs/requirements.md の NFR-01）。

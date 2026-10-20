@@ -12,7 +12,9 @@ paths:
 - 書き込みは単一ライタースレッドに集約する。読み取りは読み取り専用接続のプールから。
 - 大量挿入は 500 件程度ずつトランザクションにまとめる。
 - 新しいクエリを足したら、テストで `EXPLAIN QUERY PLAN` を確認し、全件スキャン（`SCAN items`）になっていないか見る。
-  一度きりの全件の走査（起動時の指紋で pending・stale に戻す UPDATE など）は、テストに例外として理由を書く。
+  一度きりの全件の走査（起動時の指紋で pending・stale に戻す UPDATE など）は、テストに例外として理由を書く（今の例外：
+  サムネイルの `thumbs.plan` の `plan_updates_scan_items_only_when_the_plan_changes`、解析の `analysis.plan`・`analysis.decoders` の
+  `sync_plan_reset_is_a_one_time_full_scan`。docs/data-model.md §4）。
 - 10 万件のダミーデータ（`kura-devtools seed`）で、タグ 3 つの AND 検索が 50ms 以内であることを保つ。
 
 ## 表を作り直すとき（docs/data-model.md §5）
@@ -33,7 +35,9 @@ paths:
   で行う（同梱の SQLite 3.53 以上。`named_checks_can_be_widened_without_a_rebuild` が版を見張る）。
 - CHECK 付きの `ADD COLUMN` は全行を確かめる（10 万件で約 150ms）。起動の道に載るので、作り直すついでに足すか、CHECK なしにする。
 - `INSERT OR REPLACE INTO items`（と `REPLACE INTO items`）は使わない。REPLACE は行を消してから入れるので、
-  子の行が `ON DELETE CASCADE` で消える。既存の行を変えるときは `UPDATE` か `INSERT … ON CONFLICT … DO UPDATE` にする。
+  子の行が `ON DELETE CASCADE` で消える。既存の行を変えるときは `UPDATE` か `INSERT … ON CONFLICT … DO UPDATE` にする
+  （`nothing_replaces_rows_of_items` が kura-core の src を走査して見張る）。
 - `items` の `hash`・`ext`・`size_bytes` は台帳 `blobs` の写し（0007 のトリガ `items_blob_bi`・`items_blob_bu` が載せ、食い違えば
   `items_blob_mismatch` で断る）。台帳の行を消すのは `library::ledger::release` だけ（どの表からも参照されない行だけを消す）。
-- 中身に依る書き込み（解析・サムネイル・プロキシの結果）は `WHERE id = ? AND hash = ?` のようにハッシュを条件にする。
+- 中身に依る書き込み（解析・サムネイル・プロキシの結果）は `WHERE id = ? AND hash = ?` のようにハッシュを条件にする
+  （解析・サムネイルは M11 で入れた。プロキシの今の書き込みは ID と状態だけが条件で、M12 で直す）。

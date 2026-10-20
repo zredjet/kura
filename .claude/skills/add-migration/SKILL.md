@@ -15,10 +15,11 @@ description: SQLite のスキーマ変更（テーブル・列・インデック
      （`Plain` のまま DROP すると、子の行が `ON DELETE CASCADE` で消える）。消える索引・トリガ（FTS のトリガも）は同じファイルで作り直す。
    - 新しい CHECK には名前を付ける（`<表>_<列>`・`<表>_<意味>`）。`INSERT OR REPLACE INTO items` は使わない。
 3. `docs/data-model.md` の該当テーブル定義と説明（§3 のマイグレーションの表、§5 の当て方と時間）を更新する。
-4. テストを追加する（`db/migrate.rs` の `mod tests`）：
+4. テストを追加する（`crates/kura-core/src/db/migrate_tests.rs`。準備の関数は `db/testing.rs`）：
    - 空の DB に全マイグレーションを適用できること
-   - 1 つ前の版のスキーマに `fill_v6`（すべての表に行を入れる準備。表を足したらここにも行を足す）でデータを入れ、
-     新しいマイグレーションの前後の `snapshot`（すべての表の行・索引とトリガの定義・FTS の照合）を、前からある列だけで比べて一致すること
+   - すべての表を埋めた 1 つ前の版で、新しいマイグレーションの前後の `snapshot`（すべての表の行・索引とトリガの定義・FTS の照合）を、
+     前からある列だけ（`snapshot_cols`）で比べて一致すること。準備は `fill_v6`（版 6 の表）で入れて 1 つ前の版まで当て、
+     0009 以降の表は `fill_latest` で入れる。表を足したら `fill_latest` にも行を足す（`fixture_fills_every_table_at_the_latest_version` が見張る）
    - 増えた表・索引・トリガがちょうど狙いのものであること
 5. 新しいインデックスやクエリは `EXPLAIN QUERY PLAN` で全件スキャンにならないことを確認する。
 6. 10 万件で時間を測る：`cargo run --release -p kura-devtools -- bench migrate --items 100000 --history --runs 3`

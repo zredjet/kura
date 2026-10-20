@@ -8,6 +8,7 @@ paths:
 - 色・余白・角丸・文字サイズは `src/styles/tokens.css` の CSS 変数だけを使う。色コードの直書き禁止。
 - コンポーネントは `src/components/`（汎用部品）と `src/features/<機能>/`（画面）に分ける。
 - IPC は `src/ipc/bindings.ts`（自動生成、手で編集しない）を `src/ipc/` のラッパー経由で呼ぶ。
+- アイテムの種類（`items.kind`）の型・並び・述語は `src/ipc/kinds.ts` だけから使う（bindings の定数 `ITEM_KINDS` を読む。`'image' | 'video' | 'audio'` のような型や種類の並びを画面ごとに書かない。並びは 画像・動画・音楽・フォント・3D）。検索のフィールド名・種類の語・記号の表も bindings の定数（`QUERY_FIELD_NAMES`・`QUERY_KIND_WORDS`・`QUERY_SYMBOLS`）を読み、手で写さない（M11）。
 - 画像・動画・音声とその派生（サムネイル・ジャケット・波形・試聴の PCM・アニメの帯）の URL は `src/ipc/media.ts` の関数だけで組み立てる（`kura://localhost/...`。`kura://` の文字列をほかに書かない）。
   - `thumbUrl(hash, size, rev)`：`/thumb/{hash}/{s|l}`。`rev`（`thumbRev`）が 0 より大きいときだけ `?r={rev}` を付ける（作り直したサムネイルを WebKit のメモリのキャッシュから出さないため。`rev` は省けない）。呼ぶのは `src/components/MediaImage` だけ（市松模様・ドット絵の最近傍・フォントの mask をそこで当てる）。サムネイルを出す所はすべて `MediaImage` を通す。
   - サムネイルがあるかは `hasThumb(thumbState)`（`ready` か、作り直すまで今の絵を出す `stale`）。`thumbState === 'ready'` で判定しない。
