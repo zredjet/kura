@@ -10,7 +10,8 @@
 │        │ Channel / イベント（進捗）          │  kura://localhost/...        │
 ├────────┼────────────────────────────────────┼────────────────────────────────┤
 │ src-tauri（薄い層）                                                          │
-│   commands/   protocol/kura.rs（Range 対応）   events   window（Mac 設定）    │
+│   commands/  protocol.rs（kura://・Range 対応）  navigation.rs（main の窓） │
+│   engine.rs（エンジンの部品）  state.rs  dto.rs（型・イベント）  config.rs  │
 ├────────┼────────────────────────────────────────────────────────────────────┤
 │ kura-core（OS 非依存・テスト容易）                                             │
 │   db/  import/  query/（検索言語）  unit/  playlist/  jobs/  download/  capture/ │
