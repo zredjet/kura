@@ -11,7 +11,8 @@
 //! - **描かないもの**：必須の Draco・meshopt・basisu などの圧縮・知らない必須の拡張・スキン（決定 9。情報だけ出して、
 //!   サムネイルは種類のアイコン）。点・線のプリミティブ・疎な accessor・外部の参照は飛ばす（[`Scene::warnings`]）。
 //! - **壊れた入力**：上限（[`ModelLimits`]）を確保の前に確かめ、`try_reserve_exact` で確保する。JSON は serde_json に渡す前に
-//!   生のバイト列で入れ子の深さ（64）とオブジェクトの数を数えて断る。ノードの木は再帰せずにたどり、同じノードは 1 度だけ
+//!   生のバイト列で入れ子の深さ（64）・オブジェクトの数・値の数を数えて断り、名前・文字列・使わない属性と拡張は数と長さを
+//!   抑えた入れ物に読む（組み立てる確保の見積もりは [`ModelInfo::json_heap`]）。ノードの木は再帰せずにたどり、同じノードは 1 度だけ
 //!   （輪・共有の子を断つ）。自前の走査はどの枝でも進む。panic しない（ファズの対象 `model_glb`）。
 
 mod build;
@@ -43,6 +44,8 @@ pub struct ModelLimits {
     pub max_json_bytes: u64,
     /// JSON のオブジェクトの数（serde で作る構造体の数を抑える）。
     pub max_json_objects: u64,
+    /// JSON の値の数（配列の要素とオブジェクトのメンバー。serde で作る並びの長さを抑える。M11 の検証 S3）。
+    pub max_json_values: u64,
     /// ノードの数（JSON の `nodes`）。
     pub max_nodes: u64,
     /// 描くメッシュの実体（メッシュを持つノード）× プリミティブの数。
@@ -69,6 +72,7 @@ impl Default for ModelLimits {
             max_file_bytes: 512 << 20,
             max_json_bytes: 32 << 20,
             max_json_objects: 1 << 17,
+            max_json_values: 1 << 21,
             max_nodes: 1 << 16,
             max_parts: 1 << 16,
             max_vertices: 1 << 22,
@@ -89,6 +93,7 @@ impl ModelLimits {
             max_file_bytes: 4 << 20,
             max_json_bytes: 1 << 20,
             max_json_objects: 4_096,
+            max_json_values: 1 << 16,
             max_nodes: 1_024,
             max_parts: 1_024,
             max_vertices: 1 << 16,

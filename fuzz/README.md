@@ -2,11 +2,12 @@
 
 kura-engine の外から来る入力を読むコード（デコーダと文書の読み込み・描画）を、カバレッジを見ながら変異させて試す。
 自前のエンコーダの書き出し（外から来た値の標本を書く）も試す。
-対象の本体は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_peaks`・`fuzz_model`（自前のコードの panic・形と中身の食い違い・`Internal` を見つける）。
-対象は `fuzz_targets/` のファイル名（`decode_png`・`decode_jpeg`・`decode_gif`・`decode_webp`・`decode_aseprite`・`decode_psd`・`decode_svg`・`decode_wav`・`decode_aiff`・`decode_flac`・`decode_mp3`・`decode_ogg`・`decode_m4a`・`decode_aac`・`encode_ogg`・`document`・`decode_peaks`・`decode_anchor`・`model_glb`）。
+対象の本体は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`（自前のコードの panic・形と中身の食い違い・`Internal` を見つける）。
+対象は `fuzz_targets/` のファイル名（`decode_png`・`decode_jpeg`・`decode_gif`・`decode_webp`・`decode_aseprite`・`decode_psd`・`decode_svg`・`decode_svg_text`・`decode_wav`・`decode_aiff`・`decode_flac`・`decode_mp3`・`decode_ogg`・`decode_m4a`・`decode_aac`・`encode_ogg`・`document`・`decode_peaks`・`decode_anchor`・`model_glb`）。
 
 - `decode_peaks`：波形の段のバイナリ（`kura-peaks`。解析 `audio.peaks` の正規の形で、kura-core がキャッシュから読み直すときのパーサー）を読み、読めたなら書き直すと同じバイト列に戻ることを確かめる（`tests/fuzz_smoke.rs` の対象の名前は `peaks`）。
 - `model_glb`：3D モデル（glb。M11。`kura_engine::model`）の情報を読み（JSON の塊だけ）、焼き込み（accessor・ノードの木・埋め込みのテクスチャ）、2 つの向きで 24px に描く。情報と焼き込みの食い違い（情報が読めないのに焼き込めた・描けない印があるのに焼き込めた）と描いた画像の形も見る。種は `model::sample_glbs`（`tests/fuzz_smoke.rs` の対象の名前も `model_glb`）。
+- `decode_svg_text`：文字を含む SVG を、小さなフォント 2 つ（`testing::fuzz_svg_fonts`。書体にない字は代わりを探す）を渡した svg のデコーダで読む（M11 の検証 S1。文字のレイアウト・代わりのフォント・レイアウトの手間の見積もりと、textPath の拡大の上限の道。`decode_svg` はフォントを渡さないので通らない）。遅い入力（見積もりの漏れ）は `-timeout` で見る（`tests/fuzz_smoke.rs` の対象の名前は `svg_text`）。
 - `decode_anchor`：アンカー（段 9。PNG・APNG・f32 の WAV に私用のチャンクのヘッダを足したもの。`codec::anchor`）を読む。ヘッダのダイジェスト・正規の形・中の固定のデコーダ・値のダイジェストの照合の経路（`tests/fuzz_smoke.rs` の対象の名前は `anchor`）。
 
 - `encode_ogg`：先頭の 19 バイト（`kura_engine::testing::FUZZ_ENCODE_HEADER`）で設定（品質 −1〜10・レート・チャンネル 1〜9・長さ 0〜16,384 フレーム）とメタデータ（ループ点：なし・(a, b)・始まりか終わりが u64 の端に近いもの。長さの外・長さ 0・逆向きを含む。タグ：0〜4 個。既知の名前とその別名（DESCRIPTION・小文字ちょうどの `cprt`）・大文字と小文字だけが違う名前・書けない名前と、空・`=` を含む・NUL・4,096 バイトの前後・70,000 バイトの値）を決め、残りを f32 のビット列（NaN・∞・巨大な値を含む）として標本にし、自作の Ogg Vorbis のエンコーダで書いて、すべての ogg のデコーダで読み直す（長さ・レート・チャンネルが元と同じか）。書けない形（レート・チャンネルの範囲の外）は断ること、書けると答えた形は断らないことも確かめる。メタデータは、書いたコメントヘッダを読んで、LOOPSTART・LOOPLENGTH が `start < end ≤ 長さ` のときだけ正しい値で書かれること、読み取りが同じタグにまとめる名前（大文字と小文字だけの違い・DESCRIPTION と COMMENT・小文字ちょうどの `cprt` と COPYRIGHT）が重複しないこと、`ENCODER=ogg-vorbis-kura-enc/1` があること、読み直したループ点が書いたものと同じこと、読み直したタグを書き直したときのコメントが書いたものと同じこと（読み取りが同じタグにまとめる名前の違いを除いて）を確かめる。見出しの並びは `kura_engine::testing::fuzz_encode` の説明、種の作り方は `fuzz_encode_input`・`fuzz_encode_input_meta`。

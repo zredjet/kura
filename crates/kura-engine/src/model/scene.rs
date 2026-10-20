@@ -513,7 +513,7 @@ fn add_primitive(
             "三角形でないプリミティブ（モード {mode}）は描きません"
         )));
     }
-    let pos_index = *p
+    let pos_index = p
         .attributes
         .get("POSITION")
         .ok_or_else(|| bad("POSITION がありません"))?;
@@ -535,7 +535,7 @@ fn add_primitive(
     let count = positions.len();
     // 属性は頂点と同じ数だけ（多いものは確保の前に断って、属性なしとして扱う）
     let same = count as u64;
-    let read_opt = |name: &str| p.attributes.get(name).copied();
+    let read_opt = |name: &str| p.attributes.get(name);
     let normals = match read_opt("NORMAL") {
         Some(i) => gltf::read_floats::<3>(root, bin, i, [0.0; 3], same)
             .ok()

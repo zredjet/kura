@@ -14,6 +14,7 @@ use serde_json::Value;
 use super::detect::Tool;
 use super::meta::{FileMeta, TagPolicy, from_gallerydl, from_ytdlp};
 use crate::Result;
+use crate::db::Db;
 use crate::import::place::{place, stage};
 use crate::import::store::{
     NewItem, add_tag, add_to_folder, add_unit_member, create_unit, ensure_tag, find_by_hash,
@@ -21,6 +22,7 @@ use crate::import::store::{
 };
 use crate::import::{MediaKind, Rejected, classify_file, mime_for};
 use crate::library::Layout;
+use crate::media::inflight::{self, ProbeWay};
 use crate::media::{MediaBackend, MediaInfo};
 use crate::tags::TagName;
 use crate::text::{natural_cmp, nfc};
@@ -182,47 +184,72 @@ pub struct Placed {
     hash: [u8; 32],
     size: u64,
     info: Option<MediaInfo>,
+    /// 前回このファイルのメディア情報を読んでいて落ちたので読まなかった（アイテムはサムネイルを作れなかったものにする）。
+    crashed: bool,
 }
 
 /// 配置した結果、または失敗の理由。
 pub type PlaceOutcome = std::result::Result<Placed, String>;
 
-/// ファイルを配置する（DB には触れない。並列）。作業フォルダのファイルはクローンでコピーするので残る。
+/// ファイルを配置し、メディア情報を処理中の印を付けて読む（`media::inflight::ProbeBatch`。OS のデコーダで落ちても、次の起動で
+/// 同じファイル（作業フォルダのパスで覚える）で落ち続けない。M11 の検証 S2）。印は配置の前に 1 回書き、配置と読み取りは
+/// 続けて並列に。前回まとめて読んでいて落ちたものは、あとで 1 件ずつ印を付けて読む。DB に書くのは印だけ。作業フォルダの
+/// ファイルはクローンでコピーするので残る。印は [`write_entries`] が片付ける。
 pub fn place_all(
+    db: &Db,
     layout: &Layout,
     backend: &dyn MediaBackend,
     job_id: i64,
     files: &[Downloaded],
-) -> Vec<PlaceOutcome> {
-    files
+) -> Result<Vec<PlaceOutcome>> {
+    let keys: Vec<String> = files.iter().map(|f| inflight::probe_key(&f.path)).collect();
+    let probes = inflight::ProbeBatch::begin(db, job_id, keys.clone())?;
+    let mut placed: Vec<PlaceOutcome> = files
         .par_iter()
+        .zip(keys.par_iter())
         .enumerate()
-        .map(|(i, file)| {
+        .map(|(i, (file, key))| {
             let staging = layout
                 .staging_dir()
                 .join(format!("import-dl-{job_id}-{i}.{}", file.ext));
             let staged = stage(&file.path, &staging).map_err(|e| e.to_string())?;
             let final_path = layout.content_path(&staged.hash, &file.ext);
             place(&staged, &final_path).map_err(|e| e.to_string())?;
-            let info = backend.probe(&final_path, file.kind).ok();
             Ok(Placed {
                 hash: staged.hash,
                 size: staged.size,
-                info,
+                info: probes.probe_together(key, backend, &final_path, file.kind),
+                crashed: probes.way(key) == ProbeWay::Skip,
             })
         })
-        .collect()
+        .collect();
+    for ((file, key), outcome) in files.iter().zip(&keys).zip(&mut placed) {
+        if let Ok(p) = outcome
+            && probes.way(key) == ProbeWay::Alone
+        {
+            p.info = probes.probe_alone(
+                db,
+                key,
+                backend,
+                &layout.content_path(&p.hash, &file.ext),
+                file.kind,
+            )?;
+        }
+    }
+    Ok(placed)
 }
 
 /// 配置したファイルを DB に入れる（アイテム・フォルダ・タグ・ユニット・`remote_sources`）。
 /// 同じ中身がすでにあれば、そのアイテムに所属とタグを足し、空いている取得元と投稿日だけ埋める。
 /// 同じ中身で拡張子だけ違うコピー（台帳の拡張子と違う `files/` のファイル）は、どの行も使わないのでここで消す。
+/// [`place_all`] がジョブ `job_id` に付けた probe の印を、同じトランザクションで片付ける。
 pub fn write_entries(
     tx: &Connection,
     layout: &Layout,
     entries: Vec<(Downloaded, PlaceOutcome)>,
     dest_folder_id: Option<i64>,
     origin: Origin,
+    job_id: i64,
 ) -> Result<Registered> {
     let now = crate::time::now_ms();
     let mut out = Registered::default();
@@ -232,6 +259,11 @@ pub fn write_entries(
     };
     let mut tags: HashMap<TagName, i64> = HashMap::new();
     let mut units: HashMap<String, i64> = HashMap::new();
+    let done: Vec<String> = entries
+        .iter()
+        .filter(|(_, o)| o.is_ok())
+        .map(|(f, _)| inflight::probe_key(&f.path))
+        .collect();
     for (file, outcome) in entries {
         let Ok(placed) = outcome else {
             out.failed += 1;
@@ -285,6 +317,9 @@ pub fn write_entries(
             }
         };
         out.item_ids.push(item_id);
+        if placed.crashed {
+            inflight::fail_crashed_thumb(tx, item_id)?;
+        }
         if let Some(folder) = folder {
             add_to_folder(tx, folder, item_id)?;
         }
@@ -347,6 +382,7 @@ pub fn write_entries(
         }
     }
     out.tags = tags.len() as u64;
+    inflight::settle_probes(tx, job_id, &done)?;
     Ok(out)
 }
 
@@ -525,6 +561,7 @@ mod tests {
                 hash: [hash; 32],
                 size: 3,
                 info: None,
+                crashed: false,
             }),
         )
     }
@@ -546,6 +583,7 @@ mod tests {
             ],
             Some(9),
             Origin::Download,
+            1,
         )
         .unwrap();
         assert_eq!((out.added, out.duplicates, out.tags), (2, 0, 2));
@@ -625,6 +663,7 @@ mod tests {
             ],
             None,
             Origin::Download,
+            1,
         )
         .unwrap();
         assert_eq!((again.added, again.duplicates), (1, 1));
@@ -662,6 +701,7 @@ mod tests {
             vec![entry(5, meta("7", 1, false))],
             None,
             Origin::Download,
+            1,
         )
         .unwrap();
         assert_eq!(
@@ -685,8 +725,8 @@ mod tests {
     #[test]
     fn places_files_and_counts_failures() {
         let lib_dir = tempfile::tempdir().unwrap();
-        let layout = Layout::new(lib_dir.path());
-        std::fs::create_dir_all(layout.staging_dir()).unwrap();
+        let lib = crate::library::Library::create(&lib_dir.path().join("L")).unwrap();
+        let layout = lib.layout().clone();
         let work = tempfile::tempdir().unwrap();
         let good = work.path().join("a.jpg");
         std::fs::write(&good, "image").unwrap();
@@ -694,12 +734,73 @@ mod tests {
         ok.path = good.clone();
         let mut missing = entry(2, meta("2", 1, false)).0;
         missing.path = work.path().join("missing.jpg");
-        let placed = place_all(&layout, &NoBackend, 7, &[ok, missing]);
+        let placed = place_all(lib.db(), &layout, &NoBackend, 7, &[ok, missing]).unwrap();
         assert!(placed[0].is_ok() && placed[1].is_err());
         let hash = placed[0].as_ref().unwrap().hash;
         assert!(layout.content_path(&hash, "jpg").is_file());
         // 元のファイル（作業フォルダ）はクローンでコピーしただけなので残る
         assert!(good.is_file());
+    }
+
+    /// 検証 S2：ダウンロード・キャプチャでも、メディア情報は処理中の印を付けて読む。前回 1 件だけで読んでいて落ちたファイルは
+    /// 読まずに入れ、サムネイルを作れなかったものにする。入れたら印と覚えを片付ける。
+    #[test]
+    fn place_all_marks_probes_and_skips_files_that_crashed() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let lib = crate::library::Library::create(&lib_dir.path().join("L")).unwrap();
+        let layout = lib.layout().clone();
+        let work = tempfile::tempdir().unwrap();
+        let (a_path, b_path) = (work.path().join("a.jpg"), work.path().join("b.jpg"));
+        std::fs::write(&a_path, "crashed-imageio").unwrap();
+        std::fs::write(&b_path, "fine").unwrap();
+        let crashed = serde_json::json!([inflight::probe_key(&a_path)]);
+        lib.db()
+            .write(move |tx| crate::settings::set(tx, "probe.crashed", &crashed))
+            .unwrap();
+        let mut fa = entry(1, meta("1", 1, false)).0;
+        fa.path = a_path;
+        let mut fb = entry(2, meta("2", 1, false)).0;
+        fb.path = b_path;
+        let files = vec![fa, fb];
+        let placed = place_all(
+            lib.db(),
+            &layout,
+            &crate::media::fake::FakeBackend,
+            7,
+            &files,
+        )
+        .unwrap();
+        let (pa, pb) = (placed[0].as_ref().unwrap(), placed[1].as_ref().unwrap());
+        assert!(pa.crashed && pa.info.is_none(), "落ちたファイルは読まない");
+        assert!(!pb.crashed && pb.info.is_some());
+        let mark: serde_json::Value = lib
+            .db()
+            .read(|c| crate::settings::get(c, "probe.inflight"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mark[0]["job"], serde_json::json!(7));
+        assert_eq!(mark[0]["solo"], serde_json::json!(false));
+        let written = layout.clone();
+        let entries: Vec<_> = files.into_iter().zip(placed).collect();
+        let out = lib
+            .db()
+            .write(move |tx| write_entries(tx, &written, entries, None, Origin::Download, 7))
+            .unwrap();
+        assert_eq!(out.added, 2);
+        let states: Vec<String> = lib
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT thumb_state FROM items ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(states, vec!["failed".to_string(), "pending".to_string()]);
+        for key in ["probe.inflight", "probe.crashed"] {
+            let left: Option<serde_json::Value> =
+                lib.db().read(|c| crate::settings::get(c, key)).unwrap();
+            assert_eq!(left, None, "{key}");
+        }
     }
 
     #[test]
@@ -752,6 +853,7 @@ mod tests {
                     vec![entry(5, meta("7", 1, false)), entry(6, meta("8", 1, false))],
                     None,
                     Origin::Download,
+                    1,
                 )
             })
             .unwrap();

@@ -11,6 +11,9 @@
 //! - 外部ツールの場所を変えたら（`tools_set_path`）コーデックの組を作り直す（[`EngineServices::reload_codecs`]。ffmpeg を
 //!   探し直す）。使っている途中の組（`Arc`）は使い終わるまで生きる。実行の場は作り直さない（予算を 2 つにしない。プールも
 //!   ツールに依らない）。そのため、実行の場は `OnceLock`、コーデックの組は作り直せる置き場に持つ。
+//! - 試聴の PCM の読んだ結果の置き場（[`PcmCache`]。覚えている間はこの実行の場の予算を持つ）もライブラリごとに持ち、閉じる
+//!   （部品を捨てる）ときにすぐ手放す（M11 の検証 E2：アプリに 1 つだと、前のライブラリの音声と予算の確保を TTL まで持ち続け、
+//!   新しいライブラリの予算はそれを数えなかった）。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -20,6 +23,7 @@ pub use kura_engine::codec::CodecSet;
 
 use super::runtime::{EngineRuntime, RuntimeConfig};
 use crate::Result;
+use crate::asset::pcm::{CACHE_TTL, PcmCache};
 
 /// ffmpeg の段の一時ファイルの置き場（ライブラリの `staging/` の下の名前）。
 pub const ENGINE_WORK_DIR: &str = "engine";
@@ -43,6 +47,8 @@ pub struct EngineServices {
     runtime_init: Mutex<()>,
     /// コーデックの組（作り直せるように `OnceLock` ではなく置き場にする。作る間は錠を持ち、2 回作らない）。
     codecs: Mutex<Option<Arc<CodecSet>>>,
+    /// 試聴の PCM の読んだ結果の置き場（このライブラリの分。見張りのスレッドは覚えたときだけ起きる）。
+    pcm: Arc<PcmCache>,
 }
 
 impl EngineServices {
@@ -54,7 +60,13 @@ impl EngineServices {
             runtime: OnceLock::new(),
             runtime_init: Mutex::new(()),
             codecs: Mutex::new(None),
+            pcm: PcmCache::new(CACHE_TTL),
         }
+    }
+
+    /// 試聴の PCM の読んだ結果の置き場（このライブラリの分）。
+    pub fn pcm_cache(&self) -> &Arc<PcmCache> {
+        &self.pcm
     }
 
     /// ffmpeg の段の一時ファイルの置き場（そのライブラリの `staging/engine`）。
@@ -129,6 +141,14 @@ impl EngineServices {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+}
+
+impl Drop for EngineServices {
+    /// 閉じるとき：試聴の PCM で覚えていた音声と予算の確保をすぐ手放す（TTL の見張りは置き場への強い参照を持って待つので、
+    /// 置き場が捨てられるのを待たずに空にする）。
+    fn drop(&mut self) {
+        self.pcm.clear();
     }
 }
 
