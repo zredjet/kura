@@ -15,10 +15,12 @@ use std::time::Instant;
 use kura_core::analysis::facts::{
     FACTS_V, MediaFacts, PIXEL_RULE, PixelArtInput, from_format, pixel_art_v1,
 };
+use kura_core::analysis::plan::PlanFingerprint;
 use kura_core::analysis::store::{
-    ItemWrite, ReadStamp, Write, is_from_format, write as write_facts,
+    self as analysis_store, ItemWrite, ReadStamp, Write, is_from_format, write as write_facts,
 };
 use kura_core::library::{Library, ThumbSize, hex};
+use kura_core::media::route;
 use kura_core::time::now_ms;
 use kura_engine::analysis::image::alpha::{AlphaKind, AlphaOutput};
 use kura_engine::analysis::image::colors::ColorsOutput;
@@ -149,6 +151,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     insert_items(&library, &templates, seeded)?;
     seed_units(&library, items, now)?;
+    write_plans(&library)?;
     if analyzed {
         let n = seed_facts(&library)?;
         tracing::info!(n, "偽の事実を入れました");
@@ -321,6 +324,24 @@ type PendingRow = (
 );
 
 /// 解析を待つ画像・音声に偽の事実を入れて解析済みにする（解析のジョブと同じ書き込み。500 件ずつ）。入れた数を返す。
+/// 今の作り方の指紋（サムネイルの `thumbs.plan`・解析の `analysis.plan`）を置く。置かないと、初めて開いたときに M10 の
+/// 作り方と比べて png・heic などのサムネイルがすべて作り直しになり、計測（NFR-01・02・03・07）にジョブが混ざる。
+/// seed のサムネイルは今の作り方で作ったものとみなす（中身は JPEG のひな形）。
+fn write_plans(library: &Library) -> Result<(), String> {
+    let current = kura_engine::analysis::registry()
+        .map_err(|e| e.to_string())
+        .and_then(|r| PlanFingerprint::current(&r).map_err(|e| e.to_string()))?;
+    library
+        .db()
+        .write(move |tx| {
+            kura_core::settings::set(tx, route::PLAN_KEY, &route::plan())?;
+            // 指紋がなければすべての種類を pending に戻すが、seed のアイテムはまだ pending なので変わらない
+            analysis_store::sync_plan(tx, &current)?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
+}
+
 fn seed_facts(library: &Library) -> Result<u64, String> {
     let mut rng = ChaCha8Rng::seed_from_u64(0x6661_6374);
     let mut after = 0i64;
@@ -761,6 +782,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!((units, members), (6, 60));
+
+        // 今の作り方の指紋が置かれていて、開いてもサムネイル・解析の作り直しは起きない
+        let (thumbs_sync, analysis_sync) = library
+            .db()
+            .write(|tx| {
+                let current =
+                    PlanFingerprint::current(&kura_engine::analysis::registry().unwrap()).unwrap();
+                Ok((
+                    route::sync_plan(tx)?,
+                    analysis_store::sync_plan(tx, &current)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            (thumbs_sync.stale, thumbs_sync.retried, analysis_sync.reset),
+            (0, 0, 0)
+        );
 
         // 実ファイル・サムネイル・ジャケットが置かれ、ひな形は消えている
         let layout = library.layout();
