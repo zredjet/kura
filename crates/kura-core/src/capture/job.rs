@@ -298,6 +298,7 @@ impl CaptureHandler {
         let result = result?;
         if result.added > 0 {
             ctx.ensure_queued(JobKind::Thumbnail, "{}")?;
+            ctx.ensure_queued(JobKind::Analyze, "{}")?;
         }
         Ok(Some(result))
     }

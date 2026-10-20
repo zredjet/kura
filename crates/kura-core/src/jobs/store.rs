@@ -76,11 +76,11 @@ pub fn insert(conn: &Connection, kind: JobKind, input_json: &str, now: i64) -> R
     Ok(conn.last_insert_rowid())
 }
 
-/// `kind` の `queued` のジョブがあるか。
-pub fn has_queued(conn: &Connection, kind: JobKind) -> Result<bool> {
+/// `kind` のジョブで状態が `state` のものがあるか（idx_jobs_queue）。
+pub fn has_state(conn: &Connection, kind: JobKind, state: JobState) -> Result<bool> {
     let mut stmt =
-        conn.prepare_cached("SELECT 1 FROM jobs WHERE state = 'queued' AND kind = ?1 LIMIT 1")?;
-    Ok(stmt.exists([kind.as_str()])?)
+        conn.prepare_cached("SELECT 1 FROM jobs WHERE state = ?1 AND kind = ?2 LIMIT 1")?;
+    Ok(stmt.exists(params![state.as_str(), kind.as_str()])?)
 }
 
 /// 1 件読む。
@@ -351,5 +351,21 @@ mod tests {
              ORDER BY priority DESC, created_at, id LIMIT 1",
         );
         assert!(plan.contains("idx_jobs_queue"), "{plan}");
+        let plan = query_plan(
+            &conn,
+            "SELECT 1 FROM jobs WHERE state = 'paused' AND kind = 'analyze' LIMIT 1",
+        );
+        assert!(plan.contains("idx_jobs_queue"), "{plan}");
+    }
+
+    #[test]
+    fn analyze_jobs_are_stored() {
+        let conn = test_conn();
+        let id = insert(&conn, JobKind::Analyze, "{}", 1).unwrap();
+        assert!(has_state(&conn, JobKind::Analyze, JobState::Queued).unwrap());
+        assert!(!has_state(&conn, JobKind::Analyze, JobState::Paused).unwrap());
+        assert!(transition(&conn, id, &[JobState::Queued], JobState::Paused).unwrap());
+        assert!(has_state(&conn, JobKind::Analyze, JobState::Paused).unwrap());
+        assert_eq!(get(&conn, id).unwrap().unwrap().kind, JobKind::Analyze);
     }
 }

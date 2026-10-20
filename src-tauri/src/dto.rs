@@ -379,7 +379,7 @@ pub struct ImportFailureDto {
     pub reason: String,
 }
 
-/// ジョブの種類。
+/// ジョブの種類（analyze は M11 の解析。取り込み・サムネイルに譲る）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum JobKindDto {
@@ -389,6 +389,7 @@ pub enum JobKindDto {
     Download,
     Capture,
     Export,
+    Analyze,
 }
 
 impl From<JobKind> for JobKindDto {
@@ -400,6 +401,7 @@ impl From<JobKind> for JobKindDto {
             JobKind::Download => Self::Download,
             JobKind::Capture => Self::Capture,
             JobKind::Export => Self::Export,
+            JobKind::Analyze => Self::Analyze,
         }
     }
 }
@@ -413,6 +415,7 @@ impl From<JobKindDto> for JobKind {
             JobKindDto::Download => Self::Download,
             JobKindDto::Capture => Self::Capture,
             JobKindDto::Export => Self::Export,
+            JobKindDto::Analyze => Self::Analyze,
         }
     }
 }

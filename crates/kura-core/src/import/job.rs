@@ -241,6 +241,8 @@ impl JobHandler for ImportHandler {
                 ctx.ensure_queued(JobKind::Thumbnail, "{}")?;
                 // 動画・音楽は再生できるかを確かめ、要ればプロキシを作る
                 ctx.ensure_queued(JobKind::Proxy, "{}")?;
+                // 画像・音声の事実と波形（取り込み・サムネイルが終わるまで譲って待つ）
+                ctx.ensure_queued(JobKind::Analyze, "{}")?;
             }
             // 既存と同じ中身で拡張子だけ違ったコピーは、どのアイテムも使わないので消す
             for path in extra_files {
@@ -1056,7 +1058,27 @@ mod tests {
         write(&src.join("photo.jpg"), b"photo");
         write(&src.join("song.flac"), b"song");
         let handler = ImportHandler::new(Arc::new(crate::media::fake::FakeBackend));
-        let jobs = env.manager(handler);
+        // 取り込みのあとに積むサムネイル・解析を数えるため、何もしないハンドラで登録する（登録のない種類は積まない）
+        struct Noop;
+        impl crate::jobs::JobHandler for Noop {
+            fn run(&self, _: &crate::jobs::JobContext) -> crate::Result<crate::jobs::JobEnd> {
+                Ok(crate::jobs::JobEnd::Done {
+                    result_json: "{}".into(),
+                    message: None,
+                })
+            }
+        }
+        let sink: EventSink = Arc::new(|_| {});
+        let jobs = JobManager::new(
+            env.library.clone(),
+            vec![
+                (JobKind::Import, Arc::new(handler)),
+                (JobKind::Thumbnail, Arc::new(Noop)),
+                (JobKind::Analyze, Arc::new(Noop)),
+            ],
+            sink,
+        )
+        .unwrap();
         let options = ImportOptions {
             file_info_tags: true,
             ..ImportOptions::default()
@@ -1101,10 +1123,18 @@ mod tests {
             env.count("SELECT COUNT(*) FROM tags WHERE (namespace, name) IN (VALUES ('アーティスト', '灯野'), ('アルバム', '夜'))"),
             2
         );
-        // 取り込んだらサムネイルのジョブが積まれる
+        // 取り込んだらサムネイルと解析のジョブが積まれる（登録のないプロキシは積まない）
         assert_eq!(
-            env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'thumbnail' AND state = 'queued'"),
+            env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'thumbnail'"),
             1
+        );
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'analyze'"),
+            1
+        );
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'proxy'"),
+            0
         );
     }
 

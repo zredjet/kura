@@ -2,6 +2,7 @@
 //!
 //! macOS 固有の処理は `kura-mac` に置き、このクレートには `cfg(target_os)` を書かない。
 
+pub mod analysis;
 pub mod capture;
 pub mod codec_ext;
 pub mod db;

@@ -46,6 +46,8 @@ pub enum JobEnd {
     Paused,
     /// 中止。
     Canceled { result_json: Option<String> },
+    /// 譲る（`JobContext::should_yield` が真のとき）。queued に戻り、譲る相手が終わったら続きから動く（一時停止にはしない）。
+    Yield,
 }
 
 /// 実行中のジョブへの指示。
@@ -97,6 +99,15 @@ impl JobContext {
             PAUSE | SHUTDOWN => Control::Pause,
             _ => Control::Continue,
         }
+    }
+
+    /// 譲る相手（[`JobKind::yields_to`]。登録されているものだけ）が動いている・待っているか。真なら区切りで
+    /// `JobEnd::Yield` を返す（queued に戻り、譲る相手が終わってから続きから動く）。
+    pub fn should_yield(&self) -> bool {
+        let Ok(sched) = self.inner.sched.lock() else {
+            return false;
+        };
+        self.inner.blocked(self.record.kind, &sched)
     }
 
     /// 進捗を送る（200ms より短い間隔の呼び出しは間引く）。
@@ -173,11 +184,17 @@ struct Inner {
 }
 
 impl Inner {
-    /// `kind` のジョブが待ち行列になければ積んで、スケジューラを起こす。積んだら ID を返す。
+    /// `kind` のジョブが待ち行列になければ積んで、スケジューラを起こす。積んだら ID を返す。登録されていない種類は積まない
+    /// （誰も動かさない行を残さない）。一時停止を守る種類（[`JobKind::keeps_pause`]）は、一時停止中のものがあれば積まない。
     fn ensure_queued(&self, kind: JobKind, input_json: &str) -> Result<Option<JobId>> {
+        if !self.handlers.contains_key(&kind) {
+            return Ok(None);
+        }
         let input = input_json.to_string();
         let id = self.library.db().write(move |tx| {
-            if store::has_queued(tx, kind)? {
+            if store::has_state(tx, kind, JobState::Queued)?
+                || (kind.keeps_pause() && store::has_state(tx, kind, JobState::Paused)?)
+            {
                 return Ok(None);
             }
             store::insert(tx, kind, &input, now_ms()).map(Some)
@@ -194,6 +211,40 @@ impl Inner {
             self.wake.notify_all();
         }
         Ok(id)
+    }
+
+    /// `kind` が譲る相手（登録されているものだけ）が、動いているか待ち行列にあるか。スケジューラは真の間 `kind` を取り出さず、
+    /// 動いているジョブは `should_yield` で知る。待ち行列を読めなければ譲らない（止めない）。
+    fn blocked(&self, kind: JobKind, sched: &Sched) -> bool {
+        let others: Vec<JobKind> = kind
+            .yields_to()
+            .iter()
+            .copied()
+            .filter(|k| self.handlers.contains_key(k))
+            .collect();
+        if others.is_empty() {
+            return false;
+        }
+        if others
+            .iter()
+            .any(|k| sched.running.get(k).copied().unwrap_or(0) > 0)
+        {
+            return true;
+        }
+        self.library
+            .db()
+            .read(|conn| {
+                for k in &others {
+                    if store::has_state(conn, *k, JobState::Queued)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "待ち行列を読めませんでした");
+                false
+            })
     }
 }
 
@@ -499,6 +550,10 @@ fn scheduler_loop(inner: &Arc<Inner>) {
         let mut kinds: Vec<JobKind> = inner.handlers.keys().copied().collect();
         kinds.sort_by_key(|k| k.as_str());
         for kind in kinds {
+            // 譲る相手が動いている・待っている間は取り出さない（終わると run_worker が起こす）
+            if inner.blocked(kind, &sched) {
+                continue;
+            }
             while sched.running.get(&kind).copied().unwrap_or(0) < kind.concurrency() {
                 let layout = inner.library.layout().clone();
                 let claimed = inner.library.db().write(move |tx| {
@@ -592,6 +647,13 @@ fn run_worker(inner: &Arc<Inner>, handler: &dyn JobHandler, ctx: JobContext) {
                     Some(&result_json),
                     now_ms(),
                 )
+            })
+        }
+        Ok(JobEnd::Yield) => {
+            // 譲る相手が終わったらスケジューラが取り出し直す（一時停止にしない。アプリの終了でも queued のまま）
+            ctx.log("ほかのジョブに譲るため中断");
+            db.write(move |tx| {
+                store::transition(tx, id, &[JobState::Running], JobState::Queued).map(|_| ())
             })
         }
         Ok(JobEnd::Paused) => {
@@ -874,6 +936,188 @@ mod tests {
         assert!(jobs.wait_idle(Duration::from_secs(5)));
         // 終わったあとならまた積める
         assert!(jobs.ensure_queued(JobKind::Import, "{}").unwrap().is_some());
+    }
+
+    /// 種類ごとのハンドラを渡して作る。
+    fn manager_with(f: &Fixture, handlers: Vec<(JobKind, Box<RunFn>)>) -> JobManager {
+        JobManager::new(
+            f.library.clone(),
+            handlers
+                .into_iter()
+                .map(|(k, h)| (k, Arc::new(FnHandler(h)) as Arc<dyn JobHandler>))
+                .collect(),
+            sink(&f.events),
+        )
+        .unwrap()
+    }
+
+    type Timeline = Arc<Mutex<Vec<String>>>;
+
+    /// 始まりと終わりを記録して `ms` だけ動くハンドラ。
+    fn timed(timeline: &Timeline, name: &'static str, ms: u64) -> Box<RunFn> {
+        let timeline = timeline.clone();
+        Box::new(move |_| {
+            timeline.lock().unwrap().push(format!("{name}+"));
+            std::thread::sleep(Duration::from_millis(ms));
+            timeline.lock().unwrap().push(format!("{name}-"));
+            done("{}")
+        })
+    }
+
+    fn position(timeline: &Timeline, mark: &str) -> usize {
+        let t = timeline.lock().unwrap();
+        t.iter()
+            .position(|m| m == mark)
+            .unwrap_or_else(|| panic!("{mark} がない: {t:?}"))
+    }
+
+    fn wait_state(jobs: &JobManager, id: JobId, state: JobState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while jobs.get(id).unwrap().state != state {
+            assert!(Instant::now() < deadline, "{id} が {state:?} にならない");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 取り込み・サムネイルが待っている・動いている間は、解析を取り出さない（名前の順では解析が先に見られる）。
+    #[test]
+    fn analyze_is_not_claimed_while_import_or_thumbnail_is_active() {
+        let f = fixture();
+        let timeline: Timeline = Arc::default();
+        let jobs = manager_with(
+            &f,
+            vec![
+                (JobKind::Import, timed(&timeline, "import", 120)),
+                (JobKind::Thumbnail, timed(&timeline, "thumbnail", 120)),
+                (JobKind::Analyze, timed(&timeline, "analyze", 0)),
+            ],
+        );
+        jobs.enqueue(JobKind::Import, "{}".into()).unwrap();
+        jobs.enqueue(JobKind::Thumbnail, "{}".into()).unwrap();
+        let analyze = jobs.ensure_queued(JobKind::Analyze, "{}").unwrap().unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(Duration::from_secs(5)));
+        let started = position(&timeline, "analyze+");
+        assert!(started > position(&timeline, "import-"), "{timeline:?}");
+        assert!(started > position(&timeline, "thumbnail-"), "{timeline:?}");
+        assert_eq!(jobs.get(analyze).unwrap().state, JobState::Done);
+
+        // 動いている取り込みのあとに積んだ解析も、取り込みが終わるまで待つ
+        timeline.lock().unwrap().clear();
+        let import = jobs.enqueue(JobKind::Import, "{}".into()).unwrap();
+        wait_state(&jobs, import, JobState::Running);
+        let analyze = jobs.ensure_queued(JobKind::Analyze, "{}").unwrap().unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(jobs.get(analyze).unwrap().state, JobState::Queued);
+        assert!(jobs.wait_idle(Duration::from_secs(5)));
+        assert!(position(&timeline, "analyze+") > position(&timeline, "import-"));
+    }
+
+    /// 動いている解析は、取り込みが来たら譲って queued に戻り（一時停止にはしない）、取り込みのあとで同じジョブが続きから動く。
+    #[test]
+    fn running_job_yields_and_is_requeued_not_paused() {
+        let f = fixture();
+        let timeline: Timeline = Arc::default();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        let t = timeline.clone();
+        let analyze: Box<RunFn> = Box::new(move |ctx| {
+            let run = r.fetch_add(1, Ordering::SeqCst) + 1;
+            t.lock().unwrap().push(format!("analyze{run}+"));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while run == 1 && Instant::now() < deadline {
+                if ctx.should_yield() {
+                    t.lock().unwrap().push("analyze-yield".into());
+                    return Ok(JobEnd::Yield);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            done("{}")
+        });
+        let jobs = manager_with(
+            &f,
+            vec![
+                (JobKind::Import, timed(&timeline, "import", 60)),
+                (JobKind::Analyze, analyze),
+            ],
+        );
+        let id = jobs.ensure_queued(JobKind::Analyze, "{}").unwrap().unwrap();
+        jobs.start().unwrap();
+        wait_state(&jobs, id, JobState::Running);
+        jobs.enqueue(JobKind::Import, "{}".into()).unwrap();
+        assert!(jobs.wait_idle(Duration::from_secs(10)));
+
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "{timeline:?}");
+        // 取り込みは譲るのを待たずに始まり、解析はその間の区切りで譲る
+        assert!(position(&timeline, "analyze-yield") < position(&timeline, "import-"));
+        assert!(position(&timeline, "analyze2+") > position(&timeline, "import-"));
+        let record = jobs.get(id).unwrap();
+        assert_eq!(record.state, JobState::Done);
+        let states: Vec<JobState> = f
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.id == id)
+            .map(|e| e.state)
+            .collect();
+        assert!(!states.contains(&JobState::Paused), "{states:?}");
+        assert!(
+            states
+                .windows(2)
+                .any(|w| w == [JobState::Running, JobState::Queued]),
+            "{states:?}"
+        );
+        let log = jobs.log_text(id, 1 << 16).unwrap();
+        assert!(log.contains("譲"), "{log}");
+    }
+
+    /// 登録されていない種類（エンジンのないセッションの解析など）は積まない（誰も動かさない行を残さない）。
+    #[test]
+    fn ensure_queued_ignores_unregistered_kinds() {
+        let f = fixture();
+        let jobs = manager(&f, |_| done("{}"));
+        assert_eq!(jobs.ensure_queued(JobKind::Analyze, "{}").unwrap(), None);
+        let all = jobs.list(&JobFilter::default()).unwrap();
+        assert!(all.is_empty(), "{all:?}");
+        assert!(f.events.lock().unwrap().is_empty());
+    }
+
+    /// 利用者が一時停止した解析があれば、取り込みのあとの ensure_queued で新しく積まない（ほかの種類は今のまま積む）。
+    #[test]
+    fn ensure_queued_respects_a_paused_analyze() {
+        let f = fixture();
+        let jobs = manager_with(
+            &f,
+            vec![
+                (JobKind::Analyze, Box::new(|_| done("{}"))),
+                (JobKind::Thumbnail, Box::new(|_| done("{}"))),
+            ],
+        );
+        let id = jobs.ensure_queued(JobKind::Analyze, "{}").unwrap().unwrap();
+        jobs.pause(id).unwrap();
+        assert_eq!(jobs.get(id).unwrap().state, JobState::Paused);
+        assert_eq!(jobs.ensure_queued(JobKind::Analyze, "{}").unwrap(), None);
+        let analyze = JobFilter {
+            kinds: vec![JobKind::Analyze],
+            ..JobFilter::default()
+        };
+        assert_eq!(jobs.list(&analyze).unwrap().len(), 1);
+
+        let thumb = jobs
+            .ensure_queued(JobKind::Thumbnail, "{}")
+            .unwrap()
+            .unwrap();
+        jobs.pause(thumb).unwrap();
+        assert!(
+            jobs.ensure_queued(JobKind::Thumbnail, "{}")
+                .unwrap()
+                .is_some()
+        );
+
+        // 再開したら（待ち行列にあるので）新しくは積まない
+        jobs.resume(id).unwrap();
+        assert_eq!(jobs.ensure_queued(JobKind::Analyze, "{}").unwrap(), None);
     }
 
     #[test]

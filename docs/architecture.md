@@ -89,6 +89,8 @@
 | | `open_external(hash)` → `mpv` \| `quickTime` | 元のファイルを外部プレイヤーで開く（mpv があれば mpv） |
 | | `player_prefs_get()` / `player_prefs_set(prefs)` | 再生の設定（音量・画像の間も直前の音楽を流す・BGM をループ・画像の表示時間の既定値）。app.json に保存 |
 | ジョブ | `jobs_list(filter)` / `job_cancel(id)` / `job_pause(id)` / `job_resume(id)` / `job_retry(id)` / `job_log(id)` | 進捗はイベント `job://progress` |
+| 解析 | `request_analysis(ids)` → 待っているか | インスペクタで選んだものを先に解析する（まだなら解析のジョブを積む。取り込み・サムネイルが動いている間はそれを待つ。§5） |
+| | `retry_analysis(ids)` → 戻した数 | 解析できなかったもの（failed）を解析待ちに戻し、先に解く |
 | 書き出し | `export_start(dest, entries)` → JobId | 選んだもの（一覧の ID。ユニットは印付き）を書き出すジョブを積む。書き出し先はあるフォルダで、ライブラリの中は受け付けない（§14） |
 | バックアップ | `backups_list()` → `Backup[]` / `backup_now()` → `Backup` | DB のバックアップの一覧（新しい順）と、今すぐ作る（§14） |
 | | `reveal_path(path)` | Finder で見せる（書き出したもの・バックアップ・ライブラリ） |
@@ -228,8 +230,10 @@ object-src 'none'; frame-src 'none'
 - アプリの終了・ライブラリの切り替えでは、実行中のジョブを区切りで止めて `queued` に戻す（次回の起動で自動で再開）。ユーザーが一時停止したものは `paused` のまま。
 - 再開に必要な途中経過は、ジョブ自身が作業と同じトランザクションで `result_json` に保存する。
 - ライブラリを開くときは、staging の掃除 → 整合性チェック → ジョブの開始、の順にする（チェック中に取り込みが進むと食い違いを誤って数えるため）。
-- 種類ごとの同時実行数：import 1、thumbnail 1（ジョブの中で CPU コア数の並列。ADR-31）、proxy 1、download 2、capture 1、export 1。
-- 後続のジョブは `ensure_queued(kind, input)` で積む（同じ種類が `queued` ならもう積まない）。サムネイルのジョブは、取り込みのバッチを書いたあとと、ライブラリを開いたとき（`pending` が残っていれば）に積む。
+- 種類ごとの同時実行数：import 1、thumbnail 1（ジョブの中で CPU コア数の並列。ADR-31）、proxy 1、download 2、capture 1、export 1、analyze 1。
+- 後続のジョブは `ensure_queued(kind, input)` で積む（同じ種類が `queued` ならもう積まない。そのライブラリで動かす種類（ハンドラ）がなければ積まない。analyze は一時停止中のものがあれば積まない：利用者の一時停止を次の取り込みが勝手に外さない）。サムネイルのジョブは、取り込みのバッチを書いたあとと、ライブラリを開いたとき（`pending` が残っていれば）に積む。
+- **譲る**（M11）：種類ごとに譲る相手を網羅の match で決める（`JobKind::yields_to`。今は analyze が import と thumbnail に譲る。NFR-05・NFR-04 を守るため。download はネットワーク待ちなので譲らない）。譲る相手が動いている・待っている間はスケジューラが取り出さず、動いているジョブは `should_yield` で知って区切りで `JobEnd::Yield` を返す（`queued` に戻り、相手が終わると続きから動く。一時停止にはしない）。M12 の保存・M14 の一括を足すときも、ここで解析が譲るかを決める。
+- **解析のジョブ**（`kind = 'analyze'`、M11。`kura-core/src/analysis/`）：エンジンの部品のあるライブラリだけで動く。取り込み・ダウンロード・キャプチャのバッチを書いたあと、ライブラリを開いたとき（起動のスレッドで整合性チェックのあとに計画の指紋 `analysis.plan` を比べ、変わった種類を `pending` に戻したうえで、待っているもの・投影の古いものがあれば）、`request_analysis`・`retry_analysis`、外部ツールの場所を変えたとき（デコーダの指紋を比べ直す）に積む。`pending` を新しい順に（優先の指定を先に）16 件ずつ取り出し、1 件ずつヘッダだけ読んで見積もり（値の 2 倍＋デコーダの作業領域）、min(予算/2, 1 GiB) を超えれば確保せずに失敗、収まれば一括の予算（Class::Bulk）をプールの外で確保して一括のプールで読んで解く（決定 2）。JPEG・HEIC・HEIF は読まずに形式から事実を書く（決定 5）。同じ中身の結果がそろっていれば読まない。16 件か 500 ms ごとに 1 つのトランザクションで書く（`WHERE id = ? AND hash = ? AND analysis_state = 'pending'`）。波形の段は `peaks/ab/<hash>.peaks` に一時ファイルから改名してコミットの前に置く。OS のデコーダ（Platform の段）で読むときは、読む前に処理中の印（settings の `analysis.inflight`）をコミットし、書いたら消す。次に動いたときに印が残っていれば、そのアイテムで落ちたとみなして `failed`（`crashed`）にして先へ進む（同じファイルで落ち続けない）。失敗は記録し、指紋が変わるか利用者が頼むまで解き直さない（docs/data-model.md §4「解析の読み書き」）。
 - 各ジョブはキャンセルトークンを持つ。外部プロセスはキャンセル時に SIGTERM、5 秒後に SIGKILL（編集のコーデックの ffmpeg（`tools::run_binary`）は 2 秒後に 1 回。docs/editing.md §9.8）。
 - 進捗は `job://progress` イベント（`{ id, kind, state, progress, message, resultJson }`）を 200ms 以上の間隔で間引いて送る（状態の変わり目は間引かない）。
 - ログは `logs/job-<id>.log` に書き、UI の「ログ」から開ける。
@@ -399,6 +403,8 @@ import_start:    ジョブとして実行
 | `kura-devtools bench thumbs --src <dir> [--threads N]` | 画像サムネイルの生成速度（枚/秒） |
 | `kura-devtools bench import --src <dir> [--threads N] [--out <dir>]` | 取り込みの速さ（MB/秒・件/秒）と、同じファイルをハッシュだけした速さ。新しいライブラリを `--out`（既定は `--src` と同じ場所）に作って入れ、測り終えたら消す（M9） |
 | `kura-devtools bench backup --library <path>` | DB のバックアップを 1 つ作る速さ（10 万件・58MB で 0.25 秒。M9） |
+| `kura-devtools bench analyze --kind image\|audio [--limit N] [--src <dir>] [--work <dir>] [--json <file>]` | 解析のジョブの速さとメモリ（M11）：作業フォルダに見本のライブラリを作り（`--src` のファイルか、中身の違う合成の見本）、自分を子プロセスとして `/usr/bin/time -l` で起こして、アプリと同じエンジンの部品（物理メモリからの予算・`full_codec_set`）で解析のジョブを 1 本動かす。通しの件数/秒、読んで解いた 1 件の p50・p95・最大（ジョブの結果の `readMs`）、peak memory footprint を 1 行の JSON で出す |
+| `kura-devtools seed … --analysis ready` | 画像・音声に偽の事実（透過・色数・ドット絵・アニメ・ラウドネス・ループ）を解析のジョブと同じ書き込みで入れて解析済みにする（M11 の NFR-02・03・07 の計測用。既定の `pending` は解析待ちのまま） |
 | `kura-devtools import` / `check` | コマンドラインからの取り込みと整合性の確認（§6） |
 | `kura-devtools download --library <path> <url>...` | アプリと同じダウンロードのジョブで取得して入れる（§9。既定の選択・Cookie なし） |
 | `kura-devtools edit shape --in <file>` / `edit caps` / `edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]` | 編集のエンジンを手で確かめる（形式と形の表示、今の環境の能力の表、文書を当てて書き出し、ダイジェスト・記録・警告を表示。コーデックはアプリと同じ `full_codec_set`（固定の段 → macOS → ffmpeg）。docs/editing.md） |

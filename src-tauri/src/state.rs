@@ -1,7 +1,7 @@
 //! アプリの状態（開いているライブラリとアプリ全体の設定）。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use kura_core::capture::LoginBrowser;
 use kura_core::edit::EngineFactory;
@@ -24,6 +24,9 @@ pub struct AppState {
     login: Arc<Mutex<Option<LoginBrowser>>>,
     /// エンジンの部品を作る口。ライブラリを開くたびに渡し、ライブラリごとの部品を作らせる。
     engine: Arc<dyn EngineFactory>,
+    /// ライブラリを開く・作る・戻すのを 1 つずつにする鍵（同じライブラリを並んで開くと、新しい版にする前のバックアップが
+    /// ぶつかって両方失敗する。起動の restore と開く操作が重なっても、2 回目は当て終えた版を開く）。
+    opening: Mutex<()>,
 }
 
 impl AppState {
@@ -43,7 +46,14 @@ impl AppState {
             support: RwLock::new(None),
             login: Arc::new(Mutex::new(None)),
             engine,
+            opening: Mutex::new(()),
         }
+    }
+
+    /// ライブラリを開く・作る・戻す間持つ鍵（[`AppState::replace_session`] は自分で取る。restore のように「開いているか」を
+    /// 確かめてから開くときは、これを持ったまま [`AppState::replace_session_locked`] を呼ぶ）。
+    pub fn opening(&self) -> MutexGuard<'_, ()> {
+        self.opening.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// ライブラリを開く・作るときに渡すもの：メディアの実装（macOS と ffmpeg）、エンジンの部品を作る口、DB を新しい版に
@@ -89,8 +99,19 @@ impl AppState {
         self.config.lock().ok().and_then(|c| c.last_library.clone())
     }
 
-    /// ライブラリを開く（作る）。前のライブラリは閉じ、`remember` なら場所を「前回のライブラリ」として保存する。
+    /// ライブラリを開く（作る）。前のライブラリは閉じ、`remember` なら場所を「前回のライブラリ」として保存する。開く・作る・
+    /// 戻すは 1 つずつ（[`AppState::opening`] の鍵）。
     pub fn replace_session(
+        &self,
+        open: impl FnOnce() -> kura_core::Result<LibrarySession>,
+        remember: bool,
+    ) -> Result<Arc<LibrarySession>, AppError> {
+        let _opening = self.opening();
+        self.replace_session_locked(open, remember)
+    }
+
+    /// [`AppState::replace_session`] の、鍵（[`AppState::opening`]）を持っている呼び手のためのもの。
+    pub fn replace_session_locked(
         &self,
         open: impl FnOnce() -> kura_core::Result<LibrarySession>,
         remember: bool,
@@ -264,6 +285,74 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             CodecSet::default()
         }
+    }
+
+    /// 1 つ前の版（0009 を当てる前）のライブラリを作る。
+    fn library_before_last_migration(root: &Path) {
+        let library = kura_core::library::Library::create(root).unwrap();
+        let before = kura_core::db::MIGRATIONS.len() - 1;
+        library
+            .db()
+            .write(move |tx| {
+                tx.execute_batch(&format!(
+                    "DROP TABLE asset_settings; DROP TABLE analysis_results; DROP TABLE media_facts;
+                     PRAGMA user_version = {before};"
+                ))?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// 同じライブラリを並んで開いても（起動の restore と開く操作が重なるなど）、開く・作る・戻すは 1 つの鍵で順に行うので、
+    /// 新しい版にするのと、その前のバックアップは 1 回だけ（2 回目は当て終えた版を開く）。
+    #[test]
+    fn opening_the_same_library_in_parallel_upgrades_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        library_before_last_migration(&root);
+        let state =
+            AppState::with_engine(dir.path().join("app.json"), Arc::new(Counting::default()));
+        let events: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = events.clone();
+        let notify: Arc<UpgradeNotifyFn> = Arc::new(move |e: &UpgradeEvent| {
+            let name = match e {
+                UpgradeEvent::Started { .. } => "started",
+                UpgradeEvent::Finished { .. } => "finished",
+                UpgradeEvent::Failed { .. } => "failed",
+            };
+            seen.lock().unwrap().push(name.to_string());
+        });
+        let services = || {
+            Services::new(Arc::new(NoBackend)).with_upgrade(UpgradeHooks {
+                free_space: None,
+                notify: Some(notify.clone()),
+            })
+        };
+        let barrier = std::sync::Barrier::new(2);
+        let upgraded: Vec<bool> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        let session = state
+                            .replace_session(
+                                || LibrarySession::open(&root, Arc::new(|_| {}), services()),
+                                false,
+                            )
+                            .unwrap();
+                        session.library().migration().upgraded()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["started", "finished"],
+            "新しい版にするのは 1 回だけ"
+        );
+        assert_eq!(upgraded.iter().filter(|u| **u).count(), 1);
+        state.close();
     }
 
     /// 外部ツールの場所を変えると（tools_set_path）、開いているライブラリのエンジンのコーデックの組を作り直す。

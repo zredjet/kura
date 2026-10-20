@@ -213,6 +213,10 @@ export const commands = {
 	playbackReport: (report: PlayReportDto) => typedError<boolean, AppError>(__TAURI_INVOKE("playback_report", { report })),
 	/**  再生キューの今と次のアイテムのプロキシを先に作る。`force` なら、元のまま再生できなかったものを作り直す。 */
 	proxyRequest: (ids: number[], force: boolean) => typedError<null, AppError>(__TAURI_INVOKE("proxy_request", { ids, force })),
+	/**  選んだアイテムを先に解析する（まだ解析していないものがあれば解析のジョブを積む）。解析を待つものがあれば true。 */
+	requestAnalysis: (ids: number[]) => typedError<boolean, AppError>(__TAURI_INVOKE("request_analysis", { ids })),
+	/**  解析できなかったアイテムを、もう一度解析する（先に解く）。解き直すことにした数を返す。 */
+	retryAnalysis: (ids: number[]) => typedError<number, AppError>(__TAURI_INVOKE("retry_analysis", { ids })),
 	/**  元のファイルを外部プレイヤー（mpv、なければ QuickTime Player）で開く。 */
 	openExternal: (hash: string) => typedError<ExternalPlayerDto, AppError>(__TAURI_INVOKE("open_external", { hash })),
 	/**  再生の設定。 */
@@ -711,8 +715,8 @@ export type JobFilterDto = {
 	limit?: number | null,
 };
 
-/**  ジョブの種類。 */
-export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export";
+/**  ジョブの種類（analyze は M11 の解析。取り込み・サムネイルに譲る）。 */
+export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export" | "analyze";
 
 /**  ジョブの進捗（イベント `job://progress`）。 */
 export type JobProgress = {

@@ -70,6 +70,8 @@ pub async fn library_open(app: AppHandle, path: String) -> Result<LibraryInfoDto
 pub async fn library_restore(app: AppHandle) -> Result<LibraryRestoreDto, AppError> {
     blocking(move || {
         let state = app.state::<AppState>();
+        // 開いているかを確かめてから開くまでを 1 つの鍵で（StrictMode などで並んで呼ばれても、開くのは 1 回）
+        let _opening = state.opening();
         // 計測用：環境変数 KURA_LIBRARY のライブラリを、設定を書き換えずに開く
         if let Some(path) = std::env::var_os(LIBRARY_ENV).filter(|_| state.current().is_none()) {
             let path = PathBuf::from(path);
@@ -96,7 +98,8 @@ pub async fn library_restore(app: AppHandle) -> Result<LibraryRestoreDto, AppErr
     .await
 }
 
-/// 起動時に `path` のライブラリを開く。開けなければ理由を `error` に入れて返す。
+/// 起動時に `path` のライブラリを開く（呼び手が [`AppState::opening`] の鍵を持っている）。開けなければ理由を `error` に
+/// 入れて返す。
 fn restore_from(
     app: &AppHandle,
     state: &AppState,
@@ -106,7 +109,7 @@ fn restore_from(
     let last_path = Some(path.to_string_lossy().into_owned());
     let sink = event_sink(app.clone());
     let services = state.services(app);
-    match state.replace_session(|| LibrarySession::open(&path, sink, services), remember) {
+    match state.replace_session_locked(|| LibrarySession::open(&path, sink, services), remember) {
         Ok(session) => {
             log_opened(&session, "起動から前回のライブラリを開くまで");
             Ok(LibraryRestoreDto {
