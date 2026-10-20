@@ -755,6 +755,43 @@ fn pixel_art_search_follows_the_effective_value_of_the_asset_panel() {
     assert_eq!(unanalyzed(&conn, "ドット絵:なし"), Some(waiting));
 }
 
+/// 読まずに形式から書く事実（JPEG・HEIC。決定 5）は、透過・ドット絵・アニメの「なし」に入り、色数の検索には入らない。
+#[test]
+fn facts_written_from_the_format_answer_the_none_side() {
+    use crate::analysis::facts::from_format;
+    use crate::analysis::store::{ItemWrite, Write, write};
+
+    let conn = test_conn();
+    for (id, ext) in [(1_i64, "jpg"), (2, "heic")] {
+        let hash = [u8::try_from(id).unwrap(); 32];
+        conn.execute(
+            "INSERT INTO items (id, hash, ext, kind, size_bytes, width, height, title, original_name,
+                                imported_at, updated_at, analysis_state)
+             VALUES (?1, ?2, ?3, 'image', 1, 4032, 3024, 't', 't', 0, 0, 'pending')",
+            params![id, hash.as_slice(), ext],
+        )
+        .unwrap();
+        let format = if ext == "jpg" { "jpeg" } else { "heic" };
+        let ready = ItemWrite {
+            id,
+            hash,
+            write: Write::Ready {
+                results: Vec::new(),
+                keep: None,
+                facts: Box::new(from_format(format)),
+                stamp: None,
+            },
+        };
+        assert_eq!(write(&conn, &[ready], 0).unwrap().written, 1);
+    }
+    assert_eq!(ids(&conn, "アニメ:なし"), vec![1, 2]);
+    assert_eq!(ids(&conn, "透過:なし"), vec![1, 2]);
+    assert_eq!(ids(&conn, "ドット絵:なし"), vec![1, 2]);
+    assert!(ids(&conn, "アニメ:あり").is_empty());
+    assert!(ids(&conn, "色数<=256").is_empty(), "JPEG の色数は計らない");
+    assert!(ids(&conn, "色数>256").is_empty(), "JPEG の色数は計らない");
+}
+
 /// パレットの「未解析 N 件」：解析がまだで、解析が終わると一致が変わりうるもの。
 fn unanalyzed(conn: &Connection, query: &str) -> Option<u64> {
     let check = super::check(conn, query, crate::items::ItemView::All, &ctx()).unwrap();
