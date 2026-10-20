@@ -13,6 +13,7 @@ import {
   type AuditionFacts,
   type AuditionOptions,
   type AuditionPlan,
+  auditionPosition,
   DEFAULT_AUDITION,
   planAudition,
   rangesOf,
@@ -122,6 +123,15 @@ export class ContextPool {
   }
 }
 
+/** 鳴らし始めた試聴（継ぎ目の自己点検 `VITE_KURA_CHECK` が、同じバッファと同じ組み立てで照らす）。 */
+export interface ScheduledAudition {
+  hash: string;
+  plan: AuditionPlan;
+  rate: number;
+  /** 計画の区間の順（`rangesOf`）に読んだ PCM。 */
+  pcms: readonly Pcm[];
+}
+
 export interface AuditionDeps {
   pool: ContextPool;
   /** `kura://localhost/pcm/{hash}/{from}-{to}` のバイト列。 */
@@ -130,6 +140,14 @@ export interface AuditionDeps {
   volume(): number;
   /** 止まったとき（止めた・継ぎ目だけの試聴が終わった）。 */
   onStop?(): void;
+  /** 鳴らし始めたとき（dev の継ぎ目の自己点検だけが使う）。 */
+  onScheduled?(scheduled: ScheduledAudition): void;
+}
+
+/** 長さ・ループ点を知らずに始めるときに分かっていること（解析の事実）。 */
+export interface AuditionHint {
+  rate: number;
+  channels: number;
 }
 
 export type AuditionOutcome =
@@ -174,11 +192,25 @@ export class Audition {
   private sources: SourceLike[] = [];
   private gain: GainLike | null = null;
   private token = 0;
+  /** 鳴らしている試聴の時刻の基準（位置を求める）。 */
+  private timing: {
+    ctx: ContextLike;
+    plan: AuditionPlan;
+    rate: number;
+    startFrame: number;
+  } | null = null;
 
   constructor(private readonly deps: AuditionDeps) {}
 
   get playing(): boolean {
     return this.sources.length > 0;
+  }
+
+  /** 鳴っている元のファイルの位置（フレーム）。鳴らしていなければ null。 */
+  position(): number | null {
+    const t = this.timing;
+    if (!t || !this.playing) return null;
+    return auditionPosition(t.plan, Math.round(t.ctx.currentTime * t.rate) - t.startFrame);
   }
 
   /**
@@ -198,6 +230,56 @@ export class Audition {
     const ctx = contextOf(this.deps.pool, facts.rate);
     if (!ctx || ctx.sampleRate !== facts.rate) return { status: 'unsupported' };
     const resumed = resumeOf(ctx);
+    return this.run(ctx, resumed, token, hash, facts, plan, opts);
+  }
+
+  /**
+   * 長さ・ループ点を知らずに試聴を始める（DB は長さをフレームで持たない）。先頭の 1 フレームを取り、応答の `kura`
+   * チャンク（同じ読み取りの長さ・ループ点）で計画してから取る。応答のレート・チャンネルが `hint` と違えば試聴しない。
+   * キー・クリックの処理の中から呼ぶ（resume は取る前）。
+   */
+  async startProbed(
+    hash: string,
+    hint: AuditionHint,
+    options: Partial<AuditionOptions> = {},
+  ): Promise<AuditionOutcome> {
+    this.stop();
+    const token = ++this.token;
+    const opts = { ...DEFAULT_AUDITION, ...options };
+    const ctx = contextOf(this.deps.pool, hint.rate);
+    if (!ctx || ctx.sampleRate !== hint.rate) return { status: 'unsupported' };
+    const resumed = resumeOf(ctx);
+    let probe: Pcm | null;
+    try {
+      probe = readPcmWav(await this.deps.fetchPcm(hash, 0, 1), opts.capBytes);
+    } catch (error) {
+      return token === this.token ? { status: 'failed', error } : { status: 'superseded' };
+    }
+    if (token !== this.token) return { status: 'superseded' };
+    if (!probe || probe.rate !== hint.rate || probe.channels !== hint.channels) {
+      return { status: 'unsupported' };
+    }
+    const facts: AuditionFacts = {
+      frames: probe.info.total,
+      rate: hint.rate,
+      channels: hint.channels,
+      loop: probe.info.loop,
+    };
+    const plan = planAudition(facts, opts);
+    if (!plan) return { status: 'unsupported' };
+    return this.run(ctx, resumed, token, hash, facts, plan, opts);
+  }
+
+  /** 計画の区間を取って鳴らす（start・startProbed の続き）。 */
+  private async run(
+    ctx: ContextLike,
+    resumed: Promise<void>,
+    token: number,
+    hash: string,
+    facts: AuditionFacts,
+    plan: AuditionPlan,
+    opts: AuditionOptions,
+  ): Promise<AuditionOutcome> {
     let loaded: Awaited<ReturnType<Audition['load']>>;
     try {
       loaded = await this.load(hash, facts, plan, opts, token);
@@ -213,6 +295,12 @@ export class Audition {
     }
     if (token !== this.token) return { status: 'superseded' };
     this.schedule(ctx, loaded.plan, loaded.facts.rate, loaded.pcms, token);
+    this.deps.onScheduled?.({
+      hash,
+      plan: loaded.plan,
+      rate: loaded.facts.rate,
+      pcms: loaded.pcms,
+    });
     return { status: 'playing', plan: loaded.plan, facts: loaded.facts };
   }
 
@@ -279,6 +367,7 @@ export class Audition {
     this.gain = gain;
     // フレームの境にそろえた開始のフレーム。前奏・本体の時刻は整数のフレームから求める（丸めを同じ向きにする）
     const startFrame = Math.ceil((ctx.currentTime + LEAD_IN_SECONDS) * rate);
+    this.timing = { ctx, plan, rate, startFrame };
     const make = (pcm: Pcm, looping: boolean): SourceLike => {
       const buffer = ctx.createBuffer(pcm.channels, pcm.frames, rate);
       pcm.planes.forEach((plane, ch) => buffer.copyToChannel(plane, ch));
@@ -311,6 +400,7 @@ export class Audition {
   /** 止める（鳴らしていなければ何もしない）。待っている試聴も取り消す。 */
   stop(): void {
     this.token++;
+    this.timing = null;
     if (this.sources.length === 0) return;
     for (const s of this.sources) {
       s.onended = null;

@@ -98,6 +98,29 @@ export function rangesOf(plan: AuditionPlan): [number, number][] {
   return plan.intro ? [plan.intro, plan.body] : [plan.body];
 }
 
+/**
+ * 鳴らし始めてから `elapsed` フレームのときに鳴っている、元のファイルの位置（フレーム。波形の試聴中の線）。
+ * 始まる前（負）は始めた位置。継ぎ目だけの試聴が終わったら null。
+ */
+export function auditionPosition(plan: AuditionPlan, elapsed: number): number | null {
+  const e = Math.max(0, Math.floor(elapsed));
+  if (plan.mode === 'seam') {
+    const [t0, t1] = plan.tail;
+    const [h0, h1] = plan.head;
+    if (e < t1 - t0) return t0 + e;
+    return e < t1 - t0 + (h1 - h0) ? h0 + (e - (t1 - t0)) : null;
+  }
+  const [b0, b1] = plan.body;
+  const len = b1 - b0;
+  if (!(len > 0)) return null;
+  if (plan.intro) {
+    const [i0, i1] = plan.intro;
+    if (e < i1 - i0) return i0 + e;
+    return b0 + ((e - (i1 - i0)) % len);
+  }
+  return b0 + ((plan.offset + e) % len);
+}
+
 /** 選んだら鳴らす音声の長さの上限（ms。設定にはしない）。 */
 export const SFX_MAX_MS = 10_000;
 
