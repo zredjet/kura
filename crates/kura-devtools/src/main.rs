@@ -12,6 +12,8 @@
 //! - `bench query --library <path> [--fake-facts]`：一覧の取得の速さを測る（`--fake-facts` は素材の事実の擬似の行を
 //!   入れて、透過・ループ・ラウドネスなどの検索も測り、終わったら消す。`bench_facts` の冒頭）
 //! - `bench thumbs --src <画像のフォルダ> [--threads N]`：画像サムネイルの速さを測る（NFR-04）
+//! - `bench thumbs-job --src <dir> [--threads N] [--engine-cap MiB] [--no-engine] [--out <dir>]`：サムネイルのジョブ
+//!   （道の割り振り・エンジンの道の予算込み）の速さを測る（NFR-04。M11。`bench_thumbs` の冒頭）
 //! - `bench migrate (--library <path> | --items <件数> [--history]) [--runs 3]`：マイグレーションの時間と照合
 //!   （docs/data-model.md §5。`bench_migrate` の冒頭）
 //! - `bench analyze --kind image|audio [--limit N] [--src <dir>] [--json <file>]`：解析のジョブの件数/秒・1 件の

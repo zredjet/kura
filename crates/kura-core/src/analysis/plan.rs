@@ -43,7 +43,8 @@ pub const READ_ID: &str = "kura.read";
 pub const READ_V: u16 = 1;
 /// 波形の最も細かい段のビンの数の上限（5 分の 44.1 kHz で 4,096 フレームの段＝約 34 KB）。
 pub const PEAKS_MAX_BINS: u64 = 4_096;
-/// 読まずに形式から事実を書く形式（決定 5：透過がなく、色数は 257 以上、倍率は 1。24MP で 1 件 100〜166 ms かかる）。
+/// 読まずに形式から事実を書く形式（決定 5：透過なし・色数は計らない（NULL）・ドット絵でない・1 コマ。読むと 24MP で 1 件
+/// 100〜166 ms かかるため。`facts::from_format`）。
 pub const FROM_FORMAT: [&str; 3] = ["jpeg", "heic", "heif"];
 /// スプライトの格子を推定する色の数の上限（これ以下か、透過があるとき）。
 pub const GRID_MAX_COLORS: u16 = 256;
