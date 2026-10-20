@@ -1,4 +1,4 @@
-import { useId, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 import { Button } from '../../components/Button/Button';
@@ -190,8 +190,24 @@ function AudioRows({ asset }: { asset: AssetDto }) {
 /** 試聴中の位置を読む（波形の線。同じ関数を渡し続ける）。 */
 const readPosition = () => audioRuntime().audition.position();
 
+/** 欄の中の試聴のボタンを出している間だけ、そのアイテムの試聴を続ける（消えたら止める）。 */
+function useStopAuditionOnLeave(itemId: number): void {
+  useEffect(
+    () => () => {
+      // 欄が消えた・ほかのアイテムに替わった（シアターの情報のパネルを閉じた・次の曲へ進んだ・画面を離れた）。
+      // 止める操作が画面に残らないので、このアイテムの試聴を止める（文脈は鳴らさなくなって 15 秒で閉じる）
+      const s = useAuditionStore.getState();
+      if (s.status !== 'idle' && s.itemId === itemId) {
+        stopAudition();
+      }
+    },
+    [itemId],
+  );
+}
+
 function AuditionControls({ asset, durationMs }: { asset: AssetDto; durationMs: number | null }) {
   const state = useAuditionStore();
+  useStopAuditionOnLeave(asset.itemId);
   const target = auditionTarget(asset);
   const blocker = auditionBlocker(asset);
   const active = state.status !== 'idle' && state.itemId === asset.itemId;

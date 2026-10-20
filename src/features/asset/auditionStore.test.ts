@@ -202,4 +202,22 @@ describe('試聴の状態と口', () => {
     expect(fake.audition.startProbed).not.toHaveBeenCalled();
     expect(useAuditionStore.getState().status).toBe('idle');
   });
+
+  it('プレーヤーが鳴り始めたら試聴を止める（試聴とプレーヤーを重ねない。シアターの再生ボタンなど）', async () => {
+    usePlayerStore.setState({
+      active: true,
+      snapshot: { ...usePlayerStore.getState().snapshot, playing: false },
+    });
+    startAudition(auditionTarget(audioAsset())!);
+    await settle();
+    expect(useAuditionStore.getState().status).toBe('playing');
+    // 鳴っていないプレーヤーの変化（位置など）では止めない
+    usePlayerStore.setState({ snapshot: { ...usePlayerStore.getState().snapshot, positionMs: 5 } });
+    expect(fake.audition.stop).toHaveBeenCalledTimes(1);
+    usePlayerStore.setState({
+      snapshot: { ...usePlayerStore.getState().snapshot, playing: true },
+    });
+    expect(fake.audition.stop).toHaveBeenCalledTimes(2);
+    expect(useAuditionStore.getState().status).toBe('idle');
+  });
 });

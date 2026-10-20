@@ -2,6 +2,8 @@
  * ループの試聴の状態と操作（design.md §3.1「ループの試聴」・§6 の L）。素材の欄のボタン・L のキー・メニューの
  * 「ループを試聴」が同じ口を通す。一度に 1 つだけで、始めるとプレーヤーを一時停止し、効果音を止める。
  * クイックルック中は始めない（クイックルックは自分の `<audio>` で鳴らす。効果音の即再生と同じ条件。決定 13）。
+ * 逆に、プレーヤーが鳴り始めたら（シアターの再生ボタンなど）試聴を止める（重ねない）。素材の欄が消えたら、その欄の
+ * アイテムの試聴を止める（AssetSection。シアターの情報のパネルにも出るので、止める操作が画面に残らないように）。
  * 鳴らし方（本体だけのバッファを loop で回す。loopStart・loopEnd を使わない）は src/lib/assetAudio.ts の Audition。
  */
 
@@ -37,6 +39,15 @@ const IDLE: AuditionState = { itemId: null, status: 'idle', mode: null, fromStar
 export const useAuditionStore = create<AuditionState>(() => IDLE);
 
 onAuditionStopped(() => useAuditionStore.setState(IDLE));
+
+// プレーヤーが鳴り始めたら試聴を止める（試聴を始めるときにプレーヤーを一時停止するのと対にする）
+usePlayerStore.subscribe((now, before) => {
+  const playing = now.active && now.snapshot.playing;
+  const was = before.active && before.snapshot.playing;
+  if (playing && !was && useAuditionStore.getState().status !== 'idle') {
+    stopAudition();
+  }
+});
 
 /** 試聴に要るもの（解析の事実）。 */
 export interface AuditionTarget {
