@@ -62,12 +62,17 @@ pub struct ModelInfo {
     pub extensions_required: Vec<String>,
     /// 描けない理由（必須の Draco・meshopt・知らない拡張の名前、`skin`）。空なら描ける。
     pub unsupported: Vec<String>,
+    /// JSON を読んで組み立てる確保の見積もり（バイト。オブジェクトと値の数から。`load_scene` も同じ JSON を読み直すので
+    /// [`Self::estimate_load_bytes`] に入る）。ライブラリに残す情報ではないので、書き出さない。
+    #[serde(skip)]
+    pub json_heap: u64,
 }
 
 impl ModelInfo {
     /// `load_scene` が使うメモリの見積もり（glb のバイト列そのものは含めない。上の側に）。焼き込んだ頂点（位置・法線・UV・
     /// 色で 48 バイト）と三角形（16 バイト）、読む途中の accessor の写しと索引（頂点 48・三角形 24 バイト）、テクスチャ
-    /// （持つもの `max_textures` 枚 × `max_texture_dim`² × 4 と、読む途中の 1 枚 `max_texture_pixels` × 16）。
+    /// （持つもの `max_textures` 枚 × `max_texture_dim`² × 4 と、読む途中の 1 枚 `max_texture_pixels` × 16）、JSON を
+    /// 組み立てる分（[`Self::json_heap`]）。
     pub fn estimate_load_bytes(&self, limits: &super::ModelLimits) -> u64 {
         let v = self.vertices.saturating_mul(96);
         let t = self.triangles.saturating_mul(40);
@@ -83,7 +88,9 @@ impl ModelInfo {
                 );
             kept.saturating_add(limits.max_texture_pixels.saturating_mul(16))
         };
-        v.saturating_add(t).saturating_add(textures)
+        v.saturating_add(t)
+            .saturating_add(textures)
+            .saturating_add(self.json_heap)
     }
 }
 
@@ -104,7 +111,9 @@ pub(crate) fn triangle_count(mode: u32, n: u64) -> u64 {
 /// glb の情報を読む（JSON の塊だけ）。
 pub fn read_info(bytes: &[u8], limits: &ModelLimits) -> Result<ModelInfo, EngineError> {
     let glb = gltf::parse(bytes, limits)?;
-    info_of(&glb.root, limits)
+    let mut info = info_of(&glb.root, limits)?;
+    info.json_heap = glb.json_heap;
+    Ok(info)
 }
 
 /// 情報を数える。描くプリミティブの実体（ノードの実体 × プリミティブ）が `max_parts` を超えたら、数える手間が大きすぎる
@@ -118,12 +127,12 @@ pub(crate) fn info_of(root: &Root, limits: &ModelLimits) -> Result<ModelInfo, En
         animations: count(root.animations.len()),
         skins: count(root.skins.len()),
         nodes: count(root.nodes.len()),
-        generator: root.asset.generator.clone(),
-        extensions_used: root.extensions_used.clone(),
-        extensions_required: root.extensions_required.clone(),
+        generator: root.asset.generator.as_deref().map(str::to_string),
+        extensions_used: root.extensions_used.0.clone(),
+        extensions_required: root.extensions_required.0.clone(),
         ..ModelInfo::default()
     };
-    for ext in &root.extensions_required {
+    for ext in &root.extensions_required.0 {
         if !RENDERABLE_REQUIRED.contains(&ext.as_str()) && !ext.starts_with(MATERIAL_PREFIX) {
             info.unsupported.push(ext.clone());
         }
@@ -146,7 +155,7 @@ pub(crate) fn info_of(root: &Root, limits: &ModelLimits) -> Result<ModelInfo, En
             let Some(pos) = p
                 .attributes
                 .get("POSITION")
-                .and_then(|a| root.accessors.get(*a as usize))
+                .and_then(|a| root.accessors.get(a as usize))
             else {
                 continue;
             };

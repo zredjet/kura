@@ -1,9 +1,7 @@
 //! glb の入れ物・JSON の形・ノードの木のたどり・accessor の読み取り。
 
-use std::collections::BTreeMap;
-
 use serde::Deserialize;
-use serde::de::IgnoredAny;
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use super::{ModelLimits, bad};
 use crate::error::EngineError;
@@ -17,10 +15,12 @@ const CHUNK_BIN: u32 = 0x004E_4942;
 /// JSON の入れ子の深さの上限（serde_json は入れ子の深さだけ再帰する。glTF のふつうの深さは 6〜8）。
 pub(crate) const MAX_JSON_DEPTH: usize = 64;
 
-/// 読んだ glb：JSON の形と BIN の塊。
+/// 読んだ glb：JSON の形と BIN の塊、JSON を組み立てた確保の見積もり。
 pub(crate) struct Glb<'a> {
     pub root: Root,
     pub bin: Option<&'a [u8]>,
+    /// JSON を serde で組み立てる確保の見積もり（バイト。[`JsonCounts::heap_bytes`]）。
+    pub json_heap: u64,
 }
 
 fn u32_at(b: &[u8], at: usize) -> Option<u32> {
@@ -89,13 +89,18 @@ pub(crate) fn parse<'a>(bytes: &'a [u8], limits: &ModelLimits) -> Result<Glb<'a>
             json.len()
         )));
     }
-    check_json(json, MAX_JSON_DEPTH, limits.max_json_objects)?;
+    let counts = check_json(
+        json,
+        MAX_JSON_DEPTH,
+        limits.max_json_objects,
+        limits.max_json_values,
+    )?;
     let root: Root =
         serde_json::from_slice(json).map_err(|e| bad(format!("JSON が読めません: {e}")))?;
     if !root.asset.version.starts_with("2.") {
         return Err(EngineError::Unsupported(format!(
             "glTF の版 {} は読めません（2.x だけ）",
-            root.asset.version
+            &*root.asset.version
         )));
     }
     if root.nodes.len() as u64 > limits.max_nodes {
@@ -104,14 +109,89 @@ pub(crate) fn parse<'a>(bytes: &'a [u8], limits: &ModelLimits) -> Result<Glb<'a>
             root.nodes.len()
         )));
     }
-    Ok(Glb { root, bin })
+    Ok(Glb {
+        root,
+        bin,
+        json_heap: counts.heap_bytes(json.len() as u64),
+    })
 }
 
-/// JSON の入れ子の深さ（オブジェクトと配列）とオブジェクトの数を、生のバイト列で数えて断る（文字列の中の括弧は数えない）。
+/// JSON を生のバイト列で数えたもの（[`check_json`]）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct JsonCounts {
+    /// オブジェクトの数。
+    pub objects: u64,
+    /// 値の数（配列の要素とオブジェクトのメンバー）。
+    pub values: u64,
+}
+
+/// serde で組み立てる構造体のうち、いちばん大きいもの（配列の要素になる構造体。中の構造体は外の大きさに入る）。
+const LARGEST_DEF: usize = {
+    let sizes = [
+        std::mem::size_of::<SceneDef>(),
+        std::mem::size_of::<NodeDef>(),
+        std::mem::size_of::<MeshDef>(),
+        std::mem::size_of::<PrimitiveDef>(),
+        std::mem::size_of::<AccessorDef>(),
+        std::mem::size_of::<BufferViewDef>(),
+        std::mem::size_of::<BufferDef>(),
+        std::mem::size_of::<MaterialDef>(),
+        std::mem::size_of::<TextureDef>(),
+        std::mem::size_of::<ImageDef>(),
+        std::mem::size_of::<SamplerDef>(),
+    ];
+    let mut max = 0;
+    let mut i = 0;
+    while i < sizes.len() {
+        if sizes[i] > max {
+            max = sizes[i];
+        }
+        i += 1;
+    }
+    max
+};
+
+/// オブジェクト 1 つあたりの確保の上限（構造体の配列は伸ばすときに古いものと新しいもの（2 倍）が同時に生きるので 3 倍、
+/// 中の短い文字列（[`Short`]）と min・max（16 個まで）の分を足す）。
+const OBJECT_HEAP: u64 = 3 * LARGEST_DEF as u64 + 1_024;
+/// 値 1 つあたりの確保の上限（u32 の並び（children・シーンの nodes）と TEXCOORD の組は 1 つ 8 バイトまでで、伸ばすときに
+/// 3 倍）。名前や文字列の並びは数を抑えた入れ物に読むので、値の数で増えない。
+const VALUE_HEAP: u64 = 24;
+
+impl JsonCounts {
+    /// serde で組み立てる確保の見積もり（オブジェクト × [`OBJECT_HEAP`] ＋ 値 × [`VALUE_HEAP`] ＋ JSON の長さ（逃がし文字の
+    /// ある文字列を読むときの serde_json の作業領域））。
+    pub fn heap_bytes(&self, json_len: u64) -> u64 {
+        self.objects
+            .saturating_mul(OBJECT_HEAP)
+            .saturating_add(self.values.saturating_mul(VALUE_HEAP))
+            .saturating_add(json_len)
+    }
+}
+
+/// JSON の入れ子の深さ（オブジェクトと配列）・オブジェクトの数・値の数（配列の要素とオブジェクトのメンバー）を、生の
+/// バイト列で数えて断る（文字列の中の括弧・区切りは数えない）。serde が組み立てる確保は、オブジェクトと値の数で抑える
+/// （[`JsonCounts::heap_bytes`]。M11 の検証 S3：配列の要素と文字列に上限がなく、32 MiB の JSON で 650 MiB を確保していた）。
 /// 1 バイトずつ必ず進む。
-pub(crate) fn check_json(b: &[u8], max_depth: usize, max_objects: u64) -> Result<(), EngineError> {
-    let (mut depth, mut objects) = (0usize, 0u64);
+pub(crate) fn check_json(
+    b: &[u8],
+    max_depth: usize,
+    max_objects: u64,
+    max_values: u64,
+) -> Result<JsonCounts, EngineError> {
+    let mut counts = JsonCounts::default();
+    // 開いている入れ物：(配列か, まだ要素がないか)。深さは max_depth までなので、積む数も抑えられる
+    let mut open: Vec<(bool, bool)> = Vec::new();
     let (mut in_str, mut esc) = (false, false);
+    let add_value = |counts: &mut JsonCounts| -> Result<(), EngineError> {
+        counts.values += 1;
+        if counts.values > max_values {
+            return Err(EngineError::Limit(format!(
+                "JSON の値が多すぎます（{max_values} を超える）"
+            )));
+        }
+        Ok(())
+    };
     for &c in b {
         if in_str {
             if esc {
@@ -123,29 +203,319 @@ pub(crate) fn check_json(b: &[u8], max_depth: usize, max_objects: u64) -> Result
             }
             continue;
         }
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        // 配列の最初の要素の始まり（閉じ括弧のほか）
+        if !matches!(c, b']' | b'}' | b',' | b':')
+            && let Some((true, empty)) = open.last_mut()
+            && *empty
+        {
+            *empty = false;
+            add_value(&mut counts)?;
+        }
         match c {
             b'"' => in_str = true,
             b'{' | b'[' => {
-                depth += 1;
-                if depth > max_depth {
+                if open.len() >= max_depth {
                     return Err(EngineError::Limit(format!(
                         "JSON の入れ子が深すぎます（{max_depth} 段を超える）"
                     )));
                 }
+                open.push((c == b'[', true));
                 if c == b'{' {
-                    objects += 1;
-                    if objects > max_objects {
+                    counts.objects += 1;
+                    if counts.objects > max_objects {
                         return Err(EngineError::Limit(format!(
                             "JSON のオブジェクトが多すぎます（{max_objects} を超える）"
                         )));
                     }
                 }
             }
-            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'}' | b']' => {
+                open.pop();
+            }
+            // 配列の次の要素・オブジェクトのメンバーの値
+            b',' if matches!(open.last(), Some((true, _))) => add_value(&mut counts)?,
+            b':' if matches!(open.last(), Some((false, _))) => add_value(&mut counts)?,
             _ => {}
         }
     }
-    Ok(())
+    Ok(counts)
+}
+
+// ---- 確保を抑えて読む入れ物（M11 の検証 S3。読む値は前と同じ：受け付ける型・重なったキーは後ろが勝つ・比べる結果） ----
+
+/// 頭の `N` バイトだけを持つ文字列（文字の途中では切らない）。比べる相手（"SCALAR"・"OPAQUE" など）より長い `N` にするので、
+/// 切ったものが有効な値と同じになることはない。文字列でなければ読めない（`String` と同じ）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Short<const N: usize>(String);
+
+impl<const N: usize> std::ops::Deref for Short<N> {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `s` の頭の `n` バイトまで（文字の途中では切らない）。
+fn head(s: &str, n: usize) -> &str {
+    let mut end = n.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or("")
+}
+
+impl<'de, const N: usize> Deserialize<'de> for Short<N> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<const N: usize>;
+        impl<const N: usize> Visitor<'_> for V<N> {
+            type Value = Short<N>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("文字列")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Short<N>, E> {
+                Ok(Short(head(v, N).to_string()))
+            }
+        }
+        d.deserialize_str(V::<N>)
+    }
+}
+
+/// 文字列があったという印だけ（中身は持たない。buffer・image の uri）。文字列でなければ読めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Present;
+
+impl<'de> Deserialize<'de> for Present {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl Visitor<'_> for V {
+            type Value = Present;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("文字列")
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<Present, E> {
+                Ok(Present)
+            }
+        }
+        d.deserialize_str(V)
+    }
+}
+
+/// 拡張の名前の並び（`extensionsUsed`・`extensionsRequired`）。名前は頭の [`MAX_EXTENSION_NAME`] バイトまで、数は
+/// [`MAX_EXTENSIONS`] まで（超えたら読めない。有効な glb は数個）。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Names(pub Vec<String>);
+
+/// 拡張の名前の数の上限。
+pub(crate) const MAX_EXTENSIONS: usize = 64;
+/// 拡張の名前の長さ（バイト）の上限。知っている名前（いちばん長いもので 40 バイトほど）より長い。
+pub(crate) const MAX_EXTENSION_NAME: usize = 128;
+
+impl<'de> Deserialize<'de> for Names {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Names;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("拡張の名前の配列")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Names, A::Error> {
+                let mut out = Vec::new();
+                while let Some(name) = seq.next_element::<Short<MAX_EXTENSION_NAME>>()? {
+                    if out.len() >= MAX_EXTENSIONS {
+                        return Err(de::Error::custom(format!(
+                            "拡張の名前が多すぎます（{MAX_EXTENSIONS} を超える）"
+                        )));
+                    }
+                    out.push(name.0);
+                }
+                Ok(Names(out))
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
+/// 頭の 16 個だけを持つ数の並び（accessor の min・max。成分は 16 個まで）。残りも数として読む（数でなければ読めない）。
+fn first_floats<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<f64>>, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Option<Vec<f64>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("数の配列")
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_seq(self)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(v) = seq.next_element::<f64>()? {
+                if out.len() < 16 {
+                    out.push(v);
+                }
+            }
+            Ok(Some(out))
+        }
+    }
+    d.deserialize_option(V)
+}
+
+/// オブジェクトのキーのうち、読み手が使うもの（ほかは持たない）。
+enum Key {
+    Position,
+    Normal,
+    Color0,
+    /// `TEXCOORD_<n>`（n は先頭に 0 のない 10 進。`TEXCOORD_{n}` で引くので、ほかの書き方は別のキー）。
+    TexCoord(u32),
+    Draco,
+    Meshopt,
+    Unlit,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Key {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl Visitor<'_> for V {
+            type Value = Key;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("キー")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Key, E> {
+                Ok(match v {
+                    "POSITION" => Key::Position,
+                    "NORMAL" => Key::Normal,
+                    "COLOR_0" => Key::Color0,
+                    "KHR_draco_mesh_compression" => Key::Draco,
+                    "EXT_meshopt_compression" => Key::Meshopt,
+                    "KHR_materials_unlit" => Key::Unlit,
+                    _ => match v
+                        .strip_prefix("TEXCOORD_")
+                        .and_then(|n| n.parse::<u32>().ok().filter(|k| k.to_string() == n))
+                    {
+                        Some(k) => Key::TexCoord(k),
+                        None => Key::Other,
+                    },
+                })
+            }
+        }
+        d.deserialize_str(V)
+    }
+}
+
+/// プリミティブの属性（`attributes`）のうち、読み手が引くもの。値はどのキーでも u32 として読む（前の `BTreeMap<String, u32>`
+/// と同じく、数でない値があれば読めない）。同じキーは後ろが勝つ。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Attributes {
+    position: Option<u32>,
+    normal: Option<u32>,
+    color0: Option<u32>,
+    /// (n, accessor)。n の順。
+    texcoords: Vec<(u32, u32)>,
+}
+
+impl Attributes {
+    /// 名前で引く（前の `BTreeMap::get` と同じ答え）。
+    pub(crate) fn get(&self, name: &str) -> Option<u32> {
+        match name {
+            "POSITION" => self.position,
+            "NORMAL" => self.normal,
+            "COLOR_0" => self.color0,
+            _ => {
+                let n = name.strip_prefix("TEXCOORD_")?;
+                let k = n.parse::<u32>().ok().filter(|k| k.to_string() == n)?;
+                self.texcoords
+                    .iter()
+                    .find(|(i, _)| *i == k)
+                    .map(|(_, a)| *a)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Attributes {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Attributes;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("属性のオブジェクト")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Attributes, A::Error> {
+                let mut out = Attributes::default();
+                while let Some(key) = map.next_key::<Key>()? {
+                    let v: u32 = map.next_value()?;
+                    match key {
+                        Key::Position => out.position = Some(v),
+                        Key::Normal => out.normal = Some(v),
+                        Key::Color0 => out.color0 = Some(v),
+                        Key::TexCoord(k) => match out.texcoords.iter_mut().find(|(i, _)| *i == k) {
+                            Some(slot) => slot.1 = v,
+                            None => out.texcoords.push((k, v)),
+                        },
+                        _ => {}
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_map(V)
+    }
+}
+
+/// `extensions` のオブジェクトのうち、読み手が見る名前があるか（値は何でもよい。前の `BTreeMap<String, IgnoredAny>` の
+/// `contains_key` と同じ答え）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExtKeys {
+    pub draco: bool,
+    pub meshopt: bool,
+    pub unlit: bool,
+}
+
+impl ExtKeys {
+    /// 名前があるか（読み手が見る名前だけ）。
+    pub(crate) fn contains_key(&self, name: &str) -> bool {
+        match name {
+            "KHR_draco_mesh_compression" => self.draco,
+            "EXT_meshopt_compression" => self.meshopt,
+            "KHR_materials_unlit" => self.unlit,
+            _ => false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtKeys {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ExtKeys;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("拡張のオブジェクト")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ExtKeys, A::Error> {
+                let mut out = ExtKeys::default();
+                while let Some(key) = map.next_key::<Key>()? {
+                    map.next_value::<IgnoredAny>()?;
+                    match key {
+                        Key::Draco => out.draco = true,
+                        Key::Meshopt => out.meshopt = true,
+                        Key::Unlit => out.unlit = true,
+                        _ => {}
+                    }
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_map(V)
+    }
 }
 
 // ---- JSON の形（使う項目だけ。知らない項目は読み飛ばす：glTF は extras・extensions を足せる） ----
@@ -167,15 +537,16 @@ pub(crate) struct Root {
     pub samplers: Vec<SamplerDef>,
     pub animations: Vec<IgnoredAny>,
     pub skins: Vec<IgnoredAny>,
-    pub extensions_used: Vec<String>,
-    pub extensions_required: Vec<String>,
+    pub extensions_used: Names,
+    pub extensions_required: Names,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct Asset {
-    pub version: String,
-    pub generator: Option<String>,
+    pub version: Short<16>,
+    /// 作った道具（頭の 256 バイトまで）。
+    pub generator: Option<Short<256>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,11 +576,11 @@ pub(crate) struct MeshDef {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct PrimitiveDef {
-    pub attributes: BTreeMap<String, u32>,
+    pub attributes: Attributes,
     pub indices: Option<u32>,
     pub material: Option<u32>,
     pub mode: Option<u32>,
-    pub extensions: BTreeMap<String, IgnoredAny>,
+    pub extensions: ExtKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -221,8 +592,10 @@ pub(crate) struct AccessorDef {
     pub normalized: bool,
     pub count: u64,
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: Short<16>,
+    #[serde(deserialize_with = "first_floats")]
     pub min: Option<Vec<f64>>,
+    #[serde(deserialize_with = "first_floats")]
     pub max: Option<Vec<f64>>,
     pub sparse: Option<IgnoredAny>,
 }
@@ -240,18 +613,18 @@ pub(crate) struct BufferViewDef {
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct BufferDef {
     pub byte_length: u64,
-    pub uri: Option<String>,
+    pub uri: Option<Present>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct MaterialDef {
     pub pbr_metallic_roughness: Option<PbrDef>,
-    pub alpha_mode: Option<String>,
+    pub alpha_mode: Option<Short<16>>,
     pub alpha_cutoff: Option<f64>,
     pub double_sided: bool,
     pub emissive_factor: Option<[f64; 3]>,
-    pub extensions: BTreeMap<String, IgnoredAny>,
+    pub extensions: ExtKeys,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -310,8 +683,8 @@ pub(crate) struct SourceRef {
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct ImageDef {
     pub buffer_view: Option<u32>,
-    pub mime_type: Option<String>,
-    pub uri: Option<String>,
+    pub mime_type: Option<Present>,
+    pub uri: Option<Present>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -675,7 +1048,7 @@ pub(crate) fn read_indices(
         .accessors
         .get(index as usize)
         .ok_or_else(|| bad("accessor の番号が範囲の外です"))?;
-    if acc.kind != "SCALAR" || !matches!(acc.component_type, 5121 | 5123 | 5125) {
+    if &*acc.kind != "SCALAR" || !matches!(acc.component_type, 5121 | 5123 | 5125) {
         return Err(bad("索引の accessor の型が不正です"));
     }
     if acc.count > max {
@@ -742,18 +1115,110 @@ mod tests {
     fn json_depth_and_objects_are_counted_outside_strings() {
         let deep = "[".repeat(65) + &"]".repeat(65);
         assert!(matches!(
-            check_json(deep.as_bytes(), 64, 100),
+            check_json(deep.as_bytes(), 64, 100, 1_000),
             Err(EngineError::Limit(_))
         ));
         let ok = "[".repeat(64) + &"]".repeat(64);
-        assert!(check_json(ok.as_bytes(), 64, 100).is_ok());
+        assert!(check_json(ok.as_bytes(), 64, 100, 1_000).is_ok());
         // 文字列の中の括弧・エスケープした引用符は数えない
         let s = format!(r#"{{"a":"{}\"{}"}}"#, "[".repeat(100), "{".repeat(100));
-        assert!(check_json(s.as_bytes(), 64, 1).is_ok());
+        assert!(check_json(s.as_bytes(), 64, 1, 1_000).is_ok());
         assert!(matches!(
-            check_json(b"[{},{},{}]", 64, 2),
+            check_json(b"[{},{},{}]", 64, 2, 1_000),
             Err(EngineError::Limit(_))
         ));
+    }
+
+    /// 検証 S3：値の数（配列の要素とオブジェクトのメンバー）を、文字列の中の区切りを除いて数え、上限で断る。
+    #[test]
+    fn json_values_are_counted_and_limited() {
+        let count = |s: &str| check_json(s.as_bytes(), 64, 1_000, 1_000).unwrap();
+        assert_eq!(count("[]").values, 0);
+        assert_eq!(count("{}").values, 0);
+        assert_eq!(count("[ 1 ]").values, 1);
+        assert_eq!(count("[1,2,3]").values, 3);
+        assert_eq!(
+            count(r#"{"a":1,"b":[true,null,{}]}"#),
+            JsonCounts {
+                objects: 2,
+                values: 5
+            }
+        );
+        assert_eq!(count(r#"["a,b:c","[{",[[]]]"#).values, 4);
+        assert_eq!(count(r#"{"k\":":[1]}"#).values, 2);
+        assert!(matches!(
+            check_json(b"[0,0,0,0]", 64, 10, 3),
+            Err(EngineError::Limit(_))
+        ));
+        assert!(check_json(b"[0,0,0]", 64, 10, 3).is_ok());
+        // 見積もりはオブジェクトと値の数で増える
+        let small = count("[1]").heap_bytes(3);
+        assert!(count("[1,2,{}]").heap_bytes(8) > small + OBJECT_HEAP);
+    }
+
+    /// 検証 S3：確保を抑えた入れ物は、前の型（`String`・`BTreeMap`・`Vec`）と同じ値を答え、同じものを断る。
+    #[test]
+    fn bounded_fields_read_like_the_plain_types() {
+        let root: Root = serde_json::from_str(
+            r#"{"asset":{"version":"2.0","generator":"g"},"extensionsUsed":["A","A"],
+               "meshes":[{"primitives":[{"attributes":{"POSITION":1,"NORMAL":2,"TEXCOORD_0":3,"TEXCOORD_10":4,
+               "TEXCOORD_01":5,"_X":6,"POSITION":7},"extensions":{"KHR_draco_mesh_compression":{"a":[1]}}}]}],
+               "accessors":[{"type":"VEC3","min":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18]}],
+               "buffers":[{"uri":"x"}],"materials":[{"alphaMode":"MASK","extensions":{"KHR_materials_unlit":{}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(&*root.asset.version, "2.0");
+        assert_eq!(
+            root.extensions_used.0,
+            vec!["A".to_string(), "A".to_string()]
+        );
+        let p = &root.meshes[0].primitives[0];
+        // 同じキーは後ろが勝つ。TEXCOORD_n は先頭に 0 のない書き方だけ
+        assert_eq!(p.attributes.get("POSITION"), Some(7));
+        assert_eq!(p.attributes.get("NORMAL"), Some(2));
+        assert_eq!(p.attributes.get("TEXCOORD_0"), Some(3));
+        assert_eq!(p.attributes.get("TEXCOORD_10"), Some(4));
+        assert_eq!(p.attributes.get("TEXCOORD_1"), None);
+        assert_eq!(p.attributes.get("TEXCOORD_01"), None);
+        assert_eq!(p.attributes.get("COLOR_0"), None);
+        assert!(p.extensions.contains_key("KHR_draco_mesh_compression"));
+        assert!(!p.extensions.contains_key("EXT_meshopt_compression"));
+        assert_eq!(root.accessors[0].min.as_ref().map(Vec::len), Some(16));
+        assert!(root.buffers[0].uri.is_some());
+        assert_eq!(root.materials[0].alpha_mode.as_deref(), Some("MASK"));
+        assert!(
+            root.materials[0]
+                .extensions
+                .contains_key("KHR_materials_unlit")
+        );
+        // 長い文字列は頭だけ（文字の途中では切らない）
+        let long: Asset = serde_json::from_str(&format!(
+            r#"{{"version":"2.{}","generator":"{}"}}"#,
+            "0".repeat(100),
+            "あ".repeat(100)
+        ))
+        .unwrap();
+        assert!(long.version.starts_with("2.") && long.version.len() == 16);
+        assert_eq!(long.generator.as_deref().map(str::len), Some(255));
+        // 前の型が断っていたもの（数でない属性・文字列でない uri・数でない min）は断る
+        for bad in [
+            r#"{"meshes":[{"primitives":[{"attributes":{"_X":"a"}}]}]}"#,
+            r#"{"buffers":[{"uri":1}]}"#,
+            r#"{"images":[{"mimeType":1}]}"#,
+            r#"{"accessors":[{"min":[1,"a"]}]}"#,
+            r#"{"asset":{"version":2}}"#,
+        ] {
+            assert!(serde_json::from_str::<Root>(bad).is_err(), "{bad}");
+        }
+        // 拡張の名前は 64 個まで
+        let names = |n: usize| {
+            format!(
+                r#"{{"extensionsRequired":[{}]}}"#,
+                vec![r#""a""#; n].join(",")
+            )
+        };
+        assert!(serde_json::from_str::<Root>(&names(MAX_EXTENSIONS)).is_ok());
+        assert!(serde_json::from_str::<Root>(&names(MAX_EXTENSIONS + 1)).is_err());
     }
 
     #[test]

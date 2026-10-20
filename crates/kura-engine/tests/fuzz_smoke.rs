@@ -607,6 +607,32 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 .unwrap()
                 .into_iter()
                 .map(|(_, b)| b)
+                // M11 の検証 S3：数と長さを抑えて読む項目（拡張の名前・属性のキー・min・max・uri・generator・材質と
+                // プリミティブの extensions）と、確保しない項目（extras・animations）
+                .chain([kura_engine::model::glb_bytes(
+                    &json!({
+                        "asset": { "version": "2.0", "generator": "あ".repeat(100) },
+                        "extensionsUsed": ["KHR_materials_unlit", "KHR_draco_mesh_compression", "X"],
+                        "extensionsRequired": ["KHR_materials_unlit"],
+                        "extras": [[1, 2, { "a": "b" }], "c"],
+                        "animations": [{ "channels": [], "samplers": [] }],
+                        "scene": 0,
+                        "scenes": [{ "nodes": [0, 0, 1] }],
+                        "nodes": [{ "mesh": 0, "children": [1] }, { "mesh": 0, "matrix": [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1] }],
+                        "meshes": [{ "primitives": [{
+                            "attributes": { "POSITION": 0, "TEXCOORD_0": 0, "TEXCOORD_01": 0, "_X": 0, "POSITION": 0 },
+                            "material": 0,
+                            "extensions": { "EXT_meshopt_compression": { "x": [1] } }
+                        }] }],
+                        "materials": [{ "alphaMode": "MASK", "extensions": { "KHR_materials_unlit": {} } }],
+                        "accessors": [{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                                        "min": [0, 0, 0, 9, 9], "max": [1, 1, 0] }],
+                        "bufferViews": [{ "buffer": 0, "byteLength": 36 }],
+                        "buffers": [{ "byteLength": 36, "uri": "data:," }],
+                        "images": [{ "uri": "x.png", "mimeType": "image/png" }]
+                    }),
+                    &[0u8; 36],
+                )])
                 .collect(),
         ),
     ]
