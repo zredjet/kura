@@ -655,6 +655,45 @@ mod tests {
         ));
     }
 
+    /// 決定 15 の見出し：Platform の段の形（開くだけ。展開しない）の画素の形式が、HEIC・HEIF のアルファの有無を表す
+    /// （Swift の `CGImage` の `alphaInfo`。`kCGImagePropertyHasAlpha` と同じ答え）。アルファのある HEIC は HEIF としても
+    /// アルファあり、不透明な HEIC・HEIC のシーケンスはアルファなし。見出しを読んでも ImageIO は展開しない。
+    #[test]
+    fn heic_headers_tell_alpha_without_decoding() {
+        use kura_core::analysis::plan::read_after_header;
+        let _g = exclusive();
+        let set = mac_set();
+        let shape = |bytes: &[u8], format: &str| {
+            set.shape(
+                &mut Cursor::new(bytes.to_vec()),
+                format,
+                &DecodeOptions::default(),
+                &Limits::default(),
+            )
+            .unwrap()
+        };
+        let before = stats();
+        let alpha = fixture("heic-alpha-48x32.heic");
+        for format in ["heic", "heif"] {
+            let (s, codec) = shape(&alpha, format);
+            assert_eq!(codec, IMAGEIO_DEC);
+            assert!(
+                matches!(s, kura_engine::Shape::Image { fmt, .. } if fmt.has_alpha()),
+                "{format}: {s:?}"
+            );
+            assert!(read_after_header(&s), "{format}");
+        }
+        for name in ["heic-gradient-300x200.heic", "heics-3x24x16.heic"] {
+            let (s, _) = shape(&fixture(name), "heic");
+            assert!(!read_after_header(&s), "{name}: {s:?}");
+        }
+        assert_eq!(
+            stats(),
+            before,
+            "見出しだけを読み、展開しない・閉じ忘れない"
+        );
+    }
+
     /// HEIC のシーケンスはキャンバスいっぱいのフレームの列（表示時間・繰り返しの回数つき）。
     #[test]
     fn heic_sequences_become_full_frames() {

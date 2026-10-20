@@ -795,7 +795,8 @@ fn pixel_art_search_follows_the_effective_value_of_the_asset_panel() {
     assert_eq!(unanalyzed(&conn, "ドット絵:なし"), Some(waiting));
 }
 
-/// 読まずに形式から書く事実（JPEG・HEIC。決定 5）は、透過・ドット絵・アニメの「なし」に入り、色数の検索には入らない。
+/// 読まずに形式から書く事実（JPEG とアルファのない HEIC。決定 5・15）は、透過・ドット絵・アニメの「なし」に入り、色数の
+/// 検索には入らない。
 #[test]
 fn facts_written_from_the_format_answer_the_none_side() {
     use crate::analysis::facts::from_format;

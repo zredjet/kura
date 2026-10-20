@@ -41,7 +41,7 @@ export function alphaText(image: AssetImageFactsDto | undefined): string {
   return image?.alpha ? t.alphaValues[image.alpha] : t.none;
 }
 
-/** 色数「16 色／256 色より多い」（JPEG・HEIC は計らないので「—」）。 */
+/** 色数「16 色／256 色より多い」（JPEG とアルファのない HEIC・HEIF は計らないので「—」）。 */
 export function colorsText(image: AssetImageFactsDto | undefined): string {
   const n = image?.colors;
   if (n === null || n === undefined || n <= 0) {
