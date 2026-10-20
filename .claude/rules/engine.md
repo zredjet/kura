@@ -6,7 +6,7 @@ paths:
 # 操作エンジン（kura-engine）のルール
 
 - 仕様は `docs/editing.md` に従う。特に「同じ文書・同じ元なら同じ結果」（§8）と「元に対する累積の文書」（§4.2）を崩さない。
-- kura-engine は OS・DB・Tauri を知らない。`#[cfg(target_os = …)]` を書かず、macOS の機能は kura-mac が trait を実装して注入する。Linux でも `cargo test -p kura-engine` が通ること。
+- kura-engine は OS・DB・Tauri を知らない。`#[cfg(target_os = …)]` を書かず、macOS の機能は kura-mac が trait を実装して注入する。Linux でも `cargo test -p kura-engine` が通ること。OS の資源は中身で受ける（SVG の文字のフォントは kura-mac がシステムのフォントを mmap して `codec::fonts::SvgFonts` で渡す。エンジンはファイルを開かず、フォントを探さない。M11）。
 - 決定性の規則（`crates/kura-engine/clippy.toml` で強制）：
   - 超越関数は `crate::math` だけ（OS の libm を呼ばない）。
   - `HashMap`・`HashSet` を使わない。出力に効く順序は `BTreeMap` か並べた `Vec` で決める。
@@ -24,15 +24,16 @@ paths:
   - 追記の差分：`apply_appended` を実行器（`render_cached`）が使うのは、持ち上げず、先に解く解析がなく、メタデータの写しが恒等（`MetaAccess::Map` で `SpaceMap`・`TimeMap` が `Identity`）の操作で、前回の描画と入力の指紋・実装・規則・種・段が同じときだけ。前の出力にはメタデータを写したあとの値が渡り、警告は足した分だけを出す（前の分は実行器が前に足す）。`parse_appended`・`infer_appended` を書くなら、結果（指摘と文言も）を全体の `parse`・`infer` と同じにし、全例のすべての切れ目で照らすテストを足す。
   - プレビューの段：`preview` で `Scaled`・`Skip` を返すなら、`preview_params` は段の入力に収め（矩形は clamp。canvas のように入力の外に出てよいものは除く）、大きさを決める操作は等倍の出力の ⌈n/2^k⌉ を目指す（等倍の入力の形 `full` を使う）。段で意味の変わるもの（Indexed8 にする変換など）は `FullOnly` のまま。`tests/preview.rs` の `scaled_params_infer` の一覧に 1 行足す。
   - 作業領域：入力・出力の値のほかに、値の数倍の領域（表・列・誤差の配列・画素の集合・待ち行列など）を持つ操作は `work_bytes` を申告する（`Work { shared, per_task }`。並列の仕事ごとの分は `per_task`。タイル 1 枚分の一時の領域は数えない）。入力の中身で量が変わる領域（`paint.actions` の塗りつぶしの区間の待ち行列など）は上限で申告し、上限ちょうどを `try_reserve_exact` で先に確保する（倍々に伸ばさない。申告と `Limit` を同じ式から決める）。順に当てる動作の列は、動作ごとの量の最大。`ops::tests::work_bytes_are_declared_where_values_are_multiplied` の一覧に 1 行足す。コーデックも `Decoder::work_bytes`・`Encoder::work_bytes`（既定は値の 1 倍）を実測に合わせ、ファイル全体を読んで持つデコーダ（aseprite）は `Decoder::file_work_bytes` でファイルの長さを足す（展開した中間のもの（セルなど）を層 × フレームの数で持ち続けない）。kura-devtools の `mem_smoke`（ケースを足す）と `bench edit` の NFR-17 で上回らないことを確かめる。
-- エンジンはスレッドプールを作らない（`ThreadPoolBuilder`・`.install(`・`::install`（UFCS の `ThreadPool::install(&pool, ..)`）・`build_global` をテストのモジュールの外に書かない。`tests/rules.rs` が src を走査し、clippy.toml が rayon のプールのほかの口と、`par_blocks` を通さずに並列のイテレータを作る口を禁じる）。プールは呼び手（kura-core の `EngineRuntime`）が持ち、その中で描く。
+- エンジンはスレッドプールを作らない（`ThreadPoolBuilder`・`.install(`・`::install`（UFCS の `ThreadPool::install(&pool, ..)`）・`build_global` をテストのモジュールの外に書かない。`tests/rules.rs` が src を走査し、clippy.toml が rayon のプールのほかの口と、`par_blocks` を通さずに並列のイテレータを作る口を禁じる）。プールは呼び手（kura-core の `EngineRuntime`）が持ち、その中で描く。呼び手は `preview`・`bulk` の閉包の中だけでエンジンを呼び（サムネイルのプール `kura-thumb-*` やグローバルのプールの中で呼ばない）、予算の確保（待つことがある）は閉包に入る前に行う（docs/editing.md §12.10・§12.11）。
 - 範囲の描画・継ぎはぎの値とプレビューの段の値を、保存・一括・解析・スポイト・ダイジェストに使わない（docs/editing.md §12.5・§12.7。口を足すときも崩さない）。範囲の描画・継ぎはぎの値は型で防ぐ（`PartialValue`。全体の値は由来が `Exact` のときだけ `exact()` で取り出せ、無効なタイルのある値は `Value::digest` が断る）。段の計画は `render`・`render_with_solver`・ダイジェストを取る `render_cached`・`spoit` が断る（`Unsupported`）が、ダイジェストを取らない `render_cached` の段の出力はただの `Value` で返るので、保存の道に渡さないのは呼び手の約束（保存・一括は `render` を通す）。ノードのキャッシュの当たり・差分の適用・解析・スポイトに使うのは由来 `Exact` の項目だけ（段の計画のノードの値も `Exact` で入るが、指紋の段で等倍と分かれる）。
+- 3D（glb。`model/`。値にしない）の描く値を変えたら `model::RENDERER`（`model-kura-render/1`）の版を上げる。kura-core のサムネイルの指紋（settings の `thumbs.plan`）が `RENDERER` を見て、glb のサムネイルを作り直す。情報の数え方（`read_info`）を変えても、ライブラリに入っている情報（`items.codec_info`）は読み直さない。ゴールデン `goldens-model/` は追記だけ（docs/editing.md §9.10）。
 - 結果を変える修正は操作の版を上げ、旧版を `legacy` に残す。引数の形だけの変更は `migrate` で移し、旧版のゴールデンの例が同じ値になることをテストで確かめる。
 - ゴールデン（`goldens/<操作>/v<版>.jsonl`）は追記だけ。既存の行を書き換えない。例（名前・引数・入力）は変えずに、新しい名前の例を足す。
 - 文書の型（doc.rs）に項目を足したら `SCHEMA` を上げ、`SCHEMA_STEPS` に移行を足す（文書の型は知らない項目を受け付けない）。
 - 全体の規則（メタデータの写し方・丸めなど）を変えるときは `RULES` を上げ、古い規則の実装を残す（`render` が文書の `rules` で選ぶ）。
 - 外から来たファイルを読むコードは、確保の前にヘッダから大きさを見積もって `Limits` と予算で判断し、`try_reserve_exact` で確保する。展開は上限付きの領域にだけ行う。第三者のデコーダの境界では `catch_unwind` する。
 - スタックのあふれは `catch_unwind` で受け止められない（プロセスごと落ちる）。入れ子の深さだけ再帰する第三者のパーサー（roxmltree・usvg など）に渡す前に、生のバイト列で深さを数えて断る。自前の木のたどりも再帰させない（明示の積み上げで）。深さの上限は、2 MiB のスタックのデバッグのビルドで余裕があるように決め、ビルドで変えない。
-- 新しいパーサーには、壊れた入力のテスト（ChaCha8 で作る）とファズの対象（`tests/fuzz_smoke.rs` の `targets()` と `fuzz/fuzz_targets/`）を足す。外から来たバイト列を `&str` の位置で切らない（多バイト文字の途中で panic する。走査はバイト列で）。自前の走査のループは、どの枝でも必ず 1 バイト以上進める（ファズで、読み飛ばしの枝が進まない無限ループを見つけた）。第三者のパーサー・描画器に渡す前の見積もりは、その実装が実際に確保する大きさ・回る数に合わせ、キャンバスに比べた相対ではなく絶対の予算で断る。自前のエンコーダで作れない形は、他のツールで作ったフィクスチャ（`fixtures/`。作り方は README）で他の実装と照らす。フィクスチャは消さない・変えない。
+- 新しいパーサーには、壊れた入力のテスト（ChaCha8 で作る）とファズの対象（`tests/fuzz_smoke.rs` の `targets()` と `fuzz/fuzz_targets/`。M11 の glb の読み手は `model_glb`）を足す。外から来たバイト列を `&str` の位置で切らない（多バイト文字の途中で panic する。走査はバイト列で）。自前の走査のループは、どの枝でも必ず 1 バイト以上進める（ファズで、読み飛ばしの枝が進まない無限ループを見つけた）。第三者のパーサー・描画器に渡す前の見積もりは、その実装が実際に確保する大きさ・回る数に合わせ、キャンバスに比べた相対ではなく絶対の予算で断る。自前のエンコーダで作れない形は、他のツールで作ったフィクスチャ（`fixtures/`。作り方は README）で他の実装と照らす。フィクスチャは消さない・変えない。
 - Rust と TS で同じ規則を実装するもの（描画の筆・点の列の詰め方など）は、共有のテストベクタ（`tests/vectors/`）で照らす。ベクタは消さない・変えない（規則を変えるなら操作の版を上げて新しいファイルを足す）。
 - 引数によって整数だけで済む操作は `numeric_for` で `Exact` を返す（その例のゴールデンはすべてのターゲットで照らす）。
 - コーデックは読み書きで別の識別子に約束の版を持つ（`png-rs-dec/1`・`png-rs-enc/1`）。書くバイト列が変わる変更はエンコーダの版を上げる。読む値は変えない（変えるならデコーダの版を上げ、旧版を `add_legacy_decoder` で残す）。`goldens-codecs/` は追記だけ。中で OS の libm を使う第三者のデコーダ（resvg。symphonia の Vorbis・AAC は段 9 で libm に差し替えた写しにして再現できる）は `reproducible()` を偽にし（読んだ元にアンカーを作る）、デコーダのゴールデンに入れずフィクスチャで他の実装と照らす。
