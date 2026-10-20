@@ -1257,12 +1257,25 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
         ));
     }
     // `<text>` ごとの文字のレイアウトの手間（svg_text）。textPath の参照先は、同じ id の図形の区間の数のいちばん多いもの
+    // （id ごとに 1 度だけ数える。多くの textPath が長い path を参照しても、path を数え直さない）
+    let seg_memo: std::cell::RefCell<std::collections::BTreeMap<String, u64>> =
+        std::cell::RefCell::new(std::collections::BTreeMap::new());
     let segments = |tp: &SvgNode<'_, '_>| -> u64 {
         tp.attributes()
             .filter(|a| a.name() == "href")
             .filter_map(|a| href_id(a.value()))
-            .flat_map(|id| index.targets(id))
-            .map(|t| svg_text::path_segments(&t))
+            .map(|id| {
+                if let Some(n) = seg_memo.borrow().get(id) {
+                    return *n;
+                }
+                let n = index
+                    .targets(id)
+                    .map(|t| svg_text::path_segments(&t))
+                    .max()
+                    .unwrap_or(0);
+                seg_memo.borrow_mut().insert(id.to_string(), n);
+                n
+            })
             .max()
             .unwrap_or(0)
     };

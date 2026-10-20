@@ -17,7 +17,7 @@
 //! 和文は 10 字のラベルで約 450 個）。字ごとの手間は文字の種類で大きく違う（輪郭の込み入った字・アラビア文字の字形の
 //! 組み立て・左右の向きの混在）ので、字を 3 つの組（[`class_of`]）に分けて、組ごとに測った最悪の値で数える。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -184,8 +184,10 @@ pub(crate) fn text_cost(
     let mut work = TEXT_ELEMENT_WORK;
     let mut reshape = 0u64;
     let mut cur = Chunk::default();
-    // 位置を付けた要素で、まだ最初の字が来ていないもの
-    let mut pending: Vec<SvgNode<'_, '_>> = Vec::new();
+    // 位置を付けた要素で、まだ最初の字が来ていないもの（要素の番号）
+    let mut pending: BTreeSet<usize> = BTreeSet::new();
+    // textPath ごとの参照先の区間の数（同じ textPath の中の文字の節ごとに path を数え直さない）
+    let mut segments: BTreeMap<usize, u64> = BTreeMap::new();
     let close = |c: &mut Chunk, work: &mut u64, reshape: &mut u64| {
         *work = work.saturating_add(c.work());
         *reshape = (*reshape).max(c.reshape());
@@ -194,7 +196,7 @@ pub(crate) fn text_cost(
     for d in t.descendants() {
         if d.is_element() {
             if positioned(&d) {
-                pending.push(d);
+                pending.insert(d.id().get() as usize);
             }
             continue;
         }
@@ -202,7 +204,9 @@ pub(crate) fn text_cost(
             continue;
         };
         if d.is_text() {
-            let first = pending.iter().any(|p| d.ancestors().any(|a| a == *p));
+            let first = !pending.is_empty()
+                && d.ancestors()
+                    .any(|a| pending.contains(&(a.id().get() as usize)));
             if first && s.chars().any(|c| !is_xml_space(c)) && cur.chars > 0 {
                 close(&mut cur, &mut work, &mut reshape);
             }
@@ -222,7 +226,10 @@ pub(crate) fn text_cost(
                 .take_while(|a| a.id() != t.id())
                 .find(|a| a.is_element() && a.tag_name().name() == "textPath")
             {
-                cur.path = cur.path.max(path_segments(&tp));
+                let n = *segments
+                    .entry(tp.id().get() as usize)
+                    .or_insert_with(|| path_segments(&tp));
+                cur.path = cur.path.max(n);
             }
         }
     }
@@ -537,6 +544,33 @@ mod tests {
             "a".repeat(10)
         )));
         assert!(tp.work >= 10_000 * 10 * PATH_SEGMENT_WORK);
+    }
+
+    /// 長い path を参照する textPath の中の多くの文字の節でも、path の区間は textPath ごとに 1 度だけ数える（数える手間が
+    /// 節の数 × path の長さにならない）。
+    #[test]
+    fn text_path_segments_are_counted_once_per_text_path() {
+        let d = format!("M0 0{}", " L1 1".repeat(200_000));
+        let svg = wrap(&format!(
+            r##"<path id="p" d="{d}"/><text><textPath href="#p">{}</textPath></text>"##,
+            "<tspan>a</tspan>".repeat(2_000)
+        ));
+        let doc = usvg::roxmltree::Document::parse(&svg).unwrap();
+        let t = doc
+            .descendants()
+            .find(|n| n.tag_name().name() == "text")
+            .unwrap();
+        let path = doc
+            .descendants()
+            .find(|n| n.attribute("id") == Some("p"))
+            .unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let c = text_cost(&t, &|_| {
+            calls.set(calls.get() + 1);
+            path_segments(&path)
+        });
+        assert_eq!(calls.get(), 1);
+        assert!(c.work > MAX_TEXT_WORK);
     }
 
     /// 字の組ごとの手間：アラビア文字を 1 字含む塊は、塊の字すべてを重い組で形にし直す。和文のラベルは 450 個ほど読める。
