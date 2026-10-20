@@ -15,6 +15,7 @@ import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
 import { FontSpecimen, QuickLookAnim, useFontFace } from '../asset/AssetStage';
 import { useAssetData } from '../asset/useAssetData';
+import { loopOf } from '../asset/useLoopRange';
 import { WaveformView } from '../asset/WaveformView';
 import styles from './QuickLook.module.css';
 
@@ -120,11 +121,7 @@ export function QuickLook() {
             <WaveformView
               hash={item.hash}
               version={asset?.facts?.analyzedAt ?? null}
-              loop={
-                asset?.facts?.audio.loopRange
-                  ? [asset.facts.audio.loopRange.start, asset.facts.audio.loopRange.end]
-                  : null
-              }
+              loop={loopOf(asset)}
               positionSeconds={audioSeconds}
               className={styles.wave}
             />
