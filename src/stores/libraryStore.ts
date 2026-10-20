@@ -36,9 +36,12 @@ interface LibraryState {
   loadList: () => Promise<void>;
   /** 起動時に前回のライブラリを開く（起動の間に 1 回だけ。続けて呼ばれたら同じ 1 回を待つ）。 */
   restore: () => Promise<void>;
-  /** 新しいライブラリを作って開く（失敗は呼び出し側へ）。 */
+  /**
+   * 新しいライブラリを作って開く（失敗は呼び出し側へ）。開いていたライブラリから作るのに失敗して、前のライブラリも
+   * 閉じていたら、初回の画面に戻して理由と場所を `restoreError` に持つ（`followFailedSwitch`）。
+   */
   create: (path: string) => Promise<void>;
-  /** 既存のライブラリを開く（失敗は呼び出し側へ）。 */
+  /** 既存のライブラリを開く（失敗は呼び出し側へ。開いていたライブラリから開くのに失敗したときは `create` と同じ）。 */
   open: (path: string) => Promise<void>;
   /** 件数などを読み直す。 */
   refresh: () => Promise<void>;
@@ -99,16 +102,30 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     return restoring;
   },
   create: async (path) => {
-    const info = await createLibrary(path);
-    resetForLibrary();
-    set({ status: 'open', info, missingPath: null, restoreError: null, list: null });
+    const switching = get().status === 'open';
+    try {
+      const info = await createLibrary(path);
+      resetForLibrary();
+      set({ status: 'open', info, missingPath: null, restoreError: null, list: null });
+    } catch (error) {
+      if (switching) {
+        await followFailedSwitch(set, path, error);
+      }
+      throw error;
+    }
   },
   open: async (path) => {
+    const switching = get().status === 'open';
     await watchUpgrades();
     try {
       const info = await openLibrary(path);
       resetForLibrary();
       set({ status: 'open', info, missingPath: null, restoreError: null, list: null });
+    } catch (error) {
+      if (switching) {
+        await followFailedSwitch(set, path, error);
+      }
+      throw error;
     } finally {
       settleUpgrade();
     }
@@ -146,6 +163,44 @@ async function restoreOnce(set: (state: Partial<LibraryState>) => void): Promise
   } finally {
     settleUpgrade();
   }
+}
+
+/**
+ * 開いていたライブラリから別のライブラリを開く・作るのに失敗したあと、画面を Rust に合わせる。Rust は前のライブラリを
+ * 閉じてから開く（src-tauri の `AppState::replace_session`）ので、失敗すると前のライブラリも閉じている。どれも開いて
+ * いなければ（`library_info` が NotFound）初回の画面に戻し、開けなかった理由と場所を出す（`restoreError` と同じカード。
+ * design.md §3.1「ライブラリの更新」）。まだ開いていれば（閉じる前に失敗した）そのまま。
+ */
+async function followFailedSwitch(
+  set: (state: Partial<LibraryState>) => void,
+  path: string,
+  error: unknown,
+): Promise<void> {
+  try {
+    await libraryInfo();
+    return;
+  } catch (probe) {
+    if (!isIpcError(probe, 'NotFound')) {
+      console.warn('ライブラリが開いているかを確かめられませんでした', probe);
+      return;
+    }
+  }
+  resetForLibrary();
+  set({
+    status: 'none',
+    info: null,
+    list: null,
+    missingPath: null,
+    restoreError: { path, error: appErrorOf(error) },
+  });
+}
+
+/** 開く操作の例外を AppError の形にする（IpcError でなければ Internal）。 */
+function appErrorOf(error: unknown): AppError {
+  if (isIpcError(error)) {
+    return { code: error.code, message: error.message };
+  }
+  return { code: 'Internal', message: error instanceof Error ? error.message : String(error) };
 }
 
 /** ライブラリを切り替えたときに、前のライブラリの表示を捨てる。 */
