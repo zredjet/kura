@@ -26,7 +26,9 @@ use kura_core::query::QueryCheck;
 use kura_core::queue::UnitKey;
 use kura_mac::ExternalPlayer;
 
+use crate::commands::asset::{AssetAlphaDto, AssetAnalysisStateDto};
 use crate::config::PlayerPrefs;
+use kura_core::asset::{Alpha, AnalysisState};
 use kura_core::query::suggest::{Suggestion, SuggestionKind};
 use kura_core::tags::{TagDetail, TagPatch, TagSuggestion};
 use kura_core::unit::{Cover, OrderMode, UnitDetail, UnitKind, UnitPatch, UnitSummary};
@@ -613,10 +615,47 @@ pub struct ItemSummaryDto {
     pub source_site: Option<String>,
     pub imported_at: i64,
     pub captured_at: Option<i64>,
-    /// `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。
+    /// `pending` / `ready` / `stale` / `failed`。`ready` と `stale`（作り直すまで今の絵を出す）のときサムネイルがある。
     pub thumb_state: String,
     pub proxy_state: String,
     pub last_played_at: Option<i64>,
+    /// サムネイルを作り直した回数（`thumbUrl` の `rev`。0 より大きければ URL に `?r=`）。
+    pub thumb_rev: i64,
+    /// 解析の進み具合（`pending` のものは、解析のジョブが進んだら取り直す）。
+    pub analysis_state: AssetAnalysisStateDto,
+    /// 解析で分かった透過（未解析・画像でなければ null）。`binary`・`partial` なら市松模様を敷く。
+    pub alpha: Option<AssetAlphaDto>,
+    /// ドット絵として表示するか（実効値：設定 ?? 自動の判定 ?? 偽）。広げるときだけ最近傍。
+    pub pixel_art: bool,
+    /// ドット絵の設定（null は自動）。右クリックの「ドット絵として表示」のチェックに使う。
+    pub pixel_art_setting: Option<bool>,
+    /// アニメとして回せるか（コマが 2 つ以上か、格子を設定してある）。
+    pub animated: bool,
+    /// コマの数（格子があれば帯で使う数）。タイルの「8 コマ」。
+    pub frame_count: Option<u32>,
+    /// ループ点がある音声か。
+    pub has_loop: bool,
+}
+
+impl From<Alpha> for AssetAlphaDto {
+    fn from(a: Alpha) -> Self {
+        match a {
+            Alpha::None => Self::None,
+            Alpha::Binary => Self::Binary,
+            Alpha::Partial => Self::Partial,
+        }
+    }
+}
+
+impl From<AnalysisState> for AssetAnalysisStateDto {
+    fn from(s: AnalysisState) -> Self {
+        match s {
+            AnalysisState::Pending => Self::Pending,
+            AnalysisState::Ready => Self::Ready,
+            AnalysisState::Failed => Self::Failed,
+            AnalysisState::NotNeeded => Self::NotNeeded,
+        }
+    }
 }
 
 impl From<ItemSummary> for ItemSummaryDto {
@@ -638,6 +677,14 @@ impl From<ItemSummary> for ItemSummaryDto {
             thumb_state: i.thumb_state,
             proxy_state: i.proxy_state,
             last_played_at: i.last_played_at,
+            thumb_rev: i.thumb_rev,
+            analysis_state: i.analysis_state.into(),
+            alpha: i.alpha.map(Into::into),
+            pixel_art: i.pixel_art,
+            pixel_art_setting: i.pixel_art_setting,
+            animated: i.animated,
+            frame_count: i.frame_count,
+            has_loop: i.has_loop,
         }
     }
 }
@@ -1382,6 +1429,14 @@ pub struct CoverDto {
     pub thumb_state: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    /// サムネイルを作り直した回数（アイテムの概要の `thumbRev` と同じ）。
+    pub thumb_rev: i64,
+    /// 解析の進み具合（`pending` なら解析のジョブが進んだら取り直す）。
+    pub analysis_state: AssetAnalysisStateDto,
+    /// 解析で分かった透過（市松模様）。
+    pub alpha: Option<AssetAlphaDto>,
+    /// ドット絵として表示するか（実効値）。
+    pub pixel_art: bool,
 }
 
 impl From<Cover> for CoverDto {
@@ -1393,6 +1448,10 @@ impl From<Cover> for CoverDto {
             thumb_state: c.thumb_state,
             width: c.width,
             height: c.height,
+            thumb_rev: c.thumb_rev,
+            analysis_state: c.analysis_state.into(),
+            alpha: c.alpha.map(Into::into),
+            pixel_art: c.pixel_art,
         }
     }
 }

@@ -388,7 +388,7 @@ fn grid_to_json(g: &GridSetting) -> Result<String> {
 }
 
 /// grid_json を読む（知らない版・壊れたものは格子なしとして warn を出す。設定し直せば直る）。
-fn grid_from_json(text: &str) -> Option<GridSetting> {
+pub(crate) fn grid_from_json(text: &str) -> Option<GridSetting> {
     match serde_json::from_str::<GridJson>(text) {
         Ok(g) if g.v == GRID_JSON_V => Some(GridSetting {
             cell_w: g.cell_w,
@@ -548,26 +548,55 @@ pub fn get(conn: &Connection, item_id: i64) -> Result<AssetInfo> {
 
 /// 実効値（画像でなければドット絵・アニメは偽）。
 fn effective_of(info: &AssetInfo) -> Effective {
-    if info.kind != MediaKind::Image {
+    let image = info.facts.as_ref().map(|f| &f.image);
+    effective(
+        info.kind,
+        (info.width, info.height),
+        EffectiveInputs {
+            auto_pixel_art: image.and_then(|i| i.pixel_art),
+            frame_count: image.and_then(|i| i.frame_count),
+            pixel_art_setting: info.settings.pixel_art,
+            grid: info.settings.grid.as_ref(),
+        },
+    )
+}
+
+/// 実効値の材料（事実と設定のうち、実効値に効く列だけ）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EffectiveInputs<'a> {
+    /// ドット絵の自動の判定（`media_facts.pixel_art`。未解析・材料不足は None）。
+    pub auto_pixel_art: Option<bool>,
+    /// 解析のコマの数（`media_facts.frame_count`）。
+    pub frame_count: Option<u32>,
+    /// ドット絵の設定（`asset_settings.pixel_art`。None は自動）。
+    pub pixel_art_setting: Option<bool>,
+    /// 格子の設定。
+    pub grid: Option<&'a GridSetting>,
+}
+
+/// 実効値（素材の欄と一覧のタイル（items.rs の SUMMARY）で同じ規則）。画像でなければドット絵・アニメは偽で、コマの数は None。
+/// コマの数は、格子があれば帯で使う数（大きさが分からなければ設定のコマの数）、なければ解析のコマの数。
+pub fn effective(
+    kind: MediaKind,
+    size: (Option<u32>, Option<u32>),
+    inputs: EffectiveInputs<'_>,
+) -> Effective {
+    if kind != MediaKind::Image {
         return Effective {
             pixel_art: false,
             animated: false,
             frame_count: None,
         };
     }
-    let image = info.facts.as_ref().map(|f| &f.image);
-    let frame_count = match (&info.settings.grid, info.width, info.height) {
-        (Some(grid), Some(w), Some(h)) => Some(grid.frames_used(w, h)),
+    let frame_count = match (inputs.grid, size) {
+        (Some(grid), (Some(w), Some(h))) => Some(grid.frames_used(w, h)),
         // 大きさが分からなければ設定のコマの数（帯を作るときに画像から数える）
-        (Some(grid), _, _) => grid.count,
-        (None, _, _) => image.and_then(|i| i.frame_count),
+        (Some(grid), _) => grid.count,
+        (None, _) => inputs.frame_count,
     };
     Effective {
-        pixel_art: effective_pixel_art(info.settings.pixel_art, image.and_then(|i| i.pixel_art)),
-        animated: effective_animated(
-            image.and_then(|i| i.frame_count),
-            info.settings.grid.is_some(),
-        ),
+        pixel_art: effective_pixel_art(inputs.pixel_art_setting, inputs.auto_pixel_art),
+        animated: effective_animated(inputs.frame_count, inputs.grid.is_some()),
         frame_count,
     }
 }
