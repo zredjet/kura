@@ -1,6 +1,7 @@
 /**
  * ループの試聴の状態と操作（design.md §3.1「ループの試聴」・§6 の L）。素材の欄のボタン・L のキー・メニューの
  * 「ループを試聴」が同じ口を通す。一度に 1 つだけで、始めるとプレーヤーを一時停止し、効果音を止める。
+ * クイックルック中は始めない（クイックルックは自分の `<audio>` で鳴らす。効果音の即再生と同じ条件。決定 13）。
  * 鳴らし方（本体だけのバッファを loop で回す。loopStart・loopEnd を使わない）は src/lib/assetAudio.ts の Audition。
  */
 
@@ -12,6 +13,7 @@ import { getAsset } from '../../ipc/asset';
 import { isIpcError } from '../../ipc/result';
 import { MAX_RATE, MIN_RATE } from '../../lib/asset/wav';
 import { notify } from '../../stores/noticeStore';
+import { useViewStore } from '../../stores/viewStore';
 import { playerController } from '../player/playerActions';
 import { usePlayerStore } from '../player/playerStore';
 import { audioRuntime, MediaHttpError, onAuditionStopped, touchAudio } from './audioRuntime';
@@ -104,6 +106,11 @@ function pausePlayer(): void {
   }
 }
 
+/** クイックルックを開いているか（自分の `<audio>` で鳴らしているので、試聴を重ねない）。 */
+function quickLookOpen(): boolean {
+  return useViewStore.getState().quickLook;
+}
+
 function failureText(error: unknown): string {
   if ((error instanceof MediaHttpError && error.status === 503) || isIpcError(error, 'Busy')) {
     return t.auditionBusy;
@@ -114,8 +121,12 @@ function failureText(error: unknown): string {
 /**
  * 試聴を始める。キー・クリックの処理の中から呼ぶ（文脈の resume を、取る前に呼ぶため）。
  * 長さ・ループ点は /pcm の応答（同じ読み取り）で決める（ループ点がなければ全体を回す）。
+ * クイックルック中は何もしない（素材の欄を読んでいる間にクイックルックを開いたときも）。
  */
 export function startAudition(target: AuditionTarget, fromStart = false): void {
+  if (quickLookOpen()) {
+    return;
+  }
   const { audition, sfx } = audioRuntime();
   audition.stop();
   sfx.stop();
@@ -162,13 +173,14 @@ export function toggleAudition(target: AuditionTarget, fromStart = false): void 
 /**
  * L のキー・メニュー：試聴していれば止める。していなければ、選んでいる音声を継ぎ目の手前から試聴する。
  * インスペクタが読んだ素材の欄があればすぐ始め、なければ読んでから始める。扱ったら true。
+ * クイックルック中は始めない（扱わない）。
  */
 export function toggleAuditionKey(itemId: number | null, kind: string | undefined): boolean {
   if (useAuditionStore.getState().status !== 'idle') {
     stopAudition();
     return true;
   }
-  if (itemId === null || kind !== 'audio') {
+  if (itemId === null || kind !== 'audio' || quickLookOpen()) {
     return false;
   }
   const begin = (asset: AssetDto) => {

@@ -4,6 +4,7 @@ import { ja } from '../../i18n/ja';
 import { getAsset } from '../../ipc/asset';
 import type { AuditionOutcome } from '../../lib/assetAudio';
 import { notify } from '../../stores/noticeStore';
+import { useViewStore } from '../../stores/viewStore';
 import { playerController } from '../player/playerActions';
 import { DEFAULT_PREFS, usePlayerStore } from '../player/playerStore';
 import { type AudioRuntime, MediaHttpError, setAudioRuntimeForTest } from './audioRuntime';
@@ -56,6 +57,7 @@ describe('試聴の状態と口', () => {
     setAudioRuntimeForTest(fake.runtime);
     useAuditionStore.setState({ itemId: null, status: 'idle', mode: null, fromStart: false });
     usePlayerStore.setState({ active: false, prefs: DEFAULT_PREFS });
+    useViewStore.setState({ quickLook: false });
   });
 
   afterEach(() => setAudioRuntimeForTest(null));
@@ -181,5 +183,23 @@ describe('試聴の状態と口', () => {
     await settle();
     expect(notify).toHaveBeenCalledWith(t.auditionNoFacts);
     expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+  });
+
+  it('クイックルック中は L・メニューで始めない（クイックルックが自分で鳴らす。効果音と同じ条件）', async () => {
+    rememberAsset(audioAsset());
+    useViewStore.setState({ quickLook: true });
+    expect(toggleAuditionKey(2, 'audio')).toBe(false);
+    expect(fake.audition.startProbed).not.toHaveBeenCalled();
+    expect(useAuditionStore.getState().status).toBe('idle');
+    // 素材の欄を読んでいる間にクイックルックを開いた：読めても始めない
+    useViewStore.setState({ quickLook: false });
+    let resolve: (asset: ReturnType<typeof audioAsset>) => void = () => undefined;
+    vi.mocked(getAsset).mockImplementationOnce(() => new Promise((r) => (resolve = r)));
+    expect(toggleAuditionKey(9, 'audio')).toBe(true);
+    useViewStore.setState({ quickLook: true });
+    resolve(audioAsset({ itemId: 9 }));
+    await settle();
+    expect(fake.audition.startProbed).not.toHaveBeenCalled();
+    expect(useAuditionStore.getState().status).toBe('idle');
   });
 });
