@@ -419,8 +419,8 @@ fn rebuild_keeps_children_fts_indexes_and_triggers() {
     let cols = columns(&conn);
     let before = snapshot_cols(&conn, &cols);
     assert_eq!(before["fts integrity"], "Ok(())");
-    let tolerated = apply_rebuild(&mut conn, &TEST_REBUILD, 7).unwrap();
-    assert_eq!(tolerated, 0);
+    let outcome = apply_rebuild(&mut conn, &TEST_REBUILD, 7).unwrap();
+    assert_eq!(outcome, Outcome::Applied { tolerated: 0 });
     let after = snapshot_cols(&conn, &cols);
     for (key, value) in &before {
         assert_eq!(after.get(key), Some(value), "{key} が変わった");
@@ -503,8 +503,8 @@ fn rebuild_tolerates_violations_that_existed_before() {
         conn
     };
     let mut conn = broken_v6();
-    let tolerated = apply_rebuild(&mut conn, &TEST_REBUILD, 7).unwrap();
-    assert_eq!(tolerated, 1);
+    let outcome = apply_rebuild(&mut conn, &TEST_REBUILD, 7).unwrap();
+    assert_eq!(outcome, Outcome::Applied { tolerated: 1 });
     assert_eq!(applied(&conn).unwrap(), 7);
     assert_eq!(violations(&conn).unwrap().len(), 1);
     assert_eq!(one::<i64>(&conn, "PRAGMA foreign_keys"), 1);
@@ -581,6 +581,49 @@ fn plain_migrations_never_drop_a_table_that_others_reference() {
         }
         migrate_until(&mut conn, index + 1).unwrap();
     }
+}
+
+/// 別のプロセスが同じライブラリを同時に開くと、版を読んでから当てるまでの間に、ほかの接続が先に当てていることがある。
+/// 当てるトランザクションの中で版を読み直し、当て済みなら何もせず（版を下げない）、1 つ前の版でなければ断る（D1）。
+#[test]
+fn a_migration_another_connection_applied_is_skipped_without_lowering_the_version() {
+    let latest = MIGRATIONS.len();
+    // 遅れた側の runner：版 6 と読んだあとに、ほかの接続が最新まで当てた
+    let mut conn = filled_v6();
+    migrate(&mut conn).unwrap();
+    crate::db::testing::fill_latest(&conn);
+    let before = snapshot(&conn);
+    assert_eq!(
+        apply_plain(&mut conn, &MIGRATIONS[7], 8).unwrap(),
+        Outcome::AlreadyApplied
+    );
+    assert_eq!(
+        applied(&conn).unwrap(),
+        latest,
+        "0008 を当て直して版を 8 に下げない"
+    );
+    assert_eq!(
+        apply_rebuild(&mut conn, &MIGRATIONS[6], 7).unwrap(),
+        Outcome::AlreadyApplied
+    );
+    assert_eq!(applied(&conn).unwrap(), latest);
+    assert_eq!(snapshot(&conn), before, "何も変えない");
+    assert_eq!(one::<i64>(&conn, "PRAGMA foreign_keys"), 1);
+    // 1 つ前の版でなければ当てない（0009 を版 6 に当てない）
+    let mut v6 = filled_v6();
+    let err = apply_plain(&mut v6, &MIGRATIONS[8], 9).unwrap_err();
+    assert!(matches!(err, CoreError::Conflict(_)), "{err}");
+    assert_eq!(applied(&v6).unwrap(), 6);
+    let err = apply_rebuild(&mut v6, &TEST_REBUILD, 8).unwrap_err();
+    assert!(matches!(err, CoreError::Conflict(_)), "{err}");
+    assert_eq!(applied(&v6).unwrap(), 6);
+    assert_eq!(one::<i64>(&v6, "PRAGMA foreign_keys"), 1);
+    // ふつうの順なら当てる
+    assert_eq!(
+        apply_rebuild(&mut v6, &MIGRATIONS[6], 7).unwrap(),
+        Outcome::Applied { tolerated: 0 }
+    );
+    assert_eq!(applied(&v6).unwrap(), 7);
 }
 
 #[test]

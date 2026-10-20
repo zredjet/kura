@@ -233,6 +233,15 @@ where
             .map_or("マイグレーション", |m| m.name);
         UpgradeError::apply(name, &err)
     })?;
+    // 同時に開いた新しい版の Kura が、この Kura の知らない版まで当てていたら開かない
+    let now = applied(conn)?;
+    if now > list.len() {
+        return Err(UpgradeError::Newer {
+            found: now,
+            supported: list.len(),
+        }
+        .into());
+    }
     // 当てた分の WAL を本体へ移して空にする（残すと次に開くときに WAL を読み直して約 40ms かかる）
     let checkpoint = std::time::Instant::now();
     if let Err(err) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {

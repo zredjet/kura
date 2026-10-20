@@ -5,6 +5,10 @@
 //!   1 つのトランザクションで当て、`PRAGMA foreign_key_check` に新しい違反がないことを確かめてからコミットし、
 //!   成功しても失敗しても `foreign_keys` を必ず戻す。違反があったときだけ、いったん戻して「当てる前からあった違反」を数え、
 //!   新しい違反がなければ当て直す（前からの違反は許して警告を出す）。
+//!
+//! どちらも `BEGIN IMMEDIATE` で始め、トランザクションの中で版を読み直す（別のプロセスが同じライブラリを同時に開くと、
+//! 版を読んでから当てるまでの間に先に当てていることがある）。もう当たっていれば飛ばし、1 つ前の版でなければ断る
+//! （当て直して版を下げない）。
 
 use std::time::Instant;
 
@@ -172,28 +176,67 @@ pub(super) fn run(
         }
         let started = Instant::now();
         let result = match m.kind {
-            Kind::Plain => apply_plain(conn, m, version).map(|()| 0),
+            Kind::Plain => apply_plain(conn, m, version),
             Kind::Rebuild => apply_rebuild(conn, m, version),
         };
-        report.tolerated_violations += result.map_err(|e| (Some(index), e))?;
-        let ms = started.elapsed().as_secs_f64() * 1000.0;
-        tracing::info!(migration = m.name, ms, "マイグレーションを適用しました");
-        report.applied.push(AppliedMigration { name: m.name, ms });
+        match result.map_err(|e| (Some(index), e))? {
+            Outcome::Applied { tolerated } => {
+                report.tolerated_violations += tolerated;
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(migration = m.name, ms, "マイグレーションを適用しました");
+                report.applied.push(AppliedMigration { name: m.name, ms });
+            }
+            Outcome::AlreadyApplied => {
+                tracing::info!(
+                    migration = m.name,
+                    "ほかの接続（同じライブラリを開いた別のプロセス）が当て終えていたので飛ばしました"
+                );
+            }
+        }
         report.to = version;
     }
     Ok(report)
+}
+
+/// 1 つのマイグレーションを当てようとした結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// 当てた（`tolerated` は Rebuild で許した、当てる前からあった外部キーの違反の数）。
+    Applied { tolerated: usize },
+    /// ほかの接続が先に当てていた（何もしていない）。
+    AlreadyApplied,
 }
 
 fn user_version(version: usize) -> i64 {
     i64::try_from(version).unwrap_or(i64::MAX)
 }
 
-fn apply_plain(conn: &mut Connection, m: &Migration, version: usize) -> Result<()> {
-    let tx = conn.transaction()?;
+/// 当てるトランザクションの中で版を読み直し、`version` を当てるか決める。もう当たっていれば false、1 つ前の版でなければ
+/// Conflict（別のプロセスが同時に開いても、版を読んでから当てるまでの間に当てたものを当て直して版を下げない）。
+fn due(tx: &Connection, m: &Migration, version: usize) -> Result<bool> {
+    let now = applied(tx)?;
+    if now >= version {
+        return Ok(false);
+    }
+    if now + 1 != version {
+        return Err(CoreError::Conflict(format!(
+            "{}：今の版が {now} なので当てられません（版 {} のあとに当てるもの）",
+            m.name,
+            version.saturating_sub(1)
+        )));
+    }
+    Ok(true)
+}
+
+fn apply_plain(conn: &mut Connection, m: &Migration, version: usize) -> Result<Outcome> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !due(&tx, m, version)? {
+        return Ok(Outcome::AlreadyApplied);
+    }
     tx.execute_batch(m.sql)?;
     tx.pragma_update(None, "user_version", user_version(version))?;
     tx.commit()?;
-    Ok(())
+    Ok(Outcome::Applied { tolerated: 0 })
 }
 
 /// `PRAGMA foreign_key_check` の行（表, rowid, 親の表, 外部キーの番号）。
@@ -208,8 +251,12 @@ pub fn violations(conn: &Connection) -> Result<Vec<Violation>> {
     Ok(v)
 }
 
-/// 参照される表を作り直す（モジュールの冒頭）。許した前からの違反の数を返す。
-pub(crate) fn apply_rebuild(conn: &mut Connection, m: &Migration, version: usize) -> Result<usize> {
+/// 参照される表を作り直す（モジュールの冒頭）。当てたら、許した前からの違反の数を返す。
+pub(crate) fn apply_rebuild(
+    conn: &mut Connection,
+    m: &Migration,
+    version: usize,
+) -> Result<Outcome> {
     if !conn.is_autocommit() {
         return Err(CoreError::Invalid(format!(
             "{}：トランザクションの中では作り直せません",
@@ -229,16 +276,16 @@ pub(crate) fn apply_rebuild(conn: &mut Connection, m: &Migration, version: usize
     let result = rebuild_without_foreign_keys(conn, m, version);
     // 成功しても失敗しても戻す（失敗したトランザクションはロールバック済み）
     let restored = conn.pragma_update(None, "foreign_keys", was_on);
-    let tolerated = result?;
+    let outcome = result?;
     restored?;
-    Ok(tolerated)
+    Ok(outcome)
 }
 
 fn rebuild_without_foreign_keys(
     conn: &mut Connection,
     m: &Migration,
     version: usize,
-) -> Result<usize> {
+) -> Result<Outcome> {
     let off: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
     if off {
         return Err(CoreError::Invalid(format!(
@@ -248,12 +295,15 @@ fn rebuild_without_foreign_keys(
     }
     let after = {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !due(&tx, m, version)? {
+            return Ok(Outcome::AlreadyApplied);
+        }
         tx.execute_batch(m.sql)?;
         let after = violations(&tx)?;
         if after.is_empty() {
             tx.pragma_update(None, "user_version", user_version(version))?;
             tx.commit()?;
-            return Ok(0);
+            return Ok(Outcome::Applied { tolerated: 0 });
         }
         // 違反があるときだけ：いったん戻して、当てる前からあったものかを数える
         tx.rollback()?;
@@ -271,6 +321,10 @@ fn rebuild_without_foreign_keys(
         )));
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // 戻している間に、ほかの接続が当てたかもしれない
+    if !due(&tx, m, version)? {
+        return Ok(Outcome::AlreadyApplied);
+    }
     tx.execute_batch(m.sql)?;
     tx.pragma_update(None, "user_version", user_version(version))?;
     tx.commit()?;
@@ -279,7 +333,9 @@ fn rebuild_without_foreign_keys(
         violations = after.len(),
         "当てる前からあった外部キーの食い違いを残したまま当てました"
     );
-    Ok(after.len())
+    Ok(Outcome::Applied {
+        tolerated: after.len(),
+    })
 }
 
 /// `after` のうち `before` になかったもの（同じ行が複数あれば数で比べる。どちらも並べたもの）。

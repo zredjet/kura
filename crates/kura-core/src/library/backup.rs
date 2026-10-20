@@ -6,6 +6,7 @@
 //! （docs/data-model.md §1）。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -114,9 +115,11 @@ pub fn create(layout: &Layout, now: i64) -> Result<BackupInfo> {
     let path = dir.join(&name);
     if !path.exists() {
         // 書きかけを本物の名前で残さないよう、一時ファイルに写してから名前を変える
-        let temp = dir.join(format!(".{name}.part"));
-        let _ = std::fs::remove_file(&temp);
-        copy_db(&layout.db_path(), &temp)?;
+        let temp = temp_path(&dir, &name);
+        if let Err(err) = copy_db(&layout.db_path(), &temp) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(err);
+        }
         std::fs::rename(&temp, &path)?;
         tracing::info!(path = %path.display(), "DB のバックアップを作りました");
     }
@@ -132,37 +135,85 @@ pub fn create(layout: &Layout, now: i64) -> Result<BackupInfo> {
 
 /// マイグレーションを当てる前のバックアップ（docs/data-model.md §5）。いつもの名前で作り、新しい `KEEP` 個を残す。
 /// 開くのを待たせるので、書き込みの接続から休まずに一度に写す。
-pub fn before_migration(layout: &Layout, conn: &Connection, now: i64) -> Result<BackupInfo> {
+///
+/// 同じ秒の名前のバックアップがすでにあって版が違えば（同じライブラリを同時に開いた別のプロセスが、先に当てる前の中身を
+/// 残してから当て始めた）、それを置き換えずに写しを捨てて None を返す（より前の版の中身を残す）。同じ版なら（定期の
+/// バックアップ）当てる直前の中身で置き換える。
+pub fn before_migration(
+    layout: &Layout,
+    conn: &Connection,
+    now: i64,
+) -> Result<Option<BackupInfo>> {
     let dir = layout.backups_dir();
     std::fs::create_dir_all(&dir)?;
     let name = name_for(now);
     let path = dir.join(&name);
-    let temp = dir.join(format!(".{name}.part"));
-    let _ = std::fs::remove_file(&temp);
+    let temp = temp_path(&dir, &name);
     // rusqlite は 0 以下の pages_per_step で panic するので、一度に写すには i32::MAX を渡す
-    if let Err(err) = copy_conn(conn, &temp, i32::MAX, Duration::ZERO) {
+    let copied = copy_conn(conn, &temp, i32::MAX, Duration::ZERO)
+        .and_then(|()| crate::db::applied(&Connection::open(&temp)?));
+    let version = match copied {
+        Ok(version) => version,
+        Err(err) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(err);
+        }
+    };
+    if let Some(theirs) = version_of(&path)
+        && theirs != version
+    {
         let _ = std::fs::remove_file(&temp);
-        return Err(err);
+        tracing::info!(
+            path = %path.display(),
+            theirs,
+            version,
+            "同じ秒に、ほかの接続が前の版の中身を残していたので、それを置き換えません"
+        );
+        return Ok(None);
     }
-    // 同じ秒の定期のバックアップがあっても、当てる直前の中身で置き換える
     std::fs::rename(&temp, &path)?;
     prune(layout, KEEP)?;
     let size_bytes = std::fs::metadata(&path)?.len();
     tracing::info!(path = %path.display(), size_bytes, "マイグレーションの前に DB のバックアップを作りました");
-    Ok(BackupInfo {
+    Ok(Some(BackupInfo {
         created_at: parse_name(&name).unwrap_or(now),
         name,
         path,
         size_bytes,
-    })
+    }))
+}
+
+/// バックアップのファイルの版（user_version）。ない・読めなければ None。
+fn version_of(path: &Path) -> Option<usize> {
+    if !path.is_file() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    crate::db::applied(&conn).ok()
+}
+
+/// 書きかけの一時ファイルの場所（`.<名前>.<プロセス ID>-<通し番号>.part`）。同じ秒に同じライブラリのバックアップを作る
+/// ほかのプロセス・スレッドと取り合わない（同じ名前だと互いの書きかけを消し合う）。
+fn temp_path(dir: &Path, name: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(".{name}.{}-{n}.part", std::process::id()))
 }
 
 /// 古いバックアップを消して、新しい `keep` 個を残す。消した数を返す（`backups/` の中の、この形の名前のものだけ）。
 pub fn prune(layout: &Layout, keep: usize) -> Result<usize> {
     let mut removed = 0;
     for old in list(layout)?.into_iter().skip(keep) {
-        std::fs::remove_file(&old.path)?;
-        removed += 1;
+        match std::fs::remove_file(&old.path) {
+            Ok(()) => removed += 1,
+            // 同じライブラリを開いたほかのプロセスが先に消した
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     Ok(removed)
 }
@@ -481,6 +532,55 @@ mod tests {
             "当てる前のものが最新"
         );
         assert_eq!(all[KEEP - 1].name, name_for(old + INTERVAL_MS));
+    }
+
+    /// 当てる前のバックアップの一時ファイルは、同じ秒に同じライブラリを開くほかのプロセスと取り合わない名前にする（D1。
+    /// 同じ名前だと互いの書きかけを消し合い、どちらもバックアップに失敗して開けなかった）。
+    #[test]
+    fn backup_before_migrating_does_not_share_its_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        previous_library(&root);
+        let layout = Layout::new(&root);
+        std::fs::create_dir_all(layout.backups_dir()).unwrap();
+        // ほかのプロセスが、前後の秒の名前で書きかけている（ここでは消せないフォルダで置く）
+        let now = now_ms();
+        for s in -2..60 {
+            let theirs = format!(".{}.part", name_for(now + s * 1000));
+            std::fs::create_dir(layout.backups_dir().join(theirs)).unwrap();
+        }
+        let lib = Library::open(&root).unwrap();
+        assert_eq!(lib.migration().from, crate::db::MIGRATIONS.len() - 1);
+        assert_eq!(list(lib.layout()).unwrap().len(), 1);
+    }
+
+    /// 同じ秒の名前で、ほかの接続（同時に開いた別のプロセス）が先に残した当てる前のバックアップは、当てたあとの中身で
+    /// 置き換えない。同じ版の中身（定期のバックアップ）なら置き換える。
+    #[test]
+    fn backup_before_migrating_keeps_an_earlier_copy_of_another_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        previous_library(&root);
+        let layout = Layout::new(&root);
+        let previous = crate::db::MIGRATIONS.len() - 1;
+        let mut conn = Connection::open(layout.db_path()).unwrap();
+        let first = before_migration(&layout, &conn, T).unwrap().unwrap();
+        // 同じ版なら置き換える
+        let again = before_migration(&layout, &conn, T).unwrap().unwrap();
+        assert_eq!(again.name, first.name);
+        // ほかのプロセスが当て終えた
+        crate::db::migrate(&mut conn).unwrap();
+        assert_eq!(before_migration(&layout, &conn, T).unwrap(), None);
+        let all = list(&layout).unwrap();
+        assert_eq!(all.len(), 1);
+        let copy = Connection::open(&all[0].path).unwrap();
+        assert_eq!(crate::db::applied(&copy).unwrap(), previous);
+        let leftovers: Vec<_> = std::fs::read_dir(layout.backups_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "書きかけを残さない");
     }
 
     #[test]

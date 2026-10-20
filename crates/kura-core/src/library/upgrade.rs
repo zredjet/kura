@@ -265,6 +265,57 @@ mod tests {
         assert_eq!(version_of(&root), 6);
     }
 
+    /// 別のプロセス（Kura を 2 つ動かした・開発版と本番版）が同じ前の版のライブラリを同時に開いても、どちらも開け、版は
+    /// 最新のまま（下がらない）で、次もふつうに開ける（D1。ここではスレッドごとの接続で 2 つのプロセスの代わりにする。
+    /// アプリの中の鍵 `AppState::opening` は通らない）。2 つ目を 0〜4 ms 遅らせ、先に開いた側が当てている途中に版を読ませる。
+    #[test]
+    fn two_processes_opening_the_same_library_at_once_both_open_and_keep_the_version() {
+        let latest = crate::db::MIGRATIONS.len();
+        for round in 0..40u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("L.kuralib");
+            v6_library(&root);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|i| {
+                    let (root, barrier) = (root.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        if i == 1 {
+                            std::thread::sleep(std::time::Duration::from_millis(round % 5));
+                        }
+                        Library::open(&root)
+                            .map(|lib| lib.migration().to)
+                            .map_err(|e| e.to_string().chars().take(200).collect::<String>())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Ok(latest), "round {round}");
+            }
+            assert_eq!(version_of(&root), latest, "round {round}：版が下がった");
+            let lib = Library::open(&root).unwrap();
+            assert!(lib.migration().applied.is_empty(), "round {round}");
+            let tags: i64 = lib
+                .db()
+                .read(|c| Ok(c.query_row("SELECT count(*) FROM item_tags", [], |r| r.get(0))?))
+                .unwrap();
+            assert_eq!(tags, 3, "round {round}");
+            // 当てる前の中身（版 6）のバックアップが残る。遅れた側が先の側の当てている途中の版を読んだときは、秒がずれれば
+            // その版のバックアップも残る（同じ秒なら版 6 のものを置き換えない）
+            let versions: Vec<usize> = backup::list(lib.layout())
+                .unwrap()
+                .iter()
+                .map(|b| crate::db::applied(&Connection::open(&b.path).unwrap()).unwrap())
+                .collect();
+            assert!(versions.contains(&6), "round {round}: {versions:?}");
+            assert!(
+                versions.iter().all(|v| *v < latest),
+                "round {round}: {versions:?}"
+            );
+        }
+    }
+
     /// 新しい版の Kura の DB は、当て始めないので知らせず、理由を戻り値で返す。
     #[test]
     fn a_newer_schema_is_refused_without_starting() {
