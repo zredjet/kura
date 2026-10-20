@@ -150,6 +150,11 @@ pub fn full_codec_set(opts: &PinnedOptions, work_dir: &std::path::Path) -> Codec
     set
 }
 
+/// 解析のジョブを ImageIO で動かすテスト（決定 15）。
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod analysis_tests;
+
 /// テストの共通の部品（macOS）。
 #[cfg(test)]
 #[cfg(target_os = "macos")]

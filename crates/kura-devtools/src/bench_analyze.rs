@@ -4,8 +4,8 @@
 //!    種類ごとの合成の見本を件数ぶん作る。中身はどれも違う：同じ中身の結果は読まずに使うので、測りにならない）。
 //! 2. 自分を子プロセスとして `/usr/bin/time -l` で起こし（`--child`）、アプリと同じエンジンの部品（MacEngineFactory：
 //!    物理メモリからの予算・固定の段 → macOS → ffmpeg）で解析のジョブを 1 本動かす。見本を作るメモリをピークに入れないため。
-//! 3. 子が書いたジョブの結果（読んで解いた 1 件ごとの時間の p50・p95・最大）と、通しの件数/秒、peak memory footprint を
-//!    1 行の JSON で出す（`--json` があれば追記する）。
+//! 3. 子が書いたジョブの結果（読んで解いた 1 件ごとの時間の p50・p95・最大と、HEIC・HEIF の見出しの読み取りの時間（決定 15。
+//!    `header_*`））と、通しの件数/秒、peak memory footprint を 1 行の JSON で出す（`--json` があれば追記する）。
 //!
 //! 合成の見本（`--src` なし）：画像は 128² のドット絵・1024×768 の写真らしい PNG・512² の半透明の乱数 PNG・128² で 8 コマの
 //! GIF を順に、音声は 30 秒の 44.1 kHz ステレオの WAV と FLAC（正弦波。ループ点つきを混ぜる）を順に。
@@ -398,6 +398,10 @@ fn child(path: &Path) -> Result<(), String> {
         "p50_ms": result["readMs"]["p50"],
         "p95_ms": result["readMs"]["p95"],
         "max_ms": result["readMs"]["max"],
+        "header_count": result["headerMs"]["count"],
+        "header_p50_ms": result["headerMs"]["p50"],
+        "header_p95_ms": result["headerMs"]["p95"],
+        "header_max_ms": result["headerMs"]["max"],
         "setup_ms": setup_ms,
         "budget_bytes": budget,
         "bulk_threads": engine.runtime_if_built().map(|r| r.bulk_threads()),

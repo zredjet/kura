@@ -948,3 +948,326 @@ fn read_record_is_kept_with_the_results() {
         }
     ));
 }
+
+/// HEIC・HEIF の偽の OS のデコーダ（段は Platform。決定 15 のテスト）：中身の先頭が `ALPHA` ならアルファのある形（読むと
+/// 二値の透過のスプライト）、`BROKEN` なら見出しも読めない（壊れたファイル）、ほかは不透明な形（読むと不透明な乱数）。
+/// 見出し（形）を読む前に `on_shape` を呼ぶ。
+struct FakeHeif {
+    on_shape: Option<Hook>,
+}
+
+impl FakeHeif {
+    fn input(bytes: &[u8]) -> InputGen {
+        if bytes.starts_with(b"ALPHA") {
+            InputGen::PixelSprite {
+                w: 64,
+                h: 64,
+                fmt: PixelFormat::Rgba8,
+                seed: 1,
+            }
+        } else {
+            InputGen::Noise {
+                w: 32,
+                h: 24,
+                fmt: PixelFormat::Rgb8,
+                seed: 2,
+            }
+        }
+    }
+
+    fn read(src: &mut dyn ReadSeek) -> Result<Vec<u8>, EngineError> {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(src, &mut bytes)?;
+        if bytes.starts_with(b"BROKEN") {
+            return Err(EngineError::Decode {
+                codec: "fake-heif-dec/1".into(),
+                message: "壊れた見出し".into(),
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+impl Decoder for FakeHeif {
+    fn id(&self) -> &'static str {
+        "fake-heif-dec/1"
+    }
+    fn tier(&self) -> Tier {
+        Tier::Platform
+    }
+    fn reproducible(&self) -> bool {
+        false
+    }
+    fn can_decode(&self, format: &str) -> bool {
+        matches!(format, "heic" | "heif")
+    }
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        _opts: &DecodeOptions,
+        _limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        if let Some(hook) = &self.on_shape {
+            hook("shape");
+        }
+        let bytes = Self::read(src)?;
+        Ok(Self::input(&bytes).generate()?.shape())
+    }
+    fn decode(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        _opts: &DecodeOptions,
+        _limits: &Limits,
+        _mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        let bytes = Self::read(src)?;
+        Self::input(&bytes).generate()
+    }
+}
+
+/// 検索の一致（ID の順）。
+fn search(env: &Env, text: &str) -> Vec<u32> {
+    let expr = crate::query::parse(text).unwrap().expr;
+    let mut ids = env
+        .library
+        .db()
+        .read(move |c| {
+            let query = crate::items::ItemQuery {
+                filter: Some(expr),
+                ..crate::items::ItemQuery::default()
+            };
+            let ctx = crate::query::QueryContext {
+                now_ms: 0,
+                utc_offset_minutes: 0,
+            };
+            Ok(crate::items::query_ids(c, &query, &ctx)?.ids)
+        })
+        .unwrap();
+    ids.sort_unstable();
+    ids
+}
+
+/// 見出し（形）を読んだもの（中身のハッシュの 16 進。順に）。
+fn headers(env: &Env) -> Vec<String> {
+    env.log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n.strip_prefix("shape:").map(str::to_string))
+        .collect()
+}
+
+/// 固定の段の JPEG のデコーダと、見出しを読む前に処理中の印を記録する偽の HEIC・HEIF のデコーダを足した環境。
+fn heif_env(seen: &Arc<Mutex<Vec<Option<Inflight>>>>) -> Env {
+    let s = seen.clone();
+    Env::with(
+        |log, library| {
+            let library = library.clone();
+            let on_shape: Hook = Arc::new(move |_| {
+                let mark: Option<String> = library
+                    .db()
+                    .read(|c| {
+                        Ok(c.query_row(
+                            "SELECT value FROM settings WHERE key = ?1",
+                            [INFLIGHT_KEY],
+                            |r| r.get(0),
+                        )
+                        .ok())
+                    })
+                    .unwrap();
+                s.lock()
+                    .unwrap()
+                    .push(mark.and_then(|j| serde_json::from_str(&j).ok()));
+            });
+            let mut extra: Vec<Arc<dyn Decoder>> = CodecSet::pinned()
+                .decoders_for("jpeg")
+                .into_iter()
+                .cloned()
+                .collect();
+            extra.push(Arc::new(FakeHeif {
+                on_shape: Some(on_shape),
+            }));
+            watched_set(log, None, extra)
+        },
+        64 << 20,
+    )
+}
+
+/// 決定 15：HEIC・HEIF は見出しだけを読み、アルファを持つものだけを読んで解析する（透過・色数・ドット絵。検索の
+/// `透過:あり` に入る）。ほかの HEIC・HEIF と、見出しを読めないものは読まずに形式から書く（透過なし・色数は計らない・
+/// デコーダなし）。JPEG は見出しも読まない。見出しは OS のデコーダで読むので、読む前に処理中の印をコミットする。
+#[test]
+fn heic_with_alpha_is_read_and_other_photos_come_from_the_format() {
+    let seen: Arc<Mutex<Vec<Option<Inflight>>>> = Arc::default();
+    let env = heif_env(&seen);
+    let alpha = env.add(1, "image", "heic", b"ALPHA heic 1");
+    let opaque = env.add(2, "image", "heic", b"opaque heic 2");
+    let heif = env.add(3, "image", "heif", b"opaque heif 3");
+    let photo = env.add(4, "image", "jpg", b"not really a jpeg");
+    let broken = env.add(5, "image", "heic", b"BROKEN heic 5");
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    for id in 1..=5 {
+        assert_eq!(env.state(id), "ready", "{id}");
+    }
+    assert_eq!(
+        env.reads(),
+        std::slice::from_ref(&alpha),
+        "読んだのはアルファのある HEIC だけ"
+    );
+    let looked = headers(&env);
+    for h in [&alpha, &opaque, &heif, &broken] {
+        assert!(looked.contains(h), "見出しを読む: {h}");
+    }
+    assert!(!looked.contains(&photo), "JPEG は見出しも読まない");
+
+    // アルファのある HEIC：読んで解析した事実と結果
+    assert_eq!(env.fact::<i64>(&alpha, "alpha"), 1);
+    assert!(env.fact::<Option<i64>>(&alpha, "colors").is_some());
+    assert_eq!(env.fact::<i64>(&alpha, "frame_count"), 1);
+    assert!(env.fact::<Option<i64>>(&alpha, "pixel_art").is_some());
+    assert_eq!(env.fact::<String>(&alpha, "decoder"), "fake-heif-dec/1");
+    let analyses: String = env.query(&format!(
+        "SELECT group_concat(r.analysis, ',') FROM (SELECT r.analysis FROM analysis_results r JOIN blobs b
+           ON b.id = r.blob_id WHERE hex(b.hash) = upper('{alpha}') ORDER BY r.analysis) r"
+    ));
+    assert_eq!(
+        analyses,
+        "image.alpha,image.colors,image.pixel_scale,image.sprite_grid,kura.read"
+    );
+    // 不透明な HEIC・HEIF、見出しを読めない HEIC、JPEG：形式から（決定 5 のまま）
+    for h in [&opaque, &heif, &broken, &photo] {
+        assert_eq!(env.fact::<i64>(h, "alpha"), 0, "{h}");
+        assert_eq!(env.fact::<Option<i64>>(h, "colors"), None, "{h}");
+        assert_eq!(env.fact::<i64>(h, "pixel_art"), 0, "{h}");
+        assert_eq!(env.fact::<i64>(h, "frame_count"), 1, "{h}");
+        assert_eq!(env.fact::<Option<String>>(h, "decoder"), None, "{h}");
+        assert_eq!(env.fact::<String>(h, "state"), "ok", "{h}");
+    }
+    assert_eq!(
+        env.query::<i64>(&format!(
+            "SELECT count(*) FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+              WHERE hex(b.hash) IN (upper('{opaque}'), upper('{heif}'), upper('{broken}'))"
+        )),
+        0
+    );
+
+    // 検索と表示が一致する：アルファのある HEIC は「透過:あり」、ほかの写真は「透過:なし」
+    assert_eq!(search(&env, "透過:あり"), [1]);
+    assert_eq!(search(&env, "透過:なし"), [2, 3, 4, 5]);
+
+    // 見出しを読む前に、そのアイテムの処理中の印がコミットされている（読む前の見出しも、アルファのある HEIC を読む中の
+    // 見出しも）。終えたら消す
+    let seen = seen.lock().unwrap().clone();
+    let hash_of = |id: i64| match id {
+        1 => alpha.clone(),
+        2 => opaque.clone(),
+        3 => heif.clone(),
+        _ => broken.clone(),
+    };
+    assert!(seen.len() >= 4, "{seen:?}");
+    for mark in &seen {
+        let mark = mark.as_ref().expect("見出しを読む前に印がある");
+        assert_eq!(mark.hash, hash_of(mark.id));
+    }
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.inflight'"),
+        0
+    );
+    let summary = result_json(&record);
+    assert_eq!(summary["headerMs"]["count"].as_u64(), Some(4));
+    assert_eq!(summary["readMs"]["count"].as_u64(), Some(1));
+
+    // 前回、6 の見出しを OS のデコーダで読んでいる途中で落ちた：見出しを読み直さずに crashed にする
+    let crashed = env.add(6, "image", "heic", b"opaque heic 6");
+    let mark = serde_json::to_string(&Inflight {
+        id: 6,
+        hash: crashed.clone(),
+    })
+    .unwrap();
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)",
+                params![INFLIGHT_KEY, mark],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    env.run();
+    assert_eq!(env.state(6), "failed");
+    assert_eq!(env.fact::<String>(&crashed, "error_code"), "crashed");
+    assert!(!headers(&env).contains(&crashed));
+}
+
+/// 決定 15 の前の Kura で形式から書いた HEIC・HEIF は、計画の指紋の変化（起動のスレッドの `sync_plan`）で見出しを
+/// 見直し、アルファのあるものだけを読む。JPEG は戻さない。投影の作り直しでは、読んだ HEIC は結果の表から、見出しで
+/// 決めたものは形式から作る（読まない）。
+#[test]
+fn a_plan_change_rechecks_heic_written_from_the_format() {
+    let seen: Arc<Mutex<Vec<Option<Inflight>>>> = Arc::default();
+    let env = heif_env(&seen);
+    let alpha = env.add(1, "image", "heic", b"ALPHA heic 1");
+    let opaque = env.add(2, "image", "heif", b"opaque heif 2");
+    let photo = env.add(3, "image", "jpg", b"jpeg 3");
+    // 前の Kura：3 つとも読まずに形式から書いた
+    let old_writes: Vec<store::ItemWrite> = [
+        (1, &alpha, "heic"),
+        (2, &opaque, "heif"),
+        (3, &photo, "jpeg"),
+    ]
+    .into_iter()
+    .map(|(id, h, format)| store::ItemWrite {
+        id,
+        hash: crate::library::parse_hex32(h).unwrap(),
+        write: store::Write::Ready {
+            results: Vec::new(),
+            keep: Some(Vec::new()),
+            facts: Box::new(super::facts::from_format(format)),
+            stamp: Some(store::ReadStamp::default()),
+        },
+    })
+    .collect();
+    env.library
+        .db()
+        .write(move |tx| store::write(tx, &old_writes, 1))
+        .unwrap();
+    assert_eq!(env.fact::<i64>(&alpha, "alpha"), 0);
+    let current = PlanFingerprint::current(&kura_engine::analysis::registry().unwrap()).unwrap();
+    let mut json = serde_json::to_value(&current).unwrap();
+    json.as_object_mut().unwrap().remove("formats");
+    let before: PlanFingerprint = serde_json::from_value(json).unwrap();
+    let synced = sync_from(&env, before);
+    assert_eq!((synced.reset, synced.todo), (2, true));
+    assert_eq!(
+        (env.state(1), env.state(2), env.state(3)),
+        ("pending".into(), "pending".into(), "ready".into())
+    );
+    env.run();
+    assert_eq!(env.reads(), std::slice::from_ref(&alpha));
+    assert!(!headers(&env).contains(&photo));
+    assert_eq!(env.fact::<i64>(&alpha, "alpha"), 1);
+    assert_eq!(env.fact::<i64>(&opaque, "alpha"), 0);
+    assert_eq!(search(&env, "透過:あり"), [1]);
+
+    // 投影の版が上がった：読まずに作り直す（読んだ HEIC は結果の表から、見出しで決めたものと JPEG は形式から）
+    env.exec(
+        "UPDATE media_facts SET facts_v = 0, alpha = NULL, colors = NULL, pixel_art = NULL, frame_count = NULL",
+    );
+    let mut older = current.clone();
+    older.facts_v = 0;
+    sync_from(&env, older);
+    let record = env.run();
+    assert_eq!(result_json(&record)["reprojected"].as_u64(), Some(3));
+    assert_eq!(env.reads().len(), 1, "読み直さない");
+    assert_eq!(env.fact::<i64>(&alpha, "alpha"), 1);
+    assert!(env.fact::<Option<i64>>(&alpha, "colors").is_some());
+    for h in [&opaque, &photo] {
+        assert_eq!(env.fact::<i64>(h, "alpha"), 0, "{h}");
+        assert_eq!(env.fact::<Option<i64>>(h, "colors"), None, "{h}");
+        assert_eq!(env.fact::<i64>(h, "frame_count"), 1, "{h}");
+    }
+}

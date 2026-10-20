@@ -5,7 +5,8 @@
 //! - ドット絵の自動の判定 v1（決定 7。[`pixel_art_v1`]、版 [`PIXEL_RULE`]）：aseprite は常にはい、svg・jpeg は常にいいえ。
 //!   ほかは「等倍：見える色が 64 色以下・長辺 512 以下・半透明なし」か「拡大：可逆で 2≤k≤64・元の大きさ 4px 以上」ならはい。
 //!   表示と検索の実効値は「設定 ?? 自動」（`asset_settings.pixel_art` ?? `media_facts.pixel_art`）。
-//! - JPEG・HEIC・HEIF は読まずに形式から書く（[`from_format`]。透過なし・色数は計らない・ドット絵でない。決定 5）。
+//! - JPEG と、見出しでアルファがないと分かった（か見出しを読めなかった）HEIC・HEIF は読まずに形式から書く（[`from_format`]。
+//!   透過なし・色数は計らない・ドット絵でない。決定 5・15）。アルファのある HEIC・HEIF は読んでほかの画像と同じく投影する。
 
 use std::collections::BTreeMap;
 
@@ -286,8 +287,9 @@ pub fn project(
     f
 }
 
-/// 読まずに形式から書く事実（JPEG・HEIC・HEIF。決定 5）：透過なし・色数は計らない・ドット絵でない・1 コマ
-/// （Kura はこれらを静止画として扱い、HEIC の連続した画像も先頭だけを使う。`アニメ:なし` に入る）。
+/// 読まずに形式から書く事実（JPEG と、見出しでアルファがないと分かった・見出しを読めなかった HEIC・HEIF。決定 5・15）：
+/// 透過なし・色数は計らない・ドット絵でない・1 コマ（Kura はこれらを静止画として扱い、HEIC の連続した画像も先頭だけを
+/// 使う。`アニメ:なし` に入る）。
 pub fn from_format(format: &str) -> MediaFacts {
     MediaFacts {
         facts_v: FACTS_V,
@@ -763,7 +765,7 @@ mod tests {
         assert_eq!(f.has_loop, None, "ループの結果がなければ計っていない");
     }
 
-    /// JPEG・HEIC は読まずに形式から：透過なし・色数は計らない・ドット絵でない・1 コマ。
+    /// JPEG・アルファのない HEIC は読まずに形式から：透過なし・色数は計らない・ドット絵でない・1 コマ。
     #[test]
     fn facts_from_format() {
         for format in ["jpeg", "heic", "heif"] {

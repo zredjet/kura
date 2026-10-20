@@ -19,9 +19,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::facts::{FACTS_V, MediaFacts, PIXEL_RULE};
-use super::plan::{
-    DECODERS_KEY, DecoderFingerprint, FROM_FORMAT, PLAN_KEY, PlanFingerprint, canonical_string,
-};
+use super::plan::{DECODERS_KEY, DecoderFingerprint, PLAN_KEY, PlanFingerprint, canonical_string};
 use crate::Result;
 use crate::import::MediaKind;
 use crate::settings;
@@ -489,10 +487,10 @@ pub struct PlanSync {
 }
 
 /// 起動のスレッドで、整合性チェックのあとに呼ぶ：前に置いた計画の指紋と比べ、解析の版・計画が変わった種類の ready・failed を
-/// pending に戻し、今の指紋を置く。投影（投影の版・ドット絵の規則）だけの変更は戻さず、作り直しの印を置く（ジョブが結果の表
-/// から作り直して印を消す）。
+/// pending に戻し、扱い（形式から・見出しで決める）が変わった形式の ready・failed も戻して（決定 15）、今の指紋を置く。
+/// 投影（投影の版・ドット絵の規則）だけの変更は戻さず、作り直しの印を置く（ジョブが結果の表から作り直して印を消す）。
 ///
-/// 種類で戻す UPDATE は items の全件の走査になる（指紋が変わったときだけの一度きり。10 万件で約 70 ms。
+/// 種類・形式で戻す UPDATE は items の全件の走査になる（指紋が変わったときだけの一度きり。10 万件で約 70 ms。
 /// テスト `sync_plan_reset_is_a_one_time_full_scan` に例外として書く）。ふだん（指紋が同じ）は、待っているものの有無を
 /// 部分索引で、印を settings の主キーで見るだけで、事実の表は読まない。
 pub fn sync_plan(tx: &Connection, current: &PlanFingerprint) -> Result<PlanSync> {
@@ -504,6 +502,21 @@ pub fn sync_plan(tx: &Connection, current: &PlanFingerprint) -> Result<PlanSync>
               WHERE kind = ?1 AND analysis_state IN ('ready', 'failed')",
         )?;
         reset += stmt.execute([kind.as_str()])?;
+    }
+    // 扱いが変わった形式（決定 15：形式から書いていた HEIC・HEIF を見出しで決める）のものを戻す
+    let formats = current.formats_to_recheck(stored.as_ref());
+    if !formats.is_empty() {
+        let exts: Vec<&str> = formats
+            .iter()
+            .filter_map(|f| kura_engine::codec::formats::format_by_id(f))
+            .flat_map(|f| f.exts.iter().copied())
+            .collect();
+        let mut stmt = tx.prepare_cached(
+            "UPDATE items SET analysis_state = 'pending'
+              WHERE lower(ext) IN (SELECT value FROM json_each(?1))
+                AND analysis_state IN ('ready', 'failed')",
+        )?;
+        reset += stmt.execute([serde_json::to_string(&exts)?])?;
     }
     if current.projection_changed(stored.as_ref()) {
         settings::set(tx, REPROJECT_KEY, &true)?;
@@ -526,7 +539,8 @@ pub fn sync_plan(tx: &Connection, current: &PlanFingerprint) -> Result<PlanSync>
 }
 
 /// 解析のジョブがコーデックの組を作ったときに呼ぶ：前に置いたデコーダの指紋と比べ、今の組にないデコーダで読んだものと、
-/// 並びが変わった形式で失敗していたものを pending に戻し、今の指紋を置く。最初（前の指紋がない）は戻さない。
+/// 並びが変わった形式で失敗していたもの・読まずに形式から書いたもの（`decoder` が NULL。見出しでアルファがないと分かった・
+/// 見出しを読めなかった HEIC・HEIF。決定 15）を pending に戻し、今の指紋を置く。最初（前の指紋がない）は戻さない。
 ///
 /// 戻す UPDATE は事実の表の全件の走査になる（デコーダが変わったときだけの一度きり。`sync_plan` と同じ例外）。
 pub fn sync_decoders(tx: &Connection, current: &DecoderFingerprint) -> Result<usize> {
@@ -546,7 +560,8 @@ pub fn sync_decoders(tx: &Connection, current: &DecoderFingerprint) -> Result<us
                     SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id
                      WHERE (f.decoder IS NOT NULL
                             AND f.decoder NOT IN (SELECT value FROM json_each(?1)))
-                        OR (f.state = 'failed' AND b.ext IN (SELECT value FROM json_each(?2))))",
+                        OR ((f.state = 'failed' OR f.decoder IS NULL)
+                            AND b.ext IN (SELECT value FROM json_each(?2))))",
             )?;
             reset = stmt.execute(params![
                 serde_json::to_string(&current.all_ids())?,
@@ -629,11 +644,6 @@ pub fn any_pending(conn: &Connection, ids: &[i64]) -> Result<bool> {
         }
     }
     Ok(false)
-}
-
-/// 形式から事実を書く形式か（JPEG・HEIC・HEIF）。
-pub fn is_from_format(format: &str) -> bool {
-    FROM_FORMAT.contains(&format)
 }
 
 #[cfg(test)]
@@ -979,6 +989,98 @@ mod tests {
         assert_eq!(sync_decoders(&conn, &now).unwrap(), 0);
     }
 
+    /// 決定 15：計画の指紋の形式ごとの扱いが変わったら（形式から書いていた HEIC・HEIF を見出しで決める）、その形式の ready・
+    /// failed だけを pending に戻す（JPEG・PNG・音声・動画はそのまま）。最初の起動では戻さない。
+    #[test]
+    fn a_format_whose_plan_changed_is_rechecked() {
+        let conn = test_conn();
+        add(&conn, 1, "image", "heic", 1);
+        add(&conn, 2, "image", "heif", 2);
+        add(&conn, 3, "image", "jpg", 3);
+        add(&conn, 4, "image", "png", 4);
+        add(&conn, 5, "audio", "wav", 5);
+        add(&conn, 6, "image", "heic", 6);
+        add(&conn, 7, "image", "HEIC", 7);
+        let current = PlanFingerprint::current(&registry().unwrap()).unwrap();
+        assert_eq!(sync_plan(&conn, &current).unwrap().reset, 0);
+        conn.execute(
+            "UPDATE items SET analysis_state = 'ready' WHERE id <> 6",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE items SET analysis_state = 'failed' WHERE id = 6",
+            [],
+        )
+        .unwrap();
+        // 決定 15 の前の指紋（形式ごとの扱いの欄がない）
+        let mut before = serde_json::to_value(&current).unwrap();
+        before.as_object_mut().unwrap().remove("formats");
+        put_canonical(&conn, PLAN_KEY, &canonical_string(&before).unwrap()).unwrap();
+        let synced = sync_plan(&conn, &current).unwrap();
+        assert_eq!(
+            synced,
+            PlanSync {
+                reset: 4,
+                todo: true
+            }
+        );
+        let states: Vec<String> = (1..=7).map(|id| state(&conn, id)).collect();
+        assert_eq!(
+            states,
+            [
+                "pending", "pending", "ready", "ready", "ready", "pending", "pending"
+            ]
+        );
+        let stored: PlanFingerprint = settings::get(&conn, PLAN_KEY).unwrap().unwrap();
+        assert_eq!(stored, current);
+        conn.execute("UPDATE items SET analysis_state = 'ready'", [])
+            .unwrap();
+        assert_eq!(sync_plan(&conn, &current).unwrap().reset, 0, "一度きり");
+    }
+
+    /// デコーダが変わった形式では、読まずに形式から書いたもの（見出しでアルファがないと分かった・見出しを読めなかった
+    /// HEIC・HEIF。`decoder` が NULL）も見直す（決定 15）。ほかの形式の形式から書いたもの（JPEG）は戻さない。
+    #[test]
+    fn a_decoder_change_rechecks_what_was_written_from_the_format() {
+        let conn = test_conn();
+        add(&conn, 1, "image", "heic", 1);
+        add(&conn, 2, "image", "jpg", 2);
+        add(&conn, 3, "image", "heic", 3);
+        let from_format = |id: i64, hash: u8| ItemWrite {
+            id,
+            hash: [hash; 32],
+            write: Write::Ready {
+                results: Vec::new(),
+                keep: Some(Vec::new()),
+                facts: Box::new(MediaFacts {
+                    facts_v: FACTS_V,
+                    alpha: Some(0),
+                    ..MediaFacts::default()
+                }),
+                stamp: Some(ReadStamp::default()),
+            },
+        };
+        write(
+            &conn,
+            &[from_format(1, 1), from_format(2, 2), ready(3, 3, vec![])],
+            1,
+        )
+        .unwrap();
+        let mut decoders = DecoderFingerprint::default();
+        decoders.0.insert("heic".into(), vec![]);
+        decoders.0.insert("png".into(), vec!["png-rs-dec/2".into()]);
+        assert_eq!(sync_decoders(&conn, &decoders).unwrap(), 0);
+        let mut now = decoders.clone();
+        now.0.insert("heic".into(), vec!["imageio-dec/1".into()]);
+        assert_eq!(sync_decoders(&conn, &now).unwrap(), 1);
+        assert_eq!(
+            (state(&conn, 1), state(&conn, 2), state(&conn, 3)),
+            ("pending".into(), "ready".into(), "ready".into()),
+            "読んだもの（3）はデコーダが今の組にあるので戻さない"
+        );
+    }
+
     /// 投影の古い行を探す走査は、計画の指紋の投影の版・ドット絵の規則が変わったときだけ（一度きり）。ふだんの起動では
     /// 事実の表を走査せず、待っているものがなければジョブを積まない（D3）。
     #[test]
@@ -1073,13 +1175,22 @@ mod tests {
               WHERE kind = 'audio' AND analysis_state IN ('ready', 'failed')",
         );
         assert!(plan.contains("SCAN items"), "{plan}");
+        // 形式ごとの扱いが変わった形式（決定 15）を戻すのも、指紋が変わったときだけの一度きり
+        let plan = query_plan(
+            &conn,
+            "UPDATE items SET analysis_state = 'pending'
+              WHERE lower(ext) IN (SELECT value FROM json_each('[\"heic\"]'))
+                AND analysis_state IN ('ready', 'failed')",
+        );
+        assert!(plan.contains("SCAN items"), "{plan}");
         let plan = query_plan(
             &conn,
             "UPDATE items SET analysis_state = 'pending'
               WHERE analysis_state IN ('ready', 'failed') AND hash IN (
                 SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id
                  WHERE (f.decoder IS NOT NULL AND f.decoder NOT IN (SELECT value FROM json_each('[]')))
-                    OR (f.state = 'failed' AND b.ext IN (SELECT value FROM json_each('[]'))))",
+                    OR ((f.state = 'failed' OR f.decoder IS NULL)
+                        AND b.ext IN (SELECT value FROM json_each('[]'))))",
         );
         assert!(plan.contains("SCAN"), "{plan}");
         let plan = query_plan(

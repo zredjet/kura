@@ -1,4 +1,4 @@
-//! 解析のジョブ（`JobKind::Analyze`。docs/architecture.md §5、decisions の決定 2・5・7、defaults 9・13・14）。
+//! 解析のジョブ（`JobKind::Analyze`。docs/architecture.md §5、decisions の決定 2・5・7・15、defaults 9・13・14）。
 //!
 //! 1 回の実行の流れ：
 //! 1. 前の実行が OS のデコーダ（Platform の段）で読んでいる途中で落ちていたら（処理中の印が残っていれば）、そのアイテムを
@@ -10,6 +10,9 @@
 //! 4. 優先の指定（`request_analysis`）のあるものを先に、なければ新しい順に、`pending` を 16 件ずつ取り出して 1 件ずつ解く：
 //!    - 同じ中身の結果（計画の要求の ID・版・正規の引数がすべてそろう）があり、それを読んだデコーダが今の組にあれば、読まずに
 //!      使う（デコーダの識別子が変わって pending に戻したものは読み直す）。
+//!    - JPEG は読まずに形式から書く（決定 5）。HEIC・HEIF は見出し（Platform の段の形。画素を展開しない）を読み、アルファを
+//!      持つ形のものだけを先へ進めて読み、ほかと見出しを読めないものは形式から書く（決定 15）。見出しも OS のデコーダで読む
+//!      ので、処理中の印を付けてから読む。
 //!    - ヘッダだけ読んで形を出し、見積もり（値の 2 倍＋デコーダの作業領域）が min(予算/2, 1 GiB) を超えれば確保せずに
 //!      failed（`too_large`）。収まれば一括の予算（Class::Bulk）をプールの外で確保し、一括のプールの中で読んで解く（決定 2）。
 //!    - 波形の段は `peaks/ab/<hash>.peaks` に一時ファイルから改名して置く（DB に書く前）。
@@ -39,7 +42,8 @@ use kura_engine::{AnalysisRequest, EngineError, Limits, Monitor};
 
 use super::facts::{MediaFacts, ReadRecord, from_format, project};
 use super::plan::{
-    DecoderFingerprint, Plan, READ_ID, READ_V, RequestKey, plan_for, request_key, stage1, stage2,
+    DecoderFingerprint, Plan, READ_ID, READ_V, RequestKey, from_format_unless_read, plan_for,
+    read_after_header, request_key, stage1, stage2,
 };
 use super::store::{self, Inflight, ItemWrite, NewResult, Pending, ReadStamp, Write, error_code};
 use crate::edit::{EngineRuntime, EngineServices};
@@ -120,6 +124,20 @@ struct Counts {
     skipped: u64,
     /// 読んで解いた 1 件ごとの時間（ミリ秒。ヘッダの読み取りから結果を作るまで）。
     read_ms: Vec<f64>,
+    /// 見出しで決める形式（HEIC・HEIF）の見出しの読み取りの 1 件ごとの時間（ミリ秒。決定 15）。
+    header_ms: Vec<f64>,
+}
+
+/// 時間の列の要約（件数・p50・p95・最大。ミリ秒）。
+fn timing(ms: &[f64]) -> serde_json::Value {
+    let mut ms = ms.to_vec();
+    ms.sort_by(f64::total_cmp);
+    serde_json::json!({
+        "count": ms.len(),
+        "p50": percentile(&ms, 50),
+        "p95": percentile(&ms, 95),
+        "max": ms.last().copied().unwrap_or(0.0),
+    })
 }
 
 /// 並べた列の p（0〜100）パーセンタイル（最も近い順位）。
@@ -133,20 +151,14 @@ fn percentile(sorted: &[f64], p: usize) -> f64 {
 
 impl Counts {
     fn summary(&self) -> String {
-        let mut ms = self.read_ms.clone();
-        ms.sort_by(f64::total_cmp);
         serde_json::json!({
             "done": self.done,
             "failed": self.failed,
             "reused": self.reused,
             "reprojected": self.reprojected,
             "skipped": self.skipped,
-            "readMs": {
-                "count": ms.len(),
-                "p50": percentile(&ms, 50),
-                "p95": percentile(&ms, 95),
-                "max": ms.last().copied().unwrap_or(0.0),
-            },
+            "readMs": timing(&self.read_ms),
+            "headerMs": timing(&self.header_ms),
         })
         .to_string()
     }
@@ -284,6 +296,21 @@ fn failure_code(err: &EngineError) -> Option<&'static str> {
 fn failed(code: &'static str) -> Step {
     Step::Write {
         write: Write::Failed { code, stamp: None },
+        platform: false,
+        reused: false,
+    }
+}
+
+/// 読まずに形式から書く（JPEG と、見出しでアルファがないと分かった・見出しを読めなかった HEIC・HEIF）。読み取りの記録の列は
+/// 空にし、結果の行は残さない。
+fn from_format_step(format: &str) -> Step {
+    Step::Write {
+        write: Write::Ready {
+            results: Vec::new(),
+            keep: Some(Vec::new()),
+            facts: Box::new(from_format(format)),
+            stamp: Some(ReadStamp::default()),
+        },
         platform: false,
         reused: false,
     }
@@ -437,14 +464,14 @@ impl Run<'_> {
                 .into_iter()
                 .map(|r| {
                     let format = format_id(&r.ext).unwrap_or_default();
-                    let facts = if store::is_from_format(format) {
-                        from_format(format)
-                    } else {
-                        let read = r
-                            .results
-                            .get(READ_ID)
-                            .and_then(|b| ReadRecord::from_canonical(b));
-                        project(format, read.as_ref(), &r.results)
+                    let read = r
+                        .results
+                        .get(READ_ID)
+                        .and_then(|b| ReadRecord::from_canonical(b));
+                    // 読まなかったもの（JPEG・見出しで決めた HEIC・HEIF）は形式から、読んだものは結果の表から
+                    let facts = match read {
+                        None if from_format_unless_read(format) => from_format(format),
+                        read => project(format, read.as_ref(), &r.results),
                     };
                     (r.blob_id, facts)
                 })
@@ -556,17 +583,9 @@ impl Run<'_> {
                 platform: false,
                 reused: false,
             }),
-            Plan::FromFormat => Ok(Step::Write {
-                write: Write::Ready {
-                    results: Vec::new(),
-                    keep: Some(Vec::new()),
-                    facts: Box::new(from_format(format)),
-                    stamp: Some(ReadStamp::default()),
-                },
-                platform: false,
-                reused: false,
-            }),
-            Plan::Read => self.read_and_analyze(item, format),
+            Plan::FromFormat => Ok(from_format_step(format)),
+            Plan::ByHeader => self.read_and_analyze(item, format, true),
+            Plan::Read => self.read_and_analyze(item, format, false),
         }
     }
 
@@ -629,7 +648,8 @@ impl Run<'_> {
         Ok(Some(project(format, Some(&read), &json)))
     }
 
-    fn read_and_analyze(&mut self, item: &Pending, format: &str) -> Result<Step> {
+    /// 読んで解く。見出しで決める形式（`by_header`。HEIC・HEIF）は、見出しの形でアルファを持つと分かったものだけを読む。
+    fn read_and_analyze(&mut self, item: &Pending, format: &str, by_header: bool) -> Result<Step> {
         if let Some(facts) = self.reuse(item, format)? {
             return Ok(Step::Write {
                 write: Write::Ready {
@@ -644,7 +664,7 @@ impl Run<'_> {
         }
         let path = self.layout.content_path(&item.hash, &item.ext);
         let hash_hex = hex(&item.hash);
-        // OS のデコーダ（同じプロセスで動く）を通りうるなら、読む前に処理中の印を付けてコミットする
+        // OS のデコーダ（同じプロセスで動く）を通りうるなら、読む前に処理中の印を付けてコミットする（見出しだけを読むときも）
         let platform = self
             .codecs
             .decoders_for(format)
@@ -657,8 +677,8 @@ impl Run<'_> {
             })?;
         }
         let started = Instant::now();
-        let step = match self.decode_and_solve(item, format, &path, &hash_hex) {
-            Ok(step) => step,
+        let (step, read) = match self.decode_and_solve(item, format, &path, &hash_hex, by_header) {
+            Ok(solved) => solved,
             Err(err) => {
                 // 落ちたのではない（波形の段を書けないなど）ので、処理中の印は消してからジョブを失敗にする
                 if platform
@@ -673,9 +693,11 @@ impl Run<'_> {
                 return Err(err);
             }
         };
-        self.counts
-            .read_ms
-            .push(started.elapsed().as_secs_f64() * 1000.0);
+        if read {
+            self.counts
+                .read_ms
+                .push(started.elapsed().as_secs_f64() * 1000.0);
+        }
         Ok(match step {
             Step::Write { write, reused, .. } => Step::Write {
                 write,
@@ -686,28 +708,61 @@ impl Run<'_> {
         })
     }
 
+    /// ヘッダ（形）を読んで、読むなら読んで解く。見出しで決める形式（`by_header`）は、形がアルファを持たなければ・形を
+    /// 読めなければ（中止を除く）読まずに形式から書く。返す真偽は中身を読もうとしたか（読み取りの時間に数えるか）。
     fn decode_and_solve(
         &mut self,
         item: &Pending,
         format: &str,
         path: &Path,
         hash_hex: &str,
-    ) -> Result<Step> {
+        by_header: bool,
+    ) -> Result<(Step, bool)> {
         let opts = DecodeOptions::default();
-        let (shape, _) = match self.codecs.shape_path(path, format, &opts, &self.limits) {
-            Ok(s) => s,
+        let started = Instant::now();
+        let header = self.codecs.shape_path(path, format, &opts, &self.limits);
+        if by_header {
+            self.counts
+                .header_ms
+                .push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let shape = match header {
+            Ok((shape, _)) => shape,
             Err(err) => {
                 return Ok(match failure_code(&err) {
+                    Some(_) if by_header => {
+                        self.ctx.log(&format!(
+                            "アイテム {}: 見出しを読めないので形式から書きます（{err}）",
+                            item.id
+                        ));
+                        (from_format_step(format), false)
+                    }
                     Some(code) => {
                         self.ctx.log(&format!("アイテム {}: {err}", item.id));
-                        failed(code)
+                        (failed(code), true)
                     }
-                    None => Step::Aborted,
+                    None => (Step::Aborted, false),
                 });
             }
         };
+        if by_header && !read_after_header(&shape) {
+            return Ok((from_format_step(format), false));
+        }
+        Ok((self.solve(item, format, path, hash_hex, &shape)?, true))
+    }
+
+    /// 形 `shape` を見積もって予算を確保し、読んで解く。
+    fn solve(
+        &mut self,
+        item: &Pending,
+        format: &str,
+        path: &Path,
+        hash_hex: &str,
+        shape: &kura_engine::Shape,
+    ) -> Result<Step> {
+        let opts = DecodeOptions::default();
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let need = estimate(&self.codecs, format, &shape, len);
+        let need = estimate(&self.codecs, format, shape, len);
         let cap = item_cap(self.runtime.budget().total());
         if need > cap {
             self.ctx.log(&format!(

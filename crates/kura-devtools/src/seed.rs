@@ -15,9 +15,9 @@ use std::time::Instant;
 use kura_core::analysis::facts::{
     FACTS_V, MediaFacts, PIXEL_RULE, PixelArtInput, from_format, pixel_art_v1,
 };
-use kura_core::analysis::plan::PlanFingerprint;
+use kura_core::analysis::plan::{PlanFingerprint, from_format_unless_read};
 use kura_core::analysis::store::{
-    self as analysis_store, ItemWrite, ReadStamp, Write, is_from_format, write as write_facts,
+    self as analysis_store, ItemWrite, ReadStamp, Write, write as write_facts,
 };
 use kura_core::library::{Library, ThumbSize, hex};
 use kura_core::media::route;
@@ -523,7 +523,8 @@ fn fake_audio(rng: &mut ChaCha8Rng, format: &str, duration_ms: Option<i64>) -> M
     }
 }
 
-/// 種類と形式に合った偽の事実と、読み取りの記録の列。JPEG・HEIC は読まずに形式から（解析のジョブと同じ）。
+/// 種類と形式に合った偽の事実と、読み取りの記録の列。JPEG は読まずに形式から、HEIC は見出しでアルファがないと分かった写真
+/// として形式から（解析のジョブと同じ。決定 5・15）。
 fn fake_facts(
     rng: &mut ChaCha8Rng,
     kind: &str,
@@ -539,7 +540,7 @@ fn fake_facts(
         env: None,
     };
     match kind {
-        "image" if is_from_format(format) => (from_format(format), ReadStamp::default()),
+        "image" if from_format_unless_read(format) => (from_format(format), ReadStamp::default()),
         "image" => (fake_image(rng, format, size), read),
         _ => (fake_audio(rng, format, duration_ms), read),
     }
