@@ -135,6 +135,7 @@ export function QuickLook() {
             family={specimen}
             name={asset?.font?.family ?? item.title}
             className={styles.specimen}
+            centered
           />
         )}
         {/* フォント（見本を読めるまで）・3D：描いたサムネイル（フォントは字の形を mask にする）。なければ種類の絵 */}

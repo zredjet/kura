@@ -21,6 +21,7 @@ import { createPlaylistInteractive } from '../features/playlists/playlistActions
 import { ja } from '../i18n/ja';
 import type { AssetChoiceDto } from '../ipc/asset';
 import { useItemCacheVersion } from '../stores/itemCache';
+import { useLibraryStore } from '../stores/libraryStore';
 import { useSettingsStore } from '../stores/settingsStore';
 import { type LayoutMode, useViewStore } from '../stores/viewStore';
 
@@ -346,7 +347,11 @@ export function runMenuAction(action: MenuAction): void {
   } else if (action.id === 'collapseUnits') {
     useViewStore.getState().toggleCollapseUnits();
   } else if (action.id === 'settings') {
-    useSettingsStore.getState().show();
+    // 設定のシートは LibraryScreen の中にある。初回の画面で開いた印を立てると、見えないまま残って次に開いた
+    // ライブラリでいきなり出る（M11 の確かめ F1）
+    if (useLibraryStore.getState().status === 'open') {
+      useSettingsStore.getState().show();
+    }
   }
 }
 

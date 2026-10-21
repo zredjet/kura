@@ -7,7 +7,10 @@ const t = ja.libraryOpen.failure;
 /** ライブラリを開けなかった理由の表示（見出しと説明）。 */
 export interface OpenFailure {
   title: string;
-  /** 説明（Rust の `message`。何をすればよいか・ライブラリは変えていないことまで書いてある）。 */
+  /**
+   * 説明（Rust の `message`。何をすればよいかと、ライブラリがどの版にあるか（変えていない・前の版のまま・途中の版
+   * （スキーマ N）まで当てた）まで書いてある）。
+   */
   detail: string;
 }
 

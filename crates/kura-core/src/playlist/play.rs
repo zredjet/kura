@@ -4,6 +4,8 @@
 //! - スマート：「再生のたびに作り直す」なら並びを作り直してエントリに保存する（並びはエントリの順）。
 //! - S（シャッフルの切り替え）・並べ直すは、今のアイテムを先頭にして作り直す。
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, OptionalExtension};
 
 use super::build::build_queue;
@@ -28,8 +30,9 @@ pub struct PlayRequest {
     /// このアイテム（のユニット）を先頭にして、そこから始める。
     pub start_item: Option<i64>,
     /// 並びはそのままで、このアイテムのスロットから始める（一覧の「ここから再生」）。
-    /// スマートは表示している並びを使い、作り直さない。キューにない種類（フォント・3D）のアイテムなら、それを含むエントリの
-    /// 最初のスロットから（エントリが丸ごとキューになければ、その後ろで最初にキューにあるエントリから）。
+    /// スマートは表示している並びを使い、作り直さない。キューにない種類（フォント・3D）のアイテムなら、ユニット単位はそれを
+    /// 含むエントリの最初のスロットから（エントリが丸ごとキューになければ、その後ろで最初にキューにあるエントリから）、
+    /// ファイル単位は一覧でその行より後ろの、最初にキューにあるメンバーから（docs/playlists.md §1.1）。
     pub from_item: Option<i64>,
 }
 
@@ -197,7 +200,7 @@ fn finish(
         start_index = slots
             .iter()
             .position(|s| s.item_id == item)
-            .or_else(|| entry_start(&slots, snap, item))
+            .or_else(|| entry_start(&slots, snap, item, granularity))
             .unwrap_or(0);
     }
     PlayQueue {
@@ -209,18 +212,61 @@ fn finish(
     }
 }
 
-/// キューにない種類（フォント・3D）の `item` から「ここから再生」するときに始めるスロット：`item` を含む最初のエントリ
-/// （`pos` の順。一覧の行が先頭のメンバーを渡す）の最初のスロット。そのエントリが丸ごとキューにない（フォント・3D だけ）なら、
-/// その後ろのエントリで最初にキューにあるものの最初のスロット。どれもなければ None（先頭から）。
-fn entry_start(slots: &[Slot], snap: &Snapshot, item: i64) -> Option<usize> {
+/// キューにない種類（フォント・3D）の `item` から「ここから再生」するときに始めるスロット（docs/playlists.md §1.1）。
+/// `item` を含む最初のエントリ（`pos` の順）から探す。
+///
+/// - ユニット単位（一覧の行はエントリ。行が先頭のメンバーを渡す）：そのエントリの最初のスロット。そのエントリが丸ごとキューに
+///   ない（フォント・3D だけ）なら、その後ろのエントリで最初にキューにあるものの最初のスロット。
+/// - ファイル単位（一覧の行はメンバー 1 件ずつ）：一覧の行の順（エントリの順に、メンバーを [`expand`] の順）で `item` より
+///   後ろにある、最初にキューにあるメンバーのスロット（そのエントリの中になければ後ろのエントリへ。M11 の確かめ R4）。
+///
+/// どれもなければ None（先頭から）。
+fn entry_start(
+    slots: &[Slot],
+    snap: &Snapshot,
+    item: i64,
+    granularity: Granularity,
+) -> Option<usize> {
     let mut entries: Vec<_> = snap.entries.iter().collect();
     entries.sort_by(|a, b| a.pos.total_cmp(&b.pos).then_with(|| a.id.cmp(&b.id)));
-    let at = entries
-        .iter()
-        .position(|e| expand(snap, e.target).1.contains(&item))?;
-    entries[at..]
-        .iter()
-        .find_map(|e| slots.iter().position(|s| s.entry_id == Some(e.id)))
+    let (at, after, members) = entries.iter().enumerate().find_map(|(i, e)| {
+        let members = expand(snap, e.target).1;
+        let k = members.iter().position(|m| *m == item)?;
+        Some((i, k + 1, members))
+    })?;
+    match granularity {
+        Granularity::Unit => entries[at..]
+            .iter()
+            .find_map(|e| slots.iter().position(|s| s.entry_id == Some(e.id))),
+        Granularity::File => {
+            // (エントリ, アイテム) → 最初のスロット（シャッフルしていても、一覧の行のアイテムのスロットから始める）
+            let mut first: BTreeMap<(i64, i64), usize> = BTreeMap::new();
+            for (i, s) in slots.iter().enumerate() {
+                if let Some(entry) = s.entry_id {
+                    first.entry((entry, s.item_id)).or_insert(i);
+                }
+            }
+            let slot_of = |entry: i64, member: i64| first.get(&(entry, member)).copied();
+            let here = entries[at].id;
+            members
+                .get(after..)
+                .unwrap_or_default()
+                .iter()
+                .find_map(|m| slot_of(here, *m))
+                .or_else(|| {
+                    entries
+                        .get(at + 1..)
+                        .unwrap_or_default()
+                        .iter()
+                        .find_map(|e| {
+                            expand(snap, e.target)
+                                .1
+                                .into_iter()
+                                .find_map(|m| slot_of(e.id, m))
+                        })
+                })
+        }
+    }
 }
 
 /// `item` のスロット（ユニット単位ならそのグループ）を先頭に移し、始めるスロットの番号を返す。

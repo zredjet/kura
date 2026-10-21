@@ -10,8 +10,9 @@
 //! - 計画の指紋のうち投影の版・ドット絵の規則だけが変わったら、作り直しの印（settings の `analysis.reproject`）を置く。
 //!   ジョブは印があるときだけ投影の古い行を走査して作り直し（[`stale_facts`]。これも一度きりの全件の走査）、終えたら消す。
 //!   ふだんの起動・ジョブは事実の表を走査しない。
-//! - 処理中の印（[`set_inflight`]・[`take_inflight`]。settings の `analysis.inflight`）：OS のデコーダ（Platform の段）で読む前に
-//!   付け、書いたら消す。次に動いたときに残っていれば、そのアイテムで落ちたとみなして failed（`crashed`）にする（critic 8）。
+//! - 処理中の印（[`set_inflight`]・[`take_inflight`]。settings の `analysis.inflight`）：OS のデコーダ（Platform の段）を通りうる
+//!   形式（コーデックの組にその形式の Platform のデコーダがあるもの。固定の段が先に読む形式も）を読む前に付け、書いたら消す。
+//!   次に動いたときに残っていれば、そのアイテムで落ちたとみなして failed（`crashed`）にする（critic 8・M11 の確かめ C1）。
 
 use std::collections::BTreeMap;
 
@@ -38,7 +39,7 @@ pub mod error_code {
     pub const TOO_LARGE: &str = "too_large";
     /// 中身を読めない（壊れている・食い違う）。
     pub const DECODE: &str = "decode";
-    /// OS のデコーダで読んでいる途中で落ちた（次に動いたときに処理中の印で見つける）。
+    /// OS のデコーダを通りうる形式を読んでいる途中で落ちた（次に動いたときに処理中の印で見つける。固定の段が読んでいても）。
     pub const CRASHED: &str = "crashed";
     /// すべての理由（この順で bindings に出す）。
     pub const ALL: [&str; 4] = [UNSUPPORTED, TOO_LARGE, DECODE, CRASHED];
@@ -593,7 +594,7 @@ fn put_canonical(tx: &Connection, key: &str, json: &str) -> Result<()> {
     Ok(())
 }
 
-/// 処理中の印（OS のデコーダで読んでいるアイテム）。
+/// 処理中の印（OS のデコーダを通りうる形式を読んでいるアイテム）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Inflight {

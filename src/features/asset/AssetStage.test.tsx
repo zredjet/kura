@@ -4,7 +4,13 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../../i18n/ja';
 import { fileUrl } from '../../ipc/media';
-import { type FontLoader, specimenFamily, useAssetStage, useFontFace } from './AssetStage';
+import {
+  type FontLoader,
+  FontSpecimen,
+  specimenFamily,
+  useAssetStage,
+  useFontFace,
+} from './AssetStage';
 import { imageAsset } from './testAssets';
 import type { AssetData } from './useAssetData';
 
@@ -56,6 +62,26 @@ describe('インスペクタのプレビューを置き換えるもの', () => {
     expect(specimen).toHaveStyle({ fontFamily: `"${specimenFamily(FONT.hash)}"` });
     expect(screen.getByText(ja.asset.specimenLarge)).toBeInTheDocument();
     expect(screen.getByText(ja.asset.specimenSmall)).toBeInTheDocument();
+  });
+
+  it('クイックルックの見本（centered）は枠の中で縦横とも中央に寄せる。インスペクタの見本は左寄せのまま', () => {
+    // 画面の確かめ：クイックルックの min(720px, 80vw) × min(360px, 60vh) の枠の中で左寄せに出て、広い画面では左に寄っていた
+    render(
+      <>
+        <FontSpecimen family="a" name="中央" centered />
+        <FontSpecimen family="b" name="左" />
+      </>,
+    );
+    const centered = screen.getByRole('img', { name: ja.asset.specimenLabel('中央') });
+    expect(centered).toHaveStyle({
+      justifyContent: 'center',
+      alignItems: 'center',
+      textAlign: 'center',
+    });
+    const inspector = screen.getByRole('img', { name: ja.asset.specimenLabel('左') });
+    expect(inspector).toHaveStyle({ justifyContent: 'center' });
+    expect(inspector).not.toHaveStyle({ alignItems: 'center' });
+    expect(inspector).not.toHaveStyle({ textAlign: 'center' });
   });
 
   it('フォントを読めなければ置き換えない（サムネイルのまま）。アニメでない画像も置き換えない', async () => {

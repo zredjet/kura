@@ -72,16 +72,19 @@ export function FontSpecimen({
   family,
   name,
   className,
+  centered = false,
 }: {
   family: string;
   name: string;
   /** 枠を変えるとき（クイックルック）。既定はインスペクタの 220px の枠。 */
   className?: string;
+  /** 枠の中で縦横とも中央に寄せる（クイックルック）。既定は左寄せ（インスペクタ）。 */
+  centered?: boolean;
 }) {
   return (
     <div className={className ?? styles.frame}>
       <div
-        className={styles.specimen}
+        className={centered ? `${styles.specimen} ${styles.specimenCentered}` : styles.specimen}
         style={{ fontFamily: `"${family}"` }}
         role="img"
         aria-label={t.specimenLabel(name)}

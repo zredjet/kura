@@ -781,3 +781,86 @@ fn playing_from_a_row_whose_item_never_reaches_the_queue_starts_at_its_entry() {
     playlist_queue(&conn, smart, &PlayRequest::default(), &ctx()).unwrap();
     assert_eq!(from(smart, f), b);
 }
+
+/// M11 の確かめ R4（決定 19）：ファイル単位の一覧ではユニットのメンバーが 1 行ずつ並ぶので、途中のフォント・3D の行から
+/// 「ここから再生」すると、押した行より後ろで最初に再生できるメンバーから始める（ユニットの中になければ後ろのエントリへ）。
+/// ユニット単位はユニットごとに流すので、今までどおりそのエントリの最初のスロットから。
+#[test]
+fn playing_from_a_font_row_in_the_middle_of_a_unit_starts_after_it_by_file() {
+    let conn = test_conn();
+    let a = item(&conn, "a", "image", 0);
+    let b = item(&conn, "b", "audio", 0);
+    let f = item(&conn, "f", "font", 0);
+    let c = item(&conn, "c", "video", 0);
+    let d = item(&conn, "d", "audio", 0);
+    let g = item(&conn, "g", "model", 0);
+    let e = item(&conn, "e", "image", 0);
+    let ux = set_unit(&conn, "X", &[a]);
+    let uy = set_unit(&conn, "Y", &[b, f, c]);
+    let uz = set_unit(&conn, "Z", &[d, g]);
+    let uw = set_unit(&conn, "W", &[e]);
+    let from = |pl: i64, item: i64| {
+        let q = playlist_queue(
+            &conn,
+            pl,
+            &PlayRequest {
+                from_item: Some(item),
+                ..PlayRequest::default()
+            },
+            &ctx(),
+        )
+        .unwrap();
+        q.slots[q.start_index].item_id
+    };
+    let make = |granularity: Granularity, shuffle: bool| {
+        let pl = playlist(&conn, PlaylistKind::Manual, granularity);
+        store::add_entries(
+            &conn,
+            pl,
+            &[ux, uy, uz, uw].map(|u| NewEntry::from(EntryTarget::Unit(u))),
+            None,
+            1,
+        )
+        .unwrap();
+        store::update(
+            &conn,
+            pl,
+            &PlaylistPatch {
+                shuffle: Some(shuffle),
+                ..PlaylistPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        // 一覧の行の並び（メンバーの順）
+        let rows = store::contents(&conn, pl).unwrap();
+        assert_eq!(rows[1].items, vec![b, f, c]);
+        assert_eq!(rows[2].items, vec![d, g]);
+        pl
+    };
+    for shuffle in [false, true] {
+        let file = make(Granularity::File, shuffle);
+        assert_eq!(
+            from(file, f),
+            c,
+            "ファイル単位（シャッフル {shuffle}）：f の行の次の c から"
+        );
+        assert_eq!(
+            from(file, g),
+            e,
+            "ファイル単位（シャッフル {shuffle}）：ユニットの最後の 3D の行は後ろのエントリの e から"
+        );
+        assert_eq!(from(file, c), c, "再生できる行はその行から");
+        let unit = make(Granularity::Unit, shuffle);
+        assert_eq!(
+            from(unit, f),
+            b,
+            "ユニット単位（シャッフル {shuffle}）：ユニット Y の最初から"
+        );
+        assert_eq!(
+            from(unit, g),
+            d,
+            "ユニット単位（シャッフル {shuffle}）：ユニット Z の最初から"
+        );
+    }
+}
