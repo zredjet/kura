@@ -1081,6 +1081,8 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
     let mut css_markers = false;
     // `<style>` に transform が書かれているか（どの要素の拡大にもなりうる。textPath の見積もり）
     let mut css_transform = false;
+    // 表示の領域の大きさの上限（textPath の見積もり。単位のある幅・高さで広がる）
+    let mut viewport = svg_text::UNKNOWN_VIEWPORT;
     let mut count = 0usize;
     let mut elements = 0u64;
     // CSS の手間の見積もりに使う：要素名・クラスごとの数、文書の深さ・兄弟の最大数、style 属性の宣言の手間
@@ -1110,6 +1112,7 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
         }
         // 数の大きさ（SVG の要素の、名前空間のないか SVG の属性。名前・参照の属性は読まない）
         if n.tag_name().namespace() == Some(SVG_NS) {
+            viewport = crate::math::max(viewport, svg_text::viewport_size(&n));
             for a in n.attributes() {
                 if !matches!(a.namespace(), None | Some(SVG_NS)) {
                     continue;
@@ -1279,6 +1282,35 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
             .max()
             .unwrap_or(0)
     };
+    // textPath の参照先の座標の大きさの上限（同じ id の図形のいちばん大きいもの。id ごとに 1 度だけ数える）
+    let ext_memo: std::cell::RefCell<std::collections::BTreeMap<String, f64>> =
+        std::cell::RefCell::new(std::collections::BTreeMap::new());
+    let extent = |tp: &SvgNode<'_, '_>| -> f64 {
+        tp.attributes()
+            .filter(|a| a.name() == "href")
+            .filter_map(|a| href_id(a.value()))
+            .map(|id| {
+                if let Some(e) = ext_memo.borrow().get(id) {
+                    return *e;
+                }
+                let e = index
+                    .targets(id)
+                    .map(|t| svg_text::shape_extent(&t, viewport, css_transform))
+                    .fold(0.0, crate::math::max);
+                ext_memo.borrow_mut().insert(id.to_string(), e);
+                e
+            })
+            .fold(0.0, crate::math::max)
+    };
+    let scale_cx = svg_text::ScaleContext {
+        css_transform,
+        viewport,
+        pattern_view_box: doc
+            .descendants()
+            .filter(|n| n.is_element())
+            .map(|n| svg_text::pattern_view_box_scale(&n, viewport))
+            .fold(1.0, crate::math::max),
+    };
     let mut own_text = vec![0u64; count];
     let mut reshape = 0u64;
     for t in doc
@@ -1292,9 +1324,11 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
         reshape = reshape.max(c.reshape);
     }
     // 帰りがけの順に、要素の数（use の展開と参照ごとの複製を含む）・複製で作る要素の数・高さ（参照の展開を含む）・文字の
-    // レイアウトの手間（同じ）・textPath に至る変形の拡大の上限（参照の先のいちばん大きいもの × 自分の拡大）を求める。輪は断る
+    // レイアウトの手間（同じ）・textPath に至る変形の拡大の上限（参照の先のいちばん大きいもの × 自分の拡大）と、textPath の
+    // 弧長の精度の比の上限（12 × 参照先の座標の上限から始めて、同じく拡大を掛ける。1 より小さい拡大は 1）を求める。輪は断る
     let mut text_work = vec![0u64; count];
     let mut path_scale = vec![0f64; count];
+    let mut path_range = vec![0f64; count];
     let mut state = vec![0u8; count];
     let mut size = vec![0u64; count];
     let mut clones = vec![0u64; count];
@@ -1325,10 +1359,19 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
         let i = at(n);
         let (mut total, mut h, mut cloned) = (1u64, 0usize, 0u64);
         let mut tw = own_text[i];
-        let mut ps = if n.tag_name().name() == "textPath" {
-            1.0
+        let (mut ps, mut pr) = if n.tag_name().name() == "textPath" {
+            // 座標の上限が NaN になることはない（shape_extent が無限大にする）が、念のため上限の側に倒す
+            let e = extent(n);
+            (
+                1.0,
+                if e.is_nan() {
+                    f64::INFINITY
+                } else {
+                    svg_text::TEXT_PATH_RANGE_FACTOR * e
+                },
+            )
         } else {
-            0.0
+            (0.0, 0.0)
         };
         for (s, kind) in succ.iter() {
             if *kind >= EDGE_COUNT {
@@ -1342,13 +1385,20 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
             h = h.max(height[at(s)]);
             // 共有の参照（EDGE_LINK）の先も、参照する要素の拡大を受けるとみなす（多めに取る）
             ps = crate::math::max(ps, path_scale[at(s)]);
+            pr = crate::math::max(pr, path_range[at(s)]);
         }
         size[i] = total;
         clones[i] = cloned;
         height[i] = h + 1;
         text_work[i] = tw;
-        path_scale[i] = if ps > 0.0 {
-            ps * svg_text::own_scale(n, *n == root, css_transform)
+        let own = if ps > 0.0 || pr > 0.0 {
+            svg_text::own_scale(n, *n == root, &scale_cx)
+        } else {
+            1.0
+        };
+        path_scale[i] = if ps > 0.0 { ps * own } else { 0.0 };
+        path_range[i] = if pr > 0.0 {
+            pr * crate::math::max(own, 1.0)
         } else {
             0.0
         };
@@ -1375,9 +1425,16 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
     }
     let mut total = size[at(&root)];
     let mut total_text = text_work[at(&root)];
-    if path_scale[at(&root)] > svg_text::MAX_TEXT_PATH_SCALE {
+    // NaN は超えたとみなす
+    let over = |x: f64, max: f64| x.is_nan() || x > max;
+    if over(path_scale[at(&root)], svg_text::MAX_TEXT_PATH_SCALE) {
         return Err(EngineError::Limit(
             "textPath を大きく拡大する SVG は読めません".into(),
+        ));
+    }
+    if over(path_range[at(&root)], svg_text::MAX_TEXT_PATH_RANGE) {
+        return Err(EngineError::Limit(
+            "textPath の拡大と参照する図形の座標が大きすぎる（弧長の精度が足りない）SVG は読めません".into(),
         ));
     }
     // marker の複製：頂点の数 × marker の中身の大きさ（CSS で付くものは、いちばん大きい marker とみなす）。文字の手間も同じ
@@ -2056,6 +2113,127 @@ mod tests {
             decode_with(&c, &marker),
             Err(EngineError::Unsupported(_))
         ));
+    }
+
+    /// 検証のあとの確認 R1：弧長の精度の比（参照先の区間の長さ ÷ usvg の精度 0.5 ÷ 拡大）が f64 で足りなくなる形は、
+    /// usvg に入る前（XML の木の見積もり）に断る。直す前は、どれも kurbo の弧長の逆引きが終わらずに止まった（拡大の積に
+    /// 参照先の transform と座標の大きさが入っていなかった）。見積もれない大きさ（em・100% を超える割合・transform-origin）も断る。
+    #[test]
+    fn text_path_precision_is_bounded() {
+        let c = text_codec();
+        let tp = r##"<text><textPath href="#p">A</textPath></text>"##;
+        let curve = "M0 0 C1 2 3 4 5 6";
+        let doc = |defs: &str, body: &str| text_svg(&format!("<defs>{defs}</defs>{body}"));
+        let refused = [
+            // (a) 参照先の path 自身の transform（祖先ではないので、textPath に至る拡大に入らなかった）
+            doc(
+                &format!(r#"<path id="p" transform="scale(1e9) scale(1e9)" d="{curve}"/>"#),
+                tp,
+            ),
+            // 同じ形で startOffset の割合（usvg は path の長さを精度 0.5 で測る）
+            doc(
+                &format!(
+                    r#"<path id="p" transform="scale(1e9) scale(1e9) scale(1e2)" d="{curve}"/>"#
+                ),
+                r##"<text><textPath href="#p" startOffset="50%">A</textPath></text>"##,
+            ),
+            // (b) 許される祖先の拡大（10¹²）と大きな座標（数は 10⁹ まで）
+            doc(
+                r#"<path id="p" d="M0 0 C1e9 2e8 3e8 4e8 5e8 6e8"/>"#,
+                &format!(r#"<g transform="scale(1e6) scale(1e6)">{tp}</g>"#),
+            ),
+            // 相対の命令で座標を重ねる（1 つずつの数は小さい）
+            doc(
+                &format!(
+                    r#"<path id="p" d="M0 0{} c1 2 3 4 5 6"/>"#,
+                    " l1e9 1e9".repeat(1_000)
+                ),
+                &format!(r#"<g transform="scale(1e3)">{tp}</g>"#),
+            ),
+            // mask の中身が objectBoundingBox：中身の拡大はマスクする要素の外接矩形（中で拡大した図形で大きくできる）
+            doc(
+                &format!(
+                    r#"<path id="p" d="{curve}"/><mask id="m" maskContentUnits="objectBoundingBox">{tp}</mask>"#
+                ),
+                r#"<g mask="url(#m)"><g transform="scale(1e9)"><rect width="1e9" height="1e9"/></g></g>"#,
+            ),
+            // 入れ子の svg の大きさの割合を重ねる（親の大きさの 10⁷ 倍を 3 段）
+            doc(
+                &format!(r#"<path id="p" d="{curve}"/>"#),
+                &format!(
+                    r#"<svg width="1e9%" height="1e9%"><svg width="1e9%" height="1e9%"><svg width="1e9%" height="1e9%" viewBox="0 0 1 1">{tp}</svg></svg></svg>"#
+                ),
+            ),
+            // 大きさの分からない単位：入れ子の svg・use の symbol・pattern の大きさの em（フォントの大きさは入れ子で掛け合わさる）
+            doc(
+                &format!(r#"<path id="p" d="{curve}"/>"#),
+                &format!(
+                    r#"<svg width="1e9em" height="1e9em" font-size="1e9" viewBox="0 0 1 1">{tp}</svg>"#
+                ),
+            ),
+            doc(
+                &format!(
+                    r#"<path id="p" d="{curve}"/><symbol id="s" viewBox="0 0 1 1">{tp}</symbol>"#
+                ),
+                r##"<use href="#s" width="1e9em" height="1e9em" font-size="1e9"/>"##,
+            ),
+            doc(
+                &format!(
+                    r#"<path id="p" d="{curve}"/><pattern id="q" patternUnits="userSpaceOnUse" width="1e9em" height="1e9em" font-size="1e9" viewBox="0 0 1 1">{tp}</pattern>"#
+                ),
+                r##"<rect width="64" height="64" fill="url(#q)"/>"##,
+            ),
+            // 参照先の em の大きさの図形と、transform-origin（em で大きな平行移動）
+            doc(
+                r#"<rect id="p" width="1e9em" height="1e9em" font-size="1e9"/>"#,
+                tp,
+            ),
+            doc(
+                &format!(
+                    r#"<path id="p" d="{curve}" transform="scale(2)" transform-origin="1e9em 1e9em" font-size="1e9"/>"#
+                ),
+                &format!(r#"<g transform="scale(1e6)">{tp}</g>"#),
+            ),
+            // in の単位の矩形（96 倍）
+            doc(
+                r#"<rect id="p" width="1e9in" height="1e9in"/>"#,
+                &format!(r#"<g transform="scale(1e4)">{tp}</g>"#),
+            ),
+            // T の反射は、続けるほど制御点が遠くなる
+            doc(
+                &format!(
+                    r#"<path id="p" d="M0 0 Q1e9 1e9 1e9 0{}"/>"#,
+                    " T0 0 T1e9 0".repeat(2_000)
+                ),
+                &format!(r#"<g transform="scale(1e3)">{tp}</g>"#),
+            ),
+        ];
+        for svg in &refused {
+            assert!(
+                matches!(check_elements(svg), Err(EngineError::Limit(_))),
+                "{svg}"
+            );
+            assert!(
+                matches!(decode_with(&c, svg), Err(EngineError::Limit(_))),
+                "{svg}"
+            );
+        }
+        // ふつうの textPath は読む：Inkscape 風（mm の大きさ・viewBox・startOffset の割合・path の matrix・弧）、Illustrator 風、
+        // 入れ子の svg（100%）・use の symbol・use 越し・大きめの座標の地図のラベル
+        let fine = [
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="210mm" height="297mm" viewBox="0 0 210 297" font-family="KuraTest"><g transform="translate(-12.3,-45.6)"><path id="path1" d="m 30,100 c 40,-50 100,-50 140,0 a 70 70 0 0 1 -140 0 z" transform="matrix(0.98 0.17 -0.17 0.98 5 6)" style="fill:none;stroke:#000"/><text style="font-size:10.5833px"><textPath xlink:href="#path1" startOffset="50%" style="text-anchor:middle">ABBA ABBA</textPath></text></g></svg>"##.to_string(),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="800" height="600" viewBox="0 0 800 600" font-family="KuraTest"><defs><path id="SVGID_1_" d="M101.5,300.5c0,0,150-200,300-100s300,0,300,0"/></defs><text transform="matrix(1 0 0 1 0 0)"><textPath xlink:href="#SVGID_1_" startOffset="10.5%"><tspan style="font-size:24px;">ABAB</tspan></textPath></text></svg>"##.to_string(),
+            doc(
+                r##"<path id="p" d="M5 30 Q32 0 59 30"/><symbol id="s" viewBox="0 0 64 64"><text font-size="6"><textPath href="#p">AB</textPath></text></symbol><g id="g"><text font-size="6"><textPath href="#p">BA</textPath></text></g>"##,
+                r##"<svg width="100%" height="100%" viewBox="0 0 128 128"><text font-size="6"><textPath href="#p">AB</textPath></text></svg><use href="#s" width="32" height="32"/><use href="#g" transform="scale(2)"/>"##,
+            ),
+            text_svg(
+                r##"<svg viewBox="0 0 2000000 1000000" width="64" height="32"><path id="road" d="M135000 520000 L136200 520400 L137900 521800 C138000 522000 139000 523000 140000 522500" transform="translate(-120000 -500000) scale(10)"/><text font-size="2000"><textPath href="#road">ABBA</textPath></text></svg>"##,
+            ),
+        ];
+        for svg in &fine {
+            assert!(decode_with(&c, svg).is_ok(), "{svg}");
+        }
     }
 
     /// 展開爆弾：入れ子の実体・実体の値の中の '>'・注釈の中の偽の DOCTYPE・use・marker の鎖・頂点の多い marker・巨大な大きさ。

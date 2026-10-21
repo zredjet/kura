@@ -10,7 +10,9 @@
 //!   呼ぶたびに残りの手間から引く。尽きたら選ばずに印を立て、木を作り終えたら `Limit` にする（[`TextGuard`]）。
 //! - textPath は、字ごとに path の区間をたどり、弧長を変形の拡大に応じた精度で求める（拡大の幾何平均が f32 であふれると精度が
 //!   0 になり、区間ごとに 2²⁰ 回の分割になる）。そこで path の区間の数 × 字の数を手間に入れ、textPath に至る変形の拡大の上限
-//!   （[`own_scale`] の積）を [`MAX_TEXT_PATH_SCALE`] で断る。
+//!   （[`own_scale`] の積）を [`MAX_TEXT_PATH_SCALE`] で断る。弧長の逆引きは、精度が区間の長さに比べて f64 の刻みに近づくと
+//!   終わらない（検証のあとの確認 R1）ので、精度の比の上限（12 × 拡大の上限 × 参照先の座標の上限 [`shape_extent`]）も
+//!   [`MAX_TEXT_PATH_RANGE`] で断る。
 //!
 //! 手間の単位は、M4 Max の release で測った時間（ns）の目安。上限 [`MAX_TEXT_WORK`] は 1 件 100 ms ほど
 //! （ラテン文字なら、1 つの塊は約 5,000 字、100 字ずつの text は合わせて約 3 万字、1 字ずつの span の塊は約 600 字。
@@ -58,10 +60,18 @@ const FALLBACK_FACE_WORK: u64 = 160;
 /// 精度が 0 になって区間ごとに 2²⁰ 回分ける（10²¹ の拡大で区間 1 つに 94 ms、曲線 4 つ・100 字で 5 分を超えた）。
 /// 10¹² の拡大では区間 1 万の path に 1,000 字で 9 ms だった。ふつうの SVG の拡大は 10³ ほど。
 pub(crate) const MAX_TEXT_PATH_SCALE: f64 = 1e12;
-/// 単位が objectBoundingBox の中身の拡大（参照する要素の外接矩形の大きさ。座標は 10⁹ までなので 4×10⁹ とみなす）。
-const OBB_SCALE: f64 = 4e9;
-/// 大きさの分からない表示の領域（入れ子の svg・symbol。親の大きさの割合や use の幅で決まる）。
-const UNKNOWN_VIEWPORT: f64 = 1e9;
+/// textPath の弧長の精度の比（参照先の区間の長さ ÷ usvg の精度 `0.5 ÷ max(拡大, 1)`）の上限。kurbo の弧長の逆引き
+/// （`inv_arclen`。usvg が字ごとに呼ぶ）は、精度 ÷ 区間の長さ が f64 の刻み（2⁻⁵²）に近づくと区間が縮まず、2⁻⁶³ を下回ると
+/// 分ける回数の計算（`1 << n`）が折り返して、どちらも終わらない（検証のあとの確認 R1。M4 Max の release で、比が 7×10¹⁶ を
+/// 超えると止まった）。比は 12 × 拡大の上限 × 参照先の座標の上限（[`shape_extent`]。区間の長さは制御点の折れ線の長さ
+/// 6 × 座標の上限 以下）で見積もる。10¹⁴ は止まり始める比の 1/180 で、比が 10¹⁵ までなら区間 1,000・字 3,000 でも時間は
+/// 比によらなかった（字の塊の 2 乗の手間で決まる）。
+pub(crate) const MAX_TEXT_PATH_RANGE: f64 = 1e14;
+/// 精度の比の見積もりの係数（区間の長さ ≤ 6 × 座標の上限、精度 = 0.5 ÷ 拡大）。
+pub(crate) const TEXT_PATH_RANGE_FACTOR: f64 = 12.0;
+/// 表示の領域の大きさの下限の上限（viewBox の幅・高さと、数だけの長さは 10⁹ まで）。単位のある長さで広がる分は
+/// [`viewport_size`] で足す。
+pub(crate) const UNKNOWN_VIEWPORT: f64 = 1e9;
 
 /// 字の組（手間の重さ）。0：ラテン文字など、1：和文・記号・絵文字、2：そのほか。
 type Class = usize;
@@ -265,50 +275,284 @@ pub(crate) fn path_segments(n: &SvgNode<'_, '_>) -> u64 {
     }
 }
 
-/// 変形のリストの拡大の上限（各関数の行列のノルムの上限の積）。読めなければ無限大。
-pub(crate) fn transform_scale(v: &str) -> f64 {
-    let mut s = 1.0f64;
+/// 変形のリストの関数ごとの（行列のノルムの上限, 平行移動の大きさの上限）。読めなければ None。
+fn transform_parts(v: &str) -> Option<Vec<(f64, f64)>> {
+    let mut out = Vec::new();
     let mut rest = v.trim_matches(|c: char| is_xml_space(c) || c == ',');
     while !rest.is_empty() {
-        let Some(open) = rest.find('(') else {
-            return f64::INFINITY;
-        };
-        let Some(close) = rest.find(')') else {
-            return f64::INFINITY;
-        };
+        let open = rest.find('(')?;
+        let close = rest.find(')')?;
         if close < open {
-            return f64::INFINITY;
+            return None;
         }
         let name = rest[..open].trim();
-        let nums: Option<Vec<f64>> = rest[open + 1..close]
+        let nums: Vec<f64> = rest[open + 1..close]
             .split(|c: char| is_xml_space(c) || c == ',')
             .filter(|t| !t.is_empty())
             .map(|t| t.parse::<f64>().ok().filter(|x| x.is_finite()))
-            .collect();
-        let Some(nums) = nums else {
-            return f64::INFINITY;
-        };
+            .collect::<Option<Vec<f64>>>()?;
         let at = |k: usize| nums.get(k).copied().unwrap_or(0.0).abs();
         let one = match (name, nums.len()) {
-            ("matrix", 6) => at(0) + at(1) + at(2) + at(3),
-            ("translate", 1 | 2) | ("rotate", 1 | 3) => 1.0,
-            ("scale", 1) => at(0),
-            ("scale", 2) => crate::math::max(at(0), at(1)),
+            ("matrix", 6) => (at(0) + at(1) + at(2) + at(3), at(4) + at(5)),
+            ("translate", 1 | 2) => (1.0, at(0) + at(1)),
+            ("rotate", 1) => (1.0, 0.0),
+            // 中心のまわりの回転は、中心を動かす平行移動を含む（c − R·c）
+            ("rotate", 3) => (1.0, 2.0 * (at(1) + at(2))),
+            ("scale", 1) => (at(0), 0.0),
+            ("scale", 2) => (crate::math::max(at(0), at(1)), 0.0),
             ("skewX" | "skewY", 1) => {
                 let r = nums.first().copied().unwrap_or(0.0) * (std::f64::consts::PI / 180.0);
                 let c = crate::math::cos(r).abs();
                 if c < 1e-9 {
-                    f64::INFINITY
+                    (f64::INFINITY, 0.0)
                 } else {
-                    1.0 + (crate::math::sin(r) / c).abs()
+                    (1.0 + (crate::math::sin(r) / c).abs(), 0.0)
                 }
             }
-            _ => return f64::INFINITY,
+            _ => return None,
         };
-        s *= crate::math::max(one, 1.0);
+        out.push(one);
         rest = rest[close + 1..].trim_start_matches(|c: char| is_xml_space(c) || c == ',');
     }
-    s
+    Some(out)
+}
+
+/// 変形のリストの拡大の上限（各関数の行列のノルムの上限の積。1 より小さい拡大は 1 とみなす）。読めなければ無限大。
+pub(crate) fn transform_scale(v: &str) -> f64 {
+    transform_parts(v).map_or(f64::INFINITY, |parts| {
+        parts
+            .iter()
+            .fold(1.0, |s, (one, _)| s * crate::math::max(*one, 1.0))
+    })
+}
+
+/// 変形のリストが点 p を写す先の大きさの上限 `s × |p| + t` の (s, t)（左の関数ほど外側。|p| は長さ）。読めなければ無限大。
+pub(crate) fn transform_bound(v: &str) -> (f64, f64) {
+    transform_parts(v).map_or((f64::INFINITY, f64::INFINITY), |parts| {
+        // A ∘ f の上限：|A(f(p))| ≤ sA (sf |p| + tf) + tA
+        parts
+            .iter()
+            .fold((1.0, 0.0), |(s, t), (sf, tf)| (s * sf, s * tf + t))
+    })
+}
+
+/// 長さの値（数と単位 1 つ）の大きさの上限（利用者の単位、96 dpi）。数だけ・px はそのまま、in・cm・mm・pt・pc は係数を掛け、
+/// % は `viewport` の割合。em・ex（フォントの大きさは入れ子で掛け合わさるので上限が決まらない）と読めない値は無限大。
+pub(crate) fn length_bound(v: &str, viewport: f64) -> f64 {
+    let b = v.trim().as_bytes();
+    let digit = |k: usize| b.get(k).is_some_and(u8::is_ascii_digit);
+    let mut i = 0;
+    if matches!(b.first(), Some(b'-' | b'+')) {
+        i += 1;
+    }
+    let start_digits = i;
+    while digit(i) {
+        i += 1;
+    }
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while digit(i) {
+            i += 1;
+        }
+    }
+    if !(start_digits..i).any(digit) {
+        return f64::INFINITY;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        let mut k = i + 1;
+        if matches!(b.get(k), Some(b'-' | b'+')) {
+            k += 1;
+        }
+        if digit(k) {
+            while digit(k) {
+                k += 1;
+            }
+            i = k;
+        }
+    }
+    let (Some(num), Some(unit)) = (b.get(..i), b.get(i..)) else {
+        return f64::INFINITY;
+    };
+    let Some(x) = std::str::from_utf8(num)
+        .ok()
+        .and_then(|t| t.parse::<f64>().ok())
+        .filter(|x| x.is_finite())
+    else {
+        return f64::INFINITY;
+    };
+    let factor = match unit {
+        b"" | b"px" => 1.0,
+        b"in" => 96.0,
+        b"cm" => 96.0 / 2.54,
+        b"mm" => 96.0 / 25.4,
+        b"pt" => 4.0 / 3.0,
+        b"pc" => 16.0,
+        b"%" => viewport / 100.0,
+        _ => f64::INFINITY,
+    };
+    if x == 0.0 { 0.0 } else { x.abs() * factor }
+}
+
+/// 表示の領域の大きさを決める要素（svg・use・pattern・symbol）の幅・高さが、表示の領域を広げうる大きさ（利用者の単位）。
+/// 割合は 100% までなら親の領域より広がらないので 0、100% を超える割合（入れ子で掛け合わさる）と em・ex・読めない値は無限大。
+/// 文書のこの値の最大と [`UNKNOWN_VIEWPORT`] の大きい方が、どの表示の領域の大きさの上限にもなる（svg の大きさを省くと
+/// 親の 100%、use の大きさを省くと今の領域）。
+pub(crate) fn viewport_size(n: &SvgNode<'_, '_>) -> f64 {
+    if !matches!(n.tag_name().name(), "svg" | "use" | "pattern" | "symbol") {
+        return 0.0;
+    }
+    ["width", "height"]
+        .iter()
+        .filter_map(|name| attr(n, name))
+        .map(|v| {
+            if v.trim().ends_with('%') {
+                if length_bound(v, 100.0) <= 100.0 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
+            } else {
+                length_bound(v, f64::INFINITY)
+            }
+        })
+        .fold(0.0, crate::math::max)
+}
+
+/// path のデータが表す点（制御点を含む）の座標の大きさの上限。絶対の命令（大文字）の数の絶対値の最大を A、相対の命令（小文字）の
+/// 数の絶対値の和を R として、端の点と書いた制御点はどれも A + R を超えない（絶対の命令で A 以内に戻り、相対の命令で R まで
+/// 離れる。命令の引数の区切りを読み違えても、数がどちらの命令のものかは文字の位置で決まる）。弧（中心は端から半径の内、
+/// 曲線の制御点は半径の約 1.14 倍の内）と S の反射を見込んで 4 倍、T の連続（制御点は前の制御点の反射で、続けるたびに
+/// 2(A + R) ずつ遠くなる）は (2m + 1) 倍（m は続く T の数）。
+pub(crate) fn path_extent(d: &str) -> f64 {
+    let (mut abs_max, mut rel_sum, mut relative) = (0.0f64, 0.0f64, false);
+    // 続く T の数（数の 2 つで 1 つ）と、その最大
+    let (mut in_t, mut run, mut longest) = (false, 0u64, 0u64);
+    scan_numbers(d, |t| match t {
+        Token::Letter(c) => {
+            relative = c.is_ascii_lowercase();
+            in_t = matches!(c, b'T' | b't');
+            if !in_t {
+                run = 0;
+            }
+        }
+        Token::Number(x) => {
+            if relative {
+                rel_sum += x.abs();
+            } else {
+                abs_max = crate::math::max(abs_max, x.abs());
+            }
+            if in_t {
+                run += 1;
+                longest = longest.max(run.div_ceil(2));
+            }
+        }
+    });
+    (abs_max + rel_sum) * crate::math::max(4.0, 2.0 * longest as f64 + 1.0)
+}
+
+/// polyline・polygon の点の座標の大きさの上限（x と y の絶対値の和の上限）。
+fn points_extent(p: &str) -> f64 {
+    let mut most = 0.0f64;
+    scan_numbers(p, |t| {
+        if let Token::Number(x) = t {
+            most = crate::math::max(most, x.abs());
+        }
+    });
+    2.0 * most
+}
+
+/// [`scan_numbers`] が渡すもの。
+enum Token {
+    /// 数の外の英字（path の命令）。
+    Letter(u8),
+    /// 数（読めない数は無限大）。
+    Number(f64),
+}
+
+/// 値の中の数（SVG の数の書き方：符号・数字・小数点・指数）と、数の外の英字（指数の e・E を除く。path の命令）を順に `f` に
+/// 渡す。どの枝でも 1 バイト以上進む。
+fn scan_numbers(v: &str, mut f: impl FnMut(Token)) {
+    let b = v.as_bytes();
+    let digit = |k: usize| b.get(k).is_some_and(u8::is_ascii_digit);
+    let mut i = 0usize;
+    while let Some(&c) = b.get(i) {
+        let starts = digit(i)
+            || (c == b'.' && digit(i + 1))
+            || ((c == b'-' || c == b'+')
+                && (digit(i + 1) || (b.get(i + 1) == Some(&b'.') && digit(i + 2))));
+        if !starts {
+            if c.is_ascii_alphabetic() && !matches!(c, b'e' | b'E') {
+                f(Token::Letter(c));
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        if matches!(c, b'-' | b'+') {
+            i += 1;
+        }
+        while digit(i) {
+            i += 1;
+        }
+        if b.get(i) == Some(&b'.') {
+            i += 1;
+            while digit(i) {
+                i += 1;
+            }
+        }
+        if matches!(b.get(i), Some(b'e' | b'E')) {
+            let mut k = i + 1;
+            if matches!(b.get(k), Some(b'-' | b'+')) {
+                k += 1;
+            }
+            if digit(k) {
+                while digit(k) {
+                    k += 1;
+                }
+                i = k;
+            }
+        }
+        f(Token::Number(
+            b.get(start..i)
+                .and_then(|t| std::str::from_utf8(t).ok())
+                .and_then(|t| t.parse::<f64>().ok())
+                .unwrap_or(f64::INFINITY),
+        ));
+    }
+}
+
+/// textPath の参照先の図形が usvg で path になったときの、点（制御点を含む）の座標の大きさの上限（その図形自身の transform と
+/// transform-origin を含む。祖先の変形は usvg も使わない）。path・rect・circle・ellipse・line・polyline・polygon のほかは
+/// path にならない（textPath は字を並べない）ので 0。長さの割合は `viewport` の割合、CSS の transform は無限大。
+pub(crate) fn shape_extent(n: &SvgNode<'_, '_>, viewport: f64, css_transform: bool) -> f64 {
+    let len = |name: &str| attr(n, name).map_or(0.0, |v| length_bound(v, viewport));
+    let geometry = match n.tag_name().name() {
+        "path" => attr(n, "d").map_or(0.0, path_extent),
+        "rect" => len("x") + len("y") + len("width") + len("height"),
+        "circle" => len("cx") + len("cy") + 2.0 * len("r"),
+        "ellipse" => len("cx") + len("cy") + 2.0 * (len("rx") + len("ry")),
+        "line" => len("x1") + len("y1") + len("x2") + len("y2"),
+        "polyline" | "polygon" => attr(n, "points").map_or(0.0, points_extent),
+        _ => return 0.0,
+    };
+    if css_transform || attr(n, "style").is_some_and(|s| s.contains("transform")) {
+        return f64::INFINITY;
+    }
+    let (s, mut t) = attr(n, "transform").map_or((1.0, 0.0), transform_bound);
+    // transform-origin は、変形を translate(o) · T · translate(−o) にする（平行移動が (s + 1)|o| 増える）
+    if let (Some(_), Some(o)) = (attr(n, "transform"), attr(n, "transform-origin")) {
+        let origin: f64 = o
+            .split(|c: char| is_xml_space(c) || c == ',')
+            .filter(|t| !t.is_empty())
+            .map(|t| match t {
+                "left" | "center" | "right" | "top" | "bottom" => viewport,
+                _ => length_bound(t, viewport),
+            })
+            .sum();
+        t += (s + 1.0) * origin;
+    }
+    let e = s * geometry + t;
+    if e.is_nan() { f64::INFINITY } else { e }
 }
 
 /// viewBox の拡大の上限（表示の領域の長さ ÷ viewBox の短い辺）。viewBox がなければ 1、読めなければ無限大。
@@ -329,32 +573,54 @@ fn view_box_scale(n: &SvgNode<'_, '_>, viewport: f64) -> f64 {
     }
 }
 
-/// 根の svg の大きさ（素直な数か px）。なければ None、ほかの単位・割合は分からない（UNKNOWN_VIEWPORT）。
+/// 根の svg の大きさの上限（幅と高さの大きい方）。どちらもなければ None（usvg は viewBox の大きさで描くので拡大しない）。
+/// 割合は viewBox の長い辺の割合（usvg と同じ）、em・ex・読めない値は無限大。
 fn root_viewport(n: &SvgNode<'_, '_>) -> Option<f64> {
-    let len = |name: &str| {
-        attr(n, name).map(|v| {
-            let v = v.trim();
-            let v = v.strip_suffix("px").unwrap_or(v);
-            if plain_number(v) {
-                v.parse::<f64>().map_or(UNKNOWN_VIEWPORT, f64::abs)
-            } else {
-                UNKNOWN_VIEWPORT
-            }
-        })
-    };
-    match (len("width"), len("height")) {
-        (None, None) => None,
-        (w, h) => Some(crate::math::max(
-            w.unwrap_or(UNKNOWN_VIEWPORT),
-            h.unwrap_or(UNKNOWN_VIEWPORT),
-        )),
+    let vb = attr(n, "viewBox").map_or(100.0, |v| {
+        v.split(|c: char| is_xml_space(c) || c == ',')
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse::<f64>().ok())
+            .skip(2)
+            .fold(0.0, |a, x| crate::math::max(a, x.abs()))
+    });
+    let (w, h) = (attr(n, "width"), attr(n, "height"));
+    if w.is_none() && h.is_none() {
+        return None;
+    }
+    Some(
+        [w, h]
+            .into_iter()
+            .map(|v| v.map_or(vb, |v| length_bound(v, vb)))
+            .fold(0.0, crate::math::max),
+    )
+}
+
+/// [`own_scale`] が文書全体から受け取るもの。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScaleContext {
+    /// `<style>` に transform が書かれている（どの要素にも当たりうる）。
+    pub css_transform: bool,
+    /// 表示の領域（入れ子の svg・use の symbol・pattern のタイル）の大きさの上限（[`viewport_size`] の最大と
+    /// [`UNKNOWN_VIEWPORT`] の大きい方）。
+    pub viewport: f64,
+    /// pattern の viewBox の拡大のいちばん大きいもの（viewBox は href の先から受け継ぐので、自分の viewBox のない pattern に使う）。
+    pub pattern_view_box: f64,
+}
+
+/// pattern の viewBox の拡大の上限（受け継がない分）。[`ScaleContext::pattern_view_box`] を作るのに使う。
+pub(crate) fn pattern_view_box_scale(n: &SvgNode<'_, '_>, viewport: f64) -> f64 {
+    if n.tag_name().name() == "pattern" {
+        view_box_scale(n, viewport)
+    } else {
+        1.0
     }
 }
 
-/// 要素がその中身に掛ける拡大の上限（transform・pattern の patternTransform と viewBox・単位が objectBoundingBox の中身・
-/// svg と symbol の viewBox）。`css_transform` は `<style>` に transform が書かれているとき（どの要素にも当たりうる）。
-pub(crate) fn own_scale(n: &SvgNode<'_, '_>, is_root: bool, css_transform: bool) -> f64 {
-    if css_transform || attr(n, "style").is_some_and(|s| s.contains("transform")) {
+/// 要素がその中身の文字のレイアウトに掛ける拡大の上限（transform・pattern の patternTransform と viewBox・svg と symbol の
+/// viewBox）。中身の単位が objectBoundingBox の pattern・clipPath・mask は無限大（mask の中身は、マスクする要素の外接矩形の
+/// 大きさで並べる。外接矩形は中の変形と座標で大きくできるので上限が決まらない。検証のあとの確認 R1）。
+pub(crate) fn own_scale(n: &SvgNode<'_, '_>, is_root: bool, cx: &ScaleContext) -> f64 {
+    if cx.css_transform || attr(n, "style").is_some_and(|s| s.contains("transform")) {
         return f64::INFINITY;
     }
     let mut s = attr(n, "transform").map_or(1.0, transform_scale);
@@ -362,18 +628,22 @@ pub(crate) fn own_scale(n: &SvgNode<'_, '_>, is_root: bool, css_transform: bool)
     match n.tag_name().name() {
         "pattern" => {
             s *= attr(n, "patternTransform").map_or(1.0, transform_scale);
-            s *= view_box_scale(n, UNKNOWN_VIEWPORT);
+            s *= if attr(n, "viewBox").is_none() && n.attributes().any(|a| a.name() == "href") {
+                cx.pattern_view_box
+            } else {
+                view_box_scale(n, cx.viewport)
+            };
             if obb("patternContentUnits") {
-                s *= OBB_SCALE;
+                s = f64::INFINITY;
             }
         }
-        "clipPath" if obb("clipPathUnits") => s *= OBB_SCALE,
-        "mask" if obb("maskContentUnits") => s *= OBB_SCALE,
+        "clipPath" if obb("clipPathUnits") => s = f64::INFINITY,
+        "mask" if obb("maskContentUnits") => s = f64::INFINITY,
         "svg" if is_root => match root_viewport(n) {
             Some(v) if attr(n, "viewBox").is_some() => s *= view_box_scale(n, v),
             _ => {}
         },
-        "svg" | "symbol" => s *= view_box_scale(n, UNKNOWN_VIEWPORT),
+        "svg" | "symbol" => s *= view_box_scale(n, cx.viewport),
         _ => {}
     }
     s
@@ -605,6 +875,100 @@ mod tests {
         assert!(transform_scale("scale(2) bogus(1)").is_infinite());
         assert!(transform_scale("scale(").is_infinite());
         assert!(transform_scale("scale(1e400)").is_infinite());
+    }
+
+    /// 検証のあとの確認 R1：変形の平行移動・長さの単位・path の座標・表示の領域の大きさの上限。
+    #[test]
+    fn extents_are_upper_bounds() {
+        assert_eq!(transform_bound(""), (1.0, 0.0));
+        assert_eq!(transform_bound("translate(3 -4)"), (1.0, 7.0));
+        // 左ほど外側：scale(2) translate(5) は p ↦ 2p + 10
+        assert_eq!(transform_bound("scale(2) translate(5)"), (2.0, 10.0));
+        assert_eq!(transform_bound("translate(5) scale(2)"), (2.0, 5.0));
+        assert_eq!(transform_bound("matrix(1 0 0 1 1e9 1e9)"), (2.0, 2e9));
+        assert_eq!(transform_bound("rotate(90 10 20)"), (1.0, 60.0));
+        // 1 より小さい拡大も、そのまま（座標を小さくする）
+        assert_eq!(transform_bound("scale(1e-9)"), (1e-9, 0.0));
+        assert!(transform_bound("scale(").0.is_infinite());
+        assert_eq!(length_bound("12", 1.0), 12.0);
+        assert_eq!(length_bound(" -3px ", 1.0), 3.0);
+        assert_eq!(length_bound("1in", 1.0), 96.0);
+        assert_eq!(length_bound("1e9in", 1.0), 96e9);
+        assert_eq!(length_bound("50%", 200.0), 100.0);
+        assert_eq!(length_bound("0em", 1.0), 0.0);
+        for v in ["1em", "2ex", "1e9em", "auto", "", "px", "1vw", "--1"] {
+            assert!(length_bound(v, 1.0).is_infinite(), "{v}");
+        }
+        // 絶対の命令は最大、相対の命令は和（相対の命令で重ねた座標を見落とさない）
+        assert_eq!(path_extent("M0 0 L5 6 L-7 2"), 7.0 * 4.0);
+        assert_eq!(
+            path_extent(&format!("M0 0{}", " l1e9 1e9".repeat(1_000))),
+            2e12 * 4.0
+        );
+        assert_eq!(path_extent("M10 10 l1 -2 L3 4"), (10.0 + 3.0) * 4.0);
+        // T の連続は、続く数で制御点が遠くなる
+        assert_eq!(
+            path_extent(&format!("M0 0 Q1 1 1 0{}", " T0 0 T1 0".repeat(10))),
+            41.0
+        );
+        assert_eq!(
+            path_extent("M0 0 Q1 1 1 0 T0 0 L0 0 T1 0"),
+            4.0,
+            "T は続く間だけ"
+        );
+        // 区切りのない弧の印（01）は大きな数として読む（小さく読み違えない）
+        assert!(path_extent("M0 0 a25 25 0 0150 50") >= (25.0 + 25.0 + 50.0 + 50.0) * 4.0);
+        let shape = |s: &str| {
+            let text = format!(r#"<svg xmlns="http://www.w3.org/2000/svg">{s}</svg>"#);
+            let d = usvg::roxmltree::Document::parse(&text).unwrap();
+            let n = d
+                .descendants()
+                .find(|n| n.attribute("id") == Some("p"))
+                .unwrap();
+            shape_extent(&n, 1e9, false)
+        };
+        assert_eq!(shape(r#"<path id="p" d="M0 0 L5 6"/>"#), 24.0);
+        assert_eq!(
+            shape(r#"<path id="p" d="M0 0 L5 6" transform="scale(1e9) scale(1e9)"/>"#),
+            24e18
+        );
+        assert_eq!(
+            shape(r#"<rect id="p" x="1" y="2" width="1in" height="3"/>"#),
+            102.0
+        );
+        assert_eq!(shape(r#"<circle id="p" cx="1" cy="2" r="3"/>"#), 9.0);
+        assert_eq!(shape(r#"<polygon id="p" points="1,-7 3,4"/>"#), 14.0);
+        assert_eq!(shape(r#"<use id="p" href="x" width="1e9em"/>"#), 0.0);
+        assert!(shape(r#"<rect id="p" width="1e9em" height="1"/>"#).is_infinite());
+        assert!(shape(r#"<path id="p" d="M0 0 L1 1" style="transform:scale(2)"/>"#).is_infinite());
+        // transform-origin は、変形があるときだけ平行移動を足す（(s + 1)|o|）
+        assert_eq!(
+            shape(r#"<path id="p" d="M0 0 L1 1" transform="scale(2)" transform-origin="10 20"/>"#),
+            2.0 * 4.0 + 3.0 * 30.0
+        );
+        assert_eq!(
+            shape(r#"<path id="p" d="M0 0 L1 1" transform-origin="1e9em 0"/>"#),
+            4.0
+        );
+        assert!(
+            shape(r#"<path id="p" d="M0 0 L1 1" transform="scale(2)" transform-origin="1em 0"/>"#)
+                .is_infinite()
+        );
+        // 表示の領域を広げうる大きさ：100% までの割合は広げない、em・100% を超える割合は分からない
+        let vp = |s: &str| {
+            let text = format!(r#"<svg xmlns="http://www.w3.org/2000/svg">{s}</svg>"#);
+            let d = usvg::roxmltree::Document::parse(&text).unwrap();
+            let n = d
+                .descendants()
+                .find(|n| n.attribute("id") == Some("v"))
+                .unwrap();
+            viewport_size(&n)
+        };
+        assert_eq!(vp(r#"<svg id="v" width="100%" height="50%"/>"#), 0.0);
+        assert_eq!(vp(r#"<use id="v" width="2in" height="3"/>"#), 192.0);
+        assert_eq!(vp(r#"<rect id="v" width="1e9em"/>"#), 0.0);
+        assert!(vp(r#"<svg id="v" width="101%"/>"#).is_infinite());
+        assert!(vp(r#"<pattern id="v" width="1em"/>"#).is_infinite());
     }
 
     #[test]
