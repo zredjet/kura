@@ -1081,6 +1081,8 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
     let mut css_markers = false;
     // `<style>` に transform が書かれているか（どの要素の拡大にもなりうる。textPath の見積もり）
     let mut css_transform = false;
+    // 表示の領域の大きさの上限（textPath の見積もり。単位のある幅・高さで広がる）
+    let mut viewport = svg_text::UNKNOWN_VIEWPORT;
     let mut count = 0usize;
     let mut elements = 0u64;
     // CSS の手間の見積もりに使う：要素名・クラスごとの数、文書の深さ・兄弟の最大数、style 属性の宣言の手間
@@ -1110,6 +1112,7 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
         }
         // 数の大きさ（SVG の要素の、名前空間のないか SVG の属性。名前・参照の属性は読まない）
         if n.tag_name().namespace() == Some(SVG_NS) {
+            viewport = crate::math::max(viewport, svg_text::viewport_size(&n));
             for a in n.attributes() {
                 if !matches!(a.namespace(), None | Some(SVG_NS)) {
                     continue;
@@ -1279,6 +1282,35 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
             .max()
             .unwrap_or(0)
     };
+    // textPath の参照先の座標の大きさの上限（同じ id の図形のいちばん大きいもの。id ごとに 1 度だけ数える）
+    let ext_memo: std::cell::RefCell<std::collections::BTreeMap<String, f64>> =
+        std::cell::RefCell::new(std::collections::BTreeMap::new());
+    let extent = |tp: &SvgNode<'_, '_>| -> f64 {
+        tp.attributes()
+            .filter(|a| a.name() == "href")
+            .filter_map(|a| href_id(a.value()))
+            .map(|id| {
+                if let Some(e) = ext_memo.borrow().get(id) {
+                    return *e;
+                }
+                let e = index
+                    .targets(id)
+                    .map(|t| svg_text::shape_extent(&t, viewport, css_transform))
+                    .fold(0.0, crate::math::max);
+                ext_memo.borrow_mut().insert(id.to_string(), e);
+                e
+            })
+            .fold(0.0, crate::math::max)
+    };
+    let scale_cx = svg_text::ScaleContext {
+        css_transform,
+        viewport,
+        pattern_view_box: doc
+            .descendants()
+            .filter(|n| n.is_element())
+            .map(|n| svg_text::pattern_view_box_scale(&n, viewport))
+            .fold(1.0, crate::math::max),
+    };
     let mut own_text = vec![0u64; count];
     let mut reshape = 0u64;
     for t in doc
@@ -1292,9 +1324,11 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
         reshape = reshape.max(c.reshape);
     }
     // 帰りがけの順に、要素の数（use の展開と参照ごとの複製を含む）・複製で作る要素の数・高さ（参照の展開を含む）・文字の
-    // レイアウトの手間（同じ）・textPath に至る変形の拡大の上限（参照の先のいちばん大きいもの × 自分の拡大）を求める。輪は断る
+    // レイアウトの手間（同じ）・textPath に至る変形の拡大の上限（参照の先のいちばん大きいもの × 自分の拡大）と、textPath の
+    // 弧長の精度の比の上限（12 × 参照先の座標の上限から始めて、同じく拡大を掛ける。1 より小さい拡大は 1）を求める。輪は断る
     let mut text_work = vec![0u64; count];
     let mut path_scale = vec![0f64; count];
+    let mut path_range = vec![0f64; count];
     let mut state = vec![0u8; count];
     let mut size = vec![0u64; count];
     let mut clones = vec![0u64; count];
@@ -1325,10 +1359,19 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
         let i = at(n);
         let (mut total, mut h, mut cloned) = (1u64, 0usize, 0u64);
         let mut tw = own_text[i];
-        let mut ps = if n.tag_name().name() == "textPath" {
-            1.0
+        let (mut ps, mut pr) = if n.tag_name().name() == "textPath" {
+            // 座標の上限が NaN になることはない（shape_extent が無限大にする）が、念のため上限の側に倒す
+            let e = extent(n);
+            (
+                1.0,
+                if e.is_nan() {
+                    f64::INFINITY
+                } else {
+                    svg_text::TEXT_PATH_RANGE_FACTOR * e
+                },
+            )
         } else {
-            0.0
+            (0.0, 0.0)
         };
         for (s, kind) in succ.iter() {
             if *kind >= EDGE_COUNT {
@@ -1342,13 +1385,20 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
             h = h.max(height[at(s)]);
             // 共有の参照（EDGE_LINK）の先も、参照する要素の拡大を受けるとみなす（多めに取る）
             ps = crate::math::max(ps, path_scale[at(s)]);
+            pr = crate::math::max(pr, path_range[at(s)]);
         }
         size[i] = total;
         clones[i] = cloned;
         height[i] = h + 1;
         text_work[i] = tw;
-        path_scale[i] = if ps > 0.0 {
-            ps * svg_text::own_scale(n, *n == root, css_transform)
+        let own = if ps > 0.0 || pr > 0.0 {
+            svg_text::own_scale(n, *n == root, &scale_cx)
+        } else {
+            1.0
+        };
+        path_scale[i] = if ps > 0.0 { ps * own } else { 0.0 };
+        path_range[i] = if pr > 0.0 {
+            pr * crate::math::max(own, 1.0)
         } else {
             0.0
         };
@@ -1375,9 +1425,16 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
     }
     let mut total = size[at(&root)];
     let mut total_text = text_work[at(&root)];
-    if path_scale[at(&root)] > svg_text::MAX_TEXT_PATH_SCALE {
+    // NaN は超えたとみなす
+    let over = |x: f64, max: f64| x.is_nan() || x > max;
+    if over(path_scale[at(&root)], svg_text::MAX_TEXT_PATH_SCALE) {
         return Err(EngineError::Limit(
             "textPath を大きく拡大する SVG は読めません".into(),
+        ));
+    }
+    if over(path_range[at(&root)], svg_text::MAX_TEXT_PATH_RANGE) {
+        return Err(EngineError::Limit(
+            "textPath の拡大と参照する図形の座標が大きすぎる（弧長の精度が足りない）SVG は読めません".into(),
         ));
     }
     // marker の複製：頂点の数 × marker の中身の大きさ（CSS で付くものは、いちばん大きい marker とみなす）。文字の手間も同じ
@@ -1424,12 +1481,17 @@ fn text_limit() -> EngineError {
 }
 
 impl SvgCodec {
-    fn tree(&self, text: &str) -> Result<usvg::Tree, EngineError> {
+    /// 木と、文字の手間の残り（描く前の見積もりで、文字の輪郭の描き直しに使う）。
+    fn tree(&self, text: &str) -> Result<(usvg::Tree, u64), EngineError> {
         self.tree_within(text, svg_text::MAX_TEXT_WORK)
     }
 
     /// 文字のレイアウトの手間を `max_text_work` までにして木を作る（テストは小さな上限で、フォントを選ぶ分の見張りを確かめる）。
-    fn tree_within(&self, text: &str, max_text_work: u64) -> Result<usvg::Tree, EngineError> {
+    fn tree_within(
+        &self,
+        text: &str,
+        max_text_work: u64,
+    ) -> Result<(usvg::Tree, u64), EngineError> {
         check_entities(text)?;
         check_depth(text)?;
         let facts = check_elements(text)?;
@@ -1474,7 +1536,7 @@ impl SvgCodec {
                 "画像（埋め込みの SVG・ラスター画像・外部のファイル）を含む SVG は、この段では読めません".into(),
             ));
         }
-        Ok(tree)
+        Ok((tree, guard.left()))
     }
 }
 
@@ -1486,10 +1548,132 @@ const MAX_RENDER_NODES: u64 = 1 << 22;
 /// ファズで見つけた）。ふつうの SVG の座標は、はみ出すものでもキャンバスの数倍ほど。
 const MAX_EXTENT: f32 = 1e8;
 
-/// 描く前にたどる木の項目（グループか図形）。変形・根からの道筋で同時に生きる一時の画像のバイト数・描く面の大きさ（画素）と組にして積む。
+/// 図形の点ごとの描く手間（辺を作る・並べ替える。画素と同じ単位で、M4 Max の release の 1 ns ほど）。検証のあとの確認 R3：
+/// 小さな字の輪郭を pattern に描くと 1 点 21 ns、和文 32 ns（行の分を除く）。直す前は 1 点 1 単位で、文字の pattern を
+/// 2,000 回参照して 12 秒、大きな曲線の pattern を 4 万回参照して 13 分かかるものを受け付けていた。
+const POINT_WORK: u64 = 20;
+/// 辺が覆う行ごとの手間（tiny-skia は 1 行を縦に 4 つに分けて辺を進める）。タイルいっぱいの曲線で、区間の制御点の縦の幅 ×
+/// 次数（直線 1・2 次 2・3 次 3）の 1 行あたり 2.8〜3.4 ns。
+const ROW_WORK: u64 = 4;
+/// 線（stroke）は外形の両側と継ぎ目を描く：塗りの点と行の 4 倍と、区間ごとに継ぎ目の点と線の太さの行を足す（太さ 8 の
+/// 大きな曲線で、塗りの 5 倍の時間だった）。
+const STROKE_FACTOR: u64 = 4;
+/// 区間ごとの継ぎ目の点（丸い継ぎ目は 2 次の曲線 4 つ）。
+const JOIN_POINTS: u64 = 8;
+/// 破線 1 本の点（両側と端）。細かい破線は 1 本の path が数十万本になる（64 画素の線を 0.0001 の破線にして 14.5 ms・
+/// 1 本 32 ns）。tiny-skia は 1 本の path に 100 万本を超える破線を作らない。
+const DASH_POINTS: u64 = 4;
+const MAX_DASHES: f64 = 1e6;
+
+/// 描く前にたどる木の項目（グループか図形）。変形・根からの道筋で同時に生きる一時の画像のバイト数・描く面の大きさ（画素）・
+/// 文字の輪郭の 2 度目からの描き直しか と組にして積む。
 enum Visit<'t> {
     Group(&'t usvg::Group),
     Node(&'t usvg::Node),
+}
+
+/// 積む項目：(たどるもの, 変形, 同時に生きる一時の画像のバイト数, 描く面の大きさ, 文字の輪郭の描き直しか)。
+type Visiting<'t> = (Visit<'t>, tiny_skia::Transform, u64, (u64, u64), bool);
+
+/// path の、変形によらない数（参照ごとに数え直さないように、path ごとに 1 度だけ求める）。
+#[derive(Debug, Clone, Copy, Default)]
+struct PathStats {
+    /// 点の数（制御点を含む）。
+    points: u64,
+    /// 区間の数（閉じる線を含む）。
+    segs: u64,
+    /// 区間の次数の和（直線 1・2 次 2・3 次 3。辺は単調な区間に分けると次数の数まで）。
+    order: u64,
+    /// 区間ごとの、制御点の外接矩形の幅 ＋ 高さ × 次数の和（変形の拡大を掛けると、辺が覆う行の数の上限。区間の長さの上限
+    /// でもある）。
+    extent: f64,
+}
+
+fn path_stats(p: &tiny_skia::Path) -> PathStats {
+    let mut st = PathStats {
+        points: p.points().len() as u64,
+        ..PathStats::default()
+    };
+    let (mut last, mut start) = (
+        tiny_skia::Point::from_xy(0.0, 0.0),
+        tiny_skia::Point::from_xy(0.0, 0.0),
+    );
+    let mut add = |pts: &[tiny_skia::Point], order: u64| {
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for q in pts {
+            let (x, y) = (f64::from(q.x), f64::from(q.y));
+            x0 = crate::math::min(x0, x);
+            y0 = crate::math::min(y0, y);
+            x1 = crate::math::max(x1, x);
+            y1 = crate::math::max(y1, y);
+        }
+        st.segs += 1;
+        st.order += order;
+        st.extent += order as f64 * ((x1 - x0) + (y1 - y0));
+    };
+    for seg in p.segments() {
+        match seg {
+            tiny_skia::PathSegment::MoveTo(a) => {
+                last = a;
+                start = a;
+            }
+            tiny_skia::PathSegment::LineTo(a) => {
+                add(&[last, a], 1);
+                last = a;
+            }
+            tiny_skia::PathSegment::QuadTo(b, a) => {
+                add(&[last, b, a], 2);
+                last = a;
+            }
+            tiny_skia::PathSegment::CubicTo(b, c, a) => {
+                add(&[last, b, c, a], 3);
+                last = a;
+            }
+            tiny_skia::PathSegment::Close => {
+                add(&[last, start], 1);
+                last = start;
+            }
+        }
+    }
+    st
+}
+
+/// 浮動小数の手間を整数にする（無限・NaN は u64 の最大）。
+fn work_of(x: f64) -> u64 {
+    if x.is_finite() && x >= 0.0 {
+        crate::math::min(x, u64::MAX as f64) as u64
+    } else {
+        u64::MAX
+    }
+}
+
+/// path を 1 度描く手間（点と辺が覆う行。面積は別に数える）。`ts` は描くときの変形、`surf_h` は描く面の高さ（画素）。
+fn path_work(path: &usvg::Path, st: &PathStats, ts: tiny_skia::Transform, surf_h: u64) -> u64 {
+    // 変形の拡大の上限（行列のフロベニウスのノルム）
+    let s = [ts.sx, ts.kx, ts.ky, ts.sy]
+        .iter()
+        .map(|v| f64::from(*v) * f64::from(*v))
+        .sum::<f64>()
+        .sqrt();
+    let surf_h = surf_h as f64;
+    let rows = crate::math::min(s * st.extent, st.order as f64 * surf_h);
+    let (mut points, mut rows) = (st.points as f64, rows);
+    if let Some(stroke) = path.stroke() {
+        let width = crate::math::min(f64::from(stroke.width().get()) * s, surf_h);
+        let dashes = stroke.dasharray().map_or(0.0, |a| {
+            let interval: f64 = a.iter().map(|x| f64::from(*x)).sum();
+            if interval > 0.0 {
+                crate::math::min(st.extent * (a.len() / 2) as f64 / interval, MAX_DASHES).ceil()
+            } else {
+                0.0
+            }
+        });
+        points += STROKE_FACTOR as f64 * st.points as f64
+            + JOIN_POINTS as f64 * st.segs as f64
+            + DASH_POINTS as f64 * dashes;
+        rows += STROKE_FACTOR as f64 * rows + (st.segs as f64 + 2.0 * dashes) * width;
+    }
+    work_of(POINT_WORK as f64 * points + ROW_WORK as f64 * rows)
 }
 
 /// 長さ（画素）を整数にする。無限・負は `max`。
@@ -1559,12 +1743,19 @@ fn primitive_work(p: &usvg::filter::Primitive, lw: u64, lh: u64, sx: f32, sy: f3
 /// (1) 根からの道筋ごとに同時に生きる一時の画像（層・mask と clip の画像・フィルタの結果・pattern のタイル）の合計が、絶対の予算
 /// （`limits.max_value_bytes`）を超えるもの。resvg の層は 1 枚がキャンバスの 25 倍（(-2w,-2h,5w,5h)）まで広がり、入れ子の層は
 /// 同時に生きる。フィルタはプリミティブの結果をすべて最後まで持ち、pattern のタイルには上限がない。
-/// (2) 描く手間（画素の数：図形の外接矩形と描く面の小さい方・層の合成・フィルタのプリミティブ）の合計が上限を超えるもの。
-/// resvg の描画は途中で止められないので、手間で時間を抑える。
+/// (2) 描く手間（画素の数：図形の外接矩形と描く面の小さい方・層の合成・フィルタのプリミティブ。図形の点と辺が覆う行・線・
+/// 破線（[`path_work`]））の合計が上限を超えるもの。resvg の描画は途中で止められないので、手間で時間を抑える。
 /// (3) 変形のあとの座標が `MAX_EXTENT` を超える図形。
-/// 木（mask・clipPath・フィルタの feImage・文字の輪郭・pattern の中身も。pattern は参照ごとに）は再帰せずにたどる。
-/// 変形の倍率は平行移動によらないので、層のずらしは見ない。
-fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<(), EngineError> {
+/// 木（mask・clipPath・フィルタの feImage・文字の輪郭・pattern の中身も。pattern・mask・clip は参照ごとに）は再帰せずにたどる。
+/// 変形の倍率は平行移動によらないので、層のずらしは見ない。文字の輪郭を 2 度目から描き直す手間は、文字のレイアウトの残りの
+/// 手間 `text_left` から引き、尽きたら `Limit`（文字の手間の上限の 1 件 100 ms ほどに入れる。検証のあとの確認 R3）。
+fn check_render(
+    tree: &usvg::Tree,
+    w: u32,
+    h: u32,
+    limits: &Limits,
+    text_left: u64,
+) -> Result<(), EngineError> {
     let (cw, ch) = (u64::from(w), u64::from(h));
     let max_bytes = limits.max_value_bytes;
     let max_work = cw
@@ -1574,14 +1765,21 @@ fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<()
     let too_much =
         |what: &str| EngineError::Unsupported(format!("{what}が大きすぎる SVG は読めません"));
     let mut work = 0u64;
+    // 文字の輪郭の 2 度目からの描き直しの手間（文字の手間の残り `text_left` から引く）
+    let mut text_redraw = 0u64;
+    // 見た文字（2 度目からは描き直し）と、path ごとの変形によらない数。参照で共有される節を見分けるだけなので
+    // 番地で引く（結果は番地によらない）
+    let mut seen_text: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut stats: std::collections::BTreeMap<usize, PathStats> = std::collections::BTreeMap::new();
     let mut visited = 0u64;
-    let mut stack: Vec<(Visit<'_>, tiny_skia::Transform, u64, (u64, u64))> = vec![(
+    let mut stack: Vec<Visiting<'_>> = vec![(
         Visit::Group(tree.root()),
         tiny_skia::Transform::default(),
         0,
         (cw, ch),
+        false,
     )];
-    while let Some((visit, parent, live, surf)) = stack.pop() {
+    while let Some((visit, parent, live, surf, redraw)) = stack.pop() {
         visited += 1;
         if visited > MAX_RENDER_NODES {
             return Err(EngineError::Limit("描く要素が多すぎます".into()));
@@ -1634,17 +1832,28 @@ fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<()
                     surf = (lw, lh);
                     // mask・clip・feImage の中身は、層と同じ道筋（同じ一時の画像を持ったまま）で描く
                     for (root, t) in inner {
-                        stack.push((Visit::Group(root), t, live, surf));
+                        stack.push((Visit::Group(root), t, live, surf, redraw));
                     }
                 }
                 for n in g.children() {
-                    stack.push((Visit::Node(n), ts, live, surf));
+                    stack.push((Visit::Node(n), ts, live, surf, redraw));
                 }
             }
             Visit::Node(node) => match node {
-                usvg::Node::Group(g) => stack.push((Visit::Group(g.as_ref()), parent, live, surf)),
+                usvg::Node::Group(g) => {
+                    stack.push((Visit::Group(g.as_ref()), parent, live, surf, redraw))
+                }
                 usvg::Node::Text(text) => {
-                    stack.push((Visit::Group(text.flattened()), parent, live, surf))
+                    // 文字の輪郭を 1 度描く分は、字ごとの手間（svg_text の CHAR_WORK）に入っている。pattern・clipPath・
+                    // mask の中身として 2 度目からたどるものは描き直し
+                    let again = !seen_text.insert(std::ptr::from_ref(text.as_ref()) as usize);
+                    stack.push((
+                        Visit::Group(text.flattened()),
+                        parent,
+                        live,
+                        surf,
+                        redraw || again,
+                    ))
                 }
                 usvg::Node::Image(_) => {}
                 usvg::Node::Path(path) => {
@@ -1666,9 +1875,17 @@ fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<()
                         return Err(too_much("図形の座標"));
                     }
                     let area = span(b.width(), surf.0).saturating_mul(span(b.height(), surf.1));
-                    work = work
-                        .saturating_add(area)
-                        .saturating_add(path.data().points().len() as u64);
+                    let st = *stats
+                        .entry(std::ptr::from_ref(path.data()) as usize)
+                        .or_insert_with(|| path_stats(path.data()));
+                    let drawn = path_work(path, &st, ts, surf.1);
+                    work = work.saturating_add(area).saturating_add(drawn);
+                    if redraw {
+                        text_redraw = text_redraw.saturating_add(drawn);
+                        if text_redraw > text_left {
+                            return Err(text_limit());
+                        }
+                    }
                     let paints = [
                         path.fill().map(|f| f.paint()),
                         path.stroke().map(|s| s.paint()),
@@ -1702,6 +1919,7 @@ fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<()
                                 tiny_skia::Transform::from_scale(sx, sy),
                                 live,
                                 (tw, th),
+                                redraw,
                             ));
                         }
                     }
@@ -1749,9 +1967,9 @@ impl Decoder for SvgCodec {
         limits: &Limits,
     ) -> Result<Shape, EngineError> {
         let text = read_source(src)?;
-        let tree = self.tree(&text)?;
+        let (tree, text_left) = self.tree(&text)?;
         let (w, h) = size_of(&tree, limits)?;
-        check_render(&tree, w, h, limits)?;
+        check_render(&tree, w, h, limits, text_left)?;
         Ok(Shape::Image {
             w: Dim::Exact(u64::from(w)),
             h: Dim::Exact(u64::from(h)),
@@ -1768,9 +1986,9 @@ impl Decoder for SvgCodec {
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
         let text = read_source(src)?;
-        let tree = self.tree(&text)?;
+        let (tree, text_left) = self.tree(&text)?;
         let (w, h) = size_of(&tree, limits)?;
-        check_render(&tree, w, h, limits)?;
+        check_render(&tree, w, h, limits, text_left)?;
         limits
             .check(&Shape::Image {
                 w: Dim::Exact(u64::from(w)),
@@ -2056,6 +2274,127 @@ mod tests {
             decode_with(&c, &marker),
             Err(EngineError::Unsupported(_))
         ));
+    }
+
+    /// 検証のあとの確認 R1：弧長の精度の比（参照先の区間の長さ ÷ usvg の精度 0.5 ÷ 拡大）が f64 で足りなくなる形は、
+    /// usvg に入る前（XML の木の見積もり）に断る。直す前は、どれも kurbo の弧長の逆引きが終わらずに止まった（拡大の積に
+    /// 参照先の transform と座標の大きさが入っていなかった）。見積もれない大きさ（em・100% を超える割合・transform-origin）も断る。
+    #[test]
+    fn text_path_precision_is_bounded() {
+        let c = text_codec();
+        let tp = r##"<text><textPath href="#p">A</textPath></text>"##;
+        let curve = "M0 0 C1 2 3 4 5 6";
+        let doc = |defs: &str, body: &str| text_svg(&format!("<defs>{defs}</defs>{body}"));
+        let refused = [
+            // (a) 参照先の path 自身の transform（祖先ではないので、textPath に至る拡大に入らなかった）
+            doc(
+                &format!(r#"<path id="p" transform="scale(1e9) scale(1e9)" d="{curve}"/>"#),
+                tp,
+            ),
+            // 同じ形で startOffset の割合（usvg は path の長さを精度 0.5 で測る）
+            doc(
+                &format!(
+                    r#"<path id="p" transform="scale(1e9) scale(1e9) scale(1e2)" d="{curve}"/>"#
+                ),
+                r##"<text><textPath href="#p" startOffset="50%">A</textPath></text>"##,
+            ),
+            // (b) 許される祖先の拡大（10¹²）と大きな座標（数は 10⁹ まで）
+            doc(
+                r#"<path id="p" d="M0 0 C1e9 2e8 3e8 4e8 5e8 6e8"/>"#,
+                &format!(r#"<g transform="scale(1e6) scale(1e6)">{tp}</g>"#),
+            ),
+            // 相対の命令で座標を重ねる（1 つずつの数は小さい）
+            doc(
+                &format!(
+                    r#"<path id="p" d="M0 0{} c1 2 3 4 5 6"/>"#,
+                    " l1e9 1e9".repeat(1_000)
+                ),
+                &format!(r#"<g transform="scale(1e3)">{tp}</g>"#),
+            ),
+            // mask の中身が objectBoundingBox：中身の拡大はマスクする要素の外接矩形（中で拡大した図形で大きくできる）
+            doc(
+                &format!(
+                    r#"<path id="p" d="{curve}"/><mask id="m" maskContentUnits="objectBoundingBox">{tp}</mask>"#
+                ),
+                r#"<g mask="url(#m)"><g transform="scale(1e9)"><rect width="1e9" height="1e9"/></g></g>"#,
+            ),
+            // 入れ子の svg の大きさの割合を重ねる（親の大きさの 10⁷ 倍を 3 段）
+            doc(
+                &format!(r#"<path id="p" d="{curve}"/>"#),
+                &format!(
+                    r#"<svg width="1e9%" height="1e9%"><svg width="1e9%" height="1e9%"><svg width="1e9%" height="1e9%" viewBox="0 0 1 1">{tp}</svg></svg></svg>"#
+                ),
+            ),
+            // 大きさの分からない単位：入れ子の svg・use の symbol・pattern の大きさの em（フォントの大きさは入れ子で掛け合わさる）
+            doc(
+                &format!(r#"<path id="p" d="{curve}"/>"#),
+                &format!(
+                    r#"<svg width="1e9em" height="1e9em" font-size="1e9" viewBox="0 0 1 1">{tp}</svg>"#
+                ),
+            ),
+            doc(
+                &format!(
+                    r#"<path id="p" d="{curve}"/><symbol id="s" viewBox="0 0 1 1">{tp}</symbol>"#
+                ),
+                r##"<use href="#s" width="1e9em" height="1e9em" font-size="1e9"/>"##,
+            ),
+            doc(
+                &format!(
+                    r#"<path id="p" d="{curve}"/><pattern id="q" patternUnits="userSpaceOnUse" width="1e9em" height="1e9em" font-size="1e9" viewBox="0 0 1 1">{tp}</pattern>"#
+                ),
+                r##"<rect width="64" height="64" fill="url(#q)"/>"##,
+            ),
+            // 参照先の em の大きさの図形と、transform-origin（em で大きな平行移動）
+            doc(
+                r#"<rect id="p" width="1e9em" height="1e9em" font-size="1e9"/>"#,
+                tp,
+            ),
+            doc(
+                &format!(
+                    r#"<path id="p" d="{curve}" transform="scale(2)" transform-origin="1e9em 1e9em" font-size="1e9"/>"#
+                ),
+                &format!(r#"<g transform="scale(1e6)">{tp}</g>"#),
+            ),
+            // in の単位の矩形（96 倍）
+            doc(
+                r#"<rect id="p" width="1e9in" height="1e9in"/>"#,
+                &format!(r#"<g transform="scale(1e4)">{tp}</g>"#),
+            ),
+            // T の反射は、続けるほど制御点が遠くなる
+            doc(
+                &format!(
+                    r#"<path id="p" d="M0 0 Q1e9 1e9 1e9 0{}"/>"#,
+                    " T0 0 T1e9 0".repeat(2_000)
+                ),
+                &format!(r#"<g transform="scale(1e3)">{tp}</g>"#),
+            ),
+        ];
+        for svg in &refused {
+            assert!(
+                matches!(check_elements(svg), Err(EngineError::Limit(_))),
+                "{svg}"
+            );
+            assert!(
+                matches!(decode_with(&c, svg), Err(EngineError::Limit(_))),
+                "{svg}"
+            );
+        }
+        // ふつうの textPath は読む：Inkscape 風（mm の大きさ・viewBox・startOffset の割合・path の matrix・弧）、Illustrator 風、
+        // 入れ子の svg（100%）・use の symbol・use 越し・大きめの座標の地図のラベル
+        let fine = [
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="210mm" height="297mm" viewBox="0 0 210 297" font-family="KuraTest"><g transform="translate(-12.3,-45.6)"><path id="path1" d="m 30,100 c 40,-50 100,-50 140,0 a 70 70 0 0 1 -140 0 z" transform="matrix(0.98 0.17 -0.17 0.98 5 6)" style="fill:none;stroke:#000"/><text style="font-size:10.5833px"><textPath xlink:href="#path1" startOffset="50%" style="text-anchor:middle">ABBA ABBA</textPath></text></g></svg>"##.to_string(),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="800" height="600" viewBox="0 0 800 600" font-family="KuraTest"><defs><path id="SVGID_1_" d="M101.5,300.5c0,0,150-200,300-100s300,0,300,0"/></defs><text transform="matrix(1 0 0 1 0 0)"><textPath xlink:href="#SVGID_1_" startOffset="10.5%"><tspan style="font-size:24px;">ABAB</tspan></textPath></text></svg>"##.to_string(),
+            doc(
+                r##"<path id="p" d="M5 30 Q32 0 59 30"/><symbol id="s" viewBox="0 0 64 64"><text font-size="6"><textPath href="#p">AB</textPath></text></symbol><g id="g"><text font-size="6"><textPath href="#p">BA</textPath></text></g>"##,
+                r##"<svg width="100%" height="100%" viewBox="0 0 128 128"><text font-size="6"><textPath href="#p">AB</textPath></text></svg><use href="#s" width="32" height="32"/><use href="#g" transform="scale(2)"/>"##,
+            ),
+            text_svg(
+                r##"<svg viewBox="0 0 2000000 1000000" width="64" height="32"><path id="road" d="M135000 520000 L136200 520400 L137900 521800 C138000 522000 139000 523000 140000 522500" transform="translate(-120000 -500000) scale(10)"/><text font-size="2000"><textPath href="#road">ABBA</textPath></text></svg>"##,
+            ),
+        ];
+        for svg in &fine {
+            assert!(decode_with(&c, svg).is_ok(), "{svg}");
+        }
     }
 
     /// 展開爆弾：入れ子の実体・実体の値の中の '>'・注釈の中の偽の DOCTYPE・use・marker の鎖・頂点の多い marker・巨大な大きさ。
@@ -2347,6 +2686,81 @@ mod tests {
             ),
         );
         assert!(decode(&fine).is_ok());
+    }
+
+    /// 検証のあとの確認 R3：pattern・clipPath・mask（userSpaceOnUse）の中身は参照ごとに描き直すので、描く前の見積もりは
+    /// 図形の点と辺が覆う行を参照ごとに、時間に合う重みで数える。文字の輪郭の描き直し（2 度目から）は文字の手間（1 件 100 ms
+    /// ほど。決定 20）に入れる。破線は 1 本ずつ数える。直す前は点を 1 点 1 単位で数え、どれも受け付けていた。
+    #[test]
+    fn redrawn_points_are_charged_per_reference() {
+        let c = text_codec();
+        let shape = |svg: &str| {
+            c.shape(
+                &mut Cursor::new(svg.as_bytes().to_vec()),
+                "svg",
+                &DecodeOptions::default(),
+                &Limits::default(),
+            )
+        };
+        let rects = |refs: usize, attr: &str| {
+            format!(r#"<rect width="10" height="10" {attr}/>"#).repeat(refs)
+        };
+        // 文字を pattern・clipPath・mask（userSpaceOnUse）に入れて多く参照する（確認の pat2 の形）
+        let a = "A".repeat(1_000);
+        let pat = |refs: usize| {
+            text_svg(&format!(
+                r#"<defs><pattern id="p" patternUnits="userSpaceOnUse" width="64" height="64"><text y="30">{a}</text></pattern></defs>{}"#,
+                rects(refs, r#"fill="url(#p)""#)
+            ))
+        };
+        let clip = |refs: usize| {
+            text_svg(&format!(
+                r#"<defs><clipPath id="c"><text y="30">{a}</text></clipPath></defs>{}"#,
+                rects(refs, r#"clip-path="url(#c)""#)
+            ))
+        };
+        let mask = |refs: usize| {
+            text_svg(&format!(
+                r##"<defs><mask id="m" maskUnits="userSpaceOnUse"><text y="30" fill="#fff">{a}</text></mask></defs>{}"##,
+                rects(refs, r#"mask="url(#m)""#)
+            ))
+        };
+        let docs: [&dyn Fn(usize) -> String; 3] = [&pat, &clip, &mask];
+        for doc in docs {
+            assert!(shape(&doc(1)).is_ok());
+            assert!(shape(&doc(100)).is_ok());
+            assert!(
+                matches!(shape(&doc(3_000)), Err(EngineError::Limit(_))),
+                "{}",
+                &doc(1)[..200]
+            );
+        }
+        // 文字のない大きな曲線（タイルいっぱい）の pattern を多く参照（直す前は 4 万参照で 13 分）
+        let curves = " C64 0 0 64 64 64 C0 64 64 0 0 0".repeat(2_000);
+        let big = |refs: usize| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><defs><pattern id="p" patternUnits="userSpaceOnUse" width="64" height="64"><path d="M0 0{curves}"/></pattern></defs>{}</svg>"#,
+                rects(refs, r#"fill="url(#p)""#)
+            )
+        };
+        assert!(decode(&big(4)).is_ok());
+        assert!(matches!(
+            shape(&big(3_000)),
+            Err(EngineError::Unsupported(m)) if m.contains("描く手間")
+        ));
+        // 細かい破線（1 本の path が数十万本の破線になる）
+        let dashes = |n: usize| {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">{}</svg>"##,
+                r##"<path d="M0 0 L64 64" fill="none" stroke="#000" stroke-dasharray="0.0001"/>"##
+                    .repeat(n)
+            )
+        };
+        assert!(shape(&dashes(1)).is_ok());
+        assert!(matches!(
+            shape(&dashes(1_000)),
+            Err(EngineError::Unsupported(m)) if m.contains("描く手間")
+        ));
     }
 
     /// 極端に大きな数（usvg が弧・円を細かい曲線に直して時間がかかる）は XML を読んだところで断る。色・id・参照・名前の中の
