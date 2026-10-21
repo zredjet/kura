@@ -686,7 +686,9 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
    0007・0008 が通って 0009 で失敗すれば版 8）。理由は `CoreError::Upgrade`（新しい版・空き容量・バックアップ・当てる失敗）の
    言葉で返す。当てる失敗の言葉は、1 つも当てていなければ「前の版のまま」、途中の版まで当てていれば「途中の版（スキーマ N）まで
    当てたので前の版の Kura ではもう開けない・原因を取り除いて開き直すと続きを当てる・当てる前のバックアップが backups にある」と
-   言う（`UpgradeError::Apply` の `from`・`reached`）。SQL の本文は言葉に入れず（SQLite の言葉と位置だけ。`CoreError::short`）、
+   言う（`UpgradeError::Apply` の `from`・`reached`）。ただし新しいライブラリ（版 0 から当てる。`library_create`）は、途中の版まで
+   当てて失敗しても「前の版のまま」と言う（前の版の Kura も当てる前のバックアップもないので、途中の版の言葉は使わない。作りかけの
+   DB は上がった版のまま残り、同じ場所を開く・作ると続きを当てる。M11 の確かめ C3：作るときの言葉を分けるかは未決）。SQL の本文は言葉に入れず（SQLite の言葉と位置だけ。`CoreError::short`）、
    ログに全文を残す（テスト `a_late_failure_says_the_library_is_now_at_a_middle_version`）。アプリはこれを `AppError` の code
    `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` にし、`library_open` は失敗として、`library_restore` は
    `error` に入れて返す（docs/architecture.md §3）。開く前に当てるかどうかは `library::needs_upgrade` で分かる。

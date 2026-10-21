@@ -275,9 +275,17 @@ mod tests {
             partial_full.to_string().contains("前の版の Kura"),
             "{partial_full}"
         );
-        // 新しいライブラリ（版 0）は「前の版の Kura」と言わない
+        // 新しいライブラリ（版 0）は「前の版の Kura」・バックアップと言わず、途中の版まで当てても「前の版のまま」と言う
+        // （docs/data-model.md §5 の 5・ADR-156 (4)。M11 の確かめ C3：作るときの言葉を分けるかは未決）
         let fresh = UpgradeError::apply("0009_analysis", &other, 0, 8);
         assert!(!fresh.to_string().contains("前の版の Kura"), "{fresh}");
+        assert!(!fresh.to_string().contains("backups"), "{fresh}");
+        assert!(
+            fresh
+                .to_string()
+                .contains("ライブラリは前の版のまま残っています。0009_analysis："),
+            "{fresh}"
+        );
         let short = UpgradeError::NoSpace {
             needed: 300_000_000,
             available: 120_500_000,
