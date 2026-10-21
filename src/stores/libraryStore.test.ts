@@ -247,6 +247,26 @@ describe('開いているライブラリから別のライブラリを開く・�
     expect(useSettingsStore.getState()).toMatchObject({ open: true, tab: 'library' });
   });
 
+  // M11 の確かめ F3：F6 の直しの 2 つの枝を守る
+  it('開いているかを確かめられなかった（NotFound 以外）ときは、開いたまま扱う（初回の画面に落とさない）', async () => {
+    useLibraryStore.setState({ status: 'open', info, list });
+    vi.mocked(openLibrary).mockRejectedValueOnce(
+      new IpcError({ code: 'LibraryTooNew', message: '新しい版' }),
+    );
+    vi.mocked(libraryInfo).mockRejectedValueOnce(
+      new IpcError({ code: 'Db', message: 'database is locked' }),
+    );
+    await expect(useLibraryStore.getState().open('/B.kuralib')).rejects.toMatchObject({
+      code: 'LibraryTooNew',
+    });
+    expect(useLibraryStore.getState()).toMatchObject({
+      status: 'open',
+      info,
+      list,
+      restoreError: null,
+    });
+  });
+
   it('初回の画面から開けなかったときは画面が自分で理由を出す（状態を変えない・確かめない）', async () => {
     useLibraryStore.setState({ status: 'none', info: null });
     vi.mocked(openLibrary).mockRejectedValueOnce(
@@ -254,6 +274,20 @@ describe('開いているライブラリから別のライブラリを開く・�
     );
     await expect(useLibraryStore.getState().open('/B.kuralib')).rejects.toMatchObject({
       code: 'NoSpace',
+    });
+    expect(useLibraryStore.getState()).toMatchObject({ status: 'none', restoreError: null });
+    expect(libraryInfo).not.toHaveBeenCalled();
+  });
+
+  it('初回の画面から作れなかったときも同じ（理由のカードを重ねて出さない）', async () => {
+    useLibraryStore.setState({ status: 'none', info: null });
+    vi.mocked(createLibrary).mockRejectedValueOnce(
+      new IpcError({ code: 'Io', message: '書き込めません' }),
+    );
+    // 確かめても閉じている（初回の画面）と答える。呼べば restoreError が立つ
+    vi.mocked(libraryInfo).mockRejectedValue(closed);
+    await expect(useLibraryStore.getState().create('/C.kuralib')).rejects.toMatchObject({
+      code: 'Io',
     });
     expect(useLibraryStore.getState()).toMatchObject({ status: 'none', restoreError: null });
     expect(libraryInfo).not.toHaveBeenCalled();
