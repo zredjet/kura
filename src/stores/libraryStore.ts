@@ -14,6 +14,7 @@ import {
 import { isIpcError } from '../ipc/result';
 import { clearItems } from './itemCache';
 import { notify } from './noticeStore';
+import { useSettingsStore } from './settingsStore';
 import { useSidebarStore } from './sidebarStore';
 import { settleUpgrade, watchUpgrades } from './upgradeStore';
 import { useViewStore } from './viewStore';
@@ -186,6 +187,9 @@ async function followFailedSwitch(
     }
   }
   resetForLibrary();
+  // 設定のシートは LibraryScreen の中にあり、初回の画面ではシートごと外れる。開いた印を残すと、次に開いたライブラリで
+  // いきなり出る（M11 の確かめ F1。シートのライブラリのタブから切り替えたとき）
+  useSettingsStore.getState().close();
   set({
     status: 'none',
     info: null,

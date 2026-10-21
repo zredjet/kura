@@ -9,6 +9,7 @@ import {
 } from '../ipc/library';
 import { IpcError } from '../ipc/result';
 import { useLibraryStore } from './libraryStore';
+import { useSettingsStore } from './settingsStore';
 import { receiveUpgrade, useUpgradeStore } from './upgradeStore';
 
 const order: string[] = [];
@@ -39,6 +40,7 @@ beforeEach(() => {
   vi.mocked(openLibrary).mockReset();
   vi.mocked(createLibrary).mockReset();
   vi.mocked(libraryInfo).mockReset();
+  useSettingsStore.setState({ open: false, tab: 'general' });
 });
 
 describe('起動のときに前回のライブラリを開く', () => {
@@ -218,6 +220,31 @@ describe('開いているライブラリから別のライブラリを開く・�
     vi.mocked(libraryInfo).mockResolvedValueOnce(info);
     await expect(useLibraryStore.getState().open('/B.kuralib')).rejects.toThrow('切れた');
     expect(useLibraryStore.getState()).toMatchObject({ status: 'open', info, restoreError: null });
+  });
+
+  // M11 の確かめ F1：設定のシート（LibraryScreen の中）のライブラリのタブから切り替えに失敗すると、初回の画面では
+  // シートごと外れるのに開いた印が残り、次に開いたライブラリでいきなり設定のシートが出ていた
+  it('初回の画面に戻ったら、設定のシートも閉じる', async () => {
+    useLibraryStore.setState({ status: 'open', info, list });
+    useSettingsStore.getState().show('library');
+    vi.mocked(openLibrary).mockRejectedValueOnce(
+      new IpcError({ code: 'LibraryTooNew', message: '新しい版' }),
+    );
+    vi.mocked(libraryInfo).mockRejectedValueOnce(closed);
+    await expect(useLibraryStore.getState().open('/B.kuralib')).rejects.toMatchObject({
+      code: 'LibraryTooNew',
+    });
+    expect(useLibraryStore.getState().status).toBe('none');
+    expect(useSettingsStore.getState().open).toBe(false);
+  });
+
+  it('まだ開いていれば、設定のシートも開いたまま（切り替えに使っていたタブに戻れる）', async () => {
+    useLibraryStore.setState({ status: 'open', info, list });
+    useSettingsStore.getState().show('library');
+    vi.mocked(openLibrary).mockRejectedValueOnce(new Error('切れた'));
+    vi.mocked(libraryInfo).mockResolvedValueOnce(info);
+    await expect(useLibraryStore.getState().open('/B.kuralib')).rejects.toThrow('切れた');
+    expect(useSettingsStore.getState()).toMatchObject({ open: true, tab: 'library' });
   });
 
   it('初回の画面から開けなかったときは画面が自分で理由を出す（状態を変えない・確かめない）', async () => {

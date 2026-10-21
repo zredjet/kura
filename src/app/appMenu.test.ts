@@ -11,6 +11,7 @@ import { EMPTY_SELECTION } from '../features/library/selection';
 import { ja } from '../i18n/ja';
 import { useImportStore } from '../stores/importStore';
 import { useLibraryStore } from '../stores/libraryStore';
+import { useSettingsStore } from '../stores/settingsStore';
 import { useViewStore } from '../stores/viewStore';
 import {
   HELP_MENU_ID,
@@ -138,6 +139,23 @@ describe('appMenuItems', () => {
     // ID は読み込み直しても前のメニューの片付けと重ならないよう、呼ぶ側の接頭辞を付ける
     expect(on.id).toBe('test-pixel-art');
     expect(new Set(on.items.map((c) => c.id)).size).toBe(3);
+  });
+
+  it('「設定…」（⌘,）はライブラリを開いているときだけ設定のシートを開く（初回の画面ではシートがない）', () => {
+    const run = vi.fn();
+    const settings = entry(submenu(ja.app.name, run), ja.appMenu.settings);
+    expect(settings.accelerator).toBe('CmdOrCtrl+,');
+    settings.action?.('');
+    expect(run).toHaveBeenCalledWith({ kind: 'command', id: 'settings' });
+    // M11 の確かめ F1：初回の画面で押すと、見えないまま開いた印が残り、次に開いたライブラリでいきなり出ていた
+    useSettingsStore.setState({ open: false });
+    useLibraryStore.setState({ status: 'none' });
+    runMenuAction({ kind: 'command', id: 'settings' });
+    expect(useSettingsStore.getState().open).toBe(false);
+    useLibraryStore.setState({ status: 'open' });
+    runMenuAction({ kind: 'command', id: 'settings' });
+    expect(useSettingsStore.getState().open).toBe(true);
+    useSettingsStore.setState({ open: false });
   });
 
   it('「ドット絵として表示 ▸」の選択肢は、一覧で選んでいる画像に当てる', () => {
