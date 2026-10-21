@@ -1,8 +1,8 @@
 //! 解析のジョブ（`JobKind::Analyze`。docs/architecture.md §5、decisions の決定 2・5・7・15、defaults 9・13・14）。
 //!
 //! 1 回の実行の流れ：
-//! 1. 前の実行が OS のデコーダ（Platform の段）で読んでいる途中で落ちていたら（処理中の印が残っていれば）、そのアイテムを
-//!    failed（`crashed`）にして先へ進む（同じファイルで落ち続けない。critic 8）。
+//! 1. 前の実行が OS のデコーダ（Platform の段）を通りうる形式を読んでいる途中で落ちていたら（処理中の印が残っていれば）、
+//!    そのアイテムを failed（`crashed`）にして先へ進む（同じファイルで落ち続けない。critic 8）。
 //! 2. エンジンの部品（実行の場とコーデックの組）を使う。最初に使うときにここ（ジョブのスレッド）で作られる。コーデックの組から
 //!    デコーダの指紋を作って比べ、変わった形式に関わるものを pending に戻す。
 //! 3. 起動のスレッドが計画の指紋の変化で作り直しの印を置いていれば（投影の版・ドット絵の規則が変わった）、古い事実の行を
@@ -19,9 +19,10 @@
 //!    - 16 件か 500 ms ごとに 1 つのトランザクションで書く（`store::write`。ハッシュと pending を条件にする）。
 //! 5. 取り込み・サムネイルが来たら（`should_yield`）書きためた分を書いて譲る。一時停止・中止・アプリの終了では、解いている
 //!    1 件を捨てて書きためた分を書いて返す（捨てた 1 件は pending のまま、処理中の印も消す）。強制終了（電源断・ほかの部品の
-//!    異常終了を含む）でも、書くまでは pending のまま。ただし OS のデコーダ（Platform の段）で読んでいた 1 件は処理中の印が
-//!    残るので、次に動いたときに 1 の手順で failed（`crashed`）になる（印は落ちたのか止められたのかを見分けない。
-//!    `retry_analysis` で戻せる）。
+//!    異常終了を含む）でも、書くまでは pending のまま。ただし OS のデコーダ（Platform の段）を通りうる形式（コーデックの組に
+//!    その形式の Platform のデコーダがあるもの。どの段が読むかは読む前に分からないので、固定の段が先に読む WAV・PSD なども）
+//!    を読んでいた 1 件は処理中の印が残るので、次に動いたときに 1 の手順で failed（`crashed`）になる（印は落ちたのか止められた
+//!    のかを見分けない。`retry_analysis` で戻せる。M11 の確かめ C1）。
 //!
 //! 失敗（`unsupported`・`too_large`・`decode`・`crashed`）は事実の行に記録し、指紋が変わるか利用者が頼む（`retry_analysis`）まで
 //! 解き直さない。
@@ -236,8 +237,8 @@ impl JobHandler for AnalyzeHandler {
     }
 }
 
-/// 前の実行が OS のデコーダで読んでいる途中で落ちていたら、そのアイテムを failed（`crashed`）にする（まだ待っていて、同じ
-/// 中身のときだけ）。
+/// 前の実行が OS のデコーダを通りうる形式を読んでいる途中で落ちていたら、そのアイテムを failed（`crashed`）にする（まだ
+/// 待っていて、同じ中身のときだけ）。
 fn recover_crash(ctx: &JobContext, counts: &mut Counts) -> Result<()> {
     let recovered = ctx.library().db().write(|tx| {
         let Some(mark) = store::take_inflight(tx)? else {
@@ -266,10 +267,10 @@ fn recover_crash(ctx: &JobContext, counts: &mut Counts) -> Result<()> {
         }
         tracing::warn!(
             id,
-            "前回、OS のデコーダで読んでいる途中で終わったアイテムを、解析できなかったものにしました"
+            "前回、OS のデコーダを通りうる形式を読んでいる途中で終わったアイテムを、解析できなかったものにしました"
         );
         ctx.log(&format!(
-            "アイテム {id}: 前回 OS のデコーダで読んでいる途中で終わったので、解析できなかったものにしました"
+            "アイテム {id}: 前回 OS のデコーダを通りうる形式を読んでいる途中で終わったので、解析できなかったものにしました"
         ));
     }
     Ok(())
@@ -551,7 +552,7 @@ impl Run<'_> {
                             write,
                         });
                         if platform {
-                            // OS のデコーダで読んだものは、すぐに書いて印を消す（次の 1 件で落ちても取り違えない）
+                            // 印を付けて読んだものは、すぐに書いて印を消す（次の 1 件で落ちても取り違えない）
                             self.flush(true)?;
                         } else if self.buf.len() >= BATCH
                             || self.last_flush.elapsed() >= FLUSH_INTERVAL
@@ -664,7 +665,8 @@ impl Run<'_> {
         }
         let path = self.layout.content_path(&item.hash, &item.ext);
         let hash_hex = hex(&item.hash);
-        // OS のデコーダ（同じプロセスで動く）を通りうるなら、読む前に処理中の印を付けてコミットする（見出しだけを読むときも）
+        // OS のデコーダ（同じプロセスで動く）を通りうるなら、読む前に処理中の印を付けてコミットする（見出しだけを読むときも。
+        // 固定の段が読めば OS のデコーダは呼ばれないが、どの段が読むかは読む前に分からない。M11 の確かめ C1）
         let platform = self
             .codecs
             .decoders_for(format)

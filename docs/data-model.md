@@ -393,9 +393,11 @@ CREATE TABLE settings (
 --       'analysis.decoders' = 解析で読む形式（見出しで決める HEIC・HEIF を含む）ごとの、段の順のデコーダの識別子（解析のジョブが
 --                             コーデックの組を作ったときに比べ、今の組にないデコーダで読んだものと、並びが変わった形式で失敗して
 --                             いたもの・読まずに形式から書いたもの（decoder が NULL）を pending に戻す。M11）
---       'analysis.inflight' = 解析のジョブが OS のデコーダ（Platform の段）で読んでいるアイテム（{"id","hash"}。1 件ずつ解くので
---                             1 件だけ。Platform の段を通りうる形式だけ、読む前（HEIC・HEIF の見出しを読む前も）にコミットし、
---                             書いたら・落ちずに失敗したら消す。
+--       'analysis.inflight' = 解析のジョブが OS のデコーダ（Platform の段）を通りうる形式を読んでいるアイテム（{"id","hash"}。
+--                             1 件ずつ解くので 1 件だけ。コーデックの組にその形式の Platform のデコーダがあれば、どの段が読むかに
+--                             よらず読む前（HEIC・HEIF の見出しを読む前も）にコミットし、書いたら・落ちずに失敗したら消す。アプリの
+--                             組では HEIC・HEIF・AVIF・TIFF・BMP と、固定の段が先に読む PSD・WAV・AIFF・Ogg・Opus・m4a・AAC。
+--                             PNG・GIF・WebP・aseprite・SVG・MP3・FLAC には付けない。
 --                             解析のジョブが次に動いたときに残っていれば、そのアイテムを failed（crashed）にする。M11）
 --       'thumbs.plan'       = サムネイルの道の指紋（{"v":1,"formats":{形式の表の ID: 作り方の名前}}。作り方の名前は
 --                             'engine-thumbs/1'・'imageio-alpha/1'・'imageio/1'（jpeg）・'video/1'・'audio/1'・'coretext/1'・
@@ -419,7 +421,7 @@ CREATE TABLE settings (
 CREATE TABLE media_facts (
   blob_id          INTEGER PRIMARY KEY REFERENCES blobs(id) ON DELETE CASCADE,
   state            TEXT    NOT NULL CONSTRAINT media_facts_state CHECK (state IN ('ok','failed')),
-  error_code       TEXT,                   -- failed：'unsupported'・'too_large'・'decode'・'crashed'（OS のデコーダで読んでいる途中で終わった）。一覧は analysis::store::error_code::ALL（bindings の ANALYSIS_ERROR_CODES）
+  error_code       TEXT,                   -- failed：'unsupported'・'too_large'・'decode'・'crashed'（OS のデコーダを通りうる形式を読んでいる途中で終わった。固定の段が読んでいても）。一覧は analysis::store::error_code::ALL（bindings の ANALYSIS_ERROR_CODES）
   decoder          TEXT,                   -- 読んだデコーダの識別子。形式だけで決めたとき（JPEG と、アルファのない HEIC・HEIF）は NULL
   reproducible     INTEGER,                -- 0/1
   value_digest     BLOB,                   -- 読んだ値のダイジェスト（32 バイト）
@@ -596,9 +598,11 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - **失敗**：事実の行に `state = 'failed'` と `error_code` を書き、items は `failed`。計画・デコーダの指紋が変わるか、利用者が頼む
   （`retry_analysis`：`failed` を `pending` に戻す）まで解き直さない。見積もり（値の 2 倍＋デコーダの作業領域）が
   min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`。中止・一時停止・強制終了（電源断・ほかの部品の異常終了を
-  含む）では、書くまでは `pending` のまま。ただし OS のデコーダ（Platform の段）で読んでいる 1 件は、読む前にコミットした処理中の
-  印（settings の `analysis.inflight`）が残るので、強制終了でも次にジョブが動いたときに `failed`（`crashed`）になる（印は落ちたのか
-  止められたのかを見分けない。`retry_analysis` で戻せる）。
+  含む）では、書くまでは `pending` のまま。ただし OS のデコーダ（Platform の段）を通りうる形式（コーデックの組にその形式の Platform の
+  デコーダがあるもの。アプリの組では HEIC・HEIF の見出しと AVIF・TIFF・BMP、固定の段が先に読む PSD・WAV・AIFF・Ogg・Opus・m4a・AAC）を
+  読んでいる 1 件は、固定の段が読んでいても、読む前にコミットした処理中の印（settings の `analysis.inflight`）が残るので、強制終了でも
+  次にジョブが動いたときに `failed`（`crashed`）になる（印は落ちたのか止められたのかを見分けず、どの段が読むかも読む前には分からない。
+  `retry_analysis` で戻せる。M11 の確かめ C1）。
 - **一度きりの全件の走査**（例外）：計画の指紋が変わった種類を戻す `UPDATE items … WHERE kind = ? AND analysis_state IN ('ready','failed')`
   と扱いが変わった形式を戻す `UPDATE items … WHERE lower(ext) IN (…) AND analysis_state IN ('ready','failed')`（決定 15 の更新で、
   形式から書いていた HEIC・HEIF を一度だけ見直す）、デコーダの指紋で戻す `UPDATE … WHERE … hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …)` は全件を走査する

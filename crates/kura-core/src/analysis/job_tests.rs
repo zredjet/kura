@@ -860,6 +860,73 @@ fn os_decoder_marks_the_item_before_reading_and_a_crash_fails_it() {
     );
 }
 
+/// M11 の確かめ C1：印を付けるかは、コーデックの組にその形式の Platform のデコーダがあるかで決める（どの段が読むかは読む前に
+/// 分からない）。アプリの組では、固定の段が先に読む形式（WAV・AIFF・Ogg・m4a・PSD など）の後ろの段に AudioToolbox・ImageIO が
+/// あるので、それらも読む前に印を付け、強制終了ならその 1 件は crashed になる（docs/data-model.md §4「解析の読み書き」）。
+#[test]
+fn the_mark_covers_formats_a_platform_decoder_could_read_even_when_a_fixed_stage_reads_them() {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let s = seen.clone();
+    let env = Env::with(
+        |log, library| {
+            let library = library.clone();
+            let hook: Hook = Arc::new(move |_| {
+                let mark: Option<String> = library
+                    .db()
+                    .read(|c| {
+                        Ok(c.query_row(
+                            "SELECT value FROM settings WHERE key = ?1",
+                            [INFLIGHT_KEY],
+                            |r| r.get(0),
+                        )
+                        .ok())
+                    })
+                    .unwrap();
+                s.lock().unwrap().push(mark);
+            });
+            // png の後ろの段に偽の OS のデコーダを置く（読むのは前の段の固定の png）
+            let fake = FakePlatformDecoder::new(
+                "fake-imageio-dec/1",
+                &["png"],
+                InputGen::Noise {
+                    w: 8,
+                    h: 8,
+                    fmt: PixelFormat::Rgba8,
+                    seed: 2,
+                },
+            );
+            watched_set(log, Some(hook), vec![Arc::new(fake)])
+        },
+        64 << 20,
+    );
+    let pngh = env.add(1, "image", "png", &sprite(2));
+    env.run();
+    let marks: Vec<Option<Inflight>> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_deref().and_then(|j| serde_json::from_str(j).ok()))
+        .collect();
+    assert_eq!(
+        marks,
+        vec![Some(Inflight {
+            id: 1,
+            hash: pngh.clone()
+        })],
+        "固定の段が読む形式でも、組に OS のデコーダがあれば読む前に印をコミットしている"
+    );
+    assert!(
+        env.fact::<String>(&pngh, "decoder")
+            .starts_with("png-rs-dec/")
+    );
+    assert_eq!(env.state(1), "ready");
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.inflight'"),
+        0,
+        "書いたら消す"
+    );
+}
+
 /// OS のデコーダで読んだあとに落ちずに失敗した（波形の段を書けない）ときは、処理中の印を消してジョブを失敗にする
 /// （次に動いたときに crashed と取り違えない。アイテムは pending のまま）。
 #[test]
