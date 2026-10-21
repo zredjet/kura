@@ -178,6 +178,17 @@ fn patterns(target: usize) -> Vec<(&'static str, String)> {
             ),
         ),
         (
+            // M11 の確かめ R2：違う n の TEXCOORD_n（BTreeMap に入れる。並べる順に増える n は節が 6/11 ずつ埋まる）
+            "attributes の TEXCOORD_n",
+            fill(
+                &format!(r#"{asset},"meshes":[{{"primitives":[{{"attributes":{{"#),
+                &|i| format!(r#""TEXCOORD_{i}":0"#),
+                "}}]}]}",
+                target,
+                all,
+            ),
+        ),
+        (
             "材質の extensions",
             fill(
                 &format!(r#"{asset},"materials":[{{"extensions":{{"#),

@@ -1,5 +1,7 @@
 //! glb の入れ物・JSON の形・ノードの木のたどり・accessor の読み取り。
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
@@ -154,8 +156,9 @@ const LARGEST_DEF: usize = {
 /// オブジェクト 1 つあたりの確保の上限（構造体の配列は伸ばすときに古いものと新しいもの（2 倍）が同時に生きるので 3 倍、
 /// 中の短い文字列（[`Short`]）と min・max（16 個まで）の分を足す）。
 const OBJECT_HEAP: u64 = 3 * LARGEST_DEF as u64 + 1_024;
-/// 値 1 つあたりの確保の上限（u32 の並び（children・シーンの nodes）と TEXCOORD の組は 1 つ 8 バイトまでで、伸ばすときに
-/// 3 倍）。名前や文字列の並びは数を抑えた入れ物に読むので、値の数で増えない。
+/// 値 1 つあたりの確保の上限（u32 の並び（children・シーンの nodes）は 1 つ 8 バイトまでで、伸ばすときに 3 倍。TEXCOORD の組
+/// （`BTreeMap<u32, u32>`）は節の分け方で 1 つ 20 バイトほど）。名前や文字列の並びは数を抑えた入れ物に読むので、値の数で
+/// 増えない。
 const VALUE_HEAP: u64 = 24;
 
 impl JsonCounts {
@@ -418,8 +421,9 @@ pub(crate) struct Attributes {
     position: Option<u32>,
     normal: Option<u32>,
     color0: Option<u32>,
-    /// (n, accessor)。n の順。
-    texcoords: Vec<(u32, u32)>,
+    /// n → accessor。違う n を多く並べても 1 つ O(log k) で入れる（M11 の確かめ R2：`Vec` を線形に探すと 2 乗になり、値の
+    /// 上限の内側で 1 回の読み取りが数分止まった）。1 つの確保は節の分け方で 20 バイトほどで、[`VALUE_HEAP`] に収まる。
+    texcoords: BTreeMap<u32, u32>,
 }
 
 impl Attributes {
@@ -432,10 +436,7 @@ impl Attributes {
             _ => {
                 let n = name.strip_prefix("TEXCOORD_")?;
                 let k = n.parse::<u32>().ok().filter(|k| k.to_string() == n)?;
-                self.texcoords
-                    .iter()
-                    .find(|(i, _)| *i == k)
-                    .map(|(_, a)| *a)
+                self.texcoords.get(&k).copied()
             }
         }
     }
@@ -457,10 +458,9 @@ impl<'de> Deserialize<'de> for Attributes {
                         Key::Position => out.position = Some(v),
                         Key::Normal => out.normal = Some(v),
                         Key::Color0 => out.color0 = Some(v),
-                        Key::TexCoord(k) => match out.texcoords.iter_mut().find(|(i, _)| *i == k) {
-                            Some(slot) => slot.1 = v,
-                            None => out.texcoords.push((k, v)),
-                        },
+                        Key::TexCoord(k) => {
+                            out.texcoords.insert(k, v);
+                        }
                         _ => {}
                     }
                 }
@@ -1219,6 +1219,38 @@ mod tests {
         };
         assert!(serde_json::from_str::<Root>(&names(MAX_EXTENSIONS)).is_ok());
         assert!(serde_json::from_str::<Root>(&names(MAX_EXTENSIONS + 1)).is_err());
+    }
+
+    /// M11 の確かめ R2：違う n の `TEXCOORD_n` を多く並べても、読む時間は数に比例する（S3 の直しで入れ物を `Vec` にして
+    /// 受けるたびに線形に探したので 2 乗になり、値の上限の内側の約 140 万個で 1 回 4 分を超えていた）。同じ n は後ろが勝つ。
+    #[test]
+    #[allow(clippy::disallowed_methods)] // 読む時間（2 乗にならないこと）を確かめるだけ
+    fn many_distinct_texcoords_read_in_linear_time() {
+        use std::fmt::Write as _;
+        let k = 300_000u32;
+        let mut s = String::from(r#"{"meshes":[{"primitives":[{"attributes":{"#);
+        for i in 0..k {
+            if i > 0 {
+                s.push(',');
+            }
+            write!(s, r#""TEXCOORD_{i}":{}"#, i ^ 1).unwrap();
+        }
+        s.push_str(r#","TEXCOORD_7":99,"TEXCOORD_007":5}}]}]}"#);
+        let t = std::time::Instant::now();
+        let root: Root = serde_json::from_str(&s).unwrap();
+        let elapsed = t.elapsed();
+        let a = &root.meshes[0].primitives[0].attributes;
+        assert_eq!(a.get("TEXCOORD_0"), Some(1));
+        assert_eq!(a.get("TEXCOORD_1"), Some(0));
+        assert_eq!(a.get("TEXCOORD_7"), Some(99));
+        assert_eq!(a.get(&format!("TEXCOORD_{}", k - 1)), Some((k - 1) ^ 1));
+        assert_eq!(a.get(&format!("TEXCOORD_{k}")), None);
+        assert_eq!(a.get("TEXCOORD_007"), None);
+        // 線形なら debug でも 1 秒ほど。2 乗では release でも 10 秒を超える
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "{k} 個の TEXCOORD_n を読むのに {elapsed:?}"
+        );
     }
 
     #[test]
