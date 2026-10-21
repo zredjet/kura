@@ -867,7 +867,7 @@ mod tests {
     use super::store::error_code;
     use super::{CodecSet, ITEM_CAP, estimate, failure_code, item_cap, percentile};
 
-    /// 解析しない長さの目安（docs/requirements.md の「NFR-07 の範囲」・ADR-158 (5)）：物理メモリが 8 GB 以上なら 1 件の上限は
+    /// 解析しない長さの目安（docs/requirements.md の「解析の長さの範囲」・ADR-158 (5)）：物理メモリが 8 GB 以上なら 1 件の上限は
     /// 1 GiB で、音声の見積もりは値の 3 倍なので、44.1 kHz ステレオは約 16.9 分、48 kHz ステレオは約 15.5 分、96 kHz ステレオは
     /// 約 7.8 分、44.1 kHz モノラルは約 33.8 分を超えると読まずに too_large になる（E4。docs の数を変えたらここも直す）。
     #[test]
