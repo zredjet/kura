@@ -265,6 +265,16 @@
   overflow: hidden;
 }
 
+/* クイックルック：枠の中で縦横とも中央に（インスペクタは左寄せのまま。行は枠の幅で省略する） */
+.specimenCentered {
+  align-items: center;
+  text-align: center;
+}
+
+.specimenCentered > span {
+  max-width: 100%;
+}
+
 .specimenLarge {
   font-size: var(--text-specimen);
   line-height: var(--leading-tight);

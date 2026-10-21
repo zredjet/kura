@@ -22,8 +22,8 @@ vi.mock('../asset/useAssetData', () => ({ useAssetData: vi.fn() }));
 vi.mock('../asset/AssetStage', () => ({
   useFontFace: vi.fn(() => null),
   QuickLookAnim: ({ anim }: { anim: AnimDto }) => <div data-testid="anim" data-hash={anim.hash} />,
-  FontSpecimen: ({ family }: { family: string }) => (
-    <div data-testid="specimen" data-family={family} />
+  FontSpecimen: ({ family, centered }: { family: string; centered?: boolean }) => (
+    <div data-testid="specimen" data-family={family} data-centered={String(centered ?? false)} />
   ),
 }));
 vi.mock('../asset/WaveformView', () => ({
@@ -108,6 +108,8 @@ describe('QuickLook の素材（M11）', () => {
     vi.mocked(useFontFace).mockReturnValue('kura-specimen-x');
     show(summary({ kind: 'font' }));
     expect(screen.getByTestId('specimen')).toHaveAttribute('data-family', 'kura-specimen-x');
+    // 枠の中で縦横とも中央に（インスペクタは左寄せのまま。design.md §3.1 のフォントの見本）
+    expect(screen.getByTestId('specimen')).toHaveAttribute('data-centered', 'true');
   });
 
   it('動画では素材の欄を読まない', () => {
