@@ -682,6 +682,15 @@ impl TextGuard {
     pub(crate) fn over(&self) -> bool {
         self.over.load(Ordering::Relaxed)
     }
+
+    /// 残りの手間（尽きていれば 0）。木を作ったあと、描く前の見積もり（文字の輪郭の描き直し）に渡す。
+    pub(crate) fn left(&self) -> u64 {
+        if self.over() {
+            0
+        } else {
+            self.left.load(Ordering::Relaxed)
+        }
+    }
 }
 
 /// 代わりのフォントの選び方の覚え（字と、使ったフォントの並び → 選んだもの）。

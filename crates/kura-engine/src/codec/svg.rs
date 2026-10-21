@@ -1481,12 +1481,17 @@ fn text_limit() -> EngineError {
 }
 
 impl SvgCodec {
-    fn tree(&self, text: &str) -> Result<usvg::Tree, EngineError> {
+    /// 木と、文字の手間の残り（描く前の見積もりで、文字の輪郭の描き直しに使う）。
+    fn tree(&self, text: &str) -> Result<(usvg::Tree, u64), EngineError> {
         self.tree_within(text, svg_text::MAX_TEXT_WORK)
     }
 
     /// 文字のレイアウトの手間を `max_text_work` までにして木を作る（テストは小さな上限で、フォントを選ぶ分の見張りを確かめる）。
-    fn tree_within(&self, text: &str, max_text_work: u64) -> Result<usvg::Tree, EngineError> {
+    fn tree_within(
+        &self,
+        text: &str,
+        max_text_work: u64,
+    ) -> Result<(usvg::Tree, u64), EngineError> {
         check_entities(text)?;
         check_depth(text)?;
         let facts = check_elements(text)?;
@@ -1531,7 +1536,7 @@ impl SvgCodec {
                 "画像（埋め込みの SVG・ラスター画像・外部のファイル）を含む SVG は、この段では読めません".into(),
             ));
         }
-        Ok(tree)
+        Ok((tree, guard.left()))
     }
 }
 
@@ -1543,10 +1548,132 @@ const MAX_RENDER_NODES: u64 = 1 << 22;
 /// ファズで見つけた）。ふつうの SVG の座標は、はみ出すものでもキャンバスの数倍ほど。
 const MAX_EXTENT: f32 = 1e8;
 
-/// 描く前にたどる木の項目（グループか図形）。変形・根からの道筋で同時に生きる一時の画像のバイト数・描く面の大きさ（画素）と組にして積む。
+/// 図形の点ごとの描く手間（辺を作る・並べ替える。画素と同じ単位で、M4 Max の release の 1 ns ほど）。検証のあとの確認 R3：
+/// 小さな字の輪郭を pattern に描くと 1 点 21 ns、和文 32 ns（行の分を除く）。直す前は 1 点 1 単位で、文字の pattern を
+/// 2,000 回参照して 12 秒、大きな曲線の pattern を 4 万回参照して 13 分かかるものを受け付けていた。
+const POINT_WORK: u64 = 20;
+/// 辺が覆う行ごとの手間（tiny-skia は 1 行を縦に 4 つに分けて辺を進める）。タイルいっぱいの曲線で、区間の制御点の縦の幅 ×
+/// 次数（直線 1・2 次 2・3 次 3）の 1 行あたり 2.8〜3.4 ns。
+const ROW_WORK: u64 = 4;
+/// 線（stroke）は外形の両側と継ぎ目を描く：塗りの点と行の 4 倍と、区間ごとに継ぎ目の点と線の太さの行を足す（太さ 8 の
+/// 大きな曲線で、塗りの 5 倍の時間だった）。
+const STROKE_FACTOR: u64 = 4;
+/// 区間ごとの継ぎ目の点（丸い継ぎ目は 2 次の曲線 4 つ）。
+const JOIN_POINTS: u64 = 8;
+/// 破線 1 本の点（両側と端）。細かい破線は 1 本の path が数十万本になる（64 画素の線を 0.0001 の破線にして 14.5 ms・
+/// 1 本 32 ns）。tiny-skia は 1 本の path に 100 万本を超える破線を作らない。
+const DASH_POINTS: u64 = 4;
+const MAX_DASHES: f64 = 1e6;
+
+/// 描く前にたどる木の項目（グループか図形）。変形・根からの道筋で同時に生きる一時の画像のバイト数・描く面の大きさ（画素）・
+/// 文字の輪郭の 2 度目からの描き直しか と組にして積む。
 enum Visit<'t> {
     Group(&'t usvg::Group),
     Node(&'t usvg::Node),
+}
+
+/// 積む項目：(たどるもの, 変形, 同時に生きる一時の画像のバイト数, 描く面の大きさ, 文字の輪郭の描き直しか)。
+type Visiting<'t> = (Visit<'t>, tiny_skia::Transform, u64, (u64, u64), bool);
+
+/// path の、変形によらない数（参照ごとに数え直さないように、path ごとに 1 度だけ求める）。
+#[derive(Debug, Clone, Copy, Default)]
+struct PathStats {
+    /// 点の数（制御点を含む）。
+    points: u64,
+    /// 区間の数（閉じる線を含む）。
+    segs: u64,
+    /// 区間の次数の和（直線 1・2 次 2・3 次 3。辺は単調な区間に分けると次数の数まで）。
+    order: u64,
+    /// 区間ごとの、制御点の外接矩形の幅 ＋ 高さ × 次数の和（変形の拡大を掛けると、辺が覆う行の数の上限。区間の長さの上限
+    /// でもある）。
+    extent: f64,
+}
+
+fn path_stats(p: &tiny_skia::Path) -> PathStats {
+    let mut st = PathStats {
+        points: p.points().len() as u64,
+        ..PathStats::default()
+    };
+    let (mut last, mut start) = (
+        tiny_skia::Point::from_xy(0.0, 0.0),
+        tiny_skia::Point::from_xy(0.0, 0.0),
+    );
+    let mut add = |pts: &[tiny_skia::Point], order: u64| {
+        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for q in pts {
+            let (x, y) = (f64::from(q.x), f64::from(q.y));
+            x0 = crate::math::min(x0, x);
+            y0 = crate::math::min(y0, y);
+            x1 = crate::math::max(x1, x);
+            y1 = crate::math::max(y1, y);
+        }
+        st.segs += 1;
+        st.order += order;
+        st.extent += order as f64 * ((x1 - x0) + (y1 - y0));
+    };
+    for seg in p.segments() {
+        match seg {
+            tiny_skia::PathSegment::MoveTo(a) => {
+                last = a;
+                start = a;
+            }
+            tiny_skia::PathSegment::LineTo(a) => {
+                add(&[last, a], 1);
+                last = a;
+            }
+            tiny_skia::PathSegment::QuadTo(b, a) => {
+                add(&[last, b, a], 2);
+                last = a;
+            }
+            tiny_skia::PathSegment::CubicTo(b, c, a) => {
+                add(&[last, b, c, a], 3);
+                last = a;
+            }
+            tiny_skia::PathSegment::Close => {
+                add(&[last, start], 1);
+                last = start;
+            }
+        }
+    }
+    st
+}
+
+/// 浮動小数の手間を整数にする（無限・NaN は u64 の最大）。
+fn work_of(x: f64) -> u64 {
+    if x.is_finite() && x >= 0.0 {
+        crate::math::min(x, u64::MAX as f64) as u64
+    } else {
+        u64::MAX
+    }
+}
+
+/// path を 1 度描く手間（点と辺が覆う行。面積は別に数える）。`ts` は描くときの変形、`surf_h` は描く面の高さ（画素）。
+fn path_work(path: &usvg::Path, st: &PathStats, ts: tiny_skia::Transform, surf_h: u64) -> u64 {
+    // 変形の拡大の上限（行列のフロベニウスのノルム）
+    let s = [ts.sx, ts.kx, ts.ky, ts.sy]
+        .iter()
+        .map(|v| f64::from(*v) * f64::from(*v))
+        .sum::<f64>()
+        .sqrt();
+    let surf_h = surf_h as f64;
+    let rows = crate::math::min(s * st.extent, st.order as f64 * surf_h);
+    let (mut points, mut rows) = (st.points as f64, rows);
+    if let Some(stroke) = path.stroke() {
+        let width = crate::math::min(f64::from(stroke.width().get()) * s, surf_h);
+        let dashes = stroke.dasharray().map_or(0.0, |a| {
+            let interval: f64 = a.iter().map(|x| f64::from(*x)).sum();
+            if interval > 0.0 {
+                crate::math::min(st.extent * (a.len() / 2) as f64 / interval, MAX_DASHES).ceil()
+            } else {
+                0.0
+            }
+        });
+        points += STROKE_FACTOR as f64 * st.points as f64
+            + JOIN_POINTS as f64 * st.segs as f64
+            + DASH_POINTS as f64 * dashes;
+        rows += STROKE_FACTOR as f64 * rows + (st.segs as f64 + 2.0 * dashes) * width;
+    }
+    work_of(POINT_WORK as f64 * points + ROW_WORK as f64 * rows)
 }
 
 /// 長さ（画素）を整数にする。無限・負は `max`。
@@ -1616,12 +1743,19 @@ fn primitive_work(p: &usvg::filter::Primitive, lw: u64, lh: u64, sx: f32, sy: f3
 /// (1) 根からの道筋ごとに同時に生きる一時の画像（層・mask と clip の画像・フィルタの結果・pattern のタイル）の合計が、絶対の予算
 /// （`limits.max_value_bytes`）を超えるもの。resvg の層は 1 枚がキャンバスの 25 倍（(-2w,-2h,5w,5h)）まで広がり、入れ子の層は
 /// 同時に生きる。フィルタはプリミティブの結果をすべて最後まで持ち、pattern のタイルには上限がない。
-/// (2) 描く手間（画素の数：図形の外接矩形と描く面の小さい方・層の合成・フィルタのプリミティブ）の合計が上限を超えるもの。
-/// resvg の描画は途中で止められないので、手間で時間を抑える。
+/// (2) 描く手間（画素の数：図形の外接矩形と描く面の小さい方・層の合成・フィルタのプリミティブ。図形の点と辺が覆う行・線・
+/// 破線（[`path_work`]））の合計が上限を超えるもの。resvg の描画は途中で止められないので、手間で時間を抑える。
 /// (3) 変形のあとの座標が `MAX_EXTENT` を超える図形。
-/// 木（mask・clipPath・フィルタの feImage・文字の輪郭・pattern の中身も。pattern は参照ごとに）は再帰せずにたどる。
-/// 変形の倍率は平行移動によらないので、層のずらしは見ない。
-fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<(), EngineError> {
+/// 木（mask・clipPath・フィルタの feImage・文字の輪郭・pattern の中身も。pattern・mask・clip は参照ごとに）は再帰せずにたどる。
+/// 変形の倍率は平行移動によらないので、層のずらしは見ない。文字の輪郭を 2 度目から描き直す手間は、文字のレイアウトの残りの
+/// 手間 `text_left` から引き、尽きたら `Limit`（文字の手間の上限の 1 件 100 ms ほどに入れる。検証のあとの確認 R3）。
+fn check_render(
+    tree: &usvg::Tree,
+    w: u32,
+    h: u32,
+    limits: &Limits,
+    text_left: u64,
+) -> Result<(), EngineError> {
     let (cw, ch) = (u64::from(w), u64::from(h));
     let max_bytes = limits.max_value_bytes;
     let max_work = cw
@@ -1631,14 +1765,21 @@ fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<()
     let too_much =
         |what: &str| EngineError::Unsupported(format!("{what}が大きすぎる SVG は読めません"));
     let mut work = 0u64;
+    // 文字の輪郭の 2 度目からの描き直しの手間（文字の手間の残り `text_left` から引く）
+    let mut text_redraw = 0u64;
+    // 見た文字（2 度目からは描き直し）と、path ごとの変形によらない数。参照で共有される節を見分けるだけなので
+    // 番地で引く（結果は番地によらない）
+    let mut seen_text: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut stats: std::collections::BTreeMap<usize, PathStats> = std::collections::BTreeMap::new();
     let mut visited = 0u64;
-    let mut stack: Vec<(Visit<'_>, tiny_skia::Transform, u64, (u64, u64))> = vec![(
+    let mut stack: Vec<Visiting<'_>> = vec![(
         Visit::Group(tree.root()),
         tiny_skia::Transform::default(),
         0,
         (cw, ch),
+        false,
     )];
-    while let Some((visit, parent, live, surf)) = stack.pop() {
+    while let Some((visit, parent, live, surf, redraw)) = stack.pop() {
         visited += 1;
         if visited > MAX_RENDER_NODES {
             return Err(EngineError::Limit("描く要素が多すぎます".into()));
@@ -1691,17 +1832,28 @@ fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<()
                     surf = (lw, lh);
                     // mask・clip・feImage の中身は、層と同じ道筋（同じ一時の画像を持ったまま）で描く
                     for (root, t) in inner {
-                        stack.push((Visit::Group(root), t, live, surf));
+                        stack.push((Visit::Group(root), t, live, surf, redraw));
                     }
                 }
                 for n in g.children() {
-                    stack.push((Visit::Node(n), ts, live, surf));
+                    stack.push((Visit::Node(n), ts, live, surf, redraw));
                 }
             }
             Visit::Node(node) => match node {
-                usvg::Node::Group(g) => stack.push((Visit::Group(g.as_ref()), parent, live, surf)),
+                usvg::Node::Group(g) => {
+                    stack.push((Visit::Group(g.as_ref()), parent, live, surf, redraw))
+                }
                 usvg::Node::Text(text) => {
-                    stack.push((Visit::Group(text.flattened()), parent, live, surf))
+                    // 文字の輪郭を 1 度描く分は、字ごとの手間（svg_text の CHAR_WORK）に入っている。pattern・clipPath・
+                    // mask の中身として 2 度目からたどるものは描き直し
+                    let again = !seen_text.insert(std::ptr::from_ref(text.as_ref()) as usize);
+                    stack.push((
+                        Visit::Group(text.flattened()),
+                        parent,
+                        live,
+                        surf,
+                        redraw || again,
+                    ))
                 }
                 usvg::Node::Image(_) => {}
                 usvg::Node::Path(path) => {
@@ -1723,9 +1875,17 @@ fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<()
                         return Err(too_much("図形の座標"));
                     }
                     let area = span(b.width(), surf.0).saturating_mul(span(b.height(), surf.1));
-                    work = work
-                        .saturating_add(area)
-                        .saturating_add(path.data().points().len() as u64);
+                    let st = *stats
+                        .entry(std::ptr::from_ref(path.data()) as usize)
+                        .or_insert_with(|| path_stats(path.data()));
+                    let drawn = path_work(path, &st, ts, surf.1);
+                    work = work.saturating_add(area).saturating_add(drawn);
+                    if redraw {
+                        text_redraw = text_redraw.saturating_add(drawn);
+                        if text_redraw > text_left {
+                            return Err(text_limit());
+                        }
+                    }
                     let paints = [
                         path.fill().map(|f| f.paint()),
                         path.stroke().map(|s| s.paint()),
@@ -1759,6 +1919,7 @@ fn check_render(tree: &usvg::Tree, w: u32, h: u32, limits: &Limits) -> Result<()
                                 tiny_skia::Transform::from_scale(sx, sy),
                                 live,
                                 (tw, th),
+                                redraw,
                             ));
                         }
                     }
@@ -1806,9 +1967,9 @@ impl Decoder for SvgCodec {
         limits: &Limits,
     ) -> Result<Shape, EngineError> {
         let text = read_source(src)?;
-        let tree = self.tree(&text)?;
+        let (tree, text_left) = self.tree(&text)?;
         let (w, h) = size_of(&tree, limits)?;
-        check_render(&tree, w, h, limits)?;
+        check_render(&tree, w, h, limits, text_left)?;
         Ok(Shape::Image {
             w: Dim::Exact(u64::from(w)),
             h: Dim::Exact(u64::from(h)),
@@ -1825,9 +1986,9 @@ impl Decoder for SvgCodec {
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
         let text = read_source(src)?;
-        let tree = self.tree(&text)?;
+        let (tree, text_left) = self.tree(&text)?;
         let (w, h) = size_of(&tree, limits)?;
-        check_render(&tree, w, h, limits)?;
+        check_render(&tree, w, h, limits, text_left)?;
         limits
             .check(&Shape::Image {
                 w: Dim::Exact(u64::from(w)),
@@ -2525,6 +2686,81 @@ mod tests {
             ),
         );
         assert!(decode(&fine).is_ok());
+    }
+
+    /// 検証のあとの確認 R3：pattern・clipPath・mask（userSpaceOnUse）の中身は参照ごとに描き直すので、描く前の見積もりは
+    /// 図形の点と辺が覆う行を参照ごとに、時間に合う重みで数える。文字の輪郭の描き直し（2 度目から）は文字の手間（1 件 100 ms
+    /// ほど。決定 20）に入れる。破線は 1 本ずつ数える。直す前は点を 1 点 1 単位で数え、どれも受け付けていた。
+    #[test]
+    fn redrawn_points_are_charged_per_reference() {
+        let c = text_codec();
+        let shape = |svg: &str| {
+            c.shape(
+                &mut Cursor::new(svg.as_bytes().to_vec()),
+                "svg",
+                &DecodeOptions::default(),
+                &Limits::default(),
+            )
+        };
+        let rects = |refs: usize, attr: &str| {
+            format!(r#"<rect width="10" height="10" {attr}/>"#).repeat(refs)
+        };
+        // 文字を pattern・clipPath・mask（userSpaceOnUse）に入れて多く参照する（確認の pat2 の形）
+        let a = "A".repeat(1_000);
+        let pat = |refs: usize| {
+            text_svg(&format!(
+                r#"<defs><pattern id="p" patternUnits="userSpaceOnUse" width="64" height="64"><text y="30">{a}</text></pattern></defs>{}"#,
+                rects(refs, r#"fill="url(#p)""#)
+            ))
+        };
+        let clip = |refs: usize| {
+            text_svg(&format!(
+                r#"<defs><clipPath id="c"><text y="30">{a}</text></clipPath></defs>{}"#,
+                rects(refs, r#"clip-path="url(#c)""#)
+            ))
+        };
+        let mask = |refs: usize| {
+            text_svg(&format!(
+                r##"<defs><mask id="m" maskUnits="userSpaceOnUse"><text y="30" fill="#fff">{a}</text></mask></defs>{}"##,
+                rects(refs, r#"mask="url(#m)""#)
+            ))
+        };
+        let docs: [&dyn Fn(usize) -> String; 3] = [&pat, &clip, &mask];
+        for doc in docs {
+            assert!(shape(&doc(1)).is_ok());
+            assert!(shape(&doc(100)).is_ok());
+            assert!(
+                matches!(shape(&doc(3_000)), Err(EngineError::Limit(_))),
+                "{}",
+                &doc(1)[..200]
+            );
+        }
+        // 文字のない大きな曲線（タイルいっぱい）の pattern を多く参照（直す前は 4 万参照で 13 分）
+        let curves = " C64 0 0 64 64 64 C0 64 64 0 0 0".repeat(2_000);
+        let big = |refs: usize| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><defs><pattern id="p" patternUnits="userSpaceOnUse" width="64" height="64"><path d="M0 0{curves}"/></pattern></defs>{}</svg>"#,
+                rects(refs, r#"fill="url(#p)""#)
+            )
+        };
+        assert!(decode(&big(4)).is_ok());
+        assert!(matches!(
+            shape(&big(3_000)),
+            Err(EngineError::Unsupported(m)) if m.contains("描く手間")
+        ));
+        // 細かい破線（1 本の path が数十万本の破線になる）
+        let dashes = |n: usize| {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">{}</svg>"##,
+                r##"<path d="M0 0 L64 64" fill="none" stroke="#000" stroke-dasharray="0.0001"/>"##
+                    .repeat(n)
+            )
+        };
+        assert!(shape(&dashes(1)).is_ok());
+        assert!(matches!(
+            shape(&dashes(1_000)),
+            Err(EngineError::Unsupported(m)) if m.contains("描く手間")
+        ));
     }
 
     /// 極端に大きな数（usvg が弧・円を細かい曲線に直して時間がかかる）は XML を読んだところで断る。色・id・参照・名前の中の
