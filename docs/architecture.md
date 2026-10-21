@@ -12,6 +12,7 @@
 │ src-tauri（薄い層）                                                          │
 │   commands/  protocol.rs（kura://・Range 対応）  navigation.rs（main の窓） │
 │   engine.rs（エンジンの部品）  state.rs  dto.rs（型・イベント）  config.rs  │
+│   error.rs（AppError と code）  shortcut.rs  logging.rs                     │
 ├────────┼────────────────────────────────────────────────────────────────────┤
 │ kura-core（OS 非依存・テスト容易）                                             │
 │   db/  import/  query/（検索言語）  unit/  playlist/  jobs/  download/  capture/ │
@@ -35,7 +36,7 @@
 | `kura-engine` | 編集の操作エンジン：文書・値・形・メタデータの写し方・操作と登録・描画・解析・コーデック（固定の Rust のもの）・実行とプレビュー・エディタの履歴。段 10 の部品は、実行器の `render/`（ノードのキャッシュ `cache`・差分の計画と差分の適用 `incremental`・範囲 `region`・範囲の描画とスポイト `area`・変わった範囲 `delta`・エディタの表示の経路 `view`（`Engine::render_view`）・プレビューの段 `preview`・メモリの見積もり `estimate`）、エディタのセッション `session/`（`EditSession`）、メモリの予算 `budget`、予約の部品（`monitor` の `Latest`・`Ticket`）、ベンチのワークロード `testing::bench`。M11 で 3D（glb）の読み手とソフトウェアの描画 `model`（SceneKit を使わない。決定 9。ファズの対象 `model_glb`。docs/editing.md §9.10）と、SVG の文字を描くフォントの入れ物を受ける口（`codec::SvgFonts`。中身は kura-mac が渡す）を足した。スレッドプールは作らない（呼び手のプールの中で描く）。DB・ジョブ・Tauri を知らない（ADR-134・154、§15） | serde, serde_json, thiserror, blake3, rayon, rand_chacha, libm と、版を固定したコーデックのクレート（docs/editing.md §9）。specta は feature |
 | `kura-mac` | `MediaBackend` trait の macOS 実装（サムネイル生成、メディア情報、音楽のジャケット取得、WKWebView のスナップショット、「透明度を下げる」設定の取得）と、ffmpeg との振り分け。編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し、`kura_codec_caps`。段 9、ADR-153）と、アプリのコーデックの組 `full_codec_set`。物理メモリの大きさ `physical_memory`（編集のメモリの予算の既定に渡す。段 10）。M11 で足したもの：ImageIO のアルファを保つサムネイル・CoreText のフォントのサムネイルと情報（`thumbs`）、SVG の文字を描くシステムのフォント（`fonts`：mmap して `pinned_options` で渡す）、1 MiB 以上の確保を OS へすぐ返す確保器（`alloc` の `ReturningAllocator`。アプリと kura-devtools の `#[global_allocator]`。§7、ADR-163） | kura-core, kura-engine, serde, serde_json, tracing, libc（macOS のみ。mmap）, swift-rs（ビルド時のリンクのみ） |
 | `kura-devtools` | ダミーライブラリの生成、ベンチマーク（編集の `bench edit`。NFR-11〜17）、コマンドラインからの取り込みと確認、編集のメモリの見積もりの煙のテスト（`mem_smoke`）。M11 で形式の見本（`assets`）、kura:// と CSP の自己点検のライブラリ（`selftest-library`）、`bench thumbs-job`・`bench analyze`・`bench migrate`・`bench query --fake-facts`（§13） | kura-core, kura-engine, kura-mac |
-| `src-tauri`（`kura-app`） | コマンド、kura:// プロトコル、ウィンドウ（main の移動の制限 `navigation`。§11）、イベント、状態の保持（開く処理の鍵 `AppState::opening`）、エンジンの部品を作る口（`engine` の `MacEngineFactory`。§15） | すべて |
+| `src-tauri`（`kura-app`） | コマンド（戻り値の `AppError` と code は `error.rs`。§3）、kura:// プロトコル、ウィンドウ（main の移動の制限 `navigation`。§11）、イベント、状態の保持（開く処理の鍵 `AppState::opening`）、エンジンの部品を作る口（`engine` の `MacEngineFactory`。§15） | すべて |
 
 `kura-core` は `MediaBackend` trait（`probe`、`image_thumbnails`、`video_thumbnails`、`audio_artwork`、`font_thumbnails`（M11））と、エンジンの部品を作る口 `edit::EngineFactory`（M11。§15）だけを知り、実装（`kura_mac::media_backend()`・`MacEngineFactory`）はライブラリを開くときに注入します。テストでは偽物の実装（`media::fake::FakeBackend`）を使います。Linux 上でも `kura-core` のテストが通るようにします。
 
