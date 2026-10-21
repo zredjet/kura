@@ -13,7 +13,7 @@ use super::ast::{
 };
 use crate::text::nfc;
 use crate::time::days_from_civil;
-use crate::{Result, folders, tags};
+use crate::{Result, asset, folders, tags};
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -262,7 +262,7 @@ impl Compiler<'_> {
             rest = items.iter().collect();
             tag_sets.clear();
         }
-        // 事実の条件（ドット絵を除く）は 1 つの部分問い合わせにまとめる。事実の行は中身ごとに 1 行なので、
+        // 事実の条件（ドット絵・`アニメ:あり` を除く）は 1 つの部分問い合わせにまとめる。事実の行は中身ごとに 1 行なので、
         // `hash IN A AND hash IN B` と `hash IN (A かつ B)` は同じ（集合が小さくなり、10 万件で数十 ms 縮む）
         let (facts, rest): (Vec<&Expr>, Vec<&Expr>) = rest
             .into_iter()
@@ -286,21 +286,29 @@ impl Compiler<'_> {
                 out.sql.push_str(" AND ");
             }
             first = false;
-            let wheres: Vec<String> = facts
+            let conds: Vec<&FieldCond> = facts
                 .iter()
                 .filter_map(|item| self.mergeable_fact(item))
+                .collect();
+            let wheres: Vec<String> = conds
+                .iter()
                 .map(|cond| {
                     self.fact_where(cond, out)
                         .unwrap_or_else(|| "0".to_string())
                 })
                 .collect();
             out.sql.push_str(&facts_in(&wheres.join(" AND ")));
+            // `アニメ:なし` は、まとめた事実（コマが 1 つ）に格子がないことを足す（[`Self::anim`] と同じ意味）
+            if conds.iter().any(|c| matches!(c, FieldCond::Anim { .. })) {
+                out.sql.push_str(&format!(" AND {}", no_grid()));
+            }
         }
-        // 事実の集合から items をハッシュで引けるとき、種類の索引に引っ張られないようにする（`+i.kind`。
-        // `種類:画像 透過:あり 色数<=16` が 10 万件で 35ms → 3ms）
+        // 事実・設定の集合から items をハッシュ・主キーで引けるとき（まとめた事実と、ドット絵・アニメ）、種類の索引に
+        // 引っ張られないようにする（`+i.kind`。`種類:画像 透過:あり 色数<=16` が 10 万件で 35ms → 3ms）
+        let by_sets = !facts.is_empty() || rest.iter().any(|item| self.found_by_sets(item));
         let unindexed = self
             .kind_unindexed
-            .replace(self.kind_unindexed.get() || !facts.is_empty());
+            .replace(self.kind_unindexed.get() || by_sets);
         let mut done = Ok(());
         for item in rest {
             if !first {
@@ -554,8 +562,10 @@ impl Compiler<'_> {
     /// 解析の事実の条件（`i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b … WHERE …)`。
     /// 部分索引から集合を作り、相関した EXISTS にしない）。事実がない・計れない値（NULL）はどの比較にも入らない。
     fn fact(&self, cond: &FieldCond, out: &mut SqlCond) {
-        if let FieldCond::Pixel { op, value } = cond {
-            return self.pixel(*op, *value, out);
+        match cond {
+            FieldCond::Pixel { op, value } => return self.pixel(*op, *value, out),
+            FieldCond::Anim { op, value } => return self.anim(*op, *value, out),
+            _ => {}
         }
         match self.fact_where(cond, out) {
             Some(sql) => out.sql.push_str(&facts_in(&sql)),
@@ -563,7 +573,8 @@ impl Compiler<'_> {
         }
     }
 
-    /// AND の中で 1 つの事実の部分問い合わせにまとめられる条件（事実で判定するときだけ。ドット絵は設定が勝つので除く）。
+    /// AND の中で 1 つの事実の部分問い合わせにまとめられる条件（事実で判定するときだけ）。ドット絵は素材の設定が勝つので、
+    /// `アニメ:あり` は格子との OR なので除く（`アニメ:なし` は事実の条件と、格子がないことの AND なのでまとめられる）。
     fn mergeable_fact<'e>(&self, expr: &'e Expr) -> Option<&'e FieldCond> {
         match expr {
             Expr::Field(
@@ -574,24 +585,30 @@ impl Compiler<'_> {
                 | FieldCond::Ch { .. }
                 | FieldCond::Lufs { .. }
                 | FieldCond::Peak { .. }
-                | FieldCond::Loop { .. }
-                | FieldCond::Anim { .. }),
+                | FieldCond::Loop { .. }),
             ) if self.facts == Facts::Known => Some(cond),
+            Expr::Field(cond @ FieldCond::Anim { op, value })
+                if self.facts == Facts::Known && flag_target(*op, *value) == Some(false) =>
+            {
+                Some(cond)
+            }
             _ => None,
         }
+    }
+
+    /// 事実・素材の設定の集合で items を引く条件か（AND の直下のドット絵・アニメ。否定の中は集合で引けない）。
+    fn found_by_sets(&self, expr: &Expr) -> bool {
+        self.facts == Facts::Known
+            && matches!(
+                expr,
+                Expr::Field(FieldCond::Pixel { .. } | FieldCond::Anim { .. })
+            )
     }
 
     /// 事実の条件の `media_facts f` に対する WHERE（値はバインドする）。一致しない指定（大小の比較の
     /// できないフィールドの比較など）は None。
     fn fact_where(&self, cond: &FieldCond, out: &mut SqlCond) -> Option<String> {
         // あり・なしの列は部分索引（`WHERE x = 1`）を使えるよう、定数（利用者の値ではない）を SQL に書く
-        let wanted = |op: Op, value: bool| -> Option<bool> {
-            match op {
-                Op::Has | Op::Eq => Some(value),
-                Op::Ne => Some(!value),
-                _ => None,
-            }
-        };
         match cond {
             FieldCond::Alpha { op, value } => {
                 let not = match op {
@@ -603,15 +620,12 @@ impl Compiler<'_> {
                 Some(format!("f.alpha IS NOT NULL AND f.alpha {not}IN ({marks})"))
             }
             FieldCond::Loop { op, value } => {
-                wanted(*op, *value).map(|want| format!("f.has_loop = {}", i64::from(want)))
+                flag_target(*op, *value).map(|want| format!("f.has_loop = {}", i64::from(want)))
             }
-            FieldCond::Anim { op, value } => wanted(*op, *value).map(|want| {
-                if want {
-                    "f.frame_count > 1".to_string()
-                } else {
-                    "f.frame_count <= 1".to_string()
-                }
-            }),
+            // `アニメ:なし` の事実の側（格子がないことは呼ぶ側が足す）。`アニメ:あり` は格子との OR なので、ここでは作らない
+            FieldCond::Anim { op, value } => {
+                (flag_target(*op, *value) == Some(false)).then(|| ANIM_STILL.to_string())
+            }
             FieldCond::Colors { op, value } => Some(colors_compare(*op, *value, out)),
             FieldCond::Rate { op, value } => Some(fact_compare("f.sample_rate", *op, *value, out)),
             FieldCond::Bits { op, value } => Some(fact_compare("f.bits", *op, *value, out)),
@@ -637,7 +651,7 @@ impl Compiler<'_> {
 
     /// ドット絵の実効値「素材の設定 ?? 自動の判定」が `want` か。設定があればそれだけで決まる。
     fn pixel(&self, op: Op, value: bool, out: &mut SqlCond) {
-        let Some(want) = pixel_target(op, value) else {
+        let Some(want) = flag_target(op, value) else {
             out.sql.push('0');
             return;
         };
@@ -649,12 +663,46 @@ impl Compiler<'_> {
         ));
     }
 
+    /// アニメの実効値「格子の設定 ?? 解析のコマ」が `want` か（素材の欄・タイルの `asset::effective_animated`。M11 の
+    /// ユーザーの決定 16）。格子があればアニメ、なければコマが 2 つ以上か。格子は「なし」を決めないので、`アニメ:なし` は
+    /// 格子がなく、コマが 1 つと分かっているもの（未解析・計れないものは入れない）。格子の集合は `asset_settings`
+    /// （変えたアイテムにだけ行がある）から作り、items を主キーで引く。
+    fn anim(&self, op: Op, value: bool, out: &mut SqlCond) {
+        let Some(want) = flag_target(op, value) else {
+            out.sql.push('0');
+            return;
+        };
+        if want {
+            out.sql
+                .push_str(&format!("({} OR {})", grid_items(), facts_in(ANIM_MOVING)));
+        } else {
+            out.sql
+                .push_str(&format!("({} AND {})", facts_in(ANIM_STILL), no_grid()));
+        }
+    }
+
     /// 事実を知らないものとしたときの条件（「未解析 N 件」）。否定の中かどうかで、一致しうる側（上限）と
-    /// 必ず一致する側（下限）を入れ替える。上限は「その事実を持ちうる種類」、下限は偽。ドット絵は設定があれば決まる。
+    /// 必ず一致する側（下限）を入れ替える。上限は「その事実を持ちうる種類」、下限は偽。ドット絵とアニメは、素材の設定が
+    /// あれば決まる（ドット絵は設定の値、アニメは格子があれば「あり」）。
     fn unknown_fact(&self, cond: &FieldCond, out: &mut SqlCond) {
         let upper = (self.facts == Facts::Upper) != self.negated.get();
+        if let FieldCond::Anim { op, value } = cond {
+            let Some(want) = flag_target(*op, *value) else {
+                out.sql.push('0');
+                return;
+            };
+            let kind = |out: &mut SqlCond| push(out, KindValue::Image.as_str().to_string());
+            let sql = match (want, upper) {
+                (true, true) => format!("({} OR i.kind = {})", grid_items(), kind(out)),
+                (true, false) => grid_items(),
+                (false, true) => format!("(i.kind = {} AND {})", kind(out), no_grid()),
+                (false, false) => "0".to_string(),
+            };
+            out.sql.push_str(&sql);
+            return;
+        }
         if let FieldCond::Pixel { op, value } = cond {
-            let Some(want) = pixel_target(*op, *value) else {
+            let Some(want) = flag_target(*op, *value) else {
                 out.sql.push('0');
                 return;
             };
@@ -682,13 +730,27 @@ impl Compiler<'_> {
     }
 }
 
-/// ドット絵の条件が求める実効値（`!=` は逆。大小の比較は一致なし）。
-fn pixel_target(op: Op, value: bool) -> Option<bool> {
+/// あり・なしのフィールド（ドット絵・ループ・アニメ）の条件が求める値（`!=` は逆。大小の比較は一致なし）。
+fn flag_target(op: Op, value: bool) -> Option<bool> {
     match op {
         Op::Has | Op::Eq => Some(value),
         Op::Ne => Some(!value),
         _ => None,
     }
+}
+
+/// アニメの事実の側：コマが 2 つ以上（`アニメ:あり`）と、1 つ（`アニメ:なし`。計れないものはどちらにも入らない）。
+const ANIM_MOVING: &str = "f.frame_count > 1";
+const ANIM_STILL: &str = "f.frame_count <= 1";
+
+/// 格子の設定があるアイテム（`asset::grid_items_sql`。表は変えたアイテムにだけ行がある）。
+fn grid_items() -> String {
+    format!("i.id IN ({})", asset::grid_items_sql())
+}
+
+/// 格子の設定がないアイテム。
+fn no_grid() -> String {
+    format!("i.id NOT IN ({})", asset::grid_items_sql())
 }
 
 /// 事実の条件を、アイテムのハッシュの集合にする。

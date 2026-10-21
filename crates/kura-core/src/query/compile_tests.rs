@@ -795,6 +795,155 @@ fn pixel_art_search_follows_the_effective_value_of_the_asset_panel() {
     assert_eq!(unanalyzed(&conn, "ドット絵:なし"), Some(waiting));
 }
 
+/// 格子の設定の状態（アニメの検索のテスト）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridCase {
+    /// 格子を設定していない。
+    None,
+    /// 格子を設定した（素材の欄の書き手 `asset::set_settings` で）。
+    Set,
+    /// 知らない版の grid_json（素材の欄は格子なしとして読む）。
+    UnknownVersion,
+    /// 壊れた grid_json（同じく格子なし）。
+    Broken,
+}
+
+/// アニメの検索（この SQL）と、素材の欄・一覧のタイルの実効値（`asset::effective_animated`）が同じ規則「格子の設定 ?? 解析の
+/// コマ」であること（M11 のユーザーの決定 16）。格子は素材の欄の書き手（`asset::set_settings`）、コマの数は解析の書き手
+/// （`analysis::store::write`）で入れ、格子 4 通り（なし・あり・知らない版・壊れた JSON）× コマ 4 通り（未解析・解析済みで
+/// 計れない・1 コマ・8 コマ）のすべてで照らす。
+/// - `アニメ:あり`・`アニメ!=なし` は実効値が真のもの（格子があれば、未解析でも 1 コマでも）。`-アニメ:あり` はその補集合
+///   （画像のほかの種類も入る）。
+/// - `アニメ:なし`・`アニメ!=あり` は実効値が偽で、決まっているもの（格子がなく、コマが 1 つと分かっている）。未解析・計れない
+///   ものは入れない（search-query.md §4。素材の欄とタイルは表示のために偽とする）。
+/// - 知らない版・壊れた格子は、素材の欄と同じく格子なしとして読む。
+/// - 「未解析 N 件」は、解析待ちで格子のないもの（格子があれば解析の前でも決まる）。
+#[test]
+fn anim_search_follows_the_effective_value_of_the_asset_panel() {
+    use crate::analysis::facts::{FACTS_V, MediaFacts};
+    use crate::analysis::store::{ItemWrite, Write, write};
+    use crate::asset::{Change, GridSetting, SettingsPatch, effective_animated, set_settings};
+
+    // コマの数：None は未解析（pending）、Some(None) は解析済みで計れない（NULL）
+    let frames: [Option<Option<i64>>; 4] = [None, Some(None), Some(Some(1)), Some(Some(8))];
+    let grids = [
+        GridCase::None,
+        GridCase::Set,
+        GridCase::UnknownVersion,
+        GridCase::Broken,
+    ];
+    let conn = test_conn();
+    let mut cases = Vec::new();
+    let mut id = 0_i64;
+    for grid in grids {
+        for frame in frames {
+            id += 1;
+            let hash = [u8::try_from(id).unwrap(); 32];
+            conn.execute(
+                "INSERT INTO items (id, hash, ext, kind, size_bytes, width, height, title, original_name,
+                                    imported_at, updated_at, analysis_state)
+                 VALUES (?1, ?2, 'png', 'image', 1, 64, 32, 't', 't', 0, 0, 'pending')",
+                params![id, hash.as_slice()],
+            )
+            .unwrap();
+            if let Some(count) = frame {
+                let facts = MediaFacts {
+                    facts_v: FACTS_V,
+                    alpha: Some(0),
+                    frame_count: count,
+                    ..MediaFacts::default()
+                };
+                let ready = ItemWrite {
+                    id,
+                    hash,
+                    write: Write::Ready {
+                        results: Vec::new(),
+                        keep: None,
+                        facts: Box::new(facts),
+                        stamp: None,
+                    },
+                };
+                assert_eq!(write(&conn, &[ready], 0).unwrap().written, 1);
+            }
+            let raw = |json: &str| {
+                conn.execute(
+                    "INSERT INTO asset_settings (item_id, grid_json, updated_at) VALUES (?1, ?2, 0)",
+                    params![id, json],
+                )
+                .unwrap();
+            };
+            match grid {
+                GridCase::None => {}
+                GridCase::Set => {
+                    let patch = SettingsPatch {
+                        grid: Some(Change::Set(GridSetting {
+                            cell_w: 16,
+                            cell_h: 16,
+                            offset_x: 0,
+                            offset_y: 0,
+                            gap_x: 0,
+                            gap_y: 0,
+                            count: Some(6),
+                        })),
+                        ..SettingsPatch::default()
+                    };
+                    assert_eq!(set_settings(&conn, &[id], &patch, 0).unwrap(), 1);
+                }
+                GridCase::UnknownVersion => raw(r#"{"v":2,"cellW":16,"cellH":16}"#),
+                GridCase::Broken => raw(r#"{"v":1,"cellW":"#),
+            }
+            cases.push((id, grid, frame));
+        }
+    }
+    // 画像でないもの（除外にだけ入る）
+    conn.execute(
+        "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at,
+                            analysis_state)
+         VALUES (99, ?1, 'ogg', 'audio', 1, 't', 't', 0, 0, 'pending')",
+        params![[99_u8; 32].as_slice()],
+    )
+    .unwrap();
+
+    let effective = |grid: GridCase, frame: Option<Option<i64>>| {
+        effective_animated(
+            frame.flatten().map(|n| u32::try_from(n).unwrap()),
+            grid == GridCase::Set,
+        )
+    };
+    let pick = |want: &dyn Fn(GridCase, Option<Option<i64>>) -> bool| -> Vec<i64> {
+        cases
+            .iter()
+            .filter(|(_, g, f)| want(*g, *f))
+            .map(|(id, _, _)| *id)
+            .collect()
+    };
+    let yes = pick(&|g, f| effective(g, f));
+    let no_known = pick(&|g, f| !effective(g, f) && f.flatten().is_some());
+    let mut not_yes = pick(&|g, f| !effective(g, f));
+    not_yes.push(99);
+    // 格子を設定した 4 件は、未解析・計れない・1 コマでもアニメ
+    assert_eq!(yes, vec![4, 5, 6, 7, 8, 12, 16]);
+    assert_eq!(ids(&conn, "アニメ:あり"), yes);
+    assert_eq!(ids(&conn, "アニメ!=なし"), yes);
+    assert_eq!(ids(&conn, "アニメ:なし"), no_known);
+    assert_eq!(ids(&conn, "アニメ!=あり"), no_known);
+    assert_eq!(ids(&conn, "-アニメ:あり"), not_yes);
+    // 素材の欄と一覧の概要（タイルの印）も同じ関数の値
+    let all: Vec<i64> = cases.iter().map(|c| c.0).collect();
+    let rows = crate::items::summaries(&conn, &all).unwrap();
+    for (row, (id, grid, frame)) in rows.iter().zip(&cases) {
+        let want = effective(*grid, *frame);
+        let info = crate::asset::get(&conn, *id).unwrap();
+        assert_eq!(info.effective.animated, want, "{id}: {grid:?} {frame:?}");
+        assert_eq!((row.id, row.animated), (*id, want), "{grid:?} {frame:?}");
+    }
+    let waiting = pick(&|g, f| f.is_none() && g != GridCase::Set).len() as u64;
+    assert_eq!(waiting, 3);
+    assert_eq!(unanalyzed(&conn, "アニメ:あり"), Some(waiting));
+    assert_eq!(unanalyzed(&conn, "アニメ:なし"), Some(waiting));
+    assert_eq!(unanalyzed(&conn, "-アニメ:あり"), Some(waiting));
+}
+
 /// 読まずに形式から書く事実（JPEG とアルファのない HEIC。決定 5・15）は、透過・ドット絵・アニメの「なし」に入り、色数の
 /// 検索には入らない。
 #[test]
@@ -943,6 +1092,39 @@ fn fact_conditions_are_list_subqueries_not_correlated() {
     }
 }
 
+/// アニメの条件（格子の設定 ?? 解析のコマ。決定 16）は items を走査しない：格子の集合は `asset_settings`（変えたアイテムにだけ
+/// 行がある）から、コマの数は事実から集合を作り、items は主キーとハッシュで引く（OR は MULTI-INDEX OR）。
+#[test]
+fn anim_conditions_find_items_without_scanning_them() {
+    let conn = asset_library();
+    for query in [
+        "アニメ:あり",
+        "アニメ!=なし",
+        "アニメ:なし",
+        "アニメ!=あり",
+        "種類:画像 アニメ:あり",
+        "透過:あり アニメ:なし",
+        "アニメ:あり ドット絵:あり",
+    ] {
+        let parsed = parse(query).unwrap();
+        let cond = compile(&parsed.expr, &DbResolver { conn: &conn }, &ctx()).unwrap();
+        let sql = format!(
+            "SELECT i.id FROM items i WHERE i.trashed_at IS NULL AND ({}) ORDER BY i.imported_at DESC, i.id DESC",
+            cond.sql
+        );
+        let plan = explain(&conn, &sql, &cond.params);
+        assert!(plan.contains("asset_settings"), "{query}\n{plan}");
+        assert!(plan.contains("LIST SUBQUERY"), "{query}\n{plan}");
+        assert!(!plan.contains("CORRELATED"), "{query}\n{plan}");
+        assert!(
+            !plan
+                .split(" / ")
+                .any(|step| step == "SCAN i" || step.starts_with("SCAN i ")),
+            "{query}\n{plan}"
+        );
+    }
+}
+
 #[test]
 fn facts_in_one_and_share_one_subquery() {
     let conn = asset_library();
@@ -966,6 +1148,20 @@ fn facts_in_one_and_share_one_subquery() {
             .count(),
         2
     );
+    // `アニメ:なし` は事実（コマが 1 つ）をまとめ、格子がないことを足す。`アニメ:あり` は格子との OR なのでまとめない（決定 16）
+    let still = sql("透過:あり アニメ:なし");
+    assert_eq!(still.matches("media_facts").count(), 1, "{still}");
+    assert_eq!(still.matches("asset_settings").count(), 1, "{still}");
+    assert_eq!(
+        sql("透過:あり アニメ:あり").matches("media_facts").count(),
+        2
+    );
+    // 設定と事実の集合で引くドット絵・アニメと同じ AND の種類も、種類の索引に引っ張られないようにする
+    for query in ["種類:画像 アニメ:あり", "種類:画像 ドット絵:あり"] {
+        let merged = sql(query);
+        assert!(merged.contains("+i.kind"), "{merged}");
+    }
+    assert!(!sql("種類:画像 -アニメ:あり").contains("+i.kind"));
     assert_eq!(
         sql("(透過:あり | ループ:あり) 色数<=16")
             .matches("media_facts")
@@ -974,6 +1170,8 @@ fn facts_in_one_and_share_one_subquery() {
     );
     // まとめても結果は同じ
     assert_eq!(ids(&conn, "透過:あり 色数<=16 アニメ:なし"), vec![11, 14]);
+    assert_eq!(ids(&conn, "透過:あり アニメ:なし"), vec![11, 14]);
+    assert_eq!(ids(&conn, "種類:画像 アニメ:あり"), vec![13]);
     assert_eq!(ids(&conn, "-(透過:あり 色数<=8)"), {
         let mut all = vec![11, 12, 13, 15, 16, 17, 21, 22, 23, 24, 31, 41];
         all.sort_unstable();

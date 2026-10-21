@@ -529,7 +529,9 @@ GROUP BY item_id HAVING COUNT(*) = 3;
      （主キーと `blobs.hash` の UNIQUE だけを引き、200 件でも全件を走査しない。`summaries_join_facts_and_settings_without_scanning`）。
      ドット絵の実効値は「設定 ?? 自動 ?? 偽」（素材の欄と同じ関数 `asset::effective_pixel_art`。表示のため、どちらもないものは偽）。
      検索は「設定 ?? 自動」で比べ、どちらもないものは `ドット絵:なし`・`ドット絵!=あり` に入れず、除外にだけ入れる（下の「事実で引く」、
-     docs/search-query.md §4。`ドット絵:あり` の集合は表示の実効値が真のものと同じ）。ユニットの表紙も同じ形で 1 件引く。
+     docs/search-query.md §4。`ドット絵:あり` の集合は表示の実効値が真のものと同じ）。アニメの実効値は「格子の設定 ?? 解析のコマが
+     2 つ以上」（`asset::effective_animated`。タイルの印）で、検索の `アニメ:あり` の集合と同じ（下の「事実で引く」）。ユニットの表紙も
+     同じ形で 1 件引く。
 
 ### サイドバーの一覧（M3）
 
@@ -624,10 +626,24 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - 検索の実効値は「設定 ?? 自動」：ドット絵は `asset_settings.pixel_art` があればそれ、なければ `media_facts.pixel_art`。
   どちらもない（未解析か、解析しても材料が足りず NULL）ものは決まっていないので、`:あり`・`:なし`・`!=` のどれにも入れない
   （表示の実効値は「?? 偽」で偽にする。上の「一覧の取得」。テスト `pixel_art_search_follows_the_effective_value_of_the_asset_panel`）。
+- アニメも「設定 ?? 事実」（M11 のユーザーの決定 16）：`asset_settings.grid_json` の格子があればアニメ、なければ
+  `media_facts.frame_count` が 2 以上。`アニメ:あり` は `i.id IN (格子のあるアイテム) OR i.hash IN (… frame_count > 1)`、
+  `アニメ:なし` は `i.hash IN (… frame_count <= 1) AND i.id NOT IN (格子のあるアイテム)`（AND の中ではコマの側を事実の
+  部分問い合わせにまとめる）。格子のあるアイテムは `asset::grid_items_sql`（`grid_json` が版 1 の JSON。壊れたもの・知らない版は
+  素材の欄と同じく格子なし。版 1 の中の欄の欠け・知らない欄までは SQL で見ない：書き手 `asset::set_settings` は版 1 のそろった形
+  だけを書く）で、`asset_settings` を索引なしで読む（変えたアイテムにだけ行があるので小さい。items は主キーで引き、
+  走査しない。テスト `anim_search_follows_the_effective_value_of_the_asset_panel`・`anim_conditions_find_items_without_scanning_them`）。
+  ドット絵・アニメと同じ AND の種類の条件は `+i.kind` にする（種類の索引で画像を全部たどらない。10 万件で、種類の索引を使うと
+  `種類:画像 アニメ:あり` 27 ms・`種類:画像 ドット絵:あり` 22 ms、使わなければ 7.7 ms・3.2 ms。一致が 6 万件を超える
+  `種類:画像 ドット絵:なし` は 84 ms から 96 ms に延びるが、下の広い条件として M12 で直す）。
 - 2 のべき乗は列を持たず、`width & (width - 1) = 0` のビット演算で求める。
 - まだ解析していないもの・計れない値は、肯定・`!=`・大小の比較のどれにも入れない（除外だけが含む。docs/search-query.md §4）。
   色数の打ち切りの 257 は、結果が決まる比較（`>`・`!=` は 256 以下、`>=` は 257 以下の値）のときだけ入れ、ほかは
   `f.colors < 257` を足して除く。
+- 一致が 6〜9 万件の広い条件（`透過!=あり`・`ドット絵:なし`・`アニメ:なし`・`-透過:あり` など）は 10 万件で 43〜114 ms かかる
+  （数万件の 32 バイトのハッシュで items を引く分。集合を作るだけなら 5 ms）。M12 で台帳と版の表を触るときに、items に台帳の
+  整数の id（`blob_id`）を持たせ、事実の集合を整数で引く形にして 50 ms 以内にする（見込み約 13 ms。M11 のユーザーの決定 17。
+  roadmap.md の M12・ADR-161）。
 
 ### ユニットの集計
 
