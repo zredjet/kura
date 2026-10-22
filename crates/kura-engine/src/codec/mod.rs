@@ -387,10 +387,7 @@ impl CodecSet {
         let wav: Arc<wav::WavCodec> = Arc::new(wav::WavCodec);
         let aiff: Arc<aiff::AiffCodec> = Arc::new(aiff::AiffCodec);
         let flac: Arc<flac::FlacCodec> = Arc::new(flac::FlacCodec);
-        let svg = match &opts.svg_fonts {
-            Some(fonts) => svg::SvgCodec::with_svg_fonts(fonts.clone()),
-            None => svg::SvgCodec::default(),
-        };
+        let svg = svg::SvgCodec::pinned(opts);
         Self {
             decoders: vec![
                 png.clone(),

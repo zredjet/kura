@@ -17,7 +17,8 @@
 //!   描く時間は中止できない（resvg を途中で止める口がない）。木を作る段（usvg）も、見積もりの前に時間を使う形がある。
 //!   そこでアプリ（サムネイル・解析・アニメの帯。M12 のエディタも）は、このデコーダを同じ識別子のまま kura-core の
 //!   `svg_worker`（アプリ自身を引数付きで起動した別のプロセスで、このデコーダを動かす）に差し替え、時間の上限で子を止める
-//!   （決定 23）。ここの見積もりは、速く断る・子のメモリを抑える前段として残す。
+//!   （決定 23）。ここの見積もりは、速く断る前段として残し、見積もりの口（[`PlanHook`]）で働き手に渡す（働き手は子の確保の
+//!   上限を見積もりに合わせて決める。ADR-164 (4)）。
 
 use std::io::SeekFrom;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use resvg::usvg;
 
 use crate::codec::fonts::SvgFonts;
 use crate::codec::svg_text;
-use crate::codec::{Decoder, ReadSeek, Tier, try_vec};
+use crate::codec::{Decoder, PinnedOptions, ReadSeek, Tier, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
 use crate::limits::Limits;
@@ -65,13 +66,71 @@ fn err(e: impl std::fmt::Display) -> EngineError {
     }
 }
 
-/// SVG の読み取り。文字を描くフォントを持てる。
+/// 読むときの見積もり（見積もりの口 [`PlanHook`] に渡す）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// 前段の見積もり（実体・入れ子・要素の数・文字の手間）を通ったあと、usvg で木を作る前（形でも値でも）。
+    Tree(TreePlan),
+    /// 描く前の見積もりを通ったあと、キャンバスを確保する前（値を読むときだけ）。
+    Render(RenderPlan),
+}
+
+/// 木を作る前の見積もり。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreePlan {
+    /// DTD の実体を展開したあとの文字の数（バイト。実体がなければ SVG のバイト数）。
+    pub text_bytes: u64,
+    /// `<use>` の展開・marker の頂点ごとの複製を含めた要素の数（上限 `MAX_ELEMENTS`）。
+    pub elements: u64,
+}
+
+/// 描く前の見積もり。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderPlan {
+    /// 描くキャンバスの幅（画素）。
+    pub width: u32,
+    /// 描くキャンバスの高さ（画素）。
+    pub height: u32,
+    /// 描くあいだに同時に持つ一時の画像（層・mask・clip・フィルタの結果・pattern のタイル）のバイト数の見積もりのいちばん
+    /// 大きいもの（resvg と同じ大きさで数える。キャンバスとその写しは入れない）。
+    pub scratch_bytes: u64,
+}
+
+/// 見積もりの口：木を作る前（[`Plan::Tree`]。形でも値でも）と、描く前（[`Plan::Render`]。値を読むときだけ）に 1 度ずつ、
+/// 見積もりを通ったあとで呼ぶ（その前に断るときは呼ばない）。kura-core の SVG の働き手（別のプロセス）が、子の確保の上限を
+/// 見積もりに合わせて広げるのに使う。値には効かない。
+pub type PlanHook = Arc<dyn Fn(&Plan) + Send + Sync>;
+
+/// SVG の読み取り。文字を描くフォントと、見積もりの口を持てる。
 #[derive(Clone, Default)]
 pub struct SvgCodec {
     fonts: Option<SvgFonts>,
+    plan_hook: Option<PlanHook>,
 }
 
 impl SvgCodec {
+    /// 固定の段の設定（`PinnedOptions` の SVG のフォント）から作る（`CodecSet::pinned_with` と、同じデコーダを別のプロセスで
+    /// 動かす kura-core の働き手が使う）。
+    pub fn pinned(opts: &PinnedOptions) -> Self {
+        match &opts.svg_fonts {
+            Some(fonts) => Self::with_svg_fonts(fonts.clone()),
+            None => Self::default(),
+        }
+    }
+
+    /// 見積もりの口を付ける（[`PlanHook`]）。
+    pub fn with_plan_hook(mut self, hook: PlanHook) -> Self {
+        self.plan_hook = Some(hook);
+        self
+    }
+
+    /// 見積もりの口を呼ぶ。
+    fn planned(&self, plan: Plan) {
+        if let Some(hook) = &self.plan_hook {
+            hook(&plan);
+        }
+    }
+
     /// 文字を描くフォントの集まりをそのまま渡す。
     pub fn with_fonts(fonts: Arc<usvg::fontdb::Database>) -> Self {
         Self::with_svg_fonts(SvgFonts::from_database(fonts))
@@ -79,7 +138,10 @@ impl SvgCodec {
 
     /// 文字を描くフォントの入れ物を渡す（kura-mac が OS のフォントのファイルを mmap して渡す）。
     pub fn with_svg_fonts(fonts: SvgFonts) -> Self {
-        Self { fonts: Some(fonts) }
+        Self {
+            fonts: Some(fonts),
+            plan_hook: None,
+        }
     }
 
     /// 文字を描くフォントの集まり。文字がなければ、遅れて作る集まりを作らずに空の集まりを使う。文字があるのに書体が
@@ -267,10 +329,11 @@ fn entities(subset: &str) -> Result<Vec<(String, usize)>, EngineError> {
     Ok(out)
 }
 
-/// DTD の実体を展開したときの文字の数を見積もり、上限を超えれば断る。
-fn check_entities(text: &str) -> Result<(), EngineError> {
+/// DTD の実体を展開したときの文字の数を見積もり、上限を超えれば断る。通ったら見積もった数（実体がなければ `text` の
+/// バイト数）を返す。
+fn check_entities(text: &str) -> Result<u64, EngineError> {
     let Some((subset, body_at)) = internal_subset(text)? else {
-        return Ok(());
+        return Ok(text.len() as u64);
     };
     let body = &text[body_at..];
     let mut total = body.len() as u64;
@@ -281,7 +344,7 @@ fn check_entities(text: &str) -> Result<(), EngineError> {
     if total > MAX_EXPANDED {
         return Err(EngineError::Limit("実体を展開すると大きすぎます".into()));
     }
-    Ok(())
+    Ok(total.saturating_add(body_at as u64))
 }
 
 /// `marker` を使うときに描く形の頂点の数の見積もり（数の数 ÷ 2 + 1。上限あり）。
@@ -860,6 +923,8 @@ struct Facts {
     text_work: u64,
     /// いちばん重い文字の塊を 1 度形にし直す手間（代わりのフォントが見つかったとき）。
     reshape: u64,
+    /// `<use>` の展開・参照ごとの複製・marker の頂点ごとの複製を含めた要素の数。
+    elements: u64,
 }
 
 /// href の値の参照先の id（前後の空白を除き、`#` のあと最初の空白まで。usvg が使う svgtypes の IRI と同じ読み方）。
@@ -1482,6 +1547,7 @@ fn analyze(doc: &usvg::roxmltree::Document<'_>) -> Result<Facts, EngineError> {
         has_text,
         text_work: total_text,
         reshape,
+        elements: total,
     })
 }
 
@@ -1502,13 +1568,17 @@ impl SvgCodec {
         text: &str,
         max_text_work: u64,
     ) -> Result<(usvg::Tree, u64), EngineError> {
-        check_entities(text)?;
+        let text_bytes = check_entities(text)?;
         check_depth(text)?;
         let facts = check_elements(text)?;
         if facts.text_work > max_text_work {
             return Err(text_limit());
         }
         let fontdb = self.fontdb(facts.has_text)?;
+        self.planned(Plan::Tree(TreePlan {
+            text_bytes,
+            elements: facts.elements,
+        }));
         // フォントを選ぶ・代わりを探す手間は書体の数で決まる。残りの手間から引き、尽きたら選ばずに断る（svg_text）
         let guard = Arc::new(svg_text::TextGuard::new(
             max_text_work.saturating_sub(facts.text_work),
@@ -1759,13 +1829,14 @@ fn primitive_work(p: &usvg::filter::Primitive, lw: u64, lh: u64, sx: f32, sy: f3
 /// 木（mask・clipPath・フィルタの feImage・文字の輪郭・pattern の中身も。pattern・mask・clip は参照ごとに）は再帰せずにたどる。
 /// 変形の倍率は平行移動によらないので、層のずらしは見ない。文字の輪郭を 2 度目から描き直す手間は、文字のレイアウトの残りの
 /// 手間 `text_left` から引き、尽きたら `Limit`（文字の手間の上限の 1 件 100 ms ほどに入れる。検証のあとの確認 R3）。
+/// 通ったら、(1) の同時に生きる一時の画像のいちばん大きい合計（バイト）を返す（[`RenderPlan::scratch_bytes`]）。
 fn check_render(
     tree: &usvg::Tree,
     w: u32,
     h: u32,
     limits: &Limits,
     text_left: u64,
-) -> Result<(), EngineError> {
+) -> Result<u64, EngineError> {
     let (cw, ch) = (u64::from(w), u64::from(h));
     let max_bytes = limits.max_value_bytes;
     let max_work = cw
@@ -1775,6 +1846,8 @@ fn check_render(
     let too_much =
         |what: &str| EngineError::Unsupported(format!("{what}が大きすぎる SVG は読めません"));
     let mut work = 0u64;
+    // 同時に生きる一時の画像のいちばん大きい合計
+    let mut peak = 0u64;
     // 文字の輪郭の 2 度目からの描き直しの手間（文字の手間の残り `text_left` から引く）
     let mut text_redraw = 0u64;
     // 見た文字（2 度目からは描き直し）と、path ごとの変形によらない数。参照で共有される節を見分けるだけなので
@@ -1838,6 +1911,7 @@ fn check_render(
                     if live > max_bytes {
                         return Err(too_much("描くための一時の画像（層・mask・フィルタ）"));
                     }
+                    peak = peak.max(live);
                     work = work.saturating_add(layer.saturating_mul(masks + 1));
                     surf = (lw, lh);
                     // mask・clip・feImage の中身は、層と同じ道筋（同じ一時の画像を持ったまま）で描く
@@ -1923,6 +1997,7 @@ fn check_render(
                             if live > max_bytes {
                                 return Err(too_much("pattern のタイル"));
                             }
+                            peak = peak.max(live);
                             work = work.saturating_add(tile);
                             stack.push((
                                 Visit::Group(pat.root()),
@@ -1940,7 +2015,7 @@ fn check_render(
             return Err(too_much("描く手間"));
         }
     }
-    Ok(())
+    Ok(peak)
 }
 
 fn size_of(tree: &usvg::Tree, limits: &Limits) -> Result<(u32, u32), EngineError> {
@@ -1998,7 +2073,7 @@ impl Decoder for SvgCodec {
         let text = read_source(src)?;
         let (tree, text_left) = self.tree(&text)?;
         let (w, h) = size_of(&tree, limits)?;
-        check_render(&tree, w, h, limits, text_left)?;
+        let scratch_bytes = check_render(&tree, w, h, limits, text_left)?;
         limits
             .check(&Shape::Image {
                 w: Dim::Exact(u64::from(w)),
@@ -2006,6 +2081,11 @@ impl Decoder for SvgCodec {
                 fmt: PixelFormat::Rgba8,
             })
             .map_err(EngineError::Limit)?;
+        self.planned(Plan::Render(RenderPlan {
+            width: w,
+            height: h,
+            scratch_bytes,
+        }));
         let mut pixmap = tiny_skia::Pixmap::new(w, h)
             .ok_or_else(|| EngineError::Limit("画素を確保できません".into()))?;
         resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
@@ -2048,6 +2128,103 @@ mod tests {
         )?;
         assert!(shape.admits(&v.shape()));
         Ok(v)
+    }
+
+    /// 見積もりの口：前段の見積もりを通ったら木を作る前に（形でも値でも）、描く前の見積もりを通ったらキャンバスを確保する前に
+    /// （値だけ）1 度ずつ、見積もりを渡す（実体を展開したあとの文字の数・use を展開した要素の数／大きさと同時に持つ一時の画像
+    /// （層・mask・フィルタ・pattern のタイル）のいちばん大きい合計）。その前に断るときは呼ばない。kura-core の SVG の働き手が、
+    /// 子の確保の上限を見積もりに合わせて広げるのに使う。値は口がなくても同じ。
+    #[test]
+    fn the_plan_hook_sees_the_estimates_before_building_and_drawing() {
+        let seen: Arc<std::sync::Mutex<Vec<Plan>>> = Arc::default();
+        let log = seen.clone();
+        let hooked = SvgCodec::default().with_plan_hook(Arc::new(move |p: &Plan| {
+            log.lock().unwrap().push(*p);
+        }));
+        let (opts, limits) = (DecodeOptions::default(), Limits::default());
+        let read = |c: &SvgCodec, svg: &str| {
+            c.decode(
+                &mut Cursor::new(svg.as_bytes().to_vec()),
+                "svg",
+                &opts,
+                &limits,
+                &NoMonitor,
+            )
+        };
+        let svg = |body: &str| {
+            format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="20">{body}</svg>"#
+            )
+        };
+        let plain = svg(r##"<rect width="5" height="5" fill="#f00"/>"##);
+        // 層：外接矩形 5×5 に 2 画素ずつの余白を足した 9×9
+        let group = svg(r#"<g opacity=".5"><rect width="5" height="5"/></g>"#);
+        // 層はキャンバスの外へ 2 倍まで（-2w..3w）広がる：150×100。入れ子の層は親の層を持ったまま
+        let wide = svg(
+            r#"<g opacity=".5"><rect x="-1e6" y="-1e6" width="2e6" height="2e6"/><g opacity=".5"><rect width="5" height="5"/></g></g>"#,
+        );
+        // use は参照先を展開して数える（svg・use 3 つ・defs・g・rect 2 つ ＋ 展開した g・rect 2 つ × 3）
+        let uses = svg(
+            r##"<defs><g id="a"><rect width="2" height="2"/><rect x="3" width="2" height="2"/></g></defs><use href="#a"/><use href="#a" y="4"/><use href="#a" y="8"/>"##,
+        );
+        // DTD の実体は展開した文字の数で数える
+        let entity = format!(
+            r##"<!DOCTYPE svg [<!ENTITY c "#ff0000">]>{}"##,
+            svg(
+                r#"<rect width="1" height="1" fill="&c;"/><rect width="2" height="2" fill="&c;"/>"#
+            )
+        );
+        for body in [&plain, &group, &wide, &uses, &entity] {
+            let v = read(&hooked, body).unwrap();
+            assert_eq!(v, read(&SvgCodec::default(), body).unwrap());
+        }
+        // 形を読むときは木を作る前だけ。描く前に断る（大きすぎる）ときは描く前を呼ばず、木を作る前に断る（文字）ときは呼ばない
+        hooked
+            .shape(
+                &mut Cursor::new(group.as_bytes().to_vec()),
+                "svg",
+                &opts,
+                &limits,
+            )
+            .unwrap();
+        let too_big = r#"<svg xmlns="http://www.w3.org/2000/svg" width="40000" height="4"/>"#;
+        assert!(read(&hooked, too_big).is_err());
+        assert!(read(&hooked, &svg("<text>a</text>")).is_err());
+        let tree = |svg: &str, elements| {
+            Plan::Tree(TreePlan {
+                text_bytes: svg.len() as u64,
+                elements,
+            })
+        };
+        let render = |scratch_bytes| {
+            Plan::Render(RenderPlan {
+                width: 30,
+                height: 20,
+                scratch_bytes,
+            })
+        };
+        // 実体の見積もりは、参照の文字を残したまま中身を足す（多めの側）
+        let expanded = Plan::Tree(TreePlan {
+            text_bytes: (entity.len() + 2 * "#ff0000".len()) as u64,
+            elements: 3,
+        });
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                tree(&plain, 2),
+                render(0),
+                tree(&group, 3),
+                render(9 * 9 * 4),
+                tree(&wide, 5),
+                render((150 * 100 + 9 * 9) * 4),
+                tree(&uses, 8 + 3 * 3),
+                render(0),
+                expanded,
+                render(0),
+                tree(&group, 3),
+                tree(too_big, 1),
+            ]
+        );
     }
 
     #[test]
