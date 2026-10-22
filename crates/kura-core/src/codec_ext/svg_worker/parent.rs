@@ -13,33 +13,69 @@ use kura_engine::doc::DecodeOptions;
 use kura_engine::{EngineError, Limits, Monitor, NoMonitor, Shape, Value};
 
 use super::wire::{self, Op, Reply, ReplyReader};
-use super::{DECODE_DEADLINE, SHAPE_DEADLINE, TIME_LIMIT, WORKER_ARG};
+use super::{DECODE_DEADLINE, SHAPE_DEADLINE, TIME_LIMIT, WORKER_ARG, unavailable};
 use crate::tools::{self, Budget, RunError, RunOutcome, Stopped};
 
-/// 働き手を起動するコマンド（実行ファイルと引数）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 働き手の実行ファイルを求める口（起動のたびに呼ぶ）。
+pub type ExeResolver = Arc<dyn Fn() -> std::io::Result<PathBuf> + Send + Sync>;
+
+/// 働き手を起動するコマンド（実行ファイルを求める口と引数）。実行ファイルは起動のたびに求め直す（動いているアプリを移す・
+/// 改名しても、今の場所を起動する。M11 の 3 回目の確認 W2）。
+#[derive(Clone)]
 pub struct WorkerCommand {
-    pub exe: PathBuf,
-    pub args: Vec<OsString>,
+    exe: ExeResolver,
+    args: Vec<OsString>,
+}
+
+impl std::fmt::Debug for WorkerCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerCommand")
+            .field("exe", &"（起動のたびに求める）")
+            .field("args", &self.args)
+            .finish()
+    }
 }
 
 impl WorkerCommand {
-    /// 実行ファイルと引数から作る。
+    /// 決まった実行ファイルと引数から作る（テスト・偽の働き手）。
     pub fn new(
         exe: impl Into<PathBuf>,
         args: impl IntoIterator<Item = impl Into<OsString>>,
     ) -> Self {
+        let exe: PathBuf = exe.into();
+        Self::resolved_by(move || Ok(exe.clone()), args)
+    }
+
+    /// 実行ファイルを起動のたびに `resolve` で求める形で作る。
+    pub fn resolved_by(
+        resolve: impl Fn() -> std::io::Result<PathBuf> + Send + Sync + 'static,
+        args: impl IntoIterator<Item = impl Into<OsString>>,
+    ) -> Self {
         Self {
-            exe: exe.into(),
+            exe: Arc::new(resolve),
             args: args.into_iter().map(Into::into).collect(),
         }
     }
 
-    /// 自分の実行ファイルを [`WORKER_ARG`] 付きで起動する（アプリ・kura-devtools）。分からなければ理由。
-    pub fn current_exe() -> Result<Self, String> {
-        std::env::current_exe()
-            .map(|exe| Self::new(exe, [WORKER_ARG]))
-            .map_err(|e| format!("自分の実行ファイルが分かりません: {e}"))
+    /// 自分の実行ファイル（起動のたびに `resolve` で求める）を [`WORKER_ARG`] 付きで起動する。アプリと kura-devtools は
+    /// kura-mac の `current_executable`（自分のプロセスの今の実行ファイル。改名・移動を追う）を渡す。
+    pub fn own_exe(resolve: impl Fn() -> std::io::Result<PathBuf> + Send + Sync + 'static) -> Self {
+        Self::resolved_by(resolve, [WORKER_ARG])
+    }
+
+    /// [`Self::own_exe`] の OS によらない既定（`std::env::current_exe`。macOS では起動したときのパスで、改名を追わない）。
+    pub fn current_exe() -> Self {
+        Self::own_exe(std::env::current_exe)
+    }
+
+    /// 今の実行ファイル（求める口を呼ぶ）。
+    pub fn exe(&self) -> std::io::Result<PathBuf> {
+        (self.exe)()
+    }
+
+    /// 引数。
+    pub fn args(&self) -> &[OsString] {
+        &self.args
     }
 }
 
@@ -63,16 +99,19 @@ impl Default for Deadlines {
 /// プロセスの中のデコーダ（`inner`）のものを返す（`inner` で読むことはしない）。
 pub struct SvgWorkerDecoder {
     inner: Arc<dyn Decoder>,
-    cmd: Result<WorkerCommand, String>,
+    cmd: WorkerCommand,
+    /// 親のビルドの印（`super::build_stamp`。頼みに入れ、返事の印と照らす）。
+    stamp: String,
     deadlines: Deadlines,
 }
 
 impl SvgWorkerDecoder {
-    /// プロセスの中のデコーダ `inner` の代わりに、`cmd` の働き手に頼むものを作る。
-    pub fn new(inner: Arc<dyn Decoder>, cmd: Result<WorkerCommand, String>) -> Self {
+    /// プロセスの中のデコーダ `inner` の代わりに、`cmd` の働き手に頼むものを作る。`stamp` は親のビルドの印。
+    pub fn new(inner: Arc<dyn Decoder>, cmd: WorkerCommand, stamp: String) -> Self {
         Self {
             inner,
             cmd,
+            stamp,
             deadlines: Deadlines::default(),
         }
     }
@@ -109,6 +148,13 @@ impl SvgWorkerDecoder {
         Ok(std::path::absolute(path)?)
     }
 
+    /// 働き手を使えない一時的な誤りにする（ログにも出す）。
+    fn unavailable(&self, why: impl std::fmt::Display) -> EngineError {
+        let err = unavailable(why);
+        tracing::warn!("{err}");
+        err
+    }
+
     /// 子を 1 つ起動して頼み、返事を受け取る。
     fn call(
         &self,
@@ -119,20 +165,30 @@ impl SvgWorkerDecoder {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<Reply, EngineError> {
-        let cmd = self
-            .cmd
-            .as_ref()
-            .map_err(|m| self.decode_error(format!("SVG を読む働き手を起動できません（{m}）")))?;
         if mon.canceled() {
             return Err(EngineError::Canceled);
         }
+        // 実行ファイルは起動のたびに求める（動いているアプリを移す・改名しても、今の場所を起動する）
+        let exe = self
+            .cmd
+            .exe()
+            .map_err(|e| self.unavailable(format!("自分の実行ファイルが分かりません: {e}")))?;
         let deadline = match op {
             Op::Shape => self.deadlines.shape,
             Op::Decode => self.deadlines.decode,
         };
         let mut request = Vec::new();
-        wire::write_request(&mut request, op, input, format, opts, limits, deadline)?;
-        let mut reader = ReplyReader::new(op, limits);
+        wire::write_request(
+            &mut request,
+            &self.stamp,
+            op,
+            input,
+            format,
+            opts,
+            limits,
+            deadline,
+        )?;
+        let mut reader = ReplyReader::new(op, limits, &self.stamp);
         let budget = Budget {
             max_stdout: reader.max_len(),
             stall: deadline,
@@ -145,8 +201,8 @@ impl SvgWorkerDecoder {
                 reader.push(chunk).inspect_err(|e| broken = Some(e.clone()))
             };
             tools::run_binary_kill(
-                &cmd.exe,
-                &cmd.args,
+                &exe,
+                self.cmd.args(),
                 Path::new("/"),
                 &budget,
                 &|| mon.canceled(),
@@ -164,6 +220,10 @@ impl SvgWorkerDecoder {
                 return Err(self.decode_error("SVG を読む働き手の返事が大きすぎます"));
             }
             Err(RunError::Stopped(Stopped::Consumer)) => {
+                // 返事の印・版・ビルドの印が違う：別のビルドの働き手（一時的な誤り）
+                if let Some(why) = reader.foreign() {
+                    return Err(self.unavailable(format!("{} は{why}", exe.display())));
+                }
                 return Err(self.decode_error(format!(
                     "SVG を読む働き手の返事が壊れています（{}）",
                     broken.unwrap_or_default()
@@ -173,7 +233,7 @@ impl SvgWorkerDecoder {
                 return Err(self.decode_error("SVG を読む働き手が終わりません"));
             }
             Err(RunError::Spawn(e)) => {
-                return Err(self.decode_error(format!("SVG を読む働き手を起動できません（{e}）")));
+                return Err(self.unavailable(format!("{} を起動できません: {e}", exe.display())));
             }
             Err(RunError::Wait(e)) => {
                 return Err(
@@ -183,7 +243,7 @@ impl SvgWorkerDecoder {
         };
         if !outcome.status.success() {
             let why = crashed(&outcome);
-            tracing::warn!(exe = %cmd.exe.display(), "SVG を読む働き手が異常終了しました（{why}）");
+            tracing::warn!(exe = %exe.display(), "SVG を読む働き手が異常終了しました（{why}）");
             return Err(self.decode_error(format!("SVG を読む働き手が異常終了しました（{why}）")));
         }
         reader

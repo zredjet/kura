@@ -687,8 +687,18 @@ fn failure_is_recorded_and_not_retried_until_fingerprint_changes() {
 }
 
 /// 固定の段の SVG のデコーダを、`/bin/sh -c script` の偽の働き手（時間の上限 `ms`）に頼む形に差し替えた組。
-fn svg_worker_set(log: &Arc<Mutex<Vec<String>>>, script: &'static str, ms: u64) -> CodecSet {
-    use crate::codec_ext::svg_worker::{Deadlines, WorkerCommand, install_with};
+fn svg_worker_set(log: &Arc<Mutex<Vec<String>>>, script: &str, ms: u64) -> CodecSet {
+    use crate::codec_ext::svg_worker::WorkerCommand;
+    svg_worker_set_with(log, WorkerCommand::new("/bin/sh", ["-c", script]), ms)
+}
+
+/// 固定の段の SVG のデコーダを、`worker` の働き手（時間の上限 `ms`）に頼む形に差し替えた組。
+fn svg_worker_set_with(
+    log: &Arc<Mutex<Vec<String>>>,
+    worker: crate::codec_ext::svg_worker::WorkerCommand,
+    ms: u64,
+) -> CodecSet {
+    use crate::codec_ext::svg_worker::{Deadlines, install_with};
     let mut set = watched_set(log, None, Vec::new());
     let svg = CodecSet::pinned()
         .decoder_by_id(kura_engine::codec::svg::DEC_ID)
@@ -697,7 +707,8 @@ fn svg_worker_set(log: &Arc<Mutex<Vec<String>>>, script: &'static str, ms: u64) 
     set.add_decoder(svg).unwrap();
     install_with(
         &mut set,
-        Ok(WorkerCommand::new("/bin/sh", ["-c", script])),
+        &kura_engine::codec::PinnedOptions::default(),
+        worker,
         Deadlines {
             shape: Duration::from_millis(ms),
             decode: Duration::from_millis(ms),
@@ -752,6 +763,71 @@ fn svg_worker_time_limits_fail_the_item_and_cancel_stops_the_child() {
     );
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(env.last().state, JobState::Canceled);
+    assert_eq!(env.state(1), "pending");
+}
+
+/// M11 の 3 回目の確認 W2：SVG の働き手を使えない（別のビルド・起動できない）のはアイテムのせいではない。そのアイテムは
+/// 失敗にせず（pending のまま）、書きためた分を書いて処理中の印を消し、ジョブを失敗にしてその場で止める（同じアイテムを
+/// 拾い続けない）。次にジョブを積めばやり直す（1 回の実行で働き手を 1 回だけ起動する）。
+#[test]
+fn an_unavailable_svg_worker_leaves_the_item_pending_and_stops_the_job() {
+    use crate::codec_ext::svg_worker::{WORKER_ARG, WorkerCommand};
+    let dir = tempfile::tempdir().unwrap();
+    let count = dir.path().join("spawned");
+    let spawned = || {
+        std::fs::read_to_string(&count)
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    };
+    // 前の版のやり取り（版 1）で答える働き手（動かしたまま置き換えた前のビルド）
+    let script = format!(
+        r"echo x >> '{}'; cat >/dev/null; printf 'KURASVG<\001\000\000\000\000\000\000\000'",
+        count.display()
+    );
+    let env = Env::with(|log, _| svg_worker_set(log, &script, 5_000), 64 << 20);
+    env.add(1, "image", "png", &sprite(3));
+    let svg = env.add(2, "image", "svg", TINY_SVG);
+    env.add(3, "image", "png", &sprite(4));
+    for round in 1..=2 {
+        let record = env.run();
+        assert_eq!(record.state, JobState::Failed, "{round}");
+        let message = record.message.unwrap_or_default();
+        assert!(
+            message.contains("SVG を読む働き手") && message.contains("解析を止めました"),
+            "{message}"
+        );
+        assert_eq!(record.error_code.as_deref(), Some("ToolFailed"));
+        assert_eq!(env.state(2), "pending", "{round}: 失敗にしない");
+        assert_eq!(env.state(3), "ready", "{round}: 先に解いた分は書く");
+        assert_eq!(env.state(1), "pending", "{round}: その場で止める");
+        assert_eq!(spawned(), round, "1 回の実行で起動は 1 回");
+        let mark: i64 = env.query(&format!(
+            "SELECT COUNT(*) FROM settings WHERE key = '{INFLIGHT_KEY}'"
+        ));
+        assert_eq!(mark, 0, "処理中の印を消す");
+    }
+    let facts: i64 = env.query(&format!(
+        "SELECT COUNT(*) FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE hex(b.hash) = upper('{svg}')"
+    ));
+    assert_eq!(facts, 0, "失敗の事実を書かない");
+
+    // 起動できない（動かしたまま移した・消した）も同じ
+    let missing = dir.path().join("moved/kura-app");
+    let env = Env::with(
+        |log, _| svg_worker_set_with(log, WorkerCommand::new(&missing, [WORKER_ARG]), 5_000),
+        64 << 20,
+    );
+    env.add(1, "image", "svg", TINY_SVG);
+    let record = env.run();
+    assert_eq!(record.state, JobState::Failed);
+    assert!(
+        record
+            .message
+            .unwrap_or_default()
+            .contains("起動できません"),
+        "{:?}",
+        env.last()
+    );
     assert_eq!(env.state(1), "pending");
 }
 

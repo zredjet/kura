@@ -28,18 +28,17 @@ fn the_devtools_binary_reads_svg_like_the_in_process_decoder() {
     // ビルドしたばかりの実行ファイルの最初の起動は、重い環境で 1 秒を超えることがある。値の一致を確かめるので、時間で
     // 止まらないように上限を長くする（時間の上限は kura-core の tests/svg_worker.rs が確かめる）
     let long = Duration::from_secs(120);
-    svg_worker::install_with(
-        &mut remote,
-        Ok(WorkerCommand::new(
+    let worker = || {
+        WorkerCommand::new(
             env!("CARGO_BIN_EXE_kura-devtools"),
             [svg_worker::WORKER_ARG],
-        )),
-        Deadlines {
-            shape: long,
-            decode: long,
-        },
-    )
-    .unwrap();
+        )
+    };
+    let deadlines = Deadlines {
+        shape: long,
+        decode: long,
+    };
+    svg_worker::install_with(&mut remote, &opts, worker(), deadlines).unwrap();
     for (i, svg) in CASES.iter().enumerate() {
         let read = |set: &CodecSet| {
             set.decode(
@@ -61,5 +60,23 @@ fn the_devtools_binary_reads_svg_like_the_in_process_decoder() {
             }
             (a, b) => panic!("{i}: {a:?} と {b:?}"),
         }
+    }
+    // 親と設定（ビルドの印）が違えば、働き手は読まずに断り、親は一時的な誤りにする（M11 の 3 回目の確認 W2）。macOS では
+    // 働き手がシステムのフォントを持つので、フォントなしの親とは印が違う
+    if opts.svg_fonts.is_some() {
+        let mut other = CodecSet::pinned();
+        let no_fonts = kura_engine::codec::PinnedOptions::default();
+        svg_worker::install_with(&mut other, &no_fonts, worker(), deadlines).unwrap();
+        let err = other
+            .decode(
+                &mut Cursor::new(CASES[1].as_bytes().to_vec()),
+                "svg",
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap_err();
+        assert!(svg_worker::is_unavailable(&err), "{err}");
+        assert!(err.to_string().contains("fonts"), "{err}");
     }
 }

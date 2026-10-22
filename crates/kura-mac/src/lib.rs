@@ -7,6 +7,7 @@
 //!   CoreText のフォントの見本とフォントの情報（`thumbs`）
 //! - `pinned_options`・`system_svg_fonts`：SVG の文字を描くシステムのフォント（mmap して渡す。`fonts`）
 //! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
+//! - `current_executable`・`executable_path`：プロセスの今の実行ファイル（改名・移動を追う。SVG の働き手の起動。`process`）
 //! - `find_chrome`・`snapshot_webview`：キャプチャ用の Google Chrome の場所と、WKWebView の表示範囲の撮影
 //! - `reveal_in_finder`・`volume_capacity`・`physical_memory`：Finder で見せる、ボリュームの容量、物理メモリ（編集のメモリの予算）
 //! - `codec`：編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し）と
@@ -26,6 +27,7 @@ pub mod codec;
 mod external;
 mod files;
 pub mod fonts;
+mod process;
 mod thumbs;
 
 pub use alloc::ReturningAllocator;
@@ -42,6 +44,7 @@ pub use files::{
     volume_capacity,
 };
 pub use fonts::{pinned_options, system_svg_fonts};
+pub use process::{current_executable, executable_path};
 pub use thumbs::{
     FONT_SAMPLES, FontInfo, FontProbe, font_thumbnails, image_thumbnails_keep_alpha, probe_font,
 };

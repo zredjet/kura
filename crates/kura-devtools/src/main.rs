@@ -148,30 +148,32 @@ impl EngineFactory for MacEngineFactory {
 /// アプリと同じコーデックの組：固定の段（SVG の文字はシステムのフォント）→ macOS → ffmpeg。SVG は自分を働き手として起動した
 /// 別のプロセスで読む（決定 23。`svg_worker`）。`work_dir` は ffmpeg の一時ファイルの置き場。
 pub(crate) fn app_codecs(work_dir: &std::path::Path) -> CodecSet {
-    let mut set = kura_mac::full_codec_set(&kura_mac::pinned_options(), work_dir);
+    let opts = kura_mac::pinned_options();
+    let mut set = kura_mac::full_codec_set(&opts, work_dir);
     if let Some(cmd) = svg_worker_command()
-        && let Err(e) = svg_worker::install(&mut set, cmd)
+        && let Err(e) = svg_worker::install(&mut set, &opts, cmd)
     {
         tracing::error!("SVG の働き手を組めません: {e}");
     }
     set
 }
 
-/// SVG の働き手を起動するコマンド：自分の実行ファイル（`--kura-svg-worker` 付き）。
+/// SVG の働き手を起動するコマンド：自分の実行ファイル（`--kura-svg-worker` 付き。起動のたびに kura-mac の
+/// `current_executable` で今の場所を求める）。
 #[cfg(not(test))]
-fn svg_worker_command() -> Option<Result<WorkerCommand, String>> {
-    Some(WorkerCommand::current_exe())
+fn svg_worker_command() -> Option<WorkerCommand> {
+    Some(WorkerCommand::own_exe(kura_mac::current_executable))
 }
 
 /// テストのハーネス（`target/<profile>/deps/kura_devtools-…`）は働き手になれないので、cargo が隣に作る実行ファイル
 /// （`target/<profile>/kura-devtools`。結合テスト `tests/svg_worker.rs` が使うので `cargo test -p kura-devtools` で作られる）を
 /// 働き手にする。なければ（単体テストだけを組んだとき）SVG はプロセスの中で読む。
 #[cfg(test)]
-fn svg_worker_command() -> Option<Result<WorkerCommand, String>> {
+fn svg_worker_command() -> Option<WorkerCommand> {
     let exe = std::env::current_exe().ok()?;
     let bin = exe.parent()?.parent()?.join("kura-devtools");
     bin.is_file()
-        .then(|| Ok(WorkerCommand::new(bin, [svg_worker::WORKER_ARG])))
+        .then(|| WorkerCommand::new(bin, [svg_worker::WORKER_ARG]))
 }
 
 /// アプリと同じ渡しもの（メディアの実装・エンジンの部品・DB を新しい版にするときの空きの確かめ）。知らせはログに出す。

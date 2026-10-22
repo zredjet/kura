@@ -12,6 +12,9 @@
 //!   ただし別のプロセスで読む SVG が時間の上限を超えたもの（`svg_worker::is_time_limit`）は回さずに失敗（種類の絵）にする
 //!   （ImageIO の道は SVG のサムネイルを作れず、時間を使う SVG をプロセスの中でもう一度開くだけ。決定 23）。SVG の形を読む
 //!   子は、見積もりの段でも中止で止める（`CodecSet::shape_path_monitored`）。
+//! - SVG の働き手を使えない（起動できない・別のビルド。`svg_worker::is_unavailable`。M11 の 3 回目の確認 W2）ものは、アイテムの
+//!   せいではないので [`EngineDone::Unavailable`] にする（何も書かない。pending・stale のまま）。働き手は呼ぶたびに同じく
+//!   使えないので、まだ見積もっていない残りは試さずに同じ結果にする（呼び手のジョブはその場で止める）。
 
 use std::fs::File;
 use std::io::Read;
@@ -83,6 +86,8 @@ pub enum EngineDone {
     },
     /// 中止・一時停止（何も書かない。pending・stale のまま）。
     Canceled,
+    /// SVG の働き手を使えない（一時的な誤り。理由）。何も書かない（pending・stale のまま）。呼び手はジョブを止める。
+    Unavailable(String),
 }
 
 /// 見積もり：描く全体で持つ分と、プールの仕事ごとの分。
@@ -126,18 +131,29 @@ impl EngineThumbs {
         self
     }
 
-    /// `jobs` を描く（結果は同じ順）。ジョブのスレッド（プールの外）から呼ぶ。
+    /// `jobs` を描く（結果は同じ順）。ジョブのスレッド（プールの外）から呼ぶ。見積もりで SVG の働き手を使えないと分かったら、
+    /// まだ見積もっていない残りは試さずに [`EngineDone::Unavailable`] にする（見積もり終えたものは描く）。
     pub fn render(&self, jobs: &[EngineJob], mon: &dyn Monitor) -> Vec<EngineDone> {
         let mut done: Vec<Option<EngineDone>> = vec![None; jobs.len()];
         let mut planned = Vec::new();
+        let mut unavailable: Option<String> = None;
         for (index, job) in jobs.iter().enumerate() {
             if mon.canceled() {
                 done[index] = Some(EngineDone::Canceled);
                 continue;
             }
+            if let Some(why) = &unavailable {
+                done[index] = Some(EngineDone::Unavailable(why.clone()));
+                continue;
+            }
             match self.plan(job, mon) {
                 Ok((est, model)) => planned.push(Planned { index, est, model }),
-                Err(result) => done[index] = Some(result),
+                Err(result) => {
+                    if let EngineDone::Unavailable(why) = &result {
+                        unavailable = Some(why.clone());
+                    }
+                    done[index] = Some(result);
+                }
             }
         }
         let threads = self.runtime.bulk_threads() as u64;
@@ -318,10 +334,13 @@ fn boxed(info: &model::ModelInfo) -> Box<ModelInfo> {
     Box::new(ModelInfo::from(info))
 }
 
-/// 描かなかった・描けなかったときの結果：中止はそのまま、画像は ImageIO へ回し、3D は失敗。
+/// 描かなかった・描けなかったときの結果：中止はそのまま、SVG の働き手を使えないのは一時的な誤り、画像は ImageIO へ回し、
+/// 3D は失敗。
 fn not_drawn(job: &EngineJob, err: &EngineError, info: Option<&model::ModelInfo>) -> EngineDone {
     match (err, job.what) {
         (EngineError::Canceled, _) => EngineDone::Canceled,
+        // 起動できない・別のビルド（M11 の 3 回目の確認 W2）：アイテムのせいではないので失敗にも ImageIO にもしない
+        (e, _) if svg_worker::is_unavailable(e) => EngineDone::Unavailable(e.to_string()),
         (EngineError::Io(e), _) if is_write_error(&job.targets, e) => EngineDone::Failed {
             error: format!("サムネイルを書けません: {e}"),
             model: info.map(boxed),
@@ -1119,10 +1138,15 @@ mod tests {
         }
     }
 
-    /// 働き手（/bin/sh の偽物）か、決まった答えを返す偽のデコーダに SVG を頼む組。
+    /// 働き手（/bin/sh の偽物など）か、決まった答えを返す偽のデコーダに SVG を頼む組。
     struct SvgFactory {
-        script: Option<&'static str>,
+        worker: Option<crate::codec_ext::svg_worker::WorkerCommand>,
         deadlines: crate::codec_ext::svg_worker::Deadlines,
+    }
+
+    /// `/bin/sh -c script` の偽の働き手。
+    fn sh(script: &str) -> crate::codec_ext::svg_worker::WorkerCommand {
+        crate::codec_ext::svg_worker::WorkerCommand::new("/bin/sh", ["-c", script])
     }
 
     /// 形は答えるが、値は時間の上限を超えたと答える SVG のデコーダ（描く段の時間切れ）。
@@ -1173,12 +1197,13 @@ mod tests {
             SmallFactory { budget: 1 << 30 }.runtime_config()
         }
         fn codecs(&self, _: &Path) -> CodecSet {
-            use crate::codec_ext::svg_worker::{WorkerCommand, install_with};
+            use crate::codec_ext::svg_worker::install_with;
             let mut set = CodecSet::pinned();
-            match self.script {
-                Some(script) => install_with(
+            match &self.worker {
+                Some(worker) => install_with(
                     &mut set,
-                    Ok(WorkerCommand::new("/bin/sh", ["-c", script])),
+                    &kura_engine::codec::PinnedOptions::default(),
+                    worker.clone(),
                     self.deadlines,
                 )
                 .unwrap(),
@@ -1197,11 +1222,31 @@ mod tests {
         }
     }
 
+    /// `worker` の働き手（None なら値で時間切れになる偽のデコーダ）で SVG を読むエンジンの道（時間の上限 `ms`）。
+    fn svg_engine(
+        worker: Option<crate::codec_ext::svg_worker::WorkerCommand>,
+        ms: u64,
+    ) -> EngineThumbs {
+        use crate::codec_ext::svg_worker::Deadlines;
+        use std::time::Duration;
+        let services = EngineServices::new(
+            Arc::new(SvgFactory {
+                worker,
+                deadlines: Deadlines {
+                    shape: Duration::from_millis(ms),
+                    decode: Duration::from_millis(ms),
+                },
+            }),
+            PathBuf::from("/x"),
+        );
+        EngineThumbs::new(&services).unwrap()
+    }
+
     /// 決定 23：別のプロセスで読む SVG が時間の上限を超えたら、ImageIO へ回さずに失敗（種類の絵）にする（形を読む見積もりの段
     /// でも、描く段でも）。見積もりの段で形を読む子も、ジョブの中止で止めて Canceled にする（ライブラリを閉じるのを待たせない）。
     #[test]
     fn svg_time_limits_fail_without_fallback_and_cancel_stops_the_worker() {
-        use crate::codec_ext::svg_worker::{Deadlines, TIME_LIMIT};
+        use crate::codec_ext::svg_worker::TIME_LIMIT;
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.svg");
@@ -1218,19 +1263,7 @@ mod tests {
                 small: dir.path().join("t/a_s"),
             },
         };
-        let engine = |script, ms| {
-            let services = EngineServices::new(
-                Arc::new(SvgFactory {
-                    script,
-                    deadlines: Deadlines {
-                        shape: Duration::from_millis(ms),
-                        decode: Duration::from_millis(ms),
-                    },
-                }),
-                PathBuf::from("/x"),
-            );
-            EngineThumbs::new(&services).unwrap()
-        };
+        let engine = |script: Option<&str>, ms| svg_engine(script.map(sh), ms);
         let timed_out = |done: &EngineDone| matches!(done, EngineDone::Failed { error, model: None } if error.contains(TIME_LIMIT));
         let jobs = std::slice::from_ref(&job);
         // 形を読む段（見積もり）：何も返さない子
@@ -1254,6 +1287,71 @@ mod tests {
         // 時間切れでない失敗（壊れた返事）は、今までどおり ImageIO へ回す
         let done = engine(Some("cat >/dev/null; printf x"), 5_000).render(jobs, &NoMonitor);
         assert!(matches!(&done[0], EngineDone::Fallback(_)), "{done:?}");
+    }
+
+    /// M11 の 3 回目の確認 W2：SVG の働き手を使えない（起動できない・別のビルド）のは一時的な誤り。失敗にも ImageIO にも
+    /// せずに `Unavailable`（何も書かない）にし、まだ見積もっていない残りは働き手を起動せずに同じ結果にする。
+    #[test]
+    fn an_unavailable_svg_worker_is_not_a_failure_and_stops_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"/>"#;
+        let jobs: Vec<EngineJob> = ["a", "b", "c"]
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(format!("{name}.svg"));
+                std::fs::write(&path, svg).unwrap();
+                EngineJob {
+                    path,
+                    what: EngineWhat::Image { format: "svg" },
+                    targets: ThumbTargets {
+                        large: dir.path().join(format!("t/{name}_l")),
+                        small: dir.path().join(format!("t/{name}_s")),
+                    },
+                }
+            })
+            .collect();
+        let count = dir.path().join("spawned");
+        let counted = |reply: &str| {
+            sh(&format!(
+                "echo x >> '{}'; cat >/dev/null; printf '{reply}'",
+                count.display()
+            ))
+        };
+        let spawned = || {
+            std::fs::read_to_string(&count)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        let workers = [
+            // 前の版のやり取り（版 1）で答える働き手（置き換えた前のビルド）
+            counted(r"KURASVG<\001\000\000\000\000\000\000\000"),
+            // 同じ版で、ビルドの印が違う働き手
+            counted(r"KURASVG<\002\000\000\000\002\000\000\000{}"),
+            // 働き手でないもの（印が違う）
+            counted("this is not a kura svg worker"),
+        ];
+        for worker in workers {
+            let _ = std::fs::remove_file(&count);
+            let done = svg_engine(Some(worker), 5_000).render(&jobs, &NoMonitor);
+            assert!(
+                done.iter().all(|d| matches!(d, EngineDone::Unavailable(why) if why.contains(crate::codec_ext::svg_worker::WORKER_TOOL))),
+                "{done:?}"
+            );
+            assert_eq!(spawned(), 1, "使えないと分かったら、残りは起動しない");
+            assert!(!jobs[0].targets.large.with_extension("png").exists());
+        }
+        // 起動できない（実行ファイルがない）
+        let missing = crate::codec_ext::svg_worker::WorkerCommand::new(
+            dir.path().join("moved/kura-app"),
+            [crate::codec_ext::svg_worker::WORKER_ARG],
+        );
+        let done = svg_engine(Some(missing), 5_000).render(&jobs, &NoMonitor);
+        assert!(
+            done.iter().all(
+                |d| matches!(d, EngineDone::Unavailable(why) if why.contains("起動できません"))
+            ),
+            "{done:?}"
+        );
     }
 
     #[test]

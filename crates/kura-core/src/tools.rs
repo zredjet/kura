@@ -172,13 +172,34 @@ fn parse_version(name: &str, line: &str) -> Option<String> {
     Some(version.trim_start_matches('v').to_string())
 }
 
+/// 子の起動の鍵（プロセスで 1 つ）。[`spawn`] を見る。
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// 子を起動する（kura の本番のコードは、子をすべてここか [`status`] で起動する。M11 の 3 回目の確認 W1）。
+///
+/// macOS の std はパイプを `pipe()` で作ってから別の呼び出しで FD_CLOEXEC を付けるので、その間に別のスレッドが子を起動すると、
+/// その子がパイプの端を受け継ぐ（受け継いだ子が長く生きると、パイプの相手の EOF が来ない。SVG の働き手が兄弟の遅い子の
+/// せいで時間切れになった）。起動（パイプを作るところから子が生まれるまで）を、プロセスで 1 つの鍵で順にする。鍵を持つのは
+/// `Command::spawn` のあいだだけ（待つのは鍵の外）。`tests` の `production_code_spawns_through_the_lock` が src を見張る。
+pub fn spawn(command: &mut Command) -> std::io::Result<Child> {
+    let _guard = SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    command.spawn()
+}
+
+/// `Command::status` の代わり：鍵の中で起動し（[`spawn`]）、鍵の外で終わるのを待つ。標準入出力は、指定がなければ親のものを
+/// 受け継ぐ（`status` と同じ）。
+pub fn status(command: &mut Command) -> std::io::Result<ExitStatus> {
+    spawn(command)?.wait()
+}
+
 /// 外部コマンドを実行し、`timeout` を過ぎたら止める。標準出力・標準エラー出力を返す。
 pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> std::io::Result<Output> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = spawn(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
     // 出力はパイプが詰まらないよう別スレッドで読む
     let stdout = child.stdout.take().map(read_in_thread);
     let stderr = child.stderr.take().map(read_in_thread);
@@ -241,13 +262,14 @@ pub fn run_streaming(
     stop: &dyn Fn() -> bool,
     stall: Duration,
 ) -> std::io::Result<StreamEnd> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // 子プロセス（yt-dlp が呼ぶ ffmpeg など）もまとめて止められるように、新しいグループにする
-        .process_group(0)
-        .spawn()?;
+    let mut child = spawn(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // 子プロセス（yt-dlp が呼ぶ ffmpeg など）もまとめて止められるように、新しいグループにする
+            .process_group(0),
+    )?;
     let (tx, rx) = mpsc::channel::<(String, bool)>();
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
@@ -350,13 +372,14 @@ pub fn signal_group(pid: u32, sig: &str) -> bool {
         .map(Path::new)
         .find(|p| p.is_file())
         .unwrap_or(Path::new("kill"));
-    Command::new(exe)
-        .args([sig, "--", &group])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
+    status(
+        Command::new(exe)
+            .args([sig, "--", &group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .is_ok()
 }
 
 // ---- バイナリの流れ（ffmpeg のコーデックの段。標準入力に書き、標準出力をそのまま受け取る） ----
@@ -834,12 +857,12 @@ fn stop_from_code(c: u8) -> Option<Stopped> {
     })
 }
 
-/// 起動する。書いたばかりの実行ファイルを、別のスレッドの fork が書き込みのまま持っている（ETXTBSY）ときは少し待って
-/// やり直す（偽の道具を書いてすぐ動かすテストで起きる）。
+/// 起動する（[`spawn`]。起動の鍵の中で）。書いたばかりの実行ファイルを、別のスレッドの fork が書き込みのまま持っている
+/// （ETXTBSY）ときは少し待ってやり直す（偽の道具を書いてすぐ動かすテストで起きる。待つのは鍵の外）。
 fn spawn_retrying(cmd: &mut Command) -> std::io::Result<Child> {
     let mut tries = 0;
     loop {
-        match cmd.spawn() {
+        match spawn(cmd) {
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 20 => {
                 tries += 1;
                 std::thread::sleep(Duration::from_millis(25));
@@ -2016,6 +2039,73 @@ mod tests {
         assert_eq!(bytes, b"hello");
         let r = run_capped(&s, &[], d.path(), Duration::from_secs(5), 3, &|| false);
         assert!(matches!(r, Err(RunError::Stopped(Stopped::OutputLimit))));
+    }
+
+    /// kura の本番のコード（kura-core・kura-mac・src-tauri の src の、テストだけのモジュールより前）は、子を起動の鍵（[`spawn`]・
+    /// [`status`]）を通して起動する（M11 の 3 回目の確認 W1）。`std::process::Command` を使うファイルに `.spawn()`・`.status()`・
+    /// `.output()` があれば、鍵の外の起動として断る（このファイルの [`spawn`] の中の 1 か所を除く）。鍵がないと、同時の起動で
+    /// パイプの端が子に漏れることは `tests/spawn_lock.rs` が確かめる。
+    #[test]
+    fn production_code_spawns_through_the_lock() {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        for dir in [
+            "crates/kura-core/src",
+            "crates/kura-mac/src",
+            "src-tauri/src",
+        ] {
+            walk(&root.join(dir), &mut files);
+        }
+        assert!(files.len() > 50, "{}", files.len());
+        let mut found = Vec::new();
+        let mut in_tools = 0;
+        for path in &files {
+            let name = path.file_name().unwrap().to_string_lossy();
+            if name.ends_with("tests.rs") || name.ends_with("testing.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(path).unwrap();
+            // テストだけのモジュール（`#[cfg(test)]` を付けた `mod … {`）より前（本番のコード）。注釈は見ない
+            let mut code: Vec<&str> = Vec::new();
+            let mut test_attr = false;
+            for line in text.lines() {
+                let l = line.trim();
+                if l.starts_with("#[cfg(test)]") || l.starts_with("#[cfg(all(test") {
+                    test_attr = true;
+                } else if test_attr && l.contains("mod ") && l.ends_with('{') {
+                    break;
+                } else if !l.starts_with("#[") {
+                    test_attr = false;
+                }
+                code.push(line.split("//").next().unwrap_or(""));
+            }
+            if !code.iter().any(|l| l.contains("Command")) {
+                continue;
+            }
+            for (i, line) in code.iter().enumerate() {
+                for call in [".spawn()", ".status()", ".output()"] {
+                    if line.contains(call) {
+                        if path.ends_with("kura-core/src/tools.rs") && call == ".spawn()" {
+                            in_tools += 1;
+                        } else {
+                            found.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found.is_empty(), "起動の鍵の外の起動: {found:#?}");
+        assert_eq!(in_tools, 1, "tools.rs の起動は spawn の中の 1 か所だけ");
     }
 
     #[test]
