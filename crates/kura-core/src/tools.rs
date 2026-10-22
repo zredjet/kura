@@ -863,6 +863,29 @@ pub fn run_binary(
     )
 }
 
+/// [`run_binary`] と同じだが、止めるとき（中止・無出力・時間切れ・出力の上限・受け手のエラー）に SIGTERM で待たず、すぐ
+/// グループに SIGKILL を送る。後始末の要らない自前の働き手（SVG を読む子。`codec_ext::svg_worker`。決定 23）に使う。
+pub fn run_binary_kill(
+    exe: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    budget: &Budget,
+    canceled: &(dyn Fn() -> bool + Sync),
+    feed: Option<Feed<'_>>,
+    on_chunk: OnChunk<'_>,
+) -> Result<RunOutcome, RunError> {
+    run_binary_with(
+        exe,
+        args,
+        cwd,
+        budget,
+        canceled,
+        feed,
+        on_chunk,
+        &|pid, sig| signal_group(pid, if sig == "-TERM" { "-KILL" } else { sig }),
+    )
+}
+
 /// [`run_binary`] の本体。`signal` はグループにシグナルを送る関数（[`signal_group`] と同じく、送れたかを返す。テストが
 /// 送った数を数え、送れなかったことにする）。
 #[allow(clippy::too_many_arguments)]
@@ -1295,6 +1318,64 @@ mod tests {
             "{r:?}"
         );
         assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// すぐ止める形（`run_binary_kill`。SVG の働き手）：SIGTERM を無視する子でも、時間切れ・中止で待たずにグループごと
+    /// SIGKILL する（`run_binary` は SIGTERM のあと 2 秒待つ）。
+    #[test]
+    fn the_kill_variant_stops_at_once_even_when_term_is_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let s = script(d.path(), "stubborn", "trap '' TERM; sleep 34.4159");
+        let b = Budget {
+            max_stdout: 1 << 20,
+            stall: Duration::from_secs(30),
+            deadline: Duration::from_millis(200),
+        };
+        let t = Instant::now();
+        let r = run_binary_kill(
+            &s,
+            &[],
+            Path::new("/"),
+            &b,
+            &|| false,
+            None,
+            &mut |_: &[u8]| Ok(()),
+        );
+        assert!(
+            matches!(r, Err(RunError::Stopped(Stopped::Deadline))),
+            "{r:?}"
+        );
+        assert!(
+            t.elapsed() < Duration::from_millis(1_500),
+            "{:?}",
+            t.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(gone("sleep 34.4159"));
+
+        // 中止も同じ（見張りの次の刻みで止める）
+        let s = script(d.path(), "stubborn2", "trap '' TERM; sleep 35.4159");
+        let started = Instant::now();
+        let b = Budget {
+            deadline: Duration::from_secs(30),
+            ..b
+        };
+        let r = run_binary_kill(
+            &s,
+            &[],
+            Path::new("/"),
+            &b,
+            &|| started.elapsed() > Duration::from_millis(150),
+            None,
+            &mut |_: &[u8]| Ok(()),
+        );
+        assert!(
+            matches!(r, Err(RunError::Stopped(Stopped::Canceled))),
+            "{r:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(gone("sleep 35.4159"));
     }
 
     #[test]
