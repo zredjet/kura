@@ -14,7 +14,10 @@
 //! - roxmltree・usvg は入れ子の深さだけ再帰し、スタックを使い切ると受け止められずに落ちる。そこで XML を読む前に、
 //!   生のバイト列で入れ子の深さを数えて 64 段で断り、参照（use・url(#…)・祖先から受け継ぐ fill・stroke・marker・CSS の規則）を
 //!   展開した高さも 64 段で断る（`MAX_DEPTH`）。参照の輪（pattern の中身が受け継いだ fill で自分を描き直す、など）も断る。
-//!   描く時間は中止できない（resvg を途中で止める口がない）。
+//!   描く時間は中止できない（resvg を途中で止める口がない）。木を作る段（usvg）も、見積もりの前に時間を使う形がある。
+//!   そこでアプリ（サムネイル・解析・アニメの帯。M12 のエディタも）は、このデコーダを同じ識別子のまま kura-core の
+//!   `svg_worker`（アプリ自身を引数付きで起動した別のプロセスで、このデコーダを動かす）に差し替え、時間の上限で子を止める
+//!   （決定 23）。ここの見積もりは、速く断る・子のメモリを抑える前段として残す。
 
 use std::io::SeekFrom;
 use std::sync::Arc;
@@ -33,9 +36,18 @@ use crate::monitor::Monitor;
 use crate::shape::{Dim, Shape};
 use crate::value::{Image, ImageMeta, PixelFormat, Raster, Value};
 
-const DEC_ID: &str = "svg-resvg-dec/1";
-/// 読む SVG の大きさの上限（バイト）。
-const MAX_SOURCE: u64 = 16 << 20;
+/// 読み取りの識別子（別のプロセスで読む kura-core の `svg_worker` も、この識別子のまま差し替える）。
+pub const DEC_ID: &str = "svg-resvg-dec/1";
+/// 読む SVG の大きさの上限（バイト）。別のプロセスで読むときも、親がこれで先に断る（子のメモリは予算の外なので）。
+pub const MAX_SOURCE: u64 = 16 << 20;
+
+/// 読む SVG の大きさ（バイト）を上限で確かめる（超えたら `Limit`）。
+pub fn check_source_len(len: u64) -> Result<(), EngineError> {
+    if len > MAX_SOURCE {
+        return Err(EngineError::Limit("SVG が大きすぎます".into()));
+    }
+    Ok(())
+}
 /// DTD の実体を展開したあとの文字の数の上限。
 const MAX_EXPANDED: u64 = 64 << 20;
 /// 要素の数（`<use>` の展開を含む）の上限。
@@ -90,9 +102,7 @@ impl SvgCodec {
 
 fn read_source(src: &mut dyn ReadSeek) -> Result<String, EngineError> {
     let len = src.seek(SeekFrom::End(0))?;
-    if len > MAX_SOURCE {
-        return Err(EngineError::Limit("SVG が大きすぎます".into()));
-    }
+    check_source_len(len)?;
     src.seek(SeekFrom::Start(0))?;
     let mut b = try_vec(len as usize, 0u8)?;
     src.read_exact(&mut b)

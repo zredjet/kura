@@ -469,6 +469,30 @@ impl CodecSet {
         Ok(())
     }
 
+    /// 今の版のデコーダを、同じ識別子・段・再現の約束・環境のものに差し替え、前のものを返す（並びは変えない。旧版は差し替え
+    /// ない）。読み方の約束を保ったまま、読む場所だけを変える口（固定の段の SVG を別のプロセスで読む kura-core の
+    /// `svg_worker`。決定 23）。読み取りの記録（`DecodeStamp`）は差し替えたものの識別子・段・約束で付くので、前と同じになる。
+    pub fn replace_decoder(
+        &mut self,
+        d: Arc<dyn Decoder>,
+    ) -> Result<Arc<dyn Decoder>, EngineError> {
+        let id = d.id();
+        let Some(slot) = self.decoders.iter_mut().find(|x| x.id() == id) else {
+            return Err(EngineError::Internal(format!(
+                "差し替えるデコーダ {id} がありません"
+            )));
+        };
+        if slot.tier() != d.tier()
+            || slot.reproducible() != d.reproducible()
+            || slot.env() != d.env()
+        {
+            return Err(EngineError::Internal(format!(
+                "デコーダ {id} の段・再現の約束・環境が違うので差し替えられません"
+            )));
+        }
+        Ok(std::mem::replace(slot, d))
+    }
+
     /// エンコーダを足す（段の順に並べ直す）。同じ識別子と、固定の段でないのにバイト列の再現（R2）を約束するものは断る。
     pub fn add_encoder(&mut self, e: Arc<dyn Encoder>) -> Result<(), EngineError> {
         if self.encoder_by_id(e.id()).is_some() {
@@ -545,11 +569,12 @@ impl CodecSet {
         format: &str,
         opts: &DecodeOptions,
         limits: &Limits,
+        mon: &dyn Monitor,
     ) -> Result<(&Arc<dyn Decoder>, Shape), EngineError> {
         let mut last = EngineError::Unsupported(format!("{format} を読めません"));
         for d in self.decoders_for(format) {
             match contain(d.id(), Stage::Decode, || {
-                input.shape(d.as_ref(), format, opts, limits, &NoMonitor)
+                input.shape(d.as_ref(), format, opts, limits, mon)
             }) {
                 Ok(shape) => return Ok((d, shape)),
                 Err(e @ EngineError::Unsupported(_)) => last = e,
@@ -567,7 +592,7 @@ impl CodecSet {
         opts: &DecodeOptions,
         limits: &Limits,
     ) -> Result<(Shape, &'static str), EngineError> {
-        let (d, shape) = self.pick(&mut Input::Reader(src), format, opts, limits)?;
+        let (d, shape) = self.pick(&mut Input::Reader(src), format, opts, limits, &NoMonitor)?;
         limits.check(&shape).map_err(EngineError::Limit)?;
         Ok((shape, d.id()))
     }
@@ -580,7 +605,20 @@ impl CodecSet {
         opts: &DecodeOptions,
         limits: &Limits,
     ) -> Result<(Shape, &'static str), EngineError> {
-        let (d, shape) = self.pick(&mut Input::Path(path), format, opts, limits)?;
+        self.shape_path_monitored(path, format, opts, limits, &NoMonitor)
+    }
+
+    /// [`CodecSet::shape_path`] の、中止を見る口（各デコーダの [`Decoder::shape_file_monitored`] に `mon` を渡す。中止は
+    /// `Canceled`）。形を決めるのに時間のかかりうるデコーダ（別のプロセスで読む SVG・ffmpeg の段）を、ジョブの中止で止める。
+    pub fn shape_path_monitored(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<(Shape, &'static str), EngineError> {
+        let (d, shape) = self.pick(&mut Input::Path(path), format, opts, limits, mon)?;
         limits.check(&shape).map_err(EngineError::Limit)?;
         Ok((shape, d.id()))
     }
@@ -1190,6 +1228,169 @@ mod tests {
             ))),
         });
         assert_eq!(with.decoders_for("svg").len(), 1);
+    }
+
+    /// 識別子を保ったまま、今の版のデコーダを差し替えられる（固定の段の SVG を別のプロセスで読むデコーダにする。決定 23）。
+    /// 並び・旧版はそのままで、段・再現の約束・環境が違うもの、ない識別子は断る。
+    #[test]
+    fn replace_decoder_keeps_the_id_tier_and_order() {
+        struct Stand(&'static str, Tier, bool);
+        impl Decoder for Stand {
+            fn id(&self) -> &'static str {
+                self.0
+            }
+            fn tier(&self) -> Tier {
+                self.1
+            }
+            fn reproducible(&self) -> bool {
+                self.2
+            }
+            fn can_decode(&self, format: &str) -> bool {
+                format == "svg"
+            }
+            fn shape(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+            ) -> Result<Shape, EngineError> {
+                Err(EngineError::Limit("代わりのデコーダ".into()))
+            }
+            fn decode(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+                _: &dyn Monitor,
+            ) -> Result<Value, EngineError> {
+                Err(EngineError::Limit("代わりのデコーダ".into()))
+            }
+        }
+        let mut set = CodecSet::pinned();
+        let ids = |set: &CodecSet| -> Vec<&'static str> {
+            set.decoders.iter().map(|d| d.id()).collect::<Vec<_>>()
+        };
+        let before = ids(&set);
+        let old = set
+            .replace_decoder(Arc::new(Stand(svg::DEC_ID, Tier::Pinned, false)))
+            .unwrap();
+        assert_eq!(old.id(), svg::DEC_ID);
+        assert_eq!(ids(&set), before, "並びは変えない");
+        assert_eq!(set.decoders_for("svg").len(), 1);
+        let got = set.decode(
+            &mut Cursor::new(b"<svg/>".to_vec()),
+            "svg",
+            &DecodeOptions::default(),
+            &Limits::default(),
+            &NoMonitor,
+        );
+        assert!(matches!(got, Err(EngineError::Limit(m)) if m == "代わりのデコーダ"));
+        // 段・再現の約束が違う・ない識別子は断る（記録の意味を変えない）
+        let mut set = CodecSet::pinned();
+        assert!(
+            set.replace_decoder(Arc::new(Stand(svg::DEC_ID, Tier::Platform, false)))
+                .is_err()
+        );
+        assert!(
+            set.replace_decoder(Arc::new(Stand(svg::DEC_ID, Tier::Pinned, true)))
+                .is_err()
+        );
+        assert!(
+            set.replace_decoder(Arc::new(Stand("nope-dec/1", Tier::Pinned, false)))
+                .is_err()
+        );
+        // 旧版は差し替えない（ふつうの読み取りで選ばないもの）
+        assert!(
+            set.replace_decoder(Arc::new(Stand("png-rs-dec/1", Tier::Pinned, true)))
+                .is_err()
+        );
+        assert_eq!(ids(&set), before);
+    }
+
+    /// 中止を見る形の読み口（`shape_path_monitored`）は、デコーダの `shape_file_monitored` に見張りを渡す（別のプロセスで
+    /// 読むデコーダが、中止で子を止められるように）。見張りのない `shape_path` は止めない。
+    #[test]
+    fn shape_path_monitored_passes_the_monitor() {
+        struct Watching;
+        impl Decoder for Watching {
+            fn id(&self) -> &'static str {
+                "watching-dec/1"
+            }
+            fn tier(&self) -> Tier {
+                Tier::External
+            }
+            fn reproducible(&self) -> bool {
+                false
+            }
+            fn can_decode(&self, format: &str) -> bool {
+                format == "raw"
+            }
+            fn shape(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+            ) -> Result<Shape, EngineError> {
+                Ok(Shape::Audio {
+                    rate: 8_000,
+                    channels: 1,
+                    frames: Dim::Exact(1),
+                })
+            }
+            fn shape_file_monitored(
+                &self,
+                path: &Path,
+                format: &str,
+                opts: &DecodeOptions,
+                limits: &Limits,
+                mon: &dyn Monitor,
+            ) -> Result<Shape, EngineError> {
+                if mon.canceled() {
+                    return Err(EngineError::Canceled);
+                }
+                self.shape_file(path, format, opts, limits)
+            }
+            fn shape_file(
+                &self,
+                _: &Path,
+                format: &str,
+                opts: &DecodeOptions,
+                limits: &Limits,
+            ) -> Result<Shape, EngineError> {
+                self.shape(&mut Cursor::new(Vec::new()), format, opts, limits)
+            }
+            fn decode(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+                _: &dyn Monitor,
+            ) -> Result<Value, EngineError> {
+                Err(EngineError::Unsupported("読まない".into()))
+            }
+        }
+        let mut set = CodecSet::default();
+        set.add_decoder(Arc::new(Watching)).unwrap();
+        let canceled = crate::monitor::CancelFlag::default();
+        canceled.cancel();
+        let path = Path::new("/nonexistent/a.raw");
+        let (opts, limits) = (DecodeOptions::default(), Limits::default());
+        assert!(matches!(
+            set.shape_path_monitored(path, "raw", &opts, &limits, &canceled),
+            Err(EngineError::Canceled)
+        ));
+        let (shape, id) = set
+            .shape_path_monitored(path, "raw", &opts, &limits, &NoMonitor)
+            .unwrap();
+        assert_eq!(id, "watching-dec/1");
+        assert_eq!(
+            set.shape_path(path, "raw", &opts, &limits).unwrap().0,
+            shape
+        );
     }
 
     /// パスで読む口：`decode_path`・`shape_path`・`decode_with_path` はデコーダの `*_file` を呼ぶ。既定の実装は読み口の口と
