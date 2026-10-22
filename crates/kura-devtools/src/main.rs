@@ -27,9 +27,9 @@
 //! - `vorbis-quality --out <dir> [--quick] [--input <file>]... [--reference <音>/<ラベル>=<ogg>]...`：
 //!   自作の Ogg Vorbis のエンコーダの品質を記録する（M10 段 7。`vorbis_quality` の冒頭）
 
-/// アプリと同じ確保器（大きな確保を OS へすぐ返す。計測をアプリに合わせる）。
+/// アプリと同じ確保器（大きな確保を OS へすぐ返す。計測をアプリに合わせる。SVG の働き手のときだけ確保の上限を付ける）。
 #[global_allocator]
-static ALLOC: kura_mac::ReturningAllocator = kura_mac::ReturningAllocator;
+static ALLOC: kura_mac::ReturningAllocator = kura_mac::ReturningAllocator::new();
 
 mod assets;
 mod bench;
@@ -64,7 +64,7 @@ const USAGE: &str = "使い方: kura-devtools import --library <path> [--create]
 fn main() -> ExitCode {
     // SVG の働き手として起動された（アプリと同じ組で SVG を読むとき、自分を `--kura-svg-worker` 付きで起動する。決定 23）
     if svg_worker::is_worker_invocation() {
-        return svg_worker::serve(&kura_mac::pinned_options());
+        return svg_worker::serve(&kura_mac::pinned_options(), ALLOC.meter());
     }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

@@ -4,6 +4,8 @@
 //! - 成功の値・形・読み取りの記録・エラーが、プロセスの中の固定の段と同じ（パスでも読み口でも）。
 //! - 時間の上限で止める（木を作る段で止まる S1 の形・描く段で止まる S4 の形・何も返さない子）。
 //! - 見張りの中止で止める。子が落ちた・壊れた返事は `Decode`。大きすぎる入力は子を起こさずに断る。
+//! - 確保の上限（ADR-164 (4)）：見積もりを通ったまま確保が膨らむ形は、子が上限で断って `Decode`（メモリ）。大きな値と層は、
+//!   描く前に上限を広げて読める（値はプロセスの中と同じ）。
 //! - 実行ファイルは起動のたびに求める。起動できない・求められない・別のビルド（ビルドの印・やり取りの版が違う）は、一時的な
 //!   誤り（`is_unavailable`。M11 の 3 回目の確認 W2）。
 
@@ -97,6 +99,25 @@ const SLOW_SHAPE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="100"
 
 /// 形は速いが描く段で止まる形（確認の S4 の 1 本。release で 8.9 秒）。
 const SLOW_DECODE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000"><path d="M0 5 C300 0 700 10 1000 5" stroke="black" stroke-width="3" stroke-linecap="round" stroke-dasharray="0.0005 0.000501" fill="none"/></svg>"##;
+
+/// 木を作る段で、見積もりを通ったまま確保が膨らむ形（確認の S2 の小さい版）：stop の多いグラデーション（単位は
+/// objectBoundingBox）を塗った図形を use で並べると、usvg は図形ごとに stop を写して木に持つ（stop 1 個 12 バイト）。
+fn gradient_copies(stops: usize, uses: usize) -> String {
+    let mut s = String::from(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><linearGradient id="g">"#,
+    );
+    for i in 0..stops {
+        s.push_str(&format!(
+            r##"<stop offset="{:.6}" stop-color="#{:06x}"/>"##,
+            (i + 1) as f64 / (stops + 1) as f64,
+            i * 2_654_435 % 0x100_0000
+        ));
+    }
+    s.push_str(r##"</linearGradient><rect id="r" width="9" height="9" fill="url(#g)"/></defs>"##);
+    s.push_str(&r##"<use href="#r"/>"##.repeat(uses));
+    s.push_str("</svg>");
+    s
+}
 
 fn write(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
     let p = dir.join(name);
@@ -249,6 +270,109 @@ fn slow_svgs_are_stopped_at_the_deadline() {
     )));
 }
 
+/// 確保の上限（ADR-164 (4)）：木を作る段で見積もりを通ったまま確保が膨らむ形（stop 2 万 × use 2,000 の写しで約 490 MB。
+/// 入力 0.9 MB・展開した要素 2.2 万なので、木の分の上限は 140 MB ほど）は、子が上限で断って落ち、親は `Decode`
+/// （[`svg_worker::MEMORY_LIMIT`]）にする（形も値も、パスでも読み口でも）。プロセスの中では見積もりを通る（断れない）。
+#[test]
+fn memory_hungry_svgs_are_refused_by_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (opts, limits) = (DecodeOptions::default(), Limits::default());
+    let body = gradient_copies(20_000, 2_000);
+    let path = write(dir.path(), "s2.svg", body.as_bytes());
+    assert!(
+        CodecSet::pinned()
+            .shape_path(&path, "svg", &opts, &limits)
+            .is_ok()
+    );
+    let set = set_with(worker(), generous());
+    let started = Instant::now();
+    for (what, r) in [
+        ("形", set.shape_path(&path, "svg", &opts, &limits).map(drop)),
+        (
+            "値",
+            set.decode_path(&path, "svg", &opts, &limits, &NoMonitor)
+                .map(drop),
+        ),
+        (
+            "読み口の値",
+            set.decode(
+                &mut Cursor::new(body.as_bytes().to_vec()),
+                "svg",
+                &opts,
+                &limits,
+                &NoMonitor,
+            )
+            .map(drop),
+        ),
+    ] {
+        match r {
+            Err(e @ EngineError::Decode { .. }) => {
+                assert!(svg_worker::is_memory_limit(&e), "{what}: {e}");
+                assert!(!svg_worker::is_time_limit(&e) && !svg_worker::is_unavailable(&e));
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+    }
+    // 上限で断るので、時間の上限を待たない
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// 確保の上限は、値を読むとき描く前に、キャンバスの 3 枚（描く画像・乗算を戻した行・値）と一時の画像の見積もり（層）の分
+/// だけ広げる：木の分の上限（64 MiB ほど）を超える大きな値（2,500² で 1 枚 25 MB）と層も読め、値はプロセスの中と同じ。
+/// use の展開の多い形（図形 100 個のアイコン × 1,600：入力 0.06 MB・要素 16 万で、木は 120 MB ほど）も、展開した要素の数の分
+/// だけ広げて読める。
+#[test]
+fn large_values_and_layers_fit_under_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (opts, limits) = (DecodeOptions::default(), Limits::default());
+    let body = r##"<svg xmlns="http://www.w3.org/2000/svg" width="2500" height="2500"><defs><linearGradient id="g" x2="1" y2="1"><stop offset="0" stop-color="#048"/><stop offset="1" stop-color="#fc8"/></linearGradient></defs><rect width="2500" height="2500" fill="url(#g)"/><g opacity="0.5"><rect x="10" y="10" width="2480" height="2480" fill="#0a4"/><circle cx="1250" cy="1250" r="900" fill="#f30"/></g></svg>"##;
+    let path = write(dir.path(), "big.svg", body.as_bytes());
+    let local = CodecSet::pinned();
+    let remote = set_with(worker(), generous());
+    let icons = {
+        let icon: String = (0..100)
+            .map(|i| {
+                format!(
+                    r#"<rect x="{}" y="{}" width="2" height="2"/>"#,
+                    i % 10 * 3,
+                    i / 10 * 3
+                )
+            })
+            .collect();
+        let uses: String = (0..1_600)
+            .map(|i| {
+                format!(
+                    r##"<use href="#s" x="{}" y="{}"/>"##,
+                    i % 40 * 32,
+                    i / 40 * 32
+                )
+            })
+            .collect();
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1280"><defs><g id="s">{icon}</g></defs>{uses}</svg>"#
+        )
+    };
+    let icons = write(dir.path(), "icons.svg", icons.as_bytes());
+    for (what, path) in [("2,500² と層", &path), ("use の展開", &icons)] {
+        let want = local.decode_path(path, "svg", &opts, &limits, &NoMonitor);
+        let got = remote.decode_path(path, "svg", &opts, &limits, &NoMonitor);
+        // 失敗のときに値（数 MB〜25 MB）を書き出さない
+        let (Ok((a, sa)), Ok((b, sb))) = (&want, &got) else {
+            panic!(
+                "{what}: {:?} と {:?}",
+                want.as_ref().err(),
+                got.as_ref().err()
+            );
+        };
+        assert!(a == b, "{what}: 値がプロセスの中と違います");
+        assert_eq!(sa, sb, "{what}");
+    }
+}
+
 /// 中止の旗を、時刻が来たら立てる見張り。
 struct CancelAt {
     started: Instant,
@@ -319,6 +443,11 @@ fn crashed_or_broken_workers_are_decode_errors() {
         }
     };
     decode_error(sh("cat >/dev/null; kill -SEGV $$"), "異常終了");
+    // 確保を断られて落ちた（Rust の確保の失敗の言葉で abort）は、確保の上限の `Decode`
+    decode_error(
+        sh("cat >/dev/null; echo 'memory allocation of 1048576 bytes failed' >&2; kill -ABRT $$"),
+        svg_worker::MEMORY_LIMIT,
+    );
     decode_error(sh("cat >/dev/null; exit 3"), "異常終了");
     decode_error(sh("cat >/dev/null; printf garbage"), "壊れ");
     decode_error(sh("cat >/dev/null"), "壊れ");

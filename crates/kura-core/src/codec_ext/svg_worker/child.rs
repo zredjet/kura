@@ -1,11 +1,13 @@
 //! 働き手の本体（子の側。OS によらない）：標準入力の頼みを 1 つ読み、渡されたデコーダ（固定の段の SVG）で形か値を読み、
-//! 標準出力に返事を 1 つ書く。頼みのビルドの印が自分のもの（`stamp`）と違えば、読まずに専用のエラーを返す。
+//! 標準出力に返事を 1 つ書く。頼みのビルドの印が自分のもの（`stamp`）と違えば、読まずに専用のエラーを返す。確保の上限で
+//! 断った確保があって読めなかったときは、エラーを [`MEMORY_LIMIT`] の `Decode` にする（ADR-164 (4)）。
 
 use std::io::{Cursor, Read, Write};
 
 use kura_engine::codec::{Decoder, Stage, contain};
 use kura_engine::{EngineError, NoMonitor};
 
+use super::memory::{AllocMeter, MEMORY_LIMIT};
 use super::wire::{self, Answer, Op, Request, RequestError, Source};
 
 /// 頼みを 1 つ読み、`decoder` で処理して返事を書く（`stamp` は子のビルドの印）。頼みが壊れていれば内部の誤りの返事、別の
@@ -23,16 +25,18 @@ pub fn serve_with(
         stamp,
         wire::read_request(input, max_bytes, stamp),
         output,
+        None,
     )
 }
 
-/// 読んだ頼み（読めなかったら理由）に答えて返事を書く（[`serve_with`] の後半。頼みの時間の上限を見てから答えたい
-/// 呼び手（`serve`）が使う）。
+/// 読んだ頼み（読めなかったら理由）に答えて返事を書く（[`serve_with`] の後半。頼みの時間の上限を見てから、確保の上限を
+/// 付けて答えたい呼び手（`serve`）が使う）。`meter` が確保を断っていて読めなかったら、エラーを [`MEMORY_LIMIT`] にする。
 pub fn serve_request(
     decoder: &dyn Decoder,
     stamp: &str,
     request: Result<Request, RequestError>,
     output: &mut dyn Write,
+    meter: Option<&AllocMeter>,
 ) -> std::io::Result<()> {
     let request = match request {
         Ok(r) => r,
@@ -47,7 +51,14 @@ pub fn serve_request(
             );
         }
     };
-    let result = answer(decoder, &request);
+    let result = match answer(decoder, &request) {
+        // 上限で断った確保のせいで読めなかった（`try_reserve` などのエラー、受け止めた panic）
+        Err(_) if meter.is_some_and(|m| m.refused() > 0) => Err(EngineError::Decode {
+            codec: decoder.id().to_string(),
+            message: MEMORY_LIMIT.into(),
+        }),
+        result => result,
+    };
     wire::write_reply(output, stamp, &result)
 }
 
@@ -182,6 +193,47 @@ mod tests {
             r.finish().unwrap(),
             wire::Reply::Error(EngineError::Internal(_))
         ));
+    }
+
+    /// 確保の上限で断った確保があって読めなかったら、エラーを `MEMORY_LIMIT` の `Decode` にする。断っていなければ、
+    /// 読めたものはそのまま、読めないものは元のエラーのまま。
+    #[test]
+    fn errors_after_a_refused_allocation_are_memory_limits() {
+        let big = br#"<svg xmlns="http://www.w3.org/2000/svg" width="40000" height="4"/>"#;
+        let small = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>"#;
+        let reply = |meter: &AllocMeter, body: &[u8]| {
+            let req = request(STAMP, Op::Decode, wire::Input::Bytes(body));
+            let mut out = Vec::new();
+            serve_request(
+                &SvgCodec::default(),
+                STAMP,
+                wire::read_request(&mut req.as_slice(), svg::MAX_SOURCE, STAMP),
+                &mut out,
+                Some(meter),
+            )
+            .unwrap();
+            let mut r = wire::ReplyReader::new(Op::Decode, &Limits::default(), STAMP);
+            r.push(&out).unwrap();
+            r.finish().unwrap()
+        };
+        let calm = AllocMeter::new();
+        assert!(matches!(
+            reply(&calm, big),
+            wire::Reply::Error(EngineError::Limit(_))
+        ));
+        let refused = AllocMeter::new();
+        refused.start(0);
+        assert!(!refused.charge(1));
+        match reply(&refused, big) {
+            wire::Reply::Error(EngineError::Decode { codec, message }) => {
+                assert_eq!(
+                    (codec.as_str(), message.as_str()),
+                    (svg::DEC_ID, MEMORY_LIMIT)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(reply(&refused, small), wire::Reply::Value(_)));
     }
 
     /// 別のビルドの親からの頼み（ビルドの印が違う）は読まずに、自分の印で専用のエラーを返す。親は返事の印で別のビルドと

@@ -14,7 +14,8 @@
 //!   `codec_set`（固定の段に足した組）・`full_codec_set`（さらに ffmpeg の段を足したアプリの組）・`codec_caps`（能力と環境）
 //!
 //! - `ReturningAllocator`：1 MiB 以上の確保を mmap で取り、解放したら OS へすぐ返す確保器（アプリと kura-devtools の
-//!   `#[global_allocator]`。libmalloc が大きな領域を抱えたままにして NFR-07 に戻らないため。`alloc`）
+//!   `#[global_allocator]`。libmalloc が大きな領域を抱えたままにして NFR-07 に戻らないため。`alloc`）。確保の量を数える目印を
+//!   持ち、SVG の働き手のときだけ上限を付ける（ADR-164 (4)）
 //!
 //! macOS 以外では同じ関数・型が「扱えない」を返すだけの空の実装になり、ワークスペース全体がビルドできる。
 

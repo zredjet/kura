@@ -13,7 +13,7 @@ use kura_engine::doc::DecodeOptions;
 use kura_engine::{EngineError, Limits, Monitor, NoMonitor, Shape, Value};
 
 use super::wire::{self, Op, Reply, ReplyReader};
-use super::{DECODE_DEADLINE, SHAPE_DEADLINE, TIME_LIMIT, WORKER_ARG, unavailable};
+use super::{DECODE_DEADLINE, MEMORY_LIMIT, SHAPE_DEADLINE, TIME_LIMIT, WORKER_ARG, unavailable};
 use crate::tools::{self, Budget, RunError, RunOutcome, Stopped};
 
 /// 働き手の実行ファイルを求める口（起動のたびに呼ぶ）。
@@ -243,6 +243,11 @@ impl SvgWorkerDecoder {
         };
         if !outcome.status.success() {
             let why = crashed(&outcome);
+            if ran_out_of_memory(&outcome) {
+                // 確保の上限（か OS）に確保を断られて落ちた（ADR-164 (4)）
+                tracing::warn!(exe = %exe.display(), "SVG を読む働き手が確保の上限を超えました（{why}）");
+                return Err(self.decode_error(MEMORY_LIMIT));
+            }
             tracing::warn!(exe = %exe.display(), "SVG を読む働き手が異常終了しました（{why}）");
             return Err(self.decode_error(format!("SVG を読む働き手が異常終了しました（{why}）")));
         }
@@ -266,6 +271,15 @@ impl SvgWorkerDecoder {
             Reply::Shape(_) => Err(self.decode_error("頼みと違う返事です")),
         }
     }
+}
+
+/// 子が確保を断られて落ちたか（Rust が確保の失敗の言葉「memory allocation of N bytes failed」を標準エラーに書いて abort
+/// した）。
+fn ran_out_of_memory(outcome: &RunOutcome) -> bool {
+    outcome
+        .stderr_head
+        .iter()
+        .any(|l| l.starts_with("memory allocation of ") && l.ends_with(" bytes failed"))
 }
 
 /// 異常終了の説明（シグナルか終了コードと、標準エラーの最初の行）。
