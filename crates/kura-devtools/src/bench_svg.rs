@@ -45,15 +45,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
             other => return Err(format!("不明な引数: {other}")),
         }
     }
-    let local = CodecSet::pinned_with(&kura_mac::pinned_options());
-    let mut remote = CodecSet::pinned_with(&kura_mac::pinned_options());
+    let opts = kura_mac::pinned_options();
+    let local = CodecSet::pinned_with(&opts);
+    let mut remote = CodecSet::pinned_with(&opts);
     let deadlines =
         deadline.map_or_else(svg_worker::Deadlines::default, |ms| svg_worker::Deadlines {
             shape: Duration::from_millis(ms),
             decode: Duration::from_millis(ms),
         });
-    svg_worker::install_with(&mut remote, WorkerCommand::current_exe(), deadlines)
-        .map_err(|e| e.to_string())?;
+    let worker = WorkerCommand::own_exe(kura_mac::current_executable);
+    svg_worker::install_with(&mut remote, &opts, worker, deadlines).map_err(|e| e.to_string())?;
     spawn_cost(&local, &remote, spawns)?;
     if let Some(src) = src {
         let mut files = Vec::new();

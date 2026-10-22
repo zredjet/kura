@@ -134,6 +134,11 @@ impl SvgFonts {
         }
     }
 
+    /// 総称の書体に当てる書体名（作らずに返す。kura-core の SVG の働き手が、親と子が同じ設定かを照らす印に入れる）。
+    pub fn generic(&self) -> &GenericFamilies {
+        &self.inner.generic
+    }
+
     /// もう作ったか（`lazy` で、まだ文字のある SVG を読んでいなければ偽）。
     pub fn is_built(&self) -> bool {
         self.inner.built.get().is_some()

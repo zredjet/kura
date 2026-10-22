@@ -41,3 +41,6 @@ pub use monitor::{Monitor, NoMonitor};
 pub use render::{Engine, Plan, Rendered};
 pub use shape::{Dim, Shape, ValueKind};
 pub use value::Value;
+
+/// このクレートの版（kura-core の SVG の働き手が、親と子が同じビルドかを照らす印に入れる。M11 の決定 23）。
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

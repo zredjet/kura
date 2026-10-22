@@ -3,18 +3,21 @@
 //!
 //! - 成功の値・形・読み取りの記録・エラーが、プロセスの中の固定の段と同じ（パスでも読み口でも）。
 //! - 時間の上限で止める（木を作る段で止まる S1 の形・描く段で止まる S4 の形・何も返さない子）。
-//! - 見張りの中止で止める。子が落ちた・壊れた返事・起動できないは `Decode`。大きすぎる入力は子を起こさずに断る。
+//! - 見張りの中止で止める。子が落ちた・壊れた返事は `Decode`。大きすぎる入力は子を起こさずに断る。
+//! - 実行ファイルは起動のたびに求める。起動できない・求められない・別のビルド（ビルドの印・やり取りの版が違う）は、一時的な
+//!   誤り（`is_unavailable`。M11 の 3 回目の確認 W2）。
 
 // テストの補助関数は #[test] の外にあるので、テストと同じく unwrap などを許す（clippy.toml の allow-*-in-tests が届かない）
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kura_core::codec_ext::svg_worker::{self, Deadlines, TIME_LIMIT, WorkerCommand};
-use kura_engine::codec::{CodecSet, DecodeStamp, svg};
+use kura_engine::codec::{CodecSet, DecodeStamp, GenericFamilies, PinnedOptions, SvgFonts, svg};
 use kura_engine::doc::DecodeOptions;
 use kura_engine::{EngineError, Limits, Monitor, NoMonitor, Value};
 
@@ -31,7 +34,7 @@ fn sh(script: &str) -> WorkerCommand {
 
 fn set_with(cmd: WorkerCommand, deadlines: Deadlines) -> CodecSet {
     let mut set = CodecSet::pinned();
-    svg_worker::install_with(&mut set, Ok(cmd), deadlines).unwrap();
+    svg_worker::install_with(&mut set, &PinnedOptions::default(), cmd, deadlines).unwrap();
     set
 }
 
@@ -293,15 +296,14 @@ fn cancel_stops_the_child() {
     assert!(mon.started.elapsed() < Duration::from_secs(2));
 }
 
-/// 子が落ちた・何も書かずに終わった・壊れた返事・起動できない・実行ファイルが分からないは `Decode`（プロセスは落ちない）。
+/// 子が落ちた・何も書かずに終わった・壊れた返事は `Decode`（プロセスは落ちない）。
 #[test]
 fn crashed_or_broken_workers_are_decode_errors() {
     let dir = tempfile::tempdir().unwrap();
     let (opts, limits) = (DecodeOptions::default(), Limits::default());
     let path = write(dir.path(), "a.svg", CASES[0].1);
-    let decode_error = |cmd: Result<WorkerCommand, String>, want: &str| {
-        let mut set = CodecSet::pinned();
-        svg_worker::install_with(&mut set, cmd, short(5_000, 5_000)).unwrap();
+    let decode_error = |cmd: WorkerCommand, want: &str| {
+        let set = set_with(cmd, short(5_000, 5_000));
         for r in [
             set.decode_path(&path, "svg", &opts, &limits, &NoMonitor)
                 .map(drop),
@@ -316,21 +318,146 @@ fn crashed_or_broken_workers_are_decode_errors() {
             }
         }
     };
-    decode_error(Ok(sh("cat >/dev/null; kill -SEGV $$")), "異常終了");
-    decode_error(Ok(sh("cat >/dev/null; exit 3")), "異常終了");
-    decode_error(Ok(sh("cat >/dev/null; printf garbage")), "壊れ");
-    decode_error(Ok(sh("cat >/dev/null")), "壊れ");
-    decode_error(
-        Ok(WorkerCommand::new(
-            "/nonexistent/kura-svg-worker",
-            [svg_worker::WORKER_ARG],
-        )),
+    decode_error(sh("cat >/dev/null; kill -SEGV $$"), "異常終了");
+    decode_error(sh("cat >/dev/null; exit 3"), "異常終了");
+    decode_error(sh("cat >/dev/null; printf garbage"), "壊れ");
+    decode_error(sh("cat >/dev/null"), "壊れ");
+}
+
+/// 起動できない・実行ファイルが分からない・別のビルド（ビルドの印・やり取りの版・返事の印が違う）は、アイテムのせいでは
+/// ない一時的な誤り（`is_unavailable`。`Decode` にしない。M11 の 3 回目の確認 W2）。
+#[test]
+fn missing_or_foreign_workers_are_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (opts, limits) = (DecodeOptions::default(), Limits::default());
+    let path = write(dir.path(), "a.svg", CASES[0].1);
+    let unavailable = |set: &CodecSet, want: &str| {
+        for r in [
+            set.decode_path(&path, "svg", &opts, &limits, &NoMonitor)
+                .map(drop),
+            set.shape_path(&path, "svg", &opts, &limits).map(drop),
+            set.decode(
+                &mut Cursor::new(CASES[0].1.to_vec()),
+                "svg",
+                &opts,
+                &limits,
+                &NoMonitor,
+            )
+            .map(drop),
+        ] {
+            match r {
+                Err(e) if svg_worker::is_unavailable(&e) => {
+                    assert!(e.to_string().contains(want), "{want}: {e}");
+                    assert_eq!(e.code(), "ToolMissing");
+                }
+                other => panic!("{want}: {other:?}"),
+            }
+        }
+    };
+    let generous = short(5_000, 5_000);
+    unavailable(
+        &set_with(
+            WorkerCommand::new("/nonexistent/kura-svg-worker", [svg_worker::WORKER_ARG]),
+            generous,
+        ),
         "起動できません",
     );
-    decode_error(
-        Err("実行ファイルが分かりません".into()),
-        "実行ファイルが分かりません",
+    unavailable(
+        &set_with(
+            WorkerCommand::resolved_by(
+                || Err(std::io::Error::other("消えました")),
+                [svg_worker::WORKER_ARG],
+            ),
+            generous,
+        ),
+        "実行ファイルが分かりません: 消えました",
     );
+    // 前の版のやり取りで答える（置き換えた前のビルド）・働き手でないもの
+    unavailable(
+        &set_with(
+            sh(r"cat >/dev/null; printf 'KURASVG<\001\000\000\000\000\000\000\000'"),
+            generous,
+        ),
+        "版が違います",
+    );
+    unavailable(
+        &set_with(
+            sh("cat >/dev/null; printf 'not a kura svg worker'"),
+            generous,
+        ),
+        "働き手の返事ではありません",
+    );
+    // 本物の働き手でも、親とビルドの印（ここではフォントの有無）が違えば、子が断り、親も返事の印で断る
+    let mut set = CodecSet::pinned();
+    let fonts = PinnedOptions {
+        svg_fonts: Some(SvgFonts::new(Vec::new(), GenericFamilies::default())),
+    };
+    svg_worker::install_with(&mut set, &fonts, worker(), generous).unwrap();
+    unavailable(&set, "別のビルドです（fonts");
+    // 印は設定とビルドで決まる（同じ設定なら同じ、フォントの有無で違う）
+    assert_eq!(
+        svg_worker::build_stamp(&PinnedOptions::default()),
+        svg_worker::build_stamp(&PinnedOptions::default())
+    );
+    assert_ne!(
+        svg_worker::build_stamp(&PinnedOptions::default()),
+        svg_worker::build_stamp(&fonts)
+    );
+    assert!(svg_worker::build_stamp(&fonts).contains(svg::DEC_ID));
+}
+
+/// 実行ファイルは起動のたびに求める（動いているアプリを移す・改名すると、次の起動から新しい場所を使う。M11 の 3 回目の確認
+/// W2）。求める口は、子を起動するたびに 1 回ずつ呼ばれる（`decode_path` は形と値で 2 回、`shape_path` は 1 回）。
+#[test]
+fn the_worker_executable_is_resolved_for_every_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (opts, limits) = (DecodeOptions::default(), Limits::default());
+    let path = write(dir.path(), "a.svg", CASES[0].1);
+    let a = dir.path().join("a");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_kura-svg-worker"), a.join("w")).unwrap();
+    let current = Arc::new(Mutex::new(a.join("w")));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cmd = {
+        let (current, calls) = (current.clone(), calls.clone());
+        WorkerCommand::resolved_by(
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(current.lock().unwrap().clone())
+            },
+            [svg_worker::WORKER_ARG],
+        )
+    };
+    let set = set_with(cmd, generous());
+    let want = CodecSet::pinned()
+        .decode_path(&path, "svg", &opts, &limits, &NoMonitor)
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "組むときには求めない");
+    assert_eq!(
+        set.decode_path(&path, "svg", &opts, &limits, &NoMonitor)
+            .unwrap(),
+        want
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(set.shape_path(&path, "svg", &opts, &limits).is_ok());
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    // 動いているあいだにフォルダを改名した：求める口が新しい場所を返せば、そのまま読める
+    let b = dir.path().join("b");
+    std::fs::rename(&a, &b).unwrap();
+    *current.lock().unwrap() = b.join("w");
+    assert_eq!(
+        set.decode_path(&path, "svg", &opts, &limits, &NoMonitor)
+            .unwrap(),
+        want
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    // 求める口が古い場所のままなら、起動できない一時的な誤り（失敗にしない）
+    *current.lock().unwrap() = a.join("w");
+    let err = set
+        .decode_path(&path, "svg", &opts, &limits, &NoMonitor)
+        .unwrap_err();
+    assert!(svg_worker::is_unavailable(&err), "{err}");
+    assert_eq!(calls.load(Ordering::SeqCst), 6);
 }
 
 /// 入力の大きさの上限（16 MiB）は親が先に断る（子を起こさない：起こすと失敗で終わる偽の働き手でも `Limit`）。
@@ -402,6 +529,7 @@ fn an_orphaned_worker_exits_on_its_own() {
     let mut request = Vec::new();
     svg_worker::wire::write_request(
         &mut request,
+        &svg_worker::build_stamp(&PinnedOptions::default()),
         svg_worker::wire::Op::Shape,
         svg_worker::wire::Input::Path(&path),
         "svg",

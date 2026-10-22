@@ -25,7 +25,9 @@
 //!    のかを見分けない。`retry_analysis` で戻せる。M11 の確かめ C1）。
 //!
 //! 失敗（`unsupported`・`too_large`・`decode`・`crashed`）は事実の行に記録し、指紋が変わるか利用者が頼む（`retry_analysis`）まで
-//! 解き直さない。
+//! 解き直さない。ただし SVG の働き手を使えない（起動できない・別のビルド。`svg_worker::is_unavailable`。M11 の 3 回目の確認
+//! W2）のはアイテムのせいではないので、失敗にせず（pending のまま）、書きためた分を書いてジョブをその場で失敗にして止める
+//! （同じアイテムを拾い続けない。次にジョブが積まれたとき（ライブラリを開く・取り込む・インスペクタで選ぶなど）にやり直す）。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -47,6 +49,7 @@ use super::plan::{
     read_after_header, request_key, stage1, stage2,
 };
 use super::store::{self, Inflight, ItemWrite, NewResult, Pending, ReadStamp, Write, error_code};
+use crate::codec_ext::svg_worker;
 use crate::edit::{EngineRuntime, EngineServices};
 use crate::import::format_id;
 use crate::jobs::{Control, JobContext, JobEnd, JobHandler};
@@ -175,6 +178,8 @@ enum Step {
     },
     /// 中止・一時停止で捨てた（pending のまま）。
     Aborted,
+    /// SVG の働き手を使えない（一時的な誤り。pending のまま。ジョブを止める。理由）。
+    Unavailable(String),
 }
 
 /// 1 回の実行の道具。
@@ -527,6 +532,15 @@ impl Run<'_> {
                         self.flush(true)?;
                         return Ok(Some(self.stop()?.unwrap_or(JobEnd::Paused)));
                     }
+                    Step::Unavailable(why) => {
+                        // SVG の働き手を使えない：失敗にせず（pending のまま）、書きためた分を書いて処理中の印を消し、ジョブを
+                        // 止める（同じアイテムを拾い続けない）
+                        self.flush(true)?;
+                        let message = svg_worker::job_stopped("解析", why);
+                        self.ctx.log(&format!("アイテム {}: {message}", item.id));
+                        tracing::warn!(id = item.id, "{message}");
+                        return Err(CoreError::Tool(message));
+                    }
                     Step::Write {
                         write,
                         platform,
@@ -707,6 +721,7 @@ impl Run<'_> {
                 reused,
             },
             Step::Aborted => Step::Aborted,
+            Step::Unavailable(why) => Step::Unavailable(why),
         })
     }
 
@@ -737,6 +752,10 @@ impl Run<'_> {
         }
         let shape = match header {
             Ok((shape, _)) => shape,
+            // SVG の働き手を使えない：アイテムのせいではない（失敗にも、形式から書くことにもしない）
+            Err(err) if svg_worker::is_unavailable(&err) => {
+                return Ok((Step::Unavailable(err.to_string()), false));
+            }
             Err(err) => {
                 return Ok(match failure_code(&err) {
                     Some(_) if by_header => {
@@ -816,6 +835,9 @@ impl Run<'_> {
         drop(lease);
         let (read, stamp, requests, results) = match solved {
             Ok(s) => s,
+            Err(err) if svg_worker::is_unavailable(&err) => {
+                return Ok(Step::Unavailable(err.to_string()));
+            }
             Err(err) => {
                 return Ok(match failure_code(&err) {
                     Some(code) => {

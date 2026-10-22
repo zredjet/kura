@@ -9,6 +9,9 @@
 //!   書いたら、ほかの形式の古いファイルを消す。stale のものを作り直せなかったときは、前の絵のまま ready に戻す。
 //! - 作る前に作っているアイテムの印を付け、結果と同じトランザクションで消す（[`inflight`]。OS のデコーダで落ちたときに、
 //!   同じファイルで落ち続けないように）。前回落ちたときにまとめて作っていたものは、先に 1 件ずつ作る。
+//! - SVG の働き手を使えない（起動できない・別のビルド。M11 の 3 回目の確認 W2）ときは、そのアイテムを失敗にせず（pending・
+//!   stale のまま）、その回のほかの結果を書いてから、ジョブをその場で失敗にして止める（同じアイテムを拾い続けない。次に
+//!   ジョブが積まれたとき（ライブラリを開く・取り込むなど）にやり直す）。
 //!
 //! 進み具合はアイテムごとの thumb_state そのもの（強制終了しても、続きは pending・stale のものから）。
 
@@ -24,6 +27,7 @@ use super::engine_thumbs::{
 };
 use super::route::{ThumbRoute, sync_plan, thumb_route};
 use super::{MediaBackend, MediaError, MediaInfo, ModelInfo, ThumbFormat, ThumbTargets, inflight};
+use crate::codec_ext::svg_worker;
 use crate::db::Db;
 use crate::edit::EngineServices;
 use crate::import::{MediaKind, format_id};
@@ -83,6 +87,8 @@ enum Done {
     Failed(String),
     /// 中止・一時停止で作らなかった（何も書かない）。
     Skipped,
+    /// SVG の働き手を使えないので作らなかった（何も書かない。pending・stale のまま。ジョブを止める。理由）。
+    Unavailable(String),
 }
 
 /// 1 件の結果。
@@ -260,9 +266,14 @@ impl JobHandler for ThumbnailHandler {
                     ctx.log(&format!("アイテム {}: {error}", outcome.id));
                 }
             }
+            // SVG の働き手を使えない：その回のほかの結果は書き、ジョブを止める（同じアイテムを拾い続けない）
+            let unavailable = outcomes.iter().find_map(|o| match &o.done {
+                Done::Unavailable(why) => Some((o.id, why.clone())),
+                _ => None,
+            });
             let finished: Vec<&Outcome> = outcomes
                 .iter()
-                .filter(|o| o.done != Done::Skipped)
+                .filter(|o| !matches!(o.done, Done::Skipped | Done::Unavailable(_)))
                 .collect();
             done += finished.len() as u64;
             failed += finished
@@ -276,6 +287,12 @@ impl JobHandler for ThumbnailHandler {
                 }
                 inflight::clear(tx)
             })?;
+            if let Some((id, why)) = unavailable {
+                let message = svg_worker::job_stopped("サムネイルの作成", why);
+                ctx.log(&format!("アイテム {id}: {message}"));
+                tracing::warn!(id, "{message}");
+                return Err(CoreError::Tool(message));
+            }
 
             let remaining = library.db().read(count_remaining)?;
             let total = done + remaining;
@@ -408,6 +425,7 @@ fn engine_outcome(item: &Pending, result: EngineDone) -> std::result::Result<Out
             Outcome::new(item, model_info(model), Done::Failed(error))
         }
         EngineDone::Canceled => Outcome::new(item, None, Done::Skipped),
+        EngineDone::Unavailable(why) => Outcome::new(item, None, Done::Unavailable(why)),
     })
 }
 
@@ -612,7 +630,7 @@ fn apply(tx: &Connection, outcomes: &[Outcome]) -> Result<()> {
     )?;
     for outcome in outcomes {
         let (state, rev) = match (&outcome.done, outcome.stale) {
-            (Done::Skipped, _) => continue,
+            (Done::Skipped | Done::Unavailable(_), _) => continue,
             (Done::Ready(_), _) => ("ready", 1),
             (Done::NoArt | Done::Failed(_), true) => ("ready", 0),
             (Done::NoArt | Done::Failed(_), false) => ("failed", 0),
@@ -1000,6 +1018,87 @@ mod tests {
         assert!(last_log(&jobs).contains("ImageIO"), "{}", last_log(&jobs));
         // 拡張子が gif でも中身が png なら、エンジンは読めずに ImageIO へ回す
         assert_eq!(row(&lib, 3).0, "ready");
+    }
+
+    /// SVG を `worker` の働き手で読む組（固定の段）と、予算 1 GiB の小さな実行の場。
+    struct WorkerFactory {
+        worker: crate::codec_ext::svg_worker::WorkerCommand,
+    }
+
+    impl crate::edit::EngineFactory for WorkerFactory {
+        fn runtime_config(&self) -> crate::edit::RuntimeConfig {
+            Factory.runtime_config()
+        }
+        fn codecs(&self, _: &Path) -> kura_engine::codec::CodecSet {
+            let mut set = kura_engine::codec::CodecSet::pinned();
+            svg_worker::install(
+                &mut set,
+                &kura_engine::codec::PinnedOptions::default(),
+                self.worker.clone(),
+            )
+            .unwrap();
+            set
+        }
+    }
+
+    /// M11 の 3 回目の確認 W2：SVG の働き手を使えない（動かしたまま移した・別のビルドに置き換えた）ときは、その SVG を
+    /// 失敗にせず（pending・stale のまま）、その回のほかの結果は書いて、ジョブを失敗にして止める。次に積めばやり直す。
+    #[test]
+    fn an_unavailable_svg_worker_leaves_items_waiting_and_stops_the_job() {
+        use crate::codec_ext::svg_worker::{WORKER_ARG, WorkerCommand};
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Arc::new(Library::create(&dir.path().join("L")).unwrap());
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"/>"#;
+        add_bytes(&lib, 1, "image", "jpg", None, None, b"x");
+        add_bytes(&lib, 2, "image", "svg", None, None, svg);
+        add_bytes(&lib, 3, "image", "png", None, None, &test_png(30, 20, true));
+        let moved = WorkerCommand::new(dir.path().join("moved/kura-app"), [WORKER_ARG]);
+        let handler = || {
+            ThumbnailHandler::new(Arc::new(FakeBackend)).with_engine(Some(Arc::new(
+                EngineServices::new(
+                    Arc::new(WorkerFactory {
+                        worker: moved.clone(),
+                    }),
+                    dir.path().join("engine"),
+                ),
+            )))
+        };
+        for round in 0..2 {
+            let jobs = run_with(&lib, handler());
+            let last = jobs
+                .list(&crate::jobs::JobFilter {
+                    kinds: vec![JobKind::Thumbnail],
+                    states: vec![],
+                    limit: Some(1),
+                })
+                .unwrap()
+                .remove(0);
+            assert_eq!(last.state, JobState::Failed, "{round}");
+            let message = last.message.unwrap_or_default();
+            assert!(
+                message.contains("起動できません")
+                    && message.contains("サムネイルの作成を止めました"),
+                "{message}"
+            );
+            assert_eq!(row(&lib, 2).0, "pending", "{round}: 失敗にしない");
+            assert_eq!(rev(&lib, 2), 0);
+            assert!(
+                last_log(&jobs).contains("アイテム 2"),
+                "{}",
+                last_log(&jobs)
+            );
+            // 同じ回のほかのもの（エンジンの道の png・OS の道の jpg）は書く
+            assert_eq!(row(&lib, 3).0, "ready");
+            assert_eq!(row(&lib, 1).0, "ready");
+            assert_eq!(inflight_now(&lib), None, "途中の印を消していない");
+        }
+        // 作り直し（stale）の SVG も、今の絵のまま stale に残す
+        sql(
+            &lib,
+            "UPDATE items SET thumb_state = 'stale', thumb_rev = 4 WHERE id = 2",
+        );
+        run_with(&lib, handler());
+        assert_eq!((row(&lib, 2).0.as_str(), rev(&lib, 2)), ("stale", 4));
     }
 
     /// 偽物を包んで、呼ばれた順・そのときの途中の印・失敗させるアイテムを覚える。
