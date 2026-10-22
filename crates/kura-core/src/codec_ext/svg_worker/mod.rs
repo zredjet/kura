@@ -11,7 +11,8 @@
 //!   プロセスの中の固定の段と同じ（決定性・作り直しの照合を変えない）。
 //! - 時間：形は [`SHAPE_DEADLINE`]、値は [`DECODE_DEADLINE`]（実測と理由は定数の注釈）。超えたら子をグループごと SIGKILL して
 //!   `Limit`（[`TIME_LIMIT`]。サムネイルは ImageIO へ回さず種類の絵にする）。見張り（`Monitor`）の中止でも子を止めて
-//!   `Canceled`。子が落ちた・壊れた返事は `Decode`。
+//!   `Canceled`。子が落ちた・壊れた返事は `Decode`。親が落ちた・終わったときも、子は頼みの時間の上限に [`SELF_GRACE`] を
+//!   足したら自分で終わる（止まる SVG を読み続ける子を残さない）。
 //! - 子の数は同時の呼び出しの数まで（サムネイルは一括のプールの並列、解析は 1 件ずつ）。子のメモリは予算の外なので、入力の
 //!   大きさの上限（`svg::MAX_SOURCE`。親が先に断る）と子の中の見積もり（文字・textPath・描く手間）を前段として残し、予算の
 //!   見積もり（`work_bytes`）はプロセスの中のデコーダのものを使う。
@@ -55,6 +56,28 @@ pub const SHAPE_DEADLINE: Duration = Duration::from_secs(2);
 /// 止める値にする（5 秒では地図風のものを同時に描くと止めてしまう）。
 pub const DECODE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// 子が自分で終わるまでの、頼みの時間の上限に足す猶予。ふだんは親が上限で子を止めるので届かない。親が落ちた・終わった
+/// ときに、止まる SVG を読み続ける子を残さない（[`serve`]）。
+pub const SELF_GRACE: Duration = Duration::from_secs(2);
+
+/// 子が自分で終わるときの終了コード（EX_TEMPFAIL）。
+const SELF_DEADLINE_EXIT: i32 = 75;
+
+/// `after` たったら、このプロセスを終える（働き手の中だけで使う。答えを書き終えれば、その前にふつうに終わる）。
+fn exit_after(after: Duration) {
+    let spawned = std::thread::Builder::new()
+        .name("kura-svg-worker-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(after);
+            let _ = writeln!(std::io::stderr(), "時間の上限を過ぎたので終わります");
+            std::process::exit(SELF_DEADLINE_EXIT);
+        });
+    if spawned.is_err() {
+        // 見張りを起こせないなら、親の見張り（時間の上限で SIGKILL）だけに頼る
+        let _ = writeln!(std::io::stderr(), "自分で終わる見張りを起こせません");
+    }
+}
+
 /// 引数が働き手の起動（`<exe> --kura-svg-worker` だけ）か。各 main が最初に呼ぶ。
 pub fn is_worker_invocation() -> bool {
     let mut args = std::env::args_os().skip(1);
@@ -62,7 +85,8 @@ pub fn is_worker_invocation() -> bool {
 }
 
 /// 働き手として動く：標準入力の頼みを 1 つ読み、固定の段の SVG のデコーダ（`opts` のフォントつき）で読み、標準出力に返事を
-/// 書いて終わる（Tauri もログも始めない）。返事を書けなければ 2。
+/// 書いて終わる（Tauri もログも始めない）。返事を書けなければ 2。親がいなくなっても、頼みの時間の上限に [`SELF_GRACE`] を
+/// 足したら自分で終わる（75）。
 pub fn serve(opts: &PinnedOptions) -> ExitCode {
     let set = CodecSet::pinned_with(opts);
     let Some(decoder) = set.decoder_by_id(svg::DEC_ID) else {
@@ -71,8 +95,12 @@ pub fn serve(opts: &PinnedOptions) -> ExitCode {
     };
     let mut input = std::io::stdin().lock();
     let mut output = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
-    let written = child::serve_with(decoder.as_ref(), &mut input, &mut output, svg::MAX_SOURCE)
-        .and_then(|()| output.flush());
+    let request = wire::read_request(&mut input, svg::MAX_SOURCE);
+    if let Ok(r) = &request {
+        exit_after(r.deadline.saturating_add(SELF_GRACE));
+    }
+    let written =
+        child::serve_request(decoder.as_ref(), request, &mut output).and_then(|()| output.flush());
     match written {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

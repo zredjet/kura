@@ -126,12 +126,12 @@ impl SvgWorkerDecoder {
         if mon.canceled() {
             return Err(EngineError::Canceled);
         }
-        let mut request = Vec::new();
-        wire::write_request(&mut request, op, input, format, opts, limits)?;
         let deadline = match op {
             Op::Shape => self.deadlines.shape,
             Op::Decode => self.deadlines.decode,
         };
+        let mut request = Vec::new();
+        wire::write_request(&mut request, op, input, format, opts, limits, deadline)?;
         let mut reader = ReplyReader::new(op, limits);
         let budget = Budget {
             max_stdout: reader.max_len(),

@@ -16,7 +16,17 @@ pub fn serve_with(
     output: &mut dyn Write,
     max_bytes: u64,
 ) -> std::io::Result<()> {
-    let request = match wire::read_request(input, max_bytes) {
+    serve_request(decoder, wire::read_request(input, max_bytes), output)
+}
+
+/// 読んだ頼み（読めなかったら理由）に答えて返事を書く（[`serve_with`] の後半。頼みの時間の上限を見てから答えたい
+/// 呼び手（`serve`）が使う）。
+pub fn serve_request(
+    decoder: &dyn Decoder,
+    request: Result<Request, String>,
+    output: &mut dyn Write,
+) -> std::io::Result<()> {
+    let request = match request {
         Ok(r) => r,
         Err(message) => {
             return wire::write_error(
@@ -79,6 +89,7 @@ mod tests {
             "svg",
             &DecodeOptions::default(),
             &Limits::default(),
+            std::time::Duration::from_secs(60),
         )
         .unwrap();
         let mut out = Vec::new();

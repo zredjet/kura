@@ -390,3 +390,54 @@ fn concurrent_calls_each_use_their_own_child() {
         }
     });
 }
+
+/// 親が先にいなくなっても（アプリが落ちた・終わった）、子は頼みの時間の上限のあと少しで自分で終わる（止まる SVG を読み
+/// 続けて、CPU とメモリを使い続ける子を残さない）。
+#[test]
+fn an_orphaned_worker_exits_on_its_own() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "s1.svg", SLOW_SHAPE.as_bytes());
+    let mut request = Vec::new();
+    svg_worker::wire::write_request(
+        &mut request,
+        svg_worker::wire::Op::Shape,
+        svg_worker::wire::Input::Path(&path),
+        "svg",
+        &DecodeOptions::default(),
+        &Limits::default(),
+        Duration::from_millis(300),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kura-svg-worker"))
+        .arg(svg_worker::WORKER_ARG)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    child.stdin.take().unwrap().write_all(&request).unwrap();
+    // 親は待つだけで止めない（上限 0.3 秒 ＋ 子の猶予 2 秒のあとに、子が自分で終わる）
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break Some(s);
+        }
+        if started.elapsed() > Duration::from_secs(15) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let took = started.elapsed();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let status = status.expect("子が自分で終わらない");
+    assert!(!status.success(), "{status:?}");
+    assert!(
+        took >= svg_worker::SELF_GRACE && took < Duration::from_secs(10),
+        "{took:?}"
+    );
+}

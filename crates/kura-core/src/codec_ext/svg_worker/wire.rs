@@ -1,7 +1,8 @@
 //! SVG の働き手とのやり取りの形（決定 23）。子の標準入力に頼みを 1 つ、子の標準出力に返事を 1 つ。どちらも版付き・長さ付き・
 //! 上限付きで、数はリトルエンディアン。
 //!
-//! - 頼み（親 → 子）：`KURASVG>`・版 u32・何を u8（1 形・2 値）・見出しの長さ u32・見出し（JSON：形式・読み方・上限）・
+//! - 頼み（親 → 子）：`KURASVG>`・版 u32・何を u8（1 形・2 値）・見出しの長さ u32・見出し（JSON：形式・読み方・上限・
+//!   時間の上限（子は親がいなくなっても、これに猶予を足したら自分で終わる））・
 //!   入力の種類 u8（1 パス・2 バイト列）・長さ u64・中身（パスのバイト列か、ファイルの中身）。
 //! - 返事（子 → 親）：`KURASVG<`・版 u32・種類 u8（1 形・2 値・3 エラー）・見出しの長さ u32・見出し（JSON）・中身の長さ u64・
 //!   中身。値の中身は ICC・EXIF・フレームごとの画素の行（上から、行を詰めて）の順。形とエラーの中身は空。
@@ -15,6 +16,7 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +97,8 @@ pub struct Request {
     pub format: String,
     pub opts: DecodeOptions,
     pub limits: Limits,
+    /// 親がこの頼みに使う時間の上限（子は親がいなくなっても、これに猶予を足したら自分で終わる）。
+    pub deadline: Duration,
     pub source: Source,
 }
 
@@ -181,6 +185,7 @@ struct RequestHead {
     format: String,
     opts: DecodeOptions,
     limits: WireLimits,
+    deadline_ms: u64,
 }
 
 /// 値の見出し。`frames` がなければ 1 枚の画像（`w`・`h` はその大きさ）、あればフレームの列（`w`・`h` はキャンバス）。
@@ -302,7 +307,7 @@ fn write_fixed(out: &mut dyn Write, magic: &[u8; 8], kind: u8, head: &[u8]) -> s
     out.write_all(head)
 }
 
-/// 頼みを書く（親）。
+/// 頼みを書く（親）。`deadline` は親がこの頼みに使う時間の上限。
 pub fn write_request(
     out: &mut dyn Write,
     op: Op,
@@ -310,11 +315,13 @@ pub fn write_request(
     format: &str,
     opts: &DecodeOptions,
     limits: &Limits,
+    deadline: Duration,
 ) -> std::io::Result<()> {
     let head = json(&RequestHead {
         format: format.to_string(),
         opts: opts.clone(),
         limits: WireLimits::from(limits),
+        deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
     })?;
     write_fixed(out, &REQUEST_MAGIC, op.code(), &head)?;
     let (kind, data) = match input {
@@ -387,6 +394,7 @@ pub fn read_request(src: &mut dyn Read, max_bytes: u64) -> Result<Request, Strin
         format: head.format,
         opts: head.opts,
         limits: head.limits.into(),
+        deadline: Duration::from_millis(head.deadline_ms),
         source,
     })
 }
@@ -918,9 +926,19 @@ mod tests {
             (Op::Decode, Input::Bytes(b"<svg/>")),
         ] {
             let mut b = Vec::new();
-            write_request(&mut b, op, input, "svg", &DecodeOptions::default(), &limits).unwrap();
+            write_request(
+                &mut b,
+                op,
+                input,
+                "svg",
+                &DecodeOptions::default(),
+                &limits,
+                Duration::from_millis(1_234),
+            )
+            .unwrap();
             let req = read_request(&mut b.as_slice(), 1 << 20).unwrap();
             assert_eq!(req.op, op);
+            assert_eq!(req.deadline, Duration::from_millis(1_234));
             assert_eq!(req.format, "svg");
             assert_eq!(req.limits, limits);
             match (input, &req.source) {
@@ -942,6 +960,7 @@ mod tests {
             "svg",
             &DecodeOptions::default(),
             &limits,
+            Duration::from_secs(1),
         )
         .unwrap();
         assert!(read_request(&mut b.as_slice(), 99).is_err());
