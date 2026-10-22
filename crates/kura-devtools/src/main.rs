@@ -149,10 +149,29 @@ impl EngineFactory for MacEngineFactory {
 /// 別のプロセスで読む（決定 23。`svg_worker`）。`work_dir` は ffmpeg の一時ファイルの置き場。
 pub(crate) fn app_codecs(work_dir: &std::path::Path) -> CodecSet {
     let mut set = kura_mac::full_codec_set(&kura_mac::pinned_options(), work_dir);
-    if let Err(e) = svg_worker::install(&mut set, WorkerCommand::current_exe()) {
+    if let Some(cmd) = svg_worker_command()
+        && let Err(e) = svg_worker::install(&mut set, cmd)
+    {
         tracing::error!("SVG の働き手を組めません: {e}");
     }
     set
+}
+
+/// SVG の働き手を起動するコマンド：自分の実行ファイル（`--kura-svg-worker` 付き）。
+#[cfg(not(test))]
+fn svg_worker_command() -> Option<Result<WorkerCommand, String>> {
+    Some(WorkerCommand::current_exe())
+}
+
+/// テストのハーネス（`target/<profile>/deps/kura_devtools-…`）は働き手になれないので、cargo が隣に作る実行ファイル
+/// （`target/<profile>/kura-devtools`。結合テスト `tests/svg_worker.rs` が使うので `cargo test -p kura-devtools` で作られる）を
+/// 働き手にする。なければ（単体テストだけを組んだとき）SVG はプロセスの中で読む。
+#[cfg(test)]
+fn svg_worker_command() -> Option<Result<WorkerCommand, String>> {
+    let exe = std::env::current_exe().ok()?;
+    let bin = exe.parent()?.parent()?.join("kura-devtools");
+    bin.is_file()
+        .then(|| Ok(WorkerCommand::new(bin, [svg_worker::WORKER_ARG])))
 }
 
 /// アプリと同じ渡しもの（メディアの実装・エンジンの部品・DB を新しい版にするときの空きの確かめ）。知らせはログに出す。
