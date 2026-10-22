@@ -10,8 +10,8 @@
 //! - 値が [`VALUE_CAP`]（1 GiB）を超えるもの・`Limit`・`Unsupported`・読めないもの・予算に収まらないものは、画像なら
 //!   [`EngineDone::Fallback`] で ImageIO の道へ回す（ImageIO は縮めて読める）。3D は回す先がないので失敗（種類の絵）。
 //!   ただし別のプロセスで読む SVG が時間の上限を超えたもの（`svg_worker::is_time_limit`）は回さずに失敗（種類の絵）にする
-//!   （ImageIO の SVG はプロセスの中で読み、同じように時間を使いうる。決定 23）。SVG の形を読む子は、見積もりの段でも中止で
-//!   止める（`CodecSet::shape_path_monitored`）。
+//!   （ImageIO の道は SVG のサムネイルを作れず、時間を使う SVG をプロセスの中でもう一度開くだけ。決定 23）。SVG の形を読む
+//!   子は、見積もりの段でも中止で止める（`CodecSet::shape_path_monitored`）。
 
 use std::fs::File;
 use std::io::Read;
@@ -326,8 +326,8 @@ fn not_drawn(job: &EngineJob, err: &EngineError, info: Option<&model::ModelInfo>
             error: format!("サムネイルを書けません: {e}"),
             model: info.map(boxed),
         },
-        // 別のプロセスで読む SVG が時間の上限を超えた：止めて種類の絵にする（ImageIO の SVG もプロセスの中で同じように
-        // 時間を使いうるので回さない。決定 23）
+        // 別のプロセスで読む SVG が時間の上限を超えた：止めて種類の絵にする（決定 23）。ImageIO の道は SVG のサムネイルを
+        // 作れず（確認の S の形 12 件はどれも 0.3 秒で失敗）、時間を使う SVG をプロセスの中でもう一度開くだけなので回さない
         (e, _) if svg_worker::is_time_limit(e) => EngineDone::Failed {
             error: e.to_string(),
             model: info.map(boxed),
