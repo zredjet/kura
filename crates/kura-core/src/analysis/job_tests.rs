@@ -686,6 +686,75 @@ fn failure_is_recorded_and_not_retried_until_fingerprint_changes() {
     assert_eq!(env.tries(), tried + 2);
 }
 
+/// 固定の段の SVG のデコーダを、`/bin/sh -c script` の偽の働き手（時間の上限 `ms`）に頼む形に差し替えた組。
+fn svg_worker_set(log: &Arc<Mutex<Vec<String>>>, script: &'static str, ms: u64) -> CodecSet {
+    use crate::codec_ext::svg_worker::{Deadlines, WorkerCommand, install_with};
+    let mut set = watched_set(log, None, Vec::new());
+    let svg = CodecSet::pinned()
+        .decoder_by_id(kura_engine::codec::svg::DEC_ID)
+        .cloned()
+        .unwrap();
+    set.add_decoder(svg).unwrap();
+    install_with(
+        &mut set,
+        Ok(WorkerCommand::new("/bin/sh", ["-c", script])),
+        Deadlines {
+            shape: Duration::from_millis(ms),
+            decode: Duration::from_millis(ms),
+        },
+    )
+    .unwrap();
+    set
+}
+
+const TINY_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"/>"#;
+
+/// 決定 23：別のプロセスで読む SVG が時間の上限を超えたら、そのアイテムは failed（too_large）にして先へ進む。形を読む子は
+/// ジョブの中止で止める（中止を時間の上限まで待たせない。ライブラリを閉じるときも同じ）。
+#[test]
+fn svg_worker_time_limits_fail_the_item_and_cancel_stops_the_child() {
+    let env = Env::with(|log, _| svg_worker_set(log, "sleep 40.4159", 200), 64 << 20);
+    let svg = env.add(2, "image", "svg", TINY_SVG);
+    env.add(1, "image", "png", &sprite(3));
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    assert_eq!(env.state(2), "failed");
+    assert_eq!(env.fact::<String>(&svg, "error_code"), "too_large");
+    assert_eq!(env.state(1), "ready", "次のアイテムへ進む");
+
+    let env = Env::with(
+        |log, _| svg_worker_set(log, "sleep 41.4159", 60_000),
+        64 << 20,
+    );
+    env.add(1, "image", "svg", TINY_SVG);
+    env.jobs.ensure_queued(JobKind::Analyze, "{}").unwrap();
+    let running = loop {
+        let r = env
+            .jobs
+            .list(&JobFilter {
+                kinds: vec![JobKind::Analyze],
+                states: vec![JobState::Running],
+                limit: Some(1),
+            })
+            .unwrap();
+        if let Some(r) = r.into_iter().next() {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // 子が形を読み始めるまで待ってから中止する
+    std::thread::sleep(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    env.jobs.cancel(running.id).unwrap();
+    assert!(
+        env.jobs.wait_idle(Duration::from_secs(3)),
+        "中止を待たされる"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(env.last().state, JobState::Canceled);
+    assert_eq!(env.state(1), "pending");
+}
+
 /// 見積もりが min(予算/2, 1 GiB) を超えるものは、予算を確保せずに failed（too_large）にする（予算が埋まっていても待たない）。
 #[test]
 fn too_large_fails_without_acquiring() {

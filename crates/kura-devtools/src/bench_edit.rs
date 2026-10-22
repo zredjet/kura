@@ -7,7 +7,7 @@
 //!
 //! - 判定の条件（ADR-154 (1)(c)）：プレビューのプールを `--preview-threads`（既定 3）、一括のプールを `--bulk-threads`
 //!   （既定 3）にして判定する。`--threads` に並べた数でも回し、記録する（判定はしない）。プールと予算は kura-core の
-//!   `EngineRuntime`（アプリと同じ構成）。コーデックはアプリと同じ組（`kura_mac::full_codec_set`）。
+//!   `EngineRuntime`（アプリと同じ構成）。コーデックはアプリと同じ組（`crate::app_codecs`）。
 //! - 「エンジンの中」（NFR-11・12）：編集を受けてから、プレビューの値と変わったタイルの一覧ができるまで（セッションの手・
 //!   差分の計画・段の計画・予算の確保・表示の経路（`Engine::render_view`：前回の表示から変わったタイルだけを描き直す）。
 //!   ダイジェスト・エンコード・IPC・WebKit を含めない）。
@@ -507,8 +507,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
 }
 
 fn run_all(opts: Opts, tmp: &Path) -> Result<(), String> {
-    // アプリと同じ組（SVG の文字はシステムのフォントで描く）
-    let codecs = kura_mac::full_codec_set(&kura_mac::pinned_options(), &tmp.join("codec"));
+    // アプリと同じ組（SVG の文字はシステムのフォントで描き、SVG は別のプロセスで読む）
+    let codecs = crate::app_codecs(&tmp.join("codec"));
     let real = match &opts.photo {
         Some(p) => Some(load_photo(&codecs, p)?),
         None => None,

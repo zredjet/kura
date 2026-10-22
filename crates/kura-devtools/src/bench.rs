@@ -15,7 +15,8 @@ use kura_core::time::now_ms;
 /// `bench query --library <path>` / `bench thumbs --src <dir> [--threads N]` /
 /// `bench import --src <dir> [--threads N] [--out <dir>]` / `bench backup --library <path>` /
 /// `bench edit …`（編集のベンチ。`bench_edit`）/ `bench migrate …`（マイグレーション。`bench_migrate`）/
-/// `bench analyze …`（解析のジョブ。`bench_analyze`）/ `bench thumbs-job --src <dir> …`（サムネイルのジョブ。`bench_thumbs`）。
+/// `bench analyze …`（解析のジョブ。`bench_analyze`）/ `bench thumbs-job --src <dir> …`（サムネイルのジョブ。`bench_thumbs`）/
+/// `bench svg-worker …`（SVG の働き手の手間。`bench_svg`）。
 pub fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("edit") {
         return crate::bench_edit::run(&args[1..]);
@@ -28,6 +29,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("analyze") {
         return crate::bench_analyze::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("svg-worker") {
+        return crate::bench_svg::run(&args[1..]);
     }
     let mut library = None;
     let mut src = None;

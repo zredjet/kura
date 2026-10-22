@@ -24,14 +24,14 @@
 
 ```
 Cargo.toml                 # workspace
-crates/kura-core/          # OS 非依存のドメインロジック（DB, 取り込み, 検索, ユニット, プレイリスト, ジョブ, 編集の ffmpeg の段・実行の場）
+crates/kura-core/          # OS 非依存のドメインロジック（DB, 取り込み, 検索, ユニット, プレイリスト, ジョブ, 編集の ffmpeg の段・実行の場, SVG を別のプロセスで読む働き手）
 crates/kura-core/migrations/  # SQL マイグレーション（連番、既存は編集禁止）
 crates/kura-engine/        # 編集の操作エンジン：文書・操作・描画・解析・コーデック・3D（glb）の読み手と描画・エディタのセッション（OS・DB 非依存）
 crates/vorbis-tables/      # Ogg Vorbis のエンコーダの表（aoTuV から生成。BSD-3）と照合用の C の組み方（oracle/）
 crates/kura-mac/           # macOS 専用：サムネイル, メディア情報, スナップショット, 編集の Platform のコーデック（Swift ヘルパー）, 大きな確保を OS へすぐ返す確保器（アプリの global_allocator）
 crates/kura-devtools/      # ダミーライブラリ生成・ベンチマーク
 third_party/               # 不具合を直した、または kura の要件（libm への差し替え）で手を入れた第三者のクレートの写し（[patch.crates-io]。元のライセンスのまま）
-src-tauri/                 # Tauri アプリ本体：commands/, protocol.rs（kura://）, navigation.rs（main の窓と移動の制限）, engine.rs（エンジンの部品を作る口）, state.rs（開いているライブラリ）, dto.rs（型とイベント）, error.rs（AppError と code）, config.rs, shortcut.rs, logging.rs
+src-tauri/                 # Tauri アプリ本体：main.rs（--kura-svg-worker で起動されたら SVG の働き手）, commands/, protocol.rs（kura://）, navigation.rs（main の窓と移動の制限）, engine.rs（エンジンの部品を作る口）, state.rs（開いているライブラリ）, dto.rs（型とイベント）, error.rs（AppError と code）, config.rs, shortcut.rs, logging.rs
 src/                       # React フロント：features/, components/, styles/, ipc/, stores/
 docs/                      # 仕様・設計（下記）
 ```

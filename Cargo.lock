@@ -2119,6 +2119,7 @@ name = "kura-app"
 version = "0.1.0"
 dependencies = [
  "kura-core",
+ "kura-engine",
  "kura-mac",
  "serde",
  "serde_json",

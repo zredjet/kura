@@ -5,7 +5,7 @@
 //! - `edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]`：
 //!   文書を当てて書き出し、値のダイジェスト・読み取りと書き出しの記録・警告を表示する
 //!
-//! コーデックはアプリと同じ組（`kura_mac::full_codec_set`：固定の段 → macOS → ffmpeg）で選ぶ。
+//! コーデックはアプリと同じ組（`crate::app_codecs`：固定の段 → macOS → ffmpeg。SVG は別のプロセスで読む）で選ぶ。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -43,10 +43,10 @@ fn format_of(path: &Path) -> Result<&'static str, String> {
         .ok_or_else(|| format!("{} の形式が分かりません", path.display()))
 }
 
-/// アプリと同じコーデックの組（SVG の文字はシステムのフォントで描く）。ffmpeg の一時ファイルは OS の一時フォルダの下に置く。
+/// アプリと同じコーデックの組（SVG の文字はシステムのフォントで描き、SVG は別のプロセスで読む。`crate::app_codecs`）。
+/// ffmpeg の一時ファイルは OS の一時フォルダの下に置く。
 fn codecs() -> CodecSet {
-    let work = std::env::temp_dir().join("kura-devtools-codec");
-    kura_mac::full_codec_set(&kura_mac::pinned_options(), &work)
+    crate::app_codecs(&std::env::temp_dir().join("kura-devtools-codec"))
 }
 
 fn caps() -> Result<(), String> {

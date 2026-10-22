@@ -1,6 +1,7 @@
 //! 開発用ツール。
 //!
-//! - `import --library <path> [--create] [<src>...]`：取り込む（<src> を省くと、中断していた取り込みの再開だけ待つ）
+//! - `import --library <path> [--create] [--close-after-ms N] [<src>...]`：取り込む（<src> を省くと、中断していた取り込みの
+//!   再開だけ待つ。`--close-after-ms` は N ms 待ってジョブの途中でライブラリを閉じ、閉じるのにかかった時間を出す）
 //! - `download --library <path> <url>...`：アプリと同じジョブで取得してライブラリに入れる（M7 の確認用）
 //! - `check --library <path>`：件数と整合性（DB とファイルの食い違い）を表示する
 //! - `seed --items <件数> --out <path> [--analysis pending|ready]`：ダミーライブラリを作る（グリッドと起動時間の計測用。
@@ -16,6 +17,8 @@
 //!   （道の割り振り・エンジンの道の予算込み）の速さを測る（NFR-04。M11。`bench_thumbs` の冒頭）
 //! - `bench migrate (--library <path> | --items <件数> [--history]) [--runs 3]`：マイグレーションの時間と照合
 //!   （docs/data-model.md §5。`bench_migrate` の冒頭）
+//! - `bench svg-worker [--src <dir>] [--limit N] [--parallel N] [--spawns N]`：SVG の働き手（別のプロセスで読む。決定 23）の
+//!   子の起動の手間と、ふつうの SVG をプロセスの中と働き手で読んだ時間・結果の一致（`bench_svg` の冒頭）
 //! - `bench analyze --kind image|audio [--limit N] [--src <dir>] [--json <file>]`：解析のジョブの件数/秒・1 件の
 //!   p50・p95・ピークのメモリ（`bench_analyze` の冒頭）
 //! - `bench edit [--quick] [--threads 3,4,16] [--photo <file>] [--json <file>] [--markdown <file>] …`：編集の性能
@@ -34,6 +37,7 @@ mod bench_analyze;
 mod bench_edit;
 mod bench_facts;
 mod bench_migrate;
+mod bench_svg;
 mod bench_thumbs;
 mod edit;
 mod mem_smoke;
@@ -46,6 +50,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kura_core::codec_ext::svg_worker::{self, WorkerCommand};
 use kura_core::download::{CookieSource, DownloadInput, DownloadOptions, detect, start_download};
 use kura_core::edit::{CodecSet, EngineFactory, RuntimeConfig};
 use kura_core::import::{ImportInput, ImportOptions, start_import};
@@ -57,6 +62,10 @@ const USAGE: &str = "使い方: kura-devtools import --library <path> [--create]
                      vorbis-quality --out <dir> [--quick] [--input <file>]... [--reference <音>/<ラベル>=<ogg>]...";
 
 fn main() -> ExitCode {
+    // SVG の働き手として起動された（アプリと同じ組で SVG を読むとき、自分を `--kura-svg-worker` 付きで起動する。決定 23）
+    if svg_worker::is_worker_invocation() {
+        return svg_worker::serve(&kura_mac::pinned_options());
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_target(false)
@@ -88,17 +97,26 @@ struct Args {
     library: PathBuf,
     create: bool,
     sources: Vec<PathBuf>,
+    /// 取り込みを積んでからこれだけ待ってライブラリを閉じ、閉じるのにかかった時間を出す（終わるのを待たない）。
+    close_after: Option<Duration>,
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut library = None;
     let mut create = false;
     let mut sources = Vec::new();
+    let mut close_after = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--library" => library = it.next().map(PathBuf::from),
             "--create" => create = true,
+            "--close-after-ms" => {
+                close_after = it
+                    .next()
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .map(Duration::from_millis);
+            }
             other => sources.push(PathBuf::from(other)),
         }
     }
@@ -106,11 +124,12 @@ fn parse(args: &[String]) -> Result<Args, String> {
         library: library.ok_or(USAGE)?,
         create,
         sources,
+        close_after,
     })
 }
 
-/// アプリ（src-tauri の `MacEngineFactory`）と同じエンジンの部品の作り方：物理メモリは kura-mac、コーデックの組は固定の段
-/// （SVG の文字はシステムのフォント）→ macOS → ffmpeg。
+/// アプリ（src-tauri の `MacEngineFactory`）と同じエンジンの部品の作り方：物理メモリは kura-mac、コーデックの組は
+/// [`app_codecs`]。
 struct MacEngineFactory;
 
 impl EngineFactory for MacEngineFactory {
@@ -122,8 +141,37 @@ impl EngineFactory for MacEngineFactory {
     }
 
     fn codecs(&self, work_dir: &std::path::Path) -> CodecSet {
-        kura_mac::full_codec_set(&kura_mac::pinned_options(), work_dir)
+        app_codecs(work_dir)
     }
+}
+
+/// アプリと同じコーデックの組：固定の段（SVG の文字はシステムのフォント）→ macOS → ffmpeg。SVG は自分を働き手として起動した
+/// 別のプロセスで読む（決定 23。`svg_worker`）。`work_dir` は ffmpeg の一時ファイルの置き場。
+pub(crate) fn app_codecs(work_dir: &std::path::Path) -> CodecSet {
+    let mut set = kura_mac::full_codec_set(&kura_mac::pinned_options(), work_dir);
+    if let Some(cmd) = svg_worker_command()
+        && let Err(e) = svg_worker::install(&mut set, cmd)
+    {
+        tracing::error!("SVG の働き手を組めません: {e}");
+    }
+    set
+}
+
+/// SVG の働き手を起動するコマンド：自分の実行ファイル（`--kura-svg-worker` 付き）。
+#[cfg(not(test))]
+fn svg_worker_command() -> Option<Result<WorkerCommand, String>> {
+    Some(WorkerCommand::current_exe())
+}
+
+/// テストのハーネス（`target/<profile>/deps/kura_devtools-…`）は働き手になれないので、cargo が隣に作る実行ファイル
+/// （`target/<profile>/kura-devtools`。結合テスト `tests/svg_worker.rs` が使うので `cargo test -p kura-devtools` で作られる）を
+/// 働き手にする。なければ（単体テストだけを組んだとき）SVG はプロセスの中で読む。
+#[cfg(test)]
+fn svg_worker_command() -> Option<Result<WorkerCommand, String>> {
+    let exe = std::env::current_exe().ok()?;
+    let bin = exe.parent()?.parent()?.join("kura-devtools");
+    bin.is_file()
+        .then(|| Ok(WorkerCommand::new(bin, [svg_worker::WORKER_ARG])))
 }
 
 /// アプリと同じ渡しもの（メディアの実装・エンジンの部品・DB を新しい版にするときの空きの確かめ）。知らせはログに出す。
@@ -216,6 +264,17 @@ fn import(args: &[String]) -> Result<(), String> {
         tracing::info!(id, "取り込みを積みました");
     }
     session.wait_ready();
+    if let Some(after) = args.close_after {
+        // 動いているジョブ（サムネイル・解析が SVG の働き手を待っているところなど）の途中で閉じる
+        std::thread::sleep(after);
+        let started = std::time::Instant::now();
+        drop(session);
+        tracing::info!(
+            close_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "ライブラリを閉じました"
+        );
+        return Ok(());
+    }
     if !session.jobs().wait_idle(Duration::from_secs(3600)) {
         return Err("1 時間待っても終わりませんでした".into());
     }
