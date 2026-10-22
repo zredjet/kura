@@ -32,6 +32,22 @@ export function playFromOf(
   return itemId === null ? undefined : { itemId, entryId: entry.entryId };
 }
 
+/**
+ * ↩ で「ここから再生」する行：フォーカスのある行が選んだエントリの行なら、その行（ダブルクリック・右クリックの
+ * 「ここから再生」と同じく押した行から。M11 の 3 回目の確認 P1）。フォーカスが行の外（▸）や選択の外の行
+ * （⌘ で外した行）にあれば、選んだエントリの最初の行（エントリの行・見出し・先頭のメンバー）。どちらもなければ undefined。
+ */
+export function enterRow(
+  rows: readonly ListRow[],
+  focused: ListRow | undefined,
+  isSelected: (row: ListRow) => boolean,
+): ListRow | undefined {
+  if (focused && isSelected(focused)) {
+    return focused;
+  }
+  return rows.find(isSelected);
+}
+
 /** 行の高さ（design.md §3.1：ユニット行 60px、展開した中身 44px、見出し 28px、ファイルの行 52px）。 */
 export function rowHeight(row: ListRow | undefined, granularity: 'file' | 'unit'): number {
   if (!row) {
