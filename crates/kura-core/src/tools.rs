@@ -535,19 +535,55 @@ impl Clock {
 /// 子孫が残っている。
 type OpenCount = Arc<AtomicUsize>;
 
-/// パイプを持つスレッドの数を作るときに 1 つ増やし、`Drop` で 1 つ減らす（起動に失敗したスレッドの分も戻る）。
-struct OpenGuard(OpenCount);
+/// パイプを持つスレッドの数を作るときに 1 つ増やし、`Drop` で 1 つ減らして見張りを起こす（起動に失敗したスレッドの分も
+/// 戻る）。
+struct OpenGuard(OpenCount, Arc<Wake>);
 
 impl OpenGuard {
-    fn new(count: &OpenCount) -> Self {
+    fn new(count: &OpenCount, wake: &Arc<Wake>) -> Self {
         count.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(count))
+        Self(Arc::clone(count), Arc::clone(wake))
     }
 }
 
 impl Drop for OpenGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+        self.1.notify();
+    }
+}
+
+/// 見張りを起こす合図（子を待ち終えた・パイプを持つスレッドが抜けた・受け手が終わった）。見張りは刻み（[`WATCH_TICK`]）ごとに
+/// 中止・時間を確かめ、合図があれば刻みを待たずに終わりを確かめる（すぐ終わる子を刻みの分だけ待たせない）。世代の数で、
+/// 見張りが待つ前に来た合図も取りこぼさない。
+#[derive(Default)]
+struct Wake {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl Wake {
+    fn notify(&self) {
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        self.changed.notify_all();
+    }
+
+    /// 世代が `seen` から変わっていなければ、合図か `tick` まで待つ。今の世代を返す。
+    fn wait(&self, seen: u64, tick: Duration) -> u64 {
+        let g = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *g != seen {
+            return *g;
+        }
+        match self.changed.wait_timeout(g, tick) {
+            Ok((g, _)) => *g,
+            Err(e) => *e.into_inner().0,
+        }
     }
 }
 
@@ -764,12 +800,13 @@ impl Drop for Reaper<'_> {
     }
 }
 
-/// 抜けた（子を待ち終えた・受け手が終わった）ことを、`Drop` で見張りに知らせる。
-struct DoneGuard<'a>(&'a AtomicBool);
+/// 抜けた（子を待ち終えた・受け手が終わった）ことを、`Drop` で見張りに知らせる（印を立てて起こす）。
+struct DoneGuard<'a>(&'a AtomicBool, &'a Wake);
 
 impl Drop for DoneGuard<'_> {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
+        self.1.notify();
     }
 }
 
@@ -836,7 +873,9 @@ fn spawn_pipe_thread(
 ///   スレッドに渡し、受け手が `on_chunk` を呼ぶ。標準エラーは行の数と長さを抑えて残す（[`RunOutcome`]）。
 /// - 見張りのスレッドが 20 ms ごとに中止（`canceled`）・無出力（`stall`）・時間切れ（`deadline`）を見て（子が終わった
 ///   あとも見る）、理由を 1 回だけ記録してグループに SIGTERM、2 秒で SIGKILL。標準出力の上限・受け手のエラーでも同じく
-///   止める。グループへの SIGKILL は 1 回だけ送る（`kill` を起動できなかったときだけ、次の刻みで送り直す）。
+///   止める。グループへの SIGKILL は 1 回だけ送る（`kill` を起動できなかったときだけ、次の刻みで送り直す）。子を待ち
+///   終えた・パイプを持つスレッドが抜けた・受け手が終わったときは見張りを起こし、刻みを待たずに終わる（すぐ終わる子を
+///   20 ms 待たせない）。
 /// - 子を待ち終えたのにパイプが閉じない（パイプを持つ子孫が残っている）とき：止めたあとなら、すぐグループに SIGKILL
 ///   して、パイプを持つスレッドを見捨てて戻る（記録した理由のエラー）。止めていなければ、2 秒でグループに SIGKILL、
 ///   さらに 2 秒で見捨てて [`Stopped::Lingering`] で戻る。グループの外に出た子孫（`setsid` など）は SIGKILL が届かない
@@ -920,6 +959,7 @@ fn run_binary_with(
     let abandoned = AtomicBool::new(false);
     let group_killed = AtomicBool::new(false);
     let open: OpenCount = Arc::new(AtomicUsize::new(0));
+    let wake = Arc::new(Wake::default());
     let log = Arc::new(Mutex::new(StderrLog::default()));
     let queue = Arc::new(InQueue::default());
     let out_total = AtomicU64::new(0);
@@ -940,24 +980,32 @@ fn run_binary_with(
     match stdout {
         Some(pipe) => {
             let clock = Arc::clone(&clock);
-            spawn_pipe_thread("kura-tool-stdout", OpenGuard::new(&open), move |open| {
-                pump_stdout(pipe, &out_tx, &clock, open);
-            })
+            spawn_pipe_thread(
+                "kura-tool-stdout",
+                OpenGuard::new(&open, &wake),
+                move |open| {
+                    pump_stdout(pipe, &out_tx, &clock, open);
+                },
+            )
             .map_err(RunError::Spawn)?;
         }
         None => drop(out_tx),
     }
     if let Some(pipe) = stderr {
         let log = Arc::clone(&log);
-        spawn_pipe_thread("kura-tool-stderr", OpenGuard::new(&open), move |_| {
-            read_stderr(pipe, &log);
-        })
+        spawn_pipe_thread(
+            "kura-tool-stderr",
+            OpenGuard::new(&open, &wake),
+            move |_| {
+                read_stderr(pipe, &log);
+            },
+        )
         .map_err(RunError::Spawn)?;
     }
     let writer = match stdin {
         Some(pipe) => {
             let (queue, clock) = (Arc::clone(&queue), Arc::clone(&clock));
-            spawn_pipe_thread("kura-tool-stdin", OpenGuard::new(&open), move |_| {
+            spawn_pipe_thread("kura-tool-stdin", OpenGuard::new(&open, &wake), move |_| {
                 write_stdin(pipe, &queue, &clock);
             })
             .map_err(RunError::Spawn)?;
@@ -994,13 +1042,13 @@ fn run_binary_with(
 
     std::thread::scope(|s| {
         // 抜けるときに必ず「終わった」にする（`feed` が panic しても、見張りが子孫の片付けに移って終われるように）
-        let _done = DoneGuard(&done);
+        let _done = DoneGuard(&done, &wake);
         let consumer = {
             let (out_total, kill_for, abandoned) = (&out_total, &kill_for, &abandoned);
-            let consumer_done = &consumer_done;
+            let (consumer_done, wake) = (&consumer_done, &*wake);
             let on_chunk = &mut *on_chunk;
             move || {
-                let _done = DoneGuard(consumer_done);
+                let _done = DoneGuard(consumer_done, wake);
                 while !abandoned.load(Ordering::SeqCst) {
                     let chunk = match out_rx.recv_timeout(WATCH_TICK) {
                         Ok(c) => c,
@@ -1021,12 +1069,13 @@ fn run_binary_with(
         };
         let watcher = {
             let (stop, done, consumer_done, abandoned) = (&stop, &done, &consumer_done, &abandoned);
-            let (open, clock, queue) = (&*open, &*clock, &*queue);
+            let (open, clock, queue, wake) = (&*open, &*clock, &*queue, &*wake);
             let (kill_for, kill_group) = (&kill_for, &kill_group);
             move || {
                 let mut stop_seen: Option<Instant> = None;
                 let mut done_seen: Option<Instant> = None;
                 let mut killed_at: Option<Instant> = None;
+                let mut seen = 0;
                 loop {
                     let finished = done.load(Ordering::SeqCst)
                         && open.load(Ordering::SeqCst) == 0
@@ -1034,7 +1083,8 @@ fn run_binary_with(
                     if finished || abandoned.load(Ordering::SeqCst) {
                         break;
                     }
-                    std::thread::sleep(WATCH_TICK);
+                    // 刻みごとに中止・時間を確かめる。終わりの合図があれば刻みを待たずに確かめ直す
+                    seen = wake.wait(seen, WATCH_TICK);
                     if stop.load(Ordering::SeqCst) == 0 {
                         if canceled() {
                             kill_for(Stopped::Canceled);
@@ -1318,6 +1368,28 @@ mod tests {
             "{r:?}"
         );
         assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// すぐ終わる子は、見張りの刻み（20 ms）を待たずに戻る（子を待ち終えた・パイプが閉じた・受け手が終わったときに見張りを
+    /// 起こす。SVG の働き手は 1 件で子を 2〜3 回起動するので、刻みの待ちがそのまま 1 件の時間に乗っていた）。
+    #[test]
+    fn a_quick_child_returns_without_waiting_for_the_watch_tick() {
+        let d = tempfile::tempdir().unwrap();
+        let s = script(d.path(), "quick", "printf ok; echo note >&2");
+        let fastest = (0..5)
+            .map(|_| {
+                let t = Instant::now();
+                let r = run_simple(&s, &budget(1 << 20, 5_000), &|| false, &mut |_: &[u8]| {
+                    Ok(())
+                })
+                .unwrap();
+                assert!(r.status.success());
+                assert_eq!(r.stdout_bytes, 2);
+                t.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(fastest < WATCH_TICK, "{fastest:?}");
     }
 
     /// すぐ止める形（`run_binary_kill`。SVG の働き手）：SIGTERM を無視する子でも、時間切れ・中止で待たずにグループごと
