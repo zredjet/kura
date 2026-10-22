@@ -25,7 +25,7 @@ import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemC
 import { bumpRevision } from '../../stores/revisionStore';
 import { setPlaylistOrderSource, useDragStore, watchDrag } from '../library/dragState';
 import { playPlaylist, removeFromPlaylist, snapshotPlaylist } from './playlistActions';
-import { type ListRow, listRows, playFromOf, rowHeight } from './rows';
+import { enterRow, type ListRow, listRows, playFromOf, rowHeight } from './rows';
 import styles from './PlaylistView.module.css';
 
 const t = ja.playlist;
@@ -99,7 +99,7 @@ export function useListMargin(
 
 /**
  * 手動プレイリストの中身（design.md §3.1）。ファイル単位は平らな行と「〇〇から」の見出し、
- * ユニット単位はエントリの行（▸ で中身）。選んでドラッグで並べ替え、⌫ で外す、ダブルクリックでそこから再生。
+ * ユニット単位はエントリの行（▸ で中身）。選んでドラッグで並べ替え、⌫ で外す、↩・ダブルクリックでそこから再生。
  */
 export function EntryList({
   playlist,
@@ -221,8 +221,12 @@ export function EntryList({
     return out;
   };
 
-  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (selected.size === 0) {
+  /**
+   * ⌫・↩。行のボタンで押したら `focused` にその行が来る（行で受けて preventDefault したものは、一覧では受け直さない）。
+   * ↩ はダブルクリック・右クリックの「ここから再生」と同じく押した行から（M11 の 3 回目の確認 P1）。
+   */
+  const onKeyDown = (e: KeyboardEvent<HTMLElement>, focused?: ListRow) => {
+    if (e.defaultPrevented || selected.size === 0) {
       return;
     }
     if (e.key === 'Backspace' || e.key === 'Delete') {
@@ -231,9 +235,9 @@ export function EntryList({
       setSelected(new Set());
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      const first = rows.find((r) => selected.has(entryOf(r)?.entryId ?? -1));
-      if (first) {
-        playFrom(first);
+      const target = enterRow(rows, focused, (r) => selected.has(entryOf(r)?.entryId ?? -1));
+      if (target) {
+        playFrom(target);
       }
     }
   };
@@ -279,14 +283,14 @@ export function EntryList({
   }
 
   return (
-    // 行のキー操作（⌫・↩）をまとめて受ける。操作の対象は中の行のボタン
+    // 行の外（▸）で押したキー操作（⌫・↩）を受ける。行のボタンで押したものは行で受ける
     // eslint-disable-next-line jsx-a11y/no-static-element-interactions
     <div
       ref={listRef}
       className={styles.list}
       style={{ height: virtualizer.getTotalSize() }}
       aria-label={t.listLabel}
-      onKeyDown={onKeyDown}
+      onKeyDown={(e) => onKeyDown(e)}
     >
       {visible.map((v) => {
         const row = rows[v.index];
@@ -314,6 +318,7 @@ export function EntryList({
             select(entry.entryId, e);
           },
           onDoubleClick: () => playFrom(row),
+          onKeyDown: (e: KeyboardEvent<HTMLButtonElement>) => onKeyDown(e, row),
           onPointerDown: (e: PointerEvent<HTMLButtonElement>) => startDrag(e, entry.entryId),
           onContextMenu: (e: MouseEvent) => {
             e.preventDefault();

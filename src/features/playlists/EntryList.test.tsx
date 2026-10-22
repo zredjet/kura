@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { MenuAction, MenuEntry } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import type { PlaylistContentsDto, PlaylistDto } from '../../ipc/playlists';
 import { EntryList } from './EntryList';
@@ -43,6 +44,13 @@ vi.mock('../../stores/itemCache', () => ({
 }));
 vi.mock('../../components/MediaImage/MediaImage', () => ({
   MediaImage: () => null,
+}));
+// 右クリックで開いたメニューの項目
+const menus = vi.hoisted(() => [] as MenuEntry[][]);
+vi.mock('../../components/Menu/menuStore', () => ({
+  openMenuAt: (_x: number, _y: number, _label: string, entries: MenuEntry[]) => {
+    menus.push(entries);
+  },
 }));
 
 function playlist(granularity: 'file' | 'unit'): PlaylistDto {
@@ -121,12 +129,98 @@ describe('EntryList の「ここから再生」', () => {
     fireEvent.doubleClick(fonts[1]!);
     expect(playPlaylist).toHaveBeenLastCalledWith(7, 'P', false, { itemId: 3, entryId: 11 });
   });
+});
 
-  it('↩ は選んだエントリの最初の行（先頭のメンバー）とそのエントリを渡す', () => {
+/** `act` で 1 回だけ再生を頼み、そのとき渡した「ここから」（`fromItem`・`fromEntry`）を返す。 */
+function played(act: () => void) {
+  vi.mocked(playPlaylist).mockClear();
+  act();
+  expect(playPlaylist).toHaveBeenCalledTimes(1);
+  expect(playPlaylist).toHaveBeenLastCalledWith(7, 'P', false, expect.anything());
+  return vi.mocked(playPlaylist).mock.lastCall?.[3];
+}
+
+/** 同じ行を ダブルクリック・右クリックの「ここから再生」・選んで ↩ の 3 つの道で再生し、渡した値を返す。 */
+function playEachWay(row: HTMLElement) {
+  const doubleClick = played(() => fireEvent.doubleClick(row));
+  let shortcut: string | undefined;
+  const menu = played(() => {
+    fireEvent.contextMenu(row);
+    const first = menus.at(-1)?.[0] as MenuAction;
+    expect(first.label).toBe(ja.playlist.entryMenu.playFrom);
+    shortcut = first.shortcut;
+    first.onSelect();
+  });
+  // メニューの手がかりの ↩ が、同じ行で同じことをする
+  expect(shortcut).toBe('↩');
+  const enter = played(() => {
+    fireEvent.click(row);
+    expect(document.activeElement).toBe(row);
+    fireEvent.keyDown(row, { key: 'Enter' });
+  });
+  return { doubleClick, menu, enter };
+}
+
+describe('EntryList の ↩・ダブルクリック・右クリックの「ここから再生」（M11 の 3 回目の確認 P1）', () => {
+  beforeEach(() => {
+    menus.length = 0;
+  });
+
+  it('ユニット単位：エントリの行と、▸ で開いた中身のどの行も、3 つの道で押した行のアイテムとエントリを渡す', () => {
+    show('unit');
+    fireEvent.click(screen.getByRole('button', { name: ja.playlist.expand('Y') }));
+    const cases: Array<[HTMLElement, { itemId: number; entryId: number }]> = [
+      [screen.getByRole('button', { name: /^X/ }), { itemId: 3, entryId: 10 }],
+      [screen.getByRole('button', { name: /^Y/ }), { itemId: 2, entryId: 11 }],
+      [screen.getByRole('button', { name: /b-audio/ }), { itemId: 2, entryId: 11 }],
+      // 開いた中身のフォントの行：エントリの先頭のメンバー b でなく f（Rust が後ろの c から始める）
+      [screen.getByRole('button', { name: /f-font/ }), { itemId: 3, entryId: 11 }],
+      [screen.getByRole('button', { name: /c-video/ }), { itemId: 4, entryId: 11 }],
+    ];
+    for (const [row, want] of cases) {
+      expect(playEachWay(row)).toEqual({ doubleClick: want, menu: want, enter: want });
+    }
+  });
+
+  it('ファイル単位：メンバーのどの行も、3 つの道で押した行のアイテムとエントリを渡す', () => {
     show('file');
-    const fonts = screen.getAllByRole('button', { name: /f-font/ });
-    fireEvent.click(fonts[1]!);
-    fireEvent.keyDown(fonts[1]!, { key: 'Enter' });
-    expect(playPlaylist).toHaveBeenLastCalledWith(7, 'P', false, { itemId: 2, entryId: 11 });
+    const [xf, yf] = screen.getAllByRole('button', { name: /f-font/ });
+    const cases: Array<[HTMLElement, { itemId: number; entryId: number }]> = [
+      [xf!, { itemId: 3, entryId: 10 }],
+      [screen.getByRole('button', { name: /a-image/ }), { itemId: 1, entryId: 10 }],
+      [screen.getByRole('button', { name: /b-audio/ }), { itemId: 2, entryId: 11 }],
+      // 「Y から」の 2 つ目の行（フォント）：見出しの先頭のメンバー b でなく f
+      [yf!, { itemId: 3, entryId: 11 }],
+      [screen.getByRole('button', { name: /c-video/ }), { itemId: 4, entryId: 11 }],
+    ];
+    for (const [row, want] of cases) {
+      expect(playEachWay(row)).toEqual({ doubleClick: want, menu: want, enter: want });
+    }
+  });
+
+  it('複数を選んでいても、↩ はフォーカスのある（最後に押した）行から', () => {
+    show('file');
+    fireEvent.click(screen.getByRole('button', { name: /a-image/ }));
+    const c = screen.getByRole('button', { name: /c-video/ });
+    expect(
+      played(() => {
+        fireEvent.click(c, { shiftKey: true });
+        fireEvent.keyDown(c, { key: 'Enter' });
+      }),
+    ).toEqual({ itemId: 4, entryId: 11 });
+  });
+
+  it('フォーカスのある行が選択の外なら、↩ は選んだエントリの最初の行（先頭のメンバー）から', () => {
+    show('file');
+    fireEvent.click(screen.getByRole('button', { name: /c-video/ }));
+    const a = screen.getByRole('button', { name: /a-image/ });
+    // ⌘ で X を足してから外す：フォーカスは a に残り、選択は Y だけ
+    fireEvent.click(a, { metaKey: true });
+    fireEvent.click(a, { metaKey: true });
+    expect(document.activeElement).toBe(a);
+    expect(played(() => fireEvent.keyDown(a, { key: 'Enter' }))).toEqual({
+      itemId: 2,
+      entryId: 11,
+    });
   });
 });

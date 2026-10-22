@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { EntryRowDto } from '../../ipc/playlists';
-import { listRows, playFromOf } from './rows';
+import { enterRow, type ListRow, listRows, playFromOf } from './rows';
 
 function row(entryId: number, target: EntryRowDto['target'], itemCount: number): EntryRowDto {
   return {
@@ -74,5 +74,28 @@ describe('playFromOf', () => {
   it('メンバーのないエントリ・知らない行は渡さない（先頭から）', () => {
     expect(playFromOf({ kind: 'entry', entry: 2 }, withCover)).toBeUndefined();
     expect(playFromOf({ kind: 'entry', entry: 9 }, withCover)).toBeUndefined();
+  });
+});
+
+describe('enterRow', () => {
+  // エントリ 0（単体）・エントリ 1（開いた中身 2 行）・エントリ 2
+  const rows: ListRow[] = [
+    { kind: 'entry', entry: 0 },
+    { kind: 'entry', entry: 1 },
+    { kind: 'item', entry: 1, itemId: 11, indent: true },
+    { kind: 'item', entry: 1, itemId: 12, indent: true },
+    { kind: 'entry', entry: 2 },
+  ];
+  const selectedEntries = (entries: number[]) => (row: ListRow) => entries.includes(row.entry);
+
+  it('フォーカスのある行が選んだエントリの行なら、その行（先頭のメンバーでない行も。M11 の 3 回目の確認 P1）', () => {
+    expect(enterRow(rows, rows[3], selectedEntries([1]))).toBe(rows[3]);
+    expect(enterRow(rows, rows[4], selectedEntries([1, 2]))).toBe(rows[4]);
+  });
+
+  it('フォーカスが行の外・選択の外なら、選んだエントリの最初の行。選んでいなければ undefined', () => {
+    expect(enterRow(rows, undefined, selectedEntries([1]))).toBe(rows[1]);
+    expect(enterRow(rows, rows[0], selectedEntries([1, 2]))).toBe(rows[1]);
+    expect(enterRow(rows, rows[2], selectedEntries([]))).toBeUndefined();
   });
 });
