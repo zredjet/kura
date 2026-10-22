@@ -35,6 +35,12 @@ fn set_with(cmd: WorkerCommand, deadlines: Deadlines) -> CodecSet {
     set
 }
 
+/// 値の一致を確かめるときの時間の上限（ビルドしたばかりの実行ファイルの最初の起動は、重い環境で 1 秒を超えることがあるので、
+/// 時間で止まらないように長くする。時間の上限は `slow_svgs_are_stopped_at_the_deadline` が確かめる）。
+fn generous() -> Deadlines {
+    short(120_000, 120_000)
+}
+
 fn short(shape_ms: u64, decode_ms: u64) -> Deadlines {
     Deadlines {
         shape: Duration::from_millis(shape_ms),
@@ -122,7 +128,7 @@ fn same_error(a: &EngineError, b: &EngineError, what: &str) {
 fn values_stamps_and_errors_match_the_in_process_decoder() {
     let dir = tempfile::tempdir().unwrap();
     let local = CodecSet::pinned();
-    let remote = set_with(worker(), Deadlines::default());
+    let remote = set_with(worker(), generous());
     let (opts, limits) = (DecodeOptions::default(), Limits::default());
     let mut ok = 0;
     for (name, body) in CASES {
@@ -190,6 +196,12 @@ fn slow_svgs_are_stopped_at_the_deadline() {
     let (opts, limits) = (DecodeOptions::default(), Limits::default());
     let slow_shape = write(dir.path(), "s1.svg", SLOW_SHAPE.as_bytes());
     let slow_decode = write(dir.path(), "s4.svg", SLOW_DECODE.as_bytes());
+    // ビルドしたばかりの実行ファイルの最初の起動（重い環境で 1 秒を超えることがある）を、時間を測る前に済ませる
+    let warm = set_with(worker(), generous());
+    assert!(
+        warm.shape(&mut Cursor::new(CASES[0].1.to_vec()), "svg", &opts, &limits)
+            .is_ok()
+    );
     let set = set_with(worker(), short(300, 600));
     let timed = |r: Result<(), EngineError>, what: &str, started: Instant| {
         match r {
@@ -215,8 +227,8 @@ fn slow_svgs_are_stopped_at_the_deadline() {
         "S4 の値",
         t,
     );
-    // 形は上限の中で答える（描く段だけが遅い）
-    assert!(set.shape_path(&slow_decode, "svg", &opts, &limits).is_ok());
+    // 形は答える（描く段だけが遅い）
+    assert!(warm.shape_path(&slow_decode, "svg", &opts, &limits).is_ok());
     let silent = set_with(sh("sleep 36.4159"), short(300, 300));
     let t = Instant::now();
     timed(
@@ -364,7 +376,7 @@ fn concurrent_calls_each_use_their_own_child() {
     let dir = tempfile::tempdir().unwrap();
     let (opts, limits) = (DecodeOptions::default(), Limits::default());
     let path = write(dir.path(), "r.svg", CASES[4].1);
-    let set = set_with(worker(), Deadlines::default());
+    let set = set_with(worker(), generous());
     let want = CodecSet::pinned()
         .decode_path(&path, "svg", &opts, &limits, &NoMonitor)
         .unwrap();

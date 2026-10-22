@@ -6,8 +6,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::Cursor;
+use std::time::Duration;
 
-use kura_core::codec_ext::svg_worker::{self, WorkerCommand};
+use kura_core::codec_ext::svg_worker::{self, Deadlines, WorkerCommand};
 use kura_engine::codec::CodecSet;
 use kura_engine::doc::DecodeOptions;
 use kura_engine::{Limits, NoMonitor};
@@ -24,12 +25,19 @@ fn the_devtools_binary_reads_svg_like_the_in_process_decoder() {
     let opts = kura_mac::pinned_options();
     let local = CodecSet::pinned_with(&opts);
     let mut remote = CodecSet::pinned_with(&opts);
-    svg_worker::install(
+    // ビルドしたばかりの実行ファイルの最初の起動は、重い環境で 1 秒を超えることがある。値の一致を確かめるので、時間で
+    // 止まらないように上限を長くする（時間の上限は kura-core の tests/svg_worker.rs が確かめる）
+    let long = Duration::from_secs(120);
+    svg_worker::install_with(
         &mut remote,
         Ok(WorkerCommand::new(
             env!("CARGO_BIN_EXE_kura-devtools"),
             [svg_worker::WORKER_ARG],
         )),
+        Deadlines {
+            shape: long,
+            decode: long,
+        },
     )
     .unwrap();
     for (i, svg) in CASES.iter().enumerate() {
