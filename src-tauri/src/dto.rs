@@ -2343,6 +2343,8 @@ pub struct PlayRequestDto {
     pub start_item: Option<i64>,
     /// 並びはそのままで、このアイテムから始める（一覧の「ここから再生」）。
     pub from_item: Option<i64>,
+    /// `from_item` を押した一覧の行のエントリ（同じアイテムが複数のエントリにあっても、その行から始める）。
+    pub from_entry: Option<i64>,
     /// その場のキューを同じシードで作り直すとき（16 進）。
     pub seed: Option<String>,
 }
@@ -2355,6 +2357,7 @@ impl From<&PlayRequestDto> for PlayRequest {
             reseed: r.reseed,
             start_item: r.start_item,
             from_item: r.from_item,
+            from_entry: r.from_entry,
         }
     }
 }

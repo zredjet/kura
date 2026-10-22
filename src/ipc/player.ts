@@ -41,6 +41,7 @@ export function playQueue(
         reseed: request.reseed ?? false,
         startItem: request.startItem ?? null,
         fromItem: request.fromItem ?? null,
+        fromEntry: request.fromEntry ?? null,
         seed: request.seed ?? null,
       },
       utcOffsetMinutes(),

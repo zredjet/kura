@@ -2378,6 +2378,16 @@ mod tests {
                 ),
                 &format!(r#"<g transform="scale(1e3)">{tp}</g>"#),
             ),
+            // 2 回目の確認 S6 の続き：参照先の path の拡大がほぼ 0 の transform は、usvg が無効として変形なしに置き換える
+            // （直す前は 10⁻⁸ 倍と見積もって通し、kurbo の弧長の逆引きで止まった。debug では `1 << n` のあふれで panic）
+            doc(
+                r#"<path id="p" transform="scale(1e-8)" d="M0 0 C1e9 2e8 3e8 4e8 5e8 6e8"/>"#,
+                &format!(r#"<g transform="scale(1e6) scale(1e5)">{tp}</g>"#),
+            ),
+            doc(
+                r#"<path id="p" transform="scale(1e-4) scale(1e-4)" d="M0 0 C1e9 2e8 3e8 4e8 5e8 6e8"/>"#,
+                &format!(r#"<g transform="scale(1e6) scale(1e5)">{tp}</g>"#),
+            ),
         ];
         for svg in &refused {
             assert!(
@@ -2404,6 +2414,35 @@ mod tests {
         ];
         for svg in &fine {
             assert!(decode_with(&c, svg).is_ok(), "{svg}");
+        }
+        // 2 回目の確認 S6：空白を省いた transform（svgo などが出す。数を符号・2 つ目の小数点で区切る）を参照先の path・
+        // 祖先・text に書いた形も読み、空白で区切った形と同じ絵になる（直す前は、参照先の path の形を「弧長の精度が足りない」、
+        // 祖先・text の形を「textPath を大きく拡大する」で断った）
+        let curve_doc = |path_tf: &str, g_tf: &str, text_tf: &str| {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100" font-family="KuraTest" font-size="12"><path id="a" fill="none" transform="{path_tf}" d="M10 80c40-50 140-50 180 0"/><g transform="{g_tf}"><text transform="{text_tf}"><textPath href="#a">ABBA BAAB</textPath></text></g></svg>"##
+            )
+        };
+        let same = [
+            (("translate(10-5)", "", ""), ("translate(10 -5)", "", "")),
+            (
+                ("matrix(.5 0 0 .5-10-20)", "", ""),
+                ("matrix(0.5 0 0 0.5 -10 -20)", "", ""),
+            ),
+            (("translate(.5.5)", "", ""), ("translate(0.5 0.5)", "", "")),
+            (("", "translate(10-5)", ""), ("", "translate(10 -5)", "")),
+            (
+                ("", "", "matrix(1 0 0 1-5.5-3)"),
+                ("", "", "matrix(1 0 0 1 -5.5 -3)"),
+            ),
+        ];
+        for ((p1, g1, t1), (p2, g2, t2)) in same {
+            let packed = curve_doc(p1, g1, t1);
+            let spaced = curve_doc(p2, g2, t2);
+            let a = decode_with(&c, &packed);
+            let b = decode_with(&c, &spaced);
+            assert!(a.is_ok(), "{packed}: {a:?}");
+            assert_eq!(a.ok(), b.ok(), "{packed}");
         }
     }
 

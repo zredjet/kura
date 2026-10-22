@@ -25,7 +25,7 @@ import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemC
 import { bumpRevision } from '../../stores/revisionStore';
 import { setPlaylistOrderSource, useDragStore, watchDrag } from '../library/dragState';
 import { playPlaylist, removeFromPlaylist, snapshotPlaylist } from './playlistActions';
-import { type ListRow, listRows, rowHeight } from './rows';
+import { type ListRow, listRows, playFromOf, rowHeight } from './rows';
 import styles from './PlaylistView.module.css';
 
 const t = ja.playlist;
@@ -192,9 +192,7 @@ export function EntryList({
   };
 
   const playFrom = (row: ListRow) => {
-    const entry = entryOf(row);
-    const itemId = row.kind === 'item' ? row.itemId : (entry?.coverItemId ?? undefined);
-    void playPlaylist(playlist.id, playlist.name, false, itemId);
+    void playPlaylist(playlist.id, playlist.name, false, playFromOf(row, contents));
   };
 
   const menuFor = (row: ListRow): MenuEntry[] => {

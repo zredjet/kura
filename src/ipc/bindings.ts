@@ -1166,6 +1166,8 @@ export type PlayRequestDto = {
 	startItem?: number | null,
 	/**  並びはそのままで、このアイテムから始める（一覧の「ここから再生」）。 */
 	fromItem?: number | null,
+	/**  `from_item` を押した一覧の行のエントリ（同じアイテムが複数のエントリにあっても、その行から始める）。 */
+	fromEntry?: number | null,
 	/**  その場のキューを同じシードで作り直すとき（16 進）。 */
 	seed?: string | null,
 };

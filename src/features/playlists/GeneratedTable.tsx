@@ -110,7 +110,9 @@ export function GeneratedTable({
                       playlist.id,
                       playlist.name,
                       false,
-                      row.coverItemId ?? undefined,
+                      row.coverItemId !== null
+                        ? { itemId: row.coverItemId, entryId: row.entryId }
+                        : undefined,
                     )
                   }
                 >

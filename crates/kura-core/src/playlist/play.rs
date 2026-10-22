@@ -29,11 +29,14 @@ pub struct PlayRequest {
     pub reseed: bool,
     /// このアイテム（のユニット）を先頭にして、そこから始める。
     pub start_item: Option<i64>,
-    /// 並びはそのままで、このアイテムのスロットから始める（一覧の「ここから再生」）。
-    /// スマートは表示している並びを使い、作り直さない。キューにない種類（フォント・3D）のアイテムなら、ユニット単位はそれを
-    /// 含むエントリの最初のスロットから（エントリが丸ごとキューになければ、その後ろで最初にキューにあるエントリから）、
-    /// ファイル単位は一覧でその行より後ろの、最初にキューにあるメンバーから（docs/playlists.md §1.1）。
+    /// 並びはそのままで、このアイテムのスロットから始める（一覧の「ここから再生」。行のエントリは `from_entry`）。
+    /// スマートは表示している並びを使い、作り直さない。キューにない種類（フォント・3D）のアイテムなら、一覧でその行より
+    /// 後ろの、最初にキューにあるものから（エントリの行と、その先頭のメンバーの行は、ユニット単位ならエントリの最初のスロット
+    /// から。[`entry_start`]。docs/playlists.md §1.1）。
     pub from_item: Option<i64>,
+    /// `from_item` を押した一覧の行のエントリ（同じアイテムが複数のエントリにあっても、その行から始める）。None なら
+    /// `from_item` を含む最初のエントリの行とみなす。
+    pub from_entry: Option<i64>,
 }
 
 /// 再生するキュー。
@@ -172,7 +175,8 @@ pub fn selection_entries(item_or_units: &[(bool, i64)]) -> (Vec<Entry>, Granular
 
 /// 始める位置を決める：再開ならそのスロット（アイテムが違えば同じアイテムの最初、なければ先頭）、
 /// `start_item` ならそのアイテム（ユニット単位ならそのユニット）を先頭に移してそこから、
-/// `from_item` なら並びはそのままでそのアイテムのスロットから（キューにない種類なら [`entry_start`]）。
+/// `from_item` なら並びはそのままで、行のエントリ（`from_entry`）のそのアイテムのスロットから（エントリにスロットがなければ
+/// そのアイテムの最初のスロット、キューにない種類なら [`entry_start`]）。
 fn finish(
     mut slots: Vec<Slot>,
     seed: u64,
@@ -197,10 +201,15 @@ fn finish(
     } else if let Some(item) = request.start_item {
         start_index = put_first(&mut slots, item, granularity);
     } else if let Some(item) = request.from_item {
-        start_index = slots
-            .iter()
-            .position(|s| s.item_id == item)
-            .or_else(|| entry_start(&slots, snap, item, granularity))
+        // 押した行のエントリのスロット → そのアイテムの最初のスロット（`dedup_items` で後ろの重複を除いたときなど）
+        let in_entry = request.from_entry.and_then(|entry| {
+            slots
+                .iter()
+                .position(|s| s.item_id == item && s.entry_id == Some(entry))
+        });
+        start_index = in_entry
+            .or_else(|| slots.iter().position(|s| s.item_id == item))
+            .or_else(|| entry_start(&slots, snap, item, request.from_entry, granularity))
             .unwrap_or(0);
     }
     PlayQueue {
@@ -213,10 +222,13 @@ fn finish(
 }
 
 /// キューにない種類（フォント・3D）の `item` から「ここから再生」するときに始めるスロット（docs/playlists.md §1.1）。
-/// `item` を含む最初のエントリ（`pos` の順）から探す。
+/// 行のエントリは `entry`（`item` を含まないか None なら、`item` を含む最初のエントリ（`pos` の順）。M11 の 2 回目の確認 P2：
+/// 同じアイテムが 2 つのエントリにあると、後ろのエントリの行でも前のエントリで探していた）。
 ///
-/// - ユニット単位（一覧の行はエントリ。行が先頭のメンバーを渡す）：そのエントリの最初のスロット。そのエントリが丸ごとキューに
-///   ない（フォント・3D だけ）なら、その後ろのエントリで最初にキューにあるものの最初のスロット。
+/// - ユニット単位：エントリの行（先頭のメンバーを渡す）と、▸ で開いた中身の先頭のメンバーの行は、そのエントリの最初の
+///   スロット。そのエントリが丸ごとキューにない（フォント・3D だけ）なら、その後ろのエントリで最初にキューにあるものの最初の
+///   スロット。開いた中身の先頭でないメンバーの行は、そのエントリのメンバーの並び（[`expand`] の順）で `item` より後ろにある、
+///   最初にキューにあるメンバーのスロット（なければ後ろのエントリの最初のスロット。2 回目の確認 P1）。
 /// - ファイル単位（一覧の行はメンバー 1 件ずつ）：一覧の行の順（エントリの順に、メンバーを [`expand`] の順）で `item` より
 ///   後ろにある、最初にキューにあるメンバーのスロット（そのエントリの中になければ後ろのエントリへ。M11 の確かめ R4）。
 ///
@@ -225,47 +237,60 @@ fn entry_start(
     slots: &[Slot],
     snap: &Snapshot,
     item: i64,
+    entry: Option<i64>,
     granularity: Granularity,
 ) -> Option<usize> {
     let mut entries: Vec<_> = snap.entries.iter().collect();
     entries.sort_by(|a, b| a.pos.total_cmp(&b.pos).then_with(|| a.id.cmp(&b.id)));
-    let (at, after, members) = entries.iter().enumerate().find_map(|(i, e)| {
-        let members = expand(snap, e.target).1;
+    let row_of = |i: usize| {
+        let members = expand(snap, entries.get(i)?.target).1;
         let k = members.iter().position(|m| *m == item)?;
-        Some((i, k + 1, members))
-    })?;
-    match granularity {
-        Granularity::Unit => entries[at..]
+        Some((i, k, members))
+    };
+    let (at, k, members) = entry
+        .and_then(|id| entries.iter().position(|e| e.id == id))
+        .and_then(row_of)
+        .or_else(|| (0..entries.len()).find_map(row_of))?;
+    let here = entries.get(at)?.id;
+    // 後ろのエントリで最初にキューにあるものの最初のスロット
+    let first_of_later = |from: usize| {
+        entries
+            .get(from..)
+            .unwrap_or_default()
             .iter()
-            .find_map(|e| slots.iter().position(|s| s.entry_id == Some(e.id))),
-        Granularity::File => {
-            // (エントリ, アイテム) → 最初のスロット（シャッフルしていても、一覧の行のアイテムのスロットから始める）
-            let mut first: BTreeMap<(i64, i64), usize> = BTreeMap::new();
-            for (i, s) in slots.iter().enumerate() {
-                if let Some(entry) = s.entry_id {
-                    first.entry((entry, s.item_id)).or_insert(i);
-                }
-            }
-            let slot_of = |entry: i64, member: i64| first.get(&(entry, member)).copied();
-            let here = entries[at].id;
-            members
-                .get(after..)
+            .find_map(|e| slots.iter().position(|s| s.entry_id == Some(e.id)))
+    };
+    if granularity == Granularity::Unit && k == 0 {
+        return first_of_later(at);
+    }
+    // (エントリ, アイテム) → 最初のスロット（シャッフルしていても、一覧の行のアイテムのスロットから始める）
+    let mut first: BTreeMap<(i64, i64), usize> = BTreeMap::new();
+    for (i, s) in slots.iter().enumerate() {
+        if let Some(entry) = s.entry_id {
+            first.entry((entry, s.item_id)).or_insert(i);
+        }
+    }
+    let slot_of = |entry: i64, member: i64| first.get(&(entry, member)).copied();
+    let in_entry = members
+        .get(k + 1..)
+        .unwrap_or_default()
+        .iter()
+        .find_map(|m| slot_of(here, *m));
+    match granularity {
+        // ユニットごとに流すので、後ろのエントリはその最初から
+        Granularity::Unit => in_entry.or_else(|| first_of_later(at + 1)),
+        Granularity::File => in_entry.or_else(|| {
+            entries
+                .get(at + 1..)
                 .unwrap_or_default()
                 .iter()
-                .find_map(|m| slot_of(here, *m))
-                .or_else(|| {
-                    entries
-                        .get(at + 1..)
-                        .unwrap_or_default()
-                        .iter()
-                        .find_map(|e| {
-                            expand(snap, e.target)
-                                .1
-                                .into_iter()
-                                .find_map(|m| slot_of(e.id, m))
-                        })
+                .find_map(|e| {
+                    expand(snap, e.target)
+                        .1
+                        .into_iter()
+                        .find_map(|m| slot_of(e.id, m))
                 })
-        }
+        }),
     }
 }
 
