@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { EntryRowDto } from '../../ipc/playlists';
-import { listRows } from './rows';
+import { listRows, playFromOf } from './rows';
 
 function row(entryId: number, target: EntryRowDto['target'], itemCount: number): EntryRowDto {
   return {
@@ -46,5 +46,33 @@ describe('listRows', () => {
       { kind: 'entry', entry: 2 },
       { kind: 'entry', entry: 3 },
     ]);
+  });
+});
+
+describe('playFromOf', () => {
+  const withCover = {
+    rows: [
+      { ...row(1, { kind: 'item', id: 10 }, 1), coverItemId: 10 },
+      { ...row(2, { kind: 'unit', id: 5 }, 2), coverItemId: 11 },
+      row(3, { kind: 'folder', id: 7, recursive: true }, 0),
+    ],
+  };
+
+  it('アイテムの行はそのアイテム、エントリの行・見出しは先頭のメンバーを、どれも行のエントリと渡す', () => {
+    expect(playFromOf({ kind: 'item', entry: 1, itemId: 12, indent: true }, withCover)).toEqual({
+      itemId: 12,
+      entryId: 2,
+    });
+    expect(playFromOf({ kind: 'entry', entry: 1 }, withCover)).toEqual({ itemId: 11, entryId: 2 });
+    expect(playFromOf({ kind: 'header', entry: 1 }, withCover)).toEqual({ itemId: 11, entryId: 2 });
+    expect(playFromOf({ kind: 'item', entry: 0, itemId: 10, indent: false }, withCover)).toEqual({
+      itemId: 10,
+      entryId: 1,
+    });
+  });
+
+  it('メンバーのないエントリ・知らない行は渡さない（先頭から）', () => {
+    expect(playFromOf({ kind: 'entry', entry: 2 }, withCover)).toBeUndefined();
+    expect(playFromOf({ kind: 'entry', entry: 9 }, withCover)).toBeUndefined();
   });
 });

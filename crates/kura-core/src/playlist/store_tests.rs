@@ -784,7 +784,8 @@ fn playing_from_a_row_whose_item_never_reaches_the_queue_starts_at_its_entry() {
 
 /// M11 の確かめ R4（決定 19）：ファイル単位の一覧ではユニットのメンバーが 1 行ずつ並ぶので、途中のフォント・3D の行から
 /// 「ここから再生」すると、押した行より後ろで最初に再生できるメンバーから始める（ユニットの中になければ後ろのエントリへ）。
-/// ユニット単位はユニットごとに流すので、今までどおりそのエントリの最初のスロットから。
+/// ユニット単位の一覧にも ▸ で開いた中身のメンバーが 1 行ずつ並ぶので、先頭でないメンバーの行は同じく後ろから（2 回目の
+/// 確認 P1）。行のエントリを渡さない依頼（`from_entry` なし）は、アイテムを含む最初のエントリの行とみなす。
 #[test]
 fn playing_from_a_font_row_in_the_middle_of_a_unit_starts_after_it_by_file() {
     let conn = test_conn();
@@ -852,15 +853,153 @@ fn playing_from_a_font_row_in_the_middle_of_a_unit_starts_after_it_by_file() {
         );
         assert_eq!(from(file, c), c, "再生できる行はその行から");
         let unit = make(Granularity::Unit, shuffle);
+        // ユニット単位でも、先頭でないメンバーは ▸ で開いた中身の行なので、押した行より後ろから（2 回目の確認 P1。
+        // R4 の直しはユニット単位を「そのエントリの最初から」のまま残していた）
         assert_eq!(
             from(unit, f),
-            b,
-            "ユニット単位（シャッフル {shuffle}）：ユニット Y の最初から"
+            c,
+            "ユニット単位（シャッフル {shuffle}）：開いた Y の f の行の次の c から"
         );
         assert_eq!(
             from(unit, g),
-            d,
-            "ユニット単位（シャッフル {shuffle}）：ユニット Z の最初から"
+            e,
+            "ユニット単位（シャッフル {shuffle}）：開いた Z の最後の 3D の行は後ろのエントリ W の最初から"
         );
+        assert_eq!(
+            from(unit, b),
+            b,
+            "ユニット単位：Y の行（先頭のメンバー）は Y の最初から"
+        );
+    }
+}
+
+/// M11 の 2 回目の確認 P1・P2（決定 19「後ろで最初に再生できる行から」）：一覧の「ここから再生」は押した行のエントリも渡す
+/// （`from_entry`）。ユニット単位で ▸ で開いた中身の途中のフォント・3D の行は、ファイル単位と同じく、そのエントリの中で
+/// 押した行より後ろで最初に再生できるメンバーから（なければ後ろのエントリの最初から。ユニットの先頭に戻らない。P1）。
+/// エントリの行と、開いた中身の先頭のメンバーの行は、今までどおりそのエントリの最初から。同じアイテムが 2 つのエントリに
+/// あっても、押した行のエントリで探す（前のエントリの行として扱わない。再生できるアイテムも、そのエントリのスロットから。P2）。
+#[test]
+fn playing_from_a_row_starts_within_its_entry() {
+    let conn = test_conn();
+    let a = item(&conn, "a", "image", 0);
+    let b = item(&conn, "b", "audio", 0);
+    let f = item(&conn, "f", "font", 0);
+    let c = item(&conn, "c", "video", 0);
+    let d = item(&conn, "d", "audio", 0);
+    let g = item(&conn, "g", "model", 0);
+    let e = item(&conn, "e", "image", 0);
+    let h = item(&conn, "h", "font", 0);
+    // 始めるスロットの（アイテム, エントリ）
+    let from = |pl: i64, entry: i64, item: i64| {
+        let q = playlist_queue(
+            &conn,
+            pl,
+            &PlayRequest {
+                from_item: Some(item),
+                from_entry: Some(entry),
+                ..PlayRequest::default()
+            },
+            &ctx(),
+        )
+        .unwrap();
+        let s = &q.slots[q.start_index];
+        (s.item_id, s.entry_id.unwrap_or(0))
+    };
+    let make = |granularity: Granularity, shuffle: bool, units: &[i64]| {
+        let pl = playlist(&conn, PlaylistKind::Manual, granularity);
+        let entries: Vec<NewEntry> = units
+            .iter()
+            .map(|u| NewEntry::from(EntryTarget::Unit(*u)))
+            .collect();
+        store::add_entries(&conn, pl, &entries, None, 1).unwrap();
+        store::update(
+            &conn,
+            pl,
+            &PlaylistPatch {
+                shuffle: Some(shuffle),
+                ..PlaylistPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        let ids: Vec<i64> = store::contents(&conn, pl)
+            .unwrap()
+            .iter()
+            .map(|r| r.entry.id)
+            .collect();
+        (pl, ids)
+    };
+
+    // P1：ユニット単位で開いた中身の行。X(a)・Y(b, f, c)・Z(d, g)・V(h, e)
+    let ux = set_unit(&conn, "X", &[a]);
+    let uy = set_unit(&conn, "Y", &[b, f, c]);
+    let uz = set_unit(&conn, "Z", &[d, g]);
+    let uv = set_unit(&conn, "V", &[h, e]);
+    for shuffle in [false, true] {
+        let (pl, ids) = make(Granularity::Unit, shuffle, &[ux, uy, uz, uv]);
+        let (y, z, v) = (ids[1], ids[2], ids[3]);
+        assert_eq!(
+            from(pl, y, f),
+            (c, y),
+            "シャッフル {shuffle}：Y の中の f の行は、1 行上の b でなく後ろの c から"
+        );
+        assert_eq!(
+            from(pl, z, g),
+            (e, v),
+            "シャッフル {shuffle}：Z の最後の 3D の行は、後ろのエントリ V の最初から"
+        );
+        assert_eq!(from(pl, y, c), (c, y), "再生できる行はその行から");
+        assert_eq!(
+            from(pl, y, b),
+            (b, y),
+            "Y の行（先頭のメンバー）は Y の最初から"
+        );
+        assert_eq!(
+            from(pl, v, h),
+            (e, v),
+            "先頭のメンバーがフォントの V の行は V の最初から"
+        );
+    }
+
+    // P2：同じフォントが 2 つのエントリにある。X2(f, a)・Y2(b, f, c)。ファイル単位の一覧の行は
+    // 「X2 から・f・a・Y2 から・b・f・c」、ユニット単位で両方を開くと「X2・f・a・Y2・b・f・c」
+    let ux2 = set_unit(&conn, "X2", &[f, a]);
+    let uy2 = set_unit(&conn, "Y2", &[b, f, c]);
+    for granularity in [Granularity::File, Granularity::Unit] {
+        for shuffle in [false, true] {
+            let (pl, ids) = make(granularity, shuffle, &[ux2, uy2]);
+            let (x2, y2) = (ids[0], ids[1]);
+            assert_eq!(
+                from(pl, y2, f),
+                (c, y2),
+                "{granularity:?}・シャッフル {shuffle}：Y2 の f の行は、前の X2 の a でなく c から"
+            );
+            assert_eq!(
+                from(pl, x2, f),
+                (a, x2),
+                "{granularity:?}・シャッフル {shuffle}：X2 の f の行は a から"
+            );
+        }
+    }
+
+    // P2 の続き：再生できるアイテムが 2 つのエントリにあっても、押した行のエントリのスロットから。X3(b, a)・Y3(c, b)
+    let ux3 = set_unit(&conn, "X3", &[b, a]);
+    let uy3 = set_unit(&conn, "Y3", &[c, b]);
+    for shuffle in [false, true] {
+        let (pl, ids) = make(Granularity::File, shuffle, &[ux3, uy3]);
+        // 既定の「重複を除く」では、後ろの Y3 の b はキューにない（b は X3 の位置で 1 度だけ流れる）ので、b のスロットから
+        assert_eq!(from(pl, ids[1], b), (b, ids[0]), "シャッフル {shuffle}");
+        store::update(
+            &conn,
+            pl,
+            &PlaylistPatch {
+                dedup_items: Some(false),
+                ..PlaylistPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(from(pl, ids[1], b), (b, ids[1]), "シャッフル {shuffle}");
+        assert_eq!(from(pl, ids[0], b), (b, ids[0]), "シャッフル {shuffle}");
     }
 }
