@@ -90,7 +90,12 @@ pub enum UpgradeError {
 /// 当てる途中で失敗したときの、ライブラリの今の版の説明。前の版から 1 つでも当てていれば、前の版の Kura ではもう開けない
 /// （新しい版のスキーマとして断る）ので、そう言い、当てる前のバックアップの場所を添える。
 fn where_it_stands(from: usize, reached: usize, migration: &str, detail: &str) -> String {
-    if from > 0 && reached > from {
+    if from == 0 {
+        // 新しいライブラリを作っている途中（前の版も当てる前のバックアップもない）
+        format!(
+            "新しいライブラリを作る途中で止まりました。開き直すと続きを当てます。{migration}：{detail}"
+        )
+    } else if reached > from {
         format!(
             "途中の版（スキーマ {reached}）まで当てたので、前の版の Kura ではもう開けません。原因を取り除いて開き直すと続きを当てます。当てる前のバックアップがライブラリの backups にあります。{migration}：{detail}"
         )
@@ -275,15 +280,15 @@ mod tests {
             partial_full.to_string().contains("前の版の Kura"),
             "{partial_full}"
         );
-        // 新しいライブラリ（版 0）は「前の版の Kura」・バックアップと言わず、途中の版まで当てても「前の版のまま」と言う
-        // （docs/data-model.md §5 の 5・ADR-156 (4)。M11 の確かめ C3：作るときの言葉を分けるかは未決）
+        // 新しいライブラリ（版 0）は「前の版」・バックアップと言わず、作る途中で止まったと言う（docs/data-model.md §5 の 5・
+        // ADR-156 (4)。M11 の確かめ C3）
         let fresh = UpgradeError::apply("0009_analysis", &other, 0, 8);
-        assert!(!fresh.to_string().contains("前の版の Kura"), "{fresh}");
+        assert!(!fresh.to_string().contains("前の版"), "{fresh}");
         assert!(!fresh.to_string().contains("backups"), "{fresh}");
         assert!(
             fresh
                 .to_string()
-                .contains("ライブラリは前の版のまま残っています。0009_analysis："),
+                .contains("新しいライブラリを作る途中で止まりました。開き直すと続きを当てます。0009_analysis："),
             "{fresh}"
         );
         let short = UpgradeError::NoSpace {
