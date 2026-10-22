@@ -275,24 +275,81 @@ pub(crate) fn path_segments(n: &SvgNode<'_, '_>) -> u64 {
     }
 }
 
-/// 変形のリストの関数ごとの（行列のノルムの上限, 平行移動の大きさの上限）。読めなければ None。
-fn transform_parts(v: &str) -> Option<Vec<(f64, f64)>> {
+/// 変形のリストの関数 1 つ（名前と数）。
+type TransformFn<'a> = (&'a str, Vec<f64>);
+
+/// 変形のリストを usvg（svgtypes 0.16 の `TransformListParser`）と同じ文法で読む：空白・名前（英数字と `-`・`_`）・空白・
+/// `(`・数のリスト（[`argument_list`]）・`)`、関数のあとに空白とコンマ 1 つまで。読めなければ None（usvg は変形のリスト
+/// 全体を読めないものとして、変形なしで描く）。名前と数の個数は [`transform_parts`] が確かめる。
+fn transform_list(v: &str) -> Option<Vec<TransformFn<'_>>> {
+    let b = v.as_bytes();
+    let space = |k: usize| b.get(k).is_some_and(|c| is_xml_space(char::from(*c)));
     let mut out = Vec::new();
-    let mut rest = v.trim_matches(|c: char| is_xml_space(c) || c == ',');
-    while !rest.is_empty() {
-        let open = rest.find('(')?;
-        let close = rest.find(')')?;
-        if close < open {
+    let mut i = 0usize;
+    loop {
+        while space(i) {
+            i += 1;
+        }
+        if i >= b.len() {
+            return Some(out);
+        }
+        let start = i;
+        while b
+            .get(i)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        {
+            i += 1;
+        }
+        let name = v.get(start..i)?;
+        while space(i) {
+            i += 1;
+        }
+        if b.get(i) != Some(&b'(') {
             return None;
         }
-        let name = rest[..open].trim();
-        let nums: Vec<f64> = rest[open + 1..close]
-            .split(|c: char| is_xml_space(c) || c == ',')
-            .filter(|t| !t.is_empty())
-            .map(|t| t.parse::<f64>().ok().filter(|x| x.is_finite()))
-            .collect::<Option<Vec<f64>>>()?;
+        let open = i + 1;
+        let close = open + b.get(open..)?.iter().position(|c| *c == b')')?;
+        out.push((name, argument_list(v.get(open..close)?)?));
+        i = close + 1;
+        while space(i) {
+            i += 1;
+        }
+        if b.get(i) == Some(&b',') {
+            i += 1;
+        }
+    }
+}
+
+/// 関数の `(` と `)` の間の数のリスト（svgtypes の `parse_list_number` の続き：空白・数・空白・数のあとのコンマ 1 つまで）。
+/// 数は [`scan_numbers`] と同じ文法（符号・2 つ目の小数点・指数で区切る：`10-5`・`.5.5`・`1e1-1e1`）。それ以外のもの
+/// （コンマで始まる・コンマが続く・指数や単位の残りの英字・ほかの記号）と f64 にならない数があれば None（2 回目の確認 S6）。
+fn argument_list(v: &str) -> Option<Vec<f64>> {
+    let mut out = Vec::new();
+    let mut ok = true;
+    // 直前が数（コンマを 1 つ受け付ける）
+    let mut after_number = false;
+    scan_numbers(v, |t| match t {
+        Token::Number(x) if x.is_finite() => {
+            out.push(x);
+            after_number = true;
+        }
+        Token::Other(c) if is_xml_space(char::from(c)) => {}
+        Token::Other(b',') if after_number => after_number = false,
+        _ => ok = false,
+    });
+    ok.then_some(out)
+}
+
+/// 関数ごとの（行列のノルムの上限, 平行移動の大きさの上限）と、読んだ関数の列。
+type TransformParts<'a> = (Vec<(f64, f64)>, Vec<TransformFn<'a>>);
+
+/// 変形のリストの関数ごとの（行列のノルムの上限, 平行移動の大きさの上限）と、読んだ関数の列。読めなければ None。
+fn transform_parts(v: &str) -> Option<TransformParts<'_>> {
+    let list = transform_list(v)?;
+    let mut out = Vec::with_capacity(list.len());
+    for (name, nums) in &list {
         let at = |k: usize| nums.get(k).copied().unwrap_or(0.0).abs();
-        let one = match (name, nums.len()) {
+        let one = match (*name, nums.len()) {
             ("matrix", 6) => (at(0) + at(1) + at(2) + at(3), at(4) + at(5)),
             ("translate", 1 | 2) => (1.0, at(0) + at(1)),
             ("rotate", 1) => (1.0, 0.0),
@@ -312,14 +369,51 @@ fn transform_parts(v: &str) -> Option<Vec<(f64, f64)>> {
             _ => return None,
         };
         out.push(one);
-        rest = rest[close + 1..].trim_start_matches(|c: char| is_xml_space(c) || c == ',');
     }
-    Some(out)
+    Some((out, list))
+}
+
+/// usvg が変形を「無効」として変形なしに置き換えうるか（tiny-skia の `Transform::is_valid`：f32 にした合成の行列の行の長さ
+/// √(a² + c²)・√(b² + d²) のどちらかが `f32::EPSILON`（1.2 × 10⁻⁷）以下か、値が f32 であふれる）。合成は svgtypes と同じく
+/// 左から掛ける。f64 と `crate::math` で計算した値は usvg（f64 と OS の libm で掛けて f32 にする）と僅かに違うので、10⁻⁶ 以下を
+/// 「ありうる」とする。拡大の上限の積 `s` が 1 未満のときだけ呼ぶ（合成の誤差は 関数の数 × 2⁻⁵² × s 以下で、10⁻⁶ に比べて
+/// 十分小さい）。
+fn may_be_invalid(list: &[TransformFn<'_>], t: f64) -> bool {
+    // 線形の部分 [a b c d]（点 (x, y) を (a x + c y, b x + d y) に写す）
+    let mut m = [1.0f64, 0.0, 0.0, 1.0];
+    for (name, nums) in list {
+        let at = |k: usize| nums.get(k).copied().unwrap_or(0.0);
+        let rad = at(0) * (std::f64::consts::PI / 180.0);
+        let f = match *name {
+            "matrix" => [at(0), at(1), at(2), at(3)],
+            "translate" => continue,
+            "scale" => [at(0), 0.0, 0.0, if nums.len() == 2 { at(1) } else { at(0) }],
+            "rotate" => {
+                let (c, s) = (crate::math::cos(rad), crate::math::sin(rad));
+                [c, s, -s, c]
+            }
+            "skewX" => [1.0, 0.0, crate::math::tan(rad), 1.0],
+            "skewY" => [1.0, crate::math::tan(rad), 0.0, 1.0],
+            _ => return true,
+        };
+        m = [
+            m[0] * f[0] + m[2] * f[1],
+            m[1] * f[0] + m[3] * f[1],
+            m[0] * f[2] + m[2] * f[3],
+            m[1] * f[2] + m[3] * f[3],
+        ];
+    }
+    // NaN も小さい・あふれるとみなす
+    let small = |x: f64, y: f64| {
+        let h = crate::math::hypot(x, y);
+        h.is_nan() || h <= 1e-6
+    };
+    small(m[0], m[2]) || small(m[1], m[3]) || t.is_nan() || t >= 1e38
 }
 
 /// 変形のリストの拡大の上限（各関数の行列のノルムの上限の積。1 より小さい拡大は 1 とみなす）。読めなければ無限大。
 pub(crate) fn transform_scale(v: &str) -> f64 {
-    transform_parts(v).map_or(f64::INFINITY, |parts| {
+    transform_parts(v).map_or(f64::INFINITY, |(parts, _)| {
         parts
             .iter()
             .fold(1.0, |s, (one, _)| s * crate::math::max(*one, 1.0))
@@ -327,12 +421,19 @@ pub(crate) fn transform_scale(v: &str) -> f64 {
 }
 
 /// 変形のリストが点 p を写す先の大きさの上限 `s × |p| + t` の (s, t)（左の関数ほど外側。|p| は長さ）。読めなければ無限大。
+/// 1 より小さい拡大はそのまま使う（座標を小さくする）が、usvg が無効として変形なしに置き換えうる変形（拡大がほぼ 0。
+/// [`may_be_invalid`]）では、変形なしの (1, 0) も含むように s を 1 にする。
 pub(crate) fn transform_bound(v: &str) -> (f64, f64) {
-    transform_parts(v).map_or((f64::INFINITY, f64::INFINITY), |parts| {
+    transform_parts(v).map_or((f64::INFINITY, f64::INFINITY), |(parts, list)| {
         // A ∘ f の上限：|A(f(p))| ≤ sA (sf |p| + tf) + tA
-        parts
+        let (s, t) = parts
             .iter()
-            .fold((1.0, 0.0), |(s, t), (sf, tf)| (s * sf, s * tf + t))
+            .fold((1.0, 0.0), |(s, t), (sf, tf)| (s * sf, s * tf + t));
+        if s < 1.0 && may_be_invalid(&list, t) {
+            (1.0, t)
+        } else {
+            (s, t)
+        }
     })
 }
 
@@ -446,6 +547,7 @@ pub(crate) fn path_extent(d: &str) -> f64 {
                 longest = longest.max(run.div_ceil(2));
             }
         }
+        Token::Other(_) => {}
     });
     (abs_max + rel_sum) * crate::math::max(4.0, 2.0 * longest as f64 + 1.0)
 }
@@ -467,10 +569,12 @@ enum Token {
     Letter(u8),
     /// 数（読めない数は無限大）。
     Number(f64),
+    /// 数の外の、そのほかのバイト（空白・コンマ・記号・指数にならなかった e・E・多バイト文字のバイト）。
+    Other(u8),
 }
 
-/// 値の中の数（SVG の数の書き方：符号・数字・小数点・指数）と、数の外の英字（指数の e・E を除く。path の命令）を順に `f` に
-/// 渡す。どの枝でも 1 バイト以上進む。
+/// 値の中の数（SVG の数の書き方：符号・数字・小数点・指数）と、数の外の英字（指数の e・E を除く。path の命令）と、そのほかの
+/// バイトを順に `f` に渡す。どの枝でも 1 バイト以上進む。
 fn scan_numbers(v: &str, mut f: impl FnMut(Token)) {
     let b = v.as_bytes();
     let digit = |k: usize| b.get(k).is_some_and(u8::is_ascii_digit);
@@ -481,9 +585,11 @@ fn scan_numbers(v: &str, mut f: impl FnMut(Token)) {
             || ((c == b'-' || c == b'+')
                 && (digit(i + 1) || (b.get(i + 1) == Some(&b'.') && digit(i + 2))));
         if !starts {
-            if c.is_ascii_alphabetic() && !matches!(c, b'e' | b'E') {
-                f(Token::Letter(c));
-            }
+            f(if c.is_ascii_alphabetic() && !matches!(c, b'e' | b'E') {
+                Token::Letter(c)
+            } else {
+                Token::Other(c)
+            });
             i += 1;
             continue;
         }
@@ -884,6 +990,39 @@ mod tests {
         assert!(transform_scale("scale(2) bogus(1)").is_infinite());
         assert!(transform_scale("scale(").is_infinite());
         assert!(transform_scale("scale(1e400)").is_infinite());
+        // 2 回目の確認 S6：区切りのない数（SVG の数の文法では、符号・2 つ目の小数点も数を区切る。svgo などが出す）も
+        // usvg（svgtypes）と同じに読む
+        assert_eq!(transform_scale("translate(10-5)"), 1.0);
+        assert_eq!(transform_scale("matrix(.5 0 0 .5-10-20)"), 1.0);
+        assert_eq!(transform_scale("scale(2-3)"), 3.0);
+        assert_eq!(transform_scale("scale(.5.5)rotate(1e1-5-5)"), 1.0);
+        assert_eq!(
+            transform_scale("matrix(2,0,0,-4,9,9),translate(1e1-1E1)"),
+            6.0
+        );
+        assert_eq!(transform_scale(" scale(2 ,3 ,) \n"), 3.0);
+        // svgtypes が読めない書き方は、読めないまま（usvg は変形なしとして描く。kura は無限大）
+        for v in [
+            "translate(,1)",
+            "translate(1,,2)",
+            "translate(+-1)",
+            "translate(1e)",
+            "translate(1e+)",
+            "translate(1em)",
+            "translate(.)",
+            "translate(1#2)",
+            "translate(1 2 3)",
+            "rotate(1 2)",
+            "scale()",
+            ",scale(2)",
+            "scale(2),,scale(2)",
+            "scale(2) 1",
+            "scale(2)scale(2",
+            "\u{3000}scale(2)",
+            "scale\u{3000}(2)",
+        ] {
+            assert!(transform_scale(v).is_infinite(), "{v:?}");
+        }
     }
 
     /// 検証のあとの確認 R1：変形の平行移動・長さの単位・path の座標・表示の領域の大きさの上限。
@@ -897,8 +1036,30 @@ mod tests {
         assert_eq!(transform_bound("matrix(1 0 0 1 1e9 1e9)"), (2.0, 2e9));
         assert_eq!(transform_bound("rotate(90 10 20)"), (1.0, 60.0));
         // 1 より小さい拡大も、そのまま（座標を小さくする）
-        assert_eq!(transform_bound("scale(1e-9)"), (1e-9, 0.0));
+        assert_eq!(transform_bound("scale(1e-3)"), (1e-3, 0.0));
+        assert_eq!(transform_bound("rotate(30) scale(0.5)"), (0.5, 0.0));
+        // ただし usvg は拡大がほぼ 0 の変形（f32 の行の長さが 1.2 × 10⁻⁷ 以下）を無効として変形なしに置き換えるので、
+        // 変形なしの (1, 0) も含める（2 回目の確認 S6 の続きで見つけた穴：直す前は (1e-8, 0) と見積もり、祖先の拡大 10¹¹ と
+        // 座標 10⁹ の参照先が弧長の精度の見積もりを通って止まった）
+        assert_eq!(transform_bound("scale(1e-9)"), (1.0, 0.0));
+        assert_eq!(transform_bound("scale(1e-8) translate(5)").0, 1.0);
+        assert_eq!(transform_bound("scale(1e-4) scale(1e-4)"), (1.0, 0.0));
+        assert_eq!(transform_bound("matrix(0.5 0 0 1e-9 0 0)"), (1.0, 0.0));
+        assert_eq!(transform_bound("scale(1e-7,0.5)"), (1.0, 0.0));
+        // 片方の行だけが小さくても、1.2 × 10⁻⁷ より十分大きければ usvg はそのまま使う
+        assert_eq!(transform_bound("scale(1e-5,0.5)"), (0.5, 0.0));
+        let (s, t) = transform_bound("skewX(45) scale(1e-4)");
+        assert!((s - 2e-4).abs() < 1e-12 && t == 0.0, "{s} {t}");
         assert!(transform_bound("scale(").0.is_infinite());
+        // 区切りのない数（2 回目の確認 S6）。読めない書き方は無限大（usvg が変形なしとして読む値より小さく見積もらない）
+        assert_eq!(transform_bound("translate(10-5)"), (1.0, 15.0));
+        assert_eq!(transform_bound("matrix(.5 0 0 .5-10-20)"), (1.0, 30.0));
+        assert_eq!(transform_bound("translate(.5.5)"), (1.0, 1.0));
+        assert_eq!(transform_bound("translate(1e1-1e1)"), (1.0, 20.0));
+        assert_eq!(transform_bound("rotate(90-10-20)"), (1.0, 60.0));
+        assert_eq!(transform_bound("translate(1,)"), (1.0, 1.0));
+        assert!(transform_bound("scale(,1e-3)").0.is_infinite());
+        assert!(transform_bound("translate(1)scale(1e-3)x").0.is_infinite());
         assert_eq!(length_bound("12", 1.0), 12.0);
         assert_eq!(length_bound(" -3px ", 1.0), 3.0);
         assert_eq!(length_bound("1in", 1.0), 96.0);
@@ -940,6 +1101,11 @@ mod tests {
         assert_eq!(
             shape(r#"<path id="p" d="M0 0 L5 6" transform="scale(1e9) scale(1e9)"/>"#),
             24e18
+        );
+        // 参照先の path の区切りのない transform（S6：直す前は無限大で、ふつうの textPath の SVG を断った）
+        assert_eq!(
+            shape(r#"<path id="p" d="M0 0 L5 6" transform="translate(10-5)"/>"#),
+            24.0 + 15.0
         );
         assert_eq!(
             shape(r#"<rect id="p" x="1" y="2" width="1in" height="3"/>"#),
