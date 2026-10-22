@@ -23,6 +23,23 @@ describe('ライブラリを開けなかった理由（M11：新しい版にで�
     expect(titles).not.toContain(t.other);
   });
 
+  // 版 0（新しいライブラリを作る途中）で止まったときの説明も、そのまま出す（M11 の C3。初回の画面で作るのに失敗したとき・
+  // サイドバーや設定から作るのに失敗して初回の画面に戻ったときのカード。2 回目の確認 P3）
+  it.each([
+    [
+      'UpgradeFailed',
+      t.UpgradeFailed,
+      'ライブラリを新しい版にできませんでした（新しいライブラリを作る途中で止まりました。開き直すと続きを当てます。0009_analysis：disk I/O error）',
+    ],
+    [
+      'NoSpace',
+      t.NoSpace,
+      'ディスクの空き容量が足りず、ライブラリを新しい版にできませんでした。空きを作ってから開き直してください（新しいライブラリを作る途中で止まりました。開き直すと続きを当てます。0008_jobs_named_checks：database or disk is full）',
+    ],
+  ] as const)('新しいライブラリを作る途中で止まった %s', (code, title, message) => {
+    expect(openFailure({ code, message })).toEqual({ title, detail: message });
+  });
+
   it('ほかの理由は汎用の見出し', () => {
     expect(openFailure({ code: 'Db', message: 'database is locked' })).toEqual({
       title: t.other,
