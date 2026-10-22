@@ -9,6 +9,9 @@
 //!   アイテムを並べて描く。サムネイルのプール（`kura-thumb-*`）の中ではエンジンを呼ばない（.claude/rules/engine.md）。
 //! - 値が [`VALUE_CAP`]（1 GiB）を超えるもの・`Limit`・`Unsupported`・読めないもの・予算に収まらないものは、画像なら
 //!   [`EngineDone::Fallback`] で ImageIO の道へ回す（ImageIO は縮めて読める）。3D は回す先がないので失敗（種類の絵）。
+//!   ただし別のプロセスで読む SVG が時間の上限を超えたもの（`svg_worker::is_time_limit`）は回さずに失敗（種類の絵）にする
+//!   （ImageIO の SVG はプロセスの中で読み、同じように時間を使いうる。決定 23）。SVG の形を読む子は、見積もりの段でも中止で
+//!   止める（`CodecSet::shape_path_monitored`）。
 
 use std::fs::File;
 use std::io::Read;
@@ -28,6 +31,7 @@ use kura_engine::value::{Image, ImageMeta, PixelFormat, Raster};
 use kura_engine::{EngineError, Limits, Monitor, Shape, Value};
 
 use super::{ModelInfo, ThumbFormat, ThumbTargets};
+use crate::codec_ext::svg_worker;
 use crate::edit::{EngineRuntime, EngineServices};
 use crate::library::ThumbSize;
 
@@ -131,7 +135,7 @@ impl EngineThumbs {
                 done[index] = Some(EngineDone::Canceled);
                 continue;
             }
-            match self.plan(job) {
+            match self.plan(job, mon) {
                 Ok((est, model)) => planned.push(Planned { index, est, model }),
                 Err(result) => done[index] = Some(result),
             }
@@ -176,17 +180,23 @@ impl EngineThumbs {
             .collect()
     }
 
-    /// 形を読んで見積もる（ジョブのスレッドで）。描かないと決まったものは結果を返す。
-    fn plan(&self, job: &EngineJob) -> Result<(Estimate, Option<model::ModelInfo>), EngineDone> {
+    /// 形を読んで見積もる（ジョブのスレッドで）。描かないと決まったものは結果を返す。形を読むのに時間のかかりうるデコーダ
+    /// （別のプロセスで読む SVG）は、中止で止める。
+    fn plan(
+        &self,
+        job: &EngineJob,
+        mon: &dyn Monitor,
+    ) -> Result<(Estimate, Option<model::ModelInfo>), EngineDone> {
         match job.what {
             EngineWhat::Image { format } => {
                 let shape = || -> Result<(Shape, u64), EngineError> {
                     let len = std::fs::metadata(&job.path)?.len();
-                    let (shape, _) = self.codecs.shape_path(
+                    let (shape, _) = self.codecs.shape_path_monitored(
                         &job.path,
                         format,
                         &DecodeOptions::default(),
                         &self.limits,
+                        mon,
                     )?;
                     Ok((shape, len))
                 };
@@ -314,6 +324,12 @@ fn not_drawn(job: &EngineJob, err: &EngineError, info: Option<&model::ModelInfo>
         (EngineError::Canceled, _) => EngineDone::Canceled,
         (EngineError::Io(e), _) if is_write_error(&job.targets, e) => EngineDone::Failed {
             error: format!("サムネイルを書けません: {e}"),
+            model: info.map(boxed),
+        },
+        // 別のプロセスで読む SVG が時間の上限を超えた：止めて種類の絵にする（ImageIO の SVG もプロセスの中で同じように
+        // 時間を使いうるので回さない。決定 23）
+        (e, _) if svg_worker::is_time_limit(e) => EngineDone::Failed {
+            error: e.to_string(),
             model: info.map(boxed),
         },
         (_, EngineWhat::Image { .. }) => EngineDone::Fallback(err.to_string()),
@@ -1101,6 +1117,143 @@ mod tests {
             std::fs::write(&p, bad).unwrap();
             assert!(glb_info(&p, &ModelLimits::default()).is_err());
         }
+    }
+
+    /// 働き手（/bin/sh の偽物）か、決まった答えを返す偽のデコーダに SVG を頼む組。
+    struct SvgFactory {
+        script: Option<&'static str>,
+        deadlines: crate::codec_ext::svg_worker::Deadlines,
+    }
+
+    /// 形は答えるが、値は時間の上限を超えたと答える SVG のデコーダ（描く段の時間切れ）。
+    struct SlowSvg;
+
+    impl kura_engine::codec::Decoder for SlowSvg {
+        fn id(&self) -> &'static str {
+            kura_engine::codec::svg::DEC_ID
+        }
+        fn tier(&self) -> kura_engine::codec::Tier {
+            kura_engine::codec::Tier::Pinned
+        }
+        fn reproducible(&self) -> bool {
+            false
+        }
+        fn can_decode(&self, format: &str) -> bool {
+            format == "svg"
+        }
+        fn shape(
+            &self,
+            _: &mut dyn kura_engine::codec::ReadSeek,
+            _: &str,
+            _: &DecodeOptions,
+            _: &Limits,
+        ) -> Result<Shape, EngineError> {
+            Ok(Shape::Image {
+                w: kura_engine::Dim::Exact(8),
+                h: kura_engine::Dim::Exact(8),
+                fmt: PixelFormat::Rgba8,
+            })
+        }
+        fn decode(
+            &self,
+            _: &mut dyn kura_engine::codec::ReadSeek,
+            _: &str,
+            _: &DecodeOptions,
+            _: &Limits,
+            _: &dyn Monitor,
+        ) -> Result<Value, EngineError> {
+            Err(EngineError::Limit(
+                crate::codec_ext::svg_worker::TIME_LIMIT.into(),
+            ))
+        }
+    }
+
+    impl EngineFactory for SvgFactory {
+        fn runtime_config(&self) -> RuntimeConfig {
+            SmallFactory { budget: 1 << 30 }.runtime_config()
+        }
+        fn codecs(&self, _: &Path) -> CodecSet {
+            use crate::codec_ext::svg_worker::{WorkerCommand, install_with};
+            let mut set = CodecSet::pinned();
+            match self.script {
+                Some(script) => install_with(
+                    &mut set,
+                    Ok(WorkerCommand::new("/bin/sh", ["-c", script])),
+                    self.deadlines,
+                )
+                .unwrap(),
+                None => drop(set.replace_decoder(Arc::new(SlowSvg)).unwrap()),
+            }
+            set
+        }
+    }
+
+    /// 時刻が来たら中止を頼む見張り。
+    struct CancelAfter(std::time::Instant, std::time::Duration);
+
+    impl Monitor for CancelAfter {
+        fn canceled(&self) -> bool {
+            self.0.elapsed() > self.1
+        }
+    }
+
+    /// 決定 23：別のプロセスで読む SVG が時間の上限を超えたら、ImageIO へ回さずに失敗（種類の絵）にする（形を読む見積もりの段
+    /// でも、描く段でも）。見積もりの段で形を読む子も、ジョブの中止で止めて Canceled にする（ライブラリを閉じるのを待たせない）。
+    #[test]
+    fn svg_time_limits_fail_without_fallback_and_cancel_stops_the_worker() {
+        use crate::codec_ext::svg_worker::{Deadlines, TIME_LIMIT};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.svg");
+        std::fs::write(
+            &path,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"/>"#,
+        )
+        .unwrap();
+        let job = EngineJob {
+            path,
+            what: EngineWhat::Image { format: "svg" },
+            targets: ThumbTargets {
+                large: dir.path().join("t/a_l"),
+                small: dir.path().join("t/a_s"),
+            },
+        };
+        let engine = |script, ms| {
+            let services = EngineServices::new(
+                Arc::new(SvgFactory {
+                    script,
+                    deadlines: Deadlines {
+                        shape: Duration::from_millis(ms),
+                        decode: Duration::from_millis(ms),
+                    },
+                }),
+                PathBuf::from("/x"),
+            );
+            EngineThumbs::new(&services).unwrap()
+        };
+        let timed_out = |done: &EngineDone| matches!(done, EngineDone::Failed { error, model: None } if error.contains(TIME_LIMIT));
+        let jobs = std::slice::from_ref(&job);
+        // 形を読む段（見積もり）：何も返さない子
+        let started = Instant::now();
+        let done = engine(Some("sleep 38.4159"), 200).render(jobs, &NoMonitor);
+        assert!(timed_out(&done[0]), "{done:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // 描く段：値で時間切れ
+        let done = engine(None, 200).render(jobs, &NoMonitor);
+        assert!(timed_out(&done[0]), "{done:?}");
+        // 中止：見積もりの段の子を止める
+        let started = Instant::now();
+        let mon = CancelAfter(Instant::now(), Duration::from_millis(200));
+        let done = engine(Some("sleep 39.4159"), 30_000).render(jobs, &mon);
+        assert_eq!(done, vec![EngineDone::Canceled]);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // 時間切れでない失敗（壊れた返事）は、今までどおり ImageIO へ回す
+        let done = engine(Some("cat >/dev/null; printf x"), 5_000).render(jobs, &NoMonitor);
+        assert!(matches!(&done[0], EngineDone::Fallback(_)), "{done:?}");
     }
 
     #[test]

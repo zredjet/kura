@@ -722,7 +722,14 @@ impl Run<'_> {
     ) -> Result<(Step, bool)> {
         let opts = DecodeOptions::default();
         let started = Instant::now();
-        let header = self.codecs.shape_path(path, format, &opts, &self.limits);
+        // 形を読む子（別のプロセスで読む SVG。決定 23）も、ジョブの中止で止める
+        let header = self.codecs.shape_path_monitored(
+            path,
+            format,
+            &opts,
+            &self.limits,
+            &JobMonitor(self.ctx),
+        );
         if by_header {
             self.counts
                 .header_ms
