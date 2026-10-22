@@ -3,10 +3,12 @@
 
 use std::path::Path;
 
+use kura_core::codec_ext::svg_worker::{self, WorkerCommand};
 use kura_core::edit::{CodecSet, EngineFactory, RuntimeConfig};
 
 /// 物理メモリは kura-mac の `physical_memory`、コーデックの組は固定の段（SVG の文字はシステムのフォントを mmap して渡す）→
-/// macOS（ImageIO・AudioToolbox）→ ffmpeg（設定で指定した場所を含めて探す）。
+/// macOS（ImageIO・AudioToolbox）→ ffmpeg（設定で指定した場所を含めて探す）。SVG は、アプリ自身を `--kura-svg-worker` 付きで
+/// 起動した別のプロセスで読み、時間の上限で止める（決定 23。`main.rs` が働き手の入口）。
 pub struct MacEngineFactory;
 
 impl EngineFactory for MacEngineFactory {
@@ -18,7 +20,11 @@ impl EngineFactory for MacEngineFactory {
     }
 
     fn codecs(&self, work_dir: &Path) -> CodecSet {
-        kura_mac::full_codec_set(&kura_mac::pinned_options(), work_dir)
+        let mut set = kura_mac::full_codec_set(&kura_mac::pinned_options(), work_dir);
+        if let Err(e) = svg_worker::install(&mut set, WorkerCommand::current_exe()) {
+            tracing::error!("SVG の働き手を組めません: {e}");
+        }
+        set
     }
 }
 

@@ -1,4 +1,5 @@
-//! サムネイルのジョブの速さ（`bench thumbs-job --src <dir> [--threads N] [--engine-cap <MiB>] [--no-engine] [--out <dir>]`。
+//! サムネイルのジョブの速さ（`bench thumbs-job --src <dir> [--threads N] [--engine-cap <MiB>] [--no-engine] [--svg-in-process]
+//! [--out <dir>]`。`--svg-in-process` は SVG を別のプロセスで読まずに比べる（決定 23 より前の形）。
 //! NFR-04：画像 50 枚/秒以上。M11 の決定 2 で、PNG の多いライブラリでの判定の範囲を書くために測る）。
 //!
 //! `--src` の画像などを新しいライブラリに取り込み（アプリと同じ渡しもの）、できたサムネイルを消して pending に戻してから、
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kura_core::edit::EngineServices;
+use kura_core::edit::{CodecSet, EngineFactory, EngineServices, RuntimeConfig};
 use kura_core::import::{ImportHandler, ImportInput, ImportOptions, MediaKind, start_import};
 use kura_core::jobs::{JobKind, JobManager, JobState};
 use kura_core::library::Library;
@@ -24,6 +25,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut threads = None;
     let mut cap = None;
     let mut engine = true;
+    let mut svg_in_process = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -32,13 +34,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--threads" => threads = it.next().and_then(|n| n.parse::<usize>().ok()),
             "--engine-cap" => cap = it.next().and_then(|n| n.parse::<u64>().ok()),
             "--no-engine" => engine = false,
+            "--svg-in-process" => svg_in_process = true,
             other => return Err(format!("不明な引数: {other}")),
         }
     }
     let src = src.ok_or("--src を指定してください")?;
     let base = out.unwrap_or_else(|| src.parent().map(PathBuf::from).unwrap_or_default());
     let path = base.join(format!("kura-bench-thumbs-{}.kuralib", std::process::id()));
-    let result = measure(&src, &path, threads, cap, engine);
+    let result = measure(&src, &path, threads, cap, engine, svg_in_process);
     let _ = std::fs::remove_dir_all(&path);
     result
 }
@@ -49,6 +52,7 @@ fn measure(
     threads: Option<usize>,
     cap: Option<u64>,
     engine: bool,
+    svg_in_process: bool,
 ) -> Result<(), String> {
     let library = Arc::new(Library::create(path).map_err(|e| e.to_string())?);
     let backend = kura_mac::media_backend();
@@ -106,8 +110,13 @@ fn measure(
 
     let mut handler = ThumbnailHandler::new(backend);
     if engine {
+        let factory: Arc<dyn EngineFactory> = if svg_in_process {
+            Arc::new(InProcessSvg)
+        } else {
+            Arc::new(crate::MacEngineFactory)
+        };
         handler = handler.with_engine(Some(Arc::new(EngineServices::new(
-            Arc::new(crate::MacEngineFactory),
+            factory,
             library.layout().staging_dir().join("engine"),
         ))));
     }
@@ -152,6 +161,7 @@ fn measure(
         ready = png,
         ?routes,
         engine,
+        svg_in_process,
         engine_cap_mib = cap.unwrap_or(256),
         elapsed_ms = elapsed.as_secs_f64() * 1000.0,
         per_second = rows.len() as f64 / elapsed.as_secs_f64(),
@@ -159,4 +169,17 @@ fn measure(
         "サムネイルのジョブ（NFR-04：画像 50 枚/秒以上）"
     );
     Ok(())
+}
+
+/// 比べるための組：アプリと同じだが、SVG を別のプロセスで読まない（決定 23 より前の形。`--svg-in-process`）。
+struct InProcessSvg;
+
+impl EngineFactory for InProcessSvg {
+    fn runtime_config(&self) -> RuntimeConfig {
+        crate::MacEngineFactory.runtime_config()
+    }
+
+    fn codecs(&self, work_dir: &Path) -> CodecSet {
+        kura_mac::full_codec_set(&kura_mac::pinned_options(), work_dir)
+    }
 }

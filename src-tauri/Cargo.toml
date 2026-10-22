@@ -32,6 +32,8 @@ tauri-specta.workspace = true
 
 
 [dev-dependencies]
+# tests/svg_worker.rs：アプリの実行ファイルを SVG の働き手として起動し、プロセスの中で読んだ値と照らす（決定 23）
+kura-engine.workspace = true
 tempfile.workspace = true
 
 [lints]
