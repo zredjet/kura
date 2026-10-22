@@ -746,11 +746,16 @@ impl ValueSink {
                 if f.list.is_empty() || f.list.len() as u64 > limits.max_frames {
                     return Err(format!("フレームの数が上限の外です（{}）", f.list.len()));
                 }
+                // 位置は子の見出しから来る i64 なので、足し算のあふれも外とする（kura-engine の `Frames::new` と同じ判定を、
+                // 画素を受け取る前にする）
+                let within = |at: i64, len: u32, canvas: u32| {
+                    at >= 0
+                        && at
+                            .checked_add(i64::from(len))
+                            .is_some_and(|end| end <= i64::from(canvas))
+                };
                 for fr in &f.list {
-                    let inside = fr.x >= 0
-                        && fr.y >= 0
-                        && fr.x + i64::from(fr.w) <= i64::from(head.w)
-                        && fr.y + i64::from(fr.h) <= i64::from(head.h);
+                    let inside = within(fr.x, fr.w, head.w) && within(fr.y, fr.h, head.h);
                     if !dims_ok(fr.w, fr.h) || !inside {
                         return Err("フレームがキャンバスの外です".into());
                     }
@@ -1154,6 +1159,16 @@ mod tests {
         assert!(read_back(Op::Decode, &limits, &fb, 2).is_ok());
         let b = with_head(&fb, |h| h["frames"]["list"][1]["x"] = 1.into());
         assert!(refused(&b, Op::Decode).contains("キャンバス"));
+        // 位置が i64 の端（幅・高さを足すとあふれる）でも、画素を受け取る前にキャンバスの外として断る（M11 の 3 回目の確認 W4）
+        for key in ["x", "y"] {
+            for at in [i64::MAX, i64::MAX - 3] {
+                let b = with_head(&fb, |h| h["frames"]["list"][0][key] = at.into());
+                let mut r = ReplyReader::new(Op::Decode, &limits);
+                let head_end = head_range(&b).end + 8;
+                let err = r.push(&b[..head_end]).unwrap_err();
+                assert!(err.contains("キャンバス"), "{key}={at}: {err}");
+            }
+        }
         let b = with_head(&fb, |h| {
             let one = h["frames"]["list"][0].clone();
             h["frames"]["list"] = serde_json::Value::Array(vec![one; 5]);
