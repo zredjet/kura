@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use crate::tools::terminate_group;
+use crate::tools::{self, terminate_group};
 use crate::{CoreError, Result};
 
 /// 外部ツールの欄・場所の指定に使う名前。
@@ -76,12 +76,13 @@ pub fn profile_in_use(profile: &Path) -> bool {
     else {
         return false;
     };
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    tools::status(
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .is_ok_and(|s| s.success())
 }
 
 /// 動いている Chrome。手放すとプロセスグループごと止める。
@@ -96,14 +97,15 @@ impl ChromeProcess {
     pub fn launch_headless(chrome: &Path, profile: &Path) -> Result<Self> {
         std::fs::create_dir_all(profile)?;
         let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
-        let mut child = Command::new(chrome)
-            .args(headless_args(profile))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| CoreError::Tool(format!("Chrome を起動できませんでした: {e}")))?;
+        let mut child = tools::spawn(
+            Command::new(chrome)
+                .args(headless_args(profile))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .process_group(0),
+        )
+        .map_err(|e| CoreError::Tool(format!("Chrome を起動できませんでした: {e}")))?;
         let stderr = Arc::new(Mutex::new(Vec::new()));
         if let Some(pipe) = child.stderr.take() {
             let lines = stderr.clone();

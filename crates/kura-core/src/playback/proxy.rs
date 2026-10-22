@@ -434,13 +434,14 @@ fn run_ffmpeg(
     control: &dyn Fn() -> Control,
     on_progress: &dyn Fn(f64),
 ) -> std::result::Result<Option<Control>, String> {
-    let mut child: Child = Command::new(&tools.ffmpeg)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
+    let mut child: Child = crate::tools::spawn(
+        Command::new(&tools.ffmpeg)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
     let (sender, receiver) = mpsc::channel::<f64>();
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
