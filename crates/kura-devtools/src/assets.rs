@@ -16,8 +16,9 @@
 //! 作れなかったものは理由を返す（`sips` が HEIC を書けない CI の仮想マシンなど）。
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use kura_engine::NoMonitor;
 use kura_engine::codec::CodecSet;
@@ -600,15 +601,43 @@ const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="320" height
 </svg>
 "##;
 
-/// `sips` で `src` を `format` にする。
+/// `sips` を待つ上限。CI の仮想マシンでは HEIC・AVIF を書くときに失敗せず終わらないことがある（2026-10 の macOS の
+/// CI で 3 時間止まった）。超えたら止めて、作れなかった見本として飛ばす。
+const SIPS_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// `sips` で `src` を `format` にする（[`SIPS_TIMEOUT`] を超えたら止める）。
 fn sips(src: &Path, format: &str, out: &Path) -> Result<(), String> {
-    let output = Command::new("sips")
+    let mut child = Command::new("sips")
         .args(["-s", "format", format])
         .arg(src)
         .arg("--out")
         .arg(out)
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("sips を起動できません: {e}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < SIPS_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(out);
+                return Err(format!(
+                    "sips が {} 秒で {format} を書き終えませんでした",
+                    SIPS_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("sips を待てません: {e}")),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("sips を待てません: {e}"))?;
     if output.status.success() && out.is_file() {
         Ok(())
     } else {
