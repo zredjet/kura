@@ -53,7 +53,7 @@ brew install yt-dlp gallery-dl deno ffmpeg
 必要なもの：
 
 - Xcode（Swift ヘルパーのビルド）
-- Rust 1.88 以降（`rustup`）
+- Rust 1.99.0（`rustup`。リポジトリの `rust-toolchain.toml` で固定していて、`rustup` が自動で入れる。ADR-165）
 - Node.js（LTS）と pnpm（`corepack enable`）
 - [cargo-about](https://github.com/EmbarkStudios/cargo-about)（依存ライブラリのライセンス一覧の生成。`cargo install --locked cargo-about`）
 
