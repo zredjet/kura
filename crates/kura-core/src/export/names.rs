@@ -1,5 +1,7 @@
 //! 書き出しのファイル名（純粋関数）。
 
+use crate::import::format_id;
+
 /// APFS・HFS+ のファイル名の上限（バイト）。
 const MAX_NAME_BYTES: usize = 255;
 
@@ -40,6 +42,26 @@ pub fn numbered_file(name: &str, n: u32) -> String {
     };
     let room = MAX_NAME_BYTES.saturating_sub(tail.len());
     format!("{}{tail}", truncate_bytes(stem, room))
+}
+
+/// 書き出すときの名前：元の名前の拡張子が今の中身（`items.ext`）と同じ形式なら元の名前のまま（`jpg` と `jpeg` は同じ。
+/// 形式の表の ID で比べる）、違えば元の名前の語幹に今の拡張子を付ける（形式を変えて上書きしたあとも、元の名前は
+/// 変えずに書き出しで直す。M12 の段 2 の決定 10）。拡張子のない名前・知らない拡張子も「違う」とみなす。
+pub fn export_name(original_name: &str, ext: &str) -> String {
+    let (stem, old) = split_ext(original_name);
+    let ext = ext.trim();
+    if ext.is_empty() || stem.trim().is_empty() {
+        return original_name.to_string();
+    }
+    let same = old.is_some_and(|old| match (format_id(old), format_id(ext)) {
+        (Some(a), Some(b)) => a == b,
+        _ => old.eq_ignore_ascii_case(ext),
+    });
+    if same {
+        original_name.to_string()
+    } else {
+        format!("{stem}.{ext}")
+    }
 }
 
 /// フォルダの `n` 番目の候補（拡張子を区別しない。「鎌倉 2」）。
@@ -92,6 +114,34 @@ mod tests {
         assert_eq!(numbered_file("archive.tar.gz", 3), "archive.tar 3.gz");
         assert_eq!(numbered_file("README", 2), "README 2");
         assert_eq!(numbered_file("_secret", 2), "_secret 2");
+    }
+
+    #[test]
+    fn export_name_keeps_the_name_when_the_format_is_the_same() {
+        assert_eq!(export_name("IMG_0001.JPG", "jpg"), "IMG_0001.JPG");
+        assert_eq!(export_name("photo.jpeg", "jpg"), "photo.jpeg");
+        assert_eq!(export_name("anim.apng", "png"), "anim.apng");
+        assert_eq!(export_name("scan.TIF", "tiff"), "scan.TIF");
+    }
+
+    #[test]
+    fn export_name_uses_the_current_extension_when_the_format_changed() {
+        // PSD を PNG で上書きしたあと（original_name は変えない）
+        assert_eq!(export_name("hero.psd", "png"), "hero.png");
+        assert_eq!(export_name("hero.png", "webp"), "hero.webp");
+        assert_eq!(export_name("archive.v2.gif", "png"), "archive.v2.png");
+        // 拡張子のない名前・知らない拡張子は今の拡張子を付ける
+        assert_eq!(export_name("README", "png"), "README.png");
+        assert_eq!(export_name("dump.dat", "png"), "dump.png");
+        // 知らない拡張子どうしは文字で比べる
+        assert_eq!(export_name("a.xyz", "XYZ"), "a.xyz");
+    }
+
+    #[test]
+    fn export_name_leaves_empty_names_to_the_fallback() {
+        assert_eq!(export_name("", "png"), "");
+        assert_eq!(export_name("  ", "png"), "  ");
+        assert_eq!(export_name("hero.png", ""), "hero.png");
     }
 
     #[test]

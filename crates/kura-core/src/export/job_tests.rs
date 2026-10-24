@@ -220,6 +220,24 @@ fn counts_missing_library_files_as_failures_and_continues() {
     assert_eq!(names_in(&dest), ["b.jpg", "kura-export.json"]);
 }
 
+/// 形式を変えて上書きしたアイテム（original_name は元の拡張子のまま。M12 の段 2 の決定 10）は、語幹に今の拡張子で書き出す。
+/// 形式が同じなら（jpg と jpeg）元の名前のまま。
+#[test]
+fn exports_items_saved_in_another_format_with_the_current_extension() {
+    let env = Env::new();
+    let a = env.item("hero.psd", "png", b"a");
+    let b = env.item("photo.jpeg", "jpg", b"b");
+    let dest = env.dest("out");
+
+    let (state, result) = env.run(&dest, vec![a, b]);
+    assert_eq!(state, JobState::Done);
+    assert_eq!((result.exported, result.failed), (2, 0));
+    assert_eq!(
+        names_in(&dest),
+        ["hero.png", "kura-export.json", "photo.jpeg"]
+    );
+}
+
 #[test]
 fn rejects_a_missing_destination_and_an_empty_selection() {
     let env = Env::new();

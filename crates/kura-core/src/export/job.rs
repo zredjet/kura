@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use super::names::{numbered_dir, numbered_file, safe_name};
+use super::names::{export_name, numbered_dir, numbered_file, safe_name};
 use crate::import::MediaKind;
 use crate::items::detail;
 use crate::jobs::{
@@ -295,7 +295,8 @@ fn export_one(
         )));
     }
     let fallback = format!("{}.{ext}", safe_name(&title, &format!("item-{item_id}")));
-    let name = safe_name(&original_name, &fallback);
+    // 形式を変えて上書きしたアイテムは、元の名前の語幹に今の拡張子（元の名前は変えない。M12 の段 2 の決定 10）
+    let name = safe_name(&export_name(&original_name, &ext), &fallback);
     place_new(
         &src,
         dir,
