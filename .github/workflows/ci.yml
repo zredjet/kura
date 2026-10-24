@@ -15,6 +15,8 @@ jobs:
   linux:
     name: Linux（kura-engine・kura-core・vorbis-tables）
     runs-on: ubuntu-latest
+    # ふだんは 8〜12 分。テストが止まったときに 6 時間の既定まで待たない
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -35,6 +37,8 @@ jobs:
   macos:
     name: macOS（kura-engine・kura-core・vorbis-tables・kura-mac・kura-devtools）
     runs-on: macos-26
+    # ふだんは 16〜19 分。テストが止まったときに 6 時間の既定まで待たない（2026-10 に sips が止まって 3 時間かかった）
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
