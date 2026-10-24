@@ -1,7 +1,7 @@
 //! 保存のジョブ（`JobKind::Edit`。M12 の段 2。docs/editing.md §14、docs/data-model.md §4「保存と版（M12）」）。
 //!
-//! 上書き（アイテム ID を保ったまま中身を差し替えて版を足す）と別名で保存（新しいアイテムを作り、元のアイテムの元を
-//! 引き継いで版 1 に文書を置く）。元に戻す（`revert`）は入力の形だけを受け、段 2 の C で足す（今は Unsupported）。
+//! 上書き（アイテム ID を保ったまま中身を差し替えて版を足す）・別名で保存（新しいアイテムを作り、元のアイテムの元を
+//! 引き継いで版 1 に文書を置く）・版に戻す（元に戻す・途中の版 k に戻す。版 k の中身で新しい版を足す。[`revert`]）。
 //!
 //! 手順（docs/editing.md §14 の表）：
 //! 0. 確かめ：このジョブが頭にした版があれば、前回コミットしたので Done（再開）。前回 OS のデコーダで元を読んでいる途中で
@@ -18,9 +18,13 @@
 //!    existing を決め、拡張子を決め（台帳に行があればその拡張子）、台帳にない出力とアンカーを予告する（`ledger::announce`）。
 //! 7. 配置：`files/` へ同じボリュームの中で改名する（同じ中身がもうあれば staging を消す）。
 //! 8. コミット：トランザクション 2 で土台を確かめ直し、版 0（最初の保存）・アンカー・アイテムの置き換え（か新しいアイテム）・
-//!    前の頭・新しい頭・入力の記録を書き、自分の予告を消し、途中経過に結果を書く。ここで Conflict になったら（門の間に
-//!    ゴミ箱に入れられた）、門を持ったまま、台帳に載っていない置いたファイルを消して予告を消してから失敗にする。
+//!    前の頭・新しい頭・入力の記録を書き、下書きを片付け（`drafts::settle_after_save`）、自分の予告を消し、途中経過に結果を
+//!    書く。ここで Conflict になったら（門の間にゴミ箱に入れられた）、門を持ったまま、台帳に載っていない置いたファイルを
+//!    消して予告を消してから失敗にする。
 //! 9. 後始末：門を放し、staging の残りを消し、サムネイル・解析・プロキシのジョブを積む。
+//!
+//! 版に戻すときは、版 k の中身が台帳にあってファイルがあれば、門を持って 1 つのトランザクションで戻す（描かない）。なければ
+//! 版 k の文書と入力の記録から 1〜5 で作り直し（値のダイジェストを記録と照らす）、6〜9 は上と同じ（[`revert`]）。
 //!
 //! 強制終了：1〜5 は staging の掃除とジョブの再開で初めから。6 のあとは開くときの予告の照合（`ledger::settle_pending`）が
 //! 置いたファイルを消して予告を消し、ジョブは初めから。8 のあとは 0 がこのジョブの版を見つけて Done（版は 1 つだけ）。
@@ -53,7 +57,7 @@ use super::versions::{
     self, FileState, Head, InputRole, MediaRecord, NewInput, NewVersion, OriginalFile, VersionKind,
     VersionRecord,
 };
-use super::{EngineServices, from_engine, store};
+use super::{EngineServices, drafts, from_engine, store};
 use crate::db::Db;
 use crate::import::place::{Staged, place};
 use crate::import::store::{NewItem, Owner, OwnerRole, find_owner, insert_item};
@@ -88,7 +92,7 @@ pub enum SaveAction {
         title: String,
         stem: String,
     },
-    /// 版 `to` に戻す（段 2 の C で足す。今は Unsupported）。
+    /// 版 `to`（0 が元。頭の版より前）に戻す：版 `to` の中身で新しい版を足す（docs/editing.md §14「版に戻す」）。
     Revert { to: i64 },
 }
 
@@ -154,40 +158,43 @@ pub fn check_doc(g: &Graph) -> Result<()> {
 }
 
 /// 保存のジョブを積む。文書を内容アドレスの部品に分けて先に DB に置き（`store::put_doc`）、ジョブの入力には根のダイジェスト
-/// だけを書く。アイテムがなければ NotFound。元に戻す（`Revert`）は段 2 の C で足すので、今は Unsupported。
+/// だけを書く。アイテムがなければ NotFound。版に戻す（`Revert`）は、戻す先が 0 以上・頭の版より前でなければ Invalid。
 pub fn start_save(db: &Db, jobs: &JobManager, req: &SaveRequest) -> Result<JobId> {
-    let (action, graph) = match &req.action {
-        SaveAction::Overwrite { graph } => (None, graph),
-        SaveAction::SaveAs { graph, title, stem } => {
+    let item_id = req.item_id;
+    let names = match &req.action {
+        SaveAction::SaveAs { title, stem, .. } => {
             let (title, stem) = (nfc(title.trim()), nfc(stem.trim()));
             if title.is_empty() || stem.is_empty() || stem.contains(['/', '\0']) {
                 return Err(CoreError::Invalid(
                     "別名で保存の名前が正しくありません（空・「/」を含むもの）".into(),
                 ));
             }
-            (Some((title, stem)), graph)
+            Some((title, stem))
         }
-        SaveAction::Revert { .. } => {
-            return Err(CoreError::Unsupported(
-                "前の版に戻す保存は、まだできません".into(),
-            ));
-        }
+        SaveAction::Overwrite { .. } | SaveAction::Revert { .. } => None,
     };
-    check_doc(graph)?;
-    let parts = split(graph).map_err(|e| from_engine("文書を部品に分けられません", e))?;
-    let root = parts.root;
-    let item_id = req.item_id;
-    if db.read(|c| versions::head(c, item_id))?.is_none() {
-        return Err(CoreError::NotFound(format!("アイテム {item_id}")));
+    if let SaveAction::Overwrite { graph } | SaveAction::SaveAs { graph, .. } = &req.action {
+        check_doc(graph)?;
     }
-    db.write(move |tx| store::put_doc(tx, &parts, now_ms()).map(|_| ()))?;
-    let action = match action {
-        None => ActionInput::Overwrite { doc: root },
-        Some((title, stem)) => ActionInput::SaveAs {
-            doc: root,
+    let head = db
+        .read(|c| versions::head(c, item_id))?
+        .ok_or_else(|| CoreError::NotFound(format!("アイテム {item_id}")))?;
+    let action = match (&req.action, names) {
+        (SaveAction::Overwrite { graph }, _) => ActionInput::Overwrite {
+            doc: put_graph(db, graph)?,
+        },
+        (SaveAction::SaveAs { graph, .. }, Some((title, stem))) => ActionInput::SaveAs {
+            doc: put_graph(db, graph)?,
             title,
             stem,
         },
+        (SaveAction::Revert { to }, _) => {
+            revert::check_target(*to, head.version)?;
+            ActionInput::Revert { to: *to }
+        }
+        (SaveAction::SaveAs { .. }, None) => {
+            return Err(CoreError::Invalid("別名で保存の名前がありません".into()));
+        }
     };
     let input = JobInput {
         v: INPUT_V,
@@ -201,6 +208,14 @@ pub fn start_save(db: &Db, jobs: &JobManager, req: &SaveRequest) -> Result<JobId
     jobs.enqueue(JobKind::Edit, serde_json::to_string(&input)?)
 }
 
+/// 文書を部品に分けて DB に置き、根のダイジェストを返す。
+fn put_graph(db: &Db, graph: &Graph) -> Result<Digest> {
+    let parts = split(graph).map_err(|e| from_engine("文書を部品に分けられません", e))?;
+    let root = parts.root;
+    db.write(move |tx| store::put_doc(tx, &parts, now_ms()).map(|_| ()))?;
+    Ok(root)
+}
+
 // ---- 純粋な関数 ----
 
 /// 保存の向き。
@@ -208,6 +223,8 @@ pub fn start_save(db: &Db, jobs: &JobManager, req: &SaveRequest) -> Result<JobId
 pub enum Mode {
     Overwrite,
     SaveAs,
+    /// 版に戻す（持ち主の決め方は上書きと同じ：アイテムの今を差し替える）。
+    Revert,
 }
 
 /// 出力の中身 H の持ち主から決めること。
@@ -228,13 +245,14 @@ pub enum Decision {
     },
 }
 
-/// H の持ち主 `owner`（`import::store::find_owner`。今 → 元 → 過去の版の順）と、保存するアイテム `me`・向きから決める。
+/// H の持ち主 `owner`（`import::store::find_owner`。今 → 元 → 過去の版の順）と、保存するアイテム `me`・向きから決める
+/// （版に戻すのは上書きと同じ）。
 pub fn decide(owner: Option<&Owner>, me: i64, mode: Mode) -> Decision {
     let Some(o) = owner else {
         return Decision::Proceed;
     };
     match mode {
-        Mode::Overwrite => match o.role {
+        Mode::Overwrite | Mode::Revert => match o.role {
             OwnerRole::Current if o.id == me => Decision::Unchanged,
             OwnerRole::Current => Decision::Conflict(format!(
                 "保存した結果が、別のアイテム（{}{}）の今と同じ中身になります",
@@ -331,11 +349,27 @@ pub(crate) enum Fault {
     AfterCommit,
 }
 
+/// テストが段の途中で割り込む所（中止・門の間にゴミ箱に入れる試験）。
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// 書いて staging に置いたあと、止める指示を見る前。
+    Written,
+    /// 置いたあと、トランザクション 2 の前（台帳の門を持っている）。
+    Placed,
+}
+
+/// テストの割り込み（段ごとに呼ばれる。止めて待つ・DB を書き換えるなど）。
+#[cfg(test)]
+pub(crate) type Hook = Arc<dyn Fn(Stage) + Send + Sync>;
+
 /// 保存のジョブの処理。エンジンの部品（実行の場・コーデックの組）は、このライブラリのもの。
 pub struct EditHandler {
     engine: Arc<EngineServices>,
     #[cfg(test)]
     pub(crate) fault: Option<Fault>,
+    #[cfg(test)]
+    pub(crate) hook: Option<Hook>,
 }
 
 impl EditHandler {
@@ -345,6 +379,8 @@ impl EditHandler {
             engine,
             #[cfg(test)]
             fault: None,
+            #[cfg(test)]
+            hook: None,
         }
     }
 
@@ -355,9 +391,24 @@ impl EditHandler {
         self
     }
 
+    /// 段ごとに `hook` を呼ぶ（テストの割り込み）。
+    #[cfg(test)]
+    pub(crate) fn with_hook(mut self, hook: Hook) -> Self {
+        self.hook = Some(hook);
+        self
+    }
+
     #[cfg(test)]
     fn crash_at(&self, at: Fault) -> bool {
         self.fault == Some(at)
+    }
+
+    /// テストの割り込み。
+    #[cfg(test)]
+    fn at(&self, stage: Stage) {
+        if let Some(hook) = &self.hook {
+            hook(stage);
+        }
     }
 }
 
@@ -415,6 +466,9 @@ macro_rules! go {
         }
     };
 }
+
+// 版に戻す（`go!` を使うので、マクロの定義のあとに置く）
+mod revert;
 
 /// このジョブの staging のファイル（落とすと消す。置いたものは改名で消えている）。
 #[derive(Default)]
@@ -485,6 +539,18 @@ impl AnchorUse {
     }
 }
 
+/// 何を書いたか（段 8 の分かれ目）。
+#[derive(Debug, Clone)]
+enum Act {
+    /// 文書を描いた版（上書き・別名で保存）。`names` は別名で保存の (表示名, 語幹)。
+    Edit {
+        doc: Digest,
+        names: Option<(String, String)>,
+    },
+    /// 版 k に戻す版（版 k の文書から作り直した）。
+    Revert(Box<revert::Target>),
+}
+
 /// 描いて書き終えたもの（段 5 まで）。
 #[derive(Debug, Clone)]
 struct Prepared {
@@ -492,10 +558,11 @@ struct Prepared {
     mode: Mode,
     item_id: i64,
     base: Base,
-    doc: Digest,
-    /// 別名で保存の (表示名, 語幹)。
-    names: Option<(String, String)>,
+    act: Act,
     kind: MediaKind,
+    /// 拡張子の手がかり：出力の形式がこの拡張子の形式と同じなら、この拡張子のまま（`apng` を `png` にしない。上書き・別名は
+    /// 今の拡張子、版に戻すのは版 k の拡張子）。
+    ext_hint: String,
     original: OriginalFile,
     source_format: String,
     opts: DecodeOptions,
@@ -591,18 +658,14 @@ impl JobHandler for EditHandler {
                     .into(),
             ));
         }
-        let (mode, doc, names) = match input.action.clone() {
-            ActionInput::Overwrite { doc } => (Mode::Overwrite, doc, None),
-            ActionInput::SaveAs { doc, title, stem } => (Mode::SaveAs, doc, Some((title, stem))),
-            ActionInput::Revert { .. } => {
-                return Err(CoreError::Unsupported(
-                    "前の版に戻す保存は、まだできません".into(),
-                ));
-            }
-        };
         let base = Base {
             hash: input.base.hash.0,
             version: input.base.version,
+        };
+        let (mode, doc, names) = match input.action.clone() {
+            ActionInput::Overwrite { doc } => (Mode::Overwrite, doc, None),
+            ActionInput::SaveAs { doc, title, stem } => (Mode::SaveAs, doc, Some((title, stem))),
+            ActionInput::Revert { to } => return self.revert(ctx, input.item_id, base, to),
         };
         let (prepared, staging) = match self.prepare(ctx, mode, input.item_id, base, doc, names)? {
             Flow::Go(p) => p,
@@ -613,6 +676,26 @@ impl JobHandler for EditHandler {
 }
 
 impl EditHandler {
+    /// 書き終えたあと（段 5 の終わり）：止める指示があれば止める（呼び手が staging を落として消す）。テストの強制終了なら
+    /// staging を残して失敗する。続けるなら None。
+    fn after_written<T>(
+        &self,
+        ctx: &JobContext,
+        _staging: &mut Staging,
+    ) -> Option<Result<Flow<T>>> {
+        #[cfg(test)]
+        self.at(Stage::Written);
+        if let Some(end) = stop_end(ctx) {
+            return Some(Ok(Flow::Stop(end)));
+        }
+        #[cfg(test)]
+        if self.crash_at(Fault::AfterRender) {
+            std::mem::take(_staging).keep();
+            return Some(Err(crashed(Fault::AfterRender)));
+        }
+        None
+    }
+
     /// 段 0〜5：文書を読み、元を読み（アンカーを作り）、描いて書く。
     fn prepare(
         &self,
@@ -890,13 +973,8 @@ impl EditHandler {
         staging.add(out_part.clone());
         write_synced(&out_part, &bytes)?;
         drop(bytes);
-        if let Some(end) = stop_end(ctx) {
-            return Ok(Flow::Stop(end));
-        }
-        #[cfg(test)]
-        if self.crash_at(Fault::AfterRender) {
-            staging.keep();
-            return Err(crashed(Fault::AfterRender));
+        if let Some(stop) = self.after_written(ctx, &mut staging) {
+            return stop;
         }
         Ok(Flow::Go((
             Prepared {
@@ -904,9 +982,9 @@ impl EditHandler {
                 mode,
                 item_id,
                 base,
-                doc,
-                names,
+                act: Act::Edit { doc, names },
                 kind: head.kind,
+                ext_hint: head.ext,
                 original,
                 source_format: source_format.to_string(),
                 opts,
@@ -982,14 +1060,21 @@ impl EditHandler {
             staging.keep();
             return Err(crashed(Fault::AfterPlace));
         }
+        #[cfg(test)]
+        self.at(Stage::Placed);
         // 8. コミット
         let committed = {
             let (p, go) = (p.clone(), go.clone());
             db.write(move |tx| {
                 let now = now_ms();
-                match p.mode {
-                    Mode::Overwrite => commit_overwrite(tx, &p, &go, now),
-                    Mode::SaveAs => commit_save_as(tx, &p, &go, now),
+                match &p.act {
+                    Act::Edit { doc, names } => match names {
+                        None => commit_overwrite(tx, &p, doc, &go, now),
+                        Some(names) => commit_save_as(tx, &p, doc, names, &go, now),
+                    },
+                    Act::Revert(target) => {
+                        revert::commit_revert(tx, &revert::Out::rebuilt(&p, target, &go)?, now)
+                    }
                 }
             })
         };
@@ -1011,10 +1096,10 @@ impl EditHandler {
         drop(gate);
         drop(staging);
         queue_follow_ups(ctx, p.kind);
-        let message = if go.unchanged {
-            "中身が同じなので、版だけ足しました".to_string()
-        } else {
-            "保存しました".to_string()
+        let message = match (&p.act, go.unchanged) {
+            (_, true) => "中身が同じなので、版だけ足しました".to_string(),
+            (Act::Revert(t), false) => format!("版 {} に戻しました（作り直しました）", t.to),
+            (Act::Edit { .. }, false) => "保存しました".to_string(),
         };
         ctx.log(&message);
         Ok(JobEnd::Done {
@@ -1107,7 +1192,7 @@ fn announce(tx: &Connection, p: &Prepared, now: i64) -> Result<Tx1> {
         Decision::Proceed => false,
     };
     let listed = ledger::ext_of(tx, &p.out_hash)?;
-    let ext = output_ext(&p.out_format, &head.ext, listed.as_deref()).ok_or_else(|| {
+    let ext = output_ext(&p.out_format, &p.ext_hint, listed.as_deref()).ok_or_else(|| {
         CoreError::Unsupported(format!(
             "出力の形式 {} の拡張子を決められません",
             p.out_format
@@ -1338,7 +1423,13 @@ fn add_head(
 /// トランザクション 2（上書き）：土台を確かめ直し、版 0（最初の保存）・アンカー・アイテムの置き換え・前の頭・新しい頭・入力を
 /// 書き、自分の予告を消して途中経過に結果を書く。title・original_name・取り込み日時・再生の記録・素材の設定・thumb_rev は
 /// 変えない（M12 の決定 10・11）。
-fn commit_overwrite(tx: &Connection, p: &Prepared, go: &Go, now: i64) -> Result<serde_json::Value> {
+fn commit_overwrite(
+    tx: &Connection,
+    p: &Prepared,
+    doc: &Digest,
+    go: &Go,
+    now: i64,
+) -> Result<serde_json::Value> {
     let id = p.item_id;
     // (a) 土台
     let head =
@@ -1361,8 +1452,8 @@ fn commit_overwrite(tx: &Connection, p: &Prepared, go: &Go, now: i64) -> Result<
         versions::insert_original(tx, id, &p.original, &p.decoded, now)?;
     }
     // (d) 文書（start_save で置き済み）
-    let doc_id = store::doc_id_by_digest(tx, &p.doc)?
-        .ok_or_else(|| CoreError::NotFound(format!("保存する文書 {}", p.doc)))?;
+    let doc_id = store::doc_id_by_digest(tx, doc)?
+        .ok_or_else(|| CoreError::NotFound(format!("保存する文書 {doc}")))?;
     // (e) アンカー
     let anchor_id = anchor_row(tx, p, go, now)?;
     // (f) 置き換え（同じ中身なら日時だけ）
@@ -1406,6 +1497,17 @@ fn commit_overwrite(tx: &Connection, p: &Prepared, go: &Go, now: i64) -> Result<
     // (h)(i) 新しい頭と入力
     let version = head.version + 1;
     let vid = add_head(tx, p, go, id, version, head.version, doc_id, anchor_id, now)?;
+    // (k) 下書き：保存した文書と同じなら消し、このジョブのあとに置いた下書きは土台を新しい頭に付け替える
+    drafts::settle_after_save(
+        tx,
+        id,
+        Some(doc_id),
+        p.job,
+        Base {
+            hash: p.out_hash,
+            version,
+        },
+    )?;
     // (j)(l) 予告を消し、結果を途中経過に
     ledger::clear_announced(tx, p.job)?;
     let outcome = saved_json(p, go, id, version, vid);
@@ -1422,7 +1524,14 @@ fn commit_overwrite(tx: &Connection, p: &Prepared, go: &Go, now: i64) -> Result<
 /// トランザクション 2（別名で保存）：元のアイテム A の土台を確かめ直し、新しいアイテム B を入れ、B の版 0（A の元）・
 /// アンカー・版 1・入力・写すもの（タグ・フォルダ・評価・メモ・出どころ。決定 4・9）・来歴を書き、予告を消して結果を書く。
 /// A は変えない。ユニット・プレイリスト・再生の記録・素材の設定は写さない。
-fn commit_save_as(tx: &Connection, p: &Prepared, go: &Go, now: i64) -> Result<serde_json::Value> {
+fn commit_save_as(
+    tx: &Connection,
+    p: &Prepared,
+    doc: &Digest,
+    names: &(String, String),
+    go: &Go,
+    now: i64,
+) -> Result<serde_json::Value> {
     let a = p.item_id;
     let head =
         versions::head(tx, a)?.ok_or_else(|| CoreError::NotFound(format!("アイテム {a}")))?;
@@ -1435,10 +1544,7 @@ fn commit_save_as(tx: &Connection, p: &Prepared, go: &Go, now: i64) -> Result<se
             owner.id
         )));
     }
-    let (title, stem) = p
-        .names
-        .as_ref()
-        .ok_or_else(|| CoreError::Invalid("別名で保存の名前がありません".into()))?;
+    let (title, stem) = names;
     let original_name = format!("{stem}.{}", go.ext);
     let info = MediaInfo {
         width: p.media.width,
@@ -1476,10 +1582,21 @@ fn commit_save_as(tx: &Connection, p: &Prepared, go: &Go, now: i64) -> Result<se
     .execute(params![b, a])?;
     // B の版 0 は A の元（ファイルを共有する。決定 1）
     versions::insert_original(tx, b, &p.original, &p.decoded, now)?;
-    let doc_id = store::doc_id_by_digest(tx, &p.doc)?
-        .ok_or_else(|| CoreError::NotFound(format!("保存する文書 {}", p.doc)))?;
+    let doc_id = store::doc_id_by_digest(tx, doc)?
+        .ok_or_else(|| CoreError::NotFound(format!("保存する文書 {doc}")))?;
     let anchor_id = anchor_row(tx, p, go, now)?;
     let vid = add_head(tx, p, go, b, 1, 0, doc_id, anchor_id, now)?;
+    // A の下書き：保存した文書と同じなら消す（上書きと同じ規則。A の今は変わらないので、土台は A の頭のまま）
+    drafts::settle_after_save(
+        tx,
+        a,
+        Some(doc_id),
+        p.job,
+        Base {
+            hash: head.hash,
+            version: head.version,
+        },
+    )?;
     tx.prepare_cached(
         "INSERT INTO item_tags (tag_id, item_id, source) SELECT tag_id, ?2, source FROM item_tags WHERE item_id = ?1",
     )?

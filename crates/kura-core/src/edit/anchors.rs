@@ -87,6 +87,23 @@ pub fn find(
     }))
 }
 
+/// 行の ID でアンカーを引く（版の入力の `anchor_id` から。なければ None）。
+pub fn get(conn: &Connection, id: i64) -> Result<Option<Anchor>> {
+    let source: Option<(Vec<u8>, Vec<u8>)> = conn
+        .prepare_cached("SELECT source_hash, options_digest FROM edit_anchors WHERE id = ?1")?
+        .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()?;
+    let Some((source, options_digest)) = source else {
+        return Ok(None);
+    };
+    let to32 = |v: Vec<u8>| {
+        <[u8; 32]>::try_from(v.as_slice()).map_err(|_| {
+            CoreError::Invalid(format!("アンカー {id} の鍵が 32 バイトではありません"))
+        })
+    };
+    find(conn, &to32(source)?, &to32(options_digest)?)
+}
+
 /// 足すアンカー（ファイルは置いてある）。
 pub(crate) struct NewAnchor<'a> {
     pub source: [u8; 32],

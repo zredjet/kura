@@ -447,10 +447,19 @@ pub fn doc_of(conn: &Connection, engine: &Engine, item_id: i64, version: i64) ->
     }
 }
 
-/// 版の不変条件を照らし、破れているものを文で返す（空なら正しい。docs/data-model.md §3 の item_versions の注）：
-/// 版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。版 0 と頭は hold、ほかの版は hold でない。頭の output_hash・ext は
-/// items.hash・ext に等しい。released でない行の file_blob_id が指す台帳の行の hash は output_hash と同じ。
-/// 版の表を走査する（テストと整合性の確かめで呼ぶ。起動の道では呼ばない）。
+/// 版・入力・アンカー・下書きの不変条件を照らし、破れているものを文で返す（空なら正しい。docs/data-model.md §4
+/// 「保存と版（M12）」の不変条件）：
+/// - 版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。版 0 と頭は hold、ほかの版は hold でない。頭の output_hash・ext は
+///   items.hash・ext に等しい。released でない行の file_blob_id が指す台帳の行の hash は output_hash と同じ。
+/// - 版 0 でない版の土台は 1 つ前の版（`base_version = version - 1`）。文書を持つ版の文書は根（doc）の部品。
+/// - 描いた版（edit）は入力 0（Primary）の行を持つ。
+/// - 戻した版（revert）は戻した先の版がそのアイテムにあり（`revert_to < version`）、文書・値のダイジェスト・入力の数が
+///   戻した先と同じ。
+/// - 入力の `anchor_id` はアンカーの行を指し、アンカーは台帳の行を持ち、元が入力の元と同じ。どの入力からも参照されない
+///   アンカーはない（ゴミ箱を空にする処理が片付ける）。
+/// - 下書きの文書は根の部品。版・下書きの文書は部品をつなぎ直せる（ダイジェストを照らす）。
+///
+/// 表を走査する（テストと整合性の確かめ・crash-loop で呼ぶ。起動の道では呼ばない）。
 pub fn check_invariants(conn: &Connection) -> Result<Vec<String>> {
     let mut out = Vec::new();
     // 版の並び（全件の走査。意図したもの）
@@ -519,7 +528,146 @@ pub fn check_invariants(conn: &Connection) -> Result<Vec<String>> {
             "アイテム {item}：版 {version} の file_blob_id が出力の台帳の行を指していません"
         ));
     }
+    check_lineage(conn, &mut out)?;
+    check_inputs_and_anchors(conn, &mut out)?;
+    check_docs(conn, &mut out)?;
     Ok(out)
+}
+
+/// (アイテム, 版) の組を返す問い合わせを回し、組ごとに `say` の文を足す。
+fn report_pairs(
+    conn: &Connection,
+    sql: &str,
+    out: &mut Vec<String>,
+    say: impl Fn(i64, i64) -> String,
+) -> Result<()> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (a, b) = row?;
+        out.push(say(a, b));
+    }
+    Ok(())
+}
+
+/// 版の系譜：土台は 1 つ前の版、戻した版は戻した先と文書・値・入力の数が同じ、描いた版は入力 0 を持つ。
+fn check_lineage(conn: &Connection, out: &mut Vec<String>) -> Result<()> {
+    report_pairs(
+        conn,
+        "SELECT item_id, version FROM item_versions
+          WHERE kind <> 'original' AND base_version IS NOT version - 1",
+        out,
+        |item, v| format!("アイテム {item}：版 {v} の土台が 1 つ前の版ではありません"),
+    )?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT v.item_id, v.version, v.revert_to, t.id IS NULL,
+                t.doc_id IS NOT v.doc_id, t.value_digest IS NOT v.value_digest,
+                (SELECT count(*) FROM item_version_inputs n WHERE n.version_id = v.id)
+                  <> (SELECT count(*) FROM item_version_inputs n WHERE n.version_id = t.id)
+           FROM item_versions v
+           LEFT JOIN item_versions t ON t.item_id = v.item_id AND t.version = v.revert_to
+          WHERE v.kind = 'revert'",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, bool>(3)?,
+            r.get::<_, bool>(4)?,
+            r.get::<_, bool>(5)?,
+            r.get::<_, Option<bool>>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (item, v, to, missing, doc, digest, inputs) = row?;
+        let to = to.map_or_else(|| "?".to_string(), |t| t.to_string());
+        if missing {
+            out.push(format!(
+                "アイテム {item}：版 {v} が戻した先の版 {to} がありません"
+            ));
+            continue;
+        }
+        for (broken, what) in [
+            (doc, "文書"),
+            (digest, "値のダイジェスト"),
+            (inputs.unwrap_or(true), "入力の数"),
+        ] {
+            if broken {
+                out.push(format!(
+                    "アイテム {item}：版 {v} の{what}が、戻した先の版 {to} と違います"
+                ));
+            }
+        }
+    }
+    report_pairs(
+        conn,
+        "SELECT v.item_id, v.version FROM item_versions v
+          WHERE v.kind = 'edit' AND NOT EXISTS (
+                SELECT 1 FROM item_version_inputs n
+                 WHERE n.version_id = v.id AND n.input = 0 AND n.role = 'primary')",
+        out,
+        |item, v| format!("アイテム {item}：描いた版 {v} に入力 0（元）の記録がありません"),
+    )
+}
+
+/// 入力とアンカー：入力のアンカーは台帳の行を持ち元が同じ、どの入力からも参照されないアンカーはない。
+fn check_inputs_and_anchors(conn: &Connection, out: &mut Vec<String>) -> Result<()> {
+    report_pairs(
+        conn,
+        "SELECT v.item_id, v.version FROM item_version_inputs n
+           JOIN item_versions v ON v.id = n.version_id
+           LEFT JOIN edit_anchors a ON a.id = n.anchor_id
+           LEFT JOIN blobs b ON b.id = a.blob_id
+          WHERE n.anchor_id IS NOT NULL
+            AND (a.id IS NULL OR b.id IS NULL OR a.source_hash <> n.source_hash)",
+        out,
+        |item, v| {
+            format!(
+                "アイテム {item}：版 {v} の入力のアンカーが、台帳の行か同じ元のアンカーを指していません"
+            )
+        },
+    )?;
+    report_pairs(
+        conn,
+        "SELECT a.id, a.blob_id FROM edit_anchors a
+          WHERE NOT EXISTS (SELECT 1 FROM item_version_inputs n WHERE n.anchor_id = a.id)",
+        out,
+        |id, _| format!("アンカー {id} がどの版の入力からも参照されていません"),
+    )
+}
+
+/// 版・下書きの文書：根（doc）の部品を指し、部品をつなぎ直せる（本文からダイジェストを求め直して照らす）。
+fn check_docs(conn: &Connection, out: &mut Vec<String>) -> Result<()> {
+    report_pairs(
+        conn,
+        "SELECT v.item_id, v.version FROM item_versions v LEFT JOIN edit_objects o ON o.id = v.doc_id
+          WHERE v.doc_id IS NOT NULL AND (o.id IS NULL OR o.kind <> 'doc')",
+        out,
+        |item, v| format!("アイテム {item}：版 {v} の文書が根の部品ではありません"),
+    )?;
+    report_pairs(
+        conn,
+        "SELECT d.item_id, d.doc_id FROM edit_drafts d LEFT JOIN edit_objects o ON o.id = d.doc_id
+          WHERE o.id IS NULL OR o.kind <> 'doc'",
+        out,
+        |item, _| format!("アイテム {item}：下書きの文書が根の部品ではありません"),
+    )?;
+    let docs: Vec<i64> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT v.doc_id FROM item_versions v JOIN edit_objects o ON o.id = v.doc_id AND o.kind = 'doc'
+             UNION
+             SELECT d.doc_id FROM edit_drafts d JOIN edit_objects o ON o.id = d.doc_id AND o.kind = 'doc'",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    for doc in docs {
+        if let Err(e) = store::load_doc_bytes(conn, doc) {
+            out.push(format!("文書（部品 {doc}）をつなぎ直せません：{e}"));
+        }
+    }
+    Ok(())
 }
 
 /// 版 0（元）を足す（呼び手のトランザクションの中で。最初の保存と、別名で保存した新しいアイテム）。ファイルは `original` の
@@ -795,6 +943,116 @@ mod tests {
         let found = check_invariants(&conn).unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("file_blob_id"), "{found:?}");
+    }
+
+    /// 系譜・入力・アンカー・文書の破れ：土台が 1 つ前でない、描いた版に入力がない、戻した版の先がない・文書が違う、入力の
+    /// アンカーの元が違う、参照されないアンカー、下書き・版の文書が根でない・つなぎ直せない。
+    #[test]
+    fn check_invariants_reports_lineage_input_anchor_and_doc_breaks() {
+        use crate::edit::testing::insert_anchor;
+        let found_one = |conn: &Connection, needle: &str| {
+            let found = check_invariants(conn).unwrap();
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].contains(needle), "{found:?}");
+        };
+        let setup = || {
+            let conn = test_conn();
+            let a = insert_item(&conn, 1, [1; 32]);
+            insert_version(&conn, a, 0, [5; 32], "hold", None);
+            insert_version(&conn, a, 1, [6; 32], "waiting", None);
+            insert_version(&conn, a, 2, [1; 32], "hold", None);
+            assert!(check_invariants(&conn).unwrap().is_empty());
+            (conn, a)
+        };
+        let (conn, _) = setup();
+        conn.execute(
+            "UPDATE item_versions SET base_version = 0 WHERE version = 2",
+            [],
+        )
+        .unwrap();
+        found_one(&conn, "土台が 1 つ前の版ではありません");
+
+        let (conn, _) = setup();
+        conn.execute(
+            "DELETE FROM item_version_inputs WHERE version_id = (SELECT id FROM item_versions WHERE version = 1)",
+            [],
+        )
+        .unwrap();
+        found_one(&conn, "入力 0（元）の記録がありません");
+
+        // 版 2 を「版 1 に戻した版」にする：文書・値・入力の数が版 1 と同じなら破れなし、文書が違えば破れ
+        let (conn, _) = setup();
+        conn.execute(
+            "UPDATE item_versions SET kind = 'revert', revert_to = 1,
+                    doc_id = (SELECT doc_id FROM item_versions WHERE version = 1) WHERE version = 2",
+            [],
+        )
+        .unwrap();
+        assert!(check_invariants(&conn).unwrap().is_empty());
+        conn.execute(
+            "UPDATE item_versions SET doc_id = NULL WHERE version = 2",
+            [],
+        )
+        .unwrap();
+        found_one(&conn, "文書が、戻した先の版 1 と違います");
+        conn.execute(
+            "UPDATE item_versions SET doc_id = (SELECT doc_id FROM item_versions WHERE version = 1),
+                    value_digest = x'0101010101010101010101010101010101010101010101010101010101010101'
+              WHERE version = 2",
+            [],
+        )
+        .unwrap();
+        found_one(&conn, "値のダイジェストが、戻した先の版 1 と違います");
+
+        // アンカー：入力が使うアンカーの元が違う・どの入力も使わないアンカー
+        let (conn, a) = setup();
+        let anchor = insert_anchor(&conn, [5; 32], [11; 32]);
+        insert_version(&conn, a, 3, [1; 32], "hold", Some(anchor));
+        conn.execute(
+            "UPDATE item_versions SET file_state = 'released', file_blob_id = NULL, replaced_at = 5 WHERE version = 2",
+            [],
+        )
+        .unwrap();
+        assert!(check_invariants(&conn).unwrap().is_empty());
+        conn.execute("UPDATE edit_anchors SET source_hash = x'09'", [])
+            .unwrap();
+        found_one(&conn, "同じ元のアンカーを指していません");
+        let (conn, _) = setup();
+        insert_anchor(&conn, [5; 32], [12; 32]);
+        found_one(&conn, "どの版の入力からも参照されていません");
+
+        // 下書き：根でない部品・つなぎ直せない文書
+        let draft = |conn: &Connection, item: i64, doc: i64| {
+            conn.execute(
+                "INSERT OR REPLACE INTO edit_drafts (item_id, doc_id, base_hash, base_version, updated_at)
+                 VALUES (?1, ?2, x'00', 2, 1)",
+                params![item, doc],
+            )
+            .unwrap();
+        };
+        let (conn, a) = setup();
+        let mut g = Graph::new_single();
+        g.push_linear(
+            "image.flip",
+            1,
+            serde_json::json!({ "axis": "vertical" }),
+            0,
+        )
+        .unwrap();
+        let root = store::put_doc(&conn, &kura_engine::doc_parts::split(&g).unwrap(), 1).unwrap();
+        draft(&conn, a, root);
+        assert!(check_invariants(&conn).unwrap().is_empty());
+        let node: i64 = conn
+            .query_row("SELECT id FROM edit_objects WHERE kind = 'node'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        draft(&conn, a, node);
+        found_one(&conn, "下書きの文書が根の部品ではありません");
+        draft(&conn, a, root);
+        conn.execute("DELETE FROM edit_edges WHERE parent_id = ?1", [root])
+            .unwrap();
+        found_one(&conn, "つなぎ直せません");
     }
 
     /// 頭でなくなる版は、出力が新しい頭か元と同じならすぐ released（台帳の行を指さない）、ほかは waiting。

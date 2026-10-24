@@ -1,5 +1,5 @@
-//! テストの補助：版・アンカーの行を入れる（保存のジョブ（段 2 の B）ができるまで、重複の判定とゴミ箱を空にする処理の試験に
-//! 使う）。版の行の不変条件（版 0 は original、頭は hold、hold・waiting・kept は出力の台帳の行を指す）に沿って入れる。
+//! テストの補助：版・アンカーの行を入れる（重複の判定・ゴミ箱を空にする処理・下書き・不変条件の試験に使う）。版の行の不変条件
+//! （版 0 は original、頭は hold、hold・waiting・kept は出力の台帳の行を指す、描いた版は入力 0 を持つ）に沿って入れる。
 
 use kura_engine::Graph;
 use kura_engine::doc_parts::split;
@@ -43,8 +43,9 @@ pub(crate) fn insert_version(
     insert_version_with(conn, item_id, version, output, "png", 1, file_state, anchor)
 }
 
-/// 版の行を入れる。版 0 は original、ほかは edit（空の文書の部品を置いて指す）。released でなければ出力の台帳の行を指し
-/// （なければ `ledger::register` で載せる）、hold でなければ置き換えの時刻を持つ。`anchor` があれば入力 0 にアンカーを付ける。
+/// 版の行を入れる。版 0 は original、ほかは edit（空の文書の部品を置いて指し、入力 0 の行を持つ）。released でなければ出力の
+/// 台帳の行を指し（なければ `ledger::register` で載せる）、hold でなければ置き換えの時刻を持つ。`anchor` があれば入力 0 に
+/// アンカーを付ける。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn insert_version_with(
     conn: &Connection,
@@ -87,11 +88,16 @@ pub(crate) fn insert_version_with(
             |r| r.get(0),
         )
         .unwrap();
-    if let Some(anchor) = anchor {
+    if version != 0 {
+        // 描いた版は入力 0（元）を持つ（不変条件）。元はアンカーの元か、なければ版 0 の出力
         conn.execute(
             "INSERT INTO item_version_inputs (version_id, input, role, source_hash, value_digest, recorded, anchor_id)
-             VALUES (?1, 0, 'primary', x'00', x'00', '{}', ?2)",
-            params![id, anchor],
+             VALUES (?1, 0, 'primary',
+                     coalesce((SELECT source_hash FROM edit_anchors WHERE id = ?2),
+                              (SELECT output_hash FROM item_versions WHERE item_id = ?3 AND version = 0),
+                              zeroblob(32)),
+                     zeroblob(32), '{}', ?2)",
+            params![id, anchor, item_id],
         )
         .unwrap();
     }

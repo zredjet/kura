@@ -1,6 +1,6 @@
-//! 保存のジョブの受け入れテスト（docs/editing.md §14.1 の S1・S2・S5〜S9・S14・S15 の前半と、M12 の段 2 の決定 9〜12）。
-//! 固定の段のコーデック（と偽の Platform のデコーダ）と偽のエンジンの部品で、Linux でも回る。どのテストも終わりに
-//! [`assert_consistent`]（整合性・予告・staging・版の不変条件・ジョブ）で締める。
+//! 保存のジョブの受け入れテスト（docs/editing.md §14.1 の S1〜S9・S14・S15・S17 と、M12 の段 2 の決定 9〜12、版に戻す・
+//! 下書き・中止・門の間の Conflict）。固定の段のコーデック（と偽の Platform のデコーダ）と偽のエンジンの部品で、Linux でも
+//! 回る。どのテストも終わりに [`assert_consistent`]（整合性・予告・staging・版の不変条件・ジョブ）で締める。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -17,10 +17,10 @@ use kura_engine::{Digest, Engine, Graph, NoMonitor};
 use rusqlite::params;
 use serde_json::{Value as Json, json};
 
-use super::save::{Base, EditHandler, Fault, SaveAction, SaveRequest, start_save};
+use super::save::{Base, EditHandler, Fault, Hook, SaveAction, SaveRequest, Stage, start_save};
 use super::services::fake::FakeEngineFactory;
 use super::versions::{self, FileState, Head, Version, VersionKind};
-use super::{ENGINE_WORK_DIR, EngineServices};
+use super::{ENGINE_WORK_DIR, EngineServices, drafts};
 use crate::import::{ImportInput, ImportOptions, ImportResult, hash_file, start_import};
 use crate::jobs::{EventSink, JobEvent, JobKind, JobManager, JobRecord, JobState};
 use crate::library::{
@@ -279,6 +279,7 @@ struct Env {
     lib: Arc<Library>,
     jobs: JobManager,
     events: Arc<Mutex<Vec<JobEvent>>>,
+    engine: Arc<EngineServices>,
 }
 
 impl Env {
@@ -287,15 +288,31 @@ impl Env {
     }
 
     fn with(factory: FakeEngineFactory, fault: Option<Fault>) -> Self {
+        Self::build(factory, fault, |_| None)
+    }
+
+    /// 段ごとの割り込み（`hook` はライブラリを受け取って作る）つきのもの。
+    fn with_hook(hook: impl FnOnce(&Arc<Library>) -> Hook) -> Self {
+        Self::build(FakeEngineFactory::default(), None, |lib| Some(hook(lib)))
+    }
+
+    fn build(
+        factory: FakeEngineFactory,
+        fault: Option<Fault>,
+        hook: impl FnOnce(&Arc<Library>) -> Option<Hook>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let lib = Arc::new(Library::create(&dir.path().join("L")).unwrap());
         let engine = Arc::new(EngineServices::new(
             Arc::new(factory),
             lib.layout().staging_dir().join(ENGINE_WORK_DIR),
         ));
-        let mut handler = EditHandler::new(engine);
+        let mut handler = EditHandler::new(engine.clone());
         if let Some(fault) = fault {
             handler = handler.with_fault(fault);
+        }
+        if let Some(hook) = hook(&lib) {
+            handler = handler.with_hook(hook);
         }
         let events = Arc::new(Mutex::new(Vec::new()));
         let jobs = JobManager::new(
@@ -310,7 +327,16 @@ impl Env {
             lib,
             jobs,
             events,
+            engine,
         }
+    }
+
+    fn revert(&self, item_id: i64, to: i64) -> JobRecord {
+        self.save(
+            item_id,
+            base_of(&self.lib, item_id),
+            SaveAction::Revert { to },
+        )
     }
 
     fn png(&self, seed: u64) -> (i64, [u8; 32], Vec<u8>) {
@@ -862,25 +888,31 @@ fn saving_a_trashed_item_is_a_conflict() {
     assert_consistent(&env.lib);
 }
 
-/// 元に戻す保存は段 2 の C で足す（今は積まずに Unsupported）。
+/// 版に戻す先は積む前に確かめる：まだ保存していないアイテム・頭の版・負の版は Invalid、ないアイテムは NotFound（積まない）。
 #[test]
-fn revert_is_not_yet_supported() {
+fn revert_targets_are_checked_before_queueing() {
     let env = Env::new();
     let (a, h0, _) = env.png(9);
-    let err = start_save(
-        env.lib.db(),
-        &env.jobs,
-        &SaveRequest {
-            item_id: a,
-            base: Base {
-                hash: h0,
-                version: 0,
+    let start = |item_id: i64, to: i64, version: i64| {
+        start_save(
+            env.lib.db(),
+            &env.jobs,
+            &SaveRequest {
+                item_id,
+                base: Base { hash: h0, version },
+                action: SaveAction::Revert { to },
             },
-            action: SaveAction::Revert { to: 0 },
-        },
-    )
-    .unwrap_err();
-    assert!(matches!(err, CoreError::Unsupported(_)), "{err}");
+        )
+    };
+    let err = start(a, 0, 0).unwrap_err();
+    assert!(matches!(err, CoreError::Invalid(_)), "{err}");
+    assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
+    for to in [1, 2, -1] {
+        let err = start(a, to, 1).unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(_)), "{to}: {err}");
+    }
+    let err = start(999, 0, 1).unwrap_err();
+    assert!(matches!(err, CoreError::NotFound(_)), "{err}");
     let err = start_save(
         env.lib.db(),
         &env.jobs,
@@ -897,7 +929,12 @@ fn revert_is_not_yet_supported() {
     )
     .unwrap_err();
     assert!(matches!(err, CoreError::NotFound(_)), "{err}");
-    assert_eq!(env.count("SELECT count(*) FROM jobs"), 0);
+    assert_eq!(
+        env.count("SELECT count(*) FROM jobs"),
+        1,
+        "上書きの 1 本だけ"
+    );
+    assert_consistent(&env.lib);
 }
 
 // ---- S7：出力が別のアイテムと同じ中身 ----
@@ -1393,4 +1430,737 @@ fn a_save_that_crashed_while_decoding_fails_once() {
     assert_done(&env.jobs.get(job).unwrap());
     assert_eq!(states(&env.lib, a).len(), 3);
     assert_consistent(&env.lib);
+}
+
+// ---- S3・S4：版に戻す ----
+
+fn inputs_of(lib: &Library, version_id: i64) -> Vec<versions::VersionInput> {
+    lib.db().read(|c| versions::inputs(c, version_id)).unwrap()
+}
+
+fn items_row(lib: &Library, id: i64) -> (String, Option<String>, i64, i64, String, String, String) {
+    lib.db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT mime, codec_info, width, height, title, original_name, thumb_state FROM items WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )?)
+        })
+        .unwrap()
+}
+
+/// S3：2 回上書きしてから元に戻すと、今が元とバイト単位で同じになる。版 3 は revert（戻した先 0・文書なし・値は版 0 と同じ・
+/// 入力なし・ファイルは版 0 と同じ台帳の行）、前の今（版 2）は消し待ち、版 0・3 は保持。アイテムの列（mime・codec_info・幅・
+/// 高さ）は版 0 のものに戻り、表示名・元のファイル名・所属・素材の設定は変わらない。元はいつも版 0 が持つので描かない。
+#[test]
+fn s3_revert_to_original_restores_bytes() {
+    let env = Env::new();
+    let (a, h0, png) = env.png(20);
+    decorate(&env.lib, a);
+    env.lib
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                r#"UPDATE items SET codec_info = '{"bitDepth":8}' WHERE id = ?1"#,
+                [a],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let before = memberships(&env.lib, a);
+    assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
+    assert_eq!(items_row(&env.lib, a).1, None, "上書きで codec_info は空");
+    assert_done(&env.overwrite(a, doc(&[flip("vertical"), flip("horizontal")], None)));
+    let h2 = head(&env.lib, a).hash;
+    let record = env.revert(a, 0);
+    assert_done(&record);
+    let result = result_of(&record);
+    assert_eq!(result["outcome"], "saved");
+    assert_eq!(result["version"], 3);
+    assert_eq!(
+        result["revert"],
+        json!({ "to": 0, "reused": true, "rebuilt": false })
+    );
+    let h = head(&env.lib, a);
+    assert_eq!((h.hash, h.ext.as_str(), h.version), (h0, "png", 3));
+    assert_eq!(
+        std::fs::read(env.lib.layout().content_path(&h0, "png")).unwrap(),
+        png
+    );
+    assert_eq!(
+        states(&env.lib, a),
+        vec![
+            (0, FileState::Hold),
+            (1, FileState::Waiting),
+            (2, FileState::Waiting),
+            (3, FileState::Hold)
+        ]
+    );
+    let vs = versions_of(&env.lib, a);
+    assert_eq!(
+        (
+            vs[3].kind,
+            vs[3].revert_to,
+            vs[3].doc_id,
+            vs[3].base_version,
+            vs[3].job_id
+        ),
+        (VersionKind::Revert, Some(0), None, Some(2), Some(record.id))
+    );
+    assert_eq!(vs[3].value_digest, vs[0].value_digest);
+    assert_eq!(vs[3].file_blob_id, vs[0].file_blob_id);
+    assert!(inputs_of(&env.lib, vs[3].id).is_empty());
+    assert_eq!(
+        vs[3].record().unwrap().revert,
+        Some(versions::RevertRecord {
+            to: 0,
+            reused: true,
+            rebuilt: false
+        })
+    );
+    let (mime, codec_info, w, hgt, title, name, thumb) = items_row(&env.lib, a);
+    assert_eq!(
+        (
+            mime.as_str(),
+            codec_info.as_deref(),
+            w,
+            hgt,
+            title.as_str(),
+            name.as_str(),
+            thumb.as_str()
+        ),
+        (
+            "image/png",
+            Some(r#"{"bitDepth":8}"#),
+            24,
+            20,
+            "絵20",
+            "絵20.png",
+            "pending"
+        )
+    );
+    assert_eq!(memberships(&env.lib, a), before);
+    assert!(
+        env.lib.layout().content_path(&h2, "png").exists(),
+        "版 2 は猶予中"
+    );
+    assert_consistent(&env.lib);
+}
+
+/// S4：猶予中の版 1 に戻すと、そのファイルを使い直す（描かない・ファイルを足さない・版 1 の状態は変えない）。戻した版は
+/// 版 1 の文書・値・入力・書き出しの記録を写す。もう一度版 1 に戻すと今と同じ中身なので版だけ足す（前の頭は released）。
+#[test]
+fn s4_revert_reuses_waiting_file() {
+    let env = Env::new();
+    let (a, _, _) = env.png(21);
+    assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
+    let h1 = head(&env.lib, a).hash;
+    assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
+    let files_before = files(&env.lib);
+    let record = env.revert(a, 1);
+    assert_done(&record);
+    let result = result_of(&record);
+    assert_eq!(
+        result["revert"],
+        json!({ "to": 1, "reused": true, "rebuilt": false })
+    );
+    assert_eq!(head(&env.lib, a).hash, h1);
+    assert_eq!(files(&env.lib), files_before, "ファイルを足さない");
+    assert_eq!(
+        states(&env.lib, a),
+        vec![
+            (0, FileState::Hold),
+            (1, FileState::Waiting),
+            (2, FileState::Waiting),
+            (3, FileState::Hold)
+        ]
+    );
+    let vs = versions_of(&env.lib, a);
+    assert_eq!(
+        vs[3].file_blob_id, vs[1].file_blob_id,
+        "版 1 と同じ台帳の行"
+    );
+    assert_eq!(
+        (vs[3].doc_id, vs[3].value_digest, vs[3].revert_to),
+        (vs[1].doc_id, vs[1].value_digest, Some(1))
+    );
+    assert_eq!(
+        inputs_of(&env.lib, vs[3].id),
+        inputs_of(&env.lib, vs[1].id),
+        "入力は版 1 の写し"
+    );
+    assert_eq!(
+        vs[3].record().unwrap().encoded,
+        vs[1].record().unwrap().encoded
+    );
+    let record = env.revert(a, 1);
+    assert_done(&record);
+    assert_eq!(result_of(&record)["outcome"], "unchanged");
+    assert_eq!(
+        states(&env.lib, a),
+        vec![
+            (0, FileState::Hold),
+            (1, FileState::Waiting),
+            (2, FileState::Waiting),
+            (3, FileState::Released),
+            (4, FileState::Hold)
+        ]
+    );
+    assert_consistent(&env.lib);
+}
+
+/// S4：版 1 のファイルが GC で消えたあとに版 1 に戻すと、版 1 の文書と入力の記録から作り直し、値のダイジェストが記録と同じ
+/// （記録のエンコーダで書くので、バイト列も版 1 と同じ）。版 1 は released のまま、戻した版が台帳の行を持つ。
+#[test]
+fn s4_revert_rebuilds_after_gc() {
+    let env = Env::new();
+    let (a, _, png) = env.png(22);
+    let g1 = doc(&[flip("vertical")], None);
+    assert_done(&env.overwrite(a, g1.clone()));
+    let v1 = versions_of(&env.lib, a)[1].clone();
+    let path1 = env.lib.layout().content_path(&v1.output_hash, "png");
+    let bytes1 = std::fs::read(&path1).unwrap();
+    assert_eq!(bytes1, render_png(&png, &g1));
+    assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
+    simulate_gc(&env.lib, a, 1);
+    assert!(!path1.exists());
+    let record = env.revert(a, 1);
+    assert_done(&record);
+    let result = result_of(&record);
+    assert_eq!(
+        result["revert"],
+        json!({ "to": 1, "reused": false, "rebuilt": true })
+    );
+    assert_eq!(result["hash"], hex(&v1.output_hash));
+    assert_eq!(result["warnings"], json!([]));
+    assert_eq!(std::fs::read(&path1).unwrap(), bytes1, "同じバイト列");
+    let vs = versions_of(&env.lib, a);
+    assert_eq!(
+        (vs[3].output_hash, vs[3].value_digest, vs[3].doc_id),
+        (v1.output_hash, v1.value_digest, v1.doc_id)
+    );
+    assert_eq!(
+        states(&env.lib, a),
+        vec![
+            (0, FileState::Hold),
+            (1, FileState::Released),
+            (2, FileState::Waiting),
+            (3, FileState::Hold)
+        ]
+    );
+    let r3 = vs[3].record().unwrap();
+    assert_eq!(r3.encoded.unwrap().codec, "png-rs-enc/1");
+    assert_eq!(r3.revert.map(|r| r.rebuilt), Some(true));
+    assert_consistent(&env.lib);
+}
+
+/// 作り直した値が版の記録と違えば戻さない（Mismatch）。版・ファイル・台帳は変わらず、staging も予告も空。
+#[test]
+fn revert_rebuild_that_does_not_match_the_record_is_refused() {
+    let env = Env::new();
+    let (a, _, _) = env.png(23);
+    assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
+    assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
+    simulate_gc(&env.lib, a, 1);
+    // 版 1 の値の記録を、作り直しと合わない値にする（デコーダ・エンジンの変化で記録と違う値になった場合を写す）
+    env.lib
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE item_versions SET value_digest = ?1 WHERE item_id = ?2 AND version = 1",
+                params![&[7u8; 32][..], a],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let before = snapshot(&env.lib);
+    let record = env.revert(a, 1);
+    assert_eq!(record.state, JobState::Failed, "{:?}", record.message);
+    assert_eq!(
+        record.error_code.as_deref(),
+        Some("Mismatch"),
+        "{:?}",
+        record.message
+    );
+    assert_eq!(snapshot(&env.lib), before);
+    assert_eq!(head(&env.lib, a).version, 2);
+    assert_consistent(&env.lib);
+}
+
+/// 戻す先の中身が別のアイテムの今と同じなら Conflict（上書きと同じ規則。items.hash は一意）。何も変わらない。
+#[test]
+fn revert_to_contents_another_item_holds_is_a_conflict() {
+    let env = Env::new();
+    let (a, _, png) = env.png(24);
+    let g1 = doc(&[flip("vertical")], None);
+    assert_done(&env.overwrite(a, g1.clone()));
+    let h1 = head(&env.lib, a).hash;
+    assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
+    let (_, hb) = add_item(&env.lib, &render_png(&png, &g1), "png", "写し");
+    assert_eq!(hb, h1);
+    let before = snapshot(&env.lib);
+    let record = env.revert(a, 1);
+    assert_conflict(&record);
+    assert_eq!(snapshot(&env.lib), before);
+    assert_consistent(&env.lib);
+}
+
+// ---- 門の間の Conflict・中止・一時停止 ----
+
+/// 置いたあと・トランザクション 2 の前にゴミ箱に入れられたら（台帳の門はゴミ箱に入れる操作を止めない）、保存は Conflict に
+/// なり、置いたファイル（台帳にないもの）と予告が片付く。
+#[test]
+fn trashed_between_placement_and_commit_cleans_up_placed_files() {
+    let env = Env::with_hook(|lib| {
+        let lib = lib.clone();
+        Arc::new(move |stage| {
+            if stage == Stage::Placed {
+                lib.db()
+                    .write(|tx| {
+                        let ids: Vec<i64> = {
+                            let mut stmt = tx.prepare("SELECT id FROM items")?;
+                            let rows = stmt.query_map([], |r| r.get(0))?;
+                            rows.collect::<rusqlite::Result<_>>()?
+                        };
+                        crate::items::trash(tx, &ids, 5).map(|_| ())
+                    })
+                    .unwrap();
+            }
+        })
+    });
+    let (a, _, png) = env.png(25);
+    let graph = doc(&[flip("vertical")], None);
+    let out = hash_of(&render_png(&png, &graph));
+    let before = snapshot(&env.lib);
+    let record = env.overwrite(a, graph);
+    assert_conflict(&record);
+    assert!(head(&env.lib, a).trashed);
+    assert_eq!(snapshot(&env.lib), before);
+    assert!(!env.lib.layout().content_path(&out, "png").exists());
+    assert_eq!(check_files(env.lib.db(), env.lib.layout()).unwrap(), (0, 0));
+    assert_consistent(&env.lib);
+}
+
+/// 段 5 の終わり（書いて staging に置いたところ）で一時停止・中止が来ると、staging を消して止まり、版・ファイル・台帳・予告に
+/// 何も残らない。一時停止したものは、続けると初めからやり直して保存する。上書きと、版に戻す作り直しで確かめる。
+#[test]
+fn cancel_or_pause_after_writing_leaves_nothing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    for (rebuild, pause) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (reached_tx, reached_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let armed = Arc::new(AtomicBool::new(false));
+        let env = Env::with_hook({
+            let armed = armed.clone();
+            move |_| {
+                let (reached, go) = (Mutex::new(reached_tx), Mutex::new(go_rx));
+                Arc::new(move |stage| {
+                    if stage == Stage::Written && armed.swap(false, Ordering::SeqCst) {
+                        reached.lock().unwrap().send(()).unwrap();
+                        let _ = go.lock().unwrap().recv();
+                    }
+                })
+            }
+        });
+        let (a, _, _) = env.png(26);
+        let action = if rebuild {
+            assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
+            assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
+            simulate_gc(&env.lib, a, 1);
+            SaveAction::Revert { to: 1 }
+        } else {
+            SaveAction::Overwrite {
+                graph: doc(&[flip("vertical")], None),
+            }
+        };
+        let versions_before = versions_of(&env.lib, a).len();
+        let before = snapshot(&env.lib);
+        armed.store(true, Ordering::SeqCst);
+        let id = env.start(a, base_of(&env.lib, a), action);
+        reached_rx.recv_timeout(WAIT).unwrap();
+        if pause {
+            env.jobs.pause(id).unwrap();
+        } else {
+            env.jobs.cancel(id).unwrap();
+        }
+        go_tx.send(()).unwrap();
+        assert!(env.jobs.wait_idle(WAIT));
+        let record = env.jobs.get(id).unwrap();
+        let want = if pause {
+            JobState::Paused
+        } else {
+            JobState::Canceled
+        };
+        assert_eq!(record.state, want, "{rebuild} {pause} {:?}", record.message);
+        assert_eq!(snapshot(&env.lib), before, "{rebuild} {pause}");
+        assert_eq!(staged(&env.lib), Vec::<PathBuf>::new());
+        assert_eq!(env.count("SELECT count(*) FROM ledger_pending"), 0);
+        if pause {
+            env.jobs.resume(id).unwrap();
+            assert!(env.jobs.wait_idle(WAIT));
+            assert_done(&env.jobs.get(id).unwrap());
+            assert_eq!(versions_of(&env.lib, a).len(), versions_before.max(1) + 1);
+        }
+        assert_consistent(&env.lib);
+    }
+}
+
+/// 強制終了したライブラリを、偽のエンジンの部品つきで開き直して（予告の照合・staging の掃除・ジョブの再開）、動き終えるのを
+/// 待つ。ジョブ `job` は running のまま落ちたことにする。
+fn reopen_after_crash(env: Env, job: i64) -> (tempfile::TempDir, LibrarySession) {
+    env.lib
+        .db()
+        .write(move |tx| {
+            tx.execute("UPDATE jobs SET state = 'running' WHERE id = ?1", [job])?;
+            Ok(())
+        })
+        .unwrap();
+    let Env { dir, lib, jobs, .. } = env;
+    drop(jobs);
+    let root = lib.layout().root().to_path_buf();
+    lib.close();
+    drop(lib);
+    let session = LibrarySession::open(
+        &root,
+        Arc::new(|_| {}),
+        Services::new(Arc::new(FakeBackend)).with_engine(Arc::new(FakeEngineFactory::default())),
+    )
+    .unwrap();
+    session.wait_ready();
+    let report = session.integrity().unwrap();
+    assert_eq!((report.orphan_files, report.missing_files), (0, 0));
+    assert!(session.jobs().wait_idle(WAIT));
+    (dir, session)
+}
+
+/// S9 の版に戻す：作り直しを 4 段（描いたあと・予告のあと・置いたあと・コミットのあと）のそれぞれで強制終了しても、開き直すと
+/// 食い違い 0、このジョブの版はちょうど 1 つ、ジョブは done で、今は作り直した版 1 の中身。
+#[test]
+fn revert_rebuild_crash_at_each_stage_recovers() {
+    for at in [
+        Fault::AfterRender,
+        Fault::AfterAnnounce,
+        Fault::AfterPlace,
+        Fault::AfterCommit,
+    ] {
+        let env = Env::new();
+        let (a, _, _) = env.png(27);
+        assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
+        let h1 = head(&env.lib, a).hash;
+        assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
+        simulate_gc(&env.lib, a, 1);
+        // 同じライブラリで、強制終了する保存のジョブに入れ替える
+        let Env {
+            dir,
+            lib,
+            jobs,
+            events,
+            engine,
+        } = env;
+        drop(jobs);
+        let jobs = JobManager::new(
+            lib.clone(),
+            vec![(
+                JobKind::Edit,
+                Arc::new(EditHandler::new(engine.clone()).with_fault(at)),
+            )],
+            sink(&events),
+        )
+        .unwrap();
+        jobs.start().unwrap();
+        let env = Env {
+            dir,
+            lib,
+            jobs,
+            events,
+            engine,
+        };
+        let record = env.revert(a, 1);
+        assert_eq!(record.state, JobState::Failed, "{at:?}");
+        assert_crashed_state(&env, record.id, at, h1);
+        let job = record.id;
+        let (dir, session) = reopen_after_crash(env, job);
+        assert_done(&session.jobs().get(job).unwrap());
+        let lib = session.library();
+        assert_eq!(head(lib, a).hash, h1, "{at:?}");
+        assert_eq!(
+            states(lib, a),
+            vec![
+                (0, FileState::Hold),
+                (1, FileState::Released),
+                (2, FileState::Waiting),
+                (3, FileState::Hold)
+            ],
+            "{at:?}"
+        );
+        assert_eq!(
+            one::<i64>(
+                lib,
+                "SELECT count(*) FROM item_versions WHERE job_id = ?1",
+                job
+            ),
+            1
+        );
+        assert_consistent(lib);
+        drop(session);
+        drop(dir);
+    }
+}
+
+// ---- S15 の後半：アンカーから作り直す ----
+
+fn heic_decoder(drifting: bool) -> Arc<FakePlatformDecoder> {
+    let d = FakePlatformDecoder::new(
+        "fake-heic-dec/1",
+        &["heic"],
+        InputGen::PixelSprite {
+            w: 24,
+            h: 20,
+            fmt: PixelFormat::Rgba8,
+            seed: 15,
+        },
+    );
+    Arc::new(if drifting { d.drifting() } else { d })
+}
+
+/// S15 の後半：OS のデコーダを組から外し、版 1 のファイルを GC で消してから版 1 に戻すと、アンカーから作り直せて照合が合う
+/// （デコーダは呼ばない。出力は版 1 と同じバイト列）。元に戻すと HEIC の元が今になる（版 0 が持つ）。
+#[test]
+fn s15_rebuilds_from_the_anchor_without_the_os_decoder() {
+    let decoder = heic_decoder(true);
+    let mut codecs = CodecSet::pinned();
+    codecs.add_decoder(decoder.clone()).unwrap();
+    let set = Arc::new(Mutex::new(codecs));
+    let env = Env::with(FakeEngineFactory::with_codecs(set.clone()), None);
+    let (a, heic) = add_item(&env.lib, b"fake heic bytes", "heic", "写真");
+    assert_done(&env.overwrite(a, doc(&[flip("vertical")], Some("png"))));
+    let v1 = versions_of(&env.lib, a)[1].clone();
+    let path1 = env.lib.layout().content_path(&v1.output_hash, "png");
+    let bytes1 = std::fs::read(&path1).unwrap();
+    let anchor1 = inputs_of(&env.lib, v1.id)[0].anchor_id;
+    assert!(anchor1.is_some());
+    assert_done(&env.overwrite(a, doc(&[flip("horizontal")], Some("png"))));
+    assert_eq!(decoder.reads(), 1);
+    // デコーダを外す（ツールの場所を変えたときと同じく、組を作り直させる）
+    *set.lock().unwrap() = CodecSet::pinned();
+    env.engine.reload_codecs();
+    simulate_gc(&env.lib, a, 1);
+    assert!(!path1.exists());
+    let record = env.revert(a, 1);
+    assert_done(&record);
+    let result = result_of(&record);
+    assert_eq!(result["revert"]["rebuilt"], true);
+    assert_eq!(result["anchor"], "used");
+    assert_eq!(std::fs::read(&path1).unwrap(), bytes1);
+    assert_eq!(decoder.reads(), 1, "デコーダを呼ばない");
+    let vs = versions_of(&env.lib, a);
+    assert_eq!(vs[3].value_digest, v1.value_digest);
+    assert_eq!(inputs_of(&env.lib, vs[3].id)[0].anchor_id, anchor1);
+    assert_consistent(&env.lib);
+
+    let record = env.revert(a, 0);
+    assert_done(&record);
+    let h = head(&env.lib, a);
+    assert_eq!((h.hash, h.ext.as_str()), (heic, "heic"));
+    assert_eq!(items_row(&env.lib, a).0, "image/heic");
+    assert_consistent(&env.lib);
+}
+
+/// アンカーが壊れていれば、元を記録のデコーダで読めるときは元で読み直して作り直す（値が記録と同じなら戻し、知らせを残す）。
+/// 読み直した値が記録と違えば（読むたびに値の変わるデコーダ）戻さない（Mismatch。何も変わらない）。
+#[test]
+fn revert_falls_back_to_the_original_when_the_anchor_is_broken() {
+    for drifting in [false, true] {
+        let decoder = heic_decoder(drifting);
+        let mut codecs = CodecSet::pinned();
+        codecs.add_decoder(decoder.clone()).unwrap();
+        let env = Env::with(
+            FakeEngineFactory::with_codecs(Arc::new(Mutex::new(codecs))),
+            None,
+        );
+        let (a, _) = add_item(&env.lib, b"fake heic bytes", "heic", "写真");
+        assert_done(&env.overwrite(a, doc(&[flip("vertical")], Some("png"))));
+        let v1 = versions_of(&env.lib, a)[1].clone();
+        let path1 = env.lib.layout().content_path(&v1.output_hash, "png");
+        let bytes1 = std::fs::read(&path1).unwrap();
+        assert_done(&env.overwrite(a, doc(&[flip("horizontal")], Some("png"))));
+        simulate_gc(&env.lib, a, 1);
+        let (anchor_hash, anchor_ext): (Vec<u8>, String) = env
+            .lib
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT b.hash, b.ext FROM edit_anchors a JOIN blobs b ON b.id = a.blob_id",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        let anchor_path = env
+            .lib
+            .layout()
+            .content_path(&anchor_hash.try_into().unwrap(), &anchor_ext);
+        let saved = std::fs::read(&anchor_path).unwrap();
+        std::fs::write(&anchor_path, b"broken anchor").unwrap();
+        let before = snapshot(&env.lib);
+        let record = env.revert(a, 1);
+        if drifting {
+            assert_eq!(record.state, JobState::Failed, "{:?}", record.message);
+            assert_eq!(record.error_code.as_deref(), Some("Mismatch"));
+            assert_eq!(snapshot(&env.lib), before);
+        } else {
+            assert_done(&record);
+            let result = result_of(&record);
+            assert_eq!(result["anchor"], Json::Null, "元から読んだ");
+            assert!(
+                result["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w.as_str().unwrap().contains("アンカーが使えない")),
+                "{result}"
+            );
+            assert_eq!(std::fs::read(&path1).unwrap(), bytes1);
+        }
+        assert_eq!(decoder.reads(), 2, "元を記録のデコーダで読み直した");
+        std::fs::write(&anchor_path, saved).unwrap();
+        assert_consistent(&env.lib);
+    }
+}
+
+// ---- S17：下書き ----
+
+fn root_of(g: &Graph) -> Digest {
+    kura_engine::doc_parts::split(g).unwrap().root
+}
+
+/// S17：下書きを置いてアプリが落ちても、開き直すと同じ文書（同じ根）で fresh。その土台で保存すると下書きは消える。間に別の
+/// 上書きが入ると fresh が偽になり、その土台での保存は Conflict（下書きは残る）。保存を積んだあとに置いた下書き（after_job）は、
+/// 保存がコミットすると土台が新しい頭に付け替わり、保存した文書と同じなら消える。
+#[test]
+fn s17_draft_survives_crash_and_conflicts_when_base_changed() {
+    let env = Env::new();
+    let (a, _, _) = env.png(30);
+    let d1 = doc(&[flip("vertical")], None);
+    let root = drafts::save(env.lib.db(), a, &d1, base_of(&env.lib, a), None).unwrap();
+    assert_eq!(root, root_of(&d1));
+    let Env { dir, lib, jobs, .. } = env;
+    drop(jobs);
+    let path = lib.layout().root().to_path_buf();
+    lib.close();
+    drop(lib);
+
+    let session = LibrarySession::open(
+        &path,
+        Arc::new(|_| {}),
+        Services::new(Arc::new(FakeBackend)).with_engine(Arc::new(FakeEngineFactory::default())),
+    )
+    .unwrap();
+    session.wait_ready();
+    let lib = session.library().clone();
+    let runtime = session.engine().unwrap().runtime().unwrap().clone();
+    let opened = drafts::open(lib.db(), &runtime, a).unwrap().unwrap();
+    assert_eq!(
+        (root_of(&opened.graph), opened.doc, opened.fresh),
+        (root, root, true)
+    );
+    let save = |base: Base, action: SaveAction| {
+        let id = start_save(
+            lib.db(),
+            session.jobs(),
+            &SaveRequest {
+                item_id: a,
+                base,
+                action,
+            },
+        )
+        .unwrap();
+        assert!(session.jobs().wait_idle(WAIT));
+        session.jobs().get(id).unwrap()
+    };
+    assert_done(&save(
+        opened.base,
+        SaveAction::Overwrite {
+            graph: opened.graph.clone(),
+        },
+    ));
+    assert!(lib.db().read(|c| drafts::get(c, a)).unwrap().is_none());
+
+    // 下書きを置いたあとに別の上書きが入る：fresh が偽、その土台の保存は Conflict で下書きは残る
+    let d2 = doc(&[flip("vertical"), flip("horizontal")], None);
+    drafts::save(lib.db(), a, &d2, base_of(&lib, a), None).unwrap();
+    assert_done(&save(
+        base_of(&lib, a),
+        SaveAction::Overwrite {
+            graph: doc(&[flip("horizontal")], None),
+        },
+    ));
+    let stale = drafts::open(lib.db(), &runtime, a).unwrap().unwrap();
+    assert_eq!(root_of(&stale.graph), root_of(&d2));
+    assert!(!stale.fresh);
+    assert_conflict(&save(
+        stale.base,
+        SaveAction::Overwrite {
+            graph: stale.graph.clone(),
+        },
+    ));
+    assert!(lib.db().read(|c| drafts::get(c, a)).unwrap().is_some());
+
+    // 保存を積んでから置いた下書き：保存がコミットすると土台が新しい頭に付け替わる（同じ文書なら消える）
+    for same in [false, true] {
+        let saved = doc(&[flip(if same { "vertical" } else { "horizontal" })], None);
+        let editing = if same {
+            saved.clone()
+        } else {
+            doc(
+                &[flip("horizontal"), flip("vertical"), flip("horizontal")],
+                None,
+            )
+        };
+        let opened_base = base_of(&lib, a);
+        let id = start_save(
+            lib.db(),
+            session.jobs(),
+            &SaveRequest {
+                item_id: a,
+                base: opened_base,
+                action: SaveAction::Overwrite { graph: saved },
+            },
+        )
+        .unwrap();
+        drafts::save(lib.db(), a, &editing, opened_base, Some(id)).unwrap();
+        assert!(session.jobs().wait_idle(WAIT));
+        assert_done(&session.jobs().get(id).unwrap());
+        let draft = lib.db().read(|c| drafts::get(c, a)).unwrap();
+        if same {
+            assert!(draft.is_none(), "保存した文書と同じ下書きは消える");
+        } else {
+            let draft = draft.unwrap();
+            assert_eq!(draft.base, base_of(&lib, a));
+            assert_eq!(draft.after_job, None);
+            let opened = drafts::open(lib.db(), &runtime, a).unwrap().unwrap();
+            assert!(opened.fresh);
+            assert_eq!(root_of(&opened.graph), root_of(&editing));
+        }
+    }
+    // 捨てる：あれば真、なければ偽
+    drafts::save(lib.db(), a, &d2, base_of(&lib, a), None).unwrap();
+    assert!(drafts::discard(lib.db(), a).unwrap());
+    assert!(!drafts::discard(lib.db(), a).unwrap());
+    assert!(lib.db().read(|c| drafts::get(c, a)).unwrap().is_none());
+    assert_consistent(&lib);
+    drop(session);
+    drop(dir);
 }
