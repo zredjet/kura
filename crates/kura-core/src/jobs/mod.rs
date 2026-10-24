@@ -1,4 +1,4 @@
-//! 長い処理（取り込み・サムネイル・プロキシ・ダウンロード・キャプチャ・書き出し・解析）を jobs テーブル経由で動かす。
+//! 長い処理（取り込み・サムネイル・プロキシ・ダウンロード・キャプチャ・書き出し・解析・編集の保存）を jobs テーブル経由で動かす。
 //!
 //! - 種類ごとに同時実行数を決める（docs/architecture.md §5）。
 //! - 譲る相手（[`JobKind::yields_to`]）が動いている・待っている間は取り出さず、動いていれば区切りで譲らせる
@@ -30,13 +30,17 @@ pub enum JobKind {
     Capture,
     /// 書き出し（FR-SYS-02）。
     Export,
-    /// 解析（M11。画像・音声の事実と波形の段。取り込み・サムネイルに譲る）。
+    /// 解析（M11。画像・音声の事実と波形の段。取り込み・サムネイル・保存に譲る）。
     Analyze,
+    /// 編集の保存（M12 の段 2。上書き・別名・元に戻す。1 本ずつ。利用者が待つので誰にも譲らない）。
+    Edit,
+    /// 置き換えた版のファイルの片付け（M12 の段 3。0011 の jobs_kind が受け付ける。登録は段 3 で足す）。
+    Gc,
 }
 
 impl JobKind {
     /// すべての種類（テストと一覧用）。
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Import,
         Self::Thumbnail,
         Self::Proxy,
@@ -44,6 +48,8 @@ impl JobKind {
         Self::Capture,
         Self::Export,
         Self::Analyze,
+        Self::Edit,
+        Self::Gc,
     ];
 
     /// DB に保存する名前。
@@ -56,6 +62,8 @@ impl JobKind {
             Self::Capture => "capture",
             Self::Export => "export",
             Self::Analyze => "analyze",
+            Self::Edit => "edit",
+            Self::Gc => "gc",
         }
     }
 
@@ -69,12 +77,15 @@ impl JobKind {
             "capture" => Self::Capture,
             "export" => Self::Export,
             "analyze" => Self::Analyze,
+            "edit" => Self::Edit,
+            "gc" => Self::Gc,
             _ => return None,
         })
     }
 
     /// 同時に動かす数（download 2、ほかは 1）。サムネイルは 1 本のジョブの中でコア数の並列にする
     /// （未作成のものをまとめて処理するので、複数動かすと同じアイテムを取り合う）。解析も 1 本（書き手を 1 つにする）。
+    /// 保存も 1 本（一括のプールとメモリの予算を使い、台帳の門を書きの側で持つ。M12）、GC も 1 本。
     pub fn concurrency(self) -> usize {
         match self {
             Self::Download => 2,
@@ -83,23 +94,28 @@ impl JobKind {
             | Self::Proxy
             | Self::Capture
             | Self::Export
-            | Self::Analyze => 1,
+            | Self::Analyze
+            | Self::Edit
+            | Self::Gc => 1,
         }
     }
 
     /// 譲る相手：この種類のジョブが（登録されていて）動いている・待っている間は、この種類を取り出さず、動いていれば
     /// `JobContext::should_yield` で知らせて区切りで `JobEnd::Yield` を返させる。解析は取り込み（NFR-05）とサムネイル
-    /// （NFR-04）に譲る。ダウンロードはネットワーク待ちなので譲らない。種類を足したら必ずここに書く（網羅の match。
-    /// M12 の保存・M14 の一括も同じ一括のプールと予算を使うので、足すときに解析が譲るかを決める）。
+    /// （NFR-04）と保存（M12。同じ一括のプールと予算を使い、利用者が待っている）に譲る。ダウンロードはネットワーク待ちなので
+    /// 譲らない。保存は利用者が待つので誰にも譲らない。GC が譲る相手は段 3 で決める（今は登録しない）。種類を足したら必ず
+    /// ここに書く（網羅の match。M14 の一括も同じ一括のプールと予算を使うので、足すときに解析が譲るかを決める）。
     pub fn yields_to(self) -> &'static [JobKind] {
         match self {
-            Self::Analyze => &[Self::Import, Self::Thumbnail],
+            Self::Analyze => &[Self::Import, Self::Thumbnail, Self::Edit],
             Self::Import
             | Self::Thumbnail
             | Self::Proxy
             | Self::Download
             | Self::Capture
-            | Self::Export => &[],
+            | Self::Export
+            | Self::Edit
+            | Self::Gc => &[],
         }
     }
 
@@ -113,7 +129,9 @@ impl JobKind {
             | Self::Proxy
             | Self::Download
             | Self::Capture
-            | Self::Export => false,
+            | Self::Export
+            | Self::Edit
+            | Self::Gc => false,
         }
     }
 }
@@ -190,7 +208,9 @@ mod tests {
             | JobKind::Download
             | JobKind::Capture
             | JobKind::Export
-            | JobKind::Analyze => JobKind::ALL.contains(&kind),
+            | JobKind::Analyze
+            | JobKind::Edit
+            | JobKind::Gc => JobKind::ALL.contains(&kind),
         }
     }
 
@@ -201,7 +221,9 @@ mod tests {
             assert_eq!(JobKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(JobKind::parse("analyze"), Some(JobKind::Analyze));
-        assert_eq!(JobKind::parse("edit"), None);
+        assert_eq!(JobKind::parse("edit"), Some(JobKind::Edit));
+        assert_eq!(JobKind::parse("gc"), Some(JobKind::Gc));
+        assert_eq!(JobKind::parse("batch"), None);
         for state in [
             JobState::Queued,
             JobState::Running,
@@ -220,9 +242,11 @@ mod tests {
         assert_eq!(JobKind::Download.concurrency(), 2);
         assert_eq!(JobKind::Thumbnail.concurrency(), 1);
         assert_eq!(JobKind::Analyze.concurrency(), 1);
+        assert_eq!(JobKind::Edit.concurrency(), 1);
+        assert_eq!(JobKind::Gc.concurrency(), 1);
     }
 
-    /// 譲る相手の表（解析だけが、取り込みとサムネイルに譲る）。自分に譲らず、譲り合いの輪がない。
+    /// 譲る相手の表（解析だけが、取り込み・サムネイル・保存に譲る）。自分に譲らず、譲り合いの輪がない。
     #[test]
     fn yields_to_table() {
         let table: Vec<(JobKind, &[JobKind])> =
@@ -236,7 +260,12 @@ mod tests {
                 (JobKind::Download, &[][..]),
                 (JobKind::Capture, &[][..]),
                 (JobKind::Export, &[][..]),
-                (JobKind::Analyze, &[JobKind::Import, JobKind::Thumbnail][..]),
+                (
+                    JobKind::Analyze,
+                    &[JobKind::Import, JobKind::Thumbnail, JobKind::Edit][..]
+                ),
+                (JobKind::Edit, &[][..]),
+                (JobKind::Gc, &[][..]),
             ]
         );
         for kind in JobKind::ALL {

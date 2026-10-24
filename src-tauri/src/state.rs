@@ -332,16 +332,22 @@ mod tests {
         }
     }
 
-    /// 1 つ前の版（最後のマイグレーション 0010 を当てる前）のライブラリを作る。
+    /// 1 つ前の版（最後のマイグレーション 0011 を当てる前）のライブラリを作る。
     fn library_before_last_migration(root: &Path) {
         let library = kura_core::library::Library::create(root).unwrap();
         let before = kura_core::db::MIGRATIONS.len() - 1;
         library
             .db()
             .write(move |tx| {
+                // 0011 を取り消す：足した表（子から）を消し、jobs_kind を 0008 の値に戻す
                 tx.execute_batch(&format!(
-                    "DROP TRIGGER items_blob_id_ai; DROP TRIGGER items_blob_id_au; DROP INDEX idx_items_blob;
-                     ALTER TABLE items DROP COLUMN blob_id; PRAGMA user_version = {before};"
+                    "DROP TABLE item_version_inputs; DROP TABLE item_derivations; DROP TABLE edit_drafts;
+                     DROP TABLE item_versions; DROP TABLE edit_anchors; DROP TABLE edit_edges; DROP TABLE edit_objects;
+                     DROP TABLE ledger_pending;
+                     ALTER TABLE jobs DROP CONSTRAINT jobs_kind;
+                     ALTER TABLE jobs ADD CONSTRAINT jobs_kind
+                       CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze'));
+                     PRAGMA user_version = {before};"
                 ))?;
                 Ok(())
             })

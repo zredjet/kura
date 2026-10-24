@@ -12,6 +12,15 @@ pub enum CoreError {
     /// 入力が正しくない。
     #[error("入力が正しくありません: {0}")]
     Invalid(String),
+    /// 大きすぎて扱えない（文書・値・メモリの予算の全体。やり直しても同じ。M12 の保存）。
+    #[error("大きすぎます: {0}")]
+    TooLarge(String),
+    /// この形式・組み合わせは扱えない（書けない出力の形式など。M12 の保存）。
+    #[error("扱えません: {0}")]
+    Unsupported(String),
+    /// 記録と食い違う（途中の版を作り直した値が版の記録と合わない・アンカーが壊れているなど。M12 の保存）。
+    #[error("記録と食い違います: {0}")]
+    Mismatch(String),
     /// ファイル操作の失敗。
     #[error("ファイル操作に失敗しました: {0}")]
     Io(#[from] std::io::Error),
@@ -167,6 +176,9 @@ impl CoreError {
             Self::NotFound(_) => "NotFound",
             Self::Conflict(_) => "Conflict",
             Self::Invalid(_) => "Invalid",
+            Self::TooLarge(_) => "TooLarge",
+            Self::Unsupported(_) => "Unsupported",
+            Self::Mismatch(_) => "Mismatch",
             Self::Io(_) => "Io",
             Self::Db(_) | Self::Json(_) | Self::DbClosed => "Db",
             Self::ToolMissing(_) => "ToolMissing",
@@ -231,6 +243,31 @@ mod tests {
     fn message_includes_detail() {
         let err = CoreError::NotFound("item 42".into());
         assert_eq!(err.to_string(), "見つかりません: item 42");
+    }
+
+    /// 保存（M12）で使う種類：大きすぎる・扱えない・記録と食い違う。
+    #[test]
+    fn save_errors_have_their_own_codes() {
+        for (err, code, text) in [
+            (
+                CoreError::TooLarge("x".into()),
+                "TooLarge",
+                "大きすぎます: x",
+            ),
+            (
+                CoreError::Unsupported("x".into()),
+                "Unsupported",
+                "扱えません: x",
+            ),
+            (
+                CoreError::Mismatch("x".into()),
+                "Mismatch",
+                "記録と食い違います: x",
+            ),
+        ] {
+            assert_eq!(err.code(), code);
+            assert_eq!(err.to_string(), text);
+        }
     }
 
     /// SQL の位置を指すエラーは、SQL の本文を落として SQLite の言葉と位置だけにする。

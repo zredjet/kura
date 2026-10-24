@@ -917,7 +917,7 @@ fn named_checks_can_be_widened_without_a_rebuild() {
          ALTER TABLE items ADD CONSTRAINT items_kind CHECK (kind IN ('image','video','audio','font','model','doc'));
          ALTER TABLE jobs DROP CONSTRAINT jobs_kind;
          ALTER TABLE jobs ADD CONSTRAINT jobs_kind
-           CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit'));
+           CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc','batch'));
          COMMIT;",
     )
     .unwrap();
@@ -925,7 +925,7 @@ fn named_checks_can_be_widened_without_a_rebuild() {
     conn.execute("UPDATE items SET kind = 'doc' WHERE id = 4", [])
         .unwrap();
     conn.execute(
-        "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('edit', 'queued', '{}', 1)",
+        "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('batch', 'queued', '{}', 1)",
         [],
     )
     .unwrap();
@@ -1057,6 +1057,296 @@ fn items_blob_id_0010_copies_the_ledger_id_and_follows_inserts_and_saves() {
     );
     assert!(plan.contains("idx_items_blob"), "{plan}");
     assert!(violations(&conn).unwrap().is_empty());
+}
+
+// ===== 0011（Plain）：保存と版（M12 の段 2。文書の部品・版・アンカー・来歴・下書き・予告）=====
+
+/// 0011 の版。
+const V11: usize = 11;
+
+#[test]
+fn edit_versions_0011_adds_tables_and_keeps_everything_else() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, V11 - 1).unwrap();
+    crate::db::testing::fill_v10(&conn);
+    assert_eq!(MIGRATIONS[V11 - 1].name, "0011_edit_versions");
+    assert_eq!(MIGRATIONS[V11 - 1].kind, Kind::Plain);
+    let before = snapshot(&conn);
+    migrate_until(&mut conn, V11).unwrap();
+    let after = snapshot(&conn);
+    // 既存の表の行・索引・トリガ・FTS は同じ（新しい表だけ。既存のアイテムに版の行を足さない）
+    for (key, value) in &before {
+        assert_eq!(after.get(key), Some(value), "{key} が変わった");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(
+        added,
+        vec![
+            "index idx_edit_anchors_blob",
+            "index idx_edit_drafts_doc",
+            "index idx_edit_edges_child",
+            "index idx_item_derivations_source",
+            "index idx_item_version_inputs_anchor",
+            "index idx_item_versions_doc",
+            "index idx_item_versions_file_blob",
+            "index idx_item_versions_job",
+            "index idx_item_versions_output",
+            "index idx_item_versions_waiting",
+            // WITHOUT ROWID の edit_edges・item_version_inputs は主キーが表そのもの（自動の索引の行はない）
+            "index sqlite_autoindex_edit_anchors_1",
+            "index sqlite_autoindex_edit_objects_1",
+            "index sqlite_autoindex_item_versions_1",
+            "table edit_anchors",
+            "table edit_drafts",
+            "table edit_edges",
+            "table edit_objects",
+            "table item_derivations",
+            "table item_version_inputs",
+            "table item_versions",
+            "table ledger_pending",
+        ]
+    );
+    for table in [
+        "edit_anchors",
+        "edit_drafts",
+        "edit_edges",
+        "edit_objects",
+        "item_derivations",
+        "item_version_inputs",
+        "item_versions",
+        "ledger_pending",
+    ] {
+        assert_eq!(
+            one::<i64>(&conn, &format!("SELECT count(*) FROM {table}")),
+            0,
+            "{table}"
+        );
+    }
+    assert!(violations(&conn).unwrap().is_empty());
+    // 外部キーの向き：台帳を指す列は ON DELETE なし（参照されている行は消せない）、アイテムを指す列は CASCADE
+    // （来歴の元だけ SET NULL）、部品・アンカーを指す列は ON DELETE なし
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.name, f.\"from\", f.\"table\", f.\"to\", f.on_delete
+               FROM sqlite_schema s, pragma_foreign_key_list(s.name) f
+              WHERE s.type = 'table' AND s.name IN ('edit_objects','edit_edges','edit_anchors','item_versions',
+                    'item_version_inputs','item_derivations','edit_drafts','ledger_pending')
+              ORDER BY s.name, f.\"from\"",
+        )
+        .unwrap();
+    let fks: Vec<String> = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "{}.{} → {}.{} {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        fks,
+        vec![
+            "edit_anchors.blob_id → blobs.id NO ACTION",
+            "edit_drafts.doc_id → edit_objects.id NO ACTION",
+            "edit_drafts.item_id → items.id CASCADE",
+            "edit_edges.child_id → edit_objects.id NO ACTION",
+            "edit_edges.parent_id → edit_objects.id CASCADE",
+            "item_derivations.item_id → items.id CASCADE",
+            "item_derivations.source_item_id → items.id SET NULL",
+            "item_version_inputs.anchor_id → edit_anchors.id NO ACTION",
+            "item_version_inputs.version_id → item_versions.id CASCADE",
+            "item_versions.doc_id → edit_objects.id NO ACTION",
+            "item_versions.file_blob_id → blobs.id NO ACTION",
+            "item_versions.item_id → items.id CASCADE",
+        ]
+    );
+    // 外部キーの子の列には部分でない索引がある（親の行を消すたびに子を走査しない）
+    for (table, column) in [
+        ("edit_anchors", "blob_id"),
+        ("edit_drafts", "doc_id"),
+        ("edit_edges", "child_id"),
+        ("item_derivations", "source_item_id"),
+        ("item_version_inputs", "anchor_id"),
+        ("item_versions", "doc_id"),
+        ("item_versions", "file_blob_id"),
+    ] {
+        let plan =
+            crate::db::query_plan(&conn, &format!("SELECT 1 FROM {table} WHERE {column} = 1"));
+        assert!(plan.contains("USING"), "{table}.{column}: {plan}");
+    }
+    // jobs_kind に edit と gc が入る
+    for kind in ["edit", "gc"] {
+        conn.execute(
+            "INSERT INTO jobs (kind, state, input_json, created_at) VALUES (?1, 'queued', '{}', 1)",
+            [kind],
+        )
+        .unwrap();
+    }
+    let err = conn
+        .execute(
+            "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('batch', 'queued', '{}', 1)",
+            [],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("jobs_kind"), "{err}");
+}
+
+#[test]
+fn edit_versions_0011_checks_have_names_and_follow_the_items() {
+    let mut conn = filled_v6();
+    migrate(&mut conn).unwrap();
+    crate::db::testing::fill_latest(&conn);
+    // 名前付きの CHECK：版 0 は original、系譜の列、released とファイル、hold と置き換えの時刻、部品の種類、予告の種類
+    let version = |id: i64, version: i64, kind: &str, rest: &str| {
+        format!(
+            "INSERT INTO item_versions (id, item_id, version, kind, doc_id, base_version, revert_to, output_hash, ext,
+                                        size_bytes, record, file_blob_id, file_state, replaced_at, created_at)
+             VALUES ({id}, 4, {version}, '{kind}', {rest}, x'04', 'png', 1, '{{}}', NULL, 'released', 5, 1)"
+        )
+    };
+    for (sql, name) in [
+        (
+            version(10, 0, "edit", "3, 0, NULL"),
+            "item_versions_original",
+        ),
+        (
+            version(10, 2, "original", "NULL, NULL, NULL"),
+            "item_versions_original",
+        ),
+        (
+            version(10, 2, "edit", "NULL, 1, NULL"),
+            "item_versions_lineage",
+        ),
+        (
+            version(10, 2, "revert", "NULL, 1, 2"),
+            "item_versions_lineage",
+        ),
+        (
+            version(10, -1, "edit", "3, 0, NULL"),
+            "item_versions_version",
+        ),
+        (
+            "UPDATE item_versions SET file_blob_id = NULL WHERE id = 2".into(),
+            "item_versions_file",
+        ),
+        (
+            "UPDATE item_versions SET file_state = 'waiting' WHERE id = 2".into(),
+            "item_versions_replaced",
+        ),
+        (
+            "UPDATE item_versions SET replaced_at = 5 WHERE id = 2".into(),
+            "item_versions_replaced",
+        ),
+        (
+            "UPDATE item_versions SET file_state = 'gone', replaced_at = 5 WHERE id = 2".into(),
+            "item_versions_file_state",
+        ),
+        (
+            "UPDATE edit_objects SET kind = 'blob' WHERE id = 1".into(),
+            "edit_objects_kind",
+        ),
+        (
+            "UPDATE edit_edges SET ord = -1 WHERE parent_id = 2".into(),
+            "edit_edges_ord",
+        ),
+        (
+            "UPDATE ledger_pending SET kind = 'move'".into(),
+            "ledger_pending_kind",
+        ),
+        (
+            "UPDATE item_version_inputs SET role = 'x'".into(),
+            "item_version_inputs_role",
+        ),
+    ] {
+        let err = conn.execute(&sql, []).unwrap_err().to_string();
+        assert!(err.contains(name), "{sql}: {err}");
+    }
+    // 版 1 は猶予中（置き換えの時刻を持ち、items から参照されない台帳の行 x'0a' を指す）。元に戻した版 2（revert、doc は
+    // NULL）は通る
+    conn.execute_batch(
+        "INSERT INTO blobs (hash, ext, size_bytes, created_at) VALUES (x'0a', 'png', 2, 5);
+         UPDATE item_versions SET file_state = 'waiting', replaced_at = 5, output_hash = x'0a', size_bytes = 2,
+                file_blob_id = (SELECT id FROM blobs WHERE hash = x'0a') WHERE id = 2;
+         INSERT INTO item_versions (id, item_id, version, kind, doc_id, base_version, revert_to, output_hash, ext,
+                                    size_bytes, record, file_blob_id, file_state, replaced_at, created_at)
+           SELECT 3, 4, 2, 'revert', NULL, 1, 0, x'04', 'png', 1, '{}', id, 'hold', NULL, 6 FROM blobs WHERE hash = x'04';",
+    )
+    .unwrap();
+    // 版・アンカーが指す台帳の行は消せない（ON DELETE なし。消すのは ledger::release だけで、REFERRERS を見る）
+    assert!(
+        conn.execute("DELETE FROM blobs WHERE hash = x'0a'", [])
+            .is_err()
+    );
+    // 部品は参照されている間は消せない（子の側）
+    assert!(
+        conn.execute("DELETE FROM edit_objects WHERE id = 1", [])
+            .is_err()
+    );
+    // アイテムを消すと、版・入力・来歴・下書きは CASCADE で消え、来歴の元は NULL になる。部品・アンカー・台帳の行は残る
+    conn.execute_batch(
+        "UPDATE items SET trashed_at = 9 WHERE id = 2;
+         DELETE FROM items WHERE id = 2;",
+    )
+    .unwrap();
+    assert_eq!(
+        one::<Option<i64>>(
+            &conn,
+            "SELECT source_item_id FROM item_derivations WHERE item_id = 4"
+        ),
+        None
+    );
+    conn.execute("DELETE FROM items WHERE id = 4", []).unwrap();
+    // 版の行が消えれば猶予中のファイルの台帳の行は消せる。アンカーが指す行はまだ消せない
+    conn.execute("DELETE FROM blobs WHERE hash = x'0a'", [])
+        .unwrap();
+    assert!(
+        conn.execute("DELETE FROM blobs WHERE hash = x'04'", [])
+            .is_err()
+    );
+    for (table, left) in [
+        ("item_versions", 0),
+        ("item_version_inputs", 0),
+        ("item_derivations", 0),
+        ("edit_drafts", 0),
+        ("edit_objects", 3),
+        ("edit_edges", 2),
+        ("edit_anchors", 1),
+    ] {
+        assert_eq!(
+            one::<i64>(&conn, &format!("SELECT count(*) FROM {table}")),
+            left,
+            "{table}"
+        );
+    }
+    assert!(violations(&conn).unwrap().is_empty());
+    // 版の索引：出力のハッシュ（重複の判定）・猶予中の行（GC）・ジョブ（再開）
+    for (sql, want) in [
+        (
+            "SELECT item_id FROM item_versions WHERE output_hash = x'04'",
+            "idx_item_versions_output",
+        ),
+        (
+            "SELECT id FROM item_versions WHERE file_state = 'waiting' AND replaced_at < 10",
+            "idx_item_versions_waiting",
+        ),
+        (
+            "SELECT id FROM item_versions WHERE job_id = 9",
+            "idx_item_versions_job",
+        ),
+        (
+            "SELECT id FROM edit_anchors WHERE source_hash = x'04' AND options_digest = x'0d'",
+            "sqlite_autoindex_edit_anchors_1",
+        ),
+    ] {
+        let plan = crate::db::query_plan(&conn, sql);
+        assert!(plan.contains(want), "{sql}\n{plan}");
+    }
 }
 
 #[test]

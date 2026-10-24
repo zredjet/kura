@@ -993,8 +993,11 @@ export type JobFilterDto = {
 	limit?: number | null,
 };
 
-/**  ジョブの種類（analyze は M11 の解析。取り込み・サムネイルに譲る）。 */
-export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export" | "analyze";
+/**
+ *  ジョブの種類（analyze は M11 の解析。取り込み・サムネイル・保存に譲る。edit は M12 の編集の保存、gc は M12 の段 3 の
+ *  置き換えた版のファイルの片付け）。
+ */
+export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export" | "analyze" | "edit" | "gc";
 
 /**  ジョブの進捗（イベント `job://progress`）。 */
 export type JobProgress = {

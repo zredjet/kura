@@ -20,12 +20,12 @@ use super::plan::{
 use super::scan::{ScannedFile, scan};
 use super::store::{
     NewItem, add_tag, add_to_folder, add_unit_member, create_import_unit, ensure_folder_path,
-    ensure_tag, find_by_hash, folder_exists, insert_item, restore_item, unit_exists,
+    ensure_tag, find_owner, folder_exists, insert_item, restore_item, unit_exists,
 };
 use crate::jobs::{
     Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, save_partial,
 };
-use crate::library::Layout;
+use crate::library::{Layout, ledger};
 use crate::media::inflight::{self, ProbeWay};
 use crate::media::{MediaBackend, MediaInfo, NoBackend};
 use crate::time::now_ms;
@@ -374,28 +374,41 @@ impl BatchCommit {
                 }
             };
             let hash = placed.hash;
-            let item_id = match find_by_hash(tx, &hash)? {
-                Some(existing) => {
+            // 置いたファイル（files/<hash>.<file.ext>）は、台帳にその中身が同じ拡張子で載っているときだけ使われる
+            let kept_ext = ledger::ext_of(tx, &hash)?;
+            let unused_copy = |owned: bool| match &kept_ext {
+                Some(kept) => *kept != file.ext,
+                None => owned,
+            };
+            // 今・元・過去の版のどれかと同じ中身なら、そのアイテムの重複（docs/editing.md §14）
+            let item_id = match find_owner(tx, &hash)? {
+                Some(owner) => {
                     state.duplicates += 1;
-                    if existing.ext != file.ext {
+                    // 違う拡張子のコピーと、台帳に行がない（消えた過去の版と同じ中身）コピーは、どの行も使わない
+                    if unused_copy(true) {
                         extra_files.push(self.layout.content_path(&hash, &file.ext));
                     }
                     if self.policy == DuplicatePolicy::Ignore {
                         continue;
                     }
-                    if existing.trashed {
-                        restore_item(tx, existing.id, now)?;
+                    if owner.trashed {
+                        restore_item(tx, owner.id, now)?;
                     }
-                    existing.id
+                    owner.id
                 }
                 None => {
+                    // 台帳にだけある中身（アンカーなど）は、台帳の拡張子で入れる（items のトリガが食い違いを断るため）
+                    if unused_copy(false) {
+                        extra_files.push(self.layout.content_path(&hash, &file.ext));
+                    }
+                    let ext = kept_ext.as_deref().unwrap_or(&file.ext);
                     let id = insert_item(
                         tx,
                         &NewItem {
                             hash: &hash,
-                            ext: &file.ext,
+                            ext,
                             kind: file.kind,
-                            mime: mime_for(&file.ext),
+                            mime: mime_for(ext),
                             size: placed.size,
                             title: &title_from_name(&file.name),
                             original_name: &file.name,
@@ -870,6 +883,95 @@ mod tests {
         write(&src.join("b.jpeg"), b"same bytes");
         let (_, result) = env.import(vec![src], ImportOptions::default());
         assert_eq!((result.added, result.duplicates), (1, 1));
+        env.assert_files_match_db();
+    }
+
+    /// S14（docs/editing.md §14.1）：取り込んだファイルが、あるアイテムの元・消えた過去の版と同じ中身なら、そのアイテムの重複に
+    /// なり（アイテムは増えず、ゴミ箱から戻る）、孤立したファイルが残らない。元と同じ中身で拡張子が違うコピーも消す。
+    /// 版の行は、保存のジョブ（段 2 の B）の代わりにテストの補助で入れる。
+    #[test]
+    fn duplicate_of_original_or_released_version_is_owned() {
+        use crate::edit::testing::insert_version_with;
+        let env = Env::new();
+        let first = env.dir.path().join("first");
+        write(&first.join("now.png"), b"now");
+        let (_, result) = env.import(vec![first], ImportOptions::default());
+        assert_eq!(result.added, 1);
+        let (now, orig, past) = (
+            *blake3::hash(b"now").as_bytes(),
+            *blake3::hash(b"orig").as_bytes(),
+            *blake3::hash(b"past").as_bytes(),
+        );
+        // 元 orig（files/ と台帳にある）・版 1 past（GC で消えた）・版 2 が今。アイテムはゴミ箱に入れておく
+        write(&env.library.layout().content_path(&orig, "png"), b"orig");
+        env.library
+            .db()
+            .write(move |tx| {
+                insert_version_with(tx, 1, 0, orig, "png", 4, "hold", None);
+                insert_version_with(tx, 1, 1, past, "png", 4, "released", None);
+                insert_version_with(tx, 1, 2, now, "png", 3, "hold", None);
+                tx.execute("UPDATE items SET trashed_at = 5 WHERE id = 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let again = env.dir.path().join("again");
+        write(&again.join("a.png"), b"orig");
+        write(&again.join("b.png"), b"past");
+        write(&again.join("c.jpg"), b"orig");
+        let options = ImportOptions {
+            tags: vec!["二回目".into()],
+            ..Default::default()
+        };
+        let (_, result) = env.import(vec![again], options);
+        assert_eq!((result.added, result.duplicates), (0, 3));
+        assert_eq!(env.count("SELECT COUNT(*) FROM items"), 1);
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM items WHERE id = 1 AND trashed_at IS NULL"),
+            1
+        );
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM item_tags WHERE item_id = 1"),
+            1
+        );
+        let layout = env.library.layout();
+        assert!(layout.content_path(&orig, "png").exists());
+        assert!(
+            !layout.content_path(&past, "png").exists(),
+            "消えた版のコピーが残った"
+        );
+        assert!(
+            !layout.content_path(&orig, "jpg").exists(),
+            "拡張子だけ違うコピーが残った"
+        );
+        env.assert_files_match_db();
+    }
+
+    /// 台帳にだけある中身（アンカーのファイル。アイテムの今・元・版のどれでもない）を別の拡張子で取り込むと、台帳の拡張子で
+    /// 入れる（items のトリガが食い違いで断らない）。置いたコピーは消える。
+    #[test]
+    fn content_only_in_the_ledger_is_imported_with_the_ledger_ext() {
+        let env = Env::new();
+        let anchor = *blake3::hash(b"anchor").as_bytes();
+        write(
+            &env.library.layout().content_path(&anchor, "png"),
+            b"anchor",
+        );
+        env.library
+            .db()
+            .write(move |tx| {
+                ledger::register(tx, &anchor, "png", 6, 1)?;
+                Ok(())
+            })
+            .unwrap();
+        let src = env.src();
+        write(&src.join("a.apng"), b"anchor");
+        let (_, result) = env.import(vec![src], ImportOptions::default());
+        assert_eq!((result.added, result.duplicates, result.failed), (1, 0, 0));
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM items WHERE ext = 'png' AND mime = 'image/png'"),
+            1
+        );
+        assert!(!env.library.layout().content_path(&anchor, "apng").exists());
         env.assert_files_match_db();
     }
 

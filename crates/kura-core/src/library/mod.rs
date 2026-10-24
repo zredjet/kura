@@ -25,7 +25,7 @@ pub use upgrade::{UpgradeEvent, UpgradeHooks};
 
 use std::cell::Cell;
 use std::path::Path;
-use std::sync::{PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use crate::db::{Db, MigrationReport};
@@ -52,8 +52,9 @@ pub struct Library {
     db: Db,
     /// 開いたときに当てたマイグレーション。
     migration: MigrationReport,
-    /// 取り込み（files/ に置いてから DB に書くまで）とゴミ箱を空にする処理を直列にする鍵。
-    /// 取り込みどうしは並べてよい（読み取りの側）。ゴミ箱を空にする処理は 1 つだけ（書き込みの側）。
+    /// 取り込み（files/ に置いてから DB に書くまで）と、台帳から外す・台帳にない中身を置く処理（ゴミ箱を空にする・保存の
+    /// 予告から後始末まで・段 3 の GC）を直列にする鍵（台帳の門）。取り込みどうしは並べてよい（読み取りの側）。
+    /// 台帳の門を通る処理は 1 つだけ（書き込みの側）。
     ingest: RwLock<()>,
     /// ライブラリのロック（`library.lock`。ほかのアプリが同じライブラリを開くのを断る）。閉じるときに DB を閉じてから放す
     /// （[`Library::close`]）。
@@ -176,6 +177,14 @@ impl Library {
         self.ingest.read().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// 台帳の門（取り込みの鍵の書き込みの側）：保存の「予告 → 配置 → コミット → 後始末」・ゴミ箱を空にする処理・段 3 の GC が
+    /// 持つ（M12。docs/data-model.md §4「保存と版（M12）」）。持っている間は取り込み・ダウンロード・キャプチャの「置いてから
+    /// DB に書く」が待つので、取り込みが「もう置いてある」と判断した同じ中身のファイルを、台帳に載せる前に消されない。
+    /// 描く・エンコードする間は持たない。同じスレッドで重ねて取らないこと（読み取りの側とも）。
+    pub fn ingest_exclusive(&self) -> RwLockWriteGuard<'_, ()> {
+        self.ingest.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// 開いたときに当てたマイグレーション（当てていなければ `applied` が空）。
     pub fn migration(&self) -> &MigrationReport {
         &self.migration
@@ -210,12 +219,13 @@ impl Library {
         })
     }
 
-    /// ゴミ箱を空にする。DB の行を消して、使われなくなった台帳の行を同じトランザクションで解放し、コミットのあとで
+    /// ゴミ箱を空にする。DB の行を消して、使われなくなった台帳の行（アイテムの今と、編集したアイテムの元・猶予中の版・
+    /// アンカー。M12）を同じトランザクションで解放し、コミットのあとで
     /// 解放した中身の実ファイルと派生のファイル（サムネイル・ジャケット・プロキシ・波形・アニメの帯）を消す
     /// （ADR-46。途中で落ちてもファイルが残るだけで、整合性チェックで「DB にないファイル」として数えられる）。
     /// 取り込みの鍵を書き込みの側で持つので、置いたばかりの同じ中身のファイルを消さない。
     pub fn empty_trash(&self) -> Result<TrashEmptied> {
-        let _ingest = self.ingest.write().unwrap_or_else(PoisonError::into_inner);
+        let _ingest = self.ingest_exclusive();
         let deleted = self.db.write(|tx| crate::items::delete_trashed(tx))?;
         let mut result = TrashEmptied::default();
         for blob in &deleted.released {
@@ -318,6 +328,58 @@ mod tests {
         assert!(lib.layout().content_path(&kept, "jpg").exists());
         assert_eq!(lib.item_count().unwrap(), 1);
         assert_eq!(lib.empty_trash().unwrap(), TrashEmptied::default());
+    }
+
+    /// S16（docs/editing.md §14.1）：編集したアイテムでゴミ箱を空にすると、元・猶予中の版・アンカーのファイルも消え、参照されない
+    /// 台帳の行も DB にないファイルも 0（決定 6）。版の行は、保存のジョブ（段 2 の B）の代わりにテストの補助で入れる。
+    #[test]
+    fn empty_trash_removes_the_original_waiting_versions_and_anchors_of_edited_items() {
+        use crate::edit::testing::{insert_anchor, insert_item, insert_version};
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::create(&dir.path().join("L")).unwrap();
+        lib.db()
+            .write(|tx| {
+                let a = insert_item(tx, 1, [1; 32]);
+                let anchor = insert_anchor(tx, [10; 32], [20; 32]);
+                insert_version(tx, a, 0, [10; 32], "hold", None);
+                insert_version(tx, a, 1, [11; 32], "waiting", Some(anchor));
+                insert_version(tx, a, 2, [1; 32], "hold", Some(anchor));
+                crate::items::trash(tx, &[a], 5)?;
+                Ok(())
+            })
+            .unwrap();
+        let files = [
+            ([1u8; 32], "png"),
+            ([10; 32], "png"),
+            ([11; 32], "png"),
+            ([20; 32], "wav"),
+        ];
+        for (hash, ext) in files {
+            let path = lib.layout().content_path(&hash, ext);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+            let thumb = lib.layout().thumb_path(&hex(&hash), ThumbSize::Small);
+            std::fs::create_dir_all(thumb.parent().unwrap()).unwrap();
+            std::fs::write(&thumb, b"t").unwrap();
+        }
+        assert_eq!(check_files(lib.db(), lib.layout()).unwrap(), (0, 0));
+        let result = lib.empty_trash().unwrap();
+        assert_eq!((result.items, result.failed), (1, 0));
+        for (hash, ext) in files {
+            assert!(!lib.layout().content_path(&hash, ext).exists(), "{ext}");
+            assert!(
+                !lib.layout()
+                    .thumb_path(&hex(&hash), ThumbSize::Small)
+                    .exists()
+            );
+        }
+        assert_eq!(check_files(lib.db(), lib.layout()).unwrap(), (0, 0));
+        assert_eq!(lib.db().read(ledger::unreferenced).unwrap(), 0);
+        let blobs: i64 = lib
+            .db()
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(blobs, 0);
     }
 
     #[test]

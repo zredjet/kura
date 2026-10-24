@@ -59,9 +59,9 @@ pub(crate) fn fill_v6(conn: &Connection) {
     conn.execute_batch(&sql).unwrap();
 }
 
-/// 最新の版で足した表（0009 の media_facts・analysis_results・asset_settings）にも行を入れる。`fill_v6` のあとに使う
-/// （表を足したらここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
-pub(crate) fn fill_latest(conn: &Connection) {
+/// 0010 までの版で足した表（0009 の media_facts・analysis_results・asset_settings）に行を入れる。`fill_v6` のあとに、
+/// 版 9 以降の DB に使う（0011 を当てる前の行が残ることを確かめるのにも使う）。
+pub(crate) fn fill_v10(conn: &Connection) {
     conn.execute_batch(
         "INSERT INTO media_facts (blob_id, state, decoder, reproducible, facts_v, alpha, colors, has_loop, loudness, analyzed_at)
            SELECT id, 'ok', 'png-rs-dec/1', 1, 1, 2, 16, 0, NULL, 1 FROM blobs;
@@ -72,6 +72,41 @@ pub(crate) fn fill_latest(conn: &Connection) {
                   (3, NULL, NULL, NULL, NULL, 10, 20, NULL, 1);",
     )
     .unwrap();
+}
+
+/// 最新の版で足した表（[`fill_v10`] の表と、0011 の版・文書の部品・アンカー・来歴・下書き・予告）にも行を入れる。
+/// `fill_v6` のあとに使う（表を足したらここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
+/// 0011 の行はアイテム 4（ゴミ箱を空にする試験で残るもの）に付け、版とアンカーはアイテム 4 の台帳の行を指す
+/// （出力が今と同じ中身の「版だけ足した」形）。
+pub(crate) fn fill_latest(conn: &Connection) {
+    fill_v10(conn);
+    let sql = "INSERT INTO edit_objects (id, digest, kind, body, created_at)
+           VALUES (1, x'c1', 'chunk', CAST('[1,2]' AS BLOB), 1), (2, x'a1', 'node', CAST('{}' AS BLOB), 1),
+                  (3, x'd1', 'doc', CAST('{}' AS BLOB), 1);
+         INSERT INTO edit_edges (parent_id, ord, child_id) VALUES (2, 0, 1), (3, 0, 2);
+         INSERT INTO edit_anchors (id, source_hash, options_digest, options, decoded, value_digest, blob_id, created_at)
+           SELECT 1, x'04', x'0d', '{}', '{}', x'0e', id, 1 FROM blobs WHERE hash = x'04';
+         INSERT INTO item_versions (id, item_id, version, kind, doc_id, base_version, revert_to, output_hash, ext, size_bytes,
+                                    format, value_digest, width, height, duration_ms, record, file_blob_id, file_state,
+                                    replaced_at, job_id, created_at)
+           SELECT 1, 4, 0, 'original', NULL, NULL, NULL, x'04', 'png', 1, 'png', x'0e', 1, 1, NULL, '{\"v\":1}', id, 'hold',
+                  NULL, NULL, 50 FROM blobs WHERE hash = x'04';
+         INSERT INTO item_versions (id, item_id, version, kind, doc_id, base_version, revert_to, output_hash, ext, size_bytes,
+                                    format, value_digest, width, height, duration_ms, record, file_blob_id, file_state,
+                                    replaced_at, job_id, created_at)
+           SELECT 2, 4, 1, 'edit', 3, 0, NULL, x'04', 'png', 1, 'png', x'0e', 1, 1, NULL, '{\"v\":1}', id, 'hold',
+                  NULL, 9, 50 FROM blobs WHERE hash = x'04';
+         INSERT INTO item_version_inputs (version_id, input, role, source_hash, value_digest, recorded, anchor_id)
+           VALUES (2, 0, 'primary', x'04', x'0e', '{}', 1);
+         INSERT INTO item_derivations (item_id, source_item_id, source_version, source_hash, created_at)
+           VALUES (4, 2, 0, {h2}, 50);
+         INSERT INTO edit_drafts (item_id, doc_id, base_hash, base_version, after_job, updated_at)
+           VALUES (4, 3, x'04', 1, NULL, 60);
+         INSERT INTO ledger_pending (id, hash, ext, kind, job_id, created_at) VALUES (1, {h9}, 'png', 'place', 9, 70);"
+        // format! にせず置き換える（JSON の波かっこをそのまま書くため）
+        .replace("{h2}", &h(2))
+        .replace("{h9}", &h(9));
+    conn.execute_batch(&sql).unwrap();
 }
 
 /// 名前の一覧を読む。

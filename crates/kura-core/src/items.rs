@@ -1015,11 +1015,51 @@ pub struct TrashDeleted {
 
 /// ゴミ箱のアイテムの行を消し、使われなくなった台帳の行を同じトランザクションで解放する（docs/data-model.md §4。
 /// 中身ごとの事実・結果は CASCADE で消える）。実ファイルと派生のファイルは `Library::empty_trash` がコミットのあとで消す。
+/// 編集したアイテム（M12）は、版の行（CASCADE で消える）が持つファイル（元・猶予中の版）と、版の入力が使うアンカーも、
+/// ほかから参照されなければ解放する（利用者の決定 6。段 2 の最小の対応で、部品の行の片付けは段 3 の GC）。
 pub fn delete_trashed(conn: &Connection) -> Result<TrashDeleted> {
+    let versions = trashed_version_files(conn)?;
+    let anchors = trashed_anchors(conn)?;
     let items = delete_trashed_rows(conn)?;
-    let hashes: Vec<[u8; 32]> = items.iter().map(|item| item.hash).collect();
+    let anchor_files = crate::edit::anchors::sweep_unreferenced(conn, &anchors)?;
+    let mut hashes: Vec<[u8; 32]> = items.iter().map(|item| item.hash).collect();
+    hashes.extend(versions);
+    hashes.extend(anchor_files);
+    hashes.sort_unstable();
+    hashes.dedup();
     let released = crate::library::ledger::release(conn, &hashes)?;
     Ok(TrashDeleted { items, released })
+}
+
+/// ゴミ箱のアイテムの版が持つファイル（台帳の行の hash）。ゴミ箱の部分索引からたどる（CROSS JOIN で結ぶ順を決める。
+/// 統計のない小さな表では、版の表を走査する順を選ぶことがあるため）。
+fn trashed_version_files(conn: &Connection) -> Result<Vec<[u8; 32]>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT b.hash FROM items i
+           CROSS JOIN item_versions v ON v.item_id = i.id
+           JOIN blobs b ON b.id = v.file_blob_id
+          WHERE i.trashed_at IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        if let Ok(hash) = <[u8; 32]>::try_from(row?.as_slice()) {
+            out.push(hash);
+        }
+    }
+    Ok(out)
+}
+
+/// ゴミ箱のアイテムの版の入力が使うアンカーの ID（[`trashed_version_files`] と同じくゴミ箱の部分索引からたどる）。
+fn trashed_anchors(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT n.anchor_id FROM items i
+           CROSS JOIN item_versions v ON v.item_id = i.id
+           CROSS JOIN item_version_inputs n ON n.version_id = v.id
+          WHERE i.trashed_at IS NOT NULL AND n.anchor_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
 fn delete_trashed_rows(conn: &Connection) -> Result<Vec<RemovedItem>> {
@@ -1680,6 +1720,74 @@ mod tests {
             .unwrap();
         assert_eq!(left, 0);
         assert_eq!(crate::unit::members(&conn, unit).unwrap(), vec![2]);
+    }
+
+    /// 編集したアイテムでゴミ箱を空にすると、版が持つファイル（猶予中の版）とアンカーの台帳の行も解放する（決定 6）。
+    /// ほかのアイテムの版が持つ同じ中身（別名で保存した B の版 0 が持つ A の元）は残し、参照されない台帳の行は 0。
+    #[test]
+    fn emptying_the_trash_releases_versions_and_anchors_of_edited_items() {
+        use crate::edit::testing::{insert_anchor, insert_item, insert_version};
+        let conn = test_conn();
+        let (a, b) = (
+            insert_item(&conn, 1, [1; 32]),
+            insert_item(&conn, 2, [2; 32]),
+        );
+        let mine = insert_anchor(&conn, [10; 32], [20; 32]);
+        let theirs = insert_anchor(&conn, [10; 32], [21; 32]);
+        // A：元 [10]・猶予中の版 1 [11]・今の版 2 [1]（版 1 と 2 の入力がアンカーを使う）
+        insert_version(&conn, a, 0, [10; 32], "hold", None);
+        insert_version(&conn, a, 1, [11; 32], "waiting", Some(mine));
+        insert_version(&conn, a, 2, [1; 32], "hold", Some(mine));
+        // B：A から別名で保存（版 0 は A の元 [10]、版 1 は今 [2]、別のアンカー）
+        insert_version(&conn, b, 0, [10; 32], "hold", None);
+        insert_version(&conn, b, 1, [2; 32], "hold", Some(theirs));
+        trash(&conn, &[a], 5).unwrap();
+        let removed = delete_trashed(&conn).unwrap();
+        assert_eq!(removed.items.len(), 1);
+        let released: Vec<[u8; 32]> = removed.released.iter().map(|r| r.hash).collect();
+        assert_eq!(released, vec![[1; 32], [11; 32], [20; 32]]);
+        assert_eq!(
+            removed
+                .released
+                .iter()
+                .map(|r| r.ext.as_str())
+                .collect::<Vec<_>>(),
+            ["png", "png", "wav"]
+        );
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT count(*) FROM item_versions WHERE item_id = 1"),
+            0
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM item_versions WHERE item_id = 2"),
+            2
+        );
+        assert_eq!(count("SELECT count(*) FROM edit_anchors"), 1);
+        assert_eq!(crate::library::ledger::unreferenced(&conn).unwrap(), 0);
+        // 残った台帳の行：B の今 [2]・A の元 [10]（B の版 0 が持つ）・B のアンカー [21]
+        let mut left: Vec<Vec<u8>> = {
+            let mut stmt = conn.prepare("SELECT hash FROM blobs").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        left.sort();
+        assert_eq!(left, vec![vec![2; 32], vec![10; 32], vec![21; 32]]);
+        assert!(crate::db::violations(&conn).unwrap().is_empty());
+        // 集める問い合わせは、ゴミ箱の部分索引からたどる（items を走査しない）
+        for sql in [
+            "SELECT DISTINCT b.hash FROM items i CROSS JOIN item_versions v ON v.item_id = i.id
+               JOIN blobs b ON b.id = v.file_blob_id WHERE i.trashed_at IS NOT NULL",
+            "SELECT DISTINCT n.anchor_id FROM items i CROSS JOIN item_versions v ON v.item_id = i.id
+               CROSS JOIN item_version_inputs n ON n.version_id = v.id
+              WHERE i.trashed_at IS NOT NULL AND n.anchor_id IS NOT NULL",
+        ] {
+            let plan = query_plan(&conn, sql);
+            assert!(plan.contains("idx_items_trashed"), "{sql}\n{plan}");
+            assert!(!plan.contains("SCAN i") && !plan.contains("SCAN v"), "{sql}\n{plan}");
+        }
     }
 
     #[test]

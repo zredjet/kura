@@ -18,7 +18,9 @@ paths:
   投影の作り直し（`analysis.reproject` の印があるときだけ）の `sync_plan_reset_is_a_one_time_full_scan`、利用者が設定の
   「いま確かめる」を押したときだけ走る `items.blob_id` の確かめの `full_check_repairs_blob_ids_and_startup_leaves_them`。
   docs/data-model.md §4）。
-  起動ごと・ジョブごとに走る問い合わせを例外にしない（印や指紋で、変わったときだけ走らせる）。
+  起動ごと・ジョブごとに走る問い合わせを例外にしない（印や指紋で、変わったときだけ走らせる）。ただし、行が実行中の処理の分しか
+  ない小さな表は索引を持たずに走査してよい（今の例外：台帳の予告 `ledger_pending`。開くときの照合と `job_id` での削除。
+  `announcements_are_cleared_by_job`。docs/data-model.md §4「保存と版（M12）」）。
 - 10 万件のダミーデータ（`kura-devtools seed`）で、タグ 3 つの AND 検索が 50ms 以内であることを保つ。
 
 ## 表を作り直すとき（docs/data-model.md §5）
@@ -43,6 +45,11 @@ paths:
   （`nothing_replaces_rows_of_items` が kura-core の src を走査して見張る）。
 - `items` の `hash`・`ext`・`size_bytes` は台帳 `blobs` の写し（0007 のトリガ `items_blob_bi`・`items_blob_bu` が載せ、食い違えば
   `items_blob_mismatch` で断る）。台帳の行を消すのは `library::ledger::release` だけ（どの表からも参照されない行だけを消す）。
+  「参照」は `ledger::REFERRERS`（`items.hash`・`item_versions.file_blob_id`・`edit_anchors.blob_id`。M12）で、`blobs` を ON DELETE
+  CASCADE でなく参照する列を足したらここにも足す（`release_sees_every_table_that_references_the_ledger` が見張る）。items のトリガを
+  通らないファイル（版の出力・アンカー）は `ledger::register` で載せ、台帳にまだない中身を `files/` に置く・台帳から外した中身を
+  消すときは、`Library::ingest_exclusive` を持って予告（`ledger::announce`）をコミットしてから行う（開くときに `settle_pending`
+  が照らす）。
 - 中身に依る書き込み（解析・サムネイル・プロキシの結果）は `WHERE id = ? AND hash = ?` のようにハッシュを条件にする
   （解析・サムネイルは M11、プロキシは M12 で入れた）。
 - `items.blob_id` は台帳の行の ID の写し（0010 の AFTER のトリガ `items_blob_id_ai`・`items_blob_id_au` が hash から引いて入れる）。

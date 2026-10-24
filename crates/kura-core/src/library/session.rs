@@ -1,4 +1,5 @@
-//! 開いているライブラリとそのジョブ。開くときの手順（staging の掃除 → 整合性チェック → ジョブの再開）をまとめる。
+//! 開いているライブラリとそのジョブ。開くときの手順（staging の掃除 → 台帳の予告の照合 → 整合性チェック → ジョブの再開）を
+//! まとめる。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -6,6 +7,7 @@ use std::thread::JoinHandle;
 
 use super::backup;
 use super::integrity::{self, IntegrityReport, clean_staging};
+use super::ledger;
 use super::upgrade::UpgradeHooks;
 use super::{Library, LibraryLock};
 use crate::Result;
@@ -129,6 +131,12 @@ impl LibrarySession {
                 .collect::<std::result::Result<_, _>>()?)
         })?;
         let staging_removed = clean_staging(library.layout(), &keep)?;
+        // 台帳の予告の照合（M12 の保存・段 3 の GC が途中で落ちた分）：台帳にないファイルを片付けてから、整合性チェックと
+        // ジョブを動かす（チェックが置きかけのファイルを「DB にないファイル」と数えないように。docs/data-model.md §4）
+        let settled = ledger::settle_pending(library.db(), library.layout())?;
+        if settled > 0 {
+            tracing::info!(settled, "台帳の予告を片付けました");
+        }
         let proxy = Arc::new(ProxyShared::default());
         let analysis = Arc::new(AnalyzeShared::default());
         let mut handlers: Vec<(JobKind, Arc<dyn crate::jobs::JobHandler>)> = vec![
@@ -423,6 +431,45 @@ mod tests {
         let session = LibrarySession::open(&path, sink(), services()).unwrap();
         session.wait_ready();
         assert_eq!(session.integrity().unwrap().staging_removed, 1);
+    }
+
+    /// 保存が予告のあと・台帳に載せる前に落ちた（置いたファイルが台帳にない）ライブラリを開くと、整合性チェックの前に予告を
+    /// 照らしてファイルを片付けるので、「DB にないファイル」が数えられない。
+    #[test]
+    fn opening_settles_announcements_before_the_integrity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("L.kuralib");
+        let placed = [7u8; 32];
+        {
+            let session = LibrarySession::create(&path, sink(), services()).unwrap();
+            session.wait_ready();
+            let lib = session.library();
+            lib.db()
+                .write(move |tx| {
+                    ledger::announce(tx, &placed, "png", ledger::PendingKind::Place, Some(1), 1)
+                })
+                .unwrap();
+            let file = lib.layout().content_path(&placed, "png");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
+        }
+        let session = LibrarySession::open(&path, sink(), services()).unwrap();
+        session.wait_ready();
+        let report = session.integrity().unwrap();
+        assert_eq!((report.orphan_files, report.missing_files), (0, 0));
+        assert!(
+            !session
+                .library()
+                .layout()
+                .content_path(&placed, "png")
+                .exists()
+        );
+        let left: i64 = session
+            .library()
+            .db()
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM ledger_pending", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(left, 0);
     }
 
     #[test]

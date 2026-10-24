@@ -64,6 +64,10 @@ impl From<CoreError> for AppError {
             CoreError::NotFound(_) => AppErrorCode::NotFound,
             CoreError::Conflict(_) => AppErrorCode::Conflict,
             CoreError::Invalid(_) => AppErrorCode::Invalid,
+            // 保存（M12）：大きすぎるものは TooLarge、書けない形式などは入力の誤り、記録との食い違いは競合として返す
+            CoreError::TooLarge(_) => AppErrorCode::TooLarge,
+            CoreError::Unsupported(_) => AppErrorCode::Invalid,
+            CoreError::Mismatch(_) => AppErrorCode::Conflict,
             CoreError::Io(_) => AppErrorCode::Io,
             CoreError::Db(_) | CoreError::Json(_) | CoreError::DbClosed => AppErrorCode::Db,
             CoreError::ToolMissing(_) => AppErrorCode::ToolMissing,
@@ -112,6 +116,12 @@ mod tests {
         assert_eq!(err.code, AppErrorCode::Invalid);
         let err: AppError = CoreError::DbClosed.into();
         assert_eq!(err.code, AppErrorCode::Db);
+        let err: AppError = CoreError::TooLarge("x".into()).into();
+        assert_eq!(err.code, AppErrorCode::TooLarge);
+        let err: AppError = CoreError::Unsupported("x".into()).into();
+        assert_eq!(err.code, AppErrorCode::Invalid);
+        let err: AppError = CoreError::Mismatch("x".into()).into();
+        assert_eq!(err.code, AppErrorCode::Conflict);
         let err: AppError = CoreError::LibraryInUse.into();
         assert_eq!(err.code, AppErrorCode::LibraryInUse);
         assert!(

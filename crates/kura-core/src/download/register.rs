@@ -17,7 +17,7 @@ use crate::Result;
 use crate::db::Db;
 use crate::import::place::{place, stage};
 use crate::import::store::{
-    NewItem, add_tag, add_to_folder, add_unit_member, create_unit, ensure_tag, find_by_hash,
+    NewItem, add_tag, add_to_folder, add_unit_member, create_unit, ensure_tag, find_owner,
     folder_exists, insert_item, restore_item, unit_exists,
 };
 use crate::import::{MediaKind, Rejected, classify_file, mime_for};
@@ -240,8 +240,9 @@ pub fn place_all(
 }
 
 /// 配置したファイルを DB に入れる（アイテム・フォルダ・タグ・ユニット・`remote_sources`）。
-/// 同じ中身がすでにあれば、そのアイテムに所属とタグを足し、空いている取得元と投稿日だけ埋める。
-/// 同じ中身で拡張子だけ違うコピー（台帳の拡張子と違う `files/` のファイル）は、どの行も使わないのでここで消す。
+/// 同じ中身がすでにあれば（アイテムの今・元・過去の版。M12）、そのアイテムに所属とタグを足し、空いている取得元と投稿日だけ
+/// 埋める。同じ中身で拡張子だけ違うコピー（台帳の拡張子と違う `files/` のファイル）と、消えた過去の版と同じ中身のコピー
+/// （台帳に行がない）は、どの行も使わないのでここで消す。台帳にだけある中身（アンカーなど）は台帳の拡張子で入れる。
 /// [`place_all`] がジョブ `job_id` に付けた probe の印を、同じトランザクションで片付ける。
 pub fn write_entries(
     tx: &Connection,
@@ -271,10 +272,11 @@ pub fn write_entries(
         };
         let meta = &file.meta;
         let title = nfc(&meta.title);
-        let item_id = match find_by_hash(tx, &placed.hash)? {
+        // 今・元・過去の版のどれかと同じ中身なら、そのアイテムの重複（docs/editing.md §14）
+        let item_id = match find_owner(tx, &placed.hash)? {
             Some(existing) => {
                 out.duplicates += 1;
-                remove_other_ext_copy(tx, layout, &placed.hash, &file.ext)?;
+                remove_unused_copy(tx, layout, &placed.hash, &file.ext, true)?;
                 if existing.trashed {
                     restore_item(tx, existing.id, now)?;
                 }
@@ -294,13 +296,16 @@ pub fn write_entries(
                 existing.id
             }
             None => {
+                // 台帳にだけある中身（アンカーなど）は、台帳の拡張子で入れる（items のトリガが食い違いを断るため）
+                let kept = remove_unused_copy(tx, layout, &placed.hash, &file.ext, false)?;
+                let ext = kept.as_deref().unwrap_or(&file.ext);
                 let id = insert_item(
                     tx,
                     &NewItem {
                         hash: &placed.hash,
-                        ext: &file.ext,
+                        ext,
                         kind: file.kind,
-                        mime: mime_for(&file.ext),
+                        mime: mime_for(ext),
                         size: placed.size,
                         title: &title,
                         original_name: &file.name,
@@ -387,29 +392,33 @@ pub fn write_entries(
 }
 
 /// 同じ取得元（サイト・ID）のアイテムが入っているユニット。
-/// 同じ中身で拡張子だけ違うコピー（`files/<hash>.<ext>` で、台帳の拡張子と違うもの）を消す。どの行も使わない
+/// 置いたコピー（`files/<hash>.<ext>`）は、台帳にその中身が同じ拡張子で載っているときだけ使われる。台帳の拡張子と違う
+/// コピーと、持ち主がいる（`owned`）のに台帳に行がない（消えた過去の版と同じ中身の）コピーは、どの行も使わないので消す
 /// （CLAUDE.md の「files/ を DB を通さずに消さない」に沿って、書き込みのトランザクションの中で台帳を見てから消す）。
-fn remove_other_ext_copy(
+/// 台帳の拡張子を返す（載っていなければ None）。
+fn remove_unused_copy(
     conn: &Connection,
     layout: &Layout,
     hash: &[u8; 32],
     ext: &str,
-) -> Result<()> {
-    let Some(kept) = crate::library::ledger::ext_of(conn, hash)? else {
-        return Ok(());
+    owned: bool,
+) -> Result<Option<String>> {
+    let kept = crate::library::ledger::ext_of(conn, hash)?;
+    let unused = match &kept {
+        Some(kept) => kept != ext,
+        None => owned,
     };
-    if kept == ext {
-        return Ok(());
-    }
-    let path = layout.content_path(hash, ext);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            tracing::warn!(%err, path = %path.display(), "拡張子だけ違うコピーを消せませんでした");
+    if unused {
+        let path = layout.content_path(hash, ext);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "どの行も使わないコピーを消せませんでした");
+            }
         }
     }
-    Ok(())
+    Ok(kept)
 }
 
 fn unit_of_remote(conn: &Connection, site: &str, remote_id: &str) -> Result<Option<i64>> {
@@ -801,6 +810,86 @@ mod tests {
                 lib.db().read(|c| crate::settings::get(c, key)).unwrap();
             assert_eq!(left, None, "{key}");
         }
+    }
+
+    /// S14（docs/editing.md §14.1）：取得したファイルが、あるアイテムの元・消えた過去の版と同じ中身なら、そのアイテムの重複に
+    /// なり、孤立したファイルが残らない（消えた版と同じ中身のコピーは台帳に行がないので、書き込みのトランザクションの中で消す）。
+    /// 版の行は、保存のジョブ（段 2 の B）の代わりにテストの補助で入れる。
+    #[test]
+    fn download_duplicate_of_original_or_released_version_is_owned() {
+        use crate::edit::testing::insert_version_with;
+        let dir = tempfile::tempdir().unwrap();
+        let lib = crate::library::Library::create(&dir.path().join("L")).unwrap();
+        let layout = lib.layout().clone();
+        let put = |hash: [u8; 32], ext: &str| {
+            let path = layout.content_path(&hash, ext);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "abc").unwrap();
+        };
+        // アイテム（今 [5]）：元 [6]・版 1 [7]（GC で消えた）・版 2 が今
+        let id = lib
+            .db()
+            .write(|tx| {
+                let id = insert_item(
+                    tx,
+                    &NewItem {
+                        hash: &[5; 32],
+                        ext: "jpg",
+                        kind: MediaKind::Image,
+                        mime: None,
+                        size: 3,
+                        title: "手元",
+                        original_name: "a.jpg",
+                        original_path: "/a.jpg",
+                        info: None,
+                        source_site: "local",
+                        source_url: None,
+                        captured_at: None,
+                        now: 1,
+                    },
+                )?;
+                insert_version_with(tx, id, 0, [6; 32], "jpg", 3, "hold", None);
+                insert_version_with(tx, id, 1, [7; 32], "jpg", 3, "released", None);
+                insert_version_with(tx, id, 2, [5; 32], "jpg", 3, "hold", None);
+                Ok(id)
+            })
+            .unwrap();
+        put([5; 32], "jpg");
+        put([6; 32], "jpg");
+        // 取得したファイル（どちらも jpg）を place_all が置いたところ（元と同じ中身は、もうあるので置き直さない）
+        put([7; 32], "jpg");
+        let written = layout.clone();
+        let out = lib
+            .db()
+            .write(move |tx| {
+                write_entries(
+                    tx,
+                    &written,
+                    vec![entry(6, meta("7", 1, false)), entry(7, meta("8", 1, false))],
+                    None,
+                    Origin::Download,
+                    1,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            (out.added, out.duplicates, out.item_ids.clone()),
+            (0, 2, vec![id, id])
+        );
+        assert!(layout.content_path(&[6; 32], "jpg").exists());
+        assert!(
+            !layout.content_path(&[7; 32], "jpg").exists(),
+            "消えた版と同じ中身のコピーが残った"
+        );
+        let items: i64 = lib
+            .db()
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM items", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(items, 1);
+        assert_eq!(
+            crate::library::check_files(lib.db(), lib.layout()).unwrap(),
+            (0, 0)
+        );
     }
 
     #[test]

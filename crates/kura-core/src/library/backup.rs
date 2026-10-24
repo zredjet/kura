@@ -455,7 +455,8 @@ mod tests {
                 "0007_blobs_and_kinds",
                 "0008_jobs_named_checks",
                 "0009_analysis",
-                "0010_items_blob_id"
+                "0010_items_blob_id",
+                "0011_edit_versions"
             ]
         );
         // 当てたあとの WAL は空
