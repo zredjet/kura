@@ -9,7 +9,9 @@
 Kura Library.kuralib/
   library.sqlite            # DB（-wal, -shm も同居）
   library.lock              # ライブラリのロック（中身は空。開いている間 flock を持つ。2 つ目のアプリは開けない。M12。下の注）
-  files/ab/cd/<blake3>.<ext>    # 実ファイル（内容アドレス。ハッシュ先頭 2 文字 / 次の 2 文字）。1 つに台帳 blobs の 1 行
+  files/ab/cd/<blake3>.<ext>    # 実ファイル（内容アドレス。ハッシュ先頭 2 文字 / 次の 2 文字）。1 つに台帳 blobs の 1 行。アイテムの今の
+                                #   ほか、M12 から編集したアイテムの元・猶予中の版（置き換えから 7 日。段 3 の GC が消す）・アンカー
+                                #   （再現を約束しないデコーダで読んだ元の読み取り結果。PNG・APNG・f32 の WAV）も置く
   thumbs/ab/<blake3>_s.{jpg,png}  # サムネイル 長辺 512px（グリッド用）。透明のないものは JPEG、透明のあるものは PNG（M11）
   thumbs/ab/<blake3>_l.{jpg,png}  # サムネイル 長辺 1600px（インスペクタ・プレビュー用）
   art/ab/<blake3>.jpg           # 音楽のジャケット画像
@@ -18,7 +20,9 @@ Kura Library.kuralib/
   anim/ab/<blake3>-1.png        # アニメの帯（見たときにその場で作る。末尾は帯の並べ方の版 ANIM_V。tEXt `kura-anim` に帯の情報と作った元の鍵。
                                 #   staging/anim-<pid>-<連番>.png.part に書いてから改名する。M11）
   staging/                      # 取り込み・ダウンロード・キャプチャの一時置き場。M11 から、波形の段・アニメの帯の書きかけと、
-                                #   エンジンの ffmpeg の段の一時ファイル（staging/engine/）も置く。開くときに消す
+                                #   エンジンの ffmpeg の段の一時ファイル（staging/engine/）も置く。M12 から、保存のジョブの書きかけ
+                                #   （staging/edit-<job>-out.<ext>.part・staging/edit-<job>-anchor.<png|wav>.part。sync_all してから
+                                #   files/ へ同じボリュームの中で改名する）も置く。開くときに消す
   archives/                     # yt-dlp / gallery-dl の download-archive
   logs/                         # ジョブのログ
   backups/library-YYYYMMDD-HHMMSS.sqlite  # DB のバックアップ（UTC。新しい 7 個。FR-SYS-03・ADR-121。マイグレーションの前のものも同じ名前。§5）
@@ -84,6 +88,7 @@ Kura Library.kuralib/
 | `0008_jobs_named_checks` | `jobs` を作り直し、`jobs_kind`（`analyze` を足す）・`jobs_state` に名前を付ける |
 | `0009_analysis` | 中身ごとの事実 `media_facts`・解析の結果 `analysis_results`（どちらも `blob_id` が鍵で、台帳の行を消すと CASCADE）と、アイテムごとの素材の設定 `asset_settings`（`item_id` が鍵で CASCADE） |
 | `0010_items_blob_id` | `items.blob_id`（台帳の行の ID の写し。CHECK・外部キーなしの `ADD COLUMN`）を足して hash から埋め、`idx_items_blob` と、入れる・hash を変えるときに台帳から引いて入れる AFTER のトリガ `items_blob_id_ai`・`items_blob_id_au` を作る（M12。検索の事実の条件を整数の鍵で引く。M11 の決定 17。10 万件で約 0.2 秒） |
+| `0011_edit_versions` | 保存と版（M12 の段 2。docs/editing.md §4.4・§9.4・§14）：文書の部品 `edit_objects`・`edit_edges`、版 `item_versions`、版の入力 `item_version_inputs`、アンカー `edit_anchors`、来歴 `item_derivations`、下書き `edit_drafts`、台帳の予告 `ledger_pending` を足し、`jobs_kind` に `edit`・`gc` を足す（名前付きの CHECK の入れ替え）。新しい表だけなので Plain。版 0（元）は最初の保存のときに足すので、既存のアイテムには行を足さない（10 万件でも表を作るだけ。合成 10 万件 `--history` で 1.18〜1.21 ms。`bench migrate --runs 3`、2026-10-24）。台帳を参照する列（`item_versions.file_blob_id`・`edit_anchors.blob_id`）は ON DELETE なし（`ledger::REFERRERS` に足した）、items を参照する列は CASCADE（来歴の元だけ SET NULL） |
 
 ```sql
 -- ===== 実ファイルの台帳（0007。files/ab/cd/<hash>.<ext> 1 つに 1 行）=====
@@ -353,8 +358,8 @@ CREATE INDEX idx_play_events_item ON play_events(item_id, played_at DESC);
 -- ===== ジョブ =====
 CREATE TABLE jobs (                                -- 0008 で作り直した形
   id            INTEGER PRIMARY KEY,
-  kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）
-                CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze')),
+  kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）、0011：edit（M12 の保存）・gc（M12 の段 3）
+                CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc')),
   state         TEXT    NOT NULL
                 CONSTRAINT jobs_state CHECK (state IN ('queued','running','paused','done','failed','canceled')),
   priority      INTEGER NOT NULL DEFAULT 0,
@@ -515,6 +520,123 @@ CREATE TABLE asset_settings (
 CREATE INDEX idx_asset_settings_pixel_art ON asset_settings(pixel_art) WHERE pixel_art IS NOT NULL;
 CREATE INDEX idx_asset_settings_loop      ON asset_settings(item_id) WHERE loop_start IS NOT NULL;
 
+-- ===== 文書の部品（0011。M12 の段 2。docs/editing.md §4.4 の doc・node・chunk。同じ中身の部品は 1 行）=====
+CREATE TABLE edit_objects (
+  id          INTEGER PRIMARY KEY,
+  digest      BLOB    NOT NULL UNIQUE,               -- 部品のダイジェスト（ドメイン付き BLAKE3。本文から求め直して照らす）
+  kind        TEXT    NOT NULL CONSTRAINT edit_objects_kind CHECK (kind IN ('doc','node','chunk')),
+  body        BLOB    NOT NULL,                      -- 正規の JSON（UTF-8）。子は 16 進のダイジェストで書く
+  created_at  INTEGER NOT NULL
+);
+CREATE TABLE edit_edges (                          -- 親の部品 → 子の部品（本文に書いた順。同じ子が 2 度出てもよい）
+  parent_id   INTEGER NOT NULL REFERENCES edit_objects(id) ON DELETE CASCADE,
+  ord         INTEGER NOT NULL CONSTRAINT edit_edges_ord CHECK (ord >= 0),
+  child_id    INTEGER NOT NULL REFERENCES edit_objects(id),   -- 参照されている部品は消せない（片付けは段 3 の GC）
+  PRIMARY KEY (parent_id, ord)
+) WITHOUT ROWID;
+CREATE INDEX idx_edit_edges_child ON edit_edges(child_id);
+
+-- ===== アンカー（0011。元のファイル × 読み方の設定ごとに 1 行。docs/editing.md §9.4）=====
+CREATE TABLE edit_anchors (
+  id              INTEGER PRIMARY KEY,
+  source_hash     BLOB    NOT NULL,                  -- 元のファイルの中身
+  options_digest  BLOB    NOT NULL,                  -- 読み方の設定（DecodeOptions の正規の JSON）のダイジェスト
+  options         TEXT    NOT NULL,
+  decoded         TEXT    NOT NULL,                  -- 元を読んだ記録（DecodeStamp の正規の JSON）
+  value_digest    BLOB    NOT NULL,
+  blob_id         INTEGER NOT NULL REFERENCES blobs(id),       -- アンカーのファイル（ON DELETE なし。REFERRERS）
+  created_at      INTEGER NOT NULL,
+  UNIQUE (source_hash, options_digest)
+);
+CREATE INDEX idx_edit_anchors_blob ON edit_anchors(blob_id);
+
+-- ===== 版（0011。アイテムごとに 0..n。版 0＝元は最初の保存のときに足す。行がなければ「版 0 は暗に今、頭は 0」）=====
+CREATE TABLE item_versions (
+  id            INTEGER PRIMARY KEY,
+  item_id       INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  version       INTEGER NOT NULL CONSTRAINT item_versions_version CHECK (version >= 0),
+  kind          TEXT    NOT NULL CONSTRAINT item_versions_kind CHECK (kind IN ('original','edit','revert')),
+  doc_id        INTEGER REFERENCES edit_objects(id),  -- 文書の根の部品。版 0 と、版 0 に戻した版は NULL（空の文書）
+  base_version  INTEGER,                              -- 保存したときの土台の版
+  revert_to     INTEGER,                              -- 戻した先の版（revert だけ）
+  output_hash   BLOB    NOT NULL,                     -- 出力の中身（items.hash と同じ生の BLAKE3）
+  ext           TEXT    NOT NULL,
+  size_bytes    INTEGER NOT NULL CONSTRAINT item_versions_size CHECK (size_bytes >= 0),
+  format        TEXT,
+  value_digest  BLOB,                                 -- 描いた値のダイジェスト（作り直しの照合）
+  width         INTEGER,
+  height        INTEGER,
+  duration_ms   INTEGER,
+  record        TEXT    NOT NULL,                     -- VersionRecord（JSON。エンジンの版・エンコーダ・読み取りの記録・メディア情報・警告）
+  file_blob_id  INTEGER REFERENCES blobs(id),         -- この版が持つファイル（released なら NULL。ON DELETE なし。REFERRERS）
+  file_state    TEXT    NOT NULL CONSTRAINT item_versions_file_state
+                CHECK (file_state IN ('hold','waiting','kept','released')),
+                -- hold：今か元（消さない）／waiting：頭でなくなった（7 日と、置き換えより前のバックアップの条件で段 3 の GC が消す）／
+                -- kept：GC の照合が合わず残す（段 3）／released：もうファイルを持たない
+  replaced_at   INTEGER,                              -- 頭でなくなった時刻（hold のときだけ NULL）
+  job_id        INTEGER,                              -- 頭になった行を作った保存のジョブ（再開で版を 2 つ足さない）
+  created_at    INTEGER NOT NULL,
+  UNIQUE (item_id, version),
+  CONSTRAINT item_versions_original CHECK ((version = 0) = (kind = 'original')),
+  CONSTRAINT item_versions_lineage CHECK (
+       (kind = 'original' AND doc_id IS NULL AND base_version IS NULL AND revert_to IS NULL)
+    OR (kind = 'edit'     AND doc_id IS NOT NULL AND base_version IS NOT NULL AND revert_to IS NULL)
+    OR (kind = 'revert'   AND base_version IS NOT NULL AND revert_to IS NOT NULL AND revert_to < version)),
+  CONSTRAINT item_versions_file     CHECK ((file_state = 'released') = (file_blob_id IS NULL)),
+  CONSTRAINT item_versions_replaced CHECK ((file_state = 'hold') = (replaced_at IS NULL))
+);
+CREATE INDEX idx_item_versions_output    ON item_versions(output_hash);       -- 重複の判定（find_owner）
+CREATE INDEX idx_item_versions_file_blob ON item_versions(file_blob_id);      -- 台帳の行が参照されているか（REFERRERS）
+CREATE INDEX idx_item_versions_doc       ON item_versions(doc_id);
+CREATE INDEX idx_item_versions_waiting   ON item_versions(replaced_at) WHERE file_state = 'waiting';   -- 段 3 の GC
+CREATE UNIQUE INDEX idx_item_versions_job ON item_versions(job_id) WHERE job_id IS NOT NULL;
+-- 不変条件（段 2 の C の `edit::versions::check_invariants`）：版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。版 0 と頭は hold。
+-- 頭の output_hash・ext は items.hash・ext に等しい。hold・waiting・kept の file_blob_id が指す台帳の行の hash は output_hash と同じ
+
+-- ===== 版の入力（0011。版ごとの入力の記録）=====
+CREATE TABLE item_version_inputs (
+  version_id    INTEGER NOT NULL REFERENCES item_versions(id) ON DELETE CASCADE,
+  input         INTEGER NOT NULL CONSTRAINT item_version_inputs_input CHECK (input >= 0),
+  role          TEXT    NOT NULL CONSTRAINT item_version_inputs_role CHECK (role IN ('primary','fixed','selection')),
+  source_hash   BLOB    NOT NULL,
+  value_digest  BLOB    NOT NULL,
+  recorded      TEXT    NOT NULL,                    -- RecordedInput の正規の JSON
+  anchor_id     INTEGER REFERENCES edit_anchors(id),  -- 読んだアンカー（あれば）
+  PRIMARY KEY (version_id, input)
+) WITHOUT ROWID;
+CREATE INDEX idx_item_version_inputs_anchor ON item_version_inputs(anchor_id);
+
+-- ===== 来歴（0011。別名で保存したアイテムが、どのアイテムのどの版から作られたか）=====
+CREATE TABLE item_derivations (
+  item_id         INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+  source_item_id  INTEGER REFERENCES items(id) ON DELETE SET NULL,
+  source_version  INTEGER NOT NULL,
+  source_hash     BLOB    NOT NULL,
+  created_at      INTEGER NOT NULL
+);
+CREATE INDEX idx_item_derivations_source ON item_derivations(source_item_id);
+
+-- ===== 下書き（0011。アイテムごとに保存していない文書 1 つ。docs/editing.md §12.12）=====
+CREATE TABLE edit_drafts (
+  item_id       INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+  doc_id        INTEGER NOT NULL REFERENCES edit_objects(id),
+  base_hash     BLOB    NOT NULL,                    -- 編集を始めたときの今
+  base_version  INTEGER NOT NULL,
+  after_job     INTEGER,                             -- この下書きを保存しているジョブ（終われば土台を進める）
+  updated_at    INTEGER NOT NULL
+);
+CREATE INDEX idx_edit_drafts_doc ON edit_drafts(doc_id);
+
+-- ===== 台帳の予告（0011。台帳にまだない中身を files/ に置く・台帳から外した中身を消す前に書く。§4「保存と版（M12）」）=====
+CREATE TABLE ledger_pending (                      -- 索引なし（実行中の保存・GC の分だけの小さな表。§4 の例外）
+  id          INTEGER PRIMARY KEY,
+  hash        BLOB    NOT NULL,
+  ext         TEXT    NOT NULL,
+  kind        TEXT    NOT NULL CONSTRAINT ledger_pending_kind CHECK (kind IN ('place','delete')),
+  job_id      INTEGER,
+  created_at  INTEGER NOT NULL
+);
+
 -- ===== 全文検索（外部コンテンツ FTS5、trigram）=====
 CREATE VIRTUAL TABLE items_fts USING fts5(
   title, original_name, note, source_url,
@@ -580,18 +702,99 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 ### 台帳で数える（M11）
 
 - 容量：`SELECT coalesce(sum(size_bytes), 0) FROM blobs`（覆う索引 `idx_blobs_size`）。ゴミ箱のものも含む。
-- 取り込みの重複の見込み：`SELECT hash, ext FROM blobs WHERE size_bytes = ?`（`idx_blobs_size`）。重複の判定（`find_by_hash`）は
-  M11 では items のまま（台帳と items が 1 対 1 なので同じ結果。M12 で台帳を引く形に広げる）。
+- 取り込みの重複の見込み：`SELECT hash, ext FROM blobs WHERE size_bytes = ?`（`idx_blobs_size`）。重複の判定は M12 から
+  `import::store::find_owner`（アイテムの今 → 元 → 過去の版。下の「保存と版（M12）」。M11 は items の `find_by_hash` だけ）。
 - 整合性チェック：`files/` にあるはずのファイルは台帳の `(hash, ext)` から作る。どの表からも参照されない台帳の行も数える
   （`unreferencedBlobs`）。起動時と設定の「いま確かめる」は同じ `library::check_integrity` で、いま確かめるとき（`Full`）だけ
   `items.blob_id` が hash の台帳の行と食い違うアイテムを直す（`repair_blob_ids`。M12）。
 - ゴミ箱を空にする：items の行を消したのと同じトランザクションで、どの表からも参照されなくなった台帳の行を `ledger::release` で
-  消す（事実・結果は CASCADE）。コミットのあとで、解放した中身の実ファイルと派生のファイルを消す（ADR-46 の順）。
-  取り込み（files/ に置く → DB に書く）とは `Library` の 1 つの鍵で直列にする（置いたばかりの同じ中身を消さないように）。
-- 「どの表からも参照されない」は、`blobs` を参照する CASCADE でない外部キーをすべて見る（`ledger::REFERRERS`。表を足すと
-  テスト `release_sees_every_table_that_references_the_ledger` が落ちる。M12 の版・アンカーの行を消さないため）。
-- ダウンロード・キャプチャで、同じ中身を別の拡張子で取ったときに置いたコピーは、書き込みのトランザクションの中で台帳の拡張子と
-  比べ、違う拡張子のファイルだけを消す。
+  消す（事実・結果は CASCADE）。編集したアイテム（M12）は、版の行が持つファイルとアンカーも解放する（下の「保存と版（M12）」）。
+  コミットのあとで、解放した中身の実ファイルと派生のファイルを消す（ADR-46 の順）。
+  取り込み（files/ に置く → DB に書く）とは `Library` の 1 つの鍵で直列にする（置いたばかりの同じ中身を消さないように。
+  ゴミ箱を空にする処理は書きの側 `Library::ingest_exclusive`、取り込みは読みの側 `ingest_guard`）。
+- 「どの表からも参照されない」は、`blobs` を参照する CASCADE でない外部キーをすべて見る（`ledger::REFERRERS`：`items.hash`・
+  `item_versions.file_blob_id`・`edit_anchors.blob_id`（M12）。3 つの NOT EXISTS はそれぞれ `sqlite_autoindex_items_1`・
+  `idx_item_versions_file_blob`・`idx_edit_anchors_blob` で引く。表を足すとテスト `release_sees_every_table_that_references_the_ledger`
+  が落ちる）。
+- 取り込み・ダウンロード・キャプチャで置いたコピー（`files/<hash>.<取り込んだ拡張子>`）は、書き込みのトランザクションの中で台帳と
+  比べ、台帳にその中身が同じ拡張子で載っているときだけ残す。違う拡張子のコピーと、持ち主（今・元・過去の版）がいるのに台帳に
+  行がない（消えた過去の版と同じ中身の）コピーは消す（取り込みはコミットのあと、ダウンロード・キャプチャはトランザクションの
+  中で）。持ち主がいなくても台帳に行がある中身（アンカーのファイルなど）は、台帳の拡張子で新しいアイテムを入れる（items の
+  トリガ `items_blob_mismatch` が拡張子の食い違いを断るため）。
+
+### 保存と版（M12。`crates/kura-core/src/edit/`・`library/ledger.rs`・`import/store.rs`）
+
+段 2 の A で入れたもの（版の読み書き・保存のジョブ・下書きは B・C で足す）。
+
+- **重複の判定**（`import::store::find_owner`。取り込み・ダウンロード・キャプチャ）：今 → 元 → 過去の版の順に、2 段の問い合わせで
+  探す（どちらも索引。テスト `find_owner_looks_at_current_then_original_then_past_versions` の EXPLAIN）。
+
+  ```sql
+  SELECT id, ext, trashed_at IS NOT NULL FROM items WHERE hash = ?1;                     -- sqlite_autoindex_items_1
+  SELECT v.item_id, i.ext, i.trashed_at IS NOT NULL, v.version
+    FROM item_versions v JOIN items i ON i.id = v.item_id
+   WHERE v.output_hash = ?1                                                              -- idx_item_versions_output
+   ORDER BY v.version <> 0, v.item_id, v.version DESC LIMIT 1;
+  ```
+
+  持ち主が見つかれば（どの役割でも）そのアイテムの重複（所属・タグを足し、ゴミ箱から戻す）。置いたコピーの扱いは上の「台帳で数える」。
+- **台帳の門**：台帳にまだない中身を `files/` に置いて台帳に載せる処理（保存の「予告 → 配置 → コミット → 後始末」）と、台帳から外して
+  ファイルを消す処理（ゴミ箱を空にする・段 3 の GC）は、取り込みの鍵の書きの側（`Library::ingest_exclusive`）を持つ。取り込み・
+  ダウンロード・キャプチャは「置いてから DB に書く」まで読みの側を持つので、取り込みが「もう置いてある」と判断した同じ中身を、
+  保存が台帳に載せる前に消すことがない。描く・エンコードする間は持たない。
+- **予告と照合**（`ledger::announce`・`clear_announced`・`settle_pending`）：台帳にない中身を置く前に `ledger_pending` に
+  `(hash, ext, 'place', job)` を書いてコミットし、台帳に載せるトランザクションで `DELETE FROM ledger_pending WHERE job_id = ?` で消す
+  （段 3 の GC は消す前に `'delete'`）。ライブラリを開くとき、staging の掃除の直後・整合性チェックとジョブの前に同期で照らす
+  （`LibrarySession::start`。片付けた数はログ）：
+
+  ```sql
+  SELECT p.id, p.hash, p.ext,
+         EXISTS (SELECT 1 FROM blobs b WHERE b.hash = p.hash AND b.ext = p.ext),   -- 置き終えて載せた（消すのをやめた）
+         EXISTS (SELECT 1 FROM blobs b WHERE b.hash = p.hash)                      -- ほかの拡張子で載っている
+    FROM ledger_pending p ORDER BY p.id;
+  ```
+
+  同じ拡張子で台帳にあれば予告の行だけを消す。なければ `files/<hash>.<ext>` を消し、どの拡張子でも台帳にない中身なら派生の
+  ファイル（`Layout::derived_paths`）も消してから予告の行を消す（ほかの拡張子で載っている中身の派生は、そのアイテムのもの）。
+  消せなかったファイルの予告は残し、次に開くときにやり直す。電源断で DB の最後のコミットを失っても、残りうるのは「DB にない
+  ファイル」だけ（置く前に `sync_all`）。
+- **索引なしの例外**：`ledger_pending` は実行中の保存・GC の分だけの小さな表なので索引を持たず、開くときの照合と
+  `DELETE FROM ledger_pending WHERE job_id = ?` は走査する（`announcements_are_cleared_by_job` の EXPLAIN。台帳の側は hash の一意の
+  索引で引く）。
+- **台帳に載せる**（`ledger::register`）：items のトリガを通らないファイル（版の出力・アンカー）は
+  `INSERT INTO blobs … ON CONFLICT(hash) DO NOTHING` のあと行を読み、拡張子・サイズが食い違えば items のトリガと同じ言葉
+  （`items_blob_mismatch`）の Conflict。
+- **文書の部品**（`edit::store`。部品の形は docs/editing.md §4.4）：置く（`put_doc`）ときは子から順に
+  `INSERT INTO edit_objects … ON CONFLICT(digest) DO NOTHING` → `SELECT id FROM edit_objects WHERE digest = ?`、新しく入れた親の分だけ
+  `edit_edges` を足す（すでにある部品の辺はもうある）。筆 200 本の文書に 10 本足して置くと、新しい行は最後の切れ目・描画のノード・
+  根の 3 行と、その辺だけ（`appending_ten_strokes_writes_only_the_last_chunk_the_node_and_the_root`）。読む（`load_doc_bytes`）ときは
+  根から 2 段の子を 1 つの問い合わせで集め、`doc_parts::join` で本文からダイジェストを求め直して照らしてつなぐ（`load_doc` は
+  さらに `Engine::load`）。根のダイジェストから行を引くのは `SELECT id FROM edit_objects WHERE digest = ? AND kind = 'doc'`。
+
+  ```sql
+  WITH RECURSIVE t(id, depth) AS (
+    SELECT ?1, 0
+    UNION
+    SELECT e.child_id, t.depth + 1 FROM edit_edges e JOIN t ON e.parent_id = t.id WHERE t.depth < 2)   -- 辺は主キーで引く
+  SELECT o.id, o.digest, o.kind, o.body FROM edit_objects o WHERE o.id IN (SELECT id FROM t);         -- 部品は行の ID で引く
+  ```
+
+- **ゴミ箱を空にする処理**（`items::delete_trashed`。段 2 の最小の対応で、段 3 で作り直す。利用者の決定 6）：items の行を消す前に、
+  ゴミ箱のアイテムの版が持つファイルの hash と、版の入力が使うアンカーの ID を集める（ゴミ箱の部分索引 `idx_items_trashed` から
+  たどる。統計のない小さな表で版の表を走査する順を選ばないよう、`CROSS JOIN` で結ぶ順を決める）。行を消したあと（版・入力は
+  CASCADE）、どの入力からも参照されなくなったアンカーの行を消し（`edit::anchors::sweep_unreferenced`。
+  `idx_item_version_inputs_anchor` で引く）、items ∪ 版 ∪ アンカーの hash を `ledger::release` に渡す。ほかのアイテムの版が持つ
+  同じ中身（別名で保存したアイテムの版 0 が持つ元のアイテムの元）は REFERRERS で解放されない。文書の部品の行は残る（段 3 の GC）。
+
+  ```sql
+  SELECT DISTINCT b.hash FROM items i CROSS JOIN item_versions v ON v.item_id = i.id
+    JOIN blobs b ON b.id = v.file_blob_id WHERE i.trashed_at IS NOT NULL;
+  SELECT DISTINCT n.anchor_id FROM items i CROSS JOIN item_versions v ON v.item_id = i.id
+    CROSS JOIN item_version_inputs n ON n.version_id = v.id
+   WHERE i.trashed_at IS NOT NULL AND n.anchor_id IS NOT NULL;
+  DELETE FROM edit_anchors WHERE id = ?1
+     AND NOT EXISTS (SELECT 1 FROM item_version_inputs i WHERE i.anchor_id = edit_anchors.id) RETURNING blob_id;
+  ```
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
 
