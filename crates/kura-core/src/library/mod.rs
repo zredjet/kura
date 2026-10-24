@@ -9,7 +9,10 @@ mod lock;
 mod session;
 pub mod upgrade;
 
-pub use integrity::{IntegrityReport, check_files, clean_staging};
+pub use integrity::{
+    Depth as IntegrityDepth, IntegrityReport, check as check_integrity, check_files, clean_staging,
+    repair_blob_ids,
+};
 pub use layout::{
     ANIM_V, DB_FILE, Layout, SUBDIRS, ThumbFormat, ThumbSize, content_rel_path, hex, parse_hex32,
 };

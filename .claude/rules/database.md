@@ -15,7 +15,9 @@ paths:
   一度きりの全件の走査（起動時の指紋で pending・stale に戻す UPDATE など）は、テストに例外として理由を書く（今の例外：
   サムネイルの `thumbs.plan` の `plan_updates_scan_items_only_when_the_plan_changes`、解析の `analysis.plan`（種類と、扱いの変わった
   形式。決定 15）・`analysis.decoders` と
-  投影の作り直し（`analysis.reproject` の印があるときだけ）の `sync_plan_reset_is_a_one_time_full_scan`。docs/data-model.md §4）。
+  投影の作り直し（`analysis.reproject` の印があるときだけ）の `sync_plan_reset_is_a_one_time_full_scan`、利用者が設定の
+  「いま確かめる」を押したときだけ走る `items.blob_id` の確かめの `full_check_repairs_blob_ids_and_startup_leaves_them`。
+  docs/data-model.md §4）。
   起動ごと・ジョブごとに走る問い合わせを例外にしない（印や指紋で、変わったときだけ走らせる）。
 - 10 万件のダミーデータ（`kura-devtools seed`）で、タグ 3 つの AND 検索が 50ms 以内であることを保つ。
 

@@ -5,8 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use super::backup;
-use super::integrity::{IntegrityReport, check_files, clean_staging};
-use super::ledger;
+use super::integrity::{self, IntegrityReport, clean_staging};
 use super::upgrade::UpgradeHooks;
 use super::{Library, LibraryLock};
 use crate::Result;
@@ -173,16 +172,13 @@ impl LibrarySession {
             .spawn(move || {
                 // サムネイル：前回落ちたときの印を片付け、作り方の指紋を照らす（ジョブを動かす前に。media::prepare_on_open）
                 let thumbs_todo = crate::media::prepare_on_open(lib.db());
-                let checked = check_files(lib.db(), lib.layout()).and_then(|(missing, orphans)| {
-                    Ok((missing, orphans, lib.db().read(ledger::unreferenced)?))
-                });
-                let report = match checked {
-                    Ok((missing_files, orphan_files, unreferenced_blobs)) => IntegrityReport {
-                        staging_removed,
-                        missing_files,
-                        orphan_files,
-                        unreferenced_blobs,
-                    },
+                let report = match integrity::check(
+                    lib.db(),
+                    lib.layout(),
+                    staging_removed,
+                    integrity::Depth::Startup,
+                ) {
+                    Ok(report) => report,
                     Err(err) => {
                         tracing::warn!(%err, "整合性チェックに失敗しました");
                         IntegrityReport {

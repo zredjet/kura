@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kura_core::library::{LibrarySession, backup, check_files, check_location, is_library};
+use kura_core::library::{LibrarySession, backup, check_location, is_library};
 use tauri::{AppHandle, Manager, State};
 
 use super::blocking;
@@ -223,23 +223,21 @@ pub async fn library_cache_usage(
         .await
 }
 
-/// 整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数える）。
+/// 整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数え、台帳の行の ID の写し
+/// `items.blob_id` の食い違いを直す。起動時の分は同じ `check_integrity`）。
 #[tauri::command]
 #[specta::specta]
 pub async fn library_check(state: State<'_, AppState>) -> Result<IntegrityDto, AppError> {
     let session = state.session()?;
     blocking(move || {
         let library = session.library();
-        let (missing_files, orphan_files) = check_files(library.db(), library.layout())?;
-        let unreferenced_blobs = library
-            .db()
-            .read(kura_core::library::ledger::unreferenced)?;
-        Ok(IntegrityDto {
-            staging_removed: 0,
-            missing_files,
-            orphan_files,
-            unreferenced_blobs,
-        })
+        let report = kura_core::library::check_integrity(
+            library.db(),
+            library.layout(),
+            0,
+            kura_core::library::IntegrityDepth::Full,
+        )?;
+        Ok(report.into())
     })
     .await
 }

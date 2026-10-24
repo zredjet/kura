@@ -1,4 +1,6 @@
-//! 起動時の整合性チェック。staging の残骸を消し、台帳とファイルの食い違いを数える（自動では消さない）。
+//! 整合性チェック（起動時と、設定の「いま確かめる」）。staging の残骸を消し、台帳とファイルの食い違いを数える（自動では
+//! 消さない）。items の台帳の行の ID の写し（`blob_id`。0010）だけは、いま確かめるときに食い違えば直す（検索の正しさに
+//! 関わる派生の値。items を全件走査するので起動ごとには走らせない。.claude/rules/database.md）。
 
 use serde::Serialize;
 
@@ -19,6 +21,71 @@ pub struct IntegrityReport {
     pub orphan_files: u64,
     /// どの表からも参照されない台帳の行の数（ゴミ箱を空にする途中で落ちたなど）。
     pub unreferenced_blobs: u64,
+    /// 台帳の行の ID の写し（`items.blob_id`）が hash の台帳の行と食い違っていて、直したアイテムの数（いま確かめるときだけ
+    /// 数える。ふつうは 0。M12）。
+    pub blob_ids_fixed: u64,
+}
+
+/// どこまで確かめるか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// 起動時：台帳と `files/` の突き合わせと、参照されない台帳の行。
+    Startup,
+    /// 設定の「いま確かめる」：起動時の分に加えて、`items.blob_id` の写しを確かめて直す（items を全件走査する）。
+    Full,
+}
+
+/// 整合性チェック：台帳と `files/` の突き合わせ（[`check_files`]）、参照されない台帳の行、`Full` なら `items.blob_id` の
+/// 写しの修理（[`repair_blob_ids`]）。`staging_removed` は先に消した staging の残骸の数（起動時。いま確かめるときは 0）。
+pub fn check(
+    db: &Db,
+    layout: &Layout,
+    staging_removed: u64,
+    depth: Depth,
+) -> Result<IntegrityReport> {
+    let blob_ids_fixed = match depth {
+        Depth::Startup => 0,
+        Depth::Full => repair_blob_ids(db)?,
+    };
+    let (missing_files, orphan_files) = check_files(db, layout)?;
+    Ok(IntegrityReport {
+        staging_removed,
+        missing_files,
+        orphan_files,
+        unreferenced_blobs: db.read(ledger::unreferenced)?,
+        blob_ids_fixed,
+    })
+}
+
+/// `items.blob_id` が hash の台帳の行の ID と食い違う（NULL を含む）アイテム。
+const BLOB_ID_MISMATCH: &str =
+    "SELECT i.id FROM items i LEFT JOIN blobs b ON b.id = i.blob_id WHERE b.hash IS NOT i.hash";
+
+/// `items.blob_id`（台帳の行の ID の写し。0010 のトリガが入れる）が hash の台帳の行と食い違うアイテムを直し、直した数を返す。
+/// トリガが写すので食い違わないはずだが、事実の検索とタイルの事実はこの列で引くので、いま確かめるときに直す（items を 1 回
+/// 走査して台帳を整数の主キーで引く。10 万件で約 10ms。食い違いがあるときだけ書く。全件の走査なので起動ごとには呼ばない）。
+pub fn repair_blob_ids(db: &Db) -> Result<u64> {
+    let mismatched: i64 = db.read(|conn| {
+        Ok(conn.query_row(
+            &format!("SELECT count(*) FROM ({BLOB_ID_MISMATCH})"),
+            [],
+            |r| r.get(0),
+        )?)
+    })?;
+    if mismatched == 0 {
+        return Ok(0);
+    }
+    let fixed = db.write(|tx| {
+        Ok(tx.execute(
+            &format!(
+                "UPDATE items SET blob_id = (SELECT b.id FROM blobs b WHERE b.hash = items.hash)
+                  WHERE id IN ({BLOB_ID_MISMATCH})"
+            ),
+            [],
+        )?)
+    })?;
+    tracing::warn!(fixed, "items.blob_id が台帳と食い違っていたので直しました");
+    Ok(fixed as u64)
 }
 
 /// `staging/` の中身を消す（取り込み・ダウンロードの書きかけ）。ジョブを動かす前に呼ぶ。
@@ -95,6 +162,60 @@ mod tests {
         let path = lib.layout().content_path(hash, "jpg");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "x").unwrap();
+    }
+
+    /// いま確かめるとき（`Depth::Full`）だけ、台帳の行の ID の写し（`items.blob_id`）の食い違いを直して数える。起動時は直さない。
+    #[test]
+    fn full_check_repairs_blob_ids_and_startup_leaves_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::create(&dir.path().join("L")).unwrap();
+        insert_item(&lib, [1u8; 32]);
+        insert_item(&lib, [2u8; 32]);
+        put_file(&lib, &[1u8; 32]);
+        put_file(&lib, &[2u8; 32]);
+        let broken = |lib: &Library| -> i64 {
+            lib.db()
+                .read(|c| {
+                    Ok(c.query_row(
+                        &format!("SELECT count(*) FROM ({BLOB_ID_MISMATCH})"),
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        assert_eq!(broken(&lib), 0);
+        // トリガを通らない食い違い（NULL と、ほかの行の ID）を作る
+        lib.db()
+            .write(|tx| {
+                tx.execute_batch(
+                    "UPDATE items SET blob_id = NULL WHERE id = 1;
+                     UPDATE items SET blob_id = (SELECT id FROM blobs WHERE hash = (SELECT hash FROM items WHERE id = 1))
+                      WHERE id = 2;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(broken(&lib), 2);
+        let startup = check(lib.db(), lib.layout(), 3, Depth::Startup).unwrap();
+        assert_eq!((startup.staging_removed, startup.blob_ids_fixed), (3, 0));
+        assert_eq!(broken(&lib), 2);
+        let full = check(lib.db(), lib.layout(), 0, Depth::Full).unwrap();
+        assert_eq!(
+            full,
+            IntegrityReport {
+                blob_ids_fixed: 2,
+                ..IntegrityReport::default()
+            }
+        );
+        assert_eq!(broken(&lib), 0);
+        assert_eq!(repair_blob_ids(lib.db()).unwrap(), 0);
+        // 全件の走査（.claude/rules/database.md の例外：利用者が「いま確かめる」を押したときだけ走る）
+        let plan = lib
+            .db()
+            .read(|c| Ok(crate::db::query_plan(c, BLOB_ID_MISMATCH)))
+            .unwrap();
+        assert!(plan.contains("SCAN i"), "{plan}");
     }
 
     #[test]

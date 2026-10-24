@@ -164,7 +164,7 @@ END;
 -- （M12 の保存はハッシュ・拡張子・サイズを 1 つの UPDATE で変える）
 
 -- blob_id の写し（0010）。BEFORE のトリガは NEW を書き換えられないので AFTER で入れる（台帳への登録は上の BEFORE が先に済ませる）。
--- 書き手は blob_id を書かない。食い違いは開くときの整合性の確かめで直す
+-- 書き手は blob_id を書かない。食い違いは設定の「いま確かめる」（`library_check`）で直す（items の全件の走査なので起動ごとには走らせない）
 CREATE TRIGGER items_blob_id_ai AFTER INSERT ON items BEGIN
   UPDATE items SET blob_id = (SELECT b.id FROM blobs b WHERE b.hash = new.hash) WHERE id = new.id;
 END;
@@ -583,7 +583,8 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - 取り込みの重複の見込み：`SELECT hash, ext FROM blobs WHERE size_bytes = ?`（`idx_blobs_size`）。重複の判定（`find_by_hash`）は
   M11 では items のまま（台帳と items が 1 対 1 なので同じ結果。M12 で台帳を引く形に広げる）。
 - 整合性チェック：`files/` にあるはずのファイルは台帳の `(hash, ext)` から作る。どの表からも参照されない台帳の行も数える
-  （`unreferencedBlobs`）。
+  （`unreferencedBlobs`）。起動時と設定の「いま確かめる」は同じ `library::check_integrity` で、いま確かめるとき（`Full`）だけ
+  `items.blob_id` が hash の台帳の行と食い違うアイテムを直す（`repair_blob_ids`。M12）。
 - ゴミ箱を空にする：items の行を消したのと同じトランザクションで、どの表からも参照されなくなった台帳の行を `ledger::release` で
   消す（事実・結果は CASCADE）。コミットのあとで、解放した中身の実ファイルと派生のファイルを消す（ADR-46 の順）。
   取り込み（files/ に置く → DB に書く）とは `Library` の 1 つの鍵で直列にする（置いたばかりの同じ中身を消さないように）。
