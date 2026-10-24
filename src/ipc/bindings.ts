@@ -37,7 +37,10 @@ export const commands = {
 	libraryUsage: () => typedError<LibraryUsageDto, AppError>(__TAURI_INVOKE("library_usage")),
 	/**  サムネイル・波形・アニメのキャッシュの大きさ（設定の「容量」の行。ファイルを数えるので、設定の画面を開いたときだけ呼ぶ）。 */
 	libraryCacheUsage: () => typedError<LibraryCacheUsageDto, AppError>(__TAURI_INVOKE("library_cache_usage")),
-	/**  整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数える）。 */
+	/**
+	 *  整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数え、台帳の行の ID の写し
+	 *  `items.blob_id` の食い違いを直す。起動時の分は同じ `check_integrity`）。
+	 */
 	libraryCheck: () => typedError<IntegrityDto, AppError>(__TAURI_INVOKE("library_check")),
 	/**
 	 *  選んだもの（一覧の ID。ユニットは印付き）を `dest` に書き出すジョブを積む。
