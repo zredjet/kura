@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use kura_core::db::Db;
 use kura_core::items::{ItemQuery, ItemView, count_unanalyzed, query_ids};
-use kura_core::query::{QueryContext, check, parse};
+use kura_core::query::{QueryContext, check_db, parse};
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
@@ -251,8 +251,7 @@ pub fn search(db: &Db, ctx: &QueryContext) -> Result<(), String> {
             unanalyzed_runs.push(started.elapsed());
             // パレットの 1 回分（解析・種類ごとの件数・未解析の件数）
             let started = Instant::now();
-            db.read(|conn| check(conn, text, ItemView::All, ctx))
-                .map_err(|e| e.to_string())?;
+            check_db(db, text, ItemView::All, ctx).map_err(|e| e.to_string())?;
             check_runs.push(started.elapsed());
         }
         let (list_ms, unanalyzed_ms, check_ms) = (

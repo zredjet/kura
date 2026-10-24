@@ -71,6 +71,7 @@ Kura Library.kuralib/
 | `0007_blobs_and_kinds`（Rebuild） | 実ファイルの台帳 `blobs` を items から作り、`items` を作り直す：`kind` に `font`・`model`、名前付きの CHECK、表の制約 `items_proxy_av`、`thumb_state` に `stale`、末尾に `analysis_state`（画像・音声は `pending`、ほかは `not_needed`）と `thumb_rev`。`items.hash` → `blobs.hash` の外部キーと台帳のトリガ `items_blob_bi`・`items_blob_bu`。索引 9 つと FTS のトリガを作り直し、`idx_items_thumb_stale`・`idx_items_analysis_pending` を足す。意味のない `proxy_state`（画像で pending など）は `not_needed` に正す |
 | `0008_jobs_named_checks` | `jobs` を作り直し、`jobs_kind`（`analyze` を足す）・`jobs_state` に名前を付ける |
 | `0009_analysis` | 中身ごとの事実 `media_facts`・解析の結果 `analysis_results`（どちらも `blob_id` が鍵で、台帳の行を消すと CASCADE）と、アイテムごとの素材の設定 `asset_settings`（`item_id` が鍵で CASCADE） |
+| `0010_items_blob_id` | `items.blob_id`（台帳の行の ID の写し。CHECK・外部キーなしの `ADD COLUMN`）を足して hash から埋め、`idx_items_blob` と、入れる・hash を変えるときに台帳から引いて入れる AFTER のトリガ `items_blob_id_ai`・`items_blob_id_au` を作る（M12。検索の事実の条件を整数の鍵で引く。M11 の決定 17。10 万件で約 0.2 秒） |
 
 ```sql
 -- ===== 実ファイルの台帳（0007。files/ab/cd/<hash>.<ext> 1 つに 1 行）=====
@@ -118,6 +119,8 @@ CREATE TABLE items (
                   CONSTRAINT items_analysis_state CHECK (analysis_state IN ('pending','ready','failed','not_needed')),
                                                     -- 解析の進み具合（M11）。解析するのは画像・音声だけ。動画・フォント・3D は not_needed
   thumb_rev       INTEGER NOT NULL DEFAULT 0,       -- サムネイルを作り直した回数（URL の ?r=。0 なら付けない。M11）
+  blob_id         INTEGER,                          -- 台帳の行の ID（blobs.id）の写し（0010。M12）。下のトリガが hash から引いて入れる。
+                                                    -- CHECK・外部キーなし（正は hash の外部キー）。事実・解析の結果を整数の鍵で引くのに使う
   -- プロキシを作るのは video・audio だけ（ADR-140）。ほかの種類は作成待ち・作成済み・失敗にならない（既定の unknown は許す）
   CONSTRAINT items_proxy_av CHECK (kind IN ('video','audio') OR proxy_state IN ('unknown','not_needed'))
 );
@@ -132,6 +135,7 @@ CREATE INDEX idx_items_proxy_unknown ON items(imported_at DESC, id DESC) WHERE p
 CREATE INDEX idx_items_proxy_pending ON items(imported_at DESC, id DESC) WHERE proxy_state = 'pending'; -- 0003：プロキシのジョブが作るもの
 CREATE INDEX idx_items_thumb_stale   ON items(imported_at DESC, id DESC) WHERE thumb_state = 'stale';    -- 0007：pending がなくなったら作り直すもの
 CREATE INDEX idx_items_analysis_pending ON items(imported_at DESC, id DESC) WHERE analysis_state = 'pending'; -- 0007：解析のジョブが新しい順に取り出す
+CREATE INDEX idx_items_blob ON items(blob_id); -- 0010：事実の集合（台帳の行の ID）からアイテムを引く
 -- プロキシのジョブの条件は `+kind IN ('video','audio')` と書く（`+` で kind の索引を使わせず、上の部分索引を新しい順に読む。
 -- 素の `kind IN (…)` は TEMP B-TREE に退行する）
 
@@ -146,6 +150,13 @@ CREATE TRIGGER items_blob_bi BEFORE INSERT ON items BEGIN
 END;
 -- items_blob_bu：BEFORE UPDATE OF hash, ext, size_bytes。同じ形で、作った時刻は new.updated_at
 -- （M12 の保存はハッシュ・拡張子・サイズを 1 つの UPDATE で変える）
+
+-- blob_id の写し（0010）。BEFORE のトリガは NEW を書き換えられないので AFTER で入れる（台帳への登録は上の BEFORE が先に済ませる）。
+-- 書き手は blob_id を書かない。食い違いは開くときの整合性の確かめで直す
+CREATE TRIGGER items_blob_id_ai AFTER INSERT ON items BEGIN
+  UPDATE items SET blob_id = (SELECT b.id FROM blobs b WHERE b.hash = new.hash) WHERE id = new.id;
+END;
+-- items_blob_id_au：AFTER UPDATE OF hash。同じ形
 
 -- codec_info の形（JSON。`media::MediaInfo::codec_json`。どれもなければ NULL。読み手は知らない欄を無視する）：
 --   画像・動画・音楽：{"codec": 主なコーデック}（例 'h264'・'aac'・'jpeg'）。プロキシの判定後は {"codec", "video", "audio"}
@@ -526,9 +537,10 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 
 1. `items_query_ids(query, sort)` で条件に合う ID と縦横比だけを並び順で返す（`tauri::ipc::Response` で生バイト。形式は `docs/architecture.md` §3）。縦横比は `width / height`、音楽と不明は 1.0。
 2. フロントは見えている範囲の ID だけ `items_get(ids)` で詳細を取る（最大 200 件ずつ）。
-   - M11：タイルの素材の表示（市松模様・ドット絵・アニメとループの印）のため、`items i LEFT JOIN blobs b ON b.hash = i.hash
-     LEFT JOIN media_facts f ON f.blob_id = b.id LEFT JOIN asset_settings s ON s.item_id = i.id WHERE i.id IN (…)` で引く
-     （主キーと `blobs.hash` の UNIQUE だけを引き、200 件でも全件を走査しない。`summaries_join_facts_and_settings_without_scanning`）。
+   - M11：タイルの素材の表示（市松模様・ドット絵・アニメとループの印）のため、`items i LEFT JOIN media_facts f ON f.blob_id = i.blob_id
+     LEFT JOIN asset_settings s ON s.item_id = i.id WHERE i.id IN (…)` で引く（主キーだけを引き、200 件でも全件を走査しない。
+     `summaries_join_facts_and_settings_without_scanning`。M11 は台帳を `blobs.hash` の UNIQUE で通っていたが、M12 の 0010 から
+     `items.blob_id` で直に引く）。
      ドット絵の実効値は「設定 ?? 自動 ?? 偽」（素材の欄と同じ関数 `asset::effective_pixel_art`。表示のため、どちらもないものは偽）。
      検索は「設定 ?? 自動」で比べ、どちらもないものは `ドット絵:なし`・`ドット絵!=あり` に入れず、除外にだけ入れる（下の「事実で引く」、
      docs/search-query.md §4。`ドット絵:あり` の集合は表示の実効値が真のものと同じ）。アニメの実効値は「格子の設定 ?? 解析のコマが
@@ -625,14 +637,15 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 
 ### 事実で引く（M11）
 
-- 事実の条件は `i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE …)` の形にする
-  （部分索引から集合を作る。EXISTS の相関した問い合わせにしない）。
+- 事実の条件は `i.blob_id IN (SELECT f.blob_id FROM media_facts f WHERE …)` の形にする（部分索引から台帳の行の ID の集合を作り、
+  `idx_items_blob` で items を引く。EXISTS の相関した問い合わせにしない。M11 は `i.hash IN (SELECT b.hash … JOIN blobs b …)` で、
+  M12 の 0010 で整数の鍵にした）。
 - 検索の実効値は「設定 ?? 自動」：ドット絵は `asset_settings.pixel_art` があればそれ、なければ `media_facts.pixel_art`。
   どちらもない（未解析か、解析しても材料が足りず NULL）ものは決まっていないので、`:あり`・`:なし`・`!=` のどれにも入れない
   （表示の実効値は「?? 偽」で偽にする。上の「一覧の取得」。テスト `pixel_art_search_follows_the_effective_value_of_the_asset_panel`）。
 - アニメも「設定 ?? 事実」（M11 のユーザーの決定 16）：`asset_settings.grid_json` の格子があればアニメ、なければ
-  `media_facts.frame_count` が 2 以上。`アニメ:あり` は `i.id IN (格子のあるアイテム) OR i.hash IN (… frame_count > 1)`、
-  `アニメ:なし` は `i.hash IN (… frame_count <= 1) AND i.id NOT IN (格子のあるアイテム)`（AND の中ではコマの側を事実の
+  `media_facts.frame_count` が 2 以上。`アニメ:あり` は `i.id IN (格子のあるアイテム) OR i.blob_id IN (… frame_count > 1)`、
+  `アニメ:なし` は `i.blob_id IN (… frame_count <= 1) AND i.id NOT IN (格子のあるアイテム)`（AND の中ではコマの側を事実の
   部分問い合わせにまとめる）。格子のあるアイテムは `asset::grid_items_sql`（`grid_json` が版 1 の JSON。壊れたもの・知らない版は
   素材の欄と同じく格子なし。版 1 の中の欄の欠け・知らない欄までは SQL で見ない：書き手 `asset::set_settings` は版 1 のそろった形
   だけを書く）で、`asset_settings` を索引なしで読む（変えたアイテムにだけ行があるので小さい。items は主キーで引き、
@@ -644,10 +657,13 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - まだ解析していないもの・計れない値は、肯定・`!=`・大小の比較のどれにも入れない（除外だけが含む。docs/search-query.md §4）。
   色数の打ち切りの 257 は、結果が決まる比較（`>`・`!=` は 256 以下、`>=` は 257 以下の値）のときだけ入れ、ほかは
   `f.colors < 257` を足して除く。
-- 一致が 6〜9 万件の広い条件（`透過!=あり`・`ドット絵:なし`・`アニメ:なし`・`-透過:あり` など）は 10 万件で 43〜114 ms かかる
-  （数万件の 32 バイトのハッシュで items を引く分。集合を作るだけなら 5 ms）。M12 で台帳と版の表を触るときに、items に台帳の
-  整数の id（`blob_id`）を持たせ、事実の集合を整数で引く形にして 50 ms 以内にする（見込み約 13 ms。M11 のユーザーの決定 17。
-  roadmap.md の M12・ADR-161）。
+- 一致が 6〜9 万件の広い条件（`透過!=あり`・`ドット絵:なし`・`アニメ:なし`・`-透過:あり` など）は、M11 の形（数万件の 32 バイトの
+  ハッシュで items を引く）では 10 万件で 43〜114 ms かかった。M12 で items に台帳の行の ID（`blob_id`。0010）を持たせ、事実の集合を
+  整数の鍵で引く形にした（M11 のユーザーの決定 17。ADR-166）。同じ機械・同じ seed で、広い条件の一覧は 44〜103 ms から 27〜37 ms、
+  狭い条件も 0.7〜11 ms から 0.3〜6.3 ms になった。
+- ⌘K の件数（`query::check_db`）は、種類ごとの件数と「未解析 N 件」を読み取りの接続 2 つで同時に数える（どちらも広い条件で
+  30 ms 前後かかり、順に数えると和で 50 ms を超える。結果は 1 つの接続で順に数える `query::check` と同じ。`check_db_matches_check`）。
+  広い条件で 25〜40 ms（M11 の形で 53〜127 ms）。
 
 ### ユニットの集計
 

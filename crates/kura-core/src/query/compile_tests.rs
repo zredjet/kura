@@ -424,6 +424,12 @@ const FACT_COLUMNS: &str = "alpha, colors, pixel_art, frame_count, \
 /// 画像・音声・動画・フォントを混ぜた小さなライブラリ。解析済み・未解析・失敗（計れない）・設定ありを含む。
 fn asset_library() -> Connection {
     let conn = test_conn();
+    fill_assets(&conn);
+    conn
+}
+
+/// [`asset_library`] の行を入れる（ファイルの DB でも使う）。
+fn fill_assets(conn: &Connection) {
     let n = now();
     let assets = [
         // 64×64 の二値の透過・16 色・自動でドット絵・1 コマ
@@ -582,7 +588,35 @@ fn asset_library() -> Connection {
          INSERT INTO asset_settings (item_id, pixel_art, updated_at) VALUES (13, 1, 0), (14, 0, 0), (17, 1, 0);",
     )
     .unwrap();
-    conn
+}
+
+/// パレットの件数と「未解析 N 件」を読み取りの接続 2 つで同時に数えても（`check_db`）、1 つの接続で順に数えたとき
+/// （`check`）と同じ結果になる。
+#[test]
+fn check_db_matches_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = crate::db::Db::open(&dir.path().join("library.sqlite")).unwrap();
+    db.write(|tx| {
+        fill_assets(tx);
+        Ok(())
+    })
+    .unwrap();
+    for text in [
+        "透過:あり",
+        "ドット絵:なし",
+        "-アニメ:あり",
+        "種類:画像 評価>=3",
+        "透過:",
+        "",
+    ] {
+        for view in [crate::items::ItemView::All, crate::items::ItemView::Trash] {
+            let one = db
+                .read(|conn| super::check(conn, text, view, &ctx()))
+                .unwrap();
+            let both = super::check_db(&db, text, view, &ctx()).unwrap();
+            assert_eq!(both, one, "{text}");
+        }
+    }
 }
 
 #[test]

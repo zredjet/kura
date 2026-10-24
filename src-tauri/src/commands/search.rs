@@ -1,7 +1,7 @@
 //! 検索（⌘K パレット）とスマートフォルダ。
 
 use kura_core::items::{ItemQuery, ItemView, count_kinds};
-use kura_core::query::{QueryContext, check, suggest::suggest};
+use kura_core::query::{QueryContext, check_db, suggest::suggest};
 use kura_core::smart;
 use kura_core::time::now_ms;
 use tauri::State;
@@ -32,11 +32,7 @@ pub async fn query_parse(
     blocking(move || {
         let ctx = context(utc_offset_minutes);
         let view = to_view(view.unwrap_or(ItemViewDto::All), ctx.now_ms);
-        Ok(session
-            .library()
-            .db()
-            .read(|conn| check(conn, &text, view, &ctx))?
-            .into())
+        Ok(check_db(session.library().db(), &text, view, &ctx)?.into())
     })
     .await
 }

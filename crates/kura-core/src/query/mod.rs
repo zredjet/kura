@@ -21,6 +21,7 @@ pub use parser::{Clause, ParseError, Parsed, parse};
 use rusqlite::Connection;
 
 use crate::Result;
+use crate::db::Db;
 use crate::items::{ItemQuery, ItemView, KindCounts, count_kinds, count_unanalyzed};
 
 /// パレットに出す解析の結果（エラー・チップ・件数）。
@@ -62,4 +63,45 @@ pub fn check(
             })
         }
     }
+}
+
+/// [`check`] と同じ結果を、件数と「未解析 N 件」を読み取りの接続 2 つで同時に数えて返す（パレットの 1 回の待ちを、
+/// 2 つの和でなく遅いほうにする。どちらも一致が数万件の広い条件で 30ms 前後かかる。M12。NFR-03）。
+pub fn check_db(db: &Db, text: &str, view: ItemView, ctx: &QueryContext) -> Result<QueryCheck> {
+    let parsed = match parse(text) {
+        Err(error) => {
+            return Ok(QueryCheck {
+                error: Some(error),
+                clauses: Vec::new(),
+                counts: None,
+                unanalyzed: None,
+            });
+        }
+        Ok(parsed) => parsed,
+    };
+    let uses_analysis = parsed.expr.uses_analysis();
+    let query = ItemQuery {
+        view,
+        filter: Some(parsed.expr),
+        ..ItemQuery::default()
+    };
+    let (counts, unanalyzed) = if uses_analysis {
+        std::thread::scope(|scope| {
+            let unanalyzed = scope.spawn(|| db.read(|conn| count_unanalyzed(conn, &query, ctx)));
+            let counts = db.read(|conn| count_kinds(conn, &query, ctx));
+            // 数える側の panic は、順に数えたときと同じく呼び手へ伝える
+            let unanalyzed = unanalyzed
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (counts, unanalyzed)
+        })
+    } else {
+        (db.read(|conn| count_kinds(conn, &query, ctx)), Ok(None))
+    };
+    Ok(QueryCheck {
+        error: None,
+        clauses: parsed.clauses,
+        counts: Some(counts?),
+        unanalyzed: unanalyzed?,
+    })
 }
