@@ -745,8 +745,9 @@ C（版に戻す・下書き・不変条件）で入れたもの。
   ダウンロード・キャプチャは「置いてから DB に書く」まで読みの側を持つので、取り込みが「もう置いてある」と判断した同じ中身を、
   保存が台帳に載せる前に消すことがない。描く・エンコードする間は持たない。
 - **予告と照合**（`ledger::announce`・`clear_announced`・`settle_pending`）：台帳にない中身を置く前に `ledger_pending` に
-  `(hash, ext, 'place', job)` を書いてコミットし、台帳に載せるトランザクションで `DELETE FROM ledger_pending WHERE job_id = ?` で消す
-  （段 3 の GC は消す前に `'delete'`）。ライブラリを開くとき、staging の掃除の直後・整合性チェックとジョブの前に同期で照らす
+  `(hash, ext, 'place', job)` を書いてコミットし、'place' の予告は台帳に載せるトランザクションで `DELETE FROM ledger_pending WHERE job_id = ?`
+  で消す。段 3 の GC は台帳から外す前に `'delete'` を書いてコミットし、'delete' の予告はファイルを消し終えてから消す。ゴミ箱を空にする処理は段 3 で作り直すまで ADR-46 の順（予告なし。落ちても残るのは「DB にないファイル」
+  だけで、整合性チェックが数える）。ライブラリを開くとき、staging の掃除の直後・整合性チェックとジョブの前に同期で照らす
   （`LibrarySession::start`。片付けた数はログ）：
 
   ```sql
@@ -790,7 +791,9 @@ C（版に戻す・下書き・不変条件）で入れたもの。
   a.options_digest = ?2`（`UNIQUE(source_hash, options_digest)` の索引）。足すのは保存のトランザクション 2 で、`ledger::register` のあと
   `INSERT … ON CONFLICT(source_hash, options_digest) DO NOTHING` → 行を読み、別のファイルを指す行が先にあれば Conflict（参照されない台帳の
   行を残さない）。`options` と `decoded` は正規の JSON、`value_digest` は元を読んだ記録の値のダイジェスト。
-- **保存のトランザクション 1（予告）**（`edit::save`。台帳の門を持って）：土台（`versions::head`）を確かめ直し、出力の中身 H の持ち主を
+- **保存のトランザクション 1（予告）**（`edit::save`。台帳の門を持って）：土台（`versions::head`）を確かめ直し、読んだアンカー（前からあった
+  もの）の行がまだ同じ台帳の行を指して残っていることを `anchors::get` で確かめ直し（描いている間にゴミ箱を空にして片付けられていれば、何も
+  置かずに Conflict。トランザクション 2 の外部キーの誤りにしない）、出力の中身 H の持ち主を
   `find_owner` で引いて決める（上書き：ほかのアイテムの今なら Conflict、自分の今なら版だけ足す、元・過去の版なら通す。別名：持ち主が
   いれば existing）。拡張子は台帳に H の行があればその拡張子（`ledger::ext_of`。items のトリガが食い違いで断らないように）、形式が今と
   同じなら今の拡張子、ほかは形式の代表。台帳にない H と今回作ったアンカーを `ledger::announce(…, 'place', job)`。

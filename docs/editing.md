@@ -542,7 +542,8 @@ pub trait Encoder: Send + Sync {
 - 大きさの目安：24MP の画像で約 28 MB（書き 0.21 秒・読み 0.29 秒）、3 分の 44.1 kHz ステレオで約 64 MB。4 GiB を超える音声は RIFF に収まらないので作れない（保存を失敗にする。M12）。
 - 置き場所と鍵（M12 の段 2）：アンカーのファイルは `files/<hash>.<png|wav>`（実ファイルの台帳 `blobs` に載せ、整合性チェックの対象にする。台帳に同じ中身が別の拡張子であればその拡張子）。行は `edit_anchors` に「元のファイルの中身 × 読み方の設定のダイジェスト（`DecodeOptions` の正規の JSON の、ドメイン `kura-decode-options-v1` の BLAKE3）」ごとに 1 つ（`edit::anchors`）。版の入力（`item_version_inputs`）が `anchor_id` で指し、記録（`RecordedInput.anchor`）にアンカーのファイルの中身を書く。
 - 作る時：最初の保存のジョブが、描くのと同じ読み取りから作る（§14 の「保存のジョブ」の段 3。`staging/edit-<job>-anchor.<png|wav>.part` に書いて `sync_all`、読み直して照らしてから、出力と一緒に予告 → 配置 → 1 トランザクションで台帳と行に載せる）。メモリの予算は、描く段のピークと「読む持ち越し ＋ 入力の値 ＋ 書いて読み直す分（`anchor::work_bytes`。読み直した値）」＝ 値の約 2 倍の大きいほうを確保する（`EngineRuntime::admit_bulk_with`。アンカーは読んだ直後・描く前に書くので、描く段とは重ならない）。どのデコーダが読むかは読むまで分からないので、元の形式に再現を約束しないデコーダがあれば、この分を見込む。
-- 以後はアンカーから読む：同じ元 × 読み方の設定の保存・作り直しは、元を読まずにアンカーだけを読み（`read_recorded`。記録はアンカーの元の読み取りの記録）、OS のデコーダを呼ばない。アンカーが壊れていれば `Mismatch`（段 2 の C で、元を記録のデコーダで読めるときの扱いを決める）。
+- 以後はアンカーから読む：同じ元 × 読み方の設定の保存・作り直しは、元を読まずにアンカーだけを読み（`read_recorded`。記録はアンカーの元の読み取りの記録）、OS のデコーダを呼ばない。
+- アンカーが使えない（形・中身を読めない、ファイルがない、壊れている、別の値）とき：保存（上書き・別名）も版に戻す作り直しも、元をアンカーの記録の識別子のデコーダ（`decoded.codec`）で読み直し、値のダイジェストがアンカーの記録（`decoded.value_digest`）と同じなら、その値で続けて知らせを版の記録の警告に残す（入力の記録は同じ値のアンカーを指したまま。結果の `anchor` は null。アンカーのファイルは直さず、整合性チェックが数える）。値が違う・記録のデコーダがこの環境になければ `Mismatch`（何も変えない）。読み直すデコーダが Platform の段なら、見出しを読む前から `decoding` の印を付ける（§14 の表の 1・2）。保存の描いている間にゴミ箱を空にしてアンカーの行が片付けられたら、予告のトランザクションで `Conflict`（何も置かない。もう一度保存すれば元を読み直して作り直す）。
 
 ### 9.5 段 4 の画像のコーデックの約束
 
@@ -1102,7 +1103,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 - **版に戻す**（元に戻す＝版 0、途中の版 k。段 2 の C）も新しい版を足す操作（版の記録は消さない）。版 n+1 を `kind = 'revert'`・`revert_to = k` で足し、文書は版 k の文書（版 0 と、版 0 に戻した版は空の文書で NULL）、入力は版 k の写し、値のダイジェストは版 k と同じ。アイテムは版 k の列（幅・高さ・長さ・拡張子・大きさ。版 0 なら版 0 の列と記録の mime・codec_info）に戻し、title・original_name・素材の設定は変えない。前の頭は上書きと同じく消し待ち（出力が戻した中身か版 0 と同じなら released）、版 k の状態は変えない。戻した結果が今と同じ中身なら版だけ足す（unchanged）。戻す先は 0 以上・頭の版より前（ほかは `Invalid`。まだ保存していないアイテムには戻す版がない）。
   - **使い直す**：版 k の中身が台帳にあり（版 k がまだ持っているか、ほかの版・アイテムが同じ中身を持っている）ファイルがあれば、台帳の門を持って 1 つのトランザクションで戻す（描かない・置かない）。版 0 はいつも hold なので、元に戻すのはいつもこちら。
   - **作り直す**：なければ、版 k の入力の記録（`RecordedInput`）で元を読み（`read_recorded`。アンカーがあればアンカー）、版 k の文書を描いて値のダイジェストを記録と照らし、記録のエンコーダ（`encode_bytes_with`。記録の codec・format・options）で書く。出力は作り直したファイル H′（記録のエンコーダならふつうは版 k と同じバイト列）で、予告 → 配置 → コミットは保存と同じ段 6〜9。
-  - **作り直しの照合の決まり**（M12 の段 2 で推奨で採った決定）：値のダイジェストが記録と違えば保存しない（`Mismatch`。何も変えない）。アンカーが使えない（壊れている・ない・別の値）とき、元を記録の識別子のデコーダで読めれば元で読み直し（値が記録と違えば `Mismatch`）、知らせを版の記録の警告に残す。記録のデコーダもなければ `Mismatch`。記録のエンコーダがこの環境になければ、今の組の同じ形式のエンコーダで書き、新しい書き出しの記録を残す（値は照らし済み）。バイト列が版 k と違えば知らせだけ残す。
+  - **作り直しの照合の決まり**（M12 の段 2 で推奨で採った決定）：値のダイジェストが記録と違えば保存しない（`Mismatch`。何も変えない）。アンカーが使えない（壊れている・ない・別の値）とき、元を記録の識別子のデコーダで読めれば元で読み直し（値が記録と違えば `Mismatch`）、知らせを版の記録の警告に残す（保存の上書き・別名も同じ。§9.4）。記録のデコーダもなければ `Mismatch`。記録のエンコーダがこの環境になければ、今の組の同じ形式のエンコーダで書き、新しい書き出しの記録を残す（値は照らし済み）。バイト列が版 k と違えば知らせだけ残す。
   - 戻した結果が別のアイテムの今と同じ中身なら `Conflict`（上書きと同じ。`items.hash` は一意なので、別名で保存した B を元に戻すと A の今と同じになる場合も `Conflict`）。
 - 上書きは「アイテム ID を保ったまま中身を差し替える」操作。タグ・フォルダ・ユニット・プレイリスト・再生の記録・表示名・元のファイル名・素材の設定（格子・ピボット・ループ点）は変わらない（形式が変わる上書きでも title・original_name は変えない。名前は書き出しで直す。素材の設定が中身に合わなくなった知らせは段 5 の UI。M12 の段 2 の決定 10・11）。手順は下の「保存のジョブ」（staging に書く → ハッシュ → 予告 → `files/` に配置 → 1 トランザクションで `items.hash` を比較して置き換え、版を足す → 古いファイルは消し待ち）。
 - `items.hash` を書き換えるのは保存の処理だけ。中身に依る列を書く UPDATE は、すべてハッシュを条件にする（古いハッシュで作ったサムネイルを書き込まないため）。M11 で解析（`analysis_state` と結果・事実の書き込み。`WHERE id = ? AND hash = ? AND analysis_state = 'pending'`）とサムネイル（`thumb_state`・`thumb_rev` と読んだメディア情報。`WHERE id = ? AND hash = ?`）に入れた。結果・事実は中身ごと（台帳の行 `blob_id`）に持つので、保存で中身が変わると別の行になる（docs/data-model.md §2）。M12 でプロキシ（`proxy_state` の判定と作った結果。`WHERE id = ? AND hash = ?`）にも入れた。
@@ -1119,19 +1120,19 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   | 段 | すること | 強制終了したら |
   |---|---|---|
   | 0 確かめ | このジョブが頭にした版（`item_versions.job_id`）があれば、前回コミットしたので Done。前回 OS のデコーダで元を読んでいる途中で落ちていれば（途中経過の `decoding` が真）、失敗（`ToolFailed`）にして印を消す（やり直せば読み直す）。文書を読み（`Engine::load`）、土台を確かめる | — |
-  | 1 予算 | 元（版 0。版の行がなければ今）の形をヘッダから読む（アンカーがあればアンカーの形）。計画を作り、一括の予算を確保する（アンカーを作りうるなら、ピークと「読む持ち越し ＋ 入力の値 ＋ アンカーを読み直す分」の大きいほう。超えれば `TooLarge`） | staging の掃除とジョブの再開で初めから |
-  | 2 読む | アンカーがあればアンカーから（記録はアンカーの元の読み取りの記録）、なければ元を読む。元の形式に Platform の段のデコーダがあり、まだアンカーがなければ、読む前に途中経過 `{"v":1,"decoding":true}` をコミットし、読み終えたら偽に戻す（SVG の働き手・ffmpeg は別のプロセスなので付けない） | 同上（`decoding` が真なら 0 で失敗） |
+  | 1 予算 | 元（版 0。版の行がなければ今）の形をヘッダから読む（アンカーがあればアンカーの形）。元の形式に Platform の段のデコーダがあり、まだアンカーがなければ（アンカーが使えずに元を記録のデコーダで読み直すときは、そのデコーダが Platform の段なら）、見出しを読む前から途中経過 `{"v":1,"decoding":true}` をコミットし、2 で読み終えるまで保つ（落ちずに失敗・中止・一時停止したら偽に戻す。ADR-158 (9) と同じ決まり。SVG の働き手・ffmpeg は別のプロセスなので付けない）。計画を作り、一括の予算を確保する（アンカーを作りうるなら、ピークと「読む持ち越し ＋ 入力の値 ＋ アンカーを読み直す分」の大きいほう。超えれば `TooLarge`） | staging の掃除とジョブの再開で初めから（`decoding` が真なら 0 で失敗） |
+  | 2 読む | アンカーがあればアンカーから（記録はアンカーの元の読み取りの記録）、なければ元を読む。アンカーが使えなければ、元をアンカーの記録の識別子のデコーダで読み直して値を照らす（§9.4。同じなら警告を残して続け、違えば `Mismatch`）。元の形式に Platform の段のデコーダがあれば、見出しを読む前から（1）付けた印を、読み終えたら偽に戻す | 同上（`decoding` が真なら 0 で失敗） |
   | 3 アンカー | 再現を約束しないデコーダで読み、まだアンカーがなければ、`staging/edit-<job>-anchor.<png\|wav>.part` に書いて `sync_all`、読み直して照らし（`anchor::verify`）、ハッシュを取る | 同上 |
   | 4 描く | `Engine::render`（保存は必ず `render`。値のダイジェストを版に残す） | 同上 |
   | 5 書く | エンコードし、生の BLAKE3 を H とし（`EncodedStamp.file_digest` はドメイン付きなので使わない）、`staging/edit-<job>-out.<ext>.part` に書いて `sync_all`。予算と値を手放す。ここまでは一時停止・中止で止まる（staging を消す） | 同上 |
-  | 6 予告 | 台帳の門（取り込みの鍵の書きの側）を取る。トランザクション 1 で土台を確かめ直し、H の持ち主（今 → 元 → 過去の版）で `Conflict`・`existing` を決め、拡張子を決め（台帳に同じ中身の行があればその拡張子、形式が今と同じなら今の拡張子、ほかは形式の代表）、台帳にない出力とアンカーを予告する。`Conflict`・`existing` なら何も置かずに staging を消して終わる | 開くときの予告の照合が予告の行を消し、ジョブは初めから |
+  | 6 予告 | 台帳の門（取り込みの鍵の書きの側）を取る。トランザクション 1 で土台を確かめ直し、読んだアンカー（前からあったもの）の行がまだ同じ台帳の行を指して残っていることを確かめ直し（描いている間にゴミ箱を空にして片付けられていれば `Conflict`。「もう一度保存してください」）、H の持ち主（今 → 元 → 過去の版）で `Conflict`・`existing` を決め、拡張子を決め（台帳に同じ中身の行があればその拡張子、形式が今と同じなら今の拡張子、ほかは形式の代表）、台帳にない出力とアンカーを予告する。`Conflict`・`existing` なら何も置かずに staging を消して終わる | 開くときの予告の照合が予告の行を消し、ジョブは初めから |
   | 7 配置 | `files/` へ同じボリュームの中で改名する（同じ中身がもうあれば staging を消す。台帳に行があるのにファイルがなければ置いて直す） | 照合が台帳にないファイル（と派生のファイル）を消して予告の行を消し、ジョブは初めから |
   | 8 コミット | トランザクション 2 で土台と「別のアイテムの今と同じでない」を確かめ直し、最初の保存なら版 0、アンカー、アイテムの置き換え（別名は新しいアイテム、版に戻すは版 k の列）、前の頭、新しい頭、入力の記録を書き、下書きを片付け（§12.12）、自分の予告を消し、途中経過に結果を書く | 0 がこのジョブの版を見つけて Done（版は 1 つだけ。保存のあとのジョブも積む） |
   | 9 後始末 | 門を放し、staging の残りを消し、サムネイル・解析（画像・音声）・プロキシ（動画・音声）のジョブを積む | — |
 
   版に戻すときは、0 のあと、版 k の中身が台帳にあってファイルがあれば門を持って 1 つのトランザクションで戻し（使い直す）、なければ 1〜5 を版 k の文書と入力の記録で行い（作り直す。アンカーを作らない。値のダイジェストを照らす）、6〜9 は同じ。
 
-  トランザクション 2 で `Conflict` になったら（門の間にゴミ箱に入れられたなど）、門を持ったまま、このジョブの予告のうち台帳に同じ拡張子で載っていない中身のファイルを消し、予告を消してから失敗にする。結果（`jobs.result_json`）は `{"outcome":"saved"|"unchanged","itemId","version","versionId","hash","ext","reused","anchor":"created"|"used"|null,"warnings"}`（版に戻すは `"revert":{"to","reused","rebuilt"}` も）か、別名で同じ中身のアイテムがあれば `{"outcome":"existing","itemId","role":"current"|"original"|"past","version","trashed"}`。
+  トランザクション 2 で `Conflict` になったら（門の間にゴミ箱に入れられたなど）、門を持ったまま、このジョブの予告のうち台帳に同じ拡張子で載っていない中身のファイルを消し、予告を消してから失敗にする。結果（`jobs.result_json`）は `{"outcome":"saved"|"unchanged","itemId","version","versionId","hash","ext","reused","anchor":"created"|"used"|null,"warnings"}`（`anchor` は作った・アンカーから読んだ・元から読んだ。アンカーが使えずに元を読み直したときも null）（版に戻すは `"revert":{"to","reused","rebuilt"}` も）か、別名で同じ中身のアイテムがあれば `{"outcome":"existing","itemId","role":"current"|"original"|"past","version","trashed"}`。
 - **版のファイルの状態**（`item_versions.file_state`）：`hold` は今か元（消さない）。`waiting` は頭でなくなった版で、段 3 の GC が 7 日と「置き換えより前のバックアップが残っていない」の条件で消す。`kept` は GC の照合が合わず残すもの（段 3）。`released` はもうファイルを持たない行（`file_blob_id` は NULL）。頭でなくなる版の出力が新しい頭か版 0 と同じなら、その行がファイルを持つので、すぐ `released`。最初の保存では前の今は元そのもので、版 0 が `hold` で持つ（消し待ちにならない）。
 - **版 0** は最初の保存のときに足す（10 万件のライブラリに行を足さない。版の行のないアイテムは「版 0 は暗に今、頭の版は 0」）。版 0 にはアイテムのメディア情報（幅・高さ・長さと、記録の mime・codec_info）と元を読んだ記録を写し、元に戻すときにここから items を戻す。
 - **電源断**：改名の前に `sync_all` するので、DB の最後のコミットを失っても残りうるのは「DB にないファイル」だけ（予告の照合か整合性チェックが数える）。置いたファイルの中身は改名の前に書き終えている（台帳に載せたファイルが書きかけになることはない）。
@@ -1144,7 +1145,10 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 `emptying_the_trash_releases_versions_and_anchors_of_edited_items`。S10〜S13 は段 3 で足す。ほかに、版に戻す先の確かめ
 （`revert_targets_are_checked_before_queueing`）、作り直しが記録と合わなければ何も変えない（`revert_rebuild_that_does_not_match_the_record_is_refused`）、
 戻す先が別のアイテムの今と同じなら Conflict（`revert_to_contents_another_item_holds_is_a_conflict`）、アンカーが壊れていれば元で読み直す
-（`revert_falls_back_to_the_original_when_the_anchor_is_broken`）、置いたあと・コミットの前にゴミ箱に入れられたら置いたファイルと予告が
+（`revert_falls_back_to_the_original_when_the_anchor_is_broken`）、保存の上書き・別名でもアンカーが壊れている・ないなら元で読み直す
+（`saving_with_a_broken_or_missing_anchor_reads_the_original_again`）、描いている間にアンカーが片付けられた保存は Conflict
+（`anchor_swept_while_saving_is_a_conflict`）、作り直しで記録のエンコーダがなければ今の組で書く
+（`revert_rebuild_without_the_recorded_encoder_uses_the_current_one`）、置いたあと・コミットの前にゴミ箱に入れられたら置いたファイルと予告が
 片付く（`trashed_between_placement_and_commit_cleans_up_placed_files`）、書いたところで中止・一時停止すると何も残らず、一時停止は続けると
 保存する（`cancel_or_pause_after_writing_leaves_nothing`。上書きと作り直し）、作り直しを 4 段で強制終了しても戻せる
 （`revert_rebuild_crash_at_each_stage_recovers`）。本当に落とす試験は `kura-devtools edit crash-loop`（architecture.md §13）。
@@ -1161,7 +1165,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 | S6 | 開いたあとに別の保存で今が変わった | Conflict で何も変わらない | `s6_conflict_when_head_changed`・`s6_conflict_when_version_added_with_same_hash`・`saving_a_trashed_item_is_a_conflict` |
 | S7 | 出力が別のアイテム（ゴミ箱のものを含む）の今と同じ | Conflict。files/ に孤立したファイルがない（別のアイテムの元と同じなら通して台帳の行を共有する） | `s7_conflict_with_other_current_including_trash`・`s7_overwrite_matching_other_original_shares_ledger_row` |
 | S8 | PNG → WebP の上書き | ext・mime・台帳の拡張子が新しくなる。古い今は消し待ち（今が版 1 以降のとき）。表示名・元のファイル名・素材の設定は変えない | `s8_png_to_webp_changes_ext_mime_and_ledger` |
-| S9 | 描いたあと・予告のあと・置いたあと・コミットのあとで強制終了 | 開き直すと食い違い 0、版は 1 つだけ、ジョブは done | `s9_crash_at_each_stage_recovers`（上書き・別名 × 4 段）・`a_save_that_crashed_while_decoding_fails_once` |
+| S9 | 描いたあと・予告のあと・置いたあと・コミットのあとで強制終了 | 開き直すと食い違い 0、版は 1 つだけ、ジョブは done | `s9_crash_at_each_stage_recovers`（上書き・別名 × 4 段）・`s9_crash_while_making_an_anchor_recovers`（偽の HEIC の最初の保存で、出力とアンカーを予告して置く × 上書き・別名 × 4 段）・`a_save_that_crashed_while_decoding_fails_once`・`a_save_that_crashed_while_reading_the_header_fails_once`（見出しを読む前に印をコミットしている） |
 | S10 | 7 日を過ぎた版の GC | 照合が一致すれば台帳の行・ファイル・派生のファイルが消え、版の記録は残る | 段 3 |
 | S11 | GC の照合が合わない（偽のデコーダの組） | 残す（kept）。ファイルは残る | 段 3 |
 | S12 | GC が作り直している間に同じ中身を取り込む | ファイルは消されない | 段 3 |
