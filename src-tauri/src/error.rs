@@ -68,6 +68,7 @@ impl From<CoreError> for AppError {
             CoreError::TooLarge(_) => AppErrorCode::TooLarge,
             CoreError::Unsupported(_) => AppErrorCode::Invalid,
             CoreError::Mismatch(_) => AppErrorCode::Conflict,
+            CoreError::Busy(_) => AppErrorCode::Busy,
             CoreError::Io(_) => AppErrorCode::Io,
             CoreError::Db(_) | CoreError::Json(_) | CoreError::DbClosed => AppErrorCode::Db,
             CoreError::ToolMissing(_) => AppErrorCode::ToolMissing,
@@ -122,6 +123,8 @@ mod tests {
         assert_eq!(err.code, AppErrorCode::Invalid);
         let err: AppError = CoreError::Mismatch("x".into()).into();
         assert_eq!(err.code, AppErrorCode::Conflict);
+        let err: AppError = CoreError::Busy("x".into()).into();
+        assert_eq!(err.code, AppErrorCode::Busy);
         let err: AppError = CoreError::LibraryInUse.into();
         assert_eq!(err.code, AppErrorCode::LibraryInUse);
         assert!(

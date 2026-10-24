@@ -9,19 +9,20 @@
 //!   取り置き（`default_reserved`）を立て、キャッシュの確保（`CacheLease`）を開く。下書きの有無・このまま保存できるか
 //!   （`fresh`）を返す。前のエディタは閉じる。
 //! - **手**（[`step`]）：手をまとめて当て（確定する手は仮の値で計画を作れることを確かめてから確定する。作れなければ断り、
-//!   状態を変えない）、描くのは最後に 1 回。段は Rust が決め（[`view::view_level`]。ドット絵は DB の実効値）、確保は
+//!   前の仮の値を含めて状態を変えない）、描くのは最後に 1 回。段は Rust が決め（[`view::view_level`]。ドット絵は DB の実効値）、確保は
 //!   プールの外、描くのはプレビューのプール。新しい要求が来たら前の描画を止め（`Latest::supersede`。当てた手は残す）、止めた
 //!   描画は `Superseded` で返す。版ごとの計画を小さな LRU で持つ（取り消しで描画のノードを読み直さない。§12.4）。
 //! - **表示だけ**（[`view`]）：手のない [`step`]。保存の終わり・予算の駐車もここで拾う。
-//! - **スポイト**（[`sample`]）：今の rev の等倍の計画で `spoit`（段の値からは拾わない）。
+//! - **スポイト**（[`sample`]）：今の rev の等倍の計画で `spoit`（段の値からは拾わない）。描いている途中の表示は止めない。
 //! - **保存**（[`save`]）：確定した頭を保存のジョブへ（`start_save`）。保存の間も編集を続けられ、同じアイテムの保存が待って
-//!   いる間は次の保存を断る（Busy）。ジョブが終わったら（次の要求で `jobs` を見る）、結果の版・中身で土台を更新して
+//!   いる間は次の保存を断る（Busy。このエディタが積んだものに加えて DB の保存のジョブで見るので、閉じて開き直しても効く）。ジョブが終わったら（次の要求で `jobs` を見る）、結果の版・中身で土台を更新して
 //!   `mark_saved_at(積んだときの rev)`。版に戻したあとは開き直す（`needs_reopen`）。保存が予算を待って駐車しているときは、
 //!   エディタのキャッシュを空にする（取り置きは外さない。M12 の決定）。
 //! - **下書き**：頭が変わるたびに、間引いて（[`autosave::INTERVAL`]）頭の文書と土台を置く（`drafts::save`。保存のジョブが
 //!   動いている間は `after_job`）。保存した頭に戻ったら捨てる。閉じるときは待っている分を置いてから止める。
 //! - **閉じる**（[`close`]・`EngineServices::close_editor`）：エディタを閉じる・ライブラリを閉じる・切り替える・終了のどれでも
-//!   同じ：中止 → キャッシュを空に → 確保を落とす → 取り置きを 0（NFR-17・ADR-154）。
+//!   同じ：中止 → キャッシュを空に → 確保を落とす → 取り置きを 0（NFR-17・ADR-154。取り置きは持ち主のエディタだけが外す：
+//!   `Reservation`）。
 
 mod autosave;
 mod source;
@@ -58,7 +59,7 @@ use self::autosave::{Autosave, DraftJob};
 use self::view::{
     changed_tiles, doc_delta, format_name, frames_of, shape_size, view_area, view_level,
 };
-use super::save::{Base, SaveAction, SaveRequest, check_doc, start_save};
+use super::save::{Base, SaveAction, SaveRequest, check_doc, pending_save, start_save};
 use super::versions::{self, FileState, VersionKind};
 use super::{EngineRuntime, EngineServices, anchors, drafts, store};
 use crate::CoreError;
@@ -246,7 +247,8 @@ pub struct Status {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewOutcome {
     Shown(ViewInfo),
-    /// 新しい要求に取って代わられた（当てた手は残る。新しい要求の結果を待つ）。
+    /// 新しい表示の要求（手・表示だけ）に取って代わられた（当てた手は残る。取って代わった要求が表示を返すので、その結果を
+    /// 待つ。スポイトは取って代わらない）。
     Superseded,
     /// 描けない（予算・文書の誤り）。手は当たっている（取り消せる）。
     Failed(Problem),
@@ -424,12 +426,51 @@ struct State {
     needs_reopen: bool,
 }
 
+/// エディタの取り置き（`default_reserved`）の持ち主（エディタのセッション。ライブラリに 1 つ。`EngineServices` が持つ）。
+/// 立てる・外すはこの錠の中で行い、外すのは持ち主のときだけ（閉じ終わる前に別のアイテムを開いたとき、古いエディタの閉じ
+/// 終わりが新しいエディタの取り置きを消さないように）。
+#[derive(Debug, Default)]
+pub(crate) struct Reservation(Mutex<Option<String>>);
+
+impl Reservation {
+    fn lock(&self) -> MutexGuard<'_, Option<String>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// エディタ `owner` の取り置き `bytes` を立てる（持ち主を `owner` にする）。
+    fn hold(
+        &self,
+        budget: &kura_engine::budget::MemoryBudget,
+        owner: &str,
+        bytes: u64,
+    ) -> Result<(), EngineError> {
+        let mut slot = self.lock();
+        budget.set_reserved(bytes)?;
+        *slot = Some(owner.to_string());
+        Ok(())
+    }
+
+    /// エディタ `owner` が持ち主なら、取り置きを 0 にして持ち主をなくす（ほかのエディタが持っていれば何もしない）。
+    fn release(&self, budget: &kura_engine::budget::MemoryBudget, owner: &str) {
+        let mut slot = self.lock();
+        if slot.as_deref() != Some(owner) {
+            return;
+        }
+        if let Err(err) = budget.set_reserved(0) {
+            tracing::warn!(%err, "エディタの取り置きを外せませんでした");
+        }
+        *slot = None;
+    }
+}
+
 /// 開いているエディタ（ライブラリに 1 つ。`EngineServices` が持つ）。
 pub struct Editor {
     id: String,
     item_id: i64,
     runtime: Arc<EngineRuntime>,
     codecs: Arc<CodecSet>,
+    /// 取り置きの持ち主（ライブラリの `EngineServices` と共有）。
+    reservation: Arc<Reservation>,
     latest: Arc<Latest>,
     cancel: Arc<CancelFlag>,
     /// None：開いている途中か閉じた。
@@ -513,8 +554,8 @@ impl Editor {
         p.now = Some(Shown { rev, level, view });
     }
 
-    /// 閉じる：中止 → キャッシュを空に → 確保を落とす → 取り置きを 0。待っている下書きを置いてから下書きのスレッドを止める。
-    /// 2 回目からは何もしない。
+    /// 閉じる：中止 → キャッシュを空に → 確保を落とす → 取り置きを 0（このエディタが取り置きの持ち主のときだけ。閉じ終わる前に
+    /// 開いた次のエディタの取り置きは消さない）。待っている下書きを置いてから下書きのスレッドを止める。2 回目からは何もしない。
     pub(crate) fn shutdown(&self) {
         self.cancel.cancel();
         let state = self.lock_state().take();
@@ -524,10 +565,8 @@ impl Editor {
             } = st;
             cache.clear();
             drop(lease);
-            if let Err(err) = self.runtime.budget().set_reserved(0) {
-                tracing::warn!(%err, "エディタの取り置きを外せませんでした");
-            }
         }
+        self.reservation.release(self.runtime.budget(), &self.id);
         *self.lock_published() = Published::default();
         self.autosave.close();
         tracing::debug!(
@@ -896,13 +935,17 @@ fn ensure_plan(e: &Engine, st: &mut State) -> Result<(), Issues> {
     Ok(())
 }
 
-/// 仮の値として当てて計画を作れるか確かめる（作れなければ仮の値を捨てて断る。状態は変えない）。
+/// 頭に手を当てた文書で計画を作れるか確かめてから、仮の値にする（`EditSession::preview_if`）。作れなければ断り、状態を
+/// 変えない（前の仮の値・その計画・表示もそのまま）。作った計画は版ごとの計画に覚える。
 fn preview_checked(e: &Engine, st: &mut State, edit: Edit) -> Result<(), EngineError> {
-    st.session.preview(e, edit)?;
-    if let Err(issues) = ensure_plan(e, st) {
-        st.session.cancel_preview();
-        return Err(EngineError::Invalid(issues));
-    }
+    let (shapes, prev) = (&st.shapes, &st.plan);
+    let (rev, plan) = st.session.preview_if(e, edit, |snap| {
+        e.compile_snapshot(snap, shapes, Some(prev))
+            .map_err(EngineError::Invalid)
+    })?;
+    remember(&mut st.plans, rev, plan.clone());
+    st.plan = plan;
+    st.plan_rev = rev;
     Ok(())
 }
 
@@ -988,6 +1031,10 @@ fn apply_steps(e: &Engine, st: &mut State, steps: Vec<Step>) -> (Vec<NodeId>, Op
             Ok(Some(id)) => created.push(id),
             Ok(None) => {}
             Err(err) => {
+                // 断った手は状態を変えないが、念のため計画を今の番号に合わせる（同じなら何もしない。覚えていればそれ）
+                if let Err(issues) = ensure_plan(e, st) {
+                    tracing::warn!(?issues, "断った手のあと、今の文書の計画を作れません");
+                }
                 return (
                     created,
                     Some(Rejected {
@@ -1025,7 +1072,9 @@ pub fn view(
     step(env, session, Vec::new(), viewport)
 }
 
-/// スポイト：今の rev の等倍の計画の出力の 1 画素（キャンバスの座標）。画像の外は None。
+/// スポイト：今の rev の等倍の計画の出力の 1 画素（キャンバスの座標）。画像の外は None。表示の要求ではないので、描いている
+/// 途中の表示（手・表示の要求）を止めず（`Latest` の世代を払い出さない。止めると、止めた要求の代わりの表示がどこからも
+/// 返らない）、錠を待ってから拾う。止まるのはエディタを閉じたときだけ（等倍の 1 画素なので軽い）。
 pub fn sample(
     env: &EditorEnv<'_>,
     session: &str,
@@ -1034,8 +1083,6 @@ pub fn sample(
     y: i64,
 ) -> Result<Option<Sampled>, EditorError> {
     let editor = editor_of(env, session)?;
-    let ticket = editor.latest.issue(editor.cancel.clone());
-    editor.latest.supersede(ticket.generation());
     let mut guard = editor.lock_state();
     let st = guard.as_mut().ok_or(EditorError::NoSession)?;
     if st.plan_rev != st.session.rev() {
@@ -1066,10 +1113,10 @@ pub fn sample(
         x,
         y,
     };
-    let (inputs, cache) = (&st.inputs, &mut st.cache);
+    let (inputs, cache, mon) = (&st.inputs, &mut st.cache, editor.cancel.as_ref());
     let r = editor
         .runtime
-        .preview(|e| e.spoit(&plan, inputs, cache, &at, &ticket));
+        .preview(|e| e.spoit(&plan, inputs, cache, &at, mon));
     settle(st);
     match r {
         Ok(s) => Ok(s.map(|s| Sampled {
@@ -1108,6 +1155,13 @@ pub fn save(
         return Err(EditorError::Busy(format!(
             "前の保存（ジョブ {}）が終わるまで待ってください",
             s.job
+        )));
+    }
+    // このエディタを開く前に積んだ同じアイテムの保存（閉じて開き直したとき）も、形式を変える手を確定する前に断る（積むときにも
+    // 同じトランザクションで確かめ直す）
+    if let Some(job) = env.library.db().read(|c| pending_save(c, editor.item_id))? {
+        return Err(EditorError::Busy(format!(
+            "前の保存（ジョブ {job}）が終わるまで待ってください"
         )));
     }
     let revert = matches!(mode, SaveMode::Revert { .. });
@@ -1150,6 +1204,7 @@ pub fn save(
         ),
         SaveMode::Revert { to } => (SaveAction::Revert { to }, SaveKind::Revert),
     };
+    // 同じアイテムの保存が DB で待っていれば（このエディタを開く前に積んだものを含む）Busy
     let job = start_save(
         env.library.db(),
         env.jobs,
@@ -1158,7 +1213,11 @@ pub fn save(
             base: st.base,
             action,
         },
-    )?;
+    )
+    .map_err(|e| match e {
+        CoreError::Busy(message) => EditorError::Busy(message),
+        other => other.into(),
+    })?;
     st.saving = Some(Saving { job, rev, kind });
     if !revert {
         // 保存を積んだあとも編集を続けるので、下書きは `after_job` 付きで置く（保存した文書と同じなら保存のジョブが消す）
@@ -1325,6 +1384,7 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
         item_id,
         runtime: runtime.clone(),
         codecs: codecs.clone(),
+        reservation: env.engine.reservation(),
         latest: Latest::new(),
         cancel: Arc::new(CancelFlag::default()),
         state: Mutex::new(None),
@@ -1443,13 +1503,14 @@ fn finish_open(
         cache.register_external(&v.value);
     }
     let reserved = default_reserved(budget.total());
-    budget
-        .set_reserved(reserved)
+    editor
+        .reservation
+        .hold(budget, &editor.id, reserved)
         .map_err(|e| EditorError::from_engine("取り置きを立てられません", e))?;
     let lease = match runtime.open_cache(&mut cache, reserved) {
         Ok(lease) => lease,
         Err(e) => {
-            let _ = budget.set_reserved(0);
+            editor.reservation.release(budget, &editor.id);
             return Err(if cache.bytes() > budget.total() {
                 EditorError::TooLarge(e.to_string())
             } else {

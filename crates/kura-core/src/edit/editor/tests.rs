@@ -60,10 +60,15 @@ fn noise_png(w: u32, h: u32, seed: u64) -> Vec<u8> {
     )
 }
 
-/// アイテムのファイルを置いて行を入れる。
+/// アイテムのファイル（PNG）を置いて行を入れる。
 fn add_item(lib: &Library, bytes: &[u8], w: i64, h: i64) -> i64 {
+    add_item_as(lib, bytes, "png", w, h)
+}
+
+/// アイテムのファイル（拡張子 `ext` の画像）を置いて行を入れる。
+fn add_item_as(lib: &Library, bytes: &[u8], ext: &'static str, w: i64, h: i64) -> i64 {
     let hash = *blake3::hash(bytes).as_bytes();
-    let path = lib.layout().content_path(&hash, "png");
+    let path = lib.layout().content_path(&hash, ext);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, bytes).unwrap();
     let size = bytes.len() as i64;
@@ -72,9 +77,9 @@ fn add_item(lib: &Library, bytes: &[u8], w: i64, h: i64) -> i64 {
             tx.execute(
                 "INSERT INTO items (hash, ext, kind, mime, size_bytes, width, height, title, original_name, original_path,
                                     source_site, imported_at, updated_at, thumb_state, proxy_state, analysis_state)
-                 VALUES (?1, 'png', 'image', 'image/png', ?2, ?3, ?4, '絵', '絵.png', '/src/絵.png', 'local', 1, 1, 'ready',
-                         'not_needed', 'ready')",
-                params![&hash[..], size, w, h],
+                 VALUES (?1, ?5, 'image', 'image/' || ?5, ?2, ?3, ?4, '絵', '絵.' || ?5, '/src/絵.' || ?5, 'local', 1, 1,
+                         'ready', 'not_needed', 'ready')",
+                params![&hash[..], size, w, h, ext],
             )?;
             Ok(tx.last_insert_rowid())
         })
@@ -194,11 +199,16 @@ fn shown(v: &ViewOutcome) -> &ViewInfo {
 
 /// 元（PNG）に文書を当てた全体の値（キャッシュなしの正）。
 fn rendered(png: &[u8], g: &Graph) -> Value {
+    rendered_as(png, "png", g)
+}
+
+/// 元（形式 `format`）に文書を当てた全体の値（キャッシュなしの正）。
+fn rendered_as(bytes: &[u8], format: &str, g: &Graph) -> Value {
     let engine = Engine::new().unwrap();
     let (value, _) = CodecSet::pinned()
         .decode(
-            &mut std::io::Cursor::new(png),
-            "png",
+            &mut std::io::Cursor::new(bytes),
+            format,
             &Default::default(),
             engine.limits(),
             &NoMonitor,
@@ -211,7 +221,7 @@ fn rendered(png: &[u8], g: &Graph) -> Value {
         InputId(0),
         InputValue {
             value,
-            source: Digest(*blake3::hash(png).as_bytes()),
+            source: Digest(*blake3::hash(bytes).as_bytes()),
         },
     )]);
     engine
@@ -222,30 +232,93 @@ fn rendered(png: &[u8], g: &Graph) -> Value {
         .value
 }
 
-/// 配信したタイル（RGBA8）が、全体の値の同じタイルと同じ。
-fn assert_tiles_match(env: &Env, session: &str, rev: u64, level: u8, expected: &Value) {
-    let full = PartialValue::full(expected.clone());
-    let rect = full.frame_rect(0).unwrap();
-    let (nx, ny) = (rect.w.div_ceil(TILE), rect.h.div_ceil(TILE));
-    for ty in 0..ny {
-        for tx in 0..nx {
-            let got = tile::serve(
-                &env.engine,
-                &TileRequest {
-                    session,
-                    rev,
-                    level,
-                    frame: 0,
-                    tx,
-                    ty,
-                    format: TileFormat::Rgba,
-                },
-            )
-            .unwrap();
-            let (_, _, want) = tile::tile_rgba(&full, 0, tx, ty).unwrap();
-            assert_eq!(got, want, "タイル {tx},{ty}");
+/// 全体の値 `full` のフレーム `frame` のタイル `tx, ty` の RGBA8 と大きさ（配信の道 `tile_rgba` とは別に作る：`read_rect` で行を
+/// 詰めて読み、`for_each_rgba8_key` で色にする。各画素はスポイトの値（`sample`。16 ビットの四捨五入・パレットの色）とも照らす）。
+fn expected_tile(full: &PartialValue, frame: u32, tx: u32, ty: u32) -> (u32, u32, Vec<u8>) {
+    let r = full.frame_rect(frame).unwrap();
+    let (x, y) = (tx * TILE, ty * TILE);
+    let (w, h) = (TILE.min(r.w - x), TILE.min(r.h - y));
+    let fmt = full.format().unwrap();
+    let mut raw = vec![0u8; (w * h) as usize * fmt.bytes_per_pixel()];
+    full.read_rect(
+        frame,
+        kura_engine::geom::IRect::new(i64::from(x), i64::from(y), w, h),
+        &mut raw,
+    )
+    .unwrap();
+    let palette = full.palette().map(|p| p.colors.as_slice());
+    let mut out = Vec::new();
+    kura_engine::imaging::convert::for_each_rgba8_key(fmt, palette, &raw, |k| {
+        out.extend_from_slice(&k.to_be_bytes());
+        true
+    })
+    .unwrap();
+    for j in 0..h {
+        for i in 0..w {
+            let (cx, cy) = (r.x + i64::from(x + i), r.y + i64::from(y + j));
+            let s = full.sample(frame, cx, cy).unwrap().unwrap();
+            let at = ((j * w + i) * 4) as usize;
+            assert_eq!(
+                &out[at..at + 4],
+                &s.rgba,
+                "{fmt:?} フレーム {frame} の {cx},{cy}"
+            );
         }
     }
+    (w, h, out)
+}
+
+/// 配信したタイル（RGBA8 と PNG）が、全体の値のフレーム `frame` の同じタイル（[`expected_tile`]。右端・下端は小さい）と同じ。
+/// PNG は読み直して大きさと画素を照らす。
+fn assert_tiles_match(env: &Env, session: &str, rev: u64, level: u8, frame: u32, expected: &Value) {
+    let full = PartialValue::full(expected.clone());
+    let rect = full.frame_rect(frame).unwrap();
+    let (nx, ny) = (rect.w.div_ceil(TILE), rect.h.div_ceil(TILE));
+    let get = |tx: u32, ty: u32, format: TileFormat| {
+        tile::serve(
+            &env.engine,
+            &TileRequest {
+                session,
+                rev,
+                level,
+                frame,
+                tx,
+                ty,
+                format,
+            },
+        )
+    };
+    for ty in 0..ny {
+        for tx in 0..nx {
+            let (w, h, want) = expected_tile(&full, frame, tx, ty);
+            let got = get(tx, ty, TileFormat::Rgba).unwrap();
+            assert_eq!(got, want, "フレーム {frame} のタイル {tx},{ty}（RGBA8）");
+            let png = get(tx, ty, TileFormat::Png).unwrap();
+            let (decoded, _) = CodecSet::pinned()
+                .decode(
+                    &mut std::io::Cursor::new(png),
+                    "png",
+                    &Default::default(),
+                    Engine::new().unwrap().limits(),
+                    &NoMonitor,
+                )
+                .unwrap();
+            let decoded = PartialValue::full(decoded);
+            assert_eq!(decoded.format(), Some(PixelFormat::Rgba8));
+            let r = decoded.frame_rect(0).unwrap();
+            assert_eq!(
+                (r.w, r.h),
+                (w, h),
+                "フレーム {frame} のタイル {tx},{ty}（PNG）"
+            );
+            let mut px = vec![0u8; want.len()];
+            decoded.read_rect(0, r, &mut px).unwrap();
+            assert_eq!(px, want, "フレーム {frame} のタイル {tx},{ty}（PNG）");
+        }
+    }
+    // 範囲の外のタイルはない
+    assert_eq!(get(nx, 0, TileFormat::Rgba).unwrap_err().status(), 404);
+    assert_eq!(get(0, ny, TileFormat::Rgba).unwrap_err().status(), 404);
 }
 
 /// 開くと対話の使用量と取り置きが 0 より大きく、閉じると 0（NFR-17・ADR-154）。閉じたセッションには答えない。
@@ -342,7 +415,7 @@ fn steps_render_like_the_bulk_path_and_undo_returns_to_earlier_revs() {
     let mut g = Graph::new_single();
     g.push_linear("image.flip", 1, json!({ "axis": "horizontal" }), 0)
         .unwrap();
-    assert_tiles_match(&env, s, rev1, 0, &rendered(&png, &g));
+    assert_tiles_match(&env, s, rev1, 0, 0, &rendered(&png, &g));
 
     // 2 手をまとめて当てて、描くのは 1 回
     let out = env.step(
@@ -368,7 +441,7 @@ fn steps_render_like_the_bulk_path_and_undo_returns_to_earlier_revs() {
         .unwrap();
     g.push_linear("image.flip", 1, json!({ "axis": "vertical" }), 0)
         .unwrap();
-    assert_tiles_match(&env, s, rev3, 0, &rendered(&png, &g));
+    assert_tiles_match(&env, s, rev3, 0, 0, &rendered(&png, &g));
 
     // 取り消し：戻った先の手の番号（1 手目のあと）。やり直しは同じ番号
     let back = env.step(s, vec![Step::Undo, Step::Undo]);
@@ -1081,6 +1154,330 @@ fn paint_edit_follows_the_tail() {
         paint_edit(&engine, &snap(&g), a.clone()).unwrap(),
         Edit::AddNode { at: 1, .. }
     ));
+}
+
+/// 画素の形式（パレット・16 ビット・グレーとアルファ）によらず、配るタイルは全体の値と同じ RGBA8（16 ビットは四捨五入、パレット
+/// は色に）。右端・下端の小さいタイルも、PNG も同じ画素。
+#[test]
+fn tiles_convert_every_pixel_format() {
+    let env = Env::new();
+    for (fmt, w, h, seed) in [
+        (PixelFormat::Indexed8, 300, 280, 21),
+        (PixelFormat::Rgba16, 260, 300, 22),
+        (PixelFormat::GrayA8, 270, 257, 23),
+    ] {
+        let png = png_of(&InputGen::Noise { w, h, fmt, seed }.generate().unwrap());
+        let id = add_item(&env.lib, &png, i64::from(w), i64::from(h));
+        let opened = env.open(id);
+        let info = shown(&opened.outcome.view);
+        let expected = rendered(&png, &Graph::new_single());
+        assert_eq!(
+            PartialValue::full(expected.clone()).format(),
+            Some(fmt),
+            "元の形式のまま表示する"
+        );
+        assert_tiles_match(&env, &opened.session, info.rev, 0, 0, &expected);
+        close(&env.engine, &opened.session);
+    }
+}
+
+/// フレームの列（GIF）：開いたまま（操作なし。入力をそのまま配る）と、反転したあとの、見ているフレームのタイルは全体の値の
+/// そのフレームと同じ（右端・下端も）。手のあと、見ていないフレームは描かないので 404。表示だけの要求でフレームを替えると、
+/// そのフレームのタイルを配る。
+#[test]
+fn tiles_follow_the_viewed_frame() {
+    let env = Env::new();
+    let (w, h) = (300u32, 270u32);
+    let frames = InputGen::NoiseFrames {
+        w,
+        h,
+        fmt: PixelFormat::Indexed8,
+        count: 3,
+        seed: 24,
+    }
+    .generate()
+    .unwrap();
+    let gif = CodecSet::pinned()
+        .encode_bytes(&frames, "gif", &json!({}), &NoMonitor)
+        .unwrap()
+        .0;
+    let id = add_item_as(&env.lib, &gif, "gif", i64::from(w), i64::from(h));
+    let expected = rendered_as(&gif, "gif", &Graph::new_single());
+    assert_eq!(PartialValue::full(expected.clone()).frame_count(), 3);
+    let at = |frame: u32| Viewport {
+        frame,
+        ..Viewport::whole()
+    };
+    let opened = env.open_with(id, at(1), false);
+    assert_eq!(opened.source.frames, Some(3));
+    let s = &opened.session;
+    let info = shown(&opened.outcome.view);
+    assert_tiles_match(&env, s, info.rev, 0, 1, &expected);
+    // 反転する（フレームごと）。描くのは見ているフレームだけ
+    let out = step(&env.env(), s, vec![flip("horizontal")], &at(1)).unwrap();
+    let info = shown(&out.view);
+    let mut g = Graph::new_single();
+    g.push_linear("image.flip", 1, json!({ "axis": "horizontal" }), 0)
+        .unwrap();
+    let expected = rendered_as(&gif, "gif", &g);
+    assert_tiles_match(&env, s, info.rev, 0, 1, &expected);
+    let frame0 = tile::serve(
+        &env.engine,
+        &TileRequest {
+            session: s,
+            rev: info.rev,
+            level: 0,
+            frame: 0,
+            tx: 0,
+            ty: 0,
+            format: TileFormat::Rgba,
+        },
+    );
+    assert_eq!(
+        frame0.unwrap_err().status(),
+        404,
+        "見ていないフレームは描かない"
+    );
+    let out = step(&env.env(), s, Vec::new(), &at(2)).unwrap();
+    let info = shown(&out.view);
+    assert_tiles_match(&env, s, info.rev, 0, 2, &expected);
+    close(&env.engine, s);
+}
+
+/// 仮の値がある間に、計画を作れない仮の値・確定の手を断っても、前の仮の値・番号・表示はそのまま（断った手は状態を変えない）。
+/// そのまま表示・スポイト・仮の値の確定ができる。
+#[test]
+fn rejected_steps_keep_the_previous_provisional() {
+    let env = Env::new();
+    let png = sprite_png(32, 32, 4);
+    let id = add_item(&env.lib, &png, 32, 32);
+    let opened = env.open(id);
+    let s = &opened.session;
+    let crop = Step::Commit {
+        edit: Edit::AddNode {
+            at: 0,
+            op: "image.crop".into(),
+            v: 1,
+            params: json!({ "rect": { "x": 0, "y": 0, "w": 16, "h": 16 } }),
+            seed: None,
+            extra_inputs: Vec::new(),
+        },
+        mode: CommitMode::Step,
+    };
+    let out = env.step(s, vec![crop]);
+    assert_eq!(out.rejected, None);
+    let set = |w: u32| Edit::SetParam {
+        node: NodeId(1),
+        key: "rect".into(),
+        value: json!({ "x": 0, "y": 0, "w": w, "h": w }),
+    };
+    let p = env.step(s, vec![Step::Preview { edit: set(20) }]);
+    assert!(p.status.provisional);
+    assert_eq!(shown(&p.view).canvas, (20, 20));
+    // 画像の外へ切り抜く手は計画を作れない（仮の値・確定のどちらで送っても）
+    for step in [
+        Step::Preview { edit: set(40) },
+        Step::Commit {
+            edit: set(50),
+            mode: CommitMode::Step,
+        },
+    ] {
+        let r = env.step(s, vec![step.clone()]);
+        let rejected = r.rejected.clone().unwrap();
+        assert_eq!(
+            (rejected.index, rejected.problem.code),
+            (0, ProblemCode::Invalid),
+            "{step:?}"
+        );
+        assert_eq!(r.status, p.status, "{step:?}：仮の値・番号はそのまま");
+        let info = shown(&r.view);
+        assert_eq!(
+            (info.rev, info.canvas),
+            (p.status.rev, (20, 20)),
+            "{step:?}"
+        );
+        let v = view(&env.env(), s, &Viewport::whole()).unwrap();
+        assert_eq!(shown(&v.view).rev, p.status.rev, "{step:?}");
+        assert!(sample(&env.env(), s, 0, 19, 19).unwrap().is_some());
+    }
+    // 仮の値は確定できる
+    let c = env.step(
+        s,
+        vec![Step::CommitPreview {
+            mode: CommitMode::Step,
+        }],
+    );
+    assert_eq!((c.status.rev, c.status.provisional), (p.status.rev, false));
+    let mut g = Graph::new_single();
+    g.push_linear(
+        "image.crop",
+        1,
+        json!({ "rect": { "x": 0, "y": 0, "w": 20, "h": 20 } }),
+        0,
+    )
+    .unwrap();
+    assert_tiles_match(&env, s, c.status.rev, 0, 0, &rendered(&png, &g));
+}
+
+/// 同じアイテムの保存が待っている間は、エディタを閉じて開き直しても次の保存を Busy で断る（DB のジョブで見る。土台がずれて
+/// Conflict になるため）。形式を変える手も確定しない。保存の口（`start_save`）も同じで、断るときは文書の部品も置かない。ほかの
+/// アイテムは積める。待っている保存が終われば積める。
+#[test]
+fn a_pending_save_blocks_the_next_save_even_after_reopening() {
+    let env = Env::new();
+    let png = sprite_png(24, 20, 13);
+    let id = add_item(&env.lib, &png, 24, 20);
+    let other = add_item(&env.lib, &sprite_png(8, 8, 18), 8, 8);
+    let opened = env.open(id);
+    env.step(&opened.session, vec![flip("horizontal")]);
+    let first = save(&env.env(), &opened.session, SaveMode::Overwrite, None).unwrap();
+    close(&env.engine, &opened.session);
+    // 開き直す（保存はまだ動いていない）
+    let again = env.open(id);
+    let s = &again.session;
+    assert_eq!(again.base_version, 0);
+    let edited = env.step(s, vec![flip("vertical")]);
+    for format in [
+        None,
+        Some(FormatChoice::To {
+            format: "webp".into(),
+            options: json!({}),
+        }),
+    ] {
+        let busy = save(&env.env(), s, SaveMode::Overwrite, format);
+        assert!(matches!(busy, Err(EditorError::Busy(_))), "{busy:?}");
+    }
+    let still = view(&env.env(), s, &Viewport::whole()).unwrap();
+    assert_eq!(still.status, edited.status, "形式を変える手も確定しない");
+    // 保存の口も同じ（部品も置かない）
+    let hash = *blake3::hash(&png).as_bytes();
+    let mut graph = Graph::new_single();
+    graph
+        .push_linear("image.flip", 1, json!({ "axis": "vertical" }), 0)
+        .unwrap();
+    graph
+        .push_linear("image.flip", 1, json!({ "axis": "vertical" }), 0)
+        .unwrap();
+    let req = |item_id: i64, base_hash: [u8; 32]| SaveRequest {
+        item_id,
+        base: Base {
+            hash: base_hash,
+            version: 0,
+        },
+        action: SaveAction::Overwrite {
+            graph: graph.clone(),
+        },
+    };
+    let r = start_save(env.lib.db(), &env.jobs, &req(id, hash));
+    assert!(matches!(r, Err(CoreError::Busy(_))), "{r:?}");
+    let root = kura_engine::doc_parts::split(&graph).unwrap().root;
+    assert!(
+        env.lib
+            .db()
+            .read(|c| store::doc_id_by_digest(c, &root))
+            .unwrap()
+            .is_none(),
+        "断った保存の文書の部品は置かない"
+    );
+    // ほかのアイテムは積める
+    let other_hash: [u8; 32] = env
+        .lib
+        .db()
+        .read(|c| {
+            Ok(
+                c.query_row("SELECT hash FROM items WHERE id = ?1", [other], |r| {
+                    r.get::<_, Vec<u8>>(0)
+                })?,
+            )
+        })
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let other_job = start_save(env.lib.db(), &env.jobs, &req(other, other_hash)).unwrap();
+    // 待っている保存が終われば積める
+    env.start_jobs();
+    for job in [first.job, other_job] {
+        assert_eq!(env.jobs.get(job).unwrap().state, JobState::Done);
+    }
+    assert!(save(&env.env(), s, SaveMode::Overwrite, None).is_ok());
+    assert!(env.jobs.wait_idle(WAIT));
+    close(&env.engine, s);
+}
+
+/// 閉じている途中（前の要求がエディタの錠を持っている間）に別のアイテムを開いても、閉じ終わりが新しいエディタの取り置きを
+/// 消さない（取り置きを外すのは持ち主のエディタだけ。§12.10・ADR-154）。新しいエディタを閉じると 0 に戻る。
+#[test]
+fn closing_while_another_item_opens_keeps_the_new_reservation() {
+    let env = Env::new();
+    let a = add_item(&env.lib, &sprite_png(16, 16, 1), 16, 16);
+    let b = add_item(&env.lib, &sprite_png(16, 16, 2), 16, 16);
+    let first = env.open(a);
+    let editor_a = env.engine.editor_for(&first.session).unwrap();
+    let guard = editor_a.lock_state();
+    let closing = {
+        let (engine, session) = (env.engine.clone(), first.session.clone());
+        std::thread::spawn(move || close(&engine, &session))
+    };
+    // 置き場から外れた（閉じ終わりは錠を待っている）
+    while env.engine.current_editor().is_some() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let second = env.open(b);
+    let reserved = env.usage().reserved;
+    assert!(reserved > 0);
+    drop(guard);
+    closing.join().unwrap();
+    let u = env.usage();
+    assert_eq!(u.reserved, reserved, "{u:?}");
+    assert!(env.engine.editor_for(&second.session).is_some());
+    close(&env.engine, &second.session);
+    let u = env.usage();
+    assert_eq!((u.interactive, u.reserved), (0, 0), "{u:?}");
+}
+
+/// スポイトは描いている途中の表示を止めない（止めると、止めた要求の代わりの表示がどこからも返らない）：手の要求が錠を待って
+/// いる間にスポイトを頼んでも、手の表示は描かれて公開される。
+#[test]
+fn sampling_does_not_supersede_a_render() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(16, 16, 3), 16, 16);
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    let editor = env.engine.editor_for(&s).unwrap();
+    let guard = editor.lock_state();
+    let issued = editor.latest.latest();
+    std::thread::scope(|scope| {
+        let stepping = scope.spawn(|| {
+            step(
+                &env.env(),
+                &s,
+                vec![Step::Paint {
+                    actions: vec![stroke(&[(1, 0), (1, 1)], [255, 0, 0, 255])],
+                }],
+                &Viewport::whole(),
+            )
+            .unwrap()
+        });
+        while editor.latest.latest() < issued + 1 {
+            std::thread::yield_now();
+        }
+        let sampling = scope.spawn(|| sample(&env.env(), &s, 0, 1, 1).unwrap());
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            editor.latest.latest(),
+            issued + 1,
+            "スポイトは世代を払い出さない"
+        );
+        drop(guard);
+        let stepped = stepping.join().unwrap();
+        let picked = sampling.join().unwrap();
+        let info = shown(&stepped.view);
+        assert_eq!(info.rev, stepped.status.rev);
+        assert!(picked.is_some());
+        let p = editor.lock_published();
+        assert_eq!(p.now.as_ref().map(|n| n.rev), Some(stepped.status.rev));
+    });
+    close(&env.engine, &s);
 }
 
 /// 実行の場の大きさをこの機械に任せたファクトリ（予算 2 GiB）。

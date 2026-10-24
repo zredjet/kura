@@ -21,6 +21,9 @@ pub enum CoreError {
     /// 記録と食い違う（途中の版を作り直した値が版の記録と合わない・アンカーが壊れているなど。M12 の保存）。
     #[error("記録と食い違います: {0}")]
     Mismatch(String),
+    /// 混んでいる（同じアイテムの保存が終わっていないなど。待ってやり直せば通りうる。M12 の保存）。
+    #[error("混んでいます: {0}")]
+    Busy(String),
     /// ファイル操作の失敗。
     #[error("ファイル操作に失敗しました: {0}")]
     Io(#[from] std::io::Error),
@@ -179,6 +182,7 @@ impl CoreError {
             Self::TooLarge(_) => "TooLarge",
             Self::Unsupported(_) => "Unsupported",
             Self::Mismatch(_) => "Mismatch",
+            Self::Busy(_) => "Busy",
             Self::Io(_) => "Io",
             Self::Db(_) | Self::Json(_) | Self::DbClosed => "Db",
             Self::ToolMissing(_) => "ToolMissing",

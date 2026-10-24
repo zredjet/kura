@@ -207,3 +207,94 @@ fn write(library: &Library, item_id: i64, job: DraftJob) {
         Err(err) => tracing::warn!(%err, item_id, "下書きを置けませんでした"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kura_engine::session::{EditSession, HistoryLimits};
+    use kura_engine::{Digest, Engine, Graph};
+
+    /// 頭の文書のスナップショット（反転を `n` 個）。
+    fn snapshot(engine: &Engine, n: usize) -> Snapshot {
+        let mut g = Graph::new_single();
+        for _ in 0..n {
+            g.push_linear(
+                "image.flip",
+                1,
+                serde_json::json!({ "axis": "vertical" }),
+                0,
+            )
+            .unwrap();
+        }
+        EditSession::open(engine, &g, Digest::default(), HistoryLimits::default())
+            .unwrap()
+            .head()
+            .clone()
+    }
+
+    fn draft_root(library: &Library, item_id: i64) -> Option<Digest> {
+        library
+            .db()
+            .read(|c| drafts::get(c, item_id))
+            .unwrap()
+            .map(|d| d.doc)
+    }
+
+    /// 間引き（間隔 1 時間）：1 回目の頼みはすぐ置き、間隔の中の 2 回目・3 回目は置かずに最新の 1 つだけを持つ。閉じると待っている
+    /// 最新の頼みを置いてから止まり（S17 の前提：閉じても最後の下書きが残る）、閉じたあとの頼みは何もしない。
+    #[test]
+    fn requests_are_thinned_and_the_last_one_is_written_on_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Arc::new(Library::create(&dir.path().join("L")).unwrap());
+        let item = library
+            .db()
+            .write(|tx| Ok(crate::edit::testing::insert_item(tx, 1, [1; 32])))
+            .unwrap();
+        let engine = Engine::new().unwrap();
+        let base = Base {
+            hash: [1; 32],
+            version: 0,
+        };
+        let put = |n: usize| DraftJob::Put {
+            snapshot: snapshot(&engine, n),
+            base,
+            after_job: None,
+        };
+        let root = |n: usize| {
+            kura_engine::doc_parts::split(&snapshot(&engine, n).to_graph())
+                .unwrap()
+                .root
+        };
+        let autosave = Autosave::start(library.clone(), item, Duration::from_secs(3600));
+        assert!(autosave.threaded);
+        // 1 回目はすぐ置く
+        autosave.request(put(1));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while draft_root(&library, item) != Some(root(1)) {
+            assert!(Instant::now() < deadline, "1 回目の頼みが置かれません");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 間隔の中の頼みは置かない（最新の 1 つだけを持つ）
+        autosave.request(put(2));
+        autosave.request(put(3));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(draft_root(&library, item), Some(root(1)));
+        // 閉じると、待っている最新の頼みを置いてから止まる
+        autosave.close();
+        assert_eq!(draft_root(&library, item), Some(root(3)));
+        assert!(
+            library
+                .db()
+                .read(|c| crate::edit::store::doc_id_by_digest(c, &root(2)))
+                .unwrap()
+                .is_none(),
+            "置き換えた頼みは書かない"
+        );
+        // 閉じたあとの頼みは何もしない（2 回閉じても何もしない）
+        autosave.request(DraftJob::Discard);
+        autosave.close();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(draft_root(&library, item), Some(root(3)));
+        library.close();
+    }
+}

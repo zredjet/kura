@@ -21,7 +21,7 @@ use std::time::Instant;
 
 pub use kura_engine::codec::CodecSet;
 
-use super::editor::Editor;
+use super::editor::{Editor, Reservation};
 use super::runtime::{EngineRuntime, RuntimeConfig};
 use crate::Result;
 use crate::asset::pcm::{CACHE_TTL, PcmCache};
@@ -52,6 +52,8 @@ pub struct EngineServices {
     pcm: Arc<PcmCache>,
     /// 開いているエディタ（ライブラリに 1 つ。M12。kura:// の `/edit` もここから引く）。
     editor: Mutex<Option<Arc<Editor>>>,
+    /// エディタの取り置きの持ち主（エディタどうしで共有し、外すのは持ち主だけ）。
+    reservation: Arc<Reservation>,
 }
 
 impl EngineServices {
@@ -65,7 +67,13 @@ impl EngineServices {
             codecs: Mutex::new(None),
             pcm: PcmCache::new(CACHE_TTL),
             editor: Mutex::new(None),
+            reservation: Arc::new(Reservation::default()),
         }
+    }
+
+    /// エディタの取り置きの持ち主（エディタを作るときに渡す）。
+    pub(crate) fn reservation(&self) -> Arc<Reservation> {
+        self.reservation.clone()
     }
 
     fn editor_slot(&self) -> std::sync::MutexGuard<'_, Option<Arc<Editor>>> {

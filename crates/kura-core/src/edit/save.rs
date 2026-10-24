@@ -166,7 +166,9 @@ pub fn check_doc(g: &Graph) -> Result<()> {
 }
 
 /// 保存のジョブを積む。文書を内容アドレスの部品に分けて先に DB に置き（`store::put_doc`）、ジョブの入力には根のダイジェスト
-/// だけを書く。アイテムがなければ NotFound。版に戻す（`Revert`）は、戻す先が 0 以上・頭の版より前でなければ Invalid。
+/// だけを書く。アイテムがなければ NotFound。版に戻す（`Revert`）は、戻す先が 0 以上・頭の版より前でなければ Invalid。同じ
+/// アイテムの保存のジョブ（上書き・別名・版に戻す）が終わっていなければ（待ち・実行中・一時停止）Busy（土台がずれて Conflict
+/// になるため。エディタを閉じて開き直しても効くよう、部品を置くのと同じトランザクションで DB を見る。[`pending_save`]）。
 pub fn start_save(db: &Db, jobs: &JobManager, req: &SaveRequest) -> Result<JobId> {
     let item_id = req.item_id;
     let names = match &req.action {
@@ -220,13 +222,35 @@ pub fn start_save(db: &Db, jobs: &JobManager, req: &SaveRequest) -> Result<JobId
         },
         action,
     };
-    // 文書の部品を置くのと同じトランザクションで積む（間に GC の部品の片付けが入っても、積んだジョブの根として残る）
+    // 文書の部品を置くのと同じトランザクションで積む（間に GC の部品の片付けが入っても、積んだジョブの根として残る）。同じ
+    // アイテムの保存が終わっていなければ、何も置かずに断る
     jobs.enqueue_with(JobKind::Edit, serde_json::to_string(&input)?, move |tx| {
+        if let Some(job) = pending_save(tx, item_id)? {
+            return Err(CoreError::Busy(format!(
+                "アイテム {item_id} の前の保存（ジョブ {job}）が終わるまで待ってください"
+            )));
+        }
         if let Some(parts) = parts {
             store::put_doc(tx, &parts, now_ms())?;
         }
         Ok(())
     })
+}
+
+/// アイテム `item_id` の終わっていない（待ち・実行中・一時停止の）保存のジョブ（あればその 1 つ）。状態の索引
+/// `idx_jobs_queue` で引き、入力を読んでアイテムを比べる（読めない入力は飛ばす。そのジョブは動くときに失敗する）。
+pub fn pending_save(conn: &Connection, item_id: i64) -> Result<Option<JobId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit'",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (id, input) = row?;
+        if serde_json::from_str::<JobInput>(&input).is_ok_and(|i| i.item_id == item_id) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 /// 文書を内容アドレスの部品に分ける。
@@ -712,6 +736,17 @@ impl JobHandler for EditHandler {
             }
         }
         result
+    }
+
+    /// 待ち・一時停止のまま中止された上書き・別名（`run` を通らないので上の印が置かれない）：積む前に置いた文書の部品が孤立
+    /// しうるので、中止と同じトランザクションで GC の部品の印を置く（版に戻すは文書を持たない）。
+    fn canceled_while_idle(&self, tx: &Connection, input_json: &str) -> Result<()> {
+        let with_doc = serde_json::from_str::<JobInput>(input_json)
+            .is_ok_and(|i| !matches!(i.action, ActionInput::Revert { .. }));
+        if with_doc {
+            gc::mark_parts(tx)?;
+        }
+        Ok(())
     }
 }
 
@@ -1907,6 +1942,47 @@ mod tests {
         );
         assert!(plan.contains("SCAN p"), "{plan}");
         assert!(plan.contains("sqlite_autoindex_blobs_1"), "{plan}");
+    }
+
+    /// 終わっていない保存のジョブは、アイテムごとに見分ける（版に戻すも数える。終わったもの・ほかの種類・読めない入力は
+    /// 数えない）。状態の索引で引く。
+    #[test]
+    fn pending_saves_are_found_per_item() {
+        use crate::db::{query_plan, test_conn};
+        let conn = test_conn();
+        let job = |kind: &str, state: &str, input: String| -> i64 {
+            conn.query_row(
+                "INSERT INTO jobs (kind, state, input_json, created_at) VALUES (?1, ?2, ?3, 1) RETURNING id",
+                params![kind, state, input],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let input = |item: i64, action: serde_json::Value| {
+            json!({ "v": 1, "itemId": item, "base": { "hash": "00".repeat(32), "version": 0 }, "action": action })
+                .to_string()
+        };
+        let doc = json!({ "type": "overwrite", "doc": "00".repeat(32) });
+        job("edit", "done", input(1, doc.clone()));
+        job("edit", "failed", input(1, doc.clone()));
+        job("gc", "queued", input(1, doc.clone()));
+        job("edit", "queued", "{}".into());
+        assert_eq!(pending_save(&conn, 1).unwrap(), None);
+        let paused = job(
+            "edit",
+            "paused",
+            input(2, json!({ "type": "revert", "to": 0 })),
+        );
+        assert_eq!(pending_save(&conn, 2).unwrap(), Some(paused));
+        assert_eq!(pending_save(&conn, 1).unwrap(), None);
+        let running = job("edit", "running", input(1, doc));
+        assert_eq!(pending_save(&conn, 1).unwrap(), Some(running));
+        let plan = query_plan(
+            &conn,
+            "SELECT id, input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit'",
+        );
+        assert!(plan.contains("idx_jobs_queue"), "{plan}");
+        assert!(!plan.contains("SCAN jobs"), "{plan}");
     }
 
     /// ジョブの入力の形（小さく、根のダイジェストだけ）。知らない項目は拒む。

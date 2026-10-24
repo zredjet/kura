@@ -298,10 +298,24 @@ impl EditSession {
     /// 確定した頭に `edit` を当てた仮の値を出す（履歴に入れない。前の仮の値は捨てる）。何も変えなければ仮の値を消して
     /// 頭の番号を返す。断ったら状態は変えない。
     pub fn preview(&mut self, engine: &Engine, edit: Edit) -> Result<Rev, EngineError> {
+        self.preview_if(engine, edit, |_| Ok::<(), EngineError>(()))
+            .map(|(rev, ())| rev)
+    }
+
+    /// [`Self::preview`] と同じだが、頭に `edit` を当てた文書を先に `check` に渡し（呼び手が計画を作れるかを確かめる）、`check`
+    /// が通ったときだけ仮の値を出す（前の仮の値は捨てる）。`edit` か `check` が断れば、状態は変えない（前の仮の値も残す）。
+    /// 返すのは今の番号（何も変えなければ頭の番号）と `check` の結果。
+    pub fn preview_if<T, E: From<EngineError>>(
+        &mut self,
+        engine: &Engine,
+        edit: Edit,
+        check: impl FnOnce(&Snapshot) -> Result<T, E>,
+    ) -> Result<(Rev, T), E> {
         let out = edit::apply(engine, self.head(), &edit)?;
+        let checked = check(&out.snap)?;
         self.discard_provisional();
         if out.snap.same_content(self.head()) {
-            return Ok(self.head_rev());
+            return Ok((self.head_rev(), checked));
         }
         let rev = self.fresh_rev();
         self.provisional = Some(Provisional {
@@ -310,7 +324,7 @@ impl EditSession {
             merge: MergeKey::of(&edit),
             created: out.created,
         });
-        Ok(rev)
+        Ok((rev, checked))
     }
 
     /// 仮の値を捨てる。捨てたら頭の番号、なければ None。
@@ -761,5 +775,62 @@ mod tests {
             serde_json::to_value(CommitMode::Merge).unwrap(),
             json!("merge")
         );
+    }
+
+    /// 確かめてから出す仮の値：`check` か手が断れば、前の仮の値・番号を残す（M12 のエディタが計画を作れない手を断るとき）。
+    /// 通れば前の仮の値を捨てて新しい仮の値になる。頭と同じ中身なら仮の値を消して頭の番号。
+    #[test]
+    fn preview_if_keeps_the_previous_provisional_when_refused() {
+        let engine = Engine::new().unwrap();
+        let mut g = Graph::new_single();
+        g.push_linear("image.flip", 1, json!({ "axis": "vertical" }), 0)
+            .unwrap();
+        let mut s =
+            EditSession::open(&engine, &g, Digest::default(), HistoryLimits::default()).unwrap();
+        let axis = |a: &str| Edit::SetParam {
+            node: NodeId(1),
+            key: "axis".into(),
+            value: json!(a),
+        };
+        let p = s.preview(&engine, axis("horizontal")).unwrap();
+        assert!(s.is_provisional());
+        let kept = s.current().clone();
+        // check が断る
+        let r = s.preview_if(&engine, axis("vertical"), |_| {
+            Err::<(), _>(EngineError::Internal("断る".into()))
+        });
+        assert!(r.is_err());
+        assert_eq!(s.rev(), p);
+        assert!(s.current().same_content(&kept));
+        // 手そのものが断られる（知らないノード）
+        let bad = Edit::SetParam {
+            node: NodeId(9),
+            key: "axis".into(),
+            value: json!("vertical"),
+        };
+        let mut called = false;
+        assert!(
+            s.preview_if(&engine, bad, |_| {
+                called = true;
+                Ok::<(), EngineError>(())
+            })
+            .is_err()
+        );
+        assert!(!called, "当てられない手は check に渡さない");
+        assert_eq!(s.rev(), p);
+        // 通れば、check に渡した文書が新しい仮の値になる
+        let (rev, nodes) = s
+            .preview_if(&engine, axis("horizontal"), |snap| {
+                Ok::<_, EngineError>(snap.node_count())
+            })
+            .unwrap();
+        assert_ne!(rev, p, "出し直した仮の値には新しい番号");
+        assert_eq!((s.rev(), nodes), (rev, 1));
+        // 頭と同じ中身なら仮の値を消して頭の番号
+        let (rev, ()) = s
+            .preview_if(&engine, axis("vertical"), |_| Ok::<(), EngineError>(()))
+            .unwrap();
+        assert_eq!(rev, s.head_rev());
+        assert!(!s.is_provisional());
     }
 }
