@@ -63,3 +63,40 @@ export function pcmUrl(hash: string, start: number, end: number): string {
 export function animUrl(hash: string, rev: number): string {
   return `${BASE}/anim/${hash}/${ANIM_V}${revQuery(rev)}`;
 }
+
+/** エディタのタイルの中身：行を詰めた非圧縮の RGBA8（拡張子なし）か PNG（`.png`）。 */
+export type EditTileFormat = 'rgba' | 'png';
+
+/** セッションの ID（小文字の 16 進。Rust の `editor::is_session_id`）。 */
+const SESSION_ID = /^[0-9a-f]{1,64}$/;
+
+/**
+ * エディタの表示のタイル（docs/editing.md §12.13。immutable）：`/edit/{session}/{rev}/{level}/{frame}/{tx}/{ty}`。
+ * タイルは 1 辺 256・フレームの画像の座標（右端・下端は小さい）。`rev` はそのタイルが最後に変わった番号（変わらない
+ * タイルは同じ URL のまま）。Rust が応えるのは、エディタが表示した今か直前の表示の rev・段で、そのタイルが有効なときだけ。
+ * 数は 0 以上の整数、段は 0〜3、セッションは小文字の 16 進（そうでなければ RangeError）。
+ */
+export function editTileUrl(
+  session: string,
+  rev: number,
+  level: number,
+  frame: number,
+  tx: number,
+  ty: number,
+  format: EditTileFormat,
+): string {
+  const counts = [rev, frame, tx, ty];
+  if (
+    !SESSION_ID.test(session) ||
+    !counts.every((n) => Number.isSafeInteger(n) && n >= 0) ||
+    !Number.isInteger(level) ||
+    level < 0 ||
+    level > 3
+  ) {
+    throw new RangeError(
+      `タイルの指定が正しくありません：${session}/${rev}/${level}/${frame}/${tx}/${ty}`,
+    );
+  }
+  const ext = format === 'png' ? '.png' : '';
+  return `${BASE}/edit/${session}/${rev}/${level}/${frame}/${tx}/${ty}${ext}`;
+}

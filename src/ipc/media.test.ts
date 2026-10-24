@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { animUrl, fileUrl, hasThumb, pcmUrl, peaksUrl, playUrl, thumbUrl } from './media';
+import {
+  animUrl,
+  editTileUrl,
+  fileUrl,
+  hasThumb,
+  pcmUrl,
+  peaksUrl,
+  playUrl,
+  thumbUrl,
+} from './media';
 
 describe('URL', () => {
   it('サムネイルは rev が 0 より大きいときだけ ?r= を付ける', () => {
@@ -28,6 +37,27 @@ describe('URL', () => {
     [0, Number.POSITIVE_INFINITY],
   ])('PCM の区間 %s-%s は断る', (start, end) => {
     expect(() => pcmUrl('ab', start, end)).toThrow(RangeError);
+  });
+
+  it('エディタのタイル（M12）：拡張子なしは RGBA8、.png は PNG', () => {
+    expect(editTileUrl('0a1b', 12, 0, 0, 1, 2, 'rgba')).toBe(
+      'kura://localhost/edit/0a1b/12/0/0/1/2',
+    );
+    expect(editTileUrl('0a1b', 12, 3, 4, 0, 0, 'png')).toBe(
+      'kura://localhost/edit/0a1b/12/3/4/0/0.png',
+    );
+  });
+
+  it.each([
+    ['ABC', 1, 0, 0, 0, 0],
+    ['a/b', 1, 0, 0, 0, 0],
+    ['ab', -1, 0, 0, 0, 0],
+    ['ab', 1, 4, 0, 0, 0],
+    ['ab', 1, 0.5, 0, 0, 0],
+    ['ab', 1, 0, 0, 1.5, 0],
+    ['ab', 1, 0, 0, 0, Number.NaN],
+  ])('エディタのタイルの指定 %s/%s/%s/%s/%s/%s は断る', (session, rev, level, frame, tx, ty) => {
+    expect(() => editTileUrl(session, rev, level, frame, tx, ty, 'rgba')).toThrow(RangeError);
   });
 
   it('サムネイルがあるのは ready と stale（作り直すまで今の絵を出す）', () => {
