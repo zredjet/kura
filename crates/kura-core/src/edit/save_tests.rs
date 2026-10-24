@@ -18,24 +18,25 @@ use kura_engine::{Digest, Engine, EngineError, Graph, Limits, Monitor, NoMonitor
 use rusqlite::params;
 use serde_json::{Value as Json, json};
 
+use super::gc::{GcClock, GcFault, GcHandler, GcHook};
 use super::save::{Base, EditHandler, Fault, Hook, SaveAction, SaveRequest, Stage, start_save};
 use super::services::fake::FakeEngineFactory;
 use super::versions::{self, FileState, Head, Version, VersionKind};
 use super::{ENGINE_WORK_DIR, EngineServices, drafts};
+use crate::CoreError;
 use crate::import::{ImportInput, ImportOptions, ImportResult, hash_file, start_import};
 use crate::jobs::{EventSink, JobEvent, JobKind, JobManager, JobRecord, JobState};
 use crate::library::{
     IntegrityDepth, Library, LibrarySession, Services, check_files, check_integrity, hex, ledger,
 };
 use crate::media::fake::FakeBackend;
-use crate::{CoreError, Result};
 
-const WAIT: Duration = Duration::from_secs(60);
+pub(super) const WAIT: Duration = Duration::from_secs(60);
 
 // ---- 道具 ----
 
 /// ドット絵の PNG（固定の段で書いたもの。読み直して書くと同じバイト列になる）。
-fn sprite(seed: u64) -> Vec<u8> {
+pub(super) fn sprite(seed: u64) -> Vec<u8> {
     let value = InputGen::PixelSprite {
         w: 24,
         h: 20,
@@ -50,16 +51,16 @@ fn sprite(seed: u64) -> Vec<u8> {
         .0
 }
 
-fn hash_of(bytes: &[u8]) -> [u8; 32] {
+pub(super) fn hash_of(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
-fn flip(axis: &str) -> (&'static str, Json) {
+pub(super) fn flip(axis: &str) -> (&'static str, Json) {
     ("image.flip", json!({ "axis": axis }))
 }
 
 /// 元に対する累積の文書（`to` があれば出力の形式）。
-fn doc(ops: &[(&'static str, Json)], to: Option<&str>) -> Graph {
+pub(super) fn doc(ops: &[(&'static str, Json)], to: Option<&str>) -> Graph {
     let mut g = Graph::new_single();
     for (op, params) in ops {
         g.push_linear(op, 1, params.clone(), 0).unwrap();
@@ -74,7 +75,7 @@ fn doc(ops: &[(&'static str, Json)], to: Option<&str>) -> Graph {
 }
 
 /// 保存のジョブの外で、PNG に文書を当てて PNG に書いたバイト列（保存の出力と同じになるはずのもの）。
-fn render_png(png: &[u8], g: &Graph) -> Vec<u8> {
+pub(super) fn render_png(png: &[u8], g: &Graph) -> Vec<u8> {
     let (value, _) = CodecSet::pinned()
         .decode(
             &mut std::io::Cursor::new(png),
@@ -88,7 +89,7 @@ fn render_png(png: &[u8], g: &Graph) -> Vec<u8> {
 }
 
 /// 保存のジョブの外で、元（中身 `source`）を読んだ値 `value` に文書を当てて PNG に書いたバイト列。
-fn render_value_png(value: kura_engine::Value, g: &Graph, source: [u8; 32]) -> Vec<u8> {
+pub(super) fn render_value_png(value: kura_engine::Value, g: &Graph, source: [u8; 32]) -> Vec<u8> {
     let engine = Engine::new().unwrap();
     let plan = engine
         .compile(g, &BTreeMap::from([(InputId(0), value.shape())]))
@@ -107,25 +108,25 @@ fn render_value_png(value: kura_engine::Value, g: &Graph, source: [u8; 32]) -> V
         .0
 }
 
-fn sink(events: &Arc<Mutex<Vec<JobEvent>>>) -> EventSink {
+pub(super) fn sink(events: &Arc<Mutex<Vec<JobEvent>>>) -> EventSink {
     let events = events.clone();
     Arc::new(move |e| events.lock().unwrap().push(e))
 }
 
-fn count(lib: &Library, sql: &str) -> i64 {
+pub(super) fn count(lib: &Library, sql: &str) -> i64 {
     lib.db()
         .read(|c| Ok(c.query_row(sql, [], |r| r.get(0))?))
         .unwrap()
 }
 
-fn one<T: rusqlite::types::FromSql>(lib: &Library, sql: &str, id: i64) -> T {
+pub(super) fn one<T: rusqlite::types::FromSql>(lib: &Library, sql: &str, id: i64) -> T {
     lib.db()
         .read(|c| Ok(c.query_row(sql, [id], |r| r.get(0))?))
         .unwrap()
 }
 
 /// アイテムのファイルを置いて行を入れる（サムネイル・解析は済んだものとして）。
-fn add_item(lib: &Library, bytes: &[u8], ext: &str, title: &str) -> (i64, [u8; 32]) {
+pub(super) fn add_item(lib: &Library, bytes: &[u8], ext: &str, title: &str) -> (i64, [u8; 32]) {
     let hash = hash_of(bytes);
     let path = lib.layout().content_path(&hash, ext);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -147,11 +148,11 @@ fn add_item(lib: &Library, bytes: &[u8], ext: &str, title: &str) -> (i64, [u8; 3
     (id, hash)
 }
 
-fn head(lib: &Library, id: i64) -> Head {
+pub(super) fn head(lib: &Library, id: i64) -> Head {
     lib.db().read(|c| versions::head(c, id)).unwrap().unwrap()
 }
 
-fn base_of(lib: &Library, id: i64) -> Base {
+pub(super) fn base_of(lib: &Library, id: i64) -> Base {
     let h = head(lib, id);
     Base {
         hash: h.hash,
@@ -159,23 +160,23 @@ fn base_of(lib: &Library, id: i64) -> Base {
     }
 }
 
-fn versions_of(lib: &Library, id: i64) -> Vec<Version> {
+pub(super) fn versions_of(lib: &Library, id: i64) -> Vec<Version> {
     lib.db().read(|c| versions::list(c, id)).unwrap()
 }
 
-fn states(lib: &Library, id: i64) -> Vec<(i64, FileState)> {
+pub(super) fn states(lib: &Library, id: i64) -> Vec<(i64, FileState)> {
     versions_of(lib, id)
         .iter()
         .map(|v| (v.version, v.file_state))
         .collect()
 }
 
-fn result_of(record: &JobRecord) -> Json {
+pub(super) fn result_of(record: &JobRecord) -> Json {
     serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap()
 }
 
 /// `files/` のファイル（相対パス）の一覧。
-fn files(lib: &Library) -> Vec<String> {
+pub(super) fn files(lib: &Library) -> Vec<String> {
     let root = lib.layout().files_dir();
     let mut out: Vec<String> = walkdir::WalkDir::new(&root)
         .into_iter()
@@ -194,7 +195,7 @@ fn files(lib: &Library) -> Vec<String> {
 }
 
 /// staging のファイル（エンジンの置き場を含む）。
-fn staged(lib: &Library) -> Vec<PathBuf> {
+pub(super) fn staged(lib: &Library) -> Vec<PathBuf> {
     walkdir::WalkDir::new(lib.layout().staging_dir())
         .into_iter()
         .map(|e| e.unwrap())
@@ -205,14 +206,14 @@ fn staged(lib: &Library) -> Vec<PathBuf> {
 
 /// 台帳・版・ファイルのスナップショット（Conflict で何も変わらないことを照らす）。
 /// (files/ のファイル, 台帳の (hash, ext), 版の (アイテム, 版, 状態), アイテムの数)。
-type Snapshot = (
+pub(super) type Snapshot = (
     Vec<String>,
     Vec<(Vec<u8>, String)>,
     Vec<(i64, i64, String)>,
     i64,
 );
 
-fn snapshot(lib: &Library) -> Snapshot {
+pub(super) fn snapshot(lib: &Library) -> Snapshot {
     let blobs = lib
         .db()
         .read(|c| {
@@ -241,7 +242,7 @@ fn snapshot(lib: &Library) -> Snapshot {
 
 /// 食い違い 0：整合性（DB にないファイル・ファイルのない台帳の行・参照されない台帳の行）が 0、台帳のどの行もファイルの
 /// 中身が hash と同じ、予告が空、staging が空、版の不変条件が空、保存のジョブが動いていない。
-fn assert_consistent(lib: &Library) {
+pub(super) fn assert_consistent(lib: &Library) {
     let report = check_integrity(lib.db(), lib.layout(), 0, IntegrityDepth::Startup).unwrap();
     assert_eq!(
         (
@@ -272,57 +273,124 @@ fn assert_consistent(lib: &Library) {
     assert_eq!(
         count(
             lib,
-            "SELECT count(*) FROM jobs WHERE kind = 'edit' AND state NOT IN ('done', 'failed', 'canceled')"
+            "SELECT count(*) FROM jobs WHERE kind IN ('edit', 'gc') AND state NOT IN ('done', 'failed', 'canceled')"
         ),
         0
     );
 }
 
-/// 保存のジョブだけを動かすライブラリ（サムネイル・解析のジョブは登録しないので、置き換えたあとの pending が見える）。
-struct Env {
-    dir: tempfile::TempDir,
-    lib: Arc<Library>,
-    jobs: JobManager,
-    events: Arc<Mutex<Vec<JobEvent>>>,
-    engine: Arc<EngineServices>,
+/// GC の時計（テストが決める）：決めた時刻（なければ本物の時計）と、残っているバックアップの作成時刻。
+#[derive(Clone, Default)]
+pub(super) struct TestClock {
+    fixed: Arc<Mutex<Option<i64>>>,
+    backups: Arc<Mutex<Vec<i64>>>,
+}
+
+impl TestClock {
+    /// GC の時計。
+    pub(super) fn gc(&self) -> GcClock {
+        let (fixed, backups) = (self.fixed.clone(), self.backups.clone());
+        GcClock::new(
+            Arc::new(move || fixed.lock().unwrap().unwrap_or_else(crate::time::now_ms)),
+            Arc::new(move |_| Ok(backups.lock().unwrap().clone())),
+        )
+    }
+
+    /// 時刻を決める（None で本物の時計に戻す）。
+    pub(super) fn set(&self, now: Option<i64>) {
+        *self.fixed.lock().unwrap() = now;
+    }
+
+    /// 残っているバックアップの作成時刻を決める。
+    pub(super) fn set_backups(&self, backups: &[i64]) {
+        *self.backups.lock().unwrap() = backups.to_vec();
+    }
+}
+
+/// 1 日（ミリ秒）。
+pub(super) const DAY: i64 = 24 * 60 * 60 * 1000;
+
+/// Env の組み立て（保存の強制終了・割り込み、GC の割り込み・強制終了）。
+#[derive(Default)]
+pub(super) struct Setup {
+    pub(super) factory: FakeEngineFactory,
+    pub(super) fault: Option<Fault>,
+    pub(super) gc_hook: Option<GcHook>,
+    pub(super) gc_fault: Option<GcFault>,
+}
+
+/// 保存・GC・取り込みのジョブだけを動かすライブラリ（サムネイル・解析のジョブは登録しないので、置き換えたあとの pending が
+/// 見える）。GC の時計はテストが決め（既定は本物の時計・バックアップなし）、保存のコミットのあとも同じ時計で GC の候補を数える。
+pub(super) struct Env {
+    pub(super) dir: tempfile::TempDir,
+    pub(super) lib: Arc<Library>,
+    pub(super) jobs: JobManager,
+    pub(super) events: Arc<Mutex<Vec<JobEvent>>>,
+    pub(super) engine: Arc<EngineServices>,
+    pub(super) clock: TestClock,
 }
 
 impl Env {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::with(FakeEngineFactory::default(), None)
     }
 
-    fn with(factory: FakeEngineFactory, fault: Option<Fault>) -> Self {
-        Self::build(factory, fault, |_| None)
+    pub(super) fn with(factory: FakeEngineFactory, fault: Option<Fault>) -> Self {
+        Self::setup(
+            Setup {
+                factory,
+                fault,
+                ..Setup::default()
+            },
+            |_| None,
+        )
     }
 
     /// 段ごとの割り込み（`hook` はライブラリを受け取って作る）つきのもの。
     fn with_hook(hook: impl FnOnce(&Arc<Library>) -> Hook) -> Self {
-        Self::build(FakeEngineFactory::default(), None, |lib| Some(hook(lib)))
+        Self::setup(Setup::default(), |lib| Some(hook(lib)))
     }
 
-    fn build(
-        factory: FakeEngineFactory,
-        fault: Option<Fault>,
-        hook: impl FnOnce(&Arc<Library>) -> Option<Hook>,
-    ) -> Self {
+    /// 組み立てを渡して作る。
+    pub(super) fn setup(setup: Setup, hook: impl FnOnce(&Arc<Library>) -> Option<Hook>) -> Self {
+        let Setup {
+            factory,
+            fault,
+            gc_hook,
+            gc_fault,
+        } = setup;
         let dir = tempfile::tempdir().unwrap();
         let lib = Arc::new(Library::create(&dir.path().join("L")).unwrap());
         let engine = Arc::new(EngineServices::new(
             Arc::new(factory),
             lib.layout().staging_dir().join(ENGINE_WORK_DIR),
         ));
-        let mut handler = EditHandler::new(engine.clone());
+        let clock = TestClock::default();
+        let mut handler = EditHandler::new(engine.clone()).with_gc(clock.gc());
         if let Some(fault) = fault {
             handler = handler.with_fault(fault);
         }
         if let Some(hook) = hook(&lib) {
             handler = handler.with_hook(hook);
         }
+        let mut gc = GcHandler::new(engine.clone(), clock.gc());
+        if let Some(hook) = gc_hook {
+            gc = gc.with_hook(hook);
+        }
+        if let Some(fault) = gc_fault {
+            gc = gc.with_fault(fault);
+        }
         let events = Arc::new(Mutex::new(Vec::new()));
         let jobs = JobManager::new(
             lib.clone(),
-            vec![(JobKind::Edit, Arc::new(handler))],
+            vec![
+                (JobKind::Edit, Arc::new(handler)),
+                (JobKind::Gc, Arc::new(gc)),
+                (
+                    JobKind::Import,
+                    Arc::new(crate::import::ImportHandler::new(Arc::new(FakeBackend))),
+                ),
+            ],
             sink(&events),
         )
         .unwrap();
@@ -333,10 +401,28 @@ impl Env {
             jobs,
             events,
             engine,
+            clock,
         }
     }
 
-    fn revert(&self, item_id: i64, to: i64) -> JobRecord {
+    /// 時刻を `now`（None なら置き換えから 8 日あと）にして GC のジョブを積み、動き終えるのを待つ（時計は本物に戻す）。
+    pub(super) fn gc_at(&self, now: Option<i64>) -> JobRecord {
+        self.clock
+            .set(Some(now.unwrap_or_else(|| crate::time::now_ms() + 8 * DAY)));
+        let id = self.jobs.enqueue(JobKind::Gc, "{}".into()).unwrap();
+        assert!(self.jobs.wait_idle(WAIT));
+        self.clock.set(None);
+        self.jobs.get(id).unwrap()
+    }
+
+    /// 8 日たったことにして GC を動かす（バックアップは今の決めたもの）。ジョブは done。
+    pub(super) fn gc(&self) -> Json {
+        let record = self.gc_at(None);
+        assert_done(&record);
+        result_of(&record)
+    }
+
+    pub(super) fn revert(&self, item_id: i64, to: i64) -> JobRecord {
         self.save(
             item_id,
             base_of(&self.lib, item_id),
@@ -344,13 +430,13 @@ impl Env {
         )
     }
 
-    fn png(&self, seed: u64) -> (i64, [u8; 32], Vec<u8>) {
+    pub(super) fn png(&self, seed: u64) -> (i64, [u8; 32], Vec<u8>) {
         let bytes = sprite(seed);
         let (id, hash) = add_item(&self.lib, &bytes, "png", &format!("絵{seed}"));
         (id, hash, bytes)
     }
 
-    fn start(&self, item_id: i64, base: Base, action: SaveAction) -> i64 {
+    pub(super) fn start(&self, item_id: i64, base: Base, action: SaveAction) -> i64 {
         start_save(
             self.lib.db(),
             &self.jobs,
@@ -363,13 +449,13 @@ impl Env {
         .unwrap()
     }
 
-    fn save(&self, item_id: i64, base: Base, action: SaveAction) -> JobRecord {
+    pub(super) fn save(&self, item_id: i64, base: Base, action: SaveAction) -> JobRecord {
         let id = self.start(item_id, base, action);
         assert!(self.jobs.wait_idle(WAIT));
         self.jobs.get(id).unwrap()
     }
 
-    fn overwrite(&self, item_id: i64, graph: Graph) -> JobRecord {
+    pub(super) fn overwrite(&self, item_id: i64, graph: Graph) -> JobRecord {
         self.save(
             item_id,
             base_of(&self.lib, item_id),
@@ -377,7 +463,7 @@ impl Env {
         )
     }
 
-    fn save_as(&self, item_id: i64, graph: Graph, title: &str, stem: &str) -> JobRecord {
+    pub(super) fn save_as(&self, item_id: i64, graph: Graph, title: &str, stem: &str) -> JobRecord {
         self.save(
             item_id,
             base_of(&self.lib, item_id),
@@ -389,12 +475,12 @@ impl Env {
         )
     }
 
-    fn count(&self, sql: &str) -> i64 {
+    pub(super) fn count(&self, sql: &str) -> i64 {
         count(&self.lib, sql)
     }
 }
 
-fn assert_done(record: &JobRecord) {
+pub(super) fn assert_done(record: &JobRecord) {
     assert_eq!(
         record.state,
         JobState::Done,
@@ -404,7 +490,7 @@ fn assert_done(record: &JobRecord) {
     );
 }
 
-fn assert_conflict(record: &JobRecord) {
+pub(super) fn assert_conflict(record: &JobRecord) {
     assert_eq!(record.state, JobState::Failed, "{:?}", record.message);
     assert_eq!(
         record.error_code.as_deref(),
@@ -1084,7 +1170,7 @@ fn assert_crashed_state(env: &Env, job: i64, at: Fault, out: [u8; 32], anchored:
 }
 
 /// 偽の HEIC（読むたびに値が変わる）を読めるコーデックの組。
-fn heic_codecs(decoder: &Arc<FakePlatformDecoder>) -> Arc<Mutex<CodecSet>> {
+pub(super) fn heic_codecs(decoder: &Arc<FakePlatformDecoder>) -> Arc<Mutex<CodecSet>> {
     let mut codecs = CodecSet::pinned();
     codecs.add_decoder(decoder.clone()).unwrap();
     Arc::new(Mutex::new(codecs))
@@ -1214,42 +1300,27 @@ fn s9_crash_while_making_an_anchor_recovers() {
 
 // ---- S14：保存した中身の取り込み ----
 
-/// 段 3 の GC の代わり：版 `v` のファイルを手放し（released）、台帳の行を解放してファイルを消す。
-fn simulate_gc(lib: &Library, item: i64, v: i64) {
-    let _gate = lib.ingest_exclusive();
-    let released = lib
-        .db()
-        .write(move |tx| -> Result<Vec<ledger::ReleasedBlob>> {
-            let hash: Vec<u8> = tx.query_row(
-                "SELECT output_hash FROM item_versions WHERE item_id = ?1 AND version = ?2",
-                params![item, v],
-                |r| r.get(0),
-            )?;
-            tx.execute(
-                "UPDATE item_versions SET file_state = 'released', file_blob_id = NULL WHERE item_id = ?1 AND version = ?2",
-                params![item, v],
-            )?;
-            let hash: [u8; 32] = hash.try_into().unwrap();
-            ledger::release(tx, &[hash])
-        })
-        .unwrap();
-    for blob in released {
-        let _ = std::fs::remove_file(lib.layout().content_path(&blob.hash, &blob.ext));
-        for path in lib.layout().derived_paths(&hex(&blob.hash)) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
+/// 本物の GC（8 日たったことにする）で、アイテム `item` の版 `v` のファイルを片付ける（照合して消し、released になる）。
+pub(super) fn gc_version(env: &Env, item: i64, v: i64) {
+    let result = env.gc();
+    let state = versions_of(&env.lib, item)
+        .into_iter()
+        .find(|x| x.version == v)
+        .map(|x| x.file_state);
+    assert_eq!(state, Some(FileState::Released), "{result}");
 }
 
 /// S14：本当の保存のあと、元・GC で消えた過去の版・今と同じ中身を取り込むと、どれもそのアイテムの重複になり（アイテムは
-/// 増えない）、孤立したファイルが残らない。
+/// 増えない）、孤立したファイルが残らない。GC は 8 日進めた時計で、2 回目の保存のコミットのあとに積まれて版 1 を消す。
 #[test]
 fn s14_importing_saved_contents_is_a_duplicate() {
     let dir = tempfile::tempdir().unwrap();
     let session = LibrarySession::create(
         &dir.path().join("L"),
         Arc::new(|_| {}),
-        Services::new(Arc::new(FakeBackend)).with_engine(Arc::new(FakeEngineFactory::default())),
+        Services::new(Arc::new(FakeBackend))
+            .with_engine(Arc::new(FakeEngineFactory::default()))
+            .with_gc_clock(GcClock::shifted(8 * DAY)),
     )
     .unwrap();
     session.wait_ready();
@@ -1276,7 +1347,8 @@ fn s14_importing_saved_contents_is_a_duplicate() {
     save(doc(&[flip("horizontal")], None));
     let h2 = head(&lib, a).hash;
     let now = std::fs::read(lib.layout().content_path(&h2, "png")).unwrap();
-    simulate_gc(&lib, a, 1);
+    // 保存のコミットのあとに積まれた GC が、照合して版 1 を消した
+    assert_eq!(states(&lib, a)[1], (1, FileState::Released));
     assert!(!lib.layout().content_path(&h1, "png").exists());
 
     let src = dir.path().join("src");
@@ -1640,7 +1712,7 @@ fn a_save_that_crashed_while_reading_the_header_fails_once() {
 
 // ---- S3・S4：版に戻す ----
 
-fn inputs_of(lib: &Library, version_id: i64) -> Vec<versions::VersionInput> {
+pub(super) fn inputs_of(lib: &Library, version_id: i64) -> Vec<versions::VersionInput> {
     lib.db().read(|c| versions::inputs(c, version_id)).unwrap()
 }
 
@@ -1839,7 +1911,7 @@ fn s4_revert_rebuilds_after_gc() {
     let bytes1 = std::fs::read(&path1).unwrap();
     assert_eq!(bytes1, render_png(&png, &g1));
     assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
-    simulate_gc(&env.lib, a, 1);
+    gc_version(&env, a, 1);
     assert!(!path1.exists());
     let record = env.revert(a, 1);
     assert_done(&record);
@@ -1883,7 +1955,7 @@ fn revert_rebuild_without_the_recorded_encoder_uses_the_current_one() {
         assert_done(&env.overwrite(a, g1.clone()));
         let v1 = versions_of(&env.lib, a)[1].clone();
         assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
-        simulate_gc(&env.lib, a, 1);
+        gc_version(&env, a, 1);
         // 版 1 は、この組にないエンコーダで書いたことにする（違うバイト列を書いていたなら、そのハッシュも）
         let mut record: Json = serde_json::from_str(&v1.record).unwrap();
         record["encoded"]["codec"] = json!("gone-png-enc/9");
@@ -1978,7 +2050,7 @@ fn revert_rebuild_that_does_not_match_the_record_is_refused() {
     let (a, _, _) = env.png(23);
     assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
     assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
-    simulate_gc(&env.lib, a, 1);
+    gc_version(&env, a, 1);
     // 版 1 の値の記録を、作り直しと合わない値にする（デコーダ・エンジンの変化で記録と違う値になった場合を写す）
     env.lib
         .db()
@@ -2084,7 +2156,7 @@ fn cancel_or_pause_after_writing_leaves_nothing() {
         let action = if rebuild {
             assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
             assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
-            simulate_gc(&env.lib, a, 1);
+            gc_version(&env, a, 1);
             SaveAction::Revert { to: 1 }
         } else {
             SaveAction::Overwrite {
@@ -2125,7 +2197,7 @@ fn cancel_or_pause_after_writing_leaves_nothing() {
 
 /// 強制終了したライブラリを、偽のエンジンの部品（`factory`）つきで開き直して（予告の照合・staging の掃除・ジョブの再開）、
 /// 動き終えるのを待つ。ジョブ `job` は running のまま落ちたことにする。
-fn reopen_after_crash(
+pub(super) fn reopen_after_crash(
     env: Env,
     job: i64,
     factory: FakeEngineFactory,
@@ -2170,7 +2242,7 @@ fn revert_rebuild_crash_at_each_stage_recovers() {
         assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
         let h1 = head(&env.lib, a).hash;
         assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
-        simulate_gc(&env.lib, a, 1);
+        gc_version(&env, a, 1);
         // 同じライブラリで、強制終了する保存のジョブに入れ替える
         let Env {
             dir,
@@ -2178,6 +2250,7 @@ fn revert_rebuild_crash_at_each_stage_recovers() {
             jobs,
             events,
             engine,
+            clock,
         } = env;
         drop(jobs);
         let jobs = JobManager::new(
@@ -2196,6 +2269,7 @@ fn revert_rebuild_crash_at_each_stage_recovers() {
             jobs,
             events,
             engine,
+            clock,
         };
         let record = env.revert(a, 1);
         assert_eq!(record.state, JobState::Failed, "{at:?}");
@@ -2231,7 +2305,7 @@ fn revert_rebuild_crash_at_each_stage_recovers() {
 
 // ---- S15 の後半：アンカーから作り直す ----
 
-fn heic_decoder(drifting: bool) -> Arc<FakePlatformDecoder> {
+pub(super) fn heic_decoder(drifting: bool) -> Arc<FakePlatformDecoder> {
     let d = FakePlatformDecoder::new(
         "fake-heic-dec/1",
         &["heic"],
@@ -2266,7 +2340,7 @@ fn s15_rebuilds_from_the_anchor_without_the_os_decoder() {
     // デコーダを外す（ツールの場所を変えたときと同じく、組を作り直させる）
     *set.lock().unwrap() = CodecSet::pinned();
     env.engine.reload_codecs();
-    simulate_gc(&env.lib, a, 1);
+    gc_version(&env, a, 1);
     assert!(!path1.exists());
     let record = env.revert(a, 1);
     assert_done(&record);
@@ -2306,7 +2380,7 @@ fn revert_falls_back_to_the_original_when_the_anchor_is_broken() {
         let path1 = env.lib.layout().content_path(&v1.output_hash, "png");
         let bytes1 = std::fs::read(&path1).unwrap();
         assert_done(&env.overwrite(a, doc(&[flip("horizontal")], Some("png"))));
-        simulate_gc(&env.lib, a, 1);
+        gc_version(&env, a, 1);
         let (anchor_hash, anchor_ext): (Vec<u8>, String) = env
             .lib
             .db()
@@ -2460,9 +2534,11 @@ fn saving_with_a_broken_or_missing_anchor_reads_the_original_again() {
 fn anchor_swept_while_saving_is_a_conflict() {
     let decoder = heic_decoder(false);
     let victim = Arc::new(AtomicI64::new(0));
-    let env = Env::build(
-        FakeEngineFactory::with_codecs(heic_codecs(&decoder)),
-        None,
+    let env = Env::setup(
+        Setup {
+            factory: FakeEngineFactory::with_codecs(heic_codecs(&decoder)),
+            ..Setup::default()
+        },
         |lib| {
             let (lib, victim) = (lib.clone(), victim.clone());
             Some(Arc::new(move |stage| {

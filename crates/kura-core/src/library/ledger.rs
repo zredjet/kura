@@ -4,10 +4,10 @@
 //! （M12）は `register` で載せる。台帳の行を消すのは `release` だけ（どの表からも参照されない行だけを消す。版・アンカーの
 //! 行を消さないように）。
 //!
-//! 台帳にまだない中身を `files/` に置く処理（保存）と、段 3 の GC が台帳から外した中身を消す処理は、置く・消す前に
-//! `announce` で予告を DB にコミットする。'place' の予告は台帳に載せるトランザクションで消し、'delete' の予告はファイルを
-//! 消し終えてから消す（`clear_announced`）。途中で落ちたら、次に開くときに `settle_pending` が予告を照らして、台帳にない
-//! ファイルを片付ける。ゴミ箱を空にする処理は段 3 で作り直すまで ADR-46 の順（予告なし。docs/data-model.md §4
+//! 台帳にまだない中身を `files/` に置く処理（保存）と、台帳から外した中身を消す処理（段 3 の GC・ゴミ箱を空にする処理）は、
+//! 置く・消す前に `announce` で予告を DB にコミットする。'place' の予告は台帳に載せるトランザクションで消し（`clear_announced`）、
+//! 'delete' の予告は台帳から外すトランザクションの前にコミットし、ファイルを消し終えてから行の ID で消す（`clear_pending`）。
+//! 途中で落ちたら、次に開くときに `settle_pending` が予告を照らして、台帳にないファイルを片付ける（docs/data-model.md §4
 //! 「保存と版（M12）」）。
 
 use std::collections::HashSet;
@@ -116,7 +116,8 @@ pub fn register(conn: &Connection, hash: &[u8; 32], ext: &str, size: u64, now: i
     Ok(id)
 }
 
-/// 台帳にまだない中身を `files/` に置く（消す）前の予告を書く（呼び手が置く前にコミットする）。
+/// 台帳にまだない中身を `files/` に置く（台帳から外した中身を消す）前の予告を書き、予告の行の ID を返す（呼び手が置く・
+/// 台帳から外す前にコミットする）。
 pub fn announce(
     conn: &Connection,
     hash: &[u8; 32],
@@ -124,12 +125,45 @@ pub fn announce(
     kind: PendingKind,
     job_id: Option<i64>,
     now: i64,
-) -> Result<()> {
+) -> Result<i64> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO ledger_pending (hash, ext, kind, job_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     stmt.execute(params![&hash[..], ext, kind.as_str(), job_id, now])?;
-    Ok(())
+    Ok(conn.last_insert_rowid())
+}
+
+/// 予告の行を ID で消す（'delete' の予告を、ファイルを消し終えてから。同じジョブのほかの予告（消せずに残したもの）は
+/// 残す）。消した数を返す（主キーで引く）。
+pub fn clear_pending(conn: &Connection, ids: &[i64]) -> Result<usize> {
+    let mut stmt = conn.prepare_cached("DELETE FROM ledger_pending WHERE id = ?1")?;
+    let mut n = 0;
+    for id in ids {
+        n += stmt.execute([id])?;
+    }
+    Ok(n)
+}
+
+/// 解放した台帳の行の実ファイルと派生のファイル（サムネイル・ジャケット・プロキシ・波形・アニメの帯。`Layout::derived_paths`）
+/// を消し、消せなかったファイルの数を返す（ないファイルは数えない）。台帳から外したトランザクションのコミットのあとで、
+/// 台帳の門を持ったまま呼ぶ（GC・ゴミ箱を空にする処理）。
+pub fn remove_files(layout: &Layout, released: &[ReleasedBlob]) -> u64 {
+    let mut failed = 0;
+    for blob in released {
+        let mut paths = layout.derived_paths(&hex(&blob.hash));
+        paths.insert(0, layout.content_path(&blob.hash, &blob.ext));
+        for path in paths {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(%err, path = %path.display(), "台帳から外したファイルを消せませんでした（次に開くときに消します）");
+                }
+            }
+        }
+    }
+    failed
 }
 
 /// ジョブ `job_id` の予告を消す（'place' の予告は台帳に載せるのと同じトランザクションで、'delete' の予告はファイルを消し終えて
@@ -457,6 +491,50 @@ mod tests {
             let plan = query_plan(&conn, sql);
             assert!(plan.contains("sqlite_autoindex_blobs_1"), "{sql}: {plan}");
         }
+    }
+
+    /// 'delete' の予告は行の ID で消す（同じジョブの、消せずに残した予告は残す）。主キーで引く。
+    #[test]
+    fn delete_announcements_are_cleared_by_id() {
+        let conn = test_conn();
+        let a = announce(&conn, &[7; 32], "png", PendingKind::Delete, Some(5), 1).unwrap();
+        let b = announce(&conn, &[8; 32], "png", PendingKind::Delete, Some(5), 1).unwrap();
+        let c = announce(&conn, &[9; 32], "wav", PendingKind::Delete, None, 1).unwrap();
+        assert!(a < b && b < c);
+        assert_eq!(clear_pending(&conn, &[a, c, 999]).unwrap(), 2);
+        let left: i64 = conn
+            .query_row("SELECT id FROM ledger_pending", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, b);
+        let plan = query_plan(&conn, "DELETE FROM ledger_pending WHERE id = 1");
+        assert!(plan.contains("INTEGER PRIMARY KEY"), "{plan}");
+    }
+
+    /// 解放した中身の実ファイルと派生のファイルを消し、ないファイルは数えない。
+    #[test]
+    fn remove_files_deletes_content_and_derived_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = crate::library::Library::create(&dir.path().join("L")).unwrap();
+        let layout = lib.layout().clone();
+        let hash = [4u8; 32];
+        let mut paths = layout.derived_paths(&hex(&hash));
+        paths.insert(0, layout.content_path(&hash, "png"));
+        for path in &paths[..3] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        let released = [ReleasedBlob {
+            hash,
+            ext: "png".into(),
+            size_bytes: 1,
+        }];
+        assert_eq!(remove_files(&layout, &released), 0);
+        assert!(paths.iter().all(|p| !p.exists()));
+        assert_eq!(
+            remove_files(&layout, &released),
+            0,
+            "もうないファイルは数えない"
+        );
     }
 
     #[test]

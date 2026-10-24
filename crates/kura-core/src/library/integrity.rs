@@ -8,6 +8,7 @@ use super::layout::Layout;
 use super::ledger;
 use crate::Result;
 use crate::db::Db;
+use crate::edit::gc;
 
 /// 整合性チェックの結果。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -24,6 +25,12 @@ pub struct IntegrityReport {
     /// 台帳の行の ID の写し（`items.blob_id`）が hash の台帳の行と食い違っていて、直したアイテムの数（いま確かめるときだけ
     /// 数える。ふつうは 0。M12）。
     pub blob_ids_fixed: u64,
+    /// GC の照合が合わずにファイルを残した版（kept）の数（M12 の段 3。問題には数えない。版の表を走査するので、いま確かめる
+    /// ときだけ数え、起動時は None）。
+    pub kept_versions: Option<u64>,
+    /// 7 日とバックアップの条件を満たしたのに、まだ消していない消し待ちの版の数（GC がまだ来ていない・今は照らせないもの。
+    /// M12 の段 3。問題には数えない。起動時は GC のジョブの前なので数えず None）。
+    pub overdue_versions: Option<u64>,
 }
 
 /// どこまで確かめるか。
@@ -36,7 +43,7 @@ pub enum Depth {
 }
 
 /// 整合性チェック：台帳と `files/` の突き合わせ（[`check_files`]）、参照されない台帳の行、`Full` なら `items.blob_id` の
-/// 写しの修理（[`repair_blob_ids`]）。`staging_removed` は先に消した staging の残骸の数（起動時。いま確かめるときは 0）。
+/// 写しの修理（[`repair_blob_ids`]）と、GC が残した版・7 日を過ぎた消し待ちの版の数（問題には数えない）。`staging_removed` は先に消した staging の残骸の数（起動時。いま確かめるときは 0）。
 pub fn check(
     db: &Db,
     layout: &Layout,
@@ -47,6 +54,13 @@ pub fn check(
         Depth::Startup => 0,
         Depth::Full => repair_blob_ids(db)?,
     };
+    let (kept_versions, overdue_versions) = match depth {
+        Depth::Startup => (None, None),
+        Depth::Full => {
+            let cutoff = gc::GcClock::system().cutoff(layout)?;
+            db.read(|c| Ok((Some(gc::kept(c)?), Some(gc::overdue(c, cutoff)?))))?
+        }
+    };
     let (missing_files, orphan_files) = check_files(db, layout)?;
     Ok(IntegrityReport {
         staging_removed,
@@ -54,6 +68,8 @@ pub fn check(
         orphan_files,
         unreferenced_blobs: db.read(ledger::unreferenced)?,
         blob_ids_fixed,
+        kept_versions,
+        overdue_versions,
     })
 }
 
@@ -199,12 +215,19 @@ mod tests {
         assert_eq!(broken(&lib), 2);
         let startup = check(lib.db(), lib.layout(), 3, Depth::Startup).unwrap();
         assert_eq!((startup.staging_removed, startup.blob_ids_fixed), (3, 0));
+        // GC が残した版・7 日を過ぎた消し待ちは、起動時には数えない
+        assert_eq!(
+            (startup.kept_versions, startup.overdue_versions),
+            (None, None)
+        );
         assert_eq!(broken(&lib), 2);
         let full = check(lib.db(), lib.layout(), 0, Depth::Full).unwrap();
         assert_eq!(
             full,
             IntegrityReport {
                 blob_ids_fixed: 2,
+                kept_versions: Some(0),
+                overdue_versions: Some(0),
                 ..IntegrityReport::default()
             }
         );
@@ -216,6 +239,59 @@ mod tests {
             .read(|c| Ok(crate::db::query_plan(c, BLOB_ID_MISMATCH)))
             .unwrap();
         assert!(plan.contains("SCAN i"), "{plan}");
+        // kept の数え上げも版の表を走査する（同じ例外。7 日を過ぎた消し待ちは部分索引で引く）
+        let plan = lib
+            .db()
+            .read(|c| {
+                Ok(crate::db::query_plan(
+                    c,
+                    "SELECT count(*) FROM item_versions WHERE file_state = 'kept'",
+                ))
+            })
+            .unwrap();
+        assert!(plan.contains("SCAN item_versions"), "{plan}");
+    }
+
+    /// いま確かめるとき、GC の照合が合わずに残した版（kept）と、7 日を過ぎた消し待ちの版を数える（問題には数えない）。
+    #[test]
+    fn full_check_counts_kept_and_overdue_versions() {
+        use crate::edit::testing::{insert_item, insert_version};
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::create(&dir.path().join("L")).unwrap();
+        lib.db()
+            .write(|tx| {
+                let a = insert_item(tx, 1, [1; 32]);
+                insert_version(tx, a, 0, [10; 32], "hold", None);
+                insert_version(tx, a, 1, [11; 32], "kept", None);
+                insert_version(tx, a, 2, [12; 32], "waiting", None);
+                insert_version(tx, a, 3, [13; 32], "waiting", None);
+                insert_version(tx, a, 4, [1; 32], "hold", None);
+                // 版 3 は置き換えたばかり（7 日たっていない）
+                tx.execute(
+                    "UPDATE item_versions SET replaced_at = ?1 WHERE version = 3",
+                    [crate::time::now_ms()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        for hash in [[1u8; 32], [10; 32], [11; 32], [12; 32], [13; 32]] {
+            let path = lib.layout().content_path(&hash, "png");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        let full = check(lib.db(), lib.layout(), 0, Depth::Full).unwrap();
+        assert_eq!(
+            (full.kept_versions, full.overdue_versions),
+            (Some(1), Some(1))
+        );
+        assert_eq!(
+            (
+                full.missing_files,
+                full.orphan_files,
+                full.unreferenced_blobs
+            ),
+            (0, 0, 0)
+        );
     }
 
     #[test]

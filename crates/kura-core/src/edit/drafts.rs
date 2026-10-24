@@ -8,14 +8,15 @@
 //! - エディタが保存を積んだあとも編集を続けて置いた下書きは、`after_job` にそのジョブを書く（土台はそのジョブの結果）。
 //!   保存のジョブのトランザクション 2 が [`settle_after_save`] で、保存した文書と同じ下書きを消し、`after_job` が自分の
 //!   下書きは土台を新しい頭に付け替える。ジョブがもうコミットしていれば、置くときに付け替える（[`save`]）。
-//! - アイテムを消すと下書きも消える（CASCADE）。部品の行は残る（段 3 の GC が片付ける）。
+//! - アイテムを消すと下書きも消える（CASCADE）。下書きを置き換える・捨てると前の文書の部品が孤立しうるので、GC の部品の印
+//!   （`gc::mark_parts`）を置く（片付けるのは段 3 の GC。ゴミ箱を空にする処理は、消したアイテムの分をその場で片付ける）。
 
 use kura_engine::doc_parts::{DocParts, split};
 use kura_engine::{Digest, Graph};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::save::Base;
-use super::{EngineRuntime, from_engine, store, versions};
+use super::{EngineRuntime, from_engine, gc, store, versions};
 use crate::db::Db;
 use crate::time::now_ms;
 use crate::{CoreError, Result};
@@ -77,6 +78,14 @@ fn put_draft(
         return Err(CoreError::NotFound(format!("アイテム {item_id}")));
     }
     let doc_id = store::put_doc(tx, parts, now)?;
+    // 前の下書きの文書と違えば、前の文書の部品が孤立しうる（GC の部品の印）
+    let previous: Option<i64> = tx
+        .prepare_cached("SELECT doc_id FROM edit_drafts WHERE item_id = ?1")?
+        .query_row([item_id], |r| r.get(0))
+        .optional()?;
+    if previous.is_some_and(|old| old != doc_id) {
+        gc::mark_parts(tx)?;
+    }
     let (mut base, mut after_job) = (base, after_job);
     if let Some(job) = after_job
         && let Some(v) = versions::by_job(tx, job)?
@@ -202,12 +211,16 @@ pub fn open(db: &Db, runtime: &EngineRuntime, item_id: i64) -> Result<Option<Ope
     }))
 }
 
-/// 下書きを捨てる（あったら真）。部品の行は残る（段 3 の GC）。
+/// 下書きを捨てる（あったら真）。部品の行は残り、段 3 の GC が片付ける（部品の印を置く）。
 pub fn discard(db: &Db, item_id: i64) -> Result<bool> {
     let n = db.write(move |tx| {
-        Ok(tx
+        let n = tx
             .prepare_cached("DELETE FROM edit_drafts WHERE item_id = ?1")?
-            .execute([item_id])?)
+            .execute([item_id])?;
+        if n > 0 {
+            gc::mark_parts(tx)?;
+        }
+        Ok(n)
     })?;
     Ok(n > 0)
 }
@@ -238,11 +251,19 @@ pub(crate) fn settle_after_save(
     new_base: Base,
 ) -> Result<()> {
     if let Some(doc_id) = saved_doc_id {
-        tx.prepare_cached(
-            "DELETE FROM edit_drafts
-              WHERE item_id = ?1 AND doc_id = ?2 AND (after_job IS NULL OR after_job = ?3)",
-        )?
-        .execute(params![item_id, doc_id, job])?;
+        let n = tx
+            .prepare_cached(
+                "DELETE FROM edit_drafts
+                  WHERE item_id = ?1 AND doc_id = ?2 AND (after_job IS NULL OR after_job = ?3)",
+            )?
+            .execute(params![item_id, doc_id, job])?;
+        // 版 0 に戻したときの空の文書は、どの版も指さない（版 0 の文書は NULL）ので孤立しうる
+        let held: bool = tx
+            .prepare_cached("SELECT EXISTS (SELECT 1 FROM item_versions WHERE doc_id = ?1)")?
+            .query_row([doc_id], |r| r.get(0))?;
+        if n > 0 && !held {
+            gc::mark_parts(tx)?;
+        }
     }
     tx.prepare_cached(
         "UPDATE edit_drafts SET base_hash = ?3, base_version = ?4, after_job = NULL

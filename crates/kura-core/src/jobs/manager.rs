@@ -304,11 +304,21 @@ impl JobManager {
 
     /// ジョブを追加する。
     pub fn enqueue(&self, kind: JobKind, input_json: String) -> Result<JobId> {
-        let id = self
-            .inner
-            .library
-            .db()
-            .write(move |tx| store::insert(tx, kind, &input_json, now_ms()))?;
+        self.enqueue_with(kind, input_json, |_| Ok(()))
+    }
+
+    /// `before` とジョブの追加を 1 つのトランザクションで行う（保存のジョブは、入力が指す文書の部品を置くのと同じトランザクションで
+    /// 積む。間に GC の部品の片付けが入って、積む前の部品を消さないように。M12 の段 3）。
+    pub fn enqueue_with(
+        &self,
+        kind: JobKind,
+        input_json: String,
+        before: impl FnOnce(&rusqlite::Connection) -> Result<()> + Send + 'static,
+    ) -> Result<JobId> {
+        let id = self.inner.library.db().write(move |tx| {
+            before(tx)?;
+            store::insert(tx, kind, &input_json, now_ms())
+        })?;
         self.emit(JobEvent {
             id,
             kind,

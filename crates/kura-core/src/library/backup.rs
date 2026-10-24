@@ -239,6 +239,9 @@ fn copy_conn(from: &Connection, dest: &Path, pages: i32, pause: Duration) -> Res
     Ok(())
 }
 
+/// 1 時間ごとの確かめのあとに呼ぶもの（M12 の段 3：GC の候補があれば GC を積む）。
+pub(crate) type OnCheck = Box<dyn Fn() + Send + 'static>;
+
 /// 開いているあいだのバックアップの係（閉じると止まる）。
 pub(crate) struct Scheduler {
     stop: Option<Sender<()>>,
@@ -246,8 +249,9 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-    /// 動かし始める。最初は少し待ってから、そのあとは 1 時間ごとに、時期なら作る。
-    pub(crate) fn start(layout: Layout) -> Self {
+    /// 動かし始める。最初は少し待ってから、そのあとは 1 時間ごとに、時期なら作る。確かめるたびに（作ったあとに）`on_check` を
+    /// 呼ぶ（バックアップが増える・古いものが消えると、GC が消してよい版が変わる）。
+    pub(crate) fn start(layout: Layout, on_check: OnCheck) -> Self {
         let (stop, rx) = mpsc::channel::<()>();
         let handle = std::thread::Builder::new()
             .name("kura-backup".into())
@@ -267,6 +271,7 @@ impl Scheduler {
                     {
                         tracing::warn!(%err, "DB のバックアップを作れませんでした");
                     }
+                    on_check();
                 }
             });
         match handle {
@@ -601,7 +606,7 @@ mod tests {
     fn scheduler_stops_promptly() {
         let dir = tempfile::tempdir().unwrap();
         let lib = Library::create(&dir.path().join("L")).unwrap();
-        let mut scheduler = Scheduler::start(lib.layout().clone());
+        let mut scheduler = Scheduler::start(lib.layout().clone(), Box::new(|| {}));
         let started = std::time::Instant::now();
         scheduler.stop();
         assert!(started.elapsed() < Duration::from_secs(2));

@@ -15,6 +15,7 @@ use crate::analysis::plan::PlanFingerprint;
 use crate::analysis::{AnalyzeHandler, AnalyzeShared, store as analysis_store};
 use crate::capture::CaptureHandler;
 use crate::download::{DownloadHandler, work_dir_name};
+use crate::edit::gc::{self, GcClock, GcHandler};
 use crate::edit::{ENGINE_WORK_DIR, EditHandler, EngineFactory, EngineServices};
 use crate::export::ExportHandler;
 use crate::import::ImportHandler;
@@ -34,6 +35,9 @@ pub struct Services {
     pub engine: Option<Arc<dyn EngineFactory>>,
     /// DB を新しい版にするときの、空き容量の確かめと始まり・終わり・失敗の知らせ。
     pub upgrade: UpgradeHooks,
+    /// GC（M12 の段 3）の時計とバックアップの一覧。アプリはいつも本物（[`GcClock::system`]）。`kura-devtools edit crash-loop`
+    /// の子だけが進めた時計を渡す。
+    pub gc_clock: GcClock,
 }
 
 impl Services {
@@ -43,7 +47,14 @@ impl Services {
             media,
             engine: None,
             upgrade: UpgradeHooks::default(),
+            gc_clock: GcClock::system(),
         }
+    }
+
+    /// GC の時計を差し替える（`kura-devtools edit crash-loop` の子・テスト）。
+    pub fn with_gc_clock(mut self, clock: GcClock) -> Self {
+        self.gc_clock = clock;
+        self
     }
 
     /// エンジンの部品を作る口を付ける。
@@ -108,6 +119,7 @@ impl LibrarySession {
         let Services {
             media: backend,
             engine,
+            gc_clock,
             ..
         } = services;
         let library = Arc::new(library);
@@ -162,13 +174,21 @@ impl LibrarySession {
                 Arc::new(ProxyHandler::new(ProxyTools::detect(), proxy.clone())),
             ),
         ];
-        // 解析と保存はエンジンの部品があるときだけ（ないときは積まない。JobManager::ensure_queued が登録のない種類を無視する）
+        // 解析・保存・GC はエンジンの部品があるときだけ（ないときは積まない。JobManager::ensure_queued が登録のない種類を
+        // 無視する）。保存は GC と同じ時計で、コミットのあとに GC の候補を数える
         if let Some(engine) = &engine {
             handlers.push((
                 JobKind::Analyze,
                 Arc::new(AnalyzeHandler::new(engine.clone(), analysis.clone())),
             ));
-            handlers.push((JobKind::Edit, Arc::new(EditHandler::new(engine.clone()))));
+            handlers.push((
+                JobKind::Edit,
+                Arc::new(EditHandler::new(engine.clone()).with_gc(gc_clock.clone())),
+            ));
+            handlers.push((
+                JobKind::Gc,
+                Arc::new(GcHandler::new(engine.clone(), gc_clock.clone())),
+            ));
         }
         let jobs = Arc::new(JobManager::new(library.clone(), handlers, sink)?);
         let integrity = Arc::new(Mutex::new(None));
@@ -176,6 +196,7 @@ impl LibrarySession {
         // 整合性チェックが終わってからジョブを動かす（チェック中に取り込みが進むと食い違いを誤って数えるため）
         let (lib, jobs2, slot) = (library.clone(), jobs.clone(), integrity.clone());
         let analyze = engine.is_some();
+        let clock = gc_clock.clone();
         let startup = std::thread::Builder::new()
             .name("kura-startup".into())
             .spawn(move || {
@@ -216,10 +237,25 @@ impl LibrarySession {
                 }
                 if analyze {
                     sync_analysis(&lib, &jobs2);
+                    // 置き換えた版の片付け（7 日とバックアップの条件を満たす候補・孤立した部品があるときだけ）
+                    queue_gc(&lib, &jobs2, &clock);
                 }
             })?;
 
-        let backup = Mutex::new(backup::Scheduler::start(library.layout().clone()));
+        // バックアップの 1 時間ごとの確かめのあとにも GC の候補を数える（エンジンの部品があるときだけ。閉じると係が止まる。
+        // 輪にならないよう弱い参照で持つ）
+        let on_check: backup::OnCheck = if engine.is_some() {
+            let (lib, jobs2) = (Arc::downgrade(&library), Arc::downgrade(&jobs));
+            let clock = gc_clock;
+            Box::new(move || {
+                if let (Some(lib), Some(jobs)) = (lib.upgrade(), jobs2.upgrade()) {
+                    queue_gc(&lib, &jobs, &clock);
+                }
+            })
+        } else {
+            Box::new(|| {})
+        };
+        let backup = Mutex::new(backup::Scheduler::start(library.layout().clone(), on_check));
         Ok(Self {
             library,
             jobs,
@@ -374,6 +410,14 @@ impl LibrarySession {
     }
 }
 
+/// GC の候補（7 日とバックアップの条件を満たす消し待ちの版・部品の印）があれば GC のジョブを積む（開いたあと・バックアップの
+/// 1 時間ごとの確かめ）。
+fn queue_gc(lib: &Library, jobs: &JobManager, clock: &GcClock) {
+    if let Err(err) = gc::queue_if_due(lib, clock, || jobs.ensure_queued(JobKind::Gc, "{}")) {
+        tracing::warn!(%err, "GC のジョブを積めませんでした");
+    }
+}
+
 /// 起動のスレッドで、整合性チェックのあとに呼ぶ：解析の計画の指紋を比べ（変わった種類だけ pending に戻す）、解析を待つもの・
 /// 投影の作り直しの印があれば解析のジョブを積む。デコーダの指紋はジョブがコーデックの組を作ったときに比べる（起動の道で組を
 /// 作らない）。
@@ -417,6 +461,74 @@ mod tests {
 
     fn services() -> Services {
         Services::new(Arc::new(FakeBackend))
+    }
+
+    /// GC はライブラリを開いたあと、7 日を過ぎた消し待ちの版（か部品の印）があるときだけ積む（候補がなければジョブを作らない）。
+    #[test]
+    fn gc_is_queued_on_open_only_when_due() {
+        use crate::edit::testing::{insert_item, insert_version};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("L.kuralib");
+        let gc_jobs = |session: &LibrarySession| -> i64 {
+            session
+                .library()
+                .db()
+                .read(|c| {
+                    Ok(
+                        c.query_row("SELECT count(*) FROM jobs WHERE kind = 'gc'", [], |r| {
+                            r.get(0)
+                        })?,
+                    )
+                })
+                .unwrap()
+        };
+        let engine = || {
+            Services::new(Arc::new(FakeBackend)).with_engine(Arc::new(FakeEngineFactory::default()))
+        };
+        {
+            let session = LibrarySession::create(&path, sink(), engine()).unwrap();
+            session.wait_ready();
+            assert!(session.jobs().wait_idle(Duration::from_secs(30)));
+            assert_eq!(gc_jobs(&session), 0, "候補がなければ積まない");
+            session
+                .library()
+                .db()
+                .write(|tx| {
+                    let a = insert_item(tx, 1, [1; 32]);
+                    insert_version(tx, a, 0, [10; 32], "hold", None);
+                    insert_version(tx, a, 1, [11; 32], "waiting", None);
+                    insert_version(tx, a, 2, [1; 32], "hold", None);
+                    Ok(())
+                })
+                .unwrap();
+            for hash in [[1u8; 32], [10; 32], [11; 32]] {
+                let file = session.library().layout().content_path(&hash, "png");
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, "x").unwrap();
+            }
+        }
+        // 版 1 はずっと前（テストの補助の時刻）に置き換えた：開くと GC が積まれる（照らせない記録なので次回へ回す）
+        let session = LibrarySession::open(&path, sink(), engine()).unwrap();
+        session.wait_ready();
+        assert!(session.jobs().wait_idle(Duration::from_secs(30)));
+        assert_eq!(gc_jobs(&session), 1);
+        let record = session
+            .jobs()
+            .list(&crate::jobs::JobFilter {
+                kinds: vec![JobKind::Gc],
+                ..Default::default()
+            })
+            .unwrap()
+            .remove(0);
+        assert_eq!(record.state, crate::jobs::JobState::Done);
+        let result: serde_json::Value =
+            serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
+        assert_eq!(result["deferred"], 1, "{result}");
+        // エンジンの部品がなければ GC は登録されず、積まない
+        drop(session);
+        let session = LibrarySession::open(&path, sink(), services()).unwrap();
+        session.wait_ready();
+        assert_eq!(gc_jobs(&session), 1);
     }
 
     #[test]

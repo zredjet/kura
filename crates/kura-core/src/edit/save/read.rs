@@ -211,17 +211,52 @@ pub(super) fn read_once<P>(
     })
 }
 
-/// 記録 `rec` に合う入力を読む（保存でアンカーがあるとき・版に戻す作り直し）：アンカー `anchor` があればアンカーから、使えなければ
-/// 元を記録の識別子のデコーダで読み直す（知らせを `warnings` に足す）。記録のデコーダがない・読み直した値が記録と違えば
-/// Mismatch（`cant` は何ができないかの言葉）。値・元を読んだ記録・アンカーの使い方・呼び手の計画と予算を返す。
+/// 記録に合う入力を読んだ結果（[`read_recorded_input`]）。
+#[allow(clippy::large_enum_variant)] // 1 回の読みで 1 度だけ返して、すぐ取り出す（値を箱に入れ直さない）
+pub(super) enum RecordedRead<P> {
+    /// 読めた：値・元を読んだ記録・アンカーの使い方・呼び手の計画と予算。
+    Read {
+        value: Value,
+        decoded: DecodeStamp,
+        anchor: AnchorUse,
+        prep: P,
+    },
+    /// 読めない：アンカーが使えず、記録の識別子のデコーダがこの環境にない（`platform` が偽なら、OS のデコーダでしか読めない
+    /// ときも）。文は呼び手の言葉（`cant`）から始まる。
+    Unavailable(String),
+    /// 読み直した値が記録と違う（アンカーも使えない）。文は呼び手の言葉から始まる。
+    Mismatch(String),
+}
+
+impl<P> RecordedRead<P> {
+    /// 保存・版に戻すの扱い：読めない・違うはどちらも Mismatch（docs/editing.md §14「作り直しの照合の決まり」）。
+    pub(super) fn or_mismatch(self) -> Result<(Value, DecodeStamp, AnchorUse, P)> {
+        match self {
+            Self::Read {
+                value,
+                decoded,
+                anchor,
+                prep,
+            } => Ok((value, decoded, anchor, prep)),
+            Self::Unavailable(why) | Self::Mismatch(why) => Err(CoreError::Mismatch(why)),
+        }
+    }
+}
+
+/// 記録 `rec` に合う入力を読む（保存でアンカーがあるとき・版に戻す作り直し・GC の照合）：アンカー `anchor` があればアンカーから、
+/// 使えなければ元を記録の識別子のデコーダで読み直す（知らせを `warnings` に足す）。記録のデコーダがない（`platform` が偽で、
+/// それが OS のデコーダのときも）なら Unavailable、読み直した値が記録と違えば Mismatch（`cant` は何ができないかの言葉）。
+/// GC は同じプロセスで OS のデコーダを呼ばない（ライブラリを開くたびに動くので、落ちる読みを繰り返さない）ので `platform` を
+/// 偽にする。
 pub(super) fn read_recorded_input<P>(
     cx: &ReadCx<'_>,
     rec: &RecordedInput,
     anchor: Option<Anchor>,
     cant: &str,
+    platform: bool,
     warnings: &mut Vec<String>,
     mut plan: impl FnMut(&Reading<'_>, &Shape) -> Result<Flow<P>>,
-) -> Result<Flow<(Value, DecodeStamp, AnchorUse, P)>> {
+) -> Result<Flow<RecordedRead<P>>> {
     let mut unusable = None;
     if let Some(a) = anchor {
         let how = Reading::Anchor {
@@ -234,7 +269,14 @@ pub(super) fn read_recorded_input<P>(
                 value,
                 decoded,
                 prep,
-            }) => return Ok(Flow::Go((value, decoded, AnchorUse::Existing(a), prep))),
+            }) => {
+                return Ok(Flow::Go(RecordedRead::Read {
+                    value,
+                    decoded,
+                    anchor: AnchorUse::Existing(a),
+                    prep,
+                }));
+            }
             Flow::Go(Attempt::Unusable(why)) => {
                 warnings.push(format!(
                     "アンカーが使えないので、元を読み直しました（{why}）"
@@ -253,12 +295,19 @@ pub(super) fn read_recorded_input<P>(
         .filter(|d| d.can_decode(&rec.format))
         .cloned()
     else {
-        return Err(CoreError::Mismatch(format!(
+        return Ok(Flow::Go(RecordedRead::Unavailable(format!(
             "{cant}：記録のデコーダ {} がこの環境にありません{}",
             rec.decoded.codec,
             also(&unusable)
-        )));
+        ))));
     };
+    if !platform && decoder.tier() == Tier::Platform {
+        return Ok(Flow::Go(RecordedRead::Unavailable(format!(
+            "{cant}：記録のデコーダ {} は OS のデコーダなので、ここでは読みません{}",
+            rec.decoded.codec,
+            also(&unusable)
+        ))));
+    }
     let how = Reading::Recorded { decoder, rec };
     match read_once(cx, &how, |shape| plan(&how, shape))? {
         Flow::Stop(end) => Ok(Flow::Stop(end)),
@@ -271,11 +320,16 @@ pub(super) fn read_recorded_input<P>(
                 Some((a, _)) => AnchorUse::Fallback(a),
                 None => AnchorUse::None,
             };
-            Ok(Flow::Go((value, decoded, used, prep)))
+            Ok(Flow::Go(RecordedRead::Read {
+                value,
+                decoded,
+                anchor: used,
+                prep,
+            }))
         }
-        Flow::Go(Attempt::Unusable(why)) => Err(CoreError::Mismatch(format!(
+        Flow::Go(Attempt::Unusable(why)) => Ok(Flow::Go(RecordedRead::Mismatch(format!(
             "{cant}：{why}{}",
             also(&unusable)
-        ))),
+        )))),
     }
 }

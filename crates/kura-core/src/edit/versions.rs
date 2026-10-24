@@ -458,6 +458,8 @@ pub fn doc_of(conn: &Connection, engine: &Engine, item_id: i64, version: i64) ->
 /// - 入力の `anchor_id` はアンカーの行を指し、アンカーは台帳の行を持ち、元が入力の元と同じ。どの入力からも参照されない
 ///   アンカーはない（ゴミ箱を空にする処理が片付ける）。
 /// - 下書きの文書は根の部品。版・下書きの文書は部品をつなぎ直せる（ダイジェストを照らす）。
+/// - 終わっていない（待ち・実行中・一時停止の）保存のジョブの入力の文書は、根の部品があってつなぎ直せる（GC の部品の
+///   片付けが消さない。M12 の段 3）。
 ///
 /// 表を走査する（テストと整合性の確かめ・crash-loop で呼ぶ。起動の道では呼ばない）。
 pub fn check_invariants(conn: &Connection) -> Result<Vec<String>> {
@@ -665,6 +667,21 @@ fn check_docs(conn: &Connection, out: &mut Vec<String>) -> Result<()> {
     for doc in docs {
         if let Err(e) = store::load_doc_bytes(conn, doc) {
             out.push(format!("文書（部品 {doc}）をつなぎ直せません：{e}"));
+        }
+    }
+    // 終わっていない保存のジョブの文書（GC の部品の片付けが残す根。M12 の段 3）
+    for root in super::save::live_roots(conn)? {
+        match store::doc_id_by_digest(conn, &root)? {
+            None => out.push(format!(
+                "終わっていない保存のジョブの文書（{root}）の根の部品がありません"
+            )),
+            Some(doc) => {
+                if let Err(e) = store::load_doc_bytes(conn, doc) {
+                    out.push(format!(
+                        "終わっていない保存のジョブの文書（{root}）をつなぎ直せません：{e}"
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -1053,6 +1070,27 @@ mod tests {
         conn.execute("DELETE FROM edit_edges WHERE parent_id = ?1", [root])
             .unwrap();
         found_one(&conn, "つなぎ直せません");
+
+        // 終わっていない保存のジョブの文書の根がない（GC が消してはいけないもの）。終われば問わない
+        let (conn, _) = setup();
+        let job = |state: &str| {
+            conn.execute(
+                "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('edit', ?1, ?2, 1)",
+                params![
+                    state,
+                    format!(
+                        r#"{{"v":1,"itemId":1,"base":{{"hash":"{}","version":2}},"action":{{"type":"overwrite","doc":"{}"}}}}"#,
+                        "00".repeat(32),
+                        "ab".repeat(32)
+                    )
+                ],
+            )
+            .unwrap();
+        };
+        job("failed");
+        assert!(check_invariants(&conn).unwrap().is_empty());
+        job("paused");
+        found_one(&conn, "終わっていない保存のジョブの文書");
     }
 
     /// 頭でなくなる版は、出力が新しい頭か元と同じならすぐ released（台帳の行を指さない）、ほかは waiting。

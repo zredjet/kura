@@ -23,7 +23,12 @@
 //!    前の頭・新しい頭・入力の記録を書き、下書きを片付け（`drafts::settle_after_save`）、自分の予告を消し、途中経過に結果を
 //!    書く。ここで Conflict になったら（門の間にゴミ箱に入れられた）、門を持ったまま、台帳に載っていない置いたファイルを
 //!    消して予告を消してから失敗にする。
-//! 9. 後始末：門を放し、staging の残りを消し、サムネイル・解析・プロキシのジョブを積む。
+//! 9. 後始末：門を放し、staging の残りを消し、サムネイル・解析・プロキシのジョブを積む（GC の時計を渡されていれば、GC の
+//!    候補があるときだけ GC も。M12 の段 3）。
+//!
+//! 積む口（[`start_save`]）は、文書の部品を置くのと同じトランザクションでジョブを積む（GC の部品の片付けが、積む前の部品を
+//! 消さないように）。上書き・別名が版を足さずに終わったら（失敗・中止・同じ中身のアイテムがある）、その文書の部品が孤立しうる
+//! ので GC の部品の印（`gc::mark_parts`）を置く。GC の照合（[`verify_version`]）は版に戻すの作り直しと同じ読み・描き・書きを使う。
 //!
 //! 版に戻すときは、版 k の中身が台帳にあってファイルがあれば、門を持って 1 つのトランザクションで戻す（描かない）。なければ
 //! 版 k の文書と入力の記録から 1〜5 で作り直し（値のダイジェストを記録と照らす）、6〜9 は上と同じ（[`revert`]）。
@@ -55,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::anchors::{self, Anchor, NewAnchor};
+use super::gc::{self, GcClock};
 use super::versions::{
     self, FileState, Head, InputRole, MediaRecord, NewInput, NewVersion, OriginalFile, VersionKind,
     VersionRecord,
@@ -181,18 +187,25 @@ pub fn start_save(db: &Db, jobs: &JobManager, req: &SaveRequest) -> Result<JobId
     let head = db
         .read(|c| versions::head(c, item_id))?
         .ok_or_else(|| CoreError::NotFound(format!("アイテム {item_id}")))?;
-    let action = match (&req.action, names) {
-        (SaveAction::Overwrite { graph }, _) => ActionInput::Overwrite {
-            doc: put_graph(db, graph)?,
-        },
-        (SaveAction::SaveAs { graph, .. }, Some((title, stem))) => ActionInput::SaveAs {
-            doc: put_graph(db, graph)?,
-            title,
-            stem,
-        },
+    let (action, parts) = match (&req.action, names) {
+        (SaveAction::Overwrite { graph }, _) => {
+            let parts = split_graph(graph)?;
+            (ActionInput::Overwrite { doc: parts.root }, Some(parts))
+        }
+        (SaveAction::SaveAs { graph, .. }, Some((title, stem))) => {
+            let parts = split_graph(graph)?;
+            (
+                ActionInput::SaveAs {
+                    doc: parts.root,
+                    title,
+                    stem,
+                },
+                Some(parts),
+            )
+        }
         (SaveAction::Revert { to }, _) => {
             revert::check_target(*to, head.version)?;
-            ActionInput::Revert { to: *to }
+            (ActionInput::Revert { to: *to }, None)
         }
         (SaveAction::SaveAs { .. }, None) => {
             return Err(CoreError::Invalid("別名で保存の名前がありません".into()));
@@ -207,15 +220,56 @@ pub fn start_save(db: &Db, jobs: &JobManager, req: &SaveRequest) -> Result<JobId
         },
         action,
     };
-    jobs.enqueue(JobKind::Edit, serde_json::to_string(&input)?)
+    // 文書の部品を置くのと同じトランザクションで積む（間に GC の部品の片付けが入っても、積んだジョブの根として残る）
+    jobs.enqueue_with(JobKind::Edit, serde_json::to_string(&input)?, move |tx| {
+        if let Some(parts) = parts {
+            store::put_doc(tx, &parts, now_ms())?;
+        }
+        Ok(())
+    })
 }
 
-/// 文書を部品に分けて DB に置き、根のダイジェストを返す。
-fn put_graph(db: &Db, graph: &Graph) -> Result<Digest> {
-    let parts = split(graph).map_err(|e| from_engine("文書を部品に分けられません", e))?;
-    let root = parts.root;
-    db.write(move |tx| store::put_doc(tx, &parts, now_ms()).map(|_| ()))?;
-    Ok(root)
+/// 文書を内容アドレスの部品に分ける。
+fn split_graph(graph: &Graph) -> Result<kura_engine::doc_parts::DocParts> {
+    split(graph).map_err(|e| from_engine("文書を部品に分けられません", e))
+}
+
+/// 終わっていない（待ち・実行中・一時停止の）保存のジョブの入力が指す文書の根（版の不変条件で、部品があることを確かめる）。
+/// 版に戻すジョブは文書を持たない。読めない入力は飛ばす（そのジョブは動くときに失敗する）。
+pub fn live_roots(conn: &Connection) -> Result<Vec<Digest>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit'",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    roots_of(rows)
+}
+
+/// GC の部品の片付けで残す保存のジョブの根（docs/data-model.md §4「保存と版（M12）」）：終わっていないジョブと、`since` 以後に
+/// 失敗・中止したジョブ（利用者がやり直せるように。前回 OS のデコーダで読んでいる途中で落ちた保存は、失敗にしてやり直しで
+/// 読み直す。docs/editing.md §14 の段 0）。どちらも `idx_jobs_queue`（状態）で引く。
+pub fn gc_roots(conn: &Connection, since: i64) -> Result<Vec<Digest>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit'
+         UNION ALL
+         SELECT input_json FROM jobs
+          WHERE state IN ('failed', 'canceled') AND kind = 'edit' AND finished_at >= ?1",
+    )?;
+    let rows = stmt.query_map([since], |r| r.get::<_, String>(0))?;
+    roots_of(rows)
+}
+
+/// ジョブの入力の列から、文書の根のダイジェスト（重なりなし）。
+fn roots_of(rows: impl Iterator<Item = rusqlite::Result<String>>) -> Result<Vec<Digest>> {
+    let mut out = Vec::new();
+    for row in rows {
+        match serde_json::from_str::<JobInput>(&row?).map(|i| i.action) {
+            Ok(ActionInput::Overwrite { doc } | ActionInput::SaveAs { doc, .. }) => out.push(doc),
+            Ok(ActionInput::Revert { .. }) | Err(_) => {}
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 // ---- 純粋な関数 ----
@@ -368,6 +422,8 @@ pub(crate) type Hook = Arc<dyn Fn(Stage) + Send + Sync>;
 /// 保存のジョブの処理。エンジンの部品（実行の場・コーデックの組）は、このライブラリのもの。
 pub struct EditHandler {
     engine: Arc<EngineServices>,
+    /// GC の時計（あれば、コミットのあとに候補があれば GC を積む。`LibrarySession` が GC と同じものを渡す）。
+    gc: Option<GcClock>,
     #[cfg(test)]
     pub(crate) fault: Option<Fault>,
     #[cfg(test)]
@@ -379,11 +435,18 @@ impl EditHandler {
     pub fn new(engine: Arc<EngineServices>) -> Self {
         Self {
             engine,
+            gc: None,
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
             hook: None,
         }
+    }
+
+    /// コミットのあとに、GC の候補（`clock` で数える）があれば GC のジョブを積む。
+    pub fn with_gc(mut self, clock: GcClock) -> Self {
+        self.gc = Some(clock);
+        self
     }
 
     /// 段 `fault` の直後で、後始末を通らずに失敗させる（テストの強制終了）。
@@ -429,7 +492,7 @@ impl Monitor for JobMonitor<'_> {
 }
 
 /// 段の結果：続けるか、止めるか（一時停止・中止）。
-enum Flow<T> {
+pub(crate) enum Flow<T> {
     Go(T),
     Stop(JobEnd),
 }
@@ -469,9 +532,12 @@ macro_rules! go {
     };
 }
 
-// 段 1・2 の読みと、版に戻す（`go!` を使うので、マクロの定義のあとに置く）
+// 段 1・2 の読みと、版に戻す・GC の照合（`go!` を使うので、マクロの定義のあとに置く）
 mod read;
 mod revert;
+
+pub use revert::Verdict;
+pub(crate) use revert::verify_version;
 
 /// このジョブの staging のファイル（落とすと消す。置いたものは改名で消えている）。
 #[derive(Default)]
@@ -628,6 +694,30 @@ fn partial_json(partial: Option<&str>) -> Option<serde_json::Value> {
 
 impl JobHandler for EditHandler {
     fn run(&self, ctx: &JobContext) -> Result<JobEnd> {
+        let result = self.run_job(ctx);
+        // 版を足さずに終わった上書き・別名（失敗・中止・同じ中身のアイテムがある）：積む前に置いた文書の部品が孤立しうるので、
+        // GC の部品の印を置く（一時停止・譲るはジョブが続くので置かない）
+        let ended = !matches!(result, Ok(JobEnd::Paused | JobEnd::Yield));
+        let with_doc = serde_json::from_str::<JobInput>(ctx.input())
+            .is_ok_and(|i| !matches!(i.action, ActionInput::Revert { .. }));
+        if ended && with_doc {
+            let job = ctx.id();
+            let db = ctx.library().db();
+            let marked = db.read(|c| versions::by_job(c, job)).and_then(|v| match v {
+                Some(_) => Ok(()),
+                None => db.write(|tx| gc::mark_parts(tx)),
+            });
+            if let Err(err) = marked {
+                tracing::warn!(%err, job, "文書の部品の印を置けませんでした");
+            }
+        }
+        result
+    }
+}
+
+impl EditHandler {
+    /// ジョブの本体（[`JobHandler::run`] が、版を足さずに終わったときの部品の印を置く）。
+    fn run_job(&self, ctx: &JobContext) -> Result<JobEnd> {
         let input: JobInput = serde_json::from_str(ctx.input())?;
         if input.v != INPUT_V {
             return Err(CoreError::Invalid(format!(
@@ -650,7 +740,7 @@ impl JobHandler for EditHandler {
             ctx.log("前回コミットした版があるので、そのまま終えます");
             // コミットのあと後始末の前に落ちていれば、保存のあとのジョブを積んでいない
             if let Some(h) = db.read(|c| versions::head(c, v.item_id))? {
-                queue_follow_ups(ctx, h.kind);
+                self.queue_follow_ups(ctx, h.kind);
             }
             return Ok(JobEnd::Done {
                 result_json: result.to_string(),
@@ -689,9 +779,7 @@ impl JobHandler for EditHandler {
         };
         self.commit(ctx, prepared, staging)
     }
-}
 
-impl EditHandler {
     /// 書き終えたあと（段 5 の終わり）：止める指示があれば止める（呼び手が staging を落として消す）。テストの強制終了なら
     /// staging を残して失敗する。続けるなら None。
     fn after_written<T>(
@@ -851,14 +939,18 @@ impl EditHandler {
                     decoded: a.decoded.clone(),
                     anchor: Some(Digest(a.hash)),
                 };
-                read::read_recorded_input(
+                match read::read_recorded_input(
                     &cx,
                     &rec,
                     Some(a),
                     "保存できません",
+                    true,
                     &mut warnings,
                     plan_for,
-                )?
+                )? {
+                    Flow::Go(read) => Flow::Go(read.or_mismatch()?),
+                    Flow::Stop(end) => Flow::Stop(end),
+                }
             }
             None => {
                 let how = read::Reading::Any {
@@ -1083,7 +1175,7 @@ impl EditHandler {
         // 9. 後始末
         drop(gate);
         drop(staging);
-        queue_follow_ups(ctx, p.kind);
+        self.queue_follow_ups(ctx, p.kind);
         let message = match (&p.act, go.unchanged) {
             (_, true) => "中身が同じなので、版だけ足しました".to_string(),
             (Act::Revert(t), false) => format!("版 {} に戻しました（作り直しました）", t.to),
@@ -1097,19 +1189,28 @@ impl EditHandler {
     }
 }
 
-/// 保存のあとのジョブを積む（中身が変わったのでサムネイル、画像・音声は解析、動画・音声はプロキシ）。積めなくても保存は
-/// 終わっている（開き直すときにも積む）ので、ログに残して続ける。
-fn queue_follow_ups(ctx: &JobContext, kind: MediaKind) {
-    let mut follow = vec![JobKind::Thumbnail];
-    if matches!(kind, MediaKind::Image | MediaKind::Audio) {
-        follow.push(JobKind::Analyze);
-    }
-    if kind.needs_proxy() {
-        follow.push(JobKind::Proxy);
-    }
-    for kind in follow {
-        if let Err(err) = ctx.ensure_queued(kind, "{}") {
-            tracing::warn!(%err, kind = kind.as_str(), "保存のあとのジョブを積めませんでした");
+impl EditHandler {
+    /// 保存のあとのジョブを積む（中身が変わったのでサムネイル、画像・音声は解析、動画・音声はプロキシ。GC の時計があれば、
+    /// 候補があるときだけ GC も）。積めなくても保存は終わっている（開き直すときにも積む）ので、ログに残して続ける。
+    fn queue_follow_ups(&self, ctx: &JobContext, kind: MediaKind) {
+        let mut follow = vec![JobKind::Thumbnail];
+        if matches!(kind, MediaKind::Image | MediaKind::Audio) {
+            follow.push(JobKind::Analyze);
+        }
+        if kind.needs_proxy() {
+            follow.push(JobKind::Proxy);
+        }
+        for kind in follow {
+            if let Err(err) = ctx.ensure_queued(kind, "{}") {
+                tracing::warn!(%err, kind = kind.as_str(), "保存のあとのジョブを積めませんでした");
+            }
+        }
+        if let Some(clock) = &self.gc
+            && let Err(err) = gc::queue_if_due(ctx.library(), clock, || {
+                ctx.ensure_queued(JobKind::Gc, "{}")
+            })
+        {
+            tracing::warn!(%err, "GC のジョブを積めませんでした");
         }
     }
 }

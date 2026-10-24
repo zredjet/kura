@@ -34,7 +34,8 @@ pub enum JobKind {
     Analyze,
     /// 編集の保存（M12 の段 2。上書き・別名・元に戻す。1 本ずつ。利用者が待つので誰にも譲らない）。
     Edit,
-    /// 置き換えた版のファイルの片付け（M12 の段 3。0011 の jobs_kind が受け付ける。登録は段 3 で足す）。
+    /// 置き換えた版のファイルと孤立した文書の部品・アンカーの片付け（M12 の段 3。`edit::gc`。1 本ずつ。取り込み・サムネイル・
+    /// 保存・解析・書き出し・ダウンロード・キャプチャに譲る）。
     Gc,
 }
 
@@ -103,19 +104,29 @@ impl JobKind {
     /// 譲る相手：この種類のジョブが（登録されていて）動いている・待っている間は、この種類を取り出さず、動いていれば
     /// `JobContext::should_yield` で知らせて区切りで `JobEnd::Yield` を返させる。解析は取り込み（NFR-05）とサムネイル
     /// （NFR-04）と保存（M12。同じ一括のプールと予算を使い、利用者が待っている）に譲る。ダウンロードはネットワーク待ちなので
-    /// 譲らない。保存は利用者が待つので誰にも譲らない。GC が譲る相手は段 3 で決める（今は登録しない）。種類を足したら必ず
-    /// ここに書く（網羅の match。M14 の一括も同じ一括のプールと予算を使うので、足すときに解析が譲るかを決める）。
+    /// 譲らない。保存は利用者が待つので誰にも譲らない。GC（M12 の段 3）は急がない片付けなので、取り込み・サムネイル・保存・
+    /// 解析・書き出し・ダウンロード・キャプチャに譲る（照合の作り直しは一括のプールと予算を使い、消すときは台帳の門を書きの
+    /// 側で持つので、取り込み・ダウンロード・キャプチャを待たせない。プロキシは再生の都合で動くので譲らない）。種類を足したら
+    /// 必ずここに書く（網羅の match。M14 の一括も同じ一括のプールと予算を使うので、足すときに解析・GC が譲るかを決める）。
     pub fn yields_to(self) -> &'static [JobKind] {
         match self {
             Self::Analyze => &[Self::Import, Self::Thumbnail, Self::Edit],
+            Self::Gc => &[
+                Self::Import,
+                Self::Thumbnail,
+                Self::Edit,
+                Self::Analyze,
+                Self::Export,
+                Self::Download,
+                Self::Capture,
+            ],
             Self::Import
             | Self::Thumbnail
             | Self::Proxy
             | Self::Download
             | Self::Capture
             | Self::Export
-            | Self::Edit
-            | Self::Gc => &[],
+            | Self::Edit => &[],
         }
     }
 
@@ -246,7 +257,8 @@ mod tests {
         assert_eq!(JobKind::Gc.concurrency(), 1);
     }
 
-    /// 譲る相手の表（解析だけが、取り込み・サムネイル・保存に譲る）。自分に譲らず、譲り合いの輪がない。
+    /// 譲る相手の表（解析は取り込み・サムネイル・保存に、GC は取り込み・サムネイル・保存・解析・書き出し・ダウンロード・
+    /// キャプチャに譲る）。自分に譲らず、譲り合いの輪がない。
     #[test]
     fn yields_to_table() {
         let table: Vec<(JobKind, &[JobKind])> =
@@ -265,7 +277,18 @@ mod tests {
                     &[JobKind::Import, JobKind::Thumbnail, JobKind::Edit][..]
                 ),
                 (JobKind::Edit, &[][..]),
-                (JobKind::Gc, &[][..]),
+                (
+                    JobKind::Gc,
+                    &[
+                        JobKind::Import,
+                        JobKind::Thumbnail,
+                        JobKind::Edit,
+                        JobKind::Analyze,
+                        JobKind::Export,
+                        JobKind::Download,
+                        JobKind::Capture,
+                    ][..]
+                ),
             ]
         );
         for kind in JobKind::ALL {

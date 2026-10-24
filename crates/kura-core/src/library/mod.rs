@@ -219,28 +219,81 @@ impl Library {
         })
     }
 
-    /// ゴミ箱を空にする。DB の行を消して、使われなくなった台帳の行（アイテムの今と、編集したアイテムの元・猶予中の版・
-    /// アンカー。M12）を同じトランザクションで解放し、コミットのあとで
-    /// 解放した中身の実ファイルと派生のファイル（サムネイル・ジャケット・プロキシ・波形・アニメの帯）を消す
-    /// （ADR-46。途中で落ちてもファイルが残るだけで、整合性チェックで「DB にないファイル」として数えられる）。
-    /// 取り込みの鍵を書き込みの側で持つので、置いたばかりの同じ中身のファイルを消さない。
+    /// ゴミ箱を空にする（docs/data-model.md §4「保存と版（M12）」。段 3 の GC と同じ消す手順）：台帳の門
+    /// （[`Library::ingest_exclusive`]）を取り、(1) 消すアイテムと消しうる中身（アイテムの今と、編集したアイテムの元・猶予中の版・
+    /// アンカー）を決めて 'delete' で予告してコミット、(2) アイテムの行を消し、使われなくなった台帳の行を解放し、消えたアイテムの
+    /// 文書の部品を片付けてコミット、(3) 解放した中身の実ファイルと派生のファイル（サムネイル・ジャケット・プロキシ・波形・
+    /// アニメの帯）を消し、(4) 予告を消す。途中で落ちても、開くときの予告の照合（`ledger::settle_pending`）が台帳にないファイルを
+    /// 片付ける。猶予中のファイル・元・アンカーも照合せずにすぐ消す（M12 の利用者の決定 6）。ほかのアイテムが同じ中身を持って
+    /// いれば（別名で保存したアイテムの版 0 が持つ元など）、台帳の行もファイルも残る。
     pub fn empty_trash(&self) -> Result<TrashEmptied> {
-        let _ingest = self.ingest_exclusive();
-        let deleted = self.db.write(|tx| crate::items::delete_trashed(tx))?;
-        let mut result = TrashEmptied::default();
-        for blob in &deleted.released {
-            let mut paths = self.layout.derived_paths(&hex(&blob.hash));
-            paths.insert(0, self.layout.content_path(&blob.hash, &blob.ext));
-            for path in paths {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        result.failed += 1;
-                        tracing::warn!(%err, path = %path.display(), "ゴミ箱のファイルを消せませんでした");
-                    }
+        self.empty_trash_with(TrashFault::None)
+    }
+
+    /// ゴミ箱を空にする途中、台帳の行を解放したあと・ファイルを消す前に、後始末を通らずに失敗する（テストの強制終了）。
+    #[cfg(test)]
+    pub(crate) fn empty_trash_crashing_after_release(&self) -> Result<TrashEmptied> {
+        self.empty_trash_with(TrashFault::AfterRelease)
+    }
+
+    fn empty_trash_with(&self, _fault: TrashFault) -> Result<TrashEmptied> {
+        let _gate = self.ingest_exclusive();
+        // (1) 予告
+        let (plan, pending) = self.db.write(|tx| {
+            let plan = crate::items::plan_empty_trash(tx)?;
+            let now = crate::time::now_ms();
+            let mut pending = Vec::with_capacity(plan.blobs.len());
+            for (hash, ext) in &plan.blobs {
+                pending.push(ledger::announce(
+                    tx,
+                    hash,
+                    ext,
+                    ledger::PendingKind::Delete,
+                    None,
+                    now,
+                )?);
+            }
+            Ok((plan, pending))
+        })?;
+        if plan.items.is_empty() {
+            return Ok(TrashEmptied::default());
+        }
+        // (2) 行を消して台帳を解放する
+        let (deleted, pending) = self.db.write(move |tx| {
+            let deleted = crate::items::delete_trashed(tx, &plan.items)?;
+            // 予告していない中身は解放しないはずだが（門を持ち、消すアイテムは決めてある）、念のため、解放したものは必ず予告
+            // してからファイルを消す（同じトランザクションでコミットするので、消す前にコミットされている）
+            let mut pending = pending;
+            let announced: std::collections::BTreeSet<&([u8; 32], String)> =
+                plan.blobs.iter().collect();
+            for blob in &deleted.released {
+                if !announced.contains(&(blob.hash, blob.ext.clone())) {
+                    pending.push(ledger::announce(
+                        tx,
+                        &blob.hash,
+                        &blob.ext,
+                        ledger::PendingKind::Delete,
+                        None,
+                        crate::time::now_ms(),
+                    )?);
                 }
             }
+            Ok((deleted, pending))
+        })?;
+        #[cfg(test)]
+        if _fault == TrashFault::AfterRelease {
+            return Err(CoreError::Invalid(
+                "テスト用の強制終了（AfterRelease）".into(),
+            ));
+        }
+        // (3) ファイルを消し、(4) 予告を消す（消せなかったファイルがあれば予告を残し、次に開くときの照合が消す）
+        let mut result = TrashEmptied {
+            failed: ledger::remove_files(&self.layout, &deleted.released),
+            ..TrashEmptied::default()
+        };
+        if result.failed == 0 {
+            self.db
+                .write(move |tx| ledger::clear_pending(tx, &pending).map(|_| ()))?;
         }
         for item in &deleted.items {
             result.items += 1;
@@ -248,6 +301,15 @@ impl Library {
         }
         Ok(result)
     }
+}
+
+/// ゴミ箱を空にする処理の、強制終了を写す段（テスト）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrashFault {
+    None,
+    /// 台帳の行を解放したあと、ファイルを消す前。
+    #[cfg_attr(not(test), allow(dead_code))]
+    AfterRelease,
 }
 
 impl Drop for Library {
