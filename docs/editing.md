@@ -130,6 +130,26 @@ pub struct OutputSpec {
 
 - 文書・ノードのハッシュは、自前の正規化 JSON（キーを並べる、数値は最短の表記、空白なし。RFC 8785 に準じる）の BLAKE3 で取る。非有限の小数（NaN・±∞）は正規の JSON にできないので、エラー（`Internal`）にする（段 8 で、黙って `null` にしていたのを直した。解析の結果は `Real` か理由付きの列挙で持つ。§11.1）。`serde_json::Value` の並びには頼らない（依存の feature で変わりうる）。
 - 文書を DB に置くとき（M12）は、ノードを内容アドレスで分けて持つ。筆の点の多い文書を版ごとに丸ごと持つと、容量が保存回数に比例して増えるため。
+- **文書の部品**（M12 の段 2。`doc_parts`。形は凍結：E34）：文書を 3 種類の部品に分け、同じ中身の部品は 1 つだけ持つ（DB の
+  `edit_objects`・`edit_edges`。docs/data-model.md §3）。本文は正規の JSON、ダイジェストは「ドメイン付きの BLAKE3 に長さ付きの本文」
+  （`Hasher::new(<ドメイン>).bytes_with_len(本文)`）で、本文だけから求め直して照らせる（`Node::digest` の `kura-node-v1` は使わない）。
+
+  | 部品 | 本文 | ドメイン | 子 |
+  |---|---|---|---|
+  | chunk | 配列 1 つ（1〜64 要素。元の配列の `[64k, 64k+64)`） | `kura-doc-chunk-v1` | なし |
+  | node | ノードのオブジェクト。切った引数の値は `[]`、最上位に `"$chunks": {<引数名>: {"count": N, "parts": ["<hex>", …]}}`（切った引数があるときだけ） | `kura-doc-node-v1` | 切れ目（引数名の UTF-8 のバイト順 → 切れ目の順） |
+  | doc | 文書のオブジェクト。`"nodes"` をノードの部品のダイジェストの 16 進の配列にしたもの | `kura-doc-root-v1` | ノード（文書の順） |
+
+  - 切る規則：ノードの `params` の最上位の値のうち、要素が `PART_CHUNK`（64。凍結）を超える配列を、位置 0 から 64 個ずつ切る。登録表に
+    依らない（`Engine` なしで分けられる）。64 個以下の配列は切らない。切れ目の境界は追記だけの配列（`session::log::CHUNK`。§12.12）と
+    同じなので、筆を足した版どうしで前の切れ目を共有する（200 本 → 210 本で新しく書く部品は最後の切れ目・ノード・根だけ。5 万本・約
+    15 MB の文書に 10 本足して保存すると、新しく書くのは約 0.1 MB）。部品は文書の中の同じ値より浅く、`MAX_DEPTH` を超えない。
+  - つなぐ（`doc_parts::join`）ときは、根から子をたどり、各部品について「ある・種類が合う・本文からのダイジェストが合う・本文が正規の
+    JSON」を確かめ、`$chunks` の `count` と切れ目の数・長さ（最後だけ 1〜64、ほかは 64）・殻が `[]`・切っていない長い配列がないことを
+    照らす（同じ文書は必ず同じ根になり、根が同じなら文書も同じ。DB では文書を根の行の ID で比べられる）。壊れていれば `Invalid`
+    （`BadGraph`）。読む本文の合計が `MAX_DOC_BYTES` の 2 倍を超える組（同じ切れ目を何度も参照して膨らませるもの）と、つないだ文書が
+    上限を超えるものは `Limit`。つないだバイト列は文書の読み込み（`Engine::load`）に通して使う。外の本文を読むので、壊れた入力の
+    テスト（ChaCha8）とファズの対象 `doc_parts` を持つ。
 
 ## 5. 値と形
 
@@ -1047,8 +1067,8 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   - 大きな画像：16384² の RGBA（値 1 GiB）を PNG に書いて読み直すテスト（`tests/large.rs`、release で 3.8 秒）のピークのメモリは 3.3 GB（元の値と読んだ値の 2 GiB を含む）。PNG の書き出しは行を詰めた写しを 1 つ作る（値と同じ大きさ）。行ごとに書くとバイト列が変わり、エンコーダの版を上げることになるので、写しは作ったままにし、段 10 のメモリの予算の見積もりに数える（PNG の書きの作業領域は 1 フレームの 3 倍、`fast` は 4 倍。§9.9）。エンコーダの版は上げていない。
   - 段 6 の音声のデコーダの上限：symphonia・nanomp3 に渡すファイルは `max_value_bytes` まで読み込む。長さはデコードせずに数え（パケットの長さの和・MP3 のフレームの走査）、形を上限（`max_audio_frames`・`max_value_bytes`・`max_channels`・`max_sample_rate`）で確かめてから確保する。デコードの途中でも形の上限を超えたら止める。Vorbis は codebook の表の大きさを渡す前に見積もって断る。AIFF の COMM は 279 バイトまで、MARK・INST・テキストは WAV と同じ予算（マーカーの上限・`max_meta_bytes`）。symphonia の panic は `codec::contain` が受け止める。
   - 段 9 の外部のツールと OS の機能（詳しくは §9.8）：ffmpeg は入力をファイルのパスで渡し、分離器・デコーダ・プロトコルをホワイトリストで固定し、環境変数を消して新しいプロセスグループで動かし、見張りが中止・無出力・時間切れ・出力の上限でグループごと止める。出力（WAV）は上限で確かめてから確保する。ImageIO の展開は専用のスレッドで行い、時間切れで見捨てる（壊れた HEIC で戻らないことがある）。Swift の側は大きさをすべて確かめ、Rust が確保した領域にだけ書く。
-  - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・AIFF・FLAC・MP3・Ogg・m4a・AAC・アンカー・文書の読み込み）はファズにかける。
-    - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_peaks`・`fuzz_document`・`fuzz_model`・`fuzz_svg_text` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
+  - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・AIFF・FLAC・MP3・Ogg・m4a・AAC・アンカー・文書の読み込み・文書の部品）はファズにかける。
+    - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_peaks`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_model`・`fuzz_svg_text` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
     - `tests/fuzz_smoke.rs` は同じ口を stable で回す変異のファズ。種（各形式の小さなファイル・フィクスチャ・文書）をバイトの書き換え・挿入・削除・つなぎ合わせで崩す。ふだんの `cargo test` で対象ごとに 150 回（`quick`）、`KURA_FUZZ_SECS=<秒> cargo test --release -p kura-engine --test fuzz_smoke long -- --ignored` で長く回す（`KURA_FUZZ_ONLY=svg,wav` で対象を選べる）。見つけた入力は `target/fuzz-smoke/` に残し、`replay` で流し直す。
     - 文書のファズは、上限を絞ったエンジンで読み込み、小さな入力（画像・パレットの画像・フレームの列・音声、格子・ピボット・スライス付きのシート、ループ点・マーカー付きの音声）で計画を作って描くところまで流す（段 5 から。新しい操作の実行の経路とメタデータの写し方にも届く）。追記だけの引数（`actions` の列）を持つノードは、途中で切って差分の適用（`Op::apply_appended`）が全体を当て直したものと同じかも照らす（E21）。段 10 から実行器も差分を使うので、実行器の経路（セッションで追記して `compile_snapshot` と `render_cached` の差分の適用で描く）も、文書のファズのセッションの道の照合（`testing::snapshot`）と `tests/e4.rs` の `appended_in_executor_equals_full` で照らす。
     - デコーダのファズは、上限を絞って（`testing::fuzz_limits`）その形式のすべてのデコーダ（旧版を含む）で形と中身を読み、自分のコードの panic（panic の場所が `crates/kura-engine/src/` のもの。`testing::catch_own_panic` が panic のフックで見分ける）・形と中身の食い違い・`Internal` を見つけたものとして扱う。壊れたファイルとしてのエラーと第三者のクレートの panic（`codec::contain` がエラーに変える）は正しい振る舞い。
@@ -1063,6 +1083,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
       - cargo-fuzz（release ＋デバッグの検査 ＋ ASan、`-fork=4`、3 対象ずつ並べて 10 分。種は `export_seeds`）：decode_anchor 約 764 万回・decode_peaks 約 2,827 万回・decode_flac 約 70 万回・decode_ogg 約 62 万回・decode_png 約 49 万回・decode_aiff 約 28 万回・decode_m4a 約 26 万回・decode_wav 約 24 万回・decode_aac 約 19 万回・decode_webp 約 18 万回・decode_mp3 約 14 万回・decode_psd 約 12 万回・decode_svg 約 6 万回・decode_jpeg 約 4.5 万回・decode_gif 約 2.3 万回・decode_aseprite 約 2.2 万回（確認の直しのあと `-fork=8` で 10 分回し直して約 1.7 万回）・encode_ogg 約 1.6 万回。デコードの対象は読めた値に登録されたすべての解析を当てる（段 8）ので、画像の重い形式は 1 回が重い。
       - 文書（`document`）は、段 10 の照合を足した種（約 3,400 個）を ASan の下で最初に流すだけで約 30 分かかり、10 分の枠ではほとんど変異に進まなかった（release では同じ種が全部で約 67 秒、重い種で 1 個 0.5 秒。段 10 の照合を外しても時間は変わらない）。そこで種を 8 個に 1 個（420 個）にして 15 分回し、最初の流しが 162 秒、そのあと約 81 万回で何も見つかっていない。重い種 3 個が slow-unit（ASan の下で 10 秒を超える。timeout の 30 秒には届かない）として残った。
       - stable の変異（release、各 60 秒）：png 約 142 万回・jpeg 約 152 万回・gif 約 1,207 万回・webp 約 221 万回・aseprite 約 1,046 万回（直しのあと約 1,100 万回）・psd 約 390 万回・svg 約 1,165 万回・wav 約 21 万回・aiff 約 18 万回・flac 約 70 万回・mp3 約 16 万回・ogg 約 502 万回・encode_ogg 約 2 万回・m4a 約 28 万回・aac 約 13 万回・document 約 1,068 万回（直しのあと約 1,130 万回）・peaks 約 1 億 7,398 万回・anchor 約 1,237 万回。
+    - M12 の段 2 で、文書の部品の対象 `doc_parts`（`testing::fuzz_doc_parts`。§4.4）を足した。`{` で始まる入力は文書の JSON として読み、分けてつなぎ直すと正規の JSON に戻ることを、ほかは部品の組（種類 1 バイト ‖ 長さ ‖ 本文。根は最後）としてつなぎ、つないだ文書を分け直すと同じ根になることを見る。種は文書の JSON と、切れ目 3 つに分かれる長い描画の文書の部品の組。確認の回で、stable の変異（デバッグ、40 秒）約 40 万回で何も見つからなかった。
     - 通常の `cargo test` にも、ChaCha8 でランダムな文書と壊れたファイルを作るテスト（形式ごとの `broken_files_are_errors` など）を入れる。
 
 ## 14. 保存と版（M12 以降。意味だけを決める。表は data-model.md に各段で書く）
@@ -1274,3 +1295,4 @@ M4 Max・release・3 スレッド。`kura-devtools bench edit --runs 3`（コミ
 | E31 | 変わった範囲の推論は保守的：ランダムな文書へのランダムな編集の前後を全体で描いた差が、推論した範囲（`Engine::delta`）に入る。`render_cached` が報告する変わったタイル（`Arc` の同一性で絞ったもの）は、中身の変わったタイルを含み、推論の範囲の中にある（段 10。`tests/delta.rs` の `inferred_delta_contains_actual`・`changed_tiles_by_identity`。局所の編集が全体に落ちないことは `local_edits_do_not_fall_to_all`、継ぎはぎが毎回まっさらに描いたものと同じことは `incremental_equals_fresh`）。ランダムな手（`testing::region` の `random_edit`・`random_step`。種類は `EDIT_KINDS`・`STEP_KINDS`）は、ノード 1 つの引数・描画への追記・途中の動作の差し替え・有効の切り替え・フェードの長さ・ループ点・メタデータ・canvas の fill だけ・種だけと、線形の列の構造の手（置き換え・消す・動かす・足す）、2〜3 手をまとめて途中の版を飛ばすもの（`multi`）、入力の値だけの変更（`random_step_or_input`）。決まった場合：Indexed8 の上流でパレットだけが変わると後ろは全体（`palette_changes_upstream_stay_all`）、元・エンジン・段の違いで全体（`delta_falls_to_all_for_other_sources_engines_or_levels`）、持ち上げた canvas の fill だけの変更が全フレームに広がる（`lifted_param_change_spans_all_frames`）、前の値で無効だったタイルを同じ実体でも報告する（`refine_reports_tiles_that_were_holes`）、継ぎはぎが前の値のパレットの違いで断ったら前の値なしで描き直す（`render_area_redraws_without_a_base_of_another_palette`）。段 10 の検証で抜けを見つけた種でも回す（`inferred_delta_contains_actual_on_found_seeds`）。表示の経路（`render_view`。§12.8）の報告も、表示する範囲の中で中身の変わったタイルを含み、推論と「前回は無効で今回描いたタイル」の中にあり、表示する範囲のタイルは `render` と同じ（`tests/view.rs` の `view_equals_render_on_random_edit_sequences`・`view_equals_render_on_found_seeds`・`view_redraws_only_changed_tiles_after_strokes`・`view_at_levels_equals_the_level_render`・`view_follows_a_moving_viewport`・`view_handles_palette_changes_upstream`）。表示の値から配信に要るもの（形式・パレット・メタデータ・フレームの表示時間と繰り返し）が取れる（`view_values_expose_what_delivery_needs`） |
 | E32 | プレビューの段：段 0（と段 0 に落ちた計画）は `render` とビット単位で同じ。段 1〜3 はスレッドの数によらず同じで、縮めた引数が段の形で推論を通る（通らなければ段 0 に落ちる）。継ぎ目までのノードは、等倍の計画と同じ指紋・同じ値。段の値は保存・解析・スポイト・ダイジェストに使えない（段 10。`tests/preview.rs` の `level0_equals_render`・`preview_deterministic`・`scaled_params_infer`・`prefix_before_switch_is_exact`・`level_values_are_not_for_saving`・`fallback_reasons`・`choose_level_rules`。今の登録表の操作では届かない段 0 に落ちる理由（`Infer`・`Analysis`）と Skip の操作を外す道は、試験用の操作で `fallback_reasons_of_level_nodes`。近似の程度は `preview_approximates`） |
 | E33 | `EditSession`：素朴な参照の実装（文書を丸ごと写す）と、ランダムな編集の列のどの手のあとでも、同じ文書（正規の JSON）・Rev・取り消しの可否・履歴の長さ・誤りの種類・鍵になる。同じ列を 2 回当てると同じ Rev・鍵・文書。まとめ方・仮の値・上限・構造の手・検証（E8・E25）が約束どおりで、頭の文書から作り直すと同じ文書・同じ鍵になり、`to_graph` を compile・render すると素直に組んだ文書と同じ値（段 10。`tests/session.rs` の `matches_the_naive_model_on_random_sequences`・`same_sequence_gives_same_revs_keys_and_documents`・`reopening_from_the_head_gives_the_same_document_and_keys`・`to_graph_compiles_and_renders_like_the_plain_document` ほか） |
+| E34 | 文書の部品（`doc_parts`。§4.4。M12 の段 2）の形は凍結：決めた文書の根と空の切れ目のダイジェストの 16 進が変わらない（`doc_parts::tests::parts_format_is_frozen`。変えるなら新しいドメイン（`-v2`）で別の形にする）。`PART_CHUNK` が追記だけの配列の切れ目（`session::log::CHUNK`）と同じ。分けてつなぐと文書の正規の JSON に戻り、分け直しても同じ組になる（ChaCha8 のランダムな文書でも）。追記した版どうしで前の切れ目を共有する（200 本 → 210 本で新しい部品は最後の切れ目・ノード・根だけ。`appending_shares_all_but_the_last_chunk`）。壊れた部品（足りない・本文がダイジェストと合わない・種類の違い・`count` の違い・切れ目の数と並びの違い・殻が `[]` でない・余分な項目・切っていない長い配列・正規でない本文、ChaCha8 のランダムな壊し方）は `Invalid`（`BadGraph`）で落ちない、同じ切れ目を参照して膨らませる組は `Limit`（`broken_parts_are_refused`・`random_documents_round_trip_and_random_damage_is_refused`・`amplification_is_limited`）。ファズの対象 `doc_parts`（`testing::fuzz_doc_parts`。つないだ文書を分け直すと同じ根になることも見る） |

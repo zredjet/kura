@@ -1,7 +1,7 @@
 //! stable で回す、変異によるファズ（docs/editing.md §13）。`fuzz/`（cargo-fuzz、nightly）と同じ対象
-//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
+//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
 //! カバレッジは見ない。対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、
-//! 文書は `document`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、3D モデル（glb）は `model_glb`、
+//! 文書は `document`、文書の部品（M12）は `doc_parts`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、3D モデル（glb）は `model_glb`、
 //! フォントを渡した SVG の文字は `svg_text`（`fuzz/` では `decode_svg_text`）。
 //!
 //! - ふだんの `cargo test` では、対象ごとに決めた回数だけ回す（`quick`）。
@@ -25,7 +25,7 @@ use kura_engine::doc::Graph;
 use kura_engine::testfiles::{ApngFrame, AseCel, AseFrame, AseLayer, FileGen, GifFrame, PsdGen};
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::{
-    FuzzEncodeMeta, fuzz_decode, fuzz_document, fuzz_encode, fuzz_encode_input,
+    FuzzEncodeMeta, fuzz_decode, fuzz_doc_parts, fuzz_document, fuzz_encode, fuzz_encode_input,
     fuzz_encode_input_meta, fuzz_model, fuzz_peaks, fuzz_svg_text,
 };
 use kura_engine::value::{LoopRange, PixelFormat};
@@ -596,6 +596,9 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 sprite_doc.to_canonical_json().unwrap(),
             ],
         ),
+        // M12 の段 2：文書の部品（DB から読み直す外の本文。cargo-fuzz の対象も doc_parts）。文書の JSON と、部品の組
+        // （切れ目のある長い描画の文書を分けたもの）
+        ("doc_parts", doc_parts_seeds(&[&doc, &paint_doc, &chain_doc])),
         // 波形の段のバイナリ（kura-peaks。解析 audio.peaks の正規の形。cargo-fuzz の対象は decode_peaks）
         ("peaks", peak_seeds()),
         // 段 9：アンカー（PNG・APNG・f32 の WAV ＋私用のチャンク。cargo-fuzz の対象は decode_anchor）
@@ -636,6 +639,23 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 .collect(),
         ),
     ]
+}
+
+/// 文書の部品の種：文書の JSON と、部品の組（`testing::fuzz_doc_parts_input`）。描画の動作を 150 個に増やした文書は、
+/// 切れ目 3 つに分かれる。
+fn doc_parts_seeds(docs: &[&Graph]) -> Vec<Vec<u8>> {
+    let mut long = docs[1].clone();
+    let actions = long.nodes[0].params["actions"].as_array().unwrap().clone();
+    long.nodes[0].params["actions"] =
+        serde_json::Value::Array(actions.iter().cycle().take(150).cloned().collect());
+    let mut seeds = Vec::new();
+    for g in docs.iter().copied().chain([&long]) {
+        seeds.push(g.to_canonical_json().unwrap());
+        seeds.push(kura_engine::testing::fuzz_doc_parts_input(
+            &kura_engine::doc_parts::split(g).unwrap(),
+        ));
+    }
+    seeds
 }
 
 /// アンカーの種：EXIF と ICC 付きの画像・パレットのフレームの列・メタデータ付きの音声。
@@ -773,6 +793,8 @@ fn mutate(r: &mut ChaCha8Rng, seeds: &[Vec<u8>]) -> Vec<u8> {
 fn run(target: &str, input: &[u8]) -> Result<(), String> {
     if target == "document" {
         fuzz_document(input)
+    } else if target == "doc_parts" {
+        fuzz_doc_parts(input)
     } else if target == "peaks" {
         fuzz_peaks(input)
     } else if target == "model_glb" {
@@ -856,14 +878,17 @@ fn long() {
 }
 
 /// 種を cargo-fuzz の種の置き場（`fuzz/corpus/<対象>/`。git には入れない）に書き出す（fuzz/README.md）。
-/// 対象の名前は、デコーダは `decode_<形式>`、自前のエンコーダは `encode_<形式>`、文書は `document`、3D モデルは `model_glb`。
+/// 対象の名前は、デコーダは `decode_<形式>`、自前のエンコーダは `encode_<形式>`、文書は `document`、文書の部品は `doc_parts`、3D モデルは `model_glb`。
 #[test]
 #[ignore]
 fn export_seeds() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus");
     let mut n = 0;
     for (target, seeds) in targets() {
-        let name = if target == "document" || target == "model_glb" || target.starts_with("encode_")
+        let name = if target == "document"
+            || target == "doc_parts"
+            || target == "model_glb"
+            || target.starts_with("encode_")
         {
             target.to_string()
         } else {

@@ -39,4 +39,4 @@ paths:
 - コーデックは読み書きで別の識別子に約束の版を持つ（`png-rs-dec/1`・`png-rs-enc/1`）。書くバイト列が変わる変更はエンコーダの版を上げる。読む値は変えない（変えるならデコーダの版を上げ、旧版を `add_legacy_decoder` で残す）。`goldens-codecs/` は追記だけ。中で OS の libm を使う第三者のデコーダ（resvg。symphonia の Vorbis・AAC は段 9 で libm に差し替えた写しにして再現できる）は `reproducible()` を偽にし（読んだ元にアンカーを作る）、デコーダのゴールデンに入れずフィクスチャで他の実装と照らす。
 - C の実装を移したもの（`codec/vorbis/`）は、照合用の C（`crates/vorbis-tables/oracle/`）とのビット一致を正にする。移植の規則（`codec/vorbis/mod.rs` の 12 か条：C の型・暗黙の型変換・演算の順をそのまま、`mul_add` を使わない、超越関数は `math` だけ、C の `max`・`min` マクロは比較の形）を守り、直したら `KURA_VORBIS_ORACLE` を指定して照合のテストを回す。表は `vorbis-tables` の生成物で、手で書き換えない（`gen/` の道具で作り直す）。
 - 第三者のクレートの不具合は、上流への報告の案文を用意し（報告はユーザーが行う。案文と issue の URL は `KURA.md` に）、直した写しを `third_party/<クレート>/` に置いて `[patch.crates-io]`（ワークスペースと `fuzz/` の両方）で使う。元のライセンスのまま公開し、`KURA.md` に変更・理由・確かめたことを書く。写しの `lib.rs` に `KURA_PATCHED` を置いて kura-engine から参照する（`[patch]` が外れたら組み立てで気づく）。読む値が変わるならデコーダの版を上げる。
-- 受け入れテスト E1〜E33（docs/editing.md §17）は、その段で実装するものを先に失敗する形で書く。
+- 受け入れテスト E1〜E34（docs/editing.md §17）は、その段で実装するものを先に失敗する形で書く。

@@ -1023,6 +1023,121 @@ fn check_cached(
     Ok(())
 }
 
+/// [`fuzz_doc_parts`] の部品の組の入力にする：部品ごとに「種類（0 doc・1 node・2 chunk）1 バイト ‖ 本文の長さ（u32 LE）‖
+/// 本文」を並べ、根（doc の部品）を最後に置く（ファズの種）。
+pub fn fuzz_doc_parts_input(parts: &crate::doc_parts::DocParts) -> Vec<u8> {
+    use crate::doc_parts::PartKind;
+    let mut out = Vec::new();
+    for p in &parts.parts {
+        out.push(match p.kind {
+            PartKind::Doc => 0,
+            PartKind::Node => 1,
+            PartKind::Chunk => 2,
+        });
+        out.extend_from_slice(
+            &u32::try_from(p.body.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&p.body);
+    }
+    out
+}
+
+/// ファズの対象（`fuzz/` と `tests/fuzz_smoke.rs` の `doc_parts`）：文書の部品（`doc_parts`。DB から読み直すときの外の本文）。
+/// - `{` で始まる入力は文書の JSON として読み、読めたら部品に分けてつなぎ直すと文書の正規の JSON に戻り、分け直しても同じ根に
+///   なること。
+/// - ほかは [`fuzz_doc_parts_input`] の形の部品の組として読み（ダイジェストは本文から求める。根は最後の部品）、つなぐ。
+///   つなげたら上限に収まり、それが文書として読めて正規の形のままなら、分け直すと同じ根になること（同じ文書は同じ根）。
+///
+/// 見つけたい不具合（自前のコードの panic・`Internal`・往復しない）は `Err`、壊れた部品・文書としてのエラーと上限は `Ok`。
+pub fn fuzz_doc_parts(data: &[u8]) -> Result<(), String> {
+    use crate::doc_parts::{PartKind, join, part_digest, split};
+    let r = catch_own_panic(|| {
+        let round = |g: &Graph| -> Result<crate::digest::Digest, EngineError> {
+            let parts = split(g)?;
+            let map: BTreeMap<_, _> = parts
+                .parts
+                .iter()
+                .map(|p| (p.digest, (p.kind, p.body.clone())))
+                .collect();
+            let joined = match join(&parts.root, &map) {
+                Ok(joined) => joined,
+                Err(e @ EngineError::Limit(_)) => return Err(e),
+                Err(e) => {
+                    return Err(EngineError::Internal(format!(
+                        "doc_parts：分けた部品をつなげない: {e}"
+                    )));
+                }
+            };
+            if joined != g.to_canonical_json()? {
+                return Err(EngineError::Internal(
+                    "doc_parts：分けてつなぐと元の文書に戻らない".into(),
+                ));
+            }
+            Ok(parts.root)
+        };
+        if data.first() == Some(&b'{') {
+            return match crate::doc::load(data) {
+                Ok(g) => match round(&g) {
+                    Err(EngineError::Limit(_)) => Ok(()),
+                    other => other.map(|_| ()),
+                },
+                Err(_) => Ok(()),
+            };
+        }
+        let mut map = BTreeMap::new();
+        let mut root = None;
+        let mut rest = data;
+        while let [kind, a, b, c, d, tail @ ..] = rest {
+            let len = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
+            let (body, after) = tail.split_at(len.min(tail.len()));
+            rest = after;
+            let kind = match kind {
+                0 => PartKind::Doc,
+                1 => PartKind::Node,
+                2 => PartKind::Chunk,
+                _ => continue,
+            };
+            let digest = part_digest(kind, body);
+            map.insert(digest, (kind, body.to_vec()));
+            root = Some(digest);
+        }
+        let Some(root) = root else {
+            return Ok(());
+        };
+        let bytes = match join(&root, &map) {
+            Ok(bytes) => bytes,
+            Err(EngineError::Internal(m)) => return Err(EngineError::Internal(m)),
+            Err(_) => return Ok(()),
+        };
+        if bytes.len() > crate::doc::MAX_DOC_BYTES {
+            return Err(EngineError::Internal(
+                "doc_parts：つないだ文書が上限を超えた".into(),
+            ));
+        }
+        let Ok(g) = crate::doc::load(&bytes) else {
+            return Ok(());
+        };
+        if g.to_canonical_json()? != bytes {
+            // 移行・既定値で形が変わる文書（古いスキーマ・省いた項目）は、同じ根の約束の外
+            return Ok(());
+        }
+        match round(&g) {
+            Ok(again) if again != root => Err(EngineError::Internal(
+                "doc_parts：つないだ文書を分け直すと別の根になる".into(),
+            )),
+            Ok(_) | Err(EngineError::Limit(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    });
+    match r {
+        Err(at) => Err(format!("doc_parts: 自前のコードの panic（{at}）")),
+        Ok(Err(e @ EngineError::Internal(_))) => Err(e.to_string()),
+        Ok(Err(_)) | Ok(Ok(())) => Ok(()),
+    }
+}
+
 /// ファズの対象：文書の JSON を読み、形を確かめ、エンジン（上限を絞ったもの）で読み込んで、小さな入力（画像・パレットの画像・
 /// フレームの列・音声）で計画を作って描く。見つけたいのは自前のコードの panic と `Internal`（推論と実際の食い違い、
 /// 差分の適用と全体の食い違い、キャッシュの道とキャッシュなしの食い違い・キャッシュの当たりと描き直しの食い違い、

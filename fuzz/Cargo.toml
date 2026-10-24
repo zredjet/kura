@@ -163,3 +163,10 @@ path = "fuzz_targets/model_glb.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "doc_parts"
+path = "fuzz_targets/doc_parts.rs"
+test = false
+doc = false
+bench = false

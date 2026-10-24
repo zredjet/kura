@@ -317,7 +317,8 @@ impl Graph {
 }
 
 impl Node {
-    /// ノードのハッシュ（DB で内容アドレスとして持つとき。M12）。
+    /// ノードのハッシュ（ノードの正規の JSON の `kura-node-v1`）。DB に文書を内容アドレスで置くときの部品のダイジェストは
+    /// これではなく、本文だけから照らせる `doc_parts::part_digest`（M12 の段 2。docs/editing.md §4.4）。
     pub fn digest(&self) -> Result<Digest, EngineError> {
         hash_canonical("kura-node-v1", self)
     }

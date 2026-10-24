@@ -13,6 +13,7 @@ pub mod codec;
 pub mod determinism;
 pub mod digest;
 pub mod doc;
+pub mod doc_parts;
 pub mod error;
 pub mod geom;
 pub mod imaging;
