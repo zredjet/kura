@@ -5,13 +5,16 @@
 //!    フォルダを渡す）。ドット絵の PNG を 1 つ、アプリと同じ取り込みのジョブで入れる。
 //! 2. 回ごとに自分を子として起こす（`edit crash-loop-child`）。子はアプリと同じ渡しもの（MacEngineFactory：物理メモリの予算・
 //!    アプリと同じコーデックの組）でライブラリを開き、保存を繰り返す（ふだんは上書き。版が 2 つ以上あれば 4 回に 1 回は版に
-//!    戻す）。親は ChaCha8 で決めた 10〜500 ms 待ってから SIGKILL する。
-//! 3. 親はライブラリを開き直し（ロック → staging の掃除 → 予告の照合 → 整合性チェック → ジョブの再開）、ジョブが動き終える
-//!    のを待って食い違いを数える：開いたときと終わったあとの整合性（DB にないファイル・ファイルのない台帳の行・参照されない
-//!    台帳の行）、台帳のファイルの中身と hash、版の不変条件（`edit::versions::check_invariants`）、予告の行（`ledger_pending`）、
-//!    staging のファイル、動いている・失敗した保存のジョブ、結果が saved・unchanged なのに版のないジョブ、アイテムの数。
-//! 4. 結果を 1 つの JSON で標準出力に書く（回ごとに、落とした直後の様子 `atCrash`：実行中の保存のジョブ・台帳の予告・
-//!    staging の書きかけの数も。合計はその状態だった回の数）。食い違いがあれば失敗で終わる。子のログは
+//!    戻す）。子だけ GC の時計を 8 日進めるので（`Services::with_gc_clock`。M12 の段 3）、開いたあと・保存のコミットのあとに
+//!    GC が積まれ、置き換えたばかりの版を照合して消す（保存は 2 回に 1 回、GC が動き終えるのを待ってから次を積む。GC は保存に
+//!    譲るので）。親は ChaCha8 で決めた 10〜500 ms 待ってから SIGKILL する。
+//! 3. 親はライブラリを開き直し（ロック → staging の掃除 → 予告の照合 → 整合性チェック → ジョブの再開。親の時計は本物なので
+//!    GC は版を消さない）、ジョブが動き終えるのを待って食い違いを数える：開いたときと終わったあとの整合性（DB にないファイル・
+//!    ファイルのない台帳の行・参照されない台帳の行）、台帳のファイルの中身と hash、版の不変条件（`edit::versions::check_invariants`）、
+//!    予告の行（`ledger_pending`）、staging のファイル、動いている・失敗した保存と GC のジョブ、照合が合わずに残した版（固定の
+//!    段のコーデックなので 0 のはず）、結果が saved・unchanged なのに版のないジョブ、アイテムの数。
+//! 4. 結果を 1 つの JSON で標準出力に書く（回ごとに、落とした直後の様子 `atCrash`：実行中の保存・GC のジョブ・台帳の予告
+//!    （うち 'delete'）・staging の書きかけの数も。合計はその状態だった回の数）。食い違いがあれば失敗で終わる。子のログは
 //!    `<ライブラリ>.crash-loop.log` に足す。
 
 use std::fs::OpenOptions;
@@ -21,7 +24,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kura_core::edit::{Base, SaveAction, SaveRequest, start_save, versions};
+use kura_core::edit::{Base, GcClock, SaveAction, SaveRequest, start_save, versions};
 use kura_core::import::{ImportInput, ImportOptions, hash_file, start_import};
 use kura_core::jobs::JobState;
 use kura_core::library::{IntegrityDepth, Library, LibrarySession, check_integrity};
@@ -37,6 +40,9 @@ const USAGE: &str = "使い方: kura-devtools edit crash-loop --library <新し�
 
 /// 開き直してジョブが動き終えるのを待つ上限。
 const SETTLE: Duration = Duration::from_secs(600);
+
+/// 子の GC の時計を進める長さ（7 日の猶予を過ぎたものとして、置き換えたばかりの版を片付けさせる）。
+const GC_SHIFT_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 
 /// ドット絵の幅・高さ（取り込む PNG と、塗りつぶしの位置の範囲）。
 const W: u32 = 24;
@@ -99,7 +105,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let span = opts.max_ms - opts.min_ms + 1;
     let mut runs = Vec::new();
     let mut mismatches = 0usize;
-    let mut failed_before = 0i64;
+    let mut failed_before = (0i64, 0i64);
     let mut early = 0u32;
     let mut at_crash = AtCrash::default();
     for run in 0..opts.runs {
@@ -116,7 +122,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         if let Some(status) = &exited_early {
             issues.push(format!("子が落とす前に終わりました（{status}）"));
         }
-        failed_before = check.failed_edit_jobs;
+        failed_before = (check.failed_edit_jobs, check.failed_gc_jobs);
         mismatches += issues.len();
         tracing::info!(
             run,
@@ -131,7 +137,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "childSeed": child_seed,
             "atCrash": at.json(),
             "versions": check.versions,
+            "releasedVersions": check.released_versions,
             "editJobsDone": check.done_edit_jobs,
+            "gcJobsDone": check.done_gc_jobs,
             "issues": issues,
         }));
     }
@@ -150,6 +158,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "revertVersions": last.revert_versions,
             "editJobsDone": last.done_edit_jobs,
             "editJobsFailed": last.failed_edit_jobs,
+            "gcJobsDone": last.done_gc_jobs,
+            "gcJobsFailed": last.failed_gc_jobs,
+            "releasedVersions": last.released_versions,
+            "waitingVersions": last.waiting_versions,
+            "keptVersions": last.kept_versions,
             "items": last.items,
         },
         "elapsedMs": started.elapsed().as_millis() as u64,
@@ -172,8 +185,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
 struct AtCrash {
     /// 実行中のまま残った保存のジョブ（保存の途中で落ちた）。
     running_edit: i64,
+    /// 実行中のまま残った GC のジョブ（GC の途中で落ちた）。
+    running_gc: i64,
     /// 台帳の予告の行（予告のあと・コミットの前で落ちた）。
     pending: i64,
+    /// うち 'delete' の予告（GC が台帳から外したあと・ファイルを消して予告を消す前で落ちた）。
+    pending_delete: i64,
     /// staging のファイル（書きかけ。描いて書いたあと・予告・配置の前など）。
     staging: i64,
 }
@@ -181,14 +198,18 @@ struct AtCrash {
 impl AtCrash {
     fn add(&mut self, other: &AtCrash) {
         self.running_edit += i64::from(other.running_edit > 0);
+        self.running_gc += i64::from(other.running_gc > 0);
         self.pending += i64::from(other.pending > 0);
+        self.pending_delete += i64::from(other.pending_delete > 0);
         self.staging += i64::from(other.staging > 0);
     }
 
     fn json(&self) -> Json {
         json!({
             "runningEditJobs": self.running_edit,
+            "runningGcJobs": self.running_gc,
             "ledgerPending": self.pending,
+            "ledgerPendingDelete": self.pending_delete,
             "stagingFiles": self.staging,
         })
     }
@@ -207,7 +228,9 @@ fn probe(root: &Path) -> Result<AtCrash, String> {
     files_under(&root.join("staging"), &mut staging);
     Ok(AtCrash {
         running_edit: count("SELECT count(*) FROM jobs WHERE kind = 'edit' AND state = 'running'")?,
+        running_gc: count("SELECT count(*) FROM jobs WHERE kind = 'gc' AND state = 'running'")?,
         pending: count("SELECT count(*) FROM ledger_pending")?,
+        pending_delete: count("SELECT count(*) FROM ledger_pending WHERE kind = 'delete'")?,
         staging: staging.len() as i64,
     })
 }
@@ -310,15 +333,21 @@ struct Check {
     live_edit_jobs: i64,
     failed_edit_jobs: i64,
     done_edit_jobs: i64,
+    live_gc_jobs: i64,
+    failed_gc_jobs: i64,
+    done_gc_jobs: i64,
     uncommitted: i64,
     versions: i64,
     revert_versions: i64,
+    released_versions: i64,
+    waiting_versions: i64,
+    kept_versions: i64,
     items: i64,
 }
 
 impl Check {
-    /// 食い違いの文（`failed_before` は前の回までに失敗した保存のジョブの数）。
-    fn issues(&self, failed_before: i64) -> Vec<String> {
+    /// 食い違いの文（`failed_before` は前の回までに失敗した保存・GC のジョブの数）。
+    fn issues(&self, failed_before: (i64, i64)) -> Vec<String> {
         let mut out = Vec::new();
         for (when, [missing, orphan, unreferenced]) in
             [("開いたとき", self.open), ("終わったあと", self.after)]
@@ -341,10 +370,28 @@ impl Check {
                 self.live_edit_jobs
             ));
         }
-        if self.failed_edit_jobs > failed_before {
+        if self.failed_edit_jobs > failed_before.0 {
             out.push(format!(
                 "失敗した保存のジョブが {} 本増えました",
-                self.failed_edit_jobs - failed_before
+                self.failed_edit_jobs - failed_before.0
+            ));
+        }
+        if self.live_gc_jobs != 0 {
+            out.push(format!(
+                "動き終えていない GC のジョブが {} 本",
+                self.live_gc_jobs
+            ));
+        }
+        if self.failed_gc_jobs > failed_before.1 {
+            out.push(format!(
+                "失敗した GC のジョブが {} 本増えました",
+                self.failed_gc_jobs - failed_before.1
+            ));
+        }
+        if self.kept_versions != 0 {
+            out.push(format!(
+                "照合が合わずに残した版が {} 個（固定の段のコーデックなので 0 のはず）",
+                self.kept_versions
             ));
         }
         if self.uncommitted != 0 {
@@ -446,6 +493,18 @@ fn verify(root: &Path) -> Result<Check, String> {
             lib,
             "SELECT count(*) FROM jobs WHERE kind = 'edit' AND state = 'done'",
         )?,
+        live_gc_jobs: count(
+            lib,
+            "SELECT count(*) FROM jobs WHERE kind = 'gc' AND state NOT IN ('done', 'failed', 'canceled')",
+        )?,
+        failed_gc_jobs: count(
+            lib,
+            "SELECT count(*) FROM jobs WHERE kind = 'gc' AND state = 'failed'",
+        )?,
+        done_gc_jobs: count(
+            lib,
+            "SELECT count(*) FROM jobs WHERE kind = 'gc' AND state = 'done'",
+        )?,
         uncommitted: count(
             lib,
             "SELECT count(*) FROM jobs j WHERE j.kind = 'edit' AND j.state = 'done'
@@ -456,6 +515,18 @@ fn verify(root: &Path) -> Result<Check, String> {
         revert_versions: count(
             lib,
             "SELECT count(*) FROM item_versions WHERE kind = 'revert'",
+        )?,
+        released_versions: count(
+            lib,
+            "SELECT count(*) FROM item_versions WHERE file_state = 'released'",
+        )?,
+        waiting_versions: count(
+            lib,
+            "SELECT count(*) FROM item_versions WHERE file_state = 'waiting'",
+        )?,
+        kept_versions: count(
+            lib,
+            "SELECT count(*) FROM item_versions WHERE file_state = 'kept'",
         )?,
         items: count(lib, "SELECT count(*) FROM items")?,
     };
@@ -495,7 +566,7 @@ fn random_doc(rng: &mut ChaCha8Rng) -> Result<Graph, String> {
     Ok(g)
 }
 
-/// `edit crash-loop-child`（子）：保存を繰り返す（親が SIGKILL するまで）。
+/// `edit crash-loop-child`（子）：保存を繰り返す（親が SIGKILL するまで）。GC の時計だけ 8 日進めて開く。
 pub fn child(args: &[String]) -> Result<(), String> {
     let mut library = None;
     let mut seed = 0u64;
@@ -513,7 +584,8 @@ pub fn child(args: &[String]) -> Result<(), String> {
         }
     }
     let library = library.ok_or("--library がありません")?;
-    let session = LibrarySession::open(&library, quiet(), crate::services())
+    let services = crate::services().with_gc_clock(GcClock::shifted(GC_SHIFT_MS));
+    let session = LibrarySession::open(&library, quiet(), services)
         .map_err(|e| format!("開けません: {e}"))?;
     session.wait_ready();
     let lib = session.library().clone();
@@ -560,6 +632,19 @@ pub fn child(args: &[String]) -> Result<(), String> {
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
+        }
+        // 2 回に 1 回は、保存のコミットのあとに積まれた GC が動き終えるのを待つ（GC は保存に譲るので、続けて保存を積むと
+        // 動けない）
+        if rng.next_u32().is_multiple_of(2) {
+            let until = Instant::now() + Duration::from_secs(5);
+            while count(
+                &lib,
+                "SELECT count(*) FROM jobs WHERE kind = 'gc' AND state IN ('queued', 'running')",
+            )? > 0
+                && Instant::now() < until
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
     }
 }
