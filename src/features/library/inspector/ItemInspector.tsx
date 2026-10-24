@@ -15,6 +15,7 @@ import { dateTimeLabel } from '../../../lib/dates';
 import { shortHash } from '../../../lib/format';
 import { useViewStore } from '../../../stores/viewStore';
 import { AssetSection } from '../../asset/AssetSection';
+import { canEdit, openEditor } from '../../editor/editorStore';
 import { useAssetStage } from '../../asset/AssetStage';
 import { useAssetData } from '../../asset/useAssetData';
 import { TagChips } from '../../tags/TagChips';
@@ -40,8 +41,11 @@ const t = ja.inspector;
 /** T キーで移るタグの入力欄の印。 */
 export const TAG_FOCUS_KEY = 'inspector-tags';
 
-/** 1 件のアイテムの詳細と編集（Main.dc.html のインスペクタ）。 */
-export function ItemInspector({ id }: { id: number }) {
+/**
+ * 1 件のアイテムの詳細と編集（Main.dc.html のインスペクタ）。画像なら見出しの下に「編集…」（画像エディタ。M12。
+ * エディタの右パネルの中では出さない：`editable` が偽）。
+ */
+export function ItemInspector({ id, editable = true }: { id: number; editable?: boolean }) {
   const detail = useLoaded(`item-${id}`, () => getItemDetail(id));
   const openUnit = useViewStore((s) => s.openUnit);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -92,6 +96,11 @@ export function ItemInspector({ id }: { id: number }) {
             starLabel={t.setRating}
             onChange={(rating) => void setRating([id], rating)}
           />
+        )}
+        {editable && !trashed && canEdit(item) && (
+          <Button size="sm" className={styles.editButton} onClick={() => void openEditor(item)}>
+            {ja.itemMenu.edit}
+          </Button>
         )}
       </div>
 

@@ -10,6 +10,7 @@ import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { LAYOUT_MODES, useViewStore } from '../../stores/viewStore';
 import { toggleAuditionKey } from '../asset/auditionStore';
+import { canEdit, openEditor } from '../editor/editorStore';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
 import {
@@ -37,12 +38,17 @@ function isTyping(target: EventTarget | null): boolean {
   );
 }
 
-/** シート（ダイアログ）・メニュー・シアターが開いているか。 */
+/** シート（ダイアログ）・メニュー・シアター・画像エディタが開いているか。 */
 function isBlocked(): boolean {
-  return document.querySelector('[data-sheet], [role="menu"], [data-theater]') !== null;
+  return (
+    document.querySelector('[data-sheet], [role="menu"], [data-theater], [data-editor]') !== null
+  );
 }
 
-/** ライブラリのキー操作を受け付けるか（取り込みのシート・入力欄・ダイアログ・メニュー・シアターの上では受け付けない）。 */
+/**
+ * ライブラリのキー操作を受け付けるか（取り込みのシート・入力欄・ダイアログ・メニュー・シアター・画像エディタの上では
+ * 受け付けない）。
+ */
 function acceptsKeys(target: EventTarget | null): boolean {
   return useImportStore.getState().phase === 'idle' && !isTyping(target) && !isBlocked();
 }
@@ -104,6 +110,15 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
       playSelection(entries);
     } else if (key === 'e' && e.shiftKey) {
       void exportEntries(entries);
+    } else if (key === 'e' && !e.altKey) {
+      // 画像エディタ（M12）：画像 1 件のときだけ（ゴミ箱の中・ユニットでは開かない）
+      const only = entries.length === 1 ? entries[0] : undefined;
+      const item =
+        only !== undefined && !isUnitEntry(only) && kind !== 'trash' ? getCached(only) : undefined;
+      if (!item || !canEdit(item)) {
+        return false;
+      }
+      void openEditor(item);
     } else if (key === 'g' && e.shiftKey) {
       void dissolveUnits(entries);
     } else if (key === 'g' && entries.length > 0 && kind !== 'trash') {

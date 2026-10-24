@@ -15,6 +15,7 @@ import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemC
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
 import { FontSpecimen, QuickLookAnim, useFontFace } from '../asset/AssetStage';
+import { canEdit, openEditor } from '../editor/editorStore';
 import { useAssetData } from '../asset/useAssetData';
 import { loopOf } from '../asset/useLoopRange';
 import { WaveformView } from '../asset/WaveformView';
@@ -29,6 +30,7 @@ export function QuickLook() {
   const select = useViewStore((s) => s.select);
   const setQuickLook = useViewStore((s) => s.setQuickLook);
   const ids = useLibraryStore((s) => s.list?.ids);
+  const trashView = useViewStore((s) => s.view.kind === 'trash');
   useItemCacheVersion((s) => s.version);
   const titleId = useId();
 
@@ -77,6 +79,17 @@ export function QuickLook() {
         <span className={styles.position}>
           {t.position(formatCount(index + 1), formatCount(ids.length))}
         </span>
+        {item && canEdit(item) && !trashView && (
+          // 画像エディタ（M12）：画像 1 件のときだけ。閉じるとクイックルックに戻る
+          <button
+            type="button"
+            className={styles.edit}
+            title={`${t.edit}（⌘E）`}
+            onClick={() => void openEditor(item)}
+          >
+            {t.edit}
+          </button>
+        )}
         <button
           type="button"
           className={styles.close}

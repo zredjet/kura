@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 
 import { setRating } from '../library/actions';
 import { IMAGE_STEP_MS } from './PlayBar';
+import { canEdit, openEditor } from '../editor/editorStore';
 import { cycleRepeat, playerController, toggleFullscreen, toggleShuffle } from './playerActions';
 import { usePlayerStore } from './playerStore';
 
@@ -13,9 +14,22 @@ function isTyping(target: EventTarget | null): boolean {
   );
 }
 
-/** シアターの上にダイアログやメニューが開いているか。 */
+/** シアターの上にダイアログ・メニュー・画像エディタが開いているか。 */
 function isBlocked(): boolean {
-  return document.querySelector('[data-sheet], [role="menu"]') !== null;
+  return document.querySelector('[data-sheet], [role="menu"], [data-editor]') !== null;
+}
+
+/** シアターで今出している画像を画像エディタで開く（再生は一時停止する）。画像でなければ false。 */
+export function editCurrentImage(): boolean {
+  const controller = playerController();
+  const itemId = usePlayerStore.getState().snapshot.itemId;
+  const item = itemId !== null ? controller.item(itemId) : undefined;
+  if (!item || !canEdit(item)) {
+    return false;
+  }
+  controller.pause();
+  void openEditor(item);
+  return true;
 }
 
 /** シアターのキー操作（docs/playlists.md §6.3、design.md §6）。処理したら true。 */
@@ -36,6 +50,10 @@ export function handlePlayerKey(e: KeyboardEvent): boolean {
     if (key === 'i' && !e.shiftKey) {
       store.togglePanel('info');
       return true;
+    }
+    if (key === 'e' && !e.shiftKey && !e.altKey) {
+      // 画像エディタ（M12）：今の画像を開く（スライドショーは止める）
+      return editCurrentImage();
     }
     return false;
   }

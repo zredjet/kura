@@ -9,8 +9,13 @@ import { setVerticalNavigator } from './navigation';
 import { EMPTY_SELECTION, selectOne } from './selection';
 import { handleLibraryKey } from './useLibraryKeys';
 import { toggleAuditionKey } from '../asset/auditionStore';
+import { openEditor } from '../editor/editorStore';
 
 vi.mock('../asset/auditionStore', () => ({ toggleAuditionKey: vi.fn(() => true) }));
+vi.mock('../editor/editorStore', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../editor/editorStore')>()),
+  openEditor: vi.fn(async () => undefined),
+}));
 vi.mock('../../stores/itemCache', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../stores/itemCache')>()),
   getCached: vi.fn(),
@@ -124,5 +129,52 @@ describe('handleLibraryKey（L：ループを試聴。M11）', () => {
     ).toBe(false);
     input.remove();
     expect(toggle).not.toHaveBeenCalled();
+  });
+});
+
+// design.md §3.1：⌘E で画像エディタ（M12。画像 1 件のときだけ）
+describe('handleLibraryKey（⌘E：編集…。M12）', () => {
+  const cached = vi.mocked(getCached);
+  const open = vi.mocked(openEditor);
+
+  beforeEach(() => {
+    useLibraryStore.setState({
+      status: 'open',
+      list: { ids: Uint32Array.from([10, 20]), aspects: new Uint16Array(2), groups: [] },
+    });
+    useImportStore.setState({ phase: 'idle' });
+    useViewStore.setState({ selection: selectOne(10), playlist: null, view: { kind: 'all' } });
+    open.mockClear();
+    cached.mockReset();
+    cached.mockImplementation(
+      (id) => ({ id, kind: id === 20 ? 'audio' : 'image' }) as ItemSummaryDto,
+    );
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+  });
+
+  it('画像 1 件を選んでいれば開く', () => {
+    expect(press({ key: 'e', code: 'KeyE', metaKey: true })).toBe(true);
+    expect(open).toHaveBeenCalledWith(expect.objectContaining({ id: 10 }));
+  });
+
+  it('画像でない・複数・ゴミ箱の中では開かない', () => {
+    useViewStore.setState({ selection: selectOne(20) });
+    expect(press({ key: 'e', code: 'KeyE', metaKey: true })).toBe(false);
+    useViewStore.setState({ selection: { ids: [10, 20], anchor: 10, focus: 20 } });
+    expect(press({ key: 'e', code: 'KeyE', metaKey: true })).toBe(false);
+    useViewStore.setState({ selection: selectOne(10), view: { kind: 'trash' } });
+    expect(press({ key: 'e', code: 'KeyE', metaKey: true })).toBe(false);
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it('画像エディタを開いている間は、ライブラリのキーを受けない', () => {
+    const editor = document.createElement('div');
+    editor.setAttribute('data-editor', '');
+    document.body.append(editor);
+    expect(press({ key: '1', code: 'Digit1', metaKey: true })).toBe(false);
+    expect(press({ key: 'e', code: 'KeyE', metaKey: true })).toBe(false);
   });
 });

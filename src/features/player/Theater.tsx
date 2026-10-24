@@ -30,7 +30,7 @@ import { usePlayerStore } from './playerStore';
 import { SidePanel } from './SidePanel';
 import { canHideControls, HIDE_AFTER_MS, hoverTracker } from './theaterChrome';
 import styles from './Theater.module.css';
-import { usePlayerKeys } from './usePlayerKeys';
+import { editCurrentImage, usePlayerKeys } from './usePlayerKeys';
 
 const t = ja.player;
 
@@ -158,6 +158,8 @@ function TopBar({ chrome }: { chrome: ChromeProps }) {
   const togglePanel = usePlayerStore((s) => s.togglePanel);
   const requestTagFocus = usePlayerStore((s) => s.requestTagFocus);
   const setMode = usePlayerStore((s) => s.setMode);
+  // 画像エディタ（M12）：今出しているのが画像のときだけ
+  const editable = snapshot.kind === 'image' && snapshot.itemId !== null;
 
   return (
     <div className={styles.top} data-tauri-drag-region {...chrome}>
@@ -187,6 +189,16 @@ function TopBar({ chrome }: { chrome: ChromeProps }) {
             .join(' · ')}
         </span>
       </div>
+      {editable && (
+        <button
+          type="button"
+          className={styles.edit}
+          title={`${ja.editor.edit}（⌘E）`}
+          onClick={() => editCurrentImage()}
+        >
+          {ja.editor.edit}
+        </button>
+      )}
       <button
         type="button"
         className={styles.back}

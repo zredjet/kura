@@ -1,8 +1,9 @@
 import type { MenuEntry } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry, unitIdOf } from '../../ipc/items';
-import { getCachedUnit } from '../../stores/itemCache';
+import { getCached, getCachedUnit } from '../../stores/itemCache';
 import { useViewStore } from '../../stores/viewStore';
+import { canEdit, openEditor } from '../editor/editorStore';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
 import { exportEntries } from './exportActions';
@@ -66,6 +67,11 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
       shortcut: 'Space',
       onSelect: () => state.setQuickLook(true),
     });
+    // 画像エディタ（M12）：画像 1 件のときだけ
+    const item = getCached(only);
+    if (item && canEdit(item)) {
+      out.push({ label: ja.itemMenu.edit, shortcut: '⌘E', onSelect: () => void openEditor(item) });
+    }
   }
   if (only !== undefined && units.length === 1) {
     out.push({

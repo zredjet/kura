@@ -14,6 +14,24 @@ vi.mock('./playerActions', () => ({
 const press = (key: string) =>
   handlePlayerKey(new KeyboardEvent('keydown', { key, cancelable: true }));
 
+describe('handlePlayerKey（画像エディタ。M12）', () => {
+  it('画像エディタを開いている間はシアターのキーを受けない（エディタが先に受ける）', () => {
+    usePlayerStore.setState({ mode: 'theater', fullscreen: false });
+    const editor = document.createElement('div');
+    editor.setAttribute('data-editor', '');
+    document.body.append(editor);
+    expect(press('f')).toBe(false);
+    expect(press('Escape')).toBe(false);
+    editor.remove();
+    expect(usePlayerStore.getState().mode).toBe('theater');
+  });
+
+  it('⌘E は今の画像でなければ扱わない', () => {
+    usePlayerStore.setState({ snapshot: { ...usePlayerStore.getState().snapshot, itemId: null } });
+    expect(handlePlayerKey(new KeyboardEvent('keydown', { key: 'e', metaKey: true }))).toBe(false);
+  });
+});
+
 describe('handlePlayerKey（フルスクリーン。ADR-128）', () => {
   beforeEach(() => {
     vi.mocked(toggleFullscreen).mockClear();

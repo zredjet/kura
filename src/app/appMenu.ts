@@ -6,10 +6,13 @@ import {
   MenuItem,
   type MenuItemOptions,
   type MenuOptions,
+  PredefinedMenuItem,
+  type PredefinedMenuItemOptions,
   Submenu,
   type SubmenuOptions,
 } from '@tauri-apps/api/menu';
 
+import { useEditorStore } from '../features/editor/editorStore';
 import {
   applyPixelArtToSelection,
   PIXEL_ART_CHOICES,
@@ -47,6 +50,8 @@ export type MenuCommandId = 'newPlaylist' | 'collapseUnits' | 'settings';
 /** メニューの項目を押したときにすること。 */
 export type MenuAction =
   | { kind: 'selectAll' }
+  /** 編集 › 取り消す・やり直す（M12。入力欄では文字の取り消し、ほかはエディタへ ⌘Z・⇧⌘Z を押したことにする）。 */
+  | { kind: 'history'; redo: boolean }
   | { kind: 'key'; spec: KeySpec }
   | { kind: 'command'; id: MenuCommandId }
   /** 項目 › ドット絵として表示 ▸：一覧で選んでいる画像に当てる（キーがないので、キーを押したことにはしない）。 */
@@ -72,6 +77,12 @@ export type PixelArtOptions = Omit<SubmenuOptions, 'items'> & {
   id: string;
   items: CheckMenuItemOptions[];
 };
+
+/** 編集メニューの「取り消す」「やり直す」（自前の項目。押せるかは `historySyncer` が合わせる）。 */
+export interface HistoryItems {
+  undo: MenuItemOptions | MenuItem;
+  redo: MenuItemOptions | MenuItem;
+}
 
 /** ⌘ などの付いたキーを Tauri のアクセラレータの書き方にする。修飾キーがなければ undefined（文字の入力を奪わない）。 */
 export function acceleratorOf(spec: KeySpec): string | undefined {
@@ -143,6 +154,70 @@ export function viewItemOptions(
 }
 
 /**
+ * 編集メニューの「取り消す」（⌘Z）・「やり直す」（⇧⌘Z）。既定の項目（undo:・redo:）は WebView の文字の取り消しにしか
+ * 届かず画像エディタへ渡せないので、⌘A（ADR-76）と同じく自前の項目にする（M12。FR-EDIT-06）。
+ */
+export function historyItemOptions(run: RunMenuAction): {
+  undo: MenuItemOptions;
+  redo: MenuItemOptions;
+} {
+  const t = ja.appMenu;
+  return {
+    undo: {
+      text: t.undo,
+      accelerator: 'CmdOrCtrl+Z',
+      action: () => run({ kind: 'history', redo: false }),
+    },
+    redo: {
+      text: t.redo,
+      accelerator: 'CmdOrCtrl+Shift+Z',
+      action: () => run({ kind: 'history', redo: true }),
+    },
+  };
+}
+
+/** 表示メニューの中身（ライブラリ）。 */
+export function libraryViewItems(run: RunMenuAction, view: ViewItems): MenuItems {
+  const t = ja.appMenu;
+  return [
+    view.layouts.justify,
+    view.layouts.grid,
+    view.layouts.list,
+    { item: 'Separator' },
+    keyItem(run, t.bigger, { key: '=', code: 'Equal', ...META }),
+    keyItem(run, t.smaller, { key: '-', code: 'Minus', ...META }),
+    { item: 'Separator' },
+    view.collapseUnits,
+    { item: 'Separator' },
+    view.sidebar,
+    keyItem(run, t.inspector, { key: 'i', code: 'KeyI', ...META }),
+    { item: 'Separator' },
+    { item: 'Fullscreen', text: t.fullscreen },
+  ];
+}
+
+/**
+ * 表示メニューの中身（画像エディタを開いている間。M12）：⌘0 全体を表示・⌘1 実際のサイズ（100%）・⌘+ 拡大・⌘− 縮小・
+ * ⌘I 情報。ライブラリの表示形式（⌘1〜⌘3）・サムネイルの大きさ（⌘+・⌘−）と重なるので、開いている間は差し替える。
+ * どれもそのキーを押したことにする（エディタのキーの処理が受ける）。
+ */
+export function editorViewItemOptions(
+  run: RunMenuAction,
+): (MenuItemOptions | PredefinedMenuItemOptions)[] {
+  const t = ja.appMenu;
+  return [
+    keyItem(run, t.editorFit, { key: '0', code: 'Digit0', ...META }),
+    keyItem(run, t.editorActualSize, { key: '1', code: 'Digit1', ...META }),
+    keyItem(run, t.editorZoomIn, { key: '=', code: 'Equal', ...META }),
+    keyItem(run, t.editorZoomOut, { key: '-', code: 'Minus', ...META }),
+    { item: 'Separator' },
+    keyItem(run, t.editorInfo, { key: 'i', code: 'KeyI', ...META }),
+    { item: 'Separator' },
+    { item: 'Fullscreen', text: t.fullscreen },
+  ];
+}
+
+/**
  * 項目メニューの「ドット絵として表示 ▸ 自動・はい・いいえ」の中身（design.md §3.1・§6。M11）。右クリックの同じ項目と同じく、
  * 一覧で選んでいる画像に当てる。画像を選んでいなければ ▸ ごと無効。ID は読み込み直しても前のメニューの片付けと
  * 重ならないよう毎回変える。
@@ -167,13 +242,17 @@ export function pixelArtItemOptions(
 
 /**
  * メニューバーの中身。Tauri の既定のメニューと同じ項目を日本語で並べ、Kura の操作を足す（design.md §6）。
- * - 「すべてを選択」は既定の項目（`selectAll:`）をやめて自前の項目にする（ADR-76）。
+ * - 「すべてを選択」は既定の項目（`selectAll:`）をやめて自前の項目にする（ADR-76）。「取り消す」「やり直す」も自前
+ *   （M12。`historyItemOptions`）。
  * - Kura の操作は、そのキーを押したことにする（`run` の `key`）。キーの処理と同じ場所で、同じ条件で動く。
+ * - 表示メニューは、画像エディタを開いている間だけ中身を差し替える（`viewMenu` を渡せばその Submenu を置く）。
  */
 export function appMenuItems(
   run: RunMenuAction,
   view: ViewItems,
   pixelArt: SubmenuOptions | Submenu,
+  history: HistoryItems = historyItemOptions(run),
+  viewMenu?: Submenu,
 ): MenuItems {
   const t = ja.appMenu;
   const app = ja.app.name;
@@ -212,8 +291,8 @@ export function appMenuItems(
     {
       text: t.edit,
       items: [
-        { item: 'Undo', text: t.undo },
-        { item: 'Redo', text: t.redo },
+        history.undo,
+        history.redo,
         { item: 'Separator' },
         { item: 'Cut', text: t.cut },
         { item: 'Copy', text: t.copy },
@@ -230,29 +309,13 @@ export function appMenuItems(
         keyItem(run, t.addToPlaylist, { key: 'p', code: 'KeyP' }, 'P'),
       ],
     },
-    {
-      text: t.view,
-      items: [
-        view.layouts.justify,
-        view.layouts.grid,
-        view.layouts.list,
-        { item: 'Separator' },
-        keyItem(run, t.bigger, { key: '=', code: 'Equal', ...META }),
-        keyItem(run, t.smaller, { key: '-', code: 'Minus', ...META }),
-        { item: 'Separator' },
-        view.collapseUnits,
-        { item: 'Separator' },
-        view.sidebar,
-        keyItem(run, t.inspector, { key: 'i', code: 'KeyI', ...META }),
-        { item: 'Separator' },
-        { item: 'Fullscreen', text: t.fullscreen },
-      ],
-    },
+    viewMenu ?? { text: t.view, items: libraryViewItems(run, view) },
     {
       text: t.items,
       items: [
         keyItem(run, t.play, { key: 'Enter', code: 'Enter', ...META }),
         keyItem(run, t.quickLook, { key: ' ', code: 'Space' }, 'Space'),
+        keyItem(run, t.editItem, { key: 'e', code: 'KeyE', ...META }),
         keyItem(run, ja.asset.menuAudition, { key: 'l', code: 'KeyL' }, 'L'),
         { item: 'Separator' },
         keyItem(run, t.group, { key: 'g', code: 'KeyG', ...META }),
@@ -308,6 +371,65 @@ export function selectAllText(target: Element | null): boolean {
   return false;
 }
 
+/** 文字を編集する所（入力欄・テキストエリア・contenteditable）か。 */
+export function isTextTarget(target: Element | null): boolean {
+  return (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    (target instanceof HTMLElement && target.isContentEditable)
+  );
+}
+
+/**
+ * 「取り消す」（⌘Z）・「やり直す」（⇧⌘Z）：入力欄にフォーカスがあれば文字の取り消し、なければ ⌘Z・⇧⌘Z を押したことに
+ * する（画像エディタのキーの処理が受ける。エディタの外では何も受けない：ADR-117）。
+ */
+export function historyCommand(
+  redo: boolean,
+  target: Element | null = document.activeElement,
+): void {
+  if (isTextTarget(target)) {
+    document.execCommand(redo ? 'redo' : 'undo');
+    return;
+  }
+  replayKey({ key: 'z', code: 'KeyZ', meta: true, shift: redo }, target);
+}
+
+/** 「取り消す」「やり直す」を押せるか。 */
+export interface HistoryState {
+  undo: boolean;
+  redo: boolean;
+}
+
+/**
+ * 「取り消す」「やり直す」を押せるか：エディタの外・入力欄の中は押せる（文字の取り消し）。エディタの中は、取り消せる・
+ * やり直せる手があるときだけ（Rust の `status.canUndo`・`canRedo`）。
+ */
+export function historyMenuState(target: Element | null = document.activeElement): HistoryState {
+  const s = useEditorStore.getState();
+  if (s.phase === 'closed' || isTextTarget(target)) {
+    return { undo: true, redo: true };
+  }
+  return { undo: s.status?.canUndo ?? false, redo: s.status?.canRedo ?? false };
+}
+
+/** 「取り消す」「やり直す」を今の状態に合わせる関数を作る（変わっていなければ何もしない）。 */
+export function historySyncer(
+  items: { undo: Pick<MenuItem, 'setEnabled'>; redo: Pick<MenuItem, 'setEnabled'> },
+  read: () => HistoryState = historyMenuState,
+): () => void {
+  let last: HistoryState | null = null;
+  return () => {
+    const state = read();
+    if (last && last.undo === state.undo && last.redo === state.redo) {
+      return;
+    }
+    last = state;
+    void items.undo.setEnabled(state.undo);
+    void items.redo.setEnabled(state.redo);
+  };
+}
+
 /** 「すべてを選択」（⌘A）：入力欄にフォーカスがあればその文字を、なければ一覧のすべてを選ぶ（design.md §6）。 */
 export function selectAllCommand(target: Element | null = document.activeElement): void {
   if (!selectAllText(target)) {
@@ -338,6 +460,8 @@ export function replayKey(spec: KeySpec, target: Element | null = document.activ
 export function runMenuAction(action: MenuAction): void {
   if (action.kind === 'selectAll') {
     selectAllCommand();
+  } else if (action.kind === 'history') {
+    historyCommand(action.redo);
   } else if (action.kind === 'key') {
     replayKey(action.spec);
   } else if (action.kind === 'pixelArt') {
@@ -386,6 +510,30 @@ export function pixelArtSyncer(
       void item.setChecked(state.current === PIXEL_ART_CHOICES[i]);
     });
   };
+}
+
+/** 出し入れする項目の実体。 */
+type MenuObject = Submenu | MenuItem | PredefinedMenuItem | CheckMenuItem;
+
+/** 項目の中身（オプション）を、Submenu に出し入れできる項目の実体にする（実体はそのまま）。 */
+async function toMenuObjects(items: MenuItems): Promise<MenuObject[]> {
+  const out: MenuObject[] = [];
+  for (const item of items) {
+    if (
+      item instanceof MenuItem ||
+      item instanceof CheckMenuItem ||
+      item instanceof Submenu ||
+      item instanceof PredefinedMenuItem
+    ) {
+      out.push(item);
+    } else if ('item' in item) {
+      out.push(await PredefinedMenuItem.new(item));
+    } else if (!('items' in item) && !('checked' in item) && !('icon' in item)) {
+      // 表示メニューの中身は、実体・区切りなどの既定の項目・ふつうの項目だけ
+      out.push(await MenuItem.new(item as MenuItemOptions));
+    }
+  }
+  return out;
 }
 
 /** メニューバーを差し替える。Tauri の外（ブラウザでの確認など）では何もしない。 */
@@ -442,8 +590,46 @@ export async function installAppMenu(): Promise<void> {
     const choices = await Promise.all(pixelOptions.items.map((item) => CheckMenuItem.new(item)));
     const pixelArt = await Submenu.new({ ...pixelOptions, items: choices });
     syncPixelArt = pixelArtSyncer({ submenu: pixelArt, choices }, pixelState);
-    const menu = await Menu.new({ items: appMenuItems(run, view, pixelArt) });
+    const historyOptions = historyItemOptions(run);
+    const history = {
+      undo: await MenuItem.new(historyOptions.undo),
+      redo: await MenuItem.new(historyOptions.redo),
+    };
+    const libraryView = await toMenuObjects(libraryViewItems(run, view));
+    const editorView = await toMenuObjects(editorViewItemOptions(run));
+    const viewMenu = await Submenu.new({ text: ja.appMenu.view, items: libraryView });
+    const menu = await Menu.new({ items: appMenuItems(run, view, pixelArt, history, viewMenu) });
     await menu.setAsAppMenu();
+    const syncHistory = historySyncer(history);
+    syncHistory();
+    // 画像エディタを開いている間は表示メニューを差し替える（順に。開く・閉じるが続いても最後の状態になる）
+    let editorShown = false;
+    let swapping = Promise.resolve();
+    const swapView = (editor: boolean) => {
+      if (editor === editorShown) {
+        return;
+      }
+      editorShown = editor;
+      swapping = swapping
+        .then(async () => {
+          for (const item of await viewMenu.items()) {
+            await viewMenu.remove(item);
+          }
+          await viewMenu.append(editor ? editorView : libraryView);
+        })
+        .catch((error: unknown) => console.warn('表示のメニューを替えられませんでした', error));
+    };
+    useEditorStore.subscribe((now, before) => {
+      if ((now.phase === 'closed') !== (before.phase === 'closed')) {
+        swapView(now.phase !== 'closed');
+      }
+      if (now.phase !== before.phase || now.status !== before.status) {
+        syncHistory();
+      }
+    });
+    // 入力欄に入った・出たら（入力欄の中は文字の取り消しなので押せる）
+    document.addEventListener('focusin', syncHistory);
+    document.addEventListener('focusout', () => setTimeout(syncHistory, 0));
     useViewStore.subscribe((now, before) => {
       if (
         now.layout !== before.layout ||

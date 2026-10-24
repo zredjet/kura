@@ -2,6 +2,7 @@ import type {
   CheckMenuItemOptions,
   MenuItemOptions,
   PredefinedMenuItemOptions,
+  Submenu,
   SubmenuOptions,
 } from '@tauri-apps/api/menu';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -19,6 +20,11 @@ import {
   WINDOW_MENU_ID,
   acceleratorOf,
   appMenuItems,
+  editorViewItemOptions,
+  historyCommand,
+  historyMenuState,
+  historySyncer,
+  libraryViewItems,
   pixelArtItemOptions,
   type PixelArtState,
   pixelArtSyncer,
@@ -27,6 +33,7 @@ import {
   selectAllCommand,
   viewItemOptions,
 } from './appMenu';
+import { useEditorStore } from '../features/editor/editorStore';
 
 vi.mock('../features/library/pixelArtMenu', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../features/library/pixelArtMenu')>()),
@@ -76,10 +83,74 @@ describe('appMenuItems', () => {
   it('既定の「すべてを選択」（selectAll:）はどこにも置かない', () => {
     const all = items().flatMap((m) => ('items' in m ? ((m.items ?? []) as Item[]) : [m]));
     expect(all.some((i) => 'item' in i && i.item === 'SelectAll')).toBe(false);
-    // 文字の編集に要る項目は既定のまま
-    for (const kind of ['Undo', 'Redo', 'Cut', 'Copy', 'Paste'] as const) {
+    // 文字の編集に要る項目は既定のまま（取り消す・やり直すは M12 から自前）
+    for (const kind of ['Cut', 'Copy', 'Paste'] as const) {
       expect(all.some((i) => 'item' in i && i.item === kind)).toBe(true);
     }
+    for (const kind of ['Undo', 'Redo'] as const) {
+      expect(all.some((i) => 'item' in i && i.item === kind)).toBe(false);
+    }
+  });
+
+  it('編集の「取り消す」「やり直す」は ⌘Z・⇧⌘Z の自前の項目で、押すと history を呼ぶ（M12）', () => {
+    const run = vi.fn();
+    const edit = submenu(ja.appMenu.edit, run);
+    const undo = entry(edit, ja.appMenu.undo);
+    const redo = entry(edit, ja.appMenu.redo);
+    expect(undo.accelerator).toBe('CmdOrCtrl+Z');
+    expect(redo.accelerator).toBe('CmdOrCtrl+Shift+Z');
+    undo.action?.('');
+    redo.action?.('');
+    expect(run).toHaveBeenNthCalledWith(1, { kind: 'history', redo: false });
+    expect(run).toHaveBeenNthCalledWith(2, { kind: 'history', redo: true });
+    // 並びは既定のメニューと同じく編集の先頭
+    expect((edit.items as Item[]).slice(0, 2)).toEqual([undo, redo]);
+  });
+
+  it('項目の「編集…」は ⌘E で、押すと ⌘E を押したことにする（M12）', () => {
+    const run = vi.fn();
+    const edit = entry(submenu(ja.appMenu.items, run), ja.appMenu.editItem);
+    expect(edit.accelerator).toBe('CmdOrCtrl+E');
+    edit.action?.('');
+    expect(run).toHaveBeenCalledWith({ kind: 'key', spec: { key: 'e', code: 'KeyE', meta: true } });
+  });
+
+  it('表示メニューは、エディタの間は ⌘0・⌘1・⌘+・⌘− と情報（M12）', () => {
+    const run = vi.fn();
+    const items = editorViewItemOptions(run) as Item[];
+    const keyed = items.filter((i): i is MenuItemOptions => 'accelerator' in i);
+    expect(keyed.map((i) => [i.text, i.accelerator])).toEqual([
+      [ja.appMenu.editorFit, 'CmdOrCtrl+0'],
+      [ja.appMenu.editorActualSize, 'CmdOrCtrl+1'],
+      [ja.appMenu.editorZoomIn, 'CmdOrCtrl+='],
+      [ja.appMenu.editorZoomOut, 'CmdOrCtrl+-'],
+      [ja.appMenu.editorInfo, 'CmdOrCtrl+I'],
+    ]);
+    keyed[1]?.action?.('');
+    expect(run).toHaveBeenCalledWith({
+      kind: 'key',
+      spec: { key: '1', code: 'Digit1', meta: true },
+    });
+    expect(items.some((i) => 'item' in i && i.item === 'Fullscreen')).toBe(true);
+  });
+
+  it('表示メニューは、Submenu を渡せばそれを置き、渡さなければライブラリの中身', () => {
+    const run = vi.fn();
+    const view = viewItemOptions(run, STATE, 'test');
+    const library = libraryViewItems(run, view) as Item[];
+    const texts = (list: Item[]) =>
+      list.map((i) => ('text' in i ? i.text : 'item' in i ? i.item : ''));
+    expect(texts(submenu(ja.appMenu.view).items as Item[])).toEqual(texts(library));
+    expect(library[0]).toBe(view.layouts.justify);
+    const swapped = { text: 'swapped' } as unknown as Submenu;
+    const menus = appMenuItems(
+      run,
+      view,
+      pixelArtItemOptions(run, PIXEL_ART, 'test'),
+      undefined,
+      swapped,
+    );
+    expect(menus).toContain(swapped);
   });
 
   it('ウインドウ・ヘルプのメニューは Tauri がそれと分かる ID を持つ', () => {
@@ -331,5 +402,85 @@ describe('selectAllCommand', () => {
     selectAllCommand();
 
     expect(useViewStore.getState().selection).toEqual(EMPTY_SELECTION);
+  });
+});
+
+describe('取り消す・やり直す（M12。エディタの中だけエディタへ）', () => {
+  afterEach(() => {
+    document.body.innerHTML = '';
+    useEditorStore.setState({ phase: 'closed', status: null });
+  });
+
+  it('入力欄の中は文字の取り消し（execCommand）で、キーは送らない', () => {
+    const input = document.createElement('input');
+    document.body.append(input);
+    input.focus();
+    const exec = vi.fn(() => true);
+    Object.defineProperty(document, 'execCommand', { value: exec, configurable: true });
+    const seen: KeyboardEvent[] = [];
+    const listener = (e: KeyboardEvent) => seen.push(e);
+    window.addEventListener('keydown', listener);
+
+    historyCommand(false);
+    historyCommand(true);
+
+    window.removeEventListener('keydown', listener);
+    expect(exec.mock.calls).toEqual([['undo'], ['redo']]);
+    expect(seen).toEqual([]);
+  });
+
+  it('入力欄の外は ⌘Z・⇧⌘Z を押したことにする（エディタのキーの処理が受ける）', () => {
+    const button = document.createElement('button');
+    document.body.append(button);
+    button.focus();
+    const seen: KeyboardEvent[] = [];
+    const listener = (e: KeyboardEvent) => seen.push(e);
+    window.addEventListener('keydown', listener, true);
+
+    runMenuAction({ kind: 'history', redo: false });
+    runMenuAction({ kind: 'history', redo: true });
+
+    window.removeEventListener('keydown', listener, true);
+    expect(seen.map((e) => [e.key, e.code, e.metaKey, e.shiftKey])).toEqual([
+      ['z', 'KeyZ', true, false],
+      ['z', 'KeyZ', true, true],
+    ]);
+  });
+
+  it('押せるか：エディタの外と入力欄の中はいつも、エディタの中は取り消せる・やり直せるときだけ', () => {
+    expect(historyMenuState(null)).toEqual({ undo: true, redo: true });
+    useEditorStore.setState({
+      phase: 'open',
+      status: {
+        rev: 3,
+        head: 3,
+        provisional: false,
+        canUndo: true,
+        canRedo: false,
+        dirty: true,
+        saving: null,
+        needsReopen: false,
+      },
+    });
+    expect(historyMenuState(null)).toEqual({ undo: true, redo: false });
+    const input = document.createElement('input');
+    document.body.append(input);
+    expect(historyMenuState(input)).toEqual({ undo: true, redo: true });
+    useEditorStore.setState({ status: null });
+    expect(historyMenuState(document.body)).toEqual({ undo: false, redo: false });
+  });
+
+  it('合わせる関数は、変わったときだけ項目を替える', () => {
+    const undo = { setEnabled: vi.fn(async () => {}) };
+    const redo = { setEnabled: vi.fn(async () => {}) };
+    let state = { undo: true, redo: true };
+    const sync = historySyncer({ undo, redo }, () => state);
+    sync();
+    sync();
+    expect(undo.setEnabled).toHaveBeenCalledTimes(1);
+    state = { undo: false, redo: true };
+    sync();
+    expect(undo.setEnabled).toHaveBeenLastCalledWith(false);
+    expect(redo.setEnabled).toHaveBeenLastCalledWith(true);
   });
 });
