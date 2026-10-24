@@ -157,6 +157,8 @@ mod tests {
 
     /// ロックを取ったあとに起動した子プロセスは、ロックのファイルを継がない（std は O_CLOEXEC で開く）。落ちたときと同じく
     /// 外さずに閉じても、子が生きている間に取り直せる（継いでいれば、子が終わるまで自分のライブラリを断られる）。
+    /// 並べて走るほかのテストが子を起こす一瞬（fork から exec まで）はその子もファイルを握るので、取り直しは 1 秒まで待つ
+    /// （継いだ子なら 5 秒のあいだ握り続けるので、待っても取れない）。
     #[test]
     fn children_do_not_inherit_the_lock_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -166,7 +168,14 @@ mod tests {
             .spawn()
             .unwrap();
         lock.abandon();
-        let again = LibraryLock::acquire(dir.path());
+        let mut again = LibraryLock::acquire(dir.path());
+        for _ in 0..50 {
+            if !matches!(again, Err(CoreError::LibraryInUse)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            again = LibraryLock::acquire(dir.path());
+        }
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(again.unwrap().is_held());
