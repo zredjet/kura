@@ -11,7 +11,7 @@ import { isImeKey } from '../../lib/ime';
 import { toHex } from './color';
 import { ColorPicker, Swatch } from './ColorPicker';
 import styles from './Editor.module.css';
-import { sendParam } from './editorStore';
+import { sendParam, useEditorStore } from './editorStore';
 import {
   clampNumber,
   controlFor,
@@ -34,11 +34,12 @@ import {
   unitLabel,
 } from './opsCatalog';
 import type { ParamGesture } from './paramSend';
+import type { PaintColor } from './stroke';
 
 const t = ja.editor;
 
-/** 欄が送るもの（ノード・引数は呼ぶ側が決める）。 */
-type Send = (gesture: ParamGesture) => void;
+/** 欄が送るもの（ノード・引数は呼ぶ側が決める）。送った手の番号を返す（送れなければ null）。 */
+type Send = (gesture: ParamGesture) => number | null;
 
 /** 指摘の文（種類の言葉と、Rust の言葉）。 */
 export function issueText(issue: Issue): string {
@@ -49,7 +50,8 @@ export function issueText(issue: Issue): string {
 
 /**
  * 数の入力欄（文字を打っている間は手元の文字。読める値になるたびに `onValue`、Enter・欄を離れたら `onSeal`）。範囲の外の
- * 値は、Enter・欄を離れたときに収めて送る。
+ * 値は、Enter・欄を離れたときに収めて送る。空・途中の値は送らない。打っている間に送った値は、Enter・離れたときに送り
+ * 直さない（断られた値を何度も送らない）。`stepBase` は矢印の刻みの起点（HTML の `min` 属性。収める下限は `min`）。
  */
 export function NumberInput({
   id,
@@ -60,6 +62,8 @@ export function NumberInput({
   step = 1,
   integer = true,
   disabled,
+  stepBase,
+  className = styles.paramNumber,
   onValue,
   onSeal,
 }: {
@@ -71,10 +75,13 @@ export function NumberInput({
   step?: number;
   integer?: boolean;
   disabled?: boolean;
+  stepBase?: number;
+  className?: string;
   onValue: (v: number) => void;
   onSeal: () => void;
 }) {
   const [text, setText] = useState<string | null>(null);
+  const emitted = useRef<number | null>(null);
   const clamp = (v: number): number => {
     let out = integer ? Math.round(v) : v;
     if (min !== null) out = Math.max(min, out);
@@ -86,9 +93,10 @@ export function NumberInput({
       const v = Number(text);
       if (Number.isFinite(v)) {
         const c = clamp(v);
-        if (c !== value) onValue(c);
+        if (c !== value && c !== emitted.current) onValue(c);
       }
     }
+    emitted.current = null;
     setText(null);
     onSeal();
   };
@@ -96,10 +104,10 @@ export function NumberInput({
     <input
       id={id}
       aria-label={id ? undefined : label}
-      className={styles.paramNumber}
+      className={className}
       type="number"
       inputMode={integer ? 'numeric' : 'decimal'}
-      min={min ?? undefined}
+      min={stepBase ?? min ?? undefined}
       max={max ?? undefined}
       step={step}
       disabled={disabled}
@@ -110,7 +118,10 @@ export function NumberInput({
         if (raw.trim() === '') return;
         const v = Number(raw);
         // 範囲の中のときだけ打つたびに送る（外は Enter・離れたときに収める）
-        if (Number.isFinite(v) && clamp(v) === v && v !== value) onValue(v);
+        if (Number.isFinite(v) && clamp(v) === v && v !== value) {
+          emitted.current = v;
+          onValue(v);
+        }
       }}
       onBlur={finish}
       onKeyDown={(e) => {
@@ -121,6 +132,7 @@ export function NumberInput({
         } else if (e.key === 'Escape' && text !== null) {
           e.preventDefault();
           e.stopPropagation();
+          emitted.current = null;
           setText(null);
         }
       }}
@@ -128,12 +140,26 @@ export function NumberInput({
   );
 }
 
-/** 送った値を、Rust の結果が同じ値になるまで手元に持つ（スライダーが古い値に戻ってちらつかない）。 */
-function usePending<T>(current: T): [T, (v: T | null) => void] {
-  const [pending, setPending] = useState<{ v: T } | null>(null);
-  // 結果が届いて同じ値になったら手元の値をやめる（描画の途中で直す：effect で直すと 1 回古い値で描く）
-  if (pending && Object.is(pending.v, current)) setPending(null);
-  const set = useCallback((v: T | null) => setPending(v === null ? null : { v }), []);
+/**
+ * 送った値を手元に持つ（スライダーが古い値に戻ってちらつかない・応えの前に続けて変えても前の変更を土台にする）。Rust の
+ * 結果が同じ値になったか、送った手の結果が確定したら（断られた・失敗した・仮でない結果が届いた：`acked` が送った手の番号
+ * 以上）やめて、文書の値を出す（断られた値を欄に残さない）。
+ */
+function usePending<T>(current: T): [T, (v: T | null, ticket?: number | null) => void] {
+  const acked = useEditorStore((s) => s.acked);
+  const [pending, setPending] = useState<{ v: T; ticket: number | null } | null>(null);
+  // 描画の途中で直す（effect で直すと 1 回古い値で描く）
+  if (
+    pending &&
+    (Object.is(pending.v, current) || (pending.ticket !== null && acked >= pending.ticket))
+  ) {
+    setPending(null);
+  }
+  const set = useCallback(
+    (v: T | null, ticket: number | null = null) =>
+      setPending(v === null ? null : { v, ticket: ticket ?? null }),
+    [],
+  );
   return [pending ? pending.v : current, set];
 }
 
@@ -184,8 +210,10 @@ function NumberParam({
             onChange={(e) => {
               const v = clampNumber(spec, Number(e.target.value));
               if (v === null) return;
-              setPending(v);
-              send(dragging.current ? { kind: 'drag', value: v } : { kind: 'nudge', value: v });
+              setPending(
+                v,
+                send(dragging.current ? { kind: 'drag', value: v } : { kind: 'nudge', value: v }),
+              );
             }}
             onBlur={() => {
               endDrag(false);
@@ -200,10 +228,7 @@ function NumberParam({
           max={r.max}
           step={r.step}
           integer={r.integer}
-          onValue={(v) => {
-            setPending(v);
-            send({ kind: 'nudge', value: v });
-          }}
+          onValue={(v) => setPending(v, send({ kind: 'nudge', value: v }))}
           onSeal={() => send({ kind: 'seal' })}
         />
         {unit && <span className={styles.paramUnit}>{unit}</span>}
@@ -245,8 +270,7 @@ function NumbersParam({
       const base = vals[key] ?? 0;
       if (base > 0) next[other] = Math.max(1, Math.round(((vals[other] ?? 0) * v) / base));
     }
-    setPending(JSON.stringify(next));
-    send({ kind: 'nudge', value: next });
+    setPending(JSON.stringify(next), send({ kind: 'nudge', value: next }));
   };
   return (
     <fieldset className={styles.paramGroup}>
@@ -347,7 +371,9 @@ function LengthParam({
             min={len.mode === 'px' ? 1 : 0.01}
             max={null}
             integer={len.mode === 'px'}
-            step={len.mode === 'px' ? 1 : 1}
+            step={1}
+            // % の刻みは整数から（下限の 0.01 を起点にすると 100 → 100.01 と刻まれる）
+            stepBase={len.mode === 'px' ? undefined : 0}
             onValue={(v) => send({ kind: 'nudge', value: makeLength(len.mode, v) })}
             onSeal={() => send({ kind: 'seal' })}
           />
@@ -357,7 +383,21 @@ function LengthParam({
   );
 }
 
-/** 色：見本（押すと欄の下に色を選ぶ部品）。アルファを持たない引数は不透明度を出さない。 */
+/** 色の手元の値の鍵（RGBA を「,」でつなぐ）。 */
+function colorKey(rgba: readonly number[]): string {
+  return rgba.join(',');
+}
+
+function parseColorKey(key: string): [number, number, number, number] {
+  const [r = 0, g = 0, b = 0, a = 255] = key.split(',').map(Number);
+  return [r, g, b, a];
+}
+
+/**
+ * 色：見本（押すと欄の下に色を選ぶ部品）。アルファを持たない引数は不透明度を出さない。つまみ・16 進は merge で送り、
+ * 閉じたら（見本・外を押す・esc）seal。送った色は手元に持ち、色を選ぶ部品はそれを土台にする（応えの前に別のつまみを
+ * 動かしても前の変更が消えない）。
+ */
 function ColorParam({
   spec,
   label,
@@ -370,12 +410,18 @@ function ColorParam({
   send: Send;
 }) {
   const alpha = spec.kind.type === 'color' && spec.kind.alpha;
-  const rgba = readColor(value) ?? [0, 0, 0, alpha ? 0 : 255];
+  const current = readColor(value) ?? [0, 0, 0, alpha ? 0 : 255];
+  const [shown, setPending] = usePending<string>(colorKey(current));
+  const rgba = parseColorKey(shown);
   const [open, setOpen] = useState(false);
   const close = useCallback(() => {
     setOpen(false);
     send({ kind: 'seal' });
   }, [send, setOpen]);
+  const change = (c: PaintColor) => {
+    const v = makeColor(c.rgba, alpha);
+    setPending(colorKey(readColor(v) ?? c.rgba), send({ kind: 'nudge', value: v }));
+  };
   const hex = toHex(rgba);
   return (
     <div className={styles.paramRow}>
@@ -386,7 +432,7 @@ function ColorParam({
             color={{ rgba, index: null }}
             label={t.paramColor(label, hex)}
             pressed={open}
-            onClick={() => setOpen((v) => !v)}
+            onClick={() => (open ? close() : setOpen(true))}
           />
           <span className={styles.paramHex}>{hex}</span>
         </div>
@@ -397,7 +443,7 @@ function ColorParam({
             inline
             alpha={alpha}
             label={label}
-            onChange={(c) => send({ kind: 'nudge', value: makeColor(c.rgba, alpha) })}
+            onChange={change}
             onClose={close}
           />
         )}
@@ -571,7 +617,7 @@ export function ParamField({
             checked={value !== null}
             onChange={(on) => send({ kind: 'set', value: on ? initialValue(spec, size) : null })}
           />
-          {`${label}を${t.specify}`}
+          {t.specifyParam(label)}
         </label>
       )}
       {body}

@@ -11,6 +11,7 @@ import {
   viewEdit,
 } from '../../ipc/edit';
 import type { ItemSummaryDto } from '../../ipc/items';
+import { ja } from '../../i18n/ja';
 import { IpcError } from '../../ipc/result';
 import { unpackPoints } from '../../lib/paint';
 import { useNoticeStore } from '../../stores/noticeStore';
@@ -470,12 +471,18 @@ describe('右パネル', () => {
       progress: null,
       slow: false,
       title: null,
+      before: null,
     };
     expect(hasUnsavedChanges({ status: st, save: null })).toBe(true);
     expect(hasUnsavedChanges({ status: st, save })).toBe(false);
     expect(hasUnsavedChanges({ status: { ...st, head: 5 }, save })).toBe(true);
     expect(hasUnsavedChanges({ status: st, save: { ...save, state: 'failed' } })).toBe(true);
     expect(hasUnsavedChanges({ status: status({ dirty: false }), save: null })).toBe(false);
+    // 応えの来ていない文書の手（送った・ためた手）も未保存に数える
+    expect(
+      hasUnsavedChanges({ status: status({ dirty: false }), save: null, pendingSteps: true }),
+    ).toBe(true);
+    expect(hasUnsavedChanges({ status: st, save, pendingSteps: true })).toBe(true);
   });
 });
 
@@ -655,5 +662,201 @@ describe('文書の差分', () => {
       }),
     ).toBeNull();
     expect(focusNode({ order: [], nodes: {}, outputs: [] })).toBeNull();
+  });
+});
+
+describe('応えの来ていない手と、結果が確定した手の番号', () => {
+  beforeEach(async () => {
+    vi.mocked(openEdit).mockResolvedValue(opened('aa01'));
+    await openEditor(item());
+    await flush();
+    vi.mocked(stepEdit).mockClear();
+  });
+
+  it('送った・ためた文書の手があれば pendingSteps（未保存に数える）、結果が届けば外す', async () => {
+    let answer: ((r: EditStepResultDto) => void) | null = null;
+    vi.mocked(stepEdit).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    );
+    expect(useEditorStore.getState().pendingSteps).toBe(false);
+    expect(sendParam(1, 'rect', { kind: 'nudge', value: { x: 0, y: 0, w: 9, h: 9 } })).toBe(1);
+    expect(useEditorStore.getState().pendingSteps).toBe(true);
+    // まとめを閉じる手は文書を変えないが、前の手の応えがまだ
+    expect(sendParam(1, 'rect', { kind: 'seal' })).toBe(2);
+    expect(hasUnsavedChanges(useEditorStore.getState())).toBe(true);
+    answer!(result({ status: status({ rev: 2, dirty: true }) }));
+    await flush();
+    await flush();
+    expect(useEditorStore.getState().pendingSteps).toBe(false);
+    expect(useEditorStore.getState().acked).toBe(2);
+  });
+
+  it('断られた・仮でない結果で acked を進め、仮の結果（preview）では進めない', async () => {
+    vi.mocked(stepEdit).mockResolvedValueOnce(
+      result({ status: status({ rev: 2, provisional: true }) }),
+    );
+    const drag = sendParam(1, 'rect', { kind: 'drag', value: { x: 0, y: 0, w: 9, h: 9 } });
+    await flush();
+    expect(useEditorStore.getState().acked).toBeLessThan(drag ?? 0);
+    vi.mocked(stepEdit).mockResolvedValueOnce(
+      result({
+        status: status({ rev: 2, provisional: true }),
+        rejected: { index: 0, problem: { code: 'Invalid', message: '大きすぎます', issues: [] } },
+      }),
+    );
+    const rejected = sendParam(1, 'rect', { kind: 'drag', value: { x: 0, y: 0, w: 999, h: 9 } });
+    await flush();
+    expect(useEditorStore.getState().acked).toBe(rejected);
+    // 要求そのものが通らなくても確定（欄は文書の値に戻す）
+    vi.mocked(stepEdit).mockRejectedValueOnce(new IpcError({ code: 'Internal', message: 'x' }));
+    const failed = sendParam(1, 'rect', { kind: 'release' });
+    await flush();
+    expect(useEditorStore.getState().acked).toBe(failed);
+  });
+});
+
+describe('パレットの番号・スポイトの順番', () => {
+  it('パレットの番号は開くたびに捨て、パレットの画像はこの画像で番号を拾うまで描かない', async () => {
+    useToolStore.setState({ color: { rgba: [255, 0, 0, 255], index: 200 } });
+    vi.mocked(openEdit).mockResolvedValue(opened('aa01'));
+    await openEditor(item());
+    await flush();
+    useEditorStore.setState({ view: { ...useEditorStore.getState().view!, format: 'indexed8' } });
+    vi.mocked(stepEdit).mockClear();
+    expect(useToolStore.getState().color).toEqual({ rgba: [255, 0, 0, 255], index: null });
+    expect(strokeStart([1, 1], false)).toBe(false);
+    fillAt([1, 1]);
+    expect(stepEdit).not.toHaveBeenCalled();
+    expect(useNoticeStore.getState().message).toBe(ja.editor.indexedPick);
+    // 拾った番号で描く
+    vi.mocked(sampleEdit).mockResolvedValue({ rgba: [0, 0, 255, 255], index: 3 });
+    await sampleAt([2, 2]);
+    fillAt([1, 1]);
+    const [, steps] = vi.mocked(stepEdit).mock.calls[0] ?? [];
+    expect(steps?.[0]).toMatchObject({ type: 'paint', actions: [{ color: { index: 3 } }] });
+  });
+
+  it('スポイトの応えが入れ替わっても、最後にクリックした画素の色にする', async () => {
+    vi.mocked(openEdit).mockResolvedValue(opened('aa01'));
+    await openEditor(item());
+    await flush();
+    const answers: ((v: { rgba: [number, number, number, number]; index: null }) => void)[] = [];
+    vi.mocked(sampleEdit).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          answers.push(resolve);
+        }),
+    );
+    const first = sampleAt([1, 1]);
+    const second = sampleAt([2, 2]);
+    answers[1]?.({ rgba: [2, 2, 2, 255], index: null });
+    await second;
+    answers[0]?.({ rgba: [1, 1, 1, 255], index: null });
+    await first;
+    expect(useToolStore.getState().color.rgba).toEqual([2, 2, 2, 255]);
+  });
+});
+
+describe('切り抜きの枠の基準', () => {
+  const cropNode = {
+    id: 4,
+    op: 'image.crop',
+    v: 1,
+    enabled: true,
+    params: { rect: { x: 8, y: 4, w: 16, h: 8 } },
+    log: null,
+  };
+  const resizeNode = (enabled = true) => ({
+    id: 5,
+    op: 'image.resize',
+    v: 1,
+    enabled,
+    params: { width: { px: 8 }, height: 'auto', filter: 'nearest' },
+    log: null,
+  });
+
+  it('後ろに有効な幾何の操作がある切り抜きは、枠を出さずに選んで引数パネルで直す（手を送らない）', async () => {
+    vi.mocked(openEdit).mockResolvedValue(
+      opened('aa01', {
+        doc: { base: null, order: [4, 5], nodes: [cropNode, resizeNode()], outputs: null },
+        view: { type: 'shown', view: viewDto({ fullWidth: 8, fullHeight: 4 }) },
+      }),
+    );
+    await openEditor(item());
+    await flush();
+    vi.mocked(stepEdit).mockClear();
+    useToolStore.setState({ tool: 'pen' });
+    selectTool('crop');
+    await flush();
+    expect(useEditorStore.getState().crop).toBeNull();
+    expect(useEditorStore.getState().selected).toBe(4);
+    expect(useToolStore.getState().tool).toBe('pen');
+    expect(useNoticeStore.getState().message).toBe(ja.editor.cropUseParams);
+    confirmCrop();
+    await flush();
+    expect(stepEdit).not.toHaveBeenCalled();
+  });
+
+  it('後ろの幾何の操作が無効なら、今までどおり枠で直す', async () => {
+    vi.mocked(openEdit).mockResolvedValue(
+      opened('aa01', {
+        doc: { base: null, order: [4, 5], nodes: [cropNode, resizeNode(false)], outputs: null },
+      }),
+    );
+    await openEditor(item());
+    await flush();
+    selectTool('crop');
+    expect(useEditorStore.getState().crop).toMatchObject({ node: 4, previewed: true });
+  });
+
+  it('枠を出している間に操作を足すと、切り抜きを始める前の出力の大きさを既定にする', async () => {
+    vi.mocked(openEdit).mockResolvedValue(
+      opened('aa01', {
+        doc: { base: null, order: [4], nodes: [cropNode], outputs: null },
+        view: { type: 'shown', view: viewDto({ fullWidth: 16, fullHeight: 8 }) },
+      }),
+    );
+    await openEditor(item());
+    await flush();
+    // 今の出力（切り抜いたあと）は 16 × 8
+    useEditorStore.setState({
+      view: { ...useEditorStore.getState().view!, fullWidth: 16, fullHeight: 8 },
+    });
+    vi.mocked(stepEdit).mockClear();
+    // 仮に無効にした結果（入力の大きさ 64 × 32。文書は変わらない）
+    vi.mocked(stepEdit).mockResolvedValueOnce(
+      result({
+        status: status({ rev: 5, provisional: true }),
+        doc: { base: 1, order: [4], nodes: [], outputs: null },
+        view: { type: 'shown', view: viewDto({ rev: 5, changed: { type: 'all' } }) },
+      }),
+    );
+    selectTool('crop');
+    await flush();
+    expect(useEditorStore.getState().view?.fullWidth).toBe(64);
+    addOp('image.resize');
+    await flush();
+    expect(
+      vi
+        .mocked(stepEdit)
+        .mock.calls.flatMap((c) => c[1])
+        .slice(1),
+    ).toEqual([
+      { type: 'cancelPreview' },
+      {
+        type: 'commit',
+        edit: {
+          type: 'addNode',
+          at: 1,
+          op: 'image.resize',
+          v: 1,
+          params: { width: { px: 16 }, height: 'auto', filter: 'nearest' },
+        },
+        mode: 'step',
+      },
+    ]);
   });
 });

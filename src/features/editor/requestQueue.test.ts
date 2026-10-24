@@ -130,4 +130,54 @@ describe('要求の振り分け', () => {
     q.push([{ step: { type: 'undo' } }], vp(1));
     expect(calls).toHaveLength(1);
   });
+
+  it('手をためた番号を要求に付け、応えの来ていない手があるかと、なくなるのを待つ口を持つ', async () => {
+    const { ipc, calls } = fakeIpc();
+    const done: SentRequest<string>[] = [];
+    const q = new RequestQueue<string>(ipc, {
+      done: (req) => done.push(req),
+      error: () => undefined,
+    });
+    expect(q.holds()).toBe(false);
+    await q.settled();
+    q.push([{ step: { type: 'undo' } }], vp(1));
+    q.push([{ step: { type: 'seal' } }], vp(1));
+    q.push([{ step: { type: 'redo' } }], vp(1));
+    expect(q.pushedCount).toBe(3);
+    const isUndo = (s: EditStepDto) => s.type === 'undo';
+    expect(q.holds(isUndo)).toBe(true);
+    let settled = false;
+    void q.settled().then(() => {
+      settled = true;
+    });
+    calls[0]?.resolve(RESULT);
+    await flush();
+    expect(done[0]?.upto).toBe(1);
+    // 送った undo の応えは来たので、残りは seal と redo
+    expect(q.holds(isUndo)).toBe(false);
+    expect(q.holds()).toBe(true);
+    expect(settled).toBe(false);
+    calls[1]?.resolve(RESULT);
+    await flush();
+    expect(done[1]?.upto).toBe(3);
+    expect(settled).toBe(true);
+    // 表示だけの要求は前の番号のまま
+    q.view(vp(9));
+    calls[2]?.resolve(RESULT);
+    await flush();
+    expect(done[2]?.upto).toBe(3);
+  });
+
+  it('閉じたら待っている呼び手を起こす', async () => {
+    const { ipc } = fakeIpc();
+    const q = new RequestQueue(ipc, { done: () => undefined, error: () => undefined });
+    q.push([{ step: { type: 'undo' } }], vp(1));
+    let settled = false;
+    void q.settled().then(() => {
+      settled = true;
+    });
+    q.close();
+    await flush();
+    expect(settled).toBe(true);
+  });
 });

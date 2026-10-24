@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../../i18n/ja';
@@ -118,6 +118,37 @@ describe('画像エディタの画面', () => {
     expect(screen.getByRole('button', { name: t.saveMore })).toBeInTheDocument();
     // アニメの画像はコマを選べる
     expect(screen.getByText(t.framePosition('1', '2'))).toBeInTheDocument();
+  });
+
+  it('筆の大きさの欄を空にしても 1 に戻さず、範囲の外は離したときに収める', () => {
+    openState();
+    useToolStore.setState({ size: 16 });
+    render(<Editor />);
+    const size = screen.getByRole('spinbutton', { name: t.brushSize });
+    fireEvent.change(size, { target: { value: '' } });
+    expect(size).toHaveValue(null);
+    expect(useToolStore.getState().size).toBe(16);
+    fireEvent.change(size, { target: { value: '8' } });
+    expect(size).toHaveValue(8);
+    expect(useToolStore.getState().size).toBe(8);
+    // 範囲の外は打っている間は送らず、離したら収める
+    fireEvent.change(size, { target: { value: '999' } });
+    expect(useToolStore.getState().size).toBe(8);
+    fireEvent.blur(size);
+    expect(useToolStore.getState().size).toBe(255);
+    expect(size).toHaveValue(255);
+  });
+
+  it('「保存」は保存していない変更がないときは押せない', () => {
+    openState();
+    const status = useEditorStore.getState().status;
+    if (status) useEditorStore.setState({ status: { ...status, dirty: false } });
+    render(<Editor />);
+    expect(screen.getByRole('button', { name: t.save })).toBeDisabled();
+    // 応えの来ていない手があれば押せる（未保存に数える）
+    act(() => useEditorStore.setState({ pendingSteps: true }));
+    expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
+    act(() => useEditorStore.setState({ pendingSteps: false }));
   });
 
   it('「情報」で右パネルをインスペクタに替える', () => {

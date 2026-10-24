@@ -52,10 +52,34 @@ describe('道具の設定', () => {
       tolerance: 0,
       connectivity: 'eight',
       contiguous: false,
-      color: { rgba: [255, 0, 11, 255], index: 3 },
+      // パレットの番号は画像ごとなので、保存したものがあっても読まない
+      color: { rgba: [255, 0, 11, 255], index: null },
       recent: [{ rgba: [1, 2, 3, 4], index: null }],
     });
     expect(normalizeColor({ rgba: 'x' })).toBeNull();
+    expect(normalizeColor({ rgba: [1, 2, 3, 4], index: 3 })).toEqual({
+      rgba: [1, 2, 3, 4],
+      index: 3,
+    });
+  });
+
+  it('パレットの番号は localStorage に書かず、別の画像を開くときに捨てる', () => {
+    useToolStore.setState({ ...DEFAULT_TOOLS });
+    useToolStore.getState().setColor(c(200, 7));
+    useToolStore.getState().rememberColor(c(200, 7));
+    useToolStore.getState().rememberColor(c(200, 9));
+    const saved = JSON.parse(window.localStorage.getItem('kura.editor.tools') ?? '{}') as {
+      color: { index: number | null };
+      recent: { index: number | null }[];
+    };
+    expect(saved.color.index).toBeNull();
+    // 番号を捨てると同じ RGBA になる色は 1 つ
+    expect(saved.recent).toEqual([c(200)]);
+    // このセッションの間は番号を持つ（同じ画像で描く）
+    expect(useToolStore.getState().color).toEqual(c(200, 7));
+    useToolStore.getState().forgetPaletteIndexes();
+    expect(useToolStore.getState().color).toEqual(c(200));
+    expect(useToolStore.getState().recent).toEqual([c(200)]);
   });
 
   it('筆の大きさは 1〜255 に収める', () => {

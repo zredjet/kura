@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { clampCrop, dragCrop, isFullCrop, nudgeCrop, readRect, sameRect } from './crop';
+import {
+  clampCrop,
+  dragCrop,
+  isFullCrop,
+  newCropRect,
+  nudgeCrop,
+  readRect,
+  sameRect,
+} from './crop';
 
 const B = { w: 100, h: 50 };
 const R = { x: 10, y: 10, w: 40, h: 20 };
@@ -9,6 +17,18 @@ describe('切り抜きの枠', () => {
   it('画像の中の整数の矩形に収める（幅・高さは 1 以上）', () => {
     expect(clampCrop({ x: -5.4, y: 3.6, w: 200, h: 0 }, B)).toEqual({ x: 0, y: 4, w: 100, h: 1 });
     expect(clampCrop({ x: 90, y: 45, w: 20, h: 10 }, B)).toEqual({ x: 80, y: 40, w: 20, h: 10 });
+  });
+
+  it('枠の外から取り直す：押した点と今の点を含む整数の矩形（画像の外へはみ出しても押した辺は動かない）', () => {
+    expect(newCropRect(10.5, 5.2, 30.1, 20.9, B)).toEqual({ x: 10, y: 5, w: 21, h: 16 });
+    // 逆向きのドラッグ
+    expect(newCropRect(30, 20, 10, 5, B)).toEqual({ x: 10, y: 5, w: 20, h: 15 });
+    // 右下へはみ出す：左上（押した点）は 50・30 のまま、端で止める
+    expect(newCropRect(50, 30, 170, 130, B)).toEqual({ x: 50, y: 30, w: 50, h: 20 });
+    // 左上へはみ出す：右下（押した点）は動かない
+    expect(newCropRect(60, 40, -10, -10, B)).toEqual({ x: 0, y: 0, w: 60, h: 40 });
+    // 画像の外で押して外で離しても 1px は残す
+    expect(newCropRect(120, 10, 130, 10, B)).toEqual({ x: 99, y: 10, w: 1, h: 1 });
   });
 
   it('中をドラッグすると動かす（画像の外へは出ない。小数は丸める）', () => {

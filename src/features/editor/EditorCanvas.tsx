@@ -101,9 +101,26 @@ export function EditorCanvas() {
     const observer = new ResizeObserver(measure);
     observer.observe(host);
     window.addEventListener('resize', measure);
+    // 倍率の違う画面へ窓を動かしても pt の大きさは変わらず resize は来ないので、装置の画素の比の変化を見張る
+    // （問い合わせは今の比に合うかだけなので、変わるたびに今の比で張り直す）
+    let ratio: MediaQueryList | null = null;
+    const onRatio = () => {
+      watchRatio();
+      measure();
+    };
+    const watchRatio = () => {
+      ratio?.removeEventListener('change', onRatio);
+      ratio =
+        typeof window.matchMedia === 'function'
+          ? window.matchMedia(`(resolution: ${dpr()}dppx)`)
+          : null;
+      ratio?.addEventListener('change', onRatio);
+    };
+    watchRatio();
     return () => {
       observer.disconnect();
       window.removeEventListener('resize', measure);
+      ratio?.removeEventListener('change', onRatio);
       controller.detach(canvas);
     };
   }, [openId, phase]);
@@ -231,7 +248,7 @@ export function EditorCanvas() {
         ref={canvasRef}
         className={styles.canvas}
         role="img"
-        aria-label={item ? `${t.canvas}：${item.title}` : t.canvas}
+        aria-label={item ? t.canvasOf(item.title) : t.canvas}
         data-drawing={drawing || undefined}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}

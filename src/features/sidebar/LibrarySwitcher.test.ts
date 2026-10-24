@@ -6,6 +6,8 @@ import { pickExistingLibrary, pickNewLibraryLocation } from '../../ipc/dialogs';
 import { IpcError } from '../../ipc/result';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { notify } from '../../stores/noticeStore';
+import { answerUnsaved } from '../editor/editorSave';
+import { useEditorStore } from '../editor/editorStore';
 import { createNew, openOther } from './LibrarySwitcher';
 
 vi.mock('../../ipc/dialogs', () => ({
@@ -60,6 +62,63 @@ describe('サイドバー・設定の「別のライブラリを開く…」「�
     useLibraryStore.setState({ open: vi.fn(async () => Promise.reject(tooNew)) });
     await openOther();
     expect(notify).toHaveBeenCalledWith(ja.welcome.failed(tooNew.message));
+  });
+
+  // design.md §3.1「画像エディタ」：設定のシート・サイドバーから切り替えるとき、エディタに保存していない変更があれば聞く
+  it('画像エディタに保存していない変更があれば先に聞き、［キャンセル］なら切り替えず、［保存しない］なら閉じてから開く', async () => {
+    const dirty = () =>
+      useEditorStore.setState({
+        phase: 'open',
+        sheet: null,
+        save: null,
+        pendingSteps: false,
+        status: {
+          rev: 2,
+          head: 2,
+          provisional: false,
+          canUndo: true,
+          canRedo: false,
+          dirty: true,
+          saving: null,
+          needsReopen: false,
+        },
+      });
+    vi.mocked(pickExistingLibrary).mockResolvedValue('/B.kuralib');
+    const open = vi.fn(async () => undefined);
+    useLibraryStore.setState({ open });
+    dirty();
+    const canceled = openOther();
+    await vi.waitFor(() =>
+      expect(useEditorStore.getState().sheet).toEqual({ kind: 'unsaved', then: 'library' }),
+    );
+    answerUnsaved('cancel');
+    await canceled;
+    expect(open).not.toHaveBeenCalled();
+    expect(useEditorStore.getState().phase).toBe('open');
+
+    const discarded = openOther();
+    await vi.waitFor(() => expect(useEditorStore.getState().sheet?.kind).toBe('unsaved'));
+    answerUnsaved('discard');
+    await discarded;
+    expect(useEditorStore.getState().phase).toBe('closed');
+    expect(open).toHaveBeenCalledWith('/B.kuralib');
+
+    // 新しいライブラリを作るときも
+    dirty();
+    vi.mocked(pickNewLibraryLocation).mockResolvedValue('/C.kuralib');
+    vi.mocked(checkLocation).mockResolvedValue({
+      path: '/C.kuralib',
+      status: 'new',
+      syncService: null,
+    } as never);
+    const create = vi.fn(async () => undefined);
+    useLibraryStore.setState({ create });
+    const creating = createNew();
+    await vi.waitFor(() => expect(useEditorStore.getState().sheet?.kind).toBe('unsaved'));
+    answerUnsaved('cancel');
+    await creating;
+    expect(create).not.toHaveBeenCalled();
+    useEditorStore.setState({ phase: 'closed', status: null, sheet: null });
   });
 
   // M12：ほかのアプリが開いているライブラリへは切り替えず、Rust は今のライブラリを閉じない。知らせの一行に理由を出す

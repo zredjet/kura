@@ -721,12 +721,13 @@
   font-weight: var(--weight-semibold);
 }
 
+/* 要約は 12px tertiary（design.md §3.1） */
 .opSummary {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
 }
@@ -946,17 +947,18 @@
   gap: var(--space-2);
 }
 
-/* 指摘（その欄の下） */
+/* 指摘（その欄の下。--danger-text の 12px） */
 .paramIssue {
   margin: 0;
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   line-height: var(--leading-body);
   color: var(--danger-text);
 }
 
+/* 書き出しの名前・後ろの描画の知らせ（12px tertiary） */
 .note {
   margin: 0;
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   line-height: var(--leading-body);
   color: var(--text-tertiary);
 }

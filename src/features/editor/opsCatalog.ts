@@ -408,6 +408,25 @@ export function paramsOf(node: EditNodeDto): ParamValues {
     : {};
 }
 
+/** 画像の大きさ・向き・並びを変える操作か（画像の幾何・スプライト。描画・変換・メタデータは変えない）。 */
+export function changesGeometry(id: string): boolean {
+  const c = opCategory(id);
+  return c === 'geometry' || c === 'sprite';
+}
+
+/**
+ * このノードより後ろに、有効な幾何の操作があるか（あれば、このノードを外した文書の出力はこのノードの入力の座標に
+ * ならない：切り抜きの枠はその操作の入力に重ねるので、枠では直せない）。
+ */
+export function hasLaterGeometry(doc: EditorDoc, id: number): boolean {
+  const i = doc.order.indexOf(id);
+  if (i < 0) return false;
+  return doc.order.slice(i + 1).some((n) => {
+    const node = doc.nodes[n];
+    return node !== undefined && node.enabled && changesGeometry(node.op);
+  });
+}
+
 /** このノードより後ろに描画（`paint.actions`）があるか（前の操作を変えても描画の位置は動かない）。 */
 export function hasLaterPaint(doc: EditorDoc, id: number): boolean {
   const i = doc.order.indexOf(id);

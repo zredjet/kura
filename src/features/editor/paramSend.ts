@@ -6,9 +6,9 @@
  * | スライダー・ハンドルのドラッグの途中 | `preview`（履歴に入らない。前の仮の値は捨てる） |
  * | ドラッグを離した | `commitPreview{step}` |
  * | ドラッグを esc でやめた | `cancelPreview` |
- * | キーボードの矢印・数の入力 | `commit{merge}`（同じ引数を続けて変える手を 1 手にまとめる） |
- * | Enter・欄を離れた | `seal`（まとめを閉じる） |
- * | スイッチ・セグメント・選択・色の見本 | `commit{step}` |
+ * | キーボードの矢印・数の入力・色を選ぶ部品のつまみと 16 進 | `commit{merge}`（同じ引数を続けて変える手を 1 手にまとめる） |
+ * | Enter・欄を離れた・色を選ぶ部品を閉じた | `seal`（まとめを閉じる） |
+ * | スイッチ・セグメント・選択・「指定する」 | `commit{step}` |
  */
 
 import type { EditDto, EditStepDto, FormatChoice, JsonValue, OutputSpec } from '../../ipc/edit';

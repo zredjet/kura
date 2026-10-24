@@ -60,6 +60,42 @@ describe('解いた絵', () => {
     expect(t.bytes).toBe(256 * 256 * 4);
   });
 
+  it('読み込みは鍵ごとに 1 本：別の rev を読んでいる間は、今の rev を読みに行かない', () => {
+    const t = new TileTable();
+    const key = tileKey(0, 0, 0, 0);
+    t.markAll(0, 6);
+    t.startLoad(key, 6);
+    t.markTiles(0, 0, [[0, 0]], 7);
+    expect(t.needsLoad(key, 7)).toBe(false);
+    // rev 6 が届いた：今の rev（7）の絵はまだないので出す（前の絵より新しい）
+    const six = bitmap();
+    expect(t.finishLoad(key, 6, six)).toBe(true);
+    expect(t.get(key)?.rev).toBe(6);
+    expect(t.needsLoad(key, 7)).toBe(true);
+    t.startLoad(key, 7);
+    expect(t.finishLoad(key, 7, bitmap())).toBe(true);
+    expect(six.close).toHaveBeenCalledOnce();
+    expect(t.holds(key, 7)).toBe(true);
+  });
+
+  it('今の rev の絵を持っていれば、あとから届いた別の rev の絵は閉じて捨てる（undo で rev が戻ったとき）', () => {
+    const t = new TileTable();
+    const key = tileKey(0, 0, 0, 0);
+    t.markAll(0, 1);
+    const one = bitmap();
+    t.finishLoad(key, 1, one);
+    t.markTiles(0, 0, [[0, 0]], 2);
+    t.startLoad(key, 2);
+    // undo：タイルは rev 1 に戻った
+    t.markTiles(0, 0, [[0, 0]], 1);
+    const two = bitmap();
+    expect(t.finishLoad(key, 2, two)).toBe(false);
+    expect(two.close).toHaveBeenCalledOnce();
+    expect(one.close).not.toHaveBeenCalled();
+    expect(t.get(key)?.rev).toBe(1);
+    expect(t.isLoading(key)).toBe(false);
+  });
+
   it('上限を超えたら、見えていないものから使った順の古いものを閉じて捨てる', () => {
     const one = 256 * 256 * 4;
     const t = new TileTable(one * 2);

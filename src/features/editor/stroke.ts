@@ -7,8 +7,10 @@
  *   `strokePixels` と同じ（stroke.test.ts が照らす）。
  * - `StrokeOverlay`：仮の画素を 256 の区画ごとの RGBA の帯（色）と覆い（アルファ 255）に持つ。描き方は重ねる（色を
  *   source-over）・置き換え（覆いで destination-out してから色）・消しゴム（覆いで destination-out）。
- * - `OverlayTracker`：仮の筆の寿命。描き終えたら送った要求の通し番号と手の位置を覚え、その要求以降の表示が届いて、
- *   見えている変わったタイルを解き終えたら外す（`superseded` なら次の表示を待つ）。断られた・描けなかったらすぐ外す。
+ * - `OverlayTracker`：仮の筆の寿命。描き終えたら送った要求の通し番号と手の位置を覚え、その要求以降の表示が届いたら、
+ *   見えているタイルのうちまだ今の rev の絵がないものを、その rev ごと待つ。どれもその rev の絵を解き終えたら（か、その
+ *   rev で読めなかったら）外す。古い rev の絵が届いても外さない。次の表示が届いたら、待つものをその表示の rev に替える
+ *   （`superseded` なら次の表示を待つ）。断られた・描けなかったらすぐ外す。
  * - 塗りつぶしは仮描きしない（Rust の結果を待つ。エンジンで 4096² の全面が 7 ms）。
  */
 
@@ -176,8 +178,8 @@ export interface PendingStroke {
   seq: number | null;
   /** 要求の中の手の位置。 */
   index: number | null;
-  /** 解き終えるのを待つタイルの鍵（表示が届く前は null）。 */
-  waiting: Set<string> | null;
+  /** 解き終えるのを待つタイルの鍵と、待つ rev（表示が届く前は null）。 */
+  waiting: Map<string, number> | null;
 }
 
 /** 仮の筆の寿命（モジュールの説明）。どれも描き直しが要れば true を返す。 */
@@ -221,17 +223,22 @@ export class OverlayTracker {
     return this.drop((p) => p.seq !== null && p.seq <= seq);
   }
 
-  /** 要求 `seq` の表示が届いた。`waitKeys` は解き終えるのを待つタイル（空ならすぐ外す）。 */
-  shown(seq: number, waitKeys: ReadonlySet<string>): boolean {
+  /**
+   * 要求 `seq` の表示が届いた。`wait` は解き終えるのを待つタイルの鍵と、その表示での rev（空ならすぐ外す）。その要求
+   * までに送った筆の待つものを、この表示のものに替える。
+   */
+  shown(seq: number, wait: ReadonlyMap<string, number>): boolean {
     for (const p of this.pending) {
-      if (p.seq !== null && p.seq <= seq) p.waiting = new Set(waitKeys);
+      if (p.seq !== null && p.seq <= seq) p.waiting = new Map(wait);
     }
     return this.drop((p) => p.waiting !== null && p.waiting.size === 0);
   }
 
-  /** タイルを解き終えた（か、読めなかった）。 */
-  tileReady(key: string): boolean {
-    for (const p of this.pending) p.waiting?.delete(key);
+  /** タイル `key` の rev `rev` の絵を解き終えた（か、その rev で読めなかった）。ほかの rev なら待ち続ける。 */
+  tileReady(key: string, rev: number): boolean {
+    for (const p of this.pending) {
+      if (p.waiting?.get(key) === rev) p.waiting.delete(key);
+    }
     return this.drop((p) => p.waiting !== null && p.waiting.size === 0);
   }
 

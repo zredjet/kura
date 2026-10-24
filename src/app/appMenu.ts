@@ -12,7 +12,7 @@ import {
   type SubmenuOptions,
 } from '@tauri-apps/api/menu';
 
-import { useEditorStore } from '../features/editor/editorStore';
+import { canSaveEditor, useEditorStore } from '../features/editor/editorStore';
 import {
   applyPixelArtToSelection,
   PIXEL_ART_CHOICES,
@@ -23,6 +23,7 @@ import { selectAllEntries } from '../features/library/useLibraryKeys';
 import { createPlaylistInteractive } from '../features/playlists/playlistActions';
 import { ja } from '../i18n/ja';
 import type { AssetChoiceDto } from '../ipc/asset';
+import { isTextEntry, markReplayed } from '../lib/keys';
 import { useItemCacheVersion } from '../stores/itemCache';
 import { useLibraryStore } from '../stores/libraryStore';
 import { useSettingsStore } from '../stores/settingsStore';
@@ -184,7 +185,8 @@ export function historyItemOptions(run: RunMenuAction): {
 
 /**
  * ファイルメニューの「保存」（⌘S）・「別名で保存…」（⌘⇧S）（M12）。そのキーを押したことにする（エディタのキーの処理が
- * 受ける）。画像エディタを閉じている間は押せない（作ったときは押せない）。
+ * 受ける）。画像エディタを閉じている間は押せない（作ったときは押せない）。「保存」は保存していない変更がないときも
+ * 押せない（`canSaveEditor`。元の形式に書けないときは押せる）。
  */
 export function saveItemOptions(run: RunMenuAction): {
   save: MenuItemOptions;
@@ -399,13 +401,12 @@ export function selectAllText(target: Element | null): boolean {
   return false;
 }
 
-/** 文字を編集する所（入力欄・テキストエリア・contenteditable）か。 */
+/**
+ * 文字を編集する所（文字を打つ入力欄・テキストエリア・contenteditable）か。チェックボックス・スライダー・選択は含めない
+ * （⌘Z はエディタへ。判定は画像エディタのキーと共有：`src/lib/keys.ts`）。
+ */
 export function isTextTarget(target: Element | null): boolean {
-  return (
-    target instanceof HTMLInputElement ||
-    target instanceof HTMLTextAreaElement ||
-    (target instanceof HTMLElement && target.isContentEditable)
-  );
+  return isTextEntry(target);
 }
 
 /**
@@ -471,17 +472,18 @@ export function selectAllCommand(target: Element | null = document.activeElement
  */
 export function replayKey(spec: KeySpec, target: Element | null = document.activeElement): void {
   const el = target instanceof HTMLElement ? target : document.body;
-  el.dispatchEvent(
-    new KeyboardEvent('keydown', {
-      key: spec.key,
-      code: spec.code,
-      metaKey: spec.meta ?? false,
-      shiftKey: spec.shift ?? false,
-      altKey: spec.alt ?? false,
-      bubbles: true,
-      cancelable: true,
-    }),
-  );
+  const event = new KeyboardEvent('keydown', {
+    key: spec.key,
+    code: spec.code,
+    metaKey: spec.meta ?? false,
+    shiftKey: spec.shift ?? false,
+    altKey: spec.alt ?? false,
+    bubbles: true,
+    cancelable: true,
+  });
+  // 離したキーは来ないので、押している間だけの道具（エディタの Space・⌥）には使わせない
+  markReplayed(event);
+  el.dispatchEvent(event);
 }
 
 /** メニューの項目を押したときの処理。 */
@@ -654,13 +656,19 @@ export async function installAppMenu(): Promise<void> {
         })
         .catch((error: unknown) => console.warn('表示のメニューを替えられませんでした', error));
     };
+    // 「保存」は保存できるとき（保存していない変更がある・元の形式に書けない）だけ、「別名で保存…」は開いている間
+    let canSave = false;
     useEditorStore.subscribe((now, before) => {
       if ((now.phase === 'closed') !== (before.phase === 'closed')) {
         swapView(now.phase !== 'closed');
       }
       if ((now.phase === 'open') !== (before.phase === 'open')) {
-        void save.save.setEnabled(now.phase === 'open');
         void save.saveAs.setEnabled(now.phase === 'open');
+      }
+      const nowCanSave = canSaveEditor(now);
+      if (nowCanSave !== canSave) {
+        canSave = nowCanSave;
+        void save.save.setEnabled(nowCanSave);
       }
       if (now.phase !== before.phase || now.status !== before.status) {
         syncHistory();

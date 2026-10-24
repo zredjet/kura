@@ -176,6 +176,39 @@ describe('表示の結果とタイル', () => {
     expect(c.tiles.get('0/0/1/0')?.rev).toBe(1);
   });
 
+  it('404 の取り直しは、そのとき表示している rev で（読んでいる間に表示が進んでも空かない）', async () => {
+    const { c, loader } = setup();
+    c.applyView(view(), 0, { ...WHOLE, rect: { x: 0, y: 0, w: 100, h: 100 } });
+    await loader.resolve(url(1, 0, 0, 0));
+    const wide = { ...WHOLE, rect: { x: 0, y: 0, w: 300, h: 100 } };
+    c.applyView(view({ rev: 10, changed: { type: 'tiles', frames: [] } }), 1, wide);
+    expect(loader.urls).toContain(url(1, 0, 1, 0));
+    // Rust が配るのは今と直前の表示だけ：rev 10 はもう配られない
+    c.applyView(view({ rev: 11, changed: { type: 'tiles', frames: [] } }), 2, wide);
+    c.applyView(view({ rev: 12, changed: { type: 'tiles', frames: [] } }), 3, wide);
+    await loader.reject(url(1, 0, 1, 0), new TileHttpError(404));
+    expect(loader.urls).toContain(url(12, 0, 1, 0));
+    expect(loader.urls).not.toContain(url(10, 0, 1, 0));
+    await loader.resolve(url(12, 0, 1, 0));
+    expect(c.tiles.get('0/0/1/0')?.rev).toBe(1);
+  });
+
+  it('読んでいる間にタイルが変わったら、404 は取り直さず今の rev を読む', async () => {
+    const { c, loader } = setup();
+    c.applyView(view(), 0, { ...WHOLE, rect: { x: 0, y: 0, w: 100, h: 100 } });
+    await loader.resolve(url(1, 0, 0, 0));
+    const wide = { ...WHOLE, rect: { x: 0, y: 0, w: 300, h: 100 } };
+    c.applyView(view({ rev: 10, changed: { type: 'tiles', frames: [] } }), 1, wide);
+    c.applyView(
+      view({ rev: 11, changed: { type: 'tiles', frames: [{ frame: 0, tiles: [[1, 0]] }] } }),
+      2,
+      wide,
+    );
+    await loader.reject(url(1, 0, 1, 0), new TileHttpError(404));
+    await loader.resolve(url(11, 0, 1, 0));
+    expect(c.tiles.get('0/0/1/0')?.rev).toBe(11);
+  });
+
   it('描く中身：見えているタイルを画像の矩形の中に、拡大は最近傍で。市松模様は透明を持てる形式だけ', async () => {
     const { c, loader, clock, scenes } = setup();
     c.attach({ canvas: document.createElement('canvas'), checker: null });
@@ -230,6 +263,67 @@ describe('表示の結果とタイル', () => {
     expect(scene.tiles.every((t) => t.clip !== null)).toBe(true);
   });
 
+  it('段を替えたあとに rev が進んだら（中身が変わったら）、前の段のタイルで埋めない', async () => {
+    const { c, loader } = setup({ w: 4000, h: 2000 });
+    const big = (over: Partial<EditViewDto>) =>
+      view({
+        fullWidth: 4000,
+        fullHeight: 2000,
+        width: 4000,
+        height: 2000,
+        level: 0,
+        frames: [{ index: 0, x: 0, y: 0, w: 4000, h: 2000, durationMs: null }],
+        ...over,
+      });
+    c.applyView(
+      big({
+        level: 2,
+        width: 1000,
+        height: 500,
+        frames: [{ index: 0, x: 0, y: 0, w: 1000, h: 500, durationMs: null }],
+      }),
+      0,
+      WHOLE,
+    );
+    for (const u of [...loader.urls]) await loader.resolve(u);
+    c.setZoom(1);
+    c.applyView(big({}), 1, WHOLE);
+    expect(c.scene().tiles.some((t) => t.clip !== null)).toBe(true);
+    // 反転のように全体が変わった：段 2 の絵は編集の前の中身
+    c.applyView(big({ rev: 5 }), 2, WHOLE);
+    c.panBy(-300, -200);
+    expect(c.scene().tiles).toHaveLength(0);
+  });
+
+  it('同じ段でも形が変わったら（all で大きさが違う）、その段の古い絵は出さない', async () => {
+    const { c, loader } = setup();
+    c.applyView(view(), 0, WHOLE);
+    const old: FakeBitmap[] = [];
+    for (const u of [...loader.urls]) old.push(await loader.resolve(u));
+    c.applyView(
+      view({
+        rev: 2,
+        fullWidth: 300,
+        fullHeight: 300,
+        width: 300,
+        height: 300,
+        frames: [{ index: 0, x: 0, y: 0, w: 300, h: 300, durationMs: null }],
+      }),
+      1,
+      WHOLE,
+    );
+    expect(c.scene().tiles).toHaveLength(0);
+    expect(old.every((b) => b.close.mock.calls.length === 1)).toBe(true);
+  });
+
+  it('同じ形の all（中身だけが変わった）では、新しい絵が届くまで古い絵を出す', async () => {
+    const { c, loader } = setup();
+    c.applyView(view(), 0, WHOLE);
+    for (const u of [...loader.urls]) await loader.resolve(u);
+    c.applyView(view({ rev: 2 }), 1, WHOLE);
+    expect(c.scene().tiles).toHaveLength(6);
+  });
+
   it('閉じたら絵をすべて close し、あとから届いた絵も close する', async () => {
     const { c, loader } = setup();
     c.applyView(view(), 0, WHOLE);
@@ -274,6 +368,64 @@ describe('ズーム・パンと頼み直し', () => {
     expect(c.fitting).toBe(true);
   });
 
+  it('表示の結果で画像が小さくなったら（切り抜いた）、収め直した倍率で止まってから頼み直す', () => {
+    const { c, clock, onIdle } = setup({ dpr: 2, w: 4000, h: 3000 });
+    const sized = (w: number, h: number, over: Partial<EditViewDto> = {}) =>
+      view({
+        fullWidth: w,
+        fullHeight: h,
+        width: w,
+        height: h,
+        frames: [{ index: 0, x: 0, y: 0, w, h, durationMs: null }],
+        ...over,
+      });
+    const before = c.zoom;
+    c.applyView(sized(4000, 3000), 0, { ...WHOLE, scale: before * 2 });
+    clock.runTimers();
+    onIdle.mockClear();
+    c.applyView(sized(1000, 750, { rev: 2 }), 1, { ...WHOLE, scale: before * 2 });
+    expect(c.zoom).toBeGreaterThan(before);
+    expect(onIdle).not.toHaveBeenCalled();
+    clock.runTimers();
+    expect(onIdle).toHaveBeenCalledOnce();
+    const vp = onIdle.mock.calls[0]?.[0] as EditViewportDto;
+    expect(vp.scale).toBe(c.zoom * 2);
+  });
+
+  it('収めていない表示で見ていた範囲が新しい画像の外になったら、新しい画像の中を頼み直す', () => {
+    const { c, clock, onIdle } = setup({ w: 4000, h: 3000 });
+    const sized = (w: number, h: number, over: Partial<EditViewDto> = {}) =>
+      view({
+        fullWidth: w,
+        fullHeight: h,
+        width: w,
+        height: h,
+        frames: [{ index: 0, x: 0, y: 0, w, h, durationMs: null }],
+        ...over,
+      });
+    c.setZoom(1);
+    c.panBy(-3000, 0);
+    clock.runTimers();
+    const right = c.viewport();
+    expect(right.rect?.x ?? 0).toBeGreaterThan(1000);
+    c.applyView(sized(4000, 3000), 0, right);
+    onIdle.mockClear();
+    c.applyView(sized(1000, 750, { rev: 2 }), 1, right);
+    clock.runTimers();
+    expect(onIdle).toHaveBeenCalledOnce();
+    const vp = onIdle.mock.calls[0]?.[0] as EditViewportDto;
+    const rect = vp.rect ?? { x: 0, y: 0, w: 1000, h: 750 };
+    expect(rect.x + rect.w).toBeLessThanOrEqual(1000);
+    expect(rect.y + rect.h).toBeLessThanOrEqual(750);
+  });
+
+  it('開いた直後（表示の前）の大きさの置き直しでは頼み直さない', () => {
+    const { c, clock, onIdle } = setup();
+    c.setImage({ w: 1200, h: 600, pixelArt: false });
+    expect(clock.timers.size).toBe(0);
+    expect(onIdle).not.toHaveBeenCalled();
+  });
+
   it('フレームを替えたらすぐ頼み直す', () => {
     const { c, onIdle } = setup();
     c.setFrame(2);
@@ -315,6 +467,47 @@ describe('仮の筆', () => {
     expect(c.scene().overlays).toHaveLength(1);
     await loader.resolve(url(3, 0, 0, 0));
     expect(c.scene().overlays).toHaveLength(0);
+  });
+
+  it('同じタイルを rev 6・rev 7 で：rev 6 が届いても rev 7 を待つ筆は外さず、rev 7 を読み終えてから外す', async () => {
+    const { c, loader } = setup();
+    c.applyView(view(), 0, WHOLE);
+    for (const u of [...loader.urls]) await loader.resolve(u);
+    const draw = (seq: number, at: [number, number]) => {
+      c.beginStroke(spec, at);
+      const done = c.endStroke();
+      if (!done) throw new Error('筆がない');
+      c.strokeSent(done.pending, seq, 0);
+    };
+    const changed = (rev: number) =>
+      view({ rev, changed: { type: 'tiles', frames: [{ frame: 0, tiles: [[0, 0]] }] } });
+    draw(5, [1, 1]);
+    c.applyView(changed(6), 5, WHOLE);
+    expect(loader.urls).toContain(url(6, 0, 0, 0));
+    draw(6, [2, 2]);
+    c.applyView(changed(7), 6, WHOLE);
+    // 鍵ごとに 1 本：rev 6 を読み終えるまで rev 7 は読まない（届く順が入れ替わらない）
+    expect(loader.urls).not.toContain(url(7, 0, 0, 0));
+    await loader.resolve(url(6, 0, 0, 0));
+    expect(c.scene().overlays).toHaveLength(2);
+    expect(c.tiles.get('0/0/0/0')?.rev).toBe(6);
+    expect(loader.urls).toContain(url(7, 0, 0, 0));
+    await loader.resolve(url(7, 0, 0, 0));
+    expect(c.scene().overlays).toHaveLength(0);
+    expect(c.tiles.get('0/0/0/0')?.rev).toBe(7);
+  });
+
+  it('取り消しで rev が戻ったあとに届いた先の rev の絵は、今の絵を上書きしない', async () => {
+    const { c, loader } = setup();
+    c.applyView(view(), 0, WHOLE);
+    for (const u of [...loader.urls]) await loader.resolve(u);
+    const tile = (rev: number) =>
+      view({ rev, changed: { type: 'tiles', frames: [{ frame: 0, tiles: [[0, 0]] }] } });
+    c.applyView(tile(2), 1, WHOLE);
+    c.applyView(tile(1), 2, WHOLE);
+    const late = await loader.resolve(url(2, 0, 0, 0));
+    expect(late.close).toHaveBeenCalledOnce();
+    expect(c.tiles.get('0/0/0/0')?.rev).toBe(1);
   });
 
   it('断られた・やめた筆はすぐ外す', () => {

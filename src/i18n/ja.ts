@@ -937,6 +937,7 @@ export const ja = {
     handHint: 'ドラッグで動かします（Space を押している間も）',
     eyedropperHint: 'クリックした画素の色を拾います（⌥ を押している間も）',
     indexedHint: 'パレットの画像は、スポイトで拾った色で描きます',
+    indexedPick: 'パレットの画像は、先にスポイト（I）でこの画像の色を拾ってください',
     eraserUnavailable: 'この画像は透明を持てないので、消しゴムは使えません',
     frames: 'コマ',
     framePosition: (i: string, n: string) => `${i} / ${n}`,
@@ -949,6 +950,7 @@ export const ja = {
     coords: (x: string, y: string) => `x ${x} · y ${y}`,
     reduced: '縮小して表示中',
     canvas: '編集中の画像',
+    canvasOf: (title: string) => `編集中の画像：${title}`,
     opening: '開いています…',
     openFailed: '開けませんでした',
     viewFailed: '表示できませんでした',
@@ -975,7 +977,7 @@ export const ja = {
     legacyOp: 'この操作は古い版で作られています。設定は変えられません',
     unknownOp: 'この版の Kura が知らない操作です',
     none: 'なし',
-    specify: '指定する',
+    specifyParam: (label: string) => `${label}を指定する`,
     transparent: '透明',
     disabledOp: '無効',
     rect: { x: 'X', y: 'Y', w: '幅', h: '高さ' },
@@ -995,6 +997,8 @@ export const ja = {
     } as Record<string, string>,
     paramColor: (label: string, hex: string) => `${label}を選ぶ（今は ${hex}）`,
     warnings: '警告',
+    /** 警告の 1 行（「操作の名前：言葉」。操作を指さない警告は言葉だけ）。 */
+    warningLine: (op: string | null, text: string) => (op ? `${op}：${text}` : text),
     /** 指摘の種類（bindings の `IssueCode`）。 */
     issues: {
       badGraph: '文書の形が正しくありません',
@@ -1035,6 +1039,8 @@ export const ja = {
     cropApply: '切り抜く（↵）',
     cropCancel: 'やめる（esc）',
     cropWaiting: '切り抜く前の画像を表示しています…',
+    cropUseParams:
+      'この切り抜きの後ろに大きさや向きを変える操作があるので、枠では直せません。右の欄で範囲を直してください',
     // ===== 保存 =====
     save: '保存',
     saveKey: '保存（⌘S）',
@@ -1048,6 +1054,13 @@ export const ja = {
     savedAs: (title: string) => `「${title}」として保存しました`,
     unchanged: '中身が変わらないので、版だけを足しました',
     reverted: '戻しました',
+    savedClosed: (title: string) => `「${title}」を保存しました`,
+    saveFailedClosed: (title: string, reason: string) =>
+      reason
+        ? `「${title}」を保存できませんでした：${reason}`
+        : `「${title}」を保存できませんでした`,
+    assetSettingsCheck:
+      '大きさが変わりました。格子などの素材の設定が新しい大きさに合っているか確かめてください',
     existing: (role: string) =>
       `同じ中身のアイテム（${role}）がすでにあるので、新しいアイテムは作りませんでした`,
     existingSelf: 'このアイテムと同じ中身なので、新しいアイテムは作りませんでした',

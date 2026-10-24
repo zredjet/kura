@@ -1,8 +1,10 @@
 /**
  * 画像エディタのキー（design.md §6 の「画像エディタ」の列。段 5a の道具と、段 5b の切り抜き・右パネル・保存）。
  *
- * シアターと同じく capture で受け、処理したら伝えない（ライブラリ・シアターのキーより先に）。入力欄・日本語入力の変換中・
- * シート・メニューの上では受けない。
+ * シアターと同じく capture で受け、処理したら伝えない（ライブラリ・シアターのキーより先に）。文字を打つ入力欄・日本語入力の
+ * 変換中・シート・メニューの上では受けない。選択・スライダー・スイッチ（文字は打たないが矢印・Space を自分で使う部品）に
+ * フォーカスがあるときは ⌘ の組み合わせ（⌘Z・⌘S・⌘0 など）だけを受ける。メニューが送ったキー（離したキーが来ない）では
+ * 押している間だけの道具にしない。
  *
  * | キー | 動き |
  * |---|---|
@@ -14,7 +16,7 @@
  * | ⌘S・⌘⇧S | 保存（上書き）・別名で保存…（ファイルメニューの項目もこのキー） |
  * | Space（押している間） | 手のひら |
  * | ⌥（押している間） | スポイト（ペン・消しゴム・塗りつぶしのとき） |
- * | [ ]（⇧ で 10 ずつ） | 筆の大きさ |
+ * | [ ]（⇧ で 10 ずつ。⇧ を押すと `key` は { } になる） | 筆の大きさ |
  * | ← → | 前・次のコマ（アニメの画像） |
  * | ⌘Z・⇧⌘Z | 取り消す・やり直す（編集メニューの項目もこのキーを押したことにする） |
  * | ⌘0・⌘1・⌘+・⌘− | 全体を表示・100%・拡大・縮小（表示メニューの項目もこのキー） |
@@ -25,6 +27,7 @@
 import { useEffect } from 'react';
 
 import { isImeKey } from '../../lib/ime';
+import { isKeyControl, isReplayed, isTextEntry } from '../../lib/keys';
 import { openSaveAs, requestCloseEditor, requestSave } from './editorSave';
 import {
   cancelCrop,
@@ -48,14 +51,6 @@ import {
 import { type EditorTool, useToolStore } from './toolStore';
 import { formatCanBeTransparent } from './viewMath';
 
-/** 文字を入力している場所か。 */
-function isTyping(target: EventTarget | null): boolean {
-  return (
-    target instanceof HTMLElement &&
-    (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
-  );
-}
-
 /** エディタの上にシート・メニュー・色を選ぶ部品が開いているか。 */
 function isBlocked(): boolean {
   return document.querySelector('[data-sheet], [role="menu"]') !== null;
@@ -73,11 +68,25 @@ const TOOL_KEYS: Record<string, EditorTool> = {
 /** ⌥ で一時的にスポイトにする道具。 */
 const PAINTING: readonly EditorTool[] = ['pen', 'eraser', 'fill'];
 
+/**
+ * 筆の大きさのキー（[ は −1、] は +1、ほかは 0）。⇧ を押すと `key` は { } になる（US・JIS とも）。`key` が括弧でない配列
+ * では、キーの位置（`code`）で見る。
+ */
+function bracketOf(e: KeyboardEvent, key: string): number {
+  if (key === '[' || key === '{') return -1;
+  if (key === ']' || key === '}') return 1;
+  if (e.code === 'BracketLeft') return -1;
+  if (e.code === 'BracketRight') return 1;
+  return 0;
+}
+
 /** キーを押したとき（処理したら true）。 */
 export function handleEditorKey(e: KeyboardEvent): boolean {
   const s = useEditorStore.getState();
   if (e.defaultPrevented || s.phase === 'closed' || isBlocked() || isImeKey(e)) return false;
-  if (isTyping(e.target)) return false;
+  if (isTextEntry(e.target)) return false;
+  // 選択・スライダー・スイッチの上では、矢印・Space などは部品に任せ、⌘ の組み合わせだけを受ける
+  if (isKeyControl(e.target) && !e.metaKey) return false;
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
 
   if (e.metaKey) {
@@ -131,13 +140,16 @@ export function handleEditorKey(e: KeyboardEvent): boolean {
     }
     if (!e.altKey && nudgeCropRect(key, e.shiftKey)) return true;
   }
+  // 押している間だけの道具（メニューが送ったキーでは替えない：離したキーが来ず、戻らなくなる）
   if (key === 'Alt') {
+    if (isReplayed(e)) return false;
     if (PAINTING.includes(useToolStore.getState().tool)) setTemporaryTool('eyedropper');
     return true;
   }
   if (e.altKey) return false;
 
   if (key === ' ') {
+    if (isReplayed(e)) return false;
     if (!e.repeat) setTemporaryTool('hand');
     return true;
   }
@@ -148,13 +160,12 @@ export function handleEditorKey(e: KeyboardEvent): boolean {
     else useToolStore.getState().setTool(tool);
     return true;
   }
+  const bracket = bracketOf(e, key);
+  if (bracket !== 0) {
+    useToolStore.getState().stepSize(bracket * (e.shiftKey ? 10 : 1));
+    return true;
+  }
   switch (key) {
-    case '[':
-      useToolStore.getState().stepSize(e.shiftKey ? -10 : -1);
-      return true;
-    case ']':
-      useToolStore.getState().stepSize(e.shiftKey ? 10 : 1);
-      return true;
     case 'ArrowLeft':
       stepEditorFrame(-1);
       return true;

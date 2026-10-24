@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 import { Button } from '../../components/Button/Button';
 import { Dialog } from '../../components/Dialog/Dialog';
@@ -118,12 +119,7 @@ function WarningsSheet() {
       <ul className={styles.sheetList}>
         {warnings.map((w, i) => {
           const node = w.node === null ? undefined : nodes[w.node];
-          return (
-            <li key={i}>
-              {node ? `${opName(node.op)}：` : ''}
-              {issueText(w)}
-            </li>
-          );
+          return <li key={i}>{t.warningLine(node ? opName(node.op) : null, issueText(w))}</li>;
         })}
       </ul>
       <p className={styles.sheetMessage}>{t.warningsMessage}</p>
@@ -332,10 +328,7 @@ function FailedSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'saveFaile
   );
 }
 
-/** エディタの上に出すシート（下書き・未保存で閉じる・警告・別名・元に戻す・版の一覧・失敗）。 */
-export function EditorSheets() {
-  const sheet = useEditorStore((s) => s.sheet);
-  if (!sheet) return null;
+function SheetOf({ sheet }: { sheet: EditorSheet }) {
   switch (sheet.kind) {
     case 'draft':
       return <DraftSheet />;
@@ -354,4 +347,15 @@ export function EditorSheets() {
     case 'saveFailed':
       return <FailedSheet sheet={sheet} />;
   }
+}
+
+/**
+ * エディタの上に出すシート（下書き・未保存で閉じる・警告・別名・元に戻す・版の一覧・失敗）。エディタの層（z-index 16）の
+ * 中に描くと、ルートのシート（設定など）の下に隠れるので、body に出す（設定のシートからライブラリを切り替えるとき・
+ * 設定を開いたまま窓を閉じるときも、未保存のシートがいちばん上に出る）。
+ */
+export function EditorSheets() {
+  const sheet = useEditorStore((s) => s.sheet);
+  if (!sheet) return null;
+  return createPortal(<SheetOf sheet={sheet} />, document.body);
 }

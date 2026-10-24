@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { useMenuStore } from '../../components/Menu/menuStore';
@@ -83,6 +83,7 @@ function setDoc(nodes: EditNodeDto[], selected: number | null = null, outputs = 
     selected,
     issues: [],
     warnings: [],
+    acked: 0,
   });
 }
 
@@ -276,10 +277,109 @@ describe('引数パネル', () => {
   it('既定値が null の引数は「指定する」のスイッチ（キャンバスの広げた部分の色）', () => {
     setDoc([node(7, 'image.canvas', { rect: { x: 0, y: 0, w: 64, h: 32 }, fill: null })], 7);
     render(<OpsPanel />);
-    const toggle = screen.getByRole('switch', { name: `広げた部分の色を${t.specify}` });
+    const toggle = screen.getByRole('switch', { name: t.specifyParam('広げた部分の色') });
     expect(toggle).not.toBeChecked();
     fireEvent.click(toggle);
     expect(sendParam).toHaveBeenLastCalledWith(7, 'fill', { kind: 'set', value: [0, 0, 0, 255] });
+  });
+});
+
+describe('引数の欄の手元の値', () => {
+  it('別の操作を選ぶと欄を作り直し、前の操作の手元の値を持ち越さない（送るのも新しい操作の値）', () => {
+    setDoc(
+      [
+        node(1, 'image.crop', { rect: { x: 0, y: 0, w: 15, h: 80 } }),
+        node(2, 'image.canvas', { rect: { x: 0, y: 0, w: 64, h: 32 }, fill: null }),
+      ],
+      1,
+    );
+    const { rerender } = render(<OpsPanel />);
+    const crop = screen.getByRole('group', { name: '範囲' });
+    const w = within(crop).getByLabelText(t.rect.w);
+    fireEvent.change(w, { target: { value: '150' } });
+    fireEvent.blur(w);
+    // 応えがまだなので、手元の値のまま
+    expect(w).toHaveValue(150);
+
+    act(() => useEditorStore.setState({ selected: 2 }));
+    rerender(<OpsPanel />);
+    const canvas = screen.getByRole('group', { name: '新しいキャンバス' });
+    expect(within(canvas).getByLabelText(t.rect.w)).toHaveValue(64);
+    vi.mocked(sendParam).mockClear();
+    fireEvent.change(within(canvas).getByLabelText(t.rect.x), { target: { value: '5' } });
+    expect(sendParam).toHaveBeenLastCalledWith(2, 'rect', {
+      kind: 'nudge',
+      value: { x: 5, y: 0, w: 64, h: 32 },
+    });
+  });
+
+  it('断られた値は欄に残さず、隣の欄を変えても送り直さない', () => {
+    vi.mocked(sendParam).mockReturnValue(1);
+    setDoc([node(1, 'image.crop', { rect: { x: 0, y: 0, w: 15, h: 80 } })], 1);
+    render(<OpsPanel />);
+    const group = screen.getByRole('group', { name: '範囲' });
+    const w = within(group).getByLabelText(t.rect.w);
+    fireEvent.change(w, { target: { value: '150' } });
+    expect(sendParam).toHaveBeenLastCalledWith(1, 'rect', {
+      kind: 'nudge',
+      value: { x: 0, y: 0, w: 150, h: 80 },
+    });
+    // 断られた（文書は w=15 のまま）：送った手の結果が確定
+    act(() => useEditorStore.setState({ acked: 1 }));
+    fireEvent.blur(w);
+    expect(w).toHaveValue(15);
+    expect(sendParam).toHaveBeenLastCalledWith(1, 'rect', { kind: 'seal' });
+    fireEvent.change(within(group).getByLabelText(t.rect.x), { target: { value: '5' } });
+    expect(sendParam).toHaveBeenLastCalledWith(1, 'rect', {
+      kind: 'nudge',
+      value: { x: 5, y: 0, w: 15, h: 80 },
+    });
+  });
+
+  it('色の引数：応えの前に続けて変えても前の変更を土台にし、見本を押して閉じたら seal', () => {
+    vi.mocked(sendParam).mockReturnValue(1);
+    setDoc(
+      [node(7, 'image.canvas', { rect: { x: 0, y: 0, w: 64, h: 32 }, fill: [255, 0, 0, 255] })],
+      7,
+    );
+    render(<OpsPanel />);
+    const swatch = screen.getByRole('button', { name: t.paramColor('広げた部分の色', '#FF0000') });
+    fireEvent.click(swatch);
+    fireEvent.change(screen.getByRole('slider', { name: t.hue }), { target: { value: '240' } });
+    expect(sendParam).toHaveBeenLastCalledWith(7, 'fill', {
+      kind: 'nudge',
+      value: [0, 0, 255, 255],
+    });
+    // 応えの前に不透明度を変えても、色相の変更が残る
+    fireEvent.change(screen.getByRole('slider', { name: t.opacity }), { target: { value: '128' } });
+    expect(sendParam).toHaveBeenLastCalledWith(7, 'fill', {
+      kind: 'nudge',
+      value: [0, 0, 255, 128],
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: t.paramColor('広げた部分の色', '#0000FF80') }),
+    );
+    expect(sendParam).toHaveBeenLastCalledWith(7, 'fill', { kind: 'seal' });
+    expect(screen.queryByRole('slider', { name: t.hue })).toBeNull();
+  });
+
+  it('長さの % は整数から刻む（下限 0.01 を刻みの起点にしない）', () => {
+    setDoc(
+      [
+        node(5, 'image.resize', {
+          width: { scale: { num: 100, den: 100 } },
+          height: 'auto',
+          filter: 'nearest',
+        }),
+      ],
+      5,
+    );
+    render(<OpsPanel />);
+    const input = screen.getByRole('spinbutton', { name: '幅' }) as HTMLInputElement;
+    expect(input).toHaveValue(100);
+    input.stepUp();
+    expect(input.value).toBe('101');
+    expect(input.validity.stepMismatch).toBe(false);
   });
 });
 

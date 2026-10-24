@@ -6,6 +6,8 @@
  * - ハンドルは 4 隅と 4 辺、中をドラッグすると動かす。⇧ で比（始めた時の枠の縦横比）を保つ：隅は向かいの隅を、辺は向かいの
  *   辺の中央を止めて広げる。
  * - 矢印で 1px・⇧ 矢印で 10px 動かす。
+ * - 枠の外から取り直すドラッグは、押した点と今の点を画像の中に切ってから矩形にする（画像の外へはみ出しても、押した辺が
+ *   動かない）。
  */
 
 import type { Rect } from './viewMath';
@@ -139,6 +141,20 @@ export function dragCrop(
   const maxW = 2 * Math.min(cx, b.w - cx);
   const [w, h] = fitRatio(want * ratio, want, ratio, maxW, maxH);
   return clampCrop({ x: cx - w / 2, y: top ? ay - h : ay, w, h }, b);
+}
+
+/**
+ * 枠の外から取り直す矩形（押した点 `ax`・`ay` と今の点 `bx`・`by`。画像の画素で、小数でもよい）。両方の点を画像の中に
+ * 切ってから、2 点を含む整数の矩形にする（幅・高さは 1 以上）。
+ */
+export function newCropRect(ax: number, ay: number, bx: number, by: number, b: Bounds): Rect {
+  const bw = Math.max(1, Math.round(b.w));
+  const bh = Math.max(1, Math.round(b.h));
+  const x0 = clamp(Math.floor(Math.min(ax, bx)), 0, bw - 1);
+  const y0 = clamp(Math.floor(Math.min(ay, by)), 0, bh - 1);
+  const x1 = clamp(Math.ceil(Math.max(ax, bx)), x0 + 1, bw);
+  const y1 = clamp(Math.ceil(Math.max(ay, by)), y0 + 1, bh);
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
 /** 矢印で動かす（`shift` で 10px）。 */

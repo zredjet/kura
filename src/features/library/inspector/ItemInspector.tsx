@@ -42,8 +42,9 @@ const t = ja.inspector;
 export const TAG_FOCUS_KEY = 'inspector-tags';
 
 /**
- * 1 件のアイテムの詳細と編集（Main.dc.html のインスペクタ）。画像なら見出しの下に「編集…」（画像エディタ。M12。
- * エディタの右パネルの中では出さない：`editable` が偽）。
+ * 1 件のアイテムの詳細と編集（Main.dc.html のインスペクタ）。画像なら見出しの下に「編集…」（画像エディタ。M12）。
+ * エディタの右パネルの中（`editable` が偽）では、「編集…」と「その他の操作」のメニュー（編集・クイックルック・再生・
+ * ゴミ箱に入れるなど：編集中のアイテムを開き直す・ゴミ箱に入れる操作がエディタを通らずに動く）を出さない。
  */
 export function ItemInspector({ id, editable = true }: { id: number; editable?: boolean }) {
   const detail = useLoaded(`item-${id}`, () => getItemDetail(id));
@@ -203,17 +204,19 @@ export function ItemInspector({ id, editable = true }: { id: number; editable?: 
         <dd className={styles.mono}>{shortHash(item.hash)}</dd>
       </dl>
 
-      <div className={styles.actions}>
-        <button
-          type="button"
-          className={styles.moreButton}
-          aria-label={t.more}
-          aria-haspopup="menu"
-          onClick={(e) => openMenuBelow(e.currentTarget, ja.itemMenu.label, itemMenu([id]))}
-        >
-          <MoreIcon size={16} />
-        </button>
-      </div>
+      {editable && (
+        <div className={styles.actions}>
+          <button
+            type="button"
+            className={styles.moreButton}
+            aria-label={t.more}
+            aria-haspopup="menu"
+            onClick={(e) => openMenuBelow(e.currentTarget, ja.itemMenu.label, itemMenu([id]))}
+          >
+            <MoreIcon size={16} />
+          </button>
+        </div>
+      )}
     </>
   );
 }

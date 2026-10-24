@@ -9,8 +9,15 @@
  *   existing（同じ中身のアイテムを示し、そこへ移れる）、失敗は Conflict・Busy・Mismatch・TooLarge などの分かる言葉のシート。
  * - 保存が最初の段（予算の確保を含む）から進まないときは「エディタを閉じると進みます」（予算を待って駐車している保存は、
  *   エディタの取り置きを外すと進む。Rust の Usage.parked は IPC に出ていないので、時間で見る）。
- * - 未保存で閉じるとき（‹・esc・ライブラリの切り替え・窓を閉じる）は［保存しない］［キャンセル］［保存］のシート。⌘Q（アプリの
- *   終了）は止められないが、Rust が閉じるときに下書きを置くので、次に開くと下書きのシートで戻せる。
+ * - 未保存で閉じるとき（‹・esc・ライブラリの切り替え・窓を閉じる）は［保存しない］［キャンセル］［保存］のシート。応えの
+ *   来ていない手（送った・ためた手）も未保存に数える。［保存しない］は下書きを捨て終えてから進む（窓を壊す・ライブラリを
+ *   切り替える）。［保存］は保存が終わってから閉じ、保存の間に描いた分があればもう一度聞く。⌘Q（アプリの終了）は止め
+ *   られないが、Rust が閉じるときに下書きを置くので、次に開くと下書きのシートで戻せる。
+ * - 保存（上書き）は保存していない変更がないときは積まない（元の形式に書けないときは積む）。積む前に、応えの来ていない
+ *   手の結果を待つ（保存に入るのは Rust の頭）。
+ * - 保存の途中でエディタを閉じても保存は続く。終わったら一覧・インスペクタ・サムネイルを読み直し、知らせる（失敗も）。
+ * - 上書き・版に戻したあと、大きさが変わり、アイテムに素材の設定（格子・ピボット・ループ点）があれば「新しい大きさに
+ *   合っているか確かめてください」と知らせる（設定は変えない。M12 の決定 11）。
  */
 
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -24,7 +31,8 @@ import {
   listEditVersions,
   saveEdit,
 } from '../../ipc/edit';
-import { getItems } from '../../ipc/items';
+import { getAsset } from '../../ipc/asset';
+import { getItems, type ItemSummaryDto } from '../../ipc/items';
 import { listJobs, type JobProgress } from '../../ipc/jobs';
 import { isIpcError } from '../../ipc/result';
 import { invalidateItems } from '../../stores/itemCache';
@@ -36,6 +44,7 @@ import { selectOne } from '../library/selection';
 import {
   type AfterClose,
   applyEditorStatus,
+  canSaveEditor,
   closeEditor,
   editorSession,
   type EditorSave,
@@ -44,7 +53,9 @@ import {
   openEditor,
   refreshEditorView,
   type SaveMode,
+  type SizeBefore,
   useEditorStore,
+  whenEditorSettled,
 } from './editorStore';
 import { effectiveFormat, outputChoice } from './formats';
 
@@ -101,6 +112,18 @@ interface Finished {
   mode: SaveMode;
   title: string | null;
   outcome: SaveOutcome | null;
+  before: SizeBefore | null;
+}
+
+/** エディタを閉じたあとも続いている保存（終わったら一覧を読み直し、知らせる）。 */
+interface DetachedSave {
+  mode: SaveMode;
+  title: string | null;
+  itemId: number | null;
+  itemTitle: string;
+  before: SizeBefore | null;
+  /** 積んだときのライブラリ（ほかのライブラリに替えたあとは知らせない）。 */
+  library: string | null;
 }
 
 /** 終わったが、まだ知らせていない保存（Rust が取り直しで状態を返したら知らせる）。 */
@@ -111,6 +134,10 @@ let closeAfterSave: AfterClose | null = null;
 let pendingClose: ((closed: boolean) => void) | null = null;
 let slowTimer: ReturnType<typeof setTimeout> | null = null;
 let reopening = false;
+/** 保存を積んでいる途中（応えの来ていない手を待っている・`edit_save` の応え待ち）。 */
+let starting = false;
+/** エディタを閉じたあとも続いている保存（ジョブ ID ごと）。 */
+const detached = new Map<number, DetachedSave>();
 
 function setSave(patch: Partial<EditorSave> | null): void {
   const save = useEditorStore.getState().save;
@@ -126,6 +153,24 @@ function settleClose(closed: boolean): void {
   pendingClose = null;
   closeAfterSave = null;
   resolve?.(closed);
+}
+
+/** エディタを閉じ（`edit_close` と、`discardDraft` なら下書きを捨てるのを終えてから）、閉じるのを待つ呼び手に答える。 */
+function finishClose(options: { discardDraft?: boolean } = {}): void {
+  closeAfterSave = null;
+  void closeEditor(options).then(() => settleClose(true));
+}
+
+/** 今のライブラリ（閉じたあとの保存の知らせを、替えたあとのライブラリで出さない）。 */
+function currentLibrary(): string | null {
+  return useLibraryStore.getState().info?.path ?? null;
+}
+
+/** アイテムの大きさ（分からなければ null）。 */
+function sizeOf(
+  item: Pick<ItemSummaryDto, 'width' | 'height'> | null | undefined,
+): SizeBefore | null {
+  return item?.width && item.height ? { w: item.width, h: item.height } : null;
 }
 
 function clearSlow(): void {
@@ -159,23 +204,34 @@ function forcedFormat(): EditFormatChoice {
   return forced ? { type: 'to', format } : null;
 }
 
-/** 保存のジョブを積む（積めたら true）。 */
+/** 保存を積んだ結果（積んだ・保存するものがなかった・積めなかった）。 */
+type StartResult = 'started' | 'nothing' | 'failed';
+
+/**
+ * 保存のジョブを積む。応えの来ていない手（送った・ためた手）の結果を待ってから積む（保存に入るのは Rust の頭）。上書きで
+ * 保存していない変更がなければ積まない（'nothing'）。
+ */
 async function startSave(
   mode: EditSaveModeDto,
   kind: SaveMode,
   title: string | null,
   closeAfter: AfterClose | null,
-): Promise<boolean> {
+): Promise<StartResult> {
   const session = editorSession();
-  const s = useEditorStore.getState();
-  if (!session || s.phase !== 'open') return false;
-  if (s.save) {
+  if (!session || useEditorStore.getState().phase !== 'open') return 'failed';
+  if (useEditorStore.getState().save || starting) {
     notify(t.saveBusy);
-    return false;
+    return 'failed';
   }
+  starting = true;
   try {
+    await whenEditorSettled();
+    const s = useEditorStore.getState();
+    if (editorSession() !== session || s.phase !== 'open') return 'failed';
+    if (kind === 'overwrite' && !canSaveEditor(s)) return 'nothing';
+    const before = sizeOf(s.item);
     const started = await saveEdit(session, mode, kind === 'revert' ? null : forcedFormat());
-    if (editorSession() !== session) return false;
+    if (editorSession() !== session) return 'failed';
     applyEditorStatus(started.status, started.doc);
     useEditorStore.setState({
       save: {
@@ -186,14 +242,15 @@ async function startSave(
         progress: null,
         slow: false,
         title,
+        before,
       },
     });
     closeAfterSave = closeAfter;
     finished = null;
     armSlow(started.job);
-    return true;
+    return 'started';
   } catch (error) {
-    if (editorSession() !== session) return false;
+    if (editorSession() !== session) return 'failed';
     if (isIpcError(error, 'Busy')) {
       notify(t.saveBusy);
     } else {
@@ -206,25 +263,41 @@ async function startSave(
         },
       });
     }
-    return false;
+    return 'failed';
+  } finally {
+    starting = false;
   }
 }
 
-/** 保存（⌘S。上書き）。警告があるときだけ確認のシートを出す。 */
+/** 上書きの保存を積み、閉じるのを待つ呼び手に答える（積めなければやめる、保存するものがなければ閉じる）。 */
+function startOverwrite(closeAfter: AfterClose | null): void {
+  void startSave({ type: 'overwrite' }, 'overwrite', null, closeAfter).then((result) => {
+    if (closeAfter === null) return;
+    if (result === 'failed') settleClose(false);
+    else if (result === 'nothing') finishClose();
+  });
+}
+
+/**
+ * 保存（⌘S・ファイル › 保存・ボタン。上書き）。保存していない変更がなければ何もしない（元の形式に書けないときは積む）。
+ * 警告があるときだけ確認のシートを出す。
+ */
 export function requestSave(closeAfter: AfterClose | null = null): void {
   const s = useEditorStore.getState();
-  if (s.phase !== 'open' || s.sheet || s.save) {
-    if (s.save) notify(t.saveBusy);
+  if (s.phase !== 'open' || s.sheet || s.save || starting) {
+    if (s.save || starting) notify(t.saveBusy);
     if (closeAfter !== null) settleClose(false);
+    return;
+  }
+  if (!canSaveEditor(s)) {
+    if (closeAfter !== null) finishClose();
     return;
   }
   if (s.warnings.length > 0) {
     useEditorStore.setState({ sheet: { kind: 'saveWarnings', closeAfter } });
     return;
   }
-  void startSave({ type: 'overwrite' }, 'overwrite', null, closeAfter).then((ok) => {
-    if (!ok && closeAfter !== null) settleClose(false);
-  });
+  startOverwrite(closeAfter);
 }
 
 /** 警告の確認のシートで「保存」。 */
@@ -232,9 +305,7 @@ export function confirmWarnings(): void {
   const sheet = useEditorStore.getState().sheet;
   const closeAfter = sheet?.kind === 'saveWarnings' ? sheet.closeAfter : null;
   useEditorStore.setState({ sheet: null });
-  void startSave({ type: 'overwrite' }, 'overwrite', null, closeAfter).then((ok) => {
-    if (!ok && closeAfter !== null) settleClose(false);
-  });
+  startOverwrite(closeAfter);
 }
 
 /** 別名で保存…（⌘⇧S）：名前のシート。 */
@@ -342,8 +413,8 @@ export function requestCloseEditor(then: AfterClose = 'none'): Promise<boolean> 
   const s = useEditorStore.getState();
   if (s.phase === 'closed') return Promise.resolve(true);
   if (s.phase !== 'open' || !hasUnsavedChanges(s)) {
-    closeEditor();
-    return Promise.resolve(true);
+    // `edit_close` を終えてから進む（ライブラリを切り替える前に閉じる）
+    return closeEditor().then(() => true);
   }
   return new Promise((resolve) => {
     // 前に待っていた呼び手はやめたことにする
@@ -363,8 +434,8 @@ export function answerUnsaved(answer: 'discard' | 'cancel' | 'save'): void {
     return;
   }
   if (answer === 'discard') {
-    closeEditor({ discardDraft: true });
-    settleClose(true);
+    // 下書きを捨て終えてから進む（先に窓を壊す・ライブラリを替えると、捨てる手が届かない・別のライブラリに届く）
+    finishClose({ discardDraft: true });
     return;
   }
   useEditorStore.setState({ sheet: null });
@@ -389,6 +460,42 @@ function refreshLibrary(itemIds: readonly number[]): void {
   void useLibraryStore.getState().refresh();
 }
 
+/**
+ * 大きさが変わり（`before` と `after` が違う）、アイテムに素材の設定（格子・ピボット・ループ点）があれば、新しい大きさに
+ * 合っているか確かめるよう知らせる（設定は変えない。M12 の決定 11）。
+ */
+async function checkAssetFit(
+  itemId: number,
+  before: SizeBefore | null,
+  after: SizeBefore | null,
+): Promise<void> {
+  if (!before || !after || (before.w === after.w && before.h === after.h)) return;
+  try {
+    const st = (await getAsset(itemId)).settings;
+    if (st.grid || st.pivot || st.loopRange) notify(t.assetSettingsCheck);
+  } catch (error) {
+    console.warn('素材の設定を読めませんでした', error);
+  }
+}
+
+/** 上書きのあと：エディタのアイテムの概要（大きさ・中身）を新しい今にし、素材の設定が合うかを確かめる。 */
+async function afterOverwrite(
+  itemId: number,
+  before: SizeBefore | null,
+  session: string | null,
+): Promise<void> {
+  try {
+    const [fresh] = await getItems([itemId]);
+    if (!fresh) return;
+    if (session !== null && editorSession() === session) {
+      if (useEditorStore.getState().item?.id === itemId) useEditorStore.setState({ item: fresh });
+    }
+    await checkAssetFit(itemId, before, sizeOf(fresh));
+  } catch (error) {
+    console.warn('保存したアイテムを読み直せませんでした', error);
+  }
+}
+
 /** 版に戻したあと：下書きを捨てて、新しい今で開き直す。 */
 async function reopenAfterRevert(): Promise<void> {
   const item = useEditorStore.getState().item;
@@ -400,11 +507,42 @@ async function reopenAfterRevert(): Promise<void> {
     await closeEditor({ discardDraft: true });
     await openEditor(fresh ?? item);
     notify(t.reverted);
+    await checkAssetFit(item.id, sizeOf(item), sizeOf(fresh));
   } catch (error) {
     notify(ja.common.failed(error instanceof Error ? error.message : String(error)));
   } finally {
     reopening = false;
   }
+}
+
+/** 同じ中身のアイテムがあった（existing）・別名で保存したときの知らせ（一覧を読み直す）。知らせたら true。 */
+function announceOther(
+  mode: SaveMode,
+  title: string | null,
+  o: SaveOutcome | null,
+  itemId: number | null,
+): boolean {
+  if (o?.outcome === 'existing') {
+    const self = o.itemId === itemId;
+    const text = self
+      ? t.existingSelf
+      : `${t.existing(t.existingRoles[o.role] ?? o.role)}${o.trashed ? t.existingTrashed : ''}`;
+    notify(
+      text,
+      self ? undefined : { label: t.showItem, run: () => revealItem(o.itemId, o.trashed) },
+    );
+    return true;
+  }
+  if (mode === 'saveAs') {
+    const newId = o?.itemId ?? null;
+    refreshLibrary([]);
+    notify(
+      t.savedAs(title ?? ''),
+      newId !== null ? { label: t.showItem, run: () => revealItem(newId, false) } : undefined,
+    );
+    return true;
+  }
+  return false;
 }
 
 /** 終わった保存を知らせる（Rust が取り直しの結果を返したあと：Rust の「保存しました」のあとに出す）。 */
@@ -415,31 +553,74 @@ function deliver(f: Finished): void {
   const s = useEditorStore.getState();
   const itemId = s.item?.id ?? null;
   const o = f.outcome;
-  if (o?.outcome === 'existing') {
-    const self = o.itemId === itemId;
-    const text = self
-      ? t.existingSelf
-      : `${t.existing(t.existingRoles[o.role] ?? o.role)}${o.trashed ? t.existingTrashed : ''}`;
-    notify(
-      text,
-      self ? undefined : { label: t.showItem, run: () => revealItem(o.itemId, o.trashed) },
-    );
-  } else if (f.mode === 'saveAs') {
-    const newId = o?.itemId ?? null;
-    refreshLibrary([]);
-    notify(
-      t.savedAs(f.title ?? ''),
-      newId !== null ? { label: t.showItem, run: () => revealItem(newId, false) } : undefined,
-    );
-  } else if (f.mode === 'overwrite') {
-    if (itemId !== null) refreshLibrary([itemId]);
+  if (!announceOther(f.mode, f.title, o, itemId) && f.mode === 'overwrite' && itemId !== null) {
+    refreshLibrary([itemId]);
     if (o?.outcome === 'unchanged') notify(t.unchanged);
+    else void afterOverwrite(itemId, f.before, editorSession());
   }
   if (closeAfterSave !== null) {
-    closeEditor();
-    settleClose(true);
+    const then = closeAfterSave;
+    closeAfterSave = null;
+    if (hasUnsavedChanges(useEditorStore.getState())) {
+      // 保存の間に描いた分がある：聞かずに閉じない（閉じるのを待つ呼び手はシートの答えを待つ）
+      useEditorStore.setState({ sheet: { kind: 'unsaved', then } });
+    } else {
+      finishClose();
+    }
   }
 }
+
+/** エディタを閉じたあとに終わった保存：一覧・インスペクタ・サムネイルを読み直し、知らせる（失敗も）。 */
+function onDetachedJob(event: JobProgress, d: DetachedSave): void {
+  if (event.state !== 'done' && event.state !== 'failed' && event.state !== 'canceled') return;
+  detached.delete(event.id);
+  // ほかのライブラリに替えたあとは、前のライブラリのアイテムを読み直さない
+  if (d.library !== currentLibrary()) return;
+  if (event.state === 'failed') {
+    notify(t.saveFailedClosed(d.itemTitle, event.message ?? ''));
+    return;
+  }
+  if (event.state !== 'done') return;
+  finishDetached(d, parseSaveResult(event.resultJson));
+}
+
+/** エディタを閉じたあとに終わった保存の知らせ（上書き・版に戻すは、大きさが変わって素材の設定があればそれも）。 */
+function finishDetached(d: DetachedSave, o: SaveOutcome | null): void {
+  if (announceOther(d.mode, d.title, o, d.itemId) || d.itemId === null) return;
+  refreshLibrary([d.itemId]);
+  if (o?.outcome === 'unchanged') {
+    notify(t.unchanged);
+    return;
+  }
+  notify(d.mode === 'revert' ? t.reverted : t.savedClosed(d.itemTitle));
+  void getItems([d.itemId]).then(
+    ([fresh]) => (fresh ? checkAssetFit(fresh.id, d.before, sizeOf(fresh)) : undefined),
+    () => undefined,
+  );
+}
+
+// エディタを閉じた（・別の画像を開いた）とき、続いている保存を覚える（終わったら一覧を読み直して知らせる）
+useEditorStore.subscribe((now, before) => {
+  const save = before.save;
+  if (!save || before.session === now.session) return;
+  clearSlow();
+  const d: DetachedSave = {
+    mode: save.mode,
+    title: save.title,
+    itemId: before.item?.id ?? null,
+    itemTitle: before.item?.title ?? '',
+    before: save.before,
+    library: currentLibrary(),
+  };
+  // 終わりを受けて、Rust の取り直しを待っていた保存は、ここで知らせる
+  if (finished?.job === save.job) {
+    const f = finished;
+    finished = null;
+    finishDetached(d, f.outcome);
+    return;
+  }
+  detached.set(save.job, d);
+});
 
 /** 失敗した保存の code と言葉をジョブの記録から読み、シートを出す。 */
 async function showFailure(job: number, mode: SaveMode, fallback: string | null): Promise<void> {
@@ -462,7 +643,12 @@ async function showFailure(job: number, mode: SaveMode, fallback: string | null)
 export function onEditorJob(event: JobProgress): void {
   if (event.kind !== 'edit') return;
   const save = useEditorStore.getState().save;
-  if (!save || event.id !== save.job) return;
+  if (!save || event.id !== save.job) {
+    // エディタを閉じたあとも続いている保存
+    const d = detached.get(event.id);
+    if (d) onDetachedJob(event, d);
+    return;
+  }
   const progress = event.progress ?? save.progress;
   const early = (progress ?? 0) <= FIRST_STAGE;
   setSave({ state: event.state, progress, slow: early ? save.slow : false });
@@ -474,6 +660,7 @@ export function onEditorJob(event: JobProgress): void {
       mode: save.mode,
       title: save.title,
       outcome: parseSaveResult(event.resultJson),
+      before: save.before,
     };
     // Rust がもう取り直していれば（ほかの要求で）すぐ知らせる。でなければ取り直しを頼み、その結果のあとに知らせる
     if (useEditorStore.getState().status?.saving !== save.job) deliver(finished);
@@ -561,7 +748,12 @@ function syncWindowGuard(): void {
 export function watchWindowClose(): () => void {
   if (!isTauri()) return () => undefined;
   const stop = useEditorStore.subscribe((now, before) => {
-    if (now.status !== before.status || now.save !== before.save || now.phase !== before.phase) {
+    if (
+      now.status !== before.status ||
+      now.save !== before.save ||
+      now.phase !== before.phase ||
+      now.pendingSteps !== before.pendingSteps
+    ) {
       syncWindowGuard();
     }
   });

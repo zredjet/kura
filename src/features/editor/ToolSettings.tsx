@@ -19,11 +19,15 @@ import {
   stepEditorFrame,
   useEditorStore,
 } from './editorStore';
+import { NumberInput } from './ParamFields';
 import { BRUSH_MAX, BRUSH_MIN, useToolStore } from './toolStore';
 
 const t = ja.editor;
 
-/** 大きさ・許容差の数の欄（範囲の外は丸める）。 */
+/**
+ * 大きさ・許容差・切り抜きの枠の数の欄（引数パネルと同じ数の欄：打っている間は手元の文字で、空や範囲の外の値は送らず、
+ * Enter・欄を離れたときに収めて確定する）。
+ */
 function NumberField({
   label,
   value,
@@ -43,18 +47,14 @@ function NumberField({
       <label htmlFor={id} className={styles.fieldLabel}>
         {label}
       </label>
-      <input
+      <NumberInput
         id={id}
         className={styles.number}
-        type="number"
+        value={value}
         min={min}
         max={max}
-        step={1}
-        value={value}
-        onChange={(e) => {
-          const v = Number(e.target.value);
-          if (Number.isFinite(v)) onChange(v);
-        }}
+        onValue={onChange}
+        onSeal={() => undefined}
       />
     </span>
   );
@@ -116,8 +116,8 @@ function BrushGroup() {
         <button
           type="button"
           className={styles.iconButton}
-          aria-label={`${t.smaller}（[）`}
-          title={`${t.smaller}（[）`}
+          aria-label={t.withKey(t.smaller, '[')}
+          title={t.withKey(t.smaller, '[')}
           disabled={size <= BRUSH_MIN}
           onClick={() => tools.stepSize(-1)}
         >
@@ -133,8 +133,8 @@ function BrushGroup() {
         <button
           type="button"
           className={styles.iconButton}
-          aria-label={`${t.larger}（]）`}
-          title={`${t.larger}（]）`}
+          aria-label={t.withKey(t.larger, ']')}
+          title={t.withKey(t.larger, ']')}
           disabled={size >= BRUSH_MAX}
           onClick={() => tools.stepSize(1)}
         >

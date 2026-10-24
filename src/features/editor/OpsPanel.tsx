@@ -180,9 +180,10 @@ function ParamsPanel() {
     body = <p className={styles.opsHint}>{latest ? t.legacyOp : t.unknownOp}</p>;
   } else {
     const { basic, advanced } = visibleParams(desc, params);
+    // ノードと引数で key する（別のノードを選んだら欄を作り直し、前のノードの手元の値を持ち越さない）
     const field = (spec: (typeof basic)[number]) => (
       <ParamField
-        key={spec.key}
+        key={`${node.id}:${spec.key}`}
         node={node.id}
         op={node.op}
         spec={spec}
@@ -242,10 +243,7 @@ function Warnings() {
           return (
             <li key={i} className={styles.warning}>
               <WarningIcon size={13} />
-              <span>
-                {node ? `${opName(node.op)}：` : ''}
-                {issueText(w)}
-              </span>
+              <span>{t.warningLine(node ? opName(node.op) : null, issueText(w))}</span>
             </li>
           );
         })}

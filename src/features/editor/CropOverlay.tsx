@@ -2,7 +2,7 @@ import { type PointerEvent, useEffect, useReducer, useRef } from 'react';
 
 import { ja } from '../../i18n/ja';
 import { formatCount } from '../../lib/format';
-import { CROP_HANDLES, type CropHandle, dragCrop } from './crop';
+import { CROP_HANDLES, type CropHandle, dragCrop, newCropRect } from './crop';
 import styles from './Editor.module.css';
 import { editorController, setCropRect, useEditorStore } from './editorStore';
 import { type Rect, screenToImage, toScreen } from './viewMath';
@@ -70,12 +70,8 @@ export function CropOverlay() {
     if (!g || g.id !== e.pointerId) return;
     const p = local(e);
     if (g.handle === 'new') {
-      // 枠の外から：押した画素と今の画素を含む矩形
-      const x0 = Math.floor(Math.min(g.x, p.x));
-      const y0 = Math.floor(Math.min(g.y, p.y));
-      const x1 = Math.ceil(Math.max(g.x, p.x));
-      const y1 = Math.ceil(Math.max(g.y, p.y));
-      setCropRect({ x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) });
+      // 枠の外から：押した画素と今の画素を含む矩形（画像の外へはみ出したら端で止める）
+      setCropRect(newCropRect(g.x, g.y, p.x, p.y, bounds));
       return;
     }
     setCropRect(dragCrop(g.start, g.handle, p.x - g.x, p.y - g.y, bounds, e.shiftKey));

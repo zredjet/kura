@@ -28,6 +28,7 @@ import {
 } from './editorSave';
 import { EditorSheets } from './EditorSheets';
 import {
+  canSaveEditor,
   editorUndo,
   editorZoom,
   reopenEditor,
@@ -35,7 +36,6 @@ import {
   toggleEditorInfo,
   useEditorStore,
 } from './editorStore';
-import { effectiveFormat, outputChoice } from './formats';
 import { OpsPanel } from './OpsPanel';
 import { ToolSettings } from './ToolSettings';
 import { EDITOR_TOOLS, type EditorTool, useToolStore } from './toolStore';
@@ -84,13 +84,9 @@ export function Editor() {
   );
 }
 
-/** 保存できるか（開いていて、保存の途中でなく、保存していない変更があるか、元の形式に書けず形式を変えて保存するとき）。 */
+/** 保存できるか（`canSaveEditor`：⌘S・ファイル › 保存と同じ条件）。 */
 function useCanSave(): boolean {
-  return useEditorStore((s) => {
-    if (s.phase !== 'open' || s.save || !s.status) return false;
-    if (s.status.dirty) return true;
-    return effectiveFormat(outputChoice(s.doc.outputs), s.source?.format ?? null).forced;
-  });
+  return useEditorStore(canSaveEditor);
 }
 
 /** 主ボタン「保存」（⌘S。進捗はボタンの中）と ▾（別名で保存…・元に戻す…・版の一覧…）。 */
@@ -183,7 +179,7 @@ function TopBar() {
         type="button"
         className={styles.round}
         aria-label={t.close}
-        title={`${t.close}（esc）`}
+        title={t.withKey(t.close, 'esc')}
         onClick={() => void requestCloseEditor()}
       >
         <ChevronLeftIcon size={16} strokeWidth={2} />
@@ -217,7 +213,7 @@ function TopBar() {
           type="button"
           className={styles.segment}
           aria-label={t.info}
-          title={`${t.info}（⌘I）`}
+          title={t.withKey(t.info, '⌘I')}
           aria-pressed={panel === 'info'}
           onClick={toggleEditorInfo}
         >

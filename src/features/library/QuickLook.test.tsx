@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AnimDto } from '../../ipc/asset';
@@ -8,6 +8,7 @@ import { getCached } from '../../stores/itemCache';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
 import { useFontFace } from '../asset/AssetStage';
+import { useEditorStore } from '../editor/editorStore';
 import { audioAsset, imageAsset, summary } from '../asset/testAssets';
 import { type AssetData, useAssetData } from '../asset/useAssetData';
 import { selectOne } from './selection';
@@ -115,5 +116,21 @@ describe('QuickLook の素材（M11）', () => {
   it('動画では素材の欄を読まない', () => {
     show(summary({ kind: 'video' }));
     expect(useAssetData).toHaveBeenCalledWith(null);
+  });
+});
+
+// design.md §3.1「画像エディタ」：クイックルックから開いたら、閉じるとクイックルックに戻る
+describe('QuickLook と画像エディタ', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('エディタを開いている間は描かず（エディタが下に隠れない）、閉じたら開いていた印のまま戻る', () => {
+    const view = show(summary());
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    act(() => useEditorStore.setState({ phase: 'open' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(useViewStore.getState().quickLook).toBe(true);
+    act(() => useEditorStore.setState({ phase: 'closed' }));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    view.unmount();
   });
 });

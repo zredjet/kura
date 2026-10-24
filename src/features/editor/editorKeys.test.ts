@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { markReplayed } from '../../lib/keys';
 import { openSaveAs, requestCloseEditor, requestSave } from './editorSave';
 import { handleEditorKey, handleEditorKeyUp } from './editorKeys';
 import {
@@ -95,12 +96,18 @@ describe('エディタのキー', () => {
   });
 
   it('[ ] で筆の大きさ（⇧ で 10 ずつ。1〜255）', () => {
-    press(']');
-    press(']', { shiftKey: true });
+    press(']', { code: 'BracketRight' });
+    // ⇧ を押すと key は { } になる（US・JIS とも）
+    expect(press('}', { shiftKey: true, code: 'BracketRight' })).toBe(true);
     expect(useToolStore.getState().size).toBe(12);
-    press('[', { shiftKey: true });
-    press('[', { shiftKey: true });
+    press('{', { shiftKey: true, code: 'BracketLeft' });
+    press('{', { shiftKey: true, code: 'BracketLeft' });
     expect(useToolStore.getState().size).toBe(1);
+    // JIS の [ は US の ] の位置（code は BracketRight）なので、key で見る
+    press(']', { code: 'Backslash' });
+    press(']', { code: 'Backslash' });
+    press('[', { code: 'BracketRight' });
+    expect(useToolStore.getState().size).toBe(2);
   });
 
   it('⌘Z・⇧⌘Z・⌘0・⌘1・⌘+・⌘−・⌘I', () => {
@@ -137,6 +144,7 @@ describe('エディタのキー', () => {
         node: null,
         rect: { x: 0, y: 0, w: 4, h: 4 },
         bounds: { w: 8, h: 8 },
+        output: { w: 8, h: 8 },
         previewed: false,
         returnTool: 'pen',
       },
@@ -195,6 +203,39 @@ describe('エディタのキー', () => {
     useToolStore.setState({ tool: 'hand' });
     press('Alt', { altKey: true });
     expect(useEditorStore.getState().temporary).toBeNull();
+  });
+
+  it('メニューが送った Space・⌥ では押している間だけの道具にしない（離したキーが来ない）', () => {
+    const space = new KeyboardEvent('keydown', { key: ' ', cancelable: true });
+    markReplayed(space);
+    expect(handleEditorKey(space)).toBe(false);
+    expect(useEditorStore.getState().temporary).toBeNull();
+    const alt = new KeyboardEvent('keydown', { key: 'Alt', altKey: true, cancelable: true });
+    markReplayed(alt);
+    expect(handleEditorKey(alt)).toBe(false);
+    expect(useEditorStore.getState().temporary).toBeNull();
+  });
+
+  it('選択・スライダー・スイッチの上では ⌘ の組み合わせだけを受け、矢印・Space は部品に任せる', () => {
+    const select = document.createElement('select');
+    const range = document.createElement('input');
+    range.type = 'range';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    expect(press('z', { metaKey: true, code: 'KeyZ' } as KeyboardEventInit, select)).toBe(true);
+    expect(editorUndo).toHaveBeenCalledOnce();
+    expect(press('s', { metaKey: true, code: 'KeyS' } as KeyboardEventInit, range)).toBe(true);
+    expect(requestSave).toHaveBeenCalledOnce();
+    expect(press('0', { metaKey: true }, checkbox)).toBe(true);
+    expect(editorFit).toHaveBeenCalledOnce();
+    expect(press('ArrowLeft', {}, range)).toBe(false);
+    expect(press('ArrowDown', {}, select)).toBe(false);
+    expect(press(' ', {}, checkbox)).toBe(false);
+    expect(stepEditorFrame).not.toHaveBeenCalled();
+    expect(useEditorStore.getState().temporary).toBeNull();
+    // 文字を打つ入力欄では ⌘Z も文字の取り消し（エディタは受けない）
+    const text = document.createElement('input');
+    expect(press('z', { metaKey: true, code: 'KeyZ' } as KeyboardEventInit, text)).toBe(false);
   });
 
   it('入力欄・日本語入力の変換中・シートやメニューの上・閉じているときは受けない', () => {

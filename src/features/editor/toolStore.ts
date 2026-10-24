@@ -2,6 +2,8 @@
  * エディタの道具の設定（道具・筆・色・最近の 8 色。M12 の決定 5：描画の色は 1 色＋最近の 8 色＋スポイト）。
  *
  * 見た目の設定なので localStorage に置く（読めない・書けないときは既定のまま。ライブラリのデータは置かない）。
+ * パレットの番号（スポイトで拾った `index`）は画像ごとに意味が違うので、localStorage には置かず（RGBA だけ）、エディタを
+ * 開くたびに捨てる（`forgetPaletteIndexes`）。
  */
 
 import { create } from 'zustand';
@@ -57,6 +59,8 @@ interface ToolState extends ToolSettings {
   setColor: (color: PaintColor) => void;
   /** 描いた色を最近の色の先頭に置く（同じ色は 1 つ）。 */
   rememberColor: (color: PaintColor) => void;
+  /** 色と最近の色からパレットの番号を捨てる（別の画像を開くとき）。 */
+  forgetPaletteIndexes: () => void;
 }
 
 export const DEFAULT_TOOLS: ToolSettings = {
@@ -100,6 +104,21 @@ export function pushRecent(recent: readonly PaintColor[], color: PaintColor): Pa
   return [color, ...recent.filter((c) => !sameColor(c, color))].slice(0, RECENT_COLORS);
 }
 
+/** パレットの番号を捨てた色（RGBA だけ）。 */
+export function withoutIndex(color: PaintColor): PaintColor {
+  return color.index === null ? color : { rgba: color.rgba, index: null };
+}
+
+/** 最近の色からパレットの番号を捨てる（同じ RGBA になった色は 1 つ）。 */
+export function recentWithoutIndex(recent: readonly PaintColor[]): PaintColor[] {
+  const out: PaintColor[] = [];
+  for (const c of recent) {
+    const plain = withoutIndex(c);
+    if (!out.some((o) => sameColor(o, plain))) out.push(plain);
+  }
+  return out;
+}
+
 /** 保存した設定を読む（項目ごとに確かめ、だめなものは既定）。 */
 export function parseSettings(text: string | null): ToolSettings {
   if (!text) return DEFAULT_TOOLS;
@@ -125,12 +144,12 @@ export function parseSettings(text: string | null): ToolSettings {
     connectivity:
       r.connectivity === 'eight' || r.connectivity === 'four' ? r.connectivity : d.connectivity,
     contiguous: typeof r.contiguous === 'boolean' ? r.contiguous : d.contiguous,
-    color: normalizeColor(r.color) ?? d.color,
+    // パレットの番号は画像ごとなので、保存したものがあっても読まない
+    color: withoutIndex(normalizeColor(r.color) ?? d.color),
     recent: Array.isArray(r.recent)
-      ? r.recent
-          .map(normalizeColor)
-          .filter((c): c is PaintColor => c !== null)
-          .slice(0, RECENT_COLORS)
+      ? recentWithoutIndex(
+          r.recent.map(normalizeColor).filter((c): c is PaintColor => c !== null),
+        ).slice(0, RECENT_COLORS)
       : d.recent,
   };
 }
@@ -154,8 +173,9 @@ function save(s: ToolSettings): void {
       tolerance: s.tolerance,
       connectivity: s.connectivity,
       contiguous: s.contiguous,
-      color: s.color,
-      recent: s.recent,
+      // パレットの番号は書かない（画像ごとに意味が違う。RGBA だけ）
+      color: withoutIndex(s.color),
+      recent: recentWithoutIndex(s.recent),
     };
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(out));
   } catch {
@@ -181,5 +201,10 @@ export const useToolStore = create<ToolState>((set, get) => {
     setContiguous: (contiguous) => update({ contiguous }),
     setColor: (color) => update({ color }),
     rememberColor: (color) => update({ recent: pushRecent(get().recent, color) }),
+    forgetPaletteIndexes: () => {
+      const { color, recent } = get();
+      if (color.index === null && recent.every((c) => c.index === null)) return;
+      update({ color: withoutIndex(color), recent: recentWithoutIndex(recent) });
+    },
   };
 });

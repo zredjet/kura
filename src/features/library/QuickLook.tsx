@@ -15,7 +15,7 @@ import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemC
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
 import { FontSpecimen, QuickLookAnim, useFontFace } from '../asset/AssetStage';
-import { canEdit, openEditor } from '../editor/editorStore';
+import { canEdit, openEditor, useEditorStore } from '../editor/editorStore';
 import { useAssetData } from '../asset/useAssetData';
 import { loopOf } from '../asset/useLoopRange';
 import { WaveformView } from '../asset/WaveformView';
@@ -23,9 +23,15 @@ import styles from './QuickLook.module.css';
 
 const t = ja.quickLook;
 
-/** クイックルック（design.md §3.1：黒地の全画面、上に名前と「3 / 128」、左右に移動、esc で閉じる）。 */
+/**
+ * クイックルック（design.md §3.1：黒地の全画面、上に名前と「3 / 128」、左右に移動、esc で閉じる）。画像エディタを開いて
+ * いる間は描かない（クイックルックの層はエディタより上なので、隠さないとエディタが下に隠れる）。開いている印は残すので、
+ * エディタを閉じるとクイックルックに戻る。
+ */
 export function QuickLook() {
-  const open = useViewStore((s) => s.quickLook);
+  const shown = useViewStore((s) => s.quickLook);
+  const editing = useEditorStore((s) => s.phase !== 'closed');
+  const open = shown && !editing;
   const selectedId = useViewStore((s) => s.selection.focus);
   const select = useViewStore((s) => s.select);
   const setQuickLook = useViewStore((s) => s.setQuickLook);

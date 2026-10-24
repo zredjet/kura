@@ -139,7 +139,7 @@ describe('仮の画素（StrokeOverlay）', () => {
 describe('仮の筆の寿命（OverlayTracker）', () => {
   const overlay = () => new StrokeOverlay(0, { x: 0, y: 0, w: 8, h: 8 }, 'over', [0, 0, 0, 255]);
 
-  it('送った要求以降の表示が届き、見えている変わったタイルを解き終えたら外す', () => {
+  it('送った要求以降の表示が届き、見えている変わったタイルをその rev で解き終えたら外す', () => {
     const tr = new OverlayTracker();
     tr.begin(overlay());
     const p = tr.commit();
@@ -148,14 +148,40 @@ describe('仮の筆の寿命（OverlayTracker）', () => {
     expect(tr.overlays()).toHaveLength(1);
     tr.sent(p, 4, 0);
     // 前の要求の表示では外さない
-    tr.shown(3, new Set());
+    tr.shown(3, new Map());
     expect(tr.pending).toHaveLength(1);
-    tr.shown(4, new Set(['0/0/0/0', '0/0/1/0']));
+    tr.shown(
+      4,
+      new Map([
+        ['0/0/0/0', 4],
+        ['0/0/1/0', 4],
+      ]),
+    );
     expect(tr.pending).toHaveLength(1);
-    tr.tileReady('0/0/0/0');
+    tr.tileReady('0/0/0/0', 4);
     expect(tr.pending).toHaveLength(1);
-    expect(tr.tileReady('0/0/1/0')).toBe(true);
+    expect(tr.tileReady('0/0/1/0', 4)).toBe(true);
     expect(tr.overlays()).toHaveLength(0);
+  });
+
+  it('古い rev の絵が届いても外さない。次の表示が届いたら、待つ rev をその表示のものに替える', () => {
+    const tr = new OverlayTracker();
+    const [a, b] = [overlay(), overlay()].map((o) => {
+      tr.begin(o);
+      const p = tr.commit();
+      if (!p) throw new Error('筆がない');
+      return p;
+    });
+    if (!a || !b) throw new Error('筆がない');
+    tr.sent(a, 5, 0);
+    tr.shown(5, new Map([['0/0/0/0', 6]]));
+    tr.sent(b, 6, 0);
+    // 筆 2 の表示（rev 7）：筆 1 も rev 7 を待つ（rev 6 の絵には筆 2 がない）
+    tr.shown(6, new Map([['0/0/0/0', 7]]));
+    expect(tr.tileReady('0/0/0/0', 6)).toBe(false);
+    expect(tr.pending).toEqual([a, b]);
+    expect(tr.tileReady('0/0/0/0', 7)).toBe(true);
+    expect(tr.pending).toEqual([]);
   });
 
   it('待つタイルがなければすぐ外す。新しい要求に取って代わられたら次の表示を待つ', () => {
@@ -166,7 +192,7 @@ describe('仮の筆の寿命（OverlayTracker）', () => {
     tr.sent(p, 2, 0);
     // superseded：何も呼ばない（次の表示を待つ）
     expect(tr.pending).toHaveLength(1);
-    expect(tr.shown(3, new Set())).toBe(true);
+    expect(tr.shown(3, new Map())).toBe(true);
     expect(tr.pending).toHaveLength(0);
   });
 

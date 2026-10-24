@@ -8,7 +8,11 @@
  *   必ず `edit_close` を呼ぶ。未保存で閉じるときのシート・保存の流れは `editorSave.ts`。ライブラリを切り替える・閉じるときも
  *   閉じる（App）。
  * - 右パネル（段 5b）：選んだ操作・操作の並びの手（有効・並べ替え・消す・足す）・引数の手（送り方は `paramSend.ts`）・
- *   出力の形式。切り抜きの枠（C）：その操作の入力を表示して（操作を仮に無効にする preview）枠を重ね、↵ で確定する。
+ *   出力の形式。引数の欄は、送った手の番号（`sendParam` の戻り値）と、結果が確定した番号（`acked`）を比べて手元の値を
+ *   やめる。切り抜きの枠（C）：その操作の入力を表示して（操作を仮に無効にする preview）枠を重ね、↵ で確定する。後ろに
+ *   有効な幾何の操作（大きさ・向き・並びを変える）があれば、仮に無効にしても入力にならないので、枠は出さずに引数パネルで
+ *   直す。
+ * - 応えの来ていない文書の手（送った・ためた手）があれば `pendingSteps`（未保存に数える。閉じる・保存する前に待つ）。
  * - 描画の道具：筆は描いている間フロントで仮に重ね、離したら `paint{actions:[筆]}`（描く先は Rust が決める）。
  *   塗りつぶしは仮描きせずに送る。スポイトはクリックのときだけ `edit_sample`。
  */
@@ -45,7 +49,7 @@ import type { Point } from '../../lib/paint';
 import { notify } from '../../stores/noticeStore';
 import { CanvasController, type ControllerInfo } from './canvasController';
 import { type Bounds, clampCrop, isFullCrop, nudgeCrop, readRect, sameRect } from './crop';
-import { defaultParams, opSpec, paramsOf } from './opsCatalog';
+import { defaultParams, hasLaterGeometry, opSpec, paramsOf } from './opsCatalog';
 import {
   addSteps,
   commitStep,
@@ -58,6 +62,7 @@ import {
   sameChoice,
 } from './paramSend';
 import { drawScene } from './drawScene';
+import { effectiveFormat, outputChoice } from './formats';
 import { type QueuedStep, RequestQueue, type SentRequest } from './requestQueue';
 import { fillAction, type PendingStroke, type StrokeSpec } from './stroke';
 import { type EditorTool, useToolStore } from './toolStore';
@@ -95,6 +100,12 @@ export type EditorSheet =
 /** ジョブの状態。 */
 type JobStateDto = JobProgress['state'];
 
+/** 保存する前のアイテムの大きさ（上書きで大きさが変わったかを見る）。 */
+export interface SizeBefore {
+  w: number;
+  h: number;
+}
+
 /** 動いている保存のジョブ（ボタンの中の進捗・終わったときの知らせ）。 */
 export interface EditorSave {
   job: number;
@@ -107,6 +118,8 @@ export interface EditorSave {
   slow: boolean;
   /** 別名で保存の名前。 */
   title: string | null;
+  /** 積んだときのアイテム（今）の大きさ（素材の設定が新しい大きさに合うかを知らせる）。 */
+  before: SizeBefore | null;
 }
 
 /** 切り抜きの枠（C）。 */
@@ -116,6 +129,8 @@ export interface EditorCrop {
   rect: Rect;
   /** 切り抜く前の画像の大きさ（その操作の入力を表示し終えるまで null）。 */
   bounds: Bounds | null;
+  /** 切り抜きを始める前の文書の出力の大きさ（枠を出している間に足す操作の既定値に使う）。 */
+  output: Bounds | null;
   /** その操作を仮に無効にして入力を表示している（やめる・確定するときに仮の値を捨てる）。 */
   previewed: boolean;
   /** 切り抜きを終えたら戻す道具。 */
@@ -173,6 +188,10 @@ export interface EditorState {
   /** 断られた手の指摘（引数の欄の下に出す）。 */
   issues: Issue[];
   crop: EditorCrop | null;
+  /** 応えの来ていない文書の手（送った・ためた手）がある（未保存に数える）。 */
+  pendingSteps: boolean;
+  /** 結果が確定した手の番号（断られた・失敗した・仮でない結果が届いた。引数の欄が手元の値をやめる）。 */
+  acked: number;
 }
 
 const EMPTY_DOC: EditorDoc = { order: [], nodes: {}, outputs: [] };
@@ -204,6 +223,8 @@ function closedState(panel: EditorPanel, openId: number): EditorState {
     save: null,
     issues: [],
     crop: null,
+    pendingSteps: false,
+    acked: 0,
   };
 }
 
@@ -232,10 +253,13 @@ export function applyDocDelta(doc: EditorDoc, delta: EditDocDeltaDto): EditorDoc
 }
 
 /**
- * 保存していない変更があるか（閉じるときに確かめる）。保存のジョブが今の頭を保存している途中なら、閉じても保存は続くので
- * 含めない。
+ * 保存していない変更があるか（閉じるときに確かめる）。応えの来ていない文書の手（送った・ためた手）も数える。保存のジョブが
+ * 今の頭を保存している途中なら、閉じても保存は続くので含めない。
  */
-export function hasUnsavedChanges(s: Pick<EditorState, 'status' | 'save'>): boolean {
+export function hasUnsavedChanges(
+  s: Pick<EditorState, 'status' | 'save'> & { pendingSteps?: boolean },
+): boolean {
+  if (s.pendingSteps) return true;
   const st = s.status;
   if (!st?.dirty) return false;
   const save = s.save;
@@ -246,6 +270,23 @@ export function hasUnsavedChanges(s: Pick<EditorState, 'status' | 'save'>): bool
     save.state !== 'failed' &&
     save.state !== 'canceled'
   );
+}
+
+/**
+ * 保存（上書き）できるか：開いていて、保存の途中でなく、保存していない変更がある（応えの来ていない手も）か、元の形式に
+ * 書けず形式を変えて保存するとき（ボタン・⌘S・ファイル › 保存）。
+ */
+export function canSaveEditor(
+  s: Pick<EditorState, 'phase' | 'save' | 'status' | 'pendingSteps' | 'doc' | 'source'>,
+): boolean {
+  if (s.phase !== 'open' || s.save || !s.status) return false;
+  if (s.status.dirty || s.pendingSteps) return true;
+  return effectiveFormat(outputChoice(s.doc.outputs), s.source?.format ?? null).forced;
+}
+
+/** 文書を変える手か（まとめを閉じる・仮の値の手は文書を変えない）。 */
+export function isDocStep(step: EditStepDto): boolean {
+  return step.type !== 'seal' && step.type !== 'preview' && step.type !== 'cancelPreview';
 }
 
 /** 編集中のノード（末尾が有効な描画なら、その ID。Rust のキャッシュに入力を固定する）。 */
@@ -326,6 +367,8 @@ const SUPERSEDED_RETRIES = 2;
 
 let runtime: Runtime | null = null;
 let openToken = 0;
+/** スポイトの問い合わせの番号（最後にクリックした画素の応えだけを使う）。 */
+let sampleSeq = 0;
 
 /** タイルの形式の自己点検（dev。VITE_KURA_CHECK=1 のときだけ読み込む）。 */
 let tileCheckHook: ((controller: CanvasController, session: string) => void) | null = null;
@@ -381,6 +424,8 @@ export async function openEditor(
   options: { fromDraft?: boolean } = {},
 ): Promise<void> {
   if (!canEdit(item)) return;
+  // パレットの番号は画像ごとに意味が違うので、開くたびに捨てる（スポイトで拾い直す）
+  useToolStore.getState().forgetPaletteIndexes();
   const previous = runtime;
   const returnFocus = previous?.returnFocus ?? activeElement();
   if (previous) void disposeRuntime(previous);
@@ -438,7 +483,9 @@ export async function openEditor(
       {
         sent: (req) => markSent(rt, req),
         done: (req, result) => {
-          if (runtime === rt) applyResult(rt, result, req.seq, req.viewport, req.steps.length > 0);
+          if (runtime === rt) {
+            applyResult(rt, result, req.seq, req.viewport, req.steps.length > 0, req.upto);
+          }
         },
         error: (req, error) => {
           if (runtime === rt) requestFailed(rt, req, error);
@@ -455,7 +502,7 @@ export async function openEditor(
       // 下書きがあれば、捨てるか下書きから開くかを聞く（下書きから開いたあとは聞かない）
       sheet: opened.draft.exists && !opened.draft.opened ? { kind: 'draft' } : null,
     });
-    applyResult(rt, opened.result, 0, viewport, false);
+    applyResult(rt, opened.result, 0, viewport, false, null);
     // 開いたあとの実際の大きさ・倍率で頼み直す（見積もりと同じなら送らない）
     rt.queue.view(controller.viewport());
   } catch (error) {
@@ -497,17 +544,32 @@ function markSent(rt: Runtime, req: SentRequest<PendingStroke>): void {
   });
 }
 
-/** 手と表示の結果を受ける（`hadSteps` は手を含む要求の結果か）。 */
+/** 応えの来ていない文書の手があるか（ストアに合わせる）。 */
+function pendingOf(rt: Runtime): boolean {
+  return rt.queue?.holds(isDocStep) ?? false;
+}
+
+/** 手と表示の結果を受ける（`hadSteps` は手を含む要求の結果か、`upto` はその要求に入れた手の番号の上限）。 */
 function applyResult(
   rt: Runtime,
   result: EditStepResultDto,
   seq: number,
   viewport: EditViewportDto,
   hadSteps: boolean,
+  upto: number | null,
 ): void {
   const s = useEditorStore.getState();
   const doc = applyDocDelta(s.doc, result.doc);
-  const patch: Partial<EditorState> = { status: result.status, doc };
+  const patch: Partial<EditorState> = { status: result.status, doc, pendingSteps: pendingOf(rt) };
+  // 断られた・仮でない結果が届いたら、その要求までの手の結果は確定（引数の欄は手元の値をやめて文書の値を出す）
+  if (
+    hadSteps &&
+    upto !== null &&
+    upto > s.acked &&
+    (result.rejected || !result.status.provisional)
+  ) {
+    patch.acked = upto;
+  }
   for (const n of result.notices) notify(n);
   if (result.rejected) {
     rt.controller.onRejected(seq, result.rejected.index);
@@ -571,7 +633,23 @@ function applyResult(
 
 function requestFailed(rt: Runtime, req: SentRequest<PendingStroke>, error: unknown): void {
   rt.controller.onFailed(req.seq);
-  useEditorStore.setState({ failure: failureOf('request', error) });
+  const s = useEditorStore.getState();
+  useEditorStore.setState({
+    failure: failureOf('request', error),
+    pendingSteps: pendingOf(rt),
+    // 届かなかった手の結果も確定（引数の欄は文書の値に戻す）
+    ...(req.steps.length > 0 && req.upto > s.acked ? { acked: req.upto } : {}),
+  });
+}
+
+/** 手をためて送り、応えの来ていない文書の手があるかをストアに合わせる。 */
+function queueSteps(rt: Runtime, steps: QueuedStep<PendingStroke>[]): void {
+  if (!rt.queue) return;
+  rt.queue.push(steps, rt.controller.viewport());
+  const pending = pendingOf(rt);
+  if (useEditorStore.getState().pendingSteps !== pending) {
+    useEditorStore.setState({ pendingSteps: pending });
+  }
 }
 
 /** 手を送る（開いていなければ false）。切り抜きの途中なら、先に切り抜きをやめる（仮の値を捨てる）。 */
@@ -579,7 +657,7 @@ function pushSteps(steps: QueuedStep<PendingStroke>[]): boolean {
   const rt = runtime;
   if (!rt?.queue) return false;
   if (useEditorStore.getState().crop) cancelCrop();
-  rt.queue.push(steps, rt.controller.viewport());
+  queueSteps(rt, steps);
   return true;
 }
 
@@ -603,6 +681,11 @@ export function refreshEditorView(): void {
 /** 今のセッション（開いていなければ null）。 */
 export function editorSession(): string | null {
   return runtime?.session ?? null;
+}
+
+/** 応えの来ていない手（送った・ためた手）の結果が届くのを待つ（閉じたら解ける。保存を積む前に）。 */
+export function whenEditorSettled(): Promise<void> {
+  return runtime?.queue?.settled() ?? Promise.resolve();
 }
 
 /** 保存を積んだ結果の状態・文書の差分を当てる（出力の形式を変える手を確定したときの文書）。 */
@@ -695,12 +778,13 @@ function outputSize(): Bounds | null {
 /** 操作を足す（選んだ操作のあと、選んでいなければ末尾。足したら選ぶ）。 */
 export function addOp(id: string): void {
   const desc = opSpec(id);
-  const { doc, selected } = useEditorStore.getState();
+  const { doc, selected, crop } = useEditorStore.getState();
   if (!desc) return;
   const i = selected === null ? -1 : doc.order.indexOf(selected);
   const at = i < 0 ? doc.order.length : i + 1;
-  // 末尾に足すときだけ、今の出力の大きさを既定にする（途中の入力の大きさはフロントでは分からない）
-  const size = at === doc.order.length ? outputSize() : null;
+  // 末尾に足すときだけ、今の出力の大きさを既定にする（途中の入力の大きさはフロントでは分からない）。切り抜きの枠を
+  // 出している間の表示は切り抜く前の画像なので、切り抜きを始める前の出力の大きさを使う（足すと切り抜きはやめる）
+  const size = at === doc.order.length ? (crop ? crop.output : outputSize()) : null;
   const rt = runtime;
   if (rt) rt.selectCreated = true;
   pushSteps(
@@ -708,9 +792,13 @@ export function addOp(id: string): void {
   );
 }
 
-/** 引数の欄の操作を送る（送り方は `paramSend.ts`）。 */
-export function sendParam(node: number, key: string, gesture: ParamGesture): void {
-  pushSteps(paramSteps(node, key, gesture).map((step) => ({ step })));
+/**
+ * 引数の欄の操作を送る（送り方は `paramSend.ts`）。送った手の番号を返す（`acked` がこれ以上になったら結果が確定。
+ * 送れなければ null）。
+ */
+export function sendParam(node: number, key: string, gesture: ParamGesture): number | null {
+  if (!pushSteps(paramSteps(node, key, gesture).map((step) => ({ step })))) return null;
+  return runtime?.queue?.pushedCount ?? null;
 }
 
 /** 出力の形式を替える（同じなら何もしない）。 */
@@ -724,7 +812,10 @@ export function setOutputFormat(format: FormatChoice): void {
 
 // ===== 切り抜き =====
 
-/** 切り抜きの道具を選ぶ：選んだ切り抜き（なければ最後の切り抜き）を直す。なければ末尾に足す枠。 */
+/**
+ * 切り抜きの道具を選ぶ：選んだ切り抜き（なければ最後の切り抜き）を直す。なければ末尾に足す枠。直す切り抜きの後ろに有効な
+ * 幾何の操作があれば、枠は出さずにその切り抜きを選んで引数パネルで直す（仮に無効にしても表示がその入力にならない）。
+ */
 export function startCrop(): void {
   const rt = runtime;
   const s = useEditorStore.getState();
@@ -738,14 +829,20 @@ export function startCrop(): void {
     pick(s.selected) ??
     [...s.doc.order].reverse().find((id) => s.doc.nodes[id]?.op === 'image.crop') ??
     null;
+  if (node !== null && hasLaterGeometry(s.doc, node)) {
+    useEditorStore.setState({ selected: node, panel: 'ops' });
+    notify(t.cropUseParams);
+    return;
+  }
   tools.setTool('crop');
+  const output = outputSize();
   if (node === null) {
-    const size = outputSize();
     useEditorStore.setState({
       crop: {
         node: null,
-        rect: size ? { x: 0, y: 0, w: size.w, h: size.h } : { x: 0, y: 0, w: 1, h: 1 },
-        bounds: size,
+        rect: output ? { x: 0, y: 0, w: output.w, h: output.h } : { x: 0, y: 0, w: 1, h: 1 },
+        bounds: output,
+        output,
         previewed: false,
         returnTool,
       },
@@ -757,14 +854,13 @@ export function startCrop(): void {
   const previewed = n?.enabled ?? false;
   useEditorStore.setState({
     selected: node,
-    crop: { node, rect, bounds: previewed ? null : outputSize(), previewed, returnTool },
+    crop: { node, rect, bounds: previewed ? null : output, output, previewed, returnTool },
   });
-  // その操作の入力を表示する（仮に無効にする。履歴に入らない）
+  // その操作の入力を表示する（仮に無効にする。履歴に入らない。後ろに幾何の操作はないので、出力がその入力になる）
   if (previewed) {
-    rt.queue.push(
-      [{ step: { type: 'preview', edit: { type: 'setEnabled', node, enabled: false } } }],
-      rt.controller.viewport(),
-    );
+    queueSteps(rt, [
+      { step: { type: 'preview', edit: { type: 'setEnabled', node, enabled: false } } },
+    ]);
   }
 }
 
@@ -781,9 +877,9 @@ function endCrop(steps: EditStepDto[] = []): void {
     ...steps,
   ];
   if (rt?.queue && all.length > 0) {
-    rt.queue.push(
+    queueSteps(
+      rt,
       all.map((step) => ({ step })),
-      rt.controller.viewport(),
     );
   }
 }
@@ -906,6 +1002,13 @@ function indexedNow(): boolean {
   return useEditorStore.getState().view?.format === 'indexed8';
 }
 
+/** 描く色を使えるか：パレットの画像は、この画像でスポイトで拾った番号の色だけで描く（なければ拾うよう知らせる）。 */
+function paletteColorReady(): boolean {
+  if (!indexedNow() || useToolStore.getState().color.index !== null) return true;
+  notify(t.indexedPick);
+  return false;
+}
+
 /** 筆の条件（道具・筆・色・フレーム）。描けなければ null。 */
 function strokeSpec(tool: 'pen' | 'eraser'): StrokeSpec | null {
   const rt = runtime;
@@ -933,6 +1036,7 @@ export function strokeStart(p: Point, shift: boolean): boolean {
     notify(t.eraserUnavailable);
     return false;
   }
+  if (tool === 'pen' && !paletteColorReady()) return false;
   const spec = strokeSpec(tool);
   if (!spec) return false;
   const start = shift ? rt.controller.lineStart(spec.frame) : null;
@@ -971,7 +1075,7 @@ export function strokeCancel(): boolean {
 /** 塗りつぶす（仮描きしない。画像の外は何もしない）。 */
 export function fillAt(p: Point): void {
   const rt = runtime;
-  if (!rt?.queue || !rt.controller.contains(p)) return;
+  if (!rt?.queue || !rt.controller.contains(p) || !paletteColorReady()) return;
   const tools = useToolStore.getState();
   const action = fillAction(
     {
@@ -989,16 +1093,20 @@ export function fillAt(p: Point): void {
   }
 }
 
-/** スポイト：等倍の今の値の 1 画素を色にする（クリックのときだけ。画像の外は何もしない）。 */
+/**
+ * スポイト：等倍の今の値の 1 画素を色にする（クリックのときだけ。画像の外は何もしない）。応えの順は約束されないので、
+ * 最後にクリックした画素の応えだけを使う。
+ */
 export async function sampleAt(p: Point): Promise<void> {
   const rt = runtime;
   if (!rt?.session || !rt.controller.contains(p)) return;
+  const n = ++sampleSeq;
   try {
     const got = await sampleEdit(rt.session, useEditorStore.getState().frame, p[0], p[1]);
-    if (runtime !== rt || !got) return;
+    if (runtime !== rt || n !== sampleSeq || !got) return;
     useToolStore.getState().setColor({ rgba: [...got.rgba], index: got.index });
   } catch (error) {
-    if (runtime !== rt) return;
+    if (runtime !== rt || n !== sampleSeq) return;
     notify(t.sampleFailed(isIpcError(error) ? error.message : String(error)));
   }
 }

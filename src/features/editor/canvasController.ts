@@ -5,11 +5,13 @@
  *   装置の画素で 1 倍未満の縮小は補間。ドット絵は装置の画素の整数倍に吸着する（`viewMath`）。
  * - ズーム・パンはここで描き直し、Zustand には倍率の表示（と、絵が出そろったか）だけを間引いて送る（`onInfo`）。
  *   止まって 100ms たったら、表示する範囲と倍率を頼み直す（`onIdle`。段は Rust が決める）。それまでは今の段のタイルを
- *   広げて・縮めて見せ、段が替わった直後は前の段のタイルで足りない所を埋める。
+ *   広げて・縮めて見せ、段が替わった直後（中身が同じ rev の間だけ）は前の段のタイルで足りない所を埋める。表示の結果で
+ *   画像の大きさが変わって変換が変わったとき（切り抜いた・収め直した）も、止まったら頼み直す。
  * - タイルは「最後に変わった rev」で指す（`TileTable`）。表示の結果を受けたら、見えていて、要求した範囲の中にある
- *   タイルのうち、その rev の絵を持っていないものだけを取りに行く。古い rev の URL が 404 なら（WebKit も覚えていない）、
- *   今の表示の rev で取り直す（変わっていないので中身は同じ）。
- * - 仮の筆（`stroke.ts`）を上に重ね、要求の結果のタイルを解き終えたら外す。
+ *   タイルのうち、その rev の絵を持っていないものだけを取りに行く（鍵ごとに 1 本。古い rev の絵が新しい絵を上書き
+ *   しない）。古い rev の URL が 404 なら（WebKit も覚えていない）、そのとき表示している rev で取り直す（変わっていない
+ *   ので中身は同じ）。形（大きさ・フレームの矩形）が変わったら、その段の古い絵は出さない。
+ * - 仮の筆（`stroke.ts`）を上に重ね、要求の結果の rev のタイルを解き終えたら外す（古い rev の絵では外さない）。
  * - 市松模様（透明を持てる形式のとき常に）は canvas の下の要素に敷く（画面に固定した模様を画像の矩形で切る）。
  *   消しゴム・置き換えの仮の筆は canvas を destination-out で抜くので、下の模様が見える。
  * - 描く関数・タイルを読む口・時計は差し込める（テスト）。閉じたら（`dispose`）絵をすべて close する。
@@ -179,6 +181,31 @@ export function frameOf(view: EditViewDto, frame: number): EditFrameDto | null {
   );
 }
 
+/** 同じ変換か。 */
+function sameTransform(a: Transform, b: Transform): boolean {
+  return a.zoom === b.zoom && a.ox === b.ox && a.oy === b.oy;
+}
+
+/** 同じ形か（画像の大きさとフレームの矩形）。 */
+function sameShape(a: EditViewDto, b: EditViewDto): boolean {
+  return (
+    a.fullWidth === b.fullWidth &&
+    a.fullHeight === b.fullHeight &&
+    a.frames.length === b.frames.length &&
+    a.frames.every((f, i) => {
+      const g = b.frames[i];
+      return (
+        g !== undefined &&
+        f.index === g.index &&
+        f.x === g.x &&
+        f.y === g.y &&
+        f.w === g.w &&
+        f.h === g.h
+      );
+    })
+  );
+}
+
 /** 筆を描き終えた結果（送る動作と、その仮の筆）。 */
 export interface FinishedStroke {
   action: ReturnType<typeof strokeAction>;
@@ -194,7 +221,8 @@ export class CanvasController {
   private alpha = false;
   private view: EditViewDto | null = null;
   private shown: { level: number; frame: number; range: TileRange | null } | null = null;
-  private fallbackLevel: number | null = null;
+  /** 前の段のタイルで埋める段と、その段を表示していたときの中身の rev（rev が進んだら使わない）。 */
+  private fallback: { level: number; rev: number } | null = null;
   private t: Transform = { zoom: 1, ox: 0, oy: 0 };
   private rawZoom = 1;
   private fitMode = true;
@@ -268,14 +296,23 @@ export class CanvasController {
     this.session = session;
   }
 
-  /** 画像の形（大きさが変わったら、全体を表示しているときは収め直す）。 */
+  /**
+   * 画像の形（大きさが変わったら、全体を表示しているときは収め直す）。表示のあとに大きさ・変換が変わったら、止まって
+   * から今の範囲・倍率で頼み直す（段は新しい大きさと倍率で選び直す。前の要求の範囲は新しい画像の外かもしれない）。
+   */
   setImage(model: ImageModel): void {
     const prev = this.image;
+    const before = this.t;
     this.image = model;
     if (!prev || this.fitMode) {
       this.applyFit();
     } else {
       this.t = this.settle(this.t);
+    }
+    const resized = prev !== null && (prev.w !== model.w || prev.h !== model.h);
+    if (this.view && (resized || !sameTransform(before, this.t))) {
+      this.transformed();
+      return;
     }
     this.emitInfo();
     this.invalidate();
@@ -416,13 +453,16 @@ export class CanvasController {
    */
   applyView(view: EditViewDto, seq: number, requested: EditViewportDto): void {
     if (this.disposed) return;
-    const prevLevel = this.view?.level ?? null;
-    const levelChanged = prevLevel !== null && prevLevel !== view.level;
-    if (levelChanged) this.fallbackLevel = prevLevel;
+    const prev = this.view;
+    const levelChanged = prev !== null && prev.level !== view.level;
+    // 前の段のタイルで埋めるのは、その段を表示していたときと中身が同じ rev の間だけ
+    if (prev && levelChanged) this.fallback = { level: prev.level, rev: prev.rev };
     if (view.changed.type === 'all') {
       this.tiles.markAll(view.level, view.rev);
-      // 段を替えたとき、その段に前から残っている古い絵は出さない（前の段のタイルで埋める）
-      if (levelChanged) this.tiles.dropStale(view.level, view.rev);
+      // 段を替えた・形が変わったとき、その段に前から残っている古い絵は出さない（形が変わると位置が合わない）
+      if (levelChanged || (prev && !sameShape(prev, view))) {
+        this.tiles.dropStale(view.level, view.rev);
+      }
     } else {
       for (const f of view.changed.frames)
         this.tiles.markTiles(view.level, f.frame, f.tiles, view.rev);
@@ -634,11 +674,12 @@ export class CanvasController {
   }
 
   /**
-   * 見えていて要求した範囲の中にあり、最後に変わった rev の絵を持っていないタイルを取りに行く（同時に `MAX_LOADS` まで）。
-   * まだ解き終えていないタイル（読み込み中・これから読む）の鍵を返す。
+   * 見えていて要求した範囲の中にあり、最後に変わった rev の絵を持っていないタイルを取りに行く（同時に `MAX_LOADS` まで。
+   * 鍵ごとに 1 本で、別の rev を読んでいる間は待つ）。まだその rev の絵を解き終えていないタイルの鍵と rev を返す
+   * （その rev で読めなかったものは待たない）。
    */
-  private pump(): Set<string> {
-    const need = new Set<string>();
+  private pump(): Map<string, number> {
+    const need = new Map<string, number>();
     const v = this.view;
     const s = this.shown;
     const img = this.image;
@@ -654,11 +695,9 @@ export class CanvasController {
       keep.add(key);
       if (!inRange(s.range, tx, ty)) continue;
       const rev = this.tiles.rev(v.level, this.frame, tx, ty);
-      if (rev === null) continue;
-      const loading = this.tiles.isLoading(key);
-      if (!this.tiles.needsLoad(key, rev) && !loading) continue;
-      need.add(key);
-      if (this.tiles.needsLoad(key, rev) && this.loads < MAX_LOADS) {
+      if (rev === null || this.tiles.holds(key, rev) || this.tiles.failedAt(key, rev)) continue;
+      need.set(key, rev);
+      if (this.loads < MAX_LOADS && this.tiles.needsLoad(key, rev)) {
         this.startLoad(v, fr, tx, ty, rev);
       }
     }
@@ -692,9 +731,12 @@ export class CanvasController {
     }
     first
       .catch((error: unknown) => {
-        // 古い rev は Rust がもう配らない（WebKit も覚えていなかった）。変わっていないので今の rev で同じ中身を取る
-        if (error instanceof TileHttpError && error.status === 404 && rev !== shownRev) {
-          return fetchAt(shownRev);
+        // 古い rev は Rust がもう配らない（今と直前の表示だけ。WebKit も覚えていなかった）。タイルがその rev のまま
+        // 変わっていなければ、いま表示している rev で同じ中身を取る（読んでいる間に表示が進んでいれば、進んだ先の rev）
+        if (error instanceof TileHttpError && error.status === 404 && !this.disposed) {
+          const now = this.view;
+          const retry = session === this.session && now?.level === level ? now.rev : shownRev;
+          if (retry !== rev && this.tiles.revOf(key) === rev) return fetchAt(retry);
         }
         throw error;
       })
@@ -703,23 +745,25 @@ export class CanvasController {
           this.loads--;
           if (this.disposed || session !== this.session) {
             bitmap.close();
+            this.tiles.cancelLoad(key, rev);
             return;
           }
           this.tiles.finishLoad(key, rev, bitmap);
-          this.arrived(key);
+          this.arrived(key, rev);
         },
         (error: unknown) => {
           this.loads--;
           if (this.disposed) return;
           if (!(error instanceof TileHttpError)) console.warn('タイルを解けませんでした', error);
           this.tiles.failLoad(key, rev);
-          this.arrived(key);
+          this.arrived(key, rev);
         },
       );
   }
 
-  private arrived(key: string): void {
-    this.overlays.tileReady(key);
+  /** タイル `key` の rev `rev` の読み込みが終わった（その rev を待つ仮の筆を外し、続きを読む）。 */
+  private arrived(key: string, rev: number): void {
+    this.overlays.tileReady(key, rev);
     this.invalidate();
     this.pump();
   }
@@ -802,7 +846,10 @@ export class CanvasController {
     }
   }
 
-  /** 段が替わった直後：足りないタイルの所を、前の段のタイルで埋める（1 枚の画像のときだけ）。 */
+  /**
+   * 段が替わった直後：足りないタイルの所を、前の段のタイルで埋める（1 枚の画像のときだけ）。前の段を表示していた
+   * ときから中身が変わった（rev が違う）なら使わない。その段のタイルの今の rev の絵だけを使う。
+   */
   private fillFromFallback(
     scene: Scene,
     v: EditViewDto,
@@ -811,8 +858,9 @@ export class CanvasController {
     fr: FrameRect,
     dest: Rect,
   ): void {
-    const fl = this.fallbackLevel;
-    if (fl === null || fl === v.level || v.frames.length !== 1) return;
+    const fb = this.fallback;
+    if (!fb || fb.level === v.level || fb.rev !== v.rev || v.frames.length !== 1) return;
+    const fl = fb.level;
     const s = 2 ** fl;
     const ffr: FrameRect = {
       x: 0,
@@ -824,7 +872,7 @@ export class CanvasController {
     const smoothing = smoothingFor(this.t.zoom, this.dpr, fl);
     for (const [fx, fy] of tilesIn(tileRange(full, fl, ffr, v.tile))) {
       const got = this.tiles.get(tileKey(fl, this.frame, fx, fy));
-      if (!got) continue;
+      if (!got || got.rev !== this.tiles.rev(fl, this.frame, fx, fy)) continue;
       const r = roundRect(
         scaleRect(toScreen(this.t, tileImageRect(fl, ffr, fx, fy, v.tile)), this.dpr),
       );

@@ -7,6 +7,9 @@
  * - **解いた絵**（ImageBitmap）を LRU で持つ。バイトの上限（既定 64 MiB）を超えたら、見えていないものから古い順に
  *   `close` して捨てる。閉じたらすべて `close` する。
  * - 読み込みの状態（読み込み中・失敗した rev）も持つ（同じものを二重に取りに行かない・404 を繰り返さない）。
+ *   読み込みは鍵ごとに 1 本だけ（別の rev を読んでいる間は、終わるのを待ってから今の rev を読む。届く順が入れ替わらない）。
+ * - 届いた絵がそのタイルの今の rev でなく、今の rev の絵をもう持っていれば捨てる（undo で rev が戻ったあとに、前に頼んだ
+ *   別の rev が届いたとき）。今の rev の絵がなければ、前の絵より新しいので出す（今の rev が届くまで）。
  */
 
 /** 解いたタイル（ImageBitmap など。`close` で手放す）。 */
@@ -80,6 +83,12 @@ export class TileTable<B extends TileBitmap = TileBitmap> {
     return this.changed.get(tileKey(level, frame, tx, ty)) ?? this.base.get(level) ?? null;
   }
 
+  /** 鍵 `key` のタイルが最後に変わった rev（まだ知らなければ null）。 */
+  revOf(key: string): number | null {
+    const level = Number(key.slice(0, key.indexOf('/')));
+    return this.changed.get(key) ?? this.base.get(level) ?? null;
+  }
+
   /** 持っている絵（古い rev のものも返す。使った順を進める）。 */
   get(key: string): { bitmap: B; rev: number } | null {
     const e = this.entries.get(key);
@@ -88,10 +97,24 @@ export class TileTable<B extends TileBitmap = TileBitmap> {
     return { bitmap: e.bitmap, rev: e.bitmapRev };
   }
 
-  /** rev `rev` の絵を取りに行くべきか（もう持っている・読み込み中・その rev で失敗したなら偽）。 */
+  /** rev `rev` の絵を持っているか。 */
+  holds(key: string, rev: number): boolean {
+    const e = this.entries.get(key);
+    return e?.bitmap != null && e.bitmapRev === rev;
+  }
+
+  /** rev `rev` で読めなかったか（次の表示の結果まで取り直さない）。 */
+  failedAt(key: string, rev: number): boolean {
+    return this.entries.get(key)?.failedRev === rev;
+  }
+
+  /**
+   * rev `rev` の絵を取りに行くべきか（もう持っている・その rev で失敗した・どれかの rev を読み込み中なら偽。読み込み中なら
+   * 終わってから今の rev を読む）。
+   */
   needsLoad(key: string, rev: number): boolean {
     const e = this.entries.get(key);
-    return !e || (e.bitmapRev !== rev && e.loadingRev !== rev && e.failedRev !== rev);
+    return !e || (e.bitmapRev !== rev && e.loadingRev === null && e.failedRev !== rev);
   }
 
   /** 読み込み中か。 */
@@ -105,9 +128,17 @@ export class TileTable<B extends TileBitmap = TileBitmap> {
     e.loadingRev = rev;
   }
 
-  /** 読めた（前の絵は閉じる）。 */
-  finishLoad(key: string, rev: number, bitmap: B): void {
+  /**
+   * 読めた（前の絵は閉じる）。今の rev でなく、今の rev の絵をもう持っていれば、届いた絵を閉じて捨てる。持ったら true。
+   */
+  finishLoad(key: string, rev: number, bitmap: B): boolean {
     const e = this.entry(key);
+    if (e.loadingRev === rev) e.loadingRev = null;
+    const now = this.revOf(key);
+    if (now !== null && rev !== now && e.bitmap && e.bitmapRev === now) {
+      if (e.bitmap !== bitmap) bitmap.close();
+      return false;
+    }
     if (e.bitmap && e.bitmap !== bitmap) {
       e.bitmap.close();
       this.total -= e.bytes;
@@ -117,8 +148,14 @@ export class TileTable<B extends TileBitmap = TileBitmap> {
     e.bytes = bitmap.width * bitmap.height * 4;
     this.total += e.bytes;
     e.used = ++this.clock;
-    if (e.loadingRev === rev) e.loadingRev = null;
     if (e.failedRev === rev) e.failedRev = null;
+    return true;
+  }
+
+  /** 読み込みをやめた（失敗の印は付けない）。 */
+  cancelLoad(key: string, rev: number): void {
+    const e = this.entries.get(key);
+    if (e?.loadingRev === rev) e.loadingRev = null;
   }
 
   /** 読めなかった（その rev では取り直さない。次の表示の結果で `clearFailures`）。 */

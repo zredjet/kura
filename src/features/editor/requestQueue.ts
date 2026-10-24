@@ -6,6 +6,9 @@
  * - 要求には通し番号を振る。閉じたあとの応えは捨てる（仮の筆はどの要求の結果で外すかを通し番号で決める）。
  * - 手のない表示の要求は、前に送ったビューポートと同じなら送らない（`force` で送る：表示が新しい要求に取って代わられた
  *   あとなど）。
+ * - 手をためるたびに番号（`pushed`）を進め、要求にはそこまでの番号（`upto`）を付ける（引数の欄が、送った手の結果が
+ *   届いたかを知る）。応えの来ていない手があるか（`holds`）と、それがなくなるのを待つ口（`settled`）を持つ（閉じる・
+ *   保存する前に）。
  */
 
 import type { EditStepDto, EditStepResultDto, EditViewportDto } from '../../ipc/edit';
@@ -21,6 +24,8 @@ export interface SentRequest<T> {
   seq: number;
   steps: QueuedStep<T>[];
   viewport: EditViewportDto;
+  /** この要求に入れた手の番号の上限（`push` の回数。手のない要求は前の要求と同じ）。 */
+  upto: number;
 }
 
 /** 要求を出す口（`step` は手があるとき、`view` は表示だけ）。 */
@@ -48,7 +53,9 @@ export class RequestQueue<T = unknown> {
   private lastSent: EditViewportDto | null = null;
   private flying: SentRequest<T> | null = null;
   private seq = 0;
+  private pushed = 0;
   private closed = false;
+  private waiters: (() => void)[] = [];
 
   constructor(
     private readonly ipc: QueueIpc,
@@ -70,9 +77,29 @@ export class RequestQueue<T = unknown> {
     return this.seq;
   }
 
+  /** 最後にためた手の番号（`push` の回数）。 */
+  get pushedCount(): number {
+    return this.pushed;
+  }
+
+  /** 応えの来ていない手（ためた手・送った要求の手）のうち、`pred` に合うものがあるか。 */
+  holds(pred: (step: EditStepDto) => boolean = () => true): boolean {
+    return (
+      this.steps.some((s) => pred(s.step)) ||
+      (this.flying?.steps.some((s) => pred(s.step)) ?? false)
+    );
+  }
+
+  /** 応えの来ていない手がなくなったら（閉じたときも）解ける。 */
+  settled(): Promise<void> {
+    if (this.closed || !this.holds()) return Promise.resolve();
+    return new Promise((resolve) => this.waiters.push(resolve));
+  }
+
   /** 手をためて送る（ビューポートは最新に替える）。 */
   push(steps: QueuedStep<T>[], viewport: EditViewportDto): void {
     if (this.closed) return;
+    if (steps.length > 0) this.pushed++;
     this.steps.push(...steps);
     this.viewport = viewport;
     this.flush();
@@ -97,6 +124,15 @@ export class RequestQueue<T = unknown> {
     this.closed = true;
     this.steps = [];
     this.flying = null;
+    this.wake();
+  }
+
+  /** 応えの来ていない手がなければ、待っている呼び手を起こす。 */
+  private wake(): void {
+    if (this.waiters.length === 0 || (!this.closed && this.holds())) return;
+    const waiters = this.waiters;
+    this.waiters = [];
+    for (const resolve of waiters) resolve();
   }
 
   private flush(): void {
@@ -108,7 +144,12 @@ export class RequestQueue<T = unknown> {
         return;
       }
     }
-    const req: SentRequest<T> = { seq: ++this.seq, steps: this.steps, viewport: this.viewport };
+    const req: SentRequest<T> = {
+      seq: ++this.seq,
+      steps: this.steps,
+      viewport: this.viewport,
+      upto: this.pushed,
+    };
     this.steps = [];
     this.viewWanted = false;
     this.forced = false;
@@ -128,12 +169,14 @@ export class RequestQueue<T = unknown> {
         this.flying = null;
         this.handlers.done(req, result);
         this.flush();
+        this.wake();
       },
       (error: unknown) => {
         if (this.closed || this.flying !== req) return;
         this.flying = null;
         this.handlers.error(req, error);
         this.flush();
+        this.wake();
       },
     );
   }

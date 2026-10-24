@@ -24,6 +24,7 @@ import {
   historyCommand,
   historyMenuState,
   historySyncer,
+  isTextTarget,
   libraryViewItems,
   pixelArtItemOptions,
   type PixelArtState,
@@ -34,6 +35,7 @@ import {
   viewItemOptions,
 } from './appMenu';
 import { useEditorStore } from '../features/editor/editorStore';
+import { isReplayed } from '../lib/keys';
 
 vi.mock('../features/library/pixelArtMenu', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../features/library/pixelArtMenu')>()),
@@ -325,6 +327,8 @@ describe('replayKey', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]).toMatchObject({ key: 's', code: 'KeyS', metaKey: true, altKey: true });
     expect(seen[0]?.target).toBe(button);
+    // メニューが送ったキーの印（エディタの押している間だけの道具は、このキーでは替えない）
+    expect(isReplayed(seen[0] as KeyboardEvent)).toBe(true);
   });
 });
 
@@ -485,8 +489,44 @@ describe('取り消す・やり直す（M12。エディタの中だけエディ�
     const input = document.createElement('input');
     document.body.append(input);
     expect(historyMenuState(input)).toEqual({ undo: true, redo: true });
+    // 選択・スライダー・スイッチは文字を打たないので、エディタの取り消し
+    const select = document.createElement('select');
+    const range = document.createElement('input');
+    range.type = 'range';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    for (const el of [select, range, checkbox]) {
+      expect(historyMenuState(el)).toEqual({ undo: true, redo: false });
+    }
     useEditorStore.setState({ status: null });
     expect(historyMenuState(document.body)).toEqual({ undo: false, redo: false });
+  });
+
+  it('選択・スライダー・スイッチにフォーカスがあっても、取り消すはエディタへ（execCommand にしない）', () => {
+    const exec = vi.fn(() => true);
+    Object.defineProperty(document, 'execCommand', { value: exec, configurable: true });
+    const seen: KeyboardEvent[] = [];
+    const listener = (e: KeyboardEvent) => seen.push(e);
+    window.addEventListener('keydown', listener, true);
+    for (const make of [
+      () => document.createElement('select'),
+      () => Object.assign(document.createElement('input'), { type: 'range' }),
+      () => Object.assign(document.createElement('input'), { type: 'checkbox' }),
+    ]) {
+      const el = make();
+      document.body.append(el);
+      historyCommand(false, el);
+    }
+    window.removeEventListener('keydown', listener, true);
+    expect(exec).not.toHaveBeenCalled();
+    expect(seen.map((e) => [e.key, e.metaKey])).toEqual([
+      ['z', true],
+      ['z', true],
+      ['z', true],
+    ]);
+    expect(isTextTarget(Object.assign(document.createElement('input'), { type: 'search' }))).toBe(
+      true,
+    );
   });
 
   it('合わせる関数は、変わったときだけ項目を替える', () => {
