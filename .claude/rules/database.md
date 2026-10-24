@@ -16,8 +16,10 @@ paths:
   サムネイルの `thumbs.plan` の `plan_updates_scan_items_only_when_the_plan_changes`、解析の `analysis.plan`（種類と、扱いの変わった
   形式。決定 15）・`analysis.decoders` と
   投影の作り直し（`analysis.reproject` の印があるときだけ）の `sync_plan_reset_is_a_one_time_full_scan`、利用者が設定の
-  「いま確かめる」を押したときだけ走る `items.blob_id` の確かめの `full_check_repairs_blob_ids_and_startup_leaves_them`。
-  docs/data-model.md §4）。
+  「いま確かめる」を押したときだけ走る `items.blob_id` の確かめと、GC が残した版（kept）の数え上げの
+  `full_check_repairs_blob_ids_and_startup_leaves_them`、GC のジョブが部品の印か消し待ちの候補があるときだけ走る文書の部品の片付けの
+  出発点（`edit_objects` の走査。`sweep_parts_keeps_reachable_parts_and_removes_orphans`）と、参照されないアンカーの確かめ（元 × 読み方の
+  設定ごとの小さな `edit_anchors` の走査。`unreferenced_anchors_use_the_input_index`）。docs/data-model.md §4）。
   起動ごと・ジョブごとに走る問い合わせを例外にしない（印や指紋で、変わったときだけ走らせる）。ただし、行が実行中の処理の分しか
   ない小さな表は索引を持たずに走査してよい（今の例外：台帳の予告 `ledger_pending`。開くときの照合と `job_id` での削除。
   `announcements_are_cleared_by_job`。docs/data-model.md §4「保存と版（M12）」）。
@@ -48,9 +50,10 @@ paths:
   「参照」は `ledger::REFERRERS`（`items.hash`・`item_versions.file_blob_id`・`edit_anchors.blob_id`。M12）で、`blobs` を ON DELETE
   CASCADE でなく参照する列を足したらここにも足す（`release_sees_every_table_that_references_the_ledger` が見張る）。items のトリガを
   通らないファイル（版の出力・アンカー）は `ledger::register` で載せる。台帳にまだない中身を `files/` に置く・台帳から外した
-  中身を消すときは `Library::ingest_exclusive` を持つ。予告（`ledger::announce`）をコミットしてから置く・消すのは、台帳にない
-  中身を置く保存（'place'。台帳に載せるトランザクションで予告を消す）と、段 3 の GC が消すとき（'delete'。ファイルを消し終えて
-  から予告を消す）。ゴミ箱を空にする処理は段 3 で作り直すまで ADR-46 の順（予告なし）。開くときに `settle_pending` が予告を照らす。
+  中身を消すときは `Library::ingest_exclusive` を持つ。予告（`ledger::announce`）をコミットしてから置く・消す：台帳にない
+  中身を置く保存は 'place'（台帳に載せるトランザクションで予告を消す）、台帳から外して消す GC とゴミ箱を空にする処理は 'delete'
+  （外す前に予告をコミットし、外したトランザクションのコミットのあとでファイルを消し終えてから、予告を行の ID で消す
+  `ledger::clear_pending`。消し方は `ledger::remove_files`）。開くときに `settle_pending` が予告を照らす。
 - 中身に依る書き込み（解析・サムネイル・プロキシの結果）は `WHERE id = ? AND hash = ?` のようにハッシュを条件にする
   （解析・サムネイルは M11、プロキシは M12 で入れた）。
 - `items.blob_id` は台帳の行の ID の写し（0010 の AFTER のトリガ `items_blob_id_ai`・`items_blob_id_au` が hash から引いて入れる）。

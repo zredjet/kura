@@ -444,6 +444,10 @@ CREATE TABLE settings (
 --                             ときに 'probe.inflight' から移し、次の取り込みなどで 1 件ずつ・1 件だけの印で読む。入れたら外す
 --       'probe.crashed'     = 前回 1 件だけで読んでいる途中で終わったファイル（[取り込み元のパス…]。4,096 件まで）。もう読まずに
 --                             入れ、そのアイテムのサムネイルを failed にする（pending のときだけ）。入れたら外す
+--       'gc.parts'          = 文書の部品が孤立したかもしれない印（true。下書きを置き換えた・捨てた、上書き・別名の保存のジョブが
+--                             版を足さずに終わった、版 0 に戻した保存が空の文書の下書きを消したときに置く。あれば消し待ちの版が
+--                             なくても GC を積み、GC が部品を片付けたトランザクションで、終わっていない保存のジョブがなければ消す。
+--                             M12 の段 3。§4「保存と版（M12）」）
 
 -- ===== 中身ごとの事実（0009。検索と表示の列。台帳の 1 行に 1 行。解析の結果から純粋な関数で作る）=====
 CREATE TABLE media_facts (
@@ -531,7 +535,7 @@ CREATE TABLE edit_objects (
 CREATE TABLE edit_edges (                          -- 親の部品 → 子の部品（本文に書いた順。同じ子が 2 度出てもよい）
   parent_id   INTEGER NOT NULL REFERENCES edit_objects(id) ON DELETE CASCADE,
   ord         INTEGER NOT NULL CONSTRAINT edit_edges_ord CHECK (ord >= 0),
-  child_id    INTEGER NOT NULL REFERENCES edit_objects(id),   -- 参照されている部品は消せない（片付けは段 3 の GC）
+  child_id    INTEGER NOT NULL REFERENCES edit_objects(id),   -- 参照されている部品は消せない（片付けは段 3 の GC。親から順に消す）
   PRIMARY KEY (parent_id, ord)
 ) WITHOUT ROWID;
 CREATE INDEX idx_edit_edges_child ON edit_edges(child_id);
@@ -572,7 +576,7 @@ CREATE TABLE item_versions (
   file_state    TEXT    NOT NULL CONSTRAINT item_versions_file_state
                 CHECK (file_state IN ('hold','waiting','kept','released')),
                 -- hold：今か元（消さない）／waiting：頭でなくなった（7 日と、置き換えより前のバックアップの条件で段 3 の GC が消す）／
-                -- kept：GC の照合が合わず残す（段 3）／released：もうファイルを持たない
+                -- kept：GC の照合が合わず残す（もう GC の候補にならない）／released：もうファイルを持たない
   replaced_at   INTEGER,                              -- 頭でなくなった時刻（hold のときだけ NULL）
   job_id        INTEGER,                              -- 頭になった行を作った保存のジョブ（再開で版を 2 つ足さない）
   created_at    INTEGER NOT NULL,
@@ -588,7 +592,7 @@ CREATE TABLE item_versions (
 CREATE INDEX idx_item_versions_output    ON item_versions(output_hash);       -- 重複の判定（find_owner）
 CREATE INDEX idx_item_versions_file_blob ON item_versions(file_blob_id);      -- 台帳の行が参照されているか（REFERRERS）
 CREATE INDEX idx_item_versions_doc       ON item_versions(doc_id);
-CREATE INDEX idx_item_versions_waiting   ON item_versions(replaced_at) WHERE file_state = 'waiting';   -- 段 3 の GC
+CREATE INDEX idx_item_versions_waiting   ON item_versions(replaced_at) WHERE file_state = 'waiting';   -- 段 3 の GC の候補
 CREATE UNIQUE INDEX idx_item_versions_job ON item_versions(job_id) WHERE job_id IS NOT NULL;
 -- 不変条件（`edit::versions::check_invariants`。§4「保存と版（M12）」の「不変条件」に全部）：版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。
 -- 版 0 と頭は hold（ほかの版は hold でない）。頭の output_hash・ext は items.hash・ext に等しい。hold・waiting・kept の file_blob_id が指す
@@ -707,10 +711,12 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   `import::store::find_owner`（アイテムの今 → 元 → 過去の版。下の「保存と版（M12）」。M11 は items の `find_by_hash` だけ）。
 - 整合性チェック：`files/` にあるはずのファイルは台帳の `(hash, ext)` から作る。どの表からも参照されない台帳の行も数える
   （`unreferencedBlobs`）。起動時と設定の「いま確かめる」は同じ `library::check_integrity` で、いま確かめるとき（`Full`）だけ
-  `items.blob_id` が hash の台帳の行と食い違うアイテムを直す（`repair_blob_ids`。M12）。
+  `items.blob_id` が hash の台帳の行と食い違うアイテムを直し（`repair_blob_ids`。M12）、GC が残した版・7 日を過ぎた消し待ちの版を
+  数える（M12 の段 3。下の「保存と版（M12）」の「整合性の数」）。
 - ゴミ箱を空にする：items の行を消したのと同じトランザクションで、どの表からも参照されなくなった台帳の行を `ledger::release` で
-  消す（事実・結果は CASCADE）。編集したアイテム（M12）は、版の行が持つファイルとアンカーも解放する（下の「保存と版（M12）」）。
-  コミットのあとで、解放した中身の実ファイルと派生のファイルを消す（ADR-46 の順）。
+  消す（事実・結果は CASCADE）。編集したアイテム（M12）は、版の行が持つファイルとアンカーも解放し、文書の部品も片付ける。消しうる
+  中身は先に 'delete' で予告してコミットし、コミットのあとで解放した中身の実ファイルと派生のファイルを消してから予告を消す（M12 の
+  段 3。手順は下の「保存と版（M12）」の「ゴミ箱を空にする処理」。落ちても開くときの予告の照合が片付ける）。
   取り込み（files/ に置く → DB に書く）とは `Library` の 1 つの鍵で直列にする（置いたばかりの同じ中身を消さないように。
   ゴミ箱を空にする処理は書きの側 `Library::ingest_exclusive`、取り込みは読みの側 `ingest_guard`）。
 - 「どの表からも参照されない」は、`blobs` を参照する CASCADE でない外部キーをすべて見る（`ledger::REFERRERS`：`items.hash`・
@@ -726,7 +732,7 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 ### 保存と版（M12。`crates/kura-core/src/edit/`・`library/ledger.rs`・`import/store.rs`）
 
 段 2 の A（重複の判定・台帳の門・予告と照合・文書の部品・ゴミ箱を空にする処理）、B（版の読み書き・アンカー・保存のジョブの上書きと別名）、
-C（版に戻す・下書き・不変条件）で入れたもの。
+C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空にする処理の作り直し。`edit::gc`）で入れたもの。
 
 - **重複の判定**（`import::store::find_owner`。取り込み・ダウンロード・キャプチャ）：今 → 元 → 過去の版の順に、2 段の問い合わせで
   探す（どちらも索引。テスト `find_owner_looks_at_current_then_original_then_past_versions` の EXPLAIN）。
@@ -741,14 +747,16 @@ C（版に戻す・下書き・不変条件）で入れたもの。
 
   持ち主が見つかれば（どの役割でも）そのアイテムの重複（所属・タグを足し、ゴミ箱から戻す）。置いたコピーの扱いは上の「台帳で数える」。
 - **台帳の門**：台帳にまだない中身を `files/` に置いて台帳に載せる処理（保存の「予告 → 配置 → コミット → 後始末」）と、台帳から外して
-  ファイルを消す処理（ゴミ箱を空にする・段 3 の GC）は、取り込みの鍵の書きの側（`Library::ingest_exclusive`）を持つ。取り込み・
+  ファイルを消す処理（ゴミ箱を空にする・GC）は、取り込みの鍵の書きの側（`Library::ingest_exclusive`）を持つ。取り込み・
   ダウンロード・キャプチャは「置いてから DB に書く」まで読みの側を持つので、取り込みが「もう置いてある」と判断した同じ中身を、
   保存が台帳に載せる前に消すことがない。描く・エンコードする間は持たない。
-- **予告と照合**（`ledger::announce`・`clear_announced`・`settle_pending`）：台帳にない中身を置く前に `ledger_pending` に
+- **予告と照合**（`ledger::announce`・`clear_announced`・`clear_pending`・`settle_pending`）：台帳にない中身を置く前に `ledger_pending` に
   `(hash, ext, 'place', job)` を書いてコミットし、'place' の予告は台帳に載せるトランザクションで `DELETE FROM ledger_pending WHERE job_id = ?`
-  で消す。段 3 の GC は台帳から外す前に `'delete'` を書いてコミットし、'delete' の予告はファイルを消し終えてから消す。ゴミ箱を空にする処理は段 3 で作り直すまで ADR-46 の順（予告なし。落ちても残るのは「DB にないファイル」
-  だけで、整合性チェックが数える）。ライブラリを開くとき、staging の掃除の直後・整合性チェックとジョブの前に同期で照らす
-  （`LibrarySession::start`。片付けた数はログ）：
+  で消す。台帳から外す処理（段 3 の GC・ゴミ箱を空にする処理）は、外す前に消しうる中身を `'delete'` で予告してコミットし（`announce` は
+  行の ID を返す。ゴミ箱を空にする処理は `job_id` が NULL）、外したトランザクションのコミットのあとでファイルを消し終えてから、
+  その予告を行の ID で消す（`DELETE FROM ledger_pending WHERE id = ?`。主キー。消せなかったファイルの予告は残し、同じジョブのほかの
+  予告を消さない）。外さなかった中身（ほかが参照していた）の予告は、照合で行だけ消える。ライブラリを開くとき、staging の掃除の直後・
+  整合性チェックとジョブの前に同期で照らす（`LibrarySession::start`。片付けた数はログ）：
 
   ```sql
   SELECT p.id, p.hash, p.ext,
@@ -761,9 +769,9 @@ C（版に戻す・下書き・不変条件）で入れたもの。
   ファイル（`Layout::derived_paths`）も消してから予告の行を消す（ほかの拡張子で載っている中身の派生は、そのアイテムのもの）。
   消せなかったファイルの予告は残し、次に開くときにやり直す。電源断で DB の最後のコミットを失っても、残りうるのは「DB にない
   ファイル」だけ（置く前に `sync_all`）。
-- **索引なしの例外**：`ledger_pending` は実行中の保存・GC の分だけの小さな表なので索引を持たず、開くときの照合と
+- **索引なしの例外**：`ledger_pending` は実行中の保存・GC・ゴミ箱を空にする処理の分だけの小さな表なので索引を持たず、開くときの照合と
   `DELETE FROM ledger_pending WHERE job_id = ?` は走査する（`announcements_are_cleared_by_job` の EXPLAIN。台帳の側は hash の一意の
-  索引で引く）。
+  索引で引く。'delete' の予告を ID で消すのは主キー：`delete_announcements_are_cleared_by_id`）。
 - **台帳に載せる**（`ledger::register`）：items のトリガを通らないファイル（版の出力・アンカー）は
   `INSERT INTO blobs … ON CONFLICT(hash) DO NOTHING` のあと行を読み、拡張子・サイズが食い違えば items のトリガと同じ言葉
   （`items_blob_mismatch`）の Conflict。
@@ -844,23 +852,112 @@ C（版に戻す・下書き・不変条件）で入れたもの。
 - **保存をやめるとき**（トランザクション 2 が Conflict など）：台帳の門を持ったまま、`SELECT p.hash, p.ext FROM ledger_pending p WHERE
   p.job_id = ? AND NOT EXISTS (SELECT 1 FROM blobs b WHERE b.hash = p.hash AND b.ext = p.ext)` のファイルを消し、予告を消す（予告の表は
   走査の例外）。
-- **ゴミ箱を空にする処理**（`items::delete_trashed`。段 2 の最小の対応で、段 3 で作り直す。利用者の決定 6）：items の行を消す前に、
-  ゴミ箱のアイテムの版が持つファイルの hash と、版の入力が使うアンカーの ID を集める（ゴミ箱の部分索引 `idx_items_trashed` から
-  たどる。統計のない小さな表で版の表を走査する順を選ばないよう、`CROSS JOIN` で結ぶ順を決める）。行を消したあと（版・入力は
-  CASCADE）、どの入力からも参照されなくなったアンカーの行を消し（`edit::anchors::sweep_unreferenced`。
-  `idx_item_version_inputs_anchor` で引く）、items ∪ 版 ∪ アンカーの hash を `ledger::release` に渡す。ほかのアイテムの版が持つ
-  同じ中身（別名で保存したアイテムの版 0 が持つ元のアイテムの元）は REFERRERS で解放されない。文書の部品の行は残る（段 3 の GC）。
+- **ゴミ箱を空にする処理**（`Library::empty_trash`・`items::plan_empty_trash`・`items::delete_trashed`。段 3 で GC と同じ部品の上に作り
+  直した。利用者の決定 6：猶予中のファイル・元・アンカーも照合せずにすぐ消す）：台帳の門を持って、
+  1. トランザクション 1：消すアイテム（ゴミ箱の部分索引 `idx_items_trashed`）と、消しうる中身（アイテムの今・版が持つファイル・版の入力が
+     使うアンカーのファイル）を集め、`'delete'` で予告してコミット（このあとゴミ箱に入れられたものは、次に空にするまで残す）。
+  2. トランザクション 2：決めたアイテムを 1 件ずつ（主キー・`UNIQUE(item_id, version)`・入力の主キー・下書きの主キーで）消す前に、版が持つ
+     ファイルの hash・入力が使うアンカーの ID・版と下書きの文書の根を集めてから行を消す（版・入力・下書きは CASCADE）。どの入力からも
+     参照されなくなったアンカーの行を消し（`edit::anchors::sweep_unreferenced`。`idx_item_version_inputs_anchor`）、items ∪ 版 ∪
+     アンカーの hash を `ledger::release` に渡す。消したアイテムの版・下書きの文書の部品のうち、ほかから辿れないものを消す
+     （`gc::sweep_parts` の根の範囲。下の「文書の部品の片付け」）。予告していない中身を解放したら（ないはずだが）同じトランザクションで
+     予告する。
+  3. コミットのあとで、解放した中身の実ファイルと派生のファイルを消し（`ledger::remove_files`）、4. 予告を行の ID で消す（消せない
+     ファイルがあれば予告を残し、次に開くときの照合が消す）。
+
+  ほかのアイテムの版が持つ同じ中身（別名で保存したアイテムの版 0 が持つ元のアイテムの元）・ほかの版の入力が使うアンカーは REFERRERS で
+  解放されない。途中で落ちても、2 のあとなら開くときの照合が台帳にないファイルを消す（`s16_emptying_the_trash_of_edited_items`）。
 
   ```sql
-  SELECT DISTINCT b.hash FROM items i CROSS JOIN item_versions v ON v.item_id = i.id
-    JOIN blobs b ON b.id = v.file_blob_id WHERE i.trashed_at IS NOT NULL;
-  SELECT DISTINCT n.anchor_id FROM items i CROSS JOIN item_versions v ON v.item_id = i.id
-    CROSS JOIN item_version_inputs n ON n.version_id = v.id
-   WHERE i.trashed_at IS NOT NULL AND n.anchor_id IS NOT NULL;
+  -- 1 の消しうる中身（ゴミ箱の部分索引からたどる。CROSS JOIN で結ぶ順を決める。統計のない小さな表で版の表を走査しないよう）
+  SELECT b.hash, b.ext FROM items i CROSS JOIN blobs b ON b.hash = i.hash WHERE i.trashed_at IS NOT NULL
+  UNION
+  SELECT b.hash, b.ext FROM items i CROSS JOIN item_versions v ON v.item_id = i.id
+    JOIN blobs b ON b.id = v.file_blob_id WHERE i.trashed_at IS NOT NULL
+  UNION
+  SELECT b.hash, b.ext FROM items i CROSS JOIN item_versions v ON v.item_id = i.id
+    CROSS JOIN item_version_inputs n ON n.version_id = v.id JOIN edit_anchors a ON a.id = n.anchor_id
+    JOIN blobs b ON b.id = a.blob_id WHERE i.trashed_at IS NOT NULL;
+  -- 2 のアイテムごと
+  SELECT b.hash FROM item_versions v JOIN blobs b ON b.id = v.file_blob_id WHERE v.item_id = ?1;
+  SELECT n.anchor_id FROM item_versions v CROSS JOIN item_version_inputs n ON n.version_id = v.id
+   WHERE v.item_id = ?1 AND n.anchor_id IS NOT NULL;
+  SELECT doc_id FROM item_versions WHERE item_id = ?1 AND doc_id IS NOT NULL UNION SELECT doc_id FROM edit_drafts WHERE item_id = ?1;
   DELETE FROM edit_anchors WHERE id = ?1
      AND NOT EXISTS (SELECT 1 FROM item_version_inputs i WHERE i.anchor_id = edit_anchors.id) RETURNING blob_id;
   ```
 
+- **GC の候補**（`edit::gc`。意味は docs/editing.md §14「GC のジョブ」）：消してよい置き換えの時刻の上限 `cutoff` は
+  `min(今 − 7 日, 残っているいちばん古いバックアップの作成時刻 − 1)`（バックアップがなければ `今 − 7 日`。`gc::cutoff`。バックアップは
+  `backups/` の名前の UTC。秒の単位）。積むかは部分索引の 1 行で決める（`gc::due`。版の表を走査しない）：
+
+  ```sql
+  SELECT EXISTS (SELECT 1 FROM item_versions WHERE file_state = 'waiting' AND replaced_at <= ?cutoff);   -- idx_item_versions_waiting
+  -- ほかに settings の 'gc.parts'（文書の部品の印）があれば積む
+  ```
+
+  候補は、カーソル（置き換えの時刻と版の行の ID）の次から 16 個ずつ、置き換えの古い順に読む。共有（ほかの hold の版・アイテムの今・
+  アンカーが同じ台帳の行を参照する）も同じ問い合わせで見る（3 つの EXISTS はそれぞれ `sqlite_autoindex_items_1`・`idx_item_versions_file_blob`・
+  `idx_edit_anchors_blob`。`candidates_follow_the_cursor_and_see_sharing` の EXPLAIN）：
+
+  ```sql
+  SELECT v.id, v.item_id, v.version, v.replaced_at, v.file_blob_id, b.hash, b.ext,
+         EXISTS (SELECT 1 FROM items i WHERE i.hash = b.hash)
+      OR EXISTS (SELECT 1 FROM item_versions w WHERE w.file_blob_id = v.file_blob_id AND w.file_state = 'hold')
+      OR EXISTS (SELECT 1 FROM edit_anchors a WHERE a.blob_id = v.file_blob_id)
+    FROM item_versions v JOIN blobs b ON b.id = v.file_blob_id
+   WHERE v.file_state = 'waiting' AND v.replaced_at <= ?1 AND (v.replaced_at, v.id) > (?2, ?3)
+   ORDER BY v.replaced_at, v.id LIMIT ?4;
+  ```
+
+- **GC の手順**（候補ごと。途中経過 `{"v":1,"phase","cursor","released","shared","kept","deferred","anchors","parts","files"}` は候補ごとの
+  トランザクションで書く）：
+  - 共有：台帳の門を持って、まだ消し待ちで同じ台帳の行を指し、まだ共有なら `released` にする（下の UPDATE。ファイルは消さない）。
+  - 共有でない：門の外で照合する（`save::verify_version`）。合わなければ
+    `UPDATE item_versions SET file_state = 'kept' WHERE id = ? AND file_state = 'waiting' AND file_blob_id = ?`、照らせなければ何も変えない
+    （カーソルだけ進める）。一致すれば台帳の門を取り、トランザクション 1 で `SELECT file_state, file_blob_id FROM item_versions WHERE id = ?`
+    で確かめ直し（共有になっていれば `released` にするだけ）、`ledger::announce(hash, ext, 'delete', job)` をコミット、トランザクション 2 で
+
+    ```sql
+    UPDATE item_versions SET file_state = 'released', file_blob_id = NULL
+     WHERE id = ?1 AND file_state = 'waiting' AND file_blob_id = ?2;   -- 1 行なら ledger::release(hash)
+    ```
+
+    をコミットしてから、解放した中身の実ファイルと派生のファイルを消し、予告を ID で消す。
+  - アンカー：`SELECT a.id, b.hash, b.ext FROM edit_anchors a JOIN blobs b ON b.id = a.blob_id WHERE NOT EXISTS (SELECT 1 FROM item_version_inputs n
+    WHERE n.anchor_id = a.id)`（アンカーの表は元 × 読み方の設定ごとの小さな表なので走査する。入力は `idx_item_version_inputs_anchor`）を
+    同じく予告 → `sweep_unreferenced` と `ledger::release` → ファイル → 予告の順で片付ける。
+- **文書の部品の片付け**（`gc::sweep_parts`。1 つのトランザクション）：根は版の `doc_id`・下書きの `doc_id` と、保存のジョブの入力の
+  `action.doc`（根のダイジェスト）のうち、終わっていないものと 7 日以内に失敗・中止したもの（`save::gc_roots`。利用者がやり直せるように）：
+
+  ```sql
+  SELECT input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit'
+  UNION ALL
+  SELECT input_json FROM jobs WHERE state IN ('failed', 'canceled') AND kind = 'edit' AND finished_at >= ?1;   -- どちらも idx_jobs_queue
+  ```
+
+  範囲（GC はすべて：親の辺のない部品＝文書の根と孤立したノード・切れ目。`edit_objects` を走査する（部品の印か消し待ちの候補が
+  あって GC が動くときだけ）。ゴミ箱を空にする処理は消したアイテムの版・下書きの文書の根）の部品のうち、根でなく、どこからも
+  参照されないものを消し、その子へ進む（`edit_edges.child_id` は ON DELETE なしなので親から順に。親を消すと親の辺は CASCADE で消え、
+  子は残った辺がなくなったときに消える。部品の深さは 2 まで）：
+
+  ```sql
+  SELECT EXISTS (SELECT 1 FROM edit_edges WHERE child_id = ?1)          -- idx_edit_edges_child
+      OR EXISTS (SELECT 1 FROM item_versions WHERE doc_id = ?1)        -- idx_item_versions_doc
+      OR EXISTS (SELECT 1 FROM edit_drafts WHERE doc_id = ?1);         -- idx_edit_drafts_doc
+  SELECT child_id FROM edit_edges WHERE parent_id = ?1;                 -- 主キー
+  DELETE FROM edit_objects WHERE id = ?1;
+  ```
+
+  部品が孤立しうるとき（下書きを置き換える・捨てる、上書き・別名の保存のジョブが版を足さずに終わる、版 0 に戻した保存が空の文書の
+  下書きを消す）は settings の `'gc.parts'` を置き、GC が片付けたトランザクションで
+  `DELETE FROM settings WHERE key = 'gc.parts' AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('queued','running','paused') AND kind = 'edit')`
+  （終わっていない保存があれば、その根があとで孤立しうるので印を残す）。保存のジョブは、入力が指す部品を置くのと同じトランザクションで
+  積む（`JobManager::enqueue_with`。間に片付けが入っても、積んだジョブの根として残る）。
+- **整合性の数**（M12 の段 3。問題には数えない）：設定の「いま確かめる」で、GC の照合が合わずに残した版
+  `SELECT count(*) FROM item_versions WHERE file_state = 'kept'`（版の表を走査する。いま確かめるときだけ）と、7 日とバックアップの条件を
+  満たしたのに消し待ちのままの版 `SELECT count(*) FROM item_versions WHERE file_state = 'waiting' AND replaced_at <= ?cutoff`（部分索引）を
+  `IntegrityReport` の `keptVersions`・`overdueVersions` に入れる（起動時は GC のジョブの前なので数えず null）。
 - **版に戻す**（`edit::save` の `revert`。意味は docs/editing.md §14「版に戻す」）：戻す先 k は 0 以上・頭の版より前。版 k の行は
   `UNIQUE(item_id, version)`、入力は主キーで引く。
   - 使い直す（版 k の中身が台帳にあってファイルがある）：台帳の門を持って `ledger::ext_of`（hash の一意の索引）とファイルを確かめ、
@@ -895,7 +992,8 @@ C（版に戻す・下書き・不変条件）で入れたもの。
    WHERE item_id = ?1 AND after_job = ?job;
   ```
 
-  別名で保存では元のアイテム A の下書きに同じ規則を当てる（土台は A の頭のまま）。下書きの部品の行は消さない（段 3 の GC）。
+  別名で保存では元のアイテム A の下書きに同じ規則を当てる（土台は A の頭のまま）。下書きの部品の行は消さない（置き換える・捨てると
+  `'gc.parts'` の印を置き、GC が片付ける。上の「文書の部品の片付け」）。
 - **不変条件**（`edit::versions::check_invariants`。表を走査するので、テスト・crash-loop・整合性の確かめだけで呼び、起動の道では呼ばない）：
   1. 版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。版 0 と頭は hold、ほかの版は hold でない。頭の output_hash・ext は items.hash・ext。
   2. released でない行の `file_blob_id` が指す台帳の行の hash は output_hash と同じ。
@@ -903,7 +1001,9 @@ C（版に戻す・下書き・不変条件）で入れたもの。
      （`load_doc_bytes`。本文からダイジェストを求め直す）。
   4. edit の版は入力 0（primary）の行を持つ。revert の版は戻した先の版がそのアイテムにあり、文書・値のダイジェスト・入力の数が同じ。
   5. 入力の `anchor_id` はアンカーの行を指し、アンカーは台帳の行を持ち、元（`source_hash`）が入力の元と同じ。どの入力からも参照されない
-     アンカーはない（ゴミ箱を空にする処理が片付ける）。
+     アンカーはない（ゴミ箱を空にする処理が片付ける。残っていれば GC も）。
+  6. 終わっていない（待ち・実行中・一時停止の）保存のジョブの入力の文書は、根の部品があってつなぎ直せる（GC の部品の片付けが消さない。
+     段 3）。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
 
