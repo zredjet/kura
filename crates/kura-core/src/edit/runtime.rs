@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use kura_engine::budget::{Class, MemoryBudget, default_total};
+use kura_engine::budget::{Class, Lease, MemoryBudget, default_total};
 use kura_engine::doc::InputId;
 use kura_engine::render::cache::{FingerprintedInput, NodeCache};
 use kura_engine::render::estimate::{Admission, CacheLease, EstimateSpec, MemoryEstimate};
@@ -131,6 +131,31 @@ impl EngineRuntime {
         let spec = spec.tasks(self.bulk_threads() as u64);
         self.engine
             .admit(plan, &spec, &self.budget, Class::Bulk, mon)
+    }
+
+    /// 一括の確保に、呼び手の分を足す口（保存のジョブがアンカーを作るとき。docs/editing.md §9.4）：計画を見積もり（並列の数は
+    /// 一括のプールのスレッドの数）、ピークと `extra(&見積もり)` の大きいほうを確保する。それが予算の全体を超えれば何も確保
+    /// せずに Limit、収まれば確保できるまで待つ（`mon` の中止で Canceled）。プールの外で呼び、返した確保を描き終える（書き
+    /// 終える）まで持つ。アンカーは読んだ直後・描く前に書いて読み直すので、描く段のピークとは重ならない（大きいほうでよい）。
+    pub fn admit_bulk_with(
+        &self,
+        plan: &Plan,
+        spec: EstimateSpec<'_>,
+        extra: impl FnOnce(&MemoryEstimate) -> u64,
+        mon: &dyn Monitor,
+    ) -> std::result::Result<(MemoryEstimate, Lease), EngineError> {
+        outside_the_pools("予算は、編集のプールの外で確保します");
+        let spec = spec.tasks(self.bulk_threads() as u64);
+        let estimate = self.engine.estimate(plan, &spec, None)?;
+        let need = estimate.peak.max(extra(&estimate));
+        let total = self.budget.total();
+        if need > total {
+            return Err(EngineError::Limit(format!(
+                "メモリの予算を超える見込みです（見積もり {need} バイト。予算は {total} バイト）"
+            )));
+        }
+        let lease = self.budget.acquire(need, Class::Bulk, mon)?;
+        Ok((estimate, lease))
     }
 
     /// エディタを開くとき：キャッシュの上限を `want` にして、その分（とキャッシュが数える入力）を予算から確保する
@@ -464,6 +489,45 @@ mod tests {
         assert!(!entered.load(Ordering::Relaxed));
         assert_eq!(mon.calls(), 0);
         assert_eq!(rt.budget().used().unwrap(), 0);
+    }
+
+    /// 呼び手の分を足す確保：ピークと呼び手の分の大きいほうを確保し、全体を超えれば何も確保せずに Limit、中止は Canceled。
+    #[test]
+    fn admit_bulk_with_takes_the_larger_of_peak_and_extra() {
+        use kura_engine::monitor::CancelFlag;
+
+        let rt = EngineRuntime::new(&RuntimeConfig {
+            budget: Some(64 * MIB),
+            bulk_threads: Some(2),
+            preview_threads: Some(1),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let (graph, input) = doc();
+        let plan = compiled(&rt, &graph, &input);
+        let (est, lease) = rt
+            .admit_bulk_with(&plan, EstimateSpec::new(0), |_| 0, &NoMonitor)
+            .unwrap();
+        assert_eq!(lease.bytes(), est.peak);
+        assert_eq!(rt.budget().used().unwrap(), est.peak);
+        drop(lease);
+        let (est, lease) = rt
+            .admit_bulk_with(&plan, EstimateSpec::new(0), |e| e.peak + MIB, &NoMonitor)
+            .unwrap();
+        assert_eq!(lease.bytes(), est.peak + MIB);
+        drop(lease);
+        let r = rt.admit_bulk_with(&plan, EstimateSpec::new(0), |_| 65 * MIB, &NoMonitor);
+        assert!(matches!(r, Err(EngineError::Limit(_))), "{:?}", r.err());
+        assert_eq!(rt.budget().used().unwrap(), 0);
+        // 埋まっていれば待ち、中止で Canceled
+        let _hold = rt
+            .budget()
+            .acquire(60 * MIB, Class::Bulk, &NoMonitor)
+            .unwrap();
+        let flag = CancelFlag::default();
+        flag.cancel();
+        let r = rt.admit_bulk_with(&plan, EstimateSpec::new(0), |_| 10 * MIB, &flag);
+        assert!(matches!(r, Err(EngineError::Canceled)), "{:?}", r.err());
     }
 
     /// 予算の確保をプールの中からすると、debug のビルドで止まる（ほかの描画のワーカーを塞いで待たない）。

@@ -159,14 +159,24 @@ pub(crate) mod fake {
 
     use super::*;
 
-    /// 呼ばれた回数と、渡された一時ファイルの置き場を覚える。
+    /// 呼ばれた回数と、渡された一時ファイルの置き場を覚える。コーデックの組は既定で固定の段だけ、[`FakeEngineFactory::with_codecs`]
+    /// で作ったものは置き場の組の写し（テストが中身を入れ替え、`EngineServices::reload_codecs` で作り直させる）。
     #[derive(Default)]
     pub struct FakeEngineFactory {
         runtimes: AtomicUsize,
         work_dirs: Mutex<Vec<PathBuf>>,
+        codecs: Option<Arc<Mutex<CodecSet>>>,
     }
 
     impl FakeEngineFactory {
+        /// コーデックの組を `codecs` の写しにする（偽の Platform のデコーダを足した組など）。
+        pub fn with_codecs(codecs: Arc<Mutex<CodecSet>>) -> Self {
+            Self {
+                codecs: Some(codecs),
+                ..Self::default()
+            }
+        }
+
         /// 実行の場の設定を作った回数。
         pub fn runtimes(&self) -> usize {
             self.runtimes.load(Ordering::SeqCst)
@@ -195,7 +205,10 @@ pub(crate) mod fake {
 
         fn codecs(&self, work_dir: &Path) -> CodecSet {
             self.work_dirs.lock().unwrap().push(work_dir.to_path_buf());
-            CodecSet::pinned()
+            match &self.codecs {
+                Some(set) => set.lock().unwrap().clone(),
+                None => CodecSet::pinned(),
+            }
         }
     }
 }

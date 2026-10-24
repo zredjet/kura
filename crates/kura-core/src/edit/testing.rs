@@ -68,9 +68,9 @@ pub(crate) fn insert_version_with(
     let replaced = (file_state != "hold").then_some(5);
     let id: i64 = conn
         .query_row(
-            "INSERT INTO item_versions (item_id, version, kind, doc_id, base_version, output_hash, ext, size_bytes,
+            r#"INSERT INTO item_versions (item_id, version, kind, doc_id, base_version, output_hash, ext, size_bytes,
                                         record, file_blob_id, file_state, replaced_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{}', ?9, ?10, ?11, 1) RETURNING id",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{"v":1,"engine":"test"}', ?9, ?10, ?11, 1) RETURNING id"#,
             params![
                 item_id,
                 version,

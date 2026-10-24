@@ -15,7 +15,7 @@ use crate::analysis::plan::PlanFingerprint;
 use crate::analysis::{AnalyzeHandler, AnalyzeShared, store as analysis_store};
 use crate::capture::CaptureHandler;
 use crate::download::{DownloadHandler, work_dir_name};
-use crate::edit::{ENGINE_WORK_DIR, EngineFactory, EngineServices};
+use crate::edit::{ENGINE_WORK_DIR, EditHandler, EngineFactory, EngineServices};
 use crate::export::ExportHandler;
 use crate::import::ImportHandler;
 use crate::jobs::{JobKind, JobManager};
@@ -162,12 +162,13 @@ impl LibrarySession {
                 Arc::new(ProxyHandler::new(ProxyTools::detect(), proxy.clone())),
             ),
         ];
-        // 解析はエンジンの部品があるときだけ（ないときは積まない。JobManager::ensure_queued が登録のない種類を無視する）
+        // 解析と保存はエンジンの部品があるときだけ（ないときは積まない。JobManager::ensure_queued が登録のない種類を無視する）
         if let Some(engine) = &engine {
             handlers.push((
                 JobKind::Analyze,
                 Arc::new(AnalyzeHandler::new(engine.clone(), analysis.clone())),
             ));
+            handlers.push((JobKind::Edit, Arc::new(EditHandler::new(engine.clone()))));
         }
         let jobs = Arc::new(JobManager::new(library.clone(), handlers, sink)?);
         let integrity = Arc::new(Mutex::new(None));

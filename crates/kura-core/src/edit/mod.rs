@@ -1,14 +1,19 @@
-//! 編集（docs/editing.md）のうち、エンジン（kura-engine）を動かす側の部品。エディタのセッション・保存・一括のジョブは
-//! M12〜M14 でここに足す。
+//! 編集（docs/editing.md）のうち、エンジン（kura-engine）を動かす側の部品。文書の部品（[`store`]）・版（[`versions`]）・
+//! アンカー（[`anchors`]）・保存のジョブ（[`save`]。M12 の段 2）。エディタのセッション・一括のジョブは M12〜M14 でここに足す。
 
 pub mod anchors;
 pub mod runtime;
+pub mod save;
+#[cfg(test)]
+mod save_tests;
 pub mod services;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod versions;
 
 pub use runtime::{EngineRuntime, RuntimeConfig, pool_sizes};
+pub use save::{Base, EditHandler, SaveAction, SaveRequest, start_save};
 pub use services::{CodecSet, ENGINE_WORK_DIR, EngineFactory, EngineServices};
 
 use kura_engine::EngineError;
