@@ -16,6 +16,9 @@ paths:
   - `peaksUrl(hash)`：`/peaks/{hash}`（波形の段 `kura-peaks`。immutable）。`fetch` して `src/lib/asset/peaks.ts` の `parsePeaks` で読む。
   - `pcmUrl(hash, start, end)`：`/pcm/{hash}/{start}-{end}`（試聴の PCM。フレームの半開区間で、0 以上の整数・`start < end`。キャッシュしない）。`fetch` して `src/lib/asset/wav.ts` の `readPcmWav` で読む（`decodeAudioData` は使わない。文脈のレートに直されてループ点が標本で合わなくなる）。
   - `animUrl(hash, rev)`：`/anim/{hash}/1`（アニメの帯の PNG。immutable。帯の並べ方を変えたら番号を上げる）。`rev` は `item_anim_get` の `AnimDto.rev`（格子の帯は格子ごとに変わる）で、0 より大きいときだけ `?r={rev}`。
+  - `editTileUrl(session, rev, level, frame, tx, ty, format)`：`/edit/{session}/{rev}/{段}/{frame}/{tx}/{ty}`（エディタの表示のタイル。
+    1 辺 256。`format` が `png` なら `.png`、`rgba` なら RGBA8 の行。immutable。M12）。rev は「そのタイルが最後に変わった rev」で、
+    段は Rust が決めた `view.level`。session・rev・段・番号の形が合わなければ RangeError。
   - `media.test.ts` が、`kura://` の組み立て・`thumbUrl` の呼び出し・`thumbState` の `'ready'` だけの判定がほかのファイルにないことを見張る（注釈は除く。自己点検の `src/dev/selftest.ts` は壊れた URL をわざと組むので外す）。
 - ループの試聴は `src/lib/assetAudio.ts` の `Audition` を通す。`AudioBufferSourceNode` の `loopStart`・`loopEnd` を使わない（秒に直すと標本がずれる。本体だけのバッファを `loop` で回す）。文脈は `ContextPool` から元のレートで取る。
   - 画面からは `src/features/asset/auditionStore.ts`（始める・止める・L のキー。プレーヤーを一時停止する）を通し、文脈の持ち主は `src/features/asset/audioRuntime.ts`（試聴と効果音で分け合い、ライブラリの画面を離れるときに閉じる）。長さ（フレーム）は `item_asset_get` の DTO・一覧の概要にない（DB では analysis_results の `kura.read` にだけある）ので、`Audition.startProbed`（/pcm の先頭の 1 フレームの応答で、PCM と同じ読み取りの長さ・ループ点を知る）で始める。
