@@ -15,27 +15,40 @@ import { IpcError } from '../../ipc/result';
 import { unpackPoints } from '../../lib/paint';
 import { useNoticeStore } from '../../stores/noticeStore';
 import {
+  addOp,
   applyDocDelta,
+  cancelCrop,
   closeEditor,
+  confirmCrop,
   editorController,
   editorRedo,
   editorUndo,
   fillAt,
   focusNode,
+  hasUnsavedChanges,
+  moveSelected,
+  nudgeCropRect,
   openEditor,
+  removeNode,
   sampleAt,
+  selectAdjacent,
+  selectTool,
+  sendParam,
+  setCropRect,
   strokeEnd,
   strokeStart,
   useEditorStore,
 } from './editorStore';
 import { DEFAULT_TOOLS, useToolStore } from './toolStore';
 
-vi.mock('../../ipc/edit', () => ({
+vi.mock('../../ipc/edit', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../ipc/edit')>()),
   openEdit: vi.fn(),
   stepEdit: vi.fn(),
   viewEdit: vi.fn(),
   sampleEdit: vi.fn(),
   closeEdit: vi.fn(async () => null),
+  discardEditDraft: vi.fn(async () => true),
 }));
 
 function item(over: Partial<ItemSummaryDto> = {}): ItemSummaryDto {
@@ -342,6 +355,261 @@ describe('手', () => {
   });
 });
 
+describe('右パネル', () => {
+  const crop = (id: number, rect = { x: 0, y: 0, w: 64, h: 32 }, enabled = true) => ({
+    id,
+    op: 'image.crop',
+    v: 1,
+    enabled,
+    params: { rect },
+    log: null,
+  });
+  const flip = (id: number) => ({
+    id,
+    op: 'image.flip',
+    v: 1,
+    enabled: true,
+    params: { axis: 'horizontal' },
+    log: null,
+  });
+
+  async function openWith(nodes: ReturnType<typeof crop | typeof flip>[]) {
+    vi.mocked(openEdit).mockResolvedValue(
+      opened('aa01', {
+        doc: { base: null, order: nodes.map((n) => n.id), nodes, outputs: null },
+      }),
+    );
+    await openEditor(item());
+    await flush();
+    vi.mocked(viewEdit).mockClear();
+    vi.mocked(stepEdit).mockClear();
+  }
+
+  const sent = () => vi.mocked(stepEdit).mock.calls.map((c) => c[1]);
+
+  it('↑↓ で選び、消すと次の操作を選び、⌥⌘↑↓ で並べ替える', async () => {
+    await openWith([crop(1), flip(2), flip(3)]);
+    selectAdjacent(1);
+    expect(useEditorStore.getState().selected).toBe(1);
+    selectAdjacent(1);
+    selectAdjacent(1);
+    selectAdjacent(1);
+    expect(useEditorStore.getState().selected).toBe(3);
+    selectAdjacent(-1);
+    expect(useEditorStore.getState().selected).toBe(2);
+    moveSelected(-1);
+    removeNode(2);
+    expect(useEditorStore.getState().selected).toBe(3);
+    await flush();
+    expect(sent()).toEqual([
+      [{ type: 'commit', edit: { type: 'moveNode', node: 2, to: 0 }, mode: 'step' }],
+      [{ type: 'commit', edit: { type: 'removeNode', node: 2 }, mode: 'step' }],
+    ]);
+  });
+
+  it('操作を足すと選んだ操作のあとに足し、足したノードを選ぶ', async () => {
+    await openWith([flip(2)]);
+    vi.mocked(stepEdit).mockResolvedValueOnce(
+      result({
+        created: [5],
+        doc: { base: 1, order: [2, 5], nodes: [crop(5)], outputs: null },
+        view: { type: 'shown', view: viewDto({ rev: 2, changed: { type: 'tiles', frames: [] } }) },
+      }),
+    );
+    addOp('image.crop');
+    await flush();
+    expect(sent()[0]).toEqual([
+      {
+        type: 'commit',
+        edit: {
+          type: 'addNode',
+          at: 1,
+          op: 'image.crop',
+          v: 1,
+          params: { rect: { x: 0, y: 0, w: 64, h: 32 } },
+        },
+        mode: 'step',
+      },
+    ]);
+    expect(useEditorStore.getState().selected).toBe(5);
+  });
+
+  it('断られた手の指摘を持ち、次に手を送るまで残す', async () => {
+    await openWith([crop(1)]);
+    const issue = {
+      node: 1,
+      param: 'rect',
+      code: 'outOfRange' as const,
+      severity: 'error' as const,
+      message: '入力の外です',
+    };
+    vi.mocked(stepEdit).mockResolvedValueOnce(
+      result({
+        rejected: {
+          index: 0,
+          problem: { code: 'Invalid', message: '入力の外です', issues: [issue] },
+        },
+        view: { type: 'shown', view: viewDto({ changed: { type: 'tiles', frames: [] } }) },
+      }),
+    );
+    sendParam(1, 'rect', { kind: 'nudge', value: { x: 0, y: 0, w: 99, h: 32 } });
+    await flush();
+    expect(useEditorStore.getState().issues).toEqual([issue]);
+    sendParam(1, 'rect', { kind: 'seal' });
+    await flush();
+    expect(useEditorStore.getState().issues).toEqual([]);
+  });
+
+  it('保存していない変更：保存のジョブが今の頭を保存している途中なら含めない', () => {
+    const st = status({ dirty: true, head: 4 });
+    const save = {
+      job: 9,
+      mode: 'overwrite' as const,
+      rev: 4,
+      state: 'running' as const,
+      progress: null,
+      slow: false,
+      title: null,
+    };
+    expect(hasUnsavedChanges({ status: st, save: null })).toBe(true);
+    expect(hasUnsavedChanges({ status: st, save })).toBe(false);
+    expect(hasUnsavedChanges({ status: { ...st, head: 5 }, save })).toBe(true);
+    expect(hasUnsavedChanges({ status: st, save: { ...save, state: 'failed' } })).toBe(true);
+    expect(hasUnsavedChanges({ status: status({ dirty: false }), save: null })).toBe(false);
+  });
+});
+
+describe('切り抜き', () => {
+  const cropNode = {
+    id: 4,
+    op: 'image.crop',
+    v: 1,
+    enabled: true,
+    params: { rect: { x: 8, y: 4, w: 16, h: 8 } },
+    log: null,
+  };
+
+  it('切り抜きがなければ今の出力の全体の枠。↵ で末尾に切り抜きを足し、道具を戻す', async () => {
+    vi.mocked(openEdit).mockResolvedValue(opened('aa01'));
+    await openEditor(item());
+    await flush();
+    vi.mocked(stepEdit).mockClear();
+    useToolStore.setState({ tool: 'fill' });
+    selectTool('crop');
+    expect(useToolStore.getState().tool).toBe('crop');
+    expect(useEditorStore.getState().crop).toMatchObject({
+      node: null,
+      rect: { x: 0, y: 0, w: 64, h: 32 },
+      bounds: { w: 64, h: 32 },
+      previewed: false,
+    });
+    // 全体のままなら何も足さない
+    setCropRect({ x: 0, y: 0, w: 64, h: 32 });
+    nudgeCropRect('ArrowRight', false);
+    setCropRect({ x: 2, y: 2, w: 30, h: 20 });
+    expect(nudgeCropRect('ArrowRight', true)).toBe(true);
+    expect(useEditorStore.getState().crop?.rect).toEqual({ x: 12, y: 2, w: 30, h: 20 });
+    confirmCrop();
+    await flush();
+    expect(vi.mocked(stepEdit).mock.calls[0]?.[1]).toEqual([
+      {
+        type: 'commit',
+        edit: {
+          type: 'addNode',
+          at: 0,
+          op: 'image.crop',
+          v: 1,
+          params: { rect: { x: 12, y: 2, w: 30, h: 20 } },
+        },
+        mode: 'step',
+      },
+    ]);
+    expect(useEditorStore.getState().crop).toBeNull();
+    expect(useToolStore.getState().tool).toBe('fill');
+  });
+
+  it('切り抜きがあれば、その操作を仮に無効にして入力を表示し、↵ で引数を替える', async () => {
+    vi.mocked(openEdit).mockResolvedValue(
+      opened('aa01', {
+        doc: { base: null, order: [4], nodes: [cropNode], outputs: null },
+        view: { type: 'shown', view: viewDto({ fullWidth: 16, fullHeight: 8 }) },
+      }),
+    );
+    await openEditor(item());
+    await flush();
+    vi.mocked(stepEdit).mockClear();
+    // 仮に無効にした結果（入力の大きさ 64 × 32）
+    vi.mocked(stepEdit).mockResolvedValueOnce(
+      result({
+        status: status({ rev: 5, provisional: true }),
+        view: { type: 'shown', view: viewDto({ rev: 5, changed: { type: 'all' } }) },
+      }),
+    );
+    selectTool('crop');
+    expect(useEditorStore.getState().crop).toMatchObject({
+      node: 4,
+      bounds: null,
+      previewed: true,
+    });
+    await flush();
+    expect(vi.mocked(stepEdit).mock.calls[0]?.[1]).toEqual([
+      { type: 'preview', edit: { type: 'setEnabled', node: 4, enabled: false } },
+    ]);
+    expect(useEditorStore.getState().crop).toMatchObject({
+      bounds: { w: 64, h: 32 },
+      rect: { x: 8, y: 4, w: 16, h: 8 },
+    });
+    setCropRect({ x: 0, y: 0, w: 20, h: 10 });
+    confirmCrop();
+    await flush();
+    expect(vi.mocked(stepEdit).mock.calls[1]?.[1]).toEqual([
+      { type: 'cancelPreview' },
+      {
+        type: 'commit',
+        edit: { type: 'setParam', node: 4, key: 'rect', value: { x: 0, y: 0, w: 20, h: 10 } },
+        mode: 'step',
+      },
+    ]);
+  });
+
+  it('esc・ほかの道具・ほかの手で切り抜きをやめる（仮の値を捨てる）', async () => {
+    vi.mocked(openEdit).mockResolvedValue(
+      opened('aa01', { doc: { base: null, order: [4], nodes: [cropNode], outputs: null } }),
+    );
+    await openEditor(item());
+    await flush();
+    vi.mocked(stepEdit).mockClear();
+    // 手の結果は文書を変えない（差分なし）
+    vi.mocked(stepEdit).mockImplementation(async () =>
+      result({
+        doc: { base: 1, order: [4], nodes: [], outputs: null },
+        view: { type: 'shown', view: viewDto({ changed: { type: 'tiles', frames: [] } }) },
+      }),
+    );
+    selectTool('crop');
+    await flush();
+    cancelCrop();
+    await flush();
+    expect(vi.mocked(stepEdit).mock.calls.map((c) => c[1])).toEqual([
+      [{ type: 'preview', edit: { type: 'setEnabled', node: 4, enabled: false } }],
+      [{ type: 'cancelPreview' }],
+    ]);
+    expect(useToolStore.getState().tool).toBe('pen');
+    // ⌘Z は切り抜きをやめてから
+    selectTool('crop');
+    await flush();
+    vi.mocked(stepEdit).mockClear();
+    editorUndo();
+    await flush();
+    await flush();
+    expect(vi.mocked(stepEdit).mock.calls.flatMap((c) => c[1])).toEqual([
+      { type: 'cancelPreview' },
+      { type: 'undo' },
+    ]);
+    expect(useEditorStore.getState().crop).toBeNull();
+  });
+});
+
 describe('文書の差分', () => {
   const node = (id: number, op = 'image.flip', count?: number) => ({
     id,
@@ -354,7 +622,7 @@ describe('文書の差分', () => {
 
   it('全体なら置き換え、差分なら変わったノードだけ足し、並びにないノードは消す', () => {
     const a = applyDocDelta(
-      { order: [], nodes: {} },
+      { order: [], nodes: {}, outputs: [] },
       { base: null, order: [1, 2], nodes: [node(1), node(2, 'paint.actions', 1)], outputs: null },
     );
     expect(a.order).toEqual([1, 2]);
@@ -373,11 +641,19 @@ describe('文書の差分', () => {
 
   it('編集中のノードは、末尾が有効な描画のときだけ', () => {
     expect(
-      focusNode({ order: [1, 2], nodes: { 1: node(1), 2: node(2, 'paint.actions', 1) } }),
+      focusNode({
+        order: [1, 2],
+        nodes: { 1: node(1), 2: node(2, 'paint.actions', 1) },
+        outputs: [],
+      }),
     ).toBe(2);
     expect(
-      focusNode({ order: [2, 1], nodes: { 1: node(1), 2: node(2, 'paint.actions', 1) } }),
+      focusNode({
+        order: [2, 1],
+        nodes: { 1: node(1), 2: node(2, 'paint.actions', 1) },
+        outputs: [],
+      }),
     ).toBeNull();
-    expect(focusNode({ order: [], nodes: {} })).toBeNull();
+    expect(focusNode({ order: [], nodes: {}, outputs: [] })).toBeNull();
   });
 });

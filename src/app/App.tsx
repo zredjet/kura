@@ -10,6 +10,7 @@ import { useDownloadsShortcut } from '../features/downloads/useDownloadsShortcut
 import { DropOverlay } from '../features/import/DropOverlay';
 import { ImportSheet } from '../features/import/ImportSheet';
 import { Editor } from '../features/editor/Editor';
+import { watchWindowClose } from '../features/editor/editorSave';
 import { closeEditor } from '../features/editor/editorStore';
 import { DragGhost } from '../features/library/DragGhost';
 import { useFileDrop, useImportShortcut } from '../features/import/useFileDrop';
@@ -42,6 +43,8 @@ export function App() {
   useEffect(() => (isTauri() ? startJobEvents() : undefined), []);
   useEffect(() => (isTauri() ? startLoginShotEvents() : undefined), []);
   useEffect(() => (isTauri() ? watchFullscreen() : undefined), []);
+  // 画像エディタに保存していない変更がある間は、窓を閉じる操作を止めてシートを出す
+  useEffect(() => (isTauri() ? watchWindowClose() : undefined), []);
 
   // 再生できる形式の表を Rust に渡す（プロキシの要否の判定に使う。docs/architecture.md §8）
   useEffect(() => {
@@ -84,7 +87,7 @@ function LibraryScreen() {
   // ライブラリを替えたら再生をやめ、画像エディタを閉じる（Rust もライブラリを閉じる前にエディタを閉じる）
   const libraryPath = useLibraryStore((s) => s.info?.path);
   useEffect(() => closePlayer, [libraryPath]);
-  useEffect(() => closeEditor, [libraryPath]);
+  useEffect(() => () => void closeEditor(), [libraryPath]);
 
   return (
     <>

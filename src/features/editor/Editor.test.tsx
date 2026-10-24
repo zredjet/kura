@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../../i18n/ja';
-import { EDIT_OPS } from '../../ipc/edit';
+import { EDIT_OPS, type IssueCode } from '../../ipc/edit';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { Editor } from './Editor';
 import { useEditorStore } from './editorStore';
@@ -10,6 +10,11 @@ import { DEFAULT_TOOLS, useToolStore } from './toolStore';
 
 vi.mock('../library/inspector/ItemInspector', () => ({
   ItemInspector: ({ id }: { id: number }) => <p>インスペクタ {id}</p>,
+}));
+
+vi.mock('../../ipc/items', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../ipc/items')>()),
+  getItemDetail: vi.fn(async () => ({ originalName: 'hero.png' })),
 }));
 
 const t = ja.editor;
@@ -56,6 +61,7 @@ function openState() {
           log: { field: 'actions', count: 4 },
         },
       },
+      outputs: [],
     },
     view: {
       rev: 2,
@@ -102,9 +108,14 @@ describe('画像エディタの画面', () => {
     expect(useToolStore.getState().tool).toBe('fill');
     expect(screen.getByLabelText(t.tolerance)).toBeInTheDocument();
     expect(screen.getByText('200%')).toBeInTheDocument();
-    expect(
-      screen.getByText(t.opCount(t.ops['paint.actions']?.name ?? '', '4')),
-    ).toBeInTheDocument();
+    // 右パネルの操作の並び：名前・要約（描画は本数）・有効のスイッチ
+    expect(screen.getByRole('button', { name: t.selectOp('描画') })).toHaveTextContent(
+      `描画${t.strokeCount('4')}`,
+    );
+    expect(screen.getByRole('switch', { name: t.enableOp('描画') })).toBeChecked();
+    // 上部の右に主ボタン「保存」（保存していない変更があるので押せる）と ▾
+    expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
+    expect(screen.getByRole('button', { name: t.saveMore })).toBeInTheDocument();
     // アニメの画像はコマを選べる
     expect(screen.getByText(t.framePosition('1', '2'))).toBeInTheDocument();
   });
@@ -153,6 +164,45 @@ describe('文言', () => {
   it('操作のカタログのすべての操作に名前がある', () => {
     for (const op of EDIT_OPS) {
       expect(t.ops[op.id]?.name, op.id).toBeTruthy();
+    }
+  });
+
+  it('カタログのすべての引数に文言があり、列挙の値にも名前がある', () => {
+    for (const op of EDIT_OPS) {
+      for (const p of op.schema.params) {
+        expect(t.ops[op.id]?.params[p.key], `${op.id}.${p.key}`).toBeTruthy();
+        if (p.kind.type === 'enum') {
+          for (const v of p.kind.values) {
+            expect(t.ops[op.id]?.values?.[p.key]?.[v], `${op.id}.${p.key}=${v}`).toBeTruthy();
+          }
+        }
+      }
+    }
+  });
+
+  it('カタログの単位・指摘の種類に文言がある', () => {
+    for (const op of EDIT_OPS) {
+      for (const p of op.schema.params) {
+        expect(p.unit in t.units, `${op.id}.${p.key}: ${p.unit}`).toBe(true);
+      }
+    }
+    // 指摘の種類をすべて並べる（種類が増えたら型の誤りになる）
+    const codes: Record<IssueCode, true> = {
+      badGraph: true,
+      unknownOp: true,
+      unknownVersion: true,
+      schemaTooNew: true,
+      badParams: true,
+      outOfRange: true,
+      badInput: true,
+      tooLarge: true,
+      metadataDropped: true,
+      colorSpaceAssumed: true,
+      loudnessUnmeasurable: true,
+      gainLimited: true,
+    };
+    for (const code of Object.keys(codes)) {
+      expect(t.issues[code], code).toBeTruthy();
     }
   });
 });

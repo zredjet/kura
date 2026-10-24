@@ -1,12 +1,17 @@
 /**
- * 画像エディタのキー（design.md §6 の「画像エディタ」の列。段 5a の道具の分）。
+ * 画像エディタのキー（design.md §6 の「画像エディタ」の列。段 5a の道具と、段 5b の切り抜き・右パネル・保存）。
  *
  * シアターと同じく capture で受け、処理したら伝えない（ライブラリ・シアターのキーより先に）。入力欄・日本語入力の変換中・
  * シート・メニューの上では受けない。
  *
  * | キー | 動き |
  * |---|---|
- * | B・E・G・I・H | ペン・消しゴム・塗りつぶし・スポイト・手のひら |
+ * | B・E・G・I・H・C | ペン・消しゴム・塗りつぶし・スポイト・手のひら・切り抜き |
+ * | 切り抜きの間：矢印（⇧ で 10px）・↵・esc | 枠を動かす・切り抜く・やめる |
+ * | ↑ ↓ | 右パネルの操作を選ぶ |
+ * | ⌫ | 選んだ操作を消す |
+ * | ⌥⌘↑ ⌥⌘↓ | 選んだ操作を前・後ろへ |
+ * | ⌘S・⌘⇧S | 保存（上書き）・別名で保存…（ファイルメニューの項目もこのキー） |
  * | Space（押している間） | 手のひら |
  * | ⌥（押している間） | スポイト（ペン・消しゴム・塗りつぶしのとき） |
  * | [ ]（⇧ で 10 ずつ） | 筆の大きさ |
@@ -14,19 +19,26 @@
  * | ⌘Z・⇧⌘Z | 取り消す・やり直す（編集メニューの項目もこのキーを押したことにする） |
  * | ⌘0・⌘1・⌘+・⌘− | 全体を表示・100%・拡大・縮小（表示メニューの項目もこのキー） |
  * | ⌘I | 右パネルの「情報」 |
- * | esc | 描いている途中なら取り消し、そうでなければ閉じる |
+ * | esc | 切り抜きの途中ならやめる、描いている途中なら取り消し、そうでなければ閉じる（未保存ならシート） |
  */
 
 import { useEffect } from 'react';
 
 import { isImeKey } from '../../lib/ime';
+import { openSaveAs, requestCloseEditor, requestSave } from './editorSave';
 import {
-  closeEditor,
+  cancelCrop,
+  confirmCrop,
   editorActualSize,
   editorFit,
   editorRedo,
   editorUndo,
   editorZoom,
+  moveSelected,
+  nudgeCropRect,
+  removeSelected,
+  selectAdjacent,
+  selectTool,
   setTemporaryTool,
   stepEditorFrame,
   strokeCancel,
@@ -55,6 +67,7 @@ const TOOL_KEYS: Record<string, EditorTool> = {
   g: 'fill',
   i: 'eyedropper',
   h: 'hand',
+  c: 'crop',
 };
 
 /** ⌥ で一時的にスポイトにする道具。 */
@@ -68,6 +81,15 @@ export function handleEditorKey(e: KeyboardEvent): boolean {
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
 
   if (e.metaKey) {
+    if ((e.code === 'KeyS' || key === 's') && !e.altKey && !e.ctrlKey) {
+      if (e.shiftKey) openSaveAs();
+      else requestSave();
+      return true;
+    }
+    if (e.altKey && !e.ctrlKey && !e.shiftKey && (key === 'ArrowUp' || key === 'ArrowDown')) {
+      moveSelected(key === 'ArrowUp' ? -1 : 1);
+      return true;
+    }
     if (e.code === 'KeyZ' || key === 'z') {
       if (e.shiftKey) editorRedo();
       else editorUndo();
@@ -97,6 +119,18 @@ export function handleEditorKey(e: KeyboardEvent): boolean {
     return false;
   }
   if (e.ctrlKey) return false;
+  // 切り抜きの枠：矢印で動かす・↵ で切り抜く・esc でやめる
+  if (s.crop) {
+    if (key === 'Enter') {
+      confirmCrop();
+      return true;
+    }
+    if (key === 'Escape') {
+      cancelCrop();
+      return true;
+    }
+    if (!e.altKey && nudgeCropRect(key, e.shiftKey)) return true;
+  }
   if (key === 'Alt') {
     if (PAINTING.includes(useToolStore.getState().tool)) setTemporaryTool('eyedropper');
     return true;
@@ -110,7 +144,8 @@ export function handleEditorKey(e: KeyboardEvent): boolean {
   const tool = TOOL_KEYS[key];
   if (tool && !e.shiftKey) {
     if (tool === 'eraser' && s.view && !formatCanBeTransparent(s.view.format)) return true;
-    useToolStore.getState().setTool(tool);
+    if (s.phase === 'open') selectTool(tool);
+    else useToolStore.getState().setTool(tool);
     return true;
   }
   switch (key) {
@@ -126,8 +161,18 @@ export function handleEditorKey(e: KeyboardEvent): boolean {
     case 'ArrowRight':
       stepEditorFrame(1);
       return true;
+    case 'ArrowUp':
+      selectAdjacent(-1);
+      return true;
+    case 'ArrowDown':
+      selectAdjacent(1);
+      return true;
+    case 'Backspace':
+    case 'Delete':
+      removeSelected();
+      return true;
     case 'Escape':
-      if (!strokeCancel()) closeEditor();
+      if (!strokeCancel()) void requestCloseEditor();
       return true;
     default:
       return false;

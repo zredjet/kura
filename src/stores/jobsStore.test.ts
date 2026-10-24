@@ -1,8 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { JobProgress } from '../ipc/jobs';
+import { type JobProgress, onJobProgress } from '../ipc/jobs';
 import { refreshAnalyzing, refreshThumbnails } from './itemCache';
-import { reactToJob, selectCurrentImport, useJobsStore } from './jobsStore';
+import {
+  onAnyJob,
+  reactToJob,
+  selectCurrentImport,
+  startJobEvents,
+  useJobsStore,
+} from './jobsStore';
+
+vi.mock('../ipc/jobs', async (original) => ({
+  ...(await original<typeof import('../ipc/jobs')>()),
+  onJobProgress: vi.fn(async () => () => undefined),
+}));
 
 vi.mock('./itemCache', async (original) => ({
   ...(await original<typeof import('./itemCache')>()),
@@ -74,5 +85,19 @@ describe('reactToJob', () => {
     vi.advanceTimersByTime(500);
     expect(refreshThumbnails).toHaveBeenCalledTimes(1);
     expect(refreshAnalyzing).not.toHaveBeenCalled();
+  });
+});
+
+describe('onAnyJob', () => {
+  it('進捗イベントをほかの画面（画像エディタの保存）へ回し、外したら回さない', async () => {
+    const stop = startJobEvents();
+    const handler = vi.mocked(onJobProgress).mock.calls[0]?.[0];
+    const seen: JobProgress[] = [];
+    const off = onAnyJob((e) => seen.push(e));
+    handler?.(event({ id: 9, kind: 'edit', state: 'done' }));
+    off();
+    handler?.(event({ id: 10, kind: 'edit', state: 'done' }));
+    expect(seen.map((e) => e.id)).toEqual([9]);
+    stop();
   });
 });

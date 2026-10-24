@@ -9,10 +9,17 @@ import { create } from 'zustand';
 import type { BrushShape } from '../../lib/paint';
 import type { Blend, PaintColor } from './stroke';
 
-/** 道具（切り抜きは段 5b）。 */
-export type EditorTool = 'hand' | 'pen' | 'eraser' | 'fill' | 'eyedropper';
+/** 道具（切り抜きは段 5b。切り抜きの枠は開き直したら戻らないので、保存した設定からは戻さない）。 */
+export type EditorTool = 'hand' | 'crop' | 'pen' | 'eraser' | 'fill' | 'eyedropper';
 
-export const EDITOR_TOOLS: readonly EditorTool[] = ['hand', 'pen', 'eraser', 'fill', 'eyedropper'];
+export const EDITOR_TOOLS: readonly EditorTool[] = [
+  'hand',
+  'crop',
+  'pen',
+  'eraser',
+  'fill',
+  'eyedropper',
+];
 
 /** 最近の色の数。 */
 export const RECENT_COLORS = 8;
@@ -106,7 +113,10 @@ export function parseSettings(text: string | null): ToolSettings {
   const r = raw as Partial<Record<keyof ToolSettings, unknown>>;
   const d = DEFAULT_TOOLS;
   return {
-    tool: EDITOR_TOOLS.includes(r.tool as EditorTool) ? (r.tool as EditorTool) : d.tool,
+    tool:
+      EDITOR_TOOLS.includes(r.tool as EditorTool) && r.tool !== 'crop'
+        ? (r.tool as EditorTool)
+        : d.tool,
     shape: r.shape === 'circle' || r.shape === 'square' ? r.shape : d.shape,
     size: typeof r.size === 'number' ? clampInt(r.size, BRUSH_MIN, BRUSH_MAX) : d.size,
     pixelPerfect: typeof r.pixelPerfect === 'boolean' ? r.pixelPerfect : d.pixelPerfect,

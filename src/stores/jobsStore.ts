@@ -104,6 +104,17 @@ export function selectCurrentImport(state: JobsState): JobProgress | null {
   return candidates[0] ?? null;
 }
 
+/** 進捗イベントをほかの画面へ回す先（画像エディタの保存のジョブ。jobsStore から画面を読み込まないための口）。 */
+const jobListeners = new Set<(event: JobProgress) => void>();
+
+/** 進捗イベントを受ける（戻り値で外す）。 */
+export function onAnyJob(listener: (event: JobProgress) => void): () => void {
+  jobListeners.add(listener);
+  return () => {
+    jobListeners.delete(listener);
+  };
+}
+
 /** 進捗イベントの受け取りを始める。戻り値で止める。 */
 export function startJobEvents(): () => void {
   let stop: (() => void) | null = null;
@@ -112,6 +123,7 @@ export function startJobEvents(): () => void {
     useJobsStore.getState().apply(event);
     useDownloadsStore.getState().apply(event);
     reactToJob(event);
+    for (const listener of jobListeners) listener(event);
   })
     .then((unlisten) => {
       if (stopped) {

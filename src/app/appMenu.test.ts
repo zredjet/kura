@@ -107,6 +107,25 @@ describe('appMenuItems', () => {
     expect((edit.items as Item[]).slice(0, 2)).toEqual([undo, redo]);
   });
 
+  it('ファイルの「保存」「別名で保存…」は ⌘S・⌘⇧S で、作ったときは押せない（エディタを開くと押せる。M12）', () => {
+    const run = vi.fn();
+    const file = submenu(ja.appMenu.file, run);
+    const save = entry(file, ja.appMenu.save);
+    const saveAs = entry(file, ja.appMenu.saveAs);
+    expect([save.accelerator, saveAs.accelerator]).toEqual(['CmdOrCtrl+S', 'CmdOrCtrl+Shift+S']);
+    expect([save.enabled, saveAs.enabled]).toEqual([false, false]);
+    save.action?.('');
+    saveAs.action?.('');
+    expect(run).toHaveBeenNthCalledWith(1, {
+      kind: 'key',
+      spec: { key: 's', code: 'KeyS', meta: true },
+    });
+    expect(run).toHaveBeenNthCalledWith(2, {
+      kind: 'key',
+      spec: { key: 's', code: 'KeyS', meta: true, shift: true },
+    });
+  });
+
   it('項目の「編集…」は ⌘E で、押すと ⌘E を押したことにする（M12）', () => {
     const run = vi.fn();
     const edit = entry(submenu(ja.appMenu.items, run), ja.appMenu.editItem);

@@ -11,7 +11,14 @@ import { formatCount } from '../../lib/format';
 import { toHex } from './color';
 import { ColorPicker, Swatch } from './ColorPicker';
 import styles from './Editor.module.css';
-import { setEditorFrame, stepEditorFrame, useEditorStore } from './editorStore';
+import {
+  cancelCrop,
+  confirmCrop,
+  setCropRect,
+  setEditorFrame,
+  stepEditorFrame,
+  useEditorStore,
+} from './editorStore';
 import { BRUSH_MAX, BRUSH_MIN, useToolStore } from './toolStore';
 
 const t = ja.editor;
@@ -174,6 +181,48 @@ function FrameGroup() {
   );
 }
 
+/** 切り抜き：枠の X・Y・幅・高さと「やめる」「切り抜く」。 */
+function CropGroup() {
+  const crop = useEditorStore((s) => s.crop);
+  if (!crop) return null;
+  const b = crop.bounds;
+  const r = crop.rect;
+  const field = (key: 'x' | 'y' | 'w' | 'h', max: number) => (
+    <NumberField
+      key={key}
+      label={t.rect[key]}
+      value={r[key]}
+      min={key === 'w' || key === 'h' ? 1 : 0}
+      max={max}
+      onChange={(v) => setCropRect({ ...r, [key]: v })}
+    />
+  );
+  return (
+    <>
+      {b && (
+        <>
+          {field('x', b.w - 1)}
+          {field('y', b.h - 1)}
+          {field('w', b.w)}
+          {field('h', b.h)}
+        </>
+      )}
+      <span className={styles.hint}>{t.cropHint}</span>
+      <button type="button" className={styles.pill} onClick={cancelCrop}>
+        {t.cropCancel}
+      </button>
+      <button
+        type="button"
+        className={`${styles.pill} ${styles.pillPrimary}`}
+        disabled={!b}
+        onClick={confirmCrop}
+      >
+        {t.cropApply}
+      </button>
+    </>
+  );
+}
+
 /**
  * 下のガラスのカプセル（再生バーの位置）：道具の設定。ペンは筆・重ね方・色、消しゴムは筆、塗りつぶしは許容差・
  * つながり方・色、スポイトと手のひらは使い方の一言。アニメの画像はコマを選べる。
@@ -194,7 +243,8 @@ export function ToolSettings() {
       role="toolbar"
       aria-label={t.toolSettings}
     >
-      <FrameGroup />
+      {tool !== 'crop' && <FrameGroup />}
+      {tool === 'crop' && <CropGroup />}
       {(tool === 'pen' || tool === 'eraser') && <BrushGroup />}
       {tool === 'pen' && !indexed && (
         <Segmented

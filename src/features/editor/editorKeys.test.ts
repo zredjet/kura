@@ -1,23 +1,42 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { openSaveAs, requestCloseEditor, requestSave } from './editorSave';
 import { handleEditorKey, handleEditorKeyUp } from './editorKeys';
 import {
-  closeEditor,
+  cancelCrop,
+  confirmCrop,
   editorActualSize,
   editorFit,
   editorRedo,
   editorUndo,
   editorZoom,
+  moveSelected,
+  nudgeCropRect,
+  removeSelected,
+  selectAdjacent,
+  selectTool,
   stepEditorFrame,
   strokeCancel,
   toggleEditorInfo,
   useEditorStore,
 } from './editorStore';
-import { DEFAULT_TOOLS, useToolStore } from './toolStore';
+import { DEFAULT_TOOLS, type EditorTool, useToolStore } from './toolStore';
+
+vi.mock('./editorSave', () => ({
+  openSaveAs: vi.fn(),
+  requestCloseEditor: vi.fn(async () => true),
+  requestSave: vi.fn(),
+}));
 
 vi.mock('./editorStore', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./editorStore')>()),
-  closeEditor: vi.fn(),
+  cancelCrop: vi.fn(),
+  confirmCrop: vi.fn(),
+  moveSelected: vi.fn(),
+  nudgeCropRect: vi.fn(() => true),
+  removeSelected: vi.fn(),
+  selectAdjacent: vi.fn(),
+  selectTool: vi.fn((tool: EditorTool) => useToolStore.getState().setTool(tool)),
   editorActualSize: vi.fn(),
   editorFit: vi.fn(),
   editorRedo: vi.fn(),
@@ -43,7 +62,7 @@ describe('エディタのキー', () => {
 
   afterEach(() => {
     document.body.innerHTML = '';
-    useEditorStore.setState({ phase: 'closed' });
+    useEditorStore.setState({ phase: 'closed', crop: null });
   });
 
   it('B・E・G・I・H で道具を替える', () => {
@@ -102,12 +121,59 @@ describe('エディタのキー', () => {
     expect(press('w', { metaKey: true })).toBe(false);
   });
 
-  it('esc は描いている途中なら取り消し、そうでなければ閉じる', () => {
+  it('esc は描いている途中なら取り消し、そうでなければ閉じる（未保存ならシート：requestCloseEditor）', () => {
     vi.mocked(strokeCancel).mockReturnValueOnce(true);
     press('Escape');
-    expect(closeEditor).not.toHaveBeenCalled();
+    expect(requestCloseEditor).not.toHaveBeenCalled();
     press('Escape');
-    expect(closeEditor).toHaveBeenCalledOnce();
+    expect(requestCloseEditor).toHaveBeenCalledOnce();
+  });
+
+  it('C で切り抜き。切り抜きの間は矢印で枠を動かし（⇧ で 10px）、↵ で切り抜き、esc でやめる', () => {
+    press('c');
+    expect(selectTool).toHaveBeenCalledWith('crop');
+    useEditorStore.setState({
+      crop: {
+        node: null,
+        rect: { x: 0, y: 0, w: 4, h: 4 },
+        bounds: { w: 8, h: 8 },
+        previewed: false,
+        returnTool: 'pen',
+      },
+    });
+    press('ArrowLeft');
+    press('ArrowDown', { shiftKey: true });
+    expect(vi.mocked(nudgeCropRect).mock.calls).toEqual([
+      ['ArrowLeft', false],
+      ['ArrowDown', true],
+    ]);
+    // 切り抜きの間は ← → でコマを替えない・↑↓ で操作を選ばない
+    expect(stepEditorFrame).not.toHaveBeenCalled();
+    expect(selectAdjacent).not.toHaveBeenCalled();
+    press('Enter');
+    expect(confirmCrop).toHaveBeenCalledOnce();
+    press('Escape');
+    expect(cancelCrop).toHaveBeenCalledOnce();
+    expect(requestCloseEditor).not.toHaveBeenCalled();
+  });
+
+  it('↑↓ で操作を選び、⌫ で消し、⌥⌘↑↓ で並べ替える', () => {
+    press('ArrowUp');
+    press('ArrowDown');
+    expect(vi.mocked(selectAdjacent).mock.calls).toEqual([[-1], [1]]);
+    press('Backspace');
+    press('Delete');
+    expect(removeSelected).toHaveBeenCalledTimes(2);
+    press('ArrowUp', { metaKey: true, altKey: true });
+    press('ArrowDown', { metaKey: true, altKey: true });
+    expect(vi.mocked(moveSelected).mock.calls).toEqual([[-1], [1]]);
+  });
+
+  it('⌘S で保存、⌘⇧S で別名で保存', () => {
+    expect(press('s', { metaKey: true, code: 'KeyS' } as KeyboardEventInit)).toBe(true);
+    expect(requestSave).toHaveBeenCalledOnce();
+    press('S', { metaKey: true, shiftKey: true, code: 'KeyS' } as KeyboardEventInit);
+    expect(openSaveAs).toHaveBeenCalledOnce();
   });
 
   it('← → でコマを替える', () => {

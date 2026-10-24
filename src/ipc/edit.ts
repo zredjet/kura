@@ -30,12 +30,26 @@ import {
   type EditViewDto,
   type EditViewOutcomeDto,
   type EditViewportDto,
+  type Edit_Deserialize,
+  type FormatChoice,
   type Issue,
+  type IssueCode,
   type JsonValue,
+  type OpDescriptor,
+  type OutputSpec_Serialize,
+  type ParamKind,
+  type ParamSpec,
+  type Unit,
 } from './bindings';
 import { unwrap } from './result';
 
 export { EDIT_OPS };
+
+/**
+ * 操作のカタログ（`EDIT_OPS` を型の付いた配列として読む。`as const` の定数は読み取り専用の字面の型なので、引数パネルが
+ * 汎用に扱えるよう記述の型にする）。
+ */
+export const EDIT_CATALOG: readonly OpDescriptor[] = EDIT_OPS as unknown as readonly OpDescriptor[];
 
 export type {
   CommitMode,
@@ -53,9 +67,20 @@ export type {
   EditViewDto,
   EditViewOutcomeDto,
   EditViewportDto,
+  FormatChoice,
   Issue,
+  IssueCode,
   JsonValue,
+  OpDescriptor,
+  ParamKind,
+  ParamSpec,
+  Unit,
 };
+
+/** 文書の出力（Rust が返す形）。 */
+export type OutputSpec = OutputSpec_Serialize;
+/** 文書への変更 1 つ（フロントが送る形）。 */
+export type EditDto = Edit_Deserialize;
 
 /** 開いた結果（Rust が返す形）。 */
 export type EditOpenedDto = EditOpenedDto_Serialize;

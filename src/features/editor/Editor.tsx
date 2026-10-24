@@ -2,7 +2,9 @@ import { type ReactNode, useEffect, useRef } from 'react';
 
 import glass from '../../components/glass/glass.module.css';
 import { BucketIcon } from '../../components/icons/BucketIcon';
+import { ChevronDownIcon } from '../../components/icons/ChevronDownIcon';
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
+import { CropIcon } from '../../components/icons/CropIcon';
 import { EraserIcon } from '../../components/icons/EraserIcon';
 import { EyedropperIcon } from '../../components/icons/EyedropperIcon';
 import { HandIcon } from '../../components/icons/HandIcon';
@@ -10,6 +12,7 @@ import { InfoIcon } from '../../components/icons/InfoIcon';
 import { MinusIcon } from '../../components/icons/MinusIcon';
 import { PenIcon } from '../../components/icons/PenIcon';
 import { PlusIcon } from '../../components/icons/PlusIcon';
+import { openMenuBelow } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { formatCount } from '../../lib/format';
 import { ItemInspector } from '../library/inspector/ItemInspector';
@@ -17,13 +20,23 @@ import styles from './Editor.module.css';
 import { EditorCanvas } from './EditorCanvas';
 import { useEditorKeys } from './editorKeys';
 import {
-  closeEditor,
+  openRevert,
+  openSaveAs,
+  openVersions,
+  requestCloseEditor,
+  requestSave,
+} from './editorSave';
+import { EditorSheets } from './EditorSheets';
+import {
   editorUndo,
   editorZoom,
   reopenEditor,
+  selectTool,
   toggleEditorInfo,
   useEditorStore,
 } from './editorStore';
+import { effectiveFormat, outputChoice } from './formats';
+import { OpsPanel } from './OpsPanel';
 import { ToolSettings } from './ToolSettings';
 import { EDITOR_TOOLS, type EditorTool, useToolStore } from './toolStore';
 import { formatCanBeTransparent, zoomPercent } from './viewMath';
@@ -32,6 +45,7 @@ const t = ja.editor;
 
 const TOOL_ICONS: Record<EditorTool, ReactNode> = {
   hand: <HandIcon size={16} />,
+  crop: <CropIcon size={16} />,
   pen: <PenIcon size={16} />,
   eraser: <EraserIcon size={16} />,
   fill: <BucketIcon size={16} />,
@@ -65,6 +79,72 @@ export function Editor() {
         <FailureCard />
       </section>
       <SidePanel />
+      <EditorSheets />
+    </div>
+  );
+}
+
+/** 保存できるか（開いていて、保存の途中でなく、保存していない変更があるか、元の形式に書けず形式を変えて保存するとき）。 */
+function useCanSave(): boolean {
+  return useEditorStore((s) => {
+    if (s.phase !== 'open' || s.save || !s.status) return false;
+    if (s.status.dirty) return true;
+    return effectiveFormat(outputChoice(s.doc.outputs), s.source?.format ?? null).forced;
+  });
+}
+
+/** 主ボタン「保存」（⌘S。進捗はボタンの中）と ▾（別名で保存…・元に戻す…・版の一覧…）。 */
+function SaveControls() {
+  const open = useEditorStore((s) => s.phase === 'open');
+  const save = useEditorStore((s) => s.save);
+  const canSave = useCanSave();
+  const percent =
+    save?.progress != null ? Math.round(Math.min(1, Math.max(0, save.progress)) * 100) : null;
+  const label = save ? (percent !== null ? t.savingPercent(String(percent)) : t.saving) : t.save;
+  return (
+    <div className={styles.saveArea}>
+      <div className={styles.saveGroup}>
+        <button
+          type="button"
+          className={styles.saveButton}
+          title={t.saveKey}
+          disabled={!canSave}
+          aria-busy={save !== null || undefined}
+          onClick={() => requestSave()}
+        >
+          {save && (
+            <span
+              className={styles.saveProgress}
+              style={{ width: `${percent ?? 0}%` }}
+              aria-hidden="true"
+            />
+          )}
+          <span className={styles.saveLabel}>{label}</span>
+        </button>
+        <button
+          type="button"
+          className={styles.saveMore}
+          aria-label={t.saveMore}
+          title={t.saveMore}
+          aria-haspopup="menu"
+          disabled={!open}
+          onClick={(e) =>
+            openMenuBelow(e.currentTarget, t.saveMore, [
+              { label: t.saveAs, shortcut: '⌘⇧S', disabled: save !== null, onSelect: openSaveAs },
+              'separator',
+              { label: t.revert, disabled: save !== null, onSelect: openRevert },
+              { label: t.versions, onSelect: openVersions },
+            ])
+          }
+        >
+          <ChevronDownIcon size={12} strokeWidth={2.4} />
+        </button>
+      </div>
+      {save?.slow && (
+        <p className={styles.parkedHint} role="status">
+          {t.parkedHint}
+        </p>
+      )}
     </div>
   );
 }
@@ -95,7 +175,6 @@ function TopBar() {
   const format = useEditorStore((s) => s.view?.format ?? null);
   const open = useEditorStore((s) => s.phase === 'open');
   const tool = useToolStore((s) => s.tool);
-  const setTool = useToolStore((s) => s.setTool);
   const meta = useMetaLine();
   const shown = temporary ?? tool;
   return (
@@ -105,7 +184,7 @@ function TopBar() {
         className={styles.round}
         aria-label={t.close}
         title={`${t.close}（esc）`}
-        onClick={closeEditor}
+        onClick={() => void requestCloseEditor()}
       >
         <ChevronLeftIcon size={16} strokeWidth={2} />
       </button>
@@ -126,7 +205,7 @@ function TopBar() {
               title={unavailable ? t.eraserUnavailable : label}
               aria-pressed={shown === id}
               disabled={!open || unavailable}
-              onClick={() => setTool(id)}
+              onClick={() => selectTool(id)}
             >
               {TOOL_ICONS[id]}
             </button>
@@ -145,6 +224,7 @@ function TopBar() {
           <InfoIcon size={16} />
         </button>
       </div>
+      <SaveControls />
     </div>
   );
 }
@@ -217,7 +297,7 @@ function FailureCard() {
             {failure.kind === 'open' ? t.retry : t.reopen}
           </button>
         )}
-        <button type="button" className={styles.pill} onClick={closeEditor}>
+        <button type="button" className={styles.pill} onClick={() => void requestCloseEditor()}>
           {t.close}
         </button>
       </div>
@@ -225,7 +305,7 @@ function FailureCard() {
   );
 }
 
-/** 右のガラスのパネル：操作（中身は段 5b）か、アイテムの情報（インスペクタ）。 */
+/** 右のガラスのパネル：操作（並び・引数・出力の形式）か、アイテムの情報（インスペクタ）。 */
 function SidePanel() {
   const panel = useEditorStore((s) => s.panel);
   const item = useEditorStore((s) => s.item);
@@ -239,34 +319,8 @@ function SidePanel() {
           <ItemInspector key={item.id} id={item.id} editable={false} />
         </div>
       ) : (
-        <OpsList />
+        <OpsPanel />
       )}
     </aside>
-  );
-}
-
-/** 操作の並び（名前と、描画の数）。 */
-function OpsList() {
-  const doc = useEditorStore((s) => s.doc);
-  return (
-    <div className={styles.ops}>
-      <h2 className={styles.panelTitle}>{t.opsTitle}</h2>
-      {doc.order.length === 0 ? (
-        <p className={styles.opsEmpty}>{t.opsEmpty}</p>
-      ) : (
-        <ol className={styles.opsList}>
-          {doc.order.map((id) => {
-            const node = doc.nodes[id];
-            if (!node) return null;
-            const name = t.ops[node.op]?.name ?? node.op;
-            return (
-              <li key={id} className={styles.op} data-disabled={!node.enabled || undefined}>
-                {node.log ? t.opCount(name, formatCount(node.log.count)) : name}
-              </li>
-            );
-          })}
-        </ol>
-      )}
-    </div>
   );
 }

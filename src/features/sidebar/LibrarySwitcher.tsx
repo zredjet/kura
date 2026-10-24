@@ -7,6 +7,7 @@ import { checkLocation } from '../../ipc/library';
 import { isIpcError } from '../../ipc/result';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { notify } from '../../stores/noticeStore';
+import { requestCloseEditor } from '../editor/editorSave';
 import styles from './Sidebar.module.css';
 
 function messageOf(error: unknown): string {
@@ -29,6 +30,10 @@ export async function openOther(): Promise<void> {
   if (!picked) {
     return;
   }
+  // 画像エディタに保存していない変更があれば、先に聞く（設定のシートから切り替えるとき）
+  if (!(await requestCloseEditor('library'))) {
+    return;
+  }
   try {
     await useLibraryStore.getState().open(picked);
   } catch (error) {
@@ -48,6 +53,9 @@ export async function createNew(): Promise<void> {
     const location = await checkLocation(picked);
     if (location.status === 'occupied') {
       notify(ja.welcome.occupied);
+      return;
+    }
+    if (!(await requestCloseEditor('library'))) {
       return;
     }
     const store = useLibraryStore.getState();

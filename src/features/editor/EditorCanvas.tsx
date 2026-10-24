@@ -3,6 +3,7 @@ import { type PointerEvent, useEffect, useLayoutEffect, useRef, useState } from 
 import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { ja } from '../../i18n/ja';
 import type { Point } from '../../lib/paint';
+import { CropOverlay } from './CropOverlay';
 import styles from './Editor.module.css';
 import {
   editorController,
@@ -259,6 +260,8 @@ export function EditorCanvas() {
           />
         </div>
       )}
+      {/* 切り抜きの枠（ホイール・ピンチはこの面が受けるので、枠の上でも動かせる） */}
+      <CropOverlay />
     </div>
   );
 }

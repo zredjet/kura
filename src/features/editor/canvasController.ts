@@ -207,6 +207,8 @@ export class CanvasController {
   private disposed = false;
   private ready = false;
   private infoKey = '';
+  /** 変換・画像の大きさが変わったら呼ぶもの（切り抜きの枠を重ねる）。 */
+  private readonly listeners = new Set<() => void>();
   private readonly draw: DrawScene;
   private readonly load: LoadTile;
   private readonly scheduler: Scheduler;
@@ -348,6 +350,19 @@ export class CanvasController {
   /** 今の変換（テスト・座標の表示）。 */
   get transform(): Transform {
     return this.t;
+  }
+
+  /** 変換・画像の大きさ・面の大きさが変わったら呼ぶものを足す（戻り値で外す。毎フレーム呼ぶことがある）。 */
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** 画像の形（なければ null）。 */
+  get imageModel(): ImageModel | null {
+    return this.image;
   }
 
   /** 全体を表示しているか。 */
@@ -545,6 +560,7 @@ export class CanvasController {
 
   /** 閉じる（絵をすべて close。以後は何もしない）。 */
   dispose(): void {
+    this.listeners.clear();
     this.disposed = true;
     if (this.frameId !== null) this.scheduler.cancelFrame(this.frameId);
     if (this.idleId !== null) this.scheduler.cancelLater(this.idleId);
@@ -825,6 +841,7 @@ export class CanvasController {
   }
 
   private emitInfo(): void {
+    for (const listener of this.listeners) listener();
     const img = this.image;
     const rect = img ? imageScreenRect(this.t, img) : null;
     const level = this.view?.level ?? null;

@@ -84,6 +84,12 @@ export interface HistoryItems {
   redo: MenuItemOptions | MenuItem;
 }
 
+/** ファイルメニューの「保存」「別名で保存…」（画像エディタを開いている間だけ押せる。`installAppMenu` が合わせる）。 */
+export interface SaveItems {
+  save: MenuItemOptions | MenuItem;
+  saveAs: MenuItemOptions | MenuItem;
+}
+
 /** ⌘ などの付いたキーを Tauri のアクセラレータの書き方にする。修飾キーがなければ undefined（文字の入力を奪わない）。 */
 export function acceleratorOf(spec: KeySpec): string | undefined {
   if (!spec.meta) {
@@ -176,6 +182,24 @@ export function historyItemOptions(run: RunMenuAction): {
   };
 }
 
+/**
+ * ファイルメニューの「保存」（⌘S）・「別名で保存…」（⌘⇧S）（M12）。そのキーを押したことにする（エディタのキーの処理が
+ * 受ける）。画像エディタを閉じている間は押せない（作ったときは押せない）。
+ */
+export function saveItemOptions(run: RunMenuAction): {
+  save: MenuItemOptions;
+  saveAs: MenuItemOptions;
+} {
+  const t = ja.appMenu;
+  return {
+    save: { ...keyItem(run, t.save, { key: 's', code: 'KeyS', ...META }), enabled: false },
+    saveAs: {
+      ...keyItem(run, t.saveAs, { key: 's', code: 'KeyS', meta: true, shift: true }),
+      enabled: false,
+    },
+  };
+}
+
 /** 表示メニューの中身（ライブラリ）。 */
 export function libraryViewItems(run: RunMenuAction, view: ViewItems): MenuItems {
   const t = ja.appMenu;
@@ -253,6 +277,7 @@ export function appMenuItems(
   pixelArt: SubmenuOptions | Submenu,
   history: HistoryItems = historyItemOptions(run),
   viewMenu?: Submenu,
+  save: SaveItems = saveItemOptions(run),
 ): MenuItems {
   const t = ja.appMenu;
   const app = ja.app.name;
@@ -282,6 +307,9 @@ export function appMenuItems(
         keyItem(run, t.import, { key: 'o', code: 'KeyO', ...META }),
         keyItem(run, t.newFolder, { key: 'n', code: 'KeyN', meta: true, shift: true }),
         { text: t.newPlaylist, action: () => run({ kind: 'command', id: 'newPlaylist' }) },
+        { item: 'Separator' },
+        save.save,
+        save.saveAs,
         { item: 'Separator' },
         keyItem(run, t.export, { key: 'e', code: 'KeyE', meta: true, shift: true }),
         { item: 'Separator' },
@@ -595,10 +623,17 @@ export async function installAppMenu(): Promise<void> {
       undo: await MenuItem.new(historyOptions.undo),
       redo: await MenuItem.new(historyOptions.redo),
     };
+    const saveOptions = saveItemOptions(run);
+    const save = {
+      save: await MenuItem.new(saveOptions.save),
+      saveAs: await MenuItem.new(saveOptions.saveAs),
+    };
     const libraryView = await toMenuObjects(libraryViewItems(run, view));
     const editorView = await toMenuObjects(editorViewItemOptions(run));
     const viewMenu = await Submenu.new({ text: ja.appMenu.view, items: libraryView });
-    const menu = await Menu.new({ items: appMenuItems(run, view, pixelArt, history, viewMenu) });
+    const menu = await Menu.new({
+      items: appMenuItems(run, view, pixelArt, history, viewMenu, save),
+    });
     await menu.setAsAppMenu();
     const syncHistory = historySyncer(history);
     syncHistory();
@@ -622,6 +657,10 @@ export async function installAppMenu(): Promise<void> {
     useEditorStore.subscribe((now, before) => {
       if ((now.phase === 'closed') !== (before.phase === 'closed')) {
         swapView(now.phase !== 'closed');
+      }
+      if ((now.phase === 'open') !== (before.phase === 'open')) {
+        void save.save.setEnabled(now.phase === 'open');
+        void save.saveAs.setEnabled(now.phase === 'open');
       }
       if (now.phase !== before.phase || now.status !== before.status) {
         syncHistory();

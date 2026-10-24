@@ -82,18 +82,25 @@ function Slider({
 /**
  * 色を選ぶ部品（自前。macOS の色パネルはアルファを選べない）：色相・彩度・明るさ・不透明度のつまみ、16 進の欄、
  * 最近の 8 色。下のカプセルの見本の上に開くガラスの面で、外を押す・esc で閉じる（開いている間はエディタのキーを
- * 受けない：`data-sheet`）。
+ * 受けない：`data-sheet`）。右パネルの色の引数（段 5b）では、欄の下に開く（`inline`。パネルの中でスクロールして切れない
+ * よう浮かせない）。`alpha` が偽なら不透明度のつまみを出さない（アルファを持たない引数）。
  */
 export function ColorPicker({
   color,
   recent,
   onChange,
   onClose,
+  inline = false,
+  alpha = true,
+  label = t.color,
 }: {
   color: PaintColor;
   recent: readonly PaintColor[];
   onChange: (color: PaintColor) => void;
   onClose: () => void;
+  inline?: boolean;
+  alpha?: boolean;
+  label?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const hexId = useId();
@@ -147,7 +154,7 @@ export function ColorPicker({
     const parsed = parseHex(hexText);
     if (parsed) {
       setHsv(rgbToHsv(parsed[0], parsed[1], parsed[2]));
-      onChange({ rgba: parsed, index: null });
+      onChange({ rgba: alpha ? parsed : [parsed[0], parsed[1], parsed[2], 255], index: null });
     } else {
       setHexText(toHex(color.rgba));
     }
@@ -160,9 +167,11 @@ export function ColorPicker({
   return (
     <div
       ref={ref}
-      className={`${glass.panel} ${styles.picker}`}
+      className={
+        inline ? `${styles.picker} ${styles.pickerInline}` : `${glass.panel} ${styles.picker}`
+      }
       role="dialog"
-      aria-label={t.color}
+      aria-label={label}
       data-sheet=""
     >
       <div className={`${styles.pickerPreview} ${styles.checkerFill}`}>
@@ -189,14 +198,16 @@ export function ColorPicker({
         track={`linear-gradient(to right, ${opaque(hsv.s, 0)}, ${opaque(hsv.s, 1)})`}
         onChange={(v) => setFromHsv({ ...hsv, v: v / 100 })}
       />
-      <Slider
-        label={t.opacity}
-        value={a}
-        max={255}
-        track={`linear-gradient(to right, ${clear}, ${solid})`}
-        checker
-        onChange={(alpha) => onChange({ rgba: [r, g, b, alpha], index: null })}
-      />
+      {alpha && (
+        <Slider
+          label={t.opacity}
+          value={a}
+          max={255}
+          track={`linear-gradient(to right, ${clear}, ${solid})`}
+          checker
+          onChange={(next) => onChange({ rgba: [r, g, b, next], index: null })}
+        />
+      )}
       <div className={styles.hexRow}>
         <label htmlFor={hexId} className={styles.sliderLabel}>
           {t.hex}
