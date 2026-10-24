@@ -12,6 +12,7 @@ use crate::error::EngineError;
 
 /// 32 バイトのダイジェスト。文字列では小文字の 16 進。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "specta", derive(specta::Type), specta(type = String))]
 pub struct Digest(pub [u8; 32]);
 
 impl Digest {

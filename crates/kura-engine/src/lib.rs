@@ -28,6 +28,8 @@ pub mod paint;
 pub mod render;
 pub mod session;
 pub mod shape;
+#[cfg(feature = "specta")]
+pub mod specta_types;
 pub mod testfiles;
 pub mod testgen;
 pub mod testing;

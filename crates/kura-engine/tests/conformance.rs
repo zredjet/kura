@@ -674,3 +674,88 @@ fn in_memory_and_reloaded_documents_render_the_same() {
             .unwrap();
     assert_eq!(a.digest().unwrap(), b.digest().unwrap());
 }
+
+/// 引数の表示の条件（docs/editing.md §7.2）：条件の引数は同じ記述の列挙で、値はその列挙の中にあり、自分自身でも条件付きの
+/// 引数でもない（1 段だけ）。`image.convert` の色の数・ディザは Indexed8 のときだけ、下地の色はアルファを外す形式のときだけ。
+#[test]
+fn visibility_conditions_name_enum_params() {
+    use kura_engine::op::ParamKind;
+    let engine = engine();
+    let mut conditioned = 0;
+    for op in engine.registry().all() {
+        let schema = op.schema();
+        for p in &schema.params {
+            let Some(vis) = p.visible else { continue };
+            conditioned += 1;
+            assert_ne!(
+                vis.key,
+                p.key,
+                "{}.{}: 自分自身を条件にしています",
+                op.id(),
+                p.key
+            );
+            let target = schema
+                .params
+                .iter()
+                .find(|q| q.key == vis.key)
+                .unwrap_or_else(|| {
+                    panic!("{}.{}: 条件の引数 {} がありません", op.id(), p.key, vis.key)
+                });
+            assert!(
+                target.visible.is_none(),
+                "{}.{}: 条件の引数 {} も条件付きです",
+                op.id(),
+                p.key,
+                vis.key
+            );
+            let ParamKind::Enum { values } = &target.kind else {
+                panic!(
+                    "{}.{}: 条件の引数 {} が列挙ではありません",
+                    op.id(),
+                    p.key,
+                    vis.key
+                );
+            };
+            assert!(!vis.values.is_empty(), "{}.{}", op.id(), p.key);
+            for v in vis.values {
+                assert!(
+                    values.contains(v),
+                    "{}.{}: {v} は {} の値にありません",
+                    op.id(),
+                    p.key,
+                    vis.key
+                );
+            }
+        }
+    }
+    assert!(conditioned >= 3, "{conditioned}");
+    let convert = engine
+        .registry()
+        .catalog()
+        .into_iter()
+        .find(|d| d.id == "image.convert")
+        .unwrap();
+    let when = |key: &str| {
+        convert
+            .schema
+            .params
+            .iter()
+            .find(|p| p.key == key)
+            .and_then(|p| p.visible)
+            .map(|v| (v.key, v.values.to_vec()))
+    };
+    assert_eq!(when("format"), None);
+    assert_eq!(when("colors"), Some(("format", vec!["indexed8"])));
+    assert_eq!(when("dither"), Some(("format", vec!["indexed8"])));
+    assert_eq!(
+        when("matte"),
+        Some(("format", vec!["gray8", "rgb8", "gray16", "rgb16"]))
+    );
+    // 記述の JSON（カタログ）：表示の条件は `visible`（なければ null）
+    let json = serde_json::to_value(&convert.schema).unwrap();
+    assert_eq!(json["params"][0]["visible"], serde_json::Value::Null);
+    assert_eq!(
+        json["params"][1]["visible"],
+        json!({ "key": "format", "values": ["indexed8"] })
+    );
+}

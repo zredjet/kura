@@ -6,6 +6,7 @@ use crate::value::PixelFormat;
 
 /// 値の種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase")]
 pub enum ValueKind {
     Image,

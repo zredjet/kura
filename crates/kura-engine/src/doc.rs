@@ -25,21 +25,25 @@ pub const RULES: u32 = 1;
 
 /// ノードの ID。文書の中で一意。消しても使い回さない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(transparent)]
 pub struct NodeId(pub u32);
 
 /// 文書の入力の ID。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(transparent)]
 pub struct InputId(pub u16);
 
 /// 文書の出力の ID。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(transparent)]
 pub struct OutputId(pub u16);
 
 /// 入力の役割。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", tag = "type", deny_unknown_fields)]
 pub enum InputRole {
     /// 編集・一括の対象。アイテムの元に結び付く。
@@ -52,11 +56,13 @@ pub enum InputRole {
 
 /// 読み方の設定（出力に効くので文書に入れる）。形式ごとの項目は段 2 以降で足す。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct DecodeOptions {}
 
 /// 文書の入力。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InputSlot {
     pub id: InputId,
@@ -67,6 +73,7 @@ pub struct InputSlot {
 
 /// ノードの入力の参照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", tag = "from", deny_unknown_fields)]
 pub enum PortRef {
     /// 文書の入力。
@@ -81,6 +88,7 @@ fn yes() -> bool {
 
 /// 操作 1 つ。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Node {
     pub id: NodeId,
@@ -90,10 +98,12 @@ pub struct Node {
     pub v: u16,
     /// 引数（その版の型で読む）。
     #[serde(default)]
+    #[cfg_attr(feature = "specta", specta(type = crate::specta_types::JsonValue))]
     pub params: serde_json::Value,
     pub inputs: Vec<PortRef>,
     /// 乱数を使う操作の種。作るときに決め、移行しても変えない。
     #[serde(default, with = "u64_text")]
+    #[cfg_attr(feature = "specta", specta(type = String))]
     pub seed: u64,
     /// false なら一時的に外す（入力 0 をそのまま通す）。
     #[serde(default = "yes")]
@@ -102,6 +112,7 @@ pub struct Node {
 
 /// 出力の形式。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", tag = "type", deny_unknown_fields)]
 pub enum FormatChoice {
     /// 元と同じ形式。
@@ -111,12 +122,14 @@ pub enum FormatChoice {
     To {
         format: String,
         #[serde(default)]
+        #[cfg_attr(feature = "specta", specta(type = crate::specta_types::JsonValue))]
         options: serde_json::Value,
     },
 }
 
 /// 出力をいくつのファイルにするか。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", tag = "type", deny_unknown_fields)]
 pub enum Expand {
     /// 1 つのファイル。
@@ -128,6 +141,7 @@ pub enum Expand {
 
 /// ディザの種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase")]
 pub enum Dither {
     /// 足さない（偶数への丸めだけ）。
@@ -138,6 +152,7 @@ pub enum Dither {
 
 /// 出力の量子化（整数への丸めとディザ。docs/editing.md §4.1）。音声の出力だけに付けられる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Quantize {
     /// 約束の版（`QUANTIZE_VERSION`。知らない版は計画を作るときに断る）。
@@ -147,11 +162,13 @@ pub struct Quantize {
     pub dither: Dither,
     /// ディザの乱数の種（作るときに決め、変えない）。
     #[serde(with = "u64_text")]
+    #[cfg_attr(feature = "specta", specta(type = String))]
     pub seed: u64,
 }
 
 /// 文書の出力。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutputSpec {
     pub id: OutputId,
@@ -167,6 +184,7 @@ pub struct OutputSpec {
 
 /// 文書。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Graph {
     pub schema: u32,
@@ -524,6 +542,32 @@ mod u64_text {
         match Text::deserialize(d)? {
             Text::Str(s) => s.parse().map_err(serde::de::Error::custom),
             Text::Num(n) => Ok(n),
+        }
+    }
+}
+
+/// `Option<u64>` を 10 進の文字列（なければ null）で書く・文字列か数で読む（種。JS の数は 2^53 を超える整数を表せない）。
+pub(crate) mod opt_u64_text {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => s.serialize_some(&n.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Text {
+            Str(String),
+            Num(u64),
+        }
+        match Option::<Text>::deserialize(d)? {
+            Some(Text::Str(s)) => s.parse().map(Some).map_err(serde::de::Error::custom),
+            Some(Text::Num(n)) => Ok(Some(n)),
+            None => Ok(None),
         }
     }
 }

@@ -28,6 +28,7 @@ use crate::testgen::InputGen;
 use crate::value::Value;
 
 /// 引数の種類（エディタの汎用の引数パネルはここから組む）。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 pub enum ParamKind {
@@ -65,6 +66,7 @@ pub enum ParamKind {
 }
 
 /// 引数の単位。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Unit {
@@ -80,19 +82,44 @@ pub enum Unit {
     Times,
 }
 
+/// 引数を表示する条件（docs/editing.md §7.2 の「表示の条件」）：同じ操作の列挙の引数 `key` の値が `values` のどれかのとき
+/// だけ、この引数を出す（例：`image.convert` の `colors`・`dither` は `format` が `indexed8` のときだけ）。値の検証・既定値には
+/// 効かない（出さない引数も文書に書いたまま読み、既定値を持つ）。条件の引数は同じ記述の `Enum` で、値はその列挙の中
+/// （適合テストで確かめる）。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Visible {
+    pub key: &'static str,
+    pub values: &'static [&'static str],
+}
+
 /// 引数 1 つの記述。`key` は serde のフィールド名と一致させる（適合テストで確かめる）。文言は ja.ts で `key` から引く。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParamSpec {
     pub key: &'static str,
     pub kind: ParamKind,
     pub unit: Unit,
+    #[cfg_attr(feature = "specta", specta(type = crate::specta_types::JsonValue))]
     pub default: serde_json::Value,
     /// 詳細な設定（ふだんは畳んでおく）。
     pub advanced: bool,
+    /// 表示の条件（None はいつも出す）。
+    pub visible: Option<Visible>,
+}
+
+impl ParamSpec {
+    /// 列挙の引数 `key` の値が `values` のどれかのときだけ出す（[`Visible`]）。
+    pub fn when(mut self, key: &'static str, values: &'static [&'static str]) -> Self {
+        self.visible = Some(Visible { key, values });
+        self
+    }
 }
 
 /// 引数の記述の一覧。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ParamSchema {
     pub params: Vec<ParamSpec>,
@@ -220,6 +247,7 @@ pub trait OpParams:
 }
 
 /// 入力の口の記述。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct PortSpec {
     pub name: &'static str,
@@ -227,6 +255,7 @@ pub struct PortSpec {
 }
 
 /// 画像の操作をフレームの列に当てる方法。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Lift {
@@ -237,6 +266,7 @@ pub enum Lift {
 }
 
 /// 結果の数値の性質（ゴールデンをターゲットごとに持つかどうか）。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Numeric {
@@ -247,6 +277,7 @@ pub enum Numeric {
 }
 
 /// メタデータの扱い。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MetaAccess {
@@ -257,6 +288,7 @@ pub enum MetaAccess {
 }
 
 /// 操作の型の記述。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Signature {
     pub inputs: &'static [PortSpec],
@@ -923,6 +955,7 @@ pub fn unreadable_params(id: &str, e: &dyn std::fmt::Display) -> Issues {
 }
 
 /// 操作の記述（UI のカタログ）。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpDescriptor {
@@ -1233,6 +1266,7 @@ pub fn spec(
         unit,
         default,
         advanced: false,
+        visible: None,
     }
 }
 

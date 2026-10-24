@@ -28,6 +28,11 @@ repository.workspace = true
 # - vorbis-tables：Ogg Vorbis の書き出しの表（aoTuV b6.03 から生成してコミットしたもの。ワークスペースの中のクレート。
 #   中身を変えるとテストの凍結した値が合わなくなり、エンコーダの版を上げる）
 # serde_json は固定しない：正規の JSON は自前で書き（digest.rs）、読み込みは float_roundtrip で正しく丸めるので、結果は版によらない。
+[features]
+# エディタとの境界の型（手 `Edit`・引数の記述・操作のカタログ・文書・指摘）に specta::Type を付けて TS に出す（src-tauri が
+# 有効にする。specta はこの feature の中だけで使う。docs/editing.md §3、ADR-134）。結果には効かない
+specta = ["dep:specta"]
+
 [dependencies]
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 libm.workspace = true
@@ -43,6 +48,9 @@ rayon.workspace = true
 resvg = { version = "=0.48.1", default-features = false, features = ["text"] }
 serde.workspace = true
 serde_json.workspace = true
+# feature `specta` のときだけ（引数の JSON の値は specta_types::JsonValue の名前で出す。specta の serde_json の型は入れ子を
+# 展開して TS に書き出せないので使わない）
+specta = { workspace = true, optional = true, features = ["derive"] }
 symphonia-bundle-flac = { version = "=0.6.1", default-features = false }
 symphonia-codec-aac = { version = "=0.6.1", default-features = false }
 symphonia-codec-alac = { version = "=0.6.1", default-features = false }

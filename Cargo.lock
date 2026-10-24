@@ -2203,6 +2203,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "specta",
  "symphonia-bundle-flac",
  "symphonia-codec-aac",
  "symphonia-codec-alac",

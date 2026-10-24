@@ -8,6 +8,7 @@ use crate::digest::Digest;
 use crate::doc::NodeId;
 
 /// 指摘の重さ。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Severity {
@@ -18,6 +19,7 @@ pub enum Severity {
 }
 
 /// 指摘の種類。画面の文言はこの値から引く。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum IssueCode {
@@ -48,6 +50,7 @@ pub enum IssueCode {
 }
 
 /// 検証の指摘 1 つ。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Issue {

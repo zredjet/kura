@@ -16,6 +16,8 @@ pub mod snapshot;
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use crate::digest::Digest;
 use crate::doc::{Expand, FormatChoice, Graph, NodeId, OutputId, PortRef, Quantize};
 use crate::error::EngineError;
@@ -29,7 +31,9 @@ pub use snapshot::{NodeChange, NodeView, ParamsView, Snapshot, SnapshotDiff};
 pub struct Rev(pub u64);
 
 /// 確定のしかた。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "camelCase")]
 pub enum CommitMode {
     /// 1 手にする。
     Step,
@@ -37,17 +41,25 @@ pub enum CommitMode {
     Merge,
 }
 
-/// 文書への変更 1 つ。
-#[derive(Debug, Clone, PartialEq)]
+/// 文書への変更 1 つ。JSON（エディタとの通信。M12）では `type` で種類を分ける（`{"type":"appendItems","node":3,…}`。
+/// 項目は camelCase、種は 10 進の文字列）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Edit {
     /// 線形の列の `at` 番目（0 が先頭、ノードの数なら末尾）にノードを足す。ID は `next_id` から払い出し、種は `seed`
     /// （なければ ID の値）。`extra_inputs` は 2 つ目からの入力（文書の入力か、`at` より前のノード）。
+    #[serde(rename_all = "camelCase")]
     AddNode {
         at: usize,
         op: String,
         v: u16,
+        #[cfg_attr(feature = "specta", specta(type = crate::specta_types::JsonValue))]
         params: serde_json::Value,
+        #[serde(default, with = "crate::doc::opt_u64_text")]
+        #[cfg_attr(feature = "specta", specta(type = Option<String>))]
         seed: Option<u64>,
+        #[serde(default)]
         extra_inputs: Vec<PortRef>,
     },
     /// 線形の列からノードを消し、前後をつなぎ直す。
@@ -59,18 +71,21 @@ pub enum Edit {
     /// 引数をまとめて替える。
     SetParams {
         node: NodeId,
+        #[cfg_attr(feature = "specta", specta(type = crate::specta_types::JsonValue))]
         params: serde_json::Value,
     },
     /// 引数の項目 1 つを替える。
     SetParam {
         node: NodeId,
         key: String,
+        #[cfg_attr(feature = "specta", specta(type = crate::specta_types::JsonValue))]
         value: serde_json::Value,
     },
     /// 追記だけの配列の引数（`field`）に要素を足す。
     AppendItems {
         node: NodeId,
         field: String,
+        #[cfg_attr(feature = "specta", specta(type = Vec<crate::specta_types::JsonValue>))]
         items: Vec<serde_json::Value>,
     },
     /// 出力の形式・量子化・展開を替える（つなぐ先は変えない）。
@@ -492,6 +507,23 @@ impl EditSession {
         self.saved = Some(self.head_rev());
     }
 
+    /// 番号 `rev` の手を保存したことにする（M12：保存のジョブは積んだときの頭を描き、その間も編集を続けるので、ジョブが
+    /// 終わったときに積んだときの番号に印を付ける）。番号は中身ごとに振るので、履歴から捨てた手・今の頭でない手の番号でも
+    /// よい（その手に戻ったときだけ `is_dirty` が偽になる）。
+    pub fn mark_saved_at(&mut self, rev: Rev) {
+        self.saved = Some(rev);
+    }
+
+    /// 保存した手をなくす（下書きから開いたとき：開いた文書はまだ保存していない。`is_dirty` は真になる）。
+    pub fn clear_saved(&mut self) {
+        self.saved = None;
+    }
+
+    /// 保存した手の番号（なければ None）。
+    pub fn saved_rev(&self) -> Option<Rev> {
+        self.saved
+    }
+
     /// 確定した頭が、保存したものと違うか。
     pub fn is_dirty(&self) -> bool {
         self.saved != Some(self.head_rev())
@@ -596,6 +628,138 @@ mod tests {
         assert!(
             full_steps > 20 && near_bytes > 20,
             "{full_steps} {near_bytes}"
+        );
+    }
+
+    fn flip_doc() -> Graph {
+        let mut g = Graph::new_single();
+        g.push_linear("image.flip", 1, json!({ "axis": "vertical" }), 0)
+            .unwrap();
+        g
+    }
+
+    fn axis(a: &str) -> Edit {
+        Edit::SetParam {
+            node: NodeId(1),
+            key: "axis".into(),
+            value: json!(a),
+        }
+    }
+
+    /// 保存の印：積んだときの番号に付ける（その間に積んだ手があっても）。その手に戻ると dirty でなく、印をなくすと
+    /// どの手でも dirty。
+    #[test]
+    fn mark_saved_at_marks_the_rev_saved_while_editing_goes_on() {
+        let engine = Engine::new().unwrap();
+        let mut s = EditSession::open(
+            &engine,
+            &flip_doc(),
+            Digest::default(),
+            HistoryLimits::default(),
+        )
+        .unwrap();
+        assert!(!s.is_dirty());
+        let saving = s
+            .commit(&engine, axis("horizontal"), CommitMode::Step)
+            .unwrap()
+            .rev;
+        // 保存を積んだあとも編集を続ける
+        s.commit(&engine, axis("vertical"), CommitMode::Step)
+            .unwrap();
+        assert!(s.is_dirty());
+        s.mark_saved_at(saving);
+        assert_eq!(s.saved_rev(), Some(saving));
+        assert!(s.is_dirty(), "頭は保存した手でない");
+        assert_eq!(s.undo(), Some(saving));
+        assert!(!s.is_dirty(), "保存した手に戻った");
+        assert_eq!(s.undo(), Some(Rev(0)));
+        assert!(s.is_dirty(), "開いた手は保存した手でなくなった");
+        s.clear_saved();
+        assert_eq!(s.redo(), Some(saving));
+        assert!(s.is_dirty());
+        assert_eq!(s.saved_rev(), None);
+    }
+
+    /// 手の JSON（エディタとの通信）：種類は `type`、項目は camelCase、種は文字列（数でも読む）。知らない項目は断り、
+    /// 往復で変わらない。
+    #[test]
+    fn edits_round_trip_as_json() {
+        let edits = [
+            Edit::AddNode {
+                at: 1,
+                op: "paint.actions".into(),
+                v: 1,
+                params: json!({ "actions": [] }),
+                seed: Some(u64::MAX),
+                extra_inputs: vec![PortRef::Input {
+                    id: crate::doc::InputId(0),
+                }],
+            },
+            Edit::AddNode {
+                at: 0,
+                op: "image.flip".into(),
+                v: 1,
+                params: json!({ "axis": "vertical" }),
+                seed: None,
+                extra_inputs: Vec::new(),
+            },
+            Edit::RemoveNode { node: NodeId(2) },
+            Edit::MoveNode {
+                node: NodeId(2),
+                to: 0,
+            },
+            Edit::SetEnabled {
+                node: NodeId(1),
+                enabled: false,
+            },
+            axis("horizontal"),
+            Edit::AppendItems {
+                node: NodeId(3),
+                field: "actions".into(),
+                items: vec![json!({ "k": 1 })],
+            },
+            Edit::SetOutput {
+                output: OutputId(0),
+                format: FormatChoice::To {
+                    format: "webp".into(),
+                    options: json!({}),
+                },
+                quantize: None,
+                expand: Expand::One,
+            },
+            Edit::Replace { graph: flip_doc() },
+        ];
+        for e in edits {
+            let text = serde_json::to_string(&e).unwrap();
+            let back: Edit = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, e, "{text}");
+        }
+        let add = serde_json::to_value(Edit::AddNode {
+            at: 0,
+            op: "image.flip".into(),
+            v: 1,
+            params: json!({}),
+            seed: Some(7),
+            extra_inputs: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            add,
+            json!({ "type": "addNode", "at": 0, "op": "image.flip", "v": 1, "params": {}, "seed": "7",
+                    "extraInputs": [] })
+        );
+        let read: Edit = serde_json::from_value(
+            json!({ "type": "addNode", "at": 0, "op": "image.flip", "v": 1, "params": {}, "seed": 9 }),
+        )
+        .unwrap();
+        assert!(matches!(read, Edit::AddNode { seed: Some(9), .. }));
+        assert!(
+            serde_json::from_value::<Edit>(json!({ "type": "removeNode", "node": 1, "extra": 0 }))
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(CommitMode::Merge).unwrap(),
+            json!("merge")
         );
     }
 }

@@ -53,6 +53,11 @@ pub struct ConvertParams {
     pub matte: [u8; 3],
 }
 
+/// 色の数・ディザを出す変換先（Indexed8 にするときだけ使う。docs/editing.md §7.2 の表示の条件）。
+const INDEXED: &[&str] = &["indexed8"];
+/// 下地の色を出す変換先（アルファを外す形式。Indexed8 はパレットにアルファを残すので使わない）。
+const OPAQUE: &[&str] = &["gray8", "rgb8", "gray16", "rgb16"];
+
 impl OpParams for ConvertParams {
     fn schema() -> ParamSchema {
         ParamSchema {
@@ -77,7 +82,8 @@ impl OpParams for ConvertParams {
                     },
                     Unit::None,
                     json!(256),
-                ),
+                )
+                .when("format", INDEXED),
                 spec(
                     "dither",
                     ParamKind::Enum {
@@ -85,13 +91,15 @@ impl OpParams for ConvertParams {
                     },
                     Unit::None,
                     json!("none"),
-                ),
+                )
+                .when("format", INDEXED),
                 spec(
                     "matte",
                     ParamKind::Color { alpha: false },
                     Unit::None,
                     json!([255, 255, 255]),
-                ),
+                )
+                .when("format", OPAQUE),
             ],
         }
     }
