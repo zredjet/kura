@@ -590,8 +590,9 @@ CREATE INDEX idx_item_versions_file_blob ON item_versions(file_blob_id);      --
 CREATE INDEX idx_item_versions_doc       ON item_versions(doc_id);
 CREATE INDEX idx_item_versions_waiting   ON item_versions(replaced_at) WHERE file_state = 'waiting';   -- 段 3 の GC
 CREATE UNIQUE INDEX idx_item_versions_job ON item_versions(job_id) WHERE job_id IS NOT NULL;
--- 不変条件（段 2 の B の `edit::versions::check_invariants`。ほかの版が hold でないことも照らす）：版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。版 0 と頭は hold。
--- 頭の output_hash・ext は items.hash・ext に等しい。hold・waiting・kept の file_blob_id が指す台帳の行の hash は output_hash と同じ
+-- 不変条件（`edit::versions::check_invariants`。§4「保存と版（M12）」の「不変条件」に全部）：版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。
+-- 版 0 と頭は hold（ほかの版は hold でない）。頭の output_hash・ext は items.hash・ext に等しい。hold・waiting・kept の file_blob_id が指す
+-- 台帳の行の hash は output_hash と同じ。土台は 1 つ前の版。edit は入力 0 を持ち、revert は戻した先と文書・値・入力の数が同じ
 
 -- ===== 版の入力（0011。版ごとの入力の記録）=====
 CREATE TABLE item_version_inputs (
@@ -622,7 +623,7 @@ CREATE TABLE edit_drafts (
   doc_id        INTEGER NOT NULL REFERENCES edit_objects(id),
   base_hash     BLOB    NOT NULL,                    -- 編集を始めたときの今
   base_version  INTEGER NOT NULL,
-  after_job     INTEGER,                             -- この下書きを保存しているジョブ（終われば土台を進める）
+  after_job     INTEGER,                             -- 土台を待っている保存のジョブ（コミットすると土台がその版に付け替わる）
   updated_at    INTEGER NOT NULL
 );
 CREATE INDEX idx_edit_drafts_doc ON edit_drafts(doc_id);
@@ -724,7 +725,8 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 
 ### 保存と版（M12。`crates/kura-core/src/edit/`・`library/ledger.rs`・`import/store.rs`）
 
-段 2 の A（重複の判定・台帳の門・予告と照合・文書の部品・ゴミ箱を空にする処理）と B（版の読み書き・アンカー・保存のジョブの上書きと別名）で入れたもの（元に戻す・下書きは C で足す）。
+段 2 の A（重複の判定・台帳の門・予告と照合・文書の部品・ゴミ箱を空にする処理）、B（版の読み書き・アンカー・保存のジョブの上書きと別名）、
+C（版に戻す・下書き・不変条件）で入れたもの。
 
 - **重複の判定**（`import::store::find_owner`。取り込み・ダウンロード・キャプチャ）：今 → 元 → 過去の版の順に、2 段の問い合わせで
   探す（どちらも索引。テスト `find_owner_looks_at_current_then_original_then_past_versions` の EXPLAIN）。
@@ -855,6 +857,50 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   DELETE FROM edit_anchors WHERE id = ?1
      AND NOT EXISTS (SELECT 1 FROM item_version_inputs i WHERE i.anchor_id = edit_anchors.id) RETURNING blob_id;
   ```
+
+- **版に戻す**（`edit::save` の `revert`。意味は docs/editing.md §14「版に戻す」）：戻す先 k は 0 以上・頭の版より前。版 k の行は
+  `UNIQUE(item_id, version)`、入力は主キーで引く。
+  - 使い直す（版 k の中身が台帳にあってファイルがある）：台帳の門を持って `ledger::ext_of`（hash の一意の索引）とファイルを確かめ、
+    そのまま下のトランザクション 2 だけを行う（予告・配置なし）。作り直す：保存と同じ予告 → 配置 → トランザクション 2。
+  - トランザクション 2：土台（`versions::head`）と、`SELECT id FROM items WHERE hash = ?H AND id <> ?1`（別のアイテムの今なら Conflict）を
+    確かめ直し、`ledger::register`（作り直したものはここで台帳に載る。使い直すならもうある）のあと、
+
+    ```sql
+    UPDATE items SET hash = ?2, ext = ?3, size_bytes = ?4, mime = ?5, width = ?6, height = ?7, duration_ms = ?8,
+           codec_info = ?9, thumb_state = 'pending',                      -- mime・codec_info は版 k の記録（中身が変わったら拡張子から・空）
+           proxy_state = CASE WHEN kind IN ('video','audio') THEN 'unknown' ELSE 'not_needed' END,
+           analysis_state = CASE WHEN kind IN ('image','audio') THEN 'pending' ELSE 'not_needed' END,
+           updated_at = ?10
+     WHERE id = ?1 AND hash = ?11 AND trashed_at IS NULL;   -- 1 行でなければ Conflict。H が今と同じなら updated_at だけ（unchanged）
+    ```
+
+    前の頭は上書きと同じ（出力が H か版 0 と同じなら released、ほかは waiting）。版 k の行は変えない。新しい頭は
+    `kind = 'revert'`・`revert_to = k`・`base_version = n`・`doc_id`＝版 k の `doc_id`（版 0 と、版 0 に戻した版は NULL）・
+    `value_digest`＝版 k の値・`file_blob_id`＝H の台帳の行・hold・`job_id`。記録（`record`）は版 k の書き出しの記録（作り直したら
+    新しい記録）・版 0 なら元を読んだ記録・メディア情報・警告と `revert: {to, reused, rebuilt}`。入力は版 k の行を写す
+    （`INSERT INTO item_version_inputs … ` を版 k の行ごとに。アンカーの参照も写すので、アンカーは参照されたまま）。下書きの片付け・予告の
+    消去・途中経過は上書きと同じ。
+- **下書き**（`edit::drafts`。意味は docs/editing.md §12.12）：アイテムごとに 1 行（主キー `item_id`）。置く（`drafts::save`）ときは文書を
+  `put_doc` で部品にしてから `INSERT … ON CONFLICT(item_id) DO UPDATE`。`after_job` のジョブがもうコミットしていれば（`versions::by_job`）、
+  そのとき付け替える。開く（`drafts::open`）ときは `SELECT … FROM edit_drafts d JOIN edit_objects o ON o.id = d.doc_id WHERE d.item_id = ?`
+  と、fresh の判定に `versions::head` と `SELECT state IN ('queued','running','paused') FROM jobs WHERE id = ?after_job`（どれも主キー）。
+  保存のトランザクション 2 の片付け（`settle_after_save`。保存した文書の根の行 `?saved`。版 0 に戻したときは空の文書の根の行）：
+
+  ```sql
+  DELETE FROM edit_drafts WHERE item_id = ?1 AND doc_id = ?saved AND (after_job IS NULL OR after_job = ?job);
+  UPDATE edit_drafts SET base_hash = ?new_hash, base_version = ?new_version, after_job = NULL
+   WHERE item_id = ?1 AND after_job = ?job;
+  ```
+
+  別名で保存では元のアイテム A の下書きに同じ規則を当てる（土台は A の頭のまま）。下書きの部品の行は消さない（段 3 の GC）。
+- **不変条件**（`edit::versions::check_invariants`。表を走査するので、テスト・crash-loop・整合性の確かめだけで呼び、起動の道では呼ばない）：
+  1. 版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。版 0 と頭は hold、ほかの版は hold でない。頭の output_hash・ext は items.hash・ext。
+  2. released でない行の `file_blob_id` が指す台帳の行の hash は output_hash と同じ。
+  3. 版 0 でない版の `base_version` は `version - 1`。文書を持つ版・下書きの文書は根（`kind = 'doc'`）の部品で、部品をつなぎ直せる
+     （`load_doc_bytes`。本文からダイジェストを求め直す）。
+  4. edit の版は入力 0（primary）の行を持つ。revert の版は戻した先の版がそのアイテムにあり、文書・値のダイジェスト・入力の数が同じ。
+  5. 入力の `anchor_id` はアンカーの行を指し、アンカーは台帳の行を持ち、元（`source_hash`）が入力の元と同じ。どの入力からも参照されない
+     アンカーはない（ゴミ箱を空にする処理が片付ける）。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
 

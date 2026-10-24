@@ -1021,6 +1021,10 @@ impl Engine {   // 段 10 で足したもの
 - 上限（`HistoryLimits`）：1,000 手と、共有を除いた文書の 64 MiB の早いほうで、古い手から捨てる（カーソルは土台より前にならない）。バイトは「土台の文書の長さ ＋ 各手が 1 つ前の手と共有していない分」で、正規の JSON の長さで数える見積もり（決定的にするため、アロケータの値を使わない）。実メモリは、筆の追記で見積もりのほぼ 1 倍、引数の変更で約 10 倍、開いた文書は JSON の約 8 倍（serde_json の値。5 万本で 114 MB）。上限に実メモリの倍率を掛けるかは後で決める。
 - 保存の印：`mark_saved`・`is_dirty`（開いた文書は保存したものとみなす）。
 - 下書きの形式は作らない（M12）。頭の文書と土台の版から作り直す口（`open`・`open_json`。`open_json` は `Engine::load` を通して古いスキーマを移す）だけを持つ。作り直すと同じ文書・同じ鍵になる。
+- **下書き**（M12 の段 2。kura-core の `edit::drafts`、表は docs/data-model.md §4「保存と版（M12）」）：エディタの頭の文書（内容アドレスの部品。§4.4）と、その土台（開いたときの今 `items.hash` と頭の版。保存の `Base`）だけを、アイテムごとに 1 つ持つ（`edit_drafts`）。アプリが落ちても、開き直すと同じ文書（同じ根）に戻せる（S17）。
+  - 開く（`drafts::open`）と `fresh` を返す：土台が今と頭の版に等しく、ゴミ箱になく、土台を待っている保存のジョブ（`after_job`）が動いていない（待ち・実行中・一時停止でない）。偽なら、置いたあとに別の保存でアイテムが変わったので、その土台で保存すると `Conflict`（どうするかは利用者が選ぶ。UI は段 5）。
+  - エディタが保存を積んだあとも編集を続けて置く下書きは、`after_job` にそのジョブを書く（土台はそのジョブの土台）。保存のジョブのトランザクション 2 が、保存した文書と同じ下書き（待っていないか、このジョブを待っていたもの）を消し、このジョブを待っていた下書きは土台を新しい頭に付け替える（`settle_after_save`。別名で保存は元のアイテムの下書きに同じ規則、土台は元のアイテムの頭のまま）。ジョブがもうコミットしていれば、置くときに付け替える。ほかの下書き（別の保存の前に置いたもの）は残り、開くと `fresh` が偽。
+  - 捨てる（`drafts::discard`）・アイテムを消す（CASCADE）と行が消える。部品の行は残る（段 3 の GC）。
 - 実測（M4 Max・release。`tests/bench_session.rs`）：筆 1 本（500 点）の追記の手は p95 8.0〜12.5 µs（筆 999〜5 万本の文書）、引数の変更の手は p50 1.9 µs、undo・redo は約 1 ns、開くのは 3.1 ms（999 本）〜166 ms（5 万本）。5 万本の文書の `to_graph` は 24 ms、正規の JSON は 140 ms（保存・下書きの道。to_graph を通さずに直接書けば縮められる）。
 
 ### 12.13 配信（M11・M12）
@@ -1095,6 +1099,11 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   1. 置き換えたファイルは 7 日残してから消す（バックアップの保持と同じ長さ）。消してよいのは、置き換えから 7 日たち、かつ置き換えより前に作ったバックアップが残っていないとき（バックアップは「新しい 7 個」を残す決まりで日数ではないので、DB をバックアップから戻してもそのファイルがあるように。M12 の利用者の決定 2）。
   2. 消す直前に、その版を文書から作り直して照合する。一致しなければ、そのファイルを残す。
   3. Platform・External でしか読めない元には、初めて保存するときにアンカーを作る（§9.4）。保存のジョブが、描いたのと同じ読み取りから作る（エディタを開く速さと対話の予算を守る。保存しない編集では作らない。M12 の利用者の決定 7）。
+- **版に戻す**（元に戻す＝版 0、途中の版 k。段 2 の C）も新しい版を足す操作（版の記録は消さない）。版 n+1 を `kind = 'revert'`・`revert_to = k` で足し、文書は版 k の文書（版 0 と、版 0 に戻した版は空の文書で NULL）、入力は版 k の写し、値のダイジェストは版 k と同じ。アイテムは版 k の列（幅・高さ・長さ・拡張子・大きさ。版 0 なら版 0 の列と記録の mime・codec_info）に戻し、title・original_name・素材の設定は変えない。前の頭は上書きと同じく消し待ち（出力が戻した中身か版 0 と同じなら released）、版 k の状態は変えない。戻した結果が今と同じ中身なら版だけ足す（unchanged）。戻す先は 0 以上・頭の版より前（ほかは `Invalid`。まだ保存していないアイテムには戻す版がない）。
+  - **使い直す**：版 k の中身が台帳にあり（版 k がまだ持っているか、ほかの版・アイテムが同じ中身を持っている）ファイルがあれば、台帳の門を持って 1 つのトランザクションで戻す（描かない・置かない）。版 0 はいつも hold なので、元に戻すのはいつもこちら。
+  - **作り直す**：なければ、版 k の入力の記録（`RecordedInput`）で元を読み（`read_recorded`。アンカーがあればアンカー）、版 k の文書を描いて値のダイジェストを記録と照らし、記録のエンコーダ（`encode_bytes_with`。記録の codec・format・options）で書く。出力は作り直したファイル H′（記録のエンコーダならふつうは版 k と同じバイト列）で、予告 → 配置 → コミットは保存と同じ段 6〜9。
+  - **作り直しの照合の決まり**（M12 の段 2 で推奨で採った決定）：値のダイジェストが記録と違えば保存しない（`Mismatch`。何も変えない）。アンカーが使えない（壊れている・ない・別の値）とき、元を記録の識別子のデコーダで読めれば元で読み直し（値が記録と違えば `Mismatch`）、知らせを版の記録の警告に残す。記録のデコーダもなければ `Mismatch`。記録のエンコーダがこの環境になければ、今の組の同じ形式のエンコーダで書き、新しい書き出しの記録を残す（値は照らし済み）。バイト列が版 k と違えば知らせだけ残す。
+  - 戻した結果が別のアイテムの今と同じ中身なら `Conflict`（上書きと同じ。`items.hash` は一意なので、別名で保存した B を元に戻すと A の今と同じになる場合も `Conflict`）。
 - 上書きは「アイテム ID を保ったまま中身を差し替える」操作。タグ・フォルダ・ユニット・プレイリスト・再生の記録・表示名・元のファイル名・素材の設定（格子・ピボット・ループ点）は変わらない（形式が変わる上書きでも title・original_name は変えない。名前は書き出しで直す。素材の設定が中身に合わなくなった知らせは段 5 の UI。M12 の段 2 の決定 10・11）。手順は下の「保存のジョブ」（staging に書く → ハッシュ → 予告 → `files/` に配置 → 1 トランザクションで `items.hash` を比較して置き換え、版を足す → 古いファイルは消し待ち）。
 - `items.hash` を書き換えるのは保存の処理だけ。中身に依る列を書く UPDATE は、すべてハッシュを条件にする（古いハッシュで作ったサムネイルを書き込まないため）。M11 で解析（`analysis_state` と結果・事実の書き込み。`WHERE id = ? AND hash = ? AND analysis_state = 'pending'`）とサムネイル（`thumb_state`・`thumb_rev` と読んだメディア情報。`WHERE id = ? AND hash = ?`）に入れた。結果・事実は中身ごと（台帳の行 `blob_id`）に持つので、保存で中身が変わると別の行になる（docs/data-model.md §2）。M12 でプロキシ（`proxy_state` の判定と作った結果。`WHERE id = ? AND hash = ?`）にも入れた。
 - 取り込みで、あるアイテムの今・元・過去の版と同じ中身なら、そのアイテムの重複として扱う。
@@ -1105,7 +1114,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 
 **保存のジョブ**（M12 の段 2。`kura-core` の `edit::save`。`JobKind::Edit`、同時に 1 本、誰にも譲らない。表と SQL は docs/data-model.md §4「保存と版（M12）」）：
 
-- 積む口（`start_save`）は、文書を内容アドレスの部品（§4.4）に分けて先に DB に置き、ジョブの入力には根のダイジェストだけを書く（`{"v":1,"itemId","base":{"hash","version"},"action":{"type":"overwrite","doc"}}`、別名は `{"type":"saveAs","doc","title","stem"}`、元に戻すは `{"type":"revert","to"}`）。保存できる文書は、入力が元 1 つ（Primary）・出力が 1 つのファイル（`Expand::One`）のものだけ（ほかは `Invalid`）。出力の形式は文書の `FormatChoice`（`Keep` は元の形式。書けなければ `Unsupported`）。保存でアイテムの種類は変えない。
+- 積む口（`start_save`）は、文書を内容アドレスの部品（§4.4）に分けて先に DB に置き、ジョブの入力には根のダイジェストだけを書く（版に戻すは文書を持たず、戻す先を積む前に確かめる）（`{"v":1,"itemId","base":{"hash","version"},"action":{"type":"overwrite","doc"}}`、別名は `{"type":"saveAs","doc","title","stem"}`、元に戻すは `{"type":"revert","to"}`）。保存できる文書は、入力が元 1 つ（Primary）・出力が 1 つのファイル（`Expand::One`）のものだけ（ほかは `Invalid`）。出力の形式は文書の `FormatChoice`（`Keep` は元の形式。書けなければ `Unsupported`）。保存でアイテムの種類は変えない。
 
   | 段 | すること | 強制終了したら |
   |---|---|---|
@@ -1117,20 +1126,28 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   | 5 書く | エンコードし、生の BLAKE3 を H とし（`EncodedStamp.file_digest` はドメイン付きなので使わない）、`staging/edit-<job>-out.<ext>.part` に書いて `sync_all`。予算と値を手放す。ここまでは一時停止・中止で止まる（staging を消す） | 同上 |
   | 6 予告 | 台帳の門（取り込みの鍵の書きの側）を取る。トランザクション 1 で土台を確かめ直し、H の持ち主（今 → 元 → 過去の版）で `Conflict`・`existing` を決め、拡張子を決め（台帳に同じ中身の行があればその拡張子、形式が今と同じなら今の拡張子、ほかは形式の代表）、台帳にない出力とアンカーを予告する。`Conflict`・`existing` なら何も置かずに staging を消して終わる | 開くときの予告の照合が予告の行を消し、ジョブは初めから |
   | 7 配置 | `files/` へ同じボリュームの中で改名する（同じ中身がもうあれば staging を消す。台帳に行があるのにファイルがなければ置いて直す） | 照合が台帳にないファイル（と派生のファイル）を消して予告の行を消し、ジョブは初めから |
-  | 8 コミット | トランザクション 2 で土台と「別のアイテムの今と同じでない」を確かめ直し、最初の保存なら版 0、アンカー、アイテムの置き換え（別名は新しいアイテム）、前の頭、新しい頭、入力の記録を書き、自分の予告を消し、途中経過に結果を書く | 0 がこのジョブの版を見つけて Done（版は 1 つだけ。保存のあとのジョブも積む） |
+  | 8 コミット | トランザクション 2 で土台と「別のアイテムの今と同じでない」を確かめ直し、最初の保存なら版 0、アンカー、アイテムの置き換え（別名は新しいアイテム、版に戻すは版 k の列）、前の頭、新しい頭、入力の記録を書き、下書きを片付け（§12.12）、自分の予告を消し、途中経過に結果を書く | 0 がこのジョブの版を見つけて Done（版は 1 つだけ。保存のあとのジョブも積む） |
   | 9 後始末 | 門を放し、staging の残りを消し、サムネイル・解析（画像・音声）・プロキシ（動画・音声）のジョブを積む | — |
 
-  トランザクション 2 で `Conflict` になったら（門の間にゴミ箱に入れられたなど）、門を持ったまま、このジョブの予告のうち台帳に同じ拡張子で載っていない中身のファイルを消し、予告を消してから失敗にする。結果（`jobs.result_json`）は `{"outcome":"saved"|"unchanged","itemId","version","versionId","hash","ext","reused","anchor":"created"|"used"|null,"warnings"}` か、別名で同じ中身のアイテムがあれば `{"outcome":"existing","itemId","role":"current"|"original"|"past","version","trashed"}`。
+  版に戻すときは、0 のあと、版 k の中身が台帳にあってファイルがあれば門を持って 1 つのトランザクションで戻し（使い直す）、なければ 1〜5 を版 k の文書と入力の記録で行い（作り直す。アンカーを作らない。値のダイジェストを照らす）、6〜9 は同じ。
+
+  トランザクション 2 で `Conflict` になったら（門の間にゴミ箱に入れられたなど）、門を持ったまま、このジョブの予告のうち台帳に同じ拡張子で載っていない中身のファイルを消し、予告を消してから失敗にする。結果（`jobs.result_json`）は `{"outcome":"saved"|"unchanged","itemId","version","versionId","hash","ext","reused","anchor":"created"|"used"|null,"warnings"}`（版に戻すは `"revert":{"to","reused","rebuilt"}` も）か、別名で同じ中身のアイテムがあれば `{"outcome":"existing","itemId","role":"current"|"original"|"past","version","trashed"}`。
 - **版のファイルの状態**（`item_versions.file_state`）：`hold` は今か元（消さない）。`waiting` は頭でなくなった版で、段 3 の GC が 7 日と「置き換えより前のバックアップが残っていない」の条件で消す。`kept` は GC の照合が合わず残すもの（段 3）。`released` はもうファイルを持たない行（`file_blob_id` は NULL）。頭でなくなる版の出力が新しい頭か版 0 と同じなら、その行がファイルを持つので、すぐ `released`。最初の保存では前の今は元そのもので、版 0 が `hold` で持つ（消し待ちにならない）。
-- **版 0** は最初の保存のときに足す（10 万件のライブラリに行を足さない。版の行のないアイテムは「版 0 は暗に今、頭の版は 0」）。版 0 にはアイテムのメディア情報（幅・高さ・長さと、記録の mime・codec_info）と元を読んだ記録を写し、元に戻すときにここから items を戻す（段 2 の C）。
+- **版 0** は最初の保存のときに足す（10 万件のライブラリに行を足さない。版の行のないアイテムは「版 0 は暗に今、頭の版は 0」）。版 0 にはアイテムのメディア情報（幅・高さ・長さと、記録の mime・codec_info）と元を読んだ記録を写し、元に戻すときにここから items を戻す。
 - **電源断**：改名の前に `sync_all` するので、DB の最後のコミットを失っても残りうるのは「DB にないファイル」だけ（予告の照合か整合性チェックが数える）。置いたファイルの中身は改名の前に書き終えている（台帳に載せたファイルが書きかけになることはない）。
 
 ### 14.1 保存の受け入れテスト（M12。`kura-core` のテストとして実装する）
 
-テストの場所：段 2 の保存は `crates/kura-core/src/edit/save_tests.rs`（S1・S2・S5〜S9・S14・S15 の前半）。S14 の取り込み・ダウンロードの
-重複の判定は `import/job.rs` の `duplicate_of_original_or_released_version_is_owned`・`download/register.rs` の
+テストの場所：段 2 の保存・版に戻す・下書きは `crates/kura-core/src/edit/save_tests.rs`（S1〜S9・S14・S15・S17）。S14 の取り込み・
+ダウンロードの重複の判定は `import/job.rs` の `duplicate_of_original_or_released_version_is_owned`・`download/register.rs` の
 `download_duplicate_of_original_or_released_version_is_owned` も、S16 は `items.rs` の
-`emptying_the_trash_releases_versions_and_anchors_of_edited_items`。S3・S4・S15 の後半・S17 は段 2 の C、S10〜S13 は段 3 で足す。
+`emptying_the_trash_releases_versions_and_anchors_of_edited_items`。S10〜S13 は段 3 で足す。ほかに、版に戻す先の確かめ
+（`revert_targets_are_checked_before_queueing`）、作り直しが記録と合わなければ何も変えない（`revert_rebuild_that_does_not_match_the_record_is_refused`）、
+戻す先が別のアイテムの今と同じなら Conflict（`revert_to_contents_another_item_holds_is_a_conflict`）、アンカーが壊れていれば元で読み直す
+（`revert_falls_back_to_the_original_when_the_anchor_is_broken`）、置いたあと・コミットの前にゴミ箱に入れられたら置いたファイルと予告が
+片付く（`trashed_between_placement_and_commit_cleans_up_placed_files`）、書いたところで中止・一時停止すると何も残らず、一時停止は続けると
+保存する（`cancel_or_pause_after_writing_leaves_nothing`。上書きと作り直し）、作り直しを 4 段で強制終了しても戻せる
+（`revert_rebuild_crash_at_each_stage_recovers`）。本当に落とす試験は `kura-devtools edit crash-loop`（architecture.md §13）。
 どの S のテストも終わりに、整合性（DB にないファイル・ファイルのない台帳の行・参照されない台帳の行）が 0、予告が空、staging が空、
 版の不変条件（`edit::versions::check_invariants`）が空、保存のジョブが動いていないことを確かめる（`assert_consistent`）。
 
@@ -1138,8 +1155,8 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 |---|---|---|---|
 | S1 | 上書き | アイテム ID・タグ・フォルダ・ユニット・プレイリスト・再生の記録は同じ。hash が変わり、サムネイル・解析は作り直しを待つ。版 0（元）と版 1 ができる | `s1_overwrite_keeps_identity_and_adds_versions_0_and_1` |
 | S2 | 2 回上書き | 版 1 のファイルは消し待ち、元は保持 | `s2_second_overwrite_waits_version_1_and_holds_original` |
-| S3 | 元に戻す | 今が元とバイト単位で同じ。戻した版が足され、前の今は消し待ち（今が版 1 以降のとき。最初の保存の前の今は元そのもので、版 0 が保持する） | 段 2 の C |
-| S4 | 途中の版に戻す | 猶予中ならそのファイルを使い直す。消えたあとは文書から作り直し、値のダイジェストが記録と一致する | 段 2 の C |
+| S3 | 元に戻す | 今が元とバイト単位で同じ。戻した版が足され、前の今は消し待ち（今が版 1 以降のとき。最初の保存の前の今は元そのもので、版 0 が保持する） | `s3_revert_to_original_restores_bytes`（アイテムの列・codec_info が版 0 のものに戻り、所属・表示名は変わらない） |
+| S4 | 途中の版に戻す | 猶予中ならそのファイルを使い直す。消えたあとは文書から作り直し、値のダイジェストが記録と一致する | `s4_revert_reuses_waiting_file`（ファイルを足さず、もう一度戻すと unchanged）・`s4_revert_rebuilds_after_gc`（記録のエンコーダで同じバイト列） |
 | S5 | 別名で保存 | 新しいアイテムと来歴ができ、元のアイテムは変わらない。新しいアイテムの元は元のアイテムの元で、タグ・フォルダ・評価・メモ・出どころを写し、素材の設定は写さない。結果が元のアイテムの元・今と同じなら、そのアイテムを示す | `s5_save_as_inherits_original_and_copies_metadata`・`s5_save_as_matching_original_points_to_it`・`save_as_matching_its_own_current_is_existing` |
 | S6 | 開いたあとに別の保存で今が変わった | Conflict で何も変わらない | `s6_conflict_when_head_changed`・`s6_conflict_when_version_added_with_same_hash`・`saving_a_trashed_item_is_a_conflict` |
 | S7 | 出力が別のアイテム（ゴミ箱のものを含む）の今と同じ | Conflict。files/ に孤立したファイルがない（別のアイテムの元と同じなら通して台帳の行を共有する） | `s7_conflict_with_other_current_including_trash`・`s7_overwrite_matching_other_original_shares_ledger_row` |
@@ -1150,9 +1167,9 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
 | S12 | GC が作り直している間に同じ中身を取り込む | ファイルは消されない | 段 3 |
 | S13 | GC が台帳の行を解放したあと、ファイルを消す前に強制終了 | 開き直すと孤立したファイルが 0 | 段 3 |
 | S14 | 取り込んだファイルが元・消えた過去の版と同じ | そのアイテムの重複になり、孤立したファイルがない | `s14_importing_saved_contents_is_a_duplicate`（本当の保存のあと） |
-| S15 | HEIC の最初の保存 | アンカーが台帳に載り、OS のデコーダを外しても途中の版を作り直せる | `s15_heic_first_save_makes_anchor_and_reads_it_afterwards`（前半：アンカーの行・台帳の行・ファイル・入力の `anchor_id`、2 回目はアンカーから読む）。後半は段 2 の C |
+| S15 | HEIC の最初の保存 | アンカーが台帳に載り、OS のデコーダを外しても途中の版を作り直せる | `s15_heic_first_save_makes_anchor_and_reads_it_afterwards`（前半：アンカーの行・台帳の行・ファイル・入力の `anchor_id`、2 回目はアンカーから読む）・`s15_rebuilds_from_the_anchor_without_the_os_decoder`（後半：デコーダを組から外し、版 1 を GC してから版 1 に戻すとアンカーから作り直せて照合が合う） |
 | S16 | 編集したアイテムでゴミ箱を空にする | 元・猶予中のファイル・アンカーが消え、参照されない台帳の行が 0 | `emptying_the_trash_releases_versions_and_anchors_of_edited_items` |
-| S17 | 下書きのある状態で強制終了 | 同じ文書から戻せる。土台が変わっていれば Conflict | 段 2 の C |
+| S17 | 下書きのある状態で強制終了 | 同じ文書から戻せる。土台が変わっていれば Conflict | `s17_draft_survives_crash_and_conflicts_when_base_changed`（開き直すと同じ根で fresh、保存で消える、間に別の上書きがあれば fresh が偽で保存は Conflict、保存を積んだあとの下書きは土台が付け替わる） |
 
 ## 15. 拡張のシナリオ
 
