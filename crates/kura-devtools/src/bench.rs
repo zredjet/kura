@@ -16,10 +16,17 @@ use kura_core::time::now_ms;
 /// `bench import --src <dir> [--threads N] [--out <dir>]` / `bench backup --library <path>` /
 /// `bench edit …`（編集のベンチ。`bench_edit`）/ `bench migrate …`（マイグレーション。`bench_migrate`）/
 /// `bench analyze …`（解析のジョブ。`bench_analyze`）/ `bench thumbs-job --src <dir> …`（サムネイルのジョブ。`bench_thumbs`）/
-/// `bench svg-worker …`（SVG の働き手の手間。`bench_svg`）。
+/// `bench svg-worker …`（SVG の働き手の手間。`bench_svg`）/ `bench editor …`・`bench save …`（M12 のアプリの道：エディタの
+/// 1 手とタイル、保存のジョブの全体。`bench_app`）。
 pub fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("edit") {
         return crate::bench_edit::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("editor") {
+        return crate::bench_app::editor::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("save") {
+        return crate::bench_app::save::run(&args[1..]);
     }
     if args.first().map(String::as_str) == Some("thumbs-job") {
         return crate::bench_thumbs::run(&args[1..]);
@@ -58,7 +65,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "使い方: kura-devtools bench query --library <path> [--fake-facts] | thumbs --src <dir> [--threads N] \
              | import --src <dir> [--threads N] [--out <dir>] | backup --library <path> | edit [--quick] … \
              | migrate (--library <path> | --items <件数> [--history]) [--runs 3] [--work <dir>] [--json <file>] \
-             | analyze --kind image|audio [--limit N] [--src <dir>] [--work <dir>] [--json <file>]"
+             | analyze --kind image|audio [--limit N] [--src <dir>] [--work <dir>] [--json <file>] \
+             | editor --work <dir> [--threads 4,16] [--runs 3] [--quick] … | save --work <dir> [--threads 4,16] [--runs 3] [--quick] …"
                 .into(),
         ),
     }

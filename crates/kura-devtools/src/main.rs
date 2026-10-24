@@ -36,6 +36,7 @@ static ALLOC: kura_mac::ReturningAllocator = kura_mac::ReturningAllocator::new()
 mod assets;
 mod bench;
 mod bench_analyze;
+mod bench_app;
 mod bench_edit;
 mod bench_facts;
 mod bench_migrate;

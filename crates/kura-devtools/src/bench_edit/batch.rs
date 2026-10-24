@@ -32,7 +32,7 @@ fn at(case: &str) -> impl Fn(EngineError) -> String + '_ {
 /// 保存の 1 回：ファイル `path`（形式 `format`）を読み、元のハッシュを取り、ヘッダの形で計画して予算を確保し（プールの外）、
 /// 一括のプールで読む・描く（出力のダイジェスト込み）・JPEG q90 で書き、`out` に書く。書いたバイト列と、確保した見積もりの
 /// ピーク（バイト）を返す。予算を超える見込みなら描く前に `Limit`。
-pub(super) fn save_once(
+pub(crate) fn save_once(
     rt: &EngineRuntime,
     codecs: &CodecSet,
     graph: &Graph,

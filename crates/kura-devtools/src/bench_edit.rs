@@ -25,7 +25,7 @@
 //!   合成）。
 //! - 出力：表（標準出力に 1 行ずつ）、`--json`（環境・回・レコード）、`--markdown`（architecture.md §13 の M9 の表の形）。
 
-mod batch;
+pub(crate) mod batch;
 mod editor;
 mod mem;
 mod report;
