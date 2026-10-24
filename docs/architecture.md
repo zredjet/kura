@@ -420,6 +420,7 @@ import_start:    ジョブとして実行
 - 「透明度を下げる」がオンなら `<html data-reduce-transparency="true">` を付け、ガラスを不透明な面に置き換える。
 - ファイルのドラッグ＆ドロップは `getCurrentWebview().onDragDropEvent` で受ける（`enter` で重ね表示、`drop` で取り込みシート）。
 - フルスクリーン（M9 のあと。ADR-128）：シアターのボタン・F・緑のボタン・メニューのどれでも、ウィンドウの大きさの変化で状態を読み（`watchFullscreen`）、シアターの右のパネルを閉じる・戻す。出入りが終わったら kura-mac の `keep_webview_focus_on_fullscreen` が WKWebView にキーボードのフォーカスを戻す（そうしないと esc などが届かない）。
+- 窓を閉じるときの画像エディタの未保存の見張り（M12）：エディタに保存していない変更（応えの来ていない手も）がある間だけ、フロントが main の窓の `onCloseRequested` を受けて閉じるのを止め、「編集を保存しますか？」のシートを出す（`editorSave.ts` の `watchWindowClose`）。答えが出たら（［保存しない］は下書きを捨て終えてから、［保存］は保存が終わってから）受け口を外して `destroy()` で窓を壊す（閉じる要求の受け口があると Tauri は窓を閉じないため）。そのために main の窓の権限（`capabilities/default.json`。main だけ）に `core:window:allow-destroy` を足した。⌘Q（アプリの終了）は止めず、Rust がエディタを閉じるときに置く下書きで次に戻せる。
 - `backgroundThrottling: "disabled"`（M5）：既定では、ウィンドウがほかのウィンドウに隠れると WebKit が動画の再生開始や CSS アニメーションを止め、再生キューが動画のところで止まる。メディアプレーヤーなので隠れていても再生を続ける（ADR-72）。
 - メニューバーはフロントで組む（`src/app/appMenu.ts`）。文言は ja.ts。「すべてを選択」（⌘A）だけは自前の項目で、入力欄なら文字、それ以外は一覧のすべてを選ぶ（ADR-76）。Kura の操作の項目は、押すとそのキーのイベントをフォーカスのある要素から送る（`replayKey`）ので、キーの処理と同じ条件で動く。表示形式・まとめて表示のチェックとサイドバーの項目の文字は、表示の設定に合わせて書き換える（ADR-116）。「項目 › ドット絵として表示 ▸」（M11）はキーを送らず、一覧で選んでいる画像に直接当てる（`pixelArtMenu.ts` の `applyPixelArtToSelection`。右クリックの ▸ と同じ当て方）。▸ の無効とチェックは、選択・表示・一覧のキャッシュの変化を 100ms にまとめて合わせ直す（`pixelArtSyncer`。ADR-160 (3)）。アプリの言語は `src-tauri/Info.plist` で日本語と宣言し、OS が出す文言も日本語にする（ADR-77）。
 - 署名は個人利用なのでアドホック署名（`bundle.macOS.signingIdentity: "-"`）。App Store には出さない。
