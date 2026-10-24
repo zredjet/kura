@@ -629,10 +629,9 @@ const SUMMARY_COLUMNS: &str = "i.id, i.hash, i.ext, i.kind, i.width, i.height, i
                                f.has_loop, s.pixel_art, s.grid_json";
 /// `SUMMARY_COLUMNS` の列数（続けて読む列の位置に使う）。
 const SUMMARY_LEN: usize = 24;
-/// 概要の表：アイテム（主キー）→ 台帳（hash の UNIQUE）→ 事実（blob_id の主キー）、設定（item_id の主キー）。
+/// 概要の表：アイテム（主キー）→ 事実（台帳の行の ID `items.blob_id` で、事実の主キー）、設定（item_id の主キー）。
 const SUMMARY_FROM: &str = "items i
-     LEFT JOIN blobs b ON b.hash = i.hash
-     LEFT JOIN media_facts f ON f.blob_id = b.id
+     LEFT JOIN media_facts f ON f.blob_id = i.blob_id
      LEFT JOIN asset_settings s ON s.item_id = i.id";
 
 /// 0 以上で u32 に収まる整数（ほかは None）。
@@ -1154,8 +1153,8 @@ mod tests {
         assert!(summaries(&conn, &vec![1; MAX_SUMMARIES + 1]).is_err());
     }
 
-    /// タイルの詳細（`summaries`・`detail`）は、事実を台帳の行（blobs）から、設定をアイテムの主キーから引く。
-    /// 200 件の IN でも items・blobs・media_facts・asset_settings のどれも全件走査しない。
+    /// タイルの詳細（`summaries`・`detail`）は、事実を台帳の行の ID（`items.blob_id`）から、設定をアイテムの主キーから引く。
+    /// 200 件の IN でも items・media_facts・asset_settings のどれも全件走査しない（台帳 blobs は通らない）。
     #[test]
     fn summaries_join_facts_and_settings_without_scanning() {
         let conn = test_conn();
@@ -1164,11 +1163,8 @@ mod tests {
             let sql = summaries_sql(n).replace(&vec!["?"; n].join(", "), &marks);
             let plan = query_plan(&conn, &sql);
             assert!(!plan.contains("SCAN"), "{n} 件:\n{plan}");
-            for (table, how) in [
-                ("b", "sqlite_autoindex_blobs_1"),
-                ("f", "INTEGER PRIMARY KEY"),
-                ("s", "INTEGER PRIMARY KEY"),
-            ] {
+            assert!(!plan.contains("blobs"), "{n} 件:\n{plan}");
+            for (table, how) in [("f", "INTEGER PRIMARY KEY"), ("s", "INTEGER PRIMARY KEY")] {
                 assert!(
                     plan.contains(&format!("SEARCH {table} USING")) && plan.contains(how),
                     "{table} を {how} で引く:\n{plan}"

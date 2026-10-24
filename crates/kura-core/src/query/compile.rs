@@ -559,7 +559,7 @@ impl Compiler<'_> {
         ));
     }
 
-    /// 解析の事実の条件（`i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b … WHERE …)`。
+    /// 解析の事実の条件（`i.blob_id IN (SELECT f.blob_id FROM media_facts f WHERE …)`。
     /// 部分索引から集合を作り、相関した EXISTS にしない）。事実がない・計れない値（NULL）はどの比較にも入らない。
     fn fact(&self, cond: &FieldCond, out: &mut SqlCond) {
         match cond {
@@ -753,11 +753,10 @@ fn no_grid() -> String {
     format!("i.id NOT IN ({})", asset::grid_items_sql())
 }
 
-/// 事実の条件を、アイテムのハッシュの集合にする。
+/// 事実の条件を、台帳の行の ID（`items.blob_id`。0010）の集合にする。整数の鍵で引くので、一致が数万件の広い条件も速い
+/// （M11 の決定 17。32 バイトのハッシュで引くと 6〜9 万件で 43〜114ms だった）。
 fn facts_in(cond: &str) -> String {
-    format!(
-        "i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE {cond})"
-    )
+    format!("i.blob_id IN (SELECT f.blob_id FROM media_facts f WHERE {cond})")
 }
 
 /// 事実の数の比較（NULL は `!=` を含むどの比較にも入らない）。

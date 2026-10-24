@@ -13,7 +13,7 @@
 //!   すべての欄が自動（NULL）に戻れば行を消す（「変えたアイテムにだけ行がある」）。
 //! - 格子は、セルが 1 つもできない値と、セルの数を超えるコマの数を断る（大きさの分からない画像は、セルの幅・高さが
 //!   1 以上かだけを見る）。帯で使うコマの数は [`anim::MAX_FRAMES`] まで。
-//! - DB だけを読む（ファイルは読まない）。中身に依る事実は台帳の行（blobs.id）を経て引く。
+//! - DB だけを読む（ファイルは読まない）。中身に依る事実は台帳の行の ID（`items.blob_id`。0010）で引く。
 
 pub mod anim;
 pub mod pcm;
@@ -334,8 +334,7 @@ const GET_SQL: &str = "SELECT i.id, i.hash, i.ext, i.kind, i.width, i.height, i.
             s.item_id, s.pixel_art, s.pixel_scale, s.grid_json, s.frame_ms, s.pivot_x, s.pivot_y,
             s.loop_start, s.loop_end, s.anim_tag, s.updated_at
      FROM items i
-     LEFT JOIN blobs b ON b.hash = i.hash
-     LEFT JOIN media_facts f ON f.blob_id = b.id
+     LEFT JOIN media_facts f ON f.blob_id = i.blob_id
      LEFT JOIN asset_settings s ON s.item_id = i.id
      WHERE i.id = ?1";
 

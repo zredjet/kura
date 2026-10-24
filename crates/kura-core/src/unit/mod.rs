@@ -309,13 +309,12 @@ pub struct UnitSummary {
     pub last_played_at: Option<i64>,
 }
 
-/// 表紙の問い合わせ（アイテムの概要と同じく、事実は台帳の行から、設定はアイテムの主キーから引く）。
+/// 表紙の問い合わせ（アイテムの概要と同じく、事実は台帳の行の ID（`items.blob_id`）から、設定はアイテムの主キーから引く）。
 const COVER_SQL: &str =
     "SELECT i.hash, i.kind, i.thumb_state, i.width, i.height, i.thumb_rev, i.analysis_state, f.alpha,
             f.pixel_art, s.pixel_art
      FROM items i
-     LEFT JOIN blobs b ON b.hash = i.hash
-     LEFT JOIN media_facts f ON f.blob_id = b.id
+     LEFT JOIN media_facts f ON f.blob_id = i.blob_id
      LEFT JOIN asset_settings s ON s.item_id = i.id
      WHERE i.id = ?1";
 

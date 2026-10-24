@@ -287,7 +287,7 @@ mod tests {
         }
     }
 
-    /// 1 つ前の版（0009 を当てる前）のライブラリを作る。
+    /// 1 つ前の版（最後のマイグレーション 0010 を当てる前）のライブラリを作る。
     fn library_before_last_migration(root: &Path) {
         let library = kura_core::library::Library::create(root).unwrap();
         let before = kura_core::db::MIGRATIONS.len() - 1;
@@ -295,8 +295,8 @@ mod tests {
             .db()
             .write(move |tx| {
                 tx.execute_batch(&format!(
-                    "DROP TABLE asset_settings; DROP TABLE analysis_results; DROP TABLE media_facts;
-                     PRAGMA user_version = {before};"
+                    "DROP TRIGGER items_blob_id_ai; DROP TRIGGER items_blob_id_au; DROP INDEX idx_items_blob;
+                     ALTER TABLE items DROP COLUMN blob_id; PRAGMA user_version = {before};"
                 ))?;
                 Ok(())
             })

@@ -42,4 +42,7 @@ paths:
 - `items` の `hash`・`ext`・`size_bytes` は台帳 `blobs` の写し（0007 のトリガ `items_blob_bi`・`items_blob_bu` が載せ、食い違えば
   `items_blob_mismatch` で断る）。台帳の行を消すのは `library::ledger::release` だけ（どの表からも参照されない行だけを消す）。
 - 中身に依る書き込み（解析・サムネイル・プロキシの結果）は `WHERE id = ? AND hash = ?` のようにハッシュを条件にする
-  （解析・サムネイルは M11 で入れた。プロキシの今の書き込みは ID と状態だけが条件で、M12 で直す）。
+  （解析・サムネイルは M11、プロキシは M12 で入れた）。
+- `items.blob_id` は台帳の行の ID の写し（0010 の AFTER のトリガ `items_blob_id_ai`・`items_blob_id_au` が hash から引いて入れる）。
+  書き手は blob_id を書かない。中身ごとの表（`media_facts`・`analysis_results`）を items から引くときは、台帳を hash で通らず
+  `i.blob_id` で引く。

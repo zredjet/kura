@@ -1002,6 +1002,63 @@ fn analysis_0009_adds_tables_and_keeps_everything_else() {
     assert!(violations(&conn).unwrap().is_empty());
 }
 
+// ===== 0010（Plain）：items.blob_id（台帳の行の ID の写し。M12）=====
+
+#[test]
+fn items_blob_id_0010_copies_the_ledger_id_and_follows_inserts_and_saves() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, 9).unwrap();
+    assert_eq!(MIGRATIONS[9].name, "0010_items_blob_id");
+    // 当てる前の列だけで比べる（blob_id は増える列）
+    let only = columns(&conn);
+    let before = snapshot_cols(&conn, &only);
+    migrate_until(&mut conn, 10).unwrap();
+    let after = snapshot_cols(&conn, &only);
+    for (key, value) in &before {
+        assert_eq!(after.get(key), Some(value), "{key} が変わった");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(
+        added,
+        vec![
+            "index idx_items_blob",
+            "trigger items_blob_id_ai",
+            "trigger items_blob_id_au",
+        ]
+    );
+    let mismatched = "SELECT count(*) FROM items i LEFT JOIN blobs b ON b.hash = i.hash
+                       WHERE i.blob_id IS NOT b.id OR i.blob_id IS NULL";
+    assert!(one::<i64>(&conn, "SELECT count(*) FROM items") > 0);
+    assert_eq!(one::<i64>(&conn, mismatched), 0);
+    // 取り込み（INSERT）と保存（hash・ext・size を 1 つの UPDATE で変える）に追従する。台帳の ID と items の ID は
+    // ずらしておく（seed では偶然そろう）
+    conn.execute_batch(&format!(
+        "INSERT INTO blobs (hash, ext, size_bytes, created_at) VALUES ({a}, 'png', 1, 1), ({b}, 'png', 2, 1);
+         INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+           VALUES (900, {b}, 'png', 'image', 2, 't', 't', 1, 1);
+         UPDATE items SET hash = {c}, ext = 'webp', size_bytes = 3, updated_at = 2 WHERE id = 1;",
+        a = h(21),
+        b = h(22),
+        c = h(23)
+    ))
+    .unwrap();
+    let blob =
+        |hash: String| -> i64 { one(&conn, &format!("SELECT id FROM blobs WHERE hash = {hash}")) };
+    let item =
+        |id: i64| -> i64 { one(&conn, &format!("SELECT blob_id FROM items WHERE id = {id}")) };
+    assert_ne!(blob(h(22)), 900);
+    assert_eq!(item(900), blob(h(22)));
+    assert_eq!(item(1), blob(h(23)));
+    assert_eq!(one::<i64>(&conn, mismatched), 0);
+    // タイトルなどの UPDATE では動かない（FTS のトリガは別）。台帳の行の ID で引く索引を使う
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT i.id FROM items i WHERE i.blob_id IN (SELECT f.blob_id FROM media_facts f WHERE f.alpha > 0)",
+    );
+    assert!(plan.contains("idx_items_blob"), "{plan}");
+    assert!(violations(&conn).unwrap().is_empty());
+}
+
 #[test]
 fn fixture_fills_every_table_at_the_latest_version() {
     // 新しい表も、準備で行を入れる（次に items や blobs を作り直すとき、子が残ることを確かめられるように）
@@ -1144,7 +1201,7 @@ fn ledger_and_facts_queries_use_their_indexes() {
     let plan = crate::db::query_plan(
         &conn,
         "SELECT i.id FROM items i WHERE i.trashed_at IS NULL
-           AND i.hash IN (SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE f.alpha > 0)
+           AND i.blob_id IN (SELECT f.blob_id FROM media_facts f WHERE f.alpha > 0)
          ORDER BY i.imported_at DESC, i.id DESC",
     );
     assert!(
@@ -1162,8 +1219,7 @@ fn tile_details_join_facts_and_settings_without_scanning() {
         "SELECT i.id, i.analysis_state, i.thumb_rev, f.alpha, coalesce(s.pixel_art, f.pixel_art), f.frame_count,
                 f.has_loop OR s.loop_start IS NOT NULL
            FROM items i
-           LEFT JOIN blobs b ON b.hash = i.hash
-           LEFT JOIN media_facts f ON f.blob_id = b.id
+           LEFT JOIN media_facts f ON f.blob_id = i.blob_id
            LEFT JOIN asset_settings s ON s.item_id = i.id
           WHERE i.id IN (1, 2, 3)",
     );

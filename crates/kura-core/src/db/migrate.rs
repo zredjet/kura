@@ -84,6 +84,10 @@ pub const MIGRATIONS: &[Migration] = &[
         "0009_analysis",
         include_str!("../../migrations/0009_analysis.sql"),
     ),
+    plain(
+        "0010_items_blob_id",
+        include_str!("../../migrations/0010_items_blob_id.sql"),
+    ),
 ];
 
 /// 当てたマイグレーション 1 つ。
