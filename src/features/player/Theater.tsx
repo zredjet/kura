@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
+import { type PointerEvent, type ReactNode, useCallback, useEffect, useState } from 'react';
 
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
 import { ExpandIcon } from '../../components/icons/ExpandIcon';
@@ -28,7 +28,7 @@ import {
 } from './playerActions';
 import { usePlayerStore } from './playerStore';
 import { SidePanel } from './SidePanel';
-import { canHideControls, HIDE_AFTER_MS } from './theaterChrome';
+import { canHideControls, HIDE_AFTER_MS, hoverTracker } from './theaterChrome';
 import styles from './Theater.module.css';
 import { usePlayerKeys } from './usePlayerKeys';
 
@@ -48,12 +48,12 @@ function isTyping(el: Element | null): boolean {
  */
 function useControlsIdle(visible: boolean): {
   idle: boolean;
-  onPointerEnter: () => void;
+  onPointerEnter: (event: PointerEvent<Element>) => void;
   onPointerLeave: () => void;
 } {
   const playing = usePlayerStore((s) => s.snapshot.playing);
   const [idle, setIdle] = useState(false);
-  const hovering = useRef(false);
+  const [hover] = useState(hoverTracker);
   useEffect(() => {
     if (!visible || !playing) {
       return;
@@ -65,7 +65,7 @@ function useControlsIdle(visible: boolean): {
         const focused = document.activeElement;
         const hide = canHideControls({
           playing: true,
-          hovering: hovering.current,
+          hovering: hover.hovering(),
           focusInControls:
             focused instanceof HTMLElement && focused.closest('[data-chrome]') !== null,
           menuOpen: document.querySelector('[data-sheet], [role="menu"]') !== null,
@@ -88,18 +88,15 @@ function useControlsIdle(visible: boolean): {
     return () => {
       clearTimeout(timer);
       events.forEach((name) => window.removeEventListener(name, wake));
-      // 一時停止・閉じたら出し直す
+      // 一時停止・閉じたら出し直す（閉じたときはポインタの出入りが来ないので、乗っていないことにする）
       setIdle(false);
+      hover.leave();
     };
-  }, [visible, playing]);
+  }, [visible, playing, hover]);
   return {
     idle: idle && visible && playing,
-    onPointerEnter: () => {
-      hovering.current = true;
-    },
-    onPointerLeave: () => {
-      hovering.current = false;
-    },
+    onPointerEnter: (event) => hover.enter(event.currentTarget),
+    onPointerLeave: () => hover.leave(),
   };
 }
 
@@ -146,7 +143,7 @@ export function Theater() {
 /** シアターの操作（上部・再生バー・アニメの操作の行）に付けるもの：隠してよいかを見るための印とポインタの出入り。 */
 export interface ChromeProps {
   'data-chrome': string;
-  onPointerEnter: () => void;
+  onPointerEnter: (event: PointerEvent<Element>) => void;
   onPointerLeave: () => void;
 }
 
