@@ -1229,7 +1229,12 @@ impl<'a> RenderCx<'a> {
                     let mut sub = try_vec(canvas.len(), 0u8)?;
                     self.render_group(f, Some(i), &mut sub)?;
                     let op = s.layer_opacity(l);
-                    for (d, src) in canvas.chunks_exact_mut(4).zip(sub.chunks_exact(4)) {
+                    for (d, src) in canvas
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(sub.as_chunks::<4>().0.iter())
+                    {
                         let back = [d[0], d[1], d[2], d[3]];
                         d.copy_from_slice(&blend::blend(
                             l.blend,
@@ -1379,7 +1384,7 @@ mod tests {
             Value::Frames(f) => crate::imaging::convert::to_rgba8_rows(&f.frames()[0].px).unwrap(),
             Value::Audio(_) => panic!(),
         };
-        for p in out.chunks_exact_mut(4) {
+        for p in out.as_chunks_mut::<4>().0.iter_mut() {
             if p[3] == 0 {
                 p.fill(0);
             }
@@ -1496,8 +1501,10 @@ mod tests {
         let i1 = rgba(&decode(&make(0, [0, 1])).unwrap());
         let over = |under: &[u8], top: &[u8]| -> Vec<u8> {
             let v: Vec<u8> = under
-                .chunks_exact(4)
-                .zip(top.chunks_exact(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(top.as_chunks::<4>().0.iter())
                 .flat_map(|(u, t)| {
                     blend::normal([u[0], u[1], u[2], u[3]], [t[0], t[1], t[2], t[3]], 255)
                 })
@@ -1515,7 +1522,7 @@ mod tests {
     }
 
     fn visible_only(mut v: Vec<u8>) -> Vec<u8> {
-        for p in v.chunks_exact_mut(4) {
+        for p in v.as_chunks_mut::<4>().0.iter_mut() {
             if p[3] == 0 {
                 p.fill(0);
             }

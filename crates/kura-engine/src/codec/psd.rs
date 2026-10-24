@@ -777,7 +777,9 @@ mod tests {
             let rows = |i: &Image| -> Vec<u32> {
                 let r = i.px.to_rows().unwrap();
                 if depth == 16 {
-                    r.chunks_exact(2)
+                    r.as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])))
                         .collect()
                 } else {
@@ -786,7 +788,7 @@ mod tests {
             };
             let (m, s) = (rows(&matted), rows(&straight));
             let tol = if depth == 16 { 2 } else { 1 };
-            for (pm, ps) in m.chunks_exact(4).zip(s.chunks_exact(4)) {
+            for (pm, ps) in m.as_chunks::<4>().0.iter().zip(s.as_chunks::<4>().0.iter()) {
                 assert_eq!(pm[3], ps[3]);
                 if ps[3] == 0 {
                     assert_eq!(&pm[..3], &[0, 0, 0]);

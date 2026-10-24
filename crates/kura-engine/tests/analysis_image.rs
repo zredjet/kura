@@ -141,7 +141,9 @@ fn naive_colors(v: &Value) -> ColorsOutput {
             set.insert(pack(out));
             if is_16(px.format()) {
                 exact &= q
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .all(|c| u16::from_le_bytes([c[0], c[1]]) % 257 == 0);
             }
             if px.format() == PixelFormat::Indexed8 {
@@ -1127,7 +1129,7 @@ fn bench_image_analyses_at_max_pixels() {
     };
     let worst = image(
         Raster::from_tile_fn(n, n, PixelFormat::Rgba8, None, &NoMonitor, |t, out| {
-            for (i, p) in out.chunks_exact_mut(4).enumerate() {
+            for (i, p) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let (x, y) = (t.x as u32 + i as u32 % t.w, t.y as u32 + i as u32 / t.w);
                 p.copy_from_slice(&pal[(hash(x, y) & 255) as usize]);
             }
@@ -1137,7 +1139,7 @@ fn bench_image_analyses_at_max_pixels() {
     );
     let art = image(
         Raster::from_tile_fn(n, n, PixelFormat::Rgba8, None, &NoMonitor, |t, out| {
-            for (i, p) in out.chunks_exact_mut(4).enumerate() {
+            for (i, p) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let (x, y) = (t.x as u32 + i as u32 % t.w, t.y as u32 + i as u32 / t.w);
                 let v = ((x / 4) * 7 + (y / 4) * 13) % 9;
                 p.copy_from_slice(&[v as u8 * 20, 3, 4, if v == 0 { 0 } else { 255 }]);

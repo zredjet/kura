@@ -765,7 +765,7 @@ fn bench_anchor_sizes() {
         None,
         &NoMonitor,
         |rect, out| {
-            for (i, p) in out.chunks_exact_mut(4).enumerate() {
+            for (i, p) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let x = rect.x as u32 + (i as u32 % rect.w);
                 let y = rect.y as u32 + (i as u32 / rect.w);
                 p.copy_from_slice(&[

@@ -18,7 +18,7 @@ use rand_chacha::rand_core::Rng;
 /// 完全に透明な画素の RGB は見えず、その後の合成にも効かない（式が下か上のアルファ 0 の色を使わない）ので、比べる前に 0 にそろえる。
 fn clear_invisible(mut frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     for f in &mut frames {
-        for p in f.chunks_exact_mut(4) {
+        for p in f.as_chunks_mut::<4>().0 {
             if p[3] == 0 {
                 p.fill(0);
             }

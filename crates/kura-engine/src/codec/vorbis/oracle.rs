@@ -100,16 +100,20 @@ impl Record {
 
     pub fn i32s(&self) -> Vec<i32> {
         self.data
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| i32::from_le_bytes(*b))
             .collect()
     }
 
     /// f32 をビット列のまま。
     pub fn f32_bits(&self) -> Vec<u32> {
         self.data
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect()
     }
 
@@ -119,8 +123,10 @@ impl Record {
 
     pub fn i64s(&self) -> Vec<i64> {
         self.data
-            .chunks_exact(8)
-            .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b))
             .collect()
     }
 }

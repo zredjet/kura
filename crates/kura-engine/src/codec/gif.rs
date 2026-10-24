@@ -102,9 +102,13 @@ fn plan(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Plan, EngineError> {
     if w == 0 || h == 0 {
         return Err(err("論理画面の大きさが 0 です"));
     }
-    let global: Option<Vec<[u8; 4]>> = d
-        .global_palette()
-        .map(|p| p.chunks_exact(3).map(|c| [c[0], c[1], c[2], 255]).collect());
+    let global: Option<Vec<[u8; 4]>> = d.global_palette().map(|p| {
+        p.as_chunks::<3>()
+            .0
+            .iter()
+            .map(|c| [c[0], c[1], c[2], 255])
+            .collect()
+    });
     let mut frames = Vec::new();
     while let Some(f) = d.read_next_frame().map_err(err)? {
         if frames.len() as u64 >= limits.max_frames {
@@ -223,7 +227,13 @@ impl Decoder for GifCodec {
             .map_err(err)?;
         let global: Vec<[u8; 4]> = d
             .global_palette()
-            .map(|g| g.chunks_exact(3).map(|c| [c[0], c[1], c[2], 255]).collect())
+            .map(|g| {
+                g.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|c| [c[0], c[1], c[2], 255])
+                    .collect()
+            })
             .unwrap_or_default();
         let mut meta = ImageMeta::default();
         if let Some(icc) = d.icc_profile() {
@@ -259,7 +269,9 @@ impl Decoder for GifCodec {
             // 局所パレットがあるのは Rgba8 のときだけ（計画でそう決めてある）
             let colors: Vec<[u8; 4]> = match &f.palette {
                 Some(local) if !indexed => local
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|c| [c[0], c[1], c[2], 255])
                     .collect(),
                 _ => global.clone(),
@@ -413,7 +425,7 @@ impl Encoder for GifCodec {
         let mut any_transparent = false;
         for (px, _) in &rasters {
             let mut rgba = convert::to_rgba8_rows(px)?;
-            for p in rgba.chunks_exact_mut(4) {
+            for p in rgba.as_chunks_mut::<4>().0 {
                 if p[3] < threshold {
                     p.copy_from_slice(&[0, 0, 0, 0]);
                     any_transparent = true;
@@ -429,7 +441,14 @@ impl Encoder for GifCodec {
         // 不透明な色だけでパレットを作る（透明は別の番号）
         let opaque: Vec<u8> = rgba_frames
             .iter()
-            .flat_map(|f| f.chunks_exact(4).filter(|p| p[3] == 255).flatten().copied())
+            .flat_map(|f| {
+                f.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| p[3] == 255)
+                    .flatten()
+                    .copied()
+            })
             .collect();
         let hist = quantize::histogram(&opaque, mon)?;
         drop(opaque);
@@ -478,7 +497,7 @@ impl Encoder for GifCodec {
                     mon,
                 )?;
                 if let Some(t) = transparent {
-                    for (i, p) in idx.iter_mut().zip(rgba.chunks_exact(4)) {
+                    for (i, p) in idx.iter_mut().zip(rgba.as_chunks::<4>().0.iter()) {
                         if p[3] == 0 {
                             *i = t;
                         }
@@ -757,7 +776,7 @@ mod tests {
                 frames
                     .into_iter()
                     .map(|mut f| {
-                        for p in f.chunks_exact_mut(4) {
+                        for p in f.as_chunks_mut::<4>().0.iter_mut() {
                             if p[3] == 0 {
                                 p.fill(0);
                             }

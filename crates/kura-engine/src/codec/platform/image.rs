@@ -416,7 +416,7 @@ pub fn unpremultiply_rows(fmt: PixelFormat, buf: &mut [u8]) {
             let n = fmt.bytes_per_pixel();
             for px in buf.chunks_exact_mut(n) {
                 let a = u16::from_le_bytes([px[n - 2], px[n - 1]]);
-                for c in px[..n - 2].chunks_exact_mut(2) {
+                for c in px[..n - 2].as_chunks_mut::<2>().0 {
                     let v = unpremultiply_u16(u16::from_le_bytes([c[0], c[1]]), a);
                     c.copy_from_slice(&v.to_le_bytes());
                 }
@@ -465,11 +465,7 @@ mod tests {
         for a in 0..=255u32 {
             for c in 0..=255u32 {
                 let got = u32::from(unpremultiply_u8(c as u8, a as u8));
-                let vimage = if a == 0 {
-                    0
-                } else {
-                    (c.min(a) * 255 + a / 2) / a
-                };
+                let vimage = (c.min(a) * 255 + a / 2).checked_div(a).unwrap_or(0);
                 assert_eq!(got, vimage, "c={c} a={a}");
                 if a > 0 && c <= a {
                     assert_eq!(got, (2 * c * 255 + a) / (2 * a), "c={c} a={a}");
@@ -542,7 +538,9 @@ mod tests {
         }
         unpremultiply_rows(PixelFormat::Rgba16, &mut rgba16);
         let got: Vec<u16> = rgba16
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(

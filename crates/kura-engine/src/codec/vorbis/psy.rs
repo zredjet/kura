@@ -1712,10 +1712,8 @@ pub(crate) fn m3_set_lastmdct(
                 let Some(dst) = lastmdct.get_mut(..n * MAG) else {
                     return;
                 };
-                for (d, &v) in dst.chunks_exact_mut(MAG).zip(logmdct) {
-                    for x in d {
-                        *x = v;
-                    }
+                for (d, &v) in dst.as_chunks_mut::<MAG>().0.iter_mut().zip(logmdct) {
+                    d.fill(v);
                 }
             } else if let Some(dst) = lastmdct.get_mut(..n) {
                 dst.copy_from_slice(logmdct); // next short block
@@ -4215,8 +4213,10 @@ mod tests {
         let bytes = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("{}：{e}（build.py で作る）", path.display()));
         let samples: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         let frames = samples.len() / ch;
         Some(samples.chunks_exact(frames).map(<[f32]>::to_vec).collect())

@@ -556,7 +556,7 @@ mod tests {
                 };
                 let mut r = crate::determinism::rng(u64::from(inn) * 31 + u64::from(out));
                 for _ in 0..40 {
-                    let x0 = (rand_chacha::rand_core::Rng::next_u32(&mut r) % out) as u32;
+                    let x0 = rand_chacha::rand_core::Rng::next_u32(&mut r) % out;
                     let x1 = x0 + 1 + rand_chacha::rand_core::Rng::next_u32(&mut r) % (out - x0);
                     let (s0, s1) = source_span(inn, out, filter, x0, x1);
                     for (x, (a, b)) in reads.iter().enumerate().take(x1 as usize).skip(x0 as usize)

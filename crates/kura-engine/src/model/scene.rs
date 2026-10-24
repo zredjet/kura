@@ -254,7 +254,10 @@ fn texels(px: &Raster) -> Result<Vec<u8>, EngineError> {
                 ((u32::from(u16::from_le_bytes([s[0], s[1]])) * 255 + 32_767) / 65_535) as u8
             };
             let bpp = px.format().bytes_per_pixel();
-            for (s, d) in rows.chunks_exact(bpp).zip(out.chunks_exact_mut(4)) {
+            for (s, d) in rows
+                .chunks_exact(bpp)
+                .zip(out.as_chunks_mut::<4>().0.iter_mut())
+            {
                 d.copy_from_slice(&match px.format() {
                     PixelFormat::Gray16 => [c8(&s[0..]), c8(&s[0..]), c8(&s[0..]), 255],
                     PixelFormat::GrayA16 => [c8(&s[0..]), c8(&s[0..]), c8(&s[0..]), c8(&s[2..])],
@@ -290,9 +293,9 @@ fn shrink(mut t: Texture, max: u32) -> Result<Texture, EngineError> {
                     n += 1;
                 }
                 let o = (y as usize * w2 as usize + x as usize) * 4;
-                if a_sum > 0 {
-                    for (k, s) in sum.iter().enumerate() {
-                        out[o + k] = ((s + a_sum / 2) / a_sum) as u8;
+                for (k, s) in sum.iter().enumerate() {
+                    if let Some(v) = (s + a_sum / 2).checked_div(a_sum) {
+                        out[o + k] = v as u8;
                     }
                 }
                 out[o + 3] = ((a_sum + n / 2) / n.max(1)) as u8;
@@ -587,7 +590,13 @@ fn add_primitive(
     tris.try_reserve_exact(n_tris as usize)
         .map_err(|_| EngineError::Limit("三角形を確保できません".into()))?;
     match mode {
-        4 => tris.extend(indices.chunks_exact(3).map(|c| [c[0], c[1], c[2]])),
+        4 => tris.extend(
+            indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|c| [c[0], c[1], c[2]]),
+        ),
         5 => tris.extend(indices.windows(3).enumerate().map(|(i, w)| {
             if i % 2 == 0 {
                 [w[0], w[1], w[2]]

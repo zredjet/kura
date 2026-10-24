@@ -49,13 +49,17 @@ fn same(fmt: PixelFormat, a: &[u8], b: &[u8], tol: u8) -> bool {
     }
     if is_16(fmt) {
         let t = u32::from(tol) * 257;
-        a.chunks_exact(2).zip(b.chunks_exact(2)).all(|(x, y)| {
-            let (x, y) = (
-                u32::from(u16::from_le_bytes([x[0], x[1]])),
-                u32::from(u16::from_le_bytes([y[0], y[1]])),
-            );
-            x.abs_diff(y) <= t
-        })
+        a.as_chunks::<2>()
+            .0
+            .iter()
+            .zip(b.as_chunks::<2>().0.iter())
+            .all(|(x, y)| {
+                let (x, y) = (
+                    u32::from(u16::from_le_bytes([x[0], x[1]])),
+                    u32::from(u16::from_le_bytes([y[0], y[1]])),
+                );
+                x.abs_diff(y) <= t
+            })
     } else {
         a.iter().zip(b).all(|(x, y)| x.abs_diff(*y) <= tol)
     }

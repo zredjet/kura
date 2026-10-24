@@ -753,7 +753,9 @@ pub fn fuzz_encode(format: &str, data: &[u8]) -> Result<(), String> {
     let samples: Vec<f32> = data
         .get(FUZZ_ENCODE_HEADER..)
         .unwrap_or(&[])
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     let mut planes = vec![Vec::with_capacity(frames); channels];

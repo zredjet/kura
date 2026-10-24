@@ -38,7 +38,9 @@ pub fn description(icc: &[u8]) -> Option<String> {
                 let start = be32(tag, 24)? as usize;
                 let units: Vec<u16> = tag
                     .get(start..start.checked_add(len)?)?
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                     .collect();
                 Some(String::from_utf16_lossy(&units))

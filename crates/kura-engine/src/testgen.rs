@@ -357,7 +357,7 @@ fn photo(w: u32, h: u32, seed: u64) -> Result<Raster, EngineError> {
         None,
         &crate::monitor::NoMonitor,
         |t, out| {
-            for (i, px) in out.chunks_exact_mut(3).enumerate() {
+            for (i, px) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let x = t.x as u32 + i as u32 % t.w;
                 let y = t.y as u32 + i as u32 / t.w;
                 let base = bilinear(0, coarse, x, y);
@@ -507,7 +507,7 @@ fn sprite_sheet(
         None,
         &crate::monitor::NoMonitor,
         |t, out| {
-            for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
+            for (i, chunk) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let x = t.x as u64 + u64::from(i as u32 % t.w);
                 let y = t.y as u64 + u64::from(i as u32 / t.w);
                 let mut color = bg;
@@ -608,7 +608,7 @@ impl InputGen {
                     None,
                     &crate::monitor::NoMonitor,
                     |t, out| {
-                        for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
+                        for (i, chunk) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                             let x = t.x + i64::from(i as u32 % t.w);
                             let y = t.y + i64::from(i as u32 / t.w);
                             let inside =
@@ -636,7 +636,7 @@ impl InputGen {
                     None,
                     &crate::monitor::NoMonitor,
                     |t, out| {
-                        for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
+                        for (i, chunk) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                             let x = t.x as u32 + i as u32 % t.w;
                             let y = t.y as u32 + i as u32 / t.w;
                             let n = (y / cell) * cols + x / cell;
@@ -969,7 +969,7 @@ impl InputGen {
                     None,
                     &crate::monitor::NoMonitor,
                     |t, out| {
-                        for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
+                        for (i, chunk) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                             let x = t.x as u64 + u64::from(i as u32 % t.w);
                             let y = t.y as u64 + u64::from(i as u32 / t.w);
                             let k = (y * u64::from(w) + x) % count;
@@ -1163,8 +1163,11 @@ mod tests {
         );
         let rows = p.px.to_rows().unwrap();
         assert!(
-            rows.chunks_exact(120 * 3)
-                .all(|r| r.chunks_exact(3).any(|c| c != &r[..3]))
+            rows.as_chunks::<{ 120 * 3 }>().0.iter().all(|r| r
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .any(|c| c != &r[..3]))
         );
         let sprite = |fmt| {
             let Value::Image(img) = (InputGen::PixelSprite {

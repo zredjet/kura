@@ -41,7 +41,9 @@ fn rgba16(v: &Value) -> Vec<Vec<u16>> {
             | PixelFormat::Gray16
             | PixelFormat::GrayA16 => {
                 let s: Vec<u16> = rows
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|b| u16::from_le_bytes([b[0], b[1]]))
                     .collect();
                 let ch = px.format().bytes_per_pixel() / 2;
@@ -74,7 +76,7 @@ fn max_diff(a: &[Vec<u16>], b: &[Vec<u16>]) -> u16 {
     let mut m = 0;
     for (x, y) in a.iter().zip(b) {
         assert_eq!(x.len(), y.len(), "大きさ");
-        for (p, q) in x.chunks_exact(4).zip(y.chunks_exact(4)) {
+        for (p, q) in x.as_chunks::<4>().0.iter().zip(y.as_chunks::<4>().0.iter()) {
             let visible = p[3] != 0 || q[3] != 0;
             for c in 0..4 {
                 if c == 3 || visible {
@@ -139,8 +141,10 @@ fn animated_webp_matches_libwebp_compositing() {
         let theirs =
             rgba16(&decode(&format!("webp-anim.magick-{i}.png"), "png").unwrap()).remove(0);
         for (k, (p, q)) in frame
-            .chunks_exact(4)
-            .zip(theirs.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(theirs.as_chunks::<4>().0.iter())
             .enumerate()
         {
             let (x, y) = (k % 40, k / 40);

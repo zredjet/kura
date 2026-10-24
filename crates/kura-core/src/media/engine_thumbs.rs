@@ -668,7 +668,11 @@ pub fn write_pair(
     mon: &dyn Monitor,
 ) -> Result<ThumbFormat, EngineError> {
     let large_rows = rgba8_rows(large)?;
-    let transparent = large_rows.chunks_exact(4).any(|p| p[3] != u8::MAX);
+    let transparent = large_rows
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|p| p[3] != u8::MAX);
     let format = if transparent {
         ThumbFormat::Png
     } else {
@@ -689,7 +693,9 @@ pub fn write_pair(
             ),
             ThumbFormat::Jpeg => {
                 let rgb: Vec<u8> = rows
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|p| [p[0], p[1], p[2]])
                     .collect();
                 (
@@ -922,7 +928,12 @@ mod tests {
         for (x, y) in [(0, 0), (3, 3), (7, 5), (4, 2), (7, 2)] {
             assert_eq!(at(x, y)[3], 0, "({x}, {y}) が透明でない");
         }
-        let opaque = rows.chunks_exact(4).filter(|p| p[3] == 255).count();
+        let opaque = rows
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] == 255)
+            .count();
         assert_eq!(opaque, 6, "2 枚目のフレームを描いた");
 
         // キャンバスいっぱいのフレームは写さずにそのまま
@@ -1103,7 +1114,7 @@ mod tests {
         for px in [&large, &small] {
             assert_eq!(px.2[3], 0, "角が透明でない");
             assert!(
-                px.2.chunks_exact(4).any(|p| p[3] == 255),
+                px.2.as_chunks::<4>().0.iter().any(|p| p[3] == 255),
                 "何も描いていない"
             );
         }

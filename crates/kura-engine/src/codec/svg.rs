@@ -2093,7 +2093,7 @@ impl Decoder for SvgCodec {
             return Err(EngineError::Canceled);
         }
         let mut rows = try_vec(w as usize * h as usize * 4, 0u8)?;
-        for (dst, p) in rows.chunks_exact_mut(4).zip(pixmap.pixels()) {
+        for (dst, p) in rows.as_chunks_mut::<4>().0.iter_mut().zip(pixmap.pixels()) {
             let c = p.demultiply();
             dst.copy_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
         }

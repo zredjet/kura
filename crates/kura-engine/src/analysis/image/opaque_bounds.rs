@@ -360,7 +360,7 @@ mod tests {
         for f in fr.frames() {
             let (w, rows) = (f.px.width() as usize, f.px.to_rows().unwrap());
             let mut b: Option<(i64, i64, i64, i64)> = None;
-            for (i, p) in rows.chunks_exact(4).enumerate() {
+            for (i, p) in rows.as_chunks::<4>().0.iter().enumerate() {
                 if p[3] > 254 {
                     let (x, y) = (f.offset.x + (i % w) as i64, f.offset.y + (i / w) as i64);
                     b = Some(match b {

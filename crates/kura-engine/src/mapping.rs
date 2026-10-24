@@ -299,7 +299,7 @@ pub fn map_image_meta(meta: &ImageMeta, input: Size, map: &SpaceMap) -> (ImageMe
             warnings.push(dropped(&format!("スライス「{}」", s.name)));
             continue;
         };
-        let center = s.center.and_then(&map_rect);
+        let center = s.center.and_then(map_rect);
         if s.center.is_some() && center.is_none() {
             warnings.push(dropped(&format!("スライス「{}」の 9 分割", s.name)));
         }

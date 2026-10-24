@@ -2045,8 +2045,8 @@ mod tests {
         );
         assert_eq!(out.stdout.len() % (4 * channels), 0);
         let mut planes = vec![Vec::new(); channels];
-        for (i, b) in out.stdout.chunks_exact(4).enumerate() {
-            planes[i % channels].push(f32::from_le_bytes(b.try_into().unwrap()));
+        for (i, b) in out.stdout.as_chunks::<4>().0.iter().enumerate() {
+            planes[i % channels].push(f32::from_le_bytes(*b));
         }
         planes
     }

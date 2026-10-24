@@ -484,7 +484,7 @@ mod mac_tests {
                     assert_eq!(alpha_at(&px, x, y), 0, "{}: 角が透明でない", src.display());
                 }
                 let mut opaque = 0usize;
-                for p in px.2.chunks_exact(4) {
+                for p in px.2.as_chunks::<4>().0.iter() {
                     if p[3] > 0 {
                         assert_eq!(&p[..3], &[0, 0, 0], "{}: 字が黒でない", src.display());
                     }

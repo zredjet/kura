@@ -170,7 +170,9 @@ impl Part {
 fn exact_in_8bit(fmt: PixelFormat, tile: &[u8]) -> bool {
     !is_16(fmt)
         || tile
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .all(|c| u16::from_le_bytes([c[0], c[1]]) % 257 == 0)
 }
 

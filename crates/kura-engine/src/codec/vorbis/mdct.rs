@@ -510,7 +510,7 @@ mod tests {
             // 奇数番目の bitrev（acc）は i（< n/8）のビットを log2n-1 ビットで反転したもの：0〜n/2 の 4 の倍数を 1 度ずつ。
             // 偶数番目は `(~acc & (n/2-1)) - 1`。
             let mut odd: Vec<i32> = l.bitrev.iter().skip(1).step_by(2).copied().collect();
-            for (k, pair) in l.bitrev.chunks_exact(2).enumerate() {
+            for (k, pair) in l.bitrev.as_chunks::<2>().0.iter().enumerate() {
                 assert_eq!(pair[0], ((!pair[1]) & (n / 2 - 1)) - 1, "n={n} k={k}");
             }
             odd.sort();

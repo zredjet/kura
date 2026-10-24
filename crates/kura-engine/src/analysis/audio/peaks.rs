@@ -357,7 +357,7 @@ impl AnalysisOutput for Peaks {
             let mut data = Vec::new();
             data.try_reserve_exact(len / 2)
                 .map_err(|_| EngineError::Limit("波形の段が大きすぎます".into()))?;
-            for pair in raw.chunks_exact(4) {
+            for pair in raw.as_chunks::<4>().0 {
                 let lo = i16::from_le_bytes([pair[0], pair[1]]);
                 let hi = i16::from_le_bytes([pair[2], pair[3]]);
                 if lo > hi {
@@ -861,7 +861,9 @@ mod tests {
         // data チャンクの整数（ステレオのインターリーブ）
         let at = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
         let ints: Vec<i16> = bytes[at..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]))
             .collect();
         let p = cx_run(&back, &PeaksParams::default());

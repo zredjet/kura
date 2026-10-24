@@ -51,7 +51,7 @@ pub fn seed(node_seed: u64, source_hash: &[u8; 32], purpose: &str) -> u64 {
 pub fn key_from_seed(seed: u64) -> [u8; 32] {
     let mut key = [0u8; 32];
     let mut state = seed;
-    for chunk in key.chunks_exact_mut(8) {
+    for chunk in key.as_chunks_mut::<8>().0 {
         state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         chunk.copy_from_slice(&splitmix64(state).to_le_bytes());
     }

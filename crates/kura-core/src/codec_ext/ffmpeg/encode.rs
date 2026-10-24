@@ -426,7 +426,9 @@ mod tests {
         let v = audio_value(44_100, vec![left, right]);
         let (bytes, stamp) = set.encode_bytes(&v, "mp3", &json!({}), &NoMonitor).unwrap();
         let got: Vec<f32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
         assert_eq!(got, [0.5, -0.5, 0.0, -1.0, 1.0, -1.0, 1.0, 1.0, -0.25, 1.0]);

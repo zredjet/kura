@@ -280,7 +280,7 @@ fn accept(
             }
         }
         for frame in bytes.chunks_exact(fb) {
-            for (p, s) in planes.iter_mut().zip(frame.chunks_exact(4)) {
+            for (p, s) in planes.iter_mut().zip(frame.as_chunks::<4>().0.iter()) {
                 p.push(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
             }
         }

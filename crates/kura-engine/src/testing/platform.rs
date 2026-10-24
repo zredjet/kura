@@ -593,7 +593,7 @@ pub fn premultiply_rows(fmt: PixelFormat, buf: &mut [u8]) {
             let n = fmt.bytes_per_pixel();
             for px in buf.chunks_exact_mut(n) {
                 let a = u64::from(u16::from_le_bytes([px[n - 2], px[n - 1]]));
-                for c in px[..n - 2].chunks_exact_mut(2) {
+                for c in px[..n - 2].as_chunks_mut::<2>().0 {
                     let v = u64::from(u16::from_le_bytes([c[0], c[1]]));
                     c.copy_from_slice(&(((v * a + 32_767) / 65_535) as u16).to_le_bytes());
                 }

@@ -442,7 +442,10 @@ pub(crate) fn ve_envelope_search(
 
             // float *pcm=v->pcm[i]+ve->searchstep*(j);
             let at = base + step as usize * j as usize;
-            for (p, f) in pcm.iter().zip(filter.chunks_exact_mut(VE_BANDS)) {
+            for (p, f) in pcm
+                .iter()
+                .zip(filter.as_chunks_mut::<VE_BANDS>().0.iter_mut())
+            {
                 ret |= ve_amp(ve, gi, &p[at..at + n], &ve.band, f, &mut s);
             }
 

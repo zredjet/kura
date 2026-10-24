@@ -283,7 +283,10 @@ fn rgba8(px: &Raster) -> std::result::Result<Vec<u8>, AnimError> {
     let rows = px.to_rows().map_err(failed)?;
     let bpp = px.format().bytes_per_pixel();
     let mut out = zeroed(rows.len() / bpp * 4)?;
-    for (src, dst) in rows.chunks_exact(bpp).zip(out.chunks_exact_mut(4)) {
+    for (src, dst) in rows
+        .chunks_exact(bpp)
+        .zip(out.as_chunks_mut::<4>().0.iter_mut())
+    {
         let c = read_rgba(px.format(), None, src).map_err(failed)?;
         for (d, v) in dst.iter_mut().zip(c) {
             *d = u8::try_from(down16(v)).unwrap_or(u8::MAX);

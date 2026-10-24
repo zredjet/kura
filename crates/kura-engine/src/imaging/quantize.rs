@@ -74,7 +74,9 @@ pub fn histogram(pixels: &[u8], mon: &dyn Monitor) -> Result<Vec<(u32, u64)>, En
         .map_err(|_| no_room("色の表"))?;
     colors.extend(
         pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| pack([c[0], c[1], c[2], c[3]])),
     );
     sort_cancelable(&mut colors, mon)?;
@@ -274,7 +276,7 @@ pub fn map_with_lookup(
     let mut out: Vec<u8> = Vec::new();
     out.try_reserve_exact(pixels.len() / 4)
         .map_err(|_| EngineError::Limit("番号の表を確保できません".into()))?;
-    for (k, c) in pixels.chunks_exact(4).enumerate() {
+    for (k, c) in pixels.as_chunks::<4>().0.iter().enumerate() {
         if k % 65_536 == 65_535 && mon.canceled() {
             return Err(EngineError::Canceled);
         }
@@ -384,7 +386,14 @@ mod tests {
         let hist = histogram(&px, &NoMonitor).unwrap();
         let pal = palette_for(&hist, 16, &NoMonitor).unwrap();
         assert_eq!(pal.len(), 16);
-        let mut reversed: Vec<u8> = px.chunks_exact(4).rev().flatten().copied().collect();
+        let mut reversed: Vec<u8> = px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .rev()
+            .flatten()
+            .copied()
+            .collect();
         let hist_r = histogram(&reversed, &NoMonitor).unwrap();
         assert_eq!(palette_for(&hist_r, 16, &NoMonitor).unwrap(), pal);
         let idx = map_to_palette(&px, &hist, &pal, &NoMonitor).unwrap();

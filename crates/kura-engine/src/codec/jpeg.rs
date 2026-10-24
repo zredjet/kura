@@ -365,7 +365,7 @@ impl Encoder for JpegCodec {
             PixelFormat::Rgb8 => (px.to_rows()?, jpeg_encoder::ColorType::Rgb),
             PixelFormat::GrayA8 | PixelFormat::Rgba8 | PixelFormat::Indexed8 => {
                 let rgba = convert::to_rgba8_rows(px)?;
-                if rgba.chunks_exact(4).any(|p| p[3] != 255) {
+                if rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 255) {
                     return Err(EngineError::Unsupported(
                         "JPEG は透明を持てません。先に背景を合成してください".into(),
                     ));
@@ -457,9 +457,11 @@ mod tests {
             let Value::Image(img) = &v else { panic!() };
             let rgba = convert::to_rgba8_rows(&img.px).unwrap();
             let rows: Vec<u8> = match fmt {
-                PixelFormat::Gray8 => rgba.chunks_exact(4).map(|p| p[1]).collect(),
+                PixelFormat::Gray8 => rgba.as_chunks::<4>().0.iter().map(|p| p[1]).collect(),
                 _ => rgba
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|p| [p[0], p[1], p[2]])
                     .collect(),
             };

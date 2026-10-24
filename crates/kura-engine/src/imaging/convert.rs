@@ -33,7 +33,10 @@ pub fn expand_into(
     {
         return Err(EngineError::Internal("広げる先の大きさが合いません".into()));
     }
-    for (s, d) in src.chunks_exact(bpp).zip(out.chunks_exact_mut(4)) {
+    for (s, d) in src
+        .chunks_exact(bpp)
+        .zip(out.as_chunks_mut::<4>().0.iter_mut())
+    {
         let rgba =
             match fmt {
                 PixelFormat::Gray8 => [s[0], s[0], s[0], 255],
@@ -143,28 +146,28 @@ pub fn for_each_rgba8_key(
             }
         }
         PixelFormat::GrayA8 => {
-            for p in src.chunks_exact(2) {
+            for p in src.as_chunks::<2>().0 {
                 if !f(key(p[0], p[0], p[0], p[1])) {
                     break;
                 }
             }
         }
         PixelFormat::Rgb8 => {
-            for p in src.chunks_exact(3) {
+            for p in src.as_chunks::<3>().0 {
                 if !f(key(p[0], p[1], p[2], 255)) {
                     break;
                 }
             }
         }
         PixelFormat::Rgba8 => {
-            for p in src.chunks_exact(4) {
+            for p in src.as_chunks::<4>().0 {
                 if !f(key(p[0], p[1], p[2], p[3])) {
                     break;
                 }
             }
         }
         PixelFormat::Gray16 => {
-            for p in src.chunks_exact(2) {
+            for p in src.as_chunks::<2>().0 {
                 let y = d(p[0], p[1]);
                 if !f(key(y, y, y, 255)) {
                     break;
@@ -172,7 +175,7 @@ pub fn for_each_rgba8_key(
             }
         }
         PixelFormat::GrayA16 => {
-            for p in src.chunks_exact(4) {
+            for p in src.as_chunks::<4>().0 {
                 let y = d(p[0], p[1]);
                 if !f(key(y, y, y, d(p[2], p[3]))) {
                     break;
@@ -180,14 +183,14 @@ pub fn for_each_rgba8_key(
             }
         }
         PixelFormat::Rgb16 => {
-            for p in src.chunks_exact(6) {
+            for p in src.as_chunks::<6>().0 {
                 if !f(key(d(p[0], p[1]), d(p[2], p[3]), d(p[4], p[5]), 255)) {
                     break;
                 }
             }
         }
         PixelFormat::Rgba16 => {
-            for p in src.chunks_exact(8) {
+            for p in src.as_chunks::<8>().0 {
                 if !f(key(
                     d(p[0], p[1]),
                     d(p[2], p[3]),

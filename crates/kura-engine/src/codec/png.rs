@@ -552,7 +552,9 @@ fn palette_of(
             let alphas = trns.unwrap_or_default();
             Ok(Some(Palette {
                 colors: rgb
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .enumerate()
                     .map(|(i, c)| [c[0], c[1], c[2], alphas.get(i).copied().unwrap_or(255)])
                     .collect(),
@@ -934,7 +936,7 @@ impl Encoder for PngCodec {
             let mut rows = px.to_rows()?;
             if depth == png::BitDepth::Sixteen {
                 // 値はリトルエンディアン、PNG はビッグエンディアン
-                for pair in rows.chunks_exact_mut(2) {
+                for pair in rows.as_chunks_mut::<2>().0 {
                     pair.swap(0, 1);
                 }
             }
@@ -1644,7 +1646,7 @@ mod tests {
 
     /// 完全に透明な画素の RGB を 0 にそろえる（見えず、後の合成にも効かない）。
     fn visible(mut v: Vec<u8>) -> Vec<u8> {
-        for p in v.chunks_exact_mut(4) {
+        for p in v.as_chunks_mut::<4>().0.iter_mut() {
             if p[3] == 0 {
                 p.fill(0);
             }

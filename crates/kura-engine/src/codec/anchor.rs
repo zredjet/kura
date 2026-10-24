@@ -984,7 +984,7 @@ fn write_png(
     let swap16 = |band: &mut [u8]| {
         if depth == ::png::BitDepth::Sixteen {
             // 値はリトルエンディアン、PNG はビッグエンディアン
-            for pair in band.chunks_exact_mut(2) {
+            for pair in band.as_chunks_mut::<2>().0 {
                 pair.swap(0, 1);
             }
         }
