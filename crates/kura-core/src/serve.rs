@@ -9,6 +9,7 @@
 //! | `/peaks/{hash}` | 波形の段（`peaks/ab/<hash>.peaks`。解析のジョブが書く） |
 //! | `/pcm/{hash}/{start}-{end}` | 試聴用の PCM（WAV。その場で作る。[`crate::asset::pcm`]。元は [`pcm_source`]） |
 //! | `/anim/{hash}/{版}` | アニメの帯（`anim/ab/<hash>-<版>.png`。`item_anim_get` が書く。[`crate::asset::anim`]） |
+//! | `/edit/{session}/{rev}/{段}/{frame}/{tx}/{ty}` | エディタの表示のタイル（M12。RGBA8 の行、`{ty}.png` なら PNG。その場で表示の値から作る。[`crate::edit::editor::tile`]） |
 //!
 //! 受け付け（WebView のラベル・Origin・メソッド）と応答のヘッダ・CSP の確かめは [`access`]。
 
@@ -21,6 +22,9 @@ pub use access::{
 
 use std::path::{Path, PathBuf};
 
+use kura_engine::render::preview::MAX_LEVEL;
+
+use crate::edit::editor::is_session_id;
 use crate::import::{MediaKind, classify, format_id, mime_for};
 use crate::library::{ANIM_V, Layout, ThumbFormat, ThumbSize};
 
@@ -58,26 +62,44 @@ pub enum Route {
         hash: String,
         version: u32,
     },
+    /// エディタの表示のタイル（M12）：セッション・文書の番号・段（0〜3）・フレーム・タイルの位置（1 辺 256、フレームの画像の
+    /// 座標）。`png` なら PNG、ほかは行を詰めた RGBA8。(セッション, rev, 段, フレーム, タイル) の中身は変わらない。
+    Edit {
+        session: String,
+        rev: u64,
+        level: u8,
+        frame: u32,
+        tx: u32,
+        ty: u32,
+        png: bool,
+    },
 }
 
 /// 中身が変わらないものの `Cache-Control`。
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 impl Route {
-    /// 中身が変わらないもの（ハッシュ名のサムネイル・ジャケット・波形の段・アニメの帯）。長くキャッシュしてよい。
+    /// 中身が変わらないもの（ハッシュ名のサムネイル・ジャケット・波形の段・アニメの帯・エディタのタイル）。長くキャッシュして
+    /// よい。
     pub fn immutable(&self) -> bool {
         matches!(
             self,
-            Self::Thumb { .. } | Self::Art { .. } | Self::Peaks { .. } | Self::Anim { .. }
+            Self::Thumb { .. }
+                | Self::Art { .. }
+                | Self::Peaks { .. }
+                | Self::Anim { .. }
+                | Self::Edit { .. }
         )
     }
 
     /// `Cache-Control` の値（付けないなら None）。PCM はその場で作るので残させない。
     pub fn cache_control(&self) -> Option<&'static str> {
         match self {
-            Self::Thumb { .. } | Self::Art { .. } | Self::Peaks { .. } | Self::Anim { .. } => {
-                Some(IMMUTABLE)
-            }
+            Self::Thumb { .. }
+            | Self::Art { .. }
+            | Self::Peaks { .. }
+            | Self::Anim { .. }
+            | Self::Edit { .. } => Some(IMMUTABLE),
             Self::Pcm { .. } => Some("no-store"),
             Self::File { .. } | Self::Play { .. } => None,
         }
@@ -88,6 +110,9 @@ impl Route {
 pub fn parse_route(path: &str) -> Option<Route> {
     let mut parts = path.trim_start_matches('/').split('/');
     let kind = parts.next()?;
+    if kind == "edit" {
+        return parse_edit(parts);
+    }
     let hash = parts.next().filter(|h| is_hash(h))?.to_string();
     let rest = parts.next();
     if parts.next().is_some() {
@@ -115,6 +140,38 @@ pub fn parse_route(path: &str) -> Option<Route> {
     }
 }
 
+/// `/edit/{session}/{rev}/{段}/{frame}/{tx}/{ty}`（`{ty}` は `.png`・`.rgba` を付けてよい）の `edit` より後を読む。セッションは
+/// 小文字の 16 進（1〜64 文字）、段は 0〜[`MAX_LEVEL`]、ほかは符号・空白のない 10 進（あふれたら None）。
+fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
+    let session = parts.next().filter(|s| is_session_id(s))?.to_string();
+    let rev = parse_decimal(parts.next()?)?;
+    let level = u8::try_from(parse_decimal(parts.next()?)?)
+        .ok()
+        .filter(|l| *l <= MAX_LEVEL)?;
+    let frame = u32::try_from(parse_decimal(parts.next()?)?).ok()?;
+    let tx = u32::try_from(parse_decimal(parts.next()?)?).ok()?;
+    let last = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (ty, png) = match last.split_once('.') {
+        Some((ty, "png")) => (ty, true),
+        Some((ty, "rgba")) => (ty, false),
+        Some(_) => return None,
+        None => (last, false),
+    };
+    let ty = u32::try_from(parse_decimal(ty)?).ok()?;
+    Some(Route::Edit {
+        session,
+        rev,
+        level,
+        frame,
+        tx,
+        ty,
+        png,
+    })
+}
+
 /// 符号・空白のない 10 進（u64 にあふれたら None）。
 fn parse_decimal(text: &str) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -140,7 +197,7 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
         Route::Peaks { hash } => layout.peaks_path(hash),
         // アニメの帯（item_anim_get が書く）。並べ方の版が今のものだけ（古い版は残さない）
         Route::Anim { hash, version } if *version == ANIM_V => layout.anim_path(hash),
-        Route::Anim { .. } | Route::Pcm { .. } => return None,
+        Route::Anim { .. } | Route::Pcm { .. } | Route::Edit { .. } => return None,
         Route::Play { hash } => {
             let proxy = layout.proxy_path(hash);
             if proxy.is_file() {
@@ -354,11 +411,61 @@ mod tests {
             (format!("/pcm/{HASH}/0-1"), Some("no-store")),
             (format!("/file/{HASH}"), None),
             (format!("/play/{HASH}"), None),
+            ("/edit/0af/3/0/0/1/2".to_string(), immutable),
         ] {
             let route = parse_route(&path).unwrap();
             assert_eq!(route.cache_control(), expected, "{path}");
             assert_eq!(route.immutable(), expected == immutable, "{path}");
         }
+    }
+
+    /// エディタのタイル：セッション（小文字の 16 進）・rev・段（0〜3）・フレーム・タイル。`.png` で PNG、`.rgba` か拡張子なしで
+    /// RGBA8。ファイルではないので resolve は None。ほかの綴りは 404 になる（None）。
+    #[test]
+    fn parses_edit_tile_routes() {
+        let edit = |rev, level, frame, tx, ty, png| Route::Edit {
+            session: "3fa9c0de".into(),
+            rev,
+            level,
+            frame,
+            tx,
+            ty,
+            png,
+        };
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/12/2/0/3/4"),
+            Some(edit(12, 2, 0, 3, 4, false))
+        );
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/12/0/1/3/4.png"),
+            Some(edit(12, 0, 1, 3, 4, true))
+        );
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/0/3/0/0/0.rgba"),
+            Some(edit(0, 3, 0, 0, 0, false))
+        );
+        let long = "a".repeat(64);
+        assert!(parse_route(&format!("/edit/{long}/1/0/0/0/0")).is_some());
+        for bad in [
+            "/edit/3fa9c0de/12/4/0/0/0".to_string(),       // 段は 3 まで
+            "/edit/3FA9/12/0/0/0/0".to_string(),           // 大文字
+            "/edit/xyz/12/0/0/0/0".to_string(),            // 16 進でない
+            format!("/edit/{}/1/0/0/0/0", "a".repeat(65)), // 長すぎる
+            "/edit//12/0/0/0/0".to_string(),
+            "/edit/3fa9/12/0/0/0".to_string(),     // 足りない
+            "/edit/3fa9/12/0/0/0/0/0".to_string(), // 多い
+            "/edit/3fa9/12/0/0/0/0.jpg".to_string(),
+            "/edit/3fa9/12/0/0/0/.png".to_string(),
+            "/edit/3fa9/-1/0/0/0/0".to_string(),
+            "/edit/3fa9/1/0/0/0/+1".to_string(),
+            "/edit/3fa9/1/0/4294967296/0/0".to_string(), // フレームが u32 を超える
+            "/edit/3fa9/18446744073709551616/0/0/0/0".to_string(),
+        ] {
+            assert_eq!(parse_route(&bad), None, "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        assert_eq!(resolve(&layout, &edit(1, 0, 0, 0, 0, true)), None);
     }
 
     fn put(path: &Path, bytes: &[u8]) {

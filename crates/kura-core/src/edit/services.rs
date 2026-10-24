@@ -21,6 +21,7 @@ use std::time::Instant;
 
 pub use kura_engine::codec::CodecSet;
 
+use super::editor::Editor;
 use super::runtime::{EngineRuntime, RuntimeConfig};
 use crate::Result;
 use crate::asset::pcm::{CACHE_TTL, PcmCache};
@@ -49,6 +50,8 @@ pub struct EngineServices {
     codecs: Mutex<Option<Arc<CodecSet>>>,
     /// 試聴の PCM の読んだ結果の置き場（このライブラリの分。見張りのスレッドは覚えたときだけ起きる）。
     pcm: Arc<PcmCache>,
+    /// 開いているエディタ（ライブラリに 1 つ。M12。kura:// の `/edit` もここから引く）。
+    editor: Mutex<Option<Arc<Editor>>>,
 }
 
 impl EngineServices {
@@ -61,6 +64,49 @@ impl EngineServices {
             runtime_init: Mutex::new(()),
             codecs: Mutex::new(None),
             pcm: PcmCache::new(CACHE_TTL),
+            editor: Mutex::new(None),
+        }
+    }
+
+    fn editor_slot(&self) -> std::sync::MutexGuard<'_, Option<Arc<Editor>>> {
+        self.editor.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 開いているエディタ（なければ None）。
+    pub fn current_editor(&self) -> Option<Arc<Editor>> {
+        self.editor_slot().clone()
+    }
+
+    /// セッション `session` のエディタ（今のエディタのセッションでなければ None）。
+    pub fn editor_for(&self, session: &str) -> Option<Arc<Editor>> {
+        self.editor_slot()
+            .as_ref()
+            .filter(|e| e.id() == session)
+            .cloned()
+    }
+
+    /// エディタを置く（前のエディタがあれば閉じる。開く途中から置き、閉じる・ほかを開くと読みを止められるようにする）。
+    pub(crate) fn install_editor(&self, editor: Arc<Editor>) {
+        let old = self.editor_slot().replace(editor);
+        if let Some(old) = old {
+            old.shutdown();
+        }
+    }
+
+    /// エディタを置き場から外す（`session` を渡せば、そのセッションのときだけ）。閉じるのは呼び手（`Editor::shutdown`）。
+    pub(crate) fn take_editor(&self, session: Option<&str>) -> Option<Arc<Editor>> {
+        let mut slot = self.editor_slot();
+        match session {
+            Some(id) if slot.as_ref().is_some_and(|e| e.id() != id) => None,
+            _ => slot.take(),
+        }
+    }
+
+    /// 開いているエディタを閉じる（エディタを閉じる・ライブラリを閉じる・切り替える・終了のどれでも同じ：中止 → キャッシュ
+    /// を空に → 確保を落とす → 取り置きを 0。docs/editing.md §12.10）。
+    pub fn close_editor(&self) {
+        if let Some(editor) = self.take_editor(None) {
+            editor.shutdown();
         }
     }
 
@@ -148,6 +194,7 @@ impl Drop for EngineServices {
     /// 閉じるとき：試聴の PCM で覚えていた音声と予算の確保をすぐ手放す（TTL の見張りは置き場への強い参照を持って待つので、
     /// 置き場が捨てられるのを待たずに空にする）。
     fn drop(&mut self) {
+        self.close_editor();
         self.pcm.clear();
     }
 }

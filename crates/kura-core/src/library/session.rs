@@ -344,6 +344,10 @@ impl LibrarySession {
     /// 閉じる。実行中のジョブは次回の起動で再開する。最後に DB を閉じてライブラリのロックを放す（`Arc` で握られた
     /// ライブラリが残っても、開き直し・ほかのアプリが当たらない）。
     pub fn close(&self) {
+        // エディタを閉じる（中止 → キャッシュを空に → 確保を落とす → 取り置きを 0。待っている下書きは DB を閉じる前に置く）
+        if let Some(engine) = &self.engine {
+            engine.close_editor();
+        }
         self.wait_ready();
         self.jobs.shutdown();
         if let Ok(mut backup) = self.backup.lock() {

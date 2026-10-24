@@ -1,9 +1,10 @@
 //! 編集（docs/editing.md）のうち、エンジン（kura-engine）を動かす側の部品。文書の部品（[`store`]）・版（[`versions`]）・
-//! アンカー（[`anchors`]）・保存のジョブ（[`save`]。上書き・別名・版に戻す。M12 の段 2）・下書き（[`drafts`]）。エディタの
-//! セッション・一括のジョブは M12〜M14 でここに足す。
+//! アンカー（[`anchors`]）・保存のジョブ（[`save`]。上書き・別名・版に戻す。M12 の段 2）・下書き（[`drafts`]）・エディタの
+//! セッション（[`editor`]。M12 の段 4）。一括のジョブは M14 でここに足す。
 
 pub mod anchors;
 pub mod drafts;
+pub mod editor;
 pub mod runtime;
 pub mod save;
 #[cfg(test)]
