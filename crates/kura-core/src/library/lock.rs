@@ -77,6 +77,18 @@ impl LibraryLock {
         })
     }
 
+    /// 落ちたときと同じく、ロックを外さずにファイルを閉じる（テスト用。flock は開いたファイルごとなので、ファイルを継いだ
+    /// プロセスがなければ OS が外す）。
+    #[cfg(test)]
+    pub(crate) fn abandon(&self) {
+        drop(
+            self.file
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+
     /// ライブラリのフォルダ（取ったときに渡した場所）。
     pub fn root(&self) -> &Path {
         &self.root
@@ -142,6 +154,23 @@ fn lock_unsupported(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ロックを取ったあとに起動した子プロセスは、ロックのファイルを継がない（std は O_CLOEXEC で開く）。落ちたときと同じく
+    /// 外さずに閉じても、子が生きている間に取り直せる（継いでいれば、子が終わるまで自分のライブラリを断られる）。
+    #[test]
+    fn children_do_not_inherit_the_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = LibraryLock::acquire(dir.path()).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        lock.abandon();
+        let again = LibraryLock::acquire(dir.path());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(again.unwrap().is_held());
+    }
 
     #[test]
     fn a_second_lock_on_the_same_library_is_refused_until_released() {

@@ -735,8 +735,9 @@ mod tests {
         assert_eq!(second.integrity().unwrap().staging_removed, 1);
     }
 
-    /// 閉じると、DB を閉じてからロックを放す。開いている間に子プロセスを起動していても（std は O_CLOEXEC で開くので継が
-    /// れない）、IPC の代わりに `Arc<Library>` を握っていても、閉じたらすぐ開き直せる。握っている側の DB は閉じている。
+    /// 閉じると、DB を閉じてからロックを明示的に外す。開いている間に子プロセスを起動していても、IPC の代わりに
+    /// `Arc<Library>` を握っていても、閉じたらすぐ開き直せる。握っている側の DB は閉じている（子がロックのファイルを
+    /// 継がないことは、外さずに閉じる道の `lock::tests::children_do_not_inherit_the_lock_file` が確かめる）。
     #[test]
     fn close_releases_the_lock_despite_children_and_held_arcs() {
         let dir = tempfile::tempdir().unwrap();
