@@ -6,7 +6,8 @@ const t = ja.settings;
 
 /**
  * 整合性チェックの結果の一行（設定のライブラリ）。ファイルがない項目・DB にないファイル・どの項目も使っていない
- * ファイル（台帳の行。M11）のうち 0 でないものを並べる。書きかけを片付けた数（`stagingRemoved`）は問題に数えない。
+ * ファイル（台帳の行。M11）のうち 0 でないものを並べる。書きかけを片付けた数（`stagingRemoved`）と、GC が照合が合わずに
+ * 残した版・7 日を過ぎた消し待ちの版（`keptVersions`・`overdueVersions`。M12 の段 3。表示は段 5）は問題に数えない。
  */
 export function integritySummary(integrity: IntegrityDto): { healthy: boolean; text: string } {
   const issues = [

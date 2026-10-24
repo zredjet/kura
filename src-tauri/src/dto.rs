@@ -63,6 +63,12 @@ pub struct IntegrityDto {
     pub orphan_files: u64,
     /// どの表からも参照されない台帳の行の数（M11。docs/data-model.md §4）。
     pub unreferenced_blobs: u64,
+    /// GC の照合が合わずにファイルを残した版の数（M12 の段 3。問題には数えない。設定の「いま確かめる」だけで数え、起動時は
+    /// null）。
+    pub kept_versions: Option<u64>,
+    /// 7 日とバックアップの条件を満たしたのに、まだ消していない消し待ちの版の数（M12 の段 3。問題には数えない。いま確かめる
+    /// ときだけ数え、起動時は null）。
+    pub overdue_versions: Option<u64>,
 }
 
 impl From<IntegrityReport> for IntegrityDto {
@@ -72,6 +78,8 @@ impl From<IntegrityReport> for IntegrityDto {
             missing_files: r.missing_files,
             orphan_files: r.orphan_files,
             unreferenced_blobs: r.unreferenced_blobs,
+            kept_versions: r.kept_versions,
+            overdue_versions: r.overdue_versions,
         }
     }
 }

@@ -1376,6 +1376,16 @@ export type IntegrityDto = {
 	orphanFiles: number,
 	/**  どの表からも参照されない台帳の行の数（M11。docs/data-model.md §4）。 */
 	unreferencedBlobs: number,
+	/**
+	 *  GC の照合が合わずにファイルを残した版の数（M12 の段 3。問題には数えない。設定の「いま確かめる」だけで数え、起動時は
+	 *  null）。
+	 */
+	keptVersions: number | null,
+	/**
+	 *  7 日とバックアップの条件を満たしたのに、まだ消していない消し待ちの版の数（M12 の段 3。問題には数えない。いま確かめる
+	 *  ときだけ数え、起動時は null）。
+	 */
+	overdueVersions: number | null,
 };
 
 /**  検証の指摘 1 つ。 */
