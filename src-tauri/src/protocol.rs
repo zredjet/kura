@@ -1,6 +1,7 @@
 //! `kura://localhost/...` のカスタムプロトコル（docs/architecture.md §4）。
 //! サムネイル・ジャケット・元ファイル・再生用ファイル・波形の段・アニメの帯を返す。Range は 1 区間・1 回 4MB まで。
 //! 試聴の PCM（`/pcm`）はその場で WAV にして返す（kura-core の `asset::pcm`。ジョブにしない。決定 8）。
+//! エディタの表示のタイル（`/edit`。M12）は、エディタが表示した今か直前の値からその場で作る（kura-core の `edit::editor::tile`）。
 //!
 //! 受け付けの判定（WebView のラベル・Origin・メソッド）と応答のヘッダは kura-core の `serve::access`
 //! （§4.1。CI で回す純粋な関数）が決め、ここは HTTP の型に写すだけ。
@@ -12,6 +13,7 @@ use std::sync::Arc;
 
 use kura_core::asset::pcm;
 use kura_core::edit::EngineServices;
+use kura_core::edit::editor::{TileFormat, TileRequest, tile};
 use kura_core::library::Layout;
 use kura_core::serve::{
     ALLOWED_METHODS, Admit, AppOrigin, RangeRequest, Route, admit, content_type, parse_range,
@@ -153,6 +155,31 @@ fn answer(
     if let Route::Pcm { hash, start, end } = &route {
         return pcm_response(served, hash, *start, *end, route.cache_control(), head);
     }
+    if let Route::Edit {
+        session,
+        rev,
+        level,
+        frame,
+        tx,
+        ty,
+        png,
+    } = &route
+    {
+        let req = TileRequest {
+            session,
+            rev: *rev,
+            level: *level,
+            frame: *frame,
+            tx: *tx,
+            ty: *ty,
+            format: if *png {
+                TileFormat::Png
+            } else {
+                TileFormat::Rgba
+            },
+        };
+        return edit_response(served, &req, route.cache_control(), head);
+    }
     let Some(file) = resolve(served.layout, &route) else {
         return empty(StatusCode::NOT_FOUND);
     };
@@ -193,6 +220,42 @@ fn pcm_response(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "audio/wav")
         .header(header::CONTENT_LENGTH, len);
+    if let Some(cache_control) = cache_control {
+        builder = builder.header(header::CACHE_CONTROL, cache_control);
+    }
+    builder
+        .body(if head { Vec::new() } else { body })
+        .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+/// エディタの表示のタイル（RGBA8 の行か PNG）をその場で作って返す（Range は見ない）。表示した今か直前の rev・段の有効な
+/// タイルでなければ 404、エンジンがなければ 503。中身は (セッション, rev, 段, フレーム, タイル) で決まるので immutable。
+fn edit_response(
+    served: &Served<'_>,
+    req: &TileRequest<'_>,
+    cache_control: Option<&str>,
+    head: bool,
+) -> Response<Vec<u8>> {
+    let Some(engine) = served.engine else {
+        return empty(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let body = match tile::serve(engine, req) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::debug!(%err, session = req.session, rev = req.rev, "kura:// のエディタのタイルを返せません");
+            let code =
+                StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return empty(code);
+        }
+    };
+    let content_type = match req.format {
+        TileFormat::Png => "image/png",
+        TileFormat::Rgba => "application/octet-stream",
+    };
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, body.len());
     if let Some(cache_control) = cache_control {
         builder = builder.header(header::CACHE_CONTROL, cache_control);
     }
@@ -634,6 +697,165 @@ mod tests {
             );
             assert_decorated(&r, &origin, &path);
         }
+    }
+
+    /// エディタのタイル（/edit）：開いたエディタが表示した rev・段の有効なタイルは 200（RGBA8 の行と PNG。immutable）、古い
+    /// rev・違う段・範囲の外・知らないセッション・読めない綴りは 404、エンジンがなければ 503。どの応答にも 4 つのヘッダ。
+    /// main でない WebView は受け付けで 403（ファイルにもエディタにも触らない）。
+    #[test]
+    fn edit_tiles_are_served_from_the_open_editor() {
+        use kura_core::edit::editor::{self, EditorEnv, OpenRequest, Viewport};
+        use kura_core::import::{ImportInput, ImportOptions, start_import};
+        use kura_engine::testgen::InputGen;
+        use kura_engine::value::PixelFormat;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let value = InputGen::Noise {
+            w: 300,
+            h: 260,
+            fmt: PixelFormat::Rgba8,
+            seed: 1,
+        }
+        .generate()
+        .unwrap();
+        let png = kura_core::edit::CodecSet::pinned()
+            .encode_bytes(
+                &value,
+                "png",
+                &serde_json::json!({}),
+                &kura_engine::NoMonitor,
+            )
+            .unwrap()
+            .0;
+        std::fs::write(src.join("a.png"), png).unwrap();
+        let services = kura_core::library::Services::new(Arc::new(kura_core::media::NoBackend))
+            .with_engine(Arc::new(Factory));
+        let session = kura_core::library::LibrarySession::create(
+            &dir.path().join("L"),
+            Arc::new(|_| {}),
+            services,
+        )
+        .unwrap();
+        start_import(
+            session.jobs(),
+            &ImportInput {
+                paths: vec![src],
+                options: ImportOptions::default(),
+            },
+        )
+        .unwrap();
+        session.wait_ready();
+        assert!(session.jobs().wait_idle(std::time::Duration::from_secs(60)));
+        assert_eq!(session.info().unwrap().item_count, 1);
+        let env = EditorEnv::of(&session).unwrap();
+        let opened = editor::open(
+            &env,
+            &OpenRequest {
+                item_id: 1,
+                viewport: Viewport::whole(),
+                from_draft: false,
+            },
+        )
+        .unwrap();
+        let (s, rev) = (opened.session.clone(), opened.outcome.status.rev);
+        let origin = release();
+        let with = Served {
+            layout: session.library().layout(),
+            engine: session.engine(),
+        };
+        let get = |served: &Served<'_>, path: String| {
+            reply(Some(served), &request("GET", &path, &[]), &origin, false)
+        };
+
+        let raw = get(&with, format!("/edit/{s}/{rev}/0/0/1/1"));
+        assert_eq!(raw.status(), StatusCode::OK);
+        assert_eq!(raw.body().len(), 44 * 4 * 4);
+        assert_eq!(
+            header_of(&raw, "content-type").as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(header_of(&raw, "cache-control").as_deref(), IMMUTABLE);
+        assert_decorated(&raw, &origin, "edit 200");
+        let png = get(&with, format!("/edit/{s}/{rev}/0/0/0/0.png"));
+        assert_eq!(png.status(), StatusCode::OK);
+        assert_eq!(
+            header_of(&png, "content-type").as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(&png.body()[..4], b"\x89PNG");
+        assert_eq!(header_of(&png, "cache-control").as_deref(), IMMUTABLE);
+        let head = reply(
+            Some(&with),
+            &request("HEAD", &format!("/edit/{s}/{rev}/0/0/1/1.rgba"), &[]),
+            &origin,
+            true,
+        );
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(head.body().is_empty());
+        assert_eq!(
+            header_of(&head, "content-length"),
+            Some((44 * 4 * 4).to_string())
+        );
+
+        let without = Served {
+            layout: session.library().layout(),
+            engine: None,
+        };
+        for (what, served, path, status) in [
+            (
+                "古い rev",
+                &with,
+                format!("/edit/{s}/{}/0/0/0/0", rev + 1),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "違う段",
+                &with,
+                format!("/edit/{s}/{rev}/1/0/0/0"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "範囲の外",
+                &with,
+                format!("/edit/{s}/{rev}/0/0/9/9"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "知らないセッション",
+                &with,
+                format!("/edit/abc/{rev}/0/0/0/0"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "読めない綴り",
+                &with,
+                format!("/edit/{s}/{rev}/0/0/0/0.gif"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "エンジンなし",
+                &without,
+                format!("/edit/{s}/{rev}/0/0/0/0"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let r = get(served, path);
+            assert_eq!(r.status(), status, "{what}");
+            assert_decorated(&r, &origin, what);
+        }
+        // main でない WebView は受け付けで断る
+        let req = request("GET", &format!("/edit/{s}/{rev}/0/0/0/0"), &[]);
+        let Gate::Done(r) = gate("capture-browser", &req, &origin) else {
+            panic!("ほかの WebView の /edit を受け付けました");
+        };
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        // 閉じると 404
+        editor::close(session.engine().unwrap(), &s);
+        let r = get(&with, format!("/edit/{s}/{rev}/0/0/0/0"));
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        session.close();
     }
 
     #[test]

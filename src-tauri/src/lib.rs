@@ -72,6 +72,14 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::asset::item_asset_get,
             commands::asset::item_asset_settings_set,
             commands::asset::item_anim_get,
+            commands::edit::edit_open,
+            commands::edit::edit_step,
+            commands::edit::edit_view,
+            commands::edit::edit_sample,
+            commands::edit::edit_close,
+            commands::edit::edit_save,
+            commands::edit::edit_versions,
+            commands::edit::edit_draft_discard,
             commands::items::library_counts,
             commands::items::items_selection_info,
             commands::items::items_update,
@@ -185,6 +193,10 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .constant("QUERY_SYMBOLS", dto::query_symbols())
         // 解析の失敗の理由（`AssetFactsDto.errorCode`）。フロントの describe.test.ts が理由ごとの文言と照らす
         .constant("ANALYSIS_ERROR_CODES", dto::analysis_error_codes())
+        // 編集の操作のカタログ（今の版の操作の ID・版・入力・引数の記述と表示の条件。エディタの「操作を追加」と引数パネルは
+        // これを読む。docs/editing.md §7.2・§7.3）
+        .typ::<kura_engine::op::OpDescriptor>()
+        .constant("EDIT_OPS", commands::edit::edit_ops())
         // ID・ミリ秒・バイト数は 2^53 を超えないので number として扱う
         .dangerously_cast_bigints_to_number()
 }
