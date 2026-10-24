@@ -123,7 +123,7 @@
 | ツール | `tools_status()` → `ToolInfo[]` / `tools_set_path(tool, path?)` / `tools_update()` → `{ brewCommand?, outputs }` | 版・場所・Homebrew 版か。場所の指定（app.json）。「更新を確認」（ADR-100） |
 | 設定 | `settings_get(keys)` / `settings_set(map)` | |
 | 外観 | `appearance_get()` → `Appearance` | OS の表示設定（「透明度を下げる」）。起動時に `<html data-reduce-transparency>` へ反映する（§11） |
-| 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測と、`VITE_KURA_SELFTEST=1` の自己点検（§4.2）・`VITE_KURA_CHECK=1` の試聴の継ぎ目の自己点検（`audition-seam`）の結果をログに書く（§13） |
+| 開発 | `bench_report(name, result)` | `VITE_KURA_BENCH=1` で起動したときのスクロール計測と、`VITE_KURA_SELFTEST=1` の自己点検（§4.2）・`VITE_KURA_CHECK=1` の試聴の継ぎ目の自己点検（`audition-seam`）・エディタのタイルの形式の自己点検（`edit-tiles`。M12）の結果をログに書く（§13） |
 
 変更（patch）の型は、省いた項目を変えない。色・メモの空文字は「消す」の意味（`Option<Option<T>>` を JSON で表しにくいため）。
 
@@ -471,7 +471,7 @@ import_start:    ジョブとして実行
 | `KURA_LIBRARY=<path>` | アプリをこのライブラリで起動する（「前回のライブラリ」は書き換えない）。まだコミットしていないマイグレーションのある dev・debug のビルドは、必ずこれで seed か写しのライブラリに向ける（identifier が release と同じで、なければ app.json の前回のライブラリ＝本物を開いて当ててしまう。当てたものは直しても当て直されず、前の版では開けなくなる） |
 | `VITE_KURA_BENCH=1` | グリッドを自動でスクロールし、フレーム時間を `bench_report` でログに書く |
 | `kura-devtools selftest-library --out <path> [--web <dir>] [--font <ttf>]` | kura:// と CSP の自己点検用のライブラリを作る（M11。§4.2）。アルファ付き PNG・JPEG・WAV は DB に入れ、`<script>` 入りの SVG・ttf（システムのフォントの写し）・glb は `files/` に直に置き、WAV の `kura-peaks` と、中身のハッシュの目録（決まった名前 `5e1f7e57…` で `/file` から読める）も置く。`--web` には F2 のページ `f2.html` を書く。整合性の確かめでは、DB にないファイルが 4 つ孤立して数えられる |
-| `VITE_KURA_CHECK=1` | ループの試聴の継ぎ目の自己点検（M11。`src/dev/seamCheck.ts`）。試聴を始めるたびに、同じ PCM と同じ組み立て（本体を loop・前奏のあとに本体・継ぎ目の前後を続けて。始める時刻はフレームの境、バッファの中の始まりは「フレーム ÷ レート」の秒）を OfflineAudioContext で描き、PCM を計画の順につないだ期待の標本と 1 標本ずつ照らして、`bench_report('audition-seam', {hash, mode, rate, channels, windows, seams, frames, mismatches, first, ms})` でログに書く。完了条件は `mismatches` が 0。本物との違い：始める時刻の起点は 0（本物は文脈の今の時刻の少し先）。描く長さは窓ごとに 30 秒まで（前奏と本体が長ければ、前奏の終わりの 1 秒前からの窓と本体の継ぎ目の 1 秒前からの窓に分ける）。通常のビルドには入らない（条件の中の動的 import が消える。`src/dev/seamCheck.test.ts` が読み込む所を見張る） |
+| `VITE_KURA_CHECK=1` | ループの試聴の継ぎ目の自己点検（M11。`src/dev/seamCheck.ts`）。試聴を始めるたびに、同じ PCM と同じ組み立て（本体を loop・前奏のあとに本体・継ぎ目の前後を続けて。始める時刻はフレームの境、バッファの中の始まりは「フレーム ÷ レート」の秒）を OfflineAudioContext で描き、PCM を計画の順につないだ期待の標本と 1 標本ずつ照らして、`bench_report('audition-seam', {hash, mode, rate, channels, windows, seams, frames, mismatches, first, ms})` でログに書く。完了条件は `mismatches` が 0。本物との違い：始める時刻の起点は 0（本物は文脈の今の時刻の少し先）。描く長さは窓ごとに 30 秒まで（前奏と本体が長ければ、前奏の終わりの 1 秒前からの窓と本体の継ぎ目の 1 秒前からの窓に分ける）。通常のビルドには入らない（条件の中の動的 import が消える。`src/dev/seamCheck.test.ts` が読み込む所を見張る）。画像エディタのタイルの形式の自己点検（M12 の段 5。`src/dev/tileCheck.ts`）：エディタを開いて最初の表示が届いたら、その表示の有効なタイル（見えているものを先に 24 枚まで）を非圧縮の RGBA8（拡張子なし）と PNG（`.png`）の両方で `no-store` で読み、`fetch` と解く時間（RGBA8 は `ImageData`＋`createImageBitmap`、PNG は `createImageBitmap(blob)`）だけを 1 枚ずつと全部同時に、形式の順を入れ替えて 3 回測り、`bench_report('edit-tiles', …)` と console.warn に出す（窓が隠れていても測れるよう描画・rAF は使わない）。既定の形式（`src/features/editor/tiles.ts` の `TILE_FORMAT`）はこの結果で決める |
 | `VITE_KURA_SELFTEST=1`（と任意の `VITE_KURA_SELFTEST_F2=<f2.html の URL>`） | 起動時に §4.2 の P1〜P8・F1〜F4 を試し、`bench_report('selftest')` と `selftest-nav` でログに書く。selftest のライブラリを `KURA_LIBRARY` で開き、`RUST_LOG=info,kura_app_lib=debug` で要求ごとのログ（label・Origin・status・ACAO）も出す。CSP は `VITE_KURA_SELFTEST=1 pnpm tauri build --debug --no-bundle` で作った `target/debug/kura-app` で確かめる（`pnpm tauri dev` には CSP が付かない）。F2 のページは `python3 -m http.server 18432 --bind 127.0.0.1 -d <dir>` などで配る |
 
 M2 の実測（Apple Silicon・16 コア、リリースビルド、10 万件）：
@@ -633,7 +633,7 @@ M11 の実測（NFR-01〜07 の測り直しと M11 の計測。2026-10-20。Appl
 
 - **書き出し**（`kura_core::export`、ジョブ `kind = 'export'`。ADR-120）：
   - 選んだアイテム（重ねて選んだものは 1 回）を書き出し先のフォルダへ、ユニットはユニット名のフォルダの中に並び順でコピーする。読むのはライブラリの `files/` だけで、同じボリュームならクローン。
-  - ファイル名は元のファイル名（`/`・`:`・制御文字は `_`、先頭の `.` は `_`、255 バイトまで）。書き出し先の既存のファイル・フォルダは上書きしない：一時ファイル（`.kura-export-<job>-<n>.part`）にコピーしてから、すでにあれば失敗するハードリンクで名前を付ける（あれば「名前 2.jpg」）。ハードリンクが使えないボリュームでは、ないことを確かめて名前を変える。ユニットのフォルダは `create_dir`（あれば「鎌倉 2」）。
+  - ファイル名は元のファイル名（`/`・`:`・制御文字は `_`、先頭の `.` は `_`、255 バイトまで）。ただし元のファイル名の拡張子が今の中身（`items.ext`）と違う形式なら（形式を変えて上書きした・M12。`original_name` は変えない）、元の名前の語幹に今の拡張子を付ける（`jpg` と `jpeg` のように形式の表の ID が同じなら元の名前のまま。`export::names::export_name`）。書き出し先の既存のファイル・フォルダは上書きしない：一時ファイル（`.kura-export-<job>-<n>.part`）にコピーしてから、すでにあれば失敗するハードリンクで名前を付ける（あれば「名前 2.jpg」）。ハードリンクが使えないボリュームでは、ないことを確かめて名前を変える。ユニットのフォルダは `create_dir`（あれば「鎌倉 2」）。
   - 最後に `kura-export.json`（あれば「kura-export 2.json」）を書く：`{ app, version, exportedAt, items: [{ file, originalName, title, kind, hash, sizeBytes, width, height, durationMs, rating, note, tags, folders, units, sourceSite, sourceUrl, capturedAt, importedAt }] }`。日時は ISO 8601 の UTC、タグは「名前空間:名前」、フォルダはいちばん上からの名前の列。
   - 一時停止・再開できる（位置・書いたファイル・ユニットのフォルダの名前を `result_json` に保存）。中止しても書いたファイルは消さない。ライブラリのファイルがないものは失敗として数えて続ける。
   - 入口：ファイル › 書き出す…（⌘⇧E）、項目のメニュー。進捗は取り込みと同じカプセルに出し、終わったら「Finder で表示」。
