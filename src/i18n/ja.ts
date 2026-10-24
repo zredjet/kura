@@ -697,6 +697,8 @@ export const ja = {
     gridNoCells: 'セルが 1 つもできません',
     gridTooMany: (cells: string) => `使うコマの数はセルの数（${cells}）までです`,
     gridClear: '格子を外す',
+    /** 解析の推定（sprite_grid）で入力欄を埋める副ボタン（保存はしない）。 */
+    gridUseEstimate: (w: string, h: string) => `推定を使う（${w} × ${h}）`,
     // 効果音の即再生（設定シートの一般）
     sfx: '選んだ短い音声をすぐ鳴らす',
     sfxHint:

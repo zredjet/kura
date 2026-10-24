@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type HTMLAttributes, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Select } from '../../components/Select/Select';
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
@@ -138,6 +138,15 @@ export function displaySize(
   return { width: w * s, height: h * s, smoothing: true };
 }
 
+/** 操作の行に足す属性（シアター：位置の class と、シアターの操作と一緒に隠す・出すための data-chrome・ポインタの出入り）。 */
+export type AnimControlsProps = HTMLAttributes<HTMLDivElement> & { 'data-chrome'?: string };
+
+/** テストで差し込む口（時計・描く関数・画像を読む口・動きを減らす設定・装置の画素の比）。省けば本物。 */
+export type AnimPlayerHooks = Pick<
+  AnimPlayerProps,
+  'clock' | 'draw' | 'load' | 'reducedMotion' | 'dpr'
+>;
+
 interface AnimPlayerProps {
   source: AnimSource;
   /** ドット絵の実効値（広げるときだけ最近傍・整数倍）。 */
@@ -146,8 +155,10 @@ interface AnimPlayerProps {
   alpha: AlphaKind | null;
   /** 初めに選ぶタグ（素材の設定の animTag）。 */
   initialTag?: string | null;
-  /** 枠の高さ（CSS px）。'fill' は親いっぱいに広げて測る（クイックルック）。 */
+  /** 枠の高さ（CSS px）。'fill' は親いっぱいに広げて測る（クイックルック・シアター）。 */
   frameHeight?: number | 'fill';
+  /** 操作の行に足す属性（シアター）。 */
+  controls?: AnimControlsProps;
   /** テスト用：時計・描く関数・画像を読む口・動きを減らす設定・装置の画素の比。 */
   clock?: AnimClock;
   draw?: DrawFrame;
@@ -168,6 +179,7 @@ export function AnimPlayer({
   alpha,
   initialTag = null,
   frameHeight = FRAME_HEIGHT,
+  controls,
   clock = realClock,
   draw = drawFrame,
   load = loadImage,
@@ -336,7 +348,10 @@ export function AnimPlayer({
           />
         )}
       </div>
-      <div className={styles.controls}>
+      <div
+        {...controls}
+        className={[styles.controls, controls?.className].filter(Boolean).join(' ')}
+      >
         <button
           type="button"
           className={styles.roundButton}

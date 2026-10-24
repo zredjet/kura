@@ -14,6 +14,9 @@ import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { playUrl } from '../../ipc/media';
 import { formatCount, formatDuration } from '../../lib/format';
+import type { AnimPlayerHooks } from '../asset/AnimPlayer';
+import { QuickLookAnim } from '../asset/AssetStage';
+import { useAssetData } from '../asset/useAssetData';
 import { useLoopRange } from '../asset/useLoopRange';
 import { WaveformView } from '../asset/WaveformView';
 import { PlayBar } from './PlayBar';
@@ -125,7 +128,7 @@ export function Theater() {
       role="region"
     >
       <section className={styles.stage} aria-label={t.label} data-idle={idle || undefined}>
-        <Stage />
+        <Stage active={visible} chrome={chrome} />
         {visible && <div className={styles.shade} aria-hidden="true" />}
         {visible && <TopBar chrome={chrome} />}
         {visible && <BgmPill />}
@@ -140,7 +143,8 @@ export function Theater() {
   );
 }
 
-interface ChromeProps {
+/** シアターの操作（上部・再生バー・アニメの操作の行）に付けるもの：隠してよいかを見るための印とポインタの出入り。 */
+export interface ChromeProps {
   'data-chrome': string;
   onPointerEnter: () => void;
   onPointerLeave: () => void;
@@ -231,8 +235,11 @@ function TopBar({ chrome }: { chrome: ChromeProps }) {
   );
 }
 
-/** メディア（動画・画像・音楽のジャケット）と、待ち・失敗・終わりの案内。 */
-function Stage() {
+/**
+ * メディア（動画・画像・音楽のジャケット）と、待ち・失敗・終わりの案内。`active` はシアターを出しているか（隠して
+ * いる間も `<video>` は残すが、アニメは回さない）。
+ */
+function Stage({ active, chrome }: { active: boolean; chrome: ChromeProps }) {
   const snapshot = usePlayerStore((s) => s.snapshot);
   const attach = useCallback((el: HTMLVideoElement | null) => {
     playerController().attachVideo(el);
@@ -250,7 +257,9 @@ function Stage() {
         hidden={snapshot.kind !== 'video' || !showMedia}
         playsInline
       />
-      {item && snapshot.kind === 'image' && <ImageLayer key={item.id} item={item} />}
+      {item && snapshot.kind === 'image' && (
+        <ImageLayer key={item.id} item={item} active={active} chrome={chrome} />
+      )}
       {item && snapshot.kind === 'audio' && showMedia && <AudioArt key={item.id} item={item} />}
       {snapshot.phase === 'waiting' && (
         <Status title={t.waiting} hint={t.waitingHint}>
@@ -293,16 +302,46 @@ function Stage() {
 
 /**
  * 画像（ブラウザで表示できない形式は大きいサムネイルにする）。透過と分かったものは市松模様、ドット絵は整数倍
- * （design.md §3.1）。アニメはシアターでは先頭のコマのまま（元のファイルを `<img>` に置くと WebKit が回すので、
- * 大きいサムネイルを出す。`stillOriginal`）。
+ * （design.md §3.1）。アニメ（M12）は、シアターを出している間だけ素材の欄と帯を読み（`useAssetData`）、帯ができたら
+ * クイックルックと同じ部品（`QuickLookAnim`）で回す。操作の行（再生／一時停止・「7 / 8」・コマ送り・タグ）は再生バーの
+ * 上に重ね、上の操作・再生バーと一緒に隠す・出す。Space はプレーヤーの操作のまま（`usePlayerKeys` が先に取る）。
+ * 帯を待つ間・大きすぎて作れないとき・作れなかったときは先頭のコマ（元のファイルを `<img>` に置くと WebKit が回すので、
+ * 大きいサムネイル。`stillOriginal`）。「視差効果を減らす」では自動で再生しない（AnimPlayer。クイックルックと同じ）。
  */
-export function ImageLayer({ item }: { item: ItemSummaryDto }) {
+export function ImageLayer({
+  item,
+  active,
+  chrome,
+  player,
+}: {
+  item: ItemSummaryDto;
+  /** シアターを出しているか（隠している間は素材の欄も帯も読まず、回さない）。 */
+  active: boolean;
+  /** アニメの操作の行に付けるもの（シアターの操作と一緒に隠す・出す）。 */
+  chrome?: ChromeProps;
+  /** テスト用：アニメの時計・描く関数・画像を読む口など。 */
+  player?: AnimPlayerHooks;
+}) {
+  const data = useAssetData(active ? item.id : null);
+  const asset = data.asset?.itemId === item.id ? data.asset : null;
+  const anim = asset && data.anim.status === 'ready' ? data.anim.anim : null;
+  if (active && asset && anim) {
+    return (
+      <QuickLookAnim
+        key={`${anim.hash}:${anim.rev}`}
+        asset={asset}
+        anim={anim}
+        controls={{ ...chrome, className: styles.animControls }}
+        {...player}
+      />
+    );
+  }
   return (
     <MediaImage
       source={item}
       size="l"
       fit="contain"
-      original={stillOriginal(item, playUrl(item.hash))}
+      original={stillOriginal(item, playUrl(item.hash), asset?.effective.animated)}
       className={styles.image}
     />
   );

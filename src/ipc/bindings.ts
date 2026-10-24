@@ -426,6 +426,8 @@ export type AssetDto = {
 	facts: AssetFactsDto | null,
 	settings: AssetSettingsDto,
 	effective: AssetEffectiveDto,
+	/**  解析の格子の推定（今のエンジンの版の結果で候補があるときだけ。自動では当てない）。 */
+	gridEstimate: AssetGridEstimateDto | null,
 	/**  フォントのときだけ。 */
 	font: AssetFontDto | null,
 	/**  3D のときだけ。 */
@@ -483,6 +485,16 @@ export type AssetGridDto = {
 	gapX: number,
 	gapY: number,
 	count: number | null,
+};
+
+/**  解析の格子の推定（`image.sprite_grid` の最良の候補。格子のシートの「推定を使う」が入力欄をこれで埋める）。 */
+export type AssetGridEstimateDto = {
+	/**  推定の格子（`count` は中身のあるセルの数。すべてのセルに中身があれば null＝すべて）。 */
+	grid: AssetGridDto,
+	cols: number,
+	rows: number,
+	/**  中身のあるセルの数。 */
+	filled: number,
 };
 
 /**  画像の事実（計っていないものは null）。 */

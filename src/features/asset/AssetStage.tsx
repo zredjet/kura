@@ -3,7 +3,12 @@ import { type ReactNode, useEffect, useState } from 'react';
 import { ja } from '../../i18n/ja';
 import type { AnimDto, AssetDto } from '../../ipc/asset';
 import { fileUrl } from '../../ipc/media';
-import { AnimPlayer, stripSource } from './AnimPlayer';
+import {
+  type AnimControlsProps,
+  AnimPlayer,
+  type AnimPlayerHooks,
+  stripSource,
+} from './AnimPlayer';
 import styles from './Asset.module.css';
 import type { AssetData } from './useAssetData';
 
@@ -115,8 +120,16 @@ export function AnimStage({ asset, anim }: { asset: AssetDto; anim: AnimDto }) {
   );
 }
 
-/** クイックルックのアニメ（ステージいっぱいの枠と、その下の操作の行）。 */
-export function QuickLookAnim({ asset, anim }: { asset: AssetDto; anim: AnimDto }) {
+/**
+ * クイックルック・シアターのアニメ（ステージいっぱいの枠と、その下の操作の行）。シアターは操作の行に位置の class と
+ * `data-chrome` などを足し、上の操作・再生バーと一緒に隠す・出す（M12）。
+ */
+export function QuickLookAnim({
+  asset,
+  anim,
+  controls,
+  ...hooks
+}: { asset: AssetDto; anim: AnimDto; controls?: AnimControlsProps } & AnimPlayerHooks) {
   return (
     <div className={styles.fillStage}>
       <AnimPlayer
@@ -125,6 +138,8 @@ export function QuickLookAnim({ asset, anim }: { asset: AssetDto; anim: AnimDto 
         alpha={asset.facts?.image.alpha ?? null}
         initialTag={asset.settings.animTag}
         frameHeight="fill"
+        controls={controls}
+        {...hooks}
       />
     </div>
   );

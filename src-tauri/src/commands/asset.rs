@@ -174,6 +174,18 @@ pub struct AssetSettingsDto {
     pub updated_at: Option<i64>,
 }
 
+/// 解析の格子の推定（`image.sprite_grid` の最良の候補。格子のシートの「推定を使う」が入力欄をこれで埋める）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetGridEstimateDto {
+    /// 推定の格子（`count` は中身のあるセルの数。すべてのセルに中身があれば null＝すべて）。
+    pub grid: AssetGridDto,
+    pub cols: u32,
+    pub rows: u32,
+    /// 中身のあるセルの数。
+    pub filled: u32,
+}
+
 /// 実効値（表示と検索の値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +243,8 @@ pub struct AssetDto {
     pub facts: Option<AssetFactsDto>,
     pub settings: AssetSettingsDto,
     pub effective: AssetEffectiveDto,
+    /// 解析の格子の推定（今のエンジンの版の結果で候補があるときだけ。自動では当てない）。
+    pub grid_estimate: Option<AssetGridEstimateDto>,
     /// フォントのときだけ。
     pub font: Option<AssetFontDto>,
     /// 3D のときだけ。
@@ -310,6 +324,12 @@ impl From<AssetInfo> for AssetDto {
                 animated: a.effective.animated,
                 frame_count: a.effective.frame_count,
             },
+            grid_estimate: a.grid_estimate.map(|e| AssetGridEstimateDto {
+                grid: e.grid.into(),
+                cols: e.cols,
+                rows: e.rows,
+                filled: e.filled,
+            }),
             font: a.font.map(|f| AssetFontDto {
                 family: f.family,
                 style: f.style,

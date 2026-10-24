@@ -33,19 +33,39 @@ export interface GridForm {
   frameMs: string;
 }
 
+/** 入力欄の文字（空は「なし」）。 */
+function text(v: number | null | undefined, fallback = ''): string {
+  return v === null || v === undefined ? fallback : String(v);
+}
+
 export function formOf(asset: AssetDto): GridForm {
   const g = asset.settings.grid;
-  const n = (v: number | null | undefined, fallback = '') =>
-    v === null || v === undefined ? fallback : String(v);
   return {
-    cellW: n(g?.cellW, String(DEFAULT_CELL)),
-    cellH: n(g?.cellH, String(DEFAULT_CELL)),
-    offsetX: n(g?.offsetX, '0'),
-    offsetY: n(g?.offsetY, '0'),
-    gapX: n(g?.gapX, '0'),
-    gapY: n(g?.gapY, '0'),
-    count: n(g?.count),
-    frameMs: n(asset.settings.frameMs),
+    cellW: text(g?.cellW, String(DEFAULT_CELL)),
+    cellH: text(g?.cellH, String(DEFAULT_CELL)),
+    offsetX: text(g?.offsetX, '0'),
+    offsetY: text(g?.offsetY, '0'),
+    gapX: text(g?.gapX, '0'),
+    gapY: text(g?.gapY, '0'),
+    count: text(g?.count),
+    frameMs: text(asset.settings.frameMs),
+  };
+}
+
+/**
+ * 解析の推定（`AssetDto.gridEstimate.grid`）で格子の欄を埋めた入力（コマの長さは今の入力のまま）。使うコマの数は推定の
+ * 中身のあるセルの数で、すべてのセルに中身があれば空（すべて）。
+ */
+export function withEstimate(form: GridForm, grid: AssetGridDto): GridForm {
+  return {
+    ...form,
+    cellW: text(grid.cellW),
+    cellH: text(grid.cellH),
+    offsetX: text(grid.offsetX),
+    offsetY: text(grid.offsetY),
+    gapX: text(grid.gapX),
+    gapY: text(grid.gapY),
+    count: text(grid.count),
   };
 }
 
@@ -197,8 +217,9 @@ interface GridSheetProps {
 
 /**
  * 格子のシート（design.md §3.1「格子のシート」。size="sm"）：上にその場のプレビュー（元の画像に格子の線を重ねた
- * ものと、その格子で回したアニメ）、下に数の入力（2 列）。左に「格子を外す」（設定があるとき）、右に「キャンセル」
- * 「保存」。解析の推定（sprite_grid）は素材の欄にまだ出していないので「推定を使う」は置かない（M11）。
+ * ものと、その格子で回したアニメ）、下に数の入力（2 列）。解析の推定（sprite_grid）があれば入力の上に「推定を使う
+ * （16 × 16）」の副ボタン（入力欄を埋めるだけで保存しない。自動では当てない。M12）。左に「格子を外す」（設定がある
+ * とき）、右に「キャンセル」「保存」。
  */
 export function GridSheet({
   asset,
@@ -252,6 +273,7 @@ export function GridSheet({
   );
 
   const note = failure ?? checked.error;
+  const estimate = asset.gridEstimate?.grid ?? null;
   return (
     <Dialog labelledBy={id} onClose={onClose} size="sm">
       <h2 id={id} className={styles.sheetTitle}>
@@ -290,6 +312,15 @@ export function GridSheet({
         </div>
       ) : null}
       <div className={styles.form}>
+        {estimate && (
+          <Button
+            size="sm"
+            className={styles.estimate}
+            onClick={() => setForm(withEstimate(form, estimate))}
+          >
+            {t.gridUseEstimate(formatCount(estimate.cellW), formatCount(estimate.cellH))}
+          </Button>
+        )}
         <div className={styles.fields}>
           {field('cellW', t.cellW)}
           {field('cellH', t.cellH)}

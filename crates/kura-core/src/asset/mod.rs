@@ -14,12 +14,17 @@
 //! - 格子は、セルが 1 つもできない値と、セルの数を超えるコマの数を断る（大きさの分からない画像は、セルの幅・高さが
 //!   1 以上かだけを見る）。帯で使うコマの数は [`anim::MAX_FRAMES`] まで。
 //! - DB だけを読む（ファイルは読まない）。中身に依る事実は台帳の行の ID（`items.blob_id`。0010）で引く。
+//! - 格子の推定（[`GridEstimate`]。格子のシートの「推定を使う」。M12）は、解析の結果の表の `image.sprite_grid` を、今の
+//!   エンジンの版のときだけ正規の形から読み、最良の候補を返す（[`grid_estimate_from`]）。自動では当てない。
 
 pub mod anim;
 pub mod pcm;
 
 use std::collections::BTreeSet;
 
+use kura_engine::analysis::Analysis;
+use kura_engine::analysis::image::sprite_grid::{SpriteGrid, SpriteGridOutput};
+use kura_engine::analysis::output::json_from_canonical;
 use kura_engine::ops::sprite::split_grid::cells_on_axis;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
@@ -300,6 +305,20 @@ pub struct ModelFacts {
     pub unsupported: Vec<String>,
 }
 
+/// 解析の格子の推定（`analysis_results` の `image.sprite_grid` の最良の候補。格子のシートの「推定を使う」が入力欄を
+/// これで埋める。自動では当てない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridEstimate {
+    /// 推定の格子。`count` は中身のあるセルの数（[`Self::filled`]）で、すべてのセルに中身があるとき・帯で使うコマの上限
+    /// （[`anim::MAX_FRAMES`]）に届くときは None（すべて）。
+    pub grid: GridSetting,
+    /// 列の数・行の数。
+    pub cols: u32,
+    pub rows: u32,
+    /// 中身のあるセルの数（セルの途中の空も除いた数。末尾だけが空なら「末尾の空のセルを除いた数」と同じ）。
+    pub filled: u32,
+}
+
 /// 素材の欄の中身（`item_asset_get`）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssetInfo {
@@ -315,6 +334,8 @@ pub struct AssetInfo {
     pub facts: Option<Facts>,
     pub settings: AssetSettings,
     pub effective: Effective,
+    /// 解析の格子の推定（[`grid_estimate_from`]。今のエンジンの版の結果で、候補があり、画像の大きさに合うものだけ）。
+    pub grid_estimate: Option<GridEstimate>,
     pub font: Option<FontFacts>,
     pub model: Option<ModelFacts>,
 }
@@ -324,7 +345,8 @@ const SETTINGS_COLUMNS: &str =
     "s.item_id, s.pixel_art, s.pixel_scale, s.grid_json, s.frame_ms, s.pivot_x, s.pivot_y,
      s.loop_start, s.loop_end, s.anim_tag, s.updated_at";
 
-/// 素材の欄の問い合わせ：アイテム（主キー）→ 台帳（hash の UNIQUE）→ 事実（blob_id の主キー）、設定（item_id の主キー）。
+/// 素材の欄の問い合わせ：アイテム（主キー）→ 事実（`items.blob_id` で、事実の主キー）、設定（item_id の主キー）、
+/// 格子の推定（結果の表の (blob_id, analysis) の UNIQUE。`?2` は [`SpriteGrid::ID`]）。
 const GET_SQL: &str = "SELECT i.id, i.hash, i.ext, i.kind, i.width, i.height, i.analysis_state, i.codec_info,
             f.state, f.error_code, f.decoder, f.facts_v, f.analyzed_at,
             f.alpha, f.colors, f.visible_colors, f.pixel_kx, f.pixel_ky, f.pixel_lossless, f.pixel_art,
@@ -332,14 +354,18 @@ const GET_SQL: &str = "SELECT i.id, i.hash, i.ext, i.kind, i.width, i.height, i.
             f.loudness, f.loudness_reason, f.loudness_range, f.true_peak, f.sample_peak, f.has_loop,
             f.loop_start, f.loop_end, f.sample_rate, f.channels, f.bits, f.clip_runs,
             s.item_id, s.pixel_art, s.pixel_scale, s.grid_json, s.frame_ms, s.pivot_x, s.pivot_y,
-            s.loop_start, s.loop_end, s.anim_tag, s.updated_at
+            s.loop_start, s.loop_end, s.anim_tag, s.updated_at,
+            g.version, g.encoding, g.output
      FROM items i
      LEFT JOIN media_facts f ON f.blob_id = i.blob_id
      LEFT JOIN asset_settings s ON s.item_id = i.id
+     LEFT JOIN analysis_results g ON g.blob_id = i.blob_id AND g.analysis = ?2
      WHERE i.id = ?1";
 
 /// 設定の列が始まる位置（[`GET_SQL`] の中）。
 const GET_SETTINGS_AT: usize = 34;
+/// 格子の推定の列（版・符号化・正規の形）が始まる位置（[`GET_SQL`] の中）。
+const GET_GRID_AT: usize = 45;
 
 /// 0 以上で u32 に収まる整数（ほかは None）。
 fn u32_of(v: Option<i64>) -> Option<u32> {
@@ -425,6 +451,46 @@ pub(crate) fn grid_from_json(text: &str) -> Option<GridSetting> {
             None
         }
     }
+}
+
+/// 格子の推定の結果の行（版・符号化・正規の形）から、最良の候補の格子を読む。今のエンジンの版（[`SpriteGrid::VERSION`]）で
+/// ない（解き直す前の古い版・知らない新しい版）・JSON でない・読めない・候補がない（空が決まらない・不規則な配置・1 つの
+/// スプライト）ものは None。行がなければ（未解析・段 2 の条件に入らない写真）すべて None で渡る。
+pub fn grid_estimate_from(
+    version: Option<i64>,
+    encoding: Option<&str>,
+    output: Option<&[u8]>,
+) -> Option<GridEstimate> {
+    if version != Some(i64::from(SpriteGrid::VERSION)) || encoding != Some("json") {
+        return None;
+    }
+    let parsed: SpriteGridOutput = match json_from_canonical(output?) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(%err, "格子の推定を読めないので、推定なしとして扱います");
+            return None;
+        }
+    };
+    let best = parsed.best?;
+    let cells = u64::from(best.cols).saturating_mul(u64::from(best.rows));
+    // 中身のあるセルがすべてなら「すべて」（入力欄は空）。帯の上限に届くなら、上限で切るのは「すべて」と同じ
+    let limit = cells.min(u64::from(anim::MAX_FRAMES));
+    let count = (best.filled >= 1 && u64::from(best.filled) < limit).then_some(best.filled);
+    let g = best.grid;
+    Some(GridEstimate {
+        grid: GridSetting {
+            cell_w: g.cell_w,
+            cell_h: g.cell_h,
+            offset_x: g.offset_x,
+            offset_y: g.offset_y,
+            gap_x: g.gap_x,
+            gap_y: g.gap_y,
+            count,
+        },
+        cols: best.cols,
+        rows: best.rows,
+        filled: best.filled,
+    })
 }
 
 /// 設定の列（`at` から [`SETTINGS_COLUMNS`] の 11 個）。行がなければ（item_id が NULL）既定。
@@ -529,19 +595,27 @@ fn font_and_model(
 pub fn get(conn: &Connection, item_id: i64) -> Result<AssetInfo> {
     let mut stmt = conn.prepare_cached(GET_SQL)?;
     let found = stmt
-        .query_row([item_id], |row| {
+        .query_row(params![item_id, SpriteGrid::ID], |row| {
             let hash: Vec<u8> = row.get(1)?;
             let kind: MediaKind = row.get(3)?;
             let ext: String = row.get(2)?;
             let codec_info: Option<String> = row.get(7)?;
             let (font, model) = font_and_model(kind, codec_info.as_deref(), &ext);
+            let (width, height) = (u32_of(row.get(4)?), u32_of(row.get(5)?));
+            // 推定は同じ中身から求めたものなので合うはずだが、合わない格子を入力欄に入れないよう確かめる
+            let grid_estimate = grid_estimate_from(
+                row.get(GET_GRID_AT)?,
+                row.get::<_, Option<String>>(GET_GRID_AT + 1)?.as_deref(),
+                row.get::<_, Option<Vec<u8>>>(GET_GRID_AT + 2)?.as_deref(),
+            )
+            .filter(|e| validate_grid(&e.grid, width.zip(height)).is_ok());
             Ok(AssetInfo {
                 item_id: row.get(0)?,
                 hash: hex(&hash),
                 kind,
                 ext,
-                width: u32_of(row.get(4)?),
-                height: u32_of(row.get(5)?),
+                width,
+                height,
                 analysis_state: AnalysisState::parse(&row.get::<_, String>(6)?),
                 facts: facts_from_row(row)?,
                 settings: settings_from_row(row, GET_SETTINGS_AT)?,
@@ -550,6 +624,7 @@ pub fn get(conn: &Connection, item_id: i64) -> Result<AssetInfo> {
                     animated: false,
                     frame_count: None,
                 },
+                grid_estimate,
                 font,
                 model,
             })
@@ -781,6 +856,12 @@ pub fn set_settings(
 
 #[cfg(test)]
 mod tests {
+    use kura_engine::analysis::image::sprite_grid::{
+        GridBackground, GridFit, GridGuess, GridSource,
+    };
+    use kura_engine::analysis::output::json_to_canonical;
+    use kura_engine::ops::util::GridParam;
+
     use super::*;
     use crate::db::{query_plan, test_conn};
 
@@ -1272,11 +1353,162 @@ mod tests {
         assert_eq!(s.anim_tag.as_deref(), Some("走る"));
     }
 
-    /// 素材の欄の問い合わせは主キーと台帳の索引で引く（全件を走査しない）。
+    /// 格子の推定の結果の正規の形（`best` は（格子、列、行、中身のあるセル）。None は候補なし＝空が決まらない）。
+    fn sprite_grid_output(best: Option<(GridParam, u32, u32, u32)>) -> Vec<u8> {
+        let out = SpriteGridOutput {
+            background: if best.is_some() {
+                GridBackground::Transparent
+            } else {
+                GridBackground::None
+            },
+            best: best.map(|(grid, cols, rows, filled)| GridGuess {
+                grid,
+                cols,
+                rows,
+                filled,
+                fit: GridFit::Exact,
+                source: GridSource::Gutter,
+            }),
+            alternatives: Vec::new(),
+        };
+        json_to_canonical(&out).unwrap()
+    }
+
+    /// 格子の引数（セルの幅・高さ、ずれ X・Y、間隔 X・Y）。
+    fn param(cell_w: u32, cell_h: u32, offset: (u32, u32), gap: (u32, u32)) -> GridParam {
+        GridParam {
+            cell_w,
+            cell_h,
+            offset_x: offset.0,
+            offset_y: offset.1,
+            gap_x: gap.0,
+            gap_y: gap.1,
+        }
+    }
+
+    /// 64 × 32 の画像の 4 列 × 2 行の格子（16 × 16）で、中身のあるセルが `filled`。
+    fn sheet(filled: u32) -> Vec<u8> {
+        sprite_grid_output(Some((param(16, 16, (0, 0), (0, 0)), 4, 2, filled)))
+    }
+
+    /// 結果の表に `image.sprite_grid` の行を書く（版・符号化・正規の形）。
+    fn put_sprite_grid(conn: &Connection, id: i64, version: i64, encoding: &str, output: &[u8]) {
+        conn.execute(
+            "INSERT INTO analysis_results (blob_id, analysis, version, params, encoding, output, output_len,
+                                           digest, created_at)
+             VALUES (?1, ?2, ?3, '{}', ?4, ?5, ?6, zeroblob(32), 1)
+             ON CONFLICT (blob_id, analysis) DO UPDATE SET
+               version = excluded.version, encoding = excluded.encoding, output = excluded.output,
+               output_len = excluded.output_len",
+            params![
+                blob_id(conn, id),
+                SpriteGrid::ID,
+                version,
+                encoding,
+                output,
+                output.len() as i64
+            ],
+        )
+        .unwrap();
+    }
+
+    /// 格子の推定は今のエンジンの版の結果からだけ読む。コマの数は中身のあるセルの数（すべてに中身があれば「すべて」）。
+    /// 版違い・候補なし・読めない・JSON でない・行がない・画像の大きさに合わないものは None。
+    #[test]
+    fn grid_estimate_is_read_only_from_the_current_version() {
+        let conn = test_conn();
+        item(&conn, 1, "image", Some((64, 32)), None);
+        let current = i64::from(SpriteGrid::VERSION);
+        // 行がない（未解析・段 2 に入らない）
+        assert_eq!(get(&conn, 1).unwrap().grid_estimate, None);
+
+        // 正しい版：末尾の 2 つが空の 6 コマ
+        put_sprite_grid(&conn, 1, current, "json", &sheet(6));
+        let info = get(&conn, 1).unwrap();
+        assert_eq!(
+            info.grid_estimate,
+            Some(GridEstimate {
+                grid: grid(16, Some(6)),
+                cols: 4,
+                rows: 2,
+                filled: 6,
+            })
+        );
+        // 推定は設定でない（自動では当てない）
+        assert_eq!(info.settings.grid, None);
+        assert!(!info.effective.animated);
+
+        // すべてのセルに中身があれば、使うコマの数は「すべて」
+        put_sprite_grid(&conn, 1, current, "json", &sheet(8));
+        assert_eq!(
+            get(&conn, 1).unwrap().grid_estimate.map(|e| e.grid),
+            Some(grid(16, None))
+        );
+
+        // 版違い（解き直す前の古い版・知らない新しい版）
+        for version in [current - 1, current + 1] {
+            put_sprite_grid(&conn, 1, version, "json", &sheet(6));
+            assert_eq!(get(&conn, 1).unwrap().grid_estimate, None, "版 {version}");
+        }
+        // 候補なし（空が決まらない・不規則な配置）
+        put_sprite_grid(&conn, 1, current, "json", &sprite_grid_output(None));
+        assert_eq!(get(&conn, 1).unwrap().grid_estimate, None);
+        // 読めない正規の形・JSON でない符号化
+        put_sprite_grid(&conn, 1, current, "json", b"{\"best\":");
+        assert_eq!(get(&conn, 1).unwrap().grid_estimate, None);
+        put_sprite_grid(&conn, 1, current, "binary", &sheet(6));
+        assert_eq!(get(&conn, 1).unwrap().grid_estimate, None);
+
+        // 画像の大きさに合わない推定（セルの高さ 33 は 32 に入らない）は入力欄に入れない
+        let tall = |offset, gap| sprite_grid_output(Some((param(16, 33, offset, gap), 4, 1, 3)));
+        put_sprite_grid(&conn, 1, current, "json", &tall((0, 0), (0, 0)));
+        assert_eq!(get(&conn, 1).unwrap().grid_estimate, None);
+        // 大きさの分からない画像は、セルの幅・高さだけを見る
+        item(&conn, 2, "image", None, None);
+        put_sprite_grid(&conn, 2, current, "json", &tall((1, 2), (3, 4)));
+        assert_eq!(
+            get(&conn, 2).unwrap().grid_estimate.map(|e| e.grid),
+            Some(GridSetting {
+                cell_w: 16,
+                cell_h: 33,
+                offset_x: 1,
+                offset_y: 2,
+                gap_x: 3,
+                gap_y: 4,
+                count: Some(3),
+            })
+        );
+    }
+
+    /// 推定のコマの数：中身のあるセルが帯の上限に届くなら「すべて」と同じなので None。0（起きないはず）も None。
+    #[test]
+    fn grid_estimate_count_stays_within_the_strip_limit() {
+        let count = |filled: u32, cols: u32, rows: u32| {
+            let bytes = sprite_grid_output(Some((param(1, 1, (0, 0), (0, 0)), cols, rows, filled)));
+            grid_estimate_from(
+                Some(i64::from(SpriteGrid::VERSION)),
+                Some("json"),
+                Some(&bytes),
+            )
+            .unwrap()
+            .grid
+            .count
+        };
+        assert_eq!(count(4_095, 100, 100), Some(4_095));
+        assert_eq!(count(anim::MAX_FRAMES, 100, 100), None, "上限ちょうど");
+        assert_eq!(count(5_000, 100, 100), None, "上限を超える");
+        assert_eq!(count(0, 4, 2), None);
+        assert_eq!(grid_estimate_from(None, None, None), None, "行がない");
+    }
+
+    /// 素材の欄の問い合わせは主キーと台帳・結果の表の索引で引く（全件を走査しない）。
     #[test]
     fn asset_query_uses_keys() {
         let conn = test_conn();
-        let plan = query_plan(&conn, &GET_SQL.replace("?1", "1"));
+        let sql = GET_SQL
+            .replace("?1", "1")
+            .replace("?2", &format!("'{}'", SpriteGrid::ID));
+        let plan = query_plan(&conn, &sql);
         assert!(!plan.contains("SCAN"), "{plan}");
     }
 }

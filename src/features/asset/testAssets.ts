@@ -93,6 +93,7 @@ const BASE: AssetDto = {
     updatedAt: null,
   },
   effective: { pixelArt: true, animated: false, frameCount: 1 },
+  gridEstimate: null,
   font: null,
   model: null,
 };

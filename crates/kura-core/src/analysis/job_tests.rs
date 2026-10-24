@@ -1140,6 +1140,64 @@ fn unknown_kinds_and_formats_fail_without_stopping() {
 }
 
 /// 読み取りの記録は結果の表に kura.read として残り、読まずに計画を立てるのに使う。
+/// 解析のジョブが書いた格子の推定（`image.sprite_grid`）を、素材の欄（`asset::get`）が同じ形で読む（書き手と読み手。
+/// 格子のシートの「推定を使う」。M12）。コマの数は中身のあるセルの数（末尾の 2 つが空）。透過も 256 色以下でもない
+/// 写真は段 2 に入らないので推定がない。
+#[test]
+fn the_sprite_grid_written_by_the_job_is_the_asset_grid_estimate() {
+    let env = Env::new();
+    let sheet = png(InputGen::SpriteSheet {
+        cols: 5,
+        rows: 4,
+        cell_w: 8,
+        cell_h: 8,
+        gap_x: 1,
+        gap_y: 1,
+        margin_x: 1,
+        margin_y: 1,
+        pad_right: 1,
+        pad_bottom: 1,
+        background: None,
+        full: true,
+        empty: vec![18, 19],
+        seed: 7,
+    });
+    env.add(1, "image", "png", &sheet);
+    env.add(
+        2,
+        "image",
+        "png",
+        &png(InputGen::Noise {
+            w: 32,
+            h: 24,
+            fmt: PixelFormat::Rgb8,
+            seed: 3,
+        }),
+    );
+    env.run();
+    let read = |id: i64| {
+        env.library
+            .db()
+            .read(move |c| crate::asset::get(c, id))
+            .unwrap()
+    };
+    let estimate = read(1).grid_estimate.unwrap();
+    assert_eq!(
+        estimate.grid,
+        crate::asset::GridSetting {
+            cell_w: 8,
+            cell_h: 8,
+            offset_x: 1,
+            offset_y: 1,
+            gap_x: 1,
+            gap_y: 1,
+            count: Some(18),
+        }
+    );
+    assert_eq!((estimate.cols, estimate.rows, estimate.filled), (5, 4, 18));
+    assert_eq!(read(2).grid_estimate, None);
+}
+
 #[test]
 fn read_record_is_kept_with_the_results() {
     let env = Env::new();

@@ -311,6 +311,11 @@
   gap: var(--space-2);
 }
 
+/* 「推定を使う（16 × 16）」の副ボタン：入力の上に、左に寄せて中身の幅で */
+.estimate {
+  align-self: flex-start;
+}
+
 .fields {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
