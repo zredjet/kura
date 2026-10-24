@@ -445,9 +445,10 @@ CREATE TABLE settings (
 --       'probe.crashed'     = 前回 1 件だけで読んでいる途中で終わったファイル（[取り込み元のパス…]。4,096 件まで）。もう読まずに
 --                             入れ、そのアイテムのサムネイルを failed にする（pending のときだけ）。入れたら外す
 --       'gc.parts'          = 文書の部品が孤立したかもしれない印（true。下書きを置き換えた・捨てた、上書き・別名の保存のジョブが
---                             版を足さずに終わった、版 0 に戻した保存が空の文書の下書きを消したときに置く。あれば消し待ちの版が
---                             なくても GC を積み、GC が部品を片付けたトランザクションで、終わっていない保存のジョブがなければ消す。
---                             M12 の段 3。§4「保存と版（M12）」）
+--                             版を足さずに終わった（待ち・一時停止のまま中止されたときも）、版 0 に戻した保存が空の文書の下書きを
+--                             消したときに置く。あれば消し待ちの版がなくても GC を積み、GC が部品を片付けたトランザクションで、
+--                             終わっていない保存のジョブも 7 日以内に失敗・中止した保存のジョブもなければ消す。M12 の段 3。
+--                             §4「保存と版（M12）」）
 
 -- ===== 中身ごとの事実（0009。検索と表示の列。台帳の 1 行に 1 行。解析の結果から純粋な関数で作る）=====
 CREATE TABLE media_facts (
@@ -854,7 +855,8 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   走査の例外）。
 - **ゴミ箱を空にする処理**（`Library::empty_trash`・`items::plan_empty_trash`・`items::delete_trashed`。段 3 で GC と同じ部品の上に作り
   直した。利用者の決定 6：猶予中のファイル・元・アンカーも照合せずにすぐ消す）：台帳の門を持って、
-  1. トランザクション 1：消すアイテム（ゴミ箱の部分索引 `idx_items_trashed`）と、消しうる中身（アイテムの今・版が持つファイル・版の入力が
+  1. トランザクション 1：消すアイテム（ゴミ箱の部分索引 `idx_items_trashed` の順に `SELECT id FROM items WHERE trashed_at IS NOT NULL
+     ORDER BY trashed_at, id`。`ORDER BY id` にすると items を走査する）と、消しうる中身（アイテムの今・版が持つファイル・版の入力が
      使うアンカーのファイル）を集め、`'delete'` で予告してコミット（このあとゴミ箱に入れられたものは、次に空にするまで残す）。
   2. トランザクション 2：決めたアイテムを 1 件ずつ（主キー・`UNIQUE(item_id, version)`・入力の主キー・下書きの主キーで）消す前に、版が持つ
      ファイルの hash・入力が使うアンカーの ID・版と下書きの文書の根を集めてから行を消す（版・入力・下書きは CASCADE）。どの入力からも
@@ -896,27 +898,30 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   -- ほかに settings の 'gc.parts'（文書の部品の印）があれば積む
   ```
 
-  候補は、カーソル（置き換えの時刻と版の行の ID）の次から 16 個ずつ、置き換えの古い順に読む。共有（ほかの hold の版・アイテムの今・
-  アンカーが同じ台帳の行を参照する）も同じ問い合わせで見る（3 つの EXISTS はそれぞれ `sqlite_autoindex_items_1`・`idx_item_versions_file_blob`・
-  `idx_edit_anchors_blob`。`candidates_follow_the_cursor_and_see_sharing` の EXPLAIN）：
+  候補は、カーソル（置き換えの時刻と版の行の ID）の次から 16 個ずつ、置き換えの古い順に読む（共有していても候補にする。共有は照合が
+  一致したあとに門の中で見る。下の「GC の手順」）：
 
   ```sql
-  SELECT v.id, v.item_id, v.version, v.replaced_at, v.file_blob_id, b.hash, b.ext,
-         EXISTS (SELECT 1 FROM items i WHERE i.hash = b.hash)
-      OR EXISTS (SELECT 1 FROM item_versions w WHERE w.file_blob_id = v.file_blob_id AND w.file_state = 'hold')
-      OR EXISTS (SELECT 1 FROM edit_anchors a WHERE a.blob_id = v.file_blob_id)
+  SELECT v.id, v.item_id, v.version, v.replaced_at, v.file_blob_id, b.hash, b.ext
     FROM item_versions v JOIN blobs b ON b.id = v.file_blob_id
    WHERE v.file_state = 'waiting' AND v.replaced_at <= ?1 AND (v.replaced_at, v.id) > (?2, ?3)
    ORDER BY v.replaced_at, v.id LIMIT ?4;
+  -- 共有（ほかの hold の版・アイテムの今・アンカーが同じ台帳の行を参照する。門の中で。3 つの EXISTS はそれぞれ
+  -- sqlite_autoindex_items_1・idx_item_versions_file_blob・idx_edit_anchors_blob。candidates_follow_the_cursor_and_sharing_uses_indexes の EXPLAIN）
+  SELECT EXISTS (SELECT 1 FROM items i WHERE i.hash = ?hash)
+      OR EXISTS (SELECT 1 FROM item_versions w WHERE w.file_blob_id = ?blob AND w.file_state = 'hold')
+      OR EXISTS (SELECT 1 FROM edit_anchors a WHERE a.blob_id = ?blob);
   ```
 
 - **GC の手順**（候補ごと。途中経過 `{"v":1,"phase","cursor","released","shared","kept","deferred","anchors","parts","files"}` は候補ごとの
   トランザクションで書く）：
-  - 共有：台帳の門を持って、まだ消し待ちで同じ台帳の行を指し、まだ共有なら `released` にする（下の UPDATE。ファイルは消さない）。
-  - 共有でない：門の外で照合する（`save::verify_version`）。合わなければ
-    `UPDATE item_versions SET file_state = 'kept' WHERE id = ? AND file_state = 'waiting' AND file_blob_id = ?`、照らせなければ何も変えない
-    （カーソルだけ進める）。一致すれば台帳の門を取り、トランザクション 1 で `SELECT file_state, file_blob_id FROM item_versions WHERE id = ?`
-    で確かめ直し（共有になっていれば `released` にするだけ）、`ledger::announce(hash, ext, 'delete', job)` をコミット、トランザクション 2 で
+  - どの候補も（共有しているものも）、門の外で照合する（`save::verify_version`）。共有を照合せずに `released` にすると、共有相手が
+    消えたときに照合していない版のファイルが消えるため（ADR-170 (2)）。合わなければ
+    `UPDATE item_versions SET file_state = 'kept' WHERE id = ? AND file_state = 'waiting' AND file_blob_id = ?`（台帳の行を参照し続ける）、
+    照らせなければ何も変えない（カーソルだけ進める）。一致すれば台帳の門を取り、トランザクション 1 で
+    `SELECT file_state, file_blob_id FROM item_versions WHERE id = ?` で確かめ直し、共有していれば（前からか、作り直している間に使われた）
+    下の UPDATE で `released` にするだけ（ファイルは消さない）、していなければ `ledger::announce(hash, ext, 'delete', job)` をコミット、
+    トランザクション 2 で
 
     ```sql
     UPDATE item_versions SET file_state = 'released', file_blob_id = NULL
@@ -949,10 +954,21 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   DELETE FROM edit_objects WHERE id = ?1;
   ```
 
-  部品が孤立しうるとき（下書きを置き換える・捨てる、上書き・別名の保存のジョブが版を足さずに終わる、版 0 に戻した保存が空の文書の
-  下書きを消す）は settings の `'gc.parts'` を置き、GC が片付けたトランザクションで
-  `DELETE FROM settings WHERE key = 'gc.parts' AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('queued','running','paused') AND kind = 'edit')`
-  （終わっていない保存があれば、その根があとで孤立しうるので印を残す）。保存のジョブは、入力が指す部品を置くのと同じトランザクションで
+  部品が孤立しうるとき（下書きを置き換える・捨てる、上書き・別名の保存のジョブが版を足さずに終わる（待ち・一時停止のまま中止されたときは、
+  ハンドラを通らないので `JobHandler::canceled_while_idle` が中止と同じトランザクションで置く）、版 0 に戻した保存が空の文書の下書きを消す）は
+  settings の `'gc.parts'` を置き、GC が片付けたトランザクションで
+
+  ```sql
+  DELETE FROM settings WHERE key = 'gc.parts'
+     AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('queued','running','paused') AND kind = 'edit')
+     AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('failed','canceled') AND kind = 'edit' AND finished_at >= ?since);  -- どちらも idx_jobs_queue
+  ```
+
+  （終わっていない保存と、7 日以内（`?since` は根と同じ今 − 7 日）に失敗・中止した保存は根として残すので、その部品があとで孤立しうるので
+  印を残す。7 日を過ぎて根から外れると、残した印で GC が積まれて片付け、印も消える。`the_parts_mark_outlives_failed_saves_until_their_roots_expire`）。
+  保存を積む口（`start_save`）は、同じアイテムの終わっていない保存のジョブがあれば何も置かずに `Busy` で断る（`save::pending_save`：
+  `SELECT id, input_json FROM jobs WHERE state IN ('queued','running','paused') AND kind = 'edit'`（`idx_jobs_queue`）の入力のアイテムを比べる。
+  部品を置くのと同じトランザクション）。保存のジョブは、入力が指す部品を置くのと同じトランザクションで
   積む（`JobManager::enqueue_with`。間に片付けが入っても、積んだジョブの根として残る）。
 - **整合性の数**（M12 の段 3。問題には数えない）：設定の「いま確かめる」で、GC の照合が合わずに残した版
   `SELECT count(*) FROM item_versions WHERE file_state = 'kept'`（版の表を走査する。いま確かめるときだけ）と、7 日とバックアップの条件を
