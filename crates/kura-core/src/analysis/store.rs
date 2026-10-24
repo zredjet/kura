@@ -544,6 +544,8 @@ pub fn sync_plan(tx: &Connection, current: &PlanFingerprint) -> Result<PlanSync>
 /// 見出しを読めなかった HEIC・HEIF。決定 15）を pending に戻し、今の指紋を置く。最初（前の指紋がない）は戻さない。
 ///
 /// 戻す UPDATE は事実の表の全件の走査になる（デコーダが変わったときだけの一度きり。`sync_plan` と同じ例外）。
+/// 中身から items を引くのは、写しの `items.blob_id` でなく正本の hash で台帳を通る（一度きりの書き込みなので、写しの
+/// 食い違いに左右されないほうを選ぶ。検索・表示の読み取りは `blob_id` で引く。.claude/rules/database.md）。
 pub fn sync_decoders(tx: &Connection, current: &DecoderFingerprint) -> Result<usize> {
     let stored: Option<DecoderFingerprint> = settings::get(tx, DECODERS_KEY)?;
     let mut reset = 0;

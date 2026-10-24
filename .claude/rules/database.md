@@ -46,5 +46,6 @@ paths:
 - 中身に依る書き込み（解析・サムネイル・プロキシの結果）は `WHERE id = ? AND hash = ?` のようにハッシュを条件にする
   （解析・サムネイルは M11、プロキシは M12 で入れた）。
 - `items.blob_id` は台帳の行の ID の写し（0010 の AFTER のトリガ `items_blob_id_ai`・`items_blob_id_au` が hash から引いて入れる）。
-  書き手は blob_id を書かない。中身ごとの表（`media_facts`・`analysis_results`）を items から引くときは、台帳を hash で通らず
-  `i.blob_id` で引く。
+  書き手は blob_id を書かない。検索・表示の読み取りで中身ごとの表（`media_facts`・`analysis_results`）を items から引くときは、
+  台帳を hash で通らず `i.blob_id` で引く（一度きりの書き込み（`analysis::store::sync_decoders` など）は、写しの食い違いに
+  左右されない正本の hash で台帳を通ってよい）。

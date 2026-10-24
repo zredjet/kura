@@ -5,7 +5,7 @@ import { stillOriginal } from './still';
 
 const URL = 'kura://localhost/play/x';
 
-// design.md §3.1「アニメのプレビュー」：シアターでは先頭のコマで止めたまま。<img> に元の GIF・APNG・アニメの WebP を
+// design.md §3.1「アニメのプレビュー」：帯を待つ間・作れないときは先頭のコマ。<img> に元の GIF・APNG・アニメの WebP を
 // 置くと WebKit が自分で回す（prefers-reduced-motion も見ない）
 describe('stillOriginal（アニメの画像は元のファイルを <img> に置かない）', () => {
   it('アニメの画像は、サムネイル（先頭のコマ）があれば元のファイルを出さない', () => {

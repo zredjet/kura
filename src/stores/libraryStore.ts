@@ -167,10 +167,11 @@ async function restoreOnce(set: (state: Partial<LibraryState>) => void): Promise
 }
 
 /**
- * 開いていたライブラリから別のライブラリを開く・作るのに失敗したあと、画面を Rust に合わせる。Rust は前のライブラリを
- * 閉じてから開く（src-tauri の `AppState::replace_session`）ので、失敗すると前のライブラリも閉じている。どれも開いて
- * いなければ（`library_info` が NotFound）初回の画面に戻し、開けなかった理由と場所を出す（`restoreError` と同じカード。
- * design.md §3.1「ライブラリの更新」）。まだ開いていれば（閉じる前に失敗した）そのまま。
+ * 開いていたライブラリから別のライブラリを開く・作るのに失敗したあと、画面を Rust に合わせる。既存のライブラリへは、
+ * Rust が開く先のロックを先に取り、取れなければ（ほかのアプリが開いている。`LibraryInUse`）前のライブラリを開いたまま
+ * 返す。それ以外の失敗・作るときは前のライブラリを閉じてから開く（src-tauri の `AppState::replace_session`。ADR-168）
+ * ので、前のライブラリも閉じている。どれも開いていなければ（`library_info` が NotFound）初回の画面に戻し、開けなかった
+ * 理由と場所を出す（`restoreError` と同じカード。design.md §3.1「ライブラリの更新」）。まだ開いていればそのまま。
  */
 async function followFailedSwitch(
   set: (state: Partial<LibraryState>) => void,
