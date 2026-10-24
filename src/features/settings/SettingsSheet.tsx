@@ -181,6 +181,7 @@ function LibraryTab() {
   const reveal = (path: string) => {
     revealPath(path).catch(fail);
   };
+  const summary = integrity === null ? null : integritySummary(integrity);
 
   return (
     <>
@@ -219,8 +220,9 @@ function LibraryTab() {
       <section className={styles.group} aria-label={t.integrity}>
         <h3 className={styles.groupTitle}>{t.integrity}</h3>
         <p className={styles.text} role="status">
-          {integrity === null ? t.integrityPending : integritySummary(integrity).text}
+          {summary === null ? t.integrityPending : summary.text}
         </p>
+        {summary?.notes && <p className={styles.hint}>{summary.notes}</p>}
         <div className={styles.buttons}>
           <Button size="sm" disabled={checking} onClick={check}>
             {checking ? t.checking : t.checkAgain}

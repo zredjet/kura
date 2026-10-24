@@ -14,13 +14,28 @@ const clean = {
 
 describe('整合性チェックの結果', () => {
   it('どれも 0 なら一致している（書きかけを片付けた数は問題に数えない）', () => {
-    expect(integritySummary(clean)).toEqual({ healthy: true, text: ja.settings.integrityOk });
-  });
-
-  it('GC が残した版・7 日を過ぎた消し待ちの版（M12）は問題に数えない', () => {
-    expect(integritySummary({ ...clean, keptVersions: 2, overdueVersions: 3 })).toEqual({
+    expect(integritySummary(clean)).toEqual({
       healthy: true,
       text: ja.settings.integrityOk,
+      notes: null,
+    });
+  });
+
+  it('GC が残した版・7 日を過ぎた消し待ちの版（M12）は問題に数えず、件数だけを添える', () => {
+    expect(integritySummary({ ...clean, keptVersions: 2, overdueVersions: 1234 })).toEqual({
+      healthy: true,
+      text: ja.settings.integrityOk,
+      notes: '照合が合わずに残した版 2・7 日を過ぎた消し待ちの版 1,234（問題ではありません）',
+    });
+    expect(integritySummary({ ...clean, keptVersions: 0, overdueVersions: 3 }).notes).toBe(
+      '7 日を過ぎた消し待ちの版 3（問題ではありません）',
+    );
+    // 起動時のチェック（数えていない）・0 件なら添えない
+    expect(integritySummary({ ...clean, keptVersions: 0, overdueVersions: 0 }).notes).toBeNull();
+    expect(integritySummary({ ...clean, missingFiles: 1, keptVersions: 2 })).toEqual({
+      healthy: false,
+      text: 'ファイルがない項目 1',
+      notes: '照合が合わずに残した版 2（問題ではありません）',
     });
   });
 
@@ -28,6 +43,7 @@ describe('整合性チェックの結果', () => {
     expect(integritySummary({ ...clean, unreferencedBlobs: 2 })).toEqual({
       healthy: false,
       text: 'どの項目も使っていないファイル 2',
+      notes: null,
     });
   });
 
