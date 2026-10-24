@@ -324,6 +324,8 @@ mod tests {
     /// 別のプロセス（Kura を 2 つ動かした・開発版と本番版）が同じ前の版のライブラリを同時に開いても、どちらも開け、版は
     /// 最新のまま（下がらない）で、次もふつうに開ける（D1。ここではスレッドごとの接続で 2 つのプロセスの代わりにする。
     /// アプリの中の鍵 `AppState::opening` は通らない）。2 つ目を 0〜4 ms 遅らせ、先に開いた側が当てている途中に版を読ませる。
+    /// ふだんはライブラリのロック（`library.lock`）が 2 つ目を断るので、ここでは flock が使えないファイルシステムと同じく
+    /// ロックなしで開く（`LibraryLock::unlocked`。そのときはマイグレーションの読み直しだけが守る）。
     #[test]
     fn two_processes_opening_the_same_library_at_once_both_open_and_keep_the_version() {
         let latest = crate::db::MIGRATIONS.len();
@@ -340,7 +342,8 @@ mod tests {
                         if i == 1 {
                             std::thread::sleep(std::time::Duration::from_millis(round % 5));
                         }
-                        Library::open(&root)
+                        crate::library::LibraryLock::unlocked(&root)
+                            .and_then(|lock| Library::open_locked(lock, &UpgradeHooks::default()))
                             .map(|lib| lib.migration().to)
                             .map_err(|e| e.to_string().chars().take(200).collect::<String>())
                     })
@@ -370,6 +373,47 @@ mod tests {
                 "round {round}: {versions:?}"
             );
         }
+    }
+
+    /// ほかのアプリがライブラリのロックを持っていれば、前の版のライブラリでも `LibraryInUse` で断り、何もしない：知らせない・
+    /// フォルダを作り直さない・空きを確かめない・バックアップを取らない・当てない。放せば、ふつうに新しい版にして開ける。
+    #[test]
+    fn a_library_held_by_another_app_is_refused_before_anything_happens() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("L.kuralib");
+        v6_library(&root);
+        assert!(!root.join("thumbs").exists());
+        let other = crate::library::LibraryLock::acquire(&root).unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mut hooks, events) = recording(Some(u64::MAX));
+        let seen = asked.clone();
+        hooks.free_space = Some(Arc::new(move |_| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(u64::MAX)
+        }));
+        let err = Library::open_with(&root, &hooks).err().unwrap();
+        assert!(matches!(err, CoreError::LibraryInUse), "{err}");
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!root.join("thumbs").exists(), "フォルダを作り直さない");
+        assert!(
+            backup::list(&crate::library::Layout::new(&root))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(version_of(&root), 6);
+
+        drop(other);
+        let lib = Library::open_with(&root, &hooks).unwrap();
+        assert_eq!(lib.migration().from, 6);
+        assert!(root.join("thumbs").is_dir());
+        assert_eq!(backup::list(lib.layout()).unwrap().len(), 1);
+        assert_eq!(events.lock().unwrap().len(), 2);
+        // 開いている間は、同じプロセスで開き直そうとしても断る
+        assert!(matches!(
+            Library::open(&root).err(),
+            Some(CoreError::LibraryInUse)
+        ));
     }
 
     /// 新しい版の Kura の DB は、当て始めないので知らせず、理由を戻り値で返す。

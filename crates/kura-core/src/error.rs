@@ -33,6 +33,12 @@ pub enum CoreError {
     /// ライブラリの DB を新しい版にできなかった（開くのを失敗にする。画面に出す説明）。
     #[error("{0}")]
     Upgrade(#[from] UpgradeError),
+    /// ほかのアプリ（プロセス）が同じライブラリを開いている（ライブラリのロック `library.lock` を取れない。
+    /// `library::LibraryLock`。開く側は何もせずに断る）。
+    #[error(
+        "このライブラリはほかのアプリで開かれています。同じライブラリを 2 つのアプリで同時に開くことはできません。もう一方を終了してから開き直してください"
+    )]
+    LibraryInUse,
 }
 
 /// ライブラリの DB を新しい版にできなかった理由（docs/data-model.md §5）。当てる前に断ったもの（`Newer`・`NoSpace`・
@@ -166,6 +172,7 @@ impl CoreError {
             Self::ToolMissing(_) => "ToolMissing",
             Self::Tool(_) => "ToolFailed",
             Self::Upgrade(_) => "Upgrade",
+            Self::LibraryInUse => "LibraryInUse",
         }
     }
 

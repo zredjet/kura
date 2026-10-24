@@ -61,4 +61,18 @@ describe('サイドバー・設定の「別のライブラリを開く…」「�
     await openOther();
     expect(notify).toHaveBeenCalledWith(ja.welcome.failed(tooNew.message));
   });
+
+  // M12：ほかのアプリが開いているライブラリへは切り替えず、Rust は今のライブラリを閉じない。知らせの一行に理由を出す
+  it('ほかのアプリが開いているライブラリ（LibraryInUse）なら、今のライブラリのまま知らせの一行', async () => {
+    const inUse = new IpcError({
+      code: 'LibraryInUse',
+      message:
+        'このライブラリはほかのアプリで開かれています。同じライブラリを 2 つのアプリで同時に開くことはできません。もう一方を終了してから開き直してください',
+    });
+    vi.mocked(pickExistingLibrary).mockResolvedValue('/B.kuralib');
+    useLibraryStore.setState({ open: vi.fn(async () => Promise.reject(inUse)) });
+    await openOther();
+    expect(useLibraryStore.getState()).toMatchObject({ status: 'open', info });
+    expect(notify).toHaveBeenCalledWith(ja.welcome.failed(inUse.message));
+  });
 });

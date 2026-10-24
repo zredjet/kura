@@ -6,12 +6,22 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use kura_core::capture::LoginBrowser;
 use kura_core::edit::EngineFactory;
 use kura_core::library::{
-    EventSink, LibrarySession, Services, UpgradeEvent, UpgradeHooks, upgrade::UpgradeNotifyFn,
+    EventSink, LibraryLock, LibrarySession, Services, UpgradeEvent, UpgradeHooks, is_library,
+    upgrade::UpgradeNotifyFn,
 };
 use kura_core::playback::PlaybackSupport;
 
 use crate::config::{self, AppConfig, DownloadPrefs, PlayerPrefs};
 use crate::error::{AppError, AppErrorCode};
+
+/// 開く・作るライブラリ（[`AppState::replace_session`]）。
+#[derive(Debug, Clone, Copy)]
+pub enum LibraryTarget<'a> {
+    /// 既存のライブラリを開く。
+    Open(&'a Path),
+    /// 新しいライブラリを作って開く。
+    Create(&'a Path),
+}
 
 /// Tauri の状態として持つもの。
 pub struct AppState {
@@ -100,24 +110,45 @@ impl AppState {
     }
 
     /// ライブラリを開く（作る）。前のライブラリは閉じ、`remember` なら場所を「前回のライブラリ」として保存する。開く・作る・
-    /// 戻すは 1 つずつ（[`AppState::opening`] の鍵）。
+    /// 戻すは 1 つずつ（[`AppState::opening`] の鍵）。別のライブラリへ切り替えるときは、前のライブラリを閉じる前に開く先の
+    /// ロックを取り、ほかのアプリが開いていれば前のライブラリを残したまま `LibraryInUse` を返す（M12）。
     pub fn replace_session(
         &self,
-        open: impl FnOnce() -> kura_core::Result<LibrarySession>,
+        target: LibraryTarget<'_>,
+        sink: EventSink,
+        services: Services,
         remember: bool,
     ) -> Result<Arc<LibrarySession>, AppError> {
         let _opening = self.opening();
-        self.replace_session_locked(open, remember)
+        self.replace_session_locked(target, sink, services, remember)
     }
 
     /// [`AppState::replace_session`] の、鍵（[`AppState::opening`]）を持っている呼び手のためのもの。
     pub fn replace_session_locked(
         &self,
-        open: impl FnOnce() -> kura_core::Result<LibrarySession>,
+        target: LibraryTarget<'_>,
+        sink: EventSink,
+        services: Services,
         remember: bool,
     ) -> Result<Arc<LibrarySession>, AppError> {
-        self.close();
-        let session = Arc::new(open()?);
+        let session = match target {
+            LibraryTarget::Open(path) => {
+                // 閉じる前に取る（取れなければ、前のライブラリを閉じずに断る）
+                let lock = self.lock_before_switching(path)?;
+                self.close();
+                match lock {
+                    Some(lock) => LibrarySession::open_locked(lock, sink, services)?,
+                    None => LibrarySession::open(path, sink, services)?,
+                }
+            }
+            // 作るのはまだない場所なので、ほかのアプリが開いていることはない（作るのに失敗すれば前のライブラリは閉じている。
+            // フロントは初回の画面に戻って理由を出す）
+            LibraryTarget::Create(path) => {
+                self.close();
+                LibrarySession::create(path, sink, services)?
+            }
+        };
+        let session = Arc::new(session);
         let root = session.library().layout().root().to_path_buf();
         if let Ok(mut slot) = self.session.write() {
             *slot = Some(session.clone());
@@ -219,6 +250,20 @@ impl AppState {
         config::save(&self.config_path, &config)
             .map_err(|err| AppError::internal(format!("設定を保存できませんでした: {err}")))?;
         Ok(out)
+    }
+
+    /// 別のライブラリへ切り替える前に、開く先 `path` のライブラリのロックを取る（取れなければ `LibraryInUse` などで、前の
+    /// ライブラリはそのまま）。何も開いていないとき（開く処理が取る）、開いているのと同じライブラリのとき（場所の書き方が
+    /// 違っても。閉じれば自分のロックが外れる）、ライブラリでない場所（開く処理が NotFound で断る。ロックファイルを作らない）は
+    /// 取らずに None。
+    fn lock_before_switching(&self, path: &Path) -> Result<Option<LibraryLock>, AppError> {
+        let Some(current) = self.current() else {
+            return Ok(None);
+        };
+        if !is_library(path) || current.library().lock().is_for(path) {
+            return Ok(None);
+        }
+        Ok(Some(LibraryLock::acquire(path)?))
     }
 
     /// 開いているライブラリを閉じる（実行中のジョブは次回の起動で再開する）。
@@ -336,7 +381,9 @@ mod tests {
                         barrier.wait();
                         let session = state
                             .replace_session(
-                                || LibrarySession::open(&root, Arc::new(|_| {}), services()),
+                                LibraryTarget::Open(&root),
+                                Arc::new(|_| {}),
+                                services(),
                                 false,
                             )
                             .unwrap();
@@ -363,13 +410,9 @@ mod tests {
         let state = AppState::with_engine(dir.path().join("app.json"), factory.clone());
         let session = state
             .replace_session(
-                || {
-                    LibrarySession::create(
-                        &dir.path().join("L"),
-                        Arc::new(|_| {}),
-                        Services::new(Arc::new(NoBackend)).with_engine(factory.clone()),
-                    )
-                },
+                LibraryTarget::Create(&dir.path().join("L")),
+                Arc::new(|_| {}),
+                Services::new(Arc::new(NoBackend)).with_engine(factory.clone()),
                 false,
             )
             .unwrap();
@@ -384,6 +427,47 @@ mod tests {
         assert!(!Arc::ptr_eq(&before, &after));
         assert_eq!(factory.0.load(Ordering::SeqCst), 2);
         state.set_tool_path("mpv", None).unwrap();
+        state.close();
+    }
+
+    /// 別のライブラリへ切り替えるとき、ほかのアプリが開いていれば（ロックを持っていれば）`LibraryInUse` で断り、今の
+    /// ライブラリは開いたまま使える。放されれば切り替えられ、前のライブラリのロックは閉じたときに外れる（握った Arc が残って
+    /// いても）。開いているのと同じライブラリは、場所の書き方が違っても開き直せる。
+    #[test]
+    fn switching_to_a_library_held_elsewhere_keeps_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("A.kuralib"), dir.path().join("B.kuralib"));
+        drop(kura_core::library::Library::create(&b).unwrap());
+        let state =
+            AppState::with_engine(dir.path().join("app.json"), Arc::new(Counting::default()));
+        let services = || Services::new(Arc::new(NoBackend));
+        let open = |target| state.replace_session(target, Arc::new(|_| {}), services(), true);
+        let first = open(LibraryTarget::Create(&a)).unwrap();
+        first.wait_ready();
+
+        // ほかのアプリの代わりに、同じプロセスで B を開いておく
+        let other = kura_core::library::Library::open(&b).unwrap();
+        let err = open(LibraryTarget::Open(&b)).err().unwrap();
+        assert_eq!(err.code, AppErrorCode::LibraryInUse);
+        let current = state.session().unwrap();
+        assert!(Arc::ptr_eq(&current, &first), "今のライブラリが残る");
+        assert_eq!(current.info().unwrap().item_count, 0, "DB も開いたまま");
+        assert_eq!(state.last_library().as_deref(), Some(a.as_path()));
+
+        // 同じライブラリを別の書き方（シンボリックリンク）で開き直すのは、自分のロックに当たらない
+        let link = dir.path().join("link.kuralib");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let reopened = open(LibraryTarget::Open(&link)).unwrap();
+        assert!(!Arc::ptr_eq(&reopened, &first));
+        reopened.wait_ready();
+
+        drop(other);
+        let switched = open(LibraryTarget::Open(&b)).unwrap();
+        switched.wait_ready();
+        assert_eq!(state.last_library().as_deref(), Some(b.as_path()));
+        // 前のライブラリ（A）は閉じてロックが外れている（Arc を握っていても）
+        drop(kura_core::library::Library::open(&a).unwrap());
+        drop((first, reopened));
         state.close();
     }
 }

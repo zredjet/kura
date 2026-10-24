@@ -105,3 +105,44 @@ describe('Welcome（ライブラリを開けなかったとき。M11）', () => 
     expect(alert).toHaveTextContent('スキーマ 12');
   });
 });
+
+describe('Welcome（ほかのアプリが開いているライブラリ。M12）', () => {
+  it('起動時に前回のライブラリをほかのアプリが開いていたら、見出し・説明・場所を出す', async () => {
+    useLibraryStore.setState({
+      restoreError: {
+        path: '/Users/me/Pictures/L.kuralib',
+        error: {
+          code: 'LibraryInUse',
+          message: 'このライブラリはほかのアプリで開かれています。同じライブラリを…',
+        },
+      },
+    });
+    render(<Welcome />);
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('このライブラリはほかのアプリで開かれています');
+    expect(alert).toHaveTextContent(
+      '同じライブラリを 2 つのアプリで同時に開くことはできません。もう一方を終了してから開き直してください。',
+    );
+    expect(alert).toHaveTextContent('~/Pictures/L.kuralib');
+    expect(screen.queryByText(/前回のライブラリが見つかりません/)).toBeNull();
+  });
+
+  it('既存のライブラリを開いて、ほかのアプリが開いていたら理由を出す', async () => {
+    vi.mocked(checkLocation).mockResolvedValue({
+      path: DEFAULT,
+      status: 'existingLibrary',
+      syncService: null,
+    });
+    vi.mocked(openLibrary).mockRejectedValue(
+      new IpcError({
+        code: 'LibraryInUse',
+        message: 'このライブラリはほかのアプリで開かれています。',
+      }),
+    );
+    render(<Welcome />);
+    fireEvent.click(await screen.findByRole('button', { name: 'このライブラリを開く' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(ja.libraryOpen.failure.LibraryInUse);
+    expect(alert).toHaveTextContent(ja.libraryOpen.inUseDetail);
+  });
+});

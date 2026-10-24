@@ -77,7 +77,8 @@ impl From<IntegrityReport> for IntegrityDto {
 }
 
 /// 前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかったか（`error` が空）、
-/// 開けなかった（`error` に理由。`code` は `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` など）。
+/// 開けなかった（`error` に理由。`code` は `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed`・`LibraryInUse`
+/// （ほかのアプリが開いている）など）。
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryRestoreDto {

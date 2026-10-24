@@ -8,6 +8,7 @@
 ```text
 Kura Library.kuralib/
   library.sqlite            # DB（-wal, -shm も同居）
+  library.lock              # ライブラリのロック（中身は空。開いている間 flock を持つ。2 つ目のアプリは開けない。M12。下の注）
   files/ab/cd/<blake3>.<ext>    # 実ファイル（内容アドレス。ハッシュ先頭 2 文字 / 次の 2 文字）。1 つに台帳 blobs の 1 行
   thumbs/ab/<blake3>_s.{jpg,png}  # サムネイル 長辺 512px（グリッド用）。透明のないものは JPEG、透明のあるものは PNG（M11）
   thumbs/ab/<blake3>_l.{jpg,png}  # サムネイル 長辺 1600px（インスペクタ・プレビュー用）
@@ -34,6 +35,17 @@ Kura Library.kuralib/
 - 既定の場所は初回起動時にユーザーが選ぶ（候補：`~/Pictures/Kura Library.kuralib`）。外付けディスクも可。
 - iCloud Drive など同期フォルダの中は非推奨（SQLite の WAL と相性が悪い）。選ばれたら警告する。
 - マイグレーションを当てる前にも、いつもの名前でバックアップを作る（7 個の保持に乗る。§5）。
+- **ライブラリのロック**（`library::LibraryLock`。M12、ADR-156 (6)・M11 の決定 22）：開くときは、何より先に（足りないフォルダを
+  作り直す・DB を開く・当てる前のバックアップ・マイグレーション・staging の掃除・更新の知らせより前に）`library.lock` を開き
+  （なければ作り）、排他のロックを取る（std の `File::try_lock`。macOS・Linux とも `flock(LOCK_EX | LOCK_NB)`）。ほかのアプリ
+  （Kura を 2 つ動かした・開発版と本番版・`kura-devtools`）が持っていれば `CoreError::LibraryInUse`（アプリの code も
+  `LibraryInUse`）で断り、ライブラリには何もしない。新しいライブラリは根のフォルダを作ってから取る。DB のファイル自体には
+  掛けない（SQLite の fcntl のロックと干渉しうる）。flock は開いたファイルごとなので、同じプロセスでも別々に開けばぶつかる。
+  閉じるとき（`LibrarySession::close` の最後の `Library::close`）は、DB を閉じてから明示的に放す（IPC が `Arc` で握った
+  ライブラリが残っても、開き直しが自分のロックに当たらない）。プロセスが落ちれば OS が放す。std はファイルを `O_CLOEXEC` で
+  開くので、ジョブが起動する子プロセス（ffmpeg・SVG の働き手など）には継がれない。ロックファイルは消さない（消すと、消す前に
+  開いた側と作り直した側が別々のファイルでロックを取れてしまう）。flock が使えないファイルシステム（ENOTSUP・ENOLCK など）
+  では、警告をログに残してロックなしで開く（そのときは §5 の 3 の読み直しだけが守る）。
 - **バックアップから戻す**（アプリには入れない。ADR-121）：Kura を終了し、`library.sqlite`・`library.sqlite-wal`・`library.sqlite-shm` を別の場所へ移してから、`backups/` の戻したいファイルを `library.sqlite` という名前でライブラリのフォルダへコピーして開く。バックアップより後に取り込んだファイルは `files/` に残り、開いたときの整合性チェックで「DB にないファイル」として数えられる（消えはしない）。
 
 ## 2. 共通方針
@@ -675,7 +687,8 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
 
 ## 5. マイグレーションの当て方（M11。`crates/kura-core/src/db/migrate.rs`）
 
-`Library::open` が `Db::open_with` で当てる。版は `PRAGMA user_version`（当てたマイグレーションの数）。
+`Library::open` が `Db::open_with` で当てる。版は `PRAGMA user_version`（当てたマイグレーションの数）。その前にライブラリのロック
+（`library.lock`。§1）を取り、ほかのアプリが開いていれば以下のどれもせずに `LibraryInUse` で断る（M12）。
 
 1. **DB の方が新しい**（版がこの Kura の知るより大きい）なら、当てずに開くのを失敗にする。
 2. **空き容量の確かめ**：未適用のマイグレーションがある既存の DB（版 1 以上）では、まず要る空きを DB の大きさ（頁の数 × 頁の大きさ）
@@ -717,9 +730,11 @@ set ユニットの件数・合計時間・種類は表示のたびに集計し�
 8. アプリはライブラリを開く・作る・戻すを 1 つの鍵（`AppState::opening`）で順に行う。起動の restore と開く操作が重なっても、
    新しい版にするのとその前のバックアップは 1 回だけ（2 回目は当て終えた版を開く。src-tauri の
    `opening_the_same_library_in_parallel_upgrades_once`）。別のプロセス（Kura を 2 つ動かした・開発版と本番版）が同じライブラリを
-   同時に開いたときは、この鍵は効かないが、3 の読み直しとバックアップの一時ファイルの名前で、どちらも開け、版は下がらない
-   （`two_processes_opening_the_same_library_at_once_both_open_and_keep_the_version`。スレッドごとの接続で代わりに確かめる）。
-   遅れた側は、先の側の当てている途中の版から当てる前のバックアップを作ることがある（秒が同じなら作らない）。
+   開くのは、M12 からライブラリのロック（§1）が 2 つ目を `LibraryInUse` で断る（`a_library_held_by_another_app_is_refused_before_anything_happens`）。
+   flock が使えないファイルシステムでロックなしに同時に開いたときは、3 の読み直しとバックアップの一時ファイルの名前で、どちらも
+   開け、版は下がらない（`two_processes_opening_the_same_library_at_once_both_open_and_keep_the_version`。スレッドごとの接続と
+   ロックなしの開き方で代わりに確かめる）。遅れた側は、先の側の当てている途中の版から当てる前のバックアップを作ることがある
+   （秒が同じなら作らない）。
 
 **10 万件の時間**（2026-10-20、M4 Max、同梱の SQLite 3.53、ページキャッシュは温まった状態、ほかの作業でロードアベレージ 9〜12。
 `bench migrate --runs 3`。開くところから数えた時間）：

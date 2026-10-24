@@ -11,7 +11,7 @@ use crate::dto::{
     LibraryUsageDto, LocationCheckDto,
 };
 use crate::error::{AppError, AppErrorCode};
-use crate::state::{AppState, event_sink};
+use crate::state::{AppState, LibraryTarget, event_sink};
 
 /// 計測などで、設定を書き換えずに開くライブラリを指定する環境変数。
 const LIBRARY_ENV: &str = "KURA_LIBRARY";
@@ -36,7 +36,9 @@ pub async fn library_create(app: AppHandle, path: String) -> Result<LibraryInfoD
         let state = app.state::<AppState>();
         let services = state.services(&app);
         let session = state.replace_session(
-            || LibrarySession::create(Path::new(&path), sink, services),
+            LibraryTarget::Create(Path::new(&path)),
+            sink,
+            services,
             true,
         )?;
         Ok(session.info()?.into())
@@ -45,7 +47,8 @@ pub async fn library_create(app: AppHandle, path: String) -> Result<LibraryInfoD
 }
 
 /// 既存のライブラリを開く。新しい版にするときは、始まり・終わり・失敗をイベント `library://upgrade` で知らせる。開けなければ
-/// 理由の種類（`LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` など）と説明を返す。
+/// 理由の種類（`LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed`・`LibraryInUse` など）と説明を返す。ほかのアプリが
+/// 開いているライブラリへの切り替え（`LibraryInUse`）では、今のライブラリは開いたまま。
 #[tauri::command]
 #[specta::specta]
 pub async fn library_open(app: AppHandle, path: String) -> Result<LibraryInfoDto, AppError> {
@@ -53,10 +56,8 @@ pub async fn library_open(app: AppHandle, path: String) -> Result<LibraryInfoDto
         let sink = event_sink(app.clone());
         let state = app.state::<AppState>();
         let services = state.services(&app);
-        let session = state.replace_session(
-            || LibrarySession::open(Path::new(&path), sink, services),
-            true,
-        )?;
+        let session =
+            state.replace_session(LibraryTarget::Open(Path::new(&path)), sink, services, true)?;
         log_opened(&session, "ライブラリを開きました");
         Ok(session.info()?.into())
     })
@@ -110,7 +111,7 @@ fn restore_from(
     let last_path = Some(path.to_string_lossy().into_owned());
     let sink = event_sink(app.clone());
     let services = state.services(app);
-    match state.replace_session_locked(|| LibrarySession::open(&path, sink, services), remember) {
+    match state.replace_session_locked(LibraryTarget::Open(&path), sink, services, remember) {
         Ok(session) => {
             log_opened(&session, "起動から前回のライブラリを開くまで");
             Ok(LibraryRestoreDto {

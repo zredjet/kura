@@ -5,6 +5,7 @@ mod integrity;
 mod layout;
 pub mod ledger;
 mod location;
+mod lock;
 mod session;
 pub mod upgrade;
 
@@ -15,6 +16,7 @@ pub use layout::{
 pub use location::{
     LIBRARY_EXT, LocationCheck, LocationStatus, check_location, is_library, normalize_library_path,
 };
+pub use lock::{LOCK_FILE, LibraryLock};
 pub use session::{EventSink, LibraryInfo, LibrarySession, Services};
 pub use upgrade::{UpgradeEvent, UpgradeHooks};
 
@@ -41,7 +43,7 @@ pub fn needs_upgrade(path: &Path) -> Result<bool> {
     Ok(version > 0 && version < crate::db::MIGRATIONS.len())
 }
 
-/// 開いているライブラリ。フォルダ構成と DB を持つ。
+/// 開いているライブラリ。フォルダ構成と DB とライブラリのロックを持つ。
 pub struct Library {
     layout: Layout,
     db: Db,
@@ -50,6 +52,9 @@ pub struct Library {
     /// 取り込み（files/ に置いてから DB に書くまで）とゴミ箱を空にする処理を直列にする鍵。
     /// 取り込みどうしは並べてよい（読み取りの側）。ゴミ箱を空にする処理は 1 つだけ（書き込みの側）。
     ingest: RwLock<()>,
+    /// ライブラリのロック（`library.lock`。ほかのアプリが同じライブラリを開くのを断る）。閉じるときに DB を閉じてから放す
+    /// （[`Library::close`]）。
+    lock: LibraryLock,
 }
 
 impl Library {
@@ -72,8 +77,10 @@ impl Library {
             }
         }
         std::fs::create_dir_all(&path)?;
+        // 根のフォルダを作ってからロックを取る（同じ場所に同時に作るほかのアプリとぶつかれば LibraryInUse）。
         // 新しい DB（版 0）には当てる前の手順がないので、空きの確かめと知らせは要らない
-        Self::open_dir(&path, &UpgradeHooks::default())
+        let lock = LibraryLock::acquire(&path)?;
+        Self::open_dir(lock, &UpgradeHooks::default())
     }
 
     /// 既存のライブラリを開く。足りないフォルダは作り直し、マイグレーションを適用する。
@@ -82,19 +89,24 @@ impl Library {
     }
 
     /// 既存のライブラリを開く。新しい版にするときは、当てる前に空きを確かめ（`hooks.free_space`）、始まり・終わり・失敗を
-    /// 知らせる（`hooks.notify`。`upgrade` の冒頭）。
+    /// 知らせる（`hooks.notify`。`upgrade` の冒頭）。ほかのアプリが開いていれば `CoreError::LibraryInUse` で、何もせずに断る。
     pub fn open_with(path: &Path, hooks: &UpgradeHooks) -> Result<Self> {
-        if !is_library(path) {
-            return Err(CoreError::NotFound(format!(
-                "ライブラリが見つかりません: {}",
-                path.display()
-            )));
-        }
-        Self::open_dir(path, hooks)
+        ensure_library(path)?;
+        // 何より先にロックを取る（断るときは、フォルダの作り直し・DB・バックアップ・知らせのどれもしない）
+        let lock = LibraryLock::acquire(path)?;
+        Self::open_dir(lock, hooks)
     }
 
-    fn open_dir(path: &Path, hooks: &UpgradeHooks) -> Result<Self> {
-        let layout = Layout::new(path);
+    /// 先に取ったロック（[`LibraryLock::acquire`]）で、そのライブラリを開く（別のライブラリから切り替えるとき、今の
+    /// ライブラリを閉じる前に開く先のロックを取っておく。src-tauri の `AppState::replace_session`）。
+    pub fn open_locked(lock: LibraryLock, hooks: &UpgradeHooks) -> Result<Self> {
+        ensure_library(lock.root())?;
+        Self::open_dir(lock, hooks)
+    }
+
+    /// `lock` を取ったライブラリを開く（ロックは呼び手が取る。失敗したら drop で放す）。
+    fn open_dir(lock: LibraryLock, hooks: &UpgradeHooks) -> Result<Self> {
+        let layout = Layout::new(lock.root());
         for dir in SUBDIRS {
             std::fs::create_dir_all(layout.root().join(dir))?;
         }
@@ -138,7 +150,20 @@ impl Library {
             db,
             migration,
             ingest: RwLock::new(()),
+            lock,
         })
+    }
+
+    /// 閉じる：DB を閉じてから、ライブラリのロックを放す（何度呼んでもよい）。閉じたあとの DB の読み書きは `DbClosed`。
+    /// `Arc<Library>` を握るもの（IPC・ジョブ）が残っていても、ここで放すので、開き直しやほかのアプリが当たらない。
+    pub fn close(&self) {
+        self.db.close();
+        self.lock.release();
+    }
+
+    /// ライブラリのロック（同じライブラリかを比べる：[`LibraryLock::is_for`]）。
+    pub fn lock(&self) -> &LibraryLock {
+        &self.lock
     }
 
     /// 取り込みの鍵：files/ にファイルを置いてから DB に書き終えるまで持つ（取り込み・ダウンロード・キャプチャ）。
@@ -209,6 +234,24 @@ impl Library {
             result.bytes += u64::try_from(item.size_bytes).unwrap_or(0);
         }
         Ok(result)
+    }
+}
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// `path` がライブラリ（DB がある）でなければ NotFound。
+fn ensure_library(path: &Path) -> Result<()> {
+    if is_library(path) {
+        Ok(())
+    } else {
+        Err(CoreError::NotFound(format!(
+            "ライブラリが見つかりません: {}",
+            path.display()
+        )))
     }
 }
 

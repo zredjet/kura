@@ -15,7 +15,8 @@ export const commands = {
 	libraryCreate: (path: string) => typedError<LibraryInfoDto, AppError>(__TAURI_INVOKE("library_create", { path })),
 	/**
 	 *  既存のライブラリを開く。新しい版にするときは、始まり・終わり・失敗をイベント `library://upgrade` で知らせる。開けなければ
-	 *  理由の種類（`LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` など）と説明を返す。
+	 *  理由の種類（`LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed`・`LibraryInUse` など）と説明を返す。ほかのアプリが
+	 *  開いているライブラリへの切り替え（`LibraryInUse`）では、今のライブラリは開いたまま。
 	 */
 	libraryOpen: (path: string) => typedError<LibraryInfoDto, AppError>(__TAURI_INVOKE("library_open", { path })),
 	/**
@@ -353,6 +354,11 @@ export type AppErrorCode = "NotFound" | "InvalidQuery" | "Invalid" | "ToolMissin
 "BackupFailed" | 
 /**  ライブラリを新しい版にできない（失敗した 1 つを戻した。それより前に当てたものは残り、途中の版なら説明がそう言う）。 */
 "UpgradeFailed" | 
+/**
+ *  ほかのアプリが同じライブラリを開いている（ライブラリのロック `library.lock` を取れない。開く側は何もしていない。
+ *  別のライブラリへの切り替えなら、今のライブラリは開いたまま。M12）。
+ */
+"LibraryInUse" | 
 /**  大きすぎてその場で用意できない（アニメの帯の 1 辺・画素の数・メモリの予算の全体。やり直しても同じ。M11）。 */
 "TooLarge" | 
 /**  混んでいる（メモリの予算が空いていない。少し待ってやり直せば通りうる。M11）。 */
@@ -1035,7 +1041,8 @@ export type LibraryInfoDto = {
 
 /**
  *  前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかったか（`error` が空）、
- *  開けなかった（`error` に理由。`code` は `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed` など）。
+ *  開けなかった（`error` に理由。`code` は `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed`・`LibraryInUse`
+ *  （ほかのアプリが開いている）など）。
  */
 export type LibraryRestoreDto = {
 	info: LibraryInfoDto | null,

@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use super::Library;
 use super::backup;
 use super::integrity::{IntegrityReport, check_files, clean_staging};
 use super::ledger;
 use super::upgrade::UpgradeHooks;
+use super::{Library, LibraryLock};
 use crate::Result;
 use crate::analysis::plan::PlanFingerprint;
 use crate::analysis::{AnalyzeHandler, AnalyzeShared, store as analysis_store};
@@ -85,9 +85,16 @@ pub struct LibrarySession {
 }
 
 impl LibrarySession {
-    /// 既存のライブラリを開く（新しい版にするときは `services.upgrade` で空きを確かめて知らせる）。
+    /// 既存のライブラリを開く（新しい版にするときは `services.upgrade` で空きを確かめて知らせる）。ほかのアプリが開いていれば
+    /// `CoreError::LibraryInUse` で、何もせずに断る。
     pub fn open(path: &Path, sink: EventSink, services: Services) -> Result<Self> {
         let library = Library::open_with(path, &services.upgrade)?;
+        Self::start(library, sink, services)
+    }
+
+    /// 先に取ったロックで、そのライブラリを開く（[`Library::open_locked`]。別のライブラリから切り替えるとき）。
+    pub fn open_locked(lock: LibraryLock, sink: EventSink, services: Services) -> Result<Self> {
+        let library = Library::open_locked(lock, &services.upgrade)?;
         Self::start(library, sink, services)
     }
 
@@ -329,7 +336,8 @@ impl LibrarySession {
         }
     }
 
-    /// 閉じる。実行中のジョブは次回の起動で再開する。
+    /// 閉じる。実行中のジョブは次回の起動で再開する。最後に DB を閉じてライブラリのロックを放す（`Arc` で握られた
+    /// ライブラリが残っても、開き直し・ほかのアプリが当たらない）。
     pub fn close(&self) {
         self.wait_ready();
         self.jobs.shutdown();
@@ -347,6 +355,8 @@ impl LibrarySession {
                 }
             }
         }
+        // DB を閉じてからロックを放す（drop 任せだと、IPC が握った Arc で遅れ、開き直しが自分のロックに当たる）
+        self.library.close();
     }
 
     /// いまのバックアップを作る（設定画面の「今すぐバックアップ」）。
@@ -700,5 +710,68 @@ mod tests {
             "{events:?}"
         );
         assert!(session.library().migration().upgraded());
+    }
+
+    /// 同じライブラリを 2 つ目に開こうとすると（ほかのアプリの代わりに、同じプロセスで別に開く）、`LibraryInUse` で断り、
+    /// staging の掃除などをしない。1 つ目を閉じれば開ける（掃除はそのとき）。
+    #[test]
+    fn a_second_open_of_the_same_library_is_refused_without_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = LibrarySession::create(&dir.path().join("L"), sink(), services()).unwrap();
+        first.wait_ready();
+        let root = first.library().layout().root().to_path_buf();
+        std::fs::write(root.join("staging/leftover"), "x").unwrap();
+        let err = LibrarySession::open(&root, sink(), services())
+            .err()
+            .unwrap();
+        assert!(matches!(err, crate::CoreError::LibraryInUse), "{err}");
+        assert!(root.join("staging/leftover").exists(), "staging を消さない");
+        assert!(matches!(
+            LibrarySession::create(&root, sink(), services()).err(),
+            Some(crate::CoreError::Conflict(_))
+        ));
+        // 1 つ目はそのまま使える
+        assert_eq!(first.info().unwrap().item_count, 0);
+
+        first.close();
+        let second = LibrarySession::open(&root, sink(), services()).unwrap();
+        second.wait_ready();
+        assert_eq!(second.integrity().unwrap().staging_removed, 1);
+    }
+
+    /// 閉じると、DB を閉じてからロックを放す。開いている間に子プロセスを起動していても（std は O_CLOEXEC で開くので継が
+    /// れない）、IPC の代わりに `Arc<Library>` を握っていても、閉じたらすぐ開き直せる。握っている側の DB は閉じている。
+    #[test]
+    fn close_releases_the_lock_despite_children_and_held_arcs() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = LibrarySession::create(&dir.path().join("L"), sink(), services()).unwrap();
+        session.wait_ready();
+        let root = session.library().layout().root().to_path_buf();
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let held = session.library().clone();
+        assert!(held.lock().is_held());
+
+        session.close();
+        assert!(!held.lock().is_held());
+        assert!(matches!(
+            held.db().read(|_| Ok(())),
+            Err(crate::CoreError::DbClosed)
+        ));
+        let reopened = LibrarySession::open(&root, sink(), services());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let reopened = reopened.unwrap();
+        reopened.wait_ready();
+        assert!(reopened.library().lock().is_held());
+        // 閉じたほうを drop しても、開き直したほうのロックは外れない
+        drop(session);
+        drop(held);
+        assert!(matches!(
+            Library::open(&root).err(),
+            Some(crate::CoreError::LibraryInUse)
+        ));
     }
 }

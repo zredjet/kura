@@ -25,14 +25,14 @@
 │                                     │   Google Chrome（headless, CDP）          │
 └─────────────────────────────────────────────────────────────────────────────┘
            │
-   Kura Library.kuralib/（library.sqlite, files/, thumbs/, proxies/, staging/ …）
+   Kura Library.kuralib/（library.sqlite, library.lock, files/, thumbs/, proxies/, staging/ …）
 ```
 
 ## 2. クレート構成と責務
 
 | クレート | 責務 | 依存してよいもの |
 |---|---|---|
-| `kura-core` | DB、マイグレーション、取り込み、ハッシュ、検索言語の解析と SQL 生成、ユニット、プレイリスト（純粋関数）、ジョブ管理、ダウンロード・キャプチャの手順、編集の ffmpeg の段（`codec_ext::ffmpeg`。段 9）、SVG を別のプロセスで読む働き手（`codec_ext::svg_worker`。M11 の決定 23：親の側のデコーダ・やり取りの形・子の本体。§7）、編集のエンジンの実行の場（`edit::runtime` の `EngineRuntime`：エンジン 1 つ・プレビューと一括の 2 つのスレッドプール・メモリの予算。段 10、§15）と、それとコーデックの組をライブラリごとに持つ `edit::services` の `EngineServices`（M11）。M11 で足したもの：解析（`analysis`：計画・事実の投影・ドット絵の判定 v1・読み書き・ジョブ。§5）、素材の欄（`asset`：事実と設定と実効値、試聴の PCM `asset::pcm`、アニメの帯 `asset::anim`）、サムネイルの道と作り方の指紋（`media::route`）・エンジンの道（`media::engine_thumbs`）・作っている途中の印（`media::inflight`）・キャッシュの容量（`media::usage`）（§7）、台帳（`library::ledger`）、DB を新しい版にするときの空きの確かめと知らせ（`library::upgrade`。§14）、kura:// の経路と受け付けの判定（`serve`・`serve::access`。§4） | kura-engine, rusqlite, blake3, reflink-copy, rand_chacha, rayon, serde, thiserror, tracing, tokio |
+| `kura-core` | DB、マイグレーション、取り込み、ハッシュ、検索言語の解析と SQL 生成、ユニット、プレイリスト（純粋関数）、ジョブ管理、ダウンロード・キャプチャの手順、編集の ffmpeg の段（`codec_ext::ffmpeg`。段 9）、SVG を別のプロセスで読む働き手（`codec_ext::svg_worker`。M11 の決定 23：親の側のデコーダ・やり取りの形・子の本体。§7）、編集のエンジンの実行の場（`edit::runtime` の `EngineRuntime`：エンジン 1 つ・プレビューと一括の 2 つのスレッドプール・メモリの予算。段 10、§15）と、それとコーデックの組をライブラリごとに持つ `edit::services` の `EngineServices`（M11）。M11 で足したもの：解析（`analysis`：計画・事実の投影・ドット絵の判定 v1・読み書き・ジョブ。§5）、素材の欄（`asset`：事実と設定と実効値、試聴の PCM `asset::pcm`、アニメの帯 `asset::anim`）、サムネイルの道と作り方の指紋（`media::route`）・エンジンの道（`media::engine_thumbs`）・作っている途中の印（`media::inflight`）・キャッシュの容量（`media::usage`）（§7）、台帳（`library::ledger`）、DB を新しい版にするときの空きの確かめと知らせ（`library::upgrade`。§14）、ライブラリのロック（`library::LibraryLock`。M12。§3）、kura:// の経路と受け付けの判定（`serve`・`serve::access`。§4） | kura-engine, rusqlite, blake3, reflink-copy, rand_chacha, rayon, serde, thiserror, tracing, tokio |
 | `kura-engine` | 編集の操作エンジン：文書・値・形・メタデータの写し方・操作と登録・描画・解析・コーデック（固定の Rust のもの）・実行とプレビュー・エディタの履歴。段 10 の部品は、実行器の `render/`（ノードのキャッシュ `cache`・差分の計画と差分の適用 `incremental`・範囲 `region`・範囲の描画とスポイト `area`・変わった範囲 `delta`・エディタの表示の経路 `view`（`Engine::render_view`）・プレビューの段 `preview`・メモリの見積もり `estimate`）、エディタのセッション `session/`（`EditSession`）、メモリの予算 `budget`、予約の部品（`monitor` の `Latest`・`Ticket`）、ベンチのワークロード `testing::bench`。M11 で 3D（glb）の読み手とソフトウェアの描画 `model`（SceneKit を使わない。決定 9。ファズの対象 `model_glb`。docs/editing.md §9.10）と、SVG の文字を描くフォントの入れ物を受ける口（`codec::SvgFonts`。中身は kura-mac が渡す）を足した。スレッドプールは作らない（呼び手のプールの中で描く）。DB・ジョブ・Tauri を知らない（ADR-134・154、§15） | serde, serde_json, thiserror, blake3, rayon, rand_chacha, libm と、版を固定したコーデックのクレート（docs/editing.md §9）。specta は feature |
 | `kura-mac` | `MediaBackend` trait の macOS 実装（サムネイル生成、メディア情報、音楽のジャケット取得、WKWebView のスナップショット、「透明度を下げる」設定の取得）と、ffmpeg との振り分け。編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し、`kura_codec_caps`。段 9、ADR-153）と、アプリのコーデックの組 `full_codec_set`。物理メモリの大きさ `physical_memory`（編集のメモリの予算の既定に渡す。段 10）。M11 で足したもの：ImageIO のアルファを保つサムネイル・CoreText のフォントのサムネイルと情報（`thumbs`）、SVG の文字を描くシステムのフォント（`fonts`：mmap して `pinned_options` で渡す）、1 MiB 以上の確保を OS へすぐ返す確保器（`alloc` の `ReturningAllocator`。アプリと kura-devtools の `#[global_allocator]`。§7、ADR-163） | kura-core, kura-engine, serde, serde_json, tracing, libc（macOS のみ。mmap）, swift-rs（ビルド時のリンクのみ） |
 | `kura-devtools` | ダミーライブラリの生成、ベンチマーク（編集の `bench edit`。NFR-11〜17）、コマンドラインからの取り込みと確認、編集のメモリの見積もりの煙のテスト（`mem_smoke`）。M11 で形式の見本（`assets`）、kura:// と CSP の自己点検のライブラリ（`selftest-library`）、`bench thumbs-job`・`bench svg-worker`・`bench analyze`・`bench migrate`・`bench query --fake-facts`（§13） | kura-core, kura-engine, kura-mac |
@@ -42,7 +42,7 @@
 
 ## 3. IPC コマンド一覧（初期）
 
-戻り値はすべて `Result<T, AppError>`。`AppError { code: string, message: string }`。code の例：`NotFound`、`InvalidQuery`、`Invalid`、`ToolMissing`、`Io`、`Db`、`Conflict`、`Internal`。ライブラリを新しい版にできずに開けないときは `LibraryTooNew`（新しい版の Kura で作られた）・`NoSpace`（空き容量）・`BackupFailed`（当てる前のバックアップ）・`UpgradeFailed`（当てる失敗。失敗した 1 つを戻した。それより前に当てたものは残り、途中の版なら `message` がそう言う）で、フロントは code で文言を選び、`message` を説明に出す（M11。docs/data-model.md §5）。その場で用意する表示（アニメの帯）が大きすぎるときは `TooLarge`（1 辺 8,192・16M 画素・メモリの予算の全体を超える。やり直しても同じ）、メモリの予算が空いていないときは `Busy`（少し待てば通る。画面は「混んでいます。もう一度押してください」）（M11）。
+戻り値はすべて `Result<T, AppError>`。`AppError { code: string, message: string }`。code の例：`NotFound`、`InvalidQuery`、`Invalid`、`ToolMissing`、`Io`、`Db`、`Conflict`、`Internal`。ライブラリを新しい版にできずに開けないときは `LibraryTooNew`（新しい版の Kura で作られた）・`NoSpace`（空き容量）・`BackupFailed`（当てる前のバックアップ）・`UpgradeFailed`（当てる失敗。失敗した 1 つを戻した。それより前に当てたものは残り、途中の版なら `message` がそう言う）で、フロントは code で文言を選び、`message` を説明に出す（M11。docs/data-model.md §5）。ほかのアプリ（Kura を 2 つ動かした・開発版と本番版・`kura-devtools`）が同じライブラリを開いているときは `LibraryInUse`（ライブラリのロック `library.lock` を取れない。開く側は DB・バックアップ・staging の掃除・知らせのどれもしない。画面は見出し「このライブラリはほかのアプリで開かれています」と、もう一方を終了してから開き直す説明を `ja.ts` から出す。`message` は見出しを含むので説明には使わない）（M12。docs/data-model.md §1）。別のライブラリへ切り替えるとき（`library_open`）は、Rust が今のライブラリを閉じる前に開く先のロックを取り（`AppState::replace_session`）、取れなければ今のライブラリを開いたまま `LibraryInUse` を返す（フロントは知らせの一行）。開いているのと同じライブラリを開き直すとき（場所の書き方が違っても、ロックファイルのデバイスと i ノードで見分ける）は、閉じてから開く。作るとき・ライブラリでない場所を開くときの失敗は、今までどおり前のライブラリも閉じている。その場で用意する表示（アニメの帯）が大きすぎるときは `TooLarge`（1 辺 8,192・16M 画素・メモリの予算の全体を超える。やり直しても同じ）、メモリの予算が空いていないときは `Busy`（少し待てば通る。画面は「混んでいます。もう一度押してください」）（M11）。
 
 | 領域 | コマンド | 説明 |
 |---|---|---|
@@ -242,7 +242,7 @@ object-src 'none'; frame-src 'none'
 - `jobs` テーブルに記録し、アプリ再起動後も `queued` / `paused` を再開できるようにする（`running` で終わっていたものは `queued` に戻す）。
 - アプリの終了・ライブラリの切り替えでは、実行中のジョブを区切りで止めて `queued` に戻す（次回の起動で自動で再開）。ユーザーが一時停止したものは `paused` のまま。
 - 再開に必要な途中経過は、ジョブ自身が作業と同じトランザクションで `result_json` に保存する。
-- ライブラリを開くときは、staging の掃除 → 整合性チェック → ジョブの開始、の順にする（チェック中に取り込みが進むと食い違いを誤って数えるため）。
+- ライブラリを開くときは、ライブラリのロック（`library.lock`。取れなければ何もせずに `LibraryInUse`。§3）→ staging の掃除 → 整合性チェック → ジョブの開始、の順にする（チェック中に取り込みが進むと食い違いを誤って数えるため）。閉じるときは、ジョブを止めて DB を閉じてからロックを放す（`LibrarySession::close`）。
 - 種類ごとの同時実行数：import 1、thumbnail 1（ジョブの中で CPU コア数の並列。ADR-31）、proxy 1、download 2、capture 1、export 1、analyze 1。
 - 後続のジョブは `ensure_queued(kind, input)` で積む（同じ種類が `queued` ならもう積まない。そのライブラリで動かす種類（ハンドラ）がなければ積まない。analyze は一時停止中のものがあれば積まない：利用者の一時停止を次の取り込みが勝手に外さない）。サムネイルのジョブは、取り込みのバッチを書いたあとと、ライブラリを開いたとき（起動のスレッドで前回の途中の印を片付けて作り方の指紋を照らしたあと、`pending`・`stale`・疑わしいもの（settings の `thumbs.suspects`）が残っていれば。`media::prepare_on_open`。§7）に積む。
 - **譲る**（M11）：種類ごとに譲る相手を網羅の match で決める（`JobKind::yields_to`。今は analyze が import と thumbnail に譲る。NFR-05・NFR-04 を守るため。download はネットワーク待ちなので譲らない）。譲る相手が動いている・待っている間はスケジューラが取り出さず、動いているジョブは `should_yield` で知って区切りで `JobEnd::Yield` を返す（`queued` に戻り、相手が終わると続きから動く。一時停止にはしない）。M12 の保存・M14 の一括を足すときも、ここで解析が譲るかを決める。

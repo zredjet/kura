@@ -26,6 +26,9 @@ pub enum AppErrorCode {
     BackupFailed,
     /// ライブラリを新しい版にできない（失敗した 1 つを戻した。それより前に当てたものは残り、途中の版なら説明がそう言う）。
     UpgradeFailed,
+    /// ほかのアプリが同じライブラリを開いている（ライブラリのロック `library.lock` を取れない。開く側は何もしていない。
+    /// 別のライブラリへの切り替えなら、今のライブラリは開いたまま。M12）。
+    LibraryInUse,
     /// 大きすぎてその場で用意できない（アニメの帯の 1 辺・画素の数・メモリの予算の全体。やり直しても同じ。M11）。
     TooLarge,
     /// 混んでいる（メモリの予算が空いていない。少し待ってやり直せば通りうる。M11）。
@@ -67,6 +70,7 @@ impl From<CoreError> for AppError {
             CoreError::Tool(_) => AppErrorCode::ToolFailed,
             // ライブラリを新しい版にできなかった（種類でフロントが文言を選ぶ。説明は CoreError が持つ。docs/data-model.md §5）
             CoreError::Upgrade(err) => upgrade_code(err),
+            CoreError::LibraryInUse => AppErrorCode::LibraryInUse,
         };
         Self::new(code, err.to_string())
     }
@@ -108,6 +112,17 @@ mod tests {
         assert_eq!(err.code, AppErrorCode::Invalid);
         let err: AppError = CoreError::DbClosed.into();
         assert_eq!(err.code, AppErrorCode::Db);
+        let err: AppError = CoreError::LibraryInUse.into();
+        assert_eq!(err.code, AppErrorCode::LibraryInUse);
+        assert!(
+            err.message.contains("ほかのアプリで開かれています"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            serde_json::to_value(AppErrorCode::LibraryInUse).unwrap(),
+            serde_json::json!("LibraryInUse")
+        );
     }
 
     /// ライブラリを新しい版にできなかった理由は、フロントが文言を選べる種類と、分かる説明で返す。

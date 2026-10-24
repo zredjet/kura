@@ -788,14 +788,21 @@ export const ja = {
   /** ライブラリを開くときの DB の更新（M11 の決定 1。design.md §3.1）。 */
   libraryOpen: {
     upgrading: 'ライブラリを更新しています',
-    /** 開けなかった理由の見出し（AppError の code ごと。説明は Rust の message をそのまま出す）。 */
+    /**
+     * 開けなかった理由の見出し（AppError の code ごと。説明は Rust の message をそのまま出す。`LibraryInUse` だけは
+     * message が見出しを含むので、説明に `inUseDetail` を出す）。
+     */
     failure: {
       LibraryTooNew: '新しい版の Kura で作られたライブラリです',
       NoSpace: 'ディスクの空き容量が足りません',
       BackupFailed: 'バックアップを作れませんでした',
       UpgradeFailed: 'ライブラリを新しい版にできませんでした',
+      LibraryInUse: 'このライブラリはほかのアプリで開かれています',
       other: 'ライブラリを開けませんでした',
     },
+    /** ほかのアプリが同じライブラリを開いているとき（ライブラリのロック。M12）の説明。 */
+    inUseDetail:
+      '同じライブラリを 2 つのアプリで同時に開くことはできません。もう一方を終了してから開き直してください。',
     place: (path: string) => `場所：${path}`,
   },
   drop: {

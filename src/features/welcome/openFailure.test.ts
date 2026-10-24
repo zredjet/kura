@@ -18,9 +18,25 @@ describe('ライブラリを開けなかった理由（M11：新しい版にで�
   });
 
   it('見出しは理由ごとに違い、どれも「開けませんでした」の汎用の見出しとは別', () => {
-    const titles = [t.LibraryTooNew, t.NoSpace, t.BackupFailed, t.UpgradeFailed];
-    expect(new Set(titles).size).toBe(4);
+    const titles = [t.LibraryTooNew, t.NoSpace, t.BackupFailed, t.UpgradeFailed, t.LibraryInUse];
+    expect(new Set(titles).size).toBe(5);
     expect(titles).not.toContain(t.other);
+  });
+
+  // M12：同じライブラリをほかのアプリが開いている（ライブラリのロック）。Rust の message は見出しを含むので、説明は決まった文
+  it('ほかのアプリが開いている（LibraryInUse）は専用の見出しと、もう一方を終了してから開き直す説明', () => {
+    const failure = openFailure({
+      code: 'LibraryInUse',
+      message: 'このライブラリはほかのアプリで開かれています。同じライブラリを…',
+    });
+    expect(failure).toEqual({ title: t.LibraryInUse, detail: ja.libraryOpen.inUseDetail });
+    expect(failure.title).toBe('このライブラリはほかのアプリで開かれています');
+    expect(failure.detail).toBe(
+      '同じライブラリを 2 つのアプリで同時に開くことはできません。もう一方を終了してから開き直してください。',
+    );
+    expect(openFailureOf(new IpcError({ code: 'LibraryInUse', message: 'ほかのアプリ' }))).toEqual(
+      failure,
+    );
   });
 
   // 版 0（新しいライブラリを作る途中）で止まったときの説明も、そのまま出す（M11 の C3。初回の画面で作るのに失敗したとき・
