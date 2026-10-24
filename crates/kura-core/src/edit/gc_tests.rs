@@ -22,13 +22,13 @@ use super::save::SaveAction;
 use super::save_tests::{
     DAY, Env, Setup, WAIT, add_item, assert_consistent, assert_done, base_of, count, doc, files,
     flip, hash_of, head, heic_codecs, heic_decoder, inputs_of, reopen_after_crash, result_of,
-    states, versions_of,
+    sprite, states, versions_of,
 };
 use super::services::fake::FakeEngineFactory;
 use super::versions::FileState;
-use super::{drafts, store};
+use super::{ENGINE_WORK_DIR, EditHandler, EngineServices, drafts, start_save, store};
 use crate::import::{ImportInput, ImportOptions, ImportResult, start_import};
-use crate::jobs::{JobKind, JobRecord, JobState};
+use crate::jobs::{JobKind, JobManager, JobRecord, JobState};
 use crate::library::{Library, ThumbSize, check_files, hex, ledger};
 use crate::time::now_ms;
 
@@ -702,13 +702,159 @@ fn gc_sweeps_orphaned_parts_and_keeps_roots_of_unfinished_or_recent_saves() {
             Ok(())
         })
         .unwrap();
+    // 中止したばかりの保存の文書は根として残すので、7 日以内に失敗・中止した保存があるうちは印も残す（消すと、7 日たって根から
+    // 外れた部品を片付ける GC が積まれない）
     assert_done(&env.gc_at(Some(now)));
-    assert!(!env.lib.db().read(gc::parts_marked).unwrap());
+    assert!(env.lib.db().read(gc::parts_marked).unwrap());
     assert!(
         has_doc(&env.lib, &paused),
         "中止したばかりの保存の文書は残す"
     );
+    // 8 日たつと、中止・失敗した保存の文書も根から外れて片付き、印も消える。版の文書・今の下書きは残る
+    assert_done(&env.gc_at(Some(now + 8 * DAY)));
+    assert!(!env.lib.db().read(gc::parts_marked).unwrap());
+    for (g, kept, what) in [
+        (&saved, true, "版の文書"),
+        (&draft, true, "今の下書き"),
+        (&paused, false, "8 日前に中止した保存"),
+        (&recent_fail, false, "9 日前に失敗した保存"),
+    ] {
+        assert_eq!(has_doc(&env.lib, g), kept, "{what}");
+    }
     assert_consistent(&env.lib);
+}
+
+/// 失敗した保存の部品の印は、7 日の間に GC が動いても消さず（その文書はやり直せるよう根として残す。ちょうど 7 日まで）、7 日を
+/// 過ぎると候補として GC が積まれ、部品を片付けて印を消す（印だけ先に消えて、根から外れた部品が孤立したまま残ることがない）。
+#[test]
+fn the_parts_mark_outlives_failed_saves_until_their_roots_expire() {
+    let env = Env::new();
+    let (a, _, _) = env.png(57);
+    let base = base_of(&env.lib, a);
+    assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
+    let stale = doc(&[flip("horizontal"), flip("horizontal")], None);
+    let record = env.save(
+        a,
+        base,
+        SaveAction::Overwrite {
+            graph: stale.clone(),
+        },
+    );
+    assert_eq!(record.state, JobState::Failed);
+    let failed_at = record.finished_at.unwrap();
+    let marked = || env.lib.db().read(gc::parts_marked).unwrap();
+    assert!(marked());
+    // 1 時間後（バックアップの 1 時間ごとの確かめ）・ちょうど 7 日後に GC が動いても、印と文書は残る
+    for at in [failed_at + 3_600_000, failed_at + 7 * DAY] {
+        assert_done(&env.gc_at(Some(at)));
+        assert!(marked(), "{at}");
+        assert!(has_doc(&env.lib, &stale), "{at}");
+    }
+    // 8 日後：印があるので候補になり、積む口が GC を積んで、部品を片付けて印を消す
+    let later = failed_at + 8 * DAY;
+    env.clock.set(Some(later));
+    let clock = env.clock.gc();
+    assert!(
+        env.lib
+            .db()
+            .read(|c| gc::due(c, clock.cutoff(env.lib.layout())?))
+            .unwrap()
+    );
+    assert!(
+        gc::queue_if_due(&env.lib, &clock, || env
+            .jobs
+            .ensure_queued(JobKind::Gc, "{}"))
+        .unwrap()
+    );
+    assert!(env.jobs.wait_idle(WAIT));
+    env.clock.set(None);
+    assert!(!has_doc(&env.lib, &stale));
+    assert!(!marked());
+    assert!(
+        !env.lib
+            .db()
+            .read(|c| gc::due(c, gc::cutoff(later, &[])))
+            .unwrap()
+    );
+    assert_consistent(&env.lib);
+}
+
+/// 待ち・一時停止のまま中止した上書き・別名の保存（ハンドラを通らない）も、積む前に置いた文書の部品の印を置く（GC が片付ける）。
+/// 版に戻すは文書を持たないので置かない。
+#[test]
+fn canceling_an_idle_save_marks_its_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = Arc::new(Library::create(&dir.path().join("L")).unwrap());
+    let engine = Arc::new(EngineServices::new(
+        Arc::new(FakeEngineFactory::default()),
+        lib.layout().staging_dir().join(ENGINE_WORK_DIR),
+    ));
+    // ジョブは動かさない（start しない）ので、積んだ保存は待ちのまま
+    let jobs = JobManager::new(
+        lib.clone(),
+        vec![(JobKind::Edit, Arc::new(EditHandler::new(engine)))],
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+    let (a, hash) = add_item(&lib, &sprite(58), "png", "絵");
+    let marked = || lib.db().read(gc::parts_marked).unwrap();
+    let clear = || {
+        lib.db()
+            .write(|tx| {
+                tx.execute("DELETE FROM settings WHERE key = 'gc.parts'", [])?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    let base = super::save::Base { hash, version: 0 };
+    // 版に戻す（文書なし）：印を置かない
+    let revert = json!({ "v": 1, "itemId": a, "base": { "hash": hex(&hash), "version": 1 },
+                         "action": { "type": "revert", "to": 0 } })
+    .to_string();
+    let id = jobs.enqueue(JobKind::Edit, revert).unwrap();
+    jobs.cancel(id).unwrap();
+    assert_eq!(jobs.get(id).unwrap().state, JobState::Canceled);
+    assert!(!marked());
+    // 上書き（待ちから）・別名（一時停止から）：印を置く
+    for save_as in [false, true] {
+        clear();
+        let graph = doc(
+            &[flip(if save_as { "vertical" } else { "horizontal" })],
+            None,
+        );
+        let action = if save_as {
+            SaveAction::SaveAs {
+                graph: graph.clone(),
+                title: "写し".into(),
+                stem: "copy".into(),
+            }
+        } else {
+            SaveAction::Overwrite {
+                graph: graph.clone(),
+            }
+        };
+        let id = start_save(
+            lib.db(),
+            &jobs,
+            &super::save::SaveRequest {
+                item_id: a,
+                base,
+                action,
+            },
+        )
+        .unwrap();
+        assert!(has_doc(&lib, &graph));
+        if save_as {
+            jobs.pause(id).unwrap();
+            assert_eq!(jobs.get(id).unwrap().state, JobState::Paused);
+        }
+        assert!(!marked());
+        jobs.cancel(id).unwrap();
+        assert_eq!(jobs.get(id).unwrap().state, JobState::Canceled);
+        assert!(marked(), "save_as={save_as}");
+    }
+    drop(jobs);
+    lib.close();
 }
 
 /// 保存のジョブが版を足さずに終わる（Conflict）と部品の印が付き、次の保存のコミットのあとに GC が積まれて片付ける。
@@ -796,10 +942,10 @@ fn gc_pauses_resumes_from_its_cursor_and_cancels() {
     }
 }
 
-/// 実ファイルの中身が同じ別のアイテムの今と共有している版（別のアイテムの上書きが過去の版と同じ中身を出した）は、照合せずに
-/// released にし、ファイルは残す（今のアイテムが持つ）。
+/// 実ファイルの中身が同じ別のアイテムの今と共有している版（別のアイテムの上書きが過去の版と同じ中身を出した）も、照合して
+/// から released にし（ADR-170 (2)）、ファイルは残す（今のアイテムが持つ）。
 #[test]
-fn gc_releases_shared_versions_without_rebuilding() {
+fn gc_verifies_shared_versions_before_releasing_them() {
     let env = Env::new();
     let (a, h1) = edited_twice(&env, 55);
     let original = std::fs::read(
@@ -817,12 +963,268 @@ fn gc_releases_shared_versions_without_rebuilding() {
     );
     let result = env.gc();
     assert_eq!(
-        (&result["shared"], &result["released"]),
-        (&json!(1), &json!(0)),
+        (&result["shared"], &result["released"], &result["kept"]),
+        (&json!(1), &json!(0), &json!(0)),
         "{result}"
     );
     assert_eq!(states(&env.lib, a)[1], (1, FileState::Released));
     assert!(env.lib.layout().content_path(&h1, "png").exists());
     assert!(blob_exists(&env.lib, h1));
     assert_consistent(&env.lib);
+}
+
+/// 共有相手が消えたあとも、照合していない版のファイルが消えることはない（ADR-135 の安全網 2・ADR-170 (2)）：A の版 1 と同じ中身を
+/// B の上書きが出し（共有）、B をゴミ箱に入れて GC → ゴミ箱を空にする → A を版 1 に戻す。照合が一致すれば released にし（ファイルは
+/// B が持つ）、B を消すとファイルも消えるが、照合済みなので文書から作り直せる。デコーダがずれていれば照合が合わずに kept で
+/// 残り（台帳の行を参照し続ける）、B を消してもファイルは残って版 1 に戻せる（使い直す）。
+#[test]
+fn shared_versions_survive_their_partner_unless_verified() {
+    for drift in [false, true] {
+        let set = Arc::new(Mutex::new(CodecSet::pinned()));
+        let env = Env::with(FakeEngineFactory::with_codecs(set.clone()), None);
+        let (a, h1) = edited_twice(&env, 56);
+        let original = std::fs::read(
+            env.lib
+                .layout()
+                .content_path(&versions_of(&env.lib, a)[0].output_hash, "png"),
+        )
+        .unwrap();
+        let (b, _) = add_item(&env.lib, &original, "png", "B");
+        assert_done(&env.overwrite(b, doc(&[flip("vertical")], None)));
+        assert_eq!(head(&env.lib, b).hash, h1);
+        if drift {
+            let mut codecs = set.lock().unwrap();
+            let png = codecs.decoders_for("png")[0].clone();
+            codecs.replace_decoder(Arc::new(OtherPixels(png))).unwrap();
+        }
+        env.engine.reload_codecs();
+        env.lib
+            .db()
+            .write(move |tx| crate::items::trash(tx, &[b], 5).map(|_| ()))
+            .unwrap();
+        let result = env.gc();
+        let want = if drift { (0, 1) } else { (1, 0) };
+        assert_eq!(
+            (
+                result["shared"].as_u64().unwrap(),
+                result["kept"].as_u64().unwrap()
+            ),
+            want,
+            "drift={drift} {result}"
+        );
+        assert_eq!(result["released"], 0, "{result}");
+        let state = if drift {
+            FileState::Kept
+        } else {
+            FileState::Released
+        };
+        assert_eq!(states(&env.lib, a)[1], (1, state));
+        assert!(
+            env.lib.layout().content_path(&h1, "png").exists(),
+            "ゴミ箱の B が持つ"
+        );
+        let emptied = env.lib.empty_trash().unwrap();
+        assert_eq!((emptied.items, emptied.failed), (1, 0));
+        assert_eq!(
+            env.lib.layout().content_path(&h1, "png").exists(),
+            drift,
+            "照合が合わずに残した版は台帳の行を参照し続ける"
+        );
+        assert_eq!(blob_exists(&env.lib, h1), drift);
+        let record = env.revert(a, 1);
+        assert_done(&record);
+        let how = &result_of(&record)["revert"];
+        assert_eq!(
+            (&how["reused"], &how["rebuilt"]),
+            (&json!(drift), &json!(!drift)),
+            "drift={drift} {how}"
+        );
+        assert_eq!(head(&env.lib, a).hash, h1);
+        assert_consistent(&env.lib);
+    }
+}
+
+// ---- OS のデコーダ ----
+
+/// GC は OS のデコーダを呼ばない（ADR-170 (3)）：偽の HEIC（Platform の段）で 2 回上書きした版 1 は、アンカーが壊れている・ない
+/// と元を OS のデコーダでしか読めないので、照らさずに消し待ちのまま次回へ回す（kept にしない。デコーダは呼ばない）。ファイルと
+/// 台帳の行は残り、期限を過ぎた消し待ち（整合性の overdueVersions）に数える。
+#[test]
+fn gc_never_calls_the_os_decoder() {
+    for missing in [false, true] {
+        let decoder = heic_decoder(false);
+        let env = Env::with(FakeEngineFactory::with_codecs(heic_codecs(&decoder)), None);
+        let (a, _) = add_item(&env.lib, b"fake heic bytes", "heic", "写真");
+        assert_done(&env.overwrite(a, doc(&[flip("vertical")], Some("png"))));
+        let h1 = head(&env.lib, a).hash;
+        assert_done(&env.overwrite(a, doc(&[flip("horizontal")], Some("png"))));
+        assert_eq!(states(&env.lib, a)[1], (1, FileState::Waiting));
+        let (anchor_hash, anchor_ext): (Vec<u8>, String) = env
+            .lib
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT b.hash, b.ext FROM edit_anchors a JOIN blobs b ON b.id = a.blob_id",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        let anchor_path = env
+            .lib
+            .layout()
+            .content_path(&anchor_hash.try_into().unwrap(), &anchor_ext);
+        let anchor_bytes = std::fs::read(&anchor_path).unwrap();
+        if missing {
+            std::fs::remove_file(&anchor_path).unwrap();
+        } else {
+            std::fs::write(&anchor_path, b"broken anchor").unwrap();
+        }
+        let reads = decoder.reads();
+        let later = now_ms() + 8 * DAY;
+        let record = env.gc_at(Some(later));
+        assert_done(&record);
+        let result = result_of(&record);
+        assert_eq!(
+            (
+                &result["deferred"],
+                &result["kept"],
+                &result["released"],
+                &result["shared"]
+            ),
+            (&json!(1), &json!(0), &json!(0), &json!(0)),
+            "missing={missing} {result}"
+        );
+        assert_eq!(decoder.reads(), reads, "GC は OS のデコーダを呼ばない");
+        assert_eq!(states(&env.lib, a)[1], (1, FileState::Waiting));
+        assert!(env.lib.layout().content_path(&h1, "png").exists());
+        assert!(blob_exists(&env.lib, h1));
+        assert_eq!(
+            env.lib
+                .db()
+                .read(|c| gc::overdue(c, gc::cutoff(later, &[])))
+                .unwrap(),
+            1,
+            "期限を過ぎた消し待ちに数える"
+        );
+        std::fs::write(&anchor_path, &anchor_bytes).unwrap();
+        assert_consistent(&env.lib);
+    }
+}
+
+// ---- アンカー ----
+
+/// テストの補助：台帳の行 `blob` を持つアンカーの行を入れる（元 `source`。読み方の設定のダイジェストは中身にする）。
+fn insert_anchor_on(lib: &Library, source: [u8; 32], blob: [u8; 32]) -> i64 {
+    lib.db()
+        .write(move |tx| {
+            let id = ledger::id_of(tx, &blob)?.unwrap();
+            Ok(tx.query_row(
+                "INSERT INTO edit_anchors (source_hash, options_digest, options, decoded, value_digest, blob_id, created_at)
+                 VALUES (?1, ?2, '{}', '{}', x'00', ?3, 1) RETURNING id",
+                params![&source[..], &blob[..], id],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+}
+
+/// GC のアンカーの段：どの版の入力からも参照されないアンカーの行・台帳の行・ファイル・派生のファイルを、'delete' を予告して
+/// 片付ける。参照されたアンカーと、ほかのアイテムの今が台帳の行を持つアンカーのファイルは残す（行だけ消える）。予告のあと・
+/// 台帳の行を解放したあと（ファイルを消す前）で落ちても、開き直すと食い違い 0 で、ジョブは続きから終わる。
+#[test]
+fn gc_sweeps_unreferenced_anchors() {
+    for fault in [
+        None,
+        Some(GcFault::AnchorsAfterAnnounce),
+        Some(GcFault::AnchorsAfterRelease),
+    ] {
+        let decoder = heic_decoder(false);
+        let codecs = heic_codecs(&decoder);
+        let env = Env::setup(
+            Setup {
+                factory: FakeEngineFactory::with_codecs(codecs.clone()),
+                gc_fault: fault,
+                ..Setup::default()
+            },
+            |_| None,
+        );
+        // 参照されたアンカー（偽の HEIC の最初の保存が作る）
+        let (a, heic) = add_item(&env.lib, b"fake heic bytes", "heic", "写真");
+        assert_done(&env.overwrite(a, doc(&[flip("vertical")], Some("png"))));
+        let used: i64 = env.count("SELECT id FROM edit_anchors");
+        // 参照されないアンカー：自分のファイル（台帳の行・派生のファイルつき）と、別のアイテム P の今と同じ台帳の行
+        let free_bytes = b"unreferenced anchor bytes".to_vec();
+        let free = hash_of(&free_bytes);
+        let free_path = env.lib.layout().content_path(&free, "wav");
+        std::fs::create_dir_all(free_path.parent().unwrap()).unwrap();
+        std::fs::write(&free_path, &free_bytes).unwrap();
+        let len = free_bytes.len() as u64;
+        env.lib
+            .db()
+            .write(move |tx| ledger::register(tx, &free, "wav", len, 1).map(|_| ()))
+            .unwrap();
+        let thumb = put_thumb(&env.lib, &free);
+        insert_anchor_on(&env.lib, heic, free);
+        let (_, p_hash) = add_item(&env.lib, &sprite(59), "png", "P");
+        insert_anchor_on(&env.lib, [9; 32], p_hash);
+        assert_eq!(env.count("SELECT count(*) FROM edit_anchors"), 3);
+        let record = env.gc_at(None);
+        let case = format!("{fault:?}");
+        let (_guard, lib) = match fault {
+            None => {
+                assert_done(&record);
+                let result = result_of(&record);
+                assert_eq!(
+                    (&result["anchors"], &result["files"]),
+                    (&json!(2), &json!(1)),
+                    "{result}"
+                );
+                (None, env.lib.clone())
+            }
+            Some(at) => {
+                assert_eq!(record.state, JobState::Failed, "{case}");
+                assert_eq!(
+                    env.count("SELECT count(*) FROM ledger_pending"),
+                    2,
+                    "{case}"
+                );
+                let released = at == GcFault::AnchorsAfterRelease;
+                assert_eq!(
+                    check_files(env.lib.db(), env.lib.layout()).unwrap(),
+                    (0, u64::from(released)),
+                    "{case}：解放したあとなら DB にないファイルが 1 つ"
+                );
+                let job = record.id;
+                let (dir, session) =
+                    reopen_after_crash(env, job, FakeEngineFactory::with_codecs(codecs.clone()));
+                assert_done(&session.jobs().get(job).unwrap());
+                let lib = session.library().clone();
+                (Some((dir, session)), lib)
+            }
+        };
+        assert_eq!(
+            count(&lib, "SELECT id FROM edit_anchors"),
+            used,
+            "{case}：参照されたアンカーだけ残る"
+        );
+        assert_eq!(
+            count(&lib, "SELECT count(*) FROM edit_anchors"),
+            1,
+            "{case}"
+        );
+        assert!(!free_path.exists(), "{case}");
+        assert!(!thumb.exists(), "{case}：派生のファイルも消す");
+        assert!(!blob_exists(&lib, free), "{case}");
+        assert!(
+            lib.layout().content_path(&p_hash, "png").exists() && blob_exists(&lib, p_hash),
+            "{case}：P の今のファイルは残る"
+        );
+        assert_eq!(
+            count(&lib, "SELECT count(*) FROM ledger_pending"),
+            0,
+            "{case}"
+        );
+        assert_consistent(&lib);
+    }
 }

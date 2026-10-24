@@ -2,11 +2,12 @@
 //! 「保存と版（M12）」）。
 //!
 //! 1. **版**：消し待ち（waiting）の版のうち、置き換えから 7 日たち、かつ置き換えより前に作ったバックアップが残っていないもの
-//!    （[`cutoff`]。M12 の利用者の決定 2）を、置き換えの古い順に片付ける。ほかの hold の版・アイテムの今・アンカーと台帳の行を
-//!    共有しているものは、照合せずに released にする（台帳の行はほかが持つので、ファイルは消えない）。共有していないものは、
-//!    消す前に版の文書と入力の記録から作り直して照らし（`save::verify_version`）、記録のエンコーダで書いたバイト列が出力と
-//!    同じなら消し、違えば kept で残す。今は照らせないもの（コーデックがない・大きすぎる・OS のデコーダが要る）は消し待ちの
-//!    まま次回へ。
+//!    （[`cutoff`]。M12 の利用者の決定 2）を、置き換えの古い順に片付ける。どの候補も（ほかの hold の版・アイテムの今・アンカーと
+//!    台帳の行を共有しているものも）、released にする前に版の文書と入力の記録から作り直して照らし（`save::verify_version`）、
+//!    記録のエンコーダで書いたバイト列が出力と同じなら released にし（共有していればファイルはほかが持つので消えない。して
+//!    いなければ消す）、違えば kept で残す（台帳の行を参照し続ける）。今は照らせないもの（コーデックがない・大きすぎる・OS の
+//!    デコーダが要る）は消し待ちのまま次回へ。共有を照合せずに released にすると、共有相手（ゴミ箱のアイテムなど）が消えた
+//!    ときに、一度も照合していない版のファイルが消えるため（ADR-135 の安全網 2・ADR-170 (2)）。
 //! 2. **消す手順**（ゴミ箱を空にする処理も同じ部品を使う。`Library::empty_trash`）：台帳の門（`Library::ingest_exclusive`）を
 //!    取り、トランザクション 1 で候補がまだ消し待ちで同じ台帳の行を指していることを確かめ直して（作り直している間に保存・
 //!    版に戻すで同じ中身が使われたら、共有になったので released にするだけ。S12）'delete' を予告してコミット、トランザクション
@@ -41,8 +42,9 @@ use crate::{CoreError, Result};
 /// 置き換えたファイルを残す長さ（7 日。バックアップの保持と同じ。docs/editing.md §14 の安全網 1）。
 pub const GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
-/// 文書の部品が孤立したかもしれない印（下書きを置き換えた・捨てた、保存のジョブが版を足さずに終わった）を置く settings の
-/// キー。GC が部品を片付けたら消す（終わっていない保存のジョブがあれば残す：その根が終わってから孤立しうるので）。
+/// 文書の部品が孤立したかもしれない印（下書きを置き換えた・捨てた、保存のジョブが版を足さずに終わった・待ち・一時停止の
+/// まま中止された）を置く settings のキー。GC が部品を片付けたら消す（終わっていない保存のジョブか、7 日以内に失敗・中止した
+/// 保存のジョブがあれば残す：どちらも根として残した部品が、あとで孤立しうるので）。
 pub const PARTS_KEY: &str = "gc.parts";
 
 /// 1 回の問い合わせで読む候補の数。
@@ -239,16 +241,21 @@ pub fn sweep_parts(tx: &Connection, scope: Scope<'_>, live: &[Digest]) -> Result
     Ok(removed)
 }
 
+/// 部品の印を消す問い合わせ：終わっていない保存のジョブも、`?2`（7 日前）から後に失敗・中止した保存のジョブもないときだけ
+/// （どちらも根として残すので、その部品があとで孤立しうる。7 日たつと根から外れるので、印が残っていれば GC が積まれて
+/// 片付ける）。どちらも `idx_jobs_queue`（状態）で引く。
+const CLEAR_PARTS_MARK: &str = "DELETE FROM settings WHERE key = ?1
+    AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit')
+    AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('failed', 'canceled') AND kind = 'edit' AND finished_at >= ?2)";
+
 /// GC の部品の片付け（トランザクションの中で）：すべての範囲を片付け（保存のジョブの根は、終わっていないものと `now` の 7 日
-/// 前から後に失敗・中止したもの）、終わっていない保存のジョブがなければ印を消す。
+/// 前から後に失敗・中止したもの）、そのどちらの保存のジョブもなければ印を消す（[`CLEAR_PARTS_MARK`]）。
 fn sweep_all_parts(tx: &Connection, now: i64) -> Result<u64> {
-    let live = save::gc_roots(tx, now.saturating_sub(GRACE_MS))?;
+    let since = now.saturating_sub(GRACE_MS);
+    let live = save::gc_roots(tx, since)?;
     let removed = sweep_parts(tx, Scope::All, &live)?;
-    tx.prepare_cached(
-        "DELETE FROM settings WHERE key = ?1
-            AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit')",
-    )?
-    .execute([PARTS_KEY])?;
+    tx.prepare_cached(CLEAR_PARTS_MARK)?
+        .execute(params![PARTS_KEY, since])?;
     Ok(removed)
 }
 
@@ -264,8 +271,6 @@ struct Candidate {
     blob_id: i64,
     hash: [u8; 32],
     ext: String,
-    /// ほかの hold の版・アイテムの今・アンカーと台帳の行を共有している（照合せずに released にしてよい）。
-    shared: bool,
 }
 
 /// 再開のカーソル（置き換えの時刻と版の行の ID。この組より後の候補から）。
@@ -276,13 +281,15 @@ struct Cursor {
     id: i64,
 }
 
-/// 台帳の行 `blob_id`（中身 `hash`）を、ほかの hold の版・アイテムの今・アンカーが参照しているか（3 つとも索引で引く）。
+/// 台帳の行 `blob_id`（中身 `hash`）を、ほかの hold の版・アイテムの今・アンカーが参照しているか（3 つとも索引で引く：
+/// `sqlite_autoindex_items_1`・`idx_item_versions_file_blob`・`idx_edit_anchors_blob`）。照合が一致したあと、門の中で見る
+/// （共有していれば released にするだけで、ファイルは消さない）。
 const SHARED: &str = "EXISTS (SELECT 1 FROM items i WHERE i.hash = ?2)
      OR EXISTS (SELECT 1 FROM item_versions w WHERE w.file_blob_id = ?1 AND w.file_state = 'hold')
      OR EXISTS (SELECT 1 FROM edit_anchors a WHERE a.blob_id = ?1)";
 
 /// 上限 `cutoff` までに置き換えた消し待ちの版を、カーソル `after` の次から置き換えの古い順に `limit` 個（部分索引
-/// `idx_item_versions_waiting` で引く。共有の判定は [`SHARED`] と同じ 3 つの索引）。
+/// `idx_item_versions_waiting` で引く）。共有しているかはここでは見ない（どの候補も照合してから、門の中で [`SHARED`] を見る）。
 fn candidates(
     conn: &Connection,
     cutoff: i64,
@@ -294,10 +301,7 @@ fn candidates(
         id: i64::MIN,
     });
     let mut stmt = conn.prepare_cached(
-        "SELECT v.id, v.item_id, v.version, v.replaced_at, v.file_blob_id, b.hash, b.ext,
-                EXISTS (SELECT 1 FROM items i WHERE i.hash = b.hash)
-             OR EXISTS (SELECT 1 FROM item_versions w WHERE w.file_blob_id = v.file_blob_id AND w.file_state = 'hold')
-             OR EXISTS (SELECT 1 FROM edit_anchors a WHERE a.blob_id = v.file_blob_id)
+        "SELECT v.id, v.item_id, v.version, v.replaced_at, v.file_blob_id, b.hash, b.ext
            FROM item_versions v JOIN blobs b ON b.id = v.file_blob_id
           WHERE v.file_state = 'waiting' AND v.replaced_at <= ?1 AND (v.replaced_at, v.id) > (?2, ?3)
           ORDER BY v.replaced_at, v.id LIMIT ?4",
@@ -312,12 +316,11 @@ fn candidates(
             r.get::<_, i64>(4)?,
             r.get::<_, Vec<u8>>(5)?,
             r.get::<_, String>(6)?,
-            r.get::<_, bool>(7)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, item_id, version, replaced_at, blob_id, hash, ext, shared) = row?;
+        let (id, item_id, version, replaced_at, blob_id, hash, ext) = row?;
         let hash = <[u8; 32]>::try_from(hash.as_slice()).map_err(|_| {
             CoreError::Invalid(format!(
                 "台帳の行 {blob_id} のハッシュが 32 バイトではありません"
@@ -331,7 +334,6 @@ fn candidates(
             blob_id,
             hash,
             ext,
-            shared,
         });
     }
     Ok(out)
@@ -408,9 +410,10 @@ struct GcState {
     v: u32,
     phase: Phase,
     cursor: Option<Cursor>,
-    /// 照合して消した版。
+    /// 照合が一致して消した版（台帳の行をほかが持たないので、ファイルも消した）。
     released: u64,
-    /// 共有していたので照合せずに released にした版。
+    /// 照合が一致したが、ほかの hold の版・アイテムの今・アンカーが台帳の行を持つので、released にするだけにした版
+    /// （ファイルは残る）。
     shared: u64,
     /// 照合が合わずに残した版。
     kept: u64,
@@ -447,7 +450,8 @@ impl GcState {
 enum Pre {
     /// もう消し待ちでない・別の台帳の行を指す（保存・版に戻す・ゴミ箱を空にするで変わった）。
     Gone,
-    /// 共有になった（作り直している間に保存・版に戻すで同じ中身が使われた。S12）：released にした。
+    /// 共有している（前から共有していたか、作り直している間に保存・版に戻すで同じ中身が使われた。S12）：released にした
+    /// （ファイルは消さない）。
     Shared,
     /// 'delete' を予告した（予告の行の ID）。
     Announced(i64),
@@ -473,6 +477,10 @@ pub(crate) enum GcFault {
     AfterAnnounce,
     /// 台帳の行を解放したあと、ファイルを消す前。
     AfterRelease,
+    /// アンカーの段：'delete' の予告をコミットしたあと（アンカーの行と台帳の行はまだある）。
+    AnchorsAfterAnnounce,
+    /// アンカーの段：アンカーの行を消して台帳の行を解放したあと、ファイルを消す前。
+    AnchorsAfterRelease,
 }
 
 /// GC のジョブの処理。エンジンの部品（照合の作り直し）は、このライブラリのもの。
@@ -621,8 +629,10 @@ impl JobHandler for GcHandler {
 }
 
 impl GcHandler {
-    /// 候補 1 つ：共有していれば released にし、していなければ照合して、一致すれば消し、合わなければ kept、照らせなければ
-    /// 次回へ。カーソルは候補ごとのトランザクションで途中経過に書く（照合の途中で止めたら書かず、再開でやり直す）。
+    /// 候補 1 つ：照合して、一致すれば released にし（門の中で共有していればファイルは残し、していなければ消す。[`Self::remove`]）、
+    /// 合わなければ kept（台帳の行を参照し続ける）、照らせなければ次回へ。共有している候補も照合する（共有相手があとで消えると、
+    /// 照合していない版のファイルが消えるため。ADR-170 (2)）。カーソルは候補ごとのトランザクションで途中経過に書く（照合の途中
+    /// で止めたら書かず、再開でやり直す）。
     fn collect(&self, ctx: &JobContext, cand: &Candidate, st: &mut GcState) -> Result<Flow<()>> {
         let library = ctx.library();
         let db = library.db();
@@ -631,32 +641,6 @@ impl GcHandler {
             replaced_at: cand.replaced_at,
             id: cand.id,
         };
-        if cand.shared {
-            let _gate = library.ingest_exclusive();
-            let (c, mut next) = (cand.clone(), st.clone());
-            next.cursor = Some(cursor);
-            let (done, next) = db.write(move |tx| {
-                let done = if !still_waiting(tx, &c)? {
-                    true
-                } else if is_shared(tx, &c)? {
-                    if release_row(tx, &c)? {
-                        next.shared += 1;
-                    }
-                    true
-                } else {
-                    false
-                };
-                if done {
-                    save_partial(tx, job, &next.json(), 0.0, "置き換えた版を片付けています")?;
-                }
-                Ok((done, next))
-            })?;
-            if done {
-                *st = next;
-                return Ok(Flow::Go(()));
-            }
-            // 共有でなくなった（ほかの持ち主が先に消えた）：照合してから消す
-        }
         let version = db
             .read(|c| versions::get(c, cand.item_id, cand.version))?
             .filter(|v| {
@@ -722,8 +706,8 @@ impl GcHandler {
         Ok(Flow::Go(()))
     }
 
-    /// 照合が一致した候補を消す：門を取り、確かめ直して 'delete' を予告してコミット → released にして台帳の行を解放して
-    /// コミット → 実ファイルと派生のファイルを消す → 予告を消す。
+    /// 照合が一致した候補を消す：門を取り、確かめ直して（ほかが台帳の行を持っていれば released にするだけ）'delete' を予告して
+    /// コミット → released にして台帳の行を解放してコミット → 実ファイルと派生のファイルを消す → 予告を消す。
     fn remove(
         &self,
         ctx: &JobContext,
@@ -824,6 +808,8 @@ impl GcHandler {
                 pending,
             ))
         })?;
+        #[cfg(test)]
+        self.crash_at(GcFault::AnchorsAfterAnnounce)?;
         let mut next = st.clone();
         next.phase = Phase::Parts;
         let (released, next) = db.write(move |tx| {
@@ -835,6 +821,8 @@ impl GcHandler {
             Ok((released, next))
         })?;
         *st = next;
+        #[cfg(test)]
+        self.crash_at(GcFault::AnchorsAfterRelease)?;
         if ledger::remove_files(library.layout(), &released) == 0 && !pending.is_empty() {
             db.write(move |tx| ledger::clear_pending(tx, &pending).map(|_| ()))?;
         }
@@ -869,10 +857,11 @@ mod tests {
         assert_eq!(cutoff(i64::MIN, &[i64::MIN]), i64::MIN);
     }
 
-    /// 候補の問い合わせ：消し待ちで上限までのものを、カーソルの次から置き換えの古い順に。共有（アイテムの今・hold の版・
-    /// アンカー）を見分ける。部分索引で引き、版の表を走査しない。
+    /// 候補の問い合わせ：消し待ちで上限までのものを、カーソルの次から置き換えの古い順に（共有していても候補にする。照合して
+    /// から門の中で共有を見る）。部分索引で引き、版の表を走査しない。共有の判定（アイテムの今・hold の版・アンカー）は 3 つの
+    /// 索引で引く。
     #[test]
-    fn candidates_follow_the_cursor_and_see_sharing() {
+    fn candidates_follow_the_cursor_and_sharing_uses_indexes() {
         let conn = test_conn();
         let a = insert_item(&conn, 1, [1; 32]);
         insert_version(&conn, a, 0, [10; 32], "hold", None);
@@ -886,10 +875,8 @@ mod tests {
         .unwrap();
         let all = candidates(&conn, 100, None, 10).unwrap();
         assert_eq!(
-            all.iter()
-                .map(|c| (c.version, c.shared))
-                .collect::<Vec<_>>(),
-            vec![(2, false), (1, false)]
+            all.iter().map(|c| c.version).collect::<Vec<_>>(),
+            vec![2, 1]
         );
         assert!(due(&conn, 100).unwrap());
         assert!(due(&conn, 45).unwrap());
@@ -902,21 +889,23 @@ mod tests {
         let rest = candidates(&conn, 100, Some(after), 10).unwrap();
         assert_eq!(rest.iter().map(|c| c.version).collect::<Vec<_>>(), vec![1]);
         assert_eq!(candidates(&conn, 100, None, 1).unwrap().len(), 1);
-        // 版 1 の中身を別のアイテムの今にすると共有
+        let shared = |c: &Candidate| is_shared(&conn, c).unwrap();
+        assert_eq!(
+            all.iter().map(shared).collect::<Vec<_>>(),
+            vec![false, false]
+        );
+        // 版 1 の中身を別のアイテムの今にすると共有（それでも候補のまま）
         insert_item(&conn, 2, [11; 32]);
         let all = candidates(&conn, 100, None, 10).unwrap();
         assert_eq!(
             all.iter()
-                .map(|c| (c.version, c.shared))
+                .map(|c| (c.version, shared(c)))
                 .collect::<Vec<_>>(),
             vec![(2, false), (1, true)]
         );
         let plan = query_plan(
             &conn,
-            "SELECT v.id, v.item_id, v.version, v.replaced_at, v.file_blob_id, b.hash, b.ext,
-                    EXISTS (SELECT 1 FROM items i WHERE i.hash = b.hash)
-                 OR EXISTS (SELECT 1 FROM item_versions w WHERE w.file_blob_id = v.file_blob_id AND w.file_state = 'hold')
-                 OR EXISTS (SELECT 1 FROM edit_anchors a WHERE a.blob_id = v.file_blob_id)
+            "SELECT v.id, v.item_id, v.version, v.replaced_at, v.file_blob_id, b.hash, b.ext
                FROM item_versions v JOIN blobs b ON b.id = v.file_blob_id
               WHERE v.file_state = 'waiting' AND v.replaced_at <= 100 AND (v.replaced_at, v.id) > (1, 2)
               ORDER BY v.replaced_at, v.id LIMIT 16",
@@ -924,6 +913,12 @@ mod tests {
         assert!(plan.contains("idx_item_versions_waiting"), "{plan}");
         assert!(!plan.contains("SCAN"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        let plan = query_plan(
+            &conn,
+            &format!("SELECT {SHARED}")
+                .replace("?1", "2")
+                .replace("?2", "x'00'"),
+        );
         for index in [
             "sqlite_autoindex_items_1",
             "idx_item_versions_file_blob",
@@ -931,6 +926,10 @@ mod tests {
         ] {
             assert!(plan.contains(index), "{index}: {plan}");
         }
+        assert!(
+            !plan.replace("SCAN CONSTANT ROW", "").contains("SCAN"),
+            "{plan}"
+        );
         for sql in [
             "SELECT EXISTS (SELECT 1 FROM item_versions WHERE file_state = 'waiting' AND replaced_at <= 5)",
             "SELECT count(*) FROM item_versions WHERE file_state = 'waiting' AND replaced_at <= 5",
@@ -941,7 +940,8 @@ mod tests {
         }
     }
 
-    /// 部品の印：置けば候補があることになり、終わっていない保存のジョブがなければ片付けで消える。
+    /// 部品の印：置けば候補があることになり、終わっていない保存のジョブも 7 日以内に失敗・中止した保存のジョブもなければ
+    /// 片付けで消える（どちらも根として残すので、その部品があとで孤立しうる）。印を消す問い合わせは状態の索引で引く。
     #[test]
     fn the_parts_mark_makes_gc_due_until_swept() {
         let conn = test_conn();
@@ -956,11 +956,38 @@ mod tests {
         .unwrap();
         sweep_all_parts(&conn, 10).unwrap();
         assert!(parts_marked(&conn).unwrap());
+        // 失敗した保存は 7 日の間は根として残すので、印も残す（ちょうど 7 日まで）
         conn.execute("UPDATE jobs SET state = 'failed', finished_at = 5", [])
             .unwrap();
-        sweep_all_parts(&conn, 10).unwrap();
+        for now in [10, 5 + GRACE_MS] {
+            sweep_all_parts(&conn, now).unwrap();
+            assert!(parts_marked(&conn).unwrap(), "{now}");
+        }
+        // 中止も同じ。ほかの種類のジョブは見ない
+        conn.execute(
+            "INSERT INTO jobs (kind, state, input_json, created_at, finished_at) VALUES ('gc', 'failed', '{}', 1, ?1)",
+            [GRACE_MS * 10],
+        )
+        .unwrap();
+        sweep_all_parts(&conn, 5 + GRACE_MS + 1).unwrap();
         assert!(!parts_marked(&conn).unwrap());
         assert!(!due(&conn, 0).unwrap());
+        mark_parts(&conn).unwrap();
+        conn.execute("UPDATE jobs SET state = 'canceled' WHERE kind = 'edit'", [])
+            .unwrap();
+        sweep_all_parts(&conn, 5 + GRACE_MS).unwrap();
+        assert!(parts_marked(&conn).unwrap());
+        sweep_all_parts(&conn, 6 + GRACE_MS).unwrap();
+        assert!(!parts_marked(&conn).unwrap());
+        let plan = query_plan(
+            &conn,
+            &CLEAR_PARTS_MARK
+                .replace("?1", "'gc.parts'")
+                .replace("?2", "1")
+                .replace("DELETE FROM", "SELECT 1 FROM"),
+        );
+        assert!(plan.contains("idx_jobs_queue"), "{plan}");
+        assert!(!plan.contains("SCAN jobs"), "{plan}");
     }
 
     fn doc_with(n: usize, axis: &str) -> Graph {

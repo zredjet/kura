@@ -32,6 +32,13 @@ const SHUTDOWN: u8 = 3;
 pub trait JobHandler: Send + Sync {
     /// ジョブを実行する。`ctx.control()` を区切りごとに確かめ、一時停止・中止に応じる。
     fn run(&self, ctx: &JobContext) -> Result<JobEnd>;
+
+    /// 待ち・一時停止のまま中止された（`run` を通らずに終わった）ジョブの後始末。状態を canceled にするのと同じ
+    /// トランザクションで呼ぶ（`input_json` はそのジョブの入力）。既定は何もしない（保存のジョブは、積む前に置いた文書の
+    /// 部品の印を置く。M12）。
+    fn canceled_while_idle(&self, _tx: &rusqlite::Connection, _input_json: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// ジョブの終わり方。
@@ -500,7 +507,8 @@ impl JobManager {
         (self.inner.sink)(event);
     }
 
-    /// 実行中なら指示を出し、そうでなければ DB の状態を `from` → `to` に変える。
+    /// 実行中なら指示を出し、そうでなければ DB の状態を `from` → `to` に変える。待ち・一時停止のまま中止したときは、同じ
+    /// トランザクションで種類の処理の後始末（[`JobHandler::canceled_while_idle`]）を呼ぶ。
     fn signal_or_transition(
         &self,
         id: JobId,
@@ -514,10 +522,29 @@ impl JobManager {
                 control.store(signal, Ordering::Release);
                 None
             } else {
+                // 中止なら、種類の処理と入力（後始末に渡す。行がなければ transition が何も変えない）
+                let cleanup = if to == JobState::Canceled {
+                    self.inner
+                        .library
+                        .db()
+                        .read(|conn| store::get(conn, id))?
+                        .and_then(|r| {
+                            self.inner
+                                .handlers
+                                .get(&r.kind)
+                                .cloned()
+                                .map(|h| (h, r.input_json))
+                        })
+                } else {
+                    None
+                };
                 let changed = self.inner.library.db().write(move |tx| {
                     let changed = store::transition(tx, id, from, to)?;
                     if changed && to.is_terminal() {
                         store::finish(tx, id, to, None, None, None, None, now_ms())?;
+                        if let Some((handler, input)) = &cleanup {
+                            handler.canceled_while_idle(tx, input)?;
+                        }
                     }
                     Ok(changed)
                 })?;
@@ -895,6 +922,53 @@ mod tests {
         let record = jobs.get(running).unwrap();
         assert_eq!(record.state, JobState::Canceled);
         assert!(record.finished_at.is_some());
+    }
+
+    /// 動かずに中止されたジョブの後始末を覚える処理（入力を settings に書く）。
+    struct Cleanup;
+    impl JobHandler for Cleanup {
+        fn run(&self, _ctx: &JobContext) -> Result<JobEnd> {
+            Ok(JobEnd::Paused)
+        }
+        fn canceled_while_idle(&self, tx: &rusqlite::Connection, input_json: &str) -> Result<()> {
+            crate::settings::set(tx, "test.cleanup", &input_json.to_string())
+        }
+    }
+
+    /// 待ち・一時停止のまま中止したジョブは、canceled にするのと同じトランザクションで種類の後始末を呼ぶ（入力つき）。一時停止
+    /// にするだけ・もう終わったジョブの中止では呼ばない。
+    #[test]
+    fn canceling_an_idle_job_calls_its_cleanup() {
+        let f = fixture();
+        let jobs = JobManager::new(
+            f.library.clone(),
+            vec![(JobKind::Import, Arc::new(Cleanup) as Arc<dyn JobHandler>)],
+            sink(&f.events),
+        )
+        .unwrap();
+        let cleaned = || {
+            f.library
+                .db()
+                .read(|c| crate::settings::get::<String>(c, "test.cleanup"))
+                .unwrap()
+        };
+        let a = jobs.enqueue(JobKind::Import, r#"{"a":1}"#.into()).unwrap();
+        jobs.pause(a).unwrap();
+        assert_eq!(jobs.get(a).unwrap().state, JobState::Paused);
+        assert_eq!(cleaned(), None, "一時停止では呼ばない");
+        jobs.cancel(a).unwrap();
+        assert_eq!(jobs.get(a).unwrap().state, JobState::Canceled);
+        assert_eq!(cleaned().as_deref(), Some(r#"{"a":1}"#));
+        let b = jobs.enqueue(JobKind::Import, r#"{"b":2}"#.into()).unwrap();
+        jobs.cancel(b).unwrap();
+        assert_eq!(cleaned().as_deref(), Some(r#"{"b":2}"#), "待ちから");
+        // もう終わったジョブの中止は何も変えない
+        f.library
+            .db()
+            .write(|tx| crate::settings::set(tx, "test.cleanup", &String::new()))
+            .unwrap();
+        jobs.cancel(b).unwrap();
+        assert_eq!(cleaned().as_deref(), Some(""));
     }
 
     #[test]

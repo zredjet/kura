@@ -38,6 +38,8 @@ pub struct Services {
     /// GC（M12 の段 3）の時計とバックアップの一覧。アプリはいつも本物（[`GcClock::system`]）。`kura-devtools edit crash-loop`
     /// の子だけが進めた時計を渡す。
     pub gc_clock: GcClock,
+    /// バックアップの係が確かめる時（最初の待ちと間隔）。アプリはいつも既定（20 秒・1 時間）。テストが短くする。
+    pub(crate) backup_checks: backup::Checks,
 }
 
 impl Services {
@@ -48,7 +50,15 @@ impl Services {
             engine: None,
             upgrade: UpgradeHooks::default(),
             gc_clock: GcClock::system(),
+            backup_checks: backup::Checks::default(),
         }
+    }
+
+    /// バックアップの係が確かめる時を短くする（テスト：1 時間ごとの確かめのあとに GC が積まれるのを見る）。
+    #[cfg(test)]
+    pub(crate) fn with_backup_checks(mut self, checks: backup::Checks) -> Self {
+        self.backup_checks = checks;
+        self
     }
 
     /// GC の時計を差し替える（`kura-devtools edit crash-loop` の子・テスト）。
@@ -120,6 +130,7 @@ impl LibrarySession {
             media: backend,
             engine,
             gc_clock,
+            backup_checks,
             ..
         } = services;
         let library = Arc::new(library);
@@ -242,20 +253,17 @@ impl LibrarySession {
                 }
             })?;
 
-        // バックアップの 1 時間ごとの確かめのあとにも GC の候補を数える（エンジンの部品があるときだけ。閉じると係が止まる。
-        // 輪にならないよう弱い参照で持つ）
+        // バックアップの 1 時間ごとの確かめのあとにも GC の候補を数える（エンジンの部品があるときだけ。閉じると係が止まる）
         let on_check: backup::OnCheck = if engine.is_some() {
-            let (lib, jobs2) = (Arc::downgrade(&library), Arc::downgrade(&jobs));
-            let clock = gc_clock;
-            Box::new(move || {
-                if let (Some(lib), Some(jobs)) = (lib.upgrade(), jobs2.upgrade()) {
-                    queue_gc(&lib, &jobs, &clock);
-                }
-            })
+            gc_on_check(&library, &jobs, gc_clock)
         } else {
             Box::new(|| {})
         };
-        let backup = Mutex::new(backup::Scheduler::start(library.layout().clone(), on_check));
+        let backup = Mutex::new(backup::Scheduler::start(
+            library.layout().clone(),
+            on_check,
+            backup_checks,
+        ));
         Ok(Self {
             library,
             jobs,
@@ -412,6 +420,17 @@ impl LibrarySession {
 
 /// GC の候補（7 日とバックアップの条件を満たす消し待ちの版・部品の印）があれば GC のジョブを積む（開いたあと・バックアップの
 /// 1 時間ごとの確かめ）。
+/// バックアップの 1 時間ごとの確かめのあとに呼ぶもの：GC の候補があれば積む（輪にならないよう、ライブラリとジョブは弱い参照で
+/// 持つ。閉じたあとは何もしない）。
+fn gc_on_check(library: &Arc<Library>, jobs: &Arc<JobManager>, clock: GcClock) -> backup::OnCheck {
+    let (lib, jobs) = (Arc::downgrade(library), Arc::downgrade(jobs));
+    Box::new(move || {
+        if let (Some(lib), Some(jobs)) = (lib.upgrade(), jobs.upgrade()) {
+            queue_gc(&lib, &jobs, &clock);
+        }
+    })
+}
+
 fn queue_gc(lib: &Library, jobs: &JobManager, clock: &GcClock) {
     if let Err(err) = gc::queue_if_due(lib, clock, || jobs.ensure_queued(JobKind::Gc, "{}")) {
         tracing::warn!(%err, "GC のジョブを積めませんでした");
@@ -529,6 +548,89 @@ mod tests {
         let session = LibrarySession::open(&path, sink(), services()).unwrap();
         session.wait_ready();
         assert_eq!(gc_jobs(&session), 1);
+    }
+
+    /// バックアップの 1 時間ごとの確かめのあとにも GC の候補を数え、候補があれば GC を 1 本積む（開いたときは候補がなく、開いた
+    /// まま 7 日が過ぎた場合。ADR-170 (5)）。確かめの間隔はテストで短くする。
+    #[test]
+    fn gc_is_queued_after_the_hourly_backup_check() {
+        use crate::edit::testing::{insert_item, insert_version};
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("L");
+        let now = Arc::new(AtomicI64::new(1_000));
+        let clock = {
+            let now = now.clone();
+            GcClock::new(
+                Arc::new(move || now.load(Ordering::SeqCst)),
+                Arc::new(|_| Ok(Vec::new())),
+            )
+        };
+        let services = Services::new(Arc::new(FakeBackend))
+            .with_engine(Arc::new(FakeEngineFactory::default()))
+            .with_gc_clock(clock)
+            .with_backup_checks(backup::Checks {
+                first: Duration::from_millis(50),
+                every: Duration::from_millis(50),
+            });
+        let session = LibrarySession::create(&path, sink(), services).unwrap();
+        session.wait_ready();
+        // 版 1 はテストの補助の時刻（5）に置き換えた：今（1,000）からは 7 日たっていないので、候補はない
+        session
+            .library()
+            .db()
+            .write(|tx| {
+                let a = insert_item(tx, 1, [1; 32]);
+                insert_version(tx, a, 0, [10; 32], "hold", None);
+                insert_version(tx, a, 1, [11; 32], "waiting", None);
+                insert_version(tx, a, 2, [1; 32], "hold", None);
+                Ok(())
+            })
+            .unwrap();
+        for hash in [[1u8; 32], [10; 32], [11; 32]] {
+            let file = session.library().layout().content_path(&hash, "png");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
+        }
+        let gc_jobs = || -> i64 {
+            session
+                .library()
+                .db()
+                .read(|c| {
+                    Ok(
+                        c.query_row("SELECT count(*) FROM jobs WHERE kind = 'gc'", [], |r| {
+                            r.get(0)
+                        })?,
+                    )
+                })
+                .unwrap()
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(gc_jobs(), 0, "候補がなければ確かめても積まない");
+        // 開いたまま 8 日たった：次の確かめのあとに GC が積まれる
+        now.store(5 + 8 * 24 * 60 * 60 * 1000, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while gc_jobs() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "確かめのあとに GC が積まれません"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 確かめるたびに候補を数え直すが、待っている GC は 1 本まで（`ensure_queued`）
+        let waiting: i64 = session
+            .library()
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM jobs WHERE kind = 'gc' AND state = 'queued'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert!(waiting <= 1);
+        session.close();
     }
 
     #[test]

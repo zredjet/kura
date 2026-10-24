@@ -1025,12 +1025,14 @@ pub struct TrashPlan {
     pub blobs: Vec<([u8; 32], String)>,
 }
 
-/// ゴミ箱を空にする前に、消すアイテムと消しうる中身を集める（ゴミ箱の部分索引 `idx_items_trashed` からたどる。CROSS JOIN で
-/// 結ぶ順を決める。統計のない小さな表では、版の表を走査する順を選ぶことがあるため）。
+/// ゴミ箱を空にする前に、消すアイテム（ゴミ箱に入れた順）と消しうる中身を集める（ゴミ箱の部分索引 `idx_items_trashed` から
+/// たどる。アイテムは索引の順（`trashed_at, id`）に並べる：`ORDER BY id` だと items を走査する。CROSS JOIN で結ぶ順を決める。
+/// 統計のない小さな表では、版の表を走査する順を選ぶことがあるため）。
 pub fn plan_empty_trash(conn: &Connection) -> Result<TrashPlan> {
     let items: Vec<i64> = {
-        let mut stmt =
-            conn.prepare_cached("SELECT id FROM items WHERE trashed_at IS NOT NULL ORDER BY id")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id FROM items WHERE trashed_at IS NOT NULL ORDER BY trashed_at, id",
+        )?;
         let rows = stmt.query_map([], |row| row.get(0))?;
         rows.collect::<std::result::Result<_, _>>()?
     };
@@ -1850,6 +1852,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // 消すアイテムを決める問い合わせは、ゴミ箱の部分索引の順に読む（items を走査しない）
+        let plan = query_plan(
+            &conn,
+            "SELECT id FROM items WHERE trashed_at IS NOT NULL ORDER BY trashed_at, id",
+        );
+        assert!(plan.contains("idx_items_trashed"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
         // 予告する中身を集める問い合わせは、ゴミ箱の部分索引からたどる（items・版を走査しない）
         let plan = query_plan(
             &conn,

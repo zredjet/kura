@@ -242,6 +242,22 @@ fn copy_conn(from: &Connection, dest: &Path, pages: i32, pause: Duration) -> Res
 /// 1 時間ごとの確かめのあとに呼ぶもの（M12 の段 3：GC の候補があれば GC を積む）。
 pub(crate) type OnCheck = Box<dyn Fn() + Send + 'static>;
 
+/// 確かめる時（最初の待ちと間隔）。アプリはいつも [`Checks::default`]（20 秒・1 時間）。テストが短くする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Checks {
+    pub(crate) first: Duration,
+    pub(crate) every: Duration,
+}
+
+impl Default for Checks {
+    fn default() -> Self {
+        Self {
+            first: FIRST_CHECK,
+            every: CHECK_EVERY,
+        }
+    }
+}
+
 /// 開いているあいだのバックアップの係（閉じると止まる）。
 pub(crate) struct Scheduler {
     stop: Option<Sender<()>>,
@@ -249,20 +265,20 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-    /// 動かし始める。最初は少し待ってから、そのあとは 1 時間ごとに、時期なら作る。確かめるたびに（作ったあとに）`on_check` を
-    /// 呼ぶ（バックアップが増える・古いものが消えると、GC が消してよい版が変わる）。
-    pub(crate) fn start(layout: Layout, on_check: OnCheck) -> Self {
+    /// 動かし始める。最初は少し待ってから（`checks.first`）、そのあとは 1 時間ごとに（`checks.every`）、時期なら作る。確かめる
+    /// たびに（作ったあとに）`on_check` を呼ぶ（バックアップが増える・古いものが消えると、GC が消してよい版が変わる）。
+    pub(crate) fn start(layout: Layout, on_check: OnCheck, checks: Checks) -> Self {
         let (stop, rx) = mpsc::channel::<()>();
         let handle = std::thread::Builder::new()
             .name("kura-backup".into())
             .spawn(move || {
-                let mut wait = FIRST_CHECK;
+                let mut wait = checks.first;
                 loop {
                     match rx.recv_timeout(wait) {
                         Err(RecvTimeoutError::Timeout) => {}
                         Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
                     }
-                    wait = CHECK_EVERY;
+                    wait = checks.every;
                     let last = list(&layout)
                         .ok()
                         .and_then(|l| l.first().map(|b| b.created_at));
@@ -606,11 +622,35 @@ mod tests {
     fn scheduler_stops_promptly() {
         let dir = tempfile::tempdir().unwrap();
         let lib = Library::create(&dir.path().join("L")).unwrap();
-        let mut scheduler = Scheduler::start(lib.layout().clone(), Box::new(|| {}));
+        let mut scheduler =
+            Scheduler::start(lib.layout().clone(), Box::new(|| {}), Checks::default());
         let started = std::time::Instant::now();
         scheduler.stop();
         assert!(started.elapsed() < Duration::from_secs(2));
         // 最初の確認の前に止めたので、作っていない
         assert!(list(lib.layout()).unwrap().is_empty());
+    }
+
+    /// 確かめるたびに（最初の待ちのあとと、間隔ごとに）、作ってから `on_check` を呼ぶ（GC の候補を数える。M12 の段 3）。
+    #[test]
+    fn scheduler_calls_on_check_after_each_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::create(&dir.path().join("L")).unwrap();
+        let (tx, rx) = mpsc::channel::<usize>();
+        let layout = lib.layout().clone();
+        let mut scheduler = Scheduler::start(
+            lib.layout().clone(),
+            Box::new(move || {
+                let _ = tx.send(list(&layout).map(|l| l.len()).unwrap_or(0));
+            }),
+            Checks {
+                first: Duration::from_millis(10),
+                every: Duration::from_millis(20),
+            },
+        );
+        let wait = Duration::from_secs(30);
+        assert_eq!(rx.recv_timeout(wait).unwrap(), 1, "作ってから呼ぶ");
+        assert_eq!(rx.recv_timeout(wait).unwrap(), 1, "時期でなければ作らない");
+        scheduler.stop();
     }
 }
