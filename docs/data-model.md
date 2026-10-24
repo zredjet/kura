@@ -590,7 +590,7 @@ CREATE INDEX idx_item_versions_file_blob ON item_versions(file_blob_id);      --
 CREATE INDEX idx_item_versions_doc       ON item_versions(doc_id);
 CREATE INDEX idx_item_versions_waiting   ON item_versions(replaced_at) WHERE file_state = 'waiting';   -- 段 3 の GC
 CREATE UNIQUE INDEX idx_item_versions_job ON item_versions(job_id) WHERE job_id IS NOT NULL;
--- 不変条件（段 2 の C の `edit::versions::check_invariants`）：版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。版 0 と頭は hold。
+-- 不変条件（段 2 の B の `edit::versions::check_invariants`。ほかの版が hold でないことも照らす）：版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。版 0 と頭は hold。
 -- 頭の output_hash・ext は items.hash・ext に等しい。hold・waiting・kept の file_blob_id が指す台帳の行の hash は output_hash と同じ
 
 -- ===== 版の入力（0011。版ごとの入力の記録）=====
@@ -724,7 +724,7 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 
 ### 保存と版（M12。`crates/kura-core/src/edit/`・`library/ledger.rs`・`import/store.rs`）
 
-段 2 の A で入れたもの（版の読み書き・保存のジョブ・下書きは B・C で足す）。
+段 2 の A（重複の判定・台帳の門・予告と照合・文書の部品・ゴミ箱を空にする処理）と B（版の読み書き・アンカー・保存のジョブの上書きと別名）で入れたもの（元に戻す・下書きは C で足す）。
 
 - **重複の判定**（`import::store::find_owner`。取り込み・ダウンロード・キャプチャ）：今 → 元 → 過去の版の順に、2 段の問い合わせで
   探す（どちらも索引。テスト `find_owner_looks_at_current_then_original_then_past_versions` の EXPLAIN）。
@@ -779,6 +779,66 @@ GROUP BY item_id HAVING COUNT(*) = 3;
   SELECT o.id, o.digest, o.kind, o.body FROM edit_objects o WHERE o.id IN (SELECT id FROM t);         -- 部品は行の ID で引く
   ```
 
+- **版を読む**（`edit::versions`）：頭は `SELECT i.hash, i.ext, i.kind, i.trashed_at IS NOT NULL, (SELECT coalesce(max(v.version), 0)
+  FROM item_versions v WHERE v.item_id = i.id) FROM items i WHERE i.id = ?`（版の行がなければ版 0。max は `UNIQUE(item_id, version)` の
+  索引）。元は版 0 の行、なければアイテムの今。再開の確かめは `WHERE job_id = ?`（部分の一意の索引 `idx_item_versions_job`）。版の一覧は
+  `WHERE item_id = ? ORDER BY version`、入力は主キー `(version_id, input)`（テスト `queries_use_their_indexes` の EXPLAIN）。
+  不変条件の確かめ（`check_invariants`）は版の表を走査する（テストと整合性の確かめだけ。起動の道では呼ばない）。
+- **アンカー**（`edit::anchors`）：引くのは `SELECT … FROM edit_anchors a JOIN blobs b ON b.id = a.blob_id WHERE a.source_hash = ?1 AND
+  a.options_digest = ?2`（`UNIQUE(source_hash, options_digest)` の索引）。足すのは保存のトランザクション 2 で、`ledger::register` のあと
+  `INSERT … ON CONFLICT(source_hash, options_digest) DO NOTHING` → 行を読み、別のファイルを指す行が先にあれば Conflict（参照されない台帳の
+  行を残さない）。`options` と `decoded` は正規の JSON、`value_digest` は元を読んだ記録の値のダイジェスト。
+- **保存のトランザクション 1（予告）**（`edit::save`。台帳の門を持って）：土台（`versions::head`）を確かめ直し、出力の中身 H の持ち主を
+  `find_owner` で引いて決める（上書き：ほかのアイテムの今なら Conflict、自分の今なら版だけ足す、元・過去の版なら通す。別名：持ち主が
+  いれば existing）。拡張子は台帳に H の行があればその拡張子（`ledger::ext_of`。items のトリガが食い違いで断らないように）、形式が今と
+  同じなら今の拡張子、ほかは形式の代表。台帳にない H と今回作ったアンカーを `ledger::announce(…, 'place', job)`。
+- **置き換えの UPDATE**（上書きのトランザクション 2）：土台を確かめ直し、`SELECT id FROM items WHERE hash = ?H AND id <> ?1`（ゴミ箱を含む
+  ほかのアイテムの今。hash の一意の索引）があれば Conflict。最初の保存なら版 0（出力＝今、`file_blob_id`＝今の台帳の行、hold。
+  メディア情報と元を読んだ記録を写す）を足してから、
+
+  ```sql
+  UPDATE items SET hash = ?2, ext = ?3, size_bytes = ?4, mime = ?5, width = ?6, height = ?7, duration_ms = ?8,
+         codec_info = NULL, thumb_state = 'pending',
+         proxy_state = CASE WHEN kind IN ('video','audio') THEN 'unknown' ELSE 'not_needed' END,
+         analysis_state = CASE WHEN kind IN ('image','audio') THEN 'pending' ELSE 'not_needed' END,
+         updated_at = ?9
+   WHERE id = ?1 AND hash = ?10 AND trashed_at IS NULL;   -- 1 行でなければ Conflict（台帳への登録は items_blob_bu が行う）
+  ```
+
+  H が今と同じなら `UPDATE items SET updated_at = ? WHERE id = ?` だけ。title・original_name・取り込み日時・再生の記録・素材の設定・
+  thumb_rev・kind は変えない（形式が変わる上書きでも。段 2 の決定 10・11）。codec_info は空にし、サムネイル・プロキシのジョブが読み直す。
+- **前の頭**：頭の版 n が 1 以上なら、新しい頭を足す前に
+
+  ```sql
+  UPDATE item_versions SET file_state = ?3,                                   -- 出力が H か版 0 と同じなら 'released'、ほかは 'waiting'
+         file_blob_id = CASE WHEN ?3 = 'released' THEN NULL ELSE file_blob_id END, replaced_at = ?4
+   WHERE item_id = ?1 AND version = ?2;
+  ```
+
+  （released の行のファイルは新しい頭か版 0 が持つので、台帳の行は参照されたまま）。最初の保存（n = 0）では前の今は元そのもので、
+  版 0 が hold で持つ。新しい頭は `kind = 'edit'`・`doc_id`＝根の行・`base_version = n`・`file_blob_id`＝H の台帳の行・hold・
+  `job_id`（部分の一意の索引で、再開で版を 2 つ足さない）。版の入力（Primary）は `source_hash`＝元、`value_digest`＝元を読んだ値、
+  `recorded`＝`RecordedInput` の正規の JSON、`anchor_id`。最後に `DELETE FROM ledger_pending WHERE job_id = ?` と、途中経過
+  `{"v":1,"committed":{…結果…}}`（`jobs.result_json`）を同じトランザクションで書く。
+- **別名の写し方**（別名のトランザクション 2）：元のアイテム A の土台を確かめ直し、H の持ち主がいないことを確かめ直してから、新しい
+  アイテム B を `import::store::insert_item` で入れ（original_name は「語幹．拡張子」、original_path は NULL、幅・高さ・長さは出力から）、
+
+  ```sql
+  UPDATE items SET rating = (SELECT rating FROM items WHERE id = ?A), note = (SELECT note FROM items WHERE id = ?A),
+         source_site = (SELECT source_site FROM items WHERE id = ?A), source_url = (SELECT source_url FROM items WHERE id = ?A),
+         captured_at = (SELECT captured_at FROM items WHERE id = ?A)
+   WHERE id = ?B;
+  INSERT INTO item_tags (tag_id, item_id, source) SELECT tag_id, ?B, source FROM item_tags WHERE item_id = ?A;        -- idx_item_tags_item
+  INSERT INTO item_folders (folder_id, item_id, pos) SELECT folder_id, ?B, pos FROM item_folders WHERE item_id = ?A; -- idx_item_folders_item
+  INSERT INTO item_derivations (item_id, source_item_id, source_version, source_hash, created_at) VALUES (?B, ?A, ?土台の版, ?A の今, ?);
+  ```
+
+  B の版 0 は A の元（出力・拡張子・大きさ・メディア情報は A の元のもの、`file_blob_id`＝A の元の台帳の行。A を消しても B の版 0 が台帳の
+  行を参照し続ける）、版 1 は描いた版（`base_version = 0`）。ユニット・プレイリスト・再生の記録・素材の設定（`asset_settings`）は写さない
+  （決定 4、段 2 の決定 9）。A には版の行を足さない。
+- **保存をやめるとき**（トランザクション 2 が Conflict など）：台帳の門を持ったまま、`SELECT p.hash, p.ext FROM ledger_pending p WHERE
+  p.job_id = ? AND NOT EXISTS (SELECT 1 FROM blobs b WHERE b.hash = p.hash AND b.ext = p.ext)` のファイルを消し、予告を消す（予告の表は
+  走査の例外）。
 - **ゴミ箱を空にする処理**（`items::delete_trashed`。段 2 の最小の対応で、段 3 で作り直す。利用者の決定 6）：items の行を消す前に、
   ゴミ箱のアイテムの版が持つファイルの hash と、版の入力が使うアンカーの ID を集める（ゴミ箱の部分索引 `idx_items_trashed` から
   たどる。統計のない小さな表で版の表を走査する順を選ばないよう、`CROSS JOIN` で結ぶ順を決める）。行を消したあと（版・入力は
