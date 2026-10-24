@@ -47,9 +47,10 @@ paths:
   `items_blob_mismatch` で断る）。台帳の行を消すのは `library::ledger::release` だけ（どの表からも参照されない行だけを消す）。
   「参照」は `ledger::REFERRERS`（`items.hash`・`item_versions.file_blob_id`・`edit_anchors.blob_id`。M12）で、`blobs` を ON DELETE
   CASCADE でなく参照する列を足したらここにも足す（`release_sees_every_table_that_references_the_ledger` が見張る）。items のトリガを
-  通らないファイル（版の出力・アンカー）は `ledger::register` で載せ、台帳にまだない中身を `files/` に置く・台帳から外した中身を
-  消すときは、`Library::ingest_exclusive` を持って予告（`ledger::announce`）をコミットしてから行う（開くときに `settle_pending`
-  が照らす）。
+  通らないファイル（版の出力・アンカー）は `ledger::register` で載せる。台帳にまだない中身を `files/` に置く・台帳から外した
+  中身を消すときは `Library::ingest_exclusive` を持つ。予告（`ledger::announce`）をコミットしてから置く・消すのは、台帳にない
+  中身を置く保存（'place'。台帳に載せるトランザクションで予告を消す）と、段 3 の GC が消すとき（'delete'。ファイルを消し終えて
+  から予告を消す）。ゴミ箱を空にする処理は段 3 で作り直すまで ADR-46 の順（予告なし）。開くときに `settle_pending` が予告を照らす。
 - 中身に依る書き込み（解析・サムネイル・プロキシの結果）は `WHERE id = ? AND hash = ?` のようにハッシュを条件にする
   （解析・サムネイルは M11、プロキシは M12 で入れた）。
 - `items.blob_id` は台帳の行の ID の写し（0010 の AFTER のトリガ `items_blob_id_ai`・`items_blob_id_au` が hash から引いて入れる）。
