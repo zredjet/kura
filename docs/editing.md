@@ -1073,7 +1073,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   2. 消す直前に、その版を文書から作り直して照合する。一致しなければ、そのファイルを残す。
   3. Platform・External でしか読めない元には、初めて編集するときにアンカーを作る（§9.4）。
 - 上書きは「アイテム ID を保ったまま中身を差し替える」操作。タグ・フォルダ・ユニット・プレイリスト・再生の記録は変わらない。手順：staging に書く → ハッシュ → `files/` に配置 → 1 トランザクションで `items.hash` を比較して置き換え、版を足す → 古いファイルを GC の待ち行列へ。
-- `items.hash` を書き換えるのは保存の処理だけ。中身に依る列を書く UPDATE は、すべてハッシュを条件にする（古いハッシュで作ったサムネイルを書き込まないため）。M11 で解析（`analysis_state` と結果・事実の書き込み。`WHERE id = ? AND hash = ? AND analysis_state = 'pending'`）とサムネイル（`thumb_state`・`thumb_rev` と読んだメディア情報。`WHERE id = ? AND hash = ?`）に入れた。結果・事実は中身ごと（台帳の行 `blob_id`）に持つので、保存で中身が変わると別の行になる（docs/data-model.md §2）。残りはプロキシ（`proxy_state`。今は ID と状態だけが条件）。
+- `items.hash` を書き換えるのは保存の処理だけ。中身に依る列を書く UPDATE は、すべてハッシュを条件にする（古いハッシュで作ったサムネイルを書き込まないため）。M11 で解析（`analysis_state` と結果・事実の書き込み。`WHERE id = ? AND hash = ? AND analysis_state = 'pending'`）とサムネイル（`thumb_state`・`thumb_rev` と読んだメディア情報。`WHERE id = ? AND hash = ?`）に入れた。結果・事実は中身ごと（台帳の行 `blob_id`）に持つので、保存で中身が変わると別の行になる（docs/data-model.md §2）。M12 でプロキシ（`proxy_state` の判定と作った結果。`WHERE id = ? AND hash = ?`）にも入れた。
 - 取り込みで、あるアイテムの今・元・過去の版と同じ中身なら、そのアイテムの重複として扱う。
 - 上書きの結果が別のアイテムの今と同じ中身になったら保存しない（`Conflict`）。
 - 保存の受け入れテスト（S1〜）は M12 の計画で足す。

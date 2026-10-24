@@ -158,6 +158,36 @@ fn todo_lookups_use_indexes() {
     }
 }
 
+/// 判定・作成の結果は、読んだときと中身（hash）が同じときだけ書く（保存で中身が変わっていたら書かない。editing.md §14）。
+#[test]
+fn writes_are_guarded_by_the_hash() {
+    let conn = crate::db::test_conn();
+    insert(&conn, 1, "video", "mkv", "unknown", 10);
+    let state = |c: &Connection| -> (String, Option<String>) {
+        c.query_row(
+            "SELECT proxy_state, codec_info FROM items WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    let decision = |hash: [u8; 32]| Decision {
+        id: 1,
+        hash,
+        state: "pending",
+        codec_json: Some("{}".into()),
+        error: None,
+    };
+    apply_decisions(&conn, &[decision([2u8; 32])]).unwrap();
+    assert_eq!(state(&conn), ("unknown".into(), None));
+    apply_decisions(&conn, &[decision([1u8; 32])]).unwrap();
+    assert_eq!(state(&conn), ("pending".into(), Some("{}".into())));
+    set_state(&conn, 1, &[2u8; 32], "ready").unwrap();
+    assert_eq!(state(&conn).0, "pending");
+    set_state(&conn, 1, &[1u8; 32], "ready").unwrap();
+    assert_eq!(state(&conn).0, "ready");
+}
+
 #[test]
 fn sync_support_and_force_pending_leave_fonts_alone() {
     // プロキシを作るのは video・audio だけ（ADR-140）。フォント・3D は判定にも作成待ちにもならない

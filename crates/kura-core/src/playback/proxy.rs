@@ -359,6 +359,8 @@ pub fn any_todo(conn: &Connection, ids: &[i64]) -> Result<bool> {
 #[derive(Debug)]
 struct Decision {
     id: i64,
+    /// 判定したときの中身（書くときの条件。保存で中身が変わっていたら書かない）。
+    hash: [u8; 32],
     state: &'static str,
     codec_json: Option<String>,
     error: Option<String>,
@@ -380,6 +382,7 @@ fn decide(tools: &ProxyTools, layout: &Layout, support: &PlaybackSupport, todo: 
             };
             Decision {
                 id: todo.id,
+                hash: todo.hash,
                 state,
                 codec_json: Some(
                     serde_json::json!({ "codec": main, "video": streams.video, "audio": streams.audio })
@@ -390,6 +393,7 @@ fn decide(tools: &ProxyTools, layout: &Layout, support: &PlaybackSupport, todo: 
         }
         Err(err) => Decision {
             id: todo.id,
+            hash: todo.hash,
             state: "failed",
             codec_json: None,
             error: Some(err),
@@ -401,19 +405,20 @@ fn apply_decisions(tx: &Connection, decisions: &[Decision]) -> Result<()> {
     let now = now_ms();
     let mut stmt = tx.prepare_cached(
         "UPDATE items SET proxy_state = ?2, codec_info = coalesce(?3, codec_info), updated_at = ?4
-         WHERE id = ?1 AND proxy_state = 'unknown'",
+         WHERE id = ?1 AND hash = ?5 AND proxy_state = 'unknown'",
     )?;
     for d in decisions {
-        stmt.execute(params![d.id, d.state, d.codec_json, now])?;
+        stmt.execute(params![d.id, d.state, d.codec_json, now, &d.hash[..]])?;
     }
     Ok(())
 }
 
-fn set_state(tx: &Connection, id: i64, state: &str) -> Result<()> {
-    tx.execute(
-        "UPDATE items SET proxy_state = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, state, now_ms()],
-    )?;
+/// 作った結果を書く。作り始めたときと中身（`hash`）が同じときだけ（保存で中身が変わっていたら書かない）。
+fn set_state(tx: &Connection, id: i64, hash: &[u8; 32], state: &str) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE items SET proxy_state = ?2, updated_at = ?3 WHERE id = ?1 AND hash = ?4",
+    )?
+    .execute(params![id, state, now_ms(), &hash[..]])?;
     Ok(())
 }
 
@@ -676,14 +681,18 @@ impl JobHandler for ProxyHandler {
                     match make(ctx, tools, &support, &todo, &on_progress) {
                         Made::Ready => {
                             made += 1;
-                            let id = todo.id;
-                            library.db().write(move |tx| set_state(tx, id, "ready"))?;
+                            let (id, hash) = (todo.id, todo.hash);
+                            library
+                                .db()
+                                .write(move |tx| set_state(tx, id, &hash, "ready"))?;
                         }
                         Made::Failed(err) => {
                             failed += 1;
                             ctx.log(&format!("アイテム {}: {err}", todo.id));
-                            let id = todo.id;
-                            library.db().write(move |tx| set_state(tx, id, "failed"))?;
+                            let (id, hash) = (todo.id, todo.hash);
+                            library
+                                .db()
+                                .write(move |tx| set_state(tx, id, &hash, "failed"))?;
                         }
                         Made::Interrupted(Control::Cancel) => {
                             return Ok(JobEnd::Canceled {
