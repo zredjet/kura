@@ -4,16 +4,17 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kura_engine::codec::CodecSet;
-use kura_engine::doc::{FormatChoice, InputId};
+use kura_engine::codec::{CodecEnv, CodecSet, Decoder, ReadSeek, Tier};
+use kura_engine::doc::{DecodeOptions, FormatChoice, InputId};
 use kura_engine::render::InputValue;
 use kura_engine::testgen::InputGen;
 use kura_engine::testing::platform::FakePlatformDecoder;
 use kura_engine::value::PixelFormat;
-use kura_engine::{Digest, Engine, Graph, NoMonitor};
+use kura_engine::{Digest, Engine, EngineError, Graph, Limits, Monitor, NoMonitor, Shape};
 use rusqlite::params;
 use serde_json::{Value as Json, json};
 
@@ -74,17 +75,21 @@ fn doc(ops: &[(&'static str, Json)], to: Option<&str>) -> Graph {
 
 /// 保存のジョブの外で、PNG に文書を当てて PNG に書いたバイト列（保存の出力と同じになるはずのもの）。
 fn render_png(png: &[u8], g: &Graph) -> Vec<u8> {
-    let codecs = CodecSet::pinned();
-    let engine = Engine::new().unwrap();
-    let (value, _) = codecs
+    let (value, _) = CodecSet::pinned()
         .decode(
             &mut std::io::Cursor::new(png),
             "png",
             &Default::default(),
-            engine.limits(),
+            Engine::new().unwrap().limits(),
             &NoMonitor,
         )
         .unwrap();
+    render_value_png(value, g, hash_of(png))
+}
+
+/// 保存のジョブの外で、元（中身 `source`）を読んだ値 `value` に文書を当てて PNG に書いたバイト列。
+fn render_value_png(value: kura_engine::Value, g: &Graph, source: [u8; 32]) -> Vec<u8> {
+    let engine = Engine::new().unwrap();
     let plan = engine
         .compile(g, &BTreeMap::from([(InputId(0), value.shape())]))
         .unwrap();
@@ -92,11 +97,11 @@ fn render_png(png: &[u8], g: &Graph) -> Vec<u8> {
         InputId(0),
         InputValue {
             value,
-            source: Digest(hash_of(png)),
+            source: Digest(source),
         },
     )]);
     let out = engine.render(&plan, &inputs, &NoMonitor).unwrap();
-    codecs
+    CodecSet::pinned()
         .encode_bytes(&out.outputs[0].value, "png", &json!({}), &NoMonitor)
         .unwrap()
         .0
@@ -1050,10 +1055,12 @@ fn s8_png_to_webp_changes_ext_mime_and_ledger() {
 
 // ---- S9：強制終了 ----
 
-/// 段ごとの、強制終了した直後の状態を確かめる。
-fn assert_crashed_state(env: &Env, job: i64, at: Fault, out: [u8; 32]) {
+/// 段ごとの、強制終了した直後の状態を確かめる（`anchored` ならアンカーも作る保存で、予告・staging・孤立したファイルは
+/// 出力とアンカーの 2 つずつ）。
+fn assert_crashed_state(env: &Env, job: i64, at: Fault, out: [u8; 32], anchored: bool) {
     let lib = &env.lib;
-    let pending = count(lib, "SELECT count(*) FROM ledger_pending");
+    let n: u64 = if anchored { 2 } else { 1 };
+    let pending = count(lib, "SELECT count(*) FROM ledger_pending") as u64;
     let placed = lib.layout().content_path(&out, "png").exists();
     let (_, orphans) = check_files(lib.db(), lib.layout()).unwrap();
     let committed = lib
@@ -1061,19 +1068,116 @@ fn assert_crashed_state(env: &Env, job: i64, at: Fault, out: [u8; 32]) {
         .read(|c| versions::by_job(c, job))
         .unwrap()
         .is_some();
-    let parts = staged(lib).len();
+    let parts = staged(lib).len() as u64;
     match at {
-        Fault::AfterRender => assert_eq!((pending, placed, committed, parts), (0, false, false, 1)),
+        Fault::AfterRender => assert_eq!((pending, placed, committed, parts), (0, false, false, n)),
         Fault::AfterAnnounce => {
-            assert_eq!((pending, placed, committed, parts), (1, false, false, 1))
+            assert_eq!((pending, placed, committed, parts), (n, false, false, n))
         }
         Fault::AfterPlace => {
-            assert_eq!((pending, placed, committed, orphans), (1, true, false, 1));
+            assert_eq!((pending, placed, committed, orphans), (n, true, false, n));
         }
         Fault::AfterCommit => {
             assert_eq!((pending, placed, committed, orphans), (0, true, true, 0));
         }
     }
+}
+
+/// 偽の HEIC（読むたびに値が変わる）を読めるコーデックの組。
+fn heic_codecs(decoder: &Arc<FakePlatformDecoder>) -> Arc<Mutex<CodecSet>> {
+    let mut codecs = CodecSet::pinned();
+    codecs.add_decoder(decoder.clone()).unwrap();
+    Arc::new(Mutex::new(codecs))
+}
+
+/// S9 の 1 回分：`at` で強制終了する保存（`save_as` なら別名、`heic` なら偽の HEIC の最初の保存でアンカーも作る）のあと、
+/// 同じ組で開き直すと、予告の照合・staging の掃除・ジョブの再開で食い違い 0、版はちょうど 1 つ（別名は新しいアイテムが 1 つ）、
+/// ジョブは done、アンカーは HEIC なら 1 行。
+fn crash_and_reopen(heic: bool, save_as: bool, at: Fault) {
+    let decoder = heic_decoder(true);
+    let set = heic_codecs(&decoder);
+    let factory = || {
+        if heic {
+            FakeEngineFactory::with_codecs(set.clone())
+        } else {
+            FakeEngineFactory::default()
+        }
+    };
+    let env = Env::with(factory(), Some(at));
+    let (a, graph, out) = if heic {
+        let (a, source) = add_item(&env.lib, b"fake heic bytes", "heic", "写真");
+        let graph = doc(&[flip("vertical")], Some("png"));
+        // 最初の読み取り（0 回目）の値で描いたもの
+        let out = hash_of(&render_value_png(
+            decoder.value_for(0).unwrap(),
+            &graph,
+            source,
+        ));
+        (a, graph, out)
+    } else {
+        let (a, _, png) = env.png(13);
+        let graph = doc(&[flip("vertical")], None);
+        let out = hash_of(&render_png(&png, &graph));
+        (a, graph, out)
+    };
+    let record = if save_as {
+        env.save_as(a, graph, "別名", "alt")
+    } else {
+        env.overwrite(a, graph)
+    };
+    let case = format!("heic={heic} save_as={save_as} {at:?}");
+    assert_eq!(record.state, JobState::Failed, "{case}");
+    assert_crashed_state(&env, record.id, at, out, heic);
+    let job = record.id;
+    let (dir, session) = reopen_after_crash(env, job, factory());
+    let record = session.jobs().get(job).unwrap();
+    assert_done(&record);
+    let lib = session.library();
+    let item = if save_as {
+        assert!(versions_of(lib, a).is_empty(), "{case}");
+        assert_eq!(count(lib, "SELECT count(*) FROM items"), 2, "{case}");
+        result_of(&record)["itemId"].as_i64().unwrap()
+    } else {
+        assert_eq!(count(lib, "SELECT count(*) FROM items"), 1, "{case}");
+        a
+    };
+    assert_eq!(
+        states(lib, item),
+        vec![(0, FileState::Hold), (1, FileState::Hold)],
+        "{case}"
+    );
+    // 読むたびに値の変わる HEIC は、初めからやり直すと別の出力になる（コミットのあとに落ちたものだけ同じ）
+    if !heic || at == Fault::AfterCommit {
+        assert_eq!(head(lib, item).hash, out, "{case}");
+    }
+    assert_eq!(head(lib, item).ext, "png", "{case}");
+    assert_eq!(
+        count(
+            lib,
+            "SELECT count(*) FROM item_versions WHERE job_id IS NOT NULL"
+        ),
+        1,
+        "{case}"
+    );
+    let anchors = count(lib, "SELECT count(*) FROM edit_anchors");
+    assert_eq!(anchors, i64::from(heic), "{case}");
+    if heic {
+        let v1 = versions_of(lib, item)[1].clone();
+        let used: i64 = count(lib, "SELECT id FROM edit_anchors");
+        assert_eq!(inputs_of(lib, v1.id)[0].anchor_id, Some(used), "{case}");
+    }
+    // 保存のあとのサムネイル・解析も終わっている
+    assert_eq!(
+        count(
+            lib,
+            "SELECT count(*) FROM items WHERE thumb_state = 'pending' OR analysis_state = 'pending'"
+        ),
+        0,
+        "{case}"
+    );
+    assert_consistent(lib);
+    drop(session);
+    drop(dir);
 }
 
 /// S9：{上書き, 別名} × {描いたあと, 予告のあと, 置いたあと, コミットのあと} で強制終了したライブラリを開き直すと、
@@ -1087,86 +1191,23 @@ fn s9_crash_at_each_stage_recovers() {
             Fault::AfterPlace,
             Fault::AfterCommit,
         ] {
-            let env = Env::with(FakeEngineFactory::default(), Some(at));
-            let (a, _, png) = env.png(13);
-            let graph = doc(&[flip("vertical")], None);
-            let out = hash_of(&render_png(&png, &graph));
-            let record = if save_as {
-                env.save_as(a, graph, "別名", "alt")
-            } else {
-                env.overwrite(a, graph)
-            };
-            assert_eq!(record.state, JobState::Failed, "{save_as} {at:?}");
-            assert_crashed_state(&env, record.id, at, out);
-            // 強制終了：ジョブは running のまま
-            let job = record.id;
-            env.lib
-                .db()
-                .write(move |tx| {
-                    tx.execute("UPDATE jobs SET state = 'running' WHERE id = ?1", [job])?;
-                    Ok(())
-                })
-                .unwrap();
-            let Env { dir, lib, jobs, .. } = env;
-            drop(jobs);
-            let root = lib.layout().root().to_path_buf();
-            lib.close();
-            drop(lib);
+            crash_and_reopen(false, save_as, at);
+        }
+    }
+}
 
-            let session = LibrarySession::open(
-                &root,
-                Arc::new(|_| {}),
-                Services::new(Arc::new(FakeBackend))
-                    .with_engine(Arc::new(FakeEngineFactory::default())),
-            )
-            .unwrap();
-            session.wait_ready();
-            let report = session.integrity().unwrap();
-            assert_eq!(
-                (report.orphan_files, report.missing_files),
-                (0, 0),
-                "{save_as} {at:?}"
-            );
-            assert!(session.jobs().wait_idle(WAIT));
-            let record = session.jobs().get(job).unwrap();
-            assert_done(&record);
-            let lib = session.library();
-            if save_as {
-                assert!(versions_of(lib, a).is_empty(), "{at:?}");
-                assert_eq!(count(lib, "SELECT count(*) FROM items"), 2, "{at:?}");
-                let b = result_of(&record)["itemId"].as_i64().unwrap();
-                assert_eq!(
-                    states(lib, b),
-                    vec![(0, FileState::Hold), (1, FileState::Hold)]
-                );
-                assert_eq!(head(lib, b).hash, out);
-            } else {
-                assert_eq!(count(lib, "SELECT count(*) FROM items"), 1, "{at:?}");
-                assert_eq!(
-                    states(lib, a),
-                    vec![(0, FileState::Hold), (1, FileState::Hold)]
-                );
-                assert_eq!(head(lib, a).hash, out);
-            }
-            assert_eq!(
-                count(
-                    lib,
-                    "SELECT count(*) FROM item_versions WHERE job_id IS NOT NULL"
-                ),
-                1
-            );
-            // 保存のあとのサムネイル・解析も終わっている
-            assert_eq!(
-                count(
-                    lib,
-                    "SELECT count(*) FROM items WHERE thumb_state = 'pending' OR analysis_state = 'pending'"
-                ),
-                0,
-                "{at:?}"
-            );
-            assert_consistent(lib);
-            drop(session);
-            drop(dir);
+/// S9 のアンカーを作る保存：偽の HEIC の最初の保存（出力とアンカーを予告し、2 つ置き、台帳に 2 行載せる）を {上書き, 別名} ×
+/// 4 段で強制終了しても、落ちた直後は予告・孤立したファイルが 2 つずつで、開き直すと食い違い 0、版は 1 つ、アンカーは 1 行。
+#[test]
+fn s9_crash_while_making_an_anchor_recovers() {
+    for save_as in [false, true] {
+        for at in [
+            Fault::AfterRender,
+            Fault::AfterAnnounce,
+            Fault::AfterPlace,
+            Fault::AfterCommit,
+        ] {
+            crash_and_reopen(true, save_as, at);
         }
     }
 }
@@ -1432,6 +1473,171 @@ fn a_save_that_crashed_while_decoding_fails_once() {
     assert_consistent(&env.lib);
 }
 
+/// 見出し（形）を読むときに、動いている保存のジョブの途中経過を写し取る偽の HEIC のデコーダ（`fail` が真なら見出しで
+/// 失敗する）。OS のデコーダの印が、見出しを読む前にコミットされているかを確かめる。
+struct HeaderProbe {
+    inner: FakePlatformDecoder,
+    lib: Mutex<Option<Arc<Library>>>,
+    seen: Mutex<Vec<Option<String>>>,
+    shapes: AtomicU64,
+    fail: AtomicBool,
+}
+
+impl Decoder for HeaderProbe {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+
+    fn tier(&self) -> Tier {
+        self.inner.tier()
+    }
+
+    fn reproducible(&self) -> bool {
+        false
+    }
+
+    fn env(&self) -> Option<CodecEnv> {
+        self.inner.env()
+    }
+
+    fn can_decode(&self, format: &str) -> bool {
+        self.inner.can_decode(format)
+    }
+
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> std::result::Result<Shape, EngineError> {
+        self.shapes.fetch_add(1, Ordering::SeqCst);
+        if let Some(lib) = self.lib.lock().unwrap().as_ref() {
+            let partial: Option<String> = lib
+                .db()
+                .read(|c| {
+                    Ok(c.query_row(
+                        "SELECT result_json FROM jobs WHERE kind = 'edit' AND state = 'running'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap();
+            self.seen.lock().unwrap().push(partial);
+        }
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(EngineError::Decode {
+                codec: self.id().into(),
+                message: "偽の見出しの失敗".into(),
+            });
+        }
+        self.inner.shape(src, format, opts, limits)
+    }
+
+    fn decode(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> std::result::Result<kura_engine::Value, EngineError> {
+        self.inner.decode(src, format, opts, limits, mon)
+    }
+}
+
+/// 段 1：OS のデコーダで元の見出しを読む前に `decoding` の印をコミットし、見出しでつまずいて（落ちずに）失敗したら外す。
+/// 見出しを読んでいる途中で落ちたことにした（その時の印が真のまま running の）ジョブは、開き直すと読まずに 1 回だけ失敗し、
+/// やり直すと読み直して保存する（ADR-158 (9) と同じ決まり）。
+#[test]
+fn a_save_that_crashed_while_reading_the_header_fails_once() {
+    let probe = Arc::new(HeaderProbe {
+        inner: FakePlatformDecoder::new(
+            "fake-heic-dec/1",
+            &["heic"],
+            InputGen::PixelSprite {
+                w: 24,
+                h: 20,
+                fmt: PixelFormat::Rgba8,
+                seed: 15,
+            },
+        ),
+        lib: Mutex::new(None),
+        seen: Mutex::new(Vec::new()),
+        shapes: AtomicU64::new(0),
+        fail: AtomicBool::new(true),
+    });
+    let mut codecs = CodecSet::pinned();
+    codecs.add_decoder(probe.clone()).unwrap();
+    let set = Arc::new(Mutex::new(codecs));
+    let env = Env::with(FakeEngineFactory::with_codecs(set.clone()), None);
+    *probe.lib.lock().unwrap() = Some(env.lib.clone());
+    let (a, _) = add_item(&env.lib, b"fake heic bytes", "heic", "写真");
+    let graph = doc(&[flip("vertical")], Some("png"));
+    let record = env.overwrite(a, graph);
+    assert_eq!(record.state, JobState::Failed, "{:?}", record.message);
+    // 見出しを読んでいる間、印はコミットされていた。落ちずに失敗したので外れている
+    let seen = probe.seen.lock().unwrap().clone();
+    assert_eq!(seen, vec![Some(r#"{"v":1,"decoding":true}"#.to_string())]);
+    assert_eq!(
+        record.result_json.as_deref(),
+        Some(r#"{"v":1,"decoding":false}"#)
+    );
+    assert_eq!(probe.inner.reads(), 0);
+
+    // 見出しを読んでいる途中で落ちたことにする（その時の途中経過のまま running）
+    let job = record.id;
+    let mark = seen[0].clone();
+    env.lib
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE jobs SET result_json = ?2 WHERE id = ?1",
+                params![job, mark],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    probe.fail.store(false, Ordering::SeqCst);
+    *probe.lib.lock().unwrap() = None;
+    let (dir, session) = reopen_after_crash(env, job, FakeEngineFactory::with_codecs(set.clone()));
+    let record = session.jobs().get(job).unwrap();
+    assert_eq!(record.state, JobState::Failed);
+    assert_eq!(
+        record.error_code.as_deref(),
+        Some("ToolFailed"),
+        "{:?}",
+        record.message
+    );
+    assert_eq!(
+        record.result_json.as_deref(),
+        Some(r#"{"v":1,"crashed":true}"#)
+    );
+    assert_eq!(probe.shapes.load(Ordering::SeqCst), 1, "読まずに失敗した");
+    let lib = session.library().clone();
+    assert!(versions_of(&lib, a).is_empty(), "版を足さない");
+
+    // やり直すと読み直して保存する（印を付けて読む）
+    *probe.lib.lock().unwrap() = Some(lib.clone());
+    session.jobs().retry(job).unwrap();
+    assert!(session.jobs().wait_idle(WAIT));
+    assert_done(&session.jobs().get(job).unwrap());
+    *probe.lib.lock().unwrap() = None;
+    assert_eq!(
+        probe.seen.lock().unwrap().last().cloned(),
+        Some(Some(r#"{"v":1,"decoding":true}"#.to_string()))
+    );
+    assert_eq!(probe.inner.reads(), 1);
+    assert_eq!(
+        states(&lib, a),
+        vec![(0, FileState::Hold), (1, FileState::Hold)]
+    );
+    assert_eq!(count(&lib, "SELECT count(*) FROM edit_anchors"), 1);
+    assert_consistent(&lib);
+    drop(session);
+    drop(dir);
+}
+
 // ---- S3・S4：版に戻す ----
 
 fn inputs_of(lib: &Library, version_id: i64) -> Vec<versions::VersionInput> {
@@ -1665,6 +1871,106 @@ fn s4_revert_rebuilds_after_gc() {
     assert_consistent(&env.lib);
 }
 
+/// 作り直しで記録のエンコーダがこの環境にない（識別子を上げた・外した）ときは、今の組の同じ形式のエンコーダで書き、新しい
+/// 書き出しの記録と知らせを残す（値は照らし済み）。書いたバイト列が版 k の記録と違えば（記録のエンコーダが別のバイト列を
+/// 書いていた）その知らせも残し、台帳には作り直したファイルを載せ、アイテムの mime は拡張子から・codec_info は空にする。
+#[test]
+fn revert_rebuild_without_the_recorded_encoder_uses_the_current_one() {
+    for bytes_differ in [false, true] {
+        let env = Env::new();
+        let (a, _, png) = env.png(28);
+        let g1 = doc(&[flip("vertical")], None);
+        assert_done(&env.overwrite(a, g1.clone()));
+        let v1 = versions_of(&env.lib, a)[1].clone();
+        assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
+        simulate_gc(&env.lib, a, 1);
+        // 版 1 は、この組にないエンコーダで書いたことにする（違うバイト列を書いていたなら、そのハッシュも）
+        let mut record: Json = serde_json::from_str(&v1.record).unwrap();
+        record["encoded"]["codec"] = json!("gone-png-enc/9");
+        record["media"]["codecInfo"] = json!(r#"{"probe":1}"#);
+        let recorded_hash = if bytes_differ {
+            [0x5a; 32]
+        } else {
+            v1.output_hash
+        };
+        let text = record.to_string();
+        env.lib
+            .db()
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE item_versions SET record = ?1, output_hash = ?2 WHERE item_id = ?3 AND version = 1",
+                    params![text, &recorded_hash[..], a],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let record = env.revert(a, 1);
+        assert_done(&record);
+        let result = result_of(&record);
+        assert_eq!(result["revert"]["rebuilt"], true);
+        let warnings: Vec<String> = serde_json::from_value(result["warnings"].clone()).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("記録のエンコーダ gone-png-enc/9 がない")),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .any(|w| w.contains("バイト列は、版 1 のものと違います")),
+            bytes_differ,
+            "{warnings:?}"
+        );
+        // 今の組のエンコーダは、もとの版 1 と同じバイト列を書く
+        let rebuilt = hash_of(&render_png(&png, &g1));
+        assert_eq!(rebuilt, v1.output_hash);
+        assert_eq!(result["hash"], hex(&rebuilt));
+        let vs = versions_of(&env.lib, a);
+        let r3 = vs[3].record().unwrap();
+        assert_eq!(
+            r3.encoded.map(|e| e.codec),
+            Some("png-rs-enc/1".to_string()),
+            "新しい書き出しの記録"
+        );
+        assert_eq!(r3.warnings, warnings);
+        assert_eq!(
+            (vs[3].output_hash, vs[3].value_digest),
+            (rebuilt, v1.value_digest)
+        );
+        assert_eq!(
+            states(&env.lib, a),
+            vec![
+                (0, FileState::Hold),
+                (1, FileState::Released),
+                (2, FileState::Waiting),
+                (3, FileState::Hold)
+            ]
+        );
+        assert_eq!(head(&env.lib, a).hash, rebuilt);
+        assert_eq!(
+            one::<String>(
+                &env.lib,
+                "SELECT b.ext FROM blobs b JOIN items i ON i.hash = b.hash WHERE i.id = ?1",
+                a
+            ),
+            "png"
+        );
+        let (mime, codec_info, ..) = items_row(&env.lib, a);
+        assert_eq!(mime, "image/png");
+        assert_eq!(
+            codec_info.as_deref(),
+            if bytes_differ {
+                None
+            } else {
+                Some(r#"{"probe":1}"#)
+            },
+            "中身が版 1 の記録と同じときだけ、記録の codec_info に戻す"
+        );
+        assert_consistent(&env.lib);
+    }
+}
+
 /// 作り直した値が版の記録と違えば戻さない（Mismatch）。版・ファイル・台帳は変わらず、staging も予告も空。
 #[test]
 fn revert_rebuild_that_does_not_match_the_record_is_refused() {
@@ -1817,9 +2123,13 @@ fn cancel_or_pause_after_writing_leaves_nothing() {
     }
 }
 
-/// 強制終了したライブラリを、偽のエンジンの部品つきで開き直して（予告の照合・staging の掃除・ジョブの再開）、動き終えるのを
-/// 待つ。ジョブ `job` は running のまま落ちたことにする。
-fn reopen_after_crash(env: Env, job: i64) -> (tempfile::TempDir, LibrarySession) {
+/// 強制終了したライブラリを、偽のエンジンの部品（`factory`）つきで開き直して（予告の照合・staging の掃除・ジョブの再開）、
+/// 動き終えるのを待つ。ジョブ `job` は running のまま落ちたことにする。
+fn reopen_after_crash(
+    env: Env,
+    job: i64,
+    factory: FakeEngineFactory,
+) -> (tempfile::TempDir, LibrarySession) {
     env.lib
         .db()
         .write(move |tx| {
@@ -1835,7 +2145,7 @@ fn reopen_after_crash(env: Env, job: i64) -> (tempfile::TempDir, LibrarySession)
     let session = LibrarySession::open(
         &root,
         Arc::new(|_| {}),
-        Services::new(Arc::new(FakeBackend)).with_engine(Arc::new(FakeEngineFactory::default())),
+        Services::new(Arc::new(FakeBackend)).with_engine(Arc::new(factory)),
     )
     .unwrap();
     session.wait_ready();
@@ -1889,9 +2199,9 @@ fn revert_rebuild_crash_at_each_stage_recovers() {
         };
         let record = env.revert(a, 1);
         assert_eq!(record.state, JobState::Failed, "{at:?}");
-        assert_crashed_state(&env, record.id, at, h1);
+        assert_crashed_state(&env, record.id, at, h1, false);
         let job = record.id;
-        let (dir, session) = reopen_after_crash(env, job);
+        let (dir, session) = reopen_after_crash(env, job, FakeEngineFactory::default());
         assert_done(&session.jobs().get(job).unwrap());
         let lib = session.library();
         assert_eq!(head(lib, a).hash, h1, "{at:?}");
@@ -2038,6 +2348,181 @@ fn revert_falls_back_to_the_original_when_the_anchor_is_broken() {
         std::fs::write(&anchor_path, saved).unwrap();
         assert_consistent(&env.lib);
     }
+}
+
+/// アンカーが壊れている・ファイルがないまま上書き・別名で保存すると、元を記録のデコーダ（アンカーの元の読み取りの記録の
+/// codec）で読み直す（OS のデコーダなので、見出しを読む前から印を付ける）。値がアンカーの記録と同じなら保存し（入力の記録は
+/// アンカーを指したまま。知らせを版の記録の警告に残す）、違えば（読むたびに値の変わるデコーダ）Mismatch で何も変わらない
+/// （docs/editing.md §9.4）。
+#[test]
+fn saving_with_a_broken_or_missing_anchor_reads_the_original_again() {
+    for missing in [false, true] {
+        for save_as in [false, true] {
+            for drifting in [false, true] {
+                let case = format!("missing={missing} save_as={save_as} drifting={drifting}");
+                let decoder = heic_decoder(drifting);
+                let env = Env::with(FakeEngineFactory::with_codecs(heic_codecs(&decoder)), None);
+                let (a, heic) = add_item(&env.lib, b"fake heic bytes", "heic", "写真");
+                assert_done(&env.overwrite(a, doc(&[flip("vertical")], Some("png"))));
+                let (anchor_id, anchor_hash, anchor_ext): (i64, Vec<u8>, String) = env
+                    .lib
+                    .db()
+                    .read(|c| {
+                        Ok(c.query_row(
+                            "SELECT a.id, b.hash, b.ext FROM edit_anchors a JOIN blobs b ON b.id = a.blob_id",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )?)
+                    })
+                    .unwrap();
+                let anchor_hash: [u8; 32] = anchor_hash.try_into().unwrap();
+                let anchor_path = env.lib.layout().content_path(&anchor_hash, &anchor_ext);
+                let saved = std::fs::read(&anchor_path).unwrap();
+                if missing {
+                    std::fs::remove_file(&anchor_path).unwrap();
+                } else {
+                    std::fs::write(&anchor_path, b"broken anchor").unwrap();
+                }
+                let before = snapshot(&env.lib);
+                let graph = doc(&[flip("horizontal")], Some("png"));
+                let record = if save_as {
+                    env.save_as(a, graph.clone(), "別名", "alt")
+                } else {
+                    env.overwrite(a, graph.clone())
+                };
+                assert_eq!(decoder.reads(), 2, "{case}：元を記録のデコーダで読み直した");
+                let marked = env
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.id == record.id)
+                    .filter_map(|e| e.result_json.clone())
+                    .any(|m| m.contains(r#""decoding":true"#));
+                assert!(marked, "{case}");
+                if drifting {
+                    assert_eq!(
+                        record.state,
+                        JobState::Failed,
+                        "{case} {:?}",
+                        record.message
+                    );
+                    assert_eq!(record.error_code.as_deref(), Some("Mismatch"), "{case}");
+                    assert!(
+                        record
+                            .message
+                            .as_deref()
+                            .is_some_and(|m| m.contains("保存できません")),
+                        "{case} {:?}",
+                        record.message
+                    );
+                    assert_eq!(snapshot(&env.lib), before, "{case}");
+                } else {
+                    assert_done(&record);
+                    let result = result_of(&record);
+                    assert_eq!(result["anchor"], Json::Null, "{case}：元から読んだ");
+                    let warned =
+                        |ws: &[String]| ws.iter().any(|w| w.contains("アンカーが使えない"));
+                    let warnings: Vec<String> =
+                        serde_json::from_value(result["warnings"].clone()).unwrap();
+                    assert!(warned(&warnings), "{case} {result}");
+                    let item = if save_as {
+                        result["itemId"].as_i64().unwrap()
+                    } else {
+                        a
+                    };
+                    let saved_version = versions_of(&env.lib, item).last().unwrap().clone();
+                    assert!(warned(&saved_version.record().unwrap().warnings), "{case}");
+                    let inputs = inputs_of(&env.lib, saved_version.id);
+                    assert_eq!(inputs[0].anchor_id, Some(anchor_id), "{case}");
+                    let recorded: Json = serde_json::from_str(&inputs[0].recorded).unwrap();
+                    assert_eq!(recorded["anchor"], hex(&anchor_hash), "{case}");
+                    // 出力は、アンカーの値（最初の読み取りと同じ値）に横の反転を当てたもの
+                    let want = hash_of(&render_value_png(
+                        decoder.value_for(0).unwrap(),
+                        &graph,
+                        heic,
+                    ));
+                    assert_eq!(head(&env.lib, item).hash, want, "{case}");
+                    assert_eq!(env.count("SELECT count(*) FROM edit_anchors"), 1, "{case}");
+                }
+                std::fs::write(&anchor_path, saved).unwrap();
+                assert_consistent(&env.lib);
+            }
+        }
+    }
+}
+
+/// 描いている間にゴミ箱を空にして、読んでいたアンカーが片付けられた（それを使う唯一の版を持つ別名のアイテムをゴミ箱に
+/// 入れた）保存は、予告の前に Conflict で終わり、何も置かない（外部キーの誤りにしない）。もう一度保存すると、元を読み直して
+/// アンカーを作り直す。
+#[test]
+fn anchor_swept_while_saving_is_a_conflict() {
+    let decoder = heic_decoder(false);
+    let victim = Arc::new(AtomicI64::new(0));
+    let env = Env::build(
+        FakeEngineFactory::with_codecs(heic_codecs(&decoder)),
+        None,
+        |lib| {
+            let (lib, victim) = (lib.clone(), victim.clone());
+            Some(Arc::new(move |stage| {
+                if stage != Stage::Written {
+                    return;
+                }
+                let b = victim.swap(0, Ordering::SeqCst);
+                if b != 0 {
+                    lib.db()
+                        .write(move |tx| crate::items::trash(tx, &[b], 5).map(|_| ()))
+                        .unwrap();
+                    lib.empty_trash().unwrap();
+                }
+            }))
+        },
+    );
+    let (a, heic) = add_item(&env.lib, b"fake heic bytes", "heic", "写真");
+    let record = env.save_as(a, doc(&[flip("vertical")], Some("png")), "別名", "alt");
+    assert_done(&record);
+    assert_eq!(result_of(&record)["anchor"], "created");
+    let b = result_of(&record)["itemId"].as_i64().unwrap();
+    assert_eq!(env.count("SELECT count(*) FROM edit_anchors"), 1);
+
+    victim.store(b, Ordering::SeqCst);
+    let record = env.overwrite(a, doc(&[flip("horizontal")], Some("png")));
+    assert_conflict(&record);
+    assert!(
+        record
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("アンカー")),
+        "{:?}",
+        record.message
+    );
+    assert_eq!(decoder.reads(), 1, "アンカーから読んでいた");
+    assert_eq!(
+        env.count("SELECT count(*) FROM items"),
+        1,
+        "別名のアイテムは消えた"
+    );
+    assert_eq!(
+        env.count("SELECT count(*) FROM edit_anchors"),
+        0,
+        "アンカーは片付けられた"
+    );
+    assert!(versions_of(&env.lib, a).is_empty(), "A は変わらない");
+    assert_eq!(head(&env.lib, a).hash, heic);
+    assert_consistent(&env.lib);
+
+    // もう一度保存すると、元を読み直してアンカーを作り直す
+    let record = env.overwrite(a, doc(&[flip("horizontal")], Some("png")));
+    assert_done(&record);
+    assert_eq!(result_of(&record)["anchor"], "created");
+    assert_eq!(decoder.reads(), 2);
+    assert_eq!(env.count("SELECT count(*) FROM edit_anchors"), 1);
+    assert_eq!(
+        states(&env.lib, a),
+        vec![(0, FileState::Hold), (1, FileState::Hold)]
+    );
+    assert_consistent(&env.lib);
 }
 
 // ---- S17：下書き ----

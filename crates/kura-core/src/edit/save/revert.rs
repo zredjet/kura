@@ -147,34 +147,6 @@ fn media_record(record: &VersionRecord, v: &Version, ext: &str, same: bool) -> M
     }
 }
 
-/// 作り直しで読む元。
-#[derive(Debug, Clone)]
-enum ReadFrom {
-    /// 版 k の入力が使ったアンカー。
-    Anchor(Box<Anchor>),
-    /// 元のファイル（記録のデコーダで読み直す）。
-    Original,
-}
-
-/// 作り直しの読みでつまずいたとき：止める（中止・一時停止）、アンカーをあきらめて元で読み直す、失敗。
-enum Trip {
-    Stop(JobEnd),
-    Fallback(String),
-    Fail(CoreError),
-}
-
-fn trip(ctx: &JobContext, what: &str, e: EngineError, from_anchor: bool) -> Trip {
-    if matches!(e.root(), EngineError::Canceled)
-        && let Some(end) = stop_end(ctx)
-    {
-        return Trip::Stop(end);
-    }
-    if from_anchor && !matches!(e.root(), EngineError::Canceled) {
-        return Trip::Fallback(format!("{what}：{e}"));
-    }
-    Trip::Fail(from_engine(what, e))
-}
-
 impl EditHandler {
     /// 版 `to` に戻す（ジョブの本体）。使い直せれば門を持って 1 つのトランザクションで、なければ作り直して段 6〜9 へ。
     pub(super) fn revert(
@@ -321,64 +293,19 @@ impl EditHandler {
             )));
         }
 
-        // 1・2. 読む元ごとに：形 → 計画 → 予算 → 読む（アンカーが使えなければ元で読み直す）
+        // 1・2. 読む元ごとに：形 → 計画 → 予算 → 読む（アンカーが使えなければ、元を記録のデコーダで読み直す。read.rs）
         ctx.progress(0.1, "戻す版の元を読んでいます");
-        let mut froms = Vec::with_capacity(2);
-        if let Some(a) = anchor {
-            froms.push(ReadFrom::Anchor(Box::new(a)));
-        }
-        froms.push(ReadFrom::Original);
-        let mut anchor_failed = false;
-        let mut read = None;
-        for from in froms {
-            let from_anchor = matches!(from, ReadFrom::Anchor(_));
-            let path = match &from {
-                ReadFrom::Anchor(a) => layout.content_path(&a.hash, &a.ext),
-                ReadFrom::Original => original_path.clone(),
-            };
-            let decoder = match &from {
-                ReadFrom::Anchor(_) => None,
-                ReadFrom::Original => match codecs
-                    .decoder_by_id(&rec.decoded.codec)
-                    .filter(|d| d.can_decode(&rec.format))
-                {
-                    Some(d) => Some(d.clone()),
-                    None => {
-                        return Err(CoreError::Mismatch(format!(
-                            "版 {k} を作り直せません：記録のデコーダ {} がこの環境にありません{}",
-                            rec.decoded.codec,
-                            if anchor_failed {
-                                "（アンカーも使えません）"
-                            } else {
-                                ""
-                            }
-                        )));
-                    }
-                },
-            };
-            let shape = match &decoder {
-                None => File::open(&path)
-                    .map_err(EngineError::from)
-                    .and_then(|f| anchor::shape(&mut BufReader::new(f), &limits)),
-                Some(d) => d
-                    .shape_file_monitored(&path, &rec.format, &rec.options, &limits, &mon)
-                    .and_then(|s| limits.check(&s).map_err(EngineError::Limit).map(|()| s)),
-            };
-            let shape = match shape {
-                Ok(s) => s,
-                Err(e) => match trip(ctx, "元の大きさを読めません", e, from_anchor) {
-                    Trip::Stop(end) => return Ok(Flow::Stop(end)),
-                    Trip::Fallback(why) => {
-                        anchor_failed = true;
-                        warnings.push(format!(
-                            "アンカーが使えないので、元を読み直しました（{why}）"
-                        ));
-                        continue;
-                    }
-                    Trip::Fail(err) => return Err(err),
-                },
-            };
-            let shapes = BTreeMap::from([(InputId(0), shape)]);
+        let cx = read::ReadCx {
+            ctx,
+            runtime: &runtime,
+            codecs: &codecs,
+            layout,
+            original: &original_path,
+            limits: &limits,
+            mon: &mon,
+        };
+        let plan_for = |how: &read::Reading<'_>, shape: &Shape| -> Result<Flow<_>> {
+            let shapes = BTreeMap::from([(InputId(0), *shape)]);
             let plan = runtime
                 .bulk(|e| e.compile(&graph, &shapes))
                 .map_err(|issues| {
@@ -399,16 +326,6 @@ impl EditHandler {
                     "版 {k} の結果を {out_format} に書けません"
                 )));
             }
-            let source = match &decoder {
-                None => Source::Decoder {
-                    decoder: &anchor::AnchorDecoder,
-                    format: anchor::FORMAT,
-                },
-                Some(d) => Source::Decoder {
-                    decoder: d.as_ref(),
-                    format: &rec.format,
-                },
-            };
             let sink = match &encoder {
                 Some(e) => Sink::Encoder {
                     encoder: e.as_ref(),
@@ -423,64 +340,32 @@ impl EditHandler {
             };
             let spec = EstimateSpec::new(0)
                 .digests(true)
-                .input(InputId(0), source)
-                .input_len(InputId(0), file_len(&path))
+                .input(InputId(0), how.source(&codecs))
+                .input_len(InputId(0), file_len(how.path(&original_path)))
                 .output(OutputId(0), sink);
             let (_estimate, lease) = go!(
                 ctx,
                 "作り直しのメモリを確保できません",
                 runtime.admit_bulk_with(&plan, spec, |_| 0, &mon)
             );
-            let platform = decoder.as_ref().is_some_and(|d| d.tier() == Tier::Platform);
-            if platform {
-                ctx.checkpoint(DECODING, 0.15, "元を読んでいます")?;
-            }
-            let r = runtime.bulk(|_| {
-                let at = recorded::Source::Path(&path);
-                let (a, o) = if from_anchor {
-                    (Some(at), None)
-                } else {
-                    (None, Some(at))
-                };
-                recorded::read_recorded(&codecs, &rec, a, o, &limits, &mon)
-            });
-            if platform {
-                ctx.checkpoint(DECODED, 0.3, "元を読みました")?;
-            }
-            match r {
-                Ok(Recorded::Matched { input, .. }) => {
-                    let used = match from {
-                        ReadFrom::Anchor(a) => AnchorUse::Existing(*a),
-                        ReadFrom::Original => AnchorUse::None,
-                    };
-                    read = Some((input, plan, lease, encoder, used));
-                    break;
-                }
-                Ok(Recorded::Mismatched { mismatch, .. }) if from_anchor => {
-                    anchor_failed = true;
-                    warnings.push(format!(
-                        "アンカーが使えないので、元を読み直しました（{mismatch}）"
-                    ));
-                }
-                Ok(Recorded::Mismatched { mismatch, .. }) => {
-                    return Err(CoreError::Mismatch(format!(
-                        "版 {k} を作り直せません：{mismatch}"
-                    )));
-                }
-                Err(e) => match trip(ctx, "元を読めません", e, from_anchor) {
-                    Trip::Stop(end) => return Ok(Flow::Stop(end)),
-                    Trip::Fallback(why) => {
-                        anchor_failed = true;
-                        warnings.push(format!(
-                            "アンカーが使えないので、元を読み直しました（{why}）"
-                        ));
-                    }
-                    Trip::Fail(err) => return Err(err),
-                },
-            }
-        }
-        let (input, plan, lease, encoder, anchor_use) =
-            read.ok_or_else(|| CoreError::Mismatch(format!("版 {k} を作り直す元を読めません")))?;
+            Ok(Flow::Go((plan, lease, encoder)))
+        };
+        let read = read::read_recorded_input(
+            &cx,
+            &rec,
+            anchor,
+            &format!("版 {k} を作り直せません"),
+            &mut warnings,
+            plan_for,
+        )?;
+        let (value, _, anchor_use, (plan, lease, encoder)) = match read {
+            Flow::Go(read) => read,
+            Flow::Stop(end) => return Ok(Flow::Stop(end)),
+        };
+        let input = InputValue {
+            value,
+            source: rec.source,
+        };
 
         // 4. 描いて照らす
         ctx.progress(0.5, "描き直しています");

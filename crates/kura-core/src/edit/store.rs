@@ -198,6 +198,67 @@ mod tests {
         );
     }
 
+    /// 同じ切れ目を 2 回参照するノード（同じ動作を 130 個：切れ目 0 と 1 が同じ中身）も、置いて読み直せる。辺は ord ごとに
+    /// 1 行（ord 0・1 が同じ子）、部品は 1 行だけで、置き直しても行は増えない。
+    #[test]
+    fn a_node_that_refers_to_the_same_chunk_twice_round_trips() {
+        let conn = test_conn();
+        let engine = Engine::new().unwrap();
+        let action = json!({ "type": "fill", "at": { "x": 1, "y": 3 }, "color": { "rgba": [0, 0, 0, 0] },
+                             "tolerance": 30, "connectivity": "eight", "contiguous": true, "frame": 0 });
+        let mut g = Graph::new_single();
+        g.push_linear(
+            "paint.actions",
+            1,
+            json!({ "actions": vec![action; 130] }),
+            0,
+        )
+        .unwrap();
+        let parts = split(&g).unwrap();
+        let id = put_doc(&conn, &parts, 1).unwrap();
+        // (a) 描画のノードの辺は 3 行（切れ目 64・64・2 個）で、ord 0・1 は同じ切れ目の行を指す
+        let node: i64 = conn
+            .query_row(
+                "SELECT child_id FROM edit_edges WHERE parent_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let edges: Vec<(i64, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT ord, child_id FROM edit_edges WHERE parent_id = ?1 ORDER BY ord")
+                .unwrap();
+            stmt.query_map([node], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(edges.len(), 3, "{edges:?}");
+        assert_eq!(
+            edges.iter().map(|(ord, _)| *ord).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(edges[0].1, edges[1].1, "切れ目 0 と 1 は同じ部品");
+        assert_ne!(edges[1].1, edges[2].1);
+        // 部品は根・ノード・切れ目 2 つ（同じ中身の切れ目は 1 行）
+        assert_eq!(count(&conn, "edit_objects"), 4);
+        // (b) 読み直すと同じ文書
+        assert_eq!(
+            load_doc_bytes(&conn, id).unwrap(),
+            g.to_canonical_json().unwrap()
+        );
+        assert_eq!(load_doc(&conn, &engine, id).unwrap(), g);
+        // (c) 置き直しても行は増えず、同じ根
+        let (objects, all_edges) = (count(&conn, "edit_objects"), count(&conn, "edit_edges"));
+        assert_eq!(put_doc(&conn, &parts, 2).unwrap(), id);
+        assert_eq!(
+            (count(&conn, "edit_objects"), count(&conn, "edit_edges")),
+            (objects, all_edges)
+        );
+        // (d) 外部キーの違反がない
+        assert!(violations_empty(&conn));
+    }
+
     /// DB の部品が壊れていれば（本文の書き換え・知らない種類・足りない辺）、つながずに Invalid。
     #[test]
     fn damaged_rows_are_refused() {

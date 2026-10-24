@@ -7,15 +7,17 @@
 //! 0. 確かめ：このジョブが頭にした版があれば、前回コミットしたので Done（再開）。前回 OS のデコーダで元を読んでいる途中で
 //!    落ちていれば（途中経過の `decoding` が真）、同じファイルで落ち続けないよう失敗にする。文書を読み、土台を確かめる。
 //! 1. 予算：元（版 0。なければ今）の形をヘッダから読み（アンカーがあればアンカーの形）、計画を作って一括の予算を確保する
-//!    （アンカーを作りうるなら、読む持ち越し ＋ 入力の値 ＋ アンカーを読み直す分との大きいほう。`admit_bulk_with`）。
-//! 2. 読む：アンカーがあればアンカーから（記録はアンカーの元の読み取りの記録）、なければ元を読む。OS のデコーダを通りうる
-//!    ときは、読む前に `decoding` を真にしてコミットし、読み終えたら偽に戻す。
+//!    （アンカーを作りうるなら、読む持ち越し ＋ 入力の値 ＋ アンカーを読み直す分との大きいほう。`admit_bulk_with`）。OS の
+//!    デコーダを通りうるときは、見出しを読む前に `decoding` を真にしてコミットし、2 で読み終えるまで保つ（[`read`]）。
+//! 2. 読む：アンカーがあればアンカーから（記録はアンカーの元の読み取りの記録）、なければ元を読む。アンカーが使えなければ、
+//!    元を記録の識別子のデコーダで読み直して値を照らす（同じなら警告を残して続け、違えば Mismatch）。読み終えたら印を偽に戻す。
 //! 3. アンカー：再現を約束しないデコーダで読み、まだアンカーがなければ、`staging/edit-<job>-anchor.<png|wav>.part` に書いて
 //!    `sync_all` し、読み直して照らしてハッシュを取る（M12 の決定 7。描いたのと同じ読み取りから）。
 //! 4. 描く（`Engine::render`）。5. 書く：エンコードしてハッシュ H を取り、`staging/edit-<job>-out.<ext>.part` に書いて
 //!    `sync_all`。ここで予算と値を手放す。5 までは一時停止・中止で止まる（staging を消す）。
-//! 6. 予告：台帳の門（`Library::ingest_exclusive`）を取り、トランザクション 1 で土台を確かめ直し、H の持ち主で Conflict か
-//!    existing を決め、拡張子を決め（台帳に行があればその拡張子）、台帳にない出力とアンカーを予告する（`ledger::announce`）。
+//! 6. 予告：台帳の門（`Library::ingest_exclusive`）を取り、トランザクション 1 で土台と、読んだアンカーの行が残っていることを
+//!    確かめ直し（ゴミ箱を空にして片付けられていれば Conflict）、H の持ち主で Conflict か existing を決め、拡張子を決め
+//!    （台帳に行があればその拡張子）、台帳にない出力とアンカーを予告する（`ledger::announce`）。
 //! 7. 配置：`files/` へ同じボリュームの中で改名する（同じ中身がもうあれば staging を消す）。
 //! 8. コミット：トランザクション 2 で土台を確かめ直し、版 0（最初の保存）・アンカー・アイテムの置き換え（か新しいアイテム）・
 //!    前の頭・新しい頭・入力の記録を書き、下書きを片付け（`drafts::settle_after_save`）、自分の予告を消し、途中経過に結果を
@@ -467,7 +469,8 @@ macro_rules! go {
     };
 }
 
-// 版に戻す（`go!` を使うので、マクロの定義のあとに置く）
+// 段 1・2 の読みと、版に戻す（`go!` を使うので、マクロの定義のあとに置く）
+mod read;
 mod revert;
 
 /// このジョブの staging のファイル（落とすと消す。置いたものは改名で消えている）。
@@ -513,28 +516,41 @@ struct NewAnchorFile {
 /// 元の読み方。
 #[derive(Debug, Clone)]
 enum AnchorUse {
-    /// アンカーなし（再現できるデコーダで読んだ）。
+    /// アンカーなし（再現できるデコーダで読んだ・アンカーの行がない）。
     None,
     /// あったアンカーから読んだ。
     Existing(Anchor),
+    /// あったアンカーが使えず（壊れている・ファイルがない・別の値）、元を記録の識別子のデコーダで読み直したら記録と同じ値
+    /// だった。入力の記録は同じ値のアンカーを指したまま（docs/editing.md §9.4）。
+    Fallback(Anchor),
     /// 今回作った。
     New(NewAnchorFile),
 }
 
 impl AnchorUse {
+    /// 入力の記録が指すアンカーのファイルの中身。
     fn file_hash(&self) -> Option<[u8; 32]> {
         match self {
             Self::None => None,
-            Self::Existing(a) => Some(a.hash),
+            Self::Existing(a) | Self::Fallback(a) => Some(a.hash),
             Self::New(a) => Some(a.hash),
         }
     }
 
+    /// 結果の `anchor`：アンカーから読んだ（used）・作った（created）・元から読んだ（null。使えずに読み直したときも）。
     fn label(&self) -> Option<&'static str> {
         match self {
-            Self::None => None,
+            Self::None | Self::Fallback(_) => None,
             Self::Existing(_) => Some("used"),
             Self::New(_) => Some("created"),
+        }
+    }
+
+    /// 前からあったアンカー（予告のときに、まだ同じ台帳の行を指して残っているかを確かめ直す）。
+    fn existing(&self) -> Option<&Anchor> {
+        match self {
+            Self::Existing(a) | Self::Fallback(a) => Some(a),
+            Self::None | Self::New(_) => None,
         }
     }
 }
@@ -743,39 +759,6 @@ impl EditHandler {
         let mon = JobMonitor(ctx);
         let limits: Limits = runtime.bulk(|e| e.limits().clone());
         let original_path = layout.content_path(&original.hash, &original.ext);
-
-        // 1. 予算：形をヘッダから読み、計画を作って確保する
-        ctx.progress(0.05, "元の大きさを確かめています");
-        let (shape, len) = match &found {
-            Some(a) => {
-                let path = layout.content_path(&a.hash, &a.ext);
-                let shape = File::open(&path)
-                    .map_err(EngineError::from)
-                    .and_then(|f| anchor::shape(&mut BufReader::new(f), &limits));
-                (
-                    go!(ctx, "アンカーの大きさを読めません", shape),
-                    file_len(&path),
-                )
-            }
-            None => {
-                let shape = codecs
-                    .shape_path_monitored(&original_path, source_format, &opts, &limits, &mon)
-                    .map(|(shape, _)| shape);
-                (
-                    go!(ctx, "元の大きさを読めません", shape),
-                    file_len(&original_path),
-                )
-            }
-        };
-        let shapes = BTreeMap::from([(InputId(0), shape)]);
-        let plan = runtime
-            .bulk(|e| e.compile(&graph, &shapes))
-            .map_err(|issues| CoreError::Invalid(format!("文書を描けません：{issues}")))?;
-        let out_shape = plan
-            .output_shapes()
-            .first()
-            .map(|(_, s)| *s)
-            .ok_or_else(|| CoreError::Invalid("文書に出力がありません".into()))?;
         let (out_format, enc_opts) = match graph.outputs.first().map(|o| &o.format) {
             Some(FormatChoice::To { format, options }) => (
                 format.clone(),
@@ -796,65 +779,70 @@ impl EditHandler {
                 head.kind.as_str()
             )));
         }
-        if codecs.encoder(&out_format, &out_shape).is_none() {
-            return Err(CoreError::Unsupported(format!(
-                "この結果は {out_format} に書けません"
-            )));
-        }
-        let may_anchor = found.is_none()
-            && codecs
-                .decoders_for(source_format)
-                .iter()
-                .any(|d| !d.reproducible());
-        let source = match &found {
-            Some(_) => Source::Decoder {
-                decoder: &anchor::AnchorDecoder,
-                format: anchor::FORMAT,
-            },
-            None => Source::Decode {
-                codecs: &codecs,
-                format: source_format,
-            },
-        };
-        let spec = EstimateSpec::new(0)
-            .digests(true)
-            .input(InputId(0), source)
-            .input_len(InputId(0), len)
-            .output(
-                OutputId(0),
-                Sink::Encode {
-                    codecs: &codecs,
-                    format: &out_format,
-                    opts: &enc_opts,
-                },
-            );
-        // アンカーを作るなら：読む持ち越し ＋ 入力の値 ＋ 書いて読み直す分（読み直した値。docs/editing.md §9.4 の「値の 2 倍」）
-        let anchor_need = |est: &kura_engine::render::estimate::MemoryEstimate| {
-            if may_anchor {
-                est.carried_decode
-                    .saturating_add(value_bytes(&shape))
-                    .saturating_add(anchor::work_bytes(&shape))
-            } else {
-                0
-            }
-        };
-        let (_estimate, lease) = go!(
-            ctx,
-            "保存のメモリを確保できません",
-            runtime.admit_bulk_with(&plan, spec, anchor_need, &mon)
-        );
+        let may_make_anchor = codecs
+            .decoders_for(source_format)
+            .iter()
+            .any(|d| !d.reproducible());
 
-        // 2. 読む
-        ctx.progress(0.15, "元を読んでいます");
-        let platform = found.is_none()
-            && codecs
-                .decoders_for(source_format)
-                .iter()
-                .any(|d| d.tier() == Tier::Platform);
-        if platform {
-            ctx.checkpoint(DECODING, 0.15, "元を読んでいます")?;
-        }
-        let read = match &found {
+        // 1・2. 形をヘッダから読み、計画を作って予算を確保し、読む（アンカーがあればアンカーから。使えなければ元を記録の
+        // デコーダで読み直す。OS のデコーダを通りうるなら、見出しを読む前から読み終えるまで `decoding` の印を保つ。read.rs）
+        ctx.progress(0.05, "元の大きさを確かめています");
+        let cx = read::ReadCx {
+            ctx,
+            runtime: &runtime,
+            codecs: &codecs,
+            layout,
+            original: &original_path,
+            limits: &limits,
+            mon: &mon,
+        };
+        let mut warnings: Vec<String> = Vec::new();
+        let plan_for = |how: &read::Reading<'_>, shape: &Shape| -> Result<Flow<_>> {
+            let shapes = BTreeMap::from([(InputId(0), *shape)]);
+            let plan = runtime
+                .bulk(|e| e.compile(&graph, &shapes))
+                .map_err(|issues| CoreError::Invalid(format!("文書を描けません：{issues}")))?;
+            let out_shape = plan
+                .output_shapes()
+                .first()
+                .map(|(_, s)| *s)
+                .ok_or_else(|| CoreError::Invalid("文書に出力がありません".into()))?;
+            if codecs.encoder(&out_format, &out_shape).is_none() {
+                return Err(CoreError::Unsupported(format!(
+                    "この結果は {out_format} に書けません"
+                )));
+            }
+            let may_anchor = may_make_anchor && matches!(how, read::Reading::Any { .. });
+            let spec = EstimateSpec::new(0)
+                .digests(true)
+                .input(InputId(0), how.source(&codecs))
+                .input_len(InputId(0), file_len(how.path(&original_path)))
+                .output(
+                    OutputId(0),
+                    Sink::Encode {
+                        codecs: &codecs,
+                        format: &out_format,
+                        opts: &enc_opts,
+                    },
+                );
+            // アンカーを作るなら：読む持ち越し ＋ 入力の値 ＋ 書いて読み直す分（読み直した値。docs/editing.md §9.4 の「値の 2 倍」）
+            let anchor_need = |est: &kura_engine::render::estimate::MemoryEstimate| {
+                if may_anchor {
+                    est.carried_decode
+                        .saturating_add(value_bytes(shape))
+                        .saturating_add(anchor::work_bytes(shape))
+                } else {
+                    0
+                }
+            };
+            let (_estimate, lease) = go!(
+                ctx,
+                "保存のメモリを確保できません",
+                runtime.admit_bulk_with(&plan, spec, anchor_need, &mon)
+            );
+            Ok(Flow::Go((plan, lease)))
+        };
+        let read = match found {
             Some(a) => {
                 let rec = RecordedInput {
                     source: Digest(original.hash),
@@ -863,39 +851,43 @@ impl EditHandler {
                     decoded: a.decoded.clone(),
                     anchor: Some(Digest(a.hash)),
                 };
-                let path = layout.content_path(&a.hash, &a.ext);
-                runtime
-                    .bulk(|_| {
-                        recorded::read_recorded(
-                            &codecs,
-                            &rec,
-                            Some(recorded::Source::Path(&path)),
-                            None,
-                            &limits,
-                            &mon,
-                        )
-                    })
-                    .and_then(|r| match r {
-                        Recorded::Matched { input, .. } => Ok((input.value, a.decoded.clone())),
-                        Recorded::Mismatched { mismatch, .. } => {
-                            Err(EngineError::Mismatch(mismatch))
-                        }
-                    })
+                read::read_recorded_input(
+                    &cx,
+                    &rec,
+                    Some(a),
+                    "保存できません",
+                    &mut warnings,
+                    plan_for,
+                )?
             }
-            None => runtime
-                .bulk(|_| codecs.decode_path(&original_path, source_format, &opts, &limits, &mon)),
+            None => {
+                let how = read::Reading::Any {
+                    format: source_format,
+                    opts: &opts,
+                };
+                match read::read_once(&cx, &how, |shape| plan_for(&how, shape))? {
+                    Flow::Go(read::Attempt::Read {
+                        value,
+                        decoded,
+                        prep,
+                    }) => Flow::Go((value, decoded, AnchorUse::None, prep)),
+                    Flow::Go(read::Attempt::Unusable(why)) => {
+                        return Err(CoreError::Mismatch(format!("保存できません：{why}")));
+                    }
+                    Flow::Stop(end) => Flow::Stop(end),
+                }
+            }
         };
-        if platform {
-            ctx.checkpoint(DECODED, 0.3, "元を読みました")?;
-        }
-        let (value, decoded) = go!(ctx, "元を読めません", read);
+        let (value, decoded, found_use, (plan, lease)) = match read {
+            Flow::Go(read) => read,
+            Flow::Stop(end) => return Ok(Flow::Stop(end)),
+        };
 
         // 3. アンカー
         let mut staging = Staging::default();
         std::fs::create_dir_all(layout.staging_dir())?;
-        let anchor_use = match found {
-            Some(a) => AnchorUse::Existing(a),
-            None if anchor::needs_anchor(&decoded) => {
+        let anchor_use = match found_use {
+            AnchorUse::None if anchor::needs_anchor(&decoded) => {
                 ctx.progress(0.35, "元の読み取りを残しています");
                 let ext = if matches!(value, Value::Audio(_)) {
                     "wav"
@@ -906,13 +898,13 @@ impl EditHandler {
                     .staging_dir()
                     .join(format!("edit-{job}-anchor.{ext}.part"));
                 staging.add(part.clone());
-                let cx = AnchorContext {
+                let acx = AnchorContext {
                     source: Some(Digest(original.hash)),
                     format: Some(source_format.to_string()),
                     options: opts.clone(),
                 };
                 let written =
-                    runtime.bulk(|_| write_anchor(&part, &value, &decoded, &cx, &limits, &mon));
+                    runtime.bulk(|_| write_anchor(&part, &value, &decoded, &acx, &limits, &mon));
                 go!(ctx, "元の読み取りを残せません", written);
                 let hash = hash_file(&part)?;
                 let size = std::fs::metadata(&part)?.len();
@@ -923,7 +915,7 @@ impl EditHandler {
                     ext,
                 })
             }
-            None => AnchorUse::None,
+            other => other,
         };
 
         // 4. 描く
@@ -941,11 +933,7 @@ impl EditHandler {
             runtime.bulk(|e| e.render(&plan, &inputs, &mon))
         );
         drop(inputs);
-        let warnings: Vec<String> = rendered
-            .warnings
-            .iter()
-            .map(|w| w.message.clone())
-            .collect();
+        warnings.extend(rendered.warnings.iter().map(|w| w.message.clone()));
         let out = rendered
             .outputs
             .into_iter()
@@ -1174,6 +1162,17 @@ fn announce(tx: &Connection, p: &Prepared, now: i64) -> Result<Tx1> {
     if let Some(why) = base_conflict(&head, &p.base) {
         return Ok(Tx1::Conflict(why));
     }
+    // 読んだアンカーが、描いている間に片付けられていないか（ゴミ箱を空にすると、どの版の入力からも参照されなくなったアンカーを
+    // 消す。門を持ったので、ここから後は消されない）
+    if let Some(a) = p.anchor.existing()
+        && !anchors::get(tx, a.id)?
+            .is_some_and(|now| now.blob_id == a.blob_id && now.hash == a.hash)
+    {
+        return Ok(Tx1::Conflict(
+            "保存する間に、元の読み取りの記録（アンカー）が片付けられました。もう一度保存してください"
+                .into(),
+        ));
+    }
     let owner = find_owner(tx, &p.out_hash)?;
     let unchanged = match decide(owner.as_ref(), p.item_id, p.mode) {
         Decision::Conflict(why) => return Ok(Tx1::Conflict(why)),
@@ -1228,7 +1227,7 @@ fn announce(tx: &Connection, p: &Prepared, now: i64) -> Result<Tx1> {
             }
             Some(a_ext)
         }
-        AnchorUse::None | AnchorUse::Existing(_) => None,
+        AnchorUse::None | AnchorUse::Existing(_) | AnchorUse::Fallback(_) => None,
     };
     Ok(Tx1::Go(Go {
         ext,
@@ -1327,7 +1326,7 @@ fn saved_json(
 fn anchor_row(tx: &Connection, p: &Prepared, go: &Go, now: i64) -> Result<Option<i64>> {
     Ok(match &p.anchor {
         AnchorUse::None => None,
-        AnchorUse::Existing(a) => Some(a.id),
+        AnchorUse::Existing(a) | AnchorUse::Fallback(a) => Some(a.id),
         AnchorUse::New(a) => Some(anchors::insert(
             tx,
             &NewAnchor {

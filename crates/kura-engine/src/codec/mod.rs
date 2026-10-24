@@ -142,7 +142,8 @@ pub struct DecodeStamp {
     /// 使ったデコーダ（例 `png-rs-dec/1`）。作り直しでは `CodecSet::decode_with` でこのデコーダを選ぶ。
     pub codec: String,
     pub tier: Tier,
-    /// 同じ識別子のデコーダなら、どの環境でも同じ値を読むか（偽なら、初めて編集するときにアンカーを作る。§9.4）。
+    /// 同じ識別子のデコーダなら、どの環境でも同じ値を読むか（偽なら、初めて保存するとき（保存のジョブが描くのと同じ読み取りから作る。docs/editing.md §9.4）
+    /// にアンカーを作る）。
     pub reproducible: bool,
     /// 読み取った値のダイジェスト（作り直しで照らす。E29）。
     pub value_digest: Digest,

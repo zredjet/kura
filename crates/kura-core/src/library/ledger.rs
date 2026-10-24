@@ -4,9 +4,11 @@
 //! （M12）は `register` で載せる。台帳の行を消すのは `release` だけ（どの表からも参照されない行だけを消す。版・アンカーの
 //! 行を消さないように）。
 //!
-//! 台帳にまだない中身を `files/` に置く処理（保存。段 3 の GC が消すときも）は、置く前に `announce` で予告を DB に
-//! コミットし、台帳に載せるトランザクションで `clear_announced` で消す。途中で落ちたら、次に開くときに `settle_pending` が
-//! 予告を照らして、台帳にないファイルを片付ける（docs/data-model.md §4「保存と版（M12）」）。
+//! 台帳にまだない中身を `files/` に置く処理（保存）と、段 3 の GC が台帳から外した中身を消す処理は、置く・消す前に
+//! `announce` で予告を DB にコミットする。'place' の予告は台帳に載せるトランザクションで消し、'delete' の予告はファイルを
+//! 消し終えてから消す（`clear_announced`）。途中で落ちたら、次に開くときに `settle_pending` が予告を照らして、台帳にない
+//! ファイルを片付ける。ゴミ箱を空にする処理は段 3 で作り直すまで ADR-46 の順（予告なし。docs/data-model.md §4
+//! 「保存と版（M12）」）。
 
 use std::collections::HashSet;
 
@@ -130,8 +132,8 @@ pub fn announce(
     Ok(())
 }
 
-/// ジョブ `job_id` の予告を消す（台帳に載せる・台帳から外すのと同じトランザクションで）。消した数を返す。
-/// 予告の表は小さい（実行中の保存・GC の分だけ）ので索引を持たず、走査する（docs/data-model.md §4）。
+/// ジョブ `job_id` の予告を消す（'place' の予告は台帳に載せるのと同じトランザクションで、'delete' の予告はファイルを消し終えて
+/// から）。消した数を返す。予告の表は小さい（実行中の保存・GC の分だけ）ので索引を持たず、走査する（docs/data-model.md §4）。
 pub fn clear_announced(conn: &Connection, job_id: i64) -> Result<usize> {
     let mut stmt = conn.prepare_cached("DELETE FROM ledger_pending WHERE job_id = ?1")?;
     Ok(stmt.execute([job_id])?)

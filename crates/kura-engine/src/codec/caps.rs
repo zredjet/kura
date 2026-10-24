@@ -25,7 +25,8 @@ use crate::value::PixelFormat;
 pub struct ReadCap {
     pub codec: &'static str,
     pub tier: Tier,
-    /// どの環境でも同じ値を読むか（偽なら、読んだ元に初めて編集するときにアンカーを作る。§9.4）。
+    /// どの環境でも同じ値を読むか（偽なら、読んだ元に初めて保存するとき（保存のジョブが描くのと同じ読み取りから作る。docs/editing.md §9.4）
+    /// にアンカーを作る）。
     pub reproducible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<CodecEnv>,

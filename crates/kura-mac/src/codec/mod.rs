@@ -2,8 +2,8 @@
 //! AAC の書き出し。エンジンの backend の trait（`kura_engine::codec::platform`）を Swift の C の口で実装し、adapter で
 //! `Decoder`・`Encoder` にして `CodecSet` に足す。
 //!
-//! - 段は `Tier::Platform`、値の再現を約束しない（読んだ元に初めて編集するときにアンカーを作る。§9.4）。識別子は実装ごとに
-//!   1 つ（[`IMAGEIO_DEC`]・[`AUDIOTOOLBOX_DEC`]・[`AAC_AUDIOTOOLBOX_ENC`]）で、版は kura-mac の呼び方とエンジンの変換の約束。
+//! - 段は `Tier::Platform`、値の再現を約束しない（読んだ元に初めて保存するとき（保存のジョブが描くのと同じ読み取りから作る。docs/editing.md §9.4）
+//!   にアンカーを作る）。識別子は実装ごとに 1 つ（[`IMAGEIO_DEC`]・[`AUDIOTOOLBOX_DEC`]・[`AAC_AUDIOTOOLBOX_ENC`]）で、版は kura-mac の呼び方とエンジンの変換の約束。
 //!   OS・ImageIO・AudioToolbox の版は記録の `env`（[`MacCaps::image_env`]・[`MacCaps::audio_env`]）に出す。旧版は残さない。
 //! - 能力（[`codec_caps`]）は起動時に 1 度だけ Swift に問い合わせ、何を登録するかを決める（描画の中で OS に問い合わせない）。
 //! - ABI の版と構造体の形が Swift と合わなければ、Platform のコーデックを登録しない（[`platform_status`] が理由を返す）。

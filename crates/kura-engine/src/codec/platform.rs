@@ -11,8 +11,8 @@
 //!   確かめて `try_reserve_exact` で確保 → backend が adapter の領域に書く（画像は帯、音声・AAC はチャンクごと。合間で
 //!   adapter が中止を見て進捗を出す）。backend は渡された領域を呼び出しのあいだだけ書き、保持しない。backend の
 //!   ハンドル（開いたもの）は `Drop` で 1 度だけ閉じる。
-//! - 段は `Tier::Platform`、`reproducible()` は偽（読んだ元に初めて編集するときにアンカーを作る。§9.4）。識別子は
-//!   backend の実装ごとに 1 つ（`imageio-dec/1`・`audiotoolbox-dec/1`・`aac-audiotoolbox-enc/1`。kura-mac の呼び方と
+//! - 段は `Tier::Platform`、`reproducible()` は偽（読んだ元に初めて保存するとき（保存のジョブが描くのと同じ読み取りから作る。docs/editing.md §9.4）
+//!   にアンカーを作る）。識別子は backend の実装ごとに 1 つ（`imageio-dec/1`・`audiotoolbox-dec/1`・`aac-audiotoolbox-enc/1`。kura-mac の呼び方と
 //!   この層の変換の約束の版）で、OS・フレームワークの版は backend の `env()`（記録の `env`）に出す。旧版は残さない
 //!   （作り直しはアンカーから読む）。
 //! - 失敗は [`BackendError`]（C の口の状態の番号と 1 対 1）。adapter が `EngineError` に直す（`Unsupported` は次の段へ）。
