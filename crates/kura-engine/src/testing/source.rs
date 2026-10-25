@@ -58,20 +58,21 @@ impl AudioSource for SyntheticSource {
     }
 
     fn read_chunk(&self, index: u32) -> Result<Vec<Arc<Vec<f32>>>, EngineError> {
-        if let Some(hit) = self.lru.get(index) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(hit);
-        }
-        let (start, end) = chunk_span(self.frames, index).ok_or_else(|| {
-            EngineError::Internal(format!("合成の源のチャンク {index} は範囲の外です"))
+        let (out, hit) = self.lru.get_or_load(index, || {
+            let (start, end) = chunk_span(self.frames, index).ok_or_else(|| {
+                EngineError::Internal(format!("合成の源のチャンク {index} は範囲の外です"))
+            })?;
+            let n = usize::try_from(end - start)
+                .map_err(|_| EngineError::Limit("チャンクが大きすぎます".into()))?;
+            let out: Vec<Arc<Vec<f32>>> = (0..self.channels)
+                .map(|ch| Arc::new(self.samples(ch, start, n)))
+                .collect();
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(out)
         })?;
-        let n = usize::try_from(end - start)
-            .map_err(|_| EngineError::Limit("チャンクが大きすぎます".into()))?;
-        let out: Vec<Arc<Vec<f32>>> = (0..self.channels)
-            .map(|ch| Arc::new(self.samples(ch, start, n)))
-            .collect();
-        self.reads.fetch_add(1, Ordering::Relaxed);
-        self.lru.insert(index, out.clone());
+        if hit {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(out)
     }
 

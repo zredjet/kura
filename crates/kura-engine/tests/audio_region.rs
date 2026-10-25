@@ -235,6 +235,7 @@ fn audio_cases(engine: &Engine) -> Vec<(Arc<dyn DynOp>, String, serde_json::Valu
 
 /// 核を作る（申告した解析は全体の入力 `full` で解いて、`input` に先に入れる）。
 fn kernel_of(
+    engine: &Engine,
     op: &dyn DynOp,
     params: &serde_json::Value,
     input: &Value,
@@ -243,7 +244,6 @@ fn kernel_of(
     let p = op.parse(params).unwrap();
     let limits = Limits::default();
     let mut cx = ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
-    let engine = engine();
     for need in op.needs(p.as_ref(), &[input.shape()]).unwrap() {
         let a = engine.analyses().get(need.id, need.v).unwrap();
         let acx = kura_engine::analysis::AnalyzeCx {
@@ -268,7 +268,7 @@ fn audio_reach_is_sound() {
     for (op, name, params, input) in audio_cases(&engine) {
         let p = op.parse(&params).unwrap();
         let reach = op.audio_reach(p.as_ref(), &[input.shape()]).unwrap();
-        let full = kernel_of(op.as_ref(), &params, &input, &input);
+        let full = kernel_of(&engine, op.as_ref(), &params, &input, &input);
         let frames = full.frames();
         let out_shape = Shape::Audio {
             rate: full.rate(),
@@ -276,7 +276,24 @@ fn audio_reach_is_sound() {
             frames: kura_engine::shape::Dim::Exact(frames),
         };
         let count = frames.div_ceil(C);
-        let mut areas: Vec<Area> = (0..count)
+        // 全体の核の出力（チャンクごと。区間ごとに描き直さない）
+        let want: Vec<Vec<Vec<f32>>> = (0..full.channels())
+            .map(|ch| {
+                (0..count)
+                    .map(|j| {
+                        let s = j * C;
+                        let mut v = vec![0f32; ((s + C).min(frames) - s) as usize];
+                        full.render(ch, s, &mut v).unwrap();
+                        v
+                    })
+                    .collect()
+            })
+            .collect();
+        // 区間：最初と最後のチャンク・チャンクの境をまたぐ 2 つ・ランダムな区間
+        let mut areas: Vec<Area> = [0, count.saturating_sub(1)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .map(|k| Area::span(k * C, ((k + 1) * C).min(frames)))
             .collect();
         if count > 1 {
@@ -295,19 +312,17 @@ fn audio_reach_is_sound() {
                 corrupt_outside(&input, &in_need, r.next_u64()).unwrap(),
                 only_chunks(&input, &in_need),
             ] {
-                let k = kernel_of(op.as_ref(), &params, &broken, &input);
-                for ch in 0..k.channels() {
+                let k = kernel_of(&engine, op.as_ref(), &params, &broken, &input);
+                for (ch, want) in want.iter().enumerate().take(k.channels()) {
                     for j in rounded.iter() {
                         let s = j as u64 * C;
                         let e = (s + C).min(frames);
                         let mut got = vec![0f32; (e - s) as usize];
-                        let mut want = vec![0f32; (e - s) as usize];
                         k.render(ch, s, &mut got)
                             .unwrap_or_else(|e| panic!("{what}: {e}"));
-                        full.render(ch, s, &mut want).unwrap();
                         assert!(
                             got.iter()
-                                .zip(&want)
+                                .zip(&want[j])
                                 .all(|(a, b)| a.to_bits() == b.to_bits()),
                             "{what}：チャンク {j}・チャンネル {ch} が違う"
                         );

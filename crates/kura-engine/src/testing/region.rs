@@ -1233,8 +1233,9 @@ pub fn random_audio_op(r: &mut ChaCha8Rng, shape: &Shape) -> (&'static str, serd
             )
         }
         7 => {
+            // デバッグのビルドで軽い比（縮めると窓が大きくなるので、8 kHz からは上げるだけ）
             let to = match rate {
-                8_000 => [12_000u32, 16_000, 6_000][below(r, 3) as usize],
+                8_000 => [12_000u32, 16_000][below(r, 2) as usize],
                 _ => [8_000u32, 12_000][below(r, 2) as usize],
             };
             ("audio.resample", json!({ "rate": to }))

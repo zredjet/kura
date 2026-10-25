@@ -4,6 +4,10 @@
 //! 照らす。コーデック・操作の作業領域の倍率が実装の変更で黙って足りなくなるのを、macOS の CI で捕まえる（倍率そのものの
 //! 実測と大きな入力は bench edit）。
 //!
+//! M13 段 1 のケース `audio-60min-step`（60 分の合成の源の音声に 1 手。E41 の実測）は重いので、別のテスト
+//! `audio_60min_step_stays_within_n`（`#[ignore]`。`--release` で回す）にした。判定は N（源の LRU の上限 ＋ 64 MiB）と、範囲の
+//! 描画の見積もり（＋ キャッシュが数える源の LRU）× 1.25 ＋ 4 MiB。
+//!
 //! 子プロセスは、このテストのバイナリ自身を `--exact mem_smoke::tests::child --ignored` で起こす（環境変数でケースと段を
 //! 渡す）。`/usr/bin/time -l` がない・peak memory footprint を出さない環境（Linux）では確かめずに通す（CI の Linux の job は
 //! kura-devtools を回さない）。
@@ -421,5 +425,229 @@ mod tests {
                 est.peak
             );
         }
+    }
+
+    // ---- M13 段 1：60 分の音声の 1 手（合成の源） ----
+
+    /// 子プロセスに渡す音声のケース。
+    const AUDIO_CASE: &str = "audio-60min-step";
+    /// 音声の長さ（秒）と源の LRU の上限。
+    const AUDIO_SECONDS: u64 = 60 * 60;
+    const AUDIO_RATE: u64 = 48_000;
+    const AUDIO_LRU: u64 = 64 * MIB;
+
+    /// trim → fade → normalize → gain → set_loop（kura-engine の tests/long_audio.rs と同じ形）。
+    fn audio_document(frames: u64, db: f64) -> Graph {
+        let r = AUDIO_RATE;
+        let mut g = single_node_graph(
+            "audio.trim",
+            1,
+            json!({ "start": r + 123, "end": frames - r }),
+        )
+        .unwrap();
+        g.push_linear(
+            "audio.fade",
+            1,
+            json!({ "fadeIn": 2 * r, "fadeOut": 3 * r, "curve": "equalPower" }),
+            2,
+        )
+        .unwrap();
+        g.push_linear(
+            "audio.normalize",
+            1,
+            json!({ "target": -16.0, "peakLimit": -1.0 }),
+            3,
+        )
+        .unwrap();
+        g.push_linear("audio.gain", 1, json!({ "db": db }), 4)
+            .unwrap();
+        g.push_linear(
+            "audio.set_loop",
+            1,
+            json!({ "loop": { "start": 10 * r, "end": 20 * r } }),
+            5,
+        )
+        .unwrap();
+        g
+    }
+
+    /// 音声の 1 手の通し：60 分・48 kHz ステレオの合成の源（LRU 64 MiB）を遅延の入力にして、見えている 10 秒 ＋ 試聴の 6 秒を
+    /// 表示し（最初の表示で normalize の計測を流して解く）、ゲインの引数の 1 手を表示する。返すのは（最初の表示の見積もりの
+    /// ピーク, 1 手の見積もりのピーク, 1 手で源が作ったチャンクの数）。
+    fn audio_flow() -> (u64, u64, u64) {
+        use kura_engine::render::cache::{Fingerprint, FingerprintedInput, NodeCache};
+        use kura_engine::render::estimate::CacheProbe;
+        use kura_engine::render::region::Area;
+        use kura_engine::render::view::ViewRequest;
+        use kura_engine::testing::source::SyntheticSource;
+        use kura_engine::value::{Audio, AudioMeta};
+        use std::sync::Arc;
+        let frames = AUDIO_SECONDS * AUDIO_RATE;
+        let engine = Engine::new().unwrap();
+        let src = Arc::new(SyntheticSource::new(
+            AUDIO_RATE as u32,
+            2,
+            frames,
+            7,
+            AUDIO_LRU,
+        ));
+        let value = Value::Audio(Arc::new(
+            Audio::from_source(src.clone(), AudioMeta::default()).unwrap(),
+        ));
+        let shapes = BTreeMap::from([(InputId(0), value.shape())]);
+        let inputs = BTreeMap::from([(
+            InputId(0),
+            FingerprintedInput {
+                value,
+                source: Digest([1; 32]),
+                fingerprint: Fingerprint(Digest([2; 32])),
+            },
+        )]);
+        let (at, audition) = (frames / 3, frames / 2);
+        let area = Area::span(at, at + 10 * AUDIO_RATE)
+            .union(&Area::span(audition, audition + 6 * AUDIO_RATE));
+        let req = ViewRequest {
+            output: OutputId(0),
+            area: area.clone(),
+            focus: None,
+        };
+        let mut cache = NodeCache::new(512 * MIB);
+        cache.register_external(&inputs[&InputId(0)].value);
+        let spec = |plan: &kura_engine::render::Plan| {
+            EstimateSpec::new(TASKS as u64)
+                .all_inputs(plan, Source::Held)
+                .area(OutputId(0), area.clone())
+        };
+        let first_plan = engine
+            .compile(&audio_document(frames, -2.0), &shapes)
+            .unwrap();
+        let first_est = engine
+            .estimate(
+                &first_plan,
+                &spec(&first_plan),
+                Some(CacheProbe {
+                    cache: &cache,
+                    inputs: &inputs,
+                }),
+            )
+            .unwrap();
+        let first = engine
+            .render_view(&first_plan, &inputs, &mut cache, &req, None, &NoMonitor)
+            .unwrap();
+        let plan = engine
+            .compile(&audio_document(frames, -5.0), &shapes)
+            .unwrap();
+        let step_est = engine
+            .estimate(
+                &plan,
+                &spec(&plan),
+                Some(CacheProbe {
+                    cache: &cache,
+                    inputs: &inputs,
+                }),
+            )
+            .unwrap();
+        let before = kura_engine::audio::source::AudioSource::stats(src.as_ref()).reads;
+        let got = engine
+            .render_view(
+                &plan,
+                &inputs,
+                &mut cache,
+                &req,
+                Some(&first.view),
+                &NoMonitor,
+            )
+            .unwrap();
+        assert_eq!(got.area.presolved, 0);
+        let reads = kura_engine::audio::source::AudioSource::stats(src.as_ref()).reads - before;
+        (first_est.peak, step_est.peak, reads)
+    }
+
+    /// 子プロセス（音声の 1 手）：`base` は何も作らない、`run` は通しを回す。
+    #[test]
+    #[ignore = "audio_60min_step_stays_within_n が子プロセスとして起こす"]
+    fn audio_child() {
+        let Ok(spec) = std::env::var(CASE_ENV) else {
+            return;
+        };
+        let Some((name, stage)) = spec.split_once(':') else {
+            return;
+        };
+        if name != AUDIO_CASE || stage == "base" {
+            return;
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(TASKS)
+            .build()
+            .unwrap();
+        pool.install(audio_flow);
+    }
+
+    /// 子プロセスのピーク（テスト `test` を、ケース `spec` で起こす）。`/usr/bin/time -l` が使えなければ None。
+    fn peak_of(test: &str, spec: &str) -> Option<u64> {
+        let exe = std::env::current_exe().unwrap();
+        let out = Command::new("/usr/bin/time")
+            .arg("-l")
+            .arg(exe)
+            .args([
+                "--exact",
+                test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+                "-q",
+            ])
+            .env(CASE_ENV, spec)
+            .output()
+            .ok()?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let footprint = stderr
+            .lines()
+            .find(|l| l.contains("peak memory footprint"))
+            .and_then(|l| l.split_whitespace().next())
+            .and_then(|n| n.parse().ok())?;
+        assert!(out.status.success(), "{spec}: {stderr}");
+        Some(footprint)
+    }
+
+    /// M13 段 1（E41 の実測）：60 分の音声の 1 手の子プロセスのピーク（流し解きを含む最初の表示 ＋ 1 手）から基準を引いた量が、
+    /// N（源の LRU の上限 ＋ 64 MiB）以下で、見積もり（範囲の描画の見積もりのピーク ＋ キャッシュが数える源の LRU）× 1.25 ＋
+    /// 4 MiB 以下。重い（デバッグのビルドで数十秒を 2 回）ので、ふだんは回さない：
+    /// `cargo test --release -p kura-devtools mem_smoke::tests::audio_60min_step -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "重い（--release で --ignored を付けて回す）"]
+    fn audio_60min_step_stays_within_n() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(TASKS)
+            .build()
+            .unwrap();
+        let (first_est, step_est, reads) = pool.install(audio_flow);
+        let test = "mem_smoke::tests::audio_child";
+        let (Some(base), Some(run)) = (
+            peak_of(test, &format!("{AUDIO_CASE}:base")),
+            peak_of(test, &format!("{AUDIO_CASE}:run")),
+        ) else {
+            eprintln!("/usr/bin/time -l が使えないので、音声のメモリの煙のテストを見送ります");
+            return;
+        };
+        let used = run.saturating_sub(base);
+        let n = AUDIO_LRU + 64 * MIB;
+        let est = first_est.max(step_est);
+        eprintln!(
+            "{AUDIO_CASE}: 通し {:.1} MiB（N {:.1}・見積もり 最初の表示 {:.1}／1 手 {:.1} ＋ 源の LRU {:.1}）・1 手で源が作った\
+             チャンク {reads}・基準 {:.1} MiB",
+            mib(used),
+            mib(n),
+            mib(first_est),
+            mib(step_est),
+            mib(AUDIO_LRU),
+            mib(base),
+        );
+        assert!(used <= n, "{AUDIO_CASE}: 実測 {used} バイト > N {n}");
+        assert!(
+            used <= bound(est + AUDIO_LRU),
+            "{AUDIO_CASE}: 実測 {used} バイト > 見積もり {} × 1.25 ＋ 4 MiB",
+            est + AUDIO_LRU
+        );
     }
 }

@@ -637,13 +637,29 @@ impl LoudnessScan {
     }
 }
 
-/// 値をチャンクの窓で流して `LoudnessScan` に渡す（`analyze`・`analyze_detailed` の走査）。
+/// 値を流れの窓（`STREAM_CHUNKS` チャンク）で `LoudnessScan` に渡す（`analyze`・`analyze_detailed` の走査）。窓が大きいほど、
+/// K 特性（チャンネルごとに直列）の仕事とトゥルーピークのブロックの仕事が並んで、並列が効く（チャンク 1 つずつ渡すと、
+/// チャンクごとに K 特性を待つ）。チャンク 1 つの窓は写さずに渡す。
 fn scan_value(a: &Audio, mon: &dyn Monitor) -> Result<LoudnessScan, EngineError> {
     let mut scan = LoudnessScan::new(a.rate(), a.channels(), a.frames() as u64)?;
-    a.for_each_chunk(mon, |k, data| {
-        let views: Vec<&[f32]> = data.iter().map(|d| &**d).collect();
-        scan.feed(a.chunk_range(k).start as u64, &views, mon)
-    })?;
+    for (s, e) in crate::audio::stream::stream_windows(a.frames() as u64, None) {
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
+        let (s, e) = (s as usize, e as usize);
+        if e - s <= crate::value::AUDIO_CHUNK {
+            let k = s / crate::value::AUDIO_CHUNK;
+            let data = (0..a.channels())
+                .map(|ch| a.chunk_data(ch, k))
+                .collect::<Result<Vec<_>, EngineError>>()?;
+            let views: Vec<&[f32]> = data.iter().map(|d| &**d).collect();
+            scan.feed(s as u64, &views, mon)?;
+        } else {
+            let planes = a.read_planes(s, e)?;
+            let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+            scan.feed(s as u64, &views, mon)?;
+        }
+    }
     Ok(scan)
 }
 

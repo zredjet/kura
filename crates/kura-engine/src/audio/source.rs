@@ -8,10 +8,10 @@
 //!   開き方の閉包（[`Opener`]）で読み口を作る。開いた読み口は使い回す。
 //! - 予算には LRU の上限（[`AudioSource::resident_bytes`]）が入る（`Value::chunks` の擬似のチャンク。docs/editing.md §12.10）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::SeekFrom;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::codec::ReadSeek;
 use crate::codec::pcm::PcmLayout;
@@ -62,11 +62,17 @@ fn chunk_bytes(chunks: &[Arc<Vec<f32>>]) -> u64 {
 }
 
 /// 読んだチャンクの写しの LRU（上限はバイト）。時刻を使わず、使った順の番号で追い出す（`NodeCache` と同じ）。
-/// 鍵は `Mutex` で守り、読む間は鍵を外す（同時に同じ番号を読むと二度読むが、値は同じ）。
+/// 鍵は `Mutex` で守り、読む間は鍵を外す。[`ChunkLru::get_or_load`] は同じ番号を同時に読もうとしたら、先に読み始めたものを
+/// 待って使う（同じチャンクを二度読まない。M13 段 1。チャンネルごと・隣のチャンクの仕事が同じ源のチャンクを読むため）。
 pub struct ChunkLru {
     cap: u64,
     inner: Mutex<LruInner>,
+    /// 読み終えた知らせ（読んでいる番号が減ったとき）。
+    ready: Condvar,
 }
+
+/// チャンク 1 つの全チャンネル（チャンネルの順）。
+pub type ChunkPlanes = Vec<Arc<Vec<f32>>>;
 
 /// LRU の項目：（使った順の番号, 全チャンネル, バイト数）。
 type LruEntry = (u64, Vec<Arc<Vec<f32>>>, u64);
@@ -79,6 +85,21 @@ struct LruInner {
     map: BTreeMap<u32, LruEntry>,
     /// 使った順の番号 → 番号。
     order: BTreeMap<u64, u32>,
+    /// 今読んでいる番号（`get_or_load`）。
+    pending: BTreeSet<u32>,
+}
+
+/// 読んでいる印を、読み終えたら（失敗・中断しても）外して知らせる。
+struct Loading<'a> {
+    lru: &'a ChunkLru,
+    index: u32,
+}
+
+impl Drop for Loading<'_> {
+    fn drop(&mut self) {
+        self.lru.lock().pending.remove(&self.index);
+        self.lru.ready.notify_all();
+    }
 }
 
 impl ChunkLru {
@@ -87,6 +108,7 @@ impl ChunkLru {
         Self {
             cap,
             inner: Mutex::new(LruInner::default()),
+            ready: Condvar::new(),
         }
     }
 
@@ -107,15 +129,45 @@ impl ChunkLru {
 
     /// チャンク `index` の写し（あれば。使った順を新しくする）。
     pub fn get(&self, index: u32) -> Option<Vec<Arc<Vec<f32>>>> {
-        let mut g = self.lock();
+        Self::touch(&mut self.lock(), index)
+    }
+
+    fn touch(g: &mut LruInner, index: u32) -> Option<Vec<Arc<Vec<f32>>>> {
         g.tick += 1;
         let tick = g.tick;
-        let LruInner { map, order, .. } = &mut *g;
+        let LruInner { map, order, .. } = g;
         let entry = map.get_mut(&index)?;
         order.remove(&entry.0);
         entry.0 = tick;
         order.insert(tick, index);
         Some(entry.1.clone())
+    }
+
+    /// チャンク `index` の写しを返す（なければ `load` で読んで入れる）。同じ番号をほかが読んでいれば、読み終えるのを待って
+    /// 使う（読み終えた値が LRU に入らなかったときは自分で読む）。返すのは（全チャンネル, LRU に当たったか）。待つのは
+    /// 同じ番号を読むほかの仕事だけで、読む閉包は描画の仕事に依らないので詰まらない。
+    pub fn get_or_load(
+        &self,
+        index: u32,
+        load: impl FnOnce() -> Result<ChunkPlanes, EngineError>,
+    ) -> Result<(ChunkPlanes, bool), EngineError> {
+        let mut g = self.lock();
+        loop {
+            if let Some(hit) = Self::touch(&mut g, index) {
+                return Ok((hit, true));
+            }
+            if !g.pending.contains(&index) {
+                break;
+            }
+            g = self.ready.wait(g).unwrap_or_else(|p| p.into_inner());
+        }
+        g.pending.insert(index);
+        drop(g);
+        let loading = Loading { lru: self, index };
+        let chunks = load()?;
+        self.insert(index, chunks.clone());
+        drop(loading);
+        Ok((chunks, false))
     }
 
     /// チャンク `index` の写しを入れる（上限を超えるなら古いものから追い出す。1 つで上限を超えるものは入れない）。
@@ -223,10 +275,25 @@ impl AudioSource for PcmFileSource {
     }
 
     fn read_chunk(&self, index: u32) -> Result<Vec<Arc<Vec<f32>>>, EngineError> {
-        if let Some(hit) = self.lru.get(index) {
+        let (chunks, hit) = self.lru.get_or_load(index, || self.load(index))?;
+        if hit {
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(hit);
         }
+        Ok(chunks)
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.lru.capacity()
+    }
+
+    fn stats(&self) -> SourceStats {
+        self.counters.get()
+    }
+}
+
+impl PcmFileSource {
+    /// チャンク `index` を下の読み口から読む（1 回の読みで全チャンネル）。
+    fn load(&self, index: u32) -> Result<Vec<Arc<Vec<f32>>>, EngineError> {
         let (start, end) = chunk_span(self.layout.frames, index).ok_or_else(|| {
             EngineError::Internal(format!("音声の源のチャンク {index} は範囲の外です"))
         })?;
@@ -257,16 +324,7 @@ impl AudioSource for PcmFileSource {
         self.counters
             .bytes_read
             .fetch_add(len as u64, Ordering::Relaxed);
-        self.lru.insert(index, chunks.clone());
         Ok(chunks)
-    }
-
-    fn resident_bytes(&self) -> u64 {
-        self.lru.capacity()
-    }
-
-    fn stats(&self) -> SourceStats {
-        self.counters.get()
     }
 }
 
