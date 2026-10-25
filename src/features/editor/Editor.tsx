@@ -16,6 +16,7 @@ import { openMenuBelow } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { formatCount } from '../../lib/format';
 import { ItemInspector } from '../library/inspector/ItemInspector';
+import { formatOfExt } from './formats';
 import styles from './Editor.module.css';
 import { EditorCanvas } from './EditorCanvas';
 import { useEditorKeys } from './editorKeys';
@@ -153,7 +154,8 @@ function useMetaLine(): string {
   const dirty = useEditorStore((s) => s.status?.dirty ?? false);
   const w = view?.fullWidth ?? source?.width ?? item?.width ?? null;
   const h = view?.fullHeight ?? source?.height ?? item?.height ?? null;
-  const format = (source?.format ?? item?.ext ?? '').toUpperCase();
+  // 元のファイルの形式（source.format は画素の形式で、ファイルの形式ではない）
+  const format = (formatOfExt(item?.ext) ?? item?.ext ?? '').toUpperCase();
   return [
     w !== null && h !== null ? t.size(formatCount(w), formatCount(h)) : null,
     format || null,

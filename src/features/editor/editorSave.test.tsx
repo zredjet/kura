@@ -513,11 +513,8 @@ describe('保存していない変更がないとき', () => {
     requestSave();
     await flush();
     expect(saveEdit).not.toHaveBeenCalled();
-    act(() =>
-      useEditorStore.setState({
-        source: { kind: 'image', width: 64, height: 32, frames: null, format: 'psd' },
-      }),
-    );
+    // 元のファイルの形式はアイテムの拡張子で決める（source.format は画素の形式）
+    act(() => useEditorStore.setState({ item: item({ ext: 'psd' }) }));
     requestSave();
     await flush();
     expect(saveEdit).toHaveBeenCalledWith(

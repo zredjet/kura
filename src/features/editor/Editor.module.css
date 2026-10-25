@@ -25,6 +25,11 @@
   outline: none;
 }
 
+/* キャンバスの区域は開いたときにフォーカスを受けるが、区域いっぱいの輪は出さない（道具のキーを受けるための置き場所） */
+.stage:focus-visible {
+  box-shadow: none;
+}
+
 /* ===== キャンバス ===== */
 
 .canvasHost {
@@ -217,7 +222,8 @@
   left: 50%;
   bottom: var(--space-5);
   transform: translateX(-50%);
-  max-width: calc(100% - var(--space-6) * 2 - 200px);
+  /* 右下の倍率（約 130px）と重ならないよう、真ん中に置いたまま両側を同じだけ空ける */
+  max-width: calc(100% - (var(--space-4) + 150px) * 2);
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -291,6 +297,11 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* 5 桁（16384）まで入る幅（切り抜きの座標・大きさ） */
+.numberWide {
+  width: 76px;
+}
+
 .number:focus-visible,
 .hexInput:focus-visible {
   outline: none;
@@ -304,6 +315,10 @@
 }
 
 .hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-secondary);
 }
 

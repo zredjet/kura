@@ -57,7 +57,7 @@ import {
   useEditorStore,
   whenEditorSettled,
 } from './editorStore';
-import { effectiveFormat, outputChoice } from './formats';
+import { effectiveFormat, formatOfExt, outputChoice } from './formats';
 
 const t = ja.editor;
 
@@ -200,7 +200,7 @@ function armSlow(job: number): void {
 /** 出力の形式が「元と同じ」で元の形式に書けなければ、書ける形式を渡す（PSD・HEIC などを開いて保存するとき）。 */
 function forcedFormat(): EditFormatChoice {
   const s = useEditorStore.getState();
-  const { format, forced } = effectiveFormat(outputChoice(s.doc.outputs), s.source?.format ?? null);
+  const { format, forced } = effectiveFormat(outputChoice(s.doc.outputs), formatOfExt(s.item?.ext));
   return forced ? { type: 'to', format } : null;
 }
 

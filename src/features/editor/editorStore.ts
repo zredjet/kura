@@ -62,7 +62,7 @@ import {
   sameChoice,
 } from './paramSend';
 import { drawScene } from './drawScene';
-import { effectiveFormat, outputChoice } from './formats';
+import { effectiveFormat, formatOfExt, outputChoice } from './formats';
 import { type QueuedStep, RequestQueue, type SentRequest } from './requestQueue';
 import { fillAction, type PendingStroke, type StrokeSpec } from './stroke';
 import { type EditorTool, useToolStore } from './toolStore';
@@ -277,11 +277,12 @@ export function hasUnsavedChanges(
  * 書けず形式を変えて保存するとき（ボタン・⌘S・ファイル › 保存）。
  */
 export function canSaveEditor(
-  s: Pick<EditorState, 'phase' | 'save' | 'status' | 'pendingSteps' | 'doc' | 'source'>,
+  s: Pick<EditorState, 'phase' | 'save' | 'status' | 'pendingSteps' | 'doc' | 'item'>,
 ): boolean {
   if (s.phase !== 'open' || s.save || !s.status) return false;
   if (s.status.dirty || s.pendingSteps) return true;
-  return effectiveFormat(outputChoice(s.doc.outputs), s.source?.format ?? null).forced;
+  // 元のファイルの形式はアイテムの拡張子から（source.format は画素の形式 rgba8 などで、ファイルの形式ではない）
+  return effectiveFormat(outputChoice(s.doc.outputs), formatOfExt(s.item?.ext)).forced;
 }
 
 /** 文書を変える手か（まとめを閉じる・仮の値の手は文書を変えない）。 */

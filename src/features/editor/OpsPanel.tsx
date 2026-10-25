@@ -255,7 +255,6 @@ function Warnings() {
 /** 出力の形式（形式が変わると「書き出すときの名前：hero.webp」）。 */
 function OutputRow() {
   const outputs = useEditorStore((s) => s.doc.outputs);
-  const source = useEditorStore((s) => s.source);
   const item = useEditorStore((s) => s.item);
   const open = useEditorStore((s) => s.phase === 'open');
   const id = useId();
@@ -276,7 +275,8 @@ function OutputRow() {
   }, [itemId]);
   if (!item) return null;
   const choice = outputChoice(outputs);
-  const sourceFormat = source?.format ?? formatOfExt(item.ext);
+  // 元のファイルの形式（source.format は画素の形式で、ファイルの形式ではない）
+  const sourceFormat = formatOfExt(item.ext);
   const eff = effectiveFormat(choice, sourceFormat);
   const keepable = canWrite(sourceFormat);
   const options = [

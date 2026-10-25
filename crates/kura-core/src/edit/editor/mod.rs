@@ -296,6 +296,7 @@ pub struct SourceInfo {
     pub height: u64,
     /// フレームの数（フレームの列だけ）。
     pub frames: Option<u64>,
+    /// 画素の形式（`rgba8`・`indexed8` など）。ファイルの形式（PNG など）ではない（ファイルの形式はアイテムの拡張子から）。
     pub format: Option<String>,
 }
 

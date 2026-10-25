@@ -33,12 +33,15 @@ function NumberField({
   value,
   min,
   max,
+  wide = false,
   onChange,
 }: {
   label: string;
   value: number;
   min: number;
   max: number;
+  /** 5 桁まで入る幅にする（切り抜きの座標・大きさ。16384 まで）。 */
+  wide?: boolean;
   onChange: (v: number) => void;
 }) {
   const id = useId();
@@ -49,7 +52,7 @@ function NumberField({
       </label>
       <NumberInput
         id={id}
-        className={styles.number}
+        className={wide ? `${styles.number} ${styles.numberWide}` : styles.number}
         value={value}
         min={min}
         max={max}
@@ -194,6 +197,7 @@ function CropGroup() {
       value={r[key]}
       min={key === 'w' || key === 'h' ? 1 : 0}
       max={max}
+      wide
       onChange={(v) => setCropRect({ ...r, [key]: v })}
     />
   );

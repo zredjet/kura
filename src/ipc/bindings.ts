@@ -962,6 +962,7 @@ export type EditSourceDto = {
 	width: number,
 	height: number,
 	frames: number | null,
+	/**  画素の形式（`rgba8`・`indexed8` など）。ファイルの形式ではない（ファイルの形式はアイテムの拡張子から）。 */
 	format: string | null,
 };
 

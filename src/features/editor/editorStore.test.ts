@@ -18,6 +18,7 @@ import { useNoticeStore } from '../../stores/noticeStore';
 import {
   addOp,
   applyDocDelta,
+  canSaveEditor,
   cancelCrop,
   closeEditor,
   confirmCrop,
@@ -483,6 +484,19 @@ describe('右パネル', () => {
       hasUnsavedChanges({ status: status({ dirty: false }), save: null, pendingSteps: true }),
     ).toBe(true);
     expect(hasUnsavedChanges({ status: st, save, pendingSteps: true })).toBe(true);
+  });
+
+  it('元のファイルの形式はアイテムの拡張子で決める（source.format は画素の形式。PNG を開いただけでは保存できない）', () => {
+    const open = {
+      phase: 'open' as const,
+      save: null,
+      status: status({ dirty: false }),
+      pendingSteps: false,
+      doc: { order: [], nodes: {}, outputs: [] },
+    };
+    expect(canSaveEditor({ ...open, item: item({ ext: 'png' }) })).toBe(false);
+    // 元の形式に書けない（PSD）なら、変更がなくても書ける形式で保存できる
+    expect(canSaveEditor({ ...open, item: item({ ext: 'psd' }) })).toBe(true);
   });
 });
 
