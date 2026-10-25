@@ -154,6 +154,23 @@ impl Op for SetLoop {
                 params: SetLoopParams { range: None },
                 inputs: vec![sine],
             },
+            // 音声のチャンク（65,536 フレーム。M13）の境を 2 つまたぐ長さ
+            Example {
+                name: "crosses-audio-chunks",
+                params: SetLoopParams {
+                    range: Some(FrameRange {
+                        start: 60_000,
+                        end: 131_000,
+                    }),
+                },
+                inputs: vec![InputGen::Sine {
+                    rate: 8_000,
+                    channels: 2,
+                    frames: 131_109,
+                    freq: 330,
+                    loop_range: None,
+                }],
+            },
         ]
     }
 

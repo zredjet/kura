@@ -310,6 +310,15 @@ impl Analysis for LoudnessAnalysis {
                     at: vec![(0, 0, NonFiniteSample::NegInf)],
                 },
             ),
+            // 音声のチャンク（65,536 フレーム。M13）の境を 2 つまたぐ長さ（区間とトゥルーピークの窓がチャンクの境に掛かる）
+            ex(
+                "crosses-audio-chunks",
+                InputGen::SineLevels {
+                    rate: 8_000,
+                    freq: 1_000,
+                    segments: vec![(65_530, -18), (65_579, -31)],
+                },
+            ),
         ]
     }
 
@@ -362,7 +371,7 @@ mod tests {
     #[test]
     fn examples_have_the_documented_reasons() {
         use Unmeasured::*;
-        let want: [(&str, [Option<Unmeasured>; 6]); 13] = [
+        let want: [(&str, [Option<Unmeasured>; 6]); 14] = [
             ("ebu-3342-1-8k", [None; 6]),
             ("noise-stereo", [None; 6]),
             ("bursts", [None; 6]),
@@ -412,6 +421,7 @@ mod tests {
             ("nan-in-the-partial-segment", [Some(NonFinite); 6]),
             ("inf-at-a-low-rate", [Some(NonFinite); 6]),
             ("neg-inf-too-short", [Some(NonFinite); 6]),
+            ("crosses-audio-chunks", [None; 6]),
         ];
         let examples = LoudnessAnalysis::examples();
         assert_eq!(examples.len(), want.len());

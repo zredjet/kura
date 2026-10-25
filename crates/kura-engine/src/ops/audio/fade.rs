@@ -251,6 +251,21 @@ impl Op for Fade {
                 },
                 inputs: vec![noise(43)],
             },
+            // 音声のチャンク（65,536 フレーム。M13）の境をまたぐフェード（入りと出が重なる）
+            Example {
+                name: "crosses-audio-chunks",
+                params: FadeParams {
+                    fade_in: 70_000,
+                    fade_out: 66_000,
+                    curve: FadeCurve::EqualPower,
+                },
+                inputs: vec![InputGen::AudioNoise {
+                    rate: 8_000,
+                    channels: 1,
+                    frames: 131_109,
+                    seed: 44,
+                }],
+            },
         ]
     }
 

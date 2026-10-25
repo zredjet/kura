@@ -235,6 +235,20 @@ impl Op for Normalize {
                     seed: 62,
                 }],
             },
+            // 音声のチャンク（65,536 フレーム。M13）の境を 2 つまたぐ長さ
+            Example {
+                name: "crosses-audio-chunks",
+                params: NormalizeParams {
+                    target: -20.0,
+                    peak_limit: Some(-1.0),
+                },
+                inputs: vec![InputGen::AudioNoise {
+                    rate: 8_000,
+                    channels: 2,
+                    frames: 131_109,
+                    seed: 63,
+                }],
+            },
         ]
     }
 }

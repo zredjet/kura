@@ -330,6 +330,24 @@ impl Analysis for SilenceAnalysis {
                     ],
                 },
             },
+            // 音声のチャンク（65,536 フレーム。M13）の境を 2 つまたぐ長さ：無音と音の境と、クリップの列（+∞ の 3 標本）が
+            // チャンクの境に掛かる
+            AnalysisExample {
+                name: "crosses-audio-chunks",
+                params: SilenceParams::default(),
+                input: InputGen::NonFinite {
+                    base: Box::new(InputGen::SineLevels {
+                        rate: 8_000,
+                        freq: 1_000,
+                        segments: vec![(65_535, -1_000), (65_538, -20), (36, -1_000)],
+                    }),
+                    at: vec![
+                        (0, 65_535, NonFiniteSample::Inf),
+                        (0, 65_536, NonFiniteSample::Inf),
+                        (0, 65_537, NonFiniteSample::Inf),
+                    ],
+                },
+            },
         ]
     }
 

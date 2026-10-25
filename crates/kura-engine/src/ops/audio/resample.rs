@@ -246,6 +246,17 @@ impl Op for Resample {
                     seed: 72,
                 }],
             },
+            // 音声のチャンク（65,536 フレーム。M13）の境を入力で 2 つ・出力で 2 つまたぐ（窓がチャンクの境に掛かる）
+            Example {
+                name: "crosses-audio-chunks",
+                params: ResampleParams { rate: 12_000 },
+                inputs: vec![InputGen::AudioNoise {
+                    rate: 8_000,
+                    channels: 1,
+                    frames: 131_109,
+                    seed: 73,
+                }],
+            },
         ]
     }
 

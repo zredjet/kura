@@ -237,6 +237,20 @@ impl Op for Trim {
                     seed: 32,
                 }],
             },
+            // 音声のチャンク（65,536 フレーム。M13）の境を 2 つまたぐ長さを、チャンクに揃わない位置から切る
+            Example {
+                name: "crosses-audio-chunks",
+                params: TrimParams {
+                    start: 1_000,
+                    end: Some(131_000),
+                },
+                inputs: vec![InputGen::AudioNoise {
+                    rate: 8_000,
+                    channels: 2,
+                    frames: 131_109,
+                    seed: 33,
+                }],
+            },
         ]
     }
 

@@ -184,6 +184,17 @@ impl Op for Gain {
                     }),
                 }],
             },
+            // 音声のチャンク（65,536 フレーム。M13）の境を 2 つまたぐ長さ
+            Example {
+                name: "crosses-audio-chunks",
+                params: GainParams { db: -4.5 },
+                inputs: vec![InputGen::AudioNoise {
+                    rate: 8_000,
+                    channels: 2,
+                    frames: 131_109,
+                    seed: 13,
+                }],
+            },
         ]
     }
 

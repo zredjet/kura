@@ -637,6 +637,17 @@ impl Analysis for PeaksAnalysis {
                     ],
                 },
             },
+            // 音声のチャンク（65,536 フレーム。M13）の境を 2 つまたぐ長さ（どの段にも半端なビンがあり、最も粗い段は 3 ビン）
+            AnalysisExample {
+                name: "crosses-audio-chunks",
+                params: all,
+                input: InputGen::AudioNoise {
+                    rate: 8_000,
+                    channels: 2,
+                    frames: 131_109,
+                    seed: 95,
+                },
+            },
         ]
     }
 
