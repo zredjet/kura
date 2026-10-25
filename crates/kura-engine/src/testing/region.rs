@@ -1199,20 +1199,39 @@ pub fn random_audio_input(r: &mut ChaCha8Rng) -> InputGen {
     }
 }
 
-/// 音声の操作 1 つ（形 `shape` の入力に当てるもの）：ゲイン・トリム（始まり・終わり）・フェード・モノラル・ループ点・
-/// リサンプル（軽い比）・正規化（目標・上限）。
+/// 長い音声の入力の作り方（流れの窓 `STREAM_CHUNKS` が 2〜3 つになる長さ：16C+1〜34C。8 kHz・1〜2 チャンネル（2 は 4 回に
+/// 1 回）。E37・E39 の網で、窓をまたぐ流れ・流し解きを通す。デバッグのビルドで重くならないよう、低いレートで数を絞って使う）。
+pub fn random_long_audio_input(r: &mut ChaCha8Rng) -> InputGen {
+    let c = crate::value::AUDIO_CHUNK as u64;
+    let w = crate::audio::stream::STREAM_CHUNKS as u64 * c;
+    InputGen::AudioNoise {
+        rate: 8_000,
+        channels: if below(r, 4) == 0 { 2 } else { 1 },
+        frames: w + 1 + below(r, w + 2 * c),
+        seed: r.next_u64(),
+    }
+}
+
+/// 音声の操作 1 つ（形 `shape` の入力に当てるもの）：ゲイン・トリム（始まり・終わり。始まりは 3 回に 1 回チャンクの倍数で、
+/// 核のずらした写しが入力の実体を別の番号の位置で共有する）・フェード・モノラル・ループ点・リサンプル（軽い比）・正規化
+/// （目標・上限）。
 pub fn random_audio_op(r: &mut ChaCha8Rng, shape: &Shape) -> (&'static str, serde_json::Value) {
     let (rate, frames) = match shape {
         Shape::Audio { rate, frames, .. } => (*rate, frames.max()),
         _ => (8_000, 1),
     };
+    let c = crate::value::AUDIO_CHUNK as u64;
     match below(r, 9) {
         0 | 1 => (
             "audio.gain",
             json!({ "db": below(r, 200) as f64 / 10.0 - 10.0 }),
         ),
         2 => {
-            let start = below(r, frames / 2 + 1);
+            let start = if frames > c && below(r, 3) == 0 {
+                below(r, frames / 2 / c + 1) * c
+            } else {
+                below(r, frames / 2 + 1)
+            };
             let end = if below(r, 2) == 0 {
                 serde_json::Value::Null
             } else {
@@ -1257,6 +1276,26 @@ pub fn random_audio_op(r: &mut ChaCha8Rng, shape: &Shape) -> (&'static str, serd
 /// ランダムな音声の鎖：形 `shape` の音声の入力に、compile が通る音声の操作を `len` 個まで線形につなぐ。3 回に 1 回は
 /// 出力に量子化（8・16・24 ビット、TPDF・ディザなし）を付ける。
 pub fn random_audio_chain(engine: &Engine, r: &mut ChaCha8Rng, shape: &Shape, len: usize) -> Graph {
+    audio_chain_of(engine, r, shape, len, &|_| true)
+}
+
+/// [`random_audio_chain`] の、リサンプルを使わない版（長い音声の網。デバッグのビルドで多相 FIR の全体を描くと重いため）。
+pub fn random_long_audio_chain(
+    engine: &Engine,
+    r: &mut ChaCha8Rng,
+    shape: &Shape,
+    len: usize,
+) -> Graph {
+    audio_chain_of(engine, r, shape, len, &|op| op != "audio.resample")
+}
+
+fn audio_chain_of(
+    engine: &Engine,
+    r: &mut ChaCha8Rng,
+    shape: &Shape,
+    len: usize,
+    allow: &dyn Fn(&str) -> bool,
+) -> Graph {
     let mut g = Graph::new_single();
     let shapes = BTreeMap::from([(InputId(0), *shape)]);
     for _ in 0..len {
@@ -1267,6 +1306,9 @@ pub fn random_audio_chain(engine: &Engine, r: &mut ChaCha8Rng, shape: &Shape, le
                 .and_then(|p| p.output_shapes().first().map(|o| o.1))
                 .unwrap_or(*shape);
             let (op, params) = random_audio_op(r, &now);
+            if !allow(op) {
+                continue;
+            }
             let mut next = g.clone();
             if next.push_linear(op, 1, params, r.next_u64()).is_err() {
                 continue;

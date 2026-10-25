@@ -197,6 +197,196 @@ fn streamed_windows_concatenate_to_render() {
     assert!(checked > 20 && quantized > 3, "{checked} {quantized}");
 }
 
+/// 遅延の値（源の参照のチャンク）にした入力。
+fn lazy(v: &Value) -> Value {
+    let Value::Audio(a) = v else {
+        panic!("音声ではありません")
+    };
+    Value::Audio(std::sync::Arc::new(
+        kura_engine::value::Audio::from_source(
+            std::sync::Arc::new(kura_engine::audio::source::MemorySource::new(a.clone()).unwrap()),
+            a.meta.clone(),
+        )
+        .unwrap(),
+    ))
+}
+
+/// 検証の直し（M13 段 1）：流れの窓（`STREAM_CHUNKS` チャンク）が 2 つ以上になる長さで、窓を連結したもの・流して取った
+/// ダイジェスト・窓の境（16C）をまたぐ区間の範囲の描画が `render` と同じ。量子化（窓ごとの `only`）・リサンプルの窓が流れの
+/// 窓の境をまたぐもの・窓をまたぐ流し解き（normalize の入力が部分の値）・遅延の入力を通す。決まった文書 3 つと、ランダムな
+/// 長い文書（`random_long_audio_input`。デバッグのビルドで重くならないようリサンプルなし・8 kHz）。
+#[test]
+fn long_streams_cross_windows_and_equal_render() {
+    use kura_engine::doc::{Dither, QUANTIZE_VERSION, Quantize};
+    use kura_engine::testing::region::{
+        check_region, random_long_audio_chain, random_long_audio_input,
+    };
+    let engine = engine();
+    let w = 16 * C;
+    let q = |seed| {
+        Some(Quantize {
+            v: QUANTIZE_VERSION,
+            bits: 16,
+            dither: Dither::Tpdf,
+            seed,
+        })
+    };
+    let noise = |channels: u16, frames: u64, seed: u64| {
+        InputGen::AudioNoise {
+            rate: 8_000,
+            channels,
+            frames,
+            seed,
+        }
+        .generate()
+        .unwrap()
+    };
+    // (名前, 入力, 文書, 範囲の描画で流し解きが起きるか)
+    let mut cases: Vec<(String, Value, Graph, bool)> = Vec::new();
+    {
+        // ゲイン → 8k→12k → フェード（出力 27C ほど。リサンプルの窓が流れの窓の境をまたぐ）
+        let mut g = Graph::new_single();
+        g.push_linear("audio.gain", 1, json!({ "db": -3.0 }), 1)
+            .unwrap();
+        g.push_linear("audio.resample", 1, json!({ "rate": 12_000 }), 2)
+            .unwrap();
+        g.push_linear(
+            "audio.fade",
+            1,
+            json!({ "fadeIn": 100, "fadeOut": 2 * C, "curve": "linear" }),
+            3,
+        )
+        .unwrap();
+        g.outputs[0].quantize = q(3);
+        cases.push(("リサンプル".into(), noise(1, 18 * C + 5, 51), g, false));
+        // トリム（揃わない始まり）→ 正規化 → ゲイン（正規化の入力は 3 窓）
+        let mut g = Graph::new_single();
+        g.push_linear("audio.trim", 1, json!({ "start": 777, "end": null }), 1)
+            .unwrap();
+        g.push_linear(
+            "audio.normalize",
+            1,
+            json!({ "target": -20.0, "peakLimit": -1.0 }),
+            2,
+        )
+        .unwrap();
+        g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 3)
+            .unwrap();
+        g.outputs[0].quantize = q(4);
+        cases.push(("正規化".into(), noise(2, 2 * w + 9, 52), g, true));
+        // 正規化 → フェード → 正規化（下流の計測は上流の範囲の描画を窓ごとに流して解く）
+        let mut g = Graph::new_single();
+        g.push_linear(
+            "audio.normalize",
+            1,
+            json!({ "target": -23.0, "peakLimit": null }),
+            1,
+        )
+        .unwrap();
+        g.push_linear(
+            "audio.fade",
+            1,
+            json!({ "fadeIn": 3 * C, "fadeOut": 7, "curve": "equalPower" }),
+            2,
+        )
+        .unwrap();
+        g.push_linear(
+            "audio.normalize",
+            1,
+            json!({ "target": -16.0, "peakLimit": -2.0 }),
+            3,
+        )
+        .unwrap();
+        cases.push(("正規化 2 つ".into(), noise(1, w + 3 * C + 1, 53), g, true));
+    }
+    let mut r = determinism::rng(139);
+    for k in 0..3 {
+        let input = random_long_audio_input(&mut r).generate().unwrap();
+        let len = 1 + below(&mut r, 3) as usize;
+        let g = random_long_audio_chain(&engine, &mut r, &input.shape(), len);
+        cases.push((format!("ランダム {k}"), input, g, false));
+    }
+    let mut multi = 0;
+    for (name, input, g, presolves) in cases {
+        let doc = String::from_utf8_lossy(&g.to_canonical_json().unwrap()).into_owned();
+        let what = format!("{name}\n{doc}");
+        let plan = compile(&engine, &g, &input).unwrap_or_else(|| panic!("{what}"));
+        let source = Digest([9; 32]);
+        let (want, digest) = render(&engine, &plan, &input, source).unwrap();
+        let Value::Audio(wa) = &want else { panic!() };
+        let n = wa.frames() as u64;
+        let planes = wa.read_planes(0, wa.frames()).unwrap();
+        for (resident, cap) in [(true, 0u64), (false, 1 << 30)] {
+            let value = if resident {
+                input.clone()
+            } else {
+                lazy(&input)
+            };
+            let fin =
+                BTreeMap::from([(InputId(0), FingerprintedInput::new(value, source).unwrap())]);
+            let mut sink = Collect::default();
+            let stats = engine
+                .stream_audio(
+                    &plan,
+                    &fin,
+                    &mut NodeCache::new(cap),
+                    OutputId(0),
+                    None,
+                    &mut sink,
+                    &NoMonitor,
+                )
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(stats.windows, n.div_ceil(w), "{what}");
+            assert_eq!(stats.area.fallbacks, 0, "{what}");
+            for (got, want) in sink.planes.iter().zip(&planes) {
+                assert!(
+                    got.len() == want.len()
+                        && got
+                            .iter()
+                            .zip(want.iter())
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{what}：流れが render と違う（常駐 {resident}）"
+                );
+            }
+            multi += usize::from(stats.windows >= 2);
+            if resident {
+                let got = engine
+                    .digest_audio_output(
+                        &plan,
+                        &fin,
+                        &mut NodeCache::new(cap),
+                        OutputId(0),
+                        &NoMonitor,
+                    )
+                    .unwrap();
+                assert_eq!(got, digest, "{what}");
+            }
+            // 窓の境をまたぐ区間と終わり
+            let area = Area::span(w - 3, w + 3).union(&Area::span(n.saturating_sub(2), n));
+            let got = engine
+                .render_area(
+                    &plan,
+                    &fin,
+                    &mut NodeCache::new(cap),
+                    &kura_engine::render::area::AreaRequest {
+                        output: OutputId(0),
+                        area: area.clone(),
+                    },
+                    None,
+                    &NoMonitor,
+                )
+                .unwrap();
+            check_region(&got.value, &want, &area)
+                .unwrap_or_else(|m| panic!("{what}（常駐 {resident}）: {m}"));
+            assert_eq!(got.stats.fallbacks, 0, "{what}");
+            if presolves {
+                assert!(got.stats.presolved >= 1, "{what}: {:?}", got.stats);
+            }
+        }
+    }
+    assert!(multi >= 10, "窓が 2 つ以上の流れ {multi}");
+}
+
 /// E39：流して取ったダイジェストは `render` の出力のダイジェストと同じ（量子化・長い音声のチャンクの境を含む）。
 #[test]
 fn streamed_digest_equals_value_digest() {

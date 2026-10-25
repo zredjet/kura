@@ -167,6 +167,61 @@ fn audio_region_equals_full_on_random_documents() {
     );
 }
 
+/// E37 の網（検証の直し）：流れの窓が 2〜3 つになる長い音声（`random_long_audio_input`。8 kHz・リサンプルなしの鎖）で、
+/// ランダムな区間の範囲の描画の有効なチャンクが `render` と同じ（normalize の入力が部分の値なら、入力のポートを窓をまたいで
+/// 流して解く）。入力は常駐と遅延。
+#[test]
+fn audio_region_equals_full_on_long_random_documents() {
+    use kura_engine::testing::region::{random_long_audio_chain, random_long_audio_input};
+    let engine = engine();
+    let mut r = determinism::rng(137);
+    let (mut checked, mut presolved) = (0, 0u64);
+    for case in 0..6 {
+        let input = random_long_audio_input(&mut r).generate().unwrap();
+        let len = 2 + below(&mut r, 3) as usize;
+        let g = random_long_audio_chain(&engine, &mut r, &input.shape(), len);
+        let Some(plan) = compile(&engine, &g, &input) else {
+            continue;
+        };
+        let source = Digest([case as u8; 32]);
+        let Some((want, warnings)) = render(&engine, &plan, &input, source) else {
+            continue;
+        };
+        let doc = String::from_utf8_lossy(&g.to_canonical_json().unwrap()).into_owned();
+        for round in 0..2 {
+            let value = if round == 0 {
+                input.clone()
+            } else {
+                lazy(&input)
+            };
+            let fin = fingerprinted(&value, source);
+            let mut cache = NodeCache::new([0, 1 << 30][(case + round) % 2]);
+            let area = random_audio_area(&mut r, frames_of(&want));
+            let got = engine
+                .render_area(
+                    &plan,
+                    &fin,
+                    &mut cache,
+                    &AreaRequest {
+                        output: OutputId(0),
+                        area: area.clone(),
+                    },
+                    None,
+                    &NoMonitor,
+                )
+                .unwrap_or_else(|e| panic!("{case}: {e}\n{doc}"));
+            let what = format!("{case}・{round}（{area:?}）\n{doc}");
+            assert_eq!(got.stats.fallbacks, 0, "{what}");
+            check_region(&got.value, &want, &area).unwrap_or_else(|m| panic!("{what}: {m}"));
+            let mut it = warnings.iter();
+            assert!(got.warnings.iter().all(|w| it.any(|x| x == w)), "{what}");
+            presolved += got.stats.presolved;
+            checked += 1;
+        }
+    }
+    assert!(checked >= 10 && presolved > 0, "{checked} {presolved}");
+}
+
 /// 音声を出す操作の例と、チャンクの境をまたぐ追加の場合（トリムのチャンクに揃う始まり・揃わない始まり、リサンプルの窓）。
 fn audio_cases(engine: &Engine) -> Vec<(Arc<dyn DynOp>, String, serde_json::Value, Value)> {
     let mut out = Vec::new();
@@ -846,17 +901,30 @@ struct AudioViewCounts {
     patched: usize,
     reused: u64,
     partial: usize,
+    /// 遅延の入力（源の参照のチャンク）で回した手。
+    lazy: usize,
+    /// 遅延の入力で継ぎはぎした手。
+    lazy_patched: usize,
     kinds: BTreeMap<&'static str, usize>,
 }
 
 /// ランダムな音声の文書とランダムな手の列（引数・フェードの長さ・ループ点・ゲイン・トリムの終わり・正規化の目標・有効の
-/// 切り替え・構造の手・入力だけの変更）で、表示の窓をときどき動かし、キャッシュの上限 0・1 MiB・1 GiB で回す。
+/// 切り替え・構造の手・入力だけの変更）で、表示の窓をときどき動かし、キャッシュの上限 0・1 MiB・1 GiB で回す。入力は 3 回に
+/// 1 回、遅延の値（源の参照のチャンク。継ぎはぎ・refine が源の参照を共有として扱う道）にする（検証の直し）。
 fn audio_view_cases(engine: &Engine, seed: u64, cases: usize) -> AudioViewCounts {
     let mut r = determinism::rng(seed);
     let mut c = AudioViewCounts::default();
     for case in 0..cases {
         let make = random_audio_input(&mut r);
         let mut input = make.generate().unwrap();
+        let lazy_in = case % 3 == 2;
+        let inputs_of = |v: &Value, source: Digest| {
+            if lazy_in {
+                inputs_of(&lazy(v), source)
+            } else {
+                inputs_of(v, source)
+            }
+        };
         let len = 1 + below(&mut r, 5) as usize;
         let mut g = random_audio_chain(engine, &mut r, &input.shape(), len);
         let Some(plan) = compile(engine, &g, &input) else {
@@ -980,6 +1048,7 @@ fn audio_view_cases(engine: &Engine, seed: u64, cases: usize) -> AudioViewCounts
             match got.view.value().origin() {
                 kura_engine::render::cache::Origin::Patched => {
                     c.patched += 1;
+                    c.lazy_patched += usize::from(lazy_in);
                     c.reused += got.area.reused_chunks;
                     assert!(got.view.value().exact().is_none());
                 }
@@ -987,6 +1056,7 @@ fn audio_view_cases(engine: &Engine, seed: u64, cases: usize) -> AudioViewCounts
                 _ => {}
             }
             c.steps += 1;
+            c.lazy += usize::from(lazy_in);
             *c.kinds.entry(kind).or_default() += 1;
             (g, want, prev, input) = (next, next_want, got.view, next_input);
         }
@@ -999,7 +1069,12 @@ fn audio_view_cases(engine: &Engine, seed: u64, cases: usize) -> AudioViewCounts
 fn audio_view_equals_render_on_random_edit_sequences() {
     let c = audio_view_cases(&engine(), 38, 40);
     assert!(
-        c.steps > 120 && c.patched > 20 && c.reused > 20 && c.partial > 10,
+        c.steps > 120
+            && c.patched > 20
+            && c.reused > 20
+            && c.partial > 10
+            && c.lazy > 30
+            && c.lazy_patched > 5,
         "{c:?}"
     );
     for kind in [
