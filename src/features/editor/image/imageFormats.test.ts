@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { effectiveFormat, exportName, formatOfExt, savedExt, splitName } from './formats';
+import { splitName } from '../formats';
+import { effectiveFormat, exportName, formatOfExt, savedExt } from './imageFormats';
 
 describe('書き出しの名前（Rust の export_name と同じ規則）', () => {
   it('形式が同じなら元の名前のまま（jpg と jpeg は同じ）', () => {

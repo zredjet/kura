@@ -16,7 +16,7 @@ import { openMenuBelow } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { formatCount } from '../../lib/format';
 import { ItemInspector } from '../library/inspector/ItemInspector';
-import { formatOfExt } from './formats';
+import { formatOfExt } from './image/imageFormats';
 import styles from './Editor.module.css';
 import { EditorCanvas } from './image/EditorCanvas';
 import { useEditorKeys } from './editorKeys';

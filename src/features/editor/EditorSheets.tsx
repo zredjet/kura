@@ -22,7 +22,8 @@ import {
 } from './editorSave';
 import { type EditorSheet, hasUnsavedChanges, useEditorStore } from './editorStore';
 import styles from './Editor.module.css';
-import { effectiveFormat, outputChoice, savedExt } from './formats';
+import { outputChoice } from './formats';
+import { effectiveFormat, savedExt } from './image/imageFormats';
 import { opName } from './opsCatalog';
 import { issueText } from './ParamFields';
 

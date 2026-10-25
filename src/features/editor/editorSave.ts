@@ -57,7 +57,8 @@ import {
   useEditorStore,
   whenEditorSettled,
 } from './editorStore';
-import { effectiveFormat, formatOfExt, outputChoice } from './formats';
+import { outputChoice } from './formats';
+import { effectiveFormat, formatOfExt } from './image/imageFormats';
 
 const t = ja.editor;
 

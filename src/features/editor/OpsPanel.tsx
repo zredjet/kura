@@ -20,16 +20,16 @@ import {
   setOutputFormat,
   useEditorStore,
 } from './editorStore';
+import { outputChoice } from './formats';
 import {
   canWrite,
   effectiveFormat,
   exportName,
   FALLBACK_FORMAT,
   formatOfExt,
-  outputChoice,
   savedExt,
   WRITABLE_IMAGE_FORMATS,
-} from './formats';
+} from './image/imageFormats';
 import {
   addableOps,
   hasLaterPaint,

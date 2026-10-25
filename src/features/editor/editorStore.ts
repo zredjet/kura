@@ -62,7 +62,8 @@ import {
   sameChoice,
 } from './paramSend';
 import { drawScene } from './image/drawScene';
-import { effectiveFormat, formatOfExt, outputChoice } from './formats';
+import { outputChoice } from './formats';
+import { effectiveFormat, formatOfExt } from './image/imageFormats';
 import { type QueuedStep, RequestQueue, type SentRequest } from './requestQueue';
 import { fillAction, type PendingStroke, type StrokeSpec } from './image/stroke';
 import { type EditorTool, useToolStore } from './image/toolStore';
