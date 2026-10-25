@@ -34,8 +34,9 @@ import {
   submitSaveAs,
   watchWindowClose,
 } from './editorSave';
+import { openEditor } from './editorKinds';
 import { EditorSheets } from './EditorSheets';
-import { closeEditor, openEditor, pushEditorSteps, useEditorStore } from './editorStore';
+import { closeEditor, pushEditorSteps, useEditorStore } from './editorStore';
 import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
 
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({

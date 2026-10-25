@@ -78,15 +78,15 @@ const sources = Object.entries(
 ).filter(([path]) => !/\.test\.tsx?$/.test(path));
 
 describe('タイルの自己点検は通常のビルドに入らない', () => {
-  it('読み込むのは editorStore.ts の VITE_KURA_CHECK の枝の動的な import だけ', () => {
+  it('読み込むのは image/imageStore.ts の VITE_KURA_CHECK の枝の動的な import だけ', () => {
     const users = sources
       .filter(([, text]) => /(?:from|import\()\s*'[^']*dev\/tileCheck'/.test(text))
       .map(([path]) => path);
-    expect(users).toEqual(['/src/features/editor/editorStore.ts']);
+    expect(users).toEqual(['/src/features/editor/image/imageStore.ts']);
     const text =
-      sources.find(([path]) => path === '/src/features/editor/editorStore.ts')?.[1] ?? '';
+      sources.find(([path]) => path === '/src/features/editor/image/imageStore.ts')?.[1] ?? '';
     expect(text).toMatch(
-      /if \(import\.meta\.env\.VITE_KURA_CHECK === '1'\) \{\s*void import\('\.\.\/\.\.\/dev\/tileCheck'\)/,
+      /if \(import\.meta\.env\.VITE_KURA_CHECK === '1'\) \{\s*void import\('\.\.\/\.\.\/\.\.\/dev\/tileCheck'\)/,
     );
     expect(text).not.toMatch(/^import .*dev\/tileCheck/m);
   });

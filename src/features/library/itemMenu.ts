@@ -3,7 +3,7 @@ import { ja } from '../../i18n/ja';
 import { isUnitEntry, unitIdOf } from '../../ipc/items';
 import { getCached, getCachedUnit } from '../../stores/itemCache';
 import { useViewStore } from '../../stores/viewStore';
-import { canEdit, openEditor } from '../editor/editorStore';
+import { canEdit, openEditor } from '../editor/editorKinds';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
 import { exportEntries } from './exportActions';

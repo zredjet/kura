@@ -93,7 +93,7 @@ describe('表示の条件', () => {
 
 describe('足す操作', () => {
   it('分類ごとに並べ、音声の操作は出さない', () => {
-    const groups = addableOps();
+    const groups = addableOps('image');
     const ids = groups.flatMap((g) => g.ops.map((o) => o.id));
     expect(ids).toContain('image.crop');
     expect(ids).toContain('sprite.split_grid');

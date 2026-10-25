@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { type ReactNode, useEffect, useId, useRef, useState } from 'react';
 
 import { ChevronDownIcon } from '../../components/icons/ChevronDownIcon';
 import { ChevronUpIcon } from '../../components/icons/ChevronUpIcon';
@@ -21,15 +21,7 @@ import {
   useEditorStore,
 } from './editorStore';
 import { outputChoice } from './formats';
-import {
-  canWrite,
-  effectiveFormat,
-  exportName,
-  FALLBACK_FORMAT,
-  formatOfExt,
-  savedExt,
-  WRITABLE_IMAGE_FORMATS,
-} from './image/imageFormats';
+import { formatsFor } from './kindTraits';
 import {
   addableOps,
   hasLaterPaint,
@@ -134,11 +126,12 @@ function OpStack() {
   );
 }
 
-/** 点線の「操作を追加」（分類ごとに横へ開くメニュー）。描画は描く道具で足すので出さない。 */
+/** 点線の「操作を追加」（開いている種類で足せる操作を分類ごとに横へ開くメニュー）。描画は描く道具で足すので出さない。 */
 function AddOpButton() {
   const open = useEditorStore((s) => s.phase === 'open');
+  const kind = useEditorStore((s) => s.kind);
   const entries = (): MenuEntry[] =>
-    addableOps()
+    (kind ? addableOps(kind) : [])
       .map((g) => ({
         label: t.opCategories[g.category],
         submenu: g.ops
@@ -160,19 +153,23 @@ function AddOpButton() {
   );
 }
 
-/** 選んだ操作の引数パネル（`ParamSchema` から組む。表示の条件・「詳細」・指摘・後ろの描画の知らせ）。 */
-function ParamsPanel() {
+/** 引数の欄の既定値に使う大きさ（画像は今の出力の大きさ）。 */
+type ParamSize = { w: number; h: number } | null;
+
+/**
+ * 選んだ操作の引数パネル（`ParamSchema` から組む。表示の条件・「詳細」・指摘・後ろの描画の知らせ）。`size` は欄の既定値
+ * （矩形・点・大きさを「指定する」にしたとき・長さを px にしたとき）に使う。
+ */
+function ParamsPanel({ size }: { size: ParamSize }) {
   const selected = useEditorStore((s) => s.selected);
   const node = useEditorStore((s) => (s.selected === null ? undefined : s.doc.nodes[s.selected]));
   const doc = useEditorStore((s) => s.doc);
   const issues = useEditorStore((s) => s.issues);
   const warnings = useEditorStore((s) => s.warnings);
-  const view = useEditorStore((s) => s.view);
   const headingId = useId();
   if (selected === null || !node) return <p className={styles.opsHint}>{t.opsHint}</p>;
   const desc = opSpec(node.op, node.v);
   const latest = opSpec(node.op);
-  const size = view ? { w: view.fullWidth, h: view.fullHeight } : null;
   const params = paramsOf(node);
   const all = [...issues, ...warnings];
   let body;
@@ -252,8 +249,11 @@ function Warnings() {
   );
 }
 
-/** 出力の形式（形式が変わると「書き出すときの名前：hero.webp」）。 */
-function OutputRow() {
+/**
+ * 出力の形式（アイテムの種類の形式の表から組む。形式が変わると「書き出すときの名前：hero.webp」）。種類ごとに別の行に
+ * するときは `OpsPanel` の `output` で差し替える。
+ */
+export function FormatOutputRow() {
   const outputs = useEditorStore((s) => s.doc.outputs);
   const item = useEditorStore((s) => s.item);
   const open = useEditorStore((s) => s.phase === 'open');
@@ -273,19 +273,22 @@ function OutputRow() {
       alive = false;
     };
   }, [itemId]);
-  if (!item) return null;
+  const formats = formatsFor(item);
+  if (!item || !formats) return null;
   const choice = outputChoice(outputs);
   // 元のファイルの形式（source.format は画素の形式で、ファイルの形式ではない）
-  const sourceFormat = formatOfExt(item.ext);
-  const eff = effectiveFormat(choice, sourceFormat);
-  const keepable = canWrite(sourceFormat);
+  const sourceFormat = formats.formatOfExt(item.ext);
+  const eff = formats.effectiveFormat(choice, sourceFormat);
+  const keepable = formats.canWrite(sourceFormat);
   const options = [
     ...(keepable ? [{ value: 'keep', label: t.outputKeep(formatName(sourceFormat)) }] : []),
-    ...WRITABLE_IMAGE_FORMATS.map((f) => ({ value: f, label: formatName(f) })),
+    ...formats.writable.map((f) => ({ value: f, label: formatName(f) })),
   ];
-  const value = choice.type === 'to' ? choice.format : keepable ? 'keep' : FALLBACK_FORMAT;
+  const value = choice.type === 'to' ? choice.format : keepable ? 'keep' : formats.fallback;
   const original = originalName?.id === item.id ? originalName.name : null;
-  const name = original ? exportName(original, savedExt(eff.format, item.ext)) : null;
+  const name = original
+    ? formats.exportName(original, formats.savedExt(eff.format, item.ext))
+    : null;
   return (
     <section className={styles.output} aria-labelledby={id}>
       <div className={styles.paramRow}>
@@ -312,8 +315,11 @@ function OutputRow() {
   );
 }
 
-/** 右パネルの「操作」：操作の並び・「操作を追加」・選んだ操作の引数・警告・出力の形式。 */
-export function OpsPanel() {
+/**
+ * 右パネルの「操作」：操作の並び・「操作を追加」・選んだ操作の引数・警告・出力の形式（種類ごとの部品 `EditorKindUi.Ops`
+ * から使う）。`size` は引数の欄の既定値に使う大きさ、`output` は出力の行の差し替え（省けば `FormatOutputRow`）。
+ */
+export function OpsPanel({ size = null, output }: { size?: ParamSize; output?: ReactNode }) {
   return (
     <div className={styles.ops}>
       <h2 className={styles.panelTitle}>{t.opsTitle}</h2>
@@ -322,10 +328,10 @@ export function OpsPanel() {
         <AddOpButton />
       </div>
       <div className={styles.paramsScroll}>
-        <ParamsPanel />
+        <ParamsPanel size={size} />
         <Warnings />
       </div>
-      <OutputRow />
+      {output ?? <FormatOutputRow />}
     </div>
   );
 }

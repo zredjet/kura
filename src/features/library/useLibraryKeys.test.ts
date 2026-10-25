@@ -9,11 +9,11 @@ import { setVerticalNavigator } from './navigation';
 import { EMPTY_SELECTION, selectOne } from './selection';
 import { handleLibraryKey } from './useLibraryKeys';
 import { toggleAuditionKey } from '../asset/auditionStore';
-import { openEditor } from '../editor/editorStore';
+import { openEditor } from '../editor/editorKinds';
 
 vi.mock('../asset/auditionStore', () => ({ toggleAuditionKey: vi.fn(() => true) }));
-vi.mock('../editor/editorStore', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../editor/editorStore')>()),
+vi.mock('../editor/editorKinds', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../editor/editorKinds')>()),
   openEditor: vi.fn(async () => undefined),
 }));
 vi.mock('../../stores/itemCache', async (importOriginal) => ({

@@ -54,6 +54,7 @@ const OUTPUT_KEEP = [
 function setDoc(nodes: EditNodeDto[], selected: number | null = null, outputs = OUTPUT_KEEP) {
   useEditorStore.setState({
     phase: 'open',
+    kind: 'image',
     item: { id: 7, title: 'hero', ext: 'png', kind: 'image' } as ItemSummaryDto,
     source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png' },
     status: {
@@ -65,15 +66,6 @@ function setDoc(nodes: EditNodeDto[], selected: number | null = null, outputs = 
       dirty: true,
       saving: null,
       needsReopen: false,
-    },
-    view: {
-      rev: 2,
-      level: 0,
-      fullWidth: 64,
-      fullHeight: 32,
-      frames: [],
-      format: 'rgba8',
-      fallback: null,
     },
     doc: {
       order: nodes.map((n) => n.id),

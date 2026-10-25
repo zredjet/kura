@@ -11,15 +11,15 @@ import { formatCount } from '../../../lib/format';
 import { toHex } from './color';
 import { ColorPicker, Swatch } from './ColorPicker';
 import styles from '../Editor.module.css';
+import { NumberInput } from '../ParamFields';
 import {
   cancelCrop,
   confirmCrop,
   setCropRect,
   setEditorFrame,
   stepEditorFrame,
-  useEditorStore,
-} from '../editorStore';
-import { NumberInput } from '../ParamFields';
+  useImageStore,
+} from './imageStore';
 import { BRUSH_MAX, BRUSH_MIN, useToolStore } from './toolStore';
 
 const t = ja.editor;
@@ -154,8 +154,8 @@ function BrushGroup() {
 
 /** アニメの画像のコマ（「3 / 8」と ← →）。 */
 function FrameGroup() {
-  const frame = useEditorStore((s) => s.frame);
-  const count = useEditorStore((s) => s.view?.frames.length ?? 1);
+  const frame = useImageStore((s) => s.frame);
+  const count = useImageStore((s) => s.view?.frames.length ?? 1);
   if (count <= 1) return null;
   return (
     <div className={styles.frames} role="group" aria-label={t.frames}>
@@ -186,7 +186,7 @@ function FrameGroup() {
 
 /** 切り抜き：枠の X・Y・幅・高さと「やめる」「切り抜く」。 */
 function CropGroup() {
-  const crop = useEditorStore((s) => s.crop);
+  const crop = useImageStore((s) => s.crop);
   if (!crop) return null;
   const b = crop.bounds;
   const r = crop.rect;
@@ -237,7 +237,7 @@ export function ToolSettings() {
   const tolerance = useToolStore((s) => s.tolerance);
   const connectivity = useToolStore((s) => s.connectivity);
   const contiguous = useToolStore((s) => s.contiguous);
-  const indexed = useEditorStore((s) => s.view?.format === 'indexed8');
+  const indexed = useImageStore((s) => s.view?.format === 'indexed8');
   const tools = useToolStore.getState();
 
   return (

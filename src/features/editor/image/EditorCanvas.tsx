@@ -3,8 +3,9 @@ import { type PointerEvent, useEffect, useLayoutEffect, useRef, useState } from 
 import { MediaImage } from '../../../components/MediaImage/MediaImage';
 import { ja } from '../../../i18n/ja';
 import type { Point } from '../../../lib/paint';
-import { CropOverlay } from './CropOverlay';
 import styles from '../Editor.module.css';
+import { useEditorStore } from '../editorStore';
+import { CropOverlay } from './CropOverlay';
 import {
   editorController,
   fillAt,
@@ -14,8 +15,8 @@ import {
   strokeEnd,
   strokeMove,
   strokeStart,
-  useEditorStore,
-} from '../editorStore';
+  useImageStore,
+} from './imageStore';
 import { type EditorTool, useToolStore } from './toolStore';
 import { type Insets, wheelPixels, wheelZoomFactor } from './viewMath';
 
@@ -58,7 +59,7 @@ interface GestureLike extends Event {
 
 /** 今の道具（押している間だけの道具を優先。⌥ を押していればペン・消しゴム・塗りつぶしはスポイト）。 */
 function effectiveTool(altKey: boolean): EditorTool {
-  const temporary = useEditorStore.getState().temporary;
+  const temporary = useImageStore.getState().temporary;
   if (temporary) return temporary;
   const tool = useToolStore.getState().tool;
   if (altKey && (tool === 'pen' || tool === 'eraser' || tool === 'fill')) return 'eyedropper';
@@ -76,10 +77,10 @@ export function EditorCanvas() {
   const checkerRef = useRef<HTMLDivElement>(null);
   const openId = useEditorStore((s) => s.openId);
   const item = useEditorStore((s) => s.item);
-  const ready = useEditorStore((s) => s.ready);
-  const imageRect = useEditorStore((s) => s.imageRect);
-  const temporary = useEditorStore((s) => s.temporary);
-  const drawing = useEditorStore((s) => s.drawing);
+  const ready = useImageStore((s) => s.ready);
+  const imageRect = useImageStore((s) => s.imageRect);
+  const temporary = useImageStore((s) => s.temporary);
+  const drawing = useImageStore((s) => s.drawing);
   const phase = useEditorStore((s) => s.phase);
   const tool = useToolStore((s) => s.tool);
   const pan = useRef<{ x: number; y: number; id: number } | null>(null);

@@ -15,7 +15,8 @@ import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemC
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
 import { FontSpecimen, QuickLookAnim, useFontFace } from '../asset/AssetStage';
-import { canEdit, openEditor, useEditorStore } from '../editor/editorStore';
+import { canEdit, openEditor } from '../editor/editorKinds';
+import { useEditorStore } from '../editor/editorStore';
 import { useAssetData } from '../asset/useAssetData';
 import { loopOf } from '../asset/useLoopRange';
 import { WaveformView } from '../asset/WaveformView';

@@ -23,7 +23,7 @@ import {
 import { type EditorSheet, hasUnsavedChanges, useEditorStore } from './editorStore';
 import styles from './Editor.module.css';
 import { outputChoice } from './formats';
-import { effectiveFormat, savedExt } from './image/imageFormats';
+import { formatsFor } from './kindTraits';
 import { opName } from './opsCatalog';
 import { issueText } from './ParamFields';
 
@@ -147,8 +147,9 @@ function SaveAsSheet() {
     inputRef.current?.focus();
     inputRef.current?.select();
   }, []);
-  const eff = effectiveFormat(outputChoice(outputs), source?.format ?? null);
-  const ext = savedExt(eff.format, item?.ext ?? '');
+  const formats = formatsFor(item);
+  const eff = formats?.effectiveFormat(outputChoice(outputs), source?.format ?? null) ?? null;
+  const ext = eff && formats ? formats.savedExt(eff.format, item?.ext ?? '') : (item?.ext ?? '');
   const trimmed = name.trim();
   const valid = validSaveAsName(trimmed);
   const submit = () => {

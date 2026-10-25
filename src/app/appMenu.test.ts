@@ -138,7 +138,7 @@ describe('appMenuItems', () => {
 
   it('表示メニューは、エディタの間は ⌘0・⌘1・⌘+・⌘− と情報（M12）', () => {
     const run = vi.fn();
-    const items = editorViewItemOptions(run) as Item[];
+    const items = editorViewItemOptions(run, 'image') as Item[];
     const keyed = items.filter((i): i is MenuItemOptions => 'accelerator' in i);
     expect(keyed.map((i) => [i.text, i.accelerator])).toEqual([
       [ja.appMenu.editorFit, 'CmdOrCtrl+0'],

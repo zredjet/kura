@@ -13,6 +13,7 @@ import {
 } from '@tauri-apps/api/menu';
 
 import { canSaveEditor, useEditorStore } from '../features/editor/editorStore';
+import { EDITOR_KINDS, type EditorKind } from '../features/editor/kindTraits';
 import {
   applyPixelArtToSelection,
   PIXEL_ART_CHOICES,
@@ -222,25 +223,34 @@ export function libraryViewItems(run: RunMenuAction, view: ViewItems): MenuItems
   ];
 }
 
+/** エディタの表示メニューの中身。 */
+type EditorViewItems = (MenuItemOptions | PredefinedMenuItemOptions)[];
+
 /**
- * 表示メニューの中身（画像エディタを開いている間。M12）：⌘0 全体を表示・⌘1 実際のサイズ（100%）・⌘+ 拡大・⌘− 縮小・
- * ⌘I 情報。ライブラリの表示形式（⌘1〜⌘3）・サムネイルの大きさ（⌘+・⌘−）と重なるので、開いている間は差し替える。
- * どれもそのキーを押したことにする（エディタのキーの処理が受ける）。
+ * 表示メニューの中身（エディタを開いている間。種類ごと。M12・M13）。どれもそのキーを押したことにする（エディタのキーの
+ * 処理が受ける）。ライブラリの表示形式（⌘1〜⌘3）・サムネイルの大きさ（⌘+・⌘−）と重なるので、開いている間は差し替える。
+ *
+ * - 画像：⌘0 全体を表示・⌘1 実際のサイズ（100%）・⌘+ 拡大・⌘− 縮小・⌘I 情報。
  */
-export function editorViewItemOptions(
-  run: RunMenuAction,
-): (MenuItemOptions | PredefinedMenuItemOptions)[] {
-  const t = ja.appMenu;
-  return [
-    keyItem(run, t.editorFit, { key: '0', code: 'Digit0', ...META }),
-    keyItem(run, t.editorActualSize, { key: '1', code: 'Digit1', ...META }),
-    keyItem(run, t.editorZoomIn, { key: '=', code: 'Equal', ...META }),
-    keyItem(run, t.editorZoomOut, { key: '-', code: 'Minus', ...META }),
-    { item: 'Separator' },
-    keyItem(run, t.editorInfo, { key: 'i', code: 'KeyI', ...META }),
-    { item: 'Separator' },
-    { item: 'Fullscreen', text: t.fullscreen },
-  ];
+const EDITOR_VIEW_ITEMS: Readonly<Record<EditorKind, (run: RunMenuAction) => EditorViewItems>> = {
+  image: (run) => {
+    const t = ja.appMenu;
+    return [
+      keyItem(run, t.editorFit, { key: '0', code: 'Digit0', ...META }),
+      keyItem(run, t.editorActualSize, { key: '1', code: 'Digit1', ...META }),
+      keyItem(run, t.editorZoomIn, { key: '=', code: 'Equal', ...META }),
+      keyItem(run, t.editorZoomOut, { key: '-', code: 'Minus', ...META }),
+      { item: 'Separator' },
+      keyItem(run, t.editorInfo, { key: 'i', code: 'KeyI', ...META }),
+      { item: 'Separator' },
+      { item: 'Fullscreen', text: t.fullscreen },
+    ];
+  },
+};
+
+/** 表示メニューの中身（その種類のエディタを開いている間）。 */
+export function editorViewItemOptions(run: RunMenuAction, kind: EditorKind): EditorViewItems {
+  return EDITOR_VIEW_ITEMS[kind](run);
 }
 
 /**
@@ -631,7 +641,10 @@ export async function installAppMenu(): Promise<void> {
       saveAs: await MenuItem.new(saveOptions.saveAs),
     };
     const libraryView = await toMenuObjects(libraryViewItems(run, view));
-    const editorView = await toMenuObjects(editorViewItemOptions(run));
+    const editorViews = new Map<EditorKind, MenuObject[]>();
+    for (const kind of EDITOR_KINDS) {
+      editorViews.set(kind, await toMenuObjects(editorViewItemOptions(run, kind)));
+    }
     const viewMenu = await Submenu.new({ text: ja.appMenu.view, items: libraryView });
     const menu = await Menu.new({
       items: appMenuItems(run, view, pixelArt, history, viewMenu, save),
@@ -639,28 +652,31 @@ export async function installAppMenu(): Promise<void> {
     await menu.setAsAppMenu();
     const syncHistory = historySyncer(history);
     syncHistory();
-    // 画像エディタを開いている間は表示メニューを差し替える（順に。開く・閉じるが続いても最後の状態になる）
-    let editorShown = false;
+    // エディタを開いている間は表示メニューをその種類のものに差し替える（順に。開く・閉じるが続いても最後の状態になる）
+    let shownKind: EditorKind | null = null;
     let swapping = Promise.resolve();
-    const swapView = (editor: boolean) => {
-      if (editor === editorShown) {
+    const swapView = (kind: EditorKind | null) => {
+      if (kind === shownKind) {
         return;
       }
-      editorShown = editor;
+      shownKind = kind;
       swapping = swapping
         .then(async () => {
           for (const item of await viewMenu.items()) {
             await viewMenu.remove(item);
           }
-          await viewMenu.append(editor ? editorView : libraryView);
+          await viewMenu.append((kind && editorViews.get(kind)) || libraryView);
         })
         .catch((error: unknown) => console.warn('表示のメニューを替えられませんでした', error));
     };
+    /** 表示メニューに出す種類（閉じていればライブラリ）。 */
+    const viewKind = (s: { phase: string; kind: EditorKind | null }) =>
+      s.phase === 'closed' ? null : s.kind;
     // 「保存」は保存できるとき（保存していない変更がある・元の形式に書けない）だけ、「別名で保存…」は開いている間
     let canSave = false;
     useEditorStore.subscribe((now, before) => {
-      if ((now.phase === 'closed') !== (before.phase === 'closed')) {
-        swapView(now.phase !== 'closed');
+      if (viewKind(now) !== viewKind(before)) {
+        swapView(viewKind(now));
       }
       if ((now.phase === 'open') !== (before.phase === 'open')) {
         void save.saveAs.setEnabled(now.phase === 'open');

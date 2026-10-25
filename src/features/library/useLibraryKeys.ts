@@ -10,7 +10,7 @@ import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { LAYOUT_MODES, useViewStore } from '../../stores/viewStore';
 import { toggleAuditionKey } from '../asset/auditionStore';
-import { canEdit, openEditor } from '../editor/editorStore';
+import { canEdit, openEditor } from '../editor/editorKinds';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
 import {

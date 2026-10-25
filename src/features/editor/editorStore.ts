@@ -1,32 +1,29 @@
 /**
- * 画像エディタの状態と操作（M12 の段 5。docs/editing.md §12.8・§12.12、design.md §3.1「画像エディタ」）。
+ * エディタの核の状態と操作（M12 の段 5。M13 の段 6a で画像の部分を `image/imageStore.ts` へ分けた。docs/editing.md
+ * §12.8・§12.12、design.md §3.1「画像エディタ」）。
  *
- * - 画面に出すもの（セッション・状態・文書の要約・表示の段と大きさ・失敗・右パネル・倍率の表示）は Zustand に置く。
- * - キャンバス（タイル・ズーム・パン・仮の筆）は React の外の `CanvasController`、要求は `RequestQueue`（1 つだけ出す）。
- *   開くたびに作り、閉じたら捨てる（ImageBitmap は close）。
- * - 開く（`openEditor`）：画像 1 件だけ。前のエディタは閉じる。下書きがあれば下書きのシート（段 5b）。閉じる（`closeEditor`）：
- *   必ず `edit_close` を呼ぶ。未保存で閉じるときのシート・保存の流れは `editorSave.ts`。ライブラリを切り替える・閉じるときも
- *   閉じる（App）。
+ * - 核が持つのは種類によらないもの：セッション・文書・状態・保存・シート・選んだ操作・指摘・結果が確定した手の番号
+ *   （`acked`）・応えの来ていない手（`pendingSteps`）・種類（`kind`）。表示（タイル・波形・ズーム・道具）は種類ごとの
+ *   `EditorAdapter` が持ち、核はその口だけを呼ぶ。画面に出すものは Zustand に置き、要求は `RequestQueue`（1 つだけ出す）。
+ *   開くたびにアダプタを作り、閉じたら捨てる（`dispose`）。
+ * - 開く（`openEditorAs`）：前のエディタは閉じる。下書きがあれば下書きのシート（段 5b）。種類からアダプタを選ぶ口は
+ *   `editorKinds.ts` の `openEditor`。閉じる（`closeEditor`）：必ず `edit_close` を呼ぶ。未保存で閉じるときのシート・保存の
+ *   流れは `editorSave.ts`。ライブラリを切り替える・閉じるときも閉じる（App）。
  * - 右パネル（段 5b）：選んだ操作・操作の並びの手（有効・並べ替え・消す・足す）・引数の手（送り方は `paramSend.ts`）・
  *   出力の形式。引数の欄は、送った手の番号（`sendParam` の戻り値）と、結果が確定した番号（`acked`）を比べて手元の値を
- *   やめる。切り抜きの枠（C）：その操作の入力を表示して（操作を仮に無効にする preview）枠を重ね、↵ で確定する。後ろに
- *   有効な幾何の操作（大きさ・向き・並びを変える）があれば、仮に無効にしても入力にならないので、枠は出さずに引数パネルで
- *   直す。
+ *   やめる。
  * - 応えの来ていない文書の手（送った・ためた手）があれば `pendingSteps`（未保存に数える。閉じる・保存する前に待つ）。
- * - 描画の道具：筆は描いている間フロントで仮に重ね、離したら `paint{actions:[筆]}`（描く先は Rust が決める）。
- *   塗りつぶしは仮描きせずに送る。スポイトはクリックのときだけ `edit_sample`。
  */
 
 import { create } from 'zustand';
 
-import { ja } from '../../i18n/ja';
 import {
   closeEdit,
   discardEditDraft,
   type EditDocDeltaDto,
   type EditDraftDto,
-  type EditFrameDto,
   type EditNodeDto,
+  type EditOpenedDto,
   type EditProblemDto,
   type EditSourceDto,
   type EditStatusDto,
@@ -36,23 +33,21 @@ import {
   type EditViewportDto,
   type FormatChoice,
   type Issue,
+  type OpDescriptor,
   openEdit,
   type OutputSpec,
-  sampleEdit,
   stepEdit,
   viewEdit,
 } from '../../ipc/edit';
 import type { ItemSummaryDto } from '../../ipc/items';
 import type { JobProgress } from '../../ipc/jobs';
-import { IpcError, isIpcError } from '../../ipc/result';
-import type { Point } from '../../lib/paint';
+import { IpcError } from '../../ipc/result';
 import { notify } from '../../stores/noticeStore';
-import { CanvasController, type ControllerInfo } from './image/canvasController';
-import { type Bounds, clampCrop, isFullCrop, nudgeCrop, readRect, sameRect } from './image/crop';
-import { defaultParams, hasLaterGeometry, opSpec, paramsOf } from './opsCatalog';
+import { outputChoice } from './formats';
+import { type EditorKind, formatsFor } from './kindTraits';
+import { defaultParams, opSpec, type ParamValues } from './opsCatalog';
 import {
   addSteps,
-  commitStep,
   enableSteps,
   moveSteps,
   outputSteps,
@@ -61,15 +56,7 @@ import {
   removeSteps,
   sameChoice,
 } from './paramSend';
-import { drawScene } from './image/drawScene';
-import { outputChoice } from './formats';
-import { effectiveFormat, formatOfExt } from './image/imageFormats';
 import { type QueuedStep, RequestQueue, type SentRequest } from './requestQueue';
-import { fillAction, type PendingStroke, type StrokeSpec } from './image/stroke';
-import { type EditorTool, useToolStore } from './image/toolStore';
-import { fitZoom, formatCanBeTransparent, type Rect } from './image/viewMath';
-
-const t = ja.editor;
 
 export type EditorPhase = 'closed' | 'opening' | 'open' | 'error';
 export type EditorPanel = 'ops' | 'info';
@@ -123,32 +110,6 @@ export interface EditorSave {
   before: SizeBefore | null;
 }
 
-/** 切り抜きの枠（C）。 */
-export interface EditorCrop {
-  /** 直す切り抜きのノード（null は末尾に足す）。 */
-  node: number | null;
-  rect: Rect;
-  /** 切り抜く前の画像の大きさ（その操作の入力を表示し終えるまで null）。 */
-  bounds: Bounds | null;
-  /** 切り抜きを始める前の文書の出力の大きさ（枠を出している間に足す操作の既定値に使う）。 */
-  output: Bounds | null;
-  /** その操作を仮に無効にして入力を表示している（やめる・確定するときに仮の値を捨てる）。 */
-  previewed: boolean;
-  /** 切り抜きを終えたら戻す道具。 */
-  returnTool: EditorTool;
-}
-
-/** 表示の要約（段・大きさ・フレーム・画素の形式）。 */
-export interface EditorView {
-  rev: number;
-  level: number;
-  fullWidth: number;
-  fullHeight: number;
-  frames: EditFrameDto[];
-  format: string | null;
-  fallback: string | null;
-}
-
 /** 失敗（開けなかった・表示できなかった・要求が通らなかった）。 */
 export interface EditorFailure {
   kind: 'open' | 'view' | 'request';
@@ -158,37 +119,25 @@ export interface EditorFailure {
 
 export interface EditorState {
   phase: EditorPhase;
-  /** 開くたびに増える（キャンバスをつなぎ直す）。 */
+  /** 開くたびに増える（表示の面をつなぎ直す）。 */
   openId: number;
+  /** 開いているエディタの種類（アダプタ・画面の部品・キー・表示メニューを選ぶ）。閉じていれば null。 */
+  kind: EditorKind | null;
   item: ItemSummaryDto | null;
   session: string | null;
   source: EditSourceDto | null;
-  pixelArt: boolean;
   status: EditStatusDto | null;
   doc: EditorDoc;
-  view: EditorView | null;
-  frame: number;
   failure: EditorFailure | null;
   draft: EditDraftDto | null;
   warnings: Issue[];
   panel: EditorPanel;
-  /** 倍率（CanvasController が間引いて送る）。 */
-  zoom: number;
-  /** 見えているタイルの絵が出そろった（開いた直後の仮の絵を外す）。 */
-  ready: boolean;
-  imageRect: Rect | null;
-  /** ポインタの下の画素（画像の外は null）。 */
-  pointer: Point | null;
-  /** 押している間だけの道具（Space の手のひら・⌥ のスポイト）。 */
-  temporary: 'hand' | 'eyedropper' | null;
-  drawing: boolean;
   /** 右パネルで選んだ操作（ノード ID）。 */
   selected: number | null;
   sheet: EditorSheet | null;
   save: EditorSave | null;
   /** 断られた手の指摘（引数の欄の下に出す）。 */
   issues: Issue[];
-  crop: EditorCrop | null;
   /** 応えの来ていない文書の手（送った・ためた手）がある（未保存に数える）。 */
   pendingSteps: boolean;
   /** 結果が確定した手の番号（断られた・失敗した・仮でない結果が届いた。引数の欄が手元の値をやめる）。 */
@@ -201,29 +150,20 @@ function closedState(panel: EditorPanel, openId: number): EditorState {
   return {
     phase: 'closed',
     openId,
+    kind: null,
     item: null,
     session: null,
     source: null,
-    pixelArt: false,
     status: null,
     doc: EMPTY_DOC,
-    view: null,
-    frame: 0,
     failure: null,
     draft: null,
     warnings: [],
     panel,
-    zoom: 1,
-    ready: false,
-    imageRect: null,
-    pointer: null,
-    temporary: null,
-    drawing: false,
     selected: null,
     sheet: null,
     save: null,
     issues: [],
-    crop: null,
     pendingSteps: false,
     acked: 0,
   };
@@ -231,12 +171,76 @@ function closedState(panel: EditorPanel, openId: number): EditorState {
 
 export const useEditorStore = create<EditorState>(() => closedState('ops', 0));
 
-// ===== 純粋な関数 =====
+// ===== 種類ごとの口 =====
 
-/** 編集できるアイテムか（画像だけ。ゴミ箱・ユニットは呼ぶ側で外す）。 */
-export function canEdit(item: Pick<ItemSummaryDto, 'kind'> | null | undefined): boolean {
-  return item?.kind === 'image';
+/** 表示が出たときに添えるもの。 */
+export interface EditorViewInfo {
+  /** その結果の要求の通し番号。 */
+  seq: number;
+  /** その要求に添えた表示の要求。 */
+  viewport: EditViewportDto;
+  /** 結果が仮の値（preview）を含むか。 */
+  provisional: boolean;
 }
+
+/**
+ * 種類ごとの違い（画像・音声。開くたびに作り、閉じたら捨てる）。核は文書・状態・保存を持ち、表示はアダプタが持つ。
+ *
+ * 呼ぶ順：作る（`EditorAdapterFactory`）→ `begin`（開き始め。応えの前）→ `initialViewport`（開く要求）→ `opened`
+ * （セッションが届いた）→ 結果ごとに `onRejected`（断られた手があれば）→ `applyView`（表示が出た）か `onFailed`（表示
+ * できなかった）→ `settle`（必ず最後。文書の差分を当てたあと）。要求そのものが通らなければ `onFailed` だけ。閉じる・
+ * 開き直すと `dispose`。`Tag` は手に付ける印（画像は仮の筆）。
+ */
+export interface EditorAdapter<Tag = unknown> {
+  /** 開き始め（核の状態を「開いている途中」にしたあと。仮の表示を置く）。 */
+  begin?(): void;
+  /** 開く要求に添える表示の要求（窓の大きさから見積もる）。 */
+  initialViewport(): EditViewportDto;
+  /** 開いた（セッション・元の大きさ）。 */
+  opened(opened: EditOpenedDto): void;
+  /** 今の表示の要求（手・表示の要求に添える）。 */
+  viewport(): EditViewportDto;
+  /** 要求を送った（仮の筆に通し番号を付ける）。 */
+  sent?(req: SentRequest<Tag>): void;
+  /** 手が断られた（`index` は要求の中の手の位置）。 */
+  onRejected(seq: number, index: number): void;
+  /** 表示が出た。 */
+  applyView(view: EditViewDto, info: EditorViewInfo): void;
+  /** 表示できなかった・要求が通らなかった。 */
+  onFailed(seq: number): void;
+  /** 結果を受け終えた（`doc` は差分を当てたあとの文書）。 */
+  settle(doc: EditorDoc): void;
+  /** 手を送る前（切り抜きの途中ならやめる）。`EditorAdapterContext.send` では呼ばない。 */
+  beforeSteps?(): void;
+  /** 取り消す・やり直すを止めている（描いている途中）。 */
+  busy?(): boolean;
+  /** 足す操作の引数の既定値（`atEnd` は末尾に足すか）。なければ `defaultParams(desc, null)`。 */
+  newParams?(desc: OpDescriptor, atEnd: boolean): ParamValues;
+  /** 捨てる（`closing` は閉じたか。偽なら別のアイテムを開き直した）。 */
+  dispose(closing: boolean): void;
+}
+
+/** アダプタから核を呼ぶ口（開いたエディタ 1 つ分。閉じた・開き直したあとは何もしない）。 */
+export interface EditorAdapterContext<Tag = unknown> {
+  /** このエディタが今のものか。 */
+  current(): boolean;
+  /** セッション（開くまで・閉じたあとは null）。 */
+  session(): string | null;
+  /** 表示を頼む（前に送ったものと同じなら送らない）。 */
+  requestView(viewport: EditViewportDto): void;
+  /** 手を送る（先に `beforeSteps`）。送れなければ false。`selectCreated` なら足したノードを選ぶ。 */
+  push(steps: QueuedStep<Tag>[], options?: { selectCreated?: boolean }): boolean;
+  /** 手を送る（`beforeSteps` を呼ばない。切り抜きの仮の値を出す・捨てるとき）。 */
+  send(steps: QueuedStep<Tag>[], options?: { selectCreated?: boolean }): void;
+}
+
+/** 種類ごとのアダプタの作り方。 */
+export interface EditorAdapterFactory<Tag = unknown> {
+  kind: EditorKind;
+  create(item: ItemSummaryDto, ctx: EditorAdapterContext<Tag>): EditorAdapter<Tag>;
+}
+
+// ===== 純粋な関数 =====
 
 /** 文書の差分を当てる（`base` が null なら全体。変わっていなければ同じものを返す）。 */
 export function applyDocDelta(doc: EditorDoc, delta: EditDocDeltaDto): EditorDoc {
@@ -283,32 +287,15 @@ export function canSaveEditor(
   if (s.phase !== 'open' || s.save || !s.status) return false;
   if (s.status.dirty || s.pendingSteps) return true;
   // 元のファイルの形式はアイテムの拡張子から（source.format は画素の形式 rgba8 などで、ファイルの形式ではない）
-  return effectiveFormat(outputChoice(s.doc.outputs), formatOfExt(s.item?.ext)).forced;
+  const formats = formatsFor(s.item);
+  if (!formats) return false;
+  return formats.effectiveFormat(outputChoice(s.doc.outputs), formats.formatOfExt(s.item?.ext))
+    .forced;
 }
 
 /** 文書を変える手か（まとめを閉じる・仮の値の手は文書を変えない）。 */
 export function isDocStep(step: EditStepDto): boolean {
   return step.type !== 'seal' && step.type !== 'preview' && step.type !== 'cancelPreview';
-}
-
-/** 編集中のノード（末尾が有効な描画なら、その ID。Rust のキャッシュに入力を固定する）。 */
-export function focusNode(doc: EditorDoc): number | null {
-  const last = doc.order[doc.order.length - 1];
-  const node = last === undefined ? undefined : doc.nodes[last];
-  return node && node.op === 'paint.actions' && node.enabled ? node.id : null;
-}
-
-/** 表示の結果の要約。 */
-export function summarizeView(view: EditViewDto): EditorView {
-  return {
-    rev: view.rev,
-    level: view.level,
-    fullWidth: view.fullWidth,
-    fullHeight: view.fullHeight,
-    frames: view.frames,
-    format: view.format,
-    fallback: view.fallback,
-  };
 }
 
 /** 失敗の中身（IPC の誤りは code つき）。 */
@@ -321,31 +308,14 @@ function problemFailure(kind: EditorFailure['kind'], p: EditProblemDto): EditorF
   return { kind, code: p.code, message: p.message };
 }
 
-/** 開く前の見積もりの要求：窓の大きさから「全体を表示」の倍率を見積もる（段を Rust が決めるのに使う）。 */
-export function guessViewport(
-  item: Pick<ItemSummaryDto, 'width' | 'height' | 'pixelArt'>,
-): EditViewportDto {
-  const dpr =
-    typeof window !== 'undefined' && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
-  const w = typeof window !== 'undefined' ? window.innerWidth : 1280;
-  const h = typeof window !== 'undefined' ? window.innerHeight : 800;
-  // 右パネル（340px）・余白・上部と下のカプセルを除いた大きさ
-  const area = { w: Math.max(200, w - 340 - 80), h: Math.max(200, h - 180) };
-  const zoom =
-    item.width && item.height ? fitZoom(item.width, item.height, area, dpr, item.pixelArt) : 1;
-  return { frame: 0, rect: null, scale: zoom * dpr, interacting: false, focus: null };
-}
-
 // ===== React の外の持ち物 =====
 
 interface Runtime {
   token: number;
   session: string | null;
-  controller: CanvasController;
-  queue: RequestQueue<PendingStroke> | null;
+  adapter: EditorAdapter;
+  queue: RequestQueue | null;
   returnFocus: HTMLElement | null;
-  /** 自己点検（VITE_KURA_CHECK）にタイルを渡したか。 */
-  checked: boolean;
   /** 続けて `superseded` になった数（頼み直しを繰り返さない）。 */
   superseded: number;
   /** 次に足したノードを選ぶ（「操作を追加」・切り抜きの確定）。 */
@@ -369,26 +339,8 @@ const SUPERSEDED_RETRIES = 2;
 
 let runtime: Runtime | null = null;
 let openToken = 0;
-/** スポイトの問い合わせの番号（最後にクリックした画素の応えだけを使う）。 */
-let sampleSeq = 0;
-
-/** タイルの形式の自己点検（dev。VITE_KURA_CHECK=1 のときだけ読み込む）。 */
-let tileCheckHook: ((controller: CanvasController, session: string) => void) | null = null;
-
-// 通常のビルドでは import.meta.env.VITE_KURA_CHECK が undefined に置き換わり、この枝ごと消える
-if (import.meta.env.VITE_KURA_CHECK === '1') {
-  void import('../../dev/tileCheck').then(
-    (m) => {
-      tileCheckHook = m.checkTiles;
-    },
-    () => undefined,
-  );
-}
-
-/** 今のキャンバスの制御（開いていなければ null）。 */
-export function editorController(): CanvasController | null {
-  return runtime?.controller ?? null;
-}
+/** 最後に開いた種類の口（開き直すときに使う）。 */
+let lastFactory: EditorAdapterFactory | null = null;
 
 function activeElement(): HTMLElement | null {
   return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
@@ -396,18 +348,13 @@ function activeElement(): HTMLElement | null {
     : null;
 }
 
-function setInfo(info: ControllerInfo): void {
-  useEditorStore.setState({
-    zoom: info.zoom,
-    ready: info.ready,
-    // 仮の絵を置く矩形は、絵が出そろうまでだけ要る
-    imageRect: info.ready ? null : info.imageRect,
-  });
-}
-
-function disposeRuntime(rt: Runtime, discardDraftOf: number | null = null): Promise<void> {
+function disposeRuntime(
+  rt: Runtime,
+  closing: boolean,
+  discardDraftOf: number | null = null,
+): Promise<void> {
   rt.queue?.close();
-  rt.controller.dispose();
+  rt.adapter.dispose(closing);
   if (!rt.session) return Promise.resolve();
   return (
     closeEdit(rt.session)
@@ -420,50 +367,66 @@ function disposeRuntime(rt: Runtime, discardDraftOf: number | null = null): Prom
   );
 }
 
-/** エディタを開く（画像 1 件だけ。前のエディタは閉じる）。 */
-export async function openEditor(
+/** アダプタから核を呼ぶ口を作る（`rt` が今のものでなければ何もしない）。 */
+function contextFor<Tag>(holder: { rt: Runtime | null }): EditorAdapterContext<Tag> {
+  const live = (): Runtime | null => {
+    const rt = holder.rt;
+    return rt !== null && runtime === rt ? rt : null;
+  };
+  return {
+    current: () => live() !== null,
+    session: () => live()?.session ?? null,
+    requestView: (viewport) => {
+      live()?.queue?.view(viewport);
+    },
+    push: (steps, options = {}) => {
+      const rt = live();
+      if (!rt?.queue) return false;
+      if (options.selectCreated) rt.selectCreated = true;
+      return pushSteps(steps as QueuedStep<unknown>[]);
+    },
+    send: (steps, options = {}) => {
+      const rt = live();
+      if (!rt?.queue || steps.length === 0) return;
+      if (options.selectCreated) rt.selectCreated = true;
+      queueSteps(rt, steps as QueuedStep<unknown>[]);
+    },
+  };
+}
+
+/** エディタを開く（種類の口 `factory` で。前のエディタは閉じる）。 */
+export async function openEditorAs<Tag>(
+  factory: EditorAdapterFactory<Tag>,
   item: ItemSummaryDto,
   options: { fromDraft?: boolean } = {},
 ): Promise<void> {
-  if (!canEdit(item)) return;
-  // パレットの番号は画像ごとに意味が違うので、開くたびに捨てる（スポイトで拾い直す）
-  useToolStore.getState().forgetPaletteIndexes();
+  lastFactory = factory as EditorAdapterFactory;
   const previous = runtime;
   const returnFocus = previous?.returnFocus ?? activeElement();
-  if (previous) void disposeRuntime(previous);
+  if (previous) void disposeRuntime(previous, false);
   const token = ++openToken;
-  const controller = new CanvasController({
-    draw: drawScene,
-    onInfo: (info) => {
-      if (runtime?.token === token) setInfo(info);
-    },
-    onIdle: (viewport) => {
-      if (runtime?.token === token) runtime.queue?.view(viewport);
-    },
-  });
+  const holder: { rt: Runtime | null } = { rt: null };
+  const adapter = factory.create(item, contextFor<Tag>(holder)) as EditorAdapter;
   const rt: Runtime = {
     token,
     session: null,
-    controller,
+    adapter,
     queue: null,
     returnFocus,
-    checked: false,
     superseded: 0,
     selectCreated: false,
   };
+  holder.rt = rt;
   runtime = rt;
   const panel = useEditorStore.getState().panel;
   useEditorStore.setState({
     ...closedState(panel, token),
     phase: 'opening',
+    kind: factory.kind,
     item,
-    pixelArt: item.pixelArt,
   });
-  // 開く前の大きさ（仮の絵を置く矩形を出す。開いたら元の大きさで置き直す）
-  if (item.width && item.height) {
-    controller.setImage({ w: item.width, h: item.height, pixelArt: item.pixelArt });
-  }
-  const viewport = guessViewport(item);
+  adapter.begin?.();
+  const viewport = adapter.initialViewport();
   try {
     const opened = await openEdit(item.id, viewport, options.fromDraft ?? null);
     if (runtime !== rt) {
@@ -471,19 +434,14 @@ export async function openEditor(
       return;
     }
     rt.session = opened.session;
-    controller.setSession(opened.session);
-    controller.setImage({
-      w: opened.source.width,
-      h: opened.source.height,
-      pixelArt: opened.pixelArt,
-    });
-    rt.queue = new RequestQueue<PendingStroke>(
+    adapter.opened(opened);
+    rt.queue = new RequestQueue(
       {
         step: (steps, vp) => stepEdit(opened.session, steps, vp),
         view: (vp) => viewEdit(opened.session, vp),
       },
       {
-        sent: (req) => markSent(rt, req),
+        sent: (req) => adapter.sent?.(req),
         done: (req, result) => {
           if (runtime === rt) {
             applyResult(rt, result, req.seq, req.viewport, req.steps.length > 0, req.upto);
@@ -499,24 +457,31 @@ export async function openEditor(
       phase: 'open',
       session: opened.session,
       source: opened.source,
-      pixelArt: opened.pixelArt,
       draft: opened.draft,
       // 下書きがあれば、捨てるか下書きから開くかを聞く（下書きから開いたあとは聞かない）
       sheet: opened.draft.exists && !opened.draft.opened ? { kind: 'draft' } : null,
     });
     applyResult(rt, opened.result, 0, viewport, false, null);
     // 開いたあとの実際の大きさ・倍率で頼み直す（見積もりと同じなら送らない）
-    rt.queue.view(controller.viewport());
+    rt.queue.view(adapter.viewport());
   } catch (error) {
     if (runtime !== rt) return;
     useEditorStore.setState({ phase: 'error', failure: failureOf('open', error) });
   }
 }
 
+/** 同じ種類の口で開き直す（版に戻したあと・下書きから開く。開いたことがなければ何もしない）。 */
+export function reopenEditorWith(
+  item: ItemSummaryDto,
+  options: { fromDraft?: boolean } = {},
+): Promise<void> {
+  return lastFactory ? openEditorAs(lastFactory, item, options) : Promise.resolve();
+}
+
 /** 開き直す（失敗のあと・Rust がセッションを閉じたあと）。 */
 export function reopenEditor(): void {
   const item = useEditorStore.getState().item;
-  if (item) void openEditor(item);
+  if (item) void reopenEditorWith(item);
 }
 
 /**
@@ -530,20 +495,12 @@ export function closeEditor(options: { discardDraft?: boolean } = {}): Promise<v
   const s = useEditorStore.getState();
   if (!rt && s.phase === 'closed') return Promise.resolve();
   const closing = rt
-    ? disposeRuntime(rt, options.discardDraft && s.item ? s.item.id : null)
+    ? disposeRuntime(rt, true, options.discardDraft && s.item ? s.item.id : null)
     : Promise.resolve();
-  // 切り抜きの途中で閉じたら、道具を戻す（切り抜きは保存した設定から戻さない）
-  if (s.crop) useToolStore.getState().setTool(s.crop.returnTool);
   useEditorStore.setState(closedState(s.panel, s.openId));
   const focus = rt?.returnFocus;
   if (focus && focus.isConnected) focus.focus();
   return closing;
-}
-
-function markSent(rt: Runtime, req: SentRequest<PendingStroke>): void {
-  req.steps.forEach((s, i) => {
-    if (s.tag) rt.controller.strokeSent(s.tag, req.seq, i);
-  });
 }
 
 /** 応えの来ていない文書の手があるか（ストアに合わせる）。 */
@@ -574,14 +531,8 @@ function applyResult(
   }
   for (const n of result.notices) notify(n);
   if (result.rejected) {
-    rt.controller.onRejected(seq, result.rejected.index);
+    rt.adapter.onRejected(seq, result.rejected.index);
     notify(result.rejected.problem.message);
-  }
-  // 切り抜く前の画像を表示する仮の値が断られたら、切り抜きをやめる
-  if (result.rejected && s.crop?.previewed && s.crop.bounds === null) {
-    patch.crop = null;
-    const tools = useToolStore.getState();
-    if (tools.tool === 'crop') tools.setTool(s.crop.returnTool);
   }
   // 指摘は手を送るたびに替える（表示だけの要求では消さない）
   if (hadSteps) patch.issues = result.rejected?.problem.issues ?? [];
@@ -598,43 +549,28 @@ function applyResult(
   const outcome = result.view;
   if (outcome.type !== 'superseded') rt.superseded = 0;
   if (outcome.type === 'shown') {
-    rt.controller.applyView(outcome.view, seq, viewport);
-    const view = summarizeView(outcome.view);
-    patch.view = view;
+    rt.adapter.applyView(outcome.view, {
+      seq,
+      viewport,
+      provisional: result.status.provisional,
+    });
     patch.warnings = outcome.view.warnings;
     if (s.failure?.kind !== 'open') patch.failure = null;
-    if (view.frames.length > 0 && s.frame >= view.frames.length) {
-      patch.frame = 0;
-      rt.controller.setFrame(0);
-    }
-    // 前に選んだ消しゴムのまま、透明を持てない画像を開いたらペンに戻す
-    const tools = useToolStore.getState();
-    if (tools.tool === 'eraser' && !formatCanBeTransparent(view.format)) tools.setTool('pen');
-    // 切り抜きの枠：その操作の入力（仮に無効にした結果）を表示し終えたら、その大きさで枠を置く
-    const crop = s.crop;
-    if (crop && crop.bounds === null && (!crop.previewed || result.status.provisional)) {
-      const bounds = { w: view.fullWidth, h: view.fullHeight };
-      patch.crop = { ...crop, bounds, rect: clampCrop(crop.rect, bounds) };
-    }
-    if (!rt.checked && rt.session && tileCheckHook) {
-      rt.checked = true;
-      tileCheckHook(rt.controller, rt.session);
-    }
   } else if (outcome.type === 'superseded') {
     // 当てた手は残る。新しい要求の結果を待つ（出していなければ表示を頼み直す）
     rt.superseded++;
-    if (rt.superseded <= SUPERSEDED_RETRIES) rt.queue?.view(rt.controller.viewport(), true);
+    if (rt.superseded <= SUPERSEDED_RETRIES) rt.queue?.view(rt.adapter.viewport(), true);
   } else {
-    rt.controller.onFailed(seq);
+    rt.adapter.onFailed(seq);
     patch.failure = problemFailure('view', outcome.problem);
   }
-  rt.controller.focus = focusNode(doc);
+  rt.adapter.settle(doc);
   useEditorStore.setState(patch);
   for (const hook of resultHooks) hook(result, hadSteps);
 }
 
-function requestFailed(rt: Runtime, req: SentRequest<PendingStroke>, error: unknown): void {
-  rt.controller.onFailed(req.seq);
+function requestFailed(rt: Runtime, req: SentRequest<unknown>, error: unknown): void {
+  rt.adapter.onFailed(req.seq);
   const s = useEditorStore.getState();
   useEditorStore.setState({
     failure: failureOf('request', error),
@@ -645,20 +581,20 @@ function requestFailed(rt: Runtime, req: SentRequest<PendingStroke>, error: unkn
 }
 
 /** 手をためて送り、応えの来ていない文書の手があるかをストアに合わせる。 */
-function queueSteps(rt: Runtime, steps: QueuedStep<PendingStroke>[]): void {
+function queueSteps(rt: Runtime, steps: QueuedStep<unknown>[]): void {
   if (!rt.queue) return;
-  rt.queue.push(steps, rt.controller.viewport());
+  rt.queue.push(steps, rt.adapter.viewport());
   const pending = pendingOf(rt);
   if (useEditorStore.getState().pendingSteps !== pending) {
     useEditorStore.setState({ pendingSteps: pending });
   }
 }
 
-/** 手を送る（開いていなければ false）。切り抜きの途中なら、先に切り抜きをやめる（仮の値を捨てる）。 */
-function pushSteps(steps: QueuedStep<PendingStroke>[]): boolean {
+/** 手を送る（開いていなければ false）。先にアダプタの片付け（切り抜きの途中なら、切り抜きをやめて仮の値を捨てる）。 */
+function pushSteps(steps: QueuedStep<unknown>[]): boolean {
   const rt = runtime;
   if (!rt?.queue) return false;
-  if (useEditorStore.getState().crop) cancelCrop();
+  rt.adapter.beforeSteps?.();
   queueSteps(rt, steps);
   return true;
 }
@@ -677,7 +613,7 @@ export function pushEditorSteps(
 /** 状態を取り直す（保存のジョブのイベントのあと。同じビューポートでも頼む）。 */
 export function refreshEditorView(): void {
   const rt = runtime;
-  rt?.queue?.view(rt.controller.viewport(), true);
+  rt?.queue?.view(rt.adapter.viewport(), true);
 }
 
 /** 今のセッション（開いていなければ null）。 */
@@ -701,15 +637,18 @@ export function applyEditorStatus(status: EditStatusDto, delta: EditDocDeltaDto 
 
 // ===== 取り消し =====
 
-/** 取り消す（⌘Z。描いている途中は何もしない。切り抜きの途中なら切り抜きをやめてから。取り消せる手がなければ Rust が何もしない）。 */
+/**
+ * 取り消す（⌘Z。描いている途中は何もしない。切り抜きの途中なら切り抜きをやめてから。取り消せる手がなければ Rust が
+ * 何もしない）。
+ */
 export function editorUndo(): void {
-  if (runtime?.controller.drawing) return;
+  if (runtime?.adapter.busy?.()) return;
   pushSteps([{ step: { type: 'undo' } }]);
 }
 
 /** やり直す（⇧⌘Z）。 */
 export function editorRedo(): void {
-  if (runtime?.controller.drawing) return;
+  if (runtime?.adapter.busy?.()) return;
   pushSteps([{ step: { type: 'redo' } }]);
 }
 
@@ -771,27 +710,22 @@ export function moveSelected(delta: number): void {
   if (id !== null) moveNode(id, delta);
 }
 
-/** 今の出力の大きさ（足す操作の既定値に使う）。 */
-function outputSize(): Bounds | null {
-  const v = useEditorStore.getState().view;
-  return v ? { w: v.fullWidth, h: v.fullHeight } : null;
-}
-
-/** 操作を足す（選んだ操作のあと、選んでいなければ末尾。足したら選ぶ）。 */
+/**
+ * 操作を足す（選んだ操作のあと、選んでいなければ末尾。足したら選ぶ）。引数の既定値はアダプタが決める（画像は末尾に足す
+ * ときだけ今の出力の大きさを既定にする）。
+ */
 export function addOp(id: string): void {
   const desc = opSpec(id);
-  const { doc, selected, crop } = useEditorStore.getState();
+  const { doc, selected } = useEditorStore.getState();
   if (!desc) return;
   const i = selected === null ? -1 : doc.order.indexOf(selected);
   const at = i < 0 ? doc.order.length : i + 1;
-  // 末尾に足すときだけ、今の出力の大きさを既定にする（途中の入力の大きさはフロントでは分からない）。切り抜きの枠を
-  // 出している間の表示は切り抜く前の画像なので、切り抜きを始める前の出力の大きさを使う（足すと切り抜きはやめる）
-  const size = at === doc.order.length ? (crop ? crop.output : outputSize()) : null;
   const rt = runtime;
+  const params = rt?.adapter.newParams
+    ? rt.adapter.newParams(desc, at === doc.order.length)
+    : defaultParams(desc, null);
   if (rt) rt.selectCreated = true;
-  pushSteps(
-    addSteps(at, desc.id, desc.version, defaultParams(desc, size)).map((step) => ({ step })),
-  );
+  pushSteps(addSteps(at, desc.id, desc.version, params).map((step) => ({ step })));
 }
 
 /**
@@ -812,303 +746,10 @@ export function setOutputFormat(format: FormatChoice): void {
   if (steps.length > 0) pushSteps(steps.map((step) => ({ step })));
 }
 
-// ===== 切り抜き =====
-
-/**
- * 切り抜きの道具を選ぶ：選んだ切り抜き（なければ最後の切り抜き）を直す。なければ末尾に足す枠。直す切り抜きの後ろに有効な
- * 幾何の操作があれば、枠は出さずにその切り抜きを選んで引数パネルで直す（仮に無効にしても表示がその入力にならない）。
- */
-export function startCrop(): void {
-  const rt = runtime;
-  const s = useEditorStore.getState();
-  if (!rt?.queue || s.phase !== 'open' || s.crop) return;
-  strokeCancel();
-  const tools = useToolStore.getState();
-  const returnTool: EditorTool = tools.tool === 'crop' ? 'pen' : tools.tool;
-  const pick = (id: number | null | undefined) =>
-    id != null && s.doc.nodes[id]?.op === 'image.crop' ? id : null;
-  const node =
-    pick(s.selected) ??
-    [...s.doc.order].reverse().find((id) => s.doc.nodes[id]?.op === 'image.crop') ??
-    null;
-  if (node !== null && hasLaterGeometry(s.doc, node)) {
-    useEditorStore.setState({ selected: node, panel: 'ops' });
-    notify(t.cropUseParams);
-    return;
-  }
-  tools.setTool('crop');
-  const output = outputSize();
-  if (node === null) {
-    useEditorStore.setState({
-      crop: {
-        node: null,
-        rect: output ? { x: 0, y: 0, w: output.w, h: output.h } : { x: 0, y: 0, w: 1, h: 1 },
-        bounds: output,
-        output,
-        previewed: false,
-        returnTool,
-      },
-    });
-    return;
-  }
-  const n = s.doc.nodes[node];
-  const rect = readRect(n ? paramsOf(n).rect : null) ?? { x: 0, y: 0, w: 1, h: 1 };
-  const previewed = n?.enabled ?? false;
-  useEditorStore.setState({
-    selected: node,
-    crop: { node, rect, bounds: previewed ? null : output, output, previewed, returnTool },
-  });
-  // その操作の入力を表示する（仮に無効にする。履歴に入らない。後ろに幾何の操作はないので、出力がその入力になる）
-  if (previewed) {
-    queueSteps(rt, [
-      { step: { type: 'preview', edit: { type: 'setEnabled', node, enabled: false } } },
-    ]);
-  }
-}
-
-/** 切り抜きを終える（仮の値を捨て、道具を戻す）。`steps` があれば続けて送る。 */
-function endCrop(steps: EditStepDto[] = []): void {
-  const rt = runtime;
-  const crop = useEditorStore.getState().crop;
-  if (!crop) return;
-  useEditorStore.setState({ crop: null });
-  const tools = useToolStore.getState();
-  if (tools.tool === 'crop') tools.setTool(crop.returnTool);
-  const all: EditStepDto[] = [
-    ...(crop.previewed ? [{ type: 'cancelPreview' as const }] : []),
-    ...steps,
-  ];
-  if (rt?.queue && all.length > 0) {
-    queueSteps(
-      rt,
-      all.map((step) => ({ step })),
-    );
-  }
-}
-
-/** 切り抜きをやめる（esc・ほかの道具・ほかの手）。 */
-export function cancelCrop(): void {
-  endCrop();
-}
-
-/** 切り抜きを確定する（↵）。枠が変わっていなければ何も足さない。 */
-export function confirmCrop(): void {
-  const s = useEditorStore.getState();
-  const crop = s.crop;
-  if (!crop?.bounds) return;
-  const steps: EditStepDto[] = [];
-  if (crop.node !== null) {
-    const node = s.doc.nodes[crop.node];
-    if (!sameRect(readRect(node ? paramsOf(node).rect : null), crop.rect)) {
-      steps.push(
-        commitStep({ type: 'setParam', node: crop.node, key: 'rect', value: { ...crop.rect } }),
-      );
-    }
-    if (node && !node.enabled) {
-      steps.push(commitStep({ type: 'setEnabled', node: crop.node, enabled: true }));
-    }
-  } else if (!isFullCrop(crop.rect, crop.bounds)) {
-    const desc = opSpec('image.crop');
-    if (desc) {
-      steps.push(
-        ...addSteps(s.doc.order.length, desc.id, desc.version, { rect: { ...crop.rect } }),
-      );
-      if (runtime) runtime.selectCreated = true;
-    }
-  }
-  endCrop(steps);
-}
-
-/** 枠を替える（ドラッグ・数の欄。画像の中の整数に収める）。 */
-export function setCropRect(rect: Rect): void {
-  const crop = useEditorStore.getState().crop;
-  if (!crop?.bounds) return;
-  const next = clampCrop(rect, crop.bounds);
-  if (!sameRect(next, crop.rect)) useEditorStore.setState({ crop: { ...crop, rect: next } });
-}
-
-/** 矢印で枠を動かす（1px・⇧で 10px）。動かせたら true。 */
-export function nudgeCropRect(key: string, shift: boolean): boolean {
-  const crop = useEditorStore.getState().crop;
-  if (!crop?.bounds) return false;
-  const next = nudgeCrop(crop.rect, key, shift, crop.bounds);
-  if (!next) return false;
-  setCropRect(next);
-  return true;
-}
-
-/** 道具を選ぶ（切り抜きは枠を出す。ほかの道具を選んだら切り抜きをやめる）。 */
-export function selectTool(tool: EditorTool): void {
-  if (tool === 'crop') {
-    startCrop();
-    return;
-  }
-  if (useEditorStore.getState().crop) cancelCrop();
-  useToolStore.getState().setTool(tool);
-}
-
 // ===== 表示 =====
-
-export function editorFit(): void {
-  runtime?.controller.fit();
-}
-
-export function editorActualSize(): void {
-  runtime?.controller.actualSize();
-}
-
-export function editorZoom(dir: number): void {
-  runtime?.controller.zoomStep(dir);
-}
-
-/** 表示するコマ（アニメの画像）。 */
-export function setEditorFrame(frame: number): void {
-  const s = useEditorStore.getState();
-  const count = s.view?.frames.length ?? 1;
-  if (count <= 1 || frame < 0 || frame >= count || frame === s.frame) return;
-  runtime?.controller.cancelStroke();
-  useEditorStore.setState({ frame, drawing: false });
-  runtime?.controller.setFrame(frame);
-}
-
-/** 前・次のコマ（端で回る）。 */
-export function stepEditorFrame(delta: number): void {
-  const s = useEditorStore.getState();
-  const count = s.view?.frames.length ?? 1;
-  if (count <= 1) return;
-  setEditorFrame((((s.frame + delta) % count) + count) % count);
-}
 
 /** 右パネルの「情報」を切り替える（⌘I）。 */
 export function toggleEditorInfo(): void {
   const s = useEditorStore.getState();
   useEditorStore.setState({ panel: s.panel === 'info' ? 'ops' : 'info' });
-}
-
-/** 押している間だけの道具。 */
-export function setTemporaryTool(tool: 'hand' | 'eyedropper' | null): void {
-  if (useEditorStore.getState().temporary !== tool) useEditorStore.setState({ temporary: tool });
-}
-
-/** ポインタの下の画素（画像の外は null）。 */
-export function setEditorPointer(p: Point | null): void {
-  const now = useEditorStore.getState().pointer;
-  if (now === p || (now && p && now[0] === p[0] && now[1] === p[1])) return;
-  useEditorStore.setState({ pointer: p });
-}
-
-// ===== 描画の道具 =====
-
-/** パレットの画像か。 */
-function indexedNow(): boolean {
-  return useEditorStore.getState().view?.format === 'indexed8';
-}
-
-/** 描く色を使えるか：パレットの画像は、この画像でスポイトで拾った番号の色だけで描く（なければ拾うよう知らせる）。 */
-function paletteColorReady(): boolean {
-  if (!indexedNow() || useToolStore.getState().color.index !== null) return true;
-  notify(t.indexedPick);
-  return false;
-}
-
-/** 筆の条件（道具・筆・色・フレーム）。描けなければ null。 */
-function strokeSpec(tool: 'pen' | 'eraser'): StrokeSpec | null {
-  const rt = runtime;
-  const bounds = rt?.controller.frameBounds();
-  if (!rt || !bounds) return null;
-  const tools = useToolStore.getState();
-  return {
-    tool,
-    color: tool === 'pen' ? tools.color : null,
-    blend: tools.blend,
-    brush: { shape: tools.shape, size: tools.size },
-    pixelPerfect: tools.pixelPerfect,
-    frame: useEditorStore.getState().frame,
-    bounds,
-    indexed: indexedNow(),
-  };
-}
-
-/** 筆を描き始める（⇧ なら、最後に描いた筆の終わりからの直線）。 */
-export function strokeStart(p: Point, shift: boolean): boolean {
-  const rt = runtime;
-  if (!rt?.queue) return false;
-  const tool = useToolStore.getState().tool === 'eraser' ? 'eraser' : 'pen';
-  if (tool === 'eraser' && !formatCanBeTransparent(useEditorStore.getState().view?.format)) {
-    notify(t.eraserUnavailable);
-    return false;
-  }
-  if (tool === 'pen' && !paletteColorReady()) return false;
-  const spec = strokeSpec(tool);
-  if (!spec) return false;
-  const start = shift ? rt.controller.lineStart(spec.frame) : null;
-  rt.controller.beginStroke(spec, start ?? p);
-  if (start) rt.controller.extendStroke([p]);
-  useEditorStore.setState({ drawing: true });
-  return true;
-}
-
-/** 点を足す。 */
-export function strokeMove(points: readonly Point[]): void {
-  runtime?.controller.extendStroke(points);
-}
-
-/** 描き終えて送る（1 手。描く先は Rust が決める）。 */
-export function strokeEnd(): void {
-  const rt = runtime;
-  if (!rt) return;
-  const done = rt.controller.endStroke();
-  useEditorStore.setState({ drawing: false });
-  if (!done) return;
-  pushSteps([{ step: { type: 'paint', actions: [done.action] }, tag: done.pending }]);
-  if (done.action.tool === 'pen') {
-    const tools = useToolStore.getState();
-    tools.rememberColor(tools.color);
-  }
-}
-
-/** 描いている筆をやめる（esc。送らない）。やめたら true。 */
-export function strokeCancel(): boolean {
-  const canceled = runtime?.controller.cancelStroke() ?? false;
-  if (canceled) useEditorStore.setState({ drawing: false });
-  return canceled;
-}
-
-/** 塗りつぶす（仮描きしない。画像の外は何もしない）。 */
-export function fillAt(p: Point): void {
-  const rt = runtime;
-  if (!rt?.queue || !rt.controller.contains(p) || !paletteColorReady()) return;
-  const tools = useToolStore.getState();
-  const action = fillAction(
-    {
-      color: tools.color,
-      tolerance: tools.tolerance,
-      connectivity: tools.connectivity,
-      contiguous: tools.contiguous,
-      frame: useEditorStore.getState().frame,
-      indexed: indexedNow(),
-    },
-    p,
-  );
-  if (pushSteps([{ step: { type: 'paint', actions: [action] } }])) {
-    tools.rememberColor(tools.color);
-  }
-}
-
-/**
- * スポイト：等倍の今の値の 1 画素を色にする（クリックのときだけ。画像の外は何もしない）。応えの順は約束されないので、
- * 最後にクリックした画素の応えだけを使う。
- */
-export async function sampleAt(p: Point): Promise<void> {
-  const rt = runtime;
-  if (!rt?.session || !rt.controller.contains(p)) return;
-  const n = ++sampleSeq;
-  try {
-    const got = await sampleEdit(rt.session, useEditorStore.getState().frame, p[0], p[1]);
-    if (runtime !== rt || n !== sampleSeq || !got) return;
-    useToolStore.getState().setColor({ rgba: [...got.rgba], index: got.index });
-  } catch (error) {
-    if (runtime !== rt || n !== sampleSeq) return;
-    notify(t.sampleFailed(isIpcError(error) ? error.message : String(error)));
-  }
 }

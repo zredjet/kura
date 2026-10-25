@@ -15,32 +15,35 @@ import { ja } from '../../i18n/ja';
 import { IpcError } from '../../ipc/result';
 import { unpackPoints } from '../../lib/paint';
 import { useNoticeStore } from '../../stores/noticeStore';
+import { openEditor } from './editorKinds';
 import {
   addOp,
   applyDocDelta,
   canSaveEditor,
-  cancelCrop,
   closeEditor,
-  confirmCrop,
-  editorController,
   editorRedo,
   editorUndo,
-  fillAt,
-  focusNode,
   hasUnsavedChanges,
   moveSelected,
-  nudgeCropRect,
-  openEditor,
   removeNode,
-  sampleAt,
   selectAdjacent,
-  selectTool,
   sendParam,
+  useEditorStore,
+} from './editorStore';
+import {
+  cancelCrop,
+  confirmCrop,
+  editorController,
+  fillAt,
+  focusNode,
+  nudgeCropRect,
+  sampleAt,
+  selectTool,
   setCropRect,
   strokeEnd,
   strokeStart,
-  useEditorStore,
-} from './editorStore';
+  useImageStore,
+} from './image/imageStore';
 import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
 
 vi.mock('../../ipc/edit', async (importOriginal) => ({
@@ -202,10 +205,15 @@ describe('開く・閉じる', () => {
       null,
     );
     const s = useEditorStore.getState();
-    expect(s).toMatchObject({ phase: 'open', session: 'aa01', pixelArt: true });
+    expect(s).toMatchObject({ phase: 'open', session: 'aa01' });
+    expect(useImageStore.getState()).toMatchObject({ pixelArt: true });
     expect(s.status?.canUndo).toBe(true);
     expect(s.doc.order).toEqual([2]);
-    expect(s.view).toMatchObject({ level: 0, fullWidth: 64, format: 'rgba8' });
+    expect(useImageStore.getState().view).toMatchObject({
+      level: 0,
+      fullWidth: 64,
+      format: 'rgba8',
+    });
     expect(editorController()?.focus).toBe(2);
   });
 
@@ -276,10 +284,10 @@ describe('手', () => {
 
   it('筆は離したら paint の 1 手で送り、色を最近の色に入れる', async () => {
     expect(strokeStart([1, 1], false)).toBe(true);
-    expect(useEditorStore.getState().drawing).toBe(true);
+    expect(useImageStore.getState().drawing).toBe(true);
     editorController()?.extendStroke([[4, 1]]);
     strokeEnd();
-    expect(useEditorStore.getState().drawing).toBe(false);
+    expect(useImageStore.getState().drawing).toBe(false);
     const [, steps] = vi.mocked(stepEdit).mock.calls[0] ?? [];
     const step = steps?.[0];
     expect(step?.type).toBe('paint');
@@ -291,11 +299,11 @@ describe('手', () => {
     ]);
     expect(useToolStore.getState().recent).toEqual([DEFAULT_TOOLS.color]);
     await flush();
-    expect(useEditorStore.getState().view?.rev).toBe(2);
+    expect(useImageStore.getState().view?.rev).toBe(2);
   });
 
   it('透明を持てない形式では消しゴムを使わない', async () => {
-    useEditorStore.setState({ view: { ...useEditorStore.getState().view!, format: 'rgb8' } });
+    useImageStore.setState({ view: { ...useImageStore.getState().view!, format: 'rgb8' } });
     useToolStore.setState({ tool: 'eraser' });
     expect(strokeStart([1, 1], false)).toBe(false);
     expect(useNoticeStore.getState().message).toBeTruthy();
@@ -518,7 +526,7 @@ describe('切り抜き', () => {
     useToolStore.setState({ tool: 'fill' });
     selectTool('crop');
     expect(useToolStore.getState().tool).toBe('crop');
-    expect(useEditorStore.getState().crop).toMatchObject({
+    expect(useImageStore.getState().crop).toMatchObject({
       node: null,
       rect: { x: 0, y: 0, w: 64, h: 32 },
       bounds: { w: 64, h: 32 },
@@ -529,7 +537,7 @@ describe('切り抜き', () => {
     nudgeCropRect('ArrowRight', false);
     setCropRect({ x: 2, y: 2, w: 30, h: 20 });
     expect(nudgeCropRect('ArrowRight', true)).toBe(true);
-    expect(useEditorStore.getState().crop?.rect).toEqual({ x: 12, y: 2, w: 30, h: 20 });
+    expect(useImageStore.getState().crop?.rect).toEqual({ x: 12, y: 2, w: 30, h: 20 });
     confirmCrop();
     await flush();
     expect(vi.mocked(stepEdit).mock.calls[0]?.[1]).toEqual([
@@ -545,7 +553,7 @@ describe('切り抜き', () => {
         mode: 'step',
       },
     ]);
-    expect(useEditorStore.getState().crop).toBeNull();
+    expect(useImageStore.getState().crop).toBeNull();
     expect(useToolStore.getState().tool).toBe('fill');
   });
 
@@ -567,7 +575,7 @@ describe('切り抜き', () => {
       }),
     );
     selectTool('crop');
-    expect(useEditorStore.getState().crop).toMatchObject({
+    expect(useImageStore.getState().crop).toMatchObject({
       node: 4,
       bounds: null,
       previewed: true,
@@ -576,7 +584,7 @@ describe('切り抜き', () => {
     expect(vi.mocked(stepEdit).mock.calls[0]?.[1]).toEqual([
       { type: 'preview', edit: { type: 'setEnabled', node: 4, enabled: false } },
     ]);
-    expect(useEditorStore.getState().crop).toMatchObject({
+    expect(useImageStore.getState().crop).toMatchObject({
       bounds: { w: 64, h: 32 },
       rect: { x: 8, y: 4, w: 16, h: 8 },
     });
@@ -627,7 +635,7 @@ describe('切り抜き', () => {
       { type: 'cancelPreview' },
       { type: 'undo' },
     ]);
-    expect(useEditorStore.getState().crop).toBeNull();
+    expect(useImageStore.getState().crop).toBeNull();
   });
 });
 
@@ -738,7 +746,7 @@ describe('パレットの番号・スポイトの順番', () => {
     vi.mocked(openEdit).mockResolvedValue(opened('aa01'));
     await openEditor(item());
     await flush();
-    useEditorStore.setState({ view: { ...useEditorStore.getState().view!, format: 'indexed8' } });
+    useImageStore.setState({ view: { ...useImageStore.getState().view!, format: 'indexed8' } });
     vi.mocked(stepEdit).mockClear();
     expect(useToolStore.getState().color).toEqual({ rgba: [255, 0, 0, 255], index: null });
     expect(strokeStart([1, 1], false)).toBe(false);
@@ -805,7 +813,7 @@ describe('切り抜きの枠の基準', () => {
     useToolStore.setState({ tool: 'pen' });
     selectTool('crop');
     await flush();
-    expect(useEditorStore.getState().crop).toBeNull();
+    expect(useImageStore.getState().crop).toBeNull();
     expect(useEditorStore.getState().selected).toBe(4);
     expect(useToolStore.getState().tool).toBe('pen');
     expect(useNoticeStore.getState().message).toBe(ja.editor.cropUseParams);
@@ -823,7 +831,7 @@ describe('切り抜きの枠の基準', () => {
     await openEditor(item());
     await flush();
     selectTool('crop');
-    expect(useEditorStore.getState().crop).toMatchObject({ node: 4, previewed: true });
+    expect(useImageStore.getState().crop).toMatchObject({ node: 4, previewed: true });
   });
 
   it('枠を出している間に操作を足すと、切り抜きを始める前の出力の大きさを既定にする', async () => {
@@ -836,8 +844,8 @@ describe('切り抜きの枠の基準', () => {
     await openEditor(item());
     await flush();
     // 今の出力（切り抜いたあと）は 16 × 8
-    useEditorStore.setState({
-      view: { ...useEditorStore.getState().view!, fullWidth: 16, fullHeight: 8 },
+    useImageStore.setState({
+      view: { ...useImageStore.getState().view!, fullWidth: 16, fullHeight: 8 },
     });
     vi.mocked(stepEdit).mockClear();
     // 仮に無効にした結果（入力の大きさ 64 × 32。文書は変わらない）
@@ -850,7 +858,7 @@ describe('切り抜きの枠の基準', () => {
     );
     selectTool('crop');
     await flush();
-    expect(useEditorStore.getState().view?.fullWidth).toBe(64);
+    expect(useImageStore.getState().view?.fullWidth).toBe(64);
     addOp('image.resize');
     await flush();
     expect(

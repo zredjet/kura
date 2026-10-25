@@ -4,7 +4,8 @@ import { ja } from '../../../i18n/ja';
 import { formatCount } from '../../../lib/format';
 import { CROP_HANDLES, type CropHandle, dragCrop, newCropRect } from './crop';
 import styles from '../Editor.module.css';
-import { editorController, setCropRect, useEditorStore } from '../editorStore';
+import { useEditorStore } from '../editorStore';
+import { editorController, setCropRect, useImageStore } from './imageStore';
 import { type Rect, screenToImage, toScreen } from './viewMath';
 
 const t = ja.editor;
@@ -24,9 +25,9 @@ interface Grab {
  * パン・ズームに毎フレーム合わせる（CanvasController の変換を購読する）。
  */
 export function CropOverlay() {
-  const crop = useEditorStore((s) => s.crop);
+  const crop = useImageStore((s) => s.crop);
   const openId = useEditorStore((s) => s.openId);
-  const temporary = useEditorStore((s) => s.temporary);
+  const temporary = useImageStore((s) => s.temporary);
   const [, redraw] = useReducer((n: number) => n + 1, 0);
   const grab = useRef<Grab | null>(null);
   const layerRef = useRef<HTMLDivElement>(null);

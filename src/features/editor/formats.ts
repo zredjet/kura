@@ -2,7 +2,8 @@
  * エディタの出力の形式と書き出しの名前（純粋な関数。M12 の段 5b、M13 の段 6a で種類ごとの表に分けた）。
  *
  * - 形式の表（形式の ID → 拡張子・保存で書ける形式・書けないときの形式）は種類ごとに持つ（画像は
- *   `image/imageFormats.ts`）。ここは表から関数を作る `formatTable` と、表によらない関数だけを置く。
+ *   `image/imageFormats.ts`）。ここは表から関数を作る `formatTable` と、表によらない関数だけを置く。アイテムの種類から表を
+ *   引くのは `kindTraits.ts` の `formatsFor`。
  * - 書き出しの名前は Rust の `kura_core::export::names::export_name` と同じ規則（形式が同じなら元の名前のまま、違えば
  *   元の名前の語幹に今の拡張子）。出力の行の「書き出すときの名前：hero.webp」に使う。
  */

@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 
 import { setRating } from '../library/actions';
 import { IMAGE_STEP_MS } from './PlayBar';
-import { canEdit, openEditor } from '../editor/editorStore';
+import { canEdit, openEditor } from '../editor/editorKinds';
 import { cycleRepeat, playerController, toggleFullscreen, toggleShuffle } from './playerActions';
 import { usePlayerStore } from './playerStore';
 

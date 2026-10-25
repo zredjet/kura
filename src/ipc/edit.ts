@@ -40,6 +40,7 @@ import {
   type ParamKind,
   type ParamSpec,
   type Unit,
+  type ValueKind,
 } from './bindings';
 import { unwrap } from './result';
 
@@ -75,6 +76,7 @@ export type {
   ParamKind,
   ParamSpec,
   Unit,
+  ValueKind,
 };
 
 /** 文書の出力（Rust が返す形）。 */

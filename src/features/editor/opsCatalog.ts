@@ -17,8 +17,9 @@ import {
   type ParamSpec,
 } from '../../ipc/edit';
 import { formatCount } from '../../lib/format';
-import { toHex } from './image/color';
 import type { EditorDoc } from './editorStore';
+import { toHex } from './image/color';
+import { type EditorKind, opInputsOf } from './kindTraits';
 
 const t = ja.editor;
 
@@ -77,16 +78,18 @@ export function opSpec(
   return d;
 }
 
-/** 画像のエディタで足せる操作（入力に画像かフレームの列を受けるもの）を分類ごとに。 */
+/**
+ * その種類のエディタで足せる操作（最初の入力が種類の入力のどれかを受けるもの。画像は画像かフレームの列）を分類ごとに。
+ */
 export function addableOps(
+  kind: EditorKind,
   catalog: readonly OpDescriptor[] = EDIT_CATALOG,
 ): { category: OpCategory; ops: OpDescriptor[] }[] {
-  const imageOps = catalog.filter((o) =>
-    o.signature.inputs[0]?.accepts.some((k) => k === 'image' || k === 'frames'),
-  );
+  const inputs = opInputsOf(kind);
+  const ops = catalog.filter((o) => o.signature.inputs[0]?.accepts.some((k) => inputs.includes(k)));
   return CATEGORY_ORDER.map((category) => ({
     category,
-    ops: imageOps.filter((o) => opCategory(o.id) === category),
+    ops: ops.filter((o) => opCategory(o.id) === category),
   })).filter((g) => g.ops.length > 0);
 }
 

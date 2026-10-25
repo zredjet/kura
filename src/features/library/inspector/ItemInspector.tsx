@@ -15,7 +15,7 @@ import { dateTimeLabel } from '../../../lib/dates';
 import { shortHash } from '../../../lib/format';
 import { useViewStore } from '../../../stores/viewStore';
 import { AssetSection } from '../../asset/AssetSection';
-import { canEdit, openEditor } from '../../editor/editorStore';
+import { canEdit, openEditor } from '../../editor/editorKinds';
 import { useAssetStage } from '../../asset/AssetStage';
 import { useAssetData } from '../../asset/useAssetData';
 import { TagChips } from '../../tags/TagChips';

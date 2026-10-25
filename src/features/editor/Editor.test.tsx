@@ -6,6 +6,7 @@ import { EDIT_OPS, type IssueCode } from '../../ipc/edit';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { Editor } from './Editor';
 import { useEditorStore } from './editorStore';
+import { useImageStore } from './image/imageStore';
 import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
 
 vi.mock('../library/inspector/ItemInspector', () => ({
@@ -36,6 +37,7 @@ const ITEM = {
 function openState() {
   useEditorStore.setState({
     phase: 'open',
+    kind: 'image',
     item: ITEM,
     session: 'aa01',
     source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png' },
@@ -63,6 +65,10 @@ function openState() {
       },
       outputs: [],
     },
+    failure: null,
+    panel: 'ops',
+  });
+  useImageStore.setState({
     view: {
       rev: 2,
       level: 0,
@@ -76,8 +82,6 @@ function openState() {
       fallback: null,
     },
     frame: 0,
-    failure: null,
-    panel: 'ops',
     zoom: 2,
   });
 }
@@ -160,8 +164,8 @@ describe('画像エディタの画面', () => {
 
   it('透明を持てない形式では消しゴムを押せない', () => {
     openState();
-    const view = useEditorStore.getState().view;
-    if (view) useEditorStore.setState({ view: { ...view, format: 'rgb8' } });
+    const view = useImageStore.getState().view;
+    if (view) useImageStore.setState({ view: { ...view, format: 'rgb8' } });
     render(<Editor />);
     expect(screen.getByRole('button', { name: t.withKey(t.toolNames.eraser, 'E') })).toBeDisabled();
   });
@@ -169,6 +173,7 @@ describe('画像エディタの画面', () => {
   it('開けなかったら理由と「もう一度」「閉じる」。閉じるとエディタが消える', () => {
     useEditorStore.setState({
       phase: 'error',
+      kind: 'image',
       item: ITEM,
       failure: { kind: 'open', code: 'Busy', message: '混んでいます' },
     });

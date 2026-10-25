@@ -8,10 +8,11 @@ import { ja } from '../../i18n/ja';
 import type { Issue, JsonValue, ParamSpec } from '../../ipc/edit';
 import { formatCount } from '../../lib/format';
 import { isImeKey } from '../../lib/ime';
-import { toHex } from './image/color';
-import { ColorPicker, Swatch } from './image/ColorPicker';
 import styles from './Editor.module.css';
 import { sendParam, useEditorStore } from './editorStore';
+import { toHex } from './image/color';
+import { ColorPicker, Swatch } from './image/ColorPicker';
+import type { PaintColor } from './image/stroke';
 import {
   clampNumber,
   controlFor,
@@ -34,7 +35,6 @@ import {
   unitLabel,
 } from './opsCatalog';
 import type { ParamGesture } from './paramSend';
-import type { PaintColor } from './image/stroke';
 
 const t = ja.editor;
 

@@ -4,23 +4,26 @@ import { markReplayed } from '../../lib/keys';
 import { openSaveAs, requestCloseEditor, requestSave } from './editorSave';
 import { handleEditorKey, handleEditorKeyUp } from './editorKeys';
 import {
+  editorRedo,
+  editorUndo,
+  moveSelected,
+  removeSelected,
+  selectAdjacent,
+  toggleEditorInfo,
+  useEditorStore,
+} from './editorStore';
+import {
   cancelCrop,
   confirmCrop,
   editorActualSize,
   editorFit,
-  editorRedo,
-  editorUndo,
   editorZoom,
-  moveSelected,
   nudgeCropRect,
-  removeSelected,
-  selectAdjacent,
   selectTool,
   stepEditorFrame,
   strokeCancel,
-  toggleEditorInfo,
-  useEditorStore,
-} from './editorStore';
+  useImageStore,
+} from './image/imageStore';
 import { DEFAULT_TOOLS, type EditorTool, useToolStore } from './image/toolStore';
 
 vi.mock('./editorSave', () => ({
@@ -31,21 +34,25 @@ vi.mock('./editorSave', () => ({
 
 vi.mock('./editorStore', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./editorStore')>()),
-  cancelCrop: vi.fn(),
-  confirmCrop: vi.fn(),
   moveSelected: vi.fn(),
-  nudgeCropRect: vi.fn(() => true),
   removeSelected: vi.fn(),
   selectAdjacent: vi.fn(),
+  editorRedo: vi.fn(),
+  editorUndo: vi.fn(),
+  toggleEditorInfo: vi.fn(),
+}));
+
+vi.mock('./image/imageStore', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./image/imageStore')>()),
+  cancelCrop: vi.fn(),
+  confirmCrop: vi.fn(),
+  nudgeCropRect: vi.fn(() => true),
   selectTool: vi.fn((tool: EditorTool) => useToolStore.getState().setTool(tool)),
   editorActualSize: vi.fn(),
   editorFit: vi.fn(),
-  editorRedo: vi.fn(),
-  editorUndo: vi.fn(),
   editorZoom: vi.fn(),
   stepEditorFrame: vi.fn(),
   strokeCancel: vi.fn(() => false),
-  toggleEditorInfo: vi.fn(),
 }));
 
 function press(key: string, init: KeyboardEventInit = {}, target?: EventTarget): boolean {
@@ -57,13 +64,15 @@ function press(key: string, init: KeyboardEventInit = {}, target?: EventTarget):
 describe('エディタのキー', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    useEditorStore.setState({ phase: 'open', temporary: null, view: null });
+    useEditorStore.setState({ phase: 'open', kind: 'image' });
+    useImageStore.setState({ temporary: null, view: null });
     useToolStore.setState({ ...DEFAULT_TOOLS });
   });
 
   afterEach(() => {
     document.body.innerHTML = '';
-    useEditorStore.setState({ phase: 'closed', crop: null });
+    useEditorStore.setState({ phase: 'closed' });
+    useImageStore.setState({ crop: null });
   });
 
   it('B・E・G・I・H で道具を替える', () => {
@@ -80,7 +89,7 @@ describe('エディタのキー', () => {
   });
 
   it('透明を持てない形式では E で消しゴムにしない', () => {
-    useEditorStore.setState({
+    useImageStore.setState({
       view: {
         rev: 1,
         level: 0,
@@ -139,7 +148,7 @@ describe('エディタのキー', () => {
   it('C で切り抜き。切り抜きの間は矢印で枠を動かし（⇧ で 10px）、↵ で切り抜き、esc でやめる', () => {
     press('c');
     expect(selectTool).toHaveBeenCalledWith('crop');
-    useEditorStore.setState({
+    useImageStore.setState({
       crop: {
         node: null,
         rect: { x: 0, y: 0, w: 4, h: 4 },
@@ -192,28 +201,28 @@ describe('エディタのキー', () => {
 
   it('Space・⌥ は押している間だけ手のひら・スポイト（離したら戻す）', () => {
     press(' ');
-    expect(useEditorStore.getState().temporary).toBe('hand');
+    expect(useImageStore.getState().temporary).toBe('hand');
     handleEditorKeyUp(new KeyboardEvent('keyup', { key: ' ' }));
-    expect(useEditorStore.getState().temporary).toBeNull();
+    expect(useImageStore.getState().temporary).toBeNull();
     press('Alt', { altKey: true });
-    expect(useEditorStore.getState().temporary).toBe('eyedropper');
+    expect(useImageStore.getState().temporary).toBe('eyedropper');
     handleEditorKeyUp(new KeyboardEvent('keyup', { key: 'Alt' }));
-    expect(useEditorStore.getState().temporary).toBeNull();
+    expect(useImageStore.getState().temporary).toBeNull();
     // 手のひらのときは ⌥ でスポイトにしない
     useToolStore.setState({ tool: 'hand' });
     press('Alt', { altKey: true });
-    expect(useEditorStore.getState().temporary).toBeNull();
+    expect(useImageStore.getState().temporary).toBeNull();
   });
 
   it('メニューが送った Space・⌥ では押している間だけの道具にしない（離したキーが来ない）', () => {
     const space = new KeyboardEvent('keydown', { key: ' ', cancelable: true });
     markReplayed(space);
     expect(handleEditorKey(space)).toBe(false);
-    expect(useEditorStore.getState().temporary).toBeNull();
+    expect(useImageStore.getState().temporary).toBeNull();
     const alt = new KeyboardEvent('keydown', { key: 'Alt', altKey: true, cancelable: true });
     markReplayed(alt);
     expect(handleEditorKey(alt)).toBe(false);
-    expect(useEditorStore.getState().temporary).toBeNull();
+    expect(useImageStore.getState().temporary).toBeNull();
   });
 
   it('選択・スライダー・スイッチの上では ⌘ の組み合わせだけを受け、矢印・Space は部品に任せる', () => {
@@ -232,7 +241,7 @@ describe('エディタのキー', () => {
     expect(press('ArrowDown', {}, select)).toBe(false);
     expect(press(' ', {}, checkbox)).toBe(false);
     expect(stepEditorFrame).not.toHaveBeenCalled();
-    expect(useEditorStore.getState().temporary).toBeNull();
+    expect(useImageStore.getState().temporary).toBeNull();
     // 文字を打つ入力欄では ⌘Z も文字の取り消し（エディタは受けない）
     const text = document.createElement('input');
     expect(press('z', { metaKey: true, code: 'KeyZ' } as KeyboardEventInit, text)).toBe(false);

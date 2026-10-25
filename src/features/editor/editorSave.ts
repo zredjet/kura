@@ -1,5 +1,6 @@
 /**
- * 画像エディタの保存・閉じる・下書きの流れ（M12 の段 5b。docs/editing.md §12.12・§14、design.md §3.1「画像エディタ」）。
+ * エディタの保存・閉じる・下書きの流れ（M12 の段 5b。種類によらない核。docs/editing.md §12.12・§14、design.md §3.1
+ * 「画像エディタ」）。
  *
  * - 保存（⌘S。上書き）：警告があるときだけ確認のシートに警告を並べる。保存のジョブを積み（`edit_save`）、進捗はボタンの中、
  *   終わったら知らせる。保存が待っている間に積むと Busy。
@@ -50,15 +51,15 @@ import {
   type EditorSave,
   hasUnsavedChanges,
   onEditorResult,
-  openEditor,
   refreshEditorView,
+  reopenEditorWith,
   type SaveMode,
   type SizeBefore,
   useEditorStore,
   whenEditorSettled,
 } from './editorStore';
 import { outputChoice } from './formats';
-import { effectiveFormat, formatOfExt } from './image/imageFormats';
+import { formatsFor } from './kindTraits';
 
 const t = ja.editor;
 
@@ -201,7 +202,12 @@ function armSlow(job: number): void {
 /** 出力の形式が「元と同じ」で元の形式に書けなければ、書ける形式を渡す（PSD・HEIC などを開いて保存するとき）。 */
 function forcedFormat(): EditFormatChoice {
   const s = useEditorStore.getState();
-  const { format, forced } = effectiveFormat(outputChoice(s.doc.outputs), formatOfExt(s.item?.ext));
+  const formats = formatsFor(s.item);
+  if (!formats) return null;
+  const { format, forced } = formats.effectiveFormat(
+    outputChoice(s.doc.outputs),
+    formats.formatOfExt(s.item?.ext),
+  );
   return forced ? { type: 'to', format } : null;
 }
 
@@ -389,7 +395,7 @@ export function answerDraft(answer: 'discard' | 'open'): void {
   if (!item || s.sheet?.kind !== 'draft') return;
   useEditorStore.setState({ sheet: null });
   if (answer === 'open' && s.draft?.fresh) {
-    void openEditor(item, { fromDraft: true });
+    void reopenEditorWith(item, { fromDraft: true });
     return;
   }
   discardEditDraft(item.id).then(
@@ -506,7 +512,7 @@ async function reopenAfterRevert(): Promise<void> {
     refreshLibrary([item.id]);
     const [fresh] = await getItems([item.id]);
     await closeEditor({ discardDraft: true });
-    await openEditor(fresh ?? item);
+    await reopenEditorWith(fresh ?? item);
     notify(t.reverted);
     await checkAssetFit(item.id, sizeOf(item), sizeOf(fresh));
   } catch (error) {
