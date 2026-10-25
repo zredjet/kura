@@ -762,7 +762,7 @@ mod tests {
     use super::store::save_partial;
     use super::*;
     use std::sync::OnceLock;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     type RunFn = dyn Fn(&JobContext) -> Result<JobEnd> + Send + Sync;
     struct FnHandler(Box<RunFn>);
@@ -1048,6 +1048,28 @@ mod tests {
         })
     }
 
+    /// `gate` が開いている（真）間は `timed` と同じく `ms` で終わり、閉じていれば開くまで（5 秒まで）終わらないジョブ。
+    /// 「動いている間」を時間でなくテストが握って確かめる（CI の遅い機械で、確かめる前に終わらないように）。
+    fn gated(
+        timeline: &Timeline,
+        name: &'static str,
+        ms: u64,
+        gate: &Arc<AtomicBool>,
+    ) -> Box<RunFn> {
+        let timeline = timeline.clone();
+        let gate = gate.clone();
+        Box::new(move |_| {
+            timeline.lock().unwrap().push(format!("{name}+"));
+            std::thread::sleep(Duration::from_millis(ms));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !gate.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            timeline.lock().unwrap().push(format!("{name}-"));
+            done("{}")
+        })
+    }
+
     fn position(timeline: &Timeline, mark: &str) -> usize {
         let t = timeline.lock().unwrap();
         t.iter()
@@ -1068,10 +1090,11 @@ mod tests {
     fn analyze_is_not_claimed_while_import_or_thumbnail_is_active() {
         let f = fixture();
         let timeline: Timeline = Arc::default();
+        let open = Arc::new(AtomicBool::new(true));
         let jobs = manager_with(
             &f,
             vec![
-                (JobKind::Import, timed(&timeline, "import", 120)),
+                (JobKind::Import, gated(&timeline, "import", 120, &open)),
                 (JobKind::Thumbnail, timed(&timeline, "thumbnail", 120)),
                 (JobKind::Analyze, timed(&timeline, "analyze", 0)),
             ],
@@ -1086,13 +1109,15 @@ mod tests {
         assert!(started > position(&timeline, "thumbnail-"), "{timeline:?}");
         assert_eq!(jobs.get(analyze).unwrap().state, JobState::Done);
 
-        // 動いている取り込みのあとに積んだ解析も、取り込みが終わるまで待つ
+        // 動いている取り込みのあとに積んだ解析も、取り込みが終わるまで待つ（取り込みは門を開けるまで終わらない）
         timeline.lock().unwrap().clear();
+        open.store(false, Ordering::SeqCst);
         let import = jobs.enqueue(JobKind::Import, "{}".into()).unwrap();
         wait_state(&jobs, import, JobState::Running);
         let analyze = jobs.ensure_queued(JobKind::Analyze, "{}").unwrap().unwrap();
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(jobs.get(analyze).unwrap().state, JobState::Queued);
+        open.store(true, Ordering::SeqCst);
         assert!(jobs.wait_idle(Duration::from_secs(5)));
         assert!(position(&timeline, "analyze+") > position(&timeline, "import-"));
     }
