@@ -188,13 +188,20 @@ impl Filter {
         // 範囲の外の入力（0）は足しても値が変わらない（acc は +0 から始まるので −0 にならない）ので飛ばす
         let lo = (-base).clamp(0, self.k as i128) as usize;
         let hi = (i128::from(total_len) - base).clamp(0, self.k as i128) as usize;
-        for (kk, c) in row.iter().enumerate().take(hi.max(lo)).skip(lo) {
-            let at = base + kk as i128 - i128::from(win_start);
-            let Some(x) = usize::try_from(at).ok().and_then(|at| win.get(at)) else {
-                return Err(EngineError::Internal(
-                    "変換の窓が出力の読む範囲を含みません".into(),
-                ));
-            };
+        if hi <= lo {
+            return Ok(0.0);
+        }
+        // 読む入力はタップ [lo, hi) に当たる連続の区間：窓に入っているかを 1 度だけ確かめ、タップと窓の切れを並べて足す
+        // （タップごとに位置を確かめない。同じ項を同じ順に足すので値は変わらない）
+        let xs = usize::try_from(base + lo as i128 - i128::from(win_start))
+            .ok()
+            .and_then(|s| win.get(s..s.checked_add(hi - lo)?));
+        let (Some(xs), Some(cs)) = (xs, row.get(lo..hi)) else {
+            return Err(EngineError::Internal(
+                "変換の窓が出力の読む範囲を含みません".into(),
+            ));
+        };
+        for (c, x) in cs.iter().zip(xs) {
             acc += c * f64::from(*x);
         }
         Ok(acc as f32)
@@ -271,6 +278,67 @@ mod tests {
         let plane = vec![0.25f32; 4_000];
         for n in 300..4_000u64 {
             assert_eq!(f.output_window(&plane, 0, 4_000, n).unwrap(), 0.25);
+        }
+    }
+
+    /// 窓を 1 度だけ確かめる `output_window` は、タップごとに位置を確かめて足す形（M13 段 1 の C3 の形）とビット単位で同じで、
+    /// 窓が出力の読む範囲を欠けば `Internal`（検証の直し：内側のループを速くした）。
+    #[test]
+    fn output_window_equals_the_per_tap_reference() {
+        let reference = |f: &Filter, win: &[f32], win_start: u64, total: u64, n: u64| {
+            let num = u128::from(n) * u128::from(f.m);
+            let i = num / u128::from(f.l);
+            let p = (num % u128::from(f.l)) as usize;
+            let h = (f.k / 2) as i128;
+            let base = i as i128 - (h - 1);
+            let row = &f.coeffs[p * f.k..(p + 1) * f.k];
+            let mut acc = 0f64;
+            for (kk, c) in row.iter().enumerate() {
+                let at = base + kk as i128;
+                if at < 0 || at >= i128::from(total) {
+                    continue;
+                }
+                let x = usize::try_from(at - i128::from(win_start))
+                    .ok()
+                    .and_then(|at| win.get(at))?;
+                acc += c * f64::from(*x);
+            }
+            Some(acc as f32)
+        };
+        let mut r = crate::determinism::rng(3);
+        for (from, to) in [
+            (48_000u32, 44_100u32),
+            (44_100, 48_000),
+            (8_000, 12_000),
+            (96_000, 8_000),
+        ] {
+            let f = design(from, to, &NoMonitor).unwrap();
+            let total = 3_000u64;
+            let plane: Vec<f32> = (0..total)
+                .map(|_| {
+                    use rand_chacha::rand_core::Rng;
+                    (f64::from(r.next_u32()) / 4_294_967_296.0 - 0.5) as f32
+                })
+                .collect();
+            let n_out = out_frames(total, from, to).unwrap();
+            let h = f.k as u64 / 2;
+            for n in (0..n_out).step_by(7).chain([0, 1, n_out - 1]) {
+                let want = reference(&f, &plane, 0, total, n).unwrap();
+                let got = f.output_window(&plane, 0, total, n).unwrap();
+                assert_eq!(got.to_bits(), want.to_bits(), "{from}→{to} n={n}");
+                // 出力の読む範囲だけの窓（入力の長さで切ったもの）
+                let (a, b) = source_window(f.l, f.m, h, n, n + 1);
+                let b = b.min(total);
+                let win = &plane[a as usize..b as usize];
+                let got = f.output_window(win, a, total, n).unwrap();
+                assert_eq!(got.to_bits(), want.to_bits(), "{from}→{to} n={n} 窓");
+                // 窓が 1 標本欠ける（読む範囲が空でなければ断る）
+                if a < b {
+                    let short = &plane[a as usize + 1..b as usize];
+                    assert!(f.output_window(short, a + 1, total, n).is_err());
+                    assert!(reference(&f, short, a + 1, total, n).is_none());
+                }
+            }
         }
     }
 
