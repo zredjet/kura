@@ -572,14 +572,7 @@ fn quantized_outputs_keep_only_the_requested_chunks() {
                 };
                 let read = src.stats().reads - reads;
                 check_region(&got, &want, &area).unwrap_or_else(|m| panic!("{what}: {m}"));
-                assert_eq!(
-                    got.audio_valid(),
-                    Some(kura_engine::render::audio::chunk_spans(
-                        &want_chunks,
-                        frames as usize
-                    )),
-                    "{what}"
-                );
+                assert_eq!(got.audio_valid(), Some(want_chunks.clone()), "{what}");
                 assert_eq!(got.resident_bytes(), want_bytes, "{what}：常駐");
                 assert_eq!(got.origin(), Origin::Partial, "{what}");
                 assert!(
@@ -645,10 +638,7 @@ fn partial_values_deliver_only_drawn_chunks() {
     let v = &got.value;
     let mut valid = ChunkSet::empty(3);
     valid.insert(1);
-    assert_eq!(
-        v.audio_valid(),
-        Some(kura_engine::render::region::Spans::one(C, 2 * C))
-    );
+    assert_eq!(v.audio_valid(), Some(valid.clone()));
     assert_eq!(
         chunks_covering(&Area::span(C, 2 * C), 3 * C as usize),
         valid
@@ -776,9 +766,16 @@ fn spans_within(inner: &Spans, outer: &Area, n: u64) -> bool {
         .all(|(a, b)| outer.spans().iter().any(|(c, d)| c <= a && b <= d))
 }
 
-/// 表示の値の有効なチャンクの区間（区間を含めて広げた推論の確かめに使う）。
+/// 表示の値の有効なチャンクの区間（区間を含めて広げた推論の確かめに使う。畳まれても広がるだけ）。
 fn valid_spans(v: &View) -> Spans {
-    v.value().audio_valid().unwrap_or_default()
+    let frames = match v.value().shape() {
+        Shape::Audio { frames, .. } => frames.max() as usize,
+        _ => 0,
+    };
+    v.value()
+        .audio_valid()
+        .map(|set| kura_engine::render::audio::chunk_spans(&set, frames))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Default)]
@@ -1093,15 +1090,122 @@ fn audio_view_keeps_only_requested_chunks() {
             .unwrap()
     };
     let a = view(Area::span(0, 10), None, &mut cache);
-    assert_eq!(a.view.value().audio_valid(), Some(Spans::one(0, C)));
+    let one = |k: usize| {
+        let mut set = ChunkSet::empty(3);
+        set.insert(k);
+        Some(set)
+    };
+    assert_eq!(a.view.value().audio_valid(), one(0));
     let b = view(Area::span(2 * C + 1, 2 * C + 2), Some(&a.view), &mut cache);
-    assert_eq!(b.view.value().audio_valid(), Some(Spans::one(2 * C, 3 * C)));
+    assert_eq!(b.view.value().audio_valid(), one(2));
     assert_eq!(b.changed, OutputChange::Samples(Spans::one(2 * C, 3 * C)));
     assert_eq!(b.view.value().resident_bytes(), C * 4);
     // 同じ窓をもう一度：何も描かず、前の表示のチャンクを共有する
     let c = view(Area::span(2 * C + 1, 2 * C + 2), Some(&b.view), &mut cache);
     assert_eq!(c.changed, OutputChange::Samples(Spans::new()));
     assert_eq!((c.area.drawn_chunks, c.area.reused_chunks), (0, 1));
+}
+
+/// 検証の直し（M13 段 1）：継ぎはぎで描くチャンクが 64 を超える区間に散らばっても（区間（`Spans`）に直すと外接の区間に
+/// 畳まれる）、前の表示と共有するチャンクは描き直さず、量子化（TPDF。2 度当てると変わる）は描いたチャンクだけに当たる。
+/// 値は `render` と同じで、`reused_chunks` は実際に共有した数。表示の値の有効なチャンク（`audio_valid`）も畳まずに報告する。
+#[test]
+fn scattered_patches_keep_the_shared_chunks() {
+    use kura_engine::doc::{Dither, QUANTIZE_VERSION, Quantize};
+    let engine = engine();
+    let chunks = 131u64;
+    let input = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 1,
+        frames: chunks * C,
+        seed: 71,
+    }
+    .generate()
+    .unwrap();
+    let source = Digest([6; 32]);
+    let fin = inputs_of(&input, source);
+    // ゲイン → フェード（出力のノードはフェード、ゲインは上流の範囲を持つノード）
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 1)
+        .unwrap();
+    g.push_linear(
+        "audio.fade",
+        1,
+        json!({ "fadeIn": 100, "fadeOut": 0, "curve": "linear" }),
+        2,
+    )
+    .unwrap();
+    g.outputs[0].quantize = Some(Quantize {
+        v: QUANTIZE_VERSION,
+        bits: 16,
+        dither: Dither::Tpdf,
+        seed: 3,
+    });
+    let plan = compile(&engine, &g, &input).unwrap();
+    let (want, _) = render(&engine, &plan, &input, source).unwrap();
+    // 前の表示：チャンク 1, 3, …, 127 の中の 1 標本ずつ（64 区間）
+    let mut spans = Spans::new();
+    for k in (1..128u64).step_by(2) {
+        spans.push(k * C + 5, k * C + 6);
+    }
+    assert_eq!(spans.spans().len(), 64);
+    let first_area = Area::samples(spans);
+    for cap in [0, 1 << 30] {
+        let mut cache = NodeCache::new(cap);
+        let req = |area: Area| ViewRequest {
+            output: OutputId(0),
+            area,
+            focus: None,
+        };
+        let first = engine
+            .render_view(
+                &plan,
+                &fin,
+                &mut cache,
+                &req(first_area.clone()),
+                None,
+                &NoMonitor,
+            )
+            .unwrap();
+        check_region(first.view.value(), &want, &first_area).unwrap();
+        let odd = first.view.value().audio_valid().unwrap();
+        assert_eq!(
+            odd.count(),
+            64,
+            "上限 {cap}：前の表示の有効なチャンクを畳まずに報告する"
+        );
+        // 全体を頼む：共有するチャンク 64、描くチャンク 67（区間にすると 65 個で、畳まれる）
+        let got = engine
+            .render_view(
+                &plan,
+                &fin,
+                &mut cache,
+                &req(Area::All),
+                Some(&first.view),
+                &NoMonitor,
+            )
+            .unwrap();
+        let what = format!("上限 {cap}：{:?}", got.area);
+        check_region(got.view.value(), &want, &Area::All).unwrap_or_else(|m| panic!("{what}: {m}"));
+        assert_eq!(got.area.reused_chunks, 64, "{what}");
+        for k in odd.iter() {
+            assert!(
+                got.view
+                    .value()
+                    .shares_audio_chunk(first.view.value(), 0, k),
+                "{what}：チャンク {k} を描き直した"
+            );
+        }
+        // 出力のノード（フェード）は描くチャンクだけを描く（上流のゲインは畳んだ区間で描いてよい）
+        assert!(
+            got.area.drawn_chunks <= 67 + chunks,
+            "{what}：描いたチャンクが多すぎる"
+        );
+        assert_eq!(
+            got.view.value().audio_valid().map(|s| s.count()),
+            Some(chunks as usize)
+        );
+    }
 }
 
 /// E38（M13 段 1 の C11）：トリムの終わりだけを動かす手（縮める・伸ばす）は、尻（とフェードアウトの窓）だけを報告し、頭の

@@ -212,7 +212,8 @@ impl Engine {
         Ok(true)
     }
 
-    /// 音声の範囲を持つノード 1 つを、`rounded`（出力のチャンクに揃えた区間）のチャンクだけ描く。全体の描画と同じ `apply_node`
+    /// 音声の範囲を持つノード 1 つを、`rounded`（出力のチャンクに揃えた区間）のチャンクだけ描く（`draw` があれば、そのチャンク
+    /// だけ。継ぎはぎの出力のノードが、前の値と共有するチャンクを描き直さないように集合で渡す）。全体の描画と同じ `apply_node`
     /// を通る（写し方の確かめ・メタデータの写しは同じ）。申告した解析は先に解く（流し解きした結果 → キャッシュ → 入力が完全な
     /// 値なら解いて入れる）。核のメタデータ（`meta()`、なければ入力 0 のもの）を付けて描き、写し方は実行器が当て直す。
     #[allow(clippy::too_many_arguments)]
@@ -223,6 +224,7 @@ impl Engine {
         node: &PlannedNode,
         ins: &[Value],
         rounded: &Area,
+        draw: Option<&ChunkSet>,
         base: Option<&Value>,
         presolved: &mut Presolved,
         stats: &mut AreaStats,
@@ -297,7 +299,10 @@ impl Engine {
                 });
                 let frames = usize::try_from(k.frames())
                     .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-                let picks = chunks_covering(rounded, frames);
+                let picks = match draw {
+                    Some(d) => d.clone(),
+                    None => chunks_covering(rounded, frames),
+                };
                 drawn = picks.count() as u64;
                 let (a, s) = crate::audio::render_chunks(
                     k.as_ref(),

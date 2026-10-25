@@ -1117,13 +1117,11 @@ impl PartialValue {
 
     // 音声の配信の口（M13 段 1。読むだけで、保存の道に渡せる値は返さない）
 
-    /// 音声の有効なチャンクの区間（隣り合うものは 1 つ。画像は None）。
-    pub fn audio_valid(&self) -> Option<Spans> {
+    /// 音声の有効なチャンクの番号（画像は None）。区間（`Spans`）にすると 64 個を超えたときに外接の区間へ畳まれ、無効な
+    /// チャンクまで有効と報告してしまうので、集合で返す（区間が要るなら `render::audio::chunk_spans`。M13 段 1 の検証の直し）。
+    pub fn audio_valid(&self) -> Option<crate::value::ChunkSet> {
         match &self.value {
-            Value::Audio(a) => Some(crate::render::audio::chunk_spans(
-                &a.valid_chunks(),
-                a.frames(),
-            )),
+            Value::Audio(a) => Some(a.valid_chunks()),
             _ => None,
         }
     }

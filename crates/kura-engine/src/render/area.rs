@@ -161,7 +161,7 @@ pub(super) struct PortPass {
     pub exact: bool,
     /// 前の値のタイル・チャンクを実際に使った。
     pub patched: bool,
-    /// 音声の継ぎはぎで、出力のノードが前の値から共有したチャンク（量子化を当て直さない）。
+    /// 音声の継ぎはぎで、出力の値が前の値と実際に実体を共有したチャンク（全チャンネルで `same_chunk`。量子化を当て直さない）。
     pub kept: Option<ChunkSet>,
 }
 
@@ -209,8 +209,9 @@ enum Region {
 struct Patch {
     node: NodeId,
     base: Value,
-    /// 音声：前の値から共有するチャンク。
-    kept: Option<ChunkSet>,
+    /// 音声：出力のノードが核で描くチャンク（`要る − 共有する`）。区間（`Spans`）に直すと 64 個を超えたときに外接の区間へ
+    /// 畳まれ、共有するチャンクまで描き直す（量子化がそれに当たらない）ので、集合のまま核へ渡す（検証の直し）。
+    draw: Option<ChunkSet>,
 }
 
 impl Engine {
@@ -539,14 +540,14 @@ impl Engine {
                                 chunks_covering(&round_to_chunks(&target, out_shape), frames);
                             let changed = chunks_covering(b.changed, frames);
                             let (draw, keep) = patch_target_audio(prev, &need, &changed, frames);
-                            // 共有できるチャンクがなければ継ぎはぎしない
+                            // 共有できるチャンクがなければ継ぎはぎしない。上流へ伝える範囲は描くチャンクの区間（畳まれても
+                            // 大きくなるだけで保守的）、出力のノードの核は描くチャンクの集合だけを描く
                             if !keep.is_empty() {
-                                stats.reused_chunks = keep.count() as u64;
                                 target = Area::samples(chunk_spans(&draw, frames));
                                 patch = Some(Patch {
                                     node: at,
                                     base: Value::Audio(Arc::new(prev.keep_only(&keep))),
-                                    kept: Some(keep),
+                                    draw: Some(draw),
                                 });
                             }
                         }
@@ -562,7 +563,7 @@ impl Engine {
                                 patch = Some(Patch {
                                     node: at,
                                     base: invalidate(image, b.changed)?,
-                                    kept: None,
+                                    draw: None,
                                 });
                             }
                         }
@@ -700,8 +701,12 @@ impl Engine {
                     (v, false)
                 } else if let Some(Region::Chunks(rounded)) = region {
                     patched |= base_v.is_some();
+                    let draw = patch
+                        .as_ref()
+                        .filter(|p| p.node == node.id)
+                        .and_then(|p| p.draw.as_ref());
                     let run = self.run_audio_region(
-                        cx, cache, node, &ins, &rounded, base_v, presolved, stats, mon,
+                        cx, cache, node, &ins, &rounded, draw, base_v, presolved, stats, mon,
                     );
                     // 申告した依存の外（無効なチャンク）を読んだら、範囲の描画を捨てる
                     if ins.iter().any(Value::holes_read) {
@@ -782,12 +787,29 @@ impl Engine {
         let value = values
             .remove(&out_node)
             .ok_or_else(|| EngineError::Internal("出力の値がありません".into()))?;
+        // 音声の継ぎはぎで前の値から共有したチャンクは、描いたあとの値で実際に実体を共有したもので数える（共有すると決めた
+        // チャンクを描き直していれば、量子化はそれに当て直す。数え方の誤りで量子化を飛ばさない）
+        let kept = match (&patch, &value) {
+            (
+                Some(Patch {
+                    base: Value::Audio(b),
+                    draw: Some(_),
+                    ..
+                }),
+                Value::Audio(a),
+            ) if patched => {
+                let set = shared_chunks(a, b);
+                stats.reused_chunks = set.count() as u64;
+                Some(set)
+            }
+            _ => None,
+        };
         Ok(PortPass {
             value,
             warnings,
             exact: exact.get(&out_node).copied().unwrap_or(false),
             patched,
-            kept: patch.and_then(|p| p.kept),
+            kept,
         })
     }
 
@@ -921,6 +943,23 @@ impl AudioFinish<'_> {
         }
         Ok((Value::Audio(out), exact))
     }
+}
+
+/// `a` のチャンクのうち、`b` の同じ番号のチャンクと全チャンネルで実体を共有しているもの（どちらでも有効で、長さが同じ）。
+fn shared_chunks(a: &Audio, b: &Audio) -> ChunkSet {
+    let mut set = ChunkSet::empty(a.chunk_count());
+    if a.rate() != b.rate() || a.channels() != b.channels() {
+        return set;
+    }
+    for k in a.valid_chunks().iter() {
+        if k < b.chunk_count()
+            && a.chunk_range(k).len() == b.chunk_range(k).len()
+            && (0..a.channels()).all(|ch| a.same_chunk(b, ch, k))
+        {
+            set.insert(k);
+        }
+    }
+    set
 }
 
 /// 計画の値の形（入力とノード）。
