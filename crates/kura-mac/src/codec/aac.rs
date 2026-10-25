@@ -181,7 +181,10 @@ mod tests {
                 (rate, channels, frames),
                 "{rate} {channels} {frames}"
             );
-            let (x, y) = (&a.planes()[0][..], &b.planes()[0][..]);
+            let (x, y) = (
+                &a.to_planes().unwrap()[0][..],
+                &b.to_planes().unwrap()[0][..],
+            );
             let best = (-64..=64)
                 .max_by(|&p, &q| correlate(x, y, p).total_cmp(&correlate(x, y, q)))
                 .unwrap();
@@ -251,10 +254,13 @@ mod tests {
             let (a, b) = (audio(&src), audio(&back));
             assert_eq!((b.channels(), b.frames()), (channels, 48_000));
             for c in 0..channels {
-                let same = ncc(&a.planes()[c], &b.planes()[c]);
+                let same = ncc(&a.to_planes().unwrap()[c], &b.to_planes().unwrap()[c]);
                 assert!(same > 0.9, "{channels} ch・チャンネル {c}: {same}");
                 for o in (0..channels).filter(|o| *o != c) {
-                    assert!(ncc(&a.planes()[o], &b.planes()[c]).abs() < same, "{c} {o}");
+                    assert!(
+                        ncc(&a.to_planes().unwrap()[o], &b.to_planes().unwrap()[c]).abs() < same,
+                        "{c} {o}"
+                    );
                 }
             }
         }

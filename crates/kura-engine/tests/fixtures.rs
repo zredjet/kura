@@ -204,7 +204,7 @@ fn audio(
         )
         .unwrap_or_else(|e| panic!("{name}: {e}"));
     let Value::Audio(a) = v else { panic!("{name}") };
-    let planes = a.planes().iter().map(|p| p.to_vec()).collect();
+    let planes = a.to_planes().unwrap().iter().map(|p| p.to_vec()).collect();
     (
         stamp.codec,
         stamp.reproducible,
@@ -502,7 +502,7 @@ fn truncated_mp3_reads_shorter() {
     let Value::Audio(a) = v else { panic!() };
     let n = a.frames();
     assert!(n > 10_000 && n < 44_100, "{n}");
-    for (p, f) in a.planes().iter().zip(&full) {
+    for (p, f) in a.to_planes().unwrap().iter().zip(&full) {
         assert_eq!(&p[..], &f[..n]);
     }
 }
@@ -526,7 +526,7 @@ fn short_edit_list_is_applied() {
         .unwrap();
     let Value::Audio(a) = v else { panic!() };
     assert_eq!(a.frames(), 11_025);
-    for (p, f) in a.planes().iter().zip(&full) {
+    for (p, f) in a.to_planes().unwrap().iter().zip(&full) {
         assert_eq!(&p[..], &f[..11_025]);
     }
 }

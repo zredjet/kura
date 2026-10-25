@@ -159,7 +159,7 @@ fn drift(v: Value, n: u64) -> Result<Value, EngineError> {
             )?))
         }
         Value::Audio(a) => {
-            let mut planes: Vec<Arc<Vec<f32>>> = a.planes().to_vec();
+            let mut planes: Vec<Arc<Vec<f32>>> = a.to_planes()?;
             if let Some(s) = planes
                 .first_mut()
                 .and_then(|p| Arc::make_mut(p).first_mut())

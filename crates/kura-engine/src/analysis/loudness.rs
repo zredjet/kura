@@ -148,38 +148,49 @@ const TRUE_PEAK: [[i32; 4]; 12] = [
 /// 中止を確かめる間隔（標本）。
 const CHECK_EVERY: usize = 1 << 16;
 
-/// 1 チャンネルを K 特性に通し、S 標本ずつの二乗和を返す（端数の区間は入れない）。
+/// チャンネル `ch` を K 特性に通し、S 標本ずつの二乗和を返す（端数の区間は入れない）。チャンクを番号の順にたどり、
+/// 状態をチャンクの境をまたいで運ぶ（標本を 1 本の列として順に流したものと同じ演算を同じ順に行う）。
 fn segment_powers(
-    x: &[f32],
+    a: &Audio,
+    ch: usize,
     filt: &[Biquad; 2],
     s: usize,
     mon: &dyn Monitor,
 ) -> Result<Vec<f64>, EngineError> {
-    let segments = x.len() / s;
+    let segments = a.frames() / s;
+    let used = segments * s;
     let mut q = Vec::new();
     q.try_reserve_exact(segments)
         .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
     // 段ごとの状態：x1・x2・y1・y2
     let mut st = [[0f64; 4]; 2];
     let mut acc = 0f64;
-    for (i, v) in x.iter().take(segments * s).enumerate() {
-        if i % CHECK_EVERY == 0 && mon.canceled() {
-            return Err(EngineError::Canceled);
+    let mut i = 0usize;
+    for k in 0..a.chunk_count() {
+        if i >= used {
+            break;
         }
-        let mut y = f64::from(*v);
-        for (f, st) in filt.iter().zip(st.iter_mut()) {
-            let out =
-                f.b[0] * y + f.b[1] * st[0] + f.b[2] * st[1] - f.a[0] * st[2] - f.a[1] * st[3];
-            st[1] = st[0];
-            st[0] = y;
-            st[3] = st[2];
-            st[2] = out;
-            y = out;
-        }
-        acc += y * y;
-        if (i + 1) % s == 0 {
-            q.push(acc);
-            acc = 0.0;
+        let x = a.chunk_data(ch, k)?;
+        for v in x.iter().take(used - i) {
+            if i.is_multiple_of(CHECK_EVERY) && mon.canceled() {
+                return Err(EngineError::Canceled);
+            }
+            let mut y = f64::from(*v);
+            for (f, st) in filt.iter().zip(st.iter_mut()) {
+                let out =
+                    f.b[0] * y + f.b[1] * st[0] + f.b[2] * st[1] - f.a[0] * st[2] - f.a[1] * st[3];
+                st[1] = st[0];
+                st[0] = y;
+                st[3] = st[2];
+                st[2] = out;
+                y = out;
+            }
+            acc += y * y;
+            if (i + 1).is_multiple_of(s) {
+                q.push(acc);
+                acc = 0.0;
+            }
+            i += 1;
         }
     }
     Ok(q)
@@ -204,30 +215,29 @@ fn true_peak_coefficients() -> [[f64; 12]; 4] {
 /// ±0 を足すだけで、y は −0 にならない（+0 から始めて ±0 を足しても +0、打ち消し合っても +0）ので y のビットも同じ）。
 /// 最大はどの順に取っても同じ（NaN のないとき。NaN があれば呼び手が値を捨てる）。
 fn true_peak_block(
-    x: &[f32],
+    a: &Audio,
+    ch: usize,
     b: usize,
     coef: &[[f64; 12]; 4],
 ) -> Result<(f64, f64, bool), EngineError> {
-    let total = x.len() + 11;
+    let total = a.frames() + 11;
     let start = b.saturating_mul(SUM_BLOCK);
     let end = start.saturating_add(SUM_BLOCK).min(total);
     if start >= end {
         return Ok((0.0, 0.0, true));
     }
-    // w[k] = x[start + k − 11]（範囲の外は 0）
+    // w[k] = x[start + k − 11]（範囲の外は 0。読む口は長さの外を 0 で返し、0 は有限なので有限の確かめも同じ）
     let n = end - start + 11;
+    let pad = 11usize.saturating_sub(start).min(n);
+    let mut x = crate::codec::try_vec(n, 0f32)?;
+    a.read(ch, (start + pad - 11) as u64, &mut x[pad..])?;
     let mut w: Vec<f64> = Vec::new();
     w.try_reserve_exact(n)
         .map_err(|_| EngineError::Limit("ラウドネスの作業領域を確保できません".into()))?;
     let mut finite = true;
-    for k in 0..n {
-        match (start + k).checked_sub(11).and_then(|i| x.get(i)) {
-            Some(v) => {
-                finite &= v.is_finite();
-                w.push(f64::from(*v));
-            }
-            None => w.push(0.0),
-        }
+    for v in &x {
+        finite &= v.is_finite();
+        w.push(f64::from(*v));
     }
     let (mut tp, mut sp) = (0f64, 0f64);
     for win in w.windows(12) {
@@ -445,32 +455,31 @@ enum Part {
 /// 置くので、ほかのスレッドがすぐ取りかかれる（並列の分け方だけで、値には効かない）。IIR は時間で割らない
 /// （状態の受け渡しで値が変わるため）。
 fn scan(a: &Audio, mon: &dyn Monitor) -> Result<Pass, EngineError> {
-    let planes = a.planes();
     let filter = k_filter(a.rate()).ok();
     let s = ((u64::from(a.rate()) + 5) / 10) as usize;
     let w = weights(a.channels());
     let coef = true_peak_coefficients();
     let per = (a.frames() + 11).div_ceil(SUM_BLOCK);
     let stride = per + 1;
-    let tasks = planes
-        .len()
+    let tasks = a
+        .channels()
         .checked_mul(stride)
         .ok_or_else(|| EngineError::Limit("音声が長すぎます".into()))?;
     let parts = par_blocks(tasks, mon, |t| {
         let (c, r) = (t / stride, t % stride);
-        let Some(plane) = planes.get(c) else {
+        if c >= a.channels() {
             return Err(EngineError::Internal(
                 "ラウドネスの仕事の番号が範囲の外です".into(),
             ));
-        };
+        }
         if r == 0 {
             let measured = w.get(c).copied().unwrap_or(0.0) != 0.0;
             return match &filter {
-                Some(f) if measured => Ok(Part::Segments(segment_powers(plane, f, s, mon)?)),
+                Some(f) if measured => Ok(Part::Segments(segment_powers(a, c, f, s, mon)?)),
                 _ => Ok(Part::Segments(Vec::new())),
             };
         }
-        let (true_peak, sample_peak, finite) = true_peak_block(plane, r - 1, &coef)?;
+        let (true_peak, sample_peak, finite) = true_peak_block(a, c, r - 1, &coef)?;
         Ok(Part::Peaks {
             true_peak,
             sample_peak,
@@ -478,7 +487,7 @@ fn scan(a: &Audio, mon: &dyn Monitor) -> Result<Pass, EngineError> {
         })
     })?;
     let mut pass = Pass {
-        segments: Vec::with_capacity(planes.len()),
+        segments: Vec::with_capacity(a.channels()),
         sample_peak: 0.0,
         true_peak: 0.0,
         finite: true,
@@ -917,8 +926,34 @@ mod tests {
         blocks.into_iter().fold(0.0, math::max)
     }
 
+    /// 段 6 の K 特性の区間のパワー（1 チャンネルの連続した列を順に流す）。
+    fn segment_powers_reference(x: &[f32], filt: &[Biquad; 2], s: usize) -> Vec<f64> {
+        let segments = x.len() / s;
+        let mut q = Vec::new();
+        let mut st = [[0f64; 4]; 2];
+        let mut acc = 0f64;
+        for (i, v) in x.iter().take(segments * s).enumerate() {
+            let mut y = f64::from(*v);
+            for (f, st) in filt.iter().zip(st.iter_mut()) {
+                let out =
+                    f.b[0] * y + f.b[1] * st[0] + f.b[2] * st[1] - f.a[0] * st[2] - f.a[1] * st[3];
+                st[1] = st[0];
+                st[0] = y;
+                st[3] = st[2];
+                st[2] = out;
+                y = out;
+            }
+            acc += y * y;
+            if (i + 1).is_multiple_of(s) {
+                q.push(acc);
+                acc = 0.0;
+            }
+        }
+        q
+    }
+
     fn analyze_reference(a: &Audio) -> Measured {
-        let planes = a.planes();
+        let planes = a.to_planes().unwrap();
         if planes.iter().any(|p| p.iter().any(|v| !v.is_finite())) {
             return Measured {
                 loudness: Loudness {
@@ -932,7 +967,7 @@ mod tests {
         }
         let mut sample_peak = 0f64;
         let mut true_peak_lin = 0f64;
-        for plane in planes {
+        for plane in &planes {
             sample_peak = plane
                 .iter()
                 .fold(sample_peak, |m, v| math::max(m, f64::from(v.abs())));
@@ -956,7 +991,7 @@ mod tests {
             if w.get(ch).copied().unwrap_or(0.0) == 0.0 {
                 return Ok(Vec::new());
             }
-            segment_powers(&planes[ch], &filt, s, &NoMonitor)
+            Ok(segment_powers_reference(&planes[ch], &filt, s))
         })
         .unwrap();
         let segments = a.frames() / s;
@@ -1077,12 +1112,12 @@ mod tests {
             (f32::NEG_INFINITY, 9_999),
         ] {
             let a = program(44_100, 2, 10_000, 3_000, (-30.0, -10.0), 104);
-            let mut p = (*a.planes()[1]).clone();
+            let mut p = (*a.to_planes().unwrap()[1]).clone();
             p[at] = bad;
             cases.push(
                 Audio::new(
                     44_100,
-                    vec![a.planes()[0].clone(), Arc::new(p)],
+                    vec![a.to_planes().unwrap()[0].clone(), Arc::new(p)],
                     Default::default(),
                 )
                 .unwrap(),
@@ -1141,7 +1176,10 @@ mod tests {
         let d = analyze_detailed(&low, &NoMonitor).unwrap();
         assert!(!d.non_finite && !d.measured.measurable && d.short_term.is_empty());
         assert!(d.measured.loudness.sample_peak_db.is_finite());
-        let mut p = (*program(8_000, 1, 30_000, 800, (-20.0, -10.0), 9).planes()[0]).clone();
+        let mut p = (*program(8_000, 1, 30_000, 800, (-20.0, -10.0), 9)
+            .to_planes()
+            .unwrap()[0])
+            .clone();
         p[10] = f32::NAN;
         let nan = Audio::new(8_000, vec![Arc::new(p)], Default::default()).unwrap();
         let d = analyze_detailed(&nan, &NoMonitor).unwrap();
@@ -1364,7 +1402,8 @@ mod tests {
                 // トゥルーピークは照らさない（ebur128 は別の補間で、debug では遅い。Tech 3341 の試験は E19 で確かめる）
                 let mode = Mode::I | Mode::LRA | Mode::SAMPLE_PEAK;
                 let mut e = EbuR128::new(channels as u32, rate, mode).unwrap();
-                let planes: Vec<&[f32]> = a.planes().iter().map(|p| p.as_slice()).collect();
+                let owned = a.to_planes().unwrap();
+                let planes: Vec<&[f32]> = owned.iter().map(|p| p.as_slice()).collect();
                 e.add_frames_planar_f32(&planes).unwrap();
                 let lra = loudness_range(&ours.short_term).unwrap().unwrap();
                 let want_lra = e.loudness_range().unwrap();

@@ -215,7 +215,7 @@ fn e28_lengths_and_positions_match_in_two_decoders() {
                     (rate, usize::from(channels)),
                     "{name}"
                 );
-                for (ch, (a, b)) in sym.planes().iter().zip(&lew).enumerate() {
+                for (ch, (a, b)) in sym.to_planes().unwrap().iter().zip(&lew).enumerate() {
                     let d = a
                         .iter()
                         .zip(b)
@@ -228,8 +228,8 @@ fn e28_lengths_and_positions_match_in_two_decoders() {
                 }
                 // 長いものは、位置がずれず、正弦波がそれなりの精度で戻る
                 if frames >= 4_410 {
-                    for (ch, p) in audio(&v).planes().iter().enumerate() {
-                        let snr = aligned_snr(p, &sym.planes()[ch]);
+                    for (ch, p) in audio(&v).to_planes().unwrap().iter().enumerate() {
+                        let snr = aligned_snr(p, &sym.to_planes().unwrap()[ch]);
                         assert!(snr >= 20.0, "{name}：チャンネル {ch} の SNR {snr:.1} dB");
                     }
                 }
@@ -431,8 +431,8 @@ fn channels_and_rates_round_trip() {
         let back = decode_symphonia(&bytes);
         assert_eq!(back.channels(), usize::from(channels), "{rate}・{channels}");
         assert_eq!(back.frames() as u64, u64::from(rate));
-        for (ch, p) in audio(&v).planes().iter().enumerate() {
-            let snr = aligned_snr(p, &back.planes()[ch]);
+        for (ch, p) in audio(&v).to_planes().unwrap().iter().enumerate() {
+            let snr = aligned_snr(p, &back.to_planes().unwrap()[ch]);
             assert!(
                 snr >= 15.0,
                 "{rate} Hz・{channels} ch のチャンネル {ch}：{snr:.1} dB"
@@ -446,7 +446,7 @@ fn channels_and_rates_round_trip() {
             assert_eq!(plane.len(), back.frames(), "{rate}・{channels}");
             let d = plane
                 .iter()
-                .zip(back.planes()[wi].iter())
+                .zip(back.to_planes().unwrap()[wi].iter())
                 .map(|(x, y)| (x - y).abs())
                 .fold(0f32, kura_engine::math::max32);
             assert!(
@@ -454,7 +454,7 @@ fn channels_and_rates_round_trip() {
                 "{rate} Hz・{channels} ch：lewton の {vi} 番（Vorbis の並び）と symphonia の {wi} 番（WAV の並び）の差 {d}"
             );
             // 元の同じチャンネルとも位置が合う
-            let snr = aligned_snr(&audio(&v).planes()[wi], plane);
+            let snr = aligned_snr(&audio(&v).to_planes().unwrap()[wi], plane);
             assert!(
                 snr >= 15.0,
                 "{rate} Hz・{channels} ch：lewton の {vi} 番と元の {wi} 番：{snr:.1} dB"
@@ -565,7 +565,8 @@ fn non_finite_samples_are_tamed() {
         let back = decode_symphonia(&raw_bytes);
         assert_eq!(back.frames(), frames, "{name}");
         assert!(
-            back.planes()
+            back.to_planes()
+                .unwrap()
                 .iter()
                 .all(|p| p.iter().all(|s| s.is_finite())),
             "{name}"

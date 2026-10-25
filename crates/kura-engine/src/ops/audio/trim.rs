@@ -290,7 +290,10 @@ mod tests {
             panic!("音声ではありません")
         };
         assert_eq!(a.frames(), 7_000);
-        assert_eq!(a.planes()[1][..], src.planes()[1][1_000..8_000]);
+        assert_eq!(
+            a.to_planes().unwrap()[1][..],
+            src.to_planes().unwrap()[1][1_000..8_000]
+        );
         assert_eq!(
             a.meta.loop_range,
             Some(LoopRange {

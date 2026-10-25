@@ -33,7 +33,7 @@ use crate::codec::{ReadSeek, pcm, try_vec};
 use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
-use crate::value::{AudioMeta, LoopRange};
+use crate::value::{AudioBuilder, AudioMeta, LoopRange};
 
 /// 名前・タグとして読む 1 つの文字列の長さの上限（バイト）。
 const TEXT_MAX: usize = 4_096;
@@ -237,16 +237,17 @@ impl Opened<'_> {
         out
     }
 
-    /// すべてのパケットをデコードして、planar の f32 にする（長さは `max_frames` まで）。
+    /// すべてのパケットをデコードして、標本を `out` に足す（長さは `max_frames` まで）。
     pub fn decode_all(
         &mut self,
         id: &str,
         dec: &mut dyn AudioDecoder,
         max_frames: u64,
+        out: &mut AudioBuilder,
         mon: &dyn Monitor,
-    ) -> Result<Vec<Vec<f32>>, EngineError> {
-        let mut planes: Vec<Vec<f32>> = (0..self.channels).map(|_| Vec::new()).collect();
+    ) -> Result<(), EngineError> {
         let mut total = 0u64;
+        let mut planes: Vec<Vec<f32>> = (0..self.channels).map(|_| Vec::new()).collect();
         loop {
             if mon.canceled() {
                 return Err(EngineError::Canceled);
@@ -267,8 +268,11 @@ impl Opened<'_> {
                     message: "長さがヘッダより長い".into(),
                 });
             }
-            for (ch, out) in planes.iter_mut().enumerate() {
-                out.try_reserve(n)
+            // パケットの標本を作業列に写してから組み手に足す（持つ量は値とパケットの分だけ）
+            for (ch, plane) in planes.iter_mut().enumerate() {
+                plane.clear();
+                plane
+                    .try_reserve(n)
                     .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
                 let missing = || EngineError::Decode {
                     codec: id.to_string(),
@@ -277,11 +281,11 @@ impl Opened<'_> {
                 match &buf {
                     GenericAudioBufferRef::S32(b) => {
                         let src = b.plane(ch).ok_or_else(missing)?;
-                        out.extend(src.iter().map(|s| pcm::int_to_f32(*s, 32)));
+                        plane.extend(src.iter().map(|s| pcm::int_to_f32(*s, 32)));
                     }
                     GenericAudioBufferRef::F32(b) => {
                         let src = b.plane(ch).ok_or_else(missing)?;
-                        out.extend(src.iter().map(|s| canonical_nan(*s)));
+                        plane.extend(src.iter().map(|s| canonical_nan(*s)));
                     }
                     _ => {
                         return Err(EngineError::Unsupported(format!(
@@ -290,8 +294,10 @@ impl Opened<'_> {
                     }
                 }
             }
+            let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+            out.push_frames(&views)?;
         }
-        Ok(planes)
+        Ok(())
     }
 }
 

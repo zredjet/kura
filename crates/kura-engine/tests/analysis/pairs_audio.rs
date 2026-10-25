@@ -265,7 +265,7 @@ fn normalize_uses_the_gating_measurement(engine: &Engine, p: &Pair) -> Result<()
             let Value::Audio(a) = noise(8_000, 1, 20_000, 5, 0.5) else {
                 unreachable!()
             };
-            let mut p = (*a.planes()[0]).clone();
+            let mut p = (*a.to_planes().unwrap()[0]).clone();
             p[100] = f32::NAN;
             Value::Audio(Arc::new(
                 Audio::new(8_000, vec![Arc::new(p)], AudioMeta::default()).unwrap(),
@@ -304,7 +304,7 @@ fn loudness_inputs(engine: &Engine, p: &Pair) -> Result<Vec<(String, Value)>, St
     let Value::Audio(a) = noise(8_000, 1, 20_000, 13, 0.5) else {
         return Err("音声ではない".into());
     };
-    let mut p = (*a.planes()[0]).clone();
+    let mut p = (*a.to_planes().unwrap()[0]).clone();
     p[300] = f32::NAN;
     out.push((
         "NaN".into(),

@@ -473,16 +473,17 @@ pub(crate) fn serve_with(
         usize::try_from(start).map_err(|_| PcmError::TooLong { bytes: floats })?,
         usize::try_from(end).map_err(|_| PcmError::TooLong { bytes: floats })?,
     );
-    let planes: Vec<&[f32]> = audio
-        .planes()
-        .iter()
-        .map(|p| p.get(from..to).unwrap_or(&[]))
-        .collect();
-    let format = sample_format(audio.meta.source.as_ref(), &planes);
-    // 書く間の分も予算で数える（応答を渡したら返す）
     let runtime = engine
         .runtime()
         .map_err(|err| PcmError::Unavailable(err.to_string()))?;
+    // 区間をチャンネルごとの連続した列に写す（写した分も予算で数える。応答を渡したら返す）
+    let _copy = acquire(runtime.budget(), floats)?;
+    let owned = audio
+        .read_planes(from, to)
+        .map_err(|err| PcmError::Failed(err.to_string()))?;
+    let planes: Vec<&[f32]> = owned.iter().map(Vec::as_slice).collect();
+    let format = sample_format(audio.meta.source.as_ref(), &planes);
+    // 書く間の分も予算で数える（応答を渡したら返す）
     let _writing = acquire(
         runtime.budget(),
         wav_len(end - start, channels, format, decoder.len()),

@@ -745,7 +745,7 @@ pub fn corrupt_outside(v: &Value, keep: &Area, seed: u64) -> Result<Value, Engin
     if let Value::Audio(a) = v {
         let mut r = crate::determinism::rng(seed);
         let planes = a
-            .planes()
+            .to_planes()?
             .iter()
             .map(|p| {
                 Arc::new(
@@ -849,7 +849,11 @@ pub fn check_contains(a: &Value, b: &Value, area: &Area) -> Result<(), String> {
             if x.rate() != y.rate() || x.frames() != y.frames() || x.channels() != y.channels() {
                 return Err("音声の形が変わったのに範囲が全体ではありません".into());
             }
-            for (p, q) in x.planes().iter().zip(y.planes()) {
+            let (xp, yp) = (
+                x.to_planes().map_err(|e| e.to_string())?,
+                y.to_planes().map_err(|e| e.to_string())?,
+            );
+            for (p, q) in xp.iter().zip(&yp) {
                 for (i, (s, t)) in p.iter().zip(q.iter()).enumerate() {
                     let same = s.to_bits() == t.to_bits() || (s.is_nan() && t.is_nan());
                     if !same && !area.contains_sample(i as u64) {
@@ -902,7 +906,11 @@ pub fn check_same_inside(a: &Value, b: &Value, area: &Area) -> Result<(), String
     }
     match (a, b) {
         (Value::Audio(x), Value::Audio(y)) => {
-            for (p, q) in x.planes().iter().zip(y.planes()) {
+            let (xp, yp) = (
+                x.to_planes().map_err(|e| e.to_string())?,
+                y.to_planes().map_err(|e| e.to_string())?,
+            );
+            for (p, q) in xp.iter().zip(&yp) {
                 for (i, (s, t)) in p.iter().zip(q.iter()).enumerate() {
                     let same = s.to_bits() == t.to_bits() || (s.is_nan() && t.is_nan());
                     if !same && area.contains_sample(i as u64) {

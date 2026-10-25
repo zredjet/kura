@@ -870,11 +870,9 @@ fn assemble(
                 *loop_count,
             )?))
         }
-        (Value::Audio(a), AnchorContent::Audio { meta }) => Value::Audio(Arc::new(Audio::new(
-            a.rate(),
-            a.planes().to_vec(),
-            meta.clone(),
-        )?)),
+        (Value::Audio(a), AnchorContent::Audio { meta }) => {
+            Value::Audio(Arc::new(a.with_meta(meta.clone())))
+        }
         _ => return Err(broken("中身の種類がヘッダと合いません")),
     })
 }
@@ -1104,6 +1102,7 @@ fn write_wav(
     // 塊は CHUNK_FRAMES フレームか、作業領域の上限（チャンネルが多いとき）まで
     let chunk = (CHUNK_BYTES / usize::from(block_align)).clamp(1, CHUNK_FRAMES);
     let mut buf = try_vec(chunk * ch * 4, 0u8)?;
+    let mut win = try_vec(chunk.min(n_frames), 0f32)?;
     let mut done = 0usize;
     while done < n_frames {
         if mon.canceled() {
@@ -1111,8 +1110,9 @@ fn write_wav(
         }
         let n = (n_frames - done).min(chunk);
         let bytes = &mut buf[..n * ch * 4];
-        for (c, plane) in a.planes().iter().enumerate() {
-            for (f, s) in plane[done..done + n].iter().enumerate() {
+        for c in 0..ch {
+            a.read(c, done as u64, &mut win[..n])?;
+            for (f, s) in win[..n].iter().enumerate() {
                 let at = (f * ch + c) * 4;
                 bytes[at..at + 4].copy_from_slice(&s.to_bits().to_le_bytes());
             }
@@ -1379,7 +1379,7 @@ mod tests {
             let (Value::Audio(x), Value::Audio(y)) = (&r.value, &v) else {
                 panic!()
             };
-            for (p, q) in x.planes().iter().zip(y.planes()) {
+            for (p, q) in x.to_planes().unwrap().iter().zip(y.to_planes().unwrap()) {
                 assert!(
                     p.iter()
                         .zip(q.iter())

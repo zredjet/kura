@@ -271,17 +271,19 @@ fn write_vorbis_channel(
 ) -> Result<(), EngineError> {
     let src = order
         .get(i)
-        .and_then(|&s| audio.planes().get(s))
+        .copied()
+        .filter(|&s| s < audio.channels())
         .ok_or_else(|| internal("チャンネルの並び"))?;
-    if src.len() != dst.len() {
+    if audio.frames() != dst.len() {
         return Err(internal("pcm の大きさ"));
     }
-    for (d, s) in dst.chunks_mut(COPY_CHUNK).zip(src.chunks(COPY_CHUNK)) {
+    for (k, d) in dst.chunks_mut(COPY_CHUNK).enumerate() {
         if mon.canceled() {
             return Err(EngineError::Canceled);
         }
-        for (d, s) in d.iter_mut().zip(s) {
-            *d = sanitize(*s);
+        audio.read(src, (k * COPY_CHUNK) as u64, d)?;
+        for d in d.iter_mut() {
+            *d = sanitize(*d);
         }
     }
     Ok(())
@@ -2257,7 +2259,7 @@ mod tests {
         // symphonia は third_party/ の直した写し（residue 0・1 を 3 チャンネル以上で読むときの分類の語のはみ出しを直したもの。
         // 読み取りの識別子 /2）を使うので、3 チャンネル以上（uncoupled）も lewton と同じ値になる
         for c in 0..ch {
-            let d = sym.planes()[ORDER[ch - 1][c]]
+            let d = sym.to_planes().unwrap()[ORDER[ch - 1][c]]
                 .iter()
                 .zip(&lew[c])
                 .map(|(x, y)| (x - y).abs())

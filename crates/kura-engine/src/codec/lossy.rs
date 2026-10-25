@@ -34,7 +34,7 @@ use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::{Monitor, NoMonitor};
 use crate::shape::{Dim, Shape};
-use crate::value::{Audio, AudioMeta, AudioSource, Value};
+use crate::value::{AudioBuilder, AudioMeta, AudioSource, Value};
 
 /// symphonia の写し（`third_party/`。ルートと `fuzz/` の `[patch.crates-io]`）が実際に組まれていることを、組み立てで
 /// 確かめる。`KURA_PATCHED` は写しにだけある印なので、差し替えが外れて crates.io の上流のクレートが組まれると（`[patch]`
@@ -308,38 +308,35 @@ impl Decoder for SymphoniaDecoder {
             (Dim::AtMost(_), Some(_)) => p.counted.saturating_add(8_192),
             (Dim::AtMost(n), None) => n,
         };
-        let mut planes = match self.kind {
+        // 切るなら（編集リスト）、頭の start フレームを捨てて len フレームだけを残す
+        let mut out = match p.trim {
+            Some((start, len)) => {
+                AudioBuilder::new(p.rate, usize::from(p.channels), max.min(len))?.window(start, len)
+            }
+            None => AudioBuilder::new(p.rate, usize::from(p.channels), max)?,
+        };
+        match self.kind {
             Kind::OggVorbis => {
                 let mut dec =
                     symphonia_codec_vorbis::VorbisDecoder::try_new(&o.params, &opts).map_err(e)?;
-                o.decode_all(id, &mut dec, max, mon)?
+                o.decode_all(id, &mut dec, max, &mut out, mon)?;
             }
             Kind::Mp4Alac => {
                 let mut dec =
                     symphonia_codec_alac::AlacDecoder::try_new(&o.params, &opts).map_err(e)?;
-                o.decode_all(id, &mut dec, max, mon)?
+                o.decode_all(id, &mut dec, max, &mut out, mon)?;
             }
             Kind::Mp4Aac | Kind::AdtsAac => {
                 let mut dec =
                     symphonia_codec_aac::AacDecoder::try_new(&o.params, &opts).map_err(e)?;
-                let planes = o.decode_all(id, &mut dec, max, mon)?;
+                o.decode_all(id, &mut dec, max, &mut out, mon)?;
                 // 形を決めたときに見た先頭より後で SBR の拡張が出てきたものも、半分のレートの値を返さずに次の段へ
                 if dec.sbr_seen() {
                     return Err(self.he_aac());
                 }
-                planes
-            }
-        };
-        if let Some((start, len)) = p.trim {
-            for plane in &mut planes {
-                let s = usize::try_from(start)
-                    .unwrap_or(usize::MAX)
-                    .min(plane.len());
-                plane.drain(..s);
-                plane.truncate(usize::try_from(len).unwrap_or(usize::MAX));
             }
         }
-        let got = planes.first().map_or(0, Vec::len) as u64;
+        let got = out.frames();
         if !p.frames.admits(got) {
             return Err(self.err("長さがヘッダと合いません"));
         }
@@ -364,7 +361,6 @@ impl Decoder for SymphoniaDecoder {
                 rate: p.rate,
             },
         });
-        let audio = Audio::new(p.rate, planes.into_iter().map(Arc::new).collect(), meta)?;
-        Ok(Value::Audio(Arc::new(audio)))
+        Ok(Value::Audio(Arc::new(out.finish(meta)?)))
     }
 }

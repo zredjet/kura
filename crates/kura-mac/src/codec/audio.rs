@@ -205,7 +205,7 @@ mod tests {
             let got = read(&dec, &bytes, "wav", &Limits::default(), &NoMonitor).unwrap();
             let (g, w) = (audio(&got), audio(&want));
             assert_eq!(g.frames(), frames, "{name}");
-            assert_eq!(g.planes(), w.planes(), "{name}");
+            assert_eq!(g.to_planes().unwrap(), w.to_planes().unwrap(), "{name}");
             assert_eq!(
                 g.meta.source.map(|s| (s.bits, s.float)),
                 Some((bits, false))

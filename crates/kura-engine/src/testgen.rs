@@ -1015,11 +1015,10 @@ impl InputGen {
                         "NaN・∞ を置けるのは音声だけです".into(),
                     ));
                 };
-                let mut planes = a.planes().to_vec();
+                let mut planes = a.read_planes(0, a.frames())?;
                 for &(ch, frame, v) in at {
                     let slot = planes
                         .get_mut(usize::from(ch))
-                        .map(Arc::make_mut)
                         .and_then(|p| usize::try_from(frame).ok().and_then(|f| p.get_mut(f)))
                         .ok_or_else(|| {
                             EngineError::Internal(format!(
@@ -1030,7 +1029,7 @@ impl InputGen {
                 }
                 Ok(Value::Audio(Arc::new(Audio::new(
                     a.rate(),
-                    planes,
+                    planes.into_iter().map(Arc::new).collect(),
                     a.meta.clone(),
                 )?)))
             }
@@ -1244,7 +1243,7 @@ mod tests {
         };
         assert_eq!((a.rate(), a.channels(), a.frames()), (44_100, 2, 3_000));
         let tail = 200;
-        for p in a.planes() {
+        for p in a.to_planes().unwrap() {
             for (i, s) in p.iter().enumerate() {
                 let k = i % 1_000;
                 if k < 16 {
@@ -1258,7 +1257,10 @@ mod tests {
             assert!(p[..16].iter().any(|s| s.abs() > 0.1));
             assert!(p[1_000..1_016].iter().any(|s| s.abs() > 0.1));
         }
-        assert_ne!(a.planes()[0][..16], a.planes()[1][..16]);
+        assert_ne!(
+            a.to_planes().unwrap()[0][..16],
+            a.to_planes().unwrap()[1][..16]
+        );
         assert_eq!(
             serde_json::to_value(&g).unwrap(),
             serde_json::json!({
@@ -1375,9 +1377,15 @@ mod tests {
             Value::Audio(a.clone()).digest().unwrap()
         );
         assert_eq!((a.rate(), a.meta.clone()), (b.rate(), b.meta.clone()));
-        assert!(a.planes()[0][5].is_nan());
-        assert_eq!(a.planes()[1][99], f32::NEG_INFINITY);
-        for (c, (p, q)) in a.planes().iter().zip(b.planes()).enumerate() {
+        assert!(a.to_planes().unwrap()[0][5].is_nan());
+        assert_eq!(a.to_planes().unwrap()[1][99], f32::NEG_INFINITY);
+        for (c, (p, q)) in a
+            .to_planes()
+            .unwrap()
+            .iter()
+            .zip(b.to_planes().unwrap())
+            .enumerate()
+        {
             for (i, (x, y)) in p.iter().zip(q.iter()).enumerate() {
                 if (c, i) != (0, 5) && (c, i) != (1, 99) {
                     assert_eq!(x.to_bits(), y.to_bits(), "{c} {i}");
@@ -1425,7 +1433,7 @@ mod tests {
         };
         assert_eq!((a.rate(), a.channels(), a.frames()), (48_000, 2, 4_800));
         let limit = math::db_to_gain(-6.0) as f32;
-        for p in a.planes() {
+        for p in a.to_planes().unwrap() {
             let peaks: Vec<f32> = p
                 .chunks(480)
                 .map(|c| c.iter().fold(0.0_f32, |m, s| math::max32(m, s.abs())))
@@ -1434,7 +1442,7 @@ mod tests {
             assert!(peaks[0] < math::db_to_gain(-36.0) as f32, "{peaks:?}");
             assert!(peaks.iter().all(|&m| m <= limit), "{peaks:?}");
         }
-        assert_ne!(a.planes()[0], a.planes()[1]);
+        assert_ne!(a.to_planes().unwrap()[0], a.to_planes().unwrap()[1]);
         assert_eq!(
             serde_json::to_value(&g).unwrap(),
             serde_json::json!({

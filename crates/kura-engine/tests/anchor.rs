@@ -221,7 +221,7 @@ fn random_values_round_trip() {
                     start: u64::from(r.next_u32()),
                     end: u64::MAX,
                 });
-                let mut planes = a.planes().to_vec();
+                let mut planes = a.to_planes().unwrap().to_vec();
                 if let Some(s) = Arc::make_mut(&mut planes[0]).first_mut() {
                     *s = f32::from_bits(r.next_u32());
                 }
@@ -293,7 +293,7 @@ fn frozen_values() -> Vec<(&'static str, Value)> {
     .unwrap();
     let audio = match audio {
         Value::Audio(a) => {
-            let mut planes = a.planes().to_vec();
+            let mut planes = a.to_planes().unwrap().to_vec();
             Arc::make_mut(&mut planes[1])[0] = -0.0;
             Arc::make_mut(&mut planes[2])[7] = f32::NAN;
             Value::Audio(Arc::new(
@@ -505,10 +505,14 @@ fn same_body(plain: &Value, v: &Value) -> bool {
         }
         (Value::Audio(p), Value::Audio(v)) => {
             p.rate() == v.rate()
-                && p.planes().len() == v.planes().len()
-                && p.planes().iter().zip(v.planes()).all(|(a, b)| {
-                    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| same_sample(x, y))
-                })
+                && p.to_planes().unwrap().len() == v.to_planes().unwrap().len()
+                && p.to_planes()
+                    .unwrap()
+                    .iter()
+                    .zip(v.to_planes().unwrap())
+                    .all(|(a, b)| {
+                        a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| same_sample(x, y))
+                    })
         }
         _ => false,
     }

@@ -334,12 +334,15 @@ mod tests {
             panic!("音声ではありません")
         };
         for ch in 0..2 {
-            assert_eq!(a.planes()[ch][0], 0.0);
-            assert_eq!(a.planes()[ch][8_999], 0.0);
-            assert_eq!(a.planes()[ch][2_000..6_000], src.planes()[ch][2_000..6_000]);
+            assert_eq!(a.to_planes().unwrap()[ch][0], 0.0);
+            assert_eq!(a.to_planes().unwrap()[ch][8_999], 0.0);
+            assert_eq!(
+                a.to_planes().unwrap()[ch][2_000..6_000],
+                src.to_planes().unwrap()[ch][2_000..6_000]
+            );
             // フェードインの真ん中は半分
-            let half = (f64::from(src.planes()[ch][1_000]) * 0.5) as f32;
-            assert_eq!(a.planes()[ch][1_000], half);
+            let half = (f64::from(src.to_planes().unwrap()[ch][1_000]) * 0.5) as f32;
+            assert_eq!(a.to_planes().unwrap()[ch][1_000], half);
         }
         assert!(
             render_value(

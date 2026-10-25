@@ -307,10 +307,7 @@ pub fn refine(prev: &Value, next: &Value, inferred: &Area) -> OutputChange {
             let same = a.rate() == b.rate()
                 && a.frames() == b.frames()
                 && a.channels() == b.channels()
-                && a.planes()
-                    .iter()
-                    .zip(b.planes())
-                    .all(|(x, y)| Arc::ptr_eq(x, y));
+                && (0..a.channels()).all(|ch| (0..a.chunk_count()).all(|k| a.same_chunk(b, ch, k)));
             match (same, inferred) {
                 (true, _) => OutputChange::Samples(Spans::new()),
                 (false, Area::Samples(s)) => OutputChange::Samples(s.clone()),

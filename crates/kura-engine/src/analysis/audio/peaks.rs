@@ -56,8 +56,10 @@ const HEADER_BYTES: u64 = 32;
 const LEVEL_ENTRY_BYTES: u64 = 24;
 /// 並びが表せる段の数の上限。
 pub const MAX_LEVELS: usize = 16;
-/// 並列の仕事の大きさ（フレーム）。どの段のビンの大きさでも割り切れる（並列の分け方だけで、結果に効かない）。
-const JOB_FRAMES: usize = 65_536;
+/// 並列の仕事の大きさ（フレーム）。音声のチャンクと同じで、どの段のビンの大きさでも割り切れる（並列の分け方だけで、
+/// 結果に効かない）。
+const JOB_FRAMES: usize = crate::value::AUDIO_CHUNK;
+const _: () = assert!(JOB_FRAMES.is_multiple_of(PEAK_BINS[PEAK_BINS.len() - 1] as usize));
 
 /// 引数（読むときに、段の大きさが `PEAK_BINS` のどれかで `finest ≤ coarsest` かを確かめる）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,18 +431,10 @@ pub fn compute(a: &Audio, p: &PeaksParams, cx: &AnalyzeCx<'_>) -> Result<Peaks, 
     let tasks = c
         .checked_mul(jobs)
         .ok_or_else(|| EngineError::Limit("音声が長すぎます".into()))?;
-    let planes = a.planes();
-    // 最も細かい段：チャンネル × 仕事（JOB_FRAMES フレーム。どのビンの大きさでも割り切れる）
+    // 最も細かい段：チャンネル × 仕事（JOB_FRAMES フレーム = 音声のチャンク 1 つ。どのビンの大きさでも割り切れる）
     let parts = cx.par_blocks(tasks, |t| {
         let (ch, j) = (t / jobs.max(1), t % jobs.max(1));
-        let Some(plane) = planes.get(ch) else {
-            return Err(EngineError::Internal(
-                "波形の仕事の番号が範囲の外です".into(),
-            ));
-        };
-        let start = j * JOB_FRAMES;
-        let end = start.saturating_add(JOB_FRAMES).min(frames);
-        let xs = plane.get(start..end).unwrap_or(&[]);
+        let xs = a.chunk_data(ch, j)?;
         let mut out = Vec::new();
         out.try_reserve_exact(xs.len().div_ceil(b0))
             .map_err(|_| EngineError::Limit("波形の作業領域を確保できません".into()))?;
@@ -759,7 +753,7 @@ mod tests {
             for (k, l) in p.levels.iter().enumerate() {
                 assert_eq!(l.bin, PEAK_BINS[k]);
                 for ch in 0..channels {
-                    let want = direct(&a.planes()[ch], l.bin as usize);
+                    let want = direct(&a.to_planes().unwrap()[ch], l.bin as usize);
                     let got: Vec<(i16, i16)> = (0..want.len() as u64)
                         .map(|b| p.get(k, b, ch as u16).unwrap())
                         .collect();
@@ -797,7 +791,7 @@ mod tests {
         );
         for (k, l) in p.levels.iter().enumerate() {
             for ch in 0..2 {
-                let want = direct(&a.planes()[ch], l.bin as usize);
+                let want = direct(&a.to_planes().unwrap()[ch], l.bin as usize);
                 let got: Vec<(i16, i16)> = (0..want.len() as u64)
                     .map(|b| p.get(k, b, ch as u16).unwrap())
                     .collect();
@@ -808,7 +802,7 @@ mod tests {
         let (lo, hi) = p.get(0, 1, 0).unwrap();
         assert!(lo == 0 && hi > 0, "{lo} {hi}");
         assert!(
-            a.planes()[0][256..512]
+            a.to_planes().unwrap()[0][256..512]
                 .iter()
                 .all(|v| v.is_nan() || *v > 0.0)
         );

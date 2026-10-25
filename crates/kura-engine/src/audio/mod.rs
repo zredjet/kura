@@ -246,7 +246,7 @@ mod tests {
 
     fn planes(v: &Value) -> Vec<Vec<f32>> {
         match v {
-            Value::Audio(a) => a.planes().iter().map(|p| p.to_vec()).collect(),
+            Value::Audio(a) => a.to_planes().unwrap().iter().map(|p| p.to_vec()).collect(),
             _ => panic!("音声ではありません"),
         }
     }
@@ -256,7 +256,7 @@ mod tests {
         let a = noise();
         let src = Digest::default();
         let plain = quantize(&a, &q(16, Dither::None, 0), &src, &NoMonitor).unwrap();
-        for (p, s) in planes(&plain).iter().zip(a.planes()) {
+        for (p, s) in planes(&plain).iter().zip(a.to_planes().unwrap()) {
             for (x, y) in p.iter().zip(s.iter()) {
                 let want = ((f64::from(*y) * 32_768.0)
                     .round_ties_even()
@@ -295,7 +295,7 @@ mod tests {
                 let u1 = (f64::from(r.next_u32()) + 0.5) / 4_294_967_296.0;
                 let u2 = (f64::from(r.next_u32()) + 0.5) / 4_294_967_296.0;
                 let s = f64::from(1u32 << 23);
-                let x = f64::from(a.planes()[ch][i]) * s + u1 + u2 - 1.0;
+                let x = f64::from(a.to_planes().unwrap()[ch][i]) * s + u1 + u2 - 1.0;
                 let want = (x.round_ties_even().clamp(-s, s - 1.0) / s) as f32;
                 assert_eq!(got[i], want, "ch {ch} i {i}");
             }

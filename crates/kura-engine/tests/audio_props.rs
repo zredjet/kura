@@ -163,8 +163,8 @@ fn e17_integer_round_trips() {
                 let first = encode(&v, format, json!({ "bits": bits }));
                 let back = decode(&first, format);
                 assert_eq!(
-                    audio(&back).planes(),
-                    audio(&v).planes(),
+                    audio(&back).to_planes().unwrap(),
+                    audio(&v).to_planes().unwrap(),
                     "{format} {bits} ビット {channels}ch"
                 );
                 let again = encode(&back, format, json!({ "bits": bits }));
@@ -255,7 +255,7 @@ fn e18_chunked_rendering_matches() {
                         .unwrap_or_else(|e| panic!("{op} {name}: {e}"));
                     start = end;
                 }
-                let want = &whole.planes()[ch][..];
+                let want = &whole.to_planes().unwrap()[ch][..];
                 assert!(
                     got.iter()
                         .zip(want)
@@ -378,7 +378,7 @@ fn passthrough_is_a_shifted_copy() {
         for ch in 0..kernel.channels() {
             let mut got = vec![0f32; n];
             kernel.render(ch, 0, &mut got).unwrap();
-            let want = &src.planes()[ch][off..off + n];
+            let want = &src.to_planes().unwrap()[ch][off..off + n];
             assert!(
                 got.iter()
                     .zip(want)

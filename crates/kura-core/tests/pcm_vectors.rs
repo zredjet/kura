@@ -308,7 +308,7 @@ fn engine_wav_decoder_reads_the_frozen_bytes() {
             "{name}: kura チャンクはループ点にしない"
         );
         let want = case["decoded"].as_array().unwrap();
-        for (ch, plane) in a.planes().iter().enumerate() {
+        for (ch, plane) in a.to_planes().unwrap().iter().enumerate() {
             let got: Vec<u64> = plane.iter().map(|x| u64::from(x.to_bits())).collect();
             let want: Vec<u64> = want[ch]
                 .as_array()

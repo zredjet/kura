@@ -24,7 +24,7 @@ use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::shape::{Dim, Shape};
-use crate::value::{Audio, AudioMeta, AudioSource, Value};
+use crate::value::{AudioBuilder, AudioMeta, AudioSource, Value};
 
 /// MP3 の読み取り。
 pub struct Mp3Codec;
@@ -147,16 +147,8 @@ impl Decoder for Mp3Codec {
             })
             .map_err(EngineError::Limit)?;
         let ch = usize::from(channels);
-        // 上限は中身から出うる長さ以下なので、そのまま確保してよい
-        let len =
-            usize::try_from(frames).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-        let mut planes: Vec<Vec<f32>> = Vec::with_capacity(ch);
-        for _ in 0..ch {
-            let mut p = Vec::new();
-            p.try_reserve_exact(len)
-                .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-            planes.push(p);
-        }
+        // 上限は中身から出うる長さ以下なので、そのまま見込みにしてよい
+        let mut out = AudioBuilder::new(rate, ch, frames)?;
         let mut r = nanomp3::SliceReader::<f32>::new(data);
         let mut done = 0u64;
         loop {
@@ -173,13 +165,7 @@ impl Decoder for Mp3Codec {
             if done > frames {
                 return Err(err("長さがヘッダと合いません"));
             }
-            for p in &mut planes {
-                p.try_reserve(n)
-                    .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-            }
-            for (i, s) in samples.iter().enumerate() {
-                planes[i % ch].push(*s);
-            }
+            out.push_interleaved(samples)?;
         }
         let meta = AudioMeta {
             source: Some(AudioSource {
@@ -189,7 +175,6 @@ impl Decoder for Mp3Codec {
             }),
             ..AudioMeta::default()
         };
-        let audio = Audio::new(rate, planes.into_iter().map(Arc::new).collect(), meta)?;
-        Ok(Value::Audio(Arc::new(audio)))
+        Ok(Value::Audio(Arc::new(out.finish(meta)?)))
     }
 }

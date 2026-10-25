@@ -612,7 +612,11 @@ mod tests {
         let Value::Audio(a) = &audio else { panic!() };
         assert_eq!((a.channels(), a.frames()), (2, 32_000));
         // 最初と最後の 1 秒は無音、途中は音がある
-        assert!(a.planes()[0][..8_000].iter().all(|v| *v == 0.0));
-        assert!(a.planes()[1][8_000..24_000].iter().any(|v| *v != 0.0));
+        assert!(a.to_planes().unwrap()[0][..8_000].iter().all(|v| *v == 0.0));
+        assert!(
+            a.to_planes().unwrap()[1][8_000..24_000]
+                .iter()
+                .any(|v| *v != 0.0)
+        );
     }
 }

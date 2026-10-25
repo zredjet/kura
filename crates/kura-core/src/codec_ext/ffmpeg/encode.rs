@@ -258,16 +258,23 @@ impl Encoder for Mp3FfmpegEncoder {
             stall: STALL,
             deadline: deadline_for(secs),
         };
-        let planes = audio.planes();
         let total = frames as u64;
+        let nch = audio.channels();
         let mut feed = |w: &mut dyn Write| -> std::io::Result<()> {
-            let mut buf: Vec<u8> = Vec::with_capacity(WRITE_FRAMES * planes.len() * 4);
+            let mut buf: Vec<u8> = Vec::with_capacity(WRITE_FRAMES * nch * 4);
+            // 窓ごとに各チャンネルを作業列へ読む（持つ量は窓の分だけ）
+            let mut win: Vec<Vec<f32>> = vec![vec![0f32; WRITE_FRAMES.min(frames)]; nch];
             let mut off = 0usize;
             while off < frames {
                 let n = WRITE_FRAMES.min(frames - off);
+                for (c, p) in win.iter_mut().enumerate() {
+                    audio
+                        .read(c, off as u64, &mut p[..n])
+                        .map_err(std::io::Error::other)?;
+                }
                 buf.clear();
-                for i in off..off + n {
-                    for p in planes {
+                for i in 0..n {
+                    for p in &win {
                         buf.extend_from_slice(&sanitize(p[i]).to_le_bytes());
                     }
                 }
@@ -682,7 +689,7 @@ mod tests {
             .unwrap();
         assert_eq!(stamp.codec, "mp3-nanomp3-dec/1");
         match v {
-            Value::Audio(a) => (a.rate(), a.channels(), a.frames(), a.planes().to_vec()),
+            Value::Audio(a) => (a.rate(), a.channels(), a.frames(), a.to_planes().unwrap()),
             _ => panic!("音声ではありません"),
         }
     }

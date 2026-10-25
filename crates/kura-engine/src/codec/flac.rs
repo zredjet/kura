@@ -20,7 +20,7 @@ use serde_json::json;
 use symphonia_core::codecs::audio::AudioDecoder as _;
 
 use crate::codec::symph::{self, Container};
-use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, pcm};
+use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, pcm, try_vec};
 use crate::determinism::{block_count, par_blocks};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -28,7 +28,7 @@ use crate::limits::Limits;
 use crate::monitor::{Monitor, NoMonitor};
 use crate::op::{ParamKind, ParamSchema, Unit, spec};
 use crate::shape::{Dim, Shape};
-use crate::value::{Audio, AudioSource, Value};
+use crate::value::{AudioBuilder, AudioSource, Value};
 
 /// FLAC の読み書き。
 pub struct FlacCodec;
@@ -122,11 +122,12 @@ impl Decoder for FlacCodec {
         let opts = symph::decoder_options().verify(true);
         let mut dec = symphonia_bundle_flac::FlacDecoder::try_new(&o.params, &opts)
             .map_err(|e| symph::sym_err(DEC_ID, e, mon))?;
-        let planes = o.decode_all(DEC_ID, &mut dec, p.frames, mon)?;
+        let mut out = AudioBuilder::new(p.rate, usize::from(p.channels), p.frames)?;
+        o.decode_all(DEC_ID, &mut dec, p.frames, &mut out, mon)?;
         if dec.finalize().verify_ok == Some(false) {
             return Err(dec_err("MD5 が合いません（壊れたファイル）"));
         }
-        if planes.first().map_or(0, Vec::len) as u64 != p.frames {
+        if out.frames() != p.frames {
             return Err(dec_err("長さがヘッダと合いません"));
         }
         let mut meta = symph::meta_from_tags(&raw, p.frames, true, limits);
@@ -135,8 +136,7 @@ impl Decoder for FlacCodec {
             float: false,
             rate: p.rate,
         });
-        let audio = Audio::new(p.rate, planes.into_iter().map(Arc::new).collect(), meta)?;
-        Ok(Value::Audio(Arc::new(audio)))
+        Ok(Value::Audio(Arc::new(out.finish(meta)?)))
     }
 }
 
@@ -679,22 +679,21 @@ impl Encoder for FlacCodec {
         let frames = par_blocks(block_count(total, BLOCK), mon, |b| {
             let start = b * BLOCK;
             let end = (start + BLOCK).min(total);
-            let xs: Vec<Vec<i64>> = a
-                .planes()
-                .iter()
-                .map(|p| {
-                    p[start..end]
-                        .iter()
-                        .map(|s| pcm::quantize(*s, bits))
-                        .collect()
-                })
-                .collect();
+            let mut win = try_vec(end - start, 0f32)?;
+            let mut xs: Vec<Vec<i64>> = Vec::with_capacity(nch);
+            for c in 0..nch {
+                a.read(c, start as u64, &mut win)?;
+                xs.push(win.iter().map(|s| pcm::quantize(*s, bits)).collect());
+            }
             Ok(frame(b as u64, &xs, rate, bps))
         })?;
         // 標本の MD5（入れ物の幅のリトルエンディアンを、フレームの順・チャンネルの順に）
         let mut md5 = Md5::new();
         let bytes = usize::from(bits / 8);
         let mut buf = Vec::with_capacity(BLOCK * nch * bytes);
+        let mut win: Vec<Vec<f32>> = (0..nch)
+            .map(|_| try_vec(BLOCK.min(total), 0f32))
+            .collect::<Result<_, _>>()?;
         let mut i = 0usize;
         while i < total {
             if mon.canceled() {
@@ -702,9 +701,12 @@ impl Encoder for FlacCodec {
             }
             buf.clear();
             let end = (i + BLOCK).min(total);
-            for t in i..end {
-                for p in a.planes() {
-                    buf.extend_from_slice(&pcm::quantize(p[t], bits).to_le_bytes()[..bytes]);
+            for (c, w) in win.iter_mut().enumerate() {
+                a.read(c, i as u64, &mut w[..end - i])?;
+            }
+            for t in 0..end - i {
+                for w in &win {
+                    buf.extend_from_slice(&pcm::quantize(w[t], bits).to_le_bytes()[..bytes]);
                 }
             }
             md5.update(&buf);
@@ -748,7 +750,7 @@ impl Encoder for FlacCodec {
 mod tests {
     use super::*;
     use crate::codec::CodecSet;
-    use crate::value::{AudioMeta, LoopRange};
+    use crate::value::{Audio, AudioMeta, LoopRange};
     use std::io::Cursor;
 
     fn decode(bytes: &[u8]) -> Result<Value, EngineError> {
@@ -810,7 +812,11 @@ mod tests {
                     let (Value::Audio(x), Value::Audio(y)) = (&v, &back) else {
                         panic!()
                     };
-                    assert_eq!(x.planes(), y.planes(), "{bits} {channels} {frames}");
+                    assert_eq!(
+                        x.to_planes().unwrap(),
+                        y.to_planes().unwrap(),
+                        "{bits} {channels} {frames}"
+                    );
                     assert_eq!(y.meta.source.map(|s| s.bits), Some(bits as u16));
                     if frames == 10_000 && bits == 16 {
                         let raw = frames * channels * 2;

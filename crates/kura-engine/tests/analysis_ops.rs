@@ -480,7 +480,8 @@ fn samples(v: &Value) -> Option<(u32, Vec<Vec<u32>>)> {
     let Value::Audio(a) = v else { return None };
     Some((
         a.rate(),
-        a.planes()
+        a.to_planes()
+            .unwrap()
             .iter()
             .map(|p| p.iter().map(|x| x.to_bits()).collect())
             .collect(),

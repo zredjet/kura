@@ -29,7 +29,7 @@ use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::op::{ParamKind, ParamSchema, Unit, spec};
 use crate::shape::{Dim, Shape};
-use crate::value::{Audio, AudioMeta, AudioSource, LoopRange, Marker, Value};
+use crate::value::{AudioBuilder, AudioMeta, AudioSource, LoopRange, Marker, Value};
 
 /// AIFF の読み書き。
 pub struct AiffCodec;
@@ -492,12 +492,13 @@ impl Decoder for AiffCodec {
         let frames =
             usize::try_from(frames).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
         let ch = usize::from(h.channels);
-        let mut planes: Vec<Vec<f32>> = (0..ch)
-            .map(|_| try_vec(frames, 0f32))
-            .collect::<Result<_, _>>()?;
+        let mut out = AudioBuilder::new(h.rate, ch, frames as u64)?;
         src.seek(SeekFrom::Start(h.data_offset))?;
         let chunk_frames = 16_384usize;
         let mut buf = try_vec(chunk_frames * block, 0u8)?;
+        let mut planes: Vec<Vec<f32>> = (0..ch)
+            .map(|_| try_vec(chunk_frames.min(frames), 0f32))
+            .collect::<Result<_, _>>()?;
         let mut done = 0usize;
         while done < frames {
             if mon.canceled() {
@@ -509,13 +510,14 @@ impl Decoder for AiffCodec {
             for f in 0..n {
                 for (c, plane) in planes.iter_mut().enumerate() {
                     let at = f * block + c * sample;
-                    plane[done + f] = h.layout.to_f32(&bytes[at..at + sample]);
+                    plane[f] = h.layout.to_f32(&bytes[at..at + sample]);
                 }
             }
+            let views: Vec<&[f32]> = planes.iter().map(|p| &p[..n]).collect();
+            out.push_frames(&views)?;
             done += n;
         }
-        let audio = Audio::new(h.rate, planes.into_iter().map(Arc::new).collect(), h.meta)?;
-        Ok(Value::Audio(Arc::new(audio)))
+        Ok(Value::Audio(Arc::new(out.finish(h.meta)?)))
     }
 }
 
@@ -685,15 +687,22 @@ impl Encoder for AiffCodec {
         let chunk_frames = 16_384usize;
         let mut buf = try_vec(chunk_frames * block, 0u8)?;
         let total = a.frames();
+        // 窓ごとに各チャンネルを作業列へ読む（持つ量は窓の分だけ）
+        let mut planes: Vec<Vec<f32>> = (0..a.channels())
+            .map(|_| try_vec(chunk_frames.min(total), 0f32))
+            .collect::<Result<_, _>>()?;
         let mut done = 0usize;
         while done < total {
             if mon.canceled() {
                 return Err(EngineError::Canceled);
             }
             let n = (total - done).min(chunk_frames);
+            for (c, plane) in planes.iter_mut().enumerate() {
+                a.read(c, done as u64, &mut plane[..n])?;
+            }
             for f in 0..n {
-                for (c, plane) in a.planes().iter().enumerate() {
-                    let s = plane[done + f];
+                for (c, plane) in planes.iter().enumerate() {
+                    let s = plane[f];
                     let at = f * block + c * sample;
                     let dst = &mut buf[at..at + sample];
                     if float {
@@ -808,7 +817,11 @@ mod tests {
                 panic!()
             };
             let Value::Audio(src) = &v else { panic!() };
-            assert_eq!(back.planes(), src.planes(), "{opts}");
+            assert_eq!(
+                back.to_planes().unwrap(),
+                src.to_planes().unwrap(),
+                "{opts}"
+            );
             assert_eq!(back.meta.loop_range, src.meta.loop_range);
             assert_eq!(back.meta.markers, src.meta.markers);
             assert_eq!(back.meta.tags, src.meta.tags);

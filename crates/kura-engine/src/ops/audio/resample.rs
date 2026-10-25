@@ -341,7 +341,10 @@ mod tests {
         for i in 400..(b.frames() - 400) {
             let want =
                 0.5 * crate::math::sin(2.0 * std::f64::consts::PI * 1_000.0 * i as f64 / 48_000.0);
-            worst = crate::math::max(worst, (f64::from(b.planes()[0][i]) - want).abs());
+            worst = crate::math::max(
+                worst,
+                (f64::from(b.to_planes().unwrap()[0][i]) - want).abs(),
+            );
         }
         assert!(worst < 1e-6, "{worst}");
     }

@@ -299,7 +299,11 @@ fn read_input(codecs: &CodecSet, path: &Path) -> Result<(u32, Vec<Vec<f32>>), St
         )
         .map_err(|e| format!("{} を読めません: {e}", path.display()))?;
     match value {
-        Value::Audio(a) => Ok((a.rate(), a.planes().iter().map(|p| p.to_vec()).collect())),
+        Value::Audio(a) => Ok((
+            a.rate(),
+            a.read_planes(0, a.frames())
+                .map_err(|e| format!("{} を読めません: {e}", path.display()))?,
+        )),
         _ => Err(format!("{} は音声ではありません", path.display())),
     }
 }
@@ -347,7 +351,7 @@ fn measure(
             sound.planes.len()
         ));
     }
-    let sym: Vec<Vec<f32>> = a.planes().iter().map(|p| p.to_vec()).collect();
+    let sym: Vec<Vec<f32>> = a.read_planes(0, a.frames()).map_err(|e| e.to_string())?;
     let frames_symphonia = a.frames();
 
     let (frames_lewton, frames_lewton_raw, lewton_error, lewton_max_abs_diff) =

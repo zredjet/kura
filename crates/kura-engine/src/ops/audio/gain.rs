@@ -244,7 +244,10 @@ mod tests {
             panic!()
         };
         let Value::Audio(src) = input else { panic!() };
-        for (a, b) in src.planes()[0].iter().zip(out.planes()[0].iter()) {
+        for (a, b) in src.to_planes().unwrap()[0]
+            .iter()
+            .zip(out.to_planes().unwrap()[0].iter())
+        {
             assert!((b - a * 0.501_187).abs() < 1e-6);
         }
     }

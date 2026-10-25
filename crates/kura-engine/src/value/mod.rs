@@ -1,11 +1,13 @@
 //! 値（docs/editing.md §5）。操作の入出力。中身は Arc で共有し、書き換えるときだけ複製する。
 
+pub mod audio;
 pub mod meta;
 pub mod pixel;
 pub mod raster;
 
 use std::sync::Arc;
 
+pub use audio::{AUDIO_CHUNK, Audio, AudioBuilder, ChunkData};
 pub use meta::{
     AnimTag, AudioMeta, AudioSource, Grid, ImageMeta, LoopRange, Marker, Slice, TagDirection,
 };
@@ -153,91 +155,6 @@ impl Frames {
     }
 }
 
-/// 音声。planar f32（チャンネルごとの配列）。すべてのチャンネルは同じ長さ。
-#[derive(Debug, Clone, PartialEq)]
-pub struct Audio {
-    rate: u32,
-    planes: Vec<Arc<Vec<f32>>>,
-    pub meta: AudioMeta,
-}
-
-impl Audio {
-    /// 音声を作る。チャンネルが 0 か 65,535 を超える、長さがそろっていない、レートが 0 ならエラー。
-    pub fn new(
-        rate: u32,
-        planes: Vec<Arc<Vec<f32>>>,
-        meta: AudioMeta,
-    ) -> Result<Self, EngineError> {
-        if rate == 0 || planes.is_empty() || planes.len() > usize::from(u16::MAX) {
-            return Err(EngineError::Internal(
-                "音声のレート・チャンネルの数が正しくありません".into(),
-            ));
-        }
-        let len = planes[0].len();
-        if planes.iter().any(|p| p.len() != len) {
-            return Err(EngineError::Internal(
-                "チャンネルの長さがそろっていません".into(),
-            ));
-        }
-        Ok(Self { rate, planes, meta })
-    }
-
-    /// サンプルレート。
-    pub fn rate(&self) -> u32 {
-        self.rate
-    }
-
-    /// チャンネル数（1〜65,535）。
-    pub fn channels(&self) -> usize {
-        self.planes.len()
-    }
-
-    /// 1 チャンネルあたりのフレーム数。
-    pub fn frames(&self) -> usize {
-        self.planes[0].len()
-    }
-
-    /// チャンネルの中身。
-    pub fn planes(&self) -> &[Arc<Vec<f32>>] {
-        &self.planes
-    }
-
-    /// 標本の実体を共有したまま、メタデータだけを `meta` にした値。
-    pub fn with_meta(&self, meta: AudioMeta) -> Self {
-        Self {
-            rate: self.rate,
-            planes: self.planes.clone(),
-            meta,
-        }
-    }
-
-    /// チャンネル `ch` のフレーム `start` から `out.len()` 個を `out` に写す（範囲の外は 0）。チャンネルが範囲の外なら
-    /// `Internal`。核が入力を読む口（段 1 の後半で、範囲の描画で描かなかったチャンクを読めば `Internal`、源の読みの誤りは
-    /// `Io` を返す）。
-    pub fn read(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
-        let Some(plane) = self.planes.get(ch) else {
-            return Err(EngineError::Internal(format!(
-                "音声のチャンネル {ch} はありません（{} チャンネル）",
-                self.planes.len()
-            )));
-        };
-        let start = usize::try_from(start).unwrap_or(usize::MAX);
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = start
-                .checked_add(i)
-                .and_then(|k| plane.get(k))
-                .copied()
-                .unwrap_or(0.0);
-        }
-        Ok(())
-    }
-}
-
-/// 音声のチャンクのフレーム数（M13。正規の区切り [k·C, (k+1)·C)）。並列の分け方と同じく値に効かない定数で、
-/// どの約束の形式（ダイジェスト・kura-peaks・配信の URL）にも出さない。`AUDIO_BLOCK`（4,096）・`SUM_BLOCK`（4,096）・
-/// `DIGEST_CHUNK`（16,384）の倍数で、波形の段の最も粗いビン（65,536）と同じ。
-pub const AUDIO_CHUNK: usize = 1 << 16;
-
 /// 操作の入出力の値。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -293,11 +210,7 @@ impl Value {
                     f.px.chunks(out);
                 }
             }
-            Self::Audio(a) => {
-                for p in a.planes() {
-                    out.push((Arc::as_ptr(p).addr(), (p.len() as u64).saturating_mul(4)));
-                }
-            }
+            Self::Audio(a) => a.chunks_into(out),
         }
     }
 
@@ -359,17 +272,22 @@ pub(crate) fn audio_digest(
         .u64(a.frames() as u64);
     // 標本のビット列を DIGEST_CHUNK 個ずつまとめて足す（BLAKE3 は流れのハッシュなので、まとめ方で値は
     // 変わらない。4 バイトずつ足すと 3 分のステレオで 0.15 秒かかっていた）
+    // チャンネルの順に、各チャンネルのチャンクを番号の順にたどる。チャンクの区切りは DIGEST_CHUNK の倍数なので、まとめる
+    // 塊の区切りと確かめを呼ぶ位置・数は、チャンネルを 1 本の列として DIGEST_CHUNK ずつ区切ったものと同じ
     let mut buf = Vec::with_capacity(DIGEST_CHUNK * 4);
-    for plane in a.planes() {
-        for chunk in plane.chunks(DIGEST_CHUNK) {
-            check()?;
-            buf.clear();
-            for s in chunk {
-                // NaN は 1 つの値にそろえる
-                let bits = if s.is_nan() { 0x7fc0_0000 } else { s.to_bits() };
-                buf.extend_from_slice(&bits.to_le_bytes());
+    for ch in 0..a.channels() {
+        for k in 0..a.chunk_count() {
+            let data = a.chunk_data(ch, k)?;
+            for chunk in data.chunks(DIGEST_CHUNK) {
+                check()?;
+                buf.clear();
+                for s in chunk {
+                    // NaN は 1 つの値にそろえる
+                    let bits = if s.is_nan() { 0x7fc0_0000 } else { s.to_bits() };
+                    buf.extend_from_slice(&bits.to_le_bytes());
+                }
+                h.raw(&buf);
             }
-            h.raw(&buf);
         }
     }
     h.bytes_with_len(&canonical(&a.meta)?);

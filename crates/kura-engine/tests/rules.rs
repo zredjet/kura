@@ -3,6 +3,7 @@
 //! - エンジンはスレッドプールを作らない：`ThreadPoolBuilder`・`.install(`・`::install`（UFCS の `ThreadPool::install(&pool, ..)`
 //!   など）・`build_global` は src（テストのモジュールを除く）にない。
 //!   プールは呼び手（kura-core の EngineRuntime）が作り、エンジンは呼ばれたスレッドのプールで `par_blocks` を回す。
+//! - 本番のコードは音声の全体を連続した列にしない：`.to_planes(` は src（テストのモジュールと `testing` を除く）にない（M13）。
 
 // テストの補助関数は #[test] の外にあるので、テストと同じく unwrap などを許す（clippy.toml の allow-*-in-tests が届かない）
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -316,6 +317,33 @@ fn engine_src_creates_no_pools() {
         })
     };
     assert!(all);
+}
+
+/// M13 段 1（E36）：本番のコードは音声の全体を連続した列にしない（`Audio::to_planes` はテストと短い音声だけ。長い音声を
+/// 丸ごと写すと、チャンクの共有・遅延の源の意味がなくなる）。src のテストのモジュールの外と、テストの補助（`testing`）の外に
+/// `.to_planes(` がない。読むときは `read`・`chunk_data`・`for_each_chunk`・`read_planes`（区間）を使う。
+#[test]
+fn engine_src_does_not_flatten_audio() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let found: Vec<String> = find_outside_tests(&src, &[".to_planes("])
+        .into_iter()
+        .filter(|f| !f.starts_with("testing"))
+        .collect();
+    assert!(
+        found.is_empty(),
+        "エンジンの本番のコードが音声の全体を連続した列にしています（read・chunk_data・for_each_chunk・read_planes を使う）:\n{}",
+        found.join("\n")
+    );
+    // 走査が空回りしていない：テストの補助とテストのモジュールの中には実際にある
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    assert!(
+        files
+            .iter()
+            .any(|f| { std::fs::read_to_string(f).unwrap().contains(".to_planes(") })
+    );
+    let (code, _) = code_of("fn f(a: &Audio) { let p = a.to_planes(); }");
+    assert!(code.contains(".to_planes("));
 }
 
 /// 走査は、コード・テストでない関数の中のものを見つけ、コメント・文字列・テストのモジュール（中身つき・別のファイル）は除く。

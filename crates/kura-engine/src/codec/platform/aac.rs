@@ -306,9 +306,13 @@ impl<B: AacBackend> Encoder for PlatformAacEncoder<B> {
                 return Err(EngineError::Canceled);
             }
             let n = WRITE_FRAMES.min(frames - off);
-            for (dst, src) in scratch.iter_mut().zip(audio.planes()) {
+            for (c, dst) in scratch.iter_mut().enumerate() {
                 dst.clear();
-                dst.extend(src[off..off + n].iter().map(|&s| sanitize(s)));
+                dst.resize(n, 0.0);
+                audio.read(c, off as u64, dst)?;
+                for s in dst.iter_mut() {
+                    *s = sanitize(*s);
+                }
             }
             let views: Vec<&[f32]> = scratch.iter().map(Vec::as_slice).collect();
             h.write(&views)

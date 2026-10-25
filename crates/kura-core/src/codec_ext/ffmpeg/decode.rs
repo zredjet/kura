@@ -600,7 +600,7 @@ mod tests {
         let (v, stamp) = read(&set, &t.path("in.opus"), "opus", &Limits::default()).unwrap();
         let a = audio(&v);
         assert_eq!((a.rate(), a.channels(), a.frames()), (48_000, 6, 5));
-        for (got, want) in a.planes().iter().zip(&p) {
+        for (got, want) in a.to_planes().unwrap().iter().zip(&p) {
             assert_eq!(got.as_slice(), want.as_slice());
         }
         assert_eq!(a.meta.tags.get("title").map(String::as_str), Some("T"));
@@ -1145,7 +1145,7 @@ mod tests {
         let a = audio(&v);
         assert_eq!(a.frames(), 5_000);
         assert_eq!(a.meta.source.map(|s| s.bits), Some(16));
-        for (got, want) in a.planes()[0].iter().zip(&p[0]) {
+        for (got, want) in a.to_planes().unwrap()[0].iter().zip(&p[0]) {
             let q = (want * 32_768.0).round().clamp(-32_768.0, 32_767.0) / 32_768.0;
             assert_eq!(*got, q);
         }

@@ -99,9 +99,9 @@ fn write_first(input: &Value, x: u64) -> Result<Applied, EngineError> {
     let Value::Audio(a) = input else {
         return Err(EngineError::Internal("音声ではない".into()));
     };
-    let mut p = (*a.planes()[0]).clone();
+    let mut p = (*a.to_planes().unwrap()[0]).clone();
     p[0] = x as f32;
-    let mut planes = a.planes().to_vec();
+    let mut planes = a.to_planes().unwrap().to_vec();
     planes[0] = Arc::new(p);
     Ok(Applied::value(Value::Audio(Arc::new(Audio::new(
         a.rate(),
@@ -265,7 +265,7 @@ fn render(
 
 fn first(v: &Value) -> f32 {
     let Value::Audio(a) = v else { panic!() };
-    a.planes()[0][0]
+    a.to_planes().unwrap()[0][0]
 }
 
 #[derive(Default)]

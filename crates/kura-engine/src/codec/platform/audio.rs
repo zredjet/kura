@@ -21,7 +21,7 @@ use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::shape::{Dim, Shape};
-use crate::value::{Audio, AudioMeta, AudioSource, Value};
+use crate::value::{AudioBuilder, AudioMeta, AudioSource, Value};
 
 /// 1 回の読み取りで求めるフレームの数。
 pub const CHUNK_FRAMES: usize = 65_536;
@@ -181,12 +181,14 @@ impl<B: AudioBackend> Decoder for PlatformAudioDecoder<B> {
         limits.check(&shape_of(&info)).map_err(EngineError::Limit)?;
         let frames = usize::try_from(info.frames)
             .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+        let mut out = AudioBuilder::new(info.rate, usize::from(info.channels), info.frames)?;
+        // 塊ごとに作業列へ読んでから組み手に足す（持つ量は値と塊の分だけ）
         let mut planes: Vec<Vec<f32>> = Vec::new();
         planes
             .try_reserve_exact(usize::from(info.channels))
             .map_err(|_| EngineError::Limit("チャンネルの表を確保できません".into()))?;
         for _ in 0..info.channels {
-            planes.push(try_vec(frames, 0.0f32)?);
+            planes.push(try_vec(CHUNK_FRAMES.min(frames), 0.0f32)?);
         }
         let short = |got: usize| EngineError::Decode {
             codec: id.to_string(),
@@ -198,8 +200,7 @@ impl<B: AudioBackend> Decoder for PlatformAudioDecoder<B> {
                 return Err(EngineError::Canceled);
             }
             let n = CHUNK_FRAMES.min(frames - off);
-            let mut views: Vec<&mut [f32]> =
-                planes.iter_mut().map(|p| &mut p[off..off + n]).collect();
+            let mut views: Vec<&mut [f32]> = planes.iter_mut().map(|p| &mut p[..n]).collect();
             let got = h
                 .read(&mut views)
                 .map_err(|e| e.into_engine(id, Stage::Decode))?;
@@ -211,6 +212,8 @@ impl<B: AudioBackend> Decoder for PlatformAudioDecoder<B> {
             if got == 0 {
                 return Err(short(off));
             }
+            let read: Vec<&[f32]> = planes.iter().map(|p| &p[..got]).collect();
+            out.push_frames(&read)?;
             off += got;
             mon.progress(off as u64, frames as u64);
         }
@@ -233,11 +236,8 @@ impl<B: AudioBackend> Decoder for PlatformAudioDecoder<B> {
             float: false,
             rate: info.rate,
         }));
-        Ok(Value::Audio(Arc::new(Audio::new(
-            info.rate,
-            planes.into_iter().map(Arc::new).collect(),
-            meta,
-        )?)))
+        drop(planes);
+        Ok(Value::Audio(Arc::new(out.finish(meta)?)))
     }
 }
 
@@ -335,7 +335,7 @@ mod tests {
                 .unwrap();
             let Value::Audio(a) = &v else { panic!("{v:?}") };
             assert_eq!(a.rate(), 48_000);
-            let got: Vec<Vec<f32>> = a.planes().iter().map(|p| p.to_vec()).collect();
+            let got: Vec<Vec<f32>> = a.to_planes().unwrap().iter().map(|p| p.to_vec()).collect();
             assert_eq!(got, data);
             assert_eq!(
                 a.meta.source,

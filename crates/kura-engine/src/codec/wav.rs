@@ -19,7 +19,7 @@ use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::op::{ParamKind, ParamSchema, Unit, spec};
 use crate::shape::{Dim, Shape};
-use crate::value::{Audio, AudioMeta, AudioSource, LoopRange, Marker, Value};
+use crate::value::{AudioBuilder, AudioMeta, AudioSource, LoopRange, Marker, Value};
 
 /// WAV の読み書き。
 pub struct WavCodec;
@@ -361,14 +361,15 @@ impl Decoder for WavCodec {
         let frames =
             usize::try_from(frames).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
         let ch = usize::from(h.channels);
-        let mut planes: Vec<Vec<f32>> = (0..ch)
-            .map(|_| try_vec(frames, 0f32))
-            .collect::<Result<_, _>>()?;
+        let mut out = AudioBuilder::new(h.rate, ch, frames as u64)?;
         src.seek(SeekFrom::Start(h.data_offset))?;
         let block = usize::from(h.block_align);
         let sample = usize::from(h.bits / 8);
         let chunk_frames = 16_384usize;
         let mut buf = try_vec(chunk_frames * block, 0u8)?;
+        let mut planes: Vec<Vec<f32>> = (0..ch)
+            .map(|_| try_vec(chunk_frames.min(frames), 0f32))
+            .collect::<Result<_, _>>()?;
         let mut done = 0usize;
         while done < frames {
             if mon.canceled() {
@@ -380,13 +381,14 @@ impl Decoder for WavCodec {
             for f in 0..n {
                 for (c, plane) in planes.iter_mut().enumerate() {
                     let s = &bytes[f * block + c * sample..f * block + (c + 1) * sample];
-                    plane[done + f] = to_f32(s, h.bits, h.float);
+                    plane[f] = to_f32(s, h.bits, h.float);
                 }
             }
+            let views: Vec<&[f32]> = planes.iter().map(|p| &p[..n]).collect();
+            out.push_frames(&views)?;
             done += n;
         }
-        let audio = Audio::new(h.rate, planes.into_iter().map(Arc::new).collect(), h.meta)?;
-        Ok(Value::Audio(Arc::new(audio)))
+        Ok(Value::Audio(Arc::new(out.finish(h.meta)?)))
     }
 }
 
@@ -574,15 +576,22 @@ impl Encoder for WavCodec {
         let sample = usize::from(bits / 8);
         let mut buf = try_vec(chunk_frames * block_align as usize, 0u8)?;
         let total = a.frames();
+        // 窓ごとに各チャンネルを作業列へ読む（持つ量は窓の分だけ）
+        let mut planes: Vec<Vec<f32>> = (0..a.channels())
+            .map(|_| try_vec(chunk_frames.min(total), 0f32))
+            .collect::<Result<_, _>>()?;
         let mut done = 0usize;
         while done < total {
             if mon.canceled() {
                 return Err(EngineError::Canceled);
             }
             let n = (total - done).min(chunk_frames);
+            for (c, plane) in planes.iter_mut().enumerate() {
+                a.read(c, done as u64, &mut plane[..n])?;
+            }
             for f in 0..n {
-                for (c, plane) in a.planes().iter().enumerate() {
-                    let s = plane[done + f];
+                for (c, plane) in planes.iter().enumerate() {
+                    let s = plane[f];
                     let at = f * block_align as usize + c * sample;
                     let dst = &mut buf[at..at + sample];
                     if float {
@@ -629,6 +638,7 @@ mod tests {
     use crate::codec::CodecSet;
     use crate::monitor::NoMonitor;
     use crate::testgen::InputGen;
+    use crate::value::Audio;
     use std::io::Cursor;
 
     fn decode(bytes: Vec<u8>) -> Result<Value, EngineError> {
@@ -722,7 +732,7 @@ mod tests {
         let Value::Audio(a) = &v else { panic!() };
         let back = decode(encode(&v, json!({ "float": true }))).unwrap();
         let Value::Audio(b) = &back else { panic!() };
-        assert_eq!(a.planes(), b.planes());
+        assert_eq!(a.to_planes().unwrap(), b.to_planes().unwrap());
         assert_eq!(
             b.meta.source,
             Some(AudioSource {
@@ -1025,7 +1035,8 @@ mod tests {
             let Value::Audio(a) = v else { panic!() };
             assert_eq!((a.channels(), a.frames()), (2, 64), "{tag}/{bits}");
             assert!(
-                a.planes()
+                a.to_planes()
+                    .unwrap()
                     .iter()
                     .all(|p| p.iter().all(|s| (-1.0..=1.0).contains(s)))
             );

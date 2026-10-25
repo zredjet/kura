@@ -116,32 +116,43 @@ fn rail(x: f32) -> i8 {
     }
 }
 
-fn scan_channel(x: &[f32], t: f64, cx: &AnalyzeCx<'_>) -> Result<ChannelScan, EngineError> {
+/// 1 チャンネルを、チャンクを番号の順にたどって数える（クリップの列はチャンクの境をまたいで運ぶ）。
+fn scan_channel(
+    a: &Audio,
+    ch: usize,
+    t: f64,
+    cx: &AnalyzeCx<'_>,
+) -> Result<ChannelScan, EngineError> {
     let mut s = ChannelScan::default();
     let (mut run, mut side) = (0u64, 0i8);
-    for (i, v) in x.iter().enumerate() {
-        if i % CHECK_EVERY == 0 {
-            cx.check()?;
-        }
-        let v = *v;
-        if f64::from(v).abs() > t {
-            s.first.get_or_insert(i);
-            s.last = Some(i);
-        }
-        if !v.is_finite() {
-            s.non_finite += 1;
-        } else if v.abs() > 1.0 {
-            s.overs += 1;
-        }
-        let r = rail(v);
-        if r != 0 && r == side {
-            run += 1;
-        } else {
-            if run >= CLIP_RUN {
-                s.clip_runs += 1;
+    let mut i = 0usize;
+    for k in 0..a.chunk_count() {
+        let x = a.chunk_data(ch, k)?;
+        for v in x.iter() {
+            if i.is_multiple_of(CHECK_EVERY) {
+                cx.check()?;
             }
-            run = u64::from(r != 0);
-            side = r;
+            let v = *v;
+            if f64::from(v).abs() > t {
+                s.first.get_or_insert(i);
+                s.last = Some(i);
+            }
+            if !v.is_finite() {
+                s.non_finite += 1;
+            } else if v.abs() > 1.0 {
+                s.overs += 1;
+            }
+            let r = rail(v);
+            if r != 0 && r == side {
+                run += 1;
+            } else {
+                if run >= CLIP_RUN {
+                    s.clip_runs += 1;
+                }
+                run = u64::from(r != 0);
+                side = r;
+            }
+            i += 1;
         }
     }
     if run >= CLIP_RUN {
@@ -157,13 +168,7 @@ pub fn scan(
     cx: &AnalyzeCx<'_>,
 ) -> Result<SilenceReport, EngineError> {
     let t = math::db_to_gain(p.threshold_db);
-    let planes = a.planes();
-    let scans = cx.par_blocks(planes.len(), |ch| match planes.get(ch) {
-        Some(x) => scan_channel(x, t, cx),
-        None => Err(EngineError::Internal(
-            "無音の仕事の番号が範囲の外です".into(),
-        )),
-    })?;
+    let scans = cx.par_blocks(a.channels(), |ch| scan_channel(a, ch, t, cx))?;
     let frames = a.frames() as u64;
     let first = scans.iter().filter_map(|s| s.first).min();
     let last = scans.iter().filter_map(|s| s.last).max();
@@ -579,7 +584,7 @@ mod tests {
             let Value::Audio(a) = ex.input.generate().unwrap() else {
                 panic!()
             };
-            let planes: Vec<Vec<f32>> = a.planes().iter().map(|p| p.to_vec()).collect();
+            let planes: Vec<Vec<f32>> = a.to_planes().unwrap().iter().map(|p| p.to_vec()).collect();
             let got = run(planes.clone(), ex.params.threshold_db);
             assert_eq!(got, want, "{name}");
             assert_eq!(got, reference(&planes, ex.params.threshold_db), "{name}");

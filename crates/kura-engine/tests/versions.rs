@@ -57,7 +57,8 @@ fn map_audio(
         return Err(EngineError::Internal("音声ではありません".into()));
     };
     let planes = a
-        .planes()
+        .to_planes()
+        .unwrap()
         .iter()
         .enumerate()
         .map(|(c, p)| {

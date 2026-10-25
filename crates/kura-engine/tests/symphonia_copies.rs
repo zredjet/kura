@@ -92,7 +92,7 @@ fn broken_vorbis_nans_have_the_same_bits_on_every_target() {
         };
         let mut h = blake3::Hasher::new();
         let mut count = 0usize;
-        for p in a.planes() {
+        for p in a.to_planes().unwrap() {
             for s in p.iter() {
                 h.update(&s.to_bits().to_le_bytes());
                 if s.is_nan() {

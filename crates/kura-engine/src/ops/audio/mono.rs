@@ -195,8 +195,10 @@ mod tests {
             panic!("音声ではありません")
         };
         assert_eq!(a.channels(), 1);
-        let want = ((f64::from(src.planes()[0][77]) + f64::from(src.planes()[1][77])) / 2.0) as f32;
-        assert_eq!(a.planes()[0][77], want);
+        let want = ((f64::from(src.to_planes().unwrap()[0][77])
+            + f64::from(src.to_planes().unwrap()[1][77]))
+            / 2.0) as f32;
+        assert_eq!(a.to_planes().unwrap()[0][77], want);
         // 1 チャンネルならそのまま
         assert_eq!(
             render_value(Mono::ID, 1, json!({}), out.clone()).unwrap(),
