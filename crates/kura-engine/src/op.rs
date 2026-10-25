@@ -417,13 +417,9 @@ impl<'a> ApplyCx<'a> {
         self.analyses.get_or_run::<A>(input, v, p, &cx)
     }
 
-    /// 実行器が先に解いた結果を入れる。
-    pub(crate) fn preload(
-        &mut self,
-        need: &Need,
-        v: &Value,
-        out: AnyOutput,
-    ) -> Result<(), EngineError> {
+    /// 実行器が先に解いた結果を入れる（`v` と同じ実体の値に対してだけ使われる。テストが、部分の値の入力の核に全体で解いた
+    /// 結果を渡すのにも使う）。
+    pub fn preload(&mut self, need: &Need, v: &Value, out: AnyOutput) -> Result<(), EngineError> {
         self.analyses.insert(need, v, out)
     }
 
@@ -566,6 +562,13 @@ pub trait Op: Send + Sync + 'static {
     fn reach(_p: &Self::Params, _inputs: &[Shape]) -> Reach {
         Reach::Global
     }
+    /// 音声の核の `render` が入力 0 のどこを読むか（M13 段 1。音声の範囲の描画の逆写しに使う。申告した解析は先に解いた
+    /// 前提で、核が直に読む区間だけ。大きめでよく、小さすぎてはいけない）。`reach`（変わった範囲を前へ写すのに使う。計測を
+    /// 通して全体に依るなら `Global`）とは別で、normalize は `reach` が全体・`audio_reach` が同じ位置。長さの分からない形では
+    /// `Global` を返してよい（そのノードは全体で描く）。既定は `reach`。
+    fn audio_reach(p: &Self::Params, inputs: &[Shape]) -> Reach {
+        Self::reach(p, inputs)
+    }
     /// 入力が同じとき、引数を `old` から `new` に変えて出力が変わりうる範囲（出力のキャンバスの座標。持ち上げる操作は
     /// 1 フレームの画像の座標で、実行器が全フレームに広げる）。既定は `Area::All`。
     fn param_change(_old: &Self::Params, _new: &Self::Params, _inputs: &[Shape]) -> Area {
@@ -684,6 +687,8 @@ pub trait DynOp: Send + Sync {
     fn region(&self) -> bool;
     /// 出力が入力 0 のどこに依るか（`Op::reach`）。
     fn reach(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Reach, EngineError>;
+    /// 音声の核が入力 0 のどこを読むか（`Op::audio_reach`）。
+    fn audio_reach(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Reach, EngineError>;
     /// 引数を変えたときに出力が変わりうる範囲（`Op::param_change`）。
     fn param_change(
         &self,
@@ -882,6 +887,10 @@ impl<O: Op> DynOp for OpEntry<O> {
 
     fn reach(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Reach, EngineError> {
         Ok(O::reach(self.params(p)?, inputs))
+    }
+
+    fn audio_reach(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Reach, EngineError> {
+        Ok(O::audio_reach(self.params(p)?, inputs))
     }
 
     fn param_change(

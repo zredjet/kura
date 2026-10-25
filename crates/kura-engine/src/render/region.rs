@@ -1099,10 +1099,12 @@ impl PartialValue {
             .map(|(_, px, _)| px.valid_tiles())
     }
 
-    /// 範囲（キャンバスの座標）に重なるタイルがどれも有効なら true。音声は全体を描いた値だけ true。
+    /// 範囲（キャンバスの座標・音声の区間）に重なるタイル・チャンクがどれも有効なら true。
     pub fn covers(&self, area: &Area) -> bool {
-        if matches!(self.value, Value::Audio(_)) {
-            return true;
+        if let Value::Audio(a) = &self.value {
+            let need = crate::render::audio::chunks_covering(area, a.frames());
+            let valid = a.valid_chunks();
+            return need.iter().all(|k| valid.contains(k));
         }
         if area.is_all() {
             return self.value.is_complete();
@@ -1111,6 +1113,77 @@ impl PartialValue {
             self.valid(*f)
                 .is_some_and(|valid| need.is_subset_of(&valid))
         })
+    }
+
+    // 音声の配信の口（M13 段 1。読むだけで、保存の道に渡せる値は返さない）
+
+    /// 音声の有効なチャンクの区間（隣り合うものは 1 つ。画像は None）。
+    pub fn audio_valid(&self) -> Option<Spans> {
+        match &self.value {
+            Value::Audio(a) => Some(crate::render::audio::chunk_spans(
+                &a.valid_chunks(),
+                a.frames(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// 音声のチャンネル `ch` のフレーム `start` から `out.len()` 個を写す（長さの外は 0）。描いていない区間に掛かれば誤り
+    /// （`Internal`。読んだ印は立てない）。画像は誤り。
+    pub fn audio_read(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+        let a = self.audio()?;
+        let end = start.saturating_add(out.len() as u64);
+        if !self.covers(&Area::span(start, end)) {
+            return Err(EngineError::Internal(format!(
+                "範囲だけを描いた値の、描いていない音声の区間（チャンネル {ch}・[{start}, {end})）を読もうとしました"
+            )));
+        }
+        a.read(ch, start, out)
+    }
+
+    /// 音声のチャンネル `ch` のチャンク `k` の中身（写さずに借りる）。描いていないチャンク・範囲の外は誤り（読んだ印は
+    /// 立てない）。画像は誤り。
+    pub fn audio_chunk(
+        &self,
+        ch: usize,
+        k: usize,
+    ) -> Result<crate::value::ChunkData<'_>, EngineError> {
+        let a = self.audio()?;
+        if !a.valid_chunks().contains(k) {
+            return Err(EngineError::Internal(format!(
+                "範囲だけを描いた値の、描いていない音声のチャンク（チャンネル {ch}・{k}）を読もうとしました"
+            )));
+        }
+        a.chunk_data(ch, k)
+    }
+
+    /// 音声のチャンネル `ch` のチャンク `k` の実体を共有していれば true（テスト用）。
+    pub fn shares_audio_chunk(&self, other: &PartialValue, ch: usize, k: usize) -> bool {
+        match (&self.value, &other.value) {
+            (Value::Audio(a), Value::Audio(b)) => a.same_chunk(b, ch, k),
+            _ => false,
+        }
+    }
+
+    /// 中身を持つチャンク・タイルのバイト数（音声は有効なチャンクの中身。源の参照は数えない。画像は有効なタイル）。
+    /// エディタが表示の値を持ち続ける分を予算に申告するのに使う。
+    pub fn resident_bytes(&self) -> u64 {
+        match &self.value {
+            Value::Audio(a) => a.resident_bytes(),
+            v => {
+                let mut list = Vec::new();
+                v.chunks(&mut list);
+                let unique: BTreeMap<usize, u64> = list.into_iter().collect();
+                unique.values().fold(0u64, |acc, b| acc.saturating_add(*b))
+            }
+        }
+    }
+
+    fn audio(&self) -> Result<&crate::value::Audio, EngineError> {
+        match &self.value {
+            Value::Audio(a) => Ok(a),
+            _ => Err(EngineError::Internal("音声の値ではありません".into())),
+        }
     }
 
     /// タイルの中身（フレームの画像の座標のタイル）。無効なタイル・範囲の外は誤り。

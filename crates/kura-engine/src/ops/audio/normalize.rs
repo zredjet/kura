@@ -28,6 +28,7 @@ use crate::op::{
 };
 use crate::ops::audio::gain::GainKernel;
 use crate::ops::util::{audio_of, audio_shape};
+use crate::render::region::Reach;
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::Value;
@@ -178,6 +179,12 @@ impl Op for Normalize {
             })
         };
         Some(run(cx))
+    }
+
+    // M13 段 1：核が読むのは同じ位置だけ（計測は申告した解析として先に解く）。変わった範囲を前へ写す `reach` は既定の
+    // 全体のまま（出力は計測を通して入力の全体に依る）
+    fn audio_reach(_p: &NormalizeParams, _inputs: &[Shape]) -> Reach {
+        Reach::SameTime
     }
 
     fn examples() -> Vec<Example<NormalizeParams>> {

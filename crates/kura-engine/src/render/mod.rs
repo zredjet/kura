@@ -16,6 +16,7 @@
 //!   計画を作る（段 10。段の値は近似で、`render`・`render_with_solver` は段の計画を断る）。
 
 pub mod area;
+pub mod audio;
 pub mod cache;
 pub mod delta;
 pub mod estimate;
@@ -754,7 +755,7 @@ impl Engine {
                 let mut value = lookup(&values, &input_values, from)
                     .ok_or_else(|| EngineError::Internal("出力の値がありません".into()))?;
                 if let (Some(q), Value::Audio(a)) = (quantize, &value) {
-                    value = crate::audio::quantize(a, q, &source, mon)?;
+                    value = crate::audio::quantize(a, q, &source, None, mon)?;
                 }
                 let digest = value.digest()?;
                 Ok(RenderedOutput {

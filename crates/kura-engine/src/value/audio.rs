@@ -453,6 +453,18 @@ impl Audio {
         }
     }
 
+    /// チャンネル `ch` のチャンク `k` を、実体を写さずに取り出す（中身・源の参照の写し。範囲の描画が、ずらした写しの
+    /// チャンクを入力の実体で共有するのに使う）。範囲の外は `Internal`、無効なチャンクは読んだ印を立てて `Internal`。
+    pub fn share_chunk(&self, ch: usize, k: usize) -> Result<Chunk, EngineError> {
+        match self.chunk(ch, k)? {
+            Chunk::Hole => {
+                self.touch();
+                Err(hole_error())
+            }
+            c => Ok(c.clone()),
+        }
+    }
+
     /// 無効なチャンクを読んだ印を立てる。
     fn touch(&self) {
         if let Some(h) = &self.holes {

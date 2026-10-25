@@ -972,11 +972,8 @@ pub fn check_region(
     full: &Value,
     area: &Area,
 ) -> Result<(), String> {
-    if matches!(full, Value::Audio(_)) {
-        return match got.exact() {
-            Some(v) if v == full => Ok(()),
-            _ => Err("音声の範囲の描画が全体の描画と違います".into()),
-        };
+    if let Value::Audio(want) = full {
+        return check_audio_region(got, want, area);
     }
     if got.shape() != full.shape() {
         return Err(format!(
@@ -1003,6 +1000,53 @@ pub fn check_region(
             if tile != px.tile(tx, ty) {
                 return Err(format!(
                     "フレーム {f} のタイル ({tx}, {ty}) が全体の描画と違います"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 音声の範囲の描画の値の、範囲 `area` に掛かるチャンクがどれも有効で、全体を描いた値 `want` の同じチャンクとビット単位で
+/// 同じかを確かめる（M13 段 1。有効なチャンクは範囲の外のものも同じであること。メタデータも同じ）。違えば説明。
+pub fn check_audio_region(
+    got: &crate::render::region::PartialValue,
+    want: &Audio,
+    area: &Area,
+) -> Result<(), String> {
+    let Value::Audio(a) = got.value() else {
+        return Err("音声の範囲の描画が音声ではありません".into());
+    };
+    if (a.rate(), a.channels(), a.frames()) != (want.rate(), want.channels(), want.frames()) {
+        return Err(format!(
+            "音声の範囲の描画の形が違います（{:?} と {:?}）",
+            (a.rate(), a.channels(), a.frames()),
+            (want.rate(), want.channels(), want.frames())
+        ));
+    }
+    if a.meta != want.meta {
+        return Err("音声の範囲の描画のメタデータが違います".into());
+    }
+    let valid = a.valid_chunks();
+    for k in crate::render::audio::chunks_covering(area, want.frames()).iter() {
+        if !valid.contains(k) {
+            return Err(format!("音声のチャンク {k} が描かれていません"));
+        }
+    }
+    for k in valid.iter() {
+        for ch in 0..want.channels() {
+            let (x, y) = (
+                a.chunk_data(ch, k).map_err(|e| e.to_string())?,
+                want.chunk_data(ch, k).map_err(|e| e.to_string())?,
+            );
+            if let Some(i) = x
+                .iter()
+                .zip(y.iter())
+                .position(|(p, q)| p.to_bits() != q.to_bits())
+            {
+                return Err(format!(
+                    "音声のチャンク {k}・チャンネル {ch} の標本 {} が全体の描画と違います",
+                    k * crate::value::AUDIO_CHUNK + i
                 ));
             }
         }
@@ -1130,4 +1174,285 @@ pub fn check_region_and_delta(
         })?;
     }
     Ok(())
+}
+
+// ---- 音声の範囲の描画の補助（M13 段 1。E37・E38） ----
+
+/// 音声の入力の作り方：長さ 1〜6,000 に加え、チャンクの境の前後（C−3〜C+3）・2C+37・3C 前後。レートは 8 kHz を多めに
+/// （resample を軽くする）、チャンネルは 1〜2。
+pub fn random_audio_input(r: &mut ChaCha8Rng) -> InputGen {
+    let c = crate::value::AUDIO_CHUNK as u64;
+    let frames = match below(r, 6) {
+        0 | 1 => 1 + below(r, 6_000),
+        2 => c - 3 + below(r, 7),
+        3 => 2 * c + 37,
+        _ => 3 * c - 2 + below(r, 5),
+    };
+    InputGen::AudioNoise {
+        rate: [8_000u32, 8_000, 8_000, 16_000][below(r, 4) as usize],
+        channels: 1 + below(r, 2) as u16,
+        frames,
+        seed: r.next_u64(),
+    }
+}
+
+/// 音声の操作 1 つ（形 `shape` の入力に当てるもの）：ゲイン・トリム（始まり・終わり）・フェード・モノラル・ループ点・
+/// リサンプル（軽い比）・正規化（目標・上限）。
+pub fn random_audio_op(r: &mut ChaCha8Rng, shape: &Shape) -> (&'static str, serde_json::Value) {
+    let (rate, frames) = match shape {
+        Shape::Audio { rate, frames, .. } => (*rate, frames.max()),
+        _ => (8_000, 1),
+    };
+    match below(r, 9) {
+        0 | 1 => (
+            "audio.gain",
+            json!({ "db": below(r, 200) as f64 / 10.0 - 10.0 }),
+        ),
+        2 => {
+            let start = below(r, frames / 2 + 1);
+            let end = if below(r, 2) == 0 {
+                serde_json::Value::Null
+            } else {
+                json!(start + 1 + below(r, frames.saturating_sub(start)))
+            };
+            ("audio.trim", json!({ "start": start, "end": end }))
+        }
+        3 | 4 => (
+            "audio.fade",
+            json!({ "fadeIn": below(r, frames / 2 + 1), "fadeOut": below(r, frames / 2 + 1), "curve": if below(r, 2) == 0 { "linear" } else { "equalPower" } }),
+        ),
+        5 => ("audio.mono", json!({})),
+        6 => {
+            let a = below(r, frames.max(2) - 1);
+            (
+                "audio.set_loop",
+                json!({ "loop": { "start": a, "end": a + 1 + below(r, frames.max(2) - a - 1) } }),
+            )
+        }
+        7 => {
+            let to = match rate {
+                8_000 => [12_000u32, 16_000, 6_000][below(r, 3) as usize],
+                _ => [8_000u32, 12_000][below(r, 2) as usize],
+            };
+            ("audio.resample", json!({ "rate": to }))
+        }
+        _ => {
+            let limit = if below(r, 2) == 0 {
+                serde_json::Value::Null
+            } else {
+                json!(-(below(r, 60) as f64) / 10.0)
+            };
+            (
+                "audio.normalize",
+                json!({ "target": -(10.0 + below(r, 200) as f64 / 10.0), "peakLimit": limit }),
+            )
+        }
+    }
+}
+
+/// ランダムな音声の鎖：形 `shape` の音声の入力に、compile が通る音声の操作を `len` 個まで線形につなぐ。3 回に 1 回は
+/// 出力に量子化（8・16・24 ビット、TPDF・ディザなし）を付ける。
+pub fn random_audio_chain(engine: &Engine, r: &mut ChaCha8Rng, shape: &Shape, len: usize) -> Graph {
+    let mut g = Graph::new_single();
+    let shapes = BTreeMap::from([(InputId(0), *shape)]);
+    for _ in 0..len {
+        for _ in 0..16 {
+            let now = engine
+                .compile(&g, &shapes)
+                .ok()
+                .and_then(|p| p.output_shapes().first().map(|o| o.1))
+                .unwrap_or(*shape);
+            let (op, params) = random_audio_op(r, &now);
+            let mut next = g.clone();
+            if next.push_linear(op, 1, params, r.next_u64()).is_err() {
+                continue;
+            }
+            if engine.compile(&next, &shapes).is_ok() {
+                g = next;
+                break;
+            }
+        }
+    }
+    if below(r, 3) == 0
+        && let Some(out) = g.outputs.first_mut()
+    {
+        out.quantize = Some(Quantize {
+            v: QUANTIZE_VERSION,
+            bits: [8u16, 16, 24][below(r, 3) as usize],
+            dither: if below(r, 2) == 0 {
+                Dither::Tpdf
+            } else {
+                Dither::None
+            },
+            seed: r.next_u64(),
+        });
+    }
+    g
+}
+
+/// 音声の編集の種類（テストで、どれも起きたかを数える）。
+pub const AUDIO_EDIT_KINDS: &[&str] = &[
+    "gain", "fade", "loop", "trim_end", "target", "params", "toggle", "replace", "remove", "add",
+];
+
+/// ランダムな音声の編集：ゲインの引数・フェードの長さ・ループ点・トリムの終わり・正規化の目標・ほかの引数の引き直し・
+/// 有効の切り替えと、構造の手（置き換え・消す・足す）。compile が通るものを返す（16 回試して通らなければ None）。
+pub fn random_audio_edit(
+    engine: &Engine,
+    r: &mut ChaCha8Rng,
+    g: &Graph,
+    input: &Shape,
+) -> Option<(Graph, &'static str)> {
+    let shapes = BTreeMap::from([(InputId(0), *input)]);
+    let plan = engine.compile(g, &shapes).ok()?;
+    let shape_at = |k: usize| match k.checked_sub(1).and_then(|p| g.nodes.get(p)) {
+        Some(n) => plan.node_shape(n.id),
+        None => Some(*input),
+    };
+    let len = g.nodes.len();
+    for _ in 0..16 {
+        let i = below(r, len.max(1) as u64) as usize;
+        let mut next = g.clone();
+        let pick = if len == 0 { 9 } else { below(r, 10) };
+        let kind = match pick {
+            7 => {
+                let node = next.nodes.get_mut(i)?;
+                let (op, params) = random_audio_op(r, &shape_at(i)?);
+                if op == node.op {
+                    continue;
+                }
+                (node.op, node.v, node.params) = (op.to_string(), 1, params);
+                relink(&mut next);
+                "replace"
+            }
+            8 => {
+                next.nodes.remove(i);
+                relink(&mut next);
+                "remove"
+            }
+            9 => {
+                let at = below(r, len as u64 + 1) as usize;
+                let (op, params) = random_audio_op(r, &shape_at(at)?);
+                let id = crate::doc::NodeId(next.next_id);
+                next.next_id = next.next_id.checked_add(1)?;
+                next.nodes.insert(
+                    at,
+                    crate::doc::Node {
+                        id,
+                        op: op.to_string(),
+                        v: 1,
+                        params,
+                        inputs: vec![crate::doc::PortRef::Input { id: InputId(0) }],
+                        seed: r.next_u64(),
+                        enabled: true,
+                    },
+                );
+                relink(&mut next);
+                "add"
+            }
+            _ => {
+                let (Some(node), Some(slot)) = (g.nodes.get(i), next.nodes.get_mut(i)) else {
+                    continue;
+                };
+                let n = match shape_at(i)? {
+                    Shape::Audio { frames, .. } => frames.max(),
+                    _ => continue,
+                };
+                match (pick, node.op.as_str()) {
+                    (0, "audio.gain") => {
+                        slot.params = json!({ "db": below(r, 200) as f64 / 10.0 - 10.0 });
+                        "gain"
+                    }
+                    (1, "audio.fade") => {
+                        let mut p = node.params.clone();
+                        let key = if below(r, 2) == 0 {
+                            "fadeIn"
+                        } else {
+                            "fadeOut"
+                        };
+                        p[key] = json!(below(r, n / 2 + 1));
+                        slot.params = p;
+                        "fade"
+                    }
+                    (2, "audio.set_loop") => {
+                        let a = below(r, n.max(2) - 1);
+                        slot.params = json!({ "loop": { "start": a, "end": a + 1 + below(r, n.max(2) - a - 1) } });
+                        "loop"
+                    }
+                    (3, "audio.trim") => {
+                        let start = node.params.get("start").and_then(|s| s.as_u64())?;
+                        if start >= n {
+                            continue;
+                        }
+                        let end = start + 1 + below(r, n - start);
+                        slot.params = json!({ "start": start, "end": end });
+                        "trim_end"
+                    }
+                    (4, "audio.normalize") => {
+                        let mut p = node.params.clone();
+                        p["target"] = json!(-(10.0 + below(r, 200) as f64 / 10.0));
+                        slot.params = p;
+                        "target"
+                    }
+                    (5, _) => {
+                        let (op, params) = random_audio_op(r, &shape_at(i)?);
+                        if op != node.op {
+                            continue;
+                        }
+                        slot.params = params;
+                        "params"
+                    }
+                    (6, _) => {
+                        slot.enabled = !node.enabled;
+                        "toggle"
+                    }
+                    _ => continue,
+                }
+            }
+        };
+        if engine.compile(&next, &shapes).is_ok() {
+            return Some((next, kind));
+        }
+    }
+    None
+}
+
+/// 長さ `frames` の音声の中のランダムな区間：1 フレーム・チャンクの境 ±1・終わり・2 つの区間・ときどき全体。
+pub fn random_audio_area(r: &mut ChaCha8Rng, frames: u64) -> Area {
+    let c = crate::value::AUDIO_CHUNK as u64;
+    let n = frames.max(1);
+    let one = |r: &mut ChaCha8Rng| -> Area {
+        match below(r, 5) {
+            0 => {
+                let s = below(r, n);
+                Area::span(s, s + 1)
+            }
+            1 => {
+                // チャンクの境の前後
+                let k = below(r, n.div_ceil(c) + 1) * c;
+                Area::span(k.saturating_sub(1 + below(r, 2)), k + 1 + below(r, 2))
+            }
+            2 => Area::span(n.saturating_sub(1 + below(r, 3_000)), n),
+            _ => {
+                let s = below(r, n);
+                Area::span(s, s + 1 + below(r, (n - s).min(20_000)))
+            }
+        }
+    };
+    match below(r, 10) {
+        0 => Area::All,
+        1 | 2 => one(r).union(&one(r)),
+        _ => one(r),
+    }
+}
+
+/// 音声の値の、範囲 `keep` に掛かるチャンクだけを有効にした値（ほかは無効。範囲の描画の入力を作る）。画像・`All` はそのまま。
+pub fn only_chunks(v: &Value, keep: &Area) -> Value {
+    match v {
+        Value::Audio(a) if !keep.is_all() => {
+            let set = crate::render::audio::chunks_covering(keep, a.frames());
+            Value::Audio(Arc::new(a.keep_only(&set)))
+        }
+        _ => v.clone(),
+    }
 }

@@ -20,13 +20,17 @@
 //!   等倍で全体を描いた値か、前の値を使わない範囲の描画を使う（docs/editing.md §12.3・§12.5）。
 //! - 警告は、描いたノードと当たったノードの分だけ（範囲によらず同じ）。要る範囲が空で描かなかったノードの警告は出ない
 //!   （全体の警告は `render`・`render_cached` が正）。
+//! - 音声（M13 段 1）：音声の範囲を持つノード（`Op::audio_reach` が `Global` でない）は、要る区間をチャンクに揃えて上流へ伝え、
+//!   要るチャンクだけを核で描く（render/audio.rs）。継ぎはぎは出力のノードで前の表示のチャンクを共有し、頼んだ区間の外は
+//!   持ち越さない。量子化は描いたチャンクだけに当てる（前の表示の量子化済みのチャンクに 2 度当てない）。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use super::audio::{chunk_spans, chunks_covering, patch_target_audio, round_to_chunks};
 use super::cache::{
-    Fingerprint, FingerprintedInput, NodeCache, Origin, RenderOptions, node_input_fingerprints,
-    quantized_output,
+    Fingerprint, FingerprintedInput, Fingerprints, NodeCache, Origin, RenderOptions,
+    node_input_fingerprints, quantized_output,
 };
 use super::region::{
     Area, Base, FrameTiles, PartialValue, Rects, Spans, Tiles, frames_of, invalidate, tiles_in,
@@ -35,6 +39,7 @@ use super::{
     Engine, Plan, PlannedNode, apply_node, bad_input, check_node_shape, lookup, node_inputs,
     node_seed, op_shapes, pass_through, push_warnings,
 };
+use crate::analysis::AnyOutput;
 use crate::digest::Digest;
 use crate::doc::{InputId, NodeId, OutputId, PortRef};
 use crate::error::{EngineError, Issue};
@@ -43,8 +48,8 @@ use crate::geom::{IPoint, IRect};
 use crate::monitor::Monitor;
 use crate::op::ApplyCx;
 use crate::paint::Sample;
-use crate::shape::{Fullness, Shape};
-use crate::value::{Image, TILE, Value};
+use crate::shape::{Dim, Fullness, Shape};
+use crate::value::{AUDIO_CHUNK, ChunkSet, Image, TILE, Value};
 
 /// 範囲の描画で描く出力と範囲（キャンバスの座標）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +78,78 @@ pub struct AreaStats {
     /// 継ぎはぎの描画が前の値（[`Base`]）の大きさ・形式・パレットの違いで断り、前の値なしで描き直した回数（変わりうる範囲が
     /// 小さすぎた印。遅いだけで値は正しい）。
     pub rebased: u64,
+    /// 音声の範囲を持つノードが核で描いたチャンクの数（番号の数の和。チャンネルで数えない。M13 段 1）。
+    pub drawn_chunks: u64,
+    /// 前の値から共有した出力のチャンクの数（音声の継ぎはぎ）。
+    pub reused_chunks: u64,
+    /// 核のずらした写し（`passthrough`）で、入力の実体を共有したチャンクの数（`drawn_chunks` に含む）。
+    pub shared_chunks: u64,
+    /// 申告した解析を、入力を窓ごとに流して解いた数（流し解き）。
+    pub presolved: u64,
+}
+
+/// この描画の中で流して解いた解析の結果（鍵は `analysis_fingerprint`。キャッシュの上限が 0 でも、この描画の中は足りる）。
+pub(super) type Presolved = BTreeMap<Fingerprint, AnyOutput>;
+
+/// 1 回の描画の中で変わらないもの（指紋・入力の値・元・形・ノードの番号）。
+pub(super) struct PassCx<'a> {
+    pub plan: &'a Plan,
+    pub fps: Fingerprints,
+    pub input_fps: BTreeMap<InputId, Fingerprint>,
+    pub input_values: BTreeMap<InputId, Value>,
+    pub source: Digest,
+    pub shapes: Shapes,
+    pub index: BTreeMap<NodeId, usize>,
+}
+
+impl<'a> PassCx<'a> {
+    pub(super) fn new(
+        engine: &Engine,
+        plan: &'a Plan,
+        inputs: &BTreeMap<InputId, FingerprintedInput>,
+    ) -> Result<Self, EngineError> {
+        Ok(Self {
+            plan,
+            fps: engine.fingerprints(plan, inputs)?,
+            input_fps: inputs.iter().map(|(k, v)| (*k, v.fingerprint)).collect(),
+            input_values: inputs.iter().map(|(k, v)| (*k, v.value.clone())).collect(),
+            source: plan
+                .primary
+                .and_then(|id| inputs.get(&id))
+                .map(|v| v.source)
+                .unwrap_or_default(),
+            shapes: Shapes::of(plan),
+            index: plan
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.id, i))
+                .collect(),
+        })
+    }
+
+    /// 外したノードを通り抜けた先のノード（なければそのまま）。
+    fn through_disabled(&self, mut at: NodeId) -> NodeId {
+        while let Some(n) = self.index.get(&at).map(|i| &self.plan.nodes[*i]) {
+            match (n.enabled, n.inputs.first()) {
+                (false, Some(PortRef::Node { id })) => at = *id,
+                _ => break,
+            }
+        }
+        at
+    }
+}
+
+/// 1 つのポート（ノードの出力）を範囲で描いた結果。
+pub(super) struct PortPass {
+    pub value: Value,
+    pub warnings: Vec<Issue>,
+    /// 等倍で全体を描いた値（入力がどれも Exact で、範囲の描画・継ぎはぎをしていない）。
+    pub exact: bool,
+    /// 前の値のタイル・チャンクを実際に使った。
+    pub patched: bool,
+    /// 音声の継ぎはぎで、出力のノードが前の値から共有したチャンク（量子化を当て直さない）。
+    pub kept: Option<ChunkSet>,
 }
 
 /// 範囲の描画の結果。
@@ -97,7 +174,7 @@ pub struct SpoitAt {
 
 /// 描き方の内側の誤り：無効なタイルを読んだ（全体で描き直す）か、継ぎはぎの前の値が今の値と合わなかった（前の値なしで
 /// 描き直す）か、ふつうの誤り。
-enum PassError {
+pub(super) enum PassError {
     Hole,
     Rebase,
     Engine(EngineError),
@@ -109,10 +186,18 @@ impl From<EngineError> for PassError {
     }
 }
 
-/// 出力のノードの継ぎはぎ：前の値から変わりうる範囲を無効にしたもの。
+/// 範囲を持つノードで描くもの：画像はフレームごとのタイル、音声は出力のチャンクに揃えた区間。
+enum Region {
+    Tiles(FrameTiles),
+    Chunks(Area),
+}
+
+/// 出力のノードの継ぎはぎ：前の値から変わりうる範囲を無効にしたもの（音声は共有するチャンクだけを残したもの）。
 struct Patch {
     node: NodeId,
     base: Value,
+    /// 音声：前の値から共有するチャンク。
+    kept: Option<ChunkSet>,
 }
 
 impl Engine {
@@ -197,9 +282,13 @@ impl Engine {
         r.value.sample(at.frame, at.x, at.y)
     }
 
-    /// 範囲を持つノードか（`Op::REGION` で、申告した解析がなく、`reach` が `Global` でない）。
-    fn regional(&self, node: &PlannedNode, in_shapes: &[Shape]) -> Result<bool, EngineError> {
-        if !node.enabled || !node.op.region() || !node.needs.is_empty() {
+    /// 画像の範囲を持つノードか（`Op::REGION` で、申告した解析がなく、`reach` が `Global` でない）。
+    fn image_regional(&self, node: &PlannedNode, in_shapes: &[Shape]) -> Result<bool, EngineError> {
+        if !node.enabled
+            || !node.op.region()
+            || !node.needs.is_empty()
+            || matches!(node.inferred.shape, Shape::Audio { .. })
+        {
             return Ok(false);
         }
         let reach = node
@@ -220,91 +309,162 @@ impl Engine {
         full: bool,
     ) -> Result<AreaRender, PassError> {
         let mut stats = AreaStats::default();
-        let fps = self.fingerprints(plan, inputs)?;
-        let input_fps: BTreeMap<InputId, Fingerprint> =
-            inputs.iter().map(|(k, v)| (*k, v.fingerprint)).collect();
-        let source = plan
-            .primary
-            .and_then(|id| inputs.get(&id))
-            .map(|v| v.source)
-            .unwrap_or_default();
+        let cx = PassCx::new(self, plan, inputs)?;
         let Some((_, from, out_shape, quantize)) = plan.outputs.iter().find(|o| o.0 == req.output)
         else {
             return Err(bad_input(format!("出力 {} はありません", req.output.0)).into());
         };
-        let input_values: BTreeMap<InputId, Value> =
-            inputs.iter().map(|(k, v)| (*k, v.value.clone())).collect();
         // 量子化した出力は、render・render_cached と同じく量子化の指紋で引き、なければ量子化して入れる（等倍で全体を描いた
-        // 音声だけ。そうでなければ量子化だけを当てる）
-        let out_fp = fps
+        // 音声だけ。そうでなければ有効なチャンクのうち前の値から共有していないものだけに量子化を当てる）
+        let out_fp = cx
+            .fps
             .outputs
             .iter()
             .find(|o| o.0 == req.output)
             .map(|o| o.1)
             .ok_or_else(|| EngineError::Internal("出力の指紋がありません".into()))?;
-        let quantized = |v: Value, exact: bool, cache: &mut NodeCache| match (quantize, &v) {
-            (Some(q), Value::Audio(a)) if exact => {
-                quantized_output(cache, a, q, out_fp, &source, false, mon)
-            }
-            (Some(q), Value::Audio(a)) => crate::audio::quantize(a, q, &source, mon),
-            _ => Ok(v),
-        };
+        let source = cx.source;
+        let quantized =
+            |v: Value, exact: bool, kept: Option<&ChunkSet>, cache: &mut NodeCache| match (
+                quantize, &v,
+            ) {
+                (Some(q), Value::Audio(a)) if exact => {
+                    quantized_output(cache, a, q, out_fp, &source, false, mon)
+                }
+                (Some(q), Value::Audio(a)) => {
+                    let fresh = kept.map(|kept| {
+                        let mut f = a.valid_chunks();
+                        f.subtract(kept);
+                        f
+                    });
+                    crate::audio::quantize(a, q, &source, fresh.as_ref(), mon)
+                }
+                _ => Ok(v),
+            };
         // 入力をそのまま出す出力は、入力の値（全体）
         let PortRef::Node { id: out_node } = from else {
-            let v = lookup(&BTreeMap::new(), &input_values, from)
+            let v = lookup(&BTreeMap::new(), &cx.input_values, from)
                 .ok_or_else(|| EngineError::Internal("出力の値がありません".into()))?;
             return Ok(AreaRender {
                 output: req.output,
-                value: PartialValue::new(quantized(v, true, cache)?, Origin::Exact),
+                value: PartialValue::new(quantized(v, true, None, cache)?, Origin::Exact),
                 warnings: Vec::new(),
                 stats,
             });
         };
-        // 音声・量子化は範囲の描画を持たないので全体で描く
-        let full = full || quantize.is_some() || matches!(out_shape, Shape::Audio { .. });
-        let shapes = Shapes::of(plan);
-        let index: BTreeMap<NodeId, usize> = plan
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.id, i))
-            .collect();
-        // 継ぎはぎする出力のノード（外したノードを通り抜けた先の、範囲を持つノード）と、描く範囲（呼び手の範囲は出力の
-        // キャンバスに切ってから使う。遠い座標の足し算のあふれと、畳みで覆いが欠けるのを防ぐ）
-        let mut target = if full {
+        // 描く範囲（呼び手の範囲は出力のキャンバスに切ってから使う。遠い座標の足し算のあふれと、畳みで覆いが欠けるのを防ぐ）
+        let target = if full {
             Area::All
         } else {
             clip_to_canvas(&req.area, out_shape)
         };
+        let mut presolved = Presolved::new();
+        let pass = self.port_pass(
+            &cx,
+            cache,
+            *out_node,
+            out_shape,
+            target,
+            base,
+            full,
+            &mut stats,
+            &mut presolved,
+            mon,
+        )?;
+        let out_exact = pass.exact && pass.value.is_complete();
+        let kept = pass.kept.as_ref().filter(|_| pass.patched);
+        let value = quantized(pass.value, out_exact, kept, cache)?;
+        let origin = if plan.level != 0 {
+            // 縮小の段の値は近似（保存・解析・照合に使わない）
+            Origin::Scaled
+        } else if out_exact {
+            Origin::Exact
+        } else if pass.patched {
+            Origin::Patched
+        } else {
+            Origin::Partial
+        };
+        if !pass.patched {
+            stats.reused_tiles = 0;
+            stats.reused_chunks = 0;
+        }
+        Ok(AreaRender {
+            output: req.output,
+            value: PartialValue::new(value, origin),
+            warnings: pass.warnings,
+            stats,
+        })
+    }
+
+    /// ノード `out_node` の出力を、範囲 `target`（キャンバスに切ったもの）だけ描く（範囲の描画の本体。`render_area` と、音声の
+    /// 流れの窓が使う）。`base` があれば、出力のノード（外したノードを通り抜けた先の範囲を持つノード）で前の値を継ぎはぎする。
+    /// `full` なら全体で描く（範囲の描画が依存の外を読んだあとの描き直し）。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn port_pass(
+        &self,
+        cx: &PassCx<'_>,
+        cache: &mut NodeCache,
+        out_node: NodeId,
+        out_shape: &Shape,
+        target: Area,
+        base: Option<&Base<'_>>,
+        full: bool,
+        stats: &mut AreaStats,
+        presolved: &mut Presolved,
+        mon: &dyn Monitor,
+    ) -> Result<PortPass, PassError> {
+        let plan = cx.plan;
+        let mut target = target;
+        // 継ぎはぎする出力のノード（外したノードを通り抜けた先の、範囲を持つノード）と、描く範囲
         let mut patch: Option<Patch> = None;
         if let (Some(b), false) = (base, full) {
-            let mut at = *out_node;
-            while let Some(n) = index.get(&at).map(|i| &plan.nodes[*i]) {
-                match (n.enabled, n.inputs.first()) {
-                    (false, Some(PortRef::Node { id })) => at = *id,
-                    _ => break,
-                }
-            }
-            if let Some(n) = index.get(&at).map(|i| &plan.nodes[*i])
-                && self.regional(n, &shapes.inputs_of(n)?)?
+            let at = cx.through_disabled(out_node);
+            if let Some(n) = cx.index.get(&at).map(|i| &plan.nodes[*i])
                 && b.value.shape() == n.inferred.shape
                 && n.inferred.shape == *out_shape
             {
-                let (draw, reused) = patch_target(b.value.value(), &target, b.changed)?;
-                // 共有できるタイルがなければ継ぎはぎしない（前の値の形式・パレットが今と違いうる）
-                if reused > 0 {
-                    stats.reused_tiles = reused;
-                    target = draw;
-                    patch = Some(Patch {
-                        node: at,
-                        base: invalidate(b.value.value(), b.changed)?,
-                    });
+                let in_shapes = cx.shapes.inputs_of(n)?;
+                match b.value.value() {
+                    Value::Audio(prev) => {
+                        if self.audio_regional(n, &in_shapes)? && self.needs_ready(cx, cache, n)? {
+                            let frames = prev.frames();
+                            let need =
+                                chunks_covering(&round_to_chunks(&target, out_shape), frames);
+                            let changed = chunks_covering(b.changed, frames);
+                            let (draw, keep) = patch_target_audio(prev, &need, &changed);
+                            // 共有できるチャンクがなければ継ぎはぎしない
+                            if !keep.is_empty() {
+                                stats.reused_chunks = keep.count() as u64;
+                                target = Area::samples(chunk_spans(&draw, frames));
+                                patch = Some(Patch {
+                                    node: at,
+                                    base: Value::Audio(Arc::new(prev.keep_only(&keep))),
+                                    kept: Some(keep),
+                                });
+                            }
+                        }
+                    }
+                    image => {
+                        if self.image_regional(n, &in_shapes)? {
+                            let (draw, reused) = patch_target(image, &target, b.changed)?;
+                            // 共有できるタイルがなければ継ぎはぎしない（前の値の形式・パレットが今と違いうる）
+                            if reused > 0 {
+                                stats.reused_tiles = reused;
+                                target = draw;
+                                patch = Some(Patch {
+                                    node: at,
+                                    base: invalidate(image, b.changed)?,
+                                    kept: None,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
         // 1. 後ろから要る範囲を集める。要る範囲が空でも、使い手があるノードは描く（範囲の描画を持つノードは無効なタイル
         //    だけの値を作る。使い手は形・メタデータだけを見る）
-        let mut need: BTreeMap<NodeId, Area> = BTreeMap::from([(*out_node, target)]);
+        let mut need: BTreeMap<NodeId, Area> = BTreeMap::from([(out_node, target)]);
         let mut hits: BTreeMap<NodeId, (Value, Vec<Issue>, Vec<Issue>)> = BTreeMap::new();
         let mut regional: BTreeMap<NodeId, Area> = BTreeMap::new();
         for node in plan.nodes.iter().rev() {
@@ -312,13 +472,13 @@ impl Engine {
                 continue;
             };
             if node.enabled
-                && let Some(fp) = fps.nodes.get(&node.id)
+                && let Some(fp) = cx.fps.nodes.get(&node.id)
                 && let Some(hit) = cache.hit(fp)
             {
                 hits.insert(node.id, hit);
                 continue;
             }
-            let in_shapes = shapes.inputs_of(node)?;
+            let in_shapes = cx.shapes.inputs_of(node)?;
             let mut add = |r: &PortRef, a: &Area| {
                 if let PortRef::Node { id } = r {
                     need.entry(*id).or_default().union_with(a);
@@ -330,22 +490,36 @@ impl Engine {
                 }
                 continue;
             }
-            if !full && self.regional(node, &in_shapes)? {
-                let rounded = round_to_tiles(&n_need, &node.inferred.shape);
+            let found = if full {
+                None
+            } else if self.image_regional(node, &in_shapes)? {
                 let reach = node
                     .op
                     .reach(node.params.as_ref(), &op_shapes(node, &in_shapes))?;
-                let in_need = reach.backward_in(&rounded, &node.inferred.shape);
-                if let Some(r) = node.inputs.first() {
-                    add(r, &in_need);
-                }
-                for r in node.inputs.iter().skip(1) {
-                    add(r, &Area::All);
-                }
-                regional.insert(node.id, rounded);
+                Some((round_to_tiles(&n_need, &node.inferred.shape), reach))
+            } else if self.audio_regional(node, &in_shapes)? && self.needs_ready(cx, cache, node)? {
+                let reach = node
+                    .op
+                    .audio_reach(node.params.as_ref(), &op_shapes(node, &in_shapes))?;
+                Some((round_to_chunks(&n_need, &node.inferred.shape), reach))
             } else {
-                for r in &node.inputs {
-                    add(r, &Area::All);
+                None
+            };
+            match found {
+                Some((rounded, reach)) => {
+                    let in_need = reach.backward_in(&rounded, &node.inferred.shape);
+                    if let Some(r) = node.inputs.first() {
+                        add(r, &in_need);
+                    }
+                    for r in node.inputs.iter().skip(1) {
+                        add(r, &Area::All);
+                    }
+                    regional.insert(node.id, rounded);
+                }
+                None => {
+                    for r in &node.inputs {
+                        add(r, &Area::All);
+                    }
                 }
             }
         }
@@ -366,16 +540,16 @@ impl Engine {
             let (out, is_exact) = if let Some((v, aw, mw)) = hits.remove(&node.id) {
                 stats.hits += 1;
                 // 当たったノードの描画を前回として覚える（render_cached と同じ。次の差分の適用の前の出力になる）
-                if let Some(fp) = fps.nodes.get(&node.id) {
-                    let in_fps = node_input_fingerprints(node, &fps.nodes, &input_fps)?;
-                    cache.record_last(plan, node, in_fps, &source, *fp, &aw, &mw);
+                if let Some(fp) = cx.fps.nodes.get(&node.id) {
+                    let in_fps = node_input_fingerprints(node, &cx.fps.nodes, &cx.input_fps)?;
+                    cache.record_last(plan, node, in_fps, &cx.source, *fp, &aw, &mw);
                 }
                 let mut all = aw;
                 all.extend(mw);
                 push_warnings(&mut warnings, node.id, all);
                 (v, true)
             } else {
-                let ins = node_inputs(node, &values, &input_values)?;
+                let ins = node_inputs(node, &values, &cx.input_values)?;
                 let ins_exact = node.inputs.iter().all(|r| match r {
                     PortRef::Input { .. } => true,
                     PortRef::Node { id } => exact.get(id).copied().unwrap_or(false),
@@ -384,7 +558,24 @@ impl Engine {
                     .as_ref()
                     .filter(|p| p.node == node.id)
                     .map(|p| &p.base);
-                let tiles: Option<FrameTiles> = match regional.get(&node.id) {
+                let audio_node = matches!(node.inferred.shape, Shape::Audio { .. });
+                let region: Option<Region> = match regional.get(&node.id) {
+                    Some(rounded) if node.enabled && audio_node => {
+                        // すべてのチャンクが要り、入力がどれも全体の値なら、全体の描画と同じなので全体で描く（等倍の値として
+                        // キャッシュに入れられる）
+                        let all_chunks = match node.inferred.shape {
+                            Shape::Audio {
+                                frames: Dim::Exact(n),
+                                ..
+                            } => usize::try_from(n).is_ok_and(|n| {
+                                chunks_covering(rounded, n).count() == n.div_ceil(AUDIO_CHUNK)
+                            }),
+                            _ => false,
+                        };
+                        let whole =
+                            base_v.is_none() && all_chunks && ins.iter().all(Value::is_complete);
+                        (!whole).then(|| Region::Chunks(rounded.clone()))
+                    }
                     Some(rounded) if node.enabled => {
                         let geometry = out_geometry(node, &ins)?;
                         let tiles: FrameTiles = geometry
@@ -402,16 +593,16 @@ impl Engine {
                         let whole = base_v.is_none()
                             && tiles.values().all(Tiles::is_full)
                             && ins.iter().all(Value::is_complete);
-                        (!whole).then_some(tiles)
+                        (!whole).then_some(Region::Tiles(tiles))
                     }
                     _ => None,
                 };
                 if !node.enabled {
                     (pass_through(&ins)?, ins_exact)
-                } else if let Some(tiles) = tiles {
+                } else if let Some(Region::Tiles(tiles)) = region {
                     stats.drawn_tiles += tiles.values().map(|t| t.count() as u64).sum::<u64>();
                     patched |= base_v.is_some();
-                    let run = self.run_region(plan, node, &ins, &tiles, base_v, &source, mon);
+                    let run = self.run_region(plan, node, &ins, &tiles, base_v, &cx.source, mon);
                     // 申告した依存の外（無効なタイル）を読んだら、範囲の描画を捨てる
                     if ins.iter().any(Value::holes_read) {
                         return Err(PassError::Hole);
@@ -430,22 +621,45 @@ impl Engine {
                     all.extend(mw);
                     push_warnings(&mut warnings, node.id, all);
                     (v, false)
+                } else if let Some(Region::Chunks(rounded)) = region {
+                    patched |= base_v.is_some();
+                    let run = self
+                        .run_audio_region(cx, cache, node, &ins, &rounded, base_v, presolved, mon);
+                    // 申告した依存の外（無効なチャンク）を読んだら、範囲の描画を捨てる
+                    if ins.iter().any(Value::holes_read) {
+                        return Err(PassError::Hole);
+                    }
+                    let r = match run {
+                        Ok(r) => r,
+                        Err(EngineError::Internal(_)) if base_v.is_some() => {
+                            return Err(PassError::Rebase);
+                        }
+                        Err(e) => return Err(e.at(node.id).into()),
+                    };
+                    stats.region_nodes += 1;
+                    stats.drawn_chunks += r.drawn;
+                    stats.shared_chunks += r.shared;
+                    let mut all = r.apply_warnings;
+                    all.extend(r.map_warnings);
+                    push_warnings(&mut warnings, node.id, all);
+                    (r.value, false)
                 } else {
                     // 全体で描くノードの入力は、どれも全体の値であること（範囲の値なら全体で描き直す）
                     if !ins.iter().all(Value::is_complete) {
                         return Err(PassError::Hole);
                     }
-                    let run = match fps.nodes.get(&node.id).copied().filter(|_| ins_exact) {
+                    let run = match cx.fps.nodes.get(&node.id).copied().filter(|_| ins_exact) {
                         // 入力がどれも等倍で全体を描いた値なら、render_cached の外れの道と同じ（継ぎ目の縮小の差分・差分の
                         // 適用・解析のキャッシュ・由来 Exact で入れる）。描画を前回として覚える
                         Some(fp) => {
-                            let in_fps = node_input_fingerprints(node, &fps.nodes, &input_fps)?;
+                            let in_fps =
+                                node_input_fingerprints(node, &cx.fps.nodes, &cx.input_fps)?;
                             let run = self.draw_miss(
                                 plan,
                                 node,
                                 &ins,
                                 &in_fps,
-                                &source,
+                                &cx.source,
                                 fp,
                                 cache,
                                 &RenderOptions::default(),
@@ -455,7 +669,7 @@ impl Engine {
                                 plan,
                                 node,
                                 in_fps,
-                                &source,
+                                &cx.source,
                                 fp,
                                 &run.apply_warnings,
                                 &run.map_warnings,
@@ -466,7 +680,7 @@ impl Engine {
                             plan,
                             node,
                             &ins,
-                            &source,
+                            &cx.source,
                             mon,
                             &mut |need, v, a, acx| a.run_any(&need.params, v, acx),
                         )?,
@@ -482,34 +696,20 @@ impl Engine {
             values.insert(node.id, out);
             exact.insert(node.id, is_exact);
             for id in plan.released_after(i) {
-                if *id != *out_node {
+                if *id != out_node {
                     values.remove(id);
                 }
             }
         }
         let value = values
-            .remove(out_node)
+            .remove(&out_node)
             .ok_or_else(|| EngineError::Internal("出力の値がありません".into()))?;
-        let out_exact = exact.get(out_node).copied().unwrap_or(false) && value.is_complete();
-        let value = quantized(value, out_exact, cache)?;
-        let origin = if plan.level != 0 {
-            // 縮小の段の値は近似（保存・解析・照合に使わない）
-            Origin::Scaled
-        } else if out_exact {
-            Origin::Exact
-        } else if patched {
-            Origin::Patched
-        } else {
-            Origin::Partial
-        };
-        if !patched {
-            stats.reused_tiles = 0;
-        }
-        Ok(AreaRender {
-            output: req.output,
-            value: PartialValue::new(value, origin),
+        Ok(PortPass {
+            value,
             warnings,
-            stats,
+            exact: exact.get(&out_node).copied().unwrap_or(false),
+            patched,
+            kept: patch.and_then(|p| p.kept),
         })
     }
 
@@ -579,7 +779,7 @@ impl Engine {
 }
 
 /// 計画の値の形（入力とノード）。
-struct Shapes {
+pub(super) struct Shapes {
     inputs: BTreeMap<InputId, Shape>,
     nodes: BTreeMap<NodeId, Shape>,
 }
@@ -597,7 +797,7 @@ impl Shapes {
     }
 
     /// ノードの入力の形（計画の順）。
-    fn inputs_of(&self, node: &PlannedNode) -> Result<Vec<Shape>, EngineError> {
+    pub(super) fn inputs_of(&self, node: &PlannedNode) -> Result<Vec<Shape>, EngineError> {
         node.inputs
             .iter()
             .map(|r| lookup(&self.nodes, &self.inputs, r))

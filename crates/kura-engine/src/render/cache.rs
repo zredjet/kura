@@ -366,6 +366,14 @@ impl NodeCache {
             .is_some_and(|e| e.origin == Origin::Exact && matches!(e.stored, Stored::Value(_)))
     }
 
+    /// 申告した解析の結果（鍵は `analysis_fingerprint`）を持っていれば true（使った順は変えない。範囲の描画の見積もりと、
+    /// 流し解きが要るかの判断に使う。M13 段 1）。
+    pub fn contains_analysis(&self, fp: &Fingerprint) -> bool {
+        self.entries
+            .get(fp)
+            .is_some_and(|e| matches!(e.stored, Stored::Analysis(_)))
+    }
+
     /// 固定している指紋。
     pub fn pins(&self) -> &BTreeSet<Fingerprint> {
         &self.pins
@@ -493,7 +501,7 @@ impl NodeCache {
     }
 
     /// 解析の結果を引く。
-    fn get_analysis(&mut self, fp: &Fingerprint) -> Option<AnyOutput> {
+    pub(super) fn get_analysis(&mut self, fp: &Fingerprint) -> Option<AnyOutput> {
         let out = match self.entries.get(fp) {
             Some(Entry {
                 stored: Stored::Analysis(a),
@@ -1034,7 +1042,7 @@ pub(super) fn quantized_output(
 ) -> Result<Value, EngineError> {
     if let Some(hit) = cache.get_value(&out_fp) {
         if verify {
-            let fresh = crate::audio::quantize(a, q, source, mon)?;
+            let fresh = crate::audio::quantize(a, q, source, None, mon)?;
             if fresh.digest()? != hit.value.digest()? {
                 return Err(EngineError::Internal(format!(
                     "キャッシュの量子化した出力が描き直したものと違います（指紋 {out_fp}）"
@@ -1044,7 +1052,7 @@ pub(super) fn quantized_output(
         }
         return Ok(hit.value);
     }
-    let v = crate::audio::quantize(a, q, source, mon)?;
+    let v = crate::audio::quantize(a, q, source, None, mon)?;
     cache.insert(
         out_fp,
         Stored::Value(v.clone()),
@@ -1057,7 +1065,7 @@ pub(super) fn quantized_output(
 }
 
 /// 申告した解析をキャッシュから引き、なければ既定の解き方で解いて入れる。`verify` なら当たっても解き直して照らす。
-fn solve_cached(
+pub(super) fn solve_cached(
     cache: &mut NodeCache,
     in_fps: &[Fingerprint],
     need: &Need,

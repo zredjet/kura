@@ -432,6 +432,101 @@ fn e18_lazy_inputs_render_the_same() {
     assert!(checked >= 7, "{checked}");
 }
 
+/// E18（M13 段 1）：入力 0 を、出力のチャンク 1 つ（とチャンクの境をまたぐ 2 つ）の `audio_reach` の逆写しの外を無効に
+/// した部分の値にしても、核がそのチャンクを描いた値は `apply` と同じで、無効なチャンクを読まない。申告した解析（normalize の
+/// 計測）は全体の入力で解いたものを先に入れる（実行器と同じ）。全例（旧版・退役を含む）で。
+#[test]
+fn e18_partial_inputs_render_the_same() {
+    use kura_engine::render::audio::{chunk_spans, chunks_covering};
+    use kura_engine::render::region::Area;
+    let engine = Engine::new().unwrap();
+    let mut checked = 0;
+    for op in engine.registry().all() {
+        for ex in op.examples().unwrap() {
+            let inputs: Vec<Value> = ex.inputs.iter().map(|g| g.generate().unwrap()).collect();
+            let Some(Value::Audio(first)) = inputs.first() else {
+                continue;
+            };
+            let params = op.parse(&ex.params).unwrap();
+            let limits = Limits::default();
+            let refs: Vec<&Value> = inputs.iter().collect();
+            let mut cx =
+                kura_engine::op::ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
+            let Ok(applied) = op.apply(params.as_ref(), &refs, &mut cx) else {
+                continue;
+            };
+            let Value::Audio(whole) = &applied.value else {
+                continue;
+            };
+            let shape = inputs[0].shape();
+            let reach = op.audio_reach(params.as_ref(), &[shape]).unwrap();
+            let out_shape = applied.value.shape();
+            let frames = whole.frames();
+            let count = frames.div_ceil(C);
+            let mut picks: Vec<Vec<usize>> = (0..count).map(|k| vec![k]).collect();
+            if count > 1 {
+                picks.push(vec![0, 1]);
+            }
+            for pick in picks {
+                let mut set = kura_engine::value::ChunkSet::empty(count);
+                for k in &pick {
+                    set.insert(*k);
+                }
+                let out_area = Area::samples(chunk_spans(&set, frames));
+                let in_need = reach.backward_in(&out_area, &out_shape);
+                let keep = chunks_covering(&in_need, first.frames());
+                let part = Value::Audio(Arc::new(first.keep_only(&keep)));
+                let mut kcx =
+                    kura_engine::op::ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
+                for need in op.needs(params.as_ref(), &[shape]).unwrap() {
+                    let a = engine.analyses().get(need.id, need.v).unwrap();
+                    let acx = kura_engine::analysis::AnalyzeCx {
+                        mon: &NoMonitor,
+                        limits: &limits,
+                    };
+                    let out = a.run_any(&need.params, &inputs[0], &acx).unwrap();
+                    kcx.preload(&need, &part, out).unwrap();
+                }
+                let mut part_inputs = inputs.clone();
+                part_inputs[0] = part.clone();
+                let part_refs: Vec<&Value> = part_inputs.iter().collect();
+                let kernel = op
+                    .audio_kernel(params.as_ref(), &part_refs, &mut kcx)
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("{} {}: {e}", op.id(), ex.name));
+                assert_eq!(kcx.warnings, cx.warnings, "{} {}", op.id(), ex.name);
+                for k in &pick {
+                    let range = whole.chunk_range(*k);
+                    for ch in 0..kernel.channels() {
+                        let mut got = vec![0f32; range.len()];
+                        kernel
+                            .render(ch, range.start as u64, &mut got)
+                            .unwrap_or_else(|e| panic!("{} {} {k}: {e}", op.id(), ex.name));
+                        let want = whole.chunk_data(ch, *k).unwrap();
+                        assert!(
+                            got.iter()
+                                .zip(want.iter())
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{} {}：チャンク {k}・チャンネル {ch}",
+                            op.id(),
+                            ex.name
+                        );
+                    }
+                }
+                let Value::Audio(p) = &part else { panic!() };
+                assert!(
+                    !p.holes_read(),
+                    "{} {}：無効なチャンクを読んだ",
+                    op.id(),
+                    ex.name
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 30, "{checked}");
+}
+
 /// E18（M13 段 1）：`passthrough` が Some(off) の核の出力は、入力 0 の同じチャンネルを off ずらして写したもの（ビット一致）。
 /// 実行器はこれを使ってチャンクを入力の実体で共有する。ずらす核（trim）とずらさない核（恒等）が網に入っていること。
 #[test]
