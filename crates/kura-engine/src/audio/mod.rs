@@ -6,6 +6,7 @@
 //! 状態を運ぶフィルタ（IIR など）は核にせず、解析（`crate::analysis`）の側で全体を順に流す。
 
 pub mod resample;
+pub mod source;
 
 use std::sync::Arc;
 

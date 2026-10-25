@@ -473,6 +473,39 @@ pub fn verify(
     Ok(r.header)
 }
 
+/// 音声のアンカーを源として開く（M13 段 1。`CodecSet::open_audio_source`）：ヘッダを読んで確かめ（ダイジェスト・正規の形）、
+/// 中の f32 WAV を遅延の値にして、メタデータをヘッダの値に置き換える。記録した元の読み取り（`recorded`）を返す。
+/// 開くときに全体を読まないので、値のダイジェストとヘッダの記録はここでは照らさない（保存の流れで照らす。docs/editing.md
+/// §9.11）。画像のアンカーは None。
+pub fn open_source(
+    opener: &crate::audio::source::Opener,
+    limits: &Limits,
+    lru_bytes: u64,
+) -> Result<Option<crate::codec::OpenedSource>, EngineError> {
+    let p = {
+        let mut src = opener()?;
+        parse(src.as_mut(), limits)?
+    };
+    let AnchorContent::Audio { meta } = &p.header.content else {
+        return Ok(None);
+    };
+    if p.container != Container::Wav || p.body.id() != wav_body() {
+        return Err(broken("音声のアンカーの中が f32 の WAV ではありません"));
+    }
+    let rest = p.rest(limits);
+    let inner = wav::open_source(opener, &rest, lru_bytes)
+        .map_err(body_err)?
+        .ok_or_else(|| broken("中の WAV を読めません"))?;
+    let Value::Audio(a) = inner.value else {
+        return Err(broken("中身の種類がヘッダと合いません"));
+    };
+    Ok(Some(crate::codec::OpenedSource {
+        value: Value::Audio(Arc::new(a.with_meta(meta.clone()))),
+        decoder: DEC_ID,
+        recorded: Some(p.header.decoded.clone()),
+    }))
+}
+
 /// アンカーの形（ヘッダと中のデコーダの形。描く前の上限の判断に使う）。
 pub fn shape(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Shape, EngineError> {
     let p = parse(src, limits)?;

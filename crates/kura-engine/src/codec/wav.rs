@@ -11,21 +11,22 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::codec::pcm::{self, quantize};
-use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, try_vec};
+use crate::audio::source::{Opener, PcmFileSource};
+use crate::codec::pcm::{self, PcmLayout, SampleEncoding, quantize};
+use crate::codec::{Decoder, Encoder, MetaCaps, OpenedSource, ReadSeek, Tier, caps_of, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::op::{ParamKind, ParamSchema, Unit, spec};
 use crate::shape::{Dim, Shape};
-use crate::value::{AudioBuilder, AudioMeta, AudioSource, LoopRange, Marker, Value};
+use crate::value::{Audio, AudioBuilder, AudioMeta, AudioSource, LoopRange, Marker, Value};
 
 /// WAV の読み書き。
 pub struct WavCodec;
 
 /// 読み取りの約束の版（読む値が変わる変更は上げ、旧版を残す。§9.1）。
-const DEC_ID: &str = "wav-kura-dec/1";
+pub const DEC_ID: &str = "wav-kura-dec/1";
 /// 書き出しの約束の版（書くバイト列が変わる変更は上げる。§9.1）。
 const ENC_ID: &str = "wav-kura-enc/1";
 /// メタデータのチャンクとして読む大きさの上限。
@@ -361,10 +362,10 @@ impl Decoder for WavCodec {
         let frames =
             usize::try_from(frames).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
         let ch = usize::from(h.channels);
+        let layout = h.layout();
         let mut out = AudioBuilder::new(h.rate, ch, frames as u64)?;
         src.seek(SeekFrom::Start(h.data_offset))?;
-        let block = usize::from(h.block_align);
-        let sample = usize::from(h.bits / 8);
+        let block = layout.block();
         let chunk_frames = 16_384usize;
         let mut buf = try_vec(chunk_frames * block, 0u8)?;
         let mut planes: Vec<Vec<f32>> = (0..ch)
@@ -378,13 +379,9 @@ impl Decoder for WavCodec {
             let n = (frames - done).min(chunk_frames);
             let bytes = &mut buf[..n * block];
             read_exact_or(src, bytes, "data チャンク")?;
-            for f in 0..n {
-                for (c, plane) in planes.iter_mut().enumerate() {
-                    let s = &bytes[f * block + c * sample..f * block + (c + 1) * sample];
-                    plane[f] = to_f32(s, h.bits, h.float);
-                }
-            }
-            let views: Vec<&[f32]> = planes.iter().map(|p| &p[..n]).collect();
+            // 標本の変換は音声の源（open_source）と同じ関数を通る
+            layout.decode_frames(bytes, &mut planes)?;
+            let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
             out.push_frames(&views)?;
             done += n;
         }
@@ -392,17 +389,54 @@ impl Decoder for WavCodec {
     }
 }
 
-/// 1 標本（リトルエンディアン）を -1〜1 の f32 にする（式は `pcm::int_to_f32`。8 ビットは符号なし）。
-fn to_f32(s: &[u8], bits: u16, float: bool) -> f32 {
-    match (bits, float) {
-        (8, false) => pcm::int_to_f32(i32::from(s[0]) - 128, 8),
-        (16, false) => pcm::int_to_f32(i32::from(i16::from_le_bytes([s[0], s[1]])), 16),
-        (24, false) => pcm::int_to_f32(i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8, 24),
-        (32, false) => pcm::int_to_f32(i32::from_le_bytes([s[0], s[1], s[2], s[3]]), 32),
-        (32, true) => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
-        (64, true) => f64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32,
-        _ => 0.0,
+impl Header {
+    /// data の標本の配置（8 ビットは符号なし、ほかは符号付きのリトルエンディアン。浮動小数の 32・64 ビット）。
+    fn layout(&self) -> PcmLayout {
+        let encoding = match (self.bits, self.float) {
+            (8, false) => SampleEncoding::U8,
+            (32, true) => SampleEncoding::F32Le,
+            (64, true) => SampleEncoding::F64Le,
+            (bits, _) => SampleEncoding::IntLe { bytes: bits / 8 },
+        };
+        PcmLayout {
+            data_offset: self.data_offset,
+            frames: self.data_len / u64::from(self.block_align),
+            channels: self.channels,
+            encoding,
+        }
     }
+}
+
+/// WAV を音声の源として開く（M13 段 1）：ヘッダとメタデータを読み、標本は読むときにチャンクごとにシークして読む遅延の値に
+/// する（開くときに全体を読まない）。値は `decode` と同じ（同じヘッダの読み・同じ標本の変換）。読めない形式（この
+/// デコーダが `Unsupported` を返すもの）は None（呼び手は作業用のファイルへ回す）。`lru_bytes` は源の LRU の上限。
+pub fn open_source(
+    opener: &Opener,
+    limits: &Limits,
+    lru_bytes: u64,
+) -> Result<Option<OpenedSource>, EngineError> {
+    let mut src = opener()?;
+    let h = match parse(src.as_mut(), limits) {
+        Ok(h) => h,
+        Err(EngineError::Unsupported(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let layout = h.layout();
+    limits
+        .check(&Shape::Audio {
+            rate: h.rate,
+            channels: h.channels,
+            frames: Dim::Exact(layout.frames),
+        })
+        .map_err(EngineError::Limit)?;
+    let source = PcmFileSource::new(h.rate, layout, opener.clone(), lru_bytes);
+    source.give(src);
+    let audio = Audio::from_source(Arc::new(source), h.meta)?;
+    Ok(Some(OpenedSource {
+        value: Value::Audio(Arc::new(audio)),
+        decoder: DEC_ID,
+        recorded: None,
+    }))
 }
 
 impl Encoder for WavCodec {

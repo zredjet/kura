@@ -7,7 +7,7 @@ pub mod raster;
 
 use std::sync::Arc;
 
-pub use audio::{AUDIO_CHUNK, Audio, AudioBuilder, Chunk, ChunkData, ChunkSet};
+pub use audio::{AUDIO_CHUNK, Audio, AudioBuilder, Chunk, ChunkData, ChunkSet, SourceRef};
 pub use meta::{
     AnimTag, AudioMeta, AudioSource, Grid, ImageMeta, LoopRange, Marker, Slice, TagDirection,
 };

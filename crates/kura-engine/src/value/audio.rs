@@ -2,7 +2,8 @@
 //!
 //! 中身はチャンネルごとの正規の区切りのチャンク（[k·C, min((k+1)·C, frames))。C = [`AUDIO_CHUNK`]）の表で持つ。チャンクは
 //! `Arc` で共有し、操作は描いたチャンクだけを新しく作る（画像のタイルと同じ考え方）。範囲の描画で描かなかったチャンクは
-//! 無効（[`Chunk::Hole`]。中身を持たず、読むと誤りで、読んだ印が立つ）。
+//! 無効（[`Chunk::Hole`]。中身を持たず、読むと誤りで、読んだ印が立つ）。遅延の値のチャンクは源の参照
+//! （[`Chunk::Source`]。読むときに源（`audio::source`）の LRU から読む）。
 //!
 //! 中身は読む口（[`Audio::read`]・[`Audio::chunk_data`]・[`Audio::for_each_chunk`]・[`Audio::read_planes`]）で読む。
 //! どの読み方でも同じ値を返す。長い音声を組むときは [`AudioBuilder`] で標本を足していく（値と同じ量しか持たない）。
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::meta::AudioMeta;
+use crate::audio::source::AudioSource;
 use crate::error::EngineError;
 use crate::monitor::Monitor;
 
@@ -27,8 +29,51 @@ pub const AUDIO_CHUNK: usize = 1 << 16;
 pub enum Chunk {
     /// 中身（長さは正規の長さ）。
     Data(Arc<Vec<f32>>),
+    /// 源の参照（遅延。読むときに源から読む。源の中身は不変なので、値の不変の約束と両立する）。
+    Source(SourceRef),
     /// 無効（範囲の描画で描かなかったもの。中身を持たない。読むと誤り）。全チャンネルで同じ番号にそろう。
     Hole,
+}
+
+/// 源のチャンクの参照：源 `src` のチャンク `index` のチャンネル `ch`。
+#[derive(Clone)]
+pub struct SourceRef {
+    pub src: Arc<dyn AudioSource>,
+    pub ch: u16,
+    pub index: u32,
+}
+
+impl SourceRef {
+    /// 同じ源の同じチャンネル・同じチャンクなら true（中身を読まない）。
+    pub fn same(&self, other: &SourceRef) -> bool {
+        source_addr(&self.src) == source_addr(&other.src)
+            && self.ch == other.ch
+            && self.index == other.index
+    }
+
+    /// 中身（源から読む）。
+    pub fn read(&self) -> Result<Arc<Vec<f32>>, EngineError> {
+        self.src
+            .read_chunk(self.index)?
+            .get(usize::from(self.ch))
+            .cloned()
+            .ok_or_else(|| EngineError::Internal("音声の源のチャンネルが足りません".into()))
+    }
+}
+
+impl fmt::Debug for SourceRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceRef")
+            .field("src", &source_addr(&self.src))
+            .field("ch", &self.ch)
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
+/// 源の実体の番地（共有の比べ・キャッシュの数えに使う。値に効かない）。
+fn source_addr(src: &Arc<dyn AudioSource>) -> usize {
+    Arc::as_ptr(src).cast::<()>().addr()
 }
 
 /// 無効なチャンクを読んだ印（範囲の描画が申告した依存の外を読んだことを、実行器とテストが見つけるため）。
@@ -254,11 +299,25 @@ impl Audio {
         for row in &table {
             for (k, c) in row.iter().enumerate() {
                 let hole0 = matches!(table[0][k], Chunk::Hole);
+                let want = range_of(frames, k).len();
                 match c {
-                    Chunk::Data(v) if v.len() != range_of(frames, k).len() || hole0 => {
+                    Chunk::Data(v) if v.len() != want || hole0 => {
                         return Err(EngineError::Internal(format!(
                             "音声のチャンク {k} の長さか無効の位置が正しくありません"
                         )));
+                    }
+                    Chunk::Source(r) => {
+                        let len = crate::audio::source::chunk_span(r.src.frames(), r.index)
+                            .map_or(0, |(a, b)| b - a);
+                        if hole0
+                            || r.src.rate() != rate
+                            || usize::from(r.ch) >= r.src.channels()
+                            || len != want as u64
+                        {
+                            return Err(EngineError::Internal(format!(
+                                "音声のチャンク {k} の源がレート・チャンネル・長さと合いません"
+                            )));
+                        }
                     }
                     Chunk::Hole if !hole0 => {
                         return Err(EngineError::Internal(format!(
@@ -277,6 +336,34 @@ impl Audio {
             holes: any_hole.then(|| Arc::new(HoleFlag::default())),
             meta,
         })
+    }
+
+    /// 源の全体を遅延の値にする（全チャンクが源の参照。開くときに全体を読まない）。
+    pub fn from_source(src: Arc<dyn AudioSource>, meta: AudioMeta) -> Result<Self, EngineError> {
+        let frames = usize::try_from(src.frames())
+            .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+        let count = frames.div_ceil(AUDIO_CHUNK);
+        let count32 =
+            u32::try_from(count).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+        let channels = src.channels();
+        check_header(src.rate(), channels)?;
+        let mut table = Vec::with_capacity(channels);
+        for ch in 0..channels {
+            let ch16 = u16::try_from(ch)
+                .map_err(|_| EngineError::Internal("チャンネルが多すぎます".into()))?;
+            let mut row = Vec::new();
+            row.try_reserve_exact(count)
+                .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+            for index in 0..count32 {
+                row.push(Chunk::Source(SourceRef {
+                    src: src.clone(),
+                    ch: ch16,
+                    index,
+                }));
+            }
+            table.push(row);
+        }
+        Self::from_chunks(src.rate(), frames, table, meta)
     }
 
     /// サンプルレート。
@@ -344,11 +431,21 @@ impl Audio {
         Ok(())
     }
 
-    /// チャンネル `ch` のチャンク `k` の中身（写さずに借りる。長さは正規の長さ）。範囲の外・無効なチャンクは `Internal`
-    /// （無効なら読んだ印が立つ）。
+    /// チャンネル `ch` のチャンク `k` の中身（写さずに借りる。源の参照は源の LRU の実体。長さは正規の長さ）。範囲の外・
+    /// 無効なチャンクは `Internal`（無効なら読んだ印が立つ）、源の読みの誤りはそのまま（`Io` など）。
     pub fn chunk_data(&self, ch: usize, k: usize) -> Result<ChunkData<'_>, EngineError> {
         match self.chunk(ch, k)? {
             Chunk::Data(v) => Ok(ChunkData::Borrowed(v.as_slice())),
+            Chunk::Source(r) => {
+                let v = r.read()?;
+                if v.len() != self.chunk_range(k).len() {
+                    return Err(EngineError::Internal(format!(
+                        "音声の源のチャンク {} の長さが違います",
+                        r.index
+                    )));
+                }
+                Ok(ChunkData::Shared(v))
+            }
             Chunk::Hole => {
                 self.touch();
                 Err(hole_error())
@@ -492,31 +589,45 @@ impl Audio {
     }
 
     /// チャンネル `ch` のチャンク `k` が、`other` の同じ位置のチャンクと同じ実体（写さずに共有したもの）なら true
-    /// （中身を比べない。どちらかが無効なら false。変わった区間の絞り込みと継ぎはぎに使う）。
+    /// （中身を比べない。中身どうしは `Arc::ptr_eq`、源の参照どうしは同じ源・チャンネル・番号。どちらかが無効なら false。
+    /// 変わった区間の絞り込みと継ぎはぎに使う）。
     pub fn same_chunk(&self, other: &Audio, ch: usize, k: usize) -> bool {
         match (self.chunk(ch, k), other.chunk(ch, k)) {
             (Ok(Chunk::Data(a)), Ok(Chunk::Data(b))) => Arc::ptr_eq(a, b),
+            (Ok(Chunk::Source(a)), Ok(Chunk::Source(b))) => a.same(b),
             _ => false,
         }
     }
 
-    /// 中身を持つチャンクのバイト数の和（無効なチャンクは数えない）。
+    /// 中身を持つチャンクのバイト数の和（無効なチャンク・源の参照は数えない。源の LRU は源が数える）。
     pub fn resident_bytes(&self) -> u64 {
         self.table
             .iter()
             .flatten()
             .map(|c| match c {
                 Chunk::Data(v) => (v.len() as u64).saturating_mul(4),
-                Chunk::Hole => 0,
+                Chunk::Source(_) | Chunk::Hole => 0,
             })
             .fold(0u64, u64::saturating_add)
     }
 
-    /// 中身の実体ごとの（番地, バイト数）を `out` に足す（`Value::chunks`。無効なチャンクは中身を持たないので数えない）。
+    /// 中身の実体ごとの（番地, バイト数）を `out` に足す（`Value::chunks`）。中身はチャンクごと、源の参照は源 1 つにつき
+    /// （源の番地, 源の LRU の上限）を 1 回（キャッシュは番地で 1 度だけ数えるので、遅延の入力を `register_external` すると
+    /// 源の LRU の上限が予算に入る）。無効なチャンクは中身を持たないので数えない。
     pub(crate) fn chunks_into(&self, out: &mut Vec<(usize, u64)>) {
+        let mut sources: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for c in self.table.iter().flatten() {
-            if let Chunk::Data(v) = c {
-                out.push((Arc::as_ptr(v).addr(), (v.len() as u64).saturating_mul(4)));
+            match c {
+                Chunk::Data(v) => {
+                    out.push((Arc::as_ptr(v).addr(), (v.len() as u64).saturating_mul(4)));
+                }
+                Chunk::Source(r) => {
+                    let addr = source_addr(&r.src);
+                    if sources.insert(addr) {
+                        out.push((addr, r.src.resident_bytes()));
+                    }
+                }
+                Chunk::Hole => {}
             }
         }
     }
@@ -539,21 +650,40 @@ impl PartialEq for Audio {
         self.table.iter().zip(other.table.iter()).all(|(ra, rb)| {
             ra.iter().zip(rb).all(|(a, b)| match (a, b) {
                 (Chunk::Data(x), Chunk::Data(y)) => Arc::ptr_eq(x, y) || x == y,
+                (Chunk::Source(x), Chunk::Source(y)) if x.same(y) => true,
                 (Chunk::Hole, Chunk::Hole) => true,
-                _ => false,
+                (Chunk::Hole, _) | (_, Chunk::Hole) => false,
+                // 源の参照を含むなら読んで比べる（読めなければ等しくない）
+                _ => match (content_of(a), content_of(b)) {
+                    (Some(x), Some(y)) => x[..] == y[..],
+                    _ => false,
+                },
             })
         })
+    }
+}
+
+/// 有効なチャンクの中身（源は読む。無効・読めなければ None）。
+fn content_of(c: &Chunk) -> Option<ChunkData<'_>> {
+    match c {
+        Chunk::Data(v) => Some(ChunkData::Borrowed(v.as_slice())),
+        Chunk::Source(r) => r.read().ok().map(ChunkData::Shared),
+        Chunk::Hole => None,
     }
 }
 
 impl fmt::Debug for Audio {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let holes = self.chunk_count() - self.valid_chunks().count();
+        let sources = self.table.first().map_or(0, |row| {
+            row.iter().filter(|c| matches!(c, Chunk::Source(_))).count()
+        });
         f.debug_struct("Audio")
             .field("rate", &self.rate)
             .field("channels", &self.channels())
             .field("frames", &self.frames)
             .field("chunks", &self.chunk_count())
+            .field("sources", &sources)
             .field("holes", &holes)
             .field("meta", &self.meta)
             .finish()
@@ -942,6 +1072,56 @@ mod tests {
         let text = format!("{a:?}");
         assert!(text.len() < 400, "{text}");
         assert!(text.contains("chunks: 2"), "{text}");
+    }
+
+    /// 源の参照のチャンク：`from_chunks` は源のレート・チャンネル・長さを確かめ、別の番号の源のチャンクも長さが合えば
+    /// 置ける（ずらした写しの共有）。数え（`Value::chunks`）は源 1 つにつき LRU の上限を 1 回、中身は数えない。
+    #[test]
+    fn source_chunks_are_checked_and_counted_once() {
+        use crate::audio::source::{AudioSource, MemorySource};
+        let frames = 3 * AUDIO_CHUNK;
+        let base = Arc::new(value(&ramp(2, frames)));
+        let src: Arc<dyn AudioSource> = Arc::new(MemorySource::new(base.clone()).unwrap());
+        let lazy = Audio::from_source(src.clone(), AudioMeta::default()).unwrap();
+        assert_eq!(lazy, *base);
+        let mut out = Vec::new();
+        lazy.chunks_into(&mut out);
+        assert_eq!(out.len(), 1, "源 1 つにつき 1 回");
+        assert_eq!(out[0].1, src.resident_bytes());
+        assert_eq!(lazy.resident_bytes(), 0);
+        let r = |ch: u16, index: u32| {
+            Chunk::Source(SourceRef {
+                src: src.clone(),
+                ch,
+                index,
+            })
+        };
+        // 源のチャンク 1・2 を、長さ 2C の値のチャンク 0・1 に置く（ずらした写し）
+        let shifted = Audio::from_chunks(
+            8_000,
+            2 * AUDIO_CHUNK,
+            vec![vec![r(0, 1), r(0, 2)], vec![r(1, 1), r(1, 2)]],
+            AudioMeta::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            shifted.read_planes(0, 2 * AUDIO_CHUNK).unwrap()[1],
+            ramp(2, frames)[1][AUDIO_CHUNK..]
+        );
+        // 長さ・チャンネル・レートが合わない源は断る
+        let m = AudioMeta::default;
+        assert!(
+            Audio::from_chunks(8_000, AUDIO_CHUNK + 1, vec![vec![r(0, 0), r(0, 1)]], m()).is_err()
+        );
+        assert!(Audio::from_chunks(8_000, AUDIO_CHUNK, vec![vec![r(2, 0)]], m()).is_err());
+        assert!(Audio::from_chunks(44_100, AUDIO_CHUNK, vec![vec![r(0, 0)]], m()).is_err());
+        assert!(Audio::from_chunks(8_000, AUDIO_CHUNK, vec![vec![r(0, 0)]], m()).is_ok());
+        // 同じ源・同じ番号どうしは共有、中身が同じでも別の番号は共有でない
+        let one = Audio::from_chunks(8_000, AUDIO_CHUNK, vec![vec![r(0, 0)]], m()).unwrap();
+        let again = Audio::from_chunks(8_000, AUDIO_CHUNK, vec![vec![r(0, 0)]], m()).unwrap();
+        assert!(one.same_chunk(&again, 0, 0));
+        assert!(!one.same_chunk(&base, 0, 0));
+        assert!(format!("{lazy:?}").contains("sources: 3"));
     }
 
     #[test]

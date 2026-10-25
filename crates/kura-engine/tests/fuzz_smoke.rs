@@ -1,8 +1,8 @@
 //! stable で回す、変異によるファズ（docs/editing.md §13）。`fuzz/`（cargo-fuzz、nightly）と同じ対象
-//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
+//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`・`fuzz_audio_source`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
 //! カバレッジは見ない。対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、
 //! 文書は `document`、文書の部品（M12）は `doc_parts`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、3D モデル（glb）は `model_glb`、
-//! フォントを渡した SVG の文字は `svg_text`（`fuzz/` では `decode_svg_text`）。
+//! フォントを渡した SVG の文字は `svg_text`（`fuzz/` では `decode_svg_text`）、音声の源（M13）は `audio_source`。
 //!
 //! - ふだんの `cargo test` では、対象ごとに決めた回数だけ回す（`quick`）。
 //! - `KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test fuzz_smoke -- --ignored` で、対象ごとに決めた秒数だけ回す。
@@ -25,8 +25,8 @@ use kura_engine::doc::Graph;
 use kura_engine::testfiles::{ApngFrame, AseCel, AseFrame, AseLayer, FileGen, GifFrame, PsdGen};
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::{
-    FuzzEncodeMeta, fuzz_decode, fuzz_doc_parts, fuzz_document, fuzz_encode, fuzz_encode_input,
-    fuzz_encode_input_meta, fuzz_model, fuzz_peaks, fuzz_svg_text,
+    FuzzEncodeMeta, fuzz_audio_source, fuzz_decode, fuzz_doc_parts, fuzz_document, fuzz_encode,
+    fuzz_encode_input, fuzz_encode_input_meta, fuzz_model, fuzz_peaks, fuzz_svg_text,
 };
 use kura_engine::value::{LoopRange, PixelFormat};
 use kura_engine::{NoMonitor, Value};
@@ -603,6 +603,17 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
         ("peaks", peak_seeds()),
         // 段 9：アンカー（PNG・APNG・f32 の WAV ＋私用のチャンク。cargo-fuzz の対象は decode_anchor）
         ("anchor", anchor_seeds(&with_exif, &frames, &wav_meta)),
+        // M13 段 1：音声の源（WAV・AIFF・アンカーをチャンクごとにシークして読む。cargo-fuzz の対象も audio_source）
+        (
+            "audio_source",
+            vec![
+                encoded("wav", &wav_meta, json!({ "bits": 16 })),
+                encoded("wav", &wav_meta, json!({ "float": true })),
+                encoded("aiff", &wav_meta, json!({ "bits": 24 })),
+                fixture("aifc-f32.aif"),
+                fixture("anchor-v1-audio-stereo.wav"),
+            ],
+        ),
         // M11：3D モデル（glb の情報・焼き込み・描画。cargo-fuzz の対象も model_glb）
         (
             "model_glb",
@@ -797,6 +808,8 @@ fn run(target: &str, input: &[u8]) -> Result<(), String> {
         fuzz_doc_parts(input)
     } else if target == "peaks" {
         fuzz_peaks(input)
+    } else if target == "audio_source" {
+        fuzz_audio_source(input)
     } else if target == "model_glb" {
         fuzz_model(input)
     } else if target == "svg_text" {
@@ -888,6 +901,7 @@ fn export_seeds() {
         let name = if target == "document"
             || target == "doc_parts"
             || target == "model_glb"
+            || target == "audio_source"
             || target.starts_with("encode_")
         {
             target.to_string()

@@ -91,6 +91,114 @@ pub fn container_bits(bits: u16) -> u16 {
     }
 }
 
+/// 標本の符号化（WAV・AIFF の data・SSND の 1 標本。M13 段 1：デコーダと音声の源が同じ変換を通る）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleEncoding {
+    /// 符号なしの 8 ビット（WAV の 8 ビット・AIFF-C の `raw `）。
+    U8,
+    /// 符号付きの整数（リトルエンディアン。幅 `bytes` バイト = 入れ物の幅）。
+    IntLe {
+        bytes: u16,
+    },
+    /// 符号付きの整数（ビッグエンディアン）。
+    IntBe {
+        bytes: u16,
+    },
+    F32Le,
+    F32Be,
+    F64Le,
+    F64Be,
+}
+
+impl SampleEncoding {
+    /// 1 標本のバイト数。
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::IntLe { bytes } | Self::IntBe { bytes } => usize::from(bytes),
+            Self::F32Le | Self::F32Be => 4,
+            Self::F64Le | Self::F64Be => 8,
+        }
+    }
+
+    /// 1 標本（`bytes()` バイト）を −1〜1 の f32 にする（式は [`int_to_f32`]。浮動小数はそのまま、64 ビットは f32 に丸める）。
+    pub fn to_f32(self, s: &[u8]) -> f32 {
+        match self {
+            Self::U8 => int_to_f32(i32::from(s[0]) - 128, 8),
+            Self::IntLe { bytes: 1 } | Self::IntBe { bytes: 1 } => {
+                int_to_f32(i32::from(s[0] as i8), 8)
+            }
+            Self::IntLe { bytes: 2 } => int_to_f32(i32::from(i16::from_le_bytes([s[0], s[1]])), 16),
+            Self::IntBe { bytes: 2 } => int_to_f32(i32::from(i16::from_be_bytes([s[0], s[1]])), 16),
+            Self::IntLe { bytes: 3 } => {
+                int_to_f32(i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8, 24)
+            }
+            Self::IntBe { bytes: 3 } => {
+                int_to_f32(i32::from_be_bytes([s[0], s[1], s[2], 0]) >> 8, 24)
+            }
+            Self::IntLe { .. } => int_to_f32(i32::from_le_bytes([s[0], s[1], s[2], s[3]]), 32),
+            Self::IntBe { .. } => int_to_f32(i32::from_be_bytes([s[0], s[1], s[2], s[3]]), 32),
+            Self::F32Le => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+            Self::F32Be => f32::from_be_bytes([s[0], s[1], s[2], s[3]]),
+            Self::F64Le => {
+                f64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32
+            }
+            Self::F64Be => {
+                f64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32
+            }
+        }
+    }
+}
+
+/// インターリーブした PCM の配置（ファイルの中の標本の始まり・フレーム数・チャンネル数・符号化）。WAV・AIFF のデコーダと
+/// 音声の源（`audio::source::PcmFileSource`）が同じ変換（[`PcmLayout::decode_frames`]）を通る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcmLayout {
+    /// 最初のフレームのファイルの中の位置（バイト）。
+    pub data_offset: u64,
+    /// フレーム数。
+    pub frames: u64,
+    /// チャンネル数（1 以上）。
+    pub channels: u16,
+    pub encoding: SampleEncoding,
+}
+
+impl PcmLayout {
+    /// 1 フレームのバイト数。
+    pub fn block(&self) -> usize {
+        usize::from(self.channels) * self.encoding.bytes()
+    }
+
+    /// インターリーブしたフレームのバイト列 `bytes`（フレームのバイト数の倍数）を、チャンネルごとの列 `out`（チャンネルの
+    /// 数だけ）にする（`out` は空にしてから詰める）。
+    pub fn decode_frames(&self, bytes: &[u8], out: &mut [Vec<f32>]) -> Result<(), EngineError> {
+        let block = self.block();
+        if out.len() != usize::from(self.channels)
+            || block == 0
+            || !bytes.len().is_multiple_of(block)
+        {
+            return Err(EngineError::Internal(
+                "PCM の配置とバイト列・チャンネルの数が合いません".into(),
+            ));
+        }
+        let sample = self.encoding.bytes();
+        let n = bytes.len() / block;
+        for (c, plane) in out.iter_mut().enumerate() {
+            plane.clear();
+            plane
+                .try_reserve(n)
+                .map_err(|_| EngineError::Limit("音声の作業領域を確保できません".into()))?;
+            let off = c * sample;
+            plane.extend(
+                bytes
+                    .chunks_exact(block)
+                    .map(|f| self.encoding.to_f32(&f[off..off + sample])),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

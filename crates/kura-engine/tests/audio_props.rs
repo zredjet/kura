@@ -355,6 +355,83 @@ fn kernel_meta_warnings_and_errors_match_apply() {
     }
 }
 
+/// E18（M13 段 1）：入力 0 を遅延の値（源の参照のチャンク。`MemorySource`）にしても、核を区間ごとに描いた値・`apply` の
+/// 値・メタデータ・警告は、常駐の入力と同じ。
+#[test]
+fn e18_lazy_inputs_render_the_same() {
+    use kura_engine::audio::source::MemorySource;
+    let engine = Engine::new().unwrap();
+    let mut checked = 0;
+    for op in engine.registry().all() {
+        for ex in op.examples().unwrap() {
+            let inputs: Vec<Value> = ex.inputs.iter().map(|g| g.generate().unwrap()).collect();
+            let Some(Value::Audio(first)) = inputs.first() else {
+                continue;
+            };
+            let lazy = Audio::from_source(
+                Arc::new(MemorySource::new(first.clone()).unwrap()),
+                first.meta.clone(),
+            )
+            .unwrap();
+            let mut lazy_inputs = inputs.clone();
+            lazy_inputs[0] = Value::Audio(Arc::new(lazy));
+            let params = op.parse(&ex.params).unwrap();
+            let limits = Limits::default();
+            let run = |ins: &[Value]| {
+                let refs: Vec<&Value> = ins.iter().collect();
+                let mut cx =
+                    kura_engine::op::ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
+                let v = op.apply(params.as_ref(), &refs, &mut cx).map(|a| a.value);
+                (v.map_err(|e| e.to_string()), cx.warnings)
+            };
+            let (want, want_warn) = run(&inputs);
+            let (got, got_warn) = run(&lazy_inputs);
+            assert_eq!(got_warn, want_warn, "{} {}", op.id(), ex.name);
+            let (Ok(Value::Audio(want)), Ok(Value::Audio(got))) = (&want, &got) else {
+                assert_eq!(got.is_ok(), want.is_ok(), "{} {}", op.id(), ex.name);
+                continue;
+            };
+            assert_eq!(got.meta, want.meta, "{} {}", op.id(), ex.name);
+            let (g, w) = (got.to_planes().unwrap(), want.to_planes().unwrap());
+            assert!(
+                g.iter().zip(&w).all(|(a, b)| a
+                    .iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| x.to_bits() == y.to_bits())),
+                "{} {}",
+                op.id(),
+                ex.name
+            );
+            // 核をチャンク C+1 ずつ描いても同じ
+            let refs: Vec<&Value> = lazy_inputs.iter().collect();
+            let mut kcx =
+                kura_engine::op::ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
+            let kernel = op
+                .audio_kernel(params.as_ref(), &refs, &mut kcx)
+                .unwrap()
+                .unwrap();
+            for (ch, w) in w.iter().enumerate() {
+                let mut out = vec![0f32; w.len()];
+                for (i, part) in out.chunks_mut(C + 1).enumerate() {
+                    kernel
+                        .render(ch, (i * (C + 1)) as u64, part)
+                        .unwrap_or_else(|e| panic!("{} {}: {e}", op.id(), ex.name));
+                }
+                assert!(
+                    out.iter()
+                        .zip(w.iter())
+                        .all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "{} {}：核",
+                    op.id(),
+                    ex.name
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 7, "{checked}");
+}
+
 /// E18（M13 段 1）：`passthrough` が Some(off) の核の出力は、入力 0 の同じチャンネルを off ずらして写したもの（ビット一致）。
 /// 実行器はこれを使ってチャンクを入力の実体で共有する。ずらす核（trim）とずらさない核（恒等）が網に入っていること。
 #[test]

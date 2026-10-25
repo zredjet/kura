@@ -21,21 +21,22 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::codec::pcm::{self, quantize};
-use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, try_vec};
+use crate::audio::source::{Opener, PcmFileSource};
+use crate::codec::pcm::{self, PcmLayout, SampleEncoding, quantize};
+use crate::codec::{Decoder, Encoder, MetaCaps, OpenedSource, ReadSeek, Tier, caps_of, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::op::{ParamKind, ParamSchema, Unit, spec};
 use crate::shape::{Dim, Shape};
-use crate::value::{AudioBuilder, AudioMeta, AudioSource, LoopRange, Marker, Value};
+use crate::value::{Audio, AudioBuilder, AudioMeta, AudioSource, LoopRange, Marker, Value};
 
 /// AIFF の読み書き。
 pub struct AiffCodec;
 
 /// 読み取りの約束の版。
-const DEC_ID: &str = "aiff-kura-dec/1";
+pub const DEC_ID: &str = "aiff-kura-dec/1";
 /// 書き出しの約束の版。
 const ENC_ID: &str = "aiff-kura-enc/1";
 /// 名前・タグとして読む 1 つの文字列の長さの上限（バイト）。
@@ -89,23 +90,14 @@ impl Layout {
         AudioSource { bits, float, rate }
     }
 
-    /// 1 標本を f32 にする。
-    fn to_f32(self, s: &[u8]) -> f32 {
+    /// 標本の符号化（デコーダと音声の源が同じ変換 `pcm::PcmLayout::decode_frames` を通る）。
+    fn encoding(self) -> SampleEncoding {
         match self {
-            Layout::Int { bytes: 1 } => pcm::int_to_f32(i32::from(s[0] as i8), 8),
-            Layout::Int { bytes: 2 } => {
-                pcm::int_to_f32(i32::from(i16::from_be_bytes([s[0], s[1]])), 16)
-            }
-            Layout::Int { bytes: 3 } => {
-                pcm::int_to_f32(i32::from_be_bytes([s[0], s[1], s[2], 0]) >> 8, 24)
-            }
-            Layout::Int { .. } => pcm::int_to_f32(i32::from_be_bytes([s[0], s[1], s[2], s[3]]), 32),
-            Layout::IntLe16 => pcm::int_to_f32(i32::from(i16::from_le_bytes([s[0], s[1]])), 16),
-            Layout::U8 => pcm::int_to_f32(i32::from(s[0]) - 128, 8),
-            Layout::F32 => f32::from_be_bytes([s[0], s[1], s[2], s[3]]),
-            Layout::F64 => {
-                f64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]) as f32
-            }
+            Layout::Int { bytes } => SampleEncoding::IntBe { bytes },
+            Layout::IntLe16 => SampleEncoding::IntLe { bytes: 2 },
+            Layout::U8 => SampleEncoding::U8,
+            Layout::F32 => SampleEncoding::F32Be,
+            Layout::F64 => SampleEncoding::F64Be,
         }
     }
 }
@@ -189,6 +181,50 @@ struct Header {
     data_offset: u64,
     data_len: u64,
     meta: AudioMeta,
+}
+
+impl Header {
+    /// SSND の標本の配置。
+    fn pcm_layout(&self) -> PcmLayout {
+        let block = u64::from(self.channels) * u64::from(self.layout.bytes());
+        PcmLayout {
+            data_offset: self.data_offset,
+            frames: self.data_len / block.max(1),
+            channels: self.channels,
+            encoding: self.layout.encoding(),
+        }
+    }
+}
+
+/// AIFF を音声の源として開く（M13 段 1。[`crate::codec::wav::open_source`] と同じ約束）。読めない圧縮（`Unsupported`）は
+/// None。
+pub fn open_source(
+    opener: &Opener,
+    limits: &Limits,
+    lru_bytes: u64,
+) -> Result<Option<OpenedSource>, EngineError> {
+    let mut src = opener()?;
+    let h = match parse(src.as_mut(), limits) {
+        Ok(h) => h,
+        Err(EngineError::Unsupported(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let layout = h.pcm_layout();
+    limits
+        .check(&Shape::Audio {
+            rate: h.rate,
+            channels: h.channels,
+            frames: Dim::Exact(layout.frames),
+        })
+        .map_err(EngineError::Limit)?;
+    let source = PcmFileSource::new(h.rate, layout, opener.clone(), lru_bytes);
+    source.give(src);
+    let audio = Audio::from_source(Arc::new(source), h.meta)?;
+    Ok(Some(OpenedSource {
+        value: Value::Audio(Arc::new(audio)),
+        decoder: DEC_ID,
+        recorded: None,
+    }))
 }
 
 fn read_exact_or(src: &mut dyn ReadSeek, buf: &mut [u8], what: &str) -> Result<(), EngineError> {
@@ -492,6 +528,7 @@ impl Decoder for AiffCodec {
         let frames =
             usize::try_from(frames).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
         let ch = usize::from(h.channels);
+        let layout = h.pcm_layout();
         let mut out = AudioBuilder::new(h.rate, ch, frames as u64)?;
         src.seek(SeekFrom::Start(h.data_offset))?;
         let chunk_frames = 16_384usize;
@@ -507,13 +544,9 @@ impl Decoder for AiffCodec {
             let n = (frames - done).min(chunk_frames);
             let bytes = &mut buf[..n * block];
             read_exact_or(src, bytes, "SSND")?;
-            for f in 0..n {
-                for (c, plane) in planes.iter_mut().enumerate() {
-                    let at = f * block + c * sample;
-                    plane[f] = h.layout.to_f32(&bytes[at..at + sample]);
-                }
-            }
-            let views: Vec<&[f32]> = planes.iter().map(|p| &p[..n]).collect();
+            // 標本の変換は音声の源（open_source）と同じ関数を通る
+            layout.decode_frames(bytes, &mut planes)?;
+            let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
             out.push_frames(&views)?;
             done += n;
         }

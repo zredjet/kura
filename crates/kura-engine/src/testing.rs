@@ -5,8 +5,10 @@ pub mod platform;
 pub mod preview;
 pub mod region;
 mod snapshot;
+pub mod source;
 
 pub use platform::{FakePlatformDecoder, FakePlatformEncoder};
+pub use source::SyntheticSource;
 
 use std::collections::BTreeMap;
 
@@ -231,6 +233,71 @@ pub fn fuzz_decode(format: &str, data: &[u8]) -> Result<(), String> {
         match r {
             Err(at) => return Err(format!("{}: 自前のコードの panic（{at}）", d.id())),
             Ok(Err(EngineError::Internal(m))) => return Err(format!("{}: {m}", d.id())),
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// ファズの対象（`fuzz/` の `audio_source` と `tests/fuzz_smoke.rs` の `audio_source`。M13 段 1）：バイト列を WAV・AIFF・
+/// アンカーの音声の源として開き、全チャンクを読む。見つけたい不具合（自前のコードの panic・`Internal`・`decode` が通る
+/// のに源で開けない・読めない、源で読めるのに `decode` が通らない（アンカーは値のダイジェストを照らすので除く）、両方
+/// 読めて値（ダイジェスト）が違う）は `Err`、壊れたファイルとしてのエラー・上限は `Ok`。
+pub fn fuzz_audio_source(data: &[u8]) -> Result<(), String> {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    let limits = fuzz_limits();
+    let set = crate::codec::CodecSet::pinned();
+    let opts = crate::doc::DecodeOptions::default();
+    let bytes = Arc::new(data.to_vec());
+    let opener: crate::audio::source::Opener = Arc::new(move || {
+        Ok(Box::new(Cursor::new(bytes.as_ref().clone())) as Box<dyn crate::codec::ReadSeek + Send>)
+    });
+    for format in ["wav", "aiff", crate::codec::anchor::FORMAT] {
+        let anchor = format == crate::codec::anchor::FORMAT;
+        let bad = |m: &str| Err(EngineError::Internal(format!("{format}: {m}")));
+        let r = catch_own_panic(|| -> Result<(), EngineError> {
+            let opened = set.open_audio_source(&opener, format, &opts, &limits, 1 << 20);
+            let decoded = set.decode(&mut Cursor::new(data), format, &opts, &limits, &NoMonitor);
+            let opened = match opened {
+                Err(EngineError::Internal(m)) => return bad(&m),
+                Err(_) | Ok(None) => {
+                    return match decoded {
+                        Ok((Value::Audio(_), _)) if !anchor => bad("decode が通るのに源で開けない"),
+                        _ => Ok(()),
+                    };
+                }
+                Ok(Some(o)) => o,
+            };
+            let Value::Audio(a) = &opened.value else {
+                return bad("源の値が音声でない");
+            };
+            let mut read = Ok(());
+            'all: for k in 0..a.chunk_count() {
+                for ch in 0..a.channels() {
+                    if let Err(e) = a.chunk_data(ch, k) {
+                        read = Err(e);
+                        break 'all;
+                    }
+                }
+            }
+            match (read, decoded) {
+                (Err(EngineError::Internal(m)), _) => bad(&m),
+                (Ok(()), Ok((v, _))) => {
+                    if opened.value.digest()? == v.digest()? {
+                        Ok(())
+                    } else {
+                        bad("源の値が decode と違う")
+                    }
+                }
+                (Err(_), Ok(_)) => bad("decode が通るのに源で読めない"),
+                (Ok(()), Err(_)) if !anchor => bad("源で読めるのに decode が通らない"),
+                _ => Ok(()),
+            }
+        });
+        match r {
+            Err(at) => return Err(format!("{format}: 自前のコードの panic（{at}）")),
+            Ok(Err(EngineError::Internal(m))) => return Err(m),
             Ok(_) => {}
         }
     }

@@ -152,6 +152,17 @@ pub struct DecodeStamp {
     pub env: Option<CodecEnv>,
 }
 
+/// 音声を源として開いた結果（`CodecSet::open_audio_source`）。
+#[derive(Debug, Clone)]
+pub struct OpenedSource {
+    /// 遅延の値（チャンクは源の参照）。
+    pub value: Value,
+    /// 値を読むデコーダの識別子（WAV・AIFF はそのデコーダ、アンカーは `anchor-kura-dec/1`）。遅延の入力の派生の指紋に使う。
+    pub decoder: &'static str,
+    /// 記録した元の読み取り（アンカーのヘッダの記録。値のダイジェストはこの `value_digest` と同じはず。ほかは None）。
+    pub recorded: Option<DecodeStamp>,
+}
+
 /// 書き出しの記録（版の記録に残す。保存のために読み戻せる。知らない項目は拒む）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -638,6 +649,31 @@ impl CodecSet {
             }
         }
         Err(last)
+    }
+
+    /// 音声を源として開く（M13 段 1。docs/editing.md §9.11）：直接シークして読める形式（WAV・AIFF・アンカーの中の f32 WAV）
+    /// なら、ヘッダとメタデータだけを読んで遅延の値（チャンクを読むときに `opener` で開いた読み口から読む）を返す。値は
+    /// `decode` と同じ（同じヘッダの読み・同じ標本の変換）。それ以外の形式・この組の最初のデコーダが固定の段の WAV・AIFF・
+    /// アンカーのデコーダでないとき・標本の変換が単純でない変種（`Unsupported`）は None（呼び手は作業用のファイルへ
+    /// 回す）。開くときに全体を読まないので、アンカーの値のダイジェストはここでは照らさない（保存の流れで照らす）。
+    /// `lru_bytes` は源の LRU の上限（予算で数える）。
+    pub fn open_audio_source(
+        &self,
+        opener: &crate::audio::source::Opener,
+        format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        lru_bytes: u64,
+    ) -> Result<Option<OpenedSource>, EngineError> {
+        let first = self.decoders_for(format).first().map(|d| d.id());
+        match (format, first) {
+            ("wav", Some(wav::DEC_ID)) => wav::open_source(opener, limits, lru_bytes),
+            ("aiff", Some(aiff::DEC_ID)) => aiff::open_source(opener, limits, lru_bytes),
+            (anchor::FORMAT, Some(anchor::DEC_ID)) => {
+                anchor::open_source(opener, limits, lru_bytes)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// 読む。段の順に試し、`shape` か `decode` で扱えないと答えたもの（`Unsupported`）は次の段へ回す。
