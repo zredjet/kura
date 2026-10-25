@@ -1313,7 +1313,23 @@ pub fn random_audio_edit(
     for _ in 0..16 {
         let i = below(r, len.max(1) as u64) as usize;
         let mut next = g.clone();
-        let pick = if len == 0 { 9 } else { below(r, 10) };
+        // 6 割はノードの操作に合った引数の手、ほかは有効の切り替え・同じ操作の引き直し・構造の手
+        let pick = match (len, below(r, 20)) {
+            (0, _) => 9,
+            (_, 0..=11) => match g.nodes.get(i).map(|n| n.op.as_str()) {
+                Some("audio.gain") => 0,
+                Some("audio.fade") => 1,
+                Some("audio.set_loop") => 2,
+                Some("audio.trim") => 3,
+                Some("audio.normalize") => 4,
+                _ => 5,
+            },
+            (_, 12..=14) => 6,
+            (_, 15) => 5,
+            (_, 16) => 7,
+            (_, 17) => 8,
+            _ => 9,
+        };
         let kind = match pick {
             7 => {
                 let node = next.nodes.get_mut(i)?;

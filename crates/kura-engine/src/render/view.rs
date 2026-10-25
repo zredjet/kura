@@ -198,8 +198,21 @@ impl Engine {
 }
 
 /// 前回の表示 `prev` では無効で、今回の表示 `next` で有効なタイル（キャンバスの座標。表示する範囲を広げた・動かした分）。
-/// フレームの形・位置が違えば `refine` が全体にするので、ここではフレームの全体を返す。
+/// フレームの形・位置が違えば `refine` が全体にするので、ここではフレームの全体を返す。音声は、今は有効で前は無効（か長さの
+/// 違う）チャンクの区間（M13 段 1）。
 fn newly_valid(prev: &Value, next: &Value) -> Area {
+    if let (Value::Audio(a), Value::Audio(b)) = (prev, next) {
+        let mut set = b.valid_chunks();
+        if a.rate() == b.rate() && a.channels() == b.channels() {
+            let old = a.valid_chunks();
+            for k in b.valid_chunks().iter() {
+                if old.contains(k) && a.chunk_range(k).len() == b.chunk_range(k).len() {
+                    set.remove(k);
+                }
+            }
+        }
+        return Area::samples(super::audio::chunk_spans(&set, b.frames()));
+    }
     let before = frames_of(prev);
     let mut out = BTreeMap::new();
     for (f, px, origin) in frames_of(next) {

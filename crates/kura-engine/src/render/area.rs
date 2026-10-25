@@ -341,7 +341,7 @@ impl Engine {
                 }
                 _ => Ok(v),
             };
-        // 入力をそのまま出す出力は、入力の値（全体）
+        // 入力をそのまま出す出力は、入力の値（全体。共有した実体なので、音声でも切らない）
         let PortRef::Node { id: out_node } = from else {
             let v = lookup(&BTreeMap::new(), &cx.input_values, from)
                 .ok_or_else(|| EngineError::Internal("出力の値がありません".into()))?;
@@ -371,9 +371,20 @@ impl Engine {
             &mut presolved,
             mon,
         )?;
-        let out_exact = pass.exact && pass.value.is_complete();
+        let mut out_exact = pass.exact && pass.value.is_complete();
         let kept = pass.kept.as_ref().filter(|_| pass.patched);
-        let value = quantized(pass.value, out_exact, kept, cache)?;
+        let mut value = quantized(pass.value, out_exact, kept, cache)?;
+        // 音声の値は頼んだ区間のチャンクだけを持つ（キャッシュに当たった・全体で描いた出力も切る。表示の値を予算で数えないので、
+        // 窓を動かしても溜まらないように。M13 段 1）
+        if let Value::Audio(a) = &value {
+            let want = chunks_covering(&clip_to_canvas(&req.area, out_shape), a.frames());
+            let mut keep = a.valid_chunks();
+            if keep.iter().any(|k| !want.contains(k)) {
+                keep.intersect_with(&want);
+                value = Value::Audio(Arc::new(a.keep_only(&keep)));
+                out_exact = false;
+            }
+        }
         let origin = if plan.level != 0 {
             // 縮小の段の値は近似（保存・解析・照合に使わない）
             Origin::Scaled

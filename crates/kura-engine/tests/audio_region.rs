@@ -5,6 +5,9 @@
 //!   全体に落ちず（`fallbacks` 0）、警告は `render` の部分列。量子化した出力も同じ。
 //! - audio_reach_is_sound：`audio_reach` の逆写しの外の入力を壊しても（無効なチャンクにしても）、区間の中は同じ。
 //! - audio_region_declarations_match：音声を出す操作は、例で `audio_reach` が `Global` でない。
+//! - E38（表示の経路）：audio_view_equals_render_on_random_edit_sequences（ランダムな手の列・表示の窓を動かす・キャッシュの
+//!   上限 0・1 MiB・1 GiB で、値が `render` と同じ・報告が差を含み推論の中・継ぎはぎがまっさらと同じ・頼んだ区間のチャンク
+//!   だけを持つ）、audio_inferred_delta_contains_actual、loop_only_change_reports_no_samples、audio_view_keeps_only_requested_chunks。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -473,4 +476,363 @@ fn partial_values_deliver_only_drawn_chunks() {
     assert!(!v.covers(&Area::span(0, 1)) && v.covers(&Area::span(C, C + 2)));
     assert!(v.exact().is_none() && v.audio_meta().is_some());
     assert_eq!(got.stats.drawn_chunks, 1);
+}
+
+// ---- E38：音声の継ぎはぎと変わった区間（表示の経路） ----
+
+use kura_engine::render::delta::OutputChange;
+use kura_engine::render::region::Spans;
+use kura_engine::render::view::{View, ViewRequest};
+use kura_engine::testing::region::{check_contains, random_audio_edit, reseeded};
+
+fn inputs_of(v: &Value, source: Digest) -> BTreeMap<InputId, FingerprintedInput> {
+    BTreeMap::from([(
+        InputId(0),
+        FingerprintedInput::new(v.clone(), source).unwrap(),
+    )])
+}
+
+/// 区間の集合 `inner` が、範囲 `outer`（長さ `n` で `All` を開く）の中にあるか。
+fn spans_within(inner: &Spans, outer: &Area, n: u64) -> bool {
+    let outer = match outer.expand(&Shape::Audio {
+        rate: 1,
+        channels: 1,
+        frames: kura_engine::shape::Dim::Exact(n),
+    }) {
+        Area::All => return true,
+        Area::Samples(s) => s,
+        _ => Spans::new(),
+    };
+    inner
+        .spans()
+        .iter()
+        .all(|(a, b)| outer.spans().iter().any(|(c, d)| c <= a && b <= d))
+}
+
+/// 表示の値の有効なチャンクの区間（区間を含めて広げた推論の確かめに使う）。
+fn valid_spans(v: &View) -> Spans {
+    v.value().audio_valid().unwrap_or_default()
+}
+
+#[derive(Debug, Default)]
+struct AudioViewCounts {
+    steps: usize,
+    patched: usize,
+    reused: u64,
+    partial: usize,
+    kinds: BTreeMap<&'static str, usize>,
+}
+
+/// ランダムな音声の文書とランダムな手の列（引数・フェードの長さ・ループ点・ゲイン・トリムの終わり・正規化の目標・有効の
+/// 切り替え・構造の手・入力だけの変更）で、表示の窓をときどき動かし、キャッシュの上限 0・1 MiB・1 GiB で回す。
+fn audio_view_cases(engine: &Engine, seed: u64, cases: usize) -> AudioViewCounts {
+    let mut r = determinism::rng(seed);
+    let mut c = AudioViewCounts::default();
+    for case in 0..cases {
+        let make = random_audio_input(&mut r);
+        let mut input = make.generate().unwrap();
+        let len = 1 + below(&mut r, 5) as usize;
+        let mut g = random_audio_chain(engine, &mut r, &input.shape(), len);
+        let Some(plan) = compile(engine, &g, &input) else {
+            continue;
+        };
+        let source = Digest([7; 32]);
+        let Some((mut want, _)) = render(engine, &plan, &input, source) else {
+            continue;
+        };
+        let mut cache = NodeCache::new([0, 1 << 20, 1 << 30][case % 3]);
+        let first_area = random_audio_area(&mut r, frames_of(&want));
+        let first = engine
+            .render_view(
+                &plan,
+                &inputs_of(&input, source),
+                &mut cache,
+                &ViewRequest {
+                    output: OutputId(0),
+                    area: first_area.clone(),
+                    focus: None,
+                },
+                None,
+                &NoMonitor,
+            )
+            .unwrap();
+        check_region(first.view.value(), &want, &first_area).unwrap();
+        assert_eq!(first.changed, OutputChange::All);
+        let mut prev = first.view;
+        let mut area = first_area;
+        for _ in 0..5 {
+            // 6 回に 1 回は入力の値だけを替える
+            let (next, kind, next_input) = if below(&mut r, 6) == 0 {
+                let other = reseeded(&make, r.next_u64()).unwrap().generate().unwrap();
+                (g.clone(), "input", other)
+            } else {
+                let Some((next, kind)) = random_audio_edit(engine, &mut r, &g, &input.shape())
+                else {
+                    break;
+                };
+                (next, kind, input.clone())
+            };
+            let Some(next_plan) = compile(engine, &next, &next_input) else {
+                break;
+            };
+            let Some((next_want, warnings)) = render(engine, &next_plan, &next_input, source)
+            else {
+                break;
+            };
+            // ときどき表示の窓を動かす
+            if below(&mut r, 3) == 0 {
+                area = random_audio_area(&mut r, frames_of(&next_want));
+            }
+            let fin = inputs_of(&next_input, source);
+            let req = ViewRequest {
+                output: OutputId(0),
+                area: area.clone(),
+                focus: None,
+            };
+            let got = engine
+                .render_view(&next_plan, &fin, &mut cache, &req, Some(&prev), &NoMonitor)
+                .unwrap();
+            let what = format!(
+                "種 {seed}・{case} {kind}（{area:?}）\n前 {}\n後 {}",
+                String::from_utf8_lossy(&g.to_canonical_json().unwrap()),
+                String::from_utf8_lossy(&next.to_canonical_json().unwrap())
+            );
+            check_region(got.view.value(), &next_want, &area)
+                .unwrap_or_else(|m| panic!("{what}: {m}"));
+            assert_eq!((got.area.fallbacks, got.area.rebased), (0, 0), "{what}");
+            // 継ぎはぎは、まっさらに描いたもの（前の値なし）と同じ有効なチャンクを持つ
+            let fresh = engine
+                .render_area(
+                    &next_plan,
+                    &fin,
+                    &mut NodeCache::new(0),
+                    &AreaRequest {
+                        output: OutputId(0),
+                        area: area.clone(),
+                    },
+                    None,
+                    &NoMonitor,
+                )
+                .unwrap();
+            assert_eq!(
+                fresh.value.audio_valid(),
+                got.view.value().audio_valid(),
+                "{what}：表示の値は頼んだ区間のチャンクだけを持つ"
+            );
+            // 報告：前後を全体で描いた差を含み、推論と「前は無効で今は有効」の中にある
+            match &got.changed {
+                OutputChange::All => {}
+                OutputChange::Samples(s) => {
+                    check_contains(&want, &next_want, &Area::samples(s.clone()))
+                        .unwrap_or_else(|m| panic!("{what}: 報告の外が変わった：{m}"));
+                    // 「前は無効で今は有効」は今の有効なチャンクの中（ここではそれで広げて確かめる）
+                    let mut guess = got.inferred.clone();
+                    guess.union_with(&Area::samples(valid_spans(&got.view)));
+                    assert!(
+                        spans_within(s, &guess, frames_of(&next_want)),
+                        "{what}: 報告 {s:?} が推論 {:?} の外",
+                        got.inferred
+                    );
+                }
+                OutputChange::Tiles(_) => panic!("{what}: 音声にタイルの報告"),
+            }
+            // 前後を全体で描いた差は推論に入る
+            check_contains(&want, &next_want, &got.inferred)
+                .unwrap_or_else(|m| panic!("{what}: 推論の外が変わった：{m}"));
+            let same_meta = match (&want, &next_want) {
+                (Value::Audio(a), Value::Audio(b)) => a.meta == b.meta,
+                _ => false,
+            };
+            if !same_meta {
+                assert!(got.meta_changed, "{what}: メタデータの変化を報告しない");
+            }
+            let mut it = warnings.iter();
+            assert!(
+                got.warnings.iter().all(|w| it.any(|x| x == w)),
+                "{what}: 警告が部分列でない"
+            );
+            match got.view.value().origin() {
+                kura_engine::render::cache::Origin::Patched => {
+                    c.patched += 1;
+                    c.reused += got.area.reused_chunks;
+                    assert!(got.view.value().exact().is_none());
+                }
+                kura_engine::render::cache::Origin::Partial => c.partial += 1,
+                _ => {}
+            }
+            c.steps += 1;
+            *c.kinds.entry(kind).or_default() += 1;
+            (g, want, prev, input) = (next, next_want, got.view, next_input);
+        }
+    }
+    c
+}
+
+/// E38：表示の経路の値は `render` と同じチャンクを持ち、報告は差を含み推論の中にあり、継ぎはぎはまっさらに描いたものと同じ。
+#[test]
+fn audio_view_equals_render_on_random_edit_sequences() {
+    let c = audio_view_cases(&engine(), 38, 40);
+    assert!(
+        c.steps > 120 && c.patched > 20 && c.reused > 20 && c.partial > 10,
+        "{c:?}"
+    );
+    for kind in [
+        "gain", "fade", "loop", "target", "trim_end", "toggle", "input", "add", "remove",
+    ] {
+        assert!(
+            c.kinds.get(kind).copied().unwrap_or(0) > 0,
+            "{kind} が起きない：{c:?}"
+        );
+    }
+}
+
+/// E38：ランダムな音声の手で、前後を全体で描いた差は推論（`Engine::delta`）に入る（E31 の音声版）。
+#[test]
+fn audio_inferred_delta_contains_actual() {
+    let engine = engine();
+    let mut r = determinism::rng(31);
+    let mut checked = 0;
+    for _ in 0..80 {
+        let input = random_audio_input(&mut r).generate().unwrap();
+        let len = 1 + below(&mut r, 4) as usize;
+        let g = random_audio_chain(&engine, &mut r, &input.shape(), len);
+        let Some((next, kind)) = random_audio_edit(&engine, &mut r, &g, &input.shape()) else {
+            continue;
+        };
+        let (Some(a), Some(b)) = (
+            compile(&engine, &g, &input),
+            compile(&engine, &next, &input),
+        ) else {
+            continue;
+        };
+        let source = Digest::default();
+        let (Some((x, _)), Some((y, _))) = (
+            render(&engine, &a, &input, source),
+            render(&engine, &b, &input, source),
+        ) else {
+            continue;
+        };
+        let fin = inputs_of(&input, source);
+        let d = engine.delta(&a, &fin, &b, &fin).unwrap();
+        check_contains(&x, &y, &d.outputs[0].1).unwrap_or_else(|m| {
+            panic!(
+                "{kind}: {m}\n{}\n{}",
+                String::from_utf8_lossy(&g.to_canonical_json().unwrap()),
+                String::from_utf8_lossy(&next.to_canonical_json().unwrap())
+            )
+        });
+        checked += 1;
+    }
+    assert!(checked > 50, "{checked}");
+}
+
+/// 決まった鎖（ゲイン → ループ点）と、表示の窓（チャンク 1 を含む区間）。
+fn loop_doc(lp: (u64, u64)) -> Graph {
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -1.5 }), 1)
+        .unwrap();
+    g.push_linear(
+        "audio.set_loop",
+        1,
+        json!({ "loop": { "start": lp.0, "end": lp.1 } }),
+        2,
+    )
+    .unwrap();
+    g
+}
+
+/// E38：ループ点だけの手は、標本の報告が空で `meta_changed` が真、表示のチャンクを前の表示と共有する。
+#[test]
+fn loop_only_change_reports_no_samples() {
+    let engine = engine();
+    let input = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 2,
+        frames: 3 * C + 5,
+        seed: 3,
+    }
+    .generate()
+    .unwrap();
+    let source = Digest::default();
+    let fin = inputs_of(&input, source);
+    let area = Area::span(C - 10, 2 * C + 10);
+    let req = ViewRequest {
+        output: OutputId(0),
+        area: area.clone(),
+        focus: None,
+    };
+    for cap in [0, 1 << 30] {
+        let mut cache = NodeCache::new(cap);
+        let a = compile(&engine, &loop_doc((10, 500)), &input).unwrap();
+        let first = engine
+            .render_view(&a, &fin, &mut cache, &req, None, &NoMonitor)
+            .unwrap();
+        let b = compile(&engine, &loop_doc((20, 3 * C)), &input).unwrap();
+        let got = engine
+            .render_view(&b, &fin, &mut cache, &req, Some(&first.view), &NoMonitor)
+            .unwrap();
+        assert_eq!(
+            got.changed,
+            OutputChange::Samples(Spans::new()),
+            "上限 {cap}"
+        );
+        assert!(got.meta_changed);
+        assert_eq!(got.area.reused_chunks, 3, "上限 {cap}");
+        for k in 0..3 {
+            for ch in 0..2 {
+                assert!(
+                    got.view
+                        .value()
+                        .shares_audio_chunk(first.view.value(), ch, k),
+                    "上限 {cap}・チャンク {k}"
+                );
+            }
+        }
+        let (want, _) = render(&engine, &b, &input, source).unwrap();
+        check_region(got.view.value(), &want, &area).unwrap();
+    }
+}
+
+/// E38：表示の値は頼んだ区間のチャンクしか持たない（窓を動かすと、前の窓のチャンクを持ち越さない）。
+#[test]
+fn audio_view_keeps_only_requested_chunks() {
+    let engine = engine();
+    let input = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 1,
+        frames: 3 * C,
+        seed: 9,
+    }
+    .generate()
+    .unwrap();
+    let source = Digest::default();
+    let fin = inputs_of(&input, source);
+    let plan = compile(&engine, &loop_doc((1, 2)), &input).unwrap();
+    let mut cache = NodeCache::new(1 << 30);
+    let view = |area: Area, prev: Option<&View>, cache: &mut NodeCache| {
+        engine
+            .render_view(
+                &plan,
+                &fin,
+                cache,
+                &ViewRequest {
+                    output: OutputId(0),
+                    area,
+                    focus: None,
+                },
+                prev,
+                &NoMonitor,
+            )
+            .unwrap()
+    };
+    let a = view(Area::span(0, 10), None, &mut cache);
+    assert_eq!(a.view.value().audio_valid(), Some(Spans::one(0, C)));
+    let b = view(Area::span(2 * C + 1, 2 * C + 2), Some(&a.view), &mut cache);
+    assert_eq!(b.view.value().audio_valid(), Some(Spans::one(2 * C, 3 * C)));
+    assert_eq!(b.changed, OutputChange::Samples(Spans::one(2 * C, 3 * C)));
+    assert_eq!(b.view.value().resident_bytes(), C * 4);
+    // 同じ窓をもう一度：何も描かず、前の表示のチャンクを共有する
+    let c = view(Area::span(2 * C + 1, 2 * C + 2), Some(&b.view), &mut cache);
+    assert_eq!(c.changed, OutputChange::Samples(Spans::new()));
+    assert_eq!((c.area.drawn_chunks, c.area.reused_chunks), (0, 1));
 }
