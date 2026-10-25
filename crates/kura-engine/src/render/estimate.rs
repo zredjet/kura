@@ -611,6 +611,36 @@ impl Engine {
                 .collect(),
             ..RegionCost::default()
         };
+        // 描いた値が完全な値になるか（範囲の描画の前から描く道 `port_pass` と同じ判定）：外したノードは入力 0 のまま、当たりは
+        // 完全、音声の範囲を持つノードはすべてのチャンクが要り入力がどれも完全なら全体で描く、範囲を持たないノードは全体で描く
+        // （入力が部分の値なら全体で描き直す）。画像の範囲を持つノードは部分の値とみなす（音声の解析の入力にならない）。
+        // 流し解きは、申告した解析の入力がここで部分の値になるときだけ起きる（入力が完全なら値に当てて解く）
+        let mut complete: BTreeMap<NodeId, bool> = BTreeMap::new();
+        for node in plan.nodes.iter().filter(|n| walk.need.contains_key(&n.id)) {
+            let port_ok = |r: &PortRef, complete: &BTreeMap<NodeId, bool>| match r {
+                PortRef::Input { .. } => true,
+                PortRef::Node { id } => complete.get(id).copied().unwrap_or(false),
+            };
+            let c = if !node.enabled {
+                node.inputs.first().is_some_and(|r| port_ok(r, &complete))
+            } else if walk.hits.contains(&node.id) {
+                true
+            } else if let Some(rounded) = walk.regional.get(&node.id) {
+                let all_chunks = match node.inferred.shape {
+                    Shape::Audio {
+                        frames: crate::shape::Dim::Exact(n),
+                        ..
+                    } => usize::try_from(n).is_ok_and(|n| {
+                        super::audio::chunks_covering(rounded, n).count() == n.div_ceil(AUDIO_CHUNK)
+                    }),
+                    _ => false,
+                };
+                all_chunks && node.inputs.iter().all(|r| port_ok(r, &complete))
+            } else {
+                true
+            };
+            complete.insert(node.id, c);
+        }
         for (id, rounded) in &walk.regional {
             let Some(node) = index.get(id) else { continue };
             let Shape::Audio {
@@ -636,9 +666,9 @@ impl Engine {
                 let Some(r) = node.inputs.get(need.input) else {
                     continue;
                 };
-                let complete = match port_node(plan, &index, r) {
-                    None => true,
-                    Some(up) => hits.nodes.contains(&up),
+                let complete = match r {
+                    PortRef::Input { .. } => true,
+                    PortRef::Node { id } => complete.get(id).copied().unwrap_or(false),
                 };
                 let cached = match probe {
                     Some((cx, cache)) => {
@@ -921,20 +951,4 @@ impl std::fmt::Debug for CacheLease {
             .field("want", &self.want)
             .finish()
     }
-}
-
-/// ポートの値を作るノード（外したノードを通り抜けた先の有効なノード。計画の入力なら None）。
-fn port_node(plan: &Plan, index: &BTreeMap<NodeId, &PlannedNode>, r: &PortRef) -> Option<NodeId> {
-    let mut at = *r;
-    for _ in 0..=plan.nodes.len() {
-        let PortRef::Node { id } = at else {
-            return None;
-        };
-        let n = index.get(&id)?;
-        if n.enabled {
-            return Some(id);
-        }
-        at = *n.inputs.first()?;
-    }
-    None
 }
