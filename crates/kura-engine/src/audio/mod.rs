@@ -24,7 +24,18 @@ pub trait AudioKernel: Send + Sync {
     fn frames(&self) -> u64;
     /// 出力のチャンネル `ch` の、フレーム `start` から `out.len()` フレームを書く。
     /// 同じ位置にはいつも同じ値を書く（呼び方・区間の切り方によらない）。範囲は `frames()` の中であること。
-    fn render(&self, ch: usize, start: u64, out: &mut [f32]);
+    /// 入力は `Audio::read` で読み、その誤り（範囲の描画で描かなかったチャンクを読んだ `Internal`、源の読みの `Io`）を返す。
+    fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError>;
+    /// 出力が入力 0 をずらして写したもの（出力のフレーム i ＝ 入力 0 の同じチャンネルのフレーム i + off）なら Some(off)。
+    /// 実行器はずれと長さが合うチャンクを入力の実体で共有してよい。値は `render` と同じであること（E18）。既定は None。
+    fn passthrough(&self) -> Option<u64> {
+        None
+    }
+    /// メタデータを書く操作（`MetaAccess::Write`）が書く出力のメタデータ（`apply` の出力と同じもの）。写す操作
+    /// （`MetaAccess::Map`）は None（実行器が入力 0 のメタデータを写す）。既定は None。
+    fn meta(&self) -> Option<AudioMeta> {
+        None
+    }
 }
 
 /// 核の出力の全体を描いて値にする（メタデータは `meta` を付ける。写し方は実行器が当て直す）。
@@ -41,7 +52,7 @@ pub fn render_all(
             let start = b * AUDIO_BLOCK;
             let end = start.saturating_add(AUDIO_BLOCK).min(frames);
             let mut out = crate::codec::try_vec(end - start, 0f32)?;
-            k.render(ch, start as u64, &mut out);
+            k.render(ch, start as u64, &mut out)?;
             Ok(out)
         })?;
         let mut plane: Vec<f32> = Vec::new();
@@ -69,7 +80,7 @@ pub fn render_all_work(out: &crate::shape::Shape) -> crate::op::Work {
     }
 }
 
-/// 入力をそのまま写す核（メタデータだけを書く操作が使う）。
+/// 入力をそのまま写す核（何も変えない引数の操作と、メタデータだけを書く操作が使う）。
 pub struct Identity(pub Arc<Audio>);
 
 impl AudioKernel for Identity {
@@ -85,20 +96,44 @@ impl AudioKernel for Identity {
         self.0.frames() as u64
     }
 
-    fn render(&self, ch: usize, start: u64, out: &mut [f32]) {
-        copy_from(&self.0.planes()[ch], start, out);
+    fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+        self.0.read(ch, start, out)
+    }
+
+    fn passthrough(&self) -> Option<u64> {
+        Some(0)
     }
 }
 
-/// `plane[start..]` から `out.len()` 個を写す。範囲の外は 0。
-pub fn copy_from(plane: &[f32], start: u64, out: &mut [f32]) {
-    let start = usize::try_from(start).unwrap_or(usize::MAX);
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = start
-            .checked_add(i)
-            .and_then(|k| plane.get(k))
-            .copied()
-            .unwrap_or(0.0);
+/// メタデータを書く操作の核：標本は入力のまま、メタデータは `meta`（`audio.set_loop` が使う）。
+pub struct WithMeta {
+    pub audio: Arc<Audio>,
+    pub meta: AudioMeta,
+}
+
+impl AudioKernel for WithMeta {
+    fn rate(&self) -> u32 {
+        self.audio.rate()
+    }
+
+    fn channels(&self) -> usize {
+        self.audio.channels()
+    }
+
+    fn frames(&self) -> u64 {
+        self.audio.frames() as u64
+    }
+
+    fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+        self.audio.read(ch, start, out)
+    }
+
+    fn passthrough(&self) -> Option<u64> {
+        Some(0)
+    }
+
+    fn meta(&self) -> Option<AudioMeta> {
+        Some(self.meta.clone())
     }
 }
 
@@ -151,9 +186,9 @@ impl AudioKernel for Quantizer<'_> {
         self.audio.frames() as u64
     }
 
-    fn render(&self, ch: usize, start: u64, out: &mut [f32]) {
+    fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
         use rand_chacha::rand_core::Rng;
-        copy_from(&self.audio.planes()[ch], start, out);
+        self.audio.read(ch, start, out)?;
         // 区間の始まりの位置へシークして順に取る（標本ごとにシークしたものと同じ値）
         let mut rng = self
             .seed
@@ -173,6 +208,7 @@ impl AudioKernel for Quantizer<'_> {
             };
             *s = (q / self.scale) as f32;
         }
+        Ok(())
     }
 }
 

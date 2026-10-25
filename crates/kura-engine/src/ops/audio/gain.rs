@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::audio::{AudioKernel, copy_from, render_all};
+use crate::audio::{AudioKernel, Identity, render_all};
 use crate::error::{EngineError, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::math;
@@ -76,11 +76,12 @@ impl AudioKernel for GainKernel {
         self.audio.frames() as u64
     }
 
-    fn render(&self, ch: usize, start: u64, out: &mut [f32]) {
-        copy_from(&self.audio.planes()[ch], start, out);
+    fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+        self.audio.read(ch, start, out)?;
         for s in out.iter_mut() {
             *s = (f64::from(*s) * self.factor) as f32;
         }
+        Ok(())
     }
 }
 
@@ -142,10 +143,14 @@ impl Op for Gain {
         inputs: &[&Value],
         _cx: &mut ApplyCx<'_>,
     ) -> Option<Result<Box<dyn AudioKernel>, EngineError>> {
-        Some(
-            audio_of(inputs[0], Self::ID)
-                .map(|a| Box::new(GainKernel::new(a.clone(), p.db)) as Box<dyn AudioKernel>),
-        )
+        // 0 dB は apply と同じく何も変えない（同じ実体。NaN の符号化まで入力のまま）
+        Some(audio_of(inputs[0], Self::ID).map(|a| {
+            if p.db == 0.0 {
+                Box::new(Identity(a.clone())) as Box<dyn AudioKernel>
+            } else {
+                Box::new(GainKernel::new(a.clone(), p.db))
+            }
+        }))
     }
 
     fn examples() -> Vec<Example<GainParams>> {

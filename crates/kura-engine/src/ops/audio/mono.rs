@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio::{AudioKernel, copy_from, render_all};
+use crate::audio::{AudioKernel, Identity, render_all};
 use crate::error::{EngineError, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::op::{
@@ -52,17 +52,13 @@ impl AudioKernel for MonoKernel {
         self.audio.frames() as u64
     }
 
-    fn render(&self, _ch: usize, start: u64, out: &mut [f32]) {
-        let planes = self.audio.planes();
-        if planes.len() == 1 {
-            copy_from(&planes[0], start, out);
-            return;
-        }
-        let n = planes.len() as f64;
-        let mut buf = vec![0f32; out.len()];
-        let mut sum = vec![0f64; out.len()];
-        for plane in planes {
-            copy_from(plane, start, &mut buf);
+    fn render(&self, _ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+        let channels = self.audio.channels();
+        let n = channels as f64;
+        let mut buf = crate::codec::try_vec(out.len(), 0f32)?;
+        let mut sum = crate::codec::try_vec(out.len(), 0f64)?;
+        for ch in 0..channels {
+            self.audio.read(ch, start, &mut buf)?;
             for (acc, v) in sum.iter_mut().zip(&buf) {
                 *acc += f64::from(*v);
             }
@@ -70,6 +66,7 @@ impl AudioKernel for MonoKernel {
         for (o, s) in out.iter_mut().zip(sum) {
             *o = (s / n) as f32;
         }
+        Ok(())
     }
 }
 
@@ -132,10 +129,14 @@ impl Op for Mono {
         inputs: &[&Value],
         _cx: &mut ApplyCx<'_>,
     ) -> Option<Result<Box<dyn AudioKernel>, EngineError>> {
-        Some(
-            audio_of(inputs[0], Self::ID)
-                .map(|a| Box::new(MonoKernel { audio: a.clone() }) as Box<dyn AudioKernel>),
-        )
+        // 1 チャンネルは apply と同じく何も変えない（同じ実体）
+        Some(audio_of(inputs[0], Self::ID).map(|a| {
+            if a.channels() == 1 {
+                Box::new(Identity(a.clone())) as Box<dyn AudioKernel>
+            } else {
+                Box::new(MonoKernel { audio: a.clone() })
+            }
+        }))
     }
 
     fn examples() -> Vec<Example<MonoParams>> {

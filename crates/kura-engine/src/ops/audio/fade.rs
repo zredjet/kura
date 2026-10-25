@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::audio::{AudioKernel, copy_from, render_all};
+use crate::audio::{AudioKernel, Identity, render_all};
 use crate::error::{EngineError, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::math;
@@ -119,14 +119,15 @@ impl AudioKernel for FadeKernel {
         self.audio.frames() as u64
     }
 
-    fn render(&self, ch: usize, start: u64, out: &mut [f32]) {
-        copy_from(&self.audio.planes()[ch], start, out);
+    fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+        self.audio.read(ch, start, out)?;
         for (k, s) in out.iter_mut().enumerate() {
             let g = self.gain(start + k as u64);
             if g != 1.0 {
                 *s = (f64::from(*s) * g) as f32;
             }
         }
+        Ok(())
     }
 }
 
@@ -213,7 +214,14 @@ impl Op for Fade {
         inputs: &[&Value],
         _cx: &mut ApplyCx<'_>,
     ) -> Option<Result<Box<dyn AudioKernel>, EngineError>> {
-        Some(kernel(p, inputs).map(|k| Box::new(k) as Box<dyn AudioKernel>))
+        // 長さ 0・0 は apply と同じく何も変えない（同じ実体。長さの確かめは同じく先に行う）
+        Some(kernel(p, inputs).map(|k| {
+            if p.fade_in == 0 && p.fade_out == 0 {
+                Box::new(Identity(k.audio)) as Box<dyn AudioKernel>
+            } else {
+                Box::new(k)
+            }
+        }))
     }
 
     fn examples() -> Vec<Example<FadeParams>> {

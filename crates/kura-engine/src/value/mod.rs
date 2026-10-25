@@ -201,7 +201,42 @@ impl Audio {
     pub fn planes(&self) -> &[Arc<Vec<f32>>] {
         &self.planes
     }
+
+    /// 標本の実体を共有したまま、メタデータだけを `meta` にした値。
+    pub fn with_meta(&self, meta: AudioMeta) -> Self {
+        Self {
+            rate: self.rate,
+            planes: self.planes.clone(),
+            meta,
+        }
+    }
+
+    /// チャンネル `ch` のフレーム `start` から `out.len()` 個を `out` に写す（範囲の外は 0）。チャンネルが範囲の外なら
+    /// `Internal`。核が入力を読む口（段 1 の後半で、範囲の描画で描かなかったチャンクを読めば `Internal`、源の読みの誤りは
+    /// `Io` を返す）。
+    pub fn read(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+        let Some(plane) = self.planes.get(ch) else {
+            return Err(EngineError::Internal(format!(
+                "音声のチャンネル {ch} はありません（{} チャンネル）",
+                self.planes.len()
+            )));
+        };
+        let start = usize::try_from(start).unwrap_or(usize::MAX);
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = start
+                .checked_add(i)
+                .and_then(|k| plane.get(k))
+                .copied()
+                .unwrap_or(0.0);
+        }
+        Ok(())
+    }
 }
+
+/// 音声のチャンクのフレーム数（M13。正規の区切り [k·C, (k+1)·C)）。並列の分け方と同じく値に効かない定数で、
+/// どの約束の形式（ダイジェスト・kura-peaks・配信の URL）にも出さない。`AUDIO_BLOCK`（4,096）・`SUM_BLOCK`（4,096）・
+/// `DIGEST_CHUNK`（16,384）の倍数で、波形の段の最も粗いビン（65,536）と同じ。
+pub const AUDIO_CHUNK: usize = 1 << 16;
 
 /// 操作の入出力の値。
 #[derive(Debug, Clone, PartialEq)]

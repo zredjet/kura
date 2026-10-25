@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::audio::{AudioKernel, copy_from, render_all};
+use crate::audio::{AudioKernel, render_all};
 use crate::error::{EngineError, Issues};
 use crate::mapping::{Seg, SpaceMap, TimeMap};
 use crate::op::{
@@ -93,12 +93,12 @@ impl AudioKernel for TrimKernel {
         self.frames
     }
 
-    fn render(&self, ch: usize, start: u64, out: &mut [f32]) {
-        copy_from(
-            &self.audio.planes()[ch],
-            self.start.saturating_add(start),
-            out,
-        );
+    fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+        self.audio.read(ch, self.start.saturating_add(start), out)
+    }
+
+    fn passthrough(&self) -> Option<u64> {
+        Some(self.start)
     }
 }
 

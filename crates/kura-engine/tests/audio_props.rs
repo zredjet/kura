@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use kura_engine::analysis::loudness;
+use kura_engine::audio::AudioKernel;
 use kura_engine::codec::CodecSet;
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::render_value;
@@ -176,17 +177,26 @@ fn e17_integer_round_trips() {
     }
 }
 
-/// E18：区間ごとに描いても（チャンク 1・7・4,096・全体）値が同じ。音声を出すすべての操作の例で確かめる。
+/// E18 の例を 1 つずつ核と apply で描く：(操作, 例の名前, 入力, apply の結果と警告, 核と核を作ったときの警告)。
+/// 持ち上げ（フレームの列の各フレームに当てる）は実行器が行うので、その例だけは apply を直に呼べない（飛ばす）。
+/// ほかは入力の種類によらず apply し、出力が音声なら核を求める（音声以外から音声を出す操作も網に掛ける）。
 /// 音声を出すのに核（`Op::audio_kernel`）を返さない操作は失敗にする（核を書き忘れた操作が網から抜けないように）。
-#[test]
-fn e18_chunked_rendering_matches() {
+fn for_each_audio_example(
+    mut f: impl FnMut(
+        &str,
+        &str,
+        &[Value],
+        &Arc<Audio>,
+        &[kura_engine::Issue],
+        &dyn AudioKernel,
+        &[kura_engine::Issue],
+    ),
+) -> usize {
     let engine = Engine::new().unwrap();
-    let (mut audio_examples, mut checked) = (0, 0);
+    let mut checked = 0;
     for op in engine.registry().all() {
         for ex in op.examples().unwrap() {
             let inputs: Vec<Value> = ex.inputs.iter().map(|g| g.generate().unwrap()).collect();
-            // 持ち上げ（フレームの列の各フレームに当てる）は実行器が行うので、その例だけは apply を直に呼べない。
-            // ほかは入力の種類によらず apply し、出力が音声なら核を求める（音声以外から音声を出す操作も網に掛ける）
             let lifted = op.signature().lift != kura_engine::op::Lift::None
                 && inputs.iter().any(|v| matches!(v, Value::Frames(_)));
             if lifted {
@@ -201,40 +211,188 @@ fn e18_chunked_rendering_matches() {
             let Value::Audio(whole) = &whole else {
                 continue;
             };
-            audio_examples += 1;
-            let Some(kernel) = op.audio_kernel(params.as_ref(), &refs, &mut cx) else {
+            let mut kcx =
+                kura_engine::op::ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
+            let Some(kernel) = op.audio_kernel(params.as_ref(), &refs, &mut kcx) else {
                 panic!("{} {}：音声を出すのに核がありません", op.id(), ex.name);
             };
             let kernel = kernel.unwrap_or_else(|e| panic!("{} {}: {e}", op.id(), ex.name));
-            let shape = (kernel.rate(), kernel.channels(), kernel.frames());
-            let want_shape = (whole.rate(), whole.channels(), whole.frames() as u64);
-            assert_eq!(shape, want_shape, "{} {}", op.id(), ex.name);
-            for chunk in [1usize, 7, 4_096, usize::MAX] {
-                for ch in 0..kernel.channels() {
-                    let len = kernel.frames() as usize;
-                    let mut got = vec![0f32; len];
-                    let mut start = 0usize;
-                    while start < len {
-                        let end = start.saturating_add(chunk).min(len);
-                        kernel.render(ch, start as u64, &mut got[start..end]);
-                        start = end;
-                    }
-                    let want = &whole.planes()[ch][..];
-                    assert!(
-                        got.iter()
-                            .zip(want)
-                            .all(|(a, b)| a.to_bits() == b.to_bits()),
-                        "{} {}：チャンク {chunk}・チャンネル {ch} で値が違う",
-                        op.id(),
-                        ex.name
-                    );
-                }
-            }
+            f(
+                op.id(),
+                ex.name,
+                &inputs,
+                whole,
+                &cx.warnings,
+                kernel.as_ref(),
+                &kcx.warnings,
+            );
             checked += 1;
         }
     }
-    assert_eq!(checked, audio_examples);
+    checked
+}
+
+/// 音声のチャンクの長さ（E18 の区切りに使う）。
+const C: usize = kura_engine::value::AUDIO_CHUNK;
+
+/// E18：区間ごとに描いても（チャンク 1・7・4,096・C−1・C・C+1・全体。C は音声のチャンク）値が同じ。音声を出すすべての
+/// 操作の例（旧版・退役を含む登録表の全部）で確かめる。
+#[test]
+fn e18_chunked_rendering_matches() {
+    let checked = for_each_audio_example(|op, name, _inputs, whole, _, kernel, _| {
+        let shape = (kernel.rate(), kernel.channels(), kernel.frames());
+        let want_shape = (whole.rate(), whole.channels(), whole.frames() as u64);
+        assert_eq!(shape, want_shape, "{op} {name}");
+        for chunk in [1usize, 7, 4_096, C - 1, C, C + 1, usize::MAX] {
+            for ch in 0..kernel.channels() {
+                let len = kernel.frames() as usize;
+                let mut got = vec![0f32; len];
+                let mut start = 0usize;
+                while start < len {
+                    let end = start.saturating_add(chunk).min(len);
+                    kernel
+                        .render(ch, start as u64, &mut got[start..end])
+                        .unwrap_or_else(|e| panic!("{op} {name}: {e}"));
+                    start = end;
+                }
+                let want = &whole.planes()[ch][..];
+                assert!(
+                    got.iter()
+                        .zip(want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{op} {name}：チャンク {chunk}・チャンネル {ch} で値が違う"
+                );
+            }
+        }
+    });
     assert!(checked > 0);
+}
+
+/// E18（M13 段 1）：核の約束のうち値でないもの。核のメタデータ（`meta()`、なければ入力 0 のもの。写し方は実行器が当て
+/// 直す）と、核を作るときの警告は `apply` と同じ。`apply` が断る引数は、核を作るときにも同じ誤りで断る。
+#[test]
+fn kernel_meta_warnings_and_errors_match_apply() {
+    let mut warned = 0;
+    let checked = for_each_audio_example(|op, name, inputs, whole, warnings, kernel, kwarnings| {
+        let input_meta = match inputs.first() {
+            Some(Value::Audio(a)) => a.meta.clone(),
+            _ => AudioMeta::default(),
+        };
+        let meta = kernel.meta().unwrap_or(input_meta);
+        assert_eq!(meta, whole.meta, "{op} {name}：メタデータが apply と違う");
+        assert_eq!(kwarnings, warnings, "{op} {name}：警告が apply と違う");
+        warned += usize::from(!warnings.is_empty());
+    });
+    assert!(checked > 0);
+    // 正規化の GainLimited・LoudnessUnmeasurable の例が網に入っている
+    assert!(warned >= 2, "{warned}");
+
+    // apply が断る引数
+    let short = noise(48_000, 2, 100, 1);
+    let cases: Vec<(&str, serde_json::Value, Value)> = vec![
+        (
+            "audio.trim",
+            json!({ "start": 10, "end": 5 }),
+            short.clone(),
+        ),
+        (
+            "audio.trim",
+            json!({ "start": 0, "end": 101 }),
+            short.clone(),
+        ),
+        (
+            "audio.fade",
+            json!({ "fadeIn": 101, "fadeOut": 0, "curve": "linear" }),
+            short.clone(),
+        ),
+        (
+            "audio.fade",
+            json!({ "fadeIn": 0, "fadeOut": 101, "curve": "equalPower" }),
+            short.clone(),
+        ),
+        (
+            "audio.set_loop",
+            json!({ "loop": { "start": 10, "end": 101 } }),
+            short.clone(),
+        ),
+        // 係数の表が大きすぎる
+        (
+            "audio.resample",
+            json!({ "rate": 191_999 }),
+            noise(192_000, 1, 10, 2),
+        ),
+        // 変換すると 0 フレーム
+        (
+            "audio.resample",
+            json!({ "rate": 8_000 }),
+            noise(192_000, 1, 1, 3),
+        ),
+    ];
+    let engine = Engine::new().unwrap();
+    for (id, params, input) in cases {
+        let op = engine
+            .registry()
+            .all()
+            .into_iter()
+            .find(|o| o.id() == id && o.version() == 1)
+            .unwrap();
+        let p = op
+            .parse(&params)
+            .unwrap_or_else(|e| panic!("{id} {params}: {e:?}"));
+        let limits = Limits::default();
+        let mut cx = kura_engine::op::ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
+        let applied = op.apply(p.as_ref(), &[&input], &mut cx);
+        let Err(want) = applied else {
+            panic!("{id} {params}：apply が断らない");
+        };
+        let mut kcx =
+            kura_engine::op::ApplyCx::new(&NoMonitor, &limits, 0, kura_engine::doc::RULES);
+        match op.audio_kernel(p.as_ref(), &[&input], &mut kcx) {
+            Some(Err(got)) => assert_eq!(got.to_string(), want.to_string(), "{id} {params}"),
+            Some(Ok(_)) => panic!("{id} {params}：核が断らない（apply は {want}）"),
+            None => panic!("{id}：核がない"),
+        }
+    }
+}
+
+/// E18（M13 段 1）：`passthrough` が Some(off) の核の出力は、入力 0 の同じチャンネルを off ずらして写したもの（ビット一致）。
+/// 実行器はこれを使ってチャンクを入力の実体で共有する。ずらす核（trim）とずらさない核（恒等）が網に入っていること。
+#[test]
+fn passthrough_is_a_shifted_copy() {
+    let (mut shifted, mut same) = (0, 0);
+    for_each_audio_example(|op, name, inputs, _whole, _, kernel, _| {
+        let Some(off) = kernel.passthrough() else {
+            return;
+        };
+        let Some(Value::Audio(src)) = inputs.first() else {
+            panic!("{op} {name}：passthrough なのに入力 0 が音声でない");
+        };
+        assert_eq!(kernel.channels(), src.channels(), "{op} {name}");
+        assert_eq!(kernel.rate(), src.rate(), "{op} {name}");
+        let n = kernel.frames() as usize;
+        let off = usize::try_from(off).unwrap();
+        assert!(
+            off + n <= src.frames(),
+            "{op} {name}：ずらした写しが入力の外"
+        );
+        for ch in 0..kernel.channels() {
+            let mut got = vec![0f32; n];
+            kernel.render(ch, 0, &mut got).unwrap();
+            let want = &src.planes()[ch][off..off + n];
+            assert!(
+                got.iter()
+                    .zip(want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{op} {name}：チャンネル {ch} がずらした写しでない"
+            );
+        }
+        if off == 0 {
+            same += 1;
+        } else {
+            shifted += 1;
+        }
+    });
+    assert!(shifted > 0 && same > 0, "{shifted} {same}");
 }
 
 /// EBU Tech 3341 の試験信号：1 kHz の正弦波を、区間ごとの dBFS（ピーク）で、全チャンネルに同相で入れる。

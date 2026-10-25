@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::audio::resample::{Filter, design, out_frames, ratio, table_len, taps};
+use crate::audio::resample::{Filter, design, out_frames, ratio, source_window, table_len, taps};
 use crate::audio::{AudioKernel, render_all};
 use crate::error::{EngineError, IssueCode, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
@@ -92,11 +92,26 @@ impl AudioKernel for ResampleKernel {
         self.frames
     }
 
-    fn render(&self, ch: usize, start: u64, out: &mut [f32]) {
-        let plane = &self.audio.planes()[ch];
+    fn render(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
+        let Some(last) = (out.len() as u64).checked_sub(1) else {
+            return Ok(());
+        };
+        // 出力の区間が読む入力の窓を 1 回で作業列へ読む（入力の長さで切る。外は足さない）
+        let total = self.audio.frames() as u64;
+        let h = (self.filter.k / 2) as u64;
+        let end = start.saturating_add(last).saturating_add(1);
+        let (lo, hi) = source_window(self.filter.l, self.filter.m, h, start, end);
+        let hi = hi.min(total);
+        let len = usize::try_from(hi.saturating_sub(lo))
+            .map_err(|_| EngineError::Limit("変換の窓が大きすぎます".into()))?;
+        let mut win = crate::codec::try_vec(len, 0f32)?;
+        self.audio.read(ch, lo, &mut win)?;
         for (k, o) in out.iter_mut().enumerate() {
-            *o = self.filter.output(plane, start + k as u64);
+            *o = self
+                .filter
+                .output_window(&win, lo, total, start + k as u64)?;
         }
+        Ok(())
     }
 }
 

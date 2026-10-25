@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::audio::{AudioKernel, Identity};
+use crate::audio::{AudioKernel, WithMeta};
 use crate::error::{EngineError, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::op::{
@@ -17,7 +17,7 @@ use crate::ops::util::{audio_of, audio_shape, bad_param};
 use crate::render::region::{Area, Reach};
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::InputGen;
-use crate::value::{Audio, LoopRange, Value};
+use crate::value::{Audio, AudioMeta, LoopRange, Value};
 
 /// ループの区間（引数の型。メタデータの型は流用しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +57,21 @@ fn bad_range() -> Issues {
 
 fn fits(r: FrameRange, n: u64) -> bool {
     r.start < r.end && r.end <= n
+}
+
+/// 出力のメタデータ（入力のメタデータのループ点を引数のものにする）。区間が長さを超えれば断る（`apply` と核で同じ）。
+fn loop_meta(p: &SetLoopParams, audio: &Audio) -> Result<AudioMeta, EngineError> {
+    if let Some(r) = p.range
+        && !fits(r, audio.frames() as u64)
+    {
+        return Err(EngineError::Invalid(bad_range()));
+    }
+    let mut meta = audio.meta.clone();
+    meta.loop_range = p.range.map(|r| LoopRange {
+        start: r.start,
+        end: r.end,
+    });
+    Ok(meta)
 }
 
 impl Op for SetLoop {
@@ -104,30 +119,26 @@ impl Op for SetLoop {
     ) -> Result<Applied, EngineError> {
         cx.check()?;
         let audio = audio_of(inputs[0], Self::ID)?;
-        if let Some(r) = p.range
-            && !fits(r, audio.frames() as u64)
-        {
-            return Err(EngineError::Invalid(bad_range()));
-        }
-        let mut meta = audio.meta.clone();
-        meta.loop_range = p.range.map(|r| LoopRange {
-            start: r.start,
-            end: r.end,
-        });
+        let meta = loop_meta(p, audio)?;
         // 標本の実体は共有する
-        let out = Audio::new(audio.rate(), audio.planes().to_vec(), meta)?;
-        Ok(Applied::value(Value::Audio(std::sync::Arc::new(out))))
+        Ok(Applied::value(Value::Audio(std::sync::Arc::new(
+            audio.with_meta(meta),
+        ))))
     }
 
     fn audio_kernel(
-        _p: &SetLoopParams,
+        p: &SetLoopParams,
         inputs: &[&Value],
         _cx: &mut ApplyCx<'_>,
     ) -> Option<Result<Box<dyn AudioKernel>, EngineError>> {
-        Some(
-            audio_of(inputs[0], Self::ID)
-                .map(|a| Box::new(Identity(a.clone())) as Box<dyn AudioKernel>),
-        )
+        let run = || -> Result<Box<dyn AudioKernel>, EngineError> {
+            let audio = audio_of(inputs[0], Self::ID)?;
+            Ok(Box::new(WithMeta {
+                meta: loop_meta(p, audio)?,
+                audio: audio.clone(),
+            }))
+        };
+        Some(run())
     }
 
     fn examples() -> Vec<Example<SetLoopParams>> {

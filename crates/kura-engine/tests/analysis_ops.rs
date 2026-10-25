@@ -432,10 +432,10 @@ impl<O: Op> Op for KernelOf<O> {
     ) -> Result<Applied, EngineError> {
         let kernel = O::audio_kernel(p, inputs, cx)
             .ok_or_else(|| EngineError::Internal(format!("{} に核がありません", O::ID)))??;
-        let meta = match inputs.first() {
+        let meta = kernel.meta().unwrap_or_else(|| match inputs.first() {
             Some(Value::Audio(a)) => a.meta.clone(),
             _ => AudioMeta::default(),
-        };
+        });
         Ok(Applied::value(render_all(kernel.as_ref(), meta, cx.mon)?))
     }
 

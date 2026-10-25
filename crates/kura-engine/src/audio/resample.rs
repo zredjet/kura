@@ -168,8 +168,16 @@ pub fn design(from: u32, to: u32, mon: &dyn Monitor) -> Result<Filter, EngineErr
 }
 
 impl Filter {
-    /// 出力 n の値（`plane` は入力のチャンネル）。
-    pub fn output(&self, plane: &[f32], n: u64) -> f32 {
+    /// 出力 n の値。`win` は入力のチャンネルの `[win_start, win_start + win.len())` を写したもの、`total_len` は入力の
+    /// 長さ。窓は出力 n が読む入力の範囲（`source_window` を入力の長さで切ったもの）を含むこと（足りなければ `Internal`）。
+    /// 値は入力全体を渡したとき（`win_start` = 0・`win` = 入力）と同じ：同じ項を同じ順に足す。
+    pub fn output_window(
+        &self,
+        win: &[f32],
+        win_start: u64,
+        total_len: u64,
+        n: u64,
+    ) -> Result<f32, EngineError> {
         let num = u128::from(n) * u128::from(self.m);
         let i = num / u128::from(self.l);
         let p = (num % u128::from(self.l)) as usize;
@@ -179,12 +187,17 @@ impl Filter {
         let mut acc = 0f64;
         // 範囲の外の入力（0）は足しても値が変わらない（acc は +0 から始まるので −0 にならない）ので飛ばす
         let lo = (-base).clamp(0, self.k as i128) as usize;
-        let hi = (plane.len() as i128 - base).clamp(0, self.k as i128) as usize;
-        for kk in lo..hi.max(lo) {
-            let x = plane[(base + kk as i128) as usize];
-            acc += row[kk] * f64::from(x);
+        let hi = (i128::from(total_len) - base).clamp(0, self.k as i128) as usize;
+        for (kk, c) in row.iter().enumerate().take(hi.max(lo)).skip(lo) {
+            let at = base + kk as i128 - i128::from(win_start);
+            let Some(x) = usize::try_from(at).ok().and_then(|at| win.get(at)) else {
+                return Err(EngineError::Internal(
+                    "変換の窓が出力の読む範囲を含みません".into(),
+                ));
+            };
+            acc += c * f64::from(*x);
         }
-        acc as f32
+        Ok(acc as f32)
     }
 }
 
@@ -257,7 +270,7 @@ mod tests {
         }
         let plane = vec![0.25f32; 4_000];
         for n in 300..4_000u64 {
-            assert_eq!(f.output(&plane, n), 0.25);
+            assert_eq!(f.output_window(&plane, 0, 4_000, n).unwrap(), 0.25);
         }
     }
 
