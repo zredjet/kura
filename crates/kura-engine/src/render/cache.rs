@@ -1064,6 +1064,19 @@ pub(super) fn quantized_output(
     Ok(v)
 }
 
+/// 流して解いた解析の結果を入れる（範囲の描画の流し解き。大きさは解析の見積もり。M13 段 1）。
+pub(super) fn insert_analysis(cache: &mut NodeCache, key: Fingerprint, out: AnyOutput, bytes: u64) {
+    cache.stats.analysis_solved += 1;
+    cache.insert(
+        key,
+        Stored::Analysis(out),
+        Origin::Exact,
+        Vec::new(),
+        Vec::new(),
+        bytes,
+    );
+}
+
 /// 申告した解析をキャッシュから引き、なければ既定の解き方で解いて入れる。`verify` なら当たっても解き直して照らす。
 pub(super) fn solve_cached(
     cache: &mut NodeCache,

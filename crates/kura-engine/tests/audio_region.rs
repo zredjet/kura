@@ -478,6 +478,79 @@ fn partial_values_deliver_only_drawn_chunks() {
     assert_eq!(got.stats.drawn_chunks, 1);
 }
 
+/// E37：trim → normalize の範囲の描画は、normalize の計測（入力は trim の出力の部分の値）を、trim の出力を窓ごとに描いて
+/// 流して解く（流し解き）。結果は `render` と同じで、キャッシュに入った計測は次の描画で使う（流し直さない）。
+#[test]
+fn normalize_region_presolves_its_measurement() {
+    let engine = engine();
+    let input = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 2,
+        frames: 4 * C + 17,
+        seed: 12,
+    }
+    .generate()
+    .unwrap();
+    let mut g = Graph::new_single();
+    g.push_linear("audio.trim", 1, json!({ "start": 1_234, "end": 4 * C }), 1)
+        .unwrap();
+    g.push_linear(
+        "audio.normalize",
+        1,
+        json!({ "target": -20.0, "peakLimit": -2.0 }),
+        2,
+    )
+    .unwrap();
+    g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 3)
+        .unwrap();
+    let plan = compile(&engine, &g, &input).unwrap();
+    let source = Digest([2; 32]);
+    let (want, warnings) = render(&engine, &plan, &input, source).unwrap();
+    for (resident, cap) in [(true, 0u64), (true, 1 << 30), (false, 1 << 30)] {
+        let value = if resident {
+            input.clone()
+        } else {
+            lazy(&input)
+        };
+        let fin = BTreeMap::from([(InputId(0), FingerprintedInput::new(value, source).unwrap())]);
+        let mut cache = NodeCache::new(cap);
+        for (round, area) in [Area::span(C + 5, C + 6), Area::span(3 * C - 2, 3 * C + 2)]
+            .into_iter()
+            .enumerate()
+        {
+            let got = engine
+                .render_area(
+                    &plan,
+                    &fin,
+                    &mut cache,
+                    &AreaRequest {
+                        output: OutputId(0),
+                        area: area.clone(),
+                    },
+                    None,
+                    &NoMonitor,
+                )
+                .unwrap();
+            let what = format!("常駐 {resident}・上限 {cap}・{round} 回目");
+            check_region(&got.value, &want, &area).unwrap_or_else(|m| panic!("{what}: {m}"));
+            assert_eq!(got.stats.fallbacks, 0, "{what}");
+            // normalize は範囲で描く（全体で描くのは、流し解きの窓の中の全体の描画だけ。その trim はキャッシュに入り、次の
+            // 描画では当たる）
+            assert_eq!(
+                got.stats.region_nodes + got.stats.hits,
+                3,
+                "{what}: {:?}",
+                got.stats
+            );
+            let presolved = if cap > 0 && round > 0 { 0 } else { 1 };
+            assert_eq!(got.stats.presolved, presolved, "{what}");
+            let mut it = warnings.iter();
+            assert!(got.warnings.iter().all(|w| it.any(|x| x == w)), "{what}");
+            assert!(!got.warnings.is_empty() || warnings.is_empty(), "{what}");
+        }
+    }
+}
+
 // ---- E38：音声の継ぎはぎと変わった区間（表示の経路） ----
 
 use kura_engine::render::delta::OutputChange;

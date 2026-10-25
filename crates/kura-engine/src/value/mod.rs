@@ -277,32 +277,17 @@ pub(crate) fn audio_digest(
     a: &Audio,
     check: &mut dyn FnMut() -> Result<(), EngineError>,
 ) -> Result<Digest, EngineError> {
-    let mut h = Hasher::new("kura-pcm-v1");
-    h.u32(a.rate())
-        .u32(a.channels() as u32)
-        .u64(a.frames() as u64);
-    // 標本のビット列を DIGEST_CHUNK 個ずつまとめて足す（BLAKE3 は流れのハッシュなので、まとめ方で値は
-    // 変わらない。4 バイトずつ足すと 3 分のステレオで 0.15 秒かかっていた）
-    // チャンネルの順に、各チャンネルのチャンクを番号の順にたどる。チャンクの区切りは DIGEST_CHUNK の倍数なので、まとめる
-    // 塊の区切りと確かめを呼ぶ位置・数は、チャンネルを 1 本の列として DIGEST_CHUNK ずつ区切ったものと同じ
-    let mut buf = Vec::with_capacity(DIGEST_CHUNK * 4);
+    // チャンネルの順に、各チャンネルのチャンクを番号の順にたどって流す（`audio::stream::PcmDigest`。式は同じ）。チャンクの
+    // 区切りは DIGEST_CHUNK の倍数なので、まとめる塊の区切りと確かめを呼ぶ位置・数は、チャンネルを 1 本の列として
+    // DIGEST_CHUNK ずつ区切ったものと同じ
+    let mut d = crate::audio::stream::PcmDigest::new(a.rate(), a.channels(), a.frames() as u64);
     for ch in 0..a.channels() {
         for k in 0..a.chunk_count() {
             let data = a.chunk_data(ch, k)?;
-            for chunk in data.chunks(DIGEST_CHUNK) {
-                check()?;
-                buf.clear();
-                for s in chunk {
-                    // NaN は 1 つの値にそろえる
-                    let bits = if s.is_nan() { 0x7fc0_0000 } else { s.to_bits() };
-                    buf.extend_from_slice(&bits.to_le_bytes());
-                }
-                h.raw(&buf);
-            }
+            d.push_with(ch, a.chunk_range(k).start as u64, &data, check)?;
         }
     }
-    h.bytes_with_len(&canonical(&a.meta)?);
-    Ok(h.finish())
+    d.finish(&a.meta)
 }
 
 /// 音声のダイジェストで標本をまとめて足す数（速さと、[`audio_digest`] が確かめを呼ぶ間隔のためだけ。値に効かない）。

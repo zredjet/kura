@@ -141,6 +141,25 @@ pub trait Analysis: Send + Sync + 'static {
     }
     /// この引数・入力の形で解くときの見積もり（結果の大きさは上の見積もり。適合テストが実際の大きさ以下を確かめる）。
     fn estimate(p: &Self::Params, input: &Shape) -> Estimate;
+    /// 流れの解析（M13 段 1）：形 `input` の音声を、頭から順に窓ごとに受けて解くもの（結果は `run` とビット単位で同じ）。
+    /// 流せない解析・形（長さの分からない音声など）は None（既定）。範囲の描画の流し解き（入力が部分の値のとき）が使う。
+    fn stream(_p: &Self::Params, _input: &Shape) -> Option<Box<dyn AudioStream>> {
+        None
+    }
+}
+
+/// 流れの解析（M13 段 1。段 2 の begin → feed → finish はこれに乗る）。`feed` は頭から順に、重ならず、全チャンネルの同じ区間を
+/// 渡して呼ぶ（窓の大きさは任意。実行器はチャンクに揃える）。`finish` の結果は、全体を `Analysis::run` で解いたものと同じ。
+pub trait AudioStream: Send {
+    /// フレーム `start` からの全チャンネルの標本（チャンネルの順・同じ長さ）を受ける。
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<(), EngineError>;
+    /// 全体を受けたあと、結果を返す（受けた長さが形と違えば `Internal`）。
+    fn finish(self: Box<Self>, cx: &AnalyzeCx<'_>) -> Result<AnyOutput, EngineError>;
 }
 
 /// 型を消した例。
@@ -184,6 +203,12 @@ pub trait DynAnalysis: Send + Sync {
     fn examples(&self) -> Result<Vec<DynAnalysisExample>, EngineError>;
     /// 正規の形から読み直して、もう一度正規の形にすると同じバイト列になるか。
     fn round_trip(&self, bytes: &[u8]) -> Result<bool, EngineError>;
+    /// 流れの解析（`Analysis::stream`。流せなければ None）。
+    fn stream_any(
+        &self,
+        params: &serde_json::Value,
+        input: &Shape,
+    ) -> Result<Option<Box<dyn AudioStream>>, EngineError>;
 }
 
 struct Entry<A: Analysis>(PhantomData<fn() -> A>);
@@ -324,6 +349,15 @@ impl<A: Analysis> DynAnalysis for Entry<A> {
     fn round_trip(&self, bytes: &[u8]) -> Result<bool, EngineError> {
         let back = A::Output::from_canonical(bytes)?;
         Ok(back.to_canonical()? == bytes)
+    }
+
+    fn stream_any(
+        &self,
+        params: &serde_json::Value,
+        input: &Shape,
+    ) -> Result<Option<Box<dyn AudioStream>>, EngineError> {
+        let p = self.typed(params).map_err(EngineError::Invalid)?;
+        Ok(A::stream(&p, input))
     }
 }
 

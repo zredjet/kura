@@ -13,14 +13,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::loudness::{Loudness, Measured, analyze, measurable_rate};
+use crate::analysis::loudness::{Loudness, LoudnessScan, Measured, analyze, measurable_rate};
 use crate::analysis::output::{json_from_canonical, json_to_canonical};
 use crate::analysis::{
-    Analysis, AnalysisExample, AnalysisOutput, AnalyzeCx, Encoding, Estimate, NoParams, Real,
+    Analysis, AnalysisExample, AnalysisOutput, AnalyzeCx, AnyOutput, AudioStream, Encoding,
+    Estimate, NoParams, Real,
 };
 use crate::error::EngineError;
 use crate::op::Numeric;
-use crate::shape::{Shape, ValueKind};
+use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::{InputGen, NonFiniteSample};
 use crate::value::Value;
 
@@ -65,6 +66,26 @@ impl AnalysisOutput for Measured {
 /// ゲーティングの計測（内部用）。
 pub struct LoudnessGating;
 
+/// 流れの計測（窓の核を包んだもの）。
+struct GatingStream(LoudnessScan);
+
+impl AudioStream for GatingStream {
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<(), EngineError> {
+        cx.check()?;
+        self.0.feed(start, planes, cx.mon)
+    }
+
+    fn finish(self: Box<Self>, cx: &AnalyzeCx<'_>) -> Result<AnyOutput, EngineError> {
+        cx.check()?;
+        Ok(std::sync::Arc::new(self.0.finish()?))
+    }
+}
+
 /// `Real` 1 つの正規の JSON の長さの上限（指数表記を使わないので、最小の非正規化数で 300 字を超える）と区切り。
 const REAL_BYTES: u64 = 340;
 
@@ -76,6 +97,21 @@ impl Analysis for LoudnessGating {
     const INTERNAL: bool = true;
     type Params = NoParams;
     type Output = Measured;
+
+    /// 流れ（M13 段 1）：長さの分かる音声は窓の核（`LoudnessScan`）で流して解ける（`run` とビット単位で同じ）。
+    fn stream(_p: &NoParams, input: &Shape) -> Option<Box<dyn AudioStream>> {
+        let Shape::Audio {
+            rate,
+            channels,
+            frames: Dim::Exact(n),
+        } = *input
+        else {
+            return None;
+        };
+        LoudnessScan::new(rate, usize::from(channels), n)
+            .ok()
+            .map(|scan| Box::new(GatingStream(scan)) as Box<dyn AudioStream>)
+    }
 
     fn run(_p: &NoParams, v: &Value, cx: &AnalyzeCx<'_>) -> Result<Measured, EngineError> {
         cx.check()?;

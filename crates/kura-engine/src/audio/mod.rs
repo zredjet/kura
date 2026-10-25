@@ -7,6 +7,7 @@
 
 pub mod resample;
 pub mod source;
+pub mod stream;
 
 use std::sync::Arc;
 

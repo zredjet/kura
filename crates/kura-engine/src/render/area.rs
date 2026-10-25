@@ -634,8 +634,9 @@ impl Engine {
                     (v, false)
                 } else if let Some(Region::Chunks(rounded)) = region {
                     patched |= base_v.is_some();
-                    let run = self
-                        .run_audio_region(cx, cache, node, &ins, &rounded, base_v, presolved, mon);
+                    let run = self.run_audio_region(
+                        cx, cache, node, &ins, &rounded, base_v, presolved, stats, mon,
+                    );
                     // 申告した依存の外（無効なチャンク）を読んだら、範囲の描画を捨てる
                     if ins.iter().any(Value::holes_read) {
                         return Err(PassError::Hole);
@@ -805,6 +806,11 @@ impl Shapes {
                 .map(|n| (n.id, n.inferred.shape))
                 .collect(),
         }
+    }
+
+    /// ポートの値の形。
+    pub(super) fn port(&self, r: &PortRef) -> Option<Shape> {
+        lookup(&self.nodes, &self.inputs, r)
     }
 
     /// ノードの入力の形（計画の順）。
