@@ -5,7 +5,7 @@
 //! - streamed_digest_equals_value_digest：`Engine::digest_audio_output` が `render` の出力のダイジェストと同じ。
 //! - presolved_measurement_equals_run：流れの解析（`audio.loudness_gating` の流れ）を窓（1・7・4,096・C・ランダム）で解いた結果が
 //!   `run` と同じ正規の形。
-//! - patcher_equals_compute（E40）は peaks の段の後で足す。
+//! - patcher_equals_compute（E40）：波形の段の部分更新を流れに載せた `Patcher` が `compute` と同じ。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -297,4 +297,93 @@ fn presolved_measurement_equals_run() {
         frames: kura_engine::shape::Dim::AtMost(10),
     };
     assert!(a.stream_any(&params, &unknown).unwrap().is_none());
+}
+
+/// E40：波形の段の部分更新を流れに載せた `Patcher` は、変わった区間（推論）のチャンクだけを流して、新しい出力を `compute`
+/// したものと同じ段を組む。フェードの長さ・ゲインの手と、`finest`／`coarsest` の組で。
+#[test]
+fn patcher_equals_compute() {
+    use kura_engine::analysis::audio::peaks::{Patcher, PeaksParams, compute};
+    let engine = engine();
+    let input = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 2,
+        frames: 3 * C + 37,
+        seed: 40,
+    }
+    .generate()
+    .unwrap();
+    let source = Digest::default();
+    let fin = BTreeMap::from([(
+        InputId(0),
+        FingerprintedInput::new(input.clone(), source).unwrap(),
+    )]);
+    let limits = Limits::default();
+    let cx = AnalyzeCx {
+        mon: &NoMonitor,
+        limits: &limits,
+    };
+    let doc = |fade_in: u64, db: f64| {
+        let mut g = Graph::new_single();
+        g.push_linear(
+            "audio.fade",
+            1,
+            json!({ "fadeIn": fade_in, "fadeOut": 2_000, "curve": "linear" }),
+            1,
+        )
+        .unwrap();
+        g.push_linear("audio.gain", 1, json!({ "db": db }), 2)
+            .unwrap();
+        g
+    };
+    let mut streamed_less = 0;
+    for (before, after) in [((1_000, -1.0), (C + 10, -1.0)), ((500, -1.0), (500, -3.0))] {
+        let (a, b) = (
+            compile(&engine, &doc(before.0, before.1), &input).unwrap(),
+            compile(&engine, &doc(after.0, after.1), &input).unwrap(),
+        );
+        let (Some((old, _)), Some((new, _))) = (
+            render(&engine, &a, &input, source),
+            render(&engine, &b, &input, source),
+        ) else {
+            panic!()
+        };
+        let (Value::Audio(old), Value::Audio(new)) = (&old, &new) else {
+            panic!()
+        };
+        let changed = match &engine.delta(&a, &fin, &b, &fin).unwrap().outputs[0].1 {
+            Area::Samples(s) => s.clone(),
+            _ => Spans::one(0, new.frames() as u64),
+        };
+        for p in [
+            PeaksParams::default(),
+            PeaksParams {
+                finest: 4_096,
+                coarsest: 16_384,
+            },
+        ] {
+            let old_peaks = compute(old, &p, &cx).unwrap();
+            let mut patcher = Patcher::new(old_peaks, p, new.frames() as u64, &changed);
+            let spans = patcher.spans();
+            let stats = engine
+                .stream_audio(
+                    &b,
+                    &fin,
+                    &mut NodeCache::new(0),
+                    OutputId(0),
+                    Some(&spans),
+                    &mut patcher,
+                    &NoMonitor,
+                )
+                .unwrap();
+            assert_eq!(
+                patcher.into_peaks().unwrap(),
+                compute(new, &p, &cx).unwrap(),
+                "{before:?} → {after:?}・{p:?}"
+            );
+            streamed_less += usize::from(stats.area.drawn_chunks < 4 * 2);
+        }
+    }
+    // フェードの長さの手は全体を流さない
+    assert!(streamed_less >= 2, "{streamed_less}");
 }

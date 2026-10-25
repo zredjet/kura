@@ -31,18 +31,26 @@
 //!   データで終わる。読む側（`from_canonical`）は外から来たバイト列として、magic・版・値の型・L・B が増えていくこと・
 //!   ビンの数・位置・詰め物が 0・長さがちょうど・min ≤ max を確かめる（確保の前に大きさを照らす）。
 //! - 整数だけ（`Numeric::Exact`）。
+//! - 部分更新（M13 段 1）：どの段のビンもチャンク（65,536 フレーム）の中で閉じるので、変わったチャンクのビンだけを作り直せる
+//!   （[`patch`]・流れに載せる [`Patcher`]）。結果は `compute` と同じ（整数だけ）。
+
+use std::collections::BTreeMap;
+use std::ops::Deref;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::analysis::output::AnalysisOutput;
 use crate::analysis::{Analysis, AnalysisExample, AnalyzeCx, Encoding, Estimate};
+use crate::audio::stream::{AudioSink, StreamInfo};
 use crate::codec::pcm;
 use crate::error::EngineError;
+use crate::monitor::Monitor;
 use crate::op::{Numeric, OpParams, ParamKind, ParamSchema, Unit, spec};
+use crate::render::region::{Area, Spans};
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::{InputGen, NonFiniteSample};
-use crate::value::{Audio, Value};
+use crate::value::{Audio, ChunkSet, Value};
 
 /// 段のビンのフレーム数（版 1 で凍結）。
 pub const PEAK_BINS: [u32; 5] = [256, 1_024, 4_096, 16_384, 65_536];
@@ -416,7 +424,89 @@ fn min_max(xs: &[f32]) -> Option<(i16, i16)> {
     Some((lo, hi))
 }
 
-/// 波形の段を作る（引数の段だけ）。
+/// チャンク 1 つ（全チャンネルの中身。長さはそろう）の最も細かい段のビン（ビンの順 → チャンネルの順 → [min, max]）。
+/// どの段のビンもチャンクの中で閉じる（`PEAK_BINS` は `AUDIO_CHUNK` の約数）ので、チャンクごとに作って並べれば全体の段になる。
+fn chunk_finest<C: Deref<Target = [f32]>>(data: &[C], b0: usize) -> Result<Vec<i16>, EngineError> {
+    let len = data.first().map_or(0, |d| d.len());
+    if data.iter().any(|d| d.len() != len) {
+        return Err(EngineError::Internal(
+            "波形のチャンクのチャンネルの長さがそろっていません".into(),
+        ));
+    }
+    let bins = len.div_ceil(b0.max(1));
+    let mut out = Vec::new();
+    out.try_reserve_exact(bins.saturating_mul(data.len()).saturating_mul(2))
+        .map_err(|_| EngineError::Limit("波形の作業領域を確保できません".into()))?;
+    for b in 0..bins {
+        let (s, e) = (b * b0, ((b + 1) * b0).min(len));
+        for d in data {
+            let (lo, hi) = min_max(&d[s..e]).unwrap_or((0, 0));
+            out.push(lo);
+            out.push(hi);
+        }
+    }
+    Ok(out)
+}
+
+/// 段のビン i（ビンの大きさ `bin`）が属するチャンクの番号。
+fn chunk_of(i: usize, bin: u32) -> usize {
+    i.saturating_mul(bin as usize) / JOB_FRAMES
+}
+
+/// 下の段 `prev` から上の段（ビンの大きさ `bin`）を作る（下の段の ratio 個ずつの min の min・max の max）。`reuse` が
+/// あれば、`R` に属さないチャンクのビンは前の段（同じ大きさ・同じ位置）から写す（波形の部分更新）。
+fn upper_level(
+    prev: &PeakLevel,
+    bin: u32,
+    frames: u64,
+    c: usize,
+    reuse: Option<(&PeakLevel, &ChunkSet)>,
+    mon: &dyn Monitor,
+) -> Result<PeakLevel, EngineError> {
+    if mon.canceled() {
+        return Err(EngineError::Canceled);
+    }
+    let ratio = (bin / prev.bin.max(1)) as usize;
+    let prev_n = prev.data.len() / (2 * c).max(1);
+    let n = bins_of(frames, bin);
+    let n = usize::try_from(n).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+    if ratio == 0 || n != prev_n.div_ceil(ratio) {
+        return Err(EngineError::Internal("波形の段の大きさが合いません".into()));
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(n.saturating_mul(c).saturating_mul(2))
+        .map_err(|_| EngineError::Limit("波形の作業領域を確保できません".into()))?;
+    for i in 0..n {
+        if let Some((old, r)) = reuse
+            && !r.contains(chunk_of(i, bin))
+        {
+            let at = i * c * 2;
+            let src = old
+                .data
+                .get(at..at + c * 2)
+                .ok_or_else(|| EngineError::Internal("前の波形の段のビンが足りません".into()))?;
+            data.extend_from_slice(src);
+            continue;
+        }
+        let first = i * ratio;
+        let last = (first + ratio).min(prev_n);
+        for ch in 0..c {
+            let (mut lo, mut hi) = (i16::MAX, i16::MIN);
+            for k in first..last {
+                let at = (k * c + ch) * 2;
+                if let (Some(l), Some(h)) = (prev.data.get(at), prev.data.get(at + 1)) {
+                    lo = lo.min(*l);
+                    hi = hi.max(*h);
+                }
+            }
+            data.push(lo);
+            data.push(hi);
+        }
+    }
+    Ok(PeakLevel { bin, data })
+}
+
+/// 波形の段を作る（引数の段だけ）。仕事はチャンクの番号ごと（全チャンネル。遅延の源では 1 回の読みが全チャンネルに効く）。
 pub fn compute(a: &Audio, p: &PeaksParams, cx: &AnalyzeCx<'_>) -> Result<Peaks, EngineError> {
     let bins = p.bins();
     let Some(&finest) = bins.first() else {
@@ -428,40 +518,22 @@ pub fn compute(a: &Audio, p: &PeaksParams, cx: &AnalyzeCx<'_>) -> Result<Peaks, 
     let frames = a.frames();
     let b0 = finest as usize;
     let jobs = frames.div_ceil(JOB_FRAMES);
-    let tasks = c
-        .checked_mul(jobs)
-        .ok_or_else(|| EngineError::Limit("音声が長すぎます".into()))?;
-    // 最も細かい段：チャンネル × 仕事（JOB_FRAMES フレーム = 音声のチャンク 1 つ。どのビンの大きさでも割り切れる）
-    let parts = cx.par_blocks(tasks, |t| {
-        let (ch, j) = (t / jobs.max(1), t % jobs.max(1));
-        let xs = a.chunk_data(ch, j)?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(xs.len().div_ceil(b0))
-            .map_err(|_| EngineError::Limit("波形の作業領域を確保できません".into()))?;
-        out.extend(xs.chunks(b0).filter_map(min_max));
-        Ok(out)
+    // 最も細かい段：チャンク（JOB_FRAMES フレーム。どのビンの大きさでも割り切れる）ごとに全チャンネル
+    let parts = cx.par_blocks(jobs, |j| {
+        let data = (0..c)
+            .map(|ch| a.chunk_data(ch, j))
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        chunk_finest(&data, b0)
     })?;
-    // 仕事 (c, j) の結果は parts[c·jobs + j]。ビンの順 → チャンネルの順に並べる（仕事の境はビンの境）
+    // チャンク j の結果はビンの順 → チャンネルの順。チャンクの順に並べれば全体の段（仕事の境はビンの境）
     let n0 = bins_of(frames as u64, finest);
     let n0 = usize::try_from(n0).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
     let mut level0 = cx.reserve::<i16>(n0.saturating_mul(c).saturating_mul(2))?;
-    let missing = || EngineError::Internal("波形のビンが足りません".into());
-    for j in 0..jobs {
-        let len = parts.get(j).map_or(0, Vec::len);
-        for b in 0..len {
-            for ch in 0..c {
-                let (lo, hi) = parts
-                    .get(ch * jobs + j)
-                    .and_then(|p| p.get(b))
-                    .copied()
-                    .ok_or_else(missing)?;
-                level0.push(lo);
-                level0.push(hi);
-            }
-        }
+    for part in &parts {
+        level0.extend_from_slice(part);
     }
     if level0.len() != n0 * c * 2 {
-        return Err(missing());
+        return Err(EngineError::Internal("波形のビンが足りません".into()));
     }
     drop(parts);
     let mut levels = vec![PeakLevel {
@@ -470,33 +542,9 @@ pub fn compute(a: &Audio, p: &PeaksParams, cx: &AnalyzeCx<'_>) -> Result<Peaks, 
     }];
     // 上の段：下の段の ratio（= 4）個ずつ
     for &bin in bins.iter().skip(1) {
-        cx.check()?;
         let Some(prev) = levels.last() else { break };
-        let ratio = (bin / prev.bin.max(1)) as usize;
-        let prev_n = prev.data.len() / (2 * c);
-        let n = bins_of(frames as u64, bin);
-        let n = usize::try_from(n).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-        if ratio == 0 || n != prev_n.div_ceil(ratio) {
-            return Err(EngineError::Internal("波形の段の大きさが合いません".into()));
-        }
-        let mut data = cx.reserve::<i16>(n.saturating_mul(c).saturating_mul(2))?;
-        for i in 0..n {
-            let first = i * ratio;
-            let last = (first + ratio).min(prev_n);
-            for ch in 0..c {
-                let (mut lo, mut hi) = (i16::MAX, i16::MIN);
-                for k in first..last {
-                    let at = (k * c + ch) * 2;
-                    if let (Some(l), Some(h)) = (prev.data.get(at), prev.data.get(at + 1)) {
-                        lo = lo.min(*l);
-                        hi = hi.max(*h);
-                    }
-                }
-                data.push(lo);
-                data.push(hi);
-            }
-        }
-        levels.push(PeakLevel { bin, data });
+        let next = upper_level(prev, bin, frames as u64, c, None, cx.mon)?;
+        levels.push(next);
     }
     Ok(Peaks {
         rate: a.rate(),
@@ -504,6 +552,217 @@ pub fn compute(a: &Audio, p: &PeaksParams, cx: &AnalyzeCx<'_>) -> Result<Peaks, 
         frames: frames as u64,
         levels,
     })
+}
+
+/// 波形の部分更新で作り直すチャンク R（M13 段 1）：長さ `frames` の新しい値で、`changed` に掛かるチャンク。長さが変わったら
+/// （前の長さ `old_frames`）、新しい長さの最後のチャンクと、旧い長さの最後のチャンクの番号から先も入れる（保守的）。
+pub fn patch_chunks(old_frames: u64, frames: u64, changed: &Spans) -> ChunkSet {
+    let fr = usize::try_from(frames).unwrap_or(usize::MAX);
+    let mut r = crate::render::audio::chunks_covering(&Area::samples(changed.clone()), fr);
+    if old_frames != frames {
+        let count = r.universe();
+        let old_last = old_frames.div_ceil(JOB_FRAMES as u64).saturating_sub(1);
+        let new_last = (count as u64).saturating_sub(1);
+        let from = usize::try_from(old_last.min(new_last)).unwrap_or(usize::MAX);
+        for j in from..count {
+            r.insert(j);
+        }
+    }
+    r
+}
+
+/// 前の段 `old` と、R のチャンクの最も細かい段のビン（`fresh`）から、長さ `frames` の新しい値の段を組む。R に属さない
+/// チャンクのビンは前の段の同じ位置から写す（整数だけなので、`compute` と同じ）。
+fn assemble(
+    old: &Peaks,
+    p: &PeaksParams,
+    frames: u64,
+    r: &ChunkSet,
+    fresh: &BTreeMap<usize, Vec<i16>>,
+    mon: &dyn Monitor,
+) -> Result<Peaks, EngineError> {
+    let bins = p.bins();
+    if old.levels.iter().map(|l| l.bin).collect::<Vec<_>>() != bins {
+        return Err(EngineError::Internal(
+            "前の波形の段が引数の段と違います".into(),
+        ));
+    }
+    let Some(&finest) = bins.first() else {
+        return Err(EngineError::Internal("波形の段がありません".into()));
+    };
+    let c = usize::from(old.channels);
+    let b0 = finest as usize;
+    let per = JOB_FRAMES / b0.max(1);
+    let fr = usize::try_from(frames).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+    let jobs = fr.div_ceil(JOB_FRAMES);
+    let n0 = usize::try_from(bins_of(frames, finest))
+        .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+    let mut level0 = Vec::new();
+    level0
+        .try_reserve_exact(n0.saturating_mul(c).saturating_mul(2))
+        .map_err(|_| EngineError::Limit("波形の作業領域を確保できません".into()))?;
+    let old0 = &old.levels[0];
+    for j in 0..jobs {
+        if r.contains(j) {
+            let part = fresh.get(&j).ok_or_else(|| {
+                EngineError::Internal(format!("作り直す波形のチャンク {j} がありません"))
+            })?;
+            level0.extend_from_slice(part);
+            continue;
+        }
+        // R の外のチャンクは前と同じ長さ（R の作り方による）。前の段の同じビンを写す
+        let len = (fr - j * JOB_FRAMES).min(JOB_FRAMES);
+        let (s, e) = (j * per, j * per + len.div_ceil(b0));
+        let src = old0
+            .data
+            .get(s * c * 2..e * c * 2)
+            .ok_or_else(|| EngineError::Internal("前の波形の段のビンが足りません".into()))?;
+        level0.extend_from_slice(src);
+    }
+    if level0.len() != n0 * c * 2 {
+        return Err(EngineError::Internal("波形のビンが足りません".into()));
+    }
+    let mut levels = vec![PeakLevel {
+        bin: finest,
+        data: level0,
+    }];
+    for (k, &bin) in bins.iter().enumerate().skip(1) {
+        let Some(prev) = levels.last() else { break };
+        let next = upper_level(prev, bin, frames, c, Some((&old.levels[k], r)), mon)?;
+        levels.push(next);
+    }
+    Ok(Peaks {
+        rate: old.rate,
+        channels: old.channels,
+        frames,
+        levels,
+    })
+}
+
+/// 波形の段の部分更新（M13 段 1。docs/editing.md §11.4）：前の段 `old`（引数 `p`）から、長さ `frames` の新しい値の段を、
+/// 変わった区間 `changed`（保守的でよい）に掛かるチャンク R（[`patch_chunks`]）だけ標本から作り直して求める。`chunk(j)` は
+/// 新しい値のチャンク j の全チャンネルの中身（R のチャンクだけ呼ぶ）。結果は新しい値を `compute` したものと同じ（E40）。
+/// レート・チャンネルの数は前と同じであること。
+pub fn patch<C: Deref<Target = [f32]>>(
+    old: &Peaks,
+    p: &PeaksParams,
+    frames: u64,
+    changed: &Spans,
+    mut chunk: impl FnMut(u32) -> Result<Vec<C>, EngineError>,
+    cx: &AnalyzeCx<'_>,
+) -> Result<Peaks, EngineError> {
+    let r = patch_chunks(old.frames, frames, changed);
+    let b0 = p.bins().first().copied().unwrap_or(PEAK_BINS[0]) as usize;
+    let mut fresh = BTreeMap::new();
+    for j in r.iter() {
+        cx.check()?;
+        let index = u32::try_from(j).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+        let data = chunk(index)?;
+        if data.len() != usize::from(old.channels) {
+            return Err(EngineError::Internal(
+                "波形のチャンクのチャンネルの数が違います".into(),
+            ));
+        }
+        fresh.insert(j, chunk_finest(&data, b0)?);
+    }
+    assemble(old, p, frames, &r, &fresh, cx.mon)
+}
+
+/// 波形の段の部分更新を流れに載せるもの（`AudioSink`）：`Engine::stream_audio` に [`Patcher::spans`]（R のチャンクの区間）を
+/// 渡して流すと、R のチャンクのビンを作り、`finish` で段を組む（[`Patcher::into_peaks`] で取り出す）。表示の中のチャンクは
+/// 表示の値から渡してもよい（流れも区間も同じ値）。
+pub struct Patcher {
+    old: Peaks,
+    params: PeaksParams,
+    frames: u64,
+    r: ChunkSet,
+    fresh: BTreeMap<usize, Vec<i16>>,
+    out: Option<Peaks>,
+}
+
+impl Patcher {
+    /// 前の段 `old`（引数 `params`）から、長さ `frames` の新しい値の段を、変わった区間 `changed` だけ作り直す準備をする。
+    pub fn new(old: Peaks, params: PeaksParams, frames: u64, changed: &Spans) -> Self {
+        let r = patch_chunks(old.frames, frames, changed);
+        Self {
+            old,
+            params,
+            frames,
+            r,
+            fresh: BTreeMap::new(),
+            out: None,
+        }
+    }
+
+    /// 流す区間（R のチャンク）。
+    pub fn spans(&self) -> Spans {
+        crate::render::audio::chunk_spans(
+            &self.r,
+            usize::try_from(self.frames).unwrap_or(usize::MAX),
+        )
+    }
+
+    /// 組んだ段（`finish` のあと。まだなら `Internal`）。
+    pub fn into_peaks(self) -> Result<Peaks, EngineError> {
+        self.out
+            .ok_or_else(|| EngineError::Internal("波形の段をまだ組んでいません".into()))
+    }
+}
+
+impl AudioSink for Patcher {
+    fn begin(&mut self, info: &StreamInfo) -> Result<(), EngineError> {
+        if info.rate != self.old.rate
+            || info.channels != usize::from(self.old.channels)
+            || info.frames != self.frames
+        {
+            return Err(EngineError::Internal(
+                "波形の部分更新の流れの形が前の段・新しい長さと違います".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let b0 = self.params.bins().first().copied().unwrap_or(PEAK_BINS[0]) as usize;
+        let n = planes.first().map_or(0, |p| p.len());
+        if !start.is_multiple_of(JOB_FRAMES as u64) {
+            return Err(EngineError::Internal(
+                "波形の部分更新の窓がチャンクに揃っていません".into(),
+            ));
+        }
+        let first = usize::try_from(start / JOB_FRAMES as u64)
+            .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+        for (i, s) in (0..n).step_by(JOB_FRAMES).enumerate() {
+            if mon.canceled() {
+                return Err(EngineError::Canceled);
+            }
+            let j = first + i;
+            if !self.r.contains(j) {
+                continue;
+            }
+            let e = (s + JOB_FRAMES).min(n);
+            let data: Vec<&[f32]> = planes.iter().map(|p| &p[s..e]).collect();
+            self.fresh.insert(j, chunk_finest(&data, b0)?);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
+        self.out = Some(assemble(
+            &self.old,
+            &self.params,
+            self.frames,
+            &self.r,
+            &self.fresh,
+            &crate::monitor::NoMonitor,
+        )?);
+        Ok(())
+    }
 }
 
 /// 波形の段。
@@ -983,5 +1242,118 @@ mod tests {
         assert!(!ok(json!({ "finest": 4_096, "coarsest": 1_024 })));
         assert!(!ok(json!({ "finest": 256, "coarsest": 65_536, "x": 1 })));
         assert_eq!(PeaksParams::default().bins(), PEAK_BINS.to_vec());
+    }
+
+    /// E40（M13 段 1）：ランダムな値・変わった区間（保守的な大きめも）・長さの変化（縮める・伸ばす）・`finest`／`coarsest` の
+    /// 組で、`patch` が新しい値を `compute` したものと同じ。作り直すのは R のチャンクだけ（ほかのチャンクの中身は読まない）。
+    #[test]
+    fn patch_equals_compute() {
+        let c = JOB_FRAMES;
+        let mut r = crate::determinism::rng(40);
+        let limits = crate::Limits::default();
+        let cx = AnalyzeCx {
+            mon: &NoMonitor,
+            limits: &limits,
+        };
+        let below =
+            |r: &mut rand_chacha::ChaCha8Rng, n: usize| (r.next_u64() % n.max(1) as u64) as usize;
+        let mut checked = 0;
+        for case in 0..40 {
+            let channels = 1 + below(&mut r, 3);
+            let lens = [1usize, 300, c - 1, c, c + 1, 2 * c + 37, 3 * c];
+            let n = lens[below(&mut r, lens.len())];
+            let old: Vec<Vec<f32>> = (0..channels)
+                .map(|_| {
+                    (0..n)
+                        .map(|_| (r.next_u32() as f32 / u32::MAX as f32) * 2.2 - 1.1)
+                        .collect()
+                })
+                .collect();
+            // 新しい値：区間をいくつか書き換え、ときどき長さを変える
+            let mut new = old.clone();
+            let mut changed = Spans::new();
+            for _ in 0..1 + below(&mut r, 3) {
+                let s = below(&mut r, n);
+                let e = (s + 1 + below(&mut r, 3_000)).min(n);
+                for p in &mut new {
+                    for v in &mut p[s..e] {
+                        *v = -*v * 0.5;
+                    }
+                }
+                // 保守的な大きめも
+                changed.push(
+                    s.saturating_sub(below(&mut r, 2) * 500) as u64,
+                    e as u64 + below(&mut r, 2) as u64 * 700,
+                );
+            }
+            match below(&mut r, 3) {
+                0 => {
+                    let m = 1 + below(&mut r, n);
+                    for p in &mut new {
+                        p.truncate(m);
+                    }
+                }
+                1 => {
+                    let extra = 1 + below(&mut r, c + 10);
+                    for p in &mut new {
+                        p.extend((0..extra).map(|i| (i % 100) as f32 * 0.01 - 0.5));
+                    }
+                }
+                _ => {}
+            }
+            let (fa, fb) = (audio(old), audio(new.clone()));
+            let sizes = [256u32, 1_024, 4_096, 16_384, 65_536];
+            let i = below(&mut r, 5);
+            let j = i + below(&mut r, 5 - i);
+            let p = PeaksParams {
+                finest: sizes[i],
+                coarsest: sizes[j],
+            };
+            let before = cx_run(&fa, &p);
+            let want = cx_run(&fb, &p);
+            let rset = patch_chunks(fa.frames() as u64, fb.frames() as u64, &changed);
+            let mut asked = Vec::new();
+            let got = patch(
+                &before,
+                &p,
+                fb.frames() as u64,
+                &changed,
+                |k| {
+                    asked.push(k as usize);
+                    (0..channels)
+                        .map(|ch| fb.chunk_data(ch, k as usize).map(|d| d.to_vec()))
+                        .collect()
+                },
+                &cx,
+            )
+            .unwrap();
+            assert_eq!(
+                got,
+                want,
+                "{case}（{n} → {}・{p:?}・{changed:?}）",
+                fb.frames()
+            );
+            assert_eq!(asked, rset.iter().collect::<Vec<_>>(), "{case}");
+            checked += 1;
+        }
+        assert_eq!(checked, 40);
+        // 前の段の引数が違えば断る
+        let a = audio(vec![vec![0.5; 1_000]]);
+        let before = cx_run(&a, &PeaksParams::default());
+        let other = PeaksParams {
+            finest: 1_024,
+            coarsest: 4_096,
+        };
+        assert!(
+            patch(
+                &before,
+                &other,
+                1_000,
+                &Spans::new(),
+                |_| Ok(Vec::<Vec<f32>>::new()),
+                &cx
+            )
+            .is_err()
+        );
     }
 }
