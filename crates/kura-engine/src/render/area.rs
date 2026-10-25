@@ -413,7 +413,7 @@ impl Engine {
                     patched |= base_v.is_some();
                     let run = self.run_region(plan, node, &ins, &tiles, base_v, &source, mon);
                     // 申告した依存の外（無効なタイル）を読んだら、範囲の描画を捨てる
-                    if ins.iter().any(holes_read) {
+                    if ins.iter().any(Value::holes_read) {
                         return Err(PassError::Hole);
                     }
                     let (v, aw, mw) = match run {
@@ -576,11 +576,6 @@ impl Engine {
             })?;
         Ok((value, cx.warnings, map_warnings))
     }
-}
-
-/// 値の画素のどこかで、無効なタイルを読んだことがあれば true。
-fn holes_read(v: &Value) -> bool {
-    frames_of(v).iter().any(|(_, px, _)| px.holes_read())
 }
 
 /// 計画の値の形（入力とノード）。

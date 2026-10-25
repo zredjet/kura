@@ -1,11 +1,17 @@
 //! 音声の値（docs/editing.md §5.3）。すべてのチャンネルは同じ長さ。
 //!
+//! 中身はチャンネルごとの正規の区切りのチャンク（[k·C, min((k+1)·C, frames))。C = [`AUDIO_CHUNK`]）の表で持つ。チャンクは
+//! `Arc` で共有し、操作は描いたチャンクだけを新しく作る（画像のタイルと同じ考え方）。範囲の描画で描かなかったチャンクは
+//! 無効（[`Chunk::Hole`]。中身を持たず、読むと誤りで、読んだ印が立つ）。
+//!
 //! 中身は読む口（[`Audio::read`]・[`Audio::chunk_data`]・[`Audio::for_each_chunk`]・[`Audio::read_planes`]）で読む。
-//! チャンクは正規の区切り [k·C, min((k+1)·C, frames))（C = [`AUDIO_CHUNK`]）で、どの読み方でも同じ値を返す。
-//! 長い音声を組むときは [`AudioBuilder`] で標本を足していく（値と同じ量しか持たない）。
+//! どの読み方でも同じ値を返す。長い音声を組むときは [`AudioBuilder`] で標本を足していく（値と同じ量しか持たない）。
+//! 区切りは正規なので、同じ長さの値は同じ形の表を持ち、等しさ・共有の比べ・継ぎはぎを番号だけで行える。
 
+use std::fmt;
 use std::ops::{Deref, Range};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::meta::AudioMeta;
 use crate::error::EngineError;
@@ -13,14 +19,33 @@ use crate::monitor::Monitor;
 
 /// 音声のチャンクのフレーム数（M13。正規の区切り [k·C, (k+1)·C)）。並列の分け方と同じく値に効かない定数で、
 /// どの約束の形式（ダイジェスト・kura-peaks・配信の URL）にも出さない。`AUDIO_BLOCK`（4,096）・`SUM_BLOCK`（4,096）・
-/// `DIGEST_CHUNK`（16,384）の倍数で、波形の段の最も粗いビン（65,536）と同じ。
+/// `DIGEST_CHUNK`（16,384）の倍数で、波形の段の最も粗いビン（65,536）と同じ。1 チャンネル 1 チャンクが f32 で 256 KiB。
 pub const AUDIO_CHUNK: usize = 1 << 16;
 
+/// チャンク 1 つ（1 チャンネル分）。
+#[derive(Debug, Clone)]
+pub enum Chunk {
+    /// 中身（長さは正規の長さ）。
+    Data(Arc<Vec<f32>>),
+    /// 無効（範囲の描画で描かなかったもの。中身を持たない。読むと誤り）。全チャンネルで同じ番号にそろう。
+    Hole,
+}
+
+/// 無効なチャンクを読んだ印（範囲の描画が申告した依存の外を読んだことを、実行器とテストが見つけるため）。
+#[derive(Debug, Default)]
+struct HoleFlag {
+    read: AtomicBool,
+}
+
 /// 音声。チャンネルが 1〜65,535、すべてのチャンネルは同じ長さ。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Audio {
     rate: u32,
-    planes: Vec<Arc<Vec<f32>>>,
+    frames: usize,
+    /// [チャンネル][チャンクの番号]。メタデータだけを替える写しは表を共有する。
+    table: Arc<Vec<Vec<Chunk>>>,
+    /// 無効なチャンクがあるときだけ（読んだ印）。
+    holes: Option<Arc<HoleFlag>>,
     pub meta: AudioMeta,
 }
 
@@ -44,6 +69,100 @@ impl Deref for ChunkData<'_> {
     }
 }
 
+/// チャンクの番号の集合（`universe` 個の番号 0..universe の部分集合）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkSet {
+    universe: usize,
+    bits: Vec<u64>,
+}
+
+impl ChunkSet {
+    /// 空の集合（番号は 0..universe）。
+    pub fn empty(universe: usize) -> Self {
+        Self {
+            universe,
+            bits: vec![0; universe.div_ceil(64)],
+        }
+    }
+
+    /// すべての番号。
+    pub fn all(universe: usize) -> Self {
+        let mut s = Self::empty(universe);
+        for k in 0..universe {
+            s.insert(k);
+        }
+        s
+    }
+
+    /// 番号の範囲（0..universe）の大きさ。
+    pub fn universe(&self) -> usize {
+        self.universe
+    }
+
+    /// 番号を足す（範囲の外は無視）。
+    pub fn insert(&mut self, k: usize) {
+        if k < self.universe
+            && let Some(w) = self.bits.get_mut(k / 64)
+        {
+            *w |= 1 << (k % 64);
+        }
+    }
+
+    /// 番号を除く。
+    pub fn remove(&mut self, k: usize) {
+        if let Some(w) = self.bits.get_mut(k / 64) {
+            *w &= !(1 << (k % 64));
+        }
+    }
+
+    /// 番号を含めば true。
+    pub fn contains(&self, k: usize) -> bool {
+        k < self.universe
+            && self
+                .bits
+                .get(k / 64)
+                .is_some_and(|w| (w >> (k % 64)) & 1 == 1)
+    }
+
+    /// 番号の数。
+    pub fn count(&self) -> usize {
+        self.bits.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// 空なら true。
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|w| *w == 0)
+    }
+
+    /// 番号を小さい順に。
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.universe).filter(|k| self.contains(*k))
+    }
+
+    /// 和（`other` の番号を足す）。
+    pub fn union_with(&mut self, other: &ChunkSet) {
+        for k in other.iter() {
+            self.insert(k);
+        }
+    }
+
+    /// 差（`other` の番号を除く）。
+    pub fn subtract(&mut self, other: &ChunkSet) {
+        for k in other.iter() {
+            self.remove(k);
+        }
+    }
+
+    /// 共通部分（`other` にない番号を除く）。
+    pub fn intersect_with(&mut self, other: &ChunkSet) {
+        for k in 0..self.universe {
+            if !other.contains(k) {
+                self.remove(k);
+            }
+        }
+    }
+}
+
 fn check_header(rate: u32, channels: usize) -> Result<(), EngineError> {
     if rate == 0 || channels == 0 || channels > usize::from(u16::MAX) {
         return Err(EngineError::Internal(
@@ -53,9 +172,41 @@ fn check_header(rate: u32, channels: usize) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// 長さ `frames` の音声のチャンク `k` の区間。
+fn range_of(frames: usize, k: usize) -> Range<usize> {
+    let start = k.saturating_mul(AUDIO_CHUNK).min(frames);
+    start..start.saturating_add(AUDIO_CHUNK).min(frames)
+}
+
+/// 平面を正規のチャンクに分ける。1 チャンク以下なら写さずにそのまま使い、長ければ写す（元は呼び手が手放す）。
+fn split_plane(p: Arc<Vec<f32>>) -> Result<Vec<Chunk>, EngineError> {
+    if p.is_empty() {
+        return Ok(Vec::new());
+    }
+    if p.len() <= AUDIO_CHUNK {
+        return Ok(vec![Chunk::Data(p)]);
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(p.len().div_ceil(AUDIO_CHUNK))
+        .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+    for c in p.chunks(AUDIO_CHUNK) {
+        let mut v = Vec::new();
+        v.try_reserve_exact(c.len())
+            .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+        v.extend_from_slice(c);
+        out.push(Chunk::Data(Arc::new(v)));
+    }
+    Ok(out)
+}
+
+fn hole_error() -> EngineError {
+    EngineError::Internal("範囲の描画で描かなかった音声のチャンクを読みました".into())
+}
+
 impl Audio {
-    /// 音声を作る（短い音声・テスト・外のクレート用の互換の口。長い音声を組むときは [`AudioBuilder`]）。チャンネルが 0 か
-    /// 65,535 を超える、長さがそろっていない、レートが 0 ならエラー。
+    /// 音声を作る（短い音声・テスト・外のクレート用の互換の口。長い音声を組むときは [`AudioBuilder`]）。平面を正規の
+    /// チャンクに分ける（1 チャンク以下のチャンネルは写さない。長いチャンネルは 1 本ずつ写して元を手放すので、写す間に
+    /// 余分に持つのは 1 チャンネル分だけ）。チャンネルが 0 か 65,535 を超える、長さがそろっていない、レートが 0 ならエラー。
     pub fn new(
         rate: u32,
         planes: Vec<Arc<Vec<f32>>>,
@@ -68,7 +219,64 @@ impl Audio {
                 "チャンネルの長さがそろっていません".into(),
             ));
         }
-        Ok(Self { rate, planes, meta })
+        let mut table = Vec::with_capacity(planes.len());
+        for p in planes {
+            table.push(split_plane(p)?);
+        }
+        Ok(Self {
+            rate,
+            frames: len,
+            table: Arc::new(table),
+            holes: None,
+            meta,
+        })
+    }
+
+    /// チャンクの表から作る。表はチャンネルの数だけの行で、各行は ⌈frames / C⌉ 個のチャンク。中身の長さは正規の長さ、
+    /// 無効なチャンクは全チャンネルで同じ番号にそろうこと（合わなければ `Internal`）。
+    pub fn from_chunks(
+        rate: u32,
+        frames: usize,
+        table: Vec<Vec<Chunk>>,
+        meta: AudioMeta,
+    ) -> Result<Self, EngineError> {
+        check_header(rate, table.len())?;
+        let count = frames.div_ceil(AUDIO_CHUNK);
+        let mut any_hole = false;
+        for row in &table {
+            if row.len() != count {
+                return Err(EngineError::Internal(format!(
+                    "音声のチャンクの数が長さと合いません（{} 個。{frames} フレームなら {count} 個）",
+                    row.len()
+                )));
+            }
+        }
+        for row in &table {
+            for (k, c) in row.iter().enumerate() {
+                let hole0 = matches!(table[0][k], Chunk::Hole);
+                match c {
+                    Chunk::Data(v) if v.len() != range_of(frames, k).len() || hole0 => {
+                        return Err(EngineError::Internal(format!(
+                            "音声のチャンク {k} の長さか無効の位置が正しくありません"
+                        )));
+                    }
+                    Chunk::Hole if !hole0 => {
+                        return Err(EngineError::Internal(format!(
+                            "音声の無効なチャンク {k} がチャンネルでそろっていません"
+                        )));
+                    }
+                    Chunk::Hole => any_hole = true,
+                    Chunk::Data(_) => {}
+                }
+            }
+        }
+        Ok(Self {
+            rate,
+            frames,
+            table: Arc::new(table),
+            holes: any_hole.then(|| Arc::new(HoleFlag::default())),
+            meta,
+        })
     }
 
     /// サンプルレート。
@@ -78,60 +286,81 @@ impl Audio {
 
     /// チャンネル数（1〜65,535）。
     pub fn channels(&self) -> usize {
-        self.planes.len()
+        self.table.len()
     }
 
     /// 1 チャンネルあたりのフレーム数。
     pub fn frames(&self) -> usize {
-        self.planes[0].len()
+        self.frames
     }
 
     /// チャンクの数（⌈frames / C⌉。長さ 0 なら 0）。
     pub fn chunk_count(&self) -> usize {
-        self.frames().div_ceil(AUDIO_CHUNK)
+        self.frames.div_ceil(AUDIO_CHUNK)
     }
 
     /// チャンク `k` のフレームの区間 [k·C, min((k+1)·C, frames))（範囲の外の k は空）。
     pub fn chunk_range(&self, k: usize) -> Range<usize> {
-        let n = self.frames();
-        let start = k.saturating_mul(AUDIO_CHUNK).min(n);
-        start..start.saturating_add(AUDIO_CHUNK).min(n)
+        range_of(self.frames, k)
     }
 
-    fn plane(&self, ch: usize) -> Result<&Arc<Vec<f32>>, EngineError> {
-        self.planes.get(ch).ok_or_else(|| {
-            EngineError::Internal(format!(
-                "音声のチャンネル {ch} はありません（{} チャンネル）",
-                self.planes.len()
-            ))
-        })
+    /// チャンネル `ch` のチャンク `k`（範囲の外は `Internal`）。
+    pub fn chunk(&self, ch: usize, k: usize) -> Result<&Chunk, EngineError> {
+        self.table
+            .get(ch)
+            .and_then(|row| row.get(k))
+            .ok_or_else(|| {
+                EngineError::Internal(format!(
+                    "音声のチャンク（チャンネル {ch}・番号 {k}）はありません（{} チャンネル・{} 個）",
+                    self.channels(),
+                    self.chunk_count()
+                ))
+            })
     }
 
-    /// チャンネル `ch` のフレーム `start` から `out.len()` 個を `out` に写す（範囲の外は 0）。チャンネルが範囲の外なら
-    /// `Internal`。核が入力を読む口（範囲の描画で描かなかったチャンクを読めば `Internal`、源の読みの誤りは `Io`）。
+    /// チャンネル `ch` のフレーム `start` から `out.len()` 個を `out` に写す（範囲の外は 0）。チャンネルが範囲の外、
+    /// 無効なチャンク（範囲の描画で描かなかったもの）を読んだときは `Internal`（読んだ印が立つ）。核が入力を読む口。
     pub fn read(&self, ch: usize, start: u64, out: &mut [f32]) -> Result<(), EngineError> {
-        let plane = self.plane(ch)?;
+        if ch >= self.channels() {
+            return Err(EngineError::Internal(format!(
+                "音声のチャンネル {ch} はありません（{} チャンネル）",
+                self.channels()
+            )));
+        }
         let start = usize::try_from(start).unwrap_or(usize::MAX);
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = start
-                .checked_add(i)
-                .and_then(|k| plane.get(k))
-                .copied()
-                .unwrap_or(0.0);
+        let mut i = 0usize;
+        while i < out.len() {
+            let Some(pos) = start.checked_add(i).filter(|p| *p < self.frames) else {
+                out[i..].fill(0.0);
+                break;
+            };
+            let k = pos / AUDIO_CHUNK;
+            let off = pos - k * AUDIO_CHUNK;
+            let data = self.chunk_data(ch, k)?;
+            let take = (data.len() - off).min(out.len() - i);
+            out[i..i + take].copy_from_slice(&data[off..off + take]);
+            i += take;
         }
         Ok(())
     }
 
-    /// チャンネル `ch` のチャンク `k` の中身（写さずに借りる。長さは正規の長さ）。範囲の外は `Internal`。
+    /// チャンネル `ch` のチャンク `k` の中身（写さずに借りる。長さは正規の長さ）。範囲の外・無効なチャンクは `Internal`
+    /// （無効なら読んだ印が立つ）。
     pub fn chunk_data(&self, ch: usize, k: usize) -> Result<ChunkData<'_>, EngineError> {
-        let plane = self.plane(ch)?;
-        if k >= self.chunk_count() {
-            return Err(EngineError::Internal(format!(
-                "音声のチャンク {k} はありません（{} 個）",
-                self.chunk_count()
-            )));
+        match self.chunk(ch, k)? {
+            Chunk::Data(v) => Ok(ChunkData::Borrowed(v.as_slice())),
+            Chunk::Hole => {
+                self.touch();
+                Err(hole_error())
+            }
         }
-        Ok(ChunkData::Borrowed(&plane[self.chunk_range(k)]))
+    }
+
+    /// 無効なチャンクを読んだ印を立てる。
+    fn touch(&self) {
+        if let Some(h) = &self.holes {
+            h.read.store(true, Ordering::Relaxed);
+        }
     }
 
     /// チャンクを番号の順に、全チャンネルの中身（チャンネルの順）を渡して `f(番号, 中身)` を呼ぶ。チャンクごとに中止を
@@ -157,10 +386,10 @@ impl Audio {
 
     /// フレームの区間 [start, end) を、チャンネルごとの連続した列にして返す（区間は長さの中であること）。
     pub fn read_planes(&self, start: usize, end: usize) -> Result<Vec<Vec<f32>>, EngineError> {
-        if start > end || end > self.frames() {
+        if start > end || end > self.frames {
             return Err(EngineError::Internal(format!(
                 "音声の区間 [{start}, {end}) が長さ {} の外です",
-                self.frames()
+                self.frames
             )));
         }
         let mut out = Vec::with_capacity(self.channels());
@@ -173,43 +402,176 @@ impl Audio {
     }
 
     /// 全体をチャンネルごとの連続した列にする（テストと短い音声だけ。本番のコードでは使わない：`tests/rules.rs`）。
+    /// 1 チャンク以下のチャンネルは実体を写さずに共有する。
     pub fn to_planes(&self) -> Result<Vec<Arc<Vec<f32>>>, EngineError> {
-        Ok(self.planes.clone())
+        let mut out = Vec::with_capacity(self.channels());
+        for (ch, row) in self.table.iter().enumerate() {
+            match row.as_slice() {
+                [] => out.push(Arc::new(Vec::new())),
+                [Chunk::Data(v)] => out.push(v.clone()),
+                _ => {
+                    let mut v = crate::codec::try_vec(self.frames, 0f32)?;
+                    self.read(ch, 0, &mut v)?;
+                    out.push(Arc::new(v));
+                }
+            }
+        }
+        Ok(out)
     }
 
-    /// 標本の実体を共有したまま、メタデータだけを `meta` にした値。
+    /// 標本の実体（表）を共有したまま、メタデータだけを `meta` にした値（O(1)）。
     pub fn with_meta(&self, meta: AudioMeta) -> Self {
         Self {
-            rate: self.rate,
-            planes: self.planes.clone(),
             meta,
+            ..self.clone()
         }
     }
 
-    /// チャンネル `ch` のチャンク `k` が、`other` の同じ位置のチャンクと同じ実体（写さずに共有したもの）なら true
-    /// （中身を比べない。変わった区間の絞り込みに使う）。
-    pub(crate) fn same_chunk(&self, other: &Audio, ch: usize, k: usize) -> bool {
-        match (self.planes.get(ch), other.planes.get(ch)) {
-            (Some(a), Some(b)) => {
-                Arc::ptr_eq(a, b) && k < self.chunk_count() && self.frames() == other.frames()
+    /// 有効なチャンクの番号の集合。
+    pub fn valid_chunks(&self) -> ChunkSet {
+        let mut s = ChunkSet::all(self.chunk_count());
+        if self.holes.is_some()
+            && let Some(row) = self.table.first()
+        {
+            for (k, c) in row.iter().enumerate() {
+                if matches!(c, Chunk::Hole) {
+                    s.remove(k);
+                }
             }
+        }
+        s
+    }
+
+    /// すべてのチャンクが有効（範囲の描画で作った値でない）なら true。
+    pub fn is_complete(&self) -> bool {
+        self.holes.is_none()
+    }
+
+    /// 無効なチャンクを読んだことがあれば true（範囲の描画が申告した依存の外を読んだ印）。
+    pub fn holes_read(&self) -> bool {
+        self.holes
+            .as_ref()
+            .is_some_and(|h| h.read.load(Ordering::Relaxed))
+    }
+
+    /// `set` のチャンクを（全チャンネルで）無効にした値。無効にしたチャンクの中身は持たない（手放す）。読んだ印は新しく
+    /// する。
+    pub fn invalidate(&self, set: &ChunkSet) -> Self {
+        let mut any = self.holes.is_some();
+        let table: Vec<Vec<Chunk>> = self
+            .table
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .map(|(k, c)| {
+                        if set.contains(k) {
+                            any = true;
+                            Chunk::Hole
+                        } else {
+                            c.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            rate: self.rate,
+            frames: self.frames,
+            table: Arc::new(table),
+            holes: any.then(|| Arc::new(HoleFlag::default())),
+            meta: self.meta.clone(),
+        }
+    }
+
+    /// `keep` のチャンクだけを残し、ほかを無効にした値。
+    pub fn keep_only(&self, keep: &ChunkSet) -> Self {
+        let mut drop = ChunkSet::all(self.chunk_count());
+        drop.subtract(keep);
+        self.invalidate(&drop)
+    }
+
+    /// チャンネル `ch` のチャンク `k` が、`other` の同じ位置のチャンクと同じ実体（写さずに共有したもの）なら true
+    /// （中身を比べない。どちらかが無効なら false。変わった区間の絞り込みと継ぎはぎに使う）。
+    pub fn same_chunk(&self, other: &Audio, ch: usize, k: usize) -> bool {
+        match (self.chunk(ch, k), other.chunk(ch, k)) {
+            (Ok(Chunk::Data(a)), Ok(Chunk::Data(b))) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
 
-    /// 中身の実体ごとの（番地, バイト数）を `out` に足す（`Value::chunks`）。
+    /// 中身を持つチャンクのバイト数の和（無効なチャンクは数えない）。
+    pub fn resident_bytes(&self) -> u64 {
+        self.table
+            .iter()
+            .flatten()
+            .map(|c| match c {
+                Chunk::Data(v) => (v.len() as u64).saturating_mul(4),
+                Chunk::Hole => 0,
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// 中身の実体ごとの（番地, バイト数）を `out` に足す（`Value::chunks`。無効なチャンクは中身を持たないので数えない）。
     pub(crate) fn chunks_into(&self, out: &mut Vec<(usize, u64)>) {
-        for p in &self.planes {
-            out.push((Arc::as_ptr(p).addr(), (p.len() as u64).saturating_mul(4)));
+        for c in self.table.iter().flatten() {
+            if let Chunk::Data(v) = c {
+                out.push((Arc::as_ptr(v).addr(), (v.len() as u64).saturating_mul(4)));
+            }
         }
     }
 }
 
-/// 標本を足していって音声を組む（デコーダ用。値と同じ量しか持たない）。`window` で、足した標本の頭を飛ばし、長さを
-/// 切れる（編集リストのある AAC など）。
+impl PartialEq for Audio {
+    /// レート・長さ・チャンネル・メタデータ・無効なチャンクの位置が同じで、有効なチャンクの中身が同じ（共有した実体は
+    /// 中身を比べない。f32 の比べなので、共有していない NaN は自分と違う）。
+    fn eq(&self, other: &Self) -> bool {
+        if self.rate != other.rate
+            || self.frames != other.frames
+            || self.channels() != other.channels()
+            || self.meta != other.meta
+        {
+            return false;
+        }
+        if Arc::ptr_eq(&self.table, &other.table) {
+            return true;
+        }
+        self.table.iter().zip(other.table.iter()).all(|(ra, rb)| {
+            ra.iter().zip(rb).all(|(a, b)| match (a, b) {
+                (Chunk::Data(x), Chunk::Data(y)) => Arc::ptr_eq(x, y) || x == y,
+                (Chunk::Hole, Chunk::Hole) => true,
+                _ => false,
+            })
+        })
+    }
+}
+
+impl fmt::Debug for Audio {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let holes = self.chunk_count() - self.valid_chunks().count();
+        f.debug_struct("Audio")
+            .field("rate", &self.rate)
+            .field("channels", &self.channels())
+            .field("frames", &self.frames)
+            .field("chunks", &self.chunk_count())
+            .field("holes", &holes)
+            .field("meta", &self.meta)
+            .finish()
+    }
+}
+
+/// 標本を足していって音声を組む（デコーダ用）。チャンクを `try_reserve_exact` で取って埋めていくので、値と同じ量しか
+/// 持たない。`window` で、足した標本の頭を飛ばし、長さを切れる（編集リストのある AAC など）。
 pub struct AudioBuilder {
     rate: u32,
-    planes: Vec<Vec<f32>>,
+    /// できあがったチャンク（チャンネルごと）。
+    table: Vec<Vec<Chunk>>,
+    /// 埋めている途中のチャンク（チャンネルごと。長さは C 未満でそろう）。
+    cur: Vec<Vec<f32>>,
+    /// 残したフレームの数。
+    frames: u64,
+    /// 見込みの長さ（途中のチャンクの確保の目安だけ）。
+    hint: u64,
     /// 頭から飛ばすフレームの残り。
     skip: u64,
     /// 残すフレームの上限の残り。
@@ -217,21 +579,16 @@ pub struct AudioBuilder {
 }
 
 impl AudioBuilder {
-    /// レート `rate`・`channels` チャンネルの音声を組み始める。`frames_hint` は見込みの長さ（上限。確保の目安だけで値に
+    /// レート `rate`・`channels` チャンネルの音声を組み始める。`frames_hint` は見込みの長さ（確保の目安だけで値に
     /// 効かない）。レート・チャンネルの数が正しくなければエラー。
     pub fn new(rate: u32, channels: usize, frames_hint: u64) -> Result<Self, EngineError> {
         check_header(rate, channels)?;
-        let hint = usize::try_from(frames_hint).unwrap_or(usize::MAX);
-        let mut planes = Vec::with_capacity(channels);
-        for _ in 0..channels {
-            let mut p = Vec::new();
-            p.try_reserve_exact(hint)
-                .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-            planes.push(p);
-        }
         Ok(Self {
             rate,
-            planes,
+            table: vec![Vec::new(); channels],
+            cur: vec![Vec::new(); channels],
+            frames: 0,
+            hint: frames_hint,
             skip: 0,
             take: u64::MAX,
         })
@@ -247,16 +604,39 @@ impl AudioBuilder {
 
     /// 残したフレームの数。
     pub fn frames(&self) -> u64 {
-        self.planes.first().map_or(0, |p| p.len() as u64)
+        self.frames
+    }
+
+    /// 途中のチャンクがいっぱいなら、できあがったチャンクに移して次を確保する。
+    fn reserve_next(&mut self) -> Result<(), EngineError> {
+        // 次のチャンクの大きさの見込み（見込みの長さの残りか C の小さいほう。足りなければ C まで伸ばす）
+        let left = self.hint.saturating_sub(self.frames);
+        let want = usize::try_from(left)
+            .unwrap_or(usize::MAX)
+            .clamp(1, AUDIO_CHUNK);
+        for (row, cur) in self.table.iter_mut().zip(self.cur.iter_mut()) {
+            if cur.len() == AUDIO_CHUNK {
+                let mut next = Vec::new();
+                next.try_reserve_exact(want)
+                    .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+                row.try_reserve(1)
+                    .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+                row.push(Chunk::Data(Arc::new(std::mem::replace(cur, next))));
+            } else if cur.capacity() == 0 {
+                cur.try_reserve_exact(want)
+                    .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+            }
+        }
+        Ok(())
     }
 
     /// チャンネルごとの標本の列（チャンネルの数だけ、同じ長さ）を足す。
     pub fn push_frames(&mut self, planes: &[&[f32]]) -> Result<(), EngineError> {
-        if planes.len() != self.planes.len() {
+        if planes.len() != self.cur.len() {
             return Err(EngineError::Internal(format!(
                 "チャンネルの数が違います（{} と {}）",
                 planes.len(),
-                self.planes.len()
+                self.cur.len()
             )));
         }
         let n = planes.first().map_or(0, |p| p.len());
@@ -271,20 +651,26 @@ impl AudioBuilder {
             .unwrap_or(usize::MAX)
             .min(n - skip);
         self.take -= keep as u64;
-        if keep == 0 {
-            return Ok(());
-        }
-        for (dst, src) in self.planes.iter_mut().zip(planes) {
-            dst.try_reserve(keep)
-                .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-            dst.extend_from_slice(&src[skip..skip + keep]);
+        let mut at = skip;
+        let end = skip + keep;
+        while at < end {
+            self.reserve_next()?;
+            let room = AUDIO_CHUNK - self.cur.first().map_or(0, Vec::len);
+            let m = room.min(end - at);
+            for (cur, src) in self.cur.iter_mut().zip(planes) {
+                cur.try_reserve(m)
+                    .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+                cur.extend_from_slice(&src[at..at + m]);
+            }
+            at += m;
+            self.frames += m as u64;
         }
         Ok(())
     }
 
     /// インターリーブした標本（フレームの順に全チャンネル）を足す。長さはチャンネルの数の倍数であること。
     pub fn push_interleaved(&mut self, samples: &[f32]) -> Result<(), EngineError> {
-        let ch = self.planes.len();
+        let ch = self.cur.len();
         if !samples.len().is_multiple_of(ch) {
             return Err(EngineError::Internal(
                 "インターリーブの標本の数がチャンネルの数の倍数でありません".into(),
@@ -304,12 +690,15 @@ impl AudioBuilder {
     }
 
     /// 組み終えて値にする（メタデータは `meta`）。
-    pub fn finish(self, meta: AudioMeta) -> Result<Audio, EngineError> {
-        Audio::new(
-            self.rate,
-            self.planes.into_iter().map(Arc::new).collect(),
-            meta,
-        )
+    pub fn finish(mut self, meta: AudioMeta) -> Result<Audio, EngineError> {
+        for (row, cur) in self.table.iter_mut().zip(self.cur) {
+            if !cur.is_empty() {
+                row.push(Chunk::Data(Arc::new(cur)));
+            }
+        }
+        let frames = usize::try_from(self.frames)
+            .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+        Audio::from_chunks(self.rate, frames, self.table, meta)
     }
 }
 
@@ -417,5 +806,161 @@ mod tests {
         assert!(b.push_frames(&[&[0.0]]).is_err());
         assert!(b.push_frames(&[&[0.0], &[]]).is_err());
         assert!(b.push_interleaved(&[0.0]).is_err());
+    }
+
+    fn value(planes: &[Vec<f32>]) -> Audio {
+        Audio::new(
+            8_000,
+            planes.iter().cloned().map(Arc::new).collect(),
+            AudioMeta::default(),
+        )
+        .unwrap()
+    }
+
+    /// 表は正規の区切り：チャンク k は [k·C, min((k+1)·C, frames))。1 チャンク以下のチャンネルは写さずに共有し、
+    /// 長いチャンネルは C ずつに分ける。
+    #[test]
+    fn table_is_canonical_and_short_planes_are_shared() {
+        let short = Arc::new(vec![0.25f32; 100]);
+        let a = Audio::new(8_000, vec![short.clone()], AudioMeta::default()).unwrap();
+        let Chunk::Data(c) = a.chunk(0, 0).unwrap() else {
+            panic!()
+        };
+        assert!(Arc::ptr_eq(c, &short));
+        assert!(Arc::ptr_eq(&a.to_planes().unwrap()[0], &short));
+        let frames = 2 * AUDIO_CHUNK + 37;
+        let a = value(&ramp(2, frames));
+        assert_eq!(a.chunk_count(), 3);
+        for k in 0..3 {
+            let Chunk::Data(c) = a.chunk(1, k).unwrap() else {
+                panic!()
+            };
+            assert_eq!(c.len(), a.chunk_range(k).len());
+        }
+        assert_eq!(a.chunk_range(2), 2 * AUDIO_CHUNK..frames);
+        assert!(a.chunk(2, 0).is_err() && a.chunk(0, 3).is_err());
+        assert_eq!(a.resident_bytes(), 2 * frames as u64 * 4);
+        let empty = value(&[Vec::new()]);
+        assert_eq!(empty.chunk_count(), 0);
+        assert_eq!(empty.to_planes().unwrap()[0].len(), 0);
+    }
+
+    /// `from_chunks` は不変条件（チャンクの数・正規の長さ・無効の位置がチャンネルでそろう）を確かめる。
+    #[test]
+    fn from_chunks_checks_invariants() {
+        let c = |n: usize| Chunk::Data(Arc::new(vec![0.0; n]));
+        let n = AUDIO_CHUNK + 5;
+        let m = AudioMeta::default;
+        assert!(Audio::from_chunks(8_000, n, vec![vec![c(AUDIO_CHUNK), c(5)]], m()).is_ok());
+        // 数が違う・長さが違う
+        assert!(Audio::from_chunks(8_000, n, vec![vec![c(AUDIO_CHUNK)]], m()).is_err());
+        assert!(Audio::from_chunks(8_000, n, vec![vec![c(AUDIO_CHUNK), c(6)]], m()).is_err());
+        assert!(Audio::from_chunks(8_000, n, vec![vec![c(5), c(AUDIO_CHUNK)]], m()).is_err());
+        // 無効はチャンネルでそろう
+        let ok = Audio::from_chunks(
+            8_000,
+            n,
+            vec![vec![Chunk::Hole, c(5)], vec![Chunk::Hole, c(5)]],
+            m(),
+        )
+        .unwrap();
+        assert!(!ok.is_complete());
+        assert!(
+            Audio::from_chunks(
+                8_000,
+                n,
+                vec![vec![Chunk::Hole, c(5)], vec![c(AUDIO_CHUNK), c(5)]],
+                m()
+            )
+            .is_err()
+        );
+        assert!(
+            Audio::from_chunks(
+                8_000,
+                n,
+                vec![vec![c(AUDIO_CHUNK), c(5)], vec![Chunk::Hole, c(5)]],
+                m()
+            )
+            .is_err()
+        );
+        assert!(Audio::from_chunks(0, 0, vec![vec![]], m()).is_err());
+        assert!(Audio::from_chunks(8_000, 0, vec![], m()).is_err());
+    }
+
+    /// 無効なチャンク：読むと誤りで印が立ち、有効なチャンクはそのまま読める。中身は持たない（数えない）。`keep_only` は
+    /// 残したチャンクの実体を共有する。
+    #[test]
+    fn holes_are_refused_and_marked() {
+        let frames = 3 * AUDIO_CHUNK;
+        let planes = ramp(2, frames);
+        let full = value(&planes);
+        let mut keep = ChunkSet::empty(3);
+        keep.insert(1);
+        let part = full.keep_only(&keep);
+        assert!(!part.is_complete() && full.is_complete());
+        assert_eq!(part.valid_chunks(), keep);
+        assert_eq!(part.resident_bytes(), 2 * AUDIO_CHUNK as u64 * 4);
+        assert!(part.same_chunk(&full, 1, 1) && !part.same_chunk(&full, 1, 0));
+        // 有効なチャンクの中は読める（印は立たない）
+        let mut out = vec![0f32; 10];
+        part.read(1, AUDIO_CHUNK as u64 + 3, &mut out).unwrap();
+        assert_eq!(out, planes[1][AUDIO_CHUNK + 3..AUDIO_CHUNK + 13]);
+        assert!(!part.holes_read());
+        // 境をまたいで無効なチャンクに入ると誤り・印
+        assert!(part.read(0, 2 * AUDIO_CHUNK as u64 - 2, &mut out).is_err());
+        assert!(part.holes_read());
+        let again = full.keep_only(&keep);
+        assert!(again.chunk_data(0, 0).is_err() && again.holes_read());
+        assert!(
+            full.keep_only(&keep)
+                .for_each_chunk(&NoMonitor, |_, _| Ok(()))
+                .is_err()
+        );
+        // 全部を有効にすれば完全な値と同じ（印は新しい）
+        let none = full.invalidate(&ChunkSet::empty(3));
+        assert!(none.is_complete());
+        assert_eq!(none, full);
+        // 無効の位置も等しさに入る
+        let mut other = ChunkSet::empty(3);
+        other.insert(2);
+        assert_ne!(part, full.keep_only(&other));
+        assert_eq!(part, full.keep_only(&keep));
+    }
+
+    /// メタデータだけを替える写しは表を共有する（O(1)）。`Debug` は標本を出さない。
+    #[test]
+    fn with_meta_shares_and_debug_is_short() {
+        let a = value(&ramp(2, AUDIO_CHUNK + 1));
+        let meta = AudioMeta {
+            loop_range: Some(crate::value::LoopRange { start: 1, end: 9 }),
+            ..AudioMeta::default()
+        };
+        let b = a.with_meta(meta.clone());
+        assert!(Arc::ptr_eq(&a.table, &b.table));
+        assert_eq!(b.meta, meta);
+        assert_ne!(a, b);
+        let text = format!("{a:?}");
+        assert!(text.len() < 400, "{text}");
+        assert!(text.contains("chunks: 2"), "{text}");
+    }
+
+    #[test]
+    fn chunk_sets() {
+        let mut s = ChunkSet::empty(130);
+        for k in [0, 63, 64, 129, 500] {
+            s.insert(k);
+        }
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![0, 63, 64, 129]);
+        assert_eq!(s.count(), 4);
+        let mut t = ChunkSet::all(130);
+        assert_eq!(t.count(), 130);
+        t.subtract(&s);
+        assert_eq!(t.count(), 126);
+        assert!(!t.contains(63) && t.contains(62));
+        t.intersect_with(&s);
+        assert!(t.is_empty());
+        t.union_with(&s);
+        assert_eq!(t, s);
+        assert_eq!(s.universe(), 130);
     }
 }

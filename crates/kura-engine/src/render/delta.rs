@@ -23,7 +23,7 @@ use crate::doc::{InputId, NodeId, OutputId, PortRef};
 use crate::error::EngineError;
 use crate::geom::IRect;
 use crate::shape::Shape;
-use crate::value::{PixelFormat, TILE, Value};
+use crate::value::{AUDIO_CHUNK, Audio, ChunkSet, PixelFormat, TILE, Value};
 
 /// ノードと出力ごとの、前の計画から変わりうる範囲（保守的。キャンバスの座標・音声の区間）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +292,48 @@ fn node_delta(
     })
 }
 
+/// 音声の絞り込み（チャンク単位）：推論の区間（`All` は全区間に開く。今の長さで切る）に掛かるチャンクのうち、前でも今でも
+/// 有効で全チャンネル同じ実体（`Audio::same_chunk`）のものを外し、残りのチャンクと推論の区間の重なりを報告する（無効な
+/// チャンクは推論のまま報告する）。レート・チャンネル・長さが違えば `All`（長さだけが変わる手は段 1 の後半で絞る）。
+fn refine_audio(a: &Audio, b: &Audio, inferred: &Area) -> OutputChange {
+    if a.rate() != b.rate() || a.channels() != b.channels() || a.frames() != b.frames() {
+        return OutputChange::All;
+    }
+    let n = b.frames() as u64;
+    let spans = match inferred {
+        Area::All => Spans::one(0, n),
+        Area::Samples(s) => s.clone(),
+        Area::Empty => return OutputChange::Samples(Spans::new()),
+        Area::Pixels(_) => return OutputChange::All,
+    };
+    let chunk = AUDIO_CHUNK as u64;
+    let mut touched = ChunkSet::empty(b.chunk_count());
+    for &(s, e) in spans.spans() {
+        let e = e.min(n);
+        if s >= e {
+            continue;
+        }
+        for k in s / chunk..e.div_ceil(chunk) {
+            touched.insert(k as usize);
+        }
+    }
+    let mut out = Spans::new();
+    for k in touched.iter() {
+        if (0..b.channels()).all(|ch| a.same_chunk(b, ch, k)) {
+            continue;
+        }
+        let r = b.chunk_range(k);
+        let (cs, ce) = (r.start as u64, r.end as u64);
+        for &(s, e) in spans.spans() {
+            let (lo, hi) = (s.max(cs), e.min(ce));
+            if lo < hi {
+                out.push(lo, hi);
+            }
+        }
+    }
+    OutputChange::Samples(out)
+}
+
 /// 描いたあとの絞り込み：前の出力 `prev` と今の出力 `next` のタイルを `Arc::ptr_eq` で比べ、共有したままのタイル（前の値で
 /// 有効で、同じ実体）を推論 `inferred` から外したもの（報告するタイルは、中身が変わったタイルと前の値で無効だったタイルを含み、
 /// 推論の範囲の中にある）。形・形式・パレット・フレームの位置が違えば `All`。
@@ -303,17 +345,7 @@ pub fn refine(prev: &Value, next: &Value, inferred: &Area) -> OutputChange {
         };
     }
     match (prev, next) {
-        (Value::Audio(a), Value::Audio(b)) => {
-            let same = a.rate() == b.rate()
-                && a.frames() == b.frames()
-                && a.channels() == b.channels()
-                && (0..a.channels()).all(|ch| (0..a.chunk_count()).all(|k| a.same_chunk(b, ch, k)));
-            match (same, inferred) {
-                (true, _) => OutputChange::Samples(Spans::new()),
-                (false, Area::Samples(s)) => OutputChange::Samples(s.clone()),
-                _ => OutputChange::All,
-            }
-        }
+        (Value::Audio(a), Value::Audio(b)) => refine_audio(a, b, inferred),
         (Value::Audio(_), _) | (_, Value::Audio(_)) => OutputChange::All,
         _ => {
             let (pf, nf) = (frames_of(prev), frames_of(next));

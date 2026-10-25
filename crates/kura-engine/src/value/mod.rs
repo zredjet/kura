@@ -7,7 +7,7 @@ pub mod raster;
 
 use std::sync::Arc;
 
-pub use audio::{AUDIO_CHUNK, Audio, AudioBuilder, ChunkData};
+pub use audio::{AUDIO_CHUNK, Audio, AudioBuilder, Chunk, ChunkData, ChunkSet};
 pub use meta::{
     AnimTag, AudioMeta, AudioSource, Grid, ImageMeta, LoopRange, Marker, Slice, TagDirection,
 };
@@ -214,12 +214,22 @@ impl Value {
         }
     }
 
-    /// すべての画素が有効なら true（範囲の描画で作った、無効なタイルのある値は false。段 10。音声はいつも true）。
+    /// すべての画素・標本が有効なら true（範囲の描画で作った、無効なタイル・チャンクのある値は false。段 10・M13）。
     pub fn is_complete(&self) -> bool {
         match self {
             Self::Image(img) => img.px.is_complete(),
             Self::Frames(fr) => fr.frames().iter().all(|f| f.px.is_complete()),
-            Self::Audio(_) => true,
+            Self::Audio(a) => a.is_complete(),
+        }
+    }
+
+    /// 無効なタイル・チャンク（範囲の描画で描かなかったもの）を読んだことがあれば true（範囲の描画が申告した依存の外を
+    /// 読んだ印）。
+    pub fn holes_read(&self) -> bool {
+        match self {
+            Self::Image(img) => img.px.holes_read(),
+            Self::Frames(fr) => fr.frames().iter().any(|f| f.px.holes_read()),
+            Self::Audio(a) => a.holes_read(),
         }
     }
 
@@ -228,7 +238,8 @@ impl Value {
     pub fn digest(&self) -> Result<Digest, EngineError> {
         if !self.is_complete() {
             return Err(EngineError::Internal(
-                "範囲だけを描いた値（無効なタイルのある値）のダイジェストは取れません".into(),
+                "範囲だけを描いた値（無効なタイル・チャンクのある値）のダイジェストは取れません"
+                    .into(),
             ));
         }
         match self {

@@ -213,8 +213,27 @@ impl Op for Resample {
         )?))
     }
 
-    fn work_bytes(_p: &Self::Params, _inputs: &[Shape], out: &Shape) -> crate::op::Work {
-        crate::audio::render_all_work(out)
+    fn work_bytes(p: &Self::Params, inputs: &[Shape], out: &Shape) -> crate::op::Work {
+        let mut w = crate::audio::render_all_work(out);
+        // 核の作業列：出力のチャンク 1 つが読む入力の窓（大きく縮めると窓はチャンクの何倍にもなる）
+        if let Some((from, _, _)) = inputs.first().and_then(audio_shape)
+            && from != p.rate
+        {
+            let (l, m) = ratio(from, p.rate);
+            let h = taps(from, p.rate) / 2;
+            let out_frames = match out {
+                Shape::Audio { frames, .. } => frames.max(),
+                _ => 0,
+            };
+            let chunk = out_frames.min(crate::value::AUDIO_CHUNK as u64);
+            let win = u128::from(chunk)
+                .saturating_mul(u128::from(m))
+                .div_ceil(u128::from(l.max(1)))
+                .saturating_add(u128::from(h) * 2 + 2);
+            let bytes = u64::try_from(win.saturating_mul(4)).unwrap_or(u64::MAX);
+            w.per_task = w.per_task.max(bytes);
+        }
+        w
     }
 
     fn audio_kernel(

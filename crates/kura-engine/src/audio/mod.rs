@@ -2,17 +2,17 @@
 //!
 //! 音声の操作は、入力全体を見て出力の各フレームを決まった式で計算する「核」（`AudioKernel`）として書く。
 //! 前計算（ラウドネス・フィルタの表など）は核を作るときに 1 度だけ行い、`render` は出力の区間を描く純粋な関数にする。
-//! `apply` は核を `AUDIO_BLOCK` ずつ並列に描くだけなので、区間の切り方・スレッド数によらず同じ値になる（E18）。
+//! `apply` は核をチャンク（`AUDIO_CHUNK`）ずつ並列に描くだけなので、区間の切り方・スレッド数によらず同じ値になる（E18）。
 //! 状態を運ぶフィルタ（IIR など）は核にせず、解析（`crate::analysis`）の側で全体を順に流す。
 
 pub mod resample;
 
 use std::sync::Arc;
 
-use crate::determinism::{AUDIO_BLOCK, block_count, par_blocks};
+use crate::determinism::par_blocks;
 use crate::error::EngineError;
 use crate::monitor::Monitor;
-use crate::value::{Audio, AudioMeta, Value};
+use crate::value::{AUDIO_CHUNK, Audio, AudioMeta, Chunk, Value};
 
 /// 音声の操作の核：出力のチャンネル・長さ・レートと、出力の区間を描く関数。
 pub trait AudioKernel: Send + Sync {
@@ -39,6 +39,8 @@ pub trait AudioKernel: Send + Sync {
 }
 
 /// 核の出力の全体を描いて値にする（メタデータは `meta` を付ける。写し方は実行器が当て直す）。
+/// （チャンネル, チャンク）の対ごとに、チャンク（`AUDIO_CHUNK` フレーム）を `par_blocks` で描いてそのまま表に入れる
+/// （平面へ写し直さない。持つ量は出力の値と、並列の仕事ごとの核の作業列だけ）。
 pub fn render_all(
     k: &dyn AudioKernel,
     meta: AudioMeta,
@@ -46,36 +48,41 @@ pub fn render_all(
 ) -> Result<Value, EngineError> {
     let frames =
         usize::try_from(k.frames()).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-    let mut planes = Vec::with_capacity(k.channels());
-    for ch in 0..k.channels() {
-        let blocks = par_blocks(block_count(frames, AUDIO_BLOCK), mon, |b| {
-            let start = b * AUDIO_BLOCK;
-            let end = start.saturating_add(AUDIO_BLOCK).min(frames);
-            let mut out = crate::codec::try_vec(end - start, 0f32)?;
-            k.render(ch, start as u64, &mut out)?;
-            Ok(out)
-        })?;
-        let mut plane: Vec<f32> = Vec::new();
-        plane
-            .try_reserve_exact(frames)
-            .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-        for b in blocks {
-            plane.extend_from_slice(&b);
-        }
-        planes.push(Arc::new(plane));
+    let channels = k.channels();
+    let count = frames.div_ceil(AUDIO_CHUNK);
+    let tasks = channels
+        .checked_mul(count)
+        .ok_or_else(|| EngineError::Limit("音声が長すぎます".into()))?;
+    let chunks = par_blocks(tasks, mon, |t| {
+        let (ch, j) = (t / count, t % count);
+        let start = j * AUDIO_CHUNK;
+        let end = start.saturating_add(AUDIO_CHUNK).min(frames);
+        let mut out = crate::codec::try_vec(end - start, 0f32)?;
+        k.render(ch, start as u64, &mut out)?;
+        Ok(Chunk::Data(Arc::new(out)))
+    })?;
+    let mut table = Vec::with_capacity(channels);
+    let mut it = chunks.into_iter();
+    for _ in 0..channels {
+        table.push(it.by_ref().take(count).collect());
     }
-    Ok(Value::Audio(Arc::new(Audio::new(k.rate(), planes, meta)?)))
+    Ok(Value::Audio(Arc::new(Audio::from_chunks(
+        k.rate(),
+        frames,
+        table,
+        meta,
+    )?)))
 }
 
-/// [`render_all`] が出力の値のほかに使う作業領域（`Op::work_bytes`）：チャンネルごとに、ブロックの列（1 チャンネルぶん）を
-/// 描いてから平面に写すので、描いている間は出力の 1 チャンネルぶんを余分に持つ（そのチャンネルは一時に 2 倍）。
-/// 核は大きな前計算を持たない（ラウドネスなどは解析の結果で、値に比べて小さい）。段 10 の実測（3 分の 44.1 kHz ステレオに
-/// audio.gain。ピークから入力と出力の値を引いたもの）：32 MiB（1 チャンネルは 30 MiB）。
+/// [`render_all`] が出力の値のほかに使う作業領域（`Op::work_bytes`）：並列の仕事（チャンク 1 つ）ごとの核の作業列
+/// （チャンクの長さ × 16 バイト。mono の f64 の和と f32 の読みは 12 バイト）。チャンクを直に描いて表に入れるので、平面へ写し直す分
+/// （M13 の前は出力の 1 チャンネル分）は持たない。窓の大きい核（resample の大きな縮小）は自分の分を足す。
 pub fn render_all_work(out: &crate::shape::Shape) -> crate::op::Work {
     match out {
-        crate::shape::Shape::Audio { frames, .. } => {
-            crate::op::Work::shared(frames.max().saturating_mul(4))
-        }
+        crate::shape::Shape::Audio { frames, .. } => crate::op::Work {
+            shared: 0,
+            per_task: frames.max().min(AUDIO_CHUNK as u64).saturating_mul(16),
+        },
         _ => crate::op::Work::ZERO,
     }
 }
