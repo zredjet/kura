@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../../i18n/ja';
@@ -109,6 +109,126 @@ describe('Tile（素材の表示）', () => {
     expect(container.querySelector('img')).toBeNull();
     expect(container.querySelector('[data-kind="model"][aria-hidden="true"]')).not.toBeNull();
     expect(screen.getByText(ja.kinds.model)).toBeInTheDocument();
+  });
+
+  describe('音声の波形（M13 段 5）', () => {
+    // 確かめた結果は URL ごとに覚えるので、場合ごとに別のハッシュにする
+    const hashOf = (n: number) => n.toString(16).padStart(64, '0');
+    const waveOf = (hash: string) => `kura://localhost/wave/${hash}/1`;
+    const decorative = (c: HTMLElement) => c.querySelector('svg[viewBox="0 0 120 24"]');
+    const mask = (c: HTMLElement) => c.querySelector('[data-render="mask"]');
+    const probe = (c: HTMLElement) => c.querySelector('img[hidden]');
+    const song = (hash: string, over: Partial<ItemSummaryDto> = {}) =>
+      tile({ kind: 'audio', ext: 'mp3', hash, thumbState: 'failed', durationMs: 4_000, ...over });
+
+    it('ジャケットのない解析済みの音声は実波形を mask で出し、最初の 1 回だけ同じ URL を確かめる', () => {
+      const hash = hashOf(1);
+      const { container } = song(hash);
+      expect(mask(container)?.getAttribute('style')).toContain(`url("${waveOf(hash)}")`);
+      expect(decorative(container)).toBeNull();
+      const img = probe(container);
+      expect(img?.getAttribute('src')).toBe(waveOf(hash));
+      expect(img?.getAttribute('crossorigin')).toBe('anonymous');
+      expect(screen.getByText(ja.kinds.audio)).toBeInTheDocument();
+    });
+
+    it('読めたら覚えて、作り直したタイルは mask だけ（確かめの要求を出さない）', () => {
+      const hash = hashOf(2);
+      const first = song(hash);
+      const img = probe(first.container);
+      expect(img).not.toBeNull();
+      fireEvent.load(img as HTMLImageElement);
+      first.unmount();
+      const again = song(hash);
+      expect(mask(again.container)).not.toBeNull();
+      expect(probe(again.container)).toBeNull();
+    });
+
+    it('読めなければ（段のファイルがない）飾りの波形に戻り、作り直したタイルも要求を出さない', () => {
+      const hash = hashOf(3);
+      const first = song(hash);
+      fireEvent.error(probe(first.container) as HTMLImageElement);
+      expect(decorative(first.container)).not.toBeNull();
+      expect(mask(first.container)).toBeNull();
+      expect(probe(first.container)).toBeNull();
+      first.unmount();
+      const again = song(hash);
+      expect(decorative(again.container)).not.toBeNull();
+      expect(again.container.querySelector('img')).toBeNull();
+      expect(mask(again.container)).toBeNull();
+    });
+
+    it('解析の前・解析できなかった音声は飾りの波形で、波形を求めない', () => {
+      for (const [n, analysisState] of [
+        [4, 'pending'],
+        [5, 'failed'],
+      ] as const) {
+        const { container, unmount } = song(hashOf(n), { analysisState });
+        expect(decorative(container)).not.toBeNull();
+        expect(container.querySelector('img')).toBeNull();
+        expect(mask(container)).toBeNull();
+        unmount();
+      }
+    });
+
+    it('ジャケットがあればジャケット（実波形は出さない）', () => {
+      const hash = hashOf(6);
+      const { container } = song(hash, { thumbState: 'ready', thumbRev: 1 });
+      const imgs = container.querySelectorAll('img');
+      expect(imgs).toHaveLength(1);
+      expect(imgs[0]?.getAttribute('src')).toBe(`kura://localhost/thumb/${hash}/s?r=1`);
+      expect(mask(container)).toBeNull();
+      expect(decorative(container)).toBeNull();
+    });
+
+    it('ジャケットが読めなければ実波形に替わる', () => {
+      const hash = hashOf(7);
+      const { container } = song(hash, { thumbState: 'ready' });
+      fireEvent.error(container.querySelector('img') as HTMLImageElement);
+      expect(mask(container)).not.toBeNull();
+      expect(probe(container)?.getAttribute('src')).toBe(waveOf(hash));
+    });
+
+    it('ユニットの表紙の音声も同じ（ジャケットがなく解析済みなら実波形）', () => {
+      const hash = hashOf(8);
+      const unit = {
+        id: 4,
+        kind: 'set',
+        name: '効果音',
+        cover: {
+          itemId: 2,
+          hash,
+          kind: 'audio',
+          thumbState: 'failed',
+          width: null,
+          height: null,
+          thumbRev: 0,
+          analysisState: 'ready',
+          alpha: null,
+          pixelArt: false,
+        },
+        count: 3,
+        durationMs: 0,
+        kinds: ['audio'],
+        rating: 0,
+        ownRating: 0,
+        origin: 'user',
+        createdAt: 0,
+        lastPlayedAt: null,
+      } as UnitSummaryDto;
+      const { container } = render(
+        <UnitTile
+          id={9}
+          unit={unit}
+          width={180}
+          height={180}
+          selected={false}
+          handlers={handlers}
+        />,
+      );
+      expect(mask(container)).not.toBeNull();
+      expect(probe(container)?.getAttribute('src')).toBe(waveOf(hash));
+    });
   });
 
   it('ユニットの表紙も作り直し中の絵を rev 付きで出し、透過なら市松模様', () => {

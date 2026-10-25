@@ -9,6 +9,7 @@ import {
   peaksUrl,
   playUrl,
   thumbUrl,
+  waveUrl,
 } from './media';
 
 describe('URL', () => {
@@ -27,6 +28,11 @@ describe('URL', () => {
     expect(animUrl('ab', 7)).toBe('kura://localhost/anim/ab/1?r=7');
     expect(fileUrl('ab')).toBe('kura://localhost/file/ab');
     expect(playUrl('ab')).toBe('kura://localhost/play/ab');
+  });
+
+  it('グリッドの実波形は形の版 1（immutable。?r= を付けない）', () => {
+    const hash = 'ab'.repeat(32);
+    expect(waveUrl(hash)).toBe(`kura://localhost/wave/${hash}/1`);
   });
 
   it.each([

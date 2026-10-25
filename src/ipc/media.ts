@@ -8,6 +8,9 @@ const BASE = 'kura://localhost';
 /** アニメの帯の並べ方の版（Rust の `asset::anim::ANIM_V`。並べ方を変えたら上げる）。 */
 const ANIM_V = 1;
 
+/** グリッドの実波形の形の版（Rust の `asset::wave::WAVE_V`。棒の数・大きさ・描き方を変えたら上げる）。 */
+const WAVE_V = 1;
+
 /** `?r=`（`rev` が 0 より大きいときだけ。作り直したものを WebKit のメモリのキャッシュから出さないため）。 */
 function revQuery(rev: number): string {
   return Number.isSafeInteger(rev) && rev > 0 ? `?r=${rev}` : '';
@@ -44,6 +47,14 @@ export function playUrl(hash: string): string {
 /** 波形の段（`kura-peaks`。immutable）。`fetch` して `src/lib/asset/peaks.ts` の `parsePeaks` で読む。 */
 export function peaksUrl(hash: string): string {
   return `${BASE}/peaks/${hash}`;
+}
+
+/**
+ * ジャケットのない音声のタイルの実波形（48 本の棒のアルファの PNG。波形の段から Rust がその場で作る。immutable）。
+ * CSS の `mask-image` にして tokens の色を付ける（`features/library/TileWave`）。段のファイルがなければ 404。
+ */
+export function waveUrl(hash: string): string {
+  return `${BASE}/wave/${hash}/${WAVE_V}`;
 }
 
 /**

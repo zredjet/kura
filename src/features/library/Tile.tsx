@@ -17,6 +17,7 @@ import type { UnitSummaryDto } from '../../ipc/units';
 import { formatCount, formatDuration } from '../../lib/format';
 import { spokenLabel } from './describeItem';
 import styles from './Tile.module.css';
+import { TileWave } from './TileWave';
 
 /** ダウンロードで取得したものの取得元。 */
 const DOWNLOAD_SITES = new Set(['youtube', 'pixiv', 'x', 'nicovideo', 'soundcloud']);
@@ -34,12 +35,26 @@ function hasKindBadge(kind: string | undefined): kind is ItemKind {
 /** ユニットの表紙を下げる分（Tile.module.css の .cover の top）。 */
 const UNIT_COVER_TOP = 6;
 
-/** サムネイルがないとき（まだ・作れなかった）の絵：音楽は波形の飾り、フォント・3D は種類の絵。 */
-function placeholderOf(kind: string) {
-  if (kind === 'audio') {
-    return <Waveform className={styles.waveform} />;
+/** タイルの絵の元（アイテムの概要か、ユニットの表紙）。 */
+interface PlaceholderSource {
+  hash: string;
+  kind: string;
+  analysisState: string;
+}
+
+/**
+ * サムネイル（音楽ならジャケット）がないとき（まだ・作れなかった・ジャケットがない）の絵：音楽は解析が済んでいれば実波形
+ * （段のファイルは解析のジョブが DB に書く前に置く）、解析の前・解析できないものは飾りの波形。フォント・3D は種類の絵。
+ */
+function placeholderOf(source: PlaceholderSource) {
+  if (source.kind === 'audio') {
+    return source.analysisState === 'ready' ? (
+      <TileWave hash={source.hash} className={styles.waveform} />
+    ) : (
+      <Waveform className={styles.waveform} />
+    );
   }
-  return isAsset(kind) ? <KindArt kind={kind} /> : null;
+  return isAsset(source.kind) ? <KindArt kind={source.kind} /> : null;
 }
 
 /** タイルのマウス・ドラッグの受け口（グリッドが持つ）。 */
@@ -98,7 +113,7 @@ export const Tile = memo(function Tile({
           fit="cover"
           box={{ w: width, h: height }}
           className={styles.thumb}
-          fallback={placeholderOf(item.kind)}
+          fallback={placeholderOf(item)}
         />
       )}
       {hasKindBadge(kind) && (
@@ -188,7 +203,7 @@ export const UnitTile = memo(function UnitTile({
             fit="cover"
             box={{ w: width, h: height - UNIT_COVER_TOP }}
             className={styles.thumb}
-            fallback={placeholderOf(cover.kind)}
+            fallback={placeholderOf(cover)}
           />
         )}
         <span className={`${styles.badge} ${styles.bottomRight}`}>
