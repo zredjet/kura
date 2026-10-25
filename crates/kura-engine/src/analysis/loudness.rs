@@ -289,7 +289,8 @@ impl Measured {
     /// ので、積分ラウドネスは g + h_m（h_m は上から m 個のうち相対ゲートを通るものの平均のラウドネス）の直線になる。
     /// 区間ごとに g = target − h_m が区間の中にあるかを調べ、あるもののうち |g| が最小（同じなら小さい g）を選ぶ。
     /// 回数の打ち切りがなく O(n log n)。解がなければ（target が −70 以下など）、区間の端に寄せた候補のうち
-    /// `integrated_at` が target にいちばん近い g。
+    /// `integrated_at` が target にいちばん近い g（この場合だけ候補の数 × O(n)）。値は、候補を 1 つずつ比べて選んでいた
+    /// M13 の前の求め方とビット一致（`gain_to_matches_the_quadratic_reference`）。
     pub fn gain_to(&self, target: f64) -> Option<f64> {
         if !self.measurable {
             return None;
@@ -307,31 +308,8 @@ impl Measured {
         for p in &z {
             prefix.push(prefix[prefix.len() - 1] + p);
         }
-        let mut best: Option<(f64, bool, f64)> = None; // (g, 解か, 誤差)
-        let consider = |g: f64, exact: bool, best: &mut Option<(f64, bool, f64)>| {
-            let err = if exact {
-                0.0
-            } else {
-                let i = self.integrated_at(g);
-                if i.is_finite() {
-                    (i - target).abs()
-                } else {
-                    f64::INFINITY
-                }
-            };
-            let better = match *best {
-                None => true,
-                Some((bg, bexact, berr)) => match (exact, bexact) {
-                    (true, false) => true,
-                    (false, true) => false,
-                    (true, true) => g.abs() < bg.abs() || (g.abs() == bg.abs() && g < bg),
-                    (false, false) => err < berr,
-                },
-            };
-            if better {
-                *best = Some((g, exact, err));
-            }
-        };
+        // 区間ごとの候補 (g, 解か) を区間の順に集める（ここまで O(n log n)）
+        let mut cands: Vec<(f64, bool)> = Vec::with_capacity(z.len());
         let mut c = 0usize;
         let mut m = 0usize;
         while m < z.len() {
@@ -351,14 +329,40 @@ impl Measured {
             let h = OFFSET + 10.0 * math::log10(prefix[c] / c as f64);
             let g = target - h;
             if g > lo && g <= hi {
-                consider(g, true, &mut best);
+                cands.push((g, true));
             } else if hi.is_finite() {
-                consider(hi, false, &mut best);
+                cands.push((hi, false));
             } else {
-                consider(math::max(lo, g), false, &mut best);
+                cands.push((math::max(lo, g), false));
             }
         }
-        best.map(|(g, _, _)| g)
+        // 解があれば、解のうち |g| が最小（同じなら小さい g、それも同じなら先のもの）。解は近似にいつも勝ち、解どうしの
+        // 比べは g だけで決まるので、近似の候補を評価しなくても同じ答えになる（`integrated_at` は O(n) なので呼ばない）
+        let mut exact: Option<f64> = None;
+        for &(g, is_exact) in &cands {
+            if is_exact
+                && exact.is_none_or(|bg| g.abs() < bg.abs() || (g.abs() == bg.abs() && g < bg))
+            {
+                exact = Some(g);
+            }
+        }
+        if exact.is_some() {
+            return exact;
+        }
+        // 解がなければ、近似の候補を区間の順に評価して target にいちばん近いもの（同じなら先のもの）
+        let mut best: Option<(f64, f64)> = None; // (g, 誤差)
+        for &(g, _) in &cands {
+            let i = self.integrated_at(g);
+            let err = if i.is_finite() {
+                (i - target).abs()
+            } else {
+                f64::INFINITY
+            };
+            if best.is_none_or(|(_, berr)| err < berr) {
+                best = Some((g, err));
+            }
+        }
+        best.map(|(g, _)| g)
     }
 }
 
@@ -721,6 +725,138 @@ mod tests {
         let mut silent = blocks_of(&[(-40.0, 3)]);
         silent.blocks.iter_mut().for_each(|b| *b = 0.0);
         assert_eq!(silent.gain_to(-23.0), None);
+    }
+
+    /// M13 の前の `gain_to`（候補ごとに近似なら `integrated_at` を評価して 1 つずつ比べる。O(n²)）。速い道の参照。
+    fn gain_to_quadratic_reference(m: &Measured, target: f64) -> Option<f64> {
+        if !m.measurable {
+            return None;
+        }
+        let mut z: Vec<f64> = m.blocks.iter().copied().filter(|p| *p > 0.0).collect();
+        if z.is_empty() {
+            return None;
+        }
+        z.sort_by(|a, b| b.total_cmp(a));
+        let abs_gate = math::pow(10.0, (-70.0 - OFFSET) / 10.0);
+        let thr = |p: f64| 10.0 * math::log10(abs_gate / p);
+        let mut prefix = Vec::with_capacity(z.len() + 1);
+        prefix.push(0.0f64);
+        for p in &z {
+            prefix.push(prefix[prefix.len() - 1] + p);
+        }
+        let mut best: Option<(f64, bool, f64)> = None;
+        let consider = |g: f64, exact: bool, best: &mut Option<(f64, bool, f64)>| {
+            let err = if exact {
+                0.0
+            } else {
+                let i = m.integrated_at(g);
+                if i.is_finite() {
+                    (i - target).abs()
+                } else {
+                    f64::INFINITY
+                }
+            };
+            let better = match *best {
+                None => true,
+                Some((bg, bexact, berr)) => match (exact, bexact) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    (true, true) => g.abs() < bg.abs() || (g.abs() == bg.abs() && g < bg),
+                    (false, false) => err < berr,
+                },
+            };
+            if better {
+                *best = Some((g, exact, err));
+            }
+        };
+        let mut c = 0usize;
+        let mut k = 0usize;
+        while k < z.len() {
+            let mut end = k + 1;
+            while end < z.len() && z[end] == z[k] {
+                end += 1;
+            }
+            k = end;
+            let lo = thr(z[k - 1]);
+            let hi = z.get(k).map_or(f64::INFINITY, |p| thr(*p));
+            let rel = prefix[k] / k as f64 * 0.1;
+            while c < k && z[c] > rel {
+                c += 1;
+            }
+            let h = OFFSET + 10.0 * math::log10(prefix[c] / c as f64);
+            let g = target - h;
+            if g > lo && g <= hi {
+                consider(g, true, &mut best);
+            } else if hi.is_finite() {
+                consider(hi, false, &mut best);
+            } else {
+                consider(math::max(lo, g), false, &mut best);
+            }
+        }
+        best.map(|(g, _, _)| g)
+    }
+
+    /// E19（M13 段 1）：`gain_to` の 2 段の求め方（解を先に、なければ近似を評価）は、旧い O(n²) の求め方とビット一致。
+    /// ChaCha8 のランダムなブロックの列（同じ値の並び・0・絶対ゲートより小さい値・解のない並び）と、目標 −69〜0 と
+    /// 解のない目標（−70 以下・NaN）で照らす。
+    #[test]
+    fn gain_to_matches_the_quadratic_reference() {
+        use rand_chacha::rand_core::Rng;
+        let mut r = crate::determinism::rng(0x6a17);
+        let mut unit = move || f64::from(r.next_u32()) / 4_294_967_296.0;
+        let mut seen_exact = 0usize;
+        let mut seen_approx = 0usize;
+        for case in 0..160usize {
+            let n = 1 + (unit() * 160.0) as usize;
+            let mut levels: Vec<(f64, usize)> = Vec::new();
+            let repeat_level = -30.0 - unit() * 20.0;
+            for _ in 0..n {
+                let kind = unit();
+                let lufs = if kind < 0.15 {
+                    // 同じ値の並び
+                    repeat_level
+                } else if kind < 0.3 {
+                    // 絶対ゲートより小さい値
+                    -70.5 - unit() * 30.0
+                } else if case % 7 == 0 {
+                    // ゲートの跳びが大きい並び（解のない目標が出やすい）
+                    if unit() < 0.5 { -10.0 } else { -69.0 }
+                } else {
+                    -75.0 + unit() * 75.0
+                };
+                levels.push((lufs, 1 + (unit() * 3.0) as usize));
+            }
+            let mut m = blocks_of(&levels);
+            // 0 のブロック（無音）を混ぜる
+            for b in m.blocks.iter_mut() {
+                if unit() < 0.05 {
+                    *b = 0.0;
+                }
+            }
+            let mut targets: Vec<f64> = (0..6).map(|_| -69.0 + unit() * 69.0).collect();
+            targets.extend([-23.0, 0.0, -69.0, -70.0, -85.0, f64::NAN]);
+            for t in targets {
+                let want = gain_to_quadratic_reference(&m, t);
+                let got = m.gain_to(t);
+                assert_eq!(
+                    got.map(f64::to_bits),
+                    want.map(f64::to_bits),
+                    "case {case} target {t}: {got:?} ≠ {want:?}"
+                );
+                if let Some(g) = got {
+                    if (m.integrated_at(g) - t).abs() < 1e-9 {
+                        seen_exact += 1;
+                    } else {
+                        seen_approx += 1;
+                    }
+                }
+            }
+        }
+        // 解のある場合も、ない場合（近似の評価）も網に入っている
+        assert!(
+            seen_exact > 40 && seen_approx > 40,
+            "{seen_exact} {seen_approx}"
+        );
     }
 
     /// 48 kHz の係数は BS.1770 の Table 1・2 と一致する。
