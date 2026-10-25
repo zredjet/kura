@@ -303,6 +303,25 @@ impl Op for Fade {
         area
     }
 
+    // M13 段 1：長さだけが変わる手：フェードアウトの窓 [n − fo, n) が長さとともに動くので、新旧の窓の和と引数の変化
+    fn audio_length_change(
+        old: &FadeParams,
+        new: &FadeParams,
+        old_in: &[Shape],
+        new_in: &[Shape],
+    ) -> Option<Area> {
+        let exact = |s: &[Shape]| {
+            s.first()
+                .and_then(audio_shape)
+                .and_then(|(_, _, f)| f.exact())
+        };
+        let (n_old, n_new) = (exact(old_in)?, exact(new_in)?);
+        let mut area = Self::param_change(old, new, new_in);
+        area.union_with(&Area::span(n_old - old.fade_out.min(n_old), n_old));
+        area.union_with(&Area::span(n_new - new.fade_out.min(n_new), n_new));
+        Some(area)
+    }
+
     fn effect(p: &FadeParams, inputs: &[Shape]) -> Area {
         let Some(n) = inputs
             .first()

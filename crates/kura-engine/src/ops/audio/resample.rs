@@ -18,7 +18,7 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{audio_of, audio_shape, bad_param, param_issue};
-use crate::render::region::Reach;
+use crate::render::region::{Area, Reach};
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Audio, LoopRange, Value};
@@ -292,6 +292,16 @@ impl Op for Resample {
                 }],
             },
         ]
+    }
+
+    // M13 段 1：長さだけが変わる手（同じ引数なら、入力の尻の変化は上流の範囲を前へ写したもの（窓）に入る）
+    fn audio_length_change(
+        old: &ResampleParams,
+        new: &ResampleParams,
+        _old_in: &[Shape],
+        _new_in: &[Shape],
+    ) -> Option<Area> {
+        Some(if old == new { Area::Empty } else { Area::All })
     }
 
     // 段 10：範囲（多相 FIR の窓）

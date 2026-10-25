@@ -909,3 +909,73 @@ fn audio_view_keeps_only_requested_chunks() {
     assert_eq!(c.changed, OutputChange::Samples(Spans::new()));
     assert_eq!((c.area.drawn_chunks, c.area.reused_chunks), (0, 1));
 }
+
+/// E38（M13 段 1 の C11）：トリムの終わりだけを動かす手（縮める・伸ばす）は、尻（とフェードアウトの窓）だけを報告し、頭の
+/// チャンクは前の表示と共有する。値は `render` と同じ。
+#[test]
+fn trim_end_change_reports_the_tail() {
+    let engine = engine();
+    let input = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 2,
+        frames: 4 * C + 100,
+        seed: 21,
+    }
+    .generate()
+    .unwrap();
+    let source = Digest::default();
+    let fin = inputs_of(&input, source);
+    let doc = |end: u64| {
+        let mut g = Graph::new_single();
+        g.push_linear("audio.trim", 1, json!({ "start": 300, "end": end }), 1)
+            .unwrap();
+        g.push_linear("audio.gain", 1, json!({ "db": -2.0 }), 2)
+            .unwrap();
+        g.push_linear(
+            "audio.fade",
+            1,
+            json!({ "fadeIn": 0, "fadeOut": 500, "curve": "linear" }),
+            3,
+        )
+        .unwrap();
+        g
+    };
+    let req = ViewRequest::whole(OutputId(0), None);
+    for cap in [0, 1 << 30] {
+        let mut cache = NodeCache::new(cap);
+        let mut end = 3 * C + 50;
+        let plan = compile(&engine, &doc(end), &input).unwrap();
+        let mut prev = engine
+            .render_view(&plan, &fin, &mut cache, &req, None, &NoMonitor)
+            .unwrap()
+            .view;
+        for next_end in [3 * C - 20, 3 * C + 500, 2 * C + 7] {
+            let plan = compile(&engine, &doc(next_end), &input).unwrap();
+            let got = engine
+                .render_view(&plan, &fin, &mut cache, &req, Some(&prev), &NoMonitor)
+                .unwrap();
+            let (want, _) = render(&engine, &plan, &input, source).unwrap();
+            let what = format!("上限 {cap}・終わり {end} → {next_end}");
+            check_region(got.view.value(), &want, &Area::All)
+                .unwrap_or_else(|m| panic!("{what}: {m}"));
+            let (old_len, new_len) = (end - 300, next_end - 300);
+            let lo = old_len.min(new_len) - 500;
+            let OutputChange::Samples(s) = &got.changed else {
+                panic!("{what}：全体を報告した（{:?}）", got.changed);
+            };
+            assert!(!s.is_empty(), "{what}");
+            assert!(
+                s.spans()
+                    .iter()
+                    .all(|(a, b)| *a >= lo / C * C && *b <= new_len),
+                "{what}：尻の外を報告した {s:?}"
+            );
+            assert!(got.area.reused_chunks >= 1, "{what}: {:?}", got.area);
+            assert!(
+                got.view.value().shares_audio_chunk(prev.value(), 0, 0),
+                "{what}"
+            );
+            (prev, end) = (got.view, next_end);
+        }
+    }
+}

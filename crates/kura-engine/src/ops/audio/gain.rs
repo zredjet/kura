@@ -14,7 +14,7 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::audio_of;
-use crate::render::region::Reach;
+use crate::render::region::{Area, Reach};
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Audio, LoopRange, Value};
@@ -206,6 +206,16 @@ impl Op for Gain {
     // 段 10：範囲（同じ位置。全チャンネル）
     fn reach(_p: &GainParams, _inputs: &[Shape]) -> Reach {
         Reach::SameTime
+    }
+
+    // M13 段 1：長さだけが変わる手（倍率は位置によらない）
+    fn audio_length_change(
+        old: &GainParams,
+        new: &GainParams,
+        _old_in: &[Shape],
+        _new_in: &[Shape],
+    ) -> Option<Area> {
+        Some(if old == new { Area::Empty } else { Area::All })
     }
 }
 

@@ -254,7 +254,8 @@ fn refine_reports_only_unshared_chunks() {
         refine(&va, &part, &Area::All),
         OutputChange::Samples(Spans::one(3 * C as u64, n as u64))
     );
-    // 長さが違えば全体
+    // 長さだけが違えば、今の長さで切って、共有していないチャンクを報告する（M13 段 1 の C11。長さの違うチャンクは
+    // 共有とみなさない）。レート・チャンネルが違えば全体
     let short = Value::Audio(Arc::new(
         Audio::new(
             8_000,
@@ -263,7 +264,37 @@ fn refine_reports_only_unshared_chunks() {
         )
         .unwrap(),
     ));
-    assert_eq!(refine(&va, &short, &Area::All), OutputChange::All);
+    assert_eq!(
+        refine(&va, &short, &Area::All),
+        OutputChange::Samples(Spans::one(0, n as u64 - 1))
+    );
+    let shorter = Audio::from_chunks(
+        8_000,
+        3 * C,
+        (0..2)
+            .map(|ch| (0..3).map(|k| a.chunk(ch, k).unwrap().clone()).collect())
+            .collect(),
+        AudioMeta::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        refine(
+            &va,
+            &Value::Audio(Arc::new(shorter)),
+            &Area::span(2 * C as u64, n as u64)
+        ),
+        OutputChange::Samples(Spans::new()),
+        "頭の 3 チャンクを共有して縮めた値は、何も報告しない（尻は値の長さで分かる）"
+    );
+    let mono = Value::Audio(Arc::new(
+        Audio::new(
+            8_000,
+            planes(1, n).into_iter().map(Arc::new).collect(),
+            AudioMeta::default(),
+        )
+        .unwrap(),
+    ));
+    assert_eq!(refine(&va, &mono, &Area::All), OutputChange::All);
 }
 
 /// バイト列を読む開き方（呼ぶたびに新しい読み口）。

@@ -191,9 +191,9 @@ pub(super) fn infer(
         .outputs
         .iter()
         .map(|(id, from, shape, q)| {
-            let same = prev_outputs
-                .get(id)
-                .is_some_and(|p| p.1 == *from && p.2 == *shape && p.3 == *q);
+            let same = prev_outputs.get(id).is_some_and(|p| {
+                p.1 == *from && (p.2 == *shape || audio_length_only(&p.2, shape)) && p.3 == *q
+            });
             let area = if same {
                 areas.get(from).unwrap_or(Area::All)
             } else {
@@ -265,7 +265,25 @@ fn node_delta(
         && p.inferred.shape == n.inferred.shape
         && prev_in_shapes == Some(in_shapes);
     if !same_frame {
-        return Ok(Area::All);
+        // 音声の長さだけが変わる手（同じ操作・同じつなぎで、形の違いが音声の長さだけ）は、尻の区間と操作の申告に絞る
+        let length_only = p.op.id() == n.op.id()
+            && p.op.version() == n.op.version()
+            && p.inputs == n.inputs
+            && p.seed == n.seed
+            && !p.lifted
+            && !n.lifted
+            && audio_length_only(&p.inferred.shape, &n.inferred.shape)
+            && prev_in_shapes.is_some_and(|pi| {
+                pi.len() == in_shapes.len()
+                    && pi
+                        .iter()
+                        .zip(in_shapes)
+                        .all(|(a, b)| a == b || audio_length_only(a, b))
+            });
+        return match (length_only, prev_in_shapes) {
+            (true, Some(pi)) => length_delta(p, n, ins, in_shapes, pi),
+            _ => Ok(Area::All),
+        };
     }
     let first = ins.first().cloned().unwrap_or_default();
     let shapes = op_shapes(n, in_shapes);
@@ -292,11 +310,66 @@ fn node_delta(
     })
 }
 
+/// 2 つの形が、レート・チャンネルの同じ（長さの決まった）音声で、長さだけが違うなら true（M13 段 1）。
+pub(super) fn audio_length_only(a: &Shape, b: &Shape) -> bool {
+    match (a, b) {
+        (
+            Shape::Audio {
+                rate: r1,
+                channels: c1,
+                frames: crate::shape::Dim::Exact(f1),
+            },
+            Shape::Audio {
+                rate: r2,
+                channels: c2,
+                frames: crate::shape::Dim::Exact(f2),
+            },
+        ) => r1 == r2 && c1 == c2 && f1 != f2,
+        _ => false,
+    }
+}
+
+/// 音声の長さだけが変わる手の範囲（M13 段 1。docs/editing.md §12.6）：(a) 自分の尻 [min(旧長さ, 新長さ), max(…))（新しい長さの
+/// 外にはみ出してよい。縮めたとき、下流の resample が読む位置を含めるため）∪ (b) 操作の申告（`Op::audio_length_change`。None
+/// は全体）∪ (c) 上流の範囲を前へ写したもの。外したままのノードは入力をそのまま通す（(a) ∪ 上流）。外す・入れるは全体。
+fn length_delta(
+    p: &PlannedNode,
+    n: &PlannedNode,
+    ins: &[Area],
+    in_shapes: &[Shape],
+    prev_in_shapes: &[Shape],
+) -> Result<Area, EngineError> {
+    let frames = |s: &Shape| match s {
+        Shape::Audio { frames, .. } => frames.max(),
+        _ => 0,
+    };
+    let (a, b) = (frames(&p.inferred.shape), frames(&n.inferred.shape));
+    let tail = Area::span(a.min(b), a.max(b));
+    let first = ins.first().cloned().unwrap_or_default();
+    match (p.enabled, n.enabled) {
+        (false, false) => Ok(tail.union(&first)),
+        (true, true) => {
+            let own = n.op.audio_length_change(
+                p.params.as_ref(),
+                n.params.as_ref(),
+                &op_shapes(p, prev_in_shapes),
+                &op_shapes(n, in_shapes),
+            )?;
+            let Some(own) = own else {
+                return Ok(Area::All);
+            };
+            Ok(tail.union(&own).union(&forward(n, ins, in_shapes)?))
+        }
+        _ => Ok(Area::All),
+    }
+}
+
 /// 音声の絞り込み（チャンク単位）：推論の区間（`All` は全区間に開く。今の長さで切る）に掛かるチャンクのうち、前でも今でも
-/// 有効で全チャンネル同じ実体（`Audio::same_chunk`）のものを外し、残りのチャンクと推論の区間の重なりを報告する（無効な
-/// チャンクは推論のまま報告する）。レート・チャンネル・長さが違えば `All`（長さだけが変わる手は段 1 の後半で絞る）。
+/// 有効で長さが同じ・全チャンネル同じ実体（`Audio::same_chunk`）のものを外し、残りのチャンクと推論の区間の重なりを報告する
+/// （無効なチャンクは推論のまま報告する）。レート・チャンネルが違えば `All`。長さだけが違う値は今の長さで切って報告する
+/// （長さそのものは値の形で分かる。M13 段 1）。
 fn refine_audio(a: &Audio, b: &Audio, inferred: &Area) -> OutputChange {
-    if a.rate() != b.rate() || a.channels() != b.channels() || a.frames() != b.frames() {
+    if a.rate() != b.rate() || a.channels() != b.channels() {
         return OutputChange::All;
     }
     let n = b.frames() as u64;
@@ -319,7 +392,10 @@ fn refine_audio(a: &Audio, b: &Audio, inferred: &Area) -> OutputChange {
     }
     let mut out = Spans::new();
     for k in touched.iter() {
-        if (0..b.channels()).all(|ch| a.same_chunk(b, ch, k)) {
+        if k < a.chunk_count()
+            && a.chunk_range(k).len() == b.chunk_range(k).len()
+            && (0..b.channels()).all(|ch| a.same_chunk(b, ch, k))
+        {
             continue;
         }
         let r = b.chunk_range(k);

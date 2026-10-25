@@ -846,8 +846,11 @@ pub fn check_contains(a: &Value, b: &Value, area: &Area) -> Result<(), String> {
     }
     match (a, b) {
         (Value::Audio(x), Value::Audio(y)) => {
-            if x.rate() != y.rate() || x.frames() != y.frames() || x.channels() != y.channels() {
-                return Err("音声の形が変わったのに範囲が全体ではありません".into());
+            // 長さだけが変わった音声は、両方にある区間を比べる（長さそのものは値の形で分かる。M13 段 1）
+            if x.rate() != y.rate() || x.channels() != y.channels() {
+                return Err(
+                    "音声のレート・チャンネルが変わったのに範囲が全体ではありません".into(),
+                );
             }
             let (xp, yp) = (
                 x.to_planes().map_err(|e| e.to_string())?,

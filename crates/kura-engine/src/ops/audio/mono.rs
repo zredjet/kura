@@ -15,7 +15,7 @@ use crate::op::{
     ParamSchema, PortSpec, Signature, expect_inputs,
 };
 use crate::ops::util::{audio_of, audio_shape};
-use crate::render::region::Reach;
+use crate::render::region::{Area, Reach};
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::InputGen;
 use crate::value::{Audio, Value};
@@ -178,6 +178,16 @@ impl Op for Mono {
     // 段 10：範囲（同じ位置。全チャンネル）
     fn reach(_p: &MonoParams, _inputs: &[Shape]) -> Reach {
         Reach::SameTime
+    }
+
+    // M13 段 1：長さだけが変わる手（引数はない。標本は同じ位置の平均）
+    fn audio_length_change(
+        _old: &MonoParams,
+        _new: &MonoParams,
+        _old_in: &[Shape],
+        _new_in: &[Shape],
+    ) -> Option<Area> {
+        Some(Area::Empty)
     }
 }
 

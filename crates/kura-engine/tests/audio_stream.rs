@@ -386,4 +386,64 @@ fn patcher_equals_compute() {
     }
     // フェードの長さの手は全体を流さない
     assert!(streamed_less >= 2, "{streamed_less}");
+    // 長さだけが変わる手（トリムの終わり。縮める・伸ばす）：尻のチャンクだけを流す
+    let trim = |end: u64| {
+        let mut g = Graph::new_single();
+        g.push_linear("audio.trim", 1, json!({ "start": 10, "end": end }), 1)
+            .unwrap();
+        g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 2)
+            .unwrap();
+        g
+    };
+    for (e1, e2) in [(3 * C + 30, 2 * C + 99), (C + 5, 3 * C)] {
+        let (a, b) = (
+            compile(&engine, &trim(e1), &input).unwrap(),
+            compile(&engine, &trim(e2), &input).unwrap(),
+        );
+        let (Some((old, _)), Some((new, _))) = (
+            render(&engine, &a, &input, source),
+            render(&engine, &b, &input, source),
+        ) else {
+            panic!()
+        };
+        let (Value::Audio(old), Value::Audio(new)) = (&old, &new) else {
+            panic!()
+        };
+        let Area::Samples(changed) = engine.delta(&a, &fin, &b, &fin).unwrap().outputs[0]
+            .1
+            .clone()
+        else {
+            panic!("長さだけの手が全体になった");
+        };
+        let p = PeaksParams::default();
+        let mut patcher = Patcher::new(
+            compute(old, &p, &cx).unwrap(),
+            p,
+            new.frames() as u64,
+            &changed,
+        );
+        let spans = patcher.spans();
+        // 縮めるときは頭のチャンクを流さない（伸ばすときは、前の最後の半端なチャンクから先を流す）
+        let first_full = (e1.min(e2) - 10) / C * C;
+        assert!(
+            spans.spans()[0].0 >= first_full.min(C),
+            "{e1} → {e2}：{spans:?}"
+        );
+        engine
+            .stream_audio(
+                &b,
+                &fin,
+                &mut NodeCache::new(0),
+                OutputId(0),
+                Some(&spans),
+                &mut patcher,
+                &NoMonitor,
+            )
+            .unwrap();
+        assert_eq!(
+            patcher.into_peaks().unwrap(),
+            compute(new, &p, &cx).unwrap(),
+            "{e1} → {e2}"
+        );
+    }
 }

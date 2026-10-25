@@ -16,7 +16,7 @@ use crate::op::{
     ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{MAX_FRAME_PARAM, audio_of, audio_shape, bad_param};
-use crate::render::region::Reach;
+use crate::render::region::{Area, Reach};
 use crate::shape::{Dim, Shape, ValueKind};
 use crate::testgen::{InputGen, MetaGen};
 use crate::value::{Audio, LoopRange, Value};
@@ -252,6 +252,30 @@ impl Op for Trim {
                 }],
             },
         ]
+    }
+
+    // M13 段 1：長さだけが変わる手：始まりが同じなら、新旧の終わりの間（出力の座標）だけ。始まりが違えば全体
+    fn audio_length_change(
+        old: &TrimParams,
+        new: &TrimParams,
+        old_in: &[Shape],
+        new_in: &[Shape],
+    ) -> Option<Area> {
+        if old.start != new.start {
+            return None;
+        }
+        let end = |p: &TrimParams, s: &[Shape]| match p.end {
+            Some(e) => Some(e),
+            None => s
+                .first()
+                .and_then(audio_shape)
+                .and_then(|(_, _, f)| f.exact()),
+        };
+        let (a, b) = (end(old, old_in)?, end(new, new_in)?);
+        Some(Area::span(
+            a.min(b).saturating_sub(new.start),
+            a.max(b).saturating_sub(new.start),
+        ))
     }
 
     // 段 10：範囲（区間をずらす）

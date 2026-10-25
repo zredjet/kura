@@ -578,6 +578,18 @@ pub trait Op: Send + Sync + 'static {
     fn effect(_p: &Self::Params, _inputs: &[Shape]) -> Area {
         Area::All
     }
+    /// 音声の長さだけが変わる手（M13 段 1。トリムの終わりなど）：引数が `old`→`new`、入力の形が `old_in`→`new_in`（レート・
+    /// チャンネルが同じで長さだけが違いうる）のとき、出力の変わりうる範囲のうち、この操作が足す分（出力の座標。新しい長さの
+    /// 外にはみ出してよい）。実行器はこれに、出力の尻（新旧の長さの間）と上流の範囲を前へ写したものを足す。None は全体
+    /// （既定）。保守的であること。
+    fn audio_length_change(
+        _old: &Self::Params,
+        _new: &Self::Params,
+        _old_in: &[Shape],
+        _new_in: &[Shape],
+    ) -> Option<Area> {
+        None
+    }
     /// 範囲の描画：`tiles` のタイル（フレームごと。値のタイル）だけを `apply` と同じ値で描き、ほかのタイルは `base`（前の出力。
     /// 大きさ・形式・パレットが同じ）のタイルを共有するか、無効なタイル（読むと誤り）にする。入力は `reach` の逆写しで求めた
     /// 範囲（`tiles` の矩形から）を覆うタイルだけが有効で、その外を読むと誤りになる。メタデータ・写し方・警告は `apply` と
@@ -698,6 +710,14 @@ pub trait DynOp: Send + Sync {
     ) -> Result<Area, EngineError>;
     /// 出力が入力 0 と違いうる範囲（`Op::effect`）。
     fn effect(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Area, EngineError>;
+    /// 音声の長さだけが変わる手の範囲（`Op::audio_length_change`）。
+    fn audio_length_change(
+        &self,
+        old: &AnyParams,
+        new: &AnyParams,
+        old_in: &[Shape],
+        new_in: &[Shape],
+    ) -> Result<Option<Area>, EngineError>;
     /// 範囲の描画（`Op::apply_region`）。
     fn apply_region(
         &self,
@@ -908,6 +928,21 @@ impl<O: Op> DynOp for OpEntry<O> {
 
     fn effect(&self, p: &AnyParams, inputs: &[Shape]) -> Result<Area, EngineError> {
         Ok(O::effect(self.params(p)?, inputs))
+    }
+
+    fn audio_length_change(
+        &self,
+        old: &AnyParams,
+        new: &AnyParams,
+        old_in: &[Shape],
+        new_in: &[Shape],
+    ) -> Result<Option<Area>, EngineError> {
+        Ok(O::audio_length_change(
+            self.params(old)?,
+            self.params(new)?,
+            old_in,
+            new_in,
+        ))
     }
 
     fn apply_region(

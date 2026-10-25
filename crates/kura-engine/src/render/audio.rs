@@ -664,14 +664,21 @@ impl Engine {
 
 /// 音声の継ぎはぎで描くチャンクと前の値から共有するチャンク：`keep = valid(base) ∩ need − changed`、`draw = need − keep`
 /// （M13 段 1。docs/editing.md §12.5）。音声は頼んだ区間の外の前の値のチャンクを持ち越さない（表示の値は頼んだ区間だけ）。
+/// 前の値の長さが今（`frames`）と違えば、両方にあって長さが同じチャンクだけを共有する（最後の半端なチャンクは描き直す）。
 pub(super) fn patch_target_audio(
     base: &Audio,
     need: &ChunkSet,
     changed: &ChunkSet,
+    frames: usize,
 ) -> (ChunkSet, ChunkSet) {
-    let mut keep = base.valid_chunks();
-    keep.intersect_with(need);
-    keep.subtract(changed);
+    let mut keep = ChunkSet::empty(need.universe());
+    let valid = base.valid_chunks();
+    for k in need.iter() {
+        let len = (frames - k * AUDIO_CHUNK).min(AUDIO_CHUNK);
+        if valid.contains(k) && !changed.contains(k) && base.chunk_range(k).len() == len {
+            keep.insert(k);
+        }
+    }
     let mut draw = need.clone();
     draw.subtract(&keep);
     (draw, keep)

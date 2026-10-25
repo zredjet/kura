@@ -197,6 +197,16 @@ impl Op for SetLoop {
     fn effect(_p: &SetLoopParams, _inputs: &[Shape]) -> Area {
         Area::Empty
     }
+
+    // M13 段 1：長さだけが変わる手（標本は入力のまま）
+    fn audio_length_change(
+        _old: &SetLoopParams,
+        _new: &SetLoopParams,
+        _old_in: &[Shape],
+        _new_in: &[Shape],
+    ) -> Option<Area> {
+        Some(Area::Empty)
+    }
 }
 
 #[cfg(test)]

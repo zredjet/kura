@@ -430,19 +430,28 @@ impl Engine {
         let mut patch: Option<Patch> = None;
         if let (Some(b), false) = (base, full) {
             let at = cx.through_disabled(out_node);
+            // 音声は長さだけが違う前の値も受ける（長さだけが変わる手。チャンクは両方にあって長さが同じときだけ共有する）
+            let base_shape = b.value.shape();
             if let Some(n) = cx.index.get(&at).map(|i| &plan.nodes[*i])
-                && b.value.shape() == n.inferred.shape
+                && (base_shape == n.inferred.shape
+                    || super::delta::audio_length_only(&base_shape, &n.inferred.shape))
                 && n.inferred.shape == *out_shape
             {
                 let in_shapes = cx.shapes.inputs_of(n)?;
-                match b.value.value() {
-                    Value::Audio(prev) => {
+                let new_frames = match out_shape {
+                    Shape::Audio {
+                        frames: Dim::Exact(f),
+                        ..
+                    } => usize::try_from(*f).ok(),
+                    _ => None,
+                };
+                match (b.value.value(), new_frames) {
+                    (Value::Audio(prev), Some(frames)) => {
                         if self.audio_regional(n, &in_shapes)? && self.needs_ready(cx, cache, n)? {
-                            let frames = prev.frames();
                             let need =
                                 chunks_covering(&round_to_chunks(&target, out_shape), frames);
                             let changed = chunks_covering(b.changed, frames);
-                            let (draw, keep) = patch_target_audio(prev, &need, &changed);
+                            let (draw, keep) = patch_target_audio(prev, &need, &changed, frames);
                             // 共有できるチャンクがなければ継ぎはぎしない
                             if !keep.is_empty() {
                                 stats.reused_chunks = keep.count() as u64;
@@ -455,8 +464,9 @@ impl Engine {
                             }
                         }
                     }
-                    image => {
-                        if self.image_regional(n, &in_shapes)? {
+                    (Value::Audio(_), None) => {}
+                    (image, _) => {
+                        if base_shape == n.inferred.shape && self.image_regional(n, &in_shapes)? {
                             let (draw, reused) = patch_target(image, &target, b.changed)?;
                             // 共有できるタイルがなければ継ぎはぎしない（前の値の形式・パレットが今と違いうる）
                             if reused > 0 {
