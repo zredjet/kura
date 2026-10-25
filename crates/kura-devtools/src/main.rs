@@ -4,8 +4,9 @@
 //!   再開だけ待つ。`--close-after-ms` は N ms 待ってジョブの途中でライブラリを閉じ、閉じるのにかかった時間を出す）
 //! - `download --library <path> <url>...`：アプリと同じジョブで取得してライブラリに入れる（M7 の確認用）
 //! - `check --library <path>`：件数と整合性（DB とファイルの食い違い）を表示する
-//! - `seed --items <件数> --out <path> [--analysis pending|ready]`：ダミーライブラリを作る（グリッドと起動時間の計測用。
-//!   `--analysis ready` は画像・音声に偽の事実を入れて解析済みにする）
+//! - `seed --items <件数> --out <path> [--analysis pending|ready] [--audio <百分率>] [--no-art]`：ダミーライブラリを作る
+//!   （グリッドと起動時間の計測用。`--analysis ready` は画像・音声に偽の事実を入れて解析済みにし、音声には波形の段のファイルも
+//!   置く。`--audio` は音楽の割合、`--no-art` は音楽にジャケットを付けない（グリッドの実波形の計測。`seed` の冒頭））
 //! - `assets --out <dir>`：形式の表の画像・フォント・3D の行ごとの見本と、動画・音声の見本を書く（M11 の形式の網羅。
 //!   `assets` の冒頭）
 //! - `selftest-library --out <path> [--web <dir>] [--font <ttf>]`：kura:// と CSP を実機で確かめるライブラリ
