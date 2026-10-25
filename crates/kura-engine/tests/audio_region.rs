@@ -735,6 +735,68 @@ fn normalize_region_presolves_its_measurement() {
     }
 }
 
+/// 検証の直し（M13 段 1）：normalize を 2 つ重ね、キャッシュの上限が 0（計測が残らない）でも、下流の normalize の流し解きの
+/// 窓ごとに上流の normalize の計測を解き直さない（入力が完全な値として解いた計測も、この描画の中の表に入れる）。解いた解析の
+/// 数は窓の数によらない。値は `render` と同じ。
+#[test]
+fn upstream_measurements_are_solved_once_per_render() {
+    let engine = engine();
+    let mut solved = Vec::new();
+    for chunks in [17u64, 33] {
+        let input = InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 1,
+            frames: chunks * C + 5,
+            seed: 2,
+        }
+        .generate()
+        .unwrap();
+        let mut g = Graph::new_single();
+        g.push_linear(
+            "audio.normalize",
+            1,
+            json!({ "target": -20.0, "peakLimit": null }),
+            1,
+        )
+        .unwrap();
+        g.push_linear(
+            "audio.normalize",
+            1,
+            json!({ "target": -18.0, "peakLimit": -1.0 }),
+            2,
+        )
+        .unwrap();
+        let plan = compile(&engine, &g, &input).unwrap();
+        let source = Digest([2; 32]);
+        let (want, _) = render(&engine, &plan, &input, source).unwrap();
+        let area = Area::span(C + 3, C + 4);
+        let mut cache = NodeCache::new(0);
+        let before = cache.stats();
+        let got = engine
+            .render_area(
+                &plan,
+                &inputs_of(&input, source),
+                &mut cache,
+                &AreaRequest {
+                    output: OutputId(0),
+                    area: area.clone(),
+                },
+                None,
+                &NoMonitor,
+            )
+            .unwrap();
+        check_region(&got.value, &want, &area).unwrap();
+        assert_eq!(
+            (got.stats.presolved, got.stats.fallbacks),
+            (1, 0),
+            "{chunks}"
+        );
+        solved.push(cache.stats().since(&before).analysis_solved);
+    }
+    // 上流の計測 1 回（外側の描画と流し解きの窓で共有）＋ 下流の計測の流し解き 1 回
+    assert_eq!(solved, vec![2, 2]);
+}
+
 // ---- E38：音声の継ぎはぎと変わった区間（表示の経路） ----
 
 use kura_engine::render::delta::OutputChange;

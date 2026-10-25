@@ -246,23 +246,26 @@ impl Engine {
                 let key = analysis_fingerprint(*fp, need.id, need.v, &need.params)?;
                 let out = if let Some(out) = presolved.get(&key) {
                     out.clone()
-                } else if v.is_complete() {
-                    let acx = AnalyzeCx {
-                        mon,
-                        limits: &self.limits,
-                    };
-                    solve_cached(cache, &in_fps, need, v, a.as_ref(), &acx, false)
-                        .map_err(|e| e.at(node.id))?
-                } else if let Some(out) = cache.get_analysis(&key) {
-                    out
                 } else {
-                    // 入力が部分の値：入力のポートを窓ごとに流して解く（流し解き）
-                    let r = node.inputs.get(need.input).ok_or_else(|| {
-                        EngineError::Internal("解析する入力のポートがありません".into())
-                    })?;
-                    let out = self
-                        .presolve(cx, cache, r, need, a.as_ref(), presolved, stats, mon)
-                        .map_err(|e| e.at(node.id))?;
+                    let out = if v.is_complete() {
+                        let acx = AnalyzeCx {
+                            mon,
+                            limits: &self.limits,
+                        };
+                        solve_cached(cache, &in_fps, need, v, a.as_ref(), &acx, false)
+                            .map_err(|e| e.at(node.id))?
+                    } else if let Some(out) = cache.get_analysis(&key) {
+                        out
+                    } else {
+                        // 入力が部分の値：入力のポートを窓ごとに流して解く（流し解き）
+                        let r = node.inputs.get(need.input).ok_or_else(|| {
+                            EngineError::Internal("解析する入力のポートがありません".into())
+                        })?;
+                        self.presolve(cx, cache, r, need, a.as_ref(), presolved, stats, mon)
+                            .map_err(|e| e.at(node.id))?
+                    };
+                    // どの道で得た結果も、この描画の中の表に入れる（キャッシュの上限が 0 か追い出されても、下流の流し解きの
+                    // 窓ごとに同じ計測を解き直さない。検証の直し）
                     presolved.insert(key, out.clone());
                     out
                 };

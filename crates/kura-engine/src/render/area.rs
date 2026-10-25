@@ -88,7 +88,8 @@ pub struct AreaStats {
     pub presolved: u64,
 }
 
-/// この描画の中で流して解いた解析の結果（鍵は `analysis_fingerprint`。キャッシュの上限が 0 でも、この描画の中は足りる）。
+/// この描画の中で解いた解析の結果（流し解き・入力が完全な値で解いたもの・キャッシュから引いたもの。鍵は
+/// `analysis_fingerprint`。キャッシュの上限が 0 か追い出されても、この描画の中は足りる）。
 pub(super) type Presolved = BTreeMap<Fingerprint, AnyOutput>;
 
 /// 1 回の描画の中で変わらないもの（指紋・入力の値・元・形・ノードの番号）。
