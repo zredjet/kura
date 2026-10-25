@@ -1414,3 +1414,175 @@ fn an_editor_lease_over_the_reservation_does_not_block_a_save() {
     assert_eq!(r45.unwrap(), 45 * MIB);
     assert_eq!(budget.used().unwrap(), 0);
 }
+
+/// E25（M13 段 1）：範囲の描画の見積もり（`EstimateSpec::area`）は、描いた範囲の値（出力の常駐のバイト）以上で、流し解きが
+/// なければ全体の描画の見積もり以下（長い音声の小さな区間では、ずっと小さい）。流し解き（trim → normalize）の分も入る。キャッシュに当たる・解析が
+/// キャッシュにあると減る。
+#[test]
+fn area_estimate_bounds_audio_regions() {
+    use kura_engine::render::area::AreaRequest;
+    use kura_engine::render::region::Area;
+    use kura_engine::testing::region::{
+        below, random_audio_area, random_audio_chain, random_audio_input,
+    };
+    let engine = engine();
+    let mut r = kura_engine::determinism::rng(25);
+    let mut checked = 0;
+    for case in 0..30 {
+        let input = random_audio_input(&mut r).generate().unwrap();
+        let len = 1 + below(&mut r, 4) as usize;
+        let g = random_audio_chain(&engine, &mut r, &input.shape(), len);
+        let inputs = inputs_of(input.clone(), Digest::default());
+        let Ok(plan) = engine.compile(&g, &shapes_of(&inputs)) else {
+            continue;
+        };
+        let fin = fingerprinted(&inputs);
+        let frames = match plan.output_shapes()[0].1 {
+            Shape::Audio { frames, .. } => frames.max(),
+            _ => continue,
+        };
+        let area = random_audio_area(&mut r, frames);
+        let full = engine
+            .estimate(
+                &plan,
+                &EstimateSpec::new(3).all_inputs(&plan, Source::Held),
+                None,
+            )
+            .unwrap();
+        let spec = EstimateSpec::new(3)
+            .all_inputs(&plan, Source::Held)
+            .area(OutputId(0), area.clone());
+        let mut cache = NodeCache::new(1 << 30);
+        let est = engine
+            .estimate(
+                &plan,
+                &spec,
+                Some(CacheProbe {
+                    cache: &cache,
+                    inputs: &fin,
+                }),
+            )
+            .unwrap();
+        let got = engine
+            .render_area(
+                &plan,
+                &fin,
+                &mut cache,
+                &AreaRequest {
+                    output: OutputId(0),
+                    area,
+                },
+                None,
+                &NoMonitor,
+            )
+            .unwrap();
+        let what = format!(
+            "{case}\n{}",
+            String::from_utf8_lossy(&g.to_canonical_json().unwrap())
+        );
+        assert!(
+            est.render >= got.value.resident_bytes(),
+            "{what}：見積もり {} < 出力 {}",
+            est.render,
+            got.value.resident_bytes()
+        );
+        // 流し解きがなければ全体の描画の見積もり以下（流し解きは、入力の窓を描く分が部分の値に重なるので超えうる）
+        if got.stats.presolved == 0 {
+            assert!(
+                est.render <= full.render,
+                "{what}：{} > 全体 {}",
+                est.render,
+                full.render
+            );
+        }
+        // 2 度目はキャッシュの当たり・解析で減るか同じ
+        let again = engine
+            .estimate(
+                &plan,
+                &spec,
+                Some(CacheProbe {
+                    cache: &cache,
+                    inputs: &fin,
+                }),
+            )
+            .unwrap();
+        assert!(again.render <= est.render, "{what}");
+        checked += 1;
+    }
+    assert!(checked > 20, "{checked}");
+    // 長い音声の小さな区間：全体よりずっと小さい。流し解きは入力の窓 1 つと解析の結果の分
+    let c = kura_engine::value::AUDIO_CHUNK as u64;
+    let input = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 2,
+        frames: 40 * c,
+        seed: 3,
+    }
+    .generate()
+    .unwrap();
+    let inputs = inputs_of(input, Digest::default());
+    let mut g = Graph::new_single();
+    g.push_linear("audio.trim", 1, json!({ "start": 100, "end": null }), 1)
+        .unwrap();
+    g.push_linear(
+        "audio.normalize",
+        1,
+        json!({ "target": -20.0, "peakLimit": null }),
+        2,
+    )
+    .unwrap();
+    g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 3)
+        .unwrap();
+    let plan = engine.compile(&g, &shapes_of(&inputs)).unwrap();
+    let spec = |area: Area| {
+        EstimateSpec::new(3)
+            .all_inputs(&plan, Source::Held)
+            .area(OutputId(0), area)
+    };
+    let full = engine
+        .estimate(
+            &plan,
+            &EstimateSpec::new(3).all_inputs(&plan, Source::Held),
+            None,
+        )
+        .unwrap();
+    let small = engine
+        .estimate(&plan, &spec(Area::span(5 * c, 5 * c + 10)), None)
+        .unwrap();
+    let window = 16 * c * 2 * 4;
+    assert!(
+        small.render < full.render / 2,
+        "{} {}",
+        small.render,
+        full.render
+    );
+    // 流し解き：trim の窓（16 チャンク × 2 チャンネル）を含む
+    assert!(small.render >= window, "{}", small.render);
+    // 計測がキャッシュにあれば、流し解きの分はない
+    let fin = fingerprinted(&inputs);
+    let mut cache = NodeCache::new(1 << 30);
+    engine
+        .render_area(
+            &plan,
+            &fin,
+            &mut cache,
+            &AreaRequest {
+                output: OutputId(0),
+                area: Area::span(5 * c, 5 * c + 10),
+            },
+            None,
+            &NoMonitor,
+        )
+        .unwrap();
+    let cached = engine
+        .estimate(
+            &plan,
+            &spec(Area::span(5 * c, 5 * c + 10)),
+            Some(CacheProbe {
+                cache: &cache,
+                inputs: &fin,
+            }),
+        )
+        .unwrap();
+    assert!(cached.render < window, "{}", cached.render);
+}

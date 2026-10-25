@@ -24,7 +24,7 @@
 //!   要るチャンクだけを核で描く（render/audio.rs）。継ぎはぎは出力のノードで前の表示のチャンクを共有し、頼んだ区間の外は
 //!   持ち越さない。量子化は描いたチャンクだけに当てる（前の表示の量子化済みのチャンクに 2 度当てない）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::audio::{chunk_spans, chunks_covering, patch_target_audio, round_to_chunks};
@@ -138,6 +138,19 @@ impl<'a> PassCx<'a> {
         }
         at
     }
+}
+
+/// 音声の範囲を持つノードかの判定（`region_needs` に渡す。ノードと入力の形）。
+pub(super) type AudioOk<'a> = dyn Fn(&PlannedNode, &[Shape]) -> Result<bool, EngineError> + 'a;
+
+/// 後ろからの走査の結果（[`Engine::region_needs`]）。
+pub(super) struct Needs {
+    /// ノードごとの要る範囲（要らないノードは入っていない）。
+    pub need: BTreeMap<NodeId, Area>,
+    /// 範囲を持つノードと、要る範囲を値のタイル・チャンクに広げたもの。
+    pub regional: BTreeMap<NodeId, Area>,
+    /// キャッシュに当たるノード（そこで止めた）。
+    pub hits: BTreeSet<NodeId>,
 }
 
 /// 1 つのポート（ノードの出力）を範囲で描いた結果。
@@ -280,6 +293,85 @@ impl Engine {
         };
         let r = self.render_area(plan, inputs, cache, &req, None, mon)?;
         r.value.sample(at.frame, at.x, at.y)
+    }
+
+    /// 後ろからの走査（範囲の描画と見積もりが同じ部品を通る）：出力のノード `out_node` の範囲 `target` から、各ノードの要る
+    /// 範囲を集める。範囲を持つノード（画像は `image_regional`、音声は `audio_ok`）は、要る範囲を値のタイル・チャンクに広げて
+    /// `reach`・`audio_reach` で入力 0 へ写す。持たないノードは入力を全体で要る。外したノードは入力 0 へそのまま。当たる
+    /// ノード（`is_hit`）で止める。要る範囲が空でも、使い手があるノードは要る（範囲の描画を持つノードは無効なタイル・チャンク
+    /// だけの値を作る。使い手は形・メタデータだけを見る）。`full` なら範囲を持つノードはない。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn region_needs(
+        &self,
+        plan: &Plan,
+        shapes: &Shapes,
+        out_node: NodeId,
+        target: Area,
+        full: bool,
+        audio_ok: &AudioOk<'_>,
+        is_hit: &dyn Fn(&PlannedNode) -> bool,
+    ) -> Result<Needs, EngineError> {
+        let mut need: BTreeMap<NodeId, Area> = BTreeMap::from([(out_node, target)]);
+        let mut hits = BTreeSet::new();
+        let mut regional: BTreeMap<NodeId, Area> = BTreeMap::new();
+        for node in plan.nodes.iter().rev() {
+            let Some(n_need) = need.get(&node.id).cloned() else {
+                continue;
+            };
+            if node.enabled && is_hit(node) {
+                hits.insert(node.id);
+                continue;
+            }
+            let in_shapes = shapes.inputs_of(node)?;
+            let mut add = |r: &PortRef, a: &Area| {
+                if let PortRef::Node { id } = r {
+                    need.entry(*id).or_default().union_with(a);
+                }
+            };
+            if !node.enabled {
+                if let Some(r) = node.inputs.first() {
+                    add(r, &n_need);
+                }
+                continue;
+            }
+            let found = if full {
+                None
+            } else if self.image_regional(node, &in_shapes)? {
+                let reach = node
+                    .op
+                    .reach(node.params.as_ref(), &op_shapes(node, &in_shapes))?;
+                Some((round_to_tiles(&n_need, &node.inferred.shape), reach))
+            } else if audio_ok(node, &in_shapes)? {
+                let reach = node
+                    .op
+                    .audio_reach(node.params.as_ref(), &op_shapes(node, &in_shapes))?;
+                Some((round_to_chunks(&n_need, &node.inferred.shape), reach))
+            } else {
+                None
+            };
+            match found {
+                Some((rounded, reach)) => {
+                    let in_need = reach.backward_in(&rounded, &node.inferred.shape);
+                    if let Some(r) = node.inputs.first() {
+                        add(r, &in_need);
+                    }
+                    for r in node.inputs.iter().skip(1) {
+                        add(r, &Area::All);
+                    }
+                    regional.insert(node.id, rounded);
+                }
+                None => {
+                    for r in &node.inputs {
+                        add(r, &Area::All);
+                    }
+                }
+            }
+        }
+        Ok(Needs {
+            need,
+            regional,
+            hits,
+        })
     }
 
     /// 画像の範囲を持つノードか（`Op::REGION` で、申告した解析がなく、`reach` が `Global` でない）。
@@ -483,65 +575,34 @@ impl Engine {
                 }
             }
         }
-        // 1. 後ろから要る範囲を集める。要る範囲が空でも、使い手があるノードは描く（範囲の描画を持つノードは無効なタイル
-        //    だけの値を作る。使い手は形・メタデータだけを見る）
-        let mut need: BTreeMap<NodeId, Area> = BTreeMap::from([(out_node, target)]);
+        // 1. 後ろから要る範囲を集める（`region_needs`。見積もりと同じ走査）。当たりは走査のあとで引く
+        let walk = {
+            let cache_ref = &*cache;
+            self.region_needs(
+                plan,
+                &cx.shapes,
+                out_node,
+                target,
+                full,
+                &|n, s| Ok(self.audio_regional(n, s)? && self.needs_ready(cx, cache_ref, n)?),
+                &|n| {
+                    n.enabled
+                        && cx
+                            .fps
+                            .nodes
+                            .get(&n.id)
+                            .is_some_and(|fp| cache_ref.contains(fp))
+                },
+            )?
+        };
+        let need = walk.need;
+        let regional = walk.regional;
         let mut hits: BTreeMap<NodeId, (Value, Vec<Issue>, Vec<Issue>)> = BTreeMap::new();
-        let mut regional: BTreeMap<NodeId, Area> = BTreeMap::new();
-        for node in plan.nodes.iter().rev() {
-            let Some(n_need) = need.get(&node.id).cloned() else {
-                continue;
-            };
-            if node.enabled
-                && let Some(fp) = cx.fps.nodes.get(&node.id)
+        for id in &walk.hits {
+            if let Some(fp) = cx.fps.nodes.get(id)
                 && let Some(hit) = cache.hit(fp)
             {
-                hits.insert(node.id, hit);
-                continue;
-            }
-            let in_shapes = cx.shapes.inputs_of(node)?;
-            let mut add = |r: &PortRef, a: &Area| {
-                if let PortRef::Node { id } = r {
-                    need.entry(*id).or_default().union_with(a);
-                }
-            };
-            if !node.enabled {
-                if let Some(r) = node.inputs.first() {
-                    add(r, &n_need);
-                }
-                continue;
-            }
-            let found = if full {
-                None
-            } else if self.image_regional(node, &in_shapes)? {
-                let reach = node
-                    .op
-                    .reach(node.params.as_ref(), &op_shapes(node, &in_shapes))?;
-                Some((round_to_tiles(&n_need, &node.inferred.shape), reach))
-            } else if self.audio_regional(node, &in_shapes)? && self.needs_ready(cx, cache, node)? {
-                let reach = node
-                    .op
-                    .audio_reach(node.params.as_ref(), &op_shapes(node, &in_shapes))?;
-                Some((round_to_chunks(&n_need, &node.inferred.shape), reach))
-            } else {
-                None
-            };
-            match found {
-                Some((rounded, reach)) => {
-                    let in_need = reach.backward_in(&rounded, &node.inferred.shape);
-                    if let Some(r) = node.inputs.first() {
-                        add(r, &in_need);
-                    }
-                    for r in node.inputs.iter().skip(1) {
-                        add(r, &Area::All);
-                    }
-                    regional.insert(node.id, rounded);
-                }
-                None => {
-                    for r in &node.inputs {
-                        add(r, &Area::All);
-                    }
-                }
+                hits.insert(*id, hit);
             }
         }
         // 2. 前から描く
@@ -807,7 +868,7 @@ pub(super) struct Shapes {
 }
 
 impl Shapes {
-    fn of(plan: &Plan) -> Self {
+    pub(super) fn of(plan: &Plan) -> Self {
         Self {
             inputs: plan.inputs.clone(),
             nodes: plan
@@ -878,7 +939,7 @@ fn round_to_tiles(area: &Area, shape: &Shape) -> Area {
 
 /// 呼び手の範囲を、出力の形のキャンバスに切る：画像・フレームの列は [0, 幅) × [0, 高さ) とフレームの数（大きさの決まって
 /// いない軸は上限で切る。フレームはキャンバスからはみ出さない）、音声は長さまで。フレーム全体・`All` はそのまま。
-fn clip_to_canvas(area: &Area, shape: &Shape) -> Area {
+pub(super) fn clip_to_canvas(area: &Area, shape: &Shape) -> Area {
     let side = |d: crate::shape::Dim| u32::try_from(d.max()).unwrap_or(u32::MAX);
     match (area, shape) {
         (Area::Pixels(map), Shape::Image { w, h, .. } | Shape::Frames { w, h, .. }) => {

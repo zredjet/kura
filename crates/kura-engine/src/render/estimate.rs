@@ -114,6 +114,10 @@ pub struct EstimateSpec<'a> {
     pub tasks: u64,
     /// 出力のダイジェストを取るか（帯の作業領域を数える。保存・一括・照合）。
     pub digests: bool,
+    /// 範囲の描画（`Engine::render_area`・表示の経路・音声の流れの窓）の見積もり：出力と範囲（M13 段 1）。None は全体の描画。
+    /// 範囲を持つ音声のノードは描くチャンクの分だけ、要らないノードは 0、流し解きは入力の窓 1 つを流す分と解析の結果を数える
+    /// （画像は全体のまま。保守的）。
+    pub area: Option<(OutputId, crate::render::region::Area)>,
 }
 
 impl<'a> EstimateSpec<'a> {
@@ -160,6 +164,12 @@ impl<'a> EstimateSpec<'a> {
     /// 並列の数を決める。
     pub fn tasks(mut self, tasks: u64) -> Self {
         self.tasks = tasks;
+        self
+    }
+
+    /// 出力 `output` の範囲 `area` だけを描く見積もりにする（範囲の描画・表示の経路。音声の流れの窓は窓 1 つの区間を渡す）。
+    pub fn area(mut self, output: OutputId, area: crate::render::region::Area) -> Self {
+        self.area = Some((output, area));
         self
     }
 }
@@ -257,6 +267,19 @@ fn over_total(peak: u64, total: u64) -> EngineError {
     ))
 }
 
+/// 範囲の描画の量（[`Engine::estimate`] の `EstimateSpec::area`）。
+#[derive(Default)]
+struct RegionCost {
+    /// 描くノード（要る範囲があり、キャッシュに当たらないもの）。ほかは 0。
+    drawn: BTreeSet<NodeId>,
+    /// 範囲を持つ音声のノードの値の量（ほかは全体の値）。
+    bytes: BTreeMap<NodeId, u64>,
+    /// 流し解きの量（入力のポートを窓で描いて流す間の最大 ＋ 解析の結果。核で描く間の量との大きいほうを数える）。
+    presolve: BTreeMap<NodeId, u64>,
+    /// 頼んだ出力のノードの値の量（量子化した出力の分）。
+    output_bytes: Option<u64>,
+}
+
 /// キャッシュに当たるもの（描かないノードと、量子化した出力の番号）。
 #[derive(Default)]
 struct Hits {
@@ -318,69 +341,26 @@ impl Engine {
             }
             input_buf.insert(*id, ledger.add(bytes));
         }
-        // 描く
-        let mut render = ledger.live;
-        let mut shapes: BTreeMap<NodeId, Shape> = BTreeMap::new();
-        let mut node_buf: BTreeMap<NodeId, usize> = BTreeMap::new();
-        let mut nodes = Vec::with_capacity(plan.nodes.len());
-        let buf_of = |node_buf: &BTreeMap<NodeId, usize>, r: &PortRef| match r {
-            PortRef::Input { id } => input_buf.get(id).copied(),
-            PortRef::Node { id } => node_buf.get(id).copied(),
+        // 描く（範囲の描画なら、後ろからの走査で描くノードと量を求めておく）
+        let region = match &spec.area {
+            Some((out, area)) => self.output_region(plan, *out, area, &hits, cache, tasks)?,
+            None => None,
         };
-        for (i, node) in plan.nodes.iter().enumerate() {
-            let in_shapes = node
-                .inputs
-                .iter()
-                .map(|r| super::lookup(&shapes, &plan.inputs, r))
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| EngineError::Internal("ノードの入力の形がありません".into()))?;
-            let hit = node.enabled && hits.nodes.contains(&node.id);
-            let (value, work) = if node.enabled && !hit {
-                (
-                    node.inferred.shape.value_bytes(),
-                    self.node_work(node, &in_shapes, tasks)?,
-                )
-            } else {
-                (0, 0)
+        let (mut render, nodes) =
+            self.render_stage(plan, &mut ledger, &input_buf, &hits, region.as_ref(), tasks)?;
+        // 出力：量子化した値は新しい値。ダイジェストは出力ごとに帯を持つ（範囲の描画は頼んだ出力の描いた分だけ）
+        for (k, (id, _, shape, quantize)) in plan.outputs.iter().enumerate() {
+            let bytes = match (&spec.area, &region) {
+                (Some((out, _)), _) if out != id => continue,
+                (Some(_), Some(rc)) => rc.output_bytes.unwrap_or_else(|| shape.value_bytes()),
+                (Some(_), None) => 0,
+                (None, _) => shape.value_bytes(),
             };
-            let at = ledger.live.saturating_add(value).saturating_add(work);
-            render = render.max(at);
-            let buf = if node.enabled {
-                ledger.add(value)
-            } else {
-                // 外したノードは入力 0 をそのまま通す（同じ実体）
-                let first = node
-                    .inputs
-                    .first()
-                    .and_then(|r| buf_of(&node_buf, r))
-                    .ok_or_else(|| {
-                        EngineError::Internal("外したノードの入力がありません".into())
-                    })?;
-                ledger.share(first);
-                first
-            };
-            node_buf.insert(node.id, buf);
-            shapes.insert(node.id, node.inferred.shape);
-            for id in plan.released_after(i) {
-                if let Some(b) = node_buf.get(id) {
-                    ledger.release(*b);
-                }
-            }
-            nodes.push(NodeEstimate {
-                id: node.id,
-                value,
-                work,
-                hit,
-                at,
-            });
-        }
-        // 出力：量子化した値は新しい値。ダイジェストは出力ごとに帯を持つ
-        for (k, (_, _, shape, quantize)) in plan.outputs.iter().enumerate() {
             if quantize.is_some() && !hits.outputs.contains(&k) {
-                ledger.add(shape.value_bytes());
+                ledger.add(bytes);
                 render = render.max(ledger.live);
             }
-            if spec.digests {
+            if spec.digests && spec.area.is_none() {
                 render = render.max(ledger.live.saturating_add(digest_work(shape)));
             }
         }
@@ -467,6 +447,248 @@ impl Engine {
             work = work.saturating_add(estimate.bytes);
         }
         Ok(work)
+    }
+
+    /// 描く段の量（読み終えた入力を持った `ledger` から）：計画の順に、描くノードの値と作業領域を足し、最後の使い手のあとで
+    /// 落とす。`region` があれば範囲の描画の量（描かないノードは 0、範囲を持つ音声のノードは描くチャンクの分。流し解きは核で
+    /// 描く前に終わるので、描く間の量との大きいほう）。返すのは段の最大とノードごとの見積もり。
+    fn render_stage(
+        &self,
+        plan: &Plan,
+        ledger: &mut Ledger,
+        input_buf: &BTreeMap<InputId, usize>,
+        hits: &Hits,
+        region: Option<&RegionCost>,
+        tasks: u64,
+    ) -> Result<(u64, Vec<NodeEstimate>), EngineError> {
+        let mut render = ledger.live;
+        let mut shapes: BTreeMap<NodeId, Shape> = BTreeMap::new();
+        let mut node_buf: BTreeMap<NodeId, usize> = BTreeMap::new();
+        let mut nodes = Vec::with_capacity(plan.nodes.len());
+        let buf_of = |node_buf: &BTreeMap<NodeId, usize>, r: &PortRef| match r {
+            PortRef::Input { id } => input_buf.get(id).copied(),
+            PortRef::Node { id } => node_buf.get(id).copied(),
+        };
+        for (i, node) in plan.nodes.iter().enumerate() {
+            let in_shapes = node
+                .inputs
+                .iter()
+                .map(|r| super::lookup(&shapes, &plan.inputs, r))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| EngineError::Internal("ノードの入力の形がありません".into()))?;
+            let hit = node.enabled && hits.nodes.contains(&node.id);
+            let (value, work, presolve) = match region {
+                _ if !node.enabled || hit => (0, 0, 0),
+                Some(rc) if !rc.drawn.contains(&node.id) => (0, 0, 0),
+                Some(rc) => (
+                    rc.bytes
+                        .get(&node.id)
+                        .copied()
+                        .unwrap_or_else(|| node.inferred.shape.value_bytes()),
+                    self.node_work(node, &in_shapes, tasks)?,
+                    rc.presolve.get(&node.id).copied().unwrap_or(0),
+                ),
+                None => (
+                    node.inferred.shape.value_bytes(),
+                    self.node_work(node, &in_shapes, tasks)?,
+                    0,
+                ),
+            };
+            // 流し解きは核で描く前に終わる（入力の窓を流す間の最大と、描く間の最大の大きいほう）
+            let at = ledger
+                .live
+                .saturating_add(value.saturating_add(work).max(presolve));
+            render = render.max(at);
+            let buf = if node.enabled {
+                ledger.add(value)
+            } else {
+                // 外したノードは入力 0 をそのまま通す（同じ実体）
+                let first = node
+                    .inputs
+                    .first()
+                    .and_then(|r| buf_of(&node_buf, r))
+                    .ok_or_else(|| {
+                        EngineError::Internal("外したノードの入力がありません".into())
+                    })?;
+                ledger.share(first);
+                first
+            };
+            node_buf.insert(node.id, buf);
+            shapes.insert(node.id, node.inferred.shape);
+            for id in plan.released_after(i) {
+                if let Some(b) = node_buf.get(id) {
+                    ledger.release(*b);
+                }
+            }
+            nodes.push(NodeEstimate {
+                id: node.id,
+                value,
+                work,
+                hit,
+                at,
+            });
+        }
+        Ok((render, nodes))
+    }
+
+    /// 範囲の描画の出力 `output`・範囲 `area` の量（入力をそのまま出す出力は None）。
+    fn output_region(
+        &self,
+        plan: &Plan,
+        output: OutputId,
+        area: &crate::render::region::Area,
+        hits: &Hits,
+        cache: Option<CacheProbe<'_>>,
+        tasks: u64,
+    ) -> Result<Option<RegionCost>, EngineError> {
+        let Some((_, from, shape, _)) = plan.outputs.iter().find(|o| o.0 == output) else {
+            return Err(EngineError::Internal(format!(
+                "見積もりの出力 {} はありません",
+                output.0
+            )));
+        };
+        let PortRef::Node { id } = from else {
+            return Ok(None);
+        };
+        let probe = match cache {
+            Some(p) => Some((super::area::PassCx::new(self, plan, p.inputs)?, p.cache)),
+            None => None,
+        };
+        let target = super::area::clip_to_canvas(area, shape);
+        let mut rc = self.region_cost(plan, *id, target, hits, probe.as_ref(), tasks, 0)?;
+        rc.output_bytes = rc.bytes.get(id).copied();
+        Ok(Some(rc))
+    }
+
+    /// 範囲の描画の量（`region_needs` と同じ走査を、値なしで）：描くノード、範囲を持つ音声のノードの値の量（描くチャンクの
+    /// 長さの和 × チャンネル × 4）、流し解きの量（入力のポートを窓 `STREAM_CHUNKS` チャンクで描く間の最大 ＋ 解析の結果）。
+    #[allow(clippy::too_many_arguments)]
+    fn region_cost(
+        &self,
+        plan: &Plan,
+        node_id: NodeId,
+        target: crate::render::region::Area,
+        hits: &Hits,
+        probe: Option<&(super::area::PassCx<'_>, &NodeCache)>,
+        tasks: u64,
+        depth: usize,
+    ) -> Result<RegionCost, EngineError> {
+        use crate::value::AUDIO_CHUNK;
+        let shapes = super::area::Shapes::of(plan);
+        let audio_ok = |n: &PlannedNode, s: &[Shape]| -> Result<bool, EngineError> {
+            Ok(self.audio_regional(n, s)?
+                && match probe {
+                    Some((cx, cache)) => self.needs_ready(cx, cache, n)?,
+                    None => self.needs_streamable(&shapes, n)?,
+                })
+        };
+        let walk = self.region_needs(plan, &shapes, node_id, target, false, &audio_ok, &|n| {
+            hits.nodes.contains(&n.id)
+        })?;
+        let index: BTreeMap<NodeId, &PlannedNode> =
+            plan.nodes.iter().map(|n| (n.id, n.as_ref())).collect();
+        let mut rc = RegionCost {
+            drawn: walk
+                .need
+                .keys()
+                .filter(|id| !walk.hits.contains(id))
+                .copied()
+                .collect(),
+            ..RegionCost::default()
+        };
+        for (id, rounded) in &walk.regional {
+            let Some(node) = index.get(id) else { continue };
+            let Shape::Audio {
+                channels,
+                frames: crate::shape::Dim::Exact(n),
+                ..
+            } = node.inferred.shape
+            else {
+                continue;
+            };
+            let n = usize::try_from(n).unwrap_or(usize::MAX);
+            let frames: u64 = super::audio::chunks_covering(rounded, n)
+                .iter()
+                .map(|k| (n - k * AUDIO_CHUNK).min(AUDIO_CHUNK) as u64)
+                .sum();
+            rc.bytes.insert(
+                *id,
+                frames.saturating_mul(u64::from(channels)).saturating_mul(4),
+            );
+            // 流し解き：入力が部分の値で、解析がキャッシュにないもの
+            let mut extra = 0u64;
+            for need in &node.needs {
+                let Some(r) = node.inputs.get(need.input) else {
+                    continue;
+                };
+                let complete = match port_node(plan, &index, r) {
+                    None => true,
+                    Some(up) => hits.nodes.contains(&up),
+                };
+                let cached = match probe {
+                    Some((cx, cache)) => {
+                        let fp = match r {
+                            PortRef::Input { id } => cx.input_fps.get(id).copied(),
+                            PortRef::Node { id } => cx.fps.nodes.get(id).copied(),
+                        };
+                        match fp {
+                            Some(fp) => {
+                                let key = super::cache::analysis_fingerprint(
+                                    fp,
+                                    need.id,
+                                    need.v,
+                                    &need.params,
+                                )?;
+                                cache.contains_analysis(&key)
+                            }
+                            None => false,
+                        }
+                    }
+                    None => false,
+                };
+                if complete || cached {
+                    continue;
+                }
+                let in_shape = shapes
+                    .port(r)
+                    .ok_or_else(|| EngineError::Internal("解析する入力の形がありません".into()))?;
+                let result = self
+                    .solvable(need)?
+                    .estimate(&need.params, &in_shape)
+                    .map_or(0, |e| e.bytes);
+                let window = match (r, in_shape) {
+                    (
+                        PortRef::Node { id: up },
+                        Shape::Audio {
+                            frames: crate::shape::Dim::Exact(m),
+                            ..
+                        },
+                    ) if depth < plan.nodes.len() => {
+                        let w = (crate::audio::stream::STREAM_CHUNKS * AUDIO_CHUNK) as u64;
+                        let inner = self.region_cost(
+                            plan,
+                            *up,
+                            crate::render::region::Area::span(0, w.min(m)),
+                            hits,
+                            probe,
+                            tasks,
+                            depth + 1,
+                        )?;
+                        let mut fresh = Ledger::default();
+                        let inputs: BTreeMap<InputId, usize> =
+                            plan.inputs.keys().map(|k| (*k, fresh.add(0))).collect();
+                        self.render_stage(plan, &mut fresh, &inputs, hits, Some(&inner), tasks)?
+                            .0
+                    }
+                    _ => 0,
+                };
+                extra = extra.saturating_add(window).saturating_add(result);
+            }
+            if extra > 0 {
+                rc.presolve.insert(*id, extra);
+            }
+        }
+        Ok(rc)
     }
 
     /// キャッシュに当たるもの（有効なノードの値と、量子化した出力）。別のエンジンの計画は `Internal`。
@@ -684,4 +906,20 @@ impl std::fmt::Debug for CacheLease {
             .field("want", &self.want)
             .finish()
     }
+}
+
+/// ポートの値を作るノード（外したノードを通り抜けた先の有効なノード。計画の入力なら None）。
+fn port_node(plan: &Plan, index: &BTreeMap<NodeId, &PlannedNode>, r: &PortRef) -> Option<NodeId> {
+    let mut at = *r;
+    for _ in 0..=plan.nodes.len() {
+        let PortRef::Node { id } = at else {
+            return None;
+        };
+        let n = index.get(&id)?;
+        if n.enabled {
+            return Some(id);
+        }
+        at = *n.inputs.first()?;
+    }
+    None
 }

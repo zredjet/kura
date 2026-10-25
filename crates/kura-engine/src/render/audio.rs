@@ -160,6 +160,28 @@ impl Engine {
         Ok(true)
     }
 
+    /// 申告した解析がどれも、入力の形で流して解けるか（キャッシュを見ない見積もりの判定。流せる解析は、範囲の描画で
+    /// いつも解ける）。
+    pub(super) fn needs_streamable(
+        &self,
+        shapes: &super::area::Shapes,
+        node: &PlannedNode,
+    ) -> Result<bool, EngineError> {
+        for need in &node.needs {
+            let Some(shape) = node.inputs.get(need.input).and_then(|r| shapes.port(r)) else {
+                return Ok(false);
+            };
+            if self
+                .solvable(need)?
+                .stream_any(&need.params, &shape)?
+                .is_none()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// 音声の範囲を持つノード 1 つを、`rounded`（出力のチャンクに揃えた区間）のチャンクだけ描く。全体の描画と同じ `apply_node`
     /// を通る（写し方の確かめ・メタデータの写しは同じ）。申告した解析は先に解く（流し解きした結果 → キャッシュ → 入力が完全な
     /// 値なら解いて入れる）。核のメタデータ（`meta()`、なければ入力 0 のもの）を付けて描き、写し方は実行器が当て直す。
