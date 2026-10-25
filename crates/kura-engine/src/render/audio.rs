@@ -83,6 +83,36 @@ pub fn chunks_covering(area: &Area, frames: usize) -> ChunkSet {
     }
 }
 
+/// 長さ `frames` の音声で、範囲 `area` に掛かるチャンクの長さの和（[`chunks_covering`] の和を、集合を作らずに求める。
+/// 見積もりで、長さの決まっていない音声の上限にも使う）。
+pub(super) fn covered_frames(area: &Area, frames: u64) -> u64 {
+    let c = AUDIO_CHUNK as u64;
+    match area {
+        Area::Empty => 0,
+        Area::All | Area::Pixels(_) => frames,
+        Area::Samples(spans) => {
+            // 区間は小さい順・重ならないが、隣の区間と同じチャンクに掛かりうる（そのチャンクは 1 度だけ数える）
+            let mut next = 0u64;
+            let mut sum = 0u64;
+            for &(a, b) in spans.spans() {
+                let b = b.min(frames);
+                if a >= b {
+                    continue;
+                }
+                let lo = (a / c).max(next);
+                let hi = b.div_ceil(c);
+                if lo < hi {
+                    let start = lo.saturating_mul(c);
+                    let end = hi.saturating_mul(c).min(frames);
+                    sum = sum.saturating_add(end.saturating_sub(start));
+                    next = hi;
+                }
+            }
+            sum
+        }
+    }
+}
+
 /// チャンクの集合の区間（隣り合うものは 1 つに。長さ `frames` で切る）。
 pub fn chunk_spans(set: &ChunkSet, frames: usize) -> Spans {
     let mut out = Spans::new();
@@ -765,5 +795,33 @@ mod tests {
         let mut last = ChunkSet::empty(4);
         last.insert(3);
         assert_eq!(chunk_spans(&last, n as usize), Spans::one(3 * c, n));
+    }
+
+    /// 範囲に掛かるチャンクの長さの和は、`chunks_covering` の集合の長さの和と同じ（同じチャンクに掛かる隣の区間は 1 度だけ）。
+    #[test]
+    fn covered_frames_sums_the_covering_chunks() {
+        let c = AUDIO_CHUNK as u64;
+        let n = 5 * c + 10;
+        let sum =
+            |set: &ChunkSet| -> u64 { set.iter().map(|k| (n - k as u64 * c).min(c)).sum::<u64>() };
+        let mut two = Spans::one(3, 4);
+        two.push(c - 1, c + 1);
+        two.push(c + 5, c + 6);
+        two.push(5 * c + 2, n + 100);
+        for area in [
+            Area::Empty,
+            Area::All,
+            Area::span(0, 1),
+            Area::span(c, 2 * c),
+            Area::span(4 * c + 1, n),
+            Area::samples(two),
+            Area::span(n + 1, n + 5),
+        ] {
+            assert_eq!(
+                covered_frames(&area, n),
+                sum(&chunks_covering(&area, n as usize)),
+                "{area:?}"
+            );
+        }
     }
 }

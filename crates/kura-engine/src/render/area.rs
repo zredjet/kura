@@ -41,7 +41,7 @@ use super::{
 };
 use crate::analysis::AnyOutput;
 use crate::digest::Digest;
-use crate::doc::{InputId, NodeId, OutputId, PortRef};
+use crate::doc::{InputId, NodeId, OutputId, PortRef, Quantize};
 use crate::error::{EngineError, Issue};
 use crate::geom::{IPoint, IRect};
 
@@ -49,7 +49,7 @@ use crate::monitor::Monitor;
 use crate::op::ApplyCx;
 use crate::paint::Sample;
 use crate::shape::{Dim, Fullness, Shape};
-use crate::value::{AUDIO_CHUNK, ChunkSet, Image, TILE, Value};
+use crate::value::{AUDIO_CHUNK, Audio, ChunkSet, Image, TILE, Value};
 
 /// 範囲の描画で描く出力と範囲（キャンバスの座標）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,8 +406,7 @@ impl Engine {
         else {
             return Err(bad_input(format!("出力 {} はありません", req.output.0)).into());
         };
-        // 量子化した出力は、render・render_cached と同じく量子化の指紋で引き、なければ量子化して入れる（等倍で全体を描いた
-        // 音声だけ。そうでなければ有効なチャンクのうち前の値から共有していないものだけに量子化を当てる）
+        // 量子化した出力は、render・render_cached と同じく量子化の指紋で引く（`audio_output`）
         let out_fp = cx
             .fps
             .outputs
@@ -415,31 +414,29 @@ impl Engine {
             .find(|o| o.0 == req.output)
             .map(|o| o.1)
             .ok_or_else(|| EngineError::Internal("出力の指紋がありません".into()))?;
-        let source = cx.source;
-        let quantized =
-            |v: Value, exact: bool, kept: Option<&ChunkSet>, cache: &mut NodeCache| match (
-                quantize, &v,
-            ) {
-                (Some(q), Value::Audio(a)) if exact => {
-                    quantized_output(cache, a, q, out_fp, &source, false, mon)
-                }
-                (Some(q), Value::Audio(a)) => {
-                    let fresh = kept.map(|kept| {
-                        let mut f = a.valid_chunks();
-                        f.subtract(kept);
-                        f
-                    });
-                    crate::audio::quantize(a, q, &source, fresh.as_ref(), mon)
-                }
-                _ => Ok(v),
-            };
-        // 入力をそのまま出す出力は、入力の値（全体。共有した実体なので、音声でも切らない）
+        let finish = AudioFinish {
+            quantize: quantize.as_ref(),
+            out_fp,
+            source: cx.source,
+            area: clip_to_canvas(&req.area, out_shape),
+        };
+        // 入力をそのまま出す出力は、入力の値（全体。共有した実体なので、音声でも切らない）。量子化があれば共有した実体では
+        // ないので、ほかの出力と同じく頼んだ区間のチャンクだけを量子化して切る
         let PortRef::Node { id: out_node } = from else {
             let v = lookup(&BTreeMap::new(), &cx.input_values, from)
                 .ok_or_else(|| EngineError::Internal("出力の値がありません".into()))?;
+            let (value, exact) = match (&v, quantize) {
+                (Value::Audio(a), Some(_)) => finish.apply(cache, a, true, None, mon)?,
+                _ => (v, true),
+            };
+            let origin = if exact {
+                Origin::Exact
+            } else {
+                Origin::Partial
+            };
             return Ok(AreaRender {
                 output: req.output,
-                value: PartialValue::new(quantized(v, true, None, cache)?, Origin::Exact),
+                value: PartialValue::new(value, origin),
                 warnings: Vec::new(),
                 stats,
             });
@@ -465,18 +462,16 @@ impl Engine {
         )?;
         let mut out_exact = pass.exact && pass.value.is_complete();
         let kept = pass.kept.as_ref().filter(|_| pass.patched);
-        let mut value = quantized(pass.value, out_exact, kept, cache)?;
         // 音声の値は頼んだ区間のチャンクだけを持つ（キャッシュに当たった・全体で描いた出力も切る。表示の値を予算で数えないので、
-        // 窓を動かしても溜まらないように。M13 段 1）
-        if let Value::Audio(a) = &value {
-            let want = chunks_covering(&clip_to_canvas(&req.area, out_shape), a.frames());
-            let mut keep = a.valid_chunks();
-            if keep.iter().any(|k| !want.contains(k)) {
-                keep.intersect_with(&want);
-                value = Value::Audio(Arc::new(a.keep_only(&keep)));
-                out_exact = false;
+        // 窓を動かしても溜まらないように。M13 段 1）。量子化も頼んだ区間のチャンクだけに当てる
+        let value = match pass.value {
+            Value::Audio(a) => {
+                let (v, exact) = finish.apply(cache, &a, out_exact, kept, mon)?;
+                out_exact = exact;
+                v
             }
-        }
+            v => v,
+        };
         let origin = if plan.level != 0 {
             // 縮小の段の値は近似（保存・解析・照合に使わない）
             Origin::Scaled
@@ -858,6 +853,73 @@ impl Engine {
                     .ok_or_else(none)?
             })?;
         Ok((value, cx.warnings, map_warnings))
+    }
+}
+
+/// 範囲の描画の音声の出力の仕上げ（量子化と、頼んだ区間のチャンクへの切り出し。M13 段 1。docs/editing.md §12.5）。
+struct AudioFinish<'a> {
+    quantize: Option<&'a Quantize>,
+    /// 出力の指紋（量子化した全体をキャッシュで引く鍵）。
+    out_fp: Fingerprint,
+    source: Digest,
+    /// 呼び手の範囲（出力のキャンバスに切ったもの）。
+    area: Area,
+}
+
+impl AudioFinish<'_> {
+    /// 出力の音声 `a`（`exact` は等倍で全体を描いた値か、`kept` は継ぎはぎで前の値から共有した量子化済みのチャンク）に量子化を
+    /// 当て、頼んだ区間のチャンク（want）だけを持つ値にする。返すのは（値, 等倍で全体を描いた値のままか）。
+    ///
+    /// - 量子化した全体がキャッシュにあるか、等倍の全体の値で want がすべてのチャンクを覆うときは、`render_cached` と同じ部品
+    ///   `quantized_output`（なければ量子化して `Exact` で入れる）。
+    /// - そうでなければ、want の有効なチャンクのうち `kept` でないものだけを量子化する（全体を量子化してから切らない。表示の
+    ///   値と見積もり（§12.10）が頼んだ区間の分に収まり、遅延の源も want の分しか読まない）。
+    /// - 最後に want の外を無効にする（切ったら等倍の全体の値ではない）。
+    fn apply(
+        &self,
+        cache: &mut NodeCache,
+        a: &Arc<Audio>,
+        exact: bool,
+        kept: Option<&ChunkSet>,
+        mon: &dyn Monitor,
+    ) -> Result<(Value, bool), EngineError> {
+        let want = chunks_covering(&self.area, a.frames());
+        let covers_all = want.count() == a.chunk_count();
+        let (out, mut exact) = match self.quantize {
+            None => (a.clone(), exact),
+            Some(q) if cache.contains(&self.out_fp) || (exact && covers_all) => {
+                match quantized_output(cache, a, q, self.out_fp, &self.source, false, mon)? {
+                    Value::Audio(v) => (v, true),
+                    _ => {
+                        return Err(EngineError::Internal(
+                            "量子化した値が音声ではありません".into(),
+                        ));
+                    }
+                }
+            }
+            Some(q) => {
+                let mut fresh = a.valid_chunks();
+                fresh.intersect_with(&want);
+                if let Some(kept) = kept {
+                    fresh.subtract(kept);
+                }
+                match crate::audio::quantize(a, q, &self.source, Some(&fresh), mon)? {
+                    Value::Audio(v) => (v, false),
+                    _ => {
+                        return Err(EngineError::Internal(
+                            "量子化した値が音声ではありません".into(),
+                        ));
+                    }
+                }
+            }
+        };
+        let mut keep = out.valid_chunks();
+        if keep.iter().any(|k| !want.contains(k)) {
+            keep.intersect_with(&want);
+            exact = false;
+            return Ok((Value::Audio(Arc::new(out.keep_only(&keep))), exact));
+        }
+        Ok((Value::Audio(out), exact))
     }
 }
 

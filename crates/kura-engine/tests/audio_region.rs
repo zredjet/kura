@@ -433,6 +433,185 @@ fn quantized_audio_regions_match_render() {
     assert_eq!(checked, 24);
 }
 
+/// 検証の直し（M13 段 1）：量子化した出力の範囲の描画・表示は、出力がどこから来ても（入力をそのまま出す出力・外したノード
+/// だけの鎖・キャッシュに当たった出力のノード・範囲で描いたノード）、頼んだ区間のチャンクだけを量子化して持つ。範囲の
+/// 見積もり（`EstimateSpec::area`）はその量を覆い、全体よりずっと小さい。遅延の源は頼んだ区間のチャンクしか読まない。
+/// 全体を頼めば `quantized_output` の全体（由来 Exact で `render` と同じ）。
+#[test]
+fn quantized_outputs_keep_only_the_requested_chunks() {
+    use kura_engine::audio::source::AudioSource;
+    use kura_engine::doc::{Dither, QUANTIZE_VERSION, Quantize};
+    use kura_engine::render::cache::Origin;
+    use kura_engine::render::estimate::{CacheProbe, EstimateSpec, Source};
+    use kura_engine::render::view::ViewRequest;
+    use kura_engine::testing::source::SyntheticSource;
+    let engine = engine();
+    let (frames, channels) = (40 * C + 77, 2usize);
+    let q = Quantize {
+        v: QUANTIZE_VERSION,
+        bits: 16,
+        dither: Dither::Tpdf,
+        seed: 5,
+    };
+    // 文書：ノードなし・外したゲインだけ・ゲイン（出力のノードはキャッシュに当てる）・ゲイン（範囲で描く）
+    let docs: Vec<(&str, Graph, bool)> = {
+        let plain = Graph::new_single();
+        let mut off = Graph::new_single();
+        off.push_linear("audio.gain", 1, json!({ "db": -2.0 }), 1)
+            .unwrap();
+        off.nodes[0].enabled = false;
+        let mut gain = Graph::new_single();
+        gain.push_linear("audio.gain", 1, json!({ "db": -2.0 }), 1)
+            .unwrap();
+        vec![
+            ("ノードなし", plain, false),
+            ("外したノードだけ", off, false),
+            ("当たった出力のノード", gain.clone(), true),
+            ("範囲で描いたノード", gain, false),
+        ]
+    };
+    let lazy_input = |lru: u64| {
+        let src = Arc::new(SyntheticSource::new(8_000, channels, frames, 11, lru));
+        let v = Value::Audio(Arc::new(
+            Audio::from_source(src.clone(), Default::default()).unwrap(),
+        ));
+        // 遅延の入力の指紋は記録か派生の指紋（全体のダイジェストを取らない）
+        let fin = BTreeMap::from([(
+            InputId(0),
+            FingerprintedInput {
+                value: v.clone(),
+                source: Digest([3; 32]),
+                fingerprint: Fingerprint(Digest([8; 32])),
+            },
+        )]);
+        (src, v, fin)
+    };
+    let full_bytes = frames * channels as u64 * 4;
+    for (name, plain_doc, hit) in docs {
+        let mut g = plain_doc.clone();
+        g.outputs[0].quantize = Some(q);
+        let (_, whole_input, _) = lazy_input(1 << 30);
+        let plan = compile(&engine, &g, &whole_input).unwrap();
+        let (want, _) = render(&engine, &plan, &whole_input, Digest([3; 32])).unwrap();
+        for area in [
+            Area::span(5 * C + 10, 5 * C + 20),
+            Area::span(C - 1, C + 1).union(&Area::span(39 * C, 39 * C + 3)),
+        ] {
+            let want_chunks = chunks_covering(&area, frames as usize);
+            let want_bytes: u64 = want_chunks
+                .iter()
+                .map(|k| (frames - k as u64 * C).min(C) * channels as u64 * 4)
+                .sum();
+            for view in [false, true] {
+                let what = format!("{name}・{area:?}・表示 {view}");
+                let (src, _, fin) = lazy_input(4 * C * channels as u64 * 4);
+                let mut cache = NodeCache::new(1 << 30);
+                if hit {
+                    // 量子化のない同じ文書を全体で描いて、出力のノードの値（等倍の全体）だけをキャッシュに入れる
+                    let p = compile(&engine, &plain_doc, &whole_input).unwrap();
+                    engine
+                        .render_area(
+                            &p,
+                            &fin,
+                            &mut cache,
+                            &AreaRequest {
+                                output: OutputId(0),
+                                area: Area::All,
+                            },
+                            None,
+                            &NoMonitor,
+                        )
+                        .unwrap();
+                }
+                let est = engine
+                    .estimate(
+                        &plan,
+                        &EstimateSpec::new(3)
+                            .all_inputs(&plan, Source::Held)
+                            .area(OutputId(0), area.clone()),
+                        Some(CacheProbe {
+                            cache: &cache,
+                            inputs: &fin,
+                        }),
+                    )
+                    .unwrap();
+                let reads = src.stats().reads;
+                let got = if view {
+                    engine
+                        .render_view(
+                            &plan,
+                            &fin,
+                            &mut cache,
+                            &ViewRequest {
+                                output: OutputId(0),
+                                area: area.clone(),
+                                focus: None,
+                            },
+                            None,
+                            &NoMonitor,
+                        )
+                        .unwrap()
+                        .view
+                        .value()
+                        .clone()
+                } else {
+                    engine
+                        .render_area(
+                            &plan,
+                            &fin,
+                            &mut cache,
+                            &AreaRequest {
+                                output: OutputId(0),
+                                area: area.clone(),
+                            },
+                            None,
+                            &NoMonitor,
+                        )
+                        .unwrap()
+                        .value
+                };
+                let read = src.stats().reads - reads;
+                check_region(&got, &want, &area).unwrap_or_else(|m| panic!("{what}: {m}"));
+                assert_eq!(
+                    got.audio_valid(),
+                    Some(kura_engine::render::audio::chunk_spans(
+                        &want_chunks,
+                        frames as usize
+                    )),
+                    "{what}"
+                );
+                assert_eq!(got.resident_bytes(), want_bytes, "{what}：常駐");
+                assert_eq!(got.origin(), Origin::Partial, "{what}");
+                assert!(
+                    est.render >= got.resident_bytes() && est.render < full_bytes / 2,
+                    "{what}：見積もり {}（常駐 {}・全体 {full_bytes}）",
+                    est.render,
+                    got.resident_bytes()
+                );
+                // 源は頼んだ区間のチャンクだけを読む（出力のノードがキャッシュに当たれば読まない）
+                let most = if hit { 0 } else { want_chunks.count() as u64 };
+                assert!(read <= most, "{what}：源のチャンクを {read} 個読んだ");
+            }
+        }
+        // 全体を頼めば量子化した全体（由来 Exact。render と同じ）
+        let (_, _, fin) = lazy_input(1 << 30);
+        let got = engine
+            .render_area(
+                &plan,
+                &fin,
+                &mut NodeCache::new(0),
+                &AreaRequest {
+                    output: OutputId(0),
+                    area: Area::All,
+                },
+                None,
+                &NoMonitor,
+            )
+            .unwrap();
+        assert_eq!(got.value.exact(), Some(&want), "{name}：全体");
+    }
+}
+
 /// 範囲の描画の値は、頼んだ区間のチャンクと、その読みの口（配信）が全体と同じ。描いていない区間は誤り。
 #[test]
 fn partial_values_deliver_only_drawn_chunks() {

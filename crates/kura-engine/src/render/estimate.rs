@@ -276,8 +276,6 @@ struct RegionCost {
     bytes: BTreeMap<NodeId, u64>,
     /// 流し解きの量（入力のポートを窓で描いて流す間の最大 ＋ 解析の結果。核で描く間の量との大きいほうを数える）。
     presolve: BTreeMap<NodeId, u64>,
-    /// 頼んだ出力のノードの値の量（量子化した出力の分）。
-    output_bytes: Option<u64>,
 }
 
 /// キャッシュに当たるもの（描かないノードと、量子化した出力の番号）。
@@ -348,13 +346,24 @@ impl Engine {
         };
         let (mut render, nodes) =
             self.render_stage(plan, &mut ledger, &input_buf, &hits, region.as_ref(), tasks)?;
-        // 出力：量子化した値は新しい値。ダイジェストは出力ごとに帯を持つ（範囲の描画は頼んだ出力の描いた分だけ）
+        // 出力：量子化した値は新しい値（量子化は音声の出力だけ）。範囲の描画は頼んだ区間のチャンクの分だけを量子化する
+        // （入力をそのまま出す出力・外したノードだけの鎖・全体で描いた出力のノードも同じ。render/area.rs の `AudioFinish`）。
+        // ダイジェストは出力ごとに帯を持つ（範囲の描画は頼んだ出力の描いた分だけ）
         for (k, (id, _, shape, quantize)) in plan.outputs.iter().enumerate() {
-            let bytes = match (&spec.area, &region) {
-                (Some((out, _)), _) if out != id => continue,
-                (Some(_), Some(rc)) => rc.output_bytes.unwrap_or_else(|| shape.value_bytes()),
-                (Some(_), None) => 0,
-                (None, _) => shape.value_bytes(),
+            let bytes = match &spec.area {
+                Some((out, _)) if out != id => continue,
+                Some((_, area)) => match shape {
+                    Shape::Audio {
+                        channels, frames, ..
+                    } => {
+                        let target = super::area::clip_to_canvas(area, shape);
+                        super::audio::covered_frames(&target, frames.max())
+                            .saturating_mul(u64::from(*channels))
+                            .saturating_mul(4)
+                    }
+                    _ => shape.value_bytes(),
+                },
+                None => shape.value_bytes(),
             };
             if quantize.is_some() && !hits.outputs.contains(&k) {
                 ledger.add(bytes);
@@ -555,9 +564,15 @@ impl Engine {
             None => None,
         };
         let target = super::area::clip_to_canvas(area, shape);
-        let mut rc = self.region_cost(plan, *id, target, hits, probe.as_ref(), tasks, 0)?;
-        rc.output_bytes = rc.bytes.get(id).copied();
-        Ok(Some(rc))
+        Ok(Some(self.region_cost(
+            plan,
+            *id,
+            target,
+            hits,
+            probe.as_ref(),
+            tasks,
+            0,
+        )?))
     }
 
     /// 範囲の描画の量（`region_needs` と同じ走査を、値なしで）：描くノード、範囲を持つ音声のノードの値の量（描くチャンクの
