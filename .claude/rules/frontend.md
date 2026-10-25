@@ -14,6 +14,7 @@ paths:
   - サムネイルがあるかは `hasThumb(thumbState)`（`ready` か、作り直すまで今の絵を出す `stale`）。`thumbState === 'ready'` で判定しない。
   - `artUrl(hash)`・`fileUrl(hash)`・`playUrl(hash)`：ジャケット・元のファイル・再生用（Range 対応）。
   - `peaksUrl(hash)`：`/peaks/{hash}`（波形の段 `kura-peaks`。immutable）。`fetch` して `src/lib/asset/peaks.ts` の `parsePeaks` で読む。
+  - `waveUrl(hash)`：`/wave/{hash}/1`（ジャケットのない音声のタイルの小さな波形。棒のアルファの PNG を `mask-image` に使う。immutable。形を変えたら番号を上げる）。呼ぶのは `src/features/library/TileWave.tsx` だけ。
   - `pcmUrl(hash, start, end)`：`/pcm/{hash}/{start}-{end}`（試聴の PCM。フレームの半開区間で、0 以上の整数・`start < end`。キャッシュしない）。`fetch` して `src/lib/asset/wav.ts` の `readPcmWav` で読む（`decodeAudioData` は使わない。文脈のレートに直されてループ点が標本で合わなくなる）。
   - `animUrl(hash, rev)`：`/anim/{hash}/1`（アニメの帯の PNG。immutable。帯の並べ方を変えたら番号を上げる）。`rev` は `item_anim_get` の `AnimDto.rev`（格子の帯は格子ごとに変わる）で、0 より大きいときだけ `?r={rev}`。
   - `editTileUrl(session, rev, level, frame, tx, ty, format)`：`/edit/{session}/{rev}/{段}/{frame}/{tx}/{ty}`（エディタの表示のタイル。
