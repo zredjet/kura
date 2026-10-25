@@ -1,6 +1,6 @@
 //! 素材の欄（M11。docs/design.md §3.1・docs/data-model.md §3）：中身ごとの解析の事実（`media_facts`）、アイテムごとの
 //! 利用者の設定（`asset_settings`）、その実効値、フォントと 3D の情報（`items.codec_info`）。アニメの帯は [`anim`]、試聴の
-//! PCM は [`pcm`]。
+//! PCM は [`pcm`]、グリッドの実波形は [`wave`]。
 //!
 //! - **表示の実効値の規則はここの関数だけ**：ドット絵は [`effective_pixel_art`]（設定 ?? 自動の判定 ?? 偽）。一覧の
 //!   タイルの SQL（items.rs の SUMMARY）は同じ規則であることを、検索の SQL（query の compile）は「設定 ?? 自動」で比べて
@@ -19,6 +19,7 @@
 
 pub mod anim;
 pub mod pcm;
+pub mod wave;
 
 use std::collections::BTreeSet;
 

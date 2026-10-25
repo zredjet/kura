@@ -2,6 +2,7 @@
 //! サムネイル・ジャケット・元ファイル・再生用ファイル・波形の段・アニメの帯を返す。Range は 1 区間・1 回 4MB まで。
 //! 試聴の PCM（`/pcm`）はその場で WAV にして返す（kura-core の `asset::pcm`。ジョブにしない。決定 8）。
 //! エディタの表示のタイル（`/edit`。M12）は、エディタが表示した今か直前の値からその場で作る（kura-core の `edit::editor::tile`）。
+//! グリッドの実波形（`/wave`。M13）は、波形の段のファイルからその場で棒の PNG にする（kura-core の `asset::wave`）。
 //!
 //! 受け付けの判定（WebView のラベル・Origin・メソッド）と応答のヘッダは kura-core の `serve::access`
 //! （§4.1。CI で回す純粋な関数）が決め、ここは HTTP の型に写すだけ。
@@ -11,7 +12,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
-use kura_core::asset::pcm;
+use kura_core::asset::{pcm, wave};
 use kura_core::edit::EngineServices;
 use kura_core::edit::editor::{TileFormat, TileRequest, tile};
 use kura_core::library::Layout;
@@ -155,6 +156,9 @@ fn answer(
     if let Route::Pcm { hash, start, end } = &route {
         return pcm_response(served, hash, *start, *end, route.cache_control(), head);
     }
+    if let Route::Wave { hash, version } = &route {
+        return wave_response(served, hash, *version, route.cache_control(), head);
+    }
     if let Route::Edit {
         session,
         rev,
@@ -220,6 +224,39 @@ fn pcm_response(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "audio/wav")
         .header(header::CONTENT_LENGTH, len);
+    if let Some(cache_control) = cache_control {
+        builder = builder.header(header::CACHE_CONTROL, cache_control);
+    }
+    builder
+        .body(if head { Vec::new() } else { body })
+        .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+/// グリッドの実波形（棒のアルファの PNG）をその場で作って返す（Range は見ない）。段のファイルがない・形の版が違えば 404、
+/// エンジンがなければ 503、段のファイルが壊れていれば 500。中身は (ハッシュ, 形の版) で決まるので immutable。
+fn wave_response(
+    served: &Served<'_>,
+    hash: &str,
+    version: u32,
+    cache_control: Option<&str>,
+    head: bool,
+) -> Response<Vec<u8>> {
+    let Some(engine) = served.engine else {
+        return empty(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let body = match wave::serve(engine, served.layout, hash, version) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::debug!(%err, hash, version, "kura:// の実波形を返せません");
+            let code =
+                StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return empty(code);
+        }
+    };
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CONTENT_LENGTH, body.len());
     if let Some(cache_control) = cache_control {
         builder = builder.header(header::CACHE_CONTROL, cache_control);
     }
@@ -697,6 +734,106 @@ mod tests {
             );
             assert_decorated(&r, &origin, &path);
         }
+    }
+
+    /// グリッドの実波形（/wave）：段のファイルがあれば棒の PNG（image/png・immutable）。段のファイルがない・形の版が違えば
+    /// 404、壊れていれば 500、エンジンがなければ 503。どの応答にも 4 つのヘッダ。main でない WebView は受け付けで 403。
+    #[test]
+    fn wave_is_drawn_from_the_peaks_file() {
+        use kura_engine::analysis::audio::peaks::{PeakLevel, Peaks};
+        use kura_engine::analysis::output::AnalysisOutput;
+
+        let (_dir, layout) = library();
+        let origin = release();
+        let engine = Arc::new(kura_core::edit::EngineServices::new(
+            Arc::new(Factory),
+            layout.staging_dir(),
+        ));
+        let with = Served {
+            layout: &layout,
+            engine: Some(&engine),
+        };
+        let without = Served {
+            layout: &layout,
+            engine: None,
+        };
+        let get = |served: &Served<'_>, path: String| {
+            reply(Some(served), &request("GET", &path, &[]), &origin, false)
+        };
+        let path = format!("/wave/{HASH}/1");
+        let missing = get(&with, path.clone());
+        assert_eq!(
+            missing.status(),
+            StatusCode::NOT_FOUND,
+            "段のファイルはまだ"
+        );
+        assert_decorated(&missing, &origin, "wave 404");
+
+        // 60 ビン・モノラルの段（65,536 フレーム/ビン）
+        let peaks = Peaks {
+            rate: 44_100,
+            channels: 1,
+            frames: 60 * 65_536,
+            levels: vec![PeakLevel {
+                bin: 65_536,
+                data: (0..60).flat_map(|k| [-(k * 500), k * 400]).collect(),
+            }],
+        };
+        let file = layout.peaks_path(HASH);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, peaks.to_canonical().unwrap()).unwrap();
+
+        let ok = get(&with, path.clone());
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(header_of(&ok, "content-type").as_deref(), Some("image/png"));
+        assert_eq!(header_of(&ok, "cache-control").as_deref(), IMMUTABLE);
+        assert_eq!(
+            header_of(&ok, "content-length"),
+            Some(ok.body().len().to_string())
+        );
+        assert_eq!(&ok.body()[..4], b"\x89PNG");
+        assert_decorated(&ok, &origin, "wave 200");
+        let head = reply(Some(&with), &request("HEAD", &path, &[]), &origin, true);
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(head.body().is_empty());
+        assert_eq!(
+            header_of(&head, "content-length"),
+            Some(ok.body().len().to_string())
+        );
+
+        for (what, served, path, status) in [
+            (
+                "404（形の版が違う）",
+                &with,
+                format!("/wave/{HASH}/2"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "404（読めない綴り）",
+                &with,
+                format!("/wave/{HASH}/1.png"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "503（エンジンなし）",
+                &without,
+                path.clone(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let r = get(served, path);
+            assert_eq!(r.status(), status, "{what}");
+            assert_decorated(&r, &origin, what);
+        }
+        std::fs::write(&file, b"kurapeak").unwrap();
+        let broken = get(&with, path.clone());
+        assert_eq!(broken.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_decorated(&broken, &origin, "wave 500");
+        // main でない WebView は受け付けで断る
+        let Gate::Done(r) = gate("capture-browser", &request("GET", &path, &[]), &origin) else {
+            panic!("ほかの WebView の /wave を受け付けました");
+        };
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
     /// エディタのタイル（/edit）：開いたエディタが表示した rev・段の有効なタイルは 200（RGBA8 の行と PNG。immutable）、古い

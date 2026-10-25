@@ -9,6 +9,7 @@
 //! | `/peaks/{hash}` | 波形の段（`peaks/ab/<hash>.peaks`。解析のジョブが書く） |
 //! | `/pcm/{hash}/{start}-{end}` | 試聴用の PCM（WAV。その場で作る。[`crate::asset::pcm`]。元は [`pcm_source`]） |
 //! | `/anim/{hash}/{版}` | アニメの帯（`anim/ab/<hash>-<版>.png`。`item_anim_get` が書く。[`crate::asset::anim`]） |
+//! | `/wave/{hash}/{版}` | グリッドの実波形（棒のアルファの PNG。波形の段からその場で作る。[`crate::asset::wave`]。M13） |
 //! | `/edit/{session}/{rev}/{段}/{frame}/{tx}/{ty}` | エディタの表示のタイル（M12。RGBA8 の行、`{ty}.png` なら PNG。その場で表示の値から作る。[`crate::edit::editor::tile`]） |
 //!
 //! 受け付け（WebView のラベル・Origin・メソッド）と応答のヘッダ・CSP の確かめは [`access`]。
@@ -62,6 +63,11 @@ pub enum Route {
         hash: String,
         version: u32,
     },
+    /// グリッドの実波形の PNG（M13）。`version` は形の版（1 から。今の版でなければ作る側が 404）。
+    Wave {
+        hash: String,
+        version: u32,
+    },
     /// エディタの表示のタイル（M12）：セッション・文書の番号・段（0〜3）・フレーム・タイルの位置（1 辺 256、フレームの画像の
     /// 座標）。`png` なら PNG、ほかは行を詰めた RGBA8。(セッション, rev, 段, フレーム, タイル) の中身は変わらない。
     Edit {
@@ -79,8 +85,8 @@ pub enum Route {
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
 impl Route {
-    /// 中身が変わらないもの（ハッシュ名のサムネイル・ジャケット・波形の段・アニメの帯・エディタのタイル）。長くキャッシュして
-    /// よい。
+    /// 中身が変わらないもの（ハッシュ名のサムネイル・ジャケット・波形の段・アニメの帯・実波形・エディタのタイル）。長く
+    /// キャッシュしてよい。
     pub fn immutable(&self) -> bool {
         matches!(
             self,
@@ -88,6 +94,7 @@ impl Route {
                 | Self::Art { .. }
                 | Self::Peaks { .. }
                 | Self::Anim { .. }
+                | Self::Wave { .. }
                 | Self::Edit { .. }
         )
     }
@@ -99,6 +106,7 @@ impl Route {
             | Self::Art { .. }
             | Self::Peaks { .. }
             | Self::Anim { .. }
+            | Self::Wave { .. }
             | Self::Edit { .. } => Some(IMMUTABLE),
             Self::Pcm { .. } => Some("no-store"),
             Self::File { .. } | Self::Play { .. } => None,
@@ -135,6 +143,10 @@ pub fn parse_route(path: &str) -> Option<Route> {
         ("anim", Some(version)) => {
             let version = u32::try_from(parse_decimal(version)?).ok()?;
             (version >= 1).then_some(Route::Anim { hash, version })
+        }
+        ("wave", Some(version)) => {
+            let version = u32::try_from(parse_decimal(version)?).ok()?;
+            (version >= 1).then_some(Route::Wave { hash, version })
         }
         _ => None,
     }
@@ -187,7 +199,8 @@ fn is_hash(text: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// パスに対応するファイル（なければ None）。PCM はファイルではなくその場で作るので None（元は [`pcm_source`]）。
+/// パスに対応するファイル（なければ None）。PCM・実波形・エディタのタイルはファイルではなくその場で作るので None（PCM の元は
+/// [`pcm_source`]、実波形は [`crate::asset::wave::serve`]）。
 pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
     let path = match route {
         Route::Thumb { hash, size } => return thumb_file(layout, hash, *size),
@@ -197,7 +210,9 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
         Route::Peaks { hash } => layout.peaks_path(hash),
         // アニメの帯（item_anim_get が書く）。並べ方の版が今のものだけ（古い版は残さない）
         Route::Anim { hash, version } if *version == ANIM_V => layout.anim_path(hash),
-        Route::Anim { .. } | Route::Pcm { .. } | Route::Edit { .. } => return None,
+        Route::Anim { .. } | Route::Pcm { .. } | Route::Wave { .. } | Route::Edit { .. } => {
+            return None;
+        }
         Route::Play { hash } => {
             let proxy = layout.proxy_path(hash);
             if proxy.is_file() {
@@ -377,6 +392,21 @@ mod tests {
                 version: 1
             })
         );
+        // 実波形：形の版は 1 以上（今の版でないものは作る側が 404）
+        assert_eq!(
+            parse_route(&format!("/wave/{HASH}/1")),
+            Some(Route::Wave {
+                hash: HASH.into(),
+                version: 1
+            })
+        );
+        assert_eq!(
+            parse_route(&format!("/wave/{HASH}/2")),
+            Some(Route::Wave {
+                hash: HASH.into(),
+                version: 2
+            })
+        );
         // 逆の範囲・空の範囲・片側だけ・あふれ・符号・空白・余分な区切り
         for bad in [
             format!("/pcm/{HASH}/100-0"),
@@ -395,6 +425,14 @@ mod tests {
             format!("/anim/{HASH}/4294967296"),
             format!("/anim/{HASH}/x"),
             "/peaks/abc".to_string(),
+            format!("/wave/{HASH}"),
+            format!("/wave/{HASH}/0"),
+            format!("/wave/{HASH}/1/x"),
+            format!("/wave/{HASH}/4294967296"),
+            format!("/wave/{HASH}/+1"),
+            format!("/wave/{HASH}/1.png"),
+            format!("/wave/{}/1", HASH.to_uppercase()),
+            "/wave/abc/1".to_string(),
         ] {
             assert_eq!(parse_route(&bad), None, "{bad}");
         }
@@ -408,6 +446,7 @@ mod tests {
             (format!("/art/{HASH}"), immutable),
             (format!("/peaks/{HASH}"), immutable),
             (format!("/anim/{HASH}/1"), immutable),
+            (format!("/wave/{HASH}/1"), immutable),
             (format!("/pcm/{HASH}/0-1"), Some("no-store")),
             (format!("/file/{HASH}"), None),
             (format!("/play/{HASH}"), None),
@@ -482,8 +521,9 @@ mod tests {
         let peaks = parse_route(&format!("/peaks/{HASH}")).unwrap();
         let anim = parse_route(&format!("/anim/{HASH}/1")).unwrap();
         let pcm = parse_route(&format!("/pcm/{HASH}/0-1")).unwrap();
+        let wave = parse_route(&format!("/wave/{HASH}/1")).unwrap();
         // まだ作っていない
-        for route in [&peaks, &anim, &pcm] {
+        for route in [&peaks, &anim, &pcm, &wave] {
             assert_eq!(resolve(&layout, route), None, "{route:?}");
         }
         put(&layout.peaks_path(HASH), b"kurapeak");
@@ -491,6 +531,11 @@ mod tests {
         assert_eq!(resolve(&layout, &peaks), Some(layout.peaks_path(HASH)));
         assert_eq!(resolve(&layout, &anim), Some(layout.anim_path(HASH)));
         assert_eq!(resolve(&layout, &pcm), None, "PCM はファイルから返さない");
+        assert_eq!(
+            resolve(&layout, &wave),
+            None,
+            "実波形は段のファイルから毎回作る"
+        );
         // 帯の版が違えば（古い・新しい並べ方）404
         let other = parse_route(&format!("/anim/{HASH}/2")).unwrap();
         assert_eq!(resolve(&layout, &other), None);
