@@ -378,15 +378,28 @@ mod tests {
                 heic.read
             );
             let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40"><text x="4" y="30" font-family="sans-serif" font-size="24">Kq</text></svg>"##;
-            let (value, _) = codecs
-                .decode(
+            // 働き手の形の上限（2 秒）は release の実測から決めたもので、debug のテストを全体で並べて回すと書体の読み込みが
+            // 超えることがある（ワークスペースのテストで 2 度落ちた）。時間切れのときだけ、負荷が引くのを待って読み直す
+            let decode = || {
+                codecs.decode(
                     &mut Cursor::new(svg.as_bytes().to_vec()),
                     "svg",
                     &DecodeOptions::default(),
                     &Limits::default(),
                     &NoMonitor,
                 )
-                .expect("文字を含む SVG を読める");
+            };
+            let mut got = decode();
+            for _ in 0..4 {
+                match &got {
+                    Err(e) if kura_core::codec_ext::svg_worker::is_time_limit(e) => {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        got = decode();
+                    }
+                    _ => break,
+                }
+            }
+            let (value, _) = got.expect("文字を含む SVG を読める");
             assert!(matches!(value, Value::Image(_)));
         }
     }
