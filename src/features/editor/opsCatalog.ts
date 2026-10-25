@@ -17,7 +17,7 @@ import {
   type ParamSpec,
 } from '../../ipc/edit';
 import { formatCount } from '../../lib/format';
-import { toHex } from './color';
+import { toHex } from './image/color';
 import type { EditorDoc } from './editorStore';
 
 const t = ja.editor;

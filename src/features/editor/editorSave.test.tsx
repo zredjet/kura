@@ -36,7 +36,7 @@ import {
 } from './editorSave';
 import { EditorSheets } from './EditorSheets';
 import { closeEditor, openEditor, pushEditorSteps, useEditorStore } from './editorStore';
-import { DEFAULT_TOOLS, useToolStore } from './toolStore';
+import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
 
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tauri-apps/api/core')>()),

@@ -1,10 +1,10 @@
 import { type PointerEvent, useEffect, useLayoutEffect, useRef, useState } from 'react';
 
-import { MediaImage } from '../../components/MediaImage/MediaImage';
-import { ja } from '../../i18n/ja';
-import type { Point } from '../../lib/paint';
+import { MediaImage } from '../../../components/MediaImage/MediaImage';
+import { ja } from '../../../i18n/ja';
+import type { Point } from '../../../lib/paint';
 import { CropOverlay } from './CropOverlay';
-import styles from './Editor.module.css';
+import styles from '../Editor.module.css';
 import {
   editorController,
   fillAt,
@@ -15,7 +15,7 @@ import {
   strokeMove,
   strokeStart,
   useEditorStore,
-} from './editorStore';
+} from '../editorStore';
 import { type EditorTool, useToolStore } from './toolStore';
 import { type Insets, wheelPixels, wheelZoomFactor } from './viewMath';
 

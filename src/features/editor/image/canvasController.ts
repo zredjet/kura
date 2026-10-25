@@ -17,9 +17,9 @@
  * - 描く関数・タイルを読む口・時計は差し込める（テスト）。閉じたら（`dispose`）絵をすべて close する。
  */
 
-import type { EditFrameDto, EditViewDto, EditViewportDto } from '../../ipc/edit';
-import { editTileUrl, type EditTileFormat } from '../../ipc/media';
-import type { Point } from '../../lib/paint';
+import type { EditFrameDto, EditViewDto, EditViewportDto } from '../../../ipc/edit';
+import { editTileUrl, type EditTileFormat } from '../../../ipc/media';
+import type { Point } from '../../../lib/paint';
 import {
   OverlayTracker,
   type OverlayChunk,

@@ -1,16 +1,16 @@
 import { useCallback, useId, useState } from 'react';
 
-import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
-import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
-import { MinusIcon } from '../../components/icons/MinusIcon';
-import { PlusIcon } from '../../components/icons/PlusIcon';
-import { Segmented } from '../../components/Segmented/Segmented';
-import { Switch } from '../../components/Switch/Switch';
-import { ja } from '../../i18n/ja';
-import { formatCount } from '../../lib/format';
+import { ChevronLeftIcon } from '../../../components/icons/ChevronLeftIcon';
+import { ChevronRightIcon } from '../../../components/icons/ChevronRightIcon';
+import { MinusIcon } from '../../../components/icons/MinusIcon';
+import { PlusIcon } from '../../../components/icons/PlusIcon';
+import { Segmented } from '../../../components/Segmented/Segmented';
+import { Switch } from '../../../components/Switch/Switch';
+import { ja } from '../../../i18n/ja';
+import { formatCount } from '../../../lib/format';
 import { toHex } from './color';
 import { ColorPicker, Swatch } from './ColorPicker';
-import styles from './Editor.module.css';
+import styles from '../Editor.module.css';
 import {
   cancelCrop,
   confirmCrop,
@@ -18,8 +18,8 @@ import {
   setEditorFrame,
   stepEditorFrame,
   useEditorStore,
-} from './editorStore';
-import { NumberInput } from './ParamFields';
+} from '../editorStore';
+import { NumberInput } from '../ParamFields';
 import { BRUSH_MAX, BRUSH_MIN, useToolStore } from './toolStore';
 
 const t = ja.editor;

@@ -14,7 +14,7 @@
  * - 塗りつぶしは仮描きしない（Rust の結果を待つ。エンジンで 4096² の全面が 7 ms）。
  */
 
-import { type Brush, footprint, packPoints, path, type Point } from '../../lib/paint';
+import { type Brush, footprint, packPoints, path, type Point } from '../../../lib/paint';
 import type { Rect } from './viewMath';
 
 /** 描画の色（RGBA8 のストレート。パレットの画像はスポイトで拾った番号）。 */

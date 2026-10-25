@@ -48,8 +48,8 @@ import {
   toggleEditorInfo,
   useEditorStore,
 } from './editorStore';
-import { type EditorTool, useToolStore } from './toolStore';
-import { formatCanBeTransparent } from './viewMath';
+import { type EditorTool, useToolStore } from './image/toolStore';
+import { formatCanBeTransparent } from './image/viewMath';
 
 /** エディタの上にシート・メニュー・色を選ぶ部品が開いているか。 */
 function isBlocked(): boolean {

@@ -6,7 +6,7 @@ import { EDIT_OPS, type IssueCode } from '../../ipc/edit';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { Editor } from './Editor';
 import { useEditorStore } from './editorStore';
-import { DEFAULT_TOOLS, useToolStore } from './toolStore';
+import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
 
 vi.mock('../library/inspector/ItemInspector', () => ({
   ItemInspector: ({ id }: { id: number }) => <p>インスペクタ {id}</p>,

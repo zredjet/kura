@@ -8,7 +8,7 @@
 
 import { create } from 'zustand';
 
-import type { BrushShape } from '../../lib/paint';
+import type { BrushShape } from '../../../lib/paint';
 import type { Blend, PaintColor } from './stroke';
 
 /** 道具（切り抜きは段 5b。切り抜きの枠は開き直したら戻らないので、保存した設定からは戻さない）。 */

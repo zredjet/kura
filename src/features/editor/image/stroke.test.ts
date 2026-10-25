@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
-import strokesText from '../../../crates/kura-engine/tests/vectors/paint/strokes.json?raw';
+import strokesText from '../../../../crates/kura-engine/tests/vectors/paint/strokes.json?raw';
 
-import { type BrushShape, type Point, strokePixels, unpackPoints } from '../../lib/paint';
+import { type BrushShape, type Point, strokePixels, unpackPoints } from '../../../lib/paint';
 import {
   fillAction,
   OverlayTracker,

@@ -1,10 +1,10 @@
 import { type PointerEvent, useEffect, useReducer, useRef } from 'react';
 
-import { ja } from '../../i18n/ja';
-import { formatCount } from '../../lib/format';
+import { ja } from '../../../i18n/ja';
+import { formatCount } from '../../../lib/format';
 import { CROP_HANDLES, type CropHandle, dragCrop, newCropRect } from './crop';
-import styles from './Editor.module.css';
-import { editorController, setCropRect, useEditorStore } from './editorStore';
+import styles from '../Editor.module.css';
+import { editorController, setCropRect, useEditorStore } from '../editorStore';
 import { type Rect, screenToImage, toScreen } from './viewMath';
 
 const t = ja.editor;

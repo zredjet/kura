@@ -21,7 +21,7 @@ import {
   toggleEditorInfo,
   useEditorStore,
 } from './editorStore';
-import { DEFAULT_TOOLS, type EditorTool, useToolStore } from './toolStore';
+import { DEFAULT_TOOLS, type EditorTool, useToolStore } from './image/toolStore';
 
 vi.mock('./editorSave', () => ({
   openSaveAs: vi.fn(),

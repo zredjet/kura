@@ -6,7 +6,7 @@
  *   （`VITE_KURA_CHECK=1`））。
  */
 
-import type { EditTileFormat } from '../../ipc/media';
+import type { EditTileFormat } from '../../../ipc/media';
 
 /** 既定のタイルの形式（段 5 の最後に測って決める）。 */
 export const TILE_FORMAT: EditTileFormat = 'rgba';

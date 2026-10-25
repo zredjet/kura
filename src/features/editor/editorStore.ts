@@ -47,8 +47,8 @@ import type { JobProgress } from '../../ipc/jobs';
 import { IpcError, isIpcError } from '../../ipc/result';
 import type { Point } from '../../lib/paint';
 import { notify } from '../../stores/noticeStore';
-import { CanvasController, type ControllerInfo } from './canvasController';
-import { type Bounds, clampCrop, isFullCrop, nudgeCrop, readRect, sameRect } from './crop';
+import { CanvasController, type ControllerInfo } from './image/canvasController';
+import { type Bounds, clampCrop, isFullCrop, nudgeCrop, readRect, sameRect } from './image/crop';
 import { defaultParams, hasLaterGeometry, opSpec, paramsOf } from './opsCatalog';
 import {
   addSteps,
@@ -61,12 +61,12 @@ import {
   removeSteps,
   sameChoice,
 } from './paramSend';
-import { drawScene } from './drawScene';
+import { drawScene } from './image/drawScene';
 import { effectiveFormat, formatOfExt, outputChoice } from './formats';
 import { type QueuedStep, RequestQueue, type SentRequest } from './requestQueue';
-import { fillAction, type PendingStroke, type StrokeSpec } from './stroke';
-import { type EditorTool, useToolStore } from './toolStore';
-import { fitZoom, formatCanBeTransparent, type Rect } from './viewMath';
+import { fillAction, type PendingStroke, type StrokeSpec } from './image/stroke';
+import { type EditorTool, useToolStore } from './image/toolStore';
+import { fitZoom, formatCanBeTransparent, type Rect } from './image/viewMath';
 
 const t = ja.editor;
 

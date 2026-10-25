@@ -1,6 +1,6 @@
 import { describe, expect, it, type Mock, vi } from 'vitest';
 
-import type { EditViewDto, EditViewportDto } from '../../ipc/edit';
+import type { EditViewDto, EditViewportDto } from '../../../ipc/edit';
 import { CanvasController, IDLE_MS, type Scene, type Scheduler } from './canvasController';
 import type { TileBitmap } from './tileTable';
 import { TileHttpError } from './tiles';

@@ -18,7 +18,7 @@ import { formatCount } from '../../lib/format';
 import { ItemInspector } from '../library/inspector/ItemInspector';
 import { formatOfExt } from './formats';
 import styles from './Editor.module.css';
-import { EditorCanvas } from './EditorCanvas';
+import { EditorCanvas } from './image/EditorCanvas';
 import { useEditorKeys } from './editorKeys';
 import {
   openRevert,
@@ -38,9 +38,9 @@ import {
   useEditorStore,
 } from './editorStore';
 import { OpsPanel } from './OpsPanel';
-import { ToolSettings } from './ToolSettings';
-import { EDITOR_TOOLS, type EditorTool, useToolStore } from './toolStore';
-import { formatCanBeTransparent, zoomPercent } from './viewMath';
+import { ToolSettings } from './image/ToolSettings';
+import { EDITOR_TOOLS, type EditorTool, useToolStore } from './image/toolStore';
+import { formatCanBeTransparent, zoomPercent } from './image/viewMath';
 
 const t = ja.editor;
 

@@ -41,7 +41,7 @@ import {
   strokeStart,
   useEditorStore,
 } from './editorStore';
-import { DEFAULT_TOOLS, useToolStore } from './toolStore';
+import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
 
 vi.mock('../../ipc/edit', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../ipc/edit')>()),

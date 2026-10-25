@@ -1,10 +1,10 @@
 import { type MouseEvent, useEffect, useId, useRef, useState } from 'react';
 
-import glass from '../../components/glass/glass.module.css';
-import { ja } from '../../i18n/ja';
-import { isImeKey } from '../../lib/ime';
+import glass from '../../../components/glass/glass.module.css';
+import { ja } from '../../../i18n/ja';
+import { isImeKey } from '../../../lib/ime';
 import { cssColor, type Hsv, hsvToRgb, hueStops, parseHex, rgbToHsv, toHex } from './color';
-import styles from './Editor.module.css';
+import styles from '../Editor.module.css';
 import type { PaintColor } from './stroke';
 
 const t = ja.editor;

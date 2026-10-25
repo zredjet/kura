@@ -13,7 +13,7 @@
 
 import { commands } from '../ipc/bindings';
 import { editTileUrl, type EditTileFormat } from '../ipc/media';
-import type { CanvasController } from '../features/editor/canvasController';
+import type { CanvasController } from '../features/editor/image/canvasController';
 
 /** 測るタイル。 */
 export interface TileProbe {
