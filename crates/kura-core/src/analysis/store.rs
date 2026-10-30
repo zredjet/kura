@@ -29,6 +29,17 @@ use crate::settings;
 pub const INFLIGHT_KEY: &str = "analysis.inflight";
 /// 投影の作り直しの印（計画の指紋の投影の版・ドット絵の規則が変わった）を置く settings のキー。
 pub const REPROJECT_KEY: &str = "analysis.reproject";
+/// 一度きりの解き直しの印を置く settings のキー（M13 段 2。`{"v":1}`。[`retry_once`]）。
+pub const RETRY_KEY: &str = "analysis.retry";
+/// 一度きりの解き直しの版。上げると、置いた版より新しい版の UPDATE を一度だけ当てる（v1：前の版で `too_large` になった
+/// 音声。音声は流して解くようになり、長さの上限が `Limits` だけになった）。
+pub const RETRY_V: u32 = 1;
+
+/// 一度きりの解き直しの印。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RetryMark {
+    v: u32,
+}
 
 /// 解析の失敗の理由（事実の行の `error_code`。[`Write::Failed`]）。フロントは bindings の定数 `ANALYSIS_ERROR_CODES`
 /// （[`error_code::ALL`]）を読み、理由ごとの文言と照らす。理由を足したら `ALL` にも足す。
@@ -523,6 +534,7 @@ pub fn sync_plan(tx: &Connection, current: &PlanFingerprint) -> Result<PlanSync>
         settings::set(tx, REPROJECT_KEY, &true)?;
         tracing::info!("事実の投影が変わったので、結果の表から作り直します");
     }
+    reset += retry_once(tx)?;
     if stored.as_ref() != Some(current) {
         put_canonical(tx, PLAN_KEY, &current.to_canonical()?)?;
         tracing::info!(
@@ -537,6 +549,36 @@ pub fn sync_plan(tx: &Connection, current: &PlanFingerprint) -> Result<PlanSync>
         reset,
         todo: any_pending || reproject_due(tx)?,
     })
+}
+
+/// 一度きりの解き直し（`sync_plan` の中。起動のスレッド）：置いた版（なければ 0）が [`RETRY_V`] より小さければ、版ごとの
+/// UPDATE を当てて今の版を置く。戻した数を返す。マイグレーションにしないのは、DB の版を上げる流れ（空きの確かめ・
+/// バックアップ・更新の表示）が重いのと、解析の再開の印をもともと settings で持っている（`analysis.plan`・
+/// `analysis.decoders`）ため。計画の版（`PLAN_V`）も上げない（画像まで解き直すことになる）。
+///
+/// v1 の UPDATE は事実の表の全件の走査になる（一度きり。`sync_decoders` と同じ例外。テスト
+/// `sync_plan_reset_is_a_one_time_full_scan`）。ふだんは settings の主キーを見るだけ。
+pub fn retry_once(tx: &Connection) -> Result<usize> {
+    let from = settings::get::<RetryMark>(tx, RETRY_KEY)?.map_or(0, |m| m.v);
+    if from >= RETRY_V {
+        return Ok(0);
+    }
+    let mut reset = 0;
+    if from < 1 {
+        // v1：前の版で too_large になった音声（画像は今も値を持って解くので戻さない）
+        let mut stmt = tx.prepare_cached(
+            "UPDATE items SET analysis_state = 'pending'
+              WHERE kind = 'audio' AND analysis_state = 'failed' AND hash IN (
+                SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id
+                 WHERE f.state = 'failed' AND f.error_code = 'too_large')",
+        )?;
+        reset += stmt.execute([])?;
+    }
+    settings::set(tx, RETRY_KEY, &RetryMark { v: RETRY_V })?;
+    if reset > 0 {
+        tracing::info!(reset, "前の版で大きすぎた音声を一度だけ解き直します");
+    }
+    Ok(reset)
 }
 
 /// 解析のジョブがコーデックの組を作ったときに呼ぶ：前に置いたデコーダの指紋と比べ、今の組にないデコーダで読んだものと、
@@ -1196,6 +1238,15 @@ mod tests {
                         AND b.ext IN (SELECT value FROM json_each('[]'))))",
         );
         assert!(plan.contains("SCAN"), "{plan}");
+        // 一度きりの解き直し（M13 段 2。retry_once の v1）も、印の版が上がったときだけの一度きり
+        let plan = query_plan(
+            &conn,
+            "UPDATE items SET analysis_state = 'pending'
+              WHERE kind = 'audio' AND analysis_state = 'failed' AND hash IN (
+                SELECT b.hash FROM media_facts f JOIN blobs b ON b.id = f.blob_id
+                 WHERE f.state = 'failed' AND f.error_code = 'too_large')",
+        );
+        assert!(plan.contains("SCAN"), "{plan}");
         let plan = query_plan(
             &conn,
             "SELECT f.blob_id, b.ext FROM media_facts f JOIN blobs b ON b.id = f.blob_id
@@ -1208,6 +1259,56 @@ mod tests {
                 && !plan.contains("TEMP B-TREE"),
             "{plan}"
         );
+    }
+
+    /// M13 段 2：前の版で too_large になった音声は、印（`analysis.retry`）がなければ一度だけ戻し、版を置いたら戻さない。
+    /// 画像の too_large・音声のほかの失敗は戻さない。`sync_plan` が呼び、戻した数を `reset` に足して `todo` を立てる。
+    #[test]
+    fn too_large_audio_is_retried_once() {
+        let conn = test_conn();
+        add(&conn, 1, "audio", "wav", 1);
+        add(&conn, 2, "image", "png", 2);
+        add(&conn, 3, "audio", "flac", 3);
+        add(&conn, 4, "audio", "wav", 4);
+        let failed = |id, hash, code| ItemWrite {
+            id,
+            hash: [hash; 32],
+            write: Write::Failed { code, stamp: None },
+        };
+        write(
+            &conn,
+            &[
+                failed(1, 1, error_code::TOO_LARGE),
+                failed(2, 2, error_code::TOO_LARGE),
+                failed(3, 3, error_code::DECODE),
+                ready(4, 4, vec![]),
+            ],
+            1,
+        )
+        .unwrap();
+        let states = |c: &Connection| (state(c, 1), state(c, 2), state(c, 3), state(c, 4));
+        let fp = PlanFingerprint::current(&registry().unwrap()).unwrap();
+        // 計画の指紋を先に置いて、計画の変化で戻すものをなくす（印だけを見る）
+        put_canonical(&conn, PLAN_KEY, &fp.to_canonical().unwrap()).unwrap();
+        let sync = sync_plan(&conn, &fp).unwrap();
+        assert_eq!(sync.reset, 1);
+        assert!(sync.todo);
+        assert_eq!(
+            states(&conn),
+            (
+                "pending".into(),
+                "failed".into(),
+                "failed".into(),
+                "ready".into()
+            )
+        );
+        let mark: Option<RetryMark> = settings::get(&conn, RETRY_KEY).unwrap();
+        assert_eq!(mark, Some(RetryMark { v: RETRY_V }));
+        // もう一度失敗しても、版を置いたあとは戻さない
+        write(&conn, &[failed(1, 1, error_code::TOO_LARGE)], 2).unwrap();
+        assert_eq!(retry_once(&conn).unwrap(), 0);
+        assert_eq!(sync_plan(&conn, &fp).unwrap().reset, 0);
+        assert_eq!(state(&conn, 1), "failed");
     }
 
     /// 処理中の印は置いて取り出すと消える。失敗を戻すのは failed だけ。
