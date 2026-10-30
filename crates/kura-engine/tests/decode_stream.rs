@@ -528,3 +528,59 @@ fn long_flac_streams_and_md5_is_checked_last() {
     ));
 }
 
+/// E42（D6）：Platform の音声（偽の AudioToolbox。入力はメモリ、塊ごとの読みをそのまま流す）と MP3 も流して読める。記録・
+/// 窓・値は `decode` と同じ。形を読むのにファイル全体を読むデコーダは、その分を `shape_work_bytes` に申告する。
+#[test]
+fn platform_and_mp3_stream() {
+    use kura_engine::codec::platform::PlatformAudioDecoder;
+    use kura_engine::testing::platform::{FakeAudio, FakeAudioBackend};
+    let n = 17 * AUDIO_CHUNK + 9;
+    let planes: Vec<Vec<f32>> = (0..2)
+        .map(|c| (0..n).map(|i| ((i * 5 + c) % 997) as f32 * 1e-3).collect())
+        .collect();
+    let mut fake = FakeAudio::new(44_100, planes);
+    fake.chunk = 10_007;
+    let mut set = CodecSet::default();
+    set.add_decoder(Arc::new(PlatformAudioDecoder::new(FakeAudioBackend::new(
+        fake,
+    ))))
+    .unwrap();
+    let limits = Limits::default();
+    let opts = DecodeOptions::default();
+    let bytes = vec![7u8; 1_000];
+    let (v, stamp) = set
+        .decode(&mut Cursor::new(&bytes), "m4a", &opts, &limits, &NoMonitor)
+        .unwrap();
+    let mut sink = Collect::default();
+    let got = set
+        .decode_stream(
+            &mut Cursor::new(bytes.clone()),
+            "m4a",
+            &opts,
+            &limits,
+            &mut sink,
+            &NoMonitor,
+        )
+        .unwrap();
+    assert_eq!(got, stamp);
+    assert_eq!(sink.windows.len(), 2);
+    check_windows(&sink, &v, "Platform");
+    assert_eq!(set.shape_work_bytes("m4a", 1_000), 1_000);
+    // MP3（フィクスチャ。形は上限で、見込みは上限なので外れうる）
+    let pinned = CodecSet::pinned();
+    assert_eq!(pinned.shape_work_bytes("mp3", 5_000), 5_000);
+    assert_eq!(pinned.shape_work_bytes("flac", 5_000), 0);
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    for name in ["mp3-lame.mp3", "mp3-notag.mp3", "mp3-free.mp3"] {
+        let path = dir.join(name);
+        let (v, stamp) = pinned
+            .decode_path(&path, "mp3", &opts, &limits, &NoMonitor)
+            .unwrap();
+        let mut sink = Collect::default();
+        let got = pinned
+            .decode_stream_path(&path, "mp3", &opts, &limits, &mut sink, &NoMonitor)
+            .unwrap();
+        assert_eq!(got, stamp, "{name}");
+        check_windows(&sink, &v, name);
+    }
+}

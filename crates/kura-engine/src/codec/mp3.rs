@@ -14,9 +14,10 @@
 //!   読めなくならないように前もって外す。ただし free format（ビットレート 0）は、`nanomp3::frames` が最後の 2 フレームを
 //!   見つけられないので切らない（上限にはその 2 フレームの分を足す）。
 //! - 標本は nanomp3 の f32（合成の値 / 32768）。タグ（ID3）は読まない（段 6。ADR-148）。
+//! - 流して読む（M13 段 2）：ファイルは今どおり全体を読んで持ち（nanomp3 にフレームを読み口から読む公開の口がない）、標本を
+//!   フレームごとに流す（値は持たない）。形を読むのにも全体を読むので、`shape_work_bytes` は長さ。見込みの長さは形の上限。
 
-use std::sync::Arc;
-
+use crate::codec::stream::{self, DecodeInfo, DecodeOut};
 use crate::codec::symph::read_all;
 use crate::codec::{Decoder, ReadSeek, Tier};
 use crate::doc::DecodeOptions;
@@ -24,7 +25,7 @@ use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::shape::{Dim, Shape};
-use crate::value::{AudioBuilder, AudioMeta, AudioSource, Value};
+use crate::value::{AudioMeta, AudioSource, Value};
 
 /// MP3 の読み取り。
 pub struct Mp3Codec;
@@ -132,49 +133,91 @@ impl Decoder for Mp3Codec {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
-        let all = read_all(src, limits)?;
-        let Opened {
-            data,
+        stream::collect(mon, |out| decode_into(src, limits, out, mon))
+    }
+
+    fn streams(&self, _format: &str) -> bool {
+        true
+    }
+
+    /// ファイル全体（長さ `len`）と 1 フレームの写し（1 MiB を見込む）。
+    fn stream_work_bytes(&self, _format: &str, _shape: &Shape, len: u64) -> u64 {
+        len.saturating_add(1 << 20)
+    }
+
+    /// 形を読むのにもファイル全体を読む。
+    fn shape_work_bytes(&self, _format: &str, len: u64) -> u64 {
+        len
+    }
+
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        _shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        decode_into(src, limits, out, mon)
+    }
+}
+
+/// ファイル全体を読み、フレームごとの標本を `out` に渡す（`decode`・`decode_stream` が通る）。
+fn decode_into(
+    src: &mut dyn ReadSeek,
+    limits: &Limits,
+    out: &mut DecodeOut<'_>,
+    mon: &dyn Monitor,
+) -> Result<(), EngineError> {
+    let all = read_all(src, limits)?;
+    let Opened {
+        data,
+        rate,
+        channels,
+        frames,
+    } = open(&all, limits)?;
+    limits
+        .check(&Shape::Audio {
             rate,
             channels,
-            frames,
-        } = open(&all, limits)?;
-        limits
-            .check(&Shape::Audio {
-                rate,
-                channels,
-                frames: Dim::AtMost(frames),
-            })
-            .map_err(EngineError::Limit)?;
-        let ch = usize::from(channels);
-        // 上限は中身から出うる長さ以下なので、そのまま見込みにしてよい
-        let mut out = AudioBuilder::new(rate, ch, frames)?;
-        let mut r = nanomp3::SliceReader::<f32>::new(data);
-        let mut done = 0u64;
-        loop {
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            let samples = r.read_frame().map_err(|e| err(e.to_string()))?;
-            let Some(samples) = samples else { break };
-            if samples.len() % ch != 0 {
-                return Err(err("チャンネルの数が途中で変わりました"));
-            }
-            let n = samples.len() / ch;
-            done = done.saturating_add(n as u64);
-            if done > frames {
-                return Err(err("長さがヘッダと合いません"));
-            }
-            out.push_interleaved(samples)?;
+            frames: Dim::AtMost(frames),
+        })
+        .map_err(EngineError::Limit)?;
+    let ch = usize::from(channels);
+    // 上限は中身から出うる長さ以下なので、そのまま見込みにしてよい
+    out.begin(DecodeInfo {
+        rate,
+        channels: ch,
+        frames: Dim::AtMost(frames),
+        expect: frames,
+    })?;
+    let mut r = nanomp3::SliceReader::<f32>::new(data);
+    let mut done = 0u64;
+    loop {
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
         }
-        let meta = AudioMeta {
-            source: Some(AudioSource {
-                bits: 16,
-                float: false,
-                rate,
-            }),
-            ..AudioMeta::default()
-        };
-        Ok(Value::Audio(Arc::new(out.finish(meta)?)))
+        let samples = r.read_frame().map_err(|e| err(e.to_string()))?;
+        let Some(samples) = samples else { break };
+        if samples.len() % ch != 0 {
+            return Err(err("チャンネルの数が途中で変わりました"));
+        }
+        let n = samples.len() / ch;
+        done = done.saturating_add(n as u64);
+        if done > frames {
+            return Err(err("長さがヘッダと合いません"));
+        }
+        out.push_interleaved(samples)?;
     }
+    let meta = AudioMeta {
+        source: Some(AudioSource {
+            bits: 16,
+            float: false,
+            rate,
+        }),
+        ..AudioMeta::default()
+    };
+    out.end(meta)
 }

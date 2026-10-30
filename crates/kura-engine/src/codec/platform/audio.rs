@@ -10,10 +10,13 @@
 //! - タグ・ループ点は OS に任せず、固定の段のパーサーで読む（m4a は MP4 の iTunes のタグ、Ogg・Opus は Vorbis コメント
 //!   （OpusTags）と LOOPSTART・LOOPLENGTH。位置は出力のレート）。読めなければタグなし（PCM は backend が読めたので失敗に
 //!   しない）。`AudioMeta.source` は backend の申告、なければ非可逆の扱い（16 ビットの整数・出力のレート）。
+//! - 流して読む（M13 段 2）：入力のバイト列は今どおりメモリに持ち（backend の口はメモリから）、塊ごとの `read` をそのまま
+//!   `DecodeOut` に渡す（値は持たない）。backend の口（kura-mac）は変えない。
 
 use std::sync::Arc;
 
 use crate::codec::platform::BackendError;
+use crate::codec::stream::{self, DecodeInfo, DecodeOut};
 use crate::codec::symph::{self, Container, read_all};
 use crate::codec::{CodecEnv, Decoder, ReadSeek, Stage, Tier, contain, try_vec};
 use crate::doc::DecodeOptions;
@@ -21,7 +24,7 @@ use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::shape::{Dim, Shape};
-use crate::value::{AudioBuilder, AudioMeta, AudioSource, Value};
+use crate::value::{AudioMeta, AudioSource, Value};
 
 /// 1 回の読み取りで求めるフレームの数。
 pub const CHUNK_FRAMES: usize = 65_536;
@@ -171,6 +174,51 @@ impl<B: AudioBackend> Decoder for PlatformAudioDecoder<B> {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
+        stream::collect(mon, |out| self.decode_into(src, format, limits, out, mon))
+    }
+
+    fn streams(&self, _format: &str) -> bool {
+        true
+    }
+
+    /// 入力のバイト列（長さ `len`）と塊（65,536 フレーム）の作業列 × 2 と、backend の作業領域（8 MiB を見込む）。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, len: u64) -> u64 {
+        let Shape::Audio { channels, .. } = shape else {
+            return 0;
+        };
+        len.saturating_add(CHUNK_FRAMES as u64 * u64::from(*channels) * 4 * 2)
+            .saturating_add(8 << 20)
+    }
+
+    /// 形を読むのにもファイル全体を読む。
+    fn shape_work_bytes(&self, _format: &str, len: u64) -> u64 {
+        len
+    }
+
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        _shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.decode_into(src, format, limits, out, mon)
+    }
+}
+
+impl<B: AudioBackend> PlatformAudioDecoder<B> {
+    /// 塊ごとに読んで `out` に渡す（`decode`・`decode_stream` が通る）。
+    fn decode_into(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        limits: &Limits,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
         let id = self.backend.id();
         let Opened {
             handle: mut h,
@@ -181,7 +229,12 @@ impl<B: AudioBackend> Decoder for PlatformAudioDecoder<B> {
         limits.check(&shape_of(&info)).map_err(EngineError::Limit)?;
         let frames = usize::try_from(info.frames)
             .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-        let mut out = AudioBuilder::new(info.rate, usize::from(info.channels), info.frames)?;
+        out.begin(DecodeInfo {
+            rate: info.rate,
+            channels: usize::from(info.channels),
+            frames: Dim::Exact(info.frames),
+            expect: info.frames,
+        })?;
         // 塊ごとに作業列へ読んでから組み手に足す（持つ量は値と塊の分だけ）
         let mut planes: Vec<Vec<f32>> = Vec::new();
         planes
@@ -237,7 +290,7 @@ impl<B: AudioBackend> Decoder for PlatformAudioDecoder<B> {
             rate: info.rate,
         }));
         drop(planes);
-        Ok(Value::Audio(Arc::new(out.finish(meta)?)))
+        out.end(meta)
     }
 }
 

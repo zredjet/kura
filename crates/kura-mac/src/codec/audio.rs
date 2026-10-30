@@ -177,6 +177,88 @@ mod tests {
         }
     }
 
+    /// M13 段 2：AudioToolbox で読む音声も流して読める（`CodecSet::decode_stream`）。読み取りの記録（値のダイジェスト）・
+    /// 受けた窓を連結した値は `decode` と同じ。
+    #[test]
+    fn streamed_platform_audio_equals_decode() {
+        use kura_engine::audio::stream::StreamEnd;
+        use kura_engine::codec::{DecodeInfo, DecodeSink};
+        #[derive(Default)]
+        struct Collect(Vec<Vec<f32>>, Option<StreamEnd>);
+        impl DecodeSink for Collect {
+            fn begin(&mut self, info: &DecodeInfo) -> Result<(), EngineError> {
+                self.0 = vec![Vec::new(); info.channels];
+                Ok(())
+            }
+            fn feed(
+                &mut self,
+                _start: u64,
+                planes: &[&[f32]],
+                _mon: &dyn Monitor,
+            ) -> Result<(), EngineError> {
+                for (o, p) in self.0.iter_mut().zip(planes) {
+                    o.extend_from_slice(p);
+                }
+                Ok(())
+            }
+            fn end(&mut self, end: &StreamEnd) -> Result<(), EngineError> {
+                self.1 = Some(end.clone());
+                Ok(())
+            }
+        }
+        let _g = shared();
+        let set = mac_set();
+        for (name, format) in [
+            ("aac-he.m4a", "m4a"),
+            ("ogg-opus.ogg", "opus"),
+            ("aac-lc.aac", "aac"),
+        ] {
+            let bytes = engine_fixture(name);
+            let (v, stamp) = decode(&set, &bytes, format).unwrap();
+            let mut sink = Collect::default();
+            let got = set
+                .decode_stream(
+                    &mut Cursor::new(bytes.clone()),
+                    format,
+                    &DecodeOptions::default(),
+                    &Limits::default(),
+                    &mut sink,
+                    &NoMonitor,
+                )
+                .unwrap();
+            assert_eq!(got, stamp, "{name}");
+            let a = audio(&v);
+            assert_eq!(sink.0, a.read_planes(0, a.frames()).unwrap(), "{name}");
+            assert_eq!(sink.1.unwrap().meta, a.meta, "{name}");
+        }
+        // AudioToolbox の段を直に選んでも（固定の段の読める WAV を、記録の識別子で）
+        let wav = engine_fixture("audio-src16.wav");
+        let (v, _) = set
+            .decode_with(
+                AUDIOTOOLBOX_DEC,
+                &mut Cursor::new(wav.clone()),
+                "wav",
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+        let mut sink = Collect::default();
+        let got = set
+            .decode_stream_with(
+                AUDIOTOOLBOX_DEC,
+                &mut Cursor::new(wav),
+                "wav",
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &mut sink,
+                &NoMonitor,
+            )
+            .unwrap();
+        assert_eq!(got.value_digest, v.digest().unwrap());
+        assert_eq!(got.tier, Tier::Platform);
+    }
+
     /// Ogg Vorbis は AudioToolbox では読まない（先頭を 128 フレーム余分に切るため）。固定の段が読む。
     #[test]
     fn vorbis_is_left_to_the_pinned_tier() {
