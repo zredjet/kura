@@ -11,6 +11,9 @@
 //!   前後を続けて取るので、2 回目からは読まない）。覚えている間は予算（対話）を持ち、使わずに 60 秒たつと捨てる。置き場は
 //!   ライブラリごと（[`EngineServices::pcm_cache`]。覚えた確保はそのライブラリの予算のもの）で、ライブラリを閉じると手放す
 //!   （M11 の検証 E2）。
+//! - WAV・AIFF（`CodecSet::open_audio_source` が開けるもの）は、全体を読まずに源（チャンクを読むときにファイルから読む遅延の
+//!   値。M13 段 4）として覚え、予算は源の LRU の上限だけを持つ（値は丸ごと読んだものと同じ）。ほかの形式は丸ごと読む。
+//!   [`PcmCache::decodes`] は「開いた（読んだ）数」。
 //! - ジョブにしない（利用者がその場で待つ短い表示の用意。決定 8）。呼び手が `spawn_blocking` で呼ぶ。予算は対話
 //!   （`Class::Interactive`。待たない）で、足りなければ 503。範囲が音声の外か、浮動小数で 64 MiB を超える長さは 416。
 //!   読むのはエンジンのプレビューのプールの中（`EngineRuntime::preview`）。
@@ -400,6 +403,41 @@ fn audio_of(
     }
     // 覚えるのは 1 件だけ：読む前に前のものを手放す（メモリと予算を返す）
     cache.clear();
+    // WAV・AIFF：源として開く（全体を読まない。予算は源の LRU の上限）
+    if let Shape::Audio {
+        channels,
+        frames: kura_engine::Dim::Exact(frames),
+        ..
+    } = shape
+    {
+        let lru = crate::edit::editor::audio::source::lru_bytes(
+            runtime.preview_threads(),
+            channels,
+            frames,
+            runtime.budget().total(),
+        );
+        let opener = crate::edit::editor::audio::source::path_opener(&source.path);
+        let opened = runtime
+            .preview(|_| codecs.open_audio_source(&opener, source.format, &opts, &limits, lru));
+        if let Ok(Some(opened)) = opened
+            && let Value::Audio(audio) = opened.value
+        {
+            let lease = acquire(runtime.budget(), lru)?;
+            cache.decodes.fetch_add(1, Ordering::Relaxed);
+            let decoder = opened.decoder.to_string();
+            tracing::debug!(hash, decoder, frames, "試聴の PCM の元を源として開きました");
+            cache.store(Entry {
+                root: root.to_path_buf(),
+                hash: hash.to_string(),
+                decoder: decoder.clone(),
+                codecs: Arc::downgrade(&codecs),
+                audio: audio.clone(),
+                last_used: Instant::now(),
+                _lease: lease,
+            });
+            return Ok((audio, decoder));
+        }
+    }
     let need = shape
         .value_bytes()
         .saturating_add(codecs.decode_file_work_bytes(source.format, &shape, len));
@@ -727,6 +765,53 @@ mod tests {
         for source in [Some(&int24), Some(&float), None] {
             assert_eq!(sample_format(source, &[&on_grid]), SampleFormat::F32);
         }
+    }
+
+    /// WAV・AIFF は全体を読まずに源として覚える（覚えた値は中身を持たず、読んだチャンクだけを源の LRU が持つ）。区間の値は
+    /// 丸ごと読んだものと同じ。予算は値の大きさで頭打ちの LRU の上限だけ（M13 段 4）。
+    #[test]
+    fn wav_and_aiff_are_opened_as_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let cache = PcmCache::new(CACHE_TTL);
+        let engine = engine(64 << 20);
+        let frames = 200_000;
+        let audio = ramp(frames, 44_100, None);
+        let (h, source) = place(&layout, 7, audio.clone(), 16);
+        let wav = serve_with(&cache, &engine, dir.path(), &h, &source, 150_123, 150_133).unwrap();
+        let p = parse(&wav);
+        assert_eq!((p.start, p.total), (150_123, frames as u64));
+        assert_eq!(i16::from_le_bytes([p.data[0], p.data[1]]), 123);
+        assert_eq!(i16::from_le_bytes([p.data[2], p.data[3]]), -123);
+        {
+            let state = cache.lock();
+            let entry = state.entry.as_ref().unwrap();
+            assert_eq!(entry.audio.resident_bytes(), 0, "源の参照だけ");
+            assert!(entry._lease.bytes() <= frames as u64 * 2 * 4);
+        }
+        // AIFF も同じ
+        let (bytes, _) = CodecSet::pinned()
+            .encode_bytes(
+                &Value::Audio(Arc::new(audio)),
+                "aiff",
+                &json!({}),
+                &NoMonitor,
+            )
+            .unwrap();
+        let hash = crate::library::hex(blake3::hash(&bytes).as_bytes());
+        let path = layout.content_path(&parse_hex32(&hash).unwrap(), "aiff");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let aiff = PcmSource {
+            path,
+            format: "aiff",
+        };
+        let p = parse(&serve_with(&cache, &engine, dir.path(), &hash, &aiff, 5, 6).unwrap());
+        assert_eq!(i16::from_le_bytes([p.data[0], p.data[1]]), 5);
+        assert_eq!(
+            cache.lock().entry.as_ref().unwrap().audio.resident_bytes(),
+            0
+        );
     }
 
     /// 区間を WAV にし、同じ読み取りのループ点・フレーム数・デコーダの識別子を kura チャンクに入れる。値は元のまま。

@@ -25,7 +25,7 @@ mod serve_tests;
 #[cfg(test)]
 mod session_tests;
 pub mod snap;
-pub(super) mod source;
+pub(crate) mod source;
 pub mod timeline;
 
 use std::time::Instant;

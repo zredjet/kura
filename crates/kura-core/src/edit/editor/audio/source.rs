@@ -117,8 +117,8 @@ pub(crate) fn check_whole_read(shape: &Shape, budget_total: u64) -> Result<(), E
     )))
 }
 
-/// 源の LRU の上限：max(64 MiB, プレビューのスレッドの数 × 4 チャンク × ch × 256 KiB)。ただし音声の全体の値（チャンクに
-/// 切り上げ）より大きくせず、取り置き（`default_reserved(予算の全体)`）の 1/4 で頭打ちにする（スレッドの数 × ch × 1 チャンクは
+/// 源の LRU の上限：max(64 MiB, プレビューのスレッドの数 × 4 チャンク × ch × 256 KiB)。ただし音声の全体の値より大きくせず、
+/// 取り置き（`default_reserved(予算の全体)`）の 1/4 で頭打ちにする（スレッドの数 × ch × 1 チャンクは
 /// 下回らない。小さな予算の Mac・テストで入力が予算を埋めないように。段 1 の §4.6 からの変更）。
 pub fn lru_bytes(threads: usize, channels: u16, frames: u64, budget_total: u64) -> u64 {
     let chunk = (AUDIO_CHUNK as u64) * 4;
@@ -129,10 +129,8 @@ pub fn lru_bytes(threads: usize, channels: u16, frames: u64, budget_total: u64) 
         .saturating_mul(ch)
         .saturating_mul(chunk)
         .max(LRU_FLOOR);
-    let whole = frames
-        .div_ceil(AUDIO_CHUNK as u64)
-        .saturating_mul(ch)
-        .saturating_mul(chunk);
+    // LRU は読んだチャンクの中身の大きさで数える（最後の半端なチャンクは短い）ので、全体の値の大きさで足りる
+    let whole = frames.saturating_mul(ch).saturating_mul(4);
     let cap =
         (default_reserved(budget_total) / 4).max(threads.saturating_mul(ch).saturating_mul(chunk));
     want.min(whole).min(cap)
@@ -328,7 +326,10 @@ mod tests {
             "取り置き 1 GiB の 1/4"
         );
         // 全体の値より大きくしない・取り置きの 1/4 で頭打ち（スレッド × ch × 1 チャンクは下回らない）
-        assert_eq!(lru_bytes(2, 1, 3 * 65_536 + 1, 8 * gib), 4 * chunk);
+        assert_eq!(
+            lru_bytes(2, 1, 3 * 65_536 + 1, 8 * gib),
+            (3 * 65_536 + 1) * 4
+        );
         assert_eq!(lru_bytes(2, 2, long, 64 << 20), 8 << 20);
         assert_eq!(lru_bytes(8, 2, long, 8 << 20), 16 * chunk);
     }
