@@ -8,6 +8,10 @@
 //! `audio_60min_step_stays_within_n`（`#[ignore]`。`--release` で回す）にした。判定は N（源の LRU の上限 ＋ 64 MiB）と、範囲の
 //! 描画の見積もり（＋ キャッシュが数える源の LRU）× 1.25 ＋ 4 MiB。
 //!
+//! M13 段 2 のケース `audio-60min-analyze`（60 分・48 kHz ステレオの 16 ビットの WAV を流して解析する。値を持たない）も重いので、
+//! 別のテスト `audio_60min_analyze_stays_within_n`（`#[ignore]`。`--release` で回す）にした。判定は N（96 MiB）と、解析のジョブの
+//! 見積もり（`kura_core::analysis::job::estimate_stream`）× 1.25 ＋ 4 MiB。
+//!
 //! 子プロセスは、このテストのバイナリ自身を `--exact mem_smoke::tests::child --ignored` で起こす（環境変数でケースと段を
 //! 渡す）。`/usr/bin/time -l` がない・peak memory footprint を出さない環境（Linux）では確かめずに通す（CI の Linux の job は
 //! kura-devtools を回さない）。
@@ -581,6 +585,190 @@ mod tests {
             .build()
             .unwrap();
         pool.install(audio_flow);
+    }
+
+    // ---- M13 段 2：60 分の音声の解析（流して解く） ----
+
+    /// 子プロセスに渡す解析のケース。
+    const ANALYZE_CASE: &str = "audio-60min-analyze";
+    /// 解析の N（流して解くので長さによらない数十 MB。窓 2 つ（16 MiB）・結果・ダイジェスト・読みの塊に余裕を見る）。
+    const ANALYZE_N: u64 = 96 * MIB;
+
+    /// 60 分・48 kHz ステレオの 16 ビットの WAV を `path` に書く（標本は位置から決める雑音と正弦。値は丸ごと作らない）。
+    fn write_long_wav(path: &Path) {
+        use std::io::Write;
+        let frames = AUDIO_SECONDS * AUDIO_RATE;
+        let data = frames * 2 * 2;
+        let mut f =
+            std::io::BufWriter::with_capacity(4 << 20, std::fs::File::create(path).unwrap());
+        let mut head = Vec::new();
+        head.extend_from_slice(b"RIFF");
+        head.extend_from_slice(&((36 + data) as u32).to_le_bytes());
+        head.extend_from_slice(b"WAVEfmt ");
+        head.extend_from_slice(&16u32.to_le_bytes());
+        head.extend_from_slice(&1u16.to_le_bytes());
+        head.extend_from_slice(&2u16.to_le_bytes());
+        head.extend_from_slice(&(AUDIO_RATE as u32).to_le_bytes());
+        head.extend_from_slice(&((AUDIO_RATE * 4) as u32).to_le_bytes());
+        head.extend_from_slice(&4u16.to_le_bytes());
+        head.extend_from_slice(&16u16.to_le_bytes());
+        head.extend_from_slice(b"data");
+        head.extend_from_slice(&(data as u32).to_le_bytes());
+        f.write_all(&head).unwrap();
+        let mut x: u32 = 0x9e37_79b9;
+        let mut buf = Vec::with_capacity(1 << 20);
+        for i in 0..frames {
+            for c in 0..2u32 {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                // ゆっくり大きさの変わる雑音（ゲートを通るブロックと通らないブロックを混ぜる）
+                let level = ((i / AUDIO_RATE) % 40) as i32 * 300 + c as i32 * 50;
+                let s = ((x >> 16) as i32 - 32_768) * level / 12_000;
+                buf.extend_from_slice(&(s.clamp(-32_768, 32_767) as i16).to_le_bytes());
+            }
+            if buf.len() >= 1 << 20 {
+                f.write_all(&buf).unwrap();
+                buf.clear();
+            }
+        }
+        f.write_all(&buf).unwrap();
+        f.flush().unwrap();
+    }
+
+    /// 解析の通し：ファイルを流して読み、解析のジョブと同じ要求（`stream_requests`）を扇に流して解く。返すのは結果の数。
+    fn analyze_flow(path: &Path) -> usize {
+        let engine = Engine::new().unwrap();
+        let codecs = CodecSet::pinned();
+        let opts = DecodeOptions::default();
+        let (shape, _) = codecs
+            .shape_path(path, "wav", &opts, engine.limits())
+            .unwrap();
+        let reqs = kura_core::analysis::plan::stream_requests(&shape);
+        let mut fan = engine.analyze_stream(&reqs, &shape);
+        codecs
+            .decode_stream_path(path, "wav", &opts, engine.limits(), &mut fan, &NoMonitor)
+            .unwrap();
+        let got = fan.finish(&NoMonitor);
+        assert!(
+            got.iter().all(Result::is_ok),
+            "{:?}",
+            got.iter().map(|r| r.as_ref().err()).collect::<Vec<_>>()
+        );
+        got.len()
+    }
+
+    /// 子プロセス（音声の解析）：`base` は何も作らない、`run` は通しを回す。
+    #[test]
+    #[ignore = "audio_60min_analyze_stays_within_n が子プロセスとして起こす"]
+    fn analyze_child() {
+        let Ok(spec) = std::env::var(CASE_ENV) else {
+            return;
+        };
+        let Some((name, stage)) = spec.split_once(':') else {
+            return;
+        };
+        if name != ANALYZE_CASE || stage == "base" {
+            return;
+        }
+        let path = std::path::PathBuf::from(std::env::var(FILE_ENV).unwrap());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(TASKS)
+            .build()
+            .unwrap();
+        let t = std::time::Instant::now();
+        let n = pool.install(|| analyze_flow(&path));
+        eprintln!(
+            "{ANALYZE_CASE}: 結果 {n} 個・{:.2} 秒",
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    /// M13 段 2（D12）：60 分・48 kHz ステレオの 16 ビットの WAV を流して解析する子プロセスのピークから基準を引いた量が、
+    /// N（96 MiB）以下で、解析のジョブの見積もり（`estimate_stream`）× 1.25 ＋ 4 MiB 以下。値（1.38 GB）を持たない。
+    /// 重い（691 MB のファイルを書く）ので、ふだんは回さない：
+    /// `cargo test --release -p kura-devtools mem_smoke::tests::audio_60min_analyze -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "重い（--release で --ignored を付けて回す）"]
+    fn audio_60min_analyze_stays_within_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.wav");
+        let t = std::time::Instant::now();
+        write_long_wav(&path);
+        eprintln!(
+            "{ANALYZE_CASE}: WAV を書いた（{:.1} 秒）",
+            t.elapsed().as_secs_f64()
+        );
+        let codecs = CodecSet::pinned();
+        let engine = Engine::new().unwrap();
+        let (shape, _) = codecs
+            .shape_path(&path, "wav", &DecodeOptions::default(), engine.limits())
+            .unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        let reqs = kura_core::analysis::plan::stream_requests(&shape);
+        let est = kura_core::analysis::job::estimate_stream(
+            &codecs,
+            engine.analyses(),
+            "wav",
+            &shape,
+            len,
+            &reqs,
+            TASKS as u64,
+        );
+        let exe = std::env::current_exe().unwrap();
+        let run = |stage: &str| -> Option<(u64, String)> {
+            let out = Command::new("/usr/bin/time")
+                .arg("-l")
+                .arg(&exe)
+                .args([
+                    "--exact",
+                    "mem_smoke::tests::analyze_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "-q",
+                ])
+                .env(CASE_ENV, format!("{ANALYZE_CASE}:{stage}"))
+                .env(FILE_ENV, &path)
+                .output()
+                .ok()?;
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            let footprint = stderr
+                .lines()
+                .find(|l| l.contains("peak memory footprint"))
+                .and_then(|l| l.split_whitespace().next())
+                .and_then(|n| n.parse().ok())?;
+            assert!(out.status.success(), "{stage}: {stderr}");
+            Some((footprint, stderr))
+        };
+        let (Some((base, _)), Some((peak, log))) = (run("base"), run("run")) else {
+            eprintln!(
+                "/usr/bin/time -l が使えないので、音声の解析のメモリの煙のテストを見送ります"
+            );
+            return;
+        };
+        let used = peak.saturating_sub(base);
+        let took = log
+            .lines()
+            .find(|l| l.starts_with(ANALYZE_CASE))
+            .unwrap_or_default()
+            .to_string();
+        eprintln!(
+            "{ANALYZE_CASE}: 通し {:.1} MiB（N {:.1}・見積もり {:.1}）・基準 {:.1} MiB・値なら {:.1} MiB・{took}",
+            mib(used),
+            mib(ANALYZE_N),
+            mib(est),
+            mib(base),
+            mib(AUDIO_SECONDS * AUDIO_RATE * 2 * 4),
+        );
+        assert!(
+            used <= ANALYZE_N,
+            "{ANALYZE_CASE}: 実測 {used} バイト > N {ANALYZE_N}"
+        );
+        assert!(
+            used <= bound(est),
+            "{ANALYZE_CASE}: 実測 {used} バイト > 見積もり {est} × 1.25 ＋ 4 MiB"
+        );
     }
 
     /// 子プロセスのピーク（テスト `test` を、ケース `spec` で起こす）。`/usr/bin/time -l` が使えなければ None。
