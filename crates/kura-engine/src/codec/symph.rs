@@ -84,7 +84,7 @@ impl Media<'_> {
         open_src(id, Src { inner, mon }, c, limits)
     }
 
-    /// MP4 の編集リストの切り取り（[`mp4_edit`]。読み口は最上位の箱の頭をたどり、moov だけを読む）。
+    /// MP4 の編集リストの切り取り（[`mp4_edit`]。読み口は箱の頭をたどり、要る箱の頭だけを読む：[`mp4_edit_reader`]）。
     pub fn mp4_edit(&mut self, rate: u32) -> Result<Option<(u64, u64)>, EngineError> {
         match self {
             Media::Bytes(data) => Ok(mp4_edit(data, rate)),
@@ -391,56 +391,170 @@ pub(crate) fn canonical_nan(s: f32) -> f32 {
     }
 }
 
-/// moov を読む大きさの上限（[`mp4_edit_reader`]）。
-const MOOV_MAX: u64 = 64 << 20;
+/// 読み口の `[at, end)` の中の箱を、頭だけ読んで順にたどる（[`mp4_edit`] の `boxes` と同じ規則：壊れた箱で止まる・
+/// 大きさ 0 は範囲の終わりまで・大きさ 1 は 64 ビット）。中身は読まない（シークで飛ばす）。
+struct BoxWalk {
+    at: u64,
+    end: u64,
+}
 
-/// [`mp4_edit`] の読み口の版：最上位の箱の頭をシークでたどり（mdat は飛ばす）、最初の moov だけを（[`MOOV_MAX`] まで）読んで
-/// 同じ解析に渡す。箱のたどり方（壊れた箱で止まる・大きさ 0 は終わりまで・大きさ 1 は 64 ビット）は `mp4_edit` と同じなので、
-/// 同じ切り取りを返す。
+impl BoxWalk {
+    fn new(at: u64, end: u64) -> Self {
+        Self { at, end }
+    }
+
+    /// 次の箱（種類, 中身の始まり, 中身の終わり）。範囲の終わり・壊れた箱なら None（それより後はたどらない）。
+    fn next(&mut self, src: &mut dyn ReadSeek) -> Result<Option<([u8; 4], u64, u64)>, EngineError> {
+        let at = self.at;
+        if at.saturating_add(8) > self.end {
+            return Ok(None);
+        }
+        src.seek(SeekFrom::Start(at))?;
+        let mut h = [0u8; 16];
+        let want = if at + 16 <= self.end { 16 } else { 8 };
+        src.read_exact(&mut h[..want])?;
+        let size = u64::from(u32::from_be_bytes([h[0], h[1], h[2], h[3]]));
+        let kind = [h[4], h[5], h[6], h[7]];
+        let (head, size) = if size == 1 && at + 16 <= self.end {
+            let mut v = [0u8; 8];
+            v.copy_from_slice(&h[8..16]);
+            (16u64, u64::from_be_bytes(v))
+        } else if size == 0 {
+            (8, self.end - at)
+        } else {
+            (8, size)
+        };
+        if size < head || at.saturating_add(size) > self.end {
+            self.at = self.end;
+            return Ok(None);
+        }
+        self.at = at + size;
+        Ok(Some((kind, at + head, at + size)))
+    }
+}
+
+/// `[at, end)` の中で最初の `kind` の箱の中身の範囲（壊れた箱より前だけを見る。[`mp4_edit`] の `find` と同じ）。
+fn find_box(
+    src: &mut dyn ReadSeek,
+    at: u64,
+    end: u64,
+    kind: &[u8; 4],
+) -> Result<Option<(u64, u64)>, EngineError> {
+    let mut walk = BoxWalk::new(at, end);
+    while let Some((k, s, e)) = walk.next(src)? {
+        if &k == kind {
+            return Ok(Some((s, e)));
+        }
+    }
+    Ok(None)
+}
+
+/// 箱の中身の頭 `n` バイトまで（中身が短ければ中身の全部）。
+fn read_head(
+    src: &mut dyn ReadSeek,
+    (start, end): (u64, u64),
+    n: u64,
+) -> Result<Vec<u8>, EngineError> {
+    let len = (end - start).min(n);
+    let mut buf = vec![0u8; usize::try_from(len).unwrap_or(0)];
+    src.seek(SeekFrom::Start(start))?;
+    src.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// mvhd・mdhd の中身の時間の単位（版 1 は 20 バイト目、版 0 は 12 バイト目から）。中身の頭 24 バイトだけを見る。
+fn time_scale(b: &[u8]) -> Option<u32> {
+    Some(match b.first()? {
+        1 => u32::from_be_bytes(b.get(20..24)?.try_into().ok()?),
+        _ => u32::from_be_bytes(b.get(12..16)?.try_into().ok()?),
+    })
+}
+
+/// elst の項目の数の上限（[`mp4_edit`] が見る数）。
+const ELST_MAX: u32 = 64;
+
+/// elst の中身から、最初の空でない編集を (始まり, 長さ)（メディアの時間の単位）で返す（中身の頭 8 ＋ 64 × 20 バイトだけを
+/// 見る）。
+fn elst_first(elst: &[u8], media_scale: u32, movie_scale: u64) -> Option<(u64, u64)> {
+    let version = *elst.first()?;
+    let count = u32::from_be_bytes(elst.get(4..8)?.try_into().ok()?);
+    let mut at = 8usize;
+    for _ in 0..count.min(ELST_MAX) {
+        let (dur, time, step) = if version == 1 {
+            (
+                u64::from_be_bytes(elst.get(at..at + 8)?.try_into().ok()?),
+                i64::from_be_bytes(elst.get(at + 8..at + 16)?.try_into().ok()?),
+                20,
+            )
+        } else {
+            (
+                u64::from(u32::from_be_bytes(elst.get(at..at + 4)?.try_into().ok()?)),
+                i64::from(i32::from_be_bytes(
+                    elst.get(at + 4..at + 8)?.try_into().ok()?,
+                )),
+                12,
+            )
+        };
+        at += step;
+        if time < 0 {
+            continue;
+        }
+        // 長さは映像全体の時間の単位 → メディアの時間の単位
+        let len = u128::from(dur) * u128::from(media_scale) / u128::from(movie_scale);
+        return Some((time as u64, u64::try_from(len).ok()?));
+    }
+    None
+}
+
+/// [`mp4_edit`] の読み口の版（M13 段 2 の検証の直し）：moov を写さずに、箱の頭をシークでたどって要る箱（mvhd・trak の
+/// mdia の hdlr・mdhd、edts の elst）の頭だけを読む。たどり方・見る箱・読む値は `mp4_edit` と同じなので、moov の大きさに
+/// よらず同じ切り取りを返す（上限を置かない。上限で黙って切り取りを捨てると、値が `decode` と食い違うため）。
 pub(crate) fn mp4_edit_reader(
     src: &mut dyn ReadSeek,
     rate: u32,
 ) -> Result<Option<(u64, u64)>, EngineError> {
     let len = src.seek(SeekFrom::End(0))?;
-    let mut at = 0u64;
-    while at + 8 <= len {
-        src.seek(SeekFrom::Start(at))?;
-        let mut h = [0u8; 16];
-        let want = if at + 16 <= len { 16 } else { 8 };
-        src.read_exact(&mut h[..want])?;
-        let size = u64::from(u32::from_be_bytes([h[0], h[1], h[2], h[3]]));
-        let kind = [h[4], h[5], h[6], h[7]];
-        let (head, size) = if size == 1 && at + 16 <= len {
-            let mut v = [0u8; 8];
-            v.copy_from_slice(&h[8..16]);
-            (16u64, u64::from_be_bytes(v))
-        } else if size == 0 {
-            (8, len - at)
-        } else {
-            (8, size)
+    let Some(moov) = find_box(src, 0, len, b"moov")? else {
+        return Ok(None);
+    };
+    let Some(mvhd) = find_box(src, moov.0, moov.1, b"mvhd")? else {
+        return Ok(None);
+    };
+    let Some(movie_scale) = time_scale(&read_head(src, mvhd, 24)?) else {
+        return Ok(None);
+    };
+    let movie_scale = u64::from(movie_scale);
+    let mut traks = BoxWalk::new(moov.0, moov.1);
+    while let Some((kind, ts, te)) = traks.next(src)? {
+        if &kind != b"trak" {
+            continue;
+        }
+        let Some(mdia) = find_box(src, ts, te, b"mdia")? else {
+            continue;
         };
-        if size < head || at.saturating_add(size) > len {
-            break;
+        let Some(hdlr) = find_box(src, mdia.0, mdia.1, b"hdlr")? else {
+            continue;
+        };
+        if read_head(src, hdlr, 12)?.get(8..12) != Some(b"soun") {
+            continue;
         }
-        if &kind == b"moov" {
-            let body = size - head;
-            if body > MOOV_MAX {
-                return Ok(None);
-            }
-            // 同じ解析（mp4_edit）に、moov の箱だけを最上位に置いたバイト列で渡す
-            let mut data = try_vec(usize::try_from(8 + body).unwrap_or(usize::MAX), 0u8)?;
-            let box_len = u32::try_from(8 + body).unwrap_or(0);
-            data[..4].copy_from_slice(&box_len.to_be_bytes());
-            data[4..8].copy_from_slice(b"moov");
-            src.seek(SeekFrom::Start(at + head))?;
-            src.read_exact(&mut data[8..])?;
-            if box_len == 0 {
-                // 4 GiB を超える moov（上限で断っているので来ない）
-                return Ok(None);
-            }
-            return Ok(mp4_edit(&data, rate));
+        let Some(mdhd) = find_box(src, mdia.0, mdia.1, b"mdhd")? else {
+            return Ok(None);
+        };
+        let Some(media_scale) = time_scale(&read_head(src, mdhd, 24)?) else {
+            return Ok(None);
+        };
+        if media_scale != rate || movie_scale == 0 {
+            return Ok(None);
         }
-        at += size;
+        let Some(edts) = find_box(src, ts, te, b"edts")? else {
+            return Ok(None);
+        };
+        let Some(elst) = find_box(src, edts.0, edts.1, b"elst")? else {
+            return Ok(None);
+        };
+        let head = read_head(src, elst, 8 + u64::from(ELST_MAX) * 20)?;
+        return Ok(elst_first(&head, media_scale, movie_scale));
     }
     Ok(None)
 }
@@ -754,11 +868,7 @@ pub(crate) fn mp4_edit(data: &[u8], rate: u32) -> Option<(u64, u64)> {
         boxes(b).into_iter().find(|(t, _)| t == k).map(|(_, v)| v)
     }
     let moov = find(data, b"moov")?;
-    let mvhd = find(moov, b"mvhd")?;
-    let movie_scale = u64::from(match mvhd.first()? {
-        1 => u32::from_be_bytes(mvhd.get(20..24)?.try_into().ok()?),
-        _ => u32::from_be_bytes(mvhd.get(12..16)?.try_into().ok()?),
-    });
+    let movie_scale = u64::from(time_scale(find(moov, b"mvhd")?)?);
     for (kind, trak) in boxes(moov) {
         if &kind != b"trak" {
             continue;
@@ -772,43 +882,12 @@ pub(crate) fn mp4_edit(data: &[u8], rate: u32) -> Option<(u64, u64)> {
         if hdlr.get(8..12) != Some(b"soun") {
             continue;
         }
-        let mdhd = find(mdia, b"mdhd")?;
-        let media_scale = match mdhd.first()? {
-            1 => u32::from_be_bytes(mdhd.get(20..24)?.try_into().ok()?),
-            _ => u32::from_be_bytes(mdhd.get(12..16)?.try_into().ok()?),
-        };
+        let media_scale = time_scale(find(mdia, b"mdhd")?)?;
         if media_scale != rate || movie_scale == 0 {
             return None;
         }
         let elst = find(find(trak, b"edts")?, b"elst")?;
-        let version = *elst.first()?;
-        let count = u32::from_be_bytes(elst.get(4..8)?.try_into().ok()?);
-        let mut at = 8usize;
-        for _ in 0..count.min(64) {
-            let (dur, time, step) = if version == 1 {
-                (
-                    u64::from_be_bytes(elst.get(at..at + 8)?.try_into().ok()?),
-                    i64::from_be_bytes(elst.get(at + 8..at + 16)?.try_into().ok()?),
-                    20,
-                )
-            } else {
-                (
-                    u64::from(u32::from_be_bytes(elst.get(at..at + 4)?.try_into().ok()?)),
-                    i64::from(i32::from_be_bytes(
-                        elst.get(at + 4..at + 8)?.try_into().ok()?,
-                    )),
-                    12,
-                )
-            };
-            at += step;
-            if time < 0 {
-                continue;
-            }
-            // 長さは映像全体の時間の単位 → メディアの時間の単位
-            let len = u128::from(dur) * u128::from(media_scale) / u128::from(movie_scale);
-            return Some((time as u64, u64::try_from(len).ok()?));
-        }
-        return None;
+        return elst_first(elst, media_scale, movie_scale);
     }
     None
 }
@@ -1019,6 +1098,10 @@ mod tests {
             let mut zero = vec![0, 0, 0, 0, b'f', b'r', b'e', b'e', 1, 2, 3];
             zero.extend_from_slice(&moved);
             tails.push(zero);
+            // moov の中身の後ろに 65 MiB の free を足す（前の版は 64 MiB を超える moov を黙って読まなかった。M13 段 2 の検証）
+            if mp4_edit(&data, 44_100).is_some() {
+                tails.push(with_big_moov(&moved, 65 << 20));
+            }
             for d in tails {
                 for rate in [44_100, 48_000] {
                     assert_eq!(
@@ -1031,6 +1114,29 @@ mod tests {
             }
         }
         assert!(seen_edit >= 1, "{seen_edit}");
+    }
+
+    /// 最上位の箱を並べた `data` の moov の中身の後ろに、`pad` バイトの free の箱を足す（moov の大きさを直し、ほかの箱は
+    /// そのまま）。
+    fn with_big_moov(data: &[u8], pad: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at + 8 <= data.len() {
+            let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+            let b = &data[at..at + size];
+            if &b[4..8] == b"moov" {
+                let grown = u32::try_from(size + 8 + pad).unwrap();
+                out.extend_from_slice(&grown.to_be_bytes());
+                out.extend_from_slice(&b[4..]);
+                out.extend_from_slice(&u32::try_from(8 + pad).unwrap().to_be_bytes());
+                out.extend_from_slice(b"free");
+                out.resize(out.len() + pad, 0);
+            } else {
+                out.extend_from_slice(b);
+            }
+            at += size;
+        }
+        out
     }
 
     /// NaN はどのビット列でも `0x7fc00000` にそろえ（符号・ペイロードを捨てる）、ほかの値（-0・±∞・非正規化数）は

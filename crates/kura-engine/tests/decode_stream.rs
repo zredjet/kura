@@ -466,6 +466,72 @@ fn shapes_from_files_equal_shapes_from_readers() {
     }
 }
 
+/// E42（M13 段 2 の検証の直し）：moov が 64 MiB を超える m4a（ffmpeg の AAC。編集リストあり・iTunSMPB なし）でも、流して
+/// 読んだ記録（`value_digest`）が `decode_path` と同じで、ファイルから読む形が読み口から読む形と同じ（前の版はファイルから
+/// 読むときだけ大きな moov の編集リストを黙って捨て、priming を切らなかった）。フィクスチャの moov の中身の後ろに
+/// 65 MiB の free の箱を足して作る（moov が最後なので、チャンクの位置は変わらない）。
+#[test]
+fn big_moov_keeps_the_edit_list() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/aac-lc-ffmpeg.m4a");
+    let b = std::fs::read(&src).unwrap();
+    let mut at = 0usize;
+    let mut moov = None;
+    while at + 8 <= b.len() {
+        let s = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+        if &b[at + 4..at + 8] == b"moov" {
+            moov = Some((at, s));
+        }
+        at += s;
+    }
+    let (m, ms) = moov.unwrap();
+    assert_eq!(m + ms, b.len(), "moov が最後でない");
+    let pad = 65usize << 20;
+    let mut f = b.clone();
+    f[m..m + 4].copy_from_slice(&u32::try_from(ms + 8 + pad).unwrap().to_be_bytes());
+    f.extend_from_slice(&u32::try_from(8 + pad).unwrap().to_be_bytes());
+    f.extend_from_slice(b"free");
+    f.resize(f.len() + pad, 0);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e42-big-moov");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("big-moov.m4a");
+    std::fs::write(&path, &f).unwrap();
+    let set = CodecSet::pinned();
+    let limits = Limits::default();
+    let opts = DecodeOptions::default();
+    let (orig, orig_stamp) = set
+        .decode_path(&src, "m4a", &opts, &limits, &NoMonitor)
+        .unwrap();
+    let (v, stamp) = set
+        .decode_path(&path, "m4a", &opts, &limits, &NoMonitor)
+        .unwrap();
+    assert_eq!(stamp, orig_stamp, "free の箱で値は変わらない");
+    assert_eq!(v.shape(), orig.shape());
+    let mut sink = Collect::default();
+    let streamed = set
+        .decode_stream_path(&path, "m4a", &opts, &limits, &mut sink, &NoMonitor)
+        .unwrap();
+    assert_eq!(streamed, stamp, "流して読んだ記録が decode と違う");
+    check_windows(&sink, &v, "moov の大きな m4a");
+    let mut sink = Collect::default();
+    let from_reader = set
+        .decode_stream(
+            &mut Cursor::new(&f),
+            "m4a",
+            &opts,
+            &limits,
+            &mut sink,
+            &NoMonitor,
+        )
+        .unwrap();
+    assert_eq!(from_reader, stamp);
+    let by_path = set.shape_path(&path, "m4a", &opts, &limits).unwrap();
+    let by_reader = set
+        .shape(&mut Cursor::new(&f), "m4a", &opts, &limits)
+        .unwrap();
+    assert_eq!(by_path, by_reader);
+    std::fs::remove_file(&path).unwrap();
+}
+
 /// E42（D5）：流れの窓が 2 つ以上になる FLAC を読み口から流して読むと、記録・値が `decode` と同じ。STREAMINFO の MD5 が
 /// 違えば、流して読んでも `Decode`（MD5 は最後に照らすので、受け手は窓を受けても終わりを受けない）。
 #[test]
