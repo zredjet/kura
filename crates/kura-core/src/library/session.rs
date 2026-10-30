@@ -131,16 +131,19 @@ impl LibrarySession {
             engine,
             gc_clock,
             backup_checks,
-            ..
+            upgrade,
         } = services;
         let library = Arc::new(library);
         // エンジンの部品はこのライブラリのもの（ffmpeg の一時ファイルは staging/engine。下の掃除で前回の残りが消える）。
         // 実行の場とコーデックの組は、ジョブ・IPC が最初に使うときに作る（起動の道に載せない）
         let engine = engine.map(|factory| {
-            Arc::new(EngineServices::new(
+            let e = Arc::new(EngineServices::new(
                 factory,
                 library.layout().staging_dir().join(ENGINE_WORK_DIR),
-            ))
+            ));
+            // 作業用の PCM（staging/pcm）を書く前に空きを確かめる（M13 段 2）
+            e.set_free_space(upgrade.free_space.clone());
+            e
         });
         // ジョブを動かす前に書きかけを消す（再開する取り込みは最初からコピーし直す）。
         // 待機中・一時停止中のダウンロードの作業フォルダは、続きから取るので残す
@@ -396,6 +399,10 @@ impl LibrarySession {
         self.jobs.shutdown();
         if let Ok(mut backup) = self.backup.lock() {
             backup.stop();
+        }
+        // 作業用の PCM（staging/pcm）は全部消す（DB に記録しないので、残す理由がない。M13 段 2）
+        if let Some(engine) = &self.engine {
+            engine.work_pcm().clear();
         }
         // ffmpeg の一時ファイルの置き場が空なら消す（次に開くときの掃除で「書きかけ」に数えないように）。中身が残っていれば
         // 次に開くときの掃除で消す
@@ -771,6 +778,61 @@ mod tests {
         .unwrap();
         assert!(!Arc::ptr_eq(&engine_a, again.engine().unwrap()));
         assert!(again.engine().unwrap().runtime_if_built().is_none());
+    }
+
+    /// M13 段 2：作業用の PCM の置き場は staging/pcm で、開くときに空きを測る関数を受け取る。閉じると全部消して空の置き場も
+    /// 消し、前回の残り（強制終了）は開くときの staging の掃除で消える。
+    #[test]
+    fn work_pcm_lives_in_staging_and_is_cleared_on_close() {
+        use crate::edit::work_pcm::WorkKey;
+        use crate::library::upgrade::FreeSpaceFn;
+        let dir = tempfile::tempdir().unwrap();
+        let factory = Arc::new(FakeEngineFactory::default());
+        let mut svc = services().with_engine(factory.clone());
+        svc.upgrade.free_space = Some(Arc::new(|_: &Path| Some(1u64 << 20)) as Arc<FreeSpaceFn>);
+        let session = LibrarySession::create(&dir.path().join("L"), sink(), svc).unwrap();
+        session.wait_ready();
+        let engine = session.engine().unwrap().clone();
+        let pcm_dir = dir.path().join("L.kuralib/staging/pcm");
+        assert_eq!(engine.work_pcm().dir(), pcm_dir);
+        // 空きを測る関数が渡っている（1 MiB では足りない）
+        let key = WorkKey {
+            source: [1; 32],
+            format: "flac".into(),
+            options: kura_engine::doc::DecodeOptions::default(),
+            decoder: None,
+        };
+        let bound = kura_engine::Shape::Audio {
+            rate: 8_000,
+            channels: 1,
+            frames: kura_engine::Dim::Exact(10),
+        };
+        let r = engine.work_pcm().ensure(
+            &key,
+            &bound,
+            kura_engine::codec::anchor::AnchorContext::default(),
+            |_| panic!("読まない"),
+            &kura_engine::Limits::default(),
+            &kura_engine::NoMonitor,
+        );
+        assert!(matches!(r, Err(crate::CoreError::NoSpace { .. })));
+        // 閉じると置き場ごと消える
+        std::fs::create_dir_all(&pcm_dir).unwrap();
+        std::fs::write(pcm_dir.join("x.0.part"), b"x").unwrap();
+        session.close();
+        assert!(!pcm_dir.exists());
+        drop(session);
+        // 強制終了で残ったものは、開くときの掃除で消える
+        std::fs::create_dir_all(&pcm_dir).unwrap();
+        std::fs::write(pcm_dir.join("y.wav"), b"y").unwrap();
+        let again = LibrarySession::open(
+            &dir.path().join("L.kuralib"),
+            sink(),
+            services().with_engine(factory),
+        )
+        .unwrap();
+        again.wait_ready();
+        assert!(!pcm_dir.exists());
     }
 
     /// 外部ツールの場所を変えたら、開いているライブラリのコーデックの組を作り直す（ffmpeg を探し直す）。

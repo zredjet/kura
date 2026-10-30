@@ -24,6 +24,14 @@ pub enum CoreError {
     /// 混んでいる（同じアイテムの保存が終わっていないなど。待ってやり直せば通りうる。M12 の保存）。
     #[error("混んでいます: {0}")]
     Busy(String),
+    /// ディスクの空きが足りない（作業用の PCM を書く前の見積もり。M13 段 2。書く途中の ENOSPC は `Io`（`is_no_space`））。
+    #[error(
+        "ディスクの空き容量が足りません。あと約 {} MB の空きを作ってからやり直してください（要る空きは約 {} MB、いまの空きは約 {} MB）",
+        megabytes(.needed.saturating_sub(*.available)),
+        megabytes(*.needed),
+        megabytes(*.available)
+    )]
+    NoSpace { needed: u64, available: u64 },
     /// ファイル操作の失敗。
     #[error("ファイル操作に失敗しました: {0}")]
     Io(#[from] std::io::Error),
@@ -183,6 +191,7 @@ impl CoreError {
             Self::Unsupported(_) => "Unsupported",
             Self::Mismatch(_) => "Mismatch",
             Self::Busy(_) => "Busy",
+            Self::NoSpace { .. } => "NoSpace",
             Self::Io(_) => "Io",
             Self::Db(_) | Self::Json(_) | Self::DbClosed => "Db",
             Self::ToolMissing(_) => "ToolMissing",
@@ -214,6 +223,7 @@ impl CoreError {
             Self::Db(rusqlite::Error::SqliteFailure(err, _)) => {
                 err.code == rusqlite::ErrorCode::DiskFull
             }
+            Self::NoSpace { .. } => true,
             _ => false,
         }
     }

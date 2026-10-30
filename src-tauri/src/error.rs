@@ -69,6 +69,8 @@ impl From<CoreError> for AppError {
             CoreError::Unsupported(_) => AppErrorCode::Invalid,
             CoreError::Mismatch(_) => AppErrorCode::Conflict,
             CoreError::Busy(_) => AppErrorCode::Busy,
+            // 作業用の PCM（M13 段 2）を書く前の空きの見積もりが足りない
+            CoreError::NoSpace { .. } => AppErrorCode::NoSpace,
             CoreError::Io(_) => AppErrorCode::Io,
             CoreError::Db(_) | CoreError::Json(_) | CoreError::DbClosed => AppErrorCode::Db,
             CoreError::ToolMissing(_) => AppErrorCode::ToolMissing,
@@ -125,6 +127,13 @@ mod tests {
         assert_eq!(err.code, AppErrorCode::Conflict);
         let err: AppError = CoreError::Busy("x".into()).into();
         assert_eq!(err.code, AppErrorCode::Busy);
+        let err: AppError = CoreError::NoSpace {
+            needed: 3 << 20,
+            available: 1 << 20,
+        }
+        .into();
+        assert_eq!(err.code, AppErrorCode::NoSpace);
+        assert!(err.message.contains("約 2 MB"), "{}", err.message);
         let err: AppError = CoreError::LibraryInUse.into();
         assert_eq!(err.code, AppErrorCode::LibraryInUse);
         assert!(

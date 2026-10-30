@@ -18,6 +18,7 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod versions;
+pub mod work_pcm;
 
 pub use gc::{GcClock, GcHandler};
 pub use runtime::{EngineRuntime, RuntimeConfig, pool_sizes};

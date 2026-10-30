@@ -23,8 +23,10 @@ pub use kura_engine::codec::CodecSet;
 
 use super::editor::{Editor, Reservation};
 use super::runtime::{EngineRuntime, RuntimeConfig};
+use super::work_pcm::{WORK_PCM_DIR, WorkPcmStore};
 use crate::Result;
 use crate::asset::pcm::{CACHE_TTL, PcmCache};
+use crate::library::upgrade::FreeSpaceFn;
 
 /// ffmpeg の段の一時ファイルの置き場（ライブラリの `staging/` の下の名前）。
 pub const ENGINE_WORK_DIR: &str = "engine";
@@ -54,12 +56,19 @@ pub struct EngineServices {
     editor: Mutex<Option<Arc<Editor>>>,
     /// エディタの取り置きの持ち主（エディタどうしで共有し、外すのは持ち主だけ）。
     reservation: Arc<Reservation>,
+    /// 作業用の PCM の置き場（`staging/pcm`。M13 段 2）。
+    work_pcm: Arc<WorkPcmStore>,
 }
 
 impl EngineServices {
     /// ファクトリと一時ファイルの置き場から作る（まだ何も作らない）。
     pub fn new(factory: Arc<dyn EngineFactory>, work_dir: PathBuf) -> Self {
+        // 作業用の PCM は staging/engine の隣（staging/pcm）
+        let pcm_dir = work_dir
+            .parent()
+            .map_or_else(|| work_dir.join(WORK_PCM_DIR), |p| p.join(WORK_PCM_DIR));
         Self {
+            work_pcm: Arc::new(WorkPcmStore::new(pcm_dir, None)),
             factory,
             work_dir,
             runtime: OnceLock::new(),
@@ -121,6 +130,16 @@ impl EngineServices {
     /// 試聴の PCM の読んだ結果の置き場（このライブラリの分）。
     pub fn pcm_cache(&self) -> &Arc<PcmCache> {
         &self.pcm
+    }
+
+    /// 作業用の PCM の置き場（`staging/pcm`。M13 段 2）。
+    pub fn work_pcm(&self) -> &Arc<WorkPcmStore> {
+        &self.work_pcm
+    }
+
+    /// 作業用の PCM の置き場の空きを測る関数（ライブラリを開くとき。kura-mac の `volume_capacity`）。
+    pub fn set_free_space(&self, f: Option<Arc<FreeSpaceFn>>) {
+        self.work_pcm.set_free_space(f);
     }
 
     /// ffmpeg の段の一時ファイルの置き場（そのライブラリの `staging/engine`）。

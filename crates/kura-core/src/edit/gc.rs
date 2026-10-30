@@ -619,6 +619,8 @@ impl JobHandler for GcHandler {
         if parts > 0 {
             ctx.log(&format!("孤立した文書の部品を {parts} 個消しました"));
         }
+        // 手放した作業用の PCM の期限・上限を過ぎたものを消す（M13 段 2）
+        self.engine.work_pcm().sweep();
         let message = done.message();
         ctx.log(&message);
         Ok(JobEnd::Done {

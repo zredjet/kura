@@ -528,6 +528,7 @@ pub struct F32WavWriter<W: Write + Seek + SetLen + Send> {
     frames: u64,
     buf: Vec<u8>,
     done: bool,
+    end: Option<StreamEnd>,
 }
 
 /// 作業列の大きさ（バイト）。
@@ -544,7 +545,18 @@ impl<W: Write + Seek + SetLen + Send> F32WavWriter<W> {
             frames: 0,
             buf: Vec::new(),
             done: false,
+            end: None,
         }
+    }
+
+    /// 書き終えた流れの終わり（長さとメタデータ。`end` のあと。`anchor::seal_wav` にメタデータを渡す）。
+    pub fn stream_end(&self) -> Option<&StreamEnd> {
+        self.end.as_ref()
+    }
+
+    /// 書いている音声のレートとチャンネルの数（`begin` のあと）。
+    pub fn format(&self) -> (u32, usize) {
+        (self.rate, self.channels)
     }
 
     /// 書き先を返す。
@@ -625,6 +637,7 @@ impl<W: Write + Seek + SetLen + Send> DecodeSink for F32WavWriter<W> {
         self.rate = info.rate;
         self.frames = 0;
         self.done = false;
+        self.end = None;
         // 形の上限で RIFF に収まるかを先に確かめる
         let bound = info
             .frames
@@ -695,6 +708,7 @@ impl<W: Write + Seek + SetLen + Send> DecodeSink for F32WavWriter<W> {
         self.out.seek(SeekFrom::Start(self.data_start + data_len))?;
         self.out.flush()?;
         self.done = true;
+        self.end = Some(end.clone());
         Ok(())
     }
 }
