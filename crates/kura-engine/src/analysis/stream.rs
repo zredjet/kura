@@ -38,6 +38,8 @@ struct Slot {
 pub struct AnalysisFan {
     limits: Limits,
     slots: Vec<Slot>,
+    /// 流れを作った形（最後の `restart`。デコーダが次の段へ回ったら、その段の形）。
+    input: Shape,
     pos: u64,
     end: Option<StreamEnd>,
 }
@@ -85,6 +87,7 @@ impl Engine {
         let mut fan = AnalysisFan {
             limits: self.limits().clone(),
             slots,
+            input: *input,
             pos: 0,
             end: None,
         };
@@ -98,6 +101,7 @@ impl AnalysisFan {
     pub fn restart(&mut self, input: &Shape) {
         self.pos = 0;
         self.end = None;
+        self.input = *input;
         let limits = &self.limits;
         for slot in &mut self.slots {
             let Some((a, params)) = &slot.analysis else {
@@ -150,6 +154,11 @@ impl AnalysisFan {
     /// 覚えた流れの終わり（`set_end` のあと）。
     pub fn end(&self) -> Option<&StreamEnd> {
         self.end.as_ref()
+    }
+
+    /// 流れを作った形（デコーダが読み始めた形。レート・チャンネルの数）。
+    pub fn input(&self) -> &Shape {
+        &self.input
     }
 
     /// 要求の順の結果（`analyze_many` と同じ形）。終わりがなければどれも `Internal`。

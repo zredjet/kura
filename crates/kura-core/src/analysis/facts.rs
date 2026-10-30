@@ -71,16 +71,31 @@ impl ReadRecord {
                     count: fr.frames().len() as u64,
                 }
             }
-            Value::Audio(a) => Self::Audio {
-                rate: a.rate(),
-                channels: u16::try_from(a.channels()).unwrap_or(u16::MAX),
-                frames: a.frames() as u64,
-                bits: a
-                    .meta
-                    .source
-                    .filter(|_| LOSSLESS_AUDIO.contains(&format))
-                    .map(|s| s.bits),
-            },
+            Value::Audio(a) => Self::from_audio(
+                a.rate(),
+                u16::try_from(a.channels()).unwrap_or(u16::MAX),
+                a.frames() as u64,
+                a.meta.source,
+                format,
+            ),
+        }
+    }
+
+    /// 流して読んだ音声から作る（M13 段 2。`from_value` の音声と同じ欄：レート・チャンネル・長さ・元の形式の深さ）。
+    pub fn from_audio(
+        rate: u32,
+        channels: u16,
+        frames: u64,
+        source: Option<kura_engine::value::AudioSource>,
+        format: &str,
+    ) -> Self {
+        Self::Audio {
+            rate,
+            channels,
+            frames,
+            bits: source
+                .filter(|_| LOSSLESS_AUDIO.contains(&format))
+                .map(|s| s.bits),
         }
     }
 

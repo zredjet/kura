@@ -131,6 +131,36 @@ pub fn stage1(read: &ReadRecord) -> Vec<AnalysisRequest> {
     }
 }
 
+/// 流して解く音声の段 1 の要求（M13 段 2）：形から仮の読み取りの記録を作って [`stage1`] を呼ぶ。長さが上限しか分からない形
+/// （`AtMost`）は、波形の段を最も細かい段（256）から作って、終わりの長さの引数（[`peaks_params`]）に `Peaks::coarsen` で
+/// 合わせる（細かい段を落とすだけで `compute` と同じ）。音声でない形は空。
+pub fn stream_requests(shape: &Shape) -> Vec<AnalysisRequest> {
+    let Shape::Audio {
+        rate,
+        channels,
+        frames,
+    } = *shape
+    else {
+        return Vec::new();
+    };
+    let read = ReadRecord::Audio {
+        rate,
+        channels,
+        frames: frames.max(),
+        bits: None,
+    };
+    let mut reqs = stage1(&read);
+    if let kura_engine::Dim::AtMost(_) = frames {
+        for r in &mut reqs {
+            if r.id == PeaksAnalysis::ID {
+                r.params =
+                    json!({ "finest": PEAK_BINS[0], "coarsest": PEAK_BINS[PEAK_BINS.len() - 1] });
+            }
+        }
+    }
+    reqs
+}
+
 /// 段 2：段 1 の結果で決める解析。スプライトの格子の推定は 1 枚の画像（フレームの列は受けない）で、透過があるか
 /// 256 色以下のときだけ（写真では意味がない）。段 1 の結果がなければ（失敗）解かない。
 pub fn stage2(

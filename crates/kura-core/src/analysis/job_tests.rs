@@ -109,6 +109,50 @@ impl Decoder for Watching {
         }
         self.inner.decode_file(path, format, opts, limits, mon)
     }
+    fn streams(&self, format: &str) -> bool {
+        self.inner.streams(format)
+    }
+    fn stream_work_bytes(&self, format: &str, shape: &Shape, len: u64) -> u64 {
+        self.inner.stream_work_bytes(format, shape, len)
+    }
+    fn shape_work_bytes(&self, format: &str, len: u64) -> u64 {
+        self.inner.shape_work_bytes(format, len)
+    }
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut kura_engine::codec::DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .decode_stream(src, format, opts, limits, shape, out, mon)
+    }
+    /// 流して読む（音声の解析のジョブ。M13 段 2）も、読んだものとして記録してフックを呼ぶ。
+    fn decode_stream_file(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut kura_engine::codec::DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.log.lock().unwrap().push(name.clone());
+        if let Some(hook) = &self.hook {
+            hook(&name);
+        }
+        self.inner
+            .decode_stream_file(path, format, opts, limits, shape, out, mon)
+    }
 }
 
 /// 決まったコーデックの組と予算を返すファクトリ。
@@ -1540,4 +1584,157 @@ fn a_plan_change_rechecks_heic_written_from_the_format() {
         assert_eq!(env.fact::<Option<i64>>(h, "colors"), None, "{h}");
         assert_eq!(env.fact::<i64>(h, "frame_count"), 1, "{h}");
     }
+}
+
+/// M13 段 2：音声は流して解き、結果の行（正規の形）・事実・読み取りの記録・値のダイジェストが、値に読んで `analyze_many` した
+/// 参照と同じ（WAV・AIFF・FLAC・Ogg Vorbis・m4a（ALAC・AAC）・MP3。長さが上限しか分からない MP3・AAC は波形の段を
+/// 最も細かい段から作って終わりの長さの引数に合わせる）。値を組んで読まない（`decode_file` を呼ばない）。
+#[test]
+fn streamed_results_equal_whole_results() {
+    use super::facts::ReadRecord;
+    use super::plan::stage1;
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kura-engine/fixtures");
+    let cases: Vec<(&str, &str, Vec<u8>)> = vec![
+        (
+            "wav",
+            "wav",
+            wav(
+                20_000,
+                Some(LoopRange {
+                    start: 10,
+                    end: 900,
+                }),
+            ),
+        ),
+        (
+            "aiff",
+            "aiff",
+            std::fs::read(fixtures.join("aiff-24.aiff")).unwrap(),
+        ),
+        (
+            "flac",
+            "flac",
+            std::fs::read(fixtures.join("flac-24.flac")).unwrap(),
+        ),
+        (
+            "ogg",
+            "ogg",
+            std::fs::read(fixtures.join("ogg-vorbis-loop.ogg")).unwrap(),
+        ),
+        (
+            "m4a",
+            "m4a",
+            std::fs::read(fixtures.join("alac-16.m4a")).unwrap(),
+        ),
+        (
+            "m4a",
+            "m4a",
+            std::fs::read(fixtures.join("aac-lc-ffmpeg.m4a")).unwrap(),
+        ),
+        (
+            "mp3",
+            "mp3",
+            std::fs::read(fixtures.join("mp3-lame.mp3")).unwrap(),
+        ),
+        (
+            "aac",
+            "aac",
+            std::fs::read(fixtures.join("aac-lc.aac")).unwrap(),
+        ),
+    ];
+    let env = Env::with(
+        |log, _| {
+            let pinned = CodecSet::pinned();
+            let mut set = CodecSet::default();
+            for format in ["png", "wav", "aiff", "flac", "ogg", "m4a", "mp3", "aac"] {
+                for d in pinned.decoders_for(format) {
+                    if set.decoder_by_id(d.id()).is_none() {
+                        set.add_decoder(Arc::new(Watching {
+                            inner: d.clone(),
+                            log: log.clone(),
+                            hook: None,
+                        }))
+                        .unwrap();
+                    }
+                }
+            }
+            set
+        },
+        256 << 20,
+    );
+    let mut hashes = Vec::new();
+    for (i, (ext, _, body)) in cases.iter().enumerate() {
+        hashes.push(env.add(i as i64 + 1, "audio", ext, body));
+    }
+    let job = env.run();
+    assert_eq!(job.state, JobState::Done, "{:?}", job.message);
+    let engine = kura_engine::Engine::new().unwrap();
+    let pinned = CodecSet::pinned();
+    for ((ext, format, body), hash) in cases.iter().zip(&hashes) {
+        let id = hashes.iter().position(|h| h == hash).unwrap() as i64 + 1;
+        assert_eq!(env.state(id), "ready", "{ext}");
+        let (v, stamp) = pinned
+            .decode(
+                &mut std::io::Cursor::new(body),
+                format,
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+        let read = ReadRecord::from_value(&v, format);
+        let want = engine.analyze_many(&v, &stage1(&read), &NoMonitor);
+        for a in want {
+            let a = a.unwrap();
+            let got: Vec<u8> = if a.encoding == kura_engine::analysis::Encoding::Binary {
+                std::fs::read(env.library.layout().peaks_path(hash)).unwrap()
+            } else {
+                env.query(&format!(
+                    "SELECT r.output FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+                      WHERE hex(b.hash) = upper('{hash}') AND r.analysis = '{}'",
+                    a.id
+                ))
+            };
+            assert!(got == a.output, "{ext}・{}", a.id);
+            let params: String = env.query(&format!(
+                "SELECT r.params FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+                  WHERE hex(b.hash) = upper('{hash}') AND r.analysis = '{}'",
+                a.id
+            ));
+            assert_eq!(
+                params,
+                super::plan::canonical_string(&a.params).unwrap(),
+                "{ext}"
+            );
+        }
+        let stored: Vec<u8> = env.query(&format!(
+            "SELECT r.output FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+              WHERE hex(b.hash) = upper('{hash}') AND r.analysis = '{READ_ID}'"
+        ));
+        assert_eq!(stored, read.to_canonical().unwrap(), "{ext}");
+        let digest: Vec<u8> = env.fact(hash, "value_digest");
+        assert_eq!(digest, stamp.value_digest.0.to_vec(), "{ext}");
+        let decoder: String = env.fact(hash, "decoder");
+        assert_eq!(decoder, stamp.codec, "{ext}");
+    }
+}
+
+/// M13 段 2：長い音声も流して解く。10 分の合成の WAV（8 kHz モノラル）を実際に流し、事実が値の長さで書かれる。値の 3 倍の
+/// 見積もり（前の上限）を超える予算の小さな場でも、流れの見積もりは長さによらないので解ける。
+#[test]
+fn long_audio_is_analyzed_by_streaming() {
+    let frames = 8_000 * 600;
+    let body = wav(frames, None);
+    // 値は 19 MB（f32）。予算 24 MiB（1 件の上限は 12 MiB）では値を持って解けないが、流れなら収まる
+    let env = Env::with(|log, _| watched_set(log, None, Vec::new()), 24 << 20);
+    let hash = env.add(1, "audio", "wav", &body);
+    let job = env.run();
+    assert_eq!(job.state, JobState::Done, "{:?}", job.message);
+    assert_eq!(env.state(1), "ready");
+    let n: i64 = env.query(&format!(
+        "SELECT json_extract(r.output, '$.frames') FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+          WHERE hex(b.hash) = upper('{hash}') AND r.analysis = 'audio.silence'"
+    ));
+    assert_eq!(n, frames as i64);
+    assert!(env.reads().contains(&hash));
 }

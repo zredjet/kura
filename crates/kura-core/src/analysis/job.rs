@@ -13,8 +13,12 @@
 //!    - JPEG は読まずに形式から書く（決定 5）。HEIC・HEIF は見出し（Platform の段の形。画素を展開しない）を読み、アルファを
 //!      持つ形のものだけを先へ進めて読み、ほかと見出しを読めないものは形式から書く（決定 15）。見出しも OS のデコーダで読む
 //!      ので、処理中の印を付けてから読む。
-//!    - ヘッダだけ読んで形を出し、見積もり（値の 2 倍＋デコーダの作業領域）が min(予算/2, 1 GiB) を超えれば確保せずに
-//!      failed（`too_large`）。収まれば一括の予算（Class::Bulk）をプールの外で確保し、一括のプールの中で読んで解く（決定 2）。
+//!    - ヘッダだけ読んで形を出し、見積もりが min(予算/2, 1 GiB) を超えれば確保せずに failed（`too_large`）。収まれば一括の
+//!      予算（Class::Bulk）をプールの外で確保し、一括のプールの中で読んで解く（決定 2）。画像の見積もりは値の 2 倍＋デコーダの
+//!      作業領域。音声は値を持たずに流して解く（M13 段 2。`solve_stream`）：見積もりはデコーダの流れの作業領域＋窓 2 つ＋結果＋
+//!      ダイジェストの作業領域で、長さによらない（`too_large` は `Limits`（48 kHz で 3 時間）を超えるときと、見積もりが上限を
+//!      超えるとき（多チャンネルの窓など）だけ）。形を読むのにファイル全体を読むデコーダ（MP3・AudioToolbox）は、形を読む前に
+//!      その分を確保する。
 //!    - 波形の段は `peaks/ab/<hash>.peaks` に一時ファイルから改名して置く（DB に書く前）。
 //!    - 16 件か 500 ms ごとに 1 つのトランザクションで書く（`store::write`。ハッシュと pending を条件にする）。
 //! 5. 取り込み・サムネイルが来たら（`should_yield`）書きためた分を書いて譲る。一時停止・中止・アプリの終了では、解いている
@@ -34,19 +38,24 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use kura_engine::analysis::audio::peaks::{Peaks, PeaksAnalysis};
 use kura_engine::analysis::image::alpha::{Alpha, AlphaOutput};
 use kura_engine::analysis::image::colors::{Colors, ColorsOutput};
 use kura_engine::analysis::output::json_from_canonical;
-use kura_engine::analysis::{Analysis, AnalysisRegistry, Analyzed, Encoding, registry};
+use kura_engine::analysis::{
+    Analysis, AnalysisOutput, AnalysisRegistry, Analyzed, Encoding, registry,
+};
+use kura_engine::audio::digest::PcmTreeDigest;
 use kura_engine::budget::{Class, value_bytes};
+use kura_engine::codec::stream::stream_window_bytes;
 use kura_engine::codec::{CodecSet, DecodeStamp, Tier};
 use kura_engine::doc::DecodeOptions;
 use kura_engine::{AnalysisRequest, EngineError, Limits, Monitor};
 
 use super::facts::{MediaFacts, ReadRecord, from_format, project};
 use super::plan::{
-    DecoderFingerprint, Plan, READ_ID, READ_V, RequestKey, from_format_unless_read, plan_for,
-    read_after_header, request_key, stage1, stage2,
+    DecoderFingerprint, Plan, READ_ID, READ_V, RequestKey, from_format_unless_read, peaks_params,
+    plan_for, read_after_header, request_key, stage1, stage2, stream_requests,
 };
 use super::store::{self, Inflight, ItemWrite, NewResult, Pending, ReadStamp, Write, error_code};
 use crate::codec_ext::svg_worker;
@@ -371,6 +380,44 @@ fn estimate(codecs: &CodecSet, format: &str, shape: &kura_engine::Shape, len: u6
     value_bytes(shape)
         .saturating_mul(WORK_FACTOR)
         .saturating_add(codecs.decode_file_work_bytes(format, shape, len))
+}
+
+/// 音声を流して解く 1 件の見積もり（M13 段 2）：デコーダの流れの作業領域 ＋ 窓の作業列 × 2（デコードの窓と、解析の中の
+/// 半端な残り）＋ 要求ごとの結果の見積もり ＋ ダイジェストの作業領域（一括のプールの仕事の数ぶん）。長さが上限しか分からない
+/// 形は上限で数える。
+pub fn estimate_stream(
+    codecs: &CodecSet,
+    registry: &AnalysisRegistry,
+    format: &str,
+    shape: &kura_engine::Shape,
+    len: u64,
+    reqs: &[AnalysisRequest],
+    tasks: u64,
+) -> u64 {
+    let kura_engine::Shape::Audio {
+        channels, frames, ..
+    } = *shape
+    else {
+        return u64::MAX;
+    };
+    let results = reqs
+        .iter()
+        .map(|r| {
+            registry
+                .resolve(&r.id, r.v)
+                .ok()
+                .and_then(|a| {
+                    let params = a.check_params(&r.params).ok()?;
+                    a.estimate(&params, shape).ok()
+                })
+                .map_or(0, |e| e.bytes)
+        })
+        .fold(0u64, u64::saturating_add);
+    codecs
+        .decode_stream_work_bytes(format, shape, len)
+        .saturating_add(stream_window_bytes(usize::from(channels), frames.max()).saturating_mul(2))
+        .saturating_add(results)
+        .saturating_add(PcmTreeDigest::work_bytes(usize::from(channels), tasks))
 }
 
 /// 1 件の確保の上限：min(予算の全体/2, [`ITEM_CAP`])（決定 2）。予算は min(物理メモリ/4, 4 GiB) なので、物理メモリが 8 GB
@@ -737,6 +784,34 @@ impl Run<'_> {
     ) -> Result<(Step, bool)> {
         let opts = DecodeOptions::default();
         let started = Instant::now();
+        // 形を読むのにファイル全体を読むデコーダ（MP3・AudioToolbox）は、その分を先に確保する（M13 段 2）
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let shape_need = self.codecs.shape_work_bytes(format, len);
+        let _shape_lease = if shape_need > 0 {
+            let cap = item_cap(self.runtime.budget().total());
+            if shape_need > cap {
+                self.ctx.log(&format!(
+                    "アイテム {}: 形を読むのに大きすぎるので解析しません（{shape_need} バイト・上限 {cap} バイト）",
+                    item.id
+                ));
+                return Ok((failed(error_code::TOO_LARGE), true));
+            }
+            match self
+                .runtime
+                .budget()
+                .acquire(shape_need, Class::Bulk, &JobMonitor(self.ctx))
+            {
+                Ok(lease) => Some(lease),
+                Err(err) => {
+                    return Ok(match failure_code(&err) {
+                        Some(code) => (failed(code), true),
+                        None => (Step::Aborted, false),
+                    });
+                }
+            }
+        } else {
+            None
+        };
         // 形を読む子（別のプロセスで読む SVG。決定 23）も、ジョブの中止で止める
         let header = self.codecs.shape_path_monitored(
             path,
@@ -745,6 +820,7 @@ impl Run<'_> {
             &self.limits,
             &JobMonitor(self.ctx),
         );
+        drop(_shape_lease);
         if by_header {
             self.counts
                 .header_ms
@@ -776,7 +852,99 @@ impl Run<'_> {
         if by_header && !read_after_header(&shape) {
             return Ok((from_format_step(format), false));
         }
+        if matches!(shape, kura_engine::Shape::Audio { .. }) {
+            return Ok((
+                self.solve_stream(item, format, path, hash_hex, &shape)?,
+                true,
+            ));
+        }
         Ok((self.solve(item, format, path, hash_hex, &shape)?, true))
+    }
+
+    /// 音声を流して解く（M13 段 2）：形から要求を決めて見積もり、一括の予算で確保して、一括のプールの中で流れのデコードを
+    /// 解析の扇（`Engine::analyze_stream`）に流す。値は持たない。結果の行・波形の段のファイル・事実は `solve` と同じ形。
+    fn solve_stream(
+        &mut self,
+        item: &Pending,
+        format: &str,
+        path: &Path,
+        hash_hex: &str,
+        shape: &kura_engine::Shape,
+    ) -> Result<Step> {
+        let opts = DecodeOptions::default();
+        let reqs = stream_requests(shape);
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let tasks = self.runtime.bulk_threads() as u64;
+        let need = estimate_stream(
+            &self.codecs,
+            &self.registry,
+            format,
+            shape,
+            len,
+            &reqs,
+            tasks,
+        );
+        let cap = item_cap(self.runtime.budget().total());
+        if need > cap {
+            self.ctx.log(&format!(
+                "アイテム {}: 大きすぎるので解析しません（見積もり {need} バイト・上限 {cap} バイト）",
+                item.id
+            ));
+            return Ok(failed(error_code::TOO_LARGE));
+        }
+        let mon = JobMonitor(self.ctx);
+        let lease = match self.runtime.budget().acquire(need, Class::Bulk, &mon) {
+            Ok(lease) => lease,
+            Err(err) => {
+                return Ok(match failure_code(&err) {
+                    Some(code) => failed(code),
+                    None => Step::Aborted,
+                });
+            }
+        };
+        let codecs = self.codecs.clone();
+        let registry = &self.registry;
+        let solved = self.runtime.bulk(|engine| {
+            let mut fan = engine.analyze_stream(&reqs, shape);
+            let stamp =
+                codecs.decode_stream_path(path, format, &opts, engine.limits(), &mut fan, &mon)?;
+            let end = fan
+                .end()
+                .cloned()
+                .ok_or_else(|| EngineError::Internal("流れの終わりがありません".into()))?;
+            let kura_engine::Shape::Audio { rate, channels, .. } = *fan.input() else {
+                return Err(EngineError::Internal("流れの形が音声ではありません".into()));
+            };
+            let read = ReadRecord::from_audio(rate, channels, end.frames, end.meta.source, format);
+            let mut results = fan.finish(&mon);
+            let requests = stage1(&read);
+            // 長さが上限しか分からなかった形：波形の段を終わりの長さの引数に合わせる
+            for (req, r) in reqs.iter().zip(results.iter_mut()) {
+                if req.id != PeaksAnalysis::ID {
+                    continue;
+                }
+                if let Ok(a) = r {
+                    let want = peaks_params(end.frames);
+                    let refit = coarsen_peaks(registry, a, &want);
+                    *r = refit;
+                }
+            }
+            Ok::<_, EngineError>((read, stamp, requests, results))
+        });
+        drop(lease);
+        let (read, stamp, requests, results) = match solved {
+            Ok(s) => s,
+            Err(err) => {
+                return Ok(match failure_code(&err) {
+                    Some(code) => {
+                        self.ctx.log(&format!("アイテム {}: {err}", item.id));
+                        failed(code)
+                    }
+                    None => Step::Aborted,
+                });
+            }
+        };
+        self.finish_solved(item, format, hash_hex, read, stamp, &requests, results)
     }
 
     /// 形 `shape` を見積もって予算を確保し、読んで解く。
@@ -848,6 +1016,21 @@ impl Run<'_> {
                 });
             }
         };
+        self.finish_solved(item, format, hash_hex, read, stamp, &requests, results)
+    }
+
+    /// 解いた結果から、結果の行・波形の段のファイル・事実を作る（`solve`・`solve_stream` が通る）。
+    #[allow(clippy::too_many_arguments)]
+    fn finish_solved(
+        &mut self,
+        item: &Pending,
+        format: &str,
+        hash_hex: &str,
+        read: ReadRecord,
+        stamp: DecodeStamp,
+        requests: &[AnalysisRequest],
+        results: Vec<std::result::Result<Analyzed, EngineError>>,
+    ) -> Result<Step> {
         let mut rows = Vec::new();
         let mut keep = vec![READ_ID.to_string()];
         let mut json = BTreeMap::new();
@@ -889,40 +1072,134 @@ impl Run<'_> {
     }
 }
 
+/// 最も細かい段から作った波形の段の結果を、引数 `want`（正規の形にする前の `peaks_params`）の段に合わせる
+/// （`Peaks::coarsen`。細かい段を落とすだけで、標本から `compute(want)` したものと同じ）。引数が同じならそのまま。
+fn coarsen_peaks(
+    registry: &AnalysisRegistry,
+    a: &Analyzed,
+    want: &serde_json::Value,
+) -> std::result::Result<Analyzed, EngineError> {
+    let d = registry
+        .resolve(a.id, Some(a.version))
+        .map_err(|i| EngineError::Internal(i.message))?;
+    let params = d.check_params(want).map_err(EngineError::Invalid)?;
+    if params == a.params {
+        return Ok(a.clone());
+    }
+    let finest = params
+        .get("finest")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|f| u32::try_from(f).ok())
+        .ok_or_else(|| EngineError::Internal("波形の段の引数が読めません".into()))?;
+    let peaks = Peaks::from_canonical(&a.output)?.coarsen(finest)?;
+    Ok(Analyzed {
+        id: a.id,
+        version: a.version,
+        params,
+        encoding: a.encoding,
+        output: peaks.to_canonical()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use kura_engine::{Dim, EngineError, Shape};
 
+    use super::super::plan::stream_requests;
     use super::store::error_code;
-    use super::{CodecSet, ITEM_CAP, estimate, failure_code, item_cap, percentile};
+    use super::{CodecSet, ITEM_CAP, estimate_stream, failure_code, item_cap, percentile};
 
-    /// 解析しない長さの目安（docs/requirements.md の「解析の長さの範囲」・ADR-158 (5)）：物理メモリが 8 GB 以上なら 1 件の上限は
-    /// 1 GiB で、音声の見積もりは値の 3 倍なので、44.1 kHz ステレオは約 16.9 分、48 kHz ステレオは約 15.5 分、96 kHz ステレオは
-    /// 約 7.8 分、44.1 kHz モノラルは約 33.8 分を超えると読まずに too_large になる（E4。docs の数を変えたらここも直す）。
+    /// 解析の長さの範囲（M13 段 2。docs/requirements.md の「解析の長さの範囲」）：音声は流して解くので、1 件の見積もりは長さに
+    /// よらない。60 分・3 時間の 48 kHz ステレオ、96 kHz ステレオ・32 チャンネル（`Limits` の中の長さ）、上限しか分からない
+    /// MP3 の形でも 1 件の上限（1 GiB。物理メモリが 8 GB 以上）より十分小さい。解析しないのは `Limits` を超えるもの
+    /// （48 kHz で 3 時間 ＋ 1 秒など）だけ。
     #[test]
-    fn long_audio_is_too_large_beyond_the_documented_length() {
+    fn long_audio_fits_up_to_the_engine_limits() {
         let codecs = CodecSet::pinned();
-        let audio = |rate: u32, channels: u16, secs: u64| Shape::Audio {
+        let registry = kura_engine::analysis::registry().unwrap();
+        let limits = kura_engine::Limits::default();
+        let audio = |rate: u32, channels: u16, secs: u64, exact: bool| Shape::Audio {
             rate,
             channels,
-            frames: Dim::Exact(u64::from(rate) * secs),
+            frames: if exact {
+                Dim::Exact(u64::from(rate) * secs)
+            } else {
+                Dim::AtMost(u64::from(rate) * secs)
+            },
         };
         assert_eq!(item_cap(4 << 30), ITEM_CAP);
         assert_eq!(item_cap(2 << 30), ITEM_CAP, "物理メモリ 8 GB");
         assert_eq!(item_cap(1 << 30), 512 << 20);
-        let fits = |format: &str, rate, channels, secs| {
-            estimate(&codecs, format, &audio(rate, channels, secs), 0) <= ITEM_CAP
+        let need = |format: &str, shape: &Shape, len: u64| {
+            estimate_stream(
+                &codecs,
+                &registry,
+                format,
+                shape,
+                len,
+                &stream_requests(shape),
+                16,
+            )
         };
-        for format in ["wav", "flac", "aiff"] {
-            assert!(fits(format, 44_100, 2, 1014), "{format}");
-            assert!(!fits(format, 44_100, 2, 1015), "{format}");
-            assert!(fits(format, 48_000, 2, 932), "{format}");
-            assert!(!fits(format, 48_000, 2, 933), "{format}");
-            assert!(fits(format, 96_000, 2, 466), "{format}");
-            assert!(!fits(format, 96_000, 2, 467), "{format}");
-            assert!(fits(format, 44_100, 1, 2028), "{format}");
-            assert!(!fits(format, 44_100, 1, 2029), "{format}");
+        for (format, shape, len) in [
+            ("wav", audio(48_000, 2, 3_600, true), 0),
+            ("flac", audio(48_000, 2, 3_600, true), 0),
+            ("wav", audio(48_000, 2, 3 * 3_600, true), 0),
+            ("aiff", audio(96_000, 2, 3 * 3_600 / 2, true), 0),
+            ("wav", audio(48_000, 32, 600, true), 0),
+            ("ogg", audio(48_000, 2, 3 * 3_600, true), 0),
+            // 3 時間の 320 kbps の MP3（432 MB）：ファイルを持つ分が入る
+            ("mp3", audio(48_000, 2, 3 * 3_600, false), 432_000_000),
+        ] {
+            assert!(limits.check(&shape).is_ok(), "{format} {shape:?}");
+            let n = need(format, &shape, len);
+            assert!(n <= ITEM_CAP / 2, "{format} {shape:?}: {n}");
         }
+        // ほぼ長さによらない（ファイルを持たないデコーダ。伸びるのは結果（波形の段）の分だけ）
+        let (one, two) = (
+            need("flac", &audio(48_000, 2, 3_600, true), 0),
+            need("flac", &audio(48_000, 2, 2 * 3_600, true), 0),
+        );
+        assert!(two >= one && two - one < 1 << 20, "{one} {two}");
+        // 上限の形で最も細かい段から作った波形の段を、終わりの長さの引数に合わせると、その引数で解いたものと同じ
+        let engine = kura_engine::Engine::new().unwrap();
+        let v = kura_engine::testgen::InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 1,
+            frames: 1_200_000,
+            seed: 9,
+        }
+        .generate()
+        .unwrap();
+        let req = |params| kura_engine::AnalysisRequest {
+            id: "audio.peaks".into(),
+            v: None,
+            params,
+        };
+        let fine = engine
+            .analyze_dyn(
+                &req(serde_json::json!({ "finest": 256, "coarsest": 65_536 })),
+                &v,
+                &kura_engine::NoMonitor,
+            )
+            .unwrap();
+        let want_params = super::super::plan::peaks_params(1_200_000);
+        assert_ne!(want_params["finest"], 256);
+        let want = engine
+            .analyze_dyn(&req(want_params.clone()), &v, &kura_engine::NoMonitor)
+            .unwrap();
+        let got = super::coarsen_peaks(&registry, &fine, &want_params).unwrap();
+        assert_eq!((got.params, got.output), (want.params, want.output));
+        // Limits を超えるものは断る（too_large）
+        assert!(
+            limits
+                .check(&audio(48_000, 2, 3 * 3_600 + 1, true))
+                .is_err()
+        );
+        assert!(
+            failure_code(&kura_engine::EngineError::Limit("x".into()))
+                == Some(error_code::TOO_LARGE)
+        );
     }
 
     /// 失敗の分け方は、どれも bindings に出す理由の一覧（`error_code::ALL`）にある（フロントが文言を引く）。
