@@ -1071,21 +1071,25 @@ export type EditOpenedDto_Serialize = {
 	result: EditStepResultDto_Serialize,
 };
 
-/**  波形の段の状態（`/edit/{session}/{rev}/peaks/{bin}/{tile}` の `rev` は `rev`）。 */
+/**  波形の段の状態（`/edit/{session}/{rev}/peaks/{bin}/{tile}` の `{rev}` は、この `rev`＝段の世代）。 */
 export type EditPeaksInfoDto = {
-	/**  公開した今の段の rev（なければ null）。今の文書の rev より古いことがある（そのときは `pending`）。 */
+	/**
+	 *  公開した今の段の世代（`/edit/{s}/{rev}/peaks/…` に使う番号。なければ null）。文書の rev とは別の数で、セッションの
+	 *  中で公開のたびに増え、同じ番号のタイルの中身は変わらない（immutable）。直している途中（`pending`）は、前の文書の段か、
+	 *  開いたときの仮の段（ライブラリの解析の段）のことがある。
+	 */
 	rev: number | null,
 	/**  その段のレート・チャンネル数・長さ。 */
 	rate: number,
 	channels: number,
 	frames: number,
-	/**  段のビンのフレーム数（細かい順）。 */
+	/**  その段が持つ段のビンのフレーム数（細かい順。ライブラリの粗い段だけを仮に出しているときはその段だけ）。 */
 	bins: number[],
 	/**  タイル 1 枚のビンの数（1,024）。 */
 	tileBins: number,
-	/**  前に返した段から変わった区間（この区間に掛かるタイルを取り直す）。 */
+	/**  前に返した世代の段から変わった区間（この区間に掛かるタイルを取り直す）。 */
 	changed: EditSpansChangeDto,
-	/**  直している途中（古い段を出している。手が止まったら `work: true` で頼み直す）。 */
+	/**  直している途中（古い段・仮の段を出している。手が止まったら `work: true` で頼み直す）。 */
 	pending: boolean,
 };
 

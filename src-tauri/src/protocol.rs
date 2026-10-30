@@ -1058,7 +1058,9 @@ mod tests {
     /// 4 つのヘッダ。main でない WebView は受け付けで 403。
     #[test]
     fn edit_audio_routes_are_served_from_the_open_editor() {
-        use kura_core::edit::editor::{self, EditorEnv, OpenRequest, Step, Viewport};
+        use kura_core::edit::editor::{
+            self, EditorEnv, OpenRequest, Step, ViewInfo, ViewOutcome, Viewport,
+        };
         use kura_core::import::{ImportInput, ImportOptions, start_import};
         use kura_engine::session::{CommitMode, Edit};
         use kura_engine::testgen::InputGen;
@@ -1131,6 +1133,11 @@ mod tests {
         )
         .unwrap();
         let rev = out.status.rev;
+        // 波形の段の URL の番号は段の世代（表示の情報の peaks.rev。文書の rev ではない）
+        let generation = match &out.view {
+            ViewOutcome::Shown(ViewInfo::Audio(info)) => info.peaks.rev.unwrap(),
+            other => panic!("音声を表示できませんでした: {other:?}"),
+        };
         let origin = release();
         let with = Served {
             layout: session.library().layout(),
@@ -1152,7 +1159,7 @@ mod tests {
             assert_decorated(&r, &origin, &path);
         }
         // 波形の段のタイル（immutable）
-        let peaks = get(&with, format!("/edit/{s}/{rev}/peaks/256/0"));
+        let peaks = get(&with, format!("/edit/{s}/{generation}/peaks/256/0"));
         assert_eq!(peaks.status(), StatusCode::OK);
         assert_eq!(&peaks.body()[..4], b"kpt1");
         assert_eq!(
@@ -1163,11 +1170,11 @@ mod tests {
         assert_decorated(&peaks, &origin, "peaks");
         for (path, status) in [
             (
-                format!("/edit/{s}/{rev}/peaks/256/9"),
+                format!("/edit/{s}/{generation}/peaks/256/9"),
                 StatusCode::NOT_FOUND,
             ),
             (
-                format!("/edit/{s}/{}/peaks/256/0", rev + 1),
+                format!("/edit/{s}/{}/peaks/256/0", generation + 1),
                 StatusCode::NOT_FOUND,
             ),
         ] {

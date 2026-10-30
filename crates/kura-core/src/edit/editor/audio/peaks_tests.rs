@@ -1,6 +1,7 @@
 //! エディタの波形の段（A8〜A10）：手のたびに公開した段が出力を `compute` したものと同じ・裏の仕事で小分けに進めても同じ・
 //! 直している間は前の段を配る・土台（ライブラリの解析の段）・タイルの並びと古い rev。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kura_engine::analysis::AnalyzeCx;
@@ -13,7 +14,7 @@ use serde_json::json;
 
 use super::peaks::{serve_peaks, tile_bytes};
 use super::session_tests::*;
-use crate::edit::editor::{AudioViewport, TileError, Viewport};
+use crate::edit::editor::{AudioViewport, OpenRequest, Step, TileError, Viewport, open};
 use crate::library::Library;
 
 fn peaks_of(a: &kura_engine::value::Audio) -> Peaks {
@@ -62,7 +63,7 @@ fn peaks_follow_each_step() {
     let opened = env.open(id);
     let s = opened.session.clone();
     let info = shown_audio(&opened.outcome.view).clone();
-    assert_eq!(info.peaks.rev, Some(info.rev));
+    let mut last = info.peaks.rev.unwrap();
     assert!(!info.peaks.pending);
     assert_eq!(info.peaks.changed, crate::edit::editor::ChangedSpans::All);
     assert_eq!(
@@ -71,7 +72,7 @@ fn peaks_follow_each_step() {
     );
     assert_eq!(info.peaks.bins, vec![256, 1_024, 4_096, 16_384, 65_536]);
     let original = rendered(&bytes, "wav", &Graph::new_single());
-    assert_eq!(*published(&env, &s, info.rev), peaks_of(&original));
+    assert_eq!(*published(&env, &s, last), peaks_of(&original));
 
     let vp = Viewport::audio_idle();
     let mut g = Graph::new_single();
@@ -97,7 +98,9 @@ fn peaks_follow_each_step() {
     {
         let out = env.step(&s, vec![step], &vp);
         let info = shown_audio(&out.view).clone();
-        assert_eq!(info.peaks.rev, Some(info.rev), "{i}");
+        let generation = info.peaks.rev.unwrap();
+        assert!(generation > last, "手のたびに新しい世代 {i}");
+        last = generation;
         assert!(!info.peaks.pending);
         if i == 0 {
             g.push_linear("audio.fade", 1, params, 1).unwrap();
@@ -114,7 +117,7 @@ fn peaks_follow_each_step() {
             assert!(sp.iter().all(|(_, b)| *b <= 2 * C), "{sp:?}");
         }
         let want = rendered(&bytes, "wav", &g);
-        assert_eq!(*published(&env, &s, info.rev), peaks_of(&want), "{i}");
+        assert_eq!(*published(&env, &s, generation), peaks_of(&want), "{i}");
     }
     // 操作中は直さない（前の段のまま pending）
     let moving = Viewport::Audio(AudioViewport {
@@ -241,8 +244,7 @@ fn library_peaks_are_the_base() {
     let s = opened.session.clone();
     let info = shown_audio(&opened.outcome.view);
     assert!(!info.peaks.pending, "土台がそのまま使える");
-    assert_eq!(info.peaks.rev, Some(info.rev));
-    assert_eq!(*published(&env, &s, info.rev), lib_peaks);
+    assert_eq!(*published(&env, &s, info.peaks.rev.unwrap()), lib_peaks);
     // 操作を足す手は、エンジンの推論が保守的に全体を返すので裏で作り直す
     let idle = Viewport::Audio(AudioViewport {
         work: false,
@@ -288,7 +290,7 @@ fn library_peaks_are_the_base() {
     assert_eq!(sp, &vec![(0, C)]);
     g.nodes[0].params = json!({ "fadeIn": 300, "fadeOut": 0, "curve": "linear" });
     assert_eq!(
-        *published(&env, &s, info.rev),
+        *published(&env, &s, info.peaks.rev.unwrap()),
         peaks_of(&rendered(&bytes, "wav", &g))
     );
     // 全体に効く手は裏で作り直す
@@ -318,7 +320,143 @@ fn library_peaks_are_the_base() {
     assert_eq!(info.peaks.frames, 2 * C, "土台を使わずに作った");
 }
 
-/// A10：`/edit/{s}/{rev}/peaks/{bin}/{tile}` の中身はタイルの並び。古い rev・ない段・範囲の外は 404。
+/// 公開した段のタイルをすべて（`/edit/{s}/{gen}/peaks/{bin}/{tile}` の中身。段の世代の今か直前でなければ None）。
+fn tiles_of(env: &Env, s: &str, gen_: u64) -> Option<BTreeMap<(u32, u32), Vec<u8>>> {
+    let p = env.editor(s).published_peaks(gen_)?;
+    let mut out = BTreeMap::new();
+    for l in &p.levels {
+        for tile in 0.. {
+            match serve_peaks(&env.engine, s, gen_, l.bin, tile) {
+                Ok(b) => {
+                    out.insert((l.bin, tile), b);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    Some(out)
+}
+
+/// 段の世代ごとに最初に見たタイルを覚え、同じ世代のタイルのバイト列が二度と変わらないことを確かめる。
+#[derive(Default)]
+struct Generations(BTreeMap<u64, BTreeMap<(u32, u32), Vec<u8>>>);
+
+impl Generations {
+    /// 今の段の世代 `gen_` のタイルを見る（前に見ていれば同じか確かめる）。前に見たほかの世代も、まだ配っていれば同じ。
+    fn see(&mut self, env: &Env, s: &str, gen_: u64) {
+        for (g, tiles) in &self.0 {
+            if let Some(now) = tiles_of(env, s, *g) {
+                assert_eq!(&now, tiles, "世代 {g} のタイルが変わった");
+            }
+        }
+        let tiles = tiles_of(env, s, gen_).expect("今の世代を配る");
+        assert!(!tiles.is_empty());
+        self.0.entry(gen_).or_insert(tiles);
+    }
+}
+
+/// 開くときの表示（操作中）。
+fn interacting() -> Viewport {
+    Viewport::Audio(AudioViewport {
+        interacting: true,
+        work: false,
+        ..AudioViewport::idle()
+    })
+}
+
+/// 下書きを置く（版 0 の頭に `g` を当てた文書）。
+fn place_draft(lib: &Library, id: i64, bytes: &[u8], g: &Graph) {
+    let hash = *blake3::hash(bytes).as_bytes();
+    crate::edit::drafts::save(
+        lib.db(),
+        id,
+        g,
+        crate::edit::Base { hash, version: 0 },
+        None,
+    )
+    .unwrap();
+}
+
+fn open_draft(env: &Env, id: i64, viewport: Viewport) -> crate::edit::editor::Opened {
+    let opened = open(
+        &env.env(),
+        &OpenRequest {
+            item_id: id,
+            viewport,
+            from_draft: true,
+        },
+    )
+    .unwrap();
+    assert!(opened.draft.opened);
+    opened
+}
+
+/// A9：下書き（手のある文書）から開くと、土台（ライブラリの段＝手の前の波形）は仮の段として自分の世代で出し（pending）、
+/// 直し終えたら新しい世代で公開する。同じ世代のタイルのバイト列は二度と変わらず、仮でない段はその rev の出力の `compute`。
+#[test]
+fn draft_base_is_provisional_and_generations_never_change() {
+    let env = Env::new();
+    let frames = 3 * C + 17;
+    let bytes = noise_wav(8_000, 1, frames, 36);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let lib_peaks = peaks_of(&rendered(&bytes, "wav", &Graph::new_single()));
+    place_analysis(&env.lib, id, &bytes, &lib_peaks);
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -6.0 }), 1)
+        .unwrap();
+    place_draft(&env.lib, id, &bytes, &g);
+    // 操作中で開く：手の中で直さないので、土台を仮の段として出す
+    let opened = open_draft(&env, id, interacting());
+    let s = opened.session.clone();
+    let info = shown_audio(&opened.outcome.view).clone();
+    assert!(info.peaks.pending, "土台は手の前の波形（仮の段）");
+    let g0 = info.peaks.rev.unwrap();
+    assert_eq!(*published(&env, &s, g0), lib_peaks);
+    let mut seen = Generations::default();
+    seen.see(&env, &s, g0);
+    // 手を止めると直し、新しい世代で公開する
+    let out = env.step(&s, Vec::new(), &Viewport::audio_idle());
+    let info = shown_audio(&out.view).clone();
+    assert!(!info.peaks.pending);
+    let g1 = info.peaks.rev.unwrap();
+    assert_ne!(g1, g0, "直した段は別の世代");
+    assert_eq!(
+        *published(&env, &s, g1),
+        peaks_of(&rendered(&bytes, "wav", &g))
+    );
+    seen.see(&env, &s, g1);
+    // 続く手も、そのたびに新しい世代
+    let out = env.step(
+        &s,
+        vec![add(
+            1,
+            "audio.fade",
+            json!({ "fadeIn": 700, "fadeOut": 0, "curve": "linear" }),
+        )],
+        &Viewport::audio_idle(),
+    );
+    let g2 = shown_audio(&out.view).peaks.rev.unwrap();
+    assert!(g2 != g1 && g2 != g0);
+    g.push_linear(
+        "audio.fade",
+        1,
+        json!({ "fadeIn": 700, "fadeOut": 0, "curve": "linear" }),
+        2,
+    )
+    .unwrap();
+    assert_eq!(
+        *published(&env, &s, g2),
+        peaks_of(&rendered(&bytes, "wav", &g))
+    );
+    seen.see(&env, &s, g2);
+    // 取り消しで同じ標本に戻っても、段は新しい世代で出す（同じ番号を使い回さない）
+    let out = env.step(&s, vec![Step::Undo], &Viewport::audio_idle());
+    let g3 = shown_audio(&out.view).peaks.rev.unwrap();
+    assert!(g3 > g2);
+    seen.see(&env, &s, g3);
+}
+
+/// A10：`/edit/{s}/{peaks.rev}/peaks/{bin}/{tile}` の中身はタイルの並び。古い世代・ない段・範囲の外は 404。
 #[test]
 fn peaks_tiles_are_served_by_rev() {
     let env = Env::new();
@@ -327,7 +465,7 @@ fn peaks_tiles_are_served_by_rev() {
     let id = add_audio(&env.lib, &bytes, "wav");
     let opened = env.open(id);
     let s = opened.session.clone();
-    let r0 = shown_audio(&opened.outcome.view).rev;
+    let r0 = shown_audio(&opened.outcome.view).peaks.rev.unwrap();
     let p0 = published(&env, &s, r0);
     for (bin, tile) in [(256, 0), (1_024, 0), (65_536, 0)] {
         assert_eq!(

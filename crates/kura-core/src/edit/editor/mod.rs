@@ -435,7 +435,7 @@ struct Published {
     before: Option<Shown>,
     /// 音声の元（文書の入力の値と、読んだデコーダの識別子。`/edit/{s}/input/pcm` が読む）。
     input: Option<(kura_engine::Value, String)>,
-    /// 公開した今と直前の波形の段（rev と段。`/edit/{s}/{rev}/peaks/…` が読む）。
+    /// 公開した今と直前の波形の段（段の世代と段。`/edit/{s}/{世代}/peaks/…` が読む。同じ世代の中身は変わらない）。
     peaks_now: Option<(u64, Arc<kura_engine::analysis::audio::peaks::Peaks>)>,
     peaks_before: Option<(u64, Arc<kura_engine::analysis::audio::peaks::Peaks>)>,
 }
@@ -610,23 +610,27 @@ impl Editor {
         });
     }
 
-    /// 波形の段を公開する（今のものは直前になる）。
-    fn publish_peaks(&self, rev: u64, peaks: Arc<kura_engine::analysis::audio::peaks::Peaks>) {
+    /// 波形の段を世代 `generation` で公開する（今のものは直前になる。世代は公開のたびに新しい番号）。
+    fn publish_peaks(
+        &self,
+        generation: u64,
+        peaks: Arc<kura_engine::analysis::audio::peaks::Peaks>,
+    ) {
         let mut p = self.lock_published();
         p.peaks_before = p.peaks_now.take();
-        p.peaks_now = Some((rev, peaks));
+        p.peaks_now = Some((generation, peaks));
     }
 
-    /// 公開した今か直前の波形の段のうち、rev が同じもの（配信用。なければ None）。
+    /// 公開した今か直前の波形の段のうち、段の世代（表示の情報の `peaks.rev`）が同じもの（配信用。なければ None）。
     pub fn published_peaks(
         &self,
-        rev: u64,
+        generation: u64,
     ) -> Option<Arc<kura_engine::analysis::audio::peaks::Peaks>> {
         let p = self.lock_published();
         [p.peaks_now.as_ref(), p.peaks_before.as_ref()]
             .into_iter()
             .flatten()
-            .find(|(r, _)| *r == rev)
+            .find(|(g, _)| *g == generation)
             .map(|(_, peaks)| peaks.clone())
     }
 
@@ -1628,7 +1632,7 @@ fn finish_open(
         let base = audio_base(editor, &parts, &info, &plan, &shapes, &inputs);
         audio::AudioState {
             input: info,
-            peaks: audio::peaks::PeaksJob::new(base, rev.0),
+            peaks: audio::peaks::PeaksJob::new(base),
             measure: audio::measure::MeasureJob::default(),
         }
     });
@@ -1678,8 +1682,9 @@ fn finish_open(
     };
     if let (Some(a), Some(input)) = (&st.audio, st.inputs.get(&InputId(0))) {
         editor.lock_published().input = Some((input.value.clone(), a.input.decoder.clone()));
-        if let Some(base) = a.peaks.base() {
-            editor.publish_peaks(rev.0, base);
+        // 土台は最初の世代（下書きから開いて手があれば、直し終えるまでの仮の段）
+        if let Some((generation, base)) = a.peaks.shown() {
+            editor.publish_peaks(generation, base);
         }
     }
     let ticket = editor.latest.issue(editor.cancel.clone());

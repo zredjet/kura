@@ -1,15 +1,18 @@
 //! エディタの波形の段（M13 段 4。docs/editing.md §11.4・§12.8・§12.13）。
 //!
-//! - **持ち方**：組み終えた段（`done`。rev と `Arc<Peaks>`）と、そこから今の出力までに変わりうる区間（`dirty`。今の出力の座標）。
-//!   確定した段だけを rev ごとに公開し（今と直前）、`/edit/{s}/{rev}/peaks/{bin}/{tile}`（immutable）で配る。
+//! - **持ち方**：部分更新の元にできる段（`done`）と、そこから今の出力までに変わりうる区間（`dirty`。今の出力の座標）。
+//! - **公開と世代**：段は公開のたびにセッションの中で増やす**段の世代**の番号を付けて公開し（今と直前）、
+//!   `/edit/{s}/{世代}/peaks/{bin}/{tile}`（immutable）で配る。番号は文書の rev ではなく、同じ番号で違う中身を二度と公開しない
+//!   （取り消しで同じ標本に戻っても新しい世代）。表示の情報の `peaks.rev` がこの番号。
 //! - **土台**（開くとき）：頭が元（版 0）・入力の記録の値のダイジェストが事実の行と同じ・出力に量子化がない、をすべて満たせば、
-//!   ライブラリの解析の段のファイル（`peaks/ab/<hash>.peaks`）をそのまま土台にし、空の文書から今の文書までに変わった区間
-//!   （`Engine::delta`）だけを `dirty` にする（手を当てていなければ空で、開いた瞬間に概観が出る）。ほかは全体を作る。
+//!   ライブラリの解析の段のファイル（`peaks/ab/<hash>.peaks`）を最初の世代として公開し、空の文書から今の文書までに変わった区間
+//!   （`Engine::delta`）を `dirty` にする（手を当てていなければ空で、開いた瞬間に概観が出る）。下書きから開いて `dirty` が
+//!   空でなければ、土台は手の前の波形を出す仮の段（`pending`）で、直し終えたら新しい世代で公開する。ほかは全体を作る。
 //! - **手のあと**：表示の変わった区間を `dirty` に足す（レート・チャンネルが変われば全体。長さの変化は `PeaksPatch` が尾を足す）。
 //! - **直す**（[`Editor::advance_peaks`]。操作中は何もしない）：`PeaksPatch` を作り、R のうち表示の値で有効なチャンクは写さずに
 //!   渡し、残りが [`PEAKS_SYNC_FRAMES`] 以下なら流して直す。それを超える分は、`edit_view { work: true }` のたびに
-//!   [`WORK_SLICE`] まで、見えている区間に重なる窓から流す（裏の仕事。別のスレッドは使わない）。直し終えたら差し替え、それまでは
-//!   前の段を出す（`pending`）。
+//!   [`WORK_SLICE`] まで、見えている区間に重なる窓から流す（裏の仕事。別のスレッドは使わない）。直し終えたら新しい世代で
+//!   公開し、それまでは前の段を出す（`pending`）。
 //! - **予算**：公開した段 2 つと組んでいる段の分を、表示の値と一緒に `CacheLease::extra` で数える。
 
 use std::sync::Arc;
@@ -97,20 +100,36 @@ struct Run {
     patch: PeaksPatch,
 }
 
+/// 段の形（レート・チャンネル数・長さ・段のビン）。変わったらフロントに全体を取り直させる。
+type Form = (u32, u16, u64, Vec<u32>);
+
+fn form_of(p: &Peaks) -> Form {
+    (
+        p.rate,
+        p.channels,
+        p.frames,
+        p.levels.iter().map(|l| l.bin).collect(),
+    )
+}
+
 /// 波形の段の仕事の状態（`AudioState` が持つ）。
 pub(crate) struct PeaksJob {
     params: PeaksParams,
-    /// 最後に組み終えた段（公開済み）。
-    done: Option<(u64, Arc<Peaks>)>,
+    /// 部分更新の元にできる段（`params` の段がすべてそろい、`dirty` の外は今の出力の段と同じ）。
+    done: Option<Arc<Peaks>>,
     /// `done` から今の出力までに変わりうる区間。
     dirty: Dirty,
     /// 今の出力の (rate, channels, frames)。
     shape: Option<(u32, u16, u64)>,
     run: Option<Run>,
-    /// 前に返した段から、公開した段で変わった区間（返したら空にする）。
+    /// 公開した今の段（段の世代と段）。直している途中は古い段・仮の段（土台）のことがある。
+    shown: Option<(u64, Arc<Peaks>)>,
+    /// 次に公開する段の世代（セッションの中で公開のたびに増やす）。
+    next_gen: u64,
+    /// 前に返した世代から、公開した段で変わった区間（返したら空にする）。
     changed_since_reported: Dirty,
     /// 前に返した段の形（変わったら全体を取り直させる）。
-    reported_shape: Option<(u32, u16, u64)>,
+    reported: Option<Form>,
     /// 次の表示の変わりを足さない（開いたときの最初の表示。土台からの差分は開くときに入れた）。
     skip_next: bool,
 }
@@ -118,45 +137,60 @@ pub(crate) struct PeaksJob {
 /// 表示の情報に載せる波形の段の状態。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeaksInfo {
-    /// 公開した今の段の rev（なければ None）。今の文書の rev より古いことがある（そのときは `pending`）。
+    /// 公開した今の段の世代（`/edit/{s}/{rev}/peaks/{bin}/{tile}` の番号。なければ None）。文書の rev とは別の数で、
+    /// セッションの中で公開のたびに増え、同じ番号の段の中身は変わらない。直している途中（`pending`）は、前の文書の段か、
+    /// 開いたときの仮の段（ライブラリの解析の段）のことがある。
     pub rev: Option<u64>,
     /// その段のレート・チャンネル数・長さ。
     pub rate: u32,
     pub channels: u16,
     pub frames: u64,
-    /// 段のビンのフレーム数（細かい順）。
+    /// その段が持つ段のビンのフレーム数（細かい順）。
     pub bins: Vec<u32>,
     /// タイル 1 枚のビンの数。
     pub tile_bins: u32,
-    /// 前に返した段から変わった区間（フレーム。この区間に掛かるタイルを取り直す）。
+    /// 前に返した世代の段から変わった区間（フレーム。この区間に掛かるタイルを取り直す）。
     pub changed: ChangedSpans,
-    /// 直している途中（古い段を出している）。
+    /// 直している途中（古い段・仮の段を出している）。
     pub pending: bool,
 }
 
 impl PeaksJob {
-    /// 土台（ライブラリの段。変わりうる区間つき）から始める。土台がなければ全体を作る。
-    pub(crate) fn new(base: Option<(Arc<Peaks>, Dirty)>, rev: u64) -> Self {
+    /// 土台（ライブラリの段。変わりうる区間つき）から始める（土台は最初の世代として公開する。`dirty` が空でなければ
+    /// 仮の段）。土台がなければ全体を作る。
+    pub(crate) fn new(base: Option<(Arc<Peaks>, Dirty)>) -> Self {
         let params = PeaksParams::default();
-        let (done, dirty) = match base {
-            Some((peaks, dirty)) => (Some((rev, peaks)), dirty),
-            None => (None, Dirty::All),
-        };
-        Self {
+        let mut job = Self {
             params,
-            done,
-            dirty,
+            done: None,
+            dirty: Dirty::All,
             shape: None,
             run: None,
+            shown: None,
+            next_gen: 0,
             changed_since_reported: Dirty::All,
-            reported_shape: None,
+            reported: None,
             skip_next: true,
+        };
+        if let Some((peaks, dirty)) = base {
+            job.done = Some(peaks.clone());
+            job.dirty = dirty;
+            job.publish(peaks);
         }
+        job
     }
 
-    /// 土台（開いたときに組み終えている段）。
-    pub(crate) fn base(&self) -> Option<Arc<Peaks>> {
-        self.done.as_ref().map(|(_, p)| p.clone())
+    /// 段を新しい世代で今の段にし、その世代を返す。
+    fn publish(&mut self, peaks: Arc<Peaks>) -> u64 {
+        let generation = self.next_gen;
+        self.next_gen = self.next_gen.saturating_add(1);
+        self.shown = Some((generation, peaks));
+        generation
+    }
+
+    /// 公開した今の段（世代と段。開いたときの土台を配るのに使う）。
+    pub(crate) fn shown(&self) -> Option<(u64, Arc<Peaks>)> {
+        self.shown.clone()
     }
 
     /// 直している途中か（`dirty` が残る・組んでいる途中）。
@@ -174,7 +208,7 @@ impl PeaksJob {
         let same_kind = self
             .done
             .as_ref()
-            .is_none_or(|(_, p)| p.rate == shape.0 && p.channels == shape.1);
+            .is_none_or(|p| p.rate == shape.0 && p.channels == shape.1);
         if self.skip_next {
             self.skip_next = false;
         } else {
@@ -192,29 +226,29 @@ impl PeaksJob {
     /// 今の状態を返す形にし、返したことにする。
     pub(crate) fn report(&mut self) -> PeaksInfo {
         let pending = self.pending();
-        let bins = self.params.bins();
-        let Some((rev, p)) = &self.done else {
+        let Some((generation, p)) = &self.shown else {
             return PeaksInfo {
                 rev: None,
                 rate: 0,
                 channels: 0,
                 frames: 0,
-                bins,
+                bins: self.params.bins(),
                 tile_bins: TILE_BINS,
                 changed: ChangedSpans::All,
                 pending,
             };
         };
-        let shape = (p.rate, p.channels, p.frames);
-        let changed = if self.reported_shape != Some(shape) {
+        let form = form_of(p);
+        let changed = if self.reported.as_ref() != Some(&form) {
             ChangedSpans::All
         } else {
             self.changed_since_reported.report()
         };
         self.changed_since_reported = Dirty::none();
-        self.reported_shape = Some(shape);
+        let bins = form.3.clone();
+        self.reported = Some(form);
         PeaksInfo {
-            rev: Some(*rev),
+            rev: Some(*generation),
             rate: p.rate,
             channels: p.channels,
             frames: p.frames,
@@ -225,24 +259,27 @@ impl PeaksJob {
         }
     }
 
-    /// 組み終えた段を受ける（公開は呼び手）。
-    fn finish(&mut self, rev: u64, peaks: Arc<Peaks>, target: &kura_engine::value::ChunkSet) {
+    /// 組み終えた段を受けて新しい世代にし、その世代を返す（配る置き場への公開は呼び手）。変わった区間は、前に公開した段と
+    /// 形が同じなら R、違えば全体。
+    fn finish(&mut self, peaks: Arc<Peaks>, target: &kura_engine::value::ChunkSet) -> u64 {
         let frames = peaks.frames;
-        let shape_changed = self.done.as_ref().is_none_or(|(_, p)| {
-            p.rate != peaks.rate || p.channels != peaks.channels || p.frames != peaks.frames
-        });
-        if shape_changed {
-            self.changed_since_reported = Dirty::All;
-        } else {
+        let same_form = self
+            .shown
+            .as_ref()
+            .is_some_and(|(_, p)| form_of(p) == form_of(&peaks));
+        if same_form {
             let mut s = Spans::new();
             for (a, b) in chunk_runs(target, frames) {
                 s.push(a, b);
             }
             self.changed_since_reported.add(&Dirty::Spans(s));
+        } else {
+            self.changed_since_reported = Dirty::All;
         }
-        self.done = Some((rev, peaks));
+        self.done = Some(peaks.clone());
         self.dirty = Dirty::none();
         self.run = None;
+        self.publish(peaks)
     }
 }
 
@@ -286,7 +323,7 @@ impl Editor {
             }
             let (rate, channels, frames) = shape;
             let patch = match (&job.done, &job.dirty) {
-                (Some((_, old)), Dirty::Spans(spans))
+                (Some(old), Dirty::Spans(spans))
                     if old.rate == rate && old.channels == channels =>
                 {
                     PeaksPatch::new(old.clone(), job.params, frames, spans)
@@ -395,8 +432,8 @@ impl Editor {
             Ok(peaks) => {
                 let target = run.patch.target().clone();
                 let peaks = Arc::new(peaks);
-                job.finish(rev, peaks.clone(), &target);
-                self.publish_peaks(rev, peaks);
+                let generation = job.finish(peaks.clone(), &target);
+                self.publish_peaks(generation, peaks);
             }
             Err(err) => {
                 tracing::warn!(%err, "波形の段を組めません");
@@ -450,11 +487,11 @@ pub fn tile_bytes(p: &Peaks, bin: u32, tile: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `/edit/{s}/{rev}/peaks/{bin}/{tile}` の中身（モジュールの説明。公開した段だけ。錠を待たない）。
+/// `/edit/{s}/{世代}/peaks/{bin}/{tile}` の中身（モジュールの説明。公開した今か直前の世代の段だけ。錠を待たない）。
 pub fn serve_peaks(
     engine: &EngineServices,
     session: &str,
-    rev: u64,
+    generation: u64,
     bin: u32,
     tile: u32,
 ) -> Result<Vec<u8>, TileError> {
@@ -462,8 +499,8 @@ pub fn serve_peaks(
         .editor_for(session)
         .ok_or_else(|| TileError::NotFound(format!("エディタ {session}")))?;
     let peaks = editor
-        .published_peaks(rev)
-        .ok_or_else(|| TileError::NotFound(format!("rev {rev} の波形の段")))?;
+        .published_peaks(generation)
+        .ok_or_else(|| TileError::NotFound(format!("世代 {generation} の波形の段")))?;
     if !PEAK_BINS.contains(&bin) {
         return Err(TileError::NotFound(format!("段 {bin}")));
     }
