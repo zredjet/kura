@@ -612,6 +612,117 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
         let twin: &'static str = Box::leak(format!("{name}{REREAD_SUFFIX}").into_boxed_str());
         v.push((twin, format, options, input));
     }
+    // M13 段 1 の検証の直し：チャンク（65,536 フレーム）と書き出しの窓（WAV・AIFF は 16,384、FLAC はブロック 4,096、Vorbis は
+    // 131,072）の境をまたぐ長さ（2C+37）。値を読む口への移し（C4）の前の実装（355ef01）で bless して追記した
+    let long = |channels, seed| InputGen::AudioNoise {
+        rate: 8_000,
+        channels,
+        frames: 2 * 65_536 + 37,
+        seed,
+    };
+    for (name, format, options, input) in [
+        (
+            "wav-pcm8-crosses-chunks",
+            "wav",
+            json!({ "bits": 8 }),
+            long(3, 90),
+        ),
+        (
+            "wav-pcm16-crosses-chunks",
+            "wav",
+            json!({ "bits": 16 }),
+            long(2, 91),
+        ),
+        (
+            "wav-pcm24-crosses-chunks",
+            "wav",
+            json!({ "bits": 24 }),
+            long(3, 92),
+        ),
+        (
+            "wav-pcm32-crosses-chunks",
+            "wav",
+            json!({ "bits": 32 }),
+            long(1, 93),
+        ),
+        (
+            "wav-float-crosses-chunks",
+            "wav",
+            json!({ "float": true }),
+            long(2, 94),
+        ),
+        (
+            "aiff-pcm8-crosses-chunks",
+            "aiff",
+            json!({ "bits": 8 }),
+            long(3, 95),
+        ),
+        (
+            "aiff-pcm16-crosses-chunks",
+            "aiff",
+            json!({ "bits": 16 }),
+            long(2, 96),
+        ),
+        (
+            "aiff-pcm24-crosses-chunks",
+            "aiff",
+            json!({ "bits": 24 }),
+            long(3, 97),
+        ),
+        (
+            "aiff-pcm32-crosses-chunks",
+            "aiff",
+            json!({ "bits": 32 }),
+            long(1, 98),
+        ),
+        (
+            "aiff-float-crosses-chunks",
+            "aiff",
+            json!({ "float": true }),
+            long(2, 99),
+        ),
+        (
+            "flac-pcm16-crosses-chunks",
+            "flac",
+            json!({ "bits": 16 }),
+            long(2, 100),
+        ),
+        (
+            "flac-pcm24-crosses-chunks",
+            "flac",
+            json!({ "bits": 24 }),
+            long(3, 101),
+        ),
+        (
+            "ogg-crosses-chunks-q0",
+            "ogg",
+            json!({ "quality": 0 }),
+            InputGen::AudioNoise {
+                rate: 44_100,
+                channels: 2,
+                frames: 2 * 65_536 + 37,
+                seed: 102,
+            },
+        ),
+    ] {
+        v.push((name, format, options, input));
+    }
+    // ループ点・マーカー・タグを持つもの（メタデータの書き出しと、窓をまたぐ標本の書き出しを一緒に）
+    for (name, format) in [
+        ("wav-meta-crosses-chunks", "wav"),
+        ("aiff-meta-crosses-chunks", "aiff"),
+        ("flac-meta-crosses-chunks", "flac"),
+    ] {
+        v.push((
+            name,
+            format,
+            json!({ "bits": 16 }),
+            InputGen::WithMeta {
+                base: Box::new(long(2, 103)),
+                meta: audio_meta6.clone(),
+            },
+        ));
+    }
     v
 }
 
