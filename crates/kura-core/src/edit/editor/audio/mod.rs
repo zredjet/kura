@@ -13,6 +13,8 @@
 pub mod handles;
 #[cfg(test)]
 mod handles_tests;
+#[cfg(test)]
+mod long_tests;
 pub mod measure;
 pub mod peaks;
 #[cfg(test)]
