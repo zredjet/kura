@@ -14,13 +14,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::audio::FrameSpan;
-use crate::analysis::{Analysis, AnalysisExample, AnalyzeCx, Estimate, NoParams};
+use crate::analysis::{
+    Analysis, AnalysisExample, AnalyzeCx, AnyOutput, AudioStream, Estimate, NoParams,
+};
+use crate::audio::stream::StreamEnd;
 use crate::codec::symph::writable_loop;
 use crate::error::EngineError;
 use crate::op::Numeric;
 use crate::shape::{Shape, ValueKind};
 use crate::testgen::{InputGen, MetaGen};
-use crate::value::{Audio, LoopRange, Value};
+use crate::value::{Audio, AudioMeta, LoopRange, Value};
 
 /// 結果に載せるマーカーの数の上限。
 pub const MAX_MARKERS: usize = 1_024;
@@ -72,18 +75,22 @@ fn clip_name(name: &str) -> String {
 
 /// メタデータを読む。
 pub fn read(a: &Audio) -> LoopReport {
-    let frames = a.frames() as u64;
-    let range = writable_loop(a.meta.loop_range, frames)
+    read_parts(&a.meta, a.frames() as u64, a.rate())
+}
+
+/// メタデータ `meta`・長さ `frames`・レート `rate` から読む（`read` と流れの `finish` が同じ関数を通る。M13 段 2）。
+pub fn read_parts(meta: &AudioMeta, frames: u64, rate: u32) -> LoopReport {
+    let range = writable_loop(meta.loop_range, frames)
         .map(|LoopRange { start, end }| FrameSpan { start, end });
     let mut inside: Vec<&crate::value::Marker> =
-        a.meta.markers.iter().filter(|m| m.pos < frames).collect();
+        meta.markers.iter().filter(|m| m.pos < frames).collect();
     inside.sort_by_key(|m| m.pos);
     let marker_count = inside.len() as u64;
     LoopReport {
         frames,
-        rate: a.rate(),
+        rate,
         range,
-        dropped_loop: a.meta.loop_range.is_some() && range.is_none(),
+        dropped_loop: meta.loop_range.is_some() && range.is_none(),
         markers: inside
             .iter()
             .take(MAX_MARKERS)
@@ -93,7 +100,62 @@ pub fn read(a: &Audio) -> LoopReport {
             })
             .collect(),
         marker_count,
-        dropped_markers: a.meta.markers.len() as u64 - marker_count,
+        dropped_markers: meta.markers.len() as u64 - marker_count,
+    }
+}
+
+/// ループ点とマーカーの流れ（M13 段 2）：標本は数えるだけで、`finish` で終わりのメタデータと長さから読む（`read` と同じ）。
+struct LoopStream {
+    rate: u32,
+    channels: usize,
+    max: u64,
+    exact: bool,
+    pos: u64,
+}
+
+impl AudioStream for LoopStream {
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<(), EngineError> {
+        cx.check()?;
+        let n = planes.first().map_or(0, |p| p.len());
+        if start != self.pos
+            || planes.len() != self.channels
+            || planes.iter().any(|p| p.len() != n)
+            || self.pos.checked_add(n as u64).is_none_or(|e| e > self.max)
+        {
+            return Err(EngineError::Internal(format!(
+                "ループ点の窓が順でないか形が違います（{start} から {n} フレーム。次は {}・長さ {}）",
+                self.pos, self.max
+            )));
+        }
+        self.pos += n as u64;
+        Ok(())
+    }
+
+    fn finish(
+        self: Box<Self>,
+        end: &StreamEnd,
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<AnyOutput, EngineError> {
+        cx.check()?;
+        let fits = if self.exact {
+            end.frames == self.max
+        } else {
+            end.frames <= self.max
+        };
+        if self.pos != end.frames || !fits {
+            return Err(EngineError::Internal(format!(
+                "ループ点の窓が全体を覆っていません（{} / {} フレーム・形 {}）",
+                self.pos, end.frames, self.max
+            )));
+        }
+        Ok(std::sync::Arc::new(read_parts(
+            &end.meta, end.frames, self.rate,
+        )))
     }
 }
 
@@ -110,6 +172,25 @@ impl Analysis for LoopAnalysis {
     const NUMERIC: Numeric = Numeric::Exact;
     type Params = NoParams;
     type Output = LoopReport;
+
+    /// 流れ（M13 段 2）：標本は数えるだけ（長さの決まった形も上限の形も）。
+    fn stream(_p: &NoParams, input: &Shape) -> Option<Box<dyn AudioStream>> {
+        let Shape::Audio {
+            rate,
+            channels,
+            frames,
+        } = *input
+        else {
+            return None;
+        };
+        Some(Box::new(LoopStream {
+            rate,
+            channels: usize::from(channels),
+            max: frames.max(),
+            exact: matches!(frames, crate::shape::Dim::Exact(_)),
+            pos: 0,
+        }))
+    }
 
     fn run(_p: &NoParams, v: &Value, cx: &AnalyzeCx<'_>) -> Result<LoopReport, EngineError> {
         cx.check()?;

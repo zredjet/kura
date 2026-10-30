@@ -42,8 +42,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::analysis::output::AnalysisOutput;
-use crate::analysis::{Analysis, AnalysisExample, AnalyzeCx, Encoding, Estimate};
-use crate::audio::stream::{AudioSink, StreamInfo};
+use crate::analysis::{
+    Analysis, AnalysisExample, AnalyzeCx, AnyOutput, AudioStream, Encoding, Estimate,
+};
+use crate::audio::stream::{AudioSink, StreamEnd, StreamInfo};
 use crate::codec::pcm;
 use crate::error::EngineError;
 use crate::monitor::Monitor;
@@ -172,6 +174,28 @@ pub struct Peaks {
 }
 
 impl Peaks {
+    /// 最も細かい段のビンを `finest` にした段（M13 段 2）：それより細かい段を落とす。上の段は下の段の min・max から作り、
+    /// 半端なビンも ⌈⌈n/a⌉/b⌉ = ⌈n/(ab)⌉ で同じなので、標本から `compute(finest)` したものと同じ（`coarsen_equals_compute`）。
+    /// `finest` の段がなければ `Internal`。長さが上限しか分からない音声を最も細かい段で流して解き、実際の長さの引数に合わせる。
+    pub fn coarsen(&self, finest: u32) -> Result<Peaks, EngineError> {
+        if !self.levels.iter().any(|l| l.bin == finest) {
+            return Err(EngineError::Internal(format!(
+                "波形の段に {finest} フレームのビンの段がありません"
+            )));
+        }
+        Ok(Peaks {
+            rate: self.rate,
+            channels: self.channels,
+            frames: self.frames,
+            levels: self
+                .levels
+                .iter()
+                .filter(|l| l.bin >= finest)
+                .cloned()
+                .collect(),
+        })
+    }
+
     /// 段 `level` のビン `bin` のチャンネル `ch` の (min, max)。
     pub fn get(&self, level: usize, bin: u64, ch: u16) -> Option<(i16, i16)> {
         let l = self.levels.get(level)?;
@@ -964,6 +988,160 @@ impl AudioSink for PeaksPatchSink<'_> {
     }
 }
 
+/// 波形の段の流れ（M13 段 2。`Analysis::stream`）：チャンク（`JOB_FRAMES`）に揃ったところまでを `chunk_finest` で最も細かい段に
+/// 足し（揃ったチャンクは `par_blocks` でチャンクごと）、半端な残り（C 未満）だけを作業列に持つ。`finish` で最後の半端な
+/// チャンクを足し、上の段を `compute` と同じ `upper_level` で組む。結果は `compute` と同じ（整数だけ）。
+struct PeaksStream {
+    params: PeaksParams,
+    rate: u32,
+    channels: u16,
+    /// 長さの上限（長さの決まった形はその長さ）。
+    max: u64,
+    exact: bool,
+    level0: Vec<i16>,
+    /// 半端なチャンクの残り（チャンネルごと。C 未満）。
+    pending: Vec<Vec<f32>>,
+    pos: u64,
+}
+
+impl PeaksStream {
+    fn finest(&self) -> usize {
+        self.params.bins().first().copied().unwrap_or(PEAK_BINS[0]) as usize
+    }
+
+    /// 揃ったチャンクの列（チャンネルごとの同じ長さの区間。長さは C の倍数か、最後だけ短い）を最も細かい段に足す。
+    fn push_chunks(&mut self, planes: &[&[f32]], cx: &AnalyzeCx<'_>) -> Result<(), EngineError> {
+        let n = planes.first().map_or(0, |p| p.len());
+        let b0 = self.finest();
+        let jobs = n.div_ceil(JOB_FRAMES);
+        let parts = cx.par_blocks(jobs, |j| {
+            let (s, e) = (j * JOB_FRAMES, ((j + 1) * JOB_FRAMES).min(n));
+            let data: Vec<&[f32]> = planes.iter().map(|p| &p[s..e]).collect();
+            chunk_finest(&data, b0)
+        })?;
+        for part in &parts {
+            self.level0
+                .try_reserve(part.len())
+                .map_err(|_| EngineError::Limit("波形の作業領域を確保できません".into()))?;
+            self.level0.extend_from_slice(part);
+        }
+        Ok(())
+    }
+}
+
+impl AudioStream for PeaksStream {
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<(), EngineError> {
+        cx.check()?;
+        let n = planes.first().map_or(0, |p| p.len());
+        if start != self.pos
+            || planes.len() != usize::from(self.channels)
+            || planes.iter().any(|p| p.len() != n)
+            || self.pos.checked_add(n as u64).is_none_or(|e| e > self.max)
+        {
+            return Err(EngineError::Internal(format!(
+                "波形の窓が順でないか形が違います（{start} から {n} フレーム。次は {}・長さ {}）",
+                self.pos, self.max
+            )));
+        }
+        self.pos += n as u64;
+        let mut at = 0usize;
+        // 半端なチャンクの残りを埋める
+        let have = self.pending.first().map_or(0, Vec::len);
+        if have > 0 {
+            let take = (JOB_FRAMES - have).min(n);
+            for (p, x) in self.pending.iter_mut().zip(planes) {
+                p.extend_from_slice(&x[..take]);
+            }
+            at = take;
+            if have + take == JOB_FRAMES {
+                let full = std::mem::take(&mut self.pending);
+                let views: Vec<&[f32]> = full.iter().map(Vec::as_slice).collect();
+                self.push_chunks(&views, cx)?;
+                self.pending = full
+                    .into_iter()
+                    .map(|mut v| {
+                        v.clear();
+                        v
+                    })
+                    .collect();
+            }
+        }
+        // 揃ったチャンクはそのまま
+        let whole = (n - at) / JOB_FRAMES * JOB_FRAMES;
+        if whole > 0 {
+            let views: Vec<&[f32]> = planes.iter().map(|p| &p[at..at + whole]).collect();
+            self.push_chunks(&views, cx)?;
+            at += whole;
+        }
+        // 残り（C 未満）を持つ
+        if at < n {
+            for (p, x) in self.pending.iter_mut().zip(planes) {
+                if p.capacity() == 0 {
+                    p.try_reserve_exact(JOB_FRAMES)
+                        .map_err(|_| EngineError::Limit("波形の作業領域を確保できません".into()))?;
+                }
+                p.extend_from_slice(&x[at..]);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self: Box<Self>,
+        end: &StreamEnd,
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<AnyOutput, EngineError> {
+        cx.check()?;
+        let mut me = *self;
+        let fits = if me.exact {
+            end.frames == me.max
+        } else {
+            end.frames <= me.max
+        };
+        if me.pos != end.frames || !fits {
+            return Err(EngineError::Internal(format!(
+                "波形の窓が全体を覆っていません（{} / {} フレーム・形 {}）",
+                me.pos, end.frames, me.max
+            )));
+        }
+        if me.pending.first().is_some_and(|p| !p.is_empty()) {
+            let rest = std::mem::take(&mut me.pending);
+            let views: Vec<&[f32]> = rest.iter().map(Vec::as_slice).collect();
+            me.push_chunks(&views, cx)?;
+        }
+        let bins = me.params.bins();
+        let Some(&finest) = bins.first() else {
+            return Err(EngineError::Internal("波形の段がありません".into()));
+        };
+        let c = usize::from(me.channels);
+        let n0 = usize::try_from(bins_of(end.frames, finest))
+            .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+        if me.level0.len() != n0 * c * 2 {
+            return Err(EngineError::Internal("波形のビンが足りません".into()));
+        }
+        let mut levels = vec![PeakLevel {
+            bin: finest,
+            data: me.level0,
+        }];
+        for &bin in bins.iter().skip(1) {
+            let Some(prev) = levels.last() else { break };
+            let next = upper_level(prev, bin, end.frames, c, None, cx.mon)?;
+            levels.push(next);
+        }
+        Ok(std::sync::Arc::new(Peaks {
+            rate: me.rate,
+            channels: me.channels,
+            frames: end.frames,
+            levels,
+        }))
+    }
+}
+
 /// 波形の段。
 pub struct PeaksAnalysis;
 
@@ -974,6 +1152,38 @@ impl Analysis for PeaksAnalysis {
     const NUMERIC: Numeric = Numeric::Exact;
     type Params = PeaksParams;
     type Output = Peaks;
+
+    /// 流れ（M13 段 2）：長さの決まった形も、上限しか分からない形も流して解ける（`compute` と同じ）。
+    fn stream(p: &PeaksParams, input: &Shape) -> Option<Box<dyn AudioStream>> {
+        let Shape::Audio {
+            rate,
+            channels,
+            frames,
+        } = *input
+        else {
+            return None;
+        };
+        let c = usize::from(channels);
+        if c == 0 {
+            return None;
+        }
+        let b0 = u64::from(p.bins().first().copied().unwrap_or(PEAK_BINS[0]));
+        let n0 = usize::try_from(frames.max().div_ceil(b0)).ok()?;
+        let mut level0 = Vec::new();
+        level0
+            .try_reserve_exact(n0.checked_mul(c)?.checked_mul(2)?)
+            .ok()?;
+        Some(Box::new(PeaksStream {
+            params: *p,
+            rate,
+            channels,
+            max: frames.max(),
+            exact: matches!(frames, crate::shape::Dim::Exact(_)),
+            level0,
+            pending: vec![Vec::new(); c],
+            pos: 0,
+        }))
+    }
 
     fn run(p: &PeaksParams, v: &Value, cx: &AnalyzeCx<'_>) -> Result<Peaks, EngineError> {
         cx.check()?;
@@ -1188,6 +1398,51 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    /// M13 段 2：最も細かい段で作って細かい段を落とした段は、標本から `compute(finest)` したものと同じ（半端なビン・
+    /// NaN・±∞・長さ 0・どの段の組でも）。ない段で落とすと `Internal`。
+    #[test]
+    fn coarsen_equals_compute() {
+        for (frames, channels, seed) in [
+            (0usize, 1usize, 11u64),
+            (1, 2, 12),
+            (70_001, 2, 13),
+            (2 * JOB_FRAMES + 37, 3, 14),
+            (65_536 * 3, 1, 15),
+        ] {
+            let a = noisy(frames, channels, seed);
+            let all = cx_run(&a, &PeaksParams::default());
+            for (i, &finest) in PEAK_BINS.iter().enumerate() {
+                for &coarsest in &PEAK_BINS[i..] {
+                    let p = PeaksParams { finest, coarsest };
+                    let base = cx_run(
+                        &a,
+                        &PeaksParams {
+                            finest: PEAK_BINS[0],
+                            coarsest,
+                        },
+                    );
+                    assert_eq!(
+                        base.coarsen(finest).unwrap(),
+                        cx_run(&a, &p),
+                        "{frames}・{p:?}"
+                    );
+                }
+            }
+            assert!(matches!(
+                cx_run(
+                    &a,
+                    &PeaksParams {
+                        finest: 4_096,
+                        coarsest: 65_536
+                    }
+                )
+                .coarsen(256),
+                Err(EngineError::Internal(_))
+            ));
+            assert_eq!(all.coarsen(256).unwrap(), all);
+        }
     }
 
     /// 下の段から作った段 = 標本から直接求めた段（すべての段・半端なビン・端の長さ・NaN・±∞・±1・格子の境）。

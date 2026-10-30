@@ -694,3 +694,254 @@ fn patcher_equals_compute() {
         );
     }
 }
+
+/// 音声を受ける今の版の解析（内部用を含む）。
+fn audio_analyses(engine: &Engine) -> Vec<std::sync::Arc<dyn kura_engine::analysis::DynAnalysis>> {
+    let reg = engine.analyses();
+    let ids = [
+        "audio.peaks",
+        "audio.loudness",
+        "audio.silence",
+        "audio.loop",
+        "audio.loudness_gating",
+    ];
+    let all: Vec<_> = ids
+        .iter()
+        .map(|id| reg.resolve(id, None).unwrap())
+        .collect();
+    // 登録表の音声の解析はこれで全部（足したら E35 にも足す）
+    let catalog: Vec<&str> = engine
+        .analysis_catalog()
+        .iter()
+        .filter(|d| d.accepts.contains(&kura_engine::ValueKind::Audio))
+        .map(|d| d.id)
+        .collect();
+    for id in &catalog {
+        assert!(ids.contains(id), "{id} を E35 に足す");
+    }
+    all
+}
+
+/// E35（M13 段 2）：表示の 4 つと `loudness_gating` のすべての例（チャンクの境をまたぐ・NaN・空・低いレートを含む）で、
+/// 長さの決まった形と長さの上限の形（`AtMost(frames + k)`）について、窓を 1・7・4,096・C・全体・ChaCha8 の乱数で切って流した
+/// `finish` の正規の形が `run` と同じ。
+#[test]
+fn e35_streamed_analyses_equal_run() {
+    let engine = engine();
+    let limits = Limits::default();
+    let cx = AnalyzeCx {
+        mon: &NoMonitor,
+        limits: &limits,
+    };
+    let mut r = determinism::rng(35);
+    let mut checked = 0;
+    for a in audio_analyses(&engine) {
+        for ex in a.examples().unwrap() {
+            let v = ex.input.generate().unwrap();
+            let Value::Audio(au) = &v else { panic!() };
+            let want = a
+                .encode_any(&a.run_any(&ex.params, &v, &cx).unwrap())
+                .unwrap();
+            let n = au.frames();
+            let planes = au.read_planes(0, n).unwrap();
+            let end = kura_engine::audio::stream::StreamEnd {
+                frames: n as u64,
+                meta: au.meta.clone(),
+            };
+            let shapes = [
+                v.shape(),
+                kura_engine::shape::Shape::Audio {
+                    rate: au.rate(),
+                    channels: au.channels() as u16,
+                    frames: kura_engine::shape::Dim::AtMost(n as u64 + 1 + r.next_u64() % 70_000),
+                },
+            ];
+            for shape in shapes {
+                for step in [1usize, 7, 4_096, AUDIO_CHUNK, usize::MAX, 0] {
+                    // 細かい窓は短い音声だけ（窓ごとに並列の仕事を立てるので、デバッグのビルドで重い）
+                    if (step == 1 && n > 3_000) || (step == 7 && n > 30_000) {
+                        continue;
+                    }
+                    let mut st = a.stream_any(&ex.params, &shape).unwrap().unwrap();
+                    let mut at = 0;
+                    while at < n {
+                        let len = match step {
+                            0 => 1 + (r.next_u64() % 50_000) as usize,
+                            s => s,
+                        };
+                        let e = at.saturating_add(len).min(n);
+                        let views: Vec<&[f32]> = planes.iter().map(|p| &p[at..e]).collect();
+                        st.feed(at as u64, &views, &cx).unwrap();
+                        at = e;
+                    }
+                    let got = a.encode_any(&st.finish(&end, &cx).unwrap()).unwrap();
+                    assert!(got == want, "{}・{}・窓 {step}・{shape:?}", a.id(), ex.name);
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 150, "{checked}");
+}
+
+/// E35：どの音声の解析も、長さの決まった形と上限の形の両方で流れを返す。
+#[test]
+fn audio_analyses_all_stream() {
+    let engine = engine();
+    for a in audio_analyses(&engine) {
+        for ex in a.examples().unwrap() {
+            let shape = ex.input.generate().unwrap().shape();
+            let kura_engine::shape::Shape::Audio {
+                rate,
+                channels,
+                frames,
+            } = shape
+            else {
+                panic!()
+            };
+            for f in [frames, kura_engine::shape::Dim::AtMost(frames.max() + 10)] {
+                let s = kura_engine::shape::Shape::Audio {
+                    rate,
+                    channels,
+                    frames: f,
+                };
+                assert!(
+                    a.stream_any(&ex.params, &s).unwrap().is_some(),
+                    "{}・{}・{f:?}",
+                    a.id(),
+                    ex.name
+                );
+            }
+        }
+    }
+}
+
+/// E35：解析の扇（`Engine::analyze_stream`）に値を流した結果は、値に `analyze_many` したものと同じ（要求の順・引数の正規の形・
+/// 1 つの失敗はほかに効かない）。上限の形で受けて終わりの長さを渡しても同じ。
+#[test]
+fn fan_over_values_equals_analyze_many() {
+    use kura_engine::AnalysisRequest;
+    let engine = engine();
+    let reqs = vec![
+        AnalysisRequest {
+            id: "audio.loudness".into(),
+            v: None,
+            params: json!({}),
+        },
+        AnalysisRequest {
+            id: "audio.loop".into(),
+            v: Some(1),
+            params: json!({}),
+        },
+        AnalysisRequest {
+            id: "audio.silence".into(),
+            v: None,
+            params: json!({ "thresholdDb": -50 }),
+        },
+        AnalysisRequest {
+            id: "audio.peaks".into(),
+            v: None,
+            params: json!({ "finest": 1024 }),
+        },
+        // 断る要求（知らない ID・引数の範囲の外・画像の解析）
+        AnalysisRequest {
+            id: "audio.nothing".into(),
+            v: None,
+            params: json!({}),
+        },
+        AnalysisRequest {
+            id: "audio.silence".into(),
+            v: None,
+            params: json!({ "thresholdDb": 5 }),
+        },
+        AnalysisRequest {
+            id: "image.alpha".into(),
+            v: None,
+            params: json!({}),
+        },
+    ];
+    for (i, make) in [
+        InputGen::AudioNoise {
+            rate: 44_100,
+            channels: 2,
+            frames: 2 * C + 37,
+            seed: 7,
+        },
+        InputGen::Sine {
+            rate: 22_050,
+            channels: 1,
+            frames: 1_000,
+            freq: 440,
+            loop_range: Some(kura_engine::value::LoopRange {
+                start: 100,
+                end: 900,
+            }),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let v = make.generate().unwrap();
+        let Value::Audio(au) = &v else { panic!() };
+        let want = engine.analyze_many(&v, &reqs, &NoMonitor);
+        for bounded in [false, true] {
+            let shape = if bounded {
+                kura_engine::shape::Shape::Audio {
+                    rate: au.rate(),
+                    channels: au.channels() as u16,
+                    frames: kura_engine::shape::Dim::AtMost(au.frames() as u64 + 500),
+                }
+            } else {
+                v.shape()
+            };
+            let mut fan = engine.analyze_stream(&reqs, &shape);
+            let mut sink = FanSink(&mut fan);
+            kura_engine::audio::stream::stream_value(au, None, &mut sink, &NoMonitor).unwrap();
+            fan.set_end(&kura_engine::audio::stream::StreamEnd {
+                frames: au.frames() as u64,
+                meta: au.meta.clone(),
+            });
+            let got = fan.finish(&NoMonitor);
+            assert_eq!(got.len(), want.len());
+            for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                match (g, w) {
+                    (Ok(g), Ok(w)) => {
+                        assert_eq!(g.output, w.output, "{i}・{k}・{bounded}");
+                        assert_eq!(g.params, w.params, "{i}・{k}");
+                        assert_eq!((g.id, g.version), (w.id, w.version));
+                    }
+                    (Err(g), Err(w)) => {
+                        assert_eq!(
+                            std::mem::discriminant(g),
+                            std::mem::discriminant(w),
+                            "{i}・{k}：{g} と {w}"
+                        );
+                    }
+                    _ => panic!("{i}・{k}・{bounded}：{g:?} と {w:?}"),
+                }
+            }
+        }
+    }
+}
+
+/// 値の流れを扇に渡す包み。
+struct FanSink<'a>(&'a mut kura_engine::analysis::stream::AnalysisFan);
+
+impl AudioSink for FanSink<'_> {
+    fn begin(&mut self, _info: &StreamInfo) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.0.feed(start, planes, mon)
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}

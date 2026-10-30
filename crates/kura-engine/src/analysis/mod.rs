@@ -25,6 +25,7 @@ pub mod audio;
 pub mod image;
 pub mod loudness;
 pub mod output;
+pub mod stream;
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};

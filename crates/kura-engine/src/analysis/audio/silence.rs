@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::analysis::audio::FrameSpan;
-use crate::analysis::{Analysis, AnalysisExample, AnalyzeCx, Estimate};
+use crate::analysis::{Analysis, AnalysisExample, AnalyzeCx, AnyOutput, AudioStream, Estimate};
+use crate::audio::stream::StreamEnd;
 use crate::error::EngineError;
 use crate::math;
 use crate::op::{Numeric, OpParams, ParamKind, ParamSchema, Unit, spec};
@@ -85,18 +86,24 @@ pub struct SilenceReport {
 }
 crate::json_output!(SilenceReport);
 
-/// 1 チャンネルの走査の結果。
+/// 1 チャンネルの走査の状態（M13 段 2：全体の `run` と流れの `feed` が同じ [`ChannelState::scan`] を通る）。クリップの列は
+/// 区間（チャンク・窓）の境をまたいで運ぶ。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ChannelScan {
-    first: Option<usize>,
-    last: Option<usize>,
+struct ChannelState {
+    first: Option<u64>,
+    last: Option<u64>,
     clip_runs: u64,
     overs: u64,
     non_finite: u64,
+    /// 続いている端の列の長さと、その端（1・−1・0）。
+    run: u64,
+    side: i8,
+    /// 走査した標本の数（次の標本の位置）。
+    i: u64,
 }
 
 /// 中止を確かめる間隔（標本）。
-const CHECK_EVERY: usize = 1 << 16;
+const CHECK_EVERY: u64 = 1 << 16;
 
 /// 16 ビットの格子の正の端に写る最小より小さい値：`pcm::quantize(x, 16) == 32_767` ⇔ x > 32,766.5 / 32,768
 /// （x·32,768 は f64 で正確で、32,766.5 ちょうどは偶数の 32,766 に丸まる）。65,533 / 65,536 は f32 で正確に表せる。
@@ -116,49 +123,83 @@ fn rail(x: f32) -> i8 {
     }
 }
 
+impl ChannelState {
+    /// 続きの標本 `x` を数える（閾値 `t`。位置 `CHECK_EVERY` ごとに中止を確かめる）。
+    fn scan(&mut self, x: &[f32], t: f64, cx: &AnalyzeCx<'_>) -> Result<(), EngineError> {
+        for v in x {
+            if self.i.is_multiple_of(CHECK_EVERY) {
+                cx.check()?;
+            }
+            let v = *v;
+            if f64::from(v).abs() > t {
+                self.first.get_or_insert(self.i);
+                self.last = Some(self.i);
+            }
+            if !v.is_finite() {
+                self.non_finite += 1;
+            } else if v.abs() > 1.0 {
+                self.overs += 1;
+            }
+            let r = rail(v);
+            if r != 0 && r == self.side {
+                self.run += 1;
+            } else {
+                if self.run >= CLIP_RUN {
+                    self.clip_runs += 1;
+                }
+                self.run = u64::from(r != 0);
+                self.side = r;
+            }
+            self.i += 1;
+        }
+        Ok(())
+    }
+
+    /// 走査を閉じる（最後の端の列を数える）。
+    fn close(mut self) -> Self {
+        if self.run >= CLIP_RUN {
+            self.clip_runs += 1;
+        }
+        self.run = 0;
+        self
+    }
+}
+
 /// 1 チャンネルを、チャンクを番号の順にたどって数える（クリップの列はチャンクの境をまたいで運ぶ）。
 fn scan_channel(
     a: &Audio,
     ch: usize,
     t: f64,
     cx: &AnalyzeCx<'_>,
-) -> Result<ChannelScan, EngineError> {
-    let mut s = ChannelScan::default();
-    let (mut run, mut side) = (0u64, 0i8);
-    let mut i = 0usize;
+) -> Result<ChannelState, EngineError> {
+    let mut s = ChannelState::default();
     for k in 0..a.chunk_count() {
         let x = a.chunk_data(ch, k)?;
-        for v in x.iter() {
-            if i.is_multiple_of(CHECK_EVERY) {
-                cx.check()?;
-            }
-            let v = *v;
-            if f64::from(v).abs() > t {
-                s.first.get_or_insert(i);
-                s.last = Some(i);
-            }
-            if !v.is_finite() {
-                s.non_finite += 1;
-            } else if v.abs() > 1.0 {
-                s.overs += 1;
-            }
-            let r = rail(v);
-            if r != 0 && r == side {
-                run += 1;
-            } else {
-                if run >= CLIP_RUN {
-                    s.clip_runs += 1;
-                }
-                run = u64::from(r != 0);
-                side = r;
-            }
-            i += 1;
-        }
+        s.scan(&x, t, cx)?;
     }
-    if run >= CLIP_RUN {
-        s.clip_runs += 1;
+    Ok(s.close())
+}
+
+/// チャンネルごとの走査を閉じたものから報告を組む（長さ `frames`）。
+fn report(scans: &[ChannelState], frames: u64) -> SilenceReport {
+    let first = scans.iter().filter_map(|s| s.first).min();
+    let last = scans.iter().filter_map(|s| s.last).max();
+    let content = match (first, last) {
+        (Some(f), Some(l)) => Some(FrameSpan {
+            start: f,
+            end: l + 1,
+        }),
+        _ => None,
+    };
+    SilenceReport {
+        frames,
+        content,
+        lead: content.map_or(frames, |c| c.start),
+        trail: content.map_or(frames, |c| frames - c.end),
+        clip_runs: scans.iter().map(|s| s.clip_runs).sum(),
+        overs: scans.iter().map(|s| s.overs).sum(),
+        non_finite: scans.iter().map(|s| s.non_finite).sum(),
     }
-    Ok(s)
 }
 
 /// 前後の無音とクリップを数える。
@@ -169,25 +210,70 @@ pub fn scan(
 ) -> Result<SilenceReport, EngineError> {
     let t = math::db_to_gain(p.threshold_db);
     let scans = cx.par_blocks(a.channels(), |ch| scan_channel(a, ch, t, cx))?;
-    let frames = a.frames() as u64;
-    let first = scans.iter().filter_map(|s| s.first).min();
-    let last = scans.iter().filter_map(|s| s.last).max();
-    let content = match (first, last) {
-        (Some(f), Some(l)) => Some(FrameSpan {
-            start: f as u64,
-            end: l as u64 + 1,
-        }),
-        _ => None,
-    };
-    Ok(SilenceReport {
-        frames,
-        content,
-        lead: content.map_or(frames, |c| c.start),
-        trail: content.map_or(frames, |c| frames - c.end),
-        clip_runs: scans.iter().map(|s| s.clip_runs).sum(),
-        overs: scans.iter().map(|s| s.overs).sum(),
-        non_finite: scans.iter().map(|s| s.non_finite).sum(),
-    })
+    Ok(report(&scans, a.frames() as u64))
+}
+
+/// 前後の無音とクリップの流れ（M13 段 2。`Analysis::stream`）：窓ごとに、チャンネルごとの状態を `par_blocks` で進める。
+/// `finish` で列を閉じ、終わりの長さで報告を組む（`scan` と同じ）。
+struct SilenceStream {
+    t: f64,
+    states: Vec<ChannelState>,
+    /// 長さの上限（長さの決まった形はその長さ）。
+    max: u64,
+    exact: bool,
+    pos: u64,
+}
+
+impl AudioStream for SilenceStream {
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<(), EngineError> {
+        cx.check()?;
+        let n = planes.first().map_or(0, |p| p.len());
+        if start != self.pos
+            || planes.len() != self.states.len()
+            || planes.iter().any(|p| p.len() != n)
+            || self.pos.checked_add(n as u64).is_none_or(|e| e > self.max)
+        {
+            return Err(EngineError::Internal(format!(
+                "無音の窓が順でないか形が違います（{start} から {n} フレーム。次は {}・長さ {}）",
+                self.pos, self.max
+            )));
+        }
+        let (t, states) = (self.t, &self.states);
+        let next = cx.par_blocks(states.len(), |ch| {
+            let mut s = states[ch];
+            s.scan(planes[ch], t, cx)?;
+            Ok(s)
+        })?;
+        self.states = next;
+        self.pos += n as u64;
+        Ok(())
+    }
+
+    fn finish(
+        self: Box<Self>,
+        end: &StreamEnd,
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<AnyOutput, EngineError> {
+        cx.check()?;
+        let fits = if self.exact {
+            end.frames == self.max
+        } else {
+            end.frames <= self.max
+        };
+        if self.pos != end.frames || !fits {
+            return Err(EngineError::Internal(format!(
+                "無音の窓が全体を覆っていません（{} / {} フレーム・形 {}）",
+                self.pos, end.frames, self.max
+            )));
+        }
+        let scans: Vec<ChannelState> = self.states.into_iter().map(ChannelState::close).collect();
+        Ok(std::sync::Arc::new(report(&scans, end.frames)))
+    }
 }
 
 /// 前後の無音とクリップ。
@@ -200,6 +286,23 @@ impl Analysis for SilenceAnalysis {
     const NUMERIC: Numeric = Numeric::Float;
     type Params = SilenceParams;
     type Output = SilenceReport;
+
+    /// 流れ（M13 段 2）：長さによらない状態で流して解ける（`scan` と同じ）。
+    fn stream(p: &SilenceParams, input: &Shape) -> Option<Box<dyn AudioStream>> {
+        let Shape::Audio {
+            channels, frames, ..
+        } = *input
+        else {
+            return None;
+        };
+        Some(Box::new(SilenceStream {
+            t: math::db_to_gain(p.threshold_db),
+            states: vec![ChannelState::default(); usize::from(channels)],
+            max: frames.max(),
+            exact: matches!(frames, crate::shape::Dim::Exact(_)),
+            pos: 0,
+        }))
+    }
 
     fn run(p: &SilenceParams, v: &Value, cx: &AnalyzeCx<'_>) -> Result<SilenceReport, EngineError> {
         cx.check()?;

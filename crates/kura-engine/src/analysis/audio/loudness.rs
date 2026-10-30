@@ -20,9 +20,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::loudness::{
-    Detailed, analyze_detailed, loudness_range, max_power, power_to_lufs,
+    Detailed, LoudnessScan, analyze_detailed, loudness_range, max_power, power_to_lufs,
 };
-use crate::analysis::{Analysis, AnalysisExample, AnalyzeCx, Estimate, NoParams, Reasoned};
+use crate::analysis::{
+    Analysis, AnalysisExample, AnalyzeCx, AnyOutput, AudioStream, Estimate, NoParams, Reasoned,
+};
+use crate::audio::stream::StreamEnd;
 use crate::error::EngineError;
 use crate::op::Numeric;
 use crate::shape::{Shape, ValueKind};
@@ -142,6 +145,32 @@ impl LoudnessReport {
     }
 }
 
+/// ラウドネスの流れ（M13 段 2）：窓の核（`LoudnessScan`）で受け、`finish` で `finish_detailed_at`（終わりの長さ）から報告を
+/// 組む（`run` と同じ）。
+struct LoudnessStream(LoudnessScan);
+
+impl AudioStream for LoudnessStream {
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<(), EngineError> {
+        cx.check()?;
+        self.0.feed(start, planes, cx.mon)
+    }
+
+    fn finish(
+        self: Box<Self>,
+        end: &StreamEnd,
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<AnyOutput, EngineError> {
+        cx.check()?;
+        let d = self.0.finish_detailed_at(end.frames)?;
+        Ok(std::sync::Arc::new(LoudnessReport::from_detailed(&d)?))
+    }
+}
+
 /// ラウドネス。
 pub struct LoudnessAnalysis;
 
@@ -152,6 +181,24 @@ impl Analysis for LoudnessAnalysis {
     const NUMERIC: Numeric = Numeric::Float;
     type Params = NoParams;
     type Output = LoudnessReport;
+
+    /// 流れ（M13 段 2）：長さの決まった形は `LoudnessScan::new`、上限の形は `open` で受ける（`run` と同じ）。
+    fn stream(_p: &NoParams, input: &Shape) -> Option<Box<dyn AudioStream>> {
+        let Shape::Audio {
+            rate,
+            channels,
+            frames,
+        } = *input
+        else {
+            return None;
+        };
+        let scan = match frames {
+            crate::shape::Dim::Exact(n) => LoudnessScan::new(rate, usize::from(channels), n),
+            crate::shape::Dim::AtMost(n) => LoudnessScan::open(rate, usize::from(channels), n),
+        };
+        scan.ok()
+            .map(|s| Box::new(LoudnessStream(s)) as Box<dyn AudioStream>)
+    }
 
     fn run(_p: &NoParams, v: &Value, cx: &AnalyzeCx<'_>) -> Result<LoudnessReport, EngineError> {
         cx.check()?;
