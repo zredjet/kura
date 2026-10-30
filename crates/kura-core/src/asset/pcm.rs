@@ -351,8 +351,8 @@ fn reap(weak: &Weak<PcmCache>) {
     }
 }
 
-/// 予算から対話で確保する（待たない）。全体を超える・今空いていないは Busy（503）。
-fn acquire(budget: &Arc<MemoryBudget>, bytes: u64) -> Result<Lease, PcmError> {
+/// 予算から対話で確保する（待たない）。全体を超える・今空いていないは Busy（503）。エディタの `/edit` の PCM も使う。
+pub(crate) fn acquire(budget: &Arc<MemoryBudget>, bytes: u64) -> Result<Lease, PcmError> {
     match budget.try_acquire(bytes, Class::Interactive) {
         Ok(Some(lease)) => Ok(lease),
         Ok(None) => Err(PcmError::Busy(format!(

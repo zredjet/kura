@@ -79,6 +79,19 @@ pub enum Route {
         ty: u32,
         png: bool,
     },
+    /// 音声のエディタの出力の PCM（M13 段 4）：公開した今か直前の rev の、出力のフレーム `[start, end)`（`start < end`）。
+    EditPcm {
+        session: String,
+        rev: u64,
+        start: u64,
+        end: u64,
+    },
+    /// 音声のエディタの元（文書の入力）の PCM：フレーム `[start, end)`。
+    EditInputPcm {
+        session: String,
+        start: u64,
+        end: u64,
+    },
 }
 
 /// 中身が変わらないものの `Cache-Control`。
@@ -108,7 +121,7 @@ impl Route {
             | Self::Anim { .. }
             | Self::Wave { .. }
             | Self::Edit { .. } => Some(IMMUTABLE),
-            Self::Pcm { .. } => Some("no-store"),
+            Self::Pcm { .. } | Self::EditPcm { .. } | Self::EditInputPcm { .. } => Some("no-store"),
             Self::File { .. } | Self::Play { .. } => None,
         }
     }
@@ -152,12 +165,39 @@ pub fn parse_route(path: &str) -> Option<Route> {
     }
 }
 
-/// `/edit/{session}/{rev}/{段}/{frame}/{tx}/{ty}`（`{ty}` は `.png`・`.rgba` を付けてよい）の `edit` より後を読む。セッションは
-/// 小文字の 16 進（1〜64 文字）、段は 0〜[`MAX_LEVEL`]、ほかは符号・空白のない 10 進（あふれたら None）。
+/// `/edit/{session}/{rev}/{段}/{frame}/{tx}/{ty}`（`{ty}` は `.png`・`.rgba` を付けてよい）、`/edit/{session}/{rev}/pcm/{a}-{b}`、
+/// `/edit/{session}/input/pcm/{a}-{b}` の `edit` より後を読む。セッションは小文字の 16 進（1〜64 文字）、段は 0〜[`MAX_LEVEL`]、
+/// ほかは符号・空白のない 10 進（あふれたら None）。段は 10 進なので `input`・`pcm` と綴りは重ならない。
 fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
     let session = parts.next().filter(|s| is_session_id(s))?.to_string();
-    let rev = parse_decimal(parts.next()?)?;
-    let level = u8::try_from(parse_decimal(parts.next()?)?)
+    let second = parts.next()?;
+    if second == "input" {
+        let (start, end) = match (parts.next()?, parts.next()?, parts.next()) {
+            ("pcm", span, None) => parse_span(span)?,
+            _ => return None,
+        };
+        return Some(Route::EditInputPcm {
+            session,
+            start,
+            end,
+        });
+    }
+    let rev = parse_decimal(second)?;
+    let third = parts.next()?;
+    if third == "pcm" {
+        let span = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let (start, end) = parse_span(span)?;
+        return Some(Route::EditPcm {
+            session,
+            rev,
+            start,
+            end,
+        });
+    }
+    let level = u8::try_from(parse_decimal(third)?)
         .ok()
         .filter(|l| *l <= MAX_LEVEL)?;
     let frame = u32::try_from(parse_decimal(parts.next()?)?).ok()?;
@@ -182,6 +222,13 @@ fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
         ty,
         png,
     })
+}
+
+/// `{start}-{end}`（10 進、`start < end`。等しい・逆なら None）。
+fn parse_span(span: &str) -> Option<(u64, u64)> {
+    let (start, end) = span.split_once('-')?;
+    let (start, end) = (parse_decimal(start)?, parse_decimal(end)?);
+    (start < end).then_some((start, end))
 }
 
 /// 符号・空白のない 10 進（u64 にあふれたら None）。
@@ -210,7 +257,12 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
         Route::Peaks { hash } => layout.peaks_path(hash),
         // アニメの帯（item_anim_get が書く）。並べ方の版が今のものだけ（古い版は残さない）
         Route::Anim { hash, version } if *version == ANIM_V => layout.anim_path(hash),
-        Route::Anim { .. } | Route::Pcm { .. } | Route::Wave { .. } | Route::Edit { .. } => {
+        Route::Anim { .. }
+        | Route::Pcm { .. }
+        | Route::Wave { .. }
+        | Route::Edit { .. }
+        | Route::EditPcm { .. }
+        | Route::EditInputPcm { .. } => {
             return None;
         }
         Route::Play { hash } => {
@@ -451,6 +503,8 @@ mod tests {
             (format!("/file/{HASH}"), None),
             (format!("/play/{HASH}"), None),
             ("/edit/0af/3/0/0/1/2".to_string(), immutable),
+            ("/edit/0af/3/pcm/0-65536".to_string(), Some("no-store")),
+            ("/edit/0af/input/pcm/5-9".to_string(), Some("no-store")),
         ] {
             let route = parse_route(&path).unwrap();
             assert_eq!(route.cache_control(), expected, "{path}");
@@ -505,6 +559,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = Layout::new(dir.path());
         assert_eq!(resolve(&layout, &edit(1, 0, 0, 0, 0, true)), None);
+    }
+
+    /// 音声のエディタの PCM（M13 段 4）：`/edit/{s}/{rev}/pcm/{a}-{b}`・`/edit/{s}/input/pcm/{a}-{b}`。区間は `/pcm` と同じ
+    /// （10 進・`start < end`）。ファイルではないので resolve は None。
+    #[test]
+    fn parses_edit_audio_routes() {
+        let session = "3fa9c0de".to_string();
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/12/pcm/65536-131072"),
+            Some(Route::EditPcm {
+                session: session.clone(),
+                rev: 12,
+                start: 65_536,
+                end: 131_072
+            })
+        );
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/input/pcm/0-1"),
+            Some(Route::EditInputPcm {
+                session,
+                start: 0,
+                end: 1
+            })
+        );
+        for bad in [
+            "/edit/3fa9c0de/12/pcm/5-5",
+            "/edit/3fa9c0de/12/pcm/9-5",
+            "/edit/3fa9c0de/12/pcm/5",
+            "/edit/3fa9c0de/12/pcm/-1-5",
+            "/edit/3fa9c0de/12/pcm/0-5/x",
+            "/edit/3fa9c0de/12/pcm",
+            "/edit/3fa9c0de/input/pcm/5-5",
+            "/edit/3fa9c0de/input/pcm",
+            "/edit/3fa9c0de/input/wave/0-5",
+            "/edit/3fa9c0de/input/pcm/0-5/x",
+            "/edit/3fa9c0de/input/3/pcm/0-5",
+            "/edit/3fa9c0de/x/pcm/0-5",
+        ] {
+            assert_eq!(parse_route(bad), None, "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let route = parse_route("/edit/3fa9c0de/1/pcm/0-1").unwrap();
+        assert_eq!(resolve(&layout, &route), None);
+        assert!(!route.immutable());
     }
 
     fn put(path: &Path, bytes: &[u8]) {

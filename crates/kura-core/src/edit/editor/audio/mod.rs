@@ -10,6 +10,9 @@
 //! - **予算**：公開した今と直前の表示の値（`resident_bytes`）を、エディタの確保の `extra` で数える（画像は数えない。
 //!   docs/editing.md §12.10）。
 
+pub mod serve;
+#[cfg(test)]
+mod serve_tests;
 #[cfg(test)]
 mod session_tests;
 pub(super) mod source;

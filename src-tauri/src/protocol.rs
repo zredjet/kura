@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use kura_core::asset::{pcm, wave};
 use kura_core::edit::EngineServices;
+use kura_core::edit::editor::audio::serve as edit_audio;
 use kura_core::edit::editor::{TileFormat, TileRequest, tile};
 use kura_core::library::Layout;
 use kura_core::serve::{
@@ -159,6 +160,31 @@ fn answer(
     if let Route::Wave { hash, version } = &route {
         return wave_response(served, hash, *version, route.cache_control(), head);
     }
+    if let Route::EditPcm {
+        session,
+        rev,
+        start,
+        end,
+    } = &route
+    {
+        let Some(engine) = served.engine else {
+            return empty(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let body = edit_audio::serve_pcm(engine, session, *rev, *start, *end);
+        return pcm_body_response(body, route.cache_control(), head);
+    }
+    if let Route::EditInputPcm {
+        session,
+        start,
+        end,
+    } = &route
+    {
+        let Some(engine) = served.engine else {
+            return empty(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let body = edit_audio::serve_input_pcm(engine, session, *start, *end);
+        return pcm_body_response(body, route.cache_control(), head);
+    }
     if let Route::Edit {
         session,
         rev,
@@ -219,11 +245,35 @@ fn pcm_response(
             return empty(code);
         }
     };
-    let len = body.len();
+    bytes_response(body, "audio/wav", cache_control, head)
+}
+
+/// その場で作った PCM（エディタの `/edit/…/pcm/…`）の応答：誤りは状態（404・416・503・500）に写す。
+fn pcm_body_response(
+    body: Result<Vec<u8>, pcm::PcmError>,
+    cache_control: Option<&str>,
+    head: bool,
+) -> Response<Vec<u8>> {
+    match body {
+        Ok(body) => bytes_response(body, "audio/wav", cache_control, head),
+        Err(err) => {
+            tracing::debug!(%err, "kura:// のエディタの PCM を返せません");
+            empty(StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+        }
+    }
+}
+
+/// その場で作った中身の 200 の応答（`Content-Type`・`Content-Length`・`Cache-Control`。HEAD は本文を付けない）。
+fn bytes_response(
+    body: Vec<u8>,
+    content_type: &str,
+    cache_control: Option<&str>,
+    head: bool,
+) -> Response<Vec<u8>> {
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "audio/wav")
-        .header(header::CONTENT_LENGTH, len);
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, body.len());
     if let Some(cache_control) = cache_control {
         builder = builder.header(header::CACHE_CONTROL, cache_control);
     }
@@ -253,16 +303,7 @@ fn wave_response(
             return empty(code);
         }
     };
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "image/png")
-        .header(header::CONTENT_LENGTH, body.len());
-    if let Some(cache_control) = cache_control {
-        builder = builder.header(header::CACHE_CONTROL, cache_control);
-    }
-    builder
-        .body(if head { Vec::new() } else { body })
-        .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR))
+    bytes_response(body, "image/png", cache_control, head)
 }
 
 /// エディタの表示のタイル（RGBA8 の行か PNG）をその場で作って返す（Range は見ない）。表示した今か直前の rev・段の有効な
@@ -289,16 +330,7 @@ fn edit_response(
         TileFormat::Png => "image/png",
         TileFormat::Rgba => "application/octet-stream",
     };
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, body.len());
-    if let Some(cache_control) = cache_control {
-        builder = builder.header(header::CACHE_CONTROL, cache_control);
-    }
-    builder
-        .body(if head { Vec::new() } else { body })
-        .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR))
+    bytes_response(body, content_type, cache_control, head)
 }
 
 /// main への応答すべて（エラーを含む）に、ACAO・ACEH・`CSP: sandbox`・`nosniff` を付ける。
@@ -992,6 +1024,173 @@ mod tests {
         editor::close(session.engine().unwrap(), &s);
         let r = get(&with, format!("/edit/{s}/{rev}/0/0/0/0"));
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        session.close();
+    }
+
+    /// 音声のエディタの PCM（M13 段 4。/edit/{s}/{rev}/pcm・/edit/{s}/input/pcm）：公開した rev の区間は 200（audio/wav・
+    /// no-store）、古い rev・知らないセッションは 404、範囲の外は 416、エンジンがなければ 503、閉じると 404。どの応答にも
+    /// 4 つのヘッダ。main でない WebView は受け付けで 403。
+    #[test]
+    fn edit_audio_routes_are_served_from_the_open_editor() {
+        use kura_core::edit::editor::{self, EditorEnv, OpenRequest, Step, Viewport};
+        use kura_core::import::{ImportInput, ImportOptions, start_import};
+        use kura_engine::session::{CommitMode, Edit};
+        use kura_engine::testgen::InputGen;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let value = InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 2,
+            frames: 70_000,
+            seed: 1,
+        }
+        .generate()
+        .unwrap();
+        let wav = kura_core::edit::CodecSet::pinned()
+            .encode_bytes(
+                &value,
+                "wav",
+                &serde_json::json!({}),
+                &kura_engine::NoMonitor,
+            )
+            .unwrap()
+            .0;
+        std::fs::write(src.join("a.wav"), wav).unwrap();
+        let services = kura_core::library::Services::new(Arc::new(kura_core::media::NoBackend))
+            .with_engine(Arc::new(Factory));
+        let session = kura_core::library::LibrarySession::create(
+            &dir.path().join("L"),
+            Arc::new(|_| {}),
+            services,
+        )
+        .unwrap();
+        start_import(
+            session.jobs(),
+            &ImportInput {
+                paths: vec![src],
+                options: ImportOptions::default(),
+            },
+        )
+        .unwrap();
+        session.wait_ready();
+        assert!(session.jobs().wait_idle(std::time::Duration::from_secs(60)));
+        let env = EditorEnv::of(&session).unwrap();
+        let opened = editor::open(
+            &env,
+            &OpenRequest {
+                item_id: 1,
+                viewport: Viewport::audio_idle(),
+                from_draft: false,
+            },
+        )
+        .unwrap();
+        let s = opened.session.clone();
+        let out = editor::step(
+            &env,
+            &s,
+            vec![Step::Commit {
+                edit: Edit::AddNode {
+                    at: 0,
+                    op: "audio.gain".into(),
+                    v: 1,
+                    params: serde_json::json!({ "db": -3.0 }),
+                    seed: None,
+                    extra_inputs: Vec::new(),
+                },
+                mode: CommitMode::Step,
+            }],
+            &Viewport::audio_idle(),
+        )
+        .unwrap();
+        let rev = out.status.rev;
+        let origin = release();
+        let with = Served {
+            layout: session.library().layout(),
+            engine: session.engine(),
+        };
+        let get = |served: &Served<'_>, path: String| {
+            reply(Some(served), &request("GET", &path, &[]), &origin, false)
+        };
+        for path in [
+            format!("/edit/{s}/{rev}/pcm/0-65536"),
+            format!("/edit/{s}/{rev}/pcm/65536-70000"),
+            format!("/edit/{s}/input/pcm/5-9"),
+        ] {
+            let r = get(&with, path.clone());
+            assert_eq!(r.status(), StatusCode::OK, "{path}");
+            assert_eq!(header_of(&r, "content-type").as_deref(), Some("audio/wav"));
+            assert_eq!(header_of(&r, "cache-control").as_deref(), Some("no-store"));
+            assert_eq!(&r.body()[..4], b"RIFF");
+            assert_decorated(&r, &origin, &path);
+        }
+        let head = reply(
+            Some(&with),
+            &request("HEAD", &format!("/edit/{s}/{rev}/pcm/0-10"), &[]),
+            &origin,
+            true,
+        );
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(head.body().is_empty());
+        let without = Served {
+            layout: session.library().layout(),
+            engine: None,
+        };
+        for (what, served, path, status) in [
+            (
+                "古い rev",
+                &with,
+                format!("/edit/{s}/{}/pcm/0-10", rev + 1),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "範囲の外",
+                &with,
+                format!("/edit/{s}/{rev}/pcm/0-70001"),
+                StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
+            (
+                "元の範囲の外",
+                &with,
+                format!("/edit/{s}/input/pcm/69999-70001"),
+                StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
+            (
+                "知らないセッション",
+                &with,
+                format!("/edit/abc/{rev}/pcm/0-10"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "エンジンなし",
+                &without,
+                format!("/edit/{s}/{rev}/pcm/0-10"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "エンジンなし（元）",
+                &without,
+                format!("/edit/{s}/input/pcm/0-10"),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let r = get(served, path);
+            assert_eq!(r.status(), status, "{what}");
+            assert_decorated(&r, &origin, what);
+        }
+        let req = request("GET", &format!("/edit/{s}/{rev}/pcm/0-10"), &[]);
+        let Gate::Done(r) = gate("capture-browser", &req, &origin) else {
+            panic!("ほかの WebView の /edit を受け付けました");
+        };
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        editor::close(session.engine().unwrap(), &s);
+        for path in [
+            format!("/edit/{s}/{rev}/pcm/0-10"),
+            format!("/edit/{s}/input/pcm/0-10"),
+        ] {
+            assert_eq!(get(&with, path).status(), StatusCode::NOT_FOUND);
+        }
         session.close();
     }
 
