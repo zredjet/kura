@@ -4,6 +4,7 @@
 //!   など）・`build_global` は src（テストのモジュールを除く）にない。
 //!   プールは呼び手（kura-core の EngineRuntime）が作り、エンジンは呼ばれたスレッドのプールで `par_blocks` を回す。
 //! - 本番のコードは音声の全体を連続した列にしない：`.to_planes(` は src（テストのモジュールと `testing` を除く）にない（M13）。
+//! - blake3 の hazmat（木の連鎖値を直に扱う口）は `audio/digest.rs` の外で使わない（M13 段 2）。
 
 // テストの補助関数は #[test] の外にあるので、テストと同じく unwrap などを許す（clippy.toml の allow-*-in-tests が届かない）
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -344,6 +345,27 @@ fn engine_src_does_not_flatten_audio() {
     );
     let (code, _) = code_of("fn f(a: &Audio) { let p = a.to_planes(); }");
     assert!(code.contains(".to_planes("));
+}
+
+/// M13 段 2：blake3 の hazmat（使い方を誤ると別の木のダイジェストになる口）は `audio/digest.rs`（`PcmTreeDigest`。`PcmDigest`
+/// との性質テストで照らす）の外で使わない。
+#[test]
+fn hazmat_stays_in_the_tree_digest() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let found: Vec<String> = find_outside_tests(&src, &["hazmat"])
+        .into_iter()
+        .filter(|f| !f.starts_with("audio/digest.rs"))
+        .collect();
+    assert!(
+        found.is_empty(),
+        "blake3 の hazmat を audio/digest.rs の外で使っています:\n{}",
+        found.join("\n")
+    );
+    assert!(
+        std::fs::read_to_string(src.join("audio/digest.rs"))
+            .unwrap()
+            .contains("hazmat::")
+    );
 }
 
 /// 走査は、コード・テストでない関数の中のものを見つけ、コメント・文字列・テストのモジュール（中身つき・別のファイル）は除く。

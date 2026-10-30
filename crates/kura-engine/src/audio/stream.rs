@@ -3,8 +3,9 @@
 //!
 //! - [`AudioSink`]：`begin`（形とメタデータ）→ `feed`（頭から順・重ならず・チャンクに揃えた窓の全チャンネル）→ `finish`。
 //! - [`stream_value`]：値（遅延の値を含む）を窓ごとに読んで渡す。計画の出力は `Engine::stream_audio`（render/audio.rs）。
-//! - [`PcmDigest`]：`kura-pcm-v1` のダイジェスト（docs/editing.md §8.6）を、チャンネルの順に区間を足して作る。`Value::digest`・
-//!   `Engine::digest_audio_output`・段 3 の保存が同じ部品を通る（式は変えない）。
+//! - [`PcmDigest`]：`kura-pcm-v1` のダイジェスト（docs/editing.md §8.6）を、チャンネルの順に区間を足して作る。`Value::digest`
+//!   と、区間の順によらない木のダイジェスト（`audio::digest::PcmTreeDigest`。流れの窓から 1 回で取る）の小さい音声の道が
+//!   同じ部品を通る（式は変えない）。
 
 use crate::digest::{Digest, Hasher, canonical};
 use crate::error::EngineError;

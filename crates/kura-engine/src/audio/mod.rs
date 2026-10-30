@@ -5,6 +5,7 @@
 //! `apply` は核をチャンク（`AUDIO_CHUNK`）ずつ並列に描くだけなので、区間の切り方・スレッド数によらず同じ値になる（E18）。
 //! 状態を運ぶフィルタ（IIR など）は核にせず、解析（`crate::analysis`）の側で全体を順に流す。
 
+pub mod digest;
 pub mod resample;
 pub mod source;
 pub mod stream;

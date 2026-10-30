@@ -10,7 +10,7 @@
 //! - 申告した解析の入力が部分の値でキャッシュにもなければ、入力のポートを窓ごとに描いて流れの解析（`Analysis::stream`）で
 //!   解く（流し解き。結果はキャッシュに入れる）。
 //! - 流れ（[`Engine::stream_audio`]）：出力を `STREAM_CHUNKS` チャンクの窓ごとに描いて `AudioSink` に渡す。
-//!   [`Engine::digest_audio_output`] はチャンネルの数だけ流してダイジェストを取る。
+//!   [`Engine::digest_audio_output`] は 1 回流してダイジェストを取る（`audio::digest::PcmTreeDigest`）。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,7 +23,8 @@ use super::cache::{
 use super::region::{Area, Reach, Spans};
 use super::{Engine, Plan, PlannedNode, apply_node, bad_input, node_seed, op_shapes};
 use crate::analysis::{AnalyzeCx, AnyOutput, AudioStream, DynAnalysis, Need};
-use crate::audio::stream::{AudioSink, PcmDigest, StreamInfo, stream_windows};
+use crate::audio::digest::PcmTreeDigest;
+use crate::audio::stream::{AudioSink, StreamInfo, stream_windows};
 use crate::digest::Digest;
 use crate::doc::{InputId, OutputId, PortRef, Quantize};
 use crate::error::{EngineError, Issue};
@@ -387,16 +388,15 @@ impl AudioSink for AnalysisFeed<'_> {
     }
 }
 
-/// チャンネル 1 つだけをダイジェストに足す包み（[`Engine::digest_audio_output`]）。
-struct ChannelDigest<'a> {
-    digest: &'a mut PcmDigest,
-    ch: usize,
-    meta: &'a mut Option<AudioMeta>,
+/// 流れの窓をダイジェストに足す包み（[`Engine::digest_audio_output`]。区間の順によらない木のダイジェスト）。
+struct WindowDigest {
+    digest: PcmTreeDigest,
+    meta: Option<AudioMeta>,
 }
 
-impl AudioSink for ChannelDigest<'_> {
+impl AudioSink for WindowDigest {
     fn begin(&mut self, info: &StreamInfo) -> Result<(), EngineError> {
-        *self.meta = Some(info.meta.clone());
+        self.meta = Some(info.meta.clone());
         Ok(())
     }
 
@@ -404,12 +404,9 @@ impl AudioSink for ChannelDigest<'_> {
         &mut self,
         start: u64,
         planes: &[&[f32]],
-        _mon: &dyn Monitor,
+        mon: &dyn Monitor,
     ) -> Result<(), EngineError> {
-        let p = planes
-            .get(self.ch)
-            .ok_or_else(|| EngineError::Internal("流れのチャンネルが足りません".into()))?;
-        self.digest.push(self.ch, start, p)
+        self.digest.push_window(start, planes, mon)
     }
 
     fn finish(&mut self) -> Result<(), EngineError> {
@@ -697,8 +694,8 @@ impl Engine {
         Ok(stats)
     }
 
-    /// 計画の出力 `output` の値のダイジェスト（`kura-pcm-v1`。`render` の出力の `Value::digest` と同じ）を、出力を流して取る
-    /// （チャンネルの数だけ流し、各回はチャンネル c だけを足す。全体を持たない）。段 1 ではテストと段 3 の保存のための口。
+    /// 計画の出力 `output` の値のダイジェスト（`kura-pcm-v1`。`render` の出力の `Value::digest` と同じ）を、出力を 1 回流して
+    /// 取る（区間の順によらない木のダイジェスト `PcmTreeDigest`。全体を持たない）。段 3 の保存とテストのための口。
     pub fn digest_audio_output(
         &self,
         plan: &Plan,
@@ -720,19 +717,15 @@ impl Engine {
                 "長さの分からない音声・音声でない出力は流せません".into(),
             ));
         };
-        let mut digest = PcmDigest::new(rate, usize::from(channels), frames);
-        let mut meta = None;
-        for ch in 0..usize::from(channels) {
-            let mut sink = ChannelDigest {
-                digest: &mut digest,
-                ch,
-                meta: &mut meta,
-            };
-            self.stream_audio(plan, inputs, cache, output, None, &mut sink, mon)?;
-        }
-        let meta =
-            meta.ok_or_else(|| EngineError::Internal("流れのメタデータがありません".into()))?;
-        digest.finish(&meta)
+        let mut sink = WindowDigest {
+            digest: PcmTreeDigest::new(rate, usize::from(channels), frames)?,
+            meta: None,
+        };
+        self.stream_audio(plan, inputs, cache, output, None, &mut sink, mon)?;
+        let meta = sink
+            .meta
+            .ok_or_else(|| EngineError::Internal("流れのメタデータがありません".into()))?;
+        sink.digest.finish(&meta)
     }
 }
 
