@@ -25,6 +25,16 @@ pub struct StreamInfo {
     pub meta: AudioMeta,
 }
 
+/// 流れの終わり（M13 段 2）：実際の長さとメタデータ。長さが上限しか分からないデコーダ（MP3・AAC）は、読み終えるまで長さが
+/// 決まらない。流れの解析（`AudioStream::finish`）とデコードの受け手（`codec::stream::DecodeSink::end`）が受ける。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamEnd {
+    /// 受けたフレームの数。
+    pub frames: u64,
+    /// メタデータ。
+    pub meta: AudioMeta,
+}
+
 /// 流れを受けるもの。
 pub trait AudioSink {
     /// 流し始める（窓の前に 1 度）。

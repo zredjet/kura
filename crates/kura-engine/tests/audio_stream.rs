@@ -4,7 +4,7 @@
 //!   `render` の出力と同じ。窓は頭から順・重ならず・チャンクに揃う。区間を頼むと、その区間に掛かるチャンクだけを流す。
 //! - streamed_digest_equals_value_digest：`Engine::digest_audio_output` が `render` の出力のダイジェストと同じ。
 //! - presolved_measurement_equals_run：流れの解析（`audio.loudness_gating` の流れ）を窓（1・7・4,096・C・ランダム）で解いた結果が
-//!   `run` と同じ正規の形。
+//!   `run` と同じ正規の形（長さの決まった形と、長さが上限しか分からない形。M13 段 2）。
 //! - patcher_equals_compute（E40）：波形の段の部分更新を流れに載せた `Patcher` が `compute` と同じ。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -462,8 +462,21 @@ fn presolved_measurement_equals_run() {
         let want = a.encode_any(&a.run_any(&params, &v, &cx).unwrap()).unwrap();
         let planes = au.to_planes().unwrap();
         let n = au.frames();
-        for step in [7usize, 4_096, AUDIO_CHUNK, 0] {
-            let mut st = a.stream_any(&params, &v.shape()).unwrap().unwrap();
+        let end = kura_engine::audio::stream::StreamEnd {
+            frames: n as u64,
+            meta: au.meta.clone(),
+        };
+        // 長さの決まった形と、長さが上限しか分からない形（M13 段 2）
+        let bounded = kura_engine::shape::Shape::Audio {
+            rate: au.rate(),
+            channels: au.channels() as u16,
+            frames: kura_engine::shape::Dim::AtMost(n as u64 + 4_097),
+        };
+        for (shape, step) in [7usize, 4_096, AUDIO_CHUNK, 0]
+            .into_iter()
+            .flat_map(|step| [(v.shape(), step), (bounded, step)])
+        {
+            let mut st = a.stream_any(&params, &shape).unwrap().unwrap();
             let mut at = 0;
             while at < n {
                 let len = if step == 0 {
@@ -476,17 +489,61 @@ fn presolved_measurement_equals_run() {
                 st.feed(at as u64, &views, &cx).unwrap();
                 at = end;
             }
-            let got = a.encode_any(&st.finish(&cx).unwrap()).unwrap();
-            assert_eq!(got, want, "{i}・窓 {step}");
+            let got = a.encode_any(&st.finish(&end, &cx).unwrap()).unwrap();
+            assert_eq!(got, want, "{i}・窓 {step}・{shape:?}");
         }
     }
-    // 長さの分からない形は流せない
-    let unknown = kura_engine::shape::Shape::Audio {
+    // 終わりの長さが受けた長さ・形と違えば Internal
+    let v = InputGen::AudioNoise {
         rate: 8_000,
         channels: 1,
-        frames: kura_engine::shape::Dim::AtMost(10),
+        frames: 100,
+        seed: 3,
+    }
+    .generate()
+    .unwrap();
+    let Value::Audio(au) = &v else { panic!() };
+    let planes = au.to_planes().unwrap();
+    let views: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+    let end = |frames| kura_engine::audio::stream::StreamEnd {
+        frames,
+        meta: au.meta.clone(),
     };
-    assert!(a.stream_any(&params, &unknown).unwrap().is_none());
+    for (frames, bound, ok) in [
+        (kura_engine::shape::Dim::Exact(100), 100, true),
+        (kura_engine::shape::Dim::Exact(100), 99, false),
+        (kura_engine::shape::Dim::AtMost(150), 100, true),
+        (kura_engine::shape::Dim::AtMost(150), 101, false),
+    ] {
+        let shape = kura_engine::shape::Shape::Audio {
+            rate: 8_000,
+            channels: 1,
+            frames,
+        };
+        let mut st = a.stream_any(&params, &shape).unwrap().unwrap();
+        st.feed(0, &views, &cx).unwrap();
+        let got = st.finish(&end(bound), &cx);
+        assert_eq!(got.is_ok(), ok, "{frames:?}・{bound}");
+        if !ok {
+            assert!(matches!(got, Err(EngineError::Internal(_))));
+        }
+    }
+    // 上限を超えて受けたら Internal
+    let mut st = a
+        .stream_any(
+            &params,
+            &kura_engine::shape::Shape::Audio {
+                rate: 8_000,
+                channels: 1,
+                frames: kura_engine::shape::Dim::AtMost(50),
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        st.feed(0, &views, &cx),
+        Err(EngineError::Internal(_))
+    ));
 }
 
 /// E40：波形の段の部分更新を流れに載せた `Patcher` は、変わった区間（推論）のチャンクだけを流して、新しい出力を `compute`

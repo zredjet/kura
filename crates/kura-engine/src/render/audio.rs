@@ -24,7 +24,7 @@ use super::region::{Area, Reach, Spans};
 use super::{Engine, Plan, PlannedNode, apply_node, bad_input, node_seed, op_shapes};
 use crate::analysis::{AnalyzeCx, AnyOutput, AudioStream, DynAnalysis, Need};
 use crate::audio::digest::PcmTreeDigest;
-use crate::audio::stream::{AudioSink, StreamInfo, stream_windows};
+use crate::audio::stream::{AudioSink, StreamEnd, StreamInfo, stream_windows};
 use crate::digest::Digest;
 use crate::doc::{InputId, OutputId, PortRef, Quantize};
 use crate::error::{EngineError, Issue};
@@ -73,6 +73,17 @@ pub(super) fn pad_chunks(area: &Area, shape: &Shape) -> Area {
         out.push(a.saturating_sub(c), b.saturating_add(c).min(n));
     }
     Area::samples(out)
+}
+
+/// 長さの決まった音声の形か（流し解きは長さの決まったポートだけを流す）。
+fn exact_audio(shape: &Shape) -> bool {
+    matches!(
+        shape,
+        Shape::Audio {
+            frames: Dim::Exact(_),
+            ..
+        }
+    )
 }
 
 /// 長さ `frames` の音声で、範囲 `area` に掛かるチャンクの番号（`All`・画素の範囲はすべて、空は空）。
@@ -191,12 +202,13 @@ impl Engine {
             if cx.port_complete(cache, r) || cache.contains_analysis(&key) {
                 continue;
             }
+            // 流し解きは長さの決まったポートだけ（`stream_port` が断る形を、流せるものとして数えない）
             let streamable = match cx.shapes.port(r) {
-                Some(shape) => self
+                Some(shape) if exact_audio(&shape) => self
                     .solvable(need)?
                     .stream_any(&need.params, &shape)?
                     .is_some(),
-                None => false,
+                _ => false,
             };
             if !streamable {
                 return Ok(false);
@@ -216,6 +228,9 @@ impl Engine {
             let Some(shape) = node.inputs.get(need.input).and_then(|r| shapes.port(r)) else {
                 return Ok(false);
             };
+            if !exact_audio(&shape) {
+                return Ok(false);
+            }
             if self
                 .solvable(need)?
                 .stream_any(&need.params, &shape)?
@@ -359,14 +374,30 @@ pub struct StreamStats {
     pub area: AreaStats,
 }
 
-/// 流れを解析に渡す包み（流し解き）。
+/// 流れを解析に渡す包み（流し解き）。`begin` の形とメタデータを覚え、終わりに `StreamEnd` を作る。
 struct AnalysisFeed<'a> {
     stream: &'a mut Box<dyn AudioStream>,
     limits: &'a crate::limits::Limits,
+    info: Option<StreamInfo>,
+}
+
+impl AnalysisFeed<'_> {
+    /// 流し終えた流れの終わり（長さとメタデータ）。
+    fn end(&self) -> Result<StreamEnd, EngineError> {
+        let info = self
+            .info
+            .as_ref()
+            .ok_or_else(|| EngineError::Internal("流し解きの流れが始まっていません".into()))?;
+        Ok(StreamEnd {
+            frames: info.frames,
+            meta: info.meta.clone(),
+        })
+    }
 }
 
 impl AudioSink for AnalysisFeed<'_> {
-    fn begin(&mut self, _info: &StreamInfo) -> Result<(), EngineError> {
+    fn begin(&mut self, info: &StreamInfo) -> Result<(), EngineError> {
+        self.info = Some(info.clone());
         Ok(())
     }
 
@@ -442,6 +473,7 @@ impl Engine {
         let mut feed = AnalysisFeed {
             stream: &mut stream,
             limits: &self.limits,
+            info: None,
         };
         let mut windows = 0;
         self.stream_port(
@@ -457,11 +489,12 @@ impl Engine {
             &mut windows,
             mon,
         )?;
+        let end = feed.end()?;
         let acx = AnalyzeCx {
             mon,
             limits: &self.limits,
         };
-        let out = stream.finish(&acx)?;
+        let out = stream.finish(&end, &acx)?;
         let in_fps = match r {
             PortRef::Input { id } => cx.input_fps.get(id).copied(),
             PortRef::Node { id } => cx.fps.nodes.get(id).copied(),

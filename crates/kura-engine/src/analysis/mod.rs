@@ -141,15 +141,17 @@ pub trait Analysis: Send + Sync + 'static {
     }
     /// この引数・入力の形で解くときの見積もり（結果の大きさは上の見積もり。適合テストが実際の大きさ以下を確かめる）。
     fn estimate(p: &Self::Params, input: &Shape) -> Estimate;
-    /// 流れの解析（M13 段 1）：形 `input` の音声を、頭から順に窓ごとに受けて解くもの（結果は `run` とビット単位で同じ）。
-    /// 流せない解析・形（長さの分からない音声など）は None（既定）。範囲の描画の流し解き（入力が部分の値のとき）が使う。
+    /// 流れの解析（M13 段 1・2）：形 `input` の音声を、頭から順に窓ごとに受けて解くもの（結果は `run` とビット単位で同じ。
+    /// E35）。長さの決まった形（`Exact`）と、長さが上限しか分からない形（`AtMost`。実際の長さは `finish` に渡す `StreamEnd`）の
+    /// どちらにも Some を返してよい。流せない解析・形は None（既定）。範囲の描画の流し解き（入力が部分の値のとき）と、解析の
+    /// ジョブの流れのデコード（`Engine::analyze_stream`）が使う。
     fn stream(_p: &Self::Params, _input: &Shape) -> Option<Box<dyn AudioStream>> {
         None
     }
 }
 
-/// 流れの解析（M13 段 1。段 2 の begin → feed → finish はこれに乗る）。`feed` は頭から順に、重ならず、全チャンネルの同じ区間を
-/// 渡して呼ぶ（窓の大きさは任意。実行器はチャンクに揃える）。`finish` の結果は、全体を `Analysis::run` で解いたものと同じ。
+/// 流れの解析（M13 段 1・2：begin → feed → finish）。`feed` は頭から順に、重ならず、全チャンネルの同じ区間を渡して呼ぶ（窓の
+/// 大きさは任意。実行器・デコードはチャンクに揃える）。`finish` の結果は、全体を `Analysis::run` で解いたものと同じ。
 pub trait AudioStream: Send {
     /// フレーム `start` からの全チャンネルの標本（チャンネルの順・同じ長さ）を受ける。
     fn feed(
@@ -158,8 +160,13 @@ pub trait AudioStream: Send {
         planes: &[&[f32]],
         cx: &AnalyzeCx<'_>,
     ) -> Result<(), EngineError>;
-    /// 全体を受けたあと、結果を返す（受けた長さが形と違えば `Internal`）。
-    fn finish(self: Box<Self>, cx: &AnalyzeCx<'_>) -> Result<AnyOutput, EngineError>;
+    /// 全体（長さ `end.frames`・メタデータ `end.meta`）を受けたあと、結果を返す。受けた長さが `end.frames` と違う、長さの
+    /// 決まった形で長さが形と違う、上限の形で上限を超えるなら `Internal`。
+    fn finish(
+        self: Box<Self>,
+        end: &crate::audio::stream::StreamEnd,
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<AnyOutput, EngineError>;
 }
 
 /// 型を消した例。

@@ -433,7 +433,10 @@ fn true_peak_window(w: &[f64], coef: &[[f64; 12]; 4]) -> (f64, f64) {
 pub struct LoudnessScan {
     rate: u32,
     channels: usize,
+    /// 全体の長さ（`exact`）か、長さの上限（`open`）。
     frames: usize,
+    /// 長さが決まっているか（偽なら `frames` は上限で、`finish_at` が実際の長さを受ける）。
+    exact: bool,
     filter: Option<[Biquad; 2]>,
     /// 区間の標本の数 S。
     s: usize,
@@ -456,6 +459,17 @@ impl LoudnessScan {
     /// レート `rate`・`channels` チャンネル・長さ `frames` の音声を受け始める（全体の長さを知っているので、端数の区間を
     /// 外せる）。チャンネルが 0 なら `Internal`。
     pub fn new(rate: u32, channels: usize, frames: u64) -> Result<Self, EngineError> {
+        Self::start(rate, channels, frames, true)
+    }
+
+    /// 長さが上限 `max_frames` しか分からない音声を受け始める（M13 段 2。長さの上限の形）。端数の区間は分からないので、
+    /// 区間に入れる標本の数の上限を置かず（閉じた区間だけを足すので、区間の列は長さを知って受けたものと同じ）、区間の列の
+    /// 確保は上限で行う。終わりの長さは `finish_at`・`finish_detailed_at` に渡す。
+    pub fn open(rate: u32, channels: usize, max_frames: u64) -> Result<Self, EngineError> {
+        Self::start(rate, channels, max_frames, false)
+    }
+
+    fn start(rate: u32, channels: usize, frames: u64, exact: bool) -> Result<Self, EngineError> {
         if channels == 0 {
             return Err(EngineError::Internal(
                 "ラウドネスの計測にチャンネルがありません".into(),
@@ -483,9 +497,14 @@ impl LoudnessScan {
             rate,
             channels,
             frames,
+            exact,
             filter,
             s: s.max(1),
-            used: segments_total * s.max(1),
+            used: if exact {
+                segments_total * s.max(1)
+            } else {
+                usize::MAX
+            },
             measured,
             coef: true_peak_coefficients(),
             k: vec![KState::default(); channels],
@@ -595,12 +614,18 @@ impl LoudnessScan {
         Ok(())
     }
 
-    /// 全体を受けたあと：出力の位置 m ∈ [len, len + 11) の流し切りを、直前の 11 標本と 0 で計る。受けた長さが全体と
-    /// 違えば `Internal`。
-    fn finish_pass(mut self) -> Result<(Pass, u32, usize, usize), EngineError> {
-        if self.pos != self.frames {
+    /// 全体（長さ `frames`）を受けたあと：出力の位置 m ∈ [len, len + 11) の流し切りを、直前の 11 標本と 0 で計る。受けた
+    /// 長さが `frames` と違う・長さの決まった形で `frames` が全体と違う・上限の形で上限を超えるなら `Internal`。
+    fn finish_pass(mut self, frames: u64) -> Result<(Pass, u32, usize, usize), EngineError> {
+        let frames = usize::try_from(frames).unwrap_or(usize::MAX);
+        let fits = if self.exact {
+            frames == self.frames
+        } else {
+            frames <= self.frames
+        };
+        if self.pos != frames || !fits {
             return Err(EngineError::Internal(format!(
-                "ラウドネスの窓が全体を覆っていません（{} / {} フレーム）",
+                "ラウドネスの窓が全体を覆っていません（{} / {frames} フレーム・形 {}）",
                 self.pos, self.frames
             )));
         }
@@ -621,18 +646,30 @@ impl LoudnessScan {
             finite: self.finite,
             filter: self.filter,
         };
-        Ok((pass, self.rate, self.channels, self.frames))
+        Ok((pass, self.rate, self.channels, frames))
     }
 
-    /// 全体を受けたあと、計測（`analyze` と同じ値）。
+    /// 全体を受けたあと、計測（`analyze` と同じ値）。長さが上限の形（`open`）は `finish_at` を使う。
     pub fn finish(self) -> Result<Measured, EngineError> {
-        let (pass, rate, channels, frames) = self.finish_pass()?;
+        let frames = self.frames as u64;
+        self.finish_at(frames)
+    }
+
+    /// 長さ `frames` の全体を受けたあと、計測（`analyze` と同じ値）。
+    pub fn finish_at(self, frames: u64) -> Result<Measured, EngineError> {
+        let (pass, rate, channels, frames) = self.finish_pass(frames)?;
         Ok(finish(rate, channels, frames, pass, None)?.measured)
     }
 
     /// 全体を受けたあと、計測に短期ラウドネスのブロックのパワー（10 Hz）を添えたもの（`analyze_detailed` と同じ値）。
     pub fn finish_detailed(self) -> Result<Detailed, EngineError> {
-        let (pass, rate, channels, frames) = self.finish_pass()?;
+        let frames = self.frames as u64;
+        self.finish_detailed_at(frames)
+    }
+
+    /// 長さ `frames` の全体を受けたあと、`finish_detailed` と同じもの。
+    pub fn finish_detailed_at(self, frames: u64) -> Result<Detailed, EngineError> {
+        let (pass, rate, channels, frames) = self.finish_pass(frames)?;
         finish(rate, channels, frames, pass, Some(SHORT_TERM_HOP))
     }
 }
@@ -1680,8 +1717,10 @@ mod tests {
     /// 短期ラウドネスを 1 秒ごと（`hop` = 10 区間。libebur128 と同じ）にした計測と、同じ走査の 10 Hz の短期のパワー
     /// （照合だけ）。
     fn analyze_with_one_second_hop(a: &Audio) -> (Detailed, Vec<f64>) {
-        let (pass, rate, channels, frames) =
-            scan_value(a, &NoMonitor).unwrap().finish_pass().unwrap();
+        let (pass, rate, channels, frames) = scan_value(a, &NoMonitor)
+            .unwrap()
+            .finish_pass(a.frames() as u64)
+            .unwrap();
         let s = ((u64::from(a.rate()) + 5) / 10) as usize;
         let ten_hz = joined_blocks(
             &pass.segments,

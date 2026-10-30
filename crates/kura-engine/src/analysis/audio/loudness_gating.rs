@@ -19,6 +19,7 @@ use crate::analysis::{
     Analysis, AnalysisExample, AnalysisOutput, AnalyzeCx, AnyOutput, AudioStream, Encoding,
     Estimate, NoParams, Real,
 };
+use crate::audio::stream::StreamEnd;
 use crate::error::EngineError;
 use crate::op::Numeric;
 use crate::shape::{Dim, Shape, ValueKind};
@@ -80,9 +81,13 @@ impl AudioStream for GatingStream {
         self.0.feed(start, planes, cx.mon)
     }
 
-    fn finish(self: Box<Self>, cx: &AnalyzeCx<'_>) -> Result<AnyOutput, EngineError> {
+    fn finish(
+        self: Box<Self>,
+        end: &StreamEnd,
+        cx: &AnalyzeCx<'_>,
+    ) -> Result<AnyOutput, EngineError> {
         cx.check()?;
-        Ok(std::sync::Arc::new(self.0.finish()?))
+        Ok(std::sync::Arc::new(self.0.finish_at(end.frames)?))
     }
 }
 
@@ -98,18 +103,22 @@ impl Analysis for LoudnessGating {
     type Params = NoParams;
     type Output = Measured;
 
-    /// 流れ（M13 段 1）：長さの分かる音声は窓の核（`LoudnessScan`）で流して解ける（`run` とビット単位で同じ）。
+    /// 流れ（M13 段 1・2）：窓の核（`LoudnessScan`）で流して解ける（`run` とビット単位で同じ）。長さが上限しか分からない形は
+    /// `LoudnessScan::open` で受ける。
     fn stream(_p: &NoParams, input: &Shape) -> Option<Box<dyn AudioStream>> {
         let Shape::Audio {
             rate,
             channels,
-            frames: Dim::Exact(n),
+            frames,
         } = *input
         else {
             return None;
         };
-        LoudnessScan::new(rate, usize::from(channels), n)
-            .ok()
+        let scan = match frames {
+            Dim::Exact(n) => LoudnessScan::new(rate, usize::from(channels), n),
+            Dim::AtMost(n) => LoudnessScan::open(rate, usize::from(channels), n),
+        };
+        scan.ok()
             .map(|scan| Box::new(GatingStream(scan)) as Box<dyn AudioStream>)
     }
 
