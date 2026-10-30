@@ -139,7 +139,7 @@ function opened(session = 'aa01', over: Partial<EditStepResultDto> = {}) {
     session,
     itemId: 7,
     baseVersion: 0,
-    source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png' },
+    source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png', audio: null },
     pixelArt: true,
     draft: { exists: false, fresh: true, updatedAt: null, opened: false },
     result: result(over),

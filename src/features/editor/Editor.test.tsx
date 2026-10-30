@@ -40,7 +40,7 @@ function openState() {
     kind: 'image',
     item: ITEM,
     session: 'aa01',
-    source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png' },
+    source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png', audio: null },
     status: {
       rev: 2,
       head: 2,

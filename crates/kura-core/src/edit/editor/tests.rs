@@ -827,7 +827,7 @@ fn open_refuses_other_kinds_and_replaces_the_previous_editor() {
         .db()
         .write(move |tx| {
             tx.execute("UPDATE items SET trashed_at = 1 WHERE id = ?1", [a])?;
-            tx.execute("UPDATE items SET kind = 'audio' WHERE id = ?1", [b])?;
+            tx.execute("UPDATE items SET kind = 'video' WHERE id = ?1", [b])?;
             Ok(())
         })
         .unwrap();

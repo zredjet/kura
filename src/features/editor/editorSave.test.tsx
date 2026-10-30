@@ -169,7 +169,7 @@ function opened(draft: Partial<Draft> = {}, over: Partial<EditStepResultDto> = {
     session: 'aa01',
     itemId: 7,
     baseVersion: 0,
-    source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png' },
+    source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png', audio: null },
     pixelArt: true,
     draft: { exists: false, fresh: true, updatedAt: null, opened: false, ...draft },
     result: result(over),

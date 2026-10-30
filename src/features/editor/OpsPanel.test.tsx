@@ -56,7 +56,7 @@ function setDoc(nodes: EditNodeDto[], selected: number | null = null, outputs = 
     phase: 'open',
     kind: 'image',
     item: { id: 7, title: 'hero', ext: 'png', kind: 'image' } as ItemSummaryDto,
-    source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png' },
+    source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png', audio: null },
     status: {
       rev: 2,
       head: 2,
@@ -396,7 +396,7 @@ describe('出力の形式', () => {
   it('元の形式に書けなければ（PSD）「元と同じ」を出さず、PNG で保存すると添える', async () => {
     setDoc([]);
     useEditorStore.setState({
-      source: { kind: 'image', width: 64, height: 32, frames: null, format: 'psd' },
+      source: { kind: 'image', width: 64, height: 32, frames: null, format: 'psd', audio: null },
       item: { id: 7, title: 'hero', ext: 'psd', kind: 'image' } as ItemSummaryDto,
     });
     render(<OpsPanel />);

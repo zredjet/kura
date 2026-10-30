@@ -14,10 +14,10 @@
 //! DTO はほかの班の dto.rs の変更とぶつからないよう、このファイルに置く（名前は `Edit` で始める）。
 
 use kura_core::edit::editor::{
-    self, AudioViewport, ChangedTiles, DocDelta, DraftInfo, EditorEnv, EditorError, FrameInfo,
-    ImageViewInfo, ImageViewport, NodeSummary, OpenRequest, Opened, Problem, ProblemCode, Rejected,
-    Sampled, SaveMode, SaveStarted, SourceInfo, Status, Step, StepOutcome, VersionSummary,
-    ViewInfo, ViewOutcome, Viewport,
+    self, AudioSourceInfo, AudioViewInfo, AudioViewport, ChangedSpans, ChangedTiles, DocDelta,
+    DraftInfo, EditorEnv, EditorError, FrameInfo, ImageViewInfo, ImageViewport, NodeSummary,
+    OpenRequest, Opened, Problem, ProblemCode, Rejected, Sampled, SaveMode, SaveStarted,
+    SourceInfo, Status, Step, StepOutcome, VersionSummary, ViewInfo, ViewOutcome, Viewport,
 };
 use kura_engine::Issue;
 use kura_engine::doc::{FormatChoice, NodeId, OutputSpec};
@@ -337,12 +337,99 @@ impl From<ChangedTiles> for EditChangedDto {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum EditViewDto {
     Image(EditImageViewDto),
+    Audio(EditAudioViewDto),
 }
 
 impl From<ViewInfo> for EditViewDto {
     fn from(v: ViewInfo) -> Self {
         match v {
             ViewInfo::Image(v) => Self::Image(v.into()),
+            ViewInfo::Audio(v) => Self::Audio(v.into()),
+        }
+    }
+}
+
+/// 出力のフレームの区間の変わり。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum EditSpansChangeDto {
+    /// すべて取り直す（最初の表示・形が変わった）。
+    All,
+    /// この区間だけ取り直す（空なら何も変わっていない）。
+    Spans { spans: Vec<EditSpanDto> },
+}
+
+impl From<ChangedSpans> for EditSpansChangeDto {
+    fn from(c: ChangedSpans) -> Self {
+        match c {
+            ChangedSpans::All => Self::All,
+            ChangedSpans::Spans(s) => Self::Spans {
+                spans: s.into_iter().map(span).collect(),
+            },
+        }
+    }
+}
+
+fn span((start, end): (u64, u64)) -> EditSpanDto {
+    EditSpanDto { start, end }
+}
+
+/// マーカー（出力のフレームの位置と名前）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+pub struct EditMarkerDto {
+    pub pos: u64,
+    pub name: String,
+}
+
+/// 音声の表示した結果（`/edit/{session}/{rev}/pcm/{a}-{b}` で、`valid` の区間の PCM を取る）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditAudioViewDto {
+    pub rev: u64,
+    /// 今の出力のレート・チャンネル数・長さ（フレーム）。
+    pub rate: u32,
+    pub channels: u16,
+    pub frames: u64,
+    /// 今の出力のループ点（終わりは含まない）。
+    #[serde(rename = "loop")]
+    pub loop_range: Option<EditSpanDto>,
+    pub markers: Vec<EditMarkerDto>,
+    /// 出力の指紋（量子化を含む）の先頭 8 バイトの 16 進。PCM の kura チャンクのデコーダ `kura-edit/1:{samplesId}`。
+    pub samples_id: String,
+    /// 前回の表示から変わった区間（出力のフレーム。この区間の PCM・波形を捨てる）。
+    pub changed: EditSpansChangeDto,
+    pub meta_changed: bool,
+    /// 公開した表示の値の有効な区間（PCM を取れる所）。
+    pub valid: Vec<EditSpanDto>,
+    /// 裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。
+    pub work: bool,
+    pub warnings: Vec<Issue>,
+    pub drawn_nodes: u64,
+    /// 描くのにかかった時間（ミリ秒）。
+    pub ms: f64,
+}
+
+impl From<AudioViewInfo> for EditAudioViewDto {
+    fn from(v: AudioViewInfo) -> Self {
+        Self {
+            rev: v.rev,
+            rate: v.rate,
+            channels: v.channels,
+            frames: v.frames,
+            loop_range: v.loop_range.map(span),
+            markers: v
+                .markers
+                .into_iter()
+                .map(|(pos, name)| EditMarkerDto { pos, name })
+                .collect(),
+            samples_id: v.samples_id,
+            changed: v.changed.into(),
+            meta_changed: v.meta_changed,
+            valid: v.valid.into_iter().map(span).collect(),
+            work: v.work,
+            warnings: v.warnings,
+            drawn_nodes: v.drawn_nodes,
+            ms: v.ms,
         }
     }
 }
@@ -516,16 +603,51 @@ impl From<DraftInfo> for EditDraftDto {
     }
 }
 
+/// 音声の元の形。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+pub struct EditAudioSourceDto {
+    pub rate: u32,
+    pub channels: u16,
+    pub frames: u64,
+    /// 元のファイルの標本のビット数（分かれば）と浮動小数か。
+    pub bits: Option<u16>,
+    pub float: bool,
+    /// 元のループ点。
+    #[serde(rename = "loop")]
+    pub loop_range: Option<EditSpanDto>,
+    /// 値を読んだデコーダの識別子。
+    pub decoder: String,
+    /// 遅延の源で開いた（全体を読んでいない）。
+    pub lazy: bool,
+}
+
+impl From<AudioSourceInfo> for EditAudioSourceDto {
+    fn from(a: AudioSourceInfo) -> Self {
+        Self {
+            rate: a.rate,
+            channels: a.channels,
+            frames: a.frames,
+            bits: a.bits,
+            float: a.float,
+            loop_range: a.loop_range.map(span),
+            decoder: a.decoder,
+            lazy: a.lazy,
+        }
+    }
+}
+
 /// 元の形。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
 pub struct EditSourceDto {
-    /// `image`・`frames`。
+    /// `image`・`frames`・`audio`。
     pub kind: String,
     pub width: u64,
     pub height: u64,
     pub frames: Option<u64>,
     /// 画素の形式（`rgba8`・`indexed8` など）。ファイルの形式ではない（ファイルの形式はアイテムの拡張子から）。
     pub format: Option<String>,
+    /// 音声の元（音声だけ）。
+    pub audio: Option<EditAudioSourceDto>,
 }
 
 impl From<SourceInfo> for EditSourceDto {
@@ -536,6 +658,7 @@ impl From<SourceInfo> for EditSourceDto {
             height: s.height,
             frames: s.frames,
             format: s.format,
+            audio: s.audio.map(Into::into),
         }
     }
 }
@@ -679,7 +802,7 @@ pub fn edit_ops() -> Vec<OpDescriptor> {
 
 // ===== コマンド =====
 
-/// エディタを開く（前のエディタは閉じる）。`fromDraft` が真で下書きがあれば、下書きの文書と土台で開く。画像だけ。
+/// エディタを開く（前のエディタは閉じる）。`fromDraft` が真で下書きがあれば、下書きの文書と土台で開く。画像と音声。
 #[tauri::command]
 #[specta::specta]
 pub async fn edit_open(
@@ -995,6 +1118,54 @@ mod tests {
             serde_json::to_value(EditViewOutcomeDto::from(ViewOutcome::Superseded)).unwrap(),
             json!({ "type": "superseded" })
         );
+        // 音声の表示
+        let audio = EditViewOutcomeDto::from(ViewOutcome::Shown(ViewInfo::Audio(AudioViewInfo {
+            rev: 4,
+            rate: 48_000,
+            channels: 2,
+            frames: 96_000,
+            loop_range: Some((10, 90_000)),
+            markers: vec![(5, "a".into())],
+            samples_id: "0123456789abcdef".into(),
+            changed: ChangedSpans::Spans(vec![(0, 65_536)]),
+            meta_changed: false,
+            valid: vec![(0, 96_000)],
+            work: true,
+            warnings: Vec::new(),
+            drawn_nodes: 1,
+            ms: 2.0,
+        })));
+        let json = serde_json::to_value(audio).unwrap();
+        assert_eq!(json["view"]["type"], json!("audio"));
+        assert_eq!(json["view"]["loop"], json!({ "start": 10, "end": 90000 }));
+        assert_eq!(json["view"]["samplesId"], json!("0123456789abcdef"));
+        assert_eq!(
+            json["view"]["changed"],
+            json!({ "type": "spans", "spans": [{ "start": 0, "end": 65536 }] })
+        );
+        assert_eq!(json["view"]["markers"], json!([{ "pos": 5, "name": "a" }]));
+        assert_eq!(json["view"]["valid"], json!([{ "start": 0, "end": 96000 }]));
+        assert_eq!(json["view"]["work"], json!(true));
+        let source = EditSourceDto::from(SourceInfo {
+            kind: "audio",
+            width: 0,
+            height: 0,
+            frames: None,
+            format: None,
+            audio: Some(AudioSourceInfo {
+                rate: 44_100,
+                channels: 1,
+                frames: 10,
+                bits: Some(16),
+                float: false,
+                loop_range: None,
+                decoder: "wav-rs-dec/1".into(),
+                lazy: true,
+            }),
+        });
+        let json = serde_json::to_value(source).unwrap();
+        assert_eq!(json["audio"]["loop"], json!(null));
+        assert_eq!(json["audio"]["lazy"], json!(true));
     }
 
     /// エディタのエラーは画面で分ける code にする。

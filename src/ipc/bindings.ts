@@ -64,7 +64,7 @@ export const commands = {
 	itemAssetSettingsSet: (ids: number[], patch: AssetSettingsPatchDto) => typedError<number, AppError>(__TAURI_INVOKE("item_asset_settings_set", { ids, patch })),
 	/**  アニメの帯の情報。帯がまだなければ、その場で作って `anim/ab/<hash>-1.png` に書く（長くても 0.4 秒ほど。ジョブにしない）。 */
 	itemAnimGet: (itemId: number) => typedError<AnimDto, AppError>(__TAURI_INVOKE("item_anim_get", { itemId })),
-	/**  エディタを開く（前のエディタは閉じる）。`fromDraft` が真で下書きがあれば、下書きの文書と土台で開く。画像だけ。 */
+	/**  エディタを開く（前のエディタは閉じる）。`fromDraft` が真で下書きがあれば、下書きの文書と土台で開く。画像と音声。 */
 	editOpen: (itemId: number, viewport: EditViewportDto, fromDraft: boolean | null) => typedError<EditOpenedDto_Serialize, AppError>(__TAURI_INVOKE("edit_open", { itemId, viewport, fromDraft })),
 	/**  手をまとめて当てて表示する（描くのは最後に 1 回）。 */
 	editStep: (session: string, steps: EditStepDto_Deserialize[], viewport: EditViewportDto) => typedError<EditStepResultDto_Serialize, AppError>(__TAURI_INVOKE("edit_step", { session, steps, viewport })),
@@ -788,6 +788,47 @@ export type DuplicatePolicyDto = "addMemberships" | "ignore";
  */
 export type Edit = Edit_Serialize | Edit_Deserialize;
 
+/**  音声の元の形。 */
+export type EditAudioSourceDto = {
+	rate: number,
+	channels: number,
+	frames: number,
+	/**  元のファイルの標本のビット数（分かれば）と浮動小数か。 */
+	bits: number | null,
+	float: boolean,
+	/**  元のループ点。 */
+	loop: EditSpanDto | null,
+	/**  値を読んだデコーダの識別子。 */
+	decoder: string,
+	/**  遅延の源で開いた（全体を読んでいない）。 */
+	lazy: boolean,
+};
+
+/**  音声の表示した結果（`/edit/{session}/{rev}/pcm/{a}-{b}` で、`valid` の区間の PCM を取る）。 */
+export type EditAudioViewDto = {
+	rev: number,
+	/**  今の出力のレート・チャンネル数・長さ（フレーム）。 */
+	rate: number,
+	channels: number,
+	frames: number,
+	/**  今の出力のループ点（終わりは含まない）。 */
+	loop: EditSpanDto | null,
+	markers: EditMarkerDto[],
+	/**  出力の指紋（量子化を含む）の先頭 8 バイトの 16 進。PCM の kura チャンクのデコーダ `kura-edit/1:{samplesId}`。 */
+	samplesId: string,
+	/**  前回の表示から変わった区間（出力のフレーム。この区間の PCM・波形を捨てる）。 */
+	changed: EditSpansChangeDto,
+	metaChanged: boolean,
+	/**  公開した表示の値の有効な区間（PCM を取れる所）。 */
+	valid: EditSpanDto[],
+	/**  裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。 */
+	work: boolean,
+	warnings: Issue[],
+	drawnNodes: number,
+	/**  描くのにかかった時間（ミリ秒）。 */
+	ms: number | null,
+};
+
 /**  音声の表示の要求。区間はどれも出力のフレーム。 */
 export type EditAudioViewportDto = {
 	/**  見えている区間（波形の段の作り直しを見えている所から進める。描く範囲には入れない）。 */
@@ -908,6 +949,12 @@ export type EditLogDto = {
 	count: number,
 };
 
+/**  マーカー（出力のフレームの位置と名前）。 */
+export type EditMarkerDto = {
+	pos: number,
+	name: string,
+};
+
 /**  ノードの要約。 */
 export type EditNodeDto = {
 	id: number,
@@ -1011,13 +1058,15 @@ export type EditSaveStartedDto_Serialize = {
 
 /**  元の形。 */
 export type EditSourceDto = {
-	/**  `image`・`frames`。 */
+	/**  `image`・`frames`・`audio`。 */
 	kind: string,
 	width: number,
 	height: number,
 	frames: number | null,
 	/**  画素の形式（`rgba8`・`indexed8` など）。ファイルの形式ではない（ファイルの形式はアイテムの拡張子から）。 */
 	format: string | null,
+	/**  音声の元（音声だけ）。 */
+	audio: EditAudioSourceDto | null,
 };
 
 /**  区間（フレームの半開区間 [start, end)）。 */
@@ -1025,6 +1074,13 @@ export type EditSpanDto = {
 	start: number,
 	end: number,
 };
+
+/**  出力のフレームの区間の変わり。 */
+export type EditSpansChangeDto = 
+/**  すべて取り直す（最初の表示・形が変わった）。 */
+{ type: "all" } | 
+/**  この区間だけ取り直す（空なら何も変わっていない）。 */
+{ type: "spans"; spans: EditSpanDto[] };
 
 /**  エディタの状態。 */
 export type EditStatusDto = {
@@ -1123,7 +1179,9 @@ export type EditVersionDto = {
 /**  表示した結果：種類ごとの和（`type` で分ける）。 */
 export type EditViewDto = {
 	type: "image",
-} & EditImageViewDto;
+} & EditImageViewDto | {
+	type: "audio",
+} & EditAudioViewDto;
 
 /**  表示の結果。 */
 export type EditViewOutcomeDto = { type: "shown"; view: EditViewDto } | 

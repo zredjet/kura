@@ -329,6 +329,7 @@ pub enum ChangedTiles {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewInfo {
     Image(ImageViewInfo),
+    Audio(super::audio::AudioViewInfo),
 }
 
 impl ViewInfo {
@@ -336,6 +337,7 @@ impl ViewInfo {
     pub fn rev(&self) -> u64 {
         match self {
             Self::Image(v) => v.rev,
+            Self::Audio(v) => v.rev,
         }
     }
 
@@ -343,6 +345,7 @@ impl ViewInfo {
     pub fn warnings(&self) -> &[Issue] {
         match self {
             Self::Image(v) => &v.warnings,
+            Self::Audio(v) => &v.warnings,
         }
     }
 
@@ -350,6 +353,15 @@ impl ViewInfo {
     pub fn image(&self) -> Option<&ImageViewInfo> {
         match self {
             Self::Image(v) => Some(v),
+            Self::Audio(_) => None,
+        }
+    }
+
+    /// 音声の表示（画像なら None）。
+    pub fn audio(&self) -> Option<&super::audio::AudioViewInfo> {
+        match self {
+            Self::Audio(v) => Some(v),
+            Self::Image(_) => None,
         }
     }
 }

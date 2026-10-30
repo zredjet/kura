@@ -24,6 +24,7 @@
 //!   同じ：中止 → キャッシュを空に → 確保を落とす → 取り置きを 0（NFR-17・ADR-154。取り置きは持ち主のエディタだけが外す：
 //!   `Reservation`）。
 
+pub mod audio;
 mod autosave;
 mod source;
 #[cfg(test)]
@@ -50,6 +51,7 @@ use kura_engine::{Digest, Engine, EngineError, Graph, Issue, Issues, Monitor, Pl
 use rusqlite::Connection;
 use serde_json::Value as Json;
 
+pub use audio::{AudioViewInfo, ChangedSpans};
 pub use tile::{TileError, TileFormat, TileRequest};
 pub use view::{
     AudioViewport, ChangedTiles, DocDelta, FrameInfo, ImageViewInfo, ImageViewport, LogSummary,
@@ -288,6 +290,23 @@ pub struct DraftInfo {
     pub opened: bool,
 }
 
+/// 音声の元の形の要約。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioSourceInfo {
+    pub rate: u32,
+    pub channels: u16,
+    pub frames: u64,
+    /// 元のファイルの標本の形式（分かれば。非可逆の形式は名乗った値）。
+    pub bits: Option<u16>,
+    pub float: bool,
+    /// 元のループ点（終わりは含まない）。
+    pub loop_range: Option<(u64, u64)>,
+    /// 値を読んだデコーダの識別子。
+    pub decoder: String,
+    /// 遅延の源で開いた（全体を読んでいない）。
+    pub lazy: bool,
+}
+
 /// 元の形の要約。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceInfo {
@@ -299,6 +318,8 @@ pub struct SourceInfo {
     pub frames: Option<u64>,
     /// 画素の形式（`rgba8`・`indexed8` など）。ファイルの形式（PNG など）ではない（ファイルの形式はアイテムの拡張子から）。
     pub format: Option<String>,
+    /// 音声の元（音声だけ）。
+    pub audio: Option<AudioSourceInfo>,
 }
 
 /// 開く要求。
@@ -397,12 +418,16 @@ struct Shown {
     rev: u64,
     level: u8,
     view: View,
+    /// 音声の出力の指紋（`samplesId`。画像は None）。
+    samples_id: Option<String>,
 }
 
 #[derive(Default)]
 struct Published {
     now: Option<Shown>,
     before: Option<Shown>,
+    /// 音声の元（文書の入力の値と、読んだデコーダの識別子。`/edit/{s}/input/pcm` が読む）。
+    input: Option<(kura_engine::Value, String)>,
 }
 
 /// 開いているエディタの状態（`Editor::state` の錠の中）。
@@ -426,6 +451,8 @@ struct State {
     pixel_art: bool,
     saving: Option<Saving>,
     needs_reopen: bool,
+    /// 音声のエディタの状態（画像は None）。
+    audio: Option<audio::AudioState>,
 }
 
 /// エディタの取り置き（`default_reserved`）の持ち主（エディタのセッション。ライブラリに 1 つ。`EngineServices` が持つ）。
@@ -553,7 +580,39 @@ impl Editor {
     fn publish(&self, rev: u64, level: u8, view: View) {
         let mut p = self.lock_published();
         p.before = p.now.take();
-        p.now = Some(Shown { rev, level, view });
+        p.now = Some(Shown {
+            rev,
+            level,
+            view,
+            samples_id: None,
+        });
+    }
+
+    /// 音声の表示を公開する（段は 0）。
+    fn publish_audio(&self, rev: u64, view: View, samples_id: String) {
+        let mut p = self.lock_published();
+        p.before = p.now.take();
+        p.now = Some(Shown {
+            rev,
+            level: 0,
+            view,
+            samples_id: Some(samples_id),
+        });
+    }
+
+    /// 音声の元（文書の入力の値と、読んだデコーダの識別子。配信用。音声でなければ None）。
+    pub fn published_input(&self) -> Option<(kura_engine::Value, String)> {
+        self.lock_published().input.clone()
+    }
+
+    /// 公開した今か直前の音声の表示のうち、rev が同じものの値と `samplesId`（配信用。なければ None）。
+    pub fn published_audio(&self, rev: u64) -> Option<(PartialValue, String)> {
+        let p = self.lock_published();
+        [p.now.as_ref(), p.before.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|s| s.rev == rev && s.samples_id.is_some())
+            .and_then(|s| Some((s.view.value().clone(), s.samples_id.clone()?)))
     }
 
     /// 閉じる：中止 → キャッシュを空に → 確保を落とす → 取り置きを 0（このエディタが取り置きの持ち主のときだけ。閉じ終わる前に
@@ -797,6 +856,9 @@ impl Editor {
             }));
         };
         let ivp = vp.image();
+        if matches!(full, Shape::Audio { .. }) {
+            return self.render_audio(st, vp, ticket, full, started);
+        }
         let want = view_level(&full, ivp.scale, ivp.interacting, st.pixel_art);
         let lp = match self.runtime.preview(|e| e.plan_level(&st.plan, want)) {
             Ok(lp) => lp,
@@ -1304,11 +1366,15 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             "ゴミ箱のアイテムは編集できません".into(),
         ));
     }
-    if head.kind != MediaKind::Image {
+    if !matches!(head.kind, MediaKind::Image | MediaKind::Audio) {
         return Err(EditorError::Invalid {
-            message: format!("{} は編集できません（画像だけ）", head.kind.as_str()),
+            message: format!("{} は編集できません（画像と音声だけ）", head.kind.as_str()),
             issues: Vec::new(),
         });
+    }
+    if head.kind == MediaKind::Audio {
+        // M11 の試聴の置き場が丸ごと読んだ値とその予算を返す（エディタと二重に持たない）
+        env.engine.pcm_cache().clear();
     }
     let draft = db.read(|c| {
         let Some(d) = drafts::get(c, item_id)? else {
@@ -1371,6 +1437,11 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
         .unwrap_or_default();
     let options_digest = anchors::options_digest(&opts)?;
     let anchor = db.read(|c| anchors::find(c, &original.hash, &options_digest))?;
+    let facts = if head.kind == MediaKind::Audio {
+        db.read(|c| Ok(audio::source::read_facts_stamp(c, &original.hash)?))?
+    } else {
+        None
+    };
     let layout = env.library.layout();
     let pixel_art = db
         .read(|c| crate::asset::get(c, item_id))
@@ -1411,6 +1482,8 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             }),
             pixel_art,
             from_draft: info.opened,
+            audio: head.kind == MediaKind::Audio,
+            facts,
         },
         &req.viewport,
     );
@@ -1447,6 +1520,10 @@ struct OpenParts {
     anchor: Option<(anchors::Anchor, std::path::PathBuf)>,
     pixel_art: bool,
     from_draft: bool,
+    /// 音声のアイテム。
+    audio: bool,
+    /// 元の中身の事実の行の読み取りの記録（音声だけ）。
+    facts: Option<audio::source::FactsStamp>,
 }
 
 /// 元を読み、状態を作って最初の表示を描く。
@@ -1458,20 +1535,11 @@ fn finish_open(
     let runtime = &editor.runtime;
     let limits = runtime.preview(|e| e.limits().clone());
     let started = Instant::now();
-    let read = source::read(&source::SourceCx {
-        runtime,
-        codecs: &editor.codecs,
-        original: &parts.original_path,
-        source: parts.source,
-        format: parts.format,
-        opts: &parts.opts,
-        anchor: parts.anchor,
-        limits: &limits,
-        mon: editor.cancel.as_ref(),
-    })?;
-    let shape = read.value.shape();
-    let source_info = source_info(&shape, read.value.clone());
-    let input = FingerprintedInput::decoded(read.value, parts.source, &read.decoded);
+    let read = read_input(editor, &parts, &limits)?;
+    let shape = read.input.value.shape();
+    let source_info = source_info(&shape, read.input.value.clone(), read.audio.as_ref());
+    let input = read.input;
+    let audio_state = read.audio.map(|input| audio::AudioState { input });
     let inputs = BTreeMap::from([(InputId(0), input)]);
     let shapes = BTreeMap::from([(InputId(0), shape)]);
     let (session, plan) = runtime.preview(|e| {
@@ -1537,7 +1605,11 @@ fn finish_open(
         pixel_art: parts.pixel_art,
         saving: None,
         needs_reopen: false,
+        audio: audio_state,
     };
+    if let (Some(a), Some(input)) = (&st.audio, st.inputs.get(&InputId(0))) {
+        editor.lock_published().input = Some((input.value.clone(), a.input.decoder.clone()));
+    }
     let ticket = editor.latest.issue(editor.cancel.clone());
     let view = editor.render(&mut st, vp, &ticket);
     let full = doc_delta(None, st.session.current());
@@ -1564,9 +1636,103 @@ fn finish_open(
     ))
 }
 
+/// 読んだ入力（音声なら元の要約も）。
+struct ReadInput {
+    input: FingerprintedInput,
+    audio: Option<audio::source::InputInfo>,
+    warnings: Vec<String>,
+}
+
+/// 元を読む：音声は遅延の源で開けるならそれ（[`audio::source::open_lazy`]）、ほかは今の道（丸ごと読む。音声は上限を確かめる）。
+fn read_input(
+    editor: &Editor,
+    parts: &OpenParts,
+    limits: &kura_engine::Limits,
+) -> Result<ReadInput, EditorError> {
+    let runtime = &editor.runtime;
+    if parts.audio {
+        let lazy = runtime.preview(|_| {
+            audio::source::open_lazy(&audio::source::LazyCx {
+                codecs: &editor.codecs,
+                original: &parts.original_path,
+                source: parts.source,
+                format: parts.format,
+                opts: &parts.opts,
+                anchor: parts.anchor.as_ref(),
+                facts: parts.facts.as_ref(),
+                limits,
+                threads: runtime.preview_threads(),
+                budget_total: runtime.budget().total(),
+            })
+        })?;
+        if let Some(o) = lazy {
+            return Ok(ReadInput {
+                input: o.input,
+                audio: Some(o.info),
+                warnings: Vec::new(),
+            });
+        }
+        // 丸ごと読む前に、長さの上限を確かめる
+        let shape = runtime
+            .preview(|_| {
+                editor.codecs.shape_path_monitored(
+                    &parts.original_path,
+                    parts.format,
+                    &parts.opts,
+                    limits,
+                    editor.cancel.as_ref(),
+                )
+            })
+            .map_err(|e| EditorError::from_engine("元の大きさを読めません", e))?
+            .0;
+        audio::source::check_whole_read(&shape, runtime.budget().total())?;
+    }
+    let read = source::read(&source::SourceCx {
+        runtime,
+        codecs: &editor.codecs,
+        original: &parts.original_path,
+        source: parts.source,
+        format: parts.format,
+        opts: &parts.opts,
+        anchor: parts.anchor.clone(),
+        limits,
+        mon: editor.cancel.as_ref(),
+    })?;
+    if parts.audio != matches!(read.value, kura_engine::Value::Audio(_)) {
+        return Err(EditorError::Invalid {
+            message: "アイテムの種類と元の中身（音声か）が合いません".into(),
+            issues: Vec::new(),
+        });
+    }
+    let audio = match &read.value {
+        kura_engine::Value::Audio(a) if parts.audio => Some(audio::source::InputInfo {
+            rate: a.rate(),
+            channels: u16::try_from(a.channels()).unwrap_or(u16::MAX),
+            frames: a.frames() as u64,
+            decoder: read.decoded.codec.clone(),
+            lazy: false,
+            decoded: Some(read.decoded.clone()),
+        }),
+        _ => None,
+    };
+    Ok(ReadInput {
+        input: FingerprintedInput::decoded(read.value, parts.source, &read.decoded),
+        audio,
+        warnings: read.warnings,
+    })
+}
+
 /// 元の形の要約。
-fn source_info(shape: &Shape, value: kura_engine::Value) -> SourceInfo {
+fn source_info(
+    shape: &Shape,
+    value: kura_engine::Value,
+    audio: Option<&audio::source::InputInfo>,
+) -> SourceInfo {
     let (width, height) = shape_size(shape);
+    let meta = match &value {
+        kura_engine::Value::Audio(a) => Some(a.meta.clone()),
+        _ => None,
+    };
     let format = PartialValue::full(value);
     match shape {
         Shape::Image { .. } => SourceInfo {
@@ -1575,6 +1741,7 @@ fn source_info(shape: &Shape, value: kura_engine::Value) -> SourceInfo {
             height,
             frames: None,
             format: format_name(&format),
+            audio: None,
         },
         Shape::Frames { count, .. } => SourceInfo {
             kind: "frames",
@@ -1582,14 +1749,28 @@ fn source_info(shape: &Shape, value: kura_engine::Value) -> SourceInfo {
             height,
             frames: Some(count.max()),
             format: format_name(&format),
+            audio: None,
         },
-        Shape::Audio { .. } => SourceInfo {
-            kind: "audio",
-            width,
-            height,
-            frames: None,
-            format: None,
-        },
+        Shape::Audio { .. } => {
+            let meta = meta.unwrap_or_default();
+            SourceInfo {
+                kind: "audio",
+                width,
+                height,
+                frames: None,
+                format: None,
+                audio: audio.map(|a| AudioSourceInfo {
+                    rate: a.rate,
+                    channels: a.channels,
+                    frames: a.frames,
+                    bits: meta.source.map(|s| s.bits),
+                    float: meta.source.is_some_and(|s| s.float),
+                    loop_range: meta.loop_range.map(|l| (l.start, l.end)),
+                    decoder: a.decoder.clone(),
+                    lazy: a.lazy,
+                }),
+            }
+        }
     }
 }
 
