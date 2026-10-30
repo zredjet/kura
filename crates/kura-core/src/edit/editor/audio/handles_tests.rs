@@ -1,0 +1,377 @@
+//! 時間の写しとハンドル（A11・A12）：`sourceMap`・`nodes[].marks` が出力の標本と合い、`Step::Handle` が下流の写しを逆に
+//! たどってノードの引数にする（なければ末尾に足す・外したノードは有効に戻す・写せなければ断って状態を変えない）。
+
+use kura_engine::Graph;
+use kura_engine::doc::NodeId;
+use serde_json::json;
+
+use super::handles::{Handle, HandleMode, Marks};
+use super::session_tests::*;
+use super::timeline::SourcePiece;
+use crate::edit::editor::{CommitMode, Edit, Step, Viewport};
+
+fn handle(h: Handle, node: Option<u32>, mode: HandleMode) -> Step {
+    Step::Handle {
+        handle: h,
+        node: node.map(NodeId),
+        mode,
+    }
+}
+
+const STEP: HandleMode = HandleMode::Commit(CommitMode::Step);
+
+/// 頭の文書のノードの引数。
+fn params(env: &Env, s: &str, node: u32) -> serde_json::Value {
+    let editor = env.editor(s);
+    let guard = editor.lock_state();
+    let st = guard.as_ref().unwrap();
+    let g = st.session.head().to_graph();
+    g.nodes
+        .iter()
+        .find(|n| n.id == NodeId(node))
+        .map(|n| n.params.clone())
+        .unwrap()
+}
+
+fn enabled(env: &Env, s: &str, node: u32) -> bool {
+    let editor = env.editor(s);
+    let guard = editor.lock_state();
+    let g = guard.as_ref().unwrap().session.head().to_graph();
+    g.nodes
+        .iter()
+        .find(|n| n.id == NodeId(node))
+        .unwrap()
+        .enabled
+}
+
+/// A11：trim → resample → fade → set_loop の文書で、元への写しと各ノードの印が出力のフレームで合う。
+#[test]
+fn source_map_and_marks_follow_the_chain() {
+    let env = Env::new();
+    let frames = 3 * C;
+    let bytes = noise_wav(8_000, 1, frames, 41);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    let vp = Viewport::audio_idle();
+    let out = env.step(
+        &s,
+        vec![
+            add(0, "audio.trim", json!({ "start": 1_000, "end": 50_000 })),
+            add(1, "audio.resample", json!({ "rate": 16_000 })),
+            add(
+                2,
+                "audio.fade",
+                json!({ "fadeIn": 600, "fadeOut": 400, "curve": "linear" }),
+            ),
+            add(
+                3,
+                "audio.set_loop",
+                json!({ "loop": { "start": 100, "end": 2_000 } }),
+            ),
+        ],
+        &vp,
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    let info = shown_audio(&out.view).clone();
+    assert_eq!((info.rate, info.frames), (16_000, 98_000));
+    assert_eq!(
+        info.source_map,
+        Some(vec![SourcePiece {
+            out_start: 0,
+            out_end: 98_000,
+            in_start: 1_000,
+            in_rate: 8_000,
+            out_rate: 16_000
+        }])
+    );
+    let ids: Vec<u32> = info.nodes.iter().map(|n| n.id.0).collect();
+    assert_eq!(ids, vec![1, 2, 3, 4]);
+    let n = &info.nodes;
+    assert_eq!((n[0].in_rate, n[0].in_frames), (8_000, frames));
+    assert_eq!((n[1].in_rate, n[1].in_frames), (8_000, 49_000));
+    assert_eq!((n[2].in_rate, n[2].in_frames), (16_000, 98_000));
+    // trim の枠は自分の写しを当てず、下流の resample で写す（入力を出しているときの位置）
+    assert_eq!(
+        n[0].marks,
+        Some(Marks::Trim {
+            start: 2_000,
+            end: 100_000
+        })
+    );
+    assert_eq!(n[1].marks, None);
+    assert_eq!(
+        n[2].marks,
+        Some(Marks::Fade {
+            in_end: Some(600),
+            out_start: Some(98_000 - 400)
+        })
+    );
+    assert_eq!(
+        n[3].marks,
+        Some(Marks::Loop {
+            start: 100,
+            end: 2_000
+        })
+    );
+    assert_eq!(info.loop_range, Some((100, 2_000)));
+
+    // trim だけなら、出力の標本は元への写しの位置の元の標本と同じ
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    let out = env.step(
+        &s,
+        vec![add(0, "audio.trim", json!({ "start": 1_000, "end": null }))],
+        &vp,
+    );
+    let info = shown_audio(&out.view).clone();
+    let map = info.source_map.clone().unwrap();
+    assert_eq!(map.len(), 1);
+    let original = rendered(&bytes, "wav", &Graph::new_single());
+    let (value, _) = env.editor(&s).published_audio(info.rev).unwrap();
+    for f in [0u64, 17, 5_000, info.frames - 1] {
+        let mut got = [0f32; 1];
+        value.audio_read(0, f, &mut got).unwrap();
+        let mut want = [0f32; 1];
+        original.read(0, map[0].in_start + f, &mut want).unwrap();
+        assert_eq!(got, want, "{f}");
+    }
+}
+
+/// A12：ノードがなければ末尾に足し、あれば SetParams。下流に resample があっても、写した引数でその位置に効く。
+#[test]
+fn handles_map_back_through_the_chain() {
+    let env = Env::new();
+    let bytes = noise_wav(8_000, 1, 3 * C, 42);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    let vp = Viewport::audio_idle();
+    // ノードがない：末尾に足す（値はそのまま引数）
+    let out = env.step(
+        &s,
+        vec![handle(Handle::FadeIn { end: 4_000 }, None, STEP)],
+        &vp,
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    assert_eq!(out.created, vec![NodeId(1)]);
+    assert_eq!(
+        params(&env, &s, 1),
+        json!({ "fadeIn": 4_000, "fadeOut": 0, "curve": "linear" })
+    );
+    // 下流に resample（8 → 16 kHz）：出力の 2,000 は fade の 1,000
+    let out = env.step(
+        &s,
+        vec![add(1, "audio.resample", json!({ "rate": 16_000 }))],
+        &vp,
+    );
+    assert!(out.rejected.is_none());
+    let out = env.step(
+        &s,
+        vec![handle(Handle::FadeIn { end: 2_000 }, Some(1), STEP)],
+        &vp,
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    assert_eq!(params(&env, &s, 1)["fadeIn"], json!(1_000));
+    let info = shown_audio(&out.view);
+    assert_eq!(
+        info.nodes[0].marks,
+        Some(Marks::Fade {
+            in_end: Some(2_000),
+            out_start: None
+        })
+    );
+    // フェードアウトの始まり：fadeOut = 入力の長さ − 戻した位置
+    let out = env.step(
+        &s,
+        vec![handle(
+            Handle::FadeOut { start: 6 * C - 100 },
+            Some(1),
+            STEP,
+        )],
+        &vp,
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    assert_eq!(params(&env, &s, 1)["fadeOut"], json!(50));
+    // ループ（末尾に足す）と消す
+    let out = env.step(
+        &s,
+        vec![handle(
+            Handle::Loop {
+                range: Some((10, 900)),
+            },
+            None,
+            STEP,
+        )],
+        &vp,
+    );
+    assert!(out.rejected.is_none());
+    assert_eq!(shown_audio(&out.view).loop_range, Some((10, 900)));
+    let out = env.step(
+        &s,
+        vec![handle(Handle::Loop { range: None }, Some(3), STEP)],
+        &vp,
+    );
+    assert!(out.rejected.is_none());
+    assert_eq!(shown_audio(&out.view).loop_range, None);
+}
+
+/// A12：preview → commitPreview で 1 手。外したノードは確定で有効に戻る（1 手）。写せない・操作の違う手は断り、状態を変えない。
+#[test]
+fn handle_drags_are_one_step_and_refusals_keep_the_state() {
+    let env = Env::new();
+    let bytes = noise_wav(8_000, 1, 3 * C, 43);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    let vp = Viewport::audio_idle();
+    env.step(
+        &s,
+        vec![
+            add(
+                0,
+                "audio.fade",
+                json!({ "fadeIn": 10, "fadeOut": 0, "curve": "linear" }),
+            ),
+            add(1, "audio.trim", json!({ "start": 1_000, "end": 2_000 })),
+        ],
+        &vp,
+    );
+    let before = env.step(&s, Vec::new(), &vp).status.head;
+    // ドラッグ：preview を続けて、離したら commitPreview（1 手）
+    for end in [100, 200, 300] {
+        let out = env.step(
+            &s,
+            vec![handle(Handle::FadeIn { end }, Some(1), HandleMode::Preview)],
+            &vp,
+        );
+        assert!(out.status.provisional);
+    }
+    let out = env.step(
+        &s,
+        vec![Step::CommitPreview {
+            mode: CommitMode::Step,
+        }],
+        &vp,
+    );
+    assert!(!out.status.provisional);
+    // fade の下流は trim [1000, 2000)：出力の 300 は fade の 1,300
+    assert_eq!(params(&env, &s, 1)["fadeIn"], json!(1_300));
+    let out = env.step(&s, vec![Step::Undo], &vp);
+    assert_eq!(out.status.head, before, "1 手で戻る");
+    assert_eq!(params(&env, &s, 1)["fadeIn"], json!(10));
+
+    // 外したノード：確定で有効に戻り、引数も替わる（1 手）
+    env.step(
+        &s,
+        vec![Step::Commit {
+            edit: Edit::SetEnabled {
+                node: NodeId(1),
+                enabled: false,
+            },
+            mode: CommitMode::Step,
+        }],
+        &vp,
+    );
+    assert!(!enabled(&env, &s, 1));
+    let out = env.step(
+        &s,
+        vec![handle(Handle::FadeIn { end: 50 }, Some(1), STEP)],
+        &vp,
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    assert!(enabled(&env, &s, 1));
+    assert_eq!(params(&env, &s, 1)["fadeIn"], json!(1_050));
+    env.step(&s, vec![Step::Undo], &vp);
+    assert!(!enabled(&env, &s, 1));
+    assert_eq!(params(&env, &s, 1)["fadeIn"], json!(10));
+
+    // 写せない（trim の外）・操作が違う：断って状態を変えない
+    let head = env.step(&s, Vec::new(), &vp).status;
+    for (step, why) in [
+        (
+            handle(Handle::FadeIn { end: 5_000 }, Some(1), STEP),
+            "写せない",
+        ),
+        (
+            handle(
+                Handle::Loop {
+                    range: Some((0, 5)),
+                },
+                Some(1),
+                STEP,
+            ),
+            "ではありません",
+        ),
+        (
+            handle(Handle::Trim { start: 9, end: 3 }, Some(2), STEP),
+            "前にします",
+        ),
+        (
+            handle(Handle::FadeIn { end: 5 }, Some(9), STEP),
+            "ありません",
+        ),
+    ] {
+        let out = env.step(&s, vec![step], &vp);
+        let r = out.rejected.expect("断るはず");
+        assert!(r.problem.message.contains(why), "{}", r.problem.message);
+        assert_eq!(out.status, head, "状態を変えない");
+    }
+}
+
+/// 切り詰めの道具の流れ：仮に外して入力を出し、印の位置で枠を出して、`[cancelPreview, handle{trim, step}]` で確定する。
+#[test]
+fn the_trim_tool_flow() {
+    let env = Env::new();
+    let bytes = noise_wav(8_000, 1, 3 * C, 44);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    let vp = Viewport::audio_idle();
+    env.step(
+        &s,
+        vec![add(
+            0,
+            "audio.trim",
+            json!({ "start": 1_000, "end": 2_000 }),
+        )],
+        &vp,
+    );
+    let out = env.step(
+        &s,
+        vec![Step::Preview {
+            edit: Edit::SetEnabled {
+                node: NodeId(1),
+                enabled: false,
+            },
+        }],
+        &vp,
+    );
+    let info = shown_audio(&out.view);
+    assert_eq!(info.frames, 3 * C, "外している間は入力を出す");
+    assert_eq!(
+        info.nodes[0].marks,
+        Some(Marks::Trim {
+            start: 1_000,
+            end: 2_000
+        })
+    );
+    let out = env.step(
+        &s,
+        vec![
+            Step::CancelPreview,
+            handle(
+                Handle::Trim {
+                    start: 500,
+                    end: 3 * C,
+                },
+                Some(1),
+                STEP,
+            ),
+        ],
+        &vp,
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    assert_eq!(params(&env, &s, 1), json!({ "start": 500, "end": null }));
+    assert_eq!(shown_audio(&out.view).frames, 3 * C - 500);
+}

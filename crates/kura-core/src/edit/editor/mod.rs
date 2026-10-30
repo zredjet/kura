@@ -225,6 +225,13 @@ pub enum Step {
     Paint {
         actions: Vec<Json>,
     },
+    /// 音声のハンドル（表示している出力のフレーム）を、対象のノードの引数にする手（`Paint` の音声版。`node` がなければ末尾に
+    /// 足す。M13 段 4）。
+    Handle {
+        handle: audio::handles::Handle,
+        node: Option<NodeId>,
+        mode: audio::handles::HandleMode,
+    },
 }
 
 /// エディタの状態（どの結果にも付ける）。
@@ -1114,6 +1121,33 @@ fn apply_steps(e: &Engine, st: &mut State, steps: Vec<Step>) -> (Vec<NodeId>, Op
             }
             Step::Paint { actions } => paint_edit(e, st.session.head(), actions)
                 .and_then(|edit| commit_checked(e, st, edit, CommitMode::Step)),
+            Step::Handle { handle, node, mode } => {
+                let chain = st.plan.time_chain(st.output).unwrap_or_default();
+                let output = st
+                    .plan
+                    .output_shapes()
+                    .into_iter()
+                    .find(|(id, _)| *id == st.output)
+                    .map(|(_, s)| s);
+                output
+                    .ok_or_else(|| EngineError::Internal("文書に出力がありません".into()))
+                    .and_then(|output| {
+                        audio::handles::handle_edit(
+                            e,
+                            &chain,
+                            &output,
+                            st.session.head(),
+                            &handle,
+                            node,
+                        )
+                    })
+                    .and_then(|edit| match mode {
+                        audio::handles::HandleMode::Preview => {
+                            preview_checked(e, st, edit).map(|()| None)
+                        }
+                        audio::handles::HandleMode::Commit(m) => commit_checked(e, st, edit, m),
+                    })
+            }
         };
         match r {
             Ok(Some(id)) => created.push(id),

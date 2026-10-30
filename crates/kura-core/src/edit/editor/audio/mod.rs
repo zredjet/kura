@@ -10,6 +10,9 @@
 //! - **予算**：公開した今と直前の表示の値（`resident_bytes`）を、エディタの確保の `extra` で数える（画像は数えない。
 //!   docs/editing.md §12.10）。
 
+pub mod handles;
+#[cfg(test)]
+mod handles_tests;
 pub mod peaks;
 #[cfg(test)]
 mod peaks_tests;
@@ -19,6 +22,7 @@ mod serve_tests;
 #[cfg(test)]
 mod session_tests;
 pub(super) mod source;
+pub mod timeline;
 
 use std::time::Instant;
 
@@ -83,6 +87,10 @@ pub struct AudioViewInfo {
     pub valid: Vec<(u64, u64)>,
     /// 波形の段の状態（`/edit/{s}/{peaks.rev}/peaks/{bin}/{tile}` で取る）。
     pub peaks: peaks::PeaksInfo,
+    /// 出力のフレームを元（文書の入力）のフレームへ写す区分（写せなければ None：聞き比べを出さない）。
+    pub source_map: Option<Vec<timeline::SourcePiece>>,
+    /// 出力につながるノード（入力 → 出力の順）の入力のレート・長さとハンドルの位置。
+    pub nodes: Vec<handles::AudioNodeView>,
     /// 裏の仕事が残っている（フロントは手が止まったら `work: true` で頼み直す）。
     pub work: bool,
     /// 描いたノード・当たったノードの警告。
@@ -302,6 +310,16 @@ impl Editor {
             }
             None => return failed(EditorError::Failed("音声の状態がありません".into())),
         };
+        let chain = plan.time_chain(st.output);
+        let input_shape = st.shapes.get(&kura_engine::doc::InputId(0)).copied();
+        let source_map = chain
+            .as_ref()
+            .zip(input_shape)
+            .and_then(|(c, s)| timeline::source_map(c, &s));
+        let nodes = chain
+            .as_ref()
+            .map(|c| handles::node_views(c, st.session.current()))
+            .unwrap_or_default();
         let info = AudioViewInfo {
             rev,
             rate,
@@ -318,6 +336,8 @@ impl Editor {
             meta_changed: vr.meta_changed,
             valid: valid_runs(&value, frames),
             peaks,
+            source_map,
+            nodes,
             work,
             warnings: vr.warnings.clone(),
             drawn_nodes: vr.drawn_nodes(),

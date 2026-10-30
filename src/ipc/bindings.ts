@@ -788,6 +788,27 @@ export type DuplicatePolicyDto = "addMemberships" | "ignore";
  */
 export type Edit = Edit_Serialize | Edit_Deserialize;
 
+/**  ノードの引数の位置を出力のフレームに写したもの。 */
+export type EditAudioMarksDto = 
+/**  切り詰めの枠（このノードを外して入力を出しているときの位置）。 */
+{ type: "trim"; start: number; end: number } | 
+/**  フェードインの終わり・フェードアウトの始まり（長さ 0・写せなければ null）。 */
+{ type: "fade"; inEnd: number | null; outStart: number | null } | 
+/**  ループの区間。 */
+{ type: "loop"; start: number; end: number };
+
+/**  出力につながるノード 1 つ（入力 → 出力の順）。 */
+export type EditAudioNodeDto = {
+	id: number,
+	op: string,
+	enabled: boolean,
+	/**  入力 0 のレートと長さ（引数の欄で時間と標本を変換する）。 */
+	inRate: number,
+	inFrames: number,
+	/**  ハンドルの位置（写せない・印のない操作は null）。 */
+	marks: EditAudioMarksDto | null,
+};
+
 /**  音声の元の形。 */
 export type EditAudioSourceDto = {
 	rate: number,
@@ -823,6 +844,10 @@ export type EditAudioViewDto = {
 	valid: EditSpanDto[],
 	/**  波形の段の状態。 */
 	peaks: EditPeaksInfoDto,
+	/**  出力のフレームを元のフレームへ写す区分（写せなければ null：聞き比べを出さない）。 */
+	sourceMap: EditSourcePieceDto[] | null,
+	/**  出力につながるノード。 */
+	nodes: EditAudioNodeDto[],
 	/**  裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。 */
 	work: boolean,
 	warnings: Issue[],
@@ -904,6 +929,20 @@ export type EditFrameTilesDto = {
 	frame: number,
 	tiles: ([number, number])[],
 };
+
+/**  音声のハンドル（どれも表示している出力のフレーム）。 */
+export type EditHandleDto = 
+/**  切り詰めの枠 `[start, end)`。 */
+{ type: "trim"; start: number; end: number } | 
+/**  フェードインの終わり。 */
+{ type: "fadeIn"; end: number } | 
+/**  フェードアウトの始まり。 */
+{ type: "fadeOut"; start: number } | 
+/**  ループの区間（null は消す）。 */
+{ type: "loop"; range: EditSpanDto | null };
+
+/**  ハンドルの手の当て方（`preview` はドラッグの途中、`step`・`merge` は確定）。 */
+export type EditHandleModeDto = "preview" | "step" | "merge";
 
 /**  画像の表示した結果。 */
 export type EditImageViewDto = {
@@ -1089,6 +1128,15 @@ export type EditSourceDto = {
 	audio: EditAudioSourceDto | null,
 };
 
+/**  元への写しの 1 区分（出力の `[outStart, outEnd)` は元の `inStart + round((out − outStart) × inRate / outRate)`）。 */
+export type EditSourcePieceDto = {
+	outStart: number,
+	outEnd: number,
+	inStart: number,
+	inRate: number,
+	outRate: number,
+};
+
 /**  区間（フレームの半開区間 [start, end)）。 */
 export type EditSpanDto = {
 	start: number,
@@ -1125,32 +1173,42 @@ export type EditStepDto = EditStepDto_Serialize | EditStepDto_Deserialize;
 /**  手 1 つ。 */
 export type EditStepDto_Deserialize = 
 /**  確定する（`merge` は同じ引数を続けて変える手を 1 手にまとめる：キーボードの矢印・数値の入力）。 */
-({ type: "commit"; edit: Edit_Deserialize; mode: CommitMode }) & { actions?: never } | 
+({ type: "commit"; edit: Edit_Deserialize; mode: CommitMode }) & { actions?: never; handle?: never; node?: never } | 
 /**  仮の値（スライダー・ドラッグの途中。履歴に入らない）。 */
-({ type: "preview"; edit: Edit_Deserialize }) & { actions?: never; mode?: never } | 
+({ type: "preview"; edit: Edit_Deserialize }) & { actions?: never; handle?: never; mode?: never; node?: never } | 
 /**  仮の値を確定する（ドラッグを離したら `step`）。 */
-({ type: "commitPreview"; mode: CommitMode }) & { actions?: never; edit?: never } | 
+({ type: "commitPreview"; mode: CommitMode }) & { actions?: never; edit?: never; handle?: never; node?: never } | 
 /**  仮の値を捨てる。 */
-({ type: "cancelPreview" }) & { actions?: never; edit?: never; mode?: never } | ({ type: "undo" }) & { actions?: never; edit?: never; mode?: never } | ({ type: "redo" }) & { actions?: never; edit?: never; mode?: never } | 
+({ type: "cancelPreview" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | ({ type: "undo" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | ({ type: "redo" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | 
 /**  まとめている途中の手を閉じる（blur・Enter）。 */
-({ type: "seal" }) & { actions?: never; edit?: never; mode?: never } | 
+({ type: "seal" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | 
 /**  描画の動作（`paint.actions` の要素）を 1 手で足す：末尾が有効な `paint.actions` ならそこへ追記、ほかなら末尾に足す。 */
-({ type: "paint"; actions: JsonValue[] }) & { edit?: never; mode?: never };
+({ type: "paint"; actions: JsonValue[] }) & { edit?: never; handle?: never; mode?: never; node?: never } | 
+/**
+ *  音声のハンドル（表示している出力のフレーム）を、ノード `node` の引数にする（なければ末尾に足す）。Rust が下流の時間の
+ *  写しを逆にたどってノードの座標にする。外したノードは有効に戻す。写せなければ断る。
+ */
+({ type: "handle"; handle: EditHandleDto; node: number | null; mode: EditHandleModeDto }) & { actions?: never; edit?: never };
 
 /**  手 1 つ。 */
 export type EditStepDto_Serialize = 
 /**  確定する（`merge` は同じ引数を続けて変える手を 1 手にまとめる：キーボードの矢印・数値の入力）。 */
-({ type: "commit"; edit: Edit_Serialize; mode: CommitMode }) & { actions?: never } | 
+({ type: "commit"; edit: Edit_Serialize; mode: CommitMode }) & { actions?: never; handle?: never; node?: never } | 
 /**  仮の値（スライダー・ドラッグの途中。履歴に入らない）。 */
-({ type: "preview"; edit: Edit_Serialize }) & { actions?: never; mode?: never } | 
+({ type: "preview"; edit: Edit_Serialize }) & { actions?: never; handle?: never; mode?: never; node?: never } | 
 /**  仮の値を確定する（ドラッグを離したら `step`）。 */
-({ type: "commitPreview"; mode: CommitMode }) & { actions?: never; edit?: never } | 
+({ type: "commitPreview"; mode: CommitMode }) & { actions?: never; edit?: never; handle?: never; node?: never } | 
 /**  仮の値を捨てる。 */
-({ type: "cancelPreview" }) & { actions?: never; edit?: never; mode?: never } | ({ type: "undo" }) & { actions?: never; edit?: never; mode?: never } | ({ type: "redo" }) & { actions?: never; edit?: never; mode?: never } | 
+({ type: "cancelPreview" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | ({ type: "undo" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | ({ type: "redo" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | 
 /**  まとめている途中の手を閉じる（blur・Enter）。 */
-({ type: "seal" }) & { actions?: never; edit?: never; mode?: never } | 
+({ type: "seal" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | 
 /**  描画の動作（`paint.actions` の要素）を 1 手で足す：末尾が有効な `paint.actions` ならそこへ追記、ほかなら末尾に足す。 */
-({ type: "paint"; actions: JsonValue[] }) & { edit?: never; mode?: never };
+({ type: "paint"; actions: JsonValue[] }) & { edit?: never; handle?: never; mode?: never; node?: never } | 
+/**
+ *  音声のハンドル（表示している出力のフレーム）を、ノード `node` の引数にする（なければ末尾に足す）。Rust が下流の時間の
+ *  写しを逆にたどってノードの座標にする。外したノードは有効に戻す。写せなければ断る。
+ */
+({ type: "handle"; handle: EditHandleDto; node: number | null; mode: EditHandleModeDto }) & { actions?: never; edit?: never };
 
 /**  手（と表示）の結果。 */
 export type EditStepResultDto = EditStepResultDto_Serialize | EditStepResultDto_Deserialize;

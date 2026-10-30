@@ -13,7 +13,9 @@
 //!
 //! DTO はほかの班の dto.rs の変更とぶつからないよう、このファイルに置く（名前は `Edit` で始める）。
 
+use kura_core::edit::editor::audio::handles::{AudioNodeView, Handle, HandleMode, Marks};
 use kura_core::edit::editor::audio::peaks::PeaksInfo;
+use kura_core::edit::editor::audio::timeline::SourcePiece;
 use kura_core::edit::editor::{
     self, AudioSourceInfo, AudioViewInfo, AudioViewport, ChangedSpans, ChangedTiles, DocDelta,
     DraftInfo, EditorEnv, EditorError, FrameInfo, ImageViewInfo, ImageViewport, NodeSummary,
@@ -142,6 +144,64 @@ pub enum EditStepDto {
         #[specta(type = Vec<JsonValue>)]
         actions: Vec<serde_json::Value>,
     },
+    /// 音声のハンドル（表示している出力のフレーム）を、ノード `node` の引数にする（なければ末尾に足す）。Rust が下流の時間の
+    /// 写しを逆にたどってノードの座標にする。外したノードは有効に戻す。写せなければ断る。
+    Handle {
+        handle: EditHandleDto,
+        node: Option<u32>,
+        mode: EditHandleModeDto,
+    },
+}
+
+/// 音声のハンドル（どれも表示している出力のフレーム）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum EditHandleDto {
+    /// 切り詰めの枠 `[start, end)`。
+    Trim { start: u64, end: u64 },
+    /// フェードインの終わり。
+    FadeIn { end: u64 },
+    /// フェードアウトの始まり。
+    FadeOut { start: u64 },
+    /// ループの区間（null は消す）。
+    Loop { range: Option<EditSpanDto> },
+}
+
+/// ハンドルの手の当て方（`preview` はドラッグの途中、`step`・`merge` は確定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum EditHandleModeDto {
+    Preview,
+    Step,
+    Merge,
+}
+
+impl From<EditHandleDto> for Handle {
+    fn from(h: EditHandleDto) -> Self {
+        match h {
+            EditHandleDto::Trim { start, end } => Self::Trim { start, end },
+            EditHandleDto::FadeIn { end } => Self::FadeIn { end },
+            EditHandleDto::FadeOut { start } => Self::FadeOut { start },
+            EditHandleDto::Loop { range } => Self::Loop {
+                range: range.map(|s| (s.start, s.end)),
+            },
+        }
+    }
+}
+
+impl From<EditHandleModeDto> for HandleMode {
+    fn from(m: EditHandleModeDto) -> Self {
+        match m {
+            EditHandleModeDto::Preview => Self::Preview,
+            EditHandleModeDto::Step => Self::Commit(CommitMode::Step),
+            EditHandleModeDto::Merge => Self::Commit(CommitMode::Merge),
+        }
+    }
 }
 
 impl From<EditStepDto> for Step {
@@ -155,6 +215,11 @@ impl From<EditStepDto> for Step {
             EditStepDto::Redo => Self::Redo,
             EditStepDto::Seal => Self::Seal,
             EditStepDto::Paint { actions } => Self::Paint { actions },
+            EditStepDto::Handle { handle, node, mode } => Self::Handle {
+                handle: handle.into(),
+                node: node.map(NodeId),
+                mode: mode.into(),
+            },
         }
     }
 }
@@ -411,6 +476,85 @@ impl From<PeaksInfo> for EditPeaksInfoDto {
     }
 }
 
+/// 元への写しの 1 区分（出力の `[outStart, outEnd)` は元の `inStart + round((out − outStart) × inRate / outRate)`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSourcePieceDto {
+    pub out_start: u64,
+    pub out_end: u64,
+    pub in_start: u64,
+    pub in_rate: u32,
+    pub out_rate: u32,
+}
+
+impl From<SourcePiece> for EditSourcePieceDto {
+    fn from(p: SourcePiece) -> Self {
+        Self {
+            out_start: p.out_start,
+            out_end: p.out_end,
+            in_start: p.in_start,
+            in_rate: p.in_rate,
+            out_rate: p.out_rate,
+        }
+    }
+}
+
+/// ノードの引数の位置を出力のフレームに写したもの。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum EditAudioMarksDto {
+    /// 切り詰めの枠（このノードを外して入力を出しているときの位置）。
+    Trim { start: u64, end: u64 },
+    /// フェードインの終わり・フェードアウトの始まり（長さ 0・写せなければ null）。
+    Fade {
+        in_end: Option<u64>,
+        out_start: Option<u64>,
+    },
+    /// ループの区間。
+    Loop { start: u64, end: u64 },
+}
+
+impl From<Marks> for EditAudioMarksDto {
+    fn from(m: Marks) -> Self {
+        match m {
+            Marks::Trim { start, end } => Self::Trim { start, end },
+            Marks::Fade { in_end, out_start } => Self::Fade { in_end, out_start },
+            Marks::Loop { start, end } => Self::Loop { start, end },
+        }
+    }
+}
+
+/// 出力につながるノード 1 つ（入力 → 出力の順）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditAudioNodeDto {
+    pub id: u32,
+    pub op: String,
+    pub enabled: bool,
+    /// 入力 0 のレートと長さ（引数の欄で時間と標本を変換する）。
+    pub in_rate: u32,
+    pub in_frames: u64,
+    /// ハンドルの位置（写せない・印のない操作は null）。
+    pub marks: Option<EditAudioMarksDto>,
+}
+
+impl From<AudioNodeView> for EditAudioNodeDto {
+    fn from(n: AudioNodeView) -> Self {
+        Self {
+            id: n.id.0,
+            op: n.op,
+            enabled: n.enabled,
+            in_rate: n.in_rate,
+            in_frames: n.in_frames,
+            marks: n.marks.map(Into::into),
+        }
+    }
+}
+
 /// マーカー（出力のフレームの位置と名前）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
 pub struct EditMarkerDto {
@@ -440,6 +584,10 @@ pub struct EditAudioViewDto {
     pub valid: Vec<EditSpanDto>,
     /// 波形の段の状態。
     pub peaks: EditPeaksInfoDto,
+    /// 出力のフレームを元のフレームへ写す区分（写せなければ null：聞き比べを出さない）。
+    pub source_map: Option<Vec<EditSourcePieceDto>>,
+    /// 出力につながるノード。
+    pub nodes: Vec<EditAudioNodeDto>,
     /// 裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。
     pub work: bool,
     pub warnings: Vec<Issue>,
@@ -466,6 +614,10 @@ impl From<AudioViewInfo> for EditAudioViewDto {
             meta_changed: v.meta_changed,
             valid: v.valid.into_iter().map(span).collect(),
             peaks: v.peaks.into(),
+            source_map: v
+                .source_map
+                .map(|m| m.into_iter().map(Into::into).collect()),
+            nodes: v.nodes.into_iter().map(Into::into).collect(),
             work: v.work,
             warnings: v.warnings,
             drawn_nodes: v.drawn_nodes,
@@ -1007,9 +1159,14 @@ mod tests {
             { "type": "paint", "actions": [{ "type": "fill", "at": { "x": 1, "y": 2 },
                 "color": { "rgba": [1, 2, 3, 255] }, "tolerance": 0, "connectivity": "four",
                 "contiguous": true, "frame": 0 }] },
+            { "type": "handle", "handle": { "type": "trim", "start": 5, "end": 900 }, "node": 3,
+              "mode": "step" },
+            { "type": "handle", "handle": { "type": "loop", "range": null }, "node": null,
+              "mode": "preview" },
+            { "type": "handle", "handle": { "type": "fadeOut", "start": 70 }, "mode": "merge" },
         ]))
         .unwrap();
-        assert_eq!(steps.len(), 8);
+        assert_eq!(steps.len(), 11);
         let steps: Vec<Step> = steps.into_iter().map(Into::into).collect();
         assert!(matches!(
             &steps[0],
@@ -1025,11 +1182,38 @@ mod tests {
             }
         ));
         assert!(matches!(&steps[7], Step::Paint { actions } if actions.len() == 1));
+        assert_eq!(
+            steps[8],
+            Step::Handle {
+                handle: Handle::Trim { start: 5, end: 900 },
+                node: Some(NodeId(3)),
+                mode: HandleMode::Commit(CommitMode::Step)
+            }
+        );
+        assert_eq!(
+            steps[9],
+            Step::Handle {
+                handle: Handle::Loop { range: None },
+                node: None,
+                mode: HandleMode::Preview
+            }
+        );
+        assert_eq!(
+            steps[10],
+            Step::Handle {
+                handle: Handle::FadeOut { start: 70 },
+                node: None,
+                mode: HandleMode::Commit(CommitMode::Merge)
+            }
+        );
         for bad in [
             json!({ "type": "jump" }),
             json!({ "type": "commit", "edit": { "type": "removeNode", "node": 1 } }),
             json!({ "type": "commit", "mode": "step", "edit": { "type": "removeNode", "node": 1, "x": 0 } }),
             json!({ "type": "paint", "actions": [], "extra": 0 }),
+            json!({ "type": "handle", "handle": { "type": "trim", "start": 0 }, "mode": "step" }),
+            json!({ "type": "handle", "handle": { "type": "fadeIn", "end": 1, "x": 0 }, "mode": "step" }),
+            json!({ "type": "handle", "handle": { "type": "loop", "range": null }, "mode": "commit" }),
         ] {
             assert!(
                 serde_json::from_value::<EditStepDto>(bad.clone()).is_err(),
@@ -1181,6 +1365,24 @@ mod tests {
                     changed: ChangedSpans::All,
                     pending: true,
                 },
+                source_map: Some(vec![SourcePiece {
+                    out_start: 0,
+                    out_end: 96_000,
+                    in_start: 100,
+                    in_rate: 48_000,
+                    out_rate: 48_000,
+                }]),
+                nodes: vec![AudioNodeView {
+                    id: NodeId(2),
+                    op: "audio.fade".into(),
+                    enabled: true,
+                    in_rate: 48_000,
+                    in_frames: 96_000,
+                    marks: Some(Marks::Fade {
+                        in_end: Some(10),
+                        out_start: None,
+                    }),
+                }],
                 work: true,
                 warnings: Vec::new(),
                 drawn_nodes: 1,
@@ -1200,6 +1402,15 @@ mod tests {
         assert_eq!(json["view"]["work"], json!(true));
         assert_eq!(json["view"]["peaks"]["tileBins"], json!(1024));
         assert_eq!(json["view"]["peaks"]["changed"], json!({ "type": "all" }));
+        assert_eq!(
+            json["view"]["sourceMap"],
+            json!([{ "outStart": 0, "outEnd": 96000, "inStart": 100, "inRate": 48000, "outRate": 48000 }])
+        );
+        assert_eq!(
+            json["view"]["nodes"][0]["marks"],
+            json!({ "type": "fade", "inEnd": 10, "outStart": null })
+        );
+        assert_eq!(json["view"]["nodes"][0]["inFrames"], json!(96000));
         let source = EditSourceDto::from(SourceInfo {
             kind: "audio",
             width: 0,
