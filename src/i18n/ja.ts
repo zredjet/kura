@@ -1136,6 +1136,98 @@ export const ja = {
     unsavedMessage: (title: string) =>
       `「${title}」の編集を保存していません。保存しないと、変更は失われます。`,
     dontSave: '保存しない',
+    // ===== 音声エディタ（M13） =====
+    audio: {
+      label: '音声エディタ',
+      wave: '編集中の音声の波形',
+      waveOf: (title: string) => `編集中の音声の波形：${title}`,
+      toolNames: { select: '選択', trim: '切り詰め', fade: 'フェード', loop: 'ループ' },
+      toolKeys: { select: 'S', trim: 'T', fade: 'F', loop: 'R' },
+      /** 上部の一行「48 kHz · 24 ビット · ステレオ · 3:12.500」（ビットは非可逆の形式では出さない）。 */
+      meta: (rate: string, bits: string | null, channels: string, duration: string) =>
+        [rate, bits, channels, duration].filter(Boolean).join(' · '),
+      // 再生
+      transport: '再生',
+      play: '再生',
+      stop: '止める',
+      toStart: '先頭へ',
+      loopAudition: 'ループを試聴',
+      loopAuditionStop: '試聴を止める',
+      abLabel: '聞き比べ',
+      abSource: '元',
+      abEdited: '編集後',
+      position: (now: string, total: string) => `${now} / ${total}`,
+      rateUnsupported: (n: string) => `このサンプルレート（${n} Hz）は再生できません`,
+      abUnavailable: '元との対応が分からないので聞き比べられません',
+      playFailed: (reason: string) => `再生できませんでした：${reason}`,
+      noLoop: 'ループ点がありません',
+      // 切り詰め
+      trimHint: '端をドラッグして範囲を決め、↵ で切り詰めます',
+      trimCancel: 'やめる（esc）',
+      trimConfirm: '切り詰める（↵）',
+      trimWaiting: '切り詰める前の音声を表示しています…',
+      trimUseParams:
+        'この切り詰めの後ろに時間を変える操作があるので、枠では直せません。右の欄で範囲を直してください',
+      start: '始め',
+      end: '終わり',
+      // フェード・ループ
+      fadeIn: 'フェードイン',
+      fadeOut: 'フェードアウト',
+      curve: '曲線',
+      loopClear: 'ループ点を消す',
+      snapZero: 'ゼロ交差に吸着',
+      // 選択
+      selectionToTrim: '選択の範囲に切り詰める',
+      selectionToLoop: '選択をループにする',
+      selectHint: 'ドラッグで範囲を選びます（⇧クリックで広げる・esc で外す）',
+      fadeHint: '上の角の三角をドラッグして長さを決めます',
+      loopHint: '目盛りの旗をドラッグしてループの区間を決めます',
+      // 時刻と状況
+      samples: (n: string) => `${n} 標本`,
+      width: (time: string) => `表示 ${time}`,
+      cursorAt: (time: string, samples: string) => `${time}（${samples} 標本）`,
+      selectionAt: (from: string, to: string, length: string) => `${from} – ${to}（${length}）`,
+      peaksPending: '波形を更新しています…',
+      peaksBuilding: '波形を作っています…',
+      timeField: (label: string) => `${label}（分:秒.ミリ秒）`,
+      badTime: '「1:02.345」の形で入れてください',
+      // ラウドネス
+      loudnessTitle: 'ラウドネス',
+      measuring: '計っています…',
+      target: '目標',
+      targets: [
+        { value: -23, label: '−23 LUFS（放送）' },
+        { value: -24, label: '−24 LUFS' },
+        { value: -16, label: '−16 LUFS' },
+        { value: -14, label: '−14 LUFS（配信）' },
+      ],
+      diff: (d: string) => `目標との差 ${d} LU`,
+      normalizeTarget: '正規化の目標',
+      alignToTarget: 'この目標にそろえる',
+      measureFailed: (m: string) => `ラウドネスを計れませんでした：${m}`,
+      notMeasured: 'まだ計っていません',
+      // 失うもの
+      losses: '保存で失うもの',
+      lossLoop: (fmt: string) => `${fmt} ではループ点を保存できません`,
+      lossMarkers: (fmt: string) => `${fmt} ではマーカーを保存できません`,
+      lossLossy: (fmt: string) => `${fmt} は非可逆なので、保存すると音がわずかに変わります`,
+      lossBits: (fmt: string) => `${fmt} では 16 ビットより細かい標本を保存できません`,
+      // 形式のシート（段 4C の edit_formats のあと）
+      formatUnavailableTitle: (fmt: string) => `${fmt} では保存できません`,
+      formatUnavailableBody: (fmt: string) =>
+        `ffmpeg が見つからないので ${fmt} に書けません。保存する形式を選んでください（設定の外部ツールで ffmpeg を指定すると ${fmt} で保存できます）`,
+      formatChoose: '保存する形式',
+      needsFfmpeg: 'ffmpeg が要ります',
+      // 素材の設定
+      assetSettingsCheckAudio:
+        '長さが変わりました。試聴のループが新しい長さに合っているか確かめてください',
+      /** チャンネルの段の左上の印（モノラルは出さない。ステレオは L・R、3 つ目からは番号）。 */
+      channelLabel: (i: number, channels: number) =>
+        channels <= 1 ? '' : i === 0 ? 'L' : i === 1 ? 'R' : String(i + 1),
+      zoomIn: '拡大（⌘+）',
+      zoomOut: '縮小（⌘−）',
+      viewWidth: '表示の幅',
+    },
   },
   welcome: {
     title: 'Kura へようこそ',
