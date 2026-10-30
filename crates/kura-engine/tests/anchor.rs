@@ -821,3 +821,204 @@ fn bench_anchor_sizes() {
         );
     }
 }
+
+/// 値を作業用の f32 WAV に流して書き、封をしたもの（M13 段 2）。
+fn sealed(v: &Value, stamp: &DecodeStamp, cx: &AnchorContext) -> Vec<u8> {
+    use kura_engine::audio::stream::{AudioSink, StreamEnd, StreamInfo, stream_value};
+    use kura_engine::codec::DecodeSink;
+    use kura_engine::codec::wav::F32WavWriter;
+    struct Feed<'a>(&'a mut F32WavWriter<Cursor<Vec<u8>>>, u64);
+    impl AudioSink for Feed<'_> {
+        fn begin(&mut self, info: &StreamInfo) -> Result<(), EngineError> {
+            self.1 = info.frames;
+            self.0.begin(&kura_engine::codec::DecodeInfo {
+                rate: info.rate,
+                channels: info.channels,
+                frames: kura_engine::Dim::Exact(info.frames),
+                expect: info.frames,
+            })
+        }
+        fn feed(
+            &mut self,
+            start: u64,
+            planes: &[&[f32]],
+            mon: &dyn kura_engine::Monitor,
+        ) -> Result<(), EngineError> {
+            self.0.feed(start, planes, mon)
+        }
+        fn finish(&mut self) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+    let Value::Audio(a) = v else { panic!() };
+    // 前の中身が残る書き先でも、頭から書き直す
+    let mut w = F32WavWriter::new(Cursor::new(vec![9u8; 100_000]));
+    let mut feed = Feed(&mut w, 0);
+    stream_value(a, None, &mut feed, &NoMonitor).unwrap();
+    let frames = feed.1;
+    w.end(&StreamEnd {
+        frames,
+        meta: a.meta.clone(),
+    })
+    .unwrap();
+    let end = w.data_end();
+    let mut out = w.into_inner();
+    let st = anchor::seal_wav(&mut out, end, stamp, cx, &a.meta, &Limits::default()).unwrap();
+    let bytes = out.into_inner();
+    assert_eq!(st.bytes, bytes.len() as u64);
+    bytes
+}
+
+/// E42（M13 段 2）：封をした作業用の f32 WAV は、同じ値を `anchor::write` で書いたものとバイト単位で同じ。`open_source` で
+/// 読むと同じ値・同じ記録になり、`verify_stream` が通る。標本を壊したアンカー・記録の違うものは `AnchorBroken`。
+#[test]
+fn sealed_work_file_equals_anchor_write() {
+    use kura_engine::error::Mismatch;
+    let cx = AnchorContext {
+        source: Some(Digest([5; 32])),
+        format: Some("m4a".into()),
+        options: DecodeOptions::default(),
+    };
+    let gens = [
+        InputGen::AudioNoise {
+            rate: 44_100,
+            channels: 2,
+            frames: 17 * kura_engine::value::AUDIO_CHUNK as u64 + 3,
+            seed: 1,
+        },
+        InputGen::WithMeta {
+            base: Box::new(InputGen::AudioNoise {
+                rate: 8_000,
+                channels: 3,
+                frames: 1_001,
+                seed: 2,
+            }),
+            meta: MetaGen::default(),
+        },
+        InputGen::Sine {
+            rate: 22_050,
+            channels: 1,
+            frames: 0,
+            freq: 440,
+            loop_range: None,
+        },
+    ];
+    for g in gens {
+        let mut v = g.generate().unwrap();
+        // NaN のペイロードはそのまま書く（ビット列を変えない）
+        if let Value::Audio(a) = &v {
+            let mut planes = a.read_planes(0, a.frames()).unwrap();
+            if let Some(x) = planes[0].get_mut(5) {
+                *x = f32::from_bits(0xffc0_1234);
+            }
+            let meta = AudioMeta {
+                loop_range: (a.frames() > 10).then_some(LoopRange { start: 1, end: 9 }),
+                markers: vec![Marker {
+                    pos: 0,
+                    name: "頭".into(),
+                }],
+                ..a.meta.clone()
+            };
+            v = Value::Audio(Arc::new(
+                Audio::new(a.rate(), planes.into_iter().map(Arc::new).collect(), meta).unwrap(),
+            ));
+        }
+        let stamp = fake_stamp(&v);
+        let mut want = Vec::new();
+        anchor::write(&v, &stamp, &cx, &Limits::default(), &mut want, &NoMonitor).unwrap();
+        let got = sealed(&v, &stamp, &cx);
+        assert!(
+            got == want,
+            "{g:?}：封をしたファイルが anchor::write と違う"
+        );
+        let bytes = Arc::new(got);
+        let opener: kura_engine::audio::source::Opener = {
+            let bytes = bytes.clone();
+            Arc::new(move || {
+                Ok(Box::new(Cursor::new(bytes.as_ref().clone()))
+                    as Box<dyn kura_engine::codec::ReadSeek + Send>)
+            })
+        };
+        let opened = CodecSet::pinned()
+            .open_audio_source(
+                &opener,
+                anchor::FORMAT,
+                &DecodeOptions::default(),
+                &Limits::default(),
+                1 << 20,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened.recorded.as_ref(), Some(&stamp));
+        assert_eq!(opened.value.digest().unwrap(), stamp.value_digest);
+        let h = anchor::verify_stream(&opener, &stamp, &Limits::default(), &NoMonitor).unwrap();
+        assert_eq!(h.decoded, stamp);
+        // 記録の違うもの
+        let mut other = stamp.clone();
+        other.codec = "other-dec/1".into();
+        assert!(matches!(
+            anchor::verify_stream(&opener, &other, &Limits::default(), &NoMonitor),
+            Err(EngineError::Mismatch(Mismatch::AnchorBroken { .. }))
+        ));
+        // 標本を壊したもの（data の頭の標本）
+        let Value::Audio(a) = &v else { panic!() };
+        if a.frames() > 0 {
+            let mut broken = bytes.as_ref().clone();
+            let at = if a.channels() > 2 { 68 } else { 44 };
+            broken[at] ^= 1;
+            let broken = Arc::new(broken);
+            let opener: kura_engine::audio::source::Opener = Arc::new(move || {
+                Ok(Box::new(Cursor::new(broken.as_ref().clone()))
+                    as Box<dyn kura_engine::codec::ReadSeek + Send>)
+            });
+            assert!(matches!(
+                anchor::verify_stream(&opener, &stamp, &Limits::default(), &NoMonitor),
+                Err(EngineError::Mismatch(Mismatch::AnchorBroken { .. }))
+            ));
+        }
+    }
+}
+
+/// E42（M13 段 2）：流れのデコードを作業用の f32 WAV に書いて、読んだ記録で封をすると、デコードした値を `anchor::write` で
+/// 書いたものと同じバイト列になる（Platform の偽のデコーダの読み取りの記録）。
+#[test]
+fn streamed_decode_into_the_work_file_is_an_anchor() {
+    use kura_engine::codec::wav::F32WavWriter;
+    let set = CodecSet::pinned();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/flac-24.flac");
+    let opts = DecodeOptions::default();
+    let limits = Limits::default();
+    let (v, stamp) = set
+        .decode_path(&path, "flac", &opts, &limits, &NoMonitor)
+        .unwrap();
+    let mut w = F32WavWriter::new(Cursor::new(Vec::new()));
+    let got = set
+        .decode_stream_path(&path, "flac", &opts, &limits, &mut w, &NoMonitor)
+        .unwrap();
+    assert_eq!(got, stamp);
+    assert!(w.is_done());
+    let cx = AnchorContext::default();
+    let Value::Audio(a) = &v else { panic!() };
+    let end = w.data_end();
+    let mut out = w.into_inner();
+    anchor::seal_wav(&mut out, end, &stamp, &cx, &a.meta, &limits).unwrap();
+    let mut want = Vec::new();
+    anchor::write(&v, &stamp, &cx, &limits, &mut want, &NoMonitor).unwrap();
+    assert!(out.into_inner() == want);
+}
+
+/// 形の上限で RIFF に収まらない音声（4 GiB を超える）は、作業用の f32 WAV に書き始める前に `Limit`。
+#[test]
+fn work_file_over_4_gib_is_refused_before_writing() {
+    use kura_engine::codec::wav::F32WavWriter;
+    use kura_engine::codec::{DecodeInfo, DecodeSink};
+    let mut w = F32WavWriter::new(Cursor::new(vec![1u8; 10]));
+    let big = DecodeInfo {
+        rate: 96_000,
+        channels: 2,
+        frames: kura_engine::Dim::AtMost(600_000_000),
+        expect: 1,
+    };
+    assert!(matches!(w.begin(&big), Err(EngineError::Limit(_))));
+    assert_eq!(w.into_inner().into_inner(), vec![1u8; 10], "書いていない");
+}

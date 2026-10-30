@@ -506,6 +506,126 @@ pub fn open_source(
     }))
 }
 
+/// 作業用の f32 WAV（`wav::F32WavWriter` が書いたもの。data は `data_end` で終わる）に封をしてアンカーにする（M13 段 2）：
+/// data のあとに `kura` チャンク（[`write`] と同じヘッダ。中身はメタデータ `meta`）を足し、RIFF の大きさを直す。封をした
+/// ファイルは、同じ値を [`write`] で書いたものとバイト単位で同じ（E42）。値のダイジェストは照らさない（ここには値がない）
+/// ので、使う前に [`verify_stream`] で照らす。メタデータの上限は [`write`] と同じに確かめる。
+pub fn seal_wav<W: Write + std::io::Seek>(
+    out: &mut W,
+    data_end: u64,
+    decoded: &DecodeStamp,
+    cx: &AnchorContext,
+    meta: &AudioMeta,
+    limits: &Limits,
+) -> Result<AnchorStamp, EngineError> {
+    let header = AnchorHeader {
+        v: HEADER_VERSION,
+        anchor: ENC_ID.to_string(),
+        body: wav_body().to_string(),
+        decoded: decoded.clone(),
+        source: cx.source,
+        format: cx.format.clone(),
+        options: cx.options.clone(),
+        content: AnchorContent::Audio { meta: meta.clone() },
+    };
+    let payload = header_payload(&header)?;
+    if payload.len() as u64 > limits.max_meta_bytes {
+        return Err(EngineError::Limit(format!(
+            "アンカーのメタデータ（{} バイト）が上限 {} を超えます",
+            payload.len(),
+            limits.max_meta_bytes
+        )));
+    }
+    let payload_len = payload.len() as u64;
+    let pad = payload_len & 1;
+    let total = data_end + 8 + payload_len + pad;
+    if total - 8 > u64::from(u32::MAX) {
+        return Err(EngineError::Limit(
+            "4 GiB を超える音声はアンカー（WAV）にできません".into(),
+        ));
+    }
+    out.seek(SeekFrom::Start(data_end))?;
+    out.write_all(&WAV_HEADER)?;
+    out.write_all(&(payload_len as u32).to_le_bytes())?;
+    out.write_all(&payload)?;
+    if pad == 1 {
+        out.write_all(&[0])?;
+    }
+    out.seek(SeekFrom::Start(4))?;
+    out.write_all(&((total - 8) as u32).to_le_bytes())?;
+    out.seek(SeekFrom::Start(total))?;
+    out.flush()?;
+    Ok(AnchorStamp {
+        codec: ENC_ID,
+        body: wav_body(),
+        value_digest: decoded.value_digest,
+        bytes: total,
+    })
+}
+
+/// [`verify_stream`] が源の LRU に置く上限（バイト。窓 1 つ分をステレオで 4 つ）。
+const VERIFY_LRU: u64 = 32 << 20;
+
+/// 音声のアンカーを流して照らす（M13 段 2）：[`open_source`] で開き、遅延の値を窓ごとに流して値のダイジェスト
+/// （`PcmTreeDigest`）を取り、ヘッダの記録・`expect` と照らす。[`verify`] と違い値を丸ごと持たない（持つのは源の LRU と
+/// 窓の分）。合わなければ [`Mismatch::AnchorBroken`]。
+pub fn verify_stream(
+    opener: &crate::audio::source::Opener,
+    expect: &DecodeStamp,
+    limits: &Limits,
+    mon: &dyn Monitor,
+) -> Result<AnchorHeader, EngineError> {
+    let header = {
+        let mut src = opener()?;
+        parse(src.as_mut(), limits)?.header
+    };
+    if header.decoded != *expect {
+        return Err(broken("元の読み取りの記録が違うアンカーです"));
+    }
+    let opened = open_source(opener, limits, VERIFY_LRU)?
+        .ok_or_else(|| broken("音声のアンカーではありません"))?;
+    let Value::Audio(a) = &opened.value else {
+        return Err(broken("中身の種類がヘッダと合いません"));
+    };
+    let mut sink = DigestSink {
+        digest: crate::audio::digest::PcmTreeDigest::new(
+            a.rate(),
+            a.channels(),
+            a.frames() as u64,
+        )?,
+    };
+    crate::audio::stream::stream_value(a, None, &mut sink, mon).map_err(body_err)?;
+    let digest = sink.digest.finish(&a.meta)?;
+    if digest != expect.value_digest {
+        return Err(broken("読み直した値が元の読み取りの記録と違います"));
+    }
+    Ok(header)
+}
+
+/// 流れの窓をダイジェストに足す受け手（[`verify_stream`]）。
+struct DigestSink {
+    digest: crate::audio::digest::PcmTreeDigest,
+}
+
+impl crate::audio::stream::AudioSink for DigestSink {
+    fn begin(&mut self, _info: &crate::audio::stream::StreamInfo) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.digest.push_window(start, planes, mon)
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
 /// アンカーの形（ヘッダと中のデコーダの形。描く前の上限の判断に使う）。
 pub fn shape(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Shape, EngineError> {
     let p = parse(src, limits)?;

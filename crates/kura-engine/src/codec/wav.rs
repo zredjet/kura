@@ -6,14 +6,15 @@
 //! - 書く：PCM の 8/16/24/32 ビットか浮動小数の 32 ビット。整数への丸めは偶数への丸めで、範囲で止める（ディザはしない）。
 //!   int16・int24 を読んで同じビット数で書くと、ビット単位で元に戻る（E17）。
 
-use std::io::{SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use serde_json::json;
 
 use crate::audio::source::{Opener, PcmFileSource};
+use crate::audio::stream::StreamEnd;
 use crate::codec::pcm::{self, PcmLayout, SampleEncoding, quantize};
-use crate::codec::stream::{self, DecodeInfo, DecodeOut};
+use crate::codec::stream::{self, DecodeInfo, DecodeOut, DecodeSink};
 use crate::codec::{Decoder, Encoder, MetaCaps, OpenedSource, ReadSeek, Tier, caps_of, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -484,6 +485,218 @@ pub fn open_source(
         decoder: DEC_ID,
         recorded: None,
     }))
+}
+
+/// 長さを切り詰められる書き先（作業用の f32 WAV を書き直すとき、前の中身を捨てる）。
+pub trait SetLen {
+    /// 長さを `len` バイトにする。
+    fn set_len(&mut self, len: u64) -> std::io::Result<()>;
+}
+
+impl SetLen for std::fs::File {
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        std::fs::File::set_len(self, len)
+    }
+}
+
+impl SetLen for std::io::BufWriter<std::fs::File> {
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        self.flush()?;
+        self.get_ref().set_len(len)
+    }
+}
+
+impl SetLen for std::io::Cursor<Vec<u8>> {
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        let len = usize::try_from(len).map_err(|_| std::io::Error::other("長すぎます"))?;
+        self.get_mut().truncate(len);
+        Ok(())
+    }
+}
+
+/// 作業用の f32 WAV の書き手（M13 段 2。docs/editing.md §9.11）：流れのデコード（`DecodeSink`）を、アンカーの中と同じ並びの
+/// f32 の WAV（2 チャンネル以下は形式 3、3 チャンネル以上は拡張形式で既定のマスク）に書く。`begin` で頭から書き直し
+/// （大きさ 0 のヘッダ）、`feed` でインターリーブの f32 LE（ビットはそのまま）を 1 MiB の作業列を通して書き、`end` で
+/// data と RIFF の大きさを書き直す。このあと `anchor::seal_wav` で封をすれば、`anchor::write` と同じバイト列のアンカーになる。
+pub struct F32WavWriter<W: Write + Seek + SetLen + Send> {
+    out: W,
+    channels: usize,
+    rate: u32,
+    /// data の中身の始まり（ヘッダの長さ）。
+    data_start: u64,
+    /// 書いたフレームの数。
+    frames: u64,
+    buf: Vec<u8>,
+    done: bool,
+}
+
+/// 作業列の大きさ（バイト）。
+const WRITER_BUF: usize = 1 << 20;
+
+impl<W: Write + Seek + SetLen + Send> F32WavWriter<W> {
+    /// 書き先 `out` で作る。
+    pub fn new(out: W) -> Self {
+        Self {
+            out,
+            channels: 0,
+            rate: 0,
+            data_start: 0,
+            frames: 0,
+            buf: Vec::new(),
+            done: false,
+        }
+    }
+
+    /// 書き先を返す。
+    pub fn into_inner(self) -> W {
+        self.out
+    }
+
+    /// data の終わり（`end` のあと。`anchor::seal_wav` に渡す）。
+    pub fn data_end(&self) -> u64 {
+        self.data_start + self.frames * self.channels as u64 * 4
+    }
+
+    /// 書き終えたか（`end` を呼んだ）。
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// 作業領域（作業列）の大きさ（バイト）。
+    pub fn work_bytes() -> u64 {
+        WRITER_BUF as u64
+    }
+
+    fn header(&self, data_len: u64) -> Result<Vec<u8>, EngineError> {
+        let too_big =
+            || EngineError::Limit("4 GiB を超える音声は作業用のファイルにできません".into());
+        let channels = u16::try_from(self.channels).map_err(|_| too_big())?;
+        let block_align = channels.checked_mul(4).ok_or_else(too_big)?;
+        let extensible = channels > 2;
+        let fmt_len: u64 = if extensible { 40 } else { 16 };
+        let riff = 4 + 8 + fmt_len + 8 + data_len;
+        if riff > u64::from(u32::MAX) || data_len >= u64::from(u32::MAX) {
+            return Err(too_big());
+        }
+        let byte_rate = self
+            .rate
+            .checked_mul(u32::from(block_align))
+            .ok_or_else(too_big)?;
+        let mut head = Vec::with_capacity(12 + 8 + 40 + 8);
+        head.extend_from_slice(b"RIFF");
+        head.extend_from_slice(&(riff as u32).to_le_bytes());
+        head.extend_from_slice(b"WAVE");
+        head.extend_from_slice(b"fmt ");
+        head.extend_from_slice(&(fmt_len as u32).to_le_bytes());
+        head.extend_from_slice(&(if extensible { 0xFFFEu16 } else { 3 }).to_le_bytes());
+        head.extend_from_slice(&channels.to_le_bytes());
+        head.extend_from_slice(&self.rate.to_le_bytes());
+        head.extend_from_slice(&byte_rate.to_le_bytes());
+        head.extend_from_slice(&block_align.to_le_bytes());
+        head.extend_from_slice(&32u16.to_le_bytes());
+        if extensible {
+            head.extend_from_slice(&22u16.to_le_bytes());
+            head.extend_from_slice(&32u16.to_le_bytes());
+            let mask = crate::codec::platform::default_channel_mask(channels).unwrap_or(0);
+            head.extend_from_slice(&mask.to_le_bytes());
+            // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+            head.extend_from_slice(&[
+                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+                0x9B, 0x71,
+            ]);
+        }
+        head.extend_from_slice(b"data");
+        head.extend_from_slice(&(data_len as u32).to_le_bytes());
+        Ok(head)
+    }
+
+    fn flush_buf(&mut self) -> Result<(), EngineError> {
+        if !self.buf.is_empty() {
+            self.out.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write + Seek + SetLen + Send> DecodeSink for F32WavWriter<W> {
+    fn begin(&mut self, info: &DecodeInfo) -> Result<(), EngineError> {
+        self.channels = info.channels;
+        self.rate = info.rate;
+        self.frames = 0;
+        self.done = false;
+        // 形の上限で RIFF に収まるかを先に確かめる
+        let bound = info
+            .frames
+            .max()
+            .checked_mul(info.channels as u64 * 4)
+            .ok_or_else(|| {
+                EngineError::Limit("4 GiB を超える音声は作業用のファイルにできません".into())
+            })?;
+        self.header(bound)?;
+        let head = self.header(0)?;
+        self.data_start = head.len() as u64;
+        self.out.seek(SeekFrom::Start(0))?;
+        self.out.set_len(0)?;
+        self.out.write_all(&head)?;
+        if self.buf.capacity() == 0 {
+            self.buf
+                .try_reserve_exact(WRITER_BUF)
+                .map_err(|_| EngineError::Limit("書き出しの作業領域を確保できません".into()))?;
+        }
+        self.buf.clear();
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let n = planes.first().map_or(0, |p| p.len());
+        if start != self.frames
+            || planes.len() != self.channels
+            || planes.iter().any(|p| p.len() != n)
+        {
+            return Err(EngineError::Internal(format!(
+                "作業用の WAV の窓が順でないか形が違います（{start} から。次は {}）",
+                self.frames
+            )));
+        }
+        let block = self.channels * 4;
+        for f in 0..n {
+            if self.buf.len() + block > WRITER_BUF {
+                if mon.canceled() {
+                    return Err(EngineError::Canceled);
+                }
+                self.flush_buf()?;
+            }
+            for p in planes {
+                self.buf.extend_from_slice(&p[f].to_bits().to_le_bytes());
+            }
+        }
+        self.frames += n as u64;
+        Ok(())
+    }
+
+    fn end(&mut self, end: &StreamEnd) -> Result<(), EngineError> {
+        if end.frames != self.frames {
+            return Err(EngineError::Internal(format!(
+                "作業用の WAV の長さが合いません（{} と {}）",
+                end.frames, self.frames
+            )));
+        }
+        self.flush_buf()?;
+        let data_len = self.frames * self.channels as u64 * 4;
+        let head = self.header(data_len)?;
+        self.out.seek(SeekFrom::Start(0))?;
+        self.out.write_all(&head)?;
+        self.out.seek(SeekFrom::Start(self.data_start + data_len))?;
+        self.out.flush()?;
+        self.done = true;
+        Ok(())
+    }
 }
 
 impl Encoder for WavCodec {
