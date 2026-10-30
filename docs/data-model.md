@@ -20,7 +20,9 @@ Kura Library.kuralib/
   anim/ab/<blake3>-1.png        # アニメの帯（見たときにその場で作る。末尾は帯の並べ方の版 ANIM_V。tEXt `kura-anim` に帯の情報と作った元の鍵。
                                 #   staging/anim-<pid>-<連番>.png.part に書いてから改名する。M11）
   staging/                      # 取り込み・ダウンロード・キャプチャの一時置き場。M11 から、波形の段・アニメの帯の書きかけと、
-                                #   エンジンの ffmpeg の段の一時ファイル（staging/engine/）も置く。M12 から、保存のジョブの書きかけ
+                                #   エンジンの ffmpeg の段の一時ファイル（staging/engine/）も置く。M13 から、作業用の PCM
+                                #   （staging/pcm/<元のハッシュ>-<鍵>.wav。アンカーの形の f32 WAV。DB に置かず、閉じるときに消す）も置く。
+                                #   M12 から、保存のジョブの書きかけ
                                 #   （staging/edit-<job>-out.<ext>.part・staging/edit-<job>-anchor.<png|wav>.part。sync_all してから
                                 #   files/ へ同じボリュームの中で改名する）も置く。開くときに消す
   archives/                     # yt-dlp / gallery-dl の download-archive
@@ -421,6 +423,9 @@ CREATE TABLE settings (
 --       'analysis.decoders' = 解析で読む形式（見出しで決める HEIC・HEIF を含む）ごとの、段の順のデコーダの識別子（解析のジョブが
 --                             コーデックの組を作ったときに比べ、今の組にないデコーダで読んだものと、並びが変わった形式で失敗して
 --                             いたもの・読まずに形式から書いたもの（decoder が NULL）を pending に戻す。M11）
+--       'analysis.retry'    = 一度きりの解き直しの印（{"v":1}。M13 段 2。起動のスレッドの sync_plan が、置いた版より新しい版の
+--                             UPDATE を一度だけ当てる。v1 は前の版で too_large になった音声を pending に戻す。事実の表の全件の
+--                             走査は版が上がったときだけ）
 --       'analysis.inflight' = 解析のジョブが OS のデコーダ（Platform の段）を通りうる形式を読んでいるアイテム（{"id","hash"}。
 --                             1 件ずつ解くので 1 件だけ。コーデックの組にその形式の Platform のデコーダがあれば、どの段が読むかに
 --                             よらず読む前（HEIC・HEIF の見出しを読む前も）にコミットし、書いたら・落ちずに失敗したら消す。アプリの
