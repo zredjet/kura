@@ -36,6 +36,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -761,6 +762,204 @@ impl AudioSink for Patcher {
             &self.fresh,
             &crate::monitor::NoMonitor,
         )?);
+        Ok(())
+    }
+}
+
+/// 波形の段の部分更新を小分けに受けるもの（M13 段 4。エディタの波形の段）：[`Patcher`] と同じ規則（R のチャンクだけを
+/// 標本から作り、ほかは前の段から写す）で、前の段を `Arc` で共有したまま（写さずに）持ち、R のチャンクを何回にも分けて
+/// 受ける（表示の値のチャンクを [`PeaksPatch::feed_chunk`] で・流れの窓を [`PeaksPatch::partial`] で、混ぜてよい）。
+/// R をすべて受けたら [`PeaksPatch::assemble`] で段を組む（結果は新しい値を `compute` したものと同じ。E46）。
+pub struct PeaksPatch {
+    /// 前の段（None は前の段なし：R は全部）。
+    old: Option<Arc<Peaks>>,
+    params: PeaksParams,
+    rate: u32,
+    channels: u16,
+    frames: u64,
+    r: ChunkSet,
+    fresh: BTreeMap<usize, Vec<i16>>,
+}
+
+impl PeaksPatch {
+    /// 前の段 `old`（引数 `params`）から、長さ `frames` の新しい値の段を、変わった区間 `changed` に掛かるチャンク
+    /// （[`patch_chunks`]）だけ作り直す準備をする。レート・チャンネルの数は前の段と同じ。
+    pub fn new(old: Arc<Peaks>, params: PeaksParams, frames: u64, changed: &Spans) -> Self {
+        let r = patch_chunks(old.frames, frames, changed);
+        Self {
+            rate: old.rate,
+            channels: old.channels,
+            old: Some(old),
+            params,
+            frames,
+            r,
+            fresh: BTreeMap::new(),
+        }
+    }
+
+    /// 前の段なし：レート `rate`・`channels` チャンネル・長さ `frames` の値の段を、すべてのチャンクから作る準備をする。
+    pub fn fresh(params: PeaksParams, rate: u32, channels: u16, frames: u64) -> Self {
+        let count = usize::try_from(frames.div_ceil(JOB_FRAMES as u64)).unwrap_or(usize::MAX);
+        Self {
+            old: None,
+            params,
+            rate,
+            channels,
+            frames,
+            r: ChunkSet::all(count),
+            fresh: BTreeMap::new(),
+        }
+    }
+
+    /// 作る段の長さ（フレーム）。
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// 作る段のレート。
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// 作る段のチャンネルの数。
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// 作り直すチャンク R。
+    pub fn target(&self) -> &ChunkSet {
+        &self.r
+    }
+
+    /// R のうち、まだ受けていないチャンク。
+    pub fn missing(&self) -> ChunkSet {
+        let mut m = self.r.clone();
+        for k in self.fresh.keys() {
+            m.remove(*k);
+        }
+        m
+    }
+
+    /// まだ受けていないチャンクの区間（流す区間）。
+    pub fn missing_spans(&self) -> Spans {
+        crate::render::audio::chunk_spans(
+            &self.missing(),
+            usize::try_from(self.frames).unwrap_or(usize::MAX),
+        )
+    }
+
+    /// 受けたチャンクのビンの持つバイト数（予算に数える）。
+    pub fn fresh_bytes(&self) -> u64 {
+        self.fresh
+            .values()
+            .map(|v| (v.len() as u64).saturating_mul(2))
+            .fold(0, u64::saturating_add)
+    }
+
+    /// チャンク `index` の全チャンネルの中身（チャンネルの順。長さはそのチャンクの長さ）を受ける。R の外は何もしない。
+    pub fn feed_chunk(&mut self, index: usize, planes: &[&[f32]]) -> Result<(), EngineError> {
+        if !self.r.contains(index) {
+            return Ok(());
+        }
+        let start = (index as u64).saturating_mul(JOB_FRAMES as u64);
+        let len = self.frames.saturating_sub(start).min(JOB_FRAMES as u64);
+        if planes.len() != usize::from(self.channels)
+            || planes.iter().any(|p| p.len() as u64 != len)
+        {
+            return Err(EngineError::Internal(format!(
+                "波形の部分更新のチャンク {index} の形が違います"
+            )));
+        }
+        let b0 = self.params.bins().first().copied().unwrap_or(PEAK_BINS[0]) as usize;
+        self.fresh.insert(index, chunk_finest(planes, b0)?);
+        Ok(())
+    }
+
+    /// 流れで受ける口（`begin` で形を確かめ、`feed` の窓の R のチャンクを受け、`finish` は何もしない）。窓は R の一部でよい
+    /// （何回にも分けて流してよい）。
+    pub fn partial(&mut self) -> PeaksPatchSink<'_> {
+        PeaksPatchSink { patch: self }
+    }
+
+    /// 段を組む（R をすべて受けていなければ `Internal`）。
+    pub fn assemble(&self, mon: &dyn Monitor) -> Result<Peaks, EngineError> {
+        let missing = self.missing();
+        if !missing.is_empty() {
+            return Err(EngineError::Internal(format!(
+                "波形の部分更新で、まだ受けていないチャンクが {} 個あります",
+                missing.count()
+            )));
+        }
+        let empty;
+        let old: &Peaks = match &self.old {
+            Some(old) => old,
+            None => {
+                empty = Peaks {
+                    rate: self.rate,
+                    channels: self.channels,
+                    frames: 0,
+                    levels: self
+                        .params
+                        .bins()
+                        .into_iter()
+                        .map(|bin| PeakLevel {
+                            bin,
+                            data: Vec::new(),
+                        })
+                        .collect(),
+                };
+                &empty
+            }
+        };
+        assemble(old, &self.params, self.frames, &self.r, &self.fresh, mon)
+    }
+}
+
+/// [`PeaksPatch::partial`] の流れの口。
+pub struct PeaksPatchSink<'a> {
+    patch: &'a mut PeaksPatch,
+}
+
+impl AudioSink for PeaksPatchSink<'_> {
+    fn begin(&mut self, info: &StreamInfo) -> Result<(), EngineError> {
+        let p = &self.patch;
+        if info.rate != p.rate
+            || info.channels != usize::from(p.channels)
+            || info.frames != p.frames
+        {
+            return Err(EngineError::Internal(
+                "波形の部分更新の流れの形が新しい値と違います".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        if !start.is_multiple_of(JOB_FRAMES as u64) {
+            return Err(EngineError::Internal(
+                "波形の部分更新の窓がチャンクに揃っていません".into(),
+            ));
+        }
+        let n = planes.first().map_or(0, |p| p.len());
+        let first = usize::try_from(start / JOB_FRAMES as u64)
+            .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+        for (i, s) in (0..n).step_by(JOB_FRAMES).enumerate() {
+            if mon.canceled() {
+                return Err(EngineError::Canceled);
+            }
+            let e = (s + JOB_FRAMES).min(n);
+            let data: Vec<&[f32]> = planes.iter().map(|p| &p[s..e]).collect();
+            self.patch.feed_chunk(first + i, &data)?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
         Ok(())
     }
 }
