@@ -111,3 +111,54 @@ export function editTileUrl(
   const ext = format === 'png' ? '.png' : '';
   return `${BASE}/edit/${session}/${rev}/${level}/${frame}/${tx}/${ty}${ext}`;
 }
+
+/** 数が 0 以上の安全な整数か。 */
+function isCount(n: number): boolean {
+  return Number.isSafeInteger(n) && n >= 0;
+}
+
+/** フレームの半開区間 `[start, end)` が正しいか（0 以上の整数で `start < end`）。 */
+function isSpan(start: number, end: number): boolean {
+  return isCount(start) && isCount(end) && start < end;
+}
+
+/**
+ * 音声エディタの出力の PCM（M13。docs/editing.md §12.13）：`/edit/{session}/{rev}/pcm/{start}-{end}`。出力のフレームの
+ * 半開区間の WAV（kura チャンクのデコーダは `kura-edit/1:{samplesId}`。キャッシュしない）。Rust が応えるのは、エディタが
+ * 公開した今か直前の表示の rev で、表示の結果の `valid` に覆われる区間だけ。`fetch` して `src/lib/asset/wav.ts` の
+ * `readPcmWav` で読む。セッションは小文字の 16 進、rev は 0 以上の整数、区間は 0 以上の整数で `start < end`（そうでなければ
+ * RangeError）。
+ */
+export function editPcmUrl(session: string, rev: number, start: number, end: number): string {
+  if (!SESSION_ID.test(session) || !isCount(rev) || !isSpan(start, end)) {
+    throw new RangeError(
+      `エディタの PCM の指定が正しくありません：${session}/${rev}/${start}-${end}`,
+    );
+  }
+  return `${BASE}/edit/${session}/${rev}/pcm/${start}-${end}`;
+}
+
+/**
+ * 音声エディタの元（文書の入力）の PCM：`/edit/{session}/input/pcm/{start}-{end}`（聞き比べの「元」。キャッシュしない）。
+ * 区間は元のフレーム。形が合わなければ RangeError。
+ */
+export function editInputPcmUrl(session: string, start: number, end: number): string {
+  if (!SESSION_ID.test(session) || !isSpan(start, end)) {
+    throw new RangeError(`エディタの元の PCM の指定が正しくありません：${session}/${start}-${end}`);
+  }
+  return `${BASE}/edit/${session}/input/pcm/${start}-${end}`;
+}
+
+/**
+ * 音声エディタの波形の段のタイル：`/edit/{session}/{rev}/peaks/{bin}/{tile}`（immutable）。`rev` は表示の結果の
+ * `peaks.rev`、`bin` は段のビンのフレーム数（`peaks.bins` のどれか）、`tile` はタイルの番号（1 枚 `peaks.tileBins` ビン）。
+ * 並びは `src/features/editor/audio/peakTiles.ts` の `parseEditPeaksTile`。形が合わなければ RangeError。
+ */
+export function editPeaksUrl(session: string, rev: number, bin: number, tile: number): string {
+  if (!SESSION_ID.test(session) || !isCount(rev) || !isCount(tile) || !isCount(bin) || bin < 1) {
+    throw new RangeError(
+      `波形の段のタイルの指定が正しくありません：${session}/${rev}/${bin}/${tile}`,
+    );
+  }
+  return `${BASE}/edit/${session}/${rev}/peaks/${bin}/${tile}`;
+}

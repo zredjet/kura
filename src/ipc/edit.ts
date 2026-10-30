@@ -11,22 +11,35 @@ import {
   commands,
   EDIT_OPS,
   type CommitMode,
+  type EditAudioMarksDto,
+  type EditAudioNodeDto,
+  type EditAudioSourceDto,
+  type EditAudioViewDto,
   type EditAudioViewportDto,
   type EditChangedDto,
   type EditDocDeltaDto_Serialize,
   type EditDraftDto,
   type EditFrameDto,
+  type EditHandleDto,
+  type EditHandleModeDto,
   type EditImageViewDto,
   type EditImageViewportDto,
+  type EditLoudnessDto,
+  type EditLoudnessStateDto,
+  type EditMarkerDto,
   type EditNodeDto,
   type EditOpenedDto_Serialize,
+  type EditPeaksInfoDto,
   type EditProblemDto,
   type EditRectDto,
   type EditSampleDto,
   type EditSaveModeDto,
   type EditSaveStartedDto_Serialize,
+  type EditSnapDto,
   type EditSourceDto,
+  type EditSourcePieceDto,
   type EditSpanDto,
+  type EditSpansChangeDto,
   type EditStatusDto,
   type EditStepDto_Deserialize,
   type EditStepResultDto_Serialize,
@@ -58,19 +71,32 @@ export const EDIT_CATALOG: readonly OpDescriptor[] = EDIT_OPS as unknown as read
 
 export type {
   CommitMode,
+  EditAudioMarksDto,
+  EditAudioNodeDto,
+  EditAudioSourceDto,
+  EditAudioViewDto,
   EditAudioViewportDto,
   EditChangedDto,
   EditDraftDto,
   EditFrameDto,
+  EditHandleDto,
+  EditHandleModeDto,
   EditImageViewDto,
   EditImageViewportDto,
+  EditLoudnessDto,
+  EditLoudnessStateDto,
+  EditMarkerDto,
   EditNodeDto,
+  EditPeaksInfoDto,
   EditProblemDto,
   EditRectDto,
   EditSampleDto,
   EditSaveModeDto,
+  EditSnapDto,
   EditSourceDto,
+  EditSourcePieceDto,
   EditSpanDto,
+  EditSpansChangeDto,
   EditStatusDto,
   EditVersionDto,
   EditViewDto,
@@ -93,6 +119,8 @@ export type EditImageViewport = Extract<EditViewportDto, { type: 'image' }>;
 export type EditAudioViewport = Extract<EditViewportDto, { type: 'audio' }>;
 /** 画像の表示した結果（`type: 'image'`）。 */
 export type EditImageView = Extract<EditViewDto, { type: 'image' }>;
+/** 音声の表示した結果（`type: 'audio'`）。 */
+export type EditAudioView = Extract<EditViewDto, { type: 'audio' }>;
 
 /** 文書の出力（Rust が返す形）。 */
 export type OutputSpec = OutputSpec_Serialize;
@@ -143,6 +171,22 @@ export function sampleEdit(
   y: number,
 ): Promise<EditSampleDto | null> {
   return unwrap(commands.editSample(session, frame, x, y));
+}
+
+/**
+ * 音声のゼロ交差に寄せる（M13）：今の rev の出力のフレーム `frame` から `radius` フレームの中で、いちばん近いゼロ交差。
+ * 見つからなければ頼んだ位置（`found` が偽）。
+ */
+export function snapEdit(session: string, frame: number, radius: number): Promise<EditSnapDto> {
+  return unwrap(commands.editSnap(session, frame, radius));
+}
+
+/**
+ * 音声のラウドネスを計る（M13）：今の rev の出力（量子化のあと）の積分ラウドネス・LRA・トゥルーピーク。覚えていれば
+ * それを返す。長い音声は裏の仕事で計る（`measuring`）。
+ */
+export function measureEdit(session: string): Promise<EditLoudnessStateDto> {
+  return unwrap(commands.editMeasure(session));
 }
 
 /** エディタを閉じる（キャッシュ・予算の取り置きを外す）。今のセッションでなければ Rust は何もしない。 */

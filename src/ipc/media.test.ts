@@ -2,6 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   animUrl,
+  editInputPcmUrl,
+  editPcmUrl,
+  editPeaksUrl,
   editTileUrl,
   fileUrl,
   hasThumb,
@@ -64,6 +67,44 @@ describe('URL', () => {
     ['ab', 1, 0, 0, 0, Number.NaN],
   ])('エディタのタイルの指定 %s/%s/%s/%s/%s/%s は断る', (session, rev, level, frame, tx, ty) => {
     expect(() => editTileUrl(session, rev, level, frame, tx, ty, 'rgba')).toThrow(RangeError);
+  });
+
+  it('音声エディタの PCM（出力・元）と波形の段のタイル（M13）', () => {
+    expect(editPcmUrl('0a1b', 7, 0, 65536)).toBe('kura://localhost/edit/0a1b/7/pcm/0-65536');
+    expect(editInputPcmUrl('0a1b', 65536, 131072)).toBe(
+      'kura://localhost/edit/0a1b/input/pcm/65536-131072',
+    );
+    expect(editPeaksUrl('0a1b', 3, 1024, 2)).toBe('kura://localhost/edit/0a1b/3/peaks/1024/2');
+  });
+
+  it.each([
+    ['AB', 1, 0, 1],
+    ['ab', -1, 0, 1],
+    ['ab', 1, 5, 5],
+    ['ab', 1, 5, 4],
+    ['ab', 1.5, 0, 1],
+    ['ab', 1, -1, 1],
+    ['ab', 1, 0, Number.NaN],
+  ])('エディタの PCM の指定 %s/%s/%s-%s は断る', (session, rev, start, end) => {
+    expect(() => editPcmUrl(session, rev, start, end)).toThrow(RangeError);
+  });
+
+  it.each([
+    ['ab/', 0, 1],
+    ['ab', 3, 3],
+    ['ab', 0.5, 2],
+  ])('エディタの元の PCM の指定 %s/%s-%s は断る', (session, start, end) => {
+    expect(() => editInputPcmUrl(session, start, end)).toThrow(RangeError);
+  });
+
+  it.each([
+    ['ab', 1, 0, 0],
+    ['ab', 1, 256.5, 0],
+    ['ab', -1, 256, 0],
+    ['ab', 1, 256, -1],
+    ['x', 1, 256, 0],
+  ])('波形の段のタイルの指定 %s/%s/%s/%s は断る', (session, rev, bin, tile) => {
+    expect(() => editPeaksUrl(session, rev, bin, tile)).toThrow(RangeError);
   });
 
   it('サムネイルがあるのは ready と stale（作り直すまで今の絵を出す）', () => {
