@@ -13,6 +13,7 @@
 pub mod handles;
 #[cfg(test)]
 mod handles_tests;
+pub mod measure;
 pub mod peaks;
 #[cfg(test)]
 mod peaks_tests;
@@ -94,6 +95,8 @@ pub struct AudioViewInfo {
     pub source_map: Option<Vec<timeline::SourcePiece>>,
     /// 出力につながるノード（入力 → 出力の順）の入力のレート・長さとハンドルの位置。
     pub nodes: Vec<handles::AudioNodeView>,
+    /// ラウドネスの状態（今の `samplesId` で覚えているもの。なければ `Idle`）。
+    pub loudness: measure::LoudnessState,
     /// 裏の仕事が残っている（フロントは手が止まったら `work: true` で頼み直す）。
     pub work: bool,
     /// 描いたノード・当たったノードの警告。
@@ -109,6 +112,8 @@ pub(crate) struct AudioState {
     pub(crate) input: source::InputInfo,
     /// 波形の段の仕事。
     pub(crate) peaks: peaks::PeaksJob,
+    /// ラウドネスの結果。
+    pub(crate) measure: measure::MeasureJob,
 }
 
 /// 音声の出力の形の (rate, channels, frames)。長さの分からないものは None。
@@ -305,11 +310,11 @@ impl Editor {
         }
         self.advance_peaks(st, rev, &value, &area, &avp, ticket);
         self.count_resident(st);
-        let (peaks, work) = match st.audio.as_mut() {
+        let (peaks, work, loudness) = match st.audio.as_mut() {
             Some(a) => {
                 let info = a.peaks.report();
                 let work = info.pending;
-                (info, work)
+                (info, work, a.measure.state(&id))
             }
             None => return failed(EditorError::Failed("音声の状態がありません".into())),
         };
@@ -341,6 +346,7 @@ impl Editor {
             peaks,
             source_map,
             nodes,
+            loudness,
             work,
             warnings: vr.warnings.clone(),
             drawn_nodes: vr.drawn_nodes(),

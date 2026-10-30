@@ -1629,6 +1629,7 @@ fn finish_open(
         audio::AudioState {
             input: info,
             peaks: audio::peaks::PeaksJob::new(base, rev.0),
+            measure: audio::measure::MeasureJob::default(),
         }
     });
     // 閉じる・ほかを開くのと競らないよう、錠の中で中止を確かめてから取り置き・確保を立てる

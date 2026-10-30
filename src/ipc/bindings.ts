@@ -82,6 +82,11 @@ export const commands = {
 	 *  止めない（表示の外なら区間だけを描いて読む）。
 	 */
 	editSnap: (session: string, frame: number, radius: number) => typedError<EditSnapDto, AppError>(__TAURI_INVOKE("edit_snap", { session, frame, radius })),
+	/**
+	 *  音声のエディタ：今の rev の出力（量子化のあと）のラウドネス。出力の指紋ごとに覚え、短い音声はその場で計って `ready` を
+	 *  返す（長い音声は段 4B まで `failed`）。描いている途中の表示を止めない。
+	 */
+	editMeasure: (session: string) => typedError<EditLoudnessStateDto, AppError>(__TAURI_INVOKE("edit_measure", { session })),
 	/**  エディタを閉じる（キャッシュ・予算の取り置きを外す。待っている下書きは置く）。今のセッションでなければ何もしない。 */
 	editClose: (session: string) => typedError<null, AppError>(__TAURI_INVOKE("edit_close", { session })),
 	/**
@@ -853,6 +858,8 @@ export type EditAudioViewDto = {
 	sourceMap: EditSourcePieceDto[] | null,
 	/**  出力につながるノード。 */
 	nodes: EditAudioNodeDto[],
+	/**  ラウドネスの状態（覚えているもの。`edit_measure` で頼む）。 */
+	loudness: EditLoudnessStateDto,
 	/**  裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。 */
 	work: boolean,
 	warnings: Issue[],
@@ -994,6 +1001,27 @@ export type EditLogDto = {
 	field: string,
 	count: number,
 };
+
+/**  ラウドネスの値（`AssetAudioFactsDto` の同じ名前の欄と同じ意味。計れない値は null）。 */
+export type EditLoudnessDto = {
+	/**  積分ラウドネス（LUFS）。 */
+	loudness: number | null,
+	/**  積分を計れなかった理由（`tooShort`・`silent`・`belowGate`・`lowRate`・`nonFinite`）。 */
+	loudnessReason: string | null,
+	/**  ラウドネスレンジ（LU）。 */
+	loudnessRange: number | null,
+	/**  トゥルーピーク（dBTP）。 */
+	truePeak: number | null,
+	/**  サンプルピーク（dBFS）。 */
+	samplePeak: number | null,
+};
+
+/**  ラウドネスの状態（`samplesId` は計った出力の指紋。今の表示の `samplesId` と違えば古い）。 */
+export type EditLoudnessStateDto = 
+/**  まだ計っていない（`edit_measure` で頼む）。 */
+{ type: "idle" } | 
+/**  計っている（裏の仕事で進む）。 */
+{ type: "measuring"; samplesId: string; progress: number | null } | { type: "ready"; samplesId: string; loudness: EditLoudnessDto } | { type: "failed"; samplesId: string; message: string };
 
 /**  マーカー（出力のフレームの位置と名前）。 */
 export type EditMarkerDto = {

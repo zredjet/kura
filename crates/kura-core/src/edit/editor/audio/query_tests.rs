@@ -3,9 +3,10 @@
 use kura_engine::Graph;
 use serde_json::json;
 
+use super::measure::{LoudnessState, measure, values_of};
 use super::session_tests::*;
 use super::snap::{SNAP_MAX_RADIUS, nearest_zero_crossing, snap};
-use crate::edit::editor::Viewport;
+use crate::edit::editor::{Step, Viewport};
 
 /// 全体の描画で求めたゼロ交差（正）。
 fn expected(a: &kura_engine::value::Audio, f: u64, r: u64) -> Option<u64> {
@@ -82,4 +83,64 @@ fn g_gain(db: f64) -> Graph {
     g.push_linear("audio.gain", 1, json!({ "db": db }), 1)
         .unwrap();
     g
+}
+
+/// A14：短い音声は `edit_measure` の中で計って Ready（`audio.loudness` を全体の描画に当てたものと同じ）。出力の指紋ごとに覚え、
+/// 表示の情報にも載る。長い音声は段 4B まで Failed。
+#[test]
+fn measure_matches_the_analysis_of_the_render() {
+    use kura_engine::analysis::NoParams;
+    use kura_engine::analysis::audio::loudness::LoudnessAnalysis;
+    let env = Env::new();
+    let bytes = noise_wav(8_000, 2, 5 * C, 53);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    let vp = Viewport::audio_idle();
+    assert_eq!(
+        shown_audio(&opened.outcome.view).loudness,
+        LoudnessState::Idle
+    );
+    let out = env.step(&s, vec![add(0, "audio.gain", json!({ "db": -6.0 }))], &vp);
+    let sid = shown_audio(&out.view).samples_id.clone();
+    let got = measure(&env.env(), &s).unwrap();
+    let want = rendered(&bytes, "wav", &g_gain(-6.0));
+    let report = kura_engine::Engine::new()
+        .unwrap()
+        .analyze::<LoudnessAnalysis>(
+            &kura_engine::Value::Audio(want),
+            &NoParams {},
+            &kura_engine::NoMonitor,
+        )
+        .unwrap();
+    assert_eq!(
+        got,
+        LoudnessState::Ready {
+            samples_id: sid.clone(),
+            values: values_of(&report)
+        }
+    );
+    let LoudnessState::Ready { values, .. } = &got else {
+        unreachable!()
+    };
+    assert!(values.loudness.is_some() && values.true_peak.is_some());
+    // 表示の情報にも載る・取り消しで戻った標本は別の指紋・やり直しで覚えたものを返す
+    let out = env.step(&s, Vec::new(), &vp);
+    assert_eq!(shown_audio(&out.view).loudness, got);
+    let out = env.step(&s, vec![Step::Undo], &vp);
+    assert_eq!(shown_audio(&out.view).loudness, LoudnessState::Idle);
+    let original = measure(&env.env(), &s).unwrap();
+    assert!(matches!(&original, LoudnessState::Ready { samples_id, .. } if *samples_id != sid));
+    let out = env.step(&s, vec![Step::Redo], &vp);
+    assert_eq!(shown_audio(&out.view).loudness, got);
+    assert_eq!(measure(&env.env(), &s).unwrap(), got);
+
+    // 長い音声は段 4B まで計らない
+    let long = add_audio(&env.lib, &noise_wav(8_000, 1, 130 * C, 54), "wav");
+    let opened = env.open(long);
+    let state = measure(&env.env(), &opened.session).unwrap();
+    assert!(
+        matches!(&state, LoudnessState::Failed { message, .. } if message.contains("まだ計れません")),
+        "{state:?}"
+    );
 }

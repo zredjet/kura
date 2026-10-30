@@ -14,6 +14,7 @@
 //! DTO はほかの班の dto.rs の変更とぶつからないよう、このファイルに置く（名前は `Edit` で始める）。
 
 use kura_core::edit::editor::audio::handles::{AudioNodeView, Handle, HandleMode, Marks};
+use kura_core::edit::editor::audio::measure::{LoudnessState, LoudnessValues};
 use kura_core::edit::editor::audio::peaks::PeaksInfo;
 use kura_core::edit::editor::audio::timeline::SourcePiece;
 use kura_core::edit::editor::{
@@ -555,6 +556,85 @@ impl From<AudioNodeView> for EditAudioNodeDto {
     }
 }
 
+/// ラウドネスの値（`AssetAudioFactsDto` の同じ名前の欄と同じ意味。計れない値は null）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditLoudnessDto {
+    /// 積分ラウドネス（LUFS）。
+    pub loudness: Option<f64>,
+    /// 積分を計れなかった理由（`tooShort`・`silent`・`belowGate`・`lowRate`・`nonFinite`）。
+    pub loudness_reason: Option<String>,
+    /// ラウドネスレンジ（LU）。
+    pub loudness_range: Option<f64>,
+    /// トゥルーピーク（dBTP）。
+    pub true_peak: Option<f64>,
+    /// サンプルピーク（dBFS）。
+    pub sample_peak: Option<f64>,
+}
+
+impl From<LoudnessValues> for EditLoudnessDto {
+    fn from(v: LoudnessValues) -> Self {
+        Self {
+            loudness: v.loudness,
+            loudness_reason: v.loudness_reason,
+            loudness_range: v.loudness_range,
+            true_peak: v.true_peak,
+            sample_peak: v.sample_peak,
+        }
+    }
+}
+
+/// ラウドネスの状態（`samplesId` は計った出力の指紋。今の表示の `samplesId` と違えば古い）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum EditLoudnessStateDto {
+    /// まだ計っていない（`edit_measure` で頼む）。
+    Idle,
+    /// 計っている（裏の仕事で進む）。
+    Measuring {
+        samples_id: String,
+        progress: f64,
+    },
+    Ready {
+        samples_id: String,
+        loudness: EditLoudnessDto,
+    },
+    Failed {
+        samples_id: String,
+        message: String,
+    },
+}
+
+impl From<LoudnessState> for EditLoudnessStateDto {
+    fn from(s: LoudnessState) -> Self {
+        match s {
+            LoudnessState::Idle => Self::Idle,
+            LoudnessState::Measuring {
+                samples_id,
+                progress,
+            } => Self::Measuring {
+                samples_id,
+                progress,
+            },
+            LoudnessState::Ready { samples_id, values } => Self::Ready {
+                samples_id,
+                loudness: values.into(),
+            },
+            LoudnessState::Failed {
+                samples_id,
+                message,
+            } => Self::Failed {
+                samples_id,
+                message,
+            },
+        }
+    }
+}
+
 /// マーカー（出力のフレームの位置と名前）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
 pub struct EditMarkerDto {
@@ -588,6 +668,8 @@ pub struct EditAudioViewDto {
     pub source_map: Option<Vec<EditSourcePieceDto>>,
     /// 出力につながるノード。
     pub nodes: Vec<EditAudioNodeDto>,
+    /// ラウドネスの状態（覚えているもの。`edit_measure` で頼む）。
+    pub loudness: EditLoudnessStateDto,
     /// 裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。
     pub work: bool,
     pub warnings: Vec<Issue>,
@@ -618,6 +700,7 @@ impl From<AudioViewInfo> for EditAudioViewDto {
                 .source_map
                 .map(|m| m.into_iter().map(Into::into).collect()),
             nodes: v.nodes.into_iter().map(Into::into).collect(),
+            loudness: v.loudness.into(),
             work: v.work,
             warnings: v.warnings,
             drawn_nodes: v.drawn_nodes,
@@ -1071,6 +1154,22 @@ pub async fn edit_sample(
     .await
 }
 
+/// 音声のエディタ：今の rev の出力（量子化のあと）のラウドネス。出力の指紋ごとに覚え、短い音声はその場で計って `ready` を
+/// 返す（長い音声は段 4B まで `failed`）。描いている途中の表示を止めない。
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_measure(
+    state: State<'_, AppState>,
+    session: String,
+) -> Result<EditLoudnessStateDto, AppError> {
+    let lib = state.session()?;
+    blocking(move || {
+        let env = EditorEnv::of(&lib)?;
+        Ok(editor::audio::measure::measure(&env, &session)?.into())
+    })
+    .await
+}
+
 /// ゼロ交差に寄せた位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
 pub struct EditSnapDto {
@@ -1413,6 +1512,16 @@ mod tests {
                         out_start: None,
                     }),
                 }],
+                loudness: LoudnessState::Ready {
+                    samples_id: "0123456789abcdef".into(),
+                    values: LoudnessValues {
+                        loudness: Some(-14.25),
+                        loudness_reason: None,
+                        loudness_range: None,
+                        true_peak: Some(-1.0),
+                        sample_peak: Some(-1.5),
+                    },
+                },
                 work: true,
                 warnings: Vec::new(),
                 drawn_nodes: 1,
@@ -1441,6 +1550,20 @@ mod tests {
             json!({ "type": "fade", "inEnd": 10, "outStart": null })
         );
         assert_eq!(json["view"]["nodes"][0]["inFrames"], json!(96000));
+        assert_eq!(
+            json["view"]["loudness"],
+            json!({ "type": "ready", "samplesId": "0123456789abcdef", "loudness": {
+                "loudness": -14.25, "loudnessReason": null, "loudnessRange": null,
+                "truePeak": -1.0, "samplePeak": -1.5 } })
+        );
+        assert_eq!(
+            serde_json::to_value(EditLoudnessStateDto::from(LoudnessState::Measuring {
+                samples_id: "ab".into(),
+                progress: 0.5
+            }))
+            .unwrap(),
+            json!({ "type": "measuring", "samplesId": "ab", "progress": 0.5 })
+        );
         let source = EditSourceDto::from(SourceInfo {
             kind: "audio",
             width: 0,
