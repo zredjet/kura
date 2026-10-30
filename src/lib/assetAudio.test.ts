@@ -1,128 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
+import { fakeFactory } from '../test/fakeAudio';
 import type { AuditionFacts } from './asset/audition';
 import { type PcmInfo, writePcmWav } from './asset/wav';
-import {
-  Audition,
-  type BufferLike,
-  type ContextLike,
-  ContextPool,
-  type GainLike,
-  SfxPlayer,
-  type SourceLike,
-} from './assetAudio';
-
-interface FakeSource extends SourceLike {
-  started: [number, number | undefined] | null;
-  stopped: boolean;
-  /** stop に渡した時刻（すぐ止めたら undefined）。 */
-  stoppedAt: number | undefined;
-}
-
-interface FakeContext extends ContextLike {
-  requested: number | undefined;
-  sources: FakeSource[];
-  gains: (GainLike & { ramps: [number, number][] })[];
-  closed: boolean;
-  /** 触ったら失敗にする（loopStart・loopEnd）。 */
-  touched: string[];
-}
-
-/** 偽の文脈。`honor` が偽なら、頼んだレートではなく 48kHz で作る（作れなかった環境のまね）。 */
-function fakeFactory(log: string[] = [], honor = true) {
-  const contexts: FakeContext[] = [];
-  const create = (rate?: number): ContextLike => {
-    log.push(`create:${rate ?? 'device'}`);
-    const ctx: FakeContext = {
-      requested: rate,
-      sampleRate: honor ? (rate ?? 48_000) : 48_000,
-      currentTime: 0.123_456_7,
-      destination: { disconnect: () => undefined },
-      sources: [],
-      gains: [],
-      closed: false,
-      touched: [],
-      createBuffer(channels, frames, r): BufferLike {
-        return {
-          numberOfChannels: channels,
-          length: frames,
-          sampleRate: r,
-          copyToChannel: () => undefined,
-        };
-      },
-      createBufferSource() {
-        const s: FakeSource = {
-          buffer: null,
-          loop: false,
-          onended: null,
-          started: null,
-          stopped: false,
-          stoppedAt: undefined,
-          connect: () => undefined,
-          disconnect: () => undefined,
-          start(when: number, offset?: number) {
-            s.started = [when, offset];
-          },
-          stop(when?: number) {
-            s.stopped = true;
-            s.stoppedAt = when;
-          },
-        };
-        for (const key of ['loopStart', 'loopEnd']) {
-          Object.defineProperty(s, key, {
-            get: () => {
-              ctx.touched.push(key);
-              throw new Error(`${key} に触れた`);
-            },
-            set: () => {
-              ctx.touched.push(key);
-              throw new Error(`${key} に触れた`);
-            },
-          });
-        }
-        ctx.sources.push(s);
-        return s;
-      },
-      createGain() {
-        const g = {
-          ramps: [] as [number, number][],
-          gain: {
-            value: 1,
-            setValueAtTime: (v: number) => {
-              g.gain.value = v;
-            },
-            linearRampToValueAtTime: (v: number, t: number) => {
-              g.ramps.push([v, t]);
-            },
-          },
-          connect: () => undefined,
-          disconnect: () => undefined,
-        };
-        ctx.gains.push(g);
-        return g;
-      },
-      async decodeAudioData(data: ArrayBuffer): Promise<BufferLike> {
-        log.push(`decode:${data.byteLength}`);
-        if (data.byteLength === 0) throw new Error('読めない');
-        return {
-          numberOfChannels: 2,
-          length: data.byteLength,
-          sampleRate: ctx.sampleRate,
-          copyToChannel: () => undefined,
-        };
-      },
-      async resume() {
-        log.push('resume');
-      },
-      async close() {
-        ctx.closed = true;
-      },
-    };
-    contexts.push(ctx);
-    return ctx;
-  };
-  return { create, contexts };
-}
+import { Audition, ContextPool, SfxPlayer } from './assetAudio';
 
 /** 元の音声のまね：要求された区間の WAV を、同じ読み取りのループ点・フレーム数とともに返す。 */
 function fakeSource(truth: {
@@ -528,6 +409,42 @@ describe('文脈の使い回し（元のレートごとに 1 つ）', () => {
 
   it('上限は 1 以上', () => {
     expect(() => new ContextPool(fakeFactory().create, 0)).toThrow(RangeError);
+  });
+
+  // M13：エディタが鳴らしている文脈は、効果音・試聴が別のレートで文脈を作っても閉じない
+  it('使用中の印のある文脈は追い出さず、印のないものから閉じる（なければ上限を超えて作る）', () => {
+    const { create, contexts } = fakeFactory();
+    const pool = new ContextPool(create, 2);
+    const release44 = pool.hold(44_100);
+    const release48 = pool.hold(48_000);
+    pool.get(44_100);
+    pool.get(48_000);
+    pool.get(); // 効果音（装置のレート）：どちらも使用中なので上限を超えて作る
+    expect(contexts.map((c) => c.closed)).toEqual([false, false, false]);
+    expect(pool.size).toBe(3);
+    release44();
+    release44(); // 2 回呼んでも 1 回だけ外す
+    expect(pool.isHeld(44_100)).toBe(false);
+    expect(pool.isHeld(48_000)).toBe(true);
+    pool.get(96_000); // 印のない最も古いもの（44.1k）から閉じる
+    expect(contexts.map((c) => [c.requested, c.closed])).toEqual([
+      [44_100, true],
+      [48_000, false],
+      [undefined, true],
+      [96_000, false],
+    ]);
+    release48();
+    expect(pool.isHeld(48_000)).toBe(false);
+  });
+
+  it('印を重ねたら、すべて外すまで使用中', () => {
+    const pool = new ContextPool(fakeFactory().create);
+    const a = pool.hold(48_000);
+    const b = pool.hold(48_000);
+    a();
+    expect(pool.isHeld(48_000)).toBe(true);
+    b();
+    expect(pool.isHeld(48_000)).toBe(false);
   });
 });
 

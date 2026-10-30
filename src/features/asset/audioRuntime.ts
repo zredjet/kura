@@ -1,6 +1,8 @@
 /**
  * 素材の音の口（アプリに 1 つ）：ループの試聴（Audition）と効果音の即再生（SfxPlayer）が、元のレートごとの文脈
  * （ContextPool）を分け合う。文脈は使うときに作り、ライブラリの画面を離れるときに `closeAudio` で閉じる。
+ * エディタの再生（M13）も同じ文脈を使い、鳴らしている間は `holdAudio` で使い終えたときの片付けを止める（文脈ごとの
+ * 使用中の印は `ContextPool.hold`）。
  */
 
 import { pcmUrl, playUrl } from '../../ipc/media';
@@ -84,10 +86,13 @@ export function onAuditionStopped(listener: () => void): void {
 /** 最後に鳴らしてから、使っていない文脈を閉じるまでの時間（効果音は 10 秒以下なので鳴り終えている）。 */
 export const IDLE_CLOSE_MS = 15_000;
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
+/** 文脈を使っている持ち主の数（エディタの再生。`holdAudio`）。 */
+let holders = 0;
 
 /**
  * 鳴らしたことを知らせる（試聴を始めた・効果音を鳴らした）。そのあと IDLE_CLOSE_MS のあいだ何も鳴らさず、試聴も
- * していなければ、文脈をすべて閉じる（使い終えたら閉じる。次に鳴らすときにまた作る）。
+ * していなければ、文脈をすべて閉じる（使い終えたら閉じる。次に鳴らすときにまた作る）。`holdAudio` の印がある間も
+ * 閉じない。
  */
 export function touchAudio(): void {
   if (idleTimer !== null) {
@@ -98,12 +103,30 @@ export function touchAudio(): void {
     if (!runtime) {
       return;
     }
-    if (runtime.audition.playing) {
+    if (runtime.audition.playing || holders > 0) {
       touchAudio();
       return;
     }
     runtime.pool.closeAll();
   }, IDLE_CLOSE_MS);
+}
+
+/**
+ * 文脈を使っている印を立てる（エディタの再生が鳴らし始めたとき。戻り値で外す。外したら、そこから IDLE_CLOSE_MS で
+ * 使い終えたときの片付けをする）。2 回呼んでも 1 回だけ外す。
+ */
+export function holdAudio(): () => void {
+  holders++;
+  touchAudio();
+  let released = false;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    holders = Math.max(0, holders - 1);
+    touchAudio();
+  };
 }
 
 /** 音を止め、文脈をすべて閉じる（ライブラリの画面を離れるとき）。 */

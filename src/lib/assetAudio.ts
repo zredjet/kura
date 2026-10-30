@@ -80,9 +80,13 @@ type ContextKey = number | 'device';
 /**
  * 文脈を元のレートごとに 1 つだけ持って使い回す（新しく使ったものを後ろへ）。`max` を超えたら、いちばん長く使っていない
  * ものを閉じる。持ち主（ライブラリの画面）を離れるときに `closeAll` で全部閉じる。
+ *
+ * 鳴らし続ける使い手（エディタの再生。M13）は `hold` で使用中の印を立てる。印のある文脈は追い出さない（印のないものが
+ * なければ上限を超えて作る）。印は鍵（レート）に付くので、作る前に立ててもよい。
  */
 export class ContextPool {
   private readonly contexts = new Map<ContextKey, ContextLike>();
+  private readonly holds = new Map<ContextKey, number>();
 
   constructor(
     private readonly create: (rate?: number) => ContextLike,
@@ -106,14 +110,39 @@ export class ContextPool {
       return found;
     }
     while (this.contexts.size >= this.max) {
-      const oldest = this.contexts.keys().next();
-      if (oldest.done) break;
-      void this.contexts.get(oldest.value)?.close();
-      this.contexts.delete(oldest.value);
+      let victim: ContextKey | null = null;
+      for (const k of this.contexts.keys()) {
+        if (!this.isHeld(k)) {
+          victim = k;
+          break;
+        }
+      }
+      if (victim === null) break;
+      void this.contexts.get(victim)?.close();
+      this.contexts.delete(victim);
     }
     const ctx = this.create(rate);
     this.contexts.set(key, ctx);
     return ctx;
+  }
+
+  /** レート `rate` の文脈に使用中の印を立てる（戻り値で外す。2 回呼んでも 1 回だけ外す）。 */
+  hold(rate?: number): () => void {
+    const key: ContextKey = rate ?? 'device';
+    this.holds.set(key, (this.holds.get(key) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const n = (this.holds.get(key) ?? 1) - 1;
+      if (n > 0) this.holds.set(key, n);
+      else this.holds.delete(key);
+    };
+  }
+
+  /** 使用中の印があるか。 */
+  isHeld(rate?: number | 'device'): boolean {
+    return (this.holds.get(rate ?? 'device') ?? 0) > 0;
   }
 
   /** 全部を閉じる。 */

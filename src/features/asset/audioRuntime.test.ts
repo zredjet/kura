@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   type AudioRuntime,
   closeAudio,
+  holdAudio,
   IDLE_CLOSE_MS,
   setAudioRuntimeForTest,
   touchAudio,
@@ -55,6 +56,24 @@ describe('使い終えた文脈を閉じる', () => {
     expect(fake.pool.closeAll).not.toHaveBeenCalled();
     fake.state.playing = false;
     vi.advanceTimersByTime(IDLE_CLOSE_MS);
+    expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
+  });
+
+  // M13：エディタが鳴らしている間は、試聴・効果音を使い終えても閉じない
+  it('holdAudio の印がある間は閉じず、外してから 15 秒で閉じる（2 回外しても数え違えない）', () => {
+    const release = holdAudio();
+    touchAudio();
+    vi.advanceTimersByTime(IDLE_CLOSE_MS * 3);
+    expect(fake.pool.closeAll).not.toHaveBeenCalled();
+    const other = holdAudio();
+    release();
+    release();
+    vi.advanceTimersByTime(IDLE_CLOSE_MS * 2);
+    expect(fake.pool.closeAll).not.toHaveBeenCalled();
+    other();
+    vi.advanceTimersByTime(IDLE_CLOSE_MS - 1);
+    expect(fake.pool.closeAll).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
     expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
   });
 
