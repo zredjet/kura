@@ -901,8 +901,11 @@ impl Engine {
                 }
                 return Err(over_total(estimate.peak, total));
             }
+            // 持ち続ける表示の分（`CacheLease::extra`）もキャッシュの分に足す
             let base = cache_floor(cache);
-            let need = base.saturating_add(estimate.peak);
+            let need = base
+                .saturating_add(held.extra)
+                .saturating_add(estimate.peak);
             if need <= total && held.lease.try_grow_to(need)? {
                 if lowered {
                     // 上限を下げて通った：確保を「下げた上限の分 ＋ ピーク」まで返す（今の確保が need 以上で通ったとき）
@@ -912,7 +915,9 @@ impl Engine {
             }
             // 足りない：今すぐ持てる量（今の確保 ＋ 予算の空き）からピークを引いた分まで、キャッシュの上限を下げる
             let reach = held.lease.bytes().saturating_add(held.free()?);
-            let target = reach.saturating_sub(estimate.peak);
+            let target = reach
+                .saturating_sub(estimate.peak)
+                .saturating_sub(held.extra);
             if target >= base && need <= total && recheck < RECHECKS {
                 recheck += 1;
                 continue;
@@ -961,6 +966,8 @@ pub struct CacheLease {
     lease: Lease,
     /// 望むキャッシュの上限（予算が空いていれば、ここまで戻す）。
     want: u64,
+    /// キャッシュの外で持ち続ける分（M13 段 4：音声のエディタの公開した表示の値・波形の段。[`CacheLease::set_extra`]）。
+    extra: u64,
 }
 
 impl CacheLease {
@@ -978,6 +985,7 @@ impl CacheLease {
             budget: Arc::clone(budget),
             lease,
             want,
+            extra: 0,
         };
         held.settle(cache)?;
         Ok(held)
@@ -991,6 +999,18 @@ impl CacheLease {
     /// 望むキャッシュの上限。
     pub fn want(&self) -> u64 {
         self.want
+    }
+
+    /// キャッシュの外で持ち続ける分（バイト）。
+    pub fn extra(&self) -> u64 {
+        self.extra
+    }
+
+    /// キャッシュの外で持ち続ける分を `bytes` にする（M13 段 4。音声のエディタが公開した表示の値と波形の段）。確保は
+    /// 描いていない間も「キャッシュの分 ＋ extra」になり（足りなければキャッシュの上限を下げる）、`admit_cached` も extra を
+    /// 足して伸ばす。持ち続ける対話の申告にも入る。効くのは次の [`CacheLease::settle`] から。
+    pub fn set_extra(&mut self, bytes: u64) {
+        self.extra = bytes;
     }
 
     /// 描いたあと・外の値を足したあと：確保をキャッシュの分（上限と今の大きさの大きいほう）に戻す。上限が望む量より
@@ -1007,9 +1027,10 @@ impl CacheLease {
     /// 確保をキャッシュの分に戻す（[`CacheLease::settle`] の本体）。
     fn fit(&mut self, cache: &mut NodeCache) -> Result<(), EngineError> {
         let total = self.budget.total();
+        let extra = self.extra;
         let reach = self.lease.bytes().saturating_add(self.free()?);
-        cache.set_capacity(self.want.min(reach));
-        let need = cache_floor(cache);
+        cache.set_capacity(self.want.min(reach.saturating_sub(extra)));
+        let need = cache_floor(cache).saturating_add(extra);
         if need <= self.lease.bytes() {
             return self.lease.shrink_to(need);
         }
@@ -1017,8 +1038,8 @@ impl CacheLease {
             return Ok(());
         }
         // 空きをほかの確保が先に使った：今の確保に収まる上限にする（固定と外の値は残る）
-        cache.set_capacity(self.lease.bytes());
-        let need = cache_floor(cache);
+        cache.set_capacity(self.lease.bytes().saturating_sub(extra));
+        let need = cache_floor(cache).saturating_add(extra);
         if need <= self.lease.bytes() || (need <= total && self.lease.try_grow_to(need)?) {
             return Ok(());
         }
@@ -1041,6 +1062,7 @@ impl std::fmt::Debug for CacheLease {
         f.debug_struct("CacheLease")
             .field("bytes", &self.lease.bytes())
             .field("want", &self.want)
+            .field("extra", &self.extra)
             .finish()
     }
 }

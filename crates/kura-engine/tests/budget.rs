@@ -1672,3 +1672,79 @@ fn stream_estimate_covers_every_window() {
     }
     assert_eq!(checked, 12);
 }
+
+/// E47（M13 段 4）：`CacheLease::set_extra` の分（音声のエディタが持ち続ける表示の値・波形の段）は、描いていない間の確保と
+/// 持ち続ける対話の申告に入り、描く間の確保（`admit_cached`）にも足される。予算が足りなければキャッシュの上限を下げて
+/// 場所を空け、extra を越えて伸ばさない。0 に戻せば上限も戻る。
+#[test]
+fn cache_lease_counts_the_extra() {
+    let mut ed = Editor::open();
+    assert_eq!(ed.held.extra(), 0);
+    ed.held.set_extra(2 * MIB);
+    ed.held.settle(&mut ed.cache).unwrap();
+    assert_eq!(ed.cache.capacity(), 4 * MIB);
+    assert_eq!(ed.held.bytes(), 6 * MIB, "キャッシュの分 ＋ extra");
+    assert_eq!(ed.budget.usage().unwrap().standing, 6 * MIB);
+
+    // 描く間は キャッシュの分 ＋ extra ＋ ピーク まで伸ばし、描いたら戻す
+    let a = ed.plan("image.flip", flips());
+    let est = ed.admit(&a).unwrap();
+    assert_eq!(est.peak, 2 * MIB);
+    assert_eq!(ed.held.bytes(), 8 * MIB);
+    ed.engine
+        .render_cached(
+            &a,
+            &ed.fins,
+            &mut ed.cache,
+            &RenderOptions::default(),
+            &NoMonitor,
+        )
+        .unwrap();
+    ed.held.settle(&mut ed.cache).unwrap();
+    assert_eq!(ed.held.bytes(), 6 * MIB);
+    assert_eq!(ed.cache.bytes(), 3 * MIB, "入力 ＋ 2 つの値");
+
+    // 一括が残り（10 − 6）をすべて使う：上限を下げて場所を空け、extra を越えて伸ばさない
+    let bulk = ed
+        .budget
+        .try_acquire(4 * MIB, Class::Bulk)
+        .unwrap()
+        .unwrap();
+    let b = ed.plan("image.rotate90", rotations());
+    let est = ed.admit(&b).unwrap();
+    assert_eq!(est.peak, 2 * MIB);
+    assert!(
+        ed.held.bytes() <= 6 * MIB,
+        "今の確保の中で通す（{}）",
+        ed.held.bytes()
+    );
+    assert!(ed.cache.capacity() <= 2 * MIB, "{}", ed.cache.capacity());
+    assert_eq!(ed.budget.used().unwrap(), 10 * MIB);
+    ed.held.settle(&mut ed.cache).unwrap();
+    assert!(ed.held.bytes() <= 6 * MIB);
+
+    // extra を増やすと、空きがなければキャッシュの上限を下げる（固定と外の値は残る）
+    ed.held.set_extra(5 * MIB);
+    ed.held.settle(&mut ed.cache).unwrap();
+    assert!(ed.cache.capacity() <= MIB, "{}", ed.cache.capacity());
+    assert_eq!(
+        ed.held.bytes(),
+        ed.cache.capacity().max(ed.cache.bytes()) + 5 * MIB
+    );
+    assert_eq!(ed.budget.usage().unwrap().standing, ed.held.bytes());
+
+    // extra が予算に入らなければ Limit（確保できるだけ確保する）
+    ed.held.set_extra(7 * MIB);
+    assert!(matches!(
+        ed.held.settle(&mut ed.cache),
+        Err(EngineError::Limit(_))
+    ));
+
+    // 一括が返し、extra を 0 にすれば上限は望む量に戻る
+    drop(bulk);
+    ed.held.set_extra(0);
+    ed.held.settle(&mut ed.cache).unwrap();
+    assert_eq!(ed.cache.capacity(), 4 * MIB);
+    assert_eq!(ed.held.bytes(), 4 * MIB);
+    assert_eq!(ed.budget.usage().unwrap().standing, 4 * MIB);
+}
