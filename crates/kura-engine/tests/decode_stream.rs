@@ -441,3 +441,90 @@ fn fan_over_decoders_equals_analyze_many() {
     }
     assert!(checked >= 20, "{checked}");
 }
+
+/// E42（M13 段 2・D5）：ファイルから形を読む口（symphonia はファイルを開いて probe し、全体を読み込まない）は、読み口から
+/// 読み込んで決めた形と同じ（読めないものは同じ種類の誤り）。
+#[test]
+fn shapes_from_files_equal_shapes_from_readers() {
+    let set = CodecSet::pinned();
+    let limits = Limits::default();
+    let opts = DecodeOptions::default();
+    for (path, format) in fixtures() {
+        let bytes = std::fs::read(&path).unwrap();
+        let a = set.shape_path(&path, &format, &opts, &limits);
+        let b = set.shape(&mut Cursor::new(&bytes), &format, &opts, &limits);
+        match (a, b) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{}", path.display()),
+            (Err(a), Err(b)) => assert_eq!(
+                std::mem::discriminant(&a),
+                std::mem::discriminant(&b),
+                "{}：{a} と {b}",
+                path.display()
+            ),
+            (a, b) => panic!("{}：{a:?} と {b:?}", path.display()),
+        }
+    }
+}
+
+/// E42（D5）：流れの窓が 2 つ以上になる FLAC を読み口から流して読むと、記録・値が `decode` と同じ。STREAMINFO の MD5 が
+/// 違えば、流して読んでも `Decode`（MD5 は最後に照らすので、受け手は窓を受けても終わりを受けない）。
+#[test]
+fn long_flac_streams_and_md5_is_checked_last() {
+    let set = CodecSet::pinned();
+    let limits = Limits::default();
+    let opts = DecodeOptions::default();
+    let v = kura_engine::testgen::InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 2,
+        frames: 17 * AUDIO_CHUNK as u64 + 5,
+        seed: 42,
+    }
+    .generate()
+    .unwrap();
+    let (bytes, _) = set
+        .encode_bytes(&v, "flac", &json!({ "bits": 16 }), &NoMonitor)
+        .unwrap();
+    let (want, stamp) = set
+        .decode(&mut Cursor::new(&bytes), "flac", &opts, &limits, &NoMonitor)
+        .unwrap();
+    let mut sink = Collect::default();
+    let got = set
+        .decode_stream(
+            &mut Cursor::new(bytes.clone()),
+            "flac",
+            &opts,
+            &limits,
+            &mut sink,
+            &NoMonitor,
+        )
+        .unwrap();
+    assert_eq!(got, stamp);
+    assert_eq!(sink.windows.len(), 2);
+    check_windows(&sink, &want, "長い FLAC");
+    // MD5（STREAMINFO の最後の 16 バイト：fLaC 4 ＋ 箱の頭 4 ＋ 18）を壊す
+    assert_eq!(&bytes[..4], b"fLaC");
+    let mut broken = bytes;
+    broken[30] ^= 0x5a;
+    let mut sink = Collect::default();
+    let got = set.decode_stream(
+        &mut Cursor::new(broken.clone()),
+        "flac",
+        &opts,
+        &limits,
+        &mut sink,
+        &NoMonitor,
+    );
+    assert!(matches!(got, Err(EngineError::Decode { .. })), "{got:?}");
+    assert!(!sink.windows.is_empty() && sink.end.is_none());
+    assert!(matches!(
+        set.decode(
+            &mut Cursor::new(&broken),
+            "flac",
+            &opts,
+            &limits,
+            &NoMonitor
+        ),
+        Err(EngineError::Decode { .. })
+    ));
+}
+

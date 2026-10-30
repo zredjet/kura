@@ -12,14 +12,15 @@
 //!   （リトルエンディアンの入れ物の幅で並べたもの）を書く。VORBIS_COMMENT（vendor は "kura"）にタグと LOOPSTART・
 //!   LOOPLENGTH を書く。SEEKTABLE・PADDING は書かない。
 
-use std::io::Write;
-use std::sync::Arc;
+use std::io::{BufReader, Write};
+use std::path::Path;
 
 use md5::{Digest as _, Md5};
 use serde_json::json;
 use symphonia_core::codecs::audio::AudioDecoder as _;
 
-use crate::codec::symph::{self, Container};
+use crate::codec::stream::{self, DecodeInfo, DecodeOut};
+use crate::codec::symph::{self, Container, Media};
 use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, pcm, try_vec};
 use crate::determinism::{block_count, par_blocks};
 use crate::doc::DecodeOptions;
@@ -28,7 +29,7 @@ use crate::limits::Limits;
 use crate::monitor::{Monitor, NoMonitor};
 use crate::op::{ParamKind, ParamSchema, Unit, spec};
 use crate::shape::{Dim, Shape};
-use crate::value::{AudioBuilder, AudioSource, Value};
+use crate::value::{AudioSource, Value};
 
 /// FLAC の読み書き。
 pub struct FlacCodec;
@@ -57,8 +58,8 @@ struct Probe {
     bits: Option<u32>,
 }
 
-fn probe(data: &[u8], limits: &Limits, mon: &dyn Monitor) -> Result<Probe, EngineError> {
-    let mut o = symph::open(DEC_ID, data, Container::Flac, mon, limits)?;
+fn probe(media: &mut Media<'_>, limits: &Limits, mon: &dyn Monitor) -> Result<Probe, EngineError> {
+    let mut o = media.open(DEC_ID, Container::Flac, mon, limits)?;
     let frames = match o.track.num_frames.filter(|n| *n > 0) {
         Some(n) => n,
         None => o.count_frames(DEC_ID, mon, limits)?,
@@ -92,12 +93,32 @@ impl Decoder for FlacCodec {
         limits: &Limits,
     ) -> Result<Shape, EngineError> {
         let data = symph::read_all(src, limits)?;
-        let p = probe(&data, limits, &NoMonitor)?;
-        Ok(Shape::Audio {
-            rate: p.rate,
-            channels: p.channels,
-            frames: Dim::Exact(p.frames),
-        })
+        let p = probe(&mut Media::Bytes(&data), limits, &NoMonitor)?;
+        Ok(shape_of(&p))
+    }
+
+    /// ファイルを開いて STREAMINFO を読む（全体を読み込まない。M13 段 2）。
+    fn shape_file(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.shape_file_monitored(path, format, opts, limits, &NoMonitor)
+    }
+
+    fn shape_file_monitored(
+        &self,
+        path: &Path,
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Shape, EngineError> {
+        let mut f = BufReader::new(std::fs::File::open(path)?);
+        let p = probe(&mut Media::Reader(&mut f), limits, mon)?;
+        Ok(shape_of(&p))
     }
 
     fn decode(
@@ -109,35 +130,80 @@ impl Decoder for FlacCodec {
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
         let data = symph::read_all(src, limits)?;
-        let p = probe(&data, limits, mon)?;
-        limits
-            .check(&Shape::Audio {
-                rate: p.rate,
-                channels: p.channels,
-                frames: Dim::Exact(p.frames),
-            })
-            .map_err(EngineError::Limit)?;
-        let mut o = symph::open(DEC_ID, &data, Container::Flac, mon, limits)?;
-        let raw = o.raw_tags();
-        let opts = symph::decoder_options().verify(true);
-        let mut dec = symphonia_bundle_flac::FlacDecoder::try_new(&o.params, &opts)
-            .map_err(|e| symph::sym_err(DEC_ID, e, mon))?;
-        let mut out = AudioBuilder::new(p.rate, usize::from(p.channels), p.frames)?;
-        o.decode_all(DEC_ID, &mut dec, p.frames, &mut out, mon)?;
-        if dec.finalize().verify_ok == Some(false) {
-            return Err(dec_err("MD5 が合いません（壊れたファイル）"));
-        }
-        if out.frames() != p.frames {
-            return Err(dec_err("長さがヘッダと合いません"));
-        }
-        let mut meta = symph::meta_from_tags(&raw, p.frames, true, limits);
-        meta.source = Some(AudioSource {
-            bits: pcm::container_bits(p.bits.unwrap_or(16).clamp(1, 32) as u16),
-            float: false,
-            rate: p.rate,
-        });
-        Ok(Value::Audio(Arc::new(out.finish(meta)?)))
+        stream::collect(mon, |out| {
+            decode_media(&mut Media::Bytes(&data), limits, out, mon)
+        })
     }
+
+    fn streams(&self, _format: &str) -> bool {
+        true
+    }
+
+    /// symphonia の読み口の作業領域（4 MiB）と、1 パケット（FLAC は 65,535 フレームまで）の標本の写し。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _len: u64) -> u64 {
+        let Shape::Audio { channels, .. } = shape else {
+            return 0;
+        };
+        (4 << 20) + 65_536 * u64::from(*channels) * 8
+    }
+
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        _shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        decode_media(&mut Media::Reader(src), limits, out, mon)
+    }
+}
+
+fn shape_of(p: &Probe) -> Shape {
+    Shape::Audio {
+        rate: p.rate,
+        channels: p.channels,
+        frames: Dim::Exact(p.frames),
+    }
+}
+
+/// FLAC を読んで標本を `out` に渡す（`decode`・`decode_stream` が通る）。STREAMINFO の MD5 は最後に照らす（合わなければ、
+/// 渡した標本はすべて無効：`DecodeSink` の約束）。
+fn decode_media(
+    media: &mut Media<'_>,
+    limits: &Limits,
+    out: &mut DecodeOut<'_>,
+    mon: &dyn Monitor,
+) -> Result<(), EngineError> {
+    let p = probe(media, limits, mon)?;
+    limits.check(&shape_of(&p)).map_err(EngineError::Limit)?;
+    let mut o = media.open(DEC_ID, Container::Flac, mon, limits)?;
+    let raw = o.raw_tags();
+    let opts = symph::decoder_options().verify(true);
+    let mut dec = symphonia_bundle_flac::FlacDecoder::try_new(&o.params, &opts)
+        .map_err(|e| symph::sym_err(DEC_ID, e, mon))?;
+    out.begin(DecodeInfo {
+        rate: p.rate,
+        channels: usize::from(p.channels),
+        frames: Dim::Exact(p.frames),
+        expect: p.frames,
+    })?;
+    o.decode_all(DEC_ID, &mut dec, p.frames, out, mon)?;
+    if dec.finalize().verify_ok == Some(false) {
+        return Err(dec_err("MD5 が合いません（壊れたファイル）"));
+    }
+    if out.frames() != p.frames {
+        return Err(dec_err("長さがヘッダと合いません"));
+    }
+    let mut meta = symph::meta_from_tags(&raw, p.frames, true, limits);
+    meta.source = Some(AudioSource {
+        bits: pcm::container_bits(p.bits.unwrap_or(16).clamp(1, 32) as u16),
+        float: false,
+        rate: p.rate,
+    });
+    out.end(meta)
 }
 
 /// ビットの書き手（上位のビットから）。
@@ -752,6 +818,7 @@ mod tests {
     use crate::codec::CodecSet;
     use crate::value::{Audio, AudioMeta, LoopRange};
     use std::io::Cursor;
+    use std::sync::Arc;
 
     fn decode(bytes: &[u8]) -> Result<Value, EngineError> {
         CodecSet::pinned()

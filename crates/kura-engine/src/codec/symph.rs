@@ -2,8 +2,10 @@
 //!
 //! - 部品のクレートを `=0.6.1` で直接使い、Probe は通さない（形式の表で読み口とデコーダを選ぶ）。既定の feature
 //!   （opt-simd・id3v2）は入れない（Cargo.toml と `scripts/check-engine-features.sh`）。
-//! - ファイルは読み込んでから渡す（大きさは `max_value_bytes` まで）。読み口は `read` のたびに中止を見て、パケットごとにも
-//!   中止を確かめる。symphonia の panic は `codec::contain` が受け止める。
+//! - 読む元は 2 つ（[`Media`]）：読み込んだバイト列（読み口の口 `shape`・`decode`。大きさは `max_value_bytes` まで）と、
+//!   シークできる読み口（ファイル。流して読む口 `decode_stream`・形 `shape_file`。M13 段 2。全体を読み込まない）。どちらも
+//!   同じ読み口・同じデコーダを通るので値は同じ。読み口は `read` のたびに中止を見て、パケットごとにも中止を確かめる。
+//!   symphonia の panic は `codec::contain` が受け止める。
 //! - 長さ：FLAC は STREAMINFO の総フレーム数（0 ならパケットの長さの和）、ALAC・Vorbis は、デコードせずにパケットの
 //!   長さ（`dur`。遅延・詰め物を除いた数）を足した値を形にし、デコードした長さがそれと違えば壊れたファイルとして扱う
 //!   （形と中身が必ず一致する。形より長く出てきたものも `Decode`）。AAC は priming を自前で切るので（`lossy.rs`）、
@@ -20,6 +22,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::sync::Mutex;
 
 use symphonia_core::audio::{Audio as _, GenericAudioBufferRef};
 use symphonia_core::codecs::CodecParameters;
@@ -29,11 +32,12 @@ use symphonia_core::formats::{FormatOptions, FormatReader, Track, TrackType};
 use symphonia_core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 use symphonia_core::meta::RawValue;
 
+use crate::codec::stream::DecodeOut;
 use crate::codec::{ReadSeek, pcm, try_vec};
 use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
-use crate::value::{AudioBuilder, AudioMeta, LoopRange};
+use crate::value::{AudioMeta, LoopRange};
 
 /// 名前・タグとして読む 1 つの文字列の長さの上限（バイト）。
 const TEXT_MAX: usize = 4_096;
@@ -49,10 +53,64 @@ pub(crate) enum Container {
     Adts,
 }
 
-/// 中止を見る読み口（読み込んだバイト列を包む）。
+/// 読む元（モジュールの説明）。
+pub(crate) enum Media<'a> {
+    /// 読み込んだバイト列。
+    Bytes(&'a [u8]),
+    /// シークできる読み口（ファイル。開くたびに頭へ戻す）。
+    Reader(&'a mut (dyn ReadSeek + Send)),
+}
+
+impl Media<'_> {
+    /// 読み口を開き、最初の音声のトラックを選ぶ（[`open`] と同じ）。読み口は頭へ戻してから包む。
+    pub fn open<'s>(
+        &'s mut self,
+        id: &str,
+        c: Container,
+        mon: &'s dyn Monitor,
+        limits: &Limits,
+    ) -> Result<Opened<'s>, EngineError> {
+        let inner = match self {
+            Media::Bytes(data) => SrcInner::Bytes(Cursor::new(*data)),
+            Media::Reader(r) => {
+                let len = r.seek(SeekFrom::End(0))?;
+                r.seek(SeekFrom::Start(0))?;
+                SrcInner::Reader {
+                    r: Mutex::new(&mut **r),
+                    len,
+                }
+            }
+        };
+        open_src(id, Src { inner, mon }, c, limits)
+    }
+
+    /// MP4 の編集リストの切り取り（[`mp4_edit`]。読み口は最上位の箱の頭をたどり、moov だけを読む）。
+    pub fn mp4_edit(&mut self, rate: u32) -> Result<Option<(u64, u64)>, EngineError> {
+        match self {
+            Media::Bytes(data) => Ok(mp4_edit(data, rate)),
+            Media::Reader(r) => mp4_edit_reader(&mut **r, rate),
+        }
+    }
+}
+
+/// 中止を見る読み口の中身。
+enum SrcInner<'a> {
+    Bytes(Cursor<&'a [u8]>),
+    /// 読み口（symphonia の読み口は `Sync` を求めるので `Mutex` で包む）と長さ。
+    Reader {
+        r: Mutex<&'a mut (dyn ReadSeek + Send)>,
+        len: u64,
+    },
+}
+
+/// 中止を見る読み口（読み込んだバイト列か、シークできる読み口を包む）。
 struct Src<'a> {
-    cur: Cursor<&'a [u8]>,
+    inner: SrcInner<'a>,
     mon: &'a dyn Monitor,
+}
+
+fn poisoned() -> std::io::Error {
+    std::io::Error::other("kura: 読み口の鍵が壊れています")
 }
 
 impl Read for Src<'_> {
@@ -61,13 +119,19 @@ impl Read for Src<'_> {
             // Interrupted は read_exact が再試行するので使わない
             return Err(std::io::Error::other("kura: canceled"));
         }
-        self.cur.read(buf)
+        match &mut self.inner {
+            SrcInner::Bytes(c) => c.read(buf),
+            SrcInner::Reader { r, .. } => r.get_mut().map_err(|_| poisoned())?.read(buf),
+        }
     }
 }
 
 impl Seek for Src<'_> {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.cur.seek(pos)
+        match &mut self.inner {
+            SrcInner::Bytes(c) => c.seek(pos),
+            SrcInner::Reader { r, .. } => r.get_mut().map_err(|_| poisoned())?.seek(pos),
+        }
     }
 }
 
@@ -77,7 +141,10 @@ impl MediaSource for Src<'_> {
     }
 
     fn byte_len(&self) -> Option<u64> {
-        Some(self.cur.get_ref().len() as u64)
+        match &self.inner {
+            SrcInner::Bytes(c) => Some(c.get_ref().len() as u64),
+            SrcInner::Reader { len, .. } => Some(*len),
+        }
     }
 }
 
@@ -124,13 +191,22 @@ pub(crate) fn open<'a>(
     mon: &'a dyn Monitor,
     limits: &Limits,
 ) -> Result<Opened<'a>, EngineError> {
-    let mss = MediaSourceStream::new(
-        Box::new(Src {
-            cur: Cursor::new(data),
-            mon,
-        }),
-        MediaSourceStreamOptions::default(),
-    );
+    let src = Src {
+        inner: SrcInner::Bytes(Cursor::new(data)),
+        mon,
+    };
+    open_src(id, src, c, limits)
+}
+
+/// 包んだ読み口を開き、最初の音声のトラックを選ぶ。
+fn open_src<'a>(
+    id: &str,
+    src: Src<'a>,
+    c: Container,
+    limits: &Limits,
+) -> Result<Opened<'a>, EngineError> {
+    let mon = src.mon;
+    let mss = MediaSourceStream::new(Box::new(src), MediaSourceStreamOptions::default());
     let o = FormatOptions::default();
     let e = |e| sym_err(id, e, mon);
     let reader: Box<dyn FormatReader + 'a> = match c {
@@ -237,13 +313,13 @@ impl Opened<'_> {
         out
     }
 
-    /// すべてのパケットをデコードして、標本を `out` に足す（長さは `max_frames` まで）。
+    /// すべてのパケットをデコードして、標本を `out` に足す（長さは `max_frames` まで。組み手の形でも流す形でも同じ道）。
     pub fn decode_all(
         &mut self,
         id: &str,
         dec: &mut dyn AudioDecoder,
         max_frames: u64,
-        out: &mut AudioBuilder,
+        out: &mut DecodeOut<'_>,
         mon: &dyn Monitor,
     ) -> Result<(), EngineError> {
         let mut total = 0u64;
@@ -313,6 +389,60 @@ pub(crate) fn canonical_nan(s: f32) -> f32 {
     } else {
         s
     }
+}
+
+/// moov を読む大きさの上限（[`mp4_edit_reader`]）。
+const MOOV_MAX: u64 = 64 << 20;
+
+/// [`mp4_edit`] の読み口の版：最上位の箱の頭をシークでたどり（mdat は飛ばす）、最初の moov だけを（[`MOOV_MAX`] まで）読んで
+/// 同じ解析に渡す。箱のたどり方（壊れた箱で止まる・大きさ 0 は終わりまで・大きさ 1 は 64 ビット）は `mp4_edit` と同じなので、
+/// 同じ切り取りを返す。
+pub(crate) fn mp4_edit_reader(
+    src: &mut dyn ReadSeek,
+    rate: u32,
+) -> Result<Option<(u64, u64)>, EngineError> {
+    let len = src.seek(SeekFrom::End(0))?;
+    let mut at = 0u64;
+    while at + 8 <= len {
+        src.seek(SeekFrom::Start(at))?;
+        let mut h = [0u8; 16];
+        let want = if at + 16 <= len { 16 } else { 8 };
+        src.read_exact(&mut h[..want])?;
+        let size = u64::from(u32::from_be_bytes([h[0], h[1], h[2], h[3]]));
+        let kind = [h[4], h[5], h[6], h[7]];
+        let (head, size) = if size == 1 && at + 16 <= len {
+            let mut v = [0u8; 8];
+            v.copy_from_slice(&h[8..16]);
+            (16u64, u64::from_be_bytes(v))
+        } else if size == 0 {
+            (8, len - at)
+        } else {
+            (8, size)
+        };
+        if size < head || at.saturating_add(size) > len {
+            break;
+        }
+        if &kind == b"moov" {
+            let body = size - head;
+            if body > MOOV_MAX {
+                return Ok(None);
+            }
+            // 同じ解析（mp4_edit）に、moov の箱だけを最上位に置いたバイト列で渡す
+            let mut data = try_vec(usize::try_from(8 + body).unwrap_or(usize::MAX), 0u8)?;
+            let box_len = u32::try_from(8 + body).unwrap_or(0);
+            data[..4].copy_from_slice(&box_len.to_be_bytes());
+            data[4..8].copy_from_slice(b"moov");
+            src.seek(SeekFrom::Start(at + head))?;
+            src.read_exact(&mut data[8..])?;
+            if box_len == 0 {
+                // 4 GiB を超える moov（上限で断っているので来ない）
+                return Ok(None);
+            }
+            return Ok(mp4_edit(&data, rate));
+        }
+        at += size;
+    }
+    Ok(None)
 }
 
 /// 読み取りの予算（マーカーの上限とバイト数）。
@@ -850,6 +980,58 @@ impl Bits<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M13 段 2：読み口から moov だけを読む編集リストの解析は、全体を読み込んだものと同じ（フィクスチャの m4a と、moov を
+    /// mdat の後ろに置いたもの・壊れた箱で止まるもの・大きさ 0 の箱）。
+    #[test]
+    fn mp4_edit_reader_equals_mp4_edit() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let mut seen_edit = 0;
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) != Some("m4a") {
+                continue;
+            }
+            let data = std::fs::read(&p).unwrap();
+            for rate in [44_100, 48_000, 8_000] {
+                let want = mp4_edit(&data, rate);
+                let got = mp4_edit_reader(&mut Cursor::new(&data), rate).unwrap();
+                assert_eq!(got, want, "{}・{rate}", p.display());
+                seen_edit += usize::from(want.is_some());
+            }
+            // moov を後ろへ回す（最上位の箱の並びを入れ替える）・後ろに壊れた箱を足す・大きさ 0 の箱を足す
+            let mut boxes = Vec::new();
+            let mut at = 0usize;
+            while at + 8 <= data.len() {
+                let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+                if size < 8 || at + size > data.len() {
+                    break;
+                }
+                boxes.push(data[at..at + size].to_vec());
+                at += size;
+            }
+            boxes.reverse();
+            let moved: Vec<u8> = boxes.concat();
+            let mut tails = vec![moved.clone()];
+            let mut bad = moved.clone();
+            bad.extend_from_slice(&[0, 0, 0, 3, b'f', b'r', b'e', b'e']);
+            tails.push(bad);
+            let mut zero = vec![0, 0, 0, 0, b'f', b'r', b'e', b'e', 1, 2, 3];
+            zero.extend_from_slice(&moved);
+            tails.push(zero);
+            for d in tails {
+                for rate in [44_100, 48_000] {
+                    assert_eq!(
+                        mp4_edit_reader(&mut Cursor::new(&d), rate).unwrap(),
+                        mp4_edit(&d, rate),
+                        "{}",
+                        p.display()
+                    );
+                }
+            }
+        }
+        assert!(seen_edit >= 1, "{seen_edit}");
+    }
 
     /// NaN はどのビット列でも `0x7fc00000` にそろえ（符号・ペイロードを捨てる）、ほかの値（-0・±∞・非正規化数）は
     /// ビット単位でそのまま。

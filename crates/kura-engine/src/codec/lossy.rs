@@ -22,19 +22,21 @@
 //!   変わらない（見るだけで、デコードの経路は同じ）。
 //! - ALAC：MP4 の中の ALAC。整数を `pcm::int_to_f32(v, 32)` で読み、長さはパケットの長さの和（形は `Exact`）。
 
-use std::sync::Arc;
+use std::io::BufReader;
+use std::path::Path;
 
 use symphonia_core::codecs::audio::AudioDecoder as _;
 use symphonia_core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_ALAC, CODEC_ID_VORBIS};
 
-use crate::codec::symph::{self, Container, read_all};
+use crate::codec::stream::{self, DecodeInfo, DecodeOut};
+use crate::codec::symph::{self, Container, Media, read_all};
 use crate::codec::{Decoder, ReadSeek, Tier, pcm};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::{Monitor, NoMonitor};
 use crate::shape::{Dim, Shape};
-use crate::value::{AudioBuilder, AudioMeta, AudioSource, Value};
+use crate::value::{AudioMeta, AudioSource, Value};
 
 /// symphonia の写し（`third_party/`。ルートと `fuzz/` の `[patch.crates-io]`）が実際に組まれていることを、組み立てで
 /// 確かめる。`KURA_PATCHED` は写しにだけある印なので、差し替えが外れて crates.io の上流のクレートが組まれると（`[patch]`
@@ -120,11 +122,11 @@ impl SymphoniaDecoder {
     /// 答える（読むときに今までどおりの理由で断る）。
     fn sbr_in_first_packets(
         &self,
-        data: &[u8],
+        media: &mut Media<'_>,
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<bool, EngineError> {
-        let mut o = symph::open(self.id(), data, self.container(), mon, limits)?;
+        let mut o = media.open(self.id(), self.container(), mon, limits)?;
         let mut dec =
             symphonia_codec_aac::AacDecoder::try_new(&o.params, &symph::decoder_options())
                 .map_err(|e| symph::sym_err(self.id(), e, mon))?;
@@ -165,9 +167,14 @@ struct Probe {
 
 impl SymphoniaDecoder {
     /// 開いて、中身の種類・HE-AAC・Vorbis の表の大きさを確かめ、長さを決める。
-    fn probe(&self, data: &[u8], limits: &Limits, mon: &dyn Monitor) -> Result<Probe, EngineError> {
+    fn probe(
+        &self,
+        media: &mut Media<'_>,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Probe, EngineError> {
         let id = self.id();
-        let mut o = symph::open(id, data, self.container(), mon, limits)?;
+        let mut o = media.open(id, self.container(), mon, limits)?;
         let want = match self.kind {
             Kind::OggVorbis => CODEC_ID_VORBIS,
             Kind::Mp4Alac => CODEC_ID_ALAC,
@@ -178,11 +185,17 @@ impl SymphoniaDecoder {
                 "{id}: このデコーダの扱う中身ではありません"
             )));
         }
-        if want == CODEC_ID_AAC
-            && (o.params.extra_data.as_deref().is_some_and(symph::is_he_aac)
-                || self.sbr_in_first_packets(data, limits, mon)?)
-        {
-            return Err(self.he_aac());
+        let raw_tags = o.raw_tags();
+        if want == CODEC_ID_AAC {
+            if o.params.extra_data.as_deref().is_some_and(symph::is_he_aac) {
+                return Err(self.he_aac());
+            }
+            // 帯域の中の印は開き直して見る（読み口を 1 つずつ借りる）。同じ中身なので開き直したものも同じ
+            drop(o);
+            if self.sbr_in_first_packets(media, limits, mon)? {
+                return Err(self.he_aac());
+            }
+            o = media.open(id, self.container(), mon, limits)?;
         }
         if want == CODEC_ID_VORBIS {
             let budget = limits.max_value_bytes.min(256 << 20);
@@ -201,17 +214,20 @@ impl SymphoniaDecoder {
                 None => return Err(self.err("Vorbis の setup ヘッダが読めません")),
             }
         }
-        let raw_tags = o.raw_tags();
         let rate = o.rate;
         let channels = u16::try_from(o.channels).map_err(|_| self.err("チャンネルが多すぎます"))?;
         let counted = o.count_frames(id, mon, limits)?;
+        drop(o);
         let (frames, trim) = match self.kind {
             Kind::Mp4Aac => {
                 let smpb = raw_tags
                     .iter()
                     .find(|(k, _)| k.ends_with("iTunSMPB"))
                     .and_then(|(_, v)| symph::parse_itunsmpb(v));
-                let trim = smpb.or_else(|| symph::mp4_edit(data, rate));
+                let trim = match smpb {
+                    Some(t) => Some(t),
+                    None => media.mp4_edit(rate)?,
+                };
                 // 切り取りの長さは中身より長いと言っても信じない（出うる長さで抑える）
                 let bound = trim.map_or(counted.saturating_add(4_096), |(_, len)| {
                     len.min(counted.saturating_add(4_096))
@@ -272,12 +288,32 @@ impl Decoder for SymphoniaDecoder {
         limits: &Limits,
     ) -> Result<Shape, EngineError> {
         let data = read_all(src, limits)?;
-        let p = self.probe(&data, limits, &NoMonitor)?;
-        Ok(Shape::Audio {
-            rate: p.rate,
-            channels: p.channels,
-            frames: p.frames,
-        })
+        let p = self.probe(&mut Media::Bytes(&data), limits, &NoMonitor)?;
+        Ok(shape_of(&p))
+    }
+
+    /// ファイルを開いて形を決める（全体を読み込まない。パケットの長さの和は I/O だけで数える。M13 段 2）。
+    fn shape_file(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.shape_file_monitored(path, format, opts, limits, &NoMonitor)
+    }
+
+    fn shape_file_monitored(
+        &self,
+        path: &Path,
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Shape, EngineError> {
+        let mut f = BufReader::new(std::fs::File::open(path)?);
+        let p = self.probe(&mut Media::Reader(&mut f), limits, mon)?;
+        Ok(shape_of(&p))
     }
 
     fn decode(
@@ -288,17 +324,67 @@ impl Decoder for SymphoniaDecoder {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
-        let id = self.id();
         let data = read_all(src, limits)?;
-        let p = self.probe(&data, limits, mon)?;
-        limits
-            .check(&Shape::Audio {
-                rate: p.rate,
-                channels: p.channels,
-                frames: p.frames,
-            })
-            .map_err(EngineError::Limit)?;
-        let mut o = symph::open(id, &data, self.container(), mon, limits)?;
+        stream::collect(mon, |out| {
+            self.decode_media(&mut Media::Bytes(&data), limits, out, mon)
+        })
+    }
+
+    fn streams(&self, _format: &str) -> bool {
+        true
+    }
+
+    /// symphonia の読み口の作業領域（4 MiB）と、1 パケットの標本の写し（AAC・ALAC は 8,192 フレーム、Vorbis は 8,192 フレーム）。
+    /// Vorbis は setup の codebook の表を見積もりの上限（32 MiB まで見込む）で足す。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _len: u64) -> u64 {
+        let Shape::Audio { channels, .. } = shape else {
+            return 0;
+        };
+        let packet = 8_192 * u64::from(*channels) * 8;
+        let tables = if self.kind == Kind::OggVorbis {
+            32 << 20
+        } else {
+            0
+        };
+        (4 << 20) + packet + tables
+    }
+
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        _shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.decode_media(&mut Media::Reader(src), limits, out, mon)
+    }
+}
+
+fn shape_of(p: &Probe) -> Shape {
+    Shape::Audio {
+        rate: p.rate,
+        channels: p.channels,
+        frames: p.frames,
+    }
+}
+
+impl SymphoniaDecoder {
+    /// 読んで標本を `out` に渡す（`decode`・`decode_stream` が通る）。AAC の切り取り（編集リスト）は流れの中で行い、長さは
+    /// 終わりに分かる。後から SBR が出てきたものは、読み終えたあとに `Unsupported`（次の段へ。受け手は `begin` で捨て直す）。
+    fn decode_media(
+        &self,
+        media: &mut Media<'_>,
+        limits: &Limits,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let id = self.id();
+        let p = self.probe(media, limits, mon)?;
+        limits.check(&shape_of(&p)).map_err(EngineError::Limit)?;
+        let mut o = media.open(id, self.container(), mon, limits)?;
         let opts = symph::decoder_options();
         let e = |e| symph::sym_err(id, e, mon);
         // 上限は形の上限。AAC を切るときは、切る前の長さ（パケットの長さの和）まで読んでから切る（編集リストが
@@ -308,28 +394,37 @@ impl Decoder for SymphoniaDecoder {
             (Dim::AtMost(_), Some(_)) => p.counted.saturating_add(8_192),
             (Dim::AtMost(n), None) => n,
         };
-        // 切るなら（編集リスト）、頭の start フレームを捨てて len フレームだけを残す
-        let mut out = match p.trim {
-            Some((start, len)) => {
-                AudioBuilder::new(p.rate, usize::from(p.channels), max.min(len))?.window(start, len)
-            }
-            None => AudioBuilder::new(p.rate, usize::from(p.channels), max)?,
+        // 見込みの長さ（ダイジェストを取り始める長さ。外れても 2 度目の読みで正しくなる）
+        let expect = match (p.frames, p.trim) {
+            (Dim::Exact(n), _) => n,
+            (Dim::AtMost(_), Some((start, len))) => len.min(p.counted.saturating_sub(start)),
+            (Dim::AtMost(_), None) => p.counted,
         };
+        out.begin(DecodeInfo {
+            rate: p.rate,
+            channels: usize::from(p.channels),
+            frames: p.frames,
+            expect,
+        })?;
+        // 切るなら（編集リスト）、頭の start フレームを捨てて len フレームだけを残す
+        if let Some((start, len)) = p.trim {
+            out.window(start, len);
+        }
         match self.kind {
             Kind::OggVorbis => {
                 let mut dec =
                     symphonia_codec_vorbis::VorbisDecoder::try_new(&o.params, &opts).map_err(e)?;
-                o.decode_all(id, &mut dec, max, &mut out, mon)?;
+                o.decode_all(id, &mut dec, max, out, mon)?;
             }
             Kind::Mp4Alac => {
                 let mut dec =
                     symphonia_codec_alac::AlacDecoder::try_new(&o.params, &opts).map_err(e)?;
-                o.decode_all(id, &mut dec, max, &mut out, mon)?;
+                o.decode_all(id, &mut dec, max, out, mon)?;
             }
             Kind::Mp4Aac | Kind::AdtsAac => {
                 let mut dec =
                     symphonia_codec_aac::AacDecoder::try_new(&o.params, &opts).map_err(e)?;
-                o.decode_all(id, &mut dec, max, &mut out, mon)?;
+                o.decode_all(id, &mut dec, max, out, mon)?;
                 // 形を決めたときに見た先頭より後で SBR の拡張が出てきたものも、半分のレートの値を返さずに次の段へ
                 if dec.sbr_seen() {
                     return Err(self.he_aac());
@@ -361,6 +456,6 @@ impl Decoder for SymphoniaDecoder {
                 rate: p.rate,
             },
         });
-        Ok(Value::Audio(Arc::new(out.finish(meta)?)))
+        out.end(meta)
     }
 }
