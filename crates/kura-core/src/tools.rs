@@ -465,6 +465,17 @@ pub type Feed<'a> = &'a mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Resul
 /// 標準出力の受け手（受け手のスレッドで動く）。`Err` を返すとプロセスを止める（[`Stopped::Consumer`]）。
 pub type OnChunk<'a> = &'a mut (dyn FnMut(&[u8]) -> Result<(), String> + Send);
 
+/// 呼び手のスレッドで回す標準出力の受け手（[`run_binary_pull`]）。`Err` を返すとプロセスを止める（[`Stopped::Consumer`]）。
+pub type OnChunkHere<'a> = &'a mut dyn FnMut(&[u8]) -> Result<(), String>;
+
+/// 標準出力の受け手の回し方。
+enum Consumer<'a> {
+    /// 受け手のスレッド（`kura-tool-consumer`）で回す。
+    Thread(OnChunk<'a>),
+    /// 呼び手のスレッドで回す（標準入力は書かない）。
+    Here(OnChunkHere<'a>),
+}
+
 /// 標準エラーの残した行。
 #[derive(Default)]
 struct StderrLog {
@@ -920,7 +931,31 @@ pub fn run_binary(
         budget,
         canceled,
         feed,
-        on_chunk,
+        Consumer::Thread(on_chunk),
+        &signal_group,
+    )
+}
+
+/// [`run_binary`] と同じだが、標準出力の受け手 `on_chunk` を呼び手のスレッドで回す（M13 段 2）。受け手がエンジンを呼ぶ
+/// とき（流れのデコードの窓・解析の `par_blocks`）に、エンジンを呼び手の一括のプールの中で使うため（受け手のスレッドから
+/// 呼ぶと、プールの外でエンジンを使うことになる。.claude/rules/engine.md）。標準入力は書かない（デコードは使わない）。
+/// 見張り（中止・無出力・時間切れ・出力の上限・子孫の片付け）は [`run_binary`] と同じ。
+pub fn run_binary_pull(
+    exe: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    budget: &Budget,
+    canceled: &(dyn Fn() -> bool + Sync),
+    on_chunk: OnChunkHere<'_>,
+) -> Result<RunOutcome, RunError> {
+    run_binary_with(
+        exe,
+        args,
+        cwd,
+        budget,
+        canceled,
+        None,
+        Consumer::Here(on_chunk),
         &signal_group,
     )
 }
@@ -943,7 +978,7 @@ pub fn run_binary_kill(
         budget,
         canceled,
         feed,
-        on_chunk,
+        Consumer::Thread(on_chunk),
         &|pid, sig| signal_group(pid, if sig == "-TERM" { "-KILL" } else { sig }),
     )
 }
@@ -958,7 +993,7 @@ fn run_binary_with(
     budget: &Budget,
     canceled: &(dyn Fn() -> bool + Sync),
     feed: Option<Feed<'_>>,
-    on_chunk: OnChunk<'_>,
+    consumer: Consumer<'_>,
     signal: &(dyn Fn(u32, &str) -> bool + Sync),
 ) -> Result<RunOutcome, RunError> {
     let mut cmd = Command::new(exe);
@@ -1066,11 +1101,13 @@ fn run_binary_with(
     std::thread::scope(|s| {
         // 抜けるときに必ず「終わった」にする（`feed` が panic しても、見張りが子孫の片付けに移って終われるように）
         let _done = DoneGuard(&done, &wake);
-        let consumer = {
+        // 受け手のループ（受け手のスレッドか、呼び手のスレッドで回す）。抜けると受け口を捨てるので、詰まった標準出力の
+        // スレッドも抜けられる
+        let consume = {
             let (out_total, kill_for, abandoned) = (&out_total, &kill_for, &abandoned);
             let (consumer_done, wake) = (&consumer_done, &*wake);
-            let on_chunk = &mut *on_chunk;
-            move || {
+            move |out_rx: mpsc::Receiver<Vec<u8>>,
+                  on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>| {
                 let _done = DoneGuard(consumer_done, wake);
                 while !abandoned.load(Ordering::SeqCst) {
                     let chunk = match out_rx.recv_timeout(WATCH_TICK) {
@@ -1151,14 +1188,25 @@ fn run_binary_with(
                 }
             }
         };
-        let started = std::thread::Builder::new()
-            .name("kura-tool-consumer".into())
-            .spawn_scoped(s, consumer)
-            .and_then(|_| {
+        let (here, started) = match consumer {
+            Consumer::Thread(on_chunk) => (
+                None,
+                std::thread::Builder::new()
+                    .name("kura-tool-consumer".into())
+                    .spawn_scoped(s, move || consume(out_rx, on_chunk))
+                    .and_then(|_| {
+                        std::thread::Builder::new()
+                            .name("kura-tool-watch".into())
+                            .spawn_scoped(s, watcher)
+                    }),
+            ),
+            Consumer::Here(on_chunk) => (
+                Some((out_rx, on_chunk)),
                 std::thread::Builder::new()
                     .name("kura-tool-watch".into())
-                    .spawn_scoped(s, watcher)
-            });
+                    .spawn_scoped(s, watcher),
+            ),
+        };
         if let Err(e) = started {
             // 見張りなしでは待てない：グループを止め、ほかのスレッドを抜けさせる（子は `Reaper` が回収する）
             thread_error = Some(e);
@@ -1177,6 +1225,10 @@ fn run_binary_with(
             if let Err(e) = feed(&mut w) {
                 feed_error = Some(e);
             }
+        }
+        // 呼び手のスレッドで受ける（標準出力が閉じる・止める・見捨てるまで）
+        if let Some((rx, on_chunk)) = here {
+            consume(rx, on_chunk);
         }
         // 子が終わるのを待つ（見張りが止めるので必ず戻る）
         if let Some(c) = reaper.child.as_mut() {
@@ -1357,6 +1409,118 @@ mod tests {
         on_chunk: OnChunk<'_>,
     ) -> Result<RunOutcome, RunError> {
         run_binary(exe, &[], Path::new("/"), b, canceled, None, on_chunk)
+    }
+
+    /// M13 段 2：呼び手のスレッドで受ける形（`run_binary_pull`）も、出力をそのまま渡して数え、出力の上限・中止・受け手の
+    /// 誤り・時間切れ・無出力で止まる（`run_binary` と同じ見張り）。受け手は呼び手のスレッドで回る。
+    #[test]
+    fn pull_mode_passes_output_and_stops_like_run_binary() {
+        let d = tempfile::tempdir().unwrap();
+        let pull = |exe: &Path,
+                    b: &Budget,
+                    canceled: &(dyn Fn() -> bool + Sync),
+                    on_chunk: OnChunkHere<'_>| {
+            run_binary_pull(exe, &[], Path::new("/"), b, canceled, on_chunk)
+        };
+        let caller = std::thread::current().id();
+        let s = script(d.path(), "ok", "head -c 800000 /dev/zero; echo note >&2");
+        let mut n = 0u64;
+        let mut here = true;
+        let r = pull(&s, &budget(1 << 20, 5_000), &|| false, &mut |b: &[u8]| {
+            n += b.len() as u64;
+            here &= std::thread::current().id() == caller;
+            Ok(())
+        })
+        .unwrap();
+        assert!(r.status.success() && here);
+        assert_eq!((r.stdout_bytes, n), (800_000, 800_000));
+        assert_eq!(r.stderr_head, ["note"]);
+        // 出力の上限
+        let endless = script(d.path(), "endless", "cat /dev/zero");
+        let r = pull(
+            &endless,
+            &budget(10 << 20, 5_000),
+            &|| false,
+            &mut |_: &[u8]| Ok(()),
+        );
+        assert!(
+            matches!(r, Err(RunError::Stopped(Stopped::OutputLimit))),
+            "{r:?}"
+        );
+        // 中止・受け手の誤り・時間切れ
+        let slow = script(
+            d.path(),
+            "slow",
+            "while true; do head -c 4096 /dev/zero; sleep 0.05; done",
+        );
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let t = Instant::now();
+        let r = pull(
+            &slow,
+            &budget(1 << 30, 5_000),
+            &|| flag.load(std::sync::atomic::Ordering::SeqCst),
+            &mut |_: &[u8]| {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(r, Err(RunError::Stopped(Stopped::Canceled))),
+            "{r:?}"
+        );
+        assert!(
+            t.elapsed() < Duration::from_millis(4_500),
+            "{:?}",
+            t.elapsed()
+        );
+        let r = pull(
+            &slow,
+            &budget(1 << 30, 5_000),
+            &|| false,
+            &mut |_: &[u8]| Err("もう要らない".into()),
+        );
+        assert!(
+            matches!(r, Err(RunError::Stopped(Stopped::Consumer))),
+            "{r:?}"
+        );
+        let r = pull(
+            &slow,
+            &Budget {
+                max_stdout: 1 << 30,
+                stall: Duration::from_secs(10),
+                deadline: Duration::from_millis(300),
+            },
+            &|| false,
+            &mut |_: &[u8]| Ok(()),
+        );
+        assert!(
+            matches!(r, Err(RunError::Stopped(Stopped::Deadline))),
+            "{r:?}"
+        );
+        // 無出力
+        let silent = script(d.path(), "silent", "sleep 30");
+        let t = Instant::now();
+        let r = pull(
+            &silent,
+            &budget(1 << 20, 300),
+            &|| false,
+            &mut |_: &[u8]| Ok(()),
+        );
+        assert!(
+            matches!(r, Err(RunError::Stopped(Stopped::Stalled))),
+            "{r:?}"
+        );
+        assert!(t.elapsed() < Duration::from_secs(10));
+        // 受け手が遅い（受け口が詰まる）ものも最後まで受ける
+        let mut n = 0u64;
+        let r = pull(&s, &budget(1 << 20, 5_000), &|| false, &mut |b: &[u8]| {
+            std::thread::sleep(Duration::from_millis(1));
+            n += b.len() as u64;
+            Ok(())
+        })
+        .unwrap();
+        assert!(r.status.success());
+        assert_eq!(n, 800_000);
     }
 
     #[test]
@@ -1581,7 +1745,7 @@ mod tests {
             },
             &|| false,
             None,
-            &mut |_: &[u8]| Ok(()),
+            Consumer::Thread(&mut |_: &[u8]| Ok(())),
             &|pid, s| sig.send(pid, s),
         );
         let took = t.elapsed();
@@ -1626,7 +1790,7 @@ mod tests {
             &budget(1 << 20, 30_000),
             &canceled,
             None,
-            &mut |_: &[u8]| Ok(()),
+            Consumer::Thread(&mut |_: &[u8]| Ok(())),
             &|pid, s| sig.send(pid, s),
         );
         let since = seen.lock().unwrap().map(|t| t.elapsed());
@@ -1655,7 +1819,7 @@ mod tests {
             &budget(1 << 20, 30_000),
             &|| false,
             None,
-            &mut |_: &[u8]| Ok(()),
+            Consumer::Thread(&mut |_: &[u8]| Ok(())),
             &|pid, s| sig.send(pid, s),
         );
         let took = t.elapsed();
@@ -1690,7 +1854,7 @@ mod tests {
             &budget(1 << 20, 3_000),
             &|| false,
             Some(&mut feed),
-            &mut |_: &[u8]| Ok(()),
+            Consumer::Thread(&mut |_: &[u8]| Ok(())),
             &|pid, s| sig.send(pid, s),
         );
         let took = t.elapsed();
@@ -1733,7 +1897,7 @@ mod tests {
             },
             &|| false,
             None,
-            &mut |_: &[u8]| Ok(()),
+            Consumer::Thread(&mut |_: &[u8]| Ok(())),
             &|pid, s| sig.send(pid, s),
         );
         let took = t.elapsed();

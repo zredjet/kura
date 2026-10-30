@@ -25,6 +25,9 @@ pub struct WavFormat {
     pub mask: Option<u32>,
 }
 
+/// 流す回の受け手（ヘッダの形とチャンネルごとの標本。`Err` は受け手の誤りの文言）。
+pub type ForwardSink<'a> = &'a mut dyn FnMut(WavFormat, &[&[f32]]) -> Result<(), String>;
+
 /// 読み取りの失敗。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WavError {
@@ -32,6 +35,8 @@ pub enum WavError {
     Limit(String),
     /// 出力が壊れている・想定と違う。
     Bad(String),
+    /// 流す回の受け手が断った（受け手の誤りの文言）。
+    Sink(String),
 }
 
 /// 上限（kura-engine の `Limits` のうち、ここで使うもの）。
@@ -79,6 +84,8 @@ pub struct WavStream {
     limits: WavLimits,
     /// 標本を積むか（偽なら数えるだけ）。
     store: bool,
+    /// 積んだ標本を区切りごとに渡して捨てるか（流して読む回。M13 段 2）。
+    forward: bool,
     /// 最初に確保するフレームの数の目安（ffprobe の長さ。上限で抑える）。
     hint: u64,
     header: Vec<u8>,
@@ -98,10 +105,19 @@ impl WavStream {
         Self::new(limits, true, hint)
     }
 
+    /// 流す（流して読む回。M13 段 2）：区切りごとの標本を [`WavStream::push_forward`] の受け手に渡して捨てる（持つのは
+    /// 区切り 1 つ分）。区切りがどこで切れても、渡す標本を連結したものは積む回と同じ。
+    pub fn forward(limits: WavLimits) -> Self {
+        let mut s = Self::new(limits, true, 0);
+        s.forward = true;
+        s
+    }
+
     fn new(limits: WavLimits, store: bool, hint: u64) -> Self {
         Self {
             limits,
             store,
+            forward: false,
             hint,
             header: Vec::new(),
             data: None,
@@ -139,6 +155,22 @@ impl WavStream {
                 self.push_data(rest.get(start..).unwrap_or_default())
             }
         }
+    }
+
+    /// 流す回：標準出力の続きを受け取り、揃ったフレームの標本（ヘッダの形とチャンネルごとの列）を `sink` に渡して捨てる。
+    pub fn push_forward(&mut self, bytes: &[u8], sink: ForwardSink<'_>) -> Result<(), WavError> {
+        self.push(bytes)?;
+        let Some(format) = self.format() else {
+            return Ok(());
+        };
+        if self.forward && self.planes.first().is_some_and(|p| !p.is_empty()) {
+            let views: Vec<&[f32]> = self.planes.iter().map(Vec::as_slice).collect();
+            sink(format, &views).map_err(WavError::Sink)?;
+            for p in &mut self.planes {
+                p.clear();
+            }
+        }
+        Ok(())
     }
 
     /// ヘッダを読んだ：上限を確かめ、積むなら確保する。
@@ -239,7 +271,7 @@ impl WavStream {
         Ok(WavDone {
             format: data.format,
             frames: self.frames,
-            planes: self.store.then_some(self.planes),
+            planes: (self.store && !self.forward).then_some(self.planes),
         })
     }
 }
@@ -264,8 +296,10 @@ fn accept(
         )));
     }
     if store {
-        let need =
-            usize::try_from(total).map_err(|_| WavError::Limit("音声が長すぎます".into()))?;
+        // 積んでいる長さに足す分（積む回は全体、流す回は区切りの分）
+        let have = planes.first().map_or(0, Vec::len) as u64;
+        let need = usize::try_from(have.saturating_add(n))
+            .map_err(|_| WavError::Limit("音声が長すぎます".into()))?;
         let cap_max = usize::try_from(max_frames).unwrap_or(usize::MAX);
         for p in planes.iter_mut() {
             if p.capacity() < need {

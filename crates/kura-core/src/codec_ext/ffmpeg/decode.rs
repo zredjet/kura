@@ -20,20 +20,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kura_engine::codec::pcm::container_bits;
-use kura_engine::codec::{CodecEnv, Decoder, ReadSeek, Stage, Tier};
+use kura_engine::codec::{CodecEnv, DecodeInfo, DecodeOut, Decoder, ReadSeek, Stage, Tier};
 use kura_engine::doc::DecodeOptions;
 use kura_engine::error::EngineError;
 use kura_engine::limits::Limits;
 use kura_engine::monitor::{Monitor, NoMonitor};
 use kura_engine::shape::{Dim, Shape};
-use kura_engine::value::{Audio, AudioSource, Value};
+use kura_engine::value::{Audio, AudioMeta, AudioSource, Value};
 
 use super::env::Detected;
 use super::probe::{Probe, parse_probe};
 use super::tags::{TagStyle, meta_from_tags};
 use super::wavpipe::{WavError, WavStream};
 use super::{STALL, Shared, TempFile, args, deadline_for, failure, io_error, run_error};
-use crate::tools::{Budget, RunError, Stopped, run_binary, run_capped};
+use crate::tools::{Budget, RunError, Stopped, run_binary, run_binary_pull, run_capped};
 
 /// ffprobe の時間の上限（既存の `media::ffmpeg` と同じ）。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -202,8 +202,85 @@ impl FfmpegAudioDecoder {
     fn wav_error(&self, e: WavError) -> EngineError {
         match e {
             WavError::Limit(m) => EngineError::Limit(m),
-            WavError::Bad(m) => io_error(self.kind.id, Stage::Decode, m),
+            WavError::Bad(m) | WavError::Sink(m) => io_error(self.kind.id, Stage::Decode, m),
         }
+    }
+
+    /// ffmpeg を 1 回動かし、標準出力の WAV を呼び手のスレッドで受けて `on_bytes` に渡す（流して読む回。M13 段 2）。
+    /// `on_bytes` の誤りはそのまま返す（受け手が止めた）。
+    fn run_pull(
+        &self,
+        plan: &Plan,
+        path: &Path,
+        limits: &Limits,
+        mon: &dyn Monitor,
+        on_bytes: &mut dyn FnMut(&[u8]) -> Result<(), EngineError>,
+    ) -> Result<(), EngineError> {
+        let id = self.kind.id;
+        let a = args::decode(self.kind.demuxer, plan.decoder, path);
+        let secs = plan.probe.duration_secs.unwrap_or(0.0);
+        let cap = limits.max_value_bytes.min(
+            limits
+                .max_audio_frames
+                .saturating_mul(4)
+                .saturating_mul(limits.max_channels),
+        );
+        let budget = Budget {
+            max_stdout: cap.saturating_add(STDOUT_SLACK),
+            stall: STALL,
+            deadline: deadline_for(secs),
+        };
+        let dir = self.shared.work_dir()?;
+        let mut stash: Option<EngineError> = None;
+        let result = run_binary_pull(
+            self.shared.ffmpeg(),
+            &a,
+            dir,
+            &budget,
+            &|| mon.canceled(),
+            &mut |chunk: &[u8]| match on_bytes(chunk) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    stash = Some(e);
+                    Err(String::new())
+                }
+            },
+        );
+        match result {
+            Err(RunError::Stopped(Stopped::Consumer)) => Err(match stash {
+                Some(e) => e,
+                None => run_error(
+                    id,
+                    Stage::Decode,
+                    RunError::Stopped(Stopped::Consumer),
+                    &budget,
+                ),
+            }),
+            Err(e) => Err(run_error(id, Stage::Decode, e, &budget)),
+            Ok(outcome) => match failure(id, Stage::Decode, &outcome) {
+                Some(e) => Err(e),
+                None => Ok(()),
+            },
+        }
+    }
+
+    /// 読み取りのメタデータ（タグ・ループ点・元の形式。`decode_file` と流れが同じ式を通る）。
+    fn meta_of(&self, plan: &Plan, frames: u64, rate: u32, limits: &Limits) -> AudioMeta {
+        let mut meta = meta_from_tags(&plan.probe.tags, frames, self.kind.tags, limits);
+        let bits = match plan.probe.codec_name.as_str() {
+            "flac" | "alac" => plan
+                .probe
+                .bits_per_raw_sample
+                .filter(|b| (1..=32).contains(b))
+                .map_or(16, container_bits),
+            _ => 16,
+        };
+        meta.source = Some(AudioSource {
+            bits,
+            float: false,
+            rate,
+        });
+        meta
     }
 
     /// ffprobe で中身を確かめて、使うデコーダを決める。
@@ -494,25 +571,101 @@ impl Decoder for FfmpegAudioDecoder {
                 p.shrink_to_fit();
             }
         }
-        let mut meta = meta_from_tags(&plan.probe.tags, done.frames, self.kind.tags, limits);
-        let bits = match plan.probe.codec_name.as_str() {
-            "flac" | "alac" => plan
-                .probe
-                .bits_per_raw_sample
-                .filter(|b| (1..=32).contains(b))
-                .map_or(16, container_bits),
-            _ => 16,
-        };
-        meta.source = Some(AudioSource {
-            bits,
-            float: false,
-            rate,
-        });
+        let meta = self.meta_of(&plan, done.frames, rate, limits);
         Ok(Value::Audio(Arc::new(Audio::new(
             rate,
             planes.into_iter().map(Arc::new).collect(),
             meta,
         )?)))
+    }
+
+    fn streams(&self, _format: &str) -> bool {
+        true
+    }
+
+    /// 標準出力の区切り（パイプの塊）の写しと WAV の読みの作業列（8 MiB を見込む）。値は持たない。
+    fn stream_work_bytes(&self, _format: &str, _shape: &Shape, _len: u64) -> u64 {
+        8 << 20
+    }
+
+    /// 読み口は作業フォルダの一時ファイルに写してからパスの口で流す。
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let tmp = self.spool(src, limits, mon)?;
+        self.decode_stream_file(tmp.path(), format, opts, limits, shape, out, mon)
+    }
+
+    /// ffmpeg の標準出力を呼び手のスレッドで受け（`run_binary_pull`。流れの窓・解析をエンジンの一括のプールの中で回す）、
+    /// 区切りごとの標本を `out` に渡す。形は `CodecSet` がこのデコーダで数えた `Exact` なので、見込みは外れない。
+    fn decode_stream_file(
+        &self,
+        path: &Path,
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let Shape::Audio { frames, .. } = *shape else {
+            return Err(EngineError::Internal("音声の形ではありません".into()));
+        };
+        let d = self.shared.refresh()?;
+        let plan = self.plan(&d, path, limits, &|| mon.canceled())?;
+        let _permit = self.shared.acquire(mon)?;
+        let mut stream = WavStream::forward(limits.into());
+        let mut begun = false;
+        let begin = |out: &mut DecodeOut<'_>, f: super::wavpipe::WavFormat| {
+            out.begin(DecodeInfo {
+                rate: f.rate,
+                channels: usize::from(f.channels),
+                frames,
+                expect: frames.max(),
+            })
+        };
+        let mut failed: Option<EngineError> = None;
+        self.run_pull(&plan, path, limits, mon, &mut |chunk: &[u8]| {
+            let r = stream.push_forward(chunk, &mut |f, planes| {
+                let r = if begun {
+                    Ok(())
+                } else {
+                    begun = true;
+                    begin(out, f)
+                };
+                match r.and_then(|()| out.push_frames(planes)) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        let m = e.to_string();
+                        failed = Some(e);
+                        Err(m)
+                    }
+                }
+            });
+            match r {
+                Ok(()) => Ok(()),
+                Err(WavError::Sink(_)) => Err(failed.take().unwrap_or_else(|| {
+                    EngineError::Internal("流れの受け手が誤りを返しました".into())
+                })),
+                Err(e) => Err(self.wav_error(e)),
+            }
+        })?;
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
+        let done = stream.finish().map_err(|e| self.wav_error(e))?;
+        if !begun {
+            begin(out, done.format)?;
+        }
+        let meta = self.meta_of(&plan, done.frames, done.format.rate, limits);
+        out.end(meta)
     }
 }
 
@@ -588,6 +741,103 @@ mod tests {
             Value::Audio(a) => a,
             _ => panic!("音声ではありません"),
         }
+    }
+
+    /// M13 段 2：流して読む（`decode_stream_path`・読み口の `decode_stream`）と、記録・値・メタデータが `decode_path` と同じ。
+    /// 受け手は呼び手のスレッドで標本を受け、窓は揃って頭から順。ffmpeg の壊れた出力・中止は今と同じ誤り。
+    #[test]
+    fn streamed_ffmpeg_output_equals_the_value() {
+        use kura_engine::audio::stream::StreamEnd;
+        use kura_engine::codec::DecodeSink;
+        struct Collect {
+            planes: Vec<Vec<f32>>,
+            end: Option<StreamEnd>,
+            windows: usize,
+            here: bool,
+            caller: std::thread::ThreadId,
+        }
+        impl DecodeSink for Collect {
+            fn begin(&mut self, info: &DecodeInfo) -> Result<(), EngineError> {
+                self.planes = vec![Vec::new(); info.channels];
+                Ok(())
+            }
+            fn feed(
+                &mut self,
+                start: u64,
+                planes: &[&[f32]],
+                _mon: &dyn Monitor,
+            ) -> Result<(), EngineError> {
+                assert_eq!(start, self.planes[0].len() as u64);
+                self.here &= std::thread::current().id() == self.caller;
+                self.windows += 1;
+                for (o, p) in self.planes.iter_mut().zip(planes) {
+                    o.extend_from_slice(p);
+                }
+                Ok(())
+            }
+            fn end(&mut self, end: &StreamEnd) -> Result<(), EngineError> {
+                self.end = Some(end.clone());
+                Ok(())
+            }
+        }
+        let collect = || Collect {
+            planes: Vec::new(),
+            end: None,
+            windows: 0,
+            here: true,
+            caller: std::thread::current().id(),
+        };
+        let (t, _) = standard();
+        // 窓が 2 つになる長さ（17 チャンク ＋ 3 フレーム）の出力にする
+        let long = planes(2, 17 * 65_536 + 3);
+        std::fs::write(t.path("out.wav"), wav_bytes(48_000, &long, None)).unwrap();
+        std::fs::write(t.path("probe.json"), probe_json("opus", 48_000, 2, "")).unwrap();
+        let codecs = t.codecs();
+        let set = set_with(&codecs);
+        let (v, stamp) = read(&set, &t.path("in.opus"), "opus", &Limits::default()).unwrap();
+        let mut sink = collect();
+        let got = set
+            .decode_stream_path(
+                &t.path("in.opus"),
+                "opus",
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &mut sink,
+                &NoMonitor,
+            )
+            .unwrap();
+        assert_eq!(got, stamp);
+        let a = audio(&v);
+        assert_eq!(sink.planes, a.read_planes(0, a.frames()).unwrap());
+        assert_eq!(sink.end.as_ref().unwrap().meta, a.meta);
+        assert!(sink.here && sink.windows == 2, "{}", sink.windows);
+        // 読み口の口（一時ファイルに写して流す。一時ファイルは残さない）
+        let mut sink = collect();
+        let got = set
+            .decode_stream(
+                &mut Cursor::new(b"bytes".to_vec()),
+                "opus",
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &mut sink,
+                &NoMonitor,
+            )
+            .unwrap();
+        assert_eq!(got.value_digest, stamp.value_digest);
+        let left: Vec<_> = std::fs::read_dir(&t.work).unwrap().collect();
+        assert!(left.is_empty(), "{left:?}");
+        // 中止
+        let flag = CancelFlag::default();
+        flag.cancel();
+        let r = set.decode_stream_path(
+            &t.path("in.opus"),
+            "opus",
+            &DecodeOptions::default(),
+            &Limits::default(),
+            &mut collect(),
+            &flag,
+        );
+        assert!(matches!(r, Err(EngineError::Canceled)), "{r:?}");
     }
 
     /// 偽の ffmpeg の WAV がチャンネルに分かれて値になり、記録は External・再現なし・環境つき。引数は分離器・デコーダの
