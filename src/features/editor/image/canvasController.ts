@@ -17,7 +17,7 @@
  * - 描く関数・タイルを読む口・時計は差し込める（テスト）。閉じたら（`dispose`）絵をすべて close する。
  */
 
-import type { EditFrameDto, EditViewDto, EditViewportDto } from '../../../ipc/edit';
+import type { EditFrameDto, EditImageView, EditImageViewport } from '../../../ipc/edit';
 import { editTileUrl, type EditTileFormat } from '../../../ipc/media';
 import type { Point } from '../../../lib/paint';
 import {
@@ -163,7 +163,7 @@ export interface ControllerOptions {
   budget?: number;
   onInfo?: (info: ControllerInfo) => void;
   /** 止まってから 100ms：表示の範囲を頼み直す。 */
-  onIdle?: (viewport: EditViewportDto) => void;
+  onIdle?: (viewport: EditImageViewport) => void;
 }
 
 /** 画像の形。 */
@@ -174,7 +174,7 @@ export interface ImageModel {
 }
 
 /** 表示の結果のフレームの矩形。 */
-export function frameOf(view: EditViewDto, frame: number): EditFrameDto | null {
+export function frameOf(view: EditImageView, frame: number): EditFrameDto | null {
   return (
     view.frames.find((f) => f.index === frame) ??
     (view.frames.length === 1 ? (view.frames[0] ?? null) : null)
@@ -187,7 +187,7 @@ function sameTransform(a: Transform, b: Transform): boolean {
 }
 
 /** 同じ形か（画像の大きさとフレームの矩形）。 */
-function sameShape(a: EditViewDto, b: EditViewDto): boolean {
+function sameShape(a: EditImageView, b: EditImageView): boolean {
   return (
     a.fullWidth === b.fullWidth &&
     a.fullHeight === b.fullHeight &&
@@ -219,7 +219,7 @@ export class CanvasController {
   private insets: Insets = { top: 0, right: 0, bottom: 0, left: 0 };
   private image: ImageModel | null = null;
   private alpha = false;
-  private view: EditViewDto | null = null;
+  private view: EditImageView | null = null;
   private shown: { level: number; frame: number; range: TileRange | null } | null = null;
   /** 前の段のタイルで埋める段と、その段を表示していたときの中身の rev（rev が進んだら使わない）。 */
   private fallback: { level: number; rev: number } | null = null;
@@ -431,12 +431,13 @@ export class CanvasController {
   }
 
   /** Rust へ送る表示の要求（見えている範囲を少し広げたもの。画像全体が入るなら null）。 */
-  viewport(): EditViewportDto {
+  viewport(): EditImageViewport {
     const img = this.image;
     const rect = img ? visibleImageRect(this.t, this.stage, img, VIEW_MARGIN) : null;
     const whole =
       !img || !rect || (rect.x === 0 && rect.y === 0 && rect.w === img.w && rect.h === img.h);
     return {
+      type: 'image',
       frame: this.frame,
       rect: whole || !rect ? null : { x: rect.x, y: rect.y, w: rect.w, h: rect.h },
       scale: this.t.zoom * this.dpr,
@@ -451,7 +452,7 @@ export class CanvasController {
    * 表示の結果を受ける（`requested` はその要求のビューポート）。rev の表を進め、見えているタイルを取りに行き、
    * その要求までの仮の筆に、解き終えるのを待つタイルを渡す。
    */
-  applyView(view: EditViewDto, seq: number, requested: EditViewportDto): void {
+  applyView(view: EditImageView, seq: number, requested: EditImageViewport): void {
     if (this.disposed) return;
     const prev = this.view;
     const levelChanged = prev !== null && prev.level !== view.level;
@@ -705,7 +706,7 @@ export class CanvasController {
     return need;
   }
 
-  private startLoad(v: EditViewDto, fr: FrameRect, tx: number, ty: number, rev: number): void {
+  private startLoad(v: EditImageView, fr: FrameRect, tx: number, ty: number, rev: number): void {
     const session = this.session;
     if (!session) return;
     const level = v.level;
@@ -813,7 +814,7 @@ export class CanvasController {
     return scene;
   }
 
-  private buildTiles(scene: Scene, v: EditViewDto, img: ImageModel): void {
+  private buildTiles(scene: Scene, v: EditImageView, img: ImageModel): void {
     const t = this.t;
     const d = this.dpr;
     const fr = frameOf(v, this.frame);
@@ -852,7 +853,7 @@ export class CanvasController {
    */
   private fillFromFallback(
     scene: Scene,
-    v: EditViewDto,
+    v: EditImageView,
     tx: number,
     ty: number,
     fr: FrameRect,

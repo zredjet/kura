@@ -19,8 +19,8 @@ import { ja } from '../../../i18n/ja';
 import {
   type EditFrameDto,
   type EditStepDto,
-  type EditViewDto,
-  type EditViewportDto,
+  type EditImageView,
+  type EditImageViewport,
   sampleEdit,
 } from '../../../ipc/edit';
 import type { ItemSummaryDto } from '../../../ipc/items';
@@ -115,7 +115,7 @@ export function focusNode(doc: EditorDoc): number | null {
 }
 
 /** 表示の結果の要約。 */
-export function summarizeView(view: EditViewDto): EditorView {
+export function summarizeView(view: EditImageView): EditorView {
   return {
     rev: view.rev,
     level: view.level,
@@ -130,7 +130,7 @@ export function summarizeView(view: EditViewDto): EditorView {
 /** 開く前の見積もりの要求：窓の大きさから「全体を表示」の倍率を見積もる（段を Rust が決めるのに使う）。 */
 export function guessViewport(
   item: Pick<ItemSummaryDto, 'width' | 'height' | 'pixelArt'>,
-): EditViewportDto {
+): EditImageViewport {
   const dpr =
     typeof window !== 'undefined' && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
   const w = typeof window !== 'undefined' ? window.innerWidth : 1280;
@@ -139,7 +139,14 @@ export function guessViewport(
   const area = { w: Math.max(200, w - 340 - 80), h: Math.max(200, h - 180) };
   const zoom =
     item.width && item.height ? fitZoom(item.width, item.height, area, dpr, item.pixelArt) : 1;
-  return { frame: 0, rect: null, scale: zoom * dpr, interacting: false, focus: null };
+  return {
+    type: 'image',
+    frame: 0,
+    rect: null,
+    scale: zoom * dpr,
+    interacting: false,
+    focus: null,
+  };
 }
 
 // ===== React の外の持ち物 =====
@@ -254,7 +261,9 @@ function createImageAdapter(
       }
     },
     applyView(view, info) {
-      controller.applyView(view, info.seq, info.viewport);
+      if (view.type !== 'image') return;
+      const requested = info.viewport.type === 'image' ? info.viewport : controller.viewport();
+      controller.applyView(view, info.seq, requested);
       const s = useImageStore.getState();
       const summary = summarizeView(view);
       img.patch.view = summary;

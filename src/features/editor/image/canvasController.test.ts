@@ -1,14 +1,15 @@
 import { describe, expect, it, type Mock, vi } from 'vitest';
 
-import type { EditViewDto, EditViewportDto } from '../../../ipc/edit';
+import type { EditImageView, EditImageViewport } from '../../../ipc/edit';
 import { CanvasController, IDLE_MS, type Scene, type Scheduler } from './canvasController';
 import type { TileBitmap } from './tileTable';
 import { TileHttpError } from './tiles';
 
 const SESSION = 'abc123';
 
-function view(over: Partial<EditViewDto> = {}): EditViewDto {
+function view(over: Partial<EditImageView> = {}): EditImageView {
   return {
+    type: 'image',
     rev: 1,
     level: 0,
     fallback: null,
@@ -28,7 +29,14 @@ function view(over: Partial<EditViewDto> = {}): EditViewDto {
   };
 }
 
-const WHOLE: EditViewportDto = { frame: 0, rect: null, scale: 1, interacting: false, focus: null };
+const WHOLE: EditImageViewport = {
+  type: 'image',
+  frame: 0,
+  rect: null,
+  scale: 1,
+  interacting: false,
+  focus: null,
+};
 
 /** 手で進める時計。 */
 function fakeScheduler() {
@@ -235,7 +243,7 @@ describe('表示の結果とタイル', () => {
 
   it('段が替わった直後は、前の段のタイルで足りない所を埋める（その段の古い絵は出さない）', async () => {
     const { c, loader } = setup({ w: 4000, h: 2000 });
-    const big = (over: Partial<EditViewDto>) =>
+    const big = (over: Partial<EditImageView>) =>
       view({
         fullWidth: 4000,
         fullHeight: 2000,
@@ -265,7 +273,7 @@ describe('表示の結果とタイル', () => {
 
   it('段を替えたあとに rev が進んだら（中身が変わったら）、前の段のタイルで埋めない', async () => {
     const { c, loader } = setup({ w: 4000, h: 2000 });
-    const big = (over: Partial<EditViewDto>) =>
+    const big = (over: Partial<EditImageView>) =>
       view({
         fullWidth: 4000,
         fullHeight: 2000,
@@ -344,7 +352,7 @@ describe('ズーム・パンと頼み直し', () => {
     expect([...clock.timers.values()].map((t) => t.ms)).toEqual([IDLE_MS]);
     clock.runTimers();
     expect(onIdle).toHaveBeenCalledOnce();
-    const vp = onIdle.mock.calls[0]?.[0] as EditViewportDto;
+    const vp = onIdle.mock.calls[0]?.[0] as EditImageViewport;
     expect(vp.scale).toBe(2);
     expect(vp.rect).not.toBeNull();
     expect(vp.interacting).toBe(false);
@@ -370,7 +378,7 @@ describe('ズーム・パンと頼み直し', () => {
 
   it('表示の結果で画像が小さくなったら（切り抜いた）、収め直した倍率で止まってから頼み直す', () => {
     const { c, clock, onIdle } = setup({ dpr: 2, w: 4000, h: 3000 });
-    const sized = (w: number, h: number, over: Partial<EditViewDto> = {}) =>
+    const sized = (w: number, h: number, over: Partial<EditImageView> = {}) =>
       view({
         fullWidth: w,
         fullHeight: h,
@@ -388,13 +396,13 @@ describe('ズーム・パンと頼み直し', () => {
     expect(onIdle).not.toHaveBeenCalled();
     clock.runTimers();
     expect(onIdle).toHaveBeenCalledOnce();
-    const vp = onIdle.mock.calls[0]?.[0] as EditViewportDto;
+    const vp = onIdle.mock.calls[0]?.[0] as EditImageViewport;
     expect(vp.scale).toBe(c.zoom * 2);
   });
 
   it('収めていない表示で見ていた範囲が新しい画像の外になったら、新しい画像の中を頼み直す', () => {
     const { c, clock, onIdle } = setup({ w: 4000, h: 3000 });
-    const sized = (w: number, h: number, over: Partial<EditViewDto> = {}) =>
+    const sized = (w: number, h: number, over: Partial<EditImageView> = {}) =>
       view({
         fullWidth: w,
         fullHeight: h,
@@ -413,7 +421,7 @@ describe('ズーム・パンと頼み直し', () => {
     c.applyView(sized(1000, 750, { rev: 2 }), 1, right);
     clock.runTimers();
     expect(onIdle).toHaveBeenCalledOnce();
-    const vp = onIdle.mock.calls[0]?.[0] as EditViewportDto;
+    const vp = onIdle.mock.calls[0]?.[0] as EditImageViewport;
     const rect = vp.rect ?? { x: 0, y: 0, w: 1000, h: 750 };
     expect(rect.x + rect.w).toBeLessThanOrEqual(1000);
     expect(rect.y + rect.h).toBeLessThanOrEqual(750);

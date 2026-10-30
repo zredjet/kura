@@ -56,7 +56,7 @@ const AUDIO = {
 } as unknown as ItemSummaryDto;
 
 function viewport(scale: number): EditViewportDto {
-  return { frame: 0, rect: null, scale, interacting: false, focus: null };
+  return { type: 'image', frame: 0, rect: null, scale, interacting: false, focus: null };
 }
 
 function status(over: Partial<EditStatusDto> = {}): EditStatusDto {
@@ -75,6 +75,7 @@ function status(over: Partial<EditStatusDto> = {}): EditStatusDto {
 
 function viewDto(rev = 1): EditViewDto {
   return {
+    type: 'image',
     rev,
     level: 0,
     fallback: null,

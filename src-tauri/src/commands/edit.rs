@@ -14,9 +14,10 @@
 //! DTO はほかの班の dto.rs の変更とぶつからないよう、このファイルに置く（名前は `Edit` で始める）。
 
 use kura_core::edit::editor::{
-    self, ChangedTiles, DocDelta, DraftInfo, EditorEnv, EditorError, FrameInfo, NodeSummary,
-    OpenRequest, Opened, Problem, ProblemCode, Rejected, Sampled, SaveMode, SaveStarted,
-    SourceInfo, Status, Step, StepOutcome, VersionSummary, ViewInfo, ViewOutcome, Viewport,
+    self, AudioViewport, ChangedTiles, DocDelta, DraftInfo, EditorEnv, EditorError, FrameInfo,
+    ImageViewInfo, ImageViewport, NodeSummary, OpenRequest, Opened, Problem, ProblemCode, Rejected,
+    Sampled, SaveMode, SaveStarted, SourceInfo, Status, Step, StepOutcome, VersionSummary,
+    ViewInfo, ViewOutcome, Viewport,
 };
 use kura_engine::Issue;
 use kura_engine::doc::{FormatChoice, NodeId, OutputSpec};
@@ -43,10 +44,42 @@ pub struct EditRectDto {
     pub h: u32,
 }
 
-/// 表示の要求（ビューポート）。
+/// 区間（フレームの半開区間 [start, end)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(deny_unknown_fields)]
+pub struct EditSpanDto {
+    pub start: u64,
+    pub end: u64,
+}
+
+/// 表示の要求（ビューポート）：種類ごとの和（`type` で分ける）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct EditViewportDto {
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum EditViewportDto {
+    Image(EditImageViewportDto),
+    Audio(EditAudioViewportDto),
+}
+
+/// 音声の表示の要求。区間はどれも出力のフレーム。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditAudioViewportDto {
+    /// 見えている区間（波形の段の作り直しを見えている所から進める。描く範囲には入れない）。
+    pub visible: Option<EditSpanDto>,
+    /// 描いて配ってほしい区間（4 つまで。先のものほど優先。`/edit/{session}/{rev}/pcm/…` で取る区間）。
+    pub spans: Vec<EditSpanDto>,
+    /// 操作中（ドラッグの途中）：波形の段を直さない・裏の仕事をしない。
+    pub interacting: bool,
+    /// 編集中のノード（キャッシュに固定する）。
+    pub focus: Option<u32>,
+    /// 裏の仕事（波形の段の作り直し・ラウドネスの計り）を少し進める。
+    pub work: bool,
+}
+
+/// 画像の表示の要求。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditImageViewportDto {
     /// 表示するフレーム（1 枚の画像は 0）。
     pub frame: u32,
     /// 表示する範囲（等倍のキャンバスの座標）。null は全体。
@@ -61,12 +94,21 @@ pub struct EditViewportDto {
 
 impl From<EditViewportDto> for Viewport {
     fn from(v: EditViewportDto) -> Self {
-        Self {
-            frame: v.frame,
-            rect: v.rect.map(|r| IRect::new(r.x, r.y, r.w, r.h)),
-            scale: v.scale,
-            interacting: v.interacting,
-            focus: v.focus.map(NodeId),
+        match v {
+            EditViewportDto::Image(v) => Self::Image(ImageViewport {
+                frame: v.frame,
+                rect: v.rect.map(|r| IRect::new(r.x, r.y, r.w, r.h)),
+                scale: v.scale,
+                interacting: v.interacting,
+                focus: v.focus.map(NodeId),
+            }),
+            EditViewportDto::Audio(v) => Self::Audio(AudioViewport {
+                visible: v.visible.map(|s| (s.start, s.end)),
+                spans: v.spans.into_iter().map(|s| (s.start, s.end)).collect(),
+                interacting: v.interacting,
+                focus: v.focus.map(NodeId),
+                work: v.work,
+            }),
         }
     }
 }
@@ -290,10 +332,25 @@ impl From<ChangedTiles> for EditChangedDto {
     }
 }
 
-/// 表示した結果。
+/// 表示した結果：種類ごとの和（`type` で分ける）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum EditViewDto {
+    Image(EditImageViewDto),
+}
+
+impl From<ViewInfo> for EditViewDto {
+    fn from(v: ViewInfo) -> Self {
+        match v {
+            ViewInfo::Image(v) => Self::Image(v.into()),
+        }
+    }
+}
+
+/// 画像の表示した結果。
 #[derive(Debug, Clone, PartialEq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
-pub struct EditViewDto {
+pub struct EditImageViewDto {
     pub rev: u64,
     /// 描いた段（0 は等倍。段 k は各軸 ⌈n/2^k⌉）。タイルの URL の `{level}`。
     pub level: u8,
@@ -318,8 +375,8 @@ pub struct EditViewDto {
     pub ms: f64,
 }
 
-impl From<ViewInfo> for EditViewDto {
-    fn from(v: ViewInfo) -> Self {
+impl From<ImageViewInfo> for EditImageViewDto {
+    fn from(v: ImageViewInfo) -> Self {
         Self {
             rev: v.rev,
             level: v.level,
@@ -817,13 +874,43 @@ mod tests {
             );
         }
         let vp: EditViewportDto = serde_json::from_value(json!({
-            "frame": 0, "rect": { "x": -4, "y": 8, "w": 100, "h": 50 }, "scale": 0.5,
+            "type": "image", "frame": 0, "rect": { "x": -4, "y": 8, "w": 100, "h": 50 }, "scale": 0.5,
             "interacting": true, "focus": 3
         }))
         .unwrap();
-        let vp = Viewport::from(vp);
+        let Viewport::Image(vp) = Viewport::from(vp) else {
+            panic!("画像のビューポートのはず");
+        };
         assert_eq!(vp.rect, Some(IRect::new(-4, 8, 100, 50)));
         assert_eq!(vp.focus, Some(NodeId(3)));
+        let vp: EditViewportDto = serde_json::from_value(json!({
+            "type": "audio", "visible": { "start": 0, "end": 480000 },
+            "spans": [{ "start": 65536, "end": 131072 }], "interacting": false, "focus": null, "work": true
+        }))
+        .unwrap();
+        assert_eq!(
+            Viewport::from(vp),
+            Viewport::Audio(AudioViewport {
+                visible: Some((0, 480_000)),
+                spans: vec![(65_536, 131_072)],
+                interacting: false,
+                focus: None,
+                work: true,
+            })
+        );
+        for bad in [
+            json!({ "frame": 0, "rect": null, "scale": 1.0, "interacting": false, "focus": null }),
+            json!({ "type": "image", "frame": 0, "rect": null, "scale": 1.0, "interacting": false,
+                    "focus": null, "extra": 1 }),
+            json!({ "type": "audio", "visible": null, "spans": [{ "start": 0, "end": 1, "x": 0 }],
+                    "interacting": false, "focus": null, "work": false }),
+            json!({ "type": "video" }),
+        ] {
+            assert!(
+                serde_json::from_value::<EditViewportDto>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
         let mode: EditSaveModeDto =
             serde_json::from_value(json!({ "type": "saveAs", "title": "写し", "stem": "copy" }))
                 .unwrap();
@@ -867,7 +954,7 @@ mod tests {
                 nodes: Vec::new(),
                 outputs: None,
             },
-            view: ViewOutcome::Shown(ViewInfo {
+            view: ViewOutcome::Shown(ViewInfo::Image(ImageViewInfo {
                 rev: 3,
                 level: 1,
                 fallback: None,
@@ -885,7 +972,7 @@ mod tests {
                 warnings: Vec::new(),
                 drawn_nodes: 2,
                 ms: 1.5,
-            }),
+            })),
             notices: Vec::new(),
         };
         let json = serde_json::to_value(EditStepResultDto::from(out)).unwrap();
@@ -898,6 +985,7 @@ mod tests {
             json!("axis")
         );
         assert_eq!(json["view"]["type"], json!("shown"));
+        assert_eq!(json["view"]["view"]["type"], json!("image"));
         assert_eq!(json["view"]["view"]["fullWidth"], json!(600));
         assert_eq!(
             json["view"]["view"]["changed"],

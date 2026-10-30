@@ -190,9 +190,9 @@ fn flip(axis: &str) -> Step {
     }
 }
 
-fn shown(v: &ViewOutcome) -> &ViewInfo {
+fn shown(v: &ViewOutcome) -> &ImageViewInfo {
     match v {
-        ViewOutcome::Shown(info) => info,
+        ViewOutcome::Shown(ViewInfo::Image(info)) => info,
         other => panic!("表示できませんでした: {other:?}"),
     }
 }
@@ -703,10 +703,10 @@ fn zoomed_out_views_use_coarser_levels() {
     let env = Env::new();
     let png = noise_png(1024, 768, 7);
     let id = add_item(&env.lib, &png, 1024, 768);
-    let vp = Viewport {
+    let vp = Viewport::from(ImageViewport {
         scale: 0.25,
-        ..Viewport::whole()
-    };
+        ..ImageViewport::whole()
+    });
     let opened = env.open_with(id, vp.clone(), false);
     let info = shown(&opened.outcome.view);
     assert_eq!(
@@ -714,10 +714,10 @@ fn zoomed_out_views_use_coarser_levels() {
         (2, (256, 192), (1024, 768))
     );
     let s = &opened.session;
-    let moving = Viewport {
+    let moving = Viewport::from(ImageViewport {
         interacting: true,
-        ..vp.clone()
-    };
+        ..vp.image()
+    });
     let out = step(&env.env(), s, Vec::new(), &moving).unwrap();
     assert_eq!(shown(&out.view).level, 3);
     assert_eq!(
@@ -726,10 +726,10 @@ fn zoomed_out_views_use_coarser_levels() {
         "段を替えると全体"
     );
     // 等倍で一部だけを見る
-    let part = Viewport {
+    let part = Viewport::from(ImageViewport {
         rect: Some(kura_engine::geom::IRect::new(300, 300, 100, 100)),
-        ..Viewport::whole()
-    };
+        ..ImageViewport::whole()
+    });
     let out = step(&env.env(), s, vec![flip("horizontal")], &part).unwrap();
     let info = shown(&out.view);
     assert_eq!(info.level, 0);
@@ -1066,10 +1066,10 @@ fn a_parked_save_empties_the_editor_cache() {
     let id = add_item(&env.lib, &noise_png(w, h, 16), i64::from(w), i64::from(h));
     let opened = env.open(id);
     let s = opened.session.clone();
-    let focused = Viewport {
+    let focused = Viewport::from(ImageViewport {
         focus: Some(NodeId(1)),
-        ..Viewport::whole()
-    };
+        ..ImageViewport::whole()
+    });
     let out = step(&env.env(), &s, vec![flip("horizontal")], &focused).unwrap();
     shown(&out.view);
     let editor = env.engine.editor_for(&s).unwrap();
@@ -1204,9 +1204,11 @@ fn tiles_follow_the_viewed_frame() {
     let id = add_item_as(&env.lib, &gif, "gif", i64::from(w), i64::from(h));
     let expected = rendered_as(&gif, "gif", &Graph::new_single());
     assert_eq!(PartialValue::full(expected.clone()).frame_count(), 3);
-    let at = |frame: u32| Viewport {
-        frame,
-        ..Viewport::whole()
+    let at = |frame: u32| {
+        Viewport::from(ImageViewport {
+            frame,
+            ..ImageViewport::whole()
+        })
     };
     let opened = env.open_with(id, at(1), false);
     assert_eq!(opened.source.frames, Some(3));
@@ -1509,10 +1511,10 @@ fn editor_step_latency() {
         ("等倍の全体", Viewport::whole()),
         (
             "縮小（段 2）",
-            Viewport {
+            Viewport::from(ImageViewport {
                 scale: 0.25,
-                ..Viewport::whole()
-            },
+                ..ImageViewport::whole()
+            }),
         ),
     ] {
         let opened = env.open_with(id, vp.clone(), false);

@@ -35,9 +35,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use kura_core::edit::EngineServices;
+// このベンチは画像だけ（音声のエディタは段 4 の `bench edit --audio-minutes`）
 use kura_core::edit::editor::{
-    self, ChangedTiles, EditorEnv, OpenRequest, Step, TileFormat, TileRequest, ViewInfo,
-    ViewOutcome, Viewport, tile,
+    self, ChangedTiles, EditorEnv, ImageViewInfo as ViewInfo, ImageViewport as Viewport,
+    OpenRequest, Step, TileFormat, TileRequest, ViewOutcome, tile,
 };
 use kura_core::library::LibrarySession;
 use kura_engine::budget::{Usage, default_reserved};
@@ -282,7 +283,7 @@ fn quiet() -> kura_core::jobs::EventSink {
 /// 表示した結果（表示できなければエラー）。
 fn shown(view: ViewOutcome) -> Result<ViewInfo, String> {
     match view {
-        ViewOutcome::Shown(info) => Ok(info),
+        ViewOutcome::Shown(editor::ViewInfo::Image(info)) => Ok(info),
         other => Err(format!("表示できませんでした: {other:?}")),
     }
 }
@@ -438,7 +439,7 @@ impl<'s> Open<'s> {
             &env,
             &OpenRequest {
                 item_id: item,
-                viewport: vp.clone(),
+                viewport: vp.clone().into(),
                 from_draft: false,
             },
         )
@@ -455,7 +456,7 @@ impl<'s> Open<'s> {
                 },
                 mode: CommitMode::Step,
             }],
-            &vp,
+            &vp.clone().into(),
         )
         .map_err(|e| format!("文書を入れられません: {e}"))?;
         if let Some(r) = out.rejected {
@@ -485,7 +486,7 @@ impl<'s> Open<'s> {
     /// 手を 1 つ当てて表示する（時間と表示）。
     fn step(&mut self, step: Step) -> Result<(u64, ViewInfo), String> {
         let t0 = Instant::now();
-        let out = editor::step(&self.env, &self.sid, vec![step], &self.vp)
+        let out = editor::step(&self.env, &self.sid, vec![step], &self.vp.clone().into())
             .map_err(|e| format!("手を当てられません: {e}"))?;
         let ns = nanos(t0);
         if let Some(r) = out.rejected {

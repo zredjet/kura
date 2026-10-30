@@ -18,9 +18,96 @@ use kura_engine::session::{NodeChange, ParamsView, Snapshot};
 use kura_engine::{Dim, Issue, Shape};
 use serde_json::Value as Json;
 
-/// 表示の要求（ビューポート）。座標はいつも等倍のキャンバスの座標。
+/// 表示の要求（ビューポート）：種類ごとの和（M13 段 4）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct Viewport {
+pub enum Viewport {
+    Image(ImageViewport),
+    Audio(AudioViewport),
+}
+
+impl Viewport {
+    /// 画像の全体を等倍で表示する要求（テスト・最初の表示）。
+    pub fn whole() -> Self {
+        Self::Image(ImageViewport::whole())
+    }
+
+    /// 音声の既定の要求（区間なし・裏の仕事を進める）。
+    pub fn audio_idle() -> Self {
+        Self::Audio(AudioViewport::idle())
+    }
+
+    /// 操作中か。
+    pub fn interacting(&self) -> bool {
+        match self {
+            Self::Image(v) => v.interacting,
+            Self::Audio(v) => v.interacting,
+        }
+    }
+
+    /// 編集中のノード。
+    pub fn focus(&self) -> Option<NodeId> {
+        match self {
+            Self::Image(v) => v.focus,
+            Self::Audio(v) => v.focus,
+        }
+    }
+
+    /// 画像の要求（音声の要求なら、同じ操作中・編集中のノードで全体を等倍に）。
+    pub fn image(&self) -> ImageViewport {
+        match self {
+            Self::Image(v) => v.clone(),
+            Self::Audio(v) => ImageViewport {
+                interacting: v.interacting,
+                focus: v.focus,
+                ..ImageViewport::whole()
+            },
+        }
+    }
+}
+
+impl From<ImageViewport> for Viewport {
+    fn from(v: ImageViewport) -> Self {
+        Self::Image(v)
+    }
+}
+
+impl From<AudioViewport> for Viewport {
+    fn from(v: AudioViewport) -> Self {
+        Self::Audio(v)
+    }
+}
+
+/// 音声の表示の要求。区間はどれも出力のフレームの半開区間。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioViewport {
+    /// 見えている区間（波形の段の作り直しを見えている所から進める順に使う。描く範囲には入れない）。
+    pub visible: Option<(u64, u64)>,
+    /// 描いて配ってほしい区間（4 つまで。先のものほど優先）。
+    pub spans: Vec<(u64, u64)>,
+    /// 操作中：手の中で波形の段を直さない・裏の仕事をしない。
+    pub interacting: bool,
+    /// 編集中のノード（キャッシュに固定する）。
+    pub focus: Option<NodeId>,
+    /// 裏の仕事（波形の段の作り直し・計り）を少し進める。
+    pub work: bool,
+}
+
+impl AudioViewport {
+    /// 区間なし・裏の仕事を進める要求（最初の表示）。
+    pub fn idle() -> Self {
+        Self {
+            visible: None,
+            spans: Vec::new(),
+            interacting: false,
+            focus: None,
+            work: true,
+        }
+    }
+}
+
+/// 画像の表示の要求。座標はいつも等倍のキャンバスの座標。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageViewport {
     /// 表示するフレーム（1 枚の画像は 0）。
     pub frame: u32,
     /// 表示する範囲（等倍のキャンバスの座標）。None は全体。
@@ -33,7 +120,7 @@ pub struct Viewport {
     pub focus: Option<NodeId>,
 }
 
-impl Viewport {
+impl ImageViewport {
     /// 全体を等倍で表示する要求（テスト・最初の表示）。
     pub fn whole() -> Self {
         Self {
@@ -111,7 +198,7 @@ fn ceil_shift(v: i64, level: u8) -> i64 {
 
 /// 表示する範囲（段 `level` のキャンバスの座標）：ビューポートの矩形を段に直す（始まりは床・終わりは天井）。矩形が
 /// なければ全体（フレームの列は見ているフレームの全体）。
-pub fn view_area(full: &Shape, vp: &Viewport, level: u8) -> Area {
+pub fn view_area(full: &Shape, vp: &ImageViewport, level: u8) -> Area {
     let Some(r) = vp.rect else {
         return match full {
             Shape::Frames { .. } => Area::whole_frame(vp.frame),
@@ -238,9 +325,38 @@ pub enum ChangedTiles {
     Tiles(Vec<(u32, Vec<[u32; 2]>)>),
 }
 
-/// 表示した結果（kura:// の `/edit/{session}/{rev}/{level}/{frame}/{tx}/{ty}` で、この rev・段のタイルを取る）。
+/// 表示した結果：種類ごとの和（M13 段 4）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct ViewInfo {
+pub enum ViewInfo {
+    Image(ImageViewInfo),
+}
+
+impl ViewInfo {
+    /// 表示した rev。
+    pub fn rev(&self) -> u64 {
+        match self {
+            Self::Image(v) => v.rev,
+        }
+    }
+
+    /// 描いたノード・当たったノードの警告。
+    pub fn warnings(&self) -> &[Issue] {
+        match self {
+            Self::Image(v) => &v.warnings,
+        }
+    }
+
+    /// 画像の表示（音声なら None）。
+    pub fn image(&self) -> Option<&ImageViewInfo> {
+        match self {
+            Self::Image(v) => Some(v),
+        }
+    }
+}
+
+/// 画像の表示した結果（kura:// の `/edit/{session}/{rev}/{level}/{frame}/{tx}/{ty}` で、この rev・段のタイルを取る）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageViewInfo {
     pub rev: u64,
     /// 描いた段（0 は等倍）。
     pub level: u8,
@@ -377,11 +493,11 @@ mod tests {
     #[test]
     fn area_scales_the_rect_to_the_level() {
         let photo = image(6000, 4000, PixelFormat::Rgba8);
-        let vp = |x: i64, y: i64, w: u32, h: u32| Viewport {
+        let vp = |x: i64, y: i64, w: u32, h: u32| ImageViewport {
             rect: Some(IRect::new(x, y, w, h)),
-            ..Viewport::whole()
+            ..ImageViewport::whole()
         };
-        assert_eq!(view_area(&photo, &Viewport::whole(), 2), Area::All);
+        assert_eq!(view_area(&photo, &ImageViewport::whole(), 2), Area::All);
         assert_eq!(
             view_area(&photo, &vp(100, 50, 300, 200), 0),
             Area::rect(0, IRect::new(100, 50, 300, 200))
@@ -401,9 +517,9 @@ mod tests {
             fmt: PixelFormat::Rgba8,
             full: kura_engine::shape::Fullness::Full,
         };
-        let whole = Viewport {
+        let whole = ImageViewport {
             frame: 2,
-            ..Viewport::whole()
+            ..ImageViewport::whole()
         };
         assert_eq!(view_area(&frames, &whole, 0), Area::whole_frame(2));
     }

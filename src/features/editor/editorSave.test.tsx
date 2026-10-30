@@ -11,7 +11,7 @@ import {
   type EditStatusDto,
   type EditStepResultDto,
   type EditVersionDto,
-  type EditViewDto,
+  type EditImageView,
   listEditVersions,
   openEdit,
   saveEdit,
@@ -116,8 +116,9 @@ function status(over: Partial<EditStatusDto> = {}): EditStatusDto {
   };
 }
 
-function viewDto(over: Partial<EditViewDto> = {}): EditViewDto {
+function viewDto(over: Partial<EditImageView> = {}): EditImageView {
   return {
+    type: 'image',
     rev: 2,
     level: 0,
     fallback: null,

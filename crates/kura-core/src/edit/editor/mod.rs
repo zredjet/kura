@@ -52,7 +52,8 @@ use serde_json::Value as Json;
 
 pub use tile::{TileError, TileFormat, TileRequest};
 pub use view::{
-    ChangedTiles, DocDelta, FrameInfo, LogSummary, NodeSummary, TILE, ViewInfo, Viewport,
+    AudioViewport, ChangedTiles, DocDelta, FrameInfo, ImageViewInfo, ImageViewport, LogSummary,
+    NodeSummary, TILE, ViewInfo, Viewport,
 };
 
 use self::autosave::{Autosave, DraftJob};
@@ -795,13 +796,14 @@ impl Editor {
                 issues: Vec::new(),
             }));
         };
-        let want = view_level(&full, vp.scale, vp.interacting, st.pixel_art);
+        let ivp = vp.image();
+        let want = view_level(&full, ivp.scale, ivp.interacting, st.pixel_art);
         let lp = match self.runtime.preview(|e| e.plan_level(&st.plan, want)) {
             Ok(lp) => lp,
             Err(e) => return failed(EditorError::from_engine("段の計画を作れません", e)),
         };
         let level = lp.plan.level();
-        let area = view_area(&full, vp, level);
+        let area = view_area(&full, &ivp, level);
         let spec = EstimateSpec::new(0).all_inputs(&lp.plan, Source::Held);
         if let Err(e) = self.runtime.admit_preview(
             &lp.plan,
@@ -817,7 +819,7 @@ impl Editor {
         let req = ViewRequest {
             output: st.output,
             area,
-            focus: vp.focus,
+            focus: ivp.focus,
         };
         let (inputs, cache, prev) = (&st.inputs, &mut st.cache, st.view.as_ref());
         let r = self
@@ -828,7 +830,7 @@ impl Editor {
             Ok(vr) => {
                 let rev = st.session.rev().0;
                 let value = vr.view.value();
-                let info = ViewInfo {
+                let info = ImageViewInfo {
                     rev,
                     level: vr.level(),
                     fallback: lp.fallback.as_ref().map(view::fallback_name),
@@ -845,7 +847,7 @@ impl Editor {
                 };
                 self.publish(rev, info.level, vr.view.clone());
                 st.view = Some(vr.view);
-                Ok(ViewOutcome::Shown(info))
+                Ok(ViewOutcome::Shown(ViewInfo::Image(info)))
             }
             Err(e) if matches!(e.root(), EngineError::Canceled) => {
                 if self.cancel.canceled() {

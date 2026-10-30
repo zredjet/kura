@@ -11,10 +11,13 @@ import {
   commands,
   EDIT_OPS,
   type CommitMode,
+  type EditAudioViewportDto,
   type EditChangedDto,
   type EditDocDeltaDto_Serialize,
   type EditDraftDto,
   type EditFrameDto,
+  type EditImageViewDto,
+  type EditImageViewportDto,
   type EditNodeDto,
   type EditOpenedDto_Serialize,
   type EditProblemDto,
@@ -23,6 +26,7 @@ import {
   type EditSaveModeDto,
   type EditSaveStartedDto_Serialize,
   type EditSourceDto,
+  type EditSpanDto,
   type EditStatusDto,
   type EditStepDto_Deserialize,
   type EditStepResultDto_Serialize,
@@ -54,15 +58,19 @@ export const EDIT_CATALOG: readonly OpDescriptor[] = EDIT_OPS as unknown as read
 
 export type {
   CommitMode,
+  EditAudioViewportDto,
   EditChangedDto,
   EditDraftDto,
   EditFrameDto,
+  EditImageViewDto,
+  EditImageViewportDto,
   EditNodeDto,
   EditProblemDto,
   EditRectDto,
   EditSampleDto,
   EditSaveModeDto,
   EditSourceDto,
+  EditSpanDto,
   EditStatusDto,
   EditVersionDto,
   EditViewDto,
@@ -78,6 +86,13 @@ export type {
   Unit,
   ValueKind,
 };
+
+/** 画像の表示の要求（`type: 'image'`）。 */
+export type EditImageViewport = Extract<EditViewportDto, { type: 'image' }>;
+/** 音声の表示の要求（`type: 'audio'`）。 */
+export type EditAudioViewport = Extract<EditViewportDto, { type: 'audio' }>;
+/** 画像の表示した結果（`type: 'image'`）。 */
+export type EditImageView = Extract<EditViewDto, { type: 'image' }>;
 
 /** 文書の出力（Rust が返す形）。 */
 export type OutputSpec = OutputSpec_Serialize;
@@ -97,7 +112,7 @@ export type EditStepDto = EditStepDto_Deserialize;
 /** 出力の形式の指定（保存）。 */
 export type EditFormatChoice = Parameters<typeof commands.editSave>[2];
 
-/** エディタを開く（前のエディタは閉じる）。`fromDraft` が真で下書きがあれば下書きの文書で開く。画像だけ。 */
+/** エディタを開く（前のエディタは閉じる）。`fromDraft` が真で下書きがあれば下書きの文書で開く。 */
 export function openEdit(
   itemId: number,
   viewport: EditViewportDto,

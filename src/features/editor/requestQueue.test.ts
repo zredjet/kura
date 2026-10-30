@@ -4,7 +4,14 @@ import type { EditStepDto, EditStepResultDto, EditViewportDto } from '../../ipc/
 import { RequestQueue, type SentRequest } from './requestQueue';
 
 function vp(x: number): EditViewportDto {
-  return { frame: 0, rect: { x, y: 0, w: 10, h: 10 }, scale: 1, interacting: false, focus: null };
+  return {
+    type: 'image',
+    frame: 0,
+    rect: { x, y: 0, w: 10, h: 10 },
+    scale: 1,
+    interacting: false,
+    focus: null,
+  };
 }
 
 const RESULT = { status: { rev: 1 } } as unknown as EditStepResultDto;

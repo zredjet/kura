@@ -788,6 +788,20 @@ export type DuplicatePolicyDto = "addMemberships" | "ignore";
  */
 export type Edit = Edit_Serialize | Edit_Deserialize;
 
+/**  音声の表示の要求。区間はどれも出力のフレーム。 */
+export type EditAudioViewportDto = {
+	/**  見えている区間（波形の段の作り直しを見えている所から進める。描く範囲には入れない）。 */
+	visible: EditSpanDto | null,
+	/**  描いて配ってほしい区間（4 つまで。先のものほど優先。`/edit/{session}/{rev}/pcm/…` で取る区間）。 */
+	spans: EditSpanDto[],
+	/**  操作中（ドラッグの途中）：波形の段を直さない・裏の仕事をしない。 */
+	interacting: boolean,
+	/**  編集中のノード（キャッシュに固定する）。 */
+	focus: number | null,
+	/**  裏の仕事（波形の段の作り直し・ラウドネスの計り）を少し進める。 */
+	work: boolean,
+};
+
 /**  変わったタイル。 */
 export type EditChangedDto = 
 /**  すべて取り直す（最初の表示・段や形が変わった）。 */
@@ -846,6 +860,46 @@ export type EditFrameDto = {
 export type EditFrameTilesDto = {
 	frame: number,
 	tiles: ([number, number])[],
+};
+
+/**  画像の表示した結果。 */
+export type EditImageViewDto = {
+	rev: number,
+	/**  描いた段（0 は等倍。段 k は各軸 ⌈n/2^k⌉）。タイルの URL の `{level}`。 */
+	level: number,
+	/**  求めた段から段 0 に落ちた理由。 */
+	fallback: string | null,
+	/**  等倍の出力の大きさ。 */
+	fullWidth: number,
+	fullHeight: number,
+	/**  段のキャンバスの大きさ。 */
+	width: number,
+	height: number,
+	frames: EditFrameDto[],
+	/**  画素の形式（`rgba8` など）。タイルは形式によらず RGBA8。 */
+	format: string | null,
+	/**  タイルの 1 辺（256）。 */
+	tile: number,
+	changed: EditChangedDto,
+	metaChanged: boolean,
+	warnings: Issue[],
+	drawnNodes: number,
+	/**  描くのにかかった時間（ミリ秒）。 */
+	ms: number | null,
+};
+
+/**  画像の表示の要求。 */
+export type EditImageViewportDto = {
+	/**  表示するフレーム（1 枚の画像は 0）。 */
+	frame: number,
+	/**  表示する範囲（等倍のキャンバスの座標）。null は全体。 */
+	rect: EditRectDto | null,
+	/**  等倍の 1 画素あたりの装置の画素（拡大率 × devicePixelRatio）。段は Rust が決める。 */
+	scale: number | null,
+	/**  操作中（ドラッグ・ズームの途中）なら 1 段粗く描く。 */
+	interacting: boolean,
+	/**  編集中のノード（キャッシュに固定する）。 */
+	focus: number | null,
 };
 
 /**  追記だけの配列の引数の数。 */
@@ -966,6 +1020,12 @@ export type EditSourceDto = {
 	format: string | null,
 };
 
+/**  区間（フレームの半開区間 [start, end)）。 */
+export type EditSpanDto = {
+	start: number,
+	end: number,
+};
+
 /**  エディタの状態。 */
 export type EditStatusDto = {
 	/**  今の文書の番号（仮の値があればその番号）。タイルはこの番号で取る。 */
@@ -1060,31 +1120,10 @@ export type EditVersionDto = {
 	createdAt: number,
 };
 
-/**  表示した結果。 */
+/**  表示した結果：種類ごとの和（`type` で分ける）。 */
 export type EditViewDto = {
-	rev: number,
-	/**  描いた段（0 は等倍。段 k は各軸 ⌈n/2^k⌉）。タイルの URL の `{level}`。 */
-	level: number,
-	/**  求めた段から段 0 に落ちた理由。 */
-	fallback: string | null,
-	/**  等倍の出力の大きさ。 */
-	fullWidth: number,
-	fullHeight: number,
-	/**  段のキャンバスの大きさ。 */
-	width: number,
-	height: number,
-	frames: EditFrameDto[],
-	/**  画素の形式（`rgba8` など）。タイルは形式によらず RGBA8。 */
-	format: string | null,
-	/**  タイルの 1 辺（256）。 */
-	tile: number,
-	changed: EditChangedDto,
-	metaChanged: boolean,
-	warnings: Issue[],
-	drawnNodes: number,
-	/**  描くのにかかった時間（ミリ秒）。 */
-	ms: number | null,
-};
+	type: "image",
+} & EditImageViewDto;
 
 /**  表示の結果。 */
 export type EditViewOutcomeDto = { type: "shown"; view: EditViewDto } | 
@@ -1093,19 +1132,12 @@ export type EditViewOutcomeDto = { type: "shown"; view: EditViewDto } |
 /**  描けない（手は当たっている。取り消せる）。 */
 { type: "failed"; problem: EditProblemDto };
 
-/**  表示の要求（ビューポート）。 */
+/**  表示の要求（ビューポート）：種類ごとの和（`type` で分ける）。 */
 export type EditViewportDto = {
-	/**  表示するフレーム（1 枚の画像は 0）。 */
-	frame: number,
-	/**  表示する範囲（等倍のキャンバスの座標）。null は全体。 */
-	rect: EditRectDto | null,
-	/**  等倍の 1 画素あたりの装置の画素（拡大率 × devicePixelRatio）。段は Rust が決める。 */
-	scale: number | null,
-	/**  操作中（ドラッグ・ズームの途中）なら 1 段粗く描く。 */
-	interacting: boolean,
-	/**  編集中のノード（キャッシュに固定する）。 */
-	focus: number | null,
-};
+	type: "image",
+} & EditImageViewportDto | {
+	type: "audio",
+} & EditAudioViewportDto;
 
 /**
  *  文書への変更 1 つ。JSON（エディタとの通信。M12）では `type` で種類を分ける（`{"type":"appendItems","node":3,…}`。
