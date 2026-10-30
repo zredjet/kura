@@ -118,6 +118,10 @@ pub struct EstimateSpec<'a> {
     /// 範囲を持つ音声のノードは描くチャンクの分だけ、要らないノードは 0、流し解きは入力の窓 1 つを流す分と解析の結果を数える
     /// （画像は全体のまま。保守的）。
     pub area: Option<(OutputId, crate::render::region::Area)>,
+    /// 流れ（`Engine::stream_audio` の全体）の見積もり：出力の窓（`STREAM_CHUNKS` チャンク）1 つを描く間のピークを、どの窓を
+    /// 描いても超えないように数える（M13 段 1 の検証の直し。窓 0 の区間だけの見積もりは、窓ごとの最大ではない）。`area` より
+    /// 先に見る。
+    pub stream: Option<OutputId>,
 }
 
 impl<'a> EstimateSpec<'a> {
@@ -167,9 +171,18 @@ impl<'a> EstimateSpec<'a> {
         self
     }
 
-    /// 出力 `output` の範囲 `area` だけを描く見積もりにする（範囲の描画・表示の経路。音声の流れの窓は窓 1 つの区間を渡す）。
+    /// 出力 `output` の範囲 `area` だけを描く見積もりにする（範囲の描画・表示の経路）。音声の流れの前の確保は
+    /// [`EstimateSpec::stream`] を使う。
     pub fn area(mut self, output: OutputId, area: crate::render::region::Area) -> Self {
         self.area = Some((output, area));
+        self
+    }
+
+    /// 出力 `output` を流す（`Engine::stream_audio` で全体を窓ごとに描く）見積もりにする：窓 1 つを描く間のピークを、どの窓
+    /// でも超えないように数える（窓が 3 つまでなら全部の窓、ほかは窓 0・最後の窓と、間の窓を覆う窓 1 の広げた数え方の
+    /// 最大。`render/estimate.rs` の `stream_windows_bound`）。
+    pub fn stream(mut self, output: OutputId) -> Self {
+        self.stream = Some(output);
         self
     }
 }
@@ -267,6 +280,23 @@ fn over_total(peak: u64, total: u64) -> EngineError {
     ))
 }
 
+/// 長さ `frames` の音声を流す窓（`STREAM_CHUNKS` チャンクずつ。`audio::stream::stream_windows` と同じ切り方）の、どれを
+/// 描いても見積もりが下回らない窓の候補：（区間, 広げて数えるか）。窓が 3 つまでなら全部の窓をそのまま。4 つ以上なら、窓 0
+/// （左端で切れる）と最後の窓（短い・右端で切れる）をそのまま、間の窓（長さが同じ）は窓 1 を、出力のノードのほかの要る区間を
+/// 両側へ 1 チャンク広げて数える（間の窓どうしは、要る区間の長さがほぼ同じで、チャンクへの揃い方だけが違う。揃え方の違いは
+/// ノードごとに 1 チャンクまでで、広げた区間はそれを覆い、上流へも長い区間として伝わる）。長さ 0 は空の区間 1 つ。
+fn stream_windows_bound(frames: u64) -> Vec<(crate::render::region::Area, bool)> {
+    use crate::render::region::Area;
+    let w = (crate::audio::stream::STREAM_CHUNKS * crate::value::AUDIO_CHUNK) as u64;
+    let count = frames.div_ceil(w);
+    let span = |k: u64| Area::span(k * w, (k.saturating_add(1) * w).min(frames));
+    match count {
+        0 => vec![(Area::Empty, false)],
+        1..=3 => (0..count).map(|k| (span(k), false)).collect(),
+        _ => vec![(span(0), false), (span(1), true), (span(count - 1), false)],
+    }
+}
+
 /// 範囲の描画の量（[`Engine::estimate`] の `EstimateSpec::area`）。
 #[derive(Default)]
 struct RegionCost {
@@ -293,6 +323,45 @@ impl Engine {
         plan: &Plan,
         spec: &EstimateSpec<'_>,
         cache: Option<CacheProbe<'_>>,
+    ) -> Result<MemoryEstimate, EngineError> {
+        let Some(out) = spec.stream else {
+            return self.estimate_with(plan, spec, cache, false);
+        };
+        // 流れ：どの窓を描いても超えない見積もり（窓の候補ごとの見積もりの、ピークの最大）
+        let frames = match plan.outputs.iter().find(|o| o.0 == out) {
+            Some((_, _, Shape::Audio { frames, .. }, _)) => frames.max(),
+            Some(_) => {
+                return Err(EngineError::Unsupported(
+                    "音声でない出力は流せません".into(),
+                ));
+            }
+            None => {
+                return Err(EngineError::Internal(format!(
+                    "見積もりの出力 {} はありません",
+                    out.0
+                )));
+            }
+        };
+        let mut most: Option<MemoryEstimate> = None;
+        for (window, pad) in stream_windows_bound(frames) {
+            let mut one = spec.clone();
+            one.stream = None;
+            one.area = Some((out, window));
+            let e = self.estimate_with(plan, &one, cache, pad)?;
+            if most.as_ref().is_none_or(|m| e.peak > m.peak) {
+                most = Some(e);
+            }
+        }
+        most.ok_or_else(|| EngineError::Internal("流れの窓の見積もりがありません".into()))
+    }
+
+    /// [`Engine::estimate`] の本体（`pad` は範囲の描画の見積もりで、出力のノードのほかの要る区間を両側へ 1 チャンク広げる）。
+    fn estimate_with(
+        &self,
+        plan: &Plan,
+        spec: &EstimateSpec<'_>,
+        cache: Option<CacheProbe<'_>>,
+        pad: bool,
     ) -> Result<MemoryEstimate, EngineError> {
         let hits = match cache {
             Some(probe) => self.cache_hits(plan, probe)?,
@@ -341,7 +410,7 @@ impl Engine {
         }
         // 描く（範囲の描画なら、後ろからの走査で描くノードと量を求めておく）
         let region = match &spec.area {
-            Some((out, area)) => self.output_region(plan, *out, area, &hits, cache, tasks)?,
+            Some((out, area)) => self.output_region(plan, *out, area, &hits, cache, tasks, pad)?,
             None => None,
         };
         let (mut render, nodes) =
@@ -541,6 +610,7 @@ impl Engine {
     }
 
     /// 範囲の描画の出力 `output`・範囲 `area` の量（入力をそのまま出す出力は None）。
+    #[allow(clippy::too_many_arguments)]
     fn output_region(
         &self,
         plan: &Plan,
@@ -549,6 +619,7 @@ impl Engine {
         hits: &Hits,
         cache: Option<CacheProbe<'_>>,
         tasks: u64,
+        pad: bool,
     ) -> Result<Option<RegionCost>, EngineError> {
         let Some((_, from, shape, _)) = plan.outputs.iter().find(|o| o.0 == output) else {
             return Err(EngineError::Internal(format!(
@@ -572,11 +643,13 @@ impl Engine {
             probe.as_ref(),
             tasks,
             0,
+            pad,
         )?))
     }
 
     /// 範囲の描画の量（`region_needs` と同じ走査を、値なしで）：描くノード、範囲を持つ音声のノードの値の量（描くチャンクの
-    /// 長さの和 × チャンネル × 4）、流し解きの量（入力のポートを窓 `STREAM_CHUNKS` チャンクで描く間の最大 ＋ 解析の結果）。
+    /// 長さの和 × チャンネル × 4）、流し解きの量（入力のポートを窓 `STREAM_CHUNKS` チャンクで描く間の、どの窓でも超えない
+    /// 最大 ＋ 解析の結果）。`pad` なら、出力のノードのほかの要る区間を両側へ 1 チャンク広げて数える（流れの間の窓を覆う）。
     #[allow(clippy::too_many_arguments)]
     fn region_cost(
         &self,
@@ -587,6 +660,7 @@ impl Engine {
         probe: Option<&(super::area::PassCx<'_>, &NodeCache)>,
         tasks: u64,
         depth: usize,
+        pad: bool,
     ) -> Result<RegionCost, EngineError> {
         use crate::value::AUDIO_CHUNK;
         let shapes = super::area::Shapes::of(plan);
@@ -597,9 +671,16 @@ impl Engine {
                     None => self.needs_streamable(&shapes, n)?,
                 })
         };
-        let walk = self.region_needs(plan, &shapes, node_id, target, false, &audio_ok, &|n| {
-            hits.nodes.contains(&n.id)
-        })?;
+        let walk = self.region_needs(
+            plan,
+            &shapes,
+            node_id,
+            target,
+            false,
+            pad,
+            &audio_ok,
+            &|n| hits.nodes.contains(&n.id),
+        )?;
         let index: BTreeMap<NodeId, &PlannedNode> =
             plan.nodes.iter().map(|n| (n.id, n.as_ref())).collect();
         let mut rc = RegionCost {
@@ -614,7 +695,8 @@ impl Engine {
         // 描いた値が完全な値になるか（範囲の描画の前から描く道 `port_pass` と同じ判定）：外したノードは入力 0 のまま、当たりは
         // 完全、音声の範囲を持つノードはすべてのチャンクが要り入力がどれも完全なら全体で描く、範囲を持たないノードは全体で描く
         // （入力が部分の値なら全体で描き直す）。画像の範囲を持つノードは部分の値とみなす（音声の解析の入力にならない）。
-        // 流し解きは、申告した解析の入力がここで部分の値になるときだけ起きる（入力が完全なら値に当てて解く）
+        // 流し解きは、申告した解析の入力がここで部分の値になるときだけ起きる（入力が完全なら値に当てて解く）。広げて数える
+        // ときは、範囲を持つノードを部分の値とみなす（広げた区間がすべてのチャンクを覆っても、実際の窓では覆わないことがある）
         let mut complete: BTreeMap<NodeId, bool> = BTreeMap::new();
         for node in plan.nodes.iter().filter(|n| walk.need.contains_key(&n.id)) {
             let port_ok = |r: &PortRef, complete: &BTreeMap<NodeId, bool>| match r {
@@ -626,15 +708,17 @@ impl Engine {
             } else if walk.hits.contains(&node.id) {
                 true
             } else if let Some(rounded) = walk.regional.get(&node.id) {
-                let all_chunks = match node.inferred.shape {
-                    Shape::Audio {
-                        frames: crate::shape::Dim::Exact(n),
-                        ..
-                    } => usize::try_from(n).is_ok_and(|n| {
-                        super::audio::chunks_covering(rounded, n).count() == n.div_ceil(AUDIO_CHUNK)
-                    }),
-                    _ => false,
-                };
+                let all_chunks = !pad
+                    && match node.inferred.shape {
+                        Shape::Audio {
+                            frames: crate::shape::Dim::Exact(n),
+                            ..
+                        } => usize::try_from(n).is_ok_and(|n| {
+                            super::audio::chunks_covering(rounded, n).count()
+                                == n.div_ceil(AUDIO_CHUNK)
+                        }),
+                        _ => false,
+                    };
                 all_chunks && node.inputs.iter().all(|r| port_ok(r, &complete))
             } else {
                 true
@@ -709,21 +793,29 @@ impl Engine {
                             ..
                         },
                     ) if depth < plan.nodes.len() => {
-                        let w = (crate::audio::stream::STREAM_CHUNKS * AUDIO_CHUNK) as u64;
-                        let inner = self.region_cost(
-                            plan,
-                            *up,
-                            crate::render::region::Area::span(0, w.min(m)),
-                            hits,
-                            probe,
-                            tasks,
-                            depth + 1,
-                        )?;
-                        let mut fresh = Ledger::default();
-                        let inputs: BTreeMap<InputId, usize> =
-                            plan.inputs.keys().map(|k| (*k, fresh.add(0))).collect();
-                        self.render_stage(plan, &mut fresh, &inputs, hits, Some(&inner), tasks)?
-                            .0
+                        // 窓 0 の区間だけでは窓ごとの最大にならない（縮めるリサンプルでは、間の窓が上流のノードごとに
+                        // 1 チャンク多く掛かる）ので、どの窓でも超えない数え方（`stream_windows_bound`）の最大
+                        let mut most = 0u64;
+                        for (window, pad) in stream_windows_bound(m) {
+                            let inner = self.region_cost(
+                                plan,
+                                *up,
+                                window,
+                                hits,
+                                probe,
+                                tasks,
+                                depth + 1,
+                                pad,
+                            )?;
+                            let mut fresh = Ledger::default();
+                            let inputs: BTreeMap<InputId, usize> =
+                                plan.inputs.keys().map(|k| (*k, fresh.add(0))).collect();
+                            let at = self
+                                .render_stage(plan, &mut fresh, &inputs, hits, Some(&inner), tasks)?
+                                .0;
+                            most = most.max(at);
+                        }
+                        most
                     }
                     _ => 0,
                 };

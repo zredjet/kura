@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use super::audio::{chunk_spans, chunks_covering, patch_target_audio, round_to_chunks};
+use super::audio::{chunk_spans, chunks_covering, pad_chunks, patch_target_audio, round_to_chunks};
 use super::cache::{
     Fingerprint, FingerprintedInput, Fingerprints, NodeCache, Origin, RenderOptions,
     node_input_fingerprints, quantized_output,
@@ -301,7 +301,9 @@ impl Engine {
     /// 範囲を集める。範囲を持つノード（画像は `image_regional`、音声は `audio_ok`）は、要る範囲を値のタイル・チャンクに広げて
     /// `reach`・`audio_reach` で入力 0 へ写す。持たないノードは入力を全体で要る。外したノードは入力 0 へそのまま。当たる
     /// ノード（`is_hit`）で止める。要る範囲が空でも、使い手があるノードは要る（範囲の描画を持つノードは無効なタイル・チャンク
-    /// だけの値を作る。使い手は形・メタデータだけを見る）。`full` なら範囲を持つノードはない。
+    /// だけの値を作る。使い手は形・メタデータだけを見る）。`full` なら範囲を持つノードはない。`pad` なら（見積もりだけ）、
+    /// `out_node` のほかの音声の範囲を持つノードの要る区間を、チャンクに揃えたうえで両側へ 1 チャンク広げる（流れの間の窓の
+    /// どれを描いても、要るチャンクの数がこれを超えない。`EstimateSpec::stream` と流し解きの見積もり）。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn region_needs(
         &self,
@@ -310,6 +312,7 @@ impl Engine {
         out_node: NodeId,
         target: Area,
         full: bool,
+        pad: bool,
         audio_ok: &AudioOk<'_>,
         is_hit: &dyn Fn(&PlannedNode) -> bool,
     ) -> Result<Needs, EngineError> {
@@ -347,7 +350,13 @@ impl Engine {
                 let reach = node
                     .op
                     .audio_reach(node.params.as_ref(), &op_shapes(node, &in_shapes))?;
-                Some((round_to_chunks(&n_need, &node.inferred.shape), reach))
+                let rounded = round_to_chunks(&n_need, &node.inferred.shape);
+                let rounded = if pad && node.id != out_node {
+                    pad_chunks(&rounded, &node.inferred.shape)
+                } else {
+                    rounded
+                };
+                Some((rounded, reach))
             } else {
                 None
             };
@@ -581,6 +590,7 @@ impl Engine {
                 out_node,
                 target,
                 full,
+                false,
                 &|n, s| Ok(self.audio_regional(n, s)? && self.needs_ready(cx, cache_ref, n)?),
                 &|n| {
                     n.enabled

@@ -60,6 +60,20 @@ pub(super) fn round_to_chunks(area: &Area, shape: &Shape) -> Area {
     }
 }
 
+/// チャンクに揃えた区間を、両側へ 1 チャンクずつ広げる（[0, n) で切る。見積もりだけ：流れの間の窓は、要る区間の揃い方が
+/// 窓ごとに違い、同じ長さでも 1 チャンク多く掛かりうる。広げた区間で数えれば、どの窓よりも少なくならない）。
+pub(super) fn pad_chunks(area: &Area, shape: &Shape) -> Area {
+    let (Area::Samples(spans), Shape::Audio { frames, .. }) = (area, shape) else {
+        return area.clone();
+    };
+    let (n, c) = (frames.max(), AUDIO_CHUNK as u64);
+    let mut out = Spans::new();
+    for &(a, b) in spans.spans() {
+        out.push(a.saturating_sub(c), b.saturating_add(c).min(n));
+    }
+    Area::samples(out)
+}
+
 /// 長さ `frames` の音声で、範囲 `area` に掛かるチャンクの番号（`All`・画素の範囲はすべて、空は空）。
 pub fn chunks_covering(area: &Area, frames: usize) -> ChunkSet {
     let count = frames.div_ceil(AUDIO_CHUNK);

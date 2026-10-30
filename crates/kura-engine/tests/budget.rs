@@ -1586,3 +1586,89 @@ fn area_estimate_bounds_audio_regions() {
         .unwrap();
     assert!(cached.render < window, "{}", cached.render);
 }
+
+/// 検証の直し（M13 段 1）：窓 0 の区間だけの見積もりは、流れの窓ごとの最大ではない（縮めるリサンプルでは、左端が 0 で切れる
+/// 窓 0 より、チャンクの境をまたぐ間の窓のほうが、上流の範囲を持つノードごとに 1 チャンク多く掛かる）。流れの見積もり
+/// （`EstimateSpec::stream`）は、どの窓の範囲の見積もりも下回らない。流し解き（下流の normalize）の窓の数え方も同じ。
+#[test]
+fn stream_estimate_covers_every_window() {
+    use kura_engine::render::region::Area;
+    let engine = engine();
+    let c = kura_engine::value::AUDIO_CHUNK as u64;
+    let w = 16 * c;
+    let mut checked = 0;
+    for (from, to) in [(48_000u32, 44_100u32), (48_000, 32_000), (44_100, 48_000)] {
+        for start in [0u64, 1, 30_000, c] {
+            let shapes = BTreeMap::from([(
+                InputId(0),
+                Shape::Audio {
+                    rate: from,
+                    channels: 2,
+                    frames: Dim::Exact(70 * c),
+                },
+            )]);
+            // trim → resample → gain（流す出力）と、その後ろに normalize（流し解きの入力が gain の出力）
+            let mut g = Graph::new_single();
+            g.push_linear("audio.trim", 1, json!({ "start": start, "end": null }), 1)
+                .unwrap();
+            g.push_linear("audio.resample", 1, json!({ "rate": to }), 2)
+                .unwrap();
+            g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 3)
+                .unwrap();
+            let plan = engine.compile(&g, &shapes).unwrap();
+            let frames = match plan.output_shapes()[0].1 {
+                Shape::Audio { frames, .. } => frames.max(),
+                _ => panic!(),
+            };
+            let spec = || EstimateSpec::new(3).all_inputs(&plan, Source::Held);
+            let mut most = (0u64, 0u64);
+            let mut first = 0u64;
+            for k in 0..frames.div_ceil(w) {
+                let e = engine
+                    .estimate(
+                        &plan,
+                        &spec().area(OutputId(0), Area::span(k * w, ((k + 1) * w).min(frames))),
+                        None,
+                    )
+                    .unwrap();
+                if k == 0 {
+                    first = e.render;
+                }
+                if e.render > most.0 {
+                    most = (e.render, k);
+                }
+            }
+            let stream = engine
+                .estimate(&plan, &spec().stream(OutputId(0)), None)
+                .unwrap();
+            let what = format!(
+                "{from}→{to}・始まり {start}：窓 0 {first}・窓ごとの最大 {most:?}・流れ {}",
+                stream.render
+            );
+            assert!(stream.render >= most.0, "{what}");
+            assert!(stream.render <= most.0 + 8 * MIB, "{what}：広げすぎ");
+            // 流し解き：normalize の入力（gain の出力）を窓ごとに流す分も、どの窓の範囲の見積もりも下回らない
+            let mut n = g.clone();
+            n.push_linear(
+                "audio.normalize",
+                1,
+                json!({ "target": -20.0, "peakLimit": null }),
+                4,
+            )
+            .unwrap();
+            let nplan = engine.compile(&n, &shapes).unwrap();
+            let small = engine
+                .estimate(
+                    &nplan,
+                    &EstimateSpec::new(3)
+                        .all_inputs(&nplan, Source::Held)
+                        .area(OutputId(0), Area::span(5 * c, 5 * c + 10)),
+                    None,
+                )
+                .unwrap();
+            assert!(small.render >= most.0, "{what}：流し解き {}", small.render);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 12);
+}
