@@ -581,6 +581,138 @@ fn anchor_sources_read_the_recorded_value() {
     );
 }
 
+/// `ChunkLru::get_or_load` の読み手の終わり方（[`race`] の閉包）。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FirstLoad {
+    Ok,
+    Err,
+    Panic,
+}
+
+/// [`race`] の読み手：呼ばれた数・同時に読んでいる数の最大を数え、少し待ってから返す（1 回目だけ `first` の終わり方）。
+struct Loader {
+    first: FirstLoad,
+    calls: std::sync::atomic::AtomicUsize,
+    inflight: std::sync::atomic::AtomicUsize,
+    max_inflight: std::sync::atomic::AtomicUsize,
+}
+
+impl Loader {
+    fn new(first: FirstLoad) -> Self {
+        Self {
+            first,
+            calls: Default::default(),
+            inflight: Default::default(),
+            max_inflight: Default::default(),
+        }
+    }
+
+    fn load(&self) -> Result<kura_engine::audio::source::ChunkPlanes, EngineError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let k = self.calls.fetch_add(1, SeqCst);
+        let now = self.inflight.fetch_add(1, SeqCst) + 1;
+        self.max_inflight.fetch_max(now, SeqCst);
+        // ほかの仕事が同じ番号を読みに来て待つ間（読みの重なり）を作る
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        self.inflight.fetch_sub(1, SeqCst);
+        match (k, self.first) {
+            (0, FirstLoad::Err) => Err(EngineError::Internal("読みの失敗（テスト）".into())),
+            (0, FirstLoad::Panic) => panic!("読みの panic（テスト）"),
+            _ => Ok((0..2).map(|_| Arc::new(vec![k as f32; 1_000])).collect()),
+        }
+    }
+}
+
+/// `threads` 個のスレッドが同時に `lru.get_or_load(7, …)` を呼んだ結果（Ok は（1 つ目の標本, 当たり）、Err は文言、panic は
+/// "panic"）。どの呼び手も 20 秒以内に戻らなければ失敗にする（待つ側が永久に待たないこと）。
+#[allow(clippy::disallowed_methods)] // 並列の読みを試すので std::thread を使う（描画の外のテスト）
+fn race(
+    lru: &Arc<ChunkLru>,
+    loader: &Arc<Loader>,
+    threads: usize,
+) -> Vec<Result<(f32, bool), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let start = Arc::new(std::sync::Barrier::new(threads));
+    for _ in 0..threads {
+        let (lru, loader, tx, start) = (lru.clone(), loader.clone(), tx.clone(), start.clone());
+        std::thread::spawn(move || {
+            start.wait();
+            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                lru.get_or_load(7, || loader.load())
+            }));
+            let out = match got {
+                Ok(Ok((planes, hit))) => Ok((planes[0][0], hit)),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("panic".to_string()),
+            };
+            let _ = tx.send(out);
+        });
+    }
+    (0..threads)
+        .map(|i| {
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{i} 番目の呼び手が戻らない（待ちが解けない）"))
+        })
+        .collect()
+}
+
+/// 検証の直し（M13 段 1）：`ChunkLru::get_or_load` は、同じ番号を同時に読もうとしたら 1 回だけ読み、ほかは待って同じ値を
+/// 使う。読みが Err・panic で終わっても待つ側を起こし（永久に待たない）、次の 1 つが読み直す。上限を超えるチャンク（LRU に
+/// 入らない）は待つ側が自分で読むが、同じ番号を同時に 2 つは読まない。
+#[test]
+fn chunk_lru_loads_once_and_wakes_waiters() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let threads = 16;
+    let big = 2 * 4 * 1_000;
+    // 成功：読みは 1 回、全員が同じ値、当たりは 1 回目のほかの全員
+    let lru = Arc::new(ChunkLru::new(4 * big));
+    let loader = Arc::new(Loader::new(FirstLoad::Ok));
+    let got = race(&lru, &loader, threads);
+    assert_eq!(loader.calls.load(SeqCst), 1);
+    assert!(
+        got.iter().all(|g| matches!(g, Ok((v, _)) if *v == 0.0)),
+        "{got:?}"
+    );
+    assert_eq!(
+        got.iter().filter(|g| matches!(g, Ok((_, false)))).count(),
+        1
+    );
+    // 成功のあとは当たる（読まない）
+    let again = race(&lru, &loader, 4);
+    assert!(
+        again.iter().all(|g| matches!(g, Ok((0.0, true)))),
+        "{again:?}"
+    );
+    assert_eq!(loader.calls.load(SeqCst), 1);
+    // 1 回目が Err・panic：その呼び手だけが失敗し、待っていた側の 1 つが読み直して、残りはそれに当たる
+    for first in [FirstLoad::Err, FirstLoad::Panic] {
+        let lru = Arc::new(ChunkLru::new(4 * big));
+        let loader = Arc::new(Loader::new(first));
+        let got = race(&lru, &loader, threads);
+        let failed = got.iter().filter(|g| g.is_err()).count();
+        assert_eq!(failed, 1, "{first:?}: {got:?}");
+        assert!(
+            got.iter()
+                .filter_map(|g| g.as_ref().ok())
+                .all(|(v, _)| *v == 1.0),
+            "{first:?}: {got:?}"
+        );
+        assert_eq!(loader.calls.load(SeqCst), 2, "{first:?}");
+        assert_eq!(loader.max_inflight.load(SeqCst), 1, "{first:?}");
+        if first == FirstLoad::Panic {
+            assert!(got.iter().any(|g| g.as_ref().is_err_and(|m| m == "panic")));
+        }
+    }
+    // 上限を超えるチャンク：LRU に入らないので、待っていた側がそれぞれ読む（同時に読むのは 1 つだけ）
+    let lru = Arc::new(ChunkLru::new(big / 2));
+    let loader = Arc::new(Loader::new(FirstLoad::Ok));
+    let got = race(&lru, &loader, 8);
+    assert!(got.iter().all(|g| matches!(g, Ok((_, false)))), "{got:?}");
+    assert_eq!(loader.calls.load(SeqCst), 8);
+    assert_eq!(loader.max_inflight.load(SeqCst), 1);
+    assert_eq!(lru.resident(), 0);
+}
+
 /// E36：源の LRU は上限を超えない（1 つで上限を超えるものは入れない）。ファイルの源は、開くときに読まず、同じチャンクは
 /// LRU に当たり、上限の小さい源でも値は同じ（読み直すだけ）。値の源（`MemorySource`）は実体を写さずに返す。
 #[test]
