@@ -10,7 +10,7 @@ paths:
 - 決定性の規則（`crates/kura-engine/clippy.toml` で強制）：
   - 超越関数は `crate::math` だけ（OS の libm を呼ばない）。
   - `HashMap`・`HashSet` を使わない。出力に効く順序は `BTreeMap` か並べた `Vec` で決める。
-  - 並列は `determinism::par_blocks` だけ（rayon のほかの口・`std::thread` は禁止）。浮動小数の総和は `sum_blocks`（凍結した `SUM_BLOCK` ずつの部分和を順に足す）。並列の分け方（`TILE`・`BAND_ROWS`・`AUDIO_BLOCK`）で結果が変わらないように書く。
+  - 並列は `determinism::par_blocks` だけ（rayon のほかの口・`std::thread` は禁止）。浮動小数の総和は `sum_blocks`（凍結した `SUM_BLOCK` ずつの部分和を順に足す）。並列の分け方（`TILE`・`BAND_ROWS`・音声のチャンク `AUDIO_CHUNK`。`AUDIO_BLOCK` は段 6 の音声のブロックで、今は使っていない）で結果が変わらないように書く。
   - 浮動小数の max・min は `math::max`・`min`（±0 と NaN の扱いを決めたもの）。`sort_unstable*`・`binary_search*` は使わない。
   - 乱数は ChaCha8 だけ。種は `determinism::seed`、生成器は `ApplyCx::rng_at`（絶対位置：画像は行・音声はチャンネルを流れにして位置へシーク）。タイル・ブロック・フレームの番号を流れに使わない。
   - 描画の中で時刻・環境変数を読まない（予算の確保を待つ `budget` の `Condvar::wait_timeout` は描画の外で、値に効かない）。`unsafe` は使わない（`forbid`）。
