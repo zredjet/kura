@@ -155,6 +155,55 @@ impl Plan {
     pub fn released_after(&self, index: usize) -> &[NodeId] {
         self.release.get(index).map_or(&[], Vec::as_slice)
     }
+
+    /// 出力 `output` の時間の写しの連鎖（M13 段 4。エディタのハンドル・元への写し）：出力のポートから各ノードの入力 0 を
+    /// 逆にたどり、文書の入力に着いたら、入力 → 出力の順に並べて返す（出力が入力そのものなら空）。外したノードの写しは
+    /// `Identity`（計画の推論のまま）。出力がない・入力のないノードに着いた・ノードが見つからなければ None。
+    pub fn time_chain(&self, output: OutputId) -> Option<Vec<TimeLink>> {
+        let (_, mut at, _, _) = *self.outputs.iter().find(|o| o.0 == output)?;
+        let mut links = Vec::new();
+        // ノードの数より長くはたどらない（計画は閉路を持たないが、念のため）
+        for _ in 0..=self.nodes.len() {
+            let id = match at {
+                PortRef::Input { .. } => {
+                    links.reverse();
+                    return Some(links);
+                }
+                PortRef::Node { id } => id,
+            };
+            let node = self.nodes.iter().find(|n| n.id == id)?;
+            let from = *node.inputs.first()?;
+            let input = match from {
+                PortRef::Input { id } => *self.inputs.get(&id)?,
+                PortRef::Node { id } => self.nodes.iter().find(|n| n.id == id)?.inferred.shape,
+            };
+            links.push(TimeLink {
+                node: node.id,
+                op: node.op.id().to_string(),
+                enabled: node.enabled,
+                time: node.inferred.time.clone(),
+                input,
+                output: node.inferred.shape,
+            });
+            at = from;
+        }
+        None
+    }
+}
+
+/// 時間の写しの連鎖の 1 つ（[`Plan::time_chain`]）：ノードと、その入力 0 から出力への時間の写し。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimeLink {
+    pub node: NodeId,
+    /// 操作の ID。
+    pub op: String,
+    pub enabled: bool,
+    /// 入力 0 → 出力の時間の写し（外したノードは `Identity`）。
+    pub time: TimeMap,
+    /// 入力 0 の形。
+    pub input: Shape,
+    /// 出力の形。
+    pub output: Shape,
 }
 
 /// 最後の使い手の表：ノード i を描いたあとに落としてよい値。出力が使う値は落とさない。どこからも使われない値は、

@@ -455,13 +455,49 @@ impl TimeMap {
     }
 
     /// 区間の終わり（含まない位置）を写す。`Segments` では区間の終わりちょうども写す。
-    fn end(&self, end: u64) -> Option<u64> {
+    pub fn pos_end(&self, end: u64) -> Option<u64> {
         match self {
             Self::Segments { segs } => segs
                 .iter()
                 .find(|s| end > s.src_start && end <= s.src_end)
                 .and_then(|s| s.dst_start.checked_add(end - s.src_start)),
             _ => self.pos(end),
+        }
+    }
+
+    /// 写した先の位置 `pos`（フレーム）を、写す前の位置へ戻す（M13 段 4。エディタのハンドル）。`Segments` は `pos` を含む
+    /// 写した先の区間から戻し、`Rate { from, to }` は `round_half_even(pos × from / to)`（[`TimeMap::pos`] と同じ丸め。
+    /// 往復は ⌈from/to⌉/2 フレームまでずれうる）。区間の外・`Unknown`・`Reset`・あふれは None。
+    pub fn back(&self, pos: u64) -> Option<u64> {
+        match self {
+            Self::Identity => Some(pos),
+            Self::Segments { segs } => segs.iter().find_map(|s| {
+                let len = s.src_end.checked_sub(s.src_start)?;
+                let end = s.dst_start.checked_add(len)?;
+                (pos >= s.dst_start && pos < end)
+                    .then(|| s.src_start.checked_add(pos - s.dst_start))
+                    .flatten()
+            }),
+            Self::Rate { from, to } => {
+                let v = div_round_half_even(i128::from(pos) * i128::from(*from), i128::from(*to))?;
+                u64::try_from(v).ok()
+            }
+            Self::Unknown | Self::Reset => None,
+        }
+    }
+
+    /// 写した先の区間の終わり（含まない位置）を戻す。`Segments` では写した先の区間の終わりちょうども戻す
+    /// （[`TimeMap::pos_end`] の逆）。
+    pub fn back_end(&self, end: u64) -> Option<u64> {
+        match self {
+            Self::Segments { segs } => segs.iter().find_map(|s| {
+                let len = s.src_end.checked_sub(s.src_start)?;
+                let dst_end = s.dst_start.checked_add(len)?;
+                (end > s.dst_start && end <= dst_end)
+                    .then(|| s.src_start.checked_add(end - s.dst_start))
+                    .flatten()
+            }),
+            _ => self.back(end),
         }
     }
 }
@@ -497,7 +533,7 @@ pub fn map_audio_meta(meta: &AudioMeta, map: &TimeMap, out_frames: u64) -> (Audi
             }),
             _ => map
                 .pos(l.start)
-                .zip(map.end(l.end))
+                .zip(map.pos_end(l.end))
                 .map(|(start, end)| (LoopRange { start, end }, false)),
         };
         match mapped {
