@@ -513,6 +513,233 @@ fn pcm_sources_read_the_decoded_values() {
     );
 }
 
+/// AIFF-C のファイルを手で組む（FVER・COMM（圧縮 `kind`・`numSampleFrames` は `frames`）・SSND）。
+fn aifc_bytes(kind: &[u8; 4], channels: u16, bits: u16, frames: u32, data: &[u8]) -> Vec<u8> {
+    let mut comm = Vec::new();
+    comm.extend_from_slice(&channels.to_be_bytes());
+    comm.extend_from_slice(&frames.to_be_bytes());
+    comm.extend_from_slice(&bits.to_be_bytes());
+    comm.extend_from_slice(&kura_engine::codec::aiff::write_ext80(8_000));
+    comm.extend_from_slice(kind);
+    comm.extend_from_slice(&[0, 0]); // 空の pstring ＋ 詰め物
+    let mut body = b"AIFC".to_vec();
+    let mut put = |id: &[u8; 4], b: &[u8]| {
+        body.extend_from_slice(id);
+        body.extend_from_slice(&(b.len() as u32).to_be_bytes());
+        body.extend_from_slice(b);
+        if b.len() % 2 == 1 {
+            body.push(0);
+        }
+    };
+    put(b"FVER", &0xA280_5140u32.to_be_bytes());
+    put(b"COMM", &comm);
+    let mut ssnd = vec![0u8; 8];
+    ssnd.extend_from_slice(data);
+    put(b"SSND", &ssnd);
+    let mut out = b"FORM".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// 検証の直し（M13 段 1。E36 の「AIFF のすべての符号化」）：AIFF-C の圧縮 `sowt`（16・8 ビット）・`raw `・`twos`（12 ビットは
+/// 2 バイトの入れ物）・`NONE`（20 ビットは 3 バイトの入れ物）・`in24`・`in32`・`fl32`/`FL32`・`fl64`/`FL64` を手で組み、
+/// 源として開いた値が `decode` と同じで、どちらも別に求めた標本の値（入れ物の幅で割る `int_to_f32` の式・f64 → f32 の丸め）と
+/// ビット単位で同じ。長さはチャンクの境をまたぐ（C+37）。`ulaw`・`alaw` は decode が `Unsupported` で、源は開かない（None）。
+#[test]
+fn aiff_c_encodings_read_known_values() {
+    let frames = C + 37;
+    let mut r = kura_engine::determinism::rng(36);
+    // 標本 i（チャンネルを並べた順）の（バイト列, 値）。チャンクの境の前後に端の値を置く
+    type Sample = Box<dyn Fn(usize, u32) -> (Vec<u8>, f32)>;
+    let edge = |i: usize, ch: usize| {
+        let f = i / ch;
+        (C - 2..C + 2).contains(&f) || f < 2
+    };
+    let cases: Vec<(&str, &[u8; 4], u16, Sample)> = vec![
+        (
+            "sowt16",
+            b"sowt",
+            16,
+            Box::new(|i, u| {
+                let v = match i % 7 {
+                    0 => i16::MIN,
+                    1 => i16::MAX,
+                    _ => u as i16,
+                };
+                (v.to_le_bytes().to_vec(), f32::from(v) / 32_768.0)
+            }),
+        ),
+        (
+            "sowt8",
+            b"sowt",
+            8,
+            Box::new(|i, u| {
+                let v = if i % 5 == 0 { i8::MIN } else { u as i8 };
+                (vec![v as u8], f32::from(v) / 128.0)
+            }),
+        ),
+        (
+            "raw8",
+            b"raw ",
+            8,
+            Box::new(|_, u| {
+                let v = u as u8;
+                (vec![v], (i32::from(v) - 128) as f32 / 128.0)
+            }),
+        ),
+        (
+            "twos12",
+            b"twos",
+            12,
+            Box::new(|_, u| {
+                // 12 ビットは 2 バイトの入れ物に左詰め
+                let v = ((u as i16) >> 4) << 4;
+                (v.to_be_bytes().to_vec(), f32::from(v) / 32_768.0)
+            }),
+        ),
+        (
+            "none20",
+            b"NONE",
+            20,
+            Box::new(|_, u| {
+                let v = ((u as i32) >> 12) << 4; // 20 ビットを 3 バイトの入れ物に左詰め（24 ビットの整数）
+                let b = v.to_be_bytes();
+                (vec![b[1], b[2], b[3]], v as f32 / 8_388_608.0)
+            }),
+        ),
+        (
+            "in24",
+            b"in24",
+            24,
+            Box::new(|i, u| {
+                let v = match i % 9 {
+                    0 => -(1 << 23),
+                    1 => (1 << 23) - 1,
+                    _ => (u as i32) >> 8,
+                };
+                let b = v.to_be_bytes();
+                (vec![b[1], b[2], b[3]], v as f32 / 8_388_608.0)
+            }),
+        ),
+        (
+            "in32",
+            b"in32",
+            32,
+            Box::new(|i, u| {
+                let v = match i % 11 {
+                    0 => i32::MIN,
+                    1 => i32::MAX,
+                    _ => u as i32,
+                };
+                (
+                    v.to_be_bytes().to_vec(),
+                    (f64::from(v) / 2_147_483_648.0) as f32,
+                )
+            }),
+        ),
+        (
+            "fl32",
+            b"fl32",
+            32,
+            Box::new(|i, u| {
+                let v = match i % 13 {
+                    0 => f32::NAN,
+                    1 => f32::NEG_INFINITY,
+                    2 => -0.0,
+                    _ => (f64::from(u) / 4_294_967_296.0 - 0.5) as f32,
+                };
+                (v.to_be_bytes().to_vec(), v)
+            }),
+        ),
+        (
+            "FL32",
+            b"FL32",
+            32,
+            Box::new(|_, u| {
+                let v = (f64::from(u) / 4_294_967_296.0 * 3.0 - 1.5) as f32;
+                (v.to_be_bytes().to_vec(), v)
+            }),
+        ),
+        (
+            "fl64",
+            b"fl64",
+            64,
+            Box::new(|i, u| {
+                let v = match i % 13 {
+                    0 => f64::NAN,
+                    1 => f64::INFINITY,
+                    2 => 1e300,
+                    3 => -1e-320,
+                    4 => -0.0,
+                    _ => f64::from(u) / 4_294_967_296.0 - 0.5 + 1e-12,
+                };
+                (v.to_be_bytes().to_vec(), v as f32)
+            }),
+        ),
+        (
+            "FL64",
+            b"FL64",
+            64,
+            Box::new(|_, u| {
+                let v = f64::from(u) / 1_048_576.0 - 2_048.0;
+                (v.to_be_bytes().to_vec(), v as f32)
+            }),
+        ),
+    ];
+    for (k, (name, kind, bits, sample)) in cases.iter().enumerate() {
+        let channels = 1 + (k % 3);
+        let mut data = Vec::new();
+        let mut want = vec![Vec::with_capacity(frames); channels];
+        for i in 0..frames * channels {
+            let u = if edge(i, channels) {
+                [0, u32::MAX, 1 << 31, (1 << 31) - 1][i % 4]
+            } else {
+                r.next_u32()
+            };
+            let (b, v) = sample(i, u);
+            data.extend_from_slice(&b);
+            want[i % channels].push(v);
+        }
+        let bytes = aifc_bytes(kind, channels as u16, *bits, frames as u32, &data);
+        let got = check_source(&format!("aiff-c {name}"), bytes, "aiff", k as u64);
+        assert_eq!((got.channels(), got.frames()), (channels, frames), "{name}");
+        let planes = got.read_planes(0, frames).unwrap();
+        for (ch, (g, w)) in planes.iter().zip(&want).enumerate() {
+            for (i, (a, b)) in g.iter().zip(w).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name}：チャンネル {ch}・フレーム {i}（{a} と {b}）"
+                );
+            }
+        }
+    }
+    // 読まない圧縮：decode は Unsupported、源は開かない
+    for kind in [b"ulaw", b"alaw"] {
+        let bytes = aifc_bytes(kind, 1, 16, 100, &[0u8; 100]);
+        let set = CodecSet::pinned();
+        let d = set.decode(
+            &mut Cursor::new(bytes.clone()),
+            "aiff",
+            &DecodeOptions::default(),
+            &Limits::default(),
+            &NoMonitor,
+        );
+        assert!(matches!(d, Err(EngineError::Unsupported(_))), "{kind:?}");
+        let o = set
+            .open_audio_source(
+                &opener_of(bytes),
+                "aiff",
+                &DecodeOptions::default(),
+                &Limits::default(),
+                1 << 20,
+            )
+            .unwrap();
+        assert!(o.is_none(), "{kind:?}");
+    }
+}
+
 /// E36：音声のアンカー（その場で書いたもの・凍結したフィクスチャ）を源として開くと、ヘッダのメタデータの値になり、
 /// ダイジェストはヘッダに記録した元の読み取りの `value_digest` と同じ。画像のアンカーは None。
 #[test]
