@@ -9,6 +9,9 @@
 //!   外部のツールはパスをそのまま渡すために上書きする）。
 //! - 能力の表は [`CodecSet::capabilities`]（`caps.rs`）。Platform の受け口（OS を知らない backend の trait と adapter）は
 //!   `platform`。
+//! - 音声は流して読める（M13 段 2。`stream`）：[`Decoder::decode_stream`] は標本を `stream::DecodeOut` に渡し、
+//!   [`CodecSet::decode_stream`] が窓に揃えて呼び手の `stream::DecodeSink` へ流しながら値のダイジェストを取る。音声の
+//!   デコーダの `decode` は同じ道を組み手の形（`stream::collect`）で通す（値は同じ）。
 
 pub mod aiff;
 pub mod anchor;
@@ -28,6 +31,7 @@ pub mod platform;
 pub mod png;
 pub mod psd;
 pub mod recorded;
+pub mod stream;
 pub mod svg;
 pub(crate) mod svg_text;
 pub(crate) mod symph;
@@ -55,8 +59,10 @@ use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::{Monitor, NoMonitor};
 use crate::op::ParamSchema;
-use crate::shape::Shape;
+use crate::shape::{Dim, Shape};
 use crate::value::Value;
+
+pub use stream::{DecodeInfo, DecodeOut, DecodeSink, DigestMode, NullSink};
 
 /// 読める・シークできる入力。
 pub trait ReadSeek: Read + Seek {}
@@ -291,6 +297,52 @@ pub trait Decoder: Send + Sync {
     ) -> Result<Value, EngineError> {
         let mut src = BufReader::new(std::fs::File::open(path)?);
         self.decode(&mut src, format, opts, limits, mon)
+    }
+    /// この形式を、値を丸ごと持たずに流して読むか（M13 段 2。偽なら [`Decoder::decode_stream`] の既定は全体を読んでから
+    /// 流す）。
+    fn streams(&self, _format: &str) -> bool {
+        false
+    }
+    /// 形 `shape`・長さ `len` バイトのファイルを流して読む間の作業領域の見積もり（バイト。窓の作業列とダイジェストの分は
+    /// 呼び手が足す）。既定は流さないデコーダの分（値 ＋ [`Decoder::file_work_bytes`]）。
+    fn stream_work_bytes(&self, format: &str, shape: &Shape, len: u64) -> u64 {
+        crate::budget::value_bytes(shape).saturating_add(self.file_work_bytes(format, shape, len))
+    }
+    /// 形を読むのに使う作業領域（バイト。ファイル全体を読んで形を決めるデコーダは長さ `len`）。既定は 0。呼び手は 0 でなければ
+    /// 形を読む前に確保する。
+    fn shape_work_bytes(&self, _format: &str, _len: u64) -> u64 {
+        0
+    }
+    /// 流して読む（M13 段 2）：標本を `out` に渡す（`out.begin` → `push_*` → `out.end`）。`shape` は `CodecSet` がこの
+    /// デコーダで読んだ形。既定は [`Decoder::decode`] で値にしてから流す（流さないデコーダの互換。全体を持つ）。
+    #[allow(clippy::too_many_arguments)]
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        _shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let v = self.decode(src, format, opts, limits, mon)?;
+        out.put_value(&v)
+    }
+    /// [`Decoder::decode_stream`] のパスで読む口。既定はファイルを開いて渡す。
+    #[allow(clippy::too_many_arguments)]
+    fn decode_stream_file(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let mut src = BufReader::new(std::fs::File::open(path)?);
+        self.decode_stream(&mut src, format, opts, limits, shape, out, mon)
     }
 }
 
@@ -738,6 +790,133 @@ impl CodecSet {
         decode_one(d, &mut Input::Path(path), format, opts, limits, mon)
     }
 
+    /// 形 `shape`・長さ `len` バイトのファイルを `format` から流して読む間のデコーダの作業領域の見積もり（この形式を読む
+    /// デコーダの [`Decoder::stream_work_bytes`] の最大。窓の作業列・ダイジェストの分は呼び手が足す）。
+    pub fn decode_stream_work_bytes(&self, format: &str, shape: &Shape, len: u64) -> u64 {
+        self.decoders_for(format)
+            .iter()
+            .map(|d| d.stream_work_bytes(format, shape, len))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 長さ `len` バイトのファイルの形を `format` から読むのに使う作業領域（[`Decoder::shape_work_bytes`] の最大）。
+    pub fn shape_work_bytes(&self, format: &str, len: u64) -> u64 {
+        self.decoders_for(format)
+            .iter()
+            .map(|d| d.shape_work_bytes(format, len))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// 流して読む（M13 段 2）：段の順に試し（`Unsupported` は次の段へ。`sink.begin` が呼び直される）、標本を窓に揃えて
+    /// `sink` へ流しながら値のダイジェストを取り、読み取りの記録（[`CodecSet::decode`] と同じもの）を返す。
+    pub fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        sink: &mut dyn DecodeSink,
+        mon: &dyn Monitor,
+    ) -> Result<DecodeStamp, EngineError> {
+        self.decode_stream_any(
+            &mut StreamInput::Reader(src),
+            format,
+            opts,
+            limits,
+            sink,
+            mon,
+        )
+    }
+
+    /// [`CodecSet::decode_stream`] のパスで読む口（各デコーダの `shape_file_monitored`・`decode_stream_file` を呼ぶ）。
+    pub fn decode_stream_path(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        sink: &mut dyn DecodeSink,
+        mon: &dyn Monitor,
+    ) -> Result<DecodeStamp, EngineError> {
+        self.decode_stream_any(
+            &mut StreamInput::Path(path),
+            format,
+            opts,
+            limits,
+            sink,
+            mon,
+        )
+    }
+
+    /// 記録した識別子のデコーダで流して読む（[`CodecSet::decode_with`] の流れの版）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_stream_with(
+        &self,
+        id: &str,
+        src: &mut (dyn ReadSeek + Send),
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        sink: &mut dyn DecodeSink,
+        mon: &dyn Monitor,
+    ) -> Result<DecodeStamp, EngineError> {
+        let d = self.recorded_decoder(id, format)?;
+        decode_stream_one(
+            d,
+            &mut StreamInput::Reader(src),
+            format,
+            opts,
+            limits,
+            sink,
+            mon,
+        )
+    }
+
+    /// 記録した識別子のデコーダでファイルを流して読む。
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_stream_with_path(
+        &self,
+        id: &str,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        sink: &mut dyn DecodeSink,
+        mon: &dyn Monitor,
+    ) -> Result<DecodeStamp, EngineError> {
+        let d = self.recorded_decoder(id, format)?;
+        decode_stream_one(
+            d,
+            &mut StreamInput::Path(path),
+            format,
+            opts,
+            limits,
+            sink,
+            mon,
+        )
+    }
+
+    fn decode_stream_any(
+        &self,
+        input: &mut StreamInput<'_>,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        sink: &mut dyn DecodeSink,
+        mon: &dyn Monitor,
+    ) -> Result<DecodeStamp, EngineError> {
+        let mut last = EngineError::Unsupported(format!("{format} を読めません"));
+        for d in self.decoders_for(format) {
+            match decode_stream_one(d, input, format, opts, limits, sink, mon) {
+                Err(e @ EngineError::Unsupported(_)) => last = e,
+                other => return other,
+            }
+        }
+        Err(last)
+    }
+
     /// 書いて、バイト列と記録を返す。書き手は段の順で最初にこの形を書けるもの（[`CodecSet::encoder`]）。設定は正規の
     /// JSON に直してから、エンコーダの記述で厳しく確かめる（知らないキー・型の違い・範囲の外はエラー。黙って既定に落とさない）。
     pub fn encode_bytes(
@@ -885,6 +1064,119 @@ fn decode_one(
             env: d.env(),
         },
     ))
+}
+
+/// 流して読む元（読み口か、ファイルのパス）。
+enum StreamInput<'a> {
+    Reader(&'a mut (dyn ReadSeek + Send)),
+    Path(&'a Path),
+}
+
+impl StreamInput<'_> {
+    fn shape(
+        &mut self,
+        d: &dyn Decoder,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Shape, EngineError> {
+        match self {
+            StreamInput::Reader(src) => {
+                src.rewind()?;
+                d.shape_monitored(&mut **src, format, opts, limits, mon)
+            }
+            StreamInput::Path(path) => d.shape_file_monitored(path, format, opts, limits, mon),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode(
+        &mut self,
+        d: &dyn Decoder,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        match self {
+            StreamInput::Reader(src) => {
+                src.rewind()?;
+                d.decode_stream(&mut **src, format, opts, limits, shape, out, mon)
+            }
+            StreamInput::Path(path) => {
+                d.decode_stream_file(path, format, opts, limits, shape, out, mon)
+            }
+        }
+    }
+}
+
+/// 1 つのデコーダで流して読む：形を上限で確かめてから、標本を窓にまとめて `sink` へ流しながらダイジェストを取り、ヘッダと
+/// 中身が合うか確かめる（[`decode_one`] の流れの版）。見込みの長さが外れたら、同じデコーダでダイジェストだけをもう 1 度読む。
+fn decode_stream_one(
+    d: &Arc<dyn Decoder>,
+    input: &mut StreamInput<'_>,
+    format: &str,
+    opts: &DecodeOptions,
+    limits: &Limits,
+    sink: &mut dyn DecodeSink,
+    mon: &dyn Monitor,
+) -> Result<DecodeStamp, EngineError> {
+    let shape = contain(d.id(), Stage::Decode, || {
+        input.shape(d.as_ref(), format, opts, limits, mon)
+    })?;
+    limits.check(&shape).map_err(EngineError::Limit)?;
+    let mut out = DecodeOut::stream(sink, DigestMode::Expect, mon);
+    contain(d.id(), Stage::Decode, || {
+        input.decode(d.as_ref(), format, opts, limits, &shape, &mut out, mon)
+    })?;
+    let mismatch = || EngineError::Decode {
+        codec: d.id().to_string(),
+        message: "ヘッダと中身の大きさが合いません".into(),
+    };
+    let (Some(end), Some(info)) = (out.stream_end().cloned(), out.info()) else {
+        return Err(EngineError::Internal(format!(
+            "{} が流れを読み終えませんでした",
+            d.id()
+        )));
+    };
+    let got = Shape::Audio {
+        rate: info.rate,
+        channels: u16::try_from(info.channels).map_err(|_| mismatch())?,
+        frames: Dim::Exact(end.frames),
+    };
+    if !shape.admits(&got) {
+        return Err(mismatch());
+    }
+    let value_digest = match out.digest()? {
+        Some(dg) => dg,
+        None => {
+            // 見込みの長さが外れた：同じデコーダで、実際の長さでダイジェストだけを取り直す（呼び手の sink には流さない）
+            let mut null = NullSink;
+            let mut again = DecodeOut::stream(&mut null, DigestMode::Frames(end.frames), mon);
+            contain(d.id(), Stage::Decode, || {
+                input.decode(d.as_ref(), format, opts, limits, &shape, &mut again, mon)
+            })?;
+            if again.stream_end().map(|e| e.frames) != Some(end.frames) {
+                return Err(EngineError::Decode {
+                    codec: d.id().to_string(),
+                    message: "読み直した長さが 1 度目と違います".into(),
+                });
+            }
+            again
+                .digest()?
+                .ok_or_else(|| EngineError::Internal("読み直したダイジェストを取れません".into()))?
+        }
+    };
+    Ok(DecodeStamp {
+        codec: d.id().to_string(),
+        tier: d.tier(),
+        reproducible: d.reproducible(),
+        value_digest,
+        env: d.env(),
+    })
 }
 
 /// 外から来た大きさで確保するときの補助（足りなければ落ちずにエラー）。

@@ -23,6 +23,7 @@ use serde_json::json;
 
 use crate::audio::source::{Opener, PcmFileSource};
 use crate::codec::pcm::{self, PcmLayout, SampleEncoding, quantize};
+use crate::codec::stream::{self, DecodeInfo, DecodeOut};
 use crate::codec::{Decoder, Encoder, MetaCaps, OpenedSource, ReadSeek, Tier, caps_of, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -30,7 +31,7 @@ use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::op::{ParamKind, ParamSchema, Unit, spec};
 use crate::shape::{Dim, Shape};
-use crate::value::{Audio, AudioBuilder, AudioMeta, AudioSource, LoopRange, Marker, Value};
+use crate::value::{Audio, AudioMeta, AudioSource, LoopRange, Marker, Value};
 
 /// AIFF の読み書き。
 pub struct AiffCodec;
@@ -514,44 +515,81 @@ impl Decoder for AiffCodec {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
-        let h = parse(src, limits)?;
-        let sample = usize::from(h.layout.bytes());
-        let block = usize::from(h.channels) * sample;
-        let frames = h.data_len / block as u64;
-        limits
-            .check(&Shape::Audio {
-                rate: h.rate,
-                channels: h.channels,
-                frames: Dim::Exact(frames),
-            })
-            .map_err(EngineError::Limit)?;
-        let frames =
-            usize::try_from(frames).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-        let ch = usize::from(h.channels);
-        let layout = h.pcm_layout();
-        let mut out = AudioBuilder::new(h.rate, ch, frames as u64)?;
-        src.seek(SeekFrom::Start(h.data_offset))?;
-        let chunk_frames = 16_384usize;
-        let mut buf = try_vec(chunk_frames * block, 0u8)?;
-        let mut planes: Vec<Vec<f32>> = (0..ch)
-            .map(|_| try_vec(chunk_frames.min(frames), 0f32))
-            .collect::<Result<_, _>>()?;
-        let mut done = 0usize;
-        while done < frames {
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            let n = (frames - done).min(chunk_frames);
-            let bytes = &mut buf[..n * block];
-            read_exact_or(src, bytes, "SSND")?;
-            // 標本の変換は音声の源（open_source）と同じ関数を通る
-            layout.decode_frames(bytes, &mut planes)?;
-            let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
-            out.push_frames(&views)?;
-            done += n;
-        }
-        Ok(Value::Audio(Arc::new(out.finish(h.meta)?)))
+        stream::collect(mon, |out| decode_into(src, limits, out, mon))
     }
+
+    fn streams(&self, _format: &str) -> bool {
+        true
+    }
+
+    /// 読みの塊（16,384 フレーム）のバイト列と平面の分。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _len: u64) -> u64 {
+        crate::codec::wav::stream_read_bytes(shape)
+    }
+
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        _shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        decode_into(src, limits, out, mon)
+    }
+}
+
+/// SSND を 16,384 フレームずつ順に読んで `out` に渡す（`decode`・`decode_stream` が通る。値は源（`open_source`）とも同じ）。
+fn decode_into(
+    src: &mut dyn ReadSeek,
+    limits: &Limits,
+    out: &mut DecodeOut<'_>,
+    mon: &dyn Monitor,
+) -> Result<(), EngineError> {
+    let h = parse(src, limits)?;
+    let sample = usize::from(h.layout.bytes());
+    let block = usize::from(h.channels) * sample;
+    let frames = h.data_len / block as u64;
+    limits
+        .check(&Shape::Audio {
+            rate: h.rate,
+            channels: h.channels,
+            frames: Dim::Exact(frames),
+        })
+        .map_err(EngineError::Limit)?;
+    let frames =
+        usize::try_from(frames).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+    let ch = usize::from(h.channels);
+    let layout = h.pcm_layout();
+    out.begin(DecodeInfo {
+        rate: h.rate,
+        channels: ch,
+        frames: Dim::Exact(frames as u64),
+        expect: frames as u64,
+    })?;
+    src.seek(SeekFrom::Start(h.data_offset))?;
+    let chunk_frames = 16_384usize;
+    let mut buf = try_vec(chunk_frames * block, 0u8)?;
+    let mut planes: Vec<Vec<f32>> = (0..ch)
+        .map(|_| try_vec(chunk_frames.min(frames), 0f32))
+        .collect::<Result<_, _>>()?;
+    let mut done = 0usize;
+    while done < frames {
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
+        let n = (frames - done).min(chunk_frames);
+        let bytes = &mut buf[..n * block];
+        read_exact_or(src, bytes, "SSND")?;
+        // 標本の変換は音声の源（open_source）と同じ関数を通る
+        layout.decode_frames(bytes, &mut planes)?;
+        let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+        out.push_frames(&views)?;
+        done += n;
+    }
+    out.end(h.meta)
 }
 
 /// pstring（長さ 1 バイト＋本文、全体を偶数に詰める）。255 バイトを超える名前は文字の境目で切る。

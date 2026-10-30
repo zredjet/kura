@@ -236,3 +236,31 @@ fn finish_one(
         output,
     })
 }
+
+impl crate::codec::stream::DecodeSink for AnalysisFan {
+    /// デコーダが読み始めた形で流れを作り直す（前の試みで受けたものは捨てる）。
+    fn begin(&mut self, info: &crate::codec::stream::DecodeInfo) -> Result<(), EngineError> {
+        let channels = u16::try_from(info.channels)
+            .map_err(|_| EngineError::Limit("チャンネルが多すぎます".into()))?;
+        self.restart(&Shape::Audio {
+            rate: info.rate,
+            channels,
+            frames: info.frames,
+        });
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        AnalysisFan::feed(self, start, planes, mon)
+    }
+
+    fn end(&mut self, end: &StreamEnd) -> Result<(), EngineError> {
+        self.set_end(end);
+        Ok(())
+    }
+}
