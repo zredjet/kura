@@ -27,6 +27,8 @@ use kura_engine::render::preview::MAX_LEVEL;
 
 use crate::edit::editor::is_session_id;
 use crate::import::{MediaKind, classify, format_id, mime_for};
+use kura_engine::analysis::audio::peaks::PEAK_BINS;
+
 use crate::library::{ANIM_V, Layout, ThumbFormat, ThumbSize};
 
 /// 1 回の応答で返す最大の大きさ（Range のとき）。
@@ -92,6 +94,14 @@ pub enum Route {
         start: u64,
         end: u64,
     },
+    /// 音声のエディタの波形の段のタイル：公開した rev の段 `bin`（1 ビンのフレーム数）のタイル `tile`（1,024 ビンずつ）。
+    /// (セッション, rev, 段, タイル) の中身は変わらない。
+    EditPeaks {
+        session: String,
+        rev: u64,
+        bin: u32,
+        tile: u32,
+    },
 }
 
 /// 中身が変わらないものの `Cache-Control`。
@@ -109,6 +119,7 @@ impl Route {
                 | Self::Anim { .. }
                 | Self::Wave { .. }
                 | Self::Edit { .. }
+                | Self::EditPeaks { .. }
         )
     }
 
@@ -120,7 +131,8 @@ impl Route {
             | Self::Peaks { .. }
             | Self::Anim { .. }
             | Self::Wave { .. }
-            | Self::Edit { .. } => Some(IMMUTABLE),
+            | Self::Edit { .. }
+            | Self::EditPeaks { .. } => Some(IMMUTABLE),
             Self::Pcm { .. } | Self::EditPcm { .. } | Self::EditInputPcm { .. } => Some("no-store"),
             Self::File { .. } | Self::Play { .. } => None,
         }
@@ -184,6 +196,21 @@ fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
     }
     let rev = parse_decimal(second)?;
     let third = parts.next()?;
+    if third == "peaks" {
+        let bin = u32::try_from(parse_decimal(parts.next()?)?)
+            .ok()
+            .filter(|b| PEAK_BINS.contains(b))?;
+        let tile = u32::try_from(parse_decimal(parts.next()?)?).ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some(Route::EditPeaks {
+            session,
+            rev,
+            bin,
+            tile,
+        });
+    }
     if third == "pcm" {
         let span = parts.next()?;
         if parts.next().is_some() {
@@ -262,7 +289,8 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
         | Route::Wave { .. }
         | Route::Edit { .. }
         | Route::EditPcm { .. }
-        | Route::EditInputPcm { .. } => {
+        | Route::EditInputPcm { .. }
+        | Route::EditPeaks { .. } => {
             return None;
         }
         Route::Play { hash } => {
@@ -505,6 +533,7 @@ mod tests {
             ("/edit/0af/3/0/0/1/2".to_string(), immutable),
             ("/edit/0af/3/pcm/0-65536".to_string(), Some("no-store")),
             ("/edit/0af/input/pcm/5-9".to_string(), Some("no-store")),
+            ("/edit/0af/3/peaks/256/0".to_string(), immutable),
         ] {
             let route = parse_route(&path).unwrap();
             assert_eq!(route.cache_control(), expected, "{path}");
@@ -596,6 +625,24 @@ mod tests {
             "/edit/3fa9c0de/input/pcm/0-5/x",
             "/edit/3fa9c0de/input/3/pcm/0-5",
             "/edit/3fa9c0de/x/pcm/0-5",
+        ] {
+            assert_eq!(parse_route(bad), None, "{bad}");
+        }
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/7/peaks/65536/12"),
+            Some(Route::EditPeaks {
+                session: "3fa9c0de".into(),
+                rev: 7,
+                bin: 65_536,
+                tile: 12
+            })
+        );
+        for bad in [
+            "/edit/3fa9c0de/7/peaks/512/0",
+            "/edit/3fa9c0de/7/peaks/256",
+            "/edit/3fa9c0de/7/peaks/256/0/1",
+            "/edit/3fa9c0de/7/peaks/256/4294967296",
+            "/edit/3fa9c0de/input/peaks/256/0",
         ] {
             assert_eq!(parse_route(bad), None, "{bad}");
         }

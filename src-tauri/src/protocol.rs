@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use kura_core::asset::{pcm, wave};
 use kura_core::edit::EngineServices;
+use kura_core::edit::editor::audio::peaks as edit_audio_peaks;
 use kura_core::edit::editor::audio::serve as edit_audio;
 use kura_core::edit::editor::{TileFormat, TileRequest, tile};
 use kura_core::library::Layout;
@@ -172,6 +173,31 @@ fn answer(
         };
         let body = edit_audio::serve_pcm(engine, session, *rev, *start, *end);
         return pcm_body_response(body, route.cache_control(), head);
+    }
+    if let Route::EditPeaks {
+        session,
+        rev,
+        bin,
+        tile,
+    } = &route
+    {
+        let Some(engine) = served.engine else {
+            return empty(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        return match edit_audio_peaks::serve_peaks(engine, session, *rev, *bin, *tile) {
+            Ok(body) => bytes_response(
+                body,
+                "application/octet-stream",
+                route.cache_control(),
+                head,
+            ),
+            Err(err) => {
+                tracing::debug!(%err, "kura:// のエディタの波形の段を返せません");
+                empty(
+                    StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                )
+            }
+        };
     }
     if let Route::EditInputPcm {
         session,
@@ -1124,6 +1150,28 @@ mod tests {
             assert_eq!(header_of(&r, "cache-control").as_deref(), Some("no-store"));
             assert_eq!(&r.body()[..4], b"RIFF");
             assert_decorated(&r, &origin, &path);
+        }
+        // 波形の段のタイル（immutable）
+        let peaks = get(&with, format!("/edit/{s}/{rev}/peaks/256/0"));
+        assert_eq!(peaks.status(), StatusCode::OK);
+        assert_eq!(&peaks.body()[..4], b"kpt1");
+        assert_eq!(
+            header_of(&peaks, "content-type").as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(header_of(&peaks, "cache-control").as_deref(), IMMUTABLE);
+        assert_decorated(&peaks, &origin, "peaks");
+        for (path, status) in [
+            (
+                format!("/edit/{s}/{rev}/peaks/256/9"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                format!("/edit/{s}/{}/peaks/256/0", rev + 1),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            assert_eq!(get(&with, path.clone()).status(), status, "{path}");
         }
         let head = reply(
             Some(&with),

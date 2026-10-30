@@ -13,6 +13,7 @@
 //!
 //! DTO はほかの班の dto.rs の変更とぶつからないよう、このファイルに置く（名前は `Edit` で始める）。
 
+use kura_core::edit::editor::audio::peaks::PeaksInfo;
 use kura_core::edit::editor::{
     self, AudioSourceInfo, AudioViewInfo, AudioViewport, ChangedSpans, ChangedTiles, DocDelta,
     DraftInfo, EditorEnv, EditorError, FrameInfo, ImageViewInfo, ImageViewport, NodeSummary,
@@ -337,14 +338,15 @@ impl From<ChangedTiles> for EditChangedDto {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum EditViewDto {
     Image(EditImageViewDto),
-    Audio(EditAudioViewDto),
+    /// 音声（箱に入れる：画像の結果より大きい）。
+    Audio(Box<EditAudioViewDto>),
 }
 
 impl From<ViewInfo> for EditViewDto {
     fn from(v: ViewInfo) -> Self {
         match v {
             ViewInfo::Image(v) => Self::Image(v.into()),
-            ViewInfo::Audio(v) => Self::Audio(v.into()),
+            ViewInfo::Audio(v) => Self::Audio(Box::new((*v).into())),
         }
     }
 }
@@ -374,6 +376,41 @@ fn span((start, end): (u64, u64)) -> EditSpanDto {
     EditSpanDto { start, end }
 }
 
+/// 波形の段の状態（`/edit/{session}/{rev}/peaks/{bin}/{tile}` の `rev` は `rev`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditPeaksInfoDto {
+    /// 公開した今の段の rev（なければ null）。今の文書の rev より古いことがある（そのときは `pending`）。
+    pub rev: Option<u64>,
+    /// その段のレート・チャンネル数・長さ。
+    pub rate: u32,
+    pub channels: u16,
+    pub frames: u64,
+    /// 段のビンのフレーム数（細かい順）。
+    pub bins: Vec<u32>,
+    /// タイル 1 枚のビンの数（1,024）。
+    pub tile_bins: u32,
+    /// 前に返した段から変わった区間（この区間に掛かるタイルを取り直す）。
+    pub changed: EditSpansChangeDto,
+    /// 直している途中（古い段を出している。手が止まったら `work: true` で頼み直す）。
+    pub pending: bool,
+}
+
+impl From<PeaksInfo> for EditPeaksInfoDto {
+    fn from(p: PeaksInfo) -> Self {
+        Self {
+            rev: p.rev,
+            rate: p.rate,
+            channels: p.channels,
+            frames: p.frames,
+            bins: p.bins,
+            tile_bins: p.tile_bins,
+            changed: p.changed.into(),
+            pending: p.pending,
+        }
+    }
+}
+
 /// マーカー（出力のフレームの位置と名前）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
 pub struct EditMarkerDto {
@@ -401,6 +438,8 @@ pub struct EditAudioViewDto {
     pub meta_changed: bool,
     /// 公開した表示の値の有効な区間（PCM を取れる所）。
     pub valid: Vec<EditSpanDto>,
+    /// 波形の段の状態。
+    pub peaks: EditPeaksInfoDto,
     /// 裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。
     pub work: bool,
     pub warnings: Vec<Issue>,
@@ -426,6 +465,7 @@ impl From<AudioViewInfo> for EditAudioViewDto {
             changed: v.changed.into(),
             meta_changed: v.meta_changed,
             valid: v.valid.into_iter().map(span).collect(),
+            peaks: v.peaks.into(),
             work: v.work,
             warnings: v.warnings,
             drawn_nodes: v.drawn_nodes,
@@ -1119,22 +1159,34 @@ mod tests {
             json!({ "type": "superseded" })
         );
         // 音声の表示
-        let audio = EditViewOutcomeDto::from(ViewOutcome::Shown(ViewInfo::Audio(AudioViewInfo {
-            rev: 4,
-            rate: 48_000,
-            channels: 2,
-            frames: 96_000,
-            loop_range: Some((10, 90_000)),
-            markers: vec![(5, "a".into())],
-            samples_id: "0123456789abcdef".into(),
-            changed: ChangedSpans::Spans(vec![(0, 65_536)]),
-            meta_changed: false,
-            valid: vec![(0, 96_000)],
-            work: true,
-            warnings: Vec::new(),
-            drawn_nodes: 1,
-            ms: 2.0,
-        })));
+        let audio = EditViewOutcomeDto::from(ViewOutcome::Shown(ViewInfo::Audio(Box::new(
+            AudioViewInfo {
+                rev: 4,
+                rate: 48_000,
+                channels: 2,
+                frames: 96_000,
+                loop_range: Some((10, 90_000)),
+                markers: vec![(5, "a".into())],
+                samples_id: "0123456789abcdef".into(),
+                changed: ChangedSpans::Spans(vec![(0, 65_536)]),
+                meta_changed: false,
+                valid: vec![(0, 96_000)],
+                peaks: PeaksInfo {
+                    rev: Some(3),
+                    rate: 48_000,
+                    channels: 2,
+                    frames: 96_000,
+                    bins: vec![256, 1_024],
+                    tile_bins: 1_024,
+                    changed: ChangedSpans::All,
+                    pending: true,
+                },
+                work: true,
+                warnings: Vec::new(),
+                drawn_nodes: 1,
+                ms: 2.0,
+            },
+        ))));
         let json = serde_json::to_value(audio).unwrap();
         assert_eq!(json["view"]["type"], json!("audio"));
         assert_eq!(json["view"]["loop"], json!({ "start": 10, "end": 90000 }));
@@ -1146,6 +1198,8 @@ mod tests {
         assert_eq!(json["view"]["markers"], json!([{ "pos": 5, "name": "a" }]));
         assert_eq!(json["view"]["valid"], json!([{ "start": 0, "end": 96000 }]));
         assert_eq!(json["view"]["work"], json!(true));
+        assert_eq!(json["view"]["peaks"]["tileBins"], json!(1024));
+        assert_eq!(json["view"]["peaks"]["changed"], json!({ "type": "all" }));
         let source = EditSourceDto::from(SourceInfo {
             kind: "audio",
             width: 0,

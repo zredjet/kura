@@ -821,6 +821,8 @@ export type EditAudioViewDto = {
 	metaChanged: boolean,
 	/**  公開した表示の値の有効な区間（PCM を取れる所）。 */
 	valid: EditSpanDto[],
+	/**  波形の段の状態。 */
+	peaks: EditPeaksInfoDto,
 	/**  裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。 */
 	work: boolean,
 	warnings: Issue[],
@@ -995,6 +997,24 @@ export type EditOpenedDto_Serialize = {
 	draft: EditDraftDto,
 	/**  開いたときの状態・文書（全体）・表示。 */
 	result: EditStepResultDto_Serialize,
+};
+
+/**  波形の段の状態（`/edit/{session}/{rev}/peaks/{bin}/{tile}` の `rev` は `rev`）。 */
+export type EditPeaksInfoDto = {
+	/**  公開した今の段の rev（なければ null）。今の文書の rev より古いことがある（そのときは `pending`）。 */
+	rev: number | null,
+	/**  その段のレート・チャンネル数・長さ。 */
+	rate: number,
+	channels: number,
+	frames: number,
+	/**  段のビンのフレーム数（細かい順）。 */
+	bins: number[],
+	/**  タイル 1 枚のビンの数（1,024）。 */
+	tileBins: number,
+	/**  前に返した段から変わった区間（この区間に掛かるタイルを取り直す）。 */
+	changed: EditSpansChangeDto,
+	/**  直している途中（古い段を出している。手が止まったら `work: true` で頼み直す）。 */
+	pending: boolean,
 };
 
 /**  断り・失敗（指摘はノード・引数つき）。 */
@@ -1179,7 +1199,9 @@ export type EditVersionDto = {
 /**  表示した結果：種類ごとの和（`type` で分ける）。 */
 export type EditViewDto = {
 	type: "image",
-} & EditImageViewDto | {
+} & EditImageViewDto | 
+/**  音声（箱に入れる：画像の結果より大きい）。 */
+{
 	type: "audio",
 } & EditAudioViewDto;
 

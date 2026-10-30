@@ -428,6 +428,9 @@ struct Published {
     before: Option<Shown>,
     /// 音声の元（文書の入力の値と、読んだデコーダの識別子。`/edit/{s}/input/pcm` が読む）。
     input: Option<(kura_engine::Value, String)>,
+    /// 公開した今と直前の波形の段（rev と段。`/edit/{s}/{rev}/peaks/…` が読む）。
+    peaks_now: Option<(u64, Arc<kura_engine::analysis::audio::peaks::Peaks>)>,
+    peaks_before: Option<(u64, Arc<kura_engine::analysis::audio::peaks::Peaks>)>,
 }
 
 /// 開いているエディタの状態（`Editor::state` の錠の中）。
@@ -598,6 +601,26 @@ impl Editor {
             view,
             samples_id: Some(samples_id),
         });
+    }
+
+    /// 波形の段を公開する（今のものは直前になる）。
+    fn publish_peaks(&self, rev: u64, peaks: Arc<kura_engine::analysis::audio::peaks::Peaks>) {
+        let mut p = self.lock_published();
+        p.peaks_before = p.peaks_now.take();
+        p.peaks_now = Some((rev, peaks));
+    }
+
+    /// 公開した今か直前の波形の段のうち、rev が同じもの（配信用。なければ None）。
+    pub fn published_peaks(
+        &self,
+        rev: u64,
+    ) -> Option<Arc<kura_engine::analysis::audio::peaks::Peaks>> {
+        let p = self.lock_published();
+        [p.peaks_now.as_ref(), p.peaks_before.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|(r, _)| *r == rev)
+            .map(|(_, peaks)| peaks.clone())
     }
 
     /// 音声の元（文書の入力の値と、読んだデコーダの識別子。配信用。音声でなければ None）。
@@ -1484,6 +1507,8 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             from_draft: info.opened,
             audio: head.kind == MediaKind::Audio,
             facts,
+            peaks_path: (head.kind == MediaKind::Audio)
+                .then(|| layout.peaks_path(&crate::library::hex(&original.hash))),
         },
         &req.viewport,
     );
@@ -1524,6 +1549,8 @@ struct OpenParts {
     audio: bool,
     /// 元の中身の事実の行の読み取りの記録（音声だけ）。
     facts: Option<audio::source::FactsStamp>,
+    /// ライブラリの解析の波形の段のファイル（音声だけ）。
+    peaks_path: Option<std::path::PathBuf>,
 }
 
 /// 元を読み、状態を作って最初の表示を描く。
@@ -1539,7 +1566,7 @@ fn finish_open(
     let shape = read.input.value.shape();
     let source_info = source_info(&shape, read.input.value.clone(), read.audio.as_ref());
     let input = read.input;
-    let audio_state = read.audio.map(|input| audio::AudioState { input });
+    let audio_info = read.audio;
     let inputs = BTreeMap::from([(InputId(0), input)]);
     let shapes = BTreeMap::from([(InputId(0), shape)]);
     let (session, plan) = runtime.preview(|e| {
@@ -1563,6 +1590,13 @@ fn finish_open(
     })?;
     let rev = session.rev();
     let reported = (session.current().clone(), rev);
+    let audio_state = audio_info.map(|info| {
+        let base = audio_base(editor, &parts, &info, &plan, &shapes, &inputs);
+        audio::AudioState {
+            input: info,
+            peaks: audio::peaks::PeaksJob::new(base, rev.0),
+        }
+    });
     // 閉じる・ほかを開くのと競らないよう、錠の中で中止を確かめてから取り置き・確保を立てる
     let mut guard = editor.lock_state();
     if editor.cancel.canceled() {
@@ -1609,6 +1643,9 @@ fn finish_open(
     };
     if let (Some(a), Some(input)) = (&st.audio, st.inputs.get(&InputId(0))) {
         editor.lock_published().input = Some((input.value.clone(), a.input.decoder.clone()));
+        if let Some(base) = a.peaks.base() {
+            editor.publish_peaks(rev.0, base);
+        }
     }
     let ticket = editor.latest.issue(editor.cancel.clone());
     let view = editor.render(&mut st, vp, &ticket);
@@ -1634,6 +1671,38 @@ fn finish_open(
             notices: read.warnings,
         },
     ))
+}
+
+/// 波形の段の土台（ライブラリの解析の段）：頭が元（版 0）・入力の記録の値のダイジェストが事実の行と同じ・出力に量子化が
+/// ない、をすべて満たせば、段のファイルと、空の文書から今の文書までに変わった区間（`Engine::delta`）。ほかは None。
+fn audio_base(
+    editor: &Editor,
+    parts: &OpenParts,
+    info: &audio::source::InputInfo,
+    plan: &Plan,
+    shapes: &BTreeMap<InputId, Shape>,
+    inputs: &BTreeMap<InputId, FingerprintedInput>,
+) -> Option<(
+    Arc<kura_engine::analysis::audio::peaks::Peaks>,
+    audio::peaks::Dirty,
+)> {
+    let facts = parts.facts.as_ref()?;
+    let decoded = info.decoded.as_ref()?;
+    if parts.base.version != 0 || decoded.value_digest.0 != facts.value_digest {
+        return None;
+    }
+    let path = parts.peaks_path.as_ref()?;
+    let peaks = audio::peaks::read_base(path, info.rate, info.channels, info.frames)?;
+    let empty = Graph::new_single();
+    let dirty = editor
+        .runtime
+        .preview(|e| {
+            let p0 = e.compile(&empty, shapes).ok()?;
+            let delta = e.delta(&p0, inputs, plan, inputs).ok()?;
+            delta.outputs.into_iter().find(|(o, _)| *o == parts.output)
+        })
+        .map(|(_, area)| audio::peaks::Dirty::of_area(&area))?;
+    Some((peaks, dirty))
 }
 
 /// 読んだ入力（音声なら元の要約も）。

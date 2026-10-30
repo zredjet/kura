@@ -329,7 +329,8 @@ pub enum ChangedTiles {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewInfo {
     Image(ImageViewInfo),
-    Audio(super::audio::AudioViewInfo),
+    /// 音声（箱に入れる：画像の情報より大きい）。
+    Audio(Box<super::audio::AudioViewInfo>),
 }
 
 impl ViewInfo {

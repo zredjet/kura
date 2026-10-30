@@ -10,6 +10,9 @@
 //! - **予算**：公開した今と直前の表示の値（`resident_bytes`）を、エディタの確保の `extra` で数える（画像は数えない。
 //!   docs/editing.md §12.10）。
 
+pub mod peaks;
+#[cfg(test)]
+mod peaks_tests;
 pub mod serve;
 #[cfg(test)]
 mod serve_tests;
@@ -78,6 +81,8 @@ pub struct AudioViewInfo {
     pub meta_changed: bool,
     /// 公開した表示の値の有効な区間（`/edit/{s}/{rev}/pcm` で取れる所。チャンクに揃う）。
     pub valid: Vec<(u64, u64)>,
+    /// 波形の段の状態（`/edit/{s}/{peaks.rev}/peaks/{bin}/{tile}` で取る）。
+    pub peaks: peaks::PeaksInfo,
     /// 裏の仕事が残っている（フロントは手が止まったら `work: true` で頼み直す）。
     pub work: bool,
     /// 描いたノード・当たったノードの警告。
@@ -91,6 +96,8 @@ pub struct AudioViewInfo {
 pub(crate) struct AudioState {
     /// 元（文書の入力）の読み方。
     pub(crate) input: source::InputInfo,
+    /// 波形の段の仕事。
+    pub(crate) peaks: peaks::PeaksJob,
 }
 
 /// 音声の出力の形の (rate, channels, frames)。長さの分からないものは None。
@@ -237,7 +244,7 @@ impl Editor {
         }
         let req = ViewRequest {
             output: st.output,
-            area,
+            area: area.clone(),
             focus: avp.focus,
         };
         let (inputs, cache, prev) = (&st.inputs, &mut st.cache, st.view.as_ref());
@@ -277,8 +284,24 @@ impl Editor {
             Err(e) => return failed(e),
         };
         let rev = st.session.rev().0;
-        let value = vr.view.value();
+        let value = vr.view.value().clone();
         let meta = value.audio_meta().cloned().unwrap_or_default();
+        let changed = ChangedSpans::of(&vr.changed);
+        self.publish_audio(rev, vr.view.clone(), id.clone());
+        st.view = Some(vr.view.clone());
+        if let Some(a) = st.audio.as_mut() {
+            a.peaks.note(rev, (rate, channels, frames), &changed);
+        }
+        self.advance_peaks(st, rev, &value, &area, &avp, ticket);
+        self.count_resident(st);
+        let (peaks, work) = match st.audio.as_mut() {
+            Some(a) => {
+                let info = a.peaks.report();
+                let work = info.pending;
+                (info, work)
+            }
+            None => return failed(EditorError::Failed("音声の状態がありません".into())),
+        };
         let info = AudioViewInfo {
             rev,
             rate,
@@ -291,31 +314,43 @@ impl Editor {
                 .map(|m| (m.pos, m.name.clone()))
                 .collect(),
             samples_id: id.clone(),
-            changed: ChangedSpans::of(&vr.changed),
+            changed,
             meta_changed: vr.meta_changed,
-            valid: valid_runs(value, frames),
-            work: false,
+            valid: valid_runs(&value, frames),
+            peaks,
+            work,
             warnings: vr.warnings.clone(),
             drawn_nodes: vr.drawn_nodes(),
             ms: started.elapsed().as_secs_f64() * 1000.0,
         };
-        self.publish_audio(rev, vr.view.clone(), id);
-        st.view = Some(vr.view);
-        self.count_resident(st);
-        Ok(ViewOutcome::Shown(ViewInfo::Audio(info)))
+        Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
     }
 
-    /// 持ち続ける表示の値（公開した今と直前）を、エディタの確保の `extra` に入れる（音声だけ）。
+    /// 持ち続ける表示の値（公開した今と直前）・波形の段（公開した 2 つと組んでいる途中のもの）を、エディタの確保の `extra`
+    /// に入れる（音声だけ）。
     pub(super) fn count_resident(&self, st: &mut State) {
+        let peak_bytes = |p: &kura_engine::analysis::audio::peaks::Peaks| {
+            p.levels
+                .iter()
+                .map(|l| (l.data.len() as u64).saturating_mul(2))
+                .fold(0u64, u64::saturating_add)
+        };
         let bytes = {
             let p = self.lock_published();
-            [p.now.as_ref(), p.before.as_ref()]
+            let views = [p.now.as_ref(), p.before.as_ref()]
                 .into_iter()
                 .flatten()
                 .map(|s| s.view.value().resident_bytes())
-                .fold(0u64, u64::saturating_add)
+                .fold(0u64, u64::saturating_add);
+            let peaks = [p.peaks_now.as_ref(), p.peaks_before.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|(_, p)| peak_bytes(p))
+                .fold(0u64, u64::saturating_add);
+            views.saturating_add(peaks)
         };
-        st.lease.set_extra(bytes);
+        let run = st.audio.as_ref().map_or(0, |a| a.peaks.run_bytes());
+        st.lease.set_extra(bytes.saturating_add(run));
         settle(st);
     }
 }

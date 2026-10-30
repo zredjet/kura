@@ -552,8 +552,13 @@ fn long_audio_steps_hold_only_the_spans() {
     let editor = env.editor(&s);
     let guard = editor.lock_state();
     let st = guard.as_ref().unwrap();
-    // 今と直前の 2 つの表示の値 × 2 チャンク
-    assert!(st.lease.extra() <= 2 * 2 * C * 4, "{}", st.lease.extra());
+    // 今と直前の 2 つの表示の値 × 2 チャンク ＋ 波形の段（公開した 2 つと組んでいる 1 つ。上の段を含めて最も細かい段の 2 倍まで）
+    let peaks = frames.div_ceil(256) * 4 * 2;
+    assert!(
+        st.lease.extra() <= 2 * 2 * C * 4 + 3 * peaks,
+        "{}",
+        st.lease.extra()
+    );
     assert!(st.lease.extra() > 0);
     let Value::Audio(input) = &st.inputs[&InputId(0)].value else {
         panic!()
