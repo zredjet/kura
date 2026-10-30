@@ -77,6 +77,11 @@ export const commands = {
 	/**  パレットの番号（Indexed8）。 */
 	index: number | null,
 } | null, AppError>(__TAURI_INVOKE("edit_sample", { session, frame, x, y })),
+	/**
+	 *  音声のエディタ：今の rev の出力で、`frame` に最も近いゼロ交差（半径 `radius` フレーム。4,096 で切る）。描いている途中の表示を
+	 *  止めない（表示の外なら区間だけを描いて読む）。
+	 */
+	editSnap: (session: string, frame: number, radius: number) => typedError<EditSnapDto, AppError>(__TAURI_INVOKE("edit_snap", { session, frame, radius })),
 	/**  エディタを閉じる（キャッシュ・予算の取り置きを外す。待っている下書きは置く）。今のセッションでなければ何もしない。 */
 	editClose: (session: string) => typedError<null, AppError>(__TAURI_INVOKE("edit_close", { session })),
 	/**
@@ -1113,6 +1118,13 @@ export type EditSaveStartedDto_Serialize = {
 	status: EditStatusDto,
 	/**  出力の形式を変えたときの文書の差分。 */
 	doc: EditDocDeltaDto_Serialize,
+};
+
+/**  ゼロ交差に寄せた位置。 */
+export type EditSnapDto = {
+	/**  寄せた位置（見つからなければ頼んだ位置）。 */
+	frame: number,
+	found: boolean,
 };
 
 /**  元の形。 */

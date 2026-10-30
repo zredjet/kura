@@ -16,11 +16,14 @@ mod handles_tests;
 pub mod peaks;
 #[cfg(test)]
 mod peaks_tests;
+#[cfg(test)]
+mod query_tests;
 pub mod serve;
 #[cfg(test)]
 mod serve_tests;
 #[cfg(test)]
 mod session_tests;
+pub mod snap;
 pub(super) mod source;
 pub mod timeline;
 

@@ -1071,6 +1071,36 @@ pub async fn edit_sample(
     .await
 }
 
+/// ゼロ交差に寄せた位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+pub struct EditSnapDto {
+    /// 寄せた位置（見つからなければ頼んだ位置）。
+    pub frame: u64,
+    pub found: bool,
+}
+
+/// 音声のエディタ：今の rev の出力で、`frame` に最も近いゼロ交差（半径 `radius` フレーム。4,096 で切る）。描いている途中の表示を
+/// 止めない（表示の外なら区間だけを描いて読む）。
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_snap(
+    state: State<'_, AppState>,
+    session: String,
+    frame: u64,
+    radius: u32,
+) -> Result<EditSnapDto, AppError> {
+    let lib = state.session()?;
+    blocking(move || {
+        let env = EditorEnv::of(&lib)?;
+        let s = editor::audio::snap::snap(&env, &session, frame, radius)?;
+        Ok(EditSnapDto {
+            frame: s.frame,
+            found: s.found,
+        })
+    })
+    .await
+}
+
 /// エディタを閉じる（キャッシュ・予算の取り置きを外す。待っている下書きは置く）。今のセッションでなければ何もしない。
 #[tauri::command]
 #[specta::specta]
