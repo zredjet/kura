@@ -28,6 +28,7 @@ import { editPcmUrl, editPeaksUrl } from '../../../ipc/media';
 import { readPcmWav } from '../../../lib/asset/wav';
 import {
   alignSpan,
+  CHUNK,
   chunkOf,
   chunkSpan,
   covered,
@@ -77,6 +78,8 @@ const MAX_TILE_LOADS = 4;
 const MAX_PCM_LOADS = 4;
 /** ⌘+・⌘− の 1 回の倍率。 */
 export const ZOOM_STEP = 2;
+/** PCM の表に再生の先読みのために空けておくチャンクの数（再生位置から 2 つ・ループの始めから 2 つ）。 */
+const PLAYBACK_RESERVE_CHUNKS = 4;
 /** ビューポートの `spans` の数の上限（Rust の `MAX_VIEW_SPANS`）。 */
 const MAX_SPANS = 4;
 /** 出力の PCM の kura チャンクのデコーダの頭（Rust の `EDIT_DECODER_PREFIX`）。 */
@@ -620,17 +623,29 @@ export class WaveController {
 
   // ===== 読み込み =====
 
-  /** 1 列が 256 フレームより細かく、PCM で描くか。 */
+  /** 1 列が 256 フレームより細かく、見えているチャンクが PCM の表に収まるので PCM で描くか。 */
   private pcmMode(): boolean {
     const columns = Math.max(1, Math.round(this.inner().w * this.dpr));
-    return this.w.span / columns < PCM_BELOW;
+    return this.w.span / columns < PCM_BELOW && this.pcmFits();
+  }
+
+  /**
+   * 見えているチャンク（と再生の先読みの分）が PCM の表の上限に収まるか。収まらなければ（多チャンネルを広い画面で深く
+   * 拡大した）、追い出しと取り直しが止まらなくなるので段で描く。
+   */
+  private pcmFits(): boolean {
+    const first = chunkOf(this.w.start);
+    const last = chunkOf(Math.max(this.w.start, this.w.start + this.w.span - 1));
+    const chunkBytes = CHUNK * Math.max(1, this.channels) * Float32Array.BYTES_PER_ELEMENT;
+    return (last - first + 1 + PLAYBACK_RESERVE_CHUNKS) * chunkBytes <= this.pcm.limit;
   }
 
   /** 選んだ段（PCM で描く・段がなければ null）と、試す順の段。 */
   private binsToTry(): { chosen: number | null; order: number[] } {
     const bins = this.peaks?.bins ?? [];
     const columns = Math.max(1, Math.round(this.inner().w * this.dpr));
-    const chosen = pickBin(bins, this.w.span, columns);
+    // PCM が表に収まらない拡大は、持っている最も細かい段で描く
+    const chosen = pickBin(bins, this.w.span, columns, this.pcmFits() ? PCM_BELOW : 0);
     const at = chosen === null ? 0 : Math.max(0, bins.indexOf(chosen));
     return { chosen, order: bins.slice(at) };
   }
@@ -882,7 +897,7 @@ export class WaveController {
         this.overviewCols,
         this.overviewHas,
       );
-    } else if (this.view && total > 0 && this.w.span / Math.max(1, columns) < PCM_BELOW) {
+    } else if (this.view && total > 0 && this.pcmMode()) {
       // 段がまだない短い音声の拡大：PCM で描く
       mode = 'pcm';
       fillPcmColumns(

@@ -195,6 +195,40 @@ describe('取れなかった PCM', () => {
   });
 });
 
+describe('PCM で描く拡大の上限', () => {
+  it('見えているチャンクが PCM の表の上限に収まらなければ（多チャンネル・広い画面）、PCM を取らずに段で描く', async () => {
+    for (const channels of [2, 16]) {
+      const clock = fakeClock();
+      const io = fakeFetch();
+      const c = new WaveController({ fetch: io.fetch, scheduler: clock.scheduler, now: clock.now });
+      c.resize(2560, 600, 2);
+      c.setSession(S);
+      const frames = 48_000 * 30;
+      c.setShape({ rate: 48_000, channels, frames });
+      c.applyView(
+        audioView({
+          frames,
+          channels,
+          valid: [{ start: 0, end: frames }],
+          peaks: { rev: 3, frames, channels },
+        }),
+      );
+      // 1 列 254 フレーム（5,120 列）・見えているのは 20 チャンク
+      c.setWindow({ start: 0, span: 1_300_000 }, true);
+      const pcmCalls = io.calls.filter((u) => u.includes('/pcm/'));
+      if (channels === 2) {
+        expect(c.viewport().spans).toEqual([{ start: 0, end: CHUNK * 20 }]);
+        expect(pcmCalls.length).toBeGreaterThan(0);
+        expect(c.scene().mode).toBe('pcm');
+      } else {
+        expect(c.viewport().spans).toEqual([]);
+        expect(pcmCalls).toEqual([]);
+        expect(c.scene().mode).toBe('peaks');
+      }
+    }
+  });
+});
+
 describe('止まってから頼み直す', () => {
   it('ズーム・パンが止まって 150 ms で今の区間を頼む（途中の操作で数え直す）', () => {
     const { c, clock, idle } = setup();

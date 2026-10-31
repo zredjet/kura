@@ -108,6 +108,11 @@ export class PcmChunkCache {
     return this.used;
   }
 
+  /** 持てる上限（バイト）。 */
+  get limit(): number {
+    return this.maxBytes;
+  }
+
   get size(): number {
     return this.entries.size;
   }
