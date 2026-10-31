@@ -636,18 +636,68 @@ mod tests {
         f.flush().unwrap();
     }
 
-    /// 解析の通し：ファイルを流して読み、解析のジョブと同じ要求（`stream_requests`）を扇に流して解く。返すのは結果の数。
-    fn analyze_flow(path: &Path) -> usize {
+    /// 子プロセスに渡す入力の形式（解析のケース）。
+    const FORMAT_ENV: &str = "KURA_MEM_SMOKE_FORMAT";
+    /// 埋め込みの画像を持つ音声の解析のケース（M13 段 2 の検証の直し）。
+    const HELD_CASES: [&str; 2] = ["audio-flac-pictures-analyze", "audio-m4a-covr-analyze"];
+
+    /// 解析のジョブと同じ段で形を読む（段の順に試し、読めた段を返す）。
+    fn staged_shape(
+        codecs: &CodecSet,
+        engine: &Engine,
+        path: &Path,
+        format: &str,
+    ) -> (kura_engine::Shape, kura_engine::codec::PickedStage) {
+        codecs
+            .shape_path_staged(
+                path,
+                format,
+                &DecodeOptions::default(),
+                engine.limits(),
+                &NoMonitor,
+                None,
+                &mut |_| Ok(()),
+            )
+            .unwrap()
+    }
+
+    /// 解析のジョブの見積もり（実際に読む段の `stage_stream_work_bytes` で数えた `estimate_stream` と、その段で形を読む分の
+    /// 大きい方。`Run::solve_stream` と同じ）。
+    fn analyze_estimate(path: &Path, format: &str) -> u64 {
+        let codecs = CodecSet::pinned();
+        let engine = Engine::new().unwrap();
+        let (shape, stage) = staged_shape(&codecs, &engine, path, format);
+        let len = std::fs::metadata(path).unwrap().len();
+        let reqs = kura_core::analysis::plan::stream_requests(&shape);
+        kura_core::analysis::job::estimate_stream(
+            codecs.stage_stream_work_bytes(&stage, format, &shape, len),
+            engine.analyses(),
+            &shape,
+            &reqs,
+            TASKS as u64,
+        )
+        .max(stage.shape_bytes)
+    }
+
+    /// 解析の通し：ファイルを解析のジョブと同じ段で流して読み、同じ要求（`stream_requests`）を扇に流して解く。返すのは結果の
+    /// 数。
+    fn analyze_flow(path: &Path, format: &str) -> usize {
         let engine = Engine::new().unwrap();
         let codecs = CodecSet::pinned();
         let opts = DecodeOptions::default();
-        let (shape, _) = codecs
-            .shape_path(path, "wav", &opts, engine.limits())
-            .unwrap();
+        let (shape, stage) = staged_shape(&codecs, &engine, path, format);
         let reqs = kura_core::analysis::plan::stream_requests(&shape);
         let mut fan = engine.analyze_stream(&reqs, &shape);
         codecs
-            .decode_stream_path(path, "wav", &opts, engine.limits(), &mut fan, &NoMonitor)
+            .decode_stream_with_path(
+                stage.id,
+                path,
+                format,
+                &opts,
+                engine.limits(),
+                &mut fan,
+                &NoMonitor,
+            )
             .unwrap();
         let got = fan.finish(&NoMonitor);
         assert!(
@@ -660,7 +710,7 @@ mod tests {
 
     /// 子プロセス（音声の解析）：`base` は何も作らない、`run` は通しを回す。
     #[test]
-    #[ignore = "audio_60min_analyze_stays_within_n が子プロセスとして起こす"]
+    #[ignore = "audio_60min_analyze_stays_within_n・held_pictures_analyze_within_estimate が子プロセスとして起こす"]
     fn analyze_child() {
         let Ok(spec) = std::env::var(CASE_ENV) else {
             return;
@@ -668,20 +718,53 @@ mod tests {
         let Some((name, stage)) = spec.split_once(':') else {
             return;
         };
-        if name != ANALYZE_CASE || stage == "base" {
+        if !(name == ANALYZE_CASE || HELD_CASES.contains(&name)) || stage == "base" {
             return;
         }
         let path = std::path::PathBuf::from(std::env::var(FILE_ENV).unwrap());
+        let format = std::env::var(FORMAT_ENV).unwrap_or_else(|_| "wav".into());
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(TASKS)
             .build()
             .unwrap();
         let t = std::time::Instant::now();
-        let n = pool.install(|| analyze_flow(&path));
-        eprintln!(
-            "{ANALYZE_CASE}: 結果 {n} 個・{:.2} 秒",
-            t.elapsed().as_secs_f64()
-        );
+        let n = pool.install(|| analyze_flow(&path, &format));
+        eprintln!("{name}: 結果 {n} 個・{:.2} 秒", t.elapsed().as_secs_f64());
+    }
+
+    /// 解析の子プロセスを `base`・`run` で起こし、(ピークから基準を引いた量, 基準, `run` の標準エラー)。`/usr/bin/time -l` が
+    /// 使えなければ None。
+    fn analyze_peak(name: &str, path: &Path, format: &str) -> Option<(u64, u64, String)> {
+        let exe = std::env::current_exe().unwrap();
+        let run = |stage: &str| -> Option<(u64, String)> {
+            let out = Command::new("/usr/bin/time")
+                .arg("-l")
+                .arg(&exe)
+                .args([
+                    "--exact",
+                    "mem_smoke::tests::analyze_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "-q",
+                ])
+                .env(CASE_ENV, format!("{name}:{stage}"))
+                .env(FILE_ENV, path)
+                .env(FORMAT_ENV, format)
+                .output()
+                .ok()?;
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            let footprint = stderr
+                .lines()
+                .find(|l| l.contains("peak memory footprint"))
+                .and_then(|l| l.split_whitespace().next())
+                .and_then(|n| n.parse().ok())?;
+            assert!(out.status.success(), "{stage}: {stderr}");
+            Some((footprint, stderr))
+        };
+        let (base, _) = run("base")?;
+        let (peak, log) = run("run")?;
+        Some((peak.saturating_sub(base), base, log))
     }
 
     /// M13 段 2（D12）：60 分・48 kHz ステレオの 16 ビットの WAV を流して解析する子プロセスのピークから基準を引いた量が、
@@ -699,55 +782,13 @@ mod tests {
             "{ANALYZE_CASE}: WAV を書いた（{:.1} 秒）",
             t.elapsed().as_secs_f64()
         );
-        let codecs = CodecSet::pinned();
-        let engine = Engine::new().unwrap();
-        let (shape, _) = codecs
-            .shape_path(&path, "wav", &DecodeOptions::default(), engine.limits())
-            .unwrap();
-        let len = std::fs::metadata(&path).unwrap().len();
-        let reqs = kura_core::analysis::plan::stream_requests(&shape);
-        let est = kura_core::analysis::job::estimate_stream(
-            &codecs,
-            engine.analyses(),
-            "wav",
-            &shape,
-            len,
-            &reqs,
-            TASKS as u64,
-        );
-        let exe = std::env::current_exe().unwrap();
-        let run = |stage: &str| -> Option<(u64, String)> {
-            let out = Command::new("/usr/bin/time")
-                .arg("-l")
-                .arg(&exe)
-                .args([
-                    "--exact",
-                    "mem_smoke::tests::analyze_child",
-                    "--ignored",
-                    "--nocapture",
-                    "--test-threads=1",
-                    "-q",
-                ])
-                .env(CASE_ENV, format!("{ANALYZE_CASE}:{stage}"))
-                .env(FILE_ENV, &path)
-                .output()
-                .ok()?;
-            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            let footprint = stderr
-                .lines()
-                .find(|l| l.contains("peak memory footprint"))
-                .and_then(|l| l.split_whitespace().next())
-                .and_then(|n| n.parse().ok())?;
-            assert!(out.status.success(), "{stage}: {stderr}");
-            Some((footprint, stderr))
-        };
-        let (Some((base, _)), Some((peak, log))) = (run("base"), run("run")) else {
+        let est = analyze_estimate(&path, "wav");
+        let Some((used, base, log)) = analyze_peak(ANALYZE_CASE, &path, "wav") else {
             eprintln!(
                 "/usr/bin/time -l が使えないので、音声の解析のメモリの煙のテストを見送ります"
             );
             return;
         };
-        let used = peak.saturating_sub(base);
         let took = log
             .lines()
             .find(|l| l.starts_with(ANALYZE_CASE))
@@ -771,6 +812,116 @@ mod tests {
         );
     }
 
+    /// 2 秒・44.1 kHz ステレオの FLAC の STREAMINFO の後ろに、PICTURE（各 `size` バイトの画像）を `n` 個差し込む。
+    fn flac_with_pictures(n: usize, size: usize) -> Vec<u8> {
+        let v = InputGen::AudioNoise {
+            rate: 44_100,
+            channels: 2,
+            frames: 88_200,
+            seed: 7,
+        }
+        .generate()
+        .unwrap();
+        let bytes = CodecSet::pinned()
+            .encode_bytes(&v, "flac", &json!({ "bits": 16 }), &NoMonitor)
+            .unwrap()
+            .0;
+        let at = 4 + 4 + 34;
+        let mut f = bytes[..at].to_vec();
+        let was_last = f[4] & 0x80 != 0;
+        f[4] &= 0x7f;
+        for i in 0..n {
+            let mut body = 3u32.to_be_bytes().to_vec();
+            body.extend_from_slice(&9u32.to_be_bytes());
+            body.extend_from_slice(b"image/png");
+            body.extend_from_slice(&[0u8; 20]);
+            body.extend_from_slice(&u32::try_from(size).unwrap().to_be_bytes());
+            body.resize(body.len() + size, 0x11);
+            f.push(6 | if was_last && i + 1 == n { 0x80 } else { 0 });
+            f.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
+            f.extend_from_slice(&body);
+        }
+        f.extend_from_slice(&bytes[at..]);
+        f
+    }
+
+    /// ffmpeg の AAC の m4a（フィクスチャ。moov が最後）の moov の後ろに、`size` バイトの covr を持つ udta/meta/ilst を足す。
+    fn m4a_with_covr(size: usize) -> Vec<u8> {
+        let b = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../kura-engine/fixtures/aac-lc-ffmpeg.m4a"),
+        )
+        .unwrap();
+        let atom = |kind: &[u8; 4], body: &[u8]| {
+            let mut o = u32::try_from(8 + body.len())
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
+            o.extend_from_slice(kind);
+            o.extend_from_slice(body);
+            o
+        };
+        let mut data = 14u32.to_be_bytes().to_vec();
+        data.extend_from_slice(&[0; 4]);
+        data.resize(data.len() + size, 0x55);
+        let ilst = atom(b"ilst", &atom(b"covr", &atom(b"data", &data)));
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend_from_slice(b"mdirappl");
+        hdlr.extend_from_slice(&[0u8; 9]);
+        let mut meta = vec![0u8; 4];
+        meta.extend_from_slice(&atom(b"hdlr", &hdlr));
+        meta.extend_from_slice(&ilst);
+        let udta = atom(b"udta", &atom(b"meta", &meta));
+        let mut at = 0usize;
+        let mut moov = None;
+        while at + 8 <= b.len() {
+            let s = u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+            if &b[at + 4..at + 8] == b"moov" {
+                moov = Some((at, s));
+            }
+            at += s;
+        }
+        let (m, ms) = moov.unwrap();
+        assert_eq!(m + ms, b.len(), "moov が最後でない");
+        let mut f = b.clone();
+        f[m..m + 4].copy_from_slice(&u32::try_from(ms + udta.len()).unwrap().to_be_bytes());
+        f.extend_from_slice(&udta);
+        f
+    }
+
+    /// M13 段 2 の検証の直し：大きな画像を埋め込んだ FLAC（15 MiB の PICTURE が 3 つ）と m4a（30 MiB の covr）を流して
+    /// 解析する子プロセスのピークから基準を引いた量が、解析のジョブの見積もり × 1.25 ＋ 4 MiB 以下（読み手が持ち続ける画像を
+    /// 数える。前の見積もりは中身によらない定数で、FLAC は 9.4 MiB に対して山 46.5 MiB だった）。
+    #[test]
+    fn held_pictures_analyze_within_estimate() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, format, bytes) in [
+            (HELD_CASES[0], "flac", flac_with_pictures(3, 15 << 20)),
+            (HELD_CASES[1], "m4a", m4a_with_covr(30 << 20)),
+        ] {
+            let path = dir.path().join(format!("{name}.{format}"));
+            std::fs::write(&path, &bytes).unwrap();
+            let est = analyze_estimate(&path, format);
+            // 見積もりは画像を数える
+            assert!(est > (bytes.len() as u64), "{name}: 見積もり {est}");
+            let Some((used, base, _)) = analyze_peak(name, &path, format) else {
+                eprintln!(
+                    "/usr/bin/time -l が使えないので、{name} のメモリの煙のテストを見送ります"
+                );
+                return;
+            };
+            eprintln!(
+                "{name}: 通し {:.1} MiB（見積もり {:.1}・ファイル {:.1}）・基準 {:.1} MiB",
+                mib(used),
+                mib(est),
+                mib(bytes.len() as u64),
+                mib(base)
+            );
+            assert!(
+                used <= bound(est),
+                "{name}: 実測 {used} バイト > 見積もり {est} × 1.25 ＋ 4 MiB"
+            );
+        }
+    }
     /// 子プロセスのピーク（テスト `test` を、ケース `spec` で起こす）。`/usr/bin/time -l` が使えなければ None。
     fn peak_of(test: &str, spec: &str) -> Option<u64> {
         let exe = std::env::current_exe().unwrap();

@@ -19,14 +19,14 @@ use kura_engine::codec::PinnedOptions;
 use super::IMAGEIO_DEC;
 use super::testutil::{engine_fixture, exclusive, fixture, stats};
 
-/// 固定の段 → ImageIO・AudioToolbox の組（ffmpeg は足さない）と小さな予算。
-struct MacFactory;
+/// 固定の段 → ImageIO・AudioToolbox の組（ffmpeg は足さない）と小さな予算（バイト）。
+struct MacFactory(u64);
 
 impl EngineFactory for MacFactory {
     fn runtime_config(&self) -> RuntimeConfig {
         RuntimeConfig {
             cores: Some(2),
-            budget: Some(256 << 20),
+            budget: Some(self.0),
             ..RuntimeConfig::default()
         }
     }
@@ -38,6 +38,11 @@ impl EngineFactory for MacFactory {
 
 /// 中身 `bytes`・拡張子 `ext` のアイテムを ID `id` で入れる（解析を待つ画像）。
 fn add(library: &Library, id: i64, ext: &str, bytes: &[u8]) {
+    add_kind(library, id, "image", ext, bytes);
+}
+
+/// 中身 `bytes`・種類 `kind`・拡張子 `ext` のアイテムを ID `id` で入れる（解析を待つもの）。
+fn add_kind(library: &Library, id: i64, kind: &str, ext: &str, bytes: &[u8]) {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join(format!("src.{ext}"));
     std::fs::write(&src, bytes).unwrap();
@@ -45,15 +50,15 @@ fn add(library: &Library, id: i64, ext: &str, bytes: &[u8]) {
     let dest = library.layout().content_path(&hash, ext);
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::fs::copy(&src, &dest).unwrap();
-    let (ext, size) = (ext.to_string(), bytes.len() as i64);
+    let (ext, kind, size) = (ext.to_string(), kind.to_string(), bytes.len() as i64);
     library
         .db()
         .write(move |tx| {
             tx.execute(
                 "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at,
                                     updated_at, thumb_state, proxy_state, analysis_state)
-                 VALUES (?1, ?2, ?3, 'image', ?4, 't', 't', ?1, ?1, 'ready', 'not_needed', 'pending')",
-                (id, hash.as_slice(), ext, size),
+                 VALUES (?1, ?2, ?3, ?5, ?4, 't', 't', ?1, ?1, 'ready', 'not_needed', 'pending')",
+                (id, hash.as_slice(), ext, size, kind),
             )?;
             Ok(())
         })
@@ -94,7 +99,7 @@ fn heic_with_alpha_is_analyzed_through_imageio() {
     add(&library, 3, "heic", &fixture("heics-3x24x16.heic"));
     add(&library, 4, "jpg", &engine_fixture("jpeg-422.jpg"));
     let engine = Arc::new(EngineServices::new(
-        Arc::new(MacFactory),
+        Arc::new(MacFactory(256 << 20)),
         library.layout().staging_dir().join(ENGINE_WORK_DIR),
     ));
     let sink: EventSink = Arc::new(|_| {});
@@ -160,5 +165,81 @@ fn heic_with_alpha_is_analyzed_through_imageio() {
         serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
     assert_eq!(summary["headerMs"]["count"].as_u64(), Some(3));
     assert_eq!(summary["readMs"]["count"].as_u64(), Some(1));
+    jobs.shutdown();
+}
+
+/// M13 段 2 の検証の直し：アプリの組（AudioToolbox が WAV・AIFF も読む）でも、長い WAV・AIFF は前の段の固定のデコーダの
+/// 見積もりで解く（前は後ろの段の AudioToolbox がファイルの長さで見積もり、Limits の中の長い WAV・AIFF が too_large に
+/// なった）。予算 24 MiB（1 件の上限 12 MiB）で、10 分・8 kHz モノの 16 ビットの WAV・AIFF（9.6 MB）が ready になり、
+/// デコーダは固定の段。
+#[test]
+fn long_wav_and_aiff_are_analyzed_by_the_fixed_stage() {
+    use kura_engine::testgen::InputGen;
+    let _g = exclusive();
+    let set = super::codec_set(&PinnedOptions::default());
+    for format in ["wav", "aiff"] {
+        assert!(
+            set.decoders_for(format)
+                .iter()
+                .any(|d| d.id() == super::AUDIOTOOLBOX_DEC),
+            "{format} を AudioToolbox も読む組"
+        );
+    }
+    let v = InputGen::Sine {
+        rate: 8_000,
+        channels: 1,
+        frames: 8_000 * 600,
+        freq: 440,
+        loop_range: None,
+    }
+    .generate()
+    .unwrap();
+    let encoded = |format: &str| {
+        CodecSet::pinned()
+            .encode_bytes(&v, format, &serde_json::json!({}), &kura_engine::NoMonitor)
+            .unwrap()
+            .0
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let library = Arc::new(Library::create(&dir.path().join("L.kuralib")).unwrap());
+    add_kind(&library, 1, "audio", "wav", &encoded("wav"));
+    add_kind(&library, 2, "audio", "aiff", &encoded("aiff"));
+    let engine = Arc::new(EngineServices::new(
+        Arc::new(MacFactory(24 << 20)),
+        library.layout().staging_dir().join(ENGINE_WORK_DIR),
+    ));
+    let sink: EventSink = Arc::new(|_| {});
+    let jobs = JobManager::new(
+        library.clone(),
+        vec![(
+            JobKind::Analyze,
+            Arc::new(AnalyzeHandler::new(
+                engine.clone(),
+                Arc::new(AnalyzeShared::default()),
+            )) as Arc<dyn JobHandler>,
+        )],
+        sink,
+    )
+    .unwrap();
+    jobs.start().unwrap();
+    jobs.ensure_queued(JobKind::Analyze, "{}").unwrap();
+    assert!(jobs.wait_idle(Duration::from_secs(120)));
+    let record = jobs
+        .list(&JobFilter {
+            kinds: vec![JobKind::Analyze],
+            states: vec![],
+            limit: Some(1),
+        })
+        .unwrap()
+        .remove(0);
+    assert_eq!(record.state, JobState::Done, "{:?}", record.message);
+    let info = |id: i64| library.db().read(move |c| asset::get(c, id)).unwrap();
+    for (id, decoder) in [(1, "wav-kura-dec/1"), (2, "aiff-kura-dec/1")] {
+        let item = info(id);
+        assert_eq!(item.analysis_state, AnalysisState::Ready, "{id}");
+        let facts = item.facts.unwrap();
+        assert!(facts.ok, "{id}");
+        assert_eq!(facts.decoder.as_deref(), Some(decoder), "{id}");
+    }
     jobs.shutdown();
 }

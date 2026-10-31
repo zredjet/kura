@@ -118,6 +118,22 @@ impl Decoder for Watching {
     fn shape_work_bytes(&self, format: &str, len: u64) -> u64 {
         self.inner.shape_work_bytes(format, len)
     }
+    fn held_bytes(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        limits: &Limits,
+    ) -> Result<kura_engine::codec::Held, EngineError> {
+        self.inner.held_bytes(src, format, limits)
+    }
+    fn held_bytes_file(
+        &self,
+        path: &Path,
+        format: &str,
+        limits: &Limits,
+    ) -> Result<kura_engine::codec::Held, EngineError> {
+        self.inner.held_bytes_file(path, format, limits)
+    }
     fn decode_stream(
         &self,
         src: &mut (dyn ReadSeek + Send),
@@ -1737,4 +1753,141 @@ fn long_audio_is_analyzed_by_streaming() {
     ));
     assert_eq!(n, frames as i64);
     assert!(env.reads().contains(&hash));
+}
+
+/// 形は WAV の固定の段と同じに読むが、流して読むと `Unsupported` を返す段（後ろの段へ回るときの見積もりのテスト）。
+struct RefusingStream(Arc<dyn Decoder>);
+
+impl Decoder for RefusingStream {
+    fn id(&self) -> &'static str {
+        "refusing-wav-dec/1"
+    }
+    fn tier(&self) -> Tier {
+        Tier::Pinned
+    }
+    fn can_decode(&self, format: &str) -> bool {
+        format == "wav"
+    }
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.0.shape(src, format, opts, limits)
+    }
+    fn decode(
+        &self,
+        _src: &mut dyn ReadSeek,
+        _format: &str,
+        _opts: &DecodeOptions,
+        _limits: &Limits,
+        _mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        Err(EngineError::Unsupported("この段では読まない".into()))
+    }
+    fn streams(&self, _format: &str) -> bool {
+        true
+    }
+    fn decode_stream(
+        &self,
+        _src: &mut (dyn ReadSeek + Send),
+        _format: &str,
+        _opts: &DecodeOptions,
+        _limits: &Limits,
+        _shape: &Shape,
+        _out: &mut kura_engine::codec::DecodeOut<'_>,
+        _mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported("この段では読まない".into()))
+    }
+}
+
+/// M13 段 2 の検証の直し：形を読んだ段が流して読む途中で `Unsupported` を返したら、次の段で形を読み直し、その段の見積もりで
+/// 確保し直して解く（`decode_stream_path` が次の段へ回るのと同じ。読み取りの記録は次の段のもの）。
+#[test]
+fn a_stage_refusing_the_stream_falls_through_to_the_next_stage() {
+    let env = Env::with(
+        |log, _| {
+            let pinned = CodecSet::pinned();
+            let wav = pinned.decoders_for("wav")[0].clone();
+            let mut set = CodecSet::default();
+            set.add_decoder(Arc::new(RefusingStream(wav.clone())))
+                .unwrap();
+            set.add_decoder(Arc::new(Watching {
+                inner: wav,
+                log: log.clone(),
+                hook: None,
+            }))
+            .unwrap();
+            set
+        },
+        64 << 20,
+    );
+    let hash = env.add(1, "audio", "wav", &wav(8_000 * 3, None));
+    let job = env.run();
+    assert_eq!(job.state, JobState::Done, "{:?}", job.message);
+    assert_eq!(env.state(1), "ready");
+    assert_eq!(env.fact::<String>(&hash, "decoder"), "wav-kura-dec/1");
+    assert!(env.reads().contains(&hash));
+}
+
+/// M13 段 2 の検証の直し：アプリの組（AudioToolbox が WAV・AIFF も読む）と同じく、後ろの段に WAV も読む Platform の音声
+/// デコーダ（形を読むのも流して読むのもファイルの長さで見積もる）を置いても、WAV は実際に読む前の段（固定の WAV）の
+/// 見積もりで解く。予算 24 MiB（1 件の上限 12 MiB）で 10 分・20 分の WAV（9.6 MB・19.2 MB）が ready になり、読む間に確保
+/// している量はファイルの長さによらない（前は後ろの段の長さで見積もり、どちらも too_large だった）。
+#[test]
+fn a_later_platform_stage_does_not_size_the_wav_estimate() {
+    use kura_engine::budget::MemoryBudget;
+    use kura_engine::codec::platform::PlatformAudioDecoder;
+    use kura_engine::testing::platform::{FakeAudio, FakeAudioBackend};
+
+    let used = Arc::new(Mutex::new(Vec::new()));
+    let budget: Arc<OnceLock<Arc<MemoryBudget>>> = Arc::default();
+    let hook: Hook = {
+        let (used, budget) = (used.clone(), budget.clone());
+        Arc::new(move |_: &str| {
+            if let Some(b) = budget.get() {
+                used.lock().unwrap().push(b.used().unwrap());
+            }
+        })
+    };
+    let env = Env::with(
+        |log, _| {
+            let mut backend = FakeAudioBackend::new(FakeAudio::new(8_000, vec![vec![0.0; 4]]));
+            backend.formats = vec!["wav"];
+            let platform: Arc<dyn Decoder> = Arc::new(PlatformAudioDecoder::new(backend));
+            let set = watched_set(log, Some(hook), vec![platform]);
+            assert_eq!(
+                set.decoders_for("wav")
+                    .iter()
+                    .map(|d| d.id())
+                    .collect::<Vec<_>>(),
+                ["wav-kura-dec/1", "fake-audiotoolbox-dec/1"]
+            );
+            set
+        },
+        24 << 20,
+    );
+    assert!(
+        budget
+            .set(env.engine.runtime().unwrap().budget().clone())
+            .is_ok()
+    );
+    let short = env.add(1, "audio", "wav", &wav(8_000 * 600, None));
+    let long = env.add(2, "audio", "wav", &wav(8_000 * 1_200, None));
+    let job = env.run();
+    assert_eq!(job.state, JobState::Done, "{:?}", job.message);
+    for (id, hash) in [(1, &short), (2, &long)] {
+        assert_eq!(env.state(id), "ready", "{id}");
+        assert_eq!(env.fact::<String>(hash, "decoder"), "wav-kura-dec/1");
+    }
+    let used = used.lock().unwrap().clone();
+    assert_eq!(used.len(), 2, "{used:?}");
+    // 2 つの長さの差は 9.6 MB。確保の差は波形の段の結果の見積もりだけ（1 MiB 未満）
+    assert!(
+        used[0].abs_diff(used[1]) < 1 << 20 && used.iter().all(|&u| u <= 12 << 20),
+        "確保が長さで伸びた：{used:?}"
+    );
 }
