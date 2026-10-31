@@ -2140,33 +2140,35 @@ mod tests {
     #[test]
     fn a_slow_consumer_is_not_counted_as_a_stall() {
         let d = tempfile::tempdir().unwrap();
-        // 6 回に分けて書く：受け手が眠るあいだに渡す列（4 つ）が埋まり、読み手は 6 つ目を渡すのを待つ
-        let s = script(
-            d.path(),
-            "steady",
-            "i=0; while [ $i -lt 6 ]; do head -c 1000 /dev/zero; sleep 0.05; i=$((i+1)); done",
-        );
+        // 1 つの道具が続けて書く（パイプは 1 回に 64 KiB ほどまで渡すので区切りは 10 個ほど）：受け手が最初の 2 つの
+        // 区切りで眠るあいだに、渡す列（4 つ）が埋まって読み手は渡すのを待つ
+        let s = script(d.path(), "steady", "head -c 600000 /dev/zero");
         for mode in MODES {
-            let mut n = 0u64;
+            let (mut n, mut calls) = (0u64, 0u32);
+            let nap = Duration::from_secs(5);
             let t = Instant::now();
             let r = run_in(
                 mode,
                 &s,
                 Path::new("/"),
-                &budget(1 << 20, 1_000),
+                &budget(1 << 20, 4_000),
                 &|| false,
                 &signal_group,
                 &mut |b: &[u8]| {
-                    std::thread::sleep(Duration::from_millis(1_500));
+                    if calls < 2 {
+                        std::thread::sleep(nap);
+                    }
+                    calls += 1;
                     n += b.len() as u64;
                     Ok(())
                 },
             );
             let r = r.unwrap_or_else(|e| panic!("{mode:?}: {e:?}"));
             assert!(r.status.success(), "{mode:?}");
-            assert_eq!((r.stdout_bytes, n), (6_000, 6_000), "{mode:?}");
-            // 区切りの数だけ眠った（無出力の上限の何倍も）
-            assert!(t.elapsed() >= Duration::from_secs(3), "{mode:?}");
+            assert_eq!((r.stdout_bytes, n), (600_000, 600_000), "{mode:?}");
+            assert!(calls > 6, "{mode:?}: 区切り {calls}");
+            // 無出力の上限より長く眠った
+            assert!(t.elapsed() >= 2 * nap, "{mode:?}");
         }
     }
 
