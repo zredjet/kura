@@ -117,6 +117,7 @@ async function open(v: EditAudioView = view(), nodes: EditNodeDto[] = []): Promi
     itemId: ITEM.id,
     baseVersion: 0,
     source: { kind: 'audio', width: 0, height: 0, frames: null, format: null, audio: null },
+    originalFormat: 'wav',
     pixelArt: false,
     draft: { exists: false, fresh: true, updatedAt: null, opened: false },
     result: result(v, {}, nodes),

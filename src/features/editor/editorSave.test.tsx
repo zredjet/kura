@@ -171,12 +171,17 @@ function result(over: Partial<EditStepResultDto> = {}): EditStepResultDto {
 
 type Draft = { exists: boolean; fresh: boolean; updatedAt: number | null; opened: boolean };
 
-function opened(draft: Partial<Draft> = {}, over: Partial<EditStepResultDto> = {}) {
+function opened(
+  draft: Partial<Draft> = {},
+  over: Partial<EditStepResultDto> = {},
+  originalFormat = 'png',
+) {
   return {
     session: 'aa01',
     itemId: 7,
     baseVersion: 0,
     source: { kind: 'image', width: 64, height: 32, frames: null, format: 'png', audio: null },
+    originalFormat,
     pixelArt: true,
     draft: { exists: false, fresh: true, updatedAt: null, opened: false, ...draft },
     result: result(over),
@@ -267,8 +272,11 @@ function audioItem(over: Partial<ItemSummaryDto> = {}): ItemSummaryDto {
  * アダプタで受け、種類だけを音声にする（音声の表示の流れは `audio/audioStore.test.ts`）。
  */
 async function openAudioDirty(over: Partial<ItemSummaryDto> = {}) {
-  vi.mocked(openEdit).mockResolvedValue(opened());
-  await act(() => openEditorAs({ ...IMAGE_EDITOR.adapter, kind: 'audio' }, audioItem(over)));
+  const audio = audioItem(over);
+  vi.mocked(openEdit).mockResolvedValue(
+    opened({}, {}, AUDIO_FORMATS.formatOfExt(audio.ext) ?? audio.ext),
+  );
+  await act(() => openEditorAs({ ...IMAGE_EDITOR.adapter, kind: 'audio' }, audio));
   await flush();
   vi.mocked(viewEdit).mockClear();
 }

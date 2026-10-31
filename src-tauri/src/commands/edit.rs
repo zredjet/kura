@@ -922,7 +922,7 @@ pub struct EditSourceDto {
     pub width: u64,
     pub height: u64,
     pub frames: Option<u64>,
-    /// 画素の形式（`rgba8`・`indexed8` など）。ファイルの形式ではない（ファイルの形式はアイテムの拡張子から）。
+    /// 画素の形式（`rgba8`・`indexed8` など）。ファイルの形式ではない（元のファイルの形式は `EditOpenedDto.originalFormat`）。
     pub format: Option<String>,
     /// 音声の元（音声だけ）。
     pub audio: Option<EditAudioSourceDto>,
@@ -950,6 +950,9 @@ pub struct EditOpenedDto {
     pub item_id: i64,
     pub base_version: i64,
     pub source: EditSourceDto,
+    /// 元のファイルの形式の ID（`png`・`mp3` など。出力の形式の「元と同じ」が書く形式で、アイテムの今の拡張子とは違うことが
+    /// ある：HEIC の元を PNG で保存したあとなど）。
+    pub original_format: String,
     /// ドット絵として表示する（段は 0、拡大は最近傍・装置の画素の整数倍）。
     pub pixel_art: bool,
     pub draft: EditDraftDto,
@@ -964,6 +967,7 @@ impl From<Opened> for EditOpenedDto {
             item_id: o.item_id,
             base_version: o.base_version,
             source: o.source.into(),
+            original_format: o.original_format,
             pixel_art: o.pixel_art,
             draft: o.draft.into(),
             result: o.outcome.into(),
@@ -1527,6 +1531,32 @@ mod tests {
             })),
             notices: Vec::new(),
         };
+        // 開いた結果は元のファイルの形式を持つ（`originalFormat`。画素の形式 `source.format` とは別）
+        let opened = serde_json::to_value(EditOpenedDto::from(Opened {
+            session: "aa01".into(),
+            item_id: 7,
+            base_version: 1,
+            source: SourceInfo {
+                kind: "image",
+                width: 600,
+                height: 400,
+                frames: None,
+                format: Some("rgba8".into()),
+                audio: None,
+            },
+            original_format: "heic".into(),
+            pixel_art: false,
+            draft: kura_core::edit::editor::DraftInfo {
+                exists: false,
+                fresh: true,
+                updated_at: None,
+                opened: false,
+            },
+            outcome: out.clone(),
+        }))
+        .unwrap();
+        assert_eq!(opened["originalFormat"], json!("heic"));
+        assert_eq!(opened["source"]["format"], json!("rgba8"));
         let json = serde_json::to_value(EditStepResultDto::from(out)).unwrap();
         assert_eq!(json["status"]["canUndo"], json!(true));
         assert_eq!(json["status"]["needsReopen"], json!(false));

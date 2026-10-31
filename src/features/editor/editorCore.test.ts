@@ -116,6 +116,7 @@ function opened(session: string, over: Partial<EditStepResultDto> = {}) {
     itemId: AUDIO.id,
     baseVersion: 0,
     source: { kind: 'audio', width: 0, height: 0, frames: null, format: 'wav' },
+    originalFormat: 'wav',
     pixelArt: false,
     draft: { exists: false, fresh: true, updatedAt: null, opened: false },
     result: result({

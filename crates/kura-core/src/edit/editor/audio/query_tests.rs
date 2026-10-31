@@ -72,7 +72,8 @@ fn formats_follow_the_current_codecs() {
 }
 
 /// G10 の検証の直し（#4）：元（mp3）を WAV で保存して今の拡張子が wav になっても、`Keep` の文書の `edit_formats` は元の
-/// 形式で確かめ、今の出力の形式（`current`）は mp3（今の拡張子の wav ではない）。保存の確かめも同じく mp3 で断る。
+/// 形式で確かめ、今の出力の形式（`current`）は mp3（今の拡張子の wav ではない）。保存の確かめも同じく mp3 で断る。開き直した
+/// 結果の元の形式（`original_format`。右パネルの「元と同じ（…）」）も mp3。
 #[test]
 fn keep_resolves_to_the_original_format_after_saving_as_another() {
     let env = Env::new();
@@ -83,7 +84,9 @@ fn keep_resolves_to_the_original_format_after_saving_as_another() {
     )
     .unwrap();
     let id = add_audio(&env.lib, &mp3, "mp3");
-    let s = env.open(id).session.clone();
+    let opened = env.open(id);
+    assert_eq!(opened.original_format, "mp3");
+    let s = opened.session.clone();
     let vp = Viewport::audio_idle();
     env.step(&s, vec![add(0, "audio.gain", json!({ "db": -1.0 }))], &vp);
     let wav = FormatChoice::To {
@@ -128,7 +131,12 @@ fn keep_resolves_to_the_original_format_after_saving_as_another() {
         save(&env.env(), &s, SaveMode::Overwrite, None),
         Err(EditorError::FormatUnavailable { ref format, .. }) if format == "mp3"
     ));
+
+    // 開き直しても、元の形式は mp3（アイテムの今の拡張子は wav）
     close(&env.engine, &s);
+    let again = env.open(id);
+    assert_eq!(again.original_format, "mp3");
+    close(&env.engine, &again.session);
 }
 
 /// 全体の描画で求めたゼロ交差（正）。

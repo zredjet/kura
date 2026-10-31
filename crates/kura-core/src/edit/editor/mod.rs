@@ -343,7 +343,7 @@ pub struct SourceInfo {
     pub height: u64,
     /// フレームの数（フレームの列だけ）。
     pub frames: Option<u64>,
-    /// 画素の形式（`rgba8`・`indexed8` など）。ファイルの形式（PNG など）ではない（ファイルの形式はアイテムの拡張子から）。
+    /// 画素の形式（`rgba8`・`indexed8` など）。ファイルの形式（PNG など）ではない（元のファイルの形式は `Opened::original_format`）。
     pub format: Option<String>,
     /// 音声の元（音声だけ）。
     pub audio: Option<AudioSourceInfo>,
@@ -367,6 +367,9 @@ pub struct Opened {
     /// 土台の版（保存はこの版を土台にする）。
     pub base_version: i64,
     pub source: SourceInfo,
+    /// 元のファイルの形式の ID（`versions::original` の拡張子の形式。出力の形式の `Keep` が書く形式で、アイテムの今の拡張子
+    /// とは違うことがある：HEIC の元を PNG で保存したあとなど）。
+    pub original_format: String,
     /// ドット絵として表示する（DB の実効値。段は 0、拡大は最近傍）。
     pub pixel_art: bool,
     pub draft: DraftInfo,
@@ -1684,6 +1687,7 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             item_id,
             base_version: base.version,
             source,
+            original_format: format.to_string(),
             pixel_art,
             draft: info,
             outcome,

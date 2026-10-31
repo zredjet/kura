@@ -1072,6 +1072,11 @@ export type EditOpenedDto_Deserialize = {
 	itemId: number,
 	baseVersion: number,
 	source: EditSourceDto,
+	/**
+	 *  元のファイルの形式の ID（`png`・`mp3` など。出力の形式の「元と同じ」が書く形式で、アイテムの今の拡張子とは違うことが
+	 *  ある：HEIC の元を PNG で保存したあとなど）。
+	 */
+	originalFormat: string,
 	/**  ドット絵として表示する（段は 0、拡大は最近傍・装置の画素の整数倍）。 */
 	pixelArt: boolean,
 	draft: EditDraftDto,
@@ -1086,6 +1091,11 @@ export type EditOpenedDto_Serialize = {
 	itemId: number,
 	baseVersion: number,
 	source: EditSourceDto,
+	/**
+	 *  元のファイルの形式の ID（`png`・`mp3` など。出力の形式の「元と同じ」が書く形式で、アイテムの今の拡張子とは違うことが
+	 *  ある：HEIC の元を PNG で保存したあとなど）。
+	 */
+	originalFormat: string,
 	/**  ドット絵として表示する（段は 0、拡大は最近傍・装置の画素の整数倍）。 */
 	pixelArt: boolean,
 	draft: EditDraftDto,
@@ -1188,7 +1198,7 @@ export type EditSourceDto = {
 	width: number,
 	height: number,
 	frames: number | null,
-	/**  画素の形式（`rgba8`・`indexed8` など）。ファイルの形式ではない（ファイルの形式はアイテムの拡張子から）。 */
+	/**  画素の形式（`rgba8`・`indexed8` など）。ファイルの形式ではない（元のファイルの形式は `EditOpenedDto.originalFormat`）。 */
 	format: string | null,
 	/**  音声の元（音声だけ）。 */
 	audio: EditAudioSourceDto | null,

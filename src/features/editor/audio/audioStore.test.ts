@@ -143,6 +143,7 @@ function opened(v: EditAudioView) {
         lazy: true,
       },
     },
+    originalFormat: 'wav',
     pixelArt: false,
     draft: { exists: false, fresh: true, updatedAt: null, opened: false },
     result: { ...result(v), doc: { base: null, order: [], nodes: [], outputs: null } },
