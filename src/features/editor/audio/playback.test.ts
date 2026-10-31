@@ -7,6 +7,7 @@ import {
   CROSSFADE_SECONDS,
   EditorPlayer,
   LEAD_SECONDS,
+  loopCut,
   MAX_PLACE_PER_FILL,
   neededSpans,
   PcmFeed,
@@ -63,6 +64,18 @@ describe('鳴らす区間の計画', () => {
     expect(planSegments({ from: 0, frames: 10, loop: { start: 5, end: 5 }, horizon: 100 })).toEqual(
       [{ start: 0, end: 10, at: 0 }],
     );
+  });
+
+  it('ループを替えたとき鳴っている区間を止める所（新しい終わり・1 周の境・今）', () => {
+    // つないだバッファ（1 周 64 フレーム）：今の位置は 1,036
+    const block = { start: 1000, end: 1064, abs: 0, len: 64 * 1024 };
+    expect(loopCut(block, 100, { start: 1000, end: 1032 })).toEqual({ abs: 100, pos: 1000 });
+    expect(loopCut(block, 100, { start: 1000, end: 1050 })).toEqual({ abs: 114, pos: 1000 });
+    expect(loopCut(block, 100, { start: 1000, end: 2000 })).toEqual({ abs: 128, pos: 1064 });
+    // 1 周の区間：終わりが新しいループの中なら止めない
+    const seg = { start: 10_000, end: 65_536, abs: 0, len: 55_536 };
+    expect(loopCut(seg, 4800, { start: 0, end: 200_000 })).toBeNull();
+    expect(loopCut(seg, 4800, { start: 0, end: 30_000 })).toEqual({ abs: 20_000, pos: 0 });
   });
 
   it('先読みに要るチャンク（位置から 2 チャンク・ループの始め）', () => {
@@ -244,6 +257,41 @@ describe('編集中の試聴の置き方', () => {
     expect(after.length).toBeGreaterThan(0);
     expect(after.every((len) => len === 9000)).toBe(true);
     expect(ctx.sources.slice(1, n).every((s) => s.stopped)).toBe(true);
+  });
+
+  it('ループの終わりを鳴っている区間の中へ縮めたら、新しい終わりで止めて始めから続ける', () => {
+    const t = setup();
+    t.player.play({
+      from: 10_000,
+      loop: { start: 0, end: 200_000 },
+      source: 'edited',
+      info: t.info,
+    });
+    const ctx = t.ctx();
+    const first = Math.round((ctx.sources[0]?.started?.[0] ?? 0) * R);
+    // 位置が約 14,800 のときに終わりを 30,000 へ
+    ctx.currentTime = (first + 4800) / R;
+    const n = ctx.sources.length;
+    t.player.setLoop({ start: 0, end: 30_000 });
+    expect((ctx.sources[0]?.stoppedAt ?? 0) * R).toBeCloseTo(first + 20_000, 3);
+    const next = starts(ctx, R).slice(n);
+    expect(next[0]).toEqual([first + 20_000, 30_000]);
+    expect(ctx.buffers[n]?.channels[0]?.[0]).toBeCloseTo(0, 6);
+    // 0.5 秒後の位置はループの中
+    ctx.currentTime += 0.5;
+    t.player.tick();
+    expect(t.player.position()).toBeLessThan(30_000);
+    // もう新しい終わりを過ぎていれば、すぐ止めて始めから
+    const m = ctx.sources.length;
+    const now = Math.ceil(ctx.currentTime * R) + Math.round(0.01 * R);
+    const playing = ctx.sources.find((s, i) => {
+      const [at, len] = starts(ctx, R)[i] ?? [0, 0];
+      return !s.stopped && at <= now && now < at + len;
+    });
+    expect(playing).toBeDefined();
+    t.player.setLoop({ start: 0, end: 2000 });
+    expect((playing?.stoppedAt ?? 0) * R).toBeCloseTo(now, 3);
+    expect(starts(ctx, R)[m]?.[0]).toBe(now);
   });
 
   it('短いループ（1 フレーム・数十フレーム）は、ループをつないだチャンク程度のバッファを 1 区間として置く', () => {

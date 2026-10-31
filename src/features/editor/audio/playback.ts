@@ -398,6 +398,26 @@ function placedPos(p: Placed, f: number): number {
   return p.start + (Math.floor(f - p.abs) % cycle);
 }
 
+/**
+ * ループを `loop` に替えたとき、文脈のフレーム `now` に鳴っている区間 `p` をどこで止めるか（止める文脈のフレームと、
+ * そこから続ける鳴らす音の位置。止めなくてよければ null）：もう新しい終わりを過ぎていれば今止めて始めから、この周の中で
+ * 新しい終わりに着くならそこで止めて始めから、ほかは周の終わり（つないだバッファの 1 周の境）で止めて周の終わりから。
+ */
+export function loopCut(
+  p: { start: number; end: number; abs: number; len: number },
+  now: number,
+  loop: FrameSpan,
+): { abs: number; pos: number } | null {
+  const cycle = Math.max(1, p.end - p.start);
+  const cycleAbs = p.abs + Math.floor((now - p.abs) / cycle) * cycle;
+  const pos = p.start + (now - cycleAbs);
+  let cut: { abs: number; pos: number };
+  if (pos >= loop.end) cut = { abs: now, pos: loop.start };
+  else if (loop.end < p.end) cut = { abs: cycleAbs + (loop.end - p.start), pos: loop.start };
+  else cut = { abs: cycleAbs + cycle, pos: p.end };
+  return cut.abs < p.abs + p.len ? cut : null;
+}
+
 /** ループの 1 周の標本を `reps` 回つなぐ（チャンネルごと）。 */
 function repeatPlanes(planes: readonly Float32Array[], reps: number): Float32Array<ArrayBuffer>[] {
   return planes.map((one) => {
@@ -550,7 +570,7 @@ export class EditorPlayer {
     if (!next) return;
     if (next.start === plan.loop.start && next.end === plan.loop.end) return;
     plan.loop = next;
-    this.dropUnstarted();
+    this.recutLoop(next);
     this.tick();
   }
 
@@ -837,31 +857,43 @@ export class EditorPlayer {
     this.deps.onCrossfade?.({ rate, t, old, fresh: this.placed[before]?.record ?? null });
   }
 
-  /** まだ鳴っていない区間を捨て、そこから置き直す。 */
-  private dropUnstarted(): void {
+  /**
+   * ループの区間を替えた：まだ鳴っていない区間を捨て、鳴っている区間は次の折り返し（新しい終わり・つないだバッファの
+   * 1 周の境）で止めて、そこから新しい区間で置き直す（新しい終わりをもう過ぎていれば、すぐ止めて始めから）。
+   */
+  private recutLoop(loop: FrameSpan): void {
     const plan = this.plan;
     const ctx = this.ctx;
     if (!plan || !ctx) return;
-    const nowFrame =
-      Math.ceil(ctx.currentTime * plan.info.rate) + Math.round(0.01 * plan.info.rate);
+    const rate = plan.info.rate;
+    const nowFrame = Math.ceil(ctx.currentTime * rate) + Math.round(0.01 * rate);
     const keep: Placed[] = [];
     let first: Placed | null = null;
+    let playing: Placed | null = null;
     for (const p of this.placed) {
       if (!p.fading && p.abs > nowFrame) {
         if (first === null || p.abs < first.abs) first = p;
         this.kill(p);
       } else {
         keep.push(p);
+        if (!p.fading && nowFrame >= p.abs && nowFrame < p.abs + p.len) playing = p;
       }
     }
     this.placed = keep;
-    if (first) {
+    plan.done = false;
+    const cut = playing ? loopCut(playing, nowFrame, loop) : null;
+    if (playing && cut) {
+      try {
+        playing.src.stop(cut.abs / rate);
+      } catch {
+        // もう止まっている
+      }
+      playing.len = cut.abs - playing.abs;
+      plan.nextAbs = cut.abs;
+      plan.nextPos = cut.pos;
+    } else if (first) {
       plan.nextAbs = first.abs;
       plan.nextPos = first.start;
-      plan.done = false;
-    } else {
-      const last = keep.filter((p) => !p.fading).at(-1);
-      if (last) plan.done = false;
     }
   }
 
