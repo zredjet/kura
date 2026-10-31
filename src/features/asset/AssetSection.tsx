@@ -288,9 +288,18 @@ function ModelRows({ asset }: { asset: AssetDto }) {
 
 /**
  * インスペクタの「素材」の欄（design.md §3.1「素材の欄」。見出しの直後）。解析の事実・利用者の設定・実効値と、
- * フォント・3D の情報（item_asset_get。DB だけを読む）。動画には出さない。
+ * フォント・3D の情報（item_asset_get。DB だけを読む）。動画には出さない。`audition` が偽なら（エディタの中の
+ * インスペクタ。M13 の段 6 の G9）、音声の波形は出すが試聴のボタンは出さない。
  */
-export function AssetSection({ data, item }: { data: AssetData; item: ItemSummaryDto }) {
+export function AssetSection({
+  data,
+  item,
+  audition = true,
+}: {
+  data: AssetData;
+  item: ItemSummaryDto;
+  audition?: boolean;
+}) {
   const headingId = useId();
   const { asset, reload } = data;
   if (!asset || asset.itemId !== item.id || asset.kind === 'video') {
@@ -316,7 +325,17 @@ export function AssetSection({ data, item }: { data: AssetData; item: ItemSummar
           {unsupported}
         </p>
       )}
-      {asset.kind === 'audio' && <AuditionControls asset={asset} durationMs={item.durationMs} />}
+      {asset.kind === 'audio' &&
+        (audition ? (
+          <AuditionControls asset={asset} durationMs={item.durationMs} />
+        ) : (
+          <WaveformView
+            hash={asset.hash}
+            version={asset.facts?.analyzedAt ?? null}
+            loop={loopOf(asset)}
+            position={null}
+          />
+        ))}
     </section>
   );
 }

@@ -4,8 +4,7 @@
  * - 核（`editorStore.ts`・`editorSave.ts`）が種類を知らずに使えるよう、種類ごとの違いのうちデータで済むもの（形式の表・
  *   足せる操作の入力）だけをここに置く。開く口・画面の部品・キーは `editorKinds.ts`（状態を持つ種類のモジュールを読む）。
  * - 種類はアイテムの種類（`src/ipc/kinds.ts`）から選ぶ。エディタの種類（`EditorKind`・`EDITOR_KINDS`）と、利用者が開ける
- *   種類（`OPENABLE`）を分ける：音声のエディタは部品とテストを先に積み、開く口は M13 の段 6 の G9 で開ける（それまで
- *   `canEdit` は音声に偽）。
+ *   種類（`OPENABLE`）を分ける（音声のエディタは部品とテストを先に積み、開く口は M13 の段 6 の G9 で開けた）。
  */
 
 import type { ValueKind } from '../../ipc/edit';
@@ -34,8 +33,8 @@ const TRAITS: Readonly<Record<EditorKind, KindTraits>> = {
 /** エディタの種類（並びは表の順）。 */
 export const EDITOR_KINDS = Object.keys(TRAITS) as EditorKind[];
 
-/** 利用者が開ける種類（音声は G9 で足す）。 */
-export const OPENABLE: readonly EditorKind[] = ['image'];
+/** 利用者が開ける種類（いまはエディタの種類のすべて。音声は M13 の段 6 の G9 から）。 */
+export const OPENABLE: readonly EditorKind[] = EDITOR_KINDS;
 
 /** アイテムの種類のエディタ（開けるかによらない。形式の表を引く）。なければ null。 */
 function kindOfItem(item: Pick<ItemSummaryDto, 'kind'> | null | undefined): EditorKind | null {

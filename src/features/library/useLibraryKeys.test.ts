@@ -147,7 +147,7 @@ describe('handleLibraryKey（⌘E：編集…。M12）', () => {
     open.mockClear();
     cached.mockReset();
     cached.mockImplementation(
-      (id) => ({ id, kind: id === 20 ? 'audio' : 'image' }) as ItemSummaryDto,
+      (id) => ({ id, kind: id === 20 ? 'video' : id === 30 ? 'audio' : 'image' }) as ItemSummaryDto,
     );
   });
 
@@ -160,7 +160,13 @@ describe('handleLibraryKey（⌘E：編集…。M12）', () => {
     expect(open).toHaveBeenCalledWith(expect.objectContaining({ id: 10 }));
   });
 
-  it('画像でない・複数・ゴミ箱の中では開かない', () => {
+  it('音声 1 件でも開く（M13 の G9）', () => {
+    useViewStore.setState({ selection: selectOne(30) });
+    expect(press({ key: 'e', code: 'KeyE', metaKey: true })).toBe(true);
+    expect(open).toHaveBeenCalledWith(expect.objectContaining({ id: 30, kind: 'audio' }));
+  });
+
+  it('開けない種類（動画）・複数・ゴミ箱の中では開かない', () => {
     useViewStore.setState({ selection: selectOne(20) });
     expect(press({ key: 'e', code: 'KeyE', metaKey: true })).toBe(false);
     useViewStore.setState({ selection: { ids: [10, 20], anchor: 10, focus: 20 } });

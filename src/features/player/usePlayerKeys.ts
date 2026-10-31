@@ -19,8 +19,8 @@ function isBlocked(): boolean {
   return document.querySelector('[data-sheet], [role="menu"], [data-editor]') !== null;
 }
 
-/** シアターで今出している画像を画像エディタで開く（再生は一時停止する）。画像でなければ false。 */
-export function editCurrentImage(): boolean {
+/** シアターで今出している項目（画像・音声）をエディタで開く（再生は一時停止する）。開けない種類なら false。 */
+export function editCurrentItem(): boolean {
   const controller = playerController();
   const itemId = usePlayerStore.getState().snapshot.itemId;
   const item = itemId !== null ? controller.item(itemId) : undefined;
@@ -52,8 +52,8 @@ export function handlePlayerKey(e: KeyboardEvent): boolean {
       return true;
     }
     if (key === 'e' && !e.shiftKey && !e.altKey) {
-      // 画像エディタ（M12）：今の画像を開く（スライドショーは止める）
-      return editCurrentImage();
+      // エディタ（M12・M13）：今の画像・音声を開く（スライドショー・再生は止める）
+      return editCurrentItem();
     }
     return false;
   }

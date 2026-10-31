@@ -162,6 +162,18 @@ describe('AssetSection（インスペクタの素材の欄）', () => {
     expect(startAudition).not.toHaveBeenCalled();
   });
 
+  it('エディタの中（audition が偽）では波形を出し、試聴のボタンは出さず、消えても試聴を止めない', () => {
+    const item = summary({ id: 2, kind: 'audio', durationMs: 92_000 });
+    useAuditionStore.setState({ itemId: 2, status: 'playing', mode: 'loop', fromStart: false });
+    const view = render(<AssetSection data={data(audioAsset())} item={item} audition={false} />);
+    expect(screen.getByTestId('waveform')).toHaveAttribute('data-hash', 'cd'.repeat(32));
+    expect(screen.queryByRole('button', { name: t.audition })).toBeNull();
+    expect(screen.queryByRole('button', { name: t.auditionStop })).toBeNull();
+    expect(screen.queryByRole('button', { name: t.fromStart })).toBeNull();
+    view.unmount();
+    expect(stopAudition).not.toHaveBeenCalled();
+  });
+
   it('欄が消えたら（シアターの情報のパネルを閉じた・次の曲へ進んだ）、この欄のアイテムの試聴を止める', () => {
     const item = summary({ id: 2, kind: 'audio', durationMs: 92_000 });
     useAuditionStore.setState({ itemId: 2, status: 'playing', mode: 'loop', fromStart: false });

@@ -42,11 +42,20 @@ const t = ja.inspector;
 export const TAG_FOCUS_KEY = 'inspector-tags';
 
 /**
- * 1 件のアイテムの詳細と編集（Main.dc.html のインスペクタ）。画像なら見出しの下に「編集…」（画像エディタ。M12）。
+ * 1 件のアイテムの詳細と編集（Main.dc.html のインスペクタ）。エディタで開ける種類（画像・音声）なら見出しの下に「編集…」（M12・M13）。
  * エディタの右パネルの中（`editable` が偽）では、「編集…」と「その他の操作」のメニュー（編集・クイックルック・再生・
  * ゴミ箱に入れるなど：編集中のアイテムを開き直す・ゴミ箱に入れる操作がエディタを通らずに動く）を出さない。
  */
-export function ItemInspector({ id, editable = true }: { id: number; editable?: boolean }) {
+export function ItemInspector({
+  id,
+  editable = true,
+  audition = true,
+}: {
+  id: number;
+  editable?: boolean;
+  /** 素材の欄の試聴のボタンを出すか（エディタの中では出さない）。 */
+  audition?: boolean;
+}) {
   const detail = useLoaded(`item-${id}`, () => getItemDetail(id));
   const openUnit = useViewStore((s) => s.openUnit);
   const [editingTitle, setEditingTitle] = useState(false);
@@ -105,7 +114,7 @@ export function ItemInspector({ id, editable = true }: { id: number; editable?: 
         )}
       </div>
 
-      <AssetSection data={assetData} item={item} />
+      <AssetSection data={assetData} item={item} audition={audition} />
 
       {trashed && (
         <section className={styles.trashed}>

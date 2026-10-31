@@ -218,8 +218,8 @@ describe('開く・閉じる', () => {
     expect(editorController()?.focus).toBe(2);
   });
 
-  it('画像でなければ開かない', async () => {
-    await openEditor(item({ kind: 'audio' }));
+  it('エディタで開けない種類（動画）は開かない', async () => {
+    await openEditor(item({ kind: 'video' }));
     expect(openEdit).not.toHaveBeenCalled();
     expect(useEditorStore.getState().phase).toBe('closed');
   });

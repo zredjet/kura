@@ -11,6 +11,8 @@
 import type { ComponentType } from 'react';
 
 import type { ItemSummaryDto } from '../../ipc/items';
+import { audioRuntime } from '../asset/audioRuntime';
+import { stopAudition } from '../asset/auditionStore';
 import { AUDIO_EDITOR } from './audio/audioKind';
 import type { EditorKindKeys } from './editorKeys';
 import { type EditorAdapterFactory, openEditorAs } from './editorStore';
@@ -62,12 +64,19 @@ export function everyEditorKindKeys(): EditorKindKeys[] {
   return EDITOR_KINDS.map((kind) => MODULES[kind].keys);
 }
 
-/** エディタを開く（開ける種類だけ。前のエディタは閉じる）。 */
+/**
+ * エディタを開く（開ける種類だけ。前のエディタは閉じる）。音声なら、開く前に素材の試聴と効果音を止める（プレーヤーは
+ * 止めない。エディタで鳴らし始めたら一時停止する。シアター・⌘E からは呼び手が一時停止する。M13 の段 6 の G9）。
+ */
 export function openEditor(
   item: ItemSummaryDto,
   options: { fromDraft?: boolean } = {},
 ): Promise<void> {
   const kind = editorKindOf(item);
   if (kind === null) return Promise.resolve();
+  if (kind === 'audio') {
+    stopAudition();
+    audioRuntime().sfx.stop();
+  }
   return openEditorAs(MODULES[kind].adapter, item, options);
 }

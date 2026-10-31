@@ -220,7 +220,7 @@ function SidePanel({ ui }: { ui: EditorKindUi }) {
     >
       {panel === 'info' && item ? (
         <div className={styles.info}>
-          <ItemInspector key={item.id} id={item.id} editable={false} />
+          <ItemInspector key={item.id} id={item.id} editable={false} audition={false} />
         </div>
       ) : (
         <ui.Ops />

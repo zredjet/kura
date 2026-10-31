@@ -17,6 +17,7 @@ import { formatCount, formatDuration } from '../../lib/format';
 import type { AnimPlayerHooks } from '../asset/AnimPlayer';
 import { QuickLookAnim } from '../asset/AssetStage';
 import { useAssetData } from '../asset/useAssetData';
+import { canEdit } from '../editor/kindTraits';
 import { useLoopRange } from '../asset/useLoopRange';
 import { WaveformView } from '../asset/WaveformView';
 import { PlayBar } from './PlayBar';
@@ -30,7 +31,7 @@ import { usePlayerStore } from './playerStore';
 import { SidePanel } from './SidePanel';
 import { canHideControls, HIDE_AFTER_MS, hoverTracker } from './theaterChrome';
 import styles from './Theater.module.css';
-import { editCurrentImage, usePlayerKeys } from './usePlayerKeys';
+import { editCurrentItem, usePlayerKeys } from './usePlayerKeys';
 
 const t = ja.player;
 
@@ -158,8 +159,9 @@ function TopBar({ chrome }: { chrome: ChromeProps }) {
   const togglePanel = usePlayerStore((s) => s.togglePanel);
   const requestTagFocus = usePlayerStore((s) => s.requestTagFocus);
   const setMode = usePlayerStore((s) => s.setMode);
-  // 画像エディタ（M12）：今出しているのが画像のときだけ
-  const editable = snapshot.kind === 'image' && snapshot.itemId !== null;
+  // エディタ（M12・M13）：今出しているのがエディタで開ける種類（画像・音声）のときだけ
+  const editable =
+    snapshot.itemId !== null && snapshot.kind !== null && canEdit({ kind: snapshot.kind });
 
   return (
     <div className={styles.top} data-tauri-drag-region {...chrome}>
@@ -194,7 +196,7 @@ function TopBar({ chrome }: { chrome: ChromeProps }) {
           type="button"
           className={styles.edit}
           title={`${ja.editor.edit}（⌘E）`}
-          onClick={() => editCurrentImage()}
+          onClick={() => editCurrentItem()}
         >
           {ja.editor.edit}
         </button>
