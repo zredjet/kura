@@ -301,6 +301,7 @@ impl Encoder for Mp3FfmpegEncoder {
                 buf: Vec::with_capacity(WRITE_FRAMES * info.channels * 4),
                 next: 0,
                 total,
+                pipe_failed: false,
             };
             match src.produce(None, &mut sink, mon) {
                 Ok(()) if sink.next == total => Ok(()),
@@ -313,6 +314,9 @@ impl Encoder for Mp3FfmpegEncoder {
                     produced = Some(e);
                     Err(io)
                 }
+                // 標準入力へ書けなかった（ffmpeg が読まずに終わった）：生産者の誤りではないので、ffmpeg の失敗を先に見る
+                // （feed の誤りとして返す。M13 段 3 の検証の直し）
+                Err(e) if sink.pipe_failed => Err(std::io::Error::other(e.to_string())),
                 Err(e) => {
                     let io = std::io::Error::other(e.to_string());
                     produced = Some(e);
@@ -333,7 +337,8 @@ impl Encoder for Mp3FfmpegEncoder {
         if mon.canceled() {
             return Err(EngineError::Canceled);
         }
-        // 生産者の誤り（描けない・源を読めない）はそのまま返す（ffmpeg の失敗に見せない）
+        // 生産者の誤り（描けない・源を読めない）はそのまま返す（ffmpeg の失敗に見せない）。標準入力へ書けなかったのは
+        // 生産者の誤りに入れていないので、ffmpeg の失敗（標準エラーの理由つき）が先に返る
         if let Some(e) = produced {
             return Err(e);
         }
@@ -412,6 +417,8 @@ struct Interleave<'w> {
     buf: Vec<u8>,
     next: u64,
     total: u64,
+    /// 標準入力への書き込みが失敗した（ffmpeg が読まずに終わった。生産者の誤りと分けて、ffmpeg の失敗を先に見る）。
+    pipe_failed: bool,
 }
 
 impl AudioSink for Interleave<'_> {
@@ -445,7 +452,10 @@ impl AudioSink for Interleave<'_> {
                     self.buf.extend_from_slice(&sanitize(p[i]).to_le_bytes());
                 }
             }
-            self.w.write_all(&self.buf)?;
+            if let Err(e) = self.w.write_all(&self.buf) {
+                self.pipe_failed = true;
+                return Err(e.into());
+            }
             off += k;
             self.next += k as u64;
             mon.progress(self.next, self.total);
@@ -760,6 +770,29 @@ mod tests {
             started.elapsed()
         );
         assert!(out.is_empty());
+    }
+
+    /// M13 段 3 の検証の直し #3：ffmpeg が標準入力を読み切る前に失敗したら（待ち行列とパイプを超える長さ）、パイプの誤り
+    /// （Broken pipe）ではなく ffmpeg の失敗（Encode。標準エラーの理由つき）を返す。作業フォルダは空。
+    #[test]
+    fn failing_before_reading_the_whole_input_is_an_encode_error() {
+        let t = fake("echo '[mp3 @ 0x1] [error] Option not found' >&2; exit 8");
+        let set = set_with(&t.codecs());
+        for seconds in [1usize, 20] {
+            let v = audio_value(48_000, vec![vec![0.1; 48_000 * seconds]; 2]);
+            match set.encode_bytes(&v, "mp3", &json!({}), &NoMonitor) {
+                Err(EngineError::Encode { codec, message }) => {
+                    assert_eq!(codec, ID);
+                    assert!(
+                        message.contains("Option not found") && message.contains("8"),
+                        "{seconds} 秒：{message}"
+                    );
+                }
+                other => panic!("{seconds} 秒：{other:?}"),
+            }
+            let left: Vec<_> = std::fs::read_dir(&t.work).unwrap().collect();
+            assert!(left.is_empty(), "{left:?}");
+        }
     }
 
     #[test]
