@@ -364,6 +364,46 @@ mod tests {
     }
 
     /// 出力の上限は Swift の側でも効く（超える書き込みを断って Limit）。設定の誤りは呼び方の誤り。
+    /// M13 段 3 の検証の直し：Swift は出力の配列を open で上限まで確保する（倍々に伸ばさない）。確保する大きさ（上限）は書く
+    /// バイト列を変えない：同じ値を、上限 `aac_max_output` と、その 8 倍で書いたものが同じ。
+    #[test]
+    fn reserved_output_capacity_does_not_change_the_bytes() {
+        let _g = shared();
+        let caps = codec_caps().unwrap();
+        let backend = AacToolboxBackend::new(caps);
+        for (rate, channels, frames) in [(48_000u32, 2u16, 30_000usize), (44_100, 1, 70_001)] {
+            let settings = AacSettings {
+                rate,
+                channels,
+                channel_mask: if channels == 1 { 0x4 } else { 0x3 },
+                mode: AacMode::VbrConstrained,
+                bitrate_kbps: 128,
+                quality: 127,
+            };
+            let src = tone(rate, usize::from(channels), frames);
+            let planes = audio(&src).to_planes().unwrap();
+            let write = |max_out: u64| {
+                let mut h = backend.open(&settings, max_out).unwrap();
+                let mut start = 0;
+                while start < frames {
+                    let end = (start + 4_096).min(frames);
+                    let ps: Vec<&[f32]> = planes.iter().map(|p| &p[start..end]).collect();
+                    h.write(&ps).unwrap();
+                    start = end;
+                }
+                let len = h.finish(&NoMonitor).unwrap();
+                let mut out = vec![0u8; usize::try_from(len).unwrap()];
+                h.copy(&mut out).unwrap();
+                out
+            };
+            let max = kura_engine::codec::platform::aac_max_output(frames as u64, channels);
+            let a = write(max);
+            let b = write(max * 8);
+            assert!(!a.is_empty());
+            assert_eq!(a, b, "{rate} {channels} {frames}");
+        }
+    }
+
     #[test]
     fn swift_enforces_the_output_limit_and_settings() {
         let _g = shared();

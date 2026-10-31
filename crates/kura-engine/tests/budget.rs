@@ -1837,3 +1837,55 @@ fn stream_estimate_bounds_streamed_saves() {
         }
     }
 }
+
+/// E25（M13 段 3 の検証の直し）：AAC（偽の backend）の流れの見積もりは、出力を 2 つ分数える（finish のあと Swift の出力の
+/// 配列と Rust の写しが同時にある。配列は open で上限まで確保するので倍々に伸びない）。60 分・48 kHz・モノラルの m4a。
+#[test]
+fn stream_estimate_counts_two_aac_outputs() {
+    use kura_engine::codec::platform::{PlatformAacEncoder, aac_max_output};
+    use kura_engine::testing::platform::FakeAacBackend;
+    let engine = engine();
+    let mut codecs = CodecSet::pinned();
+    codecs
+        .add_encoder(Arc::new(PlatformAacEncoder::new(FakeAacBackend::new())))
+        .unwrap();
+    let frames = 48_000 * 60 * 60;
+    let shape = Shape::Audio {
+        rate: 48_000,
+        channels: 1,
+        frames: Dim::Exact(frames),
+    };
+    let shapes = BTreeMap::from([(InputId(0), shape)]);
+    let mut g = Graph::new_single();
+    g.push_linear("audio.trim", 1, json!({ "start": 1_000, "end": null }), 1)
+        .unwrap();
+    let plan = engine.compile(&g, &shapes).unwrap();
+    let out_shape = plan.output_shapes()[0].1;
+    let Shape::Audio {
+        frames: out_frames, ..
+    } = out_shape
+    else {
+        panic!("音声の形ではない");
+    };
+    let opts = json!({});
+    let output = aac_max_output(out_frames.max(), 1);
+    let work = codecs.encode_stream_work_bytes("m4a", &out_shape, &opts);
+    assert!(work >= 2 * output, "{work} < 2 × {output}");
+    let resident = 64 * MIB;
+    let spec = EstimateSpec::new(3)
+        .stream(OutputId(0))
+        .digests(true)
+        .input(InputId(0), Source::Lazy { resident })
+        .output(
+            OutputId(0),
+            Sink::Encode {
+                codecs: &codecs,
+                format: "m4a",
+                opts: &opts,
+            },
+        );
+    let e = engine.estimate(&plan, &spec, None).unwrap();
+    assert_eq!(e.stream_passes, 1, "{e:?}");
+    assert!(e.encode >= resident + 2 * output, "{e:?}");
+    assert!(e.peak >= resident + 2 * output, "{e:?}");
+}

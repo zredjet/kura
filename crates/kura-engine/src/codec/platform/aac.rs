@@ -291,7 +291,9 @@ impl<B: AacBackend> Encoder for PlatformAacEncoder<B> {
         format == "m4a"
     }
 
-    /// 出力はメモリ（backend）にある：`aac_max_output` ＋ 渡す作業列（[`WRITE_FRAMES`] × チャンネル × 4）＋ 1 MiB。
+    /// 出力はメモリ（backend）にある：2 × `aac_max_output` ＋ 渡す作業列（[`WRITE_FRAMES`] × チャンネル × 4）＋ 1 MiB。
+    /// `finish` のあと、backend の出力（kura-mac の Swift は open で上限まで確保する）と Rust の写し（`copy` の書き先）が同時に
+    /// あるので 2 つ分（M13 段 3 の検証の直し。出力をメモリに持たない形は段 7）。
     fn stream_work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
         let (channels, frames) = match shape {
             Shape::Audio {
@@ -300,6 +302,7 @@ impl<B: AacBackend> Encoder for PlatformAacEncoder<B> {
             _ => (0, 0),
         };
         aac_max_output(frames, channels)
+            .saturating_mul(2)
             .saturating_add((WRITE_FRAMES as u64) * u64::from(channels) * 4)
             .saturating_add(1 << 20)
     }

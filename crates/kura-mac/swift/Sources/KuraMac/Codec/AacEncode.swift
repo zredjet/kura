@@ -154,6 +154,9 @@ private func openAac(_ s: kura_aac_settings, _ maxOut: Int64) -> Result<AacEncod
         return .failure(.unsupported("AAC の形式を作れません（\(describe(status))）"))
     }
     let h = AacEncodeHandle(maxOut: limit, channels: Int(s.channels))
+    // 出力の配列は上限まで先に確保する（倍々に伸ばさない。伸ばす瞬間に古い領域と新しい領域が同時に残らない）。上限は
+    // Rust が予算に入れた大きさ（aac_max_output）で、触れた頁だけが実際に使われる。書くバイト列は変わらない
+    h.memory.output.reserveCapacity(limit)
     let client = Unmanaged.passUnretained(h.memory).toOpaque()
     var file: AudioFileID?
     status = AudioFileInitializeWithCallbacks(
