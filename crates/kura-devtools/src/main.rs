@@ -25,7 +25,7 @@
 //! - `bench edit [--quick] [--threads 3,4,16] [--photo <file>] [--json <file>] [--markdown <file>] …`：編集の性能
 //!   （NFR-11〜17。`bench_edit` の冒頭）
 //! - `edit shape --in <file>` / `edit render --doc <文書.json> --in <file> --out <file>`：編集のエンジンを手で確かめる（docs/editing.md）
-//! - `edit crash-loop --library <新しい場所> [--runs 50] [--seed 1]`：保存を繰り返す子を SIGKILL しては開き直し、食い違いを数える
+//! - `edit crash-loop --library <新しい場所> [--runs 50] [--seed 1] [--audio-minutes 0]`：保存を繰り返す子を SIGKILL しては開き直し、食い違いを数える
 //!   （M12。`crash_loop` の冒頭）
 //! - `vorbis-quality --out <dir> [--quick] [--input <file>]... [--reference <音>/<ラベル>=<ogg>]...`：
 //!   自作の Ogg Vorbis のエンコーダの品質を記録する（M10 段 7。`vorbis_quality` の冒頭）

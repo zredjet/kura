@@ -1,5 +1,10 @@
 //! 本当に落とす試験（M12 の段 2。docs/architecture.md §13、docs/editing.md §14.1）：
-//! `edit crash-loop --library <path> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500]`。
+//! `edit crash-loop --library <path> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0]`。
+//!
+//! `--audio-minutes n`（M13 段 3。既定 0。確かめるときは 6）を付けると、親は n 分の合成の FLAC（44.1 kHz ステレオ）も
+//! 取り込み、子は画像と音声を交互に保存する（音声はランダムな gain・fade・normalize・trim を、flac・ogg・wav に流して書く。
+//! 作業用の PCM を通る）。音声の保存は長いので、待つ上限は max(`--max-ms`, n × 1,000 ms) に広げる。確かめに「開き直したあと
+//! `staging/pcm` が空」と「アイテムが 2 個」を足す。
 //!
 //! 1. `--library` の場所に新しいライブラリを作る（もう何かあれば断る。本物のライブラリを指さないため。テンポラリや作業用の
 //!    フォルダを渡す）。ドット絵の PNG を 1 つ、アプリと同じ取り込みのジョブで入れる。
@@ -36,7 +41,10 @@ use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 use serde_json::{Value as Json, json};
 
-const USAGE: &str = "使い方: kura-devtools edit crash-loop --library <新しいライブラリの場所> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500]";
+const USAGE: &str = "使い方: kura-devtools edit crash-loop --library <新しいライブラリの場所> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0]";
+
+/// 取り込む合成の FLAC のレート。
+const AUDIO_RATE: u32 = 44_100;
 
 /// 開き直してジョブが動き終えるのを待つ上限。
 const SETTLE: Duration = Duration::from_secs(600);
@@ -54,6 +62,8 @@ struct Opts {
     seed: u64,
     min_ms: u64,
     max_ms: u64,
+    /// 取り込む合成の音声の長さ（分。0 なら音声を入れない）。
+    audio_minutes: u64,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -63,6 +73,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         seed: 1,
         min_ms: 10,
         max_ms: 500,
+        audio_minutes: 0,
     };
     let mut library = None;
     let mut it = args.iter();
@@ -81,6 +92,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--seed" => opts.seed = num(value()?)?,
             "--min-ms" => opts.min_ms = num(value()?)?,
             "--max-ms" => opts.max_ms = num(value()?)?,
+            "--audio-minutes" => opts.audio_minutes = num(value()?)?,
             other => return Err(format!("知らない引数 {other}。{USAGE}")),
         }
     }
@@ -99,10 +111,17 @@ fn quiet() -> kura_core::library::EventSink {
 pub fn run(args: &[String]) -> Result<(), String> {
     let opts = parse(args)?;
     let started = Instant::now();
-    let root = create_library(&opts.library)?;
+    let root = create_library(&opts.library, opts.audio_minutes)?;
     let log = log_path(&root);
     let mut rng = ChaCha8Rng::seed_from_u64(opts.seed);
-    let span = opts.max_ms - opts.min_ms + 1;
+    // 音声の保存は長い（作業用の PCM・流して書く）ので、落とす時刻の上限を広げる
+    let max_ms = if opts.audio_minutes > 0 {
+        opts.max_ms.max(opts.audio_minutes.saturating_mul(1_000))
+    } else {
+        opts.max_ms
+    };
+    let span = max_ms - opts.min_ms + 1;
+    let want_items = if opts.audio_minutes > 0 { 2 } else { 1 };
     let mut runs = Vec::new();
     let mut mismatches = 0usize;
     let mut failed_before = (0i64, 0i64);
@@ -118,7 +137,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let at = probe(&root)?;
         at_crash.add(&at);
         let check = verify(&root)?;
-        let mut issues = check.issues(failed_before);
+        let mut issues = check.issues(failed_before, want_items);
         if let Some(status) = &exited_early {
             issues.push(format!("子が落とす前に終わりました（{status}）"));
         }
@@ -148,7 +167,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "library": root.display().to_string(),
         "runs": opts.runs,
         "seed": opts.seed,
-        "delayMs": { "min": opts.min_ms, "max": opts.max_ms },
+        "delayMs": { "min": opts.min_ms, "max": max_ms },
+        "audioMinutes": opts.audio_minutes,
         "mismatches": mismatches,
         "runsWithMismatch": runs.iter().filter(|r| r["issues"].as_array().is_some_and(|i| !i.is_empty())).map(|r| r["run"].clone()).collect::<Vec<Json>>(),
         "childExitedEarly": early,
@@ -242,8 +262,9 @@ fn log_path(root: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// 新しいライブラリを作り、ドット絵の PNG を 1 つ取り込む。ライブラリの根の場所を返す。
-fn create_library(path: &Path) -> Result<PathBuf, String> {
+/// 新しいライブラリを作り、ドット絵の PNG を 1 つ（`audio_minutes` が 0 でなければ、その長さの合成の FLAC も）取り込む。
+/// ライブラリの根の場所を返す。
+fn create_library(path: &Path, audio_minutes: u64) -> Result<PathBuf, String> {
     let root = kura_core::library::normalize_library_path(path);
     if path.exists() || root.exists() {
         return Err(format!(
@@ -269,6 +290,20 @@ fn create_library(path: &Path) -> Result<PathBuf, String> {
         .encode_bytes(&value, "png", &json!({}), &NoMonitor)
         .map_err(|e| e.to_string())?;
     std::fs::write(src.join("sprite.png"), png).map_err(|e| e.to_string())?;
+    if audio_minutes > 0 {
+        let audio = InputGen::AudioNoise {
+            rate: AUDIO_RATE,
+            channels: 2,
+            frames: audio_minutes * 60 * u64::from(AUDIO_RATE),
+            seed: 13,
+        }
+        .generate()
+        .map_err(|e| e.to_string())?;
+        let (flac, _) = CodecSet::pinned()
+            .encode_bytes(&audio, "flac", &json!({ "bits": 16 }), &NoMonitor)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(src.join("noise.flac"), flac).map_err(|e| e.to_string())?;
+    }
     let id = start_import(
         session.jobs(),
         &ImportInput {
@@ -330,6 +365,8 @@ struct Check {
     invariants: Vec<String>,
     pending: i64,
     staging: Vec<String>,
+    /// `staging/pcm`（作業用の PCM）に残ったファイル。
+    work_pcm: Vec<String>,
     live_edit_jobs: i64,
     failed_edit_jobs: i64,
     done_edit_jobs: i64,
@@ -346,8 +383,8 @@ struct Check {
 }
 
 impl Check {
-    /// 食い違いの文（`failed_before` は前の回までに失敗した保存・GC のジョブの数）。
-    fn issues(&self, failed_before: (i64, i64)) -> Vec<String> {
+    /// 食い違いの文（`failed_before` は前の回までに失敗した保存・GC のジョブの数、`want_items` はアイテムの数）。
+    fn issues(&self, failed_before: (i64, i64), want_items: i64) -> Vec<String> {
         let mut out = Vec::new();
         for (when, [missing, orphan, unreferenced]) in
             [("開いたとき", self.open), ("終わったあと", self.after)]
@@ -364,6 +401,11 @@ impl Check {
             out.push(format!("台帳の予告が {} 行残っています", self.pending));
         }
         out.extend(self.staging.iter().map(|p| format!("staging に残骸：{p}")));
+        out.extend(
+            self.work_pcm
+                .iter()
+                .map(|p| format!("開き直したあとの staging/pcm に残骸：{p}")),
+        );
         if self.live_edit_jobs != 0 {
             out.push(format!(
                 "動き終えていない保存のジョブが {} 本",
@@ -400,8 +442,11 @@ impl Check {
                 self.uncommitted
             ));
         }
-        if self.items != 1 {
-            out.push(format!("アイテムが {} 個（1 個のはず）", self.items));
+        if self.items != want_items {
+            out.push(format!(
+                "アイテムが {} 個（{want_items} 個のはず）",
+                self.items
+            ));
         }
         out
     }
@@ -433,6 +478,12 @@ fn verify(root: &Path) -> Result<Check, String> {
     let session = LibrarySession::open(root, quiet(), crate::services())
         .map_err(|e| format!("開き直せません: {e}"))?;
     session.wait_ready();
+    // 開いたときの staging の掃除で、前の子の作業用の PCM も消えている（ジョブを動かす前に見る）
+    let mut work_pcm = Vec::new();
+    files_under(
+        &session.library().layout().staging_dir().join("pcm"),
+        &mut work_pcm,
+    );
     let open = session
         .integrity()
         .map(|r| [r.missing_files, r.orphan_files, r.unreferenced_blobs])
@@ -481,6 +532,7 @@ fn verify(root: &Path) -> Result<Check, String> {
         invariants,
         pending: count(lib, "SELECT count(*) FROM ledger_pending")?,
         staging,
+        work_pcm,
         live_edit_jobs: count(
             lib,
             "SELECT count(*) FROM jobs WHERE kind = 'edit' AND state NOT IN ('done', 'failed', 'canceled')",
@@ -566,7 +618,51 @@ fn random_doc(rng: &mut ChaCha8Rng) -> Result<Graph, String> {
     Ok(g)
 }
 
-/// `edit crash-loop-child`（子）：保存を繰り返す（親が SIGKILL するまで）。GC の時計だけ 8 日進めて開く。
+/// 音声の文書（元に対する累積：ランダムな trim・gain・fade・normalize と、出力の形式 flac・ogg・wav。長さ `frames`）。
+fn random_audio_doc(rng: &mut ChaCha8Rng, frames: u64) -> Result<Graph, String> {
+    let mut g = Graph::new_single();
+    let pick = |rng: &mut ChaCha8Rng, n: u64| u64::from(rng.next_u32()) % n.max(1);
+    if rng.next_u32().is_multiple_of(2) {
+        let start = pick(rng, frames / 4);
+        g.push_linear("audio.trim", 1, json!({ "start": start, "end": null }), 0)
+            .map_err(|e| e.to_string())?;
+    }
+    g.push_linear(
+        "audio.gain",
+        1,
+        json!({ "db": (pick(rng, 120) as f64 - 60.0) / 10.0 }),
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    if rng.next_u32().is_multiple_of(2) {
+        let r = u64::from(AUDIO_RATE);
+        g.push_linear(
+            "audio.fade",
+            1,
+            json!({ "fadeIn": pick(rng, 5 * r), "fadeOut": pick(rng, 5 * r), "curve": "linear" }),
+            0,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if rng.next_u32().is_multiple_of(3) {
+        g.push_linear(
+            "audio.normalize",
+            1,
+            json!({ "target": -(14.0 + pick(rng, 100) as f64 / 10.0), "peakLimit": -1.0 }),
+            0,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let format = ["flac", "ogg", "wav"][pick(rng, 3) as usize];
+    g.outputs[0].format = kura_engine::doc::FormatChoice::To {
+        format: format.into(),
+        options: json!({}),
+    };
+    Ok(g)
+}
+
+/// `edit crash-loop-child`（子）：保存を繰り返す（親が SIGKILL するまで）。GC の時計だけ 8 日進めて開く。音声のアイテムが
+/// あれば、画像と音声を交互に保存する。
 pub fn child(args: &[String]) -> Result<(), String> {
     let mut library = None;
     let mut seed = 0u64;
@@ -589,9 +685,27 @@ pub fn child(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("開けません: {e}"))?;
     session.wait_ready();
     let lib = session.library().clone();
-    let item = count(&lib, "SELECT min(id) FROM items")?;
+    let image = count(&lib, "SELECT min(id) FROM items WHERE kind = 'image'")?;
+    let audio = count(
+        &lib,
+        "SELECT coalesce(min(id), 0) FROM items WHERE kind = 'audio'",
+    )?;
+    let audio_frames = if audio > 0 {
+        count(
+            &lib,
+            "SELECT coalesce(json_extract(codec_info, '$.frames'), 0) FROM items WHERE id = (SELECT min(id) FROM items WHERE kind = 'audio')",
+        )
+        .unwrap_or(0)
+        .max(i64::from(AUDIO_RATE))
+    } else {
+        0
+    };
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut turn = 0u64;
     loop {
+        turn += 1;
+        let on_audio = audio > 0 && turn.is_multiple_of(2);
+        let item = if on_audio { audio } else { image };
         let head = lib
             .db()
             .read(|c| versions::head(c, item))
@@ -607,7 +721,11 @@ pub fn child(args: &[String]) -> Result<(), String> {
             }
         } else {
             SaveAction::Overwrite {
-                graph: random_doc(&mut rng)?,
+                graph: if on_audio {
+                    random_audio_doc(&mut rng, audio_frames as u64)?
+                } else {
+                    random_doc(&mut rng)?
+                },
             }
         };
         let id = match start_save(
