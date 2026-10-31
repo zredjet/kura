@@ -269,3 +269,58 @@ fn long_measure_survives_a_canceled_preview() {
     assert_eq!(shown_audio(&out.view).samples_id, a);
     assert_eq!(position(), None, "確定の表示で標本が替わったので捨てた");
 }
+
+/// 段 4B の検証の直し 6（#8）：計りの窓の途中で中止されたら（新しい要求・閉じる）、その窓は扇に渡さず次の窓の番号を進めない
+/// （次の区切りで同じ窓を流し直す）。Failed にせず計りかけを残し、そのあとの普通の区切りで計り終えた結果は、全体の描画に
+/// 当てた解析とビット単位で同じ（窓を飛ばしたり、扇に半端に渡したりしていない）。
+#[test]
+fn long_measure_redoes_a_window_canceled_midway() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use kura_engine::monitor::CancelAfter;
+
+    let env = Env::new();
+    let frames = 130 * C;
+    let bytes = noise_wav(8_000, 1, frames, 84);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open_with(id, vp(&[], false, false)).session.clone();
+    let idle = vp(&[(0, C)], false, false);
+    let out = env.step(&s, vec![add(0, "audio.gain", json!({ "db": -6.0 }))], &idle);
+    let sid = shown_audio(&out.view).samples_id.clone();
+    assert!(matches!(
+        measure(&env.env(), &s).unwrap(),
+        LoudnessState::Measuring { .. }
+    ));
+    let editor = env.editor(&s);
+    // 親の見張りが n 回目の問いから中止を返す世代で、計りを直に進める（1 回目は窓の頭の確かめ。2 回目からは窓を流している
+    // 途中のどこか）
+    for n in 2..=5 {
+        let mut guard = editor.lock_state();
+        let st = guard.as_mut().unwrap();
+        let (_, before, windows) = st.audio.as_ref().unwrap().measure.run_position().unwrap();
+        let ticket = editor.latest.issue(Arc::new(CancelAfter::new(n)));
+        editor.advance_measure(st, &sid, Instant::now() + Duration::from_secs(60), &ticket);
+        let a = st.audio.as_ref().unwrap();
+        let (run, next, _) = a.measure.run_position().expect("中止で計りかけを捨てない");
+        assert_eq!(run, sid);
+        if n == 2 {
+            assert_eq!(next, before, "途中で中止した窓は進めない");
+        }
+        assert!(next >= before && next < windows, "{n}: {before} → {next}");
+        assert!(
+            matches!(a.measure.state(&sid), LoudnessState::Measuring { .. }),
+            "{n}: {:?}",
+            a.measure.state(&sid)
+        );
+    }
+    let (state, _) = work_until_measured(&env, &s, &vp(&[(0, C)], true, false));
+    let LoudnessState::Ready { samples_id, values } = &state else {
+        panic!("{state:?}")
+    };
+    assert_eq!(*samples_id, sid);
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -6.0 }), 1)
+        .unwrap();
+    same_bits(values, &whole_loudness(&bytes, &g));
+}

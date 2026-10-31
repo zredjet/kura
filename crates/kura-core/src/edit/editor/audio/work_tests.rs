@@ -17,9 +17,9 @@ use kura_engine::{Digest, EngineError, Graph, Limits, Monitor, NoMonitor, Shape,
 use serde_json::json;
 
 use super::session_tests::*;
-use super::source::{WorkCx, make_work, read_shape_staged, work_threshold};
+use super::source::{WorkCx, make_work, open_work, read_shape_staged, work_threshold};
 use crate::CoreError;
-use crate::edit::editor::{EditorError, OpenRequest, Viewport, close, open};
+use crate::edit::editor::{EditorError, OpenRequest, ProblemCode, Viewport, close, open};
 use crate::edit::{EngineFactory, RuntimeConfig};
 
 /// 予算 32 MiB：丸ごと読む上限と作業用のファイルの境は 8 MiB（8 kHz モノラルで約 2.1 M フレーム）。
@@ -967,6 +967,161 @@ fn work_file_errors_keep_their_kind() {
         matches!(&err, EditorError::Failed(m) if m.starts_with("元を読めません")),
         "{err}"
     );
+    assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+    let u = env.usage();
+    assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
+    assert!(env.engine.current_editor().is_none());
+}
+
+fn refuse_a() -> EngineError {
+    EngineError::Unsupported("段 A では読まない".into())
+}
+
+fn refuse_b() -> EngineError {
+    EngineError::Unsupported("段 B では読まない".into())
+}
+
+/// 形は固定の FLAC と同じに読み、流して読むと `refuse` で断る段。
+fn refusing_flac(id: &'static str, refuse: fn() -> EngineError) -> Arc<dyn Decoder> {
+    Arc::new(Stage::renamed(pinned_decoder("flac"), id, "flac").refusing(refuse))
+}
+
+/// 段 4B の検証の直し 6（#3・#10）：形を読めた段が流して読む途中で `Unsupported` を返したら、次の段で形を読み直し、その段の
+/// 見積もりで確保し直して作業用のファイルを作る。記録・値は丸ごと読み（`CodecSet::decode`。段の順で同じ後ろの段が読む）と
+/// 同じで、作り終えたら対話の確保は 0 に戻る。エディタも後ろの段の記録・指紋で開く。
+#[test]
+fn a_stage_refusing_the_stream_falls_through_to_the_next_stage() {
+    let env = flac_env(SMALL, || {
+        vec![
+            refusing_flac("refusing-flac-dec/1", refuse_a),
+            pinned_decoder("flac"),
+        ]
+    });
+    let flac = long_flac(40 * C);
+    let id = add_audio(&env.lib, &flac, "flac");
+    let dir = env.engine.work_pcm().dir().to_path_buf();
+    let hash = *blake3::hash(&flac).as_bytes();
+    let path = env.lib.layout().content_path(&hash, "flac");
+    let runtime = env.engine.runtime().unwrap().clone();
+    let codecs = env.engine.codecs();
+    let (opts, limits) = (DecodeOptions::default(), Limits::default());
+    let cx = WorkCx {
+        runtime: &runtime,
+        codecs: &codecs,
+        store: env.engine.work_pcm(),
+        path: &path,
+        source: Digest(hash),
+        format: "flac",
+        opts: &opts,
+        limits: &limits,
+        mon: &NoMonitor,
+    };
+    let (shape, stage) = read_shape_staged(&cx, None).unwrap().unwrap();
+    assert_eq!(stage.id, "refusing-flac-dec/1", "形は前の段で読める");
+    let handle = make_work(&cx, shape, stage).unwrap();
+    assert_eq!(
+        runtime.budget().usage().unwrap().interactive,
+        0,
+        "作る間の確保を返した"
+    );
+    let (whole, stamp) = codecs
+        .decode(&mut Cursor::new(&flac), "flac", &opts, &limits, &NoMonitor)
+        .unwrap();
+    assert_eq!(stamp.codec, "flac-symphonia-dec/1");
+    assert_eq!(
+        handle.pcm().decoded,
+        stamp,
+        "記録は後ろの段のもの（丸ごと読みと同じ）"
+    );
+    let made = files(&dir);
+    assert_eq!(made.len(), 1, "{made:?}");
+    assert!(made[0].extension().is_some_and(|x| x == "wav"));
+    let opened = open_work(
+        handle,
+        &limits,
+        runtime.preview_threads(),
+        runtime.budget().total(),
+    )
+    .unwrap();
+    let (Value::Audio(got), Value::Audio(whole)) = (&opened.value, &whole) else {
+        panic!("音声ではありません")
+    };
+    same_samples(got, whole);
+    assert_eq!(got.meta, whole.meta);
+    drop(opened);
+    assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+
+    let opened = env.open(id);
+    let a = opened.source.audio.clone().unwrap();
+    assert!(a.lazy);
+    assert_eq!(a.decoder, stamp.codec);
+    let editor = env.editor(&opened.session);
+    let guard = editor.lock_state();
+    assert_eq!(
+        guard.as_ref().unwrap().inputs[&InputId(0)].fingerprint,
+        Fingerprint::of_decoded(&stamp)
+    );
+}
+
+/// 段 4B の検証の直し 6（#3・#10）：どの段も流しを断る組では「元を読めません」（Failed）で断り、書きかけ・作業用のファイル・
+/// 取り置き・確保を残さず、エディタも残らない。断る段が 1 つならその段の誤り。2 つ以上なら最後に断った段の誤り（丸ごと
+/// 読みの `decode_any`・段 2 の解析のジョブと同じ）。
+#[test]
+fn every_stage_refusing_the_stream_fails_without_leftovers() {
+    let flac = long_flac(40 * C);
+    for two in [false, true] {
+        let stages: fn() -> Vec<Arc<dyn Decoder>> = if two {
+            || {
+                vec![
+                    refusing_flac("refusing-flac-dec/1", refuse_a),
+                    refusing_flac("refusing2-flac-dec/1", refuse_b),
+                ]
+            }
+        } else {
+            || vec![refusing_flac("refusing-flac-dec/1", refuse_a)]
+        };
+        let env = flac_env(SMALL, stages);
+        let id = add_audio(&env.lib, &flac, "flac");
+        let dir = env.engine.work_pcm().dir().to_path_buf();
+        let err = open_err(&env, id);
+        let want = if two { "段 B" } else { "段 A" };
+        assert!(
+            matches!(&err, EditorError::Failed(m) if m.starts_with("元を読めません") && m.contains(want)),
+            "{two}: {err}"
+        );
+        assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+        assert_eq!(env.engine.work_pcm().usage().0, 0);
+        let u = env.usage();
+        assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
+        assert!(env.engine.current_editor().is_none());
+    }
+}
+
+/// 段 4B の検証の直し 6（#10）：流して読む段の道具がない（`CodecMissing`）ときは、次の段へ回さずに ToolMissing で断る（丸ごと
+/// 読みと同じ）。書きかけ・取り置き・確保を残さない。
+#[test]
+fn a_missing_tool_is_reported_as_tool_missing() {
+    let env = flac_env(SMALL, || {
+        vec![
+            Arc::new(
+                Stage::renamed(pinned_decoder("flac"), "fake-ffmpeg-dec/1", "flac").refusing(
+                    || EngineError::CodecMissing {
+                        tool: "ffmpeg".into(),
+                    },
+                ),
+            ),
+            pinned_decoder("flac"),
+        ]
+    });
+    let flac = long_flac(40 * C);
+    let id = add_audio(&env.lib, &flac, "flac");
+    let dir = env.engine.work_pcm().dir().to_path_buf();
+    let err = open_err(&env, id);
+    assert!(
+        matches!(&err, EditorError::ToolMissing(t) if t == "ffmpeg"),
+        "{err}"
+    );
+    assert_eq!(err.problem().code, ProblemCode::ToolMissing);
     assert!(files(&dir).is_empty(), "{:?}", files(&dir));
     let u = env.usage();
     assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));

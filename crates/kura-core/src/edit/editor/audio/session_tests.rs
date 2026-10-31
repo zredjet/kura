@@ -301,18 +301,19 @@ fn wav_opens_lazily_and_flac_whole() {
     assert_eq!(shown_audio(&opened.outcome.view).valid, vec![(0, 2 * C)]);
 }
 
-/// アンカーを置く（保存のジョブの代わり）：アイテムの元 `bytes` を読んだ値を、見出しの記録 `header` でアンカーの f32 WAV に
-/// 書き、DB の行の記録を元を読んだ記録にする。返すのは DB の行の記録。
+/// アンカーを置く（保存のジョブの代わり）：アイテムの元 `bytes`（形式 `format`）を読んだ値を、見出しの記録 `header` で
+/// アンカーの f32 WAV に書き、DB の行の記録を元を読んだ記録にする。返すのは DB の行の記録。
 fn place_anchor(
     lib: &Library,
     bytes: &[u8],
+    format: &str,
     header: impl FnOnce(&kura_engine::codec::DecodeStamp) -> kura_engine::codec::DecodeStamp,
 ) -> kura_engine::codec::DecodeStamp {
     use kura_engine::codec::anchor;
     let (value, decoded) = CodecSet::pinned()
         .decode(
             &mut std::io::Cursor::new(bytes),
-            "wav",
+            format,
             &Default::default(),
             &Default::default(),
             &NoMonitor,
@@ -325,7 +326,7 @@ fn place_anchor(
         &header(&decoded),
         &anchor::AnchorContext {
             source: Some(Digest(source)),
-            format: Some("wav".into()),
+            format: Some(format.into()),
             options: Default::default(),
         },
         &Default::default(),
@@ -366,7 +367,7 @@ fn anchored_audio_opens_lazily_with_the_recorded_decoder() {
     for (seed, same) in [(61u64, true), (62, false)] {
         let bytes = noise_wav(8_000, 2, 2 * C + 9, seed);
         let id = add_audio(&env.lib, &bytes, "wav");
-        let recorded = place_anchor(&env.lib, &bytes, |d| {
+        let recorded = place_anchor(&env.lib, &bytes, "wav", |d| {
             let mut h = d.clone();
             if !same {
                 // 値は同じで、見出しの記録だけが DB と違う
@@ -417,6 +418,51 @@ fn long_whole_reads_open_from_a_work_file() {
         0,
         "前のエディタを閉じたら作業用のファイルは消える"
     );
+}
+
+/// 段 4B の検証の直し 6（#11）：アンカーがあって遅延で使えない（見出しの記録が DB と違う）長い音声は、作業用のファイルに
+/// せず、記録のデコーダで丸ごと読み直す道に落ちる。丸ごと読む上限を超えれば TooLarge（「まだエディタで開けません」。既知の
+/// 限界）で断り、作業用のファイル・取り置きを残さず、エディタも残らない。
+#[test]
+fn anchored_long_audio_that_cannot_be_used_lazily_is_too_large() {
+    // 予算 16 MiB：丸ごと読む上限と作業用のファイルの境は 4 MiB
+    let env = Env::with(Arc::new(Budgeted(16 << 20)));
+    let value = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 1,
+        frames: 20 * C,
+        seed: 9,
+    }
+    .generate()
+    .unwrap();
+    let flac = encode(&value, "flac");
+    let id = add_audio(&env.lib, &flac, "flac");
+    place_anchor(&env.lib, &flac, "flac", |d| {
+        let mut h = d.clone();
+        h.codec = "other-kura-dec/9".into();
+        h
+    });
+    let err = open(
+        &env.env(),
+        &OpenRequest {
+            item_id: id,
+            viewport: Viewport::audio_idle(),
+            from_draft: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, EditorError::TooLarge(m) if m.contains("まだエディタで開けません")),
+        "{err}"
+    );
+    assert_eq!(
+        env.engine.work_pcm().usage().0,
+        0,
+        "作業用のファイルにしない"
+    );
+    let u = env.usage();
+    assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
+    assert!(env.engine.current_editor().is_none());
 }
 
 /// 画像・音声のほかは断る。
