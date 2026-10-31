@@ -622,12 +622,15 @@ impl Wake {
 }
 
 /// 標準出力を `READ_CHUNK` ずつ読んで受け手へ渡す（パイプを持つ `'static` のスレッドで動く）。受け手が遅くて渡すのを
-/// 待つあいだは `open` から外す（パイプを開いたままの子孫が残っているかの判定に、受け手の遅さを数えない）。
+/// 待つあいだは `open` から外し（パイプを開いたままの子孫が残っているかの判定に、受け手の遅さを数えない）、`handing` を
+/// 立てる（無出力の判定にも数えない。受け手が呼び手の一括のプールで入れ子の仕事に取られている間など。M13 段 2 の検証の
+/// 直し。中止と時間切れは見張りが見る）。渡し終えたら出力が進んだとみなす。
 fn pump_stdout(
     mut pipe: impl std::io::Read,
     tx: &mpsc::SyncSender<Vec<u8>>,
     clock: &Clock,
     open: &AtomicUsize,
+    handing: &AtomicBool,
 ) {
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
@@ -639,7 +642,10 @@ fn pump_stdout(
         };
         clock.touch();
         open.fetch_sub(1, Ordering::SeqCst);
+        handing.store(true, Ordering::SeqCst);
         let sent = tx.send(buf[..n].to_vec());
+        clock.touch();
+        handing.store(false, Ordering::SeqCst);
         open.fetch_add(1, Ordering::SeqCst);
         if sent.is_err() {
             break;
@@ -814,15 +820,17 @@ impl Drop for CloseGuard<'_> {
 }
 
 /// 落ちても・エラーで戻っても、子をグループごと止めて回収する（ゾンビ・孤児を残さない）。グループへの SIGKILL は、
-/// 見張りがもう送っていれば送らない（1 回だけ）。
+/// 見張りがもう送っていれば送らない（1 回だけ）。子は鍵の中に置く（受け手を呼び手のスレッドで回す形では、見張りが
+/// `try_wait` で子の終わりを知る）。
 struct Reaper<'a> {
-    child: Option<Child>,
+    child: Mutex<Option<Child>>,
     group_killed: &'a AtomicBool,
 }
 
 impl Drop for Reaper<'_> {
     fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
+        let slot = self.child.get_mut().unwrap_or_else(PoisonError::into_inner);
+        if let Some(mut c) = slot.take() {
             if matches!(c.try_wait(), Ok(None)) {
                 if !self.group_killed.swap(true, Ordering::SeqCst) {
                     let _ = signal_group(c.id(), "-KILL");
@@ -909,7 +917,8 @@ fn spawn_pipe_thread(
 ///   あとも見る）、理由を 1 回だけ記録してグループに SIGTERM、2 秒で SIGKILL。標準出力の上限・受け手のエラーでも同じく
 ///   止める。グループへの SIGKILL は 1 回だけ送る（`kill` を起動できなかったときだけ、次の刻みで送り直す）。子を待ち
 ///   終えた・パイプを持つスレッドが抜けた・受け手が終わったときは見張りを起こし、刻みを待たずに終わる（すぐ終わる子を
-///   20 ms 待たせない）。
+///   20 ms 待たせない）。標準出力の読み手が受け手に渡すのを待っている間と、受け手が区切りを処理している間は無出力に
+///   数えない（受け手の遅さは道具の無出力ではない。処理し終えたら出力が進んだとみなす）。
 /// - 子を待ち終えたのにパイプが閉じない（パイプを持つ子孫が残っている）とき：止めたあとなら、すぐグループに SIGKILL
 ///   して、パイプを持つスレッドを見捨てて戻る（記録した理由のエラー）。止めていなければ、2 秒でグループに SIGKILL、
 ///   さらに 2 秒で見捨てて [`Stopped::Lingering`] で戻る。グループの外に出た子孫（`setsid` など）は SIGKILL が届かない
@@ -939,7 +948,9 @@ pub fn run_binary(
 /// [`run_binary`] と同じだが、標準出力の受け手 `on_chunk` を呼び手のスレッドで回す（M13 段 2）。受け手がエンジンを呼ぶ
 /// とき（流れのデコードの窓・解析の `par_blocks`）に、エンジンを呼び手の一括のプールの中で使うため（受け手のスレッドから
 /// 呼ぶと、プールの外でエンジンを使うことになる。.claude/rules/engine.md）。標準入力は書かない（デコードは使わない）。
-/// 見張り（中止・無出力・時間切れ・出力の上限・子孫の片付け）は [`run_binary`] と同じ。
+/// 見張り（中止・無出力・時間切れ・出力の上限・子孫の片付け）は [`run_binary`] と同じ：呼び手は標準出力が閉じるまで子を
+/// 待たないので、見張りが `try_wait` で子の終わりを知り、パイプを持つ子孫が残っていれば片付けに移る（グループの外の子孫が
+/// 標準出力を持ったまま残っても、中止・時間切れ・残った子孫で戻る。M13 段 2 の検証の直し）。
 pub fn run_binary_pull(
     exe: &Path,
     args: &[OsString],
@@ -1021,6 +1032,12 @@ fn run_binary_with(
     let log = Arc::new(Mutex::new(StderrLog::default()));
     let queue = Arc::new(InQueue::default());
     let out_total = AtomicU64::new(0);
+    // 標準出力の読み手が受け手に渡すのを待っている・受け手が区切りを処理している（どちらも無出力に数えない）
+    let handing = Arc::new(AtomicBool::new(false));
+    let busy = AtomicBool::new(false);
+    // 子が終わった（受け手を呼び手のスレッドで回す形で、見張りが `try_wait` で知る）
+    let child_exited = AtomicBool::new(false);
+    let watch_child = matches!(consumer, Consumer::Here(_));
 
     let mut child = spawn_retrying(&mut cmd).map_err(RunError::Spawn)?;
     let clock = Arc::new(Clock::new());
@@ -1029,7 +1046,7 @@ fn run_binary_with(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let mut reaper = Reaper {
-        child: Some(child),
+        child: Mutex::new(Some(child)),
         group_killed: &group_killed,
     };
 
@@ -1037,12 +1054,12 @@ fn run_binary_with(
     let (out_tx, out_rx) = mpsc::sync_channel::<Vec<u8>>(OUT_QUEUE);
     match stdout {
         Some(pipe) => {
-            let clock = Arc::clone(&clock);
+            let (clock, handing) = (Arc::clone(&clock), Arc::clone(&handing));
             spawn_pipe_thread(
                 "kura-tool-stdout",
                 OpenGuard::new(&open, &wake),
                 move |open| {
-                    pump_stdout(pipe, &out_tx, &clock, open);
+                    pump_stdout(pipe, &out_tx, &clock, open, &handing);
                 },
             )
             .map_err(RunError::Spawn)?;
@@ -1105,7 +1122,7 @@ fn run_binary_with(
         // スレッドも抜けられる
         let consume = {
             let (out_total, kill_for, abandoned) = (&out_total, &kill_for, &abandoned);
-            let (consumer_done, wake) = (&consumer_done, &*wake);
+            let (consumer_done, wake, clock, busy) = (&consumer_done, &*wake, &*clock, &busy);
             move |out_rx: mpsc::Receiver<Vec<u8>>,
                   on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), String>| {
                 let _done = DoneGuard(consumer_done, wake);
@@ -1120,7 +1137,13 @@ fn run_binary_with(
                         kill_for(Stopped::OutputLimit);
                         break;
                     }
-                    if on_chunk(&chunk).is_err() {
+                    // 受け手が処理している間は無出力に数えず、処理し終えたら進んだとみなす（受け手の遅さを道具の無出力に
+                    // 数えない。M13 段 2 の検証の直し）
+                    busy.store(true, Ordering::SeqCst);
+                    let handled = on_chunk(&chunk);
+                    clock.touch();
+                    busy.store(false, Ordering::SeqCst);
+                    if handled.is_err() {
                         kill_for(Stopped::Consumer);
                         break;
                     }
@@ -1131,6 +1154,7 @@ fn run_binary_with(
             let (stop, done, consumer_done, abandoned) = (&stop, &done, &consumer_done, &abandoned);
             let (open, clock, queue, wake) = (&*open, &*clock, &*queue, &*wake);
             let (kill_for, kill_group) = (&kill_for, &kill_group);
+            let (handing, busy, child_exited, reaper) = (&*handing, &busy, &child_exited, &reaper);
             move || {
                 let mut stop_seen: Option<Instant> = None;
                 let mut done_seen: Option<Instant> = None;
@@ -1145,10 +1169,24 @@ fn run_binary_with(
                     }
                     // 刻みごとに中止・時間を確かめる。終わりの合図があれば刻みを待たずに確かめ直す
                     seen = wake.wait(seen, WATCH_TICK);
+                    // 受け手を呼び手のスレッドで回す形では、呼び手は標準出力が閉じるまで子を待たない：子の終わりをここで
+                    // 知る（グループの外の子孫が標準出力を持ったまま残っても、子孫の片付けに移れるように。回収した状態は
+                    // 呼び手の `wait` が受け取る）。呼び手が `wait` で鍵を持っていれば待たずに飛ばす
+                    if watch_child
+                        && !child_exited.load(Ordering::SeqCst)
+                        && let Ok(mut slot) = reaper.child.try_lock()
+                        && let Some(c) = slot.as_mut()
+                        && matches!(c.try_wait(), Ok(Some(_)))
+                    {
+                        child_exited.store(true, Ordering::SeqCst);
+                    }
                     if stop.load(Ordering::SeqCst) == 0 {
                         if canceled() {
                             kill_for(Stopped::Canceled);
-                        } else if clock.idle() > budget.stall {
+                        } else if !handing.load(Ordering::SeqCst)
+                            && !busy.load(Ordering::SeqCst)
+                            && clock.idle() > budget.stall
+                        {
                             kill_for(Stopped::Stalled);
                         } else if clock.started.elapsed() > budget.deadline {
                             kill_for(Stopped::Deadline);
@@ -1159,7 +1197,7 @@ fn run_binary_with(
                     if stopped {
                         stop_seen.get_or_insert(now);
                     }
-                    if done.load(Ordering::SeqCst) {
+                    if done.load(Ordering::SeqCst) || child_exited.load(Ordering::SeqCst) {
                         done_seen.get_or_insert(now);
                     }
                     let over = |t: Option<Instant>| {
@@ -1230,8 +1268,13 @@ fn run_binary_with(
         if let Some((rx, on_chunk)) = here {
             consume(rx, on_chunk);
         }
-        // 子が終わるのを待つ（見張りが止めるので必ず戻る）
-        if let Some(c) = reaper.child.as_mut() {
+        // 子が終わるのを待つ（見張りが止めるので必ず戻る。見張りが先に回収していれば、その状態が返る）
+        if let Some(c) = reaper
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
             status = Some(c.wait());
         }
     });
@@ -1239,7 +1282,10 @@ fn run_binary_with(
         return Err(RunError::Spawn(e));
     }
     if matches!(status, Some(Ok(_))) {
-        reaper.child = None;
+        *reaper
+            .child
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
     if let Some(why) = stop_from_code(stop.load(Ordering::SeqCst)) {
         return Err(RunError::Stopped(why));
@@ -1409,6 +1455,34 @@ mod tests {
         on_chunk: OnChunk<'_>,
     ) -> Result<RunOutcome, RunError> {
         run_binary(exe, &[], Path::new("/"), b, canceled, None, on_chunk)
+    }
+
+    /// 標準出力の受け手の回し方（子孫・見張りの系のテストを両方で回す。M13 段 2 の検証の直し）。
+    #[derive(Debug, Clone, Copy)]
+    enum Mode {
+        /// 受け手のスレッド（`run_binary`）。
+        Thread,
+        /// 呼び手のスレッド（`run_binary_pull`）。
+        Here,
+    }
+
+    const MODES: [Mode; 2] = [Mode::Thread, Mode::Here];
+
+    /// `mode` の受け手で動かす（標準入力は書かない。`signal` はグループにシグナルを送る関数）。
+    fn run_in(
+        mode: Mode,
+        exe: &Path,
+        cwd: &Path,
+        b: &Budget,
+        canceled: &(dyn Fn() -> bool + Sync),
+        signal: &(dyn Fn(u32, &str) -> bool + Sync),
+        on_chunk: OnChunk<'_>,
+    ) -> Result<RunOutcome, RunError> {
+        let consumer = match mode {
+            Mode::Thread => Consumer::Thread(on_chunk),
+            Mode::Here => Consumer::Here(on_chunk),
+        };
+        run_binary_with(exe, &[], cwd, b, canceled, None, consumer, signal)
     }
 
     /// M13 段 2：呼び手のスレッドで受ける形（`run_binary_pull`）も、出力をそのまま渡して数え、出力の上限・中止・受け手の
@@ -1641,17 +1715,33 @@ mod tests {
     fn a_silent_process_and_its_grandchild_are_stopped() {
         let d = tempfile::tempdir().unwrap();
         let s = script(d.path(), "hang", "sleep 31.4159 & sleep 32.4159");
-        let t = Instant::now();
-        let r = run_simple(&s, &budget(1 << 20, 300), &|| false, &mut |_: &[u8]| Ok(()));
-        assert!(
-            matches!(r, Err(RunError::Stopped(Stopped::Stalled))),
-            "{r:?}"
-        );
-        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(gone("sleep 31.4159") && gone("sleep 32.4159"));
+        for mode in MODES {
+            let t = Instant::now();
+            let r = run_in(
+                mode,
+                &s,
+                Path::new("/"),
+                &budget(1 << 20, 300),
+                &|| false,
+                &signal_group,
+                &mut |_: &[u8]| Ok(()),
+            );
+            assert!(
+                matches!(r, Err(RunError::Stopped(Stopped::Stalled))),
+                "{mode:?}: {r:?}"
+            );
+            assert!(
+                t.elapsed() < Duration::from_secs(5),
+                "{mode:?}: {:?}",
+                t.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(gone("sleep 31.4159") && gone("sleep 32.4159"), "{mode:?}");
+        }
     }
 
+    /// 子が終わったあと、グループの中の孫が標準出力を持ったまま残る：KILL_GRACE で片付けて成功を返す（受け手を呼び手の
+    /// スレッドで回す形でも、無出力の上限まで待たない。M13 段 2 の検証の直し）。
     #[test]
     fn a_grandchild_holding_the_pipe_after_exit_is_killed() {
         let d = tempfile::tempdir().unwrap();
@@ -1661,17 +1751,26 @@ mod tests {
             "orphan",
             "head -c 10 /dev/zero; (sleep 33.4159) & exit 0",
         );
-        let t = Instant::now();
-        let r = run_simple(
-            &s,
-            &budget(1 << 20, 30_000),
-            &|| false,
-            &mut |_: &[u8]| Ok(()),
-        );
-        assert!(r.is_ok(), "{r:?}");
-        assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(gone("sleep 33.4159"));
+        for mode in MODES {
+            let t = Instant::now();
+            let r = run_in(
+                mode,
+                &s,
+                Path::new("/"),
+                &budget(1 << 20, 30_000),
+                &|| false,
+                &signal_group,
+                &mut |_: &[u8]| Ok(()),
+            );
+            assert!(r.is_ok(), "{mode:?}: {r:?}");
+            assert!(
+                t.elapsed() < Duration::from_secs(8),
+                "{mode:?}: {:?}",
+                t.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(gone("sleep 33.4159"), "{mode:?}");
+        }
     }
 
     /// プロセスグループの外に出た子孫（fork して setsid した perl）が標準入出力のパイプを持ったまま 30 秒眠る偽の道具。
@@ -1729,79 +1828,122 @@ mod tests {
     #[test]
     fn a_descendant_outside_the_group_does_not_outlive_the_deadline() {
         let d = tempfile::tempdir().unwrap();
-        let (s, pidfile) = escaping_tool(d.path(), "escape", "printf 'x'");
-        let sig = Signals::default();
-        // 外に出るまでの時間（重い環境では 1 秒ほどかかることがある）より長くする
-        let deadline = Duration::from_secs(3);
-        let t = Instant::now();
-        let r = run_binary_with(
-            &s,
-            &[],
-            d.path(),
-            &Budget {
-                max_stdout: 1 << 20,
-                stall: Duration::from_secs(30),
-                deadline,
-            },
-            &|| false,
-            None,
-            Consumer::Thread(&mut |_: &[u8]| Ok(())),
-            &|pid, s| sig.send(pid, s),
-        );
-        let took = t.elapsed();
-        let escaped = pidfile.is_file();
-        kill_escaped(&pidfile);
-        assert!(escaped, "子孫が外に出る前に時間切れになった");
-        assert!(
-            matches!(r, Err(RunError::Stopped(Stopped::Deadline))),
-            "{r:?}"
-        );
-        assert!(
-            took >= deadline && took < deadline + Duration::from_millis(1500),
-            "{took:?}"
-        );
-        assert_eq!(sig.counts(), (1, 1));
+        for mode in MODES {
+            let (s, pidfile) = escaping_tool(d.path(), &format!("escape-{mode:?}"), "printf 'x'");
+            let sig = Signals::default();
+            // 外に出るまでの時間（重い環境では 1 秒ほどかかることがある）より長くする
+            let deadline = Duration::from_secs(3);
+            let t = Instant::now();
+            let r = run_in(
+                mode,
+                &s,
+                d.path(),
+                &Budget {
+                    max_stdout: 1 << 20,
+                    stall: Duration::from_secs(30),
+                    deadline,
+                },
+                &|| false,
+                &|pid, s| sig.send(pid, s),
+                &mut |_: &[u8]| Ok(()),
+            );
+            let took = t.elapsed();
+            let escaped = pidfile.is_file();
+            kill_escaped(&pidfile);
+            assert!(escaped, "{mode:?}: 子孫が外に出る前に時間切れになった");
+            assert!(
+                matches!(r, Err(RunError::Stopped(Stopped::Deadline))),
+                "{mode:?}: {r:?}"
+            );
+            assert!(
+                took >= deadline && took < deadline + Duration::from_millis(1500),
+                "{mode:?}: {took:?}"
+            );
+            assert_eq!(sig.counts(), (1, 1), "{mode:?}");
+        }
     }
 
     /// 子が終わったあとも中止が効く（グループの外の子孫がパイプを持ったまま残っていても、すぐ戻る）。
     #[test]
     fn cancel_works_after_the_child_has_exited() {
         let d = tempfile::tempdir().unwrap();
-        let exited = d.path().join("exited");
-        let (s, pidfile) = escaping_tool(
-            d.path(),
-            "escape-cancel",
-            &format!("printf 'x'; : > '{}'", exited.display()),
-        );
-        let sig = Signals::default();
-        // 子が終わる直前に書く印を見てから 300 ms で中止する
-        let seen: Mutex<Option<Instant>> = Mutex::new(None);
-        let canceled = || {
-            let mut seen = seen.lock().unwrap();
-            if seen.is_none() && exited.is_file() {
-                *seen = Some(Instant::now());
-            }
-            seen.is_some_and(|t| t.elapsed() > Duration::from_millis(300))
-        };
-        let r = run_binary_with(
-            &s,
-            &[],
-            d.path(),
-            &budget(1 << 20, 30_000),
-            &canceled,
-            None,
-            Consumer::Thread(&mut |_: &[u8]| Ok(())),
-            &|pid, s| sig.send(pid, s),
-        );
-        let since = seen.lock().unwrap().map(|t| t.elapsed());
-        kill_escaped(&pidfile);
-        assert!(
-            matches!(r, Err(RunError::Stopped(Stopped::Canceled))),
-            "{r:?}"
-        );
-        let since = since.unwrap();
-        assert!(since < Duration::from_millis(1300), "{since:?}");
-        assert_eq!(sig.counts(), (1, 1));
+        for mode in MODES {
+            let exited = d.path().join(format!("exited-{mode:?}"));
+            let (s, pidfile) = escaping_tool(
+                d.path(),
+                &format!("escape-cancel-{mode:?}"),
+                &format!("printf 'x'; : > '{}'", exited.display()),
+            );
+            let sig = Signals::default();
+            // 子が終わる直前に書く印を見てから 300 ms で中止する
+            let seen: Mutex<Option<Instant>> = Mutex::new(None);
+            let canceled = || {
+                let mut seen = seen.lock().unwrap();
+                if seen.is_none() && exited.is_file() {
+                    *seen = Some(Instant::now());
+                }
+                seen.is_some_and(|t| t.elapsed() > Duration::from_millis(300))
+            };
+            let r = run_in(
+                mode,
+                &s,
+                d.path(),
+                &budget(1 << 20, 30_000),
+                &canceled,
+                &|pid, s| sig.send(pid, s),
+                &mut |_: &[u8]| Ok(()),
+            );
+            let since = seen.lock().unwrap().map(|t| t.elapsed());
+            kill_escaped(&pidfile);
+            assert!(
+                matches!(r, Err(RunError::Stopped(Stopped::Canceled))),
+                "{mode:?}: {r:?}"
+            );
+            let since = since.unwrap();
+            assert!(since < Duration::from_millis(1300), "{mode:?}: {since:?}");
+            assert_eq!(sig.counts(), (1, 1), "{mode:?}");
+        }
+    }
+
+    /// 子が生きている間に中止しても、グループの外の子孫が標準出力を持ったまま残っていれば、子を止めてすぐ戻る（受け手を
+    /// 呼び手のスレッドで回す形でも、子孫が抜けるまで待たない。M13 段 2 の検証の直し）。
+    #[test]
+    fn cancel_returns_while_an_escaped_descendant_holds_the_pipe() {
+        let d = tempfile::tempdir().unwrap();
+        for mode in MODES {
+            let (s, pidfile) = escaping_tool(
+                d.path(),
+                &format!("escape-alive-{mode:?}"),
+                "printf 'x'; sleep 30",
+            );
+            let sig = Signals::default();
+            // 子孫が外に出た（pid のファイルがある）のを見てから 300 ms で中止する
+            let seen: Mutex<Option<Instant>> = Mutex::new(None);
+            let canceled = || {
+                let mut seen = seen.lock().unwrap();
+                if seen.is_none() && pidfile.is_file() {
+                    *seen = Some(Instant::now());
+                }
+                seen.is_some_and(|t| t.elapsed() > Duration::from_millis(300))
+            };
+            let r = run_in(
+                mode,
+                &s,
+                d.path(),
+                &budget(1 << 20, 30_000),
+                &canceled,
+                &|pid, s| sig.send(pid, s),
+                &mut |_: &[u8]| Ok(()),
+            );
+            let since = seen.lock().unwrap().map(|t| t.elapsed());
+            kill_escaped(&pidfile);
+            assert!(
+                matches!(r, Err(RunError::Stopped(Stopped::Canceled))),
+                "{mode:?}: {r:?}"
+            );
+            let since = since.unwrap();
+            assert!(since < Duration::from_millis(1800), "{mode:?}: {since:?}");
+        }
     }
 
     /// 子が終わったあと、グループの外の子孫がパイプを持ったまま残る（時間切れはまだ）：KILL_GRACE でグループに SIGKILL を
@@ -1809,31 +1951,36 @@ mod tests {
     #[test]
     fn a_lingering_descendant_is_abandoned_after_the_grace() {
         let d = tempfile::tempdir().unwrap();
-        let (s, pidfile) = escaping_tool(d.path(), "linger", "printf 'x'; echo note >&2");
-        let sig = Signals::default();
-        let t = Instant::now();
-        let r = run_binary_with(
-            &s,
-            &[],
-            d.path(),
-            &budget(1 << 20, 30_000),
-            &|| false,
-            None,
-            Consumer::Thread(&mut |_: &[u8]| Ok(())),
-            &|pid, s| sig.send(pid, s),
-        );
-        let took = t.elapsed();
-        kill_escaped(&pidfile);
-        assert!(
-            matches!(r, Err(RunError::Stopped(Stopped::Lingering))),
-            "{r:?}"
-        );
-        // 下限は子が終わってから 2 × KILL_GRACE。上限は外に出るまでの時間（重い環境で 1 秒ほど）を見込む
-        assert!(
-            took >= 2 * KILL_GRACE && took < 2 * KILL_GRACE + Duration::from_secs(3),
-            "{took:?}"
-        );
-        assert_eq!(sig.counts(), (0, 1));
+        for mode in MODES {
+            let (s, pidfile) = escaping_tool(
+                d.path(),
+                &format!("linger-{mode:?}"),
+                "printf 'x'; echo note >&2",
+            );
+            let sig = Signals::default();
+            let t = Instant::now();
+            let r = run_in(
+                mode,
+                &s,
+                d.path(),
+                &budget(1 << 20, 30_000),
+                &|| false,
+                &|pid, s| sig.send(pid, s),
+                &mut |_: &[u8]| Ok(()),
+            );
+            let took = t.elapsed();
+            kill_escaped(&pidfile);
+            assert!(
+                matches!(r, Err(RunError::Stopped(Stopped::Lingering))),
+                "{mode:?}: {r:?}"
+            );
+            // 下限は子が終わってから 2 × KILL_GRACE。上限は外に出るまでの時間（重い環境で 1 秒ほど）を見込む
+            assert!(
+                took >= 2 * KILL_GRACE && took < 2 * KILL_GRACE + Duration::from_secs(3),
+                "{mode:?}: {took:?}"
+            );
+            assert_eq!(sig.counts(), (0, 1), "{mode:?}");
+        }
     }
 
     /// 標準入力を持ったまま読まない子孫がグループの外に残っても、`feed` の書き込みで止まらず、無出力で戻る。
@@ -1963,24 +2110,64 @@ mod tests {
             "i=0; while [ $i -lt 8 ]; do printf 'x'; sleep 0.02; i=$((i+1)); done",
         );
         let nap = 2 * KILL_GRACE + Duration::from_secs(3);
-        let mut n = 0u64;
-        let t = Instant::now();
-        let r = run_simple(
-            &s,
-            &budget(1 << 20, 30_000),
-            &|| false,
-            &mut |b: &[u8]| {
-                if n == 0 {
-                    std::thread::sleep(nap);
-                }
-                n += b.len() as u64;
-                Ok(())
-            },
+        for mode in MODES {
+            let mut n = 0u64;
+            let t = Instant::now();
+            let r = run_in(
+                mode,
+                &s,
+                Path::new("/"),
+                &budget(1 << 20, 30_000),
+                &|| false,
+                &signal_group,
+                &mut |b: &[u8]| {
+                    if n == 0 {
+                        std::thread::sleep(nap);
+                    }
+                    n += b.len() as u64;
+                    Ok(())
+                },
+            );
+            let r = r.unwrap();
+            assert!(r.status.success(), "{mode:?}");
+            assert_eq!((r.stdout_bytes, n), (8, 8), "{mode:?}");
+            assert!(t.elapsed() >= nap, "{mode:?}: {:?}", t.elapsed());
+        }
+    }
+
+    /// 受け手が遅くて読み手が渡すのを待っている間は、無出力に数えない（受け手が呼び手の一括のプールで入れ子の仕事に
+    /// 取られている間など。M13 段 2 の検証の直し）。道具は出し続けて終わり、受け手は区切りごとに無出力の上限より長く眠る。
+    #[test]
+    fn a_slow_consumer_is_not_counted_as_a_stall() {
+        let d = tempfile::tempdir().unwrap();
+        // 6 回に分けて書く：受け手が眠るあいだに渡す列（4 つ）が埋まり、読み手は 6 つ目を渡すのを待つ
+        let s = script(
+            d.path(),
+            "steady",
+            "i=0; while [ $i -lt 6 ]; do head -c 1000 /dev/zero; sleep 0.05; i=$((i+1)); done",
         );
-        let r = r.unwrap();
-        assert!(r.status.success());
-        assert_eq!((r.stdout_bytes, n), (8, 8));
-        assert!(t.elapsed() >= nap, "{:?}", t.elapsed());
+        for mode in MODES {
+            let mut n = 0u64;
+            let t = Instant::now();
+            let r = run_in(
+                mode,
+                &s,
+                Path::new("/"),
+                &budget(1 << 20, 1_000),
+                &|| false,
+                &signal_group,
+                &mut |b: &[u8]| {
+                    std::thread::sleep(Duration::from_millis(1_500));
+                    n += b.len() as u64;
+                    Ok(())
+                },
+            );
+            let r = r.unwrap_or_else(|e| panic!("{mode:?}: {e:?}"));
+            assert!(r.status.success(), "{mode:?}");
+            assert_eq!((r.stdout_bytes, n), (6_000, 6_000), "{mode:?}");
+            // 区切りの数だけ眠った（無出力の上限の何倍も）
+            assert!(t.elapsed() >= Duration::from_secs(3), "{mode:?}");
+        }
     }
 
     #[test]
