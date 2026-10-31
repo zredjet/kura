@@ -297,6 +297,17 @@ describe('手のあとの交差フェード', () => {
     expect(ctx.touched).toEqual([]);
   });
 
+  it('替える位置のチャンクのチャンネル数が今の形と違えば替えない（古い音を鳴らし続ける）', () => {
+    const t = setup();
+    t.player.play({ from: 0, source: 'edited', info: t.info });
+    const ctx = t.ctx();
+    const n = ctx.sources.length;
+    t.chunks.edited.set(0, makeChunk(0, t.info.frames, 1));
+    t.player.refresh({ type: 'all' });
+    expect(ctx.sources.length).toBe(n);
+    expect(ctx.sources.some((s) => s.stopped)).toBe(false);
+  });
+
   it('替えるのは 150 ms に 1 回まで', () => {
     const t = setup();
     t.player.play({ from: 0, source: 'edited', info: t.info });

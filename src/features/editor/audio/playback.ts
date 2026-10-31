@@ -573,11 +573,17 @@ export class EditorPlayer {
     for (const s of spans) {
       for (let i = chunkOf(s.start); i * CHUNK < s.end; i++) this.deps.want(plan.source, i);
     }
-    // 手のあと：替える位置のチャンクが届いていて、前に替えてから 150 ms たったら交差フェード
+    // 手のあと：替える位置のチャンクが（今の形のチャンネル数で）届いていて、前に替えてから 150 ms たったら交差フェード
     if (this.refreshWanted && this.now() - this.lastSwitch >= SWITCH_MIN_MS) {
       const t = this.switchFrame();
       const at = this.positionAt(t);
-      if (at !== null && at < plan.info.frames && this.deps.peek(plan.source, chunkOf(at))) {
+      const chunk = at === null ? undefined : this.deps.peek(plan.source, chunkOf(at));
+      if (
+        at !== null &&
+        at < plan.info.frames &&
+        chunk &&
+        chunk.planes.length === plan.info.channels
+      ) {
         this.refreshWanted = false;
         this.crossfade({
           source: plan.source,

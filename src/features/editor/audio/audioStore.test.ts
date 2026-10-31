@@ -337,6 +337,44 @@ describe('編集中の試聴と排他', () => {
     expect(runtime.pool.isHeld(48_000)).toBe(false);
   });
 
+  it('鳴らしている間にチャンネル数が変わったら（mono を足す・⌘Z で外す）、新しい形で始め直す', async () => {
+    await open();
+    togglePlay();
+    await deliver(0);
+    const ctx = factory.contexts[0];
+    if (!ctx) throw new Error('文脈がない');
+    ctx.currentTime += 0.2;
+    // mono を足した結果：rate・frames は同じで channels だけ 1
+    const mono = view({ rev: 2, channels: 1, samplesId: 'aaaa', changed: { type: 'all' } });
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(mono));
+    pushEditorSteps([{ type: 'undo' }]);
+    await flush();
+    const before = ctx.sources.length;
+    io.resolve(editPcmUrl(S, 2, 0, CHUNK), pcmBytes(0, TOTAL, 1, 'kura-edit/1:aaaa'));
+    await flush();
+    expect(ctx.sources.length).toBeGreaterThan(before);
+    expect(ctx.buffers.at(-1)?.numberOfChannels).toBe(1);
+    expect(audioPlayer()?.playing).toBe(true);
+    // ⌘Z で外した結果：channels 2
+    ctx.currentTime += 0.2;
+    const stereo = view({ rev: 3, channels: 2, samplesId: 'bbbb', changed: { type: 'all' } });
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(stereo));
+    editorUndo();
+    await flush();
+    const n = ctx.sources.length;
+    io.resolve(editPcmUrl(S, 3, 0, CHUNK), pcmBytes(0, TOTAL, 2, 'kura-edit/1:bbbb'));
+    await flush();
+    expect(ctx.sources.length).toBeGreaterThan(n);
+    expect(ctx.buffers.at(-1)?.numberOfChannels).toBe(2);
+    // 鳴り終えたら止まる（無音のまま「再生中」で固まらない）
+    io.resolve(editPcmUrl(S, 3, CHUNK, TOTAL), pcmBytes(1, TOTAL, 2, 'kura-edit/1:bbbb'));
+    await flush();
+    ctx.currentTime += 3;
+    audioPlayer()?.tick();
+    expect(audioPlayer()?.playing).toBe(false);
+    expect(useAudioStore.getState().play.status).toBe('idle');
+  });
+
   it('ループの試聴は、欄・I/O・［選択をループにする］・⌘Z で替わったループ点に従い、消したら止まる', async () => {
     await open(view({ loop: { start: 1000, end: 2000 } }));
     toggleLoopAudition();

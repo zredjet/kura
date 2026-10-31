@@ -484,9 +484,14 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       const s = useAudioStore.getState();
       const summary = summarizeAudioView(view);
       rt.patch.view = summary;
-      // 再生：形が変わったら（切り詰めの始まり・レート）元を通して位置を写して始め直し、ほかは変わった所だけ替える
+      // 再生：形が変わったら（切り詰めの始まり・レート・チャンネル数）元を通して位置を写して始め直し、ほかは変わった所
+      // だけ替える
       if (player.playing && player.source === 'edited' && prev) {
-        if (prev.rate !== view.rate || prev.frames !== view.frames) {
+        if (
+          prev.rate !== view.rate ||
+          prev.frames !== view.frames ||
+          prev.channels !== view.channels
+        ) {
           restartAfterReshape(rt, prev, view);
         } else {
           player.refresh(view.changed);
