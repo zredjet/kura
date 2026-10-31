@@ -313,8 +313,8 @@ export interface PlayerDeps {
   timer?: PlayerTimer;
   /** 時計（ms。交差フェードの間隔）。 */
   now?(): number;
-  /** 終わりまで鳴った（選択の終わり・音の終わり）。`pos` は止まった位置。 */
-  onEnded?(pos: number): void;
+  /** 終わりまで鳴った（選択の終わり・音の終わり）。`pos` は止まった位置（鳴らしていた音 `source` のフレーム）。 */
+  onEnded?(pos: number, source: PlaySource): void;
   /** 区間を置いた（継ぎ目の自己点検 `VITE_KURA_CHECK` が、同じ標本と同じ置き方で照らす）。 */
   onPlaced?(record: PlacedRecord): void;
   /** 交差フェードで替えた（自己点検が、替える前後の標本の跳びを照らす）。 */
@@ -652,8 +652,9 @@ export class EditorPlayer {
       const endAbs = last ? last.abs + last.len : plan.nextAbs;
       if (nowFrame >= endAbs) {
         const at = plan.nextPos;
+        const source = plan.source;
         this.stop();
-        this.deps.onEnded?.(at);
+        this.deps.onEnded?.(at, source);
         return;
       }
     }

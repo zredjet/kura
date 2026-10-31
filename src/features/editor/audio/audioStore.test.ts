@@ -15,7 +15,7 @@ import {
   viewEdit,
 } from '../../../ipc/edit';
 import type { ItemSummaryDto } from '../../../ipc/items';
-import { editPcmUrl } from '../../../ipc/media';
+import { editInputPcmUrl, editPcmUrl } from '../../../ipc/media';
 import { ContextPool } from '../../../lib/assetAudio';
 import { useNoticeStore } from '../../../stores/noticeStore';
 import { fakeFactory } from '../../../test/fakeAudio';
@@ -31,7 +31,9 @@ import {
   setAudioDragging,
   setAudioIoForTest,
   setAudioLocal,
+  setCursor,
   setSelection,
+  toggleAB,
   toggleLoopAudition,
   togglePlay,
   useAudioStore,
@@ -480,6 +482,39 @@ describe('編集中の試聴と排他', () => {
     pushEditorSteps([{ type: 'commitPreview', mode: 'step' }]);
     await flush();
     expect(player?.loop).toEqual({ start: 1000, end: 2000 });
+  });
+
+  it('聞き比べ：写せない位置で B を押しても替わらない（表示も鳴る音も元のまま）。止まったら鳴らした音で写す', async () => {
+    // 出力は元の [0, 48000) に切り詰めたもの
+    const cut = view({
+      frames: 48_000,
+      valid: [{ start: 0, end: 48_000 }],
+      sourceMap: [{ outStart: 0, outEnd: 48_000, inStart: 0, inRate: 48_000, outRate: 48_000 }],
+    });
+    await open(cut);
+    toggleAB();
+    expect(useAudioStore.getState().ab).toBe('source');
+    setCursor(40_000);
+    togglePlay();
+    expect(audioPlayer()?.source).toBe('source');
+    io.resolve(editInputPcmUrl(S, 0, CHUNK), pcmBytes(0, TOTAL, 2, 'wav-kura-dec/1'));
+    io.resolve(editInputPcmUrl(S, CHUNK, TOTAL), pcmBytes(1, TOTAL, 2, 'wav-kura-dec/1'));
+    await flush();
+    const ctx = factory.contexts[0];
+    if (!ctx) throw new Error('文脈がない');
+    // 元の 66,000 あたり（切り詰めの外）
+    ctx.currentTime += 0.55;
+    audioPlayer()?.tick();
+    expect(audioPlayer()?.position()).toBeGreaterThan(48_000);
+    toggleAB();
+    expect(useAudioStore.getState().ab).toBe('source');
+    expect(audioPlayer()?.source).toBe('source');
+    expect(useNoticeStore.getState().message).toBe(ja.editor.audio.abUnavailable);
+    // 元の終わりまで鳴ったら、元の位置は出力へ写せないのでカーソルは動かさない
+    ctx.currentTime += 2;
+    audioPlayer()?.tick();
+    expect(audioPlayer()?.playing).toBe(false);
+    expect(useAudioStore.getState().cursor).toBeLessThanOrEqual(48_000);
   });
 
   it('選択があれば選択の始めから終わりまで鳴らす', async () => {

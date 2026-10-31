@@ -404,8 +404,8 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     },
     volume: () => usePlayerStore.getState().prefs.volume / 100,
     hold: holdAudio,
-    onEnded: (pos) => {
-      if (ctx.current()) playEnded(pos);
+    onEnded: (pos, source) => {
+      if (ctx.current()) playEnded(pos, source);
     },
     onPlaced: (record) => checkHook?.placed?.(record),
     onCrossfade: (record) => checkHook?.crossfade?.(record),
@@ -716,11 +716,11 @@ function restartAfterReshape(rt: AudioRuntime, prev: EditAudioView, view: EditAu
   }
 }
 
-/** 終わりまで鳴った（選択だけなら、カーソルは動かさない）。 */
-function playEnded(pos: number): void {
+/** 終わりまで鳴った（選択だけなら、カーソルは動かさない）。位置は鳴らしていた音 `source` で写す。 */
+function playEnded(pos: number, source: PlaySource): void {
   live()?.controller.setPlaybackSpans([]);
   const s = useAudioStore.getState();
-  const out = toOutputPos(s, s.ab, pos);
+  const out = toOutputPos(s, source, pos);
   useAudioStore.setState({
     play: IDLE_PLAY,
     ...(s.play.mode === 'cursor' && out !== null ? { cursor: out } : {}),
@@ -799,23 +799,29 @@ export function toggleAB(): void {
     return;
   }
   const next: PlaySource = s.ab === 'edited' ? 'source' : 'edited';
-  useAudioStore.setState({ ab: next });
-  if (!rt.player.playing || rt.player.source === null) return;
+  if (!rt.player.playing || rt.player.source === null) {
+    useAudioStore.setState({ ab: next });
+    return;
+  }
+  // 鳴らしていれば、替えが成り立ったときだけ表示（ab）を替える
   const pos = rt.player.position();
   const out = pos === null ? null : toOutputPos(s, rt.player.source, pos);
-  if (out === null) return;
   const loop = s.play.mode === 'loop' ? (s.local?.loop ?? s.view.loop) : null;
   const end = s.play.mode === 'selection' ? (s.selection?.end ?? null) : null;
-  const req = requestFor({ ...s, ab: next }, next, { from: out, end, loop });
+  const req = out === null ? null : requestFor({ ...s, ab: next }, next, { from: out, end, loop });
   if (!req) {
     notify(t.abUnavailable);
     return;
   }
   const result = rt.player.switchTo(req);
-  if (result === 'rateUnsupported') {
-    notify(t.rateUnsupported(String(req.info.rate)));
-    useAudioStore.setState({ play: IDLE_PLAY });
+  if (result === 'playing') {
+    useAudioStore.setState({ ab: next });
+    return;
   }
+  // 始め直せなかった（止まった）
+  rt.controller.setPlaybackSpans([]);
+  notify(t.rateUnsupported(String(req.info.rate)));
+  useAudioStore.setState({ play: IDLE_PLAY });
 }
 
 // プレーヤーが鳴り始めたら止める（鳴らし始めるときにプレーヤーを一時停止するのと対にする）
