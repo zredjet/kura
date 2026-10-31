@@ -774,7 +774,10 @@ async function showFailure(job: number, mode: SaveMode, fallback: string | null)
     console.warn('保存のジョブを読めませんでした', error);
   }
   if (useEditorStore.getState().phase !== 'closed') {
+    const shown = useEditorStore.getState().sheet;
     useEditorStore.setState({ sheet: { kind: 'saveFailed', mode, code, message } });
+    // 保存の間に来た閉じる要求（未保存のシート）を失敗のシートで替えた：閉じるのを待つ呼び手に、やめたと答える
+    if (shown?.kind === 'unsaved') settleClose(false);
   }
 }
 

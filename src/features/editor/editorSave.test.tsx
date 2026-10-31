@@ -416,6 +416,29 @@ describe('保存（上書き）', () => {
     expect(useEditorStore.getState().sheet).toBeNull();
   });
 
+  it('保存の間に手を足して閉じようとし、ジョブが失敗したら、失敗のシートに替え、閉じるのを待つ呼び手に false を返す', async () => {
+    await openDirty();
+    requestSave();
+    await flush();
+    // 保存を積んだあとに手を足した（保存の rev より先の頭）：閉じると未保存のシート
+    const status = useEditorStore.getState().status;
+    if (!status) throw new Error('状態がない');
+    useEditorStore.setState({ status: { ...status, head: status.head + 1 } });
+    let closed: boolean | null = null;
+    act(() => {
+      void requestCloseEditor('window').then((v) => (closed = v));
+    });
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'unsaved' });
+    vi.mocked(listJobs).mockResolvedValue([
+      job({ errorCode: 'Conflict', message: '開いたあとに別の保存で変わりました' }),
+    ]);
+    act(() => onEditorJob(event('failed', { message: '開いたあとに別の保存で変わりました' })));
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'saveFailed', code: 'Conflict' });
+    expect(closed).toBe(false);
+    expect(useEditorStore.getState().phase).toBe('open');
+  });
+
   it('Mismatch・TooLarge も分かる言葉。元に戻すの Conflict には別名で作ったアイテムの説明を添える', async () => {
     await openDirty();
     render(<EditorSheets />);
