@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use kura_engine::audio::stream::{AudioProducer, AudioSink, StreamInfo, ValueProducer};
 use kura_engine::codec::formats::NONE;
-use kura_engine::codec::{CodecEnv, Encoder, MetaCaps, Stage, Tier};
+use kura_engine::codec::{CodecEnv, Encoder, MetaCaps, NoSeek, Stage, Tier, WriteSeek};
 use kura_engine::error::{EngineError, Issue, IssueCode, Issues};
 use kura_engine::monitor::Monitor;
 use kura_engine::op::{ParamKind, ParamSchema, Unit, spec};
@@ -235,9 +236,43 @@ impl Encoder for Mp3FfmpegEncoder {
                 "mp3 に書けるのは音声だけです".into(),
             ));
         };
-        let (rate, frames) = (audio.rate(), audio.frames());
-        let channels = u16::try_from(audio.channels()).unwrap_or(u16::MAX);
-        if !self.can_encode(format, &value.shape()) {
+        // 値も流して書く口を通る（実装は 1 つ。シークしない）
+        let mut src = ValueProducer::new(audio);
+        self.encode_stream(&mut src, format, opts, &mut NoSeek::new(out), mon)
+    }
+
+    fn streams(&self, format: &str) -> bool {
+        format == "mp3"
+    }
+
+    /// 渡す作業列（[`WRITE_FRAMES`] × チャンネル × 4 バイト）と写しの作業列（1 MiB）、ほかに 1 MiB。出力は一時ファイル。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
+        let channels = match shape {
+            Shape::Audio { channels, .. } => u64::from(*channels),
+            _ => 0,
+        };
+        (WRITE_FRAMES as u64) * channels * 4 + COPY_CHUNK as u64 + (1 << 20)
+    }
+
+    /// ffmpeg の標準入力に、生産者の窓を直してインターリーブした f32 で流す（`run_binary` の `feed` は呼び手のスレッドで
+    /// 動く）。出力は今どおり一時ファイル → 大きさを確かめて `out` に写す。
+    fn encode_stream(
+        &self,
+        src: &mut dyn AudioProducer,
+        format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn WriteSeek,
+        mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        let info = src.info().clone();
+        let (rate, frames) = (info.rate, info.frames);
+        let channels = u16::try_from(info.channels).unwrap_or(u16::MAX);
+        let shape = Shape::Audio {
+            rate,
+            channels,
+            frames: kura_engine::shape::Dim::Exact(frames),
+        };
+        if !self.can_encode(format, &shape) {
             return Err(EngineError::Unsupported(format!(
                 "{rate} Hz・{channels} チャンネル・{frames} フレームの音声は mp3 に書けません"
             )));
@@ -258,31 +293,32 @@ impl Encoder for Mp3FfmpegEncoder {
             stall: STALL,
             deadline: deadline_for(secs),
         };
-        let total = frames as u64;
-        let nch = audio.channels();
+        let total = frames;
+        let mut produced: Option<EngineError> = None;
         let mut feed = |w: &mut dyn Write| -> std::io::Result<()> {
-            let mut buf: Vec<u8> = Vec::with_capacity(WRITE_FRAMES * nch * 4);
-            // 窓ごとに各チャンネルを作業列へ読む（持つ量は窓の分だけ）
-            let mut win: Vec<Vec<f32>> = vec![vec![0f32; WRITE_FRAMES.min(frames)]; nch];
-            let mut off = 0usize;
-            while off < frames {
-                let n = WRITE_FRAMES.min(frames - off);
-                for (c, p) in win.iter_mut().enumerate() {
-                    audio
-                        .read(c, off as u64, &mut p[..n])
-                        .map_err(std::io::Error::other)?;
+            let mut sink = Interleave {
+                w,
+                buf: Vec::with_capacity(WRITE_FRAMES * info.channels * 4),
+                next: 0,
+                total,
+            };
+            match src.produce(None, &mut sink, mon) {
+                Ok(()) if sink.next == total => Ok(()),
+                Ok(()) => {
+                    let e = EngineError::Internal(format!(
+                        "流した長さが形と違います（{} / {total}）",
+                        sink.next
+                    ));
+                    let io = std::io::Error::other(e.to_string());
+                    produced = Some(e);
+                    Err(io)
                 }
-                buf.clear();
-                for i in 0..n {
-                    for p in &win {
-                        buf.extend_from_slice(&sanitize(p[i]).to_le_bytes());
-                    }
+                Err(e) => {
+                    let io = std::io::Error::other(e.to_string());
+                    produced = Some(e);
+                    Err(io)
                 }
-                w.write_all(&buf)?;
-                off += n;
-                mon.progress(off as u64, total);
             }
-            Ok(())
         };
         let outcome = run_binary(
             self.shared.ffmpeg(),
@@ -296,6 +332,10 @@ impl Encoder for Mp3FfmpegEncoder {
         .map_err(|e| run_error(ID, Stage::Encode, e, &budget))?;
         if mon.canceled() {
             return Err(EngineError::Canceled);
+        }
+        // 生産者の誤り（描けない・源を読めない）はそのまま返す（ffmpeg の失敗に見せない）
+        if let Some(e) = produced {
+            return Err(e);
         }
         if let Some(e) = failure(ID, Stage::Encode, &outcome) {
             return Err(e);
@@ -363,6 +403,58 @@ impl Encoder for Mp3FfmpegEncoder {
             ));
         }
         Ok(copied)
+    }
+}
+
+/// 流れの窓を、直してインターリーブした f32 LE にして ffmpeg の標準入力へ書く受け手（[`WRITE_FRAMES`] ずつ）。
+struct Interleave<'w> {
+    w: &'w mut dyn Write,
+    buf: Vec<u8>,
+    next: u64,
+    total: u64,
+}
+
+impl AudioSink for Interleave<'_> {
+    fn begin(&mut self, _info: &StreamInfo) -> Result<(), EngineError> {
+        self.next = 0;
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        if start != self.next {
+            return Err(EngineError::Internal(format!(
+                "書く流れの窓が続いていません（{start} から。次は {}）",
+                self.next
+            )));
+        }
+        let n = planes.first().map_or(0, |p| p.len());
+        let mut off = 0usize;
+        while off < n {
+            if mon.canceled() {
+                return Err(EngineError::Canceled);
+            }
+            let k = WRITE_FRAMES.min(n - off);
+            self.buf.clear();
+            for i in off..off + k {
+                for p in planes {
+                    self.buf.extend_from_slice(&sanitize(p[i]).to_le_bytes());
+                }
+            }
+            self.w.write_all(&self.buf)?;
+            off += k;
+            self.next += k as u64;
+            mon.progress(self.next, self.total);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
+        Ok(())
     }
 }
 
@@ -476,6 +568,42 @@ mod tests {
             (ID, Tier::External, false)
         );
         assert!(!w.meta.tags && !w.meta.loop_points);
+    }
+
+    /// M13 段 3（E8）：流して書く口（`CodecSet::encode_stream`）でも、偽の ffmpeg が受け取る標本（＝出力）・記録・値の
+    /// ダイジェストが値を書いたものと同じ（窓をまたぐ長さで）。生産者の誤りは ffmpeg の失敗に見せずに返す。
+    #[test]
+    fn streamed_mp3_equals_encode() {
+        use kura_engine::audio::stream::ValueProducer;
+        use kura_engine::codec::FileDigest;
+        // 標準入力の全体を cksum にして出力に書く偽物（出力が小さく、受け取った標本の列の全体で決まる）
+        let t = fake("cksum > \"$out\"");
+        let set = set_with(&t.codecs());
+        let frames = 16 * 65_536 + 5_000;
+        let left: Vec<f32> = (0..frames)
+            .map(|i| ((i % 251) as f32 - 125.0) / 130.0)
+            .collect();
+        let mut right: Vec<f32> = left.iter().map(|x| -x * 0.5).collect();
+        right[7] = f32::NAN;
+        let v = audio_value(48_000, vec![left, right]);
+        let Value::Audio(a) = &v else { panic!() };
+        let (want, stamp) = set.encode_bytes(&v, "mp3", &json!({}), &NoMonitor).unwrap();
+        let mut out = Cursor::new(Vec::new());
+        let se = set
+            .encode_stream(
+                &mut ValueProducer::new(a),
+                "mp3",
+                &json!({}),
+                &mut out,
+                &NoMonitor,
+            )
+            .unwrap();
+        let got = out.into_inner();
+        assert!(got == want, "{} と {}", got.len(), want.len());
+        let mut fd = FileDigest::new(got.len() as u64);
+        fd.update(&got);
+        assert_eq!(se.stamp(fd.finish().unwrap()), stamp);
+        assert_eq!(se.value_digest, v.digest().unwrap());
     }
 
     /// 設定：既定は CBR 192（そのレートで選べなければ 192 以下で最大）、VBR は LAME の -V、選べないビットレートは `Invalid`。
