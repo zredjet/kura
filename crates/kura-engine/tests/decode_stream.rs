@@ -7,6 +7,10 @@
 //! - mispredicted_length_reads_the_digest_again：見込みの長さが外れたデコーダ（偽の `MispredictingDecoder`）でも、2 度目の
 //!   読みで正しいダイジェストになり、呼び手の受け手には 1 度だけ流れる。
 //! - fan_over_decoders_equals_analyze_many（E35）：解析の扇を流れのデコードに通した結果が `analyze_many(decode)` と同じ。
+//! - fan_begins_again_when_a_decoder_falls_through・canceling_stops_the_fan（E35。M13 段 2 の検証の直し）：次の段へ回ると
+//!   扇は作り直して後の段の値だけで解き、中止すると全部の要求が `Canceled`。
+//! - staged_shapes_follow_the_stage_order：段ごとに形を読む口（`shape_path_staged`）が段の順・`after`・`prepare` を守る。
+//! - big_moov_keeps_the_edit_list：moov が 64 MiB を超える m4a でも、流して読む記録・形が `decode` と同じ。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -440,6 +444,139 @@ fn fan_over_decoders_equals_analyze_many() {
         checked += 1;
     }
     assert!(checked >= 20, "{checked}");
+}
+
+/// 音声の解析の全部（既定の引数）の要求。
+fn all_audio_requests() -> Vec<AnalysisRequest> {
+    [
+        "audio.peaks",
+        "audio.loudness",
+        "audio.silence",
+        "audio.loop",
+        "audio.loudness_gating",
+    ]
+    .iter()
+    .map(|id| AnalysisRequest {
+        id: (*id).into(),
+        v: None,
+        params: json!({}),
+    })
+    .collect()
+}
+
+/// E35（M13 段 2 の検証の直し）：前の段のデコーダが途中まで流してから `Unsupported` を返し、次の段へ回ると、扇は
+/// `begin` で読み始めた形に作り直し、前の試みで受けたもの（違う長さ・違う値）を捨てる。結果は後の段の値に
+/// `analyze_many` したものと出力・引数まで同じ。
+#[test]
+fn fan_begins_again_when_a_decoder_falls_through() {
+    let n = 20 * AUDIO_CHUNK as u64 + 3;
+    // 前の段は長さ（＝値）も違う
+    let first = fake(
+        "fake-a-dec/1",
+        2 * n,
+        Dim::Exact(2 * n),
+        2 * n,
+        Some(17 * AUDIO_CHUNK as u64),
+    );
+    let second = fake("fake-b-dec/1", n, Dim::Exact(n), n, None);
+    let mut set = CodecSet::default();
+    set.add_decoder(first.clone()).unwrap();
+    set.add_decoder(second.clone()).unwrap();
+    let engine = Engine::new().unwrap();
+    let reqs = all_audio_requests();
+    let want = engine.analyze_many(&second.value(), &reqs, &NoMonitor);
+    let mut fan = engine.analyze_stream(
+        &reqs,
+        &Shape::Audio {
+            rate: 8_000,
+            channels: 2,
+            frames: Dim::Exact(2 * n),
+        },
+    );
+    let stamp = set
+        .decode_stream(
+            &mut Cursor::new(Vec::new()),
+            "fake",
+            &DecodeOptions::default(),
+            &Limits::default(),
+            &mut fan,
+            &NoMonitor,
+        )
+        .unwrap();
+    assert_eq!(stamp.codec, "fake-b-dec/1");
+    assert_eq!(first.reads.load(Ordering::SeqCst), 1, "前の段も流した");
+    let got = fan.finish(&NoMonitor);
+    assert_eq!(got.len(), want.len());
+    for (g, w) in got.iter().zip(&want) {
+        let (g, w) = (g.as_ref().unwrap(), w.as_ref().unwrap());
+        assert_eq!(g.output, w.output, "{}", g.id);
+        assert_eq!(g.params, w.params, "{}", g.id);
+    }
+}
+
+/// `at` 回目の問い合わせから中止になる見張り。
+struct CancelAfter {
+    asked: AtomicU64,
+    at: u64,
+}
+
+impl Monitor for CancelAfter {
+    fn canceled(&self) -> bool {
+        self.asked.fetch_add(1, Ordering::SeqCst) >= self.at
+    }
+}
+
+/// E35（M13 段 2 の検証の直し）：流れのデコードの途中で中止すると `Canceled` で止まり、扇の `finish` もどの要求も
+/// `Canceled`（ほかの要求の結果を返さない）。読み終えてから `finish` の時点で中止しても同じ。
+#[test]
+fn canceling_stops_the_fan() {
+    let n = 20 * AUDIO_CHUNK as u64 + 3;
+    let d = fake("fake-c-dec/1", n, Dim::Exact(n), n, None);
+    let mut set = CodecSet::default();
+    set.add_decoder(d).unwrap();
+    let engine = Engine::new().unwrap();
+    let reqs = all_audio_requests();
+    let shape = Shape::Audio {
+        rate: 8_000,
+        channels: 2,
+        frames: Dim::Exact(n),
+    };
+    for at in [0u64, 1, 3, 10, 50] {
+        let mon = CancelAfter {
+            asked: AtomicU64::new(0),
+            at,
+        };
+        let mut fan = engine.analyze_stream(&reqs, &shape);
+        let r = set.decode_stream(
+            &mut Cursor::new(Vec::new()),
+            "fake",
+            &DecodeOptions::default(),
+            &Limits::default(),
+            &mut fan,
+            &mon,
+        );
+        assert!(matches!(r, Err(EngineError::Canceled)), "{at}: {r:?}");
+        for g in fan.finish(&mon) {
+            assert!(matches!(g, Err(EngineError::Canceled)), "{at}: {g:?}");
+        }
+    }
+    let mut fan = engine.analyze_stream(&reqs, &shape);
+    set.decode_stream(
+        &mut Cursor::new(Vec::new()),
+        "fake",
+        &DecodeOptions::default(),
+        &Limits::default(),
+        &mut fan,
+        &NoMonitor,
+    )
+    .unwrap();
+    let mon = CancelAfter {
+        asked: AtomicU64::new(0),
+        at: 0,
+    };
+    for g in fan.finish(&mon) {
+        assert!(matches!(g, Err(EngineError::Canceled)), "{g:?}");
+    }
 }
 
 /// E42（M13 段 2・D5）：ファイルから形を読む口（symphonia はファイルを開いて probe し、全体を読み込まない）は、読み口から

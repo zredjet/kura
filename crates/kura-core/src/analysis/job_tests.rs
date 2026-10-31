@@ -564,6 +564,48 @@ fn cancel_or_crash_leaves_items_pending() {
     );
 }
 
+/// 音声を流して解いている途中で中止すると、解いていたものは捨てて pending のまま（流れのデコード・解析の扇の中止。
+/// M13 段 2 の検証の直し）。前に解いたものは書く。
+#[test]
+fn cancel_while_streaming_audio_leaves_it_pending() {
+    let manager: Arc<OnceLock<Arc<JobManager>>> = Arc::new(OnceLock::new());
+    let slot = manager.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let r = reads.clone();
+    let hook: Hook = Arc::new(move |_| {
+        // 2 件目を流して読む前に中止を頼む（流れの中で見張りが中止を見る）
+        if r.fetch_add(1, Ordering::SeqCst) == 1
+            && let Some(jobs) = slot.get()
+        {
+            let running = jobs
+                .list(&JobFilter {
+                    kinds: vec![JobKind::Analyze],
+                    states: vec![JobState::Running],
+                    limit: Some(1),
+                })
+                .unwrap();
+            jobs.cancel(running[0].id).unwrap();
+        }
+    });
+    let env = Env::with(|log, _| watched_set(log, Some(hook), Vec::new()), 64 << 20);
+    let _ = manager.set(env.jobs.clone());
+    for id in 1..=3 {
+        env.add(id, "audio", "wav", &wav(8_000 * (id as u64 + 2), None));
+    }
+    let record = env.run();
+    assert_eq!(record.state, JobState::Canceled);
+    assert_eq!(env.state(3), "ready", "中止の前に解いたものは書く");
+    assert_eq!(env.state(2), "pending", "解いていたものは捨てる");
+    assert_eq!(env.state(1), "pending");
+    assert_eq!(env.query::<i64>("SELECT count(*) FROM media_facts"), 1);
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    assert_eq!(
+        (env.state(2), env.state(1)),
+        ("ready".into(), "ready".into())
+    );
+}
+
 /// 同じ中身の結果がそろっていれば、読まずに使う（読み取りの記録の列も変えない）。
 #[test]
 fn same_content_results_are_reused_without_decoding() {

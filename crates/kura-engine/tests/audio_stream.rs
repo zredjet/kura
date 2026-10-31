@@ -6,6 +6,8 @@
 //! - presolved_measurement_equals_run：流れの解析（`audio.loudness_gating` の流れ）を窓（1・7・4,096・C・ランダム）で解いた結果が
 //!   `run` と同じ正規の形（長さの決まった形と、長さが上限しか分からない形。M13 段 2）。
 //! - patcher_equals_compute（E40）：波形の段の部分更新を流れに載せた `Patcher` が `compute` と同じ。
+//! - e35_stream_lengths_are_checked_for_every_analysis（E35。M13 段 2 の検証の直し）：音声の解析の流れのどれも、終わりの長さ・
+//!   形の長さ・窓の順・チャンネルの数・上限を照らして `Internal`。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -813,6 +815,97 @@ fn audio_analyses_all_stream() {
                 );
             }
         }
+    }
+}
+
+/// E35（M13 段 2 の検証の直し）：音声の解析の流れはどれも、受けた長さと終わりの長さ・形の長さを照らす。長さの決まった形で
+/// 終わりの長さが受けた長さ・形と違う、上限の形で終わりの長さが受けた長さと違う、重なる窓・飛んだ窓・チャンネルの数の
+/// 違う窓・上限を超えて受けるものは、どれも `Internal`（短い・長い結果を黙って作らない）。
+#[test]
+fn e35_stream_lengths_are_checked_for_every_analysis() {
+    use kura_engine::audio::stream::StreamEnd;
+    use kura_engine::shape::{Dim, Shape};
+    let engine = engine();
+    let limits = Limits::default();
+    let cx = AnalyzeCx {
+        mon: &NoMonitor,
+        limits: &limits,
+    };
+    let v = InputGen::AudioNoise {
+        rate: 8_000,
+        channels: 2,
+        frames: 100,
+        seed: 3,
+    }
+    .generate()
+    .unwrap();
+    let Value::Audio(au) = &v else { panic!() };
+    let planes = au.read_planes(0, 100).unwrap();
+    let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+    let end = |frames| StreamEnd {
+        frames,
+        meta: au.meta.clone(),
+    };
+    let shape = |frames| Shape::Audio {
+        rate: 8_000,
+        channels: 2,
+        frames,
+    };
+    for a in audio_analyses(&engine) {
+        let id = a.id();
+        let p = a.check_params(&json!({})).unwrap();
+        // (形, 流す長さ, 終わりの長さ, 通るか)
+        for (frames, fed, at_end, ok) in [
+            (Dim::Exact(100), 100usize, 100u64, true),
+            (Dim::Exact(100), 100, 99, false),
+            (Dim::Exact(100), 100, 101, false),
+            (Dim::Exact(100), 60, 60, false),
+            (Dim::Exact(100), 60, 100, false),
+            (Dim::AtMost(150), 100, 100, true),
+            (Dim::AtMost(150), 100, 101, false),
+            (Dim::AtMost(150), 100, 99, false),
+            (Dim::AtMost(100), 100, 100, true),
+            (Dim::AtMost(150), 0, 0, true),
+        ] {
+            let mut st = a.stream_any(&p, &shape(frames)).unwrap().unwrap();
+            let part: Vec<&[f32]> = views.iter().map(|x| &x[..fed]).collect();
+            st.feed(0, &part, &cx).unwrap();
+            let got = st.finish(&end(at_end), &cx);
+            assert_eq!(got.is_ok(), ok, "{id}・{frames:?}・{fed}・{at_end}");
+            if !ok {
+                assert!(
+                    matches!(got, Err(EngineError::Internal(_))),
+                    "{id}・{frames:?}・{fed}・{at_end}"
+                );
+            }
+        }
+        let bounded = shape(Dim::AtMost(150));
+        let head: Vec<&[f32]> = views.iter().map(|x| &x[..10]).collect();
+        // 重なる窓
+        let mut st = a.stream_any(&p, &bounded).unwrap().unwrap();
+        st.feed(0, &head, &cx).unwrap();
+        assert!(
+            matches!(st.feed(5, &head, &cx), Err(EngineError::Internal(_))),
+            "{id}：重なる窓"
+        );
+        // 飛んだ窓
+        let mut st = a.stream_any(&p, &bounded).unwrap().unwrap();
+        assert!(
+            matches!(st.feed(1, &head, &cx), Err(EngineError::Internal(_))),
+            "{id}：飛んだ窓"
+        );
+        // チャンネルの数の違う窓
+        let mut st = a.stream_any(&p, &bounded).unwrap().unwrap();
+        assert!(
+            matches!(st.feed(0, &head[..1], &cx), Err(EngineError::Internal(_))),
+            "{id}：チャンネルの数"
+        );
+        // 上限を超えて受ける
+        let mut st = a.stream_any(&p, &shape(Dim::AtMost(50))).unwrap().unwrap();
+        assert!(
+            matches!(st.feed(0, &views, &cx), Err(EngineError::Internal(_))),
+            "{id}：上限を超える"
+        );
     }
 }
 
