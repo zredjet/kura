@@ -240,7 +240,7 @@ impl Pass<'_, '_> {
 struct DigestOnly<'p, 'a> {
     digest: Option<PcmTreeDigest>,
     frames: u64,
-    pass: Pass<'p, 'a>,
+    pass: Option<Pass<'p, 'a>>,
 }
 
 impl AudioSink for DigestOnly<'_, '_> {
@@ -261,7 +261,9 @@ impl AudioSink for DigestOnly<'_, '_> {
             None => return Err(EngineError::Internal("照らしの回が始まっていません".into())),
         }
         let n = planes.first().map_or(0, |p| p.len()) as u64;
-        self.pass.report(start.saturating_add(n), self.frames);
+        if let Some(pass) = &self.pass {
+            pass.report(start.saturating_add(n), self.frames);
+        }
         Ok(())
     }
 
@@ -274,7 +276,7 @@ impl AudioSink for DigestOnly<'_, '_> {
 fn digest_value(
     value: &Value,
     mon: &dyn Monitor,
-    pass: Pass<'_, '_>,
+    pass: Option<Pass<'_, '_>>,
 ) -> std::result::Result<Digest, EngineError> {
     let Value::Audio(a) = value else {
         return Err(EngineError::Internal("音声ではありません".into()));
@@ -335,6 +337,29 @@ impl DecodeSink for CountingDecode<'_, '_, '_> {
     fn end(&mut self, end: &StreamEnd) -> std::result::Result<(), EngineError> {
         self.inner.end(end)
     }
+}
+
+/// 源として開いた WAV・AIFF の値 `value` を照らしの回で流してダイジェストを取り、決めた LRU `resident` で源を開き直した値
+/// （LRU が空）と返す（開き直しは見出しを読むだけ）。照らしの回で埋めた LRU（最大 `resident`）を、計画の確保を待つ間に予算の
+/// 外で持たない（M13 段 3 の検証の直し）。
+#[allow(clippy::too_many_arguments)]
+fn verify_source(
+    codecs: &CodecSet,
+    opener: &Opener,
+    format: &str,
+    opts: &DecodeOptions,
+    limits: &Limits,
+    resident: u64,
+    value: Value,
+    mon: &dyn Monitor,
+    pass: Option<Pass<'_, '_>>,
+) -> std::result::Result<(Value, Digest), EngineError> {
+    let digest = digest_value(&value, mon, pass)?;
+    drop(value);
+    let reopened = codecs
+        .open_audio_source(opener, format, opts, limits, resident)?
+        .ok_or_else(|| EngineError::Internal("元を開き直せません".into()))?;
+    Ok((reopened.value, digest))
 }
 
 /// 照らしの回の作業領域（窓 1 つ ＋ ダイジェスト ＋ 源の LRU）。
@@ -593,10 +618,20 @@ fn read_source(
             passes.report(weight, 0.0, pass.message);
             let mon = cx.mon;
             let value = opened.value;
-            let digest = go!(
+            let (value, digest) = go!(
                 cx.ctx,
                 "元を読めません",
-                cx.runtime.bulk(|_| digest_value(&value, mon, pass))
+                cx.runtime.bulk(|_| verify_source(
+                    cx.codecs,
+                    &opener,
+                    cx.format,
+                    cx.opts,
+                    cx.limits,
+                    resident,
+                    value,
+                    mon,
+                    Some(pass)
+                ))
             );
             passes.finish(weight);
             let decoded = DecodeStamp {
@@ -853,7 +888,7 @@ pub(super) fn borrowed(
         passes.report(1.0, 0.0, pass.message);
         let mon = cx.mon;
         let value = lent.value.clone();
-        let got = cx.runtime.bulk(|_| digest_value(&value, mon, pass));
+        let got = cx.runtime.bulk(|_| digest_value(&value, mon, Some(pass)));
         let got = match got {
             Ok(d) => d,
             Err(e) if matches!(e.root(), EngineError::Canceled) => match stop_end(cx.ctx) {
@@ -1013,4 +1048,83 @@ pub(super) fn hash_part(
         .finish()
         .map_err(|e| from_engine("書いたファイルを読み直せません", e))?;
     Ok((*raw.finalize().as_bytes(), file_digest, len))
+}
+
+#[cfg(test)]
+mod tests {
+    use kura_engine::testgen::InputGen;
+    use kura_engine::value::Chunk;
+    use kura_engine::{Engine, NoMonitor};
+    use serde_json::json;
+
+    use super::*;
+
+    /// 源の読みの数（チャンク 0 の源の統計）。
+    fn source_reads(value: &Value) -> u64 {
+        let Value::Audio(a) = value else {
+            panic!("音声ではない");
+        };
+        match a.chunk(0, 0).unwrap() {
+            Chunk::Source(r) => r.src.stats().reads + r.src.stats().hits,
+            _ => panic!("源ではない"),
+        }
+    }
+
+    /// 照らしの回のあと、決めた LRU で源を開き直して返す（照らしの回で埋めた LRU を持ったまま計画の確保を待たない。M13 段 3
+    /// の検証の直し #10）。ダイジェストは丸ごと読んだ値と同じ。
+    #[test]
+    fn verified_source_comes_back_with_an_empty_lru() {
+        let codecs = CodecSet::pinned();
+        let v = InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 2,
+            frames: 3 * AUDIO_CHUNK as u64 + 5,
+            seed: 10,
+        }
+        .generate()
+        .unwrap();
+        let bytes = codecs
+            .encode_bytes(&v, "wav", &json!({ "bits": 16 }), &NoMonitor)
+            .unwrap()
+            .0;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.wav");
+        std::fs::write(&path, &bytes).unwrap();
+        let opener = path_opener(&path);
+        let opts = DecodeOptions::default();
+        let limits = Engine::new().unwrap().limits().clone();
+        let opened = codecs
+            .open_audio_source(&opener, "wav", &opts, &limits, 1 << 20)
+            .unwrap()
+            .unwrap();
+        assert_eq!(source_reads(&opened.value), 0);
+        let (value, digest) = verify_source(
+            &codecs,
+            &opener,
+            "wav",
+            &opts,
+            &limits,
+            1 << 20,
+            opened.value,
+            &NoMonitor,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            source_reads(&value),
+            0,
+            "照らしの回の LRU を持ったまま返した"
+        );
+        let (whole, _) = codecs
+            .decode(
+                &mut std::io::Cursor::new(&bytes),
+                "wav",
+                &opts,
+                &limits,
+                &NoMonitor,
+            )
+            .unwrap();
+        assert_eq!(digest, whole.digest().unwrap());
+        assert_eq!(value.digest().unwrap(), digest);
+    }
 }
