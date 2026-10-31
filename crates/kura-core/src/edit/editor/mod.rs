@@ -1126,7 +1126,7 @@ fn apply_steps(e: &Engine, st: &mut State, steps: Vec<Step>) -> (Vec<NodeId>, Op
             Step::Paint { actions } => paint_edit(e, st.session.head(), actions)
                 .and_then(|edit| commit_checked(e, st, edit, CommitMode::Step)),
             Step::Handle { handle, node, mode } => {
-                let chain = st.plan.time_chain(st.output).unwrap_or_default();
+                let chain = handle_chain(e, st, &handle, node);
                 let output = st
                     .plan
                     .output_shapes()
@@ -1172,6 +1172,36 @@ fn apply_steps(e: &Engine, st: &mut State, steps: Vec<Step>) -> (Vec<NodeId>, Op
         }
     }
     (created, None)
+}
+
+/// ハンドルの手の下流の写しに使う時間の写しの連鎖。切り詰めは、今の文書（仮の値を含む）で対象のノードを外した計画の連鎖
+/// （ハンドルの座標は対象を外した表示のもの：切り詰めの道具は対象を仮に外して入力を出している間に枠を出す。確定が
+/// `[cancelPreview, handle]` でも `handle` だけでも同じに写す。後ろに `end: null` の trim があると、対象の有無で下流の写しが
+/// 変わる）。ほかのハンドルは今の計画の連鎖。
+fn handle_chain(
+    e: &Engine,
+    st: &State,
+    handle: &audio::handles::Handle,
+    node: Option<NodeId>,
+) -> Vec<kura_engine::render::TimeLink> {
+    let now = || st.plan.time_chain(st.output).unwrap_or_default();
+    let (audio::handles::Handle::Trim { .. }, Some(id)) = (handle, node) else {
+        return now();
+    };
+    let mut g = st.session.current().to_graph();
+    match g.nodes.iter_mut().find(|n| n.id == id) {
+        Some(n) if n.enabled => n.enabled = false,
+        // 外している（道具の途中）・ない（handle_edit が断る）なら今の計画
+        _ => return now(),
+    }
+    match e.compile(&g, &st.shapes) {
+        Ok(plan) => plan.time_chain(st.output).unwrap_or_default(),
+        Err(issues) => {
+            // 外すと計画を作れない文書では道具を開けない（仮に外す手が断られる）。今の計画で写す
+            tracing::debug!(?issues, "対象を外した文書の計画を作れません");
+            now()
+        }
+    }
 }
 
 /// 開いているエディタ（セッションが違えば NoSession）。

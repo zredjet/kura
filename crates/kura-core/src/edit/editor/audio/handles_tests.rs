@@ -375,3 +375,68 @@ fn the_trim_tool_flow() {
     assert_eq!(params(&env, &s, 1), json!({ "start": 500, "end": null }));
     assert_eq!(shown_audio(&out.view).frames, 3 * C - 500);
 }
+
+/// 文書のノードを仮に外す手。
+fn preview_disabled(node: u32) -> Step {
+    Step::Preview {
+        edit: Edit::SetEnabled {
+            node: NodeId(node),
+            enabled: false,
+        },
+    }
+}
+
+/// 切り詰めの道具：後ろに `end: null` の trim があっても、前の trim を広げられる（下流の写しは対象を外した表示のもの）。
+/// `[cancelPreview, handle{trim, step}]` と `handle{trim, step}` だけの、どちらでも。
+#[test]
+fn the_trim_tool_widens_an_earlier_trim() {
+    let env = Env::new();
+    let bytes = noise_wav(8_000, 1, 3 * C, 45);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let vp = Viewport::audio_idle();
+    for cancel_first in [true, false] {
+        let opened = env.open(id);
+        let s = opened.session.clone();
+        env.step(
+            &s,
+            vec![
+                add(0, "audio.trim", json!({ "start": 1_000, "end": 2_000 })),
+                add(1, "audio.trim", json!({ "start": 100, "end": null })),
+            ],
+            &vp,
+        );
+        let out = env.step(&s, vec![preview_disabled(1)], &vp);
+        let info = shown_audio(&out.view);
+        assert_eq!(info.frames, 3 * C - 100, "外している間は後ろの trim だけ");
+        assert_eq!(
+            info.nodes[0].marks,
+            Some(Marks::Trim {
+                start: 900,
+                end: 1_900
+            })
+        );
+        // 枠を広げて確定する（表示の 900〜5,000 は前の trim の 1,000〜5,100）
+        let commit = handle(
+            Handle::Trim {
+                start: 900,
+                end: 5_000,
+            },
+            Some(1),
+            STEP,
+        );
+        let steps = if cancel_first {
+            vec![Step::CancelPreview, commit]
+        } else {
+            vec![commit]
+        };
+        let out = env.step(&s, steps, &vp);
+        assert!(out.rejected.is_none(), "{cancel_first}: {:?}", out.rejected);
+        assert!(!out.status.provisional);
+        assert!(enabled(&env, &s, 1));
+        assert_eq!(params(&env, &s, 1), json!({ "start": 1_000, "end": 5_100 }));
+        assert_eq!(shown_audio(&out.view).frames, 4_100 - 100);
+        // 1 手で戻る
+        env.step(&s, vec![Step::Undo], &vp);
+        assert_eq!(params(&env, &s, 1), json!({ "start": 1_000, "end": 2_000 }));
+    }
+}
