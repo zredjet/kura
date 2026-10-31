@@ -721,12 +721,22 @@ fn rebuild_stream_in(
         limits,
         mon: &mon,
     };
-    // GC の照合（rules.progress が偽）は送らない（GC は自分の進捗を送る）
-    let mut passes = stream::Passes::new(&cx, 3.25, rules.progress);
+    // 進捗の重み：入力 1、書く回 × 回の数（記録の書き手、なければ今の組の同じ形式のもの）、R2 の読み直し 0.25。GC の照合
+    // （rules.progress が偽）は送らない（GC は自分の進捗を送る）
+    let probe = Shape::Audio {
+        rate: 48_000,
+        channels: 2,
+        frames: Dim::Exact(48_000),
+    };
+    let planned_rounds = recorded_encoder
+        .as_deref()
+        .and_then(|id| codecs.encoder_by_id(id))
+        .or_else(|| codecs.encoder(&out_format, &probe))
+        .map_or(1, |e| e.stream_passes(&out_format, &enc_opts));
+    let mut passes =
+        stream::Passes::new(&cx, 1.0 + f64::from(planned_rounds) + 0.25, rules.progress);
     let mut warnings: Vec<String> = Vec::new();
-    if rules.progress {
-        ctx.progress(0.1, "戻す版の元を読んでいます");
-    }
+    passes.report(0.0, 0.0, "戻す版の元を読んでいます");
     // 作業用の PCM は呼び手が持つ（作り直したものと一緒に返し、止める指示を見たら落とす）
     let read = stream::read_input(
         &cx,
@@ -804,9 +814,6 @@ fn rebuild_stream_in(
         "作り直しのメモリを確保できません",
         runtime.admit_bulk_with(&plan, spec, |_| 0, &mon)
     );
-    if rules.progress {
-        ctx.progress(0.5, "描き直しています");
-    }
     let written = match stream::write_output(
         &cx,
         &plan,
@@ -822,6 +829,7 @@ fn rebuild_stream_in(
         Flow::Go(w) => w,
         Flow::Stop(end) => return Ok(Flow::Stop(end)),
     };
+    passes.finish(f64::from(rounds));
     drop(lease);
     // 値の照らし（書き終えてから分かる。違えばまれなので、書いた分の無駄は受け入れる）
     if written.encoded.value_digest != want {

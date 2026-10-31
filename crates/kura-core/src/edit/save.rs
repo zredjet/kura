@@ -1389,7 +1389,7 @@ impl EditHandler {
         };
         let mut passes =
             stream::Passes::new(&cx, 1.0 + f64::from(rounds) + promote_weight + 0.25, true);
-        ctx.progress(0.05, "元の大きさを確かめています");
+        passes.report(0.0, 0.0, "元の大きさを確かめています");
         let mut warnings: Vec<String> = Vec::new();
         // 1. 入力
         // エディタが同じ元・同じ読み方の入力を貸していれば、元を読み直さずに使う（照らしていなければ照らしの回を回す）
@@ -1476,11 +1476,15 @@ impl EditHandler {
         let mut staging = Staging::default();
         std::fs::create_dir_all(layout.staging_dir())?;
         let anchor_use = if promote {
-            ctx.progress(0.35, "元の読み取りを残しています");
             let w = work.as_ref().ok_or_else(|| {
                 CoreError::Invalid("再現しない読みなのに作業用のファイルがありません".into())
             })?;
-            let a = match stream::promote(&cx, w, &input.decoded, job, &mut staging)? {
+            let pass = stream::Pass {
+                passes: &passes,
+                weight: promote_weight,
+                message: "元の読み取りを残しています",
+            };
+            let a = match stream::promote(&cx, w, &input.decoded, job, &mut staging, pass)? {
                 Flow::Go(a) => a,
                 Flow::Stop(end) => return Ok(Flow::Stop(end)),
             };
@@ -1512,8 +1516,7 @@ impl EditHandler {
         };
         passes.finish(f64::from(rounds));
         drop(lease);
-        // 5. R2：書いたものを 1 回読んで、台帳の BLAKE3 と書き出しの記録のダイジェストを取る
-        ctx.progress(0.92, "書いたものを確かめています");
+        // 5. R2：書いたものを 1 回読んで、台帳の BLAKE3 と書き出しの記録のダイジェストを取る（重み 0.25 の回）
         let (out_hash, file_digest, out_size) = match stream::hash_part(&out_part, &passes, &mon) {
             Ok(h) => h,
             Err(CoreError::Canceled) => match stop_end(ctx) {

@@ -593,6 +593,7 @@ pub fn verify_stream(
             a.channels(),
             a.frames() as u64,
         )?,
+        frames: a.frames() as u64,
     };
     crate::audio::stream::stream_value(a, None, &mut sink, mon).map_err(body_err)?;
     let digest = sink.digest.finish(&a.meta)?;
@@ -602,9 +603,10 @@ pub fn verify_stream(
     Ok(header)
 }
 
-/// 流れの窓をダイジェストに足す受け手（[`verify_stream`]）。
+/// 流れの窓をダイジェストに足す受け手（[`verify_stream`]。窓ごとに `mon.progress(読んだフレーム, 全体)` を知らせる）。
 struct DigestSink {
     digest: crate::audio::digest::PcmTreeDigest,
+    frames: u64,
 }
 
 impl crate::audio::stream::AudioSink for DigestSink {
@@ -618,7 +620,10 @@ impl crate::audio::stream::AudioSink for DigestSink {
         planes: &[&[f32]],
         mon: &dyn Monitor,
     ) -> Result<(), EngineError> {
-        self.digest.push_window(start, planes, mon)
+        self.digest.push_window(start, planes, mon)?;
+        let n = planes.first().map_or(0, |p| p.len()) as u64;
+        mon.progress(start.saturating_add(n), self.frames);
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<(), EngineError> {

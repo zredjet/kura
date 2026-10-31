@@ -11,15 +11,18 @@
 //! 4. 描いて書く：一括のプールで `output_stream` を `encode_stream` に流し、.part を `sync_all`。
 //! 5. R2：.part を 1 回読んで、生の BLAKE3（台帳）と `kura-file-v1`（書き出しの記録）を取る。
 //!
-//! 進捗はパスの重み（作業用のファイル 1・照らしの回 0.5・書く回 × 1・昇格の照らし 0.5・R2 の読み直し 0.25）で数える。
+//! 進捗はパスの重み（入力 1（作業用のファイル・源の照らしの回、アンカーなら照らしの回 0.5）・書く回 × 1・昇格の照らし 0.5・R2 の
+//! 読み直し 0.25）で数え、どの回も受け手を包んでフレーム（R2 はバイト）を数えて今の回の割合として知らせる。割合は 0.05〜0.9
+//! （コミットの「保存しています」0.9 まで）で、送った割合より下げない（M13 段 3 の検証の直し）。
 //! 一時停止で止めるときは作業用のファイルを残す印を立て、再開は初めから（`ensure` が残っているものを使い回す）。
 
 use kura_engine::audio::digest::PcmTreeDigest;
 use kura_engine::audio::source::Opener;
 use kura_engine::audio::stream::{
-    AudioProducer, AudioSink, STREAM_CHUNKS, StreamInfo, stream_value,
+    AudioProducer, AudioSink, STREAM_CHUNKS, StreamEnd, StreamInfo, stream_value,
 };
 use kura_engine::budget::Class;
+use kura_engine::codec::stream::{DecodeInfo, DecodeSink};
 use kura_engine::codec::{CodecSet, Decoder, FileDigest, PickedStage, ReadSeek, StreamEncoded};
 use kura_engine::render::cache::{FingerprintedInput, NodeCache};
 use kura_engine::render::region::Spans;
@@ -88,6 +91,8 @@ pub(super) struct Passes<'a> {
     done: f64,
     /// 送るか（保存・版に戻すは真。GC の照合は偽：GC は自分の進捗を送る。M13 段 3 の検証の直し）。
     send: bool,
+    /// これまでに出した割合（f64 のビット。負でない f64 はビットの順が値の順。下げない）。
+    last: std::sync::atomic::AtomicU64,
     /// テストの割り込み（流れの途中の段）。
     #[cfg(test)]
     engine: &'a EngineServices,
@@ -101,6 +106,7 @@ impl<'a> Passes<'a> {
             total: total.max(1e-9),
             done: 0.0,
             send,
+            last: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             engine: cx.engine,
         }
@@ -112,13 +118,23 @@ impl<'a> Passes<'a> {
         self.engine.at(stage);
     }
 
+    /// 今の回（重み `weight`）の進み `frac`（0〜1）の割合（0.05〜0.9。コミットの 0.9 を超えない）。これまでに出した割合より
+    /// 下げない（覚える）。
+    pub(super) fn value(&self, weight: f64, frac: f64) -> f64 {
+        let p = (self.done + weight * frac.clamp(0.0, 1.0)) / self.total;
+        let v = 0.05 + 0.85 * p.clamp(0.0, 1.0);
+        let prev = self
+            .last
+            .fetch_max(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        v.max(f64::from_bits(prev))
+    }
+
     /// 今の回（重み `weight`）の進み `frac`（0〜1）を知らせる。
-    fn report(&self, weight: f64, frac: f64, message: &str) {
+    pub(super) fn report(&self, weight: f64, frac: f64, message: &str) {
         if !self.send {
             return;
         }
-        let p = (self.done + weight * frac.clamp(0.0, 1.0)) / self.total;
-        self.ctx.progress(0.05 + 0.9 * p.clamp(0.0, 1.0), message);
+        self.ctx.progress(self.value(weight, frac), message);
     }
 
     /// 回（重み `weight`）を終えた。
@@ -204,14 +220,33 @@ impl AudioProducer for Counting<'_, '_> {
     }
 }
 
-/// 流れの窓を値のダイジェストに足す受け手（照らしの回）。
-struct DigestOnly {
-    digest: Option<PcmTreeDigest>,
+/// 今の回の進み具合の知らせ先（`passes` の重み `weight` の回、文言 `message`）。
+#[derive(Clone, Copy)]
+pub(super) struct Pass<'p, 'a> {
+    pub passes: &'p Passes<'a>,
+    pub weight: f64,
+    pub message: &'p str,
 }
 
-impl AudioSink for DigestOnly {
+impl Pass<'_, '_> {
+    /// `done` / `total` まで進んだ。
+    fn report(&self, done: u64, total: u64) {
+        self.passes
+            .report(self.weight, done as f64 / total.max(1) as f64, self.message);
+    }
+}
+
+/// 流れの窓を値のダイジェストに足す受け手（照らしの回。流れたフレームを数えて今の回の割合として知らせる）。
+struct DigestOnly<'p, 'a> {
+    digest: Option<PcmTreeDigest>,
+    frames: u64,
+    pass: Pass<'p, 'a>,
+}
+
+impl AudioSink for DigestOnly<'_, '_> {
     fn begin(&mut self, info: &StreamInfo) -> std::result::Result<(), EngineError> {
         self.digest = Some(PcmTreeDigest::new(info.rate, info.channels, info.frames)?);
+        self.frames = info.frames;
         Ok(())
     }
 
@@ -222,9 +257,12 @@ impl AudioSink for DigestOnly {
         mon: &dyn Monitor,
     ) -> std::result::Result<(), EngineError> {
         match &mut self.digest {
-            Some(d) => d.push_window(start, planes, mon),
-            None => Err(EngineError::Internal("照らしの回が始まっていません".into())),
+            Some(d) => d.push_window(start, planes, mon)?,
+            None => return Err(EngineError::Internal("照らしの回が始まっていません".into())),
         }
+        let n = planes.first().map_or(0, |p| p.len()) as u64;
+        self.pass.report(start.saturating_add(n), self.frames);
+        Ok(())
     }
 
     fn finish(&mut self) -> std::result::Result<(), EngineError> {
@@ -232,16 +270,71 @@ impl AudioSink for DigestOnly {
     }
 }
 
-/// 遅延の値 `value` を 1 回流して値のダイジェストを取る（照らしの回）。
-fn digest_value(value: &Value, mon: &dyn Monitor) -> std::result::Result<Digest, EngineError> {
+/// 遅延の値 `value` を 1 回流して値のダイジェストを取る（照らしの回。進み具合を `pass` に知らせる）。
+fn digest_value(
+    value: &Value,
+    mon: &dyn Monitor,
+    pass: Pass<'_, '_>,
+) -> std::result::Result<Digest, EngineError> {
     let Value::Audio(a) = value else {
         return Err(EngineError::Internal("音声ではありません".into()));
     };
-    let mut sink = DigestOnly { digest: None };
+    let mut sink = DigestOnly {
+        digest: None,
+        frames: 0,
+        pass,
+    };
     stream_value(a, None, &mut sink, mon)?;
     sink.digest
         .ok_or_else(|| EngineError::Internal("照らしの回を流していません".into()))?
         .finish(&a.meta)
+}
+
+/// 照らしの回（`anchor::verify_stream`。窓ごとに `progress` を呼ぶ）の進み具合を今の回の割合として知らせる中止の口。
+struct PassMonitor<'p, 'a> {
+    inner: &'p dyn Monitor,
+    pass: Pass<'p, 'a>,
+}
+
+impl Monitor for PassMonitor<'_, '_> {
+    fn canceled(&self) -> bool {
+        self.inner.canceled()
+    }
+
+    fn progress(&self, done: u64, total: u64) {
+        self.pass.report(done, total);
+    }
+}
+
+/// 作業用の PCM を作る回の受け手を包み、読んだフレームを数えて今の回の割合として知らせる（長さが上限しか分からない形は
+/// 見込みの長さで）。
+struct CountingDecode<'s, 'p, 'a> {
+    inner: &'s mut dyn DecodeSink,
+    pass: Pass<'p, 'a>,
+    total: u64,
+}
+
+impl DecodeSink for CountingDecode<'_, '_, '_> {
+    fn begin(&mut self, info: &DecodeInfo) -> std::result::Result<(), EngineError> {
+        self.total = info.expect;
+        self.inner.begin(info)
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> std::result::Result<(), EngineError> {
+        self.inner.feed(start, planes, mon)?;
+        let n = planes.first().map_or(0, |p| p.len()) as u64;
+        self.pass.report(start.saturating_add(n), self.total);
+        Ok(())
+    }
+
+    fn end(&mut self, end: &StreamEnd) -> std::result::Result<(), EngineError> {
+        self.inner.end(end)
+    }
 }
 
 /// 照らしの回の作業領域（窓 1 つ ＋ ダイジェスト ＋ 源の LRU）。
@@ -306,8 +399,13 @@ impl StreamCx<'_> {
 }
 
 /// 元をデコーダ `decoder`（None は段の順）で作業用の PCM にする（あれば使い回す）。段ごとに形を読んで見積もりを確保し直し、
-/// 形を読めた段で流して読む（その段が `Unsupported` なら次の段の形を読み直す。M13 段 2 の検証の直しと同じ考え方）。
-fn ensure_work(cx: &StreamCx<'_>, decoder: Option<&Arc<dyn Decoder>>) -> Result<Flow<WorkHandle>> {
+/// 形を読めた段で流して読む（その段が `Unsupported` なら次の段の形を読み直す。M13 段 2 の検証の直しと同じ考え方）。読む
+/// 進み具合を `pass` に知らせる。
+fn ensure_work(
+    cx: &StreamCx<'_>,
+    decoder: Option<&Arc<dyn Decoder>>,
+    pass: Pass<'_, '_>,
+) -> Result<Flow<WorkHandle>> {
     let store = cx.engine.work_pcm().clone();
     let key = WorkKey {
         source: cx.original_hash,
@@ -406,7 +504,22 @@ fn ensure_work(cx: &StreamCx<'_>, decoder: Option<&Arc<dyn Decoder>>) -> Result<
                 &key,
                 &shape,
                 acx,
-                |sink| codecs.decode_stream_with_path(id, path, format, opts, limits, sink, mon),
+                |sink| {
+                    let mut counting = CountingDecode {
+                        inner: sink,
+                        pass,
+                        total: 0,
+                    };
+                    codecs.decode_stream_with_path(
+                        id,
+                        path,
+                        format,
+                        opts,
+                        limits,
+                        &mut counting,
+                        mon,
+                    )
+                },
                 limits,
                 mon,
             )
@@ -426,11 +539,12 @@ fn ensure_work(cx: &StreamCx<'_>, decoder: Option<&Arc<dyn Decoder>>) -> Result<
 type SourceRead = (Value, DecodeStamp, Option<WorkHandle>, u64);
 
 /// 元を読む（デコーダ `decoder`。None は段の順）：WAV・AIFF で源として開ければ源にして照らしの回で記録を作り、ほかは作業用の
-/// PCM にする。返すのは（遅延の値・読み取りの記録・作業用の PCM・源の LRU）。
+/// PCM にする。返すのは（遅延の値・読み取りの記録・作業用の PCM・源の LRU）。進捗はこの読みを重み `weight` の 1 回で数える。
 fn read_source(
     cx: &StreamCx<'_>,
     decoder: Option<&Arc<dyn Decoder>>,
     passes: &mut Passes<'_>,
+    weight: f64,
 ) -> Result<Flow<SourceRead>> {
     let tasks = cx.runtime.bulk_threads();
     let opener = path_opener(cx.original);
@@ -471,15 +585,20 @@ fn read_source(
                 Flow::Go(l) => l,
                 Flow::Stop(end) => return Ok(Flow::Stop(end)),
             };
-            passes.report(0.5, 0.0, "元を照らしています");
+            let pass = Pass {
+                passes,
+                weight,
+                message: "元を照らしています",
+            };
+            passes.report(weight, 0.0, pass.message);
             let mon = cx.mon;
             let value = opened.value;
             let digest = go!(
                 cx.ctx,
                 "元を読めません",
-                cx.runtime.bulk(|_| digest_value(&value, mon))
+                cx.runtime.bulk(|_| digest_value(&value, mon, pass))
             );
-            passes.finish(0.5);
+            passes.finish(weight);
             let decoded = DecodeStamp {
                 codec: d.id().to_string(),
                 tier: d.tier(),
@@ -499,13 +618,25 @@ fn read_source(
             .iter()
             .any(|d| d.tier() == Tier::Platform),
     };
-    passes.report(1.0, 0.0, "作業用のファイルに読んでいます");
-    let work = read::while_decoding(cx.ctx, platform, || ensure_work(cx, decoder))?;
+    let pass = Pass {
+        passes,
+        weight,
+        message: "作業用のファイルに読んでいます",
+    };
+    passes.report(weight, 0.0, pass.message);
+    // OS のデコーダの印の割合も今の回のもの（進捗を戻さない）
+    let work = read::while_decoding_at(
+        cx.ctx,
+        platform,
+        passes.value(weight, 0.0),
+        || passes.value(weight, 1.0),
+        || ensure_work(cx, decoder, pass),
+    )?;
     let work = match work {
         Flow::Go(w) => w,
         Flow::Stop(end) => return Ok(Flow::Stop(end)),
     };
-    passes.finish(1.0);
+    passes.finish(weight);
     let resident = lru_bytes(&work.pcm().shape, tasks);
     let opened = cx
         .runtime
@@ -560,7 +691,7 @@ pub(super) fn read_input(
 ) -> Result<Flow<StreamRead>> {
     let tasks = cx.runtime.bulk_threads();
     let Want::Recorded { decoded, platform } = want else {
-        let read = match read_source(cx, None, passes)? {
+        let read = match read_source(cx, None, passes, 1.0)? {
             Flow::Go(r) => r,
             Flow::Stop(end) => return Ok(Flow::Stop(end)),
         };
@@ -591,9 +722,14 @@ pub(super) fn read_input(
             Flow::Go(l) => l,
             Flow::Stop(end) => return Ok(Flow::Stop(end)),
         };
-        passes.report(0.5, 0.0, "元の読み取りを照らしています");
+        let pass = Pass {
+            passes,
+            weight: 0.5,
+            message: "元の読み取りを照らしています",
+        };
+        passes.report(0.5, 0.0, pass.message);
         let checked = cx.runtime.bulk(|_| {
-            anchor::verify_stream(&opener, decoded, limits, mon)?;
+            anchor::verify_stream(&opener, decoded, limits, &PassMonitor { inner: mon, pass })?;
             let probe = anchor::open_source(&opener, limits, LRU_MAX)?
                 .ok_or_else(|| EngineError::Internal("音声のアンカーではありません".into()))?;
             let resident = lru_bytes(&probe.value.shape(), tasks);
@@ -604,6 +740,8 @@ pub(super) fn read_input(
         passes.finish(0.5);
         match checked {
             Ok((value, resident)) => {
+                // 入力の重み 1 の残り（読み直さなかった分）
+                passes.finish(0.5);
                 return Ok(Flow::Go(StreamRead::Read(StreamInput {
                     value,
                     decoded: decoded.clone(),
@@ -643,7 +781,9 @@ pub(super) fn read_input(
             decoded.codec
         ))));
     }
-    let read = match read_source(cx, Some(&decoder), passes)? {
+    // 入力の重み 1 のうち、アンカーを照らした回の残り
+    let weight = if unusable.is_some() { 0.5 } else { 1.0 };
+    let read = match read_source(cx, Some(&decoder), passes, weight)? {
         Flow::Go(r) => r,
         Flow::Stop(end) => return Ok(Flow::Stop(end)),
     };
@@ -705,10 +845,15 @@ pub(super) fn borrowed(
             Flow::Go(l) => l,
             Flow::Stop(end) => return Ok(Flow::Stop(end)),
         };
-        passes.report(0.5, 0.0, "元の読み取りを照らしています");
+        let pass = Pass {
+            passes,
+            weight: 1.0,
+            message: "元の読み取りを照らしています",
+        };
+        passes.report(1.0, 0.0, pass.message);
         let mon = cx.mon;
         let value = lent.value.clone();
-        let got = cx.runtime.bulk(|_| digest_value(&value, mon));
+        let got = cx.runtime.bulk(|_| digest_value(&value, mon, pass));
         let got = match got {
             Ok(d) => d,
             Err(e) if matches!(e.root(), EngineError::Canceled) => match stop_end(cx.ctx) {
@@ -734,14 +879,16 @@ pub(super) fn borrowed(
     ))))
 }
 
-/// 段 3：作業用の PCM をアンカーに昇格する（staging に写して照らす）。
+/// 段 3：作業用の PCM をアンカーに昇格する（staging に写して照らす。照らしの進み具合を `pass` に知らせる）。
 pub(super) fn promote(
     cx: &StreamCx<'_>,
     work: &WorkHandle,
     decoded: &DecodeStamp,
     job: i64,
     staging: &mut Staging,
+    pass: Pass<'_, '_>,
 ) -> Result<Flow<AnchorUse>> {
+    pass.passes.report(pass.weight, 0.0, pass.message);
     let part = cx
         .layout
         .staging_dir()
@@ -751,9 +898,9 @@ pub(super) fn promote(
     File::open(&part)?.sync_all()?;
     let opener = path_opener(&part);
     let (limits, mon) = (cx.limits, cx.mon);
-    let verified = cx
-        .runtime
-        .bulk(|_| anchor::verify_stream(&opener, decoded, limits, mon));
+    let verified = cx.runtime.bulk(|_| {
+        anchor::verify_stream(&opener, decoded, limits, &PassMonitor { inner: mon, pass })
+    });
     go!(cx.ctx, "元の読み取りを残せません", verified);
     let hash = hash_file(&part)?;
     let size = std::fs::metadata(&part)?.len();
@@ -829,14 +976,18 @@ pub(super) fn write_output(
     Ok(Flow::Go(go!(cx.ctx, "書けません", written)))
 }
 
-/// 段 5（R2）：.part を 1 回読んで、生の BLAKE3（台帳）・`kura-file-v1`（書き出しの記録）・大きさを取る。
+/// 段 5（R2）：.part を 1 回読んで、生の BLAKE3（台帳）・`kura-file-v1`（書き出しの記録）・大きさを取る。進捗は重み 0.25 の
+/// 回で、読んだバイトを数える。
 pub(super) fn hash_part(
     path: &Path,
-    _passes: &Passes<'_>,
+    passes: &Passes<'_>,
     mon: &dyn Monitor,
 ) -> Result<([u8; 32], Digest, u64)> {
     use std::io::Read;
+    const MESSAGE: &str = "書いたものを確かめています";
     let len = std::fs::metadata(path)?.len();
+    passes.report(0.25, 0.0, MESSAGE);
+    let mut read = 0u64;
     let mut f = File::open(path)?;
     let mut raw = blake3::Hasher::new();
     let mut fd = FileDigest::new(len);
@@ -853,8 +1004,10 @@ pub(super) fn hash_part(
         };
         raw.update(&buf[..n]);
         fd.update(&buf[..n]);
+        read = read.saturating_add(n as u64);
+        passes.report(0.25, read as f64 / len.max(1) as f64, MESSAGE);
         #[cfg(test)]
-        _passes.at(super::Stage::Rehash);
+        passes.at(super::Stage::Rehash);
     }
     let file_digest = fd
         .finish()

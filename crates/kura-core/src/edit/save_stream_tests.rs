@@ -1210,3 +1210,59 @@ fn gc_rebuild_does_not_send_save_progress() {
     drop(events);
     assert_consistent(&env.lib);
 }
+
+/// ジョブ `id` の進捗の列（動いている間の (割合, 文言)。間引かない Env で）。
+fn progress_of(env: &Env, id: i64) -> Vec<(f64, String)> {
+    env.events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.id == id && e.state == JobState::Running)
+        .filter_map(|e| Some((e.progress?, e.message.clone().unwrap_or_default())))
+        .collect()
+}
+
+/// 進捗の列が戻らない（単調に増える）。
+fn assert_monotonic(seq: &[(f64, String)], what: &str) {
+    assert!(seq.len() > 3, "{what}：{seq:?}");
+    for w in seq.windows(2) {
+        assert!(
+            w[1].0 >= w[0].0,
+            "{what}：進捗が戻った {:?} → {:?}\n{seq:?}",
+            w[0],
+            w[1]
+        );
+    }
+}
+
+/// 流して書く保存・版に戻すの進捗は単調に増える（M13 段 3 の検証の直し #7）：Platform で読む音声（作業用の PCM・OS の
+/// デコーダの印・昇格・2 回流す ogg・R2・コミット）と WAV の元（源の照らしの回）の上書き、アンカー・源から作り直す版に戻す。
+#[test]
+fn streamed_progress_never_goes_back() {
+    let decoder = opus_decoder(1, 2 * 65_536 + 11);
+    let env = Env::with(FakeEngineFactory::with_codecs(opus_codecs(&decoder)), None);
+    env.jobs.set_progress_interval(0);
+    let pinned = CodecSet::pinned();
+    let wav = noise_file(&pinned, "wav", 2, 3 * 65_536 + 77, 7);
+    let items = [
+        add_audio(&env.lib, b"progress fake opus", "opus", "進みの声").0,
+        add_audio(&env.lib, &wav, "wav", "進みの WAV").0,
+    ];
+    for item in items {
+        let record = env.overwrite(item, audio_doc(-2.0, Some("ogg")));
+        assert_done(&record);
+        let seq = progress_of(&env, record.id);
+        assert_monotonic(&seq, &format!("上書き {item}"));
+        assert!(
+            seq.iter().any(|(_, m)| m == "書いたものを確かめています"),
+            "{seq:?}"
+        );
+        assert_done(&env.overwrite(item, audio_doc(-4.0, Some("wav"))));
+        gc_version(&env, item, 1);
+        let record = env.revert(item, 1);
+        assert_done(&record);
+        assert_eq!(result_of(&record)["revert"]["rebuilt"], json!(true));
+        assert_monotonic(&progress_of(&env, record.id), &format!("版に戻す {item}"));
+    }
+    assert_consistent(&env.lib);
+}

@@ -141,12 +141,24 @@ pub(super) fn while_decoding<T>(
     platform: bool,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    while_decoding_at(ctx, platform, 0.15, || 0.3, f)
+}
+
+/// [`while_decoding`] の印を、割合 `before` と読み終えたときの `after()` で書く（流して書く道は今の回の割合で。進捗を戻さない。
+/// M13 段 3 の検証の直し）。
+pub(super) fn while_decoding_at<T>(
+    ctx: &JobContext,
+    platform: bool,
+    before: f64,
+    after: impl FnOnce() -> f64,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     if !platform {
         return f();
     }
-    ctx.checkpoint(DECODING, 0.15, "元を読んでいます")?;
+    ctx.checkpoint(DECODING, before, "元を読んでいます")?;
     let r = f();
-    match ctx.checkpoint(DECODED, 0.3, "元を読みました") {
+    match ctx.checkpoint(DECODED, after(), "元を読みました") {
         Ok(()) => r,
         Err(err) => match r {
             Ok(_) => Err(err),
