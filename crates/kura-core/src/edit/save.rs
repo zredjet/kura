@@ -444,6 +444,9 @@ pub(crate) enum Stage {
     Window { fed: u64, frames: u64 },
     /// 流して書いたものの R2 の読み直しで、1 区切りを読んだあと。
     Rehash,
+    /// 流して書く保存で、計画の確保の直前（`resident` は見積もりの入力の源の LRU（`Source::Lazy`）、`promote` はアンカーに
+    /// 昇格するか）。M13 段 4C の検証の直し。
+    Admit { resident: u64, promote: bool },
 }
 
 /// テストの割り込み（段ごとに呼ばれる。止めて待つ・DB を書き換えるなど）。
@@ -1450,6 +1453,11 @@ impl EditHandler {
         } else {
             0
         };
+        #[cfg(test)]
+        self.engine.at(Stage::Admit {
+            resident: input.resident,
+            promote,
+        });
         let spec = EstimateSpec::new(0)
             .stream(OutputId(0))
             .digests(true)

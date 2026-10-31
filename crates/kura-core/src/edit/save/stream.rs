@@ -16,6 +16,8 @@
 //! （コミットの「保存しています」0.9 まで）で、送った割合より下げない（M13 段 3 の検証の直し）。
 //! 一時停止で止めるときは作業用のファイルを残す印を立て、再開は初めから（`ensure` が残っているものを使い回す）。
 
+use std::collections::BTreeSet;
+
 use kura_engine::audio::digest::PcmTreeDigest;
 use kura_engine::audio::source::Opener;
 use kura_engine::audio::stream::{
@@ -26,7 +28,7 @@ use kura_engine::codec::stream::{DecodeInfo, DecodeSink};
 use kura_engine::codec::{CodecSet, Decoder, FileDigest, PickedStage, ReadSeek, StreamEncoded};
 use kura_engine::render::cache::{FingerprintedInput, NodeCache};
 use kura_engine::render::region::Spans;
-use kura_engine::value::AUDIO_CHUNK;
+use kura_engine::value::{AUDIO_CHUNK, Chunk};
 
 use super::*;
 use crate::edit::EngineRuntime;
@@ -842,6 +844,31 @@ pub(super) fn read_input(
     })))
 }
 
+/// 値 `value` が参照する源の LRU が持ちうる量の和（源 1 つにつき、LRU の上限と源の全体の中身の小さいほうを 1 回。LRU は読んだ
+/// チャンクの中身の大きさで数え、上限を超えない。源を参照しない値は 0）。
+fn source_resident(value: &Value) -> u64 {
+    let Value::Audio(a) = value else {
+        return 0;
+    };
+    let mut seen: BTreeSet<usize> = BTreeSet::new();
+    let mut total = 0u64;
+    for ch in 0..a.channels() {
+        for k in 0..a.chunk_count() {
+            if let Ok(Chunk::Source(r)) = a.chunk(ch, k)
+                && seen.insert(Arc::as_ptr(&r.src).cast::<()>().addr())
+            {
+                let whole = r
+                    .src
+                    .frames()
+                    .saturating_mul(r.src.channels() as u64)
+                    .saturating_mul(4);
+                total = total.saturating_add(r.src.resident_bytes().min(whole));
+            }
+        }
+    }
+    total
+}
+
 /// 借りた入力（入力・作業用の PCM）。
 type Borrowed = (StreamInput, Option<WorkHandle>);
 
@@ -874,7 +901,10 @@ pub(super) fn borrowed(
     }
     let tasks = cx.runtime.bulk_threads();
     let shape = lent.value.shape();
-    let resident = lru_bytes(&shape, tasks);
+    // 貸した値の源の LRU は貸し手（エディタ）の式の上限で開いている（多チャンネル・多コアでは保存の式より大きい）。保存が流して
+    // 読む間に源の LRU はその上限まで埋まり、エディタが先に閉じれば二重に数えた分も外れるので、上限どおりに数える（M13 段 4C の
+    // 検証の直し）
+    let resident = lru_bytes(&shape, tasks).max(source_resident(&lent.value));
     if !lent.verified {
         let _lease = match cx.acquire(verify_bytes(&shape, tasks as u64, resident))? {
             Flow::Go(l) => l,
@@ -1126,5 +1156,54 @@ mod tests {
             .unwrap();
         assert_eq!(digest, whole.digest().unwrap());
         assert_eq!(value.digest().unwrap(), digest);
+    }
+
+    /// 値の源の LRU は源 1 つにつき 1 回数える（全チャンネル・全チャンクが同じ源を指しても 1 回）。数えるのは LRU の上限と
+    /// 源の全体の中身の小さいほう。中身を持つ値は 0。
+    #[test]
+    fn source_resident_counts_each_source_once() {
+        let codecs = CodecSet::pinned();
+        let frames = 4 * AUDIO_CHUNK as u64 + 1;
+        let v = InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 3,
+            frames,
+            seed: 11,
+        }
+        .generate()
+        .unwrap();
+        let bytes = codecs
+            .encode_bytes(&v, "wav", &json!({ "bits": 16 }), &NoMonitor)
+            .unwrap()
+            .0;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.wav");
+        std::fs::write(&path, &bytes).unwrap();
+        let limits = Engine::new().unwrap().limits().clone();
+        let open = |lru: u64| {
+            codecs
+                .open_audio_source(
+                    &path_opener(&path),
+                    "wav",
+                    &DecodeOptions::default(),
+                    &limits,
+                    lru,
+                )
+                .unwrap()
+                .unwrap()
+                .value
+        };
+        let whole = 3 * frames * 4;
+        assert_eq!(
+            source_resident(&open(1 << 20)),
+            1 << 20,
+            "上限が全体より小さい"
+        );
+        assert_eq!(
+            source_resident(&open(64 << 20)),
+            whole,
+            "全体が上限より小さい"
+        );
+        assert_eq!(source_resident(&v), 0, "中身を持つ値は源の LRU を持たない");
     }
 }

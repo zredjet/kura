@@ -2,8 +2,9 @@
 //! 分かるもの（WAV・AIFF の直接読み・作業用のファイル・アンカー）を開いたときに保存に貸し（`EngineServices::lend_input`）、
 //! 閉じると引き上げる（`withdraw_input`）。保存は貸した入力を使い、元を読み直さない（段 3 の S21 をエディタの道で回す）。
 
-use std::sync::Arc;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kura_engine::audio::source::SourceStats;
@@ -20,8 +21,9 @@ use super::session_tests::*;
 use super::work_tests::{Stage, Staged, pinned_decoder, plain_wav_bytes};
 use crate::edit::anchors::options_digest;
 use crate::edit::editor::{SaveMode, Step, Viewport, close, save};
+use crate::edit::save::Stage as SaveStage;
 use crate::edit::services::{LentAnchor, LentInput};
-use crate::edit::versions;
+use crate::edit::{EngineFactory, RuntimeConfig, pool_sizes, versions};
 use crate::jobs::JobState;
 use crate::library::Library;
 
@@ -71,6 +73,29 @@ fn source_stats(value: &Value) -> SourceStats {
         Chunk::Source(r) => r.src.stats(),
         other => panic!("遅延の値ではありません: {other:?}"),
     }
+}
+
+/// 遅延の値の源の LRU の上限（最初のチャンクの源）。
+fn source_cap(value: &Value) -> u64 {
+    let Value::Audio(a) = value else {
+        panic!("音声ではありません")
+    };
+    match a.chunk(0, 0).unwrap() {
+        Chunk::Source(r) => r.src.resident_bytes(),
+        other => panic!("遅延の値ではありません: {other:?}"),
+    }
+}
+
+/// 保存の流れの計画の確保の直前に、見積もりの源の LRU とアンカーに昇格するかを記す割り込みを入れる（記したものを返す）。
+fn watch_admits(env: &Env) -> Arc<Mutex<Vec<(u64, bool)>>> {
+    let seen: Arc<Mutex<Vec<(u64, bool)>>> = Arc::default();
+    let log = seen.clone();
+    env.engine.set_hook(Some(Arc::new(move |stage| {
+        if let SaveStage::Admit { resident, promote } = stage {
+            log.lock().unwrap().push((resident, promote));
+        }
+    })));
+    seen
 }
 
 /// 保存を積んで終わるまで待ち、成功を確かめる。
@@ -312,5 +337,102 @@ fn only_lazy_inputs_with_a_known_reading_are_lent() {
     assert!(
         lent(&env, fid, &hash_of(&flac)).is_none(),
         "丸ごと読んだ入力は貸さない"
+    );
+}
+
+/// 16 コアの Mac（`pool_sizes(16)`：プレビュー 4・一括 12）・予算 1 GiB（取り置き 512 MiB）・固定の段の組。
+struct SixteenCores;
+
+impl EngineFactory for SixteenCores {
+    fn runtime_config(&self) -> RuntimeConfig {
+        let (preview, bulk) = pool_sizes(16);
+        RuntimeConfig {
+            cores: Some(16),
+            preview_threads: Some(preview),
+            bulk_threads: Some(bulk),
+            budget: Some(1 << 30),
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn codecs(&self, _work_dir: &Path) -> CodecSet {
+        CodecSet::pinned()
+    }
+}
+
+/// `channels` チャンネル・`frames` フレームの 16 ビットの WAV（決まった形の波。速く作れる）。
+fn wide_wav_bytes(rate: u32, channels: u16, frames: u64) -> Vec<u8> {
+    let block = u32::from(channels) * 2;
+    let data = frames * u64::from(block);
+    let mut b = Vec::with_capacity(44 + data as usize);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&u32::try_from(36 + data).unwrap().to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&channels.to_le_bytes());
+    b.extend_from_slice(&rate.to_le_bytes());
+    b.extend_from_slice(&(rate * block).to_le_bytes());
+    b.extend_from_slice(&u16::try_from(block).unwrap().to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&u32::try_from(data).unwrap().to_le_bytes());
+    // 2,000 フレームの周期を繰り返す
+    let mut period = Vec::with_capacity(2_000 * block as usize);
+    for i in 0..2_000u64 {
+        for ch in 0..u64::from(channels) {
+            period.extend_from_slice(&((((i + 7 * ch) % 2_000) as i16) - 1_000).to_le_bytes());
+        }
+    }
+    while (b.len() as u64) < 44 + data {
+        let rest = (44 + data - b.len() as u64) as usize;
+        b.extend_from_slice(&period[..rest.min(period.len())]);
+    }
+    b
+}
+
+/// 貸した源の LRU（M13 段 4C の検証の直し）：エディタは源の LRU をプレビューのスレッドの式（max(プレビュー × 4 チャンク ×
+/// ch × 256 KiB, 64 MiB)）の上限で開いて貸す。多チャンネルでは保存の式（max(min(64 MiB, 全体), 一括 × ch × 256 KiB)）より
+/// 大きいので、保存は貸した値の源の上限どおりに数える（エディタが保存の途中で閉じても、保存が流して読む間に源の LRU は上限まで
+/// 埋まる）。16 コア（プレビュー 4・一括 12）の 24 チャンネルでは、源の上限 96 MiB に対して保存の式は 72 MiB。
+#[test]
+fn lent_source_lru_is_counted_at_its_cap() {
+    const CHANNELS: u16 = 24;
+    let frames = 16 * C;
+    let bytes = wide_wav_bytes(8_000, CHANNELS, frames);
+    let hash = hash_of(&bytes);
+
+    let env = Env::with(Arc::new(SixteenCores));
+    let admits = watch_admits(&env);
+    env.jobs.start().unwrap();
+    let id = add_audio(&env.lib, &bytes, "wav");
+    place_facts(&env.lib, id, &bytes, "wav");
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    assert!(opened.source.audio.as_ref().unwrap().lazy);
+    let l = lent(&env, id, &hash).expect("記録の分かる WAV は貸す");
+    let cap = source_cap(&l.value);
+    let chunk = C * u64::from(CHANNELS) * 4;
+    assert_eq!(cap, 16 * chunk, "エディタの源の LRU は 4 × 4 チャンク");
+    let (_, bulk) = pool_sizes(16);
+    assert!(
+        cap > (64u64 << 20).max(bulk as u64 * chunk),
+        "源の上限（{cap}）が保存の式を超える組で確かめる"
+    );
+    drop(l);
+
+    // 短く切って保存する（書く量を小さく。入力は 16 チャンクの貸した値のまま）
+    env.step(
+        &s,
+        vec![add(0, "audio.trim", json!({ "start": 0, "end": C }))],
+        &Viewport::audio_idle(),
+    );
+    save_and_wait(&env, &s, None);
+    let seen = admits.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let (resident, _) = seen[0];
+    assert!(
+        resident >= cap,
+        "保存の見積もりの源の LRU（{resident}）が貸した源の上限（{cap}）より小さい"
     );
 }
