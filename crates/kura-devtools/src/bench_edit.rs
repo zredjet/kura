@@ -3,6 +3,7 @@
 //! ```text
 //! kura-devtools bench edit [--preview-threads 3] [--bulk-threads 3] [--threads 3,4,16] [--budget 4GiB]
 //!                          [--photo <file>] [--quick] [--only 11,12] [--runs 3] [--json <file>] [--markdown <file|->]
+//!                          [--audio-minutes 60]
 //! ```
 //!
 //! - 判定の条件（ADR-154 (1)(c)）：プレビューのプールを `--preview-threads`（既定 3）、一括のプールを `--bulk-threads`
@@ -23,8 +24,13 @@
 //! - 写真のプレビュー（NFR-11 の 24MP）は縮小の段の計画（`Engine::plan_level`）で描き、段 2 で判定して段 1 も記録する
 //!   （ケースの名前に `-level1`）。段の計画にできなければ等倍で描いて記録だけにする。実写真は `--photo` で渡す（なければ
 //!   合成）。
+//! - 音声のエディタ（NFR-11 の記録。M13 段 4C の F15。[`audio`]）：kura-core の `edit::editor` で n 分の WAV を開き、gain・
+//!   フェードインの終わり・trim の終わり・ループ点の 1 手の往復（手 → 表示の区間の値）の p50／p95、開く時間、全体に効く手の
+//!   あとに波形の段・ラウドネスが裏の仕事で揃うまでの時間を記録する。長さは `--audio-minutes`（なければ NFR-11 の音声と同じ
+//!   5 分。`--quick` は 2 秒）。入力は一時の場所の新しいライブラリにアプリの取り込みのジョブで入れる。
 //! - 出力：表（標準出力に 1 行ずつ）、`--json`（環境・回・レコード）、`--markdown`（architecture.md §13 の M9 の表の形）。
 
+pub(crate) mod audio;
 pub(crate) mod batch;
 mod editor;
 mod mem;
@@ -48,7 +54,7 @@ use report::{Record, Report, emit};
 
 const USAGE: &str = "使い方: kura-devtools bench edit [--preview-threads N] [--bulk-threads N] [--threads 3,4,16] \
                      [--budget <バイト|MiB|GiB>] [--photo <file>] [--quick] [--only 11,12,…] [--runs N] \
-                     [--json <file>] [--markdown <file|->]";
+                     [--json <file>] [--markdown <file|->] [--audio-minutes N]";
 
 const MIB: u64 = 1 << 20;
 
@@ -72,6 +78,8 @@ pub(crate) struct Opts {
     /// 子プロセスの入力のファイルと形式。
     pub input: Option<PathBuf>,
     pub format: Option<String>,
+    /// 音声のエディタの長さ（分。なければ NFR-11 の音声と同じ長さ）。
+    pub audio_minutes: Option<u64>,
 }
 
 fn number<T: std::str::FromStr>(name: &str, v: Option<&String>) -> Result<T, String> {
@@ -116,6 +124,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         child: None,
         input: None,
         format: None,
+        audio_minutes: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -156,6 +165,13 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--child" => o.child = it.next().cloned(),
             "--in" => o.input = it.next().map(PathBuf::from),
             "--format" => o.format = it.next().cloned(),
+            "--audio-minutes" => {
+                let m = number::<u64>(arg, it.next())?;
+                if !(1..=600).contains(&m) {
+                    return Err(format!("--audio-minutes は 1〜600 です。{USAGE}"));
+                }
+                o.audio_minutes = Some(m);
+            }
             other => return Err(format!("知らない引数です: {other}。{USAGE}")),
         }
     }
@@ -286,6 +302,8 @@ pub(crate) struct Ctx {
     pub tmp: PathBuf,
     synthetic: Option<Photo>,
     real: Option<Photo>,
+    /// 音声のエディタのライブラリ（場所・アイテム・レートと長さ。はじめの 1 回だけ作る）。
+    audio_lib: Option<(PathBuf, i64, u32, u64)>,
 }
 
 impl Ctx {
@@ -356,6 +374,30 @@ impl Ctx {
         self.synthetic
             .as_ref()
             .ok_or_else(|| "合成の写真を作れません".to_string())
+    }
+
+    /// 音声のエディタのライブラリ（`ctx.tmp` の下。レート `rate`・長さ `frames` の WAV を書いて取り込む。はじめの 1 回だけ）。
+    pub fn audio_library(&mut self, rate: u32, frames: u64) -> Result<(PathBuf, i64), String> {
+        if let Some((lib, item, r, f)) = &self.audio_lib
+            && (*r, *f) == (rate, frames)
+        {
+            return Ok((lib.clone(), *item));
+        }
+        let root = self.tmp.join(format!("audio-editor-{rate}-{frames}"));
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        audio::write_wav(&src.join("long.wav"), rate, frames)?;
+        let lib = root.join("bench.kuralib");
+        let item = audio::prepare_library(&lib, &src)?;
+        // 取り込んだら元の WAV は要らない（ライブラリが写しを持つ）
+        let _ = std::fs::remove_dir_all(&src);
+        emit(&format!(
+            "音声のエディタ：{frames} フレームの WAV を書いて取り込んだ（{:.1} 秒）",
+            started.elapsed().as_secs_f64()
+        ));
+        self.audio_lib = Some((lib.clone(), item, rate, frames));
+        Ok((lib, item))
     }
 
     /// `--photo` の実写真（なければ None）。
@@ -523,6 +565,7 @@ fn run_all(opts: Opts, tmp: &Path) -> Result<(), String> {
         tmp: tmp.to_path_buf(),
         synthetic: None,
         real,
+        audio_lib: None,
     };
     let budget = ctx.budget_total();
     let env = env_json(&ctx.opts, budget);
@@ -583,6 +626,9 @@ fn run_once(ctx: &mut Ctx) -> Result<(), String> {
     if ctx.wants(11) || check {
         editor::preview(ctx, ctx.wants(11), check)?;
     }
+    if ctx.wants(11) {
+        audio::bench(ctx)?;
+    }
     if ctx.wants(12) || check {
         editor::paint(ctx, ctx.wants(12), check)?;
     }
@@ -612,9 +658,10 @@ mod tests {
     #[test]
     fn arguments_are_parsed() {
         let o = parse(&args(
-            "--preview-threads 4 --bulk-threads 12 --threads 3,4,16 --budget 2GiB --quick --only 11,NFR-17 --runs 3 --json a.json --markdown -",
+            "--preview-threads 4 --bulk-threads 12 --threads 3,4,16 --budget 2GiB --quick --only 11,NFR-17 --runs 3 --json a.json --markdown - --audio-minutes 60",
         ))
         .unwrap();
+        assert_eq!(o.audio_minutes, Some(60));
         assert_eq!((o.preview_threads, o.bulk_threads), (4, 12));
         assert_eq!(o.threads, vec![3, 4, 16]);
         assert_eq!(o.budget, Some(2 << 30));
@@ -625,6 +672,7 @@ mod tests {
         let d = parse(&[]).unwrap();
         assert_eq!((d.preview_threads, d.bulk_threads, d.runs), (3, 3, 1));
         assert!(d.only.is_empty() && d.threads.is_empty());
+        assert_eq!(d.audio_minutes, None);
         assert_eq!(bytes(Some(&"512MiB".into())).unwrap(), 512 * MIB);
         assert_eq!(bytes(Some(&"64k".into())).unwrap(), 64 << 10);
         assert_eq!(bytes(Some(&"1000".into())).unwrap(), 1000);
@@ -635,6 +683,8 @@ mod tests {
             "--budget 4XB",
             "--budget 0",
             "--preview-threads 0",
+            "--audio-minutes 0",
+            "--audio-minutes x",
             "--what",
         ] {
             assert!(parse(&args(bad)).is_err(), "{bad}");
@@ -655,6 +705,7 @@ mod tests {
             tmp: PathBuf::new(),
             synthetic: None,
             real: None,
+            audio_lib: None,
         };
         assert_eq!(ctx.preview_set(), vec![3, 4, 16]);
         assert_eq!(ctx.bulk_set(), vec![4, 12, 16]);

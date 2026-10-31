@@ -16,6 +16,12 @@
 //! 重いので、別のテスト `audio_60min_save_stays_within_n`（`#[ignore]`。`--release` で回す）にした。判定は N（源の LRU の上限 ＋
 //! 192 MiB）と、保存の見積もり（`EstimateSpec::stream`）× 1.25 ＋ 4 MiB ＋ チャンクの抱え込み（96 MiB。暫定）。
 //!
+//! M13 段 4C のケース `audio-editor-60min`（60 分・48 kHz ステレオの 16 ビットの WAV をアプリの取り込みのジョブでライブラリに
+//! 入れ、kura-core のエディタで区間の表示で開いて gain・fade・trim の終わり・ループ点の手を当て、裏の仕事を済ませる）も重いので、
+//! 別のテスト `audio_editor_60min_stays_within_n`（`#[ignore]`。`--release` で回す）にした。判定は N（保存の N ＋ 持ち続ける分の
+//! 上限 70 MiB）と、エディタの見積もり（キャッシュ ＋ 確保の見積もりのピーク ＋ 持ち続ける分）× 1.25 ＋ 4 MiB ＋ チャンクの
+//! 抱え込み（96 MiB。保存と同じ暫定）。
+//!
 //! 子プロセスは、このテストのバイナリ自身を `--exact mem_smoke::tests::child --ignored` で起こす（環境変数でケースと段を
 //! 渡す）。`/usr/bin/time -l` がない・peak memory footprint を出さない環境（Linux）では確かめずに通す（CI の Linux の job は
 //! kura-devtools を回さない）。
@@ -1187,6 +1193,210 @@ mod tests {
                     "{format}: 実測 {used} バイト > 見積もり {est} × 1.25 ＋ 4 MiB ＋ チャンクの抱え込み"
                 ));
             }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    // ---- M13 段 4C（F15）：60 分の音声のエディタの 1 手（kura-core のエディタの道） ----
+
+    /// 子プロセスに渡すエディタのケース。
+    const EDITOR_CASE: &str = "audio-editor-60min";
+    /// 子プロセスに渡すアイテムの ID（`FILE_ENV` はライブラリの場所）。
+    const ITEM_ENV: &str = "KURA_MEM_SMOKE_ITEM";
+    /// 子プロセスが結果の JSON の行の頭に付ける印。
+    const RESULT_MARK: &str = "KURA_MEM_SMOKE_RESULT ";
+    /// エディタの N：保存の N（源の LRU の上限 ＋ 192 MiB：窓・作業領域・流し解きの結果・チャンクの抱え込み。裏の仕事は保存と
+    /// 同じく出力を窓ごとに流す）に、エディタが持ち続ける分の上限 70 MiB（design-stage46.md §1.7：区間の表示 24 MiB × 2 ＋
+    /// 波形の段 3 つ）を足したもの。
+    const EDITOR_N: u64 = SAVE_N + 70 * MIB;
+    /// 持ち続ける分（`CacheLease::extra`）の上限（A18 と同じ）。
+    const EDITOR_EXTRA: u64 = 70 * MIB;
+    /// 子が種類ごとに当てる手の数。
+    const EDITOR_STEPS: usize = 8;
+
+    /// 子プロセス（音声のエディタ）：`base` はライブラリを開いて実行の場とコーデックの組を作るだけ。`run` は 60 分の WAV を
+    /// 区間（48 チャンク）の表示で開き、文書（trim → fade → gain → set_loop）を作って裏の仕事（波形の段・ラウドネス）を
+    /// 済ませ、フェードインの終わり・trim の終わり・ループ点・gain の手を種類ごとに当て、gain のあとの裏の仕事を済ませて
+    /// 閉じる。エディタの数（キャッシュ・持ち続ける分・確保の見積もりのピークの最大）を 1 行の JSON で標準出力に書く。
+    #[test]
+    #[ignore = "audio_editor_60min_stays_within_n が子プロセスとして起こす"]
+    fn editor_child() {
+        use crate::bench_edit::audio::{self, AudioEditor, Kind};
+        let Ok(spec) = std::env::var(CASE_ENV) else {
+            return;
+        };
+        let Some((name, stage)) = spec.split_once(':') else {
+            return;
+        };
+        if name != EDITOR_CASE {
+            return;
+        }
+        let lib = std::path::PathBuf::from(std::env::var(FILE_ENV).unwrap());
+        let item: i64 = std::env::var(ITEM_ENV).unwrap().parse().unwrap();
+        let session = kura_core::library::LibrarySession::open(
+            &lib,
+            audio::quiet(),
+            audio::services(TASKS, TASKS, None),
+        )
+        .unwrap();
+        session.wait_ready();
+        crate::bench_app::settle(&session).unwrap();
+        let engine = session.engine().unwrap();
+        let budget = engine.runtime().unwrap().budget().total();
+        let _codecs = engine.codecs();
+        if stage == "base" {
+            session.close();
+            println!("{RESULT_MARK}{}", json!({ "stage": "base" }));
+            return;
+        }
+        let frames = AUDIO_SECONDS * AUDIO_RATE;
+        let t = std::time::Instant::now();
+        let mut ed = AudioEditor::open(&session, item, frames).unwrap();
+        let open_ms = ed.open_ns as f64 / 1e6;
+        let input = ed.opened.cache_bytes;
+        ed.setup().unwrap();
+        let first = ed.settle(true).unwrap();
+        for kind in Kind::ALL {
+            for i in 0..EDITOR_STEPS {
+                ed.step(kind, i).unwrap();
+            }
+        }
+        let after = ed.settle(true).unwrap();
+        let peak = ed.take_admitted_peak().unwrap();
+        let held = ed.held;
+        let (restored, _, work_files) = ed.close().unwrap();
+        session.close();
+        println!(
+            "{RESULT_MARK}{}",
+            json!({
+                "stage": "run",
+                "budget": budget,
+                "open_ms": open_ms,
+                "input_cache_bytes": input,
+                "max_cache_bytes": held.max_cache,
+                "max_extra_bytes": held.max_extra,
+                "max_lease_bytes": held.max_lease,
+                "admitted_peak_bytes": peak,
+                "first_work_ms": first.loudness.1 as f64 / 1e6,
+                "gain_work_ms": after.loudness.1 as f64 / 1e6,
+                "restored": restored,
+                "work_files": work_files,
+                "seconds": t.elapsed().as_secs_f64(),
+            })
+        );
+    }
+
+    /// M13 段 4C（F15）：60 分・48 kHz ステレオの 16 ビットの WAV をアプリの取り込みのジョブで新しいライブラリに入れ、子プロセスで
+    /// kura-core のエディタを通して開いて手を当てる（`editor_child`）。ピークから基準（ライブラリ・実行の場・コーデックの組を作る
+    /// だけの子）を引いた量が、N（[`EDITOR_N`]）以下で、エディタの見積もり（キャッシュが持つ量（入力の源の LRU の上限を含む）の
+    /// 最大 ＋ 描く前に確保した見積もりのピークの最大 ＋ 持ち続ける分（`extra`）の最大）× 1.25 ＋ 4 MiB ＋ チャンクの抱え込み
+    /// （[`CHUNK_SLACK`]。保存のケースと同じ暫定）以下。持ち続ける分は 70 MiB 以下、閉じたら予算と作業用のファイルが戻る。重い
+    /// （691 MB のファイルを書いて取り込む）ので、ふだんは回さない：
+    /// `cargo test --release -p kura-devtools mem_smoke::tests::audio_editor_60min -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "重い（--release で --ignored を付けて回す）"]
+    fn audio_editor_60min_stays_within_n() {
+        use crate::bench_edit::audio;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let t = std::time::Instant::now();
+        audio::write_wav(
+            &src.join("long.wav"),
+            AUDIO_RATE as u32,
+            AUDIO_SECONDS * AUDIO_RATE,
+        )
+        .unwrap();
+        let lib = dir.path().join("editor.kuralib");
+        let item = audio::prepare_library(&lib, &src).unwrap();
+        // ライブラリが写しを持つので、元の WAV は消す
+        std::fs::remove_dir_all(&src).unwrap();
+        eprintln!(
+            "{EDITOR_CASE}: WAV を書いて取り込んだ（{:.1} 秒）",
+            t.elapsed().as_secs_f64()
+        );
+        let exe = std::env::current_exe().unwrap();
+        let run = |stage: &str| -> Option<(u64, serde_json::Value)> {
+            let out = Command::new("/usr/bin/time")
+                .arg("-l")
+                .arg(&exe)
+                .args([
+                    "--exact",
+                    "mem_smoke::tests::editor_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "-q",
+                ])
+                .env(CASE_ENV, format!("{EDITOR_CASE}:{stage}"))
+                .env(FILE_ENV, &lib)
+                .env(ITEM_ENV, item.to_string())
+                .output()
+                .ok()?;
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            let footprint = stderr
+                .lines()
+                .find(|l| l.contains("peak memory footprint"))
+                .and_then(|l| l.split_whitespace().next())
+                .and_then(|n| n.parse().ok())?;
+            assert!(out.status.success(), "{stage}: {stderr}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let got = stdout
+                .lines()
+                .find_map(|l| l.strip_prefix(RESULT_MARK))
+                .and_then(|l| serde_json::from_str(l).ok())
+                .unwrap_or_else(|| panic!("{stage}: 結果がありません: {stdout} {stderr}"));
+            Some((footprint, got))
+        };
+        let (Some((base, _)), Some((peak, got))) = (run("base"), run("run")) else {
+            eprintln!(
+                "/usr/bin/time -l が使えないので、音声のエディタのメモリの煙のテストを見送ります"
+            );
+            return;
+        };
+        let used = peak.saturating_sub(base);
+        let field = |k: &str| got[k].as_u64().unwrap();
+        let (cache, extra, admitted) = (
+            field("max_cache_bytes"),
+            field("max_extra_bytes"),
+            field("admitted_peak_bytes"),
+        );
+        let est = cache + extra + admitted;
+        eprintln!(
+            "{EDITOR_CASE}: 通し {:.1} MiB（N {:.1}・見積もり {:.1} ＝ キャッシュ {:.1}（入力の源の LRU {:.1} を含む）＋ 確保の見積もりの\
+             ピーク {:.1} ＋ 持ち続ける分 {:.1}。見積もり × 1.25 ＋ 4 MiB を {:+.1} MiB）・基準 {:.1} MiB・開く {:.1} ms・\
+             裏の仕事 {:.0} ms（文書を作ったあと）／{:.0} ms（gain のあと）・予算 {:.0} MiB・子 {:.1} 秒",
+            mib(used),
+            mib(EDITOR_N),
+            mib(est),
+            mib(cache),
+            mib(field("input_cache_bytes")),
+            mib(admitted),
+            mib(extra),
+            (used as f64 - bound(est) as f64) / MIB as f64,
+            mib(base),
+            got["open_ms"].as_f64().unwrap_or(0.0),
+            got["first_work_ms"].as_f64().unwrap_or(0.0),
+            got["gain_work_ms"].as_f64().unwrap_or(0.0),
+            mib(field("budget")),
+            got["seconds"].as_f64().unwrap_or(0.0),
+        );
+        let mut failed: Vec<String> = Vec::new();
+        if used > EDITOR_N {
+            failed.push(format!("実測 {used} バイト > N {EDITOR_N}"));
+        }
+        if used > bound(est) + CHUNK_SLACK {
+            failed.push(format!(
+                "実測 {used} バイト > 見積もり {est} × 1.25 ＋ 4 MiB ＋ チャンクの抱え込み"
+            ));
+        }
+        if extra > EDITOR_EXTRA {
+            failed.push(format!("持ち続ける分 {extra} バイト > 70 MiB"));
+        }
+        if got["restored"] != true || got["work_files"] != 0 {
+            failed.push(format!(
+                "閉じたあと予算か作業用のファイルが戻りません: {got}"
+            ));
         }
         assert!(failed.is_empty(), "{failed:?}");
     }
