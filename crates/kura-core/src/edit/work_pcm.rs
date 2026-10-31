@@ -8,7 +8,8 @@
 //! - DB には記録しない：中身から決まる名前で、ライブラリを開くたびに `staging/` ごと消える（`clean_staging`）。版の記録に
 //!   入るのはアンカーに昇格したものだけ（段 3）。
 //! - ディスクの空き：要る量（ヘッダ 84 ＋ 形の上限の標本 ＋ メタデータの上限 16 MiB ＋ 余裕 1 GiB）より空きが少なければ、
-//!   書く前に `CoreError::NoSpace`。空きが分からなければ確かめない。書く途中の ENOSPC は `CoreError::Io`（`is_no_space`）。
+//!   書く前に `CoreError::NoSpace`。空きは置き場の存在するいちばん近い祖先で測る（置き場は最初に書くまでない）。空きが
+//!   分からなければ確かめない。書く途中の ENOSPC は `CoreError::Io`（`is_no_space`）。
 //! - 寿命は参照の数で決める：[`WorkHandle`] を落とすと減り、0 になったら、残す印（[`WorkHandle::retain_on_drop`]。一時停止
 //!   した保存）がなければすぐ消し、あれば残す期限（30 分）まで残す。残すものの合計は min(8 GiB, 空き / 4) までで、古い順に
 //!   消す（[`WorkPcmStore::sweep`]。GC のジョブの終わりにも呼ぶ）。ライブラリを閉じるときは全部消す（[`WorkPcmStore::clear`]）。
@@ -111,13 +112,17 @@ impl Inner {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// 置き場のボリュームの空き。置き場はまだないことがある（開くたびの staging の掃除で消え、最初の `ensure` で作る）ので、
+    /// 存在するいちばん近い祖先（同じボリュームの staging かライブラリ）で測る（ないパスでは空きを測れず、確かめずに
+    /// 通ってしまうため。M13 段 2 の検証の直し）。
     fn free(&self) -> Option<u64> {
         let f = self
             .free_space
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        f.and_then(|f| f(&self.dir))
+            .clone()?;
+        let at = self.dir.ancestors().find(|p| p.exists())?;
+        f(at)
     }
 
     /// 参照を 1 つ減らす（0 になったら、残す印がなければ消す）。
@@ -597,14 +602,17 @@ mod tests {
     }
 
     /// 空きが足りなければ、書く前に NoSpace（ファイルを作らない）。
+    /// 空きを測る偽の関数（本物の `kura_mac::volume_capacity` と同じく、ないパスでは測れない）。
+    fn free_space(bytes: u64) -> Arc<FreeSpaceFn> {
+        Arc::new(move |p: &Path| p.exists().then_some(bytes))
+    }
+
+    /// 置き場がまだなくても（開いたあとの最初の作成）、存在する祖先で空きを測って、書く前に断る。
     #[test]
     fn no_space_is_refused_before_writing() {
         let d = tempfile::tempdir().unwrap();
-        let dir = d.path().join("pcm");
-        let store = WorkPcmStore::new(
-            dir.clone(),
-            Some(Arc::new(|_: &Path| Some(100u64 << 20)) as Arc<FreeSpaceFn>),
-        );
+        let dir = d.path().join("staging").join("pcm");
+        let store = WorkPcmStore::new(dir.clone(), Some(free_space(100 << 20)));
         let reads = AtomicU64::new(0);
         match ensure(&store, &key(4), &reads) {
             Err(CoreError::NoSpace { needed, available }) => {
@@ -615,7 +623,7 @@ mod tests {
             Ok(_) => panic!("書けてしまった"),
         }
         assert_eq!(reads.load(Ordering::SeqCst), 0);
-        assert!(!dir.exists());
+        assert!(!dir.exists() && !d.path().join("staging").exists());
         // 空きが分からなければ確かめない
         store.set_free_space(Some(Arc::new(|_: &Path| None) as Arc<FreeSpaceFn>));
         assert!(ensure(&store, &key(4), &reads).is_ok());
@@ -665,9 +673,7 @@ mod tests {
         g.retain_on_drop();
         drop(f);
         drop(g);
-        store.set_free_space(Some(
-            Arc::new(move |_: &Path| Some(one * 4 + 4)) as Arc<FreeSpaceFn>
-        ));
+        store.set_free_space(Some(free_space(one * 4 + 4)));
         store.sweep();
         assert!(!pf.exists() && pg.is_file(), "古いほうから消す");
     }

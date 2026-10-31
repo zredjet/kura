@@ -789,13 +789,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let factory = Arc::new(FakeEngineFactory::default());
         let mut svc = services().with_engine(factory.clone());
-        svc.upgrade.free_space = Some(Arc::new(|_: &Path| Some(1u64 << 20)) as Arc<FreeSpaceFn>);
+        // 本物（kura_mac::volume_capacity）と同じく、ないパスでは空きを測れない
+        svc.upgrade.free_space =
+            Some(Arc::new(|p: &Path| p.exists().then_some(1u64 << 20)) as Arc<FreeSpaceFn>);
         let session = LibrarySession::create(&dir.path().join("L"), sink(), svc).unwrap();
         session.wait_ready();
         let engine = session.engine().unwrap().clone();
         let pcm_dir = dir.path().join("L.kuralib/staging/pcm");
         assert_eq!(engine.work_pcm().dir(), pcm_dir);
-        // 空きを測る関数が渡っている（1 MiB では足りない）
+        assert!(!pcm_dir.exists(), "開いたあとは置き場がない");
+        // 空きを測る関数が渡っている（1 MiB では足りない。置き場がまだなくても staging で測る）
         let key = WorkKey {
             source: [1; 32],
             format: "flac".into(),
