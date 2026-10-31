@@ -10,7 +10,8 @@
  *   を確かめる）。届くまでは最も細かい段で描く。
  * - 取れなかった PCM のチャンクは印を付け、期限（1 秒から倍々で 8 秒まで）が来たら取り直す（503 の Busy もある）。
  * - 表示の結果を受けたら：`changed` に掛かる PCM のチャンクを捨て、`peaks.changed` に掛かるタイルを捨てる。
- *   `peaks.pending` か `work` が真なら、手が止まって 150 ms たったら `work: true` で頼み直す（同じビューポートでも送る）。
+ *   `peaks.pending` か `work` が真なら（ラウドネスを計っている間も：`setExtraWork`）、手が止まって 150 ms たったら
+ *   `work: true` で頼み直す（同じビューポートでも送る）。
  * - ズーム・パンで描き直すのは `requestAnimationFrame` の 1 回だけ（汚れたときだけ）。止まって 150 ms で今の区間を頼み直す。
  *   列ごとの [min, max] は使い回す型付きの配列に入れる。
  * - 公開されている段の長さが今の出力と違う間（尾を作り直している）は、重なる所だけ描く（段の長さで切る）。レートが
@@ -287,6 +288,8 @@ export class WaveController {
   private frameId: number | null = null;
   private idleId: number | null = null;
   private workWanted = false;
+  /** 表示の結果のほかに残っている裏の仕事（長い音声のラウドネスを計っている）。 */
+  private extraWork = false;
   private tileLoads = 0;
   private pcmLoads = 0;
   private readonly loadingTiles = new Map<string, Loading>();
@@ -408,6 +411,17 @@ export class WaveController {
     if (this.interacting === on) return;
     this.interacting = on;
     if (!on) this.scheduleIdle();
+  }
+
+  /**
+   * 表示の結果のほかに残っている裏の仕事（長い音声のラウドネスを計っている。計りは edit_view { work: true } の区切りで
+   * だけ進む）。真の間は、表示の work が偽でも、手が止まって 150 ms ごとに work: true で頼み直す。
+   */
+  setExtraWork(on: boolean): void {
+    if (this.extraWork === on) return;
+    this.extraWork = on;
+    this.workWanted = (this.view?.work ?? false) || (this.peaks?.pending ?? false) || on;
+    if (this.workWanted) this.scheduleIdle();
   }
 
   /** 編集中のノード（キャッシュに固定する）。 */
@@ -599,7 +613,7 @@ export class WaveController {
     if (reshaped) {
       this.w = this.fitMode ? fitView(shape.frames) : clampWindow(this.w, shape.frames);
     }
-    this.workWanted = view.work || peaks.pending;
+    this.workWanted = view.work || peaks.pending || this.extraWork;
     this.emitInfo();
     this.pump();
     this.invalidate();

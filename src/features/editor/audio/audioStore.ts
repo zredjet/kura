@@ -10,7 +10,8 @@
  *   終わりまで鳴らして止まる（カーソルは動かさない。途中で止めたら止めた所）。
  * - ほかの音との排他：鳴らし始めたらプレーヤーを一時停止し、試聴・効果音を止める。プレーヤーが鳴り始めたら止める。
  * - ラウドネスは、仮でない結果が届いたときに、今の出力（`samplesId`）を計っていなければ `edit_measure` で頼む。計って
- *   いる間・古い間は前の値を出す（`loudnessFresh` が偽）。
+ *   いる間・古い間は前の値を出す（`loudnessFresh` が偽）。長い音声を計っている間（Measuring）は、計りが進むよう
+ *   work: true で頼み続ける。一時的な誤り（Busy）は覚えずに頼み直す。
  */
 
 import { create } from 'zustand';
@@ -250,6 +251,12 @@ interface AudioRuntime {
   patch: Partial<AudioEditorState>;
   /** `edit_measure` を頼んだ出力（同じものは頼み直さない）。 */
   measuredFor: string | null;
+  /** 計っている（Measuring）出力。計り終えるまで work: true で頼み続ける。 */
+  measuringFor: string | null;
+  /** 計っていると分かったときに送り終えていた要求の番号（それより後の要求の表示だけで「計りかけを捨てた」とみる）。 */
+  measuringAfter: number;
+  /** 最後に送った要求の番号。 */
+  lastSentSeq: number;
   lastView: EditAudioView | null;
   /** ドラッグの途中（取り消しを止める）。 */
   dragging: boolean;
@@ -451,6 +458,9 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     player,
     patch: {},
     measuredFor: null,
+    measuringFor: null,
+    measuringAfter: 0,
+    lastSentSeq: 0,
     lastView: null,
     dragging: false,
     unsubscribe,
@@ -482,6 +492,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     },
     viewport: () => controller.viewport(),
     sent(req) {
+      rt.lastSentSeq = req.seq;
       checkHook?.sent?.(
         req.seq,
         req.steps.map((q) => q.step),
@@ -502,9 +513,11 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       checkHook?.shown?.(info.seq, view);
       const prev = rt.lastView;
       rt.lastView = view;
+      const s = useAudioStore.getState();
+      // ラウドネス（計っている間の裏の仕事を、波形の面が頼み直しを決める前に決める）
+      applyLoudness(rt, view, s.loudness, info);
       controller.applyView(view);
       feed.setView(view, view.changed);
-      const s = useAudioStore.getState();
       const summary = summarizeAudioView(view);
       rt.patch.view = summary;
       // 再生：形が変わったら（切り詰めの始まり・レート・チャンネル数）元を通して位置を写して始め直し、ほかは変わった所
@@ -542,22 +555,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
           });
         }
       }
-      // ラウドネス：今の出力のものなら出し、なければ（仮でない結果のとき）計る
-      const l = view.loudness;
-      const known = s.loudness;
-      if (l.type !== 'idle' && l.samplesId === view.samplesId) {
-        rt.patch.loudness = l;
-        rt.patch.loudnessFresh = l.type !== 'measuring';
-      } else if (known.type !== 'idle' && known.samplesId === view.samplesId) {
-        // 計った値（edit_measure の応え）が今の出力のもの
-        rt.patch.loudnessFresh = known.type !== 'measuring';
-      } else {
-        rt.patch.loudnessFresh = false;
-        if (!info.provisional && rt.measuredFor !== view.samplesId) {
-          rt.measuredFor = view.samplesId;
-          void measure(rt, view.samplesId);
-        }
-      }
+
       // ドラッグの手元の値は、仮でない結果が届いたらやめる（文書の値を出す）
       if (!info.provisional && !rt.dragging) rt.patch.local = null;
     },
@@ -596,20 +594,109 @@ export const AUDIO_ADAPTER: EditorAdapterFactory = {
   create: createAudioAdapter,
 };
 
+// ===== ラウドネス =====
+
+/** 一時的な誤りのあと、計るのを頼み直すまで（ms）。 */
+export const MEASURE_RETRY_MS = 1000;
+
+/**
+ * 出すラウドネス：確かな値（Ready・Failed）は替え、計っている間（Measuring）・計っていない（Idle）は最後に分かった値を
+ * 残す（`loudnessFresh` を偽にして tertiary で出す。前の値がなければ Measuring を置いて「計っています…」）。
+ */
+export function keepLastLoudness(
+  known: EditLoudnessStateDto,
+  incoming: EditLoudnessStateDto,
+): EditLoudnessStateDto {
+  if (incoming.type === 'ready' || incoming.type === 'failed') return incoming;
+  if (known.type === 'ready') return known;
+  return incoming.type === 'measuring' ? incoming : known;
+}
+
+/**
+ * 表示の結果のラウドネスを当てる。今の出力の確かな値なら出し、計っている間（Measuring）は前の値を残して、計りが
+ * 進むよう work: true で頼み続ける（長い音声は edit_view の裏の仕事の区切りでだけ進む）。どちらもなければ、仮でない
+ * 結果のときに edit_measure を頼む。計っていたはずの今の出力を表示が計っていない（Idle。Rust が計りかけを捨てた）なら
+ * 頼み直す。
+ */
+function applyLoudness(
+  rt: AudioRuntime,
+  view: EditAudioView,
+  known: EditLoudnessStateDto,
+  info: { seq: number; provisional: boolean },
+): void {
+  const id = view.samplesId;
+  const l = view.loudness;
+  if ((l.type === 'ready' || l.type === 'failed') && l.samplesId === id) {
+    rt.patch.loudness = l;
+    rt.patch.loudnessFresh = true;
+    rt.measuredFor = id;
+    rt.measuringFor = null;
+  } else if (l.type === 'measuring' && l.samplesId === id) {
+    rt.patch.loudness = keepLastLoudness(known, l);
+    rt.patch.loudnessFresh = false;
+    rt.measuredFor = id;
+    rt.measuringFor = id;
+    rt.measuringAfter = Math.max(rt.measuringAfter, info.seq);
+  } else if ((known.type === 'ready' || known.type === 'failed') && known.samplesId === id) {
+    // 計った値（edit_measure の応え）が今の出力のもの
+    rt.patch.loudnessFresh = true;
+    rt.measuringFor = null;
+  } else {
+    rt.patch.loudnessFresh = false;
+    if (!info.provisional) {
+      // 計っていると分かったあとに頼んだ表示が、今の出力を計っていない：計りかけを捨てたので頼み直す
+      if (l.type === 'idle' && rt.measuringFor === id && info.seq > rt.measuringAfter) {
+        rt.measuringFor = null;
+        rt.measuredFor = null;
+      }
+      if (rt.measuredFor !== id) {
+        rt.measuredFor = id;
+        void measure(rt, id);
+      }
+    }
+  }
+  rt.controller.setExtraWork(rt.measuringFor === id);
+}
+
+/** 一時的な誤りか（Busy：一括・保存が予算を使っている。IPC の外の誤り）。覚えずにあとで頼み直す。 */
+function transientMeasureError(error: unknown): boolean {
+  return !isIpcError(error) || error.code === 'Busy';
+}
+
 /** 今の出力のラウドネスを計る（同じ出力のうちに届いたものだけ出す）。 */
 async function measure(rt: AudioRuntime, samplesId: string): Promise<void> {
   const session = rt.ctx.session();
   if (!session) return;
+  const current = () => live() === rt && useAudioStore.getState().view?.samplesId === samplesId;
   try {
     const state = await measureEdit(session);
-    if (live() !== rt || useAudioStore.getState().view?.samplesId !== samplesId) return;
-    const fresh = state.type !== 'idle' && state.samplesId === samplesId;
-    useAudioStore.setState({
-      loudness: state,
-      loudnessFresh: fresh && state.type !== 'measuring',
-    });
+    if (!current() || state.type === 'idle' || state.samplesId !== samplesId) return;
+    if (state.type === 'measuring') {
+      // 長い音声：計りは edit_view { work: true } の区切りでだけ進むので、計り終えるまで頼み続ける
+      rt.measuringFor = samplesId;
+      rt.measuringAfter = rt.lastSentSeq;
+      rt.controller.setExtraWork(true);
+      useAudioStore.setState({
+        loudness: keepLastLoudness(useAudioStore.getState().loudness, state),
+        loudnessFresh: false,
+      });
+      return;
+    }
+    rt.measuringFor = null;
+    rt.controller.setExtraWork(false);
+    useAudioStore.setState({ loudness: state, loudnessFresh: true });
   } catch (error) {
-    if (live() !== rt) return;
+    if (!current()) return;
+    if (transientMeasureError(error)) {
+      // 確かな失敗として覚えない：次の仮でない結果か、少し待って頼み直す
+      rt.measuredFor = null;
+      setTimeout(() => {
+        if (!current() || rt.measuredFor !== null) return;
+        rt.measuredFor = samplesId;
+        void measure(rt, samplesId);
+      }, MEASURE_RETRY_MS);
+      return;
+    }
     const message = isIpcError(error) ? error.message : String(error);
     useAudioStore.setState({
       loudness: { type: 'failed', samplesId, message },

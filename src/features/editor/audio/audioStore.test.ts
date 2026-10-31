@@ -15,6 +15,7 @@ import {
   viewEdit,
 } from '../../../ipc/edit';
 import type { ItemSummaryDto } from '../../../ipc/items';
+import { IpcError } from '../../../ipc/result';
 import { editInputPcmUrl, editPcmUrl } from '../../../ipc/media';
 import { ContextPool } from '../../../lib/assetAudio';
 import { useNoticeStore } from '../../../stores/noticeStore';
@@ -34,6 +35,7 @@ import {
   audioController,
   audioPlayer,
   type AudioViewSummary,
+  MEASURE_RETRY_MS,
   overlayOf,
   setAudioDragging,
   setAudioIoForTest,
@@ -292,6 +294,142 @@ describe('音声のアダプタ', () => {
     await flush();
     expect(measureEdit).toHaveBeenCalledTimes(1);
     expect(useAudioStore.getState().loudnessFresh).toBe(false);
+  });
+
+  const READY = (samplesId: string, loudness = -14.2) =>
+    ({
+      type: 'ready',
+      samplesId,
+      loudness: {
+        loudness,
+        loudnessReason: null,
+        loudnessRange: 6.1,
+        truePeak: -1,
+        samplePeak: -1.2,
+      },
+    }) as const;
+  const ID = '00112233aabbccdd';
+
+  it('ラウドネス：一時的な誤り（Busy）は確かな失敗として覚えず、あとで頼み直す', async () => {
+    vi.mocked(measureEdit).mockRejectedValue(
+      new IpcError({ code: 'Busy', message: '一括が使っています' }),
+    );
+    await open();
+    const c0 = vi.mocked(measureEdit).mock.calls.length;
+    expect(c0).toBeGreaterThanOrEqual(1);
+    expect(useAudioStore.getState().loudness.type).not.toBe('failed');
+    expect(useAudioStore.getState().loudnessFresh).toBe(false);
+    // 同じ出力の仮でない結果が届いたら頼み直す
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(view()));
+    pushEditorSteps([{ type: 'seal' }]);
+    await flush();
+    expect(measureEdit).toHaveBeenCalledTimes(c0 + 1);
+    expect(useAudioStore.getState().loudness.type).not.toBe('failed');
+    // 何も届かなくても、少し待って頼み直す
+    vi.mocked(measureEdit).mockImplementation(async () => READY(ID));
+    await flush(MEASURE_RETRY_MS);
+    expect(vi.mocked(measureEdit).mock.calls.length).toBeGreaterThanOrEqual(c0 + 2);
+    expect(useAudioStore.getState()).toMatchObject({
+      loudness: { type: 'ready' },
+      loudnessFresh: true,
+    });
+    // 確かな誤りは失敗として出す
+    vi.mocked(measureEdit).mockRejectedValueOnce(
+      new IpcError({ code: 'TooLarge', message: '大きすぎます' }),
+    );
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(view({ rev: 2, samplesId: 'eeee' })));
+    pushEditorSteps([{ type: 'seal' }]);
+    await flush();
+    expect(useAudioStore.getState()).toMatchObject({
+      loudness: { type: 'failed', samplesId: 'eeee' },
+      loudnessFresh: true,
+    });
+  });
+
+  it('ラウドネス：計っている間（Measuring）は前の値を残して古い印にし、Ready が届いたら替える', async () => {
+    vi.mocked(measureEdit).mockImplementation(async () => READY(ID));
+    await open();
+    expect(useAudioStore.getState().loudness).toEqual(READY(ID));
+    // 出力が変わって計り始めた
+    vi.mocked(measureEdit).mockImplementation(async () => ({
+      type: 'measuring',
+      samplesId: 'ffff',
+      progress: 0,
+    }));
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(view({ rev: 2, samplesId: 'ffff' })));
+    pushEditorSteps([{ type: 'seal' }]);
+    await flush();
+    expect(useAudioStore.getState().loudness).toEqual(READY(ID));
+    expect(useAudioStore.getState().loudnessFresh).toBe(false);
+    // 表示の結果の Measuring でも前の値のまま
+    vi.mocked(viewEdit).mockImplementation(async () =>
+      result(
+        view({
+          rev: 2,
+          samplesId: 'ffff',
+          loudness: { type: 'measuring', samplesId: 'ffff', progress: 0.5 },
+        }),
+      ),
+    );
+    await flush(WAVE_IDLE_MS);
+    expect(useAudioStore.getState().loudness).toEqual(READY(ID));
+    expect(useAudioStore.getState().loudnessFresh).toBe(false);
+    // 計り終えた
+    vi.mocked(viewEdit).mockImplementation(async () =>
+      result(view({ rev: 2, samplesId: 'ffff', loudness: READY('ffff', -20) })),
+    );
+    await flush(WAVE_IDLE_MS);
+    expect(useAudioStore.getState().loudness).toEqual(READY('ffff', -20));
+    expect(useAudioStore.getState().loudnessFresh).toBe(true);
+  });
+
+  it('ラウドネス：長い音声で計り始めたら（Measuring）、表示の work が偽でも work: true で頼み続けて計りを進める', async () => {
+    vi.mocked(measureEdit).mockImplementation(async () => ({
+      type: 'measuring',
+      samplesId: ID,
+      progress: 0,
+    }));
+    // 範囲の小さい手の応え：peaks.pending も work も偽、loudness は Idle
+    await open();
+    vi.mocked(viewEdit).mockClear();
+    vi.mocked(viewEdit).mockImplementation(async () =>
+      result(view({ loudness: { type: 'measuring', samplesId: ID, progress: 0.3 } })),
+    );
+    await flush(WAVE_IDLE_MS);
+    expect(viewEdit).toHaveBeenCalledWith(S, expect.objectContaining({ work: true }));
+    const n = vi.mocked(viewEdit).mock.calls.length;
+    await flush(WAVE_IDLE_MS);
+    expect(vi.mocked(viewEdit).mock.calls.length).toBeGreaterThan(n);
+    // 計り終えたら頼み直しは止まる
+    vi.mocked(viewEdit).mockImplementation(async () => result(view({ loudness: READY(ID) })));
+    await flush(WAVE_IDLE_MS);
+    vi.mocked(viewEdit).mockClear();
+    await flush(WAVE_IDLE_MS * 3);
+    expect(viewEdit).not.toHaveBeenCalled();
+    expect(useAudioStore.getState()).toMatchObject({ loudness: READY(ID), loudnessFresh: true });
+  });
+
+  it('ラウドネス：計っている途中に仮の手が入り、戻った表示が計っていなければ（Idle）、頼み直す', async () => {
+    vi.mocked(measureEdit).mockImplementation(async () => ({
+      type: 'measuring',
+      samplesId: ID,
+      progress: 0,
+    }));
+    await open();
+    expect(measureEdit).toHaveBeenCalledTimes(1);
+    // ドラッグの途中（仮の出力）
+    vi.mocked(stepEdit).mockResolvedValueOnce(
+      result(view({ rev: 2, samplesId: 'ffff' }), {
+        status: status({ rev: 2, provisional: true }),
+      }),
+    );
+    pushEditorSteps([{ type: 'preview', edit: { type: 'setEnabled', node: 1, enabled: false } }]);
+    await flush();
+    // esc で戻った：A の表示は Idle（Rust が計りかけを捨てた）
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(view({ rev: 1 })));
+    pushEditorSteps([{ type: 'cancelPreview' }]);
+    await flush();
+    expect(measureEdit).toHaveBeenCalledTimes(2);
   });
 
   it('重ねるもの：ループ・カーソル・選択・ドラッグの手元のループを出す', async () => {
