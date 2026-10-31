@@ -229,6 +229,49 @@ describe('PCM で描く拡大の上限', () => {
   });
 });
 
+describe('レートが変わった直後の段', () => {
+  it('公開されている段のレートが今の出力と違う間は、段を時刻で写して描く（タイルも時刻で選ぶ）', async () => {
+    const clock = fakeClock();
+    const io = fakeFetch();
+    const c = new WaveController({ fetch: io.fetch, scheduler: clock.scheduler, now: clock.now });
+    c.resize(1000, 300, 1);
+    c.setSession(S);
+    const frames = 96_000 * 120;
+    const peaksFrames = 48_000 * 120;
+    c.applyView(
+      audioView({
+        rate: 96_000,
+        frames,
+        peaks: { rev: 3, rate: 48_000, frames: peaksFrames, pending: true },
+      }),
+    );
+    // 頼んだタイルは段のフレーム（48 kHz）で全体を覆う
+    for (const url of [...io.calls]) {
+      const m = /\/peaks\/(\d+)\/(\d+)$/.exec(url);
+      if (!m) continue;
+      const bin = Number(m[1]);
+      const tile = Number(m[2]);
+      io.resolve(url, tileBytes(bin, tile, peaksFrames, 2, 1000));
+    }
+    await settle();
+    // 頼み足したタイルにも応える（粗い段のあとに細かい段）
+    for (const url of io.pending()) {
+      const m = /\/peaks\/(\d+)\/(\d+)$/.exec(url);
+      if (m) io.resolve(url, tileBytes(Number(m[1]), Number(m[2]), peaksFrames, 2, 1000));
+    }
+    await settle();
+    const scene = c.scene();
+    expect(scene.mode).toBe('peaks');
+    // 右の端まで古い段の値（縮んで描かれて右が平らにならない）
+    for (const col of [100, 499, 500, 900, 999]) {
+      expect(scene.has[col]).toBe(1);
+      expect(scene.lanes[col * 2 * 2 + 1]).toBeCloseTo(1000 / 32768, 6);
+    }
+    expect(scene.overviewHas[999]).toBe(1);
+    expect(scene.overview[999 * 2 * 2 + 1]).toBeCloseTo(1000 / 32768, 6);
+  });
+});
+
 describe('止まってから頼み直す', () => {
   it('ズーム・パンが止まって 150 ms で今の区間を頼む（途中の操作で数え直す）', () => {
     const { c, clock, idle } = setup();

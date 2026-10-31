@@ -13,7 +13,8 @@
  *   `peaks.pending` か `work` が真なら、手が止まって 150 ms たったら `work: true` で頼み直す（同じビューポートでも送る）。
  * - ズーム・パンで描き直すのは `requestAnimationFrame` の 1 回だけ（汚れたときだけ）。止まって 150 ms で今の区間を頼み直す。
  *   列ごとの [min, max] は使い回す型付きの配列に入れる。
- * - 公開されている段の長さが今の出力と違う間（尾を作り直している）は、重なる所だけ描く（段の長さで切る）。
+ * - 公開されている段の長さが今の出力と違う間（尾を作り直している）は、重なる所だけ描く（段の長さで切る）。レートが
+ *   違う間（レートを変えた直後）は、段を時刻で写して描き、タイルも時刻で写した区間で選ぶ。
  * - 描く関数・取得・時計は差し込める（テスト）。
  */
 
@@ -640,12 +641,24 @@ export class WaveController {
     return (last - first + 1 + PLAYBACK_RESERVE_CHUNKS) * chunkBytes <= this.pcm.limit;
   }
 
+  /**
+   * 段のフレーム ÷ 出力のフレーム。公開されている段のレートが今の出力と違う間（レートを変えた直後、長い音声の段を作り
+   * 直している）は、段を時刻で写して描く・選ぶ（フレームの番号のまま描くと縮んで尾が平らになる）。同じなら 1。
+   */
+  private peaksScale(): number {
+    const peaks = this.peaks;
+    const rate = this.rate;
+    return peaks && peaks.rate > 0 && rate > 0 && peaks.rate !== rate ? peaks.rate / rate : 1;
+  }
+
   /** 選んだ段（PCM で描く・段がなければ null）と、試す順の段。 */
   private binsToTry(): { chosen: number | null; order: number[] } {
     const bins = this.peaks?.bins ?? [];
     const columns = Math.max(1, Math.round(this.inner().w * this.dpr));
-    // PCM が表に収まらない拡大は、持っている最も細かい段で描く
-    const chosen = pickBin(bins, this.w.span, columns, this.pcmFits() ? PCM_BELOW : 0);
+    // PCM で描くかは出力のフレームで決め（表に収まらない拡大は段）、段は段のフレーム（時刻で写した区間）で選ぶ
+    const chosen = this.pcmMode()
+      ? null
+      : pickBin(bins, this.w.span * this.peaksScale(), columns, 0);
     const at = chosen === null ? 0 : Math.max(0, bins.indexOf(chosen));
     return { chosen, order: bins.slice(at) };
   }
@@ -667,9 +680,10 @@ export class WaveController {
       // PCM で描くときも、届くまで埋める最も細かい段を取る
       const bin = chosen ?? order[0];
       if (bin !== undefined && bin !== coarsest) {
+        const k = this.peaksScale();
         const [a, b] = tileRange(
-          this.w.start,
-          this.w.start + this.w.span,
+          this.w.start * k,
+          (this.w.start + this.w.span) * k,
           bin,
           peaks.frames,
           tileBins,
@@ -848,8 +862,9 @@ export class WaveController {
       peaks !== null && peaks.rev !== null && peaks.channels === channels && peaks.frames > 0;
     if (peaksOk && peaks) {
       const { chosen, order } = this.binsToTry();
-      // 公開されている段の長さが今の出力と違う間は、重なる所だけ描く
-      const frames = Math.min(peaks.frames, total);
+      // 段のフレームで読む（レートが違う間は時刻で写す）。公開されている段の長さが今の出力と違う間は、重なる所だけ描く
+      const k = this.peaksScale();
+      const frames = Math.min(peaks.frames, Math.round(total * k));
       if (chosen === null && this.view) {
         mode = 'pcm';
         const filled = fillPcmColumns(
@@ -865,7 +880,7 @@ export class WaveController {
           this.has,
         );
         // 届くまでは最も細かい段で描く
-        if (filled < columns) this.fillMissingFromPeaks(order, frames, columns, channels);
+        if (filled < columns) this.fillMissingFromPeaks(order, frames, columns, channels, k);
       } else {
         mode = 'peaks';
         fillPeakColumns(
@@ -874,8 +889,8 @@ export class WaveController {
             bins: order,
             channels,
             frames,
-            start: this.w.start,
-            span: this.w.span,
+            start: this.w.start * k,
+            span: this.w.span * k,
             columns,
             tileBins: peaks.tileBins || TILE_BINS,
           },
@@ -890,7 +905,7 @@ export class WaveController {
           channels,
           frames,
           start: 0,
-          span: Math.max(1, total),
+          span: Math.max(1, total) * k,
           columns,
           tileBins: peaks.tileBins || TILE_BINS,
         },
@@ -948,12 +963,13 @@ export class WaveController {
     };
   }
 
-  /** PCM で埋められなかった列を段で埋める。 */
+  /** PCM で埋められなかった列を段で埋める（`k` は段のフレーム ÷ 出力のフレーム）。 */
   private fillMissingFromPeaks(
     order: number[],
     frames: number,
     columns: number,
     channels: number,
+    k: number,
   ): void {
     const peaks = this.peaks;
     if (!peaks) return;
@@ -965,8 +981,8 @@ export class WaveController {
         bins: order,
         channels,
         frames,
-        start: this.w.start,
-        span: this.w.span,
+        start: this.w.start * k,
+        span: this.w.span * k,
         columns,
         tileBins: peaks.tileBins || TILE_BINS,
       },
