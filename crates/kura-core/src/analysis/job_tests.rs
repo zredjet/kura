@@ -296,8 +296,13 @@ impl Env {
 
     /// 解析のジョブを積んで、終わるまで待つ。最後の解析のジョブを返す。
     fn run(&self) -> JobRecord {
+        self.run_within(WAIT)
+    }
+
+    /// [`Env::run`] を、待つ上限を `wait` にして行う（長い音声を解く重いテスト用）。
+    fn run_within(&self, wait: Duration) -> JobRecord {
         self.jobs.ensure_queued(JobKind::Analyze, "{}").unwrap();
-        assert!(self.jobs.wait_idle(WAIT));
+        assert!(self.jobs.wait_idle(wait));
         self.last()
     }
 
@@ -1919,7 +1924,8 @@ fn a_later_platform_stage_does_not_size_the_wav_estimate() {
     );
     let short = env.add(1, "audio", "wav", &wav(8_000 * 600, None));
     let long = env.add(2, "audio", "wav", &wav(8_000 * 1_200, None));
-    let job = env.run();
+    // 30 分ぶんの標本をデバッグのビルドで解くので、全体のテストの重い中では 30 秒を超えることがある
+    let job = env.run_within(Duration::from_secs(180));
     assert_eq!(job.state, JobState::Done, "{:?}", job.message);
     for (id, hash) in [(1, &short), (2, &long)] {
         assert_eq!(env.state(id), "ready", "{id}");
