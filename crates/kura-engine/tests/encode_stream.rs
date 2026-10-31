@@ -26,9 +26,13 @@ use serde_json::json;
 
 const C: u64 = AUDIO_CHUNK as u64;
 
-/// 書き出しの組（形式・設定）。E4 で ogg を足す。
+/// 書き出しの組（形式・設定）。Ogg Vorbis の流して書く形は後ろ向き・前向きの 2 回流す（一度に渡す形が /1 の正。品質の
+/// 範囲と細かい窓・区間は `codec::vorbis::stream_tests` が見る）。
 fn targets() -> Vec<(&'static str, serde_json::Value)> {
     vec![
+        ("ogg", json!({})),
+        ("ogg", json!({ "quality": -1 })),
+        ("ogg", json!({ "quality": 10 })),
         ("flac", json!({})),
         ("flac", json!({ "bits": 8 })),
         ("flac", json!({ "bits": 24 })),
@@ -201,13 +205,19 @@ fn streamed_encode_equals_encode_bytes() {
                 seed: k as u64,
             });
         }
+        // 窓が 2 つになる長さの Ogg Vorbis は既定の品質だけ（デバッグのビルドで重い）
+        let some: Vec<_> = targets
+            .iter()
+            .filter(|(f, o)| frames < 16 * C || *f != "ogg" || o.get("quality").is_none())
+            .cloned()
+            .collect();
         checked += check_doc(
             &engine,
             &codecs,
             &g,
             &input,
             Digest([7; 32]),
-            &targets,
+            &some,
             &format!("長さ {frames}"),
         );
     }
@@ -431,7 +441,7 @@ fn streaming_needs_a_full_pass() {
         )
         .unwrap_err();
     assert!(matches!(err, EngineError::Internal(_)), "{err}");
-    // 流して書けない書き手（PNG の形式には音声を書けない・Vorbis は E4 まで流さない）
+    // 流して書けない書き手（PNG の形式には音声を書けない）
     let err = CodecSet::pinned()
         .encode_stream(
             &mut ValueProducer::new(&a),

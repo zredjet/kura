@@ -38,6 +38,9 @@
 //! 「パケットの列 → Ogg」（[`mux`]・[`page_plan`]・[`packet_window`]）は音声の生成（block・mapping0）から独立していて、
 //! 照合用のエンコーダのパケットでそのまま試せる（このファイルのテスト）。
 //!
+//! 流して書く形（M13 段 3。`stream.rs`）は、この一度に渡す形（/1 の正）とバイト単位で同じものを、生産者を後ろ向き・前向きの
+//! 2 回流して書く。ブロックの解析は同じ [`BlockAnalyzer`]（区間をまたぐ状態を運ぶもの）を区間ごとに回す。
+//!
 //! # 決まっていること
 //!
 //! - コメント：vendor は `super::VENDOR`（"kura"）。項目は `symph::vorbis_comments_for(&meta, frames)` の LOOPSTART・LOOPLENGTH（あれば）の
@@ -342,27 +345,61 @@ fn stage3_units(
     units
 }
 
-/// 段 1〜3（冒頭の 6）：計画の列からパケットの列（`segment` ブロックずつ）。
+/// 段 1〜3（冒頭の 6）：計画の列からパケットの列（`segment` ブロックずつ。[`BlockAnalyzer`] を区間ごとに回す）。
 pub(crate) fn analyze_blocks(
     vd: &VorbisDspState,
     plans: &[BlockPlan],
     segment: usize,
     mon: &dyn Monitor,
 ) -> Result<Vec<OggPacket>, EngineError> {
-    let channels = usize::try_from(vd.vi.channels).map_err(|_| internal("チャンネルの数"))?;
-    // C の g->ampmax（_vp_global_look の −9999）と vbi->ampmax（vorbis_block_init の −9999）
-    let mut g_ampmax = vd.backend_state.psy_g_look.ampmax;
-    let mut vbi_ampmax = block::VBI_AMPMAX_INIT;
-    // aoTuV のブロックをまたぐ状態（C の private_state の欄）。段 0・段 2・段 3 がそれぞれの部分を進める
-    let mut st = AotuvState::new(channels);
-    // M3 が tempmdct を使うか（26 kHz 以上。psy の look のレートはどれも同じ）
-    let m3 = vd
-        .backend_state
-        .psy
-        .first()
-        .is_some_and(|p| p.rate >= 26000);
+    let mut analyzer = BlockAnalyzer::new(vd)?;
     let mut packets = Vec::with_capacity(plans.len());
     for chunk in plans.chunks(segment.max(1)) {
+        packets.extend(analyzer.segment(vd, chunk, mon)?);
+    }
+    Ok(packets)
+}
+
+/// 区間をまたいで運ぶブロックの解析の状態（[`analyze_blocks`] の段 0′・段 2・段 3 の状態を構造体に出したもの。流して
+/// 書く形（`stream.rs`）も同じものを区間ごとに回す。M13 段 3）。
+pub(crate) struct BlockAnalyzer {
+    channels: usize,
+    /// C の g->ampmax（_vp_global_look の −9999）。
+    g_ampmax: f32,
+    /// C の vbi->ampmax（vorbis_block_init の −9999）。
+    vbi_ampmax: f32,
+    /// aoTuV のブロックをまたぐ状態（C の private_state の欄）。段 0・段 2・段 3 がそれぞれの部分を進める。
+    st: AotuvState,
+    /// M3 が tempmdct を使うか（26 kHz 以上。psy の look のレートはどれも同じ）。
+    m3: bool,
+}
+
+impl BlockAnalyzer {
+    /// 解析を始める（`vd` は `vorbis_analysis_init` のあとの dsp の状態）。
+    pub fn new(vd: &VorbisDspState) -> Result<Self, EngineError> {
+        let channels = usize::try_from(vd.vi.channels).map_err(|_| internal("チャンネルの数"))?;
+        Ok(Self {
+            channels,
+            g_ampmax: vd.backend_state.psy_g_look.ampmax,
+            vbi_ampmax: block::VBI_AMPMAX_INIT,
+            st: AotuvState::new(channels),
+            m3: vd
+                .backend_state
+                .psy
+                .first()
+                .is_some_and(|p| p.rate >= 26000),
+        })
+    }
+
+    /// 区間 1 つ（計画の列 `chunk`。前の区間の続き）をパケットにする。PCM は計画の `start` から `vd` の pcm を読む。
+    pub fn segment(
+        &mut self,
+        vd: &VorbisDspState,
+        chunk: &[BlockPlan],
+        mon: &dyn Monitor,
+    ) -> Result<Vec<OggPacket>, EngineError> {
+        let channels = self.channels;
+        let st = &mut self.st;
         // 段 0 の続き（直列）：aoTuV の窓の状態（block_mode の列だけで決まる。mapping0.c:1297–1305）
         let mut windows = Vec::with_capacity(chunk.len());
         for p in chunk {
@@ -389,18 +426,18 @@ pub(crate) fn analyze_blocks(
         // 段 2（C の順に直列）：ampmax の再帰、M5 の lowcomp、M3・M9 の lastmdct（どれも段 1 の値だけから進む）
         let mut carried = Vec::with_capacity(chunk.len());
         for ((p, a), w) in chunk.iter().zip(&analyses).zip(&windows) {
-            let start = block::blockout_ampmax(&mut g_ampmax, vbi_ampmax, &vd.vi, p.w);
-            vbi_ampmax = mapping0_ampmax(start, &a.local_ampmax);
+            let start = block::blockout_ampmax(&mut self.g_ampmax, self.vbi_ampmax, &vd.vi, p.w);
+            self.vbi_ampmax = mapping0_ampmax(start, &a.local_ampmax);
             mapping0_lowcomp(vd, p.blocktype, p.w, w.lw_block_mode, a, &mut st.lowcomp)?;
             let snap = mapping0_lastmdct(vd, p.blocktype, p.w, p.nw, a, &mut st.lastmdct)?;
             carried.push(Carried {
-                global_ampmax: vbi_ampmax,
+                global_ampmax: self.vbi_ampmax,
                 lowcomp: st.lowcomp.clone(),
                 lastmdct: snap,
             });
         }
         // 段 3（段 2 の値があれば、M3 の tempmdct を引き継ぐ impulse の続きを除いてブロックごとに独立）
-        let units = stage3_units(chunk, &windows, m3);
+        let units = stage3_units(chunk, &windows, self.m3);
         let carry_in = &st.tempmdct;
         let out = par_blocks(units.len(), mon, |u| {
             let (s, e) = *units.get(u).ok_or_else(|| internal("段 3 の仕事"))?;
@@ -449,16 +486,17 @@ pub(crate) fn analyze_blocks(
             }
             Ok((pk, temp))
         })?;
+        let mut packets = Vec::with_capacity(chunk.len());
         for (pk, temp) in out {
             packets.extend(pk);
             // 次の区間へ：最後の仕事の tempmdct（最後のブロックが impulse でなければ次は読まない）
             st.tempmdct = temp;
         }
+        Ok(packets)
     }
-    Ok(packets)
 }
 
-fn internal(what: &str) -> EngineError {
+pub(crate) fn internal(what: &str) -> EngineError {
     EngineError::Internal(format!("Ogg Vorbis の書き出し：{what}が正しくありません"))
 }
 
@@ -476,7 +514,7 @@ pub(crate) fn sanitize(x: f32) -> f32 {
 }
 
 /// チャンネルの数 → Vorbis のチャンネル `i` に入れる kura の plane の番号の並び（`super::ORDER`）。
-fn vorbis_order(channels: usize) -> Result<&'static [usize], EngineError> {
+pub(crate) fn vorbis_order(channels: usize) -> Result<&'static [usize], EngineError> {
     channels
         .checked_sub(1)
         .and_then(|i| ORDER.get(i))
@@ -534,6 +572,15 @@ pub(crate) fn serial_of(
             Ok(())
         }
     })?;
+    serial_from_digest(&digest, quality)
+}
+
+/// シリアル番号を入力の値のダイジェスト `digest`（`kura-pcm-v1`）から作る（[`serial_of`] の後半。流して書く形は後ろ向きの
+/// 回で流したダイジェストから。M13 段 3）。
+pub(crate) fn serial_from_digest(
+    digest: &crate::digest::Digest,
+    quality: i64,
+) -> Result<u32, EngineError> {
     let settings = canonical_json(&json!({ "quality": quality }))?;
     let d = Hasher::new(SERIAL_DOMAIN)
         .raw(&digest.0)

@@ -367,6 +367,14 @@ fn lookup_is_valid(ve: &EnvelopeLookup) -> bool {
                 .saturating_add(usize::try_from(ve.storage).unwrap_or(usize::MAX))
 }
 
+/// 流して書く形で、もう読まない印（`mark_base` より前。どの読み書きも `mark[mark_base + k]`（k ≥ 0）だけ）を落とす
+/// （M13 段 3。60 分の 48 kHz で約 11 MB になる印を持ち続けない。値は変わらない）。
+pub(crate) fn ve_envelope_trim(e: &mut EnvelopeLookup) {
+    let k = e.mark_base.min(e.mark.len());
+    e.mark.drain(..k);
+    e.mark_base -= k;
+}
+
 /// C の `mark[k]` の位置（範囲の外は `Err`：C では範囲の外の読み書き）。
 fn mark_index(ve: &EnvelopeLookup, k: i64) -> Result<usize, EngineError> {
     usize::try_from(k)
@@ -383,12 +391,13 @@ pub(crate) fn ve_envelope_search(
     v: &mut VorbisDspState,
     mon: &dyn Monitor,
 ) -> Result<i64, EngineError> {
+    // pcm の中の添字（流して書く形は前を落とすので、絶対の位置から pcm_origin を引く。M13 段 3）
+    let base = v.rel(v.pcm_base)?;
     let vi = &v.vi;
     let ci = &vi.codec_setup;
     let gi = &ci.psy_g_param;
     let ve = &mut v.backend_state.ve;
     let pcm = &v.pcm;
-    let base = v.pcm_base;
 
     if !lookup_is_valid(ve) || pcm.len() != ve.filter.len() / VE_BANDS {
         return Err(EngineError::Internal(

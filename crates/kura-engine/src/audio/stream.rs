@@ -182,6 +182,9 @@ fn uncovered(covered: &std::collections::BTreeMap<u64, u64>, s: u64, e: u64) -> 
     {
         at = *pe;
     }
+    if at >= e {
+        return out;
+    }
     for (&cs, &ce) in covered.range(at..e) {
         if cs > at {
             out.push((at, cs.min(e)));
@@ -425,6 +428,8 @@ mod tests {
         cover(&mut m, 6, 8);
         assert_eq!(uncovered(&m, 0, 10), vec![(0, 2), (4, 6), (8, 10)]);
         assert_eq!(uncovered(&m, 3, 7), vec![(4, 6)]);
+        assert_eq!(uncovered(&m, 2, 3), vec![]);
+        assert_eq!(uncovered(&m, 6, 8), vec![]);
         cover(&mut m, 4, 6);
         assert_eq!(m.len(), 1);
         assert_eq!(uncovered(&m, 2, 8), vec![]);

@@ -216,6 +216,7 @@ pub(crate) mod res0;
 pub(crate) mod scales;
 pub(crate) mod setup;
 pub(crate) mod smallft;
+pub(crate) mod stream;
 #[cfg(test)]
 mod stream_tests;
 pub(crate) mod window;
@@ -224,7 +225,8 @@ use std::io::Write;
 
 use serde_json::json;
 
-use crate::codec::{Encoder, MetaCaps, Tier, caps_of};
+use crate::audio::stream::AudioProducer;
+use crate::codec::{Encoder, MetaCaps, Tier, WriteSeek, caps_of};
 use crate::error::EngineError;
 use crate::monitor::Monitor;
 use crate::op::{ParamKind, ParamSchema, Unit, spec};
@@ -333,15 +335,59 @@ impl Encoder for OggVorbisEncoder {
         };
         // 設定の形（範囲・知らないキー）は呼ぶ側（`CodecSet::encode_bytes`）が `options` の表で確かめる。
         // 直接呼ばれたときのために、範囲の外は encoder::encode が `Unsupported` にする。
-        let quality = match opts.get("quality") {
-            None | Some(serde_json::Value::Null) => QUALITY_DEFAULT,
-            Some(q) => q
-                .as_i64()
-                .ok_or_else(|| EngineError::Unsupported("Ogg Vorbis の品質は整数です".into()))?,
-        };
-        let bytes = encoder::encode(audio, quality, mon)?;
+        let bytes = encoder::encode(audio, quality_of(opts)?, mon)?;
         out.write_all(&bytes)?;
         Ok(bytes.len() as u64)
+    }
+
+    fn streams(&self, format: &str) -> bool {
+        format == "ogg"
+    }
+
+    /// 後ろ向き（前の外挿の自己相関・シリアル番号のダイジェスト）と前向きの 2 回。
+    fn stream_passes(&self, _format: &str, _opts: &serde_json::Value) -> u32 {
+        2
+    }
+
+    /// 32 MiB（区間の段 1 の結果・先読みのパケット・pcm の余裕。`stream::STREAM_FIXED`）＋ 窓 2 つ分の pcm（区間の
+    /// ブロックの幅と次の窓）× チャンネル × 4 ＋ [`FIXED_WORK`]。値の長さによらない。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
+        let channels = match shape {
+            Shape::Audio { channels, .. } => u64::from(*channels),
+            _ => 0,
+        };
+        let window = crate::codec::stream::WINDOW_FRAMES as u64;
+        stream::STREAM_FIXED
+            .saturating_add(
+                window
+                    .saturating_mul(2)
+                    .saturating_mul(channels)
+                    .saturating_mul(4),
+            )
+            .saturating_add(FIXED_WORK)
+    }
+
+    /// 生産者を後ろ向き・前向きに 2 回流して書く（`stream.rs`。一度に渡す形と同じバイト列。E43）。
+    fn encode_stream(
+        &self,
+        src: &mut dyn AudioProducer,
+        _format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn WriteSeek,
+        mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        stream::encode_stream(src, quality_of(opts)?, out, mon)
+    }
+}
+
+/// 書き出しの設定の品質（なければ既定）。設定の形（範囲・知らないキー）は呼ぶ側（`CodecSet::encode_bytes`）が `options` の
+/// 表で確かめる。直接呼ばれたときのために、範囲の外は書き出しが `Unsupported` にする。
+fn quality_of(opts: &serde_json::Value) -> Result<i64, EngineError> {
+    match opts.get("quality") {
+        None | Some(serde_json::Value::Null) => Ok(QUALITY_DEFAULT),
+        Some(q) => q
+            .as_i64()
+            .ok_or_else(|| EngineError::Unsupported("Ogg Vorbis の品質は整数です".into())),
     }
 }
 

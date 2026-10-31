@@ -701,3 +701,178 @@ fn vorbis_bench_three_minutes_stereo() {
         assert!(sizes.windows(2).all(|w| w[0] == w[1]));
     }
 }
+
+// ---- 流して書く形（M13 段 3。E43 の Vorbis） ----
+
+/// 値を細かい窓（`step` フレームずつ。窓は生産者の区間の中で前から）で流す生産者。
+struct Choppy<'a> {
+    audio: &'a Audio,
+    info: crate::audio::stream::StreamInfo,
+    step: usize,
+}
+
+impl<'a> Choppy<'a> {
+    fn new(audio: &'a Audio, step: usize) -> Self {
+        Self {
+            audio,
+            info: crate::audio::stream::StreamInfo {
+                rate: audio.rate(),
+                channels: audio.channels(),
+                frames: audio.frames() as u64,
+                meta: audio.meta.clone(),
+            },
+            step: step.max(1),
+        }
+    }
+}
+
+impl crate::audio::stream::AudioProducer for Choppy<'_> {
+    fn info(&self) -> &crate::audio::stream::StreamInfo {
+        &self.info
+    }
+
+    fn produce(
+        &mut self,
+        spans: Option<&crate::render::region::Spans>,
+        sink: &mut dyn crate::audio::stream::AudioSink,
+        mon: &dyn crate::monitor::Monitor,
+    ) -> Result<(), crate::error::EngineError> {
+        sink.begin(&self.info)?;
+        for (s, e) in crate::audio::stream::stream_windows(self.info.frames, spans) {
+            let mut at = s;
+            while at < e {
+                let end = at.saturating_add(self.step as u64).min(e);
+                let planes = self.audio.read_planes(at as usize, end as usize)?;
+                let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+                sink.feed(at, &views, mon)?;
+                at = end;
+            }
+        }
+        sink.finish()
+    }
+}
+
+/// 流して書いたバイト列（窓 `step` フレームずつ・区間 `segment` ブロックずつ）。
+fn streamed(audio: &Audio, q: i64, step: usize, segment: Option<usize>) -> Vec<u8> {
+    let mut src = Choppy::new(audio, step);
+    let mut out = std::io::Cursor::new(Vec::new());
+    let n = super::stream::encode_stream_with(&mut src, q, &mut out, &NoMonitor, segment).unwrap();
+    let bytes = out.into_inner();
+    assert_eq!(n as usize, bytes.len());
+    bytes
+}
+
+/// 流して書く形が、一度に渡す形（/1 の正）とバイト単位で同じ：レート・チャンネル・品質・長さ（0・1・31〜33・64・65・
+/// blocksizes[1] の前後・0.5 秒）と、窓の切り方（窓 1 つ・1,009・4,109 フレーム）・区間（3 ブロック・既定）を変えても。
+#[test]
+fn streamed_equals_one_shot() {
+    let mut cases = 0;
+    for (i, (kind, rate, ch, q)) in [
+        (Signal::Music, 44_100u32, 2usize, 5i64),
+        (Signal::Impulses, 8_000, 1, -1),
+        (Signal::Bursts, 48_000, 6, 0),
+        (Signal::Noise, 96_000, 8, 10),
+        (Signal::Sine, 22_050, 3, 5),
+        (Signal::Silence, 16_000, 2, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bs1 = super::setup::vorbis_encode_init_vbr(ch as i64, i64::from(rate), q as f32 / 10.0)
+            .unwrap()
+            .codec_setup
+            .blocksizes[1] as usize;
+        let mut lengths = vec![0usize, 1, 31, 32, 33, 64, 65, bs1 - 1, bs1, bs1 + 1];
+        lengths.push(rate as usize / 2 + 3 * i + 7);
+        for (j, frames) in lengths.into_iter().enumerate() {
+            let input = oracle::signal(kind, rate, ch, frames, (i * 50 + j) as u64);
+            let audio = kura_audio(rate, &input);
+            let one = encoder::encode(&audio, q, &NoMonitor).unwrap();
+            let steps: &[usize] = if frames > 4_000 {
+                &[usize::MAX, 1_009, 4_109]
+            } else {
+                &[usize::MAX, 7]
+            };
+            for &step in steps {
+                for segment in [Some(3), None] {
+                    let got = streamed(&audio, q, step, segment);
+                    assert!(
+                        got == one,
+                        "{kind:?}・{rate} Hz・{ch} ch・q{q}・{frames} フレーム・窓 {step}・区間 {segment:?}：\
+                         流して書いたものが一度に渡す形と違う（{} と {} バイト）",
+                        got.len(),
+                        one.len()
+                    );
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert!(cases > 100, "{cases}");
+}
+
+/// 流して書く形が、照合用の C とビット一致する（`KURA_VORBIS_ORACLE` があるときだけ）。パケットの列を Ogg から読み直して、
+/// 識別・setup・すべての音声パケットを照合用のものと比べる（コメントは vendor とタグが違うので比べない）。
+#[test]
+fn oracle_streamed_matches_c() {
+    use crate::codec::ogg::tests::{packets, pages};
+    let mut cases = 0;
+    for (kind, rate, ch, q, frames) in [
+        (Signal::Music, 44_100u32, 2usize, 5i32, 88_200usize),
+        (Signal::Impulses, 48_000, 6, 0, 48_000),
+        (Signal::Bursts, 44_100, 2, 0, 88_200),
+        (Signal::Music, 8_000, 1, -1, 30_001),
+        (Signal::Noise, 96_000, 8, 10, 28_800),
+        (Signal::Music, 22_050, 3, 3, 33),
+        (Signal::Sine, 32_000, 1, 10, 0),
+    ] {
+        let input = oracle::signal(kind, rate, ch, frames, 1_303);
+        let Some((want, _)) = oracle::encode(&input, rate, q, None) else {
+            return;
+        };
+        let audio = kura_audio(rate, &input);
+        for (step, segment) in [(usize::MAX, None), (1_009, Some(3))] {
+            let ogg = streamed(&audio, i64::from(q), step, segment);
+            let got = packets(&pages(&ogg));
+            assert_eq!(got.len(), want.len(), "{kind:?}・{rate} Hz・{ch} ch・q{q}");
+            for (k, ((g, _), w)) in got.iter().zip(&want).enumerate() {
+                if k != 1 {
+                    assert!(
+                        *g == w.body,
+                        "{kind:?}・{rate} Hz・{ch} ch・q{q}・{frames}：パケット {k} が照合用の C と違う"
+                    );
+                }
+            }
+            cases += 1;
+        }
+    }
+    eprintln!("照合 流して書く形：{cases} 通りがビット一致");
+}
+
+/// 長い入力の一致（release で手で回す。既定 10 分、`KURA_VORBIS_MINUTES` で変える）：48 kHz ステレオの Music を q5 で、流して
+/// 書いたもの（窓 1,048,576 フレーム・既定の区間）が一度に渡す形とバイト単位で同じ。時間も出す。
+/// `cargo test --release -p kura-engine --lib streamed_long -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn streamed_long_equals_one_shot() {
+    #![allow(clippy::disallowed_methods)]
+    let minutes: usize = std::env::var("KURA_VORBIS_MINUTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let rate = 48_000u32;
+    let input = oracle::signal(Signal::Music, rate, 2, rate as usize * 60 * minutes, 5);
+    let audio = kura_audio(rate, &input);
+    drop(input);
+    let t = std::time::Instant::now();
+    let got = streamed(&audio, 5, usize::MAX, None);
+    let streamed_secs = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    let one = encoder::encode(&audio, 5, &NoMonitor).unwrap();
+    let one_secs = t.elapsed().as_secs_f64();
+    eprintln!(
+        "{minutes} 分：流して {streamed_secs:.1} 秒・一度に {one_secs:.1} 秒（{} バイト）",
+        one.len()
+    );
+    assert!(got == one, "流して書いたものが一度に渡す形と違う");
+}

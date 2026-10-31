@@ -129,6 +129,9 @@ pub(crate) struct VorbisDspState {
     pub pcm: Vec<Vec<f32>>,
     /// C の `pcm` の先頭の位置（blockout が C で memmove した量の和。kura の追加）。
     pub pcm_base: usize,
+    /// `pcm[ch]` の 0 番が指す絶対の位置（流して書く形が前を落とした量。一度に渡す形では 0。kura の追加。M13 段 3）。
+    /// 絶対の位置 x の標本は `pcm[ch][x - pcm_origin]`。
+    pub pcm_origin: usize,
     pub pcm_storage: i32,
     pub pcm_current: i32,
     pub preextrapolate: i32,
@@ -144,6 +147,32 @@ pub(crate) struct VorbisDspState {
 
 /// `vorbis_block_init` の `vbi->ampmax`（block.c:99）。並列の書き出しの ampmax の再帰の始まり。
 pub(crate) const VBI_AMPMAX_INIT: f32 = -9999.0;
+
+impl VorbisDspState {
+    /// 絶対の位置 `abs` の `pcm[ch]` の中の添字（前を落としすぎていれば `Internal`）。
+    pub(crate) fn rel(&self, abs: usize) -> Result<usize, EngineError> {
+        abs.checked_sub(self.pcm_origin).ok_or_else(|| {
+            EngineError::Internal(format!(
+                "Ogg Vorbis：落とした pcm を読もうとしました（{abs} < {}）",
+                self.pcm_origin
+            ))
+        })
+    }
+
+    /// 絶対の位置 `abs` より前の pcm を落とす（流して書く形で、読み終えた区間を手放す。M13 段 3）。値は変わらない
+    /// （落とした所はもう読まない呼び方でだけ使う）。
+    pub(crate) fn trim_before(&mut self, abs: usize) {
+        if abs <= self.pcm_origin {
+            return;
+        }
+        let k = abs - self.pcm_origin;
+        for p in &mut self.pcm {
+            let k = k.min(p.len());
+            p.drain(..k);
+        }
+        self.pcm_origin = abs;
+    }
+}
 
 /// `vorbis_block`（codec.h:88–120）と `vorbis_block_internal`（codec_internal.h:30–39）。直列の C の形（テストの基準）だけが使う。
 #[cfg(test)]
@@ -229,6 +258,7 @@ fn vds_dsp_init(vi: VorbisInfo) -> Result<VorbisDspState, EngineError> {
         vi,
         pcm,
         pcm_base: 0,
+        pcm_origin: 0,
         pcm_storage,
         pcm_current: center_w as i32,
         preextrapolate: 0,
@@ -362,8 +392,9 @@ pub(crate) fn vorbis_block_init(v: &VorbisDspState) -> VorbisBlock {
     }
 }
 
-/// `vorbis_analysis_buffer`（block.c:412–437）：`vals` 個を書ける大きさにして、書き始めの位置（`pcm_base + pcm_current`）を返す。
-/// 呼ぶ側は `v.pcm[ch][pos .. pos + vals]` に書く。
+/// `vorbis_analysis_buffer`（block.c:412–437）：`vals` 個を書ける大きさにして、書き始めの `pcm[ch]` の中の添字（絶対の位置
+/// `pcm_base + pcm_current` から `pcm_origin` を引いたもの。一度に渡す形では絶対の位置と同じ）を返す。呼ぶ側は
+/// `v.pcm[ch][pos .. pos + vals]` に書く。
 pub(crate) fn vorbis_analysis_buffer(
     v: &mut VorbisDspState,
     vals: i32,
@@ -381,6 +412,7 @@ pub(crate) fn vorbis_analysis_buffer(
         .ok()
         .and_then(|c| c.checked_add(v.pcm_base))
         .ok_or_else(|| EngineError::Internal("vorbis_analysis_buffer：位置が負".into()))?;
+    let start = v.rel(start)?;
     let need = start + vals as usize;
     for p in &mut v.pcm {
         if p.len() < need {
@@ -395,72 +427,149 @@ pub(crate) fn vorbis_analysis_buffer(
 /// 前の外挿の自己相関の和で中止を確かめる間隔（標本の数。和は区切っても同じ順に足すので値は変わらない）。
 pub(crate) const CANCEL_SAMPLES: usize = 1 << 17;
 
+/// `_preextrapolate_helper`（block.c:439–485）の LPC の次数。
+pub(crate) const PRE_ORDER: usize = 16;
+
 /// `_preextrapolate_helper`（block.c:439–485）。
 ///
 /// C は pcm を逆順に写した work（`pcm_current` 個）で 16 次の LPC を作る。自己相関（17 個のずれ × 入力の全体）が
 /// 重いので、チャンネル × ずれごとに `par_blocks` で並列に求める（各ずれの和は C と同じ `i` の昇順。逆順の work は
 /// 作らず、pcm を後ろから読む）。値は C と同じ（スレッド数によらない）。中止は `par_blocks` の仕事ごとと、各和の
-/// [`CANCEL_SAMPLES`] 標本ごとに確かめる。
+/// [`CANCEL_SAMPLES`] 標本ごとに確かめる。自己相関（[`preextrapolate_aut`]）と当てる部分（[`preextrapolate_apply`]）に
+/// 分けた（流して書く形は、自己相関を後ろ向きの回で求めて当てる。M13 段 3）。
 fn preextrapolate_helper(v: &mut VorbisDspState, mon: &dyn Monitor) -> Result<(), EngineError> {
-    const ORDER: usize = 16;
     v.preextrapolate = 1;
 
     let cur = i64::from(v.pcm_current);
-    if cur - v.center_w > (ORDER * 2) as i64 {
-        let cur = cur as usize;
-        let center_w = v.center_w as usize;
-        let n = cur - center_w;
-        let base = v.pcm_base;
-        if v.pcm.iter().any(|p| p.len() < base + cur) {
-            return Err(EngineError::Internal(
-                "_preextrapolate_helper：pcm が足りない".into(),
-            ));
+    if cur - v.center_w > (PRE_ORDER * 2) as i64 {
+        let aut = preextrapolate_aut(v, mon)?;
+        preextrapolate_apply(v, &aut)?;
+    }
+    Ok(())
+}
+
+/// `_preextrapolate_helper` の自己相関（チャンネルごとに 17 個のずれ。`data = pcm[centerW..pcm_current]` の後ろから
+/// t = i − j の昇順に data[n−1−j−t]·data[n−1−t] を f64 で足す）。
+fn preextrapolate_aut(v: &VorbisDspState, mon: &dyn Monitor) -> Result<Vec<f64>, EngineError> {
+    const ORDER: usize = PRE_ORDER;
+    let cur = usize::try_from(v.pcm_current)
+        .map_err(|_| EngineError::Internal("_preextrapolate_helper：位置が負".into()))?;
+    let center_w = v.center_w as usize;
+    let n = cur - center_w;
+    let base = v.rel(v.pcm_base)?;
+    if v.pcm.iter().any(|p| p.len() < base + cur) {
+        return Err(EngineError::Internal(
+            "_preextrapolate_helper：pcm が足りない".into(),
+        ));
+    }
+    let channels = v.pcm.len();
+
+    // work[i] = pcm[cur-1-i]（i < n）は data = pcm[centerW..cur] の逆順：work[i] = data[n-1-i]。
+    // aut[j] = Σ_{i=j}^{n-1} work[i]*work[i-j]（i の昇順）= data[n-1-j-t]*data[n-1-t]（t = i-j の昇順）
+    // 区切り（rchunks）は 2 つの長さの同じスライスの後ろから同じ位置で切れるので、区切りの中を後ろから読むと、
+    // 区切らずに後ろから読むのと同じ順に足す
+    let pcm = &v.pcm;
+    par_blocks(channels * (ORDER + 1), mon, |k| {
+        let (c, j) = (k / (ORDER + 1), k % (ORDER + 1));
+        let data = &pcm[c][base + center_w..base + cur];
+        let mut d = 0.0_f64;
+        for (ca, cb) in data[..n - j]
+            .rchunks(CANCEL_SAMPLES)
+            .zip(data[j..].rchunks(CANCEL_SAMPLES))
+        {
+            if mon.canceled() {
+                return Err(EngineError::Canceled);
+            }
+            for (a, b) in ca.iter().rev().zip(cb.iter().rev()) {
+                d += f64::from(*a) * f64::from(*b);
+            }
         }
-        let channels = v.pcm.len();
+        Ok(d)
+    })
+}
 
-        // work[i] = pcm[cur-1-i]（i < n）は data = pcm[centerW..cur] の逆順：work[i] = data[n-1-i]。
-        // aut[j] = Σ_{i=j}^{n-1} work[i]*work[i-j]（i の昇順）= data[n-1-j-t]*data[n-1-t]（t = i-j の昇順）
-        // 区切り（rchunks）は 2 つの長さの同じスライスの後ろから同じ位置で切れるので、区切りの中を後ろから読むと、
-        // 区切らずに後ろから読むのと同じ順に足す
-        let pcm = &v.pcm;
-        let aut = par_blocks(channels * (ORDER + 1), mon, |k| {
-            let (c, j) = (k / (ORDER + 1), k % (ORDER + 1));
-            let data = &pcm[c][base + center_w..base + cur];
-            let mut d = 0.0_f64;
-            for (ca, cb) in data[..n - j]
-                .rchunks(CANCEL_SAMPLES)
-                .zip(data[j..].rchunks(CANCEL_SAMPLES))
-            {
-                if mon.canceled() {
-                    return Err(EngineError::Canceled);
-                }
-                for (a, b) in ca.iter().rev().zip(cb.iter().rev()) {
-                    d += f64::from(*a) * f64::from(*b);
-                }
-            }
-            Ok(d)
-        })?;
+/// `_preextrapolate_helper` の後半：自己相関 `aut`（チャンネルごとに 17 個）から LPC を作り、入力の頭の 16 標本
+/// （`pcm[centerW..centerW+16]`）を後ろへ読んだものを prime に `pcm[0..centerW]` を予測で書く。入力は 33 標本以上あること
+/// （C の `pcm_current - centerW > 32`。呼び手が確かめる）。`preextrapolate` の旗は変えない。
+pub(crate) fn preextrapolate_apply(v: &mut VorbisDspState, aut: &[f64]) -> Result<(), EngineError> {
+    const ORDER: usize = PRE_ORDER;
+    let center_w = v.center_w as usize;
+    let base = v.rel(v.pcm_base)?;
+    if aut.len() != v.pcm.len() * (ORDER + 1)
+        || v.pcm.iter().any(|p| p.len() < base + center_w + ORDER)
+    {
+        return Err(EngineError::Internal(
+            "_preextrapolate_helper：自己相関か pcm が足りない".into(),
+        ));
+    }
+    let mut lpc = [0.0_f32; ORDER];
+    for (c, p) in v.pcm.iter_mut().enumerate() {
+        let p = &mut p[base..];
 
-        let mut lpc = [0.0_f32; ORDER];
-        for (c, p) in v.pcm.iter_mut().enumerate() {
-            let p = &mut p[base..base + cur];
+        // prime as above（vorbis_lpc_from_data(work,lpc,cur-centerW,order) の自己相関のあと）
+        lpc_from_autocorrelation(&aut[c * (ORDER + 1)..(c + 1) * (ORDER + 1)], &mut lpc);
 
-            // prime as above（vorbis_lpc_from_data(work,lpc,cur-centerW,order) の自己相関のあと）
-            lpc_from_autocorrelation(&aut[c * (ORDER + 1)..(c + 1) * (ORDER + 1)], &mut lpc);
+        // run the predictor filter：prime は work[n-order..n] = pcm[cur-1-(n-order)..] を後ろへ読んだもの
+        // （cur - 1 - (n - order + t) = centerW + order - 1 - t。入力の頭の order 標本だけで決まる）
+        let prime: Vec<f32> = (0..ORDER).map(|t| p[center_w + ORDER - 1 - t]).collect();
+        let mut tail = vec![0.0_f32; center_w];
+        vorbis_lpc_predict(&lpc, Some(&prime), ORDER as i32, &mut tail, center_w as i64);
 
-            // run the predictor filter：prime は work[n-order..n] = pcm[cur-1-(n-order)..] を後ろへ読んだもの
-            let prime: Vec<f32> = (0..ORDER).map(|t| p[cur - 1 - (n - ORDER + t)]).collect();
-            let mut tail = vec![0.0_f32; center_w];
-            vorbis_lpc_predict(&lpc, Some(&prime), ORDER as i32, &mut tail, center_w as i64);
-
-            // for(j=0;j<v->pcm_current;j++) v->pcm[i][v->pcm_current-j-1]=work[j];
-            // （work[0..n] は pcm を逆に写しただけなので、書き戻して変わるのは pcm[0..centerW] だけ）
-            for (k, w) in tail.iter().enumerate() {
-                p[cur - (n + k) - 1] = *w;
-            }
+        // for(j=0;j<v->pcm_current;j++) v->pcm[i][v->pcm_current-j-1]=work[j];
+        // （work[0..n] は pcm を逆に写しただけなので、書き戻して変わるのは pcm[0..centerW] だけ：
+        // cur - (n + k) - 1 = centerW - 1 - k）
+        for (k, w) in tail.iter().enumerate() {
+            p[center_w - 1 - k] = *w;
         }
     }
     Ok(())
+}
+
+/// 前の外挿の自己相関を、入力を後ろから 1 標本ずつ足して求めるもの（流して書く形の後ろ向きの回。M13 段 3）。和の順は
+/// [`preextrapolate_aut`] と同じ（ずれ j ごとに、標本の位置 m の降順に data[m]·data[m+j] を f64 で足す）なので、ビット
+/// 単位で同じ。1 チャンネル分。
+#[derive(Debug, Clone)]
+pub(crate) struct PreLpc {
+    /// ずれ 0〜16 の和。
+    sums: [f64; PRE_ORDER + 1],
+    /// 直前に足した（時間では後ろの）16 標本。`recent[j - 1]` が data[m + j]。
+    recent: [f64; PRE_ORDER],
+    /// 足した標本の数。
+    seen: u64,
+}
+
+impl Default for PreLpc {
+    fn default() -> Self {
+        Self {
+            sums: [0.0; PRE_ORDER + 1],
+            recent: [0.0; PRE_ORDER],
+            seen: 0,
+        }
+    }
+}
+
+impl PreLpc {
+    /// 標本の列 `xs`（時間の順。この前に足した標本の直前）を、`map`（符号化する値にする式）を当てて後ろから足す。
+    pub fn feed_back(&mut self, xs: &[f32], map: impl Fn(f32) -> f32) {
+        for &x in xs.iter().rev() {
+            let x = f64::from(map(x));
+            self.sums[0] += x * x;
+            let k = usize::try_from(self.seen)
+                .unwrap_or(usize::MAX)
+                .min(PRE_ORDER);
+            for j in 1..=k {
+                self.sums[j] += x * self.recent[j - 1];
+            }
+            self.recent.copy_within(0..PRE_ORDER - 1, 1);
+            self.recent[0] = x;
+            self.seen += 1;
+        }
+    }
+
+    /// ずれ 0〜16 の和。
+    pub fn sums(&self) -> &[f64; PRE_ORDER + 1] {
+        &self.sums
+    }
 }
 
 /// `vorbis_analysis_wrote`（block.c:490–561。前増幅を除く）：`vals` 個を書いた（0 以下は終わり）。前の外挿の中で `mon` の
@@ -490,18 +599,27 @@ pub(crate) fn vorbis_analysis_wrote(
         v.eofflag = v.pcm_current;
         v.pcm_current = to_int(i64::from(v.pcm_current) + i64::from(extra))?;
 
-        let base = v.pcm_base;
-        let eof = v.eofflag as usize;
-        let cur = v.pcm_current as usize;
+        // C の pcm の位置は前を memmove で詰めたもの。一度に渡す形ではここで pcm_base = 0 なので、eofflag は入力の頭からの
+        // 位置そのもの。流して書く形（M13 段 3）は計画を進めながら渡すので、同じ値になるよう絶対の位置
+        // （pcm_base + eofflag）で数え、絶対の位置の標本を読む（C の一度に渡す形の LPC と同じ入力）
+        let base = v.rel(v.pcm_base)?;
+        let eof_abs = v.pcm_base + v.eofflag as usize;
+        let eof = v.rel(eof_abs)?;
+        let cur = base + v.pcm_current as usize;
         for p in &mut v.pcm {
-            let p = &mut p[base..base + cur];
-            if v.eofflag > ORDER * 2 {
+            let p = &mut p[..cur];
+            if eof_abs > (ORDER * 2) as usize {
                 // make a predictor filter
-                let mut n = i64::from(v.eofflag);
+                let mut n = eof_abs as i64;
                 if n > bs1 {
                     n = bs1;
                 }
                 let n = n as usize;
+                if n > eof {
+                    return Err(EngineError::Internal(
+                        "vorbis_analysis_wrote：末尾の外挿の pcm を落としすぎました".into(),
+                    ));
+                }
                 vorbis_lpc_from_data(&p[eof - n..eof], &mut lpc, n as i32, ORDER);
 
                 // run the predictor filter
@@ -531,7 +649,7 @@ pub(crate) fn vorbis_analysis_wrote(
         v.pcm_current += vals;
         // pcm は buffer が求めた分だけ確保している（C は pcm_storage まで確保する）。それを越えて wrote されたら、
         // C の未初期化の領域の代わりに 0 で広げる（buffer に書いたあとで wrote する正しい使い方では起きない）。
-        let need = v.pcm_base + v.pcm_current as usize;
+        let need = v.rel(v.pcm_base)? + v.pcm_current as usize;
         for p in &mut v.pcm {
             if p.len() < need {
                 p.resize(need, 0.0);
@@ -541,6 +659,30 @@ pub(crate) fn vorbis_analysis_wrote(
         // we may want to reverse extrapolate the beginning of a stream too... in case we're beginning on a cliff!
         if v.preextrapolate == 0 && i64::from(v.pcm_current) - v.center_w > bs1 {
             preextrapolate_helper(v, mon)?;
+        }
+    }
+    Ok(())
+}
+
+/// 流して書く形の `vorbis_analysis_wrote(vals > 0)`（M13 段 3）：`vals` 個を書いた。前の外挿は呼ばない（流して書く形は
+/// 入力の全体の自己相関を後ろ向きの回で求め、最初の窓を書いたあとで [`preextrapolate_apply`] で当てる）。
+pub(crate) fn vorbis_analysis_wrote_streaming(
+    v: &mut VorbisDspState,
+    vals: i32,
+) -> Result<(), EngineError> {
+    if vals <= 0 {
+        return Ok(());
+    }
+    if i64::from(v.pcm_current) + i64::from(vals) > i64::from(v.pcm_storage) {
+        return Err(EngineError::Internal(
+            "vorbis_analysis_wrote：buffer で確保した数より多い".into(),
+        ));
+    }
+    v.pcm_current += vals;
+    let need = v.rel(v.pcm_base)? + v.pcm_current as usize;
+    for p in &mut v.pcm {
+        if p.len() < need {
+            p.resize(need, 0.0);
         }
     }
     Ok(())
@@ -632,7 +774,7 @@ pub(crate) fn vorbis_analysis_plan(
         .ok()
         .and_then(|b| b.checked_add(v.pcm_base))
         .ok_or_else(|| EngineError::Internal("blockout：beginW が負".into()))?;
-    let end = start + pcmend as usize;
+    let end = v.rel(start)? + pcmend as usize;
     if v.pcm.iter().any(|p| p.len() < end) {
         return Err(EngineError::Internal("blockout：pcm が足りない".into()));
     }
@@ -747,10 +889,11 @@ pub(crate) fn vorbis_analysis_blockout(
 
 /// 計画 `p` のブロックの PCM の写し（チャンネルごとに `pcmend` 個。mapping0 の段 1 がその場で書き換える）。
 pub(crate) fn block_pcm(v: &VorbisDspState, p: &BlockPlan) -> Result<Vec<Vec<f32>>, EngineError> {
+    let start = v.rel(p.start)?;
     v.pcm
         .iter()
         .map(|src| {
-            src.get(p.start..p.start + p.pcmend as usize)
+            src.get(start..start + p.pcmend as usize)
                 .map(<[f32]>::to_vec)
                 .ok_or_else(|| EngineError::Internal("blockout：pcm が足りない".into()))
         })
