@@ -1770,6 +1770,7 @@ fn finish_open(
             input: info,
             peaks: audio::peaks::PeaksJob::new(base),
             measure: audio::measure::MeasureJob::default(),
+            last_area: Default::default(),
         }
     });
     // 閉じる・ほかを開くのと競らないよう、錠の中で中止を確かめてから取り置き・確保を立てる

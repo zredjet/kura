@@ -40,13 +40,16 @@ mod work_tests;
 
 use std::time::Instant;
 
+use kura_engine::audio::source::SourceStats;
+use kura_engine::doc::InputId;
 use kura_engine::monitor::Ticket;
+use kura_engine::render::area::AreaStats;
 use kura_engine::render::delta::OutputChange;
 use kura_engine::render::estimate::{EstimateSpec, Source};
 use kura_engine::render::region::{Area, PartialValue, Spans};
 use kura_engine::render::view::ViewRequest;
-use kura_engine::value::{AUDIO_CHUNK, ChunkSet};
-use kura_engine::{Dim, EngineError, Issue, Monitor, Shape};
+use kura_engine::value::{AUDIO_CHUNK, Chunk, ChunkSet};
+use kura_engine::{Dim, EngineError, Issue, Monitor, Shape, Value};
 
 use super::view::AudioViewport;
 use super::{
@@ -124,6 +127,24 @@ pub(crate) struct AudioState {
     pub(crate) peaks: peaks::PeaksJob,
     /// ラウドネスの結果。
     pub(crate) measure: measure::MeasureJob,
+    /// 最後の表示の範囲の描画の数（測るための数。[`Editor::audio_counts`]）。
+    pub(crate) last_area: AreaStats,
+}
+
+/// 音声のエディタの測るための数（A18・devtools の `mem_smoke` と `bench edit`。振る舞いに効かない）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioCounts {
+    /// 最後の表示の範囲の描画の数（描いたチャンク・ノード・全体に落ちた回数など）。
+    pub area: AreaStats,
+    /// 元（文書の入力）の源の読みの数（遅延の入力だけ。丸ごと読んだ値は None）。
+    pub source: Option<SourceStats>,
+    /// キャッシュが持つ量（入力の源の LRU の上限を含む）と、その上限。
+    pub cache_bytes: u64,
+    pub cache_capacity: u64,
+    /// 持ち続ける表示の値・波形の段（`CacheLease::extra`）。
+    pub extra: u64,
+    /// キャッシュの分の確保（描いていない間。上限と今の大きさの大きいほう ＋ extra）。
+    pub lease_bytes: u64,
 }
 
 /// 音声の出力の形の (rate, channels, frames)。長さの分からないものは None。
@@ -289,6 +310,9 @@ impl Editor {
             }
             Err(e) => return failed(EditorError::from_engine("表示を描けません", e)),
         };
+        if let Some(a) = st.audio.as_mut() {
+            a.last_area = vr.area;
+        }
         if vr.area.fallbacks > 0 {
             tracing::warn!(
                 fallbacks = vr.area.fallbacks,
@@ -374,6 +398,28 @@ impl Editor {
             ms: started.elapsed().as_secs_f64() * 1000.0,
         };
         Ok(ViewOutcome::Shown(ViewInfo::Audio(Box::new(info))))
+    }
+
+    /// 測るための数（[`AudioCounts`]。描いている途中なら描き終えるまで待つ）。音声のエディタでなければ・閉じていれば None。
+    pub fn audio_counts(&self) -> Option<AudioCounts> {
+        let guard = self.lock_state();
+        let st = guard.as_ref()?;
+        let audio = st.audio.as_ref()?;
+        let source = match st.inputs.get(&InputId(0)).map(|i| &i.value) {
+            Some(Value::Audio(a)) if a.frames() > 0 => match a.chunk(0, 0) {
+                Ok(Chunk::Source(r)) => Some(r.src.stats()),
+                _ => None,
+            },
+            _ => None,
+        };
+        Some(AudioCounts {
+            area: audio.last_area,
+            source,
+            cache_bytes: st.cache.bytes(),
+            cache_capacity: st.cache.capacity(),
+            extra: st.lease.extra(),
+            lease_bytes: st.lease.bytes(),
+        })
     }
 
     /// 持ち続ける表示の値（公開した今と直前）・波形の段（公開した 2 つと組んでいる途中のもの）を、エディタの確保の `extra`

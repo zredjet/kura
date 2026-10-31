@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kura_engine::budget::{Class, Lease, MemoryBudget, default_total};
 use kura_engine::doc::InputId;
@@ -61,6 +62,9 @@ pub struct EngineRuntime {
     preview: ThreadPool,
     bulk: ThreadPool,
     budget: Arc<MemoryBudget>,
+    /// エディタの確保（[`EngineRuntime::admit_preview`]）で通した見積もりのピークの最大（測るための数。
+    /// [`EngineRuntime::take_admitted_peak`]。値・確保には効かない）。
+    admitted_peak: AtomicU64,
 }
 
 fn pool(threads: usize, name: &'static str) -> Result<ThreadPool> {
@@ -90,6 +94,7 @@ impl EngineRuntime {
                 cfg.budget
                     .unwrap_or_else(|| default_total(cfg.physical_memory)),
             ),
+            admitted_peak: AtomicU64::new(0),
         })
     }
 
@@ -181,7 +186,16 @@ impl EngineRuntime {
     ) -> std::result::Result<MemoryEstimate, EngineError> {
         outside_the_pools("予算は、編集のプールの外で確保します");
         let spec = spec.tasks(self.preview_threads() as u64);
-        self.engine.admit_cached(plan, &spec, inputs, cache, held)
+        let estimate = self.engine.admit_cached(plan, &spec, inputs, cache, held)?;
+        self.admitted_peak
+            .fetch_max(estimate.peak, Ordering::Relaxed);
+        Ok(estimate)
+    }
+
+    /// 前に読んでから [`EngineRuntime::admit_preview`] で通した見積もりのピークの最大を読み、0 に戻す（測るための数：
+    /// エディタの 1 手・裏の仕事が描く前に確保した量。A18・devtools の `mem_smoke`。値・確保には効かない）。
+    pub fn take_admitted_peak(&self) -> u64 {
+        self.admitted_peak.swap(0, Ordering::Relaxed)
     }
 }
 

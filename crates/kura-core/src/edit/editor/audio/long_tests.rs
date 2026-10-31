@@ -4,6 +4,11 @@
 //! ラウドネスを裏の仕事で流して計る時間も出す。
 //!
 //! `cargo test --release -p kura-core --lib sixty_minutes -- --ignored --nocapture`
+//!
+//! 段 4C の A18（F15）：同じ WAV を 48 チャンクの区間の表示で開き、gain・fade・trim の終わり・ループ点の手を当てて、描いたのが
+//! 区間の分だけ・源の読みが区間の分だけ・持ち続ける分が 70 MiB 以下・閉じると取り置き・確保・作業用のファイルが 0 を確かめる。
+//!
+//! `cargo test --release -p kura-core --lib a18_ -- --ignored --nocapture`
 
 use std::io::Write;
 use std::sync::Arc;
@@ -15,8 +20,9 @@ use rusqlite::params;
 use serde_json::json;
 
 use super::measure::{LoudnessState, measure};
+use super::peaks::PEAKS_SYNC_FRAMES;
 use super::session_tests::*;
-use crate::edit::editor::{AudioViewport, Viewport};
+use crate::edit::editor::{AudioViewport, Step, Viewport};
 
 const RATE: u64 = 48_000;
 
@@ -289,4 +295,277 @@ fn sixty_minutes_flac_from_a_work_file() {
     );
     let id = insert(&env, hash, "flac", size);
     steps_and_measure(&env, id, "FLAC");
+}
+
+/// A18 の区間：10 分の位置から 48 チャンク（`MAX_VIEW_CHUNKS`。区間で頼める上限で、持ち続ける表示の値がいちばん大きい形）。
+const A18_AREA: u64 = super::MAX_VIEW_CHUNKS as u64;
+
+/// A18 の 1 手のあとの数（区間だけを描き、全体に落ちない）を確かめ、表を出す。返すのは数。
+fn a18_check(
+    env: &Env,
+    s: &str,
+    what: &str,
+    t: Instant,
+    out: &crate::edit::editor::StepOutcome,
+    nodes: u64,
+    area: (u64, u64),
+) -> super::AudioCounts {
+    assert!(out.rejected.is_none(), "{what}: {:?}", out.rejected);
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    let info = shown_audio(&out.view);
+    let counts = env.editor(s).audio_counts().unwrap();
+    let a = counts.area;
+    println!(
+        "[A18] {what}：往復 {ms:.1} ms・描いたチャンク {}（範囲 {}・全体 {}・共有 {}・継ぎはぎ {}・落ちた {}）・有効 {:?}・\
+         源の読み {:?}・extra {:.1} MiB・キャッシュ {:.1} MiB・波形の段 pending {}",
+        a.drawn_chunks,
+        a.region_nodes,
+        a.full_nodes,
+        a.shared_chunks,
+        a.reused_chunks,
+        a.fallbacks,
+        info.valid,
+        counts.source,
+        counts.extra as f64 / MIB,
+        counts.cache_bytes as f64 / MIB,
+        info.peaks.pending,
+    );
+    assert_eq!(a.fallbacks, 0, "{what}: 範囲の描画が全体に落ちた");
+    assert_eq!(a.full_nodes, 0, "{what}: 全体を描いたノードがある");
+    assert!(
+        a.drawn_chunks <= nodes * A18_AREA,
+        "{what}: 描いたチャンク {} > ノード {nodes} × 区間 {A18_AREA}",
+        a.drawn_chunks
+    );
+    let valid: u64 = info.valid.iter().map(|(x, y)| y - x).sum();
+    assert!(
+        info.valid.iter().all(|(x, y)| area.0 <= *x && *y <= area.1) && valid <= A18_AREA * C,
+        "{what}: 公開した表示が区間の外を持つ: {:?}",
+        info.valid
+    );
+    assert!(
+        counts.extra <= A18_EXTRA,
+        "{what}: 持ち続ける分 {} バイト > 70 MiB",
+        counts.extra
+    );
+    counts
+}
+
+/// 持ち続ける分の上限（design-stage46.md §1.7 の「区間の表示 24 MiB × 2 ＋ 段 3 つ 22 MB で 70 MB 程度」）。
+const A18_EXTRA: u64 = 70 << 20;
+const MIB: f64 = (1u64 << 20) as f64;
+
+/// 源の読みの数（遅延の入力の源）。
+fn reads(env: &Env, s: &str) -> u64 {
+    env.editor(s)
+        .audio_counts()
+        .and_then(|c| c.source)
+        .expect("遅延の入力")
+        .reads
+}
+
+/// A18（F15。docs/editing.md §12.12）：60 分（48 kHz ステレオ・16 ビットの WAV）を、10 分の位置から 48 チャンクの区間の表示で
+/// 開き、gain・fade・trim の終わり・ループ点の手（足す・引数を変える）を当てる。
+///
+/// - 描くのは区間の分だけ：どの手も、表示の範囲の描画が全体に落ちず（`fallbacks`・`full_nodes` が 0）、描いたチャンクがノード
+///   × 区間のチャンク以下で、公開した表示の有効な区間は区間の中だけ。
+/// - 源の読みは区間の分だけ：開いて 8 手を当てるまでに源から読んだチャンクが区間のチャンク以下（全体は 2,637 チャンク）。
+///   波形の段を作り直したあとの fade の手は、区間 ＋ 手の中で直す波形の段の汚れ（`PEAKS_SYNC_FRAMES`）まで、gain の手は
+///   区間まで。
+/// - 持ち続ける分（`extra`）：手のあとも、裏の仕事で 60 分の波形の段を作り直す間（公開した全段の段 2 つを持ったまま組み直す
+///   gain のあとを含む）も 70 MiB 以下。
+/// - 閉じると取り置き・対話・持ち続ける分・作業用のファイルが 0。
+#[test]
+#[ignore = "60 分の WAV（約 660 MB）を一時に書く。--release で回す"]
+fn a18_sixty_minutes_one_step_draws_only_the_spans() {
+    let env = Env::with(Arc::new(Budgeted(2 << 30)));
+    let frames = 60 * 60 * RATE;
+    let tmp = env.lib.layout().staging_dir().join("long.wav");
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    let hash = write_wav(&tmp, frames);
+    let path = env.lib.layout().content_path(&hash, "wav");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    let id = insert(
+        &env,
+        hash,
+        "wav",
+        std::fs::metadata(&path).unwrap().len() as i64,
+    );
+
+    let at = 10 * 60 * RATE / C * C;
+    let area = (at, at + A18_AREA * C);
+    let vp = Viewport::Audio(AudioViewport {
+        visible: Some(area),
+        spans: vec![area],
+        work: false,
+        ..AudioViewport::idle()
+    });
+    let t = Instant::now();
+    let opened = env.open_with(id, vp.clone());
+    let s = opened.session.clone();
+    assert!(opened.source.audio.as_ref().unwrap().lazy, "遅延の源で開く");
+    let open_reads = reads(&env, &s);
+    println!(
+        "[A18] 開く：{:.1} ms・源の読み {open_reads}",
+        t.elapsed().as_secs_f64() * 1e3
+    );
+
+    let r = RATE;
+    let steps: Vec<(&str, Step, u64)> = vec![
+        (
+            "gain を足す",
+            add(0, "audio.gain", json!({ "db": -3.0 })),
+            1,
+        ),
+        ("gain の引数", set(1, json!({ "db": -4.0 })), 1),
+        (
+            "fade を足す",
+            add(
+                1,
+                "audio.fade",
+                json!({ "fadeIn": r, "fadeOut": 0, "curve": "linear" }),
+            ),
+            2,
+        ),
+        (
+            "fade の長さ",
+            set(
+                2,
+                json!({ "fadeIn": 2 * r, "fadeOut": 0, "curve": "linear" }),
+            ),
+            2,
+        ),
+        (
+            "trim（終わり）を足す",
+            add(2, "audio.trim", json!({ "start": 0, "end": frames - r })),
+            3,
+        ),
+        (
+            "trim の終わり",
+            set(3, json!({ "start": 0, "end": frames - 2 * r })),
+            3,
+        ),
+        (
+            "ループ点を足す",
+            add(
+                3,
+                "audio.set_loop",
+                json!({ "loop": { "start": at, "end": at + r } }),
+            ),
+            4,
+        ),
+        (
+            "ループ点",
+            set(
+                4,
+                json!({ "loop": { "start": at + r / 2, "end": at + 3 * r / 2 } }),
+            ),
+            4,
+        ),
+    ];
+    for (what, step, nodes) in steps {
+        let t = Instant::now();
+        let out = env.step(&s, vec![step], &vp);
+        a18_check(&env, &s, what, t, &out, nodes, area);
+    }
+    let step_reads = reads(&env, &s);
+    println!("[A18] 開いて 8 手を当てるまでの源の読み：{step_reads} チャンク（区間 {A18_AREA}）");
+    assert!(
+        step_reads <= A18_AREA,
+        "源の読み {step_reads} チャンク > 区間 {A18_AREA} チャンク"
+    );
+
+    // 裏の仕事で 60 分の波形の段を作り直す（区間の表示 2 つと、公開した段・組んでいる段を持つ間も 70 MiB 以下）
+    let work = Viewport::Audio(AudioViewport {
+        work: true,
+        ..match vp.clone() {
+            Viewport::Audio(a) => a,
+            Viewport::Image(_) => unreachable!(),
+        }
+    });
+    let background = |when: &str| {
+        let before = reads(&env, &s);
+        let t = Instant::now();
+        let mut calls = 0u32;
+        let mut max_extra = 0u64;
+        loop {
+            calls += 1;
+            let out = env.step(&s, Vec::new(), &work);
+            let info = shown_audio(&out.view);
+            let extra = env.editor(&s).audio_counts().unwrap().extra;
+            max_extra = max_extra.max(extra);
+            assert!(
+                extra <= A18_EXTRA,
+                "裏の仕事（{when}）：持ち続ける分 {extra} バイト > 70 MiB"
+            );
+            if !info.peaks.pending {
+                break;
+            }
+            assert!(calls < 10_000, "波形の段を作り直せません");
+        }
+        println!(
+            "[A18] 裏の仕事（{when}・波形の段の作り直し）：{calls} 回・{:.2} 秒・源の読み {}・extra の最大 {:.1} MiB",
+            t.elapsed().as_secs_f64(),
+            reads(&env, &s) - before,
+            max_extra as f64 / MIB
+        );
+    };
+    background("8 手のあと");
+
+    // 段がそろったあとの fade の手：変わった区間（頭の数チャンク）は手の中で直す
+    let before = reads(&env, &s);
+    let t = Instant::now();
+    let out = env.step(
+        &s,
+        vec![set(
+            2,
+            json!({ "fadeIn": 3 * r, "fadeOut": 0, "curve": "linear" }),
+        )],
+        &vp,
+    );
+    a18_check(&env, &s, "段がそろったあとの fade の長さ", t, &out, 4, area);
+    assert!(
+        !shown_audio(&out.view).peaks.pending,
+        "fade の汚れは手の中で直す"
+    );
+    let sync = PEAKS_SYNC_FRAMES / C;
+    let fade_reads = reads(&env, &s) - before;
+    println!(
+        "[A18] その手の源の読み：{fade_reads} チャンク（区間 {A18_AREA} ＋ 手の中で直す汚れ {sync}）"
+    );
+    assert!(
+        fade_reads <= A18_AREA + sync,
+        "源の読み {fade_reads} チャンク > 区間 {A18_AREA} ＋ {sync}"
+    );
+    // 全体に効く gain の手：区間だけを描き（源の LRU は裏の仕事が流した尾を持つので、区間を読み直す）、段は裏の仕事に回す
+    let before = reads(&env, &s);
+    let t = Instant::now();
+    let out = env.step(&s, vec![set(1, json!({ "db": -5.0 }))], &vp);
+    a18_check(&env, &s, "段がそろったあとの gain の引数", t, &out, 4, area);
+    assert!(
+        shown_audio(&out.view).peaks.pending,
+        "gain の段は裏の仕事で直す"
+    );
+    let gain_reads = reads(&env, &s) - before;
+    assert!(
+        gain_reads <= A18_AREA,
+        "gain の手の源の読み {gain_reads} チャンク > 区間 {A18_AREA}"
+    );
+    // 公開した段 2 つ（どちらも全段）を持ったまま組み直す：持ち続ける分がいちばん大きくなる形
+    background("gain のあと");
+
+    crate::edit::editor::close(&env.engine, &s);
+    let u = env.usage();
+    assert_eq!(
+        (u.reserved, u.interactive, u.standing),
+        (0, 0, 0),
+        "閉じたら取り置き・確保・持ち続ける分は 0"
+    );
+    assert_eq!(
+        env.engine.work_pcm().usage(),
+        (0, 0),
+        "作業用のファイルは 0"
+    );
+    assert!(env.engine.current_editor().is_none());
 }
