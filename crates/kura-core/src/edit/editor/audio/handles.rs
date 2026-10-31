@@ -109,8 +109,9 @@ const UNMAPPABLE: &str = "後ろの操作で時間が写せないので、ハン
 /// 入力の長さ、`now` はノードの今の引数（頭の文書。末尾に足すときは null）。
 ///
 /// - 動かさなかった側（今の引数を下流で写した位置、つまり印と同じ値）は今の引数のまま（往復の丸めでずらさない）。
-/// - 区間の終わり（trim の end・ループの end）が、入力の終わりを下流で写した位置（`forward_end(in_frames)`。出力の終わり）
-///   以上なら入力の終わりにする（trim は end: null）。下げるレートの往復は、入力の長さを超えたり手前に戻ったりするため。
+/// - 区間の終わり（trim の end・ループの end・フェードインの終わり）は `back_end` で戻す。入力の終わりを下流で写した位置
+///   （`forward_end(in_frames)`。出力の終わり）以上なら入力の終わりにする（trim は end: null）。下げるレートの往復は、
+///   入力の長さを超えたり手前に戻ったりするため。
 fn handle_params(
     handle: &Handle,
     down: &[TimeLink],
@@ -145,7 +146,8 @@ fn handle_params(
             }
             json!({ "start": s, "end": (e != in_frames).then_some(e) })
         }
-        Handle::FadeIn { end } => json!({ "fadeIn": back(end)?.min(in_frames) }),
+        // フェードインの長さは区間の終わり（含まない位置）なので、印（forward_end）と対になる back_end で戻す
+        Handle::FadeIn { end } => json!({ "fadeIn": end_of(end, None)?.min(in_frames) }),
         Handle::FadeOut { start } => {
             let s = back(start)?;
             json!({ "fadeOut": in_frames.saturating_sub(s) })

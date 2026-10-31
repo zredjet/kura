@@ -629,3 +629,45 @@ fn the_trim_tool_widens_an_earlier_trim() {
         assert_eq!(params(&env, &s, 1), json!({ "start": 1_000, "end": 2_000 }));
     }
 }
+
+/// フェードインの終わりは区間の終わり（含まない位置）として戻す：下流の trim の出力の終わりへも動かせる。
+#[test]
+fn fade_in_can_reach_the_end_of_a_downstream_trim() {
+    let env = Env::new();
+    let (s, marks) = open_with_nodes(
+        &env,
+        8_000,
+        3 * C,
+        vec![
+            add(
+                0,
+                "audio.fade",
+                json!({ "fadeIn": 1_500, "fadeOut": 0, "curve": "linear" }),
+            ),
+            add(1, "audio.trim", json!({ "start": 1_000, "end": 2_000 })),
+        ],
+        None,
+    );
+    assert_eq!(
+        marks[0],
+        Some(Marks::Fade {
+            in_end: Some(500),
+            out_start: None
+        })
+    );
+    // 出力の終わり（1,000）＝ trim の終わり 2,000 まで掛ける
+    let out = env.step(
+        &s,
+        vec![handle(Handle::FadeIn { end: 1_000 }, Some(1), STEP)],
+        &Viewport::audio_idle(),
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    assert_eq!(params(&env, &s, 1)["fadeIn"], json!(2_000));
+    assert_eq!(
+        shown_audio(&out.view).nodes[0].marks,
+        Some(Marks::Fade {
+            in_end: Some(1_000),
+            out_start: None
+        })
+    );
+}
