@@ -1,7 +1,9 @@
 //! 音声のエディタ（M13 段 4。docs/editing.md §12.8・§12.10・§12.12）：開く・表示の範囲・表示の情報・予算。
 //!
 //! - **開く**（[`source`]）：WAV・AIFF・アンカーは遅延の源で開き、全体を読まない（`CodecSet::open_audio_source`）。ほかの形式は
-//!   段 2 が入るまで丸ごと読む（min(取り置き/2, 512 MiB) まで）。開くときに M11 の試聴の置き場を空にする。
+//!   値が min(64 MiB, 丸ごと読む上限 min(取り置き/2, 512 MiB)) 以下なら丸ごと読み、超えれば作業用のファイル（`WorkPcmStore`）に
+//!   流して書いてから遅延の源で開く（段 4B）。開くときに M11 の試聴の置き場を空にする（試聴が持つ作業用のファイルは開き
+//!   終えるまで残し、同じ元ならエディタが使い回す）。
 //! - **表示の範囲**（[`view_area`]）：出力の値が [`WHOLE_VIEW_BYTES`] 以下なら全体（中間のノードも `Exact` でキャッシュに
 //!   入り、PCM・波形・計りが手の中で済む）。それより長ければ、フロントが頼む区間（`spans`）だけをチャンクに揃えて、合わせて
 //!   [`MAX_VIEW_CHUNKS`] まで。`visible` は描く範囲に入れない。
@@ -29,6 +31,8 @@ mod session_tests;
 pub mod snap;
 pub(crate) mod source;
 pub mod timeline;
+#[cfg(test)]
+mod work_tests;
 
 use std::time::Instant;
 

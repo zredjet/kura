@@ -7,8 +7,17 @@
 //! 2. **WAV・AIFF**（`open_audio_source` が Some を返すもの）：遅延の源で開く。DB の事実の行（`media_facts`）のデコーダが開いた
 //!    デコーダと同じで、文書の入力の読み方が既定なら、その値のダイジェストで記録（`DecodeStamp`。固定の段・再現する）を作る。
 //!    そうでなければ記録はなく、指紋は派生（`Fingerprint::derive("audio-source", 元の中身, デコーダと読み方)`）。
-//! 3. **それ以外**（FLAC・Ogg・MP3・AAC・Platform・External、A-law の WAV など）：段 2 が入るまで、今の道で丸ごと読む。読む前に、
-//!    値が [`whole_limit`]（min(取り置き/2, 512 MiB)。48 kHz ステレオで約 23 分）を超えれば TooLarge。
+//! 3. **それ以外**（FLAC・Ogg・MP3・AAC・Platform・External、A-law の WAV など）：値が [`work_threshold`]（min(64 MiB,
+//!    丸ごと読む上限 [`whole_limit`]）以下なら今の道で丸ごと読み、超えれば作業用のファイル（`WorkPcmStore`。封をした f32 WAV＝
+//!    アンカーの形）に流して書いてから遅延の源で開く（[`make_work`]・[`open_work`]。M13 段 4B）。記録は流れのダイジェストから
+//!    作ったもの（作業用のファイルの封の記録）で、丸ごと読んだときと同じ値・同じ記録・同じ指紋になる。作業用のファイルの参照
+//!    （[`WorkRef`]）は `InputInfo` が持ち、閉じると落ちて、ほかに使い手（試聴の `/pcm`・保存）がなければ消える。
+//!    - 作る間の予算は対話の枠で**待たずに**確保する（予算の全体を超えれば TooLarge、空いていなければ Busy）。見積もりは段ごと
+//!      （`CodecSet::shape_path_staged` でその段の形を読む分を確保し直して形を読み、形を読めた段の `stage_stream_work_bytes` ＋
+//!      窓 ＋ ダイジェスト ＋ 書き手の作業列で確保し直して、その段で流して読む。その段が `Unsupported` なら次の段で形から読み
+//!      直す。段 2 の解析のジョブと同じ考え方）。中止は呼び手の見張り（エディタは `editor.cancel`）。
+//!    - アンカーがあって遅延で使えなかったものは、設計どおり今の道（記録のデコーダで読み直す）に落ち、丸ごと読む上限を超えれば
+//!      TooLarge のまま。
 //!
 //! 遅延の値の源の LRU の上限は [`lru_bytes`]（max(64 MiB, プレビューのスレッド × 4 チャンク × ch × 256 KiB) を、音声の全体の値と
 //! 取り置きの 1/4 で頭打ち）。入力は `register_external` で数える（源 1 つにつき LRU の上限を 1 回）ので、読む段の予算
@@ -19,35 +28,64 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use kura_engine::audio::digest::PcmTreeDigest;
 use kura_engine::audio::source::Opener;
-use kura_engine::budget::default_reserved;
-use kura_engine::codec::{CodecSet, DecodeStamp, ReadSeek, Tier, anchor};
+use kura_engine::budget::{Class, Lease, MemoryBudget, default_reserved};
+use kura_engine::codec::anchor::AnchorContext;
+use kura_engine::codec::stream::stream_window_bytes;
+use kura_engine::codec::wav::F32WavWriter;
+use kura_engine::codec::{CodecSet, DecodeStamp, PickedStage, ReadSeek, Tier, anchor};
 use kura_engine::doc::DecodeOptions;
 use kura_engine::render::cache::{Fingerprint, FingerprintedInput};
 use kura_engine::value::AUDIO_CHUNK;
-use kura_engine::{Digest, EngineError, Limits, Shape, Value};
+use kura_engine::{Digest, EngineError, Limits, Monitor, Shape, Value};
 use rusqlite::{Connection, OptionalExtension};
 
 use super::super::EditorError;
+use crate::CoreError;
+use crate::edit::EngineRuntime;
 use crate::edit::anchors::Anchor;
+use crate::edit::work_pcm::{WorkHandle, WorkKey, WorkPcmStore};
 
 /// 丸ごと読む音声の上限の頭打ち（バイト）。
 pub const WHOLE_READ_CAP: u64 = 512 << 20;
 /// 源の LRU の上限の下限（バイト）。
 pub const LRU_FLOOR: u64 = 64 << 20;
+/// 直接読めない形式の音声を作業用のファイルにする値の大きさの頭打ち（バイト。これを超えれば作業用のファイル）。
+pub const WORK_ABOVE: u64 = 64 << 20;
+
+/// 作業用のファイルの参照（`InputInfo`・試聴の置き場が持つ。落とすと参照が減り、0 になれば消える）。
+#[derive(Clone)]
+pub(crate) struct WorkRef(pub(crate) Arc<WorkHandle>);
+
+impl WorkRef {
+    /// 作業用のファイルの場所。
+    pub(crate) fn path(&self) -> &Path {
+        &self.0.pcm().path
+    }
+}
+
+impl std::fmt::Debug for WorkRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WorkRef").field(&self.path()).finish()
+    }
+}
 
 /// 開いた音声の入力の要約（`AudioState` が持つ）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct InputInfo {
     pub rate: u32,
     pub channels: u16,
     pub frames: u64,
     /// 値を読んだデコーダの識別子（`/edit/{s}/input/pcm` の kura チャンクに入れる）。
     pub decoder: String,
-    /// 遅延の源で開いた（全体を読んでいない）。
+    /// 遅延の源で開いた（全体を読んでいない。作業用のファイルから開いたものも真）。
     pub lazy: bool,
     /// 読み取りの記録（分からなければ None。段 3 の貸し出しで使う）。
     pub decoded: Option<DecodeStamp>,
+    /// 作業用のファイル（直接読めない形式の長い音声。持つことで寿命を決め、閉じると落ちる。段 4C の貸し出しで読む）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub work: Option<WorkRef>,
 }
 
 /// 開いた音声。
@@ -97,6 +135,12 @@ pub(crate) fn read_facts_stamp(
 /// 丸ごと読む音声の値の上限：min(取り置き/2, 512 MiB)。
 pub fn whole_limit(budget_total: u64) -> u64 {
     (default_reserved(budget_total) / 2).min(WHOLE_READ_CAP)
+}
+
+/// 直接読めない形式の音声を丸ごと読むか作業用のファイルにするかの境：min(64 MiB, 丸ごと読む上限)。値がこれを超えれば作業用の
+/// ファイル（実機の予算では 64 MiB。小さな予算で、丸ごと読む上限と 64 MiB の間の長さを断らないよう頭打ちにする）。
+pub fn work_threshold(budget_total: u64) -> u64 {
+    WORK_ABOVE.min(whole_limit(budget_total))
 }
 
 /// 丸ごと読む前の確かめ：値が [`whole_limit`] を超えれば TooLarge（「約 N 分まで」はその形のレート・チャンネルで数える）。
@@ -197,6 +241,7 @@ fn opened(
         decoder: decoder.to_string(),
         lazy: true,
         decoded: decoded.clone(),
+        work: None,
     };
     let fp = fingerprint(source, decoder, opts, decoded.as_ref());
     Ok(OpenedAudio {
@@ -294,6 +339,267 @@ pub(crate) fn open_lazy(cx: &LazyCx<'_>) -> Result<Option<OpenedAudio>, EditorEr
             env: None,
         });
     opened(o.value, cx.source, o.decoder, cx.opts, decoded).map(Some)
+}
+
+/// 作業用のファイルを作る・開く材料（エディタと試聴の `/pcm` が使う）。
+pub(crate) struct WorkCx<'a> {
+    pub runtime: &'a EngineRuntime,
+    pub codecs: &'a CodecSet,
+    pub store: &'a WorkPcmStore,
+    /// 元のファイルとその中身・形式・読み方。
+    pub path: &'a Path,
+    pub source: Digest,
+    pub format: &'a str,
+    pub opts: &'a DecodeOptions,
+    pub limits: &'a Limits,
+    /// 中止（エディタは閉じる・ほかを開くで止まる `editor.cancel`）。
+    pub mon: &'a dyn Monitor,
+}
+
+impl WorkCx<'_> {
+    /// 作業用のファイルの鍵（元の中身・形式・読み方。デコーダは段の順）。エディタと試聴の `/pcm` で同じなので、どちらかが
+    /// 作ったものをもう一方が使い回す。
+    pub(crate) fn key(&self) -> WorkKey {
+        WorkKey {
+            source: self.source.0,
+            format: self.format.to_string(),
+            options: self.opts.clone(),
+            decoder: None,
+        }
+    }
+}
+
+/// 対話の枠で待たずに確保する（0 なら確保しない。予算の全体を超えれば TooLarge、今すぐ確保できなければ Busy）。
+fn admit(budget: &Arc<MemoryBudget>, need: u64, what: &str) -> Result<Option<Lease>, EditorError> {
+    if need == 0 {
+        return Ok(None);
+    }
+    if need > budget.total() {
+        return Err(EditorError::TooLarge(format!(
+            "{what}のにメモリの予算を超えます（見積もり {need} バイト。予算は {} バイト）",
+            budget.total()
+        )));
+    }
+    match budget.try_acquire(need, Class::Interactive) {
+        Ok(Some(lease)) => Ok(Some(lease)),
+        Ok(None) => Err(EditorError::Busy(format!(
+            "{what}メモリ（{need} バイト）が空いていません。少し待ってからやり直してください"
+        ))),
+        Err(e) => Err(EditorError::Busy(e.to_string())),
+    }
+}
+
+/// 段の順に元の形を読む（`after` の段より後ろから。`CodecSet::shape_path_staged`）。段ごとに、その段で形を読む分を対話の枠で
+/// 待たずに確保し直してから読み、読み終えたら返す。予算で断ったら外側の Err（Busy・TooLarge）、読めなければ内側の Err。
+pub(crate) fn read_shape_staged(
+    cx: &WorkCx<'_>,
+    after: Option<&str>,
+) -> Result<Result<(Shape, PickedStage), EngineError>, EditorError> {
+    let budget = cx.runtime.budget();
+    let mut lease: Option<Lease> = None;
+    let mut refused: Option<EditorError> = None;
+    let read = cx.runtime.preview(|_| {
+        cx.codecs.shape_path_staged(
+            cx.path,
+            cx.format,
+            cx.opts,
+            cx.limits,
+            cx.mon,
+            after,
+            &mut |stage| {
+                lease = None;
+                match admit(budget, stage.shape_bytes, "元の形を読む") {
+                    Ok(l) => {
+                        lease = l;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        refused = Some(e);
+                        Err(EngineError::Canceled)
+                    }
+                }
+            },
+        )
+    });
+    drop(lease);
+    if let Some(e) = refused {
+        return Err(e);
+    }
+    Ok(read)
+}
+
+/// 形 `shape` を段 `stage` で流して作業用のファイルに書く間の見積もり：その段の流れの作業領域（読み手が持つ埋め込みの画像
+/// などを含む。`stage_stream_work_bytes`）＋ 窓 1 つ ＋ 値のダイジェストの作業列（プレビューのプールの仕事の数ぶん）＋ 書き手の
+/// 作業列。流して読む段も形を読み直すので、形を読む分も覆う。
+pub(crate) fn work_bytes(cx: &WorkCx<'_>, stage: &PickedStage, shape: &Shape) -> u64 {
+    let Shape::Audio {
+        channels, frames, ..
+    } = *shape
+    else {
+        return u64::MAX;
+    };
+    let len = std::fs::metadata(cx.path).map(|m| m.len()).unwrap_or(0);
+    let ch = usize::from(channels);
+    cx.codecs
+        .stage_stream_work_bytes(stage, cx.format, shape, len)
+        .saturating_add(stream_window_bytes(ch, frames.max()))
+        .saturating_add(PcmTreeDigest::work_bytes(
+            ch,
+            cx.runtime.preview_threads() as u64,
+        ))
+        .saturating_add(F32WavWriter::<File>::work_bytes())
+        .max(stage.shape_bytes)
+}
+
+/// 置き場に渡す、同じ種類の誤り（読みの誤りそのものは呼び手が覚える。`EngineError` は `Clone` でない）。
+fn same_kind(e: &EngineError) -> EngineError {
+    match e.root() {
+        EngineError::Canceled => EngineError::Canceled,
+        EngineError::Unsupported(m) => EngineError::Unsupported(m.clone()),
+        EngineError::Limit(m) => EngineError::Limit(m.clone()),
+        other => EngineError::Internal(other.to_string()),
+    }
+}
+
+/// 置き場の誤り（読みの誤りでないもの：空き・書き込み・封）をエディタの誤りに。
+fn work_error(e: CoreError) -> EditorError {
+    match e {
+        CoreError::TooLarge(m) => EditorError::TooLarge(m),
+        CoreError::Invalid(m) | CoreError::Unsupported(m) => {
+            EditorError::Failed(format!("作業用のファイルを作れません：{m}"))
+        }
+        other => EditorError::Core(other),
+    }
+}
+
+/// 作業用のファイルを用意する（`WorkPcmStore::ensure`。同じ鍵の封をし終えたものがあれば使い回し、読まない）。形 `shape` を読めた
+/// 段 `stage` の見積もり（[`work_bytes`]）を対話の枠で待たずに確保して、その段で流して読む。その段が読めない
+/// （`Unsupported`）なら次の段で形を読み直して確保し直す（段 2 の解析のジョブと同じ）。中止は `cx.mon`（Canceled）。
+pub(crate) fn make_work(
+    cx: &WorkCx<'_>,
+    shape: Shape,
+    stage: PickedStage,
+) -> Result<WorkHandle, EditorError> {
+    let key = cx.key();
+    if let Some(h) = cx.store.find(&key) {
+        return Ok(h);
+    }
+    let (mut shape, mut stage) = (shape, stage);
+    loop {
+        let need = work_bytes(cx, &stage, &shape);
+        let lease = admit(cx.runtime.budget(), need, "元を作業用のファイルにする")?;
+        let acx = AnchorContext {
+            source: Some(cx.source),
+            format: Some(cx.format.to_string()),
+            options: cx.opts.clone(),
+        };
+        let id = stage.id;
+        // 読みの誤りは、置き場の誤りに写される前の形で覚える（道具がない・中止・次の段へ回す、を見分ける）
+        let mut read_err: Option<(EditorError, bool)> = None;
+        let made = cx.runtime.preview(|_| {
+            cx.store.ensure(
+                &key,
+                &shape,
+                acx,
+                |sink| match cx.codecs.decode_stream_with_path(
+                    id, cx.path, cx.format, cx.opts, cx.limits, sink, cx.mon,
+                ) {
+                    Ok(stamp) => Ok(stamp),
+                    Err(e) => {
+                        let next = matches!(e.root(), EngineError::Unsupported(_));
+                        let kind = same_kind(&e);
+                        read_err = Some((EditorError::from_engine("元を読めません", e), next));
+                        Err(kind)
+                    }
+                },
+                cx.limits,
+                cx.mon,
+            )
+        });
+        drop(lease);
+        let err = match made {
+            Ok(h) => return Ok(h),
+            Err(e) => e,
+        };
+        if cx.mon.canceled() {
+            return Err(EditorError::Canceled);
+        }
+        let (read, next) = match read_err {
+            Some(r) => r,
+            None => return Err(work_error(err)),
+        };
+        if !next {
+            return Err(read);
+        }
+        // この段では読めない：次の段（あれば）で形を読み直す。次の段がない・次の段も読めなければ、この段の誤り
+        match read_shape_staged(cx, Some(id))? {
+            Ok((s, st)) => {
+                shape = s;
+                stage = st;
+            }
+            Err(e) if matches!(e.root(), EngineError::Unsupported(_)) => return Err(read),
+            Err(e) => return Err(EditorError::from_engine("元の大きさを読めません", e)),
+        }
+    }
+}
+
+/// 作業用のファイルを遅延の源で開いたもの。
+pub(crate) struct OpenedWork {
+    /// 遅延の値（メタデータは封の値＝流れの終わりのメタデータ）。
+    pub value: Value,
+    /// 元を読んだ記録（封の記録。値のダイジェストは流れのダイジェスト）。
+    pub decoded: DecodeStamp,
+    pub work: WorkRef,
+}
+
+/// 作業用のファイルを遅延の源で開く（`anchor::open_source`。源の LRU は [`lru_bytes`]）。
+pub(crate) fn open_work(
+    handle: WorkHandle,
+    limits: &Limits,
+    threads: usize,
+    budget_total: u64,
+) -> Result<OpenedWork, EditorError> {
+    let (channels, frames) = match handle.pcm().shape {
+        Shape::Audio {
+            channels, frames, ..
+        } => (channels, frames.max()),
+        _ => {
+            return Err(EditorError::Failed(
+                "作業用のファイルが音声ではありません".into(),
+            ));
+        }
+    };
+    let lru = lru_bytes(threads, channels, frames, budget_total);
+    let opened = anchor::open_source(&handle.opener(), limits, lru)
+        .map_err(|e| EditorError::from_engine("作業用のファイルを開けません", e))?
+        .ok_or_else(|| EditorError::Failed("作業用のファイルが音声ではありません".into()))?;
+    Ok(OpenedWork {
+        value: opened.value,
+        decoded: handle.pcm().decoded.clone(),
+        work: WorkRef(Arc::new(handle)),
+    })
+}
+
+/// 作業用のファイルから開いた入力と要約（エディタの入力。指紋は封の記録の値のダイジェスト＝丸ごと読んだときと同じ）。
+pub(crate) fn work_input(o: OpenedWork, source: Digest) -> Result<OpenedAudio, EditorError> {
+    let Value::Audio(a) = &o.value else {
+        return Err(EditorError::Failed("音声ではありません".into()));
+    };
+    let channels = u16::try_from(a.channels())
+        .map_err(|_| EditorError::Failed("チャンネルが多すぎます".into()))?;
+    let info = InputInfo {
+        rate: a.rate(),
+        channels,
+        frames: a.frames() as u64,
+        decoder: o.decoded.codec.clone(),
+        lazy: true,
+        decoded: Some(o.decoded.clone()),
+        work: Some(o.work),
+    };
+    Ok(OpenedAudio {
+        input: FingerprintedInput::decoded(o.value, source, &o.decoded),
+        info,
+    })
 }
 
 #[cfg(test)]

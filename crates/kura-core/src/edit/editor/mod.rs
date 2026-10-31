@@ -1495,6 +1495,10 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             issues: Vec::new(),
         });
     }
+    // 試聴の置き場が持つ作業用のファイルは、開き終えるまで残す（同じ元ならエディタが使い回す。M13 段 4B）
+    let _pcm_work = (head.kind == MediaKind::Audio)
+        .then(|| env.engine.pcm_cache().work())
+        .flatten();
     if head.kind == MediaKind::Audio {
         // M11 の試聴の置き場が丸ごと読んだ値とその予算を返す（エディタと二重に持たない）
         env.engine.pcm_cache().clear();
@@ -1609,6 +1613,7 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             facts,
             peaks_path: (head.kind == MediaKind::Audio)
                 .then(|| layout.peaks_path(&crate::library::hex(&original.hash))),
+            work_pcm: (head.kind == MediaKind::Audio).then(|| env.engine.work_pcm().clone()),
         },
         &req.viewport,
     );
@@ -1651,6 +1656,8 @@ struct OpenParts {
     facts: Option<audio::source::FactsStamp>,
     /// ライブラリの解析の波形の段のファイル（音声だけ）。
     peaks_path: Option<std::path::PathBuf>,
+    /// 作業用の PCM の置き場（音声だけ。直接読めない形式の長い音声を作業用のファイルから開く）。
+    work_pcm: Option<Arc<crate::edit::work_pcm::WorkPcmStore>>,
 }
 
 /// 元を読み、状態を作って最初の表示を描く。
@@ -1815,7 +1822,8 @@ struct ReadInput {
     warnings: Vec<String>,
 }
 
-/// 元を読む：音声は遅延の源で開けるならそれ（[`audio::source::open_lazy`]）、ほかは今の道（丸ごと読む。音声は上限を確かめる）。
+/// 元を読む：音声は遅延の源で開けるならそれ（[`audio::source::open_lazy`]）、アンカーのない長い音声は作業用のファイル
+/// （[`read_work`]）、ほかは今の道（丸ごと読む。アンカーが遅延で使えなかった音声は上限を確かめる）。
 fn read_input(
     editor: &Editor,
     parts: &OpenParts,
@@ -1844,7 +1852,16 @@ fn read_input(
                 warnings: Vec::new(),
             });
         }
-        // 丸ごと読む前に、長さの上限を確かめる
+        if let (None, Some(store)) = (&parts.anchor, &parts.work_pcm)
+            && let Some(o) = read_work(editor, parts, store, limits)?
+        {
+            return Ok(ReadInput {
+                input: o.input,
+                audio: Some(o.info),
+                warnings: Vec::new(),
+            });
+        }
+        // アンカーが遅延で使えなかったもの：丸ごと読む前に、長さの上限を確かめる
         let shape = runtime
             .preview(|_| {
                 editor.codecs.shape_path_monitored(
@@ -1884,6 +1901,7 @@ fn read_input(
             decoder: read.decoded.codec.clone(),
             lazy: false,
             decoded: Some(read.decoded.clone()),
+            work: None,
         }),
         _ => None,
     };
@@ -1892,6 +1910,54 @@ fn read_input(
         audio,
         warnings: read.warnings,
     })
+}
+
+/// 直接読めない形式（アンカーなし）の音声：値が `work_threshold` を超えれば作業用のファイルにして遅延の源で開く（同じ鍵の
+/// ものがあれば使い回す）。短ければ None（呼び手が丸ごと読む）。作る間の予算は対話の枠で待たずに確保し、閉じる・ほかを
+/// 開くと止まる（`editor.cancel`）。
+fn read_work(
+    editor: &Editor,
+    parts: &OpenParts,
+    store: &crate::edit::work_pcm::WorkPcmStore,
+    limits: &kura_engine::Limits,
+) -> Result<Option<audio::source::OpenedAudio>, EditorError> {
+    let runtime = &editor.runtime;
+    let started = Instant::now();
+    let total = runtime.budget().total();
+    let threads = runtime.preview_threads();
+    let cx = audio::source::WorkCx {
+        runtime,
+        codecs: &editor.codecs,
+        store,
+        path: &parts.original_path,
+        source: parts.source,
+        format: parts.format,
+        opts: &parts.opts,
+        limits,
+        mon: editor.cancel.as_ref(),
+    };
+    let handle = match store.find(&cx.key()) {
+        // 試聴の /pcm が作ったもの（作られるのは長いものだけ）
+        Some(h) => h,
+        None => {
+            let (shape, stage) = audio::source::read_shape_staged(&cx, None)?
+                .map_err(|e| EditorError::from_engine("元の大きさを読めません", e))?;
+            // 短い・音声でない（種類が合わない）ものは今の道へ（丸ごと読み、種類は読んだ値で確かめる）
+            if !matches!(shape, Shape::Audio { .. })
+                || shape.value_bytes() <= audio::source::work_threshold(total)
+            {
+                return Ok(None);
+            }
+            audio::source::make_work(&cx, shape, stage)?
+        }
+    };
+    let opened = audio::source::open_work(handle, limits, threads, total)?;
+    tracing::debug!(
+        path = %opened.work.path().display(),
+        ms = started.elapsed().as_secs_f64() * 1000.0,
+        "元を作業用のファイルから開きました"
+    );
+    audio::source::work_input(opened, parts.source).map(Some)
 }
 
 /// 元の形の要約。

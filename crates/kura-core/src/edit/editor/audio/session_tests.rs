@@ -390,10 +390,11 @@ fn anchored_audio_opens_lazily_with_the_recorded_decoder() {
     }
 }
 
-/// A1：丸ごと読む形式は、値が min(取り置き/2, 512 MiB) を超えれば TooLarge（WAV は遅延なので同じ長さでも開ける）。
+/// A1・A15：丸ごと読む形式は、値が min(64 MiB, 丸ごと読む上限 min(取り置き/2, 512 MiB)) を超えれば、断らずに作業用の
+/// ファイルから遅延で開く（段 4A までは TooLarge だった）。WAV は遅延なので同じ長さでもそのまま開ける。
 #[test]
-fn long_whole_reads_are_refused() {
-    // 予算 16 MiB：取り置き 8 MiB、丸ごと読む上限 4 MiB
+fn long_whole_reads_open_from_a_work_file() {
+    // 予算 16 MiB：取り置き 8 MiB、丸ごと読む上限と作業用のファイルの境は 4 MiB
     let env = Env::with(Arc::new(Budgeted(16 << 20)));
     let value = InputGen::AudioNoise {
         rate: 8_000,
@@ -404,23 +405,18 @@ fn long_whole_reads_are_refused() {
     .generate()
     .unwrap();
     let flac = add_audio(&env.lib, &encode(&value, "flac"), "flac");
-    let err = open(
-        &env.env(),
-        &OpenRequest {
-            item_id: flac,
-            viewport: Viewport::audio_idle(),
-            from_draft: false,
-        },
-    )
-    .unwrap_err();
-    assert!(
-        matches!(&err, EditorError::TooLarge(m) if m.contains("まだエディタで開けません")),
-        "{err}"
-    );
-    assert_eq!(env.usage().reserved, 0, "断ったら取り置きを残さない");
+    let opened = env.open(flac);
+    let a = opened.source.audio.unwrap();
+    assert!(a.lazy, "作業用のファイルから開く");
+    assert_eq!(env.engine.work_pcm().usage().0, 1);
     let wav = add_audio(&env.lib, &encode(&value, "wav"), "wav");
     let opened = env.open(wav);
     assert!(opened.source.audio.unwrap().lazy);
+    assert_eq!(
+        env.engine.work_pcm().usage().0,
+        0,
+        "前のエディタを閉じたら作業用のファイルは消える"
+    );
 }
 
 /// 画像・音声のほかは断る。

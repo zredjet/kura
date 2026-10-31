@@ -12,8 +12,12 @@
 //!   ライブラリごと（[`EngineServices::pcm_cache`]。覚えた確保はそのライブラリの予算のもの）で、ライブラリを閉じると手放す
 //!   （M11 の検証 E2）。
 //! - WAV・AIFF（`CodecSet::open_audio_source` が開けるもの）は、全体を読まずに源（チャンクを読むときにファイルから読む遅延の
-//!   値。M13 段 4）として覚え、予算は源の LRU の上限だけを持つ（値は丸ごと読んだものと同じ）。ほかの形式は丸ごと読む。
-//!   [`PcmCache::decodes`] は「開いた（読んだ）数」。
+//!   値。M13 段 4）として覚え、予算は源の LRU の上限だけを持つ（値は丸ごと読んだものと同じ）。ほかの形式は、値が
+//!   `work_threshold`（min(64 MiB, 丸ごと読む上限)）以下なら丸ごと読み、超えればエディタと同じ鍵の作業用のファイル
+//!   （`WorkPcmStore`。エディタが開いていれば同じファイルを使い回す）を遅延の源で開いて覚える（M13 段 4B。作る間の予算は
+//!   エディタと同じく段ごとの見積もりで、対話の枠で待たずに確保する）。覚えている間は作業用のファイルの参照を持つ。
+//!   値・kura チャンク（ループ点・フレーム数・デコーダの識別子）は丸ごと読んだものと同じ。[`PcmCache::decodes`] は「開いた
+//!   （読んだ）数」。
 //! - ジョブにしない（利用者がその場で待つ短い表示の用意。決定 8）。呼び手が `spawn_blocking` で呼ぶ。予算は対話
 //!   （`Class::Interactive`。待たない）で、足りなければ 503。範囲が音声の外か、浮動小数で 64 MiB を超える長さは 416。
 //!   読むのはエンジンのプレビューのプールの中（`EngineRuntime::preview`）。
@@ -32,6 +36,8 @@ use kura_engine::value::{Audio, AudioSource};
 use kura_engine::{EngineError, Limits, NoMonitor, Value};
 
 use crate::edit::EngineServices;
+use crate::edit::editor::EditorError;
+use crate::edit::editor::audio::source::{self as audio_source, WorkRef};
 use crate::serve::PcmSource;
 
 /// kura チャンクの並びの版。
@@ -225,6 +231,8 @@ struct Entry {
     last_used: Instant,
     /// 覚えている値の分の予算（対話）。捨てると返る。
     _lease: Lease,
+    /// 作業用のファイル（直接読めない形式の長い音声。捨てると参照が減る）。
+    work: Option<WorkRef>,
 }
 
 #[derive(Default)]
@@ -272,6 +280,12 @@ impl PcmCache {
     /// 元を読んだ回数（覚えていたものを使った回数は数えない）。診断とテスト用。
     pub fn decodes(&self) -> u64 {
         self.decodes.load(Ordering::Relaxed)
+    }
+
+    /// 覚えているものが作業用のファイルから開いたものなら、その参照（エディタを開く間に試聴の置き場を空にしても、同じ元の
+    /// ファイルを消さずに使い回すため）。
+    pub(crate) fn work(&self) -> Option<WorkRef> {
+        self.lock().entry.as_ref().and_then(|e| e.work.clone())
     }
 
     /// 覚えているものを手放す（ライブラリを閉じるときなど）。
@@ -434,9 +448,22 @@ fn audio_of(
                 audio: audio.clone(),
                 last_used: Instant::now(),
                 _lease: lease,
+                work: None,
             });
             return Ok((audio, decoder));
         }
+    }
+    // 直接読めない形式の長い音声：作業用のファイル（エディタと同じ鍵。あれば使い回す）を源として開く
+    if shape.value_bytes() > audio_source::work_threshold(runtime.budget().total()) {
+        return work_of(
+            cache,
+            &codecs,
+            runtime,
+            engine.work_pcm(),
+            root,
+            hash,
+            source,
+        );
     }
     let need = shape
         .value_bytes()
@@ -470,8 +497,94 @@ fn audio_of(
         audio: audio.clone(),
         last_used: Instant::now(),
         _lease: lease,
+        work: None,
     });
     Ok((audio, stamp.codec))
+}
+
+/// 作業用のファイルを作る・開く誤り（エディタの誤り）を試聴の誤りに（予算は 503、ほかは 500）。
+fn work_failed(err: EditorError) -> PcmError {
+    match err {
+        EditorError::Busy(m) | EditorError::TooLarge(m) => PcmError::Busy(m),
+        other => PcmError::Failed(other.to_string()),
+    }
+}
+
+/// 直接読めない形式の長い音声を、作業用のファイル（エディタと同じ鍵。エディタが開いていれば同じファイル）から源として開いて
+/// 覚える（予算は源の LRU の上限）。作る間の予算は段ごとの見積もりで、対話の枠で待たずに確保する。
+fn work_of(
+    cache: &Arc<PcmCache>,
+    codecs: &Arc<CodecSet>,
+    runtime: &crate::edit::EngineRuntime,
+    store: &crate::edit::work_pcm::WorkPcmStore,
+    root: &Path,
+    hash: &str,
+    source: &PcmSource,
+) -> Result<(Arc<Audio>, String), PcmError> {
+    let (opts, limits) = (DecodeOptions::default(), Limits::default());
+    let digest = crate::library::parse_hex32(hash).ok_or(PcmError::NotFound)?;
+    let started = Instant::now();
+    let cx = audio_source::WorkCx {
+        runtime,
+        codecs,
+        store,
+        path: &source.path,
+        source: kura_engine::Digest(digest),
+        format: source.format,
+        opts: &opts,
+        limits: &limits,
+        mon: &NoMonitor,
+    };
+    let handle = match store.find(&cx.key()) {
+        Some(h) => h,
+        None => {
+            let (shape, stage) = audio_source::read_shape_staged(&cx, None)
+                .map_err(work_failed)?
+                .map_err(engine_failed)?;
+            audio_source::make_work(&cx, shape, stage).map_err(work_failed)?
+        }
+    };
+    let opened = audio_source::open_work(
+        handle,
+        &limits,
+        runtime.preview_threads(),
+        runtime.budget().total(),
+    )
+    .map_err(work_failed)?;
+    let Value::Audio(audio) = opened.value else {
+        return Err(PcmError::NotFound);
+    };
+    let Shape::Audio { channels, .. } = Value::Audio(audio.clone()).shape() else {
+        return Err(PcmError::NotFound);
+    };
+    let lru = audio_source::lru_bytes(
+        runtime.preview_threads(),
+        channels,
+        audio.frames() as u64,
+        runtime.budget().total(),
+    );
+    let lease = acquire(runtime.budget(), lru)?;
+    cache.decodes.fetch_add(1, Ordering::Relaxed);
+    let decoder = opened.decoded.codec.clone();
+    tracing::debug!(
+        hash,
+        decoder,
+        frames = audio.frames(),
+        path = %opened.work.path().display(),
+        ms = started.elapsed().as_secs_f64() * 1000.0,
+        "試聴の PCM の元を作業用のファイルから開きました"
+    );
+    cache.store(Entry {
+        root: root.to_path_buf(),
+        hash: hash.to_string(),
+        decoder: decoder.clone(),
+        codecs: Arc::downgrade(codecs),
+        audio: audio.clone(),
+        last_used: Instant::now(),
+        _lease: lease,
+        work: Some(opened.work),
+    });
+    Ok((audio, decoder))
 }
 
 /// `/pcm/{hash}/{start}-{end}` の WAV を作る（ブロックする。呼び手が `spawn_blocking` で呼ぶ）。読んだ結果は、そのライブラリの
