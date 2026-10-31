@@ -4,7 +4,8 @@
 //! `--audio-minutes n`（M13 段 3。既定 0。確かめるときは 6）を付けると、親は n 分の合成の FLAC（44.1 kHz ステレオ）も
 //! 取り込み、子は画像と音声を交互に保存する（音声はランダムな gain・fade・normalize・trim を、flac・ogg・wav に流して書く。
 //! 作業用の PCM を通る）。音声の保存は長いので、待つ上限は max(`--max-ms`, n × 1,000 ms) に広げる。確かめに「開き直したあと
-//! `staging/pcm` が空」と「アイテムが 2 個」を足す。
+//! `staging/pcm` が空」と「アイテムが 2 個」を足す。子には音声の長さ（n × 60 × 44,100 フレーム）を `--audio-frames` で渡す
+//! （ランダムな trim の位置を決める。音声のアイテムがあるのに渡されなければ子は失敗する。M13 段 3 の検証の直し）。
 //!
 //! 1. `--library` の場所に新しいライブラリを作る（もう何かあれば断る。本物のライブラリを指さないため。テンポラリや作業用の
 //!    フォルダを渡す）。ドット絵の PNG を 1 つ、アプリと同じ取り込みのジョブで入れる。
@@ -130,7 +131,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
     for run in 0..opts.runs {
         let child_seed = rng.next_u64();
         let delay = opts.min_ms + rng.next_u64() % span;
-        let exited_early = crash_once(&root, child_seed, Duration::from_millis(delay), &log)?;
+        let exited_early = crash_once(
+            &root,
+            child_seed,
+            audio_frames(opts.audio_minutes),
+            Duration::from_millis(delay),
+            &log,
+        )?;
         if exited_early.is_some() {
             early += 1;
         }
@@ -324,10 +331,19 @@ fn create_library(path: &Path, audio_minutes: u64) -> Result<PathBuf, String> {
     Ok(root)
 }
 
-/// 子を起こし、`delay` 待って SIGKILL する。子が先に終わっていれば、その終わり方を返す。
+/// 取り込む合成の音声の長さ（フレーム。`minutes` 分の 44.1 kHz）。
+fn audio_frames(minutes: u64) -> u64 {
+    minutes
+        .saturating_mul(60)
+        .saturating_mul(u64::from(AUDIO_RATE))
+}
+
+/// 子を起こし（音声の長さ `audio_frames` を渡す。0 なら渡さない）、`delay` 待って SIGKILL する。子が先に終わっていれば、
+/// その終わり方を返す。
 fn crash_once(
     root: &Path,
     seed: u64,
+    audio_frames: u64,
     delay: Duration,
     log: &Path,
 ) -> Result<Option<String>, String> {
@@ -338,10 +354,15 @@ fn crash_once(
         .open(log)
         .map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
-    let mut child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .args(["edit", "crash-loop-child", "--library"])
         .arg(root)
-        .args(["--seed", &seed.to_string()])
+        .args(["--seed", &seed.to_string()]);
+    if audio_frames > 0 {
+        command.args(["--audio-frames", &audio_frames.to_string()]);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(err)
@@ -661,11 +682,19 @@ fn random_audio_doc(rng: &mut ChaCha8Rng, frames: u64) -> Result<Graph, String> 
     Ok(g)
 }
 
-/// `edit crash-loop-child`（子）：保存を繰り返す（親が SIGKILL するまで）。GC の時計だけ 8 日進めて開く。音声のアイテムが
-/// あれば、画像と音声を交互に保存する。
-pub fn child(args: &[String]) -> Result<(), String> {
+/// 子の引数。
+#[derive(Debug, PartialEq)]
+struct ChildArgs {
+    library: PathBuf,
+    seed: u64,
+    /// 音声のアイテムの長さ（フレーム。親が渡す。0 は渡されていない）。
+    audio_frames: u64,
+}
+
+fn child_args(args: &[String]) -> Result<ChildArgs, String> {
     let mut library = None;
     let mut seed = 0u64;
+    let mut audio_frames = 0u64;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -676,10 +705,31 @@ pub fn child(args: &[String]) -> Result<(), String> {
                     .and_then(|s| s.parse().ok())
                     .ok_or("--seed の値がありません")?;
             }
+            "--audio-frames" => {
+                audio_frames = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .filter(|n| *n > 0)
+                    .ok_or("--audio-frames の値がありません（1 以上）")?;
+            }
             other => return Err(format!("知らない引数 {other}")),
         }
     }
-    let library = library.ok_or("--library がありません")?;
+    Ok(ChildArgs {
+        library: library.ok_or("--library がありません")?,
+        seed,
+        audio_frames,
+    })
+}
+
+/// `edit crash-loop-child`（子）：保存を繰り返す（親が SIGKILL するまで）。GC の時計だけ 8 日進めて開く。音声のアイテムが
+/// あれば、画像と音声を交互に保存する（音声の長さは親が `--audio-frames` で渡す）。
+pub fn child(args: &[String]) -> Result<(), String> {
+    let ChildArgs {
+        library,
+        seed,
+        audio_frames,
+    } = child_args(args)?;
     let services = crate::services().with_gc_clock(GcClock::shifted(GC_SHIFT_MS));
     let session = LibrarySession::open(&library, quiet(), services)
         .map_err(|e| format!("開けません: {e}"))?;
@@ -690,16 +740,10 @@ pub fn child(args: &[String]) -> Result<(), String> {
         &lib,
         "SELECT coalesce(min(id), 0) FROM items WHERE kind = 'audio'",
     )?;
-    let audio_frames = if audio > 0 {
-        count(
-            &lib,
-            "SELECT coalesce(json_extract(codec_info, '$.frames'), 0) FROM items WHERE id = (SELECT min(id) FROM items WHERE kind = 'audio')",
-        )
-        .unwrap_or(0)
-        .max(i64::from(AUDIO_RATE))
-    } else {
-        0
-    };
+    // 音声の長さは親が渡す（読めないのに 1 秒とみなすと、trim がいつも頭の 0.25 秒になる）
+    if audio > 0 && audio_frames == 0 {
+        return Err("音声のアイテムがあるのに、長さ（--audio-frames）が渡されていません".into());
+    }
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let mut turn = 0u64;
     loop {
@@ -722,7 +766,7 @@ pub fn child(args: &[String]) -> Result<(), String> {
         } else {
             SaveAction::Overwrite {
                 graph: if on_audio {
-                    random_audio_doc(&mut rng, audio_frames as u64)?
+                    random_audio_doc(&mut rng, audio_frames)?
                 } else {
                     random_doc(&mut rng)?
                 },
@@ -771,5 +815,69 @@ pub fn child(args: &[String]) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 子の引数：音声の長さは `--audio-frames`（1 以上）。渡されなければ 0（音声のアイテムがあれば子が失敗する）。
+    #[test]
+    fn child_takes_the_audio_length_from_the_parent() {
+        let got = child_args(&args(&[
+            "--library",
+            "/tmp/x.kuralib",
+            "--seed",
+            "7",
+            "--audio-frames",
+            "15876000",
+        ]))
+        .unwrap();
+        assert_eq!(
+            got,
+            ChildArgs {
+                library: PathBuf::from("/tmp/x.kuralib"),
+                seed: 7,
+                audio_frames: 15_876_000,
+            }
+        );
+        assert_eq!(audio_frames(6), 15_876_000);
+        assert_eq!(audio_frames(0), 0);
+        let none = child_args(&args(&["--library", "/tmp/x.kuralib"])).unwrap();
+        assert_eq!(none.audio_frames, 0);
+        for bad in [
+            &["--audio-frames"][..],
+            &["--audio-frames", "0"],
+            &["--audio-frames", "x"],
+        ] {
+            assert!(child_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// 音声の文書の trim は、渡した長さの 1/4 までの位置から始まる（6 分なら 0.25 秒を大きく超える位置も出る）。
+    #[test]
+    fn audio_trim_spans_the_given_length() {
+        let frames = audio_frames(6);
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let mut starts = Vec::new();
+        for _ in 0..64 {
+            let g = random_audio_doc(&mut rng, frames).unwrap();
+            for n in &g.nodes {
+                if n.op == "audio.trim" {
+                    starts.push(n.params["start"].as_u64().unwrap());
+                }
+            }
+        }
+        assert!(!starts.is_empty());
+        assert!(starts.iter().all(|s| *s < frames / 4), "{starts:?}");
+        assert!(
+            starts.iter().any(|s| *s > 60 * u64::from(AUDIO_RATE)),
+            "{starts:?}"
+        );
     }
 }
