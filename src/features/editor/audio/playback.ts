@@ -40,6 +40,12 @@ export const CROSSFADE_SECONDS = 0.01;
 export const SWITCH_MIN_MS = 150;
 /** 再生位置から先に頼むチャンクの数。 */
 export const PREFETCH_CHUNKS = 2;
+/** これより短いループは、1 周ずつではなく、つないだバッファ（`LOOP_BLOCK_FRAMES` 程度）を 1 区間として置く。 */
+export const SHORT_LOOP_FRAMES = CHUNK / 8;
+/** 短いループをつなぐバッファの長さの目安（フレーム）。 */
+export const LOOP_BLOCK_FRAMES = CHUNK;
+/** 1 回の足し（`fill`）で置く区間の数の上限（ノードを一度に作りすぎない。足りない分は次の tick で）。 */
+export const MAX_PLACE_PER_FILL = 32;
 
 /** 鳴らす音：編集後（出力）か元（文書の入力）。 */
 export type PlaySource = 'edited' | 'source';
@@ -321,9 +327,12 @@ export interface PlacedRecord {
   rate: number;
   /** 文脈のフレームで鳴り始める位置。 */
   abs: number;
+  /** 鳴らす音のフレーム `[start, end)`。短いループをつないだバッファでは `end − start` はバッファの長さ。 */
   start: number;
   end: number;
-  /** バッファに写した標本（チャンネルごと。チャンクの切り出しで、写しではない）。 */
+  /** 1 周の長さ（短いループをつないだバッファ。ほかは `end − start`）。 */
+  cycle: number;
+  /** バッファに写した標本（チャンネルごと。チャンクの切り出し、短いループはつないだもの）。 */
   planes: Float32Array<ArrayBuffer>[];
   fadeIn: boolean;
 }
@@ -351,10 +360,13 @@ export type PlayOutcome = 'playing' | 'rateUnsupported' | 'failed';
 
 /** 置いた区間 1 つ。 */
 interface Placed {
+  /** 鳴らす音のフレーム（1 周分。短いループをつないだバッファは、この区間を繰り返す）。 */
   start: number;
   end: number;
   /** 文脈のフレームで鳴り始める位置。 */
   abs: number;
+  /** 鳴らす長さ（フレーム。つないだバッファは 1 周の長さ × 回数。途中で止めたら縮める）。 */
+  len: number;
   src: SourceLike;
   gain: GainLike;
   /** 交差フェードで止めた（`stopAt` のあとは位置の計算に使わない）。 */
@@ -378,6 +390,25 @@ interface Plan {
   done: boolean;
   /** 次に置く区間を 0→1 で入れる（交差フェード）。 */
   fadeInNext: boolean;
+}
+
+/** 置いた区間が文脈のフレーム `f` で鳴らしている位置（つないだバッファは 1 周の中へ折り返す）。 */
+function placedPos(p: Placed, f: number): number {
+  const cycle = Math.max(1, p.end - p.start);
+  return p.start + (Math.floor(f - p.abs) % cycle);
+}
+
+/** ループの 1 周の標本を `reps` 回つなぐ（チャンネルごと）。 */
+function repeatPlanes(planes: readonly Float32Array[], reps: number): Float32Array<ArrayBuffer>[] {
+  return planes.map((one) => {
+    const out = new Float32Array(one.length * reps);
+    out.set(one, 0);
+    // 倍々に写す
+    for (let filled = one.length; filled < out.length; filled *= 2) {
+      out.copyWithin(filled, 0, Math.min(filled, out.length - filled));
+    }
+    return out;
+  });
 }
 
 /** 編集中の試聴（一度に 1 つ）。 */
@@ -496,15 +527,14 @@ export class EditorPlayer {
     const live = this.placed.filter((p) => !p.fading);
     let after: Placed | null = null;
     for (const p of live) {
-      const len = p.end - p.start;
-      if (f >= p.abs && f < p.abs + len) return p.start + Math.floor(f - p.abs);
+      if (f >= p.abs && f < p.abs + p.len) return placedPos(p, f);
       if (p.abs > f && (after === null || p.abs < after.abs)) after = p;
     }
     // 交差フェードで替える前（T より前）は、止める前の音の位置
     for (const p of this.placed) {
       if (!p.fading) continue;
-      const end = Math.min(p.abs + (p.end - p.start), p.stopAt ?? Number.POSITIVE_INFINITY);
-      if (f >= p.abs && f < end) return p.start + Math.floor(f - p.abs);
+      const end = Math.min(p.abs + p.len, p.stopAt ?? Number.POSITIVE_INFINITY);
+      if (f >= p.abs && f < end) return placedPos(p, f);
     }
     if (after) return after.start;
     const last = live[live.length - 1];
@@ -532,7 +562,7 @@ export class EditorPlayer {
     if (changed.type === 'spans' && changed.spans.length === 0) return;
     const nowFrame = ctx.currentTime * plan.info.rate;
     const hit = this.placed.some(
-      (p) => !p.fading && p.abs + (p.end - p.start) > nowFrame && touches(changed, p.start, p.end),
+      (p) => !p.fading && p.abs + p.len > nowFrame && touches(changed, p.start, p.end),
     );
     if (hit || changed.type === 'all') {
       this.refreshWanted = true;
@@ -599,7 +629,7 @@ export class EditorPlayer {
     // 置き終えて、最後の区間が鳴り終えたら止める
     if (plan.done) {
       const last = this.placed.filter((p) => !p.fading).at(-1);
-      const endAbs = last ? last.abs + (last.end - last.start) : plan.nextAbs;
+      const endAbs = last ? last.abs + last.len : plan.nextAbs;
       if (nowFrame >= endAbs) {
         const at = plan.nextPos;
         this.stop();
@@ -618,7 +648,7 @@ export class EditorPlayer {
     const rate = plan.info.rate;
     const horizon = Math.round((plan.loop ? LOOP_HORIZON_SECONDS : HORIZON_SECONDS) * rate);
     const until = nowFrame + horizon;
-    while (plan.nextAbs < until) {
+    for (let count = 0; plan.nextAbs < until && count < MAX_PLACE_PER_FILL; count++) {
       const segs = planSegments({
         from: plan.nextPos,
         frames: plan.info.frames,
@@ -631,33 +661,85 @@ export class EditorPlayer {
         plan.done = true;
         return;
       }
-      const chunk = this.deps.peek(plan.source, chunkOf(seg.start));
-      if (!chunk || chunk.planes.length !== plan.info.channels) {
-        this.deps.want(plan.source, chunkOf(seg.start));
-        return;
-      }
+      // 短いループの頭：1 周をつないだバッファを 1 区間に（区間ごとにノードを作りすぎない）
+      const loop = plan.loop;
+      const short =
+        loop !== null && seg.start === loop.start && loop.end - loop.start <= SHORT_LOOP_FRAMES;
+      const planes = short && loop ? this.loopBlock(loop) : this.segmentPlanes(seg);
+      if (!planes) return;
       // 間に合わなかった（時刻が過ぎた）なら、今から少し先へ遅らせて置く
       const earliest = this.leadFrame();
       if (plan.nextAbs < earliest - Math.round(LEAD_SECONDS * rate)) plan.nextAbs = earliest;
-      this.place(seg, chunk, plan.nextAbs, plan.fadeInNext);
+      const end = short && loop ? loop.end : seg.end;
+      const len = planes[0]?.length ?? 0;
+      if (len <= 0) return;
+      this.place(seg.start, end, planes, plan.nextAbs, plan.fadeInNext);
       plan.fadeInNext = false;
-      plan.nextAbs += seg.end - seg.start;
-      plan.nextPos = seg.end;
+      plan.nextAbs += len;
+      plan.nextPos = end;
     }
   }
 
-  /** 区間を置く（その標本だけのバッファ）。`fadeIn` なら 0→1 の 10 ms で入れる。 */
-  private place(seg: Segment, chunk: PcmChunk, abs: number, fadeIn: boolean): void {
+  /** 区間の標本（チャンクの切り出し。チャンクが手元になければ取りに行って null）。 */
+  private segmentPlanes(seg: Segment): Float32Array<ArrayBuffer>[] | null {
+    const plan = this.plan;
+    if (!plan) return null;
+    const chunk = this.deps.peek(plan.source, chunkOf(seg.start));
+    if (!chunk || chunk.planes.length !== plan.info.channels) {
+      this.deps.want(plan.source, chunkOf(seg.start));
+      return null;
+    }
+    return chunk.planes.map((plane) =>
+      plane.subarray(seg.start - chunk.start, seg.end - chunk.start),
+    );
+  }
+
+  /**
+   * 短いループの 1 周を、チャンク程度の長さ（`LOOP_BLOCK_FRAMES`）までつないだ標本（1 周がチャンクの境をまたいでも
+   * よい。チャンクが手元になければ取りに行って null）。
+   */
+  private loopBlock(loop: FrameSpan): Float32Array<ArrayBuffer>[] | null {
+    const plan = this.plan;
+    if (!plan) return null;
+    const cycle = loop.end - loop.start;
+    const one = Array.from({ length: plan.info.channels }, () => new Float32Array(cycle));
+    let ready = true;
+    for (let i = chunkOf(loop.start); i * CHUNK < loop.end; i++) {
+      const chunk = this.deps.peek(plan.source, i);
+      if (!chunk || chunk.planes.length !== plan.info.channels) {
+        this.deps.want(plan.source, i);
+        ready = false;
+        continue;
+      }
+      const a = Math.max(loop.start, chunk.start);
+      const b = Math.min(loop.end, chunk.start + chunk.frames);
+      if (b <= a) continue;
+      chunk.planes.forEach((plane, ch) => {
+        one[ch]?.set(plane.subarray(a - chunk.start, b - chunk.start), a - loop.start);
+      });
+    }
+    if (!ready) return null;
+    return repeatPlanes(one, Math.max(1, Math.floor(LOOP_BLOCK_FRAMES / cycle)));
+  }
+
+  /**
+   * 区間を置く（その標本だけのバッファ）。`[start, end)` は 1 周分の鳴らす音のフレームで、`planes` がそれより長ければ
+   * つないだ短いループ。`fadeIn` なら 0→1 の 10 ms で入れる。
+   */
+  private place(
+    start: number,
+    end: number,
+    planes: Float32Array<ArrayBuffer>[],
+    abs: number,
+    fadeIn: boolean,
+  ): void {
     const ctx = this.ctx;
     const plan = this.plan;
     const master = this.master;
     if (!ctx || !plan || !master) return;
     const rate = plan.info.rate;
-    const len = seg.end - seg.start;
-    const buffer = ctx.createBuffer(chunk.planes.length, len, rate);
-    const planes = chunk.planes.map((plane) =>
-      plane.subarray(seg.start - chunk.start, seg.end - chunk.start),
-    );
+    const len = planes[0]?.length ?? 0;
+    const buffer = ctx.createBuffer(planes.length, len, rate);
     planes.forEach((plane, ch) => buffer.copyToChannel(plane, ch));
     const src = ctx.createBufferSource();
     src.buffer = buffer;
@@ -676,15 +758,17 @@ export class EditorPlayer {
       source: plan.source,
       rate,
       abs,
-      start: seg.start,
-      end: seg.end,
+      start,
+      end: start + len,
+      cycle: end - start,
       planes,
       fadeIn,
     };
     this.placed.push({
-      start: seg.start,
-      end: seg.end,
+      start,
+      end,
       abs,
+      len,
       src,
       gain,
       fading: false,
@@ -725,7 +809,7 @@ export class EditorPlayer {
         keep.push(p);
         continue;
       }
-      const endAbs = p.abs + (p.end - p.start);
+      const endAbs = p.abs + p.len;
       if (p.abs >= t) {
         this.kill(p);
       } else if (endAbs > t) {
@@ -787,7 +871,7 @@ export class EditorPlayer {
     const keep: Placed[] = [];
     const lastLive = this.placed.filter((p) => !p.fading).at(-1);
     for (const p of this.placed) {
-      const endAbs = p.abs + (p.end - p.start);
+      const endAbs = p.abs + p.len;
       if (
         endAbs + Math.round(CROSSFADE_SECONDS * 4 * (this.plan?.info.rate ?? 48_000)) < nowFrame &&
         p !== lastLive

@@ -7,6 +7,7 @@ import {
   CROSSFADE_SECONDS,
   EditorPlayer,
   LEAD_SECONDS,
+  MAX_PLACE_PER_FILL,
   neededSpans,
   PcmFeed,
   type PlaySource,
@@ -237,11 +238,53 @@ describe('編集中の試聴の置き方', () => {
     expect(placed.reduce((n, [, len]) => n + len, 0)).toBeLessThan(R + 12_000 + 1);
     expect(placed.every(([, len]) => len === 12_000)).toBe(true);
     const n = ctx.sources.length;
-    t.player.setLoop({ start: 1000, end: 7000 });
+    // 短いループ（SHORT_LOOP_FRAMES 以下）はつないだバッファになるので、それより長い区間に替える
+    t.player.setLoop({ start: 1000, end: 10_000 });
     const after = ctx.sources.slice(n).map((s) => s.buffer?.length);
     expect(after.length).toBeGreaterThan(0);
-    expect(after.every((len) => len === 6000)).toBe(true);
+    expect(after.every((len) => len === 9000)).toBe(true);
     expect(ctx.sources.slice(1, n).every((s) => s.stopped)).toBe(true);
+  });
+
+  it('短いループ（1 フレーム・数十フレーム）は、ループをつないだチャンク程度のバッファを 1 区間として置く', () => {
+    for (const len of [1, 64]) {
+      const t = setup();
+      const loop = { start: 1000, end: 1000 + len };
+      t.player.play({ from: 1000, loop, source: 'edited', info: t.info });
+      const ctx = t.ctx();
+      // 先読みの 1 秒を数本で埋める（区間ごとのノードを作らない）
+      expect(ctx.sources.length).toBeLessThanOrEqual(2);
+      const buf = ctx.buffers[0];
+      expect(buf?.length).toBeGreaterThanOrEqual(R);
+      expect(buf?.length).toBeLessThanOrEqual(CHUNK);
+      expect((buf?.length ?? 0) % len).toBe(0);
+      // 中身はループの標本の繰り返し
+      for (const k of [0, len - 1, len, 5 * len + 1, (buf?.length ?? 1) - 1]) {
+        expect(buf?.channels[0]?.[k]).toBeCloseTo(((1000 + (k % len)) % 1000) / 1000, 6);
+      }
+      // 位置はループの中
+      ctx.currentTime += 0.3;
+      t.player.tick();
+      const pos = t.player.position() ?? -1;
+      expect(pos).toBeGreaterThanOrEqual(loop.start);
+      expect(pos).toBeLessThan(loop.end);
+      // 時間が進んでも、1 回の足しで作るノードは数本
+      const n = ctx.sources.length;
+      ctx.currentTime += 1;
+      t.player.tick();
+      expect(ctx.sources.length - n).toBeLessThanOrEqual(2);
+      expect(ctx.gains.length).toBeLessThanOrEqual(ctx.sources.length + 1);
+    }
+  });
+
+  it('1 回の足しで置く区間の数には上限がある（高いレートの細かいループ）', () => {
+    const t = setup({ rate: 384_000, total: CHUNK * 8 });
+    const loop = { start: 0, end: 9000 };
+    t.player.play({ from: 0, loop, source: 'edited', info: t.info });
+    const ctx = t.ctx();
+    expect(ctx.sources.length).toBe(MAX_PLACE_PER_FILL);
+    t.player.tick();
+    expect(ctx.sources.length).toBeGreaterThan(MAX_PLACE_PER_FILL);
   });
 
   it('このレートは鳴らさない（3〜384 kHz の外）', () => {

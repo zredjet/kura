@@ -188,7 +188,16 @@ describe('自己点検は通常のビルドに入らない', () => {
 /** エディタが置いた区間（標本は元の位置から決める）。 */
 function placed(abs: number, start: number, end: number, fadeIn = false): PlacedRecord {
   const p = pcm(start, end);
-  return { source: 'edited', rate: R, abs, start, end, planes: p.planes, fadeIn };
+  return {
+    source: 'edited',
+    rate: R,
+    abs,
+    start,
+    end,
+    cycle: end - start,
+    planes: p.planes,
+    fadeIn,
+  };
 }
 
 /** 窓をそのまま描いたことにする（本物と同じ置き方なら、期待の標本と同じ）。 */
