@@ -196,6 +196,44 @@ mod tests {
         }
     }
 
+    /// M13 段 3：流して書く口（`CodecSet::encode_stream`。値の生産者）でも、値を書いたものと同じ形の m4a（backend には同じ
+    /// 4,096 フレームずつ渡る）。AudioToolbox は呼び出しの道によって最後のパケットのバイト列が変わることがある（同じ道なら
+    /// 同じ。R2 は約束しない）ので、固定の段の読み取りで読み直した長さと音が同じことを確かめる。値のダイジェストは流した
+    /// 標本のもの。
+    #[test]
+    fn streamed_aac_equals_encode_here() {
+        let _g = shared();
+        let set = mac_set();
+        let pinned = CodecSet::pinned();
+        for (rate, channels, frames) in [(48_000, 2, 30_000), (44_100, 1, 70_001)] {
+            let src = tone(rate, channels, frames);
+            let (want, stamp) = set
+                .encode_bytes(&src, "m4a", &json!({}), &NoMonitor)
+                .unwrap();
+            let a = audio(&src);
+            let mut producer = kura_engine::audio::stream::ValueProducer::new(a);
+            let mut out = std::io::Cursor::new(Vec::new());
+            let se = set
+                .encode_stream(&mut producer, "m4a", &json!({}), &mut out, &NoMonitor)
+                .unwrap();
+            let got = out.into_inner();
+            assert_eq!(got.len(), want.len(), "{rate} {channels} {frames}");
+            assert_eq!(
+                (se.codec.as_str(), se.tier, se.bytes),
+                (stamp.codec.as_str(), stamp.tier, stamp.bytes)
+            );
+            assert_eq!(se.value_digest, src.digest().unwrap());
+            let (x, _) = decode(&pinned, &got, "m4a").unwrap();
+            let (y, _) = decode(&pinned, &want, "m4a").unwrap();
+            let (x, y) = (audio(&x), audio(&y));
+            assert_eq!(x.frames(), y.frames());
+            for c in 0..channels {
+                let (p, q) = (&x.to_planes().unwrap()[c], &y.to_planes().unwrap()[c]);
+                assert!(ncc(p, q) > 0.999, "{rate} {channels} {frames} ch {c}");
+            }
+        }
+    }
+
     /// 同じ値・同じ設定なら、同じプロセスでは同じバイト列（Apple の時刻は 0 にした）。約束はしない（R2 は偽）。
     #[test]
     fn same_input_writes_the_same_bytes_here() {

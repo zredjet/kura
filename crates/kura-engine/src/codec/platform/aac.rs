@@ -18,9 +18,10 @@ use std::io::Write;
 
 use serde_json::json;
 
+use crate::audio::stream::{AudioProducer, ValueProducer};
 use crate::codec::formats::NONE;
 use crate::codec::platform::{BackendError, default_channel_mask};
-use crate::codec::{CodecEnv, Encoder, MetaCaps, Stage, Tier};
+use crate::codec::{CodecEnv, Encoder, MetaCaps, NoSeek, Stage, Tier, WriteSeek};
 use crate::error::{EngineError, Issue, IssueCode, Issues};
 use crate::monitor::Monitor;
 use crate::op::{ParamKind, ParamSchema, Unit, spec};
@@ -276,50 +277,81 @@ impl<B: AacBackend> Encoder for PlatformAacEncoder<B> {
         out: &mut dyn Write,
         mon: &dyn Monitor,
     ) -> Result<u64, EngineError> {
-        let id = self.backend.id();
         let Value::Audio(audio) = value else {
             return Err(EngineError::Unsupported(
                 "m4a には音声だけを書けます".into(),
             ));
         };
-        if !self.can_encode(format, &value.shape()) {
+        // 値も流して書く口を通る（実装は 1 つ。シークしない）
+        let mut src = ValueProducer::new(audio);
+        self.encode_stream(&mut src, format, opts, &mut NoSeek::new(out), mon)
+    }
+
+    fn streams(&self, format: &str) -> bool {
+        format == "m4a"
+    }
+
+    /// 出力はメモリ（backend）にある：`aac_max_output` ＋ 渡す作業列（[`WRITE_FRAMES`] × チャンネル × 4）＋ 1 MiB。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
+        let (channels, frames) = match shape {
+            Shape::Audio {
+                channels, frames, ..
+            } => (*channels, frames.max()),
+            _ => (0, 0),
+        };
+        aac_max_output(frames, channels)
+            .saturating_add((WRITE_FRAMES as u64) * u64::from(channels) * 4)
+            .saturating_add(1 << 20)
+    }
+
+    /// handle を開き、窓を [`WRITE_FRAMES`] ずつ（値を書くときと同じ区切り：頭から 4,096 フレームずつ）直して渡す。終わりに
+    /// `finish` → `copy` → 時刻を 0 にして `out` に書く（出力は backend のメモリにある。kura-mac の口は変えない）。
+    fn encode_stream(
+        &self,
+        src: &mut dyn AudioProducer,
+        format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn WriteSeek,
+        mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        let id = self.backend.id();
+        let info = src.info().clone();
+        let channels = u16::try_from(info.channels)
+            .map_err(|_| EngineError::Unsupported("チャンネルが多すぎます".into()))?;
+        let shape = Shape::Audio {
+            rate: info.rate,
+            channels,
+            frames: crate::shape::Dim::Exact(info.frames),
+        };
+        if !self.can_encode(format, &shape) {
             return Err(EngineError::Unsupported(format!(
                 "{id}: {} Hz・{} チャンネルの AAC は書けません",
-                audio.rate(),
-                audio.channels()
+                info.rate, info.channels
             )));
         }
-        let channels = u16::try_from(audio.channels())
-            .map_err(|_| EngineError::Unsupported("チャンネルが多すぎます".into()))?;
-        let settings = self.settings(audio.rate(), channels, opts)?;
-        let frames = audio.frames();
-        let max_out = aac_max_output(frames as u64, channels);
-        let mut h = self
+        let settings = self.settings(info.rate, channels, opts)?;
+        let frames = info.frames;
+        let max_out = aac_max_output(frames, channels);
+        let h = self
             .backend
             .open(&settings, max_out)
             .map_err(|e| e.into_engine(id, Stage::Encode))?;
-        let mut scratch: Vec<Vec<f32>> =
-            vec![Vec::with_capacity(WRITE_FRAMES.min(frames)); audio.channels()];
-        let mut off = 0usize;
-        while off < frames {
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            let n = WRITE_FRAMES.min(frames - off);
-            for (c, dst) in scratch.iter_mut().enumerate() {
-                dst.clear();
-                dst.resize(n, 0.0);
-                audio.read(c, off as u64, dst)?;
-                for s in dst.iter_mut() {
-                    *s = sanitize(*s);
-                }
-            }
-            let views: Vec<&[f32]> = scratch.iter().map(Vec::as_slice).collect();
-            h.write(&views)
-                .map_err(|e| e.into_engine(id, Stage::Encode))?;
-            off += n;
-            mon.progress(off as u64, frames as u64);
+        let mut sink = AacSink {
+            id,
+            h,
+            scratch: vec![Vec::with_capacity(WRITE_FRAMES.min(frames as usize)); info.channels],
+            next: 0,
+            frames,
+        };
+        src.produce(None, &mut sink, mon)?;
+        if sink.next != frames {
+            return Err(EngineError::Internal(format!(
+                "流した長さが形と違います（{} / {frames}）",
+                sink.next
+            )));
         }
+        sink.push(mon)?;
+        let mut h = sink.h;
         if mon.canceled() {
             return Err(EngineError::Canceled);
         }
@@ -344,6 +376,81 @@ impl<B: AacBackend> Encoder for PlatformAacEncoder<B> {
         })?;
         out.write_all(&buf)?;
         Ok(len)
+    }
+}
+
+/// 流れの窓を [`WRITE_FRAMES`] ずつにためて backend に渡す受け手（頭から 4,096 フレームずつの区切りは窓の切り方によらない）。
+struct AacSink<'b, H: AacHandle> {
+    id: &'b str,
+    h: H,
+    /// 渡す前の作業列（チャンネルごとに [`WRITE_FRAMES`] まで。直した値）。
+    scratch: Vec<Vec<f32>>,
+    next: u64,
+    frames: u64,
+}
+
+impl<H: AacHandle> AacSink<'_, H> {
+    /// たまった分を渡す（空なら何もしない）。
+    fn push(&mut self, mon: &dyn Monitor) -> Result<(), EngineError> {
+        if self.scratch.first().is_none_or(Vec::is_empty) {
+            return Ok(());
+        }
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
+        let views: Vec<&[f32]> = self.scratch.iter().map(Vec::as_slice).collect();
+        self.h
+            .write(&views)
+            .map_err(|e| e.into_engine(self.id, Stage::Encode))?;
+        for s in &mut self.scratch {
+            s.clear();
+        }
+        mon.progress(self.next, self.frames);
+        Ok(())
+    }
+}
+
+impl<H: AacHandle> crate::audio::stream::AudioSink for AacSink<'_, H> {
+    fn begin(&mut self, info: &crate::audio::stream::StreamInfo) -> Result<(), EngineError> {
+        if info.channels != self.scratch.len() {
+            return Err(EngineError::Internal(
+                "書く流れのチャンネルの数が違います".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        if start != self.next || planes.len() != self.scratch.len() {
+            return Err(EngineError::Internal(format!(
+                "書く流れの窓が続いていません（{start} から。次は {}）",
+                self.next
+            )));
+        }
+        let total = planes.first().map_or(0, |p| p.len());
+        let mut at = 0usize;
+        while at < total {
+            let have = self.scratch.first().map_or(0, Vec::len);
+            let n = (WRITE_FRAMES - have).min(total - at);
+            for (dst, src) in self.scratch.iter_mut().zip(planes) {
+                dst.extend(src[at..at + n].iter().map(|s| sanitize(*s)));
+            }
+            at += n;
+            self.next += n as u64;
+            if have + n == WRITE_FRAMES {
+                self.push(mon)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
+        Ok(())
     }
 }
 
@@ -664,6 +771,88 @@ mod tests {
             ),
             Err(EngineError::Unsupported(_))
         ));
+    }
+
+    /// 細かい窓（`step` フレームずつ）で値を流す生産者。
+    struct Choppy<'a> {
+        audio: &'a Audio,
+        info: crate::audio::stream::StreamInfo,
+        step: usize,
+    }
+
+    impl crate::audio::stream::AudioProducer for Choppy<'_> {
+        fn info(&self) -> &crate::audio::stream::StreamInfo {
+            &self.info
+        }
+
+        fn produce(
+            &mut self,
+            _spans: Option<&crate::render::region::Spans>,
+            sink: &mut dyn crate::audio::stream::AudioSink,
+            mon: &dyn Monitor,
+        ) -> Result<(), EngineError> {
+            sink.begin(&self.info)?;
+            let mut at = 0usize;
+            while at < self.audio.frames() {
+                let end = (at + self.step).min(self.audio.frames());
+                let planes = self.audio.read_planes(at, end)?;
+                let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+                sink.feed(at as u64, &views, mon)?;
+                at = end;
+            }
+            sink.finish()
+        }
+    }
+
+    /// E43（M13 段 3）：流して書いた m4a は、値を書いたものとバイト列・記録・値のダイジェストが同じ。窓の切り方によらず、
+    /// backend には頭から 4,096 フレームずつ渡る。
+    #[test]
+    fn streamed_m4a_equals_encode() {
+        let set = set_with(FakeAacBackend::new());
+        for (channels, frames) in [(1usize, 1usize), (2, 4_096), (2, 10_000), (3, 70_001)] {
+            let planes: Vec<Vec<f32>> = (0..channels)
+                .map(|c| {
+                    (0..frames)
+                        .map(|i| ((i * 3 + c) % 97) as f32 / 97.0)
+                        .collect()
+                })
+                .collect();
+            let v = audio(48_000, planes);
+            let Value::Audio(a) = &v else { panic!() };
+            let (want, stamp) = set
+                .encode_bytes(&v, "m4a", &serde_json::json!({}), &NoMonitor)
+                .unwrap();
+            for step in [1_000usize, 4_096, 65_536] {
+                let mut src = Choppy {
+                    audio: a,
+                    info: crate::audio::stream::StreamInfo {
+                        rate: 48_000,
+                        channels,
+                        frames: frames as u64,
+                        meta: a.meta.clone(),
+                    },
+                    step,
+                };
+                let mut out = std::io::Cursor::new(Vec::new());
+                let se = set
+                    .encode_stream(
+                        &mut src,
+                        "m4a",
+                        &serde_json::json!({}),
+                        &mut out,
+                        &NoMonitor,
+                    )
+                    .unwrap();
+                let got = out.into_inner();
+                assert_eq!(got, want, "{channels} {frames} {step}");
+                let mut fd = crate::codec::FileDigest::new(got.len() as u64);
+                fd.update(&got);
+                assert_eq!(se.stamp(fd.finish().unwrap()), stamp);
+                assert_eq!(se.value_digest, v.digest().unwrap());
+                let (_, chunks) = fake_m4a_payload(&got).unwrap();
+                assert_eq!(chunks, frames.div_ceil(WRITE_FRAMES));
+            }
+        }
     }
 
     /// 中止は 4,096 フレームの合間（1〜4 回目）。backend の失敗・大きすぎる出力・壊れた m4a はエラー。
