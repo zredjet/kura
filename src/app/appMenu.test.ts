@@ -155,6 +155,19 @@ describe('appMenuItems', () => {
     expect(items.some((i) => 'item' in i && i.item === 'Fullscreen')).toBe(true);
   });
 
+  it('表示メニューは、音声のエディタの間は ⌘0・⌘+・⌘− と情報（M13。100% はない）', () => {
+    const run = vi.fn();
+    const items = editorViewItemOptions(run, 'audio') as Item[];
+    const keyed = items.filter((i): i is MenuItemOptions => 'accelerator' in i);
+    expect(keyed.map((i) => [i.text, i.accelerator])).toEqual([
+      [ja.appMenu.editorFit, 'CmdOrCtrl+0'],
+      [ja.appMenu.editorZoomIn, 'CmdOrCtrl+='],
+      [ja.appMenu.editorZoomOut, 'CmdOrCtrl+-'],
+      [ja.appMenu.editorInfo, 'CmdOrCtrl+I'],
+    ]);
+    expect(items.some((i) => 'item' in i && i.item === 'Fullscreen')).toBe(true);
+  });
+
   it('表示メニューは、Submenu を渡せばそれを置き、渡さなければライブラリの中身', () => {
     const run = vi.fn();
     const view = viewItemOptions(run, STATE, 'test');

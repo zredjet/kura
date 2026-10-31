@@ -53,12 +53,19 @@ const CATEGORY_ORDER: readonly OpCategory[] = [
   'convert',
   'sprite',
   'paint',
+  'audioTime',
+  'audioSignal',
   'meta',
   'other',
 ];
 
-/** 操作の分類（docs/editing.md §7.4 の表）。 */
+/** 音声の時間の操作（切り詰め・フェード・ループ点）。 */
+const AUDIO_TIME_OPS: readonly string[] = ['audio.trim', 'audio.fade', 'audio.set_loop'];
+
+/** 操作の分類（docs/editing.md §7.4 の表。音声は「時間」と「音量・チャンネル・レート」）。 */
 export function opCategory(id: string): OpCategory {
+  if (AUDIO_TIME_OPS.includes(id)) return 'audioTime';
+  if (id.startsWith('audio.')) return 'audioSignal';
   if (id === 'image.convert' || id.startsWith('palette.')) return 'convert';
   if (id.startsWith('image.')) return 'geometry';
   if (id.startsWith('sprite.')) return 'sprite';

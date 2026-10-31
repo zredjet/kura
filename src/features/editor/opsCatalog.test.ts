@@ -106,7 +106,19 @@ describe('足す操作', () => {
       'meta',
     ]);
     expect(opCategory('palette.replace')).toBe('convert');
+    expect(opCategory('audio.trim')).toBe('audioTime');
+    expect(opCategory('audio.set_loop')).toBe('audioTime');
+    expect(opCategory('audio.gain')).toBe('audioSignal');
+    expect(opCategory('audio.resample')).toBe('audioSignal');
     expect(opCategory('image.rotate90')).toBe('geometry');
+  });
+
+  it('音声のエディタは音声の操作だけを「時間」「音量・チャンネル・レート」に分ける', () => {
+    const groups = addableOps('audio');
+    expect(groups.map((g) => [g.category, g.ops.map((o) => o.id).sort()])).toEqual([
+      ['audioTime', ['audio.fade', 'audio.set_loop', 'audio.trim']],
+      ['audioSignal', ['audio.gain', 'audio.mono', 'audio.normalize', 'audio.resample']],
+    ]);
   });
 
   it('既定の引数：切り抜き・キャンバスは今の出力の全体、大きさを変えるは今の幅', () => {

@@ -232,6 +232,18 @@ describe('核と種類ごとのアダプタ', () => {
     expect(viewEdit).toHaveBeenCalledWith('aa01', viewport(1));
   });
 
+  // M13 段 6：音声の裏の仕事（波形の段の作り直し）の頼み直しは、同じビューポートでも送る
+  it('アダプタの requestView は同じビューポートなら送らず、force なら送る', async () => {
+    const adapter = await openFake();
+    adapter.ctx.requestView(viewport(1));
+    await flush();
+    expect(viewEdit).not.toHaveBeenCalled();
+    adapter.ctx.requestView(viewport(1), true);
+    await flush();
+    expect(viewEdit).toHaveBeenCalledTimes(1);
+    expect(viewEdit).toHaveBeenCalledWith('aa01', viewport(1));
+  });
+
   it('手の結果：送るときに印つきで sent、断られたら onRejected → applyView → settle（acked・指摘・知らせは核）', async () => {
     const adapter = await openFake();
     vi.mocked(stepEdit).mockResolvedValueOnce(

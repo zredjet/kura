@@ -4,12 +4,14 @@
  * - 種類ごとのモジュール（画像は `image/imageKind.ts`）は、核のアダプタの作り方・画面の部品・キーをまとめて持つ。核
  *   （`editorStore.ts`）はここを読まない（種類のモジュールが核を読むので、輪にしない）。画面の殻（`Editor.tsx`）とキー
  *   （`editorKeys.ts`）は、開いている種類（`useEditorStore` の `kind`）でここから部品を引く。
- * - 音声を足すときは `kindTraits.ts` の `EditorKind`・性質と、ここの表に 1 行足す。
+ * - 種類を足すときは `kindTraits.ts` の `EditorKind`・性質と、ここの表に 1 行足す（音声は M13 の段 6。開けるのは
+ *   `kindTraits.ts` の `OPENABLE` にある種類だけ）。
  */
 
 import type { ComponentType } from 'react';
 
 import type { ItemSummaryDto } from '../../ipc/items';
+import { AUDIO_EDITOR } from './audio/audioKind';
 import type { EditorKindKeys } from './editorKeys';
 import { type EditorAdapterFactory, openEditorAs } from './editorStore';
 import { IMAGE_EDITOR } from './image/imageKind';
@@ -42,6 +44,7 @@ export interface EditorKindModule {
 
 const MODULES: Readonly<Record<EditorKind, EditorKindModule>> = {
   image: IMAGE_EDITOR,
+  audio: AUDIO_EDITOR,
 };
 
 /** 種類のモジュール（閉じていれば null）。 */

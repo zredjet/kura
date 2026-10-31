@@ -893,6 +893,8 @@ export const ja = {
       convert: '画像の変換',
       sprite: 'スプライト',
       paint: '描画',
+      audioTime: '時間',
+      audioSignal: '音量・チャンネル・レート',
       meta: 'メタデータ',
       other: 'その他',
     },

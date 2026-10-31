@@ -231,6 +231,7 @@ type EditorViewItems = (MenuItemOptions | PredefinedMenuItemOptions)[];
  * 処理が受ける）。ライブラリの表示形式（⌘1〜⌘3）・サムネイルの大きさ（⌘+・⌘−）と重なるので、開いている間は差し替える。
  *
  * - 画像：⌘0 全体を表示・⌘1 実際のサイズ（100%）・⌘+ 拡大・⌘− 縮小・⌘I 情報。
+ * - 音声：⌘0 全体を表示・⌘+ 拡大・⌘− 縮小・⌘I 情報（M13。⌘1 の 100% はない）。
  */
 const EDITOR_VIEW_ITEMS: Readonly<Record<EditorKind, (run: RunMenuAction) => EditorViewItems>> = {
   image: (run) => {
@@ -238,6 +239,18 @@ const EDITOR_VIEW_ITEMS: Readonly<Record<EditorKind, (run: RunMenuAction) => Edi
     return [
       keyItem(run, t.editorFit, { key: '0', code: 'Digit0', ...META }),
       keyItem(run, t.editorActualSize, { key: '1', code: 'Digit1', ...META }),
+      keyItem(run, t.editorZoomIn, { key: '=', code: 'Equal', ...META }),
+      keyItem(run, t.editorZoomOut, { key: '-', code: 'Minus', ...META }),
+      { item: 'Separator' },
+      keyItem(run, t.editorInfo, { key: 'i', code: 'KeyI', ...META }),
+      { item: 'Separator' },
+      { item: 'Fullscreen', text: t.fullscreen },
+    ];
+  },
+  audio: (run) => {
+    const t = ja.appMenu;
+    return [
+      keyItem(run, t.editorFit, { key: '0', code: 'Digit0', ...META }),
       keyItem(run, t.editorZoomIn, { key: '=', code: 'Equal', ...META }),
       keyItem(run, t.editorZoomOut, { key: '-', code: 'Minus', ...META }),
       { item: 'Separator' },

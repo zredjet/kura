@@ -198,8 +198,12 @@ export interface WaveScheduler {
 }
 
 const realScheduler: WaveScheduler = {
-  frame: (cb) => requestAnimationFrame(cb),
-  cancelFrame: (id) => cancelAnimationFrame(id),
+  frame: (cb) =>
+    typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame(cb)
+      : window.setTimeout(cb, 16),
+  cancelFrame: (id) =>
+    typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame(id) : window.clearTimeout(id),
   later: (cb, ms) => window.setTimeout(cb, ms),
   cancelLater: (id) => window.clearTimeout(id),
 };

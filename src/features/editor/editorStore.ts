@@ -226,8 +226,8 @@ export interface EditorAdapterContext<Tag = unknown> {
   current(): boolean;
   /** セッション（開くまで・閉じたあとは null）。 */
   session(): string | null;
-  /** 表示を頼む（前に送ったものと同じなら送らない）。 */
-  requestView(viewport: EditViewportDto): void;
+  /** 表示を頼む（前に送ったものと同じなら送らない。`force` なら同じでも送る：裏の仕事を進める頼み直し）。 */
+  requestView(viewport: EditViewportDto, force?: boolean): void;
   /** 手を送る（先に `beforeSteps`）。送れなければ false。`selectCreated` なら足したノードを選ぶ。 */
   push(steps: QueuedStep<Tag>[], options?: { selectCreated?: boolean }): boolean;
   /** 手を送る（`beforeSteps` を呼ばない。切り抜きの仮の値を出す・捨てるとき）。 */
@@ -376,8 +376,8 @@ function contextFor<Tag>(holder: { rt: Runtime | null }): EditorAdapterContext<T
   return {
     current: () => live() !== null,
     session: () => live()?.session ?? null,
-    requestView: (viewport) => {
-      live()?.queue?.view(viewport);
+    requestView: (viewport, force = false) => {
+      live()?.queue?.view(viewport, force);
     },
     push: (steps, options = {}) => {
       const rt = live();
