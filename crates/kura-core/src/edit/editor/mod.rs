@@ -26,6 +26,7 @@
 
 pub mod audio;
 mod autosave;
+pub mod formats;
 mod source;
 #[cfg(test)]
 mod tests;

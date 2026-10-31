@@ -87,6 +87,11 @@ export const commands = {
 	 *  返す（長い音声は段 4B まで `failed`）。描いている途中の表示を止めない。
 	 */
 	editMeasure: (session: string) => typedError<EditLoudnessStateDto, AppError>(__TAURI_INVOKE("edit_measure", { session })),
+	/**
+	 *  書ける形式の一覧（確定した頭の出力の形で、保存のジョブと同じ今のコーデックの組で確かめる）。保存が `FormatUnavailable` で
+	 *  断られたときに、フロントが形式を選ぶシートに使う。
+	 */
+	editFormats: (session: string) => typedError<EditFormatsDto, AppError>(__TAURI_INVOKE("edit_formats", { session })),
 	/**  エディタを閉じる（キャッシュ・予算の取り置きを外す。待っている下書きは置く）。今のセッションでなければ何もしない。 */
 	editClose: (session: string) => typedError<null, AppError>(__TAURI_INVOKE("edit_close", { session })),
 	/**
@@ -931,6 +936,13 @@ export type EditDraftDto = {
 	opened: boolean,
 };
 
+/**  書ける形式の一覧（形式の表の順で、アイテムの種類の行すべて）。 */
+export type EditFormatsDto = {
+	formats: EditWritableFormatDto[],
+	/**  今の出力の形式に書けないときに保存が使う形式（音声は Ogg Vorbis、書けなければ WAV。画像は PNG）。書ければ null。 */
+	fallback: string | null,
+};
+
 /**  フレームの矩形（段の座標）と表示時間。 */
 export type EditFrameDto = {
 	index: number,
@@ -1325,6 +1337,21 @@ export type EditViewportDto = {
 } & EditImageViewportDto | {
 	type: "audio",
 } & EditAudioViewportDto;
+
+/**  書ける形式 1 つ（形式の表の行。M13 段 4C）。 */
+export type EditWritableFormatDto = {
+	/**  形式の ID（`edit_save` の `format: { type: "to", format }` に渡す）。 */
+	format: string,
+	/**  代表の拡張子。 */
+	ext: string,
+	/**  今の環境（今のコーデックの組）で、今の出力の形を書けるか（MP3 は ffmpeg がなければ偽）。 */
+	available: boolean,
+	/**  形式の表の保存できるもの：可逆・ループ点・マーカー・16 ビットより細かい標本。 */
+	lossless: boolean,
+	loopPoints: boolean,
+	markers: boolean,
+	highBitDepth: boolean,
+};
 
 /**
  *  文書への変更 1 つ。JSON（エディタとの通信。M12）では `type` で種類を分ける（`{"type":"appendItems","node":3,…}`。

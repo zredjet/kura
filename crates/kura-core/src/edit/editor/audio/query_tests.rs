@@ -1,12 +1,71 @@
-//! 問い合わせ（A13・A14）：`edit_snap` は近いゼロ交差を返し、表示の外でも区間を描いて読む（表示を止めない）。
+//! 問い合わせ（A13・A14・A17）：`edit_snap` は近いゼロ交差を返し、表示の外でも区間を描いて読む（表示を止めない）。
+//! `edit_measure` は今の出力のラウドネス。`edit_formats` は今の組で書ける形式。
+
+use std::sync::{Arc, Mutex};
 
 use kura_engine::Graph;
+use kura_engine::codec::CodecSet;
 use serde_json::json;
 
 use super::measure::{LoudnessState, measure, values_of};
 use super::session_tests::*;
 use super::snap::{SNAP_MAX_RADIUS, nearest_zero_crossing, snap};
-use crate::edit::editor::{Step, Viewport};
+use crate::codec_ext::ffmpeg::testing::FakeTools;
+use crate::edit::editor::formats::formats;
+use crate::edit::editor::{EditorError, SaveMode, Step, Viewport, close, save};
+use crate::edit::services::fake::FakeEngineFactory;
+
+/// A17（F14）：`edit_formats` は、ffmpeg のない組で mp3 の元を元の形式のまま保存しようとすると mp3 を `available: false`、
+/// 代わりを ogg にする（保存はそのとき `FormatUnavailable`）。確かめは保存のジョブと同じ今の組で、ツールの場所を変えて組を
+/// 作り直せば（偽の ffmpeg）、開いたままのエディタでも mp3 が書けて代わりは要らない。
+#[test]
+fn formats_follow_the_current_codecs() {
+    let set = Arc::new(Mutex::new(CodecSet::pinned()));
+    let env = Env::with(Arc::new(FakeEngineFactory::with_codecs(set.clone())));
+    let mp3 = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kura-engine/fixtures/mp3-free.mp3"),
+    )
+    .unwrap();
+    let id = add_audio(&env.lib, &mp3, "mp3");
+    let s = env.open(id).session.clone();
+    env.step(
+        &s,
+        vec![add(0, "audio.gain", json!({ "db": -1.0 }))],
+        &Viewport::audio_idle(),
+    );
+    let f = formats(&env.env(), &s).unwrap();
+    let mp3_row = f.formats.iter().find(|w| w.format == "mp3").unwrap();
+    assert!(!mp3_row.available);
+    assert_eq!(mp3_row.ext, "mp3");
+    assert_eq!(f.fallback.as_deref(), Some("ogg"));
+    assert!(
+        f.formats
+            .iter()
+            .filter(|w| w.available)
+            .map(|w| w.format.as_str())
+            .eq(["wav", "aiff", "flac", "ogg"])
+    );
+    assert!(matches!(
+        save(&env.env(), &s, SaveMode::Overwrite, None),
+        Err(EditorError::FormatUnavailable { fallback: Some(ref fb), .. }) if fb == "ogg"
+    ));
+
+    // ツールの場所を変えた（偽の ffmpeg を足した組に作り直す）
+    let tools = FakeTools::new("exit 1", "exit 1", "cksum > \"$out\"");
+    tools.codecs().add_to(&mut set.lock().unwrap()).unwrap();
+    env.engine.reload_codecs();
+    let f = formats(&env.env(), &s).unwrap();
+    assert!(f.formats.iter().any(|w| w.format == "mp3" && w.available));
+    assert_eq!(f.fallback, None);
+
+    // 閉じたセッションは NoSession
+    close(&env.engine, &s);
+    assert!(matches!(
+        formats(&env.env(), &s),
+        Err(EditorError::NoSession)
+    ));
+}
 
 /// 全体の描画で求めたゼロ交差（正）。
 fn expected(a: &kura_engine::value::Audio, f: u64, r: u64) -> Option<u64> {

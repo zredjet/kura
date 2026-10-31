@@ -19,6 +19,7 @@ import {
   type EditChangedDto,
   type EditDocDeltaDto_Serialize,
   type EditDraftDto,
+  type EditFormatsDto,
   type EditFrameDto,
   type EditHandleDto,
   type EditHandleModeDto,
@@ -47,6 +48,7 @@ import {
   type EditViewDto,
   type EditViewOutcomeDto,
   type EditViewportDto,
+  type EditWritableFormatDto,
   type Edit_Deserialize,
   type FormatChoice,
   type Issue,
@@ -78,6 +80,7 @@ export type {
   EditAudioViewportDto,
   EditChangedDto,
   EditDraftDto,
+  EditFormatsDto,
   EditFrameDto,
   EditHandleDto,
   EditHandleModeDto,
@@ -102,6 +105,7 @@ export type {
   EditViewDto,
   EditViewOutcomeDto,
   EditViewportDto,
+  EditWritableFormatDto,
   FormatChoice,
   Issue,
   IssueCode,
@@ -201,6 +205,15 @@ export function saveEdit(
   format: EditFormatChoice = null,
 ): Promise<EditSaveStartedDto> {
   return unwrap(commands.editSave(session, mode, format));
+}
+
+/**
+ * 書ける形式の一覧（M13）：確定した頭の出力の形を、保存のジョブと同じ今のコーデックの組で書けるか（形式の表の順で、
+ * アイテムの種類の行すべて）と、今の出力の形式に書けないときの代わり（`fallback`）。保存が `FormatUnavailable` で
+ * 断られたときの形式を選ぶシートに使う。
+ */
+export function listEditFormats(session: string): Promise<EditFormatsDto> {
+  return unwrap(commands.editFormats(session));
 }
 
 /** アイテムの版の一覧（まだ保存していなければ空）。 */

@@ -17,6 +17,7 @@ use kura_core::edit::editor::audio::handles::{AudioNodeView, Handle, HandleMode,
 use kura_core::edit::editor::audio::measure::{LoudnessState, LoudnessValues};
 use kura_core::edit::editor::audio::peaks::PeaksInfo;
 use kura_core::edit::editor::audio::timeline::SourcePiece;
+use kura_core::edit::editor::formats::EditFormats;
 use kura_core::edit::editor::{
     self, AudioSourceInfo, AudioViewInfo, AudioViewport, ChangedSpans, ChangedTiles, DocDelta,
     DraftInfo, EditorEnv, EditorError, FrameInfo, ImageViewInfo, ImageViewport, NodeSummary,
@@ -1204,6 +1205,69 @@ pub async fn edit_snap(
     .await
 }
 
+/// 書ける形式 1 つ（形式の表の行。M13 段 4C）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditWritableFormatDto {
+    /// 形式の ID（`edit_save` の `format: { type: "to", format }` に渡す）。
+    pub format: String,
+    /// 代表の拡張子。
+    pub ext: String,
+    /// 今の環境（今のコーデックの組）で、今の出力の形を書けるか（MP3 は ffmpeg がなければ偽）。
+    pub available: bool,
+    /// 形式の表の保存できるもの：可逆・ループ点・マーカー・16 ビットより細かい標本。
+    pub lossless: bool,
+    pub loop_points: bool,
+    pub markers: bool,
+    pub high_bit_depth: bool,
+}
+
+/// 書ける形式の一覧（形式の表の順で、アイテムの種類の行すべて）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditFormatsDto {
+    pub formats: Vec<EditWritableFormatDto>,
+    /// 今の出力の形式に書けないときに保存が使う形式（音声は Ogg Vorbis、書けなければ WAV。画像は PNG）。書ければ null。
+    pub fallback: Option<String>,
+}
+
+impl From<EditFormats> for EditFormatsDto {
+    fn from(f: EditFormats) -> Self {
+        Self {
+            formats: f
+                .formats
+                .into_iter()
+                .map(|w| EditWritableFormatDto {
+                    format: w.format,
+                    ext: w.ext,
+                    available: w.available,
+                    lossless: w.caps.lossless,
+                    loop_points: w.caps.loop_points,
+                    markers: w.caps.markers,
+                    high_bit_depth: w.caps.high_bit_depth,
+                })
+                .collect(),
+            fallback: f.fallback,
+        }
+    }
+}
+
+/// 書ける形式の一覧（確定した頭の出力の形で、保存のジョブと同じ今のコーデックの組で確かめる）。保存が `FormatUnavailable` で
+/// 断られたときに、フロントが形式を選ぶシートに使う。
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_formats(
+    state: State<'_, AppState>,
+    session: String,
+) -> Result<EditFormatsDto, AppError> {
+    let lib = state.session()?;
+    blocking(move || {
+        let env = EditorEnv::of(&lib)?;
+        Ok(editor::formats::formats(&env, &session)?.into())
+    })
+    .await
+}
+
 /// エディタを閉じる（キャッシュ・予算の取り置きを外す。待っている下書きは置く）。今のセッションでなければ何もしない。
 #[tauri::command]
 #[specta::specta]
@@ -1588,6 +1652,48 @@ mod tests {
         let json = serde_json::to_value(source).unwrap();
         assert_eq!(json["audio"]["loop"], json!(null));
         assert_eq!(json["audio"]["lazy"], json!(true));
+    }
+
+    /// 書ける形式の一覧の JSON の形（camelCase。保存できるものは形式の表の値）。
+    #[test]
+    fn formats_serialize_for_the_front() {
+        use kura_core::edit::editor::formats::formats_for;
+        use kura_engine::codec::CodecSet;
+        let shape = kura_engine::Shape::Audio {
+            rate: 44_100,
+            channels: 2,
+            frames: kura_engine::Dim::Exact(1_000),
+        };
+        let dto: EditFormatsDto =
+            formats_for(&CodecSet::pinned(), &FormatChoice::Keep, "mp3", &shape).into();
+        let json = serde_json::to_value(&dto).unwrap();
+        assert_eq!(json["fallback"], json!("ogg"));
+        let rows = json["formats"].as_array().unwrap();
+        let row = |id: &str| rows.iter().find(|r| r["format"] == id).unwrap().clone();
+        assert_eq!(
+            row("mp3"),
+            json!({
+                "format": "mp3",
+                "ext": "mp3",
+                "available": false,
+                "lossless": false,
+                "loopPoints": false,
+                "markers": false,
+                "highBitDepth": false,
+            })
+        );
+        assert_eq!(
+            row("flac"),
+            json!({
+                "format": "flac",
+                "ext": "flac",
+                "available": true,
+                "lossless": true,
+                "loopPoints": true,
+                "markers": false,
+                "highBitDepth": true,
+            })
+        );
     }
 
     /// エディタのエラーは画面で分ける code にする。
