@@ -264,6 +264,30 @@ impl PeaksJob {
         }
     }
 
+    /// 組んでいる段が R をすべて受けていれば組み、新しい世代にして返す（配る置き場への公開は呼び手）。まだ受けていない・
+    /// 組めなければ None。中止（新しい要求・閉じる）は組みかけを残し（次の呼び出しで組み直す）、ほかの誤りは捨てる（次の
+    /// 呼び出しで最初から作り直す）。
+    fn complete(&mut self, mon: &dyn Monitor) -> Option<(u64, Arc<Peaks>)> {
+        let run = self.run.as_ref()?;
+        if !run.patch.missing().is_empty() {
+            return None;
+        }
+        match run.patch.assemble(mon) {
+            Ok(peaks) => {
+                let target = run.patch.target().clone();
+                let peaks = Arc::new(peaks);
+                let generation = self.finish(peaks.clone(), &target);
+                Some((generation, peaks))
+            }
+            Err(err) if matches!(err.root(), EngineError::Canceled) => None,
+            Err(err) => {
+                tracing::warn!(%err, "波形の段を組めません");
+                self.run = None;
+                None
+            }
+        }
+    }
+
     /// 組み終えた段を受けて新しい世代にし、その世代を返す（配る置き場への公開は呼び手）。変わった区間は、前に公開した段と
     /// 形が同じなら R、違えば全体。
     fn finish(&mut self, peaks: Arc<Peaks>, target: &kura_engine::value::ChunkSet) -> u64 {
@@ -426,24 +450,8 @@ impl Editor {
         let Some(audio) = st.audio.as_mut() else {
             return;
         };
-        let job = &mut audio.peaks;
-        let Some(run) = job.run.as_ref() else {
-            return;
-        };
-        if !run.patch.missing().is_empty() {
-            return;
-        }
-        match run.patch.assemble(ticket) {
-            Ok(peaks) => {
-                let target = run.patch.target().clone();
-                let peaks = Arc::new(peaks);
-                let generation = job.finish(peaks.clone(), &target);
-                self.publish_peaks(generation, peaks);
-            }
-            Err(err) => {
-                tracing::warn!(%err, "波形の段を組めません");
-                job.run = None;
-            }
+        if let Some((generation, peaks)) = audio.peaks.complete(ticket) {
+            self.publish_peaks(generation, peaks);
         }
     }
 }
@@ -614,6 +622,39 @@ mod tests {
             order_windows(w, Some((15, 25))),
             vec![(10, 20), (20, 30), (0, 10)]
         );
+    }
+
+    /// 組み立て（assemble）が中止（新しい要求に取って代わられた）で止まっても、受けたチャンク（組みかけ）は残し、次の
+    /// 呼び出しで組み直して新しい世代で出す。
+    #[test]
+    fn canceled_assembly_keeps_the_run() {
+        let c = AUDIO_CHUNK as u64;
+        let frames = 2 * c + 5;
+        let data: Vec<f32> = (0..frames)
+            .map(|i| (i % 200) as f32 / 100.0 - 1.0)
+            .collect();
+        let mut job = PeaksJob::new(None);
+        let mut patch = PeaksPatch::fresh(PeaksParams::default(), 8_000, 1, frames);
+        for k in patch.missing().iter() {
+            let a = k * AUDIO_CHUNK;
+            let b = (a + AUDIO_CHUNK).min(data.len());
+            patch.feed_chunk(k, &[&data[a..b]]).unwrap();
+        }
+        job.run = Some(Run {
+            target_rev: 0,
+            patch,
+        });
+        let canceled = kura_engine::monitor::CancelFlag::default();
+        canceled.cancel();
+        assert!(job.complete(&canceled).is_none());
+        assert!(job.run.is_some(), "中止では組みかけを残す");
+        assert!(job.pending());
+        let (generation, peaks) = job.complete(&kura_engine::NoMonitor).unwrap();
+        assert!(job.run.is_none());
+        assert!(!job.pending());
+        assert_eq!(job.shown().map(|(g, _)| g), Some(generation));
+        assert_eq!(peaks.frames, frames);
+        assert_eq!(peaks.levels.len(), PEAK_BINS.len());
     }
 
     #[test]
