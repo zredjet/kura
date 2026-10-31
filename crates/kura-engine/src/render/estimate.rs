@@ -59,6 +59,9 @@ pub enum Source<'a> {
         decoder: &'a dyn Decoder,
         format: &'a str,
     },
+    /// 遅延の値（チャンクは源の参照。M13 段 3）：値は数えず、源の LRU の上限 `resident` を読む段・描く段・書く段のどれにも
+    /// 足す（読む段の作業領域は 0。保存は貸りた入力でも自分で数える）。
+    Lazy { resident: u64 },
 }
 
 impl std::fmt::Debug for Source<'_> {
@@ -68,6 +71,7 @@ impl std::fmt::Debug for Source<'_> {
             Self::Memory => write!(f, "Memory"),
             Self::Decode { format, .. } => write!(f, "Decode({format})"),
             Self::Decoder { decoder, format } => write!(f, "Decoder({}, {format})", decoder.id()),
+            Self::Lazy { resident } => write!(f, "Lazy({resident})"),
         }
     }
 }
@@ -120,7 +124,8 @@ pub struct EstimateSpec<'a> {
     pub area: Option<(OutputId, crate::render::region::Area)>,
     /// 流れ（`Engine::stream_audio` の全体）の見積もり：出力の窓（`STREAM_CHUNKS` チャンク）1 つを描く間のピークを、どの窓を
     /// 描いても超えないように数える（M13 段 1 の検証の直し。窓 0 の区間だけの見積もりは、窓ごとの最大ではない）。`area` より
-    /// 先に見る。
+    /// 先に見る。その出力を書き出すなら（`outputs`）、流して書く量で数える（M13 段 3：窓の出力 ＋ エンコーダの
+    /// `Encoder::stream_work_bytes` ＋ 値のダイジェストの作業領域 ＋ 遅延の入力の `resident`。書いたバイト列は持たない）。
     pub stream: Option<OutputId>,
 }
 
@@ -222,6 +227,8 @@ pub struct MemoryEstimate {
     pub retained: u64,
     /// ノードごと（計画の順）。
     pub nodes: Vec<NodeEstimate>,
+    /// 流して書くときに出力を全体で流す回数（`Encoder::stream_passes`。進捗の重み。流して書かなければ 0。M13 段 3）。
+    pub stream_passes: u32,
 }
 
 /// 見積もりでキャッシュの当たりを引くためのもの（エディタ）。`inputs` は `render_cached` に渡すのと同じもの。
@@ -325,7 +332,7 @@ impl Engine {
         cache: Option<CacheProbe<'_>>,
     ) -> Result<MemoryEstimate, EngineError> {
         let Some(out) = spec.stream else {
-            return self.estimate_with(plan, spec, cache, false);
+            return self.estimate_with(plan, spec, cache, false, None);
         };
         // 流れ：どの窓を描いても超えない見積もり（窓の候補ごとの見積もりの、ピークの最大）
         let frames = match plan.outputs.iter().find(|o| o.0 == out) {
@@ -347,7 +354,7 @@ impl Engine {
             let mut one = spec.clone();
             one.stream = None;
             one.area = Some((out, window));
-            let e = self.estimate_with(plan, &one, cache, pad)?;
+            let e = self.estimate_with(plan, &one, cache, pad, Some(out))?;
             if most.as_ref().is_none_or(|m| e.peak > m.peak) {
                 most = Some(e);
             }
@@ -355,13 +362,15 @@ impl Engine {
         most.ok_or_else(|| EngineError::Internal("流れの窓の見積もりがありません".into()))
     }
 
-    /// [`Engine::estimate`] の本体（`pad` は範囲の描画の見積もりで、出力のノードのほかの要る区間を両側へ 1 チャンク広げる）。
+    /// [`Engine::estimate`] の本体（`pad` は範囲の描画の見積もりで、出力のノードのほかの要る区間を両側へ 1 チャンク広げる。
+    /// `streamed` は流す出力（書き出すなら流して書く量で数える）。
     fn estimate_with(
         &self,
         plan: &Plan,
         spec: &EstimateSpec<'_>,
         cache: Option<CacheProbe<'_>>,
         pad: bool,
+        streamed: Option<OutputId>,
     ) -> Result<MemoryEstimate, EngineError> {
         let hits = match cache {
             Some(probe) => self.cache_hits(plan, probe)?,
@@ -377,6 +386,8 @@ impl Engine {
             let src = spec.inputs.get(id).copied().unwrap_or(Source::Memory);
             let bytes = match src {
                 Source::Held => 0,
+                // 遅延の値は源の LRU の上限だけを持つ（どの段にも足す）
+                Source::Lazy { resident } => resident,
                 _ => shape.value_bytes(),
             };
             let len = spec.lens.get(id).copied();
@@ -393,7 +404,7 @@ impl Engine {
                 (Source::Decoder { decoder, format }, Some(len)) => {
                     Some(decoder.file_work_bytes(format, shape, len))
                 }
-                (Source::Held | Source::Memory, _) => None,
+                (Source::Held | Source::Memory | Source::Lazy { .. }, _) => None,
             };
             if let Some(work) = work {
                 // 読み取りの記録のために、読んだ値のダイジェストも取る
@@ -447,11 +458,53 @@ impl Engine {
         let mut encode = 0u64;
         let mut files = 0u64;
         let mut writes = false;
+        let mut stream_passes = 0u32;
         for (id, _, shape, _) in &plan.outputs {
             let Some(sink) = spec.outputs.get(id) else {
                 continue;
             };
             writes = true;
+            if streamed == Some(*id) {
+                // 流して書く（M13 段 3）：窓の出力（描く段の残り `retained` に入っている）＋ エンコーダの流れの作業領域 ＋
+                // 値のダイジェスト（R1）の作業領域。書いたバイト列はファイルへ出すので持たない
+                let (work, passes) = match *sink {
+                    Sink::Encode {
+                        codecs,
+                        format,
+                        opts,
+                    } => (
+                        codecs.encode_stream_work_bytes(format, shape, opts),
+                        codecs
+                            .encoder(format, shape)
+                            .map_or(1, |e| e.stream_passes(format, opts)),
+                    ),
+                    Sink::Encoder {
+                        encoder,
+                        format,
+                        opts,
+                    } => (
+                        encoder.stream_work_bytes(format, shape, opts),
+                        encoder.stream_passes(format, opts),
+                    ),
+                };
+                let channels = match shape {
+                    Shape::Audio { channels, .. } => usize::from(*channels),
+                    _ => 0,
+                };
+                let digest = if spec.digests {
+                    crate::audio::digest::PcmTreeDigest::work_bytes(channels, tasks)
+                } else {
+                    0
+                };
+                stream_passes = stream_passes.max(passes);
+                encode = encode.max(
+                    retained
+                        .saturating_add(files)
+                        .saturating_add(work)
+                        .saturating_add(digest),
+                );
+                continue;
+            }
             let work = match *sink {
                 Sink::Encode {
                     codecs,
@@ -487,6 +540,7 @@ impl Engine {
             carried_render,
             retained,
             nodes,
+            stream_passes,
         })
     }
 

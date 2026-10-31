@@ -1748,3 +1748,92 @@ fn cache_lease_counts_the_extra() {
     assert_eq!(ed.held.bytes(), 4 * MIB);
     assert_eq!(ed.budget.usage().unwrap().standing, 4 * MIB);
 }
+
+/// E25（M13 段 3）：流して書く見積もり（`EstimateSpec::stream` ＋ 書き出し）は、窓の値の常駐 ＋ エンコーダの流れの作業領域
+/// （`Encoder::stream_work_bytes`）＋ 遅延の入力の `resident` 以上で、書いたバイト列（値の大きさ）を持たない。60 分の
+/// 48 kHz ステレオ（値 1.3 GiB）の trim → fade → normalize → gain を WAV・FLAC・ogg q5 に書く見積もりは 3 時間まで resident ＋ 128 MiB 未満、
+/// パスの数はエンコーダの申告（ogg は 2）。
+#[test]
+fn stream_estimate_bounds_streamed_saves() {
+    let engine = engine();
+    let codecs = CodecSet::pinned();
+    let resident = 64 * MIB;
+    for minutes in [1u64, 60, 180] {
+        let frames = 48_000 * 60 * minutes;
+        let shape = Shape::Audio {
+            rate: 48_000,
+            channels: 2,
+            frames: Dim::Exact(frames),
+        };
+        let shapes = BTreeMap::from([(InputId(0), shape)]);
+        let mut g = Graph::new_single();
+        g.push_linear("audio.trim", 1, json!({ "start": 1_000, "end": null }), 1)
+            .unwrap();
+        g.push_linear(
+            "audio.fade",
+            1,
+            json!({ "fadeIn": 48_000, "fadeOut": 96_000, "curve": "linear" }),
+            2,
+        )
+        .unwrap();
+        g.push_linear(
+            "audio.normalize",
+            1,
+            json!({ "target": -16.0, "peakLimit": -1.0 }),
+            3,
+        )
+        .unwrap();
+        g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 4)
+            .unwrap();
+        let plan = engine.compile(&g, &shapes).unwrap();
+        let out_shape = plan.output_shapes()[0].1;
+        let value = out_shape.value_bytes();
+        for (format, opts, passes) in [
+            ("wav", json!({}), 1u32),
+            ("flac", json!({}), 1),
+            ("ogg", json!({ "quality": 5 }), 2),
+        ] {
+            let spec = EstimateSpec::new(3)
+                .stream(OutputId(0))
+                .digests(true)
+                .input(InputId(0), Source::Lazy { resident })
+                .output(
+                    OutputId(0),
+                    Sink::Encode {
+                        codecs: &codecs,
+                        format,
+                        opts: &opts,
+                    },
+                );
+            let e = engine.estimate(&plan, &spec, None).unwrap();
+            let work = codecs.encode_stream_work_bytes(format, &out_shape, &opts);
+            let window = 16 * 65_536 * 2 * 4;
+            let what = format!("{minutes} 分・{format}：{e:?}");
+            assert_eq!(e.stream_passes, passes, "{what}");
+            assert!(e.peak >= resident + work + window, "{what}");
+            assert!(e.encode >= resident + work + window, "{what}");
+            assert!(
+                e.peak < resident + work + 128 * MIB,
+                "{what}：書いたバイト列や全体の値を数えている"
+            );
+            assert!(minutes < 60 || e.peak < value / 8, "{what}");
+            // 流さない見積もりは全体の値とバイト列を数える
+            let whole = engine
+                .estimate(
+                    &plan,
+                    &EstimateSpec::new(3).digests(true).output(
+                        OutputId(0),
+                        Sink::Encode {
+                            codecs: &codecs,
+                            format,
+                            opts: &opts,
+                        },
+                    ),
+                    None,
+                )
+                .unwrap();
+            assert!(whole.peak > 2 * value, "{what}：{whole:?}");
+            assert_eq!(whole.stream_passes, 0);
+        }
+    }
+}
