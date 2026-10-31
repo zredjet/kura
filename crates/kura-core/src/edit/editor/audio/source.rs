@@ -1,8 +1,9 @@
 //! 音声の元の開き方（M13 段 4。docs/editing.md §9.11・§12.10）。
 //!
 //! 1. **アンカーがある**：アンカーの f32 WAV を遅延の源で開く（`CodecSet::open_audio_source`）。アンカーの見出しの記録が DB の
-//!    アンカーの記録と同じなら、その記録の値のダイジェストを入力の指紋にする。違う・開けなければ今の道（記録のデコーダで読み
-//!    直して照らす。`super::super::source::read`）に落とす。値を照らすのは開くときではなく保存のとき（段 3）。
+//!    アンカーの記録と同じなら、その記録の値のダイジェストを入力の指紋にし、元の読み取りのデコーダは記録のもの（アンカーの
+//!    読み手の名前ではない）にする。違う・開けなければ今の道（記録のデコーダで読み直して照らす。`super::super::source::read`）
+//!    に落とす。値を照らすのは開くときではなく保存のとき（段 3）。
 //! 2. **WAV・AIFF**（`open_audio_source` が Some を返すもの）：遅延の源で開く。DB の事実の行（`media_facts`）のデコーダが開いた
 //!    デコーダと同じで、文書の入力の読み方が既定なら、その値のダイジェストで記録（`DecodeStamp`。固定の段・再現する）を作る。
 //!    そうでなければ記録はなく、指紋は派生（`Fingerprint::derive("audio-source", 元の中身, デコーダと読み方)`）。
@@ -242,10 +243,11 @@ pub(crate) fn open_lazy(cx: &LazyCx<'_>) -> Result<Option<OpenedAudio>, EditorEr
             tracing::info!("アンカーの見出しの記録が DB と違うので、元を読み直して開きます");
             return Ok(None);
         }
+        // 元の読み取りのデコーダは記録のもの（アンカーの読み手の名前ではない。丸ごと読みに落ちたときと同じ値）
         return opened(
             o.value,
             cx.source,
-            o.decoder,
+            &a.decoded.codec,
             cx.opts,
             Some(a.decoded.clone()),
         )

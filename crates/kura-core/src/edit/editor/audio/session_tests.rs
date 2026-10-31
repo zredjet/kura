@@ -301,6 +301,95 @@ fn wav_opens_lazily_and_flac_whole() {
     assert_eq!(shown_audio(&opened.outcome.view).valid, vec![(0, 2 * C)]);
 }
 
+/// アンカーを置く（保存のジョブの代わり）：アイテムの元 `bytes` を読んだ値を、見出しの記録 `header` でアンカーの f32 WAV に
+/// 書き、DB の行の記録を元を読んだ記録にする。返すのは DB の行の記録。
+fn place_anchor(
+    lib: &Library,
+    bytes: &[u8],
+    header: impl FnOnce(&kura_engine::codec::DecodeStamp) -> kura_engine::codec::DecodeStamp,
+) -> kura_engine::codec::DecodeStamp {
+    use kura_engine::codec::anchor;
+    let (value, decoded) = CodecSet::pinned()
+        .decode(
+            &mut std::io::Cursor::new(bytes),
+            "wav",
+            &Default::default(),
+            &Default::default(),
+            &NoMonitor,
+        )
+        .unwrap();
+    let source = *blake3::hash(bytes).as_bytes();
+    let mut file = Vec::new();
+    anchor::write(
+        &value,
+        &header(&decoded),
+        &anchor::AnchorContext {
+            source: Some(Digest(source)),
+            format: Some("wav".into()),
+            options: Default::default(),
+        },
+        &Default::default(),
+        &mut file,
+        &NoMonitor,
+    )
+    .unwrap();
+    let hash = *blake3::hash(&file).as_bytes();
+    let path = lib.layout().content_path(&hash, "wav");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &file).unwrap();
+    let size = file.len() as u64;
+    let row = decoded.clone();
+    lib.db()
+        .write(move |tx| {
+            crate::edit::anchors::insert(
+                tx,
+                &crate::edit::anchors::NewAnchor {
+                    source,
+                    options: &Default::default(),
+                    decoded: &row,
+                    hash,
+                    ext: "wav",
+                    size,
+                    now: 1,
+                },
+            )
+        })
+        .unwrap();
+    decoded
+}
+
+/// A1：アンカーのある音声は、見出しの記録が DB と同じなら遅延で開き（入力は中身を持たない）、違えば丸ごと読みに落ちる。
+/// どちらの道でも、元の読み取りのデコーダは記録のもの（アンカーの読み手の名前ではない）。
+#[test]
+fn anchored_audio_opens_lazily_with_the_recorded_decoder() {
+    let env = Env::new();
+    for (seed, same) in [(61u64, true), (62, false)] {
+        let bytes = noise_wav(8_000, 2, 2 * C + 9, seed);
+        let id = add_audio(&env.lib, &bytes, "wav");
+        let recorded = place_anchor(&env.lib, &bytes, |d| {
+            let mut h = d.clone();
+            if !same {
+                // 値は同じで、見出しの記録だけが DB と違う
+                h.codec = "other-kura-dec/9".into();
+            }
+            h
+        });
+        let opened = env.open(id);
+        let a = opened.source.audio.clone().unwrap();
+        assert_eq!(a.lazy, same, "見出しが DB と同じときだけ遅延");
+        assert_eq!(a.decoder, recorded.codec, "記録のデコーダ（{same}）");
+        let editor = env.editor(&opened.session);
+        let (input, decoder) = editor.published_input().unwrap();
+        assert_eq!(decoder, recorded.codec);
+        let Value::Audio(input) = input else { panic!() };
+        if same {
+            assert_eq!(input.resident_bytes(), 0, "遅延の入力は中身を持たない");
+        }
+        let info = shown_audio(&opened.outcome.view);
+        assert_eq!((info.channels, info.frames), (2, 2 * C + 9));
+    }
+}
+
 /// A1：丸ごと読む形式は、値が min(取り置き/2, 512 MiB) を超えれば TooLarge（WAV は遅延なので同じ長さでも開ける）。
 #[test]
 fn long_whole_reads_are_refused() {
