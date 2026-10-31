@@ -341,6 +341,8 @@ fn save_document(frames: u64) -> Graph {
 
 /// 長さ `seconds` 秒の合成の源（LRU 64 MiB）の文書を `formats` に流して書き、E44 の 3 つを確かめる。
 fn save_streams(seconds: u64, formats: &[(&'static str, serde_json::Value)]) -> Vec<SaveReport> {
+    // 報告用に時間を測る（描画の外。値に効かない）
+    #![allow(clippy::disallowed_methods)]
     let frames = seconds * RATE;
     let engine = Engine::new().unwrap();
     let codecs = kura_engine::codec::CodecSet::pinned();
