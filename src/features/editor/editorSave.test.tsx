@@ -725,6 +725,95 @@ describe('書けない形式（FormatUnavailable）', () => {
     );
   });
 
+  it('⌘S の応え待ちに閉じる要求が来たら、形式を選ぶシートが閉じる要求を引き継ぐ：［保存］なら保存し終えてから閉じ、［キャンセル］なら閉じない', async () => {
+    await openAudioDirty({ ext: 'mp3' });
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS,
+      current: 'mp3',
+      fallback: 'ogg',
+    });
+    render(<EditorSheets />);
+    let reject: (error: unknown) => void = () => undefined;
+    const pendingSave = () =>
+      vi.mocked(saveEdit).mockImplementationOnce(
+        () =>
+          new Promise((_, rj) => {
+            reject = rj;
+          }),
+      );
+    let closed: boolean | null = null;
+
+    // ［保存］：選んだ形式で保存し終えてから閉じる
+    pendingSave();
+    requestSave();
+    await flush();
+    expect(saveEdit).toHaveBeenCalledTimes(1);
+    act(() => {
+      void requestCloseEditor('window').then((v) => (closed = v));
+    });
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'unsaved', then: 'window' });
+    await act(async () => reject(formatUnavailable()));
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'format', closeAfter: 'window' });
+    expect(closed).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await flush();
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      'aa01',
+      { type: 'overwrite' },
+      { type: 'to', format: 'ogg' },
+    );
+    expect(closed).toBeNull();
+    savedRefresh();
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    expect(closed).toBe(true);
+    expect(useEditorStore.getState().phase).toBe('closed');
+
+    // ［キャンセル］：閉じるのを待つ呼び手に false を返す
+    await openAudioDirty({ ext: 'mp3' });
+    closed = null;
+    pendingSave();
+    requestSave();
+    await flush();
+    act(() => {
+      void requestCloseEditor('window').then((v) => (closed = v));
+    });
+    await act(async () => reject(formatUnavailable()));
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'format', closeAfter: 'window' });
+    fireEvent.click(screen.getByRole('button', { name: ja.common.cancel }));
+    await flush();
+    expect(closed).toBe(false);
+    expect(useEditorStore.getState().phase).toBe('open');
+    expect(useEditorStore.getState().sheet).toBeNull();
+  });
+
+  it('⌘S の応え待ちに閉じる要求が来て保存が断られたら（保存できませんでした）、閉じるのを待つ呼び手に false を返す', async () => {
+    await openAudioDirty({ ext: 'mp3' });
+    let reject: (error: unknown) => void = () => undefined;
+    vi.mocked(saveEdit).mockImplementationOnce(
+      () =>
+        new Promise((_, rj) => {
+          reject = rj;
+        }),
+    );
+    requestSave();
+    await flush();
+    let closed: boolean | null = null;
+    act(() => {
+      void requestCloseEditor('window').then((v) => (closed = v));
+    });
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'unsaved' });
+    await act(async () =>
+      reject(new IpcError({ code: 'Conflict', message: '版に戻したので開き直してください' })),
+    );
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'saveFailed', code: 'Conflict' });
+    expect(closed).toBe(false);
+    expect(useEditorStore.getState().phase).toBe('open');
+  });
+
   it('書ける形式を読めなければ、今の「保存できませんでした」のシート', async () => {
     await openAudioDirty({ ext: 'mp3' });
     vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());

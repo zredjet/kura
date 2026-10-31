@@ -23,6 +23,8 @@
  * - 保存（上書き・別名・閉じる前の保存）が `FormatUnavailable`（この環境では書けない形式。MP3 で ffmpeg がない、など）で
  *   断られたら、書ける形式の一覧（`edit_formats`）を読んで形式を選ぶシートを出す。既定は代わりの既定（音声は Ogg Vorbis、
  *   画像は PNG）。［保存］で選んだ形式を渡して同じ向きで積み直す。一覧を読めなければ今の「保存できませんでした」のシート。
+ *   保存の応えを待つ間に閉じる要求が来ていたら（未保存のシート）、形式のシートが閉じる要求を引き継ぎ、失敗のシートに
+ *   替えるときは閉じるのを待つ呼び手に「やめた」と答える。
  */
 
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -264,7 +266,9 @@ export function defaultFormatChoice(
 
 /**
  * 書けない形式で断られた保存：書ける形式を読んで、形式を選ぶシートを出す（出せたら真）。書けなかった形式は Rust の解いた
- * 今の出力の形式（`current`。「元と同じ」は元の形式）で、`attempted`（フロントが積むときに推した形式）は予備。
+ * 今の出力の形式（`current`。「元と同じ」は元の形式）で、`attempted`（フロントが積むときに推した形式）は予備。保存の応えを
+ * 待つ間に閉じる要求が来ていたら（未保存のシートが出ている）、形式のシートがそれを引き継ぐ（［保存］なら保存し終えてから
+ * 閉じ、［キャンセル］なら閉じるのをやめる）。
  */
 async function offerFormats(
   session: string,
@@ -280,11 +284,12 @@ async function offerFormats(
     return false;
   }
   if (editorSession() !== session || useEditorStore.getState().phase !== 'open') return false;
+  const shown = useEditorStore.getState().sheet;
   useEditorStore.setState({
     sheet: {
       kind: 'format',
       mode,
-      closeAfter,
+      closeAfter: closeAfter ?? (shown?.kind === 'unsaved' ? shown.then : null),
       formats: list.formats,
       fallback: list.fallback,
       unavailable: list.current || attempted,
@@ -356,6 +361,7 @@ async function startSave(
     if (isIpcError(error, 'Busy')) {
       notify(t.saveBusy);
     } else {
+      const shown = useEditorStore.getState().sheet;
       useEditorStore.setState({
         sheet: {
           kind: 'saveFailed',
@@ -364,6 +370,8 @@ async function startSave(
           message: error instanceof Error ? error.message : String(error),
         },
       });
+      // 応えを待つ間に来た閉じる要求（未保存のシート）を失敗のシートで替えた：閉じるのを待つ呼び手に、やめたと答える
+      if (shown?.kind === 'unsaved') settleClose(false);
     }
     return 'failed';
   } finally {
