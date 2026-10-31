@@ -54,6 +54,7 @@ import {
   type SourceInfo,
 } from './playback';
 import { fromSource, toSource } from './timeline';
+import { trimFrameOf } from './trim';
 import { EMPTY_OVERLAY, type FetchBytes, WaveController, type WaveOverlay } from './waveController';
 import type { FrameSpan, WaveWindow } from './waveMath';
 
@@ -525,13 +526,21 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
         const end = view.frames;
         rt.patch.selection = s.selection.start < end ? { start: s.selection.start, end } : null;
       }
-      // 切り詰めの枠：その操作の入力（仮に無効にした結果）を表示し終えたら、その長さで枠を置く
+      // 切り詰めの枠：その操作の入力（仮に無効にした結果）を表示し終えたら、その表示の印と長さで枠を置く。外した表示
+      // でも写せなければ、枠を出さずに引数パネルで直すよう知らせる（仮の値は結果を受け終えてから捨てる）
       const trim = s.trim;
       if (trim && trim.bounds === null && (!trim.previewed || info.provisional)) {
-        const bounds = view.frames;
-        const start = Math.min(Math.max(0, trim.start), Math.max(0, bounds - 1));
-        const end = Math.min(bounds, Math.max(start + 1, trim.end));
-        rt.patch.trim = { ...trim, bounds, start, end };
+        const framed = trimFrameOf(trim, view.nodes, view.frames);
+        if (framed) {
+          rt.patch.trim = framed;
+        } else {
+          rt.patch.trim = null;
+          rt.patch.tool = 'select';
+          const node = trim.node;
+          queueMicrotask(() => {
+            if (live() === rt && node !== null) trimUnmappable(rt, node);
+          });
+        }
       }
       // ラウドネス：今の出力のものなら出し、なければ（仮でない結果のとき）計る
       const l = view.loudness;
@@ -971,6 +980,13 @@ export function endTrim(
 /** 切り詰めをやめる（esc・ほかの道具・ほかの手）。 */
 export function cancelTrim(): void {
   endTrim();
+}
+
+/** 仮に外した表示でも写せない：仮の値を捨て、その操作を選んで引数パネルで直すよう知らせる。 */
+function trimUnmappable(rt: AudioRuntime, node: number): void {
+  rt.ctx.send([{ step: { type: 'cancelPreview' } }]);
+  useEditorStore.setState({ selected: node, panel: 'ops' });
+  notify(t.trimUseParams);
 }
 
 /** 結果の外で状態に足す（道具の流れ）。 */

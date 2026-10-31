@@ -12,7 +12,7 @@ import {
   targetNode,
   trimHandle,
 } from './handles';
-import { beginTrim, clampTrim, confirmTrimSteps } from './trim';
+import { beginTrim, clampTrim, confirmTrimSteps, trimFrameOf } from './trim';
 
 function doc(nodes: Partial<EditNodeDto>[]): EditorDoc {
   const all = nodes.map((n, i) => ({
@@ -123,37 +123,44 @@ describe('切り詰めの道具の決め方', () => {
     });
   });
 
-  it('有効な切り詰めは仮に無効にして入力を表示し、印の位置に枠（長さは入力が届いてから）', () => {
+  it('有効な切り詰めは仮に無効にして入力を表示し、その表示の印の位置に枠（長さも入力が届いてから）', () => {
     const d = doc([{ id: 5, op: 'audio.trim' }]);
-    const nodes = [
-      {
-        id: 5,
-        op: 'audio.trim',
-        enabled: true,
-        inRate: 48_000,
-        inFrames: 2000,
-        marks: { type: 'trim' as const, start: 100, end: 900 },
-      },
-    ];
-    expect(beginTrim(d, null, nodes, 800)).toEqual({
-      kind: 'frame',
-      trim: { node: 5, start: 100, end: 900, bounds: null, previewed: true },
-      preview: { type: 'preview', edit: { type: 'setEnabled', node: 5, enabled: false } },
+    // 外す前の表示の印（後ろの操作で写せなければ null）では決めない
+    for (const marks of [{ type: 'trim' as const, start: 100, end: 900 }, null]) {
+      const nodes = [
+        { id: 5, op: 'audio.trim', enabled: true, inRate: 48_000, inFrames: 2000, marks },
+      ];
+      expect(beginTrim(d, null, nodes, 800)).toEqual({
+        kind: 'frame',
+        trim: { node: 5, start: 0, end: 800, bounds: null, previewed: true },
+        preview: { type: 'preview', edit: { type: 'setEnabled', node: 5, enabled: false } },
+      });
+    }
+    // 外した表示が届いたら、その印の位置で、その長さに収める
+    const pending = { node: 5, start: 0, end: 800, bounds: null, previewed: true };
+    const off5 = { id: 5, op: 'audio.trim', enabled: false, inRate: 48_000, inFrames: 2000 };
+    const shown = [{ ...off5, marks: { type: 'trim' as const, start: 100, end: 900 } }];
+    expect(trimFrameOf(pending, shown, 2000)).toEqual({
+      ...pending,
+      start: 100,
+      end: 900,
+      bounds: 2000,
     });
+    expect(trimFrameOf(pending, [{ ...off5, marks: null }], 2000)).toBeNull();
     // 外した切り詰めは、今の表示がもう入力
     const off = doc([{ id: 5, op: 'audio.trim', enabled: false }]);
-    expect(beginTrim(off, null, nodes, 2000)).toMatchObject({
-      trim: { bounds: 2000, previewed: false },
+    expect(beginTrim(off, null, shown, 2000)).toMatchObject({
+      trim: { start: 100, end: 900, bounds: 2000, previewed: false },
       preview: null,
     });
   });
 
-  it('印が null（後ろの操作で写せない）なら引数パネルで直す', () => {
-    const d = doc([{ id: 5, op: 'audio.trim' }]);
+  it('外してある切り詰めの印が null（後ろの操作で写せない）なら引数パネルで直す', () => {
+    const d = doc([{ id: 5, op: 'audio.trim', enabled: false }]);
     const nodes = [
-      { id: 5, op: 'audio.trim', enabled: true, inRate: 48_000, inFrames: 2000, marks: null },
+      { id: 5, op: 'audio.trim', enabled: false, inRate: 48_000, inFrames: 2000, marks: null },
     ];
-    expect(beginTrim(d, 5, nodes, 800)).toEqual({ kind: 'params', node: 5 });
+    expect(beginTrim(d, 5, nodes, 2000)).toEqual({ kind: 'params', node: 5 });
   });
 
   it('枠を収め、↵ で送る手（全体の新しい枠は何も足さない）', () => {

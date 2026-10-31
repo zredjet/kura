@@ -219,7 +219,7 @@ describe('切り詰めの道具', () => {
     ]);
   });
 
-  it('後ろの操作で写せない（印が null）なら枠を出さずに知らせ、その操作を選ぶ', async () => {
+  it('仮に外した表示でも写せない（印が null）なら、枠を出さずに知らせ、その操作を選んで仮の値を捨てる', async () => {
     const trimNode = {
       id: 5,
       op: 'audio.trim',
@@ -229,10 +229,73 @@ describe('切り詰めの道具', () => {
       marks: null,
     };
     await open(view({ nodes: [trimNode] }), [node(5, 'audio.trim')]);
+    // 仮の値を捨てた結果（文書はそのまま）
+    vi.mocked(stepEdit).mockImplementation(async () =>
+      result(view({ nodes: [trimNode] }), {}, [node(5, 'audio.trim')]),
+    );
+    vi.mocked(stepEdit).mockImplementationOnce(async () => ({
+      ...result(view({ frames: 20_000, rev: 2, nodes: [trimNode] }), {}, [node(5, 'audio.trim')]),
+      status: { ...result(view()).status, rev: 2, provisional: true },
+    }));
     startTrim();
+    await flush();
     expect(useAudioStore.getState().trim).toBeNull();
+    expect(useAudioStore.getState().tool).toBe('select');
     expect(useEditorStore.getState().selected).toBe(5);
     expect(useNoticeStore.getState().message).toBe(t.trimUseParams);
+    expect(sentSteps()).toEqual([
+      { type: 'preview', edit: { type: 'setEnabled', node: 5, enabled: false } },
+      { type: 'cancelPreview' },
+    ]);
+  });
+
+  it('外す前の印では写せなくても（後ろに end: null の切り詰め）、外した表示の印で枠を出して直せる', async () => {
+    // [trim A {1000, 2000}, trim B {100, null}]：A が有効なとき、B の写しでは A の印が範囲の外
+    const a = { id: 1, op: 'audio.trim', enabled: true, inRate: 48_000, inFrames: 20_000 };
+    const b = { id: 2, op: 'audio.trim', enabled: true, inRate: 48_000, inFrames: 1000 };
+    await open(
+      view({
+        frames: 900,
+        nodes: [
+          { ...a, marks: null },
+          { ...b, marks: { type: 'trim' as const, start: 0, end: 900 } },
+        ],
+      }),
+      [node(1, 'audio.trim'), node(2, 'audio.trim')],
+    );
+    useEditorStore.setState({ selected: 1 });
+    // A を仮に外した表示：B は [100, 20000) で、A の印は 900..1900
+    vi.mocked(stepEdit).mockImplementationOnce(async () => ({
+      ...result(
+        view({
+          frames: 19_900,
+          rev: 2,
+          nodes: [
+            { ...a, enabled: false, marks: { type: 'trim' as const, start: 900, end: 1900 } },
+            { ...b, inFrames: 20_000, marks: { type: 'trim' as const, start: 0, end: 19_900 } },
+          ],
+        }),
+      ),
+      status: { ...result(view()).status, rev: 2, provisional: true },
+    }));
+    startTrim();
+    await flush();
+    expect(useNoticeStore.getState().message).toBeNull();
+    expect(useAudioStore.getState().trim).toEqual({
+      node: 1,
+      start: 900,
+      end: 1900,
+      bounds: 19_900,
+      previewed: true,
+    });
+    setTrimFrame(900, 5000);
+    vi.mocked(stepEdit).mockClear();
+    confirmTrim();
+    await flush();
+    expect(sentSteps()).toEqual([
+      { type: 'cancelPreview' },
+      { type: 'handle', handle: { type: 'trim', start: 900, end: 5000 }, node: 1, mode: 'step' },
+    ]);
   });
 
   it('切り詰めの枠を出している間は、ループの旗をつかめない（表示の座標が切り詰めを外したものなので）', async () => {
