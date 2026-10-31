@@ -199,6 +199,136 @@ impl PcmLayout {
     }
 }
 
+/// 書く標本の並べ方（WAV・AIFF の data・SSND）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackOrder {
+    /// WAV：リトルエンディアン。8 ビットは符号なし（+128）。
+    WavLe,
+    /// AIFF：ビッグエンディアン。8 ビットも符号付き。
+    AiffBe,
+}
+
+/// 流れの窓を、フレームごとにチャンネルを並べた整数・浮動小数の標本にして書く受け手（WAV・AIFF の `encode_stream`。
+/// 標本ごとの式は値を書くときと同じなので、窓の切り方によらず同じバイト列）。窓は頭から続けて来ること（隙間・重なりは
+/// `Internal`）。作業列は [`PACK_FRAMES`] フレーム分。
+pub(crate) struct PackSink<'o> {
+    out: &'o mut dyn crate::codec::WriteSeek,
+    order: PackOrder,
+    bits: u16,
+    float: bool,
+    channels: usize,
+    next: u64,
+    buf: Vec<u8>,
+    /// 書いたバイト数。
+    pub written: u64,
+}
+
+/// [`PackSink`] の作業列のフレームの数（書くバイト列に効かない）。
+pub(crate) const PACK_FRAMES: usize = 16_384;
+
+impl<'o> PackSink<'o> {
+    /// `channels` チャンネルを `bits` ビット（`float` なら 32 ビットの浮動小数）で `out` に書く受け手。
+    pub fn new(
+        out: &'o mut dyn crate::codec::WriteSeek,
+        order: PackOrder,
+        bits: u16,
+        float: bool,
+        channels: usize,
+    ) -> Result<Self, EngineError> {
+        let block = channels.saturating_mul(usize::from(bits / 8));
+        let buf = crate::codec::try_vec(PACK_FRAMES.saturating_mul(block), 0u8)?;
+        Ok(Self {
+            out,
+            order,
+            bits,
+            float,
+            channels,
+            next: 0,
+            buf,
+            written: 0,
+        })
+    }
+
+    /// 受けたフレームの数。
+    pub fn frames(&self) -> u64 {
+        self.next
+    }
+
+    /// 作業列の大きさ（見積もり）：`channels` チャンネル × 4 バイト × [`PACK_FRAMES`]。
+    pub fn work_bytes(channels: usize) -> u64 {
+        (channels as u64)
+            .saturating_mul(4)
+            .saturating_mul(PACK_FRAMES as u64)
+    }
+}
+
+impl crate::audio::stream::AudioSink for PackSink<'_> {
+    fn begin(&mut self, info: &crate::audio::stream::StreamInfo) -> Result<(), EngineError> {
+        if info.channels != self.channels {
+            return Err(EngineError::Internal(
+                "書く流れのチャンネルの数が違います".into(),
+            ));
+        }
+        self.next = 0;
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn crate::monitor::Monitor,
+    ) -> Result<(), EngineError> {
+        if start != self.next || planes.len() != self.channels {
+            return Err(EngineError::Internal(format!(
+                "書く流れの窓が続いていません（{start} から。次は {}）",
+                self.next
+            )));
+        }
+        let total = planes.first().map_or(0, |p| p.len());
+        let sample = usize::from(self.bits / 8);
+        let block = self.channels * sample;
+        let mut done = 0usize;
+        while done < total {
+            if mon.canceled() {
+                return Err(EngineError::Canceled);
+            }
+            let n = (total - done).min(PACK_FRAMES);
+            for f in 0..n {
+                for (c, plane) in planes.iter().enumerate() {
+                    let s = plane[done + f];
+                    let at = f * block + c * sample;
+                    let dst = &mut self.buf[at..at + sample];
+                    match (self.order, self.float) {
+                        (PackOrder::WavLe, true) => dst.copy_from_slice(&s.to_le_bytes()),
+                        (PackOrder::AiffBe, true) => dst.copy_from_slice(&s.to_be_bytes()),
+                        (PackOrder::WavLe, false) if self.bits == 8 => {
+                            dst[0] = (quantize(s, 8) + 128) as u8;
+                        }
+                        (PackOrder::WavLe, false) => {
+                            dst.copy_from_slice(&quantize(s, self.bits).to_le_bytes()[..sample]);
+                        }
+                        (PackOrder::AiffBe, false) => {
+                            dst.copy_from_slice(
+                                &quantize(s, self.bits).to_be_bytes()[8 - sample..],
+                            );
+                        }
+                    }
+                }
+            }
+            self.out.write_all(&self.buf[..n * block])?;
+            self.written += (n * block) as u64;
+            done += n;
+        }
+        self.next += total as u64;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

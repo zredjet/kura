@@ -22,9 +22,12 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::audio::source::{Opener, PcmFileSource};
-use crate::codec::pcm::{self, PcmLayout, SampleEncoding, quantize};
+use crate::audio::stream::{AudioProducer, ValueProducer};
+use crate::codec::pcm::{self, PackOrder, PackSink, PcmLayout, SampleEncoding};
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
-use crate::codec::{Decoder, Encoder, MetaCaps, OpenedSource, ReadSeek, Tier, caps_of, try_vec};
+use crate::codec::{
+    Decoder, Encoder, MetaCaps, NoSeek, OpenedSource, ReadSeek, Tier, WriteSeek, caps_of, try_vec,
+};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
 use crate::limits::Limits;
@@ -644,7 +647,7 @@ impl Encoder for AiffCodec {
     fn encode(
         &self,
         value: &Value,
-        _format: &str,
+        format: &str,
         opts: &serde_json::Value,
         out: &mut dyn Write,
         mon: &dyn Monitor,
@@ -654,14 +657,43 @@ impl Encoder for AiffCodec {
                 "AIFF には音声だけを書けます".into(),
             ));
         };
-        let (bits, float) = pcm::target(opts, a.meta.source, &[8, 16, 24, 32], true, "AIFF")?;
-        let channels = i16::try_from(a.channels())
+        // 値も流して書く口を通る（実装は 1 つ。シークしない）
+        let mut src = ValueProducer::new(a);
+        self.encode_stream(&mut src, format, opts, &mut NoSeek::new(out), mon)
+    }
+
+    fn streams(&self, format: &str) -> bool {
+        format == "aiff"
+    }
+
+    /// 作業列（16,384 フレーム × チャンネル × 4 バイトまで）とメタデータのチャンク（64 KiB の見込み）。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
+        let channels = match shape {
+            Shape::Audio { channels, .. } => usize::from(*channels),
+            _ => 0,
+        };
+        PackSink::work_bytes(channels).saturating_add(64 << 10)
+    }
+
+    /// 長さ・メタデータは流れの形で分かるので、COMM・MARK・INST・名前を先に書き、SSND を窓ごとに書く（シークしない）。
+    fn encode_stream(
+        &self,
+        src: &mut dyn AudioProducer,
+        _format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn WriteSeek,
+        mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        let info = src.info().clone();
+        let meta = &info.meta;
+        let (bits, float) = pcm::target(opts, meta.source, &[8, 16, 24, 32], true, "AIFF")?;
+        let channels = i16::try_from(info.channels)
             .map_err(|_| EngineError::Unsupported("チャンネルが多すぎます".into()))?;
-        let frames = a.frames() as u64;
+        let frames = info.frames;
         let frames32 = u32::try_from(frames)
             .map_err(|_| EngineError::Unsupported("長すぎて AIFF に書けません".into()))?;
         let sample = usize::from(bits / 8);
-        let block = a.channels() * sample;
+        let block = info.channels * sample;
         let data_len = frames * block as u64;
 
         let mut chunks: Vec<([u8; 4], Vec<u8>)> = Vec::new();
@@ -672,16 +704,15 @@ impl Encoder for AiffCodec {
         comm.extend_from_slice(&channels.to_be_bytes());
         comm.extend_from_slice(&frames32.to_be_bytes());
         comm.extend_from_slice(&(bits as i16).to_be_bytes());
-        comm.extend_from_slice(&write_ext80(a.rate()));
+        comm.extend_from_slice(&write_ext80(info.rate));
         if float {
             comm.extend_from_slice(b"fl32");
             comm.extend_from_slice(&pstring("32-bit floating point"));
         }
         chunks.push((*b"COMM", comm));
         // マーカー：ふつうのマーカー（id 1..）とループの 2 つ
-        let markers: Vec<&Marker> = a.meta.markers.iter().filter(|m| m.pos < frames).collect();
-        let lp = a
-            .meta
+        let markers: Vec<&Marker> = meta.markers.iter().filter(|m| m.pos < frames).collect();
+        let lp = meta
             .loop_range
             .filter(|l| l.start < l.end && l.end <= frames);
         let count = markers.len() + if lp.is_some() { 2 } else { 0 };
@@ -721,7 +752,7 @@ impl Encoder for AiffCodec {
             ("comment", *b"ANNO"),
         ] {
             // 読み取りと同じ形（4,096 バイトまで・NUL まで・前後の空白なし）にして書く（書いて読み直すと同じ値）
-            if let Some(t) = a.meta.tags.get(key) {
+            if let Some(t) = meta.tags.get(key) {
                 let t = text_of(crate::codec::clip_text(t, TEXT_MAX).as_bytes());
                 chunks.push((id, t.into_bytes()));
             }
@@ -736,62 +767,41 @@ impl Encoder for AiffCodec {
         let form_len = u32::try_from(form_len)
             .map_err(|_| EngineError::Unsupported("4GB を超える AIFF は書けません".into()))?;
         let mut written = 0u64;
-        let mut put = |out: &mut dyn Write, bytes: &[u8]| -> Result<(), EngineError> {
-            out.write_all(bytes)?;
-            written += bytes.len() as u64;
-            Ok(())
-        };
-        put(out, b"FORM")?;
-        put(out, &form_len.to_be_bytes())?;
-        put(out, if float { b"AIFC" } else { b"AIFF" })?;
+        put(out, &mut written, b"FORM")?;
+        put(out, &mut written, &form_len.to_be_bytes())?;
+        put(out, &mut written, if float { b"AIFC" } else { b"AIFF" })?;
         for (id, body) in &chunks {
-            put(out, id)?;
-            put(out, &(body.len() as u32).to_be_bytes())?;
-            put(out, body)?;
+            put(out, &mut written, id)?;
+            put(out, &mut written, &(body.len() as u32).to_be_bytes())?;
+            put(out, &mut written, body)?;
             if body.len() & 1 == 1 {
-                put(out, &[0])?;
+                put(out, &mut written, &[0])?;
             }
         }
-        put(out, b"SSND")?;
-        put(out, &((8 + data_len) as u32).to_be_bytes())?;
-        put(out, &[0u8; 8])?;
-        let chunk_frames = 16_384usize;
-        let mut buf = try_vec(chunk_frames * block, 0u8)?;
-        let total = a.frames();
-        // 窓ごとに各チャンネルを作業列へ読む（持つ量は窓の分だけ）
-        let mut planes: Vec<Vec<f32>> = (0..a.channels())
-            .map(|_| try_vec(chunk_frames.min(total), 0f32))
-            .collect::<Result<_, _>>()?;
-        let mut done = 0usize;
-        while done < total {
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            let n = (total - done).min(chunk_frames);
-            for (c, plane) in planes.iter_mut().enumerate() {
-                a.read(c, done as u64, &mut plane[..n])?;
-            }
-            for f in 0..n {
-                for (c, plane) in planes.iter().enumerate() {
-                    let s = plane[f];
-                    let at = f * block + c * sample;
-                    let dst = &mut buf[at..at + sample];
-                    if float {
-                        dst.copy_from_slice(&s.to_be_bytes());
-                    } else {
-                        let v = quantize(s, bits);
-                        dst.copy_from_slice(&v.to_be_bytes()[8 - sample..]);
-                    }
-                }
-            }
-            put(out, &buf[..n * block])?;
-            done += n;
+        put(out, &mut written, b"SSND")?;
+        put(out, &mut written, &((8 + data_len) as u32).to_be_bytes())?;
+        put(out, &mut written, &[0u8; 8])?;
+        let mut data = PackSink::new(out, PackOrder::AiffBe, bits, float, info.channels)?;
+        src.produce(None, &mut data, mon)?;
+        if data.frames() != frames {
+            return Err(EngineError::Internal(format!(
+                "流した長さが形と違います（{} / {frames}）",
+                data.frames()
+            )));
         }
+        written += data.written;
         if data_len & 1 == 1 {
-            put(out, &[0])?;
+            put(out, &mut written, &[0])?;
         }
         Ok(written)
     }
+}
+
+/// `bytes` を書いて `written` に数える。
+fn put(out: &mut dyn WriteSeek, written: &mut u64, bytes: &[u8]) -> Result<(), EngineError> {
+    out.write_all(bytes)?;
+    *written += bytes.len() as u64;
+    Ok(())
 }
 
 #[cfg(test)]

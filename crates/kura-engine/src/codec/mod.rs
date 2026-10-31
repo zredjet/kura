@@ -12,6 +12,10 @@
 //! - 音声は流して読める（M13 段 2。`stream`）：[`Decoder::decode_stream`] は標本を `stream::DecodeOut` に渡し、
 //!   [`CodecSet::decode_stream`] が窓に揃えて呼び手の `stream::DecodeSink` へ流しながら値のダイジェストを取る。音声の
 //!   デコーダの `decode` は同じ道を組み手の形（`stream::collect`）で通す（値は同じ）。
+//! - 音声は流して書ける（M13 段 3）：[`Encoder::encode_stream`] は生産者（`audio::stream::AudioProducer`。計画の出力は
+//!   `Engine::output_stream`）を読んで [`WriteSeek`] に書き、[`CodecSet::encode_stream`] が生産者をダイジェストの包みで
+//!   包んで値のダイジェスト（R1）を取る。流して書くエンコーダの `encode` は値の生産者で同じ道を通す（バイト列は 1 つの
+//!   実装で決まる）。ファイルのダイジェスト（R2）は書いたものを読み直して [`FileDigest`] で取る。
 
 pub mod aiff;
 pub mod anchor;
@@ -41,7 +45,7 @@ pub mod wav;
 pub mod webp;
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read, Seek, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
@@ -69,6 +73,83 @@ pub use stream::{DecodeInfo, DecodeOut, DecodeSink, DigestMode, NullSink};
 /// 読める・シークできる入力。
 pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
+
+/// 書ける・シークできる出力（流して書く口 [`Encoder::encode_stream`] の書き先。FLAC は最後に STREAMINFO へ戻って直す）。
+pub trait WriteSeek: Write + Seek {}
+impl<T: Write + Seek> WriteSeek for T {}
+
+/// シークできない書き先を [`WriteSeek`] にする包み（値を書く `Encoder::encode` が、流して書く実装を通るため）。シークを
+/// 呼ぶと誤り（今の位置を尋ねるだけなら答える）。シークしないエンコーダ（WAV・AIFF・Ogg Vorbis・AAC・MP3）だけが使う。
+pub struct NoSeek<'a> {
+    out: &'a mut dyn Write,
+    pos: u64,
+}
+
+impl<'a> NoSeek<'a> {
+    /// `out` を包む。
+    pub fn new(out: &'a mut dyn Write) -> Self {
+        Self { out, pos: 0 }
+    }
+}
+
+impl Write for NoSeek<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.out.write(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+impl Seek for NoSeek<'_> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match pos {
+            std::io::SeekFrom::Current(0) => Ok(self.pos),
+            std::io::SeekFrom::Start(p) if p == self.pos => Ok(self.pos),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "この書き先はシークできません",
+            )),
+        }
+    }
+}
+
+/// `kura-file-v1`（書いたファイルの中身のダイジェスト。R2）を流して取る：blake3("kura-file-v1" のドメイン ‖ 長さ（u64 LE）‖
+/// 中身)。長さを先に決めて、中身を何回に分けて足しても同じ（[`EncodedStamp::file_digest`]）。
+pub struct FileDigest {
+    h: Hasher,
+    len: u64,
+    seen: u64,
+}
+
+impl FileDigest {
+    /// 長さ `len` バイトのファイルのダイジェストを取り始める。
+    pub fn new(len: u64) -> Self {
+        let mut h = Hasher::new("kura-file-v1");
+        h.u64(len);
+        Self { h, len, seen: 0 }
+    }
+
+    /// 中身を続けて足す。
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.h.raw(bytes);
+        self.seen = self.seen.saturating_add(bytes.len() as u64);
+    }
+
+    /// 足し終えたダイジェスト（足した長さが `new` の長さと違えば `Internal`）。
+    pub fn finish(&self) -> Result<Digest, EngineError> {
+        if self.seen != self.len {
+            return Err(EngineError::Internal(format!(
+                "ファイルのダイジェストの長さが違います（{} / {}）",
+                self.seen, self.len
+            )));
+        }
+        Ok(self.h.finish())
+    }
+}
 
 /// 文字の境目で `max` バイト以下に切り詰める（AIFF・FLAC の書き出しで、タグを読み取りの上限 4,096 バイトにそろえ、
 /// 書いて読み直したものが同じになるようにする）。
@@ -423,6 +504,70 @@ pub trait Encoder: Send + Sync {
         out: &mut dyn std::io::Write,
         mon: &dyn Monitor,
     ) -> Result<u64, EngineError>;
+    /// この形式を流して書けるか（[`Encoder::encode_stream`] を実装しているか。M13 段 3）。既定は偽。
+    fn streams(&self, _format: &str) -> bool {
+        false
+    }
+    /// 流して書くときに生産者を全体で流す回数（進捗の重み。Ogg Vorbis は後ろ向き・前向きの 2）。既定は 1。
+    fn stream_passes(&self, _format: &str, _opts: &serde_json::Value) -> u32 {
+        1
+    }
+    /// 流して書く間の作業領域（生産者の窓・書き先に渡したバイト列は含めない）。既定は値を書くときの作業領域 ＋ 値の 1 倍
+    /// （流さないエンコーダの見積もりとして多めに）。
+    fn stream_work_bytes(&self, format: &str, shape: &Shape, opts: &serde_json::Value) -> u64 {
+        self.work_bytes(format, shape, opts)
+            .saturating_add(crate::budget::value_bytes(shape))
+    }
+    /// 流して書く（M13 段 3）：生産者 `src` を（区間を選んで何度でも）流して読み、`out` に書いて書いたバイト数を返す。
+    /// バイト列は同じ値を `encode` で書いたものと同じ（E43）。呼び手（`CodecSet::encode_stream`）が生産者をダイジェストの
+    /// 包みで包み、全体を 1 度は流したことを確かめる。既定は `Unsupported`。
+    fn encode_stream(
+        &self,
+        _src: &mut dyn crate::audio::stream::AudioProducer,
+        format: &str,
+        _opts: &serde_json::Value,
+        _out: &mut dyn WriteSeek,
+        _mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        Err(EngineError::Unsupported(format!(
+            "{} は {format} を流して書けません",
+            self.id()
+        )))
+    }
+}
+
+/// 流して書いた結果（[`CodecSet::encode_stream`]）：書き出しの記録（ファイルのダイジェストを除く）と、流した標本の値の
+/// ダイジェスト（R1）。ファイルのダイジェスト（R2）は呼び手が書いたものを読み直して取る（FLAC は最後にヘッダを直すので、
+/// 書きながらは取れない）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamEncoded {
+    pub codec: String,
+    pub tier: Tier,
+    pub format: String,
+    /// 確かめて正規の形にした書き出しの設定。
+    pub options: serde_json::Value,
+    /// 書いたバイト数。
+    pub bytes: u64,
+    /// 流した標本の値のダイジェスト（`kura-pcm-v1`。`render` の出力の `Value::digest` と同じ）。
+    pub value_digest: Digest,
+    pub reproducible: bool,
+    pub env: Option<CodecEnv>,
+}
+
+impl StreamEncoded {
+    /// ファイルのダイジェスト `file_digest` を足した書き出しの記録。
+    pub fn stamp(&self, file_digest: Digest) -> EncodedStamp {
+        EncodedStamp {
+            codec: self.codec.clone(),
+            tier: self.tier,
+            format: self.format.clone(),
+            options: self.options.clone(),
+            bytes: self.bytes,
+            file_digest,
+            reproducible: self.reproducible,
+            env: self.env.clone(),
+        }
+    }
 }
 
 /// 読み取りか書き出しか（受け止めた panic をどちらのエラーにするか）。
@@ -1059,6 +1204,119 @@ impl CodecSet {
             })?;
         encode_one(e, value, format, opts, mon)
     }
+
+    /// 形 `shape` の値を `format`・設定 `opts` で流して書く間のエンコーダの作業領域（[`CodecSet::encoder`] が選ぶエンコーダの
+    /// [`Encoder::stream_work_bytes`]。生産者の窓とダイジェストの分は呼び手が足す）。書けるエンコーダがなければ 0。
+    pub fn encode_stream_work_bytes(
+        &self,
+        format: &str,
+        shape: &Shape,
+        opts: &serde_json::Value,
+    ) -> u64 {
+        self.encoder(format, shape)
+            .map_or(0, |e| e.stream_work_bytes(format, shape, opts))
+    }
+
+    /// この形式・形の値を流して書けるか（[`CodecSet::encoder`] が選ぶエンコーダが流して書けるか）。
+    pub fn encode_streams(&self, format: &str, shape: &Shape) -> bool {
+        self.encoder(format, shape)
+            .is_some_and(|e| e.streams(format))
+    }
+
+    /// 流して書く（M13 段 3）：書き手は [`CodecSet::encode_bytes`] と同じく段の順で最初にこの形を書けるもの（流して書けなければ
+    /// `Unsupported`）。設定の確かめ方・panic の受け止め方は同じ。生産者をダイジェストの包みで包み、書き終えて全体を 1 度も
+    /// 流していなければ `Internal`。返すのは書き出しの記録（ファイルのダイジェストを除く）と値のダイジェスト。
+    pub fn encode_stream(
+        &self,
+        src: &mut dyn crate::audio::stream::AudioProducer,
+        format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn WriteSeek,
+        mon: &dyn Monitor,
+    ) -> Result<StreamEncoded, EngineError> {
+        let shape = producer_shape(src)?;
+        let e = self
+            .encoder(format, &shape)
+            .ok_or_else(|| EngineError::Unsupported(format!("{format} には書けません")))?;
+        encode_stream_one(e, src, format, opts, out, mon)
+    }
+
+    /// 識別子で選んだ書き手で流して書く（[`CodecSet::encode_bytes_with`] の流れの版）。
+    pub fn encode_stream_with(
+        &self,
+        id: &str,
+        src: &mut dyn crate::audio::stream::AudioProducer,
+        format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn WriteSeek,
+        mon: &dyn Monitor,
+    ) -> Result<StreamEncoded, EngineError> {
+        let shape = producer_shape(src)?;
+        let e = self
+            .encoder_by_id(id)
+            .filter(|e| e.can_encode(format, &shape))
+            .ok_or_else(|| {
+                EngineError::Unsupported(format!(
+                    "{format} のこの値を書くエンコーダ {id} がありません"
+                ))
+            })?;
+        encode_stream_one(e, src, format, opts, out, mon)
+    }
+}
+
+/// 生産者の形（長さの決まった音声）。
+fn producer_shape(src: &dyn crate::audio::stream::AudioProducer) -> Result<Shape, EngineError> {
+    let info = src.info();
+    Ok(Shape::Audio {
+        rate: info.rate,
+        channels: u16::try_from(info.channels)
+            .map_err(|_| EngineError::Unsupported("チャンネルが多すぎます".into()))?,
+        frames: Dim::Exact(info.frames),
+    })
+}
+
+/// 1 つのエンコーダで流して書く：設定を正規の JSON に直して確かめ（[`encode_one`] と同じ）、生産者をダイジェストの包みで
+/// 包んで panic を受け止めて書き、全体を流したダイジェストと記録を返す。
+fn encode_stream_one(
+    e: &Arc<dyn Encoder>,
+    src: &mut dyn crate::audio::stream::AudioProducer,
+    format: &str,
+    opts: &serde_json::Value,
+    out: &mut dyn WriteSeek,
+    mon: &dyn Monitor,
+) -> Result<StreamEncoded, EngineError> {
+    if !e.streams(format) {
+        return Err(EngineError::Unsupported(format!(
+            "{} は {format} を流して書けません",
+            e.id()
+        )));
+    }
+    let opts: serde_json::Value = serde_json::from_slice(&canonical_json(opts)?)
+        .map_err(|err| EngineError::Internal(format!("設定を正規の形にできません: {err}")))?;
+    let issues = e.options(format).validate(&opts);
+    if issues.has_errors() {
+        return Err(EngineError::Invalid(issues));
+    }
+    let mut dp = crate::audio::stream::DigestingProducer::new(src)?;
+    let bytes = contain(e.id(), Stage::Encode, || {
+        e.encode_stream(&mut dp, format, &opts, out, mon)
+    })?;
+    let value_digest = crate::audio::stream::AudioProducer::digest(&mut dp)?.ok_or_else(|| {
+        EngineError::Internal(format!(
+            "{} が出力の全体を 1 度も流さずに書き終えました",
+            e.id()
+        ))
+    })?;
+    Ok(StreamEncoded {
+        codec: e.id().to_string(),
+        tier: e.tier(),
+        format: format.to_string(),
+        options: opts,
+        bytes,
+        value_digest,
+        reproducible: e.reproducible(),
+        env: e.env(),
+    })
 }
 
 /// 1 つのエンコーダで書く：設定を正規の JSON に直してエンコーダの記述で確かめ、panic を受け止めて書き、記録を返す。
@@ -1079,7 +1337,9 @@ fn encode_one(
     let bytes = contain(e.id(), Stage::Encode, || {
         e.encode(value, format, &opts, &mut out, mon)
     })?;
-    let file_digest = Hasher::new("kura-file-v1").bytes_with_len(&out).finish();
+    let mut fd = FileDigest::new(out.len() as u64);
+    fd.update(&out);
+    let file_digest = fd.finish()?;
     Ok((
         out,
         EncodedStamp {

@@ -13,9 +13,12 @@ use serde_json::json;
 
 use crate::audio::source::{Opener, PcmFileSource};
 use crate::audio::stream::StreamEnd;
-use crate::codec::pcm::{self, PcmLayout, SampleEncoding, quantize};
+use crate::audio::stream::{AudioProducer, ValueProducer};
+use crate::codec::pcm::{self, PackOrder, PackSink, PcmLayout, SampleEncoding};
 use crate::codec::stream::{self, DecodeInfo, DecodeOut, DecodeSink};
-use crate::codec::{Decoder, Encoder, MetaCaps, OpenedSource, ReadSeek, Tier, caps_of, try_vec};
+use crate::codec::{
+    Decoder, Encoder, MetaCaps, NoSeek, OpenedSource, ReadSeek, Tier, WriteSeek, caps_of, try_vec,
+};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
 use crate::limits::Limits;
@@ -751,7 +754,7 @@ impl Encoder for WavCodec {
     fn encode(
         &self,
         value: &Value,
-        _format: &str,
+        format: &str,
         opts: &serde_json::Value,
         out: &mut dyn Write,
         mon: &dyn Monitor,
@@ -761,12 +764,43 @@ impl Encoder for WavCodec {
                 "WAV には音声だけを書けます".into(),
             ));
         };
+        // 値も流して書く口を通る（実装は 1 つ。シークしない）
+        let mut src = ValueProducer::new(a);
+        self.encode_stream(&mut src, format, opts, &mut NoSeek::new(out), mon)
+    }
+
+    fn streams(&self, format: &str) -> bool {
+        format == "wav"
+    }
+
+    /// 作業列（16,384 フレーム × チャンネル × 4 バイトまで）とメタデータのチャンク（64 KiB の見込み）。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
+        let channels = match shape {
+            Shape::Audio { channels, .. } => usize::from(*channels),
+            _ => 0,
+        };
+        PackSink::work_bytes(channels).saturating_add(64 << 10)
+    }
+
+    /// 長さ・メタデータは流れの形で分かるので、ヘッダ（fmt・data の大きさ・RIFF の大きさ）を先に書き、窓を量子化して
+    /// 書き、最後に smpl・cue・LIST を書く（シークしない）。
+    fn encode_stream(
+        &self,
+        src: &mut dyn AudioProducer,
+        _format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn WriteSeek,
+        mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        let info = src.info().clone();
+        let meta = &info.meta;
         // float を指定すればそれ、bits だけを指定すれば整数、どちらもなければ元の形式（docs/editing.md §5.3）
-        let (bits, float) = pcm::target(opts, a.meta.source, &[8, 16, 24, 32], true, "WAV")?;
-        let channels = u16::try_from(a.channels())
+        let (bits, float) = pcm::target(opts, meta.source, &[8, 16, 24, 32], true, "WAV")?;
+        let channels = u16::try_from(info.channels)
             .map_err(|_| EngineError::Unsupported("チャンネルが多すぎます".into()))?;
+        let rate = info.rate;
         let block_align = u32::from(channels) * u32::from(bits / 8);
-        let frames = a.frames() as u64;
+        let frames = info.frames;
         let data_len = frames * u64::from(block_align);
         let extensible = channels > 2;
 
@@ -775,8 +809,8 @@ impl Encoder for WavCodec {
         let tag: u16 = if float { 3 } else { 1 };
         fmt.extend_from_slice(&(if extensible { 0xFFFEu16 } else { tag }).to_le_bytes());
         fmt.extend_from_slice(&channels.to_le_bytes());
-        fmt.extend_from_slice(&a.rate().to_le_bytes());
-        let byte_rate = a.rate().checked_mul(block_align).ok_or_else(|| {
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        let byte_rate = rate.checked_mul(block_align).ok_or_else(|| {
             EngineError::Unsupported("サンプルレートが大きすぎて WAV に書けません".into())
         })?;
         let block_align_16 = u16::try_from(block_align).map_err(|_| {
@@ -796,13 +830,12 @@ impl Encoder for WavCodec {
             ]);
         }
         let mut chunks: Vec<([u8; 4], Vec<u8>)> = Vec::new();
-        if let Some(l) = a
-            .meta
+        if let Some(l) = meta
             .loop_range
             .filter(|l| l.start < l.end && l.end <= frames && l.end <= u64::from(u32::MAX))
         {
             let mut b = Vec::new();
-            for v in [0u32, 0, 1_000_000_000 / a.rate().max(1), 60, 0, 0, 0, 1, 0] {
+            for v in [0u32, 0, 1_000_000_000 / rate.max(1), 60, 0, 0, 0, 1, 0] {
                 b.extend_from_slice(&v.to_le_bytes());
             }
             for v in [0u32, 0, l.start as u32, (l.end - 1) as u32, 0, 0] {
@@ -810,8 +843,7 @@ impl Encoder for WavCodec {
             }
             chunks.push((*b"smpl", b));
         }
-        let markers: Vec<&Marker> = a
-            .meta
+        let markers: Vec<&Marker> = meta
             .markers
             .iter()
             .filter(|m| m.pos < frames && m.pos <= u64::from(u32::MAX))
@@ -836,8 +868,8 @@ impl Encoder for WavCodec {
             chunks.push((*b"cue ", cue));
             chunks.push((*b"LIST", adtl));
         }
-        let mut info = b"INFO".to_vec();
-        for (key, text) in &a.meta.tags {
+        let mut list = b"INFO".to_vec();
+        for (key, text) in &meta.tags {
             let id: Option<[u8; 4]> = INFO_TAGS
                 .iter()
                 .find(|(_, k)| k == key)
@@ -849,11 +881,11 @@ impl Encoder for WavCodec {
             if let Some(id) = id {
                 let mut t = text.as_bytes().to_vec();
                 t.push(0);
-                push_sub(&mut info, &id, &t);
+                push_sub(&mut list, &id, &t);
             }
         }
-        if info.len() > 4 {
-            chunks.push((*b"LIST", info));
+        if list.len() > 4 {
+            chunks.push((*b"LIST", list));
         }
 
         let padded = |n: u64| 8 + n + (n & 1);
@@ -867,67 +899,43 @@ impl Encoder for WavCodec {
         let riff_len = u32::try_from(riff_len)
             .map_err(|_| EngineError::Unsupported("4GB を超える WAV は書けません".into()))?;
         let mut written = 0u64;
-        let mut put = |out: &mut dyn Write, bytes: &[u8]| -> Result<(), EngineError> {
-            out.write_all(bytes)?;
-            written += bytes.len() as u64;
-            Ok(())
-        };
-        put(out, b"RIFF")?;
-        put(out, &riff_len.to_le_bytes())?;
-        put(out, b"WAVE")?;
-        put(out, b"fmt ")?;
-        put(out, &(fmt.len() as u32).to_le_bytes())?;
-        put(out, &fmt)?;
-        put(out, b"data")?;
-        put(out, &(data_len as u32).to_le_bytes())?;
-        let chunk_frames = 16_384usize;
-        let sample = usize::from(bits / 8);
-        let mut buf = try_vec(chunk_frames * block_align as usize, 0u8)?;
-        let total = a.frames();
-        // 窓ごとに各チャンネルを作業列へ読む（持つ量は窓の分だけ）
-        let mut planes: Vec<Vec<f32>> = (0..a.channels())
-            .map(|_| try_vec(chunk_frames.min(total), 0f32))
-            .collect::<Result<_, _>>()?;
-        let mut done = 0usize;
-        while done < total {
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            let n = (total - done).min(chunk_frames);
-            for (c, plane) in planes.iter_mut().enumerate() {
-                a.read(c, done as u64, &mut plane[..n])?;
-            }
-            for f in 0..n {
-                for (c, plane) in planes.iter().enumerate() {
-                    let s = plane[f];
-                    let at = f * block_align as usize + c * sample;
-                    let dst = &mut buf[at..at + sample];
-                    if float {
-                        dst.copy_from_slice(&s.to_le_bytes());
-                    } else if bits == 8 {
-                        dst[0] = (quantize(s, 8) + 128) as u8;
-                    } else {
-                        let v = quantize(s, bits);
-                        dst.copy_from_slice(&v.to_le_bytes()[..sample]);
-                    }
-                }
-            }
-            put(out, &buf[..n * block_align as usize])?;
-            done += n;
+        put(out, &mut written, b"RIFF")?;
+        put(out, &mut written, &riff_len.to_le_bytes())?;
+        put(out, &mut written, b"WAVE")?;
+        put(out, &mut written, b"fmt ")?;
+        put(out, &mut written, &(fmt.len() as u32).to_le_bytes())?;
+        put(out, &mut written, &fmt)?;
+        put(out, &mut written, b"data")?;
+        put(out, &mut written, &(data_len as u32).to_le_bytes())?;
+        let mut data = PackSink::new(out, PackOrder::WavLe, bits, float, info.channels)?;
+        src.produce(None, &mut data, mon)?;
+        if data.frames() != frames {
+            return Err(EngineError::Internal(format!(
+                "流した長さが形と違います（{} / {frames}）",
+                data.frames()
+            )));
         }
+        written += data.written;
         if data_len & 1 == 1 {
-            put(out, &[0])?;
+            put(out, &mut written, &[0])?;
         }
         for (id, body) in &chunks {
-            put(out, id)?;
-            put(out, &(body.len() as u32).to_le_bytes())?;
-            put(out, body)?;
+            put(out, &mut written, id)?;
+            put(out, &mut written, &(body.len() as u32).to_le_bytes())?;
+            put(out, &mut written, body)?;
             if body.len() & 1 == 1 {
-                put(out, &[0])?;
+                put(out, &mut written, &[0])?;
             }
         }
         Ok(written)
     }
+}
+
+/// `bytes` を書いて `written` に数える。
+fn put(out: &mut dyn WriteSeek, written: &mut u64, bytes: &[u8]) -> Result<(), EngineError> {
+    out.write_all(bytes)?;
+    *written += bytes.len() as u64;
+    Ok(())
 }
 
 /// LIST の中の小さなチャンクを足す（奇数なら 1 バイト詰める）。
@@ -944,6 +952,7 @@ fn push_sub(list: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
 mod tests {
     use super::*;
     use crate::codec::CodecSet;
+    use crate::codec::pcm::quantize;
     use crate::monitor::NoMonitor;
     use crate::testgen::InputGen;
     use crate::value::Audio;

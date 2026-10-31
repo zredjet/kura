@@ -137,6 +137,161 @@ impl AudioProducer for ValueProducer<'_> {
     }
 }
 
+/// 生産者を包み、流れた標本を一度だけ値のダイジェスト（`kura-pcm-v1`。区間の順によらない `PcmTreeDigest`）に足す
+/// （M13 段 3。R1 を流しながら取る）。同じ区間を何度流しても（Ogg Vorbis の 2 回目）、足すのは初めて流れた部分だけ。
+/// [`AudioProducer::digest`] は全体を覆い終えていれば Some。
+pub struct DigestingProducer<'a> {
+    inner: &'a mut dyn AudioProducer,
+    state: DigestState,
+}
+
+/// ダイジェストの途中・終わり。
+enum DigestState {
+    Open {
+        digest: Box<crate::audio::digest::PcmTreeDigest>,
+        /// 足した区間（[start, end)。重ならず、隣り合うものはまとめる）。
+        covered: std::collections::BTreeMap<u64, u64>,
+    },
+    Done(Digest),
+    Taken,
+}
+
+impl<'a> DigestingProducer<'a> {
+    /// `inner` を包む（形は `inner.info()`）。
+    pub fn new(inner: &'a mut dyn AudioProducer) -> Result<Self, EngineError> {
+        let info = inner.info();
+        let digest =
+            crate::audio::digest::PcmTreeDigest::new(info.rate, info.channels, info.frames)?;
+        Ok(Self {
+            inner,
+            state: DigestState::Open {
+                digest: Box::new(digest),
+                covered: std::collections::BTreeMap::new(),
+            },
+        })
+    }
+}
+
+/// [s, e) のうち `covered` にない区間（小さい順）。
+fn uncovered(covered: &std::collections::BTreeMap<u64, u64>, s: u64, e: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut at = s;
+    // at を含む区間があれば、その終わりまで飛ばす
+    if let Some((_, pe)) = covered.range(..=at).next_back()
+        && *pe > at
+    {
+        at = *pe;
+    }
+    for (&cs, &ce) in covered.range(at..e) {
+        if cs > at {
+            out.push((at, cs.min(e)));
+        }
+        at = at.max(ce);
+        if at >= e {
+            break;
+        }
+    }
+    if at < e {
+        out.push((at, e));
+    }
+    out
+}
+
+/// [s, e) を `covered` に足す（隣り合う区間はまとめる。重なりは呼び手が除いてある）。
+fn cover(covered: &mut std::collections::BTreeMap<u64, u64>, s: u64, e: u64) {
+    if s >= e {
+        return;
+    }
+    let (mut start, mut end) = (s, e);
+    if let Some((ps, pe)) = covered.range(..=s).next_back().map(|(a, b)| (*a, *b))
+        && pe >= s
+    {
+        covered.remove(&ps);
+        start = ps;
+        end = end.max(pe);
+    }
+    while let Some((ns, ne)) = covered.range(start..=end).next().map(|(a, b)| (*a, *b)) {
+        covered.remove(&ns);
+        end = end.max(ne);
+    }
+    covered.insert(start, end);
+}
+
+/// 流れの窓をダイジェストに足してから、呼び手の受け手へ渡す包み。
+struct DigestSink<'s> {
+    sink: &'s mut dyn AudioSink,
+    state: &'s mut DigestState,
+}
+
+impl AudioSink for DigestSink<'_> {
+    fn begin(&mut self, info: &StreamInfo) -> Result<(), EngineError> {
+        self.sink.begin(info)
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        if let DigestState::Open { digest, covered } = self.state {
+            let n = planes.first().map_or(0, |p| p.len()) as u64;
+            for (a, b) in uncovered(covered, start, start + n) {
+                let (x, y) = ((a - start) as usize, (b - start) as usize);
+                let parts: Vec<&[f32]> = planes.iter().map(|p| &p[x..y]).collect();
+                digest.push_window(a, &parts, mon)?;
+                cover(covered, a, b);
+            }
+        }
+        self.sink.feed(start, planes, mon)
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
+        self.sink.finish()
+    }
+}
+
+impl AudioProducer for DigestingProducer<'_> {
+    fn info(&self) -> &StreamInfo {
+        self.inner.info()
+    }
+
+    fn produce(
+        &mut self,
+        spans: Option<&Spans>,
+        sink: &mut dyn AudioSink,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let mut wrap = DigestSink {
+            sink,
+            state: &mut self.state,
+        };
+        self.inner.produce(spans, &mut wrap, mon)
+    }
+
+    fn digest(&mut self) -> Result<Option<Digest>, EngineError> {
+        match std::mem::replace(&mut self.state, DigestState::Taken) {
+            DigestState::Open { digest, covered } => {
+                if digest.is_complete() {
+                    let d = digest.finish(&self.inner.info().meta)?;
+                    self.state = DigestState::Done(d);
+                    Ok(Some(d))
+                } else {
+                    self.state = DigestState::Open { digest, covered };
+                    Ok(None)
+                }
+            }
+            DigestState::Done(d) => {
+                self.state = DigestState::Done(d);
+                Ok(Some(d))
+            }
+            DigestState::Taken => Err(EngineError::Internal(
+                "流れのダイジェストの状態が失われました".into(),
+            )),
+        }
+    }
+}
+
 /// 値 `a`（`spans` の区間に掛かるチャンク。None は全体）を窓ごとに読んで `sink` に渡す。窓ごとに中止を確かめる。
 pub fn stream_value(
     a: &Audio,
@@ -260,6 +415,66 @@ mod tests {
     use super::*;
     use crate::monitor::NoMonitor;
     use std::sync::Arc;
+
+    /// 区間の表：覆っていない部分と、まとめて足す形。
+    #[test]
+    fn uncovered_and_cover_track_spans() {
+        let mut m = std::collections::BTreeMap::new();
+        assert_eq!(uncovered(&m, 0, 10), vec![(0, 10)]);
+        cover(&mut m, 2, 4);
+        cover(&mut m, 6, 8);
+        assert_eq!(uncovered(&m, 0, 10), vec![(0, 2), (4, 6), (8, 10)]);
+        assert_eq!(uncovered(&m, 3, 7), vec![(4, 6)]);
+        cover(&mut m, 4, 6);
+        assert_eq!(m.len(), 1);
+        assert_eq!(uncovered(&m, 2, 8), vec![]);
+        cover(&mut m, 0, 2);
+        cover(&mut m, 8, 10);
+        assert_eq!(m.into_iter().collect::<Vec<_>>(), vec![(0, 10)]);
+    }
+
+    /// ダイジェストの包み：後ろから・何度流しても、値のダイジェストと同じ（覆い終えるまでは None）。
+    #[test]
+    fn digesting_producer_counts_each_frame_once() {
+        let frames = 3 * AUDIO_CHUNK + 5;
+        let planes: Vec<Arc<Vec<f32>>> = (0..2)
+            .map(|c| {
+                Arc::new(
+                    (0..frames)
+                        .map(|i| ((i * 7 + c) % 13) as f32 * 0.01)
+                        .collect(),
+                )
+            })
+            .collect();
+        let a = Audio::new(8_000, planes, AudioMeta::default()).unwrap();
+        let want = crate::value::Value::Audio(Arc::new(a.clone()))
+            .digest()
+            .unwrap();
+        struct Null;
+        impl AudioSink for Null {
+            fn begin(&mut self, _: &StreamInfo) -> Result<(), EngineError> {
+                Ok(())
+            }
+            fn feed(&mut self, _: u64, _: &[&[f32]], _: &dyn Monitor) -> Result<(), EngineError> {
+                Ok(())
+            }
+            fn finish(&mut self) -> Result<(), EngineError> {
+                Ok(())
+            }
+        }
+        let mut inner = ValueProducer::new(&a);
+        let mut d = DigestingProducer::new(&mut inner).unwrap();
+        let c = AUDIO_CHUNK as u64;
+        d.produce(Some(&Spans::one(3 * c, 3 * c + 1)), &mut Null, &NoMonitor)
+            .unwrap();
+        assert_eq!(d.digest().unwrap(), None);
+        d.produce(Some(&Spans::one(c, 2 * c + 1)), &mut Null, &NoMonitor)
+            .unwrap();
+        d.produce(None, &mut Null, &NoMonitor).unwrap();
+        assert_eq!(d.digest().unwrap(), Some(want));
+        d.produce(None, &mut Null, &NoMonitor).unwrap();
+        assert_eq!(d.digest().unwrap(), Some(want));
+    }
 
     #[test]
     fn windows_are_aligned_ordered_and_bounded() {
