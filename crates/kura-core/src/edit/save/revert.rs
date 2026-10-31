@@ -227,7 +227,14 @@ impl EditHandler {
             platform: true,
             progress: true,
         };
-        let r = match rebuild(&self.engine, ctx, item_id, kind, &target, rules) {
+        // 書きかけ（音声は作り直しが流して直接書く。M13 段 3）
+        let mut staging = Staging::default();
+        std::fs::create_dir_all(layout.staging_dir())?;
+        let out_part = layout
+            .staging_dir()
+            .join(format!("edit-{job}-out.{}.part", out_ext0(&target.version)));
+        staging.add(out_part.clone());
+        let r = match rebuild(&self.engine, ctx, item_id, kind, &target, rules, &out_part) {
             Ok(Flow::Go(r)) => r,
             Ok(Flow::Stop(end)) => return Ok(Flow::Stop(end)),
             Err(fail) => return Err(fail.into_core()),
@@ -235,21 +242,15 @@ impl EditHandler {
         let v = &target.version;
         let k = target.to;
         let mut warnings = r.warnings;
-        let out_hash = *blake3::hash(&r.bytes).as_bytes();
+        let (out_hash, out_size) = (r.out_hash, r.out_size);
         if out_hash != v.output_hash {
             warnings.push(format!(
                 "作り直したファイルのバイト列は、版 {k} のものと違います（値は同じです）"
             ));
         }
-        let out_size = r.bytes.len() as u64;
-        let mut staging = Staging::default();
-        std::fs::create_dir_all(layout.staging_dir())?;
-        let out_part = layout
-            .staging_dir()
-            .join(format!("edit-{job}-out.{}.part", r.ext0));
-        staging.add(out_part.clone());
-        write_synced(&out_part, &r.bytes)?;
-        drop(r.bytes);
+        if let RebuiltOut::Bytes(bytes) = r.out {
+            write_synced(&out_part, &bytes)?;
+        }
         if let Some(stop) = self.after_written(ctx, &mut staging) {
             return stop;
         }
@@ -322,23 +323,47 @@ impl RebuildFail {
     }
 }
 
-/// 作り直したもの（段 4・5 の結果。staging にはまだ書いていない）。
+/// 作り直した出力：メモリのバイト列（画像）か、流して書いた書きかけ（音声。M13 段 3。呼び手が渡した道に書いて `sync_all`
+/// した）。
+enum RebuiltOut {
+    Bytes(Vec<u8>),
+    Part,
+}
+
+/// 版 `v` の出力の形式の代表の拡張子（書きかけの名前。記録の書き出しの形式、なければ版の形式）。
+fn out_ext0(v: &Version) -> String {
+    let format = v
+        .record()
+        .ok()
+        .and_then(|r| r.encoded.map(|e| e.format))
+        .or_else(|| v.format.clone())
+        .unwrap_or_default();
+    format_by_id(&format)
+        .and_then(|d| d.exts.first().copied())
+        .unwrap_or("bin")
+        .to_string()
+}
+
+/// 作り直したもの（段 4・5 の結果。画像は staging にまだ書いていない）。
 struct Rebuilt {
-    bytes: Vec<u8>,
+    out: RebuiltOut,
+    /// 出力の生の BLAKE3 と大きさ。
+    out_hash: [u8; 32],
+    out_size: u64,
     encoded: EncodedStamp,
     value_digest: Digest,
     media: Media,
     out_format: String,
-    /// 形式の代表の拡張子（staging の名前）。
-    ext0: String,
     anchor: AnchorUse,
     original: OriginalFile,
     rec: RecordedInput,
     warnings: Vec<String>,
 }
 
-/// 版 k を作り直す（段 1〜5。staging には書かない）：版 k の文書を読み、入力の記録で元を読み（アンカー → 元。[`read`]）、描いて
-/// 値のダイジェストを記録と照らし、記録のエンコーダ（`rules.fallback_encoder` なら、なければ今の組の同じ形式のもの）で書く。
+/// 版 k を作り直す（段 1〜5。画像は staging には書かない）：版 k の文書を読み、入力の記録で元を読み（アンカー → 元。[`read`]）、
+/// 描いて値のダイジェストを記録と照らし、記録のエンコーダ（`rules.fallback_encoder` なら、なければ今の組の同じ形式のもの）で
+/// 書く。音声は値に組まずに `part` へ流して書き（M13 段 3。[`rebuild_stream`]）、値は書き終えたあとに照らす（違えば消して
+/// Mismatch）。
 fn rebuild(
     engine: &EngineServices,
     ctx: &JobContext,
@@ -346,6 +371,7 @@ fn rebuild(
     kind: MediaKind,
     target: &Target,
     rules: Rules,
+    part: &Path,
 ) -> std::result::Result<Flow<Rebuilt>, RebuildFail> {
     let library = ctx.library();
     let db = library.db();
@@ -423,6 +449,41 @@ fn rebuild(
             kind.as_str()
         ))
         .into());
+    }
+
+    // 音声：流して書ける書き手（記録の識別子のもの、なければ今の組の同じ形式のもの）なら流して作り直す
+    let probe = Shape::Audio {
+        rate: 48_000,
+        channels: 2,
+        frames: Dim::Exact(48_000),
+    };
+    let streams = match recorded_encoder
+        .as_deref()
+        .and_then(|id| codecs.encoder_by_id(id))
+    {
+        Some(e) => e.streams(&out_format),
+        None => rules.fallback_encoder && codecs.encode_streams(&out_format, &probe),
+    };
+    if kind == MediaKind::Audio && streams {
+        return rebuild_stream(StreamRebuild {
+            engine,
+            ctx,
+            k,
+            want,
+            rec,
+            graph: &graph,
+            original,
+            original_path: &original_path,
+            anchor,
+            limits: &limits,
+            out_format,
+            enc_opts,
+            recorded_encoder,
+            rules,
+            part,
+            runtime: &runtime,
+            codecs: &codecs,
+        });
     }
 
     // 1・2. 読む元ごとに：形 → 計画 → 予算 → 読む（アンカーが使えなければ、元を記録のデコーダで読み直す。read.rs）
@@ -555,13 +616,216 @@ fn rebuild(
     drop(out);
     drop(lease);
     Ok(Flow::Go(Rebuilt {
-        bytes,
+        out_hash: *blake3::hash(&bytes).as_bytes(),
+        out_size: bytes.len() as u64,
+        out: RebuiltOut::Bytes(bytes),
         encoded,
         value_digest,
         media,
         out_format,
-        ext0: desc.exts.first().copied().unwrap_or("bin").to_string(),
         anchor: anchor_use,
+        original,
+        rec,
+        warnings,
+    }))
+}
+
+/// 流して作り直すのに使うもの（[`rebuild`] が決めたもの）。
+struct StreamRebuild<'a> {
+    engine: &'a EngineServices,
+    ctx: &'a JobContext,
+    k: i64,
+    want: Digest,
+    rec: RecordedInput,
+    graph: &'a Graph,
+    original: OriginalFile,
+    original_path: &'a Path,
+    anchor: Option<Anchor>,
+    limits: &'a Limits,
+    out_format: String,
+    enc_opts: serde_json::Value,
+    recorded_encoder: Option<String>,
+    rules: Rules,
+    part: &'a Path,
+    runtime: &'a crate::edit::EngineRuntime,
+    codecs: &'a kura_engine::codec::CodecSet,
+}
+
+/// 音声の版 k を流して作り直す（M13 段 3）：入力の記録に合う遅延の入力（アンカー → 元を記録のデコーダで。`rules.platform` が
+/// 偽なら OS のデコーダの作業用のファイルを作らずに Unavailable）を、記録の書き手（なければ今の組の同じ形式のもの）で
+/// `part` へ流して書き、値のダイジェストを記録と照らす（違えば `part` を消して Mismatch）。
+fn rebuild_stream(s: StreamRebuild<'_>) -> std::result::Result<Flow<Rebuilt>, RebuildFail> {
+    let StreamRebuild {
+        engine,
+        ctx,
+        k,
+        want,
+        rec,
+        graph,
+        original,
+        original_path,
+        anchor,
+        limits,
+        out_format,
+        enc_opts,
+        recorded_encoder,
+        rules,
+        part,
+        runtime,
+        codecs,
+    } = s;
+    let mon = JobMonitor(ctx);
+    let layout = ctx.library().layout();
+    let cx = stream::StreamCx {
+        ctx,
+        runtime,
+        codecs,
+        engine,
+        layout,
+        original: original_path,
+        original_hash: original.hash,
+        format: &rec.format,
+        opts: &rec.options,
+        limits,
+        mon: &mon,
+    };
+    let mut passes = stream::Passes::new(ctx, 3.25);
+    let mut warnings: Vec<String> = Vec::new();
+    if rules.progress {
+        ctx.progress(0.1, "戻す版の元を読んでいます");
+    }
+    // 作業用の PCM は作り直しの間だけ持つ（終われば落として消す）
+    let mut work = None;
+    let read = stream::read_input(
+        &cx,
+        anchor,
+        stream::Want::Recorded {
+            decoded: &rec.decoded,
+            platform: rules.platform,
+        },
+        &format!("版 {k} を作り直せません"),
+        &mut warnings,
+        &mut passes,
+        &mut work,
+    )?;
+    let input = match read {
+        Flow::Go(stream::StreamRead::Read(input)) => input,
+        Flow::Go(stream::StreamRead::Unavailable(why)) => {
+            return Err(RebuildFail::Unavailable(why));
+        }
+        Flow::Go(stream::StreamRead::Mismatch(why)) => return Err(RebuildFail::Mismatch(why)),
+        Flow::Stop(end) => return Ok(Flow::Stop(end)),
+    };
+    let shapes = BTreeMap::from([(InputId(0), input.value.shape())]);
+    let plan = runtime
+        .bulk(|e| e.compile(graph, &shapes))
+        .map_err(|issues| CoreError::Invalid(format!("版 {k} の文書を描けません：{issues}")))?;
+    let out_shape = plan
+        .output_shapes()
+        .first()
+        .map(|(_, s)| *s)
+        .ok_or_else(|| CoreError::Invalid("文書に出力がありません".into()))?;
+    let encoder = recorded_encoder
+        .as_deref()
+        .and_then(|id| codecs.encoder_by_id(id))
+        .filter(|e| e.can_encode(&out_format, &out_shape) && e.streams(&out_format))
+        .cloned();
+    if encoder.is_none() && !rules.fallback_encoder {
+        return Err(CoreError::Unsupported(format!(
+            "版 {k} の記録のエンコーダ {} がこの環境にありません",
+            recorded_encoder.as_deref().unwrap_or("（記録なし）")
+        ))
+        .into());
+    }
+    if encoder.is_none() && !codecs.encode_streams(&out_format, &out_shape) {
+        return Err(
+            CoreError::Unsupported(format!("版 {k} の結果を {out_format} に書けません")).into(),
+        );
+    }
+    let sink = match &encoder {
+        Some(e) => Sink::Encoder {
+            encoder: e.as_ref(),
+            format: &out_format,
+            opts: &enc_opts,
+        },
+        None => Sink::Encode {
+            codecs,
+            format: &out_format,
+            opts: &enc_opts,
+        },
+    };
+    let rounds = encoder
+        .as_ref()
+        .map_or(1, |e| e.stream_passes(&out_format, &enc_opts));
+    let spec = EstimateSpec::new(0)
+        .stream(OutputId(0))
+        .digests(true)
+        .input(
+            InputId(0),
+            Source::Lazy {
+                resident: input.resident,
+            },
+        )
+        .output(OutputId(0), sink);
+    let (_estimate, lease) = go!(
+        ctx,
+        "作り直しのメモリを確保できません",
+        runtime.admit_bulk_with(&plan, spec, |_| 0, &mon)
+    );
+    if rules.progress {
+        ctx.progress(0.5, "描き直しています");
+    }
+    let written = match stream::write_output(
+        &cx,
+        &plan,
+        &input,
+        encoder.as_ref().map(|e| e.id()),
+        &out_format,
+        &enc_opts,
+        part,
+        &passes,
+        f64::from(rounds),
+        rounds,
+    )? {
+        Flow::Go(w) => w,
+        Flow::Stop(end) => return Ok(Flow::Stop(end)),
+    };
+    drop(lease);
+    drop(work);
+    // 値の照らし（書き終えてから分かる。違えばまれなので、書いた分の無駄は受け入れる）
+    if written.encoded.value_digest != want {
+        let _ = std::fs::remove_file(part);
+        return Err(RebuildFail::Mismatch(format!(
+            "版 {k} を作り直した値が記録と違うので、戻しません（記録 {want}、作り直し {}）",
+            written.encoded.value_digest
+        )));
+    }
+    let (out_hash, file_digest, out_size) = match stream::hash_part(part, &mon) {
+        Ok(h) => h,
+        Err(CoreError::Canceled) => match stop_end(ctx) {
+            Some(end) => return Ok(Flow::Stop(end)),
+            None => return Err(CoreError::Canceled.into()),
+        },
+        Err(e) => return Err(e.into()),
+    };
+    warnings.extend(written.warnings);
+    let encoded = written.encoded.stamp(file_digest);
+    if encoder.is_none() {
+        warnings.push(format!(
+            "記録のエンコーダ {} がないので、{} で書きました（値は記録と同じです）",
+            recorded_encoder.as_deref().unwrap_or("（記録なし）"),
+            encoded.codec
+        ));
+    }
+    Ok(Flow::Go(Rebuilt {
+        out: RebuiltOut::Part,
+        out_hash,
+        out_size,
+        value_digest: written.encoded.value_digest,
+        encoded,
+        media: media_of(&out_shape),
+        out_format,
+        anchor: input.anchor,
         original,
         rec,
         warnings,
@@ -615,11 +879,21 @@ pub(crate) fn verify_version(
         platform: false,
         progress: false,
     };
+    // 音声の作り直しはここへ流して書く（照らしたら消す）
+    let layout = ctx.library().layout();
+    if let Err(e) = std::fs::create_dir_all(layout.staging_dir()) {
+        return Ok(Flow::Go(Verdict::Defer(e.to_string())));
+    }
+    let part = layout
+        .staging_dir()
+        .join(format!("gc-{}-verify-{}.part", ctx.id(), version.id));
+    let mut staging = Staging::default();
+    staging.add(part.clone());
     Ok(Flow::Go(
-        match rebuild(engine, ctx, version.item_id, kind, &target, rules) {
+        match rebuild(engine, ctx, version.item_id, kind, &target, rules, &part) {
             Ok(Flow::Stop(end)) => return Ok(Flow::Stop(end)),
             Ok(Flow::Go(r)) => {
-                if *blake3::hash(&r.bytes).as_bytes() == version.output_hash {
+                if r.out_hash == version.output_hash {
                     Verdict::Match
                 } else {
                     Verdict::Mismatch(format!(

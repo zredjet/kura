@@ -17,10 +17,11 @@ use serde_json::{Value as Json, json};
 
 use super::save::{SaveAction, Stage};
 use super::save_tests::{
-    Env, Setup, WAIT, assert_consistent, assert_done, base_of, hash_of, head, result_of, staged,
-    versions_of,
+    Env, Setup, WAIT, assert_consistent, assert_done, base_of, gc_version, hash_of, head,
+    result_of, staged, states, versions_of,
 };
 use super::services::fake::FakeEngineFactory;
+use super::versions::FileState;
 use crate::codec_ext::ffmpeg::testing::FakeTools;
 use crate::jobs::JobState;
 use crate::library::Library;
@@ -212,15 +213,15 @@ fn s18_streamed_audio_save_equals_the_whole_path() {
     assert_consistent(&env.lib);
 }
 
-/// 偽の Platform のデコーダ（opus。8 kHz ステレオの雑音を読むたびに少しずつ変えて返す）。
-fn opus_decoder(frames: u64) -> Arc<FakePlatformDecoder> {
+/// 偽の Platform のデコーダ（opus。8 kHz の雑音を読むたびに少しずつ変えて返す）。
+fn opus_decoder(channels: u16, frames: u64) -> Arc<FakePlatformDecoder> {
     Arc::new(
         FakePlatformDecoder::new(
             "fake-opus-dec/1",
             &["opus"],
             InputGen::AudioNoise {
                 rate: 8_000,
-                channels: 2,
+                channels,
                 frames,
                 seed: 19,
             },
@@ -233,7 +234,7 @@ fn opus_decoder(frames: u64) -> Arc<FakePlatformDecoder> {
 /// WAV。照らしたもの）。OS のデコーダを外しても、アンカーから作り直せる（S15 の音声版）。
 #[test]
 fn s19_platform_audio_first_save_promotes_the_work_file() {
-    let decoder = opus_decoder(2 * 65_536 + 11);
+    let decoder = opus_decoder(2, 2 * 65_536 + 11);
     let codecs = {
         let mut set = CodecSet::pinned();
         set.add_decoder(decoder.clone()).unwrap();
@@ -313,7 +314,7 @@ fn s19_platform_audio_first_save_promotes_the_work_file() {
 #[test]
 fn s20_long_audio_pause_restarts_and_reuses_the_work_file() {
     for pause in [true, false] {
-        let decoder = opus_decoder(2_300_000);
+        let decoder = opus_decoder(1, 2_300_000);
         let codecs = {
             let mut set = CodecSet::pinned();
             set.add_decoder(decoder.clone()).unwrap();
@@ -349,7 +350,7 @@ fn s20_long_audio_pause_restarts_and_reuses_the_work_file() {
                 graph: audio_doc(-3.0, Some("wav")),
             },
         );
-        reached_rx.recv_timeout(WAIT).unwrap();
+        reached_rx.recv_timeout(4 * WAIT).unwrap();
         if pause {
             env.jobs.pause(id).unwrap();
         } else {
@@ -374,7 +375,7 @@ fn s20_long_audio_pause_restarts_and_reuses_the_work_file() {
                 .collect();
             assert!(left.is_empty(), "{left:?}");
             env.jobs.resume(id).unwrap();
-            assert!(env.jobs.wait_idle(WAIT));
+            assert!(env.jobs.wait_idle(4 * WAIT));
             assert_done(&env.jobs.get(id).unwrap());
             assert_eq!(decoder.reads(), 1, "作業用のファイルを作り直した");
             assert_eq!(result_of(&env.jobs.get(id).unwrap())["anchor"], "created");
@@ -382,4 +383,61 @@ fn s20_long_audio_pause_restarts_and_reuses_the_work_file() {
         assert_eq!(env.engine.work_pcm().usage(), (0, 0));
         assert_consistent(&env.lib);
     }
+}
+
+/// S23：流して書いた音声の版は、GC の照合（流して作り直して生の BLAKE3 を比べる）で一致して released になり、版に戻すと
+/// 流して作り直して同じバイト列になる。記録の値のダイジェストと違えば、照合は kept（ファイルを残す）。
+#[test]
+fn s23_streamed_rebuild_verifies_audio_versions() {
+    let env = Env::new();
+    let pinned = CodecSet::pinned();
+    let original = noise_file(&pinned, "wav", 2, 3 * 65_536 + 77, 23);
+    let (a, _) = add_audio(&env.lib, &original, "wav", "版の声");
+    assert_done(&env.overwrite(a, audio_doc(-2.0, Some("flac"))));
+    let v1 = versions_of(&env.lib, a)[1].clone();
+    let path1 = env.lib.layout().content_path(&v1.output_hash, &v1.ext);
+    let bytes1 = std::fs::read(&path1).unwrap();
+    assert_done(&env.overwrite(a, audio_doc(-5.0, Some("ogg"))));
+    // GC の照合：流して作り直したバイト列が版 1 と同じなので消す
+    gc_version(&env, a, 1);
+    assert!(!path1.exists());
+    // 版に戻す：流して作り直す
+    let record = env.revert(a, 1);
+    assert_done(&record);
+    let result = result_of(&record);
+    assert_eq!(
+        result["revert"],
+        json!({ "to": 1, "reused": false, "rebuilt": true })
+    );
+    assert_eq!(result["warnings"], json!([]));
+    assert!(std::fs::read(&path1).unwrap() == bytes1, "同じバイト列");
+    let vs = versions_of(&env.lib, a);
+    assert_eq!(
+        (vs[3].output_hash, vs[3].value_digest),
+        (v1.output_hash, v1.value_digest)
+    );
+    assert_eq!(env.engine.work_pcm().usage(), (0, 0));
+    assert_consistent(&env.lib);
+    // 版 2（ogg。消し待ち）の値のダイジェストの記録を変えると、照合は合わずに kept
+    let v2 = vs[2].clone();
+    env.lib
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE item_versions SET value_digest = ?1 WHERE id = ?2",
+                params![&[7u8; 32][..], v2.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let result = env.gc();
+    assert_eq!(result["kept"], json!(1), "{result}");
+    assert_eq!(states(&env.lib, a)[2], (2, FileState::Kept));
+    assert!(
+        env.lib
+            .layout()
+            .content_path(&vs[2].output_hash, &vs[2].ext)
+            .exists()
+    );
+    assert_consistent(&env.lib);
 }

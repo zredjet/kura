@@ -489,104 +489,155 @@ fn read_source(
     Ok(Flow::Go((opened.value, decoded, Some(work), resident)))
 }
 
-/// 段 1：入力を得る。アンカー `found` があれば照らしてから源として開き、使えなければ元を記録のデコーダで読み直す（知らせを
-/// `warnings` に足す）。アンカーがなければ元を段の順に読む。
+/// 何を読むか：段の順（アンカーがまだない保存）か、記録の読み取り `decoded` に合う入力（アンカーがある保存・版に戻す作り直し・
+/// GC の照合。`platform` が偽なら、記録のデコーダが OS のものなら読まない）。
+#[derive(Clone, Copy)]
+pub(super) enum Want<'a> {
+    Any,
+    Recorded {
+        decoded: &'a DecodeStamp,
+        platform: bool,
+    },
+}
+
+/// 段 1 の結果：読めた・今は読めない（記録のデコーダがない・OS のデコーダでしか読めない）・記録と違う。
+#[allow(clippy::large_enum_variant)] // 1 回の読みで 1 度だけ返して、すぐ取り出す（`read::RecordedRead` と同じ）
+pub(super) enum StreamRead {
+    Read(StreamInput),
+    Unavailable(String),
+    Mismatch(String),
+}
+
+impl StreamRead {
+    /// 保存・版に戻すの扱い：読めない・違うはどちらも Mismatch（docs/editing.md §14「作り直しの照合の決まり」）。
+    pub(super) fn or_mismatch(self) -> Result<StreamInput> {
+        match self {
+            Self::Read(input) => Ok(input),
+            Self::Unavailable(why) | Self::Mismatch(why) => Err(CoreError::Mismatch(why)),
+        }
+    }
+}
+
+/// 段 1：入力を得る。アンカー `found` があれば記録と照らしてから源として開き、使えなければ元を記録の識別子のデコーダで読み
+/// 直して値を記録と照らす（知らせを `warnings` に足す。`read::read_recorded_input` と同じ分かれ方）。段の順なら元を段の順に
+/// 読む。作業用の PCM を作ったら `slot` に入れる（呼び手が一時停止のときに残す印を立てる）。`cant` は何ができないかの言葉。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn read_input(
     cx: &StreamCx<'_>,
     found: Option<Anchor>,
+    want: Want<'_>,
+    cant: &str,
     warnings: &mut Vec<String>,
     passes: &mut Passes<'_>,
     slot: &mut Option<WorkHandle>,
-) -> Result<Flow<StreamInput>> {
+) -> Result<Flow<StreamRead>> {
     let tasks = cx.runtime.bulk_threads();
-    let Some(a) = found else {
+    let Want::Recorded { decoded, platform } = want else {
         let read = match read_source(cx, None, passes)? {
             Flow::Go(r) => r,
             Flow::Stop(end) => return Ok(Flow::Stop(end)),
         };
         let (value, decoded, work, resident) = read;
         *slot = work;
-        return Ok(Flow::Go(StreamInput {
+        return Ok(Flow::Go(StreamRead::Read(StreamInput {
             value,
             decoded,
             anchor: AnchorUse::None,
             resident,
-        }));
+        })));
     };
-    // アンカーから：記録と照らしてから源として開く
-    let path = cx.layout.content_path(&a.hash, &a.ext);
-    let opener = path_opener(&path);
-    let (limits, mon) = (cx.limits, cx.mon);
-    // 照らしの回の量（`verify_stream` の源の LRU 32 MiB ＋ 窓 ＋ ダイジェスト）。見出しを読めなければ照らしで断る
-    let shape = File::open(&path)
-        .map_err(EngineError::from)
-        .and_then(|f| anchor::shape(&mut BufReader::new(f), limits))
-        .ok();
-    let need = shape.map_or(64 << 20, |s| {
-        verify_bytes(&s, tasks as u64, 32 << 20).max(lru_bytes(&s, tasks))
-    });
-    let _lease = match cx.acquire(need)? {
-        Flow::Go(l) => l,
-        Flow::Stop(end) => return Ok(Flow::Stop(end)),
-    };
-    passes.report(0.5, 0.0, "元の読み取りを照らしています");
-    let checked = cx.runtime.bulk(|_| {
-        anchor::verify_stream(&opener, &a.decoded, limits, mon)?;
-        let probe = anchor::open_source(&opener, limits, LRU_MAX)?
-            .ok_or_else(|| EngineError::Internal("音声のアンカーではありません".into()))?;
-        let resident = lru_bytes(&probe.value.shape(), tasks);
-        let opened = anchor::open_source(&opener, limits, resident)?
-            .ok_or_else(|| EngineError::Internal("音声のアンカーではありません".into()))?;
-        Ok::<_, EngineError>((opened.value, resident))
-    });
-    passes.finish(0.5);
-    let why = match checked {
-        Ok((value, resident)) => {
-            return Ok(Flow::Go(StreamInput {
-                value,
-                decoded: a.decoded.clone(),
-                anchor: AnchorUse::Existing(a),
-                resident,
-            }));
+    let mut unusable: Option<(Anchor, String)> = None;
+    if let Some(a) = found {
+        // アンカーから：記録と照らしてから源として開く
+        let path = cx.layout.content_path(&a.hash, &a.ext);
+        let opener = path_opener(&path);
+        let (limits, mon) = (cx.limits, cx.mon);
+        // 照らしの回の量（`verify_stream` の源の LRU 32 MiB ＋ 窓 ＋ ダイジェスト）。見出しを読めなければ照らしで断る
+        let shape = File::open(&path)
+            .map_err(EngineError::from)
+            .and_then(|f| anchor::shape(&mut BufReader::new(f), limits))
+            .ok();
+        let need = shape.map_or(64 << 20, |s| {
+            verify_bytes(&s, tasks as u64, 32 << 20).max(lru_bytes(&s, tasks))
+        });
+        let _lease = match cx.acquire(need)? {
+            Flow::Go(l) => l,
+            Flow::Stop(end) => return Ok(Flow::Stop(end)),
+        };
+        passes.report(0.5, 0.0, "元の読み取りを照らしています");
+        let checked = cx.runtime.bulk(|_| {
+            anchor::verify_stream(&opener, decoded, limits, mon)?;
+            let probe = anchor::open_source(&opener, limits, LRU_MAX)?
+                .ok_or_else(|| EngineError::Internal("音声のアンカーではありません".into()))?;
+            let resident = lru_bytes(&probe.value.shape(), tasks);
+            let opened = anchor::open_source(&opener, limits, resident)?
+                .ok_or_else(|| EngineError::Internal("音声のアンカーではありません".into()))?;
+            Ok::<_, EngineError>((opened.value, resident))
+        });
+        passes.finish(0.5);
+        match checked {
+            Ok((value, resident)) => {
+                return Ok(Flow::Go(StreamRead::Read(StreamInput {
+                    value,
+                    decoded: decoded.clone(),
+                    anchor: AnchorUse::Existing(a),
+                    resident,
+                })));
+            }
+            Err(e) if matches!(e.root(), EngineError::Canceled) => match stop_end(cx.ctx) {
+                Some(end) => return Ok(Flow::Stop(end)),
+                None => return Err(from_engine("元の読み取りを照らせません", e)),
+            },
+            Err(e) => {
+                warnings.push(format!("アンカーが使えないので、元を読み直しました（{e}）"));
+                unusable = Some((a, e.to_string()));
+            }
         }
-        Err(e) if matches!(e.root(), EngineError::Canceled) => match stop_end(cx.ctx) {
-            Some(end) => return Ok(Flow::Stop(end)),
-            None => return Err(from_engine("元の読み取りを照らせません", e)),
-        },
-        Err(e) => e.to_string(),
+    }
+    let also = match &unusable {
+        Some((_, why)) => format!("（アンカーも使えません：{why}）"),
+        None => String::new(),
     };
-    warnings.push(format!(
-        "アンカーが使えないので、元を読み直しました（{why}）"
-    ));
     // 元を記録の識別子のデコーダで読み直し、値を記録と照らす
     let Some(decoder) = cx
         .codecs
-        .decoder_by_id(&a.decoded.codec)
+        .decoder_by_id(&decoded.codec)
         .filter(|d| d.can_decode(cx.format))
         .cloned()
     else {
-        return Err(CoreError::Mismatch(format!(
-            "保存できません：記録のデコーダ {} がこの環境にありません（アンカーも使えません：{why}）",
-            a.decoded.codec
-        )));
+        return Ok(Flow::Go(StreamRead::Unavailable(format!(
+            "{cant}：記録のデコーダ {} がこの環境にありません{also}",
+            decoded.codec
+        ))));
     };
+    if !platform && decoder.tier() == Tier::Platform {
+        return Ok(Flow::Go(StreamRead::Unavailable(format!(
+            "{cant}：記録のデコーダ {} は OS のデコーダなので、ここでは読みません{also}",
+            decoded.codec
+        ))));
+    }
     let read = match read_source(cx, Some(&decoder), passes)? {
         Flow::Go(r) => r,
         Flow::Stop(end) => return Ok(Flow::Stop(end)),
     };
-    let (value, decoded, work, resident) = read;
+    let (value, got, work, resident) = read;
     *slot = work;
-    if decoded.value_digest != a.decoded.value_digest {
-        return Err(CoreError::Mismatch(format!(
-            "保存できません：元を読み直した値が記録と違います（アンカーも使えません：{why}）"
-        )));
+    if got.value_digest != decoded.value_digest {
+        return Ok(Flow::Go(StreamRead::Mismatch(format!(
+            "{cant}：元を読み直した値が記録と違います（{}）{also}",
+            decoded.codec
+        ))));
     }
-    Ok(Flow::Go(StreamInput {
+    let anchor = match unusable {
+        Some((a, _)) => AnchorUse::Fallback(a),
+        None => AnchorUse::None,
+    };
+    Ok(Flow::Go(StreamRead::Read(StreamInput {
         value,
-        decoded: a.decoded.clone(),
-        anchor: AnchorUse::Fallback(a),
+        decoded: decoded.clone(),
+        anchor,
         resident,
-    }))
+    })))
 }
 
 /// 段 3：作業用の PCM をアンカーに昇格する（staging に写して照らす）。
@@ -626,12 +677,13 @@ pub(super) struct Written {
     pub warnings: Vec<String>,
 }
 
-/// 段 4：計画の出力を流して `part` に書き、`sync_all` する。
+/// 段 4：計画の出力を流して `part` に書き、`sync_all` する（`encoder` があればその識別子の書き手で）。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_output(
     cx: &StreamCx<'_>,
     plan: &kura_engine::Plan,
     input: &StreamInput,
+    encoder: Option<&str>,
     out_format: &str,
     enc_opts: &serde_json::Value,
     part: &Path,
@@ -661,7 +713,17 @@ pub(super) fn write_output(
                 rounds,
                 done: 0,
             };
-            codecs.encode_stream(&mut counting, out_format, enc_opts, &mut w, mon)?
+            match encoder {
+                Some(id) => codecs.encode_stream_with(
+                    id,
+                    &mut counting,
+                    out_format,
+                    enc_opts,
+                    &mut w,
+                    mon,
+                )?,
+                None => codecs.encode_stream(&mut counting, out_format, enc_opts, &mut w, mon)?,
+            }
         };
         let file = w
             .into_inner()

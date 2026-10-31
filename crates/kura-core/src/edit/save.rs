@@ -1228,11 +1228,26 @@ impl EditHandler {
         ctx.progress(0.05, "元の大きさを確かめています");
         let mut warnings: Vec<String> = Vec::new();
         // 1. 入力
-        let input =
-            match stream::read_input(&cx, d.found.clone(), &mut warnings, &mut passes, work)? {
-                Flow::Go(input) => input,
-                Flow::Stop(end) => return Ok(Flow::Stop(end)),
-            };
+        let want = match &d.found {
+            Some(a) => stream::Want::Recorded {
+                decoded: &a.decoded,
+                platform: true,
+            },
+            None => stream::Want::Any,
+        };
+        let read = stream::read_input(
+            &cx,
+            d.found.clone(),
+            want,
+            "保存できません",
+            &mut warnings,
+            &mut passes,
+            work,
+        )?;
+        let input = match read {
+            Flow::Go(read) => read.or_mismatch()?,
+            Flow::Stop(end) => return Ok(Flow::Stop(end)),
+        };
         // 2. 計画（遅延の値の形で）と予算
         let shape = input.value.shape();
         let shapes = BTreeMap::from([(InputId(0), shape)]);
@@ -1307,6 +1322,7 @@ impl EditHandler {
             &cx,
             &plan,
             &input,
+            None,
             &d.out_format,
             &d.enc_opts,
             &out_part,
