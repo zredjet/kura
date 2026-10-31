@@ -54,6 +54,7 @@ import {
   type LaneLayout,
   minSpan,
   overviewStart,
+  PCM_BELOW,
   panBy,
   pickBin,
   rulerTicks,
@@ -600,11 +601,10 @@ export class WaveController {
 
   // ===== 読み込み =====
 
-  /** 1 列のフレーム数が段で描けるか（PCM で描くなら偽）。 */
+  /** 1 列が 256 フレームより細かく、PCM で描くか。 */
   private pcmMode(): boolean {
-    const bins = this.peaks?.bins ?? [];
     const columns = Math.max(1, Math.round(this.inner().w * this.dpr));
-    return bins.length > 0 && pickBin(bins, this.w.span, columns) === null;
+    return this.w.span / columns < PCM_BELOW;
   }
 
   /** 選んだ段（PCM で描く・段がなければ null）と、試す順の段。 */
@@ -839,7 +839,7 @@ export class WaveController {
         this.overviewCols,
         this.overviewHas,
       );
-    } else if (this.view && total > 0 && this.w.span / Math.max(1, columns) < 256) {
+    } else if (this.view && total > 0 && this.w.span / Math.max(1, columns) < PCM_BELOW) {
       // 段がまだない短い音声の拡大：PCM で描く
       mode = 'pcm';
       fillPcmColumns(

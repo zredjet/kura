@@ -138,6 +138,9 @@ describe('段を選ぶ', () => {
     expect(pickBin(BINS, 255_000, 1000)).toBeNull();
     expect(pickBin(BINS, 256_000, 1000)).toBe(256);
     expect(pickBin([], 1e6, 100)).toBeNull();
+    // 細かい段がない（長い音声をライブラリの段で仮に出している）：持っている最も細かい段で描き、PCM は 256 未満だけ
+    expect(pickBin([4096, 16384, 65536], 1_000_000, 1000)).toBe(4096);
+    expect(pickBin([4096, 16384, 65536], 255_000, 1000)).toBeNull();
     expect(pickBin(BINS, 1e6, 0)).toBeNull();
   });
 });

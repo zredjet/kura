@@ -144,14 +144,23 @@ export function rulerTicks(w: WaveWindow, width: number, rate: number): Tick[] {
   return out;
 }
 
+/** 1 列がこのフレーム数より細かければ PCM で描く（段の最も細かいビン。Rust の `PEAK_BINS[0]`）。 */
+export const PCM_BELOW = 256;
+
 /**
- * 描く段のビンのフレーム数：区間 `span` を `columns` 列に描くとき、ビンの数が列の数以上の段のうち最も粗いもの。1 列が
- * 最も細かい段のビンより細かければ null（PCM で描く）。`bins` は細かい順。
+ * 描く段のビンのフレーム数：区間 `span` を `columns` 列に描くとき、ビンの数が列の数以上の段のうち最も粗いもの（なければ
+ * 持っている最も細かい段）。1 列が `pcmBelow`（256）フレームより細かければ null（PCM で描く）。`bins` は細かい順で、
+ * 結果の `peaks.bins` にある段だけから選ぶ（長い音声をライブラリの段で仮に出している間は粗い段しかないことがある）。
  */
-export function pickBin(bins: readonly number[], span: number, columns: number): number | null {
+export function pickBin(
+  bins: readonly number[],
+  span: number,
+  columns: number,
+  pcmBelow = PCM_BELOW,
+): number | null {
   const finest = bins[0];
   if (finest === undefined || !(columns > 0) || !(span > 0)) return null;
-  if (span / columns < finest) return null;
+  if (span / columns < pcmBelow) return null;
   let best = finest;
   for (const b of bins) {
     if (Math.ceil(span / b) >= columns) best = b;
