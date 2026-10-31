@@ -388,6 +388,19 @@ export type RenderCrossfade = (
   fade: boolean,
 ) => Promise<Float32Array[]>;
 
+/**
+ * 窓の中で区間を鳴らし始める時刻（秒）と、バッファの中の始まり（秒）。窓の頭 `base` より前に置いた区間（T をまたいで
+ * 鳴っていた古い音）は、窓の 0 秒から `base − abs` フレーム目を鳴らす（純粋な関数）。
+ */
+export function crossfadePlacement(
+  r: Pick<PlacedRecord, 'abs'>,
+  base: number,
+  rate: number,
+): { when: number; offset: number } {
+  const w = (r.abs - base) / rate;
+  return { when: Math.max(0, w), offset: Math.max(0, -w) };
+}
+
 /** エディタと同じ組み立て（止める音は T から 1→0、入れる音は 0→1。どちらも 10 ms）で OfflineAudioContext に描く。 */
 export const offlineCrossfade: RenderCrossfade = async (record, base, frames, fade) => {
   const channels = record.fresh?.planes.length ?? record.old[0]?.planes.length ?? 1;
@@ -401,7 +414,11 @@ export const offlineCrossfade: RenderCrossfade = async (record, base, frames, fa
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     const gain = ctx.createGain();
-    const when = (r.abs - base) / rate;
+    src.connect(gain);
+    gain.connect(ctx.destination);
+    // 先に start（stop を先に呼ぶと InvalidStateError）。窓の頭より前に始まった区間はバッファの中をずらして鳴らす
+    const { when, offset } = crossfadePlacement(r, base, rate);
+    src.start(when, offset);
     if (role === 'old') {
       if (fade) {
         gain.gain.setValueAtTime(1, t);
@@ -414,9 +431,6 @@ export const offlineCrossfade: RenderCrossfade = async (record, base, frames, fa
       gain.gain.setValueAtTime(0, when);
       gain.gain.linearRampToValueAtTime(1, when + xf);
     }
-    src.connect(gain);
-    gain.connect(ctx.destination);
-    src.start(Math.max(0, when));
   };
   for (const r of record.old) put(r, 'old');
   if (record.fresh) put(record.fresh, 'fresh');

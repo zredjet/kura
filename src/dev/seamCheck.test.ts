@@ -1,13 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { planAudition } from '../lib/asset/audition';
 import type { Pcm } from '../lib/asset/wav';
 import type { CrossfadeRecord, PlacedRecord } from '../features/editor/audio/playback';
 import {
   compareSamples,
+  crossfadePlacement,
   editorSeamWindow,
   expectedSamples,
   maxJump,
+  offlineCrossfade,
   type RenderCrossfade,
   type RenderWindow,
   runCrossfadeCheck,
@@ -252,6 +254,72 @@ describe('エディタの継ぎ目の自己点検', () => {
 });
 
 describe('交差フェードの自己点検', () => {
+  it('窓の頭より前に始まった区間は、窓の 0 秒からバッファの中のずらした位置で鳴らす', () => {
+    // base = 1000：abs 400 の区間は 600 フレーム目から、abs 1500 は 500 フレーム後から頭で
+    expect(crossfadePlacement({ abs: 400 }, 1000, R)).toEqual({ when: 0, offset: 600 / R });
+    expect(crossfadePlacement({ abs: 1500 }, 1000, R)).toEqual({ when: 500 / R, offset: 0 });
+  });
+
+  it('OfflineAudioContext に組むとき、start（ずらした位置）を stop より先に呼ぶ', async () => {
+    const calls: string[] = [];
+    class FakeOffline {
+      readonly destination = {};
+      constructor(
+        readonly channels: number,
+        readonly length: number,
+        readonly sampleRate: number,
+      ) {}
+      createBuffer(channels: number, length: number) {
+        return { length, numberOfChannels: channels, copyToChannel: () => undefined };
+      }
+      createBufferSource() {
+        let started = false;
+        return {
+          buffer: null as unknown,
+          connect: () => undefined,
+          start(when: number, offset?: number) {
+            started = true;
+            calls.push(`start ${when} ${offset ?? 0}`);
+          },
+          stop(when: number) {
+            // 仕様と WebKit：start の前の stop は InvalidStateError
+            if (!started)
+              throw new Error('InvalidStateError: cannot call stop without calling start first.');
+            calls.push(`stop ${when}`);
+          },
+        };
+      }
+      createGain() {
+        return {
+          gain: { setValueAtTime: () => undefined, linearRampToValueAtTime: () => undefined },
+          connect: () => undefined,
+        };
+      }
+      async startRendering() {
+        return { getChannelData: () => new Float32Array(this.length) };
+      }
+    }
+    vi.stubGlobal('OfflineAudioContext', FakeOffline);
+    try {
+      const record: CrossfadeRecord = {
+        rate: R,
+        t: 1000,
+        old: [placed(0, 0, 2000)],
+        fresh: placed(1000, 1000, 2000),
+      };
+      const base = 680;
+      await offlineCrossfade(record, base, 640, true);
+      expect(calls[0]).toBe(`start 0 ${680 / R}`);
+      expect(calls[1]).toBe(`stop ${(1000 - base) / R + 0.01}`);
+      expect(calls[2]).toBe(`start ${(1000 - base) / R} 0`);
+      calls.length = 0;
+      await offlineCrossfade(record, base, 640, false);
+      expect(calls.slice(0, 2)).toEqual([`start 0 ${680 / R}`, `stop ${(1000 - base) / R}`]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('隣り合う標本の差の最大', () => {
     expect(maxJump([Float32Array.from([0, 0.1, 0.5, 0.4])], 0, 3)).toBeCloseTo(0.4, 6);
     expect(maxJump([Float32Array.from([0, 1])], 1, 5)).toBe(0);
