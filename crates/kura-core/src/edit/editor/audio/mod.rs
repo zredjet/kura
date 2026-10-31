@@ -18,6 +18,8 @@ mod handles_tests;
 #[cfg(test)]
 mod long_tests;
 pub mod measure;
+#[cfg(test)]
+mod measure_tests;
 pub mod peaks;
 #[cfg(test)]
 mod peaks_tests;
@@ -313,13 +315,20 @@ impl Editor {
         st.view = Some(vr.view.clone());
         if let Some(a) = st.audio.as_mut() {
             a.peaks.note(rev, (rate, channels, frames), &changed);
+            // 出力が変わったら、前の出力の計りかけを捨てる
+            a.measure.retarget(&id);
         }
-        self.advance_peaks(st, rev, &value, &area, &avp, ticket);
+        // 裏の仕事の区切り（`work` の要求だけ。操作中は進めない）：波形の段を先に、残った時間で長い音声の計りを進める
+        let deadline = (avp.work && !avp.interacting).then(|| Instant::now() + peaks::WORK_SLICE);
+        self.advance_peaks(st, rev, &value, &area, &avp, deadline, ticket);
+        if let Some(deadline) = deadline {
+            self.advance_measure(st, &id, deadline, ticket);
+        }
         self.count_resident(st);
         let (peaks, work, loudness) = match st.audio.as_mut() {
             Some(a) => {
                 let info = a.peaks.report();
-                let work = info.pending;
+                let work = info.pending || a.measure.running(&id);
                 (info, work, a.measure.state(&id))
             }
             None => return failed(EditorError::Failed("音声の状態がありません".into())),

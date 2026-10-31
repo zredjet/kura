@@ -7,22 +7,49 @@
 //!   決める（`whole_is_short`：出力と、全体を描くときに作るどのノードの値も `WHOLE_VIEW_BYTES` 以下）。長い元を gain → trim
 //!   で短くした文書は、表示は区間だけを描けても、全体を描くと上流に長い値ができるので長い音声と同じ扱い。範囲の描画・
 //!   継ぎはぎの表示の値は解析に使わない。
-//! - 長い音声：段 2 の流れの解析が入るまで `Failed`（「この長さのラウドネスは、まだ計れません」。結果の LRU には入れない）。
-//!   段 4B（F12）で、裏の仕事で窓ごとに流して計る（`Measuring { progress }`）。
+//! - 長い音声（`whole_is_short` が偽。M13 段 4B）：`edit_measure` は計りを予約して `Measuring { progress: 0 }` を返す（同じ
+//!   出力を計っている途中ならその進み）。計りは裏の仕事（`edit_view { work: true }` の区切り。別のスレッドは使わない）で、
+//!   今の出力を窓（[`MEASURE_WINDOW_CHUNKS`] チャンク）ごとに頭から `Engine::stream_audio` で流し、流れの解析の扇（`AnalysisFan`。
+//!   `audio.loudness` v1）に渡して解く。窓の前に、その区間だけの見積もり（`.area`）で `admit_preview` する。結果は全体の値に
+//!   当てた解析とビット単位で同じ（E35・E39。A16）で、結果の LRU に入れる。
+//!   - 順と区切りの予算：1 回の区切り（`WORK_SLICE`）は波形の段を先に進め、残った時間で計りを進める（波形は画面の主で、
+//!     どちらも同じ出力を全体に流すので、順に済ませたほうがどちらも早く済む。段 4B の決定）。
+//!   - 操作中（`interacting`）は進めない。今の出力の `samplesId` が計っている出力と違えば、計りかけを捨てる（取り消しで同じ
+//!     標本に戻っても、計り直しは `edit_measure` から）。計っている間は表示の情報の `work` を真にする（フロントが頼み直す）。
 //! - `Latest` の世代を払い出さない（表示を止めない）。止まるのは閉じたときだけ。表示の情報の `loudness` にも、覚えている状態を
-//!   毎回載せる（覚えていなければ `Idle`）。
+//!   毎回載せる（計っている途中なら `Measuring`、覚えていなければ `Idle`）。
 
-use kura_engine::analysis::NoParams;
-use kura_engine::analysis::Reasoned;
+use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
+
 use kura_engine::analysis::audio::loudness::{LoudnessAnalysis, LoudnessReport, Unmeasured};
+use kura_engine::analysis::output::json_from_canonical;
+use kura_engine::analysis::stream::AnalysisFan;
+use kura_engine::analysis::{Analysis, AnalysisRequest, Analyzed, NoParams, Reasoned};
+use kura_engine::audio::stream::{AudioSink, StreamEnd, StreamInfo};
+use kura_engine::monitor::Ticket;
 use kura_engine::render::cache::RenderOptions;
 use kura_engine::render::estimate::{EstimateSpec, Source};
+use kura_engine::render::region::{Area, Spans};
+use kura_engine::value::{AUDIO_CHUNK, AudioMeta};
+use kura_engine::{EngineError, Monitor, NoMonitor};
 
-use super::super::{EditorEnv, EditorError, ProblemCode, State, editor_of, settle};
-use super::{WHOLE_VIEW_BYTES, is_short, samples_id};
+use super::super::{Editor, EditorEnv, EditorError, ProblemCode, State, editor_of, settle};
+use super::{WHOLE_VIEW_BYTES, audio_shape, is_short, samples_id};
 
 /// 覚える結果の数。
 pub const RESULTS: usize = 8;
+/// 長い音声の計りで 1 度に流す窓のチャンクの数（262,144 フレーム。48 kHz ステレオで 1 窓 10 ms ほど）。流れの窓（16 チャンク。
+/// 1 窓 40 ms ほど）より小さくして、裏の仕事の区切り（40 ms）を窓 1 つぶんしか越えないようにする。値に効かない。
+pub const MEASURE_WINDOW_CHUNKS: u64 = 4;
+
+/// 長さ `frames` の出力を頭から順に流す窓（[`MEASURE_WINDOW_CHUNKS`] チャンクずつ。最後だけ短い）。
+fn measure_windows(frames: u64) -> Vec<(u64, u64)> {
+    let step = MEASURE_WINDOW_CHUNKS * AUDIO_CHUNK as u64;
+    (0..frames.div_ceil(step))
+        .map(|i| (i * step, ((i + 1) * step).min(frames)))
+        .collect()
+}
 
 /// ラウドネスの値（M11 の素材の事実と同じ意味。計れない値は None で、積分の理由は `loudness_reason`）。
 #[derive(Debug, Clone, PartialEq)]
@@ -85,20 +112,64 @@ pub fn values_of(r: &LoudnessReport) -> LoudnessValues {
     }
 }
 
-/// 計りの結果の LRU（`AudioState` が持つ）。
-#[derive(Debug, Default)]
+/// 長い音声の計りかけ（裏の仕事で窓ごとに進める）。
+struct MeasureRun {
+    /// 計っている出力の `samplesId`。
+    samples_id: String,
+    /// 出力の長さ（フレーム）。
+    frames: u64,
+    /// 流れの解析の扇（`Sync` でないので錠で包む。触るのは状態の錠の中だけで、取り合わない）。
+    fan: Mutex<AnalysisFan>,
+    /// 流す窓（頭から順・重ならず）と、次に流す窓の番号。
+    windows: Vec<(u64, u64)>,
+    next: usize,
+    /// 出力のメタデータ（最初の窓の `begin` で覚える。流れの終わりに渡す）。
+    meta: Option<AudioMeta>,
+}
+
+impl MeasureRun {
+    fn progress(&self) -> f64 {
+        if self.windows.is_empty() {
+            1.0
+        } else {
+            self.next as f64 / self.windows.len() as f64
+        }
+    }
+}
+
+/// 計りの結果の LRU と、長い音声の計りかけ（`AudioState` が持つ）。
+#[derive(Default)]
 pub(crate) struct MeasureJob {
     /// (samplesId, 状態)。古い順。
     results: Vec<(String, LoudnessState)>,
+    run: Option<MeasureRun>,
 }
 
 impl MeasureJob {
-    /// 覚えている状態（なければ `Idle`）。
+    /// 覚えている状態（計っている途中なら `Measuring`、なければ `Idle`）。
     pub(crate) fn state(&self, id: &str) -> LoudnessState {
+        if let Some(r) = self.run.as_ref().filter(|r| r.samples_id == id) {
+            return LoudnessState::Measuring {
+                samples_id: id.to_string(),
+                progress: r.progress(),
+            };
+        }
         self.results
             .iter()
             .find(|(k, _)| k == id)
             .map_or(LoudnessState::Idle, |(_, s)| s.clone())
+    }
+
+    /// 出力 `id` を計っている途中か（裏の仕事が残っている）。
+    pub(crate) fn running(&self, id: &str) -> bool {
+        self.run.as_ref().is_some_and(|r| r.samples_id == id)
+    }
+
+    /// 今の出力が `id` になった：ほかの出力の計りかけを捨てる。
+    pub(crate) fn retarget(&mut self, id: &str) {
+        if self.run.as_ref().is_some_and(|r| r.samples_id != id) {
+            self.run = None;
+        }
     }
 
     fn remember(&mut self, id: &str, state: LoudnessState) {
@@ -107,6 +178,167 @@ impl MeasureJob {
         while self.results.len() > RESULTS {
             self.results.remove(0);
         }
+    }
+
+    /// 計りかけの出力・次の窓の番号・窓の数（テスト）。
+    #[cfg(test)]
+    pub(crate) fn run_position(&self) -> Option<(String, usize, usize)> {
+        self.run
+            .as_ref()
+            .map(|r| (r.samples_id.clone(), r.next, r.windows.len()))
+    }
+}
+
+/// 窓の流れを扇に渡す包み（`begin` のメタデータを覚え、渡せたかを記す。`finish` は何もしない：窓ごとに `stream_audio` を
+/// 呼ぶので、流れの終わりは呼び手が最後の窓のあとに渡す）。
+struct FanFeed<'a> {
+    fan: &'a mut AnalysisFan,
+    meta: &'a mut Option<AudioMeta>,
+    fed: bool,
+}
+
+impl AudioSink for FanFeed<'_> {
+    fn begin(&mut self, info: &StreamInfo) -> Result<(), EngineError> {
+        if self.meta.is_none() {
+            *self.meta = Some(info.meta.clone());
+        }
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.fan.feed(start, planes, mon)?;
+        self.fed = true;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
+/// 扇の結果（要求は `audio.loudness` だけ）を状態にする。
+fn finished(id: &str, results: Vec<Result<Analyzed, EngineError>>) -> LoudnessState {
+    let report = results
+        .into_iter()
+        .next()
+        .ok_or_else(|| EngineError::Internal("ラウドネスの結果がありません".into()))
+        .and_then(|r| r)
+        .and_then(|a| json_from_canonical::<LoudnessReport>(&a.output));
+    match report {
+        Ok(report) => LoudnessState::Ready {
+            samples_id: id.to_string(),
+            values: values_of(&report),
+        },
+        Err(e) => LoudnessState::Failed {
+            samples_id: id.to_string(),
+            message: EditorError::from_engine("ラウドネスを計れません", e).to_string(),
+        },
+    }
+}
+
+impl Editor {
+    /// 長い音声の計りを裏の仕事で進める（モジュールの説明）。今の出力 `id` の計りかけがあれば、`deadline` まで窓を 1 つずつ
+    /// 流し（窓の前にその区間だけの見積もりで確保する。空いていなければあとにする）、流し終えたら解いて結果の LRU に入れる。
+    /// 中止（新しい要求・閉じる）は窓の境で止め、計りかけを残す。
+    pub(super) fn advance_measure(
+        &self,
+        st: &mut State,
+        id: &str,
+        deadline: Instant,
+        ticket: &Ticket,
+    ) {
+        if !st.audio.as_ref().is_some_and(|a| a.measure.running(id)) {
+            return;
+        }
+        let plan = st.plan.clone();
+        let output = st.output;
+        loop {
+            let Some(run) = st.audio.as_mut().and_then(|a| a.measure.run.as_mut()) else {
+                return;
+            };
+            if run.next >= run.windows.len() {
+                break;
+            }
+            if Instant::now() >= deadline || ticket.canceled() {
+                return;
+            }
+            let (a, b) = run.windows[run.next];
+            let spans = Spans::one(a, b);
+            let spec = EstimateSpec::new(0)
+                .all_inputs(&plan, Source::Held)
+                .area(output, Area::samples(spans.clone()));
+            if let Err(err) =
+                self.runtime
+                    .admit_preview(&plan, spec, &st.inputs, &mut st.cache, &mut st.lease)
+            {
+                tracing::debug!(%err, "ラウドネスを計る予算が空いていないので、あとにします");
+                settle(st);
+                return;
+            }
+            let Some(run) = st.audio.as_mut().and_then(|a| a.measure.run.as_mut()) else {
+                settle(st);
+                return;
+            };
+            let (inputs, cache) = (&st.inputs, &mut st.cache);
+            let mut feed = FanFeed {
+                fan: run.fan.get_mut().unwrap_or_else(PoisonError::into_inner),
+                meta: &mut run.meta,
+                fed: false,
+            };
+            let r = self.runtime.preview(|e| {
+                e.stream_audio(
+                    &plan,
+                    inputs,
+                    cache,
+                    output,
+                    Some(&spans),
+                    &mut feed,
+                    ticket,
+                )
+            });
+            if feed.fed {
+                run.next += 1;
+            }
+            settle(st);
+            match r {
+                Ok(_) => {}
+                Err(err) if matches!(err.root(), EngineError::Canceled) => return,
+                Err(err) => {
+                    let state = LoudnessState::Failed {
+                        samples_id: id.to_string(),
+                        message: EditorError::from_engine("ラウドネスを計れません", err)
+                            .to_string(),
+                    };
+                    if let Some(a) = st.audio.as_mut() {
+                        a.measure.run = None;
+                        a.measure.remember(id, state);
+                    }
+                    return;
+                }
+            }
+        }
+        // 流し終えた：解く（短い計算なので中止を見ない。新しい要求に取って代わられても計りかけを無駄にしない）
+        let Some(a) = st.audio.as_mut() else {
+            return;
+        };
+        let Some(run) = a.measure.run.take() else {
+            return;
+        };
+        let MeasureRun {
+            fan, frames, meta, ..
+        } = run;
+        let mut fan = fan.into_inner().unwrap_or_else(PoisonError::into_inner);
+        fan.set_end(&StreamEnd {
+            frames,
+            meta: meta.unwrap_or_default(),
+        });
+        let state = finished(id, fan.finish(&NoMonitor));
+        a.measure.remember(id, state);
     }
 }
 
@@ -173,10 +405,29 @@ pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, Edit
         }
     }
     if !whole_is_short(&editor, st, &full)? {
-        return Ok(LoudnessState::Failed {
-            samples_id: id,
-            message: "この長さのラウドネスは、まだ計れません".into(),
-        });
+        // 長い音声：計りを予約する（裏の仕事で窓ごとに流して解く）
+        let frames = audio_shape(&full)
+            .map(|(_, _, n)| n)
+            .ok_or_else(|| EditorError::Failed("長さの分からない音声は計れません".into()))?;
+        let req = AnalysisRequest {
+            id: LoudnessAnalysis::ID.into(),
+            v: Some(LoudnessAnalysis::VERSION),
+            params: serde_json::json!({}),
+        };
+        let fan = editor
+            .runtime
+            .preview(|e| e.analyze_stream(std::slice::from_ref(&req), &full));
+        if let Some(a) = st.audio.as_mut() {
+            a.measure.run = Some(MeasureRun {
+                samples_id: id.clone(),
+                frames,
+                fan: Mutex::new(fan),
+                windows: measure_windows(frames),
+                next: 0,
+                meta: None,
+            });
+            return Ok(a.measure.state(&id));
+        }
     }
     let plan = st.plan.clone();
     let spec = EstimateSpec::new(0).all_inputs(&plan, Source::Held);
@@ -229,6 +480,18 @@ pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, Edit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measure_windows_cover_the_output_in_order() {
+        let step = MEASURE_WINDOW_CHUNKS * AUDIO_CHUNK as u64;
+        assert!(measure_windows(0).is_empty());
+        assert_eq!(measure_windows(5), vec![(0, 5)]);
+        assert_eq!(
+            measure_windows(2 * step + 3),
+            vec![(0, step), (step, 2 * step), (2 * step, 2 * step + 3)]
+        );
+        assert_eq!(measure_windows(2 * step).len(), 2);
+    }
 
     #[test]
     fn results_are_kept_by_samples_id() {

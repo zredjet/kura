@@ -118,7 +118,7 @@ fn g_gain(db: f64) -> Graph {
 }
 
 /// A14：短い音声は `edit_measure` の中で計って Ready（`audio.loudness` を全体の描画に当てたものと同じ）。出力の指紋ごとに覚え、
-/// 表示の情報にも載る。長い音声は段 4B まで Failed。
+/// 表示の情報にも載る。長い音声は計りを予約して Measuring（裏の仕事で計る。A16）。
 #[test]
 fn measure_matches_the_analysis_of_the_render() {
     use kura_engine::analysis::NoParams;
@@ -167,19 +167,22 @@ fn measure_matches_the_analysis_of_the_render() {
     assert_eq!(shown_audio(&out.view).loudness, got);
     assert_eq!(measure(&env.env(), &s).unwrap(), got);
 
-    // 長い音声は段 4B まで計らない
+    // 長い音声は計りを予約するだけ（裏の仕事で計る。A16）
     let long = add_audio(&env.lib, &noise_wav(8_000, 1, 130 * C, 54), "wav");
     let opened = env.open(long);
     let state = measure(&env.env(), &opened.session).unwrap();
-    assert!(
-        matches!(&state, LoudnessState::Failed { message, .. } if message.contains("まだ計れません")),
-        "{state:?}"
+    assert_eq!(
+        state,
+        LoudnessState::Measuring {
+            samples_id: shown_audio(&opened.outcome.view).samples_id.clone(),
+            progress: 0.0
+        }
     );
 }
 
 /// A14：「短い」は全体を描く見積もり（上流を含む）で決める。長い元 → gain → trim は出力が短くても、全体を描くと上流に長い値が
-/// できるので長い音声と同じ扱い（段 4B まで Failed・結果を覚えない）。表示はそのまま描ける。上流が長い値を作らない
-/// （長い元 → trim）なら計って Ready。
+/// できるので長い音声と同じ扱い（計りを予約し、裏の仕事で窓ごとに流して計る。結果は全体の描画の解析と同じ。A16）。表示は
+/// そのまま描ける。上流が長い値を作らない（長い元 → trim）なら `edit_measure` の中で計って Ready。
 #[test]
 fn measure_judges_the_whole_render_not_the_output() {
     use kura_engine::analysis::NoParams;
@@ -203,14 +206,36 @@ fn measure_judges_the_whole_render_not_the_output() {
     assert_eq!(info.valid, vec![(0, C)], "表示は短い音声として全体を描く");
     let state = measure(&env.env(), &s).unwrap();
     assert!(
-        matches!(&state, LoudnessState::Failed { message, .. } if message.contains("まだ計れません")),
+        matches!(&state, LoudnessState::Measuring { samples_id, .. } if *samples_id == info.samples_id),
         "{state:?}"
     );
-    let out = env.step(&s, Vec::new(), &vp);
+    // 裏の仕事（`audio_idle` は work: true）で流して計る
+    let mut ready = None;
+    for _ in 0..200 {
+        let out = env.step(&s, Vec::new(), &vp);
+        if let LoudnessState::Ready { values, .. } = &shown_audio(&out.view).loudness {
+            ready = Some(values.clone());
+            break;
+        }
+    }
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -3.0 }), 1)
+        .unwrap();
+    g.push_linear("audio.trim", 1, json!({ "start": 0, "end": C }), 2)
+        .unwrap();
+    let want = rendered(&bytes, "wav", &g);
+    let report = kura_engine::Engine::new()
+        .unwrap()
+        .analyze::<LoudnessAnalysis>(
+            &kura_engine::Value::Audio(want),
+            &NoParams {},
+            &kura_engine::NoMonitor,
+        )
+        .unwrap();
     assert_eq!(
-        shown_audio(&out.view).loudness,
-        LoudnessState::Idle,
-        "結果を覚えない"
+        ready,
+        Some(values_of(&report)),
+        "流して計った値は全体の解析と同じ"
     );
 
     // 長い元 → trim：上流に長い値を作らないので計る

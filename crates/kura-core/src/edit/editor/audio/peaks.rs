@@ -325,7 +325,9 @@ fn order_windows(windows: Vec<(u64, u64)>, visible: Option<(u64, u64)>) -> Vec<(
 
 impl Editor {
     /// 波形の段を直す（モジュールの説明）。`value` は公開した今の表示の値、`drawn` はその表示で描いた範囲（ここに掛かる有効な
-    /// チャンクだけを値から渡す。遅延の入力のチャンクを読み回さないため）。中止（新しい要求）は途中で止め、組んだ分は残す。
+    /// チャンクだけを値から渡す。遅延の入力のチャンクを読み回さないため）。`deadline` は裏の仕事の区切りの終わり（`work` の
+    /// 要求だけ。呼び手が決め、残った時間で長い音声の計りを進める）。中止（新しい要求）は途中で止め、組んだ分は残す。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn advance_peaks(
         &self,
         st: &mut State,
@@ -333,6 +335,7 @@ impl Editor {
         value: &PartialValue,
         drawn: &Area,
         vp: &super::AudioViewport,
+        deadline: Option<Instant>,
         ticket: &Ticket,
     ) {
         let Some(shape) = st.audio.as_ref().and_then(|a| a.peaks.shape) else {
@@ -341,7 +344,6 @@ impl Editor {
         if vp.interacting {
             return;
         }
-        let deadline = vp.work.then(|| Instant::now() + WORK_SLICE);
         let Some(audio) = st.audio.as_mut() else {
             return;
         };
