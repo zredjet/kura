@@ -639,14 +639,35 @@ impl Editor {
         self.lock_published().input.clone()
     }
 
-    /// 公開した今か直前の音声の表示のうち、rev が同じものの値と `samplesId`（配信用。なければ None）。
+    /// 公開した今か直前の音声の表示のうち、rev が同じものの値と `samplesId`（今を先に。配信用。なければ None）。
     pub fn published_audio(&self, rev: u64) -> Option<(PartialValue, String)> {
+        self.published_audio_where(rev, |_| true)
+    }
+
+    /// 公開した今か直前の音声の表示のうち、rev が同じで区間 `area` を有効なチャンクで覆うものの値と `samplesId`（今 → 直前の
+    /// 順に探す。同じ rev のまま区間を替えて描き直しても、直前の表示が覆う区間は配る。なければ None）。
+    pub fn published_audio_covering(
+        &self,
+        rev: u64,
+        area: &kura_engine::render::region::Area,
+    ) -> Option<(PartialValue, String)> {
+        self.published_audio_where(rev, |v| v.covers(area))
+    }
+
+    fn published_audio_where(
+        &self,
+        rev: u64,
+        accept: impl Fn(&PartialValue) -> bool,
+    ) -> Option<(PartialValue, String)> {
         let p = self.lock_published();
         [p.now.as_ref(), p.before.as_ref()]
             .into_iter()
             .flatten()
-            .find(|s| s.rev == rev && s.samples_id.is_some())
-            .and_then(|s| Some((s.view.value().clone(), s.samples_id.clone()?)))
+            .filter(|s| s.rev == rev)
+            .find_map(|s| {
+                let id = s.samples_id.clone()?;
+                accept(s.view.value()).then(|| (s.view.value().clone(), id))
+            })
     }
 
     /// 閉じる：中止 → キャッシュを空に → 確保を落とす → 取り置きを 0（このエディタが取り置きの持ち主のときだけ。閉じ終わる前に

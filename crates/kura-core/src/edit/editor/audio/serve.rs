@@ -1,7 +1,7 @@
 //! `/edit` の音声のルートの中身（M13 段 4。docs/editing.md §12.13、docs/architecture.md §4）。
 //!
-//! - `/edit/{s}/{rev}/pcm/{a}-{b}`（[`serve_pcm`]）：エディタが公開した今か直前の表示（rev が同じもの）の、出力のフレーム
-//!   `[a, b)` の PCM。M11 の WAV（kura チャンク付き。`asset::pcm::write_wav`）で、kura チャンクは `{ start: a, total: 出力の長さ,
+//! - `/edit/{s}/{rev}/pcm/{a}-{b}`（[`serve_pcm`]）：エディタが公開した今か直前の表示（rev が同じで区間を覆うもの。今を先に）の、
+//!   出力のフレーム `[a, b)` の PCM。M11 の WAV（kura チャンク付き。`asset::pcm::write_wav`）で、kura チャンクは `{ start: a, total: 出力の長さ,
 //!   loop: 出力のループ, decoder: "kura-edit/1:" + samplesId }`。区間が表示の値の有効なチャンクに覆われなければ 404。
 //! - `/edit/{s}/input/pcm/{a}-{b}`（[`serve_input_pcm`]）：元（文書の入力）の PCM。遅延の値なら源の LRU を通って読む。kura チャンクは
 //!   `{ total: 元の長さ, loop: 元のループ, decoder: 元の読み取りのデコーダ }`。
@@ -100,21 +100,21 @@ pub fn serve_pcm(
     end: u64,
 ) -> Result<Vec<u8>, PcmError> {
     let editor = engine.editor_for(session).ok_or(PcmError::NotFound)?;
-    let (value, samples_id): (PartialValue, String) =
-        editor.published_audio(rev).ok_or(PcmError::NotFound)?;
+    // 形は rev で決まる（今と直前が同じ rev なら同じ形）。区間は今 → 直前の順に、有効なチャンクで覆うものから読む
+    let (shown, _) = editor.published_audio(rev).ok_or(PcmError::NotFound)?;
     let kura_engine::Shape::Audio {
         rate,
         channels,
         frames,
-    } = value.shape()
+    } = shown.shape()
     else {
         return Err(PcmError::NotFound);
     };
     let total = frames.max();
     let floats = check_span(start, end, total, u64::from(channels))?;
-    if !value.covers(&Area::span(start, end)) {
-        return Err(PcmError::NotFound);
-    }
+    let (value, samples_id): (PartialValue, String) = editor
+        .published_audio_covering(rev, &Area::span(start, end))
+        .ok_or(PcmError::NotFound)?;
     let meta = value.audio_meta().cloned().unwrap_or_default();
     let decoder = format!("{EDIT_DECODER_PREFIX}{samples_id}");
     let form = Form {

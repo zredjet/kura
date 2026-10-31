@@ -104,9 +104,9 @@ pub fn snap(
     let channels = usize::from(channels);
     let span = Area::span(a, b);
     let rev = st.session.rev().0;
-    let planes = match editor.published_audio(rev) {
-        Some((value, _)) if value.covers(&span) => read(&value, channels, a, b)?,
-        _ => {
+    let planes = match editor.published_audio_covering(rev, &span) {
+        Some((value, _)) => read(&value, channels, a, b)?,
+        None => {
             let plan = st.plan.clone();
             let spec = EstimateSpec::new(0)
                 .all_inputs(&plan, Source::Held)

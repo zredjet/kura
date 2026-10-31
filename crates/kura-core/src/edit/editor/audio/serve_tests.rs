@@ -207,3 +207,38 @@ fn edit_pcm_outside_the_drawn_spans_is_not_found() {
     let w = parse_wav(&serve_input_pcm(&env.engine, &s, 100 * C, 100 * C + 4).unwrap());
     assert_eq!(w.planes[0].len(), 4);
 }
+
+/// A7：同じ rev のまま区間を替えて描き直しても、直前の表示（同じ rev）が覆う区間の PCM は取れる（今 → 直前の順に覆うものを
+/// 探す）。どちらにも覆われない区間は 404。
+#[test]
+fn edit_pcm_of_the_same_rev_reads_the_previous_spans_too() {
+    let env = Env::new();
+    let frames = 130 * C;
+    let bytes = noise_wav(8_000, 1, frames, 23);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open(id).session.clone();
+    let out = env.step(
+        &s,
+        vec![add(0, "audio.gain", json!({ "db": -1.0 }))],
+        &spans(&[(10 * C, 11 * C)]),
+    );
+    let rev = shown_audio(&out.view).rev;
+    let out = env.step(&s, Vec::new(), &spans(&[(50 * C, 51 * C)]));
+    assert_eq!(shown_audio(&out.view).rev, rev, "手なしは同じ rev");
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -1.0 }), 1)
+        .unwrap();
+    let want = rendered(&bytes, "wav", &g);
+    for (a, b) in [(10 * C, 11 * C), (50 * C, 51 * C), (10 * C + 5, 10 * C + 9)] {
+        let w = parse_wav(&serve_pcm(&env.engine, &s, rev, a, b).unwrap());
+        assert_eq!(w.planes, expected(&want, a, b), "[{a}, {b})");
+    }
+    assert!(matches!(
+        serve_pcm(&env.engine, &s, rev, 11 * C - 1, 50 * C + 1),
+        Err(PcmError::NotFound)
+    ));
+    assert!(matches!(
+        serve_pcm(&env.engine, &s, rev, 0, 1),
+        Err(PcmError::NotFound)
+    ));
+}
