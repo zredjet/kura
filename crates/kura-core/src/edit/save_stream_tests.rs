@@ -441,3 +441,133 @@ fn s23_streamed_rebuild_verifies_audio_versions() {
     );
     assert_consistent(&env.lib);
 }
+
+/// S21：エディタの入力（作業用の PCM から開いた遅延の値）を貸して保存すると、元を読み直さない（デコーダが読んだ数が増えない）。
+/// 結果は貸さないときと同じ（バイト列・アンカーの昇格）。照らしていない貸しものの値が記録と違えば、使わずにふつうに読む。
+#[test]
+fn s21_lent_input_is_not_read_again() {
+    use super::anchors::options_digest;
+    use super::services::{LentAnchor, LentInput};
+    use super::work_pcm::WorkKey;
+    use kura_engine::codec::anchor::{self, AnchorContext};
+    use kura_engine::doc::DecodeOptions;
+    let decoder = opus_decoder(2, 2 * 65_536 + 11);
+    let codecs = {
+        let mut set = CodecSet::pinned();
+        set.add_decoder(decoder.clone()).unwrap();
+        Arc::new(Mutex::new(set))
+    };
+    let env = Env::with(FakeEngineFactory::with_codecs(codecs), None);
+    let (item, hash) = add_audio(&env.lib, b"lent fake opus", "opus", "貸す声");
+    // エディタと同じに、作業用の PCM を作って遅延の値で開く
+    let set = env.engine.codecs();
+    let path = env.lib.layout().content_path(&hash, "opus");
+    let opts = DecodeOptions::default();
+    let limits = Engine::new().unwrap().limits().clone();
+    let shape = set.shape_path(&path, "opus", &opts, &limits).unwrap().0;
+    let lend = |verified: bool, value_digest: Option<Digest>| {
+        let work = env
+            .engine
+            .work_pcm()
+            .ensure(
+                &WorkKey {
+                    source: hash,
+                    format: "opus".into(),
+                    options: opts.clone(),
+                    decoder: None,
+                },
+                &shape,
+                AnchorContext {
+                    source: Some(Digest(hash)),
+                    format: Some("opus".into()),
+                    options: opts.clone(),
+                },
+                |sink| set.decode_stream_path(&path, "opus", &opts, &limits, sink, &NoMonitor),
+                &limits,
+                &NoMonitor,
+            )
+            .unwrap();
+        let opened = anchor::open_source(&work.opener(), &limits, 64 << 20)
+            .unwrap()
+            .unwrap();
+        let mut decoded = work.pcm().decoded.clone();
+        if let Some(d) = value_digest {
+            decoded.value_digest = d;
+        }
+        env.engine.lend_input(
+            "editor-1",
+            LentInput {
+                item_id: item,
+                source: hash,
+                options_digest: Digest(options_digest(&opts).unwrap()),
+                format: "opus".into(),
+                value: opened.value,
+                decoded,
+                anchor: LentAnchor::None,
+                work: Some(work),
+                verified,
+            },
+        );
+    };
+    lend(true, None);
+    assert_eq!(decoder.reads(), 1);
+    let first = decoder.value_for(0).unwrap();
+    let g = audio_doc(-2.0, Some("wav"));
+    let (want, _, _, _) = whole_path(&CodecSet::pinned(), first, hash, &g, "wav");
+    let record = env.overwrite(item, g);
+    assert_done(&record);
+    assert_eq!(decoder.reads(), 1, "貸した入力を使い、元を読み直さない");
+    assert_eq!(result_of(&record)["anchor"], "created");
+    let (got, _, _) = current(&env, item);
+    assert!(got == want, "貸した入力の保存のバイト列が違う");
+    // 貸している間は作業用の PCM が残り、引き上げると消える
+    assert_eq!(env.engine.work_pcm().usage().0, 1);
+    env.engine.withdraw_input("editor-1");
+    assert_eq!(env.engine.work_pcm().usage(), (0, 0));
+    assert_consistent(&env.lib);
+}
+
+/// 貸した入力のうち、照らしていない（`verified` が偽）もので値が記録と違うものは使わず、アンカーから読む。
+#[test]
+fn unverified_lent_input_that_does_not_match_is_not_used() {
+    use super::anchors::options_digest;
+    use super::services::{LentAnchor, LentInput};
+    use kura_engine::doc::DecodeOptions;
+    let env = Env::new();
+    let pinned = CodecSet::pinned();
+    let original = noise_file(&pinned, "wav", 1, 70_001, 21);
+    let (item, hash) = add_audio(&env.lib, &original, "wav", "照らす声");
+    let value = decode_pinned(&original, "wav");
+    // 別の値を貸す（記録のダイジェストは元のもの）
+    let other = decode_pinned(&noise_file(&pinned, "wav", 1, 70_001, 22), "wav");
+    let (_, stamp) = pinned
+        .decode(
+            &mut std::io::Cursor::new(&original),
+            "wav",
+            &DecodeOptions::default(),
+            Engine::new().unwrap().limits(),
+            &NoMonitor,
+        )
+        .unwrap();
+    env.engine.lend_input(
+        "editor-2",
+        LentInput {
+            item_id: item,
+            source: hash,
+            options_digest: Digest(options_digest(&DecodeOptions::default()).unwrap()),
+            format: "wav".into(),
+            value: other,
+            decoded: stamp,
+            anchor: LentAnchor::None,
+            work: None,
+            verified: false,
+        },
+    );
+    let g = audio_doc(-3.0, None);
+    let (want, _, _, _) = whole_path(&pinned, value, hash, &g, "wav");
+    assert_done(&env.overwrite(item, g));
+    let (got, _, _) = current(&env, item);
+    assert!(got == want, "記録と違う貸しものを使った");
+    env.engine.withdraw_input("editor-2");
+    assert_consistent(&env.lib);
+}

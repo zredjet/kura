@@ -230,6 +230,22 @@ impl Drop for WorkHandle {
     }
 }
 
+/// 写すと参照が 1 つ増える（エディタが保存に入力を貸すとき。M13 段 3）。残す印は写さない。
+impl Clone for WorkHandle {
+    fn clone(&self) -> Self {
+        if let Some(e) = self.inner.entries().get_mut(&self.name) {
+            e.refs += 1;
+            e.retained_until = None;
+        }
+        Self {
+            pcm: self.pcm.clone(),
+            name: self.name.clone(),
+            inner: self.inner.clone(),
+            retain: false,
+        }
+    }
+}
+
 /// 書きかけの `.part`（落とすと消す）。
 struct Part(PathBuf);
 

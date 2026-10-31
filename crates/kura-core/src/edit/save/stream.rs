@@ -640,6 +640,73 @@ pub(super) fn read_input(
     })))
 }
 
+/// 借りた入力（入力・作業用の PCM）。
+type Borrowed = (StreamInput, Option<WorkHandle>);
+
+/// エディタが貸している入力を借りる（M13 段 3。`EngineServices::borrow_input`）：同じアイテム・元・読み方のものがあれば、
+/// 照らしていなければ照らしの回で値を記録と照らし（違えば使わない）、アンカーに昇格する読み（再現しない読み）なのに作業用の
+/// PCM がなければ使わない。使えれば（入力・作業用の PCM）。
+pub(super) fn borrowed(
+    cx: &StreamCx<'_>,
+    item_id: i64,
+    options_digest: &[u8; 32],
+    passes: &mut Passes<'_>,
+) -> Result<Flow<Option<Borrowed>>> {
+    let Some(lent) = cx
+        .engine
+        .borrow_input(item_id, &cx.original_hash, &Digest(*options_digest))
+        .filter(|l| l.format == cx.format)
+    else {
+        return Ok(Flow::Go(None));
+    };
+    let anchor = match &lent.anchor {
+        crate::edit::services::LentAnchor::None => AnchorUse::None,
+        crate::edit::services::LentAnchor::Existing(a) => AnchorUse::Existing(a.clone()),
+        crate::edit::services::LentAnchor::Fallback(a) => AnchorUse::Fallback(a.clone()),
+    };
+    if matches!(anchor, AnchorUse::None)
+        && anchor::needs_anchor(&lent.decoded)
+        && lent.work.is_none()
+    {
+        return Ok(Flow::Go(None));
+    }
+    let tasks = cx.runtime.bulk_threads();
+    let shape = lent.value.shape();
+    let resident = lru_bytes(&shape, tasks);
+    if !lent.verified {
+        let _lease = match cx.acquire(verify_bytes(&shape, tasks as u64, resident))? {
+            Flow::Go(l) => l,
+            Flow::Stop(end) => return Ok(Flow::Stop(end)),
+        };
+        passes.report(0.5, 0.0, "元の読み取りを照らしています");
+        let mon = cx.mon;
+        let value = lent.value.clone();
+        let got = cx.runtime.bulk(|_| digest_value(&value, mon));
+        let got = match got {
+            Ok(d) => d,
+            Err(e) if matches!(e.root(), EngineError::Canceled) => match stop_end(cx.ctx) {
+                Some(end) => return Ok(Flow::Stop(end)),
+                None => return Err(from_engine("元の読み取りを照らせません", e)),
+            },
+            // 照らせない貸しものは使わない（ふつうに読む）
+            Err(_) => return Ok(Flow::Go(None)),
+        };
+        if got != lent.decoded.value_digest {
+            return Ok(Flow::Go(None));
+        }
+    }
+    passes.finish(1.0);
+    Ok(Flow::Go(Some((
+        StreamInput {
+            value: lent.value,
+            decoded: lent.decoded,
+            anchor,
+            resident,
+        },
+        lent.work,
+    ))))
+}
+
 /// 段 3：作業用の PCM をアンカーに昇格する（staging に写して照らす）。
 pub(super) fn promote(
     cx: &StreamCx<'_>,

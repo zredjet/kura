@@ -699,6 +699,8 @@ struct Decided<'a> {
     source_format: &'static str,
     opts: DecodeOptions,
     found: Option<Anchor>,
+    /// 読み方の設定のダイジェスト（エディタが貸す入力を引く鍵）。
+    options_digest: [u8; 32],
     out_format: String,
     enc_opts: serde_json::Value,
     /// 出力の拡張子の候補の最初（staging の名前）。
@@ -946,6 +948,7 @@ impl EditHandler {
                     source_format,
                     opts,
                     found,
+                    options_digest,
                     out_format,
                     enc_opts,
                     ext0: desc.exts.first().copied().unwrap_or("bin"),
@@ -1228,25 +1231,38 @@ impl EditHandler {
         ctx.progress(0.05, "元の大きさを確かめています");
         let mut warnings: Vec<String> = Vec::new();
         // 1. 入力
-        let want = match &d.found {
-            Some(a) => stream::Want::Recorded {
-                decoded: &a.decoded,
-                platform: true,
-            },
-            None => stream::Want::Any,
-        };
-        let read = stream::read_input(
-            &cx,
-            d.found.clone(),
-            want,
-            "保存できません",
-            &mut warnings,
-            &mut passes,
-            work,
-        )?;
-        let input = match read {
-            Flow::Go(read) => read.or_mismatch()?,
+        // エディタが同じ元・同じ読み方の入力を貸していれば、元を読み直さずに使う（照らしていなければ照らしの回を回す）
+        let lent = match stream::borrowed(&cx, d.item_id, &d.options_digest, &mut passes)? {
+            Flow::Go(lent) => lent,
             Flow::Stop(end) => return Ok(Flow::Stop(end)),
+        };
+        let input = match lent {
+            Some((input, lent_work)) => {
+                *work = lent_work;
+                input
+            }
+            None => {
+                let want = match &d.found {
+                    Some(a) => stream::Want::Recorded {
+                        decoded: &a.decoded,
+                        platform: true,
+                    },
+                    None => stream::Want::Any,
+                };
+                let read = stream::read_input(
+                    &cx,
+                    d.found.clone(),
+                    want,
+                    "保存できません",
+                    &mut warnings,
+                    &mut passes,
+                    work,
+                )?;
+                match read {
+                    Flow::Go(read) => read.or_mismatch()?,
+                    Flow::Stop(end) => return Ok(Flow::Stop(end)),
+                }
+            }
         };
         // 2. 計画（遅延の値の形で）と予算
         let shape = input.value.shape();

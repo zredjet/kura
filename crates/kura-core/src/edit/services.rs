@@ -15,15 +15,20 @@
 //!   （部品を捨てる）ときにすぐ手放す（M11 の検証 E2：アプリに 1 つだと、前のライブラリの音声と予算の確保を TTL まで持ち続け、
 //!   新しいライブラリの予算はそれを数えなかった）。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
+use kura_engine::codec::DecodeStamp;
+use kura_engine::{Digest, Value};
+
 pub use kura_engine::codec::CodecSet;
 
+use super::anchors::Anchor;
 use super::editor::{Editor, Reservation};
 use super::runtime::{EngineRuntime, RuntimeConfig};
-use super::work_pcm::{WORK_PCM_DIR, WorkPcmStore};
+use super::work_pcm::{WORK_PCM_DIR, WorkHandle, WorkPcmStore};
 use crate::Result;
 use crate::asset::pcm::{CACHE_TTL, PcmCache};
 use crate::library::upgrade::FreeSpaceFn;
@@ -58,6 +63,42 @@ pub struct EngineServices {
     reservation: Arc<Reservation>,
     /// 作業用の PCM の置き場（`staging/pcm`。M13 段 2）。
     work_pcm: Arc<WorkPcmStore>,
+    /// エディタが保存に貸している入力（エディタのセッションごと。M13 段 3）。
+    lent: Mutex<BTreeMap<String, LentInput>>,
+}
+
+/// 貸す入力のアンカーの使い方（保存の `AnchorUse` の、作ったものを除いた形）。
+#[derive(Debug, Clone)]
+pub enum LentAnchor {
+    /// アンカーなし（再現できるデコーダで読んだ・作業用の PCM から読んだ）。
+    None,
+    /// あったアンカーから読んだ。
+    Existing(Anchor),
+    /// あったアンカーが使えず、元を記録のデコーダで読み直した（値は記録と同じ）。
+    Fallback(Anchor),
+}
+
+/// エディタが保存に貸す入力（M13 段 3。docs/editing.md §14）：同じ元・同じ読み方なら、エディタの遅延の値と保存が読む値は同じ
+/// なので、保存は元を読み直さずにこれを使う。`verified` が偽（遅延のアンカーで、まだ値を照らしていない）なら、保存が照らしの
+/// 回を回す（違えば元を読み直す）。作業用の PCM の参照を持つ（貸している間は消えない）。
+#[derive(Clone)]
+pub struct LentInput {
+    pub item_id: i64,
+    /// 元の中身。
+    pub source: [u8; 32],
+    /// 読み方の設定のダイジェスト（`anchors::options_digest`）。
+    pub options_digest: Digest,
+    /// 元の形式。
+    pub format: String,
+    /// 遅延の値（チャンクは源の参照）。
+    pub value: Value,
+    /// 元を読んだ記録（アンカーから読んだときはアンカーの元の読み取りの記録）。
+    pub decoded: DecodeStamp,
+    pub anchor: LentAnchor,
+    /// 作業用の PCM（Platform・External・symphonia などで読んだとき。保存がアンカーに昇格するときに写す）。
+    pub work: Option<WorkHandle>,
+    /// 値を記録と照らし済みか。
+    pub verified: bool,
 }
 
 impl EngineServices {
@@ -77,7 +118,38 @@ impl EngineServices {
             pcm: PcmCache::new(CACHE_TTL),
             editor: Mutex::new(None),
             reservation: Arc::new(Reservation::default()),
+            lent: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    fn lent_slot(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, LentInput>> {
+        self.lent.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// エディタ（セッション `editor`）が入力を保存に貸す（前に貸していたものは置き換える。段 4 で音声のエディタが開いたあとに
+    /// 呼ぶ）。
+    pub fn lend_input(&self, editor: &str, input: LentInput) {
+        self.lent_slot().insert(editor.to_string(), input);
+    }
+
+    /// エディタ（セッション `editor`）が貸していた入力を引き上げる（閉じるとき。保存が借りている写しはそのまま使える）。
+    pub fn withdraw_input(&self, editor: &str) {
+        let taken = self.lent_slot().remove(editor);
+        drop(taken);
+    }
+
+    /// 保存が入力を借りる：アイテム `item_id`・元 `source`・読み方 `options` が同じ貸しものがあれば、その写し（作業用の PCM の
+    /// 参照も増える）。
+    pub(crate) fn borrow_input(
+        &self,
+        item_id: i64,
+        source: &[u8; 32],
+        options: &Digest,
+    ) -> Option<LentInput> {
+        self.lent_slot()
+            .values()
+            .find(|l| l.item_id == item_id && l.source == *source && l.options_digest == *options)
+            .cloned()
     }
 
     /// エディタの取り置きの持ち主（エディタを作るときに渡す）。
