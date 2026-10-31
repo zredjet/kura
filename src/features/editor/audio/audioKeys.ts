@@ -15,9 +15,11 @@
  * | ⌘A | すべてを選択（編集メニューの項目も `selectAll` を通る） |
  * | ⌘0・⌘+・⌘− | 全体を表示・拡大・縮小（表示メニューの項目もこのキー） |
  *
- * ↑↓・⌫・⌘Z・⌘S・⌘I は核のまま。
+ * ↑↓・⌫・⌘Z・⌘S・⌘I は核のまま。メニューが押したことにした文字のキー・Space（ライブラリ向けの T・F・L・Space の
+ * 項目）は受けない。
  */
 
+import { isReplayed } from '../../../lib/keys';
 import type { EditorKindKeys } from '../editorKeys';
 import {
   type AudioTool,
@@ -59,6 +61,9 @@ function meta(e: KeyboardEvent, key: string): boolean {
 
 /** ⌘・⌃ のないキー。 */
 function down(e: KeyboardEvent, key: string): boolean | null {
+  // メニューが押したことにした文字のキー・Space（「タグを追加（T）」「クイックルック（Space）」など、ライブラリ向けの
+  // 項目）は道具・再生に回さない（画像のエディタと同じく何も起きない。ライブラリのキーは [data-editor] で止まる）
+  if (key.length === 1 && isReplayed(e)) return false;
   const s = useAudioStore.getState();
   if (key === 'Enter' && s.trim) {
     confirmTrim();

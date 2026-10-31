@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { markReplayed } from '../../../lib/keys';
 import { editorSelectAll, handleEditorKey } from '../editorKeys';
 import { useEditorStore } from '../editorStore';
 import * as store from './audioStore';
@@ -117,6 +118,23 @@ describe('音声エディタのキー', () => {
     expect(editorSelectAll()).toBe(false);
     useEditorStore.setState({ phase: 'closed', kind: null });
     expect(editorSelectAll()).toBe(false);
+  });
+
+  it('メニューが押したことにするキー（T・F・L・Space など）は、道具・再生に届かない', () => {
+    for (const key of ['t', 'f', 'l', ' ', 's', 'r', 'b', 'i', 'o']) {
+      const e = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+      markReplayed(e);
+      document.body.dispatchEvent(e);
+      expect(handleEditorKey(e)).toBe(false);
+    }
+    expect(tools.selectAudioTool).not.toHaveBeenCalled();
+    expect(tools.setInOut).not.toHaveBeenCalled();
+    expect(store.togglePlay).not.toHaveBeenCalled();
+    expect(store.toggleLoopAudition).not.toHaveBeenCalled();
+    expect(store.toggleAB).not.toHaveBeenCalled();
+    // 本当に押したキーは今までどおり
+    expect(press('t')).toBe(true);
+    expect(tools.selectAudioTool).toHaveBeenCalledWith('trim');
   });
 
   it('文字を打つ欄の上では受けない', () => {
