@@ -5,6 +5,7 @@ import { useEditorStore } from '../editorStore';
 import { wheelPixels, wheelZoomFactor } from '../image/viewMath';
 import styles from './Audio.module.css';
 import { audioController, audioPlayhead, setCursor, useAudioStore } from './audioStore';
+import { AUDIO_POINTER } from './audioTools';
 import {
   DEFAULT_COLORS,
   DEFAULT_METRICS,
@@ -92,21 +93,6 @@ function dpr(): number {
 interface GestureLike extends Event {
   scale: number;
   clientX: number;
-}
-
-/** ポインタの扱い（道具ごとの振り分けは `audioTools.ts`）。差し込まなければ、全体図で動かし、段でカーソルを置く。 */
-export interface WavePointer {
-  down(e: PointerEvent<HTMLCanvasElement>, x: number, y: number): boolean;
-  move(e: PointerEvent<HTMLCanvasElement>, x: number, y: number): void;
-  up(e: PointerEvent<HTMLCanvasElement>, x: number, y: number, canceled: boolean): void;
-  cursor(x: number, y: number): string | undefined;
-}
-
-let pointerImpl: WavePointer | null = null;
-
-/** ポインタの扱いを差し込む（道具の流れ。`audioTools.ts`）。 */
-export function setWavePointer(p: WavePointer | null): void {
-  pointerImpl = p;
 }
 
 /**
@@ -239,7 +225,7 @@ export function WaveStage() {
     const controller = audioController();
     if (!controller) return;
     const { x, y } = local(e);
-    if (pointerImpl?.down(e, x, y)) {
+    if (AUDIO_POINTER.down(e, x, y)) {
       e.currentTarget.setPointerCapture(e.pointerId);
       drag.current = { id: e.pointerId, overview: false };
       return;
@@ -259,11 +245,11 @@ export function WaveStage() {
     const { x, y } = local(e);
     const host = hostRef.current;
     if (!d || d.id !== e.pointerId) {
-      if (host) host.dataset.cursor = pointerImpl?.cursor(x, y) ?? '';
+      if (host) host.dataset.cursor = AUDIO_POINTER.cursor(x, y) ?? '';
       return;
     }
     if (d.overview) audioController()?.panToOverview(x);
-    else pointerImpl?.move(e, x, y);
+    else AUDIO_POINTER.move(e, x, y);
   };
 
   const finish = (e: PointerEvent<HTMLCanvasElement>, canceled: boolean) => {
@@ -272,7 +258,7 @@ export function WaveStage() {
     drag.current = null;
     if (!d.overview) {
       const { x, y } = local(e);
-      pointerImpl?.up(e, x, y, canceled);
+      AUDIO_POINTER.up(e, x, y, canceled);
     }
   };
 
