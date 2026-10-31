@@ -309,6 +309,31 @@ export interface PlayerDeps {
   now?(): number;
   /** 終わりまで鳴った（選択の終わり・音の終わり）。`pos` は止まった位置。 */
   onEnded?(pos: number): void;
+  /** 区間を置いた（継ぎ目の自己点検 `VITE_KURA_CHECK` が、同じ標本と同じ置き方で照らす）。 */
+  onPlaced?(record: PlacedRecord): void;
+  /** 交差フェードで替えた（自己点検が、替える前後の標本の跳びを照らす）。 */
+  onCrossfade?(record: CrossfadeRecord): void;
+}
+
+/** 置いた区間の記録（自己点検）。 */
+export interface PlacedRecord {
+  source: PlaySource;
+  rate: number;
+  /** 文脈のフレームで鳴り始める位置。 */
+  abs: number;
+  start: number;
+  end: number;
+  /** バッファに写した標本（チャンネルごと。チャンクの切り出しで、写しではない）。 */
+  planes: Float32Array<ArrayBuffer>[];
+  fadeIn: boolean;
+}
+
+/** 交差フェードの記録（自己点検）：替える位置 T（文脈のフレーム）と、止めた音・入れた音。 */
+export interface CrossfadeRecord {
+  rate: number;
+  t: number;
+  old: PlacedRecord[];
+  fresh: PlacedRecord | null;
 }
 
 /** 鳴らす頼み。 */
@@ -336,6 +361,8 @@ interface Placed {
   fading: boolean;
   /** 交差フェードで止める文脈のフレーム。 */
   stopAt: number | null;
+  /** 記録（自己点検）。 */
+  record: PlacedRecord;
 }
 
 /** 鳴らしている計画。 */
@@ -617,9 +644,10 @@ export class EditorPlayer {
     const rate = plan.info.rate;
     const len = seg.end - seg.start;
     const buffer = ctx.createBuffer(chunk.planes.length, len, rate);
-    chunk.planes.forEach((plane, ch) =>
-      buffer.copyToChannel(plane.subarray(seg.start - chunk.start, seg.end - chunk.start), ch),
+    const planes = chunk.planes.map((plane) =>
+      plane.subarray(seg.start - chunk.start, seg.end - chunk.start),
     );
+    planes.forEach((plane, ch) => buffer.copyToChannel(plane, ch));
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     const gain = ctx.createGain();
@@ -633,6 +661,15 @@ export class EditorPlayer {
     src.connect(gain);
     gain.connect(master);
     src.start(when);
+    const record: PlacedRecord = {
+      source: plan.source,
+      rate,
+      abs,
+      start: seg.start,
+      end: seg.end,
+      planes,
+      fadeIn,
+    };
     this.placed.push({
       start: seg.start,
       end: seg.end,
@@ -641,7 +678,9 @@ export class EditorPlayer {
       gain,
       fading: false,
       stopAt: null,
+      record,
     });
+    this.deps.onPlaced?.(record);
   }
 
   /** 交差フェードで替える位置（今 + 60 ms をフレームの境に）。 */
@@ -695,8 +734,12 @@ export class EditorPlayer {
     }
     this.placed = keep;
     this.lastSwitch = this.now();
+    const rate = plan.info.rate;
+    const old = keep.filter((p) => p.fading && p.stopAt === t).map((p) => p.record);
+    const before = this.placed.length;
     Object.assign(plan, next, { nextAbs: t, done: false, fadeInNext: true });
     this.fill(Math.ceil(ctx.currentTime * plan.info.rate));
+    this.deps.onCrossfade?.({ rate, t, old, fresh: this.placed[before]?.record ?? null });
   }
 
   /** まだ鳴っていない区間を捨て、そこから置き直す。 */

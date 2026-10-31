@@ -301,6 +301,10 @@ export class WaveController {
   readonly tiles: PeakTileCache;
   colors: WaveColors;
   metrics: WaveMetrics;
+  /** 描いた時間（ms）を受ける（波形の描画の自己点検 `VITE_KURA_CHECK`）。 */
+  renderProbe: ((ms: number) => void) | null = null;
+  /** 取りに行った数（自己点検）。 */
+  readonly stats = { tileLoads: 0, pcmLoads: 0 };
 
   constructor(private readonly options: WaveOptions = {}) {
     this.draw = options.draw ?? (() => undefined);
@@ -677,6 +681,7 @@ export class WaveController {
     const mark: Loading = { epoch: this.tileEpoch };
     this.loadingTiles.set(key, mark);
     this.tileLoads++;
+    this.stats.tileLoads++;
     this.fetch(url)
       .then((buf) => {
         if (this.disposed || this.loadingTiles.get(key) !== mark) return;
@@ -719,6 +724,7 @@ export class WaveController {
     const mark: Loading = { epoch: this.pcmEpoch };
     this.loadingPcm.set(index, mark);
     this.pcmLoads++;
+    this.stats.pcmLoads++;
     const decoder = EDIT_DECODER_PREFIX + view.samplesId;
     this.fetch(url)
       .then((buf) => {
@@ -949,8 +955,11 @@ export class WaveController {
 
   private render(): void {
     if (this.disposed) return;
+    const probe = this.renderProbe;
+    const t0 = probe ? performance.now() : 0;
     const scene = this.scene();
     if (this.canvas) this.draw(this.canvas, scene);
+    if (probe) probe(performance.now() - t0);
   }
 
   /** 何で描いたか（最後の描画。テスト）。 */

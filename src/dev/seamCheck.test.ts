@@ -2,10 +2,16 @@ import { describe, expect, it } from 'vitest';
 
 import { planAudition } from '../lib/asset/audition';
 import type { Pcm } from '../lib/asset/wav';
+import type { CrossfadeRecord, PlacedRecord } from '../features/editor/audio/playback';
 import {
   compareSamples,
+  editorSeamWindow,
   expectedSamples,
+  maxJump,
+  type RenderCrossfade,
   type RenderWindow,
+  runCrossfadeCheck,
+  runEditorSeamCheck,
   runSeamCheck,
   type SeamWindow,
   seamWindows,
@@ -174,5 +180,89 @@ describe('自己点検は通常のビルドに入らない', () => {
       /if \(import\.meta\.env\.VITE_KURA_CHECK === '1'\) \{\s*void import\('\.\.\/\.\.\/dev\/seamCheck'\)/,
     );
     expect(text).not.toMatch(/^import .*dev\/seamCheck/m);
+  });
+});
+
+// ===== 音声エディタ（M13 の段 6） =====
+
+/** エディタが置いた区間（標本は元の位置から決める）。 */
+function placed(abs: number, start: number, end: number, fadeIn = false): PlacedRecord {
+  const p = pcm(start, end);
+  return { source: 'edited', rate: R, abs, start, end, planes: p.planes, fadeIn };
+}
+
+/** 窓をそのまま描いたことにする（本物と同じ置き方なら、期待の標本と同じ）。 */
+const exactRender: RenderWindow = async (w, pcms, _rate, channels) =>
+  expectedSamples(w, pcms, channels);
+
+describe('エディタの継ぎ目の自己点検', () => {
+  it('続けて置いた区間だけで窓を作る（交差フェードで入れた区間・間の空いた所で切る）', () => {
+    const records = [
+      placed(100, 0, 500),
+      placed(600, 500, 900),
+      placed(1000, 900, 1000),
+      placed(1200, 0, 10),
+    ];
+    const built = editorSeamWindow(records);
+    expect(built?.window.parts.map((p) => p.at)).toEqual([0, 500, 900]);
+    expect(built?.window.seams).toEqual([500, 900]);
+    expect(built?.window.frames).toBe(1000);
+    // ループの折り返し：同じ区間を続けて置く
+    const loop = editorSeamWindow([
+      placed(0, 200, 400),
+      placed(200, 200, 400),
+      placed(400, 200, 400),
+    ]);
+    expect(loop?.window.seams).toEqual([200, 400]);
+    expect(editorSeamWindow([placed(0, 0, 10)])).toBeNull();
+    expect(editorSeamWindow([placed(0, 0, 10, true), placed(10, 10, 20)])).toBeNull();
+    expect(editorSeamWindow([placed(0, 0, 10), placed(10, 10, 20, true)])).toBeNull();
+  });
+
+  it('同じ置き方で描けば食い違いは 0、継ぎ目で 1 標本ずれれば数える', async () => {
+    const records = [placed(0, 0, 300), placed(300, 300, 700), placed(700, 200, 400)];
+    const ok = await runEditorSeamCheck(records, exactRender, () => 0);
+    expect(ok).toMatchObject({
+      rate: R,
+      channels: 2,
+      segments: 3,
+      seams: 2,
+      frames: 900,
+      mismatches: 0,
+    });
+    const shifted: RenderWindow = async (w, pcms, rate, channels) => {
+      const out = await exactRender(w, pcms, rate, channels);
+      for (const plane of out) plane.copyWithin(301, 300);
+      return out;
+    };
+    const bad = await runEditorSeamCheck(records, shifted, () => 0);
+    expect(bad?.mismatches).toBeGreaterThan(0);
+    expect(bad?.first?.frame).toBe(301);
+    expect(await runEditorSeamCheck([placed(0, 0, 10)], exactRender)).toBeNull();
+  });
+});
+
+describe('交差フェードの自己点検', () => {
+  it('隣り合う標本の差の最大', () => {
+    expect(maxJump([Float32Array.from([0, 0.1, 0.5, 0.4])], 0, 3)).toBeCloseTo(0.4, 6);
+    expect(maxJump([Float32Array.from([0, 1])], 1, 5)).toBe(0);
+  });
+
+  it('前後 20 ms の跳びを T で切り替えたときと比べる', async () => {
+    const record: CrossfadeRecord = {
+      rate: R,
+      t: 1000,
+      old: [placed(0, 0, 2000)],
+      fresh: placed(1000, 1000, 2000),
+    };
+    const render: RenderCrossfade = async (_r, _base, frames, fade) => {
+      const out = new Float32Array(frames);
+      for (let k = 0; k < frames; k++) out[k] = fade ? k / frames : k < frames / 2 ? 0 : 0.9;
+      return [out];
+    };
+    const report = await runCrossfadeCheck(record, render, () => 0);
+    expect(report?.ok).toBe(true);
+    expect(report?.withFade).toBeLessThan(report?.hardCut ?? 0);
+    expect(await runCrossfadeCheck({ ...record, fresh: null }, render)).toBeNull();
   });
 });

@@ -10,8 +10,13 @@
  * 本物の試聴との違い：OfflineAudioContext は 0 秒から描くので、始める時刻は 0 を起点にする（本物は文脈の今の時刻の
  * 少し先のフレームの境）。前奏と本体が長くて描く長さが上限を超えるときは、前奏の終わりの手前から始める窓と、本体の
  * 継ぎ目の手前から始める窓に分ける。
+ *
+ * 音声エディタ（M13 の段 6）：エディタの置き方（チャンクの区間ごとのバッファを続けて置く・ループの折り返し）を同じく
+ * 照らす（`runEditorSeamCheck`。`bench_report('edit-seam', …)`）。手のあとの交差フェードは、前後 20 ms の標本の跳びを
+ * T で切り替えたときと比べる（`runCrossfadeCheck`。`bench_report('edit-crossfade', …)`）。呼ぶのは `waveCheck.ts`。
  */
 
+import type { CrossfadeRecord, PlacedRecord } from '../features/editor/audio/playback';
 import { commands } from '../ipc/bindings';
 import type { AuditionPlan } from '../lib/asset/audition';
 import type { Pcm } from '../lib/asset/wav';
@@ -273,4 +278,187 @@ function send(value: unknown): void {
   const json = JSON.stringify(value);
   console.warn(`[check] audition-seam ${json}`);
   void commands.benchReport('audition-seam', json).catch(() => undefined);
+}
+
+// ===== 音声エディタの編集中の試聴（M13 の段 6。設計 §2.13 の 1・2） =====
+
+/** 区間の標本を PCM の形にする（`expectedSamples`・`offlineRender` に渡す）。 */
+function asPcm(r: PlacedRecord): Pcm {
+  const frames = r.end - r.start;
+  return {
+    rate: r.rate,
+    channels: r.planes.length,
+    frames,
+    format: 'f32',
+    planes: r.planes,
+    info: { start: r.start, total: r.end, loop: null, decoder: 'kura-edit' },
+  };
+}
+
+/**
+ * エディタが置いた区間の列から、照らす窓を作る（純粋な関数）：先頭から、続けて置いたもの（次の区間がちょうど前の区間の
+ * 終わりに置かれた）だけを、上限の長さまで。交差フェードで入れた区間（0→1）と、間の空いた所（遅らせて置いた）で切る。
+ * 継ぎ目が 1 つもなければ null。
+ */
+export function editorSeamWindow(
+  records: readonly PlacedRecord[],
+  maxSeconds = MAX_WINDOW_SECONDS,
+): { window: SeamWindow; pcms: Pcm[]; rate: number; channels: number } | null {
+  const first = records[0];
+  if (!first || first.fadeIn) return null;
+  const rate = first.rate;
+  const max = Math.round(maxSeconds * rate);
+  const parts: WindowPart[] = [];
+  const pcms: Pcm[] = [];
+  const seams: number[] = [];
+  let at = 0;
+  let prevEnd = first.abs;
+  for (const r of records) {
+    const len = r.end - r.start;
+    if (r.rate !== rate || r.fadeIn || r.abs !== prevEnd || len <= 0) break;
+    if (parts.length > 0 && at + len > max) break;
+    if (parts.length > 0) seams.push(at);
+    parts.push({ pcm: pcms.length, loop: false, at, offset: 0 });
+    pcms.push(asPcm(r));
+    at += len;
+    prevEnd = r.abs + len;
+  }
+  if (seams.length === 0) return null;
+  return { window: { parts, frames: at, seams }, pcms, rate, channels: first.planes.length };
+}
+
+/** エディタの継ぎ目の報告（bench_report('edit-seam', …)）。 */
+export interface EditorSeamReport {
+  rate: number;
+  channels: number;
+  segments: number;
+  seams: number;
+  frames: number;
+  mismatches: number;
+  first: Comparison['first'];
+  ms: number;
+}
+
+/**
+ * エディタの置き方（区間ごとのバッファを、前の区間の終わりのフレームに続けて置く。ループの折り返しも同じ）を
+ * OfflineAudioContext で描き、PCM をつないだものと 1 標本ずつ照らす。照らす窓がなければ null。
+ */
+export async function runEditorSeamCheck(
+  records: readonly PlacedRecord[],
+  render: RenderWindow = offlineRender,
+  now: () => number = () => performance.now(),
+): Promise<EditorSeamReport | null> {
+  const built = editorSeamWindow(records);
+  if (!built) return null;
+  const started = now();
+  const { window, pcms, rate, channels } = built;
+  const got = await render(window, pcms, rate, channels);
+  const result = compareSamples(expectedSamples(window, pcms, channels), got);
+  return {
+    rate,
+    channels,
+    segments: window.parts.length,
+    seams: window.seams.length,
+    frames: result.frames,
+    mismatches: result.mismatches,
+    first: result.first,
+    ms: Math.round(now() - started),
+  };
+}
+
+/** 区間 `[from, to)` の、隣り合う標本の差の最大（チャンネルのうち最大）。 */
+export function maxJump(samples: readonly Float32Array[], from: number, to: number): number {
+  let max = 0;
+  for (const plane of samples) {
+    const a = Math.max(0, from);
+    const b = Math.min(plane.length - 1, to);
+    for (let k = a; k < b; k++) {
+      const d = Math.abs((plane[k + 1] ?? 0) - (plane[k] ?? 0));
+      if (d > max) max = d;
+    }
+  }
+  return max;
+}
+
+/** 交差フェードの前後を描く口（`fade` が偽なら、T で切り替える）。描く長さ `frames`、窓の頭は文脈のフレーム `base`。 */
+export type RenderCrossfade = (
+  record: CrossfadeRecord,
+  base: number,
+  frames: number,
+  fade: boolean,
+) => Promise<Float32Array[]>;
+
+/** エディタと同じ組み立て（止める音は T から 1→0、入れる音は 0→1。どちらも 10 ms）で OfflineAudioContext に描く。 */
+export const offlineCrossfade: RenderCrossfade = async (record, base, frames, fade) => {
+  const channels = record.fresh?.planes.length ?? record.old[0]?.planes.length ?? 1;
+  const rate = record.rate;
+  const ctx = new OfflineAudioContext(channels, frames, rate);
+  const t = (record.t - base) / rate;
+  const xf = 0.01;
+  const put = (r: PlacedRecord, role: 'old' | 'fresh') => {
+    const buffer = ctx.createBuffer(r.planes.length, r.end - r.start, rate);
+    r.planes.forEach((plane, ch) => buffer.copyToChannel(plane, ch));
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    const gain = ctx.createGain();
+    const when = (r.abs - base) / rate;
+    if (role === 'old') {
+      if (fade) {
+        gain.gain.setValueAtTime(1, t);
+        gain.gain.linearRampToValueAtTime(0, t + xf);
+        src.stop(Math.max(when, t + xf));
+      } else {
+        src.stop(Math.max(when, t));
+      }
+    } else if (fade) {
+      gain.gain.setValueAtTime(0, when);
+      gain.gain.linearRampToValueAtTime(1, when + xf);
+    }
+    src.connect(gain);
+    gain.connect(ctx.destination);
+    src.start(Math.max(0, when));
+  };
+  for (const r of record.old) put(r, 'old');
+  if (record.fresh) put(record.fresh, 'fresh');
+  const rendered = await ctx.startRendering();
+  return Array.from({ length: channels }, (_, ch) => rendered.getChannelData(ch));
+};
+
+/** 交差フェードの報告（bench_report('edit-crossfade', …)）。 */
+export interface CrossfadeReport {
+  rate: number;
+  /** T の前後 20 ms の、隣り合う標本の差の最大（交差フェードあり・T で切り替えたとき）。 */
+  withFade: number;
+  hardCut: number;
+  /** 交差フェードのほうが跳びが小さい（同じ中身で、どちらもほとんど跳ばなければ良しとする）。 */
+  ok: boolean;
+  ms: number;
+}
+
+/** 交差フェードの前後 20 ms の跳びを、T で切り替えたときと比べる。 */
+export async function runCrossfadeCheck(
+  record: CrossfadeRecord,
+  render: RenderCrossfade = offlineCrossfade,
+  now: () => number = () => performance.now(),
+): Promise<CrossfadeReport | null> {
+  if (!record.fresh || record.old.length === 0) return null;
+  const started = now();
+  const rate = record.rate;
+  const around = Math.round(0.02 * rate);
+  const base = record.t - around * 2;
+  const frames = around * 4;
+  const center = record.t - base;
+  const [a, b] = await Promise.all([
+    render(record, base, frames, true),
+    render(record, base, frames, false),
+  ]);
+  const withFade = maxJump(a, center - around, center + around);
+  const hardCut = maxJump(b, center - around, center + around);
+  return {
+    rate,
+    withFade,
+    hardCut,
+    ok: withFade <= hardCut + 1e-6 || hardCut < 1e-3,
+    ms: Math.round(now() - started),
+  };
 }

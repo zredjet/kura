@@ -25,6 +25,7 @@ import {
   type EditMarkerDto,
   type EditSourcePieceDto,
   type EditSpanDto,
+  type EditStepDto,
   measureEdit,
 } from '../../../ipc/edit';
 import type { ItemSummaryDto } from '../../../ipc/items';
@@ -43,8 +44,10 @@ import {
 import { defaultParams } from '../opsCatalog';
 import { drawWave } from './drawWave';
 import {
+  type CrossfadeRecord,
   EditorPlayer,
   PcmFeed,
+  type PlacedRecord,
   type PlayRequest,
   type PlaySource,
   type SourceInfo,
@@ -263,6 +266,46 @@ export function setAudioIoForTest(io: {
   drawImpl = io.draw ?? drawWave;
 }
 
+/**
+ * 音声エディタの自己点検（dev。`VITE_KURA_CHECK=1` のときだけ読み込む `src/dev/waveCheck.ts`）が受けるもの：継ぎ目
+ * （置いた区間）・交差フェード・往復の時間（送った手と表示）・PCM を取る時間・波形の描画。
+ */
+export interface AudioCheck {
+  attach(parts: {
+    player: EditorPlayer;
+    controller: WaveController;
+    session: () => string | null;
+  }): void;
+  sent?(seq: number, steps: readonly EditStepDto[]): void;
+  shown?(seq: number, view: EditAudioView): void;
+  placed?(record: PlacedRecord): void;
+  crossfade?(record: CrossfadeRecord): void;
+  fetched?(url: string, ms: number): void;
+}
+
+let checkHook: AudioCheck | null = null;
+
+// 通常のビルドでは import.meta.env.VITE_KURA_CHECK が undefined に置き換わり、この枝ごと消える
+if (import.meta.env.VITE_KURA_CHECK === '1') {
+  void import('../../../dev/waveCheck').then(
+    (m) => {
+      checkHook = m.createAudioCheck();
+    },
+    () => undefined,
+  );
+}
+
+/** 取る（自己点検があれば時間を渡す）。 */
+function fetchTimed(url: string): Promise<ArrayBuffer> {
+  const hook = checkHook;
+  if (!hook?.fetched) return fetchImpl(url);
+  const t0 = performance.now();
+  return fetchImpl(url).then((buf) => {
+    hook.fetched?.(url, performance.now() - t0);
+    return buf;
+  });
+}
+
 /** 今の波形の面の制御（開いていなければ null）。 */
 export function audioController(): WaveController | null {
   return live()?.controller ?? null;
@@ -326,7 +369,7 @@ export function audioPlayhead(): number | null {
 function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): EditorAdapter {
   const controller = new WaveController({
     draw: (canvas, scene) => drawImpl(canvas, scene),
-    fetch: (url) => fetchImpl(url),
+    fetch: fetchTimed,
     onInfo: (info) => {
       if (!ctx.current()) return;
       useAudioStore.setState({
@@ -340,7 +383,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     },
   });
   const feed = new PcmFeed({
-    fetch: (url) => fetchImpl(url),
+    fetch: fetchTimed,
     output: controller.pcm,
     onLoaded: () => {
       if (ctx.current()) rt.player.tick();
@@ -358,6 +401,8 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     onEnded: (pos) => {
       if (ctx.current()) playEnded(pos);
     },
+    onPlaced: (record) => checkHook?.placed?.(record),
+    onCrossfade: (record) => checkHook?.crossfade?.(record),
   });
   const unsubscribe = useAudioStore.subscribe((s) => controller.setOverlay(overlayOf(s)));
   const rt: AudioRuntime = {
@@ -372,6 +417,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     unsubscribe,
   };
   current = rt;
+  checkHook?.attach({ player, controller, session: () => ctx.session() });
   return {
     begin() {
       const s = useAudioStore.getState();
@@ -396,6 +442,12 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       useAudioStore.setState({ source: audio });
     },
     viewport: () => controller.viewport(),
+    sent(req) {
+      checkHook?.sent?.(
+        req.seq,
+        req.steps.map((q) => q.step),
+      );
+    },
     onRejected() {
       // 切り詰める前の音声を表示する仮の値が断られたら、切り詰めをやめる
       const trim = useAudioStore.getState().trim;
@@ -408,6 +460,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     },
     applyView(view, info) {
       if (view.type !== 'audio') return;
+      checkHook?.shown?.(info.seq, view);
       const prev = rt.lastView;
       rt.lastView = view;
       controller.applyView(view);
