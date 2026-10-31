@@ -1183,6 +1183,9 @@ export const ja = {
       // 選択
       selectionToTrim: '選択の範囲に切り詰める',
       selectionToLoop: '選択をループにする',
+      /** 下のカプセルのボタンに出す短い文（読み上げ・ツールチップは上の長い文）。 */
+      selectionToTrimShort: '切り詰める',
+      selectionToLoopShort: 'ループにする',
       selectHint: 'ドラッグで範囲を選びます（⇧クリックで広げる・esc で外す）',
       fadeHint: '上の角の三角をドラッグして長さを決めます',
       loopHint: '目盛りの旗をドラッグしてループの区間を決めます',

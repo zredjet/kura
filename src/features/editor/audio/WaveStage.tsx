@@ -127,6 +127,9 @@ export function WaveStage() {
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(host);
+    // 下のカプセルの高さは道具・一言・折り返しで替わる（2 段）ので、それも測り直す
+    const capsule = host.parentElement?.querySelector('[data-editor-capsule]');
+    if (capsule) observer.observe(capsule);
     window.addEventListener('resize', measure);
     return () => {
       observer.disconnect();

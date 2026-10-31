@@ -1,11 +1,7 @@
-import { type ReactNode, useMemo } from 'react';
+import { useMemo } from 'react';
 
-import { FadeIcon } from '../../../components/icons/FadeIcon';
 import { MinusIcon } from '../../../components/icons/MinusIcon';
 import { PlusIcon } from '../../../components/icons/PlusIcon';
-import { RepeatIcon } from '../../../components/icons/RepeatIcon';
-import { ScissorsIcon } from '../../../components/icons/ScissorsIcon';
-import { SelectRangeIcon } from '../../../components/icons/SelectRangeIcon';
 import { ja } from '../../../i18n/ja';
 import { formatCount } from '../../../lib/format';
 import { channelsText, khz } from '../../asset/describe';
@@ -15,53 +11,25 @@ import { FormatOutputRow, OpsPanel, type ParamTime } from '../OpsPanel';
 import { outputChoice } from '../formats';
 import styles from './Audio.module.css';
 import { AUDIO_FORMATS, capsOf, lossesFor, type AudioLoss } from './audioFormats';
-import { AUDIO_TOOLS, type AudioTool, audioZoom, useAudioStore } from './audioStore';
-import { selectAudioTool } from './audioTools';
+import { audioZoom, useAudioStore } from './audioStore';
 import { LoudnessSection } from './LoudnessSection';
 import { timeText } from './timeText';
 
 export { AudioCapsule } from './AudioCapsule';
 
 /*
- * 音声エディタの殻に置く部品（design.md §3.1 の「音声エディタ」の案文。M13 の段 6）：上部の道具のカプセルと名前の下の
- * 一行、左下のカーソル・選択の時刻と標本の位置（波形の段を作り直している間の一言）、右下の表示の幅、右パネルの「操作」
- * （ラウドネス・出力の形式・失うもの）。波形の面は `WaveStage`、下のカプセルは `AudioCapsule`。
+ * 音声エディタの殻に置く部品（design.md §3.1 の「音声エディタ」の案文。M13 の段 6）：名前の下の一行、左下のカーソル・
+ * 選択の時刻と標本の位置（波形の段を作り直している間の一言はその上）、右下の表示の幅、右パネルの「操作」（ラウドネス・
+ * 出力の形式・失うもの）。波形の面は `WaveStage`、下のカプセル（再生の操作・道具の切り替え・道具の欄）は `AudioCapsule`。
  */
 
 const t = ja.editor.audio;
 
-const TOOL_ICONS: Record<AudioTool, ReactNode> = {
-  select: <SelectRangeIcon size={16} />,
-  trim: <ScissorsIcon size={16} />,
-  fade: <FadeIcon size={16} />,
-  loop: <RepeatIcon size={16} />,
-};
-
-/** 上部の道具のカプセル（選択 S・切り詰め T・フェード F・ループ R）。 */
-export function AudioTools() {
-  const tool = useAudioStore((s) => s.tool);
-  const open = useEditorStore((s) => s.phase === 'open');
-  return (
-    <div className={editorStyles.tools} role="group" aria-label={ja.editor.tools}>
-      {AUDIO_TOOLS.map((id) => {
-        const label = ja.editor.withKey(t.toolNames[id], t.toolKeys[id]);
-        return (
-          <button
-            key={id}
-            type="button"
-            className={editorStyles.tool}
-            aria-label={label}
-            title={label}
-            aria-pressed={tool === id}
-            disabled={!open}
-            onClick={() => selectAudioTool(id)}
-          >
-            {TOOL_ICONS[id]}
-          </button>
-        );
-      })}
-    </div>
-  );
+/**
+ * 上部の道具の置き場（音声では空。道具の切り替えは、欄と並べて下のカプセルの上の段に置く：`AudioToolSwitch`）。
+ */
+export function AudioTopTools() {
+  return null;
 }
 
 /** 元の形式が非可逆か（ビットを出さない）。 */
@@ -118,15 +86,18 @@ export function AudioStatus() {
       : t.cursorAt(timeText(cursor, rate), formatCount(cursor));
   return (
     <>
-      <div className={editorStyles.coords} aria-live="off">
-        <span>{where}</span>
+      {/* 左下：カーソル・選択の時刻。波形の段を作り直している間の一言はその上の行（カプセルと重ならない幅に収める） */}
+      <div className={styles.corner}>
         {(pending || building) && (
-          <span className={editorStyles.reduced} aria-live="polite">
+          <span className={`${styles.cornerPill} ${styles.cornerStatus}`} aria-live="polite">
             {building ? t.peaksBuilding : t.peaksPending}
           </span>
         )}
+        <span className={styles.cornerPill} aria-live="off">
+          {where}
+        </span>
       </div>
-      <div className={editorStyles.zoom} role="group" aria-label={t.viewWidth}>
+      <div className={`${editorStyles.zoom} ${styles.zoom}`} role="group" aria-label={t.viewWidth}>
         <button
           type="button"
           className={editorStyles.iconButton}

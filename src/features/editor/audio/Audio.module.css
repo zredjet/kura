@@ -44,11 +44,32 @@
   display: none;
 }
 
-/* ===== 下のカプセル ===== */
+/* ===== 下のカプセル（2 段：上に再生の操作と道具の切り替え、下に今の道具の欄） ===== */
 
-/* 画像の道具の設定より欄が多いので、横に収まらなければ折り返さずに中で詰める */
+/*
+ * 殻の .capsule は真ん中に置いて両側を同じだけ空けるが、音声は左下（カーソル・選択の時刻。.corner の 204px まで）と
+ * 右下（表示の幅。.zoom の 160px まで）を避けた帯の真ん中に置く。帯より広い中身は段の中で折り返す（ガラスの外へ出さない）。
+ * 測った値は scratchpad の stage6-notes「検証の直し」（窓の幅 1280〜1512pt で重ならない）。
+ */
 .capsule {
-  gap: var(--space-2-5);
+  left: calc(var(--space-4) + 204px + var(--space-2));
+  right: calc(var(--space-4) + 160px + var(--space-2));
+  width: fit-content;
+  max-width: none;
+  margin-inline: auto;
+  transform: none;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1-5);
+  padding: var(--space-2) var(--space-3);
+}
+
+.capsuleRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1-5) var(--space-2-5);
 }
 
 .transport {
@@ -62,23 +83,70 @@
 }
 
 .position {
-  min-width: 132px;
+  min-width: 120px;
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
 
-.divider {
-  flex: none;
-  width: 1px;
-  align-self: stretch;
-  background: var(--stroke-2);
+/* 道具の切り替え（画像の上部の道具のカプセルと同じボタンを、カプセルの段に詰める） */
+.toolSwitch {
+  height: auto;
+  padding: 2px;
+}
+
+.toolSwitch > button {
+  width: 28px;
 }
 
 .toolFields {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2-5);
+  gap: var(--space-1-5) var(--space-2-5);
   min-width: 0;
+}
+
+/* 使い方の一言（欄の下の行。カプセルの幅は欄で決め、一言はその幅に収める） */
+.toolHint {
+  flex-basis: 100%;
+  min-width: 0;
+  contain: inline-size;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+/* ===== 左下：カーソル・選択の時刻（上の行に、波形の段を作り直している間の一言） ===== */
+
+.corner {
+  position: absolute;
+  left: var(--space-4);
+  bottom: var(--space-4);
+  max-width: 204px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  pointer-events: none;
+}
+
+.cornerPill {
+  max-width: 100%;
+  padding: var(--space-1) var(--space-2-5);
+  border-radius: var(--radius-pill);
+  background: var(--scrim);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cornerStatus {
+  color: var(--text-tertiary);
 }
 
 /* ===== 時刻の欄（時間で入れ、下に標本の位置） ===== */
@@ -139,11 +207,18 @@
   white-space: nowrap;
 }
 
-/* ===== 右下の表示の幅 ===== */
+/* ===== 右下の表示の幅（160px まで。下のカプセルはこの幅を避ける） ===== */
+
+.zoom {
+  max-width: 160px;
+}
 
 .widthValue {
-  min-width: 96px;
+  width: 96px;
+  overflow: hidden;
   text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
 

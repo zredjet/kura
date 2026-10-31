@@ -1,3 +1,9 @@
+import type { ReactNode } from 'react';
+
+import { FadeIcon } from '../../../components/icons/FadeIcon';
+import { RepeatIcon } from '../../../components/icons/RepeatIcon';
+import { ScissorsIcon } from '../../../components/icons/ScissorsIcon';
+import { SelectRangeIcon } from '../../../components/icons/SelectRangeIcon';
 import { Segmented } from '../../../components/Segmented/Segmented';
 import { Switch } from '../../../components/Switch/Switch';
 import { ja } from '../../../i18n/ja';
@@ -5,12 +11,13 @@ import editorStyles from '../Editor.module.css';
 import { sendParam, useEditorStore } from '../editorStore';
 import { paramsOf } from '../opsCatalog';
 import styles from './Audio.module.css';
-import { cancelTrim, setSelection, useAudioStore } from './audioStore';
+import { AUDIO_TOOLS, type AudioTool, cancelTrim, setSelection, useAudioStore } from './audioStore';
 import {
   clearLoop,
   confirmTrim,
   fadeLengths,
   sealHandle,
+  selectAudioTool,
   selectionToLoop,
   selectionToTrim,
   setFade,
@@ -23,6 +30,44 @@ import { TimeField } from './TimeField';
 import { Transport } from './Transport';
 
 const t = ja.editor.audio;
+
+const TOOL_ICONS: Record<AudioTool, ReactNode> = {
+  select: <SelectRangeIcon size={16} />,
+  trim: <ScissorsIcon size={16} />,
+  fade: <FadeIcon size={16} />,
+  loop: <RepeatIcon size={16} />,
+};
+
+/** 道具の切り替え（選択 S・切り詰め T・フェード F・ループ R。下のカプセルの上の段）。 */
+export function AudioToolSwitch() {
+  const tool = useAudioStore((s) => s.tool);
+  const open = useEditorStore((s) => s.phase === 'open');
+  return (
+    <div
+      className={`${editorStyles.tools} ${styles.toolSwitch}`}
+      role="group"
+      aria-label={ja.editor.tools}
+    >
+      {AUDIO_TOOLS.map((id) => {
+        const label = ja.editor.withKey(t.toolNames[id], t.toolKeys[id]);
+        return (
+          <button
+            key={id}
+            type="button"
+            className={editorStyles.tool}
+            aria-label={label}
+            title={label}
+            aria-pressed={tool === id}
+            disabled={!open}
+            onClick={() => selectAudioTool(id)}
+          >
+            {TOOL_ICONS[id]}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 /** 選択：始め・終わり、［選択の範囲に切り詰める］［選択をループにする］。 */
 function SelectFields({ rate, frames }: { rate: number; frames: number }) {
@@ -44,11 +89,25 @@ function SelectFields({ rate, frames }: { rate: number; frames: number }) {
         max={frames}
         onValue={(f) => setSelection({ start: Math.min(f - 1, sel?.start ?? 0), end: f })}
       />
-      <button type="button" className={editorStyles.pill} disabled={!has} onClick={selectionToTrim}>
-        {t.selectionToTrim}
+      <button
+        type="button"
+        className={editorStyles.pill}
+        aria-label={t.selectionToTrim}
+        title={t.selectionToTrim}
+        disabled={!has}
+        onClick={selectionToTrim}
+      >
+        {t.selectionToTrimShort}
       </button>
-      <button type="button" className={editorStyles.pill} disabled={!has} onClick={selectionToLoop}>
-        {t.selectionToLoop}
+      <button
+        type="button"
+        className={editorStyles.pill}
+        aria-label={t.selectionToLoop}
+        title={t.selectionToLoop}
+        disabled={!has}
+        onClick={selectionToLoop}
+      >
+        {t.selectionToLoopShort}
       </button>
     </>
   );
@@ -80,7 +139,6 @@ function TrimFields({ rate }: { rate: number }) {
           />
         </>
       )}
-      <span className={editorStyles.hint}>{b === null ? t.trimWaiting : t.trimHint}</span>
       <button type="button" className={editorStyles.pill} onClick={cancelTrim}>
         {t.trimCancel}
       </button>
@@ -92,6 +150,7 @@ function TrimFields({ rate }: { rate: number }) {
       >
         {t.trimConfirm}
       </button>
+      <span className={styles.toolHint}>{b === null ? t.trimWaiting : t.trimHint}</span>
     </>
   );
 }
@@ -140,7 +199,7 @@ function FadeFields({ rate, frames }: { rate: number; frames: number }) {
         }}
       />
       {lengths.fadeIn === 0 && lengths.fadeOut === 0 && (
-        <span className={editorStyles.hint}>{t.fadeHint}</span>
+        <span className={styles.toolHint}>{t.fadeHint}</span>
       )}
     </>
   );
@@ -178,13 +237,14 @@ function LoopFields({ rate, frames }: { rate: number; frames: number }) {
         <Switch checked={snap} onChange={setSnapZero} />
         {t.snapZero}
       </label>
-      {!loop && <span className={editorStyles.hint}>{t.loopHint}</span>}
+      {!loop && <span className={styles.toolHint}>{t.loopHint}</span>}
     </>
   );
 }
 
 /**
- * 下のガラスのカプセル（再生バーの位置）：左に再生の操作、右に道具ごとの欄（時刻の欄は時間で入れ、下に標本の位置）。
+ * 下のガラスのカプセル（再生バーの位置）を 2 段にする：上の段に再生の操作と道具の切り替え、下の段に今の道具の欄（時刻
+ * の欄は時間で入れ、下に標本の位置。使い方の一言は欄の下の行）。左下・右下の表示と重ならない帯の中に置く。
  */
 export function AudioCapsule() {
   const tool = useAudioStore((s) => s.tool);
@@ -197,8 +257,10 @@ export function AudioCapsule() {
       role="toolbar"
       aria-label={ja.editor.toolSettings}
     >
-      <Transport />
-      <span className={styles.divider} aria-hidden="true" />
+      <div className={styles.capsuleRow}>
+        <Transport />
+        <AudioToolSwitch />
+      </div>
       <div className={styles.toolFields}>
         {tool === 'select' && <SelectFields rate={rate} frames={frames} />}
         {tool === 'trim' && <TrimFields rate={rate} />}

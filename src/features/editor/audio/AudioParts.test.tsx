@@ -136,6 +136,26 @@ describe('音声エディタの画面', () => {
     expect(screen.getByText(a.width('0:10.000'))).toBeInTheDocument();
   });
 
+  it('下のカプセルは 2 段：上の段に再生の操作と道具の切り替え、下の段に今の道具の欄（ボタンは短い文、読み上げは長い文）', () => {
+    openState();
+    render(<Editor />);
+    const capsule = screen.getByRole('toolbar', { name: t.toolSettings });
+    const [top, fields] = Array.from(capsule.children);
+    if (!top || !fields) throw new Error('2 段になっていない');
+    expect(
+      within(top as HTMLElement).getByRole('group', { name: a.transport }),
+    ).toBeInTheDocument();
+    expect(within(top as HTMLElement).getByRole('group', { name: t.tools })).toBeInTheDocument();
+    // 道具の切り替えは上部ではなくカプセルに 1 つだけ
+    expect(screen.getAllByRole('group', { name: t.tools })).toHaveLength(1);
+    const toTrim = within(fields as HTMLElement).getByRole('button', { name: a.selectionToTrim });
+    expect(toTrim).toHaveTextContent(a.selectionToTrimShort);
+    expect(toTrim).toHaveAttribute('title', a.selectionToTrim);
+    expect(
+      within(fields as HTMLElement).getByRole('button', { name: a.selectionToLoop }),
+    ).toHaveTextContent(a.selectionToLoopShort);
+  });
+
   it('道具を替えると、カプセルの欄が替わる（切り詰め・フェード・ループ）', () => {
     openState();
     render(<Editor />);
