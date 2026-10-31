@@ -20,7 +20,7 @@ import { ContextPool } from '../../../lib/assetAudio';
 import { useNoticeStore } from '../../../stores/noticeStore';
 import { fakeFactory } from '../../../test/fakeAudio';
 import { type AudioRuntime, setAudioRuntimeForTest } from '../../asset/audioRuntime';
-import { closeEditor, openEditorAs, useEditorStore } from '../editorStore';
+import { closeEditor, editorUndo, openEditorAs, useEditorStore } from '../editorStore';
 import {
   AUDIO_ADAPTER,
   audioController,
@@ -396,6 +396,78 @@ describe('フェード・ループのドラッグ', () => {
     await flush();
     expect(player?.loop).toEqual({ start: 1000, end: 4000 });
     expect(useAudioStore.getState().local).toBeNull();
+  });
+
+  it('旗を離してから吸着の応えが届くまでは取り消しを止め、届いたら確定してから取り消せる', async () => {
+    let answer: (v: { frame: number; found: boolean }) => void = () => undefined;
+    vi.mocked(snapEdit).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    );
+    await open(view({ loop: { start: 1000, end: 4000 } }));
+    selectAudioTool('loop');
+    AUDIO_POINTER.down({ shiftKey: false }, xOf(4000), 5);
+    AUDIO_POINTER.move({ shiftKey: false }, xOf(6000), 5);
+    await flush();
+    vi.mocked(stepEdit).mockClear();
+    AUDIO_POINTER.up({ shiftKey: false }, xOf(6000), 5, false);
+    editorUndo();
+    await flush();
+    expect(sentSteps()).toEqual([]);
+    answer({ frame: 5990, found: true });
+    await flush();
+    editorUndo();
+    await flush();
+    expect(sentSteps()).toEqual([
+      {
+        type: 'handle',
+        handle: { type: 'loop', range: { start: 1000, end: 5990 } },
+        node: null,
+        mode: 'preview',
+      },
+      { type: 'commitPreview', mode: 'step' },
+      { type: 'undo' },
+    ]);
+  });
+
+  it('吸着の応えを待つ間に次のドラッグを始めたら、前の値で確定し、遅れて届いた応えは捨てる', async () => {
+    let answer: (v: { frame: number; found: boolean }) => void = () => undefined;
+    vi.mocked(snapEdit).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    );
+    await open(view({ loop: { start: 1000, end: 4000 } }));
+    selectAudioTool('loop');
+    AUDIO_POINTER.down({ shiftKey: false }, xOf(4000), 5);
+    AUDIO_POINTER.move({ shiftKey: false }, xOf(6000), 5);
+    await flush();
+    vi.mocked(stepEdit).mockClear();
+    AUDIO_POINTER.up({ shiftKey: false }, xOf(6000), 5, false);
+    const late = answer;
+    // 次のドラッグ（始めの旗）
+    expect(AUDIO_POINTER.down({ shiftKey: false }, xOf(1000), 5)).toBe(true);
+    await flush();
+    expect(sentSteps()).toEqual([
+      {
+        type: 'handle',
+        handle: { type: 'loop', range: { start: 1000, end: 6000 } },
+        node: null,
+        mode: 'preview',
+      },
+      { type: 'commitPreview', mode: 'step' },
+    ]);
+    AUDIO_POINTER.move({ shiftKey: false }, xOf(2000), 5);
+    expect(useAudioStore.getState().local?.loop).toEqual({ start: 2000, end: 6000 });
+    vi.mocked(stepEdit).mockClear();
+    late({ frame: 5990, found: true });
+    await flush();
+    // 前の応えでは上書きも確定もしない
+    expect(useAudioStore.getState().local?.loop).toEqual({ start: 2000, end: 6000 });
+    expect(sentSteps().filter((q) => q.type === 'commitPreview')).toEqual([]);
   });
 
   it('吸着がオフなら寄せない・動かさずに離したら何も送らない', async () => {

@@ -278,15 +278,38 @@ function showLoop(span: FrameSpan, node: number | null): void {
   if (span.end > span.start) send(dragSteps(loopHandle(span), node, 'move'));
 }
 
-/** ループのドラッグを終える（吸着がオンならゼロ交差に寄せた値で確定する）。 */
+/** ループのドラッグの番号（離したあと吸着の応えを待つ間に次のドラッグが始まったら、古い応えを捨てる）。 */
+let loopGen = 0;
+/** 離して吸着の応えを待っているループのドラッグ（その間は取り消しを止める）。 */
+let finishing: { gen: number; span: FrameSpan; node: number | null } | null = null;
+
+/**
+ * 吸着の応えを待っているループのドラッグがあれば、待たずにその値で確定する（次のドラッグを始める前に。古い応えは番号で
+ * 捨てる）。
+ */
+function settlePendingLoop(): void {
+  const f = finishing;
+  if (!f) return;
+  finishing = null;
+  loopGen++;
+  send([handleStep(loopHandle(f.span), f.node, 'preview'), COMMIT_DRAG], f.node === null);
+}
+
+/**
+ * ループのドラッグを終える（吸着がオンならゼロ交差に寄せた値で確定する）。吸着の応えを待って確定を送り終えるまでは
+ * ドラッグの途中のまま（⌘Z・⇧⌘Z を止める）。
+ */
 async function finishLoop(d: Extract<Drag, { kind: 'loop' }>, canceled: boolean): Promise<void> {
+  const gen = ++loopGen;
   const span = d.span;
   if (!d.moved) {
+    setAudioDragging(false);
     setAudioLocal(null);
     return;
   }
   if (canceled || span.end <= span.start) {
     send(dragSteps(loopHandle(span), d.node, 'cancel'));
+    setAudioDragging(false);
     setAudioLocal(null);
     // 試聴していれば、ドラッグの途中に替えた区間をやめて文書のループ点に戻す
     followLoopAudition();
@@ -297,6 +320,7 @@ async function finishLoop(d: Extract<Drag, { kind: 'loop' }>, canceled: boolean)
   const s = state();
   const session = rt?.ctx.session();
   if (s.snapZero && session && s.view) {
+    finishing = { gen, span, node: d.node };
     const radius = Math.max(1, Math.round(s.view.rate * SNAP_SECONDS));
     const snap = async (f: number) => {
       try {
@@ -308,12 +332,16 @@ async function finishLoop(d: Extract<Drag, { kind: 'loop' }>, canceled: boolean)
     };
     const start = d.edge === 'end' ? span.start : await snap(span.start);
     const end = d.edge === 'start' ? span.end : await snap(span.end);
+    // 次のドラッグが始まった（その前にこの値で確定した）・閉じた：古い応えは捨てる
+    if (gen !== loopGen || openedAudio() !== rt) return;
+    finishing = null;
     if (end > start) next = { start, end };
   }
   if (openedAudio() !== rt) return;
   setAudioLocal({ ...state().local, loop: next });
   audioPlayer()?.setLoop(next);
   send([handleStep(loopHandle(next), d.node, 'preview'), COMMIT_DRAG], d.node === null);
+  setAudioDragging(false);
 }
 
 /** 波形の面のポインタ（道具ごとに振り分ける）。 */
@@ -327,7 +355,8 @@ export const AUDIO_POINTER: WavePointer = {
     const editor = useEditorStore.getState();
     switch (hit.kind) {
       case 'loop': {
-        const loop = overlayOf(s).loop;
+        settlePendingLoop();
+        const loop = overlayOf(state()).loop;
         if (!loop) return false;
         const node = targetNode(editor.doc, editor.selected, 'audio.set_loop');
         drag = { kind: 'loop', edge: hit.edge, node, anchor: f, span: loop, moved: false };
@@ -348,6 +377,7 @@ export const AUDIO_POINTER: WavePointer = {
         return true;
       case 'ruler':
         if (s.tool === 'loop') {
+          settlePendingLoop();
           const node = targetNode(editor.doc, editor.selected, 'audio.set_loop');
           drag = {
             kind: 'loop',
@@ -458,7 +488,7 @@ export const AUDIO_POINTER: WavePointer = {
         return;
       }
       case 'loop':
-        setAudioDragging(false);
+        // ドラッグの途中のまま（取り消しを止める）、吸着と確定を終えたら外す
         void finishLoop(d, canceled);
         return;
     }
@@ -485,6 +515,8 @@ export const AUDIO_POINTER: WavePointer = {
 /** ドラッグをやめる（閉じた・開き直した）。 */
 export function resetAudioDrag(): void {
   drag = null;
+  finishing = null;
+  loopGen++;
 }
 
 /** フェードの対象の長さ（右パネル・カプセルの欄）。 */
