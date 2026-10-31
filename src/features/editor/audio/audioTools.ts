@@ -247,12 +247,19 @@ type Drag =
 
 let drag: Drag | null = null;
 
-/** 今つかめるもの（道具ごと）。 */
+/**
+ * 今つかめるもの（道具ごと）。切り詰めの枠を出している間は、枠のほかのハンドル（ループの旗・フェードの三角）は
+ * つかめない（表示は切り詰めを仮に外した入力の座標だが、手は切り詰めを戻した出力の座標として読まれるため）。
+ */
 function hitScene(s: AudioEditorState) {
   const o = overlayOf(s);
+  const trimming = s.trim !== null;
   return {
-    loop: s.tool === 'loop' || o.loop ? o.loop : null,
-    fade: s.tool === 'fade' && o.fade ? { inEnd: o.fade.inEnd, outStart: o.fade.outStart } : null,
+    loop: !trimming && (s.tool === 'loop' || o.loop) ? o.loop : null,
+    fade:
+      !trimming && s.tool === 'fade' && o.fade
+        ? { inEnd: o.fade.inEnd, outStart: o.fade.outStart }
+        : null,
     trim: s.trim && s.trim.bounds !== null ? { start: s.trim.start, end: s.trim.end } : null,
     selection: s.tool === 'select' ? s.selection : null,
   };

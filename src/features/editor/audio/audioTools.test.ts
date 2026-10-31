@@ -235,6 +235,19 @@ describe('切り詰めの道具', () => {
     expect(useNoticeStore.getState().message).toBe(t.trimUseParams);
   });
 
+  it('切り詰めの枠を出している間は、ループの旗をつかめない（表示の座標が切り詰めを外したものなので）', async () => {
+    await open(view({ loop: { start: 3000, end: 5000 } }));
+    selectAudioTool('trim');
+    expect(useAudioStore.getState().trim).not.toBeNull();
+    expect(AUDIO_POINTER.down({ shiftKey: false }, xOf(5000), 5)).toBe(false);
+    AUDIO_POINTER.move({ shiftKey: false }, xOf(6000), 5);
+    AUDIO_POINTER.up({ shiftKey: false }, xOf(6000), 5, false);
+    await flush();
+    expect(sentSteps()).toEqual([]);
+    expect(useAudioStore.getState().local).toBeNull();
+    expect(AUDIO_POINTER.cursor(xOf(5000), 5)).toBeUndefined();
+  });
+
   it('ほかの道具を選んだらやめる（仮の値を捨てる）', async () => {
     const trimNode = {
       id: 5,
