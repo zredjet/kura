@@ -939,6 +939,11 @@ export type EditDraftDto = {
 /**  書ける形式の一覧（形式の表の順で、アイテムの種類の行すべて）。 */
 export type EditFormatsDto = {
 	formats: EditWritableFormatDto[],
+	/**
+	 *  今の出力の形式（Rust が解いた形式：「元と同じ」は元の形式（アイテムの今の拡張子ではない）、ほかはその形式）。保存が
+	 *  `FormatUnavailable` で断られた直後なら、断った形式。
+	 */
+	current: string,
 	/**  今の出力の形式に書けないときに保存が使う形式（音声は Ogg Vorbis、書けなければ WAV。画像は PNG）。書ければ null。 */
 	fallback: string | null,
 };
@@ -1346,6 +1351,11 @@ export type EditWritableFormatDto = {
 	ext: string,
 	/**  今の環境（今のコーデックの組）で、今の出力の形を書けるか（MP3 は ffmpeg がなければ偽）。 */
 	available: boolean,
+	/**
+	 *  書けない理由が道具のないことなら、その道具（`"ffmpeg"`：外部の道具に頼る形式で、書き手が今の組にない）。書き手は
+	 *  あるが今の出力の形（レート・チャンネル数・大きさ）が合わない・書けるときは null。
+	 */
+	missingTool: string | null,
 	/**  形式の表の保存できるもの：可逆・ループ点・マーカー・16 ビットより細かい標本。 */
 	lossless: boolean,
 	loopPoints: boolean,

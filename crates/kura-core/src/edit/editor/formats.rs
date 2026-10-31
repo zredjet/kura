@@ -8,6 +8,12 @@
 //!   点・マーカー・高いビット）は形式の表の `MetaCaps`。
 //! - `fallback` は、今の出力の形式に書けないときに保存が使う代わりの既定（`edit::save::save_format` と同じ：音声は Ogg Vorbis、
 //!   書けなければ WAV、画像は PNG）。今の出力の形式に書ければ None。
+//! - `current` は、今の出力の形式（`save_format` が解いた形式：`Keep` は元の形式（`versions::original` の拡張子。アイテムの
+//!   今の拡張子ではない）、`To` はその形式）。保存が `FormatUnavailable` で断られた直後なら、断った形式。シートの「MP3 では
+//!   保存できません」に使う（G10 の検証の直し）。
+//! - `missing_tool` は、書けない理由が道具のないことか：外部の道具に頼る形式（今は MP3 の ffmpeg だけ）で、その形式の書き手が
+//!   今の組にないとき道具の名前。書き手はあるが今の出力の形（レート・チャンネル数・大きさ）が合わないとき、外部の道具に
+//!   頼らない形式、書けるときは None（G10 の検証の直し）。
 //! - 確かめは保存のジョブと同じ今のコーデックの組（`EngineServices::codecs`。ツールの場所を変えたら作り直した組）で行う
 //!   （エディタを開いたときの組ではない）。出力は確定した頭の文書（保存するもの）。
 
@@ -30,16 +36,31 @@ pub struct WritableChoice {
     pub ext: String,
     /// 今のコーデックの組で、今の出力の形を書けるか。
     pub available: bool,
+    /// 書けない理由が道具のないことなら、その道具（`"ffmpeg"`）。形が合わない・書けるときは None。
+    pub missing_tool: Option<&'static str>,
     /// 形式の表の保存できるもの。
     pub caps: MetaCaps,
 }
 
-/// 書ける形式の一覧と、代わりの既定。
+/// 書ける形式の一覧と、今の出力の形式・代わりの既定。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditFormats {
     pub formats: Vec<WritableChoice>,
+    /// 今の出力の形式（`Keep` は元の形式、`To` はその形式。保存の確かめが解く形式）。
+    pub current: String,
     /// 今の出力の形式に書けないときに保存が使う形式（書ければ None）。
     pub fallback: Option<String>,
+}
+
+/// 書くのに外部の道具が要る形式と、その道具。書き手が組になければ道具がない（MP3 の書き手は
+/// `codec_ext::ffmpeg::Mp3FfmpegEncoder` だけで、ffmpeg が見つからない・libmp3lame がなければ組に足さない）。
+const TOOL_FORMATS: [(&str, &str); 1] = [("mp3", crate::codec_ext::ffmpeg::TOOL)];
+
+/// 形式 `format` を書けない理由が道具のないことなら、その道具（外部の道具に頼る形式で、書き手が組にない）。
+fn missing_tool(codecs: &CodecSet, format: &str) -> Option<&'static str> {
+    let &(_, tool) = TOOL_FORMATS.iter().find(|(f, _)| *f == format)?;
+    let has_writer = codecs.format_caps(format).is_some_and(|c| c.writable());
+    (!has_writer).then_some(tool)
 }
 
 /// 開いているエディタの確定した頭の出力（形式の選びと形）で、書ける形式の一覧を作る（モジュールの説明）。
@@ -96,18 +117,30 @@ pub fn formats_for(
     let formats = FORMATS
         .iter()
         .filter(|f| MediaKind::from(f.item_kind) == kind && !f.decodes_to.is_empty())
-        .map(|f| WritableChoice {
-            format: f.id.to_string(),
-            ext: f.exts.first().copied().unwrap_or(f.id).to_string(),
-            available: writable.iter().any(|w| w == f.id),
-            caps: f.caps,
+        .map(|f| {
+            let available = writable.iter().any(|w| w == f.id);
+            WritableChoice {
+                format: f.id.to_string(),
+                ext: f.exts.first().copied().unwrap_or(f.id).to_string(),
+                available,
+                missing_tool: if available {
+                    None
+                } else {
+                    missing_tool(codecs, f.id)
+                },
+                caps: f.caps,
+            }
         })
         .collect();
-    let fallback = match save_format(codecs, choice, source_format, shape) {
-        Ok(_) => None,
-        Err(FormatProblem::Unavailable { fallback, .. }) => fallback,
+    let (current, fallback) = match save_format(codecs, choice, source_format, shape) {
+        Ok((format, _)) => (format, None),
+        Err(FormatProblem::Unavailable { format, fallback }) => (format, fallback),
     };
-    EditFormats { formats, fallback }
+    EditFormats {
+        formats,
+        current,
+        fallback,
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +211,68 @@ mod tests {
         let f = formats_for(&with, &FormatChoice::Keep, "mp3", &stereo());
         assert!(row(&f, "mp3").available);
         assert_eq!(f.fallback, None);
+    }
+
+    /// 今の出力の形式（`current`）は Rust が解いた形式：`Keep` は元の形式（今の拡張子ではない）、`To` はその形式。書けても
+    /// 書けなくても同じ（保存の確かめ `save_format` と同じ）。G10 の検証の直し（#4）。
+    #[test]
+    fn current_is_the_format_the_save_resolves() {
+        let pinned = CodecSet::pinned();
+        let f = formats_for(&pinned, &FormatChoice::Keep, "mp3", &stereo());
+        assert_eq!(f.current, "mp3", "Keep は元の形式");
+        assert!(!row(&f, "mp3").available);
+        assert_eq!(f.fallback.as_deref(), Some("ogg"));
+        let f = formats_for(&pinned, &to("wav"), "mp3", &stereo());
+        assert_eq!(f.current, "wav");
+        assert_eq!(f.fallback, None);
+        let f = formats_for(&pinned, &FormatChoice::Keep, "flac", &stereo());
+        assert_eq!(f.current, "flac");
+        for (choice, source) in [(FormatChoice::Keep, "mp3"), (to("opus"), "wav")] {
+            let want = match save_format(&pinned, &choice, source, &stereo()) {
+                Ok((format, _)) => format,
+                Err(FormatProblem::Unavailable { format, .. }) => format,
+            };
+            assert_eq!(
+                formats_for(&pinned, &choice, source, &stereo()).current,
+                want
+            );
+        }
+    }
+
+    /// 書けない理由（G10 の検証の直し #5）：MP3 の書き手（ffmpeg）が組になければ `missing_tool` は ffmpeg。書き手はあるが
+    /// 形（96 kHz・88.2 kHz・3 チャンネル以上）が合わなければ None（道具を足しても書けない）。外部の道具に頼らない形式・
+    /// 書ける形式は None。
+    #[test]
+    fn missing_tool_tells_a_missing_writer_from_a_shape_it_cannot_write() {
+        let pinned = CodecSet::pinned();
+        let f = formats_for(&pinned, &FormatChoice::Keep, "mp3", &stereo());
+        assert_eq!(row(&f, "mp3").missing_tool, Some("ffmpeg"));
+        for id in ["wav", "aiff", "flac", "m4a", "aac", "ogg", "opus"] {
+            assert_eq!(row(&f, id).missing_tool, None, "{id}");
+        }
+        // 書き手のない組では、形が MP3 で書けないものでも道具がない（道具を足せば、ほかの形なら書ける）
+        let hi = |rate: u32, channels: u16| Shape::Audio {
+            rate,
+            channels,
+            frames: Dim::Exact(1_000),
+        };
+        let f = formats_for(&pinned, &FormatChoice::Keep, "mp3", &hi(96_000, 2));
+        assert_eq!(row(&f, "mp3").missing_tool, Some("ffmpeg"));
+
+        let tools = FakeTools::new("exit 1", "exit 1", "cksum > \"$out\"");
+        let mut with = CodecSet::pinned();
+        tools.codecs().add_to(&mut with).unwrap();
+        let f = formats_for(&with, &FormatChoice::Keep, "mp3", &stereo());
+        assert!(row(&f, "mp3").available);
+        assert_eq!(row(&f, "mp3").missing_tool, None);
+        for shape in [hi(96_000, 2), hi(88_200, 2), hi(44_100, 3), hi(48_000, 6)] {
+            let f = formats_for(&with, &FormatChoice::Keep, "mp3", &shape);
+            let mp3 = row(&f, "mp3");
+            assert!(!mp3.available, "{shape:?}");
+            assert_eq!(mp3.missing_tool, None, "形が合わない（{shape:?}）");
+            assert_eq!(f.current, "mp3");
+            assert_eq!(f.fallback.as_deref(), Some("ogg"), "{shape:?}");
+        }
     }
 
     /// 代わりの既定は保存の確かめ（`save_format`）と同じ：Ogg Vorbis に書けない形（9 チャンネル）は WAV、画像は PNG。

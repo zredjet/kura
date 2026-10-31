@@ -1215,6 +1215,9 @@ pub struct EditWritableFormatDto {
     pub ext: String,
     /// 今の環境（今のコーデックの組）で、今の出力の形を書けるか（MP3 は ffmpeg がなければ偽）。
     pub available: bool,
+    /// 書けない理由が道具のないことなら、その道具（`"ffmpeg"`：外部の道具に頼る形式で、書き手が今の組にない）。書き手は
+    /// あるが今の出力の形（レート・チャンネル数・大きさ）が合わない・書けるときは null。
+    pub missing_tool: Option<String>,
     /// 形式の表の保存できるもの：可逆・ループ点・マーカー・16 ビットより細かい標本。
     pub lossless: bool,
     pub loop_points: bool,
@@ -1227,6 +1230,9 @@ pub struct EditWritableFormatDto {
 #[serde(rename_all = "camelCase")]
 pub struct EditFormatsDto {
     pub formats: Vec<EditWritableFormatDto>,
+    /// 今の出力の形式（Rust が解いた形式：「元と同じ」は元の形式（アイテムの今の拡張子ではない）、ほかはその形式）。保存が
+    /// `FormatUnavailable` で断られた直後なら、断った形式。
+    pub current: String,
     /// 今の出力の形式に書けないときに保存が使う形式（音声は Ogg Vorbis、書けなければ WAV。画像は PNG）。書ければ null。
     pub fallback: Option<String>,
 }
@@ -1241,12 +1247,14 @@ impl From<EditFormats> for EditFormatsDto {
                     format: w.format,
                     ext: w.ext,
                     available: w.available,
+                    missing_tool: w.missing_tool.map(str::to_string),
                     lossless: w.caps.lossless,
                     loop_points: w.caps.loop_points,
                     markers: w.caps.markers,
                     high_bit_depth: w.caps.high_bit_depth,
                 })
                 .collect(),
+            current: f.current,
             fallback: f.fallback,
         }
     }
@@ -1654,7 +1662,7 @@ mod tests {
         assert_eq!(json["audio"]["lazy"], json!(true));
     }
 
-    /// 書ける形式の一覧の JSON の形（camelCase。保存できるものは形式の表の値）。
+    /// 書ける形式の一覧の JSON の形（camelCase。保存できるものは形式の表の値。今の出力の形式と、書けない理由の道具）。
     #[test]
     fn formats_serialize_for_the_front() {
         use kura_core::edit::editor::formats::formats_for;
@@ -1668,6 +1676,7 @@ mod tests {
             formats_for(&CodecSet::pinned(), &FormatChoice::Keep, "mp3", &shape).into();
         let json = serde_json::to_value(&dto).unwrap();
         assert_eq!(json["fallback"], json!("ogg"));
+        assert_eq!(json["current"], json!("mp3"));
         let rows = json["formats"].as_array().unwrap();
         let row = |id: &str| rows.iter().find(|r| r["format"] == id).unwrap().clone();
         assert_eq!(
@@ -1676,6 +1685,7 @@ mod tests {
                 "format": "mp3",
                 "ext": "mp3",
                 "available": false,
+                "missingTool": "ffmpeg",
                 "lossless": false,
                 "loopPoints": false,
                 "markers": false,
@@ -1688,6 +1698,7 @@ mod tests {
                 "format": "flac",
                 "ext": "flac",
                 "available": true,
+                "missingTool": null,
                 "lossless": true,
                 "loopPoints": true,
                 "markers": false,

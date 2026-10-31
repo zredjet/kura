@@ -2,9 +2,12 @@
 //! `edit_measure` は今の出力のラウドネス。`edit_formats` は今の組で書ける形式。
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kura_engine::Graph;
 use kura_engine::codec::CodecSet;
+use kura_engine::doc::{Expand, FormatChoice, OutputId};
+use kura_engine::session::{CommitMode, Edit};
 use serde_json::json;
 
 use super::measure::{LoudnessState, measure, values_of};
@@ -14,6 +17,7 @@ use crate::codec_ext::ffmpeg::testing::FakeTools;
 use crate::edit::editor::formats::formats;
 use crate::edit::editor::{EditorError, SaveMode, Step, Viewport, close, save};
 use crate::edit::services::fake::FakeEngineFactory;
+use crate::jobs::JobState;
 
 /// A17（F14）：`edit_formats` は、ffmpeg のない組で mp3 の元を元の形式のまま保存しようとすると mp3 を `available: false`、
 /// 代わりを ogg にする（保存はそのとき `FormatUnavailable`）。確かめは保存のジョブと同じ今の組で、ツールの場所を変えて組を
@@ -65,6 +69,66 @@ fn formats_follow_the_current_codecs() {
         formats(&env.env(), &s),
         Err(EditorError::NoSession)
     ));
+}
+
+/// G10 の検証の直し（#4）：元（mp3）を WAV で保存して今の拡張子が wav になっても、`Keep` の文書の `edit_formats` は元の
+/// 形式で確かめ、今の出力の形式（`current`）は mp3（今の拡張子の wav ではない）。保存の確かめも同じく mp3 で断る。
+#[test]
+fn keep_resolves_to_the_original_format_after_saving_as_another() {
+    let env = Env::new();
+    env.jobs.start().unwrap();
+    let mp3 = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kura-engine/fixtures/mp3-free.mp3"),
+    )
+    .unwrap();
+    let id = add_audio(&env.lib, &mp3, "mp3");
+    let s = env.open(id).session.clone();
+    let vp = Viewport::audio_idle();
+    env.step(&s, vec![add(0, "audio.gain", json!({ "db": -1.0 }))], &vp);
+    let wav = FormatChoice::To {
+        format: "wav".into(),
+        options: json!({}),
+    };
+    let job = save(&env.env(), &s, SaveMode::Overwrite, Some(wav))
+        .unwrap()
+        .job;
+    assert!(env.jobs.wait_idle(Duration::from_secs(60)));
+    let record = env.jobs.get(job).unwrap();
+    assert_eq!(record.state, JobState::Done, "{:?}", record.message);
+    let head = env
+        .lib
+        .db()
+        .read(|c| crate::edit::versions::head(c, id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.ext, "wav", "今の拡張子は wav");
+    let f = formats(&env.env(), &s).unwrap();
+    assert_eq!(f.current, "wav", "文書の出力は To(wav)");
+
+    // 「元と同じ」に戻す（Keep は元の形式 mp3。ffmpeg のない組では書けない）
+    let keep = Step::Commit {
+        edit: Edit::SetOutput {
+            output: OutputId(0),
+            format: FormatChoice::Keep,
+            quantize: None,
+            expand: Expand::One,
+        },
+        mode: CommitMode::Step,
+    };
+    let out = env.step(&s, vec![keep], &vp);
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    let f = formats(&env.env(), &s).unwrap();
+    assert_eq!(f.current, "mp3", "Keep は元の形式（今の拡張子ではない）");
+    assert_eq!(f.fallback.as_deref(), Some("ogg"));
+    let row = f.formats.iter().find(|w| w.format == "mp3").unwrap();
+    assert!(!row.available);
+    assert_eq!(row.missing_tool, Some("ffmpeg"));
+    assert!(matches!(
+        save(&env.env(), &s, SaveMode::Overwrite, None),
+        Err(EditorError::FormatUnavailable { ref format, .. }) if format == "mp3"
+    ));
+    close(&env.engine, &s);
 }
 
 /// 全体の描画で求めたゼロ交差（正）。

@@ -283,6 +283,7 @@ function formatRow(
     format,
     ext: format,
     available,
+    missingTool: null,
     lossless: false,
     loopPoints: false,
     markers: false,
@@ -296,7 +297,7 @@ const AUDIO_ROWS: EditWritableFormatDto[] = [
   formatRow('wav', true, { lossless: true, loopPoints: true, markers: true, highBitDepth: true }),
   formatRow('aiff', true, { lossless: true, loopPoints: true, markers: true, highBitDepth: true }),
   formatRow('flac', true, { lossless: true, loopPoints: true, highBitDepth: true }),
-  formatRow('mp3', false),
+  formatRow('mp3', false, { missingTool: 'ffmpeg' }),
   formatRow('m4a', false),
   formatRow('aac', false),
   formatRow('ogg', true, { loopPoints: true }),
@@ -508,6 +509,7 @@ describe('書けない形式（FormatUnavailable）', () => {
         formatRow('webp', false, { lossless: true }),
         formatRow('heic', false),
       ],
+      current: 'webp',
       fallback: 'png',
     });
     render(<EditorSheets />);
@@ -548,7 +550,11 @@ describe('書けない形式（FormatUnavailable）', () => {
   it('音声：MP3 は ffmpeg が要る印で、既定は Ogg Vorbis。選んだ形式で失うものを出し、別名で保存も同じ向きで積み直す', async () => {
     await openAudioDirty({ ext: 'mp3' });
     vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
-    vi.mocked(listEditFormats).mockResolvedValue({ formats: AUDIO_ROWS, fallback: 'ogg' });
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS,
+      current: 'mp3',
+      fallback: 'ogg',
+    });
     render(<EditorSheets />);
     requestSave();
     await flush();
@@ -606,7 +612,11 @@ describe('書けない形式（FormatUnavailable）', () => {
 
   it('閉じる前の保存：［キャンセル］なら閉じない、［保存］なら選んだ形式で保存し終えてから閉じる', async () => {
     await openAudioDirty({ ext: 'mp3' });
-    vi.mocked(listEditFormats).mockResolvedValue({ formats: AUDIO_ROWS, fallback: 'ogg' });
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS,
+      current: 'mp3',
+      fallback: 'ogg',
+    });
     render(<EditorSheets />);
     let closed: boolean | null = null;
     act(() => {
