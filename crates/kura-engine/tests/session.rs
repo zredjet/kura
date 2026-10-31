@@ -1140,6 +1140,56 @@ fn merge_folds_one_key_and_breaks_on_others() {
     assert!(!p1.merged && p2.merged);
 }
 
+/// 仮の値をノードの引数の手としてまとめる口（`merge_preview_as_params`。M13 段 4）：外したノードを引数ごと有効に戻す
+/// Replace の仮の値を Merge で確定すると、続く同じノードの SetParams の Merge がその手にまとまり、取り消し 1 回で外した
+/// 文書に戻る。口を使わない Replace は今までどおり区切る。
+#[test]
+fn a_provisional_replace_can_merge_as_params() {
+    let engine = Engine::new().unwrap();
+    for keyed in [true, false] {
+        let mut s = open(&sample());
+        s.commit(
+            &engine,
+            Edit::SetEnabled {
+                node: NodeId(2),
+                enabled: false,
+            },
+            CommitMode::Step,
+        )
+        .unwrap();
+        let disabled = snap_json(s.head());
+        let len = s.history_len();
+        let mut g = s.head().to_graph();
+        let n = g.nodes.iter_mut().find(|n| n.id == NodeId(2)).unwrap();
+        n.enabled = true;
+        n.params = json!({ "axis": "vertical" });
+        s.preview(&engine, Edit::Replace { graph: g }).unwrap();
+        if keyed {
+            s.merge_preview_as_params(NodeId(2));
+        }
+        let first = s.commit_preview(CommitMode::Merge).unwrap();
+        assert!(!first.merged);
+        let next = s
+            .commit(
+                &engine,
+                Edit::SetParams {
+                    node: NodeId(2),
+                    params: json!({ "axis": "horizontal" }),
+                },
+                CommitMode::Merge,
+            )
+            .unwrap();
+        assert_eq!(next.merged, keyed);
+        assert_eq!(s.history_len(), len + if keyed { 1 } else { 2 });
+        s.undo();
+        assert_eq!(snap_json(s.head()) == disabled, keyed, "{keyed}");
+    }
+    // 仮の値がなければ何もしない
+    let mut s = open(&sample());
+    s.merge_preview_as_params(NodeId(2));
+    assert!(!s.is_provisional());
+}
+
 /// まとめている手で値を元に戻すと、その手が消える（取り消すものがなくなる）。
 #[test]
 fn returning_the_value_removes_the_step() {

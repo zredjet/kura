@@ -630,6 +630,56 @@ fn the_trim_tool_widens_an_earlier_trim() {
     }
 }
 
+/// 数の欄などから続ける merge のハンドルの手：有効なノードでも外したノードでも 1 手にまとまり、⌘Z 1 回で前に戻る
+/// （外したノードは外したまま・元の引数に）。
+#[test]
+fn merged_handle_steps_undo_at_once() {
+    let env = Env::new();
+    let vp = Viewport::audio_idle();
+    let merge = HandleMode::Commit(CommitMode::Merge);
+    for disabled in [false, true] {
+        let (s, _) = open_with_nodes(
+            &env,
+            8_000,
+            3 * C,
+            vec![add(
+                0,
+                "audio.fade",
+                json!({ "fadeIn": 10, "fadeOut": 0, "curve": "linear" }),
+            )],
+            None,
+        );
+        if disabled {
+            env.step(
+                &s,
+                vec![Step::Commit {
+                    edit: Edit::SetEnabled {
+                        node: NodeId(1),
+                        enabled: false,
+                    },
+                    mode: CommitMode::Step,
+                }],
+                &vp,
+            );
+        }
+        let before = env.step(&s, Vec::new(), &vp).status.head;
+        for end in [100, 200, 300] {
+            let out = env.step(
+                &s,
+                vec![handle(Handle::FadeIn { end }, Some(1), merge)],
+                &vp,
+            );
+            assert!(out.rejected.is_none(), "{:?}", out.rejected);
+        }
+        assert!(enabled(&env, &s, 1));
+        assert_eq!(params(&env, &s, 1)["fadeIn"], json!(300));
+        let out = env.step(&s, vec![Step::Undo], &vp);
+        assert_eq!(out.status.head, before, "外した {disabled}：1 手で戻る");
+        assert_eq!(enabled(&env, &s, 1), !disabled);
+        assert_eq!(params(&env, &s, 1)["fadeIn"], json!(10));
+    }
+}
+
 /// フェードインの終わりは区間の終わり（含まない位置）として戻す：下流の trim の出力の終わりへも動かせる。
 #[test]
 fn fade_in_can_reach_the_end_of_a_downstream_trim() {

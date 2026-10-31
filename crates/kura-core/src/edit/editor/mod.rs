@@ -1145,11 +1145,22 @@ fn apply_steps(e: &Engine, st: &mut State, steps: Vec<Step>) -> (Vec<NodeId>, Op
                             node,
                         )
                     })
-                    .and_then(|edit| match mode {
-                        audio::handles::HandleMode::Preview => {
-                            preview_checked(e, st, edit).map(|()| None)
+                    .and_then(|edit| {
+                        // 外したノードを直す手（引数と有効を 1 手で替える Replace）は、続く同じノードの引数の手（SetParams）
+                        // と同じまとめの鍵にする（数の欄からの merge の手が 1 手にまとまり、⌘Z 1 回で外す前に戻る）
+                        let replace = matches!(edit, Edit::Replace { .. });
+                        preview_checked(e, st, edit)?;
+                        if let (true, Some(id)) = (replace, node) {
+                            st.session.merge_preview_as_params(id);
                         }
-                        audio::handles::HandleMode::Commit(m) => commit_checked(e, st, edit, m),
+                        match mode {
+                            audio::handles::HandleMode::Preview => Ok(None),
+                            audio::handles::HandleMode::Commit(m) => {
+                                let c = st.session.commit_preview(m)?;
+                                ensure_plan(e, st).map_err(EngineError::Invalid)?;
+                                Ok(c.created)
+                            }
+                        }
                     })
             }
         };

@@ -327,6 +327,15 @@ impl EditSession {
         Ok((rev, checked))
     }
 
+    /// 今の仮の値を、ノード `node` の引数をまとめて変える手として扱う（まとめの鍵を `SetParams` と同じ `Params(node)` に
+    /// する）。`Merge` で確定すると、続く同じノードの `SetParams` の `Merge` がこの手にまとまる。引数と有効を 1 手で替える
+    /// `Replace`（外したノードをハンドルで直す。M13 段 4）に使う。仮の値がなければ何もしない。
+    pub fn merge_preview_as_params(&mut self, node: NodeId) {
+        if let Some(p) = self.provisional.as_mut() {
+            p.merge = Some(MergeKey::Params(node));
+        }
+    }
+
     /// 仮の値を捨てる。捨てたら頭の番号、なければ None。
     pub fn cancel_preview(&mut self) -> Option<Rev> {
         self.provisional.as_ref()?;
