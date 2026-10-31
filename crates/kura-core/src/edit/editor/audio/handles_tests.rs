@@ -721,3 +721,91 @@ fn fade_in_can_reach_the_end_of_a_downstream_trim() {
         })
     );
 }
+
+/// 後ろに trim（と resample）がある鎖でも、フェードインの終わりを出力の頭（0）に、フェードアウトの始めを出力の終わりに
+/// 置く手は、写さずにフェードを 0 にする（三角を端まで・欄に 0・I/O）。ほかの値の写し方は変わらない。
+#[test]
+fn fades_can_be_cleared_through_a_downstream_trim() {
+    let env = Env::new();
+    let vp = Viewport::audio_idle();
+    let n = 3 * C;
+    let chains = [
+        vec![add(1, "audio.trim", json!({ "start": 1_000, "end": null }))],
+        vec![
+            add(1, "audio.trim", json!({ "start": 1_000, "end": null })),
+            add(2, "audio.resample", json!({ "rate": 4_000 })),
+        ],
+        vec![add(
+            1,
+            "audio.trim",
+            json!({ "start": 1_000, "end": 150_000 }),
+        )],
+    ];
+    for (i, tail) in chains.into_iter().enumerate() {
+        let mut steps = vec![add(
+            0,
+            "audio.fade",
+            json!({ "fadeIn": 1_500, "fadeOut": 2_000, "curve": "linear" }),
+        )];
+        steps.extend(tail);
+        let (s, _) = open_with_nodes(&env, 8_000, n, steps, None);
+        let frames = shown_audio(&env.step(&s, Vec::new(), &vp).view).frames;
+        // フェードインを 0 に
+        let out = env.step(
+            &s,
+            vec![handle(Handle::FadeIn { end: 0 }, Some(1), STEP)],
+            &vp,
+        );
+        assert!(out.rejected.is_none(), "{i}: {:?}", out.rejected);
+        assert_eq!(params(&env, &s, 1)["fadeIn"], json!(0), "{i}");
+        assert_eq!(params(&env, &s, 1)["fadeOut"], json!(2_000), "{i}");
+        // フェードアウトを 0 に（始めを出力の終わりへ）
+        let out = env.step(
+            &s,
+            vec![handle(Handle::FadeOut { start: frames }, Some(1), STEP)],
+            &vp,
+        );
+        assert!(out.rejected.is_none(), "{i}: {:?}", out.rejected);
+        assert_eq!(params(&env, &s, 1)["fadeOut"], json!(0), "{i}");
+        assert_eq!(
+            shown_audio(&out.view).nodes[0].marks,
+            Some(Marks::Fade {
+                in_end: None,
+                out_start: None
+            }),
+            "{i}"
+        );
+    }
+    // ほかの値はこれまでどおり写す（trim の始め 1,000 の分だけ戻す）
+    let (s, _) = open_with_nodes(
+        &env,
+        8_000,
+        n,
+        vec![
+            add(
+                0,
+                "audio.fade",
+                json!({ "fadeIn": 0, "fadeOut": 0, "curve": "linear" }),
+            ),
+            add(1, "audio.trim", json!({ "start": 1_000, "end": null })),
+        ],
+        None,
+    );
+    let out = env.step(
+        &s,
+        vec![
+            handle(Handle::FadeIn { end: 500 }, Some(1), STEP),
+            handle(
+                Handle::FadeOut {
+                    start: n - 1_000 - 300,
+                },
+                Some(1),
+                STEP,
+            ),
+        ],
+        &vp,
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    assert_eq!(params(&env, &s, 1)["fadeIn"], json!(1_500));
+    assert_eq!(params(&env, &s, 1)["fadeOut"], json!(300));
+}

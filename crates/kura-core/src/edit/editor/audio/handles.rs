@@ -113,6 +113,8 @@ const UNMAPPABLE: &str = "後ろの操作で時間が写せないので、ハン
 /// - 区間の終わり（trim の end・ループの end・フェードインの終わり）は `back_end` で戻す。入力の終わりを下流で写した位置
 ///   （`forward_end(in_frames)`。出力の終わり）以上なら入力の終わりにする（trim は end: null）。下げるレートの往復は、
 ///   入力の長さを超えたり手前に戻ったりするため。
+/// - フェードを消す手（フェードインの終わりが出力の頭 0、フェードアウトの始めが出力の終わり以上）は写さずに 0 にする。
+///   下流に trim があると、出力の頭・終わりちょうどは写した先の区間の外になり戻せないため。
 fn handle_params(
     handle: &Handle,
     down: &[TimeLink],
@@ -122,6 +124,12 @@ fn handle_params(
     let back = |p: u64| backward(down, p).ok_or_else(|| invalid(UNMAPPABLE));
     let back_end = |p: u64| backward_end(down, p).ok_or_else(|| invalid(UNMAPPABLE));
     let in_end = forward_end(down, in_frames);
+    // 出力の長さ（下流がなければ入力の長さ）
+    let out_frames = match down.last() {
+        Some(l) => rate_frames(&l.output).map(|(_, n)| n),
+        None => Some(in_frames),
+    };
+    let at_out_end = |p: u64| out_frames.or(in_end).is_some_and(|n| p >= n);
     let start_of = |p: u64, cur: Option<u64>| match cur {
         Some(c) if forward(down, c) == Some(p) => Ok(c),
         _ => back(p),
@@ -147,6 +155,9 @@ fn handle_params(
             }
             json!({ "start": s, "end": (e != in_frames).then_some(e) })
         }
+        // フェードを消す（出力の頭・終わりまで寄せた）
+        Handle::FadeIn { end: 0 } => json!({ "fadeIn": 0 }),
+        Handle::FadeOut { start } if at_out_end(start) => json!({ "fadeOut": 0 }),
         // フェードインの長さは区間の終わり（含まない位置）なので、印（forward_end）と対になる back_end で戻す
         Handle::FadeIn { end } => json!({ "fadeIn": end_of(end, None)?.min(in_frames) }),
         Handle::FadeOut { start } => {
