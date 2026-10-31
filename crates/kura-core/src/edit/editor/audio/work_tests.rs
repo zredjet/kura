@@ -895,6 +895,41 @@ fn pcm_without_disk_space_falls_back_to_the_whole_read() {
     );
 }
 
+/// 段 4B の検証の直し 5：エディタを開く間に握る試聴の作業用のファイルは、同じ元のものだけ。別の元 X を試聴していたら、Y を
+/// 開くときに X のファイルを手放してから Y の作業用のファイルを作る（Y の空きを確かめる時点で X のファイルはもうない）。
+#[test]
+fn opening_another_item_releases_the_auditioned_work_file_first() {
+    let env = Env::with(Arc::new(Budgeted(SMALL)));
+    let x = long_flac(40 * C);
+    let y = long_flac(41 * C);
+    add_audio(&env.lib, &x, "flac");
+    let yid = add_audio(&env.lib, &y, "flac");
+    let dir = env.engine.work_pcm().dir().to_path_buf();
+    let hash = crate::library::hex(blake3::hash(&x).as_bytes());
+    let src = crate::serve::pcm_source(env.lib.layout(), &hash).unwrap();
+    crate::asset::pcm::serve(&env.engine, env.lib.layout().root(), &hash, &src, 0, 10).unwrap();
+    let made = files(&dir);
+    assert_eq!(made.len(), 1, "{made:?}");
+    let x_path = made[0].clone();
+    // 空きを測るたびに、X のファイルが残っているかを記す（空きは測れないことにして確かめを通す）
+    let seen: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let (s, xp) = (seen.clone(), x_path.clone());
+    env.engine.set_free_space(Some(Arc::new(move |_: &Path| {
+        s.lock().unwrap().push(xp.exists());
+        None
+    }) as Arc<crate::library::upgrade::FreeSpaceFn>));
+    let opened = env.open(yid);
+    assert!(opened.source.audio.unwrap().lazy);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![false],
+        "Y の空きを確かめるときに X の作業用のファイルが残っていた"
+    );
+    assert!(!x_path.exists());
+    assert_eq!(files(&dir).len(), 1, "Y の分だけ");
+    assert!(env.engine.pcm_cache().cached().is_none());
+}
+
 /// 段 4B の検証の直し 4：置き場そのものの誤り（作る前の空きの確かめ）は `Core(NoSpace)` で、作業用のファイル・取り置きを
 /// 残さず、エディタも残らない。元を読む側の Io（デコーダが返したもの）は、書き手の誤りと違って「元を読めません」（Failed）の
 /// まま（書き手の Io の写しは `source::tests::write_errors_are_kept_apart_from_read_errors`）。

@@ -67,6 +67,23 @@ impl WorkRef {
     pub(crate) fn path(&self) -> &Path {
         &self.0.pcm().path
     }
+
+    /// 鍵 `key` の作業用のファイルか（置き場の名前は鍵から決まる）。
+    pub(crate) fn is_for(&self, key: &WorkKey) -> bool {
+        key.file_name()
+            .is_ok_and(|name| self.path().file_name() == Some(std::ffi::OsStr::new(&name)))
+    }
+}
+
+/// 作業用のファイルの鍵（元の中身・形式・読み方。デコーダは段の順）。エディタと試聴の `/pcm` で同じなので、どちらかが
+/// 作ったものをもう一方が使い回す。
+pub(crate) fn work_key(source: Digest, format: &str, opts: &DecodeOptions) -> WorkKey {
+    WorkKey {
+        source: source.0,
+        format: format.to_string(),
+        options: opts.clone(),
+        decoder: None,
+    }
 }
 
 impl std::fmt::Debug for WorkRef {
@@ -375,15 +392,9 @@ pub(crate) struct WorkCx<'a> {
 }
 
 impl WorkCx<'_> {
-    /// 作業用のファイルの鍵（元の中身・形式・読み方。デコーダは段の順）。エディタと試聴の `/pcm` で同じなので、どちらかが
-    /// 作ったものをもう一方が使い回す。
+    /// 作業用のファイルの鍵（[`work_key`]）。
     pub(crate) fn key(&self) -> WorkKey {
-        WorkKey {
-            source: self.source.0,
-            format: self.format.to_string(),
-            options: self.opts.clone(),
-            decoder: None,
-        }
+        work_key(self.source, self.format, self.opts)
     }
 }
 

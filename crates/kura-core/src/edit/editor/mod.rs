@@ -1495,14 +1495,6 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             issues: Vec::new(),
         });
     }
-    // 試聴の置き場が持つ作業用のファイルは、開き終えるまで残す（同じ元ならエディタが使い回す。M13 段 4B）
-    let _pcm_work = (head.kind == MediaKind::Audio)
-        .then(|| env.engine.pcm_cache().work())
-        .flatten();
-    if head.kind == MediaKind::Audio {
-        // M11 の試聴の置き場が丸ごと読んだ値とその予算を返す（エディタと二重に持たない）
-        env.engine.pcm_cache().clear();
-    }
     let draft = db.read(|c| {
         let Some(d) = drafts::get(c, item_id)? else {
             return Ok(None);
@@ -1562,6 +1554,22 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
         .first()
         .map(|slot| slot.decode.clone())
         .unwrap_or_default();
+    // 試聴の置き場が持つ作業用のファイルは、同じ元（エディタと同じ鍵）なら開き終えるまで握って使い回す。違う元のものは
+    // 握らず、置き場を空にして手放す（開く間にディスクを二重に使わない。M13 段 4B・その検証の直し）
+    let _pcm_work = (head.kind == MediaKind::Audio)
+        .then(|| env.engine.pcm_cache().work())
+        .flatten()
+        .filter(|w| {
+            w.is_for(&audio::source::work_key(
+                Digest(original.hash),
+                format,
+                &opts,
+            ))
+        });
+    if head.kind == MediaKind::Audio {
+        // M11 の試聴の置き場が丸ごと読んだ値とその予算を返す（エディタと二重に持たない）
+        env.engine.pcm_cache().clear();
+    }
     let options_digest = anchors::options_digest(&opts)?;
     let anchor = db.read(|c| anchors::find(c, &original.hash, &options_digest))?;
     let facts = if head.kind == MediaKind::Audio {
