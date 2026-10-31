@@ -32,6 +32,10 @@ pub enum CoreError {
         megabytes(*.available)
     )]
     NoSpace { needed: u64, available: u64 },
+    /// 中止した（ジョブの一時停止・中止の指示で、途中で止めた。作業用の PCM を書く途中など。M13 段 3。ジョブは止め方
+    /// （一時停止・中止）に写す）。
+    #[error("中止しました")]
+    Canceled,
     /// ファイル操作の失敗。
     #[error("ファイル操作に失敗しました: {0}")]
     Io(#[from] std::io::Error),
@@ -192,6 +196,7 @@ impl CoreError {
             Self::Mismatch(_) => "Mismatch",
             Self::Busy(_) => "Busy",
             Self::NoSpace { .. } => "NoSpace",
+            Self::Canceled => "Canceled",
             Self::Io(_) => "Io",
             Self::Db(_) | Self::Json(_) | Self::DbClosed => "Db",
             Self::ToolMissing(_) => "ToolMissing",

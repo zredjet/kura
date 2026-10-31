@@ -12,6 +12,8 @@ mod gc_tests;
 pub mod runtime;
 pub mod save;
 #[cfg(test)]
+mod save_stream_tests;
+#[cfg(test)]
 mod save_tests;
 pub mod services;
 pub mod store;

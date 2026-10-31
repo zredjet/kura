@@ -556,9 +556,10 @@ macro_rules! go {
     };
 }
 
-// 段 1・2 の読みと、版に戻す・GC の照合（`go!` を使うので、マクロの定義のあとに置く）
+// 段 1・2 の読みと、版に戻す・GC の照合と、音声を流して書く道（`go!` を使うので、マクロの定義のあとに置く）
 mod read;
 mod revert;
+mod stream;
 
 pub use revert::Verdict;
 pub(crate) use revert::verify_version;
@@ -683,6 +684,29 @@ struct Prepared {
     media: Media,
     encoded: EncodedStamp,
     warnings: Vec<String>,
+}
+
+/// 段 0 で決めたもの（流して書く道 `prepare_stream` に渡す）。
+struct Decided<'a> {
+    mode: Mode,
+    item_id: i64,
+    base: Base,
+    doc: Digest,
+    names: Option<(String, String)>,
+    graph: &'a Graph,
+    head: Head,
+    original: OriginalFile,
+    source_format: &'static str,
+    opts: DecodeOptions,
+    found: Option<Anchor>,
+    out_format: String,
+    enc_opts: serde_json::Value,
+    /// 出力の拡張子の候補の最初（staging の名前）。
+    ext0: &'static str,
+    limits: Limits,
+    may_make_anchor: bool,
+    runtime: Arc<crate::edit::EngineRuntime>,
+    codecs: Arc<kura_engine::codec::CodecSet>,
 }
 
 /// 予告のトランザクションで決めたこと。
@@ -906,6 +930,32 @@ impl EditHandler {
             .decoders_for(source_format)
             .iter()
             .any(|d| !d.reproducible());
+        // 音声で、出力の形式の書き手が流して書けるなら、値に組まずに流して書く（M13 段 3。save/stream.rs）
+        if stream::applies(&codecs, head.kind, &out_format) {
+            return self.prepare_stream(
+                ctx,
+                Decided {
+                    mode,
+                    item_id,
+                    base,
+                    doc,
+                    names,
+                    graph: &graph,
+                    head,
+                    original,
+                    source_format,
+                    opts,
+                    found,
+                    out_format,
+                    enc_opts,
+                    ext0: desc.exts.first().copied().unwrap_or("bin"),
+                    limits,
+                    may_make_anchor,
+                    runtime: runtime.clone(),
+                    codecs: codecs.clone(),
+                },
+            );
+        }
 
         // 1・2. 形をヘッダから読み、計画を作って予算を確保し、読む（アンカーがあればアンカーから。使えなければ元を記録の
         // デコーダで読み直す。OS のデコーダを通りうるなら、見出しを読む前から読み終えるまで `decoding` の印を保つ。read.rs）
@@ -1111,6 +1161,202 @@ impl EditHandler {
                 out_format,
                 value_digest,
                 media,
+                encoded,
+                warnings,
+            },
+            staging,
+        )))
+    }
+
+    /// 段 0〜5 の流して書く道（M13 段 3。音声）：遅延の入力から計画の出力を窓ごとに描いて流して書く（save/stream.rs）。
+    /// 一時停止で止めるときは作業用の PCM を残す印を立てる（再開は初めから。残っているものを使い回す）。
+    fn prepare_stream(
+        &self,
+        ctx: &JobContext,
+        d: Decided<'_>,
+    ) -> Result<Flow<(Prepared, Staging)>> {
+        let mut work: Option<crate::edit::work_pcm::WorkHandle> = None;
+        let r = self.prepare_stream_in(ctx, d, &mut work);
+        if matches!(r, Ok(Flow::Stop(JobEnd::Paused)))
+            && let Some(w) = work.as_mut()
+        {
+            w.retain_on_drop();
+        }
+        r
+    }
+
+    fn prepare_stream_in(
+        &self,
+        ctx: &JobContext,
+        d: Decided<'_>,
+        work: &mut Option<crate::edit::work_pcm::WorkHandle>,
+    ) -> Result<Flow<(Prepared, Staging)>> {
+        let library = ctx.library();
+        let layout = library.layout();
+        let job = ctx.id();
+        let mon = JobMonitor(ctx);
+        let (runtime, codecs) = (d.runtime.as_ref(), d.codecs.as_ref());
+        let original_path = layout.content_path(&d.original.hash, &d.original.ext);
+        let cx = stream::StreamCx {
+            ctx,
+            runtime,
+            codecs,
+            engine: &self.engine,
+            layout,
+            original: &original_path,
+            original_hash: d.original.hash,
+            format: d.source_format,
+            opts: &d.opts,
+            limits: &d.limits,
+            mon: &mon,
+        };
+        // 進捗の重み：入力 1（作業用のファイル 1・照らしの回 0.5）、書く回 × 1、昇格の照らし 0.5、R2 の読み直し 0.25
+        let probe = Shape::Audio {
+            rate: 48_000,
+            channels: 2,
+            frames: Dim::Exact(48_000),
+        };
+        let rounds = codecs
+            .encoder(&d.out_format, &probe)
+            .map_or(1, |e| e.stream_passes(&d.out_format, &d.enc_opts));
+        let promote_weight = if d.may_make_anchor && d.found.is_none() {
+            0.5
+        } else {
+            0.0
+        };
+        let mut passes = stream::Passes::new(ctx, 1.0 + f64::from(rounds) + promote_weight + 0.25);
+        ctx.progress(0.05, "元の大きさを確かめています");
+        let mut warnings: Vec<String> = Vec::new();
+        // 1. 入力
+        let input =
+            match stream::read_input(&cx, d.found.clone(), &mut warnings, &mut passes, work)? {
+                Flow::Go(input) => input,
+                Flow::Stop(end) => return Ok(Flow::Stop(end)),
+            };
+        // 2. 計画（遅延の値の形で）と予算
+        let shape = input.value.shape();
+        let shapes = BTreeMap::from([(InputId(0), shape)]);
+        let plan = runtime
+            .bulk(|e| e.compile(d.graph, &shapes))
+            .map_err(|issues| CoreError::Invalid(format!("文書を描けません：{issues}")))?;
+        let out_shape = plan
+            .output_shapes()
+            .first()
+            .map(|(_, s)| *s)
+            .ok_or_else(|| CoreError::Invalid("文書に出力がありません".into()))?;
+        if !codecs.encode_streams(&d.out_format, &out_shape) {
+            return Err(CoreError::Unsupported(format!(
+                "この結果は {} に書けません（保存する形式を選び直してください。既定は Ogg Vorbis）",
+                d.out_format
+            )));
+        }
+        let promote =
+            matches!(input.anchor, AnchorUse::None) && anchor::needs_anchor(&input.decoded);
+        let tasks = runtime.bulk_threads() as u64;
+        let promote_need = if promote {
+            stream::verify_bytes(&shape, tasks, 32 << 20)
+        } else {
+            0
+        };
+        let spec = EstimateSpec::new(0)
+            .stream(OutputId(0))
+            .digests(true)
+            .input(
+                InputId(0),
+                Source::Lazy {
+                    resident: input.resident,
+                },
+            )
+            .output(
+                OutputId(0),
+                Sink::Encode {
+                    codecs,
+                    format: &d.out_format,
+                    opts: &d.enc_opts,
+                },
+            );
+        let (_estimate, lease) = go!(
+            ctx,
+            "保存のメモリを確保できません",
+            runtime.admit_bulk_with(&plan, spec, |_| promote_need, &mon)
+        );
+        // 3. アンカーの昇格（Platform・External で読んだ作業用のファイルを、写して照らす）
+        let mut staging = Staging::default();
+        std::fs::create_dir_all(layout.staging_dir())?;
+        let anchor_use = if promote {
+            ctx.progress(0.35, "元の読み取りを残しています");
+            let w = work.as_ref().ok_or_else(|| {
+                CoreError::Invalid("再現しない読みなのに作業用のファイルがありません".into())
+            })?;
+            let a = match stream::promote(&cx, w, &input.decoded, job, &mut staging)? {
+                Flow::Go(a) => a,
+                Flow::Stop(end) => return Ok(Flow::Stop(end)),
+            };
+            passes.finish(promote_weight);
+            a
+        } else {
+            passes.finish(promote_weight);
+            input.anchor.clone()
+        };
+        // 4. 描いて書く
+        let out_part = layout
+            .staging_dir()
+            .join(format!("edit-{job}-out.{}.part", d.ext0));
+        staging.add(out_part.clone());
+        let written = match stream::write_output(
+            &cx,
+            &plan,
+            &input,
+            &d.out_format,
+            &d.enc_opts,
+            &out_part,
+            &passes,
+            f64::from(rounds),
+            rounds,
+        )? {
+            Flow::Go(w) => w,
+            Flow::Stop(end) => return Ok(Flow::Stop(end)),
+        };
+        passes.finish(f64::from(rounds));
+        drop(lease);
+        // 5. R2：書いたものを 1 回読んで、台帳の BLAKE3 と書き出しの記録のダイジェストを取る
+        ctx.progress(0.92, "書いたものを確かめています");
+        let (out_hash, file_digest, out_size) = match stream::hash_part(&out_part, &mon) {
+            Ok(h) => h,
+            Err(CoreError::Canceled) => match stop_end(ctx) {
+                Some(end) => return Ok(Flow::Stop(end)),
+                None => return Err(CoreError::Canceled),
+            },
+            Err(e) => return Err(e),
+        };
+        warnings.extend(written.warnings);
+        let encoded = written.encoded.stamp(file_digest);
+        if let Some(stop) = self.after_written(ctx, &mut staging) {
+            return stop;
+        }
+        Ok(Flow::Go((
+            Prepared {
+                job,
+                mode: d.mode,
+                item_id: d.item_id,
+                base: d.base,
+                act: Act::Edit {
+                    doc: d.doc,
+                    names: d.names,
+                },
+                kind: d.head.kind,
+                ext_hint: d.head.ext,
+                original: d.original,
+                source_format: d.source_format.to_string(),
+                opts: d.opts,
+                decoded: input.decoded,
+                anchor: anchor_use,
+                out_part,
+                out_hash,
+                out_size,
+                out_format: d.out_format,
+                value_digest: written.encoded.value_digest,
+                media: media_of(&out_shape),
                 encoded,
                 warnings,
             },

@@ -71,6 +71,8 @@ impl From<CoreError> for AppError {
             CoreError::Busy(_) => AppErrorCode::Busy,
             // 作業用の PCM（M13 段 2）を書く前の空きの見積もりが足りない
             CoreError::NoSpace { .. } => AppErrorCode::NoSpace,
+            // 中止した（M13 段 3。ジョブの中の誤りで、ふつうはコマンドに届かない。エディタの中止と同じく競合として返す）
+            CoreError::Canceled => AppErrorCode::Conflict,
             CoreError::Io(_) => AppErrorCode::Io,
             CoreError::Db(_) | CoreError::Json(_) | CoreError::DbClosed => AppErrorCode::Db,
             CoreError::ToolMissing(_) => AppErrorCode::ToolMissing,

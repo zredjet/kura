@@ -136,7 +136,11 @@ fn trip<P>(
 
 /// OS のデコーダを通りうる読み（`platform`）なら、`f` の前に途中経過の `decoding` を真にしてコミットし、`f` が落ちずに終われば
 /// （失敗・止めるときも）偽に戻す。
-fn while_decoding<T>(ctx: &JobContext, platform: bool, f: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(super) fn while_decoding<T>(
+    ctx: &JobContext,
+    platform: bool,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     if !platform {
         return f();
     }

@@ -10,6 +10,11 @@
 //! - ディスクの空き：要る量（ヘッダ 84 ＋ 形の上限の標本 ＋ メタデータの上限 16 MiB ＋ 余裕 1 GiB）より空きが少なければ、
 //!   書く前に `CoreError::NoSpace`。空きは置き場の存在するいちばん近い祖先で測る（置き場は最初に書くまでない）。空きが
 //!   分からなければ確かめない。書く途中の ENOSPC は `CoreError::Io`（`is_no_space`）。
+//! - 中止（`mon` の中止・デコーダの `Canceled`）は `CoreError::Canceled`（ジョブは一時停止・中止の止め方に写す。M13 段 3）。
+//!   書きかけの `.part` は消す。
+//! - 作る段の見積もり（計画なし）は [`ensure_estimate`]：実際に読む段のデコーダの流れの作業領域（`CodecSet::shape_path_staged`
+//!   で形を読めた段の `stage_stream_work_bytes`）＋ 窓の作業列 ＋ 値のダイジェスト ＋ 書き手の作業列。呼び手は段ごとに確保し
+//!   直し、形を読めた段で流して読む（`decode` 閉包に `decode_stream_with_path(段の識別子)`。M13 段 2 の検証の直し）。
 //! - 寿命は参照の数で決める：[`WorkHandle`] を落とすと減り、0 になったら、残す印（[`WorkHandle::retain_on_drop`]。一時停止
 //!   した保存）がなければすぐ消し、あれば残す期限（30 分）まで残す。残すものの合計は min(8 GiB, 空き / 4) までで、古い順に
 //!   消す（[`WorkPcmStore::sweep`]。GC のジョブの終わりにも呼ぶ）。ライブラリを閉じるときは全部消す（[`WorkPcmStore::clear`]）。
@@ -44,6 +49,29 @@ const SPARE: u64 = 1 << 30;
 const HEADER: u64 = 44 + 40;
 /// アンカーのヘッダ（メタデータ）の上限の見込み。
 const META: u64 = 16 << 20;
+
+/// 作業用の PCM を作る段の見積もり（計画なし。M13 段 3。docs/editing.md §12.10）：実際に読む段のデコーダの流れの作業領域
+/// `decoder_work`（`CodecSet::stage_stream_work_bytes`。読み手が持つ埋め込みの画像などを含む）＋ 窓の作業列（デコードの窓）
+/// ＋ 値のダイジェスト（一括のプールの仕事 `tasks` 個）＋ 書き手の作業列（`F32WavWriter::work_bytes`）。長さが上限しか
+/// 分からない形は上限で数える。
+pub fn ensure_estimate(decoder_work: u64, shape: &Shape, tasks: u64) -> u64 {
+    let Shape::Audio {
+        channels, frames, ..
+    } = *shape
+    else {
+        return u64::MAX;
+    };
+    decoder_work
+        .saturating_add(kura_engine::codec::stream::stream_window_bytes(
+            usize::from(channels),
+            frames.max(),
+        ))
+        .saturating_add(kura_engine::audio::digest::PcmTreeDigest::work_bytes(
+            usize::from(channels),
+            tasks,
+        ))
+        .saturating_add(F32WavWriter::<File>::work_bytes())
+}
 
 /// 作業用の PCM の鍵（元の中身・形式・読み方・デコーダ）。
 #[derive(Debug, Clone, PartialEq)]
@@ -328,7 +356,7 @@ impl WorkPcmStore {
         let mut writer = F32WavWriter::new(file);
         let decoded = decode(&mut writer).map_err(engine_err)?;
         if mon.canceled() {
-            return Err(CoreError::Invalid("中止しました".into()));
+            return Err(CoreError::Canceled);
         }
         let end = writer
             .stream_end()
@@ -438,7 +466,7 @@ fn engine_err(e: EngineError) -> CoreError {
         EngineError::Io(io) => CoreError::Io(io),
         EngineError::Limit(m) => CoreError::TooLarge(m),
         EngineError::Unsupported(m) => CoreError::Unsupported(m),
-        EngineError::Canceled => CoreError::Invalid("中止しました".into()),
+        EngineError::Canceled => CoreError::Canceled,
         other => CoreError::Invalid(format!("作業用の PCM を作れませんでした: {other}")),
     }
 }
@@ -599,6 +627,65 @@ mod tests {
         assert!(seen.len() == 1 && seen[0].ends_with(".part"), "{seen:?}");
         assert!(files(&dir).is_empty(), "{:?}", files(&dir));
         assert!(store.find(&key(3)).is_none());
+    }
+
+    /// M13 段 3：中止（デコーダの `Canceled`・読み終えたあとの `mon` の中止）は `CoreError::Canceled`（ジョブが止め方に写す）。
+    /// 書きかけの .part は残らない。
+    #[test]
+    fn cancel_is_reported_as_canceled() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("pcm");
+        let store = WorkPcmStore::new(dir.clone(), None);
+        let set = CodecSet::pinned();
+        let path = fixture("flac-24.flac");
+        let bound = shape(&set, &path);
+        // デコーダが中止を返す
+        let r = store.ensure(
+            &key(4),
+            &bound,
+            AnchorContext::default(),
+            |_| Err(EngineError::Canceled),
+            &Limits::default(),
+            &NoMonitor,
+        );
+        assert!(matches!(r, Err(CoreError::Canceled)), "{:?}", r.err());
+        // 読み終えたあとに中止を頼まれていた
+        let stop = kura_engine::monitor::CancelFlag::default();
+        stop.cancel();
+        let r = store.ensure(
+            &key(4),
+            &bound,
+            AnchorContext::default(),
+            |sink| {
+                set.decode_stream_path(
+                    &path,
+                    "flac",
+                    &DecodeOptions::default(),
+                    &Limits::default(),
+                    sink,
+                    &NoMonitor,
+                )
+            },
+            &Limits::default(),
+            &stop,
+        );
+        assert!(matches!(r, Err(CoreError::Canceled)), "{:?}", r.err());
+        assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+    }
+
+    /// 作る段の見積もりは、デコーダの作業領域 ＋ 窓 ＋ ダイジェスト ＋ 書き手で、長さによらない（60 分と 3 時間の差が窓の
+    /// 分まで）。
+    #[test]
+    fn ensure_estimate_does_not_grow_with_length() {
+        let shape = |minutes: u64| Shape::Audio {
+            rate: 48_000,
+            channels: 2,
+            frames: kura_engine::Dim::Exact(48_000 * 60 * minutes),
+        };
+        let one = ensure_estimate(4 << 20, &shape(60), 3);
+        let three = ensure_estimate(4 << 20, &shape(180), 3);
+        assert_eq!(one, three);
+        assert!(one > (4 << 20) + 8 * (1 << 20) && one < 32 << 20, "{one}");
     }
 
     /// 空きが足りなければ、書く前に NoSpace（ファイルを作らない）。
