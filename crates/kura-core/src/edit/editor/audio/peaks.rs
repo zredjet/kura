@@ -7,7 +7,9 @@
 //! - **土台**（開くとき）：頭が元（版 0）・入力の記録の値のダイジェストが事実の行と同じ・出力に量子化がない、をすべて満たせば、
 //!   ライブラリの解析の段のファイル（`peaks/ab/<hash>.peaks`）を最初の世代として公開し、空の文書から今の文書までに変わった区間
 //!   （`Engine::delta`）を `dirty` にする（手を当てていなければ空で、開いた瞬間に概観が出る）。下書きから開いて `dirty` が
-//!   空でなければ、土台は手の前の波形を出す仮の段（`pending`）で、直し終えたら新しい世代で公開する。ほかは全体を作る。
+//!   空でなければ、土台は手の前の波形を出す仮の段（`pending`）で、直し終えたら新しい世代で公開する。ライブラリの段は解析の
+//!   ジョブの引数（`analysis::plan::peaks_params(frames)`）なので、約 22 秒を超える音声では粗い段だけ：それを仮の段として
+//!   出し（`peaks.bins` は持っている段だけ）、部分更新の元にはせず全体を作る。ほかは全体を作る。
 //! - **手のあと**：表示の変わった区間を `dirty` に足す（レート・チャンネルが変われば全体。長さの変化は `PeaksPatch` が尾を足す）。
 //! - **直す**（[`Editor::advance_peaks`]。操作中は何もしない）：`PeaksPatch` を作り、R のうち表示の値で有効なチャンクは写さずに
 //!   渡し、残りが [`PEAKS_SYNC_FRAMES`] 以下なら流して直す。それを超える分は、`edit_view { work: true }` のたびに
@@ -156,8 +158,9 @@ pub struct PeaksInfo {
 }
 
 impl PeaksJob {
-    /// 土台（ライブラリの段。変わりうる区間つき）から始める（土台は最初の世代として公開する。`dirty` が空でなければ
-    /// 仮の段）。土台がなければ全体を作る。
+    /// 土台（ライブラリの段。変わりうる区間つき）から始める。土台は最初の世代として公開する（`dirty` が空でなければ
+    /// 直し終えるまでの仮の段）。段がすべてそろっていない土台（長い音声のライブラリの粗い段だけ）は仮の段として出すだけで、
+    /// 部分更新の元にはしない（全体を作る）。土台がなければ全体を作る。
     pub(crate) fn new(base: Option<(Arc<Peaks>, Dirty)>) -> Self {
         let params = PeaksParams::default();
         let mut job = Self {
@@ -173,8 +176,10 @@ impl PeaksJob {
             skip_next: true,
         };
         if let Some((peaks, dirty)) = base {
-            job.done = Some(peaks.clone());
-            job.dirty = dirty;
+            if form_of(&peaks).3 == params.bins() {
+                job.done = Some(peaks.clone());
+                job.dirty = dirty;
+            }
             job.publish(peaks);
         }
         job
@@ -443,7 +448,14 @@ impl Editor {
     }
 }
 
-/// ライブラリの解析の段のファイルを土台として読む（引数の段・入力の形と合わなければ None）。
+/// ライブラリの解析のジョブが長さ `frames` の音声に書く段の引数（`analysis::plan::peaks_params`。約 22 秒（256 × 4,096
+/// フレーム）を超えると、細かい段を書かない）。
+fn library_params(frames: u64) -> Option<PeaksParams> {
+    serde_json::from_value(crate::analysis::plan::peaks_params(frames)).ok()
+}
+
+/// ライブラリの解析の段のファイルを土台として読む。段の並びがエディタの段（`PeaksParams::default()`）か、解析のジョブが
+/// その長さに書く段（[`library_params`]。既定の段の列の後ろ寄りの一部）で、入力の形と同じときだけ。ほかは None。
 pub(crate) fn read_base(
     path: &std::path::Path,
     rate: u32,
@@ -453,11 +465,9 @@ pub(crate) fn read_base(
     let bytes = std::fs::read(path).ok()?;
     let p = Peaks::from_canonical(&bytes).ok()?;
     let bins: Vec<u32> = p.levels.iter().map(|l| l.bin).collect();
-    (bins == PeaksParams::default().bins()
-        && p.rate == rate
-        && p.channels == channels
-        && p.frames == frames)
-        .then(|| Arc::new(p))
+    let known = bins == PeaksParams::default().bins()
+        || library_params(frames).is_some_and(|l| bins == l.bins());
+    (known && p.rate == rate && p.channels == channels && p.frames == frames).then(|| Arc::new(p))
 }
 
 /// 波形の段のタイルの並び（リトルエンディアン。`crates/kura-core/tests/vectors/edit/peaks_tile.json` が正）：

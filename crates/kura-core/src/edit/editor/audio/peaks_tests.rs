@@ -14,7 +14,9 @@ use serde_json::json;
 
 use super::peaks::{serve_peaks, tile_bytes};
 use super::session_tests::*;
-use crate::edit::editor::{AudioViewport, OpenRequest, Step, TileError, Viewport, open};
+use crate::edit::editor::{
+    AudioViewInfo, AudioViewport, OpenRequest, Step, TileError, Viewport, open,
+};
 use crate::library::Library;
 
 fn peaks_of(a: &kura_engine::value::Audio) -> Peaks {
@@ -35,8 +37,14 @@ fn published(env: &Env, s: &str, rev: u64) -> Arc<Peaks> {
     env.editor(s).published_peaks(rev).unwrap()
 }
 
-/// 裏の仕事を、終わるまで頼み直す（`work: true`）。何回頼んだか。
+/// 裏の仕事を、終わるまで頼み直す（`work: true`）。段の世代と、何回頼んだか。
 fn work_until_done(env: &Env, s: &str) -> (u64, usize) {
+    let (info, i) = work_until_done_info(env, s);
+    (info.peaks.rev.unwrap(), i)
+}
+
+/// 裏の仕事を、終わるまで頼み直す（`work: true`）。終えた表示の情報と、何回頼んだか。
+fn work_until_done_info(env: &Env, s: &str) -> (AudioViewInfo, usize) {
     let vp = Viewport::Audio(AudioViewport {
         visible: Some((0, 10)),
         ..AudioViewport::idle()
@@ -46,11 +54,28 @@ fn work_until_done(env: &Env, s: &str) -> (u64, usize) {
         let info = shown_audio(&out.view);
         if !info.peaks.pending {
             assert!(!info.work);
-            return (info.peaks.rev.unwrap(), i);
+            return (info.clone(), i);
         }
         assert!(info.work, "直している間は work");
     }
     panic!("波形の段が終わりません");
+}
+
+/// ライブラリの解析のジョブが書く段（引数は `analysis::plan::peaks_params(frames)`。256 × 4,096 = 1,048,576 フレームを
+/// 超えると、細かい段がない）。
+fn library_peaks_of(a: &kura_engine::value::Audio) -> Peaks {
+    let limits = Limits::default();
+    let params: PeaksParams =
+        serde_json::from_value(crate::analysis::plan::peaks_params(a.frames() as u64)).unwrap();
+    compute(
+        a,
+        &params,
+        &AnalyzeCx {
+            mon: &NoMonitor,
+            limits: &limits,
+        },
+    )
+    .unwrap()
 }
 
 /// A8：短い音声は手の中で直し、公開した段は出力を `compute` したものと同じ。変わった区間はチャンクに揃う。
@@ -223,15 +248,26 @@ fn place_analysis(lib: &Library, id: i64, bytes: &[u8], peaks: &Peaks) {
         .unwrap();
 }
 
-/// A9：手を当てていない元はライブラリの解析の段をそのまま土台にし（開いた瞬間に出る）、全体に効く手で作り直す。
+/// A9：手を当てていない元はライブラリの解析の段を土台にし、開いた瞬間に出す。長い音声のライブラリの段（解析のジョブの
+/// 引数 `peaks_params(frames)`）は粗い段だけなので、それを仮の世代として出し（`bins` は持っている段だけ・pending）、
+/// 細かい段は裏の仕事で全体を作ってから新しい世代で出す。全体に効く手で作り直す。
 #[test]
 fn library_peaks_are_the_base() {
     let env = Env::new();
+    // 256 × 4,096 = 1,048,576 フレームを超える（ライブラリに 256・1,024 の段がない）
     let frames = 130 * C + 5;
     let bytes = noise_wav(8_000, 1, frames, 33);
     let id = add_audio(&env.lib, &bytes, "wav");
     let original = rendered(&bytes, "wav", &Graph::new_single());
-    let lib_peaks = peaks_of(&original);
+    let lib_peaks = library_peaks_of(&original);
+    let coarse: Vec<u32> = lib_peaks.levels.iter().map(|l| l.bin).collect();
+    assert_eq!(coarse, vec![4_096, 16_384, 65_536], "解析のジョブが書く段");
+    let full = peaks_of(&original);
+    assert_eq!(
+        lib_peaks.levels[..],
+        full.levels[2..],
+        "粗い段は全段の同じ段と同じ"
+    );
     place_analysis(&env.lib, id, &bytes, &lib_peaks);
     let opened = env.open_with(
         id,
@@ -243,8 +279,30 @@ fn library_peaks_are_the_base() {
     assert!(opened.source.audio.as_ref().unwrap().lazy);
     let s = opened.session.clone();
     let info = shown_audio(&opened.outcome.view);
-    assert!(!info.peaks.pending, "土台がそのまま使える");
-    assert_eq!(*published(&env, &s, info.peaks.rev.unwrap()), lib_peaks);
+    assert!(info.peaks.pending, "細かい段は裏で作る");
+    assert_eq!(info.peaks.bins, coarse, "持っている段だけを示す");
+    assert_eq!(
+        (info.peaks.rate, info.peaks.channels, info.peaks.frames),
+        (8_000, 1, frames)
+    );
+    let g0 = info.peaks.rev.expect("開いた瞬間に粗い段が出る");
+    assert_eq!(*published(&env, &s, g0), lib_peaks);
+    assert!(serve_peaks(&env.engine, &s, g0, 4_096, 0).is_ok());
+    assert!(matches!(
+        serve_peaks(&env.engine, &s, g0, 256, 0),
+        Err(TileError::NotFound(_))
+    ));
+    let (done, _) = work_until_done_info(&env, &s);
+    let g1 = done.peaks.rev.unwrap();
+    assert!(g1 > g0, "全段は新しい世代");
+    assert_eq!(done.peaks.bins, vec![256, 1_024, 4_096, 16_384, 65_536]);
+    assert_eq!(done.peaks.changed, crate::edit::editor::ChangedSpans::All);
+    assert_eq!(*published(&env, &s, g1), full);
+    assert_eq!(
+        *published(&env, &s, g0),
+        lib_peaks,
+        "仮の段は直前として残る"
+    );
     // 操作を足す手は、エンジンの推論が保守的に全体を返すので裏で作り直す
     let idle = Viewport::Audio(AudioViewport {
         work: false,
@@ -318,6 +376,46 @@ fn library_peaks_are_the_base() {
     let opened = env.open(oid);
     let info = shown_audio(&opened.outcome.view);
     assert_eq!(info.peaks.frames, 2 * C, "土台を使わずに作った");
+}
+
+/// A9：長い音声の下書き（手のある文書）から開くと、ライブラリの粗い段（手の前の波形）を仮の世代で出し、裏の仕事で全体を
+/// 作り直して新しい世代で出す。同じ世代のタイルは変わらず、直し終えた段はその rev の出力の `compute`。
+#[test]
+fn long_draft_shows_the_library_peaks_until_rebuilt() {
+    let env = Env::new();
+    let frames = 130 * C + 5;
+    let bytes = noise_wav(8_000, 1, frames, 37);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let lib_peaks = library_peaks_of(&rendered(&bytes, "wav", &Graph::new_single()));
+    place_analysis(&env.lib, id, &bytes, &lib_peaks);
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -6.0 }), 1)
+        .unwrap();
+    place_draft(&env.lib, id, &bytes, &g);
+    let opened = open_draft(
+        &env,
+        id,
+        Viewport::Audio(AudioViewport {
+            work: false,
+            ..AudioViewport::idle()
+        }),
+    );
+    let s = opened.session.clone();
+    let info = shown_audio(&opened.outcome.view).clone();
+    assert!(info.peaks.pending);
+    let g0 = info.peaks.rev.unwrap();
+    assert_eq!(info.peaks.bins, vec![4_096, 16_384, 65_536]);
+    assert_eq!(*published(&env, &s, g0), lib_peaks, "手の前の波形（仮）");
+    let mut seen = Generations::default();
+    seen.see(&env, &s, g0);
+    let (done, _) = work_until_done_info(&env, &s);
+    let g1 = done.peaks.rev.unwrap();
+    assert_ne!(g1, g0);
+    assert_eq!(
+        *published(&env, &s, g1),
+        peaks_of(&rendered(&bytes, "wav", &g))
+    );
+    seen.see(&env, &s, g1);
 }
 
 /// 公開した段のタイルをすべて（`/edit/{s}/{gen}/peaks/{bin}/{tile}` の中身。段の世代の今か直前でなければ None）。
@@ -399,7 +497,9 @@ fn draft_base_is_provisional_and_generations_never_change() {
     let frames = 3 * C + 17;
     let bytes = noise_wav(8_000, 1, frames, 36);
     let id = add_audio(&env.lib, &bytes, "wav");
-    let lib_peaks = peaks_of(&rendered(&bytes, "wav", &Graph::new_single()));
+    // 短い音声のライブラリの段は全段（解析のジョブの引数がエディタと同じ）なので、部分更新の元にもなる
+    let lib_peaks = library_peaks_of(&rendered(&bytes, "wav", &Graph::new_single()));
+    assert_eq!(lib_peaks.levels.len(), 5);
     place_analysis(&env.lib, id, &bytes, &lib_peaks);
     let mut g = Graph::new_single();
     g.push_linear("audio.gain", 1, json!({ "db": -6.0 }), 1)
