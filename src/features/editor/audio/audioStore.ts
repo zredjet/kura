@@ -681,27 +681,39 @@ export function followLoopAudition(): void {
   if (rt) followLoop(rt);
 }
 
-/** 形が変わった（レート・長さ）：元を通して位置を写し、止めてから始め直す。 */
+/**
+ * 形が変わった（レート・長さ・チャンネル数）：元を通して位置を写し、止めてから始め直す。写せない・始め直せない（3 kHz
+ * 未満など）なら止めて（始め直せなければ知らせ）、先読みの区間を外す。
+ */
 function restartAfterReshape(rt: AudioRuntime, prev: EditAudioView, view: EditAudioView): void {
   const pos = rt.player.position();
   const src = pos === null ? null : toSource(pos, prev.sourceMap);
   const next = src === null ? null : fromSource(src, view.sourceMap);
   const s = useAudioStore.getState();
-  if (next === null || next >= view.frames) {
+  const halt = () => {
     rt.player.stop();
+    rt.controller.setPlaybackSpans([]);
     rt.patch.play = IDLE_PLAY;
+  };
+  if (next === null || next >= view.frames) {
+    halt();
     return;
   }
   const loop = s.play.mode === 'loop' ? (s.local?.loop ?? view.loop) : null;
   const end =
     s.play.mode === 'selection' && s.selection ? Math.min(view.frames, s.selection.end) : null;
-  rt.player.play({
+  const out = rt.player.play({
     from: next,
     end,
     loop,
     source: 'edited',
     info: { rate: view.rate, channels: view.channels, frames: view.frames },
   });
+  if (out !== 'playing') {
+    // play が断るのはレートが鳴らせないときだけ（3〜384 kHz の外・文脈を作れない）
+    halt();
+    notify(t.rateUnsupported(String(view.rate)));
+  }
 }
 
 /** 終わりまで鳴った（選択だけなら、カーソルは動かさない）。 */

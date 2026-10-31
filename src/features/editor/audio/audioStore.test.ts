@@ -4,6 +4,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ja } from '../../../i18n/ja';
 import {
   type EditAudioView,
   type EditStatusDto,
@@ -16,6 +17,7 @@ import {
 import type { ItemSummaryDto } from '../../../ipc/items';
 import { editPcmUrl } from '../../../ipc/media';
 import { ContextPool } from '../../../lib/assetAudio';
+import { useNoticeStore } from '../../../stores/noticeStore';
 import { fakeFactory } from '../../../test/fakeAudio';
 import { type AudioRuntime, setAudioRuntimeForTest } from '../../asset/audioRuntime';
 import { playerController } from '../../player/playerActions';
@@ -178,6 +180,7 @@ beforeEach(() => {
     active: false,
     snapshot: { ...usePlayerStore.getState().snapshot, playing: false },
   });
+  useNoticeStore.setState({ message: null });
 });
 
 afterEach(async () => {
@@ -373,6 +376,57 @@ describe('編集中の試聴と排他', () => {
     audioPlayer()?.tick();
     expect(audioPlayer()?.playing).toBe(false);
     expect(useAudioStore.getState().play.status).toBe('idle');
+  });
+
+  it('形が変わって始め直せない（3 kHz 未満・写せない）ときは止めて知らせ、先読みの区間を外す', async () => {
+    await open();
+    togglePlay();
+    await deliver(0);
+    const c = audioController();
+    const ctx = factory.contexts[0];
+    if (!c || !ctx) throw new Error('面・文脈がない');
+    expect(c.viewport().spans.length).toBeGreaterThan(0);
+    ctx.currentTime += 0.2;
+    // 打っている途中の 2205 Hz の結果
+    const low = view({
+      rev: 2,
+      rate: 2205,
+      frames: 4410,
+      valid: [{ start: 0, end: 4410 }],
+      changed: { type: 'all' },
+      sourceMap: [{ outStart: 0, outEnd: 4410, inStart: 0, inRate: 48_000, outRate: 2205 }],
+    });
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(low));
+    pushEditorSteps([{ type: 'undo' }]);
+    await flush();
+    expect(audioPlayer()?.playing).toBe(false);
+    expect(useAudioStore.getState().play.status).toBe('idle');
+    expect(useNoticeStore.getState().message).toBe(ja.editor.audio.rateUnsupported('2205'));
+    expect(c.viewport().spans).toEqual([]);
+    // Space で鳴らし始められる（止まった状態から）
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(view({ rev: 3, changed: { type: 'all' } })));
+    pushEditorSteps([{ type: 'undo' }]);
+    await flush();
+    togglePlay();
+    expect(audioPlayer()?.playing).toBe(true);
+    // 頭を切り詰めて今の位置を写せない：止めて先読みの区間を外す
+    await deliver(0);
+    ctx.currentTime += 0.5;
+    const cut = view({
+      rev: 4,
+      frames: 48_000,
+      valid: [{ start: 0, end: 48_000 }],
+      changed: { type: 'all' },
+      sourceMap: [
+        { outStart: 0, outEnd: 48_000, inStart: 48_000, inRate: 48_000, outRate: 48_000 },
+      ],
+    });
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(cut));
+    pushEditorSteps([{ type: 'undo' }]);
+    await flush();
+    expect(audioPlayer()?.playing).toBe(false);
+    expect(useAudioStore.getState().play.status).toBe('idle');
+    expect(c.viewport().spans).toEqual([]);
   });
 
   it('ループの試聴は、欄・I/O・［選択をループにする］・⌘Z で替わったループ点に従い、消したら止まる', async () => {
