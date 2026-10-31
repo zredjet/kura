@@ -158,6 +158,19 @@ impl Stage {
         }
     }
 
+    /// `inner` と同じに読む、識別子 `id` の段（遅延の源で開く判定から外したいときなど）。
+    fn renamed(inner: Arc<dyn Decoder>, id: &'static str, format: &'static str) -> Self {
+        Self {
+            inner,
+            id,
+            format,
+            inner_format: format,
+            whole_shape: false,
+            refuse: None,
+            log: None,
+        }
+    }
+
     fn note(&self) {
         if let Some(log) = &self.log {
             log.note();
@@ -361,6 +374,53 @@ fn watched_env(budget: u64, log: &ShapeLog) -> Env {
             set
         }),
     }))
+}
+
+/// WAV を、固定の段の WAV と同じに読むが識別子の違う段（`plain-wav-dec/1`）だけで読むライブラリ（予算 `budget`）。遅延の源で
+/// 開かない（直接読めない形式と同じ道）ので、長い値を速く作って作業用のファイルの道を試せる。
+fn plain_wav_env(budget: u64) -> Env {
+    Env::with(Arc::new(Staged {
+        budget,
+        make: Box::new(|| {
+            let mut set = CodecSet::default();
+            set.add_decoder(Arc::new(Stage::renamed(
+                pinned_decoder("wav"),
+                "plain-wav-dec/1",
+                "wav",
+            )))
+            .unwrap();
+            set
+        }),
+    }))
+}
+
+/// 16 ビット・モノラルの WAV（`frames` フレーム。標本は (i mod 2000) − 1000）を手で書く（長い値を速く作る）。
+fn plain_wav_bytes(rate: u32, frames: u64) -> Vec<u8> {
+    let data = frames * 2;
+    let mut b = Vec::with_capacity(44 + data as usize);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&u32::try_from(36 + data).unwrap().to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&rate.to_le_bytes());
+    b.extend_from_slice(&(rate * 2).to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&u32::try_from(data).unwrap().to_le_bytes());
+    for i in 0..frames {
+        b.extend_from_slice(&(((i % 2000) as i16) - 1000).to_le_bytes());
+    }
+    b
+}
+
+/// 置き場の空きを `bytes` にする（空きを測る関数）。
+fn set_free(env: &Env, bytes: u64) {
+    env.engine.set_free_space(Some(
+        Arc::new(move |_: &Path| Some(bytes)) as Arc<crate::library::upgrade::FreeSpaceFn>
+    ));
 }
 
 /// A15：丸ごと読む上限を超える FLAC は作業用のファイルから遅延で開く。値・記録・指紋は丸ごと読んだものと同じで、閉じると
@@ -712,4 +772,91 @@ fn pcm_reads_the_shape_only_inside_the_budget() {
             "予算の外で形を読んだ（{frames} フレーム）：{seen:?}（ファイルは {len} バイト）"
         );
     }
+}
+
+/// 段 4B の検証の直し 3：試聴の `/pcm` で作業用のファイルを作れない（ディスクの空きが足りない）とき、丸ごと読む見積もりが
+/// 丸ごと読む上限を超えれば 507（「ディスクの空き容量が足りません…」）。作業用のファイル・覚えたもの・予算を残さない。
+#[test]
+fn pcm_without_disk_space_is_507_when_it_cannot_read_whole() {
+    let env = Env::with(Arc::new(Budgeted(SMALL)));
+    set_free(&env, 1 << 20);
+    let flac = long_flac(40 * C);
+    add_audio(&env.lib, &flac, "flac");
+    let dir = env.engine.work_pcm().dir().to_path_buf();
+    let hash = crate::library::hex(blake3::hash(&flac).as_bytes());
+    let root = env.lib.layout().root().to_path_buf();
+    let src = crate::serve::pcm_source(env.lib.layout(), &hash).unwrap();
+    let err = crate::asset::pcm::serve(&env.engine, &root, &hash, &src, 0, 10).unwrap_err();
+    assert_eq!(err.status(), 507, "{err}");
+    assert!(
+        matches!(&err, crate::asset::pcm::PcmError::NoSpace(m) if m.starts_with("ディスクの空き容量が足りません")),
+        "{err}"
+    );
+    assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+    assert!(env.engine.pcm_cache().cached().is_none());
+    assert_eq!(env.engine.pcm_cache().decodes(), 0);
+    assert_eq!(env.usage().interactive, 0);
+}
+
+/// 段 4B の検証の直し 3：試聴の `/pcm` で作業用のファイルを作れない（ディスクの空きが足りない）とき、丸ごと読む見積もりが
+/// 丸ごと読む上限に収まり、対話の枠で今すぐ確保できれば、M11 の丸ごと読みに落として鳴らす（応答は空きのあるライブラリの
+/// 作業用のファイルからのものとバイト列まで同じ）。確保できなければ 507。
+#[test]
+fn pcm_without_disk_space_falls_back_to_the_whole_read() {
+    // 予算 1 GiB：作業用のファイルの境は 64 MiB、丸ごと読む上限は 256 MiB。値は 64 MiB を少し超える
+    let budget = 1u64 << 30;
+    let frames = (64u64 << 20) / 4 + 4 * C;
+    let bytes = plain_wav_bytes(8_000, frames);
+    let hash = crate::library::hex(blake3::hash(&bytes).as_bytes());
+    let ranges = [(0, 10), (frames - 1_000, frames), (5 * C + 7, 9 * C)];
+    // 空きのあるライブラリ（作業用のファイルから。丸ごと読みと同じ値であることは A15）
+    let want: Vec<Vec<u8>> = {
+        let roomy = plain_wav_env(budget);
+        add_audio(&roomy.lib, &bytes, "wav");
+        let src = crate::serve::pcm_source(roomy.lib.layout(), &hash).unwrap();
+        let root = roomy.lib.layout().root().to_path_buf();
+        let got = ranges
+            .iter()
+            .map(|&(a, b)| {
+                crate::asset::pcm::serve(&roomy.engine, &root, &hash, &src, a, b).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            roomy.engine.work_pcm().usage().0,
+            1,
+            "作業用のファイルから読んだ"
+        );
+        got
+    };
+    let env = plain_wav_env(budget);
+    set_free(&env, 1 << 20);
+    add_audio(&env.lib, &bytes, "wav");
+    let dir = env.engine.work_pcm().dir().to_path_buf();
+    let src = crate::serve::pcm_source(env.lib.layout(), &hash).unwrap();
+    let root = env.lib.layout().root().to_path_buf();
+    let serve = |a: u64, b: u64| crate::asset::pcm::serve(&env.engine, &root, &hash, &src, a, b);
+    // 丸ごと読む分が空いていない：507（作業用のファイル・覚えたものを残さない）
+    let rt = env.engine.runtime().unwrap().clone();
+    let held = rt
+        .budget()
+        .try_acquire(budget - (100 << 20), Class::Interactive)
+        .unwrap()
+        .unwrap();
+    let err = serve(0, 10).unwrap_err();
+    assert_eq!(err.status(), 507, "{err}");
+    assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+    assert!(env.engine.pcm_cache().cached().is_none());
+    drop(held);
+    // 空いていれば丸ごと読む（作業用のファイルを作らない）
+    for (&(a, b), want) in ranges.iter().zip(&want) {
+        assert_eq!(&serve(a, b).unwrap(), want, "{a}-{b}");
+    }
+    assert_eq!(env.engine.pcm_cache().decodes(), 1, "1 回だけ読んだ");
+    assert!(env.engine.pcm_cache().work().is_none(), "丸ごと読んだ");
+    assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+    assert_eq!(
+        env.usage().interactive,
+        frames * 4,
+        "覚えている値の分だけを持ち続ける"
+    );
 }

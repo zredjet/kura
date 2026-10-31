@@ -37,6 +37,7 @@ use kura_engine::shape::Shape;
 use kura_engine::value::{Audio, AudioSource};
 use kura_engine::{EngineError, Limits, NoMonitor, Value};
 
+use crate::CoreError;
 use crate::edit::EngineServices;
 use crate::edit::editor::EditorError;
 use crate::edit::editor::audio::source::{self as audio_source, WorkRef};
@@ -94,19 +95,34 @@ pub enum PcmError {
     /// エンジンを使えない（ライブラリを開いていない・実行の場を作れない）。
     #[error("エンジンを使えません（{0}）")]
     Unavailable(String),
+    /// ディスクの空きが足りず、長い音声の作業用のファイルを作れない（丸ごと読みにも落とせない。M13 段 4B の検証の直し）。
+    /// 文言は「ディスクの空き容量が足りません…」で始まる。
+    #[error("{0}")]
+    NoSpace(String),
     /// 読めない・書けない。
     #[error("試聴の PCM を作れませんでした（{0}）")]
     Failed(String),
 }
 
 impl PcmError {
-    /// HTTP の状態（404・416・503・500）。
+    /// HTTP の状態（404・416・503・507・500）。
     pub fn status(&self) -> u16 {
         match self {
             Self::NotFound => 404,
             Self::OutOfRange { .. } | Self::TooLong { .. } => 416,
             Self::Busy(_) | Self::Unavailable(_) => 503,
+            Self::NoSpace(_) => 507,
             Self::Failed(_) => 500,
+        }
+    }
+
+    /// 作業用のファイルを作れなかった空きの不足（`CoreError::NoSpace`・ENOSPC の Io）から。
+    fn no_space(err: &CoreError) -> Self {
+        match err {
+            CoreError::NoSpace { .. } => Self::NoSpace(err.to_string()),
+            other => Self::NoSpace(format!(
+                "ディスクの空き容量が足りません。空きを作ってからやり直してください（{other}）"
+            )),
         }
     }
 }
@@ -546,11 +562,35 @@ impl Work<'_> {
         // 覚えるのは 1 件だけ：読む前に前のものを手放す（メモリと予算を返す）
         self.cache.clear();
         if shape.value_bytes() > audio_source::work_threshold(self.runtime.budget().total()) {
-            let handle = audio_source::make_work(&cx, shape, stage).map_err(work_failed)?;
-            return self.remember_work(handle, started);
+            return match audio_source::make_work(&cx, shape, stage) {
+                Ok(handle) => self.remember_work(handle, started),
+                Err(EditorError::Core(err)) if err.is_no_space() => {
+                    self.whole_without_space(&shape, len, &err)
+                }
+                Err(err) => Err(work_failed(err)),
+            };
         }
         let lease = acquire(self.runtime.budget(), self.whole_need(&shape, len))?;
         self.remember_whole(lease)
+    }
+
+    /// 作業用のファイルを作れない（ディスクの空きが足りない）とき：丸ごと読む見積もりが丸ごと読む上限（`whole_limit`）に
+    /// 収まり、対話の枠で今すぐ確保できれば M11 の丸ごと読みに落とす（ディスクを使わずに鳴らす）。落とせなければ 507。
+    fn whole_without_space(
+        &self,
+        shape: &Shape,
+        len: u64,
+        err: &CoreError,
+    ) -> Result<(Arc<Audio>, String), PcmError> {
+        let budget = self.runtime.budget();
+        let need = self.whole_need(shape, len);
+        if need <= audio_source::whole_limit(budget.total())
+            && let Ok(lease) = acquire(budget, need)
+        {
+            tracing::info!(%err, need, hash = self.hash, "作業用のファイルを作れないので、試聴の PCM の元を丸ごと読みます");
+            return self.remember_whole(lease);
+        }
+        Err(PcmError::no_space(err))
     }
 
     /// 丸ごと読む間の見積もり（値 ＋ ファイルから読む間の作業領域）。
