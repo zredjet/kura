@@ -24,7 +24,8 @@ Kura Library.kuralib/
                                 #   （staging/pcm/<元のハッシュ>-<鍵>.wav。アンカーの形の f32 WAV。DB に置かず、閉じるときに消す）も置く。
                                 #   M12 から、保存のジョブの書きかけ
                                 #   （staging/edit-<job>-out.<ext>.part・staging/edit-<job>-anchor.<png|wav>.part。sync_all してから
-                                #   files/ へ同じボリュームの中で改名する）も置く。開くときに消す
+                                #   files/ へ同じボリュームの中で改名する）も置く。M13 から、GC の照合の作り直しの書きかけ
+                                #   （staging/gc-<job>-verify-<版の id>.part。音声を流して書き、照らしたら消す）も置く。開くときに消す
   archives/                     # yt-dlp / gallery-dl の download-archive
   logs/                         # ジョブのログ
   backups/library-YYYYMMDD-HHMMSS.sqlite  # DB のバックアップ（UTC。新しい 7 個。FR-SYS-03・ADR-121。マイグレーションの前のものも同じ名前。§5）
