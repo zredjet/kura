@@ -182,8 +182,8 @@ fn fresh_params(handle: &Handle, frames: u64) -> Result<Json, EngineError> {
     ))
 }
 
-/// ハンドルの手を `Edit` にする（モジュールの説明）。`chain` は今の計画の時間の写しの連鎖、`output` は今の出力の形、`head` は
-/// 確定した頭の文書。
+/// ハンドルの手を `Edit` にする（モジュールの説明）。`chain` は時間の写しの連鎖（切り詰めは今の文書で対象を外した計画の
+/// もの、ほかは今の計画のもの）、`output` は今の出力の形、`head` は確定した頭の文書。
 pub fn handle_edit(
     e: &Engine,
     chain: &[TimeLink],
