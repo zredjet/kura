@@ -385,6 +385,104 @@ fn s20_long_audio_pause_restarts_and_reuses_the_work_file() {
     }
 }
 
+/// 割り込みの門：構えたあと、`at` が真になる段に初めて来たら、テストに知らせて「進め」を待つ（一度だけ。構え直せる）。
+struct Gate {
+    reached: mpsc::Receiver<()>,
+    go: mpsc::Sender<()>,
+    armed: Arc<AtomicBool>,
+}
+
+impl Gate {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// 門に来るのを待つ。
+    fn wait(&self) {
+        self.reached.recv_timeout(4 * WAIT).unwrap();
+    }
+
+    /// 門を開ける（止めた段から進める）。
+    fn open(&self) {
+        self.go.send(()).unwrap();
+    }
+}
+
+/// 割り込みの門つきの Env（コーデックの組は `codecs`）。
+fn gated_env(
+    codecs: Arc<Mutex<CodecSet>>,
+    at: impl Fn(Stage) -> bool + Send + Sync + 'static,
+) -> (Env, Gate) {
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let armed = Arc::new(AtomicBool::new(false));
+    let env = Env::setup(
+        Setup {
+            factory: FakeEngineFactory::with_codecs(codecs),
+            ..Setup::default()
+        },
+        {
+            let armed = armed.clone();
+            move |_| {
+                let (reached, go) = (Mutex::new(reached_tx), Mutex::new(go_rx));
+                Some(Arc::new(move |stage| {
+                    if at(stage) && armed.swap(false, Ordering::SeqCst) {
+                        reached.lock().unwrap().send(()).unwrap();
+                        let _ = go.lock().unwrap().recv();
+                    }
+                }))
+            }
+        },
+    );
+    (
+        env,
+        Gate {
+            reached: reached_rx,
+            go: go_tx,
+            armed,
+        },
+    )
+}
+
+/// 偽の Platform のデコーダ（opus）だけを足した組。
+fn opus_codecs(decoder: &Arc<FakePlatformDecoder>) -> Arc<Mutex<CodecSet>> {
+    let mut set = CodecSet::pinned();
+    set.add_decoder(decoder.clone()).unwrap();
+    Arc::new(Mutex::new(set))
+}
+
+/// 一時停止したまま中止した保存は、残していた作業用の PCM を消す（GC のジョブ・閉じるのを待たない。M13 段 3 の検証の
+/// 直し #5）。
+#[test]
+fn paused_then_canceled_save_removes_the_work_file() {
+    let decoder = opus_decoder(1, 2 * 65_536 + 11);
+    let (env, gate) = gated_env(opus_codecs(&decoder), |s| s == Stage::Written);
+    let (item, _) = add_audio(&env.lib, b"paused fake opus", "opus", "止めた声");
+    gate.arm();
+    let id = env.start(
+        item,
+        base_of(&env.lib, item),
+        SaveAction::Overwrite {
+            graph: audio_doc(-3.0, Some("wav")),
+        },
+    );
+    gate.wait();
+    env.jobs.pause(id).unwrap();
+    gate.open();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_eq!(env.jobs.get(id).unwrap().state, JobState::Paused);
+    assert_eq!(env.engine.work_pcm().usage().0, 1, "一時停止は残す");
+    env.jobs.cancel(id).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_eq!(env.jobs.get(id).unwrap().state, JobState::Canceled);
+    assert_eq!(
+        env.engine.work_pcm().usage(),
+        (0, 0),
+        "中止したら作業用の PCM を消す"
+    );
+    assert_consistent(&env.lib);
+}
+
 /// S23：流して書いた音声の版は、GC の照合（流して作り直して生の BLAKE3 を比べる）で一致して released になり、版に戻すと
 /// 流して作り直して同じバイト列になる。記録の値のダイジェストと違えば、照合は kept（ファイルを残す）。
 #[test]

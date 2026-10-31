@@ -17,7 +17,8 @@
 //!   直し、形を読めた段で流して読む（`decode` 閉包に `decode_stream_with_path(段の識別子)`。M13 段 2 の検証の直し）。
 //! - 寿命は参照の数で決める：[`WorkHandle`] を落とすと減り、0 になったら、残す印（[`WorkHandle::retain_on_drop`]。一時停止
 //!   した保存）がなければすぐ消し、あれば残す期限（30 分）まで残す。残すものの合計は min(8 GiB, 空き / 4) までで、古い順に
-//!   消す（[`WorkPcmStore::sweep`]。GC のジョブの終わりにも呼ぶ）。ライブラリを閉じるときは全部消す（[`WorkPcmStore::clear`]）。
+//!   消す（[`WorkPcmStore::sweep`]。残す手放しのたびと、GC のジョブの終わりに当てる）。一時停止したまま中止した保存の分は
+//!   中止の後始末で捨てる（[`WorkPcmStore::discard`]）。ライブラリを閉じるときは全部消す（[`WorkPcmStore::clear`]）。
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -153,7 +154,8 @@ impl Inner {
         f(at)
     }
 
-    /// 参照を 1 つ減らす（0 になったら、残す印がなければ消す）。
+    /// 参照を 1 つ減らす（0 になったら、残す印がなければ消す）。残したときは、期限と残す上限をその場で当てる（[`Inner::sweep`]。
+    /// GC のジョブを待たない。M13 段 3 の検証の直し）。
     fn release(&self, name: &str, retain: bool) {
         let remove = {
             let mut entries = self.entries();
@@ -176,7 +178,44 @@ impl Inner {
                 entries.remove(name)
             }
         };
-        if let Some(e) = remove {
+        match remove {
+            Some(e) => remove_file(&e.pcm.path),
+            None => self.sweep(),
+        }
+    }
+
+    /// 期限を過ぎた・残す上限（min(8 GiB, 空き / 4)）を超えた手放したものを、古い順に消す。
+    fn sweep(&self) {
+        let now = Instant::now();
+        let cap = self.free().map_or(RETAIN_CAP, |f| (f / 4).min(RETAIN_CAP));
+        let removed: Vec<Entry> = {
+            let mut entries = self.entries();
+            let mut out = Vec::new();
+            let expired: Vec<String> = entries
+                .iter()
+                .filter(|(_, e)| e.refs == 0 && e.retained_until.is_some_and(|t| t <= now))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in expired {
+                out.extend(entries.remove(&k));
+            }
+            let mut retained: Vec<(u64, String, u64)> = entries
+                .iter()
+                .filter(|(_, e)| e.refs == 0)
+                .map(|(k, e)| (e.released_at, k.clone(), e.pcm.bytes))
+                .collect();
+            retained.sort();
+            let mut total: u64 = retained.iter().map(|r| r.2).sum();
+            for (_, k, bytes) in retained {
+                if total <= cap {
+                    break;
+                }
+                out.extend(entries.remove(&k));
+                total = total.saturating_sub(bytes);
+            }
+            out
+        };
+        for e in removed {
             remove_file(&e.pcm.path);
         }
     }
@@ -414,41 +453,29 @@ impl WorkPcmStore {
         Ok(h)
     }
 
-    /// 期限を過ぎた・残す上限（min(8 GiB, 空き / 4)）を超えた手放したものを、古い順に消す。
+    /// 期限を過ぎた・残す上限（min(8 GiB, 空き / 4)）を超えた手放したものを、古い順に消す（残す手放しのたびにも当てる）。
     pub fn sweep(&self) {
-        let now = Instant::now();
-        let cap = self
-            .inner
-            .free()
-            .map_or(RETAIN_CAP, |f| (f / 4).min(RETAIN_CAP));
-        let removed: Vec<Entry> = {
-            let mut entries = self.inner.entries();
-            let mut out = Vec::new();
-            let expired: Vec<String> = entries
-                .iter()
-                .filter(|(_, e)| e.refs == 0 && e.retained_until.is_some_and(|t| t <= now))
-                .map(|(k, _)| k.clone())
-                .collect();
-            for k in expired {
-                out.extend(entries.remove(&k));
-            }
-            let mut retained: Vec<(u64, String, u64)> = entries
-                .iter()
-                .filter(|(_, e)| e.refs == 0)
-                .map(|(k, e)| (e.released_at, k.clone(), e.pcm.bytes))
-                .collect();
-            retained.sort();
-            let mut total: u64 = retained.iter().map(|r| r.2).sum();
-            for (_, k, bytes) in retained {
-                if total <= cap {
-                    break;
-                }
-                out.extend(entries.remove(&k));
-                total = total.saturating_sub(bytes);
-            }
-            out
+        self.inner.sweep();
+    }
+
+    /// 鍵 `key` の作業用の PCM を捨てる（一時停止したまま中止した保存の後始末。M13 段 3 の検証の直し）：残す印を外し、参照が
+    /// なければ消す（参照があれば、最後の参照を落としたときに消える）。なければ何もしない。
+    pub fn discard(&self, key: &WorkKey) {
+        let Ok(name) = key.file_name() else {
+            return;
         };
-        for e in removed {
+        let removed = {
+            let mut entries = self.inner.entries();
+            match entries.get_mut(&name) {
+                Some(e) if e.refs == 0 => entries.remove(&name),
+                Some(e) => {
+                    e.retained_until = None;
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(e) = removed {
             remove_file(&e.pcm.path);
         }
     }
@@ -779,6 +806,62 @@ mod tests {
         store.set_free_space(Some(free_space(one * 4 + 4)));
         store.sweep();
         assert!(!pf.exists() && pg.is_file(), "古いほうから消す");
+    }
+
+    /// 残す印のある手放しは、そのたびに期限と上限を当てる（GC のジョブを待たない。M13 段 3 の検証の直し #5）。
+    #[test]
+    fn retaining_release_applies_the_cap_and_expiry() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("pcm");
+        let store = WorkPcmStore::new(dir.clone(), None);
+        store.set_retention(Duration::from_secs(3_600));
+        let reads = AtomicU64::new(0);
+        let mut a = ensure(&store, &key(9), &reads).unwrap();
+        let one = a.pcm().bytes;
+        let pa = a.pcm().path.clone();
+        a.retain_on_drop();
+        drop(a);
+        assert!(pa.is_file());
+        // 上限（空き / 4）が 2 つ分に満たない：2 つ目を残したところで古いほうを消す（sweep を呼ばずに）
+        let mut b = ensure(&store, &key(10), &reads).unwrap();
+        let pb = b.pcm().path.clone();
+        store.set_free_space(Some(free_space(one * 6)));
+        b.retain_on_drop();
+        drop(b);
+        assert!(!pa.exists() && pb.is_file(), "上限を超えた古いものを消す");
+        // 期限：期限 0 で残すと、その手放しのうちに消える（期限の前のものは残る）
+        store.set_free_space(None);
+        store.set_retention(Duration::ZERO);
+        let mut c = ensure(&store, &key(11), &reads).unwrap();
+        let pc = c.pcm().path.clone();
+        c.retain_on_drop();
+        drop(c);
+        assert!(!pc.exists() && pb.is_file(), "期限を過ぎたものだけを消す");
+    }
+
+    /// 捨てる（中止した保存の後始末）：残す印を外し、参照がなければ消す。参照があれば、最後の参照を落としたときに消す。
+    #[test]
+    fn discard_removes_retained_files() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("pcm");
+        let store = WorkPcmStore::new(dir.clone(), None);
+        let reads = AtomicU64::new(0);
+        let mut a = ensure(&store, &key(12), &reads).unwrap();
+        let path = a.pcm().path.clone();
+        a.retain_on_drop();
+        drop(a);
+        assert!(path.is_file());
+        store.discard(&key(12));
+        assert!(!path.exists());
+        assert_eq!(store.usage(), (0, 0));
+        // 参照があるうちは消さず、最後の参照で消す
+        let b = ensure(&store, &key(12), &reads).unwrap();
+        store.discard(&key(12));
+        assert!(path.is_file());
+        drop(b);
+        assert!(!path.exists());
+        // ないものは何もしない
+        store.discard(&key(13));
     }
 
     /// 閉じるときは全部消し、空の置き場も消す（残っていた .part・.wav も）。

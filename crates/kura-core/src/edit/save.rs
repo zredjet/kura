@@ -65,6 +65,7 @@ use super::versions::{
     self, FileState, Head, InputRole, MediaRecord, NewInput, NewVersion, OriginalFile, VersionKind,
     VersionRecord,
 };
+use super::work_pcm::WorkKey;
 use super::{EngineServices, drafts, from_engine, store};
 use crate::db::Db;
 use crate::import::place::{Staged, place};
@@ -843,14 +844,89 @@ impl JobHandler for EditHandler {
     }
 
     /// 待ち・一時停止のまま中止された上書き・別名（`run` を通らないので上の印が置かれない）：積む前に置いた文書の部品が孤立
-    /// しうるので、中止と同じトランザクションで GC の部品の印を置く（版に戻すは文書を持たない）。
+    /// しうるので、中止と同じトランザクションで GC の部品の印を置く（版に戻すは文書を持たない）。一時停止で残した作業用の PCM
+    /// は、入力から鍵を求めて捨てる（GC のジョブ・閉じるのを待たずに消す。M13 段 3 の検証の直し）。
     fn canceled_while_idle(&self, tx: &Connection, input_json: &str) -> Result<()> {
-        let with_doc = serde_json::from_str::<JobInput>(input_json)
-            .is_ok_and(|i| !matches!(i.action, ActionInput::Revert { .. }));
+        let input = serde_json::from_str::<JobInput>(input_json).ok();
+        let with_doc = input
+            .as_ref()
+            .is_some_and(|i| !matches!(i.action, ActionInput::Revert { .. }));
         if with_doc {
             gc::mark_parts(tx)?;
         }
+        if let Some(input) = &input {
+            match paused_work_keys(tx, input) {
+                Ok(keys) => {
+                    for key in &keys {
+                        self.engine.work_pcm().discard(key);
+                    }
+                }
+                // 鍵を求められなくても中止は止めない（残したものは期限・上限・閉じるときに消える）
+                Err(err) => tracing::warn!(%err, "中止した保存の作業用の PCM の鍵を求められません"),
+            }
+        }
         Ok(())
+    }
+}
+
+/// 一時停止した保存が残しうる作業用の PCM の鍵（中止の後始末で捨てる。M13 段 3 の検証の直し）：上書き・別名は元・形式・文書の
+/// 入力の読み方で、段の順（decoder None。エディタ・試聴と同じ鍵）と、アンカーがあればその記録のデコーダのもの（アンカーが
+/// 使えずに読み直したとき）。版に戻すは版の入力の記録（形式・読み方・記録のデコーダ）のもの。
+fn paused_work_keys(conn: &Connection, input: &JobInput) -> Result<Vec<WorkKey>> {
+    let Some(original) = versions::original(conn, input.item_id)? else {
+        return Ok(Vec::new());
+    };
+    match &input.action {
+        ActionInput::Overwrite { doc } | ActionInput::SaveAs { doc, .. } => {
+            let Some(format) = format_id(&original.ext) else {
+                return Ok(Vec::new());
+            };
+            let Some(doc_id) = store::doc_id_by_digest(conn, doc)? else {
+                return Ok(Vec::new());
+            };
+            let bytes = store::load_doc_bytes(conn, doc_id)?;
+            let graph =
+                kura_engine::doc::load(&bytes).map_err(|e| from_engine("文書を読めません", e))?;
+            let options = graph
+                .inputs
+                .first()
+                .map(|slot| slot.decode.clone())
+                .unwrap_or_default();
+            let any = WorkKey {
+                source: original.hash,
+                format: format.to_string(),
+                options,
+                decoder: None,
+            };
+            let found = anchors::find(
+                conn,
+                &original.hash,
+                &anchors::options_digest(&any.options)?,
+            )?;
+            let mut keys = vec![any.clone()];
+            if let Some(a) = found {
+                keys.push(WorkKey {
+                    decoder: Some(a.decoded.codec),
+                    ..any
+                });
+            }
+            Ok(keys)
+        }
+        ActionInput::Revert { to } => {
+            let Some(v) = versions::get(conn, input.item_id, *to)? else {
+                return Ok(Vec::new());
+            };
+            Ok(versions::inputs(conn, v.id)?
+                .iter()
+                .filter_map(|i| serde_json::from_str::<RecordedInput>(&i.recorded).ok())
+                .map(|rec| WorkKey {
+                    source: rec.source.0,
+                    format: rec.format,
+                    options: rec.options,
+                    decoder: Some(rec.decoded.codec),
+                })
+                .collect())
+        }
     }
 }
 
