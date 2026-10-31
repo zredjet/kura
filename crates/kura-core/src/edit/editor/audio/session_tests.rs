@@ -303,7 +303,7 @@ fn wav_opens_lazily_and_flac_whole() {
 
 /// アンカーを置く（保存のジョブの代わり）：アイテムの元 `bytes`（形式 `format`）を読んだ値を、見出しの記録 `header` で
 /// アンカーの f32 WAV に書き、DB の行の記録を元を読んだ記録にする。返すのは DB の行の記録。
-fn place_anchor(
+pub(super) fn place_anchor(
     lib: &Library,
     bytes: &[u8],
     format: &str,

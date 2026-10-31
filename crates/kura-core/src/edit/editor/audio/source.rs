@@ -49,6 +49,7 @@ use super::super::EditorError;
 use crate::CoreError;
 use crate::edit::EngineRuntime;
 use crate::edit::anchors::Anchor;
+use crate::edit::services::{LentAnchor, LentInput};
 use crate::edit::work_pcm::{WorkHandle, WorkKey, WorkPcmStore};
 
 /// 丸ごと読む音声の上限の頭打ち（バイト）。
@@ -104,9 +105,57 @@ pub(crate) struct InputInfo {
     pub lazy: bool,
     /// 読み取りの記録（分からなければ None。段 3 の貸し出しで使う）。
     pub decoded: Option<DecodeStamp>,
-    /// 作業用のファイル（直接読めない形式の長い音声。持つことで寿命を決め、閉じると落ちる。段 4C の貸し出しで読む）。
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 作業用のファイル（直接読めない形式の長い音声。持つことで寿命を決め、閉じると落ちる。保存に貸すときは参照を写す）。
     pub work: Option<WorkRef>,
+}
+
+/// 保存に貸す入力の材料（[`lent_input`]）。
+pub(crate) struct LendCx<'a> {
+    pub item_id: i64,
+    /// 元の中身・形式・読み方の設定のダイジェスト（`anchors::options_digest`）。
+    pub source: Digest,
+    pub format: &'a str,
+    pub options_digest: [u8; 32],
+    /// 開くときに見つけたアンカー（あれば、遅延の入力はこのアンカーから開いたもの）。
+    pub anchor: Option<&'a Anchor>,
+}
+
+/// 開いた入力を保存に貸す形（M13 段 4C。`EngineServices::lend_input`。docs/editing.md §14）。貸すのは遅延で開いた入力のうち、
+/// 読み取りの記録が分かるものだけ：
+///
+/// - 作業用のファイルから開いた：参照ごと貸す（保存が借りている間は消えない）。封の記録は流れのダイジェストなので照らし済み。
+/// - アンカーから遅延で開いた：アンカーの記録で、照らしていない印（保存が照らしの回で値を記録と照らす）。
+/// - WAV・AIFF の直接読み：記録（中身のハッシュの名前のファイルを同じデコーダで読んだ事実の行）があれば照らし済み。記録の分から
+///   ないものは貸さない（保存は自分で遅延で開くので軽い）。
+///
+/// 丸ごと読んだ入力（短い FLAC など・アンカーが遅延で使えずに読み直したもの）は貸さない：値の中身はエディタの予算で数えて
+/// いて、保存は借りた入力の源の LRU しか数えないので、エディタを閉じたあとも保存が持つと予算の外になる（短いものは読み直しても
+/// 軽い）。
+pub(crate) fn lent_input(
+    cx: &LendCx<'_>,
+    input: &FingerprintedInput,
+    info: &InputInfo,
+) -> Option<LentInput> {
+    if !info.lazy {
+        return None;
+    }
+    let decoded = info.decoded.clone()?;
+    let (anchor, work, verified) = match (&info.work, cx.anchor) {
+        (Some(w), _) => (LentAnchor::None, Some(WorkHandle::clone(&w.0)), true),
+        (None, Some(a)) => (LentAnchor::Existing(a.clone()), None, false),
+        (None, None) => (LentAnchor::None, None, true),
+    };
+    Some(LentInput {
+        item_id: cx.item_id,
+        source: cx.source.0,
+        options_digest: Digest(cx.options_digest),
+        format: cx.format.to_string(),
+        value: input.value.clone(),
+        decoded,
+        anchor,
+        work,
+        verified,
+    })
 }
 
 /// 開いた音声。

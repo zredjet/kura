@@ -34,7 +34,7 @@ pub mod view;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kura_engine::budget::default_reserved;
@@ -529,6 +529,8 @@ pub struct Editor {
     codecs: Arc<CodecSet>,
     /// 取り置きの持ち主（ライブラリの `EngineServices` と共有）。
     reservation: Arc<Reservation>,
+    /// ライブラリのエンジンの部品（音声の入力を保存に貸す・閉じるときに引き上げる。部品がエディタを持つので弱い参照）。
+    services: Weak<EngineServices>,
     latest: Arc<Latest>,
     cancel: Arc<CancelFlag>,
     /// None：開いている途中か閉じた。
@@ -689,11 +691,17 @@ impl Editor {
             })
     }
 
-    /// 閉じる：中止 → キャッシュを空に → 確保を落とす → 取り置きを 0（このエディタが取り置きの持ち主のときだけ。閉じ終わる前に
-    /// 開いた次のエディタの取り置きは消さない）。待っている下書きを置いてから下書きのスレッドを止める。2 回目からは何もしない。
+    /// 閉じる：中止 → 保存に貸していた入力を引き上げる → キャッシュを空に → 確保を落とす → 取り置きを 0（このエディタが取り
+    /// 置きの持ち主のときだけ。閉じ終わる前に開いた次のエディタの取り置きは消さない）。待っている下書きを置いてから下書きの
+    /// スレッドを止める。2 回目からは何もしない。
     pub(crate) fn shutdown(&self) {
         self.cancel.cancel();
         let state = self.lock_state().take();
+        // 貸すのは開き終える状態の錠の中（`finish_open`）なので、錠を取ったあとに引き上げれば貸し残さない。保存が借りている
+        // 写し（作業用のファイルの参照を含む）はそのまま使える
+        if let Some(services) = self.services.upgrade() {
+            services.withdraw_input(&self.id);
+        }
         if let Some(st) = state {
             let State {
                 mut cache, lease, ..
@@ -1634,6 +1642,7 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
         runtime: runtime.clone(),
         codecs: codecs.clone(),
         reservation: env.engine.reservation(),
+        services: Arc::downgrade(env.engine),
         latest: Latest::new(),
         cancel: Arc::new(CancelFlag::default()),
         state: Mutex::new(None),
@@ -1651,6 +1660,7 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             source: Digest(original.hash),
             format,
             opts,
+            options_digest,
             anchor: anchor.map(|a| {
                 let path = layout.content_path(&a.hash, &a.ext);
                 (a, path)
@@ -1695,6 +1705,8 @@ struct OpenParts {
     source: Digest,
     format: &'static str,
     opts: kura_engine::doc::DecodeOptions,
+    /// 読み方の設定のダイジェスト（`anchors::options_digest`。保存に貸す入力の鍵）。
+    options_digest: [u8; 32],
     anchor: Option<(anchors::Anchor, std::path::PathBuf)>,
     pixel_art: bool,
     from_draft: bool,
@@ -1808,6 +1820,7 @@ fn finish_open(
     let view = editor.render(&mut st, vp, &ticket);
     let full = doc_delta(None, st.session.current());
     let status = Editor::status(&st);
+    lend_audio_input(editor, &parts, &st);
     *guard = Some(st);
     drop(guard);
     let view = view?;
@@ -1828,6 +1841,27 @@ fn finish_open(
             notices: read.warnings,
         },
     ))
+}
+
+/// 開いた音声の入力を保存に貸す（M13 段 4C。`EngineServices::lend_input`。貸す形と貸すものは `audio::source::lent_input`）。
+/// `finish_open` が状態の錠の中で、中止を確かめたあとに呼ぶ（閉じるのが引き上げるのは錠を取ったあとなので、貸し残さない）。
+fn lend_audio_input(editor: &Editor, parts: &OpenParts, st: &State) {
+    let (Some(a), Some(input)) = (&st.audio, st.inputs.get(&InputId(0))) else {
+        return;
+    };
+    let cx = audio::source::LendCx {
+        item_id: editor.item_id,
+        source: parts.source,
+        format: parts.format,
+        options_digest: parts.options_digest,
+        anchor: parts.anchor.as_ref().map(|(anchor, _)| anchor),
+    };
+    let Some(lent) = audio::source::lent_input(&cx, input, &a.input) else {
+        return;
+    };
+    if let Some(services) = editor.services.upgrade() {
+        services.lend_input(&editor.id, lent);
+    }
 }
 
 /// 波形の段の土台（ライブラリの解析の段）：頭が元（版 0）・入力の記録の値のダイジェストが事実の行と同じ・出力に量子化が

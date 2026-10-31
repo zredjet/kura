@@ -16,6 +16,8 @@ pub mod handles;
 #[cfg(test)]
 mod handles_tests;
 #[cfg(test)]
+mod lend_tests;
+#[cfg(test)]
 mod long_tests;
 pub mod measure;
 #[cfg(test)]

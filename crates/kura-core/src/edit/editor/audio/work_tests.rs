@@ -5,6 +5,7 @@
 use std::io::Cursor;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kura_engine::budget::{Class, MemoryBudget};
@@ -131,8 +132,8 @@ impl ShapeLog {
 }
 
 /// 試す段：`inner`（固定の段のデコーダ）の読み方をそのまま使い、識別子・読む形式・形を読む分・流しの断り・形を読んだときの
-/// 記録だけを替える（段 2 の解析のジョブの `RefusingStream` と同じ考え方）。
-struct Stage {
+/// 記録だけを替える（段 2 の解析のジョブの `RefusingStream` と同じ考え方）。値を読んだ・流して読んだ数も数える。
+pub(super) struct Stage {
     inner: Arc<dyn Decoder>,
     id: &'static str,
     /// この段が読む形式と、`inner` に渡す形式。
@@ -143,6 +144,8 @@ struct Stage {
     /// 値を読む・流して読むと、この誤りを返す（形は読める）。
     refuse: Option<fn() -> EngineError>,
     log: Option<ShapeLog>,
+    /// 値を読んだ・流して読んだ数（[`Stage::counting`]）。
+    decodes: Option<Arc<AtomicU64>>,
 }
 
 impl Stage {
@@ -156,11 +159,12 @@ impl Stage {
             whole_shape: true,
             refuse: None,
             log: Some(log.clone()),
+            decodes: None,
         }
     }
 
     /// `inner` と同じに読む、識別子 `id` の段（遅延の源で開く判定から外したいときなど）。
-    fn renamed(inner: Arc<dyn Decoder>, id: &'static str, format: &'static str) -> Self {
+    pub(super) fn renamed(inner: Arc<dyn Decoder>, id: &'static str, format: &'static str) -> Self {
         Self {
             inner,
             id,
@@ -169,7 +173,14 @@ impl Stage {
             whole_shape: false,
             refuse: None,
             log: None,
+            decodes: None,
         }
+    }
+
+    /// 値を読む・流して読むたびに `counter` を 1 増やす。
+    pub(super) fn counting(mut self, counter: &Arc<AtomicU64>) -> Self {
+        self.decodes = Some(counter.clone());
+        self
     }
 
     /// 形は読めるが、値を読む・流して読むと `refuse` の誤りを返すようにする。
@@ -185,6 +196,9 @@ impl Stage {
     }
 
     fn refused(&self) -> Result<(), EngineError> {
+        if let Some(n) = &self.decodes {
+            n.fetch_add(1, Ordering::SeqCst);
+        }
         match self.refuse {
             Some(f) => Err(f()),
             None => Ok(()),
@@ -341,9 +355,9 @@ impl Decoder for Stage {
 }
 
 /// 予算 `budget` で、`make` が作るコーデックの組を使う偽のファクトリ。
-struct Staged {
-    budget: u64,
-    make: Box<dyn Fn() -> CodecSet + Send + Sync>,
+pub(super) struct Staged {
+    pub budget: u64,
+    pub make: Box<dyn Fn() -> CodecSet + Send + Sync>,
 }
 
 impl EngineFactory for Staged {
@@ -361,7 +375,7 @@ impl EngineFactory for Staged {
 }
 
 /// 固定の段の組の、`format` の最初の段のデコーダ。
-fn pinned_decoder(format: &str) -> Arc<dyn Decoder> {
+pub(super) fn pinned_decoder(format: &str) -> Arc<dyn Decoder> {
     CodecSet::pinned().decoders_for(format)[0].clone()
 }
 
@@ -431,7 +445,7 @@ fn plain_wav_env(budget: u64) -> Env {
 }
 
 /// 16 ビット・モノラルの WAV（`frames` フレーム。標本は (i mod 2000) − 1000）を手で書く（長い値を速く作る）。
-fn plain_wav_bytes(rate: u32, frames: u64) -> Vec<u8> {
+pub(super) fn plain_wav_bytes(rate: u32, frames: u64) -> Vec<u8> {
     let data = frames * 2;
     let mut b = Vec::with_capacity(44 + data as usize);
     b.extend_from_slice(b"RIFF");
