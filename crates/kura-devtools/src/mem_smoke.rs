@@ -12,6 +12,10 @@
 //! 別のテスト `audio_60min_analyze_stays_within_n`（`#[ignore]`。`--release` で回す）にした。判定は N（96 MiB）と、解析のジョブの
 //! 見積もり（`kura_core::analysis::job::estimate_stream`）× 1.25 ＋ 4 MiB。
 //!
+//! M13 段 3 のケース `audio-60min-save`（60 分の合成の源の音声を FLAC・ogg q5・WAV に流して書く。値も書いたバイト列も持たない）も
+//! 重いので、別のテスト `audio_60min_save_stays_within_n`（`#[ignore]`。`--release` で回す）にした。判定は N（源の LRU の上限 ＋
+//! 192 MiB）と、保存の見積もり（`EstimateSpec::stream`）× 1.25 ＋ 4 MiB ＋ チャンクの抱え込み（96 MiB。暫定）。
+//!
 //! 子プロセスは、このテストのバイナリ自身を `--exact mem_smoke::tests::child --ignored` で起こす（環境変数でケースと段を
 //! 渡す）。`/usr/bin/time -l` がない・peak memory footprint を出さない環境（Linux）では確かめずに通す（CI の Linux の job は
 //! kura-devtools を回さない）。
@@ -988,5 +992,202 @@ mod tests {
             "{AUDIO_CASE}: 実測 {used} バイト > 見積もり {} × 1.25 ＋ 4 MiB",
             est + AUDIO_LRU
         );
+    }
+
+    // ---- M13 段 3：60 分の音声の保存（流して書く） ----
+
+    /// 子プロセスに渡す保存のケース。
+    const SAVE_CASE: &str = "audio-60min-save";
+    /// 保存の N（源の LRU の上限 ＋ 192 MiB。窓・エンコーダの流れの作業領域・ダイジェスト・流し解きの結果と、下の
+    /// [`CHUNK_SLACK`]）。設計の LRU ＋ 128 MiB は、段 3 の実測（WAV 168・FLAC 170〜221・ogg 234 MiB。負荷で揺れる）が
+    /// 超えたので広げた（暫定。段 7 で測り直す）。
+    const SAVE_N: u64 = AUDIO_LRU + 192 * MIB;
+    /// 音声のチャンク（1 チャンネル 256 KiB）は確保器が `mmap` で返す大きさ（1 MiB）より小さく、libmalloc が解放した領域を
+    /// スレッドごとに抱える。流れは窓ごとにチャンクを確保しては捨てるので、その抱え込みがエンジンの見積もり（段をまたぐ
+    /// 持ち越しのモデル）を 50〜70 MiB 上回る（段 3 の実測）。見積もりとの照らしにこの分を足す（暫定。段 7 で、見積もりに
+    /// 入れるか、チャンクの確保を返す形にするかを決める）。
+    const CHUNK_SLACK: u64 = 96 * MIB;
+
+    /// 保存の見積もり（60 分の合成の源を遅延の入力に、trim → fade → normalize → gain → set_loop を `format` に流して書く）。
+    fn save_estimate(format: &str, opts: &serde_json::Value) -> u64 {
+        let frames = AUDIO_SECONDS * AUDIO_RATE;
+        let engine = Engine::new().unwrap();
+        let codecs = CodecSet::pinned();
+        let shape = kura_engine::Shape::Audio {
+            rate: AUDIO_RATE as u32,
+            channels: 2,
+            frames: kura_engine::Dim::Exact(frames),
+        };
+        let plan = engine
+            .compile(
+                &audio_document(frames, -2.0),
+                &BTreeMap::from([(InputId(0), shape)]),
+            )
+            .unwrap();
+        let spec = EstimateSpec::new(TASKS as u64)
+            .stream(OutputId(0))
+            .digests(true)
+            .input(
+                InputId(0),
+                Source::Lazy {
+                    resident: AUDIO_LRU,
+                },
+            )
+            .output(
+                OutputId(0),
+                Sink::Encode {
+                    codecs: &codecs,
+                    format,
+                    opts,
+                },
+            );
+        engine.estimate(&plan, &spec, None).unwrap().peak
+    }
+
+    /// 保存の通し：60 分・48 kHz ステレオの合成の源（LRU 64 MiB）を遅延の入力にして、計画の出力を `format` に流して書く
+    /// （書き先は一時のファイル）。返すのは書いたバイト数。
+    fn save_flow(format: &str, opts: &serde_json::Value, out: &Path) -> u64 {
+        use kura_engine::render::cache::{Fingerprint, FingerprintedInput, NodeCache};
+        use kura_engine::testing::source::SyntheticSource;
+        use kura_engine::value::{Audio, AudioMeta};
+        use std::sync::Arc;
+        let frames = AUDIO_SECONDS * AUDIO_RATE;
+        let engine = Engine::new().unwrap();
+        let codecs = CodecSet::pinned();
+        let src = Arc::new(SyntheticSource::new(
+            AUDIO_RATE as u32,
+            2,
+            frames,
+            7,
+            AUDIO_LRU,
+        ));
+        let value = Value::Audio(Arc::new(
+            Audio::from_source(src, AudioMeta::default()).unwrap(),
+        ));
+        let shapes = BTreeMap::from([(InputId(0), value.shape())]);
+        let inputs = BTreeMap::from([(
+            InputId(0),
+            FingerprintedInput {
+                value,
+                source: Digest([1; 32]),
+                fingerprint: Fingerprint(Digest([2; 32])),
+            },
+        )]);
+        let plan = engine
+            .compile(&audio_document(frames, -2.0), &shapes)
+            .unwrap();
+        let mut cache = NodeCache::new(0);
+        let mut stream = engine
+            .output_stream(&plan, &inputs, &mut cache, OutputId(0), &NoMonitor)
+            .unwrap();
+        let mut file = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
+        let se = codecs
+            .encode_stream(&mut stream, format, opts, &mut file, &NoMonitor)
+            .unwrap();
+        use std::io::Write;
+        file.flush().unwrap();
+        se.bytes
+    }
+
+    fn save_opts(format: &str) -> serde_json::Value {
+        match format {
+            "ogg" => json!({ "quality": 5 }),
+            _ => json!({}),
+        }
+    }
+
+    /// 子プロセス（音声の保存）：`base` は何も作らない、`run` は通しを回す。
+    #[test]
+    #[ignore = "audio_60min_save_stays_within_n が子プロセスとして起こす"]
+    fn save_child() {
+        let Ok(spec) = std::env::var(CASE_ENV) else {
+            return;
+        };
+        let Some((name, stage)) = spec.split_once(':') else {
+            return;
+        };
+        if name != SAVE_CASE || stage == "base" {
+            return;
+        }
+        let path = std::path::PathBuf::from(std::env::var(FILE_ENV).unwrap());
+        let format = std::env::var(FORMAT_ENV).unwrap_or_else(|_| "flac".into());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(TASKS)
+            .build()
+            .unwrap();
+        let t = std::time::Instant::now();
+        let n = pool.install(|| save_flow(&format, &save_opts(&format), &path));
+        eprintln!(
+            "{name}・{format}: {n} バイト・{:.2} 秒",
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    /// M13 段 3（E7）：60 分・48 kHz ステレオの合成の源を FLAC・ogg q5 に流して書く子プロセスのピークから基準を引いた量が、
+    /// N（源の LRU ＋ 192 MiB）以下で、保存の見積もり（`EstimateSpec::stream`）× 1.25 ＋ 4 MiB ＋ `CHUNK_SLACK` 以下。値（1.38 GB）も書いた
+    /// バイト列も持たない。重いので、ふだんは回さない：
+    /// `cargo test --release -p kura-devtools mem_smoke::tests::audio_60min_save -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "重い（--release で --ignored を付けて回す）"]
+    fn audio_60min_save_stays_within_n() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut failed: Vec<String> = Vec::new();
+        for format in ["flac", "ogg", "wav"] {
+            let est = save_estimate(format, &save_opts(format));
+            let path = dir.path().join(format!("out.{format}"));
+            let exe = std::env::current_exe().unwrap();
+            let run = |stage: &str| -> Option<(u64, String)> {
+                let out = Command::new("/usr/bin/time")
+                    .arg("-l")
+                    .arg(&exe)
+                    .args([
+                        "--exact",
+                        "mem_smoke::tests::save_child",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                        "-q",
+                    ])
+                    .env(CASE_ENV, format!("{SAVE_CASE}:{stage}"))
+                    .env(FILE_ENV, &path)
+                    .env(FORMAT_ENV, format)
+                    .output()
+                    .ok()?;
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                let footprint = stderr
+                    .lines()
+                    .find(|l| l.contains("peak memory footprint"))
+                    .and_then(|l| l.split_whitespace().next())
+                    .and_then(|n| n.parse().ok())?;
+                assert!(out.status.success(), "{stage}: {stderr}");
+                Some((footprint, stderr))
+            };
+            let (Some((base, _)), Some((peak, log))) = (run("base"), run("run")) else {
+                eprintln!("/usr/bin/time -l が使えないので、保存のメモリの煙のテストを見送ります");
+                return;
+            };
+            let used = peak.saturating_sub(base);
+            let line = log
+                .lines()
+                .find(|l| l.contains(SAVE_CASE))
+                .unwrap_or("")
+                .to_string();
+            eprintln!(
+                "{SAVE_CASE}・{format}: 通し {:.1} MiB（N {:.1}・見積もり {:.1}）・基準 {:.1} MiB・{line}",
+                mib(used),
+                mib(SAVE_N),
+                mib(est),
+                mib(base),
+            );
+            if used > SAVE_N {
+                failed.push(format!("{format}: 実測 {used} バイト > N {SAVE_N}"));
+            }
+            if used > bound(est) + CHUNK_SLACK {
+                failed.push(format!(
+                    "{format}: 実測 {used} バイト > 見積もり {est} × 1.25 ＋ 4 MiB ＋ チャンクの抱え込み"
+                ));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
     }
 }
