@@ -15,7 +15,8 @@ paths:
   一度きりの全件の走査（起動時の指紋で pending・stale に戻す UPDATE など）は、テストに例外として理由を書く（今の例外：
   サムネイルの `thumbs.plan` の `plan_updates_scan_items_only_when_the_plan_changes`、解析の `analysis.plan`（種類と、扱いの変わった
   形式。決定 15）・`analysis.decoders` と
-  投影の作り直し（`analysis.reproject` の印があるときだけ）の `sync_plan_reset_is_a_one_time_full_scan`、利用者が設定の
+  投影の作り直し（`analysis.reproject` の印があるときだけ）・一度きりの解き直し（`analysis.retry` の版が上がったときだけ。`retry_once`）の
+  `sync_plan_reset_is_a_one_time_full_scan`、利用者が設定の
   「いま確かめる」を押したときだけ走る `items.blob_id` の確かめと、GC が残した版（kept）の数え上げの
   `full_check_repairs_blob_ids_and_startup_leaves_them`、GC のジョブが部品の印か消し待ちの候補があるときだけ走る文書の部品の片付けの
   出発点（`edit_objects` の走査。`sweep_parts_keeps_reachable_parts_and_removes_orphans`）と、参照されないアンカーの確かめ（元 × 読み方の
