@@ -23,13 +23,20 @@ fn expected(a: &kura_engine::value::Audio, f: u64, r: u64) -> Option<u64> {
     nearest_zero_crossing(&views, lo, f, r)
 }
 
-/// A13：公開した表示の値からも、表示の外を描いても、全体の描画のゼロ交差と同じ。半径は 4,096 で切る。表示を止めない。
+/// 吸着が読む区間 `[f − r − 1, f + r + 1) ∩ [0, n)` を、公開した今の表示の値が覆うか（覆えば、そこから読む道を通る）。
+fn published_covers(env: &Env, s: &str, rev: u64, f: u64, r: u64, n: u64) -> bool {
+    let area = kura_engine::render::region::Area::span(f.saturating_sub(r + 1), (f + r + 1).min(n));
+    env.editor(s).published_audio_covering(rev, &area).is_some()
+}
+
+/// A13：公開した表示の値（短い音声の Exact・長い音声の区間の継ぎはぎ）から読んでも、表示の外を描いて読んでも、全体の描画の
+/// ゼロ交差と同じ。半径の内だけを返し、半径は 4,096 で切る。表示を止めない。
 #[test]
 fn snap_finds_the_nearest_zero_crossing() {
     let env = Env::new();
-    let frames = 130 * C;
-    let bytes = noise_wav(8_000, 2, frames / 2, 51);
-    // 短い音声（全体を表示）
+    // 短い音声（8 kHz ステレオ・3 チャンク余り。全体を表示）
+    let n = 3 * C + 11;
+    let bytes = noise_wav(8_000, 2, n, 51);
     let id = add_audio(&env.lib, &bytes, "wav");
     let opened = env.open(id);
     let s = opened.session.clone();
@@ -38,15 +45,23 @@ fn snap_finds_the_nearest_zero_crossing() {
         vec![add(0, "audio.gain", json!({ "db": -2.0 }))],
         &Viewport::audio_idle(),
     );
+    let info = shown_audio(&out.view);
+    assert_eq!(info.valid, vec![(0, n)], "短い音声は全体を表示");
+    let rev = info.rev;
+    let (value, _) = env.editor(&s).published_audio(rev).unwrap();
+    assert!(value.exact().is_some(), "全体を描いた値は Exact");
     let mut g = Graph::new_single();
     g.push_linear("audio.gain", 1, json!({ "db": -2.0 }), 1)
         .unwrap();
     let want = rendered(&bytes, "wav", &g);
-    for f in [0, 1, 777, 3 * C + 5, frames / 2] {
+    for f in [0, 1, 777, 3 * C + 5, n, n + 50] {
+        let at = f.min(n);
+        assert!(published_covers(&env, &s, rev, at, 32, n), "{f}");
         let got = snap(&env.env(), &s, f, 32).unwrap();
-        let e = expected(&want, f.min(frames / 2), 32);
+        let e = expected(&want, at, 32);
         assert_eq!(got.found, e.is_some(), "{f}");
-        assert_eq!(got.frame, e.unwrap_or(f.min(frames / 2)), "{f}");
+        assert_eq!(got.frame, e.unwrap_or(at), "{f}");
+        assert!(got.frame.abs_diff(at) <= 32, "半径の内 {f}");
     }
     let status = out.status.clone();
     assert_eq!(
@@ -54,22 +69,39 @@ fn snap_finds_the_nearest_zero_crossing() {
         status
     );
 
-    // 長い音声：表示の外を描いて読む
+    // 長い音声：区間の表示の値（継ぎはぎ）が覆う所はそこから、覆わない所は区間を描いて読む
+    let frames = 130 * C;
     let long_bytes = noise_wav(8_000, 1, frames, 52);
     let lid = add_audio(&env.lib, &long_bytes, "wav");
     let opened = env.open(lid);
     let s = opened.session.clone();
-    env.step(
+    let out = env.step(
         &s,
         vec![add(0, "audio.gain", json!({ "db": 1.0 }))],
         &spans(&[(10 * C, 11 * C)]),
     );
+    let rev = shown_audio(&out.view).rev;
+    let (value, _) = env.editor(&s).published_audio(rev).unwrap();
+    assert!(value.exact().is_none(), "区間の表示の値は継ぎはぎ");
     let want = rendered(&long_bytes, "wav", &g_gain(1.0));
-    for f in [10 * C + 3, 100 * C + 9, frames - 1] {
+    let r = u64::from(SNAP_MAX_RADIUS);
+    for (f, covered) in [
+        (10 * C + 5_000, true),
+        (11 * C - r - 2, true),
+        (10 * C + 3, false),
+        (100 * C + 9, false),
+        (frames - 1, false),
+    ] {
+        assert_eq!(
+            published_covers(&env, &s, rev, f, r, frames),
+            covered,
+            "{f}"
+        );
         let got = snap(&env.env(), &s, f, 100_000).unwrap();
-        let e = expected(&want, f, u64::from(SNAP_MAX_RADIUS));
+        let e = expected(&want, f, r);
         assert_eq!(got.frame, e.unwrap_or(f), "{f}");
         assert_eq!(got.found, e.is_some());
+        assert!(got.frame.abs_diff(f) <= r, "半径の内 {f}");
     }
     // 吸着のあとも表示はそのまま使える（Superseded にしない）
     let out = env.step(&s, Vec::new(), &spans(&[(10 * C, 11 * C)]));
