@@ -22,6 +22,7 @@ pub mod flac;
 pub mod fonts;
 pub mod formats;
 pub mod gif;
+pub(crate) mod held;
 pub mod jpeg;
 pub mod lossy;
 pub mod mp3;
@@ -62,6 +63,7 @@ use crate::op::ParamSchema;
 use crate::shape::{Dim, Shape};
 use crate::value::Value;
 
+pub use held::Held;
 pub use stream::{DecodeInfo, DecodeOut, DecodeSink, DigestMode, NullSink};
 
 /// 読める・シークできる入力。
@@ -139,6 +141,17 @@ impl CodecEnv {
         self.components.insert(key.into(), value.into());
         self
     }
+}
+
+/// 段の順に形を読むときの 1 つの段（[`CodecSet::shape_path_staged`]。M13 段 2 の検証の直し）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PickedStage {
+    /// デコーダの識別子。
+    pub id: &'static str,
+    /// 頭で数えた、読み手が音声でない部分で持つ量（[`Decoder::held_bytes`]）。
+    pub held: Held,
+    /// この段で形を読む間の作業領域（[`Decoder::shape_work_bytes`] ＋ `held.open`）。
+    pub shape_bytes: u64,
 }
 
 /// 読み取りの記録（版の記録に残す。保存のために読み戻せる）。
@@ -312,6 +325,28 @@ pub trait Decoder: Send + Sync {
     /// 形を読む前に確保する。
     fn shape_work_bytes(&self, _format: &str, _len: u64) -> u64 {
         0
+    }
+    /// ファイルの頭だけを見て安く数える、この段の読み手が音声でない部分（埋め込みの画像・タグ・箱・コーデックの表）で持つ量
+    /// （M13 段 2 の検証の直し。[`Held`]）。[`Decoder::shape_work_bytes`]・[`Decoder::stream_work_bytes`] には入らないので、
+    /// 呼び手が足す（[`CodecSet::shape_path_staged`]・[`CodecSet::stage_stream_work_bytes`]）。既定は 0（持たないか、
+    /// ファイル全体を読む段で長さに入っているもの）。I/O の誤りのほかは誤りにしない（数えられない頭はそこまでの量）。
+    fn held_bytes(
+        &self,
+        _src: &mut dyn ReadSeek,
+        _format: &str,
+        _limits: &Limits,
+    ) -> Result<Held, EngineError> {
+        Ok(Held::default())
+    }
+    /// [`Decoder::held_bytes`] のパスで読む口。既定は 0（数えるデコーダが上書きしてファイルを開く。数えないデコーダの
+    /// ためにファイルを開かない）。
+    fn held_bytes_file(
+        &self,
+        _path: &Path,
+        _format: &str,
+        _limits: &Limits,
+    ) -> Result<Held, EngineError> {
+        Ok(Held::default())
     }
     /// 流して読む（M13 段 2）：標本を `out` に渡す（`out.begin` → `push_*` → `out.end`）。`shape` は `CodecSet` がこの
     /// デコーダで読んだ形。既定は [`Decoder::decode`] で値にしてから流す（流さないデコーダの互換。全体を持つ）。
@@ -791,7 +826,9 @@ impl CodecSet {
     }
 
     /// 形 `shape`・長さ `len` バイトのファイルを `format` から流して読む間のデコーダの作業領域の見積もり（この形式を読む
-    /// デコーダの [`Decoder::stream_work_bytes`] の最大。窓の作業列・ダイジェストの分は呼び手が足す）。
+    /// デコーダの [`Decoder::stream_work_bytes`] の最大。窓の作業列・ダイジェストの分は呼び手が足す）。段の最大なので、
+    /// ファイル全体を読む後ろの段（AudioToolbox）があれば長さが入り、読み手が持つ埋め込みの画像（[`Decoder::held_bytes`]）は
+    /// 入らない。ファイルを読む見積もりは、実際に読む段で数える [`CodecSet::stage_stream_work_bytes`] を使う。
     pub fn decode_stream_work_bytes(&self, format: &str, shape: &Shape, len: u64) -> u64 {
         self.decoders_for(format)
             .iter()
@@ -800,13 +837,82 @@ impl CodecSet {
             .unwrap_or(0)
     }
 
-    /// 長さ `len` バイトのファイルの形を `format` から読むのに使う作業領域（[`Decoder::shape_work_bytes`] の最大）。
+    /// 長さ `len` バイトのファイルの形を `format` から読むのに使う作業領域（[`Decoder::shape_work_bytes`] の最大）。段ごとに
+    /// 確保するときは [`CodecSet::shape_path_staged`] を使う。
     pub fn shape_work_bytes(&self, format: &str, len: u64) -> u64 {
         self.decoders_for(format)
             .iter()
             .map(|d| d.shape_work_bytes(format, len))
             .max()
             .unwrap_or(0)
+    }
+
+    /// ファイルの形を段の順に読み（[`CodecSet::shape_path_monitored`] と同じ段・同じ形）、各段で形を読む前に `prepare` に
+    /// その段（識別子・頭で数えた保持の量・形を読む間の作業領域）を渡す（M13 段 2 の検証の直し。呼び手は、その段で形を
+    /// 読む分の予算を確保し直す。`prepare` の誤りはそのまま返す）。`after` があれば、その識別子の段より後ろの段から試す
+    /// （流して読んだ段が `Unsupported` を返したときに、次の段を読む。段の順で `decode_stream_path` と同じ段に当たる）。
+    /// 読めた形（上限で確かめたもの）とその段を返す。
+    #[allow(clippy::too_many_arguments)]
+    pub fn shape_path_staged(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+        after: Option<&str>,
+        prepare: &mut dyn FnMut(&PickedStage) -> Result<(), EngineError>,
+    ) -> Result<(Shape, PickedStage), EngineError> {
+        let decoders = self.decoders_for(format);
+        let start = match after {
+            None => 0,
+            Some(id) => decoders
+                .iter()
+                .position(|d| d.id() == id)
+                .map_or(decoders.len(), |i| i + 1),
+        };
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let mut last = EngineError::Unsupported(format!("{format} を読めません"));
+        for d in decoders.into_iter().skip(start) {
+            let held = contain(d.id(), Stage::Decode, || {
+                d.held_bytes_file(path, format, limits)
+            })?;
+            let stage = PickedStage {
+                id: d.id(),
+                held,
+                shape_bytes: d.shape_work_bytes(format, len).saturating_add(held.open),
+            };
+            prepare(&stage)?;
+            match contain(d.id(), Stage::Decode, || {
+                d.shape_file_monitored(path, format, opts, limits, mon)
+            }) {
+                Ok(shape) => {
+                    limits.check(&shape).map_err(EngineError::Limit)?;
+                    return Ok((shape, stage));
+                }
+                Err(e @ EngineError::Unsupported(_)) => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last)
+    }
+
+    /// 段 `stage`（[`CodecSet::shape_path_staged`] が返したもの）で、形 `shape`・長さ `len` バイトのファイルを流して読む間の
+    /// デコーダの作業領域（その段の [`Decoder::stream_work_bytes`] ＋ 頭で数えた保持の量。窓の作業列・ダイジェストの分は
+    /// 呼び手が足す）。その段のデコーダがなければ、段の最大に保持の量を足したもの。
+    pub fn stage_stream_work_bytes(
+        &self,
+        stage: &PickedStage,
+        format: &str,
+        shape: &Shape,
+        len: u64,
+    ) -> u64 {
+        let work = match self.decoders.iter().find(|d| d.id() == stage.id) {
+            Some(d) => d.stream_work_bytes(format, shape, len),
+            None => self.decode_stream_work_bytes(format, shape, len),
+        };
+        work.saturating_add(stage.held.open)
+            .saturating_add(stage.held.decode)
     }
 
     /// 流して読む（M13 段 2）：段の順に試し（`Unsupported` は次の段へ。`sink.begin` が呼び直される）、標本を窓に揃えて

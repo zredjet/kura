@@ -466,6 +466,65 @@ fn shapes_from_files_equal_shapes_from_readers() {
     }
 }
 
+/// 段ごとの形（M13 段 2 の検証の直し）：`shape_path_staged` は `shape_path` と同じ段・同じ形を返し、試す段ごとに形を読む前に
+/// `prepare` を呼ぶ（m4a の AAC は、ALAC の段が断ってから AAC の段）。`after` の段より後ろから試し、`prepare` の誤りは
+/// そのまま返す。流して読む見積もりは、その段の `stream_work_bytes` ＋ 頭で数えた保持の量。
+#[test]
+fn staged_shapes_follow_the_stage_order() {
+    let set = CodecSet::pinned();
+    let limits = Limits::default();
+    let opts = DecodeOptions::default();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/aac-lc-ffmpeg.m4a");
+    let len = std::fs::metadata(&path).unwrap().len();
+    let (want, want_id) = set.shape_path(&path, "m4a", &opts, &limits).unwrap();
+    let mut seen = Vec::new();
+    let (shape, stage) = set
+        .shape_path_staged(&path, "m4a", &opts, &limits, &NoMonitor, None, &mut |s| {
+            seen.push(*s);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((shape, stage.id), (want, want_id));
+    assert_eq!(
+        seen.iter().map(|s| s.id).collect::<Vec<_>>(),
+        ["m4a-alac-symphonia-dec/1", "m4a-aac-symphonia-dec/2"]
+    );
+    assert_eq!(seen[1], stage);
+    assert!(stage.held.open > 0 && stage.shape_bytes == stage.held.open);
+    let d = set
+        .decoders_for("m4a")
+        .into_iter()
+        .find(|d| d.id() == stage.id)
+        .unwrap();
+    assert_eq!(
+        set.stage_stream_work_bytes(&stage, "m4a", &shape, len),
+        d.stream_work_bytes("m4a", &shape, len) + stage.held.open + stage.held.decode
+    );
+    // 前の段のあとから：ALAC のあとは AAC、AAC のあとはない
+    let after = |id| {
+        set.shape_path_staged(
+            &path,
+            "m4a",
+            &opts,
+            &limits,
+            &NoMonitor,
+            Some(id),
+            &mut |_| Ok(()),
+        )
+    };
+    assert_eq!(after("m4a-alac-symphonia-dec/1").unwrap().1.id, stage.id);
+    assert!(matches!(
+        after("m4a-aac-symphonia-dec/2"),
+        Err(EngineError::Unsupported(_))
+    ));
+    // prepare の誤りはそのまま
+    let refused =
+        set.shape_path_staged(&path, "m4a", &opts, &limits, &NoMonitor, None, &mut |_| {
+            Err(EngineError::Limit("予算".into()))
+        });
+    assert!(matches!(refused, Err(EngineError::Limit(m)) if m == "予算"));
+}
+
 /// E42（M13 段 2 の検証の直し）：moov が 64 MiB を超える m4a（ffmpeg の AAC。編集リストあり・iTunSMPB なし）でも、流して
 /// 読んだ記録（`value_digest`）が `decode_path` と同じで、ファイルから読む形が読み口から読む形と同じ（前の版はファイルから
 /// 読むときだけ大きな moov の編集リストを黙って捨て、priming を切らなかった）。フィクスチャの moov の中身の後ろに

@@ -19,6 +19,7 @@ use md5::{Digest as _, Md5};
 use serde_json::json;
 use symphonia_core::codecs::audio::AudioDecoder as _;
 
+use crate::codec::held::{self, Held};
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
 use crate::codec::symph::{self, Container, Media};
 use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, pcm, try_vec};
@@ -139,12 +140,33 @@ impl Decoder for FlacCodec {
         true
     }
 
-    /// symphonia の読み口の作業領域（4 MiB）と、1 パケット（FLAC は 65,535 フレームまで）の標本の写し。
+    /// symphonia の読み口の作業領域（4 MiB）と、1 パケット（FLAC は 65,535 フレームまで）の標本の写し。読み手が持つ
+    /// メタデータの箱（埋め込みの画像など）は [`Decoder::held_bytes`] で数える。
     fn stream_work_bytes(&self, _format: &str, shape: &Shape, _len: u64) -> u64 {
         let Shape::Audio { channels, .. } = shape else {
             return 0;
         };
         (4 << 20) + 65_536 * u64::from(*channels) * 8
+    }
+
+    /// 読み手が開くときに読んで持ち続けるメタデータの箱（PICTURE・APPLICATION・VORBIS_COMMENT など。`codec::held`）。
+    fn held_bytes(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        _limits: &Limits,
+    ) -> Result<Held, EngineError> {
+        held::flac(src)
+    }
+
+    fn held_bytes_file(
+        &self,
+        path: &Path,
+        format: &str,
+        limits: &Limits,
+    ) -> Result<Held, EngineError> {
+        let mut f = BufReader::new(std::fs::File::open(path)?);
+        self.held_bytes(&mut f, format, limits)
     }
 
     fn decode_stream(

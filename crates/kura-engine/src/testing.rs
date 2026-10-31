@@ -217,6 +217,8 @@ pub fn fuzz_decode(format: &str, data: &[u8]) -> Result<(), String> {
     let opts = crate::doc::DecodeOptions::default();
     for d in set.all_decoders_for(format) {
         let r = catch_own_panic(|| {
+            // 頭で数える読み手の保持の量（M13 段 2 の検証の直し。壊れた頭でも落ちず、必ず終わる）
+            d.held_bytes(&mut Cursor::new(data), format, &limits)?;
             let s = d.shape(&mut Cursor::new(data), format, &opts, &limits)?;
             limits.check(&s).map_err(EngineError::Limit)?;
             let v = d.decode(&mut Cursor::new(data), format, &opts, &limits, &NoMonitor)?;

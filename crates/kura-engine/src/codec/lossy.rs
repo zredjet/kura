@@ -28,6 +28,7 @@ use std::path::Path;
 use symphonia_core::codecs::audio::AudioDecoder as _;
 use symphonia_core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_ALAC, CODEC_ID_VORBIS};
 
+use crate::codec::held::{self, Held};
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
 use crate::codec::symph::{self, Container, Media, read_all};
 use crate::codec::{Decoder, ReadSeek, Tier, pcm};
@@ -54,6 +55,12 @@ const _: [u32; 4] = [
 /// SBR のデータを最初のフレームから毎フレーム書くので、先頭の数パケットで足りる。これより後で初めて出てくるものは、
 /// 読むとき（全部のパケットを読んだあと）に断る。
 const SBR_PROBE_PACKETS: usize = 16;
+
+/// ALAC の 1 パケットのフレームの数の上限（symphonia の `AlacDecoder` が受け付ける magic cookie の frame_length の上限
+/// 4,096 × 16。形からは cookie を見られないので、上限で数える）。
+const ALAC_FRAMES: u64 = 65_536;
+/// `stream_work_bytes` が見込む Vorbis の codebook の表（これを超える分は `held_bytes` が setup から見積もる）。
+const VORBIS_TABLES: u64 = 32 << 20;
 
 /// どの中身を読むか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,19 +341,62 @@ impl Decoder for SymphoniaDecoder {
         true
     }
 
-    /// symphonia の読み口の作業領域（4 MiB）と、1 パケットの標本の写し（AAC・ALAC は 8,192 フレーム、Vorbis は 8,192 フレーム）。
-    /// Vorbis は setup の codebook の表を見積もりの上限（32 MiB まで見込む）で足す。
+    /// symphonia の読み口の作業領域（4 MiB）と、1 パケットの標本の写し（AAC・Vorbis は 8,192 フレーム × 8 バイト）。ALAC は
+    /// magic cookie の frame_length（symphonia は 65,536 まで受け付けて先に確保する）で数え、デコーダの i32 の緩衝と
+    /// 作業列（8 バイト）・パケット（非圧縮で 4 バイト）を 65,536 フレームで、tail_bits（4 バイト × フレーム）を足す。
+    /// Vorbis は setup の codebook の表を [`VORBIS_TABLES`] まで見込む（それを超える分と、読み手が持つ頭のパケット・
+    /// 埋め込みの画像は [`Decoder::held_bytes`] で数える）。
     fn stream_work_bytes(&self, _format: &str, shape: &Shape, _len: u64) -> u64 {
         let Shape::Audio { channels, .. } = shape else {
             return 0;
         };
-        let packet = 8_192 * u64::from(*channels) * 8;
-        let tables = if self.kind == Kind::OggVorbis {
-            32 << 20
-        } else {
-            0
+        let ch = u64::from(*channels);
+        let work = match self.kind {
+            Kind::Mp4Alac => ALAC_FRAMES * ch * 12 + ALAC_FRAMES * 4,
+            Kind::OggVorbis => 8_192 * ch * 8 + VORBIS_TABLES,
+            Kind::Mp4Aac | Kind::AdtsAac => 8_192 * ch * 8,
         };
-        (4 << 20) + packet + tables
+        (4 << 20) + work
+    }
+
+    /// 読み手が開くときに読んで持ち続ける部分（Ogg の頭のパケットのコメント・画像、m4a の moov と ilst の covr。
+    /// `codec::held`）と、Vorbis の setup の codebook の表のうち [`VORBIS_TABLES`] を超える分。ADTS は読み手の緩衝だけ。
+    fn held_bytes(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        limits: &Limits,
+    ) -> Result<Held, EngineError> {
+        Ok(match self.container() {
+            Container::Ogg => {
+                let mut h = held::ogg(src, limits)?;
+                h.decode = h.decode.saturating_sub(VORBIS_TABLES);
+                h
+            }
+            Container::Mp4 => held::mp4(src)?,
+            Container::Flac | Container::Adts => Held {
+                open: held::READER,
+                decode: 0,
+            },
+        })
+    }
+
+    fn held_bytes_file(
+        &self,
+        path: &Path,
+        format: &str,
+        limits: &Limits,
+    ) -> Result<Held, EngineError> {
+        match self.container() {
+            Container::Ogg | Container::Mp4 => {
+                let mut f = BufReader::new(std::fs::File::open(path)?);
+                self.held_bytes(&mut f, format, limits)
+            }
+            Container::Flac | Container::Adts => Ok(Held {
+                open: held::READER,
+                decode: 0,
+            }),
+        }
     }
 
     fn decode_stream(
