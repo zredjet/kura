@@ -372,12 +372,14 @@ fn watched_env(budget: u64, log: &ShapeLog) -> Env {
         budget,
         make: Box::new(move || {
             let mut set = CodecSet::pinned();
-            set.replace_decoder(Arc::new(Stage::watching(
-                pinned_decoder("flac"),
-                "flac",
-                &log,
-            )))
-            .unwrap();
+            for format in ["flac", "mp3"] {
+                set.replace_decoder(Arc::new(Stage::watching(
+                    pinned_decoder(format),
+                    format,
+                    &log,
+                )))
+                .unwrap();
+            }
             set
         }),
     }))
@@ -777,11 +779,19 @@ fn pcm_reads_the_shape_only_inside_the_budget() {
     let root = env.lib.layout().root().to_path_buf();
     let budget = env.engine.runtime().unwrap().budget().clone();
     log.attach(&budget);
-    for frames in [40 * C, 2 * C] {
-        let flac = long_flac(frames);
-        let len = flac.len() as u64;
-        add_audio(&env.lib, &flac, "flac");
-        let hash = crate::library::hex(blake3::hash(&flac).as_bytes());
+    // 長い FLAC（作業用のファイル）・短い FLAC（丸ごと読み）・MP3（固定の段は形を読むのにファイル全体を読む。丸ごと読み）
+    let mp3 = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../kura-engine/fixtures/mp3-free.mp3"),
+    )
+    .unwrap();
+    for (bytes, ext) in [
+        (long_flac(40 * C), "flac"),
+        (long_flac(2 * C), "flac"),
+        (mp3, "mp3"),
+    ] {
+        let len = bytes.len() as u64;
+        add_audio(&env.lib, &bytes, ext);
+        let hash = crate::library::hex(blake3::hash(&bytes).as_bytes());
         let src = crate::serve::pcm_source(env.lib.layout(), &hash).unwrap();
         let serve = || crate::asset::pcm::serve(&env.engine, &root, &hash, &src, 0, 10);
         env.engine.pcm_cache().clear();
@@ -803,7 +813,7 @@ fn pcm_reads_the_shape_only_inside_the_budget() {
         assert!(!seen.is_empty());
         assert!(
             seen.iter().all(|&u| u >= len),
-            "予算の外で形を読んだ（{frames} フレーム）：{seen:?}（ファイルは {len} バイト）"
+            "予算の外で形を読んだ（{ext}）：{seen:?}（ファイルは {len} バイト）"
         );
     }
 }
