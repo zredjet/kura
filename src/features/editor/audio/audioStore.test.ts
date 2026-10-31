@@ -22,11 +22,18 @@ import { fakeFactory } from '../../../test/fakeAudio';
 import { type AudioRuntime, setAudioRuntimeForTest } from '../../asset/audioRuntime';
 import { playerController } from '../../player/playerActions';
 import { usePlayerStore } from '../../player/playerStore';
-import { closeEditor, editorUndo, openEditorAs, pushEditorSteps } from '../editorStore';
+import {
+  closeEditor,
+  editorUndo,
+  openEditorAs,
+  pushEditorSteps,
+  useEditorStore,
+} from '../editorStore';
 import {
   AUDIO_ADAPTER,
   audioController,
   audioPlayer,
+  type AudioViewSummary,
   overlayOf,
   setAudioDragging,
   setAudioIoForTest,
@@ -295,6 +302,52 @@ describe('音声のアダプタ', () => {
     expect(o.selection).toEqual({ start: 100, end: 200 });
     setAudioLocal({ loop: { start: 30, end: 40 } });
     expect(overlayOf(useAudioStore.getState()).loop).toEqual({ start: 30, end: 40 });
+  });
+});
+
+describe('フェードの曲線', () => {
+  const fade = (id: number, enabled: boolean, inEnd: number) => ({
+    id,
+    op: 'audio.fade',
+    enabled,
+    inRate: 48_000,
+    inFrames: TOTAL,
+    marks: { type: 'fade' as const, inEnd, outStart: null },
+  });
+  const doc = (nodes: { id: number; enabled: boolean }[]) => ({
+    order: nodes.map((n) => n.id),
+    nodes: Object.fromEntries(
+      nodes.map((n) => [
+        n.id,
+        { id: n.id, op: 'audio.fade', v: 1, enabled: n.enabled, params: {}, log: null },
+      ]),
+    ),
+    outputs: [],
+  });
+
+  it('外したフェードの曲線は、フェードの道具でそのノードを直しているときだけ描く（ほかは有効なノードの曲線）', async () => {
+    await open(view({ nodes: [fade(1, true, 1000), fade(2, false, 2000)] }));
+    useEditorStore.setState({
+      doc: doc([
+        { id: 1, enabled: true },
+        { id: 2, enabled: false },
+      ]),
+      selected: null,
+    });
+    // 選択の道具：最後の（外した）フェードではなく、有効なフェードの曲線
+    expect(overlayOf(useAudioStore.getState()).fade?.inEnd).toBe(1000);
+    // 外したフェードだけ：曲線を描かない
+    useEditorStore.setState({ doc: doc([{ id: 2, enabled: false }]) });
+    useAudioStore.setState({
+      view: {
+        ...(useAudioStore.getState().view as AudioViewSummary),
+        nodes: [fade(2, false, 2000)],
+      },
+    });
+    expect(overlayOf(useAudioStore.getState()).fade).toBeNull();
+    // フェードの道具でそのノードを直している：出す（ハンドルも）
+    useAudioStore.setState({ tool: 'fade' });
+    expect(overlayOf(useAudioStore.getState()).fade).toMatchObject({ inEnd: 2000, handles: true });
   });
 });
 

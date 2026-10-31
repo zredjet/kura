@@ -185,17 +185,27 @@ export function lastNodeOf(
   return null;
 }
 
+/**
+ * 曲線・欄に出すフェードのノード。フェードの道具ではドラッグ・欄が直すのと同じノード（選んだフェード、なければ最後の
+ * フェード。外していても：直すと有効に戻る）、ほかの道具では音に効いている有効なノードだけ（対象が外れていれば最後の
+ * 有効なフェード）。
+ */
+export function fadeNodeOf(s: AudioEditorState): EditAudioNodeDto | null {
+  const view = s.view;
+  if (!view) return null;
+  const editor = useEditorStore.getState();
+  const id = targetNode(editor.doc, editor.selected, 'audio.fade');
+  const target = id === null ? null : (view.nodes.find((n) => n.id === id) ?? null);
+  if (s.tool === 'fade') return target ?? lastNodeOf(view.nodes, 'audio.fade');
+  return target?.enabled ? target : lastNodeOf(view.nodes, 'audio.fade');
+}
+
 /** 波形に重ねるもの（ストアの状態から）。 */
 export function overlayOf(s: AudioEditorState): WaveOverlay {
   const view = s.view;
   if (!view) return EMPTY_OVERLAY;
   const total = view.frames;
-  // ドラッグ・欄が直すのと同じノード（選んだフェード、なければ最後のフェード）
-  const editor = useEditorStore.getState();
-  const fadeId = targetNode(editor.doc, editor.selected, 'audio.fade');
-  const fadeNode =
-    (fadeId === null ? null : view.nodes.find((n) => n.id === fadeId)) ??
-    lastNodeOf(view.nodes, 'audio.fade');
+  const fadeNode = fadeNodeOf(s);
   const marks = fadeNode?.marks?.type === 'fade' ? fadeNode.marks : null;
   const inEnd = s.local?.fadeIn ?? marks?.inEnd ?? 0;
   const outStart = s.local?.fadeOut ?? marks?.outStart ?? total;

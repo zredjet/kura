@@ -23,8 +23,8 @@ import {
   audioPlayhead,
   cancelTrim,
   endTrim,
+  fadeNodeOf,
   followLoopAudition,
-  lastNodeOf,
   openedAudio,
   overlayOf,
   setAudioDragging,
@@ -485,11 +485,7 @@ export function fadeLengths(): { fadeIn: number; fadeOut: number } {
   const s = state();
   const view = s.view;
   if (!view) return { fadeIn: 0, fadeOut: 0 };
-  const editor = useEditorStore.getState();
-  const id = targetNode(editor.doc, editor.selected, 'audio.fade');
-  const node =
-    (id === null ? null : view.nodes.find((n) => n.id === id)) ??
-    lastNodeOf(view.nodes, 'audio.fade');
+  const node = fadeNodeOf(s);
   const marks = node?.marks?.type === 'fade' ? node.marks : null;
   const inEnd = s.local?.fadeIn ?? marks?.inEnd ?? 0;
   const outStart = s.local?.fadeOut ?? marks?.outStart ?? view.frames;
