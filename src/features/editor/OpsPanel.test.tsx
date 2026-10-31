@@ -84,7 +84,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  useEditorStore.setState({ phase: 'closed', selected: null, item: null });
+  useEditorStore.setState({ phase: 'closed', selected: null, item: null, originalFormat: null });
   useMenuStore.setState({ menu: null });
 });
 
@@ -404,5 +404,25 @@ describe('出力の形式', () => {
     expect(select).toHaveValue('png');
     expect(within(select).queryByText(t.outputKeep('PSD'))).toBeNull();
     expect(screen.getByText(t.outputUnwritable('PSD', 'PNG'))).toBeInTheDocument();
+  });
+
+  it('「元と同じ」は元のファイルの形式（Rust の originalFormat）で決める（元と違う形式で保存したあとの今の拡張子ではない）', () => {
+    // JPEG の元を PNG で保存したあと
+    setDoc([]);
+    useEditorStore.setState({ originalFormat: 'jpeg' });
+    const { unmount } = render(<OpsPanel />);
+    const select = screen.getByRole('combobox', { name: t.output });
+    expect(select).toHaveValue('keep');
+    expect(within(select).getByText(t.outputKeep('JPEG'))).toBeInTheDocument();
+    expect(within(select).queryByText(t.outputKeep('PNG'))).toBeNull();
+    unmount();
+
+    // HEIC の元を PNG で保存したあと：元の形式に書けないので「元と同じ」を出さず、PNG で保存すると添える
+    useEditorStore.setState({ originalFormat: 'heic' });
+    render(<OpsPanel />);
+    const again = screen.getByRole('combobox', { name: t.output });
+    expect(again).toHaveValue('png');
+    expect(within(again).queryByText(t.outputKeep('PNG'))).toBeNull();
+    expect(screen.getByText(t.outputUnwritable('HEIC', 'PNG'))).toBeInTheDocument();
   });
 });

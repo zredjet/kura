@@ -7,7 +7,7 @@ import type { EditWritableFormatDto } from '../../../ipc/edit';
 import { formatCount } from '../../../lib/format';
 import { channelsText, khz } from '../../asset/describe';
 import editorStyles from '../Editor.module.css';
-import { useEditorStore } from '../editorStore';
+import { originalFormatOf, useEditorStore } from '../editorStore';
 import { FormatOutputRow, OpsPanel, type ParamTime } from '../OpsPanel';
 import { outputChoice } from '../formats';
 import styles from './Audio.module.css';
@@ -33,9 +33,9 @@ export function AudioTopTools() {
   return null;
 }
 
-/** 元の形式が非可逆か（ビットを出さない）。 */
-function lossyExt(ext: string | undefined): boolean {
-  return capsOf(AUDIO_FORMATS.formatOfExt(ext))?.lossless === false;
+/** 元の形式が非可逆か（元のビット数を出さない）。 */
+function lossyFormat(format: string | null): boolean {
+  return capsOf(format)?.lossless === false;
 }
 
 /** 「48 kHz · 24 ビット · ステレオ · 3:12.500 · WAV · 未保存」（レート・チャンネル・長さは今の出力、ビットは元）。 */
@@ -43,12 +43,14 @@ export function AudioMeta() {
   const view = useAudioStore((s) => s.view);
   const source = useAudioStore((s) => s.source);
   const item = useEditorStore((s) => s.item);
+  const originalFormat = useEditorStore(originalFormatOf);
   const dirty = useEditorStore((s) => s.status?.dirty ?? false);
   const rate = view?.rate ?? source?.rate ?? null;
   const channels = view?.channels ?? source?.channels ?? null;
   const frames = view?.frames ?? source?.frames ?? null;
   const bits =
-    source?.bits && !lossyExt(item?.ext) ? ja.asset.bitsValue(String(source.bits)) : null;
+    source?.bits && !lossyFormat(originalFormat) ? ja.asset.bitsValue(String(source.bits)) : null;
+  // アイテムの今のファイルの形式（元と違う形式で保存したあとは、元の形式ではない）
   const format = (AUDIO_FORMATS.formatOfExt(item?.ext) ?? item?.ext ?? '').toUpperCase();
   const parts =
     rate !== null && channels !== null && frames !== null
@@ -161,11 +163,8 @@ function LossItems({ losses, format }: { losses: AudioLoss[]; format: string }) 
 /** 出力の形式の下の、保存で失うものの一覧。 */
 export function LossList() {
   const outputs = useEditorStore((s) => s.doc.outputs);
-  const item = useEditorStore((s) => s.item);
-  const eff = AUDIO_FORMATS.effectiveFormat(
-    outputChoice(outputs),
-    AUDIO_FORMATS.formatOfExt(item?.ext),
-  );
+  const originalFormat = useEditorStore(originalFormatOf);
+  const eff = AUDIO_FORMATS.effectiveFormat(outputChoice(outputs), originalFormat);
   return <LossItems losses={useLosses(capsOf(eff.format))} format={eff.format} />;
 }
 

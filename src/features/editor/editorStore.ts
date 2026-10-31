@@ -140,6 +140,11 @@ export interface EditorState {
   item: ItemSummaryDto | null;
   session: string | null;
   source: EditSourceDto | null;
+  /**
+   * 元のファイルの形式（Rust の `originalFormat`。出力の形式の「元と同じ」が書く形式）。元と違う形式で保存したアイテムでは
+   * アイテムの今の拡張子と違う。開き終えるまでは null（`originalFormatOf`）。
+   */
+  originalFormat: string | null;
   status: EditStatusDto | null;
   doc: EditorDoc;
   failure: EditorFailure | null;
@@ -168,6 +173,7 @@ function closedState(panel: EditorPanel, openId: number): EditorState {
     item: null,
     session: null,
     source: null,
+    originalFormat: null,
     status: null,
     doc: EMPTY_DOC,
     failure: null,
@@ -292,19 +298,29 @@ export function hasUnsavedChanges(
 }
 
 /**
+ * 元のファイルの形式（出力の形式の「元と同じ」が書く形式）：Rust の `originalFormat`。開き終える前（まだ分からない）だけ、
+ * アイテムの今の拡張子から推す。`source.format` は画素の形式（rgba8 など）で、ファイルの形式ではない。アイテムの今の形式
+ * （保存したあとの拡張子・上部の「PNG」）の意味では `item.ext` を使う。
+ */
+export function originalFormatOf(
+  s: Pick<EditorState, 'item'> & Partial<Pick<EditorState, 'originalFormat'>>,
+): string | null {
+  return s.originalFormat ?? formatsFor(s.item)?.formatOfExt(s.item?.ext) ?? null;
+}
+
+/**
  * 保存（上書き）できるか：開いていて、保存の途中でなく、保存していない変更がある（応えの来ていない手も）か、元の形式に
  * 書けず形式を変えて保存するとき（ボタン・⌘S・ファイル › 保存）。
  */
 export function canSaveEditor(
-  s: Pick<EditorState, 'phase' | 'save' | 'status' | 'pendingSteps' | 'doc' | 'item'>,
+  s: Pick<EditorState, 'phase' | 'save' | 'status' | 'pendingSteps' | 'doc' | 'item'> &
+    Partial<Pick<EditorState, 'originalFormat'>>,
 ): boolean {
   if (s.phase !== 'open' || s.save || !s.status) return false;
   if (s.status.dirty || s.pendingSteps) return true;
-  // 元のファイルの形式はアイテムの拡張子から（source.format は画素の形式 rgba8 などで、ファイルの形式ではない）
   const formats = formatsFor(s.item);
   if (!formats) return false;
-  return formats.effectiveFormat(outputChoice(s.doc.outputs), formats.formatOfExt(s.item?.ext))
-    .forced;
+  return formats.effectiveFormat(outputChoice(s.doc.outputs), originalFormatOf(s)).forced;
 }
 
 /** 文書を変える手か（まとめを閉じる・仮の値の手は文書を変えない）。 */
@@ -471,6 +487,7 @@ export async function openEditorAs<Tag>(
       phase: 'open',
       session: opened.session,
       source: opened.source,
+      originalFormat: opened.originalFormat,
       draft: opened.draft,
       // 下書きがあれば、捨てるか下書きから開くかを聞く（下書きから開いたあとは聞かない）
       sheet: opened.draft.exists && !opened.draft.opened ? { kind: 'draft' } : null,

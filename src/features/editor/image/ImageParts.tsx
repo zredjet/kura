@@ -74,7 +74,8 @@ export function ImageMeta() {
   const dirty = useEditorStore((s) => s.status?.dirty ?? false);
   const w = view?.fullWidth ?? source?.width ?? item?.width ?? null;
   const h = view?.fullHeight ?? source?.height ?? item?.height ?? null;
-  // 元のファイルの形式（source.format は画素の形式で、ファイルの形式ではない）
+  // アイテムの今のファイルの形式（source.format は画素の形式で、ファイルの形式ではない。元と違う形式で保存したあとは
+  // 元の形式ではない：「元と同じ」の判定は originalFormatOf）
   const format = (formatOfExt(item?.ext) ?? item?.ext ?? '').toUpperCase();
   const meta = [
     w !== null && h !== null ? t.size(formatCount(w), formatCount(h)) : null,

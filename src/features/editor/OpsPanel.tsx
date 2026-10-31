@@ -14,6 +14,7 @@ import styles from './Editor.module.css';
 import {
   addOp,
   moveNode,
+  originalFormatOf,
   removeNode,
   selectNode,
   setNodeEnabled,
@@ -265,6 +266,8 @@ function Warnings() {
 export function FormatOutputRow() {
   const outputs = useEditorStore((s) => s.doc.outputs);
   const item = useEditorStore((s) => s.item);
+  // 元のファイルの形式（Rust の originalFormat。今の拡張子ではない。source.format は画素の形式で、ファイルの形式ではない）
+  const sourceFormat = useEditorStore(originalFormatOf);
   const open = useEditorStore((s) => s.phase === 'open');
   const id = useId();
   const [originalName, setOriginalName] = useState<{ id: number; name: string } | null>(null);
@@ -285,8 +288,6 @@ export function FormatOutputRow() {
   const formats = formatsFor(item);
   if (!item || !formats) return null;
   const choice = outputChoice(outputs);
-  // 元のファイルの形式（source.format は画素の形式で、ファイルの形式ではない）
-  const sourceFormat = formats.formatOfExt(item.ext);
   const eff = formats.effectiveFormat(choice, sourceFormat);
   const keepable = formats.canWrite(sourceFormat);
   const options = [
@@ -295,6 +296,7 @@ export function FormatOutputRow() {
   ];
   const value = choice.type === 'to' ? choice.format : keepable ? 'keep' : formats.fallback;
   const original = originalName?.id === item.id ? originalName.name : null;
+  // 保存したあとの拡張子は今の拡張子から（形式が今と同じなら今の拡張子のまま）
   const name = original
     ? formats.exportName(original, formats.savedExt(eff.format, item.ext))
     : null;

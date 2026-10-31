@@ -271,10 +271,10 @@ function audioItem(over: Partial<ItemSummaryDto> = {}): ItemSummaryDto {
  * 音声のアイテムを未保存で開く。核の保存の流れ（保存を積む・形式のシート・大きさの確かめ）だけを見るので、表示は画像の
  * アダプタで受け、種類だけを音声にする（音声の表示の流れは `audio/audioStore.test.ts`）。
  */
-async function openAudioDirty(over: Partial<ItemSummaryDto> = {}) {
+async function openAudioDirty(over: Partial<ItemSummaryDto> = {}, originalFormat?: string) {
   const audio = audioItem(over);
   vi.mocked(openEdit).mockResolvedValue(
-    opened({}, {}, AUDIO_FORMATS.formatOfExt(audio.ext) ?? audio.ext),
+    opened({}, {}, originalFormat ?? AUDIO_FORMATS.formatOfExt(audio.ext) ?? audio.ext),
   );
   await act(() => openEditorAs({ ...IMAGE_EDITOR.adapter, kind: 'audio' }, audio));
   await flush();
@@ -665,6 +665,41 @@ describe('書けない形式（FormatUnavailable）', () => {
     expect(useEditorStore.getState().phase).toBe('closed');
   });
 
+  it('「元と同じ」の保存が断られたら、Rust の解いた形式（元の MP3）を出す（今の拡張子の WAV ではない）', async () => {
+    // MP3 の元を WAV で保存したあと（今の拡張子は wav）、出力を「元と同じ」に戻して保存する
+    await openAudioDirty({ ext: 'wav' }, 'mp3');
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS,
+      current: 'mp3',
+      fallback: 'ogg',
+    });
+    render(<EditorSheets />);
+    requestSave();
+    await flush();
+    expect(saveEdit).toHaveBeenCalledWith('aa01', { type: 'overwrite' }, null);
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'format', unavailable: 'mp3' });
+    expect(
+      screen.getByRole('heading', { name: t.formatUnavailableTitle('MP3') }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(t.formatUnavailableBody('MP3'))).toBeInTheDocument();
+    expect(screen.queryByText(t.formatUnavailableTitle('WAV'))).toBeNull();
+  });
+
+  it('元の形式（Rust の originalFormat）に書けなければ、今の拡張子が書ける形式でも書ける形式を渡して保存する', async () => {
+    // HEIC の元を PNG で保存したあと（今の拡張子は png）。「元と同じ」は HEIC なので PNG を渡す
+    vi.mocked(openEdit).mockResolvedValue(opened({}, { status: status({ dirty: false }) }, 'heic'));
+    await act(() => openEditor(item({ ext: 'png' })));
+    await flush();
+    requestSave();
+    await flush();
+    expect(saveEdit).toHaveBeenCalledWith(
+      'aa01',
+      { type: 'overwrite' },
+      { type: 'to', format: 'png' },
+    );
+  });
+
   it('書ける形式を読めなければ、今の「保存できませんでした」のシート', async () => {
     await openAudioDirty({ ext: 'mp3' });
     vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
@@ -715,6 +750,15 @@ describe('別名で保存', () => {
     const notice = useNoticeStore.getState();
     expect(notice.message).toBe(t.existing(t.existingRoles.original ?? ''));
     expect(notice.action?.label).toBe(t.showItem);
+  });
+
+  it('ファイル名の拡張子は元のファイルの形式から決める（画素の形式 source.format ではない）', async () => {
+    vi.mocked(openEdit).mockResolvedValue(opened({}, {}, 'jpeg'));
+    await act(() => openEditor(item({ ext: 'jpg' })));
+    await flush();
+    render(<EditorSheets />);
+    act(() => openSaveAs());
+    expect(screen.getByText(t.saveAsFile('hero のコピー.jpg'))).toBeInTheDocument();
   });
 
   it('新しいアイテムができたら「…として保存しました」と表示のボタン', async () => {
@@ -789,8 +833,8 @@ describe('保存していない変更がないとき', () => {
     requestSave();
     await flush();
     expect(saveEdit).not.toHaveBeenCalled();
-    // 元のファイルの形式はアイテムの拡張子で決める（source.format は画素の形式）
-    act(() => useEditorStore.setState({ item: item({ ext: 'psd' }) }));
+    // 元のファイルの形式は Rust の originalFormat で決める（source.format は画素の形式）。PSD を開いたとき
+    act(() => useEditorStore.setState({ item: item({ ext: 'psd' }), originalFormat: 'psd' }));
     requestSave();
     await flush();
     expect(saveEdit).toHaveBeenCalledWith(

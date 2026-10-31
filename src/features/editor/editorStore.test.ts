@@ -496,7 +496,7 @@ describe('右パネル', () => {
     expect(hasUnsavedChanges({ status: st, save, pendingSteps: true })).toBe(true);
   });
 
-  it('元のファイルの形式はアイテムの拡張子で決める（source.format は画素の形式。PNG を開いただけでは保存できない）', () => {
+  it('開き終える前（originalFormat がない）は、元のファイルの形式をアイテムの拡張子から推す（source.format は画素の形式。PNG を開いただけでは保存できない）', () => {
     const open = {
       phase: 'open' as const,
       save: null,
@@ -507,6 +507,23 @@ describe('右パネル', () => {
     expect(canSaveEditor({ ...open, item: item({ ext: 'png' }) })).toBe(false);
     // 元の形式に書けない（PSD）なら、変更がなくても書ける形式で保存できる
     expect(canSaveEditor({ ...open, item: item({ ext: 'psd' }) })).toBe(true);
+  });
+
+  it('開いたあとは、元のファイルの形式を Rust の originalFormat で決める（元と違う形式で保存したアイテム）', () => {
+    const open = {
+      phase: 'open' as const,
+      save: null,
+      status: status({ dirty: false }),
+      pendingSteps: false,
+      doc: { order: [], nodes: {}, outputs: [] },
+    };
+    // HEIC の元を PNG で保存したあと：元の形式に書けないので、変更がなくても書ける形式で保存できる
+    expect(canSaveEditor({ ...open, item: item({ ext: 'png' }), originalFormat: 'heic' })).toBe(
+      true,
+    );
+    expect(canSaveEditor({ ...open, item: item({ ext: 'psd' }), originalFormat: 'png' })).toBe(
+      false,
+    );
   });
 });
 

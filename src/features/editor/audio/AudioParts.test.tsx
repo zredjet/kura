@@ -109,7 +109,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  useEditorStore.setState({ phase: 'closed', kind: null, item: null, failure: null, panel: 'ops' });
+  useEditorStore.setState({
+    phase: 'closed',
+    kind: null,
+    item: null,
+    originalFormat: null,
+    failure: null,
+    panel: 'ops',
+  });
 });
 
 describe('音声エディタの画面', () => {
@@ -208,6 +215,19 @@ describe('音声エディタの画面', () => {
     expect(screen.getByText(a.lossLoop('MP3'))).toBeInTheDocument();
     expect(screen.getByText(a.lossMarkers('MP3'))).toBeInTheDocument();
     expect(screen.getByText(a.lossLossy('MP3'))).toBeInTheDocument();
+  });
+
+  it('「元と同じ」と失うものは元のファイルの形式（Rust の originalFormat）で決める（今の拡張子ではない）', () => {
+    // MP3 の元を WAV で保存したあと（今の拡張子は wav）、出力は「元と同じ」
+    openState();
+    useEditorStore.setState({ originalFormat: 'mp3' });
+    render(<Editor />);
+    const select = screen.getByRole('combobox', { name: t.output });
+    expect(select).toHaveValue('keep');
+    expect(within(select).getByText(t.outputKeep('MP3'))).toBeInTheDocument();
+    expect(screen.getByText(a.lossLossy('MP3'))).toBeInTheDocument();
+    // 元のビット数は、元が非可逆なら出さない
+    expect(screen.queryByText(/16 ビット/)).toBeNull();
   });
 
   it('正規化の操作があれば、その目標を出して選択を止める・計っている間は前の値に「計っています…」', () => {

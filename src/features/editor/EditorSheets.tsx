@@ -24,7 +24,12 @@ import {
   submitSaveAs,
   validSaveAsName,
 } from './editorSave';
-import { type EditorSheet, hasUnsavedChanges, useEditorStore } from './editorStore';
+import {
+  type EditorSheet,
+  hasUnsavedChanges,
+  originalFormatOf,
+  useEditorStore,
+} from './editorStore';
 import styles from './Editor.module.css';
 import { outputChoice } from './formats';
 import { formatsFor } from './kindTraits';
@@ -142,7 +147,7 @@ function WarningsSheet() {
 function SaveAsSheet() {
   const item = useEditorStore((s) => s.item);
   const outputs = useEditorStore((s) => s.doc.outputs);
-  const source = useEditorStore((s) => s.source);
+  const sourceFormat = useEditorStore(originalFormatOf);
   const titleId = useId();
   const inputId = useId();
   const [name, setName] = useState(() => t.saveAsDefault(item?.title ?? ''));
@@ -152,7 +157,8 @@ function SaveAsSheet() {
     inputRef.current?.select();
   }, []);
   const formats = formatsFor(item);
-  const eff = formats?.effectiveFormat(outputChoice(outputs), source?.format ?? null) ?? null;
+  // 「元と同じ」は元のファイルの形式（source.format は画素の形式で、ファイルの形式ではない）
+  const eff = formats?.effectiveFormat(outputChoice(outputs), sourceFormat) ?? null;
   const ext = eff && formats ? formats.savedExt(eff.format, item?.ext ?? '') : (item?.ext ?? '');
   const trimmed = name.trim();
   const valid = validSaveAsName(trimmed);

@@ -58,6 +58,7 @@ import {
   type EditorSave,
   hasUnsavedChanges,
   onEditorResult,
+  originalFormatOf,
   refreshEditorView,
   reopenEditorWith,
   type SaveMode,
@@ -223,18 +224,21 @@ function forcedFormat(): EditFormatChoice {
   if (!formats) return null;
   const { format, forced } = formats.effectiveFormat(
     outputChoice(s.doc.outputs),
-    formats.formatOfExt(s.item?.ext),
+    originalFormatOf(s),
   );
   return forced ? { type: 'to', format } : null;
 }
 
-/** 保存しようとした形式（渡した形式。なければ文書の出力の形式、「元と同じ」なら元の形式。分からなければ null）。 */
+/**
+ * 保存しようとした形式（渡した形式。なければ文書の出力の形式、「元と同じ」なら元の形式。分からなければ null）。書けない
+ * 形式で断られたシートは Rust の解いた形式（`edit_formats` の `current`）を出し、これはその予備。
+ */
 function attemptedFormat(choice: EditFormatChoice): string | null {
   if (choice?.type === 'to') return choice.format;
   const s = useEditorStore.getState();
   const out = outputChoice(s.doc.outputs);
   if (out.type === 'to') return out.format;
-  return formatsFor(s.item)?.formatOfExt(s.item?.ext) ?? null;
+  return originalFormatOf(s);
 }
 
 /**
@@ -258,12 +262,15 @@ export function defaultFormatChoice(
   return (usable.find((c) => c.format === fallback) ?? usable[0])?.format ?? null;
 }
 
-/** 書けない形式で断られた保存：書ける形式を読んで、形式を選ぶシートを出す（出せたら真）。 */
+/**
+ * 書けない形式で断られた保存：書ける形式を読んで、形式を選ぶシートを出す（出せたら真）。書けなかった形式は Rust の解いた
+ * 今の出力の形式（`current`。「元と同じ」は元の形式）で、`attempted`（フロントが積むときに推した形式）は予備。
+ */
 async function offerFormats(
   session: string,
   mode: EditSaveModeDto,
   closeAfter: AfterClose | null,
-  unavailable: string | null,
+  attempted: string | null,
 ): Promise<boolean> {
   let list: Awaited<ReturnType<typeof listEditFormats>>;
   try {
@@ -280,7 +287,7 @@ async function offerFormats(
       closeAfter,
       formats: list.formats,
       fallback: list.fallback,
-      unavailable,
+      unavailable: list.current || attempted,
     },
   });
   return true;
@@ -308,7 +315,7 @@ async function startSave(
     return 'failed';
   }
   starting = true;
-  let unavailable: string | null = null;
+  let attempted: string | null = null;
   try {
     await whenEditorSettled();
     const s = useEditorStore.getState();
@@ -316,7 +323,7 @@ async function startSave(
     if (kind === 'overwrite' && !canSaveEditor(s)) return 'nothing';
     const before = sizeOf(s.item);
     const choice = kind === 'revert' ? null : (format ?? forcedFormat());
-    unavailable = kind === 'revert' ? null : attemptedFormat(choice);
+    attempted = kind === 'revert' ? null : attemptedFormat(choice);
     const started = await saveEdit(session, mode, choice);
     if (editorSession() !== session) return 'failed';
     applyEditorStatus(started.status, started.doc);
@@ -341,7 +348,7 @@ async function startSave(
     if (
       isIpcError(error, 'FormatUnavailable') &&
       kind !== 'revert' &&
-      (await offerFormats(session, mode, closeAfter, unavailable))
+      (await offerFormats(session, mode, closeAfter, attempted))
     ) {
       return 'format';
     }
