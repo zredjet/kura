@@ -199,6 +199,89 @@ fn streamed_windows_concatenate_to_render() {
     assert!(checked > 20 && quantized > 3, "{checked} {quantized}");
 }
 
+/// M13 段 3（E1）：`Engine::output_stream` の生産者を、全体・窓ごとに後ろから・区間を何度も頼んで流しても、`render` の出力と
+/// 同じ標本・メタデータになる。警告は `render` の警告と同じ（計画の順・重複なし）。流し解きは何度流しても 1 回。
+#[test]
+fn output_stream_reproduces_render_in_any_order() {
+    use kura_engine::audio::stream::{AudioProducer, stream_windows};
+    let engine = engine();
+    let mut r = determinism::rng(1301);
+    let (mut checked, mut warned) = (0, 0);
+    for case in 0..30 {
+        let input = random_audio_input(&mut r).generate().unwrap();
+        let len = 1 + below(&mut r, 4) as usize;
+        let g = random_audio_chain(&engine, &mut r, &input.shape(), len);
+        let Some(plan) = compile(&engine, &g, &input) else {
+            continue;
+        };
+        let source = Digest([case as u8; 32]);
+        let plain = BTreeMap::from([(
+            InputId(0),
+            InputValue {
+                value: input.clone(),
+                source,
+            },
+        )]);
+        let Ok(mut rendered) = engine.render(&plan, &plain, &NoMonitor) else {
+            continue;
+        };
+        let want = rendered.outputs.swap_remove(0).value;
+        let Value::Audio(w) = &want else { panic!() };
+        let planes = w.to_planes().unwrap();
+        let fin = BTreeMap::from([(
+            InputId(0),
+            FingerprintedInput::new(input.clone(), source).unwrap(),
+        )]);
+        let doc = String::from_utf8_lossy(&g.to_canonical_json().unwrap()).into_owned();
+        let mut cache = NodeCache::new([0, 1 << 30][case % 2]);
+        let mut out = engine
+            .output_stream(&plan, &fin, &mut cache, OutputId(0), &NoMonitor)
+            .unwrap_or_else(|e| panic!("{case}: {e}\n{doc}"));
+        assert_eq!(out.info().meta, w.meta, "{case}\n{doc}");
+        assert_eq!(out.info().frames, w.frames() as u64);
+        // 全体
+        let mut sink = Collect::default();
+        out.produce(None, &mut sink, &NoMonitor).unwrap();
+        for (got, want) in sink.planes.iter().zip(&planes) {
+            assert!(
+                got.len() == want.len()
+                    && got
+                        .iter()
+                        .zip(want.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{case}：流れが render と違う\n{doc}"
+            );
+        }
+        let presolved = out.stats().area.presolved;
+        // 窓ごとに後ろから
+        let windows = stream_windows(w.frames() as u64, None);
+        for (s, e) in windows.iter().rev() {
+            let mut one = Collect::default();
+            out.produce(Some(&Spans::one(*s, *e)), &mut one, &NoMonitor)
+                .unwrap();
+            assert_eq!(one.windows, vec![(*s, *e)]);
+            assert_eq!(one.info.as_ref().unwrap().meta, w.meta);
+            for (got, want) in one.planes.iter().zip(&planes) {
+                assert!(
+                    got.iter()
+                        .zip(&want[*s as usize..*e as usize])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{case}\n{doc}"
+                );
+            }
+        }
+        assert_eq!(out.stats().area.presolved, presolved, "流し解きは 1 回");
+        assert_eq!(
+            out.warnings(),
+            rendered.warnings.as_slice(),
+            "{case}\n{doc}"
+        );
+        warned += usize::from(!rendered.warnings.is_empty());
+        checked += 1;
+    }
+    assert!(checked > 20, "{checked} {warned}");
+}
+
 /// 遅延の値（源の参照のチャンク）にした入力。
 fn lazy(v: &Value) -> Value {
     let Value::Audio(a) = v else {

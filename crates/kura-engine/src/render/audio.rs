@@ -11,6 +11,8 @@
 //!   解く（流し解き。結果はキャッシュに入れる）。
 //! - 流れ（[`Engine::stream_audio`]）：出力を `STREAM_CHUNKS` チャンクの窓ごとに描いて `AudioSink` に渡す。
 //!   [`Engine::digest_audio_output`] は 1 回流してダイジェストを取る（`audio::digest::PcmTreeDigest`）。
+//! - 何度でも区間を選んで流せる出力（[`Engine::output_stream`]・[`OutputStream`]。M13 段 3）：流し解きの結果を呼び出しを
+//!   またいで持ち、警告を（ノード・符号・文で重複を除いて）計画の順に集める。保存の `Encoder::encode_stream` が読む。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -483,10 +485,12 @@ impl Engine {
             &shape,
             None,
             None,
+            None,
             &mut feed,
             presolved,
             stats,
             &mut windows,
+            None,
             mon,
         )?;
         let end = feed.end()?;
@@ -509,7 +513,8 @@ impl Engine {
 
     /// ポート `port`（形 `shape`。長さが決まっていること）の値を、`spans` に掛かるチャンク（None は全体）の窓ごとに描いて
     /// `sink` に渡す。窓は `port_pass`（前の値なし）で描き、依存の外を読んだ窓は全体で描き直す。`quantize` があれば窓ごとに
-    /// 量子化する（乱数は絶対位置なので全体と同じ）。メタデータは最初の窓（窓がなければ空の範囲の描画）の値のもの。
+    /// 量子化する（乱数は絶対位置なので全体と同じ）。`info` があれば最初にそれで `begin` し、なければメタデータは最初の窓
+    /// （窓がなければ空の範囲の描画）の値のもの。`warnings` があれば、描いたノード・当たったノードの警告を足す。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn stream_port(
         &self,
@@ -518,11 +523,13 @@ impl Engine {
         port: &PortRef,
         shape: &Shape,
         quantize: Option<&Quantize>,
+        info: Option<&StreamInfo>,
         spans: Option<&Spans>,
         sink: &mut dyn AudioSink,
         presolved: &mut Presolved,
         stats: &mut AreaStats,
         windows: &mut u64,
+        mut warnings: Option<&mut Vec<Issue>>,
         mon: &dyn Monitor,
     ) -> Result<(), EngineError> {
         let Shape::Audio {
@@ -537,13 +544,25 @@ impl Engine {
         };
         let list = stream_windows(frames, spans);
         let mut begun = false;
-        let first = list
-            .first()
-            .map_or(Area::Empty, |(s, e)| Area::span(*s, *e));
-        if list.is_empty() {
-            let a = self.window_value(
-                cx, cache, port, shape, quantize, first, presolved, stats, mon,
+        if let Some(info) = info {
+            sink.begin(info)?;
+            begun = true;
+        }
+        if list.is_empty() && !begun {
+            let (a, w) = self.window_value(
+                cx,
+                cache,
+                port,
+                shape,
+                quantize,
+                Area::Empty,
+                presolved,
+                stats,
+                mon,
             )?;
+            if let Some(out) = warnings.as_deref_mut() {
+                merge_warnings(out, w);
+            }
             sink.begin(&StreamInfo {
                 rate,
                 channels: usize::from(channels),
@@ -556,7 +575,7 @@ impl Engine {
             if mon.canceled() {
                 return Err(EngineError::Canceled);
             }
-            let a = self.window_value(
+            let (a, w) = self.window_value(
                 cx,
                 cache,
                 port,
@@ -567,6 +586,9 @@ impl Engine {
                 stats,
                 mon,
             )?;
+            if let Some(out) = warnings.as_deref_mut() {
+                merge_warnings(out, w);
+            }
             if !begun {
                 sink.begin(&StreamInfo {
                     rate,
@@ -598,17 +620,19 @@ impl Engine {
         presolved: &mut Presolved,
         stats: &mut AreaStats,
         mon: &dyn Monitor,
-    ) -> Result<Arc<Audio>, EngineError> {
+    ) -> Result<(Arc<Audio>, Vec<Issue>), EngineError> {
         let frames = match shape {
             Shape::Audio { frames, .. } => frames.max(),
             _ => 0,
         };
-        let value = match port {
-            PortRef::Input { id } => cx
-                .input_values
-                .get(id)
-                .cloned()
-                .ok_or_else(|| EngineError::Internal("流す入力の値がありません".into()))?,
+        let (value, warnings) = match port {
+            PortRef::Input { id } => (
+                cx.input_values
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| EngineError::Internal("流す入力の値がありません".into()))?,
+                Vec::new(),
+            ),
             PortRef::Node { id } => {
                 let pass = match self.port_pass(
                     cx,
@@ -654,7 +678,7 @@ impl Engine {
                         ));
                     }
                 };
-                pass.value
+                (pass.value, pass.warnings)
             }
         };
         let Value::Audio(a) = value else {
@@ -665,13 +689,13 @@ impl Engine {
                 let usize_frames = usize::try_from(frames).unwrap_or(usize::MAX);
                 let only = chunks_covering(&area, usize_frames.min(a.frames()));
                 match crate::audio::quantize(&a, q, &cx.source, Some(&only), mon)? {
-                    Value::Audio(q) => Ok(q),
+                    Value::Audio(q) => Ok((q, warnings)),
                     _ => Err(EngineError::Internal(
                         "量子化した値が音声ではありません".into(),
                     )),
                 }
             }
-            None => Ok(a),
+            None => Ok((a, warnings)),
         }
     }
 
@@ -717,11 +741,13 @@ impl Engine {
             from,
             shape,
             quantize.as_ref(),
+            None,
             spans,
             sink,
             &mut presolved,
             &mut stats.area,
             &mut stats.windows,
+            None,
             mon,
         )?;
         Ok(stats)
@@ -759,6 +785,167 @@ impl Engine {
             .meta
             .ok_or_else(|| EngineError::Internal("流れのメタデータがありません".into()))?;
         sink.digest.finish(&meta)
+    }
+}
+
+/// 窓の警告 `w` を `out` に足す（同じもの（ノード・符号・文）は 1 度だけ）。
+fn merge_warnings(out: &mut Vec<Issue>, w: Vec<Issue>) {
+    for i in w {
+        if !out.contains(&i) {
+            out.push(i);
+        }
+    }
+}
+
+/// 計画の出力を、何度でも区間を選んで流せる生産者（M13 段 3。[`Engine::output_stream`]）。窓は `stream_audio` と同じく
+/// 範囲の描画（前の値なし）で描いて渡したら手放す。流し解きの結果（`Presolved`）を `produce` の呼び出しをまたいで持つので、
+/// 区間ごとに何度呼んでも（Ogg Vorbis の後ろ向きの窓ごとの呼び出しでも）流し解きは 1 回で済む。形とメタデータ（`info`）は
+/// 作るときに空の範囲の窓から求める。値は `render` の出力と同じ（E39・E43）。
+pub struct OutputStream<'a> {
+    engine: &'a Engine,
+    cx: PassCx<'a>,
+    cache: &'a mut NodeCache,
+    from: PortRef,
+    shape: Shape,
+    quantize: Option<Quantize>,
+    info: StreamInfo,
+    presolved: Presolved,
+    stats: StreamStats,
+    warnings: Vec<Issue>,
+}
+
+impl OutputStream<'_> {
+    /// これまでに描いた窓の警告（ノード・符号・文で重複を除き、計画のノードの順）。
+    pub fn warnings(&self) -> &[Issue] {
+        &self.warnings
+    }
+
+    /// これまでの流れの数（窓・範囲の描画の数の和）。
+    pub fn stats(&self) -> StreamStats {
+        self.stats
+    }
+
+    /// 警告を計画のノードの順に並べ直す（同じノードの中は見つけた順。ノードのないものは後ろ）。
+    fn order_warnings(&mut self) {
+        let index = &self.cx.index;
+        self.warnings.sort_by_key(|w| {
+            w.node
+                .and_then(|n| index.get(&n).copied())
+                .unwrap_or(usize::MAX)
+        });
+    }
+}
+
+impl crate::audio::stream::AudioProducer for OutputStream<'_> {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+
+    fn produce(
+        &mut self,
+        spans: Option<&Spans>,
+        sink: &mut dyn AudioSink,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let mut warnings = std::mem::take(&mut self.warnings);
+        let r = self.engine.stream_port(
+            &self.cx,
+            self.cache,
+            &self.from,
+            &self.shape,
+            self.quantize.as_ref(),
+            Some(&self.info),
+            spans,
+            sink,
+            &mut self.presolved,
+            &mut self.stats.area,
+            &mut self.stats.windows,
+            Some(&mut warnings),
+            mon,
+        );
+        self.warnings = warnings;
+        self.order_warnings();
+        r
+    }
+}
+
+impl Engine {
+    /// 計画の出力 `output` を、何度でも区間を選んで流せる生産者にする（M13 段 3。保存の `Encoder::encode_stream` が読む）。
+    /// 形とメタデータは空の範囲の窓を描いて求める（範囲を持つノードは標本を描かない。流し解きはここで済み、結果を持ち越す）。
+    /// 長さの分からない出力・縮小の段の計画は `Unsupported`（`stream_audio` と同じ）。
+    pub fn output_stream<'a>(
+        &'a self,
+        plan: &'a Plan,
+        inputs: &BTreeMap<InputId, FingerprintedInput>,
+        cache: &'a mut NodeCache,
+        output: OutputId,
+        mon: &dyn Monitor,
+    ) -> Result<OutputStream<'a>, EngineError> {
+        if plan.engine != self.token {
+            return Err(EngineError::Internal(
+                "別のエンジンで作った計画です（キャッシュの指紋が登録表に縛られないため）".into(),
+            ));
+        }
+        if plan.level != 0 {
+            return Err(EngineError::Unsupported(
+                "縮小の段の計画は流せません（等倍の計画で描きます）".into(),
+            ));
+        }
+        cache.bind_engine(self.token)?;
+        if inputs.len() != plan.inputs.len() {
+            return Err(bad_input("入力の数が計画と違います"));
+        }
+        self.check_inputs(plan, |id| inputs.get(&id).map(|v| &v.value))?;
+        let cx = PassCx::new(self, plan, inputs)?;
+        let Some((_, from, shape, quantize)) = plan.outputs.iter().find(|o| o.0 == output) else {
+            return Err(bad_input(format!("出力 {} はありません", output.0)));
+        };
+        let Shape::Audio {
+            rate,
+            channels,
+            frames: Dim::Exact(frames),
+        } = *shape
+        else {
+            return Err(EngineError::Unsupported(
+                "長さの分からない音声・音声でない出力は流せません".into(),
+            ));
+        };
+        let mut presolved = Presolved::new();
+        let mut stats = StreamStats::default();
+        let (a, mut warnings) = self.window_value(
+            &cx,
+            cache,
+            from,
+            shape,
+            quantize.as_ref(),
+            Area::Empty,
+            &mut presolved,
+            &mut stats.area,
+            mon,
+        )?;
+        let info = StreamInfo {
+            rate,
+            channels: usize::from(channels),
+            frames,
+            meta: a.meta.clone(),
+        };
+        drop(a);
+        let mut uniq = Vec::new();
+        merge_warnings(&mut uniq, std::mem::take(&mut warnings));
+        let mut out = OutputStream {
+            engine: self,
+            cx,
+            cache,
+            from: *from,
+            shape: *shape,
+            quantize: *quantize,
+            info,
+            presolved,
+            stats,
+            warnings: uniq,
+        };
+        out.order_warnings();
+        Ok(out)
     }
 }
 

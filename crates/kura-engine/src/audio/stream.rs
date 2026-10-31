@@ -3,6 +3,8 @@
 //!
 //! - [`AudioSink`]：`begin`（形とメタデータ）→ `feed`（頭から順・重ならず・チャンクに揃えた窓の全チャンネル）→ `finish`。
 //! - [`stream_value`]：値（遅延の値を含む）を窓ごとに読んで渡す。計画の出力は `Engine::stream_audio`（render/audio.rs）。
+//! - [`AudioProducer`]：何度でも区間を選んで流せるもの（M13 段 3。計画の出力は `Engine::output_stream`、値は
+//!   [`ValueProducer`]）。エンコーダの `encode_stream` が読む。
 //! - [`PcmDigest`]：`kura-pcm-v1` のダイジェスト（docs/editing.md §8.6）を、チャンネルの順に区間を足して作る。`Value::digest`
 //!   と、区間の順によらない木のダイジェスト（`audio::digest::PcmTreeDigest`。流れの窓から 1 回で取る）の小さい音声の道が
 //!   同じ部品を通る（式は変えない）。
@@ -78,6 +80,61 @@ pub fn stream_windows(frames: u64, spans: Option<&Spans>) -> Vec<(u64, u64)> {
     }
     out.extend(run);
     out
+}
+
+/// 何度でも、区間を選んで流せる音声（M13 段 3。docs/editing.md §12.1）：計画の出力（`Engine::output_stream`）と値
+/// （[`ValueProducer`]）。エンコーダはこれを読んで書く（`Encoder::encode_stream`。Ogg Vorbis は後ろ向き・前向きの 2 回流す）。
+pub trait AudioProducer {
+    /// 流れの形とメタデータ（どの区間を流しても同じ。`produce` の `begin` に渡すもの）。
+    fn info(&self) -> &StreamInfo;
+    /// `spans` に掛かるチャンク（None は全体）を窓ごとに `sink` へ流す（`begin` → 窓 → `finish`）。何度呼んでもよく、同じ
+    /// 区間なら同じ標本を渡す。
+    fn produce(
+        &mut self,
+        spans: Option<&Spans>,
+        sink: &mut dyn AudioSink,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError>;
+    /// 流した標本のダイジェスト（`kura-pcm-v1`。全体を 1 度でも流し終えていれば Some。ダイジェストを取らない生産者は None）。
+    fn digest(&mut self) -> Result<Option<Digest>, EngineError> {
+        Ok(None)
+    }
+}
+
+/// 値（遅延の値を含む）を流す生産者（[`stream_value`] を包む。値の `encode` が流して書く口を通るための形）。
+pub struct ValueProducer<'a> {
+    audio: &'a Audio,
+    info: StreamInfo,
+}
+
+impl<'a> ValueProducer<'a> {
+    /// 値 `audio` を流す生産者。
+    pub fn new(audio: &'a Audio) -> Self {
+        Self {
+            audio,
+            info: StreamInfo {
+                rate: audio.rate(),
+                channels: audio.channels(),
+                frames: audio.frames() as u64,
+                meta: audio.meta.clone(),
+            },
+        }
+    }
+}
+
+impl AudioProducer for ValueProducer<'_> {
+    fn info(&self) -> &StreamInfo {
+        &self.info
+    }
+
+    fn produce(
+        &mut self,
+        spans: Option<&Spans>,
+        sink: &mut dyn AudioSink,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        stream_value(self.audio, spans, sink, mon)
+    }
 }
 
 /// 値 `a`（`spans` の区間に掛かるチャンク。None は全体）を窓ごとに読んで `sink` に渡す。窓ごとに中止を確かめる。
