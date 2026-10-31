@@ -1404,7 +1404,9 @@ pub fn save(
         }
     }
     if !revert {
-        // 文書の出力の形式をこの環境で書けるか（MP3 で ffmpeg がない、など）を積む前に確かめる（M13 段 3）
+        // 文書の出力の形式をこの環境で書けるか（MP3 で ffmpeg がない、など）を積む前に確かめる（M13 段 3）。確かめるのは保存の
+        // ジョブと同じ今の組（開いたあとに外部ツールの場所が変わっても効く。読むための `editor.codecs` とは分ける）
+        let codecs = env.engine.codecs();
         let graph = st.session.head().to_graph();
         let source = env
             .library
@@ -1418,7 +1420,7 @@ pub fn save(
             graph.outputs.first().map(|o| o.format.clone()),
         ) && let Some((_, shape)) = plan.output_shapes().first()
             && let Err(crate::edit::save::FormatProblem::Unavailable { format, fallback }) =
-                crate::edit::save::save_format(&editor.codecs, &out, source, shape)
+                crate::edit::save::save_format(&codecs, &out, source, shape)
         {
             return Err(EditorError::FormatUnavailable { format, fallback });
         }

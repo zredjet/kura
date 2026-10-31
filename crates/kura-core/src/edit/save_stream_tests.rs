@@ -1266,3 +1266,95 @@ fn streamed_progress_never_goes_back() {
     }
     assert_consistent(&env.lib);
 }
+
+/// mp3 のフィクスチャ（固定の段の nanomp3 で読める）を元にした音声のアイテム。
+fn add_mp3(env: &Env) -> i64 {
+    let mp3 = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kura-engine/fixtures/mp3-lame.mp3"),
+    )
+    .unwrap();
+    add_audio(&env.lib, &mp3, "mp3", "mp3 の声").0
+}
+
+/// エディタで開く（音声の表示の範囲は既定）。
+fn open_editor(env: &Env, item: i64) -> String {
+    use super::editor::{EditorEnv, OpenRequest, Viewport, open};
+    open(
+        &EditorEnv {
+            library: &env.lib,
+            jobs: &env.jobs,
+            engine: &env.engine,
+        },
+        &OpenRequest {
+            item_id: item,
+            viewport: Viewport::audio_idle(),
+            from_draft: false,
+        },
+    )
+    .unwrap()
+    .session
+}
+
+/// エディタの保存（`editor::save`）。
+fn editor_save(
+    env: &Env,
+    session: &str,
+    mode: super::editor::SaveMode,
+    format: Option<FormatChoice>,
+) -> Result<super::editor::SaveStarted, super::editor::EditorError> {
+    use super::editor::{EditorEnv, save};
+    save(
+        &EditorEnv {
+            library: &env.lib,
+            jobs: &env.jobs,
+            engine: &env.engine,
+        },
+        session,
+        mode,
+        format,
+    )
+}
+
+/// 保存のジョブの数。
+fn edit_jobs(env: &Env) -> i64 {
+    env.count("SELECT count(*) FROM jobs WHERE kind = 'edit'")
+}
+
+/// エディタの保存の FormatUnavailable は、開いたときの組ではなく今のコーデックの組（保存のジョブと同じ）で確かめる：開いた
+/// あとに ffmpeg の書き手のある組へ入れ替えて作り直せば、開いたままのエディタで元の形式のまま（mp3）保存でき、書き手を
+/// 外せばまた断る（M13 段 3 の検証の直し #12）。
+#[test]
+fn editor_save_checks_the_current_codecs() {
+    use super::editor::{EditorError, SaveMode};
+    let codecs = Arc::new(Mutex::new(CodecSet::pinned()));
+    let env = Env::with(FakeEngineFactory::with_codecs(codecs.clone()), None);
+    let item = add_mp3(&env);
+    let session = open_editor(&env, item);
+    let r = editor_save(&env, &session, SaveMode::Overwrite, None);
+    assert!(
+        matches!(&r, Err(EditorError::FormatUnavailable { format, .. }) if format == "mp3"),
+        "{:?}",
+        r.err()
+    );
+    // ffmpeg の場所を指定した（書き手のある組を作り直した）
+    let tools = FakeTools::new("exit 1", "exit 1", "cksum > \"$out\"");
+    *codecs.lock().unwrap() = save_codecs(&tools);
+    env.engine.reload_codecs();
+    let started = editor_save(&env, &session, SaveMode::Overwrite, None).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_done(&env.jobs.get(started.job).unwrap());
+    assert_eq!(head(&env.lib, item).ext, "mp3");
+    // 書き手を外した（ffmpeg の指定を外した）：また積む前に断る
+    *codecs.lock().unwrap() = CodecSet::pinned();
+    env.engine.reload_codecs();
+    let jobs = edit_jobs(&env);
+    let r = editor_save(&env, &session, SaveMode::Overwrite, None);
+    assert!(
+        matches!(&r, Err(EditorError::FormatUnavailable { .. })),
+        "{:?}",
+        r.err()
+    );
+    assert_eq!(edit_jobs(&env), jobs, "断ったのに保存を積んだ");
+    assert_consistent(&env.lib);
+}
