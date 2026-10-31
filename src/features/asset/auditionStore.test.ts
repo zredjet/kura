@@ -132,10 +132,12 @@ describe('試聴の状態と口', () => {
     expect(notify).toHaveBeenLastCalledWith(t.auditionUnsupported);
   });
 
-  it('/pcm が 2xx でなければ HTTP の番号を出さず、分かる言葉で知らせる（ファイルがない・範囲の外・ほか）', async () => {
+  it('/pcm が 2xx でなければ HTTP の番号を出さず、分かる言葉で知らせる（ファイルがない・範囲の外・空き不足・ほか）', async () => {
     const cases: [unknown, string][] = [
       [new MediaHttpError(404), t.auditionFailed(t.auditionMissing)],
       [new MediaHttpError(416), t.auditionFailed(t.auditionRange)],
+      // 試聴の PCM を作る一時の置き場の空きが足りない（PcmError::NoSpace）
+      [new MediaHttpError(507), t.auditionFailed(t.auditionNoSpace)],
       [new MediaHttpError(500), t.auditionFailed(t.auditionUnreadable)],
       // fetch そのものの失敗（WebKit の英語の message）・応答を読めない
       [new TypeError('Load failed'), t.auditionFailed(t.auditionUnreadable)],

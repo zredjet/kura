@@ -645,9 +645,10 @@ export const ja = {
     auditionUnsupported: 'この音声は試聴できません',
     auditionBusy: '混んでいます。もう一度押してください',
     auditionFailed: (message: string) => `試聴できませんでした：${message}`,
-    /** 試聴の PCM（/pcm）を取れなかった理由（HTTP の番号は出さない）。404・416・ほか。 */
+    /** 試聴の PCM（/pcm）を取れなかった理由（HTTP の番号は出さない）。404・416・507・ほか。 */
     auditionMissing: 'ファイルが見つかりません',
     auditionRange: 'この範囲は試聴できません',
+    auditionNoSpace: 'ディスクの空き容量が足りません',
     auditionUnreadable: '音声を読めませんでした',
     // フォント
     family: '書体名',
