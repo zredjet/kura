@@ -20,7 +20,7 @@ fn expected(a: &kura_engine::value::Audio, f: u64, r: u64) -> Option<u64> {
         })
         .collect();
     let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
-    nearest_zero_crossing(&views, lo, f)
+    nearest_zero_crossing(&views, lo, f, r)
 }
 
 /// A13：公開した表示の値からも、表示の外を描いても、全体の描画のゼロ交差と同じ。半径は 4,096 で切る。表示を止めない。

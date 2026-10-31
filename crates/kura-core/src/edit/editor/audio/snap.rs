@@ -4,7 +4,8 @@
 //!   そこから読み、覆っていなければ錠の中で区間だけを描いて読む（`render_area`）。
 //! - `Latest` の世代を払い出さない（スポイトと同じ。描いている途中の表示を止めない）。止まるのは閉じたときだけ。
 //! - ゼロ交差（[`nearest_zero_crossing`]）：チャンネルの和 m について、g は「m[g] == 0、または m[g−1] と m[g] の符号が違う」
-//!   位置。|g − f| が最も小さいもの（同じなら小さい g）。なければ `found: false` で f を返す。
+//!   位置で、|g − f| ≤ r のもの（読む区間の左端 f − r − 1 は前の標本との比べのためだけに読む）。|g − f| が最も小さいもの
+//!   （同じなら小さい g）。なければ `found: false` で f を返す。
 
 use kura_engine::Shape;
 use kura_engine::render::area::AreaRequest;
@@ -24,8 +25,9 @@ pub struct Snapped {
     pub found: bool,
 }
 
-/// `planes`（フレーム `offset` から。チャンネルの順・同じ長さ）の中で、`f` に最も近いゼロ交差（モジュールの説明）。
-pub fn nearest_zero_crossing(planes: &[&[f32]], offset: u64, f: u64) -> Option<u64> {
+/// `planes`（フレーム `offset` から。チャンネルの順・同じ長さ）の中で、`f` に最も近い半径 `radius` 以内のゼロ交差
+/// （モジュールの説明）。
+pub fn nearest_zero_crossing(planes: &[&[f32]], offset: u64, f: u64, radius: u64) -> Option<u64> {
     let n = planes.first().map_or(0, |p| p.len());
     let mix = |i: usize| -> f32 { planes.iter().map(|p| p[i]).sum() };
     let mut best: Option<u64> = None;
@@ -35,7 +37,8 @@ pub fn nearest_zero_crossing(planes: &[&[f32]], offset: u64, f: u64) -> Option<u
         let g = offset + i as u64;
         let crossing =
             m == 0.0 || prev.is_some_and(|p| (p < 0.0 && m > 0.0) || (p > 0.0 && m < 0.0));
-        if crossing && best.is_none_or(|b| g.abs_diff(f) < b.abs_diff(f)) {
+        if crossing && g.abs_diff(f) <= radius && best.is_none_or(|b| g.abs_diff(f) < b.abs_diff(f))
+        {
             best = Some(g);
         }
         prev = Some(m);
@@ -139,7 +142,7 @@ pub fn snap(
         }
     };
     let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
-    Ok(match nearest_zero_crossing(&views, a, f) {
+    Ok(match nearest_zero_crossing(&views, a, f, r) {
         Some(g) => Snapped {
             frame: g,
             found: true,
@@ -162,15 +165,35 @@ mod tests {
         let r = [0.25f32, 0.1, -0.05, -0.1, 0.0, 0.2];
         let p: Vec<&[f32]> = vec![&l, &r];
         // 交差：2（+→−）・4（0）・5 は 4 が 0 なので符号の比べには入らない（0 は正でも負でもない）
-        assert_eq!(nearest_zero_crossing(&p, 100, 100), Some(102));
+        assert_eq!(nearest_zero_crossing(&p, 100, 100, 9), Some(102));
         assert_eq!(
-            nearest_zero_crossing(&p, 100, 103),
+            nearest_zero_crossing(&p, 100, 103, 9),
             Some(102),
             "同じ距離なら小さい g"
         );
-        assert_eq!(nearest_zero_crossing(&p, 100, 105), Some(104));
+        assert_eq!(nearest_zero_crossing(&p, 100, 105, 9), Some(104));
         let flat = [0.5f32; 8];
-        assert_eq!(nearest_zero_crossing(&[&flat], 0, 3), None);
-        assert_eq!(nearest_zero_crossing(&[], 0, 3), None);
+        assert_eq!(nearest_zero_crossing(&[&flat], 0, 3, 9), None);
+        assert_eq!(nearest_zero_crossing(&[], 0, 3, 9), None);
+    }
+
+    /// 半径の外は返さない：読む区間の左端（f − r − 1）は前の標本との比べのためだけに読む。半径 0・左端の 0 も。
+    #[test]
+    fn crossings_stay_within_the_radius() {
+        // 半径 2・f = 3：読む区間は [0, 6)。g = 0 は |g − f| = 3 なので返さない
+        let edge = [0.0f32, 0.5, 0.5, 0.5, 0.5, 0.5];
+        assert_eq!(nearest_zero_crossing(&[&edge], 0, 3, 2), None);
+        // 符号の比べは左端の標本と g = f − r の間でもよい（[−, +] の + の位置 1 は半径 2 の内）
+        let flip = [-0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5];
+        assert_eq!(nearest_zero_crossing(&[&flip], 0, 3, 2), Some(1));
+        // 半径 0：f の標本が 0 のときだけ
+        let pair = [0.0f32, 0.5];
+        assert_eq!(nearest_zero_crossing(&[&pair], 2, 3, 0), None);
+        let zero = [0.5f32, 0.0];
+        assert_eq!(nearest_zero_crossing(&[&zero], 2, 3, 0), Some(3));
+        // 左端（f ≤ r なら読む区間は 0 から）：g = 0 の 0 は半径の内
+        let start = [0.0f32, 0.5, 0.5];
+        assert_eq!(nearest_zero_crossing(&[&start], 0, 1, 2), Some(0));
+        assert_eq!(nearest_zero_crossing(&[&start], 0, 2, 1), None);
     }
 }
