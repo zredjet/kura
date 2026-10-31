@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use kura_engine::codec::platform::PlatformAacEncoder;
-use kura_engine::codec::{CodecSet, EncodedStamp};
-use kura_engine::doc::{FormatChoice, InputId};
+use kura_engine::codec::{CodecEnv, CodecSet, Decoder, EncodedStamp, ReadSeek, Tier};
+use kura_engine::doc::{DecodeOptions, FormatChoice, InputId};
 use kura_engine::render::InputValue;
 use kura_engine::testgen::InputGen;
 use kura_engine::testing::platform::{FakeAacBackend, FakePlatformDecoder};
-use kura_engine::{Digest, Engine, Graph, NoMonitor, Value};
+use kura_engine::{Digest, Engine, EngineError, Graph, Limits, Monitor, NoMonitor, Shape, Value};
 use rusqlite::params;
 use serde_json::{Value as Json, json};
 
@@ -308,88 +308,210 @@ fn s19_platform_audio_first_save_promotes_the_work_file() {
     assert_consistent(&env.lib);
 }
 
-/// S20：窓が 3 つ以上ある音声（8 kHz で 2.2M フレーム以上）の保存を、書き終えた所で一時停止 → 再開・中止。一時停止は
-/// 作業用のファイルを残し、再開すると初めから書いて作業用のファイルを作り直さない（デコーダが読んだ数が 1 のまま）。
-/// 中止は staging も作業用のファイルも残らない。
+/// S20 で止める所。
+#[derive(Debug, Clone, Copy)]
+enum StopAt {
+    /// 書く回の途中：その回の最初の窓を書き手に渡したあと（`second` なら 2 回目の回。ogg の 1 回目は後ろ向きの回）。
+    Writing { second: bool },
+    /// 作業用の PCM を作る途中（偽の Platform のデコーダの中）。
+    Decoding,
+    /// R2 の読み直しの途中（最初の区切りを読んだあと）。
+    Rehash,
+    /// 書き終えた所（R2 のあと、止める指示を見る前）。
+    Written,
+}
+
+/// S20：窓が 2 つ以上ある音声（8 kHz で 1.1M・2.3M フレーム）の保存を、書いている途中（書く回の窓の合間。ogg は後ろ向きの回と
+/// 前向きの回）・作業用の PCM を作る途中・R2 の読み直しの途中・書き終えた所で一時停止 → 再開・中止する。止めたジョブは
+/// Paused／Canceled（Failed ではない）で、止めた所より先へ進まず、staging に .part は残らない。一時停止は作業用の PCM を残し
+/// （作る途中なら書きかけは残さない）、再開すると初めから書いて作業用の PCM を作り直さない（デコーダが読んだ数が 1 のまま）。
+/// 中止は何も残らない。
 #[test]
 fn s20_long_audio_pause_restarts_and_reuses_the_work_file() {
-    for pause in [true, false] {
-        let decoder = opus_decoder(1, 2_300_000);
-        let codecs = {
-            let mut set = CodecSet::pinned();
-            set.add_decoder(decoder.clone()).unwrap();
-            Arc::new(Mutex::new(set))
-        };
-        let (reached_tx, reached_rx) = mpsc::channel::<()>();
-        let (go_tx, go_rx) = mpsc::channel::<()>();
-        let armed = Arc::new(AtomicBool::new(false));
-        let env = Env::setup(
-            Setup {
-                factory: FakeEngineFactory::with_codecs(codecs.clone()),
-                ..Setup::default()
-            },
-            {
-                let armed = armed.clone();
-                move |_| {
-                    let (reached, go) = (Mutex::new(reached_tx), Mutex::new(go_rx));
-                    Some(Arc::new(move |stage| {
-                        if stage == Stage::Written && armed.swap(false, Ordering::SeqCst) {
-                            reached.lock().unwrap().send(()).unwrap();
-                            let _ = go.lock().unwrap().recv();
-                        }
-                    }))
-                }
-            },
-        );
-        let (item, _) = add_audio(&env.lib, b"long fake opus", "opus", "長い声");
-        armed.store(true, Ordering::SeqCst);
-        let id = env.start(
-            item,
-            base_of(&env.lib, item),
-            SaveAction::Overwrite {
-                graph: audio_doc(-3.0, Some("wav")),
-            },
-        );
-        reached_rx.recv_timeout(4 * WAIT).unwrap();
-        if pause {
-            env.jobs.pause(id).unwrap();
-        } else {
-            env.jobs.cancel(id).unwrap();
+    let cases = [
+        (StopAt::Writing { second: false }, "wav", 2_300_000),
+        (StopAt::Writing { second: false }, "ogg", 1_100_000),
+        (StopAt::Writing { second: true }, "ogg", 1_100_000),
+        (StopAt::Decoding, "wav", 1_100_000),
+        (StopAt::Rehash, "wav", 1_100_000),
+        (StopAt::Written, "wav", 2_300_000),
+    ];
+    for (at, out, frames) in cases {
+        for pause in [true, false] {
+            s20_case(at, out, frames, pause);
         }
-        go_tx.send(()).unwrap();
-        assert!(env.jobs.wait_idle(WAIT));
+    }
+}
+
+fn s20_case(at: StopAt, out: &str, frames: u64, pause: bool) {
+    let what = format!(
+        "{at:?} → {out}・{frames} フレーム（{}）",
+        if pause { "一時停止" } else { "中止" }
+    );
+    let decoder = opus_decoder(1, frames);
+    let (gated, in_decoder) = gated_decoder(decoder.clone());
+    let mut set = CodecSet::pinned();
+    set.add_decoder(gated).unwrap();
+    let (env, env_gate) = gated_env(Arc::new(Mutex::new(set)), move |stage| match (at, stage) {
+        (StopAt::Writing { second }, Stage::Window { fed, frames }) => {
+            if second {
+                fed > frames && fed < 2 * frames
+            } else {
+                fed < frames
+            }
+        }
+        (StopAt::Rehash, Stage::Rehash) | (StopAt::Written, Stage::Written) => true,
+        _ => false,
+    });
+    let (item, _) = add_audio(&env.lib, b"long fake opus", "opus", "長い声");
+    let gate = match at {
+        StopAt::Decoding => &in_decoder,
+        _ => &env_gate,
+    };
+    gate.arm();
+    let id = env.start(
+        item,
+        base_of(&env.lib, item),
+        SaveAction::Overwrite {
+            graph: audio_doc(-3.0, Some(out)),
+        },
+    );
+    gate.wait(&env, id);
+    if pause {
+        env.jobs.pause(id).unwrap();
+    } else {
+        env.jobs.cancel(id).unwrap();
+    }
+    gate.open();
+    assert!(env.jobs.wait_idle(4 * WAIT), "{what}");
+    let record = env.jobs.get(id).unwrap();
+    let state = if pause {
+        JobState::Paused
+    } else {
+        JobState::Canceled
+    };
+    assert_eq!(record.state, state, "{what}：{:?}", record.message);
+    // 止めた所より先へ進んでいない（書く途中で止めたら R2 も書き終えた所も通らない）
+    let seen = env_gate.seen();
+    let beyond = |s: &Stage| match at {
+        StopAt::Writing { .. } => matches!(s, Stage::Rehash | Stage::Written),
+        StopAt::Decoding => matches!(s, Stage::Window { .. } | Stage::Rehash | Stage::Written),
+        StopAt::Rehash => matches!(s, Stage::Written),
+        StopAt::Written => false,
+    };
+    assert!(!seen.iter().any(beyond), "{what}：止めずに進んだ {seen:?}");
+    let parts: Vec<_> = staged(&env.lib)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|x| x == "part"))
+        .collect();
+    assert!(parts.is_empty(), "{what}：{parts:?}");
+    // 作る途中で止めたら、デコーダは読み終えていない（書きかけの作業用の PCM は残さない）
+    let decoding = matches!(at, StopAt::Decoding);
+    assert_eq!(decoder.reads(), u64::from(!decoding), "{what}");
+    if pause {
+        assert_eq!(
+            env.engine.work_pcm().usage().0,
+            usize::from(!decoding),
+            "{what}：一時停止で残す作業用の PCM"
+        );
+        env.jobs.resume(id).unwrap();
+        assert!(env.jobs.wait_idle(4 * WAIT), "{what}");
         let record = env.jobs.get(id).unwrap();
-        let state = if pause {
-            JobState::Paused
-        } else {
-            JobState::Canceled
-        };
-        assert_eq!(record.state, state, "{:?}", record.message);
-        assert_eq!(decoder.reads(), 1);
-        if pause {
-            // 作業用のファイルは残す（再開で使う）。staging の .part は消えている
-            assert_eq!(env.engine.work_pcm().usage().0, 1);
-            let left: Vec<_> = staged(&env.lib)
-                .into_iter()
-                .filter(|p| p.extension().is_some_and(|x| x == "part"))
-                .collect();
-            assert!(left.is_empty(), "{left:?}");
-            env.jobs.resume(id).unwrap();
-            assert!(env.jobs.wait_idle(4 * WAIT));
-            assert_done(&env.jobs.get(id).unwrap());
-            assert_eq!(decoder.reads(), 1, "作業用のファイルを作り直した");
-            assert_eq!(result_of(&env.jobs.get(id).unwrap())["anchor"], "created");
+        assert_done(&record);
+        assert_eq!(decoder.reads(), 1, "{what}：作業用の PCM を作り直した");
+        assert_eq!(result_of(&record)["anchor"], "created", "{what}");
+    }
+    assert_eq!(env.engine.work_pcm().usage(), (0, 0), "{what}");
+    assert_consistent(&env.lib);
+}
+
+/// 読む途中で門に止まる偽の Platform のデコーダ（`inner` に読ませる前に、構えていればテストに知らせて「進め」を待ち、止める
+/// 指示が出ていれば中止を返す）。作業用の PCM を作る途中の一時停止・中止を写す。
+struct GatedDecoder {
+    inner: Arc<FakePlatformDecoder>,
+    reached: Mutex<mpsc::Sender<()>>,
+    go: Mutex<mpsc::Receiver<()>>,
+    armed: Arc<AtomicBool>,
+}
+
+/// `inner` を包んだ [`GatedDecoder`] と、その門（通った段は覚えない）。
+fn gated_decoder(inner: Arc<FakePlatformDecoder>) -> (Arc<GatedDecoder>, Gate) {
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let armed = Arc::new(AtomicBool::new(false));
+    (
+        Arc::new(GatedDecoder {
+            inner,
+            reached: Mutex::new(reached_tx),
+            go: Mutex::new(go_rx),
+            armed: armed.clone(),
+        }),
+        Gate {
+            reached: reached_rx,
+            go: go_tx,
+            armed,
+            seen: Arc::new(Mutex::new(Vec::new())),
+        },
+    )
+}
+
+impl Decoder for GatedDecoder {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+
+    fn tier(&self) -> Tier {
+        self.inner.tier()
+    }
+
+    fn reproducible(&self) -> bool {
+        false
+    }
+
+    fn env(&self) -> Option<CodecEnv> {
+        self.inner.env()
+    }
+
+    fn can_decode(&self, format: &str) -> bool {
+        self.inner.can_decode(format)
+    }
+
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.inner.shape(src, format, opts, limits)
+    }
+
+    fn decode(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.reached.lock().unwrap().send(()).unwrap();
+            let _ = self.go.lock().unwrap().recv();
+            if mon.canceled() {
+                return Err(EngineError::Canceled);
+            }
         }
-        assert_eq!(env.engine.work_pcm().usage(), (0, 0));
-        assert_consistent(&env.lib);
+        self.inner.decode(src, format, opts, limits, mon)
     }
 }
 
 /// 割り込みの門：構えたあと、`at` が真になる段に初めて来たら、テストに知らせて「進め」を待つ（一度だけ。構え直せる）。
+/// 門を開けたあとに通った段を覚える。
 struct Gate {
     reached: mpsc::Receiver<()>,
     go: mpsc::Sender<()>,
     armed: Arc<AtomicBool>,
+    seen: Arc<Mutex<Vec<Stage>>>,
 }
 
 impl Gate {
@@ -397,14 +519,40 @@ impl Gate {
         self.armed.store(true, Ordering::SeqCst);
     }
 
-    /// 門に来るのを待つ。
-    fn wait(&self) {
-        self.reached.recv_timeout(4 * WAIT).unwrap();
+    /// ジョブ `id` が門に来るのを待つ（来る前にジョブが終わったら、その結果で落とす）。
+    fn wait(&self, env: &Env, id: i64) {
+        let until = std::time::Instant::now() + 4 * WAIT;
+        loop {
+            match self
+                .reached
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(()) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let record = env.jobs.get(id).unwrap();
+                    assert!(
+                        !record.state.is_terminal() && record.state != JobState::Paused,
+                        "門に来る前にジョブが終わった：{:?} {:?} {:?}",
+                        record.state,
+                        record.error_code,
+                        record.message
+                    );
+                    assert!(std::time::Instant::now() < until, "門に来ない");
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
     }
 
-    /// 門を開ける（止めた段から進める）。
+    /// 門を開ける（止めた段から進める）。ここから通った段を覚え直す。
     fn open(&self) {
+        self.seen.lock().unwrap().clear();
         self.go.send(()).unwrap();
+    }
+
+    /// 門を開けたあとに通った段。
+    fn seen(&self) -> Vec<Stage> {
+        self.seen.lock().unwrap().clone()
     }
 }
 
@@ -416,16 +564,18 @@ fn gated_env(
     let (reached_tx, reached_rx) = mpsc::channel::<()>();
     let (go_tx, go_rx) = mpsc::channel::<()>();
     let armed = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(Vec::new()));
     let env = Env::setup(
         Setup {
-            factory: FakeEngineFactory::with_codecs(codecs),
+            factory: FakeEngineFactory::with_codecs(codecs).with_budget(256 << 20),
             ..Setup::default()
         },
         {
-            let armed = armed.clone();
+            let (armed, seen) = (armed.clone(), seen.clone());
             move |_| {
                 let (reached, go) = (Mutex::new(reached_tx), Mutex::new(go_rx));
                 Some(Arc::new(move |stage| {
+                    seen.lock().unwrap().push(stage);
                     if at(stage) && armed.swap(false, Ordering::SeqCst) {
                         reached.lock().unwrap().send(()).unwrap();
                         let _ = go.lock().unwrap().recv();
@@ -440,6 +590,7 @@ fn gated_env(
             reached: reached_rx,
             go: go_tx,
             armed,
+            seen,
         },
     )
 }
@@ -466,7 +617,7 @@ fn paused_then_canceled_save_removes_the_work_file() {
             graph: audio_doc(-3.0, Some("wav")),
         },
     );
-    gate.wait();
+    gate.wait(&env, id);
     env.jobs.pause(id).unwrap();
     gate.open();
     assert!(env.jobs.wait_idle(WAIT));
@@ -548,7 +699,7 @@ fn paused_save_keeps_the_work_file_shared_with_the_editor() {
             graph: audio_doc(-3.0, Some("wav")),
         },
     );
-    gate.wait();
+    gate.wait(&env, id);
     env.jobs.pause(id).unwrap();
     gate.open();
     assert!(env.jobs.wait_idle(WAIT));

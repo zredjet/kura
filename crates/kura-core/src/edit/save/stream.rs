@@ -86,16 +86,27 @@ pub(super) struct Passes<'a> {
     ctx: &'a JobContext,
     total: f64,
     done: f64,
+    /// テストの割り込み（流れの途中の段）。
+    #[cfg(test)]
+    engine: &'a EngineServices,
 }
 
 impl<'a> Passes<'a> {
-    /// 重みの和 `total` で始める。
-    pub(super) fn new(ctx: &'a JobContext, total: f64) -> Self {
+    /// 重みの和 `total` で始める（`cx` のジョブに知らせる）。
+    pub(super) fn new(cx: &StreamCx<'a>, total: f64) -> Self {
         Self {
-            ctx,
+            ctx: cx.ctx,
             total: total.max(1e-9),
             done: 0.0,
+            #[cfg(test)]
+            engine: cx.engine,
         }
+    }
+
+    /// テストの割り込み（流れの途中の段 `stage`）。
+    #[cfg(test)]
+    fn at(&self, stage: super::Stage) {
+        self.engine.at(stage);
     }
 
     /// 今の回（重み `weight`）の進み `frac`（0〜1）を知らせる。
@@ -125,6 +136,9 @@ struct CountingSink<'s, 'p, 'a> {
     weight: f64,
     total: f64,
     done: &'s mut u64,
+    /// 1 回の長さ（テストの割り込みに渡す）。
+    #[cfg(test)]
+    frames: u64,
 }
 
 impl AudioSink for CountingSink<'_, '_, '_> {
@@ -142,6 +156,11 @@ impl AudioSink for CountingSink<'_, '_, '_> {
         *self.done += planes.first().map_or(0, |p| p.len()) as u64;
         self.passes
             .report(self.weight, *self.done as f64 / self.total, "書いています");
+        #[cfg(test)]
+        self.passes.at(super::Stage::Window {
+            fed: *self.done,
+            frames: self.frames,
+        });
         Ok(())
     }
 
@@ -168,6 +187,8 @@ impl AudioProducer for Counting<'_, '_> {
             weight: self.weight,
             total,
             done: &mut self.done,
+            #[cfg(test)]
+            frames: self.inner.info().frames,
         };
         self.inner.produce(spans, &mut wrap, mon)
     }
@@ -803,7 +824,11 @@ pub(super) fn write_output(
 }
 
 /// 段 5（R2）：.part を 1 回読んで、生の BLAKE3（台帳）・`kura-file-v1`（書き出しの記録）・大きさを取る。
-pub(super) fn hash_part(path: &Path, mon: &dyn Monitor) -> Result<([u8; 32], Digest, u64)> {
+pub(super) fn hash_part(
+    path: &Path,
+    _passes: &Passes<'_>,
+    mon: &dyn Monitor,
+) -> Result<([u8; 32], Digest, u64)> {
     use std::io::Read;
     let len = std::fs::metadata(path)?.len();
     let mut f = File::open(path)?;
@@ -822,6 +847,8 @@ pub(super) fn hash_part(path: &Path, mon: &dyn Monitor) -> Result<([u8; 32], Dig
         };
         raw.update(&buf[..n]);
         fd.update(&buf[..n]);
+        #[cfg(test)]
+        _passes.at(super::Stage::Rehash);
     }
     let file_digest = fd
         .finish()

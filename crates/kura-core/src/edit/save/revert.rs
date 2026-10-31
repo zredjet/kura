@@ -689,7 +689,7 @@ fn rebuild_stream(s: StreamRebuild<'_>) -> std::result::Result<Flow<Rebuilt>, Re
         limits,
         mon: &mon,
     };
-    let mut passes = stream::Passes::new(ctx, 3.25);
+    let mut passes = stream::Passes::new(&cx, 3.25);
     let mut warnings: Vec<String> = Vec::new();
     if rules.progress {
         ctx.progress(0.1, "戻す版の元を読んでいます");
@@ -800,7 +800,7 @@ fn rebuild_stream(s: StreamRebuild<'_>) -> std::result::Result<Flow<Rebuilt>, Re
             written.encoded.value_digest
         )));
     }
-    let (out_hash, file_digest, out_size) = match stream::hash_part(part, &mon) {
+    let (out_hash, file_digest, out_size) = match stream::hash_part(part, &passes, &mon) {
         Ok(h) => h,
         Err(CoreError::Canceled) => match stop_end(ctx) {
             Some(end) => return Ok(Flow::Stop(end)),

@@ -65,6 +65,9 @@ pub struct EngineServices {
     work_pcm: Arc<WorkPcmStore>,
     /// エディタが保存に貸している入力（エディタのセッションごと。M13 段 3）。
     lent: Mutex<BTreeMap<String, LentInput>>,
+    /// テストの割り込み（保存の流れの途中の段。保存のジョブの割り込みと同じもの。M13 段 3 の検証の直し）。
+    #[cfg(test)]
+    hook: Mutex<Option<crate::edit::save::Hook>>,
 }
 
 /// 貸す入力のアンカーの使い方（保存の `AnchorUse` の、作ったものを除いた形）。
@@ -119,6 +122,27 @@ impl EngineServices {
             editor: Mutex::new(None),
             reservation: Arc::new(Reservation::default()),
             lent: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            hook: Mutex::new(None),
+        }
+    }
+
+    /// テストの割り込みを入れる（保存の流れの途中の段で呼ぶ）。
+    #[cfg(test)]
+    pub(crate) fn set_hook(&self, hook: Option<crate::edit::save::Hook>) {
+        *self.hook.lock().unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// テストの割り込み（保存の流れの途中の段 `stage`）。
+    #[cfg(test)]
+    pub(crate) fn at(&self, stage: crate::edit::save::Stage) {
+        let hook = self
+            .hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(stage);
         }
     }
 
@@ -312,6 +336,8 @@ pub(crate) mod fake {
         runtimes: AtomicUsize,
         work_dirs: Mutex<Vec<PathBuf>>,
         codecs: Option<Arc<Mutex<CodecSet>>>,
+        /// 予算（None は 64 MiB）。
+        budget: Option<u64>,
     }
 
     impl FakeEngineFactory {
@@ -321,6 +347,12 @@ pub(crate) mod fake {
                 codecs: Some(codecs),
                 ..Self::default()
             }
+        }
+
+        /// 予算を `bytes` にする（既定は 64 MiB。長い ogg の保存など）。
+        pub fn with_budget(mut self, bytes: u64) -> Self {
+            self.budget = Some(bytes);
+            self
         }
 
         /// 実行の場の設定を作った回数。
@@ -344,7 +376,7 @@ pub(crate) mod fake {
             self.runtimes.fetch_add(1, Ordering::SeqCst);
             RuntimeConfig {
                 cores: Some(2),
-                budget: Some(64 << 20),
+                budget: Some(self.budget.unwrap_or(64 << 20)),
                 ..RuntimeConfig::default()
             }
         }

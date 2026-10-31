@@ -438,6 +438,12 @@ pub(crate) enum Stage {
     Written,
     /// 置いたあと、トランザクション 2 の前（台帳の門を持っている）。
     Placed,
+    /// 音声を流して書く回で窓を 1 つ書き手に渡したあと（`fed` はそれまでに渡したフレームの数（回をまたいで足す）、`frames`
+    /// は 1 回の長さ。Ogg Vorbis は `fed < frames` が後ろ向きの回）。保存・版に戻す・GC の照合のどれでも呼ぶ（M13 段 3 の
+    /// 検証の直し）。
+    Window { fed: u64, frames: u64 },
+    /// 流して書いたものの R2 の読み直しで、1 区切りを読んだあと。
+    Rehash,
 }
 
 /// テストの割り込み（段ごとに呼ばれる。止めて待つ・DB を書き換えるなど）。
@@ -1381,7 +1387,7 @@ impl EditHandler {
         } else {
             0.0
         };
-        let mut passes = stream::Passes::new(ctx, 1.0 + f64::from(rounds) + promote_weight + 0.25);
+        let mut passes = stream::Passes::new(&cx, 1.0 + f64::from(rounds) + promote_weight + 0.25);
         ctx.progress(0.05, "元の大きさを確かめています");
         let mut warnings: Vec<String> = Vec::new();
         // 1. 入力
@@ -1507,7 +1513,7 @@ impl EditHandler {
         drop(lease);
         // 5. R2：書いたものを 1 回読んで、台帳の BLAKE3 と書き出しの記録のダイジェストを取る
         ctx.progress(0.92, "書いたものを確かめています");
-        let (out_hash, file_digest, out_size) = match stream::hash_part(&out_part, &mon) {
+        let (out_hash, file_digest, out_size) = match stream::hash_part(&out_part, &passes, &mon) {
             Ok(h) => h,
             Err(CoreError::Canceled) => match stop_end(ctx) {
                 Some(end) => return Ok(Flow::Stop(end)),

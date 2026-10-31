@@ -371,6 +371,8 @@ impl Env {
             handler = handler.with_fault(fault);
         }
         if let Some(hook) = hook(&lib) {
+            // 流れの途中の段（窓・R2）はエンジンの部品が呼ぶ
+            engine.set_hook(Some(hook.clone()));
             handler = handler.with_hook(hook);
         }
         let mut gc = GcHandler::new(engine.clone(), clock.gc());
