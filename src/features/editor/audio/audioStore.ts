@@ -409,6 +409,12 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     },
     onPlaced: (record) => checkHook?.placed?.(record),
     onCrossfade: (record) => checkHook?.crossfade?.(record),
+    onSwitchFailed: () => {
+      // 待っていた聞き比べの替えをやめた：表示を鳴っている音に戻す
+      if (!ctx.current()) return;
+      useAudioStore.setState({ ab: rt.player.source ?? useAudioStore.getState().ab });
+      notify(t.abUnavailable);
+    },
   });
   const offAudio = useAudioStore.subscribe((s) => controller.setOverlay(overlayOf(s)));
   // 選んだ操作・文書が変わったら、フェードの印を出し直す
@@ -799,29 +805,45 @@ export function toggleAB(): void {
     return;
   }
   const next: PlaySource = s.ab === 'edited' ? 'source' : 'edited';
-  if (!rt.player.playing || rt.player.source === null) {
+  const cur = rt.player.source;
+  if (!rt.player.playing || cur === null) {
     useAudioStore.setState({ ab: next });
     return;
   }
-  // 鳴らしていれば、替えが成り立ったときだけ表示（ab）を替える
-  const pos = rt.player.position();
-  const out = pos === null ? null : toOutputPos(s, rt.player.source, pos);
-  const loop = s.play.mode === 'loop' ? (s.local?.loop ?? s.view.loop) : null;
-  const end = s.play.mode === 'selection' ? (s.selection?.end ?? null) : null;
-  const req = out === null ? null : requestFor({ ...s, ab: next }, next, { from: out, end, loop });
-  if (!req) {
+  // 鳴らしていれば、替えが成り立ったときだけ表示（ab）を替える。位置は替える時刻に鳴っている位置を写す
+  const info = next === 'edited' ? outputInfo(s) : sourceInfo(s);
+  const loopOut = s.play.mode === 'loop' ? (s.local?.loop ?? s.view.loop) : null;
+  const endOut = s.play.mode === 'selection' ? (s.selection?.end ?? null) : null;
+  const loop = loopOut ? toPlayLoop(s, next, loopOut) : null;
+  const end = endOut === null ? null : toPlayEnd(s, next, endOut);
+  if (!info || (loopOut && !loop) || (endOut !== null && end === null)) {
     notify(t.abUnavailable);
     return;
   }
-  const result = rt.player.switchTo(req);
-  if (result === 'playing') {
-    useAudioStore.setState({ ab: next });
-    return;
+  const result = rt.player.switchTo({
+    source: next,
+    info,
+    end,
+    loop,
+    map: (pos) => {
+      const now = useAudioStore.getState();
+      const out = toOutputPos(now, cur, pos);
+      return out === null ? null : toPlayPos(now, next, out);
+    },
+  });
+  switch (result) {
+    case 'playing':
+      useAudioStore.setState({ ab: next });
+      return;
+    case 'unmappable':
+      notify(t.abUnavailable);
+      return;
+    default:
+      // 始め直せなかった（止まった）
+      rt.controller.setPlaybackSpans([]);
+      notify(t.rateUnsupported(String(info.rate)));
+      useAudioStore.setState({ play: IDLE_PLAY });
   }
-  // 始め直せなかった（止まった）
-  rt.controller.setPlaybackSpans([]);
-  notify(t.rateUnsupported(String(req.info.rate)));
-  useAudioStore.setState({ play: IDLE_PLAY });
 }
 
 // プレーヤーが鳴り始めたら止める（鳴らし始めるときにプレーヤーを一時停止するのと対にする）

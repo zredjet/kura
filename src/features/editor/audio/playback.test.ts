@@ -425,26 +425,71 @@ describe('手のあとの交差フェード', () => {
 });
 
 describe('聞き比べ', () => {
-  it('レートが同じなら交差フェードで元に替え、違えば止めて始め直す', () => {
+  /** 元の位置 = 出力の位置 + 500（元の頭 500 を切り詰めた出力のまね）。 */
+  const shifted = (pos: number) => pos + 500;
+
+  it('レートが同じなら、替える時刻 T の位置を写して交差フェードで替える（位置が続く）', () => {
+    const t = setup();
+    for (let i = 0; i < 8; i++) t.chunks.source.set(i, makeChunk(i, CHUNK * 8, 2, 0.25));
+    t.player.play({ from: 0, source: 'edited', info: t.info });
+    const ctx = t.ctx();
+    const first = Math.round((ctx.sources[0]?.started?.[0] ?? 0) * R);
+    ctx.currentTime += 0.3;
+    t.player.tick();
+    const n = ctx.sources.length;
+    expect(t.player.switchTo({ source: 'source', info: t.info, map: shifted })).toBe('playing');
+    expect(t.player.source).toBe('source');
+    expect(t.factory.contexts).toHaveLength(1);
+    const T = Math.ceil((ctx.currentTime + SWITCH_AHEAD_SECONDS) * R);
+    // T で古い音が鳴らす位置は T − first。新しい音はそれを写した位置から（戻らない）
+    const at = shifted(T - first);
+    const fresh = ctx.sources[n];
+    expect(Math.round((fresh?.started?.[0] ?? 0) * R)).toBe(T);
+    expect(fresh?.buffer?.length).toBe(CHUNK - at);
+    expect(ctx.buffers[n]?.channels[0]?.[0]).toBeCloseTo((at % 1000) / 1000 + 0.25, 5);
+    expect(ctx.sources[0]?.stoppedAt).toBeCloseTo(T / R + CROSSFADE_SECONDS, 9);
+  });
+
+  it('替える先の T のチャンクが手元に来るまでは、古い音を鳴らし続けて待つ', () => {
+    const t = setup();
+    t.player.play({ from: 0, source: 'edited', info: t.info });
+    const ctx = t.ctx();
+    const first = Math.round((ctx.sources[0]?.started?.[0] ?? 0) * R);
+    const n = ctx.sources.length;
+    expect(t.player.switchTo({ source: 'source', info: t.info, map: shifted })).toBe('playing');
+    // まだ替えない（元が届くまで編集後が鳴る）
+    expect(t.player.source).toBe('edited');
+    expect(ctx.sources.length).toBe(n);
+    expect(ctx.sources.some((s) => s.stopped)).toBe(false);
+    expect(t.wanted).toContainEqual(['source', 0]);
+    // 0.2 秒後に届いた：その時の T で替える
+    ctx.currentTime += 0.2;
+    t.chunks.source.set(0, makeChunk(0, CHUNK * 8));
+    t.player.tick();
+    expect(t.player.source).toBe('source');
+    const T = Math.ceil((ctx.currentTime + SWITCH_AHEAD_SECONDS) * R);
+    const fresh = ctx.sources.find((s, i) => i >= n && Math.round((s.started?.[0] ?? 0) * R) === T);
+    expect(fresh?.buffer?.length).toBe(CHUNK - shifted(T - first));
+  });
+
+  it('写せなければ替えない・レートが違えば今の位置を写して止めてから始め直す', () => {
     const t = setup();
     for (let i = 0; i < 8; i++) t.chunks.source.set(i, makeChunk(i, CHUNK * 8));
     t.player.play({ from: 0, source: 'edited', info: t.info });
     const ctx = t.ctx();
     const n = ctx.sources.length;
-    expect(t.player.switchTo({ from: 500, source: 'source', info: t.info })).toBe('playing');
-    expect(t.player.source).toBe('source');
-    expect(t.factory.contexts).toHaveLength(1);
-    const fresh = ctx.sources[n];
-    const T = Math.ceil((ctx.currentTime + SWITCH_AHEAD_SECONDS) * R);
-    expect(Math.round((fresh?.started?.[0] ?? 0) * R)).toBe(T);
-    expect(fresh?.buffer?.length).toBe(CHUNK - 500);
+    expect(t.player.switchTo({ source: 'source', info: t.info, map: () => null })).toBe(
+      'unmappable',
+    );
+    expect(t.player.source).toBe('edited');
+    expect(ctx.sources.length).toBe(n);
     // 元のレートが違う：止めて、そのレートの文脈で始め直す
-    for (let i = 0; i < 8; i++) t.chunks.source.set(i, makeChunk(i, CHUNK * 8));
-    t.player.switchTo({ from: 0, source: 'source', info: { ...t.info, rate: 44_100 } });
+    t.player.switchTo({ source: 'source', info: { ...t.info, rate: 44_100 }, map: shifted });
     expect(t.factory.contexts.map((c) => c.requested)).toEqual([R, 44_100]);
     expect(ctx.sources.every((s) => s.stopped)).toBe(true);
     expect(t.pool.isHeld(R)).toBe(false);
     expect(t.pool.isHeld(44_100)).toBe(true);
+    expect(t.factory.contexts[1]?.buffers[0]?.length).toBe(CHUNK - 500);
   });
 });
 

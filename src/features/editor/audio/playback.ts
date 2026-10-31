@@ -12,7 +12,8 @@
  * - 手のあと（`refresh`）：鳴らしている・置いた区間が変わった区間に掛かれば、その位置の新しい PCM が届いてから、
  *   T = 今 + 60 ms（フレームの境）で新しい音を 0→1、古い音を 1→0 の 10 ms の直線で替え、古い音は T + 10 ms に止める
  *   （置いてまだ鳴っていないものは捨てて置き直す）。替えるのは 150 ms に 1 回まで。
- * - 聞き比べ（`switchTo`）：レートが同じなら同じ交差フェードで替え、違えば止めて始め直す。
+ * - 聞き比べ（`switchTo`）：レートが同じなら、替える時刻 T の位置を写して同じ交差フェードで替える（T のチャンクが
+ *   届くまでは古い音を鳴らし続ける）。違えば止めて始め直す。
  * - ループの試聴の区間を替えたら（旗のドラッグ）、まだ鳴っていない区間から新しい区間で置き直す。
  */
 
@@ -319,6 +320,8 @@ export interface PlayerDeps {
   onPlaced?(record: PlacedRecord): void;
   /** 交差フェードで替えた（自己点検が、替える前後の標本の跳びを照らす）。 */
   onCrossfade?(record: CrossfadeRecord): void;
+  /** 待っていた聞き比べの替えをやめた（替える時刻の位置を写せなくなった。今の音を鳴らし続ける）。 */
+  onSwitchFailed?(): void;
 }
 
 /** 置いた区間の記録（自己点検）。 */
@@ -357,6 +360,21 @@ export interface PlayRequest {
 }
 
 export type PlayOutcome = 'playing' | 'rateUnsupported' | 'failed';
+
+/** 聞き比べで替える先（位置は、替える時刻 T に鳴っている位置を `map` で写して決める）。 */
+export interface SwitchRequest {
+  source: PlaySource;
+  info: SourceInfo;
+  /** ここで止める（選択の終わり。替える先のフレーム）。 */
+  end?: number | null;
+  /** ループを試聴する区間（替える先のフレーム）。 */
+  loop?: FrameSpan | null;
+  /** 今鳴らしている音の位置を、替える先の位置にする（写せなければ null）。替える時刻に呼ぶ。 */
+  map(pos: number): number | null;
+}
+
+/** 聞き比べの替えの結果（`unmappable` は今の位置を写せないので替えなかった）。 */
+export type SwitchOutcome = PlayOutcome | 'unmappable';
 
 /** 置いた区間 1 つ。 */
 interface Placed {
@@ -440,6 +458,8 @@ export class EditorPlayer {
   private timerId: number | null = null;
   private releases: (() => void)[] = [];
   private refreshWanted = false;
+  /** 替える先のチャンクを待っている聞き比べ。 */
+  private pendingSwitch: SwitchRequest | null = null;
   private lastSwitch = Number.NEGATIVE_INFINITY;
   private readonly timer: PlayerTimer;
   private readonly now: () => number;
@@ -526,6 +546,7 @@ export class EditorPlayer {
     this.plan = null;
     this.ctx = null;
     this.refreshWanted = false;
+    this.pendingSwitch = null;
     const releases = this.releases;
     this.releases = [];
     for (const r of releases) r();
@@ -591,22 +612,68 @@ export class EditorPlayer {
   }
 
   /**
-   * 聞き比べ：鳴らす音を替える（`from` は替えた音の位置）。レートが同じなら交差フェードで、違えば止めて始め直す。
+   * 聞き比べ：鳴らす音を替える。レートが同じなら、替える時刻 T（今 + 60 ms）に鳴っている位置を `map` で写した位置から
+   * 交差フェードで替える。替える先の T のチャンクが手元に来るまでは古い音を鳴らし続けて待つ（手のあとの道と同じ）。
+   * レートが違えば、今の位置を写して止めてから始め直す。今の位置を写せなければ替えない（`unmappable`）。
    */
-  switchTo(req: PlayRequest): PlayOutcome {
+  switchTo(req: SwitchRequest): SwitchOutcome {
     const plan = this.plan;
     const ctx = this.ctx;
-    if (!plan || !ctx || plan.info.rate !== req.info.rate) {
-      return this.play(req);
+    if (!plan || !ctx) return 'failed';
+    if (req.source === plan.source) {
+      // 待っている替えを取り消す（同じ音のまま）
+      this.pendingSwitch = null;
+      return 'playing';
     }
+    if (plan.info.rate !== req.info.rate) {
+      const pos = this.position();
+      const from = pos === null ? null : req.map(pos);
+      if (from === null || from >= req.info.frames) return 'unmappable';
+      return this.play({
+        from,
+        end: req.end,
+        loop: req.loop,
+        source: req.source,
+        info: req.info,
+      });
+    }
+    const at = this.positionAt(this.switchFrame());
+    const to = at === null ? null : req.map(at);
+    if (to === null || to >= req.info.frames) return 'unmappable';
+    this.pendingSwitch = req;
+    this.tick();
+    return 'playing';
+  }
+
+  /** 待っている聞き比べの替えを試す（替えたら true）。写せなくなったらやめて知らせる。 */
+  private trySwitch(): boolean {
+    const req = this.pendingSwitch;
+    if (!req) return false;
+    const t = this.switchFrame();
+    const at = this.positionAt(t);
+    const to = at === null ? null : req.map(at);
+    if (to === null || to >= req.info.frames) {
+      this.pendingSwitch = null;
+      this.deps.onSwitchFailed?.();
+      return false;
+    }
+    const loop = validLoop(req.loop, req.info.frames);
+    const chunk = this.deps.peek(req.source, chunkOf(to));
+    if (!chunk || chunk.planes.length !== req.info.channels) {
+      this.deps.need?.(req.source, neededSpans(to, req.info.frames, loop));
+      this.deps.want(req.source, chunkOf(to));
+      return false;
+    }
+    this.pendingSwitch = null;
+    this.refreshWanted = false;
     this.crossfade({
       source: req.source,
       info: req.info,
       end: req.end ?? null,
-      loop: validLoop(req.loop, req.info.frames),
-      nextPos: Math.max(0, Math.min(req.info.frames, Math.floor(req.from))),
+      loop,
+      nextPos: to,
     });
-    return 'playing';
+    return true;
   }
 
   /** 先読みを足す（100 ms ごと・取ったチャンクが届いたとき）。 */
@@ -623,6 +690,8 @@ export class EditorPlayer {
     for (const s of spans) {
       for (let i = chunkOf(s.start); i * CHUNK < s.end; i++) this.deps.want(plan.source, i);
     }
+    // 聞き比べ：替える先の T のチャンクが届いたら替える
+    if (this.trySwitch()) return;
     // 手のあと：替える位置のチャンクが（今の形のチャンネル数で）届いていて、前に替えてから 150 ms たったら交差フェード
     if (this.refreshWanted && this.now() - this.lastSwitch >= SWITCH_MIN_MS) {
       const t = this.switchFrame();
