@@ -376,6 +376,195 @@ fn the_trim_tool_flow() {
     assert_eq!(shown_audio(&out.view).frames, 3 * C - 500);
 }
 
+/// `rate`・`frames` の元に `steps` を当てて開いた、セッションと、`tool` が Some ならそのノードを仮に外した表示の印。
+fn open_with_nodes(
+    env: &Env,
+    rate: u32,
+    frames: u64,
+    steps: Vec<Step>,
+    tool: Option<u32>,
+) -> (String, Vec<Option<Marks>>) {
+    // 開くたびに別のアイテム（同じ中身は同じハッシュになるので種を変える）
+    static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(100);
+    let seed = SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let bytes = noise_wav(rate, 1, frames, seed);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open(id).session.clone();
+    let vp = Viewport::audio_idle();
+    let out = env.step(&s, steps, &vp);
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    let out = match tool {
+        Some(node) => env.step(&s, vec![preview_disabled(node)], &vp),
+        None => out,
+    };
+    let marks = shown_audio(&out.view)
+        .nodes
+        .iter()
+        .map(|n| n.marks)
+        .collect();
+    (s, marks)
+}
+
+/// 下流でレートを下げる resample があっても、印の終わり（出力の終わり）は入力の終わりに戻り（trim は end: null）、動かさな
+/// かった側は今の引数のまま（丸めでずらさない）。2:1・48 kHz → 44.1 kHz、奇数の長さ。
+#[test]
+fn handle_ends_survive_downsampling() {
+    let env = Env::new();
+    let vp = Viewport::audio_idle();
+    let trim_then = |start: u64, end: Option<u64>, rate: u32| {
+        vec![
+            add(0, "audio.trim", json!({ "start": start, "end": end })),
+            add(1, "audio.resample", json!({ "rate": rate })),
+        ]
+    };
+    let commit = |s: &str, h: Handle| {
+        let out = env.step(s, vec![Step::CancelPreview, handle(h, Some(1), STEP)], &vp);
+        assert!(out.rejected.is_none(), "{h:?}: {:?}", out.rejected);
+    };
+    // 2:1・3C+3：始めだけ動かす（印の終わりは出力の終わり 98,306。戻すと 196,612 で入力を超えていた）
+    let n = 3 * C + 3;
+    let (s, marks) = open_with_nodes(&env, 8_000, n, trim_then(1_000, None, 4_000), Some(1));
+    assert_eq!(
+        marks[0],
+        Some(Marks::Trim {
+            start: 500,
+            end: 98_306
+        })
+    );
+    commit(
+        &s,
+        Handle::Trim {
+            start: 400,
+            end: 98_306,
+        },
+    );
+    assert_eq!(params(&env, &s, 1), json!({ "start": 800, "end": null }));
+    // 2:1・3C+1：印の終わりを戻すと 196,608（黙って 1 フレーム縮んでいた）
+    let n = 3 * C + 1;
+    let (s, marks) = open_with_nodes(&env, 8_000, n, trim_then(1_000, None, 4_000), Some(1));
+    assert_eq!(
+        marks[0],
+        Some(Marks::Trim {
+            start: 500,
+            end: 98_304
+        })
+    );
+    commit(
+        &s,
+        Handle::Trim {
+            start: 400,
+            end: 98_304,
+        },
+    );
+    assert_eq!(params(&env, &s, 1), json!({ "start": 800, "end": null }));
+    // 2:1・奇数の始め：終わりを出力の終わりへ動かす（始めの 1,001 は印 500 から戻すと 1,000 になっていた）
+    let n = 3 * C + 3;
+    let (s, marks) = open_with_nodes(
+        &env,
+        8_000,
+        n,
+        trim_then(1_001, Some(150_000), 4_000),
+        Some(1),
+    );
+    assert_eq!(
+        marks[0],
+        Some(Marks::Trim {
+            start: 500,
+            end: 75_000
+        })
+    );
+    commit(
+        &s,
+        Handle::Trim {
+            start: 500,
+            end: 98_306,
+        },
+    );
+    assert_eq!(params(&env, &s, 1), json!({ "start": 1_001, "end": null }));
+    // 終わりだけを途中へ動かす
+    env.step(&s, vec![preview_disabled(1)], &vp);
+    commit(
+        &s,
+        Handle::Trim {
+            start: 500,
+            end: 90_000,
+        },
+    );
+    assert_eq!(
+        params(&env, &s, 1),
+        json!({ "start": 1_001, "end": 180_000 })
+    );
+    // 48 kHz → 44.1 kHz・3C+1：印の終わり 180,635 を戻すと 196,610（入力を超えていた）。始め 1,003 は印 922 から戻すと 1,004
+    let n = 3 * C + 1;
+    let (s, marks) = open_with_nodes(&env, 48_000, n, trim_then(1_003, None, 44_100), Some(1));
+    assert_eq!(
+        marks[0],
+        Some(Marks::Trim {
+            start: 922,
+            end: 180_635
+        })
+    );
+    commit(
+        &s,
+        Handle::Trim {
+            start: 900,
+            end: 180_635,
+        },
+    );
+    assert_eq!(params(&env, &s, 1), json!({ "start": 980, "end": null }));
+    env.step(&s, vec![Step::Undo, preview_disabled(1)], &vp);
+    commit(
+        &s,
+        Handle::Trim {
+            start: 922,
+            end: 170_000,
+        },
+    );
+    assert_eq!(
+        params(&env, &s, 1),
+        json!({ "start": 1_003, "end": 185_034 })
+    );
+    // ループの終わりを出力の終わりに置く（2:1・3C+3）
+    let n = 3 * C + 3;
+    let (s, marks) = open_with_nodes(
+        &env,
+        8_000,
+        n,
+        vec![
+            add(
+                0,
+                "audio.set_loop",
+                json!({ "loop": { "start": 0, "end": n } }),
+            ),
+            add(1, "audio.resample", json!({ "rate": 4_000 })),
+        ],
+        None,
+    );
+    assert_eq!(
+        marks[0],
+        Some(Marks::Loop {
+            start: 0,
+            end: 98_306
+        })
+    );
+    let out = env.step(
+        &s,
+        vec![handle(
+            Handle::Loop {
+                range: Some((100, 98_306)),
+            },
+            Some(1),
+            STEP,
+        )],
+        &vp,
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    assert_eq!(
+        params(&env, &s, 1),
+        json!({ "loop": { "start": 200, "end": n } })
+    );
+}
+
 /// 文書のノードを仮に外す手。
 fn preview_disabled(node: u32) -> Step {
     Step::Preview {

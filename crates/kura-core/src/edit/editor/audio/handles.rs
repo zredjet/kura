@@ -106,16 +106,40 @@ fn merged(base: Json, patch: Json) -> Json {
 const UNMAPPABLE: &str = "後ろの操作で時間が写せないので、ハンドルでは直せません";
 
 /// ハンドルの位置（出力のフレーム）を、下流の写し `down` を逆にたどってノードの座標の引数にする。`in_frames` はノードの
-/// 入力の長さ。
-fn handle_params(handle: &Handle, down: &[TimeLink], in_frames: u64) -> Result<Json, EngineError> {
+/// 入力の長さ、`now` はノードの今の引数（頭の文書。末尾に足すときは null）。
+///
+/// - 動かさなかった側（今の引数を下流で写した位置、つまり印と同じ値）は今の引数のまま（往復の丸めでずらさない）。
+/// - 区間の終わり（trim の end・ループの end）が、入力の終わりを下流で写した位置（`forward_end(in_frames)`。出力の終わり）
+///   以上なら入力の終わりにする（trim は end: null）。下げるレートの往復は、入力の長さを超えたり手前に戻ったりするため。
+fn handle_params(
+    handle: &Handle,
+    down: &[TimeLink],
+    in_frames: u64,
+    now: &Json,
+) -> Result<Json, EngineError> {
     let back = |p: u64| backward(down, p).ok_or_else(|| invalid(UNMAPPABLE));
     let back_end = |p: u64| backward_end(down, p).ok_or_else(|| invalid(UNMAPPABLE));
+    let in_end = forward_end(down, in_frames);
+    let start_of = |p: u64, cur: Option<u64>| match cur {
+        Some(c) if forward(down, c) == Some(p) => Ok(c),
+        _ => back(p),
+    };
+    let end_of = |p: u64, cur: Option<u64>| match cur {
+        Some(c) if forward_end(down, c) == Some(p) => Ok(c),
+        _ if in_end.is_some_and(|n| p >= n) => Ok(in_frames),
+        _ => back_end(p),
+    };
+    let num = |v: &Json, k: &str| v.get(k).and_then(Json::as_u64);
     Ok(match *handle {
         Handle::Trim { start, end } => {
             if start >= end {
                 return Err(invalid("切り詰めの始めは終わりより前にします"));
             }
-            let (s, e) = (back(start)?, back_end(end)?);
+            // 今の終わり（null は入力の終わり）
+            let cur_end = now
+                .is_object()
+                .then(|| num(now, "end").unwrap_or(in_frames));
+            let (s, e) = (start_of(start, num(now, "start"))?, end_of(end, cur_end)?);
             if e > in_frames || s >= e {
                 return Err(invalid("切り詰めの枠が入力の外です"));
             }
@@ -133,7 +157,10 @@ fn handle_params(handle: &Handle, down: &[TimeLink], in_frames: u64) -> Result<J
             if start >= end {
                 return Err(invalid("ループの始めは終わりより前にします"));
             }
-            json!({ "loop": { "start": back(start)?, "end": back_end(end)? } })
+            let cur = now.get("loop").filter(|l| l.is_object());
+            let s = start_of(start, cur.and_then(|l| num(l, "start")))?;
+            let e = end_of(end, cur.and_then(|l| num(l, "end")))?;
+            json!({ "loop": { "start": s, "end": e } })
         }
     })
 }
@@ -146,7 +173,10 @@ fn fresh_params(handle: &Handle, frames: u64) -> Result<Json, EngineError> {
         }
         _ => json!({}),
     };
-    Ok(merged(base, handle_params(handle, &[], frames)?))
+    Ok(merged(
+        base,
+        handle_params(handle, &[], frames, &Json::Null)?,
+    ))
 }
 
 /// ハンドルの手を `Edit` にする（モジュールの説明）。`chain` は今の計画の時間の写しの連鎖、`output` は今の出力の形、`head` は
@@ -191,11 +221,9 @@ pub fn handle_edit(
     let in_frames = rate_frames(&chain[at].input)
         .map(|(_, n)| n)
         .ok_or_else(|| invalid("ノードの入力の長さが分かりません"))?;
-    let patch = handle_params(handle, &chain[at + 1..], in_frames)?;
-    let params = merged(
-        params_of(head, id).ok_or_else(|| invalid("引数を読めません"))?,
-        patch,
-    );
+    let now = params_of(head, id).ok_or_else(|| invalid("引数を読めません"))?;
+    let patch = handle_params(handle, &chain[at + 1..], in_frames, &now)?;
+    let params = merged(now, patch);
     if enabled {
         return Ok(Edit::SetParams { node: id, params });
     }
