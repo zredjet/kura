@@ -1054,8 +1054,14 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   規則が変わって起動のスレッドが作り直しの印（settings の `analysis.reproject`）を置いたときだけで、作り直し終えたら消す
   （途中で止めたら印は残り、次の実行で初めから探す）。ふだんの起動・ジョブは事実の表を走査しない。
 - **失敗**：事実の行に `state = 'failed'` と `error_code` を書き、items は `failed`。計画・デコーダの指紋が変わるか、利用者が頼む
-  （`retry_analysis`：`failed` を `pending` に戻す）まで解き直さない。見積もり（値の 2 倍＋デコーダの作業領域）が
-  min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`。中止・一時停止・強制終了（電源断・ほかの部品の異常終了を
+  （`retry_analysis`：`failed` を `pending` に戻す）まで解き直さない。ただし M13 より前の版で `too_large` になった音声は、
+  更新のあと一度だけ `pending` に戻す（settings の `analysis.retry`。下の「一度きりの全件の走査」）。見積もりが
+  min(予算/2, 1 GiB) を超えるものは、予算を確保せずに `too_large`：画像の見積もりは値の 2 倍＋デコーダの作業領域。音声は値を
+  持たずに流して解き（M13 段 2）、見積もりは実際に読む段のデコーダの流れの作業領域（読み手が持つ埋め込みの画像などを含む）＋
+  窓 2 つ＋結果＋ダイジェストで長さによらない（`analysis::job::estimate_stream`）。形を読む前にも、段ごとにその段で形を読む
+  分（ファイル全体を読む MP3・AudioToolbox は長さ）を確保し、上限を超えれば `too_large`。音声の `too_large` は、`Limits` を
+  超える長さ（48 kHz で 3 時間）と、見積もりが上限を超えるもの（多チャンネルの窓・巨大な埋め込みの画像など）だけ。
+  中止・一時停止・強制終了（電源断・ほかの部品の異常終了を
   含む）では、書くまでは `pending` のまま。ただし OS のデコーダ（Platform の段）を通りうる形式（コーデックの組にその形式の Platform の
   デコーダがあるもの。アプリの組では HEIC・HEIF の見出しと AVIF・TIFF・BMP、固定の段が先に読む PSD・WAV・AIFF・Ogg・Opus・m4a・AAC）を
   読んでいる 1 件は、固定の段が読んでいても、読む前にコミットした処理中の印（settings の `analysis.inflight`）が残るので、強制終了でも
@@ -1065,8 +1071,10 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   と扱いが変わった形式を戻す `UPDATE items … WHERE lower(ext) IN (…) AND analysis_state IN ('ready','failed')`（決定 15 の更新で、
   形式から書いていた HEIC・HEIF を一度だけ見直す）、デコーダの指紋で戻す `UPDATE … WHERE … hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …)` は全件を走査する
   （指紋が変わったときだけ。10 万件で約 70 ms）。投影の古い行を探す `stale_facts`（`media_facts` を主キーの範囲で読み、残りの
-  条件で絞る）も、古い行がなければ表の終わりまで読む（作り直しの印があるときだけ。8 万行で約 3〜7 ms）。テスト
-  `sync_plan_reset_is_a_one_time_full_scan`。
+  条件で絞る）も、古い行がなければ表の終わりまで読む（作り直しの印があるときだけ。8 万行で約 3〜7 ms）。M13 段 2 の一度きりの解き直し（`store::retry_once`）の
+  `UPDATE items … WHERE kind = 'audio' AND analysis_state = 'failed' AND hash IN (SELECT b.hash FROM media_facts f JOIN blobs b …
+  WHERE f.state = 'failed' AND f.error_code = 'too_large')` も `media_facts` を全件走査する（settings の `analysis.retry` の版が
+  上がったときだけ。印を置いたあとの起動では走査しない）。テスト `sync_plan_reset_is_a_one_time_full_scan`。
 
 ### サムネイルの作り直し（M11。`crates/kura-core/src/media/`）
 
