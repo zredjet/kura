@@ -1,6 +1,6 @@
 //! 長い音声のラウドネス（A16。M13 段 4B）：`edit_measure` は計りを予約して `Measuring` を返し、裏の仕事（`edit_view { work }`
 //! の区切り）で窓ごとに流して解く。区切りは波形の段を先に進め、残った時間で計りを進める。結果は全体の描画に当てた解析と
-//! ビット単位で同じ。操作中は進めず、出力の標本が変わったら計りかけを捨てる。
+//! ビット単位で同じ。操作中は進めず、操作中でない確定の表示で出力の標本が変わったら計りかけを捨てる（仮の表示では残す）。
 
 use kura_engine::analysis::NoParams;
 use kura_engine::analysis::audio::loudness::LoudnessAnalysis;
@@ -176,4 +176,96 @@ fn long_measure_waits_while_interacting_and_drops_stale_runs() {
     assert_eq!(info.loudness, LoudnessState::Idle);
     assert_eq!(measure(&env.env(), &s).unwrap(), measuring, "計り直す");
     assert_eq!(position(), Some((a, 0, windows)));
+}
+
+/// 段 4B の検証の直し 1：計りの途中の仮の表示（ドラッグ中の Preview。標本が違う）では計りかけを捨てない。CancelPreview で
+/// 同じ出力に戻れば、計りかけが残っていて、裏の仕事の区切りで計り終える（結果は全体の解析とビット単位で同じ）。捨てるのは
+/// 操作中でない確定の表示で標本が替わったときだけ。
+#[test]
+fn long_measure_survives_a_canceled_preview() {
+    use kura_engine::doc::NodeId;
+    use kura_engine::session::Edit;
+
+    let env = Env::new();
+    let frames = 130 * C;
+    let bytes = noise_wav(8_000, 1, frames, 83);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open_with(id, vp(&[], false, false)).session.clone();
+    let idle = vp(&[(0, C)], false, false);
+    let out = env.step(&s, vec![add(0, "audio.gain", json!({ "db": -6.0 }))], &idle);
+    let a = shown_audio(&out.view).samples_id.clone();
+    assert!(matches!(
+        measure(&env.env(), &s).unwrap(),
+        LoudnessState::Measuring { .. }
+    ));
+    let editor = env.editor(&s);
+    let position = || {
+        editor
+            .lock_state()
+            .as_ref()
+            .unwrap()
+            .audio
+            .as_ref()
+            .unwrap()
+            .measure
+            .run_position()
+    };
+    let preview = |db: f64| Step::Preview {
+        edit: Edit::SetParams {
+            node: NodeId(1),
+            params: json!({ "db": db }),
+        },
+    };
+    // ドラッグ中の仮の表示（別の標本）：計りかけは残る（進めない）
+    let dragging = vp(&[(0, C)], true, true);
+    for db in [-7.0, -8.0] {
+        let out = env.step(&s, vec![preview(db)], &dragging);
+        let info = shown_audio(&out.view);
+        assert_ne!(info.samples_id, a);
+        assert_eq!(info.loudness, LoudnessState::Idle);
+        assert_eq!(
+            position().map(|p| p.0),
+            Some(a.clone()),
+            "仮の表示では捨てない"
+        );
+    }
+    // 手を離した仮の表示（操作中でない）でも、仮の値の間は捨てない
+    let out = env.step(&s, vec![preview(-9.0)], &idle);
+    assert_ne!(shown_audio(&out.view).samples_id, a);
+    assert_eq!(position().map(|p| p.0), Some(a.clone()));
+    // 取り消して同じ出力に戻る：計りかけがそのまま見え、裏の仕事で計り終える
+    let out = env.step(&s, vec![Step::CancelPreview], &idle);
+    let info = shown_audio(&out.view);
+    assert_eq!(info.samples_id, a);
+    assert!(
+        matches!(&info.loudness, LoudnessState::Measuring { samples_id, .. } if *samples_id == a),
+        "{:?}",
+        info.loudness
+    );
+    assert!(info.work, "計りかけがあるので裏の仕事がある");
+    let (state, _) = work_until_measured(&env, &s, &vp(&[(0, C)], true, false));
+    let LoudnessState::Ready { samples_id, values } = &state else {
+        panic!("{state:?}")
+    };
+    assert_eq!(*samples_id, a);
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -6.0 }), 1)
+        .unwrap();
+    same_bits(values, &whole_loudness(&bytes, &g));
+    // 確定の表示（操作中でない）で標本が替われば捨てる
+    assert_eq!(
+        measure(&env.env(), &s).unwrap(),
+        state,
+        "計り終えたものは覚えている"
+    );
+    let out = env.step(&s, vec![set(1, json!({ "db": -5.0 }))], &idle);
+    let b = shown_audio(&out.view).samples_id.clone();
+    assert!(matches!(
+        measure(&env.env(), &s).unwrap(),
+        LoudnessState::Measuring { .. }
+    ));
+    assert_eq!(position().map(|p| p.0), Some(b.clone()));
+    let out = env.step(&s, vec![Step::Undo], &idle);
+    assert_eq!(shown_audio(&out.view).samples_id, a);
+    assert_eq!(position(), None, "確定の表示で標本が替わったので捨てた");
 }

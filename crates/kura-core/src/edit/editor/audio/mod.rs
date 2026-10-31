@@ -313,10 +313,14 @@ impl Editor {
         let changed = ChangedSpans::of(&vr.changed);
         self.publish_audio(rev, vr.view.clone(), id.clone());
         st.view = Some(vr.view.clone());
+        let settled = !avp.interacting && !st.session.is_provisional();
         if let Some(a) = st.audio.as_mut() {
             a.peaks.note(rev, (rate, channels, frames), &changed);
-            // 出力が変わったら、前の出力の計りかけを捨てる
-            a.measure.retarget(&id);
+            // 操作中でない確定の表示で出力が変わったときだけ、前の出力の計りかけを捨てる（ドラッグ中・仮の値の表示では残す。
+            // 取り消して同じ出力に戻れば続きから計る。段 4B の検証の直し）
+            if settled {
+                a.measure.retarget(&id);
+            }
         }
         // 裏の仕事の区切り（`work` の要求だけ。操作中は進めない）：波形の段を先に、残った時間で長い音声の計りを進める
         let deadline = (avp.work && !avp.interacting).then(|| Instant::now() + peaks::WORK_SLICE);
