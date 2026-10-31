@@ -144,3 +144,65 @@ fn measure_matches_the_analysis_of_the_render() {
         "{state:?}"
     );
 }
+
+/// A14：「短い」は全体を描く見積もり（上流を含む）で決める。長い元 → gain → trim は出力が短くても、全体を描くと上流に長い値が
+/// できるので長い音声と同じ扱い（段 4B まで Failed・結果を覚えない）。表示はそのまま描ける。上流が長い値を作らない
+/// （長い元 → trim）なら計って Ready。
+#[test]
+fn measure_judges_the_whole_render_not_the_output() {
+    use kura_engine::analysis::NoParams;
+    use kura_engine::analysis::audio::loudness::LoudnessAnalysis;
+    let env = Env::new();
+    // 8 kHz モノラルで 32 MiB を超える長さ
+    let bytes = noise_wav(8_000, 1, 130 * C + 5, 55);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let vp = Viewport::audio_idle();
+    let s = env.open(id).session.clone();
+    let out = env.step(
+        &s,
+        vec![
+            add(0, "audio.gain", json!({ "db": -3.0 })),
+            add(1, "audio.trim", json!({ "start": 0, "end": C })),
+        ],
+        &vp,
+    );
+    let info = shown_audio(&out.view);
+    assert_eq!(info.frames, C);
+    assert_eq!(info.valid, vec![(0, C)], "表示は短い音声として全体を描く");
+    let state = measure(&env.env(), &s).unwrap();
+    assert!(
+        matches!(&state, LoudnessState::Failed { message, .. } if message.contains("まだ計れません")),
+        "{state:?}"
+    );
+    let out = env.step(&s, Vec::new(), &vp);
+    assert_eq!(
+        shown_audio(&out.view).loudness,
+        LoudnessState::Idle,
+        "結果を覚えない"
+    );
+
+    // 長い元 → trim：上流に長い値を作らないので計る
+    let s = env.open(id).session.clone();
+    env.step(
+        &s,
+        vec![add(0, "audio.trim", json!({ "start": 7, "end": C + 7 }))],
+        &vp,
+    );
+    let got = measure(&env.env(), &s).unwrap();
+    let mut g = Graph::new_single();
+    g.push_linear("audio.trim", 1, json!({ "start": 7, "end": C + 7 }), 1)
+        .unwrap();
+    let want = rendered(&bytes, "wav", &g);
+    let report = kura_engine::Engine::new()
+        .unwrap()
+        .analyze::<LoudnessAnalysis>(
+            &kura_engine::Value::Audio(want),
+            &NoParams {},
+            &kura_engine::NoMonitor,
+        )
+        .unwrap();
+    assert!(
+        matches!(&got, LoudnessState::Ready { values, .. } if *values == values_of(&report)),
+        "{got:?}"
+    );
+}

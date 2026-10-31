@@ -2,10 +2,13 @@
 //!
 //! - 計るのは今の rev の出力（量子化のあと）で、結果は出力の指紋（`samplesId`）ごとに覚える（[`RESULTS`] 件の LRU）。同じ標本
 //!   なら `samplesId` が同じなので、取り消しで戻った・仮の値と同じ確定の値は計り直さない。
-//! - 短い音声（出力の値が `WHOLE_VIEW_BYTES` 以下）：`edit_measure` の中で、キャッシュを引いて全体を描き（表示の範囲が全体なので
-//!   ノードは当たる）、`audio.loudness` v1 を解いて、すぐ `Ready` を返す。
-//! - 長い音声：段 2 の流れの解析が入るまで `Failed`（「この長さのラウドネスは、まだ計れません」）。段 4B（F12）で、裏の仕事で
-//!   窓ごとに流して計る（`Measuring { progress }`）。
+//! - 短い音声：`edit_measure` の中で、キャッシュを引いて全体を描き（`render_cached`。全体の値なので解析に使える）、
+//!   `audio.loudness` v1 を解いて、すぐ `Ready` を返す。「短い」は出力の大きさだけでなく、全体を描く見積もり（上流を含む）で
+//!   決める（`whole_is_short`：出力と、全体を描くときに作るどのノードの値も `WHOLE_VIEW_BYTES` 以下）。長い元を gain → trim
+//!   で短くした文書は、表示は区間だけを描けても、全体を描くと上流に長い値ができるので長い音声と同じ扱い。範囲の描画・
+//!   継ぎはぎの表示の値は解析に使わない。
+//! - 長い音声：段 2 の流れの解析が入るまで `Failed`（「この長さのラウドネスは、まだ計れません」。結果の LRU には入れない）。
+//!   段 4B（F12）で、裏の仕事で窓ごとに流して計る（`Measuring { progress }`）。
 //! - `Latest` の世代を払い出さない（表示を止めない）。止まるのは閉じたときだけ。表示の情報の `loudness` にも、覚えている状態を
 //!   毎回載せる（覚えていなければ `Idle`）。
 
@@ -16,7 +19,7 @@ use kura_engine::render::cache::RenderOptions;
 use kura_engine::render::estimate::{EstimateSpec, Source};
 
 use super::super::{EditorEnv, EditorError, ProblemCode, State, editor_of, settle};
-use super::{is_short, samples_id};
+use super::{WHOLE_VIEW_BYTES, is_short, samples_id};
 
 /// 覚える結果の数。
 pub const RESULTS: usize = 8;
@@ -120,6 +123,24 @@ fn current_id(editor: &super::super::Editor, st: &State) -> Result<String, Edito
         .ok_or_else(|| EditorError::Failed("出力の指紋がありません".into()))
 }
 
+/// 全体を描いても長い値を作らないか：出力が短く（[`is_short`]）、上流を含む全体の描画の見積もりで、どのノードが新しく作る
+/// 値も [`WHOLE_VIEW_BYTES`] 以下（モジュールの説明）。
+fn whole_is_short(
+    editor: &super::super::Editor,
+    st: &State,
+    full: &kura_engine::Shape,
+) -> Result<bool, EditorError> {
+    if !is_short(full) {
+        return Ok(false);
+    }
+    let spec = EstimateSpec::new(0).all_inputs(&st.plan, Source::Held);
+    let est = editor
+        .runtime
+        .preview(|e| e.estimate(&st.plan, &spec, None))
+        .map_err(|e| EditorError::from_engine("全体の描画を見積もれません", e))?;
+    Ok(est.nodes.iter().all(|n| n.value <= WHOLE_VIEW_BYTES))
+}
+
 /// 今の rev の出力のラウドネス（モジュールの説明）。
 pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, EditorError> {
     let editor = editor_of(env, session)?;
@@ -151,7 +172,7 @@ pub fn measure(env: &EditorEnv<'_>, session: &str) -> Result<LoudnessState, Edit
             return Ok(known);
         }
     }
-    if !is_short(&full) {
+    if !whole_is_short(&editor, st, &full)? {
         return Ok(LoudnessState::Failed {
             samples_id: id,
             message: "この長さのラウドネスは、まだ計れません".into(),
