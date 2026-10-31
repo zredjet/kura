@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::edit::versions::{RevertRecord, Version, VersionInput};
+use crate::edit::work_pcm::WorkHandle;
 
 /// 版に戻す先の確かめ：0 以上で、頭の版 `head` より前（頭の版そのものには戻さない）。
 pub(super) fn check_target(to: i64, head: i64) -> Result<()> {
@@ -226,6 +227,7 @@ impl EditHandler {
             fallback_encoder: true,
             platform: true,
             progress: true,
+            retain_work: true,
         };
         // 書きかけ（音声は作り直しが流して直接書く。M13 段 3）
         let mut staging = Staging::default();
@@ -234,11 +236,13 @@ impl EditHandler {
             .staging_dir()
             .join(format!("edit-{job}-out.{}.part", out_ext0(&target.version)));
         staging.add(out_part.clone());
-        let r = match rebuild(&self.engine, ctx, item_id, kind, &target, rules, &out_part) {
+        let mut r = match rebuild(&self.engine, ctx, item_id, kind, &target, rules, &out_part) {
             Ok(Flow::Go(r)) => r,
             Ok(Flow::Stop(end)) => return Ok(Flow::Stop(end)),
             Err(fail) => return Err(fail.into_core()),
         };
+        // 作業用の PCM は書き終えた所の止める指示を見るまで持つ（一時停止なら残す。M13 段 3 の検証の直し）
+        let mut work = r.work.take();
         let v = &target.version;
         let k = target.to;
         let mut warnings = r.warnings;
@@ -252,8 +256,14 @@ impl EditHandler {
             write_synced(&out_part, &bytes)?;
         }
         if let Some(stop) = self.after_written(ctx, &mut staging) {
+            if matches!(stop, Ok(Flow::Stop(JobEnd::Paused)))
+                && let Some(w) = work.as_mut()
+            {
+                w.retain_on_drop();
+            }
             return stop;
         }
+        drop(work);
         let ext_hint = v.ext.clone();
         Ok(Flow::Go((
             Prepared {
@@ -294,6 +304,8 @@ struct Rules {
     platform: bool,
     /// 進捗を送る（版に戻す。GC は自分の進捗を送る）。
     progress: bool,
+    /// 一時停止で止めるとき、作業用の PCM を残す（版に戻す。再開で使い回す。決定 A3。GC は残さない。M13 段 3 の検証の直し）。
+    retain_work: bool,
 }
 
 /// 作り直せなかった理由。
@@ -358,6 +370,8 @@ struct Rebuilt {
     original: OriginalFile,
     rec: RecordedInput,
     warnings: Vec<String>,
+    /// 流して作り直したときの作業用の PCM（呼び手が止める指示を見るまで持つ。画像・アンカー・源から読んだときは None）。
+    work: Option<WorkHandle>,
 }
 
 /// 版 k を作り直す（段 1〜5。画像は staging には書かない）：版 k の文書を読み、入力の記録で元を読み（アンカー → 元。[`read`]）、
@@ -627,6 +641,7 @@ fn rebuild(
         original,
         rec,
         warnings,
+        work: None,
     }))
 }
 
@@ -653,8 +668,25 @@ struct StreamRebuild<'a> {
 
 /// 音声の版 k を流して作り直す（M13 段 3）：入力の記録に合う遅延の入力（アンカー → 元を記録のデコーダで。`rules.platform` が
 /// 偽なら OS のデコーダの作業用のファイルを作らずに Unavailable）を、記録の書き手（なければ今の組の同じ形式のもの）で
-/// `part` へ流して書き、値のダイジェストを記録と照らす（違えば `part` を消して Mismatch）。
+/// `part` へ流して書き、値のダイジェストを記録と照らす（違えば `part` を消して Mismatch）。一時停止で止めるときは、
+/// `rules.retain_work`（版に戻す）なら作業用の PCM を残す印を立てる（再開は初めから。残っているものを使い回す。決定 A3）。
 fn rebuild_stream(s: StreamRebuild<'_>) -> std::result::Result<Flow<Rebuilt>, RebuildFail> {
+    let retain = s.rules.retain_work;
+    let mut work: Option<WorkHandle> = None;
+    let r = rebuild_stream_in(s, &mut work);
+    if retain
+        && matches!(r, Ok(Flow::Stop(JobEnd::Paused)))
+        && let Some(w) = work.as_mut()
+    {
+        w.retain_on_drop();
+    }
+    r
+}
+
+fn rebuild_stream_in(
+    s: StreamRebuild<'_>,
+    work: &mut Option<WorkHandle>,
+) -> std::result::Result<Flow<Rebuilt>, RebuildFail> {
     let StreamRebuild {
         engine,
         ctx,
@@ -694,8 +726,7 @@ fn rebuild_stream(s: StreamRebuild<'_>) -> std::result::Result<Flow<Rebuilt>, Re
     if rules.progress {
         ctx.progress(0.1, "戻す版の元を読んでいます");
     }
-    // 作業用の PCM は作り直しの間だけ持つ（終われば落として消す）
-    let mut work = None;
+    // 作業用の PCM は呼び手が持つ（作り直したものと一緒に返し、止める指示を見たら落とす）
     let read = stream::read_input(
         &cx,
         anchor,
@@ -706,7 +737,7 @@ fn rebuild_stream(s: StreamRebuild<'_>) -> std::result::Result<Flow<Rebuilt>, Re
         &format!("版 {k} を作り直せません"),
         &mut warnings,
         &mut passes,
-        &mut work,
+        work,
     )?;
     let input = match read {
         Flow::Go(stream::StreamRead::Read(input)) => input,
@@ -791,7 +822,6 @@ fn rebuild_stream(s: StreamRebuild<'_>) -> std::result::Result<Flow<Rebuilt>, Re
         Flow::Stop(end) => return Ok(Flow::Stop(end)),
     };
     drop(lease);
-    drop(work);
     // 値の照らし（書き終えてから分かる。違えばまれなので、書いた分の無駄は受け入れる）
     if written.encoded.value_digest != want {
         let _ = std::fs::remove_file(part);
@@ -829,6 +859,7 @@ fn rebuild_stream(s: StreamRebuild<'_>) -> std::result::Result<Flow<Rebuilt>, Re
         original,
         rec,
         warnings,
+        work: work.take(),
     }))
 }
 
@@ -878,6 +909,7 @@ pub(crate) fn verify_version(
         fallback_encoder: false,
         platform: false,
         progress: false,
+        retain_work: false,
     };
     // 音声の作り直しはここへ流して書く（照らしたら消す）
     let layout = ctx.library().layout();

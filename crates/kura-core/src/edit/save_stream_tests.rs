@@ -719,6 +719,183 @@ fn paused_save_keeps_the_work_file_shared_with_the_editor() {
     assert_consistent(&env.lib);
 }
 
+/// 読んだ数を数える包み（固定の段のデコーダを `CodecSet::replace_decoder` で差し替える。識別子・段・約束・読み方は同じ）。
+struct CountingDecoder {
+    inner: Arc<dyn Decoder>,
+    reads: std::sync::atomic::AtomicU64,
+}
+
+impl CountingDecoder {
+    fn reads(&self) -> u64 {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl Decoder for CountingDecoder {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+
+    fn tier(&self) -> Tier {
+        self.inner.tier()
+    }
+
+    fn reproducible(&self) -> bool {
+        self.inner.reproducible()
+    }
+
+    fn env(&self) -> Option<CodecEnv> {
+        self.inner.env()
+    }
+
+    fn can_decode(&self, format: &str) -> bool {
+        self.inner.can_decode(format)
+    }
+
+    fn work_bytes(&self, format: &str, shape: &Shape) -> u64 {
+        self.inner.work_bytes(format, shape)
+    }
+
+    fn file_work_bytes(&self, format: &str, shape: &Shape, len: u64) -> u64 {
+        self.inner.file_work_bytes(format, shape, len)
+    }
+
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.inner.shape(src, format, opts, limits)
+    }
+
+    fn decode(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.decode(src, format, opts, limits, mon)
+    }
+
+    fn shape_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.inner.shape_file(path, format, opts, limits)
+    }
+
+    fn shape_file_monitored(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Shape, EngineError> {
+        self.inner
+            .shape_file_monitored(path, format, opts, limits, mon)
+    }
+
+    fn streams(&self, format: &str) -> bool {
+        self.inner.streams(format)
+    }
+
+    fn stream_work_bytes(&self, format: &str, shape: &Shape, len: u64) -> u64 {
+        self.inner.stream_work_bytes(format, shape, len)
+    }
+
+    fn shape_work_bytes(&self, format: &str, len: u64) -> u64 {
+        self.inner.shape_work_bytes(format, len)
+    }
+
+    fn held_bytes_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        limits: &Limits,
+    ) -> Result<kura_engine::codec::Held, EngineError> {
+        self.inner.held_bytes_file(path, format, limits)
+    }
+
+    fn decode_stream_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut kura_engine::codec::DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .decode_stream_file(path, format, opts, limits, shape, out, mon)
+    }
+}
+
+/// 版に戻すの作り直し（アンカーのない FLAC の元。作業用の PCM から読む）を書く途中で一時停止すると、作業用の PCM を残し、
+/// 再開で元を読み直さない（M13 段 3 の検証の直し #8。A3）。一時停止のまま中止すれば消す。
+#[test]
+fn paused_revert_keeps_the_work_file() {
+    let pinned = CodecSet::pinned();
+    let mut set = CodecSet::pinned();
+    let flac = set.decoders_for("flac")[0].clone();
+    let counting = Arc::new(CountingDecoder {
+        inner: flac,
+        reads: Default::default(),
+    });
+    set.replace_decoder(counting.clone()).unwrap();
+    let (env, gate) = gated_env(
+        Arc::new(Mutex::new(set)),
+        |s| matches!(s, Stage::Window { fed, frames } if fed < frames),
+    );
+    let original = noise_file(&pinned, "flac", 1, 1_100_000, 8);
+    let (item, _) = add_audio(&env.lib, &original, "flac", "戻す声");
+    assert_done(&env.overwrite(item, audio_doc(-2.0, Some("wav"))));
+    assert_done(&env.overwrite(item, audio_doc(-4.0, Some("wav"))));
+    // 版 1 のファイルを GC で消す（照合も作業用の PCM から読む）
+    gc_version(&env, item, 1);
+    assert_eq!(env.engine.work_pcm().usage(), (0, 0));
+    // 中止の回（版を足さない）のあとに、再開の回
+    for pause_then_cancel in [true, false] {
+        let before = counting.reads();
+        gate.arm();
+        let id = env.start(item, base_of(&env.lib, item), SaveAction::Revert { to: 1 });
+        gate.wait(&env, id);
+        env.jobs.pause(id).unwrap();
+        gate.open();
+        assert!(env.jobs.wait_idle(WAIT));
+        assert_eq!(env.jobs.get(id).unwrap().state, JobState::Paused);
+        assert_eq!(counting.reads(), before + 1);
+        assert_eq!(
+            env.engine.work_pcm().usage().0,
+            1,
+            "版に戻すの一時停止で作業用の PCM を消した"
+        );
+        if pause_then_cancel {
+            env.jobs.cancel(id).unwrap();
+            assert!(env.jobs.wait_idle(WAIT));
+            assert_eq!(env.jobs.get(id).unwrap().state, JobState::Canceled);
+            assert_eq!(env.engine.work_pcm().usage(), (0, 0));
+        } else {
+            env.jobs.resume(id).unwrap();
+            assert!(env.jobs.wait_idle(WAIT));
+            assert_done(&env.jobs.get(id).unwrap());
+            assert_eq!(counting.reads(), before + 1, "再開で元を読み直した");
+            assert_eq!(env.engine.work_pcm().usage(), (0, 0));
+        }
+        assert_consistent(&env.lib);
+    }
+}
+
 /// S23：流して書いた音声の版は、GC の照合（流して作り直して生の BLAKE3 を比べる）で一致して released になり、版に戻すと
 /// 流して作り直して同じバイト列になる。記録の値のダイジェストと違えば、照合は kept（ファイルを残す）。
 #[test]
