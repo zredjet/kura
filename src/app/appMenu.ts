@@ -12,6 +12,7 @@ import {
   type SubmenuOptions,
 } from '@tauri-apps/api/menu';
 
+import { editorSelectAll } from '../features/editor/editorKeys';
 import { canSaveEditor, useEditorStore } from '../features/editor/editorStore';
 import { EDITOR_KINDS, type EditorKind } from '../features/editor/kindTraits';
 import {
@@ -482,9 +483,12 @@ export function historySyncer(
   };
 }
 
-/** 「すべてを選択」（⌘A）：入力欄にフォーカスがあればその文字を、なければ一覧のすべてを選ぶ（design.md §6）。 */
+/**
+ * 「すべてを選択」（⌘A）：入力欄にフォーカスがあればその文字を、なければ開いているエディタの種類（音声は全体を選ぶ。
+ * M13）、受けなければ一覧のすべてを選ぶ（design.md §6）。
+ */
 export function selectAllCommand(target: Element | null = document.activeElement): void {
-  if (!selectAllText(target)) {
+  if (!selectAllText(target) && !editorSelectAll()) {
     selectAllEntries(target);
   }
 }

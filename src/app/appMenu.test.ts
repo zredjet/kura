@@ -34,12 +34,17 @@ import {
   selectAllCommand,
   viewItemOptions,
 } from './appMenu';
+import { editorSelectAll } from '../features/editor/editorKeys';
 import { useEditorStore } from '../features/editor/editorStore';
 import { isReplayed } from '../lib/keys';
 
 vi.mock('../features/library/pixelArtMenu', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../features/library/pixelArtMenu')>()),
   applyPixelArtToSelection: vi.fn(),
+}));
+vi.mock('../features/editor/editorKeys', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../features/editor/editorKeys')>()),
+  editorSelectAll: vi.fn(() => false),
 }));
 
 type Item = MenuItemOptions | PredefinedMenuItemOptions | SubmenuOptions;
@@ -385,6 +390,21 @@ describe('selectAllCommand', () => {
 
     expect(area.selectionStart).toBe(0);
     expect(area.selectionEnd).toBe(area.value.length);
+  });
+
+  // M13：音声エディタを開いている間は、エディタの種類が全体を選ぶ（入力欄の文字が先）
+  it('エディタの種類が受ければ、一覧は選ばない（入力欄の文字が先）', () => {
+    vi.mocked(editorSelectAll).mockReturnValueOnce(true);
+    selectAllCommand();
+    expect(editorSelectAll).toHaveBeenCalled();
+    expect(useViewStore.getState().selection).toEqual(EMPTY_SELECTION);
+    vi.mocked(editorSelectAll).mockClear();
+    const input = document.createElement('input');
+    input.value = 'abc';
+    document.body.append(input);
+    input.focus();
+    selectAllCommand();
+    expect(editorSelectAll).not.toHaveBeenCalled();
   });
 
   it('入力欄の外なら一覧のすべてを選ぶ', () => {

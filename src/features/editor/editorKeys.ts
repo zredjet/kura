@@ -49,6 +49,8 @@ export interface EditorKindKeys {
   up?(e: KeyboardEvent): boolean;
   /** 押している間だけの道具を戻す（窓を離れた・キーを受けるのをやめた）。 */
   reset?(): void;
+  /** すべてを選択（⌘A・編集メニュー。音声は全体を選ぶ）。選んだら true。 */
+  selectAll?(): boolean;
 }
 
 /** エディタの上にシート・メニュー・色を選ぶ部品が開いているか。 */
@@ -110,6 +112,16 @@ export function handleEditorKey(e: KeyboardEvent): boolean {
     default:
       return false;
   }
+}
+
+/**
+ * 編集メニューの「すべてを選択」（⌘A）をエディタの種類に渡す（開いていない・シートやメニューの上・種類が受けなければ
+ * false：呼び手が一覧のすべてを選ぶ）。
+ */
+export function editorSelectAll(): boolean {
+  const s = useEditorStore.getState();
+  if (s.phase === 'closed' || isBlocked()) return false;
+  return editorKindKeys(s.kind)?.selectAll?.() ?? false;
 }
 
 /** キーを離したとき（押している間だけの道具を戻す）。 */
