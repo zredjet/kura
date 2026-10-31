@@ -140,6 +140,11 @@ export class ContextPool {
     };
   }
 
+  /** 持っているレート `rate` の文脈（作らない・使った順も変えない。なければ undefined。自己点検）。 */
+  peek(rate?: number): ContextLike | undefined {
+    return this.contexts.get(rate ?? 'device');
+  }
+
   /** 使用中の印があるか。 */
   isHeld(rate?: number | 'device'): boolean {
     return (this.holds.get(rate ?? 'device') ?? 0) > 0;

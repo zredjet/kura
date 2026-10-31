@@ -11,7 +11,7 @@
  * 4. 往復（`edit-roundtrip`）：手を含む `edit_step` を送ってから表示が届くまでと、PCM 1 チャンクの取得（NFR-11 の 50 ms）。
  *    20 回ごとにまとめて出す（gain・fade・ループ点の手を試す）。
  * 5. 文脈（`edit-context`）：鳴らしている間に devtools で `__kuraContextCheck()`：効果音・試聴がほかのレートで文脈を
- *    作っても（3 つ作る）、エディタの文脈が閉じられない（使用中の印がある）。
+ *    作っても（3 つ作る）、エディタの文脈が閉じられない（使用中の印がある・プールに残っている）。
  */
 
 import { audioRuntime } from '../features/asset/audioRuntime';
@@ -23,6 +23,7 @@ import type {
 } from '../features/editor/audio/playback';
 import type { WaveController } from '../features/editor/audio/waveController';
 import { commands } from '../ipc/bindings';
+import type { ContextLike } from '../lib/assetAudio';
 import type { EditStepDto } from '../ipc/edit';
 import { runCrossfadeCheck, runEditorSeamCheck } from './seamCheck';
 import { stats } from './tileCheck';
@@ -145,9 +146,12 @@ export async function runWaveBench(c: WaveController, frames = BENCH_FRAMES): Pr
   };
 }
 
-/** 鳴らしている間に、ほかのレートで文脈を作っても、エディタの文脈が閉じられないか。 */
+/**
+ * 鳴らしている間に、ほかのレートで文脈を作っても、エディタの文脈が閉じられないか。判定はプールに同じ文脈が残っているか
+ * で行う（追い出した文脈の close は待たないので、直後の `state` はまだ 'closed' にならない。WebKit で確かめた）。
+ */
 export function contextCheck(player: EditorPlayer): unknown {
-  const ctx = player.context as { sampleRate: number; state?: string } | null;
+  const ctx = player.context as ({ sampleRate: number; state?: string } & ContextLike) | null;
   if (!ctx || !player.playing) return { playing: false };
   const pool = audioRuntime().pool;
   const rate = ctx.sampleRate;
@@ -165,7 +169,7 @@ export function contextCheck(player: EditorPlayer): unknown {
     rate,
     held: pool.isHeld(rate),
     state: ctx.state ?? null,
-    ok: ctx.state !== 'closed',
+    ok: pool.peek(rate) === ctx,
   };
 }
 

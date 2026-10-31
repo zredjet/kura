@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { PlacedRecord } from '../features/editor/audio/playback';
+import { type AudioRuntime, setAudioRuntimeForTest } from '../features/asset/audioRuntime';
+import type { EditorPlayer, PlacedRecord } from '../features/editor/audio/playback';
+import { ContextPool } from '../lib/assetAudio';
+import { fakeFactory } from '../test/fakeAudio';
 import { runEditorSeamCheck } from './seamCheck';
-import { benchSteps, createAudioCheck, RoundTrips, stepKind } from './waveCheck';
+import { benchSteps, contextCheck, createAudioCheck, RoundTrips, stepKind } from './waveCheck';
 
 vi.mock('./seamCheck', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./seamCheck')>()),
@@ -15,6 +18,25 @@ vi.mock('../ipc/bindings', async (importOriginal) => {
     ...real,
     commands: { ...real.commands, benchReport: vi.fn(async () => ({ status: 'ok', data: null })) },
   };
+});
+
+describe('文脈の自己点検', () => {
+  it('ok はエディタの文脈がプールに残っているかで決める（close の直後に state を読まない）', () => {
+    for (const held of [true, false]) {
+      const factory = fakeFactory();
+      const pool = new ContextPool(factory.create, 3);
+      setAudioRuntimeForTest({ pool } as unknown as AudioRuntime);
+      const ctx = pool.get(48_000);
+      const release = held ? pool.hold(48_000) : () => undefined;
+      const player = { context: ctx, playing: true } as unknown as EditorPlayer;
+      const report = contextCheck(player) as { ok: boolean; held: boolean };
+      expect(report.held).toBe(held);
+      // 印がなければ、ほかのレートの文脈を 3 つ作ると追い出される
+      expect(report.ok).toBe(held);
+      release();
+      setAudioRuntimeForTest(null);
+    }
+  });
 });
 
 describe('往復の時間', () => {
