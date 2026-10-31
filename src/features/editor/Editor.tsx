@@ -49,8 +49,18 @@ export function Editor() {
     return null;
   }
   return (
-    <div className={styles.editor} data-editor="" role="region" aria-label={t.label}>
-      <section ref={stageRef} className={styles.stage} aria-label={t.canvas} tabIndex={-1}>
+    <div
+      className={styles.editor}
+      data-editor=""
+      role="region"
+      aria-label={kind === 'audio' ? t.audio.label : t.label}
+    >
+      <section
+        ref={stageRef}
+        className={styles.stage}
+        aria-label={kind === 'audio' ? t.audio.wave : t.canvas}
+        tabIndex={-1}
+      >
         <ui.Stage />
         <TopBar ui={ui} />
         {phase === 'open' && <ui.Capsule />}

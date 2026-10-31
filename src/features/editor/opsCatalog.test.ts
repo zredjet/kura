@@ -7,6 +7,7 @@ import {
   controlFor,
   defaultParams,
   hasLaterPaint,
+  initialValue,
   isParamVisible,
   makeColor,
   makeLength,
@@ -15,6 +16,7 @@ import {
   readColor,
   readLength,
   summarizeNode,
+  valueSummary,
   visibleParams,
 } from './opsCatalog';
 
@@ -55,6 +57,19 @@ describe('引数の欄の種類', () => {
     expect(controlFor(param('meta.set_pivot', 'pivot'))).toBe('point');
     expect(controlFor(param('paint.actions', 'actions'))).toBe('count');
     expect(controlFor(param('palette.replace', 'entries'))).toBe('count');
+  });
+
+  it('音声の区間は始め・終わりの欄（指定すると全体）、標本の引数は入力の長さを初めの値にする', () => {
+    expect(controlFor(param('audio.set_loop', 'loop'))).toBe('frameRange');
+    expect(initialValue(param('audio.set_loop', 'loop'), null, 500)).toEqual({
+      start: 0,
+      end: 500,
+    });
+    expect(initialValue(param('audio.trim', 'end'), null, 500)).toBe(500);
+    expect(initialValue(param('audio.trim', 'end'), null)).toBe(1);
+    expect(
+      valueSummary('audio.set_loop', param('audio.set_loop', 'loop'), { start: 0, end: 48000 }),
+    ).toBe('0 – 48,000');
   });
 });
 

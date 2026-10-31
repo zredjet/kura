@@ -40,6 +40,7 @@ export type ParamControl =
   | 'grid'
   | 'ratio'
   | 'count'
+  | 'frameRange'
   | 'readonly';
 
 /** 列挙をセグメントにする数の上限（それより多ければ選択）。 */
@@ -177,6 +178,8 @@ export function controlFor(spec: ParamSpec): ParamControl {
     case 'strokes':
     case 'paletteEntries':
       return 'count';
+    case 'frameRange':
+      return 'frameRange';
     default:
       return 'readonly';
   }
@@ -285,9 +288,18 @@ export function makeColor(rgba: readonly number[], alpha: boolean): JsonValue {
   return alpha ? [r, g, b, a] : [r, g, b];
 }
 
-/** 引数の既定の値が null のとき、「指定する」にしたときの初めの値。 */
-export function initialValue(spec: ParamSpec, size: { w: number; h: number } | null): JsonValue {
+/**
+ * 引数の既定の値が null のとき、「指定する」にしたときの初めの値。`frames` は音声のノードの入力の長さ（区間・標本の
+ * 位置は全体にする）。
+ */
+export function initialValue(
+  spec: ParamSpec,
+  size: { w: number; h: number } | null,
+  frames: number | null = null,
+): JsonValue {
   switch (spec.kind.type) {
+    case 'frameRange':
+      return { start: 0, end: Math.max(1, frames ?? 1) };
     case 'color':
       return spec.kind.alpha ? [0, 0, 0, 255] : [0, 0, 0];
     case 'grid':
@@ -303,6 +315,9 @@ export function initialValue(spec: ParamSpec, size: { w: number; h: number } | n
     case 'int':
     case 'float': {
       const r = numberRange(spec);
+      if (spec.unit === 'samples' && frames !== null) {
+        return Math.min(r.max ?? frames, Math.max(r.min ?? 0, frames));
+      }
       return r.min ?? 0;
     }
     case 'bool':
@@ -381,6 +396,10 @@ export function valueSummary(op: string, spec: ParamSpec, value: JsonValue): str
     case 'color': {
       const c = readColor(value);
       return c ? toHex(c) : null;
+    }
+    case 'frameRange': {
+      const r = numbers(value, ['start', 'end']);
+      return r ? `${formatCount(r.start ?? 0)} – ${formatCount(r.end ?? 0)}` : null;
     }
     default:
       return null;

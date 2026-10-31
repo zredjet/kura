@@ -8,6 +8,7 @@ import { ja } from '../../i18n/ja';
 import type { Issue, JsonValue, ParamSpec } from '../../ipc/edit';
 import { formatCount } from '../../lib/format';
 import { isImeKey } from '../../lib/ime';
+import { TimeField } from './audio/TimeField';
 import styles from './Editor.module.css';
 import { sendParam, useEditorStore } from './editorStore';
 import { toHex } from './image/color';
@@ -330,6 +331,116 @@ function NumberLabeled({
   );
 }
 
+/**
+ * 標本の位置・長さ（音声。`Unit 'samples'` の整数）：時刻の欄（`m:ss.mmm`。下に標本の位置）。数の入力と同じく merge で
+ * 送り、Enter・離れたら seal。
+ */
+function SamplesParam({
+  spec,
+  label,
+  value,
+  rate,
+  send,
+}: {
+  spec: ParamSpec;
+  label: string;
+  value: JsonValue;
+  rate: number;
+  send: Send;
+}) {
+  const r = numberRange(spec);
+  const current = typeof value === 'number' ? value : null;
+  const [shown, setPending] = usePending<number | null>(current);
+  return (
+    <div className={styles.paramRow}>
+      <TimeField
+        label={label}
+        frames={shown}
+        rate={rate}
+        min={r.min ?? 0}
+        max={r.max ?? Number.POSITIVE_INFINITY}
+        onValue={(v) => setPending(v, send({ kind: 'nudge', value: v }))}
+        onSeal={() => send({ kind: 'seal' })}
+      />
+    </div>
+  );
+}
+
+/** 音声の区間（ループの区間など）：始め・終わりの時刻の欄 2 つ（終わりは含まない）。 */
+function FrameRangeParam({
+  label,
+  value,
+  rate,
+  frames,
+  send,
+}: {
+  label: string;
+  value: JsonValue;
+  rate: number | null;
+  frames: number | null;
+  send: Send;
+}) {
+  const now = numbers(value, ['start', 'end']) ?? { start: 0, end: 1 };
+  const [shown, setPending] = usePending<string>(JSON.stringify(now));
+  const vals = JSON.parse(shown) as { start: number; end: number };
+  const max = frames ?? Number.POSITIVE_INFINITY;
+  const setOne = (key: 'start' | 'end', v: number) => {
+    const next = { ...vals, [key]: v };
+    if (key === 'start' && next.end <= v) next.end = Math.min(max, v + 1);
+    if (key === 'end' && next.start >= v) next.start = Math.max(0, v - 1);
+    setPending(JSON.stringify(next), send({ kind: 'nudge', value: next }));
+  };
+  const a = t.audio;
+  return (
+    <fieldset className={styles.paramGroup}>
+      <legend className={styles.paramLabel}>{label}</legend>
+      <div
+        className={styles.paramGrid}
+        style={{ gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' }}
+      >
+        {rate !== null ? (
+          <>
+            <TimeField
+              label={a.start}
+              frames={vals.start}
+              rate={rate}
+              max={max - 1}
+              onValue={(v) => setOne('start', v)}
+              onSeal={() => send({ kind: 'seal' })}
+            />
+            <TimeField
+              label={a.end}
+              frames={vals.end}
+              rate={rate}
+              min={1}
+              max={max}
+              onValue={(v) => setOne('end', v)}
+              onSeal={() => send({ kind: 'seal' })}
+            />
+          </>
+        ) : (
+          <>
+            <NumberLabeled
+              name={a.start}
+              value={vals.start}
+              min={0}
+              onValue={(v) => setOne('start', v)}
+              onSeal={() => send({ kind: 'seal' })}
+            />
+            <NumberLabeled
+              name={a.end}
+              value={vals.end}
+              min={1}
+              onValue={(v) => setOne('end', v)}
+              onSeal={() => send({ kind: 'seal' })}
+            />
+          </>
+        )}
+      </div>
+    </fieldset>
+  );
+}
+
 /** 長さ：「px｜%｜自動」と数。 */
 function LengthParam({
   spec,
@@ -461,6 +572,7 @@ export function ParamField({
   issues,
   size,
   count = null,
+  time,
 }: {
   node: number;
   op: string;
@@ -470,6 +582,8 @@ export function ParamField({
   size: { w: number; h: number } | null;
   /** 追記だけの配列の要素の数（ノードの `log`。引数の値は `[]` で届く）。 */
   count?: number | null;
+  /** 音声のノードの入力のレートと長さ（標本の引数を時間の欄にする）。 */
+  time?: { rate: number | null; frames: number | null };
 }) {
   const label = paramLabel(op, spec.key);
   const send = useCallback<Send>((g) => sendParam(node, spec.key, g), [node, spec.key]);
@@ -480,7 +594,23 @@ export function ParamField({
   if (!(optional && value === null)) {
     switch (control) {
       case 'number':
-        body = <NumberParam spec={spec} label={label} value={value} send={send} />;
+        body =
+          spec.unit === 'samples' && spec.kind.type === 'int' && time?.rate ? (
+            <SamplesParam spec={spec} label={label} value={value} rate={time.rate} send={send} />
+          ) : (
+            <NumberParam spec={spec} label={label} value={value} send={send} />
+          );
+        break;
+      case 'frameRange':
+        body = (
+          <FrameRangeParam
+            label={label}
+            value={value}
+            rate={time?.rate ?? null}
+            frames={time?.frames ?? null}
+            send={send}
+          />
+        );
         break;
       case 'switch':
         body = (
@@ -615,7 +745,12 @@ export function ParamField({
         <label className={styles.paramSwitch}>
           <Switch
             checked={value !== null}
-            onChange={(on) => send({ kind: 'set', value: on ? initialValue(spec, size) : null })}
+            onChange={(on) =>
+              send({
+                kind: 'set',
+                value: on ? initialValue(spec, size, time?.frames ?? null) : null,
+              })
+            }
           />
           {t.specifyParam(label)}
         </label>

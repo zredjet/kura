@@ -157,10 +157,18 @@ function AddOpButton() {
 type ParamSize = { w: number; h: number } | null;
 
 /**
+ * 標本の引数を時間の欄にするためのノードごとのレートと長さ（音声。ノードの入力 0 のもの。分からなければ null で数の欄）。
+ */
+export interface ParamTime {
+  rate(node: number): number | null;
+  frames(node: number): number | null;
+}
+
+/**
  * 選んだ操作の引数パネル（`ParamSchema` から組む。表示の条件・「詳細」・指摘・後ろの描画の知らせ）。`size` は欄の既定値
  * （矩形・点・大きさを「指定する」にしたとき・長さを px にしたとき）に使う。
  */
-function ParamsPanel({ size }: { size: ParamSize }) {
+function ParamsPanel({ size, time }: { size: ParamSize; time?: ParamTime }) {
   const selected = useEditorStore((s) => s.selected);
   const node = useEditorStore((s) => (s.selected === null ? undefined : s.doc.nodes[s.selected]));
   const doc = useEditorStore((s) => s.doc);
@@ -188,6 +196,7 @@ function ParamsPanel({ size }: { size: ParamSize }) {
         issues={all}
         size={size}
         count={node.log?.field === spec.key ? node.log.count : null}
+        time={time ? { rate: time.rate(node.id), frames: time.frames(node.id) } : undefined}
       />
     );
     body =
@@ -317,9 +326,18 @@ export function FormatOutputRow() {
 
 /**
  * 右パネルの「操作」：操作の並び・「操作を追加」・選んだ操作の引数・警告・出力の形式（種類ごとの部品 `EditorKindUi.Ops`
- * から使う）。`size` は引数の欄の既定値に使う大きさ、`output` は出力の行の差し替え（省けば `FormatOutputRow`）。
+ * から使う）。`size` は引数の欄の既定値に使う大きさ、`time` は標本の引数を時間の欄にするレートと長さ（音声）、`output` は
+ * 出力の行の差し替え（省けば `FormatOutputRow`）。
  */
-export function OpsPanel({ size = null, output }: { size?: ParamSize; output?: ReactNode }) {
+export function OpsPanel({
+  size = null,
+  time,
+  output,
+}: {
+  size?: ParamSize;
+  time?: ParamTime;
+  output?: ReactNode;
+}) {
   return (
     <div className={styles.ops}>
       <h2 className={styles.panelTitle}>{t.opsTitle}</h2>
@@ -328,7 +346,7 @@ export function OpsPanel({ size = null, output }: { size?: ParamSize; output?: R
         <AddOpButton />
       </div>
       <div className={styles.paramsScroll}>
-        <ParamsPanel size={size} />
+        <ParamsPanel size={size} time={time} />
         <Warnings />
       </div>
       {output ?? <FormatOutputRow />}

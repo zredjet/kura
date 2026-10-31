@@ -122,8 +122,13 @@ export function audioFormatText(audio: AssetAudioFactsDto | undefined): string {
   return parts.length > 0 ? parts.join(' · ') : t.none;
 }
 
-/** ラウドネス「−14.2 LUFS（LRA 6.1 LU）」。計れなければ理由（「短くて計れません」）。 */
-export function loudnessText(audio: AssetAudioFactsDto | undefined): string {
+/**
+ * ラウドネス「−14.2 LUFS（LRA 6.1 LU）」。計れなければ理由（「短くて計れません」）。素材の欄の事実と、エディタの
+ * `edit_measure` の値（同じ名前の欄）の両方から読む。
+ */
+export function loudnessText(
+  audio: Pick<AssetAudioFactsDto, 'loudness' | 'loudnessReason' | 'loudnessRange'> | undefined,
+): string {
   if (!audio) {
     return t.none;
   }
@@ -138,7 +143,7 @@ export function loudnessText(audio: AssetAudioFactsDto | undefined): string {
 }
 
 /** ピーク「−1.0 dBTP」。 */
-export function peakText(audio: AssetAudioFactsDto | undefined): string {
+export function peakText(audio: Pick<AssetAudioFactsDto, 'truePeak'> | undefined): string {
   return audio?.truePeak === null || audio?.truePeak === undefined
     ? t.none
     : t.peakValue(signed(audio.truePeak, 1));

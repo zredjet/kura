@@ -81,6 +81,12 @@
   --checker-size: 16px;        /* 市松模様の 2×2 の一辺（1 マス 8px。画面に固定で、拡大率で変えない） */
   --loop-region: color-mix(in srgb, var(--accent) 22%, transparent);  /* 波形のループの区間 */
 
+  /* ---- 音声エディタ（M13）---- */
+  --wave-selection: color-mix(in srgb, var(--text-primary) 14%, transparent);  /* 波形の選択の地 */
+  --wave-outside: rgba(6, 6, 8, 0.62);                                         /* 切り詰めの外の暗さ */
+  --h-wave-ruler: 20px;     /* 波形の目盛り */
+  --h-wave-overview: 24px;  /* 波形の全体図 */
+
   /* ---- 角丸 ---- */
   --radius-xs: 5px;    /* kbd */
   --radius-sm: 7px;    /* タグ、トークン、小さなサムネ */
