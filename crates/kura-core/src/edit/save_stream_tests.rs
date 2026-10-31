@@ -1358,3 +1358,61 @@ fn editor_save_checks_the_current_codecs() {
     assert_eq!(edit_jobs(&env), jobs, "断ったのに保存を積んだ");
     assert_consistent(&env.lib);
 }
+
+/// S22（エディタの保存の道）：mp3 の元を固定の段の組（ffmpeg なし）で開き、元の形式のまま上書きしようとすると
+/// `editor::save` が `FormatUnavailable{format: "mp3", fallback: Some("ogg")}` を返し、保存のジョブを積まない。format に ogg を
+/// 渡せば積めて保存できる。版に戻すでは確かめない（M13 段 3 の検証の直し #14）。
+#[test]
+fn s22_editor_save_refuses_mp3_without_ffmpeg() {
+    use super::editor::{EditorError, SaveMode};
+    // エディタの取り置きと ogg の保存（Vorbis の作業領域）が同時に入る予算
+    let env = Env::with(
+        FakeEngineFactory::with_codecs(Arc::new(Mutex::new(CodecSet::pinned())))
+            .with_budget(1 << 30),
+        None,
+    );
+    let item = add_mp3(&env);
+    let session = open_editor(&env, item);
+    match editor_save(&env, &session, SaveMode::Overwrite, None) {
+        Err(EditorError::FormatUnavailable { format, fallback }) => {
+            assert_eq!((format.as_str(), fallback.as_deref()), ("mp3", Some("ogg")));
+        }
+        other => panic!("{:?}", other.map(|s| s.job)),
+    }
+    let r = editor_save(
+        &env,
+        &session,
+        SaveMode::SaveAs {
+            title: "別名".into(),
+            stem: "別名".into(),
+        },
+        None,
+    );
+    assert!(
+        matches!(&r, Err(EditorError::FormatUnavailable { .. })),
+        "{:?}",
+        r.err()
+    );
+    assert_eq!(edit_jobs(&env), 0, "断ったのに保存を積んだ");
+    assert_eq!(versions_of(&env.lib, item).len(), 0);
+    // 形式を選び直せば（ogg）積めて保存できる
+    let started = editor_save(
+        &env,
+        &session,
+        SaveMode::Overwrite,
+        Some(FormatChoice::To {
+            format: "ogg".into(),
+            options: json!({}),
+        }),
+    )
+    .unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_done(&env.jobs.get(started.job).unwrap());
+    assert_eq!(head(&env.lib, item).ext, "ogg");
+    // 版に戻す（版 0 の mp3）は確かめない（積んで、ファイルを使い直して戻す）
+    let started = editor_save(&env, &session, SaveMode::Revert { to: 0 }, None).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_done(&env.jobs.get(started.job).unwrap());
+    assert_eq!(head(&env.lib, item).ext, "mp3");
+    assert_consistent(&env.lib);
+}
