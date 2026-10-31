@@ -43,6 +43,7 @@ import {
 } from '../editorStore';
 import { defaultParams } from '../opsCatalog';
 import { drawWave } from './drawWave';
+import { targetNode } from './handles';
 import {
   type CrossfadeRecord,
   EditorPlayer,
@@ -189,7 +190,12 @@ export function overlayOf(s: AudioEditorState): WaveOverlay {
   const view = s.view;
   if (!view) return EMPTY_OVERLAY;
   const total = view.frames;
-  const fadeNode = lastNodeOf(view.nodes, 'audio.fade');
+  // ドラッグ・欄が直すのと同じノード（選んだフェード、なければ最後のフェード）
+  const editor = useEditorStore.getState();
+  const fadeId = targetNode(editor.doc, editor.selected, 'audio.fade');
+  const fadeNode =
+    (fadeId === null ? null : view.nodes.find((n) => n.id === fadeId)) ??
+    lastNodeOf(view.nodes, 'audio.fade');
   const marks = fadeNode?.marks?.type === 'fade' ? fadeNode.marks : null;
   const inEnd = s.local?.fadeIn ?? marks?.inEnd ?? 0;
   const outStart = s.local?.fadeOut ?? marks?.outStart ?? total;
@@ -404,7 +410,17 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     onPlaced: (record) => checkHook?.placed?.(record),
     onCrossfade: (record) => checkHook?.crossfade?.(record),
   });
-  const unsubscribe = useAudioStore.subscribe((s) => controller.setOverlay(overlayOf(s)));
+  const offAudio = useAudioStore.subscribe((s) => controller.setOverlay(overlayOf(s)));
+  // 選んだ操作・文書が変わったら、フェードの印を出し直す
+  const offEditor = useEditorStore.subscribe((now, before) => {
+    if (now.selected !== before.selected || now.doc !== before.doc) {
+      controller.setOverlay(overlayOf(useAudioStore.getState()));
+    }
+  });
+  const unsubscribe = () => {
+    offAudio();
+    offEditor();
+  };
   const rt: AudioRuntime = {
     ctx,
     controller,
@@ -646,6 +662,7 @@ function restartAfterReshape(rt: AudioRuntime, prev: EditAudioView, view: EditAu
 
 /** 終わりまで鳴った（選択だけなら、カーソルは動かさない）。 */
 function playEnded(pos: number): void {
+  live()?.controller.setPlaybackSpans([]);
   const s = useAudioStore.getState();
   const out = toOutputPos(s, s.ab, pos);
   useAudioStore.setState({
@@ -661,6 +678,7 @@ export function stopPlayback(): void {
   const playing = rt.player.playing;
   const source = rt.player.source;
   const pos = rt.player.stop();
+  rt.controller.setPlaybackSpans([]);
   const s = useAudioStore.getState();
   const out = pos === null || source === null ? null : toOutputPos(s, source, pos);
   useAudioStore.setState({
