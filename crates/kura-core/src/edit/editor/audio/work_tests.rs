@@ -5,19 +5,21 @@
 use std::io::Cursor;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use kura_engine::codec::CodecSet;
-use kura_engine::doc::InputId;
+use kura_engine::budget::{Class, MemoryBudget};
+use kura_engine::codec::{CodecEnv, CodecSet, DecodeOut, Decoder, Held, ReadSeek, Tier};
+use kura_engine::doc::{DecodeOptions, InputId};
 use kura_engine::render::cache::Fingerprint;
 use kura_engine::testgen::InputGen;
 use kura_engine::value::LoopRange;
-use kura_engine::{Digest, Graph, Monitor, NoMonitor, Value};
+use kura_engine::{Digest, EngineError, Graph, Limits, Monitor, NoMonitor, Shape, Value};
 use serde_json::json;
 
 use super::session_tests::*;
 use super::source::{WorkCx, make_work, read_shape_staged, work_threshold};
 use crate::edit::editor::{EditorError, OpenRequest, Viewport, close, open};
+use crate::edit::{EngineFactory, RuntimeConfig};
 
 /// 予算 32 MiB：丸ごと読む上限と作業用のファイルの境は 8 MiB（8 kHz モノラルで約 2.1 M フレーム）。
 const SMALL: u64 = 32 << 20;
@@ -93,6 +95,272 @@ fn g_gain(db: f64) -> Graph {
     g.push_linear("audio.gain", 1, json!({ "db": db }), 1)
         .unwrap();
     g
+}
+
+/// 形を読むたびに、その時点の対話の確保（`Usage::interactive`）を記す（予算の外で形を読まないことの確かめ）。
+#[derive(Clone, Default)]
+struct ShapeLog {
+    budget: Arc<Mutex<Option<Arc<MemoryBudget>>>>,
+    seen: Arc<Mutex<Vec<u64>>>,
+}
+
+impl ShapeLog {
+    /// 記す予算（ライブラリのエンジンの部品を作ってから）。
+    fn attach(&self, budget: &Arc<MemoryBudget>) {
+        *self.budget.lock().unwrap() = Some(budget.clone());
+    }
+
+    fn note(&self) {
+        let used = self
+            .budget
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |b| b.usage().unwrap().interactive);
+        self.seen.lock().unwrap().push(used);
+    }
+
+    fn seen(&self) -> Vec<u64> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn clear(&self) {
+        self.seen.lock().unwrap().clear();
+    }
+}
+
+/// 試す段：`inner`（固定の段のデコーダ）の読み方をそのまま使い、識別子・読む形式・形を読む分・流しの断り・形を読んだときの
+/// 記録だけを替える（段 2 の解析のジョブの `RefusingStream` と同じ考え方）。
+struct Stage {
+    inner: Arc<dyn Decoder>,
+    id: &'static str,
+    /// この段が読む形式と、`inner` に渡す形式。
+    format: &'static str,
+    inner_format: &'static str,
+    /// 形を読むのにファイル全体を読む段（MP3・Platform）のように、形を読む分をファイルの長さで申告する。
+    whole_shape: bool,
+    /// 値を読む・流して読むと、この誤りを返す（形は読める）。
+    refuse: Option<fn() -> EngineError>,
+    log: Option<ShapeLog>,
+}
+
+impl Stage {
+    /// `inner` と同じ識別子・形式で、形を読むたびに記す段（`CodecSet::replace_decoder` で差し替える）。
+    fn watching(inner: Arc<dyn Decoder>, format: &'static str, log: &ShapeLog) -> Self {
+        Self {
+            id: inner.id(),
+            inner,
+            format,
+            inner_format: format,
+            whole_shape: true,
+            refuse: None,
+            log: Some(log.clone()),
+        }
+    }
+
+    fn note(&self) {
+        if let Some(log) = &self.log {
+            log.note();
+        }
+    }
+
+    fn refused(&self) -> Result<(), EngineError> {
+        match self.refuse {
+            Some(f) => Err(f()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Decoder for Stage {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn tier(&self) -> Tier {
+        self.inner.tier()
+    }
+    fn reproducible(&self) -> bool {
+        self.inner.reproducible()
+    }
+    fn env(&self) -> Option<CodecEnv> {
+        self.inner.env()
+    }
+    fn can_decode(&self, format: &str) -> bool {
+        format == self.format
+    }
+    fn work_bytes(&self, _format: &str, shape: &Shape) -> u64 {
+        self.inner.work_bytes(self.inner_format, shape)
+    }
+    fn file_work_bytes(&self, _format: &str, shape: &Shape, len: u64) -> u64 {
+        self.inner.file_work_bytes(self.inner_format, shape, len)
+    }
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.note();
+        self.inner.shape(src, self.inner_format, opts, limits)
+    }
+    fn decode(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        self.refused()?;
+        self.inner.decode(src, self.inner_format, opts, limits, mon)
+    }
+    fn shape_file(
+        &self,
+        path: &Path,
+        _format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.note();
+        self.inner.shape_file(path, self.inner_format, opts, limits)
+    }
+    fn shape_monitored(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Shape, EngineError> {
+        self.note();
+        self.inner
+            .shape_monitored(src, self.inner_format, opts, limits, mon)
+    }
+    fn shape_file_monitored(
+        &self,
+        path: &Path,
+        _format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Shape, EngineError> {
+        self.note();
+        self.inner
+            .shape_file_monitored(path, self.inner_format, opts, limits, mon)
+    }
+    fn decode_file(
+        &self,
+        path: &Path,
+        _format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        self.refused()?;
+        self.inner
+            .decode_file(path, self.inner_format, opts, limits, mon)
+    }
+    fn streams(&self, _format: &str) -> bool {
+        self.inner.streams(self.inner_format)
+    }
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, len: u64) -> u64 {
+        self.inner.stream_work_bytes(self.inner_format, shape, len)
+    }
+    fn shape_work_bytes(&self, _format: &str, len: u64) -> u64 {
+        if self.whole_shape {
+            len
+        } else {
+            self.inner.shape_work_bytes(self.inner_format, len)
+        }
+    }
+    fn held_bytes(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        limits: &Limits,
+    ) -> Result<Held, EngineError> {
+        self.inner.held_bytes(src, self.inner_format, limits)
+    }
+    fn held_bytes_file(
+        &self,
+        path: &Path,
+        _format: &str,
+        limits: &Limits,
+    ) -> Result<Held, EngineError> {
+        self.inner.held_bytes_file(path, self.inner_format, limits)
+    }
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        _format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.refused()?;
+        self.inner
+            .decode_stream(src, self.inner_format, opts, limits, shape, out, mon)
+    }
+    fn decode_stream_file(
+        &self,
+        path: &Path,
+        _format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.refused()?;
+        self.inner
+            .decode_stream_file(path, self.inner_format, opts, limits, shape, out, mon)
+    }
+}
+
+/// 予算 `budget` で、`make` が作るコーデックの組を使う偽のファクトリ。
+struct Staged {
+    budget: u64,
+    make: Box<dyn Fn() -> CodecSet + Send + Sync>,
+}
+
+impl EngineFactory for Staged {
+    fn runtime_config(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            cores: Some(2),
+            budget: Some(self.budget),
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn codecs(&self, _work_dir: &Path) -> CodecSet {
+        (self.make)()
+    }
+}
+
+/// 固定の段の組の、`format` の最初の段のデコーダ。
+fn pinned_decoder(format: &str) -> Arc<dyn Decoder> {
+    CodecSet::pinned().decoders_for(format)[0].clone()
+}
+
+/// 固定の段の FLAC を、形を読むたびに記す段（形を読む分はファイルの長さ）に替えたライブラリ（予算 `budget`）。
+fn watched_env(budget: u64, log: &ShapeLog) -> Env {
+    let log = log.clone();
+    Env::with(Arc::new(Staged {
+        budget,
+        make: Box::new(move || {
+            let mut set = CodecSet::pinned();
+            set.replace_decoder(Arc::new(Stage::watching(
+                pinned_decoder("flac"),
+                "flac",
+                &log,
+            )))
+            .unwrap();
+            set
+        }),
+    }))
 }
 
 /// A15：丸ごと読む上限を超える FLAC は作業用のファイルから遅延で開く。値・記録・指紋は丸ごと読んだものと同じで、閉じると
@@ -356,4 +624,92 @@ fn pcm_reads_long_flac_from_the_work_file_shared_with_the_editor() {
     assert!(files(&dir).is_empty(), "{:?}", files(&dir));
     // 試聴の予算も返した
     assert_eq!(env.usage().interactive, 0);
+}
+
+/// 段 4B の検証の直し 2：直接読めない形式（形を読むのにファイル全体・埋め込みの画像を読む段がある）は、遅延で開けるかを
+/// 確かめるために予算の外で形を読まない。エディタを開くときの形の読みはどれも、その段の見積もり（ここではファイルの長さ）を
+/// 対話の枠で確保している間に起き、空いていなければ形を読む前に Busy で断る。
+#[test]
+fn opening_reads_the_shape_only_inside_the_budget() {
+    let log = ShapeLog::default();
+    let env = watched_env(SMALL, &log);
+    let flac = long_flac(40 * C);
+    let len = flac.len() as u64;
+    let id = add_audio(&env.lib, &flac, "flac");
+    let budget = env.engine.runtime().unwrap().budget().clone();
+    log.attach(&budget);
+    // 形を読む分（ファイルの長さ）が空いていない：読む前に断る
+    let held = budget
+        .try_acquire(SMALL - len / 2, Class::Interactive)
+        .unwrap()
+        .unwrap();
+    let err = open(
+        &env.env(),
+        &OpenRequest {
+            item_id: id,
+            viewport: Viewport::audio_idle(),
+            from_draft: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, EditorError::Busy(m) if m.contains("元の形を読む")),
+        "{err}"
+    );
+    assert!(
+        log.seen().is_empty(),
+        "断る前に形を読んだ：{:?}",
+        log.seen()
+    );
+    assert!(env.engine.current_editor().is_none());
+    drop(held);
+    // 空いていれば開ける。形の読みはどれも確保の中
+    let opened = env.open(id);
+    assert!(opened.source.audio.unwrap().lazy);
+    let seen = log.seen();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter().all(|&u| u >= len),
+        "予算の外で形を読んだ：{seen:?}（ファイルは {len} バイト）"
+    );
+}
+
+/// 段 4B の検証の直し 2：試聴の `/pcm` も、直接読めない形式は予算の外で形を読まない（境の判定・丸ごと読みに使う形は段ごとに
+/// 確保して読む）。空いていなければ、形を読む前に 503。短いもの（丸ごと読む）も同じ。
+#[test]
+fn pcm_reads_the_shape_only_inside_the_budget() {
+    let log = ShapeLog::default();
+    let env = watched_env(SMALL, &log);
+    let root = env.lib.layout().root().to_path_buf();
+    let budget = env.engine.runtime().unwrap().budget().clone();
+    log.attach(&budget);
+    for frames in [40 * C, 2 * C] {
+        let flac = long_flac(frames);
+        let len = flac.len() as u64;
+        add_audio(&env.lib, &flac, "flac");
+        let hash = crate::library::hex(blake3::hash(&flac).as_bytes());
+        let src = crate::serve::pcm_source(env.lib.layout(), &hash).unwrap();
+        let serve = || crate::asset::pcm::serve(&env.engine, &root, &hash, &src, 0, 10);
+        env.engine.pcm_cache().clear();
+        log.clear();
+        let held = budget
+            .try_acquire(SMALL - len / 2, Class::Interactive)
+            .unwrap()
+            .unwrap();
+        let err = serve().unwrap_err();
+        assert_eq!(err.status(), 503, "{err}");
+        assert!(
+            log.seen().is_empty(),
+            "断る前に形を読んだ：{:?}",
+            log.seen()
+        );
+        drop(held);
+        serve().unwrap();
+        let seen = log.seen();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|&u| u >= len),
+            "予算の外で形を読んだ（{frames} フレーム）：{seen:?}（ファイルは {len} バイト）"
+        );
+    }
 }

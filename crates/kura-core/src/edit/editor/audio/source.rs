@@ -4,7 +4,9 @@
 //!    アンカーの記録と同じなら、その記録の値のダイジェストを入力の指紋にし、元の読み取りのデコーダは記録のもの（アンカーの
 //!    読み手の名前ではない）にする。違う・開けなければ今の道（記録のデコーダで読み直して照らす。`super::super::source::read`）
 //!    に落とす。値を照らすのは開くときではなく保存のとき（段 3）。
-//! 2. **WAV・AIFF**（`open_audio_source` が Some を返すもの）：遅延の源で開く。DB の事実の行（`media_facts`）のデコーダが開いた
+//! 2. **WAV・AIFF**（`open_audio_source` が Some を返すもの）：遅延の源で開く。見出しを読む前に、この形式の最初の段が固定の段の
+//!    WAV・AIFF のデコーダか確かめ（[`opens_as_source`]）、ほかの形式の形はここでは読まない（予算の外で読まない。段 4B の
+//!    検証の直し）。DB の事実の行（`media_facts`）のデコーダが開いた
 //!    デコーダと同じで、文書の入力の読み方が既定なら、その値のダイジェストで記録（`DecodeStamp`。固定の段・再現する）を作る。
 //!    そうでなければ記録はなく、指紋は派生（`Fingerprint::derive("audio-source", 元の中身, デコーダと読み方)`）。
 //! 3. **それ以外**（FLAC・Ogg・MP3・AAC・Platform・External、A-law の WAV など）：値が [`work_threshold`]（min(64 MiB,
@@ -33,8 +35,8 @@ use kura_engine::audio::source::Opener;
 use kura_engine::budget::{Class, Lease, MemoryBudget, default_reserved};
 use kura_engine::codec::anchor::AnchorContext;
 use kura_engine::codec::stream::stream_window_bytes;
-use kura_engine::codec::wav::F32WavWriter;
-use kura_engine::codec::{CodecSet, DecodeStamp, PickedStage, ReadSeek, Tier, anchor};
+use kura_engine::codec::wav::{self, F32WavWriter};
+use kura_engine::codec::{CodecSet, DecodeStamp, PickedStage, ReadSeek, Tier, aiff, anchor};
 use kura_engine::doc::DecodeOptions;
 use kura_engine::render::cache::{Fingerprint, FingerprintedInput};
 use kura_engine::value::AUDIO_CHUNK;
@@ -254,8 +256,18 @@ fn opened(
     })
 }
 
-/// 遅延の源で開く（モジュールの説明の 1・2）。開けない形式・アンカーの記録が違うときは None（呼び手は丸ごと読む）。中止は
-/// 見ない（見出しだけを読むので軽い）。
+/// この組が形式 `format` を遅延の源で開くか（`CodecSet::open_audio_source` の WAV・AIFF の判定と同じ：この形式の最初の段が
+/// 固定の段の WAV・AIFF のデコーダ）。形を読む前に確かめる（ほかの形式の形の読みは重いことがあるので、予算の中で読む）。
+pub(crate) fn opens_as_source(codecs: &CodecSet, format: &str) -> bool {
+    let first = codecs.decoders_for(format).first().map(|d| d.id());
+    matches!(
+        (format, first),
+        ("wav", Some(wav::DEC_ID)) | ("aiff", Some(aiff::DEC_ID))
+    )
+}
+
+/// 遅延の源で開く（モジュールの説明の 1・2）。開けない形式・アンカーの記録が違うときは None（呼び手は作業用のファイルか
+/// 丸ごと読み）。WAV・AIFF（[`opens_as_source`]）でなければ形も読まない。中止は見ない（見出しだけを読むので軽い）。
 pub(crate) fn open_lazy(cx: &LazyCx<'_>) -> Result<Option<OpenedAudio>, EditorError> {
     let to_err = |e: EngineError| EditorError::from_engine("元を開けません", e);
     if let Some((a, path)) = cx.anchor {
@@ -298,7 +310,11 @@ pub(crate) fn open_lazy(cx: &LazyCx<'_>) -> Result<Option<OpenedAudio>, EditorEr
         )
         .map(Some);
     }
-    // WAV・AIFF：見出しのチャンネル数で LRU を決める
+    // WAV・AIFF：見出しのチャンネル数で LRU を決める。ほかの形式は形を読まずに None（形を読むのにファイル全体・埋め込みの
+    // 画像を読む段や、全体をデコードして数える段があるので、呼び手が段ごとに確保してから読む。段 4B の検証の直し）
+    if !opens_as_source(cx.codecs, cx.format) {
+        return Ok(None);
+    }
     let shape = match cx
         .codecs
         .shape_path(cx.original, cx.format, cx.opts, cx.limits)
@@ -640,5 +656,70 @@ mod tests {
         );
         assert_eq!(lru_bytes(2, 2, long, 64 << 20), 8 << 20);
         assert_eq!(lru_bytes(8, 2, long, 8 << 20), 16 * chunk);
+    }
+
+    /// 遅延の源で開くか（形を読む前の判定）は `open_audio_source` と同じ：WAV・AIFF で、最初の段が固定の段のデコーダのとき
+    /// だけ。ほかの形式・最初の段がほかのデコーダの組は開かない（`open_audio_source` も None）。
+    #[test]
+    fn opens_as_source_follows_the_first_stage() {
+        use kura_engine::testgen::InputGen;
+        use kura_engine::testing::platform::FakePlatformDecoder;
+
+        let pinned = CodecSet::pinned();
+        for (format, want) in [
+            ("wav", true),
+            ("aiff", true),
+            ("flac", false),
+            ("mp3", false),
+            ("ogg", false),
+            ("m4a", false),
+        ] {
+            assert_eq!(opens_as_source(&pinned, format), want, "{format}");
+        }
+        // 固定の段の WAV・AIFF がなく、Platform の段が最初
+        let mut platform = CodecSet::default();
+        platform
+            .add_decoder(Arc::new(FakePlatformDecoder::new(
+                "fake-at-dec/1",
+                &["wav", "aiff"],
+                InputGen::AudioNoise {
+                    rate: 8_000,
+                    channels: 1,
+                    frames: 10,
+                    seed: 1,
+                },
+            )))
+            .unwrap();
+        let wav = InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 1,
+            frames: 10,
+            seed: 1,
+        }
+        .generate()
+        .unwrap();
+        let bytes = pinned
+            .encode_bytes(&wav, "wav", &serde_json::json!({}), &kura_engine::NoMonitor)
+            .unwrap()
+            .0;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        std::fs::write(&path, &bytes).unwrap();
+        for format in ["wav", "aiff"] {
+            assert!(!opens_as_source(&platform, format), "{format}");
+        }
+        let opens = |set: &CodecSet| {
+            set.open_audio_source(
+                &path_opener(&path),
+                "wav",
+                &Default::default(),
+                &Default::default(),
+                1 << 20,
+            )
+            .unwrap()
+            .is_some()
+        };
+        assert!(opens(&pinned));
+        assert!(!opens(&platform));
     }
 }
