@@ -32,11 +32,13 @@ use std::sync::Arc;
 
 use kura_engine::audio::digest::PcmTreeDigest;
 use kura_engine::audio::source::Opener;
+use kura_engine::audio::stream::StreamEnd;
 use kura_engine::budget::{Class, Lease, MemoryBudget, default_reserved};
 use kura_engine::codec::anchor::AnchorContext;
 use kura_engine::codec::stream::stream_window_bytes;
 use kura_engine::codec::wav::{self, F32WavWriter};
 use kura_engine::codec::{CodecSet, DecodeStamp, PickedStage, ReadSeek, Tier, aiff, anchor};
+use kura_engine::codec::{DecodeInfo, DecodeSink};
 use kura_engine::doc::DecodeOptions;
 use kura_engine::render::cache::{Fingerprint, FingerprintedInput};
 use kura_engine::value::AUDIO_CHUNK;
@@ -477,6 +479,94 @@ fn same_kind(e: &EngineError) -> EngineError {
     }
 }
 
+/// 作業用のファイルの書き手（`WorkPcmStore::ensure` が渡す受け手）を包み、書き手が返した Io の誤り（ENOSPC など）を、元を
+/// 読む誤りと分けて覚える（段 4B の検証の直し）。読み手には同じ種類の写し（`EngineError::Io`）を返す。書けた値のバイト数も
+/// 数える（空きの不足の目安）。
+struct WriteGuard<'a> {
+    inner: &'a mut dyn DecodeSink,
+    /// 書き手が返した最初の Io の誤り。
+    failed: Option<std::io::Error>,
+    /// 今の試み（`begin` から）で書けた値のバイト数。
+    written: u64,
+}
+
+impl<'a> WriteGuard<'a> {
+    fn new(inner: &'a mut dyn DecodeSink) -> Self {
+        Self {
+            inner,
+            failed: None,
+            written: 0,
+        }
+    }
+
+    /// 書き手の誤りを覚える（Io だけ。ほかの誤りはそのまま返す）。
+    fn check(&mut self, r: Result<(), EngineError>) -> Result<(), EngineError> {
+        match r {
+            Err(EngineError::Io(e)) => {
+                let copy = match e.raw_os_error() {
+                    Some(code) => std::io::Error::from_raw_os_error(code),
+                    None => std::io::Error::new(e.kind(), e.to_string()),
+                };
+                if self.failed.is_none() {
+                    self.failed = Some(e);
+                }
+                Err(EngineError::Io(copy))
+            }
+            other => other,
+        }
+    }
+
+    /// 書き手の誤り（あれば）と、それまでに書けた値のバイト数。
+    fn into_failure(self) -> Option<(std::io::Error, u64)> {
+        let written = self.written;
+        self.failed.map(|e| (e, written))
+    }
+}
+
+impl DecodeSink for WriteGuard<'_> {
+    fn begin(&mut self, info: &DecodeInfo) -> Result<(), EngineError> {
+        self.written = 0;
+        let r = self.inner.begin(info);
+        self.check(r)
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let r = self.inner.feed(start, planes, mon);
+        if r.is_ok() {
+            let n = planes
+                .iter()
+                .map(|p| p.len() as u64)
+                .fold(0u64, u64::saturating_add);
+            self.written = self.written.saturating_add(n.saturating_mul(4));
+        }
+        self.check(r)
+    }
+
+    fn end(&mut self, end: &StreamEnd) -> Result<(), EngineError> {
+        let r = self.inner.end(end);
+        self.check(r)
+    }
+}
+
+/// 作業用のファイルに書く途中の誤り（書き手の Io）を置き場の誤りに：空きの不足（ENOSPC。`CoreError::is_no_space`）は
+/// `NoSpace`（要る空きは書く値の大きさ `need`、いまの空きは書けた分 `written` を目安にする）、ほかは `Io`。どちらも
+/// `EditorError::Core`（src-tauri の写しは NoSpace → `AppErrorCode::NoSpace`、Io → `AppErrorCode::Io`）。
+fn write_error(e: std::io::Error, need: u64, written: u64) -> EditorError {
+    let core = CoreError::Io(e);
+    if core.is_no_space() {
+        return EditorError::Core(CoreError::NoSpace {
+            needed: need.max(written.saturating_add(1)),
+            available: written,
+        });
+    }
+    EditorError::Core(core)
+}
+
 /// 置き場の誤り（読みの誤りでないもの：空き・書き込み・封）をエディタの誤りに。
 fn work_error(e: CoreError) -> EditorError {
     match e {
@@ -491,6 +581,8 @@ fn work_error(e: CoreError) -> EditorError {
 /// 作業用のファイルを用意する（`WorkPcmStore::ensure`。同じ鍵の封をし終えたものがあれば使い回し、読まない）。形 `shape` を読めた
 /// 段 `stage` の見積もり（[`work_bytes`]）を対話の枠で待たずに確保して、その段で流して読む。その段が読めない
 /// （`Unsupported`）なら次の段で形を読み直して確保し直す（段 2 の解析のジョブと同じ）。中止は `cx.mon`（Canceled）。
+/// 作業用のファイルに書く途中の書き手の Io は、読みの誤りより先に置き場の誤りにする（[`write_error`]。空きの不足は
+/// `Core(NoSpace)`、ほかは `Core(Io)`）。
 pub(crate) fn make_work(
     cx: &WorkCx<'_>,
     shape: Shape,
@@ -510,22 +602,30 @@ pub(crate) fn make_work(
             options: cx.opts.clone(),
         };
         let id = stage.id;
-        // 読みの誤りは、置き場の誤りに写される前の形で覚える（道具がない・中止・次の段へ回す、を見分ける）
+        // 読みの誤りは、置き場の誤りに写される前の形で覚える（道具がない・中止・次の段へ回す、を見分ける）。書き手（作業用の
+        // ファイル）の Io は読みの誤りと分けて覚える
         let mut read_err: Option<(EditorError, bool)> = None;
+        let mut write_err: Option<(std::io::Error, u64)> = None;
         let made = cx.runtime.preview(|_| {
             cx.store.ensure(
                 &key,
                 &shape,
                 acx,
-                |sink| match cx.codecs.decode_stream_with_path(
-                    id, cx.path, cx.format, cx.opts, cx.limits, sink, cx.mon,
-                ) {
-                    Ok(stamp) => Ok(stamp),
-                    Err(e) => {
-                        let next = matches!(e.root(), EngineError::Unsupported(_));
-                        let kind = same_kind(&e);
-                        read_err = Some((EditorError::from_engine("元を読めません", e), next));
-                        Err(kind)
+                |sink| {
+                    let mut guard = WriteGuard::new(sink);
+                    let r = cx.codecs.decode_stream_with_path(
+                        id, cx.path, cx.format, cx.opts, cx.limits, &mut guard, cx.mon,
+                    );
+                    write_err = guard.into_failure();
+                    match r {
+                        Ok(stamp) => Ok(stamp),
+                        Err(e) if write_err.is_some() => Err(same_kind(&e)),
+                        Err(e) => {
+                            let next = matches!(e.root(), EngineError::Unsupported(_));
+                            let kind = same_kind(&e);
+                            read_err = Some((EditorError::from_engine("元を読めません", e), next));
+                            Err(kind)
+                        }
                     }
                 },
                 cx.limits,
@@ -539,6 +639,10 @@ pub(crate) fn make_work(
         };
         if cx.mon.canceled() {
             return Err(EditorError::Canceled);
+        }
+        // 書き手の誤り（置き場そのもの）は読みの誤りより先に
+        if let Some((e, written)) = write_err {
+            return Err(write_error(e, shape.value_bytes(), written));
         }
         let (read, next) = match read_err {
             Some(r) => r,
@@ -656,6 +760,127 @@ mod tests {
         );
         assert_eq!(lru_bytes(2, 2, long, 64 << 20), 8 << 20);
         assert_eq!(lru_bytes(8, 2, long, 8 << 20), 16 * chunk);
+    }
+
+    /// `fail_after` 回の窓のあと、書くと `error` の Io を返す受け手（書き手の誤りの代わり）。
+    struct FailingSink {
+        fail_after: usize,
+        feeds: usize,
+        error: fn() -> std::io::Error,
+        internal: bool,
+    }
+
+    impl DecodeSink for FailingSink {
+        fn begin(&mut self, _info: &DecodeInfo) -> Result<(), EngineError> {
+            self.feeds = 0;
+            Ok(())
+        }
+
+        fn feed(
+            &mut self,
+            _start: u64,
+            _planes: &[&[f32]],
+            _mon: &dyn Monitor,
+        ) -> Result<(), EngineError> {
+            self.feeds += 1;
+            if self.feeds <= self.fail_after {
+                Ok(())
+            } else if self.internal {
+                Err(EngineError::Internal("窓が順でない".into()))
+            } else {
+                Err(EngineError::Io((self.error)()))
+            }
+        }
+
+        fn end(&mut self, _end: &StreamEnd) -> Result<(), EngineError> {
+            Err(EngineError::Io((self.error)()))
+        }
+    }
+
+    /// 段 4B の検証の直し 4：書き手が返した Io は覚えて（読み手には同じ種類の写しを返す）、空きの不足（ENOSPC）は
+    /// `Core(NoSpace)`（いまの空きは書けた分）、ほかの Io は `Core(Io)` に写す。書き手の Io でない誤りは覚えない。
+    #[test]
+    fn write_errors_are_kept_apart_from_read_errors() {
+        let info = DecodeInfo {
+            rate: 8_000,
+            channels: 2,
+            frames: Dim::Exact(100),
+            expect: 100,
+        };
+        let planes: [&[f32]; 2] = [&[0.0; 10], &[0.0; 10]];
+        let enospc = || std::io::Error::from_raw_os_error(28);
+        let mut sink = FailingSink {
+            fail_after: 2,
+            feeds: 0,
+            error: enospc,
+            internal: false,
+        };
+        let mut guard = WriteGuard::new(&mut sink);
+        guard.begin(&info).unwrap();
+        guard.feed(0, &planes, &kura_engine::NoMonitor).unwrap();
+        guard.feed(10, &planes, &kura_engine::NoMonitor).unwrap();
+        let err = guard
+            .feed(20, &planes, &kura_engine::NoMonitor)
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Io(e) if e.raw_os_error() == Some(28)),
+            "読み手にも Io の写しを返す：{err}"
+        );
+        let (e, written) = guard.into_failure().unwrap();
+        assert_eq!(e.raw_os_error(), Some(28));
+        assert_eq!(written, 2 * 2 * 10 * 4, "書けた 2 窓の分");
+        let mapped = write_error(e, 1 << 20, written);
+        assert!(
+            matches!(
+                &mapped,
+                EditorError::Core(CoreError::NoSpace { needed, available })
+                    if *needed == 1 << 20 && *available == written
+            ),
+            "{mapped}"
+        );
+        assert!(
+            mapped
+                .to_string()
+                .starts_with("ディスクの空き容量が足りません")
+        );
+        // ほかの Io（EFBIG）は Io のまま。end の誤りも覚える
+        let mut sink = FailingSink {
+            fail_after: usize::MAX,
+            feeds: 0,
+            error: || std::io::Error::from_raw_os_error(27),
+            internal: false,
+        };
+        let mut guard = WriteGuard::new(&mut sink);
+        guard.begin(&info).unwrap();
+        guard.feed(0, &planes, &kura_engine::NoMonitor).unwrap();
+        assert!(
+            guard
+                .end(&StreamEnd {
+                    frames: 10,
+                    meta: Default::default(),
+                })
+                .is_err()
+        );
+        let (e, written) = guard.into_failure().unwrap();
+        let mapped = write_error(e, 1 << 20, written);
+        assert!(
+            matches!(&mapped, EditorError::Core(CoreError::Io(io)) if io.raw_os_error() == Some(27)),
+            "{mapped}"
+        );
+        // 書き手の Io でない誤りは覚えない（読みの誤りとして扱う）
+        let mut sink = FailingSink {
+            fail_after: 0,
+            feeds: 0,
+            error: enospc,
+            internal: true,
+        };
+        let mut guard = WriteGuard::new(&mut sink);
+        guard.begin(&info).unwrap();
+        assert!(matches!(
+            guard.feed(0, &planes, &kura_engine::NoMonitor),
+            Err(EngineError::Internal(_))
+        ));
+        assert!(guard.into_failure().is_none());
     }
 
     /// 遅延の源で開くか（形を読む前の判定）は `open_audio_source` と同じ：WAV・AIFF で、最初の段が固定の段のデコーダのとき

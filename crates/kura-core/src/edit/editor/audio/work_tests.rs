@@ -18,6 +18,7 @@ use serde_json::json;
 
 use super::session_tests::*;
 use super::source::{WorkCx, make_work, read_shape_staged, work_threshold};
+use crate::CoreError;
 use crate::edit::editor::{EditorError, OpenRequest, Viewport, close, open};
 use crate::edit::{EngineFactory, RuntimeConfig};
 
@@ -169,6 +170,12 @@ impl Stage {
             refuse: None,
             log: None,
         }
+    }
+
+    /// 形は読めるが、値を読む・流して読むと `refuse` の誤りを返すようにする。
+    fn refusing(mut self, refuse: fn() -> EngineError) -> Self {
+        self.refuse = Some(refuse);
+        self
     }
 
     fn note(&self) {
@@ -374,6 +381,33 @@ fn watched_env(budget: u64, log: &ShapeLog) -> Env {
             set
         }),
     }))
+}
+
+/// FLAC を `stages`（段の順）だけで読むライブラリ（予算 `budget`）。
+fn flac_env(budget: u64, stages: fn() -> Vec<Arc<dyn Decoder>>) -> Env {
+    Env::with(Arc::new(Staged {
+        budget,
+        make: Box::new(move || {
+            let mut set = CodecSet::default();
+            for d in stages() {
+                set.add_decoder(d).unwrap();
+            }
+            set
+        }),
+    }))
+}
+
+/// 開くのを断った誤り。
+fn open_err(env: &Env, item_id: i64) -> EditorError {
+    open(
+        &env.env(),
+        &OpenRequest {
+            item_id,
+            viewport: Viewport::audio_idle(),
+            from_draft: false,
+        },
+    )
+    .unwrap_err()
 }
 
 /// WAV を、固定の段の WAV と同じに読むが識別子の違う段（`plain-wav-dec/1`）だけで読むライブラリ（予算 `budget`）。遅延の源で
@@ -859,4 +893,47 @@ fn pcm_without_disk_space_falls_back_to_the_whole_read() {
         frames * 4,
         "覚えている値の分だけを持ち続ける"
     );
+}
+
+/// 段 4B の検証の直し 4：置き場そのものの誤り（作る前の空きの確かめ）は `Core(NoSpace)` で、作業用のファイル・取り置きを
+/// 残さず、エディタも残らない。元を読む側の Io（デコーダが返したもの）は、書き手の誤りと違って「元を読めません」（Failed）の
+/// まま（書き手の Io の写しは `source::tests::write_errors_are_kept_apart_from_read_errors`）。
+#[test]
+fn work_file_errors_keep_their_kind() {
+    let flac = long_flac(40 * C);
+    let env = Env::with(Arc::new(Budgeted(SMALL)));
+    set_free(&env, 1 << 20);
+    let id = add_audio(&env.lib, &flac, "flac");
+    let dir = env.engine.work_pcm().dir().to_path_buf();
+    let err = open_err(&env, id);
+    assert!(
+        matches!(&err, EditorError::Core(CoreError::NoSpace { .. })),
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("ディスクの空き容量が足りません")
+    );
+    assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+    let u = env.usage();
+    assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
+    assert!(env.engine.current_editor().is_none());
+
+    let env = flac_env(SMALL, || {
+        vec![Arc::new(
+            Stage::renamed(pinned_decoder("flac"), "eio-flac-dec/1", "flac")
+                .refusing(|| EngineError::Io(std::io::Error::from_raw_os_error(5))),
+        )]
+    });
+    let id = add_audio(&env.lib, &flac, "flac");
+    let dir = env.engine.work_pcm().dir().to_path_buf();
+    let err = open_err(&env, id);
+    assert!(
+        matches!(&err, EditorError::Failed(m) if m.starts_with("元を読めません")),
+        "{err}"
+    );
+    assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+    let u = env.usage();
+    assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
+    assert!(env.engine.current_editor().is_none());
 }
