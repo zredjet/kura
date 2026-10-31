@@ -517,6 +517,29 @@ describe('編集中の試聴と排他', () => {
     expect(useAudioStore.getState().cursor).toBeLessThanOrEqual(48_000);
   });
 
+  it('PCM を取れなかったチャンクは時間をおいて取り直し、続けて 3 回取れなければ止めて知らせる', async () => {
+    await open();
+    togglePlay();
+    await deliver(0);
+    const url = editPcmUrl(S, 1, CHUNK, TOTAL);
+    for (const wait of [1000, 2000]) {
+      io.reject(url, new Error('HTTP 503'));
+      await flush(wait - 100);
+      expect(io.pending()).not.toContain(url);
+      await flush(100);
+      expect(io.pending()).toContain(url);
+      expect(audioPlayer()?.playing).toBe(true);
+    }
+    io.reject(url, new Error('HTTP 503'));
+    await flush();
+    expect(audioPlayer()?.playing).toBe(false);
+    expect(useAudioStore.getState().play.status).toBe('idle');
+    expect(useNoticeStore.getState().message).toBe(
+      ja.editor.audio.playFailed(ja.editor.audio.pcmUnavailable),
+    );
+    expect(audioController()?.viewport().spans).toEqual([]);
+  });
+
   it('選択があれば選択の始めから終わりまで鳴らす', async () => {
     await open();
     setSelection({ start: 1000, end: 2000 });

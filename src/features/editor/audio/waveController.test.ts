@@ -2,12 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import type { EditAudioViewport } from '../../../ipc/edit';
 import { editPcmUrl, editPeaksUrl } from '../../../ipc/media';
-import { CHUNK } from './pcmChunks';
+import { CHUNK, FAIL_RETRY_MS } from './pcmChunks';
 import { audioView, fakeClock, fakeFetch, pcmBytes, settle, tileBytes } from './testAudioView';
 import {
   EDIT_DECODER_PREFIX,
   WAVE_IDLE_MS,
   WaveController,
+  WaveHttpError,
   type WaveScene,
 } from './waveController';
 
@@ -23,6 +24,7 @@ function setup(width = 1000) {
     draw: (_canvas, scene) => scenes.push(scene),
     fetch: io.fetch,
     scheduler: clock.scheduler,
+    now: clock.now,
     onIdle: (vp, force) => idle.push([vp, force]),
   });
   c.attach(document.createElement('canvas'));
@@ -160,6 +162,36 @@ describe('PCM で描く拡大', () => {
     const scene = c.scene();
     expect(scene.mode).toBe('pcm');
     expect(scene.lanes[1]).toBeCloseTo(0.5, 6);
+  });
+});
+
+describe('取れなかった PCM', () => {
+  it('503 などで取れなかったチャンクは、同じ rev のまま時間をおいて取り直す', async () => {
+    const { c, io, clock } = setup();
+    const valid = [{ start: 0, end: CHUNK * 4 }];
+    c.applyView(audioView({ peaks: { rev: 3 }, valid }));
+    c.setWindow({ start: 0, span: 200_000 }, true);
+    const url = editPcmUrl(S, 1, 0, CHUNK);
+    const count = () => io.calls.filter((u) => u === url).length;
+    expect(count()).toBe(1);
+    io.reject(url, new WaveHttpError(503));
+    await settle();
+    // 同じ rev の結果が届いても、離れて戻っても、期限の前は取らない
+    const same = audioView({
+      peaks: { rev: 3, changed: { type: 'spans', spans: [] } },
+      changed: { type: 'spans', spans: [] },
+      valid,
+    });
+    c.applyView(same);
+    c.setWindow({ start: CHUNK * 20, span: 200_000 }, true);
+    c.setWindow({ start: 0, span: 200_000 }, true);
+    expect(count()).toBe(1);
+    // 期限が来たら（何もしなくても）取り直す
+    clock.advance(FAIL_RETRY_MS);
+    expect(count()).toBe(2);
+    io.resolve(url, pcmBytes(0, TOTAL, 2, EDIT_DECODER_PREFIX + same.samplesId));
+    await settle();
+    expect(c.pcm.has(0)).toBe(true);
   });
 });
 

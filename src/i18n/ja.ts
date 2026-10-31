@@ -1162,6 +1162,7 @@ export const ja = {
       rateUnsupported: (n: string) => `このサンプルレート（${n} Hz）は再生できません`,
       abUnavailable: '元との対応が分からないので聞き比べられません',
       playFailed: (reason: string) => `再生できませんでした：${reason}`,
+      pcmUnavailable: '音の標本を取れませんでした',
       noLoop: 'ループ点がありません',
       // 切り詰め
       trimHint: '端をドラッグして範囲を決め、↵ で切り詰めます',

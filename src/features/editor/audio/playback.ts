@@ -21,7 +21,15 @@ import type { EditSpanDto, EditSpansChangeDto } from '../../../ipc/edit';
 import { editInputPcmUrl, editPcmUrl } from '../../../ipc/media';
 import { MAX_RATE, MIN_RATE, readPcmWav } from '../../../lib/asset/wav';
 import type { ContextLike, ContextPool, GainLike, SourceLike } from '../../../lib/assetAudio';
-import { CHUNK, chunkOf, chunkSpan, covered, type PcmChunk, PcmChunkCache } from './pcmChunks';
+import {
+  CHUNK,
+  chunkOf,
+  chunkSpan,
+  covered,
+  FailureMarks,
+  type PcmChunk,
+  PcmChunkCache,
+} from './pcmChunks';
 import { touches } from './peakTiles';
 import type { FrameSpan } from './waveMath';
 
@@ -47,6 +55,8 @@ export const SHORT_LOOP_FRAMES = CHUNK / 8;
 export const LOOP_BLOCK_FRAMES = CHUNK;
 /** 1 回の足し（`fill`）で置く区間の数の上限（ノードを一度に作りすぎない。足りない分は次の tick で）。 */
 export const MAX_PLACE_PER_FILL = 32;
+/** 待っているチャンクがこの回数続けて取れなければ、止めて知らせる。 */
+export const MAX_CHUNK_FAILURES = 3;
 
 /** 鳴らす音：編集後（出力）か元（文書の入力）。 */
 export type PlaySource = 'edited' | 'source';
@@ -168,14 +178,16 @@ export interface FeedView {
 
 /**
  * 試聴の PCM のチャンクを取る（出力は表示の `valid` に覆われるものだけ。元はいつでも）。出力の表は波形の拡大と分け合い
- * （捨てるのは波形の面）、元の表はここで持つ（元は変わらない）。届いたら `onLoaded`。
+ * （捨てるのは波形の面）、元の表はここで持つ（元は変わらない）。届いたら `onLoaded`。取れなかったチャンクは印を付け、
+ * 期限（1 秒から倍々で 8 秒まで。`FailureMarks`）が過ぎたら取り直す（503 の Busy のような一時的な失敗があるため）。
+ * 取れなかったら `onFailed` に続けて失敗した回数を渡す。
  */
 export class PcmFeed {
   private session: string | null = null;
   private view: FeedView | null = null;
   private input: SourceInfo | null = null;
   private readonly loading = new Set<string>();
-  private readonly failed = new Set<string>();
+  private readonly failures: FailureMarks;
   private epoch = 0;
   private disposed = false;
   readonly inputCache: PcmChunkCache;
@@ -186,9 +198,14 @@ export class PcmFeed {
       output: PcmChunkCache;
       input?: PcmChunkCache;
       onLoaded?(): void;
+      /** 取れなかった（`count` は続けて失敗した回数）。 */
+      onFailed?(source: PlaySource, index: number, count: number): void;
+      /** 時計（ms。取り直すまでの期限）。 */
+      now?(): number;
     },
   ) {
     this.inputCache = deps.input ?? new PcmChunkCache();
+    this.failures = new FailureMarks(deps.now);
   }
 
   setSession(session: string | null): void {
@@ -206,7 +223,7 @@ export class PcmFeed {
     if (changed && (changed.type === 'all' || changed.spans.length > 0)) {
       this.epoch++;
       for (const k of [...this.loading]) if (k.startsWith('e')) this.loading.delete(k);
-      for (const k of [...this.failed]) if (k.startsWith('e')) this.failed.delete(k);
+      this.failures.clear('e');
     }
   }
 
@@ -215,13 +232,19 @@ export class PcmFeed {
     return source === 'edited' ? this.deps.output.peek(index) : this.inputCache.peek(index);
   }
 
-  /** チャンクを取りに行く（手元にある・読んでいる・取れない区間は何もしない）。 */
+  /** チャンクを取りに行く（手元にある・読んでいる・取れない区間・取り直す期限の前は何もしない）。 */
   want(source: PlaySource, index: number): void {
     if (this.disposed || !this.session || this.peek(source, index)) return;
     const key = `${source === 'edited' ? 'e' : 'i'}${index}`;
     if (this.loading.has(key)) return;
     if (source === 'edited') this.loadOutput(index, key);
     else this.loadInput(index, key);
+  }
+
+  /** 取れなかった印を付けて知らせる。 */
+  private failed(failKey: string, source: PlaySource, index: number): void {
+    const count = this.failures.fail(failKey);
+    this.deps.onFailed?.(source, index, count);
   }
 
   private loadOutput(index: number, key: string): void {
@@ -231,7 +254,7 @@ export class PcmFeed {
     const span = chunkSpan(index, view.frames);
     if (!span || !covered(view.valid, span[0], span[1])) return;
     const failKey = `${key}@${view.rev}`;
-    if (this.failed.has(failKey)) return;
+    if (this.failures.blocked(failKey)) return;
     const [a, b] = span;
     const epoch = this.epoch;
     const decoder = DECODER_PREFIX + view.samplesId;
@@ -242,14 +265,15 @@ export class PcmFeed {
         if (this.disposed || epoch !== this.epoch || !this.loading.has(key)) return;
         const pcm = readPcmWav(buf);
         if (!pcm || pcm.info.start !== a || pcm.frames !== b - a || pcm.info.decoder !== decoder) {
-          this.failed.add(failKey);
+          this.failed(failKey, 'edited', index);
           return;
         }
+        this.failures.ok(failKey);
         this.deps.output.put(index, { rev: view.rev, start: a, frames: b - a, planes: pcm.planes });
         this.deps.onLoaded?.();
       })
       .catch(() => {
-        if (epoch === this.epoch) this.failed.add(failKey);
+        if (!this.disposed && epoch === this.epoch) this.failed(failKey, 'edited', index);
       })
       .finally(() => {
         if (epoch === this.epoch) this.loading.delete(key);
@@ -261,7 +285,7 @@ export class PcmFeed {
     const session = this.session;
     if (!info || !session) return;
     const span = chunkSpan(index, info.frames);
-    if (!span || this.failed.has(key)) return;
+    if (!span || this.failures.blocked(key)) return;
     const [a, b] = span;
     this.loading.add(key);
     this.deps
@@ -270,13 +294,16 @@ export class PcmFeed {
         if (this.disposed) return;
         const pcm = readPcmWav(buf);
         if (!pcm || pcm.info.start !== a || pcm.frames !== b - a || pcm.rate !== info.rate) {
-          this.failed.add(key);
+          this.failed(key, 'source', index);
           return;
         }
+        this.failures.ok(key);
         this.inputCache.put(index, { rev: 0, start: a, frames: b - a, planes: pcm.planes });
         this.deps.onLoaded?.();
       })
-      .catch(() => this.failed.add(key))
+      .catch(() => {
+        if (!this.disposed) this.failed(key, 'source', index);
+      })
       .finally(() => this.loading.delete(key));
   }
 
@@ -320,8 +347,13 @@ export interface PlayerDeps {
   onPlaced?(record: PlacedRecord): void;
   /** 交差フェードで替えた（自己点検が、替える前後の標本の跳びを照らす）。 */
   onCrossfade?(record: CrossfadeRecord): void;
-  /** 待っていた聞き比べの替えをやめた（替える時刻の位置を写せなくなった。今の音を鳴らし続ける）。 */
-  onSwitchFailed?(): void;
+  /**
+   * 待っていた聞き比べの替えをやめた（今の音を鳴らし続ける）。`unmappable` は替える時刻の位置を写せなくなった、
+   * `unavailable` は替える先のチャンクを取れなかった。
+   */
+  onSwitchFailed?(reason: 'unmappable' | 'unavailable'): void;
+  /** 待っているチャンクを取れないので止めた。 */
+  onFailed?(): void;
 }
 
 /** 置いた区間の記録（自己点検）。 */
@@ -460,6 +492,9 @@ export class EditorPlayer {
   private refreshWanted = false;
   /** 替える先のチャンクを待っている聞き比べ。 */
   private pendingSwitch: SwitchRequest | null = null;
+  /** 置くのに待っているチャンク・聞き比べで替える先の待っているチャンク（取れなければ止める・替えをやめる）。 */
+  private waiting: { source: PlaySource; index: number } | null = null;
+  private switchWaiting: { source: PlaySource; index: number } | null = null;
   private lastSwitch = Number.NEGATIVE_INFINITY;
   private readonly timer: PlayerTimer;
   private readonly now: () => number;
@@ -547,6 +582,8 @@ export class EditorPlayer {
     this.ctx = null;
     this.refreshWanted = false;
     this.pendingSwitch = null;
+    this.waiting = null;
+    this.switchWaiting = null;
     const releases = this.releases;
     this.releases = [];
     for (const r of releases) r();
@@ -623,6 +660,7 @@ export class EditorPlayer {
     if (req.source === plan.source) {
       // 待っている替えを取り消す（同じ音のまま）
       this.pendingSwitch = null;
+      this.switchWaiting = null;
       return 'playing';
     }
     if (plan.info.rate !== req.info.rate) {
@@ -654,17 +692,20 @@ export class EditorPlayer {
     const to = at === null ? null : req.map(at);
     if (to === null || to >= req.info.frames) {
       this.pendingSwitch = null;
-      this.deps.onSwitchFailed?.();
+      this.switchWaiting = null;
+      this.deps.onSwitchFailed?.('unmappable');
       return false;
     }
     const loop = validLoop(req.loop, req.info.frames);
     const chunk = this.deps.peek(req.source, chunkOf(to));
     if (!chunk || chunk.planes.length !== req.info.channels) {
+      this.switchWaiting = { source: req.source, index: chunkOf(to) };
       this.deps.need?.(req.source, neededSpans(to, req.info.frames, loop));
       this.deps.want(req.source, chunkOf(to));
       return false;
     }
     this.pendingSwitch = null;
+    this.switchWaiting = null;
     this.refreshWanted = false;
     this.crossfade({
       source: req.source,
@@ -674,6 +715,25 @@ export class EditorPlayer {
       nextPos: to,
     });
     return true;
+  }
+
+  /**
+   * チャンクを取れなかった（`count` は続けて失敗した回数）。置くのに待っているチャンクが `MAX_CHUNK_FAILURES` 回続けて
+   * 取れなければ止めて知らせる。聞き比べで替える先なら、替えをやめて今の音を鳴らし続ける。
+   */
+  chunkFailed(source: PlaySource, index: number, count: number): void {
+    if (!this.plan || count < MAX_CHUNK_FAILURES) return;
+    const same = (w: { source: PlaySource; index: number } | null) =>
+      w !== null && w.source === source && w.index === index;
+    if (this.pendingSwitch && same(this.switchWaiting)) {
+      this.pendingSwitch = null;
+      this.switchWaiting = null;
+      this.deps.onSwitchFailed?.('unavailable');
+      return;
+    }
+    if (!same(this.waiting)) return;
+    this.stop();
+    this.deps.onFailed?.();
   }
 
   /** 先読みを足す（100 ms ごと・取ったチャンクが届いたとき）。 */
@@ -763,6 +823,7 @@ export class EditorPlayer {
       const end = short && loop ? loop.end : seg.end;
       const len = planes[0]?.length ?? 0;
       if (len <= 0) return;
+      this.waiting = null;
       this.place(seg.start, end, planes, plan.nextAbs, plan.fadeInNext);
       plan.fadeInNext = false;
       plan.nextAbs += len;
@@ -776,6 +837,7 @@ export class EditorPlayer {
     if (!plan) return null;
     const chunk = this.deps.peek(plan.source, chunkOf(seg.start));
     if (!chunk || chunk.planes.length !== plan.info.channels) {
+      this.waiting = { source: plan.source, index: chunkOf(seg.start) };
       this.deps.want(plan.source, chunkOf(seg.start));
       return null;
     }
@@ -797,6 +859,7 @@ export class EditorPlayer {
     for (let i = chunkOf(loop.start); i * CHUNK < loop.end; i++) {
       const chunk = this.deps.peek(plan.source, i);
       if (!chunk || chunk.planes.length !== plan.info.channels) {
+        if (ready) this.waiting = { source: plan.source, index: i };
         this.deps.want(plan.source, i);
         ready = false;
         continue;

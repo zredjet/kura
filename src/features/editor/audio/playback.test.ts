@@ -8,6 +8,7 @@ import {
   EditorPlayer,
   LEAD_SECONDS,
   loopCut,
+  MAX_CHUNK_FAILURES,
   MAX_PLACE_PER_FILL,
   neededSpans,
   PcmFeed,
@@ -16,7 +17,7 @@ import {
   SWITCH_AHEAD_SECONDS,
   SWITCH_MIN_MS,
 } from './playback';
-import { CHUNK, type PcmChunk, PcmChunkCache } from './pcmChunks';
+import { CHUNK, FAIL_RETRY_MS, type PcmChunk, PcmChunkCache } from './pcmChunks';
 import { fakeFetch, pcmBytes, settle } from './testAudioView';
 
 const R = 48_000;
@@ -540,5 +541,113 @@ describe('試聴の PCM を取る', () => {
     );
     await settle();
     expect(feed.peek('edited', 2)).toBeUndefined();
+  });
+
+  it('取れなかったチャンクは期限（1 秒から倍々）が過ぎたら取り直す（出力も元も）。失敗の回数を知らせる', async () => {
+    const io = fakeFetch();
+    let now = 0;
+    const failed: [PlaySource, number, number][] = [];
+    const feed = new PcmFeed({
+      fetch: io.fetch,
+      output: new PcmChunkCache(),
+      now: () => now,
+      onFailed: (source, index, count) => void failed.push([source, index, count]),
+    });
+    const total = CHUNK * 4;
+    feed.setSession('ab');
+    feed.setInput({ rate: R, channels: 2, frames: total });
+    const view = {
+      rev: 5,
+      samplesId: '0011',
+      valid: [{ start: 0, end: total }],
+      frames: total,
+      channels: 2,
+      rate: R,
+    };
+    feed.setView(view, null);
+    const out = editPcmUrl('ab', 5, CHUNK, CHUNK * 2);
+    const input = editInputPcmUrl('ab', CHUNK, CHUNK * 2);
+    const count = (url: string) => io.calls.filter((u) => u === url).length;
+    for (const [source, url] of [
+      ['edited', out],
+      ['source', input],
+    ] as const) {
+      feed.want(source, 1);
+      io.reject(url, new Error('HTTP 503'));
+      await settle();
+      // 同じ表示のまま頼み直しても、期限の前は取らない
+      feed.setView(view, { type: 'spans', spans: [] });
+      feed.want(source, 1);
+      expect(count(url)).toBe(1);
+      now += FAIL_RETRY_MS;
+      feed.want(source, 1);
+      expect(count(url)).toBe(2);
+      io.reject(url, new Error('HTTP 503'));
+      await settle();
+      // 2 回目のあとは 2 秒
+      now += FAIL_RETRY_MS;
+      feed.want(source, 1);
+      expect(count(url)).toBe(2);
+      now += FAIL_RETRY_MS;
+      feed.want(source, 1);
+      expect(count(url)).toBe(3);
+      io.resolve(
+        url,
+        pcmBytes(1, total, 2, source === 'edited' ? 'kura-edit/1:0011' : 'wav-kura-dec/1'),
+      );
+      await settle();
+      expect(feed.peek(source, 1)?.start).toBe(CHUNK);
+    }
+    expect(failed).toEqual([
+      ['edited', 1, 1],
+      ['edited', 1, 2],
+      ['source', 1, 1],
+      ['source', 1, 2],
+    ]);
+  });
+});
+
+describe('PCM を取れないとき', () => {
+  it('待っているチャンクが 3 回続けて取れなければ止めて知らせる（ほかのチャンク・2 回までは止めない）', () => {
+    const failedPlays: number[] = [];
+    const t = setup({ missing: [1] });
+    const player = new EditorPlayer({
+      pool: t.pool,
+      peek: (source, i) => t.chunks[source].get(i),
+      want: () => undefined,
+      volume: () => 1,
+      timer: { every: () => 1, clear: () => undefined },
+      onFailed: () => void failedPlays.push(1),
+    });
+    player.play({ from: 0, source: 'edited', info: t.info });
+    player.chunkFailed('edited', 2, MAX_CHUNK_FAILURES);
+    player.chunkFailed('edited', 1, MAX_CHUNK_FAILURES - 1);
+    expect(player.playing).toBe(true);
+    player.chunkFailed('edited', 1, MAX_CHUNK_FAILURES);
+    expect(player.playing).toBe(false);
+    expect(failedPlays).toEqual([1]);
+  });
+
+  it('聞き比べで替える先のチャンクが取れなければ、替えをやめて今の音を鳴らし続ける', () => {
+    const reasons: string[] = [];
+    const t = setup();
+    const player = new EditorPlayer({
+      pool: t.pool,
+      peek: (source, i) => t.chunks[source].get(i),
+      want: () => undefined,
+      volume: () => 1,
+      timer: { every: () => 1, clear: () => undefined },
+      onSwitchFailed: (reason) => void reasons.push(reason),
+    });
+    player.play({ from: 0, source: 'edited', info: t.info });
+    expect(player.switchTo({ source: 'source', info: t.info, map: (p) => p })).toBe('playing');
+    player.chunkFailed('source', 0, MAX_CHUNK_FAILURES);
+    expect(player.playing).toBe(true);
+    expect(player.source).toBe('edited');
+    expect(reasons).toEqual(['unavailable']);
+    // 替えをやめたので、元が届いても替えない
+    t.chunks.source.set(0, makeChunk(0, t.info.frames));
+    player.tick();
+    expect(player.source).toBe('edited');
   });
 });

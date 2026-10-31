@@ -394,6 +394,9 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     onLoaded: () => {
       if (ctx.current()) rt.player.tick();
     },
+    onFailed: (source, index, count) => {
+      if (ctx.current()) rt.player.chunkFailed(source, index, count);
+    },
   });
   const player = new EditorPlayer({
     pool: audioRuntime().pool,
@@ -409,11 +412,14 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     },
     onPlaced: (record) => checkHook?.placed?.(record),
     onCrossfade: (record) => checkHook?.crossfade?.(record),
-    onSwitchFailed: () => {
+    onSwitchFailed: (reason) => {
       // 待っていた聞き比べの替えをやめた：表示を鳴っている音に戻す
       if (!ctx.current()) return;
       useAudioStore.setState({ ab: rt.player.source ?? useAudioStore.getState().ab });
-      notify(t.abUnavailable);
+      notify(reason === 'unmappable' ? t.abUnavailable : t.playFailed(t.pcmUnavailable));
+    },
+    onFailed: () => {
+      if (ctx.current()) playFailed();
     },
   });
   const offAudio = useAudioStore.subscribe((s) => controller.setOverlay(overlayOf(s)));
@@ -731,6 +737,13 @@ function playEnded(pos: number, source: PlaySource): void {
     play: IDLE_PLAY,
     ...(s.play.mode === 'cursor' && out !== null ? { cursor: out } : {}),
   });
+}
+
+/** 待っているチャンクを取れないので止まった（知らせて、先読みの区間を外す）。 */
+function playFailed(): void {
+  live()?.controller.setPlaybackSpans([]);
+  useAudioStore.setState({ play: IDLE_PLAY });
+  notify(t.playFailed(t.pcmUnavailable));
 }
 
 /** 止める（止めた所を新しいカーソルにする）。 */

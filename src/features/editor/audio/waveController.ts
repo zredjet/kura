@@ -8,6 +8,7 @@
  *   256 未満は PCM で描く：見えている区間をチャンクにそろえてビューポートの `spans` に入れて頼み、結果の `valid` に
  *   入ったチャンクを `/edit/{s}/{rev}/pcm/{a}-{b}` で取る（`kura` チャンクの頭・長さ・デコーダ `kura-edit/1:{samplesId}`
  *   を確かめる）。届くまでは最も細かい段で描く。
+ * - 取れなかった PCM のチャンクは印を付け、期限（1 秒から倍々で 8 秒まで）が来たら取り直す（503 の Busy もある）。
  * - 表示の結果を受けたら：`changed` に掛かる PCM のチャンクを捨て、`peaks.changed` に掛かるタイルを捨てる。
  *   `peaks.pending` か `work` が真なら、手が止まって 150 ms たったら `work: true` で頼み直す（同じビューポートでも送る）。
  * - ズーム・パンで描き直すのは `requestAnimationFrame` の 1 回だけ（汚れたときだけ）。止まって 150 ms で今の区間を頼み直す。
@@ -30,6 +31,8 @@ import {
   chunkOf,
   chunkSpan,
   covered,
+  FAIL_RETRY_MS,
+  FailureMarks,
   fillPcmColumns,
   type PcmChunk,
   PcmChunkCache,
@@ -226,6 +229,8 @@ export interface WaveOptions {
   tiles?: PeakTileCache;
   colors?: WaveColors;
   metrics?: WaveMetrics;
+  /** 時計（ms。取れなかった PCM を取り直すまでの期限）。 */
+  now?(): number;
   onInfo?(info: WaveInfo): void;
   /** 表示の範囲を頼む（`force` は同じビューポートでも送る：裏の仕事）。 */
   onIdle?(viewport: EditAudioViewport, force: boolean): void;
@@ -283,7 +288,11 @@ export class WaveController {
   private readonly loadingTiles = new Map<string, Loading>();
   private readonly failedTiles = new Set<string>();
   private readonly loadingPcm = new Map<number, Loading>();
-  private readonly failedPcm = new Set<string>();
+  /** 取れなかった PCM のチャンク（`{番号}@{rev}`。期限が来たら取り直す）。 */
+  private readonly failedPcm: FailureMarks;
+  private retryId: number | null = null;
+  private retryAt = Number.POSITIVE_INFINITY;
+  private readonly now: () => number;
   /** 波形の段・PCM を捨てた回数（読んでいる途中のものが古くなったかを見る）。 */
   private tileEpoch = 0;
   private pcmEpoch = 0;
@@ -314,6 +323,8 @@ export class WaveController {
     this.tiles = options.tiles ?? new PeakTileCache();
     this.colors = options.colors ?? DEFAULT_COLORS;
     this.metrics = options.metrics ?? DEFAULT_METRICS;
+    this.now = options.now ?? (() => Date.now());
+    this.failedPcm = new FailureMarks(this.now);
   }
 
   // ===== 面 =====
@@ -714,7 +725,7 @@ export class WaveController {
     const [a, b] = span;
     if (!covered(view.valid, a, b)) return;
     const failKey = `${index}@${view.rev}`;
-    if (this.failedPcm.has(failKey)) return;
+    if (this.failedPcm.blocked(failKey)) return;
     let url: string;
     try {
       url = editPcmUrl(session, view.rev, a, b);
@@ -738,20 +749,42 @@ export class WaveController {
           pcm.info.decoder !== decoder ||
           pcm.channels !== view.channels
         ) {
-          this.failedPcm.add(failKey);
+          this.pcmFailed(failKey);
           return;
         }
+        this.failedPcm.ok(failKey);
         this.pcm.put(index, { rev: view.rev, start: a, frames: b - a, planes: pcm.planes });
         this.invalidate();
       })
       .catch(() => {
-        if (!this.disposed) this.failedPcm.add(failKey);
+        if (!this.disposed && mark.epoch === this.pcmEpoch) this.pcmFailed(failKey);
       })
       .finally(() => {
         if (this.loadingPcm.get(index) === mark) this.loadingPcm.delete(index);
         this.pcmLoads--;
         if (!this.disposed) this.pump();
       });
+  }
+
+  /** PCM を取れなかった：印を付け、期限が来たら取り直す（503 の Busy のような一時的な失敗があるため）。 */
+  private pcmFailed(key: string): void {
+    this.failedPcm.fail(key);
+    this.retryIn(this.failedPcm.waitOf(key) ?? FAIL_RETRY_MS);
+  }
+
+  /** `ms` 後に足りないものを取りに行く（もっと早く頼んであればそのまま）。 */
+  private retryIn(ms: number): void {
+    const at = this.now() + ms;
+    if (this.retryId !== null) {
+      if (this.retryAt <= at) return;
+      this.scheduler.cancelLater(this.retryId);
+    }
+    this.retryAt = at;
+    this.retryId = this.scheduler.later(() => {
+      this.retryId = null;
+      this.retryAt = Number.POSITIVE_INFINITY;
+      if (!this.disposed) this.pump();
+    }, ms);
   }
 
   // ===== 描く =====
@@ -985,8 +1018,10 @@ export class WaveController {
     this.disposed = true;
     if (this.frameId !== null) this.scheduler.cancelFrame(this.frameId);
     if (this.idleId !== null) this.scheduler.cancelLater(this.idleId);
+    if (this.retryId !== null) this.scheduler.cancelLater(this.retryId);
     this.frameId = null;
     this.idleId = null;
+    this.retryId = null;
     this.canvas = null;
     this.loadingTiles.clear();
     this.loadingPcm.clear();

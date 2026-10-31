@@ -8,6 +8,9 @@ import {
   chunkOf,
   chunkSpan,
   covered,
+  FAIL_RETRY_MAX_MS,
+  FAIL_RETRY_MS,
+  FailureMarks,
   fillPcmColumns,
   type PcmChunk,
   PcmChunkCache,
@@ -131,5 +134,37 @@ describe('PCM から列を埋める', () => {
       has,
     );
     expect(Array.from(has)).toEqual([0, 0]);
+  });
+});
+
+describe('取れなかった印', () => {
+  it('期限（1 秒から倍々で 8 秒まで）の前は取らず、過ぎたら取り直してよい。取れたら数え直す', () => {
+    let now = 0;
+    const marks = new FailureMarks(() => now);
+    expect(marks.blocked('e0@1')).toBe(false);
+    expect(marks.fail('e0@1')).toBe(1);
+    expect(marks.blocked('e0@1')).toBe(true);
+    now += FAIL_RETRY_MS - 1;
+    expect(marks.blocked('e0@1')).toBe(true);
+    now += 1;
+    expect(marks.blocked('e0@1')).toBe(false);
+    expect(marks.fail('e0@1')).toBe(2);
+    now += FAIL_RETRY_MS;
+    expect(marks.blocked('e0@1')).toBe(true);
+    now += FAIL_RETRY_MS;
+    expect(marks.blocked('e0@1')).toBe(false);
+    // 上限は 8 秒
+    for (let i = 0; i < 6; i++) marks.fail('e0@1');
+    now += FAIL_RETRY_MAX_MS - 1;
+    expect(marks.blocked('e0@1')).toBe(true);
+    now += 1;
+    expect(marks.blocked('e0@1')).toBe(false);
+    marks.ok('e0@1');
+    expect(marks.fail('e0@1')).toBe(1);
+    // 頭の文字で消す
+    marks.fail('i3');
+    marks.clear('e');
+    expect(marks.blocked('e0@1')).toBe(false);
+    expect(marks.blocked('i3')).toBe(true);
   });
 });

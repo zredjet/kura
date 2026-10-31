@@ -52,6 +52,51 @@ export function covered(valid: readonly EditSpanDto[], a: number, b: number): bo
   return valid.some((s) => s.start <= a && b <= s.end);
 }
 
+/** 取れなかったチャンクを取り直すまでの待ち（ms。続けて失敗するたびに倍にする）。 */
+export const FAIL_RETRY_MS = 1000;
+/** 取り直すまでの待ちの上限（ms）。 */
+export const FAIL_RETRY_MAX_MS = 8000;
+
+/**
+ * 取れなかった印（鍵ごと。503 の Busy のような一時的な失敗もあるので、期限が来たら取り直してよい）。期限は 1 秒から
+ * 続けて失敗するたびに倍にして 8 秒まで。取れたら消す（数え直す）。
+ */
+export class FailureMarks {
+  private readonly marks = new Map<string, { until: number; count: number }>();
+
+  constructor(private readonly now: () => number = () => Date.now()) {}
+
+  /** 取れなかった（続けて失敗した回数を返す）。 */
+  fail(key: string): number {
+    const count = (this.marks.get(key)?.count ?? 0) + 1;
+    const wait = Math.min(FAIL_RETRY_MAX_MS, FAIL_RETRY_MS * 2 ** (count - 1));
+    this.marks.set(key, { until: this.now() + wait, count });
+    return count;
+  }
+
+  /** 期限の前か（今は取らない）。 */
+  blocked(key: string): boolean {
+    const m = this.marks.get(key);
+    return m !== undefined && this.now() < m.until;
+  }
+
+  /** 次に取り直してよくなるまでの ms（印がなければ null）。 */
+  waitOf(key: string): number | null {
+    const m = this.marks.get(key);
+    return m ? Math.max(0, m.until - this.now()) : null;
+  }
+
+  /** 取れた（印を消す）。 */
+  ok(key: string): void {
+    this.marks.delete(key);
+  }
+
+  /** 頭が `prefix` の印を消す（省けば全部）。 */
+  clear(prefix = ''): void {
+    for (const k of [...this.marks.keys()]) if (k.startsWith(prefix)) this.marks.delete(k);
+  }
+}
+
 /** 手元の PCM のチャンクの表。 */
 export class PcmChunkCache {
   private readonly entries = new Map<number, PcmChunk & { bytes: number }>();
