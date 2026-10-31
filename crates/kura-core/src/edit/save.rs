@@ -1396,7 +1396,13 @@ impl EditHandler {
         let mut warnings: Vec<String> = Vec::new();
         // 1. 入力
         // エディタが同じ元・同じ読み方の入力を貸していれば、元を読み直さずに使う（照らしていなければ照らしの回を回す）
-        let lent = match stream::borrowed(&cx, d.item_id, &d.options_digest, &mut passes)? {
+        let lent = match stream::borrowed(
+            &cx,
+            d.item_id,
+            &d.options_digest,
+            d.found.as_ref(),
+            &mut passes,
+        )? {
             Flow::Go(lent) => lent,
             Flow::Stop(end) => return Ok(Flow::Stop(end)),
         };

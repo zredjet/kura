@@ -194,16 +194,30 @@ fn s24_lent_wav_is_not_read_again() {
 /// 固定の段の WAV に書くライブラリ（予算 128 MiB：取り置き 64 MiB、作業用のファイルの境は 32 MiB）。遅延の源で開かないので、直接読めない
 /// 形式の長い音声と同じに作業用のファイルの道を通る（長い値を速く作れる。読み手は再現するので、保存はアンカーを作らない）。
 fn plain_wav_env(decodes: &Arc<AtomicU64>) -> Env {
+    staged_wav_env(decodes, "plain-wav-dec/1", false)
+}
+
+/// [`plain_wav_env`] と同じだが、段を再現しない読み手（`unreproducible-wav-dec/1`。Platform・External の代わり）と申告する
+/// ライブラリ。保存は作業用のファイルをアンカーに昇格する。
+fn unreproducible_wav_env(decodes: &Arc<AtomicU64>) -> Env {
+    staged_wav_env(decodes, "unreproducible-wav-dec/1", true)
+}
+
+/// WAV を識別子 `id` の段（固定の段の WAV と同じに読み、`unreproducible` なら再現しないと申告する）だけで読むライブラリ。
+fn staged_wav_env(decodes: &Arc<AtomicU64>, id: &'static str, unreproducible: bool) -> Env {
     let decodes = decodes.clone();
     Env::with(Arc::new(Staged {
         budget: 128 << 20,
         make: Box::new(move || {
             let pinned = CodecSet::pinned();
             let mut set = CodecSet::default();
-            set.add_decoder(Arc::new(
-                Stage::renamed(pinned_decoder("wav"), "plain-wav-dec/1", "wav").counting(&decodes),
-            ))
-            .unwrap();
+            let stage = Stage::renamed(pinned_decoder("wav"), id, "wav").counting(&decodes);
+            let stage = if unreproducible {
+                stage.unreproducible()
+            } else {
+                stage
+            };
+            set.add_decoder(Arc::new(stage)).unwrap();
             let probe = Shape::Audio {
                 rate: 8_000,
                 channels: 1,
@@ -435,4 +449,35 @@ fn lent_source_lru_is_counted_at_its_cap() {
         resident >= cap,
         "保存の見積もりの源の LRU（{resident}）が貸した源の上限（{cap}）より小さい"
     );
+}
+
+/// 再現しない読み手で開いたエディタから、開いたまま 2 回保存する（M13 段 4C の検証の直し）：1 回目は貸した作業用のファイルを
+/// アンカーに昇格する（created）。2 回目は、貸し出しは開いたときのまま（アンカーなし）でも同じ記録のアンカーがあるので、昇格
+/// （staging への写し・照らし・全体を読む hash_file）をやり直さずにそのアンカーを使う（used）。どちらも元を読み直さない。
+#[test]
+fn second_save_from_the_open_editor_uses_the_anchor() {
+    let bytes = plain_wav_bytes(8_000, LONG);
+    let decodes = Arc::new(AtomicU64::new(0));
+    let env = unreproducible_wav_env(&decodes);
+    let admits = watch_admits(&env);
+    env.jobs.start().unwrap();
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open(id).session;
+
+    env.step(&s, gain(), &Viewport::audio_idle());
+    let first = save_and_wait(&env, &s, None);
+    assert_eq!(first["anchor"], "created", "{first}");
+    env.step(
+        &s,
+        vec![add(0, "audio.gain", json!({ "db": -2.0 }))],
+        &Viewport::audio_idle(),
+    );
+    let second = save_and_wait(&env, &s, None);
+    assert_eq!(
+        second["anchor"], "used",
+        "2 回目は前の保存が作ったアンカーを使う：{second}"
+    );
+    let promoted: Vec<bool> = admits.lock().unwrap().iter().map(|(_, p)| *p).collect();
+    assert_eq!(promoted, [true, false], "2 回目は昇格しない");
+    assert_eq!(decodes.load(Ordering::SeqCst), 1, "保存は元を読み直さない");
 }

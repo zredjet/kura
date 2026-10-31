@@ -874,11 +874,13 @@ type Borrowed = (StreamInput, Option<WorkHandle>);
 
 /// エディタが貸している入力を借りる（M13 段 3。`EngineServices::borrow_input`）：同じアイテム・元・読み方のものがあれば、
 /// 照らしていなければ照らしの回で値を記録と照らし（違えば使わない）、アンカーに昇格する読み（再現しない読み）なのに作業用の
-/// PCM がなければ使わない。使えれば（入力・作業用の PCM）。
+/// PCM がなければ使わない。昇格する読みでも、保存のときのアンカー `found` が同じ記録なら昇格せずにそのアンカーを使う。
+/// 使えれば（入力・作業用の PCM）。
 pub(super) fn borrowed(
     cx: &StreamCx<'_>,
     item_id: i64,
     options_digest: &[u8; 32],
+    found: Option<&Anchor>,
     passes: &mut Passes<'_>,
 ) -> Result<Flow<Option<Borrowed>>> {
     let Some(lent) = cx
@@ -889,7 +891,15 @@ pub(super) fn borrowed(
         return Ok(Flow::Go(None));
     };
     let anchor = match &lent.anchor {
-        crate::edit::services::LentAnchor::None => AnchorUse::None,
+        // 貸し出しは開いたときのまま（アンカーなし）でも、同じエディタからの前の保存が同じ記録のアンカーを作っていれば、昇格を
+        // やり直さずにそれを使う（値は記録と照らし済みの作業用のファイルで、同じ記録のアンカーを指すだけなので照らし直さない。
+        // M13 段 4C の検証の直し）
+        crate::edit::services::LentAnchor::None => match found {
+            Some(a) if anchor::needs_anchor(&lent.decoded) && a.decoded == lent.decoded => {
+                AnchorUse::Existing(a.clone())
+            }
+            _ => AnchorUse::None,
+        },
         crate::edit::services::LentAnchor::Existing(a) => AnchorUse::Existing(a.clone()),
         crate::edit::services::LentAnchor::Fallback(a) => AnchorUse::Fallback(a.clone()),
     };

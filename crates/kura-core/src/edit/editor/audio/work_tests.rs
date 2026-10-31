@@ -146,6 +146,8 @@ pub(super) struct Stage {
     log: Option<ShapeLog>,
     /// 値を読んだ・流して読んだ数（[`Stage::counting`]）。
     decodes: Option<Arc<AtomicU64>>,
+    /// 再現しない読み手として申告する（[`Stage::unreproducible`]。Platform・External と同じに、保存がアンカーに昇格する）。
+    unreproducible: bool,
 }
 
 impl Stage {
@@ -160,6 +162,7 @@ impl Stage {
             refuse: None,
             log: Some(log.clone()),
             decodes: None,
+            unreproducible: false,
         }
     }
 
@@ -174,12 +177,19 @@ impl Stage {
             refuse: None,
             log: None,
             decodes: None,
+            unreproducible: false,
         }
     }
 
     /// 値を読む・流して読むたびに `counter` を 1 増やす。
     pub(super) fn counting(mut self, counter: &Arc<AtomicU64>) -> Self {
         self.decodes = Some(counter.clone());
+        self
+    }
+
+    /// 再現しない読み手として申告する（読む値は `inner` と同じ）。
+    pub(super) fn unreproducible(mut self) -> Self {
+        self.unreproducible = true;
         self
     }
 
@@ -214,7 +224,7 @@ impl Decoder for Stage {
         self.inner.tier()
     }
     fn reproducible(&self) -> bool {
-        self.inner.reproducible()
+        !self.unreproducible && self.inner.reproducible()
     }
     fn env(&self) -> Option<CodecEnv> {
         self.inner.env()
