@@ -483,6 +483,91 @@ fn paused_then_canceled_save_removes_the_work_file() {
     assert_consistent(&env.lib);
 }
 
+/// 作業用の PCM をエディタと共有していても、一時停止した保存の残す印は捨てない：エディタを閉じても残り、再開で読み直さない
+/// （M13 段 3 の検証の直し #9）。
+#[test]
+fn paused_save_keeps_the_work_file_shared_with_the_editor() {
+    use super::anchors::options_digest;
+    use super::services::{LentAnchor, LentInput};
+    use super::work_pcm::WorkKey;
+    use kura_engine::codec::anchor::{self, AnchorContext};
+    use kura_engine::doc::DecodeOptions;
+    let decoder = opus_decoder(1, 2 * 65_536 + 11);
+    let (env, gate) = gated_env(opus_codecs(&decoder), |s| s == Stage::Written);
+    let (item, hash) = add_audio(&env.lib, b"shared fake opus", "opus", "共有の声");
+    // エディタと同じ鍵で作業用の PCM を作って貸す
+    let set = env.engine.codecs();
+    let path = env.lib.layout().content_path(&hash, "opus");
+    let opts = DecodeOptions::default();
+    let limits = Engine::new().unwrap().limits().clone();
+    let shape = set.shape_path(&path, "opus", &opts, &limits).unwrap().0;
+    let work = env
+        .engine
+        .work_pcm()
+        .ensure(
+            &WorkKey {
+                source: hash,
+                format: "opus".into(),
+                options: opts.clone(),
+                decoder: None,
+            },
+            &shape,
+            AnchorContext {
+                source: Some(Digest(hash)),
+                format: Some("opus".into()),
+                options: opts.clone(),
+            },
+            |sink| set.decode_stream_path(&path, "opus", &opts, &limits, sink, &NoMonitor),
+            &limits,
+            &NoMonitor,
+        )
+        .unwrap();
+    let opened = anchor::open_source(&work.opener(), &limits, 64 << 20)
+        .unwrap()
+        .unwrap();
+    env.engine.lend_input(
+        "editor-9",
+        LentInput {
+            item_id: item,
+            source: hash,
+            options_digest: Digest(options_digest(&opts).unwrap()),
+            format: "opus".into(),
+            value: opened.value,
+            decoded: work.pcm().decoded.clone(),
+            anchor: LentAnchor::None,
+            work: Some(work),
+            verified: true,
+        },
+    );
+    assert_eq!(decoder.reads(), 1);
+    gate.arm();
+    let id = env.start(
+        item,
+        base_of(&env.lib, item),
+        SaveAction::Overwrite {
+            graph: audio_doc(-3.0, Some("wav")),
+        },
+    );
+    gate.wait();
+    env.jobs.pause(id).unwrap();
+    gate.open();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_eq!(env.jobs.get(id).unwrap().state, JobState::Paused);
+    // エディタを閉じる（貸したものを引き上げる）
+    env.engine.withdraw_input("editor-9");
+    assert_eq!(
+        env.engine.work_pcm().usage().0,
+        1,
+        "エディタを閉じたら消えた"
+    );
+    env.jobs.resume(id).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_done(&env.jobs.get(id).unwrap());
+    assert_eq!(decoder.reads(), 1, "再開で元を読み直した");
+    assert_eq!(env.engine.work_pcm().usage(), (0, 0));
+    assert_consistent(&env.lib);
+}
+
 /// S23：流して書いた音声の版は、GC の照合（流して作り直して生の BLAKE3 を比べる）で一致して released になり、版に戻すと
 /// 流して作り直して同じバイト列になる。記録の値のダイジェストと違えば、照合は kept（ファイルを残す）。
 #[test]

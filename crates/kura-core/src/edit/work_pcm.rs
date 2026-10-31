@@ -16,7 +16,7 @@
 //!   で形を読めた段の `stage_stream_work_bytes`）＋ 窓の作業列 ＋ 値のダイジェスト ＋ 書き手の作業列。呼び手は段ごとに確保し
 //!   直し、形を読めた段で流して読む（`decode` 閉包に `decode_stream_with_path(段の識別子)`。M13 段 2 の検証の直し）。
 //! - 寿命は参照の数で決める：[`WorkHandle`] を落とすと減り、0 になったら、残す印（[`WorkHandle::retain_on_drop`]。一時停止
-//!   した保存）がなければすぐ消し、あれば残す期限（30 分）まで残す。残すものの合計は min(8 GiB, 空き / 4) までで、古い順に
+//!   した保存。ほかの使い手がまだ持っていても印は覚えておき、取り直せば外す）がなければすぐ消し、あれば残す期限（30 分）まで残す。残すものの合計は min(8 GiB, 空き / 4) までで、古い順に
 //!   消す（[`WorkPcmStore::sweep`]。残す手放しのたびと、GC のジョブの終わりに当てる）。一時停止したまま中止した保存の分は
 //!   中止の後始末で捨てる（[`WorkPcmStore::discard`]）。ライブラリを閉じるときは全部消す（[`WorkPcmStore::clear`]）。
 
@@ -124,6 +124,9 @@ struct Entry {
     retained_until: Option<Instant>,
     /// 手放した順（古い順に消すため）。
     released_at: u64,
+    /// 参照が 0 になったら残す（一時停止した保存が手放したとき、ほかの使い手（エディタ・試聴）がまだ持っていても立てる。
+    /// 取り直せば外す。M13 段 3 の検証の直し）。
+    retain_at_zero: bool,
 }
 
 /// 置き場の中身（ハンドルと共有する）。
@@ -154,7 +157,7 @@ impl Inner {
         f(at)
     }
 
-    /// 参照を 1 つ減らす（0 になったら、残す印がなければ消す）。残したときは、期限と残す上限をその場で当てる（[`Inner::sweep`]。
+    /// 参照を 1 つ減らす（0 になったら、残す印がなければ消す。印は参照が残っていても覚えておき、最後の参照で効く）。残したときは、期限と残す上限をその場で当てる（[`Inner::sweep`]。
     /// GC のジョブを待たない。M13 段 3 の検証の直し）。
     fn release(&self, name: &str, retain: bool) {
         let remove = {
@@ -163,10 +166,13 @@ impl Inner {
                 return;
             };
             e.refs = e.refs.saturating_sub(1);
+            if retain {
+                e.retain_at_zero = true;
+            }
             if e.refs > 0 {
                 return;
             }
-            if retain {
+            if e.retain_at_zero {
                 let d = *self
                     .retain_for
                     .lock()
@@ -257,7 +263,8 @@ impl WorkHandle {
         })
     }
 
-    /// 手放したあとも残す期限まで残す（一時停止した保存。再開で作り直さない）。
+    /// 手放したあとも残す期限まで残す（一時停止した保存。再開で作り直さない）。ほかの使い手がまだ持っていれば、最後の参照を
+    /// 落としたときに残す。
     pub fn retain_on_drop(&mut self) {
         self.retain = true;
     }
@@ -269,12 +276,13 @@ impl Drop for WorkHandle {
     }
 }
 
-/// 写すと参照が 1 つ増える（エディタが保存に入力を貸すとき。M13 段 3）。残す印は写さない。
+/// 写すと参照が 1 つ増える（エディタが保存に入力を貸すとき。M13 段 3）。残す印は写さず、取り直したので置き場の印も外す。
 impl Clone for WorkHandle {
     fn clone(&self) -> Self {
         if let Some(e) = self.inner.entries().get_mut(&self.name) {
             e.refs += 1;
             e.retained_until = None;
+            e.retain_at_zero = false;
         }
         Self {
             pcm: self.pcm.clone(),
@@ -343,6 +351,7 @@ impl WorkPcmStore {
     fn handle(&self, name: &str, e: &mut Entry) -> WorkHandle {
         e.refs += 1;
         e.retained_until = None;
+        e.retain_at_zero = false;
         WorkHandle {
             pcm: e.pcm.clone(),
             name: name.to_string(),
@@ -447,6 +456,7 @@ impl WorkPcmStore {
             refs: 0,
             retained_until: None,
             released_at: 0,
+            retain_at_zero: false,
         };
         let h = self.handle(&name, &mut e);
         entries.insert(name, e);
@@ -470,6 +480,7 @@ impl WorkPcmStore {
                 Some(e) if e.refs == 0 => entries.remove(&name),
                 Some(e) => {
                     e.retained_until = None;
+                    e.retain_at_zero = false;
                     None
                 }
                 None => None,
@@ -837,6 +848,40 @@ mod tests {
         c.retain_on_drop();
         drop(c);
         assert!(!pc.exists() && pb.is_file(), "期限を過ぎたものだけを消す");
+    }
+
+    /// ほかの使い手（エディタ・試聴）と共有していても、残す印は捨てない：最後の参照を落としたときに残す（M13 段 3 の検証の
+    /// 直し #9）。取り直せば（find・ensure・写し）印は外れる。
+    #[test]
+    fn retain_survives_while_shared() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("pcm");
+        let store = WorkPcmStore::new(dir.clone(), None);
+        let reads = AtomicU64::new(0);
+        // エディタが持つ
+        let editor = ensure(&store, &key(14), &reads).unwrap();
+        let path = editor.pcm().path.clone();
+        // 保存が同じものを取り、一時停止で残す印を立てて手放す
+        let mut save = store.find(&key(14)).unwrap();
+        save.retain_on_drop();
+        drop(save);
+        // エディタを閉じても残る
+        drop(editor);
+        assert!(path.is_file(), "共有していた残す印が捨てられた");
+        assert_eq!(store.usage().0, 1);
+        // 再開で取り直すと印は外れる（使い終えれば消える）
+        let again = store.find(&key(14)).unwrap();
+        drop(again);
+        assert!(!path.exists());
+        // 写しで取り直しても外れる
+        let editor = ensure(&store, &key(14), &reads).unwrap();
+        let mut save = store.find(&key(14)).unwrap();
+        save.retain_on_drop();
+        drop(save);
+        let lent = editor.clone();
+        drop(lent);
+        drop(editor);
+        assert!(!path.exists(), "写しで取り直したら印は外れる");
     }
 
     /// 捨てる（中止した保存の後始末）：残す印を外し、参照がなければ消す。参照があれば、最後の参照を落としたときに消す。
