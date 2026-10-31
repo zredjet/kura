@@ -3,8 +3,8 @@
 //! 閉じると引き上げる（`withdraw_input`）。保存は貸した入力を使い、元を読み直さない（段 3 の S21 をエディタの道で回す）。
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use kura_engine::audio::source::SourceStats;
@@ -451,22 +451,71 @@ fn lent_source_lru_is_counted_at_its_cap() {
     );
 }
 
-/// 再現しない読み手で開いたエディタから、開いたまま 2 回保存する（M13 段 4C の検証の直し）：1 回目は貸した作業用のファイルを
-/// アンカーに昇格する（created）。2 回目は、貸し出しは開いたときのまま（アンカーなし）でも同じ記録のアンカーがあるので、昇格
-/// （staging への写し・照らし・全体を読む hash_file）をやり直さずにそのアンカーを使う（used）。どちらも元を読み直さない。
+/// 保存のときのアンカー（元 `hash`・既定の読み方。なければ None）。
+fn anchor_of(env: &Env, hash: &[u8; 32]) -> Option<crate::edit::anchors::Anchor> {
+    let digest = options_digest(&DecodeOptions::default()).unwrap();
+    let hash = *hash;
+    env.lib
+        .db()
+        .read(move |c| crate::edit::anchors::find(c, &hash, &digest))
+        .unwrap()
+}
+
+/// S24（再現しない読み手。M13 段 4C の検証の直し）：Platform・External のように再現しない読み手（`unreproducible-wav-dec/1`）で
+/// 読む長い音声は作業用のファイルから開き、参照ごと照らし済み・アンカーなしで貸す。保存はデコードし直さず、貸した作業用の
+/// ファイルをアンカーに昇格する（created。アンカーの中身は作業用のファイルと同じ）。結果は貸さないときとバイト単位で同じ。
+/// 開いたまま 2 回目を保存すると、貸し出しは開いたときのまま（アンカーなし）でも同じ記録のアンカーがあるので、昇格（staging への
+/// 写し・照らし・全体を読む hash_file）をやり直さずにそのアンカーを使う（used）。保存のあとに閉じると、貸し出しと作業用の
+/// ファイルが消える。
 #[test]
-fn second_save_from_the_open_editor_uses_the_anchor() {
+fn s24_lent_unreproducible_work_file_is_promoted_once() {
     let bytes = plain_wav_bytes(8_000, LONG);
+    let hash = hash_of(&bytes);
+
     let decodes = Arc::new(AtomicU64::new(0));
     let env = unreproducible_wav_env(&decodes);
     let admits = watch_admits(&env);
     env.jobs.start().unwrap();
     let id = add_audio(&env.lib, &bytes, "wav");
-    let s = env.open(id).session;
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    assert!(opened.source.audio.as_ref().unwrap().lazy);
+    assert_eq!(
+        decodes.load(Ordering::SeqCst),
+        1,
+        "作業用のファイルを作るのに 1 回読む"
+    );
+    let l = lent(&env, id, &hash).expect("作業用のファイルから開いた入力は貸す");
+    assert!(l.verified, "作業用のファイルの封の記録は照らし済み");
+    assert!(matches!(l.anchor, LentAnchor::None));
+    assert_eq!(l.decoded.codec, "unreproducible-wav-dec/1");
+    assert!(!l.decoded.reproducible, "再現しない読みの記録");
+    let work_path = l
+        .work
+        .as_ref()
+        .expect("作業用のファイルの参照ごと貸す")
+        .pcm()
+        .path
+        .clone();
+    let decoded = l.decoded.clone();
+    drop(l);
+    assert!(anchor_of(&env, &hash).is_none());
 
+    // 1 回目：貸した作業用のファイルをアンカーに昇格する
     env.step(&s, gain(), &Viewport::audio_idle());
     let first = save_and_wait(&env, &s, None);
     assert_eq!(first["anchor"], "created", "{first}");
+    assert_eq!(decodes.load(Ordering::SeqCst), 1, "保存は元を読み直さない");
+    let a = anchor_of(&env, &hash).expect("保存がアンカーを作った");
+    assert_eq!(a.decoded, decoded, "アンカーの記録は貸した入力の記録");
+    let work = std::fs::read(&work_path).unwrap();
+    assert!(
+        std::fs::read(env.lib.layout().content_path(&a.hash, &a.ext)).unwrap() == work,
+        "アンカーの中身は作業用のファイルと同じ"
+    );
+    let got = saved_bytes(&env, id);
+
+    // 2 回目（開いたまま）：昇格をやり直さずにアンカーを使う
     env.step(
         &s,
         vec![add(0, "audio.gain", json!({ "db": -2.0 }))],
@@ -480,4 +529,88 @@ fn second_save_from_the_open_editor_uses_the_anchor() {
     let promoted: Vec<bool> = admits.lock().unwrap().iter().map(|(_, p)| *p).collect();
     assert_eq!(promoted, [true, false], "2 回目は昇格しない");
     assert_eq!(decodes.load(Ordering::SeqCst), 1, "保存は元を読み直さない");
+
+    // 貸さないとき：同じ元・同じ手で、貸し出しを引き上げてから保存する
+    let other_decodes = Arc::new(AtomicU64::new(0));
+    let other = unreproducible_wav_env(&other_decodes);
+    other.jobs.start().unwrap();
+    let oid = add_audio(&other.lib, &bytes, "wav");
+    let o = other.open(oid);
+    other.engine.withdraw_input(&o.session);
+    other.step(&o.session, gain(), &Viewport::audio_idle());
+    let o1 = save_and_wait(&other, &o.session, None);
+    assert_eq!(o1["anchor"], "created", "{o1}");
+    assert!(
+        got == saved_bytes(&other, oid),
+        "貸したときと貸さないときでバイト列が違う"
+    );
+    assert_eq!(
+        anchor_of(&other, &hash).unwrap().hash,
+        a.hash,
+        "貸さないときも同じアンカー"
+    );
+
+    // 閉じると貸し出しが消え、作業用のファイルはほかに使い手がなければ消える
+    close(&env.engine, &s);
+    assert!(lent(&env, id, &hash).is_none());
+    assert_eq!(env.engine.work_pcm().usage(), (0, 0));
+}
+
+/// S24（再現しない読み手・保存の途中で閉じる。M13 段 4C の検証の直し）：昇格する保存が貸した入力を借りたあと（計画の確保の
+/// 直前）にエディタを閉じても、保存が借りている作業用のファイルは保存の間は残り、保存は昇格して書き終える（created。アンカーの
+/// 中身は作業用のファイルと同じ）。保存が終われば作業用のファイルは消える。
+#[test]
+fn s24_closing_the_editor_mid_save_keeps_the_lent_work_file() {
+    let bytes = plain_wav_bytes(8_000, LONG);
+    let hash = hash_of(&bytes);
+
+    let decodes = Arc::new(AtomicU64::new(0));
+    let env = unreproducible_wav_env(&decodes);
+    let (reached_tx, reached_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (reached, go) = (Mutex::new(reached_tx), Mutex::new(go_rx));
+    let armed = AtomicBool::new(true);
+    env.engine.set_hook(Some(Arc::new(move |stage| {
+        if matches!(stage, SaveStage::Admit { .. }) && armed.swap(false, Ordering::SeqCst) {
+            reached.lock().unwrap().send(()).unwrap();
+            let _ = go.lock().unwrap().recv();
+        }
+    })));
+    env.jobs.start().unwrap();
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open(id).session;
+    let l = lent(&env, id, &hash).expect("作業用のファイルから開いた入力は貸す");
+    let work_path = l.work.as_ref().unwrap().pcm().path.clone();
+    drop(l);
+    let work_hash = hash_of(&std::fs::read(&work_path).unwrap());
+
+    env.step(&s, gain(), &Viewport::audio_idle());
+    let job = save(&env.env(), &s, SaveMode::Overwrite, None).unwrap().job;
+    reached_rx
+        .recv_timeout(WAIT)
+        .expect("保存が貸した入力を借りた");
+    close(&env.engine, &s);
+    assert!(lent(&env, id, &hash).is_none(), "閉じたら貸し出しが消える");
+    assert!(work_path.exists(), "保存が借りている作業用のファイルは残る");
+    assert_eq!(env.engine.work_pcm().usage().0, 1);
+    go_tx.send(()).unwrap();
+
+    assert!(env.jobs.wait_idle(WAIT));
+    let record = env.jobs.get(job).unwrap();
+    assert_eq!(record.state, JobState::Done, "{:?}", record.message);
+    let result: serde_json::Value =
+        serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
+    assert_eq!(result["anchor"], "created", "{result}");
+    assert_eq!(decodes.load(Ordering::SeqCst), 1, "保存は元を読み直さない");
+    assert_eq!(
+        anchor_of(&env, &hash).unwrap().hash,
+        work_hash,
+        "アンカーの中身は作業用のファイルと同じ"
+    );
+    assert_eq!(
+        env.engine.work_pcm().usage(),
+        (0, 0),
+        "保存が終われば作業用のファイルは消える"
+    );
+    assert!(!work_path.exists());
 }
