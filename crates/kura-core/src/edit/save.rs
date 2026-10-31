@@ -1387,7 +1387,8 @@ impl EditHandler {
         } else {
             0.0
         };
-        let mut passes = stream::Passes::new(&cx, 1.0 + f64::from(rounds) + promote_weight + 0.25);
+        let mut passes =
+            stream::Passes::new(&cx, 1.0 + f64::from(rounds) + promote_weight + 0.25, true);
         ctx.progress(0.05, "元の大きさを確かめています");
         let mut warnings: Vec<String> = Vec::new();
         // 1. 入力

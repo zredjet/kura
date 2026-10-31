@@ -721,7 +721,8 @@ fn rebuild_stream_in(
         limits,
         mon: &mon,
     };
-    let mut passes = stream::Passes::new(&cx, 3.25);
+    // GC の照合（rules.progress が偽）は送らない（GC は自分の進捗を送る）
+    let mut passes = stream::Passes::new(&cx, 3.25, rules.progress);
     let mut warnings: Vec<String> = Vec::new();
     if rules.progress {
         ctx.progress(0.1, "戻す版の元を読んでいます");

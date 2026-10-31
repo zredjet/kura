@@ -1169,3 +1169,44 @@ fn s22_mp3_without_ffmpeg_needs_another_format() {
     assert_eq!(head(&env.lib, item).ext, "ogg");
     assert_consistent(&env.lib);
 }
+
+/// 保存の流れの進捗の文言（GC の照合では送らない）。
+const STREAM_MESSAGES: [&str; 7] = [
+    "元の大きさを確かめています",
+    "元を照らしています",
+    "元の読み取りを照らしています",
+    "作業用のファイルに読んでいます",
+    "書いています",
+    "書いたものを確かめています",
+    "戻す版の元を読んでいます",
+];
+
+/// GC の照合で音声を流して作り直すときは、保存の進捗（文言・割合）を送らない（GC は自分の進捗を送る。M13 段 3 の検証の
+/// 直し #6）。
+#[test]
+fn gc_rebuild_does_not_send_save_progress() {
+    let env = Env::new();
+    env.jobs.set_progress_interval(0);
+    let pinned = CodecSet::pinned();
+    let original = noise_file(&pinned, "wav", 2, 3 * 65_536 + 77, 6);
+    let (item, _) = add_audio(&env.lib, &original, "wav", "照合の声");
+    assert_done(&env.overwrite(item, audio_doc(-2.0, Some("flac"))));
+    assert_done(&env.overwrite(item, audio_doc(-5.0, Some("wav"))));
+    env.events.lock().unwrap().clear();
+    gc_version(&env, item, 1);
+    let events = env.events.lock().unwrap();
+    let gc: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == crate::jobs::JobKind::Gc && e.progress.is_some())
+        .collect();
+    assert!(!gc.is_empty());
+    for e in gc {
+        let m = e.message.as_deref().unwrap_or("");
+        assert!(
+            !STREAM_MESSAGES.contains(&m),
+            "GC が保存の進捗を送った：{e:?}"
+        );
+    }
+    drop(events);
+    assert_consistent(&env.lib);
+}

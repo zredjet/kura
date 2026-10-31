@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -188,6 +188,8 @@ struct Inner {
     sink: EventSink,
     sched: Mutex<Sched>,
     wake: Condvar,
+    /// 進捗イベントの最小間隔（ミリ秒。既定は [`PROGRESS_INTERVAL_MS`]。テストは 0 にして進捗の列をすべて見る）。
+    progress_interval_ms: AtomicI64,
 }
 
 impl Inner {
@@ -285,9 +287,16 @@ impl JobManager {
                     workers: Vec::new(),
                 }),
                 wake: Condvar::new(),
+                progress_interval_ms: AtomicI64::new(PROGRESS_INTERVAL_MS),
             }),
             scheduler: Mutex::new(None),
         })
+    }
+
+    /// 進捗イベントの最小間隔を変える（テストが進捗の列をすべて見るとき。これから動くジョブに効く）。
+    #[cfg(test)]
+    pub(crate) fn set_progress_interval(&self, ms: i64) {
+        self.inner.progress_interval_ms.store(ms, Ordering::Relaxed);
     }
 
     /// 待ち行列の処理を始める。
@@ -628,7 +637,9 @@ fn spawn_worker(inner: &Arc<Inner>, sched: &mut Sched, record: JobRecord) {
         library: inner.library.clone(),
         control: control.clone(),
         sink: inner.sink.clone(),
-        throttle: Mutex::new(Throttle::new(PROGRESS_INTERVAL_MS)),
+        throttle: Mutex::new(Throttle::new(
+            inner.progress_interval_ms.load(Ordering::Relaxed),
+        )),
         log: Mutex::new(None),
     };
     let worker_inner = inner.clone();

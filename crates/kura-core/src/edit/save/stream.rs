@@ -86,18 +86,21 @@ pub(super) struct Passes<'a> {
     ctx: &'a JobContext,
     total: f64,
     done: f64,
+    /// 送るか（保存・版に戻すは真。GC の照合は偽：GC は自分の進捗を送る。M13 段 3 の検証の直し）。
+    send: bool,
     /// テストの割り込み（流れの途中の段）。
     #[cfg(test)]
     engine: &'a EngineServices,
 }
 
 impl<'a> Passes<'a> {
-    /// 重みの和 `total` で始める（`cx` のジョブに知らせる）。
-    pub(super) fn new(cx: &StreamCx<'a>, total: f64) -> Self {
+    /// 重みの和 `total` で始める（`send` が真なら `cx` のジョブに知らせる）。
+    pub(super) fn new(cx: &StreamCx<'a>, total: f64, send: bool) -> Self {
         Self {
             ctx: cx.ctx,
             total: total.max(1e-9),
             done: 0.0,
+            send,
             #[cfg(test)]
             engine: cx.engine,
         }
@@ -111,6 +114,9 @@ impl<'a> Passes<'a> {
 
     /// 今の回（重み `weight`）の進み `frac`（0〜1）を知らせる。
     fn report(&self, weight: f64, frac: f64, message: &str) {
+        if !self.send {
+            return;
+        }
         let p = (self.done + weight * frac.clamp(0.0, 1.0)) / self.total;
         self.ctx.progress(0.05 + 0.9 * p.clamp(0.0, 1.0), message);
     }
