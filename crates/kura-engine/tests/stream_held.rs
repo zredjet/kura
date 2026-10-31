@@ -17,6 +17,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use kura_engine::audio::digest::PcmTreeDigest;
 use kura_engine::codec::stream::stream_window_bytes;
@@ -33,6 +34,13 @@ use symphonia_core::units::{Duration, Timestamp};
 struct Counting;
 static CUR: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// 山は大域の数え手で測るので、このバイナリのテストは 1 本ずつ回す（並ぶと、ほかのテストの確保が山に混ざる）。
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn grow(n: usize) {
     let c = CUR.fetch_add(n, Ordering::Relaxed) + n;
@@ -553,6 +561,7 @@ fn m4a_with_tags(tags: &[([u8; 4], u32, Vec<u8>)]) -> Vec<u8> {
 /// 見積もりが、埋め込みの画像・タグ・箱・Vorbis の表で持つ量を下回らない（M13 段 2 の検証の直し）。
 #[test]
 fn stream_estimates_cover_what_readers_hold() {
+    let _serial = serial();
     let d = dir();
     let mib8 = 8usize << 20;
     let mut cases: Vec<(&str, PathBuf, &str)> = Vec::new();
@@ -673,6 +682,7 @@ fn stream_estimates_cover_what_readers_hold() {
 /// 4.5 MiB だった）。
 #[test]
 fn alac_largest_frames_fit_the_stream_estimate() {
+    let _serial = serial();
     const FRAMES: u32 = 65_536;
     const CH: u8 = 8;
     let mut cookie = FRAMES.to_be_bytes().to_vec();
