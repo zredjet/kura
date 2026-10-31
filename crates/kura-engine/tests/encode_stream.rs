@@ -26,9 +26,12 @@ use serde_json::json;
 
 const C: u64 = AUDIO_CHUNK as u64;
 
-/// 書き出しの組（形式・設定）。E3・E4 で FLAC・ogg を足す。
+/// 書き出しの組（形式・設定）。E4 で ogg を足す。
 fn targets() -> Vec<(&'static str, serde_json::Value)> {
     vec![
+        ("flac", json!({})),
+        ("flac", json!({ "bits": 8 })),
+        ("flac", json!({ "bits": 24 })),
         ("wav", json!({})),
         ("wav", json!({ "bits": 8 })),
         ("wav", json!({ "bits": 16 })),

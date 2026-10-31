@@ -19,10 +19,11 @@ use md5::{Digest as _, Md5};
 use serde_json::json;
 use symphonia_core::codecs::audio::AudioDecoder as _;
 
+use crate::audio::stream::{AudioProducer, ValueProducer};
 use crate::codec::held::{self, Held};
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
 use crate::codec::symph::{self, Container, Media};
-use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, pcm, try_vec};
+use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, WriteSeek, caps_of, pcm};
 use crate::determinism::{block_count, par_blocks};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -726,7 +727,7 @@ impl Encoder for FlacCodec {
     fn encode(
         &self,
         value: &Value,
-        _format: &str,
+        format: &str,
         opts: &serde_json::Value,
         out: &mut dyn Write,
         mon: &dyn Monitor,
@@ -736,24 +737,64 @@ impl Encoder for FlacCodec {
                 "FLAC には音声だけを書けます".into(),
             ));
         };
-        let (bits, _) = pcm::target(opts, a.meta.source, &[8, 16, 24], false, "FLAC")?;
+        // 値も流して書く口を通る（実装は 1 つ）。最後に STREAMINFO を直すのでメモリに書いてから写す（フレームを全部持つ
+        // のは前と同じ量）
+        let mut src = ValueProducer::new(a);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let n = self.encode_stream(&mut src, format, opts, &mut buf, mon)?;
+        out.write_all(buf.get_ref())?;
+        Ok(n)
+    }
+
+    fn streams(&self, format: &str) -> bool {
+        format == "flac"
+    }
+
+    /// 窓 1 つ（`stream::WINDOW_FRAMES` フレーム）の量子化した標本（i64）と書いたフレーム（入れ物の幅まで）、MD5 の作業列。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
+        let (channels, frames) = match shape {
+            Shape::Audio {
+                channels, frames, ..
+            } => (u64::from(*channels), frames.max()),
+            _ => (0, 0),
+        };
+        let window = frames.min(stream::WINDOW_FRAMES as u64);
+        window
+            .saturating_mul(channels)
+            .saturating_mul(8 + 4)
+            .saturating_add((BLOCK as u64).saturating_mul(channels).saturating_mul(4))
+            .saturating_add(1 << 20)
+    }
+
+    /// `fLaC` ＋ STREAMINFO（最小・最大のフレームの大きさと MD5 は仮の 0）＋ VORBIS_COMMENT を書き、窓ごとに `par_blocks` で
+    /// ブロック（4,096。チャンクの約数なので窓の境はブロックの境）のフレームを作って順に書き、MD5 も窓ごとに足す。最後に
+    /// STREAMINFO へ戻って直し、終わりへ戻る（値を書くときと同じバイト列）。
+    fn encode_stream(
+        &self,
+        src: &mut dyn AudioProducer,
+        _format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn WriteSeek,
+        mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        let info = src.info().clone();
+        let (bits, _) = pcm::target(opts, info.meta.source, &[8, 16, 24], false, "FLAC")?;
         let bps = u32::from(bits);
-        let nch = a.channels();
+        let nch = info.channels;
         if !(1..=8).contains(&nch) {
             return Err(EngineError::Unsupported(
                 "FLAC に書けるのは 1〜8 チャンネルです".into(),
             ));
         }
-        let rate = a.rate();
+        let rate = info.rate;
         if rate == 0 || rate > 655_350 {
             return Err(EngineError::Unsupported(
                 "このサンプルレートは FLAC に書けません".into(),
             ));
         }
-        let total = a.frames();
-        let total64 = total as u64;
+        let total64 = info.frames;
         // 総フレーム数 0 は FLAC では「不明」の意味で、フレームのない FLAC は読み直せない（flac も空の入力は書かない）
-        if total == 0 {
+        if total64 == 0 {
             return Err(EngineError::Unsupported(
                 "空の音声は FLAC に書けません".into(),
             ));
@@ -763,25 +804,136 @@ impl Encoder for FlacCodec {
                 "長すぎて FLAC に書けません".into(),
             ));
         }
-        // フレームは互いに独立なので並列に作り、番号の順に並べる（バイト列はスレッド数によらない）
-        let frames = par_blocks(block_count(total, BLOCK), mon, |b| {
-            let start = b * BLOCK;
-            let end = (start + BLOCK).min(total);
-            let mut win = try_vec(end - start, 0f32)?;
-            let mut xs: Vec<Vec<i64>> = Vec::with_capacity(nch);
-            for c in 0..nch {
-                a.read(c, start as u64, &mut win)?;
-                xs.push(win.iter().map(|s| pcm::quantize(*s, bits)).collect());
+        let comments = symph::vorbis_comments_for(&info.meta, total64);
+        let streaminfo = |min_fs: u32, max_fs: u32, md5: &[u8]| {
+            let mut si = Bits::new();
+            // 最小・最大のブロックは決まった大きさ（最後の短いブロックは数えない。libFLAC と同じ）
+            si.put(BLOCK as u64, 16);
+            si.put(BLOCK as u64, 16);
+            si.put(u64::from(min_fs), 24);
+            si.put(u64::from(max_fs), 24);
+            si.put(u64::from(rate), 20);
+            si.put((nch - 1) as u64, 3);
+            si.put(u64::from(bps - 1), 5);
+            si.put(total64, 36);
+            for b in md5 {
+                si.put(u64::from(*b), 8);
             }
-            Ok(frame(b as u64, &xs, rate, bps))
+            si.buf
+        };
+        let origin = out.stream_position()?;
+        let mut head = b"fLaC".to_vec();
+        meta_block(
+            comments.is_empty(),
+            0,
+            &streaminfo(0, 0, &[0u8; 16]),
+            &mut head,
+        )?;
+        if !comments.is_empty() {
+            meta_block(true, 4, &vorbis_comment_block(&comments), &mut head)?;
+        }
+        out.write_all(&head)?;
+        let mut sink = FlacSink {
+            out,
+            bits,
+            rate,
+            nch,
+            md5: Md5::new(),
+            min_fs: u32::MAX,
+            max_fs: 0,
+            next: 0,
+            written: 0,
+        };
+        src.produce(None, &mut sink, mon)?;
+        if sink.next != total64 {
+            return Err(EngineError::Internal(format!(
+                "流した長さが形と違います（{} / {total64}）",
+                sink.next
+            )));
+        }
+        let FlacSink {
+            out,
+            md5,
+            min_fs,
+            max_fs,
+            written,
+            ..
+        } = sink;
+        let digest = md5.finalize();
+        let si = streaminfo(
+            if min_fs == u32::MAX { 0 } else { min_fs },
+            max_fs,
+            digest.as_slice(),
+        );
+        // STREAMINFO の本体は fLaC（4）とブロックの頭（4）のあと
+        out.seek(std::io::SeekFrom::Start(origin + 8))?;
+        out.write_all(&si)?;
+        let end = origin + head.len() as u64 + written;
+        out.seek(std::io::SeekFrom::Start(end))?;
+        Ok(head.len() as u64 + written)
+    }
+}
+
+/// 流れの窓をフレームにして書く受け手（[`FlacCodec`] の `encode_stream`）。
+struct FlacSink<'o> {
+    out: &'o mut dyn WriteSeek,
+    bits: u16,
+    rate: u32,
+    nch: usize,
+    md5: Md5,
+    min_fs: u32,
+    max_fs: u32,
+    next: u64,
+    written: u64,
+}
+
+impl crate::audio::stream::AudioSink for FlacSink<'_> {
+    fn begin(&mut self, info: &crate::audio::stream::StreamInfo) -> Result<(), EngineError> {
+        if info.channels != self.nch {
+            return Err(EngineError::Internal(
+                "書く流れのチャンネルの数が違います".into(),
+            ));
+        }
+        self.next = 0;
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        if start != self.next || !start.is_multiple_of(BLOCK as u64) || planes.len() != self.nch {
+            return Err(EngineError::Internal(format!(
+                "書く流れの窓が続いていないかブロックに揃っていません（{start} から。次は {}）",
+                self.next
+            )));
+        }
+        let total = planes.first().map_or(0, |p| p.len());
+        let (bits, rate, bps) = (self.bits, self.rate, u32::from(self.bits));
+        let first = start / BLOCK as u64;
+        // フレームは互いに独立なので並列に作り、番号の順に並べる（バイト列はスレッド数・窓の切り方によらない）
+        let frames = par_blocks(block_count(total, BLOCK), mon, |b| {
+            let s = b * BLOCK;
+            let e = (s + BLOCK).min(total);
+            let xs: Vec<Vec<i64>> = planes
+                .iter()
+                .map(|p| p[s..e].iter().map(|v| pcm::quantize(*v, bits)).collect())
+                .collect();
+            Ok(frame(first + b as u64, &xs, rate, bps))
         })?;
+        for f in &frames {
+            self.out.write_all(f)?;
+            self.written += f.len() as u64;
+            let n = f.len() as u32;
+            self.min_fs = self.min_fs.min(n);
+            self.max_fs = self.max_fs.max(n);
+        }
+        drop(frames);
         // 標本の MD5（入れ物の幅のリトルエンディアンを、フレームの順・チャンネルの順に）
-        let mut md5 = Md5::new();
         let bytes = usize::from(bits / 8);
-        let mut buf = Vec::with_capacity(BLOCK * nch * bytes);
-        let mut win: Vec<Vec<f32>> = (0..nch)
-            .map(|_| try_vec(BLOCK.min(total), 0f32))
-            .collect::<Result<_, _>>()?;
+        let mut buf = Vec::with_capacity(BLOCK * self.nch * bytes);
         let mut i = 0usize;
         while i < total {
             if mon.canceled() {
@@ -789,48 +941,20 @@ impl Encoder for FlacCodec {
             }
             buf.clear();
             let end = (i + BLOCK).min(total);
-            for (c, w) in win.iter_mut().enumerate() {
-                a.read(c, i as u64, &mut w[..end - i])?;
-            }
-            for t in 0..end - i {
-                for w in &win {
-                    buf.extend_from_slice(&pcm::quantize(w[t], bits).to_le_bytes()[..bytes]);
+            for t in i..end {
+                for p in planes {
+                    buf.extend_from_slice(&pcm::quantize(p[t], bits).to_le_bytes()[..bytes]);
                 }
             }
-            md5.update(&buf);
+            self.md5.update(&buf);
             i = end;
         }
-        let digest = md5.finalize();
-        let (min_fs, max_fs) = frames.iter().fold((u32::MAX, 0u32), |(lo, hi), f| {
-            let n = f.len() as u32;
-            (lo.min(n), hi.max(n))
-        });
-        let mut si = Bits::new();
-        // 最小・最大のブロックは決まった大きさ（最後の短いブロックは数えない。libFLAC と同じ）
-        si.put(BLOCK as u64, 16);
-        si.put(BLOCK as u64, 16);
-        si.put(u64::from(if min_fs == u32::MAX { 0 } else { min_fs }), 24);
-        si.put(u64::from(max_fs), 24);
-        si.put(u64::from(rate), 20);
-        si.put((nch - 1) as u64, 3);
-        si.put(u64::from(bps - 1), 5);
-        si.put(total64, 36);
-        for b in digest.iter() {
-            si.put(u64::from(*b), 8);
-        }
-        let comments = symph::vorbis_comments_for(&a.meta, total64);
-        let mut head = b"fLaC".to_vec();
-        meta_block(comments.is_empty(), 0, &si.buf, &mut head)?;
-        if !comments.is_empty() {
-            meta_block(true, 4, &vorbis_comment_block(&comments), &mut head)?;
-        }
-        out.write_all(&head)?;
-        let mut written = head.len() as u64;
-        for f in &frames {
-            out.write_all(f)?;
-            written += f.len() as u64;
-        }
-        Ok(written)
+        self.next += total as u64;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), EngineError> {
+        Ok(())
     }
 }
 
