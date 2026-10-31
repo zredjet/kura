@@ -413,6 +413,11 @@ export class EditorPlayer {
     return this.plan?.loop != null;
   }
 
+  /** 試聴しているループの区間（鳴らしている音のフレーム。していなければ null）。 */
+  get loop(): FrameSpan | null {
+    return this.plan?.loop ?? null;
+  }
+
   /** 鳴らしている文脈（テスト・自己点検）。 */
   get context(): ContextLike | null {
     return this.ctx;

@@ -20,7 +20,7 @@ import { fakeFactory } from '../../../test/fakeAudio';
 import { type AudioRuntime, setAudioRuntimeForTest } from '../../asset/audioRuntime';
 import { playerController } from '../../player/playerActions';
 import { usePlayerStore } from '../../player/playerStore';
-import { closeEditor, openEditorAs, pushEditorSteps } from '../editorStore';
+import { closeEditor, editorUndo, openEditorAs, pushEditorSteps } from '../editorStore';
 import {
   AUDIO_ADAPTER,
   audioController,
@@ -30,9 +30,17 @@ import {
   setAudioIoForTest,
   setAudioLocal,
   setSelection,
+  toggleLoopAudition,
   togglePlay,
   useAudioStore,
 } from './audioStore';
+import {
+  clearLoop,
+  selectAudioTool,
+  selectionToLoop,
+  setInOut,
+  setLoop as setLoopFromField,
+} from './audioTools';
 import { CHUNK } from './pcmChunks';
 import { audioView, type AudioViewOver, fakeFetch, pcmBytes } from './testAudioView';
 import { WAVE_IDLE_MS } from './waveController';
@@ -327,6 +335,59 @@ describe('編集中の試聴と排他', () => {
     expect(useAudioStore.getState().play.status).toBe('idle');
     expect(useAudioStore.getState().cursor).toBeGreaterThan(0);
     expect(runtime.pool.isHeld(48_000)).toBe(false);
+  });
+
+  it('ループの試聴は、欄・I/O・［選択をループにする］・⌘Z で替わったループ点に従い、消したら止まる', async () => {
+    await open(view({ loop: { start: 1000, end: 2000 } }));
+    toggleLoopAudition();
+    const player = audioPlayer();
+    expect(player?.loop).toEqual({ start: 1000, end: 2000 });
+    expect(useAudioStore.getState().play).toEqual({ status: 'playing', mode: 'loop' });
+    const answer = async (
+      action: () => void,
+      loop: { start: number; end: number } | null,
+      rev: number,
+    ) => {
+      vi.mocked(stepEdit).mockResolvedValueOnce(result(view({ rev, loop })));
+      action();
+      await flush();
+    };
+    // 時刻の欄（merge）
+    await answer(() => setLoopFromField({ start: 3000, end: 4000 }), { start: 3000, end: 4000 }, 2);
+    expect(player?.loop).toEqual({ start: 3000, end: 4000 });
+    // ⌘Z
+    await answer(editorUndo, { start: 5000, end: 6000 }, 3);
+    expect(player?.loop).toEqual({ start: 5000, end: 6000 });
+    // ［選択をループにする］
+    setSelection({ start: 7000, end: 9000 });
+    await answer(selectionToLoop, { start: 7000, end: 9000 }, 4);
+    expect(player?.loop).toEqual({ start: 7000, end: 9000 });
+    // I/O（ループの道具）
+    selectAudioTool('loop');
+    await answer(() => setInOut('out'), { start: 7000, end: 8000 }, 5);
+    expect(player?.loop).toEqual({ start: 7000, end: 8000 });
+    expect(player?.playing).toBe(true);
+    // ［ループ点を消す］：試聴を止める
+    await answer(clearLoop, null, 6);
+    expect(player?.playing).toBe(false);
+    expect(useAudioStore.getState().play.status).toBe('idle');
+  });
+
+  it('ループの試聴：断られた手のあとは、ドラッグの手元の値をやめて文書のループ点で鳴らす', async () => {
+    await open(view({ loop: { start: 1000, end: 2000 } }));
+    toggleLoopAudition();
+    const player = audioPlayer();
+    setAudioLocal({ loop: { start: 1200, end: 1800 } });
+    player?.setLoop({ start: 1200, end: 1800 });
+    expect(player?.loop).toEqual({ start: 1200, end: 1800 });
+    vi.mocked(stepEdit).mockResolvedValueOnce(
+      result(view({ loop: { start: 1000, end: 2000 } }), {
+        rejected: { index: 0, problem: { code: 'Invalid', message: '写せません', issues: [] } },
+      }),
+    );
+    pushEditorSteps([{ type: 'commitPreview', mode: 'step' }]);
+    await flush();
+    expect(player?.loop).toEqual({ start: 1000, end: 2000 });
   });
 
   it('選択があれば選択の始めから終わりまで鳴らす', async () => {

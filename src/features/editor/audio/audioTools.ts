@@ -23,6 +23,7 @@ import {
   audioPlayhead,
   cancelTrim,
   endTrim,
+  followLoopAudition,
   lastNodeOf,
   openedAudio,
   overlayOf,
@@ -280,6 +281,8 @@ async function finishLoop(d: Extract<Drag, { kind: 'loop' }>, canceled: boolean)
   if (canceled || span.end <= span.start) {
     send(dragSteps(loopHandle(span), d.node, 'cancel'));
     setAudioLocal(null);
+    // 試聴していれば、ドラッグの途中に替えた区間をやめて文書のループ点に戻す
+    followLoopAudition();
     return;
   }
   let next = span;

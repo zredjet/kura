@@ -532,6 +532,8 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       const patch = rt.patch;
       rt.patch = {};
       if (Object.keys(patch).length > 0) useAudioStore.setState(patch);
+      // ループの試聴は、結果で替わったループ点（と、手元の値をやめた文書の値）で鳴らす
+      followLoop(rt);
     },
     beforeSteps() {
       if (useAudioStore.getState().trim) cancelTrim();
@@ -611,6 +613,20 @@ function startPlayback(
   useAudioStore.setState({ play: { status: 'playing', mode: o.mode } });
 }
 
+/** 出力の区間の終わり（含まない位置）を鳴らす音の位置にする（元なら最後のフレームを写して 1 足す）。 */
+function toPlayEnd(s: AudioEditorState, ab: PlaySource, end: number): number | null {
+  if (ab === 'edited') return end;
+  const last = toPlayPos(s, ab, Math.max(0, end - 1));
+  return last === null ? null : last + 1;
+}
+
+/** 出力のループの区間を鳴らす音の区間にする（写せなければ null）。 */
+function toPlayLoop(s: AudioEditorState, ab: PlaySource, loop: FrameSpan): FrameSpan | null {
+  const a = toPlayPos(s, ab, loop.start);
+  const b = toPlayEnd(s, ab, loop.end);
+  return a === null || b === null ? null : { start: a, end: b };
+}
+
 /** 鳴らす頼み（元なら位置・止める所・ループを写す。写せなければ null）。 */
 function requestFor(
   s: AudioEditorState,
@@ -621,20 +637,43 @@ function requestFor(
   if (!info) return null;
   const from = toPlayPos(s, ab, o.from);
   if (from === null) return null;
-  const mapEnd = (end: number) => {
-    if (ab === 'edited') return end;
-    const last = toPlayPos(s, ab, Math.max(0, end - 1));
-    return last === null ? null : last + 1;
-  };
-  const end = o.end == null ? null : mapEnd(o.end);
+  const end = o.end == null ? null : toPlayEnd(s, ab, o.end);
   let loop: FrameSpan | null = null;
   if (o.loop) {
-    const a = toPlayPos(s, ab, o.loop.start);
-    const b = mapEnd(o.loop.end);
-    if (a === null || b === null) return null;
-    loop = { start: a, end: b };
+    loop = toPlayLoop(s, ab, o.loop);
+    if (!loop) return null;
   }
   return { from, end, loop, source: ab, info };
+}
+
+/**
+ * ループの試聴を表示のループ点に合わせる（時刻の欄・I/O・［選択をループにする］・⌘Z・引数パネル・旗のドラッグの取り消し・
+ * 断られた手で替わったとき。結果を受け終えるたびと、旗のドラッグを終えたときに呼ぶ）。旗をドラッグしている間（手元の値が
+ * ある間）は手元の値で鳴らすので何もしない。ループ点がなくなった・元へ写せなければ止める。
+ */
+function followLoop(rt: AudioRuntime): void {
+  const player = rt.player;
+  if (!player.playing || !player.looping || rt.dragging) return;
+  const s = useAudioStore.getState();
+  if (s.local && 'loop' in s.local) return;
+  const loop = s.view?.loop ?? null;
+  if (!loop || loop.end <= loop.start) {
+    stopPlayback();
+    return;
+  }
+  const mapped = toPlayLoop(s, player.source ?? 'edited', loop);
+  if (!mapped) {
+    stopPlayback();
+    notify(t.abUnavailable);
+    return;
+  }
+  player.setLoop(mapped);
+}
+
+/** ループの試聴を表示のループ点に合わせる（旗のドラッグを終えた・やめたとき。`followLoop`）。 */
+export function followLoopAudition(): void {
+  const rt = live();
+  if (rt) followLoop(rt);
 }
 
 /** 形が変わった（レート・長さ）：元を通して位置を写し、止めてから始め直す。 */

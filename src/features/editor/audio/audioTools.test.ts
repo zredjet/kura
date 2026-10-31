@@ -24,9 +24,11 @@ import { closeEditor, openEditorAs, useEditorStore } from '../editorStore';
 import {
   AUDIO_ADAPTER,
   audioController,
+  audioPlayer,
   setAudioIoForTest,
   setCursor,
   setSelection,
+  toggleLoopAudition,
   useAudioStore,
 } from './audioStore';
 import {
@@ -291,6 +293,33 @@ describe('フェード・ループのドラッグ', () => {
       },
       { type: 'commitPreview', mode: 'step' },
     ]);
+  });
+
+  it('ループを試聴しながら旗のドラッグを esc でやめたら、試聴も文書のループ点に戻す', async () => {
+    const loop = { start: 1000, end: 4000 };
+    await open(view({ loop }));
+    // 仮の値は仮の結果、やめたら文書の値
+    vi.mocked(stepEdit).mockImplementation(async (_s, steps) => {
+      const preview = steps.find((q) => q.type === 'handle');
+      return preview?.type === 'handle' && preview.handle.type === 'loop'
+        ? {
+            ...result(view({ rev: 2, loop: preview.handle.range })),
+            status: { ...result(view()).status, rev: 2, provisional: true },
+          }
+        : result(view({ loop }));
+    });
+    selectAudioTool('loop');
+    toggleLoopAudition();
+    const player = audioPlayer();
+    expect(player?.loop).toEqual(loop);
+    AUDIO_POINTER.down({ shiftKey: false }, xOf(4000), 5);
+    AUDIO_POINTER.move({ shiftKey: false }, xOf(6000), 5);
+    await flush();
+    expect(player?.loop).toEqual({ start: 1000, end: 6000 });
+    AUDIO_POINTER.up({ shiftKey: false }, xOf(6000), 5, true);
+    await flush();
+    expect(player?.loop).toEqual({ start: 1000, end: 4000 });
+    expect(useAudioStore.getState().local).toBeNull();
   });
 
   it('吸着がオフなら寄せない・動かさずに離したら何も送らない', async () => {
