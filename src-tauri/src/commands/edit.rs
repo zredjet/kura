@@ -1057,6 +1057,8 @@ impl From<EditorError> for AppError {
             EditorError::Conflict(_) | EditorError::Mismatch(_) | EditorError::Canceled => {
                 AppErrorCode::Conflict
             }
+            // 保存する形式をこの環境で書けない（M13 段 3。フロントは形式を選ぶシートを出す）
+            EditorError::FormatUnavailable { .. } => AppErrorCode::FormatUnavailable,
             EditorError::Core(_) => AppErrorCode::Internal,
         };
         match err {
@@ -1607,6 +1609,13 @@ mod tests {
                 AppErrorCode::Invalid,
             ),
             (EditorError::Mismatch("x".into()), AppErrorCode::Conflict),
+            (
+                EditorError::FormatUnavailable {
+                    format: "mp3".into(),
+                    fallback: Some("ogg".into()),
+                },
+                AppErrorCode::FormatUnavailable,
+            ),
             (
                 EditorError::Core(kura_core::CoreError::NotFound("x".into())),
                 AppErrorCode::NotFound,

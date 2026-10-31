@@ -711,6 +711,84 @@ struct Decided<'a> {
     codecs: Arc<kura_engine::codec::CodecSet>,
 }
 
+/// 保存する形式の問題（[`save_format`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatProblem {
+    /// この環境では書けない（MP3 で ffmpeg がない、など）。`fallback` は代わりの既定（音声は Ogg Vorbis、書けなければ WAV）。
+    Unavailable {
+        format: String,
+        fallback: Option<String>,
+    },
+}
+
+/// 文書の出力の形式の選び `choice`（`Keep` は元の形式 `source_format`）で、出力の形 `out_shape` を書く形式と設定（M13 段 3。
+/// docs/editing.md §14）。書き手がなければ [`FormatProblem::Unavailable`]（代わりは音声なら Ogg Vorbis（書けるとき）、
+/// なければ WAV、画像なら PNG）。エディタの保存が積む前に確かめる（積んだあとに書き手が消えたら、ジョブが `Unsupported`）。
+pub fn save_format(
+    codecs: &kura_engine::codec::CodecSet,
+    choice: &FormatChoice,
+    source_format: &str,
+    out_shape: &Shape,
+) -> std::result::Result<(String, serde_json::Value), FormatProblem> {
+    let (format, opts) = match choice {
+        FormatChoice::To { format, options } => (
+            format.clone(),
+            if options.is_null() {
+                json!({})
+            } else {
+                options.clone()
+            },
+        ),
+        FormatChoice::Keep => (source_format.to_string(), json!({})),
+    };
+    if codecs.encoder(&format, out_shape).is_some() {
+        return Ok((format, opts));
+    }
+    let fallback = match out_shape {
+        Shape::Audio { .. } => ["ogg", "wav"]
+            .into_iter()
+            .find(|f| codecs.encoder(f, out_shape).is_some()),
+        _ => ["png"]
+            .into_iter()
+            .find(|f| codecs.encoder(f, out_shape).is_some()),
+    }
+    .map(str::to_string);
+    Err(FormatProblem::Unavailable { format, fallback })
+}
+
+/// 書ける形式 1 つ（[`writable_formats`]）：形式・既定の書き手・段・バイト列の再現を約束するか。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WritableFormat {
+    pub format: String,
+    pub codec: String,
+    pub tier: Tier,
+    pub reproducible: bool,
+}
+
+/// 種類 `kind` のアイテムの形 `shape` の値を書ける形式の一覧（形式の表の順。M13 段 3。段 6 の形式を選ぶシートが使う）：
+/// `CodecSet::capabilities` のうち、その種類の形式で、段の順で最初にこの形を書ける書き手があるもの。
+pub fn writable_formats(
+    codecs: &kura_engine::codec::CodecSet,
+    kind: MediaKind,
+    shape: &Shape,
+) -> Vec<WritableFormat> {
+    codecs
+        .capabilities()
+        .into_iter()
+        .filter(|c| MediaKind::from(c.item_kind) == kind)
+        .filter_map(|c| {
+            let e = codecs.encoder(c.format, shape)?;
+            Some(WritableFormat {
+                format: c.format.to_string(),
+                codec: e.id().to_string(),
+                tier: e.tier(),
+                reproducible: e.reproducible(),
+            })
+        })
+        .collect()
+}
+
 /// 予告のトランザクションで決めたこと。
 #[derive(Debug, Clone)]
 struct Go {
@@ -985,7 +1063,7 @@ impl EditHandler {
                 .ok_or_else(|| CoreError::Invalid("文書に出力がありません".into()))?;
             if codecs.encoder(&out_format, &out_shape).is_none() {
                 return Err(CoreError::Unsupported(format!(
-                    "この結果は {out_format} に書けません"
+                    "この結果は {out_format} に書けません（保存する形式を選び直してください。音声の既定は Ogg Vorbis）"
                 )));
             }
             let may_anchor = may_make_anchor && matches!(how, read::Reading::Any { .. });

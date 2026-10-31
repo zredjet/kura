@@ -571,3 +571,90 @@ fn unverified_lent_input_that_does_not_match_is_not_used() {
     env.engine.withdraw_input("editor-2");
     assert_consistent(&env.lib);
 }
+
+/// S22：mp3 の元を「元の形式のまま」で保存しようとしても、ffmpeg がない組では書けない（`save_format` が
+/// `Unavailable{fallback: "ogg"}`。エディタの保存はこれで `FormatUnavailable` を返し、積まない）。書ける組なら通る。積んだ
+/// あとに書き手が消えた（ffmpeg がない組でジョブが動いた）ら、ジョブは `Unsupported`（「保存する形式を選び直してください」）。
+/// 書ける形式の一覧は、その種類の形式で書き手のあるものだけ。
+#[test]
+fn s22_mp3_without_ffmpeg_needs_another_format() {
+    use super::save::{FormatProblem, WritableFormat, save_format, writable_formats};
+    use crate::import::MediaKind;
+    use kura_engine::Shape;
+    let shape = Shape::Audio {
+        rate: 44_100,
+        channels: 2,
+        frames: kura_engine::Dim::Exact(1_000),
+    };
+    let pinned = CodecSet::pinned();
+    assert_eq!(
+        save_format(&pinned, &FormatChoice::Keep, "mp3", &shape),
+        Err(FormatProblem::Unavailable {
+            format: "mp3".into(),
+            fallback: Some("ogg".into()),
+        })
+    );
+    assert_eq!(
+        save_format(
+            &pinned,
+            &FormatChoice::To {
+                format: "flac".into(),
+                options: json!({ "bits": 24 }),
+            },
+            "mp3",
+            &shape,
+        ),
+        Ok(("flac".into(), json!({ "bits": 24 })))
+    );
+    // Ogg Vorbis に書けない形（9 チャンネル）の代わりは WAV
+    let nine = Shape::Audio {
+        rate: 44_100,
+        channels: 9,
+        frames: kura_engine::Dim::Exact(1_000),
+    };
+    assert_eq!(
+        save_format(&pinned, &FormatChoice::Keep, "mp3", &nine),
+        Err(FormatProblem::Unavailable {
+            format: "mp3".into(),
+            fallback: Some("wav".into()),
+        })
+    );
+    let tools = FakeTools::new("exit 1", "exit 1", "cksum > \"$out\"");
+    let with_mp3 = save_codecs(&tools);
+    assert!(save_format(&with_mp3, &FormatChoice::Keep, "mp3", &shape).is_ok());
+    let formats: Vec<String> = writable_formats(&pinned, MediaKind::Audio, &shape)
+        .into_iter()
+        .map(|w: WritableFormat| w.format)
+        .collect();
+    assert_eq!(formats, ["wav", "aiff", "flac", "ogg"]);
+    let with: Vec<String> = writable_formats(&with_mp3, MediaKind::Audio, &shape)
+        .into_iter()
+        .map(|w| w.format)
+        .collect();
+    assert!(with.contains(&"mp3".to_string()) && with.contains(&"m4a".to_string()));
+
+    // 積んだあとに書き手がない：ジョブは Unsupported（何も変えない）
+    let env = Env::new();
+    let mp3 = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kura-engine/fixtures/mp3-lame.mp3"),
+    )
+    .unwrap();
+    let (item, _) = add_audio(&env.lib, &mp3, "mp3", "mp3 の声");
+    let record = env.overwrite(item, audio_doc(-1.0, None));
+    assert_eq!(record.state, JobState::Failed, "{:?}", record.message);
+    assert_eq!(record.error_code.as_deref(), Some("Unsupported"));
+    assert!(
+        record
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("選び直して")),
+        "{:?}",
+        record.message
+    );
+    assert_eq!(versions_of(&env.lib, item).len(), 0);
+    // 形式を選び直せば（ogg）保存できる
+    assert_done(&env.overwrite(item, audio_doc(-1.0, Some("ogg"))));
+    assert_eq!(head(&env.lib, item).ext, "ogg");
+    assert_consistent(&env.lib);
+}

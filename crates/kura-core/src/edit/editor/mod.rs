@@ -129,8 +129,25 @@ pub enum EditorError {
     /// 読めない・描けない。
     #[error("{0}")]
     Failed(String),
+    /// 文書の出力の形式をこの環境では書けない（MP3 で ffmpeg がない、など。M13 段 3）。`fallback` は代わりの既定（音声は
+    /// Ogg Vorbis）。保存を積む前に断る（保存する形式を選び直す）。
+    #[error("{}", format_unavailable_message(.format, .fallback.as_deref()))]
+    FormatUnavailable {
+        format: String,
+        fallback: Option<String>,
+    },
     #[error(transparent)]
     Core(#[from] CoreError),
+}
+
+/// [`EditorError::FormatUnavailable`] の文。
+fn format_unavailable_message(format: &str, fallback: Option<&str>) -> String {
+    match fallback {
+        Some(f) => format!(
+            "この環境では {format} に書けません。保存する形式を選び直してください（既定は {f}）"
+        ),
+        None => format!("この環境では {format} に書けません。保存する形式を選び直してください"),
+    }
 }
 
 impl EditorError {
@@ -165,7 +182,9 @@ impl EditorError {
             Self::Conflict(_) | Self::Mismatch(_) | Self::Canceled | Self::NoSession => {
                 ProblemCode::Conflict
             }
-            Self::Unavailable(_) | Self::Core(_) => ProblemCode::Failed,
+            Self::Unavailable(_) | Self::Core(_) | Self::FormatUnavailable { .. } => {
+                ProblemCode::Failed
+            }
         };
         let issues = match self {
             Self::Invalid { issues, .. } => issues.clone(),
@@ -1373,6 +1392,26 @@ pub fn save(
                 .runtime
                 .preview(|e| commit_checked(e, st, edit, CommitMode::Step))
                 .map_err(|e| EditorError::from_engine("出力の形式を変えられません", e))?;
+        }
+    }
+    if !revert {
+        // 文書の出力の形式をこの環境で書けるか（MP3 で ffmpeg がない、など）を積む前に確かめる（M13 段 3）
+        let graph = st.session.head().to_graph();
+        let source = env
+            .library
+            .db()
+            .read(|c| crate::edit::versions::original(c, editor.item_id))?
+            .and_then(|o| format_id(&o.ext));
+        let plan = editor.runtime.preview(|e| e.compile(&graph, &st.shapes));
+        if let (Some(source), Ok(plan), Some(out)) = (
+            source,
+            plan,
+            graph.outputs.first().map(|o| o.format.clone()),
+        ) && let Some((_, shape)) = plan.output_shapes().first()
+            && let Err(crate::edit::save::FormatProblem::Unavailable { format, fallback }) =
+                crate::edit::save::save_format(&editor.codecs, &out, source, shape)
+        {
+            return Err(EditorError::FormatUnavailable { format, fallback });
         }
     }
     let rev = st.session.head_rev();

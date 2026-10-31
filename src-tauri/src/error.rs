@@ -33,6 +33,9 @@ pub enum AppErrorCode {
     TooLarge,
     /// 混んでいる（メモリの予算が空いていない。少し待ってやり直せば通りうる。M11）。
     Busy,
+    /// 保存する形式（文書の出力の形式）をこの環境では書けない（MP3 で ffmpeg がない、など。保存を積む前に断った。M13 段 3）。
+    /// 保存する形式を選び直す（音声の既定は Ogg Vorbis）。
+    FormatUnavailable,
 }
 
 /// コマンドが返すエラー。JSON では `{ code, message }` になる。
