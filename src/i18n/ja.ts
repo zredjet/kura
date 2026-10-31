@@ -1102,11 +1102,14 @@ export const ja = {
     // ===== 形式を選ぶシート（保存が FormatUnavailable で断られたとき。画像と音声で共通。M13） =====
     formatUnavailableTitle: (fmt: string) => `${fmt} では保存できません`,
     formatUnavailableTitleAny: 'この形式では保存できません',
-    /** 書くのに ffmpeg が要る形式（MP3）。 */
+    /** 書き手の道具（ffmpeg）がない（MP3。Rust の `missingTool`）。 */
     formatUnavailableBody: (fmt: string) =>
       `ffmpeg が見つからないので ${fmt} に書けません。保存する形式を選んでください（設定の外部ツールで ffmpeg を指定すると ${fmt} で保存できます）`,
     formatUnavailableBodyOther: (fmt: string) =>
       `この環境では ${fmt} に書けません。保存する形式を選んでください`,
+    /** 書き手はあるが、今の音声の出力の形（サンプルレート・チャンネル数など）をその形式で書けない（96 kHz の MP3 など）。 */
+    formatUnavailableBodyShape: (fmt: string) =>
+      `今の出力（サンプルレート・チャンネル数など）は ${fmt} では書けません。保存する形式を選んでください`,
     formatUnavailableBodyAny: 'この環境ではこの形式に書けません。保存する形式を選んでください',
     formatChoose: '保存する形式',
     needsFfmpeg: 'ffmpeg が要ります',

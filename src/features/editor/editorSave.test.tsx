@@ -618,6 +618,31 @@ describe('書けない形式（FormatUnavailable）', () => {
     expect(useEditorStore.getState().save).toMatchObject({ mode: 'saveAs', title: '写し' });
   });
 
+  it('MP3 に書けない理由が形（96 kHz・3 チャンネル以上など）なら、ffmpeg の案内を出さずに形の理由を言う', async () => {
+    // ffmpeg はある（MP3 の書き手は組にある）が、今の出力の形が MP3 で書けない
+    await openAudioDirty({ ext: 'mp3' });
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS.map((r) => (r.format === 'mp3' ? { ...r, missingTool: null } : r)),
+      current: 'mp3',
+      fallback: 'ogg',
+    });
+    render(<EditorSheets />);
+    requestSave();
+    await flush();
+    expect(
+      screen.getByRole('heading', { name: t.formatUnavailableTitle('MP3') }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(t.formatUnavailableBodyShape('MP3'))).toBeInTheDocument();
+    expect(screen.queryByText(t.formatUnavailableBody('MP3'))).toBeNull();
+    expect(screen.getByRole('radio', { name: /MP3/ })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: /MP3/ })).toHaveAccessibleName(
+      `MP3 ${t.formatNotWritable}`,
+    );
+    expect(screen.queryByText(t.needsFfmpeg)).toBeNull();
+    expect(screen.getByRole('radio', { name: /Ogg Vorbis/ })).toBeChecked();
+  });
+
   it('閉じる前の保存：［キャンセル］なら閉じない、［保存］なら選んだ形式で保存し終えてから閉じる', async () => {
     await openAudioDirty({ ext: 'mp3' });
     vi.mocked(listEditFormats).mockResolvedValue({

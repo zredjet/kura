@@ -32,7 +32,7 @@ import {
 } from './editorStore';
 import styles from './Editor.module.css';
 import { outputChoice } from './formats';
-import { formatsFor } from './kindTraits';
+import { type EditorKind, formatsFor } from './kindTraits';
 import { opName } from './opsCatalog';
 import { issueText } from './ParamFields';
 
@@ -341,8 +341,26 @@ function FailedSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'saveFaile
 }
 
 /**
+ * 書けなかった理由の文：道具がない（Rust の `missingTool`。今は MP3 の ffmpeg だけ）なら ffmpeg の案内、音声で道具はあるなら
+ * 出力の形（サンプルレート・チャンネル数など）が理由、ほかは「この環境では書けません」。形式の表（`needsFfmpeg`）では決めない
+ * （ffmpeg があっても 96 kHz の MP3 は書けない）。
+ */
+function formatUnavailableBody(
+  sheet: Extract<EditorSheet, { kind: 'format' }>,
+  kind: EditorKind | null,
+): string {
+  if (!sheet.unavailable) return t.formatUnavailableBodyAny;
+  const name = formatName(sheet.unavailable);
+  const row = sheet.formats.find((r) => r.format === sheet.unavailable);
+  if (row?.missingTool) return t.formatUnavailableBody(name);
+  if (kind === 'audio' && row && !row.available) return t.formatUnavailableBodyShape(name);
+  return t.formatUnavailableBodyOther(name);
+}
+
+/**
  * 保存が書けない形式で断られたとき（M13）：「MP3 では保存できません」と理由、書ける形式の選択（既定は代わりの既定。
- * 書けない形式は押せず、ffmpeg が要るものはそう添える）、選んだ形式で失うもの（種類の部品）。［保存］で選んだ形式で積み直す。
+ * 書けない形式は押せず、道具（ffmpeg）がないものはそう添える）、選んだ形式で失うもの（種類の部品）。［保存］で選んだ形式で
+ * 積み直す。
  */
 function FormatSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'format' }> }) {
   const item = useEditorStore((s) => s.item);
@@ -355,12 +373,7 @@ function FormatSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'format' }
   const selected = choices.find((c) => c.format === chosen && c.available) ?? null;
   const FormatLosses = editorKindModule(kind)?.ui.FormatLosses;
   const name = sheet.unavailable ? formatName(sheet.unavailable) : null;
-  const body =
-    name === null
-      ? t.formatUnavailableBodyAny
-      : table?.needsFfmpeg(sheet.unavailable)
-        ? t.formatUnavailableBody(name)
-        : t.formatUnavailableBodyOther(name);
+  const body = formatUnavailableBody(sheet, kind);
   return (
     <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
       <h2 id={titleId} className={styles.sheetTitle}>
@@ -388,7 +401,7 @@ function FormatSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'format' }
               <>
                 {' '}
                 <span className={styles.formatChoiceNote}>
-                  {table?.needsFfmpeg(c.format) ? t.needsFfmpeg : t.formatNotWritable}
+                  {c.missingTool ? t.needsFfmpeg : t.formatNotWritable}
                 </span>
               </>
             )}
