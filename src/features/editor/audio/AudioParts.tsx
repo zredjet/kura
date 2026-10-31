@@ -3,6 +3,7 @@ import { useMemo } from 'react';
 import { MinusIcon } from '../../../components/icons/MinusIcon';
 import { PlusIcon } from '../../../components/icons/PlusIcon';
 import { ja } from '../../../i18n/ja';
+import type { EditWritableFormatDto } from '../../../ipc/edit';
 import { formatCount } from '../../../lib/format';
 import { channelsText, khz } from '../../asset/describe';
 import editorStyles from '../Editor.module.css';
@@ -10,7 +11,7 @@ import { useEditorStore } from '../editorStore';
 import { FormatOutputRow, OpsPanel, type ParamTime } from '../OpsPanel';
 import { outputChoice } from '../formats';
 import styles from './Audio.module.css';
-import { AUDIO_FORMATS, capsOf, lossesFor, type AudioLoss } from './audioFormats';
+import { AUDIO_FORMATS, type AudioCaps, capsOf, lossesFor, type AudioLoss } from './audioFormats';
 import { audioZoom, useAudioStore } from './audioStore';
 import { LoudnessSection } from './LoudnessSection';
 import { timeText } from './timeText';
@@ -136,20 +137,18 @@ function lossText(loss: AudioLoss, format: string): string {
   }
 }
 
-/** 出力の形式の下の、保存で失うものの一覧（12px tertiary の箇条）。 */
-export function LossList() {
-  const outputs = useEditorStore((s) => s.doc.outputs);
-  const item = useEditorStore((s) => s.item);
+/** 書けるもの `caps` の形式に保存したときに失うもの（今の出力のループ・マーカーと元のビット数から）。 */
+function useLosses(caps: AudioCaps | null): AudioLoss[] {
   const loop = useAudioStore((s) => s.view?.loop ?? null);
   const markers = useAudioStore((s) => s.view?.markers);
   const bits = useAudioStore((s) => s.source?.bits ?? null);
-  const eff = AUDIO_FORMATS.effectiveFormat(
-    outputChoice(outputs),
-    AUDIO_FORMATS.formatOfExt(item?.ext),
-  );
-  const losses = lossesFor(capsOf(eff.format), { loop, markers: markers ?? [], bits });
+  return lossesFor(caps, { loop, markers: markers ?? [], bits });
+}
+
+/** 失うものの箇条（12px tertiary）。なければ出さない。 */
+function LossItems({ losses, format }: { losses: AudioLoss[]; format: string }) {
   if (losses.length === 0) return null;
-  const name = ja.editor.formats[eff.format] ?? eff.format.toUpperCase();
+  const name = ja.editor.formats[format] ?? format.toUpperCase();
   return (
     <ul className={styles.losses} aria-label={t.losses}>
       {losses.map((l) => (
@@ -157,6 +156,22 @@ export function LossList() {
       ))}
     </ul>
   );
+}
+
+/** 出力の形式の下の、保存で失うものの一覧。 */
+export function LossList() {
+  const outputs = useEditorStore((s) => s.doc.outputs);
+  const item = useEditorStore((s) => s.item);
+  const eff = AUDIO_FORMATS.effectiveFormat(
+    outputChoice(outputs),
+    AUDIO_FORMATS.formatOfExt(item?.ext),
+  );
+  return <LossItems losses={useLosses(capsOf(eff.format))} format={eff.format} />;
+}
+
+/** 形式を選ぶシートで、選んだ形式で失うもの（保存できるものは Rust の `edit_formats` の値）。 */
+export function FormatLosses({ format }: { format: EditWritableFormatDto }) {
+  return <LossItems losses={useLosses(format)} format={format.format} />;
 }
 
 /** 右パネルの「操作」（標本の引数は時間の欄。ラウドネス・出力の形式・失うもの）。 */

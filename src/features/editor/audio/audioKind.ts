@@ -4,7 +4,14 @@
  */
 
 import type { EditorKindModule } from '../editorKinds';
-import { AudioCapsule, AudioMeta, AudioOps, AudioStatus, AudioTopTools } from './AudioParts';
+import {
+  AudioCapsule,
+  AudioMeta,
+  AudioOps,
+  AudioStatus,
+  AudioTopTools,
+  FormatLosses,
+} from './AudioParts';
 import { AUDIO_KEYS } from './audioKeys';
 import { AUDIO_ADAPTER } from './audioStore';
 import { WaveStage } from './WaveStage';
@@ -18,6 +25,7 @@ export const AUDIO_EDITOR: EditorKindModule = {
     Capsule: AudioCapsule,
     Status: AudioStatus,
     Ops: AudioOps,
+    FormatLosses,
   },
   keys: AUDIO_KEYS,
 };

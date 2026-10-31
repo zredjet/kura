@@ -4,8 +4,9 @@
  * - 形式の ID・拡張子（先頭が代表）・書ける印（可逆・高いビット・ループ点・マーカー）は、エンジンの形式の表
  *   （`crates/kura-engine/src/codec/formats.rs` の音声の行の `MetaCaps`）と同じ。bindings に形式の表の定数がないので、
  *   エディタが使う音声の行だけをここに写す。
- * - 保存で書ける形式は wav・aiff・flac・ogg（Vorbis）・mp3（ffmpeg）・m4a（ffmpeg）。元の形式に書けないときは
- *   Ogg Vorbis（利用者の決定）。ffmpeg がないときに書けない形式は、段 4C の `edit_formats` が来たら差し替える。
+ * - 保存で書ける形式は wav・aiff・flac・ogg（Vorbis）・mp3（ffmpeg）・m4a（OS の AAC）。元の形式に書けないときは
+ *   Ogg Vorbis（利用者の決定）。この環境で実際に書けるかは Rust の `edit_formats` が答える（保存が `FormatUnavailable`
+ *   で断られたときの形式を選ぶシート。M13 の段 6 の G10）。
  * - 失うもの（`lossesFor`）：ループ点・マーカーを書けない形式、非可逆の形式、高いビットを書けない可逆の形式。
  */
 
@@ -36,11 +37,15 @@ export const WRITABLE_AUDIO_FORMATS: readonly string[] = [
 /** 元の形式に書けないときに使う形式。 */
 export const AUDIO_FALLBACK_FORMAT = 'ogg';
 
+/** 書くのに ffmpeg が要る音声の形式（Rust の ffmpeg の書き手が書く形式）。 */
+export const FFMPEG_AUDIO_FORMATS: readonly string[] = ['mp3'];
+
 /** 音声の形式の表。 */
 export const AUDIO_FORMATS = formatTable({
   exts: AUDIO_FORMAT_EXTS,
   writable: WRITABLE_AUDIO_FORMATS,
   fallback: AUDIO_FALLBACK_FORMAT,
+  ffmpeg: FFMPEG_AUDIO_FORMATS,
 });
 
 /** 形式が書けるもの（エンジンの `MetaCaps` のうち音声に効くもの）。 */

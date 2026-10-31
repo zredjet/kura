@@ -8,15 +8,19 @@ import type { EditVersionDto } from '../../ipc/edit';
 import { relativeDateTime } from '../../lib/dates';
 import { formatBytes, formatCount } from '../../lib/format';
 import { isImeKey } from '../../lib/ime';
+import { editorKindModule } from './editorKinds';
 import {
   answerDraft,
   answerUnsaved,
   askRestore,
   confirmRevert,
   confirmWarnings,
+  defaultFormatChoice,
   dismissSheet,
+  formatChoices,
   loadVersions,
   saveFailureText,
+  submitFormat,
   submitSaveAs,
   validSaveAsName,
 } from './editorSave';
@@ -330,6 +334,79 @@ function FailedSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'saveFaile
   );
 }
 
+/**
+ * 保存が書けない形式で断られたとき（M13）：「MP3 では保存できません」と理由、書ける形式の選択（既定は代わりの既定。
+ * 書けない形式は押せず、ffmpeg が要るものはそう添える）、選んだ形式で失うもの（種類の部品）。［保存］で選んだ形式で積み直す。
+ */
+function FormatSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'format' }> }) {
+  const item = useEditorStore((s) => s.item);
+  const kind = useEditorStore((s) => s.kind);
+  const titleId = useId();
+  const groupName = useId();
+  const table = formatsFor(item);
+  const choices = formatChoices(table, sheet.formats);
+  const [chosen, setChosen] = useState(() => defaultFormatChoice(choices, sheet.fallback));
+  const selected = choices.find((c) => c.format === chosen && c.available) ?? null;
+  const FormatLosses = editorKindModule(kind)?.ui.FormatLosses;
+  const name = sheet.unavailable ? formatName(sheet.unavailable) : null;
+  const body =
+    name === null
+      ? t.formatUnavailableBodyAny
+      : table?.needsFfmpeg(sheet.unavailable)
+        ? t.formatUnavailableBody(name)
+        : t.formatUnavailableBodyOther(name);
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {name === null ? t.formatUnavailableTitleAny : t.formatUnavailableTitle(name)}
+      </h2>
+      <p className={styles.sheetMessage}>{body}</p>
+      <fieldset className={styles.formatChoices}>
+        <legend className={styles.sheetLabel}>{t.formatChoose}</legend>
+        {choices.map((c) => (
+          <label
+            key={c.format}
+            className={styles.formatChoice}
+            data-disabled={c.available ? undefined : ''}
+          >
+            <input
+              type="radio"
+              name={groupName}
+              value={c.format}
+              checked={chosen === c.format}
+              disabled={!c.available}
+              onChange={() => setChosen(c.format)}
+            />
+            <span>{formatName(c.format)}</span>
+            {!c.available && (
+              <>
+                {' '}
+                <span className={styles.formatChoiceNote}>
+                  {table?.needsFfmpeg(c.format) ? t.needsFfmpeg : t.formatNotWritable}
+                </span>
+              </>
+            )}
+          </label>
+        ))}
+      </fieldset>
+      {selected === null && <p className={styles.sheetNote}>{t.formatNoneWritable}</p>}
+      {selected && FormatLosses && <FormatLosses format={selected} />}
+      <footer className={styles.sheetActions}>
+        <Button onClick={dismissSheet}>{ja.common.cancel}</Button>
+        <Button
+          variant="primary"
+          disabled={selected === null}
+          onClick={() => {
+            if (selected) submitFormat(selected.format);
+          }}
+        >
+          {t.save}
+        </Button>
+      </footer>
+    </Dialog>
+  );
+}
+
 function SheetOf({ sheet }: { sheet: EditorSheet }) {
   switch (sheet.kind) {
     case 'draft':
@@ -348,11 +425,13 @@ function SheetOf({ sheet }: { sheet: EditorSheet }) {
       return <VersionsSheet />;
     case 'saveFailed':
       return <FailedSheet sheet={sheet} />;
+    case 'format':
+      return <FormatSheet sheet={sheet} />;
   }
 }
 
 /**
- * エディタの上に出すシート（下書き・未保存で閉じる・警告・別名・元に戻す・版の一覧・失敗）。エディタの層（z-index 16）の
+ * エディタの上に出すシート（下書き・未保存で閉じる・警告・別名・元に戻す・版の一覧・失敗・形式を選ぶ）。エディタの層（z-index 16）の
  * 中に描くと、ルートのシート（設定など）の下に隠れるので、body に出す（設定のシートからライブラリを切り替えるとき・
  * 設定を開いたまま窓を閉じるときも、未保存のシートがいちばん上に出る）。
  */

@@ -12,6 +12,8 @@ import {
   type EditStepResultDto,
   type EditVersionDto,
   type EditImageView,
+  type EditWritableFormatDto,
+  listEditFormats,
   listEditVersions,
   openEdit,
   saveEdit,
@@ -23,9 +25,12 @@ import { type JobDto, listJobs } from '../../ipc/jobs';
 import { IpcError } from '../../ipc/result';
 import { invalidateItems } from '../../stores/itemCache';
 import { useNoticeStore } from '../../stores/noticeStore';
+import { AUDIO_FORMATS } from './audio/audioFormats';
 import {
   answerUnsaved,
   confirmWarnings,
+  defaultFormatChoice,
+  formatChoices,
   onEditorJob,
   openSaveAs,
   requestCloseEditor,
@@ -36,7 +41,8 @@ import {
 } from './editorSave';
 import { openEditor } from './editorKinds';
 import { EditorSheets } from './EditorSheets';
-import { closeEditor, pushEditorSteps, useEditorStore } from './editorStore';
+import { closeEditor, openEditorAs, pushEditorSteps, useEditorStore } from './editorStore';
+import { IMAGE_EDITOR } from './image/imageKind';
 import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
 
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({
@@ -59,6 +65,7 @@ vi.mock('../../ipc/edit', async (importOriginal) => ({
   sampleEdit: vi.fn(),
   closeEdit: vi.fn(async () => null),
   saveEdit: vi.fn(),
+  listEditFormats: vi.fn(),
   listEditVersions: vi.fn(async () => []),
   discardEditDraft: vi.fn(async () => true),
 }));
@@ -242,6 +249,63 @@ async function openDirty(draft: Partial<Draft> = {}) {
   vi.mocked(viewEdit).mockClear();
 }
 
+/** 音声のアイテム（WAV・2 秒）。 */
+function audioItem(over: Partial<ItemSummaryDto> = {}): ItemSummaryDto {
+  return item({
+    ext: 'wav',
+    kind: 'audio',
+    width: null,
+    height: null,
+    durationMs: 2000,
+    title: 'loop',
+    ...over,
+  });
+}
+
+/**
+ * 音声のアイテムを未保存で開く。核の保存の流れ（保存を積む・形式のシート・大きさの確かめ）だけを見るので、表示は画像の
+ * アダプタで受け、種類だけを音声にする（音声の表示の流れは `audio/audioStore.test.ts`）。
+ */
+async function openAudioDirty(over: Partial<ItemSummaryDto> = {}) {
+  vi.mocked(openEdit).mockResolvedValue(opened());
+  await act(() => openEditorAs({ ...IMAGE_EDITOR.adapter, kind: 'audio' }, audioItem(over)));
+  await flush();
+  vi.mocked(viewEdit).mockClear();
+}
+
+/** 形式の表の行（Rust の `EditWritableFormatDto`）。 */
+function formatRow(
+  format: string,
+  available: boolean,
+  over: Partial<EditWritableFormatDto> = {},
+): EditWritableFormatDto {
+  return {
+    format,
+    ext: format,
+    available,
+    lossless: false,
+    loopPoints: false,
+    markers: false,
+    highBitDepth: false,
+    ...over,
+  };
+}
+
+/** ffmpeg のない組の音声の形式の一覧（mp3 は書けない、代わりは ogg）。 */
+const AUDIO_ROWS: EditWritableFormatDto[] = [
+  formatRow('wav', true, { lossless: true, loopPoints: true, markers: true, highBitDepth: true }),
+  formatRow('aiff', true, { lossless: true, loopPoints: true, markers: true, highBitDepth: true }),
+  formatRow('flac', true, { lossless: true, loopPoints: true, highBitDepth: true }),
+  formatRow('mp3', false),
+  formatRow('m4a', false),
+  formatRow('aac', false),
+  formatRow('ogg', true, { loopPoints: true }),
+  formatRow('opus', false, { loopPoints: true }),
+];
+
+const formatUnavailable = () =>
+  new IpcError({ code: 'FormatUnavailable', message: 'mp3 には書けません（既定は ogg）' });
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(viewEdit).mockImplementation(async () =>
@@ -405,6 +469,198 @@ describe('保存（上書き）', () => {
     // 進んだら消す
     act(() => onEditorJob(event('running', { progress: 0.5 })));
     expect(useEditorStore.getState().save?.slow).toBe(false);
+  });
+});
+
+describe('書けない形式（FormatUnavailable）', () => {
+  it('選択肢は種類の形式の表の書ける形式（表の順）、既定は代わりの既定（書けなければ最初の書ける形式）', () => {
+    const choices = formatChoices(AUDIO_FORMATS, AUDIO_ROWS);
+    expect(choices.map((c) => c.format)).toEqual(['wav', 'aiff', 'flac', 'ogg', 'mp3', 'm4a']);
+    expect(formatChoices(null, AUDIO_ROWS)).toEqual([]);
+    expect(defaultFormatChoice(choices, 'ogg')).toBe('ogg');
+    expect(defaultFormatChoice(choices, 'mp3')).toBe('wav');
+    expect(defaultFormatChoice(choices, null)).toBe('wav');
+    expect(
+      defaultFormatChoice(
+        choices.map((c) => ({ ...c, available: false })),
+        'ogg',
+      ),
+    ).toBeNull();
+  });
+
+  it('保存が断られたら書ける形式を読んで選ぶシートを出し、［保存］で選んだ形式を渡して積む（画像は PNG が既定）', async () => {
+    await openDirty();
+    // 出力の形式を WebP にしてあるが、この環境では書けない
+    act(() =>
+      useEditorStore.setState((s) => ({
+        doc: {
+          ...s.doc,
+          outputs: s.doc.outputs.map((o) => ({ ...o, format: { type: 'to', format: 'webp' } })),
+        },
+      })),
+    );
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: [
+        formatRow('png', true, { lossless: true }),
+        formatRow('jpeg', true),
+        formatRow('gif', true, { lossless: true }),
+        formatRow('webp', false, { lossless: true }),
+        formatRow('heic', false),
+      ],
+      fallback: 'png',
+    });
+    render(<EditorSheets />);
+    requestSave();
+    await flush();
+    expect(listEditFormats).toHaveBeenCalledWith('aa01');
+    expect(useEditorStore.getState().sheet).toMatchObject({
+      kind: 'format',
+      mode: { type: 'overwrite' },
+      closeAfter: null,
+      fallback: 'png',
+      unavailable: 'webp',
+    });
+    expect(
+      screen.getByRole('heading', { name: t.formatUnavailableTitle('WebP') }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(t.formatUnavailableBodyOther('WebP'))).toBeInTheDocument();
+    // 選択肢は画像の形式の表の書ける形式（表の順）。書けないものは押せない
+    const radios = screen.getAllByRole('radio');
+    expect(radios.map((r) => r.getAttribute('value'))).toEqual(['png', 'jpeg', 'gif', 'webp']);
+    expect(screen.getByRole('radio', { name: /PNG/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /WebP/ })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: /WebP/ })).toHaveAccessibleName(
+      `WebP ${t.formatNotWritable}`,
+    );
+    fireEvent.click(screen.getByRole('radio', { name: /JPEG/ }));
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await flush();
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      'aa01',
+      { type: 'overwrite' },
+      { type: 'to', format: 'jpeg' },
+    );
+    expect(useEditorStore.getState().sheet).toBeNull();
+    expect(useEditorStore.getState().save).toMatchObject({ job: 9, mode: 'overwrite' });
+  });
+
+  it('音声：MP3 は ffmpeg が要る印で、既定は Ogg Vorbis。選んだ形式で失うものを出し、別名で保存も同じ向きで積み直す', async () => {
+    await openAudioDirty({ ext: 'mp3' });
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    vi.mocked(listEditFormats).mockResolvedValue({ formats: AUDIO_ROWS, fallback: 'ogg' });
+    render(<EditorSheets />);
+    requestSave();
+    await flush();
+    expect(saveEdit).toHaveBeenCalledWith('aa01', { type: 'overwrite' }, null);
+    expect(
+      screen.getByRole('heading', { name: t.formatUnavailableTitle('MP3') }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(t.formatUnavailableBody('MP3'))).toBeInTheDocument();
+    const radios = screen.getAllByRole('radio');
+    expect(radios.map((r) => r.getAttribute('value'))).toEqual([
+      'wav',
+      'aiff',
+      'flac',
+      'ogg',
+      'mp3',
+      'm4a',
+    ]);
+    expect(screen.getByRole('radio', { name: /Ogg Vorbis/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /MP3/ })).toBeDisabled();
+    expect(screen.getByRole('radio', { name: /MP3/ })).toHaveAccessibleName(`MP3 ${t.needsFfmpeg}`);
+    expect(screen.getByRole('radio', { name: /M4A/ })).toHaveAccessibleName(
+      `M4A ${t.formatNotWritable}`,
+    );
+    // 失うもの：Ogg Vorbis は非可逆
+    expect(screen.getByText(t.audio.lossLossy('Ogg Vorbis'))).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('radio', { name: /FLAC/ }));
+    expect(screen.queryByText(t.audio.lossLossy('Ogg Vorbis'))).toBeNull();
+    fireEvent.click(screen.getByRole('radio', { name: /Ogg Vorbis/ }));
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await flush();
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      'aa01',
+      { type: 'overwrite' },
+      { type: 'to', format: 'ogg' },
+    );
+
+    // 別名で保存が断られたら、同じ名前の別名で積み直す
+    act(() => useEditorStore.setState({ save: null, status: status() }));
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    act(() => submitSaveAs('写し'));
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({
+      kind: 'format',
+      mode: { type: 'saveAs', title: '写し', stem: '写し' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await flush();
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      'aa01',
+      { type: 'saveAs', title: '写し', stem: '写し' },
+      { type: 'to', format: 'ogg' },
+    );
+    expect(useEditorStore.getState().save).toMatchObject({ mode: 'saveAs', title: '写し' });
+  });
+
+  it('閉じる前の保存：［キャンセル］なら閉じない、［保存］なら選んだ形式で保存し終えてから閉じる', async () => {
+    await openAudioDirty({ ext: 'mp3' });
+    vi.mocked(listEditFormats).mockResolvedValue({ formats: AUDIO_ROWS, fallback: 'ogg' });
+    render(<EditorSheets />);
+    let closed: boolean | null = null;
+    act(() => {
+      void requestCloseEditor('library').then((v) => (closed = v));
+    });
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    act(() => answerUnsaved('save'));
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({
+      kind: 'format',
+      closeAfter: 'library',
+    });
+    expect(closed).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: ja.common.cancel }));
+    await flush();
+    expect(closed).toBe(false);
+    expect(useEditorStore.getState().phase).toBe('open');
+
+    act(() => {
+      void requestCloseEditor('library').then((v) => (closed = v));
+    });
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    act(() => answerUnsaved('save'));
+    await flush();
+    closed = null;
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await flush();
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      'aa01',
+      { type: 'overwrite' },
+      { type: 'to', format: 'ogg' },
+    );
+    expect(closed).toBeNull();
+    savedRefresh();
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    expect(closed).toBe(true);
+    expect(useEditorStore.getState().phase).toBe('closed');
+  });
+
+  it('書ける形式を読めなければ、今の「保存できませんでした」のシート', async () => {
+    await openAudioDirty({ ext: 'mp3' });
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    vi.mocked(listEditFormats).mockRejectedValueOnce(
+      new IpcError({ code: 'NotFound', message: 'x' }),
+    );
+    render(<EditorSheets />);
+    requestSave();
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({
+      kind: 'saveFailed',
+      code: 'FormatUnavailable',
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent(t.saveFailures.FormatUnavailable ?? '');
   });
 });
 
@@ -719,6 +975,50 @@ describe('素材の設定の知らせ（M12 の決定 11）', () => {
     await flush();
     expect(getAsset).toHaveBeenCalledTimes(1);
     expect(useNoticeStore.getState().message).toBe('保存しました');
+  });
+
+  it('音声：上書きで長さが変わり、試聴のループがあれば、新しい長さに合うか確かめるよう知らせる（格子などは見ない）', async () => {
+    await openAudioDirty();
+    requestSave();
+    await flush();
+    expect(useEditorStore.getState().save?.before).toEqual({ kind: 'audio', durationMs: 2000 });
+    savedRefresh();
+    vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs: 1500 })]);
+    vi.mocked(getAsset).mockResolvedValue(asset({ loopRange: { start: 0, end: 48_000 } }));
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    await flush();
+    expect(getAsset).toHaveBeenCalledWith(7);
+    expect(useNoticeStore.getState().message).toBe(t.audio.assetSettingsCheckAudio);
+    expect(useEditorStore.getState().item?.durationMs).toBe(1500);
+
+    // 長さが変わっても、試聴のループがなければ知らせない（格子・ピボットは音声に効かない）
+    act(() => useEditorStore.setState({ status: status({ dirty: true }) }));
+    requestSave();
+    await flush();
+    savedRefresh();
+    vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs: 1000 })]);
+    vi.mocked(getAsset).mockResolvedValue(
+      asset({
+        grid: { cellW: 16, cellH: 16, offsetX: 0, offsetY: 0, gapX: 0, gapY: 0, count: null },
+      }),
+    );
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    await flush();
+    expect(getAsset).toHaveBeenCalledTimes(2);
+    expect(useNoticeStore.getState().message).toBe('保存しました');
+
+    // 長さが同じなら素材の設定を読まない
+    act(() => useEditorStore.setState({ status: status({ dirty: true }) }));
+    requestSave();
+    await flush();
+    savedRefresh();
+    vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs: 1000 })]);
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    await flush();
+    expect(getAsset).toHaveBeenCalledTimes(2);
   });
 });
 

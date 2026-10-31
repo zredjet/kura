@@ -47,6 +47,13 @@ describe('音声の形式の表', () => {
     });
     expect(AUDIO_FORMATS.exportName('loop.wav', 'ogg')).toBe('loop.ogg');
   });
+
+  it('書くのに ffmpeg が要るのは MP3 だけ（Rust の ffmpeg の書き手が書く形式。M4A は OS の AAC）', () => {
+    expect(AUDIO_FORMATS.needsFfmpeg('mp3')).toBe(true);
+    expect(AUDIO_FORMATS.needsFfmpeg('m4a')).toBe(false);
+    expect(AUDIO_FORMATS.needsFfmpeg('ogg')).toBe(false);
+    expect(AUDIO_FORMATS.needsFfmpeg(null)).toBe(false);
+  });
 });
 
 describe('保存で失うもの', () => {

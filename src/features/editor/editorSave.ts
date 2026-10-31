@@ -18,7 +18,11 @@
  *   手の結果を待つ（保存に入るのは Rust の頭）。
  * - 保存の途中でエディタを閉じても保存は続く。終わったら一覧・インスペクタ・サムネイルを読み直し、知らせる（失敗も）。
  * - 上書き・版に戻したあと、大きさが変わり、アイテムに素材の設定（格子・ピボット・ループ点）があれば「新しい大きさに
- *   合っているか確かめてください」と知らせる（設定は変えない。M12 の決定 11）。
+ *   合っているか確かめてください」と知らせる（設定は変えない。M12 の決定 11）。音声は長さで比べ、試聴のループがあるときだけ
+ *   知らせる（M13）。
+ * - 保存（上書き・別名・閉じる前の保存）が `FormatUnavailable`（この環境では書けない形式。MP3 で ffmpeg がない、など）で
+ *   断られたら、書ける形式の一覧（`edit_formats`）を読んで形式を選ぶシートを出す。既定は代わりの既定（音声は Ogg Vorbis、
+ *   画像は PNG）。［保存］で選んだ形式を渡して同じ向きで積み直す。一覧を読めなければ今の「保存できませんでした」のシート。
  */
 
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -29,12 +33,15 @@ import {
   discardEditDraft,
   type EditFormatChoice,
   type EditSaveModeDto,
+  type EditWritableFormatDto,
+  listEditFormats,
   listEditVersions,
   saveEdit,
 } from '../../ipc/edit';
 import { getAsset } from '../../ipc/asset';
 import { getItems, type ItemSummaryDto } from '../../ipc/items';
 import { listJobs, type JobProgress } from '../../ipc/jobs';
+import { hasDuration } from '../../ipc/kinds';
 import { isIpcError } from '../../ipc/result';
 import { invalidateItems } from '../../stores/itemCache';
 import { onAnyJob } from '../../stores/jobsStore';
@@ -58,7 +65,7 @@ import {
   useEditorStore,
   whenEditorSettled,
 } from './editorStore';
-import { outputChoice } from './formats';
+import { type FormatTable, outputChoice } from './formats';
 import { formatsFor } from './kindTraits';
 
 const t = ja.editor;
@@ -168,11 +175,21 @@ function currentLibrary(): string | null {
   return useLibraryStore.getState().info?.path ?? null;
 }
 
-/** アイテムの大きさ（分からなければ null）。 */
+/** アイテムの大きさ（画像は幅と高さ、音声は長さ。分からなければ null）。 */
 function sizeOf(
-  item: Pick<ItemSummaryDto, 'width' | 'height'> | null | undefined,
+  item: Pick<ItemSummaryDto, 'kind' | 'width' | 'height' | 'durationMs'> | null | undefined,
 ): SizeBefore | null {
-  return item?.width && item.height ? { w: item.width, h: item.height } : null;
+  if (!item) return null;
+  if (hasDuration(item.kind)) {
+    return item.durationMs ? { kind: 'audio', durationMs: item.durationMs } : null;
+  }
+  return item.width && item.height ? { kind: 'image', w: item.width, h: item.height } : null;
+}
+
+/** 大きさが同じか（種類が違えば比べられないので同じとみなす）。 */
+function sameSize(a: SizeBefore, b: SizeBefore): boolean {
+  if (a.kind === 'audio') return b.kind !== 'audio' || a.durationMs === b.durationMs;
+  return b.kind !== 'image' || (a.w === b.w && a.h === b.h);
 }
 
 function clearSlow(): void {
@@ -211,18 +228,78 @@ function forcedFormat(): EditFormatChoice {
   return forced ? { type: 'to', format } : null;
 }
 
-/** 保存を積んだ結果（積んだ・保存するものがなかった・積めなかった）。 */
-type StartResult = 'started' | 'nothing' | 'failed';
+/** 保存しようとした形式（渡した形式。なければ文書の出力の形式、「元と同じ」なら元の形式。分からなければ null）。 */
+function attemptedFormat(choice: EditFormatChoice): string | null {
+  if (choice?.type === 'to') return choice.format;
+  const s = useEditorStore.getState();
+  const out = outputChoice(s.doc.outputs);
+  if (out.type === 'to') return out.format;
+  return formatsFor(s.item)?.formatOfExt(s.item?.ext) ?? null;
+}
+
+/**
+ * 形式を選ぶシートの選択肢：種類の形式の表の書ける形式（表の順）のうち、Rust の一覧（`edit_formats`）にあるもの。書けるか
+ * （`available`）と保存できるものは Rust の値。
+ */
+export function formatChoices(
+  table: FormatTable | null,
+  rows: readonly EditWritableFormatDto[],
+): EditWritableFormatDto[] {
+  if (!table) return [];
+  return table.writable.flatMap((id) => rows.filter((r) => r.format === id));
+}
+
+/** 既定の選択：代わりの既定が書ければそれ、なければ最初の書ける形式（どれも書けなければ null）。 */
+export function defaultFormatChoice(
+  choices: readonly EditWritableFormatDto[],
+  fallback: string | null,
+): string | null {
+  const usable = choices.filter((c) => c.available);
+  return (usable.find((c) => c.format === fallback) ?? usable[0])?.format ?? null;
+}
+
+/** 書けない形式で断られた保存：書ける形式を読んで、形式を選ぶシートを出す（出せたら真）。 */
+async function offerFormats(
+  session: string,
+  mode: EditSaveModeDto,
+  closeAfter: AfterClose | null,
+  unavailable: string | null,
+): Promise<boolean> {
+  let list: Awaited<ReturnType<typeof listEditFormats>>;
+  try {
+    list = await listEditFormats(session);
+  } catch (error) {
+    console.warn('書ける形式を読めませんでした', error);
+    return false;
+  }
+  if (editorSession() !== session || useEditorStore.getState().phase !== 'open') return false;
+  useEditorStore.setState({
+    sheet: {
+      kind: 'format',
+      mode,
+      closeAfter,
+      formats: list.formats,
+      fallback: list.fallback,
+      unavailable,
+    },
+  });
+  return true;
+}
+
+/** 保存を積んだ結果（積んだ・保存するものがなかった・積めなかった・形式を選ぶシートを出した）。 */
+type StartResult = 'started' | 'nothing' | 'failed' | 'format';
 
 /**
  * 保存のジョブを積む。応えの来ていない手（送った・ためた手）の結果を待ってから積む（保存に入るのは Rust の頭）。上書きで
- * 保存していない変更がなければ積まない（'nothing'）。
+ * 保存していない変更がなければ積まない（'nothing'）。`format` を渡すとその形式で保存する（形式を選ぶシートから）。書けない
+ * 形式で断られたら形式を選ぶシートを出す（'format'。閉じる前の保存なら、閉じるのはシートの答えを待つ）。
  */
 async function startSave(
   mode: EditSaveModeDto,
   kind: SaveMode,
   title: string | null,
   closeAfter: AfterClose | null,
+  format: EditFormatChoice = null,
 ): Promise<StartResult> {
   const session = editorSession();
   if (!session || useEditorStore.getState().phase !== 'open') return 'failed';
@@ -231,13 +308,16 @@ async function startSave(
     return 'failed';
   }
   starting = true;
+  let unavailable: string | null = null;
   try {
     await whenEditorSettled();
     const s = useEditorStore.getState();
     if (editorSession() !== session || s.phase !== 'open') return 'failed';
     if (kind === 'overwrite' && !canSaveEditor(s)) return 'nothing';
     const before = sizeOf(s.item);
-    const started = await saveEdit(session, mode, kind === 'revert' ? null : forcedFormat());
+    const choice = kind === 'revert' ? null : (format ?? forcedFormat());
+    unavailable = kind === 'revert' ? null : attemptedFormat(choice);
+    const started = await saveEdit(session, mode, choice);
     if (editorSession() !== session) return 'failed';
     applyEditorStatus(started.status, started.doc);
     useEditorStore.setState({
@@ -258,6 +338,14 @@ async function startSave(
     return 'started';
   } catch (error) {
     if (editorSession() !== session) return 'failed';
+    if (
+      isIpcError(error, 'FormatUnavailable') &&
+      kind !== 'revert' &&
+      (await offerFormats(session, mode, closeAfter, unavailable))
+    ) {
+      return 'format';
+    }
+    if (editorSession() !== session) return 'failed';
     if (isIpcError(error, 'Busy')) {
       notify(t.saveBusy);
     } else {
@@ -276,13 +364,34 @@ async function startSave(
   }
 }
 
-/** 上書きの保存を積み、閉じるのを待つ呼び手に答える（積めなければやめる、保存するものがなければ閉じる）。 */
-function startOverwrite(closeAfter: AfterClose | null): void {
-  void startSave({ type: 'overwrite' }, 'overwrite', null, closeAfter).then((result) => {
+/**
+ * 保存を積み、閉じるのを待つ呼び手に答える（積めなければやめる、保存するものがなければ閉じる。形式を選ぶシートを出したら、
+ * シートの答えを待つ）。
+ */
+function startThenClose(
+  mode: EditSaveModeDto,
+  closeAfter: AfterClose | null,
+  format: EditFormatChoice = null,
+): void {
+  const title = mode.type === 'saveAs' ? mode.title : null;
+  void startSave(mode, mode.type, title, closeAfter, format).then((result) => {
     if (closeAfter === null) return;
     if (result === 'failed') settleClose(false);
     else if (result === 'nothing') finishClose();
   });
+}
+
+/** 上書きの保存を積み、閉じるのを待つ呼び手に答える。 */
+function startOverwrite(closeAfter: AfterClose | null): void {
+  startThenClose({ type: 'overwrite' }, closeAfter);
+}
+
+/** 形式を選ぶシートで「保存」：選んだ形式を渡して、断られた保存と同じ向き（上書き・同じ名前の別名）で積み直す。 */
+export function submitFormat(format: string): void {
+  const sheet = useEditorStore.getState().sheet;
+  if (sheet?.kind !== 'format') return;
+  useEditorStore.setState({ sheet: null });
+  startThenClose(sheet.mode, sheet.closeAfter, { type: 'to', format });
 }
 
 /**
@@ -381,7 +490,10 @@ export function dismissSheet(): void {
     return;
   }
   useEditorStore.setState({ sheet: null });
-  if (sheet.kind === 'unsaved' || (sheet.kind === 'saveWarnings' && sheet.closeAfter !== null)) {
+  if (
+    sheet.kind === 'unsaved' ||
+    ((sheet.kind === 'saveWarnings' || sheet.kind === 'format') && sheet.closeAfter !== null)
+  ) {
     settleClose(false);
   }
 }
@@ -469,17 +581,22 @@ function refreshLibrary(itemIds: readonly number[]): void {
 
 /**
  * 大きさが変わり（`before` と `after` が違う）、アイテムに素材の設定（格子・ピボット・ループ点）があれば、新しい大きさに
- * 合っているか確かめるよう知らせる（設定は変えない。M12 の決定 11）。
+ * 合っているか確かめるよう知らせる（設定は変えない。M12 の決定 11）。音声は長さで比べ、試聴のループ（`loopRange`）が
+ * あるときだけ知らせる（M13）。
  */
 async function checkAssetFit(
   itemId: number,
   before: SizeBefore | null,
   after: SizeBefore | null,
 ): Promise<void> {
-  if (!before || !after || (before.w === after.w && before.h === after.h)) return;
+  if (!before || !after || sameSize(before, after)) return;
   try {
     const st = (await getAsset(itemId)).settings;
-    if (st.grid || st.pivot || st.loopRange) notify(t.assetSettingsCheck);
+    if (before.kind === 'audio') {
+      if (st.loopRange) notify(t.audio.assetSettingsCheckAudio);
+    } else if (st.grid || st.pivot || st.loopRange) {
+      notify(t.assetSettingsCheck);
+    }
   } catch (error) {
     console.warn('素材の設定を読めませんでした', error);
   }

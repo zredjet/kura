@@ -25,12 +25,14 @@ import {
   type EditNodeDto,
   type EditOpenedDto,
   type EditProblemDto,
+  type EditSaveModeDto,
   type EditSourceDto,
   type EditStatusDto,
   type EditStepDto,
   type EditStepResultDto,
   type EditViewDto,
   type EditViewportDto,
+  type EditWritableFormatDto,
   type FormatChoice,
   type Issue,
   type OpDescriptor,
@@ -83,16 +85,28 @@ export type EditorSheet =
   | { kind: 'revert' }
   | { kind: 'versions' }
   | { kind: 'restore'; version: number }
-  | { kind: 'saveFailed'; mode: SaveMode; code: string | null; message: string };
+  | { kind: 'saveFailed'; mode: SaveMode; code: string | null; message: string }
+  | {
+      /** 保存が FormatUnavailable で断られた：書ける形式を選んで、同じ向きで積み直す（M13）。 */
+      kind: 'format';
+      /** 断られた保存の向き（上書き・別名。別名は名前つき）。 */
+      mode: EditSaveModeDto;
+      /** 閉じる前の保存なら、保存が終わってから閉じる。 */
+      closeAfter: AfterClose | null;
+      /** 書ける形式の一覧（Rust の `edit_formats`。形式の表の順）。 */
+      formats: EditWritableFormatDto[];
+      /** 代わりの既定（音声は Ogg Vorbis、画像は PNG）。 */
+      fallback: string | null;
+      /** 書けなかった形式（分からなければ null）。 */
+      unavailable: string | null;
+    };
 
 /** ジョブの状態。 */
 type JobStateDto = JobProgress['state'];
 
-/** 保存する前のアイテムの大きさ（上書きで大きさが変わったかを見る）。 */
-export interface SizeBefore {
-  w: number;
-  h: number;
-}
+/** 保存する前のアイテムの大きさ（上書きで変わったかを見る。画像は幅と高さ、音声は長さ）。 */
+export type SizeBefore =
+  { kind: 'image'; w: number; h: number } | { kind: 'audio'; durationMs: number };
 
 /** 動いている保存のジョブ（ボタンの中の進捗・終わったときの知らせ）。 */
 export interface EditorSave {

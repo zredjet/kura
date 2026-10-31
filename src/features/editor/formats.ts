@@ -18,10 +18,14 @@ export interface FormatTableDef {
   writable: readonly string[];
   /** 元の形式に書けないときに使う形式。 */
   fallback: string;
+  /** 書くのに ffmpeg が要る形式（なければ書けない。形式を選ぶシートで「ffmpeg が要ります」と添える）。 */
+  ffmpeg?: readonly string[];
 }
 
 /** 形式の表と、表から作った関数（関数は `this` を使わないので、分けて取り出してよい）。 */
 export interface FormatTable extends FormatTableDef {
+  /** 書くのに ffmpeg が要る形式か。 */
+  needsFfmpeg(format: string | null | undefined): boolean;
   /** 拡張子（大文字・小文字は問わない）の形式の ID。知らなければ null。 */
   formatOfExt(ext: string | null | undefined): string | null;
   /** 形式の代表の拡張子。知らなければ null。 */
@@ -71,6 +75,8 @@ export function formatTable(def: FormatTableDef): FormatTable {
   const extOfFormat = (format: string): string | null => def.exts[format]?.[0] ?? null;
   const canWrite = (format: string | null | undefined): boolean =>
     format != null && def.writable.includes(format);
+  const needsFfmpeg = (format: string | null | undefined): boolean =>
+    format != null && (def.ffmpeg ?? []).includes(format);
   const exportName = (originalName: string, ext: string): string => {
     const { stem, ext: old } = splitName(originalName);
     const e = ext.trim();
@@ -98,6 +104,7 @@ export function formatTable(def: FormatTableDef): FormatTable {
     formatOfExt,
     extOfFormat,
     canWrite,
+    needsFfmpeg,
     exportName,
     effectiveFormat,
     savedExt,

@@ -1094,10 +1094,24 @@ export const ja = {
       Unsupported: 'この形式には書けません。出力の形式を変えてください。',
       Invalid: 'この編集は保存できません。',
       NotFound: 'アイテムが見つかりません。',
+      FormatUnavailable: 'この環境ではこの形式に書けません。出力の形式を変えてください。',
     } as Record<string, string>,
     revertConflictHint:
       '別名で保存して作ったアイテムを元に戻すと、元にしたアイテムをまだ編集していなければ、その今と同じ中身になるため戻せません（同じ中身のアイテムは 1 つだけ）。元にしたアイテムを使ってください。',
     ok: 'OK',
+    // ===== 形式を選ぶシート（保存が FormatUnavailable で断られたとき。画像と音声で共通。M13） =====
+    formatUnavailableTitle: (fmt: string) => `${fmt} では保存できません`,
+    formatUnavailableTitleAny: 'この形式では保存できません',
+    /** 書くのに ffmpeg が要る形式（MP3）。 */
+    formatUnavailableBody: (fmt: string) =>
+      `ffmpeg が見つからないので ${fmt} に書けません。保存する形式を選んでください（設定の外部ツールで ffmpeg を指定すると ${fmt} で保存できます）`,
+    formatUnavailableBodyOther: (fmt: string) =>
+      `この環境では ${fmt} に書けません。保存する形式を選んでください`,
+    formatUnavailableBodyAny: 'この環境ではこの形式に書けません。保存する形式を選んでください',
+    formatChoose: '保存する形式',
+    needsFfmpeg: 'ffmpeg が要ります',
+    formatNotWritable: 'この環境では書けません',
+    formatNoneWritable: 'この環境で書ける形式がありません',
     // ===== シート =====
     warningsTitle: '警告があります',
     warningsMessage: 'このまま保存しますか？',
@@ -1219,12 +1233,7 @@ export const ja = {
       lossMarkers: (fmt: string) => `${fmt} ではマーカーを保存できません`,
       lossLossy: (fmt: string) => `${fmt} は非可逆なので、保存すると音がわずかに変わります`,
       lossBits: (fmt: string) => `${fmt} では 16 ビットより細かい標本を保存できません`,
-      // 形式のシート（段 4C の edit_formats のあと）
-      formatUnavailableTitle: (fmt: string) => `${fmt} では保存できません`,
-      formatUnavailableBody: (fmt: string) =>
-        `ffmpeg が見つからないので ${fmt} に書けません。保存する形式を選んでください（設定の外部ツールで ffmpeg を指定すると ${fmt} で保存できます）`,
-      formatChoose: '保存する形式',
-      needsFfmpeg: 'ffmpeg が要ります',
+      // 形式を選ぶシートの文言は画像と共通（ja.editor の formatUnavailableTitle など）
       // 素材の設定
       assetSettingsCheckAudio:
         '長さが変わりました。試聴のループが新しい長さに合っているか確かめてください',

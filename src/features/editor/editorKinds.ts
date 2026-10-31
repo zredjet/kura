@@ -10,6 +10,7 @@
 
 import type { ComponentType } from 'react';
 
+import type { EditWritableFormatDto } from '../../ipc/edit';
 import type { ItemSummaryDto } from '../../ipc/items';
 import { audioRuntime } from '../asset/audioRuntime';
 import { stopAudition } from '../asset/auditionStore';
@@ -35,6 +36,11 @@ export interface EditorKindUi {
   Status: ComponentType;
   /** 右パネルの「操作」（核の `OpsPanel` に、引数の欄の大きさ・出力の行を種類ごとに渡す）。 */
   Ops: ComponentType;
+  /**
+   * 形式を選ぶシート（保存が書けない形式で断られたとき。`EditorSheets.tsx`）で、選んだ形式で失うもの（音声のループ点・
+   * マーカー・非可逆など）。なければ出さない。
+   */
+  FormatLosses?: ComponentType<{ format: EditWritableFormatDto }>;
 }
 
 /** 種類ごとのエディタ。 */
