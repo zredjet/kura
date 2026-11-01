@@ -91,7 +91,7 @@
 /* 道具の切り替え（画像の上部の道具のカプセルと同じボタンを、カプセルの段に詰める） */
 .toolSwitch {
   height: auto;
-  padding: 2px;
+  padding: var(--space-0-5);
 }
 
 .toolSwitch > button {
