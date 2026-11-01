@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kura_core::edit::editor::audio::AudioCounts;
-use kura_core::edit::editor::audio::handles::{Handle, HandleMode};
+use kura_core::edit::editor::audio::handles::{Handle, HandleMode, Marks};
 use kura_core::edit::editor::audio::measure::{LoudnessState, measure};
 use kura_core::edit::editor::{
     self, AudioViewInfo, AudioViewport, EditorEnv, OpenRequest, Step, ViewInfo, ViewOutcome,
@@ -216,6 +216,19 @@ impl Held {
     }
 }
 
+/// 手が効いたことを確かめる表示の値。
+#[derive(Debug, Clone, Copy)]
+enum Expect {
+    /// 標本が変わる（`samplesId`）。
+    NewSamples,
+    /// フェードのノードのフェードインの終わりの印。
+    FadeIn(NodeId, u64),
+    /// 出力の長さ。
+    Frames(u64),
+    /// ループ点。
+    Loop((u64, u64)),
+}
+
 /// 開いた音声のエディタ 1 つ。
 pub(crate) struct AudioEditor<'s> {
     env: EditorEnv<'s>,
@@ -227,6 +240,8 @@ pub(crate) struct AudioEditor<'s> {
     vp: AudioViewport,
     /// trim・fade・gain・set_loop のノード（`setup` のあと）。
     nodes: Option<[NodeId; 4]>,
+    /// 前の表示の `samplesId`。
+    samples: String,
     /// 開く前の予算の使用量。
     pub before: Usage,
     /// 開くのにかかった時間（ナノ秒）と、開いたときの数（入力の源の LRU の上限がキャッシュに入る）。
@@ -278,6 +293,7 @@ impl<'s> AudioEditor<'s> {
             rate: u64::from(info.rate),
             vp,
             nodes: None,
+            samples: info.samples_id.clone(),
             before,
             open_ns,
             opened: AudioCounts::default(),
@@ -319,6 +335,7 @@ impl<'s> AudioEditor<'s> {
             return Err(format!("手を断られました: {:?}", r.problem));
         }
         let info = shown(out.view)?;
+        self.samples = info.samples_id.clone();
         let c = self.counts()?;
         self.held.note(&c);
         Ok((ns, info))
@@ -368,7 +385,7 @@ impl<'s> AudioEditor<'s> {
                 .first()
                 .copied()
                 .ok_or_else(|| format!("{op} のノードができません"))?;
-            shown(out.view)?;
+            self.samples = shown(out.view)?.samples_id;
             ids.push(id);
         }
         let c = self.counts()?;
@@ -377,8 +394,8 @@ impl<'s> AudioEditor<'s> {
         Ok(())
     }
 
-    /// 測る手の `i` 回目（回ごとに違う値）。
-    fn step_of(&self, kind: Kind, i: usize) -> Result<Step, String> {
+    /// 測る手の `i` 回目（回ごとに違う値）と、手が効いたことを確かめる表示の値。
+    fn step_of(&self, kind: Kind, i: usize) -> Result<(Step, Expect), String> {
         let [trim, fade, gain, set_loop] = self.nodes.ok_or("文書を作っていません")?;
         let r = self.rate.min(self.frames / 8).max(1);
         // 回ごとに 480 フレーム（10 ms）ずつずらす（同じ値を続けて当てない）
@@ -386,43 +403,80 @@ impl<'s> AudioEditor<'s> {
         let at = self.vp.spans[0].0;
         let commit = HandleMode::Commit(CommitMode::Step);
         Ok(match kind {
-            Kind::Gain => Step::Commit {
-                edit: Edit::SetParams {
-                    node: gain,
-                    params: json!({ "db": -3.0 - 0.01 * (i as f64 + 1.0) }),
+            Kind::Gain => (
+                Step::Commit {
+                    edit: Edit::SetParams {
+                        node: gain,
+                        params: json!({ "db": -3.0 - 0.01 * (i as f64 + 1.0) }),
+                    },
+                    mode: CommitMode::Step,
                 },
-                mode: CommitMode::Step,
-            },
-            Kind::Fade => Step::Handle {
-                handle: Handle::FadeIn {
-                    end: (r + d).min(self.frames / 4),
-                },
-                node: Some(fade),
-                mode: commit,
-            },
-            Kind::TrimEnd => Step::Handle {
-                handle: Handle::Trim {
-                    start: 0,
-                    end: self.frames.saturating_sub(r + d).max(self.frames / 2),
-                },
-                node: Some(trim),
-                mode: commit,
-            },
-            Kind::Loop => Step::Handle {
-                handle: Handle::Loop {
-                    range: Some((at + d % r, at + r + d % r)),
-                },
-                node: Some(set_loop),
-                mode: commit,
-            },
+                Expect::NewSamples,
+            ),
+            Kind::Fade => {
+                let end = (r + d).min(self.frames / 4);
+                (
+                    Step::Handle {
+                        handle: Handle::FadeIn { end },
+                        node: Some(fade),
+                        mode: commit,
+                    },
+                    Expect::FadeIn(fade, end),
+                )
+            }
+            Kind::TrimEnd => {
+                let end = self.frames.saturating_sub(r + d).max(self.frames / 2);
+                (
+                    Step::Handle {
+                        handle: Handle::Trim { start: 0, end },
+                        node: Some(trim),
+                        mode: commit,
+                    },
+                    Expect::Frames(end),
+                )
+            }
+            Kind::Loop => {
+                let range = (at + d % r, at + r + d % r);
+                (
+                    Step::Handle {
+                        handle: Handle::Loop { range: Some(range) },
+                        node: Some(set_loop),
+                        mode: commit,
+                    },
+                    Expect::Loop(range),
+                )
+            }
         })
     }
 
-    /// 測る手の `i` 回目を当てる（往復のナノ秒と表示）。
+    /// 測る手の `i` 回目を当てる（往復のナノ秒と表示）。手が効いていなければ（同じ標本・長さ・ループ点・印のまま）誤り。
     pub fn step(&mut self, kind: Kind, i: usize) -> Result<(u64, AudioViewInfo), String> {
-        let step = self.step_of(kind, i)?;
+        let (step, expect) = self.step_of(kind, i)?;
         let vp = self.vp.clone();
-        self.apply(vec![step], &vp)
+        let before = self.samples.clone();
+        let (ns, info) = self.apply(vec![step], &vp)?;
+        let fade_end = |node: NodeId| {
+            info.nodes
+                .iter()
+                .find(|n| n.id == node)
+                .and_then(|n| match n.marks {
+                    Some(Marks::Fade { in_end, .. }) => in_end,
+                    _ => None,
+                })
+        };
+        let ok = match expect {
+            Expect::NewSamples => info.samples_id != before,
+            Expect::FadeIn(node, end) => fade_end(node) == Some(end),
+            Expect::Frames(end) => info.frames == end,
+            Expect::Loop(range) => info.loop_range == Some(range),
+        };
+        if !ok {
+            return Err(format!(
+                "{} の {i} 回目の手が効いていません（{expect:?}）",
+                kind.key()
+            ));
+        }
+        Ok((ns, info))
     }
 
     /// ラウドネスを予約し（`measure` が真のとき）、`work: true` の表示を続けて頼んで、波形の段とラウドネスが揃うまで回す。
