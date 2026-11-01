@@ -58,6 +58,7 @@ import {
   closeEditor,
   editorSession,
   type EditorSave,
+  type EditorState,
   hasUnsavedChanges,
   onEditorResult,
   originalFormatOf,
@@ -541,11 +542,13 @@ export function answerDraft(answer: 'discard' | 'open'): void {
 
 /**
  * エディタを閉じる（‹・esc・ライブラリの切り替え・窓を閉じる）。保存していない変更があれば［保存しない］［キャンセル］
- * ［保存］のシートを出す。閉じたら true、やめたら false（開いていなければ true）。
+ * ［保存］のシートを出す。閉じたら true、やめたら false（開いていなければ true）。シートを出している間は受けずに false
+ * （シート・閉じるのを待つ呼び手・閉じる前の保存の続きはそのまま。macOS のシートの付いた窓と同じく、先にシートに答える）。
  */
 export function requestCloseEditor(then: AfterClose = 'none'): Promise<boolean> {
   const s = useEditorStore.getState();
   if (s.phase === 'closed') return Promise.resolve(true);
+  if (s.phase === 'open' && s.sheet !== null) return Promise.resolve(false);
   if (s.phase !== 'open' || !hasUnsavedChanges(s)) {
     // `edit_close` を終えてから進む（ライブラリを切り替える前に閉じる）
     return closeEditor().then(() => true);
@@ -852,9 +855,17 @@ onAnyJob(onEditorJob);
 let windowGuard: (() => void) | null = null;
 let windowGuardPending = false;
 
-/** 保存していない変更がある間だけ、窓を閉じる操作（⌘W・閉じるボタン）を止めてシートを出す。 */
+/** 窓を閉じる操作を止めるか（保存していない変更がある・エディタのシートを出している）。 */
+function guardsWindow(s: EditorState): boolean {
+  return hasUnsavedChanges(s) || (s.phase === 'open' && s.sheet !== null);
+}
+
+/**
+ * 保存していない変更がある間（未保存のシートを出す）と、エディタのシートを出している間（受けずにシートを残す）だけ、
+ * 窓を閉じる操作（⌘W・閉じるボタン）を止めて `requestCloseEditor` に回す。
+ */
 function syncWindowGuard(): void {
-  const want = hasUnsavedChanges(useEditorStore.getState());
+  const want = guardsWindow(useEditorStore.getState());
   if (want && !windowGuard && !windowGuardPending) {
     windowGuardPending = true;
     const win = getCurrentWindow();
@@ -873,7 +884,7 @@ function syncWindowGuard(): void {
         (unlisten) => {
           windowGuardPending = false;
           windowGuard = unlisten;
-          if (!hasUnsavedChanges(useEditorStore.getState())) syncWindowGuard();
+          if (!guardsWindow(useEditorStore.getState())) syncWindowGuard();
         },
         (error: unknown) => {
           windowGuardPending = false;
@@ -894,7 +905,8 @@ export function watchWindowClose(): () => void {
       now.status !== before.status ||
       now.save !== before.save ||
       now.phase !== before.phase ||
-      now.pendingSteps !== before.pendingSteps
+      now.pendingSteps !== before.pendingSteps ||
+      now.sheet !== before.sheet
     ) {
       syncWindowGuard();
     }

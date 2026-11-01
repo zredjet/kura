@@ -28,11 +28,15 @@ import { useNoticeStore } from '../../stores/noticeStore';
 import { AUDIO_FORMATS } from './audio/audioFormats';
 import {
   answerUnsaved,
+  askRestore,
   confirmWarnings,
   defaultFormatChoice,
+  dismissSheet,
   formatChoices,
   onEditorJob,
+  openRevert,
   openSaveAs,
+  openVersions,
   requestCloseEditor,
   requestSave,
   SLOW_SAVE_MS,
@@ -962,6 +966,180 @@ describe('未保存で閉じる', () => {
   });
 });
 
+describe('シートを出している間の閉じる要求', () => {
+  /**
+   * 窓を閉じる・ライブラリを切り替える・‹ の閉じる要求を順に送り、どれも false で、シート（同じもの）とエディタが残る
+   * ことを確かめる。
+   */
+  async function expectRefused(): Promise<void> {
+    const before = useEditorStore.getState().sheet;
+    expect(before).not.toBeNull();
+    for (const then of ['window', 'library', 'none'] as const) {
+      let answer: boolean | null = null;
+      act(() => {
+        void requestCloseEditor(then).then((v) => (answer = v));
+      });
+      await flush();
+      expect(answer).toBe(false);
+      expect(useEditorStore.getState().sheet).toBe(before);
+      expect(useEditorStore.getState().phase).toBe('open');
+    }
+    expect(closeEdit).not.toHaveBeenCalled();
+  }
+
+  it('未保存のシート：閉じる要求を受けず、前の呼び手を待たせたまま。［保存］でもとの要求どおり保存し終えてから閉じる', async () => {
+    await openDirty();
+    render(<EditorSheets />);
+    let closed: boolean | null = null;
+    act(() => {
+      void requestCloseEditor('library').then((v) => (closed = v));
+    });
+    expect(useEditorStore.getState().sheet).toEqual({ kind: 'unsaved', then: 'library' });
+    await expectRefused();
+    expect(closed).toBeNull();
+    act(() => answerUnsaved('save'));
+    await flush();
+    expect(saveEdit).toHaveBeenCalledTimes(1);
+    savedRefresh();
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    expect(closed).toBe(true);
+    expect(useEditorStore.getState().phase).toBe('closed');
+  });
+
+  it('形式を選ぶシート：⌘W で未保存のシートに替えず、closeAfter が生きていて［保存］で保存し終えてから閉じる', async () => {
+    await openAudioDirty({ ext: 'mp3' });
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS,
+      current: 'mp3',
+      fallback: 'ogg',
+    });
+    render(<EditorSheets />);
+    let closed: boolean | null = null;
+    act(() => {
+      void requestCloseEditor('window').then((v) => (closed = v));
+    });
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    act(() => answerUnsaved('save'));
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'format', closeAfter: 'window' });
+    await expectRefused();
+    expect(closed).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await flush();
+    expect(saveEdit).toHaveBeenLastCalledWith(
+      'aa01',
+      { type: 'overwrite' },
+      { type: 'to', format: 'ogg' },
+    );
+    expect(closed).toBeNull();
+    savedRefresh();
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    expect(closed).toBe(true);
+    expect(useEditorStore.getState().phase).toBe('closed');
+  });
+
+  it('⌘S の形式を選ぶシート（閉じる要求なし）：⌘W を受けず、［保存］で保存してもエディタは開いたまま', async () => {
+    await openAudioDirty({ ext: 'mp3' });
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS,
+      current: 'mp3',
+      fallback: 'ogg',
+    });
+    render(<EditorSheets />);
+    vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
+    requestSave();
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'format', closeAfter: null });
+    await expectRefused();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await flush();
+    savedRefresh();
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    expect(useEditorStore.getState().phase).toBe('open');
+  });
+
+  it('警告の確認のシート：閉じる要求を受けず、「保存」でもとの要求どおり保存し終えてから閉じる', async () => {
+    await openDirty();
+    act(() =>
+      useEditorStore.setState({
+        warnings: [
+          {
+            node: null,
+            param: null,
+            code: 'metadataDropped',
+            severity: 'warning',
+            message: 'EXIF を書けません',
+          },
+        ],
+      }),
+    );
+    render(<EditorSheets />);
+    let closed: boolean | null = null;
+    act(() => {
+      void requestCloseEditor('window').then((v) => (closed = v));
+    });
+    act(() => answerUnsaved('save'));
+    expect(useEditorStore.getState().sheet).toEqual({ kind: 'saveWarnings', closeAfter: 'window' });
+    await expectRefused();
+    expect(closed).toBeNull();
+    act(() => confirmWarnings());
+    await flush();
+    savedRefresh();
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    expect(closed).toBe(true);
+    expect(useEditorStore.getState().phase).toBe('closed');
+  });
+
+  it('失敗のシート・別名で保存・下書きのシートでも閉じる要求を受けない', async () => {
+    // 失敗のシート
+    await openDirty();
+    render(<EditorSheets />);
+    vi.mocked(saveEdit).mockRejectedValueOnce(
+      new IpcError({ code: 'Conflict', message: '版に戻したので開き直してください' }),
+    );
+    requestSave();
+    await flush();
+    expect(useEditorStore.getState().sheet).toMatchObject({ kind: 'saveFailed' });
+    await expectRefused();
+    act(() => dismissSheet());
+
+    // 別名で保存
+    act(() => openSaveAs());
+    expect(useEditorStore.getState().sheet).toEqual({ kind: 'saveAs' });
+    await expectRefused();
+    act(() => dismissSheet());
+    await act(() => closeEditor());
+    vi.mocked(closeEdit).mockClear();
+
+    // 下書きのシート
+    await openDirty({ exists: true, fresh: true, updatedAt: Date.now() });
+    expect(useEditorStore.getState().sheet).toEqual({ kind: 'draft' });
+    await expectRefused();
+  });
+
+  it('保存していない変更がなくても、元に戻す・版の一覧・版に戻すのシートの間は閉じない', async () => {
+    vi.mocked(openEdit).mockResolvedValue(opened({}, { status: status({ dirty: false }) }));
+    await act(() => openEditor(item()));
+    await flush();
+    act(() => openRevert());
+    await expectRefused();
+    act(() => dismissSheet());
+    act(() => openVersions());
+    await expectRefused();
+    act(() => askRestore(1));
+    expect(useEditorStore.getState().sheet).toEqual({ kind: 'restore', version: 1 });
+    await expectRefused();
+    act(() => dismissSheet());
+    // シートを閉じたら、これまでどおり聞かずに閉じる
+    await expect(requestCloseEditor()).resolves.toBe(true);
+    expect(useEditorStore.getState().phase).toBe('closed');
+  });
+});
+
 describe('保存していない変更がないとき', () => {
   it('⌘S・ファイル › 保存は積まない（元の形式に書けなければ形式を変えて積む）', async () => {
     vi.mocked(openEdit).mockResolvedValue(opened({}, { status: status({ dirty: false }) }));
@@ -1281,6 +1459,45 @@ describe('窓を閉じる見張り', () => {
       expect(win.destroy).not.toHaveBeenCalled();
       expect(unlisten).not.toHaveBeenCalled();
       act(() => useEditorStore.setState({ status: status({ dirty: false }) }));
+      expect(unlisten).toHaveBeenCalledTimes(1);
+    } finally {
+      stop();
+      vi.mocked(isTauri).mockReturnValue(false);
+    }
+  });
+});
+
+describe('窓を閉じる見張り（シート）', () => {
+  it('保存していない変更がなくても、シートを出している間は閉じる操作を受けて止め、窓を残す', async () => {
+    vi.mocked(isTauri).mockReturnValue(true);
+    let handler: ((e: { preventDefault: () => void }) => void) | null = null;
+    const unlisten = vi.fn();
+    const win = {
+      onCloseRequested: vi.fn(async (cb: (e: { preventDefault: () => void }) => void) => {
+        handler = cb;
+        return unlisten;
+      }),
+      destroy: vi.fn(async () => undefined),
+    };
+    vi.mocked(getCurrentWindow).mockReturnValue(win as never);
+    const stop = watchWindowClose();
+    try {
+      vi.mocked(openEdit).mockResolvedValue(opened({}, { status: status({ dirty: false }) }));
+      await act(() => openEditor(item()));
+      await flush();
+      expect(win.onCloseRequested).not.toHaveBeenCalled();
+      act(() => openVersions());
+      await flush();
+      expect(win.onCloseRequested).toHaveBeenCalledTimes(1);
+      const preventDefault = vi.fn();
+      act(() => handler?.({ preventDefault }));
+      await flush();
+      expect(preventDefault).toHaveBeenCalled();
+      expect(win.destroy).not.toHaveBeenCalled();
+      expect(useEditorStore.getState().sheet).toEqual({ kind: 'versions' });
+      expect(useEditorStore.getState().phase).toBe('open');
+      // シートを閉じたら受け口を外す（未保存でなければ窓はそのまま閉じられる）
+      act(() => dismissSheet());
       expect(unlisten).toHaveBeenCalledTimes(1);
     } finally {
       stop();
