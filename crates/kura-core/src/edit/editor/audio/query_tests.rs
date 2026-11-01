@@ -241,6 +241,52 @@ fn snap_finds_the_nearest_zero_crossing() {
     assert!(snap(&env.env(), "abc", 0, 10).is_err());
 }
 
+/// A13・A14：`edit_snap`・`edit_measure` は描いている途中の表示を止めない（`Latest` の世代を払い出さずに状態の錠を待つ。止めると、
+/// 止めた要求の代わりの表示がどこからも返らない。画像のスポイトの `sampling_does_not_supersede_a_render` と同じ形）：手の要求が
+/// 錠を待っている間に吸着・計りを頼んでも世代は増えず、錠を放すと手の表示は描かれて公開される。
+#[test]
+fn snap_and_measure_do_not_supersede_a_render() {
+    let env = Env::new();
+    let id = add_audio(&env.lib, &noise_wav(8_000, 2, 3 * C + 11, 54), "wav");
+    let s = env.open(id).session.clone();
+    let editor = env.editor(&s);
+    let guard = editor.lock_state();
+    let issued = editor.latest.latest();
+    std::thread::scope(|scope| {
+        let stepping = scope.spawn(|| {
+            crate::edit::editor::step(
+                &env.env(),
+                &s,
+                vec![add(0, "audio.gain", json!({ "db": -2.0 }))],
+                &Viewport::audio_idle(),
+            )
+            .unwrap()
+        });
+        while editor.latest.latest() < issued + 1 {
+            std::thread::yield_now();
+        }
+        let snapping = scope.spawn(|| snap(&env.env(), &s, 777, 32).unwrap());
+        let measuring = scope.spawn(|| measure(&env.env(), &s).unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            editor.latest.latest(),
+            issued + 1,
+            "吸着・計りは世代を払い出さない"
+        );
+        drop(guard);
+        let stepped = stepping.join().unwrap();
+        let snapped = snapping.join().unwrap();
+        measuring.join().unwrap();
+        assert!(snapped.frame.abs_diff(777) <= 32);
+        let info = shown_audio(&stepped.view);
+        assert_eq!(info.rev, stepped.status.rev);
+        assert_eq!(editor.latest.latest(), issued + 1);
+        let p = editor.lock_published();
+        assert_eq!(p.now.as_ref().map(|n| n.rev), Some(stepped.status.rev));
+    });
+    close(&env.engine, &s);
+}
+
 fn g_gain(db: f64) -> Graph {
     let mut g = Graph::new_single();
     g.push_linear("audio.gain", 1, json!({ "db": db }), 1)
