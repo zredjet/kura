@@ -1938,7 +1938,8 @@ struct ReadInput {
 }
 
 /// 元を読む：音声は遅延の源で開けるならそれ（[`audio::source::open_lazy`]）、アンカーのない長い音声は作業用のファイル
-/// （[`read_work`]）、ほかは今の道（丸ごと読む。アンカーが遅延で使えなかった音声は上限を確かめる）。
+/// （[`read_work`]）、ほかは今の道（丸ごと読む。アンカーが遅延で使えなかった音声は上限を確かめる。アンカーのない短い音声は
+/// 境の判定で値が上限の内と分かっているので確かめない）。
 fn read_input(
     editor: &Editor,
     parts: &OpenParts,
@@ -1967,29 +1968,37 @@ fn read_input(
                 warnings: Vec::new(),
             });
         }
-        if let (None, Some(store)) = (&parts.anchor, &parts.work_pcm)
-            && let Some(o) = read_work(editor, parts, store, limits)?
-        {
-            return Ok(ReadInput {
-                input: o.input,
-                audio: Some(o.info),
-                warnings: Vec::new(),
-            });
+        // アンカーのないものは作業用のファイルの道を試す。None なら、段ごとに確保して読んだ形で値が境以下（か音声でない）と
+        // 分かっている（境 ≤ 丸ごと読む上限なので、上限の確かめは要らない）
+        let short = match (&parts.anchor, &parts.work_pcm) {
+            (None, Some(store)) => match read_work(editor, parts, store, limits)? {
+                Some(o) => {
+                    return Ok(ReadInput {
+                        input: o.input,
+                        audio: Some(o.info),
+                        warnings: Vec::new(),
+                    });
+                }
+                None => true,
+            },
+            _ => false,
+        };
+        if !short {
+            // アンカーが遅延で使えなかったもの：丸ごと読む前に、長さの上限を確かめる（形の読みは確保なし。段 7）
+            let shape = runtime
+                .preview(|_| {
+                    editor.codecs.shape_path_monitored(
+                        &parts.original_path,
+                        parts.format,
+                        &parts.opts,
+                        limits,
+                        editor.cancel.as_ref(),
+                    )
+                })
+                .map_err(|e| EditorError::from_engine("元の大きさを読めません", e))?
+                .0;
+            audio::source::check_whole_read(&shape, runtime.budget().total())?;
         }
-        // アンカーが遅延で使えなかったもの：丸ごと読む前に、長さの上限を確かめる
-        let shape = runtime
-            .preview(|_| {
-                editor.codecs.shape_path_monitored(
-                    &parts.original_path,
-                    parts.format,
-                    &parts.opts,
-                    limits,
-                    editor.cancel.as_ref(),
-                )
-            })
-            .map_err(|e| EditorError::from_engine("元の大きさを読めません", e))?
-            .0;
-        audio::source::check_whole_read(&shape, runtime.budget().total())?;
     }
     let read = source::read(&source::SourceCx {
         runtime,

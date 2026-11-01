@@ -885,6 +885,29 @@ fn opening_reads_the_shape_only_inside_the_budget() {
     );
 }
 
+/// F15・docs の検証の直し：境以下の短い音声（アンカーなし）は、段ごとに確保して形を読んだあと、丸ごと読む上限を確かめる
+/// ための形を読まない（値 ≤ 境 ≤ 丸ごと読む上限なので必ず通る）。予算の外の形の読みは、丸ごと読む今の道
+/// （`editor::source::read`）の 1 回だけ（段 7 に残したこと。docs/editing.md §9.11）。
+#[test]
+fn short_audio_reads_the_shape_outside_the_budget_only_once() {
+    let log = ShapeLog::default();
+    let env = watched_env(SMALL, &log);
+    let flac = long_flac(2 * C);
+    let len = flac.len() as u64;
+    let id = add_audio(&env.lib, &flac, "flac");
+    log.attach(env.engine.runtime().unwrap().budget());
+    let opened = env.open(id);
+    assert!(!opened.source.audio.unwrap().lazy, "短いものは丸ごと読む");
+    // 最初は段ごとに確保して読む（境の判定）。丸ごと読む道の読み（確保した読む段の中の形の確かめ）も確保の中
+    let seen = log.seen();
+    assert!(seen.first().is_some_and(|&u| u >= len), "{seen:?}");
+    assert_eq!(
+        seen.iter().filter(|&&u| u < len).count(),
+        1,
+        "予算の外の形の読み：{seen:?}（ファイルは {len} バイト）"
+    );
+}
+
 /// 段 4B の検証の直し 2：試聴の `/pcm` も、直接読めない形式は予算の外で形を読まない（境の判定・丸ごと読みに使う形は段ごとに
 /// 確保して読む）。空いていなければ、形を読む前に 503。短いもの（丸ごと読む）も同じ。
 #[test]
