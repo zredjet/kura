@@ -84,7 +84,7 @@ export const commands = {
 	editSnap: (session: string, frame: number, radius: number) => typedError<EditSnapDto, AppError>(__TAURI_INVOKE("edit_snap", { session, frame, radius })),
 	/**
 	 *  音声のエディタ：今の rev の出力（量子化のあと）のラウドネス。出力の指紋ごとに覚え、短い音声はその場で計って `ready` を
-	 *  返す（長い音声は段 4B まで `failed`）。描いている途中の表示を止めない。
+	 *  返す（長い音声は計りを予約して `measuring` を返し、`edit_view { work: true }` の裏の仕事で計る）。描いている途中の表示を止めない。
 	 */
 	editMeasure: (session: string) => typedError<EditLoudnessStateDto, AppError>(__TAURI_INVOKE("edit_measure", { session })),
 	/**

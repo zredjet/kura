@@ -467,7 +467,7 @@ impl TimeMap {
 
     /// 写した先の位置 `pos`（フレーム）を、写す前の位置へ戻す（M13 段 4。エディタのハンドル）。`Segments` は `pos` を含む
     /// 写した先の区間から戻し、`Rate { from, to }` は `round_half_even(pos × from / to)`（[`TimeMap::pos`] と同じ丸め。
-    /// 往復は ⌈from/to⌉/2 フレームまでずれうる）。区間の外・`Unknown`・`Reset`・あふれは None。
+    /// 往復は from/(2·to) + 1/2 フレームまでずれうる）。区間の外・`Unknown`・`Reset`・あふれは None。
     pub fn back(&self, pos: u64) -> Option<u64> {
         match self {
             Self::Identity => Some(pos),
