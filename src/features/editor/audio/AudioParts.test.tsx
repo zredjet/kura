@@ -217,6 +217,32 @@ describe('音声エディタの画面', () => {
     expect(screen.getByText(a.lossLossy('MP3'))).toBeInTheDocument();
   });
 
+  it.each(['silent', 'tooShort'])(
+    '計り終えても積分ラウドネスを計れなければ（%s）、理由を出して［この目標にそろえる］は押せない',
+    (reason) => {
+      openState();
+      useAudioStore.setState({
+        loudness: {
+          type: 'ready',
+          samplesId: '00112233aabbccdd',
+          loudness: {
+            loudness: null,
+            loudnessReason: reason,
+            loudnessRange: null,
+            truePeak: null,
+            samplePeak: null,
+          },
+        },
+        loudnessFresh: true,
+      });
+      render(<Editor />);
+      const text = ja.asset.loudnessReasons[reason];
+      expect(text).toBeDefined();
+      expect(screen.getByText(text ?? '')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: a.alignToTarget })).toBeDisabled();
+    },
+  );
+
   it('「元と同じ」と失うものは元のファイルの形式（Rust の originalFormat）で決める（今の拡張子ではない）', () => {
     // MP3 の元を WAV で保存したあと（今の拡張子は wav）、出力は「元と同じ」
     openState();

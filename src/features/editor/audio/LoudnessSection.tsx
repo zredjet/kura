@@ -48,7 +48,7 @@ export function targetDiff(state: EditLoudnessStateDto, target: number): string 
 /**
  * 右パネルのラウドネス（出力の形式の上に固定）：値・目標の選択（−23 LUFS が既定）・目標との差。正規化の操作があれば
  * その目標を出して選択を止める。計っている間・古い間は前の値を tertiary にして「計っています…」を添える。
- * ［この目標にそろえる］で末尾に正規化を足す。
+ * ［この目標にそろえる］（積分ラウドネスを計れたときだけ押せる）で末尾に正規化を足す。
  */
 export function LoudnessSection() {
   const headingId = useId();
@@ -62,6 +62,8 @@ export function LoudnessSection() {
   const line = loudnessLine(loudness);
   const diff = targetDiff(loudness, target);
   const measuring = !fresh && loudness.type !== 'failed';
+  // 積分ラウドネスを計れたときだけそろえられる（無音・短すぎるなどは計り終えても null）
+  const measured = loudness.type === 'ready' && loudness.loudness.loudness !== null;
   const align = () => {
     const desc = opSpec('audio.normalize');
     if (!desc) return;
@@ -109,7 +111,7 @@ export function LoudnessSection() {
         <button
           type="button"
           className={editorStyles.pill}
-          disabled={!open || loudness.type !== 'ready'}
+          disabled={!open || !measured}
           onClick={align}
         >
           {t.alignToTarget}
