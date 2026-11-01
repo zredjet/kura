@@ -215,6 +215,20 @@ impl EngineServices {
         }
     }
 
+    /// アイテム `item_id` を開いている途中のエディタを置き場から外す（開き終えたもの・別のアイテムなら None。開く途中の
+    /// 中止 `editor::cancel_open`）。閉じるのは呼び手。
+    pub(crate) fn take_opening(&self, item_id: i64) -> Option<Arc<Editor>> {
+        let mut slot = self.editor_slot();
+        if slot
+            .as_ref()
+            .is_some_and(|e| e.item_id() == item_id && e.is_opening())
+        {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
     /// 開いているエディタを閉じる（エディタを閉じる・ライブラリを閉じる・切り替える・終了のどれでも同じ：中止 → キャッシュ
     /// を空に → 確保を落とす → 取り置きを 0。docs/editing.md §12.10）。
     pub fn close_editor(&self) {

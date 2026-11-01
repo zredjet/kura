@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  cancelOpenEdit,
   closeEdit,
   type EditStatusDto,
   type EditStepResultDto,
@@ -39,6 +40,7 @@ vi.mock('../../ipc/edit', async (importOriginal) => ({
   stepEdit: vi.fn(),
   viewEdit: vi.fn(),
   closeEdit: vi.fn(async () => null),
+  cancelOpenEdit: vi.fn(async () => null),
   discardEditDraft: vi.fn(async () => true),
 }));
 
@@ -189,6 +191,8 @@ beforeEach(() => {
   vi.mocked(stepEdit).mockReset();
   vi.mocked(viewEdit).mockReset();
   vi.mocked(closeEdit).mockClear();
+  vi.mocked(cancelOpenEdit).mockReset();
+  vi.mocked(cancelOpenEdit).mockImplementation(async () => null);
   vi.mocked(viewEdit).mockImplementation(async () => result());
   vi.mocked(stepEdit).mockImplementation(async () =>
     result({ view: { type: 'shown', view: viewDto(2) } }),
@@ -402,6 +406,68 @@ describe('核と種類ごとのアダプタ', () => {
     expect(closeEdit).toHaveBeenCalledWith('bb02');
     expect(second?.ctx.current()).toBe(false);
     expect(useEditorStore.getState()).toMatchObject({ phase: 'closed', kind: null, item: null });
+  });
+
+  // F15・docs の検証の直し：開いている途中（セッションがまだない）に閉じたら、Rust の開く途中を止める
+  it('開いている途中に閉じると edit_cancel_open でそのアイテムの開く途中を止め、止められて返った Conflict は失敗にしない', async () => {
+    const { factory, made } = fakeKind();
+    let rejectOpen: (e: unknown) => void = () => undefined;
+    vi.mocked(openEdit).mockReturnValueOnce(new Promise((_, reject) => (rejectOpen = reject)));
+    const pending = openEditorAs(factory, AUDIO);
+    expect(useEditorStore.getState().phase).toBe('opening');
+    const closing = closeEditor();
+    expect(cancelOpenEdit).toHaveBeenCalledTimes(1);
+    expect(cancelOpenEdit).toHaveBeenCalledWith(AUDIO.id);
+    expect(closeEdit).not.toHaveBeenCalled();
+    expect(made[0]?.log.at(-1)).toBe('dispose:close');
+    await closing;
+    rejectOpen(new IpcError({ code: 'Conflict', message: '中止しました' }));
+    await pending;
+    expect(useEditorStore.getState()).toMatchObject({ phase: 'closed', failure: null, item: null });
+    expect(closeEdit).not.toHaveBeenCalled();
+  });
+
+  it('止めが間に合わずに開き終えたら、届いたセッションを edit_close で閉じる', async () => {
+    const { factory } = fakeKind();
+    let resolveOpen: (v: ReturnType<typeof opened>) => void = () => undefined;
+    vi.mocked(openEdit).mockReturnValueOnce(new Promise((r) => (resolveOpen = r)));
+    const pending = openEditorAs(factory, AUDIO);
+    await closeEditor();
+    expect(cancelOpenEdit).toHaveBeenCalledWith(AUDIO.id);
+    resolveOpen(opened('dd04'));
+    await pending;
+    expect(closeEdit).toHaveBeenCalledWith('dd04');
+    expect(useEditorStore.getState()).toMatchObject({ phase: 'closed', session: null });
+  });
+
+  it('開いている途中にほかを開くときは edit_cancel_open を送らない（次の edit_open が前のエディタを止める）', async () => {
+    const { factory } = fakeKind();
+    vi.mocked(openEdit).mockReturnValueOnce(new Promise(() => undefined));
+    void openEditorAs(factory, AUDIO);
+    vi.mocked(openEdit).mockResolvedValueOnce(opened('ee05'));
+    await openEditorAs(factory, { ...AUDIO, id: 10 });
+    expect(cancelOpenEdit).not.toHaveBeenCalled();
+    expect(useEditorStore.getState()).toMatchObject({ phase: 'open', session: 'ee05' });
+  });
+
+  it('開く途中を止めた直後に開き直すと、止めの応えを待ってから edit_open を送る（遅れた止めで新しい開く途中を止めない）', async () => {
+    const { factory } = fakeKind();
+    vi.mocked(openEdit).mockReturnValueOnce(new Promise(() => undefined));
+    void openEditorAs(factory, AUDIO);
+    let finishCancel: () => void = () => undefined;
+    vi.mocked(cancelOpenEdit).mockReturnValueOnce(
+      new Promise((r) => (finishCancel = () => r(null))),
+    );
+    void closeEditor();
+    vi.mocked(openEdit).mockResolvedValueOnce(opened('ff06'));
+    const reopening = openEditorAs(factory, AUDIO);
+    await flush();
+    expect(openEdit).toHaveBeenCalledTimes(1);
+    expect(useEditorStore.getState().phase).toBe('opening');
+    finishCancel();
+    await reopening;
+    expect(openEdit).toHaveBeenCalledTimes(2);
+    expect(useEditorStore.getState()).toMatchObject({ phase: 'open', session: 'ff06' });
   });
 
   it('開き直す（下書きから・版に戻したあと）は、最後に開いた種類の口で開く', async () => {

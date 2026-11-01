@@ -198,6 +198,14 @@ export function closeEdit(session: string): Promise<null> {
   return unwrap(commands.editClose(session));
 }
 
+/**
+ * 開く途中のエディタを止める（`openEdit` が返る前に閉じたとき。セッションはまだ分からないのでアイテムで指す）。止められた
+ * `openEdit` は `Conflict` で返る。開き終えたエディタ・別のアイテムには何もしない。
+ */
+export function cancelOpenEdit(itemId: number): Promise<null> {
+  return unwrap(commands.editCancelOpen(itemId));
+}
+
 /** 保存のジョブを積む（保存が待っている間は Busy）。 */
 export function saveEdit(
   session: string,

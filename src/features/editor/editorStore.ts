@@ -7,8 +7,9 @@
  *   `EditorAdapter` が持ち、核はその口だけを呼ぶ。画面に出すものは Zustand に置き、要求は `RequestQueue`（1 つだけ出す）。
  *   開くたびにアダプタを作り、閉じたら捨てる（`dispose`）。
  * - 開く（`openEditorAs`）：前のエディタは閉じる。下書きがあれば下書きのシート（段 5b）。種類からアダプタを選ぶ口は
- *   `editorKinds.ts` の `openEditor`。閉じる（`closeEditor`）：必ず `edit_close` を呼ぶ。未保存で閉じるときのシート・保存の
- *   流れは `editorSave.ts`。ライブラリを切り替える・閉じるときも閉じる（App）。
+ *   `editorKinds.ts` の `openEditor`。閉じる（`closeEditor`）：必ず `edit_close` を呼ぶ（開いている途中でセッションがまだ
+ *   なければ、Rust の開く途中を `edit_cancel_open` で止める）。未保存で閉じるときのシート・保存の流れは `editorSave.ts`。
+ *   ライブラリを切り替える・閉じるときも閉じる（App）。
  * - 右パネル（段 5b）：選んだ操作・操作の並びの手（有効・並べ替え・消す・足す）・引数の手（送り方は `paramSend.ts`）・
  *   出力の形式。引数の欄は、送った手の番号（`sendParam` の戻り値）と、結果が確定した番号（`acked`）を比べて手元の値を
  *   やめる。
@@ -18,6 +19,7 @@
 import { create } from 'zustand';
 
 import {
+  cancelOpenEdit,
   closeEdit,
   discardEditDraft,
   type EditDocDeltaDto,
@@ -342,6 +344,8 @@ function problemFailure(kind: EditorFailure['kind'], p: EditProblemDto): EditorF
 
 interface Runtime {
   token: number;
+  /** 開いたアイテム（開いている途中に閉じたら、これで Rust の開く途中を止める）。 */
+  itemId: number;
   session: string | null;
   adapter: EditorAdapter;
   queue: RequestQueue | null;
@@ -369,6 +373,11 @@ const SUPERSEDED_RETRIES = 2;
 
 let runtime: Runtime | null = null;
 let openToken = 0;
+/**
+ * 応えの来ていない開く途中の中止（`edit_cancel_open`）。次の `edit_open` はこれを待ってから送る（中止が遅れて届くと、同じ
+ * アイテムを開き直した新しい開く途中を止めてしまうため）。
+ */
+let pendingCancel: Promise<void> | null = null;
 /** 最後に開いた種類の口（開き直すときに使う）。 */
 let lastFactory: EditorAdapterFactory | null = null;
 
@@ -385,7 +394,12 @@ function disposeRuntime(
 ): Promise<void> {
   rt.queue?.close();
   rt.adapter.dispose(closing);
-  if (!rt.session) return Promise.resolve();
+  if (!rt.session) {
+    // 開いている途中（edit_open がまだ返らない）：閉じるなら Rust の開く途中を止める（直接読めない形式の長い音声の作業用の
+    // ファイルを最後まで書かせない）。止められた edit_open の Conflict は openEditorAs が捨てる。ほかを開くときは、次の
+    // edit_open が前のエディタを止めるので送らない
+    return closing ? cancelOpening(rt.itemId) : Promise.resolve();
+  }
   return (
     closeEdit(rt.session)
       // 閉じるときに待っている下書きを置くので、捨てるのは閉じ終えてから
@@ -395,6 +409,19 @@ function disposeRuntime(
         (error: unknown) => console.warn('エディタを閉じられませんでした', error),
       )
   );
+}
+
+/** 開く途中のエディタを止める（応えまで `pendingCancel` に置く）。 */
+function cancelOpening(itemId: number): Promise<void> {
+  const canceling = cancelOpenEdit(itemId).then(
+    () => undefined,
+    (error: unknown) => console.warn('開く途中のエディタを止められませんでした', error),
+  );
+  pendingCancel = canceling;
+  void canceling.then(() => {
+    if (pendingCancel === canceling) pendingCancel = null;
+  });
+  return canceling;
 }
 
 /** アダプタから核を呼ぶ口を作る（`rt` が今のものでなければ何もしない）。 */
@@ -439,6 +466,7 @@ export async function openEditorAs<Tag>(
   const adapter = factory.create(item, contextFor<Tag>(holder)) as EditorAdapter;
   const rt: Runtime = {
     token,
+    itemId: item.id,
     session: null,
     adapter,
     queue: null,
@@ -458,8 +486,13 @@ export async function openEditorAs<Tag>(
   adapter.begin?.();
   const viewport = adapter.initialViewport();
   try {
+    if (pendingCancel) {
+      await pendingCancel;
+      if (runtime !== rt) return;
+    }
     const opened = await openEdit(item.id, viewport, options.fromDraft ?? null);
     if (runtime !== rt) {
+      // 閉じた・替えたあとに開き終えた（開く途中の中止が間に合わなかった）
       closeEdit(opened.session).catch(() => undefined);
       return;
     }
@@ -496,6 +529,7 @@ export async function openEditorAs<Tag>(
     // 開いたあとの実際の大きさ・倍率で頼み直す（見積もりと同じなら送らない）
     rt.queue.view(adapter.viewport());
   } catch (error) {
+    // 閉じた・替えたあとの失敗（開く途中の中止で返った Conflict を含む）は出さない
     if (runtime !== rt) return;
     useEditorStore.setState({ phase: 'error', failure: failureOf('open', error) });
   }
@@ -516,8 +550,8 @@ export function reopenEditor(): void {
 }
 
 /**
- * エディタを閉じる（必ず `edit_close` を呼ぶ。未保存かは確かめない：確かめるのは `requestCloseEditor`）。`discardDraft` なら
- * 閉じ終えてから下書きを捨てる（「保存しない」）。
+ * エディタを閉じる（必ず `edit_close` を呼ぶ。開いている途中なら `edit_cancel_open` で開く途中を止める。未保存かは確かめない：
+ * 確かめるのは `requestCloseEditor`）。`discardDraft` なら閉じ終えてから下書きを捨てる（「保存しない」）。
  */
 export function closeEditor(options: { discardDraft?: boolean } = {}): Promise<void> {
   const rt = runtime;

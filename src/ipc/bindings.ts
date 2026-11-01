@@ -95,6 +95,12 @@ export const commands = {
 	/**  エディタを閉じる（キャッシュ・予算の取り置きを外す。待っている下書きは置く）。今のセッションでなければ何もしない。 */
 	editClose: (session: string) => typedError<null, AppError>(__TAURI_INVOKE("edit_close", { session })),
 	/**
+	 *  開く途中のエディタを止める（`edit_open` が返る前に閉じたとき。セッションはまだ分からないのでアイテムで指す）。そのアイテムを
+	 *  開いている途中なら止め、止められた `edit_open` は `Conflict`（中止）で返る（作業用のファイルの書きかけは消える）。開き終えた
+	 *  エディタ・別のアイテム・ライブラリがないときは何もしない。
+	 */
+	editCancelOpen: (itemId: number) => typedError<null, AppError>(__TAURI_INVOKE("edit_cancel_open", { itemId })),
+	/**
 	 *  保存のジョブを積む（確定した頭を保存する。`format` を渡すと先に出力の形式を変える手を確定する）。保存が待っている間は
 	 *  Busy。
 	 */

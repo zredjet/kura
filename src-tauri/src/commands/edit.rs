@@ -1296,6 +1296,24 @@ pub async fn edit_close(state: State<'_, AppState>, session: String) -> Result<(
     .await
 }
 
+/// 開く途中のエディタを止める（`edit_open` が返る前に閉じたとき。セッションはまだ分からないのでアイテムで指す）。そのアイテムを
+/// 開いている途中なら止め、止められた `edit_open` は `Conflict`（中止）で返る（作業用のファイルの書きかけは消える）。開き終えた
+/// エディタ・別のアイテム・ライブラリがないときは何もしない。
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_cancel_open(state: State<'_, AppState>, item_id: i64) -> Result<(), AppError> {
+    let Some(lib) = state.current() else {
+        return Ok(());
+    };
+    blocking(move || {
+        if let Some(engine) = lib.engine() {
+            editor::cancel_open(engine, item_id);
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// 保存のジョブを積む（確定した頭を保存する。`format` を渡すと先に出力の形式を変える手を確定する）。保存が待っている間は
 /// Busy。
 #[tauri::command]

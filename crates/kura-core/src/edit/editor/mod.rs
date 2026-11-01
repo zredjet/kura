@@ -34,7 +34,7 @@ pub mod tile;
 pub mod view;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -539,6 +539,9 @@ pub struct Editor {
     cancel: Arc<CancelFlag>,
     /// None：開いている途中か閉じた。
     state: Mutex<Option<State>>,
+    /// 開き終えた（`finish_open` が状態を置いた）。開く途中の中止（[`cancel_open`]）が、状態の錠（最初の表示を描く間は
+    /// 握ったまま）を待たずに開いている途中かを見分ける。
+    opened: AtomicBool,
     published: Mutex<Published>,
     autosave: Autosave,
 }
@@ -585,6 +588,11 @@ impl Editor {
     /// 編集しているアイテム。
     pub fn item_id(&self) -> i64 {
         self.item_id
+    }
+
+    /// 開いている途中（開き終えていない。置き場にあるものだけに使う：閉じたものも開き終えていなければ真）。
+    pub(crate) fn is_opening(&self) -> bool {
+        !self.opened.load(Ordering::Acquire)
     }
 
     /// 開いたときのコーデックの組（タイルの PNG を書く）。
@@ -1354,6 +1362,21 @@ pub fn close(engine: &EngineServices, session: &str) {
     }
 }
 
+/// 開く途中のエディタを止める（フロントが「開いています…」の間に閉じたとき。セッションは `open` が返るまで分からないので
+/// アイテムで指す）。置き場のエディタがアイテム `item_id` を開いている途中なら、置き場から外して閉じる（ほかを開くときと
+/// 同じ道：中止 → 取り置き・確保を外す）。止められた `open` は `Canceled` で返り、作業用のファイルの書きかけは消える。開き
+/// 終えたエディタ・別のアイテムには何もしない。止めたら真。
+pub fn cancel_open(engine: &EngineServices, item_id: i64) -> bool {
+    match engine.take_opening(item_id) {
+        Some(editor) => {
+            editor.shutdown();
+            tracing::debug!(item_id, "開く途中のエディタを止めました");
+            true
+        }
+        None => false,
+    }
+}
+
 /// 保存を積む（モジュールの説明）。`format` を渡すと、先に出力の形式を変える手を確定する（取り消せる）。
 pub fn save(
     env: &EditorEnv<'_>,
@@ -1640,7 +1663,7 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             false
         });
 
-    // ここからは閉じる・ほかを開くと止まる（エディタを置き場に入れてから読む）
+    // ここからは閉じる・ほかを開く・開く途中の中止（`cancel_open`）で止まる（エディタを置き場に入れてから読む）
     let codecs = env.engine.codecs();
     let editor = Arc::new(Editor {
         id: session_id(),
@@ -1652,6 +1675,7 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
         latest: Latest::new(),
         cancel: Arc::new(CancelFlag::default()),
         state: Mutex::new(None),
+        opened: AtomicBool::new(false),
         published: Mutex::new(Published::default()),
         autosave: Autosave::start(env.library.clone(), item_id, draft_interval()),
     });
@@ -1830,6 +1854,7 @@ fn finish_open(
     let status = Editor::status(&st);
     lend_audio_input(editor, &parts, &st);
     *guard = Some(st);
+    editor.opened.store(true, Ordering::Release);
     drop(guard);
     let view = view?;
     tracing::info!(

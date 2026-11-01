@@ -20,7 +20,9 @@ use serde_json::json;
 use super::session_tests::*;
 use super::source::{WorkCx, make_work, open_work, read_shape_staged, work_threshold};
 use crate::CoreError;
-use crate::edit::editor::{EditorError, OpenRequest, ProblemCode, Viewport, close, open};
+use crate::edit::editor::{
+    EditorError, OpenRequest, ProblemCode, Viewport, cancel_open, close, open,
+};
 use crate::edit::{EngineFactory, RuntimeConfig};
 
 /// 予算 32 MiB：丸ごと読む上限と作業用のファイルの境は 8 MiB（8 kHz モノラルで約 2.1 M フレーム）。
@@ -675,6 +677,95 @@ fn work_file_creation_stops_on_cancel() {
     });
     assert!(files(&dir).is_empty(), "{:?}", files(&dir));
     assert_eq!(env.engine.work_pcm().usage().0, 0);
+    let u = env.usage();
+    assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
+
+    // 開く途中の中止の口（フロントが「開いています…」の間に閉じたとき。セッションはまだ分からない）でも同じに止まる
+    let r = open_and_cancel_while_writing(&env, id, id);
+    assert!(matches!(r, Err(EditorError::Canceled)), "{:?}", r.err());
+    assert!(files(&dir).is_empty(), "{:?}", files(&dir));
+    assert_eq!(env.engine.work_pcm().usage().0, 0);
+    assert!(env.engine.current_editor().is_none());
+    let u = env.usage();
+    assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
+}
+
+/// 別のスレッドで `item_id` を開き、作業用のファイルの書きかけ（.part）が現れたら、まず別のアイテム（`item_id + 1000`）を、
+/// 次に `cancel` を開く途中の中止の口で止める。別のアイテムを指したときは何もしないこと（偽が返る）を確かめ、`cancel` を
+/// 止めたかと `open` の結果を返す。
+fn open_and_cancel_while_writing(
+    env: &Env,
+    item_id: i64,
+    cancel: i64,
+) -> Result<crate::edit::editor::Opened, EditorError> {
+    let dir = env.engine.work_pcm().dir().to_path_buf();
+    let engine = env.engine.clone();
+    std::thread::scope(|scope| {
+        let opening = scope.spawn(|| {
+            open(
+                &env.env(),
+                &OpenRequest {
+                    item_id,
+                    viewport: Viewport::audio_idle(),
+                    from_draft: false,
+                },
+            )
+        });
+        let started = std::time::Instant::now();
+        while !files(&dir)
+            .iter()
+            .any(|p| p.extension().is_some_and(|x| x == "part"))
+        {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "書き始めません"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            !cancel_open(&engine, item_id + 1000),
+            "別のアイテムの開く途中は止めない"
+        );
+        assert!(
+            engine
+                .current_editor()
+                .is_some_and(|e| e.item_id() == item_id),
+            "別のアイテムを指しても、開いている途中のエディタはそのまま"
+        );
+        let stopped = cancel_open(&engine, cancel);
+        let r = opening.join().unwrap();
+        assert_eq!(stopped, cancel == item_id, "{:?}", r.as_ref().err());
+        r
+    })
+}
+
+/// A15：開く途中の中止の口は、そのアイテムを開いている途中のエディタだけを止める。開き終えたエディタ・別のアイテムには
+/// 何もしない（`edit_close` と同じく、閉じる操作が遅れて届いても次に開いたものを壊さない）。
+#[test]
+fn cancel_open_leaves_opened_editors_and_other_items_alone() {
+    let env = Env::with(Arc::new(Budgeted(SMALL)));
+    let flac = long_flac(40 * C);
+    let id = add_audio(&env.lib, &flac, "flac");
+    let other = add_audio(&env.lib, &sine_wav(C, None), "wav");
+    let dir = env.engine.work_pcm().dir().to_path_buf();
+
+    // 開いている途中に別のアイテムを指しても止まらず、開き終える
+    let opened = open_and_cancel_while_writing(&env, id, other).unwrap();
+    assert!(opened.source.audio.unwrap().lazy);
+    assert_eq!(files(&dir).len(), 1, "作業用のファイルを作り終えた");
+
+    // 開き終えたエディタには効かない（同じアイテムでも）
+    assert!(!cancel_open(&env.engine, id));
+    assert!(!cancel_open(&env.engine, other));
+    assert!(env.engine.editor_for(&opened.session).is_some());
+    let out = env.step(
+        &opened.session,
+        vec![add(0, "audio.gain", json!({ "db": -3.0 }))],
+        &Viewport::audio_idle(),
+    );
+    shown_audio(&out.view);
+    close(&env.engine, &opened.session);
+    assert!(files(&dir).is_empty(), "{:?}", files(&dir));
     let u = env.usage();
     assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
 }
