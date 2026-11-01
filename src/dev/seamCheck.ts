@@ -5,7 +5,8 @@
  * 試聴を始めるたびに、同じバッファ（/pcm から読んだ PCM）と同じ組み立て（本体を loop で回す・前奏のあとに本体を置く・
  * 継ぎ目の前後を続けて鳴らす。始める時刻はフレームの境、バッファの中の始まりは「フレーム ÷ レート」の秒）を
  * OfflineAudioContext で描き、期待の標本（PCM を計画の順につないだもの）と 1 標本ずつ照らす。
- * 結果は `bench_report('audition-seam', …)` でログに出す（完了条件「ループの試聴に継ぎ目がない」は mismatches = 0）。
+ * 結果は `bench_report('audition-seam', …)` でログに出す（完了条件「ループの試聴に継ぎ目がない」は mismatches = 0。違いは
+ * 聞こえない差（`SEAM_TOLERANCE`）を超えたものだけを数え、1 標本ずつ一致しなかった数 `inexact` と差の最大 `maxDiff` も出す）。
  *
  * 本物の試聴との違い：OfflineAudioContext は 0 秒から描くので、始める時刻は 0 を起点にする（本物は文脈の今の時刻の
  * 少し先のフレームの境）。前奏と本体が長くて描く長さが上限を超えるときは、前奏の終わりの手前から始める窓と、本体の
@@ -150,39 +151,66 @@ export function expectedSamples(
   return out;
 }
 
+/**
+ * 聞こえない差として許す幅（2^-24 ≈ 6.0e-8。−144 dBFS）。書き出す整数の形式のいちばん細かい 24 ビットの 1 段（2^-23）より
+ * 小さく、どの形式に書いても区別できない。WebKit の OfflineAudioContext は、始める時刻（秒）が標本の境に乗らないと標本の途中
+ * から補間して鳴らすので、0 ちょうどの標本に 1e-14 ほどの残りが出る（0 でない標本は float32 に丸めると元に戻る）。区間を秒で
+ * 置く限りこれは避けられないので、1 標本ずつの一致ではなくこの幅で判定し、一致しなかった数と差の最大は別に報告する
+ * （docs/architecture.md §13・ADR-179）。
+ */
+export const SEAM_TOLERANCE = 2 ** -24;
+
 /** 照らした結果。 */
 export interface Comparison {
   frames: number;
-  /** 1 チャンネルでも違ったフレームの数。 */
+  /** 1 チャンネルでも許す幅（`SEAM_TOLERANCE`）を超えて違ったフレームの数（合格は 0）。 */
   mismatches: number;
+  /** 1 チャンネルでも 1 標本ずつは一致しなかったフレームの数（幅の内の差を含む。見張りのための数）。 */
+  inexact: number;
+  /** 差の最大（NaN の食い違い・足りない標本は Infinity）。 */
+  maxDiff: number;
+  /** 許す幅を超えた最初の違い。 */
   first: { frame: number; channel: number; expected: number; got: number } | null;
 }
 
-function same(a: number, b: number): boolean {
-  return a === b || (Number.isNaN(a) && Number.isNaN(b));
+/** 2 つの標本の差（どちらも NaN なら 0、片方だけなら Infinity）。 */
+function diff(a: number, b: number): number {
+  if (Number.isNaN(a) || Number.isNaN(b)) return Number.isNaN(a) && Number.isNaN(b) ? 0 : Infinity;
+  return Math.abs(a - b);
 }
 
-/** 描いた標本と期待の標本を 1 標本ずつ照らす（足りないチャンネル・フレームは違いとして数える）。 */
+/**
+ * 描いた標本と期待の標本を 1 標本ずつ照らす（足りないチャンネル・フレームは違いとして数える）。違いは許す幅で判定し、
+ * 幅の内でも一致しなかったフレームは `inexact` に数える。
+ */
 export function compareSamples(
   expected: readonly Float32Array[],
   got: readonly Float32Array[],
+  tolerance = SEAM_TOLERANCE,
 ): Comparison {
   const frames = expected[0]?.length ?? 0;
   let mismatches = 0;
+  let inexact = 0;
+  let maxDiff = 0;
   let first: Comparison['first'] = null;
   for (let k = 0; k < frames; k++) {
     let bad = false;
+    let off = false;
     for (const [ch, want] of expected.entries()) {
       const e = want[k] ?? 0;
       const g = got[ch]?.[k];
-      if (g === undefined || !same(e, g)) {
+      const d = g === undefined ? Infinity : diff(e, g);
+      if (d > maxDiff) maxDiff = d;
+      if (d > 0) off = true;
+      if (d > tolerance) {
         bad = true;
         first ??= { frame: k, channel: ch, expected: e, got: g ?? Number.NaN };
       }
     }
     if (bad) mismatches++;
+    if (off) inexact++;
   }
-  return { frames, mismatches, first };
+  return { frames, mismatches, inexact, maxDiff, first };
 }
 
 /** 窓を描く口（本物は OfflineAudioContext。テストでは偽物）。 */
@@ -221,6 +249,9 @@ export interface SeamReport {
   seams: number;
   frames: number;
   mismatches: number;
+  inexact: number;
+  /** 差の最大（JSON では Infinity が null になる）。 */
+  maxDiff: number;
   first: Comparison['first'];
   ms: number;
 }
@@ -242,6 +273,8 @@ export async function runSeamCheck(
   let seams = 0;
   let frames = 0;
   let mismatches = 0;
+  let inexact = 0;
+  let maxDiff = 0;
   let first: Comparison['first'] = null;
   for (const w of windows) {
     const got = await render(w, pcms, rate, channels);
@@ -249,6 +282,8 @@ export async function runSeamCheck(
     seams += w.seams.length;
     frames += result.frames;
     mismatches += result.mismatches;
+    inexact += result.inexact;
+    maxDiff = Math.max(maxDiff, result.maxDiff);
     first ??= result.first;
   }
   return {
@@ -260,6 +295,8 @@ export async function runSeamCheck(
     seams,
     frames,
     mismatches,
+    inexact,
+    maxDiff,
     first,
     ms: Math.round(now() - started),
   };
@@ -335,13 +372,17 @@ export interface EditorSeamReport {
   seams: number;
   frames: number;
   mismatches: number;
+  inexact: number;
+  /** 差の最大（JSON では Infinity が null になる）。 */
+  maxDiff: number;
   first: Comparison['first'];
   ms: number;
 }
 
 /**
  * エディタの置き方（区間ごとのバッファを、前の区間の終わりのフレームに続けて置く。ループの折り返しも同じ）を
- * OfflineAudioContext で描き、PCM をつないだものと 1 標本ずつ照らす。照らす窓がなければ null。
+ * OfflineAudioContext で描き、PCM をつないだものと 1 標本ずつ照らす（違いは聞こえない差 `SEAM_TOLERANCE` で判定）。
+ * 照らす窓がなければ null。
  */
 export async function runEditorSeamCheck(
   records: readonly PlacedRecord[],
@@ -361,6 +402,8 @@ export async function runEditorSeamCheck(
     seams: window.seams.length,
     frames: result.frames,
     mismatches: result.mismatches,
+    inexact: result.inexact,
+    maxDiff: result.maxDiff,
     first: result.first,
     ms: Math.round(now() - started),
   };

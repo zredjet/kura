@@ -15,6 +15,7 @@ import {
   runCrossfadeCheck,
   runEditorSeamCheck,
   runSeamCheck,
+  SEAM_TOLERANCE,
   type SeamWindow,
   seamWindows,
 } from './seamCheck';
@@ -125,15 +126,41 @@ describe('継ぎ目の自己点検（VITE_KURA_CHECK）', () => {
     expect(compareSamples(a, [Float32Array.of(0, 1, 2), Float32Array.of(5, 6, 7)])).toEqual({
       frames: 3,
       mismatches: 0,
+      inexact: 0,
+      maxDiff: 0,
       first: null,
     });
     const b = compareSamples(a, [Float32Array.of(0, 1, 2.5), Float32Array.of(5, 6.5, 7)]);
     expect(b.mismatches).toBe(2);
+    expect(b.inexact).toBe(2);
+    expect(b.maxDiff).toBe(0.5);
     expect(b.first).toEqual({ frame: 1, channel: 1, expected: 6, got: 6.5 });
-    expect(compareSamples(a, [Float32Array.of(0, 1, 2)]).mismatches).toBe(3);
+    const short = compareSamples(a, [Float32Array.of(0, 1, 2)]);
+    expect(short.mismatches).toBe(3);
+    expect(short.maxDiff).toBe(Infinity);
     expect(
       compareSamples([Float32Array.of(Number.NaN)], [Float32Array.of(Number.NaN)]).mismatches,
     ).toBe(0);
+    expect(compareSamples([Float32Array.of(Number.NaN)], [Float32Array.of(0)]).mismatches).toBe(1);
+  });
+
+  it('聞こえない差（2^-24 以下）は違いに数えず、1 標本ずつ一致しなかった数と差の最大だけに出す', () => {
+    expect(SEAM_TOLERANCE).toBe(2 ** -24);
+    // WebKit が標本の途中から鳴らして、0 ちょうどの標本に残る 1e-14 ほどの値（実機の edit-seam で見たもの）
+    const residue = compareSamples(
+      [Float32Array.of(0, 0.5, 0)],
+      [Float32Array.of(1.1086617734967774e-14, 0.5, -9.7e-15)],
+    );
+    expect(residue).toMatchObject({ mismatches: 0, inexact: 2, first: null });
+    expect(residue.maxDiff).toBeGreaterThan(0);
+    expect(residue.maxDiff).toBeLessThanOrEqual(SEAM_TOLERANCE);
+    // 幅ちょうどは許し、それを超えれば違い
+    expect(compareSamples([Float32Array.of(0)], [Float32Array.of(SEAM_TOLERANCE)]).mismatches).toBe(
+      0,
+    );
+    const over = compareSamples([Float32Array.of(0, 0)], [Float32Array.of(0, 2 ** -23)]);
+    expect(over).toMatchObject({ mismatches: 1, inexact: 1, maxDiff: 2 ** -23 });
+    expect(over.first).toEqual({ frame: 1, channel: 0, expected: 0, got: 2 ** -23 });
   });
 
   it('試聴 1 回分を照らして報告にまとめる（ずれがあれば数える）', async () => {
