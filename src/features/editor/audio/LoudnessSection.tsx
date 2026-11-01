@@ -47,7 +47,8 @@ export function targetDiff(state: EditLoudnessStateDto, target: number): string 
 
 /**
  * 右パネルのラウドネス（出力の形式の上に固定）：値・目標の選択（−23 LUFS が既定）・目標との差。正規化の操作があれば
- * その目標を出して選択を止める。計っている間・古い間は前の値を tertiary にして「計っています…」を添える。
+ * その目標を出して選択を止める。計っている間・古い間は前の値を tertiary にして「計っています…」を添える（前の値が
+ * なければ「計っています…」だけ。開くとすぐ計りを頼むので、計る前もこれ）。
  * ［この目標にそろえる］（積分ラウドネスを計れたときだけ押せる）で末尾に正規化を足す。
  */
 export function LoudnessSection() {
@@ -85,9 +86,7 @@ export function LoudnessSection() {
         {t.loudnessTitle}
       </h3>
       <p className={styles.loudnessValue} data-stale={measuring || undefined}>
-        {loudness.type === 'failed'
-          ? t.measureFailed(loudness.message)
-          : (line ?? (measuring ? t.measuring : t.notMeasured))}
+        {loudness.type === 'failed' ? t.measureFailed(loudness.message) : (line ?? t.measuring)}
       </p>
       {measuring && line && (
         <p className={styles.loudnessNote} role="status">

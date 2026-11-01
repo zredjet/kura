@@ -217,6 +217,14 @@ describe('音声エディタの画面', () => {
     expect(screen.getByText(a.lossLossy('MP3'))).toBeInTheDocument();
   });
 
+  it('計る前（開いてすぐ計りを頼むので、まだ値が届いていない）も「計っています…」で、そろえるボタンは押せない', () => {
+    openState();
+    render(<Editor />);
+    const section = screen.getByRole('region', { name: a.loudnessTitle });
+    expect(within(section).getByText(a.measuring)).toHaveAttribute('data-stale', 'true');
+    expect(within(section).getByRole('button', { name: a.alignToTarget })).toBeDisabled();
+  });
+
   it.each(['silent', 'tooShort'])(
     '計り終えても積分ラウドネスを計れなければ（%s）、理由を出して［この目標にそろえる］は押せない',
     (reason) => {

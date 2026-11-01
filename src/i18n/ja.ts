@@ -1228,7 +1228,6 @@ export const ja = {
       normalizeTarget: '正規化の目標',
       alignToTarget: 'この目標にそろえる',
       measureFailed: (m: string) => `ラウドネスを計れませんでした：${m}`,
-      notMeasured: 'まだ計っていません',
       // 失うもの
       losses: '保存で失うもの',
       lossLoop: (fmt: string) => `${fmt} ではループ点を保存できません`,
