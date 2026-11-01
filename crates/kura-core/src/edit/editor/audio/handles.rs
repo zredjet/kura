@@ -6,7 +6,8 @@
 //!   （末尾なので下流の写しはなく、値はそのまま引数）。
 //!   写せなければ `Invalid`。
 //! - **印**（[`node_views`]）：連鎖のノードごとの入力のレート・長さと、引数の位置を下流の写しで出力のフレームに写したもの
-//!   （trim は自分の写しを当てない：切り詰めの道具はこのノードを仮に外して入力を出している間に枠を出すため）。
+//!   （trim は自分の写しを当てない：切り詰めの道具はこのノードを仮に外して入力を出している間に枠を出すため）。フェードは
+//!   三角の位置（`in_end`・`out_start`）に加えて、曲線を引くための見かけの始まり・終わり（[`fade_marks`]）。
 
 use kura_engine::doc::NodeId;
 use kura_engine::render::TimeLink;
@@ -14,7 +15,7 @@ use kura_engine::session::{CommitMode, Edit, ParamsView, Snapshot};
 use kura_engine::{Engine, EngineError, Issue, IssueCode, Issues};
 use serde_json::{Value as Json, json};
 
-use super::timeline::{backward, backward_end, forward, forward_end, rate_frames};
+use super::timeline::{backward, backward_end, forward, forward_end, forward_line, rate_frames};
 
 /// ハンドル（どれも表示している出力のフレーム）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,9 +57,13 @@ pub enum Marks {
         start: u64,
         end: u64,
     },
+    /// フェード。`in_end`・`out_start` は三角（ハンドル）の位置。`in_start`・`out_end` は曲線を引く見かけの始まり・終わり
+    /// （符号つき。下流で頭・終わりを切られていれば出力の範囲の外）。どれも長さ 0・写せなければ None。
     Fade {
+        in_start: Option<i64>,
         in_end: Option<u64>,
         out_start: Option<u64>,
+        out_end: Option<i64>,
     },
     Loop {
         start: u64,
@@ -253,6 +258,26 @@ pub fn handle_edit(
     Ok(Edit::Replace { graph })
 }
 
+/// フェードの印。`down` はノードより下流の写し、`in_frames` はノードの入力の長さ（フェードは時間を変えないので出力の長さも同じ）。
+///
+/// - 三角：`in_end` は `fadeIn`（入力の長さで切る）を `forward_end`、`out_start` は `in_frames − fadeOut` を `forward` で写す
+///   （手の写し方と対）。
+/// - 見かけの始まり `in_start`・終わり `out_end`：フェードインの区間 `[0, fadeIn)`（フェードアウトは `[in_frames − fadeOut,
+///   in_frames)`）の出力に写る部分の写しを 1 本の直線で延ばし、入力の 0（入力の終わり）を写した位置（[`forward_line`]）。
+///   三角が写せないとき・区間が継ぎ目にかかるときは None（フロントは曲線を描かない）。
+pub fn fade_marks(down: &[TimeLink], in_frames: u64, fade_in: u64, fade_out: u64) -> Marks {
+    let fin = fade_in.min(in_frames);
+    let out_from = in_frames.saturating_sub(fade_out);
+    let in_end = (fade_in > 0).then(|| forward_end(down, fin)).flatten();
+    let out_start = (fade_out > 0).then(|| forward(down, out_from)).flatten();
+    Marks::Fade {
+        in_start: in_end.and_then(|_| forward_line(down, (0, fin), 0)),
+        in_end,
+        out_start,
+        out_end: out_start.and_then(|_| forward_line(down, (out_from, in_frames), in_frames)),
+    }
+}
+
 /// 連鎖のノードの表示（モジュールの説明）。
 pub fn node_views(chain: &[TimeLink], head: &Snapshot) -> Vec<AudioNodeView> {
     chain
@@ -272,14 +297,12 @@ pub fn node_views(chain: &[TimeLink], head: &Snapshot) -> Vec<AudioNodeView> {
                             end: forward_end(down, e)?,
                         })
                     }),
-                "audio.fade" => {
-                    let fin = num("fadeIn").filter(|n| *n > 0);
-                    let fout = num("fadeOut").filter(|n| *n > 0);
-                    Some(Marks::Fade {
-                        in_end: fin.and_then(|n| forward_end(down, n.min(in_frames))),
-                        out_start: fout.and_then(|n| forward(down, in_frames.saturating_sub(n))),
-                    })
-                }
+                "audio.fade" => Some(fade_marks(
+                    down,
+                    in_frames,
+                    num("fadeIn").unwrap_or(0),
+                    num("fadeOut").unwrap_or(0),
+                )),
                 "audio.set_loop" => p.get("loop").and_then(|r| {
                     let (s, e) = (r.get("start")?.as_u64()?, r.get("end")?.as_u64()?);
                     Some(Marks::Loop {
@@ -299,4 +322,110 @@ pub fn node_views(chain: &[TimeLink], head: &Snapshot) -> Vec<AudioNodeView> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kura_engine::mapping::{Seg, TimeMap};
+    use kura_engine::{Dim, Shape};
+
+    fn audio(frames: u64) -> Shape {
+        Shape::Audio {
+            rate: 8_000,
+            channels: 1,
+            frames: Dim::Exact(frames),
+        }
+    }
+
+    fn segs(list: &[(u64, u64, u64)], frames: u64, out: u64) -> TimeLink {
+        TimeLink {
+            node: NodeId(9),
+            op: "x".into(),
+            enabled: true,
+            time: TimeMap::Segments {
+                segs: list
+                    .iter()
+                    .map(|&(src_start, src_end, dst_start)| Seg {
+                        src_start,
+                        src_end,
+                        dst_start,
+                    })
+                    .collect(),
+            },
+            input: audio(frames),
+            output: audio(out),
+        }
+    }
+
+    /// 下流がなければ、見かけの始まりは 0・終わりは入力の長さ（三角と同じ所から曲線を引く今までの描き方と同じ）。長さ 0 は None。
+    #[test]
+    fn fade_marks_without_downstream() {
+        assert_eq!(
+            fade_marks(&[], 10_000, 3_000, 2_000),
+            Marks::Fade {
+                in_start: Some(0),
+                in_end: Some(3_000),
+                out_start: Some(8_000),
+                out_end: Some(10_000),
+            }
+        );
+        assert_eq!(
+            fade_marks(&[], 10_000, 0, 0),
+            Marks::Fade {
+                in_start: None,
+                in_end: None,
+                out_start: None,
+                out_end: None,
+            }
+        );
+    }
+
+    /// フェードの区間の出力に写る部分が継ぎ目にかかる（真ん中を抜いて継ぐ）・写しが分からないと、見かけの始まり・終わりは
+    /// None（三角はそれぞれ写せれば出す）。
+    #[test]
+    fn fade_marks_refuse_seams_and_unknown_maps() {
+        // [0, 1,000) と [2,000, 10,000) を継ぐ：フェードイン [0, 3,000) は継ぎ目にかかる。フェードアウト [8,000, 10,000) は 1 本
+        let cut = segs(&[(0, 1_000, 0), (2_000, 10_000, 1_000)], 10_000, 9_000);
+        assert_eq!(
+            fade_marks(std::slice::from_ref(&cut), 10_000, 3_000, 2_000),
+            Marks::Fade {
+                in_start: None,
+                in_end: Some(2_000),
+                out_start: Some(7_000),
+                out_end: Some(9_000),
+            }
+        );
+        // フェードアウトの区間が継ぎ目にかかる
+        let cut = segs(&[(0, 8_500, 0), (9_000, 10_000, 8_500)], 10_000, 9_500);
+        assert_eq!(
+            fade_marks(&[cut], 10_000, 0, 2_000),
+            Marks::Fade {
+                in_start: None,
+                in_end: None,
+                out_start: Some(8_000),
+                out_end: None,
+            }
+        );
+        // 写しが分からない：三角も見かけの位置も None
+        for time in [TimeMap::Unknown, TimeMap::Reset] {
+            let l = TimeLink {
+                node: NodeId(9),
+                op: "x".into(),
+                enabled: true,
+                time,
+                input: audio(10_000),
+                output: audio(10_000),
+            };
+            assert_eq!(
+                fade_marks(&[l], 10_000, 3_000, 2_000),
+                Marks::Fade {
+                    in_start: None,
+                    in_end: None,
+                    out_start: None,
+                    out_end: None,
+                }
+            );
+        }
+    }
 }

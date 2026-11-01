@@ -211,6 +211,10 @@ export function overlayOf(s: AudioEditorState): WaveOverlay {
   const marks = fadeNode?.marks?.type === 'fade' ? fadeNode.marks : null;
   const inEnd = s.local?.fadeIn ?? marks?.inEnd ?? 0;
   const outStart = s.local?.fadeOut ?? marks?.outStart ?? total;
+  // 曲線の見かけの始まり・終わり（印のまま。null は写せないので描かない）。ノードがなければ末尾に足す（下流がない）ので
+  // 0 と出力の長さ
+  const inStart = fadeNode === null ? 0 : (marks?.inStart ?? null);
+  const outEnd = fadeNode === null ? total : (marks?.outEnd ?? null);
   const showFade = s.tool === 'fade' || (marks !== null && (inEnd > 0 || outStart < total));
   const loop = s.local && 'loop' in s.local ? (s.local.loop ?? null) : view.loop;
   return {
@@ -219,8 +223,10 @@ export function overlayOf(s: AudioEditorState): WaveOverlay {
     trim: s.trim && s.trim.bounds !== null ? { start: s.trim.start, end: s.trim.end } : null,
     fade: showFade
       ? {
+          inStart,
           inEnd: Math.min(total, Math.max(0, inEnd)),
           outStart: Math.min(total, Math.max(0, outStart)),
+          outEnd,
           curve: curveOf(fadeNode),
           handles: s.tool === 'fade',
         }

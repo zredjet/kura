@@ -2,6 +2,7 @@
 //!
 //! - [`forward`]・[`forward_end`]：連鎖を順に写す（入力 → 出力）。区間の終わりは `_end`（`Segments` の終わりちょうども写す）。
 //! - [`backward`]・[`backward_end`]：逆に写す（出力 → 入力）。`Rate` の往復は丸めの分（from/(2·to) + 1/2 フレーム）までずれうる。
+//! - [`forward_line`]：区間の出力に写る部分の写し（1 本の直線）を延ばす（フェードの見かけの始まり・終わり。符号つき）。
 //! - [`source_map`]：出力のフレームを元（入力 0）のフレームへ写す区分の列。意味は
 //!   `in = in_start + round((out − out_start) × in_rate / out_rate)`。`Unknown`・`Reset` があれば None。ふつうは 1 区分。
 
@@ -50,6 +51,60 @@ pub fn backward(links: &[TimeLink], pos: u64) -> Option<u64> {
 /// 区間の終わりを連鎖の逆に写す。
 pub fn backward_end(links: &[TimeLink], end: u64) -> Option<u64> {
     links.iter().rev().try_fold(end, |p, l| l.time.back_end(p))
+}
+
+fn gcd(mut a: i128, mut b: i128) -> i128 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.abs()
+}
+
+/// 区間 `[lo, hi)`（連鎖の入力のフレーム）の出力に写る部分が 1 本の直線に収まるとき、その直線を延ばして入力の位置 `at` を
+/// 写した出力の位置（符号つき。出力の頭より前なら負、出力の終わりより後もある）。フェードの見かけの始まり・終わりに使う。
+///
+/// 直線は区間が通る区分のずらし（`Segments`）とレートの比（`Rate`）を重ねた有理数の式で持ち、最後に 1 回 round half even で
+/// 丸める（`Rate` の写しと同じ丸め）。区間の出力に写る部分が `Segments` の 2 つ以上の区分にかかる（継ぎ目）・どれにも
+/// かからない・空、`Unknown`・`Reset`・あふれは None。
+pub fn forward_line(links: &[TimeLink], range: (u64, u64), at: u64) -> Option<i64> {
+    let (mut lo, mut hi) = range;
+    // 出力 = (入力 · num + add) / den
+    let (mut num, mut add, mut den) = (1i128, 0i128, 1i128);
+    for link in links {
+        if lo >= hi {
+            return None;
+        }
+        match &link.time {
+            TimeMap::Identity => {}
+            TimeMap::Segments { segs } => {
+                let mut hit = segs.iter().filter(|s| s.src_start < hi && lo < s.src_end);
+                let s = hit.next()?;
+                if hit.next().is_some() {
+                    return None;
+                }
+                let shift = i128::from(s.dst_start) - i128::from(s.src_start);
+                add = add.checked_add(shift.checked_mul(den)?)?;
+                lo = s.dst_start.checked_add(lo.max(s.src_start) - s.src_start)?;
+                hi = s.dst_start.checked_add(hi.min(s.src_end) - s.src_start)?;
+            }
+            TimeMap::Rate { from, to } => {
+                lo = link.time.pos(lo)?;
+                hi = link.time.pos_end(hi)?;
+                num = num.checked_mul(i128::from(*to))?;
+                add = add.checked_mul(i128::from(*to))?;
+                den = den.checked_mul(i128::from(*from))?;
+                let g = gcd(gcd(num, add), den);
+                if g > 1 {
+                    (num, add, den) = (num / g, add / g, den / g);
+                }
+            }
+            TimeMap::Unknown | TimeMap::Reset => return None,
+        }
+    }
+    if lo >= hi {
+        return None;
+    }
+    div_round_half_even(i128::from(at).checked_mul(num)?.checked_add(add)?, den)
 }
 
 /// 区分の中の位置 `out` の元の位置。
@@ -194,6 +249,136 @@ mod tests {
         );
         let unknown = link(TimeMap::Unknown, audio(8_000, 10), audio(8_000, 10));
         assert_eq!(source_map(&[unknown], &audio(8_000, 10)), None);
+    }
+
+    fn trim(start: u64, end: u64, frames: u64) -> TimeLink {
+        link(
+            TimeMap::Segments {
+                segs: vec![Seg {
+                    src_start: start,
+                    src_end: end,
+                    dst_start: 0,
+                }],
+            },
+            audio(8_000, frames),
+            audio(8_000, end - start),
+        )
+    }
+
+    fn rate(from: u32, to: u32, frames: u64, out: u64) -> TimeLink {
+        link(
+            TimeMap::Rate { from, to },
+            audio(from, frames),
+            audio(to, out),
+        )
+    }
+
+    /// 区間の出力に写る部分の直線を延ばす：下流がなければそのまま、trim で頭を切ると負、レートは比を掛け、最後に 1 回
+    /// round half even で丸める。
+    #[test]
+    fn forward_line_extends_the_mapping_of_the_visible_part() {
+        // 下流がない：そのまま
+        assert_eq!(forward_line(&[], (0, 3_000), 0), Some(0));
+        assert_eq!(forward_line(&[], (7_000, 10_000), 10_000), Some(10_000));
+        // trim [1,000, 9,000)：フェードイン [0, 3,000) の見かけの始まりは −1,000、終わりの延長は入力の終わりの先
+        let t = [trim(1_000, 9_000, 10_000)];
+        assert_eq!(forward_line(&t, (0, 3_000), 0), Some(-1_000));
+        assert_eq!(forward_line(&t, (0, 3_000), 3_000), Some(2_000));
+        assert_eq!(forward_line(&t, (7_000, 10_000), 10_000), Some(9_000));
+        // trim のあとに 8 → 16 kHz：比を掛ける
+        let tr = [
+            trim(1_000, 9_000, 10_000),
+            rate(8_000, 16_000, 8_000, 16_000),
+        ];
+        assert_eq!(forward_line(&tr, (0, 3_000), 0), Some(-2_000));
+        assert_eq!(forward_line(&tr, (7_000, 10_000), 10_000), Some(18_000));
+        // 先に 3 → 2 のレート、そのあと trim [1, …)：直線は (2x − 3) / 3 で、x = 0 は −1
+        let rt = [
+            link(
+                TimeMap::Rate { from: 3, to: 2 },
+                audio(3, 300),
+                audio(2, 200),
+            ),
+            link(
+                TimeMap::Segments {
+                    segs: vec![Seg {
+                        src_start: 1,
+                        src_end: 200,
+                        dst_start: 0,
+                    }],
+                },
+                audio(2, 200),
+                audio(2, 199),
+            ),
+        ];
+        assert_eq!(forward_line(&rt, (0, 30), 0), Some(-1));
+        // 4 → 8 kHz・trim [1, …)・8 → 4 kHz：直線は (2x − 1) / 2。半分ちょうどは偶数へ（x = 0 は −1/2 → 0）
+        let half = [
+            rate(4_000, 8_000, 10, 20),
+            link(
+                TimeMap::Segments {
+                    segs: vec![Seg {
+                        src_start: 1,
+                        src_end: 20,
+                        dst_start: 0,
+                    }],
+                },
+                audio(8_000, 20),
+                audio(8_000, 19),
+            ),
+            rate(8_000, 4_000, 19, 10),
+        ];
+        assert_eq!(forward_line(&half, (0, 5), 0), Some(0));
+        assert_eq!(
+            forward_line(&half, (0, 5), 3),
+            Some(2),
+            "(6 − 1) / 2 = 2.5 → 2"
+        );
+    }
+
+    /// 区間の出力に写る部分が 1 本の直線で写せない（区分の継ぎ目にかかる・どこにも写らない）、写しが分からない、あふれは None。
+    #[test]
+    fn forward_line_refuses_seams_and_unknown_maps() {
+        // 区間 [0, 3,000) が 2 つの区分にかかる（真ん中を抜いて継ぐ）
+        let cut = link(
+            TimeMap::Segments {
+                segs: vec![
+                    Seg {
+                        src_start: 0,
+                        src_end: 1_000,
+                        dst_start: 0,
+                    },
+                    Seg {
+                        src_start: 2_000,
+                        src_end: 10_000,
+                        dst_start: 1_000,
+                    },
+                ],
+            },
+            audio(8_000, 10_000),
+            audio(8_000, 9_000),
+        );
+        assert_eq!(
+            forward_line(std::slice::from_ref(&cut), (0, 3_000), 0),
+            None
+        );
+        // 継ぎ目の後ろだけにかかる区間は 1 本で写せる
+        assert_eq!(forward_line(&[cut], (7_000, 10_000), 10_000), Some(9_000));
+        // どこにも写らない（trim の外）
+        assert_eq!(
+            forward_line(&[trim(5_000, 9_000, 10_000)], (0, 3_000), 0),
+            None
+        );
+        // 区間が空
+        assert_eq!(forward_line(&[], (0, 0), 0), None);
+        // 写しが分からない
+        for time in [TimeMap::Unknown, TimeMap::Reset] {
+            let l = link(time, audio(8_000, 10), audio(8_000, 10));
+            assert_eq!(forward_line(&[l], (0, 5), 0), None);
+        }
+        // あふれ（i64 に収まらない）
+        let big = [rate(1, u32::MAX, 10, 10)];
+        assert_eq!(forward_line(&big, (0, 10), u64::MAX), None);
     }
 
     #[test]

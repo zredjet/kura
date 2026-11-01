@@ -33,6 +33,40 @@ export const HIT_PX = 6;
 /** フェードの三角のハンドルの大きさ（CSS px）。 */
 export const FADE_HANDLE_PX = 10;
 
+/** フェードの曲線の 1 点（出力のフレームとゲイン 0〜1）。 */
+export interface FadePoint {
+  frame: number;
+  gain: number;
+}
+
+/**
+ * フェードの曲線の点。フェードは見かけの始まり `from` から見かけの終わり `to`（出力のフレーム。下流で頭・終わりを
+ * 切られていれば出力の範囲の外もある）に掛かり、`rising`（フェードイン）なら from で 0・to で 1、そうでなければ
+ * from で 1・to で 0。形は `equalPower` なら sin(πu/2)、ほかは直線（u は見かけの区間で測る）。出力の範囲 [0, total] で
+ * 切った区間を `steps` 等分した点を返す。端が null（写せない）・切った区間が空なら空（曲線を描かない）。
+ */
+export function fadeCurvePoints(
+  from: number | null,
+  to: number | null,
+  rising: boolean,
+  total: number,
+  curve: string,
+  steps: number,
+): FadePoint[] {
+  if (from === null || to === null || !(to > from) || steps < 1) return [];
+  const a = Math.max(0, from);
+  const b = Math.min(total, to);
+  if (!(b > a)) return [];
+  const shape = (u: number) => (curve === 'equalPower' ? Math.sin((u * Math.PI) / 2) : u);
+  const points: FadePoint[] = [];
+  for (let k = 0; k <= steps; k++) {
+    const frame = k === steps ? b : a + ((b - a) * k) / steps;
+    const u = (frame - from) / (to - from);
+    points.push({ frame, gain: shape(rising ? u : 1 - u) });
+  }
+  return points;
+}
+
 /** フレームを x にする。 */
 export function frameToX(frame: number, w: WaveWindow, width: number): number {
   return w.span > 0 ? ((frame - w.start) / w.span) * width : 0;

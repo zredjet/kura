@@ -123,10 +123,15 @@ export interface WaveOverlay {
   selection: FrameSpan | null;
   /** 切り詰めの枠（外を暗くする）。 */
   trim: FrameSpan | null;
-  /** フェードの曲線（長さ 0 の側は描かない）と、三角のハンドルを出すか。 */
+  /**
+   * フェードの三角の位置（`inEnd`・`outStart`）と、曲線の見かけの始まり・終わり（`inStart`・`outEnd`。出力の範囲の外も
+   * ある。null なら曲線を描かない）、三角のハンドルを出すか。長さ 0 の側は描かない。
+   */
   fade: {
+    inStart: number | null;
     inEnd: number;
     outStart: number;
+    outEnd: number | null;
     curve: string;
     handles: boolean;
   } | null;

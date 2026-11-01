@@ -818,8 +818,12 @@ export type Edit = Edit_Serialize | Edit_Deserialize;
 export type EditAudioMarksDto = 
 /**  切り詰めの枠（このノードを外して入力を出しているときの位置）。 */
 { type: "trim"; start: number; end: number } | 
-/**  フェードインの終わり・フェードアウトの始まり（長さ 0・写せなければ null）。 */
-{ type: "fade"; inEnd: number | null; outStart: number | null } | 
+/**
+ *  フェード。`inEnd`・`outStart` は三角の位置（フェードインの終わり・フェードアウトの始まり）。`inStart`・`outEnd` は
+ *  曲線を引く見かけの始まり・終わり（フェードの区間の写しを延ばした位置。符号つきで、下流で頭・終わりを切られていれば
+ *  出力の範囲の外）。どれも長さ 0・写せなければ null（`inStart`・`outEnd` が null なら曲線を描かない）。
+ */
+{ type: "fade"; inStart: number | null; inEnd: number | null; outStart: number | null; outEnd: number | null } | 
 /**  ループの区間。 */
 { type: "loop"; start: number; end: number };
 

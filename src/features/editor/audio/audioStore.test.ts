@@ -445,13 +445,25 @@ describe('音声のアダプタ', () => {
 });
 
 describe('フェードの曲線', () => {
-  const fade = (id: number, enabled: boolean, inEnd: number) => ({
+  const fade = (
+    id: number,
+    enabled: boolean,
+    inEnd: number,
+    more: { inStart?: number | null; outStart?: number | null; outEnd?: number | null } = {},
+  ) => ({
     id,
     op: 'audio.fade',
     enabled,
     inRate: 48_000,
     inFrames: TOTAL,
-    marks: { type: 'fade' as const, inEnd, outStart: null },
+    marks: {
+      type: 'fade' as const,
+      inStart: 0,
+      inEnd,
+      outStart: null,
+      outEnd: null,
+      ...more,
+    },
   });
   const doc = (nodes: { id: number; enabled: boolean }[]) => ({
     order: nodes.map((n) => n.id),
@@ -487,6 +499,49 @@ describe('フェードの曲線', () => {
     // フェードの道具でそのノードを直している：出す（ハンドルも）
     useAudioStore.setState({ tool: 'fade' });
     expect(overlayOf(useAudioStore.getState()).fade).toMatchObject({ inEnd: 2000, handles: true });
+  });
+
+  it('曲線の見かけの始まり・終わりは印のまま渡す（下流で切られると出力の外・写せなければ null）。ノードがなければ 0 と出力の長さ', async () => {
+    await open(
+      view({
+        nodes: [
+          fade(1, true, 2000, { inStart: -1000, outStart: TOTAL - 500, outEnd: TOTAL + 700 }),
+        ],
+      }),
+    );
+    useEditorStore.setState({ doc: doc([{ id: 1, enabled: true }]), selected: null });
+    expect(overlayOf(useAudioStore.getState()).fade).toMatchObject({
+      inStart: -1000,
+      inEnd: 2000,
+      outStart: TOTAL - 500,
+      outEnd: TOTAL + 700,
+    });
+    // 写せない：null のまま（曲線を描かない）。三角の位置は今のまま
+    useAudioStore.setState({
+      view: {
+        ...(useAudioStore.getState().view as AudioViewSummary),
+        nodes: [fade(1, true, 2000, { inStart: null, outStart: TOTAL - 500, outEnd: null })],
+      },
+    });
+    expect(overlayOf(useAudioStore.getState()).fade).toMatchObject({
+      inStart: null,
+      inEnd: 2000,
+      outStart: TOTAL - 500,
+      outEnd: null,
+    });
+    // フェードのノードがない（フェードの道具で足す）：末尾に足すので 0 と出力の長さ
+    useEditorStore.setState({ doc: doc([]) });
+    useAudioStore.setState({
+      tool: 'fade',
+      view: { ...(useAudioStore.getState().view as AudioViewSummary), nodes: [] },
+    });
+    setAudioLocal({ fadeIn: 3000 });
+    expect(overlayOf(useAudioStore.getState()).fade).toMatchObject({
+      inStart: 0,
+      inEnd: 3000,
+      outStart: TOTAL,
+      outEnd: TOTAL,
+    });
   });
 });
 

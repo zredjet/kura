@@ -11,7 +11,7 @@
 
 import { ja } from '../../../i18n/ja';
 import type { WaveScene } from './waveController';
-import { FADE_HANDLE_PX, frameToX } from './waveMath';
+import { FADE_HANDLE_PX, fadeCurvePoints, frameToX } from './waveMath';
 
 const t = ja.editor.audio;
 
@@ -139,28 +139,22 @@ export function drawWave(canvas: HTMLCanvasElement, s: WaveScene): void {
     ctx.fillRect(b - d, lanesTop, Math.max(1, 2 * d), lanesH);
   }
 
-  // フェードの曲線（段の下から上へ。等パワーは正弦）と三角のハンドル
+  // フェードの曲線（段の下から上へ。等パワーは正弦）と三角のハンドル。曲線は見かけの始まり・終わりから引き、出力の
+  // 範囲で切る（下流で頭を切られたフェードは頭のゲインが 0 にならない）。見かけの位置が分からなければ三角だけ
   if (o.fade) {
     ctx.strokeStyle = c.accent;
     ctx.lineWidth = 1.5 * d;
-    const curve = (u: number) => (o.fade?.curve === 'equalPower' ? Math.sin((u * Math.PI) / 2) : u);
-    if (o.fade.inEnd > 0) {
+    const { curve } = o.fade;
+    const lines = [
+      fadeCurvePoints(o.fade.inStart, o.fade.inEnd, true, s.total, curve, CURVE_STEPS),
+      fadeCurvePoints(o.fade.outStart, o.fade.outEnd, false, s.total, curve, CURVE_STEPS),
+    ];
+    for (const pts of lines) {
+      if (pts.length < 2) continue;
       ctx.beginPath();
-      for (let k = 0; k <= CURVE_STEPS; k++) {
-        const u = k / CURVE_STEPS;
-        const px = x(u * o.fade.inEnd);
-        const py = lanesBottom - curve(u) * lanesH;
-        if (k === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      }
-      ctx.stroke();
-    }
-    if (o.fade.outStart < s.total) {
-      ctx.beginPath();
-      for (let k = 0; k <= CURVE_STEPS; k++) {
-        const u = k / CURVE_STEPS;
-        const px = x(o.fade.outStart + u * (s.total - o.fade.outStart));
-        const py = lanesBottom - curve(1 - u) * lanesH;
+      for (const [k, p] of pts.entries()) {
+        const px = x(p.frame);
+        const py = lanesBottom - p.gain * lanesH;
         if (k === 0) ctx.moveTo(px, py);
         else ctx.lineTo(px, py);
       }

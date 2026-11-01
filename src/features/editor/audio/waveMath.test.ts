@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   clampWindow,
+  fadeCurvePoints,
   fitView,
   followPlayhead,
   frameToX,
@@ -212,5 +213,54 @@ describe('全体図', () => {
     expect(overviewStart(500, 1000, w, 1000)).toBe(450);
     expect(overviewStart(0, 1000, w, 1000)).toBe(0);
     expect(overviewStart(1000, 1000, w, 1000)).toBe(900);
+  });
+});
+
+describe('フェードの曲線の点', () => {
+  it('下流がない（見かけの始まり 0）：出力の頭のゲインは 0 で、三角の位置で 1', () => {
+    const pts = fadeCurvePoints(0, 4800, true, 48_000, 'linear', 4);
+    expect(pts).toEqual([
+      { frame: 0, gain: 0 },
+      { frame: 1200, gain: 0.25 },
+      { frame: 2400, gain: 0.5 },
+      { frame: 3600, gain: 0.75 },
+      { frame: 4800, gain: 1 },
+    ]);
+  });
+
+  it('見かけの始まりが負（下流で頭を切った）：出力の頭で切り、頭のゲインは 0 にならない', () => {
+    const pts = fadeCurvePoints(-1000, 2000, true, 10_000, 'linear', 3);
+    expect(pts[0]?.frame).toBe(0);
+    expect(pts[0]?.gain).toBeCloseTo(1 / 3, 12);
+    expect(pts[0]?.gain).toBeGreaterThan(0);
+    expect(pts[pts.length - 1]).toEqual({ frame: 2000, gain: 1 });
+    expect(pts.map((p) => p.frame)).toEqual([0, 2000 / 3, 4000 / 3, 2000]);
+  });
+
+  it('等パワーは sin(πu/2)。u は見かけの区間で測る', () => {
+    const pts = fadeCurvePoints(-1000, 1000, true, 10_000, 'equalPower', 2);
+    expect(pts[0]).toEqual({ frame: 0, gain: Math.sin(Math.PI / 4) });
+    expect(pts[2]?.gain).toBeCloseTo(1, 12);
+  });
+
+  it('フェードアウト：始まりで 1、見かけの終わりで 0。出力の終わりの先は切る', () => {
+    const pts = fadeCurvePoints(9000, 10_500, false, 10_000, 'linear', 2);
+    expect(pts[0]).toEqual({ frame: 9000, gain: 1 });
+    expect(pts[2]?.frame).toBe(10_000);
+    expect(pts[2]?.gain).toBeCloseTo(1 / 3, 12);
+    // 下流がない（見かけの終わり＝出力の長さ）：終わりで 0
+    expect(fadeCurvePoints(9000, 10_000, false, 10_000, 'linear', 2)).toEqual([
+      { frame: 9000, gain: 1 },
+      { frame: 9500, gain: 0.5 },
+      { frame: 10_000, gain: 0 },
+    ]);
+  });
+
+  it('見かけの始まり・終わりが null（写せない）・出力に写る所がない・長さ 0 なら描かない', () => {
+    expect(fadeCurvePoints(null, 2000, true, 10_000, 'linear', 4)).toEqual([]);
+    expect(fadeCurvePoints(9000, null, false, 10_000, 'linear', 4)).toEqual([]);
+    expect(fadeCurvePoints(0, 0, true, 10_000, 'linear', 4)).toEqual([]);
+    expect(fadeCurvePoints(10_000, 10_000, false, 10_000, 'linear', 4)).toEqual([]);
+    expect(fadeCurvePoints(-3000, -1000, true, 10_000, 'linear', 4)).toEqual([]);
   });
 });

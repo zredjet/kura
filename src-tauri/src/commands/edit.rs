@@ -513,10 +513,14 @@ impl From<SourcePiece> for EditSourcePieceDto {
 pub enum EditAudioMarksDto {
     /// 切り詰めの枠（このノードを外して入力を出しているときの位置）。
     Trim { start: u64, end: u64 },
-    /// フェードインの終わり・フェードアウトの始まり（長さ 0・写せなければ null）。
+    /// フェード。`inEnd`・`outStart` は三角の位置（フェードインの終わり・フェードアウトの始まり）。`inStart`・`outEnd` は
+    /// 曲線を引く見かけの始まり・終わり（フェードの区間の写しを延ばした位置。符号つきで、下流で頭・終わりを切られていれば
+    /// 出力の範囲の外）。どれも長さ 0・写せなければ null（`inStart`・`outEnd` が null なら曲線を描かない）。
     Fade {
+        in_start: Option<i64>,
         in_end: Option<u64>,
         out_start: Option<u64>,
+        out_end: Option<i64>,
     },
     /// ループの区間。
     Loop { start: u64, end: u64 },
@@ -526,7 +530,17 @@ impl From<Marks> for EditAudioMarksDto {
     fn from(m: Marks) -> Self {
         match m {
             Marks::Trim { start, end } => Self::Trim { start, end },
-            Marks::Fade { in_end, out_start } => Self::Fade { in_end, out_start },
+            Marks::Fade {
+                in_start,
+                in_end,
+                out_start,
+                out_end,
+            } => Self::Fade {
+                in_start,
+                in_end,
+                out_start,
+                out_end,
+            },
             Marks::Loop { start, end } => Self::Loop { start, end },
         }
     }
@@ -1632,8 +1646,10 @@ mod tests {
                     in_rate: 48_000,
                     in_frames: 96_000,
                     marks: Some(Marks::Fade {
+                        in_start: Some(-5),
                         in_end: Some(10),
                         out_start: None,
+                        out_end: None,
                     }),
                 }],
                 loudness: LoudnessState::Ready {
@@ -1671,7 +1687,7 @@ mod tests {
         );
         assert_eq!(
             json["view"]["nodes"][0]["marks"],
-            json!({ "type": "fade", "inEnd": 10, "outStart": null })
+            json!({ "type": "fade", "inStart": -5, "inEnd": 10, "outStart": null, "outEnd": null })
         );
         assert_eq!(json["view"]["nodes"][0]["inFrames"], json!(96000));
         assert_eq!(

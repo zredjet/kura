@@ -103,8 +103,10 @@ fn source_map_and_marks_follow_the_chain() {
     assert_eq!(
         n[2].marks,
         Some(Marks::Fade {
+            in_start: Some(0),
             in_end: Some(600),
-            out_start: Some(98_000 - 400)
+            out_start: Some(98_000 - 400),
+            out_end: Some(98_000)
         })
     );
     assert_eq!(
@@ -177,8 +179,10 @@ fn handles_map_back_through_the_chain() {
     assert_eq!(
         info.nodes[0].marks,
         Some(Marks::Fade {
+            in_start: Some(0),
             in_end: Some(2_000),
-            out_start: None
+            out_start: None,
+            out_end: None
         })
     );
     // フェードアウトの始まり：fadeOut = 入力の長さ − 戻した位置
@@ -701,8 +705,10 @@ fn fade_in_can_reach_the_end_of_a_downstream_trim() {
     assert_eq!(
         marks[0],
         Some(Marks::Fade {
+            in_start: Some(-1_000),
             in_end: Some(500),
-            out_start: None
+            out_start: None,
+            out_end: None
         })
     );
     // 出力の終わり（1,000）＝ trim の終わり 2,000 まで掛ける
@@ -716,8 +722,10 @@ fn fade_in_can_reach_the_end_of_a_downstream_trim() {
     assert_eq!(
         shown_audio(&out.view).nodes[0].marks,
         Some(Marks::Fade {
+            in_start: Some(-1_000),
             in_end: Some(1_000),
-            out_start: None
+            out_start: None,
+            out_end: None
         })
     );
 }
@@ -770,8 +778,10 @@ fn fades_can_be_cleared_through_a_downstream_trim() {
         assert_eq!(
             shown_audio(&out.view).nodes[0].marks,
             Some(Marks::Fade {
+                in_start: None,
                 in_end: None,
-                out_start: None
+                out_start: None,
+                out_end: None
             }),
             "{i}"
         );
@@ -808,4 +818,157 @@ fn fades_can_be_cleared_through_a_downstream_trim() {
     assert!(out.rejected.is_none(), "{:?}", out.rejected);
     assert_eq!(params(&env, &s, 1)["fadeIn"], json!(1_500));
     assert_eq!(params(&env, &s, 1)["fadeOut"], json!(300));
+}
+
+/// 下流の trim・resample のあとのフェードの印：見かけの始まり `in_start`（出力の頭より前なら負）と見かけの終わり `out_end`
+/// （出力の終わりより後もある）は、フェードの区間が通る区分の写しを延ばした位置。曲線を `in_start` から `in_end` へ引くと、
+/// 出力の各フレームのゲインが描いた音と合う（目視の記録の 1：fade → trim で頭のゲインが 0 にならない）。
+#[test]
+fn fade_marks_extend_to_the_apparent_start_and_end() {
+    let env = Env::new();
+    let vp = Viewport::audio_idle();
+    let n = 3 * C;
+    let fade = || {
+        add(
+            0,
+            "audio.fade",
+            json!({ "fadeIn": 3_000, "fadeOut": 2_000, "curve": "linear" }),
+        )
+    };
+
+    // fade → trim（始まりがフェードインの途中）：見かけの始まりは −1,000、出力の頭のゲインは 1/3
+    let bytes = noise_wav(8_000, 1, n, 77);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open(id).session.clone();
+    let out = env.step(
+        &s,
+        vec![
+            fade(),
+            add(1, "audio.trim", json!({ "start": 1_000, "end": null })),
+        ],
+        &vp,
+    );
+    assert!(out.rejected.is_none(), "{:?}", out.rejected);
+    let info = shown_audio(&out.view).clone();
+    assert_eq!(info.frames, n - 1_000);
+    let Some(Marks::Fade {
+        in_start: Some(in_start),
+        in_end: Some(in_end),
+        out_start,
+        out_end,
+    }) = info.nodes[0].marks
+    else {
+        panic!("{:?}", info.nodes[0].marks);
+    };
+    assert_eq!((in_start, in_end), (-1_000, 2_000));
+    assert_eq!(out_start, Some(n - 3_000));
+    assert_eq!(
+        out_end,
+        Some(i64::try_from(n - 1_000).unwrap()),
+        "出力の終わり"
+    );
+    // 曲線（直線）の出力のフレーム t のゲイン (t − in_start) / (in_end − in_start) が、描いた標本と元の標本の比と合う
+    let original = rendered(&bytes, "wav", &Graph::new_single());
+    let (value, _) = env.editor(&s).published_audio(info.rev).unwrap();
+    let gain = |t: u64| (t as f64 - in_start as f64) / (in_end as f64 - in_start as f64);
+    assert_eq!(gain(0), 1_000.0 / 3_000.0, "出力の頭のゲインは 0 ではない");
+    for t in [0u64, 1, 777, 1_999] {
+        let g = gain(t);
+        let mut want = [0f32; 1];
+        original.read(0, t + 1_000, &mut want).unwrap();
+        let mut got = [0f32; 1];
+        value.audio_read(0, t, &mut got).unwrap();
+        let want = (f64::from(want[0]) * g) as f32;
+        assert!(
+            (got[0] - want).abs() <= 1.0 / 32_768.0,
+            "{t}: {} {want}",
+            got[0]
+        );
+    }
+
+    // fade → trim（終わりがフェードアウトの途中）：見かけの終わりは出力の長さより後
+    let (_, marks) = open_with_nodes(
+        &env,
+        8_000,
+        n,
+        vec![
+            fade(),
+            add(1, "audio.trim", json!({ "start": 0, "end": n - 500 })),
+        ],
+        None,
+    );
+    assert_eq!(
+        marks[0],
+        Some(Marks::Fade {
+            in_start: Some(0),
+            in_end: Some(3_000),
+            out_start: Some(n - 2_000),
+            out_end: Some(i64::try_from(n).unwrap()),
+        })
+    );
+
+    // fade → trim → resample（8 → 16 kHz）：ずらしに比を掛ける
+    let (s, marks) = open_with_nodes(
+        &env,
+        8_000,
+        n,
+        vec![
+            fade(),
+            add(1, "audio.trim", json!({ "start": 1_000, "end": n - 500 })),
+            add(2, "audio.resample", json!({ "rate": 16_000 })),
+        ],
+        None,
+    );
+    let frames = shown_audio(&env.step(&s, Vec::new(), &vp).view).frames;
+    assert_eq!(frames, 2 * (n - 1_500));
+    assert_eq!(
+        marks[0],
+        Some(Marks::Fade {
+            in_start: Some(-2_000),
+            in_end: Some(4_000),
+            out_start: Some(2 * (n - 3_000)),
+            out_end: Some(i64::try_from(2 * (n - 1_000)).unwrap()),
+        })
+    );
+
+    // fade → resample（8 → 6 kHz）だけ：見かけの始まりは 0、終わりは出力の長さ（今の描き方と同じ）
+    let (s, marks) = open_with_nodes(
+        &env,
+        8_000,
+        n,
+        vec![fade(), add(1, "audio.resample", json!({ "rate": 6_000 }))],
+        None,
+    );
+    let frames = shown_audio(&env.step(&s, Vec::new(), &vp).view).frames;
+    assert_eq!(frames, n * 3 / 4);
+    assert_eq!(
+        marks[0],
+        Some(Marks::Fade {
+            in_start: Some(0),
+            in_end: Some(2_250),
+            out_start: Some(n * 3 / 4 - 1_500),
+            out_end: Some(i64::try_from(frames).unwrap()),
+        })
+    );
+
+    // フェードインの終わりが下流の trim の外（写せない）なら、見かけの始まりも null
+    let (_, marks) = open_with_nodes(
+        &env,
+        8_000,
+        n,
+        vec![
+            fade(),
+            add(1, "audio.trim", json!({ "start": 1_000, "end": 2_000 })),
+        ],
+        None,
+    );
+    assert_eq!(
+        marks[0],
+        Some(Marks::Fade {
+            in_start: None,
+            in_end: None,
+            out_start: None,
+            out_end: None,
+        })
+    );
 }
