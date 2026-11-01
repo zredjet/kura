@@ -26,7 +26,7 @@
 //!   合成）。
 //! - 音声のエディタ（NFR-11 の記録。M13 段 4C の F15。[`audio`]）：kura-core の `edit::editor` で n 分の WAV を開き、gain・
 //!   フェードインの終わり・trim の終わり・ループ点の 1 手の往復（手 → 表示の区間の値）の p50／p95、開く時間、全体に効く手の
-//!   あとに波形の段・ラウドネスが裏の仕事で揃うまでの時間を記録する。長さは `--audio-minutes`（なければ NFR-11 の音声と同じ
+//!   あとに波形の段・ラウドネスが裏の仕事で揃うまでの時間を記録する。長さは `--audio-minutes`（1〜180 分。なければ NFR-11 の音声と同じ
 //!   5 分。`--quick` は 2 秒）。入力は一時の場所の新しいライブラリにアプリの取り込みのジョブで入れる。
 //! - 出力：表（標準出力に 1 行ずつ）、`--json`（環境・回・レコード）、`--markdown`（architecture.md §13 の M9 の表の形）。
 
@@ -57,6 +57,9 @@ const USAGE: &str = "使い方: kura-devtools bench edit [--preview-threads N] [
                      [--json <file>] [--markdown <file|->] [--audio-minutes N]";
 
 const MIB: u64 = 1 << 20;
+
+/// `--audio-minutes` の上限（音声の長さの範囲の 3 時間）。
+const MAX_AUDIO_MINUTES: u64 = 180;
 
 /// 引数。
 #[derive(Debug, Clone)]
@@ -166,9 +169,12 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--in" => o.input = it.next().map(PathBuf::from),
             "--format" => o.format = it.next().cloned(),
             "--audio-minutes" => {
+                // 音声の長さの範囲（3 時間。ADR-175）。48 kHz で WAV に書ける 372 分より小さい
                 let m = number::<u64>(arg, it.next())?;
-                if !(1..=600).contains(&m) {
-                    return Err(format!("--audio-minutes は 1〜600 です。{USAGE}"));
+                if !(1..=MAX_AUDIO_MINUTES).contains(&m) {
+                    return Err(format!(
+                        "--audio-minutes は 1〜{MAX_AUDIO_MINUTES} です。{USAGE}"
+                    ));
                 }
                 o.audio_minutes = Some(m);
             }
@@ -684,6 +690,7 @@ mod tests {
             "--budget 0",
             "--preview-threads 0",
             "--audio-minutes 0",
+            "--audio-minutes 181",
             "--audio-minutes x",
             "--what",
         ] {
