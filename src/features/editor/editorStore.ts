@@ -397,8 +397,10 @@ function disposeRuntime(
   if (!rt.session) {
     // 開いている途中（edit_open がまだ返らない）：閉じるなら Rust の開く途中を止める（直接読めない形式の長い音声の作業用の
     // ファイルを最後まで書かせない）。止められた edit_open の Conflict は openEditorAs が捨てる。ほかを開くときは、次の
-    // edit_open が前のエディタを止めるので送らない
-    return closing ? cancelOpening(rt.itemId) : Promise.resolve();
+    // edit_open が前のエディタを止めるので送らない。開けなかった（失敗のカード）あとは止めるものがない（閉じるときの
+    // ストアはまだこのエディタの状態）
+    const opening = useEditorStore.getState().phase === 'opening';
+    return closing && opening ? cancelOpening(rt.itemId) : Promise.resolve();
   }
   return (
     closeEdit(rt.session)

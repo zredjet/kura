@@ -440,6 +440,18 @@ describe('核と種類ごとのアダプタ', () => {
     expect(useEditorStore.getState()).toMatchObject({ phase: 'closed', session: null });
   });
 
+  it('開けなかった（失敗のカード）あとに閉じるときは edit_cancel_open を送らない', async () => {
+    const { factory } = fakeKind();
+    vi.mocked(openEdit).mockRejectedValueOnce(
+      new IpcError({ code: 'Busy', message: '混んでいます' }),
+    );
+    await openEditorAs(factory, AUDIO);
+    expect(useEditorStore.getState().phase).toBe('error');
+    await closeEditor();
+    expect(cancelOpenEdit).not.toHaveBeenCalled();
+    expect(closeEdit).not.toHaveBeenCalled();
+  });
+
   it('開いている途中にほかを開くときは edit_cancel_open を送らない（次の edit_open が前のエディタを止める）', async () => {
     const { factory } = fakeKind();
     vi.mocked(openEdit).mockReturnValueOnce(new Promise(() => undefined));
