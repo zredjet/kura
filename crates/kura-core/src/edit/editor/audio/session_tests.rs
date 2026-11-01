@@ -615,7 +615,8 @@ fn changed_spans_follow_the_edit() {
         "{sp:?}"
     );
     assert!(!info.meta_changed);
-    // ループ点だけ：標本は変わらない（足した手は保守的に全体でもよい。引数だけを変えた手は空）
+    // ループ点だけ：標本は変わらない。足した手は前の表示とチャンクの実体を共有せず、全区間（下の「足す手は、手の前の状態に
+    // よっては」と同じ）。引数だけを変えた手は空
     let out = env.step(
         &s,
         vec![add(
@@ -625,7 +626,9 @@ fn changed_spans_follow_the_edit() {
         )],
         &vp,
     );
-    assert!(shown_audio(&out.view).meta_changed);
+    let info = shown_audio(&out.view);
+    assert_eq!(info.changed, ChangedSpans::Spans(vec![(0, 4 * C)]));
+    assert!(info.meta_changed);
     let out = env.step(
         &s,
         vec![set(2, json!({ "loop": { "start": 10, "end": 2_000 } }))],
@@ -651,7 +654,8 @@ fn changed_spans_follow_the_edit() {
     let mut expect = vec![0f32; want.frames()];
     want.read(0, 0, &mut expect).unwrap();
     assert_eq!(got, expect);
-    // trim の終わり：長さが変わる
+    // trim の終わり（始まりは同じ）：長さが変わる。報告は長さの変わったチャンクだけを新しい長さで切ったもの（§12.6 の
+    // refine。残ったチャンクは前の表示と実体を共有するので外れる）。チャンクの境で縮めれば空で、長さは frames で分かる
     let out = env.step(
         &s,
         vec![add(2, "audio.trim", json!({ "start": 0, "end": 3 * C }))],
@@ -659,10 +663,79 @@ fn changed_spans_follow_the_edit() {
     );
     let info = shown_audio(&out.view);
     assert_eq!(info.frames, 3 * C);
-    assert!(matches!(
+    assert_eq!(info.changed, ChangedSpans::Spans(Vec::new()));
+    // チャンクの境でない終わり：最後のチャンクだけ（新しい長さで切る）
+    let out = env.step(
+        &s,
+        vec![set(3, json!({ "start": 0, "end": 2 * C + 500 }))],
+        &vp,
+    );
+    let info = shown_audio(&out.view);
+    assert_eq!(info.frames, 2 * C + 500);
+    assert_eq!(
         info.changed,
-        ChangedSpans::All | ChangedSpans::Spans(_)
-    ));
+        ChangedSpans::Spans(vec![(2 * C, 2 * C + 500)])
+    );
+    // 足す手でも同じ：同じ手順で開き直し（出力は set_loop）、チャンクの境でない終わりの trim を足すと最後のチャンクだけ
+    let s = env.open(id).session.clone();
+    for step in [
+        add(
+            0,
+            "audio.fade",
+            json!({ "fadeIn": 1_000, "fadeOut": 0, "curve": "linear" }),
+        ),
+        set(
+            1,
+            json!({ "fadeIn": C + 10, "fadeOut": 0, "curve": "linear" }),
+        ),
+        add(
+            1,
+            "audio.set_loop",
+            json!({ "loop": { "start": 5, "end": 900 } }),
+        ),
+        set(2, json!({ "loop": { "start": 10, "end": 2_000 } })),
+    ] {
+        shown_audio(&env.step(&s, vec![step], &vp).view);
+    }
+    let out = env.step(
+        &s,
+        vec![add(
+            2,
+            "audio.trim",
+            json!({ "start": 0, "end": 3 * C - 100 }),
+        )],
+        &vp,
+    );
+    let info = shown_audio(&out.view);
+    assert_eq!(info.frames, 3 * C - 100);
+    assert_eq!(
+        info.changed,
+        ChangedSpans::Spans(vec![(2 * C, 3 * C - 100)])
+    );
+    // 足す手は、手の前の状態によっては前の表示とチャンクの実体を共有せず、残った全区間になる（多めの報告。上の set_loop を
+    // 足す手と同じ。手を当てていない遅延の入力の上・gain の直後に trim を足す）
+    for first in [None, Some(add(0, "audio.gain", json!({ "db": -1.0 })))] {
+        let s = env.open(id).session.clone();
+        let at = usize::from(first.is_some());
+        if let Some(step) = first {
+            shown_audio(&env.step(&s, vec![step], &vp).view);
+        }
+        let out = env.step(
+            &s,
+            vec![add(
+                at,
+                "audio.trim",
+                json!({ "start": 0, "end": 3 * C - 100 }),
+            )],
+            &vp,
+        );
+        let info = shown_audio(&out.view);
+        assert_eq!(
+            info.changed,
+            ChangedSpans::Spans(vec![(0, 3 * C - 100)]),
+            "{at}"
+        );
+    }
 }
 
 /// A5：長い音声の 1 手は区間の分だけを描き、持ち続ける分（`extra`）は公開した区間の表示の値だけ。入力は遅延のまま。
