@@ -1250,18 +1250,32 @@ mod tests {
             return;
         }
         let frames = AUDIO_SECONDS * AUDIO_RATE;
+        // 見立てのための数：確保器の目印で、エディタを開いてからの生きている確保（解放した分を引いた総量）の山を段ごとに数える
+        // （確保器が抱える解放済みの領域は入らない。判定には使わない）
+        let meter = crate::ALLOC.meter();
+        meter.start(u64::MAX);
+        let mut heap = Vec::new();
+        let mut phase = |name: &str| {
+            heap.push((name.to_string(), meter.peak()));
+            meter.reset_peak();
+        };
         let t = std::time::Instant::now();
         let mut ed = AudioEditor::open(&session, item, frames).unwrap();
         let open_ms = ed.open_ns as f64 / 1e6;
         let input = ed.opened.cache_bytes;
+        phase("open");
         ed.setup().unwrap();
+        phase("setup");
         let first = ed.settle(true).unwrap();
+        phase("work-setup");
         for kind in Kind::ALL {
             for i in 0..EDITOR_STEPS {
                 ed.step(kind, i).unwrap();
             }
+            phase(kind.key());
         }
         let after = ed.settle(true).unwrap();
+        phase("work-gain");
         let peak = ed.take_admitted_peak().unwrap();
         let held = ed.held;
         let (restored, _, work_files) = ed.close().unwrap();
@@ -1282,6 +1296,7 @@ mod tests {
                 "restored": restored,
                 "work_files": work_files,
                 "seconds": t.elapsed().as_secs_f64(),
+                "heap_peaks": heap,
             })
         );
     }
@@ -1380,6 +1395,25 @@ mod tests {
             got["gain_work_ms"].as_f64().unwrap_or(0.0),
             mib(field("budget")),
             got["seconds"].as_f64().unwrap_or(0.0),
+        );
+        // 見立て：生きている確保の山（段ごと）。通しとの差は、確保器が抱える解放済みの領域・スタックなど
+        let heap: Vec<(String, u64)> = got["heap_peaks"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_u64()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let heap_max = heap.iter().map(|(_, b)| *b).max().unwrap_or(0);
+        eprintln!(
+            "{EDITOR_CASE}: 生きている確保の山 {:.1} MiB（{}）・通しとの差 {:.1} MiB",
+            mib(heap_max),
+            heap.iter()
+                .map(|(n, b)| format!("{n} {:.1}", mib(*b)))
+                .collect::<Vec<_>>()
+                .join("・"),
+            (used as f64 - heap_max as f64) / MIB as f64,
         );
         let mut failed: Vec<String> = Vec::new();
         if used > EDITOR_N {
