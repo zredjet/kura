@@ -28,7 +28,7 @@ function useNormalizeTarget(): number | null {
   });
 }
 
-/** 値の一行「−14.2 LUFS · LRA 6.1 LU · −1.0 dBTP」（計れない値は理由）。 */
+/** 値の一行「−14.2 LUFS（LRA 6.1 LU） · −1.0 dBTP」（インスペクタと同じ書き方。計れない値は理由）。 */
 export function loudnessLine(state: EditLoudnessStateDto): string | null {
   if (state.type !== 'ready') return null;
   const l = state.loudness;
