@@ -20,6 +20,7 @@ import { ContextPool } from '../../../lib/assetAudio';
 import { useNoticeStore } from '../../../stores/noticeStore';
 import { fakeFactory } from '../../../test/fakeAudio';
 import { type AudioRuntime, setAudioRuntimeForTest } from '../../asset/audioRuntime';
+import { handleEditorKey } from '../editorKeys';
 import { closeEditor, editorUndo, openEditorAs, useEditorStore } from '../editorStore';
 import {
   AUDIO_ADAPTER,
@@ -136,6 +137,13 @@ async function open(v: EditAudioView = view(), nodes: EditNodeDto[] = []): Promi
 /** 送った手（呼んだ順につないだもの）。 */
 function sentSteps(): EditStepDto[] {
   return vi.mocked(stepEdit).mock.calls.flatMap((c) => c[1]);
+}
+
+/** esc を押す（エディタのキーの口に通す。処理したら true）。 */
+function pressEscape(): boolean {
+  const e = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+  document.body.dispatchEvent(e);
+  return handleEditorKey(e);
 }
 
 /** フレームの x（面は幅 1000・余白なし）。 */
@@ -397,6 +405,78 @@ describe('フェード・ループのドラッグ', () => {
     await flush();
     expect(player?.loop).toEqual({ start: 1000, end: 4000 });
     expect(useAudioStore.getState().local).toBeNull();
+  });
+
+  it('フェードの三角をドラッグ中に esc：閉じずにドラッグをやめ（仮の値を捨てる）、離しても何も送らない', async () => {
+    await open();
+    selectAudioTool('fade');
+    AUDIO_POINTER.down({ shiftKey: false }, xOf(0) + 2, 48);
+    AUDIO_POINTER.move({ shiftKey: false }, xOf(2000), 48);
+    await flush();
+    expect(useAudioStore.getState().local?.fadeIn).toBe(2000);
+    vi.mocked(stepEdit).mockClear();
+    expect(pressEscape()).toBe(true);
+    await flush();
+    expect(useEditorStore.getState()).toMatchObject({ phase: 'open', sheet: null });
+    expect(useAudioStore.getState().local).toBeNull();
+    expect(sentSteps()).toEqual([{ type: 'cancelPreview' }]);
+    vi.mocked(stepEdit).mockClear();
+    AUDIO_POINTER.move({ shiftKey: false }, xOf(3000), 48);
+    AUDIO_POINTER.up({ shiftKey: false }, xOf(3000), 48, false);
+    await flush();
+    expect(sentSteps()).toEqual([]);
+    expect(useAudioStore.getState().local).toBeNull();
+    // ドラッグの途中ではなくなった（取り消しが効く）
+    editorUndo();
+    await flush();
+    expect(sentSteps()).toEqual([{ type: 'undo' }]);
+  });
+
+  it('動かす前のフェードの三角を esc でやめたら何も送らない', async () => {
+    await open();
+    selectAudioTool('fade');
+    AUDIO_POINTER.down({ shiftKey: false }, xOf(0) + 2, 48);
+    expect(pressEscape()).toBe(true);
+    AUDIO_POINTER.up({ shiftKey: false }, xOf(0) + 2, 48, false);
+    await flush();
+    expect(useEditorStore.getState()).toMatchObject({ phase: 'open', sheet: null });
+    expect(sentSteps()).toEqual([]);
+  });
+
+  it('未保存の変更があってループの旗をドラッグ中に esc：シートを出さずにやめ、試聴も文書のループ点に戻す', async () => {
+    const loop = { start: 1000, end: 4000 };
+    const dirty = (v: EditAudioView, provisional: boolean): EditStepResultDto => {
+      const r = result(v);
+      return { ...r, status: { ...r.status, rev: v.rev, dirty: true, provisional } };
+    };
+    await open(view({ loop }));
+    vi.mocked(stepEdit).mockImplementation(async (_s, steps) => {
+      const preview = steps.find((q) => q.type === 'handle');
+      return preview?.type === 'handle' && preview.handle.type === 'loop'
+        ? dirty(view({ rev: 2, loop: preview.handle.range }), true)
+        : dirty(view({ loop }), false);
+    });
+    selectAudioTool('loop');
+    toggleLoopAudition();
+    const player = audioPlayer();
+    AUDIO_POINTER.down({ shiftKey: false }, xOf(4000), 5);
+    AUDIO_POINTER.move({ shiftKey: false }, xOf(6000), 5);
+    await flush();
+    expect(useEditorStore.getState().status?.dirty).toBe(true);
+    expect(player?.loop).toEqual({ start: 1000, end: 6000 });
+    vi.mocked(stepEdit).mockClear();
+    expect(pressEscape()).toBe(true);
+    await flush();
+    expect(useEditorStore.getState()).toMatchObject({ phase: 'open', sheet: null });
+    expect(useAudioStore.getState().local).toBeNull();
+    expect(player?.loop).toEqual(loop);
+    expect(sentSteps()).toEqual([{ type: 'cancelPreview' }]);
+    vi.mocked(stepEdit).mockClear();
+    AUDIO_POINTER.up({ shiftKey: false }, xOf(6000), 5, false);
+    await flush();
+    expect(snapEdit).not.toHaveBeenCalled();
+    expect(sentSteps()).toEqual([]);
+    expect(player?.loop).toEqual(loop);
   });
 
   it('旗を離してから吸着の応えが届くまでは取り消しを止め、届いたら確定してから取り消せる', async () => {

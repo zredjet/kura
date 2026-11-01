@@ -5,6 +5,7 @@
  *   足す。選択は今の出力の位置なので）・「選択をループにする」（ループ点のノードの引数にする）。
  * - 切り詰め：切り抜きと同じ流れ（`trim.ts`）。端をドラッグ・数の欄で直し、↵ で確定、esc・ほかの道具・ほかの手でやめる。
  * - フェード：段の上の角の三角をドラッグして `handle{fadeIn|fadeOut, node, preview}`、離したら `commitPreview`。
+ *   フェード・ループのドラッグは esc でやめられる（`cancelAudioDrag`。仮の値を捨てる）。
  * - ループ：目盛りの段の旗 2 本をドラッグして `handle{loop, preview}`。手元の値はストアに持ち、ループを試聴していれば
  *   次の折り返しから替える（標本は変わらないので Rust を待たない）。離したら、吸着がオンなら `edit_snap(frame,
  *   round(rate × 0.005))` で寄せた値を `preview` → `commitPreview` で送る。［ループ点を消す］は `handle{loop: null, step}`。
@@ -344,6 +345,23 @@ async function finishLoop(d: Extract<Drag, { kind: 'loop' }>, canceled: boolean)
   setAudioDragging(false);
 }
 
+/**
+ * フェードのドラッグを終える（離したら確定、やめたら仮の値を捨てる。動かさずに終えたら何も送らない）。
+ */
+function finishFade(d: Extract<Drag, { kind: 'fade' }>, canceled: boolean): void {
+  setAudioDragging(false);
+  if (!d.moved) {
+    setAudioLocal(null);
+    return;
+  }
+  if (canceled) {
+    send([CANCEL_DRAG]);
+    setAudioLocal(null);
+  } else {
+    send([COMMIT_DRAG], d.node === null);
+  }
+}
+
 /** 波形の面のポインタ（道具ごとに振り分ける）。 */
 export const AUDIO_POINTER: WavePointer = {
   down(e, x, y) {
@@ -473,20 +491,9 @@ export const AUDIO_POINTER: WavePointer = {
       case 'selEdge':
       case 'trim':
         return;
-      case 'fade': {
-        setAudioDragging(false);
-        if (!d.moved) {
-          setAudioLocal(null);
-          return;
-        }
-        if (canceled) {
-          send([CANCEL_DRAG]);
-          setAudioLocal(null);
-        } else {
-          send([COMMIT_DRAG], d.node === null);
-        }
+      case 'fade':
+        finishFade(d, canceled);
         return;
-      }
       case 'loop':
         // ドラッグの途中のまま（取り消しを止める）、吸着と確定を終えたら外す
         void finishLoop(d, canceled);
@@ -511,6 +518,26 @@ export const AUDIO_POINTER: WavePointer = {
     return undefined;
   },
 };
+
+/**
+ * フェード・ループのドラッグの途中ならやめる（esc。design.md §6）：フェードは仮の値を捨て、ループは試聴も文書の
+ * ループ点に戻す（ポインタを離したときに canceled で終えるのと同じ）。そのあとのポインタの動き・離したときは何も
+ * 送らない。やめたら true（ほかのドラッグ・ドラッグしていなければ false）。
+ */
+export function cancelAudioDrag(): boolean {
+  const d = drag;
+  if (d?.kind === 'fade') {
+    drag = null;
+    finishFade(d, true);
+    return true;
+  }
+  if (d?.kind === 'loop') {
+    drag = null;
+    void finishLoop(d, true);
+    return true;
+  }
+  return false;
+}
 
 /** ドラッグをやめる（閉じた・開き直した）。 */
 export function resetAudioDrag(): void {

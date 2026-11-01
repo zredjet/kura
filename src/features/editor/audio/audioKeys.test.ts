@@ -23,6 +23,7 @@ vi.mock('./audioTools', async (importOriginal) => ({
   selectAudioTool: vi.fn(),
   setInOut: vi.fn(),
   confirmTrim: vi.fn(),
+  cancelAudioDrag: vi.fn(() => false),
 }));
 vi.mock('../editorSave', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../editorSave')>()),
@@ -84,7 +85,7 @@ describe('音声エディタのキー', () => {
     expect(vi.mocked(store.cursorToEdge).mock.calls.map((c) => c[0])).toEqual([false, true]);
   });
 
-  it('↵ は切り詰めの間だけ確定、esc は切り詰めをやめる → 選択を外す → 閉じる', async () => {
+  it('↵ は切り詰めの間だけ確定、esc は（ドラッグしていなければ）切り詰めをやめる → 選択を外す → 閉じる', async () => {
     const { requestCloseEditor } = await import('../editorSave');
     expect(press('Enter')).toBe(false);
     store.useAudioStore.setState({
@@ -101,6 +102,23 @@ describe('音声エディタのキー', () => {
     expect(requestCloseEditor).not.toHaveBeenCalled();
     press('Escape');
     expect(requestCloseEditor).toHaveBeenCalled();
+  });
+
+  it('esc は、フェード・ループのドラッグ中ならそれをやめるだけ（切り詰めをやめない・閉じない）', async () => {
+    const { requestCloseEditor } = await import('../editorSave');
+    store.useAudioStore.setState({
+      trim: { node: null, start: 0, end: 10, bounds: 10, previewed: false },
+      selection: { start: 0, end: 5 },
+    });
+    vi.mocked(tools.cancelAudioDrag).mockReturnValueOnce(true);
+    expect(press('Escape')).toBe(true);
+    expect(tools.cancelAudioDrag).toHaveBeenCalledTimes(1);
+    expect(store.cancelTrim).not.toHaveBeenCalled();
+    expect(store.useAudioStore.getState().selection).toEqual({ start: 0, end: 5 });
+    expect(requestCloseEditor).not.toHaveBeenCalled();
+    // ドラッグしていなければ、今までどおり切り詰めをやめる
+    expect(press('Escape')).toBe(true);
+    expect(store.cancelTrim).toHaveBeenCalled();
   });
 
   it('⌘0・⌘+・⌘− で全体・拡大・縮小、⌘A ですべてを選択（メニューの項目も種類へ回す）', () => {

@@ -11,7 +11,7 @@
  * | Home・End | カーソルを先頭・末尾へ |
  * | S・T・F・R | 選択・切り詰め・フェード・ループ |
  * | ↵ | 切り詰めを確定 |
- * | esc | 切り詰めをやめる → 選択を外す →（核が）閉じる |
+ * | esc | フェード・ループのドラッグ中ならやめる → 切り詰めをやめる → 選択を外す →（核が）閉じる |
  * | ⌘A | すべてを選択（編集メニューの項目も `selectAll` を通る） |
  * | ⌘0・⌘+・⌘− | 全体を表示・拡大・縮小（表示メニューの項目もこのキー） |
  *
@@ -35,7 +35,7 @@ import {
   togglePlay,
   useAudioStore,
 } from './audioStore';
-import { confirmTrim, selectAudioTool, setInOut } from './audioTools';
+import { cancelAudioDrag, confirmTrim, selectAudioTool, setInOut } from './audioTools';
 
 const TOOL_KEYS: Record<string, AudioTool> = { s: 'select', t: 'trim', f: 'fade', r: 'loop' };
 
@@ -109,8 +109,12 @@ function down(e: KeyboardEvent, key: string): boolean | null {
   }
 }
 
-/** esc：切り詰めをやめる → 選択を外す（どちらもなければ核が閉じる）。 */
+/**
+ * esc：フェード・ループのドラッグ中ならやめる（仮の値を捨てる）→ 切り詰めをやめる → 選択を外す（どれもなければ核が
+ * 閉じる）。
+ */
 function escape(): boolean {
+  if (cancelAudioDrag()) return true;
   if (useAudioStore.getState().trim) {
     cancelTrim();
     return true;
