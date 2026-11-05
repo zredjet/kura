@@ -254,6 +254,94 @@ describe('音声のアダプタ', () => {
     expect(viewEdit).not.toHaveBeenCalled();
   });
 
+  describe('裏の仕事の頼みの連鎖', () => {
+    const busy = () => view({ work: true, peaks: { pending: true } });
+
+    /** 応えを後から返す edit_view（届いた順に `answer` で返す）。 */
+    function deferredViews() {
+      const waiting: ((r: EditStepResultDto) => void)[] = [];
+      vi.mocked(viewEdit).mockImplementation(
+        () => new Promise<EditStepResultDto>((resolve) => waiting.push(resolve)),
+      );
+      return {
+        answer: async (v: EditAudioView) => {
+          waiting.shift()?.(result(v));
+          await flush();
+        },
+      };
+    }
+
+    it('仕事が残っている間は、応えが届くたびに次を頼む（手が止まって 150 ms の最初のあとは待たない）', async () => {
+      await open(busy(), busy());
+      vi.mocked(viewEdit).mockClear();
+      let left = 3;
+      vi.mocked(viewEdit).mockImplementation(async () => result(left-- > 0 ? busy() : view()));
+      await flush(WAVE_IDLE_MS - 1);
+      expect(viewEdit).not.toHaveBeenCalled();
+      await flush(1);
+      await flush(10);
+      // 3 回の仕事の応えのたびに続け、仕事のない応えで止まる
+      expect(viewEdit).toHaveBeenCalledTimes(4);
+      for (const [, vp] of vi.mocked(viewEdit).mock.calls) {
+        expect(vp).toMatchObject({ type: 'audio', work: true });
+      }
+      await flush(WAVE_IDLE_MS * 3);
+      expect(viewEdit).toHaveBeenCalledTimes(4);
+    });
+
+    it('同時に 2 本送らない：応えが届くまで次を頼まない', async () => {
+      await open(busy(), busy());
+      vi.mocked(viewEdit).mockClear();
+      const io = deferredViews();
+      await flush(WAVE_IDLE_MS);
+      expect(viewEdit).toHaveBeenCalledTimes(1);
+      await flush(WAVE_IDLE_MS * 5);
+      expect(viewEdit).toHaveBeenCalledTimes(1);
+      await io.answer(busy());
+      await flush(5);
+      expect(viewEdit).toHaveBeenCalledTimes(2);
+      await flush(WAVE_IDLE_MS * 5);
+      expect(viewEdit).toHaveBeenCalledTimes(2);
+    });
+
+    it('手が来たらそちらを先に送って連鎖をやめ、手が止まって 150 ms から始め直す', async () => {
+      await open(busy(), busy());
+      vi.mocked(viewEdit).mockClear();
+      const io = deferredViews();
+      await flush(WAVE_IDLE_MS);
+      expect(viewEdit).toHaveBeenCalledTimes(1);
+      // 頼みの応えを待つ間に手が来た（ためて、応えのあとに送る）
+      vi.mocked(stepEdit).mockImplementation(async () => result(busy()));
+      pushEditorSteps([{ type: 'undo' }]);
+      expect(stepEdit).not.toHaveBeenCalled();
+      await io.answer(busy());
+      await flush(5);
+      expect(stepEdit).toHaveBeenCalledTimes(1);
+      expect(stepEdit).toHaveBeenCalledWith(
+        S,
+        [{ type: 'undo' }],
+        expect.objectContaining({ work: false }),
+      );
+      expect(viewEdit).toHaveBeenCalledTimes(1);
+      await flush(WAVE_IDLE_MS - 10);
+      expect(viewEdit).toHaveBeenCalledTimes(1);
+      await flush(10);
+      expect(viewEdit).toHaveBeenCalledTimes(2);
+      expect(viewEdit).toHaveBeenLastCalledWith(S, expect.objectContaining({ work: true }));
+    });
+
+    it('閉じたら止まる', async () => {
+      await open(busy(), busy());
+      vi.mocked(viewEdit).mockClear();
+      await flush(WAVE_IDLE_MS + 5);
+      const n = vi.mocked(viewEdit).mock.calls.length;
+      expect(n).toBeGreaterThan(1);
+      await closeEditor();
+      await flush(WAVE_IDLE_MS * 3);
+      expect(viewEdit).toHaveBeenCalledTimes(n);
+    });
+  });
+
   it('断られた手のあとは、ドラッグの手元の値をやめて文書の値を出す', async () => {
     await open();
     setAudioLocal({ fadeIn: 1234 });

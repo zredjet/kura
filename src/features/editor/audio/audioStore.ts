@@ -27,6 +27,7 @@ import {
   type EditSourcePieceDto,
   type EditSpanDto,
   type EditStepDto,
+  type EditViewportDto,
   measureEdit,
 } from '../../../ipc/edit';
 import type { ItemSummaryDto } from '../../../ipc/items';
@@ -395,6 +396,11 @@ export function audioPlayhead(): number | null {
   return toOutputPos(s, rt.player.source ?? s.ab, pos);
 }
 
+/** 裏の仕事を進める頼み（音声のビューポートの `work: true`）か。 */
+function isWorkRequest(viewport: EditViewportDto): boolean {
+  return viewport.type === 'audio' && viewport.work;
+}
+
 /** 音声のアダプタを作る。 */
 function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): EditorAdapter {
   const controller = new WaveController({
@@ -499,6 +505,8 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     viewport: () => controller.viewport(),
     sent(req) {
       rt.lastSentSeq = req.seq;
+      // 裏の仕事の頼みのほか（手・再生・表示の頼み）が出たら、波形の面が頼みの連鎖をやめる
+      controller.noteSent(req.steps.length === 0 && isWorkRequest(req.viewport));
       checkHook?.sent?.(
         req.seq,
         req.steps.map((q) => q.step),
@@ -522,7 +530,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       const s = useAudioStore.getState();
       // ラウドネス（計っている間の裏の仕事を、波形の面が頼み直しを決める前に決める）
       applyLoudness(rt, view, s.loudness, info);
-      controller.applyView(view);
+      controller.applyView(view, isWorkRequest(info.viewport));
       feed.setView(view, view.changed);
       const summary = summarizeAudioView(view);
       rt.patch.view = summary;
@@ -566,7 +574,8 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       if (!info.provisional && !rt.dragging) rt.patch.local = null;
     },
     onFailed() {
-      // 表示できなかった：前の表示のまま
+      // 表示できなかった：前の表示のまま（裏の仕事の頼みの連鎖はやめる）
+      controller.viewFailed();
     },
     settle() {
       const patch = rt.patch;

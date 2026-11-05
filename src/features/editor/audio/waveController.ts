@@ -11,7 +11,9 @@
  * - 取れなかった PCM のチャンクは印を付け、期限（1 秒から倍々で 8 秒まで）が来たら取り直す（503 の Busy もある）。
  * - 表示の結果を受けたら：`changed` に掛かる PCM のチャンクを捨て、`peaks.changed` に掛かるタイルを捨てる。
  *   `peaks.pending` か `work` が真なら（ラウドネスを計っている間も：`setExtraWork`）、手が止まって 150 ms たったら
- *   `work: true` で頼み直す（同じビューポートでも送る）。
+ *   `work: true` で頼み直す（同じビューポートでも送る）。そのあと仕事が残っている間は、その頼みの応えが届いたら次のタスク
+ *   で次を頼む（連鎖。1 本ずつ）。手・ズーム・パン・再生の頼み・ドラッグが来たら連鎖をやめ、また手が止まって 150 ms から
+ *   始める（`noteSent`・`setWindow`・`setPlaybackSpans`・`setInteracting`）。
  * - ズーム・パンで描き直すのは `requestAnimationFrame` の 1 回だけ（汚れたときだけ）。止まって 150 ms で今の区間を頼み直す。
  *   列ごとの [min, max] は使い回す型付きの配列に入れる。
  * - 公開されている段の長さが今の出力と違う間（尾を作り直している）は、重なる所だけ描く（段の長さで切る）。レートが
@@ -292,6 +294,13 @@ export class WaveController {
   private focusNode: number | null = null;
   private frameId: number | null = null;
   private idleId: number | null = null;
+  /** 連鎖の次の頼み（次のタスク）。 */
+  private chainId: number | null = null;
+  /**
+   * 連鎖している（手が止まって 150 ms で `work: true` を頼み、そのあとほかの頼み・手が出ていない）。真の間は、`work: true`
+   * の頼みの応えが届いたら次のタスクで次を頼む。
+   */
+  private chaining = false;
   private workWanted = false;
   /** 表示の結果のほかに残っている裏の仕事（長い音声のラウドネスを計っている）。 */
   private extraWork = false;
@@ -408,6 +417,8 @@ export class WaveController {
       );
     if (same) return;
     this.extraSpans = [...spans];
+    // 再生の頼みを先にする（裏の仕事の続きは、また 150 ms から）
+    this.breakChain();
     this.options.onIdle?.(this.viewport(), false);
   }
 
@@ -415,18 +426,34 @@ export class WaveController {
   setInteracting(on: boolean): void {
     if (this.interacting === on) return;
     this.interacting = on;
-    if (!on) this.scheduleIdle();
+    if (on) this.stopChain();
+    else this.scheduleIdle();
   }
 
   /**
    * 表示の結果のほかに残っている裏の仕事（長い音声のラウドネスを計っている。計りは edit_view { work: true } の区切りで
-   * だけ進む）。真の間は、表示の work が偽でも、手が止まって 150 ms ごとに work: true で頼み直す。
+   * だけ進む）。真の間は、表示の work が偽でも、手が止まって 150 ms で work: true を頼み、応えのたびに続ける。
    */
   setExtraWork(on: boolean): void {
     if (this.extraWork === on) return;
     this.extraWork = on;
     this.workWanted = (this.view?.work ?? false) || (this.peaks?.pending ?? false) || on;
-    if (this.workWanted) this.scheduleIdle();
+    // 連鎖している間は、届く応えが続ける（同時に 2 本頼まない）
+    if (this.workWanted && !this.chaining) this.scheduleIdle();
+  }
+
+  /**
+   * 要求を送った（核の `sent`。`work` は、手を含まない `work: true` の頼み＝裏の仕事の頼みか）。ほかの要求（手・再生・
+   * 表示の頼み）が出たら、そちらが先なので連鎖をやめ、また手が止まって 150 ms から始める。
+   */
+  noteSent(work: boolean): void {
+    if (this.disposed || work) return;
+    this.breakChain();
+  }
+
+  /** 表示できなかった・要求が通らなかった：連鎖をやめる（次の手・ズームなどのあとに 150 ms から始める）。 */
+  viewFailed(): void {
+    this.stopChain();
   }
 
   /** 編集中のノード（キャッシュに固定する）。 */
@@ -558,7 +585,11 @@ export class WaveController {
     this.emitInfo();
     this.invalidate();
     this.pump();
-    if (user) this.scheduleIdle();
+    if (user) {
+      // ズーム・パンを先にする（止まって 150 ms で今の区間を頼み、裏の仕事もそこから続ける）
+      this.stopChain();
+      this.scheduleIdle();
+    }
   }
 
   // ===== 表示の結果 =====
@@ -588,8 +619,11 @@ export class WaveController {
     };
   }
 
-  /** 表示の結果を受ける。 */
-  applyView(view: EditAudioView): void {
+  /**
+   * 表示の結果を受ける（`requestedWork` は、その結果の要求が裏の仕事の頼み（`work: true`）だったか。連鎖を続けるのは
+   * その応えだけ）。
+   */
+  applyView(view: EditAudioView, requestedWork = false): void {
     if (this.disposed) return;
     const shape = { rate: view.rate, channels: view.channels, frames: view.frames };
     const reshaped =
@@ -622,10 +656,18 @@ export class WaveController {
     this.emitInfo();
     this.pump();
     this.invalidate();
-    if (this.workWanted) this.scheduleIdle();
+    if (!this.workWanted) {
+      this.stopChain();
+    } else if (this.chaining) {
+      // 連鎖の頼みの応えなら、次のタスクで次を頼む（応えの直後に核が送る、ためていた手・表示の頼みを先にする。それが
+      // 出たら `noteSent` が連鎖をやめる）。ほかの要求の応えなら、そのあとに出る連鎖の頼みの応えを待つ
+      if (requestedWork) this.scheduleChain();
+    } else {
+      this.scheduleIdle();
+    }
   }
 
-  /** 止まって 150 ms で頼み直す（裏の仕事が残っていれば `work: true` で、同じでも送る）。 */
+  /** 止まって 150 ms で頼み直す（裏の仕事が残っていれば `work: true` で、同じでも送り、連鎖を始める）。 */
   private scheduleIdle(): void {
     if (this.idleId !== null) this.scheduler.cancelLater(this.idleId);
     this.idleId = this.scheduler.later(() => {
@@ -634,11 +676,40 @@ export class WaveController {
       if (this.interacting) return;
       const vp = this.viewport();
       if (this.workWanted) {
+        // 送るとすぐ核の `sent` が `noteSent` を呼ぶので、先に連鎖に入る
+        this.chaining = true;
         this.options.onIdle?.({ ...vp, work: true }, true);
       } else {
         this.options.onIdle?.(vp, false);
       }
     }, WAVE_IDLE_MS);
+  }
+
+  /** 連鎖の次の頼みを次のタスクで出す（それまでに仕事がなくなった・ドラッグが始まったら出さない）。 */
+  private scheduleChain(): void {
+    if (this.chainId !== null) return;
+    this.chainId = this.scheduler.later(() => {
+      this.chainId = null;
+      if (this.disposed || !this.chaining) return;
+      if (!this.workWanted || this.interacting) {
+        this.chaining = false;
+        return;
+      }
+      this.options.onIdle?.({ ...this.viewport(), work: true }, true);
+    }, 0);
+  }
+
+  /** 連鎖をやめる（待っている次の頼みも出さない）。 */
+  private stopChain(): void {
+    this.chaining = false;
+    if (this.chainId !== null) this.scheduler.cancelLater(this.chainId);
+    this.chainId = null;
+  }
+
+  /** ほかの頼みが先に出た：連鎖をやめ、仕事が残っていれば手が止まって 150 ms から始め直す。 */
+  private breakChain(): void {
+    this.stopChain();
+    if (this.workWanted) this.scheduleIdle();
   }
 
   // ===== 読み込み =====
@@ -1069,6 +1140,7 @@ export class WaveController {
     if (this.frameId !== null) this.scheduler.cancelFrame(this.frameId);
     if (this.idleId !== null) this.scheduler.cancelLater(this.idleId);
     if (this.retryId !== null) this.scheduler.cancelLater(this.retryId);
+    this.stopChain();
     this.frameId = null;
     this.idleId = null;
     this.retryId = null;

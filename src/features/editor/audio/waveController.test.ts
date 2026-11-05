@@ -315,6 +315,142 @@ describe('止まってから頼み直す', () => {
   });
 });
 
+describe('裏の仕事の頼みの連鎖', () => {
+  const busy = () =>
+    audioView({
+      work: true,
+      peaks: { rev: 3, pending: true, changed: { type: 'spans', spans: [] } },
+    });
+  const done = () =>
+    audioView({
+      work: false,
+      peaks: { rev: 4, pending: false, changed: { type: 'spans', spans: [] } },
+    });
+
+  /** 手が止まって 150 ms の最初の頼みまで進める。 */
+  function started() {
+    const s = setup();
+    s.c.applyView(busy());
+    s.clock.advance(WAVE_IDLE_MS);
+    expect(s.idle).toHaveLength(1);
+    return s;
+  }
+
+  it('仕事が残っている間は、work: true の頼みの応えが届くたびに次のタスクで次を頼む（150 ms 待たない）', () => {
+    const { c, clock, idle } = started();
+    for (let n = 2; n <= 5; n++) {
+      c.applyView(busy(), true);
+      // 応えを受けている間には送らない（核がためた手を先に送れるように、次のタスクで）
+      expect(idle).toHaveLength(n - 1);
+      clock.advance(0);
+      expect(idle).toHaveLength(n);
+      expect(idle[n - 1]).toEqual([expect.objectContaining({ work: true }), true]);
+    }
+  });
+
+  it('同時に 2 本頼まない：応えが届くまでは、時間がたっても・ラウドネスの仕事が増えても次を頼まない', () => {
+    const { c, clock, idle } = started();
+    clock.advance(WAVE_IDLE_MS * 10);
+    c.setExtraWork(true);
+    clock.advance(WAVE_IDLE_MS * 10);
+    expect(idle).toHaveLength(1);
+    // ほかの要求（work: false）の応えでは続けない（連鎖の頼みの応えを待つ）
+    c.applyView(busy(), false);
+    clock.advance(WAVE_IDLE_MS * 3);
+    expect(idle).toHaveLength(1);
+    c.applyView(busy(), true);
+    c.applyView(busy(), true);
+    clock.advance(0);
+    expect(idle).toHaveLength(2);
+  });
+
+  it('手が送られたら連鎖をやめ、手が止まって 150 ms から始め直す', () => {
+    const { c, clock, idle } = started();
+    c.applyView(busy(), true);
+    // 応えの直後に核がためていた手を送った
+    c.noteSent(false);
+    clock.advance(0);
+    expect(idle).toHaveLength(1);
+    // 手の応え
+    c.applyView(busy(), false);
+    clock.advance(WAVE_IDLE_MS - 1);
+    expect(idle).toHaveLength(1);
+    clock.advance(1);
+    expect(idle).toHaveLength(2);
+    expect(idle[1]?.[0].work).toBe(true);
+    // また連鎖する
+    c.applyView(busy(), true);
+    clock.advance(0);
+    expect(idle).toHaveLength(3);
+  });
+
+  it('ズーム・パン・再生の頼みが来たら連鎖をやめ、止まって 150 ms から始め直す', () => {
+    const { c, clock, idle } = started();
+    c.applyView(busy(), true);
+    c.zoomAt(2, 500);
+    clock.advance(0);
+    expect(idle).toHaveLength(1);
+    clock.advance(WAVE_IDLE_MS);
+    expect(idle).toHaveLength(2);
+    expect(idle[1]?.[0].work).toBe(true);
+    // 再生の先読みの区間：すぐ work: false で頼み、続きは 150 ms から
+    c.applyView(busy(), true);
+    c.setPlaybackSpans([{ start: 0, end: CHUNK }]);
+    expect(idle).toHaveLength(3);
+    expect(idle[2]).toEqual([expect.objectContaining({ work: false }), false]);
+    c.noteSent(false);
+    clock.advance(WAVE_IDLE_MS - 1);
+    expect(idle).toHaveLength(3);
+    clock.advance(1);
+    expect(idle).toHaveLength(4);
+    expect(idle[3]?.[0].work).toBe(true);
+    // ドラッグが始まったら止め、離して 150 ms から
+    c.applyView(busy(), true);
+    c.setInteracting(true);
+    clock.advance(WAVE_IDLE_MS * 3);
+    expect(idle).toHaveLength(4);
+    c.setInteracting(false);
+    clock.advance(WAVE_IDLE_MS);
+    expect(idle).toHaveLength(5);
+  });
+
+  it('work が偽になったら止まる（ラウドネスの仕事が終わったときも）', () => {
+    const { c, clock, idle } = started();
+    c.applyView(done(), true);
+    clock.advance(WAVE_IDLE_MS * 10);
+    expect(idle).toHaveLength(1);
+    // ラウドネスだけが残っている間は続け、終わったら次を出さない
+    c.setExtraWork(true);
+    clock.advance(WAVE_IDLE_MS);
+    expect(idle).toHaveLength(2);
+    c.applyView(done(), true);
+    c.setExtraWork(false);
+    clock.advance(WAVE_IDLE_MS * 10);
+    expect(idle).toHaveLength(2);
+  });
+
+  it('閉じたら止まる', () => {
+    const { c, clock, idle } = started();
+    c.applyView(busy(), true);
+    c.dispose();
+    clock.advance(WAVE_IDLE_MS * 10);
+    c.applyView(busy(), true);
+    clock.advance(WAVE_IDLE_MS * 10);
+    expect(idle).toHaveLength(1);
+  });
+
+  it('表示できなかったら連鎖をやめる（次の手・ズームなどのあとに 150 ms から）', () => {
+    const { c, clock, idle } = started();
+    c.viewFailed();
+    clock.advance(WAVE_IDLE_MS * 10);
+    expect(idle).toHaveLength(1);
+    c.zoomAt(2, 500);
+    clock.advance(WAVE_IDLE_MS);
+    expect(idle).toHaveLength(2);
+    expect(idle[1]?.[0].work).toBe(true);
+  });
+});
+
 describe('ズームと再生位置', () => {
   it('全体を表示・拡大・縮小・再生位置が外へ出たら 1 画面ぶん飛ぶ', () => {
     const { c } = setup();
