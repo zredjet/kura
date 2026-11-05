@@ -448,7 +448,11 @@ impl WorkCx<'_> {
 }
 
 /// 対話の枠で待たずに確保する（0 なら確保しない。予算の全体を超えれば TooLarge、今すぐ確保できなければ Busy）。
-fn admit(budget: &Arc<MemoryBudget>, need: u64, what: &str) -> Result<Option<Lease>, EditorError> {
+pub(crate) fn admit(
+    budget: &Arc<MemoryBudget>,
+    need: u64,
+    what: &str,
+) -> Result<Option<Lease>, EditorError> {
     if need == 0 {
         return Ok(None);
     }
@@ -471,6 +475,37 @@ fn admit(budget: &Arc<MemoryBudget>, need: u64, what: &str) -> Result<Option<Lea
 /// 待たずに確保し直してから読み、読み終えたら返す。予算で断ったら外側の Err（Busy・TooLarge）、読めなければ内側の Err。
 pub(crate) fn read_shape_staged(
     cx: &WorkCx<'_>,
+    after: Option<&str>,
+) -> Result<Result<(Shape, PickedStage), EngineError>, EditorError> {
+    shape_staged(
+        &ShapeCx {
+            runtime: cx.runtime,
+            codecs: cx.codecs,
+            path: cx.path,
+            format: cx.format,
+            opts: cx.opts,
+            limits: cx.limits,
+            mon: cx.mon,
+        },
+        after,
+    )
+}
+
+/// 段ごとに確保して形を読む材料（[`shape_staged`]）。
+pub(crate) struct ShapeCx<'a> {
+    pub runtime: &'a EngineRuntime,
+    pub codecs: &'a CodecSet,
+    /// 元のファイルとその形式・読み方。
+    pub path: &'a Path,
+    pub format: &'a str,
+    pub opts: &'a DecodeOptions,
+    pub limits: &'a Limits,
+    pub mon: &'a dyn Monitor,
+}
+
+/// [`read_shape_staged`] の本体（作業用のファイルの置き場を使わない読み手も使う。エディタの今の道の形の読み。段 7）。
+pub(crate) fn shape_staged(
+    cx: &ShapeCx<'_>,
     after: Option<&str>,
 ) -> Result<Result<(Shape, PickedStage), EngineError>, EditorError> {
     let budget = cx.runtime.budget();

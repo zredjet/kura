@@ -1938,14 +1938,17 @@ struct ReadInput {
 }
 
 /// 元を読む：音声は遅延の源で開けるならそれ（[`audio::source::open_lazy`]）、アンカーのない長い音声は作業用のファイル
-/// （[`read_work`]）、ほかは今の道（丸ごと読む。アンカーが遅延で使えなかった音声は上限を確かめる。アンカーのない短い音声は
-/// 境の判定で値が上限の内と分かっているので確かめない）。
+/// （[`read_work`]）、ほかは今の道（丸ごと読む。`source::read`）。アンカーのない短い音声は、境の判定で段ごとに確保して読んだ
+/// 形を今の道に渡して読み直さない（段 7）。音声は今の道が、試す読み方の形（アンカーの見出し・確保して読んだ元の形）で
+/// 丸ごと読む上限を確かめる（アンカーが遅延で使えなかった長い音声は TooLarge。元の形を先に読まない）。
 fn read_input(
     editor: &Editor,
     parts: &OpenParts,
     limits: &kura_engine::Limits,
 ) -> Result<ReadInput, EditorError> {
     let runtime = &editor.runtime;
+    // 確保の中で読んだ元の形（あれば今の道で読み直さない）
+    let mut known: Option<Shape> = None;
     if parts.audio {
         let lazy = runtime.preview(|_| {
             audio::source::open_lazy(&audio::source::LazyCx {
@@ -1968,36 +1971,21 @@ fn read_input(
                 warnings: Vec::new(),
             });
         }
-        // アンカーのないものは作業用のファイルの道を試す。None なら、段ごとに確保して読んだ形で値が境以下（か音声でない）と
-        // 分かっている（境 ≤ 丸ごと読む上限なので、上限の確かめは要らない）
-        let short = match (&parts.anchor, &parts.work_pcm) {
-            (None, Some(store)) => match read_work(editor, parts, store, limits)? {
-                Some(o) => {
+        // アンカーのないものは作業用のファイルの道を試す。短い（か音声でない）なら、段ごとに確保して読んだ形を今の道に渡す
+        if parts.anchor.is_none()
+            && let Some(store) = &parts.work_pcm
+        {
+            match read_work(editor, parts, store, limits)? {
+                WorkRead::Opened(o) => {
+                    let o = *o;
                     return Ok(ReadInput {
                         input: o.input,
                         audio: Some(o.info),
                         warnings: Vec::new(),
                     });
                 }
-                None => true,
-            },
-            _ => false,
-        };
-        if !short {
-            // アンカーが遅延で使えなかったもの：丸ごと読む前に、長さの上限を確かめる（形の読みは確保なし。段 7）
-            let shape = runtime
-                .preview(|_| {
-                    editor.codecs.shape_path_monitored(
-                        &parts.original_path,
-                        parts.format,
-                        &parts.opts,
-                        limits,
-                        editor.cancel.as_ref(),
-                    )
-                })
-                .map_err(|e| EditorError::from_engine("元の大きさを読めません", e))?
-                .0;
-            audio::source::check_whole_read(&shape, runtime.budget().total())?;
+                WorkRead::Short(shape) => known = Some(shape),
+            }
         }
     }
     let read = source::read(&source::SourceCx {
@@ -2010,6 +1998,8 @@ fn read_input(
         anchor: parts.anchor.clone(),
         limits,
         mon: editor.cancel.as_ref(),
+        shape: known,
+        check_whole: parts.audio,
     })?;
     if parts.audio != matches!(read.value, kura_engine::Value::Audio(_)) {
         return Err(EditorError::Invalid {
@@ -2036,15 +2026,23 @@ fn read_input(
     })
 }
 
+/// [`read_work`] の結果。
+enum WorkRead {
+    /// 作業用のファイルから遅延で開いた。
+    Opened(Box<audio::source::OpenedAudio>),
+    /// 短い（値が境以下）か音声でない：段ごとに確保して読んだ形（呼び手が今の道に渡して丸ごと読む。読み直さない）。
+    Short(Shape),
+}
+
 /// 直接読めない形式（アンカーなし）の音声：値が `work_threshold` を超えれば作業用のファイルにして遅延の源で開く（同じ鍵の
-/// ものがあれば使い回す）。短ければ None（呼び手が丸ごと読む）。作る間の予算は対話の枠で待たずに確保し、閉じる・ほかを
+/// ものがあれば使い回す）。短ければ、読んだ形（呼び手が丸ごと読む）。作る間の予算は対話の枠で待たずに確保し、閉じる・ほかを
 /// 開くと止まる（`editor.cancel`）。
 fn read_work(
     editor: &Editor,
     parts: &OpenParts,
     store: &crate::edit::work_pcm::WorkPcmStore,
     limits: &kura_engine::Limits,
-) -> Result<Option<audio::source::OpenedAudio>, EditorError> {
+) -> Result<WorkRead, EditorError> {
     let runtime = &editor.runtime;
     let started = Instant::now();
     let total = runtime.budget().total();
@@ -2066,11 +2064,11 @@ fn read_work(
         None => {
             let (shape, stage) = audio::source::read_shape_staged(&cx, None)?
                 .map_err(|e| EditorError::from_engine("元の大きさを読めません", e))?;
-            // 短い・音声でない（種類が合わない）ものは今の道へ（丸ごと読み、種類は読んだ値で確かめる）
+            // 短い・音声でない（種類が合わない）ものは今の道へ（丸ごと読み、種類は読んだ値で確かめる。形は読み直さない）
             if !matches!(shape, Shape::Audio { .. })
                 || shape.value_bytes() <= audio::source::work_threshold(total)
             {
-                return Ok(None);
+                return Ok(WorkRead::Short(shape));
             }
             audio::source::make_work(&cx, shape, stage)?
         }
@@ -2081,7 +2079,7 @@ fn read_work(
         ms = started.elapsed().as_secs_f64() * 1000.0,
         "元を作業用のファイルから開きました"
     );
-    audio::source::work_input(opened, parts.source).map(Some)
+    audio::source::work_input(opened, parts.source).map(|o| WorkRead::Opened(Box::new(o)))
 }
 
 /// 元の形の要約。

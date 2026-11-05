@@ -7,6 +7,12 @@
 //! - 予算：形を読んでから、読む段の見積もり（`Engine::estimate` の読む段。デコーダの作業領域・ファイルの長さを含む）を対話
 //!   （`Class::Interactive`）で待たずに確保する。予算の全体を超えれば TooLarge、今すぐ確保できなければ Busy。確保は読み
 //!   終えたら手放し、そのあとはエディタのキャッシュの確保（入力を `register_external` で数える）が覆う。
+//! - 形の読みも予算の外で行わない（M13 段 7）：元の形は、その段で形を読む分（ファイル全体を読む段の長さ・埋め込みの画像など）
+//!   を対話の枠で待たずに確保してから読む（組の段の順は `audio::source::shape_staged`、記録のデコーダは同じ見積もりを 1 段で）。
+//!   呼び手が確保の中で読んだ形（[`SourceCx::shape`]。アンカーのない短い音声の境の判定で読んだもの）があれば、それを使って
+//!   読み直さない。アンカーの見出し（自前の f32 WAV の見出しだけ）は確保しない。
+//! - 音声のアイテムは、試す読み方の形で丸ごと読む上限を確かめる（[`SourceCx::check_whole`]。超えれば TooLarge。元の形を
+//!   先に読まない）。
 //! - 中止：エディタを閉じる・別のアイテムを開くと止まる（`mon`）。
 
 use std::collections::BTreeMap;
@@ -24,6 +30,7 @@ use kura_engine::render::estimate::{EstimateSpec, Source};
 use kura_engine::{Digest, EngineError, Graph, Limits, Monitor, Shape, Value};
 
 use super::EditorError;
+use super::audio::source::{ShapeCx, admit, check_whole_read, shape_staged};
 use crate::edit::EngineRuntime;
 use crate::edit::anchors::Anchor;
 
@@ -49,6 +56,10 @@ pub(super) struct SourceCx<'a> {
     pub anchor: Option<(Anchor, PathBuf)>,
     pub limits: &'a Limits,
     pub mon: &'a dyn Monitor,
+    /// 呼び手が確保の中で読んだ元の形（組の段の順で読んだもの。アンカーのない読み（組の段の順）で使い、読み直さない）。
+    pub shape: Option<Shape>,
+    /// 音声のアイテム：形を読んだら、丸ごと読む上限（`audio::source::check_whole_read`）を確かめる。
+    pub check_whole: bool,
 }
 
 /// 1 回分の読み方。
@@ -127,10 +138,17 @@ fn attempt(
     how: &How<'_>,
 ) -> Result<std::result::Result<(Value, DecodeStamp), String>, EditorError> {
     let from_record = !matches!(how, How::Any);
-    let shape = match cx.runtime.preview(|_| shape_of(cx, how)) {
-        Ok(shape) => shape,
-        Err(e) => return unusable(e, from_record, "元の大きさを読めません"),
+    let shape = match (how, cx.shape) {
+        // 呼び手が確保の中で読んだ形（同じ組の段の順で読んだもの）：読み直さない
+        (How::Any, Some(shape)) => shape,
+        _ => match read_shape(cx, how)? {
+            Ok(shape) => shape,
+            Err(e) => return unusable(e, from_record, "元の大きさを読めません"),
+        },
     };
+    if cx.check_whole {
+        check_whole_read(&shape, cx.runtime.budget().total())?;
+    }
     let _lease = admit_read(cx, how, &shape)?;
     let read = cx.runtime.preview(|_| match how {
         How::Anchor { path, rec } => recorded::read_recorded(
@@ -185,27 +203,70 @@ fn unusable<T>(
     Err(EditorError::from_engine(what, e))
 }
 
-/// 形（見出し）を読む。
-fn shape_of(cx: &SourceCx<'_>, how: &How<'_>) -> Result<Shape, EngineError> {
-    let shape = match how {
-        How::Anchor { path, .. } => File::open(path)
-            .map_err(EngineError::from)
-            .and_then(|f| anchor::shape(&mut BufReader::new(f), cx.limits))?,
-        How::Recorded { decoder, rec } => decoder.shape_file_monitored(
-            cx.original,
-            &rec.format,
-            &rec.options,
-            cx.limits,
-            cx.mon,
-        )?,
+/// 形（見出し）を読む。元の形は予算の外で読まない（モジュールの説明）：組の段の順なら段ごとに、記録のデコーダならその段の
+/// 形を読む分（`Decoder::shape_work_bytes` ＋ 頭で数えた保持の量。`CodecSet::shape_path_staged` と同じ見積もり）を対話の枠で
+/// 待たずに確保してから読む。アンカーの見出しは確保しない。予算で断ったら外の Err（Busy・TooLarge）、読めなければ内の Err。
+fn read_shape(
+    cx: &SourceCx<'_>,
+    how: &How<'_>,
+) -> Result<std::result::Result<Shape, EngineError>, EditorError> {
+    let read = match how {
+        How::Anchor { path, .. } => cx.runtime.preview(|_| {
+            File::open(path)
+                .map_err(EngineError::from)
+                .and_then(|f| anchor::shape(&mut BufReader::new(f), cx.limits))
+        }),
+        How::Recorded { decoder, rec } => {
+            let len = std::fs::metadata(cx.original).map_or(0, |m| m.len());
+            let mut lease: Option<Lease> = None;
+            let mut refused: Option<EditorError> = None;
+            let read = cx.runtime.preview(|_| {
+                let held = decoder.held_bytes_file(cx.original, &rec.format, cx.limits)?;
+                let need = decoder
+                    .shape_work_bytes(&rec.format, len)
+                    .saturating_add(held.open);
+                match admit(cx.runtime.budget(), need, "元の形を読む") {
+                    Ok(l) => lease = l,
+                    Err(e) => {
+                        refused = Some(e);
+                        return Err(EngineError::Canceled);
+                    }
+                }
+                decoder.shape_file_monitored(
+                    cx.original,
+                    &rec.format,
+                    &rec.options,
+                    cx.limits,
+                    cx.mon,
+                )
+            });
+            drop(lease);
+            if let Some(e) = refused {
+                return Err(e);
+            }
+            read
+        }
         How::Any => {
-            cx.codecs
-                .shape_path_monitored(cx.original, cx.format, cx.opts, cx.limits, cx.mon)?
-                .0
+            let staged = shape_staged(
+                &ShapeCx {
+                    runtime: cx.runtime,
+                    codecs: cx.codecs,
+                    path: cx.original,
+                    format: cx.format,
+                    opts: cx.opts,
+                    limits: cx.limits,
+                    mon: cx.mon,
+                },
+                None,
+            )?;
+            // 段の順の読みは上限の確かめを済ませている
+            return Ok(staged.map(|(shape, _)| shape));
         }
     };
-    cx.limits.check(&shape).map_err(EngineError::Limit)?;
-    Ok(shape)
+    Ok(read.and_then(|shape| {
+        cx.limits.check(&shape).map_err(EngineError::Limit)?;
+        Ok(shape)
+    }))
 }
 
 /// 読む段の見積もりを、対話で待たずに確保する（予算の全体を超えれば TooLarge、空いていなければ Busy）。

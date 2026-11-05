@@ -885,11 +885,25 @@ fn opening_reads_the_shape_only_inside_the_budget() {
     );
 }
 
-/// F15・docs の検証の直し：境以下の短い音声（アンカーなし）は、段ごとに確保して形を読んだあと、丸ごと読む上限を確かめる
-/// ための形を読まない（値 ≤ 境 ≤ 丸ごと読む上限なので必ず通る）。予算の外の形の読みは、丸ごと読む今の道
-/// （`editor::source::read`）の 1 回だけ（段 7 に残したこと。docs/editing.md §9.11）。
+/// 開いた入力の値が、元を丸ごと読んだ値・記録と同じ（値のダイジェストと読んだデコーダ）。
+fn assert_read_like_whole(env: &Env, opened: &crate::edit::editor::Opened, flac: &[u8]) {
+    let (want, stamp) = decode_whole(flac);
+    let a = opened.source.audio.clone().unwrap();
+    assert_eq!(a.decoder, stamp.codec);
+    let (input, decoder) = env.editor(&opened.session).published_input().unwrap();
+    assert_eq!(decoder, stamp.codec);
+    assert_eq!(
+        input.digest().unwrap(),
+        Value::Audio(want).digest().unwrap(),
+        "値が丸ごと読んだものと違う"
+    );
+}
+
+/// 段 7（F15・docs の検証の直しの残り）：境以下の短い音声（アンカーなし）は、段ごとに確保して読んだ形を丸ごと読む今の道
+/// （`editor::source::read`）に渡し、予算の外で形を読み直さない。形の読みはどれも確保の中（境の判定の段ごとの確保・丸ごと
+/// 読む段の確保の中の形の確かめ）。値・記録は丸ごと読んだものと同じ。
 #[test]
-fn short_audio_reads_the_shape_outside_the_budget_only_once() {
+fn short_audio_reads_the_shape_only_inside_the_budget() {
     let log = ShapeLog::default();
     let env = watched_env(SMALL, &log);
     let flac = long_flac(2 * C);
@@ -897,15 +911,86 @@ fn short_audio_reads_the_shape_outside_the_budget_only_once() {
     let id = add_audio(&env.lib, &flac, "flac");
     log.attach(env.engine.runtime().unwrap().budget());
     let opened = env.open(id);
-    assert!(!opened.source.audio.unwrap().lazy, "短いものは丸ごと読む");
-    // 最初は段ごとに確保して読む（境の判定）。丸ごと読む道の読み（確保した読む段の中の形の確かめ）も確保の中
+    assert!(
+        !opened.source.audio.clone().unwrap().lazy,
+        "短いものは丸ごと読む"
+    );
     let seen = log.seen();
     assert!(seen.first().is_some_and(|&u| u >= len), "{seen:?}");
-    assert_eq!(
-        seen.iter().filter(|&&u| u < len).count(),
-        1,
-        "予算の外の形の読み：{seen:?}（ファイルは {len} バイト）"
+    assert!(
+        seen.iter().all(|&u| u >= len),
+        "予算の外で形を読んだ：{seen:?}（ファイルは {len} バイト）"
     );
+    assert_read_like_whole(&env, &opened, &flac);
+}
+
+/// 段 7：アンカーがあって遅延で使えない短い音声も、予算の外で元の形を読まない。丸ごと読む上限の確かめは、試す読み方の形
+/// （アンカーの見出し・記録のデコーダで確保して読んだ形）で行い、元の形を先に読まない。アンカーが読めず記録のデコーダで
+/// 読み直すときは、その形の読みも確保の中で、空いていなければ形を読む前に Busy。値・記録は丸ごと読んだものと同じ。
+#[test]
+fn anchored_audio_reads_the_shape_only_inside_the_budget() {
+    let log = ShapeLog::default();
+    let env = watched_env(SMALL, &log);
+    let budget = env.engine.runtime().unwrap().budget().clone();
+    log.attach(&budget);
+    // 見出しの記録だけが DB と違う（遅延で使わず、アンカーを丸ごと読む）・アンカーのファイルがない（記録のデコーダで元を
+    // 読み直す）
+    for (frames, missing) in [(2 * C, false), (2 * C + 11, true)] {
+        let flac = long_flac(frames);
+        let len = flac.len() as u64;
+        let id = add_audio(&env.lib, &flac, "flac");
+        place_anchor(&env.lib, &flac, "flac", |d| {
+            let mut h = d.clone();
+            h.codec = "other-kura-dec/9".into();
+            h
+        });
+        if missing {
+            let row = env
+                .lib
+                .db()
+                .read(|c| {
+                    let hash = *blake3::hash(&flac).as_bytes();
+                    crate::edit::anchors::find(
+                        c,
+                        &hash,
+                        &crate::edit::anchors::options_digest(&Default::default())?,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            std::fs::remove_file(env.lib.layout().content_path(&row.hash, &row.ext)).unwrap();
+            // 元の形を読む分（ファイルの長さ）が空いていない：読む前に断る
+            log.clear();
+            let held = budget
+                .try_acquire(SMALL - len / 2, Class::Interactive)
+                .unwrap()
+                .unwrap();
+            let err = open_err(&env, id);
+            assert!(
+                matches!(&err, EditorError::Busy(m) if m.contains("元の形を読む")),
+                "{err}"
+            );
+            assert!(
+                log.seen().is_empty(),
+                "断る前に形を読んだ：{:?}",
+                log.seen()
+            );
+            drop(held);
+        }
+        log.clear();
+        let opened = env.open(id);
+        assert!(!opened.source.audio.clone().unwrap().lazy, "{missing}");
+        let seen = log.seen();
+        if missing {
+            assert!(!seen.is_empty(), "記録のデコーダで読み直す");
+        }
+        assert!(
+            seen.iter().all(|&u| u >= len),
+            "予算の外で形を読んだ（{missing}）：{seen:?}（ファイルは {len} バイト）"
+        );
+        assert_read_like_whole(&env, &opened, &flac);
+        close(&env.engine, &opened.session);
+    }
 }
 
 /// 段 4B の検証の直し 2：試聴の `/pcm` も、直接読めない形式は予算の外で形を読まない（境の判定・丸ごと読みに使う形は段ごとに
