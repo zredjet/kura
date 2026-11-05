@@ -14,6 +14,10 @@
 //! - 試聴の PCM の読んだ結果の置き場（[`PcmCache`]。覚えている間はこの実行の場の予算を持つ）もライブラリごとに持ち、閉じる
 //!   （部品を捨てる）ときにすぐ手放す（M11 の検証 E2：アプリに 1 つだと、前のライブラリの音声と予算の確保を TTL まで持ち続け、
 //!   新しいライブラリの予算はそれを数えなかった）。
+//! - ライブラリの開いている間だけ有効な中止の印（[`EngineServices::closing`]。M13 段 7）：閉じる・切り替えるときに
+//!   [`EngineServices::begin_close`] で立て（`LibrarySession::close` の最初。部品を捨てるときも）、戻さない（部品はライブラリ
+//!   ごとに作り直す）。試聴の `/pcm` の作業用のファイル作りなど、ジョブでないその場の用意が見張りに使い、閉じたら止まる
+//!   （作りかけの `.part` は消える）。エディタの開く途中の中止（`editor::cancel_open`・`close_editor`）とは別の道。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,7 +25,8 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use kura_engine::codec::DecodeStamp;
-use kura_engine::{Digest, Value};
+use kura_engine::monitor::CancelFlag;
+use kura_engine::{Digest, Monitor, Value};
 
 pub use kura_engine::codec::CodecSet;
 
@@ -65,6 +70,8 @@ pub struct EngineServices {
     work_pcm: Arc<WorkPcmStore>,
     /// エディタが保存に貸している入力（エディタのセッションごと。M13 段 3）。
     lent: Mutex<BTreeMap<String, LentInput>>,
+    /// ライブラリの開いている間だけ有効な中止の印（閉じる・切り替えるときに立てる。M13 段 7）。
+    closing: CancelFlag,
     /// テストの割り込み（保存の流れの途中の段。保存のジョブの割り込みと同じもの。M13 段 3 の検証の直し）。
     #[cfg(test)]
     hook: Mutex<Option<crate::edit::save::Hook>>,
@@ -122,9 +129,22 @@ impl EngineServices {
             editor: Mutex::new(None),
             reservation: Arc::new(Reservation::default()),
             lent: Mutex::new(BTreeMap::new()),
+            closing: CancelFlag::default(),
             #[cfg(test)]
             hook: Mutex::new(None),
         }
+    }
+
+    /// ライブラリを閉じる・切り替える：中止の印（[`EngineServices::closing`]）を立てる。試聴の `/pcm` の作業用のファイル作り
+    /// などが止まる（作りかけの `.part` は消える）。立てたら戻さない。`LibrarySession::close` が最初に呼ぶ。
+    pub fn begin_close(&self) {
+        self.closing.cancel();
+    }
+
+    /// ライブラリの開いている間だけ有効な中止の印（[`EngineServices::begin_close`] で立つ）。ジョブでないその場の用意（試聴の
+    /// `/pcm`）が見張りに渡す。
+    pub fn closing(&self) -> &dyn Monitor {
+        &self.closing
     }
 
     /// テストの割り込みを入れる（保存の流れの途中の段で呼ぶ）。
@@ -331,6 +351,7 @@ impl Drop for EngineServices {
     /// 閉じるとき：試聴の PCM で覚えていた音声と予算の確保をすぐ手放す（TTL の見張りは置き場への強い参照を持って待つので、
     /// 置き場が捨てられるのを待たずに空にする）。
     fn drop(&mut self) {
+        self.begin_close();
         self.close_editor();
         self.pcm.clear();
     }

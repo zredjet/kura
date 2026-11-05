@@ -391,8 +391,10 @@ impl LibrarySession {
     /// 閉じる。実行中のジョブは次回の起動で再開する。最後に DB を閉じてライブラリのロックを放す（`Arc` で握られた
     /// ライブラリが残っても、開き直し・ほかのアプリが当たらない）。
     pub fn close(&self) {
+        // ライブラリの開いている間だけ有効な中止の印を立てる（試聴の /pcm の作業用のファイル作りを止める。M13 段 7）。
         // エディタを閉じる（中止 → キャッシュを空に → 確保を落とす → 取り置きを 0。待っている下書きは DB を閉じる前に置く）
         if let Some(engine) = &self.engine {
+            engine.begin_close();
             engine.close_editor();
         }
         self.wait_ready();
@@ -819,11 +821,14 @@ mod tests {
             &kura_engine::NoMonitor,
         );
         assert!(matches!(r, Err(crate::CoreError::NoSpace { .. })));
-        // 閉じると置き場ごと消える
+        // 閉じると置き場ごと消える。ライブラリの開いている間だけ有効な中止の印も立つ（試聴の /pcm の作り途中を止める。M13
+        // 段 7。`work_tests::pcm_work_file_creation_stops_when_the_library_closes`）
         std::fs::create_dir_all(&pcm_dir).unwrap();
         std::fs::write(pcm_dir.join("x.0.part"), b"x").unwrap();
+        assert!(!engine.closing().canceled());
         session.close();
         assert!(!pcm_dir.exists());
+        assert!(engine.closing().canceled());
         drop(session);
         // 強制終了で残ったものは、開くときの掃除で消える
         std::fs::create_dir_all(&pcm_dir).unwrap();

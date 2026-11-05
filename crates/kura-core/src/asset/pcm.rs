@@ -23,6 +23,10 @@
 //! - ジョブにしない（利用者がその場で待つ短い表示の用意。決定 8）。呼び手が `spawn_blocking` で呼ぶ。予算は対話
 //!   （`Class::Interactive`。待たない）で、足りなければ 503。範囲が音声の外か、浮動小数で 64 MiB を超える長さは 416。
 //!   読むのはエンジンのプレビューのプールの中（`EngineRuntime::preview`）。
+//! - 中止（M13 段 7）：読む（形の読み・丸ごと読み・作業用のファイル作り）見張りは、ライブラリの開いている間だけ有効な中止の
+//!   印（[`EngineServices::closing`]。ライブラリを閉じる・切り替えるときに立つ）。閉じたら止めて、作りかけの `.part` を消し、
+//!   覚えずに [`PcmError::Canceled`]（409）を返す。閉じたあとに届いた要求は読まない。応えを捨てただけ（試聴を止めた）では
+//!   止めない（作り終えた作業用のファイルはエディタ・次の試聴が使う）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,7 +39,7 @@ use kura_engine::codec::pcm::quantize;
 use kura_engine::doc::DecodeOptions;
 use kura_engine::shape::Shape;
 use kura_engine::value::{Audio, AudioSource};
-use kura_engine::{EngineError, Limits, NoMonitor, Value};
+use kura_engine::{EngineError, Limits, Monitor, Value};
 
 use crate::CoreError;
 use crate::edit::EngineServices;
@@ -102,13 +106,18 @@ pub enum PcmError {
     /// 読めない・書けない。
     #[error("試聴の PCM を作れませんでした（{0}）")]
     Failed(String),
+    /// ライブラリを閉じた・切り替えたので、読むのをやめた（作業用のファイルの書きかけは消した。M13 段 7。中止の写しは
+    /// エディタ・ジョブと同じく競合（`EditorError::Canceled`・`CoreError::Canceled` の IPC の code は `Conflict`））。
+    #[error("ライブラリを閉じたので、試聴の PCM を作るのをやめました")]
+    Canceled,
 }
 
 impl PcmError {
-    /// HTTP の状態（404・416・503・507・500）。
+    /// HTTP の状態（404・409・416・503・507・500）。
     pub fn status(&self) -> u16 {
         match self {
             Self::NotFound => 404,
+            Self::Canceled => 409,
             Self::OutOfRange { .. } | Self::TooLong { .. } => 416,
             Self::Busy(_) | Self::Unavailable(_) => 503,
             Self::NoSpace(_) => 507,
@@ -397,7 +406,11 @@ pub(crate) fn acquire(budget: &Arc<MemoryBudget>, bytes: u64) -> Result<Lease, P
     }
 }
 
+/// 読みの誤りを試聴の誤りに（中止は [`PcmError::Canceled`]、ほかは 500）。
 fn engine_failed(err: EngineError) -> PcmError {
+    if matches!(err.root(), EngineError::Canceled) {
+        return PcmError::Canceled;
+    }
     PcmError::Failed(err.to_string())
 }
 
@@ -416,6 +429,10 @@ fn audio_of(
     let _reading = cache.reading.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(hit) = cache.lookup(root, hash, &codecs, None) {
         return Ok(hit);
+    }
+    // ライブラリを閉じた（切り替えた）あとに届いた要求は読まない
+    if engine.closing().canceled() {
+        return Err(PcmError::Canceled);
     }
     let runtime = engine
         .runtime()
@@ -439,6 +456,7 @@ fn audio_of(
         root,
         hash,
         source,
+        closing: engine.closing(),
     };
     work.decoded_of(len)
 }
@@ -505,10 +523,11 @@ fn source_of(
     Ok(Some((audio, decoder)))
 }
 
-/// 作業用のファイルを作る・開く誤り（エディタの誤り）を試聴の誤りに（予算は 503、ほかは 500）。
+/// 作業用のファイルを作る・開く誤り（エディタの誤り）を試聴の誤りに（予算は 503、中止は 409、ほかは 500）。
 fn work_failed(err: EditorError) -> PcmError {
     match err {
         EditorError::Busy(m) | EditorError::TooLarge(m) => PcmError::Busy(m),
+        EditorError::Canceled => PcmError::Canceled,
         other => PcmError::Failed(other.to_string()),
     }
 }
@@ -522,9 +541,19 @@ struct Work<'a> {
     root: &'a Path,
     hash: &'a str,
     source: &'a PcmSource,
+    /// ライブラリの開いている間だけ有効な中止の印（[`EngineServices::closing`]。読む間の見張り）。
+    closing: &'a dyn Monitor,
 }
 
 impl Work<'_> {
+    /// ライブラリを閉じたなら中止（覚える前に確かめる。読み終えた値・作業用のファイルの参照は落とす）。
+    fn check_open(&self) -> Result<(), PcmError> {
+        if self.closing.canceled() {
+            return Err(PcmError::Canceled);
+        }
+        Ok(())
+    }
+
     /// 形を段ごとに確保して読み（`read_shape_staged`）、値が `work_threshold` を超えれば作業用のファイル（エディタと同じ鍵。
     /// エディタが開いていれば同じファイル）を源として開き、超えなければ丸ごと読んで覚える。同じ鍵の作業用のファイルが
     /// あれば、形を読まずに使い回す（作られるのは長いものだけ）。`len` は元のファイルの長さ。
@@ -541,7 +570,7 @@ impl Work<'_> {
             format: self.source.format,
             opts: &opts,
             limits: &limits,
-            mon: &NoMonitor,
+            mon: self.closing,
         };
         if let Some(handle) = self.store.find(&cx.key()) {
             self.cache.clear();
@@ -615,10 +644,11 @@ impl Work<'_> {
                     self.source.format,
                     &opts,
                     &limits,
-                    &NoMonitor,
+                    self.closing,
                 )
             })
             .map_err(engine_failed)?;
+        self.check_open()?;
         self.cache.decodes.fetch_add(1, Ordering::Relaxed);
         let Value::Audio(audio) = value else {
             return Err(PcmError::NotFound);
@@ -654,6 +684,8 @@ impl Work<'_> {
         handle: crate::edit::work_pcm::WorkHandle,
         started: Instant,
     ) -> Result<(Arc<Audio>, String), PcmError> {
+        // 閉じたなら覚えない（参照を落とせば、ほかに使い手がなければ消える）
+        self.check_open()?;
         let limits = Limits::default();
         let opened = audio_source::open_work(
             handle,

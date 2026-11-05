@@ -690,6 +690,79 @@ fn work_file_creation_stops_on_cancel() {
     assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
 }
 
+/// 置き場に書きかけ（.part）が現れるまで待つ。
+fn wait_for_part(dir: &Path) {
+    let started = std::time::Instant::now();
+    while !files(dir)
+        .iter()
+        .any(|p| p.extension().is_some_and(|x| x == "part"))
+    {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "書き始めません"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// 段 7：試聴の `/pcm` の作業用のファイル作り（直接読めない形式の長い音声）は、ライブラリを閉じると止まる（ライブラリの
+/// 開いている間だけ有効な中止の印。`LibrarySession::close` が最初に立てる。エディタの開く途中の中止とは別の道）。応えは
+/// 中止（409）で、書きかけ（.part）・作業用のファイル・覚えたもの・予算の確保を残さない。閉じたあとに届いた要求は読まずに
+/// 中止。閉じていなければ今どおり作れる。
+#[test]
+fn pcm_work_file_creation_stops_when_the_library_closes() {
+    use crate::asset::pcm::{PcmError, serve};
+    use crate::library::{LibrarySession, Services};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sink: crate::jobs::EventSink = Arc::new(|_| {});
+    let session = LibrarySession::create(
+        &dir.path().join("L"),
+        sink,
+        Services::new(Arc::new(crate::media::NoBackend)).with_engine(Arc::new(Budgeted(SMALL))),
+    )
+    .unwrap();
+    session.wait_ready();
+    let lib = session.library().clone();
+    let engine = session.engine().unwrap().clone();
+    let root = lib.layout().root().to_path_buf();
+    let pcm_dir = engine.work_pcm().dir().to_path_buf();
+    let source = |bytes: &[u8]| {
+        add_audio(&lib, bytes, "flac");
+        let hash = crate::library::hex(blake3::hash(bytes).as_bytes());
+        let src = crate::serve::pcm_source(lib.layout(), &hash).unwrap();
+        (hash, src)
+    };
+    // 閉じていなければ作れる
+    let (ha, src_a) = source(&long_flac(40 * C));
+    serve(&engine, &root, &ha, &src_a, 0, 10).unwrap();
+    assert_eq!(files(&pcm_dir).len(), 1);
+    let decodes = engine.pcm_cache().decodes();
+
+    // 作りかけの間に閉じる
+    let (hb, src_b) = source(&long_flac(40 * C + 1));
+    let err = std::thread::scope(|scope| {
+        let serving = scope.spawn(|| serve(&engine, &root, &hb, &src_b, 0, 10));
+        wait_for_part(&pcm_dir);
+        session.close();
+        serving.join().unwrap().unwrap_err()
+    });
+    assert!(matches!(err, PcmError::Canceled), "{err}");
+    assert_eq!(err.status(), 409);
+    assert!(files(&pcm_dir).is_empty(), "{:?}", files(&pcm_dir));
+    assert_eq!(engine.work_pcm().usage().0, 0);
+    assert!(engine.pcm_cache().cached().is_none());
+    assert_eq!(engine.pcm_cache().decodes(), decodes, "覚えていない");
+    let u = engine.runtime().unwrap().budget().usage().unwrap();
+    assert_eq!((u.reserved, u.interactive, u.standing), (0, 0, 0));
+
+    // 閉じたあとに届いた要求は読まない
+    let err = serve(&engine, &root, &ha, &src_a, 0, 10).unwrap_err();
+    assert!(matches!(err, PcmError::Canceled), "{err}");
+    assert!(files(&pcm_dir).is_empty(), "{:?}", files(&pcm_dir));
+    assert_eq!(engine.pcm_cache().decodes(), decodes);
+}
+
 /// 別のスレッドで `item_id` を開き、作業用のファイルの書きかけ（.part）が現れたら、まず別のアイテム（`item_id + 1000`）を、
 /// 次に `cancel` を開く途中の中止の口で止める。別のアイテムを指したときは何もしないこと（偽が返る）を確かめ、`cancel` を
 /// 止めたかと `open` の結果を返す。
