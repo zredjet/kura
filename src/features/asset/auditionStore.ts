@@ -19,6 +19,7 @@ import { useViewStore } from '../../stores/viewStore';
 import { playerController } from '../player/playerActions';
 import { usePlayerStore } from '../player/playerStore';
 import { audioRuntime, MediaHttpError, onAuditionStopped, touchAudio } from './audioRuntime';
+import { type LoopRange, settingLoopOf } from './useLoopRange';
 
 const t = ja.asset;
 
@@ -49,12 +50,17 @@ usePlayerStore.subscribe((now, before) => {
   }
 });
 
-/** 試聴に要るもの（解析の事実）。 */
+/** 試聴に要るもの（解析の事実と、素材の設定の試聴のループ）。 */
 export interface AuditionTarget {
   itemId: number;
   hash: string;
   rate: number;
   channels: number;
+  /**
+   * 試聴の設定の区間（素材の設定 `loopRange`。M13）。/pcm の応答の長さに収まればファイルのループ点の代わりに回し、超えれば
+   * ファイルのループ点（`Audition.startProbed`）。なければ null。
+   */
+  loop: LoopRange | null;
 }
 
 /**
@@ -86,6 +92,7 @@ export function auditionTarget(asset: AssetDto): AuditionTarget | null {
     hash: asset.hash,
     rate: audio.sampleRate,
     channels: audio.channels,
+    loop: settingLoopOf(asset),
   };
 }
 
@@ -148,7 +155,8 @@ function failureText(error: unknown): string {
 
 /**
  * 試聴を始める。キー・クリックの処理の中から呼ぶ（文脈の resume を、取る前に呼ぶため）。
- * 長さ・ループ点は /pcm の応答（同じ読み取り）で決める（ループ点がなければ全体を回す）。
+ * 長さ・ループ点は /pcm の応答（同じ読み取り）で決める（試聴の設定が長さに収まればそれ、なければファイルのループ点、
+ * それもなければ全体を回す）。
  * クイックルック中は何もしない（素材の欄を読んでいる間にクイックルックを開いたときも）。
  */
 export function startAudition(target: AuditionTarget, fromStart = false): void {
@@ -166,7 +174,11 @@ export function startAudition(target: AuditionTarget, fromStart = false): void {
     return s.itemId === target.itemId && s.fromStart === fromStart && s.status === 'loading';
   };
   void audition
-    .startProbed(target.hash, { rate: target.rate, channels: target.channels }, { fromStart })
+    .startProbed(
+      target.hash,
+      { rate: target.rate, channels: target.channels, loop: target.loop },
+      { fromStart },
+    )
     .then((out) => {
       if (out.status === 'superseded' || !isCurrent()) {
         return;

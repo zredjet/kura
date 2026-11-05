@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   type AuditionFacts,
+  auditionLoop,
   auditionPosition,
   DEFAULT_AUDITION,
   SFX_MAX_MS,
@@ -111,6 +112,35 @@ describe('ループの試聴の計画', () => {
     expect(planAudition({ ...facts, rate: 2_999 })).toBeNull();
     expect(planAudition({ ...facts, rate: 384_001 })).toBeNull();
     expect(planAudition({ ...facts, rate: 768_000 })).toBeNull();
+  });
+});
+
+// docs/design.md §3.1「試聴のループのシート」：試聴と波形は「設定 ?? ファイル」。設定が長さを超えればファイルのループ点
+describe('試聴のループの区間', () => {
+  const file = [R, R * 61] as const;
+
+  it('設定が長さに収まればそれ（終わりがちょうど長さでもよい）', () => {
+    expect(auditionLoop([R * 2, R * 5], R * 70, file)).toEqual([R * 2, R * 5]);
+    expect(auditionLoop([0, R * 70], R * 70, file)).toEqual([0, R * 70]);
+    expect(auditionLoop([R * 2, R * 5], R * 70, null)).toEqual([R * 2, R * 5]);
+  });
+
+  it('設定がなければファイルのループ点（なければ null＝全体）', () => {
+    expect(auditionLoop(null, R * 70, file)).toEqual(file);
+    expect(auditionLoop(null, R * 70, null)).toBeNull();
+  });
+
+  it('設定が長さを超える（上書きで縮んだ）・壊れているならファイルのループ点', () => {
+    expect(auditionLoop([R * 2, R * 70 + 1], R * 70, file)).toEqual(file);
+    expect(auditionLoop([R * 80, R * 90], R * 70, null)).toBeNull();
+    expect(auditionLoop([5, 5], R * 70, file)).toEqual(file);
+    expect(auditionLoop([6, 5], R * 70, file)).toEqual(file);
+    expect(auditionLoop([-1, 5], R * 70, file)).toEqual(file);
+    expect(auditionLoop([0.5, 5], R * 70, file)).toEqual(file);
+  });
+
+  it('長さが分からなければ設定を使う（書くときに Rust が確かめている）', () => {
+    expect(auditionLoop([R * 2, R * 500], null, file)).toEqual([R * 2, R * 500]);
   });
 });
 

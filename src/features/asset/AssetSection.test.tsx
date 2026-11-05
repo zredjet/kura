@@ -138,7 +138,7 @@ describe('AssetSection（インスペクタの素材の欄）', () => {
     expect(audition).toHaveAttribute('aria-pressed', 'false');
     fireEvent.click(audition);
     expect(startAudition).toHaveBeenCalledWith(
-      { itemId: 2, hash: 'cd'.repeat(32), rate: 44_100, channels: 2 },
+      { itemId: 2, hash: 'cd'.repeat(32), rate: 44_100, channels: 2, loop: null },
       false,
     );
     fireEvent.click(screen.getByRole('button', { name: t.fromStart }));

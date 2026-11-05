@@ -359,12 +359,12 @@ export function ImageLayer({
 }
 
 /**
- * 音楽：ジャケット（なければ音符）と波形（解析の前は飾りの波形。M11）。ループ点のあるものは、インスペクタと同じく
- * ループの区間を出す。
+ * 音楽：ジャケット（なければ音符）と波形（解析の前は飾りの波形。M11）。インスペクタと同じくループの区間を出す（試聴の設定が
+ * 長さに収まればそれ、なければファイルのループ点。M13）。
  */
 export function AudioArt({ item }: { item: ItemSummaryDto }) {
   const positionMs = usePlayerStore((s) => s.snapshot.positionMs);
-  const loop = useLoopRange(item.id, item.hasLoop);
+  const loop = useLoopRange(item.id);
   return (
     <div className={styles.audio}>
       <MediaImage

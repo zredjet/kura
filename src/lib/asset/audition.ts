@@ -92,6 +92,23 @@ export function planAudition(
   return { mode: 'seam', tail: [end - seam, end], head: [start, start + seam] };
 }
 
+/**
+ * 試聴と波形で回すループの区間（M13 の決定 5「試聴だけのループ」）：素材の設定の区間（`setting`）が長さ `frames` に収まれば
+ * それ、なければファイルのループ点（`file`。null は全体）。設定が長さを超える（上書きで縮んだ）・壊れているときもファイルの
+ * ループ点。長さが分からない（null）ときは設定を使う（書くときに Rust が解析の長さで確かめている）。
+ */
+export function auditionLoop(
+  setting: readonly [number, number] | null,
+  frames: number | null,
+  file: readonly [number, number] | null,
+): readonly [number, number] | null {
+  if (!setting) return file;
+  const [start, end] = setting;
+  const ok =
+    frameIndex(start) && frameIndex(end) && start < end && (frames === null || end <= frames);
+  return ok ? setting : file;
+}
+
 /** 計画が読む区間（取る順。/pcm の `{start}-{end}`）。 */
 export function rangesOf(plan: AuditionPlan): [number, number][] {
   if (plan.mode === 'seam') return [plan.tail, plan.head];

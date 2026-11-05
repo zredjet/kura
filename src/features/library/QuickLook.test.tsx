@@ -9,7 +9,7 @@ import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
 import { useFontFace } from '../asset/AssetStage';
 import { useEditorStore } from '../editor/editorStore';
-import { audioAsset, imageAsset, summary } from '../asset/testAssets';
+import { audioAsset, imageAsset, summary, withAuditionLoop } from '../asset/testAssets';
 import { type AssetData, useAssetData } from '../asset/useAssetData';
 import { selectOne } from './selection';
 import { QuickLook } from './QuickLook';
@@ -103,6 +103,13 @@ describe('QuickLook の素材（M11）', () => {
   it('音声は波形（ループの区間つき）を出す', () => {
     show(summary({ id: 2, hash: 'cd'.repeat(32), kind: 'audio' }), { asset: audioAsset() });
     expect(screen.getByTestId('waveform')).toHaveAttribute('data-loop', '185220-4057200');
+  });
+
+  it('音声の波形のループの区間は、試聴の設定を先に使う（M13）', () => {
+    show(summary({ id: 2, hash: 'cd'.repeat(32), kind: 'audio' }), {
+      asset: withAuditionLoop(audioAsset(), 100, 200),
+    });
+    expect(screen.getByTestId('waveform')).toHaveAttribute('data-loop', '100-200');
   });
 
   it('フォントを読めたら見本を出し、読めなければ種類の絵のまま', () => {

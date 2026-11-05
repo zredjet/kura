@@ -127,6 +127,11 @@ export function audioAsset(patch: Partial<AssetDto> = {}): AssetDto {
   };
 }
 
+/** 素材の設定に試聴のループ [start, end) を付けたもの。 */
+export function withAuditionLoop(asset: AssetDto, start: number, end: number): AssetDto {
+  return { ...asset, settings: { ...asset.settings, loopRange: { start, end } } };
+}
+
 /** 一覧の概要（素材の欄のテストで使う所だけ）。 */
 export function summary(patch: Partial<ItemSummaryDto> = {}): ItemSummaryDto {
   return {

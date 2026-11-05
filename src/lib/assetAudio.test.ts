@@ -326,6 +326,52 @@ describe('長さを知らないで始める試聴', () => {
     expect(scheduled).toEqual([]);
   });
 
+  it('試聴の設定の区間があれば、ファイルのループ点の代わりに回す（応答のループ点とは比べ直さない）', async () => {
+    const { audition, log, scheduled } = probing({
+      rate: R,
+      channels: 2,
+      total: R * 20,
+      loop: [R, R * 11],
+    });
+    const out = await audition.startProbed('h', { rate: R, channels: 2, loop: [R * 2, R * 5] });
+    expect(out.status).toBe('playing');
+    if (out.status === 'playing') {
+      expect(out.plan).toMatchObject({ mode: 'loop', body: [R * 2, R * 5] });
+      expect(out.facts.loop).toEqual([R * 2, R * 5]);
+    }
+    expect(log).toEqual([`create:${R}`, 'resume', 'fetch:0-1', `fetch:${R * 2}-${R * 5}`]);
+    expect(scheduled).toEqual([{ hash: 'h', mode: 'loop', rate: R, frames: [R * 3] }]);
+  });
+
+  it('はじめからは前奏 [0, 設定の始め) のあとに設定の区間を回す', async () => {
+    const { audition, log } = probing({ rate: R, channels: 1, total: R * 20, loop: null });
+    const out = await audition.startProbed(
+      'h',
+      { rate: R, channels: 1, loop: [R * 2, R * 5] },
+      { fromStart: true },
+    );
+    expect(out.status === 'playing' && out.plan).toMatchObject({
+      intro: [0, R * 2],
+      body: [R * 2, R * 5],
+    });
+    expect(log.slice(-2)).toEqual([`fetch:0-${R * 2}`, `fetch:${R * 2}-${R * 5}`]);
+  });
+
+  it('設定が応答の長さを超えれば（上書きで縮んだ）ファイルのループ点、なければ全体を回す', async () => {
+    const looped = probing({ rate: R, channels: 2, total: R * 20, loop: [R, R * 11] });
+    const a = await looped.audition.startProbed('h', {
+      rate: R,
+      channels: 2,
+      loop: [R * 2, R * 20 + 1],
+    });
+    expect(a.status === 'playing' && a.plan).toMatchObject({ body: [R, R * 11] });
+    expect(looped.log.slice(-1)).toEqual([`fetch:${R}-${R * 11}`]);
+
+    const plain = probing({ rate: R, channels: 2, total: R * 4, loop: null });
+    const b = await plain.audition.startProbed('h', { rate: R, channels: 2, loop: [R, R * 5] });
+    expect(b.status === 'playing' && b.plan).toMatchObject({ body: [0, R * 4] });
+  });
+
   it('鳴っている位置を元のファイルのフレームで返す（止めたら null）', async () => {
     const { audition, factory } = probing({
       rate: R,

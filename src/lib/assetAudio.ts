@@ -7,10 +7,13 @@
  * - 文脈は元のレートで作る（違うレートは補間になる）。作れなければ試聴しない。
  * - 始める時刻はフレームの境にそろえ、前奏のあとの本体は「開始のフレーム + 前奏のフレーム数」÷ レートに置く。
  * - ループ点・長さは /pcm の応答（同じ読み取りの値）を正とし、DB の値と違えば計画し直して 1 回だけ取り直す。
+ * - 試聴の設定の区間（素材の設定。M13）は、応答の長さに収まるときだけファイルのループ点の代わりに回す（`auditionLoop`）。
+ *   応答と比べ直すのはファイルのループ点（応答の kura チャンクにあるのはファイルのループ点なので）。
  */
 
 import {
   type AuditionFacts,
+  auditionLoop,
   type AuditionOptions,
   type AuditionPlan,
   auditionPosition,
@@ -178,10 +181,21 @@ export interface AuditionDeps {
   onScheduled?(scheduled: ScheduledAudition): void;
 }
 
-/** 長さ・ループ点を知らずに始めるときに分かっていること（解析の事実）。 */
+/** 長さ・ループ点を知らずに始めるときに分かっていること（解析の事実と、素材の設定の試聴のループ）。 */
 export interface AuditionHint {
   rate: number;
   channels: number;
+  /**
+   * 試聴の設定の区間 [始まり, 終わり)（素材の設定 `loopRange`）。応答の長さに収まればファイルのループ点の代わりに回し、
+   * 超えればファイルのループ点（`auditionLoop`）。省けばファイルのループ点。
+   */
+  loop?: readonly [number, number] | null;
+}
+
+/** 回す区間の決め方（ファイルのループ点と試聴の設定。応答と比べ直すのはファイルのループ点）。 */
+interface LoopSource {
+  file: readonly [number, number] | null;
+  setting: readonly [number, number] | null;
 }
 
 export type AuditionOutcome =
@@ -264,13 +278,17 @@ export class Audition {
     const ctx = contextOf(this.deps.pool, facts.rate);
     if (!ctx || ctx.sampleRate !== facts.rate) return { status: 'unsupported' };
     const resumed = resumeOf(ctx);
-    return this.run(ctx, resumed, token, hash, facts, plan, opts);
+    return this.run(ctx, resumed, token, hash, facts, plan, opts, {
+      file: facts.loop,
+      setting: null,
+    });
   }
 
   /**
    * 長さ・ループ点を知らずに試聴を始める（長さ（フレーム）は素材の欄の DTO・一覧の概要にない。DB では解析の読み取りの
    * 記録 `kura.read` にだけある）。先頭の 1 フレームを取り、応答の `kura` チャンク（PCM と同じ読み取りの長さ・ループ点）で
-   * 計画してから取る。応答のレート・チャンネルが `hint` と違えば試聴しない。
+   * 計画してから取る。応答のレート・チャンネルが `hint` と違えば試聴しない。`hint.loop`（試聴の設定の区間）が応答の長さに
+   * 収まれば、ファイルのループ点の代わりにそれを回す。
    * キー・クリックの処理の中から呼ぶ（resume は取る前）。
    */
   async startProbed(
@@ -294,15 +312,16 @@ export class Audition {
     if (!probe || probe.rate !== hint.rate || probe.channels !== hint.channels) {
       return { status: 'unsupported' };
     }
+    const loops: LoopSource = { file: probe.info.loop, setting: hint.loop ?? null };
     const facts: AuditionFacts = {
       frames: probe.info.total,
       rate: hint.rate,
       channels: hint.channels,
-      loop: probe.info.loop,
+      loop: auditionLoop(loops.setting, probe.info.total, loops.file),
     };
     const plan = planAudition(facts, opts);
     if (!plan) return { status: 'unsupported' };
-    return this.run(ctx, resumed, token, hash, facts, plan, opts);
+    return this.run(ctx, resumed, token, hash, facts, plan, opts, loops);
   }
 
   /** 計画の区間を取って鳴らす（start・startProbed の続き）。 */
@@ -314,10 +333,11 @@ export class Audition {
     facts: AuditionFacts,
     plan: AuditionPlan,
     opts: AuditionOptions,
+    loops: LoopSource,
   ): Promise<AuditionOutcome> {
     let loaded: Awaited<ReturnType<Audition['load']>>;
     try {
-      loaded = await this.load(hash, facts, plan, opts, token);
+      loaded = await this.load(hash, facts, plan, opts, loops, token);
     } catch (error) {
       return token === this.token ? { status: 'failed', error } : { status: 'superseded' };
     }
@@ -340,16 +360,19 @@ export class Audition {
   }
 
   /**
-   * 計画の区間を取って読む。応答のループ点・長さ・デコーダが DB の値と違えば、応答の値で計画し直して 1 回だけ取り直す。
+   * 計画の区間を取って読む。応答のループ点（ファイルのループ点）・長さ・デコーダが DB の値と違えば、応答の値で計画し直して
+   * 1 回だけ取り直す（試聴の設定の区間は、新しい長さに収まるかを確かめ直す）。
    */
   private async load(
     hash: string,
     facts: AuditionFacts,
     plan: AuditionPlan,
     opts: AuditionOptions,
+    loops: LoopSource,
     token: number,
   ): Promise<{ plan: AuditionPlan; facts: AuditionFacts; pcms: Pcm[] } | null | typeof SUPERSEDED> {
     let want = facts;
+    let file = loops.file;
     let current = plan;
     for (let attempt = 0; attempt < 2; attempt++) {
       const ranges = rangesOf(current);
@@ -377,11 +400,16 @@ export class Audition {
           sameLoop(p.info.loop, first.loop) &&
           p.info.decoder === first.decoder,
       );
-      if (agree && first.total === want.frames && sameLoop(first.loop, want.loop)) {
+      if (agree && first.total === want.frames && sameLoop(first.loop, file)) {
         return { plan: current, facts: want, pcms };
       }
       if (attempt === 1) return null;
-      want = { ...want, frames: first.total, loop: first.loop };
+      file = first.loop;
+      want = {
+        ...want,
+        frames: first.total,
+        loop: auditionLoop(loops.setting, first.total, first.loop),
+      };
       const next = planAudition(want, opts);
       if (!next) return null;
       current = next;

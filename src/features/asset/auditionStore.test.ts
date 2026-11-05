@@ -19,7 +19,7 @@ import {
   toggleAuditionKey,
   useAuditionStore,
 } from './auditionStore';
-import { audioAsset, AUDIO_FACTS, imageAsset } from './testAssets';
+import { audioAsset, AUDIO_FACTS, imageAsset, withAuditionLoop } from './testAssets';
 
 vi.mock('../../ipc/asset', () => ({ getAsset: vi.fn() }));
 vi.mock('../../stores/noticeStore', () => ({ notify: vi.fn() }));
@@ -70,6 +70,7 @@ describe('試聴の状態と口', () => {
       hash: 'cd'.repeat(32),
       rate: 44_100,
       channels: 2,
+      loop: null,
     });
     expect(auditionBlocker(imageAsset())).toBe(t.auditionUnsupported);
     expect(auditionBlocker(audioAsset({ analysisState: 'pending', facts: null }))).toBe(
@@ -105,7 +106,7 @@ describe('試聴の状態と口', () => {
     expect(pause).toHaveBeenCalled();
     expect(fake.audition.startProbed).toHaveBeenCalledWith(
       target.hash,
-      { rate: 44_100, channels: 2 },
+      { rate: 44_100, channels: 2, loop: null },
       { fromStart: true },
     );
     expect(useAuditionStore.getState()).toMatchObject({
@@ -115,6 +116,27 @@ describe('試聴の状態と口', () => {
     });
     await settle();
     expect(useAuditionStore.getState()).toMatchObject({ status: 'playing', mode: 'loop' });
+  });
+
+  it('試聴の設定の区間があれば対象に入れ、長さ（/pcm の応答）で確かめるよう Audition に渡す（L も同じ）', async () => {
+    const asset = withAuditionLoop(audioAsset(), 44_100, 88_200);
+    const target = auditionTarget(asset);
+    expect(target?.loop).toEqual([44_100, 88_200]);
+    startAudition(target!);
+    expect(fake.audition.startProbed).toHaveBeenLastCalledWith(
+      asset.hash,
+      { rate: 44_100, channels: 2, loop: [44_100, 88_200] },
+      { fromStart: false },
+    );
+    await settle();
+    stopAudition();
+    rememberAsset(asset);
+    expect(toggleAuditionKey(asset.itemId, 'audio')).toBe(true);
+    expect(fake.audition.startProbed).toHaveBeenLastCalledWith(
+      asset.hash,
+      { rate: 44_100, channels: 2, loop: [44_100, 88_200] },
+      { fromStart: false },
+    );
   });
 
   it('混んでいて読めなければ（503）知らせのカプセルに「混んでいます…」', async () => {
