@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { pcmUrl } from '../../ipc/media';
+import { writePcmWav } from '../../lib/asset/wav';
 import {
   type AudioRuntime,
   closeAudio,
   holdAudio,
   IDLE_CLOSE_MS,
+  MediaHttpError,
+  probeFrames,
   setAudioRuntimeForTest,
   touchAudio,
 } from './audioRuntime';
@@ -85,5 +89,27 @@ describe('使い終えた文脈を閉じる', () => {
     expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(IDLE_CLOSE_MS);
     expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
+  });
+});
+
+// 試聴のループのシート：長さは試聴と同じく /pcm の先頭の 1 フレームの応答（kura チャンクの total）で知る
+describe('probeFrames', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('/pcm/{hash}/0-1 を取り、kura チャンクの total を返す。2xx でなければ MediaHttpError', async () => {
+    const wav = writePcmWav({
+      rate: 48_000,
+      format: 'i16',
+      planes: [new Float32Array(1)],
+      info: { start: 0, total: 96_000, loop: [10, 20], decoder: 'wav-kura-dec/1' },
+    });
+    const fetch = vi.fn(async () => new Response(wav));
+    vi.stubGlobal('fetch', fetch);
+    await expect(probeFrames('ab'.repeat(32))).resolves.toBe(96_000);
+    expect(fetch).toHaveBeenCalledWith(pcmUrl('ab'.repeat(32), 0, 1));
+    fetch.mockImplementation(async () => new Response(new Uint8Array([1, 2, 3])));
+    await expect(probeFrames('ab'.repeat(32))).resolves.toBeNull();
+    fetch.mockImplementation(async () => new Response(null, { status: 503 }));
+    await expect(probeFrames('ab'.repeat(32))).rejects.toBeInstanceOf(MediaHttpError);
   });
 });

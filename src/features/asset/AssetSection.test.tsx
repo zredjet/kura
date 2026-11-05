@@ -4,9 +4,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ja } from '../../i18n/ja';
 import { retryAnalysis, setAssetSettings } from '../../ipc/asset';
 import { invalidateItems } from '../../stores/itemCache';
+import { bumpRevision } from '../../stores/revisionStore';
 import { AssetSection } from './AssetSection';
 import { startAudition, stopAudition, useAuditionStore } from './auditionStore';
-import { audioAsset, AUDIO_FACTS, imageAsset, summary } from './testAssets';
+import { audioAsset, AUDIO_FACTS, imageAsset, summary, withAuditionLoop } from './testAssets';
 import type { AssetData } from './useAssetData';
 
 vi.mock('../../ipc/asset', () => ({
@@ -15,6 +16,12 @@ vi.mock('../../ipc/asset', () => ({
   getAsset: vi.fn(),
 }));
 vi.mock('../../stores/itemCache', () => ({ invalidateItems: vi.fn() }));
+vi.mock('../../stores/revisionStore', () => ({ bumpRevision: vi.fn() }));
+// シートが開いたときに長さを確かめる /pcm の口（このテストでは解析の長さと同じ）
+vi.mock('./audioRuntime', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./audioRuntime')>()),
+  probeFrames: vi.fn(async () => 4_410_000),
+}));
 vi.mock('../player/playerActions', () => ({ playerController: vi.fn() }));
 vi.mock('./auditionStore', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./auditionStore')>()),
@@ -132,7 +139,7 @@ describe('AssetSection（インスペクタの素材の欄）', () => {
     expect(valueOf(t.format)).toBe('44.1 kHz · 24 ビット · ステレオ');
     expect(valueOf(t.loudness)).toBe('−14.2 LUFS（LRA 6.1 LU）');
     expect(valueOf(t.peak)).toBe('−1.0 dBTP');
-    expect(valueOf(t.loop)).toBe('0:04.200 – 1:32.000185,220 – 4,057,200');
+    expect(valueOf(t.loop)).toBe(`0:04.200 – 1:32.000${t.auditionLoopEdit}185,220 – 4,057,200`);
     expect(screen.getByTestId('waveform')).toHaveAttribute('data-loop', '185220-4057200');
     const audition = screen.getByRole('button', { name: t.audition });
     expect(audition).toHaveAttribute('aria-pressed', 'false');
@@ -143,6 +150,77 @@ describe('AssetSection（インスペクタの素材の欄）', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: t.fromStart }));
     expect(startAudition).toHaveBeenLastCalledWith(expect.objectContaining({ itemId: 2 }), true);
+  });
+
+  it('ループの行の［設定…］（読み上げ「試聴のループを設定」）で試聴のループのシートを body に開く', async () => {
+    const reload = vi.fn();
+    const { container } = render(
+      <AssetSection
+        data={data(audioAsset(), { reload })}
+        item={summary({ id: 2, kind: 'audio', durationMs: 100_000 })}
+      />,
+    );
+    expect(screen.queryByText(/^試聴：/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: t.auditionLoopEditLabel }));
+    const sheet = screen.getByRole('dialog', { name: t.auditionLoopTitle });
+    expect(container.contains(sheet)).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: t.auditionLoopCustom }));
+    fireEvent.click(screen.getByRole('button', { name: ja.common.save }));
+    expect(setAssetSettings).toHaveBeenCalledWith([2], {
+      loopRange: { set: { start: 185_220, end: 4_057_200 } },
+    });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    // 欄を読み直し、ほかの画面（シアターの波形）にも知らせる
+    expect(reload).toHaveBeenCalled();
+    expect(bumpRevision).toHaveBeenCalled();
+  });
+
+  it('試聴の設定があれば下に「試聴：…」を出し、波形と試聴は設定の区間を使う', () => {
+    const asset = withAuditionLoop(audioAsset(), 441_000, 3_528_000);
+    render(
+      <AssetSection
+        data={data(asset)}
+        item={summary({ id: 2, kind: 'audio', durationMs: 100_000 })}
+      />,
+    );
+    expect(screen.getByText(t.auditionLoopValue('0:10.000 – 1:20.000'))).toBeInTheDocument();
+    expect(screen.queryByText(t.auditionLoopTooLong)).toBeNull();
+    // ファイルのループ点の表示はそのまま
+    expect(valueOf(t.loop)).toContain('0:04.200 – 1:32.000');
+    expect(screen.getByTestId('waveform')).toHaveAttribute('data-loop', '441000-3528000');
+    fireEvent.click(screen.getByRole('button', { name: t.audition }));
+    expect(startAudition).toHaveBeenCalledWith(
+      expect.objectContaining({ itemId: 2, loop: [441_000, 3_528_000] }),
+      false,
+    );
+  });
+
+  it('試聴の設定が長さを超えていれば知らせ、波形はファイルのループ点に戻す', () => {
+    const asset = withAuditionLoop(audioAsset(), 441_000, AUDIO_FACTS.frames! + 1);
+    render(
+      <AssetSection
+        data={data(asset)}
+        item={summary({ id: 2, kind: 'audio', durationMs: 100_000 })}
+      />,
+    );
+    expect(screen.getByText(t.auditionLoopTooLong)).toBeInTheDocument();
+    expect(screen.getByTestId('waveform')).toHaveAttribute('data-loop', '185220-4057200');
+  });
+
+  it('試聴できない（解析の前）・エディタの中では［設定…］を出さない（試聴の設定の表示は残す）', () => {
+    const item = summary({ id: 2, kind: 'audio', durationMs: 100_000 });
+    const pending = render(
+      <AssetSection
+        data={data(audioAsset({ analysisState: 'pending', facts: null }))}
+        item={item}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: t.auditionLoopEditLabel })).toBeNull();
+    pending.unmount();
+    const asset = withAuditionLoop(audioAsset(), 441_000, 3_528_000);
+    render(<AssetSection data={data(asset)} item={item} audition={false} />);
+    expect(screen.queryByRole('button', { name: t.auditionLoopEditLabel })).toBeNull();
+    expect(screen.getByText(t.auditionLoopValue('0:10.000 – 1:20.000'))).toBeInTheDocument();
   });
 
   it('試聴中は［試聴を止める］（aria-pressed）で止める', () => {
@@ -204,7 +282,7 @@ describe('AssetSection（インスペクタの素材の欄）', () => {
     render(
       <AssetSection data={data(asset)} item={summary({ id: 2, kind: 'audio', durationMs: 300 })} />,
     );
-    expect(valueOf(t.loop)).toBe(t.loopNone);
+    expect(valueOf(t.loop)).toBe(`${t.loopNone}${t.auditionLoopEdit}`);
     expect(valueOf(t.loudness)).toBe('短くて計れません');
     expect(screen.getByRole('button', { name: t.audition })).toBeEnabled();
     expect(screen.queryByText(t.seamOnly)).toBeNull();

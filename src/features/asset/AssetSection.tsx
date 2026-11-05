@@ -16,8 +16,10 @@ import type { ItemSummaryDto } from '../../ipc/items';
 import { planAudition } from '../../lib/asset/audition';
 import { invalidateItems } from '../../stores/itemCache';
 import { notify } from '../../stores/noticeStore';
+import { bumpRevision } from '../../stores/revisionStore';
 import styles from './Asset.module.css';
 import { audioRuntime } from './audioRuntime';
+import { AuditionLoopSheet } from './AuditionLoopSheet';
 import {
   auditionBlocker,
   auditionTarget,
@@ -29,6 +31,7 @@ import {
   alphaText,
   animText,
   audioFormatText,
+  clockText,
   colorsText,
   countText,
   failureText,
@@ -44,7 +47,7 @@ import {
 } from './describe';
 import { GridSheet } from './GridSheet';
 import type { AssetData } from './useAssetData';
-import { loopOf } from './useLoopRange';
+import { loopOf, settingLoopOf, settingLoopTooLong } from './useLoopRange';
 import { WaveformView } from './WaveformView';
 
 const t = ja.asset;
@@ -166,10 +169,30 @@ function seamOnly(asset: AssetDto, durationMs: number | null): boolean {
   return plan?.mode === 'seam';
 }
 
-/** 音声の行（形式・ラウドネス・ピーク・ループ）と、波形・ループの試聴。 */
-function AudioRows({ asset }: { asset: AssetDto }) {
+/**
+ * 音声の行（形式・ラウドネス・ピーク・ループ）。ループの行はファイルのループ点と、右に［設定…］（試聴のループのシート。
+ * 試聴できるものだけ。エディタの中では出さない）、下に試聴の設定の区間と、それが長さを超えている知らせ（M13）。
+ */
+function AudioRows({
+  asset,
+  editable,
+  onChanged,
+}: {
+  asset: AssetDto;
+  /** ［設定…］を出すか（エディタの中のインスペクタでは偽）。 */
+  editable: boolean;
+  onChanged: () => void;
+}) {
   const audio = asset.facts?.audio;
   const loop = loopTexts(audio);
+  const [sheet, setSheet] = useState(false);
+  const setting = settingLoopOf(asset);
+  const rate = audio?.sampleRate ?? null;
+  const settingText =
+    setting && rate
+      ? t.auditionLoopValue(t.loopRange(clockText(setting[0], rate), clockText(setting[1], rate)))
+      : null;
+  const canEdit = editable && auditionTarget(asset) !== null;
   return (
     <>
       <dt>{t.format}</dt>
@@ -180,8 +203,41 @@ function AudioRows({ asset }: { asset: AssetDto }) {
       <dd>{peakText(audio)}</dd>
       <dt>{t.loop}</dt>
       <dd>
-        {loop ? loop.time : audio?.hasLoop === false ? t.loopNone : t.none}
+        <span className={styles.inline}>
+          <span>{loop ? loop.time : audio?.hasLoop === false ? t.loopNone : t.none}</span>
+          {canEdit && (
+            <button
+              type="button"
+              className={styles.textButton}
+              aria-label={t.auditionLoopEditLabel}
+              onClick={() => setSheet(true)}
+            >
+              {t.auditionLoopEdit}
+            </button>
+          )}
+        </span>
         {loop && <span className={styles.sub}>{loop.frames}</span>}
+        {settingText && <span className={styles.sub}>{settingText}</span>}
+        {settingLoopTooLong(asset) && (
+          <span className={`${styles.sub} ${styles.warning}`}>
+            <WarningIcon size={12} />
+            {t.auditionLoopTooLong}
+          </span>
+        )}
+        {sheet &&
+          // 格子のシートと同じく body に出す（インスペクタのガラスは fixed の子の基準になる）
+          createPortal(
+            <AuditionLoopSheet
+              asset={asset}
+              onClose={() => setSheet(false)}
+              onSaved={() => {
+                onChanged();
+                // シアターの波形（useLoopRange）など、ほかの画面の素材の欄も読み直す
+                bumpRevision();
+              }}
+            />,
+            document.body,
+          )}
       </dd>
     </>
   );
@@ -315,7 +371,9 @@ export function AssetSection({
       <AnalysisStatus asset={asset} onRetried={reload} />
       <dl className={styles.info}>
         {asset.kind === 'image' && <ImageRows data={data} onChanged={reload} />}
-        {asset.kind === 'audio' && <AudioRows asset={asset} />}
+        {asset.kind === 'audio' && (
+          <AudioRows asset={asset} editable={audition} onChanged={reload} />
+        )}
         {asset.kind === 'font' && <FontRows asset={asset} />}
         {asset.kind === 'model' && <ModelRows asset={asset} />}
       </dl>

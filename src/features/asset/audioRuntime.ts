@@ -6,6 +6,7 @@
  */
 
 import { pcmUrl, playUrl } from '../../ipc/media';
+import { readPcmWav } from '../../lib/asset/wav';
 import {
   Audition,
   browserContext,
@@ -29,6 +30,14 @@ async function fetchBytes(url: string): Promise<ArrayBuffer> {
     throw new MediaHttpError(res.status);
   }
   return res.arrayBuffer();
+}
+
+/**
+ * 試聴と同じ読み取りの長さ（フレーム）：/pcm の先頭の 1 フレームの応答の kura チャンクの total（試聴のループのシートが
+ * 区間を確かめるのに使う。試聴の `Audition.startProbed` と同じ取り方）。応答を読めなければ null、取れなければ失敗。
+ */
+export async function probeFrames(hash: string): Promise<number | null> {
+  return readPcmWav(await fetchBytes(pcmUrl(hash, 0, 1)))?.info.total ?? null;
 }
 
 /** 試聴を始めたときに呼ぶもの（dev の継ぎ目の自己点検。VITE_KURA_CHECK=1 のときだけ読み込む）。 */

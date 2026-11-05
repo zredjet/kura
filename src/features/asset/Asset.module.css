@@ -365,3 +365,12 @@
 .sheetActions .spacer {
   flex: 1;
 }
+
+/* ===== 試聴のループのシート（M13。形は格子のシートと同じ。時刻の欄はエディタの TimeField）===== */
+
+/* 「ファイルのループ点」「全体」を選んだときの区間（0:04.200 – 1:32.000） */
+.loopValue {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}

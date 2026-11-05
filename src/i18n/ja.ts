@@ -709,6 +709,25 @@ export const ja = {
     gridClear: '格子を外す',
     /** 解析の推定（sprite_grid）で入力欄を埋める副ボタン（保存はしない）。 */
     gridUseEstimate: (w: string, h: string) => `推定を使う（${w} × ${h}）`,
+    // 試聴のループ（素材の欄のループの行とそのシート。ファイルは変えない。M13）
+    auditionLoopEdit: '設定…',
+    auditionLoopEditLabel: '試聴のループを設定',
+    /** ループの行の下（「試聴：0:10.000 – 1:20.000」）。 */
+    auditionLoopValue: (range: string) => `試聴：${range}`,
+    auditionLoopTooLong: '試聴のループが長さを超えています',
+    auditionLoopTitle: '試聴のループ',
+    auditionLoopGroup: '試聴で回す区間',
+    auditionLoopFile: 'ファイルのループ点',
+    /** ファイルにループ点がないときのセグメントの左。 */
+    auditionLoopWhole: '全体',
+    auditionLoopCustom: '区間を指定',
+    auditionLoopStart: '始め',
+    auditionLoopEnd: '終わり',
+    auditionLoopNote: 'ファイルは変わりません。ループの試聴だけがこの区間を回します',
+    auditionLoopLength: (length: string) => `長さ ${length}`,
+    auditionLoopMissing: '始めと終わりを入れてください',
+    auditionLoopOrder: '始めは終わりより前にしてください',
+    auditionLoopPastEnd: (length: string) => `終わりは長さ（${length}）までにしてください`,
     // 効果音の即再生（設定シートの一般）
     sfx: '選んだ短い音声をすぐ鳴らす',
     sfxHint:
