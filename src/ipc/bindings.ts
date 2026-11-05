@@ -58,8 +58,9 @@ export const commands = {
 	/**  素材の欄の中身（DB だけを読む）。 */
 	itemAssetGet: (itemId: number) => typedError<AssetDto, AppError>(__TAURI_INVOKE("item_asset_get", { itemId })),
 	/**
-	 *  素材の設定を変える（右クリックの複数の選択にも使う。画像だけに付け、ほかは飛ばす）。変えた数を返す。格子が合わない画像が
-	 *  あれば、どれも変えずに `Invalid`。
+	 *  素材の設定を変える（右クリックの複数の選択にも使う。画像の欄は画像だけ、試聴のループは音声だけに付け、ほかは飛ばす）。
+	 *  変えた数を返す。格子が合わない画像・長さ（解析の読み取りで分かっていれば）を超える試聴のループ・始め ≥ 終わりがあれば、
+	 *  どれも変えずに `Invalid`。
 	 */
 	itemAssetSettingsSet: (ids: number[], patch: AssetSettingsPatchDto) => typedError<number, AppError>(__TAURI_INVOKE("item_asset_settings_set", { ids, patch })),
 	/**  アニメの帯の情報。帯がまだなければ、その場で作って `anim/ab/<hash>-1.png` に書く（長くても 0.4 秒ほど。ジョブにしない）。 */
@@ -467,6 +468,11 @@ export type AssetAudioFactsDto = {
 	/**  非可逆の形式は null。 */
 	bits: number | null,
 	clipRuns: number | null,
+	/**
+	 *  長さ（フレーム。解析の読み取りの記録 `kura.read` の値。今の版の記録がなければ null）。素材の欄が試聴のループの
+	 *  長さ超えを出す・波形のループの区間を選ぶのに使う。試聴は /pcm の kura チャンクの値を使う。
+	 */
+	frames: number | null,
 };
 
 /**  「ドット絵として表示」の 3 択。 */
@@ -571,6 +577,9 @@ export type AssetImageFactsDto = {
 	frameCount: number | null,
 };
 
+/**  試聴のループの変え方（`"clear"` か `{ set: { start, end } }`。M13）。 */
+export type AssetLoopChangeDto = "clear" | { set: AssetSpanDto };
+
 /**  3D モデルの情報。 */
 export type AssetModelDto = {
 	vertices: number | null,
@@ -602,13 +611,16 @@ export type AssetSettingsDto = {
 	/**  格子のアニメのコマの長さ（ms）。 */
 	frameMs: number | null,
 	pivot: AssetPivotDto | null,
-	/**  試聴のループ（M13 で書く）。 */
+	/**
+	 *  試聴のループ（音声だけ。ファイルは変えない。M13）。試聴と波形のループの区間は、これが長さに収まればこれ、
+	 *  なければファイルのループ点。
+	 */
 	loopRange: AssetSpanDto | null,
 	animTag: string | null,
 	updatedAt: number | null,
 };
 
-/**  素材の設定の変更（省いた項目は変えない）。数の 0 と文字の空は「自動に戻す」。ループ点は M13 で書くのでここにはない。 */
+/**  素材の設定の変更（省いた項目は変えない）。数の 0 と文字の空は「自動に戻す」。 */
 export type AssetSettingsPatchDto = {
 	/**  ドット絵として表示（自動・はい・いいえ）。 */
 	pixelArt?: AssetChoiceDto | null,
@@ -620,6 +632,8 @@ export type AssetSettingsPatchDto = {
 	pivot?: AssetPivotChangeDto | null,
 	/**  再生するタグ（空文字は自動）。 */
 	animTag?: string | null,
+	/**  試聴のループ（音声だけ。始め < 終わり、長さが分かっていれば終わり ≤ 長さ）。 */
+	loopRange?: AssetLoopChangeDto | null,
 };
 
 /**  フレームの半開区間 [start, end)。 */

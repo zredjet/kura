@@ -9,8 +9,11 @@
 //!   [`effective_animated`]（格子の設定 ?? 解析のコマが 2 つ以上）。検索の SQL も「格子の設定 ?? 解析のコマ」で比べ
 //!   （[`grid_items_sql`]）、`アニメ:あり` がこの関数の真と同じ集合になることを、格子 4 通り（なし・あり・知らない版・壊れた
 //!   JSON）× コマ 4 通り（未解析・計れない・1・8）で照らす（M11 のユーザーの決定 16）。
-//! - 設定は画像だけに付ける（音声・動画・フォント・3D の ID は飛ばす。検索の「ドット絵:あり」に画像以外が入らないように）。
-//!   すべての欄が自動（NULL）に戻れば行を消す（「変えたアイテムにだけ行がある」）。
+//! - 画像の設定（ドット絵・倍率・格子・コマの長さ・ピボット・タグ）は画像だけに、試聴のループ（M13）は音声だけに付ける
+//!   （ほかの種類の ID・欄は飛ばす。検索の「ドット絵:あり」に画像以外が入らないように）。すべての欄が自動（NULL）に戻れば
+//!   行を消す（「変えたアイテムにだけ行がある」）。
+//! - 試聴のループは始め < 終わりで、解析の読み取りの記録（`kura.read`）で長さが分かっていれば終わり ≤ 長さ。ファイルは
+//!   変えず、検索の `ループ:あり`（ファイルのループ点。`media_facts.has_loop`）にも効かない。
 //! - 格子は、セルが 1 つもできない値と、セルの数を超えるコマの数を断る（大きさの分からない画像は、セルの幅・高さが
 //!   1 以上かだけを見る）。帯で使うコマの数は [`anim::MAX_FRAMES`] まで。
 //! - DB だけを読む（ファイルは読まない）。中身に依る事実は台帳の行の ID（`items.blob_id`。0010）で引く。
@@ -30,6 +33,8 @@ use kura_engine::ops::sprite::split_grid::cells_on_axis;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
+use crate::analysis::facts::ReadRecord;
+use crate::analysis::plan::{READ_ID, READ_V};
 use crate::import::MediaKind;
 use crate::library::hex;
 use crate::{CoreError, Result};
@@ -130,6 +135,9 @@ pub struct AudioFacts {
     /// 非可逆の形式は None。
     pub bits: Option<u32>,
     pub clip_runs: Option<u64>,
+    /// 長さ（フレーム。解析の読み取りの記録 `kura.read` の値。今の版の音声の記録があるときだけ）。試聴は /pcm の kura
+    /// チャンクの値を使う（解析のあとにデコーダが変わっても PCM とずれない）。
+    pub frames: Option<u64>,
 }
 
 /// 解析の事実（`media_facts` の 1 行）。
@@ -238,7 +246,7 @@ pub struct AssetSettings {
     /// 格子のアニメのコマの長さ（ms）。
     pub frame_ms: Option<u32>,
     pub pivot: Option<Pivot>,
-    /// 試聴のループ（M13 で書く。M11 では読むだけ）。
+    /// 試聴のループ（フレームの半開区間。音声だけ。ファイルは変えない。M13）。
     pub loop_range: Option<(u64, u64)>,
     /// aseprite の再生するタグ。
     pub anim_tag: Option<String>,
@@ -347,7 +355,7 @@ const SETTINGS_COLUMNS: &str =
      s.loop_start, s.loop_end, s.anim_tag, s.updated_at";
 
 /// 素材の欄の問い合わせ：アイテム（主キー）→ 事実（`items.blob_id` で、事実の主キー）、設定（item_id の主キー）、
-/// 格子の推定（結果の表の (blob_id, analysis) の UNIQUE。`?2` は [`SpriteGrid::ID`]）。
+/// 格子の推定と読み取りの記録（結果の表の (blob_id, analysis) の UNIQUE。`?2` は [`SpriteGrid::ID`]、`?3` は [`READ_ID`]）。
 const GET_SQL: &str = "SELECT i.id, i.hash, i.ext, i.kind, i.width, i.height, i.analysis_state, i.codec_info,
             f.state, f.error_code, f.decoder, f.facts_v, f.analyzed_at,
             f.alpha, f.colors, f.visible_colors, f.pixel_kx, f.pixel_ky, f.pixel_lossless, f.pixel_art,
@@ -356,17 +364,21 @@ const GET_SQL: &str = "SELECT i.id, i.hash, i.ext, i.kind, i.width, i.height, i.
             f.loop_start, f.loop_end, f.sample_rate, f.channels, f.bits, f.clip_runs,
             s.item_id, s.pixel_art, s.pixel_scale, s.grid_json, s.frame_ms, s.pivot_x, s.pivot_y,
             s.loop_start, s.loop_end, s.anim_tag, s.updated_at,
-            g.version, g.encoding, g.output
+            g.version, g.encoding, g.output,
+            r.version, r.output
      FROM items i
      LEFT JOIN media_facts f ON f.blob_id = i.blob_id
      LEFT JOIN asset_settings s ON s.item_id = i.id
      LEFT JOIN analysis_results g ON g.blob_id = i.blob_id AND g.analysis = ?2
+     LEFT JOIN analysis_results r ON r.blob_id = i.blob_id AND r.analysis = ?3
      WHERE i.id = ?1";
 
 /// 設定の列が始まる位置（[`GET_SQL`] の中）。
 const GET_SETTINGS_AT: usize = 34;
 /// 格子の推定の列（版・符号化・正規の形）が始まる位置（[`GET_SQL`] の中）。
 const GET_GRID_AT: usize = 45;
+/// 読み取りの記録の列（版・正規の形）が始まる位置（[`GET_SQL`] の中）。
+const GET_READ_AT: usize = 48;
 
 /// 0 以上で u32 に収まる整数（ほかは None）。
 fn u32_of(v: Option<i64>) -> Option<u32> {
@@ -386,6 +398,18 @@ fn bool_of(v: Option<i64>) -> Option<bool> {
 /// ループ点の 2 つの列（片方だけなら None。CHECK が断るので起きない）。
 fn span_of(start: Option<i64>, end: Option<i64>) -> Option<(u64, u64)> {
     Some((u64_of(start)?, u64_of(end)?))
+}
+
+/// 読み取りの記録（`kura.read` の版と正規の形）の音声の長さ（フレーム）。今の版（[`READ_V`]）の音声の記録でなければ・
+/// 読めなければ None。
+fn read_frames(version: Option<i64>, output: Option<&[u8]>) -> Option<u64> {
+    if version != Some(i64::from(READ_V)) {
+        return None;
+    }
+    match ReadRecord::from_canonical(output?)? {
+        ReadRecord::Audio { frames, .. } => Some(frames),
+        ReadRecord::Image { .. } | ReadRecord::Frames { .. } => None,
+    }
 }
 
 /// grid_json の版 1。
@@ -555,6 +579,10 @@ fn facts_from_row(row: &Row<'_>) -> rusqlite::Result<Option<Facts>> {
             channels: u32_of(row.get(31)?),
             bits: u32_of(row.get(32)?),
             clip_runs: u64_of(row.get(33)?),
+            frames: read_frames(
+                row.get(GET_READ_AT)?,
+                row.get::<_, Option<Vec<u8>>>(GET_READ_AT + 1)?.as_deref(),
+            ),
         },
     }))
 }
@@ -596,7 +624,7 @@ fn font_and_model(
 pub fn get(conn: &Connection, item_id: i64) -> Result<AssetInfo> {
     let mut stmt = conn.prepare_cached(GET_SQL)?;
     let found = stmt
-        .query_row(params![item_id, SpriteGrid::ID], |row| {
+        .query_row(params![item_id, SpriteGrid::ID, READ_ID], |row| {
             let hash: Vec<u8> = row.get(1)?;
             let kind: MediaKind = row.get(3)?;
             let ext: String = row.get(2)?;
@@ -709,7 +737,7 @@ impl<T: Clone> Change<T> {
     }
 }
 
-/// 設定の変更（省いた欄は変えない）。ループ点は M13 で書くので、ここでは変えない。
+/// 設定の変更（省いた欄は変えない）。試聴のループは音声だけに、ほかの欄は画像だけに効く（[`set_settings`]）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SettingsPatch {
     pub pixel_art: Option<Change<bool>>,
@@ -718,13 +746,16 @@ pub struct SettingsPatch {
     pub frame_ms: Option<Change<u32>>,
     pub pivot: Option<Change<Pivot>>,
     pub anim_tag: Option<Change<String>>,
+    /// 試聴のループ（フレームの半開区間。M13）。
+    pub loop_range: Option<Change<(u64, u64)>>,
 }
 
 /// タグの名前の長さの上限（バイト）。
 const MAX_TAG_BYTES: usize = 256;
 
 impl SettingsPatch {
-    /// 画像の大きさに依らない値を確かめる（倍率 1〜64、コマの長さ 1 以上、ピボットは有限、タグの名前は空でなく 256 バイトまで）。
+    /// 画像の大きさ・音声の長さに依らない値を確かめる（倍率 1〜64、コマの長さ 1 以上、ピボットは有限、タグの名前は空でなく
+    /// 256 バイトまで、試聴のループは始め < 終わりで DB の整数に収まる）。
     pub fn validate(&self) -> Result<()> {
         let bad = |m: &str| Err(CoreError::Invalid(m.to_string()));
         if let Some(Change::Set(scale)) = self.pixel_scale
@@ -748,7 +779,30 @@ impl SettingsPatch {
         if let Some(Change::Set(grid)) = &self.grid {
             validate_grid(grid, None).map_err(CoreError::Invalid)?;
         }
+        if let Some(Change::Set((start, end))) = self.loop_range {
+            if start >= end {
+                return bad("試聴のループの始めは終わりより前にしてください");
+            }
+            if i64::try_from(end).is_err() {
+                return bad("試聴のループの位置が大きすぎます");
+            }
+        }
         Ok(())
+    }
+
+    /// 種類 `kind` に効く欄だけを残した変更（画像は試聴のループを除くすべて、音声は試聴のループだけ。ほかの種類は何も変えない）。
+    fn for_kind(&self, kind: MediaKind) -> Self {
+        match kind {
+            MediaKind::Image => Self {
+                loop_range: None,
+                ..self.clone()
+            },
+            MediaKind::Audio => Self {
+                loop_range: self.loop_range.clone(),
+                ..Self::default()
+            },
+            MediaKind::Video | MediaKind::Font | MediaKind::Model => Self::default(),
+        }
     }
 
     /// 今の設定に当てたもの。
@@ -772,11 +826,26 @@ impl SettingsPatch {
         if let Some(c) = &self.anim_tag {
             next.anim_tag = c.apply();
         }
+        if let Some(c) = &self.loop_range {
+            next.loop_range = c.apply();
+        }
         next
     }
 }
 
-/// 選んだアイテム（右クリックで複数）の設定を変える。画像でない ID・ない ID は飛ばす。格子が合わない画像が 1 つでもあれば、
+/// 設定を書く前に読むもの（種類・大きさ・読み取りの記録・今の設定。`?1` はアイテム、`?2` は [`READ_ID`]）。
+fn target_sql() -> String {
+    format!(
+        "SELECT i.kind, i.width, i.height, r.version, r.output, {SETTINGS_COLUMNS}
+         FROM items i
+         LEFT JOIN asset_settings s ON s.item_id = i.id
+         LEFT JOIN analysis_results r ON r.blob_id = i.blob_id AND r.analysis = ?2
+         WHERE i.id = ?1"
+    )
+}
+
+/// 選んだアイテム（右クリックで複数）の設定を変える。画像の欄は画像だけに、試聴のループは音声だけに付け、ほかの種類の ID・
+/// ない ID は飛ばす。格子が合わない画像・長さ（読み取りの記録で分かっていれば）を超える試聴のループが 1 つでもあれば、
 /// どれも変えずに Invalid。変えた（行の中身が変わった）アイテムの数を返す。
 pub fn set_settings(
     conn: &Connection,
@@ -785,38 +854,39 @@ pub fn set_settings(
     now: i64,
 ) -> Result<u32> {
     patch.validate()?;
-    let mut target = conn.prepare_cached(&format!(
-        "SELECT i.kind, i.width, i.height, {SETTINGS_COLUMNS}
-         FROM items i LEFT JOIN asset_settings s ON s.item_id = i.id WHERE i.id = ?1"
-    ))?;
+    let mut target = conn.prepare_cached(&target_sql())?;
     // 先にすべてを確かめてから書く（呼び手のトランザクションの中なので、途中で断っても戻るが、書く前に断る）
     let mut writes: Vec<(i64, AssetSettings)> = Vec::new();
     for id in ids.iter().copied().collect::<BTreeSet<i64>>() {
         let found = target
-            .query_row([id], |row| {
+            .query_row(params![id, READ_ID], |row| {
                 Ok((
                     row.get::<_, MediaKind>(0)?,
                     u32_of(row.get(1)?).zip(u32_of(row.get(2)?)),
-                    settings_from_row(row, 3)?,
+                    read_frames(row.get(3)?, row.get::<_, Option<Vec<u8>>>(4)?.as_deref()),
+                    settings_from_row(row, 5)?,
                 ))
             })
             .optional()?;
-        let Some((MediaKind::Image, size, current)) = found else {
+        let Some((kind, size, frames, current)) = found else {
             continue;
         };
+        let patch = patch.for_kind(kind);
         let next = patch.apply_to(&current);
-        if next.pixel_art == current.pixel_art
-            && next.pixel_scale == current.pixel_scale
-            && next.grid == current.grid
-            && next.frame_ms == current.frame_ms
-            && next.pivot == current.pivot
-            && next.anim_tag == current.anim_tag
-        {
+        if next == current {
             continue;
         }
         if let (Some(grid), Some(Change::Set(_))) = (&next.grid, &patch.grid) {
             validate_grid(grid, size)
                 .map_err(|why| CoreError::Invalid(format!("アイテム {id}：{why}")))?;
+        }
+        if let (Some((_, end)), Some(Change::Set(_)), Some(frames)) =
+            (next.loop_range, &patch.loop_range, frames)
+            && end > frames
+        {
+            return Err(CoreError::Invalid(format!(
+                "アイテム {id}：試聴のループの終わり（{end}）が長さ（{frames} フレーム）を超えています"
+            )));
         }
         writes.push((id, next));
     }
@@ -1502,13 +1572,220 @@ mod tests {
         assert_eq!(grid_estimate_from(None, None, None), None, "行がない");
     }
 
+    /// 読み取りの記録（`kura.read`）を結果の表に置く（版 `version`）。
+    fn put_read(conn: &Connection, id: i64, version: i64, read: &ReadRecord) {
+        let output = read.to_canonical().unwrap();
+        conn.execute(
+            "INSERT INTO analysis_results (blob_id, analysis, version, params, encoding, output, output_len,
+                                           digest, created_at)
+             VALUES (?1, ?2, ?3, '{}', 'json', ?4, ?5, zeroblob(32), 1)
+             ON CONFLICT (blob_id, analysis) DO UPDATE SET
+               version = excluded.version, output = excluded.output, output_len = excluded.output_len",
+            params![
+                blob_id(conn, id),
+                READ_ID,
+                version,
+                output,
+                output.len() as i64
+            ],
+        )
+        .unwrap();
+    }
+
+    /// 音声の読み取りの記録（48 kHz・ステレオ・`frames` フレーム）。
+    fn audio_read(frames: u64) -> ReadRecord {
+        ReadRecord::Audio {
+            rate: 48_000,
+            channels: 2,
+            frames,
+            bits: Some(16),
+        }
+    }
+
+    fn loop_patch(change: Change<(u64, u64)>) -> SettingsPatch {
+        SettingsPatch {
+            loop_range: Some(change),
+            ..SettingsPatch::default()
+        }
+    }
+
+    /// 素材の欄の音声の長さは、今の版の読み取りの記録（`kura.read`）の音声のフレーム数。版違い・画像の記録・記録が
+    /// ないものは None（事実の行がなければ事実ごと None）。
+    #[test]
+    fn get_reads_the_audio_length_from_the_read_record() {
+        let conn = test_conn();
+        item(&conn, 1, "audio", None, None);
+        conn.execute(
+            "INSERT INTO media_facts (blob_id, state, facts_v, sample_rate, channels, analyzed_at)
+             VALUES (?1, 'ok', 1, 48000, 2, 7)",
+            [blob_id(&conn, 1)],
+        )
+        .unwrap();
+        let frames = |conn: &Connection| get(conn, 1).unwrap().facts.unwrap().audio.frames;
+        assert_eq!(frames(&conn), None, "記録がない");
+        put_read(&conn, 1, i64::from(READ_V), &audio_read(96_000));
+        assert_eq!(frames(&conn), Some(96_000));
+        put_read(&conn, 1, i64::from(READ_V) + 1, &audio_read(96_000));
+        assert_eq!(frames(&conn), None, "知らない版");
+        put_read(
+            &conn,
+            1,
+            i64::from(READ_V),
+            &ReadRecord::Image { w: 4, h: 4 },
+        );
+        assert_eq!(frames(&conn), None, "音声でない記録");
+        conn.execute(
+            "UPDATE analysis_results SET output = x'7b7d' WHERE analysis = ?1",
+            [READ_ID],
+        )
+        .unwrap();
+        assert_eq!(frames(&conn), None, "読めない記録");
+    }
+
+    /// 試聴のループ（M13）：音声にだけ書く・消す（画像には付けない）。画像の欄は音声に付けない。ほかの欄は変えない。
+    #[test]
+    fn audition_loop_is_written_to_audio_only_and_keeps_other_fields() {
+        let conn = test_conn();
+        item(&conn, 1, "audio", None, None);
+        item(&conn, 2, "image", Some((64, 64)), None);
+        let both = SettingsPatch {
+            pixel_art: Some(Change::Set(true)),
+            grid: Some(Change::Set(grid(16, None))),
+            loop_range: Some(Change::Set((10, 20))),
+            ..SettingsPatch::default()
+        };
+        assert_eq!(set_settings(&conn, &[1, 2, 99], &both, 5).unwrap(), 2);
+        let audio = get(&conn, 1).unwrap().settings;
+        assert_eq!(
+            audio,
+            AssetSettings {
+                loop_range: Some((10, 20)),
+                updated_at: Some(5),
+                ..AssetSettings::default()
+            },
+            "音声には試聴のループだけ"
+        );
+        let image = get(&conn, 2).unwrap().settings;
+        assert_eq!(
+            (image.pixel_art, image.grid, image.loop_range),
+            (Some(true), Some(grid(16, None)), None),
+            "画像には試聴のループを付けない"
+        );
+        let (s, e): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT loop_start, loop_end FROM asset_settings WHERE item_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((s, e), (Some(10), Some(20)));
+        // 同じ値は変えない（数えない・時刻も変えない）
+        assert_eq!(
+            set_settings(&conn, &[1], &loop_patch(Change::Set((10, 20))), 9).unwrap(),
+            0
+        );
+        assert_eq!(get(&conn, 1).unwrap().settings.updated_at, Some(5));
+        // 画像の欄だけの変更は音声を変えない
+        let pixel = SettingsPatch {
+            pixel_art: Some(Change::Set(false)),
+            ..SettingsPatch::default()
+        };
+        assert_eq!(set_settings(&conn, &[1], &pixel, 9).unwrap(), 0);
+        // 区間を変える・消す（ほかの欄がなければ行も消える）
+        assert_eq!(
+            set_settings(&conn, &[1], &loop_patch(Change::Set((0, 48_000))), 11).unwrap(),
+            1
+        );
+        assert_eq!(
+            get(&conn, 1).unwrap().settings.loop_range,
+            Some((0, 48_000))
+        );
+        assert_eq!(settings_rows(&conn), 2);
+        assert_eq!(
+            set_settings(&conn, &[1, 2], &loop_patch(Change::Clear), 12).unwrap(),
+            1
+        );
+        assert_eq!(get(&conn, 1).unwrap().settings, AssetSettings::default());
+        assert_eq!(settings_rows(&conn), 1, "画像の行は残る");
+        assert_eq!(
+            get(&conn, 2).unwrap().settings.grid,
+            Some(grid(16, None)),
+            "画像の格子はそのまま"
+        );
+    }
+
+    /// 試聴のループは始め < 終わり（どれも変えずに断る）。読み取りの記録で長さが分かっていれば、終わり ≤ 長さも確かめる。
+    #[test]
+    fn audition_loop_rejects_bad_ranges_and_ranges_past_the_length() {
+        let conn = test_conn();
+        item(&conn, 1, "audio", None, None);
+        item(&conn, 2, "audio", None, None);
+        for (start, end) in [(20, 10), (10, 10), (0, u64::MAX)] {
+            let bad = loop_patch(Change::Set((start, end)));
+            assert!(
+                matches!(bad.validate(), Err(CoreError::Invalid(_))),
+                "{start}–{end}"
+            );
+            assert!(set_settings(&conn, &[1], &bad, 1).is_err(), "{start}–{end}");
+        }
+        assert_eq!(settings_rows(&conn), 0);
+        // 長さが分からない（解析の前）：始め < 終わりだけを見る
+        assert_eq!(
+            set_settings(&conn, &[1], &loop_patch(Change::Set((0, 500_000))), 1).unwrap(),
+            1
+        );
+        // 長さが分かる：終わりは長さまで（ちょうど長さはよい）
+        put_read(&conn, 1, i64::from(READ_V), &audio_read(96_000));
+        put_read(&conn, 2, i64::from(READ_V), &audio_read(48_000));
+        assert_eq!(
+            set_settings(&conn, &[1], &loop_patch(Change::Set((1_000, 96_000))), 2).unwrap(),
+            1
+        );
+        let err =
+            set_settings(&conn, &[1, 2], &loop_patch(Change::Set((1_000, 60_000))), 3).unwrap_err();
+        assert!(
+            matches!(&err, CoreError::Invalid(m) if m.contains("アイテム 2")),
+            "{err}"
+        );
+        assert_eq!(
+            get(&conn, 1).unwrap().settings.loop_range,
+            Some((1_000, 96_000)),
+            "1 件でも長さを超えれば、どれも変えない"
+        );
+        assert_eq!(get(&conn, 2).unwrap().settings.loop_range, None);
+        // 知らない版の記録は長さを知らないものとする
+        put_read(&conn, 2, i64::from(READ_V) + 1, &audio_read(48_000));
+        assert_eq!(
+            set_settings(&conn, &[2], &loop_patch(Change::Set((1_000, 60_000))), 4).unwrap(),
+            1
+        );
+        // 消すのは長さによらない
+        put_read(&conn, 1, i64::from(READ_V), &audio_read(10));
+        assert_eq!(
+            set_settings(&conn, &[1], &loop_patch(Change::Clear), 5).unwrap(),
+            1
+        );
+    }
+
     /// 素材の欄の問い合わせは主キーと台帳・結果の表の索引で引く（全件を走査しない）。
     #[test]
     fn asset_query_uses_keys() {
         let conn = test_conn();
         let sql = GET_SQL
             .replace("?1", "1")
-            .replace("?2", &format!("'{}'", SpriteGrid::ID));
+            .replace("?2", &format!("'{}'", SpriteGrid::ID))
+            .replace("?3", &format!("'{READ_ID}'"));
+        let plan = query_plan(&conn, &sql);
+        assert!(!plan.contains("SCAN"), "{plan}");
+    }
+
+    /// 設定を書くときの問い合わせも主キーと結果の表の索引で引く。
+    #[test]
+    fn settings_target_query_uses_keys() {
+        let conn = test_conn();
+        let sql = target_sql()
+            .replace("?1", "1")
+            .replace("?2", &format!("'{READ_ID}'"));
         let plan = query_plan(&conn, &sql);
         assert!(!plan.contains("SCAN"), "{plan}");
     }

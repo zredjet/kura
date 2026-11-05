@@ -1,7 +1,7 @@
 //! 素材の欄・アニメの帯（M11。docs/architecture.md §3。ロジックは kura-core の `asset`）。
 //!
 //! - `item_asset_get`：解析の事実・利用者の設定・実効値・フォントと 3D の情報（DB だけを読む）。
-//! - `item_asset_settings_set`：右クリックの複数の選択にも使う（画像だけに付ける）。
+//! - `item_asset_settings_set`：右クリックの複数の選択にも使う（画像の欄は画像だけ、試聴のループ（M13）は音声だけに付ける）。
 //! - `item_anim_get`：見たものだけ、その場で帯の PNG を作る（ジョブにしない。決定 8）。帯は kura:// の `/anim/{hash}/1`
 //!   （`rev` が 0 でなければ `?r={rev}` を付ける）で読む。大きすぎれば `TooLarge`、混んでいれば `Busy`。
 //!
@@ -46,7 +46,7 @@ pub enum AssetAnalysisStateDto {
 }
 
 /// フレームの半開区間 [start, end)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetSpanDto {
     pub start: u64,
@@ -90,6 +90,9 @@ pub struct AssetAudioFactsDto {
     /// 非可逆の形式は null。
     pub bits: Option<u32>,
     pub clip_runs: Option<u64>,
+    /// 長さ（フレーム。解析の読み取りの記録 `kura.read` の値。今の版の記録がなければ null）。素材の欄が試聴のループの
+    /// 長さ超えを出す・波形のループの区間を選ぶのに使う。試聴は /pcm の kura チャンクの値を使う。
+    pub frames: Option<u64>,
 }
 
 /// 解析の事実（`media_facts`）。
@@ -168,7 +171,8 @@ pub struct AssetSettingsDto {
     /// 格子のアニメのコマの長さ（ms）。
     pub frame_ms: Option<u32>,
     pub pivot: Option<AssetPivotDto>,
-    /// 試聴のループ（M13 で書く）。
+    /// 試聴のループ（音声だけ。ファイルは変えない。M13）。試聴と波形のループの区間は、これが長さに収まればこれ、
+    /// なければファイルのループ点。
     pub loop_range: Option<AssetSpanDto>,
     pub anim_tag: Option<String>,
     pub updated_at: Option<i64>,
@@ -316,6 +320,7 @@ impl From<AssetInfo> for AssetDto {
                     channels: f.audio.channels,
                     bits: f.audio.bits,
                     clip_runs: f.audio.clip_runs,
+                    frames: f.audio.frames,
                 },
             }),
             settings: settings_dto(a.settings),
@@ -378,7 +383,15 @@ pub enum AssetPivotChangeDto {
     Set(AssetPivotDto),
 }
 
-/// 素材の設定の変更（省いた項目は変えない）。数の 0 と文字の空は「自動に戻す」。ループ点は M13 で書くのでここにはない。
+/// 試聴のループの変え方（`"clear"` か `{ set: { start, end } }`。M13）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum AssetLoopChangeDto {
+    Clear,
+    Set(AssetSpanDto),
+}
+
+/// 素材の設定の変更（省いた項目は変えない）。数の 0 と文字の空は「自動に戻す」。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Type)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AssetSettingsPatchDto {
@@ -392,6 +405,8 @@ pub struct AssetSettingsPatchDto {
     pub pivot: Option<AssetPivotChangeDto>,
     /// 再生するタグ（空文字は自動）。
     pub anim_tag: Option<String>,
+    /// 試聴のループ（音声だけ。始め < 終わり、長さが分かっていれば終わり ≤ 長さ）。
+    pub loop_range: Option<AssetLoopChangeDto>,
 }
 
 impl From<AssetSettingsPatchDto> for SettingsPatch {
@@ -426,6 +441,10 @@ impl From<AssetSettingsPatchDto> for SettingsPatch {
                     Change::Set(t)
                 }
             }),
+            loop_range: p.loop_range.map(|l| match l {
+                AssetLoopChangeDto::Clear => Change::Clear,
+                AssetLoopChangeDto::Set(s) => Change::Set((s.start, s.end)),
+            }),
         }
     }
 }
@@ -448,8 +467,9 @@ pub async fn item_asset_get(
     .await
 }
 
-/// 素材の設定を変える（右クリックの複数の選択にも使う。画像だけに付け、ほかは飛ばす）。変えた数を返す。格子が合わない画像が
-/// あれば、どれも変えずに `Invalid`。
+/// 素材の設定を変える（右クリックの複数の選択にも使う。画像の欄は画像だけ、試聴のループは音声だけに付け、ほかは飛ばす）。
+/// 変えた数を返す。格子が合わない画像・長さ（解析の読み取りで分かっていれば）を超える試聴のループ・始め ≥ 終わりがあれば、
+/// どれも変えずに `Invalid`。
 #[tauri::command]
 #[specta::specta]
 pub async fn item_asset_settings_set(
@@ -621,6 +641,25 @@ mod tests {
             SettingsPatch::from(AssetSettingsPatchDto::default()),
             SettingsPatch::default()
         );
+    }
+
+    /// 試聴のループ（M13）：格子と同じ形（`"clear"` か `{ set: { start, end } }`）。省けば変えない。
+    #[test]
+    fn patch_dto_maps_the_audition_loop() {
+        let p: AssetSettingsPatchDto =
+            serde_json::from_str(r#"{"loopRange":{"set":{"start":10,"end":48000}}}"#).unwrap();
+        let p = SettingsPatch::from(p);
+        assert_eq!(p.loop_range, Some(Change::Set((10, 48_000))));
+        assert_eq!(p.grid, None);
+        let p: AssetSettingsPatchDto = serde_json::from_str(r#"{"loopRange":"clear"}"#).unwrap();
+        assert_eq!(SettingsPatch::from(p).loop_range, Some(Change::Clear));
+        let p: AssetSettingsPatchDto = serde_json::from_str(r#"{"pixelArt":"no"}"#).unwrap();
+        assert_eq!(SettingsPatch::from(p).loop_range, None);
+        // 始め ≥ 終わりは変換では断らず、validate（item_asset_settings_set）で Invalid にする
+        let p: AssetSettingsPatchDto =
+            serde_json::from_str(r#"{"loopRange":{"set":{"start":5,"end":5}}}"#).unwrap();
+        let err = AppError::from(SettingsPatch::from(p).validate().unwrap_err());
+        assert_eq!(err.code, AppErrorCode::Invalid);
     }
 
     /// 帯の情報とタグの向きは timeline.ts と同じ綴り。帯の失敗は画面で分ける code にする。

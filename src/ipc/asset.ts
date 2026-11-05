@@ -45,7 +45,11 @@ export function getAsset(itemId: number): Promise<AssetDto> {
   return unwrap(commands.itemAssetGet(itemId));
 }
 
-/** 素材の設定を変える（素材の欄・格子のシート・右クリックの「ドット絵として表示 ▸」から。画像だけに付く。変えた数を返す。格子が合わなければ `Invalid` で何も変えない）。 */
+/**
+ * 素材の設定を変える（素材の欄・格子のシート・試聴のループのシート・右クリックの「ドット絵として表示 ▸」から。画像の欄は
+ * 画像だけ、試聴のループ（`loopRange`）は音声だけに付く。変えた数を返す。格子が合わない・試聴のループが始め ≥ 終わりか
+ * 長さを超えるときは `Invalid` で何も変えない）。
+ */
 export function setAssetSettings(ids: number[], patch: AssetSettingsPatchDto): Promise<number> {
   return unwrap(commands.itemAssetSettingsSet(ids, patch));
 }

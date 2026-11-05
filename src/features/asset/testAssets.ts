@@ -32,6 +32,8 @@ export const AUDIO_FACTS: AssetAudioFactsDto = {
   channels: 2,
   bits: 24,
   clipRuns: 0,
+  // 100 秒（ループの終わり 4,057,200 より長い）
+  frames: 4_410_000,
 };
 
 const NO_IMAGE: AssetImageFactsDto = {
@@ -58,6 +60,7 @@ const NO_AUDIO: AssetAudioFactsDto = {
   channels: null,
   bits: null,
   clipRuns: null,
+  frames: null,
 };
 
 function facts(patch: Partial<AssetFactsDto>): AssetFactsDto {

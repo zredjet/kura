@@ -729,6 +729,25 @@ fn audio_facts_match_only_known_values() {
     }
 }
 
+/// `ループ` はファイルのループ点（解析の事実）だけを見る。試聴のループ（素材の設定。ファイルに入らない。M13）は、あっても
+/// なくても結果を変えない（持ち出すループ素材を探すときに混ざらないように）。
+#[test]
+fn loop_search_ignores_the_audition_loop_setting() {
+    use crate::asset::{Change, SettingsPatch, set_settings};
+    let conn = asset_library();
+    let queries = ["ループ:あり", "ループ:なし", "ループ!=あり", "-ループ:あり"];
+    let before: Vec<Vec<i64>> = queries.iter().map(|q| ids(&conn, q)).collect();
+    let patch = SettingsPatch {
+        loop_range: Some(Change::Set((0, 100))),
+        ..SettingsPatch::default()
+    };
+    // ループのない音声・未解析の音声・ループのある音声の 3 つに試聴のループを付ける
+    assert_eq!(set_settings(&conn, &[21, 22, 23], &patch, 1).unwrap(), 3);
+    for (query, want) in queries.iter().zip(&before) {
+        assert_eq!(ids(&conn, query), *want, "{query}");
+    }
+}
+
 /// ドット絵の検索（この SQL）と素材の欄の実効値（`asset::effective_pixel_art`）が同じ規則であること。設定は素材の欄の
 /// 書き手（`asset::set_settings`）、自動の判定は解析の書き手（`analysis::store::write`）で入れ、設定 3 通り × 自動
 /// 4 通り（未解析・解析済みで材料が足りない・いいえ・はい）のすべてで照らす。
