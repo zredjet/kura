@@ -595,3 +595,83 @@ fn peaks_tiles_are_served_by_rev() {
         Err(TileError::NotFound(_))
     ));
 }
+
+/// 段 7（F15 の申し送り 3）：波形の段の区切りは窓（流れの窓 16 チャンク）の途中でもチャンクごとに止める。区切りに渡した
+/// チャンクの数だけ流し（窓の途中で止まり）、続きは次の区切りで流す。ランダムな数で区切って組み終えた段は `compute` と同じ。
+#[test]
+fn background_peaks_stop_mid_window_and_resume() {
+    use rand_chacha::rand_core::Rng;
+
+    let env = Env::new();
+    let frames = 130 * C + 5;
+    let bytes = noise_wav(8_000, 1, frames, 37);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let idle = Viewport::Audio(AudioViewport {
+        work: false,
+        ..AudioViewport::idle()
+    });
+    let s = env.open_with(id, idle.clone()).session.clone();
+    let out = env.step(&s, vec![add(0, "audio.gain", json!({ "db": -6.0 }))], &idle);
+    assert!(shown_audio(&out.view).peaks.pending);
+    let editor = env.editor(&s);
+    let missing = || {
+        editor
+            .lock_state()
+            .as_ref()
+            .unwrap()
+            .audio
+            .as_ref()
+            .unwrap()
+            .peaks
+            .missing_chunks()
+    };
+    let script = |n: u64| {
+        editor
+            .lock_state()
+            .as_mut()
+            .unwrap()
+            .audio
+            .as_mut()
+            .unwrap()
+            .script = Some(n);
+    };
+    let total = frames.div_ceil(C) as usize;
+    assert_eq!(missing(), Some(total), "手の中では流さない");
+    let work = Viewport::Audio(AudioViewport {
+        work: true,
+        ..AudioViewport::idle()
+    });
+    // 流れの窓（16 チャンク）の途中で止まる
+    script(3);
+    let out = env.step(&s, Vec::new(), &work);
+    assert!(shown_audio(&out.view).peaks.pending);
+    assert_eq!(missing(), Some(total - 3), "窓の途中で止まる");
+    // 渡した数だけ流し、続きから流す
+    let mut r = kura_engine::determinism::rng(29);
+    let mut left = total - 3;
+    let generation = loop {
+        let n = 1 + (r.next_u32() % 23) as usize;
+        script(n as u64);
+        let out = env.step(&s, Vec::new(), &work);
+        let info = shown_audio(&out.view);
+        match missing() {
+            Some(m) => {
+                assert_eq!(m, left - n, "渡した数だけ流す");
+                assert!(info.peaks.pending);
+                left = m;
+            }
+            None => {
+                assert!(n >= left);
+                assert!(!info.peaks.pending);
+                break info.peaks.rev.unwrap();
+            }
+        }
+    };
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -6.0 }), 1)
+        .unwrap();
+    assert_eq!(
+        *published(&env, &s, generation),
+        peaks_of(&rendered(&bytes, "wav", &g))
+    );
+}

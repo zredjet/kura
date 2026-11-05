@@ -13,8 +13,9 @@
 //! - **手のあと**：表示の変わった区間を `dirty` に足す（レート・チャンネルが変われば全体。長さの変化は `PeaksPatch` が尾を足す）。
 //! - **直す**（[`Editor::advance_peaks`]。操作中は何もしない）：`PeaksPatch` を作り、R のうち表示の値で有効なチャンクは写さずに
 //!   渡し、残りが [`PEAKS_SYNC_FRAMES`] 以下なら流して直す。それを超える分は、`edit_view { work: true }` のたびに
-//!   [`WORK_SLICE`] まで、見えている区間に重なる窓から流す（裏の仕事。別のスレッドは使わない）。直し終えたら新しい世代で
-//!   公開し、それまでは前の段を出す（`pending`）。
+//!   [`WORK_SLICE`] まで、見えている区間に重なる窓から流す（裏の仕事。別のスレッドは使わない。窓の途中でもチャンクごとに
+//!   締め切りを見て止め、続きは次の区切り：[`super::slice`]。流しの読みは源の LRU に入れない：`read_through`）。直し終えたら
+//!   新しい世代で公開し、それまでは前の段を出す（`pending`）。
 //! - **予算**：公開した段 2 つと組んでいる段の分を、表示の値と一緒に `CacheLease::extra` で数える。
 
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use kura_engine::value::AUDIO_CHUNK;
 use kura_engine::{EngineError, Monitor};
 
 use super::super::{Editor, State, TileError, settle};
+use super::slice::{Limit, Pace};
 use super::{ChangedSpans, chunk_runs};
 use crate::edit::EngineServices;
 
@@ -135,6 +137,8 @@ pub(crate) struct PeaksJob {
     reported: Option<Form>,
     /// 次の表示の変わりを足さない（開いたときの最初の表示。土台からの差分は開くときに入れた）。
     skip_next: bool,
+    /// 裏の仕事で 1 チャンクを流す時間の見積もり（区切りの中で流す数を決める。段 7）。
+    pub(crate) pace: Pace,
 }
 
 /// 表示の情報に載せる波形の段の状態。
@@ -175,6 +179,7 @@ impl PeaksJob {
             changed_since_reported: Dirty::All,
             reported: None,
             skip_next: true,
+            pace: Pace::default(),
         };
         if let Some((peaks, dirty)) = base {
             if form_of(&peaks).3 == params.bins() {
@@ -202,6 +207,12 @@ impl PeaksJob {
     /// 直している途中か（`dirty` が残る・組んでいる途中）。
     pub(crate) fn pending(&self) -> bool {
         !self.dirty.is_empty() || self.run.is_some()
+    }
+
+    /// 組んでいる段がまだ受けていないチャンクの数（テスト）。
+    #[cfg(test)]
+    pub(crate) fn missing_chunks(&self) -> Option<usize> {
+        self.run.as_ref().map(|r| r.patch.missing().count())
     }
 
     /// 組んでいる段の持つバイト数。
@@ -326,8 +337,9 @@ fn order_windows(windows: Vec<(u64, u64)>, visible: Option<(u64, u64)>) -> Vec<(
 
 impl Editor {
     /// 波形の段を直す（モジュールの説明）。`value` は公開した今の表示の値、`drawn` はその表示で描いた範囲（ここに掛かる有効な
-    /// チャンクだけを値から渡す。遅延の入力のチャンクを読み回さないため）。`deadline` は裏の仕事の区切りの終わり（`work` の
-    /// 要求だけ。呼び手が決め、残った時間で長い音声の計りを進める）。中止（新しい要求）は途中で止め、組んだ分は残す。
+    /// チャンクだけを値から渡す。遅延の入力のチャンクを読み回さないため）。`limit` は裏の仕事の区切り（`work` の要求だけ。
+    /// 呼び手が決め、残りで長い音声の計りを進める。窓の途中でもチャンクごとに見て止める：[`super::slice`]）。中止（新しい
+    /// 要求）は途中で止め、組んだ分は残す。
     #[allow(clippy::too_many_arguments)]
     pub(super) fn advance_peaks(
         &self,
@@ -336,7 +348,7 @@ impl Editor {
         value: &PartialValue,
         drawn: &Area,
         vp: &super::AudioViewport,
-        deadline: Option<Instant>,
+        limit: Option<&mut Limit>,
         ticket: &Ticket,
     ) {
         let Some(shape) = st.audio.as_ref().and_then(|a| a.peaks.shape) else {
@@ -395,62 +407,47 @@ impl Editor {
             }
         }
         let remaining = run.patch.missing().count() as u64 * AUDIO_CHUNK as u64;
-        if remaining > PEAKS_SYNC_FRAMES && deadline.is_none() {
-            return;
-        }
+        // 裏の仕事の区切りなら、その中だけ流す（残りが少なくても区切りを守る）。手の中では、直せる量なら区切らずに流し、
+        // 超える分は裏の仕事に回す
+        let mut limit = match limit {
+            Some(l) => Some(l),
+            None if remaining <= PEAKS_SYNC_FRAMES => None,
+            None => return,
+        };
         let windows = order_windows(
             stream_windows(run.patch.frames(), Some(&run.patch.missing_spans())),
             vp.visible,
         );
         let plan = st.plan.clone();
         let output = st.output;
-        for (a, b) in windows {
-            if remaining > PEAKS_SYNC_FRAMES && deadline.is_some_and(|d| Instant::now() >= d) {
-                break;
-            }
-            let spans = Spans::one(a, b);
-            let spec = EstimateSpec::new(0)
-                .all_inputs(&plan, Source::Held)
-                .area(output, Area::samples(spans.clone()));
-            if let Err(err) =
-                self.runtime
-                    .admit_preview(&plan, spec, &st.inputs, &mut st.cache, &mut st.lease)
-            {
-                tracing::debug!(%err, "波形の段を直す予算が空いていないので、あとにします");
-                settle(st);
-                return;
-            }
-            let Some(run) = st.audio.as_mut().and_then(|a| a.peaks.run.as_mut()) else {
-                settle(st);
-                return;
-            };
-            let (inputs, cache) = (&st.inputs, &mut st.cache);
-            // 流して読む読みは源の LRU に入れない（見えている区間のチャンクを追い出さない。段 7）
-            let r = self.runtime.preview(|e| {
-                read_through(|| {
-                    e.stream_audio(
-                        &plan,
-                        inputs,
-                        cache,
-                        output,
-                        Some(&spans),
-                        &mut run.patch.partial(),
-                        ticket,
-                    )
-                })
-            });
-            settle(st);
-            if let Err(err) = r {
-                if !matches!(err.root(), EngineError::Canceled) {
-                    tracing::warn!(%err, "波形の段を直せません（あとでやり直します）");
-                    if let Some(a) = st.audio.as_mut() {
-                        a.peaks.run = None;
+        let c = AUDIO_CHUNK as u64;
+        'windows: for (a, b) in windows {
+            let mut at = a;
+            while at < b {
+                // 窓の途中でも、締め切りまでに流せるチャンクの数だけにする（続きは次の区切り）
+                let max = (b - at).div_ceil(c);
+                let n = match limit.as_deref_mut() {
+                    Some(l) => {
+                        let pace = st.audio.as_ref().map(|a| a.peaks.pace).unwrap_or_default();
+                        l.grant(&pace, max)
                     }
+                    None => max,
+                };
+                if n == 0 {
+                    break 'windows;
                 }
-                return;
-            }
-            if ticket.canceled() {
-                return;
+                let end = at.saturating_add(n * c).min(b);
+                let started = Instant::now();
+                if !self.stream_peaks_window(st, &plan, output, Spans::one(at, end), ticket) {
+                    return;
+                }
+                if let Some(a) = st.audio.as_mut() {
+                    a.peaks.pace.note(n, started.elapsed());
+                }
+                if ticket.canceled() {
+                    return;
+                }
+                at = end;
             }
         }
         let Some(audio) = st.audio.as_mut() else {
@@ -459,6 +456,59 @@ impl Editor {
         if let Some((generation, peaks)) = audio.peaks.complete(ticket) {
             self.publish_peaks(generation, peaks);
         }
+    }
+
+    /// 波形の段の窓（区間 `spans`）を 1 つ流す（区間だけの見積もりで確保してから。空いていなければあとにする）。流せたら
+    /// true。止めるとき（予算が空いていない・中止・誤り）は false（誤りなら組みかけを捨てる）。
+    fn stream_peaks_window(
+        &self,
+        st: &mut State,
+        plan: &kura_engine::Plan,
+        output: kura_engine::doc::OutputId,
+        spans: Spans,
+        ticket: &Ticket,
+    ) -> bool {
+        let spec = EstimateSpec::new(0)
+            .all_inputs(plan, Source::Held)
+            .area(output, Area::samples(spans.clone()));
+        if let Err(err) =
+            self.runtime
+                .admit_preview(plan, spec, &st.inputs, &mut st.cache, &mut st.lease)
+        {
+            tracing::debug!(%err, "波形の段を直す予算が空いていないので、あとにします");
+            settle(st);
+            return false;
+        }
+        let Some(run) = st.audio.as_mut().and_then(|a| a.peaks.run.as_mut()) else {
+            settle(st);
+            return false;
+        };
+        let (inputs, cache) = (&st.inputs, &mut st.cache);
+        // 流して読む読みは源の LRU に入れない（見えている区間のチャンクを追い出さない。段 7）
+        let r = self.runtime.preview(|e| {
+            read_through(|| {
+                e.stream_audio(
+                    plan,
+                    inputs,
+                    cache,
+                    output,
+                    Some(&spans),
+                    &mut run.patch.partial(),
+                    ticket,
+                )
+            })
+        });
+        settle(st);
+        if let Err(err) = r {
+            if !matches!(err.root(), EngineError::Canceled) {
+                tracing::warn!(%err, "波形の段を直せません（あとでやり直します）");
+                if let Some(a) = st.audio.as_mut() {
+                    a.peaks.run = None;
+                }
+            }
+            return false;
+        }
+        true
     }
 }
 

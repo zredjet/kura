@@ -32,6 +32,7 @@ pub mod serve;
 mod serve_tests;
 #[cfg(test)]
 mod session_tests;
+pub(crate) mod slice;
 pub mod snap;
 pub(crate) mod source;
 pub mod timeline;
@@ -129,6 +130,9 @@ pub(crate) struct AudioState {
     pub(crate) measure: measure::MeasureJob,
     /// 最後の表示の範囲の描画の数（測るための数。[`Editor::audio_counts`]）。
     pub(crate) last_area: AreaStats,
+    /// テスト：次の裏の仕事の区切りを、時間ではなくチャンクの数で区切る（`slice::Limit::Chunks`）。
+    #[cfg(test)]
+    pub(crate) script: Option<u64>,
 }
 
 /// 音声のエディタの測るための数（A18・devtools の `mem_smoke` と `bench edit`。振る舞いに効かない）。
@@ -145,6 +149,9 @@ pub struct AudioCounts {
     pub extra: u64,
     /// キャッシュの分の確保（描いていない間。上限と今の大きさの大きいほう ＋ extra）。
     pub lease_bytes: u64,
+    /// 裏の仕事で 1 チャンクを流す時間の見積もり（波形の段・計り。区切りの中で流す数を決めるもの。段 7）。
+    pub peaks_chunk: Option<std::time::Duration>,
+    pub measure_chunk: Option<std::time::Duration>,
 }
 
 /// 音声の出力の形の (rate, channels, frames)。長さの分からないものは None。
@@ -348,11 +355,20 @@ impl Editor {
                 a.measure.retarget(&id);
             }
         }
-        // 裏の仕事の区切り（`work` の要求だけ。操作中は進めない）：波形の段を先に、残った時間で長い音声の計りを進める
-        let deadline = (avp.work && !avp.interacting).then(|| Instant::now() + peaks::WORK_SLICE);
-        self.advance_peaks(st, rev, &value, &area, &avp, deadline, ticket);
-        if let Some(deadline) = deadline {
-            self.advance_measure(st, &id, deadline, ticket);
+        // 裏の仕事の区切り（`work` の要求だけ。操作中は進めない）：波形の段を先に、残った時間で長い音声の計りを進める。窓の
+        // 途中でもチャンクごとに締め切りを見る（`slice`）
+        let mut limit = (avp.work && !avp.interacting)
+            .then(|| slice::Limit::Deadline(Instant::now() + peaks::WORK_SLICE));
+        #[cfg(test)]
+        if let (Some(l), Some(n)) = (
+            limit.as_mut(),
+            st.audio.as_mut().and_then(|a| a.script.take()),
+        ) {
+            *l = slice::Limit::Chunks(n);
+        }
+        self.advance_peaks(st, rev, &value, &area, &avp, limit.as_mut(), ticket);
+        if let Some(limit) = limit.as_mut() {
+            self.advance_measure(st, &id, limit, ticket);
         }
         self.count_resident(st);
         let (peaks, work, loudness) = match st.audio.as_mut() {
@@ -419,6 +435,8 @@ impl Editor {
             cache_capacity: st.cache.capacity(),
             extra: st.lease.extra(),
             lease_bytes: st.lease.bytes(),
+            peaks_chunk: audio.peaks.pace.per_chunk(),
+            measure_chunk: audio.measure.pace.per_chunk(),
         })
     }
 

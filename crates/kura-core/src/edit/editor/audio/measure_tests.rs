@@ -9,6 +9,7 @@ use serde_json::json;
 
 use super::measure::{LoudnessState, LoudnessValues, MEASURE_WINDOW_CHUNKS, measure, values_of};
 use super::session_tests::*;
+use super::slice::Limit;
 use crate::edit::editor::{AudioViewport, Step, Viewport};
 
 /// 区間 `spans` を描く要求（裏の仕事は `work`、操作中は `interacting`）。
@@ -154,15 +155,15 @@ fn long_measure_waits_while_interacting_and_drops_stale_runs() {
             .measure
             .run_position()
     };
-    let windows = frames.div_ceil(MEASURE_WINDOW_CHUNKS * C) as usize;
-    assert_eq!(position(), Some((a.clone(), 0, windows)));
+    let chunks = frames.div_ceil(C) as usize;
+    assert_eq!(position(), Some((a.clone(), 0, chunks)));
     // 操作中（裏の仕事を頼んでいても）は進めない
     let dragging = vp(&[(0, C)], true, true);
     for _ in 0..3 {
         let out = env.step(&s, Vec::new(), &dragging);
         assert_eq!(shown_audio(&out.view).loudness, measuring);
     }
-    assert_eq!(position(), Some((a.clone(), 0, windows)));
+    assert_eq!(position(), Some((a.clone(), 0, chunks)));
     // 標本が変わった：計りかけを捨てる
     let out = env.step(&s, vec![set(1, json!({ "db": -7.0 }))], &idle);
     let info = shown_audio(&out.view);
@@ -175,7 +176,7 @@ fn long_measure_waits_while_interacting_and_drops_stale_runs() {
     assert_eq!(info.samples_id, a);
     assert_eq!(info.loudness, LoudnessState::Idle);
     assert_eq!(measure(&env.env(), &s).unwrap(), measuring, "計り直す");
-    assert_eq!(position(), Some((a, 0, windows)));
+    assert_eq!(position(), Some((a, 0, chunks)));
 }
 
 /// 段 4B の検証の直し 1：計りの途中の仮の表示（ドラッグ中の Preview。標本が違う）では計りかけを捨てない。CancelPreview で
@@ -298,16 +299,17 @@ fn long_measure_redoes_a_window_canceled_midway() {
     for n in 2..=5 {
         let mut guard = editor.lock_state();
         let st = guard.as_mut().unwrap();
-        let (_, before, windows) = st.audio.as_ref().unwrap().measure.run_position().unwrap();
+        let (_, before, chunks) = st.audio.as_ref().unwrap().measure.run_position().unwrap();
         let ticket = editor.latest.issue(Arc::new(CancelAfter::new(n)));
-        editor.advance_measure(st, &sid, Instant::now() + Duration::from_secs(60), &ticket);
+        let mut limit = Limit::Deadline(Instant::now() + Duration::from_secs(60));
+        editor.advance_measure(st, &sid, &mut limit, &ticket);
         let a = st.audio.as_ref().unwrap();
         let (run, next, _) = a.measure.run_position().expect("中止で計りかけを捨てない");
         assert_eq!(run, sid);
         if n == 2 {
             assert_eq!(next, before, "途中で中止した窓は進めない");
         }
-        assert!(next >= before && next < windows, "{n}: {before} → {next}");
+        assert!(next >= before && next < chunks, "{n}: {before} → {next}");
         assert!(
             matches!(a.measure.state(&sid), LoudnessState::Measuring { .. }),
             "{n}: {:?}",
@@ -374,4 +376,102 @@ fn background_work_keeps_the_visible_chunks_in_the_source_lru() {
         after_step.reads, after_work.reads,
         "裏の仕事のあとの手は区間を読み直さない: {after_work:?} → {after_step:?}"
     );
+}
+
+/// テスト：次の裏の仕事の区切りを、時間ではなくチャンクの数 `n` で区切る。
+fn script(env: &Env, s: &str, n: u64) {
+    env.editor(s)
+        .lock_state()
+        .as_mut()
+        .unwrap()
+        .audio
+        .as_mut()
+        .unwrap()
+        .script = Some(n);
+}
+
+/// 段 7（F15 の申し送り 3）：計りの区切りは窓（`MEASURE_WINDOW_CHUNKS`）の途中でもチャンクごとに止める。区切りに渡した
+/// チャンクの数だけ進み（窓の途中で止まり）、続きは次の区切りで流す。ランダムな数で区切って計り終えた結果は、全体の描画に
+/// 当てた解析とビット単位で同じ。
+#[test]
+fn long_measure_stops_mid_window_and_resumes_bit_exact() {
+    use rand_chacha::rand_core::Rng;
+
+    let env = Env::new();
+    let frames = 130 * C + 7;
+    let bytes = noise_wav(8_000, 1, frames, 86);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let s = env.open_with(id, vp(&[], false, false)).session.clone();
+    let idle = vp(&[(0, C)], false, false);
+    let out = env.step(&s, vec![add(0, "audio.gain", json!({ "db": -6.0 }))], &idle);
+    let sid = shown_audio(&out.view).samples_id.clone();
+    // 波形の段を先に済ませる（区切りは波形の段が先に使う）
+    let work = vp(&[(0, C)], true, false);
+    for _ in 0..400 {
+        if !shown_audio(&env.step(&s, Vec::new(), &work).view)
+            .peaks
+            .pending
+        {
+            break;
+        }
+    }
+    assert!(matches!(
+        measure(&env.env(), &s).unwrap(),
+        LoudnessState::Measuring { .. }
+    ));
+    let editor = env.editor(&s);
+    let position = || {
+        editor
+            .lock_state()
+            .as_ref()
+            .unwrap()
+            .audio
+            .as_ref()
+            .unwrap()
+            .measure
+            .run_position()
+    };
+    let total = frames.div_ceil(C) as usize;
+    assert_eq!(position(), Some((sid.clone(), 0, total)));
+    // 窓の途中で止まる
+    const { assert!(MEASURE_WINDOW_CHUNKS > 3) };
+    script(&env, &s, 3);
+    let out = env.step(&s, Vec::new(), &work);
+    assert!(matches!(
+        shown_audio(&out.view).loudness,
+        LoudnessState::Measuring { .. }
+    ));
+    assert_eq!(
+        position(),
+        Some((sid.clone(), 3, total)),
+        "窓の途中で止まる"
+    );
+    // 渡した数だけ進み、続きから流す
+    let mut r = kura_engine::determinism::rng(23);
+    let mut at = 3usize;
+    let state = loop {
+        let n = 1 + u64::from(r.next_u32() % 9);
+        script(&env, &s, n);
+        let out = env.step(&s, Vec::new(), &work);
+        let info = shown_audio(&out.view);
+        match position() {
+            Some((_, pos, _)) => {
+                assert_eq!(pos, at + n as usize, "渡した数だけ進む");
+                assert!(pos < total);
+                at = pos;
+            }
+            None => {
+                assert!(at + n as usize >= total);
+                break info.loudness.clone();
+            }
+        }
+    };
+    let LoudnessState::Ready { samples_id, values } = &state else {
+        panic!("{state:?}")
+    };
+    assert_eq!(*samples_id, sid);
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, json!({ "db": -6.0 }), 1)
+        .unwrap();
+    same_bits(values, &whole_loudness(&bytes, &g));
 }
