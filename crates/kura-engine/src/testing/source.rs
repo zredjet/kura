@@ -1,5 +1,6 @@
 //! テストの合成の源（M13 段 1）：チャンクを種と位置から決定的に作る音声の源。60 分・3 時間の音声を、全体を持たずに
-//! 遅延の値として作る（E41・`mem_smoke`）。作ったチャンクは LRU に置き、作った数を統計の `reads` で数える。
+//! 遅延の値として作る（E41・`mem_smoke`）。作ったチャンクは LRU に置き（ファイルの源と同じく流しの段を持つ）、作った数を
+//! 統計の `reads` で数える。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,10 +30,15 @@ impl SyntheticSource {
             channels,
             frames,
             seed,
-            lru: ChunkLru::new(lru_bytes),
+            lru: ChunkLru::for_channels(lru_bytes, channels),
             reads: AtomicU64::new(0),
             hits: AtomicU64::new(0),
         }
+    }
+
+    /// 作ったチャンクの LRU（テストと測るため）。
+    pub fn lru(&self) -> &ChunkLru {
+        &self.lru
     }
 
     /// 位置 `i` から `n` 個の標本（チャンネル `ch`）。
@@ -85,6 +91,7 @@ impl AudioSource for SyntheticSource {
             reads: self.reads.load(Ordering::Relaxed),
             hits: self.hits.load(Ordering::Relaxed),
             bytes_read: 0,
+            streamed: self.lru.streamed(),
         }
     }
 }

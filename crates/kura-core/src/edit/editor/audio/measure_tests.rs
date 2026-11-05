@@ -324,3 +324,54 @@ fn long_measure_redoes_a_window_canceled_midway() {
         .unwrap();
     same_bits(values, &whole_loudness(&bytes, &g));
 }
+
+/// 源の読みの数（遅延の入力の源）。
+fn source_stats(env: &Env, s: &str) -> kura_engine::audio::source::SourceStats {
+    env.editor(s)
+        .audio_counts()
+        .and_then(|c| c.source)
+        .expect("遅延の入力")
+}
+
+/// 段 7（F15 の申し送り 2）：裏の仕事（波形の段の作り直し・ラウドネスの計り）は出力の全体を流すが、源の LRU の主の段を
+/// 変えない（読み通し）。見えている区間を描いたあと裏の仕事を済ませても、次の全体に効く手（gain の引数）は区間を源から
+/// 読み直さない。裏の仕事の読みは LRU に入れなかった数（`streamed`）に出る。
+#[test]
+fn background_work_keeps_the_visible_chunks_in_the_source_lru() {
+    let env = Env::new();
+    // 8 kHz モノラル 131 チャンク（32.75 MiB）。源の LRU は 8 MiB（主の段 24 チャンク・流しの段 8 チャンク）
+    let frames = 130 * C + 5;
+    let bytes = noise_wav(8_000, 1, frames, 85);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let span = [(60 * C, 68 * C)];
+    let idle = vp(&span, false, false);
+    let s = env.open_with(id, idle.clone()).session.clone();
+    let out = env.step(&s, vec![add(0, "audio.gain", json!({ "db": -6.0 }))], &idle);
+    assert!(shown_audio(&out.view).peaks.pending, "波形の段は裏の仕事");
+    assert!(matches!(
+        measure(&env.env(), &s).unwrap(),
+        LoudnessState::Measuring { .. }
+    ));
+    let before = source_stats(&env, &s);
+    let work = Viewport::Audio(AudioViewport {
+        spans: span.to_vec(),
+        visible: Some(span[0]),
+        work: true,
+        ..AudioViewport::idle()
+    });
+    let (state, _) = work_until_measured(&env, &s, &work);
+    assert!(matches!(state, LoudnessState::Ready { .. }), "{state:?}");
+    let after_work = source_stats(&env, &s);
+    assert!(
+        after_work.streamed >= 131 - 8,
+        "裏の仕事は区間の外を読み通す: {before:?} → {after_work:?}"
+    );
+    // 次の全体に効く手：区間は LRU の主の段に残っているので、源から読まない
+    let out = env.step(&s, vec![set(1, json!({ "db": -7.0 }))], &idle);
+    assert!(!shown_audio(&out.view).valid.is_empty());
+    let after_step = source_stats(&env, &s);
+    assert_eq!(
+        after_step.reads, after_work.reads,
+        "裏の仕事のあとの手は区間を読み直さない: {after_work:?} → {after_step:?}"
+    );
+}

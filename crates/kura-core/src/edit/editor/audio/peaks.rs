@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use kura_engine::analysis::audio::peaks::{PEAK_BINS, Peaks, PeaksParams, PeaksPatch};
 use kura_engine::analysis::output::AnalysisOutput;
+use kura_engine::audio::source::read_through;
 use kura_engine::audio::stream::stream_windows;
 use kura_engine::monitor::Ticket;
 use kura_engine::render::estimate::{EstimateSpec, Source};
@@ -424,16 +425,19 @@ impl Editor {
                 return;
             };
             let (inputs, cache) = (&st.inputs, &mut st.cache);
+            // 流して読む読みは源の LRU に入れない（見えている区間のチャンクを追い出さない。段 7）
             let r = self.runtime.preview(|e| {
-                e.stream_audio(
-                    &plan,
-                    inputs,
-                    cache,
-                    output,
-                    Some(&spans),
-                    &mut run.patch.partial(),
-                    ticket,
-                )
+                read_through(|| {
+                    e.stream_audio(
+                        &plan,
+                        inputs,
+                        cache,
+                        output,
+                        Some(&spans),
+                        &mut run.patch.partial(),
+                        ticket,
+                    )
+                })
             });
             settle(st);
             if let Err(err) = r {

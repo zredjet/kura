@@ -29,6 +29,7 @@ use kura_engine::analysis::audio::loudness::{LoudnessAnalysis, LoudnessReport, U
 use kura_engine::analysis::output::json_from_canonical;
 use kura_engine::analysis::stream::AnalysisFan;
 use kura_engine::analysis::{Analysis, AnalysisRequest, Analyzed, NoParams, Reasoned};
+use kura_engine::audio::source::read_through;
 use kura_engine::audio::stream::{AudioSink, StreamEnd, StreamInfo};
 use kura_engine::monitor::Ticket;
 use kura_engine::render::cache::RenderOptions;
@@ -293,16 +294,19 @@ impl Editor {
                 meta: &mut run.meta,
                 fed: false,
             };
+            // 流して読む読みは源の LRU に入れない（見えている区間のチャンクを追い出さない。段 7）
             let r = self.runtime.preview(|e| {
-                e.stream_audio(
-                    &plan,
-                    inputs,
-                    cache,
-                    output,
-                    Some(&spans),
-                    &mut feed,
-                    ticket,
-                )
+                read_through(|| {
+                    e.stream_audio(
+                        &plan,
+                        inputs,
+                        cache,
+                        output,
+                        Some(&spans),
+                        &mut feed,
+                        ticket,
+                    )
+                })
             });
             if feed.fed {
                 run.next += 1;

@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use kura_engine::audio::source::{ReadMode, with_read_mode};
 use kura_engine::budget::{Class, Lease, MemoryBudget, default_total};
 use kura_engine::doc::InputId;
 use kura_engine::render::cache::{FingerprintedInput, NodeCache};
@@ -205,9 +206,11 @@ fn outside_the_pools(why: &str) {
     debug_assert!(rayon::current_thread_index().is_none(), "{why}");
 }
 
+/// プールに入って `f` を回す。音声の源の読み方は手の読み（`ReadMode::Keep`）から始める（ワーカーは待つ間にほかの呼び手の
+/// 仕事を拾うので、拾った前の仕事の読み通しを持ち込まない。読み通しは `f` の中で `read_through` で包む）。
 fn enter<R: Send>(pool: &ThreadPool, engine: &Engine, f: impl FnOnce(&Engine) -> R + Send) -> R {
     outside_the_pools("編集のプールには、プールの外から入ります");
-    pool.install(|| f(engine))
+    pool.install(|| with_read_mode(ReadMode::Keep, || f(engine)))
 }
 
 #[cfg(test)]

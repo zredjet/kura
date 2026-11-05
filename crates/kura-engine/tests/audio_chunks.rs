@@ -1038,3 +1038,157 @@ fn source_lru_stays_within_its_capacity() {
     assert!(!lazy.same_chunk(&base, 0, 0));
     assert!(MemorySource::new(Arc::new(base.keep_only(&ChunkSet::empty(5)))).is_err());
 }
+
+/// 読みを数える安い源（チャンク `k` のチャンネル `ch` は `k + ch / 10` の定数。LRU はファイルの源と同じ `for_channels`）。
+struct CheapSource {
+    channels: usize,
+    frames: u64,
+    lru: ChunkLru,
+    loads: std::sync::atomic::AtomicU64,
+}
+
+impl AudioSource for CheapSource {
+    fn rate(&self) -> u32 {
+        8_000
+    }
+    fn channels(&self) -> usize {
+        self.channels
+    }
+    fn frames(&self) -> u64 {
+        self.frames
+    }
+    fn read_chunk(&self, index: u32) -> Result<Vec<Arc<Vec<f32>>>, EngineError> {
+        let (planes, _) = self.lru.get_or_load(index, || {
+            self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (a, b) = kura_engine::audio::source::chunk_span(self.frames, index).unwrap();
+            Ok((0..self.channels)
+                .map(|ch| Arc::new(vec![index as f32 + ch as f32 / 10.0; (b - a) as usize]))
+                .collect())
+        })?;
+        Ok(planes)
+    }
+    fn resident_bytes(&self) -> u64 {
+        self.lru.capacity()
+    }
+}
+
+/// 流れの窓を集める受け手。
+struct Collect(Vec<Vec<f32>>);
+
+impl kura_engine::audio::stream::AudioSink for Collect {
+    fn begin(&mut self, info: &kura_engine::audio::stream::StreamInfo) -> Result<(), EngineError> {
+        self.0 = vec![Vec::new(); info.channels];
+        Ok(())
+    }
+    fn feed(
+        &mut self,
+        _start: u64,
+        planes: &[&[f32]],
+        _: &dyn kura_engine::Monitor,
+    ) -> Result<(), EngineError> {
+        for (o, p) in self.0.iter_mut().zip(planes) {
+            o.extend_from_slice(p);
+        }
+        Ok(())
+    }
+    fn finish(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
+/// M13 段 7：流して読む読み（`read_through`）は源の LRU の主の段を変えない。手の読みで入れた見えている区間のチャンクは、
+/// 計画の出力（gain）を全体に流したあとも同じ順で残り（核の読みは `par_blocks` の仕事のスレッドで、読み方を引き継ぐ）、
+/// どのチャンクも 1 回だけ読む（チャンネルごとの読みを流しの段がまとめる）。流した標本は手の読みで流したものとビット単位で
+/// 同じ。手の読みで流すと、見えている区間は追い出される（直す前の形）。
+#[test]
+fn read_through_streams_leave_the_kept_chunks_alone() {
+    use kura_engine::audio::source::{ReadMode, read_mode};
+    use kura_engine::doc::{Graph, InputId, OutputId};
+    use kura_engine::render::Engine;
+    use kura_engine::render::cache::{Fingerprint, FingerprintedInput, NodeCache};
+
+    let (channels, chunks) = (2usize, 65u64);
+    let frames = (chunks - 1) * C as u64 + 123;
+    let one = channels as u64 * C as u64 * 4;
+    // 流しの段は 18 チャンク（窓 16 ＋ 2）、主の段は 54 チャンク（全体の 65 より小さい）
+    let cap = 72 * one;
+    let engine = Engine::new().unwrap();
+    let mut g = Graph::new_single();
+    g.push_linear("audio.gain", 1, serde_json::json!({ "db": -3.0 }), 1)
+        .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build()
+        .unwrap();
+    let run = |mode: ReadMode| {
+        let src = Arc::new(CheapSource {
+            channels,
+            frames,
+            lru: ChunkLru::for_channels(cap, channels),
+            loads: Default::default(),
+        });
+        assert_eq!(src.lru.stream_capacity(), 18 * one);
+        let a = Audio::from_source(src.clone(), AudioMeta::default()).unwrap();
+        // 手の読み：見えている区間（チャンク 2..6）
+        for k in 2..6 {
+            for ch in 0..channels {
+                a.chunk_data(ch, k).unwrap();
+            }
+        }
+        let kept = src.lru.kept();
+        assert_eq!(kept, vec![2, 3, 4, 5]);
+        let input = Value::Audio(Arc::new(a));
+        let plan = engine
+            .compile(
+                &g,
+                &std::collections::BTreeMap::from([(InputId(0), input.shape())]),
+            )
+            .unwrap();
+        let inputs = std::collections::BTreeMap::from([(
+            InputId(0),
+            FingerprintedInput {
+                value: input,
+                source: kura_engine::Digest([1; 32]),
+                fingerprint: Fingerprint(kura_engine::Digest([2; 32])),
+            },
+        )]);
+        let mut cache = NodeCache::new(0);
+        let mut sink = Collect(Vec::new());
+        let stats = pool.install(|| {
+            kura_engine::audio::source::with_read_mode(mode, || {
+                engine.stream_audio(
+                    &plan,
+                    &inputs,
+                    &mut cache,
+                    OutputId(0),
+                    None,
+                    &mut sink,
+                    &NoMonitor,
+                )
+            })
+        });
+        assert!(stats.unwrap().windows >= 5);
+        assert_eq!(read_mode(), ReadMode::Keep);
+        assert!(src.lru.resident() <= cap);
+        (src, kept, sink.0)
+    };
+    let (src, kept, through) = run(ReadMode::Through);
+    assert_eq!(src.lru.kept(), kept, "主の段の中身も順も同じ");
+    assert_eq!(
+        src.loads.load(std::sync::atomic::Ordering::SeqCst),
+        chunks,
+        "どのチャンクも 1 回だけ読む"
+    );
+    assert_eq!(src.lru.streamed(), chunks - 4);
+    let (src, _, keep) = run(ReadMode::Keep);
+    assert!(
+        !src.lru.kept().contains(&2),
+        "手の読みで流すと見えている区間を追い出す"
+    );
+    assert_eq!(src.lru.streamed(), 0);
+    assert_eq!(through.len(), channels);
+    assert_eq!(through[0].len() as u64, frames);
+    for (x, y) in through.iter().zip(&keep) {
+        assert!(x.iter().zip(y).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+}

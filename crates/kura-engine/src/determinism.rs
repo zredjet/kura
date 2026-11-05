@@ -81,7 +81,8 @@ pub fn rng_at(seed: u64, stream: u64, word: u128) -> ChaCha8Rng {
 }
 
 /// `0..count` の各ブロックを並列に計算し、添字の順に並べて返す。
-/// ブロックの前で中止を確かめる。結果の順はスレッド数によらない。
+/// ブロックの前で中止を確かめる。結果の順はスレッド数によらない。呼んだスレッドの音声の源の読み方
+/// （`audio::source::read_mode`。値に効かない）を各ブロックに引き継ぐ。
 pub fn par_blocks<T, F>(count: usize, mon: &dyn Monitor, f: F) -> Result<Vec<T>, EngineError>
 where
     T: Send,
@@ -90,12 +91,15 @@ where
     // 並列の口はここだけ（clippy.toml で、ほかの場所の into_par_iter などを禁じている）
     #[allow(clippy::disallowed_methods)]
     let blocks = (0..count).into_par_iter();
+    // 音声の源の読み方（読み通しか。値に効かない）を、呼んだスレッドから仕事へ引き継ぐ（ほかのスレッドで動く仕事も、
+    // 待つ間にほかの呼び手の仕事を拾ったスレッドも、その仕事の読み方で読む）
+    let mode = crate::audio::source::read_mode();
     blocks
         .map(|i| {
             if mon.canceled() {
                 Err(EngineError::Canceled)
             } else {
-                f(i)
+                crate::audio::source::with_read_mode(mode, || f(i))
             }
         })
         .collect()
@@ -130,6 +134,32 @@ mod tests {
     use super::*;
     use crate::monitor::{CancelFlag, NoMonitor};
     use rand_chacha::rand_core::Rng;
+
+    /// 音声の源の読み方（`audio::source::read_mode`）は、`par_blocks` のどの仕事（入れ子を含む）にも呼んだスレッドのものが
+    /// 引き継がれ、終わったら戻る（M13 段 7）。
+    #[test]
+    fn par_blocks_carry_the_read_mode() {
+        use crate::audio::source::{ReadMode, read_mode, read_through};
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let all = |want: ReadMode| {
+                par_blocks(256, &NoMonitor, |_| {
+                    let inner = par_blocks(4, &NoMonitor, |_| Ok(read_mode()))?;
+                    Ok(inner.into_iter().all(|m| m == want) && read_mode() == want)
+                })
+                .unwrap()
+                .into_iter()
+                .all(|ok| ok)
+            };
+            assert!(all(ReadMode::Keep));
+            assert!(read_through(|| all(ReadMode::Through)));
+            assert!(all(ReadMode::Keep));
+            assert_eq!(read_mode(), ReadMode::Keep);
+        });
+    }
 
     #[test]
     fn mixers_match_kura_core() {
