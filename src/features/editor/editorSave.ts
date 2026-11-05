@@ -287,6 +287,8 @@ async function offerFormats(
   if (editorSession() !== session || useEditorStore.getState().phase !== 'open') return false;
   const shown = useEditorStore.getState().sheet;
   useEditorStore.setState({
+    // 出力の行も今の一覧で押せる形式を出す
+    writableFormats: list.formats,
     sheet: {
       kind: 'format',
       mode,

@@ -1,6 +1,6 @@
 import { isTauri } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../../i18n/ja';
@@ -25,6 +25,7 @@ import { type JobDto, listJobs } from '../../ipc/jobs';
 import { IpcError } from '../../ipc/result';
 import { invalidateItems } from '../../stores/itemCache';
 import { useNoticeStore } from '../../stores/noticeStore';
+import { useSettingsStore } from '../../stores/settingsStore';
 import { AUDIO_FORMATS } from './audio/audioFormats';
 import {
   answerUnsaved,
@@ -47,6 +48,7 @@ import { openEditor } from './editorKinds';
 import { EditorSheets } from './EditorSheets';
 import { closeEditor, openEditorAs, pushEditorSteps, useEditorStore } from './editorStore';
 import { IMAGE_EDITOR } from './image/imageKind';
+import { FormatOutputRow } from './OpsPanel';
 import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
 
 vi.mock('@tauri-apps/api/core', async (importOriginal) => ({
@@ -855,6 +857,87 @@ describe('書けない形式（FormatUnavailable）', () => {
       code: 'FormatUnavailable',
     });
     expect(screen.getByRole('alert')).toHaveTextContent(t.saveFailures.FormatUnavailable ?? '');
+  });
+});
+
+describe('出力の形式の行：この環境で書けない形式（M13 段 7）', () => {
+  afterEach(() => {
+    useSettingsStore.setState({ open: false });
+  });
+
+  const mp3Option = (name: string) =>
+    within(screen.getByRole('combobox', { name: t.output })).getByRole('option', { name });
+
+  it('開いたときに edit_formats を読み、MP3 を書けなければ行の MP3 は押せず、今の形式が MP3 なら一言を出す', async () => {
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS,
+      current: 'mp3',
+      fallback: 'ogg',
+    });
+    await openAudioDirty({ ext: 'mp3' });
+    expect(listEditFormats).toHaveBeenCalledWith('aa01');
+    render(<FormatOutputRow />);
+    expect(mp3Option(t.outputOptionUnavailable('MP3', t.needsFfmpeg))).toBeDisabled();
+    expect(mp3Option(t.outputKeepUnavailable('MP3', t.needsFfmpeg))).toBeDisabled();
+    expect(mp3Option('WAV')).toBeEnabled();
+    expect(screen.getByText(t.formatUnavailableBody('MP3'))).toBeInTheDocument();
+  });
+
+  it('読めなければ今どおり形式の表だけ（MP3 も押せ、一言はない）', async () => {
+    vi.mocked(listEditFormats).mockRejectedValueOnce(
+      new IpcError({ code: 'NotFound', message: 'x' }),
+    );
+    await openAudioDirty({ ext: 'mp3' });
+    expect(listEditFormats).toHaveBeenCalledTimes(1);
+    expect(useEditorStore.getState().writableFormats).toBeNull();
+    render(<FormatOutputRow />);
+    expect(mp3Option('MP3')).toBeEnabled();
+    expect(mp3Option(t.outputKeep('MP3'))).toBeEnabled();
+    expect(screen.queryByText(t.formatUnavailableBody('MP3'))).toBeNull();
+  });
+
+  it('設定のシートを閉じたら読み直す（外部ツールの場所を変えたあと）', async () => {
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS,
+      current: 'mp3',
+      fallback: 'ogg',
+    });
+    await openAudioDirty({ ext: 'mp3' });
+    render(<FormatOutputRow />);
+    expect(mp3Option(t.outputOptionUnavailable('MP3', t.needsFfmpeg))).toBeDisabled();
+    // 設定のシートで ffmpeg を指定した
+    vi.mocked(listEditFormats).mockResolvedValue({
+      formats: AUDIO_ROWS.map((r) =>
+        r.format === 'mp3' ? { ...r, available: true, missingTool: null } : r,
+      ),
+      current: 'mp3',
+      fallback: null,
+    });
+    act(() => useSettingsStore.getState().show('downloads'));
+    await flush();
+    expect(listEditFormats).toHaveBeenCalledTimes(1);
+    act(() => useSettingsStore.getState().close());
+    await flush();
+    expect(listEditFormats).toHaveBeenCalledTimes(2);
+    expect(mp3Option('MP3')).toBeEnabled();
+    expect(screen.queryByText(t.formatUnavailableBody('MP3'))).toBeNull();
+  });
+
+  it('閉じたあと・開き直したあとに届いた一覧は使わない', async () => {
+    let answer: (v: Awaited<ReturnType<typeof listEditFormats>>) => void = () => undefined;
+    vi.mocked(listEditFormats).mockImplementationOnce(
+      () => new Promise((resolve) => (answer = resolve)),
+    );
+    await openAudioDirty({ ext: 'mp3' });
+    await act(() => closeEditor());
+    answer({ formats: AUDIO_ROWS, current: 'mp3', fallback: 'ogg' });
+    await flush();
+    expect(useEditorStore.getState().writableFormats).toBeNull();
+    // 閉じている間に設定のシートを閉じても読まない
+    act(() => useSettingsStore.getState().show());
+    act(() => useSettingsStore.getState().close());
+    await flush();
+    expect(listEditFormats).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -21,7 +21,7 @@ import {
   setOutputFormat,
   useEditorStore,
 } from './editorStore';
-import { outputChoice } from './formats';
+import { formatUnavailableText, outputChoice, unavailableNote, unavailableRow } from './formats';
 import { formatsFor } from './kindTraits';
 import {
   addableOps,
@@ -261,11 +261,15 @@ function Warnings() {
 
 /**
  * 出力の形式（アイテムの種類の形式の表から組む。形式が変わると「書き出すときの名前：hero.webp」）。種類ごとに別の行に
- * するときは `OpsPanel` の `output` で差し替える。
+ * するときは `OpsPanel` の `output` で差し替える。この環境で書けない形式（開いたときに読む `edit_formats`。ffmpeg の
+ * ない MP3 など）は押せず「ffmpeg が要ります」「この環境では書けません」を添え、今の出力の形式が書けなければ形式を選ぶ
+ * シートと同じ理由の文を出す。一覧を読めていなければ形式の表だけ（M13 段 7）。
  */
 export function FormatOutputRow() {
   const outputs = useEditorStore((s) => s.doc.outputs);
   const item = useEditorStore((s) => s.item);
+  const kind = useEditorStore((s) => s.kind);
+  const rows = useEditorStore((s) => s.writableFormats);
   // 元のファイルの形式（Rust の originalFormat。今の拡張子ではない。source.format は画素の形式で、ファイルの形式ではない）
   const sourceFormat = useEditorStore(originalFormatOf);
   const open = useEditorStore((s) => s.phase === 'open');
@@ -290,10 +294,33 @@ export function FormatOutputRow() {
   const choice = outputChoice(outputs);
   const eff = formats.effectiveFormat(choice, sourceFormat);
   const keepable = formats.canWrite(sourceFormat);
+  const keepRow = unavailableRow(rows, sourceFormat);
+  const keepName = formatName(sourceFormat);
   const options = [
-    ...(keepable ? [{ value: 'keep', label: t.outputKeep(formatName(sourceFormat)) }] : []),
-    ...formats.writable.map((f) => ({ value: f, label: formatName(f) })),
+    ...(keepable
+      ? [
+          keepRow
+            ? {
+                value: 'keep',
+                label: t.outputKeepUnavailable(keepName, unavailableNote(keepRow)),
+                disabled: true,
+              }
+            : { value: 'keep', label: t.outputKeep(keepName) },
+        ]
+      : []),
+    ...formats.writable.map((f) => {
+      const row = unavailableRow(rows, f);
+      return row
+        ? {
+            value: f,
+            label: t.outputOptionUnavailable(formatName(f), unavailableNote(row)),
+            disabled: true,
+          }
+        : { value: f, label: formatName(f) };
+    }),
   ];
+  // 今の出力の形式が書けない（保存すると形式を選ぶシートが出る）
+  const effRow = unavailableRow(rows, eff.format);
   const value = choice.type === 'to' ? choice.format : keepable ? 'keep' : formats.fallback;
   const original = originalName?.id === item.id ? originalName.name : null;
   // 保存したあとの拡張子は今の拡張子から（形式が今と同じなら今の拡張子のまま）
@@ -320,6 +347,9 @@ export function FormatOutputRow() {
         <p className={styles.note}>
           {t.outputUnwritable(formatName(sourceFormat), formatName(eff.format))}
         </p>
+      )}
+      {effRow && (
+        <p className={styles.note}>{formatUnavailableText(formatName(eff.format), effRow, kind)}</p>
       )}
       {name && original && name !== original && <p className={styles.note}>{t.exportName(name)}</p>}
     </section>

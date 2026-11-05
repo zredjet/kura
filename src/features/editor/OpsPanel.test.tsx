@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { useMenuStore } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
-import type { EditNodeDto, OutputSpec } from '../../ipc/edit';
+import type { EditNodeDto, EditWritableFormatDto, OutputSpec } from '../../ipc/edit';
 import type { ItemSummaryDto } from '../../ipc/items';
 import {
   addOp,
@@ -84,7 +84,13 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  useEditorStore.setState({ phase: 'closed', selected: null, item: null, originalFormat: null });
+  useEditorStore.setState({
+    phase: 'closed',
+    selected: null,
+    item: null,
+    originalFormat: null,
+    writableFormats: null,
+  });
   useMenuStore.setState({ menu: null });
 });
 
@@ -424,5 +430,120 @@ describe('出力の形式', () => {
     expect(again).toHaveValue('png');
     expect(within(again).queryByText(t.outputKeep('PNG'))).toBeNull();
     expect(screen.getByText(t.outputUnwritable('HEIC', 'PNG'))).toBeInTheDocument();
+  });
+});
+
+describe('出力の形式：この環境で書けない形式（edit_formats）', () => {
+  /** 形式の表の行（Rust の `EditWritableFormatDto`）。 */
+  function formatRow(
+    format: string,
+    available: boolean,
+    missingTool: string | null = null,
+  ): EditWritableFormatDto {
+    return {
+      format,
+      ext: format,
+      available,
+      missingTool,
+      lossless: false,
+      loopPoints: false,
+      markers: false,
+      highBitDepth: false,
+    };
+  }
+
+  /** ffmpeg のない組の音声（MP3 だけ書けない）。 */
+  const NO_FFMPEG = ['wav', 'aiff', 'flac', 'ogg', 'm4a', 'aac', 'opus']
+    .map((f) => formatRow(f, f !== 'aac' && f !== 'opus'))
+    .concat(formatRow('mp3', false, 'ffmpeg'));
+
+  const outputTo = (format: string) =>
+    [
+      {
+        id: 0,
+        from: { from: 'input', id: 0 },
+        format: { type: 'to', format },
+        expand: { type: 'one' },
+      },
+    ] as unknown as OutputSpec[];
+
+  /** MP3 のアイテム（元も MP3）を開いている。 */
+  function setMp3(writableFormats: EditWritableFormatDto[] | null, outputs = OUTPUT_KEEP) {
+    setDoc([], null, outputs);
+    useEditorStore.setState({
+      kind: 'audio',
+      item: { id: 7, title: 'loop', ext: 'mp3', kind: 'audio' } as ItemSummaryDto,
+      source: { kind: 'audio', width: 0, height: 0, frames: null, format: null, audio: null },
+      originalFormat: 'mp3',
+      writableFormats,
+    });
+  }
+
+  it('MP3 を書けなければ、行の MP3 と「元と同じ（MP3）」は押せず（ffmpeg が要ります）、今の形式が MP3 なので一言を出す', () => {
+    setMp3(NO_FFMPEG);
+    render(<OpsPanel />);
+    const select = screen.getByRole('combobox', { name: t.output });
+    expect(select).toHaveValue('keep');
+    expect(
+      within(select).getByRole('option', { name: t.outputOptionUnavailable('MP3', t.needsFfmpeg) }),
+    ).toBeDisabled();
+    expect(
+      within(select).getByRole('option', { name: t.outputKeepUnavailable('MP3', t.needsFfmpeg) }),
+    ).toBeDisabled();
+    for (const name of ['WAV', 'AIFF', 'FLAC', 'Ogg Vorbis', 'M4A']) {
+      expect(within(select).getByRole('option', { name })).toBeEnabled();
+    }
+    // 形式を選ぶシートの本文と同じ文
+    expect(screen.getByText(t.formatUnavailableBody('MP3'))).toBeInTheDocument();
+  });
+
+  it('今の形式が書ければ一言は出さない（書けない MP3 は押せないまま）', () => {
+    setMp3(NO_FFMPEG, outputTo('wav'));
+    render(<OpsPanel />);
+    const select = screen.getByRole('combobox', { name: t.output });
+    expect(select).toHaveValue('wav');
+    expect(
+      within(select).getByRole('option', { name: t.outputOptionUnavailable('MP3', t.needsFfmpeg) }),
+    ).toBeDisabled();
+    expect(screen.queryByText(t.formatUnavailableBody('MP3'))).toBeNull();
+  });
+
+  it('道具はあるが今の出力の形を書けない（96 kHz の MP3 など）なら、「この環境では書けません」と形の一言', () => {
+    setMp3(NO_FFMPEG.map((r) => (r.format === 'mp3' ? { ...r, missingTool: null } : r)));
+    render(<OpsPanel />);
+    const select = screen.getByRole('combobox', { name: t.output });
+    expect(
+      within(select).getByRole('option', {
+        name: t.outputOptionUnavailable('MP3', t.formatNotWritable),
+      }),
+    ).toBeDisabled();
+    expect(screen.getByText(t.formatUnavailableBodyShape('MP3'))).toBeInTheDocument();
+  });
+
+  it('読めなければ（null）今どおり形式の表だけ（どれも押せ、一言はない）', () => {
+    setMp3(null);
+    render(<OpsPanel />);
+    const select = screen.getByRole('combobox', { name: t.output });
+    expect(within(select).getByRole('option', { name: 'MP3' })).toBeEnabled();
+    expect(within(select).getByRole('option', { name: t.outputKeep('MP3') })).toBeEnabled();
+    expect(screen.queryByText(t.formatUnavailableBody('MP3'))).toBeNull();
+  });
+
+  it('画像も同じ：書けない WebP は「この環境では書けません」、今の形式なら一言', () => {
+    setDoc([], null, outputTo('webp'));
+    useEditorStore.setState({
+      writableFormats: ['png', 'jpeg', 'gif', 'heic']
+        .map((f) => formatRow(f, f !== 'heic'))
+        .concat(formatRow('webp', false)),
+    });
+    render(<OpsPanel />);
+    const select = screen.getByRole('combobox', { name: t.output });
+    expect(
+      within(select).getByRole('option', {
+        name: t.outputOptionUnavailable('WebP', t.formatNotWritable),
+      }),
+    ).toBeDisabled();
+    expect(within(select).getByRole('option', { name: 'PNG' })).toBeEnabled();
+    expect(screen.getByText(t.formatUnavailableBodyOther('WebP'))).toBeInTheDocument();
   });
 });

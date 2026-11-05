@@ -1019,6 +1019,9 @@ export const ja = {
     } as Record<string, string>,
     output: '出力の形式',
     outputKeep: (format: string) => `元と同じ（${format}）`,
+    /** この環境で書けない形式の選択肢（押せない。`note` は「ffmpeg が要ります」「この環境では書けません」）。 */
+    outputOptionUnavailable: (format: string, note: string) => `${format}（${note}）`,
+    outputKeepUnavailable: (format: string, note: string) => `元と同じ（${format}・${note}）`,
     outputUnwritable: (from: string, to: string) => `${from} には書けないので、${to} で保存します`,
     exportName: (name: string) => `書き出すときの名前：${name}`,
     /** 形式の名前（エンジンの形式の ID）。 */

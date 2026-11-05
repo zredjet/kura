@@ -6,9 +6,13 @@
  *   引くのは `kindTraits.ts` の `formatsFor`。
  * - 書き出しの名前は Rust の `kura_core::export::names::export_name` と同じ規則（形式が同じなら元の名前のまま、違えば
  *   元の名前の語幹に今の拡張子）。出力の行の「書き出すときの名前：hero.webp」に使う。
+ * - この環境で書けるかは Rust の `edit_formats` の行（`EditWritableFormatDto`）で決める。書けない形式に添える言葉と理由の
+ *   文は、形式を選ぶシートと右パネルの出力の行で共有する（M13 段 7）。
  */
 
-import type { FormatChoice, OutputSpec } from '../../ipc/edit';
+import { ja } from '../../i18n/ja';
+import type { EditWritableFormatDto, FormatChoice, OutputSpec } from '../../ipc/edit';
+import type { EditorKind } from './kindTraits';
 
 /** 種類ごとの形式の表（エンジンの形式の表の行を写す）。 */
 export interface FormatTableDef {
@@ -109,4 +113,39 @@ export function formatTable(def: FormatTableDef): FormatTable {
     effectiveFormat,
     savedExt,
   };
+}
+
+/**
+ * この環境で書けない形式なら、その Rust の行（`edit_formats`）。書けるか、一覧を読めていない・一覧にない形式なら null
+ * （形式の表だけで決める）。
+ */
+export function unavailableRow(
+  rows: readonly EditWritableFormatDto[] | null,
+  format: string | null | undefined,
+): EditWritableFormatDto | null {
+  const row = format ? rows?.find((r) => r.format === format) : undefined;
+  return row && !row.available ? row : null;
+}
+
+/** 書けない形式に添える言葉：書く道具がない（`missingTool`）なら「ffmpeg が要ります」、ほかは「この環境では書けません」。 */
+export function unavailableNote(row: EditWritableFormatDto): string {
+  return row.missingTool ? ja.editor.needsFfmpeg : ja.editor.formatNotWritable;
+}
+
+/**
+ * 書けない理由の文（形式を選ぶシートの本文と、右パネルの出力の行の一言）：道具がない（Rust の `missingTool`。今は MP3 の
+ * ffmpeg だけ）なら ffmpeg の案内、音声で道具はあるなら出力の形（サンプルレート・チャンネル数など）が理由、ほかは「この
+ * 環境では … に書けません」。形式の表（`needsFfmpeg`）では決めない（ffmpeg があっても 96 kHz の MP3 は書けない）。`name`
+ * は形式の名前（分からなければ null）、`row` はその形式の Rust の行。
+ */
+export function formatUnavailableText(
+  name: string | null,
+  row: EditWritableFormatDto | null | undefined,
+  kind: EditorKind | null,
+): string {
+  const t = ja.editor;
+  if (name === null) return t.formatUnavailableBodyAny;
+  if (row?.missingTool) return t.formatUnavailableBody(name);
+  if (kind === 'audio' && row && !row.available) return t.formatUnavailableBodyShape(name);
+  return t.formatUnavailableBodyOther(name);
 }

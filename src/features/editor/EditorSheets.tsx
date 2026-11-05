@@ -31,7 +31,7 @@ import {
   useEditorStore,
 } from './editorStore';
 import styles from './Editor.module.css';
-import { outputChoice } from './formats';
+import { formatUnavailableText, outputChoice, unavailableNote } from './formats';
 import { type EditorKind, formatsFor } from './kindTraits';
 import { opName } from './opsCatalog';
 import { issueText } from './ParamFields';
@@ -340,21 +340,15 @@ function FailedSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'saveFaile
   );
 }
 
-/**
- * 書けなかった理由の文：道具がない（Rust の `missingTool`。今は MP3 の ffmpeg だけ）なら ffmpeg の案内、音声で道具はあるなら
- * 出力の形（サンプルレート・チャンネル数など）が理由、ほかは「この環境では書けません」。形式の表（`needsFfmpeg`）では決めない
- * （ffmpeg があっても 96 kHz の MP3 は書けない）。
- */
+/** 書けなかった理由の文（右パネルの出力の行の一言と同じ。`formatUnavailableText`）。 */
 function formatUnavailableBody(
   sheet: Extract<EditorSheet, { kind: 'format' }>,
   kind: EditorKind | null,
 ): string {
-  if (!sheet.unavailable) return t.formatUnavailableBodyAny;
-  const name = formatName(sheet.unavailable);
-  const row = sheet.formats.find((r) => r.format === sheet.unavailable);
-  if (row?.missingTool) return t.formatUnavailableBody(name);
-  if (kind === 'audio' && row && !row.available) return t.formatUnavailableBodyShape(name);
-  return t.formatUnavailableBodyOther(name);
+  const format = sheet.unavailable;
+  if (!format) return formatUnavailableText(null, null, kind);
+  const row = sheet.formats.find((r) => r.format === format);
+  return formatUnavailableText(formatName(format), row, kind);
 }
 
 /**
@@ -400,9 +394,7 @@ function FormatSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'format' }
             {!c.available && (
               <>
                 {' '}
-                <span className={styles.formatChoiceNote}>
-                  {c.missingTool ? t.needsFfmpeg : t.formatNotWritable}
-                </span>
+                <span className={styles.formatChoiceNote}>{unavailableNote(c)}</span>
               </>
             )}
           </label>

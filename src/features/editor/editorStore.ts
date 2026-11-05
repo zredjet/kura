@@ -37,6 +37,7 @@ import {
   type EditWritableFormatDto,
   type FormatChoice,
   type Issue,
+  listEditFormats,
   type OpDescriptor,
   openEdit,
   type OutputSpec,
@@ -47,6 +48,7 @@ import type { ItemSummaryDto } from '../../ipc/items';
 import type { JobProgress } from '../../ipc/jobs';
 import { IpcError } from '../../ipc/result';
 import { notify } from '../../stores/noticeStore';
+import { useSettingsStore } from '../../stores/settingsStore';
 import { outputChoice } from './formats';
 import { type EditorKind, formatsFor } from './kindTraits';
 import { defaultParams, opSpec, type ParamValues } from './opsCatalog';
@@ -163,6 +165,11 @@ export interface EditorState {
   pendingSteps: boolean;
   /** 結果が確定した手の番号（断られた・失敗した・仮でない結果が届いた。引数の欄が手元の値をやめる）。 */
   acked: number;
+  /**
+   * この環境で書けるか（Rust の `edit_formats` の行。開いたとき・設定のシートを閉じたとき・形式を選ぶシートを出すときに
+   * 読む）。読めていなければ null で、出力の行は形式の表だけで組む。
+   */
+  writableFormats: EditWritableFormatDto[] | null;
 }
 
 const EMPTY_DOC: EditorDoc = { order: [], nodes: {}, outputs: [] };
@@ -188,6 +195,7 @@ function closedState(panel: EditorPanel, openId: number): EditorState {
     issues: [],
     pendingSteps: false,
     acked: 0,
+    writableFormats: null,
   };
 }
 
@@ -381,6 +389,28 @@ let pendingCancel: Promise<void> | null = null;
 /** 最後に開いた種類の口（開き直すときに使う）。 */
 let lastFactory: EditorAdapterFactory | null = null;
 
+/**
+ * この環境で書けるか（`edit_formats`）を読む（届いたときにそのエディタが今のものなら置く。読めなければ今の値のまま：
+ * 開いたときは null で、出力の行は形式の表だけ）。開く・閉じるの流れを止めないよう、誤りはここで飲む。
+ */
+async function readWritableFormats(rt: Runtime): Promise<void> {
+  const session = rt.session;
+  if (!session) return;
+  try {
+    const list = await listEditFormats(session);
+    if (runtime === rt) useEditorStore.setState({ writableFormats: list.formats });
+  } catch {
+    // 読めない：形式の表だけで組む（保存のときに断られたら、形式を選ぶシートが読み直す）
+  }
+}
+
+// 設定のシート（外部ツールの場所）を閉じたら、開いているエディタの書ける形式を読み直す（ffmpeg を指定した・外したあと）
+useSettingsStore.subscribe((now, before) => {
+  if (before.open && !now.open && runtime && useEditorStore.getState().phase === 'open') {
+    void readWritableFormats(runtime);
+  }
+});
+
 function activeElement(): HTMLElement | null {
   return typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
     ? document.activeElement
@@ -530,6 +560,8 @@ export async function openEditorAs<Tag>(
     applyResult(rt, opened.result, 0, viewport, false, null);
     // 開いたあとの実際の大きさ・倍率で頼み直す（見積もりと同じなら送らない）
     rt.queue.view(adapter.viewport());
+    // この環境で書ける形式（右パネルの出力の行が、書けない形式を押せなくする）
+    void readWritableFormats(rt);
   } catch (error) {
     // 閉じた・替えたあとの失敗（開く途中の中止で返った Conflict を含む）は出さない
     if (runtime !== rt) return;
