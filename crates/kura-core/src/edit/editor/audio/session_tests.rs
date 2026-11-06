@@ -247,6 +247,28 @@ pub(super) fn set(node: u32, params: serde_json::Value) -> Step {
     }
 }
 
+/// 段 7 の検証の直し（短い音声の読み直し）：源の LRU の上限が全体の値で頭打ちになる短い WAV（4 チャンク以上）は、全チャンクが
+/// 主の段に入る。全体に効く手は 2 手目から源を読まない（読むのは最初の 1 回だけ）。
+#[test]
+fn short_wav_reads_the_source_only_once() {
+    let env = Env::new();
+    for frames in [4 * C, 6 * C + 17] {
+        let bytes = noise_wav(8_000, 2, frames, frames);
+        let id = add_audio(&env.lib, &bytes, "wav");
+        let s = env.open(id).session.clone();
+        let editor = env.editor(&s);
+        let reads = || editor.audio_counts().unwrap().source.unwrap().reads;
+        let idle = Viewport::audio_idle();
+        env.step(&s, vec![add(0, "audio.gain", json!({ "db": -3.0 }))], &idle);
+        let first = reads();
+        assert_eq!(first, frames.div_ceil(C), "どのチャンクも 1 回だけ読む");
+        for db in [-4.0, -5.0, -6.0] {
+            env.step(&s, vec![set(1, json!({ "db": db }))], &idle);
+            assert_eq!(reads(), first, "2 手目から源を読まない（{db} dB）");
+        }
+    }
+}
+
 /// A1：WAV は遅延の源で開く（入力は中身を持たない）。元の形の要約・デコーダ。開くと試聴の置き場が空になる。FLAC は丸ごと読む。
 #[test]
 fn wav_opens_lazily_and_flac_whole() {

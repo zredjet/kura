@@ -13,6 +13,8 @@
 //!   区間のチャンクを LRU から追い出さない。流しの段は窓の中の同じチャンクの読み（チャンネルごと・隣のチャンクの核）を
 //!   1 回にまとめる。読み方は読むスレッドの印で、`determinism::par_blocks` が仕事に引き継ぐ。値には効かない（どちらも
 //!   同じ中身を返す）。
+//! - 上限に音声の全体が収まる源は段を分けない（[`ChunkLru::for_source`]）：どのチャンクも読み方によらず LRU に入り、何も
+//!   追い出さないので、2 回目からは読まない（段 7 の検証の直し）。
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,14 +103,22 @@ pub fn read_through<R>(f: impl FnOnce() -> R) -> R {
 /// 流しの段に置けるチャンクの数（流れの窓 `STREAM_CHUNKS` ＋ 両隣の 1 チャンクずつ）。
 pub const STREAM_TIER_CHUNKS: u64 = crate::audio::stream::STREAM_CHUNKS as u64 + 2;
 
+/// 手の読みが一度に読むチャンクの数の上限（エディタの表示の区間。kura-core の `MAX_VIEW_CHUNKS`）。上限にこの分が収まる LRU は、
+/// 主の段にも収める（[`stream_tier_bytes`]）。手のたびに区間を読み直さないため。
+pub const KEPT_VIEW_CHUNKS: u64 = 48;
+
 /// 上限 `cap` の LRU に `channels` チャンネルのチャンクを置くときの流しの段の上限（`cap` の内）：
-/// min(`cap` / 4, [`STREAM_TIER_CHUNKS`] × チャンネル × 256 KiB)。チャンク 1 つ（全チャンネル）も置けなければ 0（流しの段を
-/// 持たない。読み通しは LRU に入れずに読むだけ）。
+/// min(`cap` / 4, [`STREAM_TIER_CHUNKS`] × チャンネル × 256 KiB) を、[`KEPT_VIEW_CHUNKS`] が `cap` に収まるなら主の段に収まる
+/// 大きさ（`cap` − その分）で頭打ちにしたもの。チャンク 1 つ（全チャンネル）も置けなければ 0（流しの段を持たない。読み通しは
+/// LRU に入れずに読むだけ）。
 pub fn stream_tier_bytes(cap: u64, channels: usize) -> u64 {
     let one = (AUDIO_CHUNK as u64)
         .saturating_mul(4)
         .saturating_mul(channels.max(1) as u64);
-    let tier = (cap / 4).min(STREAM_TIER_CHUNKS.saturating_mul(one));
+    let mut tier = (cap / 4).min(STREAM_TIER_CHUNKS.saturating_mul(one));
+    if let Some(spare) = cap.checked_sub(KEPT_VIEW_CHUNKS.saturating_mul(one)) {
+        tier = tier.min(spare);
+    }
     if tier < one { 0 } else { tier }
 }
 
@@ -132,10 +142,13 @@ fn chunk_bytes(chunks: &[Arc<Vec<f32>>]) -> u64 {
 /// 上限 `cap` の内を、手・表示の読み（[`ReadMode::Keep`]）の主の段（`cap` − 流しの段の上限）と、読み通し
 /// （[`ReadMode::Through`]）の流しの段に分ける（M13 段 7。[`ChunkLru::for_channels`]。`new` は流しの段を持たない）。読み通しは
 /// 主の段を変えない（当たっても使った順を変えず、読んだものは流しの段に置く）。流しの段のチャンクを手が読めば主の段へ移す。
+/// 上限に音声の全体が収まる源（[`ChunkLru::for_source`]）は段を分けない。
 pub struct ChunkLru {
     cap: u64,
     /// 流しの段の上限（`cap` の内）。
     stream_cap: u64,
+    /// 読み通しで読んだものも主の段に入れる（上限に全体が収まり、何も追い出さない）。
+    keep_all: bool,
     inner: Mutex<LruInner>,
     /// 読み終えた知らせ（読んでいる番号が減ったとき）。
     ready: Condvar,
@@ -250,11 +263,29 @@ impl ChunkLru {
         Self::with_stream(cap, stream_tier_bytes(cap, channels))
     }
 
+    /// `channels` チャンネル・`frames` フレームの音声の源の LRU（上限 `cap` バイト）。上限に全体が収まるなら段を分けず、どの
+    /// チャンクも読み方によらず主の段に入れる（何も追い出さないので、読み通しでも見えている区間は残り、2 回目からは読まない）。
+    /// 収まらなければ [`ChunkLru::for_channels`]。
+    pub fn for_source(cap: u64, channels: usize, frames: u64) -> Self {
+        let whole = frames
+            .saturating_mul(channels.max(1) as u64)
+            .saturating_mul(4);
+        if cap >= whole {
+            Self {
+                keep_all: true,
+                ..Self::new(cap)
+            }
+        } else {
+            Self::for_channels(cap, channels)
+        }
+    }
+
     /// 上限 `cap` バイトのうち `stream_cap`（`cap` で頭打ち）を流しの段にした LRU。
     pub fn with_stream(cap: u64, stream_cap: u64) -> Self {
         Self {
             cap,
             stream_cap: stream_cap.min(cap),
+            keep_all: false,
             inner: Mutex::new(LruInner::default()),
             ready: Condvar::new(),
             streamed: AtomicU64::new(0),
@@ -351,8 +382,7 @@ impl ChunkLru {
         let loading = Loading { lru: self, index };
         let chunks = load()?;
         match mode {
-            ReadMode::Keep => self.insert(index, chunks.clone()),
-            ReadMode::Through => {
+            ReadMode::Through if !self.keep_all => {
                 self.streamed.fetch_add(1, Ordering::Relaxed);
                 let bytes = chunk_bytes(&chunks);
                 let mut g = self.lock();
@@ -360,6 +390,7 @@ impl ChunkLru {
                 g.stream
                     .put(index, chunks.clone(), bytes, tick, self.stream_cap);
             }
+            _ => self.insert(index, chunks.clone()),
         }
         drop(loading);
         Ok((chunks, false))
@@ -411,15 +442,16 @@ pub struct PcmFileSource {
 }
 
 impl PcmFileSource {
-    /// 源を作る（読み口はまだ開かない）。`lru_bytes` は LRU の上限（流しの段を含む。[`ChunkLru::for_channels`]）。
+    /// 源を作る（読み口はまだ開かない）。`lru_bytes` は LRU の上限（流しの段を含む。[`ChunkLru::for_source`]）。
     pub fn new(rate: u32, layout: PcmLayout, opener: Opener, lru_bytes: u64) -> Self {
         let channels = usize::from(layout.channels);
+        let lru = ChunkLru::for_source(lru_bytes, channels, layout.frames);
         Self {
             rate,
             layout,
             opener,
             pool: Mutex::new(Vec::new()),
-            lru: ChunkLru::for_channels(lru_bytes, channels),
+            lru,
             counters: Counters::default(),
         }
     }
@@ -687,5 +719,73 @@ mod tests {
         let lru = ChunkLru::for_channels(64 << 20, 2);
         assert_eq!(lru.capacity(), 64 << 20);
         assert_eq!(lru.stream_capacity(), 18 * one(2));
+        // 区間（48 チャンク）が上限に収まるなら、主の段にも収める（5 チャンネルの 64 MiB は区間 60 MiB）
+        assert_eq!(stream_tier_bytes(64 << 20, 5), 4 << 20);
+        assert_eq!(stream_tier_bytes(48 * one(5), 5), 0);
+        assert_eq!(stream_tier_bytes(48 * one(5) - 1, 5), (48 * one(5) - 1) / 4);
+        assert_eq!(stream_tier_bytes(64 * one(5), 5), 16 * one(5));
+        for ch in 1..=64u64 {
+            for cap in [1u64, 4, 16, 47, 48, 49, 63, 64, 65, 66, 72, 100] {
+                let cap = cap * one(ch);
+                let tier = stream_tier_bytes(cap, ch as usize);
+                assert!(tier * 4 <= cap && tier <= 18 * one(ch), "{ch} {cap}");
+                if cap >= 48 * one(ch) {
+                    assert!(cap - tier >= 48 * one(ch), "{ch} チャンネル・{cap}");
+                }
+            }
+        }
+    }
+
+    /// 上限に全体が収まる源は段を分けない：どのチャンクも読み方によらず主の段に入り（最後の半端なチャンクも）、2 回目からは
+    /// 読まない。読み通しの当たりは使った順を変えない。全体に 1 バイト足りなければ段を分ける。
+    #[test]
+    fn a_source_that_fits_the_lru_keeps_every_chunk() {
+        let c = AUDIO_CHUNK;
+        let tail = 17usize;
+        let chunks = 6u32;
+        let frames = (u64::from(chunks) - 1) * c as u64 + tail as u64;
+        let whole = frames * 2 * 4;
+        let body = Arc::new(vec![0f32; c]);
+        let short = Arc::new(vec![0f32; tail]);
+        let of = |k: u32| -> ChunkPlanes {
+            let p = if k + 1 == chunks { &short } else { &body };
+            vec![p.clone(), p.clone()]
+        };
+        let lru = ChunkLru::for_source(whole, 2, frames);
+        assert_eq!(lru.capacity(), whole);
+        assert_eq!(lru.stream_capacity(), 0);
+        for k in 0..chunks {
+            let (_, hit) = lru.get_or_load(k, || Ok(of(k))).unwrap();
+            assert!(!hit);
+        }
+        assert_eq!(lru.resident(), whole);
+        assert_eq!(lru.kept(), (0..chunks).collect::<Vec<_>>());
+        for k in 0..chunks {
+            lru.get_or_load(k, || panic!("{k} は読まずに当たるはず"))
+                .unwrap();
+        }
+        // 読み通し：読んだものも主の段に入り（流しの段に置かない）、当たりは使った順を変えない
+        let lru = ChunkLru::for_source(whole, 2, frames);
+        read_through(|| {
+            for k in 0..chunks {
+                lru.get_or_load(k, || Ok(of(k))).unwrap();
+            }
+            let (_, hit) = lru.get_or_load(0, || panic!("当たるはず")).unwrap();
+            assert!(hit);
+        });
+        assert_eq!(lru.kept(), (0..chunks).collect::<Vec<_>>());
+        assert!(lru.streaming().is_empty());
+        assert_eq!(lru.streamed(), 0);
+        for k in 0..chunks {
+            lru.get_or_load(k, || panic!("{k} は読まずに当たるはず"))
+                .unwrap();
+        }
+        // 収まらなければ段を分ける
+        let lru = ChunkLru::for_source(whole - 1, 2, frames);
+        assert_eq!(lru.stream_capacity(), stream_tier_bytes(whole - 1, 2));
+        assert!(lru.stream_capacity() > 0);
+        read_through(|| lru.get_or_load(0, || Ok(of(0))).unwrap());
+        assert!(lru.kept().is_empty());
+        assert_eq!(lru.streaming(), vec![0]);
     }
 }

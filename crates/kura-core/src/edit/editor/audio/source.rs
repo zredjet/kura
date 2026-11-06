@@ -21,8 +21,8 @@
 //!    - アンカーがあって遅延で使えなかったものは、設計どおり今の道（記録のデコーダで読み直す）に落ち、丸ごと読む上限を超えれば
 //!      TooLarge のまま。
 //!
-//! 遅延の値の源の LRU の上限は [`lru_bytes`]（max(64 MiB, プレビューのスレッド × 4 チャンク × ch × 256 KiB) を、音声の全体の値と
-//! 取り置きの 1/4 で頭打ち）。入力は `register_external` で数える（源 1 つにつき LRU の上限を 1 回）ので、読む段の予算
+//! 遅延の値の源の LRU の上限は [`lru_bytes`]（max(64 MiB, max(プレビューのスレッド × 4, 64) チャンク × ch × 256 KiB) を、音声の
+//! 全体の値と取り置きの 1/4 で頭打ち）。入力は `register_external` で数える（源 1 つにつき LRU の上限を 1 回）ので、読む段の予算
 //! （`admit_read`）は通さない。
 
 use std::fs::File;
@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kura_engine::audio::digest::PcmTreeDigest;
-use kura_engine::audio::source::Opener;
-use kura_engine::audio::stream::StreamEnd;
+use kura_engine::audio::source::{KEPT_VIEW_CHUNKS, Opener};
+use kura_engine::audio::stream::{STREAM_CHUNKS, StreamEnd};
 use kura_engine::budget::{Class, Lease, MemoryBudget, default_reserved};
 use kura_engine::codec::anchor::AnchorContext;
 use kura_engine::codec::stream::stream_window_bytes;
@@ -56,6 +56,9 @@ use crate::edit::work_pcm::{WorkHandle, WorkKey, WorkPcmStore};
 pub const WHOLE_READ_CAP: u64 = 512 << 20;
 /// 源の LRU の上限の下限（バイト）。
 pub const LRU_FLOOR: u64 = 64 << 20;
+/// 源の LRU に置きたいチャンクの数（全チャンネル）：主の段に区間で頼める上限（`KEPT_VIEW_CHUNKS`）、流しの段に流れの窓
+/// （`STREAM_CHUNKS`）。`stream_tier_bytes` の 1/4 の分け方でちょうど分かれる。
+pub const LRU_CHUNKS: u64 = KEPT_VIEW_CHUNKS + STREAM_CHUNKS as u64;
 /// 直接読めない形式の音声を作業用のファイルにする値の大きさの頭打ち（バイト。これを超えれば作業用のファイル）。
 pub const WORK_ABOVE: u64 = 64 << 20;
 
@@ -232,7 +235,8 @@ pub(crate) fn check_whole_read(shape: &Shape, budget_total: u64) -> Result<(), E
     )))
 }
 
-/// 源の LRU の上限：max(64 MiB, プレビューのスレッドの数 × 4 チャンク × ch × 256 KiB)。ただし音声の全体の値より大きくせず、
+/// 源の LRU の上限：max(64 MiB, max(プレビューのスレッドの数 × 4, [`LRU_CHUNKS`]) チャンク × ch × 256 KiB)（[`LRU_CHUNKS`] が効くのは
+/// 5 チャンネルから：区間と流れの窓が主の段と流しの段にそれぞれ収まる）。ただし音声の全体の値より大きくせず、
 /// 取り置き（`default_reserved(予算の全体)`）の 1/4 で頭打ちにする（スレッドの数 × ch × 1 チャンクは
 /// 下回らない。小さな予算の Mac・テストで入力が予算を埋めないように。段 1 の §4.6 からの変更）。
 pub fn lru_bytes(threads: usize, channels: u16, frames: u64, budget_total: u64) -> u64 {
@@ -241,10 +245,12 @@ pub fn lru_bytes(threads: usize, channels: u16, frames: u64, budget_total: u64) 
     let threads = threads.max(1) as u64;
     let want = threads
         .saturating_mul(4)
+        .max(LRU_CHUNKS)
         .saturating_mul(ch)
         .saturating_mul(chunk)
         .max(LRU_FLOOR);
-    // LRU は読んだチャンクの中身の大きさで数える（最後の半端なチャンクは短い）ので、全体の値の大きさで足りる
+    // LRU は読んだチャンクの中身の大きさで数える（最後の半端なチャンクは短い）ので、全体の値の大きさで足りる。全体が収まる
+    // 源は段を分けない（`ChunkLru::for_source`。全チャンクが主の段に入る）
     let whole = frames.saturating_mul(ch).saturating_mul(4);
     let cap =
         (default_reserved(budget_total) / 4).max(threads.saturating_mul(ch).saturating_mul(chunk));
@@ -842,6 +848,12 @@ mod tests {
         let chunk = 256u64 << 10;
         let long = 48_000 * 3_600;
         assert_eq!(lru_bytes(2, 2, long, 8 * gib), LRU_FLOOR);
+        assert_eq!(
+            lru_bytes(4, 4, long, 8 * gib),
+            LRU_FLOOR,
+            "4 チャンネルまで"
+        );
+        assert_eq!(lru_bytes(4, 5, long, 8 * gib), 64 * 5 * chunk);
         assert_eq!(lru_bytes(64, 2, long, 64 * gib), 64 * 4 * 2 * chunk);
         assert_eq!(
             lru_bytes(64, 8, long, 64 * gib),
@@ -855,6 +867,28 @@ mod tests {
         );
         assert_eq!(lru_bytes(2, 2, long, 64 << 20), 8 << 20);
         assert_eq!(lru_bytes(8, 2, long, 8 << 20), 16 * chunk);
+    }
+
+    /// 区間で頼める上限（48 チャンク）は、実機の予算の LRU の上限なら主の段に収まる（段 7 より前に 64 MiB の LRU に
+    /// 収まっていた 5 チャンネルも）。2 回読んでも源から読むのは 1 回だけ。
+    #[test]
+    fn view_chunks_fit_the_source_lru() {
+        use kura_engine::audio::source::AudioSource;
+        use kura_engine::testing::source::SyntheticSource;
+
+        let gib = 1u64 << 30;
+        let frames = 48_000 * 3_600;
+        for channels in [1u16, 2, 4, 5] {
+            let lru = lru_bytes(4, channels, frames, 8 * gib);
+            let src = SyntheticSource::new(48_000, usize::from(channels), frames, 1, lru);
+            let n = crate::edit::editor::audio::MAX_VIEW_CHUNKS as u32;
+            for _ in 0..2 {
+                for k in 100..100 + n {
+                    src.read_chunk(k).unwrap();
+                }
+            }
+            assert_eq!(src.stats().reads, u64::from(n), "{channels} チャンネル");
+        }
     }
 
     /// `fail_after` 回の窓のあと、書くと `error` の Io を返す受け手（書き手の誤りの代わり）。

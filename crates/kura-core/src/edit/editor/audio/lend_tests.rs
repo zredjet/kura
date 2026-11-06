@@ -133,7 +133,18 @@ fn gain() -> Vec<Step> {
 /// 閉じると貸し出しが消える。
 #[test]
 fn s24_lent_wav_is_not_read_again() {
-    let bytes = noise_wav(8_000, 2, 3 * C + 17, 41);
+    lent_wav_is_not_read_again(3 * C + 17, 41);
+}
+
+/// S24 の、源の LRU に流しの段を取れる長さ（4 チャンク以上）。上限が全体の値で頭打ちになる短い WAV は全チャンクが主の段に
+/// 入るので、保存も読み直さない（段 7 の検証の直し）。
+#[test]
+fn s24_lent_wav_of_many_chunks_is_not_read_again() {
+    lent_wav_is_not_read_again(6 * C + 17, 42);
+}
+
+fn lent_wav_is_not_read_again(frames: u64, seed: u64) {
+    let bytes = noise_wav(8_000, 2, frames, seed);
     let hash = hash_of(&bytes);
 
     let env = Env::new();

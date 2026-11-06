@@ -30,7 +30,7 @@ impl SyntheticSource {
             channels,
             frames,
             seed,
-            lru: ChunkLru::for_channels(lru_bytes, channels),
+            lru: ChunkLru::for_source(lru_bytes, channels, frames),
             reads: AtomicU64::new(0),
             hits: AtomicU64::new(0),
         }

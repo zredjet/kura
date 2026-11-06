@@ -60,8 +60,8 @@ use super::{
 
 /// 出力の値の大きさ（frames × ch × 4）がこれ以下なら、表示の範囲を全体にする（48 kHz ステレオで約 87 秒）。
 pub const WHOLE_VIEW_BYTES: u64 = 32 << 20;
-/// 区間で頼むときのチャンクの数の上限（ステレオで 24 MiB）。超えたら頼んだ順に切る。
-pub const MAX_VIEW_CHUNKS: usize = 48;
+/// 区間で頼むときのチャンクの数の上限（ステレオで 24 MiB）。超えたら頼んだ順に切る。源の LRU の主の段に収める分と同じ。
+pub const MAX_VIEW_CHUNKS: usize = kura_engine::audio::source::KEPT_VIEW_CHUNKS as usize;
 /// 頼める区間の数の上限。
 pub const MAX_VIEW_SPANS: usize = 4;
 
