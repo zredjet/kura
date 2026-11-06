@@ -676,6 +676,8 @@ export class WaveController {
     this.pump();
     this.invalidate();
     if (!this.workWanted) {
+      // 仕事がなくなった（手の応えの中で直し切ったときも）：進まなかった数も戻す（次の最初の待ちは 150 ms）
+      this.stalls = 0;
       this.stopChain();
     } else if (this.chaining) {
       if (stalled) {

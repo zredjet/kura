@@ -506,6 +506,26 @@ describe('裏の仕事の頼みの連鎖', () => {
       expectNextAfter(s, WAVE_IDLE_MS);
     });
 
+    it('手の応えで仕事がなくなったら待ちの数も戻す（あとの手でまた進まなくても、最初の待ちは 150 ms）', () => {
+      const s = started();
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, 1000);
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, 2000);
+      // 手の応え（work: false）の中で直し切った
+      s.c.applyView(done(), false);
+      s.clock.advance(FAIL_RETRY_MAX_MS * 2);
+      const n = s.idle.length;
+      // あとの手で仕事ができ、手が止まって 150 ms で頼んだが、1 回だけ進まなかった
+      s.c.applyView(busy(), false);
+      s.clock.advance(WAVE_IDLE_MS);
+      expect(s.idle).toHaveLength(n + 1);
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, WAVE_IDLE_MS);
+    });
+
     it('手・ズーム・再生が来たら待ちを切ってそちらを先にし、続きは 150 ms から。待ちの数は進むまで戻さない', () => {
       const s = started();
       const { c, clock, idle } = s;
