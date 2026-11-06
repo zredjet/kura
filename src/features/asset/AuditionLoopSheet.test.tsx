@@ -132,6 +132,40 @@ describe('試聴のループのシート', () => {
     expect(save()).toBeEnabled();
   });
 
+  it('画面に出ている長さをそのまま終わりに打つと、ちょうど長さになる（ミリ秒への丸めで長さを超えて断られない）', async () => {
+    // 4,410,030 フレームは 100.00068 秒で「1:40.001」と出る。打つと 4,410,044 と読むが、同じ時刻の文字なので長さに寄せる
+    const length = 4_410_030;
+    open(plainAsset(), async () => length);
+    fireEvent.click(choice(t.auditionLoopCustom));
+    await waitFor(() => expect(screen.getByLabelText(t.auditionLoopEnd)).toHaveValue('1:40.001'));
+    type(t.auditionLoopEnd, '0:50');
+    expect(screen.getByLabelText(t.auditionLoopEnd)).toHaveValue('0:50.000');
+    type(t.auditionLoopEnd, '1:40.001');
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText(ja.editor.audio.samples('4,410,030'))).toBeInTheDocument();
+    fireEvent.click(save());
+    expect(setAssetSettings).toHaveBeenCalledWith([2], {
+      loopRange: { set: { start: 0, end: length } },
+    });
+  });
+
+  it('切り下がって見える長さを打っても長さになり、違う時刻は今どおり（長くても短くても）そのまま読む', async () => {
+    // 4,410,020 フレームは 100.00045 秒で「1:40.000」と出る。そのまま読むと 20 フレーム足りない
+    open(plainAsset(), async () => 4_410_020);
+    fireEvent.click(choice(t.auditionLoopCustom));
+    await waitFor(() => expect(screen.getByLabelText(t.auditionLoopEnd)).toHaveValue('1:40.000'));
+    type(t.auditionLoopEnd, '0:50');
+    type(t.auditionLoopEnd, '1:40');
+    expect(screen.getByText(ja.editor.audio.samples('4,410,020'))).toBeInTheDocument();
+    // 1 ミリ秒でも違えば寄せない
+    type(t.auditionLoopEnd, '1:40.001');
+    expect(screen.getByRole('alert')).toHaveTextContent(t.auditionLoopPastEnd('1:40.000'));
+    expect(save()).toBeDisabled();
+    type(t.auditionLoopEnd, '1:39.999');
+    expect(screen.getByText(ja.editor.audio.samples('4,409,956'))).toBeInTheDocument();
+    expect(save()).toBeEnabled();
+  });
+
   it('長さは /pcm の応答を正とする（解析の長さより短ければ、応答の長さで確かめる）', async () => {
     const probe = vi.fn(async () => R * 60);
     open(audioAsset(), probe);
@@ -178,5 +212,37 @@ describe('試聴のループのシート', () => {
     fireEvent.click(save());
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('長さを超えています'));
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('保存に失敗したあと時刻の欄を変えたら前の理由を消し、今の状態を出す', async () => {
+    vi.mocked(setAssetSettings).mockRejectedValueOnce(new Error('長さを超えています'));
+    open(withAuditionLoop(audioAsset(), R, R * 2));
+    await act(async () => undefined);
+    fireEvent.click(save());
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('長さを超えています'));
+
+    // 問題のない値：理由を消して長さを出す
+    type(t.auditionLoopStart, '0:00.5');
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText(t.auditionLoopLength('1:40.000'))).toBeInTheDocument();
+    expect(save()).toBeEnabled();
+
+    // もう一度断られたあと、終わりの欄で問題のある値にする：今の理由を出す
+    vi.mocked(setAssetSettings).mockRejectedValueOnce(new Error('長さを超えています'));
+    fireEvent.click(save());
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('長さを超えています'));
+    type(t.auditionLoopEnd, '0:00.1');
+    expect(screen.getByRole('alert')).toHaveTextContent(t.auditionLoopOrder);
+    expect(save()).toBeDisabled();
+  });
+
+  it('断られたあと、打ち直しても値が変わらなければ理由は残る', async () => {
+    vi.mocked(setAssetSettings).mockRejectedValueOnce(new Error('長さを超えています'));
+    open(withAuditionLoop(audioAsset(), R, R * 2));
+    await act(async () => undefined);
+    fireEvent.click(save());
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('長さを超えています'));
+    type(t.auditionLoopStart, '0:01');
+    expect(screen.getByRole('alert')).toHaveTextContent('長さを超えています');
   });
 });

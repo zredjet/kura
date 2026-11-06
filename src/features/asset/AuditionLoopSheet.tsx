@@ -6,6 +6,7 @@ import { Segmented } from '../../components/Segmented/Segmented';
 import { ja } from '../../i18n/ja';
 import { type AssetDto, type AssetSettingsPatchDto, setAssetSettings } from '../../ipc/asset';
 import { TimeField } from '../editor/audio/TimeField';
+import { timeText } from '../editor/audio/timeText';
 import styles from './Asset.module.css';
 import { probeFrames } from './audioRuntime';
 import { clockText } from './describe';
@@ -30,6 +31,14 @@ export function checkAuditionLoop(
   if (start >= end) return t.auditionLoopOrder;
   if (length !== null && end > length) return t.auditionLoopPastEnd(clockText(length, rate));
   return null;
+}
+
+/**
+ * 終わりの欄に打った値：時刻の文字が長さの時刻の文字と同じなら、ちょうど長さにする。欄と長さの文字はミリ秒に丸めるので、
+ * 画面に出ている長さをそのまま打っても標本では合わない（切り上がって見える長さなら、超えて断られる）。
+ */
+function endOf(frames: number, length: number | null, rate: number): number {
+  return length !== null && timeText(frames, rate) === timeText(length, rate) ? length : frames;
 }
 
 function rangeText(range: LoopRange, rate: number): string {
@@ -140,8 +149,24 @@ export function AuditionLoopSheet({
           <p className={styles.loopValue}>{fileRange ? rangeText(fileRange, rate) : t.none}</p>
         ) : (
           <div className={styles.fields}>
-            <TimeField label={t.auditionLoopStart} frames={start} rate={rate} onValue={setStart} />
-            <TimeField label={t.auditionLoopEnd} frames={shownEnd} rate={rate} onValue={setEnd} />
+            <TimeField
+              label={t.auditionLoopStart}
+              frames={start}
+              rate={rate}
+              onValue={(frames) => {
+                setStart(frames);
+                setFailure(null);
+              }}
+            />
+            <TimeField
+              label={t.auditionLoopEnd}
+              frames={shownEnd}
+              rate={rate}
+              onValue={(frames) => {
+                setEnd(endOf(frames, length, rate));
+                setFailure(null);
+              }}
+            />
           </div>
         )}
         <p className={styles.note}>{t.auditionLoopNote}</p>
