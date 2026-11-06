@@ -12,7 +12,9 @@ import { type AudioRuntime, MediaHttpError, setAudioRuntimeForTest } from './aud
 import {
   auditionBlocker,
   auditionTarget,
+  recentAsset,
   rememberAsset,
+  restartAudition,
   startAudition,
   stopAudition,
   toggleAudition,
@@ -211,6 +213,114 @@ describe('試聴の状態と口', () => {
     resolve({ status: 'playing', plan: PLAN as never, facts: FACTS });
     await settle();
     expect(useAuditionStore.getState().status).toBe('idle');
+  });
+
+  describe('素材の設定を保存したあとの鳴らし直し（restartAudition）', () => {
+    const asset = withAuditionLoop(audioAsset(), 44_100, 88_200);
+
+    /** 読み直しの応えを待たせる。 */
+    function deferAsset() {
+      let resolve: (value: typeof asset) => void = () => undefined;
+      let reject: (error: unknown) => void = () => undefined;
+      vi.mocked(getAsset).mockImplementationOnce(
+        () =>
+          new Promise((res, rej) => {
+            resolve = res;
+            reject = rej;
+          }),
+      );
+      return { resolve: (v: typeof asset) => resolve(v), reject: (e: unknown) => reject(e) };
+    }
+
+    it('試聴していない・ほかのアイテムを試聴しているなら、読みも鳴らしもしない', async () => {
+      restartAudition(asset.itemId);
+      startAudition(auditionTarget(audioAsset({ itemId: 9 }))!);
+      await settle();
+      restartAudition(asset.itemId);
+      await settle();
+      expect(getAsset).not.toHaveBeenCalled();
+      expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+    });
+
+    it('試聴中なら、読み直した区間で同じ鳴らし方で始め直し、覚えている素材の欄も新しくする', async () => {
+      startAudition(auditionTarget(audioAsset())!, true);
+      await settle();
+      vi.mocked(getAsset).mockResolvedValueOnce(asset);
+      restartAudition(asset.itemId);
+      await settle();
+      expect(fake.audition.startProbed).toHaveBeenLastCalledWith(
+        asset.hash,
+        { rate: 44_100, channels: 2, loop: [44_100, 88_200] },
+        { fromStart: true },
+      );
+      expect(useAuditionStore.getState()).toMatchObject({ status: 'playing', fromStart: true });
+      expect(recentAsset(asset.itemId)).toBe(asset);
+    });
+
+    it('読み終える前に試聴を止めた・ほかへ移ったら、鳴らさない', async () => {
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      const stopped = deferAsset();
+      restartAudition(asset.itemId);
+      stopAudition();
+      stopped.resolve(asset);
+      await settle();
+      expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+      expect(useAuditionStore.getState().status).toBe('idle');
+
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      const moved = deferAsset();
+      restartAudition(asset.itemId);
+      startAudition(auditionTarget(audioAsset({ itemId: 9 }))!);
+      await settle();
+      moved.resolve(asset);
+      await settle();
+      expect(fake.audition.startProbed).toHaveBeenCalledTimes(3);
+      expect(useAuditionStore.getState().itemId).toBe(9);
+    });
+
+    it('読み終える前に［はじめから］で始め直していたら、読み直した区間でその鳴らし方にする', async () => {
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      const later = deferAsset();
+      restartAudition(asset.itemId);
+      startAudition(auditionTarget(audioAsset())!, true);
+      await settle();
+      later.resolve(asset);
+      await settle();
+      expect(fake.audition.startProbed).toHaveBeenLastCalledWith(
+        asset.hash,
+        { rate: 44_100, channels: 2, loop: [44_100, 88_200] },
+        { fromStart: true },
+      );
+    });
+
+    it('読み直せなければ、前の区間を鳴らし続けずに止めて知らせる', async () => {
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      vi.mocked(getAsset).mockRejectedValueOnce(
+        new IpcError({ code: 'Db', message: 'データベースを読めません' }),
+      );
+      restartAudition(asset.itemId);
+      await settle();
+      expect(useAuditionStore.getState().status).toBe('idle');
+      expect(fake.audition.stop).toHaveBeenCalledTimes(2);
+      expect(notify).toHaveBeenCalledWith(t.auditionFailed('データベースを読めません'));
+    });
+
+    it('読み直したら試聴できなくなっていれば、止めて理由を知らせる', async () => {
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      vi.mocked(getAsset).mockResolvedValueOnce(
+        audioAsset({ analysisState: 'pending', facts: null }),
+      );
+      restartAudition(asset.itemId);
+      await settle();
+      expect(useAuditionStore.getState().status).toBe('idle');
+      expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+      expect(notify).toHaveBeenCalledWith(t.auditionNoFacts);
+    });
   });
 
   it('ボタン：同じものを同じ鳴らし方でもう一度押すと止める', async () => {

@@ -207,6 +207,43 @@ export function stopAudition(): void {
 }
 
 /**
+ * 試聴のループの設定を保存したあと（試聴のループのシート。design.md §3.1）：そのアイテムを試聴中なら、読み直した素材の欄の
+ * 区間で鳴らし直す（ファイルのループ点に戻したならファイルのループ点か全体）。鳴らし方は読み終えたときのもの（継ぎ目の手前
+ * から・［はじめから］）。試聴していなければ何もしない。読み終える前に止めた・ほかのアイテムへ移ったら鳴らさない。読み直せ
+ * なければ、前の区間を鳴らし続けずに止める。試聴中の文脈は動いているので、クリックの処理の外（読み直しの応え）から始めてよい。
+ */
+export function restartAudition(itemId: number): void {
+  const isAuditioning = () => {
+    const s = useAuditionStore.getState();
+    return s.status !== 'idle' && s.itemId === itemId;
+  };
+  if (!isAuditioning()) {
+    return;
+  }
+  getAsset(itemId).then(
+    (asset) => {
+      rememberAsset(asset);
+      if (!isAuditioning()) {
+        return;
+      }
+      const target = auditionTarget(asset);
+      if (target) {
+        startAudition(target, useAuditionStore.getState().fromStart);
+      } else {
+        stopAudition();
+        notify(auditionBlocker(asset) ?? t.auditionUnsupported);
+      }
+    },
+    (error: unknown) => {
+      if (isAuditioning()) {
+        stopAudition();
+        notify(failureText(error));
+      }
+    },
+  );
+}
+
+/**
  * ボタン：同じアイテムを同じ鳴らし方で試聴していれば止め、そうでなければ始める（［ループを試聴］と［はじめから］）。
  */
 export function toggleAudition(target: AuditionTarget, fromStart = false): void {

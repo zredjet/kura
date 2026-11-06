@@ -23,6 +23,7 @@ import { AuditionLoopSheet } from './AuditionLoopSheet';
 import {
   auditionBlocker,
   auditionTarget,
+  restartAudition,
   startAudition,
   stopAudition,
   useAuditionStore,
@@ -234,6 +235,8 @@ function AudioRows({
                 onChanged();
                 // シアターの波形（useLoopRange）など、ほかの画面の素材の欄も読み直す
                 bumpRevision();
+                // 試聴中なら、直した区間をそのまま聞けるように鳴らし直す（前の区間を回し続けない）
+                restartAudition(asset.itemId);
               }}
             />,
             document.body,
