@@ -317,6 +317,43 @@ describe('保存の一時停止・再開・中止（▾ とボタン）', () => 
     expect(screen.getByRole('button', { name: t.saving })).toBeDisabled();
   });
 
+  it('前の保存が終わっていない間（waiting）：シートだけで、上部の保存と ▾ は押せず、キーも受けない', () => {
+    useJobsStore.getState().trackSave({
+      id: 30,
+      itemId: ITEM.id,
+      itemTitle: 'hero.png',
+      mode: 'overwrite',
+      newTitle: null,
+      state: 'paused',
+      progress: 0.42,
+      message: null,
+    });
+    useEditorStore.setState({
+      phase: 'waiting',
+      kind: 'image',
+      item: ITEM,
+      session: null,
+      status: null,
+      sheet: { kind: 'pendingSave' },
+    });
+    render(<Editor />);
+    expect(screen.getByRole('dialog', { name: t.pendingSaveTitle })).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: t.opening })).toBeNull();
+    expect(screen.queryByText(t.opening)).toBeNull();
+    expect(screen.getByRole('button', { name: t.save, hidden: true })).toBeDisabled();
+    expect(screen.getByRole('button', { name: t.saveMore, hidden: true })).toBeDisabled();
+    fireEvent.keyDown(window, { key: 's', code: 'KeyS', metaKey: true });
+    expect(useEditorStore.getState().sheet).toEqual({ kind: 'pendingSave' });
+    expect(useMenuStore.getState().menu).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: t.pendingSaveResume }));
+    expect(resumeJob).toHaveBeenCalledWith(30);
+    expect(pauseJob).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: t.pendingSaveCancel }));
+    expect(cancelJob).toHaveBeenCalledWith(30);
+    act(() => useEditorStore.setState({ phase: 'closed', item: null, sheet: null }));
+  });
+
   it('ほかのアイテムの保存はこのエディタに出さない', () => {
     useJobsStore.getState().trackSave({
       id: 30,
