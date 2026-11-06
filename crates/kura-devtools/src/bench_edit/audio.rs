@@ -748,9 +748,8 @@ pub(super) fn bench(ctx: &mut Ctx) -> Result<(), String> {
                 judged,
                 load,
             )
-            .with_note(
-                "手 → 表示の区間の値（editor::step。IPC・WebKit・PCM の取得を含まない。NFR-11 の全体は 50 ms）",
-            ),
+            .with_note(kura_engine::testing::bench::OUT_OF_SCOPE_RESAMPLE)
+            .out_of_scope(),
         );
         let (restored, after, work_files) = ed.close()?;
         if !restored || work_files > 0 {

@@ -169,6 +169,9 @@ pub const OUT_OF_SCOPE_STROKE: &str = "範囲外（NFR-12 は太さ 32px まで�
 /// 範囲外の減色のプレビュー（NFR-11）の注。
 pub const OUT_OF_SCOPE_REDUCE: &str = "範囲外（NFR-11 の対象外。減色のプレビューは古い結果を出したまま、描けたら差し替える。ADR-154）";
 
+/// レート変換のケースの注（NFR-11 の対象外。M13 段 7。ADR-187）。
+pub const OUT_OF_SCOPE_RESAMPLE: &str = "範囲外（NFR-11 の対象外。レート変換があるプレビューは古い結果を出したまま、描けたら差し替える。ADR-187）";
+
 /// 筆の太さ `size`（px）が NFR-12 の目標の範囲か。
 pub fn stroke_in_scope(size: u8) -> bool {
     size <= STROKE_SIZE_LIMIT

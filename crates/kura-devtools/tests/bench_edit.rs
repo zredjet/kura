@@ -45,7 +45,7 @@ fn quick_writes_a_record_for_every_nfr() {
             ["pass", "fail", "record", "out_of_scope", "skip"].contains(&verdict),
             "{r}"
         );
-        // 決めた範囲の外（NFR-12 の 32px より太い筆・NFR-11 の減色のプレビュー）の時間は、達成・未達にしない（ADR-154。
+        // 決めた範囲の外（NFR-12 の 32px より太い筆・NFR-11 の減色とレート変換のプレビュー）の時間は、達成・未達にしない（ADR-154。
         // 同じケースの正しさの照らし（NFR-16）は判定する）
         let case = r["case"].as_str().unwrap();
         let px = case
@@ -53,7 +53,10 @@ fn quick_writes_a_record_for_every_nfr() {
             .and_then(|c| c.rsplit('-').next())
             .and_then(|n| n.parse::<u32>().ok());
         let outside = matches!(r["nfr"].as_u64(), Some(11 | 12))
-            && (px.is_some_and(|px| px > 32) || case == "pixel-convert-indexed8");
+            && (px.is_some_and(|px| px > 32)
+                || case == "pixel-convert-indexed8"
+                || case == "audio-resample"
+                || case.ends_with("-gain-resample"));
         if outside {
             assert!(["out_of_scope", "record"].contains(&verdict), "{r}");
             if verdict == "out_of_scope" {

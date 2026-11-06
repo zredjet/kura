@@ -246,8 +246,8 @@ pub fn audio_sweeps(rate: u32, secs: usize) -> Result<Vec<Sweep>, EngineError> {
         node: gain,
         edit: set(gain, "db", |i| json!(-0.1 * (i + 1) as f64)),
         level: 0,
-        judged: true,
-        note: "",
+        judged: false,
+        note: super::OUT_OF_SCOPE_RESAMPLE,
     };
     Ok(vec![
         sweep(

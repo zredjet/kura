@@ -256,7 +256,7 @@ fn run_sweep(
             r = r.with_note(PHOTO_FALLBACK).into_reference();
         }
         if !s.judged {
-            // 決めた範囲の外（減色のプレビュー。注は Sweep の note）
+            // 決めた範囲の外（減色・レート変換のプレビュー。注は Sweep の note）
             r = r.out_of_scope();
         } else if level != s.level {
             r = r.into_reference();
