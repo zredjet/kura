@@ -394,6 +394,42 @@ impl<'s> AudioEditor<'s> {
         Ok(())
     }
 
+    /// 文書の末尾にレート変換を足す（M13 段 7。48 kHz は 44.1 kHz へ。相 147・タップの多い重い向き。--quick のレートは
+    /// `resample_target`）。このあとの手は、見えている区間のレート変換を毎回描き直す。
+    pub fn add_resample(&mut self) -> Result<(), String> {
+        let target: u64 = if self.rate == 48_000 {
+            44_100
+        } else {
+            u32::try_from(self.rate)
+                .map(kura_engine::testing::bench::cases::resample_target)
+                .map_err(|_| "レートが大きすぎます".to_string())?
+                .into()
+        };
+        let vp = self.vp.clone();
+        let out = editor::step(
+            &self.env,
+            &self.sid,
+            vec![Step::Commit {
+                edit: Edit::AddNode {
+                    at: 4,
+                    op: "audio.resample".into(),
+                    v: 1,
+                    params: json!({ "rate": target }),
+                    seed: None,
+                    extra_inputs: Vec::new(),
+                },
+                mode: CommitMode::Step,
+            }],
+            &Viewport::Audio(vp),
+        )
+        .map_err(|e| format!("audio.resample を足せません: {e}"))?;
+        if let Some(r) = out.rejected {
+            return Err(format!("audio.resample を足せません: {:?}", r.problem));
+        }
+        self.samples = shown(out.view)?.samples_id;
+        Ok(())
+    }
+
     /// 測る手の `i` 回目（回ごとに違う値）と、手が効いたことを確かめる表示の値。
     fn step_of(&self, kind: Kind, i: usize) -> Result<(Step, Expect), String> {
         let [trim, fade, gain, set_loop] = self.nodes.ok_or("文書を作っていません")?;
@@ -688,6 +724,34 @@ pub(super) fn bench(ctx: &mut Ctx) -> Result<(), String> {
             threads,
             judged,
         )?;
+        // 末尾にレート変換があるときの gain の手（見えている区間のレート変換を毎回描き直す。M13 段 7）
+        ed.add_resample()?;
+        let load = load1();
+        let mut samples = Vec::new();
+        for i in 0..z.edit_warmup + z.edit_n {
+            // 前の gain の手と同じ値を当てない（上流をキャッシュに当てない）
+            let (ns, _) = ed.step(Kind::Gain, 1_000 + i)?;
+            if i >= z.edit_warmup {
+                samples.push(ns);
+            }
+        }
+        let stats = Stats::from_samples(samples).ok_or("手の時間がありません")?;
+        ctx.push(
+            Record::timed(
+                ctx.run,
+                11,
+                "preview",
+                &format!("audio-editor-{label}-gain-resample"),
+                &format!("{what}の 1 手の往復：末尾にレート変換があるときの gain の引数（区間のレート変換を毎回描き直す）"),
+                threads,
+                stats,
+                judged,
+                load,
+            )
+            .with_note(
+                "手 → 表示の区間の値（editor::step。IPC・WebKit・PCM の取得を含まない。NFR-11 の全体は 50 ms）",
+            ),
+        );
         let (restored, after, work_files) = ed.close()?;
         if !restored || work_files > 0 {
             return Err(format!(
