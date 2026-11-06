@@ -2,7 +2,8 @@
 //! `kura-devtools bench edit` が同じものを使う。入力は ChaCha8 と整数だけで作る（機械によらず同じ）。
 //!
 //! - NFR-11：引数を動かすスライダー（[`Sweep`]）。i 回目の手は i ごとに違う値にする（キャッシュに当てない）。ドット絵 2048² の
-//!   等倍（[`pixel_sweeps`]）、音声 5 分（[`audio_sweeps`]。正規化の解析はキャッシュに当たる）、写真 24MP（[`photo_sweeps`]。
+//!   等倍（[`pixel_sweeps`]）、音声 5 分（[`audio_sweeps`]。正規化の解析はキャッシュに当たる。レート変換は手前の利得を動かして
+//!   変換を全体で描き直す）、写真 24MP（[`photo_sweeps`]。
 //!   縮小の段 [`PHOTO_LEVEL`] で判定し、段 1 も記録する。`EditorPath::render_preview` が `Engine::plan_level` で段の計画にする）。
 //! - NFR-12：筆・塗りつぶしの文書（[`paint_doc`]・[`prior_strokes`]・[`stroke_item`]・[`fill_item`]・[`nearest4`]）。
 //! - NFR-13：保存（[`save_doc`]・[`save_jpeg`]）。NFR-14：一括（[`bulk_doc`]・[`bulk_png`]、入力は `super::sprite_batch`）。
@@ -199,8 +200,20 @@ pub fn pixel_sweeps(side: u32) -> Result<Vec<Sweep>, EngineError> {
     Ok(out)
 }
 
-/// 音声（`rate` Hz ステレオ `secs` 秒。`super::program_audio`）の利得・フェード・正規化の引数を動かすケース。正規化の
-/// ラウドネスの解析は入力が同じなのでキャッシュに当たる（2 回目から解かない）。
+/// レート変換のケースの変換先（[`audio_sweeps`]）：44.1 kHz の族（147 の倍数）は 48 kHz の族へ（× 160/147。5 分の 44.1 kHz は
+/// 48 kHz へ。相 160・タップ 256）、ほかは × 6/5（煙のテストの 8 kHz は 9.6 kHz。係数の表と描く量を小さく保つ）。
+pub fn resample_target(rate: u32) -> u32 {
+    if rate.is_multiple_of(147) {
+        rate / 147 * 160
+    } else {
+        rate / 5 * 6
+    }
+}
+
+/// 音声（`rate` Hz ステレオ `secs` 秒。`super::program_audio`）の利得・フェード・正規化の引数を動かすケースと、レート変換
+/// （M13 段 7。利得 → `audio.resample`（[`resample_target`]）の文書で、手前の利得を動かす。変換の引数は 1 つの値しか取らない
+/// ので、変換を毎回全体で描き直すように上流を動かす）。正規化のラウドネスの解析は入力が同じなのでキャッシュに当たる（2 回目
+/// から解かない）。
 pub fn audio_sweeps(rate: u32, secs: usize) -> Result<Vec<Sweep>, EngineError> {
     let audio = program_audio(rate, secs.max(2))?;
     let source = Digest([0x15; 32]);
@@ -216,6 +229,26 @@ pub fn audio_sweeps(rate: u32, secs: usize) -> Result<Vec<Sweep>, EngineError> {
         |i| json!(-16.0 - 0.1 * (i + 1) as f64),
     )?;
     normalize.note = "ラウドネスの解析はキャッシュに当たる";
+    let mut resample = Graph::new_single();
+    let gain = resample.push_linear("audio.gain", 1, json!({ "db": 0.0 }), 0)?;
+    resample.push_linear(
+        "audio.resample",
+        1,
+        json!({ "rate": resample_target(rate) }),
+        0,
+    )?;
+    let resample = Sweep {
+        case: "audio-resample",
+        item: "レート変換（44.1 → 48 kHz。手前の利得を 0.1 dB ずつ動かし、変換を全体で描き直す）",
+        graph: resample,
+        input: audio.clone(),
+        source,
+        node: gain,
+        edit: set(gain, "db", |i| json!(-0.1 * (i + 1) as f64)),
+        level: 0,
+        judged: true,
+        note: "",
+    };
     Ok(vec![
         sweep(
             "audio-gain",
@@ -238,6 +271,7 @@ pub fn audio_sweeps(rate: u32, secs: usize) -> Result<Vec<Sweep>, EngineError> {
             move |i| json!(rate_n + 100 * (i as u64 + 1)),
         )?,
         normalize,
+        resample,
     ])
 }
 
@@ -470,7 +504,7 @@ mod tests {
             .chain(photo_sweeps(photo).unwrap())
             .collect();
         let names: Vec<&str> = sweeps.iter().map(|s| s.case).collect();
-        assert_eq!(names.len(), 13, "{names:?}");
+        assert_eq!(names.len(), 14, "{names:?}");
         for s in &sweeps {
             let engine = Engine::new().unwrap();
             let mut ed = EditorPath::open(
@@ -500,6 +534,14 @@ mod tests {
                 if s.level == 0 {
                     assert_eq!(out.rendered.stats.hits, 0, "{}: {i} 回目が当たった", s.case);
                 }
+                if s.case == "audio-resample" {
+                    // 動かすのは手前の利得でも、変換を毎回描き直す（変換の時間を測る）
+                    assert!(
+                        out.rendered.drawn_nodes() >= 2,
+                        "{}: {i} 回目に変換を描き直していない",
+                        s.case
+                    );
+                }
             }
             revs.dedup();
             assert_eq!(revs.len(), 4, "{}: 同じ文書の手がある", s.case);
@@ -516,6 +558,28 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// レート変換のケース（M13 段 7）は、5 分の曲と同じ 44.1 kHz を 48 kHz に変える（ほかのレートは × 6/5）。
+    #[test]
+    fn resample_case_converts_to_the_target_rate() {
+        assert_eq!(resample_target(44_100), 48_000);
+        assert_eq!(resample_target(8_000), 9_600);
+        let s = audio_sweeps(44_100, 2)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.case == "audio-resample")
+            .unwrap();
+        let engine = Engine::new().unwrap();
+        let plan = engine
+            .compile(&s.graph, &BTreeMap::from([(InputId(0), s.input.shape())]))
+            .unwrap();
+        let inputs = plain_inputs(&single_input(s.input.clone(), s.source).unwrap());
+        let out = engine.render(&plan, &inputs, &NoMonitor).unwrap();
+        let Value::Audio(a) = &out.outputs[0].value else {
+            panic!("音声ではありません");
+        };
+        assert_eq!((a.rate(), a.channels(), a.frames()), (48_000, 2, 96_000));
     }
 
     /// 筆の文書・最近傍 ×4 が続く文書・塗りつぶし（取り消して足し直す）で、確定ごとに差分の適用が効き、値が一括の経路と同じ。
