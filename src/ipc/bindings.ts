@@ -424,7 +424,12 @@ export type AppErrorCode = "NotFound" | "InvalidQuery" | "Invalid" | "ToolMissin
  *  保存する形式（文書の出力の形式）をこの環境では書けない（MP3 で ffmpeg がない、など。保存を積む前に断った。M13 段 3）。
  *  保存する形式を選び直す（音声の既定は Ogg Vorbis）。
  */
-"FormatUnavailable";
+"FormatUnavailable" | 
+/**
+ *  同じアイテムの前の保存が終わっていないのでエディタを開かない（ADR-189。`Busy` と違い、予算ではなく保存を待つ）。フロントは
+ *  「前の保存が終わっていません」のシートを出し、終わったら開き直す。
+ */
+"SavePending";
 
 /**  OS の表示設定。 */
 export type Appearance = {

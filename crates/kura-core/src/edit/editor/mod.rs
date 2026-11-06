@@ -130,6 +130,9 @@ pub enum EditorError {
     /// 読めない・描けない。
     #[error("{0}")]
     Failed(String),
+    /// 同じアイテムの前の保存が終わっていないので開かない（ADR-189）。終わる（中止する）と開ける。
+    #[error("前の保存（ジョブ {job}）が終わっていません")]
+    SavePending { job: JobId },
     /// 文書の出力の形式をこの環境では書けない（MP3 で ffmpeg がない、など。M13 段 3）。`fallback` は代わりの既定（音声は
     /// Ogg Vorbis）。保存を積む前に断る（保存する形式を選び直す）。
     #[error("{}", format_unavailable_message(.format, .fallback.as_deref()))]
@@ -178,7 +181,7 @@ impl EditorError {
         let code = match self {
             Self::Invalid { .. } | Self::NotFound(_) | Self::Failed(_) => ProblemCode::Invalid,
             Self::TooLarge(_) => ProblemCode::TooLarge,
-            Self::Busy(_) => ProblemCode::Busy,
+            Self::Busy(_) | Self::SavePending { .. } => ProblemCode::Busy,
             Self::ToolMissing(_) => ProblemCode::ToolMissing,
             Self::Conflict(_) | Self::Mismatch(_) | Self::Canceled | Self::NoSession => {
                 ProblemCode::Conflict
@@ -1653,6 +1656,11 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             message: format!("{} は編集できません（画像と音声だけ）", head.kind.as_str()),
             issues: Vec::new(),
         });
+    }
+    // 同じアイテムの前の保存が終わっていなければ開かない（ADR-189）。開くと、その保存で古くなる土台の上で手を受け、下書きを
+    // 置き換えてしまう。セッションを作らないので手は Rust に届かない（下書きは残り、終わったあとに開き直すと付け替わっている）
+    if let Some(job) = db.read(|c| pending_save(c, item_id))? {
+        return Err(EditorError::SavePending { job });
     }
     let draft = db.read(|c| {
         let Some(d) = drafts::get(c, item_id)? else {

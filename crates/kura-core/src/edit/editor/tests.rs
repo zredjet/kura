@@ -1508,24 +1508,43 @@ fn canceling_a_save_tells_it_was_canceled_and_allows_the_next_save() {
     assert!(save(&env.env(), s, SaveMode::Overwrite, None).is_ok());
 }
 
-/// 同じアイテムの保存が待っている間は、エディタを閉じて開き直しても次の保存を Busy で断る（DB のジョブで見る。土台がずれて
-/// Conflict になるため）。形式を変える手も確定しない。保存の口（`start_save`）も同じで、断るときは文書の部品も置かない。ほかの
-/// アイテムは積める。待っている保存が終われば積める。
+/// 開いているエディタの外で積んだ同じアイテムの保存が待っている間は、エディタの次の保存を Busy で断る（DB のジョブで見る。土台が
+/// ずれて Conflict になるため）。形式を変える手も確定しない。保存の口（`start_save`）も同じで、断るときは文書の部品も置かない。
+/// ほかのアイテムは積める。
 #[test]
-fn a_pending_save_blocks_the_next_save_even_after_reopening() {
+fn a_pending_save_blocks_the_next_save_of_an_open_editor() {
     let env = Env::new();
     let png = sprite_png(24, 20, 13);
     let id = add_item(&env.lib, &png, 24, 20);
     let other = add_item(&env.lib, &sprite_png(8, 8, 18), 8, 8);
     let opened = env.open(id);
-    env.step(&opened.session, vec![flip("horizontal")]);
-    let first = save(&env.env(), &opened.session, SaveMode::Overwrite, None).unwrap();
-    close(&env.engine, &opened.session);
-    // 開き直す（保存はまだ動いていない）
-    let again = env.open(id);
-    let s = &again.session;
-    assert_eq!(again.base_version, 0);
+    let s = &opened.session;
+    assert_eq!(opened.base_version, 0);
     let edited = env.step(s, vec![flip("vertical")]);
+    let hash = *blake3::hash(&png).as_bytes();
+    let doc = |axes: &[&str]| {
+        let mut graph = Graph::new_single();
+        for axis in axes {
+            graph
+                .push_linear("image.flip", 1, json!({ "axis": axis }), 0)
+                .unwrap();
+        }
+        graph
+    };
+    let req = |item_id: i64, base_hash: [u8; 32], graph: Graph| SaveRequest {
+        item_id,
+        base: Base {
+            hash: base_hash,
+            version: 0,
+        },
+        action: SaveAction::Overwrite { graph },
+    };
+    let first = start_save(
+        env.lib.db(),
+        &env.jobs,
+        &req(id, hash, doc(&["horizontal"])),
+    )
+    .unwrap();
     for format in [
         None,
         Some(FormatChoice::To {
@@ -1539,27 +1558,10 @@ fn a_pending_save_blocks_the_next_save_even_after_reopening() {
     let still = view(&env.env(), s, &Viewport::whole()).unwrap();
     assert_eq!(still.status, edited.status, "形式を変える手も確定しない");
     // 保存の口も同じ（部品も置かない）
-    let hash = *blake3::hash(&png).as_bytes();
-    let mut graph = Graph::new_single();
-    graph
-        .push_linear("image.flip", 1, json!({ "axis": "vertical" }), 0)
-        .unwrap();
-    graph
-        .push_linear("image.flip", 1, json!({ "axis": "vertical" }), 0)
-        .unwrap();
-    let req = |item_id: i64, base_hash: [u8; 32]| SaveRequest {
-        item_id,
-        base: Base {
-            hash: base_hash,
-            version: 0,
-        },
-        action: SaveAction::Overwrite {
-            graph: graph.clone(),
-        },
-    };
-    let r = start_save(env.lib.db(), &env.jobs, &req(id, hash));
+    let refused = doc(&["vertical", "vertical"]);
+    let r = start_save(env.lib.db(), &env.jobs, &req(id, hash, refused.clone()));
     assert!(matches!(r, Err(CoreError::Busy(_))), "{r:?}");
-    let root = kura_engine::doc_parts::split(&graph).unwrap().root;
+    let root = kura_engine::doc_parts::split(&refused).unwrap().root;
     assert!(
         env.lib
             .db()
@@ -1582,15 +1584,348 @@ fn a_pending_save_blocks_the_next_save_even_after_reopening() {
         .unwrap()
         .try_into()
         .unwrap();
-    let other_job = start_save(env.lib.db(), &env.jobs, &req(other, other_hash)).unwrap();
-    // 待っている保存が終われば積める
+    let other_job = start_save(
+        env.lib.db(),
+        &env.jobs,
+        &req(other, other_hash, doc(&["vertical"])),
+    )
+    .unwrap();
     env.start_jobs();
-    for job in [first.job, other_job] {
+    for job in [first, other_job] {
         assert_eq!(env.jobs.get(job).unwrap().state, JobState::Done);
     }
-    assert!(save(&env.env(), s, SaveMode::Overwrite, None).is_ok());
-    assert!(env.jobs.wait_idle(WAIT));
     close(&env.engine, s);
+}
+
+/// 開こうとして断られた誤り（`Opened` は比べられないので、開けたら止める）。
+fn refused_open(env: &EditorEnv<'_>, item_id: i64, from_draft: bool) -> EditorError {
+    match open(
+        env,
+        &OpenRequest {
+            item_id,
+            viewport: Viewport::whole(),
+            from_draft,
+        },
+    ) {
+        Ok(_) => panic!("前の保存が終わっていないのに開けた"),
+        Err(err) => err,
+    }
+}
+
+/// `job` が終わるまで、開いても下書きから開いても `SavePending` で断られ、セッションを作らない。
+fn assert_held_by(env: &EditorEnv<'_>, item_id: i64, job: JobId) {
+    for from_draft in [false, true] {
+        let err = refused_open(env, item_id, from_draft);
+        assert!(
+            matches!(err, EditorError::SavePending { job: j } if j == job),
+            "{err:?}"
+        );
+        assert!(
+            env.engine.current_editor().is_none(),
+            "セッションを作らない"
+        );
+    }
+}
+
+/// 上書きを積み、手を足して閉じる（下書きは保存のあとの手まで。土台を待つジョブ付き）。
+fn saved_then_edited_and_closed(env: &Env, item_id: i64) -> JobId {
+    let opened = env.open(item_id);
+    let s = &opened.session;
+    env.step(s, vec![flip("horizontal")]);
+    let job = save(&env.env(), s, SaveMode::Overwrite, None).unwrap().job;
+    env.step(s, vec![flip("vertical")]);
+    close(&env.engine, s);
+    job
+}
+
+/// 保存のジョブが正しく終わったことを確かめ（Conflict で失敗していない）、アイテムの頭の版を返す。
+fn assert_saved(env: &Env, item_id: i64, job: JobId) -> i64 {
+    let record = env.jobs.get(job).unwrap();
+    assert_eq!(record.state, JobState::Done, "{:?}", record.message);
+    env.lib
+        .db()
+        .read(|c| versions::head(c, item_id))
+        .unwrap()
+        .unwrap()
+        .version
+}
+
+/// 同じアイテムの保存が終わっていなければ開かない（待ち・一時停止。開いても下書きから開いても。ADR-189）：セッションがないので
+/// 手は Rust に届かず、下書きは置き換わらない・消えない。ほかのアイテムは開ける。
+#[test]
+fn a_pending_save_refuses_opening_and_keeps_the_draft() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(24, 20, 21), 24, 20);
+    let other = add_item(&env.lib, &sprite_png(8, 8, 22), 8, 8);
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    env.step(&s, vec![flip("horizontal")]);
+    let job = save(&env.env(), &s, SaveMode::Overwrite, None).unwrap().job;
+    env.step(&s, vec![flip("vertical")]);
+    close(&env.engine, &s);
+    let draft = || env.lib.db().read(|c| drafts::get(c, id)).unwrap();
+    let kept = draft().unwrap();
+    assert_eq!(kept.after_job, Some(job));
+
+    assert_held_by(&env.env(), id, job);
+    env.jobs.pause(job).unwrap();
+    assert_eq!(env.jobs.get(job).unwrap().state, JobState::Paused);
+    assert_held_by(&env.env(), id, job);
+
+    // 前のセッションの口にも手は届かない（前の問題：手で下書きが置き換わり、取り消すと消えた）
+    let late = step(&env.env(), &s, vec![flip("horizontal")], &Viewport::whole());
+    assert!(matches!(late, Err(EditorError::NoSession)), "{late:?}");
+    assert_eq!(draft(), Some(kept), "下書きは置き換わらない・消えない");
+
+    // ほかのアイテムは開いて編集できる。そのあとも同じアイテムは断る
+    let o = env.open(other);
+    env.step(&o.session, vec![flip("horizontal")]);
+    close(&env.engine, &o.session);
+    assert_held_by(&env.env(), id, job);
+}
+
+/// 再開して終わったら開ける：下書きは新しい頭の上で開け、続きの保存は Conflict にならず版が増える（結果まで確かめる。下書きから
+/// でも、下書きを使わずに頭から編集しても。上書きでも別名で保存でも）。
+#[test]
+fn resuming_the_pending_save_lets_the_next_save_succeed() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(24, 20, 23), 24, 20);
+    let job = saved_then_edited_and_closed(&env, id);
+    env.jobs.pause(job).unwrap();
+    assert_held_by(&env.env(), id, job);
+    env.jobs.resume(job).unwrap();
+    env.start_jobs();
+    assert_eq!(assert_saved(&env, id, job), 1);
+
+    // 下書きは新しい頭に付け替わって開ける
+    let plain = env.open(id);
+    assert_eq!(plain.base_version, 1);
+    assert!(plain.draft.exists && plain.draft.fresh && !plain.draft.opened);
+    let restored = env.open_with(id, Viewport::whole(), true);
+    assert!(restored.draft.opened);
+    assert_eq!(restored.base_version, 1);
+    assert_eq!(restored.outcome.doc.order.len(), 2, "保存のあとの手まで");
+    assert!(restored.outcome.status.dirty);
+    let s = &restored.session;
+    let second = save(&env.env(), s, SaveMode::Overwrite, None).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_eq!(assert_saved(&env, id, second.job), 2, "Conflict にならない");
+    let after = view(&env.env(), s, &Viewport::whole()).unwrap();
+    assert_eq!(after.status.saving, None);
+    assert!(!after.status.dirty);
+    close(&env.engine, s);
+
+    // 下書きを使わずに開いても、頭の上で編集して保存できる（別名で保存も）
+    let fresh = env.open(id);
+    assert!(!fresh.draft.exists, "保存した文書と同じ下書きは消える");
+    assert_eq!(fresh.base_version, 2);
+    let s = &fresh.session;
+    env.step(s, vec![flip("horizontal")]);
+    let third = save(&env.env(), s, SaveMode::Overwrite, None).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_eq!(assert_saved(&env, id, third.job), 3);
+    view(&env.env(), s, &Viewport::whole()).unwrap();
+    env.step(s, vec![flip("vertical")]);
+    let copy = save(
+        &env.env(),
+        s,
+        SaveMode::SaveAs {
+            title: "写し".into(),
+            stem: "copy".into(),
+        },
+        None,
+    )
+    .unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_eq!(
+        assert_saved(&env, id, copy.job),
+        3,
+        "別名はこのアイテムの版を増やさない"
+    );
+    close(&env.engine, s);
+}
+
+/// 保存のあとに手がなければ、終わると下書きは消えていて（同じ文書）、シートなしで開ける。
+#[test]
+fn a_draft_of_the_same_doc_is_gone_after_the_pending_save() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(24, 20, 24), 24, 20);
+    let opened = env.open(id);
+    let s = &opened.session;
+    env.step(s, vec![flip("horizontal")]);
+    let job = save(&env.env(), s, SaveMode::Overwrite, None).unwrap().job;
+    close(&env.engine, s);
+    assert!(env.lib.db().read(|c| drafts::get(c, id)).unwrap().is_some());
+    assert_held_by(&env.env(), id, job);
+    env.start_jobs();
+    assert_eq!(assert_saved(&env, id, job), 1);
+    let again = env.open(id);
+    assert!(!again.draft.exists);
+    assert!(!again.outcome.status.dirty);
+    assert_eq!(again.outcome.doc.order.len(), 1, "保存した版の文書");
+    close(&env.engine, &again.session);
+}
+
+/// 中止したら開ける：頭は変わらず、下書きは同じ土台のまま開けて、保存のあとの手まで保存できる（前の問題：中止すると編集が失われた）。
+#[test]
+fn canceling_the_pending_save_opens_from_the_draft() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(24, 20, 25), 24, 20);
+    let job = saved_then_edited_and_closed(&env, id);
+    let kept = env.lib.db().read(|c| drafts::get(c, id)).unwrap().unwrap();
+    env.jobs.pause(job).unwrap();
+    assert_held_by(&env.env(), id, job);
+    env.jobs.cancel(job).unwrap();
+    assert_eq!(env.jobs.get(job).unwrap().state, JobState::Canceled);
+
+    let plain = env.open(id);
+    assert_eq!(plain.base_version, 0);
+    assert!(plain.draft.exists && plain.draft.fresh);
+    let restored = env.open_with(id, Viewport::whole(), true);
+    assert_eq!(restored.outcome.doc.order.len(), 2);
+    assert!(restored.outcome.status.dirty);
+    let editor = env.engine.current_editor().unwrap();
+    let digest = {
+        let st = editor.lock_state();
+        let st = st.as_ref().unwrap();
+        kura_engine::doc_parts::split(&st.session.head().to_graph())
+            .unwrap()
+            .root
+    };
+    assert_eq!(digest, kept.doc, "下書きの文書");
+    let s = &restored.session;
+    let second = save(&env.env(), s, SaveMode::Overwrite, None).unwrap();
+    env.start_jobs();
+    assert_eq!(assert_saved(&env, id, second.job), 1);
+    close(&env.engine, s);
+}
+
+/// アプリを開き直す（ジョブの管理を止め、同じライブラリに新しいジョブの管理・エンジンを作る。動かし始めるのは呼び手）。
+fn restart(env: &Env) -> (Arc<EngineServices>, JobManager) {
+    env.jobs.shutdown();
+    let engine = Arc::new(EngineServices::new(
+        Arc::new(FakeEngineFactory::default()),
+        env.lib.layout().staging_dir().join(ENGINE_WORK_DIR),
+    ));
+    let sink: EventSink = Arc::new(|_| {});
+    let jobs = JobManager::new(
+        env.lib.clone(),
+        vec![(JobKind::Edit, Arc::new(EditHandler::new(engine.clone())))],
+        sink,
+    )
+    .unwrap();
+    (engine, jobs)
+}
+
+/// アプリを開き直したあと（新しいジョブの管理・エンジン。DB の一時停止のジョブは残る）も開かない。再開して終われば開ける。
+#[test]
+fn a_paused_save_still_refuses_opening_after_a_restart() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(24, 20, 26), 24, 20);
+    let job = saved_then_edited_and_closed(&env, id);
+    env.jobs.pause(job).unwrap();
+
+    let (engine, jobs) = restart(&env);
+    let restarted = EditorEnv {
+        library: &env.lib,
+        jobs: &jobs,
+        engine: &engine,
+    };
+    assert_held_by(&restarted, id, job);
+    jobs.resume(job).unwrap();
+    jobs.start().unwrap();
+    assert!(jobs.wait_idle(WAIT));
+    assert_eq!(jobs.get(job).unwrap().state, JobState::Done);
+    let opened = open(
+        &restarted,
+        &OpenRequest {
+            item_id: id,
+            viewport: Viewport::whole(),
+            from_draft: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(opened.base_version, 1);
+    let second = save(&restarted, &opened.session, SaveMode::Overwrite, None).unwrap();
+    assert!(jobs.wait_idle(WAIT));
+    assert_eq!(jobs.get(second.job).unwrap().state, JobState::Done);
+    close(&engine, &opened.session);
+}
+
+/// 迷う形も `save::pending_save` の見方に揃える：別名で保存（ジョブの入力のアイテムは元のアイテム）・版に戻すが待っている間も、
+/// 元のアイテムは開かない（次の保存を Busy で断るのと同じ条件）。別名で保存が終われば元のアイテムの土台は変わらず、版に戻すが
+/// 終われば頭が進む。
+#[test]
+fn save_as_and_revert_hold_the_item_they_came_from() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(24, 20, 27), 24, 20);
+    let opened = env.open(id);
+    let s = &opened.session;
+    env.step(s, vec![flip("horizontal")]);
+    let copy = save(
+        &env.env(),
+        s,
+        SaveMode::SaveAs {
+            title: "写し".into(),
+            stem: "copy".into(),
+        },
+        None,
+    )
+    .unwrap()
+    .job;
+    close(&env.engine, s);
+    assert_held_by(&env.env(), id, copy);
+    env.start_jobs();
+    assert_eq!(
+        assert_saved(&env, id, copy),
+        0,
+        "別名はこのアイテムの版を増やさない"
+    );
+
+    let opened = env.open(id);
+    assert_eq!(opened.base_version, 0);
+    let s = &opened.session;
+    env.step(s, vec![flip("vertical")]);
+    let first = save(&env.env(), s, SaveMode::Overwrite, None).unwrap().job;
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_eq!(assert_saved(&env, id, first), 1);
+    close(&env.engine, s);
+
+    // 版に戻す（動かし始める前のジョブの管理で積む）
+    let (engine, jobs) = restart(&env);
+    let held = EditorEnv {
+        library: &env.lib,
+        jobs: &jobs,
+        engine: &engine,
+    };
+    let opened = open(
+        &held,
+        &OpenRequest {
+            item_id: id,
+            viewport: Viewport::whole(),
+            from_draft: false,
+        },
+    )
+    .unwrap();
+    let revert = save(&held, &opened.session, SaveMode::Revert { to: 0 }, None)
+        .unwrap()
+        .job;
+    close(&engine, &opened.session);
+    assert_held_by(&held, id, revert);
+    jobs.start().unwrap();
+    assert!(jobs.wait_idle(WAIT));
+    assert_eq!(jobs.get(revert).unwrap().state, JobState::Done);
+    let again = open(
+        &held,
+        &OpenRequest {
+            item_id: id,
+            viewport: Viewport::whole(),
+            from_draft: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(again.base_version, 2);
+    close(&engine, &again.session);
 }
 
 /// 閉じている途中（前の要求がエディタの錠を持っている間）に別のアイテムを開いても、閉じ終わりが新しいエディタの取り置きを

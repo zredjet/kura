@@ -1115,6 +1115,8 @@ impl From<EditorError> for AppError {
             }
             // 保存する形式をこの環境で書けない（M13 段 3。フロントは形式を選ぶシートを出す）
             EditorError::FormatUnavailable { .. } => AppErrorCode::FormatUnavailable,
+            // 前の保存が終わっていない（フロントは「前の保存が終わっていません」のシートを出す。ADR-189）
+            EditorError::SavePending { .. } => AppErrorCode::SavePending,
             EditorError::Core(_) => AppErrorCode::Internal,
         };
         match err {
@@ -1879,6 +1881,10 @@ mod tests {
             (EditorError::NoSession, AppErrorCode::NotFound),
             (EditorError::TooLarge("x".into()), AppErrorCode::TooLarge),
             (EditorError::Busy("x".into()), AppErrorCode::Busy),
+            (
+                EditorError::SavePending { job: 9 },
+                AppErrorCode::SavePending,
+            ),
             (
                 EditorError::ToolMissing("ffmpeg".into()),
                 AppErrorCode::ToolMissing,
