@@ -1,9 +1,12 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { type MenuAction, type MenuEntry, useMenuStore } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { EDIT_OPS, type IssueCode } from '../../ipc/edit';
 import type { ItemSummaryDto } from '../../ipc/items';
+import { cancelJob, pauseJob, resumeJob } from '../../ipc/jobs';
+import { useJobsStore } from '../../stores/jobsStore';
 import { Editor } from './Editor';
 import { useEditorStore } from './editorStore';
 import { useImageStore } from './image/imageStore';
@@ -11,6 +14,18 @@ import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
 
 vi.mock('../library/inspector/ItemInspector', () => ({
   ItemInspector: ({ id }: { id: number }) => <p>インスペクタ {id}</p>,
+}));
+
+vi.mock('../../ipc/edit', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../ipc/edit')>()),
+  listPendingSaves: vi.fn(() => new Promise(() => undefined)),
+}));
+
+vi.mock('../../ipc/jobs', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../ipc/jobs')>()),
+  pauseJob: vi.fn(async () => null),
+  resumeJob: vi.fn(async () => null),
+  cancelJob: vi.fn(async () => null),
 }));
 
 vi.mock('../../ipc/items', async (importOriginal) => ({
@@ -193,6 +208,184 @@ describe('画像エディタの画面', () => {
     render(<Editor />);
     expect(screen.getByRole('alert')).toHaveTextContent(t.viewFailed);
     expect(screen.getByRole('button', { name: t.undo })).toBeInTheDocument();
+  });
+});
+
+describe('保存の一時停止・再開・中止（▾ とボタン）', () => {
+  const SAVE = {
+    job: 21,
+    mode: 'overwrite' as const,
+    rev: 2,
+    state: 'running' as const,
+    progress: 0.42,
+    slow: false,
+    title: null,
+    before: null,
+    after: null,
+  };
+
+  /** ▾ を押して、開いたメニューの項目。 */
+  function openMore(): MenuEntry[] {
+    fireEvent.click(screen.getByRole('button', { name: t.saveMore }));
+    return useMenuStore.getState().menu?.entries ?? [];
+  }
+  /** 項目の名前（区切りは「-」）。 */
+  const labels = (entries: MenuEntry[]) => entries.map((e) => (e === 'separator' ? '-' : e.label));
+  function action(entries: MenuEntry[], label: string): MenuAction {
+    const found = entries.find((e) => e !== 'separator' && e.label === label);
+    if (!found || found === 'separator' || 'submenu' in found) throw new Error(label);
+    return found;
+  }
+
+  beforeEach(() => {
+    vi.mocked(pauseJob).mockClear();
+    vi.mocked(resumeJob).mockClear();
+    vi.mocked(cancelJob).mockClear();
+    useJobsStore.setState({ saves: {}, endedSaves: {} });
+    useToolStore.setState({ ...DEFAULT_TOOLS });
+  });
+
+  afterEach(() => {
+    useMenuStore.setState({ menu: null });
+    useJobsStore.setState({ saves: {}, endedSaves: {} });
+    useEditorStore.setState({ phase: 'closed', item: null, save: null, sheet: null });
+  });
+
+  it('保存していないときは今までの項目だけで、ボタンは「保存」', () => {
+    openState();
+    render(<Editor />);
+    expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
+    expect(labels(openMore())).toEqual([t.saveAs, '-', t.revert, t.versions]);
+  });
+
+  it('保存の間：ボタンは「保存中 42%」、▾ は「保存を一時停止」「保存を中止」（別名・元に戻すは押せない）', () => {
+    openState();
+    useEditorStore.setState({ save: SAVE });
+    render(<Editor />);
+    const button = screen.getByRole('button', { name: t.savingPercent('42') });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute('aria-busy', 'true');
+    const entries = openMore();
+    expect(labels(entries)).toEqual([
+      t.savePause,
+      t.saveCancel,
+      '-',
+      t.saveAs,
+      '-',
+      t.revert,
+      t.versions,
+    ]);
+    expect(action(entries, t.saveAs).disabled).toBe(true);
+    expect(action(entries, t.revert).disabled).toBe(true);
+    expect(action(entries, t.versions).disabled).toBeFalsy();
+    action(entries, t.savePause).onSelect();
+    expect(pauseJob).toHaveBeenCalledWith(21);
+    action(entries, t.saveCancel).onSelect();
+    expect(cancelJob).toHaveBeenCalledWith(21);
+  });
+
+  it('一時停止の間：ボタンは「一時停止中 42%」、▾ は「保存を再開」「保存を中止」', () => {
+    openState();
+    useEditorStore.setState({ save: { ...SAVE, state: 'paused' } });
+    render(<Editor />);
+    const button = screen.getByRole('button', { name: t.savePausedPercent('42') });
+    expect(button).toBeDisabled();
+    expect(button).not.toHaveAttribute('aria-busy');
+    const entries = openMore();
+    expect(labels(entries)).toEqual([
+      t.saveResume,
+      t.saveCancel,
+      '-',
+      t.saveAs,
+      '-',
+      t.revert,
+      t.versions,
+    ]);
+    action(entries, t.saveResume).onSelect();
+    expect(resumeJob).toHaveBeenCalledWith(21);
+    expect(pauseJob).not.toHaveBeenCalled();
+    action(entries, t.saveCancel).onSelect();
+    expect(cancelJob).toHaveBeenCalledWith(21);
+  });
+
+  it('進捗の分からない一時停止は「一時停止中」、再開したあと（頭から）は「保存中…」', () => {
+    openState();
+    useEditorStore.setState({ save: { ...SAVE, state: 'paused', progress: null } });
+    render(<Editor />);
+    expect(screen.getByRole('button', { name: t.savePaused })).toBeDisabled();
+    act(() => useEditorStore.setState({ save: { ...SAVE, state: 'queued', progress: null } }));
+    expect(screen.getByRole('button', { name: t.saving })).toBeDisabled();
+  });
+
+  it('開き直したエディタでも、待っている保存（前のエディタで積んだもの）が一時停止中なら同じに出す', () => {
+    useJobsStore.getState().trackSave({
+      id: 30,
+      itemId: ITEM.id,
+      itemTitle: 'hero.png',
+      mode: 'overwrite',
+      newTitle: null,
+      state: 'paused',
+      progress: 0.42,
+      message: null,
+    });
+    openState();
+    render(<Editor />);
+    expect(screen.getByRole('button', { name: t.savePausedPercent('42') })).toBeDisabled();
+    const entries = openMore();
+    expect(labels(entries).slice(0, 2)).toEqual([t.saveResume, t.saveCancel]);
+    expect(action(entries, t.saveAs).disabled).toBe(true);
+    action(entries, t.saveResume).onSelect();
+    expect(resumeJob).toHaveBeenCalledWith(30);
+    useMenuStore.setState({ menu: null });
+
+    // 再開した：頭から。進めば「保存中 5%」、▾ は一時停止に
+    const job = (state: 'queued' | 'running' | 'canceled', progress: number | null) => ({
+      id: 30,
+      kind: 'edit' as const,
+      state,
+      progress,
+      message: null,
+      resultJson: null,
+    });
+    act(() => useJobsStore.getState().apply(job('queued', null)));
+    expect(screen.getByRole('button', { name: t.saving })).toBeDisabled();
+    act(() => useJobsStore.getState().apply(job('running', 0.05)));
+    expect(screen.getByRole('button', { name: t.savingPercent('5') })).toBeDisabled();
+    action(openMore(), t.savePause).onSelect();
+    expect(pauseJob).toHaveBeenCalledWith(30);
+    useMenuStore.setState({ menu: null });
+
+    // 中止・完了：ボタンは「保存」に戻る（保存していない変更があるので押せる）
+    act(() => useJobsStore.getState().apply(job('canceled', null)));
+    expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
+    expect(labels(openMore())).toEqual([t.saveAs, '-', t.revert, t.versions]);
+  });
+
+  it('ほかのアイテムの保存はこのエディタに出さない', () => {
+    useJobsStore.getState().trackSave({
+      id: 30,
+      itemId: ITEM.id + 1,
+      itemTitle: 'other',
+      mode: 'overwrite',
+      newTitle: null,
+      state: 'paused',
+      progress: 0.42,
+      message: null,
+    });
+    openState();
+    render(<Editor />);
+    expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
+  });
+
+  it('開けなかったときは ▾ を押せない', () => {
+    useEditorStore.setState({
+      phase: 'error',
+      kind: 'image',
+      item: ITEM,
+      failure: { kind: 'open', code: 'Busy', message: '混んでいます' },
+    });
+    render(<Editor />);
+    expect(screen.getByRole('button', { name: t.saveMore })).toBeDisabled();
   });
 });
 

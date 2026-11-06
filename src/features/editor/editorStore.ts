@@ -136,6 +136,16 @@ export interface EditorSave {
   after: ItemSize | null;
 }
 
+/**
+ * 開く前に積んだ同じアイテムの保存のジョブ（閉じて開き直したとき。Rust の `status.saving` はそのセッションで積んだものだけなので、
+ * jobsStore の表で見る）。終わるまで次の保存は積めない（Rust の Busy）。終わっても土台は替わらない。
+ */
+export interface EditorEarlierSave {
+  job: number;
+  state: JobStateDto;
+  progress: number | null;
+}
+
 /** 失敗（開けなかった・表示できなかった・要求が通らなかった）。 */
 export interface EditorFailure {
   kind: 'open' | 'view' | 'request';
@@ -167,6 +177,8 @@ export interface EditorState {
   selected: number | null;
   sheet: EditorSheet | null;
   save: EditorSave | null;
+  /** 開く前に積んだ同じアイテムの保存（`save` とは同時に持たない）。 */
+  earlierSave: EditorEarlierSave | null;
   /** 断られた手の指摘（引数の欄の下に出す）。 */
   issues: Issue[];
   /** 応えの来ていない文書の手（送った・ためた手）がある（未保存に数える）。 */
@@ -200,6 +212,7 @@ function closedState(panel: EditorPanel, openId: number): EditorState {
     selected: null,
     sheet: null,
     save: null,
+    earlierSave: null,
     issues: [],
     pendingSteps: false,
     acked: 0,
@@ -297,7 +310,7 @@ export function applyDocDelta(doc: EditorDoc, delta: EditDocDeltaDto): EditorDoc
 
 /**
  * 保存していない変更があるか（閉じるときに確かめる）。応えの来ていない文書の手（送った・ためた手）も数える。保存のジョブが
- * 今の頭を保存している途中なら、閉じても保存は続くので含めない。
+ * 今の頭を保存している途中なら、閉じても保存は続くので含めない（一時停止中も、閉じたあとにカプセルから再開できるので含めない）。
  */
 export function hasUnsavedChanges(
   s: Pick<EditorState, 'status' | 'save'> & { pendingSteps?: boolean },
@@ -326,15 +339,22 @@ export function originalFormatOf(
   return s.originalFormat ?? formatsFor(s.item)?.formatOfExt(s.item?.ext) ?? null;
 }
 
+/** 今のエディタのアイテムで待っている保存のジョブ（このエディタで積んだもの、なければ開く前に積んだもの）。 */
+export function activeSave(
+  s: Pick<EditorState, 'save' | 'earlierSave'>,
+): EditorSave | EditorEarlierSave | null {
+  return s.save ?? s.earlierSave;
+}
+
 /**
- * 保存（上書き）できるか：開いていて、保存の途中でなく、保存していない変更がある（応えの来ていない手も）か、元の形式に
- * 書けず形式を変えて保存するとき（ボタン・⌘S・ファイル › 保存）。
+ * 保存（上書き）できるか：開いていて、保存の途中でなく（一時停止中・開く前に積んだ保存を含む）、保存していない変更がある（応えの
+ * 来ていない手も）か、元の形式に書けず形式を変えて保存するとき（ボタン・⌘S・ファイル › 保存）。
  */
 export function canSaveEditor(
   s: Pick<EditorState, 'phase' | 'save' | 'status' | 'pendingSteps' | 'doc' | 'item'> &
-    Partial<Pick<EditorState, 'originalFormat'>>,
+    Partial<Pick<EditorState, 'originalFormat' | 'earlierSave'>>,
 ): boolean {
-  if (s.phase !== 'open' || s.save || !s.status) return false;
+  if (s.phase !== 'open' || s.save || s.earlierSave || !s.status) return false;
   if (s.status.dirty || s.pendingSteps) return true;
   const formats = formatsFor(s.item);
   if (!formats) return false;

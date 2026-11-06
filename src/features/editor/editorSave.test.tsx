@@ -8,6 +8,7 @@ import { type AssetDto, getAsset } from '../../ipc/asset';
 import {
   closeEdit,
   discardEditDraft,
+  type EditPendingSaveDto,
   type EditStatusDto,
   type EditStepResultDto,
   type EditVersionDto,
@@ -15,15 +16,17 @@ import {
   type EditWritableFormatDto,
   listEditFormats,
   listEditVersions,
+  listPendingSaves,
   openEdit,
   saveEdit,
   stepEdit,
   viewEdit,
 } from '../../ipc/edit';
 import { getItems, type ItemSummaryDto } from '../../ipc/items';
-import { type JobDto, listJobs } from '../../ipc/jobs';
+import { type JobDto, type JobProgress, listJobs } from '../../ipc/jobs';
 import { IpcError } from '../../ipc/result';
 import { invalidateItems } from '../../stores/itemCache';
+import { shownSaves, useJobsStore } from '../../stores/jobsStore';
 import { useNoticeStore } from '../../stores/noticeStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { AUDIO_FORMATS } from './audio/audioFormats';
@@ -35,7 +38,7 @@ import {
   defaultFormatChoice,
   dismissSheet,
   formatChoices,
-  onEditorJob,
+  onEditorJob as handleEditorJob,
   openRevert,
   openSaveAs,
   openVersions,
@@ -80,6 +83,7 @@ vi.mock('../../ipc/edit', async (importOriginal) => ({
   saveEdit: vi.fn(),
   listEditFormats: vi.fn(),
   listEditVersions: vi.fn(async () => []),
+  listPendingSaves: vi.fn(async () => []),
   discardEditDraft: vi.fn(async () => true),
 }));
 
@@ -104,6 +108,12 @@ vi.mock('../../stores/itemCache', async (importOriginal) => ({
 }));
 
 const t = ja.editor;
+
+/** 保存のジョブのイベント（本物と同じく、jobsStore が受けてからエディタへ回す）。 */
+function onEditorJob(event: JobProgress): void {
+  useJobsStore.getState().apply(event);
+  handleEditorJob(event);
+}
 
 function item(over: Partial<ItemSummaryDto> = {}): ItemSummaryDto {
   return {
@@ -353,8 +363,11 @@ beforeEach(() => {
   vi.mocked(saveEdit).mockResolvedValue(started() as Awaited<ReturnType<typeof saveEdit>>);
   vi.mocked(closeEdit).mockImplementation(async () => null);
   vi.mocked(discardEditDraft).mockImplementation(async () => true);
+  vi.mocked(listPendingSaves).mockReset();
+  vi.mocked(listPendingSaves).mockResolvedValue([]);
   useToolStore.setState({ ...DEFAULT_TOOLS });
   useNoticeStore.setState({ message: null, action: null });
+  useJobsStore.setState({ imports: {}, dismissed: {}, saves: {}, endedSaves: {} });
 });
 
 afterEach(async () => {
@@ -648,7 +661,10 @@ describe('書けない形式（FormatUnavailable）', () => {
     );
 
     // 別名で保存が断られたら、同じ名前の別名で積み直す
-    act(() => useEditorStore.setState({ save: null, status: status() }));
+    act(() => {
+      useJobsStore.getState().apply(event('done'));
+      useEditorStore.setState({ save: null, status: status() });
+    });
     vi.mocked(saveEdit).mockRejectedValueOnce(formatUnavailable());
     act(() => submitSaveAs('写し'));
     await flush();
@@ -1591,6 +1607,396 @@ describe('閉じたあとに終わる保存', () => {
     expect(useNoticeStore.getState().message).toBe(
       t.saveFailedClosed('hero', 'ディスクがいっぱいです'),
     );
+  });
+});
+
+describe('保存の一時停止・再開・中止', () => {
+  /** 上書きの保存を積み、途中まで進める。 */
+  async function saving(progress = 0.42) {
+    await openDirty();
+    requestSave();
+    await flush();
+    act(() => onEditorJob(event('running', { progress })));
+  }
+
+  it('積んだ保存はカプセルが読む表にも載る（名前・向き）', async () => {
+    await saving();
+    expect(useJobsStore.getState().saves[9]).toMatchObject({
+      itemId: 7,
+      itemTitle: 'hero',
+      mode: 'overwrite',
+      state: 'running',
+      progress: 0.42,
+    });
+    // 別名で保存は新しい名前
+    act(() => onEditorJob(event('canceled')));
+    await flush();
+    useJobsStore.setState({ endedSaves: {} });
+    act(() => submitSaveAs('夕方'));
+    await flush();
+    expect(useJobsStore.getState().saves[9]).toMatchObject({ mode: 'saveAs', newTitle: '夕方' });
+  });
+
+  it('一時停止：進捗はそのまま（イベントが進捗を持たなくても）。再開は頭から', async () => {
+    await saving();
+    act(() => onEditorJob(event('paused')));
+    expect(useEditorStore.getState().save).toMatchObject({ state: 'paused', progress: 0.42 });
+    act(() => onEditorJob(event('queued')));
+    expect(useEditorStore.getState().save).toMatchObject({ state: 'queued', progress: null });
+    act(() => onEditorJob(event('running')));
+    expect(useEditorStore.getState().save?.progress).toBeNull();
+    act(() => onEditorJob(event('running', { progress: 0.05 })));
+    expect(useEditorStore.getState().save?.progress).toBe(0.05);
+  });
+
+  it('一時停止の間は「エディタを閉じると進みます」を出さない。再開したら見張り直す', async () => {
+    await openDirty();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    requestSave();
+    await vi.advanceTimersByTimeAsync(0);
+    act(() => onEditorJob(event('running', { progress: 0.05 })));
+    act(() => onEditorJob(event('paused')));
+    await act(() => vi.advanceTimersByTimeAsync(SLOW_SAVE_MS + 1));
+    expect(useEditorStore.getState().save?.slow).toBe(false);
+    // 出ているときに一時停止しても消える
+    act(() => onEditorJob(event('queued')));
+    act(() => onEditorJob(event('running', { progress: 0.05 })));
+    await act(() => vi.advanceTimersByTimeAsync(SLOW_SAVE_MS));
+    expect(useEditorStore.getState().save?.slow).toBe(true);
+    act(() => onEditorJob(event('paused')));
+    expect(useEditorStore.getState().save?.slow).toBe(false);
+  });
+
+  it('一時停止の間の ⌘S・別名で保存…は積まず、再開か中止を促す', async () => {
+    await saving();
+    act(() => onEditorJob(event('paused')));
+    vi.mocked(saveEdit).mockClear();
+    act(() => requestSave());
+    await flush();
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(useNoticeStore.getState().message).toBe(t.saveBusyPaused);
+    useNoticeStore.setState({ message: null, action: null });
+    act(() => openSaveAs());
+    expect(useEditorStore.getState().sheet).toBeNull();
+    expect(useNoticeStore.getState().message).toBe(t.saveBusyPaused);
+  });
+
+  it('今の頭の上書きを一時停止したまま閉じても聞かない。閉じたあともカプセルに残り、再開して終われば知らせる', async () => {
+    await saving();
+    act(() => onEditorJob(event('paused')));
+    await act(() => requestCloseEditor());
+    expect(useEditorStore.getState().phase).toBe('closed');
+    expect(discardEditDraft).not.toHaveBeenCalled();
+    expect(shownSaves(useJobsStore.getState().saves).map((j) => j.id)).toEqual([9]);
+
+    act(() => onEditorJob(event('queued')));
+    act(() => onEditorJob(event('running', { progress: 0.5 })));
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    expect(shownSaves(useJobsStore.getState().saves)).toEqual([]);
+    expect(invalidateItems).toHaveBeenCalledWith([7]);
+    expect(useNoticeStore.getState().message).toBe(t.savedClosed('hero'));
+  });
+
+  it('保存のあとに描いた分があれば閉じるときに聞く。一時停止の間の［保存］は断り、閉じない', async () => {
+    await saving();
+    act(() => onEditorJob(event('paused')));
+    const s = useEditorStore.getState();
+    act(() => useEditorStore.setState({ status: { ...(s.status ?? status()), head: 3 } }));
+    let closed: boolean | null = null;
+    act(() => {
+      void requestCloseEditor().then((v) => (closed = v));
+    });
+    expect(useEditorStore.getState().sheet?.kind).toBe('unsaved');
+    vi.mocked(saveEdit).mockClear();
+    act(() => answerUnsaved('save'));
+    await flush();
+    expect(saveEdit).not.toHaveBeenCalled();
+    expect(useNoticeStore.getState().message).toBe(t.saveBusyPaused);
+    expect(closed).toBe(false);
+    expect(useEditorStore.getState().phase).toBe('open');
+  });
+
+  it('閉じる前の保存を一時停止したら、閉じるのをやめる（呼び手に false。再開して終わっても閉じない）', async () => {
+    await openDirty();
+    let closed: boolean | null = null;
+    act(() => {
+      void requestCloseEditor('library').then((v) => (closed = v));
+    });
+    act(() => answerUnsaved('save'));
+    await flush();
+    expect(closed).toBeNull();
+    act(() => onEditorJob(event('paused')));
+    await flush();
+    expect(closed).toBe(false);
+    expect(useEditorStore.getState().phase).toBe('open');
+
+    act(() => onEditorJob(event('queued')));
+    savedRefresh();
+    act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+    await flush();
+    expect(useEditorStore.getState().phase).toBe('open');
+    expect(useEditorStore.getState().save).toBeNull();
+  });
+
+  it('中止：失敗のシートを出さず、保存していない変更のまま次の保存を積める', async () => {
+    await saving();
+    act(() => onEditorJob(event('paused')));
+    vi.mocked(viewEdit).mockClear();
+    vi.mocked(viewEdit).mockResolvedValue(
+      result({
+        status: status({ dirty: true, saving: null }),
+        doc: { base: 2, order: [], nodes: [], outputs: null },
+        view: { type: 'shown', view: viewDto() },
+        notices: ['保存を中止しました'],
+      }),
+    );
+    act(() => onEditorJob(event('canceled')));
+    await flush();
+    expect(viewEdit).toHaveBeenCalled();
+    const s = useEditorStore.getState();
+    expect(s.save).toBeNull();
+    expect(s.sheet).toBeNull();
+    expect(s.status?.dirty).toBe(true);
+    expect(useNoticeStore.getState().message).toBe('保存を中止しました');
+    expect(shownSaves(useJobsStore.getState().saves)).toEqual([]);
+    vi.mocked(saveEdit).mockClear();
+    vi.mocked(saveEdit).mockResolvedValue({
+      ...started(),
+      job: 10,
+      status: status({ saving: 10 }),
+    } as Awaited<ReturnType<typeof saveEdit>>);
+    act(() => requestSave());
+    await flush();
+    expect(saveEdit).toHaveBeenCalledTimes(1);
+    expect(useEditorStore.getState().save?.job).toBe(10);
+  });
+
+  it('閉じたあとに中止した保存は何も知らせない（カプセルが消える）', async () => {
+    await saving();
+    act(() => onEditorJob(event('paused')));
+    await act(() => requestCloseEditor());
+    useNoticeStore.setState({ message: null, action: null });
+    act(() => onEditorJob(event('canceled')));
+    await flush();
+    expect(shownSaves(useJobsStore.getState().saves)).toEqual([]);
+    expect(useNoticeStore.getState().message).toBeNull();
+  });
+
+  describe('開き直したエディタ', () => {
+    /** 保存の途中で閉じ、同じアイテムを開き直す（新しいセッションの `status.saving` は null）。 */
+    async function reopened() {
+      await saving();
+      act(() => onEditorJob(event('paused')));
+      await act(() => requestCloseEditor());
+      vi.mocked(listPendingSaves).mockResolvedValue([pending()]);
+      await openDirty();
+    }
+
+    /** Rust の一覧の行（ジョブ 9、アイテム 7、一時停止）。 */
+    function pending(over: Partial<EditPendingSaveDto> = {}): EditPendingSaveDto {
+      return {
+        job: 9,
+        itemId: 7,
+        itemTitle: 'hero',
+        mode: { type: 'overwrite' },
+        state: 'paused',
+        progress: null,
+        message: null,
+        ...over,
+      };
+    }
+
+    it('待っている保存を「前の保存」として持ち、⌘S・別名で保存…は積まない（Rust の Busy と同じ）', async () => {
+      await reopened();
+      const s = useEditorStore.getState();
+      expect(s.save).toBeNull();
+      expect(s.earlierSave).toEqual({ job: 9, state: 'paused', progress: 0.42 });
+      vi.mocked(saveEdit).mockClear();
+      act(() => requestSave());
+      await flush();
+      expect(saveEdit).not.toHaveBeenCalled();
+      expect(useNoticeStore.getState().message).toBe(t.saveBusyPaused);
+      useNoticeStore.setState({ message: null, action: null });
+      act(() => openSaveAs());
+      expect(useEditorStore.getState().sheet).toBeNull();
+      expect(useNoticeStore.getState().message).toBe(t.saveBusyPaused);
+    });
+
+    it('前の保存の間は編集が未保存なら閉じるときに聞き、［保存］は断って閉じない', async () => {
+      await reopened();
+      let closed: boolean | null = null;
+      act(() => {
+        void requestCloseEditor().then((v) => (closed = v));
+      });
+      expect(useEditorStore.getState().sheet?.kind).toBe('unsaved');
+      act(() => answerUnsaved('save'));
+      await flush();
+      expect(closed).toBe(false);
+      expect(useEditorStore.getState().phase).toBe('open');
+    });
+
+    it('前の保存が動き出せば進捗を追い、終われば知らせて保存できるようになる', async () => {
+      await reopened();
+      act(() => onEditorJob(event('queued')));
+      expect(useEditorStore.getState().earlierSave).toEqual({
+        job: 9,
+        state: 'queued',
+        progress: null,
+      });
+      act(() => onEditorJob(event('running', { progress: 0.5 })));
+      expect(useEditorStore.getState().earlierSave?.progress).toBe(0.5);
+      act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+      await flush();
+      expect(useEditorStore.getState().earlierSave).toBeNull();
+      expect(useNoticeStore.getState().message).toBe(t.savedClosed('hero'));
+      vi.mocked(saveEdit).mockClear();
+      act(() => requestSave());
+      await flush();
+      expect(saveEdit).toHaveBeenCalledTimes(1);
+    });
+
+    it('前の保存を中止すれば、すぐ保存できる（知らせない）', async () => {
+      await reopened();
+      useNoticeStore.setState({ message: null, action: null });
+      act(() => onEditorJob(event('canceled')));
+      expect(useEditorStore.getState().earlierSave).toBeNull();
+      expect(useNoticeStore.getState().message).toBeNull();
+      vi.mocked(saveEdit).mockClear();
+      act(() => requestSave());
+      await flush();
+      expect(saveEdit).toHaveBeenCalledTimes(1);
+    });
+
+    it('画面が知らなくても（読み損ねた・別の経路で積んだ）、開いたときに Rust に聞いて合わせる', async () => {
+      vi.mocked(listPendingSaves).mockResolvedValue([pending({ job: 60 })]);
+      await openDirty();
+      expect(useEditorStore.getState().earlierSave).toEqual({
+        job: 60,
+        state: 'paused',
+        progress: null,
+      });
+      vi.mocked(saveEdit).mockClear();
+      act(() => requestSave());
+      await flush();
+      expect(saveEdit).not.toHaveBeenCalled();
+    });
+
+    it('画面が待っているつもりでも（イベントを取りこぼした）、開いたときに Rust になければ忘れて保存できる', async () => {
+      await saving();
+      act(() => onEditorJob(event('paused')));
+      await act(() => requestCloseEditor());
+      vi.mocked(listPendingSaves).mockResolvedValue([]);
+      await openDirty();
+      expect(useEditorStore.getState().earlierSave).toBeNull();
+      expect(shownSaves(useJobsStore.getState().saves)).toEqual([]);
+      vi.mocked(saveEdit).mockClear();
+      act(() => requestSave());
+      await flush();
+      expect(saveEdit).toHaveBeenCalledTimes(1);
+    });
+
+    it('下書きのシート：保存が待っている間は理由を言い、下書きを捨てずに開ける（▾ から再開・中止できる）', async () => {
+      await saving();
+      act(() => onEditorJob(event('paused')));
+      await act(() => requestCloseEditor());
+      vi.mocked(listPendingSaves).mockResolvedValue([pending()]);
+      await openDirty({ exists: true, fresh: false, updatedAt: 1000 });
+      render(<EditorSheets />);
+      expect(screen.getByText(t.draftPending)).toBeInTheDocument();
+      expect(screen.queryByText(t.draftStale)).toBeNull();
+      expect(screen.queryByRole('button', { name: t.draftOpen })).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: t.draftKeep }));
+      expect(useEditorStore.getState().sheet).toBeNull();
+      expect(useEditorStore.getState().phase).toBe('open');
+      expect(discardEditDraft).not.toHaveBeenCalled();
+      expect(useEditorStore.getState().earlierSave?.job).toBe(9);
+    });
+
+    it('下書きのシート：捨てるも選べる（待っている保存はそのまま）', async () => {
+      await saving();
+      act(() => onEditorJob(event('paused')));
+      await act(() => requestCloseEditor());
+      vi.mocked(listPendingSaves).mockResolvedValue([pending()]);
+      await openDirty({ exists: true, fresh: false, updatedAt: 1000 });
+      render(<EditorSheets />);
+      fireEvent.click(screen.getByRole('button', { name: t.draftDiscard }));
+      await flush();
+      expect(discardEditDraft).toHaveBeenCalledWith(7);
+      expect(useEditorStore.getState().earlierSave?.job).toBe(9);
+    });
+
+    it('閉じれば前の保存を忘れる（カプセルには残る）', async () => {
+      await reopened();
+      await act(() => closeEditor());
+      expect(useEditorStore.getState().earlierSave).toBeNull();
+      expect(shownSaves(useJobsStore.getState().saves).map((j) => j.id)).toEqual([9]);
+    });
+  });
+
+  it('Rust が Busy で断ったら（画面の知らない保存がある）、待っている保存を読み直してボタンを合わせる', async () => {
+    await openDirty();
+    vi.mocked(saveEdit).mockRejectedValueOnce(new IpcError({ code: 'Busy', message: '待って' }));
+    vi.mocked(listPendingSaves).mockResolvedValueOnce([
+      {
+        job: 40,
+        itemId: 7,
+        itemTitle: 'hero',
+        mode: { type: 'overwrite' },
+        state: 'paused',
+        progress: null,
+        message: null,
+      },
+    ]);
+    act(() => requestSave());
+    await flush();
+    await flush();
+    expect(useNoticeStore.getState().message).toBe(t.saveBusy);
+    expect(useEditorStore.getState().earlierSave).toEqual({
+      job: 40,
+      state: 'paused',
+      progress: null,
+    });
+  });
+
+  it('アプリを開き直したあとの保存（DB から読んだもの）も、再開して終われば一覧を読み直して知らせる', async () => {
+    vi.mocked(listPendingSaves).mockResolvedValueOnce([
+      {
+        job: 50,
+        itemId: 7,
+        itemTitle: 'long-60min',
+        mode: { type: 'overwrite' },
+        state: 'paused',
+        progress: null,
+        message: null,
+      },
+    ]);
+    await act(() => useJobsStore.getState().reloadSaves());
+    expect(shownSaves(useJobsStore.getState().saves).map((j) => j.id)).toEqual([50]);
+    act(() => onEditorJob({ ...event('queued'), id: 50 }));
+    act(() =>
+      onEditorJob({ ...event('done', { resultJson: '{"outcome":"saved","itemId":7}' }), id: 50 }),
+    );
+    await flush();
+    expect(invalidateItems).toHaveBeenCalledWith([7]);
+    expect(useNoticeStore.getState().message).toBe(t.savedClosed('long-60min'));
+  });
+
+  it('保存のイベントを取りこぼして Rust から終わりを知ったら、カプセルの表からも消す', async () => {
+    await saving();
+    vi.mocked(listJobs).mockResolvedValue([job({ id: 9, state: 'canceled' })]);
+    vi.mocked(viewEdit).mockResolvedValue(
+      result({
+        status: status({ saving: null }),
+        doc: { base: 2, order: [], nodes: [], outputs: null },
+        view: { type: 'shown', view: viewDto() },
+      }),
+    );
+    act(() => refreshEditorView());
+    await flush();
+    await flush();
+    expect(useEditorStore.getState().save).toBeNull();
+    expect(useJobsStore.getState().saves[9]).toBeUndefined();
   });
 });
 

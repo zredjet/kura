@@ -1075,8 +1075,9 @@
   opacity: 0.45;
 }
 
-/* 保存中はボタンの中に進み（地を少し明るく） */
-.saveButton[aria-busy='true']:disabled {
+/* 保存中はボタンの中に進み（地を少し明るく）。一時停止の間も止まった進みを見せる */
+.saveButton[aria-busy='true']:disabled,
+.saveButton[data-paused]:disabled {
   opacity: 1;
 }
 

@@ -4,21 +4,25 @@ import glass from '../../components/glass/glass.module.css';
 import { ChevronDownIcon } from '../../components/icons/ChevronDownIcon';
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
 import { InfoIcon } from '../../components/icons/InfoIcon';
-import { openMenuBelow } from '../../components/Menu/menuStore';
+import { type MenuEntry, openMenuBelow } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { ItemInspector } from '../library/inspector/ItemInspector';
 import styles from './Editor.module.css';
 import { useEditorKeys } from './editorKeys';
 import { type EditorKindUi, editorKindModule } from './editorKinds';
 import {
+  cancelEditorSave,
   openRevert,
   openSaveAs,
   openVersions,
+  pauseEditorSave,
   requestCloseEditor,
   requestSave,
+  resumeEditorSave,
 } from './editorSave';
 import { EditorSheets } from './EditorSheets';
 import {
+  activeSave,
   canSaveEditor,
   editorUndo,
   reopenEditor,
@@ -78,14 +82,42 @@ function useCanSave(): boolean {
   return useEditorStore(canSaveEditor);
 }
 
-/** 主ボタン「保存」（⌘S。進捗はボタンの中）と ▾（別名で保存…・元に戻す…・版の一覧…）。 */
+/** ▾ の項目：保存の間は一時停止（一時停止の間は再開）・中止を先頭に。別名で保存…・元に戻す…は保存の間は押せない。 */
+function saveMenu(state: 'idle' | 'running' | 'paused'): MenuEntry[] {
+  const busy = state !== 'idle';
+  const control: MenuEntry[] = busy
+    ? [
+        state === 'paused'
+          ? { label: t.saveResume, onSelect: resumeEditorSave }
+          : { label: t.savePause, onSelect: pauseEditorSave },
+        { label: t.saveCancel, onSelect: cancelEditorSave },
+        'separator',
+      ]
+    : [];
+  return [
+    ...control,
+    { label: t.saveAs, shortcut: '⌘⇧S', disabled: busy, onSelect: openSaveAs },
+    'separator',
+    { label: t.revert, disabled: busy, onSelect: openRevert },
+    { label: t.versions, onSelect: openVersions },
+  ];
+}
+
+/**
+ * 主ボタン「保存」（⌘S。進捗はボタンの中。一時停止の間は「一時停止中 42%」）と ▾。保存のジョブは、このエディタで積んだものと、開く前に
+ * 積んだ同じアイテムのものを同じに出す（`activeSave`）。
+ */
 function SaveControls() {
   const open = useEditorStore((s) => s.phase === 'open');
-  const save = useEditorStore((s) => s.save);
+  const save = useEditorStore(activeSave);
+  const slow = useEditorStore((s) => s.save?.slow ?? false);
   const canSave = useCanSave();
+  const paused = save?.state === 'paused';
   const percent =
     save?.progress != null ? Math.round(Math.min(1, Math.max(0, save.progress)) * 100) : null;
-  const label = save ? (percent !== null ? t.savingPercent(String(percent)) : t.saving) : t.save;
+  const running = percent !== null ? t.savingPercent(String(percent)) : t.saving;
+  const stopped = percent !== null ? t.savePausedPercent(String(percent)) : t.savePaused;
+  const label = !save ? t.save : paused ? stopped : running;
   return (
     <div className={styles.saveArea}>
       <div className={styles.saveGroup}>
@@ -94,7 +126,8 @@ function SaveControls() {
           className={styles.saveButton}
           title={t.saveKey}
           disabled={!canSave}
-          aria-busy={save !== null || undefined}
+          aria-busy={(save !== null && !paused) || undefined}
+          data-paused={paused || undefined}
           onClick={() => requestSave()}
         >
           {save && (
@@ -114,18 +147,17 @@ function SaveControls() {
           aria-haspopup="menu"
           disabled={!open}
           onClick={(e) =>
-            openMenuBelow(e.currentTarget, t.saveMore, [
-              { label: t.saveAs, shortcut: '⌘⇧S', disabled: save !== null, onSelect: openSaveAs },
-              'separator',
-              { label: t.revert, disabled: save !== null, onSelect: openRevert },
-              { label: t.versions, onSelect: openVersions },
-            ])
+            openMenuBelow(
+              e.currentTarget,
+              t.saveMore,
+              saveMenu(!save ? 'idle' : paused ? 'paused' : 'running'),
+            )
           }
         >
           <ChevronDownIcon size={12} strokeWidth={2.4} />
         </button>
       </div>
-      {save?.slow && (
+      {slow && (
         <p className={styles.parkedHint} role="status">
           {t.parkedHint}
         </p>

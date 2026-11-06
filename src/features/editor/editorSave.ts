@@ -25,6 +25,12 @@
  *   画像は PNG）。［保存］で選んだ形式を渡して同じ向きで積み直す。一覧を読めなければ今の「保存できませんでした」のシート。
  *   保存の応えを待つ間に閉じる要求が来ていたら（未保存のシート）、形式のシートが閉じる要求を引き継ぎ、失敗のシートに
  *   替えるときは閉じるのを待つ呼び手に「やめた」と答える。
+ * - 一時停止・再開・中止（ADR-189。▾ のメニュー。閉じたあとはグリッドの下のカプセル）：積んだ保存を jobsStore の表にも載せる。
+ *   再開は初めから書き直すので進捗も頭から。一時停止の間も保存は待っている（次の保存は Busy）ので ⌘S・別名で保存…・閉じる前の
+ *   保存は断り、再開か中止を促す。閉じる前の保存を一時停止したら、閉じるのをやめる（いつ終わるか分からない保存を待たせない）。
+ *   中止は失敗にしない（シートを出さず、Rust の「保存を中止しました」。閉じたあとはカプセルが消えるだけ）。
+ * - 開き直したエディタ：Rust の `status.saving` はそのセッションで積んだものだけなので、同じアイテムの待っている保存は jobsStore
+ *   の表から `earlierSave` に写す（開くたびに Rust に聞き直す）。ボタンと ▾ は `save` と同じに出す。
  */
 
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -43,16 +49,24 @@ import {
 } from '../../ipc/edit';
 import { getAsset } from '../../ipc/asset';
 import { getItems, type ItemSummaryDto } from '../../ipc/items';
-import { listJobs, type JobProgress } from '../../ipc/jobs';
+import {
+  cancelJob,
+  listJobs,
+  type JobProgress,
+  pauseJob,
+  progressFromJob,
+  resumeJob,
+} from '../../ipc/jobs';
 import { hasDuration } from '../../ipc/kinds';
 import { isIpcError } from '../../ipc/result';
 import { invalidateItems } from '../../stores/itemCache';
-import { onAnyJob } from '../../stores/jobsStore';
+import { nextSaveProgress, onAnyJob, selectItemSave, useJobsStore } from '../../stores/jobsStore';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { notify } from '../../stores/noticeStore';
 import { useViewStore } from '../../stores/viewStore';
 import { selectOne } from '../library/selection';
 import {
+  activeSave,
   type AfterClose,
   applyEditorStatus,
   canSaveEditor,
@@ -171,6 +185,16 @@ function settleClose(closed: boolean): void {
   pendingClose = null;
   closeAfterSave = null;
   resolve?.(closed);
+}
+
+/** 保存が待っている（このエディタの保存・開く前に積んだ保存・積んでいる途中）か。 */
+function saveIsBusy(s: EditorState): boolean {
+  return starting || activeSave(s) !== null;
+}
+
+/** 前の保存を待つよう知らせる（一時停止中なら、待っても進まないので再開か中止を促す）。 */
+function notifyBusy(s: EditorState): void {
+  notify(activeSave(s)?.state === 'paused' ? t.saveBusyPaused : t.saveBusy);
 }
 
 /** エディタを閉じ（`edit_close` と、`discardDraft` なら下書きを捨てるのを終えてから）、閉じるのを待つ呼び手に答える。 */
@@ -328,9 +352,10 @@ async function startSave(
   format: EditFormatChoice = null,
 ): Promise<StartResult> {
   const session = editorSession();
-  if (!session || useEditorStore.getState().phase !== 'open') return 'failed';
-  if (useEditorStore.getState().save || starting) {
-    notify(t.saveBusy);
+  const current = useEditorStore.getState();
+  if (!session || current.phase !== 'open') return 'failed';
+  if (saveIsBusy(current)) {
+    notifyBusy(current);
     return 'failed';
   }
   starting = true;
@@ -362,6 +387,18 @@ async function startSave(
         after,
       },
     });
+    if (s.item) {
+      useJobsStore.getState().trackSave({
+        id: started.job,
+        itemId: s.item.id,
+        itemTitle: s.item.title,
+        mode: kind,
+        newTitle: title,
+        state: 'queued',
+        progress: null,
+        message: null,
+      });
+    }
     closeAfterSave = closeAfter;
     finished = null;
     armSlow(started.job);
@@ -378,6 +415,8 @@ async function startSave(
     if (editorSession() !== session) return 'failed';
     if (isIpcError(error, 'Busy')) {
       notify(t.saveBusy);
+      // 画面の知らない保存が待っている：読み直してボタンと ▾ を合わせる
+      void useJobsStore.getState().readSaves();
     } else {
       const shown = useEditorStore.getState().sheet;
       useEditorStore.setState({
@@ -433,8 +472,8 @@ export function submitFormat(format: string): void {
  */
 export function requestSave(closeAfter: AfterClose | null = null): void {
   const s = useEditorStore.getState();
-  if (s.phase !== 'open' || s.sheet || s.save || starting) {
-    if (s.save || starting) notify(t.saveBusy);
+  if (s.phase !== 'open' || s.sheet || saveIsBusy(s)) {
+    if (saveIsBusy(s)) notifyBusy(s);
     if (closeAfter !== null) settleClose(false);
     return;
   }
@@ -461,8 +500,8 @@ export function confirmWarnings(): void {
 export function openSaveAs(): void {
   const s = useEditorStore.getState();
   if (s.phase !== 'open' || s.sheet) return;
-  if (s.save) {
-    notify(t.saveBusy);
+  if (activeSave(s)) {
+    notifyBusy(s);
     return;
   }
   useEditorStore.setState({ sheet: { kind: 'saveAs' } });
@@ -531,14 +570,41 @@ export function dismissSheet(): void {
   }
 }
 
+// ===== 一時停止・再開・中止 =====
+
+/** 今のエディタの保存のジョブを操作する（▾ のメニュー）。 */
+function controlSave(call: (id: number) => Promise<unknown>): void {
+  const job = activeSave(useEditorStore.getState())?.job;
+  if (job === undefined) return;
+  call(job).catch((error: unknown) =>
+    notify(ja.common.failed(error instanceof Error ? error.message : String(error))),
+  );
+}
+
+/** 保存を一時停止する（実行中なら区切りで止まる。止まったらジョブのイベントで分かる）。 */
+export function pauseEditorSave(): void {
+  controlSave(pauseJob);
+}
+
+/** 保存を再開する（初めから書き直す）。 */
+export function resumeEditorSave(): void {
+  controlSave(resumeJob);
+}
+
+/** 保存を中止する（編集は残る）。 */
+export function cancelEditorSave(): void {
+  controlSave(cancelJob);
+}
+
 // ===== 下書き =====
 
-/** 下書きのシートの答え：捨てる・下書きから開く。 */
-export function answerDraft(answer: 'discard' | 'open'): void {
+/** 下書きのシートの答え：捨てる・下書きから開く・残して開く（保存が待っている間。下書きはそのまま）。 */
+export function answerDraft(answer: 'discard' | 'open' | 'keep'): void {
   const s = useEditorStore.getState();
   const item = s.item;
   if (!item || s.sheet?.kind !== 'draft') return;
   useEditorStore.setState({ sheet: null });
+  if (answer === 'keep') return;
   if (answer === 'open' && s.draft?.fresh) {
     void reopenEditorWith(item, { fromDraft: true });
     return;
@@ -784,6 +850,41 @@ useEditorStore.subscribe((now, before) => {
   detached.set(save.job, d);
 });
 
+/**
+ * jobsStore の表をエディタに写す：開いているアイテムの、このエディタで積んだのではない保存を `earlierSave` に。積んだ記憶のない保存
+ * （アプリを開き直したあとに一覧で知った）は、終わったら知らせられるよう覚える（大きさの前後は分からないので見ない）。
+ */
+function syncSaveJobs(): void {
+  const s = useEditorStore.getState();
+  const { saves } = useJobsStore.getState();
+  for (const job of Object.values(saves)) {
+    if (job.id === s.save?.job || detached.has(job.id)) continue;
+    detached.set(job.id, {
+      mode: job.mode,
+      title: job.newTitle,
+      itemId: job.itemId,
+      itemTitle: job.itemTitle ?? '',
+      before: null,
+      after: null,
+      library: currentLibrary(),
+    });
+  }
+  const itemId = s.item?.id;
+  const job = itemId === undefined ? null : selectItemSave(saves, itemId, s.save?.job);
+  const was = s.earlierSave;
+  if (job?.id === was?.job && job?.state === was?.state && job?.progress === was?.progress) return;
+  useEditorStore.setState({
+    earlierSave: job ? { job: job.id, state: job.state, progress: job.progress } : null,
+  });
+}
+
+useJobsStore.subscribe(syncSaveJobs);
+useEditorStore.subscribe((now, before) => {
+  // 開くたびに Rust に聞き直す（待っている保存があれば、ボタンと ▾ をそれに合わせる）
+  if (now.openId !== before.openId) void useJobsStore.getState().readSaves();
+  if (now.item?.id !== before.item?.id || now.save?.job !== before.save?.job) syncSaveJobs();
+});
+
 /** 失敗した保存の code と言葉をジョブの記録から読み、シートを出す。 */
 async function showFailure(job: number, mode: SaveMode, fallback: string | null): Promise<void> {
   let code: string | null = null;
@@ -814,11 +915,14 @@ export function onEditorJob(event: JobProgress): void {
     if (d) onDetachedJob(event, d);
     return;
   }
-  const progress = event.progress ?? save.progress;
+  const progress = nextSaveProgress(save, event);
   const early = (progress ?? 0) <= FIRST_STAGE;
-  setSave({ state: event.state, progress, slow: early ? save.slow : false });
-  if (!early) clearSlow();
+  const paused = event.state === 'paused';
+  setSave({ state: event.state, progress, slow: early && !paused ? save.slow : false });
+  if (!early || paused) clearSlow();
   else if (event.state === 'running' && slowTimer === null && !save.slow) armSlow(save.job);
+  // 閉じる前の保存を一時停止した：いつ終わるか分からないので閉じるのをやめる（再開して終わっても閉じない）
+  if (paused && closeAfterSave !== null) settleClose(false);
   if (event.state === 'done') {
     finished = {
       job: save.job,
@@ -852,14 +956,9 @@ onEditorResult((result) => {
       (jobs) => {
         const record = jobs.find((j) => j.id === save.job);
         if (record && useEditorStore.getState().save?.job === save.job) {
-          onEditorJob({
-            id: record.id,
-            kind: record.kind,
-            state: record.state,
-            progress: record.progress,
-            message: record.message,
-            resultJson: record.resultJson,
-          });
+          const missed = progressFromJob(record);
+          useJobsStore.getState().apply(missed);
+          onEditorJob(missed);
         }
       },
       () => undefined,

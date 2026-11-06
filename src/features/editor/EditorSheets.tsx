@@ -63,26 +63,38 @@ function useVersions(): EditVersionDto[] | null {
   return versions;
 }
 
-/** 下書きのシート：「前回の編集の下書きがあります（日時）」［捨てる］［下書きから開く］。土台が変わっていれば捨てるだけ。 */
+/**
+ * 下書きのシート：「前回の編集の下書きがあります（日時）」［捨てる］［下書きから開く］。土台が変わっていれば捨てるだけ。保存が待っている
+ * 間（一時停止中を含む）は土台がまだ決まらないので下書きからは開けないが、捨てずに開ける（▾ から再開・中止する。ADR-189）。
+ */
 function DraftSheet() {
   const draft = useEditorStore((s) => s.draft);
+  const waiting = useEditorStore((s) => s.earlierSave !== null);
   const titleId = useId();
   if (!draft) return null;
   const when = draft.updatedAt !== null ? relativeDateTime(draft.updatedAt) : '';
+  const keep = !draft.fresh && waiting;
   return (
     <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
       <h2 id={titleId} className={styles.sheetTitle}>
         {t.draftTitle}
       </h2>
       <p className={styles.sheetMessage}>{t.draftMessage(when)}</p>
-      <p className={styles.sheetNote}>{draft.fresh ? t.draftHistory : t.draftStale}</p>
+      <p className={styles.sheetNote}>
+        {draft.fresh ? t.draftHistory : keep ? t.draftPending : t.draftStale}
+      </p>
       <footer className={styles.sheetActions}>
         <Button
-          variant={draft.fresh ? 'secondary' : 'primary'}
+          variant={draft.fresh || keep ? 'secondary' : 'primary'}
           onClick={() => answerDraft('discard')}
         >
           {t.draftDiscard}
         </Button>
+        {keep && (
+          <Button variant="primary" onClick={() => answerDraft('keep')}>
+            {t.draftKeep}
+          </Button>
+        )}
         {draft.fresh && (
           <Button variant="primary" onClick={() => answerDraft('open')}>
             {t.draftOpen}
