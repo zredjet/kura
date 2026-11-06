@@ -16,13 +16,15 @@
 //!   頼らない形式、書けるときは None（G10 の検証の直し）。
 //! - 確かめは保存のジョブと同じ今のコーデックの組（`EngineServices::codecs`。ツールの場所を変えたら作り直した組）で行う
 //!   （エディタを開いたときの組ではない）。出力は確定した頭の文書（保存するもの）。
+//! - 手のあとに読むので、状態の錠の中で文書全体を compile しない（筆 5 万本で 1 回約 290 ms、その間は手と表示が錠で待つ）。出力の
+//!   形は頭の計画から読む（[`head_shape`]）。
 
 use kura_engine::codec::CodecSet;
 use kura_engine::codec::formats::{FORMATS, MetaCaps};
 use kura_engine::doc::FormatChoice;
 use kura_engine::{EngineError, Shape};
 
-use super::{EditorEnv, EditorError, editor_of};
+use super::{Editor, EditorEnv, EditorError, State, editor_of};
 use crate::edit::save::{FormatProblem, save_format, writable_formats};
 use crate::edit::versions;
 use crate::import::{MediaKind, format_id};
@@ -77,26 +79,44 @@ pub fn formats(env: &EditorEnv<'_>, session: &str) -> Result<EditFormats, Editor
     let (choice, shape) = {
         let guard = editor.lock_state();
         let st = guard.as_ref().ok_or(EditorError::NoSession)?;
-        let graph = st.session.head().to_graph();
-        let choice = graph
-            .outputs
+        let choice = st
+            .session
+            .head()
+            .outputs()
             .first()
             .map(|o| o.format.clone())
             .ok_or_else(|| EditorError::Failed("文書に出力がありません".into()))?;
-        let plan = editor
-            .runtime
-            .preview(|e| e.compile(&graph, &st.shapes))
-            .map_err(|issues| {
-                EditorError::from_engine("文書を描けません", EngineError::Invalid(issues))
-            })?;
-        let shape = plan
-            .output_shapes()
-            .first()
-            .map(|(_, s)| *s)
-            .ok_or_else(|| EditorError::Failed("文書に出力がありません".into()))?;
-        (choice, shape)
+        (choice, head_shape(&editor, st)?)
     };
     Ok(formats_for(&codecs, &choice, source, &shape))
+}
+
+/// 確定した頭の最初の出力の形。今の計画か版ごとの計画が頭のものならそれから読み、なければ（プレビューの途中で覚えていない頭など）
+/// 今の計画からの差分で作る（全体を compile しない）。
+pub(super) fn head_shape(editor: &Editor, st: &State) -> Result<Shape, EditorError> {
+    let rev = st.session.head_rev();
+    let known = if st.plan_rev == rev {
+        Some(&st.plan)
+    } else {
+        st.plans.iter().find(|(r, _)| *r == rev).map(|(_, p)| p)
+    };
+    let made;
+    let plan = match known {
+        Some(plan) => plan,
+        None => {
+            made = editor
+                .runtime
+                .preview(|e| e.compile_snapshot(st.session.head(), &st.shapes, Some(&st.plan)))
+                .map_err(|issues| {
+                    EditorError::from_engine("文書を描けません", EngineError::Invalid(issues))
+                })?;
+            &made
+        }
+    };
+    plan.output_shapes()
+        .first()
+        .map(|(_, s)| *s)
+        .ok_or_else(|| EditorError::Failed("文書に出力がありません".into()))
 }
 
 /// 組 `codecs` で、出力の形式の選び `choice`（`Keep` は元の形式 `source_format`）・形 `shape` の書ける形式の一覧（純粋な関数）。

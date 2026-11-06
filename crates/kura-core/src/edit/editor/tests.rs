@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use kura_engine::render::InputValue;
 use kura_engine::render::region::PartialValue;
 use kura_engine::testgen::InputGen;
 use kura_engine::value::PixelFormat;
-use kura_engine::{Digest, Engine, Graph, NoMonitor, Value};
+use kura_engine::{Digest, Dim, Engine, Graph, NoMonitor, Value};
 use rusqlite::params;
 use serde_json::json;
 
@@ -2018,6 +2019,178 @@ impl EngineFactory for Machine {
     fn codecs(&self, _work_dir: &Path) -> CodecSet {
         CodecSet::pinned()
     }
+}
+
+/// 書ける形式が読む確定した頭の出力の形は、全体を compile した形と同じ：手のあと（今の計画）・取り消しのあと・プレビューの途中
+/// （版ごとの計画）・版ごとの計画から頭が追い出されたあと（今の計画からの差分）。
+#[test]
+fn formats_read_the_head_shape_without_a_whole_compile() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(16, 12, 31), 16, 12);
+    let opened = env.open(id);
+    let s = &opened.session;
+    let editor = env.engine.current_editor().unwrap();
+    let check = |what: &str, want: (u64, u64)| {
+        let guard = editor.lock_state();
+        let st = guard.as_ref().unwrap();
+        let shape = formats::head_shape(&editor, st).unwrap();
+        let graph = st.session.head().to_graph();
+        let whole = editor
+            .runtime
+            .preview(|e| e.compile(&graph, &st.shapes))
+            .unwrap();
+        assert_eq!(shape, whole.output_shapes()[0].1, "{what}");
+        let Shape::Image { w, h, .. } = shape else {
+            panic!("{what}：{shape:?}");
+        };
+        assert_eq!((w, h), (Dim::Exact(want.0), Dim::Exact(want.1)), "{what}");
+    };
+    let crop = |at: usize, w: u32, h: u32| Edit::AddNode {
+        at,
+        op: "image.crop".into(),
+        v: 1,
+        params: json!({ "rect": { "x": 0, "y": 0, "w": w, "h": h } }),
+        seed: None,
+        extra_inputs: Vec::new(),
+    };
+    check("開いた直後", (16, 12));
+    env.step(
+        s,
+        vec![Step::Commit {
+            edit: crop(0, 8, 6),
+            mode: CommitMode::Step,
+        }],
+    );
+    check("手のあと", (8, 6));
+    env.step(s, vec![Step::Undo]);
+    check("取り消しのあと", (16, 12));
+    env.step(s, vec![Step::Redo]);
+    check("やり直しのあと", (8, 6));
+
+    // プレビューの途中は確定した頭の形（仮の値の形ではない）
+    let preview = |edit: Edit| Step::Preview { edit };
+    let out = env.step(s, vec![preview(crop(1, 4, 4))]);
+    assert_eq!(out.rejected, None);
+    check("プレビューの途中", (8, 6));
+    // 版ごとの計画から頭が追い出されても（仮の値を 8 つより多く替えた）、今の計画からの差分で作る
+    for i in 0..10 {
+        let out = env.step(s, vec![preview(crop(1, 1 + i % 8, 1 + i % 6))]);
+        assert_eq!(out.rejected, None);
+    }
+    {
+        let guard = editor.lock_state();
+        let st = guard.as_ref().unwrap();
+        let rev = st.session.head_rev();
+        assert_ne!(st.plan_rev, rev);
+        assert!(
+            st.plans.iter().all(|(r, _)| *r != rev),
+            "頭の計画はもうない"
+        );
+    }
+    check("頭の計画を覚えていないプレビューの途中", (8, 6));
+    let f = formats::formats(&env.env(), s).unwrap();
+    assert_eq!(f.current, "png");
+    env.step(s, vec![Step::CancelPreview]);
+    check("プレビューをやめたあと", (8, 6));
+    close(&env.engine, s);
+}
+
+/// 手のあとの書ける形式の読み（`edit_formats`）が手を待たせないことの測り：筆 5 万本の文書で、筆を 1 本描くたびに読む時間（全体を
+/// compile する道と比べる）と、読み続けている間の手の時間（読まないときと比べる）。release で
+/// `cargo test --release -p kura-core --lib formats_with_many_strokes -- --ignored --nocapture`。
+#[test]
+#[ignore]
+fn formats_with_many_strokes() {
+    use kura_engine::testing::bench::{pen, walk_stroke};
+    const SIDE: u32 = 1024;
+    let summary = |what: &str, mut ms: Vec<f64>| {
+        ms.sort_by(f64::total_cmp);
+        let at = |q: f64| ms[((ms.len() - 1) as f64 * q).round() as usize];
+        println!(
+            "{what}：p50 {:.3} ms・p95 {:.3} ms・最大 {:.3} ms（{} 回）",
+            at(0.5),
+            at(0.95),
+            at(1.0),
+            ms.len()
+        );
+    };
+    let env = Env::with(Arc::new(Machine));
+    let png = noise_png(SIDE, SIDE, 31);
+    let id = add_item(&env.lib, &png, i64::from(SIDE), i64::from(SIDE));
+    let action = |seed: u64, points: usize| {
+        serde_json::to_value(pen(
+            walk_stroke(seed, points, SIDE, SIDE, 12),
+            4,
+            false,
+            [(seed % 251) as u8, 40, 200, 255],
+        ))
+        .unwrap()
+    };
+    let prior: Vec<Json> = (0..50_000u64).map(|i| action(1_000 + i, 50)).collect();
+    let mut graph = Graph::new_single();
+    graph
+        .push_linear("paint.actions", 1, json!({ "actions": prior }), 0)
+        .unwrap();
+    let base = Base {
+        hash: *blake3::hash(&png).as_bytes(),
+        version: 0,
+    };
+    drafts::save(env.lib.db(), id, &graph, base, None).unwrap();
+    let vp = Viewport::from(ImageViewport {
+        scale: 0.25,
+        ..ImageViewport::whole()
+    });
+    let opened = env.open_with(id, vp.clone(), true);
+    let s = opened.session.clone();
+    let paint = |i: u64| {
+        let started = std::time::Instant::now();
+        let steps = vec![Step::Paint {
+            actions: vec![action(100_000 + i, 40)],
+        }];
+        step(&env.env(), &s, steps, &vp).unwrap();
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+    // 1 本描くたびに読む
+    let mut reads = Vec::new();
+    for i in 0..30 {
+        paint(i);
+        let started = std::time::Instant::now();
+        formats::formats(&env.env(), &s).unwrap();
+        reads.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    summary("筆 5 万本：手のあとの読み", reads);
+    // 比べ：全体を compile する道（今の頭の to_graph と compile。錠を持つ間）
+    let editor = env.engine.current_editor().unwrap();
+    let whole: Vec<f64> = (0..5)
+        .map(|_| {
+            let guard = editor.lock_state();
+            let st = guard.as_ref().unwrap();
+            let started = std::time::Instant::now();
+            let graph = st.session.head().to_graph();
+            editor
+                .runtime
+                .preview(|e| e.compile(&graph, &st.shapes))
+                .unwrap();
+            started.elapsed().as_secs_f64() * 1000.0
+        })
+        .collect();
+    summary("比べ：全体を compile する道", whole);
+    // 手と競るか：読まない間の手と、別のスレッドで読み続けている間の手
+    let quiet: Vec<f64> = (100..130).map(paint).collect();
+    summary("手（読まない間）", quiet);
+    let done = AtomicBool::new(false);
+    let contended = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                formats::formats(&env.env(), &s).unwrap();
+            }
+        });
+        let ms: Vec<f64> = (200..230).map(paint).collect();
+        done.store(true, Ordering::Relaxed);
+        ms
+    });
+    summary("手（別のスレッドで読み続けている間）", contended);
+    close(&env.engine, &s);
 }
 
 /// 1 手の往復の目安（Rust の中だけ：手を当てる → 計画 → 確保 → 表示の経路 → 文書の差分。IPC・タイルの配信・WebKit は
