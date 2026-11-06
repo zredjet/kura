@@ -2,10 +2,11 @@ import { describe, expect, it } from 'vitest';
 
 import type { EditAudioViewport } from '../../../ipc/edit';
 import { editPcmUrl, editPeaksUrl } from '../../../ipc/media';
-import { CHUNK, FAIL_RETRY_MS } from './pcmChunks';
+import { CHUNK, FAIL_RETRY_MAX_MS, FAIL_RETRY_MS } from './pcmChunks';
 import { audioView, fakeClock, fakeFetch, pcmBytes, settle, tileBytes } from './testAudioView';
 import {
   EDIT_DECODER_PREFIX,
+  stallWaitMs,
   WAVE_IDLE_MS,
   WaveController,
   WaveHttpError,
@@ -437,6 +438,139 @@ describe('裏の仕事の頼みの連鎖', () => {
     c.applyView(busy(), true);
     clock.advance(WAVE_IDLE_MS * 10);
     expect(idle).toHaveLength(1);
+  });
+
+  describe('裏の仕事が進まない応え（workStalled）', () => {
+    const stuck = () =>
+      audioView({
+        work: true,
+        workStalled: true,
+        peaks: { rev: 3, pending: true, changed: { type: 'spans', spans: [] } },
+      });
+
+    /** 次の頼みがちょうど `wait` ms で出る（その前には出ない）ことを確かめ、頼みの数を返す。 */
+    function expectNextAfter(s: ReturnType<typeof started>, wait: number): number {
+      const n = s.idle.length;
+      if (wait > 0) s.clock.advance(wait - 1);
+      expect(s.idle).toHaveLength(n);
+      s.clock.advance(wait > 0 ? 1 : 0);
+      expect(s.idle).toHaveLength(n + 1);
+      expect(s.idle[n]).toEqual([expect.objectContaining({ work: true }), true]);
+      return n + 1;
+    }
+
+    it('待ちの長さ：150 ms、続けば 1 秒から倍々に 8 秒まで', () => {
+      expect([1, 2, 3, 4, 5, 6, 20].map(stallWaitMs)).toEqual([
+        WAVE_IDLE_MS,
+        FAIL_RETRY_MS,
+        2 * FAIL_RETRY_MS,
+        4 * FAIL_RETRY_MS,
+        FAIL_RETRY_MAX_MS,
+        FAIL_RETRY_MAX_MS,
+        FAIL_RETRY_MAX_MS,
+      ]);
+    });
+
+    it('次のタスクで頼まず待つ（150 ms）。続くと 1 秒から倍々に 8 秒まで伸びる', () => {
+      const s = started();
+      s.c.applyView(stuck(), true);
+      s.clock.advance(0);
+      expect(s.idle).toHaveLength(1);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      for (const wait of [1000, 2000, 4000, 8000, 8000]) {
+        s.c.applyView(stuck(), true);
+        expectNextAfter(s, wait);
+      }
+    });
+
+    it('待っている間は時間がたっても 2 本送らない。応えが届くまで次を頼まない', () => {
+      const s = started();
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      // 頼みの応えがまだ届かない
+      s.clock.advance(FAIL_RETRY_MAX_MS * 3);
+      expect(s.idle).toHaveLength(2);
+    });
+
+    it('進めば連鎖に戻り、待ちも元に戻す', () => {
+      const s = started();
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, 1000);
+      s.c.applyView(busy(), true);
+      expectNextAfter(s, 0);
+      s.c.applyView(busy(), true);
+      expectNextAfter(s, 0);
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, WAVE_IDLE_MS);
+    });
+
+    it('手・ズーム・再生が来たら待ちを切ってそちらを先にし、続きは 150 ms から。待ちの数は進むまで戻さない', () => {
+      const s = started();
+      const { c, clock, idle } = s;
+      c.applyView(stuck(), true);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      c.applyView(stuck(), true);
+      expectNextAfter(s, 1000);
+      // 2 秒の待ちの間に手が送られた
+      c.applyView(stuck(), true);
+      clock.advance(10);
+      c.noteSent(false);
+      c.applyView(busy(), false);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      // また進まなければ、続きの長さ（4 秒）で待つ
+      c.applyView(stuck(), true);
+      clock.advance(10);
+      c.zoomAt(2, 500);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      c.applyView(stuck(), true);
+      clock.advance(10);
+      // 再生の先読みの区間：すぐ work: false で頼み、続きは 150 ms から
+      c.setPlaybackSpans([{ start: 0, end: CHUNK }]);
+      const n = idle.length;
+      expect(idle[n - 1]).toEqual([expect.objectContaining({ work: false }), false]);
+      c.noteSent(false);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      // ドラッグの間は頼まない。離して 150 ms から
+      c.applyView(stuck(), true);
+      c.setInteracting(true);
+      clock.advance(FAIL_RETRY_MAX_MS * 2);
+      expect(idle).toHaveLength(n + 1);
+      c.setInteracting(false);
+      expectNextAfter(s, WAVE_IDLE_MS);
+    });
+
+    it('ほかの要求の応えでは数えない（待ちの数を戻さない）', () => {
+      const s = started();
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      // 連鎖の頼みの応えを待つ間に届いた、ほかの要求の応え
+      s.c.applyView(busy(), false);
+      s.clock.advance(FAIL_RETRY_MAX_MS);
+      expect(s.idle).toHaveLength(2);
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, 1000);
+    });
+
+    it('仕事がなくなれば頼み直さない', () => {
+      const s = started();
+      s.c.applyView(stuck(), true);
+      expectNextAfter(s, WAVE_IDLE_MS);
+      s.c.applyView(done(), true);
+      s.clock.advance(FAIL_RETRY_MAX_MS * 2);
+      expect(s.idle).toHaveLength(2);
+    });
+
+    it('閉じたら止まる（待っている頼みも出さない）', () => {
+      const s = started();
+      s.c.applyView(stuck(), true);
+      s.c.dispose();
+      s.clock.advance(FAIL_RETRY_MAX_MS * 2);
+      s.c.applyView(stuck(), true);
+      s.clock.advance(FAIL_RETRY_MAX_MS * 2);
+      expect(s.idle).toHaveLength(1);
+    });
   });
 
   it('表示できなかったら連鎖をやめる（次の手・ズームなどのあとに 150 ms から）', () => {

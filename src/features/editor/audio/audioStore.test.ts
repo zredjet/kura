@@ -54,7 +54,7 @@ import {
   setInOut,
   setLoop as setLoopFromField,
 } from './audioTools';
-import { CHUNK } from './pcmChunks';
+import { CHUNK, FAIL_RETRY_MS } from './pcmChunks';
 import { audioView, type AudioViewOver, fakeFetch, pcmBytes } from './testAudioView';
 import { WAVE_IDLE_MS } from './waveController';
 
@@ -286,6 +286,27 @@ describe('音声のアダプタ', () => {
         expect(vp).toMatchObject({ type: 'audio', work: true });
       }
       await flush(WAVE_IDLE_MS * 3);
+      expect(viewEdit).toHaveBeenCalledTimes(4);
+    });
+
+    it('進まない応え（workStalled）では続けて頼まず、待ってから頼み直す。進めば連鎖に戻る', async () => {
+      const stuck = () => view({ work: true, workStalled: true, peaks: { pending: true } });
+      await open(busy(), busy());
+      vi.mocked(viewEdit).mockClear();
+      const replies = [stuck(), stuck(), busy(), view()];
+      vi.mocked(viewEdit).mockImplementation(async () => result(replies.shift() ?? view()));
+      await flush(WAVE_IDLE_MS);
+      await flush(WAVE_IDLE_MS - 1);
+      expect(viewEdit).toHaveBeenCalledTimes(1);
+      await flush(1);
+      expect(viewEdit).toHaveBeenCalledTimes(2);
+      await flush(FAIL_RETRY_MS - 1);
+      expect(viewEdit).toHaveBeenCalledTimes(2);
+      await flush(1);
+      await flush(10);
+      // 進んだ応えで連鎖に戻り、仕事のない応えで止まる
+      expect(viewEdit).toHaveBeenCalledTimes(4);
+      await flush(FAIL_RETRY_MS * 3);
       expect(viewEdit).toHaveBeenCalledTimes(4);
     });
 
