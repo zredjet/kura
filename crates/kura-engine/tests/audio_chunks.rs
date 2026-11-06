@@ -1039,7 +1039,7 @@ fn source_lru_stays_within_its_capacity() {
     assert!(MemorySource::new(Arc::new(base.keep_only(&ChunkSet::empty(5)))).is_err());
 }
 
-/// 読みを数える安い源（チャンク `k` のチャンネル `ch` は `k + ch / 10` の定数。LRU はファイルの源と同じ `for_channels`）。
+/// 読みを数える安い源（チャンク `k` のチャンネル `ch` は `k + ch / 10` の定数。LRU は全体が収まらないファイルの源と同じ `for_channels`）。
 struct CheapSource {
     channels: usize,
     frames: u64,

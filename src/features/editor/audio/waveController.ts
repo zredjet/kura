@@ -88,6 +88,7 @@ export function stallWaitMs(count: number): number {
   if (count <= 1) return WAVE_IDLE_MS;
   return Math.min(FAIL_RETRY_MAX_MS, FAIL_RETRY_MS * 2 ** (count - 2));
 }
+
 /** 同時に取るタイルの数。 */
 const MAX_TILE_LOADS = 4;
 /** 同時に取る PCM のチャンクの数。 */
