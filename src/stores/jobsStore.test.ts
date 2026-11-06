@@ -9,6 +9,7 @@ import {
   SAVE_CAPSULE_DELAY_MS,
   type SaveJob,
   selectCurrentImport,
+  nextSaveProgress,
   selectItemSave,
   shownSaves,
   startJobEvents,
@@ -187,6 +188,16 @@ describe('保存のジョブ（カプセル・開き直したエディタ）', (
     expect(saves()[9]?.progress).toBeNull();
     useJobsStore.getState().apply(edit({ state: 'running', progress: 0.05 }));
     expect(saves()[9]?.progress).toBe(0.05);
+  });
+
+  it('一時停止のイベントは止めた時点の進捗を保つ（DB の古い値に戻さない）。前の値がなければイベントの値', () => {
+    track();
+    useJobsStore.getState().apply(edit({ state: 'running', progress: 0.7 }));
+    useJobsStore.getState().apply(edit({ state: 'paused', progress: 0.36, message: null }));
+    expect(saves()[9]).toMatchObject({ state: 'paused', progress: 0.7 });
+    expect(
+      nextSaveProgress({ state: 'queued', progress: null }, { state: 'paused', progress: 0.36 }),
+    ).toBe(0.36);
   });
 
   it('取り込み・書き出しの表には入れない。知らないジョブのイベントでは増やさない', () => {

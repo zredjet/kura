@@ -1662,6 +1662,13 @@ describe('保存の一時停止・再開・中止', () => {
     expect(useEditorStore.getState().save?.progress).toBe(0.05);
   });
 
+  it('一時停止のイベントが DB の古い進捗を持っていても、止めた時点の値のまま', async () => {
+    await saving(0.7);
+    act(() => onEditorJob(event('paused', { progress: 0.36 })));
+    expect(useEditorStore.getState().save).toMatchObject({ state: 'paused', progress: 0.7 });
+    expect(useJobsStore.getState().saves[9]).toMatchObject({ state: 'paused', progress: 0.7 });
+  });
+
   it('一時停止の間は「エディタを閉じると進みます」を出さない。再開したら見張り直す', async () => {
     await openDirty();
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });

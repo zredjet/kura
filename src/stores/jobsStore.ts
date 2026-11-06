@@ -76,14 +76,16 @@ export interface SaveJob {
 }
 
 /**
- * 保存のジョブのイベントのあとの進捗。一時停止のイベントは進捗を持たない（ジョブの進捗は画面へ送るだけで DB に書かない）ので前の
- * 値を引き継ぎ、再開（一時停止から待ちへ）は初めから書き直すので進捗も頭から。
+ * 保存のジョブのイベントのあとの進捗。一時停止のイベントは止めた時点の値を保つ（イベントの値は DB のもので、保存のジョブは進捗を DB
+ * に書かないので、古い行だけが持つ古い値。一覧で知ったばかりで前の値がなければそれを使う）。再開（一時停止から待ちへ）は初めから
+ * 書き直すので進捗も頭から。
  */
 export function nextSaveProgress(
   previous: { state: JobProgress['state']; progress: number | null },
   event: Pick<JobProgress, 'state' | 'progress'>,
 ): number | null {
   if (previous.state === 'paused' && event.state === 'queued') return null;
+  if (event.state === 'paused') return previous.progress ?? event.progress;
   return event.progress ?? previous.progress;
 }
 

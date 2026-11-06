@@ -200,6 +200,13 @@ pub fn save_partial(
     Ok(())
 }
 
+/// 途中経過だけを保存する（進捗と一言は書かない。`JobContext::mark`）。
+pub fn save_mark(conn: &Connection, id: JobId, result_json: &str) -> Result<()> {
+    let mut stmt = conn.prepare_cached("UPDATE jobs SET result_json = ?2 WHERE id = ?1")?;
+    stmt.execute(params![id, result_json])?;
+    Ok(())
+}
+
 /// 失敗・中止したジョブを `queued` に戻す（再試行）。戻したら true。
 pub fn requeue(conn: &Connection, id: JobId) -> Result<bool> {
     let mut stmt = conn.prepare_cached(

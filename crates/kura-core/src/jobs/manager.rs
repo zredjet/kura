@@ -154,6 +154,24 @@ impl JobContext {
         Ok(())
     }
 
+    /// 途中経過の印だけを保存し、結果ごと画面へ送る（間引かない。進捗と一言は画面へ送るだけで DB に書かない：再開すると初めから
+    /// 書き直すジョブでは、DB の進捗が一時停止・再開のイベントで前の回の値に戻してしまう）。
+    pub fn mark(&self, result_json: &str, progress: f64, message: &str) -> Result<()> {
+        let (id, json) = (self.record.id, result_json.to_string());
+        self.library
+            .db()
+            .write(move |tx| store::save_mark(tx, id, &json))?;
+        (self.sink)(JobEvent {
+            id,
+            kind: self.record.kind,
+            state: JobState::Running,
+            progress: Some(progress.clamp(0.0, 1.0)),
+            message: Some(message.to_string()),
+            result_json: Some(result_json.to_string()),
+        });
+        Ok(())
+    }
+
     /// `kind` のジョブが待ち行列になければ積む（取り込みのあとにサムネイルを作る、など）。
     pub fn ensure_queued(&self, kind: JobKind, input_json: &str) -> Result<Option<JobId>> {
         self.inner.ensure_queued(kind, input_json)
@@ -915,6 +933,55 @@ mod tests {
         let finished = jobs.get(id).unwrap();
         assert_eq!(finished.state, JobState::Done);
         assert_eq!(finished.result_json.as_deref(), Some("10"));
+    }
+
+    /// 印（`mark`）は途中経過だけを保存し、進捗と一言は画面へ送るだけ：一時停止のイベントも再開の最初のイベントも進捗を持たない。
+    #[test]
+    fn mark_keeps_progress_out_of_the_db() {
+        let f = fixture();
+        let first = Arc::new(AtomicBool::new(true));
+        let jobs = manager_with(
+            &f,
+            vec![(
+                JobKind::Edit,
+                Box::new(move |ctx: &JobContext| {
+                    if first.swap(false, Ordering::SeqCst) {
+                        ctx.mark("印", 0.36, "読みました")?;
+                        return Ok(JobEnd::Paused);
+                    }
+                    done("終わり")
+                }),
+            )],
+        );
+        let id = jobs.enqueue(JobKind::Edit, "{}".into()).unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(Duration::from_secs(5)));
+        let paused = jobs.get(id).unwrap();
+        assert_eq!(paused.state, JobState::Paused);
+        assert_eq!(paused.result_json.as_deref(), Some("印"));
+        assert_eq!((paused.progress, paused.message.as_deref()), (None, None));
+
+        jobs.resume(id).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(jobs.wait_idle(Duration::from_secs(5)));
+        assert_eq!(jobs.get(id).unwrap().state, JobState::Done);
+        let events = f.events.lock().unwrap();
+        let seen: Vec<_> = events
+            .iter()
+            .filter(|e| e.id == id && e.state != JobState::Done)
+            .map(|e| (e.state, e.progress))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (JobState::Queued, None),
+                (JobState::Running, None),
+                (JobState::Running, Some(0.36)),
+                (JobState::Paused, None),
+                (JobState::Queued, None),
+                (JobState::Running, None),
+            ]
+        );
     }
 
     #[test]

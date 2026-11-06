@@ -391,6 +391,12 @@ fn s20_case(at: StopAt, out: &str, frames: u64, pause: bool) {
         JobState::Canceled
     };
     assert_eq!(record.state, state, "{what}：{:?}", record.message);
+    // 進捗と一言は DB に残さない（残すと、一時停止・再開のイベントが前の回の値に戻す。元を読んだ印も値を書かない）
+    assert_eq!(
+        (record.progress, record.message.as_deref()),
+        (None, None),
+        "{what}"
+    );
     // 止めた所より先へ進んでいない（書く途中で止めたら R2 も書き終えた所も通らない）
     let seen = env_gate.seen();
     let beyond = |s: &Stage| match at {

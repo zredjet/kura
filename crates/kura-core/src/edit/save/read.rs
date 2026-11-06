@@ -144,8 +144,8 @@ pub(super) fn while_decoding<T>(
     while_decoding_at(ctx, platform, 0.15, || 0.3, f)
 }
 
-/// [`while_decoding`] の印を、割合 `before` と読み終えたときの `after()` で書く（流して書く道は今の回の割合で。進捗を戻さない。
-/// M13 段 3 の検証の直し）。
+/// [`while_decoding`] の印を、割合 `before` と読み終えたときの `after()` で画面へ送る（流して書く道は今の回の割合で。進捗を戻さない。
+/// M13 段 3 の検証の直し）。DB に書くのは印だけ（[`JobContext::mark`]）。
 pub(super) fn while_decoding_at<T>(
     ctx: &JobContext,
     platform: bool,
@@ -156,9 +156,9 @@ pub(super) fn while_decoding_at<T>(
     if !platform {
         return f();
     }
-    ctx.checkpoint(DECODING, before, "元を読んでいます")?;
+    ctx.mark(DECODING, before, "元を読んでいます")?;
     let r = f();
-    match ctx.checkpoint(DECODED, after(), "元を読みました") {
+    match ctx.mark(DECODED, after(), "元を読みました") {
         Ok(()) => r,
         Err(err) => match r {
             Ok(_) => Err(err),
