@@ -370,8 +370,8 @@ fn reads(env: &Env, s: &str) -> u64 {
 /// - 描くのは区間の分だけ：どの手も、表示の範囲の描画が全体に落ちず（`fallbacks`・`full_nodes` が 0）、描いたチャンクがノード
 ///   × 区間のチャンク以下で、公開した表示の有効な区間は区間の中だけ。
 /// - 源の読みは区間の分だけ：開いて 8 手を当てるまでに源から読んだチャンクが区間のチャンク以下（全体は 2,637 チャンク）。
-///   波形の段を作り直したあとの fade の手は、区間 ＋ 手の中で直す波形の段の汚れ（`PEAKS_SYNC_FRAMES`）まで、gain の手は
-///   区間まで。
+///   裏の仕事（全体を流す）の読みは源の LRU に入れない（段 7）ので、波形の段を作り直したあとも区間は LRU に残り、fade の手は
+///   手の中で直す波形の段の汚れ（`PEAKS_SYNC_FRAMES`）まで、gain の手は 0。
 /// - 持ち続ける分（`extra`）：手のあとも、裏の仕事で 60 分の波形の段を作り直す間（公開した全段の段 2 つを持ったまま組み直す
 ///   gain のあとを含む）も 70 MiB 以下。
 /// - 閉じると取り置き・対話・持ち続ける分・作業用のファイルが 0。
@@ -532,13 +532,14 @@ fn a18_sixty_minutes_one_step_draws_only_the_spans() {
     let sync = PEAKS_SYNC_FRAMES / C;
     let fade_reads = reads(&env, &s) - before;
     println!(
-        "[A18] その手の源の読み：{fade_reads} チャンク（区間 {A18_AREA} ＋ 手の中で直す汚れ {sync}）"
+        "[A18] その手の源の読み：{fade_reads} チャンク（手の中で直す汚れ {sync} まで。区間は源の LRU に残る）"
     );
     assert!(
-        fade_reads <= A18_AREA + sync,
-        "源の読み {fade_reads} チャンク > 区間 {A18_AREA} ＋ {sync}"
+        fade_reads <= sync,
+        "源の読み {fade_reads} チャンク > 手の中で直す汚れ {sync}"
     );
-    // 全体に効く gain の手：区間だけを描き（源の LRU は裏の仕事が流した尾を持つので、区間を読み直す）、段は裏の仕事に回す
+    // 全体に効く gain の手：区間だけを描き、段は裏の仕事に回す。裏の仕事の読みは源の LRU に入れない（読み通し。段 7）ので、
+    // 区間のチャンクは LRU に残り、読み直さない
     let before = reads(&env, &s);
     let t = Instant::now();
     let out = env.step(&s, vec![set(1, json!({ "db": -5.0 }))], &vp);
@@ -548,9 +549,10 @@ fn a18_sixty_minutes_one_step_draws_only_the_spans() {
         "gain の段は裏の仕事で直す"
     );
     let gain_reads = reads(&env, &s) - before;
-    assert!(
-        gain_reads <= A18_AREA,
-        "gain の手の源の読み {gain_reads} チャンク > 区間 {A18_AREA}"
+    println!("[A18] 裏の仕事のあとの gain の手の源の読み：{gain_reads} チャンク");
+    assert_eq!(
+        gain_reads, 0,
+        "裏の仕事のあとの gain の手は区間を源から読み直さない"
     );
     // 公開した段 2 つ（どちらも全段）を持ったまま組み直す：持ち続ける分がいちばん大きくなる形
     background("gain のあと");
