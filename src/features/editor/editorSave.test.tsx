@@ -46,7 +46,13 @@ import {
 } from './editorSave';
 import { openEditor } from './editorKinds';
 import { EditorSheets } from './EditorSheets';
-import { closeEditor, openEditorAs, pushEditorSteps, useEditorStore } from './editorStore';
+import {
+  closeEditor,
+  openEditorAs,
+  pushEditorSteps,
+  refreshEditorView,
+  useEditorStore,
+} from './editorStore';
 import { IMAGE_EDITOR } from './image/imageKind';
 import { FormatOutputRow } from './OpsPanel';
 import { DEFAULT_TOOLS, useToolStore } from './image/toolStore';
@@ -921,6 +927,206 @@ describe('出力の形式の行：この環境で書けない形式（M13 段 7�
     expect(listEditFormats).toHaveBeenCalledTimes(2);
     expect(mp3Option('MP3')).toBeEnabled();
     expect(screen.queryByText(t.formatUnavailableBody('MP3'))).toBeNull();
+  });
+
+  describe('手のあと（出力の形が変わる）', () => {
+    /** 開いたときの一覧（ffmpeg はあるが、今の形は MP3 に書けない。`mp3` が書けるかだけが変わる）。 */
+    const rowsWith = (mp3: boolean) => ({
+      formats: AUDIO_ROWS.map((r) =>
+        r.format === 'mp3' ? { ...r, available: mp3, missingTool: null } : r,
+      ),
+      current: 'wav',
+      fallback: mp3 ? null : 'ogg',
+    });
+    const answerWith = (mp3: boolean) =>
+      vi.mocked(listEditFormats).mockResolvedValueOnce(rowsWith(mp3));
+    const mp3Row = () =>
+      useEditorStore.getState().writableFormats?.find((r) => r.format === 'mp3')?.available;
+    /** 1 手送って結果を受ける（既定は確定の結果）。 */
+    async function hand(over: Partial<EditStepResultDto> = {}) {
+      vi.mocked(stepEdit).mockImplementationOnce(async () => result(over));
+      act(() => {
+        pushEditorSteps([{ type: 'undo' }]);
+      });
+      await flush();
+    }
+
+    it('書けるようになる向き：確定の結果のあとに読み直し、行が押せるようになる（レート変換・モノラルなど）', async () => {
+      answerWith(false);
+      await openAudioDirty({ ext: 'wav' });
+      render(<FormatOutputRow />);
+      expect(mp3Option(t.outputOptionUnavailable('MP3', t.formatNotWritable))).toBeDisabled();
+      expect(listEditFormats).toHaveBeenCalledTimes(1);
+      answerWith(true);
+      await hand();
+      expect(listEditFormats).toHaveBeenCalledTimes(2);
+      expect(listEditFormats).toHaveBeenLastCalledWith('aa01');
+      expect(mp3Option('MP3')).toBeEnabled();
+    });
+
+    it('書けなくなる向き：行が押せなくなり、今の形式なら理由の一言も出す', async () => {
+      answerWith(true);
+      await openAudioDirty({ ext: 'mp3' });
+      render(<FormatOutputRow />);
+      expect(mp3Option('MP3')).toBeEnabled();
+      expect(screen.queryByText(t.formatUnavailableBodyShape('MP3'))).toBeNull();
+      answerWith(false);
+      await hand();
+      expect(mp3Option(t.outputOptionUnavailable('MP3', t.formatNotWritable))).toBeDisabled();
+      expect(screen.getByText(t.formatUnavailableBodyShape('MP3'))).toBeInTheDocument();
+      // 戻せば理由も消える
+      answerWith(true);
+      await hand();
+      expect(mp3Option('MP3')).toBeEnabled();
+      expect(screen.queryByText(t.formatUnavailableBodyShape('MP3'))).toBeNull();
+    });
+
+    it('画像も同じ：縮めて書けるようになった形式が押せるようになる', async () => {
+      const row = (webp: boolean) => ({
+        formats: [
+          formatRow('png', true),
+          formatRow('webp', webp),
+          formatRow('jpeg', true),
+          formatRow('gif', true),
+        ],
+        current: 'png',
+        fallback: null,
+      });
+      vi.mocked(listEditFormats).mockResolvedValueOnce(row(false));
+      await openDirty();
+      render(<FormatOutputRow />);
+      expect(mp3Option(t.outputOptionUnavailable('WebP', t.formatNotWritable))).toBeDisabled();
+      vi.mocked(listEditFormats).mockResolvedValueOnce(row(true));
+      await hand();
+      expect(mp3Option('WebP')).toBeEnabled();
+    });
+
+    it('連打：最新の頼みの応えだけを使い、古い応えは後から届いても捨てる', async () => {
+      answerWith(false);
+      await openAudioDirty({ ext: 'wav' });
+      const answers: ((mp3: boolean) => void)[] = [];
+      vi.mocked(listEditFormats).mockImplementation(
+        () => new Promise((resolve) => answers.push((mp3) => resolve(rowsWith(mp3)))),
+      );
+      await hand();
+      await hand();
+      expect(answers).toHaveLength(2);
+      // 新しい頼みの応えが先に届く
+      answers[1]?.(true);
+      await flush();
+      expect(mp3Row()).toBe(true);
+      // 古い頼みの応えが後から届いても使わない
+      answers[0]?.(false);
+      await flush();
+      expect(mp3Row()).toBe(true);
+
+      // 古い頼みの応えが先に届いても使わない（新しい応えを待つ）
+      await hand();
+      await hand();
+      answers[2]?.(false);
+      await flush();
+      expect(mp3Row()).toBe(true);
+      answers[3]?.(false);
+      await flush();
+      expect(mp3Row()).toBe(false);
+    });
+
+    it('応えを待っても手を止めない：読み直しの応えが届く前に次の手を送る', async () => {
+      answerWith(false);
+      await openAudioDirty({ ext: 'wav' });
+      vi.mocked(listEditFormats).mockImplementation(() => new Promise(() => undefined));
+      await hand();
+      expect(listEditFormats).toHaveBeenCalledTimes(2);
+      vi.mocked(stepEdit).mockClear();
+      await hand();
+      expect(stepEdit).toHaveBeenCalledTimes(1);
+    });
+
+    it('プレビューの途中・表示だけの結果では読まない。プレビューを確定したら読む', async () => {
+      answerWith(false);
+      await openAudioDirty({ ext: 'wav' });
+      await hand({ status: status({ provisional: true }) });
+      expect(listEditFormats).toHaveBeenCalledTimes(1);
+      act(() => refreshEditorView());
+      await flush();
+      expect(viewEdit).toHaveBeenCalled();
+      expect(listEditFormats).toHaveBeenCalledTimes(1);
+      answerWith(true);
+      await hand();
+      expect(listEditFormats).toHaveBeenCalledTimes(2);
+      expect(mp3Row()).toBe(true);
+    });
+
+    it('続けて手を送っている間は読まず、最後の結果のあとに読む（手と競らない）', async () => {
+      answerWith(false);
+      await openAudioDirty({ ext: 'wav' });
+      const release: (() => void)[] = [];
+      vi.mocked(stepEdit).mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release.push(() => resolve(result()));
+          }),
+      );
+      act(() => {
+        pushEditorSteps([{ type: 'undo' }]);
+        pushEditorSteps([{ type: 'undo' }]);
+      });
+      await flush();
+      // 1 つ目の結果：ためた手が残っているので読まない
+      release[0]?.();
+      await flush();
+      expect(listEditFormats).toHaveBeenCalledTimes(1);
+      // 最後の結果のあとに読む
+      answerWith(true);
+      release[1]?.();
+      await flush();
+      expect(listEditFormats).toHaveBeenCalledTimes(2);
+      expect(mp3Row()).toBe(true);
+    });
+
+    it('最後の手が届かなかったら、確かめ直すために読む', async () => {
+      answerWith(false);
+      await openAudioDirty({ ext: 'wav' });
+      vi.mocked(stepEdit).mockRejectedValueOnce(new IpcError({ code: 'Internal', message: 'x' }));
+      answerWith(true);
+      act(() => {
+        pushEditorSteps([{ type: 'undo' }]);
+      });
+      await flush();
+      expect(listEditFormats).toHaveBeenCalledTimes(2);
+      expect(mp3Row()).toBe(true);
+    });
+
+    it('読めなければ今の行のまま。同じ中身なら行を差し替えない（再描画しない）', async () => {
+      answerWith(false);
+      await openAudioDirty({ ext: 'wav' });
+      const rows = useEditorStore.getState().writableFormats;
+      vi.mocked(listEditFormats).mockRejectedValueOnce(
+        new IpcError({ code: 'NotFound', message: 'x' }),
+      );
+      await hand();
+      expect(useEditorStore.getState().writableFormats).toBe(rows);
+      answerWith(false);
+      await hand();
+      expect(listEditFormats).toHaveBeenCalledTimes(3);
+      expect(useEditorStore.getState().writableFormats).toBe(rows);
+    });
+
+    it('エディタが替わったあとに届いた応えは使わない', async () => {
+      answerWith(false);
+      await openAudioDirty({ ext: 'wav' });
+      let answer: (v: Awaited<ReturnType<typeof listEditFormats>>) => void = () => undefined;
+      vi.mocked(listEditFormats).mockImplementationOnce(
+        () => new Promise((resolve) => (answer = resolve)),
+      );
+      await hand();
+      answerWith(false);
+      await openAudioDirty({ ext: 'wav', id: 8 });
+      expect(mp3Row()).toBe(false);
+      answer(rowsWith(true));
+      await flush();
+      expect(mp3Row()).toBe(false);
+    });
   });
 
   it('閉じたあと・開き直したあとに届いた一覧は使わない', async () => {

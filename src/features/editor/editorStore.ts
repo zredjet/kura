@@ -166,8 +166,8 @@ export interface EditorState {
   /** 結果が確定した手の番号（断られた・失敗した・仮でない結果が届いた。引数の欄が手元の値をやめる）。 */
   acked: number;
   /**
-   * この環境で書けるか（Rust の `edit_formats` の行。開いたとき・設定のシートを閉じたとき・形式を選ぶシートを出すときに
-   * 読む）。読めていなければ null で、出力の行は形式の表だけで組む。
+   * この環境で今の出力の形を書けるか（Rust の `edit_formats` の行。開いたとき・設定のシートを閉じたとき・手を含む確定の結果の
+   * あと・形式を選ぶシートを出すときに読む）。読めていなければ null で、出力の行は形式の表だけで組む。
    */
   writableFormats: EditWritableFormatDto[] | null;
 }
@@ -362,6 +362,8 @@ interface Runtime {
   superseded: number;
   /** 次に足したノードを選ぶ（「操作を追加」・切り抜きの確定）。 */
   selectCreated: boolean;
+  /** 書ける形式の頼みの番号（最新の頼みの応えだけを使う）。 */
+  formatsAsked: number;
 }
 
 /** 結果を受けたあとに呼ぶもの（保存の流れ。`hadSteps` は手を含む要求の結果か）。 */
@@ -389,16 +391,40 @@ let pendingCancel: Promise<void> | null = null;
 /** 最後に開いた種類の口（開き直すときに使う）。 */
 let lastFactory: EditorAdapterFactory | null = null;
 
+/** 書ける形式の行が同じか（変わるのは書けるかと道具だけ。同じなら行を差し替えず、手のたびに描き直さない）。 */
+function sameWritable(
+  a: readonly EditWritableFormatDto[] | null,
+  b: readonly EditWritableFormatDto[],
+): boolean {
+  return (
+    a !== null &&
+    a.length === b.length &&
+    a.every((row, i) => {
+      const other = b[i];
+      return (
+        row.format === other?.format &&
+        row.available === other.available &&
+        row.missingTool === other.missingTool
+      );
+    })
+  );
+}
+
 /**
- * この環境で書けるか（`edit_formats`）を読む（届いたときにそのエディタが今のものなら置く。読めなければ今の値のまま：
- * 開いたときは null で、出力の行は形式の表だけ）。開く・閉じるの流れを止めないよう、誤りはここで飲む。
+ * この環境で今の出力の形を書けるか（`edit_formats`）を読む（最新の頼みの応えだけを、そのエディタが今のものなら置く。読めな
+ * ければ今の値のまま：開いたときは null で、出力の行は形式の表だけ）。呼び手は待たない。開く・閉じるの流れを止めないよう、
+ * 誤りはここで飲む。
  */
 async function readWritableFormats(rt: Runtime): Promise<void> {
   const session = rt.session;
   if (!session) return;
+  const asked = ++rt.formatsAsked;
   try {
     const list = await listEditFormats(session);
-    if (runtime === rt) useEditorStore.setState({ writableFormats: list.formats });
+    if (runtime !== rt || rt.formatsAsked !== asked) return;
+    if (!sameWritable(useEditorStore.getState().writableFormats, list.formats)) {
+      useEditorStore.setState({ writableFormats: list.formats });
+    }
   } catch {
     // 読めない：形式の表だけで組む（保存のときに断られたら、形式を選ぶシートが読み直す）
   }
@@ -505,6 +531,7 @@ export async function openEditorAs<Tag>(
     returnFocus,
     superseded: 0,
     selectCreated: false,
+    formatsAsked: 0,
   };
   holder.rt = rt;
   runtime = rt;
@@ -666,6 +693,9 @@ function applyResult(
   rt.adapter.settle(doc);
   useEditorStore.setState(patch);
   for (const hook of resultHooks) hook(result, hadSteps);
+  // 手で出力の形（レート・チャンネル数・大きさ）が変わると、書ける形式も変わる。確定の結果だけを見る（Rust は確定した頭で
+  // 答える）。続けて手を送っている間は読まない（最後の結果のあとに読む。手と錠を競らない）
+  if (hadSteps && !result.status.provisional && !pendingOf(rt)) void readWritableFormats(rt);
 }
 
 function requestFailed(rt: Runtime, req: SentRequest<unknown>, error: unknown): void {
@@ -677,6 +707,8 @@ function requestFailed(rt: Runtime, req: SentRequest<unknown>, error: unknown): 
     // 届かなかった手の結果も確定（引数の欄は文書の値に戻す）
     ...(req.steps.length > 0 && req.upto > s.acked ? { acked: req.upto } : {}),
   });
+  // 手の結果のあとに読まずにいた分（続けて手を送っていた）を、最後の手が届かなかったときに読む
+  if (req.steps.length > 0 && !pendingOf(rt)) void readWritableFormats(rt);
 }
 
 /** 手をためて送り、応えの来ていない文書の手があるかをストアに合わせる。 */
