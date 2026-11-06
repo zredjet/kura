@@ -370,7 +370,7 @@
 
 /* 「ファイルのループ点」「全体」を選んだときの区間（0:04.200 – 1:32.000） */
 .loopValue {
-  font-size: var(--text-sm);
+  font-size: var(--text-md);
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
