@@ -13,7 +13,7 @@
 //! それより小さい確保（音声のチャンク（1 チャンネル 256 KiB）など）を解放した領域は libmalloc が抱える。エディタの裏の仕事・
 //! 音声の保存のように窓ごとにチャンクを確保しては捨てると、その抱え込みがフットプリントに残る。空いた領域を OS へ返させる口
 //! [`pressure_relief`]（`malloc_zone_pressure_relief`）を kura-core に渡す（`RuntimeConfig::relief`。M13 段 7）が、macOS 26 の
-//! libmalloc はこれでも 256 KiB の確保の抱え込みを返さない（0 バイトを返し、フットプリントは変わらない。1 回 1 µs 未満。段 7 の
+//! libmalloc はこれでも 256 KiB の確保の抱え込みを返さない（0 バイトを返し、フットプリントは変わらない。1 回 約 2.5 µs。段 7 の
 //! 実測。`MallocSpaceEfficient=1` なら解放のときに返る）。
 //!
 //! 確保の量を数える目印（kura-core の `svg_worker::AllocMeter`）を持つ。SVG の働き手（アプリ自身を `--kura-svg-worker` 付きで
