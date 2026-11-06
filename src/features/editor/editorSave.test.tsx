@@ -111,8 +111,13 @@ vi.mock('../../ipc/jobs', async (importOriginal) => ({
   cancelJob: vi.fn(async () => null),
 }));
 
+/** 今のライブラリ（テストが替える）。 */
+const library = vi.hoisted(() => ({ path: '/L.kuralib' }));
+
 vi.mock('../../stores/libraryStore', () => ({
-  useLibraryStore: { getState: () => ({ loadList: vi.fn(), refresh: vi.fn() }) },
+  useLibraryStore: {
+    getState: () => ({ loadList: vi.fn(), refresh: vi.fn(), info: { path: library.path } }),
+  },
 }));
 
 vi.mock('../../stores/itemCache', async (importOriginal) => ({
@@ -1845,6 +1850,46 @@ describe('保存の一時停止・再開・中止', () => {
     await flush();
     expect(invalidateItems).toHaveBeenCalledWith([7]);
     expect(useNoticeStore.getState().message).toBe(t.savedClosed('long-60min'));
+  });
+
+  it('前のライブラリのジョブの覚えが残っていても、今のライブラリの同じ番号の保存が終われば知らせて読み直す', async () => {
+    const row = (itemId: number, itemTitle: string): EditPendingSaveDto => ({
+      job: 120,
+      itemId,
+      itemTitle,
+      mode: { type: 'overwrite' },
+      state: 'paused',
+      progress: null,
+      message: null,
+    });
+    try {
+      library.path = '/A.kuralib';
+      vi.mocked(listPendingSaves).mockResolvedValueOnce([row(7, 'A の絵')]);
+      await act(() => useJobsStore.getState().reloadSaves());
+      library.path = '/B.kuralib';
+      vi.mocked(listPendingSaves).mockResolvedValueOnce([row(8, 'B の絵')]);
+      await act(() => useJobsStore.getState().reloadSaves());
+      act(() => onEditorJob({ ...event('queued'), id: 120 }));
+      act(() =>
+        onEditorJob({
+          ...event('done', { resultJson: '{"outcome":"saved","itemId":8}' }),
+          id: 120,
+        }),
+      );
+      await flush();
+      expect(invalidateItems).toHaveBeenCalledWith([8]);
+      expect(useNoticeStore.getState().message).toBe(t.savedClosed('B の絵'));
+
+      // 失敗も同じ。戻ったライブラリの同じ番号も今のライブラリのものとして知らせる
+      library.path = '/A.kuralib';
+      vi.mocked(listPendingSaves).mockResolvedValueOnce([row(7, 'A の絵')]);
+      await act(() => useJobsStore.getState().reloadSaves());
+      act(() => onEditorJob({ ...event('failed', { message: '書けません' }), id: 120 }));
+      await flush();
+      expect(useNoticeStore.getState().message).toBe(t.saveFailedClosed('A の絵', '書けません'));
+    } finally {
+      library.path = '/L.kuralib';
+    }
   });
 
   it('保存のイベントを取りこぼして Rust から終わりを知ったら、カプセルの表からも消す', async () => {
