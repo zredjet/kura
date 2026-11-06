@@ -511,7 +511,8 @@ CREATE TABLE analysis_results (
 );
 
 -- ===== 素材の設定（0009。利用者の決定。アイテムごと、変えたアイテムにだけ行がある）=====
--- 付けるのは画像だけ（`asset::set_settings` がほかの種類の ID を飛ばす）。すべての欄が自動（NULL）に戻れば行を消す。
+-- 画像の欄は画像だけ、試聴のループ（loop_*）は音声だけに付ける（`asset::set_settings` がほかの種類の ID・欄を飛ばす。M13）。
+-- すべての欄が自動（NULL）に戻れば行を消す。
 CREATE TABLE asset_settings (
   item_id      INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
   pixel_art    INTEGER CONSTRAINT asset_settings_pixel_art CHECK (pixel_art IN (0, 1)),   -- NULL は自動
@@ -521,7 +522,10 @@ CREATE TABLE asset_settings (
                                            -- sprite.split_grid と同じ）。知らない版・知らない欄・壊れたものは格子なしとして読む
   frame_ms     INTEGER CONSTRAINT asset_settings_frame_ms CHECK (frame_ms > 0),
   pivot_x      REAL, pivot_y REAL,
-  loop_start   INTEGER, loop_end INTEGER,  -- 試聴のループ（標本）。ファイルは変えない（M11 では使わない。M13）
+  loop_start   INTEGER, loop_end INTEGER,  -- 試聴のループ（フレームの半開区間。音声だけ。M13 段 7 の試聴のループのシートが書く）。
+                                           -- ファイルは変えない。試聴と波形のループの区間に、長さに収まるときだけファイルの
+                                           -- ループ点（media_facts.loop_*）より先に使う。書くときに kura.read の長さで
+                                           -- 終わり ≤ 長さを確かめる（分かるときだけ）。検索の `ループ` は見ない
   anim_tag     TEXT,                       -- aseprite の再生するタグ
   updated_at   INTEGER NOT NULL,
   CONSTRAINT asset_settings_loop CHECK (   -- NULL を含む比較は CHECK を通ってしまうので、片方だけ NULL を明示して断る
