@@ -690,6 +690,9 @@ pub struct EditAudioViewDto {
     pub loudness: EditLoudnessStateDto,
     /// 裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。
     pub work: bool,
+    /// この `work: true` の頼みでは、誤り・予算の断りのために裏の仕事が 1 チャンクも進まなかった（中止は含めない）。連鎖をやめて
+    /// 待ってから頼み直す。
+    pub work_stalled: bool,
     pub warnings: Vec<Issue>,
     pub drawn_nodes: u64,
     /// 描くのにかかった時間（ミリ秒）。
@@ -720,6 +723,7 @@ impl From<AudioViewInfo> for EditAudioViewDto {
             nodes: v.nodes.into_iter().map(Into::into).collect(),
             loudness: v.loudness.into(),
             work: v.work,
+            work_stalled: v.work_stalled,
             warnings: v.warnings,
             drawn_nodes: v.drawn_nodes,
             ms: v.ms,
@@ -1694,6 +1698,7 @@ mod tests {
                     },
                 },
                 work: true,
+                work_stalled: true,
                 warnings: Vec::new(),
                 drawn_nodes: 1,
                 ms: 2.0,
@@ -1703,6 +1708,7 @@ mod tests {
         assert_eq!(json["view"]["type"], json!("audio"));
         assert_eq!(json["view"]["loop"], json!({ "start": 10, "end": 90000 }));
         assert_eq!(json["view"]["samplesId"], json!("0123456789abcdef"));
+        assert_eq!(json["view"]["workStalled"], json!(true));
         assert_eq!(
             json["view"]["changed"],
             json!({ "type": "spans", "spans": [{ "start": 0, "end": 65536 }] })

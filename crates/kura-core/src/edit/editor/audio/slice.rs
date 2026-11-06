@@ -7,6 +7,8 @@
 //! - 見積もりは窓ごとのかかった時間 ÷ チャンクの数の、半分ずつの移動平均（窓の前の確保と呼び出しの手間も含むので、チャンクの
 //!   少ない窓ほど大きめに出て、締め切りの前では控えめになる）。見積もりがなければ 1 チャンクで測る。見積もりが合っていれば、
 //!   区切りは締め切り ＋ 1 チャンクまでで終わる（[`Pace::fit`] の約束）。結果（段・ラウドネス）は切り方によらず同じ。
+//! - 進まない区切り（[`WorkProgress`]）：誤り・予算の断りのために 1 チャンクも進まなかったら、表示の情報の `work_stalled` で
+//!   知らせる（フロントは連鎖をやめて待つ。源が読めない間に、往復の速さで頼み続けないため）。中止・締め切りは含めない。
 
 use std::time::{Duration, Instant};
 
@@ -50,6 +52,22 @@ impl Pace {
     /// 今の見積もり（1 チャンク）。
     pub(crate) fn per_chunk(&self) -> Option<Duration> {
         self.per_chunk
+    }
+}
+
+/// 裏の仕事の 1 回の区切りの進み（波形の段と計りで足す）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorkProgress {
+    /// 進めたチャンクの数（誤りで捨てた分は入れない）。
+    pub(crate) moved: u64,
+    /// 誤り・予算の断りで止まった（中止・締め切りでは立てない）。
+    pub(crate) blocked: bool,
+}
+
+impl WorkProgress {
+    /// 誤り・予算の断りのために 1 チャンクも進まなかった。
+    pub(crate) fn stalled(&self) -> bool {
+        self.blocked && self.moved == 0
     }
 }
 
@@ -146,6 +164,16 @@ mod tests {
         let mut zero = Pace::default();
         zero.note(4, Duration::ZERO);
         assert_eq!(zero.fit(ms(1), 16), 16);
+    }
+
+    /// 進まなかったのは、止まって（誤り・予算の断り）1 チャンクも進まなかったときだけ。
+    #[test]
+    fn stalled_means_blocked_without_moving() {
+        let stalled = |moved, blocked| WorkProgress { moved, blocked }.stalled();
+        assert!(stalled(0, true));
+        assert!(!stalled(1, true), "進んでから止まった");
+        assert!(!stalled(0, false), "中止・締め切り");
+        assert!(!stalled(1, false));
     }
 
     /// 締め切りを過ぎたら 0。テストの数は区切りの中で分け合う（尽きたら 0）。

@@ -908,6 +908,11 @@ export type EditAudioViewDto = {
 	loudness: EditLoudnessStateDto,
 	/**  裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。 */
 	work: boolean,
+	/**
+	 *  この `work: true` の頼みでは、誤り・予算の断りのために裏の仕事が 1 チャンクも進まなかった（中止は含めない）。連鎖をやめて
+	 *  待ってから頼み直す。
+	 */
+	workStalled: boolean,
 	warnings: Issue[],
 	drawnNodes: number,
 	/**  描くのにかかった時間（ミリ秒）。 */

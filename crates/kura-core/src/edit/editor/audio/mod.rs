@@ -113,6 +113,9 @@ pub struct AudioViewInfo {
     pub loudness: measure::LoudnessState,
     /// 裏の仕事が残っている（フロントは手が止まったら `work: true` で頼み直す）。
     pub work: bool,
+    /// この `work: true` の頼みでは、誤り・予算の断りのために裏の仕事が 1 チャンクも進まなかった（中止は含めない。`work` が
+    /// 真のときだけ立つ）。フロントは連鎖をやめて待つ。
+    pub work_stalled: bool,
     /// 描いたノード・当たったノードの警告。
     pub warnings: Vec<Issue>,
     pub drawn_nodes: u64,
@@ -366,9 +369,19 @@ impl Editor {
         ) {
             *l = slice::Limit::Chunks(n);
         }
-        self.advance_peaks(st, rev, &value, &area, &avp, limit.as_mut(), ticket);
+        let mut progress = slice::WorkProgress::default();
+        self.advance_peaks(
+            st,
+            rev,
+            &value,
+            &area,
+            &avp,
+            limit.as_mut(),
+            &mut progress,
+            ticket,
+        );
         if let Some(limit) = limit.as_mut() {
-            self.advance_measure(st, &id, limit, ticket);
+            self.advance_measure(st, &id, limit, &mut progress, ticket);
         }
         self.count_resident(st);
         let (peaks, work, loudness) = match st.audio.as_mut() {
@@ -409,6 +422,7 @@ impl Editor {
             nodes,
             loudness,
             work,
+            work_stalled: work && limit.is_some() && progress.stalled(),
             warnings: vr.warnings.clone(),
             drawn_nodes: vr.drawn_nodes(),
             ms: started.elapsed().as_secs_f64() * 1000.0,

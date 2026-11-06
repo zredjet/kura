@@ -675,3 +675,176 @@ fn background_peaks_stop_mid_window_and_resume() {
         peaks_of(&rendered(&bytes, "wav", &g))
     );
 }
+
+/// 裏の仕事を進まなくするテストの場：8 kHz モノラル 131 チャンクの WAV に gain を当てて、波形の段が残っているエディタ。
+struct Stuck {
+    env: Env,
+    session: String,
+    bytes: Vec<u8>,
+    path: std::path::PathBuf,
+    total: usize,
+}
+
+impl Stuck {
+    fn open(seed: u64, hold: Option<u64>) -> (Self, Option<kura_engine::budget::Lease>) {
+        let env = Env::new();
+        let frames = 130 * C + 5;
+        let bytes = noise_wav(8_000, 1, frames, seed);
+        let id = add_audio(&env.lib, &bytes, "wav");
+        let path = env
+            .lib
+            .layout()
+            .content_path(blake3::hash(&bytes).as_bytes(), "wav");
+        let budget = env.engine.runtime().unwrap().budget().clone();
+        let held = hold.map(|keep| {
+            budget
+                .try_acquire(
+                    budget.total() - keep,
+                    kura_engine::budget::Class::Interactive,
+                )
+                .unwrap()
+                .unwrap()
+        });
+        let idle = Self::viewport(false, false);
+        let session = env.open_with(id, idle.clone()).session.clone();
+        let out = env.step(
+            &session,
+            vec![add(0, "audio.gain", json!({ "db": -6.0 }))],
+            &idle,
+        );
+        let info = shown_audio(&out.view);
+        assert!(info.peaks.pending);
+        assert!(!info.work_stalled, "手の応えには立たない");
+        (
+            Self {
+                env,
+                session,
+                bytes,
+                path,
+                total: frames.div_ceil(C) as usize,
+            },
+            held,
+        )
+    }
+
+    fn viewport(work: bool, interacting: bool) -> Viewport {
+        Viewport::Audio(AudioViewport {
+            work,
+            interacting,
+            ..AudioViewport::idle()
+        })
+    }
+
+    /// 裏の仕事を `n` チャンクの区切りで 1 回頼む。
+    fn work(&self, n: u64) -> AudioViewInfo {
+        self.with_job(|a| a.script = Some(n));
+        let out = self
+            .env
+            .step(&self.session, Vec::new(), &Self::viewport(true, false));
+        shown_audio(&out.view).clone()
+    }
+
+    fn with_job<R>(&self, f: impl FnOnce(&mut crate::edit::editor::audio::AudioState) -> R) -> R {
+        let editor = self.env.editor(&self.session);
+        let mut guard = editor.lock_state();
+        f(guard.as_mut().unwrap().audio.as_mut().unwrap())
+    }
+
+    fn missing(&self) -> Option<usize> {
+        self.with_job(|a| a.peaks.missing_chunks())
+    }
+
+    fn warned(&self) -> u32 {
+        self.with_job(|a| a.peaks.warned)
+    }
+
+    /// 終わるまで頼み（進まない応えはない）、組み終えた段が全体の描画の段と同じことを確かめる。
+    fn finish_like_compute(&self) {
+        let generation = loop {
+            let info = self.work(1_000);
+            assert!(!info.work_stalled);
+            if !info.peaks.pending {
+                break info.peaks.rev.unwrap();
+            }
+        };
+        let mut g = Graph::new_single();
+        g.push_linear("audio.gain", 1, json!({ "db": -6.0 }), 1)
+            .unwrap();
+        assert_eq!(
+            *published(&self.env, &self.session, generation),
+            peaks_of(&rendered(&self.bytes, "wav", &g))
+        );
+    }
+}
+
+/// 段 7 の検証の直し（裏の仕事の空回り）：源が読めなくなると、波形の段は読める所まで進み、組みかけを残して止まる。1 チャンクも
+/// 進まなかった `work: true` の頼みの応えにだけ `work_stalled` が立つ（表示は Shown のまま）。warn は失敗が続く間は最初の 1 回
+/// だけ。読めるようになれば続きから進み、組み終えた段は `compute` と同じ。
+#[test]
+fn background_peaks_report_a_stall_while_the_source_cannot_be_read() {
+    let (t, _) = Stuck::open(39, None);
+    // 頭から 40 チャンク目の途中までのファイルにする（読み口は開いたまま）
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&t.path)
+        .unwrap()
+        .set_len(40 * C * 2)
+        .unwrap();
+    let info = t.work(16);
+    assert!(!info.work_stalled, "進んだ");
+    assert_eq!(t.missing(), Some(t.total - 16));
+    // 次の窓は読め、その次の窓（32..48）で止まる：進んだので立たない
+    let info = t.work(1_000);
+    assert!(!info.work_stalled, "進んでから止まった");
+    assert_eq!(t.missing(), Some(t.total - 32), "組みかけを残す");
+    assert_eq!(t.warned(), 1);
+    for _ in 0..3 {
+        let info = t.work(1_000);
+        assert!(info.work_stalled, "1 チャンクも進まない");
+        assert!(info.work && info.peaks.pending);
+        assert_eq!(t.missing(), Some(t.total - 32));
+    }
+    assert_eq!(t.warned(), 1, "warn は最初の 1 回だけ");
+    // ほかの要求の応えには立たない（裏の仕事を頼んでいない・操作中）
+    for vp in [Stuck::viewport(false, false), Stuck::viewport(true, true)] {
+        let out = t.env.step(&t.session, Vec::new(), &vp);
+        assert!(!shown_audio(&out.view).work_stalled);
+    }
+    // 読めるようになれば続きから進む（読み口は開き直す）
+    std::fs::write(&t.path, &t.bytes).unwrap();
+    let info = t.work(16);
+    assert!(!info.work_stalled);
+    assert_eq!(t.missing(), Some(t.total - 48), "続きから");
+    t.finish_like_compute();
+    assert_eq!(t.warned(), 1);
+}
+
+/// 段 7 の検証の直し（裏の仕事の空回り）：窓の確保が断られた（「あとにします」）区切りも `work_stalled` で知らせ、組みかけは残す。
+/// 予算が空けば進む。
+#[test]
+fn background_peaks_report_a_stall_while_the_budget_refuses() {
+    // 源の LRU（8 MiB）と少しだけを残して埋める
+    let (t, held) = Stuck::open(40, Some((8 << 20) + (1 << 20)));
+    assert_eq!(t.missing(), Some(t.total));
+    for _ in 0..2 {
+        let info = t.work(16);
+        assert!(info.work_stalled, "予算の断りで進まない");
+        assert!(info.work && info.peaks.pending);
+        assert_eq!(t.missing(), Some(t.total));
+    }
+    assert_eq!(t.warned(), 0, "予算の断りは誤りでない");
+    drop(held);
+    let info = t.work(16);
+    assert!(!info.work_stalled);
+    assert_eq!(t.missing(), Some(t.total - 16));
+    t.finish_like_compute();
+}
+
+/// 裏の仕事が残っていない・終わった応えには立たない（`work` が偽なら `work_stalled` も偽）。
+#[test]
+fn finished_work_is_not_reported_as_stalled() {
+    let (t, _) = Stuck::open(41, None);
+    t.finish_like_compute();
+    let info = t.work(1_000);
+    assert!(!info.work && !info.work_stalled);
+}

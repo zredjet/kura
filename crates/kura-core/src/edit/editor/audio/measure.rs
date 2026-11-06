@@ -40,7 +40,7 @@ use kura_engine::value::{AUDIO_CHUNK, AudioMeta};
 use kura_engine::{EngineError, Monitor, NoMonitor};
 
 use super::super::{Editor, EditorEnv, EditorError, ProblemCode, State, editor_of, settle};
-use super::slice::{Limit, Pace};
+use super::slice::{Limit, Pace, WorkProgress};
 use super::{WHOLE_VIEW_BYTES, audio_shape, is_short, samples_id};
 
 /// 覚える結果の数。
@@ -249,12 +249,13 @@ impl Editor {
     /// 長い音声の計りを裏の仕事で進める（モジュールの説明）。今の出力 `id` の計りかけがあれば、区切り `limit` の中で窓
     /// （[`MEASURE_WINDOW_CHUNKS`] まで。締め切りが近ければ窓の途中まで）を 1 つずつ頭から流し（窓の前にその区間だけの見積もりで
     /// 確保する。空いていなければあとにする）、流し終えたら解いて結果の LRU に入れる。中止（新しい要求・閉じる）は窓の境で
-    /// 止め、計りかけを残す（途中で中止した窓は次の区切りで流し直す）。
+    /// 止め、計りかけを残す（途中で中止した窓は次の区切りで流し直す）。進みは `progress` に足す。
     pub(super) fn advance_measure(
         &self,
         st: &mut State,
         id: &str,
         limit: &mut Limit,
+        progress: &mut WorkProgress,
         ticket: &Ticket,
     ) {
         if !st.audio.as_ref().is_some_and(|a| a.measure.running(id)) {
@@ -299,6 +300,7 @@ impl Editor {
             {
                 tracing::debug!(%err, "ラウドネスを計る予算が空いていないので、あとにします");
                 settle(st);
+                progress.blocked = true;
                 return;
             }
             let Some(run) = st.audio.as_mut().and_then(|a| a.measure.run.as_mut()) else {
@@ -331,6 +333,7 @@ impl Editor {
             settle(st);
             match r {
                 Ok(_) => {
+                    progress.moved += n;
                     if let Some(a) = st.audio.as_mut() {
                         a.measure.pace.note(n, started.elapsed());
                     }
@@ -346,6 +349,7 @@ impl Editor {
                         a.measure.run = None;
                         a.measure.remember(id, state);
                     }
+                    progress.blocked = true;
                     return;
                 }
             }

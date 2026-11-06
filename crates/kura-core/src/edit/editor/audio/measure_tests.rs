@@ -9,7 +9,7 @@ use serde_json::json;
 
 use super::measure::{LoudnessState, LoudnessValues, MEASURE_WINDOW_CHUNKS, measure, values_of};
 use super::session_tests::*;
-use super::slice::Limit;
+use super::slice::{Limit, WorkProgress};
 use crate::edit::editor::{AudioViewport, Step, Viewport};
 
 /// 区間 `spans` を描く要求（裏の仕事は `work`、操作中は `interacting`）。
@@ -302,7 +302,9 @@ fn long_measure_redoes_a_window_canceled_midway() {
         let (_, before, chunks) = st.audio.as_ref().unwrap().measure.run_position().unwrap();
         let ticket = editor.latest.issue(Arc::new(CancelAfter::new(n)));
         let mut limit = Limit::Deadline(Instant::now() + Duration::from_secs(60));
-        editor.advance_measure(st, &sid, &mut limit, &ticket);
+        let mut progress = WorkProgress::default();
+        editor.advance_measure(st, &sid, &mut limit, &mut progress, &ticket);
+        assert!(!progress.stalled(), "中止は進まなかったことにしない");
         let a = st.audio.as_ref().unwrap();
         let (run, next, _) = a.measure.run_position().expect("中止で計りかけを捨てない");
         assert_eq!(run, sid);
@@ -376,6 +378,54 @@ fn background_work_keeps_the_visible_chunks_in_the_source_lru() {
         after_step.reads, after_work.reads,
         "裏の仕事のあとの手は区間を読み直さない: {after_work:?} → {after_step:?}"
     );
+}
+
+/// 段 7 の検証の直し（裏の仕事の空回り）：計りの窓の確保が断られたら、1 チャンクも進まないことを知らせ、計りかけは残す。空いたら
+/// 続きから進む。
+#[test]
+fn long_measure_reports_a_refused_budget() {
+    use std::sync::Arc;
+
+    use kura_engine::budget::Class;
+    use kura_engine::monitor::CancelFlag;
+
+    let env = Env::new();
+    let frames = 130 * C;
+    let bytes = noise_wav(8_000, 1, frames, 86);
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let budget = env.engine.runtime().unwrap().budget().clone();
+    // 源の LRU（8 MiB）と少しだけを残して埋める
+    let held = budget
+        .try_acquire(budget.total() - (8 << 20) - (1 << 20), Class::Interactive)
+        .unwrap()
+        .unwrap();
+    let idle = vp(&[], false, false);
+    let s = env.open_with(id, idle.clone()).session.clone();
+    let out = env.step(&s, vec![add(0, "audio.gain", json!({ "db": -6.0 }))], &idle);
+    let sid = shown_audio(&out.view).samples_id.clone();
+    assert!(matches!(
+        measure(&env.env(), &s).unwrap(),
+        LoudnessState::Measuring { .. }
+    ));
+    let editor = env.editor(&s);
+    let advance = || {
+        let mut guard = editor.lock_state();
+        let st = guard.as_mut().unwrap();
+        let ticket = editor.latest.issue(Arc::new(CancelFlag::default()));
+        let mut limit = Limit::Chunks(MEASURE_WINDOW_CHUNKS);
+        let mut progress = WorkProgress::default();
+        editor.advance_measure(st, &sid, &mut limit, &mut progress, &ticket);
+        let at = st.audio.as_ref().unwrap().measure.run_position().unwrap().1;
+        (progress, at)
+    };
+    let (progress, at) = advance();
+    assert!(progress.stalled(), "{progress:?}");
+    assert_eq!(at, 0, "計りかけは残す");
+    drop(held);
+    let (progress, at) = advance();
+    assert_eq!(progress.moved, MEASURE_WINDOW_CHUNKS);
+    assert!(!progress.stalled());
+    assert_eq!(at, MEASURE_WINDOW_CHUNKS as usize);
 }
 
 /// テスト：次の裏の仕事の区切りを、時間ではなくチャンクの数 `n` で区切る。

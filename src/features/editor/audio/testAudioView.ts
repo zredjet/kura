@@ -45,6 +45,7 @@ export function audioView(over: AudioViewOver = {}): EditAudioView {
     nodes: [],
     loudness: { type: 'idle' },
     work: false,
+    workStalled: false,
     warnings: [],
     drawnNodes: 0,
     ms: 1,
