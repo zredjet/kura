@@ -181,6 +181,26 @@ describe('試聴の状態と口', () => {
     expect(notify).toHaveBeenLastCalledWith(t.auditionFailed('データベースを読めません'));
   });
 
+  it('ライブラリを閉じた・切り替えた中止（/pcm の 409）は知らせず、警告も出さず、止まっただけにする', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    fake.audition.startProbed.mockImplementationOnce(async () => ({
+      status: 'failed',
+      error: new MediaHttpError(409),
+    }));
+    startAudition(auditionTarget(audioAsset())!);
+    expect(useAuditionStore.getState().status).toBe('loading');
+    await settle();
+    expect(useAuditionStore.getState()).toEqual({
+      itemId: null,
+      status: 'idle',
+      mode: null,
+      fromStart: false,
+    });
+    expect(notify).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it('待つ間に止めたら、あとから鳴り始めの知らせが来ても状態を戻さない', async () => {
     let resolve: (o: AuditionOutcome) => void = () => undefined;
     fake.audition.startProbed.mockImplementation(

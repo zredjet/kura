@@ -188,6 +188,14 @@ export function startAudition(target: AuditionTarget, fromStart = false): void {
         return;
       }
       useAuditionStore.setState(IDLE);
+      // ライブラリを閉じた・切り替えた中止（/pcm の 409。ADR-185）は読めなかったのではないので知らせない
+      if (
+        out.status === 'failed' &&
+        out.error instanceof MediaHttpError &&
+        out.error.status === 409
+      ) {
+        return;
+      }
       notify(out.status === 'failed' ? failureText(out.error) : t.auditionUnsupported);
     });
 }
