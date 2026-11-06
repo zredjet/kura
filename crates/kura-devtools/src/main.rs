@@ -133,17 +133,14 @@ fn parse(args: &[String]) -> Result<Args, String> {
     })
 }
 
-/// アプリ（src-tauri の `MacEngineFactory`）と同じエンジンの部品の作り方：物理メモリと空いた確保の領域を OS へ返させる口は
-/// kura-mac、コーデックの組は [`app_codecs`]。
+/// アプリ（src-tauri の `MacEngineFactory`）と同じエンジンの部品の作り方：物理メモリは kura-mac、コーデックの組は
+/// [`app_codecs`]。
 struct MacEngineFactory;
 
 impl EngineFactory for MacEngineFactory {
     fn runtime_config(&self) -> RuntimeConfig {
         RuntimeConfig {
             physical_memory: kura_mac::physical_memory(),
-            relief: Some(kura_core::edit::MemoryRelief::new(
-                kura_mac::pressure_relief,
-            )),
             ..RuntimeConfig::default()
         }
     }

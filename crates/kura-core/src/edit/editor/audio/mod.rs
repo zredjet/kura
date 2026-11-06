@@ -358,21 +358,17 @@ impl Editor {
         // 裏の仕事の区切り（`work` の要求だけ。操作中は進めない）：波形の段を先に、残った時間で長い音声の計りを進める。窓の
         // 途中でもチャンクごとに締め切りを見る（`slice`）
         let mut limit = (avp.work && !avp.interacting)
-            .then(|| slice::Limit::deadline(Instant::now() + peaks::WORK_SLICE));
+            .then(|| slice::Limit::Deadline(Instant::now() + peaks::WORK_SLICE));
         #[cfg(test)]
         if let (Some(l), Some(n)) = (
             limit.as_mut(),
             st.audio.as_mut().and_then(|a| a.script.take()),
         ) {
-            *l = slice::Limit::chunks(n);
+            *l = slice::Limit::Chunks(n);
         }
         self.advance_peaks(st, rev, &value, &area, &avp, limit.as_mut(), ticket);
         if let Some(limit) = limit.as_mut() {
             self.advance_measure(st, &id, limit, ticket);
-        }
-        // 裏の仕事で流した区切りの終わりに、窓ごとに確保しては捨てたチャンクの領域を OS へ返させる（libmalloc が抱える分。段 7）
-        if limit.as_ref().is_some_and(|l| l.granted() > 0) {
-            self.runtime.relieve_memory("裏の仕事の区切り");
         }
         self.count_resident(st);
         let (peaks, work, loudness) = match st.audio.as_mut() {

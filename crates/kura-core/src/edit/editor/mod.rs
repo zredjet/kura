@@ -704,8 +704,8 @@ impl Editor {
     }
 
     /// 閉じる：中止 → 保存に貸していた入力を引き上げる → キャッシュを空に → 確保を落とす → 取り置きを 0（このエディタが取り
-    /// 置きの持ち主のときだけ。閉じ終わる前に開いた次のエディタの取り置きは消さない）→ 空いた確保の領域を OS へ返させる
-    /// （`EngineRuntime::relieve_memory`）。待っている下書きを置いてから下書きのスレッドを止める。2 回目からは何もしない。
+    /// 置きの持ち主のときだけ。閉じ終わる前に開いた次のエディタの取り置きは消さない）。待っている下書きを置いてから下書きの
+    /// スレッドを止める。2 回目からは何もしない。
     pub(crate) fn shutdown(&self) {
         self.cancel.cancel();
         let state = self.lock_state().take();
@@ -723,8 +723,6 @@ impl Editor {
         }
         self.reservation.release(self.runtime.budget(), &self.id);
         *self.lock_published() = Published::default();
-        // 手放した値・キャッシュ・源の LRU のチャンクの領域を OS へ返させる（libmalloc が抱える分。段 7）
-        self.runtime.relieve_memory("エディタを閉じた");
         self.autosave.close();
         tracing::debug!(
             session = self.id,

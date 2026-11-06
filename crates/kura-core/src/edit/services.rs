@@ -373,8 +373,6 @@ pub(crate) mod fake {
         codecs: Option<Arc<Mutex<CodecSet>>>,
         /// 予算（None は 64 MiB）。
         budget: Option<u64>,
-        /// 空いた確保の領域を返させる口を呼んだ回数（None は口を渡さない）。
-        relief: Option<Arc<std::sync::atomic::AtomicU64>>,
     }
 
     impl FakeEngineFactory {
@@ -389,12 +387,6 @@ pub(crate) mod fake {
         /// 予算を `bytes` にする（既定は 64 MiB。長い ogg の保存など）。
         pub fn with_budget(mut self, bytes: u64) -> Self {
             self.budget = Some(bytes);
-            self
-        }
-
-        /// 空いた確保の領域を返させる口（呼ぶと `calls` を 1 増やし、0 バイトを返す）を渡す。
-        pub fn with_relief(mut self, calls: Arc<std::sync::atomic::AtomicU64>) -> Self {
-            self.relief = Some(calls);
             self
         }
 
@@ -420,12 +412,6 @@ pub(crate) mod fake {
             RuntimeConfig {
                 cores: Some(2),
                 budget: Some(self.budget.unwrap_or(64 << 20)),
-                relief: self.relief.clone().map(|calls| {
-                    super::super::runtime::MemoryRelief::new(move || {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        0
-                    })
-                }),
                 ..RuntimeConfig::default()
             }
         }

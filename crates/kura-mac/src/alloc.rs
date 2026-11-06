@@ -10,12 +10,6 @@
 //! （解放・取り直しのときも同じ `Layout` が渡るので、目印を持たずに済む）。`mmap` の領域は 0 で埋まっているので、
 //! 0 で埋めた確保は書かずに済む。macOS 以外は `System` をそのまま使う。
 //!
-//! それより小さい確保（音声のチャンク（1 チャンネル 256 KiB）など）を解放した領域は libmalloc が抱える。エディタの裏の仕事・
-//! 音声の保存のように窓ごとにチャンクを確保しては捨てると、その抱え込みがフットプリントに残る。空いた領域を OS へ返させる口
-//! [`pressure_relief`]（`malloc_zone_pressure_relief`）を kura-core に渡す（`RuntimeConfig::relief`。M13 段 7）が、macOS 26 の
-//! libmalloc はこれでも 256 KiB の確保の抱え込みを返さない（0 バイトを返し、フットプリントは変わらない。1 回 約 2.5 µs。段 7 の
-//! 実測。`MallocSpaceEfficient=1` なら解放のときに返る）。
-//!
 //! 確保の量を数える目印（kura-core の `svg_worker::AllocMeter`）を持つ。SVG の働き手（アプリ自身を `--kura-svg-worker` 付きで
 //! 起動した子）だけが数え始めて上限を付け、超える確保を断る（ヌルを返す。ADR-164 (4)）。アプリの本体では数えず、確保ごとに
 //! 旗を 1 度読むだけ。
@@ -26,21 +20,6 @@ use kura_core::codec_ext::svg_worker::AllocMeter;
 
 /// これ以上の確保を `mmap` で取る（1 MiB）。
 pub const LARGE: usize = 1 << 20;
-
-/// libmalloc に、解放したまま抱えている領域を OS へ返させる（`malloc_zone_pressure_relief(NULL, 0)`：すべてのゾーンで、
-/// 返せるだけ返す）。返したバイト数。macOS 以外は何もせず 0。kura-core が `RuntimeConfig::relief` で受け、エディタの裏の仕事の
-/// 区切り・閉じるとき・音声の保存の終わりに呼ぶ（M13 段 7）。macOS 26 の libmalloc では、解放した 256 KiB の確保を抱えていても
-/// 0 を返す（モジュールの説明）。
-pub fn pressure_relief() -> u64 {
-    #[cfg(target_os = "macos")]
-    {
-        imp::relief()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        0
-    }
-}
 
 /// 大きな確保を OS へすぐ返す確保器（確保の量を数える目印つき）。
 #[derive(Debug, Default)]
@@ -136,21 +115,6 @@ impl ReturningAllocator {
 mod imp {
     use super::{LARGE, Layout};
     use std::ptr;
-
-    // <malloc/malloc.h>（libSystem）。libc のクレートにないので自分で宣言する
-    unsafe extern "C" {
-        fn malloc_zone_pressure_relief(
-            zone: *mut libc::malloc_zone_t,
-            goal: libc::size_t,
-        ) -> libc::size_t;
-    }
-
-    /// すべてのゾーンで返せるだけ返す（返したバイト数）。
-    pub fn relief() -> u64 {
-        // SAFETY: ゾーンにヌル（すべてのゾーン）と目標 0（返せるだけ）を渡す問い合わせで、呼び手の領域に触れない
-        let n = unsafe { malloc_zone_pressure_relief(ptr::null_mut(), 0) };
-        n as u64
-    }
 
     /// ページの大きさ（arm64 の macOS は 16 KiB）。`mmap` の領域はこれに揃う。
     fn page() -> usize {
@@ -415,32 +379,6 @@ mod tests {
             a.dealloc(p, layout(LARGE, 16));
             a.dealloc(q, small);
             assert_eq!(a.meter().used(), 0);
-        }
-    }
-
-    /// `pressure_relief` は何度でも呼べ、返したバイト数は抱えていた量（ここで解放した 32 MiB ＋ ほかのテストの分）を大きく
-    /// 超えない。macOS 26 の libmalloc は解放した 256 KiB の確保（音声のチャンクの大きさ）を抱えたままで、この口は 0 を返し、
-    /// フットプリントも変わらない（段 7 の実測。`MallocSpaceEfficient=1` なら解放のときに返る）。
-    #[test]
-    fn pressure_relief_can_be_called_any_time() {
-        let l = layout(256 << 10, 16);
-        // SAFETY: 取った領域に書いてから同じ Layout で返す
-        unsafe {
-            let blocks: Vec<*mut u8> = (0..128)
-                .map(|_| {
-                    let p = A.alloc(l);
-                    assert!(!p.is_null());
-                    std::ptr::write_bytes(p, 1, l.size());
-                    p
-                })
-                .collect();
-            for p in blocks {
-                A.dealloc(p, l);
-            }
-        }
-        for _ in 0..3 {
-            let n = pressure_relief();
-            assert!(n < 1 << 30, "返したバイト数 {n}");
         }
     }
 

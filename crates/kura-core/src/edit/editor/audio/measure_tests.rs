@@ -301,7 +301,7 @@ fn long_measure_redoes_a_window_canceled_midway() {
         let st = guard.as_mut().unwrap();
         let (_, before, chunks) = st.audio.as_ref().unwrap().measure.run_position().unwrap();
         let ticket = editor.latest.issue(Arc::new(CancelAfter::new(n)));
-        let mut limit = Limit::deadline(Instant::now() + Duration::from_secs(60));
+        let mut limit = Limit::Deadline(Instant::now() + Duration::from_secs(60));
         editor.advance_measure(st, &sid, &mut limit, &ticket);
         let a = st.audio.as_ref().unwrap();
         let (run, next, _) = a.measure.run_position().expect("中止で計りかけを捨てない");
@@ -474,43 +474,4 @@ fn long_measure_stops_mid_window_and_resumes_bit_exact() {
     g.push_linear("audio.gain", 1, json!({ "db": -6.0 }), 1)
         .unwrap();
     same_bits(values, &whole_loudness(&bytes, &g));
-}
-
-/// 段 7（F15 の申し送り 1）：裏の仕事で流した区切りの終わりと、エディタを閉じるときに、空いた確保の領域を OS へ返させる口
-/// （`RuntimeConfig::relief`）を呼ぶ。流さなかった区切り・手（`work: false`）では呼ばない。
-#[test]
-fn background_slices_and_close_relieve_memory() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-
-    use crate::edit::services::fake::FakeEngineFactory;
-
-    let calls = Arc::new(AtomicU64::new(0));
-    let env = Env::with(Arc::new(
-        FakeEngineFactory::default().with_relief(calls.clone()),
-    ));
-    let frames = 130 * C + 5;
-    let id = add_audio(&env.lib, &noise_wav(8_000, 1, frames, 87), "wav");
-    let idle = vp(&[(0, C)], false, false);
-    let s = env.open_with(id, idle.clone()).session.clone();
-    let out = env.step(&s, vec![add(0, "audio.gain", json!({ "db": -6.0 }))], &idle);
-    assert!(shown_audio(&out.view).peaks.pending);
-    assert_eq!(calls.load(SeqCst), 0, "手では呼ばない");
-    let work = vp(&[(0, C)], true, false);
-    let mut slices = 0;
-    loop {
-        let before = calls.load(SeqCst);
-        let out = env.step(&s, Vec::new(), &work);
-        slices += 1;
-        assert_eq!(calls.load(SeqCst), before + 1, "流した区切りの終わりに呼ぶ");
-        if !shown_audio(&out.view).work {
-            break;
-        }
-        assert!(slices < 400);
-    }
-    let before = calls.load(SeqCst);
-    env.step(&s, Vec::new(), &work);
-    assert_eq!(calls.load(SeqCst), before, "流さなかった区切りでは呼ばない");
-    crate::edit::editor::close(&env.engine, &s);
-    assert_eq!(calls.load(SeqCst), before + 1, "閉じるときに呼ぶ");
 }

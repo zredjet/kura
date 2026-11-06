@@ -53,15 +53,9 @@ impl Pace {
     }
 }
 
-/// 1 回の区切りの上限（波形の段と計りで 1 つを分け合う：波形の段が先に使い、残りで計りを進める）と、渡したチャンクの数。
+/// 1 回の区切りの上限（波形の段と計りで 1 つを分け合う：波形の段が先に使い、残りで計りを進める）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Limit {
-    until: Until,
-    granted: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Until {
+pub(crate) enum Limit {
     /// 締め切り（`WORK_SLICE` の終わり）まで。流す数は見積もりで決める。
     Deadline(Instant),
     /// テスト：この区切りで流してよいチャンクの数（時間によらずに、窓の途中で止める・切り方によらず同じを確かめる）。
@@ -70,44 +64,20 @@ enum Until {
 }
 
 impl Limit {
-    /// 締め切り `at` までの区切り。
-    pub(crate) fn deadline(at: Instant) -> Self {
-        Self {
-            until: Until::Deadline(at),
-            granted: 0,
-        }
-    }
-
-    /// テスト：`n` チャンクまでの区切り。
-    #[cfg(test)]
-    pub(crate) fn chunks(n: u64) -> Self {
-        Self {
-            until: Until::Chunks(n),
-            granted: 0,
-        }
-    }
-
     /// 次に流すチャンクの数（`max` まで。0 は止める）：締め切りなら残りの時間と `pace` の見積もりで、テストの数なら残りから
     /// 引く。
     pub(crate) fn grant(&mut self, pace: &Pace, max: u64) -> u64 {
-        let n = match &mut self.until {
-            Until::Deadline(deadline) => {
+        match self {
+            Self::Deadline(deadline) => {
                 pace.fit(deadline.saturating_duration_since(Instant::now()), max)
             }
             #[cfg(test)]
-            Until::Chunks(left) => {
+            Self::Chunks(left) => {
                 let n = (*left).min(max);
                 *left -= n;
                 n
             }
-        };
-        self.granted = self.granted.saturating_add(n);
-        n
-    }
-
-    /// この区切りで渡したチャンクの数の和。
-    pub(crate) fn granted(&self) -> u64 {
-        self.granted
+        }
     }
 }
 
@@ -183,15 +153,14 @@ mod tests {
     fn limits_stop_at_the_deadline_or_the_count() {
         let mut p = Pace::default();
         p.note(1, ms(1));
-        assert_eq!(Limit::deadline(Instant::now()).grant(&p, 16), 0);
-        let mut l = Limit::deadline(Instant::now() + ms(60_000));
-        assert_eq!(l.grant(&p, 16), 16);
-        assert_eq!(l.grant(&p, 3), 3);
-        assert_eq!(l.granted(), 19);
-        let mut l = Limit::chunks(5);
+        assert_eq!(Limit::Deadline(Instant::now()).grant(&p, 16), 0);
+        assert_eq!(
+            Limit::Deadline(Instant::now() + ms(60_000)).grant(&p, 16),
+            16
+        );
+        let mut l = Limit::Chunks(5);
         assert_eq!(l.grant(&p, 4), 4);
         assert_eq!(l.grant(&p, 4), 1);
         assert_eq!(l.grant(&p, 4), 0);
-        assert_eq!(l.granted(), 5);
     }
 }
