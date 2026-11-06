@@ -317,50 +317,6 @@ describe('保存の一時停止・再開・中止（▾ とボタン）', () => 
     expect(screen.getByRole('button', { name: t.saving })).toBeDisabled();
   });
 
-  it('開き直したエディタでも、待っている保存（前のエディタで積んだもの）が一時停止中なら同じに出す', () => {
-    useJobsStore.getState().trackSave({
-      id: 30,
-      itemId: ITEM.id,
-      itemTitle: 'hero.png',
-      mode: 'overwrite',
-      newTitle: null,
-      state: 'paused',
-      progress: 0.42,
-      message: null,
-    });
-    openState();
-    render(<Editor />);
-    expect(screen.getByRole('button', { name: t.savePausedPercent('42') })).toBeDisabled();
-    const entries = openMore();
-    expect(labels(entries).slice(0, 2)).toEqual([t.saveResume, t.saveCancel]);
-    expect(action(entries, t.saveAs).disabled).toBe(true);
-    action(entries, t.saveResume).onSelect();
-    expect(resumeJob).toHaveBeenCalledWith(30);
-    useMenuStore.setState({ menu: null });
-
-    // 再開した：頭から。進めば「保存中 5%」、▾ は一時停止に
-    const job = (state: 'queued' | 'running' | 'canceled', progress: number | null) => ({
-      id: 30,
-      kind: 'edit' as const,
-      state,
-      progress,
-      message: null,
-      resultJson: null,
-    });
-    act(() => useJobsStore.getState().apply(job('queued', null)));
-    expect(screen.getByRole('button', { name: t.saving })).toBeDisabled();
-    act(() => useJobsStore.getState().apply(job('running', 0.05)));
-    expect(screen.getByRole('button', { name: t.savingPercent('5') })).toBeDisabled();
-    action(openMore(), t.savePause).onSelect();
-    expect(pauseJob).toHaveBeenCalledWith(30);
-    useMenuStore.setState({ menu: null });
-
-    // 中止・完了：ボタンは「保存」に戻る（保存していない変更があるので押せる）
-    act(() => useJobsStore.getState().apply(job('canceled', null)));
-    expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
-    expect(labels(openMore())).toEqual([t.saveAs, '-', t.revert, t.versions]);
-  });
-
   it('ほかのアイテムの保存はこのエディタに出さない', () => {
     useJobsStore.getState().trackSave({
       id: 30,

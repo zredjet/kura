@@ -1178,11 +1178,14 @@ export const ja = {
     draftHistory: '下書きから開いても、取り消しの履歴は戻りません。',
     draftStale:
       'この下書きを残したあとに、別の保存でアイテムが変わったため、下書きからは開けません。',
-    draftPending:
-      '保存が待っている間は、下書きからは開けません。保存を再開・中止してから開き直すと、残っている下書きから開けます。',
-    draftKeep: '下書きを残して開く',
     draftDiscard: '捨てる',
     draftOpen: '下書きから開く',
+    pendingSaveTitle: '前の保存が終わっていません',
+    pendingSaveMessage:
+      '保存が終わるか中止すると、エディタが開きます。閉じても保存はそのままで、グリッドの下のカプセルから続けられます。',
+    pendingSavePause: '一時停止',
+    pendingSaveResume: '再開',
+    pendingSaveCancel: '中止',
     unsavedTitle: '編集を保存しますか？',
     unsavedMessage: (title: string) =>
       `「${title}」の編集を保存していません。保存しないと、変更は失われます。`,

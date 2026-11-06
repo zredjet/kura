@@ -6,7 +6,8 @@
  *   （`acked`）・応えの来ていない手（`pendingSteps`）・種類（`kind`）。表示（タイル・波形・ズーム・道具）は種類ごとの
  *   `EditorAdapter` が持ち、核はその口だけを呼ぶ。画面に出すものは Zustand に置き、要求は `RequestQueue`（1 つだけ出す）。
  *   開くたびにアダプタを作り、閉じたら捨てる（`dispose`）。
- * - 開く（`openEditorAs`）：前のエディタは閉じる。下書きがあれば下書きのシート（段 5b）。種類からアダプタを選ぶ口は
+ * - 開く（`openEditorAs`）：前のエディタは閉じる。下書きがあれば下書きのシート（段 5b）。同じアイテムの前の保存が終わって
+ *   いなければ Rust が断るので、開かずに `waiting` で止める（ADR-189）。種類からアダプタを選ぶ口は
  *   `editorKinds.ts` の `openEditor`。閉じる（`closeEditor`）：必ず `edit_close` を呼ぶ（開いている途中でセッションがまだ
  *   なければ、Rust の開く途中を `edit_cancel_open` で止める）。未保存で閉じるときのシート・保存の流れは `editorSave.ts`。
  *   ライブラリを切り替える・閉じるときも閉じる（App）。
@@ -46,7 +47,7 @@ import {
 } from '../../ipc/edit';
 import type { ItemSummaryDto } from '../../ipc/items';
 import type { JobProgress } from '../../ipc/jobs';
-import { IpcError } from '../../ipc/result';
+import { IpcError, isIpcError } from '../../ipc/result';
 import { notify } from '../../stores/noticeStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { outputChoice } from './formats';
@@ -64,7 +65,11 @@ import {
 } from './paramSend';
 import { type QueuedStep, RequestQueue, type SentRequest } from './requestQueue';
 
-export type EditorPhase = 'closed' | 'opening' | 'open' | 'error';
+/**
+ * エディタの段階。`waiting` は、同じアイテムの前の保存が終わっていないので開いていない間（Rust の `SavePending`。セッションはなく、
+ * 「前の保存が終わっていません」のシートを出す。終わる・中止すると開き直す。ADR-189）。
+ */
+export type EditorPhase = 'closed' | 'opening' | 'waiting' | 'open' | 'error';
 export type EditorPanel = 'ops' | 'info';
 
 /** 文書の要約（ノードの並びと、各ノードの要約・出力）。 */
@@ -83,6 +88,8 @@ export type AfterClose = 'none' | 'library' | 'window';
 /** エディタの上に出すシート（`EditorSheets.tsx`）。 */
 export type EditorSheet =
   | { kind: 'draft' }
+  /** 前の保存が終わっていない（`waiting` の間。ジョブは jobsStore の表で見る）。 */
+  | { kind: 'pendingSave' }
   | { kind: 'unsaved'; then: AfterClose }
   | { kind: 'saveWarnings'; closeAfter: AfterClose | null }
   | { kind: 'saveAs' }
@@ -136,16 +143,6 @@ export interface EditorSave {
   after: ItemSize | null;
 }
 
-/**
- * 開く前に積んだ同じアイテムの保存のジョブ（閉じて開き直したとき。Rust の `status.saving` はそのセッションで積んだものだけなので、
- * jobsStore の表で見る）。終わるまで次の保存は積めない（Rust の Busy）。終わっても土台は替わらない。
- */
-export interface EditorEarlierSave {
-  job: number;
-  state: JobStateDto;
-  progress: number | null;
-}
-
 /** 失敗（開けなかった・表示できなかった・要求が通らなかった）。 */
 export interface EditorFailure {
   kind: 'open' | 'view' | 'request';
@@ -177,8 +174,6 @@ export interface EditorState {
   selected: number | null;
   sheet: EditorSheet | null;
   save: EditorSave | null;
-  /** 開く前に積んだ同じアイテムの保存（`save` とは同時に持たない）。 */
-  earlierSave: EditorEarlierSave | null;
   /** 断られた手の指摘（引数の欄の下に出す）。 */
   issues: Issue[];
   /** 応えの来ていない文書の手（送った・ためた手）がある（未保存に数える）。 */
@@ -212,7 +207,6 @@ function closedState(panel: EditorPanel, openId: number): EditorState {
     selected: null,
     sheet: null,
     save: null,
-    earlierSave: null,
     issues: [],
     pendingSteps: false,
     acked: 0,
@@ -339,22 +333,15 @@ export function originalFormatOf(
   return s.originalFormat ?? formatsFor(s.item)?.formatOfExt(s.item?.ext) ?? null;
 }
 
-/** 今のエディタのアイテムで待っている保存のジョブ（このエディタで積んだもの、なければ開く前に積んだもの）。 */
-export function activeSave(
-  s: Pick<EditorState, 'save' | 'earlierSave'>,
-): EditorSave | EditorEarlierSave | null {
-  return s.save ?? s.earlierSave;
-}
-
 /**
- * 保存（上書き）できるか：開いていて、保存の途中でなく（一時停止中・開く前に積んだ保存を含む）、保存していない変更がある（応えの
- * 来ていない手も）か、元の形式に書けず形式を変えて保存するとき（ボタン・⌘S・ファイル › 保存）。
+ * 保存（上書き）できるか：開いていて、保存の途中でなく（一時停止中を含む）、保存していない変更がある（応えの来ていない手も）か、
+ * 元の形式に書けず形式を変えて保存するとき（ボタン・⌘S・ファイル › 保存）。
  */
 export function canSaveEditor(
   s: Pick<EditorState, 'phase' | 'save' | 'status' | 'pendingSteps' | 'doc' | 'item'> &
-    Partial<Pick<EditorState, 'originalFormat' | 'earlierSave'>>,
+    Partial<Pick<EditorState, 'originalFormat'>>,
 ): boolean {
-  if (s.phase !== 'open' || s.save || s.earlierSave || !s.status) return false;
+  if (s.phase !== 'open' || s.save || !s.status) return false;
   if (s.status.dirty || s.pendingSteps) return true;
   const formats = formatsFor(s.item);
   if (!formats) return false;
@@ -620,6 +607,11 @@ export async function openEditorAs<Tag>(
   } catch (error) {
     // 閉じた・替えたあとの失敗（開く途中の中止で返った Conflict を含む）は出さない
     if (runtime !== rt) return;
+    if (isIpcError(error, 'SavePending')) {
+      // 前の保存が終わっていない：開かずにシートで止める（セッションがないので手は届かない。終わったら editorSave が開き直す）
+      useEditorStore.setState({ phase: 'waiting', sheet: { kind: 'pendingSave' } });
+      return;
+    }
     useEditorStore.setState({ phase: 'error', failure: failureOf('open', error) });
   }
 }

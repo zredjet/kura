@@ -57,7 +57,7 @@ export function reactToJob(event: JobProgress): void {
 }
 
 /**
- * 終わっていない保存のジョブ（`kind = 'edit'`。グリッドの下のカプセルと、開き直したエディタの保存のボタンが読む。ADR-189）。
+ * 終わっていない保存のジョブ（`kind = 'edit'`。グリッドの下のカプセルと、前の保存のシートが読む。ADR-189）。
  * 終わったら表から消す（カプセルに完了の状態は出さない。知らせはエディタの保存の流れ）。
  */
 export interface SaveJob {
@@ -95,13 +95,9 @@ export function shownSaves(saves: Record<number, SaveJob>): SaveJob[] {
     .slice(0, MAX_SAVE_CAPSULES);
 }
 
-/** アイテムの終わっていない保存のジョブ（同じアイテムは同時に 1 つ。`except` は今のエディタの保存）。 */
-export function selectItemSave(
-  saves: Record<number, SaveJob>,
-  itemId: number,
-  except?: number,
-): SaveJob | null {
-  return Object.values(saves).find((job) => job.itemId === itemId && job.id !== except) ?? null;
+/** アイテムの終わっていない保存のジョブ（同じアイテムは同時に 1 つ）。 */
+export function selectItemSave(saves: Record<number, SaveJob>, itemId: number): SaveJob | null {
+  return Object.values(saves).find((job) => job.itemId === itemId) ?? null;
 }
 
 /** Rust の一覧の行を、表の形にする。 */
@@ -139,13 +135,13 @@ interface JobsState {
   /** 保存のジョブを表に載せる（積んだ・一覧で知った。知っている・終わったジョブなら何もしない）。 */
   trackSave: (job: Omit<SaveJob, 'shown'>) => void;
   /**
-   * 終わっていない保存のジョブを Rust に聞いて表に合わせる（エディタを開いたとき・Rust が Busy で断ったとき）。頼む前から知って
-   * いて一覧にないジョブは終わった（イベントを取りこぼした）ものとして消す。知っているジョブの状態はイベントのほうが新しいので
-   * 替えない。
+   * 終わっていない保存のジョブを Rust に聞いて表に合わせる（エディタを開いたとき・開かずに止めたとき・Rust が Busy で断ったとき）。
+   * 頼む前から知っていて一覧にないジョブは終わった（イベントを取りこぼした）ものとして消す。知っているジョブの状態はイベントの
+   * ほうが新しいので替えない。今のライブラリの一覧を読めたら真。
    */
-  readSaves: () => Promise<void>;
+  readSaves: () => Promise<boolean>;
   /** 表を捨てて読み直す（ライブラリを開いた・替えた。一時停止した保存はアプリを開き直しても残っている）。 */
-  reloadSaves: () => Promise<void>;
+  reloadSaves: () => Promise<boolean>;
 }
 
 export const useJobsStore = create<JobsState>((set, get) => ({
@@ -224,7 +220,7 @@ export const useJobsStore = create<JobsState>((set, get) => ({
     const known = Object.values(get().saves).map((job) => job.id);
     try {
       const list = await listPendingSaves();
-      if (epoch !== savesEpoch) return;
+      if (epoch !== savesEpoch) return false;
       const alive = new Set(list.map((row) => row.job));
       const gone = known.filter((id) => !alive.has(id));
       if (gone.length > 0) {
@@ -239,8 +235,10 @@ export const useJobsStore = create<JobsState>((set, get) => ({
         });
       }
       for (const row of list) get().trackSave(saveFromDto(row));
+      return true;
     } catch (error) {
       console.warn('保存のジョブを読めませんでした', error);
+      return false;
     }
   },
   reloadSaves: () => {

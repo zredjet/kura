@@ -201,12 +201,11 @@ describe('保存のジョブ（カプセル・開き直したエディタ）', (
     expect(saves()).toEqual({});
   });
 
-  it('アイテムの保存を引ける（今のエディタの保存は除く）', () => {
+  it('アイテムの保存を引ける', () => {
     track();
     track({ id: 10, itemId: 8 });
     const { saves: all } = useJobsStore.getState();
     expect(selectItemSave(all, 7)?.id).toBe(9);
-    expect(selectItemSave(all, 7, 9)).toBeNull();
     expect(selectItemSave(all, 8)?.id).toBe(10);
     expect(selectItemSave(all, 1)).toBeNull();
   });

@@ -3,22 +3,28 @@ import { createPortal } from 'react-dom';
 
 import { Button } from '../../components/Button/Button';
 import { Dialog } from '../../components/Dialog/Dialog';
+import { ProgressBar } from '../../components/ProgressBar/ProgressBar';
 import { ja } from '../../i18n/ja';
 import type { EditVersionDto } from '../../ipc/edit';
 import { relativeDateTime } from '../../lib/dates';
 import { formatBytes, formatCount } from '../../lib/format';
 import { isImeKey } from '../../lib/ime';
+import { selectItemSave, useJobsStore } from '../../stores/jobsStore';
+import { saveProgressView } from '../import/progressView';
 import { editorKindModule } from './editorKinds';
 import {
   answerDraft,
   answerUnsaved,
   askRestore,
+  cancelEditorSave,
   confirmRevert,
   confirmWarnings,
   defaultFormatChoice,
   dismissSheet,
   formatChoices,
   loadVersions,
+  pauseEditorSave,
+  resumeEditorSave,
   saveFailureText,
   submitFormat,
   submitSaveAs,
@@ -64,40 +70,79 @@ function useVersions(): EditVersionDto[] | null {
 }
 
 /**
- * 下書きのシート：「前回の編集の下書きがあります（日時）」［捨てる］［下書きから開く］。土台が変わっていれば捨てるだけ。保存が待っている
- * 間（一時停止中を含む）は土台がまだ決まらないので下書きからは開けないが、捨てずに開ける（▾ から再開・中止する。ADR-189）。
+ * 下書きのシート：「前回の編集の下書きがあります（日時）」［捨てる］［下書きから開く］。土台が変わっていれば捨てるだけ（同じアイテムの
+ * 保存が待っている間はここへ来ない：前の保存のシートで止める）。
  */
 function DraftSheet() {
   const draft = useEditorStore((s) => s.draft);
-  const waiting = useEditorStore((s) => s.earlierSave !== null);
   const titleId = useId();
   if (!draft) return null;
   const when = draft.updatedAt !== null ? relativeDateTime(draft.updatedAt) : '';
-  const keep = !draft.fresh && waiting;
   return (
     <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
       <h2 id={titleId} className={styles.sheetTitle}>
         {t.draftTitle}
       </h2>
       <p className={styles.sheetMessage}>{t.draftMessage(when)}</p>
-      <p className={styles.sheetNote}>
-        {draft.fresh ? t.draftHistory : keep ? t.draftPending : t.draftStale}
-      </p>
+      <p className={styles.sheetNote}>{draft.fresh ? t.draftHistory : t.draftStale}</p>
       <footer className={styles.sheetActions}>
         <Button
-          variant={draft.fresh || keep ? 'secondary' : 'primary'}
+          variant={draft.fresh ? 'secondary' : 'primary'}
           onClick={() => answerDraft('discard')}
         >
           {t.draftDiscard}
         </Button>
-        {keep && (
-          <Button variant="primary" onClick={() => answerDraft('keep')}>
-            {t.draftKeep}
-          </Button>
-        )}
         {draft.fresh && (
           <Button variant="primary" onClick={() => answerDraft('open')}>
             {t.draftOpen}
+          </Button>
+        )}
+      </footer>
+    </Dialog>
+  );
+}
+
+/**
+ * 前の保存が終わっていないアイテムを開いたとき（ADR-189）：そのジョブの進捗と操作だけを出す（動いていれば［一時停止］、止まっていれば
+ * ［再開］、［中止］、［閉じる］）。文言と進捗はカプセルと同じ。終わる・中止すると開き直す（`editorSave`）。［閉じる］・esc はエディタを
+ * 閉じるだけで、ジョブはそのまま（カプセルから続けられる）。ジョブを読めないうちは［閉じる］だけ。
+ */
+function PendingSaveSheet() {
+  const itemId = useEditorStore((s) => s.item?.id);
+  const job = useJobsStore((s) => (itemId === undefined ? null : selectItemSave(s.saves, itemId)));
+  const titleId = useId();
+  const view = job && saveProgressView(job);
+  const paused = job?.state === 'paused';
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {t.pendingSaveTitle}
+      </h2>
+      <p className={styles.sheetMessage}>{t.pendingSaveMessage}</p>
+      {view && (
+        <div className={styles.pendingSave}>
+          <p className={styles.sheetMessage} role="status">
+            {view.title}
+          </p>
+          {view.progress !== undefined && (
+            <ProgressBar value={view.progress} label={ja.savingJob.label} />
+          )}
+          {view.detail && <p className={styles.sheetNote}>{view.detail}</p>}
+        </div>
+      )}
+      <footer className={styles.sheetActions}>
+        {job && (
+          <Button className={styles.sheetLeft} onClick={cancelEditorSave}>
+            {t.pendingSaveCancel}
+          </Button>
+        )}
+        <Button onClick={dismissSheet}>{ja.common.close}</Button>
+        {job && (
+          <Button
+            variant={paused ? 'primary' : 'secondary'}
+            onClick={paused ? resumeEditorSave : pauseEditorSave}
+          >
+            {paused ? t.pendingSaveResume : t.pendingSavePause}
           </Button>
         )}
       </footer>
@@ -434,6 +479,8 @@ function SheetOf({ sheet }: { sheet: EditorSheet }) {
   switch (sheet.kind) {
     case 'draft':
       return <DraftSheet />;
+    case 'pendingSave':
+      return <PendingSaveSheet />;
     case 'unsaved':
       return <UnsavedSheet />;
     case 'saveWarnings':
@@ -454,7 +501,7 @@ function SheetOf({ sheet }: { sheet: EditorSheet }) {
 }
 
 /**
- * エディタの上に出すシート（下書き・未保存で閉じる・警告・別名・元に戻す・版の一覧・失敗・形式を選ぶ）。エディタの層（z-index 16）の
+ * エディタの上に出すシート（下書き・前の保存・未保存で閉じる・警告・別名・元に戻す・版の一覧・失敗・形式を選ぶ）。エディタの層（z-index 16）の
  * 中に描くと、ルートのシート（設定など）の下に隠れるので、body に出す（設定のシートからライブラリを切り替えるとき・
  * 設定を開いたまま窓を閉じるときも、未保存のシートがいちばん上に出る）。
  */

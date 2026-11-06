@@ -29,8 +29,9 @@
  *   再開は初めから書き直すので進捗も頭から。一時停止の間も保存は待っている（次の保存は Busy）ので ⌘S・別名で保存…・閉じる前の
  *   保存は断り、再開か中止を促す。閉じる前の保存を一時停止したら、閉じるのをやめる（いつ終わるか分からない保存を待たせない）。
  *   中止は失敗にしない（シートを出さず、Rust の「保存を中止しました」。閉じたあとはカプセルが消えるだけ）。
- * - 開き直したエディタ：Rust の `status.saving` はそのセッションで積んだものだけなので、同じアイテムの待っている保存は jobsStore
- *   の表から `earlierSave` に写す（開くたびに Rust に聞き直す）。ボタンと ▾ は `save` と同じに出す。
+ * - 前の保存が終わっていないアイテムを開いた（閉じて開き直した・アプリを開き直した。ADR-189）：Rust が `SavePending` で断るので
+ *   開かず（`waiting`）、「前の保存が終わっていません」のシートでそのジョブの進捗と一時停止・再開・中止・閉じるだけを出す。終わる
+ *   （成功・失敗）・中止すると開き直す（下書きは Rust の `fresh`・`exists` でいつものシート）。ジョブは jobsStore の表で見る。
  */
 
 import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -66,7 +67,6 @@ import { notify } from '../../stores/noticeStore';
 import { useViewStore } from '../../stores/viewStore';
 import { selectOne } from '../library/selection';
 import {
-  activeSave,
   type AfterClose,
   applyEditorStatus,
   canSaveEditor,
@@ -164,6 +164,10 @@ let closeAfterSave: AfterClose | null = null;
 let pendingClose: ((closed: boolean) => void) | null = null;
 let slowTimer: ReturnType<typeof setTimeout> | null = null;
 let reopening = false;
+/** 前の保存の開き直しで開こうとしている（また断られたら繰り返さない）。 */
+let reopeningAfterWait = false;
+/** 前の保存を Rust に聞き直せた、シートの開くたびの番号（これより前は、表にないことを「終わった」と読まない）。 */
+let waitChecked: number | null = null;
 /** 保存を積んでいる途中（応えの来ていない手を待っている・`edit_save` の応え待ち）。 */
 let starting = false;
 /** エディタを閉じたあとも続いている保存（ジョブ ID ごと）。 */
@@ -187,14 +191,14 @@ function settleClose(closed: boolean): void {
   resolve?.(closed);
 }
 
-/** 保存が待っている（このエディタの保存・開く前に積んだ保存・積んでいる途中）か。 */
+/** 保存が待っている（このエディタの保存・積んでいる途中）か。 */
 function saveIsBusy(s: EditorState): boolean {
-  return starting || activeSave(s) !== null;
+  return starting || s.save !== null;
 }
 
 /** 前の保存を待つよう知らせる（一時停止中なら、待っても進まないので再開か中止を促す）。 */
 function notifyBusy(s: EditorState): void {
-  notify(activeSave(s)?.state === 'paused' ? t.saveBusyPaused : t.saveBusy);
+  notify(s.save?.state === 'paused' ? t.saveBusyPaused : t.saveBusy);
 }
 
 /** エディタを閉じ（`edit_close` と、`discardDraft` なら下書きを捨てるのを終えてから）、閉じるのを待つ呼び手に答える。 */
@@ -415,7 +419,7 @@ async function startSave(
     if (editorSession() !== session) return 'failed';
     if (isIpcError(error, 'Busy')) {
       notify(t.saveBusy);
-      // 画面の知らない保存が待っている：読み直してボタンと ▾ を合わせる
+      // 画面の知らない保存が待っている：読み直してカプセルに出す
       void useJobsStore.getState().readSaves();
     } else {
       const shown = useEditorStore.getState().sheet;
@@ -500,7 +504,7 @@ export function confirmWarnings(): void {
 export function openSaveAs(): void {
   const s = useEditorStore.getState();
   if (s.phase !== 'open' || s.sheet) return;
-  if (activeSave(s)) {
+  if (s.save) {
     notifyBusy(s);
     return;
   }
@@ -556,8 +560,9 @@ export function confirmRevert(to: number): void {
 export function dismissSheet(): void {
   const sheet = useEditorStore.getState().sheet;
   if (!sheet) return;
-  if (sheet.kind === 'draft') {
-    // 下書きのシートを esc で閉じたら、開くのをやめる（下書きは残る。開いただけでは下書きを替えない）
+  if (sheet.kind === 'draft' || sheet.kind === 'pendingSave') {
+    // 下書きのシートを esc で閉じたら、開くのをやめる（下書きは残る。開いただけでは下書きを替えない）。前の保存のシートの
+    // ［閉じる］・esc も開くのをやめる（ジョブはそのまま。カプセルから続けられる）
     closeEditor();
     return;
   }
@@ -572,9 +577,16 @@ export function dismissSheet(): void {
 
 // ===== 一時停止・再開・中止 =====
 
-/** 今のエディタの保存のジョブを操作する（▾ のメニュー）。 */
+/** 開かずに待っている前の保存（`waiting` の間。jobsStore の表のジョブ）。 */
+function waitedSave(s: EditorState): number | undefined {
+  if (s.phase !== 'waiting' || !s.item) return undefined;
+  return selectItemSave(useJobsStore.getState().saves, s.item.id)?.id;
+}
+
+/** 今のエディタの保存のジョブ、開かずに待っている前の保存を操作する（▾ のメニュー・前の保存のシート）。 */
 function controlSave(call: (id: number) => Promise<unknown>): void {
-  const job = activeSave(useEditorStore.getState())?.job;
+  const s = useEditorStore.getState();
+  const job = s.save?.job ?? waitedSave(s);
   if (job === undefined) return;
   call(job).catch((error: unknown) =>
     notify(ja.common.failed(error instanceof Error ? error.message : String(error))),
@@ -598,13 +610,12 @@ export function cancelEditorSave(): void {
 
 // ===== 下書き =====
 
-/** 下書きのシートの答え：捨てる・下書きから開く・残して開く（保存が待っている間。下書きはそのまま）。 */
-export function answerDraft(answer: 'discard' | 'open' | 'keep'): void {
+/** 下書きのシートの答え：捨てる・下書きから開く。 */
+export function answerDraft(answer: 'discard' | 'open'): void {
   const s = useEditorStore.getState();
   const item = s.item;
   if (!item || s.sheet?.kind !== 'draft') return;
   useEditorStore.setState({ sheet: null });
-  if (answer === 'keep') return;
   if (answer === 'open' && s.draft?.fresh) {
     void reopenEditorWith(item, { fromDraft: true });
     return;
@@ -623,6 +634,11 @@ export function answerDraft(answer: 'discard' | 'open' | 'keep'): void {
 
 // ===== 閉じる =====
 
+/** シートが閉じる要求を止めているか（開いている間のシートと、前の保存のシート。ADR-181）。 */
+function sheetHolds(s: Pick<EditorState, 'phase' | 'sheet'>): boolean {
+  return (s.phase === 'open' || s.phase === 'waiting') && s.sheet !== null;
+}
+
 /**
  * エディタを閉じる（‹・esc・ライブラリの切り替え・窓を閉じる）。保存していない変更があれば［保存しない］［キャンセル］
  * ［保存］のシートを出す。閉じたら true、やめたら false（開いていなければ true）。シートを出している間は受けずに false
@@ -631,7 +647,7 @@ export function answerDraft(answer: 'discard' | 'open' | 'keep'): void {
 export function requestCloseEditor(then: AfterClose = 'none'): Promise<boolean> {
   const s = useEditorStore.getState();
   if (s.phase === 'closed') return Promise.resolve(true);
-  if (s.phase === 'open' && s.sheet !== null) return Promise.resolve(false);
+  if (sheetHolds(s)) return Promise.resolve(false);
   if (s.phase !== 'open' || !hasUnsavedChanges(s)) {
     // `edit_close` を終えてから進む（ライブラリを切り替える前に閉じる）
     return closeEditor().then(() => true);
@@ -851,14 +867,15 @@ useEditorStore.subscribe((now, before) => {
 });
 
 /**
- * jobsStore の表をエディタに写す：開いているアイテムの、このエディタで積んだのではない保存を `earlierSave` に。積んだ記憶のない保存
- * （アプリを開き直したあとに一覧で知った）は、終わったら知らせられるよう覚える（大きさの前後は分からないので見ない）。
+ * jobsStore の表を見る：積んだ記憶のない保存（アプリを開き直したあとに一覧で知った）は、終わったら知らせられるよう覚える（大きさの
+ * 前後は分からないので見ない）。開かずに待っている保存が表からなくなったら開き直す。
  */
 function syncSaveJobs(): void {
   const s = useEditorStore.getState();
-  const { saves } = useJobsStore.getState();
-  for (const job of Object.values(saves)) {
-    if (job.id === s.save?.job || detached.has(job.id)) continue;
+  const library = currentLibrary();
+  for (const job of Object.values(useJobsStore.getState().saves)) {
+    if (job.id === s.save?.job || detached.get(job.id)?.library === library) continue;
+    // 別のライブラリの同じ番号のジョブの覚えは、今のライブラリのもので置き換える（ジョブの ID はライブラリの DB ごとの連番）
     detached.set(job.id, {
       mode: job.mode,
       title: job.newTitle,
@@ -866,23 +883,58 @@ function syncSaveJobs(): void {
       itemTitle: job.itemTitle ?? '',
       before: null,
       after: null,
-      library: currentLibrary(),
+      library,
     });
   }
-  const itemId = s.item?.id;
-  const job = itemId === undefined ? null : selectItemSave(saves, itemId, s.save?.job);
-  const was = s.earlierSave;
-  if (job?.id === was?.job && job?.state === was?.state && job?.progress === was?.progress) return;
-  useEditorStore.setState({
-    earlierSave: job ? { job: job.id, state: job.state, progress: job.progress } : null,
-  });
+  reopenIfSaveEnded();
+}
+
+/** 開かずに待っている保存が終わった（中止した）なら開き直す（Rust に聞き直せたあとだけ。読む前の表にないのは「終わった」ではない）。 */
+function reopenIfSaveEnded(): void {
+  const s = useEditorStore.getState();
+  if (s.phase !== 'waiting' || !s.item || waitChecked !== s.openId || waitedSave(s) !== undefined) {
+    return;
+  }
+  void reopenAfterWait(s.item, s.openId);
+}
+
+/** 前の保存が終わったあとに開き直す（アイテムの中身・大きさは変わっているので読み直す。下書きは Rust の答えでいつものシート）。 */
+async function reopenAfterWait(item: ItemSummaryDto, openId: number): Promise<void> {
+  if (reopening) return;
+  reopening = true;
+  reopeningAfterWait = true;
+  try {
+    const fresh = await getItems([item.id]).then(
+      ([row]) => row,
+      () => undefined,
+    );
+    const s = useEditorStore.getState();
+    if (s.openId === openId && s.phase === 'waiting') await reopenEditorWith(fresh ?? item);
+  } finally {
+    reopening = false;
+    reopeningAfterWait = false;
+  }
+}
+
+/**
+ * 開かずに止めたら、前の保存を Rust に聞き直す（アプリを開き直したあとは表がまだ空のことがある）。聞いたらもう終わっていれば開き
+ * 直す。開き直して断られたばかりで一覧にもなければ、繰り返さずに止まる（［閉じる］だけのシート）。
+ */
+async function checkWaitedSave(openId: number): Promise<void> {
+  const retried = reopeningAfterWait;
+  const read = await useJobsStore.getState().readSaves();
+  const s = useEditorStore.getState();
+  if (!read || s.openId !== openId || s.phase !== 'waiting') return;
+  if (retried && waitedSave(s) === undefined) return;
+  waitChecked = openId;
+  reopenIfSaveEnded();
 }
 
 useJobsStore.subscribe(syncSaveJobs);
 useEditorStore.subscribe((now, before) => {
-  // 開くたびに Rust に聞き直す（待っている保存があれば、ボタンと ▾ をそれに合わせる）
+  // 開くたびに Rust に聞き直す（カプセルの表を合わせる）
   if (now.openId !== before.openId) void useJobsStore.getState().readSaves();
-  if (now.item?.id !== before.item?.id || now.save?.job !== before.save?.job) syncSaveJobs();
+  if (now.phase === 'waiting' && before.phase !== 'waiting') void checkWaitedSave(now.openId);
 });
 
 /** 失敗した保存の code と言葉をジョブの記録から読み、シートを出す。 */
@@ -977,7 +1029,7 @@ let windowGuardPending = false;
 
 /** 窓を閉じる操作を止めるか（保存していない変更がある・エディタのシートを出している）。 */
 function guardsWindow(s: EditorState): boolean {
-  return hasUnsavedChanges(s) || (s.phase === 'open' && s.sheet !== null);
+  return hasUnsavedChanges(s) || sheetHolds(s);
 }
 
 /**

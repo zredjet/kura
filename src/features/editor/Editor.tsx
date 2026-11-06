@@ -22,7 +22,6 @@ import {
 } from './editorSave';
 import { EditorSheets } from './EditorSheets';
 import {
-  activeSave,
   canSaveEditor,
   editorUndo,
   reopenEditor,
@@ -103,13 +102,10 @@ function saveMenu(state: 'idle' | 'running' | 'paused'): MenuEntry[] {
   ];
 }
 
-/**
- * 主ボタン「保存」（⌘S。進捗はボタンの中。一時停止の間は「一時停止中 42%」）と ▾。保存のジョブは、このエディタで積んだものと、開く前に
- * 積んだ同じアイテムのものを同じに出す（`activeSave`）。
- */
+/** 主ボタン「保存」（⌘S。進捗はボタンの中。一時停止の間は「一時停止中 42%」）と ▾（このエディタで積んだ保存の操作）。 */
 function SaveControls() {
   const open = useEditorStore((s) => s.phase === 'open');
-  const save = useEditorStore(activeSave);
+  const save = useEditorStore((s) => s.save);
   const slow = useEditorStore((s) => s.save?.slow ?? false);
   const canSave = useCanSave();
   const paused = save?.state === 'paused';
