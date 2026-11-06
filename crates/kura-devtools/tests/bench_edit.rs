@@ -1,6 +1,6 @@
 //! `kura-devtools bench edit --quick` の煙のテスト（E30。docs/editing.md §16・requirements.md の NFR-11〜17）。極小の大きさで
 //! 2 回ずつ回し、すべての NFR のレコードを持つ JSON と、architecture.md §13 の形の Markdown を出すこと、正しさの照らし
-//! （エディタの経路と一括の経路の一致・予算を超える入力の Limit）が通ることと、決めた範囲の外（32px より太い筆・減色の
+//! （エディタの経路と一括の経路の一致・予算を超える入力の Limit）が通ることと、決めた範囲の外（32px より太い筆・減色とレート変換の
 //! プレビュー）が達成・未達でなく「範囲外」の記録になることを確かめる。debug でも数十秒で回る（macOS の CI）。
 //! NFR-17 は子プロセスを `/usr/bin/time -l` で起こすので、それが使えない環境では、そのレコードを見送り（skip）として出す。
 
@@ -81,7 +81,7 @@ fn quick_writes_a_record_for_every_nfr() {
     assert_eq!(
         out_of_scope,
         BTreeSet::from([11, 12]),
-        "範囲外の記録（減色のプレビュー・64px の筆）"
+        "範囲外の記録（減色・レート変換のプレビュー・64px の筆）"
     );
     // 環境とロードアベレージ
     for key in [

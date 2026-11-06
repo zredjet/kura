@@ -47,7 +47,7 @@ pub struct Sweep {
     pub edit: EditFn,
     /// 描く段（写真は [`PHOTO_LEVEL`]、ほかは等倍の 0）。
     pub level: u8,
-    /// 判定に使うか（偽は目標の範囲の外。測っても判定しない範囲外の記録。NFR-11 の減色のプレビュー）。
+    /// 判定に使うか（偽は目標の範囲の外。測っても判定しない範囲外の記録。NFR-11 の減色とレート変換のプレビュー）。
     pub judged: bool,
     /// 注（表の注に出す。なければ空）。
     pub note: &'static str,
