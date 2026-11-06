@@ -6,7 +6,8 @@
 //!    に落とす。値を照らすのは開くときではなく保存のとき（段 3）。
 //! 2. **WAV・AIFF**（`open_audio_source` が Some を返すもの）：遅延の源で開く。見出しを読む前に、この形式の最初の段が固定の段の
 //!    WAV・AIFF のデコーダか確かめ（[`opens_as_source`]）、ほかの形式の形はここでは読まない（予算の外で読まない。段 4B の
-//!    検証の直し）。DB の事実の行（`media_facts`）のデコーダが開いた
+//!    検証の直し）。読むのはその段の見出しだけ（`CodecSet::shape_path_first`）で、その段が読めない変種（A-law など）は
+//!    後ろの段へ回さず 3 に任せる（段 7 の検証の直し）。DB の事実の行（`media_facts`）のデコーダが開いた
 //!    デコーダと同じで、文書の入力の読み方が既定なら、その値のダイジェストで記録（`DecodeStamp`。固定の段・再現する）を作る。
 //!    そうでなければ記録はなく、指紋は派生（`Fingerprint::derive("audio-source", 元の中身, デコーダと読み方)`）。
 //! 3. **それ以外**（FLAC・Ogg・MP3・AAC・Platform・External、A-law の WAV など）：値が [`work_threshold`]（min(64 MiB,
@@ -278,6 +279,8 @@ pub(crate) struct LazyCx<'a> {
     pub threads: usize,
     /// 予算の全体（LRU の頭打ちに使う）。
     pub budget_total: u64,
+    /// 中止（エディタは閉じる・ほかを開くで止まる `editor.cancel`）。
+    pub mon: &'a dyn Monitor,
 }
 
 /// 入力の指紋（記録があればその値のダイジェスト、なければ派生）。
@@ -341,7 +344,8 @@ pub(crate) fn opens_as_source(codecs: &CodecSet, format: &str) -> bool {
 }
 
 /// 遅延の源で開く（モジュールの説明の 1・2）。開けない形式・アンカーの記録が違うときは None（呼び手は作業用のファイルか
-/// 丸ごと読み）。WAV・AIFF（[`opens_as_source`]）でなければ形も読まない。中止は見ない（見出しだけを読むので軽い）。
+/// 丸ごと読み）。WAV・AIFF（[`opens_as_source`]）でなければ形も読まない。読むのは固定の段の見出しだけ（確保しない）で、その段が
+/// 読めない変種も None（後ろの段の形は、呼び手が段ごとに確保して読む）。
 pub(crate) fn open_lazy(cx: &LazyCx<'_>) -> Result<Option<OpenedAudio>, EditorError> {
     let to_err = |e: EngineError| EditorError::from_engine("元を開けません", e);
     if let Some((a, path)) = cx.anchor {
@@ -391,7 +395,7 @@ pub(crate) fn open_lazy(cx: &LazyCx<'_>) -> Result<Option<OpenedAudio>, EditorEr
     }
     let shape = match cx
         .codecs
-        .shape_path(cx.original, cx.format, cx.opts, cx.limits)
+        .shape_path_first(cx.original, cx.format, cx.opts, cx.limits, cx.mon)
     {
         Ok((shape, _)) => shape,
         Err(e) if matches!(e.root(), EngineError::Unsupported(_)) => return Ok(None),

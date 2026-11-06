@@ -5,14 +5,16 @@
 use std::io::Cursor;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use kura_engine::budget::{Class, MemoryBudget};
 use kura_engine::codec::{CodecEnv, CodecSet, DecodeOut, Decoder, Held, ReadSeek, Tier};
 use kura_engine::doc::{DecodeOptions, InputId};
 use kura_engine::render::cache::Fingerprint;
 use kura_engine::testgen::InputGen;
+use kura_engine::testing::platform::FakePlatformDecoder;
 use kura_engine::value::LoopRange;
 use kura_engine::{Digest, EngineError, Graph, Limits, Monitor, NoMonitor, Shape, Value};
 use serde_json::json;
@@ -133,6 +135,41 @@ impl ShapeLog {
     }
 }
 
+/// 形を読むところで見張りが止めるのを待つ印（[`Stage::gated`]。見張りが止めなければ、時間の上限で諦めて `gave_up` を立てる）。
+#[derive(Clone, Default)]
+struct ShapeGate {
+    entered: Arc<AtomicBool>,
+    gave_up: Arc<AtomicBool>,
+}
+
+impl ShapeGate {
+    fn wait(&self, mon: &dyn Monitor) -> Result<(), EngineError> {
+        self.entered.store(true, Ordering::SeqCst);
+        let limit = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < limit {
+            if mon.canceled() {
+                return Err(EngineError::Canceled);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.gave_up.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// 形を読み始めるまで待つ。
+    fn wait_entered(&self) {
+        let limit = Instant::now() + Duration::from_secs(30);
+        while !self.entered.load(Ordering::SeqCst) {
+            assert!(Instant::now() < limit, "形を読み始めません");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn gave_up(&self) -> bool {
+        self.gave_up.load(Ordering::SeqCst)
+    }
+}
+
 /// 試す段：`inner`（固定の段のデコーダ）の読み方をそのまま使い、識別子・読む形式・形を読む分・流しの断り・形を読んだときの
 /// 記録だけを替える（段 2 の解析のジョブの `RefusingStream` と同じ考え方）。値を読んだ・流して読んだ数も数える。
 pub(super) struct Stage {
@@ -150,6 +187,8 @@ pub(super) struct Stage {
     decodes: Option<Arc<AtomicU64>>,
     /// 再現しない読み手として申告する（[`Stage::unreproducible`]。Platform・External と同じに、保存がアンカーに昇格する）。
     unreproducible: bool,
+    /// 形を読むところで見張りが止めるのを待つ（[`Stage::gated`]）。
+    gate: Option<ShapeGate>,
 }
 
 impl Stage {
@@ -165,6 +204,7 @@ impl Stage {
             log: Some(log.clone()),
             decodes: None,
             unreproducible: false,
+            gate: None,
         }
     }
 
@@ -180,6 +220,7 @@ impl Stage {
             log: None,
             decodes: None,
             unreproducible: false,
+            gate: None,
         }
     }
 
@@ -192,6 +233,12 @@ impl Stage {
     /// 再現しない読み手として申告する（読む値は `inner` と同じ）。
     pub(super) fn unreproducible(mut self) -> Self {
         self.unreproducible = true;
+        self
+    }
+
+    /// 形を読むところで、見張りが止めるのを待つ（`gate`）。
+    fn gated(mut self, gate: &ShapeGate) -> Self {
+        self.gate = Some(gate.clone());
         self
     }
 
@@ -292,6 +339,9 @@ impl Decoder for Stage {
         mon: &dyn Monitor,
     ) -> Result<Shape, EngineError> {
         self.note();
+        if let Some(gate) = &self.gate {
+            gate.wait(mon)?;
+        }
         self.inner
             .shape_file_monitored(path, self.inner_format, opts, limits, mon)
     }
@@ -451,6 +501,55 @@ fn plain_wav_env(budget: u64) -> Env {
                 "wav",
             )))
             .unwrap();
+            set
+        }),
+    }))
+}
+
+/// A-law の WAV（8 kHz モノラル・`frames` フレーム）を手で書く（形式タグ 6。固定の段の WAV は `Unsupported` を返し、遅延の源でも
+/// 開けない変種）。
+fn alaw_wav(frames: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(44 + frames as usize);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&u32::try_from(36 + frames).unwrap().to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&6u16.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&8_000u32.to_le_bytes());
+    b.extend_from_slice(&8_000u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&8u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&u32::try_from(frames).unwrap().to_le_bytes());
+    b.resize(b.len() + frames as usize, 0x55);
+    b
+}
+
+/// 固定の段のあとに、WAV の変種を読む偽の Platform の段（形を読むのにファイル全体を読み、読むたびに記す）を足したライブラリ。
+/// `gate` があれば、その段は形を読むところで見張りが止めるのを待つ。値は `frames` フレームの雑音（ファイルの中身は使わない）。
+fn wav_variant_env(frames: u64, log: &ShapeLog, gate: Option<&ShapeGate>) -> Env {
+    let log = log.clone();
+    let gate = gate.cloned();
+    Env::with(Arc::new(Staged {
+        budget: SMALL,
+        make: Box::new(move || {
+            let inner = FakePlatformDecoder::new(
+                "fake-at-dec/1",
+                &["wav"],
+                InputGen::AudioNoise {
+                    rate: 8_000,
+                    channels: 1,
+                    frames,
+                    seed: 7,
+                },
+            );
+            let mut stage = Stage::watching(Arc::new(inner), "wav", &log);
+            if let Some(g) = &gate {
+                stage = stage.gated(g);
+            }
+            let mut set = CodecSet::pinned();
+            set.add_decoder(Arc::new(stage)).unwrap();
             set
         }),
     }))
@@ -958,6 +1057,62 @@ fn opening_reads_the_shape_only_inside_the_budget() {
     );
 }
 
+/// 段 7 の検証の直し：遅延の源で開けない WAV の変種（A-law など）の形を、遅延で開く道（`open_lazy`）で後ろの段に読ませない。
+/// 形の読みはどれも段ごとの確保の中で、空いていなければ読む前に Busy。
+#[test]
+fn wav_variant_opening_reads_the_shape_only_inside_the_budget() {
+    let log = ShapeLog::default();
+    let env = wav_variant_env(2 * C, &log, None);
+    let bytes = alaw_wav(2 * C);
+    let len = bytes.len() as u64;
+    let id = add_audio(&env.lib, &bytes, "wav");
+    let budget = env.engine.runtime().unwrap().budget().clone();
+    log.attach(&budget);
+    let held = budget
+        .try_acquire(SMALL - len / 2, Class::Interactive)
+        .unwrap()
+        .unwrap();
+    let err = open_err(&env, id);
+    assert!(
+        matches!(&err, EditorError::Busy(m) if m.contains("元の形を読む")),
+        "{err}"
+    );
+    assert!(
+        log.seen().is_empty(),
+        "断る前に形を読んだ：{:?}",
+        log.seen()
+    );
+    assert!(env.engine.current_editor().is_none());
+    drop(held);
+    let opened = env.open(id);
+    let audio = opened.source.audio.unwrap();
+    assert!(!audio.lazy, "変種は遅延の源で開かない");
+    assert_eq!(audio.decoder, "fake-at-dec/1");
+    let seen = log.seen();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter().all(|&u| u >= len),
+        "予算の外で形を読んだ：{seen:?}（ファイルは {len} バイト）"
+    );
+}
+
+/// 段 7 の検証の直し：WAV の変種の形の読み（ffmpeg の段なら全体をデコードして数える）は `editor.cancel` で止まる。
+#[test]
+fn wav_variant_opening_stops_on_cancel() {
+    let log = ShapeLog::default();
+    let gate = ShapeGate::default();
+    let env = wav_variant_env(2 * C, &log, Some(&gate));
+    let id = add_audio(&env.lib, &alaw_wav(2 * C), "wav");
+    let err = std::thread::scope(|scope| {
+        let opening = scope.spawn(|| open_err(&env, id));
+        gate.wait_entered();
+        assert!(cancel_open(&env.engine, id), "開く途中のエディタを止める");
+        opening.join().unwrap()
+    });
+    assert!(matches!(err, EditorError::Canceled), "{err}");
+    assert!(!gate.gave_up(), "見張りを渡さずに形を読んだ");
+}
+
 /// 開いた入力の値が、元を丸ごと読んだ値・記録と同じ（値のダイジェストと読んだデコーダ）。
 fn assert_read_like_whole(env: &Env, opened: &crate::edit::editor::Opened, flac: &[u8]) {
     let (want, stamp) = decode_whole(flac);
@@ -1112,6 +1267,66 @@ fn pcm_reads_the_shape_only_inside_the_budget() {
             "予算の外で形を読んだ（{ext}）：{seen:?}（ファイルは {len} バイト）"
         );
     }
+}
+
+/// 段 7 の検証の直し：試聴の `/pcm` も、WAV の変種の形を源で開く道（`source_of`）で後ろの段に読ませない。形の読みはどれも段ごとの
+/// 確保の中で、空いていなければ読む前に 503。
+#[test]
+fn pcm_wav_variant_reads_the_shape_only_inside_the_budget() {
+    let log = ShapeLog::default();
+    let env = wav_variant_env(2 * C, &log, None);
+    let bytes = alaw_wav(2 * C);
+    let len = bytes.len() as u64;
+    add_audio(&env.lib, &bytes, "wav");
+    let root = env.lib.layout().root().to_path_buf();
+    let budget = env.engine.runtime().unwrap().budget().clone();
+    log.attach(&budget);
+    let hash = crate::library::hex(blake3::hash(&bytes).as_bytes());
+    let src = crate::serve::pcm_source(env.lib.layout(), &hash).unwrap();
+    let serve = || crate::asset::pcm::serve(&env.engine, &root, &hash, &src, 0, 10);
+    let held = budget
+        .try_acquire(SMALL - len / 2, Class::Interactive)
+        .unwrap()
+        .unwrap();
+    let err = serve().unwrap_err();
+    assert_eq!(err.status(), 503, "{err}");
+    assert!(
+        log.seen().is_empty(),
+        "断る前に形を読んだ：{:?}",
+        log.seen()
+    );
+    drop(held);
+    serve().unwrap();
+    let seen = log.seen();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter().all(|&u| u >= len),
+        "予算の外で形を読んだ：{seen:?}（ファイルは {len} バイト）"
+    );
+}
+
+/// 段 7 の検証の直し：試聴の `/pcm` の WAV の変種の形の読みは、ライブラリを閉じる印で止まり 409（ADR-185）。
+#[test]
+fn pcm_wav_variant_stops_when_the_library_closes() {
+    use crate::asset::pcm::{PcmError, serve};
+
+    let log = ShapeLog::default();
+    let gate = ShapeGate::default();
+    let env = wav_variant_env(2 * C, &log, Some(&gate));
+    let bytes = alaw_wav(2 * C);
+    add_audio(&env.lib, &bytes, "wav");
+    let root = env.lib.layout().root().to_path_buf();
+    let hash = crate::library::hex(blake3::hash(&bytes).as_bytes());
+    let src = crate::serve::pcm_source(env.lib.layout(), &hash).unwrap();
+    let err = std::thread::scope(|scope| {
+        let serving = scope.spawn(|| serve(&env.engine, &root, &hash, &src, 0, 10));
+        gate.wait_entered();
+        env.engine.begin_close();
+        serving.join().unwrap().unwrap_err()
+    });
+    assert!(matches!(err, PcmError::Canceled), "{err}");
+    assert_eq!(err.status(), 409);
+    assert!(!gate.gave_up(), "見張りを渡さずに形を読んだ");
 }
 
 /// 段 4B の検証の直し 3：試聴の `/pcm` で作業用のファイルを作れない（ディスクの空きが足りない）とき、丸ごと読む見積もりが

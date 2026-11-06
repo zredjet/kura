@@ -2035,6 +2035,7 @@ fn read_input(
                 limits,
                 threads: runtime.preview_threads(),
                 budget_total: runtime.budget().total(),
+                mon: editor.cancel.as_ref(),
             })
         })?;
         if let Some(o) = lazy {

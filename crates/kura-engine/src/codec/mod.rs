@@ -864,6 +864,28 @@ impl CodecSet {
         Ok((shape, d.id()))
     }
 
+    /// ファイルの形を、形式 `format` の最初の段だけで読む（後ろの段へ回さない。その段が読めなければ `Unsupported` のまま）。
+    /// 遅延の源で開くかを決める固定の段の WAV・AIFF の見出しを読む口：形を読むのにファイル全体を読む段・全体をデコードして
+    /// 数える段（Platform・ffmpeg）を、予算の外で動かさない（呼び手は `Unsupported` なら [`CodecSet::shape_path_staged`] で読む）。
+    pub fn shape_path_first(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<(Shape, &'static str), EngineError> {
+        let decoders = self.decoders_for(format);
+        let Some(d) = decoders.first() else {
+            return Err(EngineError::Unsupported(format!("{format} を読めません")));
+        };
+        let shape = contain(d.id(), Stage::Decode, || {
+            d.shape_file_monitored(path, format, opts, limits, mon)
+        })?;
+        limits.check(&shape).map_err(EngineError::Limit)?;
+        Ok((shape, d.id()))
+    }
+
     /// 段の順に読む（読み口かパス）。
     fn decode_any(
         &self,
@@ -2116,6 +2138,41 @@ mod tests {
             .unwrap();
         assert_eq!(s3, s1);
         let (shape, id) = set.shape_path(&path, "png", &opts, &limits).unwrap();
+        assert_eq!(
+            set.shape_path_first(&path, "png", &opts, &limits, &NoMonitor)
+                .unwrap(),
+            (shape, id),
+            "最初の段で読めれば同じ"
+        );
+        // 最初の段が読めなくても後ろの段へ回さない（`shape_path` は回す）。読む段がなければ `Unsupported`
+        let fake =
+            |id, input| crate::testing::platform::FakePlatformDecoder::new(id, &["fake"], input);
+        let input = crate::testgen::InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 1,
+            frames: 10,
+            seed: 1,
+        };
+        let mut two = CodecSet::default();
+        two.add_decoder(Arc::new(
+            fake("first-dec/1", input.clone())
+                .failing(crate::testing::platform::FakeFailure::Unsupported),
+        ))
+        .unwrap();
+        two.add_decoder(Arc::new(
+            fake("second-dec/1", input).with_tier(Tier::External),
+        ))
+        .unwrap();
+        for format in ["fake", "no-such-format"] {
+            assert!(matches!(
+                two.shape_path_first(&path, format, &opts, &limits, &NoMonitor),
+                Err(EngineError::Unsupported(_))
+            ));
+        }
+        assert_eq!(
+            two.shape_path(&path, "fake", &opts, &limits).unwrap().1,
+            "second-dec/1"
+        );
         assert!(shape.admits(&v3.shape()));
         assert_eq!(
             set.shape(&mut Cursor::new(bytes), "png", &opts, &limits)

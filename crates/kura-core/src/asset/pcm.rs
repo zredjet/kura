@@ -440,9 +440,17 @@ fn audio_of(
     let len = std::fs::metadata(&source.path)
         .map_err(|_| PcmError::NotFound)?
         .len();
-    // WAV・AIFF：見出しだけを読み、源として開く（全体を読まない。予算は源の LRU の上限）
+    // WAV・AIFF：固定の段の見出しだけを読み、源として開く（全体を読まない。予算は源の LRU の上限）
     if audio_source::opens_as_source(&codecs, source.format)
-        && let Some(found) = source_of(cache, &codecs, runtime, root, hash, source)?
+        && let Some(found) = source_of(
+            cache,
+            &codecs,
+            runtime,
+            root,
+            hash,
+            source,
+            engine.closing(),
+        )?
     {
         return Ok(found);
     }
@@ -461,7 +469,8 @@ fn audio_of(
     work.decoded_of(len)
 }
 
-/// WAV・AIFF を源として開いて覚える。源で開けない変種・長さの分からないものは None（呼び手が読む）。
+/// WAV・AIFF を源として開いて覚える。源で開けない変種・長さの分からないものは None（呼び手が読む）。形の読みは固定の段の見出し
+/// だけ（確保しない）で、その段が読めない変種の形は後ろの段に読ませない（呼び手が段ごとに確保して読む。予算の外で読まない）。
 fn source_of(
     cache: &Arc<PcmCache>,
     codecs: &Arc<CodecSet>,
@@ -469,11 +478,16 @@ fn source_of(
     root: &Path,
     hash: &str,
     source: &PcmSource,
+    closing: &dyn Monitor,
 ) -> Result<Option<(Arc<Audio>, String)>, PcmError> {
     let (opts, limits) = (DecodeOptions::default(), Limits::default());
-    let (shape, decoder) = runtime
-        .preview(|_| codecs.shape_path(&source.path, source.format, &opts, &limits))
-        .map_err(engine_failed)?;
+    let first = runtime
+        .preview(|_| codecs.shape_path_first(&source.path, source.format, &opts, &limits, closing));
+    let (shape, decoder) = match first {
+        Ok(found) => found,
+        Err(err) if matches!(err.root(), EngineError::Unsupported(_)) => return Ok(None),
+        Err(err) => return Err(engine_failed(err)),
+    };
     if let Some(hit) = cache.lookup(root, hash, codecs, Some(decoder)) {
         return Ok(Some(hit));
     }
