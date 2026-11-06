@@ -1079,6 +1079,11 @@ export const ja = {
     saveKey: '保存（⌘S）',
     saving: '保存中…',
     savingPercent: (p: string) => `保存中 ${p}%`,
+    savePaused: '一時停止中',
+    savePausedPercent: (p: string) => `一時停止中 ${p}%`,
+    savePause: '保存を一時停止',
+    saveResume: '保存を再開',
+    saveCancel: '保存を中止',
     saveMore: '保存のほかの操作',
     saveAs: '別名で保存…',
     revert: '元に戻す…',
@@ -1104,6 +1109,7 @@ export const ja = {
     existingTrashed: '（ゴミ箱）',
     showItem: '表示',
     saveBusy: '前の保存が終わるまで待ってください',
+    saveBusyPaused: '前の保存を一時停止しています。再開するか中止してください',
     saveFailed: '保存できませんでした',
     /** 保存できなかった理由（ジョブ・IPC の code）。 */
     saveFailures: {
@@ -1172,6 +1178,9 @@ export const ja = {
     draftHistory: '下書きから開いても、取り消しの履歴は戻りません。',
     draftStale:
       'この下書きを残したあとに、別の保存でアイテムが変わったため、下書きからは開けません。',
+    draftPending:
+      '保存が待っている間は、下書きからは開けません。保存を再開・中止してから開き直すと、残っている下書きから開けます。',
+    draftKeep: '下書きを残して開く',
     draftDiscard: '捨てる',
     draftOpen: '下書きから開く',
     unsavedTitle: '編集を保存しますか？',
@@ -1703,6 +1712,17 @@ export const ja = {
     canceled: '書き出しを中止しました',
     canceledDetail: (n: string) => `${n} 項目は書き出し済みです`,
     reveal: 'Finder で表示',
+  },
+  savingJob: {
+    label: '保存の進捗',
+    unnamed: 'アイテム',
+    queued: (name: string) => `「${name}」の保存の順番を待っています`,
+    running: (name: string) => `「${name}」を保存しています`,
+    paused: (name: string) => `「${name}」の保存を一時停止しています`,
+    revertQueued: (name: string) => `「${name}」を戻す順番を待っています`,
+    revertRunning: (name: string) => `「${name}」を戻しています`,
+    revertPaused: (name: string) => `「${name}」を戻すのを一時停止しています`,
+    resumeNote: '再開すると初めから書き直します',
   },
   progress: {
     label: '取り込みの進捗',

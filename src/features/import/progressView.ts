@@ -3,6 +3,7 @@ import { parseExportResult } from '../../ipc/export';
 import { parseImportResult } from '../../ipc/import';
 import type { JobProgress } from '../../ipc/jobs';
 import { formatCount } from '../../lib/format';
+import type { SaveJob } from '../../stores/jobsStore';
 
 const t = ja.progress;
 
@@ -85,6 +86,42 @@ export function progressView(job: JobProgress): ProgressView {
         progress: undefined,
         actions: ['close'],
         finished: true,
+      };
+  }
+}
+
+/**
+ * 保存のジョブ（`kind = 'edit'`）。終わったらカプセルから消すので、終わった状態は持たない（知らせはエディタの保存の流れ）。待っている
+ * 間も止められる（待ちのジョブは一時停止の指示でそのまま一時停止になる）。
+ */
+export function saveProgressView(job: SaveJob): ProgressView {
+  const s = ja.savingJob;
+  const name = (job.mode === 'saveAs' ? job.newTitle : null) ?? job.itemTitle ?? s.unnamed;
+  const revert = job.mode === 'revert';
+  switch (job.state) {
+    case 'paused':
+      return {
+        title: revert ? s.revertPaused(name) : s.paused(name),
+        detail: s.resumeNote,
+        progress: job.progress ?? 0,
+        actions: ['resume', 'cancel'],
+        finished: false,
+      };
+    case 'queued':
+      return {
+        title: revert ? s.revertQueued(name) : s.queued(name),
+        detail: null,
+        progress: null,
+        actions: ['pause', 'cancel'],
+        finished: false,
+      };
+    default:
+      return {
+        title: revert ? s.revertRunning(name) : s.running(name),
+        detail: job.message,
+        progress: job.progress,
+        actions: ['pause', 'cancel'],
+        finished: false,
       };
   }
 }

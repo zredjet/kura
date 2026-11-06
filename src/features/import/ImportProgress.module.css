@@ -1,12 +1,18 @@
-/* Main.dc.html のミニプレーヤーと同じ置き方：グリッドの下中央、幅 560px まで、ガラスのカプセル */
+/* Main.dc.html のミニプレーヤーと同じ置き方：グリッドの下中央、幅 560px まで、ガラスのカプセル（保存と取り込みは縦に積む） */
 
-.capsule {
+.stack {
   position: absolute;
   left: 50%;
   bottom: var(--space-5);
   z-index: 5;
   transform: translateX(-50%);
   width: min(560px, calc(100% - var(--space-4) * 2));
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.capsule {
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -20,7 +26,7 @@
 }
 
 /* ミニプレーヤーが出ているときは、その上に積む（ミニプレーヤーの高さ 58px と間隔 8px） */
-.capsule[data-raised] {
+.stack[data-raised] {
   bottom: calc(var(--space-5) + 58px + var(--space-2));
 }
 

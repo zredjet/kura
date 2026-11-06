@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 
+import { type EditPendingSaveDto, listPendingSaves } from '../ipc/edit';
 import { listJobs, type JobProgress, onJobProgress, progressFromJob } from '../ipc/jobs';
 import { useDownloadsStore } from './downloadsStore';
 import { refreshAnalyzing, refreshThumbnails } from './itemCache';
@@ -10,6 +11,13 @@ import { useSidebarStore } from './sidebarStore';
 const LIST_RELOAD_MS = 1000;
 const THUMB_REFRESH_MS = 500;
 const ANALYSIS_REFRESH_MS = 1000;
+/**
+ * 保存のジョブをカプセルに出すまでの時間（ms）。画像の保存のように一瞬で終わるものでカプセルがちらつかないように（一時停止中は
+ * すぐ出す）。
+ */
+export const SAVE_CAPSULE_DELAY_MS = 1000;
+/** カプセルに並べる保存のジョブの数（古い順。動くのは 1 本ずつで、終わると次が出る）。 */
+const MAX_SAVE_CAPSULES = 3;
 
 /** 呼ばれてから `ms` のあいだに何度呼ばれても 1 回にまとめる。 */
 function coalesce(ms: number, run: () => void): () => void {
@@ -48,24 +56,126 @@ export function reactToJob(event: JobProgress): void {
   }
 }
 
+/**
+ * 終わっていない保存のジョブ（`kind = 'edit'`。グリッドの下のカプセルと、開き直したエディタの保存のボタンが読む。ADR-189）。
+ * 終わったら表から消す（カプセルに完了の状態は出さない。知らせはエディタの保存の流れ）。
+ */
+export interface SaveJob {
+  id: number;
+  itemId: number;
+  /** 保存しているアイテムの表示名（行がなければ null）。 */
+  itemTitle: string | null;
+  mode: 'overwrite' | 'saveAs' | 'revert';
+  /** 別名で保存の名前。 */
+  newTitle: string | null;
+  state: JobProgress['state'];
+  progress: number | null;
+  message: string | null;
+  /** カプセルに出す（`SAVE_CAPSULE_DELAY_MS` 動いた・一時停止した）。 */
+  shown: boolean;
+}
+
+/**
+ * 保存のジョブのイベントのあとの進捗。一時停止のイベントは進捗を持たない（ジョブの進捗は画面へ送るだけで DB に書かない）ので前の
+ * 値を引き継ぎ、再開（一時停止から待ちへ）は初めから書き直すので進捗も頭から。
+ */
+export function nextSaveProgress(
+  previous: { state: JobProgress['state']; progress: number | null },
+  event: Pick<JobProgress, 'state' | 'progress'>,
+): number | null {
+  if (previous.state === 'paused' && event.state === 'queued') return null;
+  return event.progress ?? previous.progress;
+}
+
+/** カプセルに出す保存のジョブ（古い順）。 */
+export function shownSaves(saves: Record<number, SaveJob>): SaveJob[] {
+  return Object.values(saves)
+    .filter((job) => job.shown)
+    .sort((a, b) => a.id - b.id)
+    .slice(0, MAX_SAVE_CAPSULES);
+}
+
+/** アイテムの終わっていない保存のジョブ（同じアイテムは同時に 1 つ。`except` は今のエディタの保存）。 */
+export function selectItemSave(
+  saves: Record<number, SaveJob>,
+  itemId: number,
+  except?: number,
+): SaveJob | null {
+  return Object.values(saves).find((job) => job.itemId === itemId && job.id !== except) ?? null;
+}
+
+/** Rust の一覧の行を、表の形にする。 */
+function saveFromDto(row: EditPendingSaveDto): Omit<SaveJob, 'shown'> {
+  return {
+    id: row.job,
+    itemId: row.itemId,
+    itemTitle: row.itemTitle,
+    mode: row.mode.type,
+    newTitle: row.mode.type === 'saveAs' ? row.mode.title : null,
+    state: row.state,
+    progress: row.progress,
+    message: row.message,
+  };
+}
+
+/** 読み直しの世代（ライブラリを替えたあとに届いた前のライブラリの一覧を捨てる）。 */
+let savesEpoch = 0;
+
 interface JobsState {
   /** 取り込み・書き出しのジョブの最新の状態（ID ごと）。 */
   imports: Record<number, JobProgress>;
   /** 画面から消したジョブ。 */
   dismissed: Record<number, true>;
+  /** 終わっていない保存のジョブ（ID ごと）。 */
+  saves: Record<number, SaveJob>;
+  /** 終わったと分かった保存のジョブ（積む応え・一覧の応えより先に終わりが届いても、動いていることにしない）。 */
+  endedSaves: Record<number, true>;
   /** 進捗イベントを反映する。 */
   apply: (event: JobProgress) => void;
   /** 表示から消す。 */
   dismiss: (id: number) => void;
   /** 終わっていない取り込み・書き出しのジョブを読み込む（起動時に再開したもの）。 */
   load: () => Promise<void>;
+  /** 保存のジョブを表に載せる（積んだ・一覧で知った。知っている・終わったジョブなら何もしない）。 */
+  trackSave: (job: Omit<SaveJob, 'shown'>) => void;
+  /**
+   * 終わっていない保存のジョブを Rust に聞いて表に合わせる（エディタを開いたとき・Rust が Busy で断ったとき）。頼む前から知って
+   * いて一覧にないジョブは終わった（イベントを取りこぼした）ものとして消す。知っているジョブの状態はイベントのほうが新しいので
+   * 替えない。
+   */
+  readSaves: () => Promise<void>;
+  /** 表を捨てて読み直す（ライブラリを開いた・替えた。一時停止した保存はアプリを開き直しても残っている）。 */
+  reloadSaves: () => Promise<void>;
 }
 
-export const useJobsStore = create<JobsState>((set) => ({
+export const useJobsStore = create<JobsState>((set, get) => ({
   imports: {},
   dismissed: {},
+  saves: {},
+  endedSaves: {},
   apply: (event) => {
-    // 進捗のカプセルに出すのは取り込みと書き出し
+    if (event.kind === 'edit') {
+      set((state) => {
+        const previous = state.saves[event.id];
+        if (event.state === 'done' || event.state === 'failed' || event.state === 'canceled') {
+          const saves = { ...state.saves };
+          delete saves[event.id];
+          return { saves, endedSaves: { ...state.endedSaves, [event.id]: true } };
+        }
+        if (!previous) return state;
+        const restarted = previous.state === 'paused' && event.state === 'queued';
+        const next: SaveJob = {
+          ...previous,
+          state: event.state,
+          progress: nextSaveProgress(previous, event),
+          message: restarted ? null : (event.message ?? previous.message),
+          shown: previous.shown || event.state === 'paused',
+        };
+        return { saves: { ...state.saves, [event.id]: next } };
+      });
+      return;
+    }
+    // 進捗のカプセルに出すのは取り込みと書き出し（と、上の保存）
     if (event.kind !== 'import' && event.kind !== 'export') {
       return;
     }
@@ -93,6 +203,50 @@ export const useJobsStore = create<JobsState>((set) => ({
     } catch (error) {
       console.warn('ジョブを読めませんでした', error);
     }
+  },
+  trackSave: (job) => {
+    const { saves, endedSaves } = get();
+    if (saves[job.id] || endedSaves[job.id]) return;
+    const shown = job.state === 'paused';
+    set({ saves: { ...saves, [job.id]: { ...job, shown } } });
+    if (shown) return;
+    setTimeout(() => {
+      set((state) => {
+        const now = state.saves[job.id];
+        return now && !now.shown
+          ? { saves: { ...state.saves, [job.id]: { ...now, shown: true } } }
+          : state;
+      });
+    }, SAVE_CAPSULE_DELAY_MS);
+  },
+  readSaves: async () => {
+    const epoch = savesEpoch;
+    const known = Object.values(get().saves).map((job) => job.id);
+    try {
+      const list = await listPendingSaves();
+      if (epoch !== savesEpoch) return;
+      const alive = new Set(list.map((row) => row.job));
+      const gone = known.filter((id) => !alive.has(id));
+      if (gone.length > 0) {
+        set((state) => {
+          const saves = { ...state.saves };
+          const endedSaves = { ...state.endedSaves };
+          for (const id of gone) {
+            delete saves[id];
+            endedSaves[id] = true;
+          }
+          return { saves, endedSaves };
+        });
+      }
+      for (const row of list) get().trackSave(saveFromDto(row));
+    } catch (error) {
+      console.warn('保存のジョブを読めませんでした', error);
+    }
+  },
+  reloadSaves: () => {
+    savesEpoch++;
+    set({ saves: {}, endedSaves: {} });
+    return get().readSaves();
   },
 }));
 

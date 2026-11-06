@@ -1,11 +1,16 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../i18n/ja';
+import { listPendingSaves } from '../ipc/edit';
 import { restoreLibrary } from '../ipc/library';
 import { useLibraryStore } from '../stores/libraryStore';
 import { App } from './App';
 
+vi.mock(import('../ipc/edit'), async (importOriginal) => ({
+  ...(await importOriginal()),
+  listPendingSaves: vi.fn(async () => []),
+}));
 vi.mock('../ipc/library', () => ({
   onLibraryUpgrade: vi.fn(async () => () => {}),
   restoreLibrary: vi.fn(),
@@ -91,6 +96,15 @@ describe('App（前回のライブラリを開けたとき）', () => {
     expect(
       screen.getByRole('complementary', { name: ja.library.inspectorLabel }),
     ).toBeInTheDocument();
+  });
+
+  it('ライブラリを開いたら・替えたら、終わっていない保存を読む（カプセルから再開できる）', async () => {
+    vi.mocked(listPendingSaves).mockClear();
+    render(<App />);
+    await screen.findByRole('navigation', { name: ja.sidebar.label });
+    expect(listPendingSaves).toHaveBeenCalledTimes(1);
+    act(() => useLibraryStore.setState({ info: { ...info, path: '/Users/me/other.kuralib' } }));
+    await waitFor(() => expect(listPendingSaves).toHaveBeenCalledTimes(2));
   });
 
   it('サイドバーの先頭行とツールバーがウィンドウのドラッグ領域になっている', async () => {

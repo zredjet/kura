@@ -87,6 +87,10 @@ function LibraryScreen() {
   // ライブラリを替えたら再生をやめ、画像エディタを閉じる（Rust もライブラリを閉じる前にエディタを閉じる）
   const libraryPath = useLibraryStore((s) => s.info?.path);
   useEffect(() => closePlayer, [libraryPath]);
+  // 終わっていない保存を読む（一時停止した保存はアプリを開き直しても残っている。カプセルから再開・中止できる）
+  useEffect(() => {
+    void useJobsStore.getState().reloadSaves();
+  }, [libraryPath]);
   useEffect(() => () => void closeEditor(), [libraryPath]);
 
   return (
