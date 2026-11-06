@@ -258,8 +258,8 @@ describe('ループの試聴', () => {
   });
 });
 
-// 長さ（フレーム）は素材の欄の DTO・一覧の概要にないので、/pcm の応答（同じ読み取り）で知ってから計画する（素材の欄・L のキー）
-describe('長さを知らないで始める試聴', () => {
+// 鳴らす区間は PCM と同じ読み取りの長さで計画するので、/pcm の応答で知ってから計画する（素材の欄・L のキー。解析の長さはデコーダが変わるとずれる）
+describe('/pcm の応答で長さを知ってから始める試聴', () => {
   function probing(truth: Parameters<typeof fakeSource>[0], honor = true) {
     const log: string[] = [];
     const factory = fakeFactory(log, honor);
