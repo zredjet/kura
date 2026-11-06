@@ -46,6 +46,7 @@ import {
   type EditStepDto_Deserialize,
   type EditStepResultDto_Serialize,
   type EditVersionDto,
+  type EditPendingSaveDto,
   type EditViewDto,
   type EditViewOutcomeDto,
   type EditViewportDto,
@@ -104,6 +105,7 @@ export type {
   EditSpansChangeDto,
   EditStatusDto,
   EditVersionDto,
+  EditPendingSaveDto,
   EditViewDto,
   EditViewOutcomeDto,
   EditViewportDto,
@@ -229,6 +231,14 @@ export function listEditFormats(session: string): Promise<EditFormatsDto> {
 /** アイテムの版の一覧（まだ保存していなければ空）。 */
 export function listEditVersions(itemId: number): Promise<EditVersionDto[]> {
   return unwrap(commands.editVersions(itemId));
+}
+
+/**
+ * 終わっていない保存のジョブ（古い順。エディタを閉じたあとのカプセル・開き直したエディタの保存のボタン・アプリを開き直した
+ * あとの再開が読む）。
+ */
+export function listPendingSaves(): Promise<EditPendingSaveDto[]> {
+  return unwrap(commands.editPendingSaves());
 }
 
 /** アイテムの下書きを捨てる（あったら真）。 */

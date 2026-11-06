@@ -112,6 +112,8 @@ export const commands = {
 { type: "to"; format: string; options?: JsonValue } | null) => typedError<EditSaveStartedDto_Serialize, AppError>(__TAURI_INVOKE("edit_save", { session, mode, format })),
 	/**  アイテムの版の一覧（版の順。まだ保存していなければ空）。 */
 	editVersions: (itemId: number) => typedError<EditVersionDto[], AppError>(__TAURI_INVOKE("edit_versions", { itemId })),
+	/**  終わっていない保存のジョブ（古い順。エディタを閉じたあとのカプセル・開き直したエディタの保存のボタン。ADR-189）。 */
+	editPendingSaves: () => typedError<EditPendingSaveDto[], AppError>(__TAURI_INVOKE("edit_pending_saves")),
 	/**  アイテムの下書きを捨てる（あったら真）。 */
 	editDraftDiscard: (itemId: number) => typedError<boolean, AppError>(__TAURI_INVOKE("edit_draft_discard", { itemId })),
 	/**  サイドバーの「ライブラリ」の件数。 */
@@ -1165,6 +1167,23 @@ export type EditPeaksInfoDto = {
 	/**  直している途中（古い段・仮の段を出している。手が止まったら `work: true` で頼み直す）。 */
 	pending: boolean,
 };
+
+/**  終わっていない保存のジョブ 1 件。 */
+export type EditPendingSaveDto = {
+	job: number,
+	itemId: number,
+	/**  保存しているアイテムの表示名（別名で保存では元にしたアイテム。行がなければ null）。 */
+	itemTitle: string | null,
+	mode: EditPendingSaveModeDto,
+	state: JobStateDto,
+	progress: number | null,
+	message: string | null,
+};
+
+/**  終わっていない保存のジョブの向き。 */
+export type EditPendingSaveModeDto = { type: "overwrite" } | 
+/**  別名で保存（新しいアイテムの表示名）。 */
+{ type: "saveAs"; title: string } | { type: "revert" };
 
 /**  断り・失敗（指摘はノード・引数つき）。 */
 export type EditProblemDto = {

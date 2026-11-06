@@ -813,12 +813,14 @@ impl Editor {
                 self.saved(env, st, saving, &result);
                 notices.push("保存しました".into());
             }
-            JobState::Failed | JobState::Canceled => {
+            JobState::Failed => {
                 notices.push(format!(
                     "保存できませんでした（{}）",
                     record.message.as_deref().unwrap_or("理由は不明です")
                 ));
             }
+            // 利用者が止めた（ボタンの ▾・カプセル）：失敗の言葉にしない
+            JobState::Canceled => notices.push("保存を中止しました".into()),
         }
         st.saving = None;
     }

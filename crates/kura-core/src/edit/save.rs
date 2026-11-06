@@ -72,7 +72,7 @@ use crate::import::place::{Staged, place};
 use crate::import::store::{NewItem, Owner, OwnerRole, find_owner, insert_item};
 use crate::import::{MediaKind, format_id, hash_file, mime_for};
 use crate::jobs::{
-    Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, save_partial,
+    Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, JobState, save_partial,
 };
 use crate::library::{Layout, hex, ledger};
 use crate::media::MediaInfo;
@@ -252,6 +252,71 @@ pub fn pending_save(conn: &Connection, item_id: i64) -> Result<Option<JobId>> {
         }
     }
     Ok(None)
+}
+
+/// 終わっていない保存のジョブの向き（[`PendingSave`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSaveMode {
+    Overwrite,
+    /// 別名で保存（新しいアイテムの表示名 `title`）。
+    SaveAs {
+        title: String,
+    },
+    Revert,
+}
+
+/// 終わっていない（待ち・実行中・一時停止の）保存のジョブ 1 件（画面が進捗・一時停止・再開・中止を出す。ADR-189）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSave {
+    pub job: JobId,
+    pub item_id: i64,
+    /// 保存しているアイテムの表示名（別名で保存では元にしたアイテム。行がなければ None）。
+    pub item_title: Option<String>,
+    pub mode: PendingSaveMode,
+    pub state: JobState,
+    pub progress: Option<f64>,
+    pub message: Option<String>,
+}
+
+/// 終わっていない保存のジョブを古い順に（アプリを開き直した・ライブラリを替えたあとも、一時停止した保存を画面から再開・中止
+/// できるように）。読めない入力は飛ばす（そのジョブは動くときに失敗する）。
+pub fn pending_saves(conn: &Connection) -> Result<Vec<PendingSave>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, state, progress, message, input_json FROM jobs
+          WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit' ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, JobId>(0)?,
+            r.get::<_, JobState>(1)?,
+            r.get::<_, Option<f64>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut title = conn.prepare_cached("SELECT title FROM items WHERE id = ?1")?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (job, state, progress, message, input) = row?;
+        let Ok(input) = serde_json::from_str::<JobInput>(&input) else {
+            continue;
+        };
+        let mode = match input.action {
+            ActionInput::Overwrite { .. } => PendingSaveMode::Overwrite,
+            ActionInput::SaveAs { title, .. } => PendingSaveMode::SaveAs { title },
+            ActionInput::Revert { .. } => PendingSaveMode::Revert,
+        };
+        out.push(PendingSave {
+            job,
+            item_id: input.item_id,
+            item_title: title.query_row([input.item_id], |r| r.get(0)).optional()?,
+            mode,
+            state,
+            progress,
+            message,
+        });
+    }
+    Ok(out)
 }
 
 /// 文書を内容アドレスの部品に分ける。
@@ -2439,6 +2504,88 @@ mod tests {
         );
         assert!(plan.contains("idx_jobs_queue"), "{plan}");
         assert!(!plan.contains("SCAN jobs"), "{plan}");
+    }
+
+    /// 画面が読む終わっていない保存のジョブ：古い順に、アイテムの名前・向き・状態つき。終わったもの・ほかの種類・読めない入力は
+    /// 数えない。アイテムの行がなくても（ジョブは中止できるよう）出す。
+    #[test]
+    fn pending_saves_lists_unfinished_jobs_with_item_titles() {
+        use crate::db::test_conn;
+        let conn = test_conn();
+        crate::edit::testing::insert_item(&conn, 1, [1; 32]);
+        conn.execute("UPDATE items SET title = 'long-60min' WHERE id = 1", [])
+            .unwrap();
+        let job = |kind: &str, state: &str, input: String| -> i64 {
+            conn.query_row(
+                "INSERT INTO jobs (kind, state, input_json, created_at) VALUES (?1, ?2, ?3, 1) RETURNING id",
+                params![kind, state, input],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let input = |item: i64, action: serde_json::Value| {
+            json!({ "v": 1, "itemId": item, "base": { "hash": "00".repeat(32), "version": 0 }, "action": action })
+                .to_string()
+        };
+        let doc = json!({ "type": "overwrite", "doc": "00".repeat(32) });
+        job("edit", "done", input(1, doc.clone()));
+        job("edit", "canceled", input(1, doc.clone()));
+        job("gc", "queued", input(1, doc.clone()));
+        job("edit", "paused", "{}".into());
+        assert_eq!(pending_saves(&conn).unwrap(), Vec::new());
+        let running = job("edit", "running", input(1, doc));
+        conn.execute(
+            "UPDATE jobs SET progress = 0.5, message = '描いています' WHERE id = ?1",
+            [running],
+        )
+        .unwrap();
+        let save_as = job(
+            "edit",
+            "paused",
+            input(
+                1,
+                json!({ "type": "saveAs", "doc": "00".repeat(32), "title": "夕方", "stem": "yu" }),
+            ),
+        );
+        let revert = job(
+            "edit",
+            "queued",
+            input(9, json!({ "type": "revert", "to": 0 })),
+        );
+        assert_eq!(
+            pending_saves(&conn).unwrap(),
+            vec![
+                PendingSave {
+                    job: running,
+                    item_id: 1,
+                    item_title: Some("long-60min".into()),
+                    mode: PendingSaveMode::Overwrite,
+                    state: JobState::Running,
+                    progress: Some(0.5),
+                    message: Some("描いています".into()),
+                },
+                PendingSave {
+                    job: save_as,
+                    item_id: 1,
+                    item_title: Some("long-60min".into()),
+                    mode: PendingSaveMode::SaveAs {
+                        title: "夕方".into()
+                    },
+                    state: JobState::Paused,
+                    progress: None,
+                    message: None,
+                },
+                PendingSave {
+                    job: revert,
+                    item_id: 9,
+                    item_title: None,
+                    mode: PendingSaveMode::Revert,
+                    state: JobState::Queued,
+                    progress: None,
+                    message: None,
+                },
+            ]
+        );
     }
 
     /// ジョブの入力の形（小さく、根のダイジェストだけ）。知らない項目は拒む。

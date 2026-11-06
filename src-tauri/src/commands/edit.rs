@@ -25,6 +25,7 @@ use kura_core::edit::editor::{
     SaveStarted, SourceInfo, Status, Step, StepOutcome, VersionSummary, ViewInfo, ViewOutcome,
     Viewport,
 };
+use kura_core::edit::save::{PendingSave, PendingSaveMode, pending_saves};
 use kura_engine::Issue;
 use kura_engine::doc::{FormatChoice, NodeId, OutputSpec};
 use kura_engine::geom::IRect;
@@ -36,6 +37,7 @@ use specta::Type;
 use tauri::State;
 
 use super::blocking;
+use crate::dto::JobStateDto;
 use crate::error::{AppError, AppErrorCode};
 use crate::state::AppState;
 
@@ -1381,6 +1383,54 @@ pub async fn edit_save(
     .await
 }
 
+/// 終わっていない保存のジョブの向き。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "type"
+)]
+pub enum EditPendingSaveModeDto {
+    Overwrite,
+    /// 別名で保存（新しいアイテムの表示名）。
+    SaveAs {
+        title: String,
+    },
+    Revert,
+}
+
+/// 終わっていない保存のジョブ 1 件。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditPendingSaveDto {
+    pub job: i64,
+    pub item_id: i64,
+    /// 保存しているアイテムの表示名（別名で保存では元にしたアイテム。行がなければ null）。
+    pub item_title: Option<String>,
+    pub mode: EditPendingSaveModeDto,
+    pub state: JobStateDto,
+    pub progress: Option<f64>,
+    pub message: Option<String>,
+}
+
+impl From<PendingSave> for EditPendingSaveDto {
+    fn from(p: PendingSave) -> Self {
+        Self {
+            job: p.job,
+            item_id: p.item_id,
+            item_title: p.item_title,
+            mode: match p.mode {
+                PendingSaveMode::Overwrite => EditPendingSaveModeDto::Overwrite,
+                PendingSaveMode::SaveAs { title } => EditPendingSaveModeDto::SaveAs { title },
+                PendingSaveMode::Revert => EditPendingSaveModeDto::Revert,
+            },
+            state: p.state.into(),
+            progress: p.progress,
+            message: p.message,
+        }
+    }
+}
+
 /// アイテムの版の一覧（版の順。まだ保存していなければ空）。
 #[tauri::command]
 #[specta::specta]
@@ -1394,6 +1444,20 @@ pub async fn edit_versions(
             .library()
             .db()
             .read(|c| editor::version_list(c, item_id))?;
+        Ok(list.into_iter().map(Into::into).collect())
+    })
+    .await
+}
+
+/// 終わっていない保存のジョブ（古い順。エディタを閉じたあとのカプセル・開き直したエディタの保存のボタン。ADR-189）。
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_pending_saves(
+    state: State<'_, AppState>,
+) -> Result<Vec<EditPendingSaveDto>, AppError> {
+    let lib = state.session()?;
+    blocking(move || {
+        let list = lib.library().db().read(pending_saves)?;
         Ok(list.into_iter().map(Into::into).collect())
     })
     .await

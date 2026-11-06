@@ -83,6 +83,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::edit::edit_cancel_open,
             commands::edit::edit_save,
             commands::edit::edit_versions,
+            commands::edit::edit_pending_saves,
             commands::edit::edit_draft_discard,
             commands::items::library_counts,
             commands::items::items_selection_info,

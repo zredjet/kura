@@ -1477,6 +1477,37 @@ fn rejected_steps_keep_the_previous_provisional() {
     assert_tiles_match(&env, s, c.status.rev, 0, 0, &rendered(&png, &g));
 }
 
+/// 利用者が保存を中止した（一時停止の間に中止した）：失敗の言葉を出さず、中止したと知らせ、保存していない変更のまま次の保存を
+/// 積める（ADR-189）。
+#[test]
+fn canceling_a_save_tells_it_was_canceled_and_allows_the_next_save() {
+    let env = Env::new();
+    let png = sprite_png(24, 20, 13);
+    let id = add_item(&env.lib, &png, 24, 20);
+    let opened = env.open(id);
+    let s = &opened.session;
+    env.step(s, vec![flip("horizontal")]);
+    let started = save(&env.env(), s, SaveMode::Overwrite, None).unwrap();
+    env.jobs.pause(started.job).unwrap();
+    assert_eq!(env.jobs.get(started.job).unwrap().state, JobState::Paused);
+    let paused = view(&env.env(), s, &Viewport::whole()).unwrap();
+    assert_eq!(
+        paused.status.saving,
+        Some(started.job),
+        "一時停止の間も保存は待っている"
+    );
+    assert!(paused.notices.is_empty(), "{:?}", paused.notices);
+    let busy = save(&env.env(), s, SaveMode::Overwrite, None);
+    assert!(matches!(busy, Err(EditorError::Busy(_))), "{busy:?}");
+
+    env.jobs.cancel(started.job).unwrap();
+    let after = view(&env.env(), s, &Viewport::whole()).unwrap();
+    assert_eq!(after.status.saving, None);
+    assert!(after.status.dirty);
+    assert_eq!(after.notices, vec!["保存を中止しました".to_string()]);
+    assert!(save(&env.env(), s, SaveMode::Overwrite, None).is_ok());
+}
+
 /// 同じアイテムの保存が待っている間は、エディタを閉じて開き直しても次の保存を Busy で断る（DB のジョブで見る。土台がずれて
 /// Conflict になるため）。形式を変える手も確定しない。保存の口（`start_save`）も同じで、断るときは文書の部品も置かない。ほかの
 /// アイテムは積める。待っている保存が終われば積める。
