@@ -18,8 +18,8 @@
  *   手の結果を待つ（保存に入るのは Rust の頭）。
  * - 保存の途中でエディタを閉じても保存は続く。終わったら一覧・インスペクタ・サムネイルを読み直し、知らせる（失敗も）。
  * - 上書き・版に戻したあと、大きさが変わり、アイテムに素材の設定（格子・ピボット・ループ点）があれば「新しい大きさに
- *   合っているか確かめてください」と知らせる（設定は変えない。M12 の決定 11）。音声は長さで比べ、試聴のループがあるときだけ
- *   知らせる（M13）。
+ *   合っているか確かめてください」と知らせる（設定は変えない。M12 の決定 11）。音声はフレームとレート（`edit_save` の
+ *   `lengths`）で比べ、試聴のループがあるときだけ知らせる（M13）。
  * - 保存（上書き・別名・閉じる前の保存）が `FormatUnavailable`（この環境では書けない形式。MP3 で ffmpeg がない、など）で
  *   断られたら、書ける形式の一覧（`edit_formats`）を読んで形式を選ぶシートを出す。既定は代わりの既定（音声は Ogg Vorbis、
  *   画像は PNG）。［保存］で選んだ形式を渡して同じ向きで積み直す。一覧を読めなければ今の「保存できませんでした」のシート。
@@ -33,6 +33,7 @@ import { isTauri } from '@tauri-apps/api/core';
 import { ja } from '../../i18n/ja';
 import {
   discardEditDraft,
+  type EditAudioLengthDto,
   type EditFormatChoice,
   type EditSaveModeDto,
   type EditWritableFormatDto,
@@ -60,12 +61,12 @@ import {
   type EditorSave,
   type EditorState,
   hasUnsavedChanges,
+  type ItemSize,
   onEditorResult,
   originalFormatOf,
   refreshEditorView,
   reopenEditorWith,
   type SaveMode,
-  type SizeBefore,
   useEditorStore,
   whenEditorSettled,
 } from './editorStore';
@@ -125,7 +126,8 @@ interface Finished {
   mode: SaveMode;
   title: string | null;
   outcome: SaveOutcome | null;
-  before: SizeBefore | null;
+  before: ItemSize | null;
+  after: ItemSize | null;
 }
 
 /** エディタを閉じたあとも続いている保存（終わったら一覧を読み直し、知らせる）。 */
@@ -134,7 +136,8 @@ interface DetachedSave {
   title: string | null;
   itemId: number | null;
   itemTitle: string;
-  before: SizeBefore | null;
+  before: ItemSize | null;
+  after: ItemSize | null;
   /** 積んだときのライブラリ（ほかのライブラリに替えたあとは知らせない）。 */
   library: string | null;
 }
@@ -151,6 +154,8 @@ let reopening = false;
 let starting = false;
 /** エディタを閉じたあとも続いている保存（ジョブ ID ごと）。 */
 const detached = new Map<number, DetachedSave>();
+/** 版に戻す保存の前後の大きさ（積んだときに覚える。戻し終えて開き直したあとに比べる）。 */
+let revertSizes: Pick<EditorSave, 'before' | 'after'> | null = null;
 
 function setSave(patch: Partial<EditorSave> | null): void {
   const save = useEditorStore.getState().save;
@@ -179,20 +184,26 @@ function currentLibrary(): string | null {
   return useLibraryStore.getState().info?.path ?? null;
 }
 
-/** アイテムの大きさ（画像は幅と高さ、音声は長さ。分からなければ null）。 */
+/**
+ * アイテムの概要から分かる大きさ（画像の幅と高さ。音声の概要の長さは ms に丸めてあるので使わない：`edit_save` の `lengths`）。
+ */
 function sizeOf(
-  item: Pick<ItemSummaryDto, 'kind' | 'width' | 'height' | 'durationMs'> | null | undefined,
-): SizeBefore | null {
-  if (!item) return null;
-  if (hasDuration(item.kind)) {
-    return item.durationMs ? { kind: 'audio', durationMs: item.durationMs } : null;
-  }
+  item: Pick<ItemSummaryDto, 'kind' | 'width' | 'height'> | null | undefined,
+): ItemSize | null {
+  if (!item || hasDuration(item.kind)) return null;
   return item.width && item.height ? { kind: 'image', w: item.width, h: item.height } : null;
 }
 
+/** 音声の長さ（Rust の `EditAudioLengthDto`）の大きさ。 */
+function lengthSize(length: EditAudioLengthDto): ItemSize {
+  return { kind: 'audio', frames: length.frames, rate: length.rate };
+}
+
 /** 大きさが同じか（種類が違えば比べられないので同じとみなす）。 */
-function sameSize(a: SizeBefore, b: SizeBefore): boolean {
-  if (a.kind === 'audio') return b.kind !== 'audio' || a.durationMs === b.durationMs;
+function sameSize(a: ItemSize, b: ItemSize): boolean {
+  if (a.kind === 'audio') {
+    return b.kind !== 'audio' || (a.frames === b.frames && a.rate === b.rate);
+  }
   return b.kind !== 'image' || (a.w === b.w && a.h === b.h);
 }
 
@@ -329,12 +340,15 @@ async function startSave(
     const s = useEditorStore.getState();
     if (editorSession() !== session || s.phase !== 'open') return 'failed';
     if (kind === 'overwrite' && !canSaveEditor(s)) return 'nothing';
-    const before = sizeOf(s.item);
+    const imageSize = sizeOf(s.item);
     const choice = kind === 'revert' ? null : (format ?? forcedFormat());
     attempted = kind === 'revert' ? null : attemptedFormat(choice);
     const started = await saveEdit(session, mode, choice);
     if (editorSession() !== session) return 'failed';
     applyEditorStatus(started.status, started.doc);
+    const before = started.lengths ? lengthSize(started.lengths.before) : imageSize;
+    const after = started.lengths ? lengthSize(started.lengths.after) : null;
+    if (kind === 'revert') revertSizes = { before, after };
     useEditorStore.setState({
       save: {
         job: started.job,
@@ -345,6 +359,7 @@ async function startSave(
         slow: false,
         title,
         before,
+        after,
       },
     });
     closeAfterSave = closeAfter;
@@ -601,13 +616,13 @@ function refreshLibrary(itemIds: readonly number[]): void {
 
 /**
  * 大きさが変わり（`before` と `after` が違う）、アイテムに素材の設定（格子・ピボット・ループ点）があれば、新しい大きさに
- * 合っているか確かめるよう知らせる（設定は変えない。M12 の決定 11）。音声は長さで比べ、試聴のループ（`loopRange`）が
- * あるときだけ知らせる（M13）。
+ * 合っているか確かめるよう知らせる（設定は変えない。M12 の決定 11）。音声はフレームとレートで比べ、試聴のループ
+ * （`loopRange`）があるときだけ知らせる（M13）。
  */
 async function checkAssetFit(
   itemId: number,
-  before: SizeBefore | null,
-  after: SizeBefore | null,
+  before: ItemSize | null,
+  after: ItemSize | null,
 ): Promise<void> {
   if (!before || !after || sameSize(before, after)) return;
   try {
@@ -625,7 +640,7 @@ async function checkAssetFit(
 /** 上書きのあと：エディタのアイテムの概要（大きさ・中身）を新しい今にし、素材の設定が合うかを確かめる。 */
 async function afterOverwrite(
   itemId: number,
-  before: SizeBefore | null,
+  { before, after }: Pick<EditorSave, 'before' | 'after'>,
   session: string | null,
 ): Promise<void> {
   try {
@@ -634,7 +649,7 @@ async function afterOverwrite(
     if (session !== null && editorSession() === session) {
       if (useEditorStore.getState().item?.id === itemId) useEditorStore.setState({ item: fresh });
     }
-    await checkAssetFit(itemId, before, sizeOf(fresh));
+    await checkAssetFit(itemId, before, after ?? sizeOf(fresh));
   } catch (error) {
     console.warn('保存したアイテムを読み直せませんでした', error);
   }
@@ -645,13 +660,15 @@ async function reopenAfterRevert(): Promise<void> {
   const item = useEditorStore.getState().item;
   if (!item || reopening) return;
   reopening = true;
+  const sizes = revertSizes;
+  revertSizes = null;
   try {
     refreshLibrary([item.id]);
     const [fresh] = await getItems([item.id]);
     await closeEditor({ discardDraft: true });
     await reopenEditorWith(fresh ?? item);
     notify(t.reverted);
-    await checkAssetFit(item.id, sizeOf(item), sizeOf(fresh));
+    await checkAssetFit(item.id, sizes?.before ?? null, sizes?.after ?? sizeOf(fresh));
   } catch (error) {
     notify(ja.common.failed(error instanceof Error ? error.message : String(error)));
   } finally {
@@ -700,7 +717,7 @@ function deliver(f: Finished): void {
   if (!announceOther(f.mode, f.title, o, itemId) && f.mode === 'overwrite' && itemId !== null) {
     refreshLibrary([itemId]);
     if (o?.outcome === 'unchanged') notify(t.unchanged);
-    else void afterOverwrite(itemId, f.before, editorSession());
+    else void afterOverwrite(itemId, f, editorSession());
   }
   if (closeAfterSave !== null) {
     const then = closeAfterSave;
@@ -738,7 +755,7 @@ function finishDetached(d: DetachedSave, o: SaveOutcome | null): void {
   }
   notify(d.mode === 'revert' ? t.reverted : t.savedClosed(d.itemTitle));
   void getItems([d.itemId]).then(
-    ([fresh]) => (fresh ? checkAssetFit(fresh.id, d.before, sizeOf(fresh)) : undefined),
+    ([fresh]) => (fresh ? checkAssetFit(fresh.id, d.before, d.after ?? sizeOf(fresh)) : undefined),
     () => undefined,
   );
 }
@@ -754,6 +771,7 @@ useEditorStore.subscribe((now, before) => {
     itemId: before.item?.id ?? null,
     itemTitle: before.item?.title ?? '',
     before: save.before,
+    after: save.after,
     library: currentLibrary(),
   };
   // 終わりを受けて、Rust の取り直しを待っていた保存は、ここで知らせる
@@ -808,6 +826,7 @@ export function onEditorJob(event: JobProgress): void {
       title: save.title,
       outcome: parseSaveResult(event.resultJson),
       before: save.before,
+      after: save.after,
     };
     // Rust がもう取り直していれば（ほかの要求で）すぐ知らせる。でなければ取り直しを頼み、その結果のあとに知らせる
     if (useEditorStore.getState().status?.saving !== save.job) deliver(finished);

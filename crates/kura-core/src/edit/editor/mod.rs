@@ -391,6 +391,20 @@ pub enum SaveMode {
     },
 }
 
+/// 音声の長さ（フレームと標本化周波数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioLength {
+    pub frames: u64,
+    pub rate: u32,
+}
+
+/// 保存の前（アイテムの今）と後の音声の長さ（文書の出力の形。素材の設定が新しい長さに合うかをフロントが比べる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioLengths {
+    pub before: AudioLength,
+    pub after: AudioLength,
+}
+
 /// 保存を積んだ結果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaveStarted {
@@ -398,6 +412,8 @@ pub struct SaveStarted {
     pub status: Status,
     /// 出力の形式を変えたときの文書の差分（変えなければ空）。
     pub doc: DocDelta,
+    /// 音声の上書き・版に戻すの前後の長さ（画像・別名は None。文書を描けなくても None）。
+    pub lengths: Option<AudioLengths>,
 }
 
 /// スポイトで拾った 1 画素。
@@ -1451,6 +1467,7 @@ pub fn save(
             return Err(EditorError::FormatUnavailable { format, fallback });
         }
     }
+    let lengths = save_lengths(env, &editor, st, &mode);
     let rev = st.session.head_rev();
     let (action, kind) = match mode {
         SaveMode::Overwrite => (
@@ -1492,6 +1509,69 @@ pub fn save(
         job,
         status: Editor::status(st),
         doc: Editor::report_doc(st),
+        lengths,
+    })
+}
+
+/// 版 `version` の文書（版の行がない・文書のない版は空の文書）。
+fn version_graph(
+    env: &EditorEnv<'_>,
+    runtime: &EngineRuntime,
+    item_id: i64,
+    version: i64,
+) -> Result<Graph, EditorError> {
+    let db = env.library.db();
+    let v = db.read(|c| versions::get(c, item_id, version))?;
+    match v.and_then(|v| v.doc_id) {
+        Some(doc_id) => {
+            let bytes = db.read(|c| store::load_doc_bytes(c, doc_id))?;
+            runtime
+                .preview(|e| e.load(&bytes))
+                .map_err(|e| EditorError::from_engine("版の文書を読めません", e))
+        }
+        None => Ok(Graph::new_single()),
+    }
+}
+
+/// 文書 `graph` の最初の出力の音声の長さ（音声でない・描けなければ None）。
+fn audio_length(editor: &Editor, st: &State, graph: &Graph) -> Option<AudioLength> {
+    let plan = editor
+        .runtime
+        .preview(|e| e.compile(graph, &st.shapes))
+        .ok()?;
+    match plan.output_shapes().first()?.1 {
+        Shape::Audio { rate, frames, .. } => Some(AudioLength {
+            frames: frames.max(),
+            rate,
+        }),
+        Shape::Image { .. } | Shape::Frames { .. } => None,
+    }
+}
+
+/// 音声の上書き・版に戻すの前（土台の版）と後（確定した頭・戻す先の版）の長さ（[`SaveStarted::lengths`]）。アイテムの概要の
+/// `duration_ms` では比べられない（レート変換・1 ms 未満の切り詰めで同じになる）。素材の欄の `kura.read` の長さは解析の
+/// あとにしか新しくならないので、前の値にも使えない。どちらも文書を今の入力の形で compile して求める（描かない）。
+fn save_lengths(
+    env: &EditorEnv<'_>,
+    editor: &Editor,
+    st: &State,
+    mode: &SaveMode,
+) -> Option<AudioLengths> {
+    st.audio.as_ref()?;
+    let of_version = |version: i64| {
+        let graph = version_graph(env, &editor.runtime, editor.item_id, version)
+            .map_err(|err| tracing::warn!(%err, version, "版の長さを求められません"))
+            .ok()?;
+        audio_length(editor, st, &graph)
+    };
+    let after = match mode {
+        SaveMode::Overwrite => audio_length(editor, st, &st.session.head().to_graph())?,
+        SaveMode::Revert { to } => of_version(*to)?,
+        SaveMode::SaveAs { .. } => return None,
+    };
+    Some(AudioLengths {
+        before: of_version(st.base.version)?,
+        after,
     })
 }
 
@@ -1594,16 +1674,7 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             (opened.graph, opened.base)
         }
         _ => {
-            let v = db.read(|c| versions::get(c, item_id, head.version))?;
-            let graph = match v.and_then(|v| v.doc_id) {
-                Some(doc_id) => {
-                    let bytes = db.read(|c| store::load_doc_bytes(c, doc_id))?;
-                    runtime
-                        .preview(|e| e.load(&bytes))
-                        .map_err(|e| EditorError::from_engine("頭の文書を読めません", e))?
-                }
-                None => Graph::new_single(),
-            };
+            let graph = version_graph(env, &runtime, item_id, head.version)?;
             (
                 graph,
                 Base {

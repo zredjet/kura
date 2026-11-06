@@ -108,9 +108,12 @@ export type EditorSheet =
 /** ジョブの状態。 */
 type JobStateDto = JobProgress['state'];
 
-/** 保存する前のアイテムの大きさ（上書きで変わったかを見る。画像は幅と高さ、音声は長さ）。 */
-export type SizeBefore =
-  { kind: 'image'; w: number; h: number } | { kind: 'audio'; durationMs: number };
+/**
+ * アイテムの大きさ（上書き・版に戻すで変わったかを見る）。画像は幅と高さ、音声はフレームとレート（ms の長さは丸めるので、
+ * レート変換や 1 ms 未満の切り詰めで前後が同じになる。素材の設定の区間はフレームで持つ）。
+ */
+export type ItemSize =
+  { kind: 'image'; w: number; h: number } | { kind: 'audio'; frames: number; rate: number };
 
 /** 動いている保存のジョブ（ボタンの中の進捗・終わったときの知らせ）。 */
 export interface EditorSave {
@@ -125,7 +128,12 @@ export interface EditorSave {
   /** 別名で保存の名前。 */
   title: string | null;
   /** 積んだときのアイテム（今）の大きさ（素材の設定が新しい大きさに合うかを知らせる）。 */
-  before: SizeBefore | null;
+  before: ItemSize | null;
+  /**
+   * 積んだときに分かる保存のあとの大きさ（音声。`edit_save` の `lengths`）。null なら、終わってからアイテムの概要で見る
+   * （画像）。
+   */
+  after: ItemSize | null;
 }
 
 /** 失敗（開けなかった・表示できなかった・要求が通らなかった）。 */

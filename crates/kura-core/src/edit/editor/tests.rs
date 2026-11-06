@@ -1029,6 +1029,162 @@ fn save_as_marks_saved_and_revert_requires_reopening() {
     assert!(matches!(r, Err(EditorError::Conflict(_))), "{r:?}");
 }
 
+/// 音声のアイテム（雑音の WAV）のファイルを置いて行を入れる。
+fn add_wav(lib: &Library, rate: u32, frames: u64) -> i64 {
+    let value = InputGen::AudioNoise {
+        rate,
+        channels: 1,
+        frames,
+        seed: 7,
+    }
+    .generate()
+    .unwrap();
+    let bytes = CodecSet::pinned()
+        .encode_bytes(&value, "wav", &json!({}), &NoMonitor)
+        .unwrap()
+        .0;
+    let hash = *blake3::hash(&bytes).as_bytes();
+    let path = lib.layout().content_path(&hash, "wav");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let size = bytes.len() as i64;
+    lib.db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO items (hash, ext, kind, mime, size_bytes, title, original_name, original_path,
+                                    source_site, imported_at, updated_at, thumb_state, proxy_state, analysis_state)
+                 VALUES (?1, 'wav', 'audio', 'audio/wav', ?2, '音', '音.wav', '/src/音.wav', 'local', 1, 1,
+                         'ready', 'not_needed', 'ready')",
+                params![&hash[..], size],
+            )?;
+            Ok(tx.last_insert_rowid())
+        })
+        .unwrap()
+}
+
+/// 音声の操作を足す手。
+fn audio_op(at: usize, op: &str, params: serde_json::Value) -> Step {
+    Step::Commit {
+        edit: Edit::AddNode {
+            at,
+            op: op.into(),
+            v: 1,
+            params,
+            seed: None,
+            extra_inputs: Vec::new(),
+        },
+        mode: CommitMode::Step,
+    }
+}
+
+/// 音声の保存は、上書き・版に戻すの前（今）と後の長さをフレームとレートで返す（「長さが変わりました」の比べ。ms では 1 ms 未満の
+/// 切り詰めもレート変換も同じになる）。前は確定した頭ではなく今（土台の版）で、保存を終えると新しい今になる。
+#[test]
+fn audio_saves_report_the_lengths_before_and_after() {
+    let length = |frames, rate| AudioLength { frames, rate };
+    let env = Env::new();
+    let id = add_wav(&env.lib, 48_000, 96_000);
+    let opened = env.open_with(id, Viewport::audio_idle(), false);
+    let s = &opened.session;
+    let vp = Viewport::audio_idle();
+
+    // 1 ms 未満の切り詰め（どちらも 2000 ms）
+    step(
+        &env.env(),
+        s,
+        vec![audio_op(
+            0,
+            "audio.trim",
+            json!({ "start": 0, "end": 95_990 }),
+        )],
+        &vp,
+    )
+    .unwrap();
+    let trimmed = save(&env.env(), s, SaveMode::Overwrite, None).unwrap();
+    assert_eq!(
+        trimmed.lengths,
+        Some(AudioLengths {
+            before: length(96_000, 48_000),
+            after: length(95_990, 48_000),
+        })
+    );
+    env.start_jobs();
+    let after = view(&env.env(), s, &vp).unwrap();
+    assert!(!after.status.dirty, "{:?}", after.notices);
+
+    // レート変換（今は切り詰めたあとの長さ。ms はほとんど変わらない）
+    step(
+        &env.env(),
+        s,
+        vec![audio_op(1, "audio.resample", json!({ "rate": 44_100 }))],
+        &vp,
+    )
+    .unwrap();
+    let resampled = save(&env.env(), s, SaveMode::Overwrite, None).unwrap();
+    assert_eq!(
+        resampled.lengths,
+        Some(AudioLengths {
+            before: length(95_990, 48_000),
+            after: length(88_191, 44_100),
+        })
+    );
+    assert!(env.jobs.wait_idle(WAIT));
+    let after = view(&env.env(), s, &vp).unwrap();
+    assert!(!after.status.dirty, "{:?}", after.notices);
+
+    // 別名は前後を比べない（新しいアイテム）
+    let copy = save(
+        &env.env(),
+        s,
+        SaveMode::SaveAs {
+            title: "写し".into(),
+            stem: "写し".into(),
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(copy.lengths, None);
+    assert!(env.jobs.wait_idle(WAIT));
+    view(&env.env(), s, &vp).unwrap();
+
+    // 版に戻す：後は戻す先の版の長さ（途中の版も、元も）
+    let reverted = save(&env.env(), s, SaveMode::Revert { to: 1 }, None).unwrap();
+    assert_eq!(
+        reverted.lengths,
+        Some(AudioLengths {
+            before: length(88_191, 44_100),
+            after: length(95_990, 48_000),
+        })
+    );
+    assert!(env.jobs.wait_idle(WAIT));
+    let opened = env.open_with(id, Viewport::audio_idle(), false);
+    let to_original = save(
+        &env.env(),
+        &opened.session,
+        SaveMode::Revert { to: 0 },
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        to_original.lengths,
+        Some(AudioLengths {
+            before: length(95_990, 48_000),
+            after: length(96_000, 48_000),
+        })
+    );
+}
+
+/// 画像の保存は長さを返さない（大きさはアイテムの概要で比べる）。
+#[test]
+fn image_saves_do_not_report_lengths() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(24, 20, 13), 24, 20);
+    let opened = env.open(id);
+    env.step(&opened.session, vec![flip("horizontal")]);
+    let started = save(&env.env(), &opened.session, SaveMode::Overwrite, None).unwrap();
+    assert_eq!(started.lengths, None);
+}
+
 /// 新しい要求に取って代わられた描画は Superseded（当てた手は残る）。
 #[test]
 fn superseded_renders_are_reported() {

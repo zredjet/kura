@@ -30,6 +30,7 @@ import { AUDIO_FORMATS } from './audio/audioFormats';
 import {
   answerUnsaved,
   askRestore,
+  confirmRevert,
   confirmWarnings,
   defaultFormatChoice,
   dismissSheet,
@@ -224,7 +225,19 @@ function started() {
     job: 9,
     status: status({ saving: 9 }),
     doc: { base: 2, order: [], nodes: [], outputs: null },
+    lengths: null,
   };
+}
+
+/** 音声の保存を積んだ結果（`edit_save` の保存の前後の長さ。[フレーム, レート]）。 */
+function savingLengths(before: [number, number], after: [number, number]) {
+  vi.mocked(saveEdit).mockResolvedValue({
+    ...started(),
+    lengths: {
+      before: { frames: before[0], rate: before[1] },
+      after: { frames: after[0], rate: after[1] },
+    },
+  } as Awaited<ReturnType<typeof saveEdit>>);
 }
 
 /** 保存のジョブのイベント。 */
@@ -1645,9 +1658,13 @@ describe('素材の設定の知らせ（M12 の決定 11）', () => {
 
   it('音声：上書きで長さが変わり、試聴のループがあれば、新しい長さに合うか確かめるよう知らせる（格子などは見ない）', async () => {
     await openAudioDirty();
+    savingLengths([96_000, 48_000], [72_000, 48_000]);
     requestSave();
     await flush();
-    expect(useEditorStore.getState().save?.before).toEqual({ kind: 'audio', durationMs: 2000 });
+    expect(useEditorStore.getState().save).toMatchObject({
+      before: { kind: 'audio', frames: 96_000, rate: 48_000 },
+      after: { kind: 'audio', frames: 72_000, rate: 48_000 },
+    });
     savedRefresh();
     vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs: 1500 })]);
     vi.mocked(getAsset).mockResolvedValue(asset({ loopRange: { start: 0, end: 48_000 } }));
@@ -1660,6 +1677,7 @@ describe('素材の設定の知らせ（M12 の決定 11）', () => {
 
     // 長さが変わっても、試聴のループがなければ知らせない（格子・ピボットは音声に効かない）
     act(() => useEditorStore.setState({ status: status({ dirty: true }) }));
+    savingLengths([72_000, 48_000], [48_000, 48_000]);
     requestSave();
     await flush();
     savedRefresh();
@@ -1677,6 +1695,7 @@ describe('素材の設定の知らせ（M12 の決定 11）', () => {
 
     // 長さが同じなら素材の設定を読まない
     act(() => useEditorStore.setState({ status: status({ dirty: true }) }));
+    savingLengths([48_000, 48_000], [48_000, 48_000]);
     requestSave();
     await flush();
     savedRefresh();
@@ -1685,6 +1704,153 @@ describe('素材の設定の知らせ（M12 の決定 11）', () => {
     await flush();
     await flush();
     expect(getAsset).toHaveBeenCalledTimes(2);
+  });
+
+  // ms の長さ（概要の durationMs）は丸めるので、前後が同じでも設定の区間の意味は変わる
+  describe('音声の長さはフレームとレートで比べる', () => {
+    const looping = () =>
+      vi.mocked(getAsset).mockResolvedValue(asset({ loopRange: { start: 96_000, end: 192_000 } }));
+
+    /** 上書きする（概要の長さは前後とも `durationMs`）。 */
+    async function overwrite(
+      before: [number, number],
+      after: [number, number],
+      durationMs: number,
+    ) {
+      await openAudioDirty({ durationMs });
+      savingLengths(before, after);
+      requestSave();
+      await flush();
+      savedRefresh();
+      vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs })]);
+      looping();
+      act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+      await flush();
+      await flush();
+    }
+
+    it('レート変換：480,000@48k → 441,000@44.1k（どちらも 10000 ms）でも知らせる', async () => {
+      await overwrite([480_000, 48_000], [441_000, 44_100], 10_000);
+      expect(getAsset).toHaveBeenCalledWith(7);
+      expect(useNoticeStore.getState().message).toBe(t.audio.assetSettingsCheckAudio);
+    });
+
+    it('1 ms 未満の切り詰め：96,000 → 95,990（どちらも 2000 ms）でも知らせる', async () => {
+      await overwrite([96_000, 48_000], [95_990, 48_000], 2000);
+      expect(getAsset).toHaveBeenCalledWith(7);
+      expect(useNoticeStore.getState().message).toBe(t.audio.assetSettingsCheckAudio);
+    });
+
+    it('フレームが同じでレートだけ変わっても知らせる', async () => {
+      await overwrite([96_000, 48_000], [96_000, 44_100], 2000);
+      expect(useNoticeStore.getState().message).toBe(t.audio.assetSettingsCheckAudio);
+    });
+
+    it('フレームとレートが同じなら、素材の設定を読まない', async () => {
+      await overwrite([96_000, 48_000], [96_000, 48_000], 2000);
+      expect(getAsset).not.toHaveBeenCalled();
+      expect(useNoticeStore.getState().message).toBe('保存しました');
+    });
+
+    it('前後の長さが分からなければ（文書を描けない）、ms では比べず知らせない', async () => {
+      await openAudioDirty({ durationMs: 2000 });
+      requestSave();
+      await flush();
+      expect(useEditorStore.getState().save).toMatchObject({ before: null, after: null });
+      savedRefresh();
+      vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs: 1500 })]);
+      looping();
+      act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+      await flush();
+      await flush();
+      expect(getAsset).not.toHaveBeenCalled();
+    });
+
+    it('版に戻す：ms が同じでもフレームが変われば、開き直したあとに知らせる', async () => {
+      await openAudioDirty({ durationMs: 2000 });
+      savingLengths([95_990, 48_000], [96_000, 48_000]);
+      act(() => confirmRevert(0));
+      await flush();
+      expect(saveEdit).toHaveBeenCalledWith('aa01', { type: 'revert', to: 0 }, null);
+      vi.mocked(viewEdit).mockResolvedValue(
+        result({
+          status: status({ dirty: false, saving: null, needsReopen: true }),
+          doc: { base: 2, order: [], nodes: [], outputs: null },
+          view: { type: 'shown', view: viewDto() },
+        }),
+      );
+      vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs: 2000 })]);
+      vi.mocked(openEdit).mockClear();
+      vi.mocked(openEdit).mockResolvedValue(
+        opened({}, { status: status({ dirty: false }) }, 'wav'),
+      );
+      looping();
+      act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+      await flush();
+      await flush();
+      await flush();
+      expect(openEdit).toHaveBeenCalledTimes(1);
+      expect(getAsset).toHaveBeenCalledWith(7);
+      expect(useNoticeStore.getState().message).toBe(t.audio.assetSettingsCheckAudio);
+    });
+
+    it('版に戻す：フレームとレートが同じなら知らせない', async () => {
+      await openAudioDirty({ durationMs: 2000 });
+      savingLengths([96_000, 48_000], [96_000, 48_000]);
+      act(() => confirmRevert(0));
+      await flush();
+      vi.mocked(viewEdit).mockResolvedValue(
+        result({
+          status: status({ dirty: false, saving: null, needsReopen: true }),
+          doc: { base: 2, order: [], nodes: [], outputs: null },
+          view: { type: 'shown', view: viewDto() },
+        }),
+      );
+      vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs: 2000 })]);
+      vi.mocked(openEdit).mockClear();
+      vi.mocked(openEdit).mockResolvedValue(
+        opened({}, { status: status({ dirty: false }) }, 'wav'),
+      );
+      looping();
+      act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+      await flush();
+      await flush();
+      await flush();
+      expect(openEdit).toHaveBeenCalledTimes(1);
+      expect(getAsset).not.toHaveBeenCalled();
+      expect(useNoticeStore.getState().message).toBe(t.reverted);
+    });
+
+    it('閉じたあとの保存：ms が同じでもフレームが変われば知らせる', async () => {
+      await openAudioDirty({ durationMs: 10_000 });
+      savingLengths([480_000, 48_000], [441_000, 44_100]);
+      requestSave();
+      await flush();
+      await act(() => requestCloseEditor());
+      expect(useEditorStore.getState().phase).toBe('closed');
+      vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs: 10_000 })]);
+      looping();
+      act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+      await flush();
+      await flush();
+      expect(getAsset).toHaveBeenCalledWith(7);
+      expect(useNoticeStore.getState().message).toBe(t.audio.assetSettingsCheckAudio);
+    });
+
+    it('閉じたあとの保存：フレームとレートが同じなら知らせない', async () => {
+      await openAudioDirty({ durationMs: 2000 });
+      savingLengths([96_000, 48_000], [96_000, 48_000]);
+      requestSave();
+      await flush();
+      await act(() => requestCloseEditor());
+      vi.mocked(getItems).mockResolvedValue([audioItem({ durationMs: 2000 })]);
+      looping();
+      act(() => onEditorJob(event('done', { resultJson: '{"outcome":"saved","itemId":7}' })));
+      await flush();
+      await flush();
+      expect(getAsset).not.toHaveBeenCalled();
+      expect(useNoticeStore.getState().message).toBe(t.savedClosed('loop'));
+    });
   });
 });
 

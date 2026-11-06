@@ -828,6 +828,18 @@ export type DuplicatePolicyDto = "addMemberships" | "ignore";
  */
 export type Edit = Edit_Serialize | Edit_Deserialize;
 
+/**  音声の長さ（フレームと標本化周波数）。 */
+export type EditAudioLengthDto = {
+	frames: number,
+	rate: number,
+};
+
+/**  保存の前（アイテムの今）と後の音声の長さ。 */
+export type EditAudioLengthsDto = {
+	before: EditAudioLengthDto,
+	after: EditAudioLengthDto,
+};
+
 /**  ノードの引数の位置を出力のフレームに写したもの。 */
 export type EditAudioMarksDto = 
 /**  切り詰めの枠（このノードを外して入力を出しているときの位置）。 */
@@ -1197,6 +1209,11 @@ export type EditSaveStartedDto_Deserialize = {
 	status: EditStatusDto,
 	/**  出力の形式を変えたときの文書の差分。 */
 	doc: EditDocDeltaDto_Deserialize,
+	/**
+	 *  音声の上書き・版に戻すの前後の長さ（素材の設定が新しい長さに合うかを比べる。ms では 1 ms 未満の切り詰めもレート変換も
+	 *  同じになる）。画像・別名は null。文書を描けなくても null。
+	 */
+	lengths: EditAudioLengthsDto | null,
 };
 
 /**  保存を積んだ結果。 */
@@ -1206,6 +1223,11 @@ export type EditSaveStartedDto_Serialize = {
 	status: EditStatusDto,
 	/**  出力の形式を変えたときの文書の差分。 */
 	doc: EditDocDeltaDto_Serialize,
+	/**
+	 *  音声の上書き・版に戻すの前後の長さ（素材の設定が新しい長さに合うかを比べる。ms では 1 ms 未満の切り詰めもレート変換も
+	 *  同じになる）。画像・別名は null。文書を描けなくても null。
+	 */
+	lengths: EditAudioLengthsDto | null,
 };
 
 /**  ゼロ交差に寄せた位置。 */

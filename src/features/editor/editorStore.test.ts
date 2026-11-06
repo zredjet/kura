@@ -483,6 +483,7 @@ describe('右パネル', () => {
       slow: false,
       title: null,
       before: null,
+      after: null,
     };
     expect(hasUnsavedChanges({ status: st, save: null })).toBe(true);
     expect(hasUnsavedChanges({ status: st, save })).toBe(false);

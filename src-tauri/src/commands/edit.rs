@@ -19,10 +19,11 @@ use kura_core::edit::editor::audio::peaks::PeaksInfo;
 use kura_core::edit::editor::audio::timeline::SourcePiece;
 use kura_core::edit::editor::formats::EditFormats;
 use kura_core::edit::editor::{
-    self, AudioSourceInfo, AudioViewInfo, AudioViewport, ChangedSpans, ChangedTiles, DocDelta,
-    DraftInfo, EditorEnv, EditorError, FrameInfo, ImageViewInfo, ImageViewport, NodeSummary,
-    OpenRequest, Opened, Problem, ProblemCode, Rejected, Sampled, SaveMode, SaveStarted,
-    SourceInfo, Status, Step, StepOutcome, VersionSummary, ViewInfo, ViewOutcome, Viewport,
+    self, AudioLength, AudioSourceInfo, AudioViewInfo, AudioViewport, ChangedSpans, ChangedTiles,
+    DocDelta, DraftInfo, EditorEnv, EditorError, FrameInfo, ImageViewInfo, ImageViewport,
+    NodeSummary, OpenRequest, Opened, Problem, ProblemCode, Rejected, Sampled, SaveMode,
+    SaveStarted, SourceInfo, Status, Step, StepOutcome, VersionSummary, ViewInfo, ViewOutcome,
+    Viewport,
 };
 use kura_engine::Issue;
 use kura_engine::doc::{FormatChoice, NodeId, OutputSpec};
@@ -1007,6 +1008,29 @@ impl From<Sampled> for EditSampleDto {
     }
 }
 
+/// 音声の長さ（フレームと標本化周波数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+pub struct EditAudioLengthDto {
+    pub frames: u64,
+    pub rate: u32,
+}
+
+impl From<AudioLength> for EditAudioLengthDto {
+    fn from(l: AudioLength) -> Self {
+        Self {
+            frames: l.frames,
+            rate: l.rate,
+        }
+    }
+}
+
+/// 保存の前（アイテムの今）と後の音声の長さ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+pub struct EditAudioLengthsDto {
+    pub before: EditAudioLengthDto,
+    pub after: EditAudioLengthDto,
+}
+
 /// 保存を積んだ結果。
 #[derive(Debug, Clone, PartialEq, Serialize, Type)]
 pub struct EditSaveStartedDto {
@@ -1015,6 +1039,9 @@ pub struct EditSaveStartedDto {
     pub status: EditStatusDto,
     /// 出力の形式を変えたときの文書の差分。
     pub doc: EditDocDeltaDto,
+    /// 音声の上書き・版に戻すの前後の長さ（素材の設定が新しい長さに合うかを比べる。ms では 1 ms 未満の切り詰めもレート変換も
+    /// 同じになる）。画像・別名は null。文書を描けなくても null。
+    pub lengths: Option<EditAudioLengthsDto>,
 }
 
 impl From<SaveStarted> for EditSaveStartedDto {
@@ -1023,6 +1050,10 @@ impl From<SaveStarted> for EditSaveStartedDto {
             job: s.job,
             status: s.status.into(),
             doc: s.doc.into(),
+            lengths: s.lengths.map(|l| EditAudioLengthsDto {
+                before: l.before.into(),
+                after: l.after.into(),
+            }),
         }
     }
 }

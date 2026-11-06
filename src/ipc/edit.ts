@@ -11,6 +11,7 @@ import {
   commands,
   EDIT_OPS,
   type CommitMode,
+  type EditAudioLengthDto,
   type EditAudioMarksDto,
   type EditAudioNodeDto,
   type EditAudioSourceDto,
@@ -73,6 +74,7 @@ export const EDIT_CATALOG: readonly OpDescriptor[] = EDIT_OPS as unknown as read
 
 export type {
   CommitMode,
+  EditAudioLengthDto,
   EditAudioMarksDto,
   EditAudioNodeDto,
   EditAudioSourceDto,
