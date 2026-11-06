@@ -1342,12 +1342,15 @@ impl EditHandler {
         d: Decided<'_>,
     ) -> Result<Flow<(Prepared, Staging)>> {
         let mut work: Option<crate::edit::work_pcm::WorkHandle> = None;
+        let runtime = d.runtime.clone();
         let r = self.prepare_stream_in(ctx, d, &mut work);
         if matches!(r, Ok(Flow::Stop(JobEnd::Paused)))
             && let Some(w) = work.as_mut()
         {
             w.retain_on_drop();
         }
+        // 窓ごとに確保しては捨てたチャンクの領域を OS へ返させる（libmalloc が抱える分。終わり方によらない。段 7）
+        runtime.relieve_memory("音声の保存の終わり");
         r
     }
 

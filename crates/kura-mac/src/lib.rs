@@ -31,7 +31,7 @@ pub mod fonts;
 mod process;
 mod thumbs;
 
-pub use alloc::ReturningAllocator;
+pub use alloc::{ReturningAllocator, pressure_relief};
 pub use browser::{
     SnapshotDone, SnapshotInfo, find_chrome, frontmost_pid, play_capture_sound, snapshot_webview,
 };

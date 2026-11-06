@@ -1214,6 +1214,25 @@ mod tests {
     /// 子が種類ごとに当てる手の数。
     const EDITOR_STEPS: usize = 8;
 
+    /// エディタの子のエンジンの部品：bench edit の音声のエディタと同じもの（`bench_edit::audio::AudioFactory`）に、アプリと
+    /// 同じ空いた確保の領域を返させる口（kura-mac の `pressure_relief`。M13 段 7）を足したもの。
+    struct EditorFactory(crate::bench_edit::audio::AudioFactory);
+
+    impl kura_core::edit::EngineFactory for EditorFactory {
+        fn runtime_config(&self) -> kura_core::edit::RuntimeConfig {
+            kura_core::edit::RuntimeConfig {
+                relief: Some(kura_core::edit::MemoryRelief::new(
+                    kura_mac::pressure_relief,
+                )),
+                ..self.0.runtime_config()
+            }
+        }
+
+        fn codecs(&self, work_dir: &Path) -> CodecSet {
+            self.0.codecs(work_dir)
+        }
+    }
+
     /// 子プロセス（音声のエディタ）：`base` はライブラリを開いて実行の場とコーデックの組を作るだけ。`run` は 60 分の WAV を
     /// 区間（48 チャンク）の表示で開き、文書（trim → fade → gain → set_loop）を作って裏の仕事（波形の段・ラウドネス）を
     /// 済ませ、フェードインの終わり・trim の終わり・ループ点・gain の手を種類ごとに当て、gain のあとの裏の仕事を済ませて
@@ -1233,12 +1252,15 @@ mod tests {
         }
         let lib = std::path::PathBuf::from(std::env::var(FILE_ENV).unwrap());
         let item: i64 = std::env::var(ITEM_ENV).unwrap().parse().unwrap();
-        let session = kura_core::library::LibrarySession::open(
-            &lib,
-            audio::quiet(),
-            audio::services(TASKS, TASKS, None),
-        )
-        .unwrap();
+        let services = kura_core::library::Services::new(kura_mac::media_backend()).with_engine(
+            std::sync::Arc::new(EditorFactory(audio::AudioFactory {
+                preview: TASKS,
+                bulk: TASKS,
+                budget: None,
+            })),
+        );
+        let session =
+            kura_core::library::LibrarySession::open(&lib, audio::quiet(), services).unwrap();
         session.wait_ready();
         crate::bench_app::settle(&session).unwrap();
         let engine = session.engine().unwrap();
@@ -1279,6 +1301,7 @@ mod tests {
         let peak = ed.take_admitted_peak().unwrap();
         let held = ed.held;
         let (restored, _, work_files) = ed.close().unwrap();
+        let relief = engine.runtime().unwrap().take_relief_stats();
         session.close();
         println!(
             "{RESULT_MARK}{}",
@@ -1297,6 +1320,10 @@ mod tests {
                 "work_files": work_files,
                 "seconds": t.elapsed().as_secs_f64(),
                 "heap_peaks": heap,
+                "relief_calls": relief.calls,
+                "relief_bytes": relief.bytes,
+                "relief_total_us": relief.total.as_micros() as u64,
+                "relief_max_us": relief.max.as_micros() as u64,
             })
         );
     }
@@ -1406,6 +1433,13 @@ mod tests {
             })
             .unwrap_or_default();
         let heap_max = heap.iter().map(|(_, b)| *b).max().unwrap_or(0);
+        eprintln!(
+            "{EDITOR_CASE}: 空いた確保の領域を返させる口 {} 回・返した {:.1} MiB・時間の和 {} µs・最大 {} µs",
+            got["relief_calls"].as_u64().unwrap_or(0),
+            mib(got["relief_bytes"].as_u64().unwrap_or(0)),
+            got["relief_total_us"].as_u64().unwrap_or(0),
+            got["relief_max_us"].as_u64().unwrap_or(0),
+        );
         eprintln!(
             "{EDITOR_CASE}: 生きている確保の山 {:.1} MiB（{}）・通しとの差 {:.1} MiB",
             mib(heap_max),

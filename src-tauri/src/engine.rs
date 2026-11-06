@@ -4,9 +4,10 @@
 use std::path::Path;
 
 use kura_core::codec_ext::svg_worker::{self, WorkerCommand};
-use kura_core::edit::{CodecSet, EngineFactory, RuntimeConfig};
+use kura_core::edit::{CodecSet, EngineFactory, MemoryRelief, RuntimeConfig};
 
-/// 物理メモリは kura-mac の `physical_memory`、コーデックの組は固定の段（SVG の文字はシステムのフォントを mmap して渡す）→
+/// 物理メモリは kura-mac の `physical_memory`、空いた確保の領域を OS へ返させる口は kura-mac の `pressure_relief`（M13 段 7）、
+/// コーデックの組は固定の段（SVG の文字はシステムのフォントを mmap して渡す）→
 /// macOS（ImageIO・AudioToolbox）→ ffmpeg（設定で指定した場所を含めて探す）。SVG は、アプリ自身を `--kura-svg-worker` 付きで
 /// 起動した別のプロセスで読み、時間の上限で止める（決定 23。`main.rs` が働き手の入口）。働き手の実行ファイルは起動のたびに
 /// kura-mac の `current_executable`（今の場所。動いているアプリを移す・改名しても追う）で求める。
@@ -16,6 +17,7 @@ impl EngineFactory for MacEngineFactory {
     fn runtime_config(&self) -> RuntimeConfig {
         RuntimeConfig {
             physical_memory: kura_mac::physical_memory(),
+            relief: Some(MemoryRelief::new(kura_mac::pressure_relief)),
             ..RuntimeConfig::default()
         }
     }
@@ -41,6 +43,10 @@ mod tests {
         let config = MacEngineFactory.runtime_config();
         assert_eq!(config.physical_memory, kura_mac::physical_memory());
         assert!(config.physical_memory.is_some());
+        assert!(
+            config.relief.is_some(),
+            "空いた確保の領域を返させる口を渡す"
+        );
         let dir = tempfile::tempdir().unwrap();
         let codecs = MacEngineFactory.codecs(&dir.path().join("engine"));
         let heic = codecs

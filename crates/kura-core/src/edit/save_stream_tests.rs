@@ -1416,3 +1416,22 @@ fn s22_editor_save_refuses_mp3_without_ffmpeg() {
     assert_eq!(head(&env.lib, item).ext, "mp3");
     assert_consistent(&env.lib);
 }
+
+/// 段 7（F15 の申し送り 1）：流して書く音声の保存の終わりに、空いた確保の領域を OS へ返させる口（`RuntimeConfig::relief`）を
+/// 呼ぶ。
+#[test]
+fn streamed_audio_save_relieves_memory_at_the_end() {
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+
+    let calls = Arc::new(AtomicU64::new(0));
+    let env = Env::with(
+        FakeEngineFactory::default().with_relief(calls.clone()),
+        None,
+    );
+    let original = noise_file(&CodecSet::pinned(), "wav", 2, 3 * 65_536 + 77, 71);
+    let (item, _) = add_audio(&env.lib, &original, "wav", "wav");
+    assert_eq!(calls.load(SeqCst), 0);
+    let record = env.overwrite(item, audio_doc(-2.0, None));
+    assert_done(&record);
+    assert_eq!(calls.load(SeqCst), 1, "保存の終わりに 1 回");
+}

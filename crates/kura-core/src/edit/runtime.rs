@@ -9,14 +9,19 @@
 //!   輪のスレッド）で行う。ワーカーの中で待つと、ほかの描画のワーカーを塞ぐ（試作で 2.3〜3 倍遅い）。閉包はプールの中から
 //!   入れない（debug のビルドで止める）。
 //! - 物理メモリは設定の値で受け取る（kura-mac の `physical_memory`。kura-core は OS を知らない）。
+//! - 空いた確保の領域を OS へ返させる口も設定で受け取る（[`MemoryRelief`]。kura-mac の `pressure_relief`。M13 段 7）。音声の
+//!   チャンク（1 チャンネル 256 KiB）は確保器が OS へすぐ返す大きさ（1 MiB）より小さく、解放した領域を libmalloc が抱えるので、
+//!   エディタの裏の仕事の区切り・エディタを閉じるとき・音声の保存の終わりに [`EngineRuntime::relieve_memory`] で返させる。
+//!   ないとき（Linux・テスト）は何もしない。
 //! - 確保の口：一括は [`EngineRuntime::admit_bulk`]（見積もって、全体を超えれば Limit、収まれば待つ）、エディタは
 //!   [`EngineRuntime::open_cache`] でキャッシュの分を確保し、描くたびに [`EngineRuntime::admit_preview`]（待たない。足りなければ
 //!   キャッシュを追い出す）。見積もりの並列の数は、描くプールのスレッドの数。エディタを開いている間の取り置き
 //!   （`MemoryBudget::set_reserved`。既定は `budget::default_reserved`）は呼び手（M12 のエディタ）が決める。
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use kura_engine::audio::source::{ReadMode, with_read_mode};
 use kura_engine::budget::{Class, Lease, MemoryBudget, default_total};
@@ -39,6 +44,36 @@ pub fn pool_sizes(cores: usize) -> (usize, usize) {
     (preview, (cores - preview).max(1))
 }
 
+/// 空いた確保の領域を OS へ返させる口（返したバイト数を返す。アプリと kura-devtools が kura-mac の `pressure_relief` を渡す）。
+/// kura-core は中身を知らない（OS に依らない）。
+#[derive(Clone)]
+pub struct MemoryRelief(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl MemoryRelief {
+    /// `f`（返したバイト数を返す）を包む。
+    pub fn new(f: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for MemoryRelief {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemoryRelief")
+    }
+}
+
+/// [`EngineRuntime::relieve_memory`] を呼んだ数（測るための数。[`EngineRuntime::take_relief_stats`]）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReliefStats {
+    /// 呼んだ回数。
+    pub calls: u64,
+    /// 返したバイト数の和。
+    pub bytes: u64,
+    /// かかった時間の和と最大。
+    pub total: Duration,
+    pub max: Duration,
+}
+
 /// [`EngineRuntime`] の設定。`None` は既定。
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeConfig {
@@ -54,6 +89,8 @@ pub struct RuntimeConfig {
     pub bulk_threads: Option<usize>,
     /// エンジンの上限。既定は `Limits::default()`。
     pub limits: Option<Limits>,
+    /// 空いた確保の領域を OS へ返させる口（kura-mac の `pressure_relief`）。既定はなし（何もしない）。
+    pub relief: Option<MemoryRelief>,
 }
 
 /// エンジン 1 つと、プレビュー・一括の 2 つのプール、メモリの予算。開いているライブラリに 1 つ持つ（[`super::EngineServices`]。
@@ -66,6 +103,9 @@ pub struct EngineRuntime {
     /// エディタの確保（[`EngineRuntime::admit_preview`]）で通した見積もりのピークの最大（測るための数。
     /// [`EngineRuntime::take_admitted_peak`]。値・確保には効かない）。
     admitted_peak: AtomicU64,
+    /// 空いた確保の領域を OS へ返させる口（[`RuntimeConfig::relief`]）と、呼んだ数。
+    relief: Option<MemoryRelief>,
+    relief_stats: Mutex<ReliefStats>,
 }
 
 fn pool(threads: usize, name: &'static str) -> Result<ThreadPool> {
@@ -96,6 +136,8 @@ impl EngineRuntime {
                     .unwrap_or_else(|| default_total(cfg.physical_memory)),
             ),
             admitted_peak: AtomicU64::new(0),
+            relief: cfg.relief.clone(),
+            relief_stats: Mutex::new(ReliefStats::default()),
         })
     }
 
@@ -193,6 +235,44 @@ impl EngineRuntime {
         Ok(estimate)
     }
 
+    /// 空いた確保の領域を OS へ返させる（[`RuntimeConfig::relief`]。なければ何もしない）。返したバイト数。値・予算には効かない
+    /// （確保の見積もりは生きている確保を数え、返すのは解放したあとに確保器が抱えている領域だけ）。
+    pub fn relieve_memory(&self, why: &'static str) -> u64 {
+        let Some(relief) = &self.relief else {
+            return 0;
+        };
+        let t = Instant::now();
+        let bytes = (relief.0)();
+        let took = t.elapsed();
+        {
+            let mut s = self
+                .relief_stats
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            s.calls += 1;
+            s.bytes = s.bytes.saturating_add(bytes);
+            s.total += took;
+            s.max = s.max.max(took);
+        }
+        tracing::debug!(
+            why,
+            bytes,
+            us = took.as_micros() as u64,
+            "空いた確保の領域を OS へ返しました"
+        );
+        bytes
+    }
+
+    /// 前に読んでから [`EngineRuntime::relieve_memory`] を呼んだ数を読み、0 に戻す（測るための数）。
+    pub fn take_relief_stats(&self) -> ReliefStats {
+        std::mem::take(
+            &mut *self
+                .relief_stats
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
     /// 前に読んでから [`EngineRuntime::admit_preview`] で通した見積もりのピークの最大を読み、0 に戻す（測るための数：
     /// エディタの 1 手・裏の仕事が描く前に確保した量。A18・devtools の `mem_smoke`。値・確保には効かない）。
     pub fn take_admitted_peak(&self) -> u64 {
@@ -284,6 +364,33 @@ mod tests {
             .unwrap()
             .digest()
             .unwrap()
+    }
+
+    /// 空いた確保の領域を返させる口：渡されていれば呼んで返したバイト数を返し、回数・バイト数・時間を数える（読むと 0 に
+    /// 戻る）。渡されていなければ何もしない（0）。プールの入口は手の読みから始める（読み通しを持ち込まない）。
+    #[test]
+    fn relief_is_called_only_when_given_and_counted() {
+        use kura_engine::audio::source::{read_mode, read_through};
+        let none = runtime(1, 1);
+        assert_eq!(none.relieve_memory("テスト"), 0);
+        assert_eq!(none.take_relief_stats(), ReliefStats::default());
+        let rt = EngineRuntime::new(&RuntimeConfig {
+            cores: Some(2),
+            relief: Some(MemoryRelief::new(|| 4_096)),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        assert_eq!(rt.relieve_memory("テスト"), 4_096);
+        assert_eq!(rt.relieve_memory("テスト"), 4_096);
+        let s = rt.take_relief_stats();
+        assert_eq!((s.calls, s.bytes), (2, 8_192));
+        assert!(s.max <= s.total);
+        assert_eq!(rt.take_relief_stats(), ReliefStats::default());
+        assert_eq!(
+            read_through(|| rt.preview(|_| read_mode())),
+            ReadMode::Keep,
+            "プールの入口は手の読み"
+        );
     }
 
     #[test]
