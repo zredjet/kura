@@ -10,6 +10,10 @@
 //! （解放・取り直しのときも同じ `Layout` が渡るので、目印を持たずに済む）。`mmap` の領域は 0 で埋まっているので、
 //! 0 で埋めた確保は書かずに済む。macOS 以外は `System` をそのまま使う。
 //!
+//! [`LARGE`] より小さいものの抱え込み（音声のチャンクなど）は、確保器ではなく libmalloc の設定 [`SPACE_EFFICIENT_ENV`] で返させる
+//! （M13 段 7。ADR-183）。libmalloc が起動のときに環境変数を読むので、アプリは Info.plist の `LSEnvironment` で渡し、kura-devtools は
+//! 付けて自分を起こし直す。
+//!
 //! 確保の量を数える目印（kura-core の `svg_worker::AllocMeter`）を持つ。SVG の働き手（アプリ自身を `--kura-svg-worker` 付きで
 //! 起動した子）だけが数え始めて上限を付け、超える確保を断る（ヌルを返す。ADR-164 (4)）。アプリの本体では数えず、確保ごとに
 //! 旗を 1 度読むだけ。
@@ -20,6 +24,10 @@ use kura_core::codec_ext::svg_worker::AllocMeter;
 
 /// これ以上の確保を `mmap` で取る（1 MiB）。
 pub const LARGE: usize = 1 << 20;
+
+/// libmalloc に解放した領域をすぐ OS へ返させる環境変数（値は `1`。`man malloc` にない設定で、効かなくなっても動きは変わらず
+/// メモリが増えるだけ。`mem_smoke` が見積もりとの照らしで気づく）。起動のときに読まれるので、走り出してからは変えられない。
+pub const SPACE_EFFICIENT_ENV: &str = "MallocSpaceEfficient";
 
 /// 大きな確保を OS へすぐ返す確保器（確保の量を数える目印つき）。
 #[derive(Debug, Default)]

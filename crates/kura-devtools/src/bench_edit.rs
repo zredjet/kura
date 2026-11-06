@@ -576,7 +576,7 @@ fn run_all(opts: Opts, tmp: &Path) -> Result<(), String> {
     let budget = ctx.budget_total();
     let env = env_json(&ctx.opts, budget);
     emit(&format!(
-        "bench edit：{}・{} コア・{}・プレビュー {} スレッド・一括 {} スレッド・記録 {:?}・予算 {} MiB{}",
+        "bench edit：{}・{} コア・{}・プレビュー {} スレッド・一括 {} スレッド・記録 {:?}・予算 {} MiB・{}={}{}",
         env["cpu"].as_str().unwrap_or("不明"),
         env["cores"],
         env["build"].as_str().unwrap_or(""),
@@ -584,6 +584,8 @@ fn run_all(opts: Opts, tmp: &Path) -> Result<(), String> {
         ctx.opts.bulk_threads,
         ctx.opts.threads,
         budget / MIB,
+        kura_mac::SPACE_EFFICIENT_ENV,
+        std::env::var(kura_mac::SPACE_EFFICIENT_ENV).unwrap_or_else(|_| "なし".into()),
         if ctx.opts.quick { "・--quick" } else { "" }
     ));
     let mut runs = Vec::new();

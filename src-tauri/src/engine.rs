@@ -35,6 +35,20 @@ impl EngineFactory for MacEngineFactory {
 mod tests {
     use super::*;
 
+    /// アプリは libmalloc の省メモリの設定で動く（Info.plist の `LSEnvironment`。ADR-183。外すと音声の保存・エディタのメモリが
+    /// 見積もりを超える）。
+    #[test]
+    fn the_app_runs_with_the_space_efficient_malloc() {
+        let plist = include_str!("../Info.plist");
+        let env = plist
+            .split_once("<key>LSEnvironment</key>")
+            .map(|(_, rest)| rest)
+            .expect("LSEnvironment がない");
+        let expected = format!("<key>{}</key>", kura_mac::SPACE_EFFICIENT_ENV);
+        let (_, value) = env.split_once(&expected).expect("設定がない");
+        assert!(value.trim_start().starts_with("<string>1</string>"));
+    }
+
     /// 予算の元は物理メモリ、コーデックの組は macOS の段まで持つ。
     #[test]
     fn the_mac_factory_uses_physical_memory_and_platform_codecs() {

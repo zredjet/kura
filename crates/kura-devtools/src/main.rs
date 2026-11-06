@@ -66,15 +66,45 @@ const USAGE: &str = "使い方: kura-devtools import --library <path> [--create]
                      download --library <path> <url>... | check --library <path> | \
                      vorbis-quality --out <dir> [--quick] [--input <file>]... [--reference <音>/<ラベル>=<ogg>]...";
 
+/// アプリと同じ libmalloc の設定（アプリは Info.plist の `LSEnvironment`。ADR-183）で動くように、なければ付けて自分を起こし直す
+/// （libmalloc は起動のときに読むので、走り出してからは変えられない。計測をアプリに合わせる）。比べるときは値を `0` にして起動
+/// する。起こし直せなければ理由を返し、そのまま続ける（戻ってくるのは起こし直せなかったときだけ）。
+#[cfg(unix)]
+fn with_app_malloc() -> Option<std::io::Error> {
+    use std::os::unix::process::CommandExt;
+    if std::env::var_os(kura_mac::SPACE_EFFICIENT_ENV).is_some() {
+        return None;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => return Some(err),
+    };
+    Some(
+        std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .env(kura_mac::SPACE_EFFICIENT_ENV, "1")
+            .exec(),
+    )
+}
+
+#[cfg(not(unix))]
+fn with_app_malloc() -> Option<std::io::Error> {
+    None
+}
+
 fn main() -> ExitCode {
     // SVG の働き手として起動された（アプリと同じ組で SVG を読むとき、自分を `--kura-svg-worker` 付きで起動する。決定 23）
     if svg_worker::is_worker_invocation() {
         return svg_worker::serve(&kura_mac::pinned_options(), ALLOC.meter());
     }
+    let restart_failed = with_app_malloc();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
+    if let Some(err) = restart_failed {
+        tracing::warn!("アプリと同じ確保の設定で起こし直せません: {err}");
+    }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {

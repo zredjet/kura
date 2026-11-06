@@ -14,13 +14,12 @@
 //!
 //! M13 段 3 のケース `audio-60min-save`（60 分の合成の源の音声を FLAC・ogg q5・WAV に流して書く。値も書いたバイト列も持たない）も
 //! 重いので、別のテスト `audio_60min_save_stays_within_n`（`#[ignore]`。`--release` で回す）にした。判定は N（源の LRU の上限 ＋
-//! 192 MiB）と、保存の見積もり（`EstimateSpec::stream`）× 1.25 ＋ 4 MiB ＋ チャンクの抱え込み（96 MiB。暫定）。
+//! 128 MiB）と、保存の見積もり（`EstimateSpec::stream`）× 1.25 ＋ 4 MiB。
 //!
 //! M13 段 4C のケース `audio-editor-60min`（60 分・48 kHz ステレオの 16 ビットの WAV をアプリの取り込みのジョブでライブラリに
 //! 入れ、kura-core のエディタで区間の表示で開いて gain・fade・trim の終わり・ループ点の手を当て、裏の仕事を済ませる）も重いので、
 //! 別のテスト `audio_editor_60min_stays_within_n`（`#[ignore]`。`--release` で回す）にした。判定は N（保存の N ＋ 持ち続ける分の
-//! 上限 70 MiB）と、エディタの見積もり（キャッシュ ＋ 確保の見積もりのピーク ＋ 持ち続ける分）× 1.25 ＋ 4 MiB ＋ チャンクの
-//! 抱え込み（96 MiB。保存と同じ暫定）。
+//! 上限 70 MiB）と、エディタの見積もり（キャッシュ ＋ 確保の見積もりのピーク ＋ 持ち続ける分）× 1.25 ＋ 4 MiB。
 //!
 //! 子プロセスは、このテストのバイナリ自身を `--exact mem_smoke::tests::child --ignored` で起こす（環境変数でケースと段を
 //! 渡す）。`/usr/bin/time -l` がない・peak memory footprint を出さない環境（Linux）では確かめずに通す（CI の Linux の job は
@@ -323,11 +322,17 @@ mod tests {
         });
     }
 
+    /// 子プロセスを `/usr/bin/time -l` で起こす形。アプリと同じ libmalloc の設定（Info.plist の `LSEnvironment`。ADR-183）にする。
+    fn time_l() -> Command {
+        let mut cmd = Command::new("/usr/bin/time");
+        cmd.arg("-l").env(kura_mac::SPACE_EFFICIENT_ENV, "1");
+        cmd
+    }
+
     /// 子プロセスのピーク（バイト）。`/usr/bin/time -l` が使えなければ（ない・peak memory footprint を出さない）None。
     fn peak(case: &Case, file: &Path, stage: &str) -> Option<u64> {
         let exe = std::env::current_exe().unwrap();
-        let out = Command::new("/usr/bin/time")
-            .arg("-l")
+        let out = time_l()
             .arg(exe)
             .args([
                 "--exact",
@@ -747,8 +752,7 @@ mod tests {
     fn analyze_peak(name: &str, path: &Path, format: &str) -> Option<(u64, u64, String)> {
         let exe = std::env::current_exe().unwrap();
         let run = |stage: &str| -> Option<(u64, String)> {
-            let out = Command::new("/usr/bin/time")
-                .arg("-l")
+            let out = time_l()
                 .arg(&exe)
                 .args([
                     "--exact",
@@ -935,8 +939,7 @@ mod tests {
     /// 子プロセスのピーク（テスト `test` を、ケース `spec` で起こす）。`/usr/bin/time -l` が使えなければ None。
     fn peak_of(test: &str, spec: &str) -> Option<u64> {
         let exe = std::env::current_exe().unwrap();
-        let out = Command::new("/usr/bin/time")
-            .arg("-l")
+        let out = time_l()
             .arg(exe)
             .args([
                 "--exact",
@@ -1004,18 +1007,10 @@ mod tests {
 
     /// 子プロセスに渡す保存のケース。
     const SAVE_CASE: &str = "audio-60min-save";
-    /// 保存の N（源の LRU の上限 ＋ 192 MiB。窓・エンコーダの流れの作業領域・ダイジェスト・流し解きの結果と、下の
-    /// [`CHUNK_SLACK`]）。設計の LRU ＋ 128 MiB は、段 3 の実測（WAV 168・FLAC 170〜221・ogg 234 MiB。負荷で揺れる）が
-    /// 超えたので広げた（暫定。段 7 で測り直す）。
-    const SAVE_N: u64 = AUDIO_LRU + 192 * MIB;
-    /// 音声のチャンク（1 チャンネル 256 KiB）は確保器が `mmap` で返す大きさ（1 MiB）より小さく、libmalloc が解放した領域を
-    /// スレッドごとに抱える。流れは窓ごとにチャンクを確保しては捨てるので、その抱え込みがエンジンの見積もり（段をまたぐ
-    /// 持ち越しのモデル）を 50〜70 MiB 上回る（段 3 の実測）。見積もりとの照らしにこの分を足す（暫定）。段 7 で、エディタの
-    /// 区切り・閉じるとき・保存の終わりに libmalloc へ空いた領域を返させる口（kura-mac の `pressure_relief`）を入れたが、
-    /// macOS 26 では 0 バイトしか返らず、通しは見積もり × 1.25 ＋ 4 MiB をエディタで −36〜＋37 MiB・保存で −12〜＋37 MiB
-    /// のまま（外せなかった）。確保器の `mmap` の境を 256 KiB に下げれば収まる（エディタ 152〜167・保存 84〜116 MiB）が、
-    /// 音声の手が遅くなるので入れていない（docs/architecture.md の確保器の項）。
-    const CHUNK_SLACK: u64 = 96 * MIB;
+    /// 保存の N（源の LRU の上限 ＋ 128 MiB。窓・エンコーダの流れの作業領域・ダイジェスト・流し解きの結果）。音声のチャンク
+    /// （1 チャンネル 256 KiB）を libmalloc が抱える分は、アプリと同じ設定（`MallocSpaceEfficient`。[`time_l`]）で返るので数えない
+    /// （M13 段 7。設定なしでは FLAC 163・ogg 196・WAV 158 MiB、ありでは 25.5・34.5・25.4 MiB。ADR-183）。
+    const SAVE_N: u64 = AUDIO_LRU + 128 * MIB;
 
     /// 保存の見積もり（60 分の合成の源を遅延の入力に、trim → fade → normalize → gain → set_loop を `format` に流して書く）。
     fn save_estimate(format: &str, opts: &serde_json::Value) -> u64 {
@@ -1133,7 +1128,7 @@ mod tests {
     }
 
     /// M13 段 3（E7）：60 分・48 kHz ステレオの合成の源を FLAC・ogg q5 に流して書く子プロセスのピークから基準を引いた量が、
-    /// N（源の LRU ＋ 192 MiB）以下で、保存の見積もり（`EstimateSpec::stream`）× 1.25 ＋ 4 MiB ＋ `CHUNK_SLACK` 以下。値（1.38 GB）も書いた
+    /// N（源の LRU ＋ 128 MiB）以下で、保存の見積もり（`EstimateSpec::stream`）× 1.25 ＋ 4 MiB 以下。値（1.38 GB）も書いた
     /// バイト列も持たない。重いので、ふだんは回さない：
     /// `cargo test --release -p kura-devtools mem_smoke::tests::audio_60min_save -- --ignored --nocapture`。
     #[test]
@@ -1146,8 +1141,7 @@ mod tests {
             let path = dir.path().join(format!("out.{format}"));
             let exe = std::env::current_exe().unwrap();
             let run = |stage: &str| -> Option<(u64, String)> {
-                let out = Command::new("/usr/bin/time")
-                    .arg("-l")
+                let out = time_l()
                     .arg(&exe)
                     .args([
                         "--exact",
@@ -1191,9 +1185,9 @@ mod tests {
             if used > SAVE_N {
                 failed.push(format!("{format}: 実測 {used} バイト > N {SAVE_N}"));
             }
-            if used > bound(est) + CHUNK_SLACK {
+            if used > bound(est) {
                 failed.push(format!(
-                    "{format}: 実測 {used} バイト > 見積もり {est} × 1.25 ＋ 4 MiB ＋ チャンクの抱え込み"
+                    "{format}: 実測 {used} バイト > 見積もり {est} × 1.25 ＋ 4 MiB"
                 ));
             }
         }
@@ -1208,7 +1202,7 @@ mod tests {
     const ITEM_ENV: &str = "KURA_MEM_SMOKE_ITEM";
     /// 子プロセスが結果の JSON の行の頭に付ける印。
     const RESULT_MARK: &str = "KURA_MEM_SMOKE_RESULT ";
-    /// エディタの N：保存の N（源の LRU の上限 ＋ 192 MiB：窓・作業領域・流し解きの結果・チャンクの抱え込み。裏の仕事は保存と
+    /// エディタの N：保存の N（源の LRU の上限 ＋ 128 MiB：窓・作業領域・流し解きの結果。裏の仕事は保存と
     /// 同じく出力を窓ごとに流す）に、エディタが持ち続ける分の上限 70 MiB（design-stage46.md §1.7：区間の表示 24 MiB × 2 ＋
     /// 波形の段 3 つ）を足したもの。
     const EDITOR_N: u64 = SAVE_N + 70 * MIB;
@@ -1307,8 +1301,8 @@ mod tests {
     /// M13 段 4C（F15）：60 分・48 kHz ステレオの 16 ビットの WAV をアプリの取り込みのジョブで新しいライブラリに入れ、子プロセスで
     /// kura-core のエディタを通して開いて手を当てる（`editor_child`）。ピークから基準（ライブラリ・実行の場・コーデックの組を作る
     /// だけの子）を引いた量が、N（[`EDITOR_N`]）以下で、エディタの見積もり（キャッシュが持つ量（入力の源の LRU の上限を含む）の
-    /// 最大 ＋ 描く前に確保した見積もりのピークの最大 ＋ 持ち続ける分（`extra`）の最大）× 1.25 ＋ 4 MiB ＋ チャンクの抱え込み
-    /// （[`CHUNK_SLACK`]。保存のケースと同じ暫定）以下。持ち続ける分は 70 MiB 以下、閉じたら予算と作業用のファイルが戻る。重い
+    /// 最大 ＋ 描く前に確保した見積もりのピークの最大 ＋ 持ち続ける分（`extra`）の最大）× 1.25 ＋ 4 MiB
+    /// 以下。持ち続ける分は 70 MiB 以下、閉じたら予算と作業用のファイルが戻る。重い
     /// （691 MB のファイルを書いて取り込む）ので、ふだんは回さない：
     /// `cargo test --release -p kura-devtools mem_smoke::tests::audio_editor_60min -- --ignored --nocapture`。
     #[test]
@@ -1335,8 +1329,7 @@ mod tests {
         );
         let exe = std::env::current_exe().unwrap();
         let run = |stage: &str| -> Option<(u64, serde_json::Value)> {
-            let out = Command::new("/usr/bin/time")
-                .arg("-l")
+            let out = time_l()
                 .arg(&exe)
                 .args([
                     "--exact",
@@ -1422,9 +1415,9 @@ mod tests {
         if used > EDITOR_N {
             failed.push(format!("実測 {used} バイト > N {EDITOR_N}"));
         }
-        if used > bound(est) + CHUNK_SLACK {
+        if used > bound(est) {
             failed.push(format!(
-                "実測 {used} バイト > 見積もり {est} × 1.25 ＋ 4 MiB ＋ チャンクの抱え込み"
+                "実測 {used} バイト > 見積もり {est} × 1.25 ＋ 4 MiB"
             ));
         }
         if extra > EDITOR_EXTRA {
