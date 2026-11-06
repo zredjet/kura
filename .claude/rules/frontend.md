@@ -22,7 +22,7 @@ paths:
     段は Rust が決めた `view.level`。session・rev・段・番号の形が合わなければ RangeError。
   - `media.test.ts` が、`kura://` の組み立て・`thumbUrl` の呼び出し・`thumbState` の `'ready'` だけの判定がほかのファイルにないことを見張る（注釈は除く。自己点検の `src/dev/selftest.ts` は壊れた URL をわざと組むので外す）。
 - ループの試聴は `src/lib/assetAudio.ts` の `Audition` を通す。`AudioBufferSourceNode` の `loopStart`・`loopEnd` を使わない（秒に直すと標本がずれる。本体だけのバッファを `loop` で回す）。文脈は `ContextPool` から元のレートで取る。
-  - 画面からは `src/features/asset/auditionStore.ts`（始める・止める・L のキー。プレーヤーを一時停止する）を通し、文脈の持ち主は `src/features/asset/audioRuntime.ts`（試聴と効果音で分け合い、ライブラリの画面を離れるときに閉じる）。長さ（フレーム）は `item_asset_get` の DTO・一覧の概要にない（DB では analysis_results の `kura.read` にだけある）ので、`Audition.startProbed`（/pcm の先頭の 1 フレームの応答で、PCM と同じ読み取りの長さ・ループ点を知る）で始める。
+  - 画面からは `src/features/asset/auditionStore.ts`（始める・止める・L のキー。プレーヤーを一時停止する）を通し、文脈の持ち主は `src/features/asset/audioRuntime.ts`（試聴と効果音で分け合い、ライブラリの画面を離れるときに閉じる）。試聴は `Audition.startProbed`（/pcm の先頭の 1 フレームの応答で、PCM と同じ読み取りの長さ・ループ点を知る）で始める。`item_asset_get` の `facts.audio.frames` は解析のときの長さで、試聴のループの長さ超えの表示と波形の区間に使う（デコーダが変わると標本がずれるので、鳴らす区間の計画には使わない）。
 - 一覧・グリッド・キューは必ず仮想スクロール。1 万件を DOM に並べない。
 - 検索結果は ID 配列（`Int32Array` など）で保持し、詳細は見えている範囲だけ取得してキャッシュする。
 - ドメインデータを `localStorage` に置かない（サイドバーの開閉など見た目の設定だけ可）。
