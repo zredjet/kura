@@ -260,7 +260,7 @@ fn examples() -> Vec<(&'static str, bool, Graph, Vec<InputGen>)> {
             }],
         ),
         // M14 段 1：レシピを継いで結び付けた文書（頭の編集＋素材の設定・秒を具体的な値にしたレシピのノード）。版の文書は
-        // 具体的な値だけを持つので、読み直して同じ値になることを凍結する（新しい操作 image.pad などを使う見本は B の合流のあと）
+        // 具体的な値だけを持つので、読み直して同じ値になることを凍結する
         (
             "recipe-bound-sheet",
             true,
@@ -272,6 +272,13 @@ fn examples() -> Vec<(&'static str, bool, Graph, Vec<InputGen>)> {
             false,
             bound_audio(),
             vec![bound_audio_input()],
+        ),
+        // 相対の指定の操作（image.pad）を、格子を結び付けたノードの後ろに置いたレシピ
+        (
+            "recipe-bound-sheet-pad",
+            true,
+            bound_sheet_pad(),
+            vec![bound_sheet_input()],
         ),
     ]
 }
@@ -357,6 +364,94 @@ fn bound_sheet() -> Graph {
         .instantiate(&base, &recipe, &shapes, &facts)
         .unwrap()
         .graph
+}
+
+/// 切り抜いて上下を返した頭に、「素材の格子（16×16）で切ってコマの時間（80 ms）を付け、各コマに余白（上 1・右 1・下 2px、
+/// 左は幅の 1/8）を足して 4 列に並べ直す」レシピを当てた文書（80×48 → 15 コマ → 19×19 のコマを 4 列 × 4 行）。
+fn bound_sheet_pad() -> Graph {
+    let engine = Engine::new().unwrap();
+    let base = chain(&[
+        (
+            "image.crop",
+            1,
+            json!({ "rect": { "x": 8, "y": 8, "w": 80, "h": 48 } }),
+            0,
+            true,
+        ),
+        ("image.flip", 1, json!({ "axis": "vertical" }), 0, true),
+    ]);
+    let recipe = Recipe::new(
+        "コマに余白".into(),
+        String::new(),
+        RecipeKind::Each,
+        chain(&[
+            (
+                "sprite.split_grid",
+                1,
+                json!({ "grid": { "cellW": 8, "cellH": 8, "offsetX": 0, "offsetY": 0, "gapX": 0, "gapY": 0 }, "durationMs": 100, "skipEmpty": false }),
+                0,
+                true,
+            ),
+            (
+                "image.pad",
+                1,
+                json!({ "top": { "px": 1 }, "right": { "px": 1 }, "bottom": { "px": 2 }, "left": { "scale": { "num": 1, "den": 8 } }, "fill": [255, 0, 255, 255] }),
+                0,
+                true,
+            ),
+            (
+                "sprite.pack_grid",
+                1,
+                json!({ "columns": 4, "gapX": 0, "gapY": 0, "fill": null }),
+                0,
+                true,
+            ),
+        ]),
+        vec![
+            bind(1, "grid", None, Source::Setting { key: SettingKey::Grid }),
+            bind(
+                1,
+                "durationMs",
+                None,
+                Source::Setting {
+                    key: SettingKey::FrameMs,
+                },
+            ),
+        ],
+    )
+    .unwrap();
+    let facts = Facts {
+        grid: Some(GridParam {
+            cell_w: 16,
+            cell_h: 16,
+            offset_x: 0,
+            offset_y: 0,
+            gap_x: 0,
+            gap_y: 0,
+        }),
+        frame_ms: Some(80),
+        ..Facts::default()
+    };
+    let input = bound_sheet_input().generate().unwrap();
+    let shapes = BTreeMap::from([(InputId(0), input.shape())]);
+    let g = engine
+        .instantiate(&base, &recipe, &shapes, &facts)
+        .unwrap()
+        .graph;
+    // 版の文書は具体的な値だけ（結び付けた格子・コマの時間、相対の指定の余白はそのまま）
+    assert_eq!(g.nodes[2].params["grid"]["cellW"], json!(16));
+    assert_eq!(g.nodes[2].params["durationMs"], json!(80));
+    assert_eq!(g.nodes[3].op, "image.pad");
+    let plan = engine.compile(&g, &shapes).unwrap();
+    assert_eq!(
+        plan.output_shapes()[0].1,
+        kura_engine::shape::Shape::Image {
+            w: kura_engine::shape::Dim::Exact(76),
+            h: kura_engine::shape::Dim::Exact(76),
+            fmt: PixelFormat::Rgba8
+        }
+    );
+    g
 }
 
 /// 音量を下げた頭に、「頭 100 ms と終わり 250 ms を切り、50 ms と 80 ms のフェード、全体をループ」のレシピを当てた文書。
