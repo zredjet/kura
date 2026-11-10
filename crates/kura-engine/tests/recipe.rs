@@ -14,6 +14,7 @@ use kura_engine::doc::{
     self, DecodeOptions, Dither, Expand, FormatChoice, Graph, InputId, InputRole, InputSlot,
     NodeId, OutputId, PortRef, QUANTIZE_VERSION, Quantize, compose,
 };
+use kura_engine::geom::IPoint;
 use kura_engine::ops::util::GridParam;
 use kura_engine::recipe::{
     BindError, Binding, Facts, MAX_BINDINGS, MAX_RECIPE_BYTES, PivotFact, RangePart, Recipe,
@@ -239,6 +240,60 @@ fn pivot_recipe() -> Recipe {
     .unwrap()
 }
 
+/// 設計 §1.2 の例そのもの：素材の格子で切ってコマの時間を付け、各コマに透明な 1px の余白を足して 8 列に並べ直す。
+/// `image.pad` は結び付けた `sprite.split_grid` の後ろ（前に置くと座標が動いて `Moved`）。
+fn padded_sheet_recipe() -> Recipe {
+    let g = chain(&[
+        (
+            "sprite.split_grid",
+            json!({ "grid": grid_json(16), "durationMs": 100, "skipEmpty": false }),
+        ),
+        (
+            "image.pad",
+            json!({ "top": { "px": 1 }, "right": { "px": 1 }, "bottom": { "px": 1 }, "left": { "px": 1 }, "fill": null }),
+        ),
+        (
+            "sprite.pack_grid",
+            json!({ "columns": 8, "gapX": 0, "gapY": 0, "fill": null }),
+        ),
+    ]);
+    Recipe::new(
+        "コマに 1px の余白".into(),
+        "素材の格子で切って、上下左右に 1px 足して並べ直す".into(),
+        RecipeKind::Each,
+        g,
+        vec![
+            bind(1, "durationMs", None, setting(SettingKey::FrameMs)),
+            bind(1, "grid", None, setting(SettingKey::Grid)),
+        ],
+    )
+    .unwrap()
+}
+
+/// 格子を付け直してから、32 の倍数のキャンバスの中央に置き、ピボットを下中央にするレシピ（`meta.set_grid` の結び付けの
+/// 後ろに `image.fit_canvas`・`meta.anchor_pivot`。どちらも入力の形だけで決まる相対の指定）。
+fn fitted_sprite_recipe() -> Recipe {
+    let g = chain(&[
+        ("meta.set_grid", json!({ "grid": null })),
+        (
+            "image.fit_canvas",
+            json!({ "width": { "multipleOf": 32 }, "height": { "multipleOf": 32 }, "anchor": "center", "fill": null, "allowCrop": false }),
+        ),
+        (
+            "meta.anchor_pivot",
+            json!({ "anchor": "bottom", "offset": { "x": 0, "y": -1 } }),
+        ),
+    ]);
+    Recipe::new(
+        "32 の倍数の中央に".into(),
+        "格子を付け直し、32 の倍数のキャンバスの中央に置いて、ピボットを下中央に".into(),
+        RecipeKind::Each,
+        g,
+        vec![bind(1, "grid", None, setting(SettingKey::Grid))],
+    )
+    .unwrap()
+}
+
 // ---------------------------------------------------------------------------------------------
 // E48：ファイル
 // ---------------------------------------------------------------------------------------------
@@ -254,6 +309,8 @@ fn recipe_files_round_trip() {
         loop_recipe(),
         set_grid_recipe(),
         pivot_recipe(),
+        padded_sheet_recipe(),
+        fitted_sprite_recipe(),
     ] {
         let file = r.to_file().unwrap();
         let text = String::from_utf8(file.clone()).unwrap();
@@ -306,6 +363,53 @@ fn recipe_files_round_trip() {
         file_value(&audio_recipe())["bindings"][4],
         json!({ "node": 3, "param": "loop", "part": "start", "from": { "type": "time", "ms": 0, "anchor": "start" } })
     );
+}
+
+/// 設計 §1.2 の例（読みやすく整えた `.kurarecipe`）がそのまま読め、`padded_sheet_recipe` と同じレシピになり、書くと正規の
+/// 1 行になる。
+#[test]
+fn the_design_example_reads_as_written() {
+    let text = r#"{
+  "kura": "recipe",
+  "schema": 1,
+  "name": "コマに 1px の余白",
+  "description": "素材の格子で切って、上下左右に 1px 足して並べ直す",
+  "kind": "each",
+  "requires": [
+    { "op": "image.pad", "v": 1 },
+    { "op": "sprite.pack_grid", "v": 1 },
+    { "op": "sprite.split_grid", "v": 1 }
+  ],
+  "graph": {
+    "schema": 3, "rules": 1, "nextId": 4,
+    "inputs": [{ "id": 0, "role": { "type": "primary" }, "decode": {} }],
+    "nodes": [
+      { "id": 1, "op": "sprite.split_grid", "v": 1, "seed": "0", "enabled": true,
+        "inputs": [{ "from": "input", "id": 0 }],
+        "params": { "grid": { "cellW": 16, "cellH": 16, "offsetX": 0, "offsetY": 0, "gapX": 0, "gapY": 0 },
+                    "durationMs": 100, "skipEmpty": false } },
+      { "id": 2, "op": "image.pad", "v": 1, "seed": "0", "enabled": true,
+        "inputs": [{ "from": "node", "id": 1 }],
+        "params": { "top": { "px": 1 }, "right": { "px": 1 }, "bottom": { "px": 1 }, "left": { "px": 1 }, "fill": null } },
+      { "id": 3, "op": "sprite.pack_grid", "v": 1, "seed": "0", "enabled": true,
+        "inputs": [{ "from": "node", "id": 2 }],
+        "params": { "columns": 8, "gapX": 0, "gapY": 0, "fill": null } }
+    ],
+    "outputs": [{ "id": 0, "from": { "from": "node", "id": 3 }, "format": { "type": "keep" }, "expand": { "type": "one" } }]
+  },
+  "bindings": [
+    { "node": 1, "param": "durationMs", "from": { "type": "setting", "key": "frameMs" } },
+    { "node": 1, "param": "grid", "from": { "type": "setting", "key": "grid" } }
+  ]
+}"#;
+    let engine = Engine::new().unwrap();
+    let loaded = engine.load_recipe(text.as_bytes()).unwrap();
+    assert!(loaded.notes.is_empty());
+    assert_eq!(loaded.recipe, padded_sheet_recipe());
+    let file = loaded.recipe.to_file().unwrap();
+    assert_eq!(file, padded_sheet_recipe().to_file().unwrap());
+    let canonical: J = serde_json::from_str(text).unwrap();
+    assert_eq!(file, kura_engine::digest::canonical(&canonical).unwrap());
 }
 
 /// 正規でない JSON（整えたもの・キーの順の違い・BOM つき・並べていない結び付け・重なった requires・省いた項目）も読め、
@@ -1922,6 +2026,180 @@ fn binding_errors_are_specific() {
     ));
 }
 
+/// 相対の指定の操作（`image.pad`・`image.fit_canvas`・`meta.anchor_pivot`）を、結び付けたノードの後ろに置いたレシピ：
+/// 結び付けた値のまま、相対の指定はアイテムの形で決まり、計算した矩形・点の `image.canvas`・`meta.set_pivot` を具体的な
+/// 値で並べた文書と同じ値になる。座標を変える pad・fit_canvas を結び付けたノードの前に置くと `Moved`（anchor_pivot は
+/// 座標を変えないので前に置いてよい）。anchor_pivot の引数には結び付けを置けない。
+#[test]
+fn relative_ops_after_bound_nodes() {
+    let engine = Engine::new().unwrap();
+    let base = Graph::new_single();
+    // pad：64×32 のシートを 16 で切り（8 コマ）、各コマ 18×18 にして 8 列 → 144×18
+    let sheet = sheet_input();
+    let inst = engine
+        .instantiate(
+            &base,
+            &padded_sheet_recipe(),
+            &shapes(&sheet),
+            &full_facts(),
+        )
+        .unwrap();
+    assert_eq!(inst.graph.nodes[0].params["grid"], grid_json(16));
+    assert_eq!(inst.graph.nodes[0].params["durationMs"], json!(120));
+    assert_eq!(
+        inst.graph.nodes[1].params,
+        padded_sheet_recipe().graph.nodes[1].params
+    );
+    let got = render(&engine, &inst.graph, &sheet, Digest([2; 32])).unwrap();
+    assert_eq!(
+        got.shape(),
+        Shape::Image {
+            w: Dim::Exact(144),
+            h: Dim::Exact(18),
+            fmt: PixelFormat::Rgba8
+        }
+    );
+    let absolute = chain(&[
+        (
+            "sprite.split_grid",
+            json!({ "grid": grid_json(16), "durationMs": 120, "skipEmpty": false }),
+        ),
+        (
+            "image.canvas",
+            json!({ "rect": { "x": -1, "y": -1, "w": 18, "h": 18 }, "fill": null }),
+        ),
+        (
+            "sprite.pack_grid",
+            json!({ "columns": 8, "gapX": 0, "gapY": 0, "fill": null }),
+        ),
+    ]);
+    let want = render(&engine, &absolute, &sheet, Digest([2; 32])).unwrap();
+    assert_eq!(got.digest().unwrap(), want.digest().unwrap());
+    // fit_canvas・anchor_pivot：48×48 を 64×64 の中央（中身は (8, 8)）に置き、ピボットは下中央の 1px 上
+    let square = InputGen::Sheet {
+        cols: 3,
+        rows: 3,
+        cell: 16,
+    }
+    .generate()
+    .unwrap();
+    let mut facts = full_facts();
+    facts.grid = Some(GridParam {
+        cell_w: 8,
+        cell_h: 16,
+        offset_x: 0,
+        offset_y: 0,
+        gap_x: 0,
+        gap_y: 0,
+    });
+    let inst = engine
+        .instantiate(&base, &fitted_sprite_recipe(), &shapes(&square), &facts)
+        .unwrap();
+    let cell8 =
+        json!({ "cellW": 8, "cellH": 16, "offsetX": 0, "offsetY": 0, "gapX": 0, "gapY": 0 });
+    assert_eq!(inst.graph.nodes[0].params["grid"], cell8);
+    let got = render(&engine, &inst.graph, &square, Digest([3; 32])).unwrap();
+    let absolute = chain(&[
+        ("meta.set_grid", json!({ "grid": cell8 })),
+        (
+            "image.canvas",
+            json!({ "rect": { "x": -8, "y": -8, "w": 64, "h": 64 }, "fill": null }),
+        ),
+        ("meta.set_pivot", json!({ "pivot": { "x": 32, "y": 63 } })),
+    ]);
+    let want = render(&engine, &absolute, &square, Digest([3; 32])).unwrap();
+    assert_eq!(got.digest().unwrap(), want.digest().unwrap());
+    let Value::Image(img) = &got else { panic!() };
+    assert_eq!(img.meta.pivot, Some(IPoint { x: 32, y: 63 }));
+    assert_eq!(
+        img.meta.grid.map(|g| (g.offset_x, g.offset_y)),
+        Some((8, 8))
+    );
+    // 同じレシピでも大きさの違うアイテムには、そのアイテムの形で当たる（64×32 → そのまま、ピボットは (32, 31)）
+    let inst = engine
+        .instantiate(&base, &fitted_sprite_recipe(), &shapes(&sheet), &facts)
+        .unwrap();
+    let Value::Image(img) = render(&engine, &inst.graph, &sheet, Digest([3; 32])).unwrap() else {
+        panic!()
+    };
+    assert_eq!((img.px.width(), img.px.height()), (64, 32));
+    assert_eq!(img.meta.pivot, Some(IPoint { x: 32, y: 31 }));
+    // 前に置くと Moved（by は座標を変えたノード）。anchor_pivot は座標を変えないので前に置いてよい
+    let before = |first: (&str, J), then: (&str, J), param: &str, key: SettingKey| {
+        Recipe::new(
+            "前に置く".into(),
+            String::new(),
+            RecipeKind::Each,
+            chain(&[first, then]),
+            vec![bind(2, param, None, setting(key))],
+        )
+        .unwrap()
+    };
+    let pad = (
+        "image.pad",
+        padded_sheet_recipe().graph.nodes[1].params.clone(),
+    );
+    let fit = (
+        "image.fit_canvas",
+        fitted_sprite_recipe().graph.nodes[1].params.clone(),
+    );
+    let anchor = (
+        "meta.anchor_pivot",
+        fitted_sprite_recipe().graph.nodes[2].params.clone(),
+    );
+    let split = (
+        "sprite.split_grid",
+        json!({ "grid": grid_json(16), "durationMs": 100, "skipEmpty": false }),
+    );
+    let set_pivot = ("meta.set_pivot", json!({ "pivot": null }));
+    let set_grid = ("meta.set_grid", json!({ "grid": null }));
+    for (recipe, param) in [
+        (before(pad, split.clone(), "grid", SettingKey::Grid), "grid"),
+        (
+            before(fit, set_pivot.clone(), "pivot", SettingKey::Pivot),
+            "pivot",
+        ),
+    ] {
+        match engine.instantiate(&base, &recipe, &shapes(&square), &full_facts()) {
+            Err(BindError::Moved { node, param: p, by }) => {
+                assert_eq!((node, p.as_str(), by), (NodeId(2), param, NodeId(1)));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    for recipe in [
+        before(anchor.clone(), set_grid, "grid", SettingKey::Grid),
+        before(anchor.clone(), set_pivot, "pivot", SettingKey::Pivot),
+    ] {
+        assert!(
+            engine
+                .instantiate(&base, &recipe, &shapes(&square), &full_facts())
+                .is_ok()
+        );
+    }
+    // anchor_pivot の基準・ずれは元によらない引数なので、素材のピボットを結べない（レシピの確かめで断る）
+    for param in ["offset", "anchor"] {
+        let r = Recipe::new(
+            "ずれに結ぶ".into(),
+            String::new(),
+            RecipeKind::Each,
+            chain(&[anchor.clone()]),
+            vec![bind(1, param, None, setting(SettingKey::Pivot))],
+        )
+        .unwrap();
+        let e = engine.check_recipe(&r).unwrap_err();
+        assert_eq!(
+            codes(&e),
+            [Want::Code(IssueCode::BadParams)],
+            "{param}：{e}"
+        );
+        assert!(matches!(
+            engine.instantiate(&base, &r, &shapes(&square), &full_facts()),
+            Err(BindError::Recipe(_))
+        ));
+    }
+}
+
 /// 記録の形と、Facts のダイジェスト（同じ値なら同じ、変われば違う、有限でないピボットは断る）。
 #[test]
 fn bound_records_and_fact_digests() {
@@ -2113,7 +2391,8 @@ fn contents(g: &Graph) -> Vec<(String, u16, J, u64, bool)> {
 
 /// E50（E4 の延長）：結び付けた文書を一括の経路（正規の JSON・別のエンジン・キャッシュなしの render）で描いた値・PNG と
 /// WAV のバイト列・警告が、エディタの経路と同じ。ランダムな頭の文書と、格子・ピボット・ループ・秒・コマの時間を結ぶ決まった
-/// レシピ 6 つ。継いだ文書とエディタの文書は、ノード ID を除いて同じ。
+/// レシピ 8 つ（うち 2 つは結び付けたノードの後ろに相対の指定の操作 `image.pad`・`image.fit_canvas`・`meta.anchor_pivot`）。
+/// 継いだ文書とエディタの文書は、ノード ID を除いて同じ。
 #[test]
 fn bound_documents_match_the_editor_path() {
     let editor = Engine::new().unwrap();
@@ -2186,8 +2465,25 @@ fn bound_documents_match_the_editor_path() {
                 seed: 8,
             },
         ),
+        (
+            padded_sheet_recipe(),
+            InputGen::Sheet {
+                cols: 4,
+                rows: 2,
+                cell: 16,
+            },
+        ),
+        (
+            fitted_sprite_recipe(),
+            InputGen::Sheet {
+                cols: 3,
+                rows: 3,
+                cell: 16,
+            },
+        ),
     ];
     let mut matched = 0;
+    let mut matched_by = vec![0; recipes.len()];
     for (k, (recipe, make)) in recipes.iter().enumerate() {
         for round in 0..6 {
             let at = format!("レシピ {k} の {round}");
@@ -2239,9 +2535,13 @@ fn bound_documents_match_the_editor_path() {
                 "{at}"
             );
             matched += 1;
+            matched_by[k] += 1;
         }
     }
-    assert!(matched >= 24, "{matched}");
+    eprintln!("E50 の照らした回（レシピごと）：{matched_by:?}");
+    assert!(matched >= 32, "{matched}");
+    // どの決まったレシピも照らしている（頭の編集で当てられない回ばかりにならない）
+    assert!(matched_by.iter().all(|n| *n >= 2), "{matched_by:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
