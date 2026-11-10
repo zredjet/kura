@@ -330,4 +330,33 @@ mod tests {
     fn export_bindings() {
         super::export_bindings(&super::specta_builder()).unwrap();
     }
+
+    /// 型定義に、引数の記述の印（`origin`・`binds`）と新しい引数の種類（余白・キャンバスの長さ）が出る（M14 段 1）。
+    /// `EDIT_OPS` の各引数にも同じ項目が入る。
+    #[test]
+    fn bindings_describe_param_origin_and_binds() {
+        let temp =
+            std::env::temp_dir().join(format!("kura-bindings-origin-{}.ts", std::process::id()));
+        super::specta_builder()
+            .export(super::Typescript::default(), &temp)
+            .unwrap();
+        let ts = std::fs::read_to_string(&temp).unwrap();
+        std::fs::remove_file(&temp).unwrap();
+        for needle in [
+            "export type Origin = ",
+            "\"free\" | ",
+            "\"ratio\" | ",
+            "\"source\";",
+            "export type BindKind = ",
+            "\"frameMs\" | ",
+            "origin: Origin,",
+            "binds: BindKind[],",
+            "{ type: \"margin\" }",
+            "{ type: \"canvasLength\" }",
+            "\"binds\":[],",
+            "\"origin\":\"free\",",
+        ] {
+            assert!(ts.contains(needle), "bindings に {needle} がありません");
+        }
+    }
 }

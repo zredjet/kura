@@ -63,6 +63,10 @@ pub enum ParamKind {
     PaletteEntries,
     /// 音声の区間（フレーム。`{start, end}`、end は含まない。null で消す）。
     FrameRange,
+    /// 余白 1 辺（`{"px": n}`（負で削る。±2^31）か `{"scale": {"num", "den"}}`（その軸の長さに対する比）。M14 段 1）。
+    Margin,
+    /// キャンバスの 1 辺の長さ（`{"px": n}`・`{"scale": …}`・`"keep"`・`{"multipleOf": n}`・`"pow2"`・`"longest"`。M14 段 1）。
+    CanvasLength,
 }
 
 /// 引数の単位。
@@ -94,6 +98,36 @@ pub struct Visible {
     pub values: &'static [&'static str],
 }
 
+/// 引数の値が元（見本）によるか（M14 段 1。レシピを作る画面が印を付ける。結果には効かないので、直しても操作の版は上げない）。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Origin {
+    /// 元によらない（色・フィルタ・dB・列の数など）。
+    Free,
+    /// 比で書ける（`Length`・`Margin`・`CanvasLength`）。px で書けば絶対の値（意図して決めた大きさのこともある）。
+    Ratio,
+    /// 元の座標・長さで書いた値（矩形・点・区間・標本の数・描いたもの・パレットの番号）。ほかのアイテムでは合わないことがある。
+    Source,
+}
+
+/// 引数をアイテムの値に結び付けられる出どころの種類（M14 段 1。レシピの結び付け）。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BindKind {
+    /// 素材の設定の格子（`ParamKind::Grid` の引数）。
+    Grid,
+    /// 素材の設定のピボット（`ParamKind::Point` の引数）。
+    Pivot,
+    /// 素材の設定の試聴のループ（`ParamKind::FrameRange` の引数）。
+    Loop,
+    /// 素材の設定のコマの時間（単位 ms の `ParamKind::Int` の引数）。
+    FrameMs,
+    /// 秒（ノードの入力のレートでフレームに直す。単位 samples の `ParamKind::Int` か `ParamKind::FrameRange` の片方）。
+    Time,
+}
+
 /// 引数 1 つの記述。`key` は serde のフィールド名と一致させる（適合テストで確かめる）。文言は ja.ts で `key` から引く。
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -108,12 +142,34 @@ pub struct ParamSpec {
     pub advanced: bool,
     /// 表示の条件（None はいつも出す）。
     pub visible: Option<Visible>,
+    /// 値が元（見本）によるか（[`Origin`]。[`spec`] の既定は `Free`）。
+    pub origin: Origin,
+    /// 結び付けられる出どころの種類（[`BindKind`]。既定は空＝結び付けられない）。
+    pub binds: &'static [BindKind],
 }
 
 impl ParamSpec {
     /// 列挙の引数 `key` の値が `values` のどれかのときだけ出す（[`Visible`]）。
     pub fn when(mut self, key: &'static str, values: &'static [&'static str]) -> Self {
         self.visible = Some(Visible { key, values });
+        self
+    }
+
+    /// 比で書ける引数にする（[`Origin::Ratio`]）。
+    pub fn ratio(mut self) -> Self {
+        self.origin = Origin::Ratio;
+        self
+    }
+
+    /// 元の座標・長さで書いた引数にする（[`Origin::Source`]）。
+    pub fn source(mut self) -> Self {
+        self.origin = Origin::Source;
+        self
+    }
+
+    /// 結び付けられる出どころの種類を置く（[`BindKind`]。前に置いたものは置き換える）。
+    pub fn binds(mut self, kinds: &'static [BindKind]) -> Self {
+        self.binds = kinds;
         self
     }
 }
@@ -126,6 +182,11 @@ pub struct ParamSchema {
 }
 
 impl ParamSchema {
+    /// 名前 `key` の引数の記述（ないなら None）。
+    pub fn param(&self, key: &str) -> Option<&ParamSpec> {
+        self.params.iter().find(|p| p.key == key)
+    }
+
     /// 追記だけの配列の引数（[`ParamKind::Strokes`]）の名前（段 10。セッションと実行器が、追記した分だけを読み・指紋を
     /// 求め直し・差分で当てる）。ない、または 2 つ以上あれば `None`（差分の口を使わない）。
     pub fn append_field(&self) -> Option<&'static str> {
@@ -184,6 +245,11 @@ impl ParamSchema {
                             .is_some_and(|n| n > crate::geom::COORD_LIMIT as u64)
                     })
                 }
+                // 余白の px は ±2^31 まで（i64 に収まらない正の整数も外。比の項の範囲は操作の検証で見る）
+                ParamKind::Margin => v.get("px").is_some_and(|px| match px.as_i64() {
+                    Some(n) => !crate::geom::coord_ok(n),
+                    None => px.is_u64(),
+                }),
                 _ => false,
             };
             if bad {
@@ -1297,7 +1363,7 @@ impl Registry {
     }
 }
 
-/// 引数の記述を短く書く補助。
+/// 引数の記述を短く書く補助（詳細でなく・いつも出し・元によらず（`Origin::Free`）・結び付けられない）。
 pub fn spec(
     key: &'static str,
     kind: ParamKind,
@@ -1311,6 +1377,8 @@ pub fn spec(
         default,
         advanced: false,
         visible: None,
+        origin: Origin::Free,
+        binds: &[],
     }
 }
 
@@ -1675,5 +1743,245 @@ mod tests {
         assert!(schema.check_ranges(&ok).is_empty());
         assert!(schema.check_ranges(&far).has_errors());
         assert!(schema.check_ranges(&wide).has_errors());
+    }
+
+    /// `spec` の既定は元によらず（free）・結び付けられない（空）。`ratio`・`source`・`binds` はその項目だけを変え、
+    /// 続けて呼ぶと後のものになる。
+    #[test]
+    fn spec_defaults_to_free_without_binds_and_builders_set_one_field() {
+        let base = spec("grid", ParamKind::Grid, Unit::Px, serde_json::json!(null));
+        assert_eq!(base.origin, Origin::Free);
+        assert!(base.binds.is_empty());
+        assert!(!base.advanced && base.visible.is_none());
+
+        let ratio = base.clone().ratio();
+        assert_eq!(ratio.origin, Origin::Ratio);
+        assert_eq!(
+            ParamSpec {
+                origin: Origin::Free,
+                ..ratio.clone()
+            },
+            base
+        );
+        let source = base.clone().source();
+        assert_eq!(source.origin, Origin::Source);
+        assert!(source.binds.is_empty());
+        assert_eq!(base.clone().ratio().source().origin, Origin::Source);
+        assert_eq!(base.clone().source().ratio().origin, Origin::Ratio);
+
+        let bound = base
+            .clone()
+            .source()
+            .binds(&[BindKind::Grid, BindKind::FrameMs]);
+        assert_eq!(bound.origin, Origin::Source);
+        assert_eq!(bound.binds, &[BindKind::Grid, BindKind::FrameMs]);
+        assert_eq!(
+            ParamSpec {
+                binds: &[],
+                ..bound.clone()
+            },
+            source
+        );
+        // 置き換え（足さない）
+        assert_eq!(
+            bound.clone().binds(&[BindKind::Time]).binds,
+            &[BindKind::Time]
+        );
+        assert!(bound.binds(&[]).binds.is_empty());
+        // 表示の条件と組み合わせても互いに消さない
+        let both = base.when("mode", &["a"]).ratio().binds(&[BindKind::Loop]);
+        assert_eq!(
+            both.visible,
+            Some(Visible {
+                key: "mode",
+                values: &["a"]
+            })
+        );
+        assert_eq!(both.origin, Origin::Ratio);
+        assert_eq!(both.binds, &[BindKind::Loop]);
+    }
+
+    /// 名前で引数の記述を引ける（ないなら None。同じ名前は先のもの）。
+    #[test]
+    fn schema_finds_params_by_key() {
+        let schema = ParamSchema {
+            params: vec![
+                spec("a", ParamKind::Bool, Unit::None, serde_json::json!(false)),
+                spec(
+                    "b",
+                    ParamKind::Margin,
+                    Unit::Px,
+                    serde_json::json!({"px": 0}),
+                )
+                .ratio(),
+            ],
+        };
+        assert_eq!(
+            schema.param("a").map(|p| p.kind.clone()),
+            Some(ParamKind::Bool)
+        );
+        assert_eq!(schema.param("b").map(|p| p.origin), Some(Origin::Ratio));
+        assert!(schema.param("c").is_none());
+        assert!(schema.param("").is_none());
+        assert!(ParamSchema::default().param("a").is_none());
+    }
+
+    /// 余白の px は ±2^31 の中だけ（比・知らない形・null は型の読みに任せる）。キャンバスの長さは操作の検証で見る。
+    #[test]
+    fn margin_px_out_of_range_is_rejected() {
+        let schema = ParamSchema {
+            params: vec![
+                spec(
+                    "top",
+                    ParamKind::Margin,
+                    Unit::Px,
+                    serde_json::json!({"px": 0}),
+                ),
+                spec(
+                    "width",
+                    ParamKind::CanvasLength,
+                    Unit::Px,
+                    serde_json::json!("keep"),
+                ),
+            ],
+        };
+        let limit = crate::geom::COORD_LIMIT;
+        for ok in [
+            serde_json::json!({}),
+            serde_json::json!({ "top": { "px": 0 } }),
+            serde_json::json!({ "top": { "px": -2 } }),
+            serde_json::json!({ "top": { "px": limit } }),
+            serde_json::json!({ "top": { "px": -limit } }),
+            serde_json::json!({ "top": { "scale": { "num": 1, "den": 2 } } }),
+            serde_json::json!({ "top": { "scale": { "num": u64::MAX, "den": 0 } } }),
+            serde_json::json!({ "top": { "px": 1.5 } }),
+            serde_json::json!({ "top": { "px": "3" } }),
+            serde_json::json!({ "top": null }),
+            serde_json::json!({ "top": "px" }),
+            serde_json::json!({ "width": { "px": u64::MAX } }),
+            serde_json::json!({ "width": { "multipleOf": 0 } }),
+        ] {
+            assert!(schema.check_ranges(&ok).is_empty(), "{ok}");
+        }
+        for bad in [
+            serde_json::json!({ "top": { "px": limit + 1 } }),
+            serde_json::json!({ "top": { "px": -limit - 1 } }),
+            serde_json::json!({ "top": { "px": i64::MAX } }),
+            serde_json::json!({ "top": { "px": i64::MIN } }),
+            serde_json::json!({ "top": { "px": u64::MAX } }),
+        ] {
+            let issues = schema.check_ranges(&bad);
+            assert!(issues.has_errors(), "{bad}");
+            assert!(
+                issues.0.len() == 1
+                    && issues
+                        .0
+                        .iter()
+                        .all(|i| i.code == IssueCode::OutOfRange
+                            && i.param.as_deref() == Some("top")),
+                "{bad}"
+            );
+        }
+    }
+
+    /// 記述の JSON の形（bindings の `EDIT_OPS` に出る形）：`origin` は小文字の文字列、`binds` は camelCase の文字列の配列、
+    /// 新しい引数の種類は `{"type": "margin"}`・`{"type": "canvasLength"}`。
+    #[test]
+    fn descriptor_json_carries_origin_and_binds() {
+        let plain = serde_json::to_value(spec(
+            "columns",
+            ParamKind::Int {
+                min: 1,
+                max: 8,
+                step: 1,
+            },
+            Unit::None,
+            serde_json::json!(8),
+        ))
+        .unwrap();
+        assert_eq!(
+            plain,
+            serde_json::json!({
+                "key": "columns",
+                "kind": { "type": "int", "min": 1, "max": 8, "step": 1 },
+                "unit": "none",
+                "default": 8,
+                "advanced": false,
+                "visible": null,
+                "origin": "free",
+                "binds": [],
+            })
+        );
+        let marked = serde_json::to_value(
+            spec(
+                "loop",
+                ParamKind::FrameRange,
+                Unit::Samples,
+                serde_json::json!(null),
+            )
+            .source()
+            .binds(&[BindKind::Loop, BindKind::Time]),
+        )
+        .unwrap();
+        assert_eq!(marked["origin"], "source");
+        assert_eq!(marked["binds"], serde_json::json!(["loop", "time"]));
+        let ratio = serde_json::to_value(
+            spec("w", ParamKind::Length, Unit::Px, serde_json::json!("auto")).ratio(),
+        )
+        .unwrap();
+        assert_eq!(ratio["origin"], "ratio");
+        assert_eq!(
+            serde_json::to_value([
+                BindKind::Grid,
+                BindKind::Pivot,
+                BindKind::Loop,
+                BindKind::FrameMs,
+                BindKind::Time,
+            ])
+            .unwrap(),
+            serde_json::json!(["grid", "pivot", "loop", "frameMs", "time"])
+        );
+        assert_eq!(
+            serde_json::to_value([Origin::Free, Origin::Ratio, Origin::Source]).unwrap(),
+            serde_json::json!(["free", "ratio", "source"])
+        );
+        assert_eq!(
+            serde_json::to_value([ParamKind::Margin, ParamKind::CanvasLength]).unwrap(),
+            serde_json::json!([{ "type": "margin" }, { "type": "canvasLength" }])
+        );
+    }
+
+    /// 本物の登録表のすべての版の記述が `origin`・`binds` を JSON に持つ（A0 では印をまだ付けないので、どれも既定のまま）。
+    /// 既定値の引数（文書に書く値）は記述を足しても変わらない。
+    #[test]
+    fn registered_descriptors_serialize_the_new_fields() {
+        let registry = crate::ops::registry().unwrap();
+        let mut params = 0;
+        for op in registry.all() {
+            let schema = op.schema();
+            let json = serde_json::to_value(&schema).unwrap();
+            for (spec, j) in schema.params.iter().zip(json["params"].as_array().unwrap()) {
+                params += 1;
+                assert!(
+                    matches!(j["origin"].as_str(), Some("free" | "ratio" | "source")),
+                    "{} {}",
+                    op.id(),
+                    spec.key
+                );
+                assert!(j["binds"].is_array(), "{} {}", op.id(), spec.key);
+                assert_eq!(j["default"], spec.default);
+            }
+            assert!(
+                schema
+                    .defaults()
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .all(|k| schema.param(k).is_some()),
+                "{}",
+                op.id()
+            );
+        }
+        assert!(params > 0);
     }
 }
