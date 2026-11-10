@@ -1,3 +1,16 @@
+/** 9 点の基準の名前（`image.fit_canvas`・`meta.anchor_pivot` の `anchor`。bindings の値の名前がキー）。 */
+const ANCHOR_LABELS = {
+  topLeft: '左上',
+  top: '上',
+  topRight: '右上',
+  left: '左',
+  center: '中央',
+  right: '右',
+  bottomLeft: '左下',
+  bottom: '下',
+  bottomRight: '右下',
+};
+
 /** UI の文言（日本語）。画面に出す文字列はすべてここに置く。数値は呼ぶ側で整形して渡す。 */
 export const ja = {
   app: {
@@ -860,10 +873,25 @@ export const ja = {
         },
       },
       'image.crop': { name: '切り抜き', params: { rect: '範囲' } },
+      'image.fit_canvas': {
+        name: 'キャンバスを合わせる',
+        params: {
+          width: '幅',
+          height: '高さ',
+          anchor: '基準',
+          fill: '広げた部分の色',
+          allowCrop: '画像より小さければ切る',
+        },
+        values: { anchor: ANCHOR_LABELS },
+      },
       'image.flip': {
         name: '反転',
         params: { axis: '向き' },
         values: { axis: { horizontal: '左右', vertical: '上下' } },
+      },
+      'image.pad': {
+        name: '余白',
+        params: { top: '上', right: '右', bottom: '下', left: '左', fill: '足した部分の色' },
       },
       'image.resize': {
         name: '大きさを変える',
@@ -886,6 +914,11 @@ export const ja = {
         name: '透明な余白を切る',
         params: { threshold: 'しきい値', mode: 'コマの扱い' },
         values: { mode: { union: 'まとめて切る', perFrame: 'コマごとに切る' } },
+      },
+      'meta.anchor_pivot': {
+        name: 'ピボット（基準）',
+        params: { anchor: '基準', offset: 'ずれ' },
+        values: { anchor: ANCHOR_LABELS },
       },
       'meta.set_grid': { name: '格子', params: { grid: '格子' } },
       'meta.set_pivot': { name: 'ピボット', params: { pivot: 'ピボット' } },

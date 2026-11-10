@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { ja } from '../../i18n/ja';
 import { EDIT_CATALOG, type EditNodeDto, type ParamSpec } from '../../ipc/edit';
 import {
+  NOT_ADDABLE_YET,
   addableOps,
   controlFor,
   defaultParams,
@@ -126,6 +127,28 @@ describe('足す操作', () => {
     expect(opCategory('audio.gain')).toBe('audioSignal');
     expect(opCategory('audio.resample')).toBe('audioSignal');
     expect(opCategory('image.rotate90')).toBe('geometry');
+  });
+
+  it('相対の指定の操作（余白・キャンバスを合わせる・9 点のピボット）は段 7 まで足せないが、カタログにはある', () => {
+    expect([...NOT_ADDABLE_YET].sort()).toEqual([
+      'image.fit_canvas',
+      'image.pad',
+      'meta.anchor_pivot',
+    ]);
+    const ids = (['image', 'audio'] as const).flatMap((kind) =>
+      addableOps(kind).flatMap((g) => g.ops.map((o) => o.id)),
+    );
+    for (const id of NOT_ADDABLE_YET) {
+      expect(opSpec(id), id).not.toBeNull();
+      expect(ids, id).not.toContain(id);
+    }
+    // 文書に入っていれば、余白・長さは読むだけの欄、9 点は選択、ずれは点の欄で出す
+    expect(controlFor(param('image.pad', 'top'))).toBe('readonly');
+    expect(controlFor(param('image.fit_canvas', 'width'))).toBe('readonly');
+    expect(controlFor(param('image.fit_canvas', 'anchor'))).toBe('select');
+    expect(controlFor(param('meta.anchor_pivot', 'offset'))).toBe('point');
+    expect(opCategory('image.pad')).toBe('geometry');
+    expect(opCategory('meta.anchor_pivot')).toBe('meta');
   });
 
   it('音声のエディタは音声の操作だけを「時間」「音量・チャンネル・レート」に分ける', () => {

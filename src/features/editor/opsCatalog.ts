@@ -60,6 +60,16 @@ const CATEGORY_ORDER: readonly OpCategory[] = [
   'other',
 ];
 
+/**
+ * 「操作を追加」にまだ出さない操作（M14 段 1 で入れた相対の指定。余白・キャンバスの長さ・9 点の欄は段 7 で作るので、
+ * それまでは足せない。文書に入っていれば、汎用の欄（読むだけ）で表示する）。段 7 でこの一覧から消す。
+ */
+export const NOT_ADDABLE_YET: readonly string[] = [
+  'image.pad',
+  'image.fit_canvas',
+  'meta.anchor_pivot',
+];
+
 /** 音声の時間の操作（切り詰め・フェード・ループ点）。 */
 const AUDIO_TIME_OPS: readonly string[] = ['audio.trim', 'audio.fade', 'audio.set_loop'];
 
@@ -88,13 +98,18 @@ export function opSpec(
 
 /**
  * その種類のエディタで足せる操作（最初の入力が種類の入力のどれかを受けるもの。画像は画像かフレームの列）を分類ごとに。
+ * `NOT_ADDABLE_YET` の操作は除く。
  */
 export function addableOps(
   kind: EditorKind,
   catalog: readonly OpDescriptor[] = EDIT_CATALOG,
 ): { category: OpCategory; ops: OpDescriptor[] }[] {
   const inputs = opInputsOf(kind);
-  const ops = catalog.filter((o) => o.signature.inputs[0]?.accepts.some((k) => inputs.includes(k)));
+  const ops = catalog.filter(
+    (o) =>
+      !NOT_ADDABLE_YET.includes(o.id) &&
+      o.signature.inputs[0]?.accepts.some((k) => inputs.includes(k)),
+  );
   return CATEGORY_ORDER.map((category) => ({
     category,
     ops: ops.filter((o) => opCategory(o.id) === category),
