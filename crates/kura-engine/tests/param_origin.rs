@@ -25,10 +25,6 @@ const BOUND: &[(&str, &str, &[BindKind])] = &[
     ("sprite.split_grid", "grid", &[BindKind::Grid]),
 ];
 
-/// 新しい操作の担当（M14 段 1 の B）が印を付ける引数。B を合流するまでは印のない（free・結び付けなし）形も許す。
-/// 合流したらこの表を消す（印が付いていれば、ほかの引数と同じく確かめる）。
-const AWAITING_B: &[(&str, &str)] = &[("image.canvas", "rect"), ("meta.set_pivot", "pivot")];
-
 /// 引数の種類から決まる印（None は「Ratio でなければよい」）。
 fn expected_origin(op: &str, spec: &ParamSpec) -> Option<Origin> {
     match spec.kind {
@@ -70,12 +66,6 @@ fn param_origins_and_binds_follow_the_kinds() {
         for spec in op.schema().params {
             checked += 1;
             let at = format!("{id} v{} の {}", op.version(), spec.key);
-            let awaiting = AWAITING_B.contains(&(id, spec.key))
-                && spec.origin == Origin::Free
-                && spec.binds.is_empty();
-            if awaiting {
-                continue;
-            }
             match expected_origin(id, &spec) {
                 Some(want) if spec.origin != want => {
                     failures.push(format!(
@@ -118,8 +108,7 @@ fn param_origins_and_binds_follow_the_kinds() {
     }
     // 表の行はどれも登録表にある（消した引数の行を残さない）
     for (op, key, _) in BOUND {
-        if !seen_bound.iter().any(|(o, k)| o == op && k == key) && !AWAITING_B.contains(&(op, key))
-        {
+        if !seen_bound.iter().any(|(o, k)| o == op && k == key) {
             failures.push(format!("BOUND の {op} の {key} が登録表にありません"));
         }
     }
