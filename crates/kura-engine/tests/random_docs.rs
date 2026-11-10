@@ -75,6 +75,30 @@ fn random_params(r: &mut ChaCha8Rng, schema: &ParamSchema) -> J {
                 2 => json!({ "px": u32::MAX }),
                 _ => json!({ "px": below(r, 400) }),
             },
+            // 余白：削る・足す・比（ときどき端の値と使えない比）
+            ParamKind::Margin => match below(r, 10) {
+                0 => json!({ "scale": { "num": below(r, 6), "den": below(r, 6) } }),
+                1 => {
+                    let edge = [i64::MIN, i64::MAX, (1i64 << 31) + 1, -(1i64 << 31)];
+                    json!({ "px": edge[below(r, 4) as usize] })
+                }
+                2 => json!({ "scale": { "num": u32::MAX, "den": 1 } }),
+                _ => json!({ "px": below(r, 80) as i64 - 40 }),
+            },
+            // キャンバスの長さの 6 種（ときどき 0・端の値）
+            ParamKind::CanvasLength => match below(r, 10) {
+                0 => json!("keep"),
+                1 => json!("pow2"),
+                2 => json!("longest"),
+                3 => json!({ "multipleOf": below(r, 40) }),
+                4 => json!({ "scale": { "num": below(r, 6), "den": below(r, 6) } }),
+                5 => {
+                    let edge = [0, u32::MAX];
+                    json!({ "px": edge[below(r, 2) as usize] })
+                }
+                6 => json!({ "multipleOf": u32::MAX }),
+                _ => json!({ "px": below(r, 400) }),
+            },
             ParamKind::Grid => {
                 if below(r, 8) == 0 {
                     J::Null

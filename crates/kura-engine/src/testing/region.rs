@@ -12,7 +12,7 @@ use serde_json::json;
 
 use crate::doc::{Dither, Graph, InputId, QUANTIZE_VERSION, Quantize};
 use crate::error::EngineError;
-use crate::geom::{IPoint, IRect, Length, Ratio};
+use crate::geom::{ANCHOR_NAMES, Anchor, IPoint, IRect, Length, Ratio};
 use crate::monitor::NoMonitor;
 use crate::paint::{Blend, Brush, BrushShape, PaintAction, PaintColor, PointList, Tool};
 use crate::render::Engine;
@@ -242,7 +242,7 @@ pub fn random_op(
         IRect::new(x, y, rw, rh)
     };
     loop {
-        let pick = below(r, 13);
+        let pick = below(r, 16);
         match pick {
             0 if full_frames => {
                 return ("image.crop", json!({ "rect": rect(r) }));
@@ -346,6 +346,60 @@ pub fn random_op(
                     json!({ "threshold": below(r, 20), "mode": "union" }),
                 );
             }
+            // 余白：足す・削る（各辺は長さの半分未満なので 1 以上が残る）・比
+            13 if full_frames => {
+                let side = |r: &mut ChaCha8Rng, n: u64| match below(r, 5) {
+                    0 => json!({ "scale": { "num": below(r, 3), "den": 1 + below(r, 4) } }),
+                    1 => json!({ "px": -(below(r, (n.max(1) - 1) / 2 + 1) as i64) }),
+                    _ => json!({ "px": below(r, 40) }),
+                };
+                let (top, right) = (side(r, h), side(r, w));
+                let (bottom, left) = (side(r, h), side(r, w));
+                let fill = if below(r, 2) == 0 {
+                    serde_json::Value::Null
+                } else {
+                    json!(color(r))
+                };
+                return (
+                    "image.pad",
+                    json!({ "top": top, "right": right, "bottom": bottom, "left": left, "fill": fill }),
+                );
+            }
+            // 大きさと 9 点（2 倍くらいまで）。切ってよいかは半々（切れる大きさで断られれば選び直す）
+            14 if full_frames => {
+                let len = |r: &mut ChaCha8Rng, n: u64| match below(r, 7) {
+                    0 => json!({ "px": 1 + below(r, n + 40) }),
+                    1 => json!({ "scale": { "num": 1 + below(r, 2), "den": 1 + below(r, 3) } }),
+                    2 => json!("keep"),
+                    3 => json!({ "multipleOf": 1 + below(r, 32) }),
+                    4 => json!("pow2"),
+                    5 => json!("longest"),
+                    _ => json!({ "px": n + below(r, 30) }),
+                };
+                let (width, height) = (len(r, w), len(r, h));
+                let anchor = ANCHOR_NAMES[below(r, ANCHOR_NAMES.len() as u64) as usize];
+                let fill = if below(r, 2) == 0 {
+                    serde_json::Value::Null
+                } else {
+                    json!(color(r))
+                };
+                return (
+                    "image.fit_canvas",
+                    json!({ "width": width, "height": height, "anchor": anchor, "fill": fill, "allowCrop": below(r, 2) == 0 }),
+                );
+            }
+            // 9 点のピボット（画像の中に収まるずれ）
+            15 => {
+                let i = below(r, Anchor::ALL.len() as u64) as usize;
+                let (ax, ay) = Anchor::ALL[i].factors();
+                let base = |n: u64, a: i64| (n as i64).saturating_mul(a) / 2;
+                let x = below(r, w + 1) as i64 - base(w, ax);
+                let y = below(r, h + 1) as i64 - base(h, ay);
+                return (
+                    "meta.anchor_pivot",
+                    json!({ "anchor": ANCHOR_NAMES[i], "offset": { "x": x, "y": y } }),
+                );
+            }
             _ => continue,
         }
     }
@@ -405,7 +459,8 @@ pub fn random_chain(
 }
 
 /// ランダムな編集の種類（テストで、どれも起きたかを数える）。前の 7 つはノード 1 つの引数・追記・有効の切り替え、
-/// `fill` は canvas の fill だけの変更、`seed` は種だけの変更、後ろの 4 つは構造の手（置き換え・消す・動かす・足す）。
+/// `fill` は canvas・pad・fit_canvas の fill だけの変更、`seed` は種だけの変更、後ろの 4 つは構造の手（置き換え・消す・
+/// 動かす・足す）。
 pub const EDIT_KINDS: &[&str] = &[
     "params", "append", "middle", "toggle", "fade", "loop", "meta", "fill", "seed", "replace",
     "remove", "move", "add",
@@ -500,8 +555,13 @@ pub fn random_edit(
             let (w, h, fmt, frames) =
                 image_dims(&in_shape).unwrap_or((1, 1, PixelFormat::Rgba8, 1));
             match pick {
-                0 if node.op == "image.canvas" && below(r, 2) == 0 => {
-                    // fill だけを変える（持ち上げた canvas の param_change は、フレームの列の全フレームに広げる）
+                0 if matches!(
+                    node.op.as_str(),
+                    "image.canvas" | "image.pad" | "image.fit_canvas"
+                ) && below(r, 2) == 0 =>
+                {
+                    // fill だけを変える（持ち上げた canvas の param_change は、フレームの列の全フレームに広げる。pad・fit_canvas も
+                    // canvas と同じ）
                     kind = "fill";
                     let mut p = node.params.clone();
                     p["fill"] = if below(r, 3) == 0 {
