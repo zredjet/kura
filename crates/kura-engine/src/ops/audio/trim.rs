@@ -12,8 +12,8 @@ use crate::audio::{AudioKernel, render_all};
 use crate::error::{EngineError, Issues};
 use crate::mapping::{Seg, SpaceMap, TimeMap};
 use crate::op::{
-    Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
-    ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
+    Applied, ApplyCx, BindKind, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op,
+    OpParams, ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{MAX_FRAME_PARAM, audio_of, audio_shape, bad_param};
 use crate::render::region::{Area, Reach};
@@ -44,7 +44,9 @@ impl OpParams for TrimParams {
                     },
                     Unit::Samples,
                     json!(0),
-                ),
+                )
+                .source()
+                .binds(&[BindKind::Time]),
                 spec(
                     "end",
                     ParamKind::Int {
@@ -54,7 +56,9 @@ impl OpParams for TrimParams {
                     },
                     Unit::Samples,
                     json!(null),
-                ),
+                )
+                .source()
+                .binds(&[BindKind::Time]),
             ],
         }
     }

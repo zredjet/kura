@@ -15,8 +15,8 @@ use crate::error::{EngineError, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::math;
 use crate::op::{
-    Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
-    ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
+    Applied, ApplyCx, BindKind, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op,
+    OpParams, ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{MAX_FRAME_PARAM, audio_of, audio_shape, bad_param};
 use crate::render::region::{Area, Reach};
@@ -54,8 +54,12 @@ impl OpParams for FadeParams {
         };
         ParamSchema {
             params: vec![
-                spec("fadeIn", frames(), Unit::Samples, json!(0)),
-                spec("fadeOut", frames(), Unit::Samples, json!(0)),
+                spec("fadeIn", frames(), Unit::Samples, json!(0))
+                    .source()
+                    .binds(&[BindKind::Time]),
+                spec("fadeOut", frames(), Unit::Samples, json!(0))
+                    .source()
+                    .binds(&[BindKind::Time]),
                 spec(
                     "curve",
                     ParamKind::Enum {

@@ -2142,7 +2142,7 @@ mod tests {
         );
     }
 
-    /// 本物の登録表のすべての版の記述が `origin`・`binds` を JSON に持つ（A0 では印をまだ付けないので、どれも既定のまま）。
+    /// 本物の登録表のすべての版の記述が `origin`・`binds` を JSON に持つ（印は `tests/param_origin.rs` の E53 が確かめる）。
     /// 既定値の引数（文書に書く値）は記述を足しても変わらない。
     #[test]
     fn registered_descriptors_serialize_the_new_fields() {

@@ -15,8 +15,8 @@ use crate::geom::{IRect, Size};
 use crate::imaging::bounds::opaque_bounds;
 use crate::mapping::{IntAffine, SpaceMap, TimeMap, map_image_meta_for};
 use crate::op::{
-    Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
-    ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
+    Applied, ApplyCx, BindKind, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op,
+    OpParams, ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{GridParam, bad_param, image_of};
 use crate::shape::{Dim, Fullness, Shape, ValueKind};
@@ -43,7 +43,9 @@ impl OpParams for SplitParams {
                     ParamKind::Grid,
                     Unit::Px,
                     json!({ "cellW": 16, "cellH": 16, "offsetX": 0, "offsetY": 0, "gapX": 0, "gapY": 0 }),
-                ),
+                )
+                .source()
+                .binds(&[BindKind::Grid]),
                 spec(
                     "durationMs",
                     ParamKind::Int {
@@ -53,7 +55,8 @@ impl OpParams for SplitParams {
                     },
                     Unit::Ms,
                     json!(100),
-                ),
+                )
+                .binds(&[BindKind::FrameMs]),
                 spec("skipEmpty", ParamKind::Bool, Unit::None, json!(false)),
             ],
         }

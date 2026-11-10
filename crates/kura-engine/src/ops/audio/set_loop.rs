@@ -10,8 +10,8 @@ use crate::audio::{AudioKernel, WithMeta};
 use crate::error::{EngineError, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::op::{
-    Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
-    ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
+    Applied, ApplyCx, BindKind, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op,
+    OpParams, ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{audio_of, audio_shape, bad_param};
 use crate::render::region::{Area, Reach};
@@ -38,12 +38,11 @@ pub struct SetLoopParams {
 impl OpParams for SetLoopParams {
     fn schema() -> ParamSchema {
         ParamSchema {
-            params: vec![spec(
-                "loop",
-                ParamKind::FrameRange,
-                Unit::Samples,
-                json!(null),
-            )],
+            params: vec![
+                spec("loop", ParamKind::FrameRange, Unit::Samples, json!(null))
+                    .source()
+                    .binds(&[BindKind::Loop, BindKind::Time]),
+            ],
         }
     }
 }

@@ -37,12 +37,9 @@ pub struct ReplaceParams {
 impl OpParams for ReplaceParams {
     fn schema() -> ParamSchema {
         ParamSchema {
-            params: vec![spec(
-                "entries",
-                ParamKind::PaletteEntries,
-                Unit::None,
-                json!([]),
-            )],
+            params: vec![
+                spec("entries", ParamKind::PaletteEntries, Unit::None, json!([])).source(),
+            ],
         }
     }
 }

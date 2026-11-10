@@ -68,8 +68,8 @@ impl OpParams for ResizeParams {
     fn schema() -> ParamSchema {
         ParamSchema {
             params: vec![
-                spec("width", ParamKind::Length, Unit::Px, json!({ "px": 1 })),
-                spec("height", ParamKind::Length, Unit::Px, json!("auto")),
+                spec("width", ParamKind::Length, Unit::Px, json!({ "px": 1 })).ratio(),
+                spec("height", ParamKind::Length, Unit::Px, json!("auto")).ratio(),
                 spec(
                     "filter",
                     ParamKind::Enum {

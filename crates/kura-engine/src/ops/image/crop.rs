@@ -29,12 +29,15 @@ pub struct CropParams {
 impl OpParams for CropParams {
     fn schema() -> ParamSchema {
         ParamSchema {
-            params: vec![spec(
-                "rect",
-                ParamKind::Rect,
-                Unit::Px,
-                json!({ "x": 0, "y": 0, "w": 1, "h": 1 }),
-            )],
+            params: vec![
+                spec(
+                    "rect",
+                    ParamKind::Rect,
+                    Unit::Px,
+                    json!({ "x": 0, "y": 0, "w": 1, "h": 1 }),
+                )
+                .source(),
+            ],
         }
     }
 }

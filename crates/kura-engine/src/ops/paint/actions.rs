@@ -40,7 +40,7 @@ pub struct PaintParams {
 impl OpParams for PaintParams {
     fn schema() -> ParamSchema {
         ParamSchema {
-            params: vec![spec("actions", ParamKind::Strokes, Unit::None, json!([]))],
+            params: vec![spec("actions", ParamKind::Strokes, Unit::None, json!([])).source()],
         }
     }
 }

@@ -10,8 +10,8 @@ use serde_json::json;
 use crate::error::{EngineError, Issues};
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::op::{
-    Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
-    ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
+    Applied, ApplyCx, BindKind, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op,
+    OpParams, ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{GridParam, bad_param, exact_size};
 use crate::render::preview::{Preview, image_bounds, scale_exact};
@@ -30,7 +30,11 @@ pub struct SetGridParams {
 impl OpParams for SetGridParams {
     fn schema() -> ParamSchema {
         ParamSchema {
-            params: vec![spec("grid", ParamKind::Grid, Unit::Px, json!(null))],
+            params: vec![
+                spec("grid", ParamKind::Grid, Unit::Px, json!(null))
+                    .source()
+                    .binds(&[BindKind::Grid]),
+            ],
         }
     }
 }
