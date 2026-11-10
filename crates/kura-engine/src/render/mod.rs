@@ -134,6 +134,18 @@ impl Plan {
             .map(|n| (n.inferred.space.clone(), n.inferred.time.clone()))
     }
 
+    /// `ids` のノードの写し方を 1 度の走査で（[`Plan::node_maps`] の多くのノードの版。ないノードは入らない）。
+    pub fn nodes_maps(
+        &self,
+        ids: &std::collections::BTreeSet<NodeId>,
+    ) -> BTreeMap<NodeId, (SpaceMap, TimeMap)> {
+        self.nodes
+            .iter()
+            .filter(|n| ids.contains(&n.id))
+            .map(|n| (n.id, (n.inferred.space.clone(), n.inferred.time.clone())))
+            .collect()
+    }
+
     /// ノードが描く前に解く解析（操作の申告）。
     pub fn node_needs(&self, id: NodeId) -> Option<&[Need]> {
         self.nodes

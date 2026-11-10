@@ -278,8 +278,9 @@ impl Graph {
         if input_ids.windows(2).any(|w| w[0] == w[1]) {
             issues.push(bad("入力の ID が重複しています".into()));
         }
-        let mut seen: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
-        let known = |r: &PortRef, seen: &[NodeId]| match r {
+        // 前のノードの ID（木で引く。1 万ノードの文書で線形に探すと、レシピの結び付けの compile が重くなる）
+        let mut seen: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        let known = |r: &PortRef, seen: &std::collections::BTreeSet<NodeId>| match r {
             PortRef::Input { id } => input_ids.contains(id),
             PortRef::Node { id } => seen.contains(id),
         };
@@ -298,7 +299,7 @@ impl Graph {
                         .push(bad("前にないノードか、ない入力を参照しています".into()).at(node.id));
                 }
             }
-            seen.push(node.id);
+            seen.insert(node.id);
         }
         let mut out_ids: Vec<OutputId> = self.outputs.iter().map(|o| o.id).collect();
         out_ids.sort();

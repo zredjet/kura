@@ -498,33 +498,37 @@ fn moved(
     offset: u32,
     time: bool,
 ) -> Result<(), BindError> {
+    // 1：入力 0 の鎖（ID で引く表を 1 度作る。1 歩ごとに文書を線形に探すと、大きなレシピで結び付けごとに 2 乗になる）
+    let index: BTreeMap<NodeId, &crate::doc::Node> = g.nodes.iter().map(|n| (n.id, n)).collect();
+    let mut chain = Vec::new();
     let mut at = input0;
-    let mut by = None;
     // ノードの数より長くはたどらない（前のノードしか指せないので必ず終わる）
     for _ in 0..=g.nodes.len() {
         let PortRef::Node { id } = at else { break };
         if id.0 < offset {
             break;
         }
-        let Some((space, time_map)) = before.node_maps(id) else {
+        chain.push(id);
+        match index.get(&id).and_then(|n| n.inputs.first()) {
+            Some(next) => at = *next,
+            None => break,
+        }
+    }
+    // 2：鎖のノードの写し方（計画を 1 度だけ走査する）。計画にないノードで止める
+    let ids: std::collections::BTreeSet<NodeId> = chain.iter().copied().collect();
+    let maps = before.nodes_maps(&ids);
+    let mut by = None;
+    for id in chain {
+        let Some((space, time_map)) = maps.get(&id) else {
             break;
         };
         let identity = if time {
-            time_map == TimeMap::Identity
+            *time_map == TimeMap::Identity
         } else {
-            space == SpaceMap::Identity
+            *space == SpaceMap::Identity
         };
         if !identity {
             by = Some(id);
-        }
-        match g
-            .nodes
-            .iter()
-            .find(|n| n.id == id)
-            .and_then(|n| n.inputs.first())
-        {
-            Some(next) => at = *next,
-            None => break,
         }
     }
     match by {
