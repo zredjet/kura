@@ -655,8 +655,8 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
     ]
 }
 
-/// レシピの種：素材の格子で切ってコマの時間を付けて並べ直すもの（docs の例から B の操作を除いたもの）・音声の秒のもの・
-/// N → 1 の形だけのもの・結び付けのないもの。
+/// レシピの種：素材の格子で切ってコマの時間を付けて並べ直すもの・その各コマに 1px の余白を足すもの（M14 段 1 の設計
+/// §1.2 の例そのもの。`image.pad` を含む）・音声の秒のもの・N → 1 の形だけのもの・結び付けのないもの。
 fn recipe_seeds() -> Vec<Vec<u8>> {
     use kura_engine::doc::{InputRole, NodeId};
     use kura_engine::recipe::{
@@ -690,6 +690,28 @@ fn recipe_seeds() -> Vec<Vec<u8>> {
         vec![
             bind(1, "grid", None, Source::Setting { key: SettingKey::Grid }),
             bind(1, "durationMs", None, Source::Setting { key: SettingKey::FrameMs }),
+        ],
+    )
+    .unwrap();
+    // 設計 §1.2 の例（格子は 16×16、8 列）
+    let padded = Recipe::new(
+        "コマに 1px の余白".into(),
+        "素材の格子で切って、上下左右に 1px 足して並べ直す".into(),
+        RecipeKind::Each,
+        chain(&[
+            (
+                "sprite.split_grid",
+                json!({ "grid": { "cellW": 16, "cellH": 16, "offsetX": 0, "offsetY": 0, "gapX": 0, "gapY": 0 }, "durationMs": 100, "skipEmpty": false }),
+            ),
+            (
+                "image.pad",
+                json!({ "top": { "px": 1 }, "right": { "px": 1 }, "bottom": { "px": 1 }, "left": { "px": 1 }, "fill": null }),
+            ),
+            ("sprite.pack_grid", json!({ "columns": 8, "gapX": 0, "gapY": 0, "fill": null })),
+        ]),
+        vec![
+            bind(1, "durationMs", None, Source::Setting { key: SettingKey::FrameMs }),
+            bind(1, "grid", None, Source::Setting { key: SettingKey::Grid }),
         ],
     )
     .unwrap();
@@ -761,10 +783,64 @@ fn recipe_seeds() -> Vec<Vec<u8>> {
         Vec::new(),
     )
     .unwrap();
-    [sheet, audio, setting, merge, plain]
+    [sheet, padded, audio, setting, merge, plain]
         .iter()
         .map(|r| r.to_file().unwrap())
         .collect()
+}
+
+/// レシピの種はどれも、上限を絞ったファズのエンジンでそのまま読め（読めない種は変異の元として働かない）、§1.2 の例
+/// （image.pad）は素材の設定のある画像に当たる。
+#[test]
+fn recipe_seeds_load() {
+    use std::collections::BTreeMap;
+
+    use kura_engine::doc::InputId;
+    use kura_engine::ops::util::GridParam;
+    use kura_engine::recipe::Facts;
+    use kura_engine::shape::{Dim, Shape};
+    let engine =
+        kura_engine::render::Engine::with_limits(kura_engine::testing::fuzz_limits()).unwrap();
+    let seeds = recipe_seeds();
+    let loaded: Vec<_> = seeds
+        .iter()
+        .map(|s| engine.load_recipe(s).unwrap().recipe)
+        .collect();
+    let padded = loaded
+        .iter()
+        .find(|r| r.graph.nodes.iter().any(|n| n.op == "image.pad"))
+        .unwrap();
+    let facts = Facts {
+        grid: Some(GridParam {
+            cell_w: 4,
+            cell_h: 4,
+            offset_x: 0,
+            offset_y: 0,
+            gap_x: 0,
+            gap_y: 0,
+        }),
+        frame_ms: Some(80),
+        ..Facts::default()
+    };
+    let shape = Shape::Image {
+        w: Dim::Exact(24),
+        h: Dim::Exact(16),
+        fmt: PixelFormat::Rgba8,
+    };
+    let inputs = BTreeMap::from([(InputId(0), shape)]);
+    let inst = engine
+        .instantiate(&Graph::new_single(), padded, &inputs, &facts)
+        .unwrap();
+    // 24×16 を 4 で切った 24 コマを 6×6 にして 8 列 → 48×18
+    let plan = engine.compile(&inst.graph, &inputs).unwrap();
+    assert_eq!(
+        plan.output_shapes()[0].1,
+        Shape::Image {
+            w: Dim::Exact(48),
+            h: Dim::Exact(18),
+            fmt: PixelFormat::Rgba8
+        }
+    );
 }
 
 /// 文書の部品の種：文書の JSON と、部品の組（`testing::fuzz_doc_parts_input`）。描画の動作を 150 個に増やした文書は、
