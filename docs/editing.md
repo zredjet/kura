@@ -344,11 +344,11 @@ register_ops! {
 
 | 分類 | 操作 |
 |---|---|
-| 画像の幾何 | `image.crop`・`image.canvas`・`image.trim_alpha`・`image.flip`・`image.rotate90`・`image.resize`（最近傍・box・bilinear・Lanczos3） |
+| 画像の幾何 | `image.crop`・`image.canvas`・`image.pad`・`image.fit_canvas`・`image.trim_alpha`・`image.flip`・`image.rotate90`・`image.resize`（最近傍・box・bilinear・Lanczos3） |
 | 画像の変換 | `image.convert`（画素の形式・減色・ディザ）・`palette.replace` |
 | スプライト | `sprite.split_grid`・`sprite.pack_grid`・`layers.flatten` |
 | 描画 | `paint.actions`（§10） |
-| メタデータ | `meta.set_grid`・`meta.set_pivot`・`audio.set_loop` |
+| メタデータ | `meta.set_grid`・`meta.set_pivot`・`meta.anchor_pivot`・`audio.set_loop` |
 | 音声 | `audio.trim`・`audio.fade`・`audio.gain`・`audio.normalize`・`audio.resample`・`audio.mono` |
 
 - 段 5 で、画像の幾何・変換・スプライト（`layers.flatten` を除く）・描画・`meta.set_grid`・`meta.set_pivot` を入れた。各操作の約束はソースの冒頭（`crates/kura-engine/src/ops/<分類>/<名前>.rs`）に書く。
@@ -366,6 +366,11 @@ register_ops! {
   - `audio.set_loop`：`loop`（`{start, end}`、end は含まない、0 ≤ start < end ≤ 長さ）か null（消す）。メタデータを書く操作。
   - `audio.normalize`：`target`（−69〜0 LUFS、既定 −23。ゲートは厳密な「>」なので −70 ちょうどには届かない）と `peakLimit`（−30〜0 dBTP、任意）。利得は、利得をかけたあとの積分ラウドネスがちょうど目標になる値で、`audio.gain` と同じ式で当てる（同じ dB のゲインとビット単位で同じ）。利得をかけると絶対ゲートをまたぐブロックが入れ替わるので、1 回の計測の差（目標 − 積分ラウドネス）では届かないことがある（静かな区間がゲートを越える入力で 1.6〜3.3 LU ずれた）。そこで計測したブロックのパワーを大きい順に並べ、上から m 個が絶対ゲートを通る利得の区間ごとに、相対ゲートは利得によらないので積分ラウドネスが「利得 + 定数」の直線になることを使い、区間の中に入る解を厳密に求める（`Measured::gain_to`。O(n log n)。|利得| が最小の解）。ブロックが 1 つでもあれば、−70 LKFS より静かな入力も含めて −69〜0 のどの目標にも届く（ChaCha8 で作った多区間の入力と、反復では届かなかった 81 段の階段の形で確かめる）。トゥルーピークが上限を超えるなら上限にちょうど届くまで下げて `GainLimited` の警告、計れない（ブロックのパワーがすべて 0（無音）・4 区間（⌊(fs + 5)/10⌋ 標本の 4 倍。約 400 ms）に満たない・3,363 Hz 以下・NaN や ∞ の標本）ときは何も変えずに `LoudnessUnmeasurable` の警告。
   - `audio.resample`：`rate`（1,000〜768,000 Hz）。多相 FIR（§8.3）。出力の長さは round_half_even(frames · to / from) で、ループ点・マーカーは `TimeMap::Rate`。同じレートなら何もしない。係数の表が `min(max_value_bytes, 256 MiB)` を超える組み合わせと、出力が 0 フレームになる入力は断る。
+- M14 段 1 で、相対の指定の操作を入れた（約束はソースの冒頭）。どれも画素を動かすだけ・整数だけで、ある入力の形について、計算した矩形の `image.canvas`・計算した点の `meta.set_pivot` と値・メタデータ・警告が同じになる（E51。実装も canvas・set_pivot の部品を使う）。引数が入力の形だけで推論のときに決まるので、文書の引数がそのまま意図（「上下左右に 2px」「64×64 の中央」「下中央」）になり、一括でアイテムごとに大きさが違っても同じ意味で当たる。既存の操作の版は上げていない。
+  - `image.pad`：上下左右の余白（`{"px": n}`、負で削る。±2^31・`{"scale": 比}`、その軸の入力の長さに対する比を偶数への丸め。分子 0〜2^16・分母 1〜2^16）。出力は幅 `w + left + right`・高さ `h + top + bottom`（1 以上・`max_dim` 以下）で、新しいキャンバスは入力の座標の `(−left, −top)` から。`fill` の意味は canvas と同じ。持ち上げはキャンバスいっぱいのフレームの列だけ。大きさの決まらない入力は、上限の長さで求めた大きさを上限（`max_dim` で切る）にして推論し、実際の大きさで 0 以下・上限を超えるなら実行で断る。ドット絵の倍率にそろえる指定は持たない。
+  - `image.fit_canvas`：出力の大きさ（各軸 `px`・`scale`（1 より小さくしない）・`keep`・`multipleOf`（切り上げ。n は 1〜2^16）・`pow2`・`longest`（入力の長い辺））と 9 点の基準（`anchor`）。中身の位置は ⌊(外 − 中)·a/2⌋（a は左・上 0、中央 1、右・下 2。割り切れない中央は中身が左・上へ 0.5px 寄り、広げる余りの 1px は右・下に付き、狭める余りの 1px は左・上から削る）。画像より小さくなる大きさは `allowCrop` がなければ断る（大きさが決まっていれば推論で、決まらなければ実行で。一括で黙って切らない）。`keep`・`multipleOf`・`pow2`・`longest` は縮まない。大きさの決まらない入力は、`px` の軸は決まった長さ、ほかは上限の長さで求めた上限（どれも長さについて単調）を推論にする。
+  - `meta.anchor_pivot`：ピボットを 9 点の基準（⌊w·a/2⌋・⌊h·a/2⌋。フレームの列はキャンバス。トリムしたフレームも受ける）と整数のずれ（`offset`）で決める。画像の外なら引数 `offset` の誤りで、黙って詰めない（大きさの決まらない入力は実行で確かめる）。
+  - 3 つとも、範囲の描画（`REGION`）とプレビューの段（pad・fit_canvas は `Scaled`、anchor_pivot は `Skip`）を canvas・set_pivot と同じ考え方で持つ。pad の段の引数は、等倍の矩形を canvas と同じく段に縮めて段の入力との差を各辺の px にしたもの、fit_canvas の段の引数は等倍の出力の ⌈n/2^k⌉ の px（`allowCrop` を入れる）。エディタの「操作を追加」には、余白・長さ・9 点の欄を作る M14 段 7 まで出さない（文書に入っていれば汎用の欄で表示する）。
 
 ## 8. 決定性と版
 
@@ -1589,3 +1594,4 @@ M12 の段 6（2026-10-24）。段 10 の `bench edit` はエンジンの中だ�
 | E45 | 時間の写し（M13 段 4）：ランダムな線形の音声の文書（trim・resample・外したノード・ほかの操作）で、`Plan::time_chain` がノードの数・順と合い、各ノードの入力の形が前の出力、出力の形が推論の形、外したノードは `Identity`、trim は `Segments`・レートを変える resample は `Rate`。`Segments` は範囲の中で `back(pos(x)) == x`（区間の終わりは `back_end(pos_end(x))`）。`Rate { from, to }` の往復は \|back(pos(x)) − x\| ≤ from/(2·to) + 1/2（整数で diff·2·to ≤ from + to。上げるレートでは厳密）。`Unknown`・`Reset` は None。`pos_end` が `map_audio_meta` のループの終わりの写しと同じ（`tests/time_chain.rs` の `chain_follows_the_plan`・`back_inverts_segments`・`rate_back_is_within_half_a_step`・`pos_end_matches_the_loop_mapping`） |
 | E46 | 波形の段の小分けの部分更新（M13 段 4）：ランダムな値・変わった区間・長さの変化・段の組・渡し方（`feed_chunk` と `partial` の混ぜ方、窓の切り方）で、`PeaksPatch::assemble` が新しい値を `compute` したものと同じ。`fresh` も同じ。R を受け切る前の `assemble` は `Internal`、チャンクに揃わない窓・形の違う流れは誤り。計画の出力を `Engine::stream_audio` で区間ごとに何回にも分けて流しても（表示の値のチャンクと混ぜても）同じ（`tests/peaks_patch.rs` の `incremental_patch_equals_compute`・`partial_patcher_over_many_streams`） |
 | E47 | `CacheLease::set_extra`（M13 段 4）：extra は描いていない間の確保（`settle`）と持ち続ける対話の申告に入り、描く間の確保（`admit_cached`）にも足される。予算が足りなければキャッシュの上限を下げて場所を空け、extra を越えて伸ばさない。0 に戻せば上限も戻る（`tests/budget.rs` の `cache_lease_counts_the_extra`） |
+| E51 | 相対の指定の操作（M14 段 1）：`image.pad`・`image.fit_canvas` は、入力の形から計算した矩形の `image.canvas` と値・メタデータ・警告・推論した形がビット単位で同じ（例のすべてと、ChaCha8 のランダムな大きさ・形式（Indexed8 を含む）・フレームの列・格子とピボットとスライスのあるシート・余白（負・比）・長さの 6 種・9 点・`fill`・`allowCrop` の 500 組。矩形の作れないものは推論で断る）。`meta.anchor_pivot` は計算した点の `meta.set_pivot` と同じ（トリムしたフレームを含む 300 組。画像の外は推論で断る）。余白 m（0 以上）と −m を続けると、元を全体の矩形の canvas に通したものと同じ（アルファのある形式は元とビット単位で同じ）。9 点の位置が床の規則どおり（差が奇数・偶数・負）。`allowCrop` がなければ縮む大きさは推論で断り（大きさの決まらない入力は実行で）、`keep`・`multipleOf`・`pow2`・`longest` はいつも通る。格子・ピボット・スライスが平行移動で写り、はみ出たものは警告付きで落ちる。0 以下・上限を超える大きさ、範囲の外の値、使えない比・倍数は、どの引数かを付けて断る（`tests/relative_ops.rs`、各操作の単体テスト、`geom.rs` の単体テスト） |
