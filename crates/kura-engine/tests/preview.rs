@@ -503,11 +503,14 @@ fn scaled_params_infer() {
         "image.flip",
         "image.rotate90",
         "image.canvas",
+        "image.pad",
+        "image.fit_canvas",
         "image.resize",
         "image.convert",
         "palette.replace",
         "meta.set_grid",
         "meta.set_pivot",
+        "meta.anchor_pivot",
     ] {
         assert!(ops_seen.contains(&want), "{want} の例を照らしていません");
     }

@@ -818,7 +818,9 @@ fn random_edit_sequences_match_the_bulk_path() {
     let codecs = CodecSet::pinned();
     let mut counts = Counts::default();
     let capacities = [0u64, 4 << 10, 64 << 10, 1 << 30];
-    for seed in 0..20u64 {
+    // 列は 24 本（操作を足すと手の選び方がずれ、描けない手の起きる列が変わる。M14 段 1 で image.pad・image.fit_canvas・
+    // meta.anchor_pivot を足したとき、20 本では描けない手が 0 回になったので 4 本足した。前の 20 本は同じ列のまま）
+    for seed in 0..24u64 {
         let capacity = capacities[(seed / KINDS.len() as u64 % 4) as usize];
         run_e4_sequence(
             seed,

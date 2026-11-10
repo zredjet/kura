@@ -49,7 +49,8 @@ impl OpParams for CanvasParams {
                     ParamKind::Rect,
                     Unit::Px,
                     json!({ "x": 0, "y": 0, "w": 1, "h": 1 }),
-                ),
+                )
+                .source(),
                 spec(
                     "fill",
                     ParamKind::Color { alpha: true },
@@ -69,6 +70,26 @@ pub fn out_format(fmt: PixelFormat, fill: Option<[u8; 4]>) -> PixelFormat {
     match fill {
         None => with_alpha(fmt),
         Some(_) => fmt,
+    }
+}
+
+/// 推論の出力の形式（`fill` の色がその形式で塗れるかも確かめる。誤りは引数 `fill`）。`image.pad`・`image.fit_canvas` も使う。
+pub(crate) fn infer_format(fmt: PixelFormat, fill: Option<[u8; 4]>) -> Result<PixelFormat, Issues> {
+    let out_fmt = out_format(fmt, fill);
+    if let (Some(c), false) = (fill, out_fmt == PixelFormat::Indexed8) {
+        color_bytes(out_fmt, c).map_err(|m| bad_param("fill", m))?;
+    }
+    Ok(out_fmt)
+}
+
+/// 新しいキャンバス `rect`（入力の座標）の写し方（入力の左上は出力の (−x, −y)）。`image.pad`・`image.fit_canvas` も使う。
+pub(crate) fn space_of(rect: IRect) -> SpaceMap {
+    SpaceMap::Affine {
+        m: IntAffine::translate(-rect.x, -rect.y),
+        out: Size {
+            w: rect.w,
+            h: rect.h,
+        },
     }
 }
 
@@ -219,23 +240,14 @@ impl Op for Canvas {
         if p.rect.w == 0 || p.rect.h == 0 {
             return Err(bad_param("rect", "キャンバスの大きさが 0 です"));
         }
-        let out_fmt = out_format(fmt, p.fill);
-        if let (Some(c), false) = (p.fill, out_fmt == PixelFormat::Indexed8) {
-            color_bytes(out_fmt, c).map_err(|m| bad_param("fill", m))?;
-        }
+        let out_fmt = infer_format(fmt, p.fill)?;
         Ok(Inferred {
             shape: Shape::Image {
                 w: Dim::Exact(u64::from(p.rect.w)),
                 h: Dim::Exact(u64::from(p.rect.h)),
                 fmt: out_fmt,
             },
-            space: SpaceMap::Affine {
-                m: IntAffine::translate(-p.rect.x, -p.rect.y),
-                out: Size {
-                    w: p.rect.w,
-                    h: p.rect.h,
-                },
-            },
+            space: space_of(p.rect),
             time: TimeMap::Identity,
             cost: u64::from(p.rect.w) * u64::from(p.rect.h),
         })

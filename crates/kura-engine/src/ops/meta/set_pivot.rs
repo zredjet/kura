@@ -11,8 +11,8 @@ use crate::error::{EngineError, Issues};
 use crate::geom::IPoint;
 use crate::mapping::{SpaceMap, TimeMap};
 use crate::op::{
-    Applied, ApplyCx, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op, OpParams,
-    ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
+    Applied, ApplyCx, BindKind, Example, InferCx, Inferred, Lift, MetaAccess, Numeric, Op,
+    OpParams, ParamKind, ParamSchema, PortSpec, Signature, Unit, expect_inputs, spec,
 };
 use crate::ops::util::{bad_param, exact_size};
 use crate::render::preview::{Preview, image_bounds, scale_point};
@@ -31,7 +31,11 @@ pub struct SetPivotParams {
 impl OpParams for SetPivotParams {
     fn schema() -> ParamSchema {
         ParamSchema {
-            params: vec![spec("pivot", ParamKind::Point, Unit::Px, json!(null))],
+            params: vec![
+                spec("pivot", ParamKind::Point, Unit::Px, json!(null))
+                    .source()
+                    .binds(&[BindKind::Pivot]),
+            ],
         }
     }
 }
@@ -39,7 +43,8 @@ impl OpParams for SetPivotParams {
 /// ピボットの設定。
 pub struct SetPivot;
 
-fn inside(p: IPoint, w: u64, h: u64) -> bool {
+/// 点が `0..=w × 0..=h`（右端・下端も可）の中なら true。`meta.anchor_pivot` も使う。
+pub(crate) fn inside(p: IPoint, w: u64, h: u64) -> bool {
     p.x >= 0 && p.y >= 0 && p.x as u64 <= w && p.y as u64 <= h
 }
 
