@@ -1828,38 +1828,59 @@ mod tests {
     #[test]
     fn a_descendant_outside_the_group_does_not_outlive_the_deadline() {
         let d = tempfile::tempdir().unwrap();
+        // 外に出るまでの時間は負荷で数秒かかることがある（全体のテストの最中に 3 秒を超えた）。外に出る前に時間切れに
+        // なったら確かめたい場面が起きていないので、失敗にせず、長い期限でやり直す
+        let mut late = Vec::new();
         for mode in MODES {
-            let (s, pidfile) = escaping_tool(d.path(), &format!("escape-{mode:?}"), "printf 'x'");
-            let sig = Signals::default();
-            // 外に出るまでの時間（重い環境では 1 秒ほどかかることがある）より長くする
-            let deadline = Duration::from_secs(3);
-            let t = Instant::now();
-            let r = run_in(
-                mode,
-                &s,
-                d.path(),
-                &Budget {
-                    max_stdout: 1 << 20,
-                    stall: Duration::from_secs(30),
-                    deadline,
-                },
-                &|| false,
-                &|pid, s| sig.send(pid, s),
-                &mut |_: &[u8]| Ok(()),
-            );
-            let took = t.elapsed();
-            let escaped = pidfile.is_file();
-            kill_escaped(&pidfile);
-            assert!(escaped, "{mode:?}: 子孫が外に出る前に時間切れになった");
+            let mut checked = false;
+            for (attempt, secs) in [3u64, 6, 12].into_iter().enumerate() {
+                let (s, pidfile) = escaping_tool(
+                    d.path(),
+                    &format!("escape-{mode:?}-{attempt}"),
+                    "printf 'x'",
+                );
+                let sig = Signals::default();
+                let deadline = Duration::from_secs(secs);
+                let t = Instant::now();
+                let r = run_in(
+                    mode,
+                    &s,
+                    d.path(),
+                    &Budget {
+                        max_stdout: 1 << 20,
+                        stall: Duration::from_secs(30),
+                        deadline,
+                    },
+                    &|| false,
+                    &|pid, s| sig.send(pid, s),
+                    &mut |_: &[u8]| Ok(()),
+                );
+                let took = t.elapsed();
+                if !pidfile.is_file() {
+                    // あとから外に出たものは最後に片付ける
+                    late.push(pidfile);
+                    continue;
+                }
+                kill_escaped(&pidfile);
+                assert!(
+                    matches!(r, Err(RunError::Stopped(Stopped::Deadline))),
+                    "{mode:?}: {r:?}"
+                );
+                assert!(
+                    took >= deadline && took < deadline + Duration::from_millis(1500),
+                    "{mode:?}: {took:?}"
+                );
+                assert_eq!(sig.counts(), (1, 1), "{mode:?}");
+                checked = true;
+                break;
+            }
             assert!(
-                matches!(r, Err(RunError::Stopped(Stopped::Deadline))),
-                "{mode:?}: {r:?}"
+                checked,
+                "{mode:?}: 期限を 12 秒まで延ばしても、子孫が外に出る前に時間切れになった"
             );
-            assert!(
-                took >= deadline && took < deadline + Duration::from_millis(1500),
-                "{mode:?}: {took:?}"
-            );
-            assert_eq!(sig.counts(), (1, 1), "{mode:?}");
+        }
+        for pidfile in &late {
+            kill_escaped(pidfile);
         }
     }
 
@@ -1952,32 +1973,46 @@ mod tests {
     fn a_lingering_descendant_is_abandoned_after_the_grace() {
         let d = tempfile::tempdir().unwrap();
         for mode in MODES {
+            let exited = d.path().join(format!("linger-exited-{mode:?}"));
             let (s, pidfile) = escaping_tool(
                 d.path(),
                 &format!("linger-{mode:?}"),
-                "printf 'x'; echo note >&2",
+                &format!("printf 'x'; echo note >&2; : > '{}'", exited.display()),
             );
             let sig = Signals::default();
+            // 子が終わる直前に書く印を最初に見た時刻（中止の問い合わせのたびに見る）。外に出るまでの時間は負荷で数秒
+            // かかることがある（全体のテストの最中に、開始からの上限を超えた）ので、上限は印から測る
+            let seen: Mutex<Option<Instant>> = Mutex::new(None);
+            let canceled = || {
+                let mut seen = seen.lock().unwrap();
+                if seen.is_none() && exited.is_file() {
+                    *seen = Some(Instant::now());
+                }
+                false
+            };
             let t = Instant::now();
             let r = run_in(
                 mode,
                 &s,
                 d.path(),
                 &budget(1 << 20, 30_000),
-                &|| false,
+                &canceled,
                 &|pid, s| sig.send(pid, s),
                 &mut |_: &[u8]| Ok(()),
             );
             let took = t.elapsed();
+            let since = seen.lock().unwrap().map(|t| t.elapsed());
             kill_escaped(&pidfile);
             assert!(
                 matches!(r, Err(RunError::Stopped(Stopped::Lingering))),
                 "{mode:?}: {r:?}"
             );
-            // 下限は子が終わってから 2 × KILL_GRACE。上限は外に出るまでの時間（重い環境で 1 秒ほど）を見込む
+            // 子が終わってから 2 × KILL_GRACE（下限は開始から、上限は印を見た時刻から。見るのは問い合わせの間隔だけ
+            // 遅れうるので、下限には使わない）
+            let since = since.unwrap();
             assert!(
-                took >= 2 * KILL_GRACE && took < 2 * KILL_GRACE + Duration::from_secs(3),
-                "{mode:?}: {took:?}"
+                took >= 2 * KILL_GRACE && since < 2 * KILL_GRACE + Duration::from_millis(1500),
+                "{mode:?}: {took:?} {since:?}"
             );
             assert_eq!(sig.counts(), (0, 1), "{mode:?}");
         }
@@ -1987,37 +2022,68 @@ mod tests {
     #[test]
     fn a_descendant_holding_stdin_does_not_block_the_feed() {
         let d = tempfile::tempdir().unwrap();
-        let (s, pidfile) = escaping_tool(d.path(), "stdin-escape", "head -c 10 > /dev/null");
-        let sig = Signals::default();
         let data = vec![7u8; 3_000_000];
-        let mut feed = |w: &mut dyn std::io::Write| w.write_all(&data);
-        // 書き始めにパイプへ入る分も「進んだ」になるので、外に出るまでの時間（重い環境では 1 秒ほど）より長くする
-        let stall = Duration::from_secs(3);
-        let t = Instant::now();
-        let r = run_binary_with(
-            &s,
-            &[],
-            d.path(),
-            &budget(1 << 20, 3_000),
-            &|| false,
-            Some(&mut feed),
-            Consumer::Thread(&mut |_: &[u8]| Ok(())),
-            &|pid, s| sig.send(pid, s),
-        );
-        let took = t.elapsed();
-        let escaped = pidfile.is_file();
-        kill_escaped(&pidfile);
-        assert!(escaped, "子孫が外に出る前に止まった");
+        // 書き始めにパイプへ入る分も「進んだ」になるので、無出力の期限は外に出るまでの時間より長くする。外に出るまでの
+        // 時間は負荷で数秒かかることがある（全体のテストの最中に 3 秒を超えた）。外に出る前に止まったら確かめたい場面が
+        // 起きていないので、長い期限でやり直す。時間は外に出たのを見た時刻から測る
+        let mut late = Vec::new();
+        let mut checked = false;
+        for (attempt, secs) in [3u64, 6, 12].into_iter().enumerate() {
+            let (s, pidfile) = escaping_tool(
+                d.path(),
+                &format!("stdin-escape-{attempt}"),
+                "head -c 10 > /dev/null",
+            );
+            let sig = Signals::default();
+            let mut feed = |w: &mut dyn std::io::Write| w.write_all(&data);
+            let stall = Duration::from_secs(secs);
+            let seen: Mutex<Option<Instant>> = Mutex::new(None);
+            let canceled = || {
+                let mut seen = seen.lock().unwrap();
+                if seen.is_none() && pidfile.is_file() {
+                    *seen = Some(Instant::now());
+                }
+                false
+            };
+            let t = Instant::now();
+            let r = run_binary_with(
+                &s,
+                &[],
+                d.path(),
+                &budget(1 << 20, secs * 1_000),
+                &canceled,
+                Some(&mut feed),
+                Consumer::Thread(&mut |_: &[u8]| Ok(())),
+                &|pid, s| sig.send(pid, s),
+            );
+            let took = t.elapsed();
+            let since = seen.lock().unwrap().map(|t| t.elapsed());
+            let Some(since) = since else {
+                late.push(pidfile);
+                continue;
+            };
+            kill_escaped(&pidfile);
+            assert!(
+                matches!(r, Err(RunError::Stopped(Stopped::Stalled))),
+                "{r:?}"
+            );
+            // 最後に進んだのは head が読んだとき（外に出たあと）。そこから stall で止まり、すぐ戻る（下限は開始から、上限は
+            // 外に出たのを見た時刻から。見るのは問い合わせの間隔だけ遅れうるので、下限には使わない）
+            assert!(
+                took >= stall && since < stall + Duration::from_secs(2),
+                "{took:?} {since:?}"
+            );
+            assert_eq!(sig.counts(), (1, 1));
+            checked = true;
+            break;
+        }
+        for pidfile in &late {
+            kill_escaped(pidfile);
+        }
         assert!(
-            matches!(r, Err(RunError::Stopped(Stopped::Stalled))),
-            "{r:?}"
+            checked,
+            "無出力の期限を 12 秒まで延ばしても、子孫が外に出る前に止まった"
         );
-        // 最後に進んだのは head が読んだとき（外に出たあと）。そこから stall で止まり、すぐ戻る
-        assert!(
-            took >= stall && took < stall + Duration::from_secs(3),
-            "{took:?}"
-        );
-        assert_eq!(sig.counts(), (1, 1));
     }
 
     /// グループへの KILL を送れなかったら（`kill` を起動できない）、次の刻みで送り直す。TERM を無視する子でも、時間切れから
