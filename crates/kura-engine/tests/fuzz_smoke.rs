@@ -783,10 +783,28 @@ fn recipe_seeds() -> Vec<Vec<u8>> {
         Vec::new(),
     )
     .unwrap();
-    [sheet, padded, audio, setting, merge, plain]
+    let mut seeds: Vec<Vec<u8>> = [sheet, padded, audio, setting, merge, plain]
         .iter()
         .map(|r| r.to_file().unwrap())
-        .collect()
+        .collect();
+    // 引数の整数を 16.0 と書いたもの（読めて、書いて読み直すと同じ。正規の形に往復させずに持つと偽の crash になった）
+    fn floats(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Number(n) if n.is_u64() || n.is_i64() => {
+                let x = n.as_f64().unwrap();
+                *v = serde_json::Value::Number(serde_json::Number::from_f64(x).unwrap());
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(floats),
+            serde_json::Value::Object(o) => o.values_mut().for_each(floats),
+            _ => {}
+        }
+    }
+    let mut v: serde_json::Value = serde_json::from_slice(&seeds[0]).unwrap();
+    for node in v["graph"]["nodes"].as_array_mut().unwrap() {
+        floats(&mut node["params"]);
+    }
+    seeds.push(serde_json::to_vec(&v).unwrap());
+    seeds
 }
 
 /// レシピの種はどれも、上限を絞ったファズのエンジンでそのまま読め（読めない種は変異の元として働かない）、§1.2 の例
@@ -806,6 +824,10 @@ fn recipe_seeds_load() {
         .iter()
         .map(|s| engine.load_recipe(s).unwrap().recipe)
         .collect();
+    // どの種もファズの対象の確かめ（書いて読み直すと同じ）を通る
+    for (i, s) in seeds.iter().enumerate() {
+        kura_engine::testing::fuzz_recipe(s).unwrap_or_else(|e| panic!("種 {i}：{e}"));
+    }
     let padded = loaded
         .iter()
         .find(|r| r.graph.nodes.iter().any(|n| n.op == "image.pad"))

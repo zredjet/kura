@@ -201,6 +201,24 @@ fn render(engine: &Engine, g: &Graph, input: &Value, source: Digest) -> Result<V
     Ok(out.outputs.swap_remove(0).value)
 }
 
+/// JSON の中の整数を小数（16 → 16.0）にする（`zero_as_neg` なら 0 だけを -0.0 に）。変えた数の個数。
+fn ints_as_floats(v: &mut J, zero_as_neg: bool) -> usize {
+    match v {
+        J::Number(n) if n.is_i64() || n.is_u64() => {
+            let x = n.as_f64().unwrap();
+            if zero_as_neg && x != 0.0 {
+                return 0;
+            }
+            let f = if zero_as_neg { -0.0 } else { x };
+            *v = J::Number(serde_json::Number::from_f64(f).unwrap());
+            1
+        }
+        J::Array(a) => a.iter_mut().map(|x| ints_as_floats(x, zero_as_neg)).sum(),
+        J::Object(o) => o.values_mut().map(|x| ints_as_floats(x, zero_as_neg)).sum(),
+        _ => 0,
+    }
+}
+
 fn file_value(r: &Recipe) -> J {
     serde_json::from_slice(&r.to_file().unwrap()).unwrap()
 }
@@ -456,6 +474,17 @@ fn loose_files_are_read_and_written_canonically() {
         // 数を 16.0 と書く・seed を数で書く
         let text = String::from_utf8(canonical.clone()).unwrap();
         variants.push(text.replace(r#""seed":"0""#, r#""seed":0"#).into_bytes());
+        // 引数の整数を 16.0 と書く（0 は -0.0）。読んだレシピは整数で持ち、書いて読み直したものと等しい
+        for zero_as_neg in [false, true] {
+            let mut w = v.clone();
+            let mut floats = 0;
+            for node in w["graph"]["nodes"].as_array_mut().unwrap() {
+                floats += ints_as_floats(&mut node["params"], zero_as_neg);
+            }
+            if floats > 0 {
+                variants.push(bytes(&w));
+            }
+        }
         for (i, raw) in variants.iter().enumerate() {
             let loaded = engine
                 .load_recipe(raw)

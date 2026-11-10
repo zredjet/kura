@@ -171,8 +171,9 @@ impl Engine {
                 file.bindings.len()
             )));
         }
-        // 5：文書（スキーマの確かめと移行・型・大きさ）と、封筒の全体の正規の形の長さ・深さ（膨らむ数・深い入れ子）
-        let graph = doc::load_value(file.graph)?;
+        // 5：文書（スキーマの確かめと移行・型・大きさ）と、封筒の全体の正規の形の長さ・深さ（膨らむ数・深い入れ子）。文書は
+        // `Recipe::new` と同じく保存の形に往復させて持つ（引数の 16.0・-0 を 16・0 にし、書いて読み直したレシピと等しくする）
+        let graph = doc::load(&doc::load_value(file.graph)?.to_canonical_json()?)?;
         let mut bindings = file.bindings;
         sort_bindings(&mut bindings);
         let recipe = Recipe {
