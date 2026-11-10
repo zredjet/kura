@@ -785,6 +785,21 @@ fn bad_sizes_are_refused() {
             IssueCode::OutOfRange,
             "top",
         ),
+        // 両辺を同じだけ削りすぎたら前（左・上）
+        (
+            &engine,
+            "image.pad",
+            pad(z.clone(), json!({"px": -10}), z.clone(), json!({"px": -10})),
+            IssueCode::OutOfRange,
+            "left",
+        ),
+        (
+            &engine,
+            "image.pad",
+            pad(json!({"px": -6}), z.clone(), json!({"px": -6}), z.clone()),
+            IssueCode::OutOfRange,
+            "top",
+        ),
         // 上限を超える
         (
             &small,

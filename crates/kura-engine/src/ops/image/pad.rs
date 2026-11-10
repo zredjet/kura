@@ -97,11 +97,8 @@ fn axis(
             .ok_or_else(|| bad_param(key, "比が使えません"))
     };
     let (b, a) = (px(before_key, before)?, px(after_key, after)?);
-    let (more, less) = if a > b {
-        (after_key, before_key)
-    } else {
-        (before_key, after_key)
-    };
+    let more = if a > b { after_key } else { before_key };
+    let less = if a < b { after_key } else { before_key };
     let new = i64::try_from(len)
         .ok()
         .and_then(|l| l.checked_add(b)?.checked_add(a))
@@ -394,8 +391,11 @@ impl Op for Pad {
                 fill: p.fill,
             };
         }
+        // 余白は ⌈n/2^k⌉（削る余白は 0 の側）。段の入力は等倍の ⌈w/2^k⌉ なので、⌈w/2^k⌉ + Σ⌈n/2^k⌉ ≥ ⌈(w + Σn)/2^k⌉ と
+        // なり、等倍で 1 以上残るなら段でも残る（床で丸めると、削る余白が等倍の比より大きくなって描けなくなる）
+        let k = u32::from(level.min(62));
         let shrink = |m: Margin| match m {
-            Margin::Px(n) => Margin::Px(n >> u32::from(level.min(62))),
+            Margin::Px(n) => Margin::Px(-(n.saturating_neg() >> k)),
             other => other,
         };
         PadParams {

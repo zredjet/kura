@@ -517,6 +517,67 @@ fn scaled_params_infer() {
     assert!(px_seen > 30, "{px_seen}");
 }
 
+/// 大きさが中身で決まる入力（trim の後ろ）の image.pad で、負の余白は段でも描ける（等倍で 1 px 以上残るなら、段 1〜3 でも
+/// 残る。床で丸めると削る量が等倍の比より大きくなり、段で幅 0 になって描けなかった）。正負を混ぜた余白でも同じ。
+#[test]
+fn pad_after_trim_draws_at_every_level() {
+    let engine = engine();
+    // 40×40 の中の不透明な 11×10（等倍の trim の出力）
+    let (v, src) = input(&InputGen::Sprite {
+        w: 40,
+        h: 40,
+        rect: IRect {
+            x: 14,
+            y: 15,
+            w: 11,
+            h: 10,
+        },
+    });
+    let inputs = fin(&v, src);
+    let margins = [
+        (-5, -5, 0, 0),
+        (-10, 0, -4, -5),
+        (1, -10, 3, -8),
+        (-1, 2, -9, 0),
+    ];
+    for (l, r, t, b) in margins {
+        let g = chain(&[
+            (
+                "image.trim_alpha",
+                json!({ "mode": "union", "threshold": 0 }),
+            ),
+            (
+                "image.pad",
+                json!({ "left": {"px": l}, "right": {"px": r}, "top": {"px": t}, "bottom": {"px": b}, "fill": null }),
+            ),
+            (
+                "image.resize",
+                json!({ "width": {"px": 800}, "height": {"px": 800}, "filter": "bilinear" }),
+            ),
+        ]);
+        let plan = compile(&engine, &g, &v);
+        assert!(
+            engine
+                .render(&plan, &plain_inputs(&v, src), &NoMonitor)
+                .is_ok()
+        );
+        for level in 1..=3 {
+            let lp = engine.plan_level(&plan, level).unwrap();
+            assert_eq!(lp.fallback, None, "{l} {r} {t} {b} 段 {level}");
+            let mut cache = NodeCache::new(1 << 30);
+            engine
+                .render_cached(
+                    &lp.plan,
+                    &inputs,
+                    &mut cache,
+                    &RenderOptions::default(),
+                    &NoMonitor,
+                )
+                .unwrap_or_else(|e| panic!("{l} {r} {t} {b} 段 {level}：{e}"));
+        }
+    }
+}
+
 /// 縮小しない（比が 1 以下の）操作だけのランダムな鎖（大きさの近さを見るため）。
 fn shrinking_chain(r: &mut ChaCha8Rng, engine: &Engine, input: &Shape, len: usize) -> Graph {
     let mut g = Graph::new_single();
