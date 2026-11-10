@@ -452,9 +452,14 @@ pub fn migrate_with(
 }
 
 /// 編集済みの文書（`base`）の出力 0 の後ろに、レシピ（`recipe`）の操作をつなぐ（docs/editing.md §4.3。一括加工の継ぎ足し）。
-/// - レシピは入力 1 つ（Primary）の文書。その入力を `base` の出力 0 に結び付ける。
+/// - レシピは入力 1 つ（Primary・読み方は既定）の文書。その入力を `base` の出力 0 に結び付ける。継いだ文書の入力（と読み方）は
+///   `base` のもの。
 /// - レシピのノード ID は `base.next_id` だけずらす。種はそのまま（元のハッシュと合わせて乱数が決まるので、結果は継ぎ足しても変わらない）。
-/// - 出力はレシピの出力（形式・展開もレシピのもの）。`base` のほかの出力は捨てる。
+/// - 出力：レシピの形式が `Keep`（元と同じ）なら `base` の出力 0 の形式・設定・量子化を継ぐ（エディタで頭を開いて同じ操作を
+///   足したときと同じ文書になる）。`To` ならレシピの形式・設定・量子化（`base` の量子化は捨てる）。`Keep` に量子化を付けた
+///   レシピは断る。展開はレシピのもの。`base`・レシピとも出力はちょうど 1 つで `Expand::One`（保存できる文書）。
+/// - 継いだ文書の正規の JSON が `MAX_DOC_BYTES` を超えれば `Limit`（保存できず読めなくなる文書をつながない）。
+/// - 結合的：`compose(compose(a, r1), r2) == compose(a, compose(r1, r2))`（E49）。
 pub fn compose(base: &Graph, recipe: &Graph) -> Result<Graph, EngineError> {
     let bad = |msg: &str| EngineError::Invalid(Issues::one(Issue::error(IssueCode::BadGraph, msg)));
     if base.schema != SCHEMA || recipe.schema != SCHEMA {
@@ -470,11 +475,25 @@ pub fn compose(base: &Graph, recipe: &Graph) -> Result<Graph, EngineError> {
     if slot.role != InputRole::Primary {
         return Err(bad("レシピの入力は対象（Primary）です"));
     }
-    let attach = base
-        .outputs
-        .first()
-        .map(|o| o.from)
-        .ok_or_else(|| bad("つなぐ先の出力がありません"))?;
+    if slot.decode != DecodeOptions::default() {
+        return Err(bad("レシピの入力の読み方は既定のものだけです"));
+    }
+    let [head] = base.outputs.as_slice() else {
+        return Err(bad("つなぐ先の文書の出力は 1 つだけです"));
+    };
+    if head.expand != Expand::One {
+        return Err(bad("つなぐ先の文書の出力は 1 つのファイルだけです"));
+    }
+    let [tail] = recipe.outputs.as_slice() else {
+        return Err(bad("レシピの出力は 1 つだけです"));
+    };
+    if tail.expand != Expand::One {
+        return Err(bad("レシピの出力は 1 つのファイルだけです"));
+    }
+    if tail.format == FormatChoice::Keep && tail.quantize.is_some() {
+        return Err(bad("形式を決めない出力に量子化は付けられません"));
+    }
+    let attach = head.from;
     let offset = base.next_id;
     let shift = |id: NodeId| {
         id.0.checked_add(offset)
@@ -501,27 +520,36 @@ pub fn compose(base: &Graph, recipe: &Graph) -> Result<Graph, EngineError> {
             ..n.clone()
         });
     }
-    let outputs = recipe
-        .outputs
-        .iter()
-        .map(|o| {
-            Ok(OutputSpec {
-                from: remap(o.from)?,
-                ..o.clone()
-            })
-        })
-        .collect::<Result<Vec<_>, EngineError>>()?;
+    // 「元と同じ」は頭の出力の形式・設定・量子化（量子化は形式と組で扱う。その形式のビット数に丸める約束なので）
+    let (format, quantize) = match tail.format {
+        FormatChoice::Keep => (head.format.clone(), head.quantize),
+        FormatChoice::To { .. } => (tail.format.clone(), tail.quantize),
+    };
+    let outputs = vec![OutputSpec {
+        id: tail.id,
+        from: remap(tail.from)?,
+        format,
+        quantize,
+        expand: tail.expand.clone(),
+    }];
     let next_id = offset
         .checked_add(recipe.next_id)
         .ok_or_else(|| bad("ノードの ID を使い切りました"))?;
-    Ok(Graph {
+    let g = Graph {
         schema: SCHEMA,
         rules: base.rules,
         inputs: base.inputs.clone(),
         nodes,
         outputs,
         next_id,
-    })
+    };
+    crate::digest::canonical_len_within(&g, MAX_DOC_BYTES).map_err(|e| match e {
+        EngineError::Limit(m) => EngineError::Limit(format!(
+            "継いだ文書を保存の形（正規の JSON）にできません：{m}"
+        )),
+        other => other,
+    })?;
+    Ok(g)
 }
 
 /// u64 を 10 進の文字列で書く（JS の数で精度が落ちないように）。読むときは数でも受け付ける。
@@ -804,6 +832,166 @@ mod tests {
             decode: DecodeOptions::default(),
         });
         assert!(compose(&base, &two_inputs).is_err());
+    }
+
+    fn to(format: &str, options: serde_json::Value) -> FormatChoice {
+        FormatChoice::To {
+            format: format.into(),
+            options,
+        }
+    }
+
+    /// 継ぎ足しの出力（E49 の表）：レシピが Keep なら頭の出力 0 の形式・設定・量子化を継ぎ、To ならレシピのもの（頭の
+    /// 量子化は捨てる）。展開はレシピのもの。
+    #[test]
+    fn compose_keeps_the_head_output_when_the_recipe_keeps() {
+        let mut recipe = Graph::new_single();
+        recipe
+            .push_linear("image.flip", 1, json!({ "axis": "vertical" }), 0)
+            .unwrap();
+        // 画像：頭が To{png}（jpg を png で保存したアイテム）＋ Keep → To{png}
+        let mut base = sample();
+        base.outputs[0].format = to("png", json!({}));
+        let g = compose(&base, &recipe).unwrap();
+        assert_eq!(g.outputs[0].format, to("png", json!({})));
+        assert_eq!(g.outputs[0].expand, Expand::One);
+        // 頭が Keep なら Keep のまま（元の形式）
+        assert_eq!(
+            compose(&sample(), &recipe).unwrap().outputs[0].format,
+            FormatChoice::Keep
+        );
+        // 音声：頭が To{wav,{bits:16}}＋量子化 Q ＋ Keep → 同じ形式・Q
+        let q = Quantize {
+            v: QUANTIZE_VERSION,
+            bits: 16,
+            dither: Dither::Tpdf,
+            seed: 7,
+        };
+        let mut audio = Graph::new_single();
+        audio
+            .push_linear("audio.gain", 1, json!({ "db": -3.0 }), 0)
+            .unwrap();
+        audio.outputs[0].format = to("wav", json!({ "bits": 16 }));
+        audio.outputs[0].quantize = Some(q);
+        let mut gain = Graph::new_single();
+        gain.push_linear("audio.gain", 1, json!({ "db": 1.0 }), 0)
+            .unwrap();
+        let g = compose(&audio, &gain).unwrap();
+        assert_eq!(g.outputs[0].format, to("wav", json!({ "bits": 16 })));
+        assert_eq!(g.outputs[0].quantize, Some(q));
+        // 頭が Keep でも量子化は継ぐ（エディタで頭を開いて足したときと同じ）
+        let mut keep_q = audio.clone();
+        keep_q.outputs[0].format = FormatChoice::Keep;
+        let g = compose(&keep_q, &gain).unwrap();
+        assert_eq!(
+            (g.outputs[0].format.clone(), g.outputs[0].quantize),
+            (FormatChoice::Keep, Some(q))
+        );
+        // レシピが To{flac}・量子化なし → To{flac}・量子化なし（頭の量子化は捨てる）
+        let mut flac = gain.clone();
+        flac.outputs[0].format = to("flac", json!({}));
+        let g = compose(&audio, &flac).unwrap();
+        assert_eq!(
+            (g.outputs[0].format.clone(), g.outputs[0].quantize),
+            (to("flac", json!({})), None)
+        );
+        // レシピが To＋量子化 → レシピの量子化
+        let q2 = Quantize { bits: 24, ..q };
+        let mut wav24 = gain.clone();
+        wav24.outputs[0].format = to("wav", json!({ "bits": 24 }));
+        wav24.outputs[0].quantize = Some(q2);
+        assert_eq!(
+            compose(&audio, &wav24).unwrap().outputs[0].quantize,
+            Some(q2)
+        );
+        // Keep に量子化のレシピは断る
+        let mut bad = gain.clone();
+        bad.outputs[0].quantize = Some(q);
+        assert!(compose(&audio, &bad).is_err());
+    }
+
+    /// 頭とレシピの出力はちょうど 1 つで `One`（保存できる文書）。違えば断る。
+    #[test]
+    fn compose_needs_one_saved_output_on_both_sides() {
+        let recipe = Graph::new_single();
+        let mut two = sample();
+        let mut second = two.outputs[0].clone();
+        second.id = OutputId(1);
+        two.outputs.push(second);
+        assert!(compose(&two, &recipe).is_err());
+        assert!(compose(&sample(), &two_outputs_recipe()).is_err());
+        let mut per = sample();
+        per.outputs[0].expand = Expand::PerElement {
+            name: "{stem}_{index:03}".into(),
+        };
+        assert!(compose(&per, &recipe).is_err());
+        let mut per_recipe = recipe.clone();
+        per_recipe.outputs[0].expand = Expand::PerElement {
+            name: "{stem}_{index:03}".into(),
+        };
+        assert!(compose(&sample(), &per_recipe).is_err());
+        let mut none = sample();
+        none.outputs.clear();
+        assert!(compose(&none, &recipe).is_err());
+    }
+
+    fn two_outputs_recipe() -> Graph {
+        let mut g = Graph::new_single();
+        let mut second = g.outputs[0].clone();
+        second.id = OutputId(1);
+        g.outputs.push(second);
+        g
+    }
+
+    /// 継いだ文書が保存の形の上限（`MAX_DOC_BYTES`）を超えれば `Limit`（保存できず読めなくなる文書をつながない）。
+    #[test]
+    fn compose_refuses_documents_too_large_to_save() {
+        let big = |n: usize| {
+            let mut g = Graph::new_single();
+            g.push_linear("image.flip", 1, json!({ "axis": "a".repeat(n) }), 0)
+                .unwrap();
+            g
+        };
+        let part = MAX_DOC_BYTES * 6 / 10;
+        assert!(big(part).to_canonical_json().is_ok());
+        assert!(compose(&big(part), &big(10)).is_ok());
+        assert!(matches!(
+            compose(&big(part), &big(part)),
+            Err(EngineError::Limit(_))
+        ));
+    }
+
+    /// 結合則：`compose(compose(a, r1), r2) == compose(a, compose(r1, r2))`（ID のずらしも形式の継ぎ方も結合的）。
+    #[test]
+    fn compose_is_associative() {
+        let a = sample();
+        let mut r1 = Graph::new_single();
+        r1.push_linear("image.flip", 1, json!({ "axis": "vertical" }), 3)
+            .unwrap();
+        r1.push_linear("image.flip", 1, json!({ "axis": "horizontal" }), 4)
+            .unwrap();
+        let mut r2 = Graph::new_single();
+        r2.push_linear("image.rotate90", 1, json!({ "turn": "cw" }), 5)
+            .unwrap();
+        for (f1, f2) in [
+            (FormatChoice::Keep, FormatChoice::Keep),
+            (to("png", json!({})), FormatChoice::Keep),
+            (FormatChoice::Keep, to("webp", json!({}))),
+            (to("png", json!({})), to("webp", json!({}))),
+        ] {
+            let (mut r1, mut r2) = (r1.clone(), r2.clone());
+            r1.outputs[0].format = f1;
+            r2.outputs[0].format = f2;
+            let left = compose(&compose(&a, &r1).unwrap(), &r2).unwrap();
+            let right = compose(&a, &compose(&r1, &r2).unwrap()).unwrap();
+            assert_eq!(left, right);
+            assert!(left.check_structure(100).is_empty());
+            assert_eq!(left.next_id, a.next_id + r1.next_id + r2.next_id);
+        }
+        // 空のレシピを継ぐと base と同じ（next_id が 1 増えるだけ）
+        let mut want = a.clone();
+        want.next_id += 1;
+        assert_eq!(compose(&a, &Graph::new_single()).unwrap(), want);
     }
 
     #[test]
