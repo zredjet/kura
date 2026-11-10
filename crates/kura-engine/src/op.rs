@@ -1181,6 +1181,33 @@ pub fn node_key(op: &str, v: u16, params: &Digest, seed: u64, enabled: bool) -> 
         .finish()
 }
 
+/// 文書のノードの（操作, 版）が、この登録表でどう描かれるか（docs/editing.md §8.4。M14 段 1）。レシピの読み込みの印・
+/// 事前チェックが使う。
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum OpStatus {
+    /// 今の版。
+    Current,
+    /// 実装のない古い版で、今の版の実装へ引数を移して描く（結果は同じ。E7）。
+    Migrated { current: u16 },
+    /// 結果を変えた旧版（またはそこへ移す古い版）の実装 `uses` で描く。今の版 `current` とは結果が違いうる（E6）。
+    Legacy { uses: u16, current: u16 },
+    /// なくした操作（カタログにない）。実装 `uses` で描く。
+    Retired { uses: u16 },
+}
+
+impl OpStatus {
+    /// 文書に書いた版 `v` のノードを描く実装の版（`Registry::resolve` が選ぶもの）。
+    pub fn uses(self, v: u16) -> u16 {
+        match self {
+            Self::Current => v,
+            Self::Migrated { current } => current,
+            Self::Legacy { uses, .. } | Self::Retired { uses } => uses,
+        }
+    }
+}
+
 /// 操作の登録表。（操作 ID, 版）→ 実装。旧版（legacy）も入れる。
 #[derive(Default)]
 pub struct Registry {
@@ -1194,16 +1221,33 @@ impl Registry {
         Self::default()
     }
 
-    /// 今の版の操作を足す。同じ ID の今の版が 2 つあればエラー。
+    /// 今の版の操作を足す。同じ ID の今の版が 2 つある・今の版より上の旧版があればエラー。
     pub fn add_current<O: Op>(&mut self) -> Result<(), String> {
+        if self.versions(O::ID).iter().any(|v| *v > O::VERSION) {
+            return Err(format!(
+                "{} の今の版 {} より上の旧版があります",
+                O::ID,
+                O::VERSION
+            ));
+        }
         if self.current.insert(O::ID, O::VERSION).is_some() {
             return Err(format!("{} の今の版が 2 つあります", O::ID));
         }
         self.insert::<O>()
     }
 
-    /// 結果を変えた旧版の操作を足す（新しく作れないが、作り直しに使う）。
+    /// 結果を変えた旧版の操作を足す（新しく作れないが、作り直しに使う）。旧版の版は今の版より小さいこと（§8.4。
+    /// 「今の版より上なら新しすぎる」を成り立たせる）。
     pub fn add_legacy<O: Op>(&mut self) -> Result<(), String> {
+        if let Some(current) = self.current_version(O::ID)
+            && O::VERSION >= current
+        {
+            return Err(format!(
+                "{} の旧版 {} が今の版 {current} より小さくありません",
+                O::ID,
+                O::VERSION
+            ));
+        }
         self.insert::<O>()
     }
 
@@ -1306,6 +1350,38 @@ impl Registry {
                 format!("{op} の版 {v} を移せません: {why}"),
             )),
         }
+    }
+
+    /// 文書のノードの（操作, 版）がこの登録表でどう描かれるか（[`OpStatus`]。docs/editing.md §8.4）。使う実装は `resolve`
+    /// と同じ（その版の実装か、すぐ上の実装のある版）。それが今の版なら `Current`（版も同じ）か `Migrated`、今の版でなければ
+    /// `Legacy`、今の版がなければ `Retired`。知らない操作は `UnknownOp`、実装のある最大の版より上は `UnknownVersion`。
+    /// 「移せない版」（`migrate` が断るもの）は引数を見ないと分からないので、ここでは分からない（`resolve` が断る）。
+    pub fn status(&self, op: &str, v: u16) -> Result<OpStatus, Issue> {
+        let versions = self.versions(op);
+        let Some(max) = versions.iter().max().copied() else {
+            return Err(Issue::error(
+                IssueCode::UnknownOp,
+                format!("知らない操作です（{op}）"),
+            ));
+        };
+        if v > max {
+            return Err(Issue::error(
+                IssueCode::UnknownVersion,
+                format!("{op} の版 {v} はこの版の Kura より新しい"),
+            ));
+        }
+        let Some(uses) = versions.into_iter().find(|ver| *ver >= v) else {
+            return Err(Issue::error(
+                IssueCode::UnknownOp,
+                format!("知らない操作です（{op}）"),
+            ));
+        };
+        Ok(match self.current_version(op) {
+            None => OpStatus::Retired { uses },
+            Some(current) if uses == current && v == current => OpStatus::Current,
+            Some(current) if uses == current => OpStatus::Migrated { current },
+            Some(current) => OpStatus::Legacy { uses, current },
+        })
     }
 
     /// `resolve` が（操作, 版）に使う実装：その版の実装か、なければすぐ上の実装のある版のもの（引数は移さない）。
@@ -1666,6 +1742,121 @@ mod tests {
         fn examples() -> Vec<Example<P>> {
             Vec::new()
         }
+    }
+
+    /// 旧版を見分ける口（E52 の単体の側）：今の版・実装を消して今の版へ移す版・旧版・旧版へ移す古い版・退役した版・
+    /// 知らない操作・新しすぎる版。使う実装の版は `resolve` が選ぶものと同じ。
+    #[test]
+    fn status_tells_how_each_version_is_drawn() {
+        let r = table();
+        assert_eq!(r.status("test.dummy", 3), Ok(OpStatus::Current));
+        assert_eq!(
+            r.status("test.dummy", 2),
+            Ok(OpStatus::Legacy {
+                uses: 2,
+                current: 3
+            })
+        );
+        // v1 は実装がなく、旧版 v2 へ移す
+        assert_eq!(
+            r.status("test.dummy", 1),
+            Ok(OpStatus::Legacy {
+                uses: 2,
+                current: 3
+            })
+        );
+        // 移せない版（v2 の migrate が v0 を断る）は引数を見ないと分からないので、使う実装の版だけを返す
+        assert_eq!(
+            r.status("test.dummy", 0),
+            Ok(OpStatus::Legacy {
+                uses: 2,
+                current: 3
+            })
+        );
+        assert!(matches!(r.status("test.dummy", 4), Err(i) if i.code == IssueCode::UnknownVersion));
+        assert!(matches!(r.status("test.none", 1), Err(i) if i.code == IssueCode::UnknownOp));
+        // 旧版がなければ、古い版は今の版へ移す（結果は同じ）
+        let mut only = Registry::empty();
+        only.add_current::<V3>().unwrap();
+        assert_eq!(
+            only.status("test.dummy", 1),
+            Ok(OpStatus::Migrated { current: 3 })
+        );
+        assert_eq!(
+            only.status("test.dummy", 2),
+            Ok(OpStatus::Migrated { current: 3 })
+        );
+        assert_eq!(only.status("test.dummy", 3), Ok(OpStatus::Current));
+        // 退役した操作：今の版がない
+        let mut gone = Registry::empty();
+        gone.add_retired::<V3>().unwrap();
+        gone.add_legacy::<V2>().unwrap();
+        assert_eq!(
+            gone.status("test.dummy", 3),
+            Ok(OpStatus::Retired { uses: 3 })
+        );
+        assert_eq!(
+            gone.status("test.dummy", 2),
+            Ok(OpStatus::Retired { uses: 2 })
+        );
+        assert_eq!(
+            gone.status("test.dummy", 1),
+            Ok(OpStatus::Retired { uses: 2 })
+        );
+        assert!(
+            matches!(gone.status("test.dummy", 4), Err(i) if i.code == IssueCode::UnknownVersion)
+        );
+        // 使う実装の版は resolve と同じ
+        for reg in [&r, &only, &gone] {
+            for v in 0..=5u16 {
+                let resolved = match reg.resolve("test.dummy", v, &serde_json::json!({ "old": 1 }))
+                {
+                    Ok(Resolved::Direct(i, _) | Resolved::Migrated(i, _)) => Some(i.version()),
+                    Err(_) => None,
+                };
+                let status = reg.status("test.dummy", v);
+                if let Some(used) = resolved {
+                    assert_eq!(status.clone().map(|s| s.uses(v)), Ok(used), "v{v}");
+                }
+                if status.is_err() {
+                    assert!(resolved.is_none(), "v{v}");
+                }
+            }
+        }
+        // JSON の形（取り込みの画面とレシピの印）
+        assert_eq!(
+            serde_json::to_value([
+                OpStatus::Current,
+                OpStatus::Migrated { current: 3 },
+                OpStatus::Legacy {
+                    uses: 2,
+                    current: 3
+                },
+                OpStatus::Retired { uses: 4 },
+            ])
+            .unwrap(),
+            serde_json::json!([
+                { "type": "current" },
+                { "type": "migrated", "current": 3 },
+                { "type": "legacy", "uses": 2, "current": 3 },
+                { "type": "retired", "uses": 4 },
+            ])
+        );
+    }
+
+    /// 同じ ID の旧版の版は今の版より小さい（どちらの順に足しても断る）。これで「今の版より上なら新しすぎる」が成り立つ。
+    #[test]
+    fn legacy_versions_must_be_below_the_current_one() {
+        let mut r = Registry::empty();
+        r.add_current::<V2>().unwrap();
+        assert!(r.add_legacy::<V3>().is_err());
+        let mut r = Registry::empty();
+        r.add_legacy::<V3>().unwrap();
+        assert!(r.add_current::<V2>().is_err());
+        // 下の旧版は足せる
+        let mut r = Registry::empty();
+        r.add_current::<V3>().unwrap();
+        assert!(r.add_legacy::<V2>().is_ok());
     }
 
     #[test]

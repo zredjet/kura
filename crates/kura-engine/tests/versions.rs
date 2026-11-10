@@ -463,6 +463,113 @@ impl Op for StepV2 {
     }
 }
 
+/// なくした操作 `test.gone` の最後の版（v2。カタログに出ないが作り直しに使う）。v1 は実装を消して v2 へ移す。
+struct GoneV2;
+impl Op for GoneV2 {
+    const ID: &'static str = "test.gone";
+    const VERSION: u16 = 2;
+    type Params = AmountParams;
+    fn signature() -> Signature {
+        SIG
+    }
+    fn infer(_: &AmountParams, inputs: &[Shape], _: &InferCx<'_>) -> Result<Inferred, Issues> {
+        same_shape(inputs)
+    }
+    fn apply(
+        p: &AmountParams,
+        inputs: &[&Value],
+        cx: &mut ApplyCx<'_>,
+    ) -> Result<Applied, EngineError> {
+        map_audio(inputs[0], cx, |_, _, s| (f64::from(s) * p.amount) as f32)
+    }
+    fn migrate(from: u16, raw: serde_json::Value) -> Result<serde_json::Value, String> {
+        match from {
+            1 => Ok(raw),
+            _ => Err(format!("版 {from} からは移せません")),
+        }
+    }
+    fn examples() -> Vec<Example<AmountParams>> {
+        example(AmountParams { amount: 0.5 })
+    }
+}
+
+/// 版の印の試験用の登録表：test.shift（v1 旧版・v2 は v3 へ移す・v3 今の版）、test.step（v1 は v2 へ移す）、test.noise、
+/// なくした test.gone（v1 は v2 へ移す・v2 退役）。
+fn marked() -> Engine {
+    engine_with(&[
+        |r| r.add_current::<ShiftV3>(),
+        |r| r.add_legacy::<ShiftV1>(),
+        |r| r.add_current::<StepV2>(),
+        |r| r.add_current::<Noise>(),
+        |r| r.add_retired::<GoneV2>(),
+    ])
+}
+
+/// E52：旧版を見分ける口。今の版・旧版・実装を消して移す版・退役した版・知らない操作・新しすぎる版を返し、使う実装の版は
+/// `resolve` が選ぶものと同じ。
+#[test]
+fn registry_status_tells_current_legacy_migrated_and_retired() {
+    use kura_engine::op::OpStatus;
+    let engine = marked();
+    let reg = engine.registry();
+    let cases: &[(&str, u16, Result<OpStatus, kura_engine::IssueCode>)] = &[
+        (
+            "test.shift",
+            1,
+            Ok(OpStatus::Legacy {
+                uses: 1,
+                current: 3,
+            }),
+        ),
+        ("test.shift", 2, Ok(OpStatus::Migrated { current: 3 })),
+        ("test.shift", 3, Ok(OpStatus::Current)),
+        ("test.shift", 4, Err(kura_engine::IssueCode::UnknownVersion)),
+        ("test.step", 1, Ok(OpStatus::Migrated { current: 2 })),
+        ("test.step", 2, Ok(OpStatus::Current)),
+        ("test.noise", 1, Ok(OpStatus::Current)),
+        ("test.gone", 1, Ok(OpStatus::Retired { uses: 2 })),
+        ("test.gone", 2, Ok(OpStatus::Retired { uses: 2 })),
+        ("test.gone", 3, Err(kura_engine::IssueCode::UnknownVersion)),
+        ("test.none", 1, Err(kura_engine::IssueCode::UnknownOp)),
+    ];
+    for (op, v, want) in cases {
+        let got = reg.status(op, *v).map_err(|i| i.code);
+        assert_eq!(&got, want, "{op} v{v}");
+    }
+    // 使う実装の版は resolve と同じ（resolve が通るなら status も通り、status が断るなら resolve も断る）
+    let params = [
+        json!({ "delta": 0.1 }),
+        json!({ "amount": 0.1 }),
+        json!({ "n": 2 }),
+    ];
+    for op in [
+        "test.shift",
+        "test.step",
+        "test.noise",
+        "test.gone",
+        "test.none",
+    ] {
+        for v in 0..=5u16 {
+            let status = reg.status(op, v);
+            let resolved: Vec<u16> = params
+                .iter()
+                .filter_map(|p| match reg.resolve(op, v, p) {
+                    Ok(Resolved::Direct(i, _) | Resolved::Migrated(i, _)) => Some(i.version()),
+                    Err(_) => None,
+                })
+                .collect();
+            for used in &resolved {
+                assert_eq!(status.clone().map(|s| s.uses(v)), Ok(*used), "{op} v{v}");
+            }
+            if status.is_err() {
+                assert!(resolved.is_empty(), "{op} v{v}");
+            }
+        }
+    }
+    // 退役した操作はカタログに出ない
+    assert!(reg.catalog().iter().all(|d| d.id != "test.gone"));
+}
+
 /// 移行は正規の JSON に直した引数に当てる：メモリ上の `5.0`・読み直した文書・正規でない書き方（`5.0`）が同じ結果になる
 /// （migrate が整数として読んでも、書き方で結果が分かれない。ADR-145）。
 #[test]

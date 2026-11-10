@@ -110,6 +110,36 @@ mod tests {
         );
     }
 
+    /// 本物の登録表：同じ ID の旧版の版は今の版より小さく（E52）、どの実装の版も `Registry::status` で今の版・旧版・
+    /// 退役した版のどれかに見分けられ、使う実装はその版そのもの。
+    #[test]
+    fn legacy_versions_are_below_the_current_one() {
+        use crate::op::OpStatus;
+        let reg = super::registry().unwrap();
+        let all = reg.all();
+        assert!(!all.is_empty());
+        for op in all {
+            let (id, v) = (op.id(), op.version());
+            match reg.current_version(id) {
+                Some(current) => {
+                    assert!(v <= current, "{id} v{v} は今の版 v{current} より上です");
+                    let want = if v == current {
+                        OpStatus::Current
+                    } else {
+                        OpStatus::Legacy { uses: v, current }
+                    };
+                    assert_eq!(reg.status(id, v), Ok(want), "{id} v{v}");
+                }
+                None => assert_eq!(reg.status(id, v), Ok(OpStatus::Retired { uses: v })),
+            }
+            let newest = reg.versions(id).last().copied().unwrap();
+            assert!(
+                matches!(reg.status(id, newest + 1), Err(i) if i.code == crate::IssueCode::UnknownVersion),
+                "{id}"
+            );
+        }
+    }
+
     #[test]
     fn work_totals_saturate() {
         let w = Work {
