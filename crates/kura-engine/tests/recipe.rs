@@ -1732,7 +1732,8 @@ fn seconds_become_frames_at_the_node_rate() {
             channels: 1,
             frames: Dim::Exact(frames),
         };
-        for ms in [0u64, 1, 999, 1_500] {
+        // 5・10・15・30 ms は 22.05k・44.1k で丁度半分になる（220.5・661.5 → 偶数へ 220・662）
+        for ms in [0u64, 1, 5, 10, 15, 30, 999, 1_500] {
             let want = half_even(u128::from(ms) * u128::from(rate), 1_000) as u64;
             let inst = engine
                 .instantiate(&base, &trim_start(ms), &one_shape(shape), &Facts::default())
@@ -1774,6 +1775,11 @@ fn seconds_become_frames_at_the_node_rate() {
     assert_eq!(at(44_100, 1_500), json!(66_150));
     assert_eq!(at(48_000, 1_500), json!(72_000));
     assert_eq!(at(22_050, 1), json!(22));
+    // 丁度半分は偶数へ（下へも上へも）
+    assert_eq!(at(22_050, 10), json!(220));
+    assert_eq!(at(22_050, 30), json!(662));
+    assert_eq!(at(44_100, 5), json!(220));
+    assert_eq!(at(44_100, 15), json!(662));
     // 前に resample があれば、変えたあとのレート
     let resampled = Recipe::new(
         "48k にして頭を切る".into(),
@@ -2285,11 +2291,12 @@ fn bound_records_and_fact_digests() {
 /// 描いた出力（値のダイジェストと、固定のコーデックで書いた PNG・WAV のバイト列）。
 type Outputs = Vec<(Digest, Vec<u8>)>;
 
-/// エディタの経路：頭を `EditSession` で開き、レシピのノードを結び付けた値で末尾に足して（外したノードは外し、To の形式は
-/// 出力に置く）、差分の計画とキャッシュで描く。
+/// エディタの経路：頭を `EditSession` で開き、レシピのノードを結び付けた値で末尾に足して（外したノードは外し、レシピの
+/// 出力が To ならその形式・量子化を出力に置く。Keep なら頭の出力に触らない）、差分の計画とキャッシュで描く。
 fn editor_render(
     engine: &Engine,
     base: &Graph,
+    recipe: &Graph,
     bound: &Graph,
     input: &Value,
     source: Digest,
@@ -2320,17 +2327,21 @@ fn editor_render(
             )?;
         }
     }
-    let out = &bound.outputs[0];
-    s.commit(
-        engine,
-        Edit::SetOutput {
-            output: out.id,
-            format: out.format.clone(),
-            quantize: out.quantize,
-            expand: out.expand.clone(),
-        },
-        CommitMode::Step,
-    )?;
+    let want = &recipe.outputs[0];
+    if matches!(want.format, FormatChoice::To { .. }) {
+        let head = &s.head().to_graph().outputs[0];
+        let output = head.id;
+        s.commit(
+            engine,
+            Edit::SetOutput {
+                output,
+                format: want.format.clone(),
+                quantize: want.quantize,
+                expand: want.expand.clone(),
+            },
+            CommitMode::Step,
+        )?;
+    }
     let snap = s.current().clone();
     let shapes = shapes(input);
     let plan = engine
@@ -2528,7 +2539,14 @@ fn bound_documents_match_the_editor_path() {
             let source = Digest(*blake3::hash(format!("{k}-{round}").as_bytes()).as_bytes());
             // 頭の文書：ランダムな編集（素材の設定は頭の座標なので、頭が座標を変えても当てられる）
             let len = below(&mut r, 3) as usize;
-            let base = random_chain(&editor, &mut r, &input.shape(), len, false);
+            let mut base = random_chain(&editor, &mut r, &input.shape(), len, false);
+            // 頭の出力も形式・量子化を持つ（Keep のレシピは、エディタで足したときと同じくそれを継ぐ）
+            random_output(
+                &mut r,
+                &mut base,
+                matches!(input.shape(), Shape::Audio { .. }),
+                false,
+            );
             let mut facts = full_facts();
             facts.frame_ms = Some(40 + below(&mut r, 200) as u32);
             facts.pivot = Some(PivotFact {
@@ -2544,7 +2562,7 @@ fn bound_documents_match_the_editor_path() {
                 Err(e) => panic!("{at}：{e}"),
             };
             let (session_doc, ed, ed_warn) =
-                match editor_render(&editor, &base, &inst.graph, &input, source) {
+                match editor_render(&editor, &base, &recipe.graph, &inst.graph, &input, source) {
                     Ok(x) => x,
                     Err(e) => {
                         // 描けないなら一括の経路も描けない
@@ -2567,10 +2585,14 @@ fn bound_documents_match_the_editor_path() {
                 contents(&inst.graph),
                 "{at}：ノードの中身"
             );
-            assert_eq!(
-                session_doc.outputs[0].format, inst.graph.outputs[0].format,
-                "{at}"
-            );
+            // 出力（指すノードの ID はエディタが振るので除く）
+            let out = |g: &Graph| {
+                g.outputs
+                    .iter()
+                    .map(|o| (o.id, o.format.clone(), o.quantize, o.expand.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(out(&session_doc), out(&inst.graph), "{at}：出力");
             matched += 1;
             matched_by[k] += 1;
         }
