@@ -14,12 +14,6 @@ use kura_engine::doc::{
     self, DecodeOptions, Dither, Expand, FormatChoice, Graph, InputId, InputRole, InputSlot,
     NodeId, OutputId, PortRef, QUANTIZE_VERSION, Quantize, compose,
 };
-use kura_engine::geom::IPoint;
-use kura_engine::op::{
-    Applied, ApplyCx, BindKind, Example, InferCx, Inferred, Op, OpParams, ParamKind, ParamSchema,
-    Signature, Unit, spec,
-};
-use kura_engine::ops::meta::set_pivot::{SetPivot, SetPivotParams};
 use kura_engine::ops::util::GridParam;
 use kura_engine::recipe::{
     BindError, Binding, Facts, MAX_BINDINGS, MAX_RECIPE_BYTES, PivotFact, RangePart, Recipe,
@@ -33,10 +27,9 @@ use kura_engine::testgen::InputGen;
 use kura_engine::testing::catch_own_panic;
 use kura_engine::testing::region::{below, random_chain, random_input};
 use kura_engine::value::{PixelFormat, Value};
-use kura_engine::{Digest, EngineError, IssueCode, Issues, Limits, NoMonitor, determinism};
+use kura_engine::{Digest, EngineError, IssueCode, Limits, NoMonitor, determinism};
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::Rng;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value as J, json};
 
 // ---------------------------------------------------------------------------------------------
@@ -230,74 +223,11 @@ fn codes(e: &EngineError) -> Vec<Want> {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// ピボットの試験用の操作（`meta.set_pivot` の印は B が付けるので、ここでは同じ実装に印を付けた操作で確かめる）
-// ---------------------------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PivotParams {
-    pivot: Option<IPoint>,
-}
-
-impl OpParams for PivotParams {
-    fn schema() -> ParamSchema {
-        ParamSchema {
-            params: vec![
-                spec("pivot", ParamKind::Point, Unit::Px, json!(null))
-                    .source()
-                    .binds(&[BindKind::Pivot]),
-            ],
-        }
-    }
-}
-
-/// `meta.set_pivot` と同じ実装で、ピボットに結び付けられる試験用の操作。
-struct TestPivot;
-impl Op for TestPivot {
-    const ID: &'static str = "test.pivot";
-    const VERSION: u16 = 1;
-    type Params = PivotParams;
-    fn signature() -> Signature {
-        SetPivot::signature()
-    }
-    fn infer(p: &PivotParams, inputs: &[Shape], cx: &InferCx<'_>) -> Result<Inferred, Issues> {
-        SetPivot::infer(&SetPivotParams { pivot: p.pivot }, inputs, cx)
-    }
-    fn apply(
-        p: &PivotParams,
-        inputs: &[&Value],
-        cx: &mut ApplyCx<'_>,
-    ) -> Result<Applied, EngineError> {
-        SetPivot::apply(&SetPivotParams { pivot: p.pivot }, inputs, cx)
-    }
-    fn examples() -> Vec<Example<PivotParams>> {
-        vec![Example {
-            name: "center",
-            params: PivotParams {
-                pivot: Some(IPoint { x: 4, y: 4 }),
-            },
-            inputs: vec![InputGen::Noise {
-                w: 8,
-                h: 8,
-                fmt: PixelFormat::Rgba8,
-                seed: 1,
-            }],
-        }]
-    }
-}
-
-/// すべての操作と試験用の `test.pivot` を登録したエンジン。
-fn pivot_engine() -> Engine {
-    let mut r = kura_engine::ops::registry().unwrap();
-    r.add_current::<TestPivot>().unwrap();
-    Engine::with_registry(r, Limits::default())
-}
-
+/// ピボットを素材の設定にするレシピ（`meta.set_pivot` の結び付け。前の操作は座標を変えない）。
 fn pivot_recipe() -> Recipe {
     let g = chain(&[
         ("paint.actions", json!({ "actions": [] })),
-        ("test.pivot", json!({ "pivot": null })),
+        ("meta.set_pivot", json!({ "pivot": null })),
     ]);
     Recipe::new(
         "ピボットを素材の設定に".into(),
@@ -323,6 +253,7 @@ fn recipe_files_round_trip() {
         merge_recipe(),
         loop_recipe(),
         set_grid_recipe(),
+        pivot_recipe(),
     ] {
         let file = r.to_file().unwrap();
         let text = String::from_utf8(file.clone()).unwrap();
@@ -1559,8 +1490,7 @@ fn settings_are_written_as_read() {
         inst.graph.nodes[1].params["loop"],
         json!({ "start": 100, "end": 900 })
     );
-    // ピボット：切り捨て（7.5 → 7、−0.5 → −1、2.99 → 2）
-    let pe = pivot_engine();
+    // ピボット（meta.set_pivot）：切り捨て（7.5 → 7、−0.5 → −1、2.99 → 2）
     let img = InputGen::Noise {
         w: 20,
         h: 10,
@@ -1576,13 +1506,13 @@ fn settings_are_written_as_read() {
     ] {
         let mut f = full_facts();
         f.pivot = Some(PivotFact { x, y });
-        let inst = pe
+        let inst = engine
             .instantiate(&base, &pivot_recipe(), &shapes(&img), &f)
             .unwrap();
         assert_eq!(inst.graph.nodes[1].params["pivot"], want);
         assert_eq!(inst.bound[0].read, json!({ "x": x, "y": y }));
         assert_eq!(inst.bound[0].value, want);
-        let out = render(&pe, &inst.graph, &img, Digest::default()).unwrap();
+        let out = render(&engine, &inst.graph, &img, Digest::default()).unwrap();
         let Value::Image(i) = out else { panic!() };
         assert_eq!(i.meta.pivot, serde_json::from_value(want).ok());
     }
@@ -1590,7 +1520,7 @@ fn settings_are_written_as_read() {
     let mut f = full_facts();
     f.pivot = Some(PivotFact { x: -0.5, y: 2.0 });
     assert!(matches!(
-        pe.instantiate(&base, &pivot_recipe(), &shapes(&img), &f),
+        engine.instantiate(&base, &pivot_recipe(), &shapes(&img), &f),
         Err(BindError::OutOfRange {
             node: NodeId(2),
             ..
@@ -1607,7 +1537,7 @@ fn settings_are_written_as_read() {
         f.pivot = Some(PivotFact { x, y });
         assert!(
             matches!(
-                pe.instantiate(&base, &pivot_recipe(), &shapes(&img), &f),
+                engine.instantiate(&base, &pivot_recipe(), &shapes(&img), &f),
                 Err(BindError::OutOfRange {
                     node: NodeId(2),
                     ..
@@ -2186,8 +2116,8 @@ fn contents(g: &Graph) -> Vec<(String, u16, J, u64, bool)> {
 /// レシピ 6 つ。継いだ文書とエディタの文書は、ノード ID を除いて同じ。
 #[test]
 fn bound_documents_match_the_editor_path() {
-    let editor = pivot_engine();
-    let bulk = pivot_engine();
+    let editor = Engine::new().unwrap();
+    let bulk = Engine::new().unwrap();
     let mut r = determinism::rng(0xe50_0004);
     let mut audio_disabled = audio_recipe();
     audio_disabled.graph.nodes[1].enabled = false;
