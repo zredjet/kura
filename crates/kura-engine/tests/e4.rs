@@ -681,6 +681,145 @@ struct Counts {
 // E4 の本体
 // ---------------------------------------------------------------------------------------------
 
+/// 列の入力を照合の形にしたもの（列の間は変わらない）。
+struct Prepared {
+    shapes: BTreeMap<InputId, Shape>,
+    fingerprinted: BTreeMap<InputId, FingerprintedInput>,
+    plain: BTreeMap<InputId, InputValue>,
+}
+
+impl Prepared {
+    fn new(input: &Input) -> Self {
+        Self {
+            shapes: input.shapes(),
+            fingerprinted: input.fingerprinted(),
+            plain: input.plain(),
+        }
+    }
+}
+
+/// 列のエディタの経路の状態（キャッシュ・前の計画・描く目当てのノード）。
+struct Track {
+    cache: NodeCache,
+    prev: Option<Plan>,
+    focus: Option<NodeId>,
+}
+
+/// 1 つの手のあとの照合の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepOutcome {
+    /// 計画を作れない（両方の経路で同じ指摘）。
+    Unplanned,
+    /// 描けた（値・バイト列・警告が同じ）。
+    Rendered,
+    /// 計画は作れたが描けない（どの経路も内部の誤りでない誤り）。
+    Unrenderable,
+}
+
+/// 今の文書を、エディタの経路（差分の計画・キャッシュ・差分の適用、3 スレッド。ときどき中止を挟む）と一括の経路（正規の
+/// JSON から別のエンジンで、1・16 スレッド）で照らす。
+#[allow(clippy::too_many_arguments)]
+fn check_step(
+    r: &mut ChaCha8Rng,
+    at: &str,
+    snap: &Snapshot,
+    inputs: &Prepared,
+    editor: &Engine,
+    bulk: &Engine,
+    pools: &[rayon::ThreadPool; 3],
+    codecs: &CodecSet,
+    counts: &mut Counts,
+    track: &mut Track,
+) -> StepOutcome {
+    counts.steps += 1;
+    // エディタの経路の計画（前の計画から差分で）
+    let planned = editor.compile_snapshot(snap, &inputs.shapes, track.prev.as_ref());
+    // 一括の経路の計画（正規の JSON から、別のエンジンで）
+    let doc = bulk.load(&snap.to_canonical_json().unwrap()).unwrap();
+    let bulk_plan = bulk.compile(&doc, &inputs.shapes);
+    assert_same_plan(&planned, &bulk_plan, at);
+    let (Ok(plan), Ok(bulk_plan)) = (planned, bulk_plan) else {
+        return StepOutcome::Unplanned;
+    };
+    counts.planned += 1;
+    let opts = RenderOptions {
+        digests: chance(r, 50),
+        focus: track.focus,
+        verify_hits: false,
+    };
+    let (fp_inputs, plain) = (&inputs.fingerprinted, &inputs.plain);
+    // ときどき中止を挟む（中止のあともキャッシュが正しいこと）
+    if chance(r, 12) {
+        let mon = CancelAfter::new(below(r, 6));
+        match pools[1]
+            .install(|| editor.render_cached(&plan, fp_inputs, &mut track.cache, &opts, &mon))
+        {
+            Ok(_) => {}
+            Err(EngineError::Canceled) => counts.canceled += 1,
+            Err(EngineError::Internal(m)) => panic!("{at}：中止の描画が内部の誤り: {m}"),
+            Err(_) => {}
+        }
+    }
+    let ed = pools[1]
+        .install(|| editor.render_cached(&plan, fp_inputs, &mut track.cache, &opts, &NoMonitor));
+    let b1 = pools[0].install(|| bulk.render(&bulk_plan, plain, &NoMonitor));
+    let b16 = pools[2].install(|| bulk.render(&bulk_plan, plain, &NoMonitor));
+    let result = match (ed, b1, b16) {
+        (Ok(ed), Ok(b1), Ok(b16)) => {
+            counts.rendered += 1;
+            counts.hits += ed.stats.hits;
+            counts.appended += ed.stats.appended;
+            let e = outcome(
+                codecs,
+                ed.outputs
+                    .into_iter()
+                    .map(|o| (o.id, o.value, o.digest))
+                    .collect(),
+                ed.warnings,
+            );
+            let one = outcome(
+                codecs,
+                b1.outputs
+                    .into_iter()
+                    .map(|o| (o.id, o.value, Some(o.digest)))
+                    .collect(),
+                b1.warnings,
+            );
+            assert_eq!(
+                e, one,
+                "{at}：エディタの経路と一括の経路（1 スレッド）が違います"
+            );
+            let sixteen: Vec<(OutputId, Digest)> =
+                b16.outputs.iter().map(|o| (o.id, o.digest)).collect();
+            let want: Vec<(OutputId, Digest)> = one.outputs.iter().map(|o| (o.0, o.1)).collect();
+            assert_eq!(sixteen, want, "{at}：16 スレッドの一括の経路が違います");
+            assert_eq!(b16.warnings, one.warnings, "{at}");
+            StepOutcome::Rendered
+        }
+        (Err(a), Err(b), Err(c)) => {
+            counts.render_errors += 1;
+            for e in [&a, &b, &c] {
+                assert!(
+                    !matches!(e, EngineError::Internal(_)),
+                    "{at}：内部の誤り: {e}"
+                );
+            }
+            StepOutcome::Unrenderable
+        }
+        (a, b, c) => panic!(
+            "{at}：描けたかが違います（エディタ {}・一括 1 {}・一括 16 {}）: {:?} {:?} {:?}",
+            a.is_ok(),
+            b.is_ok(),
+            c.is_ok(),
+            a.err(),
+            b.err(),
+            c.err()
+        ),
+    };
+    track.prev = Some(plan);
+    result
+}
+
 /// 1 つの列：エディタの経路と一括の経路を、各手のあとに照らす。
 #[allow(clippy::too_many_arguments)]
 fn run_e4_sequence(
@@ -697,7 +836,7 @@ fn run_e4_sequence(
     let mut r = determinism::rng(0xe4_0000 + seed);
     let kind = KINDS[(seed % KINDS.len() as u64) as usize];
     let input = Input::new(&kind.input(seed));
-    let (shapes, fp_inputs, plain) = (input.shapes(), input.fingerprinted(), input.plain());
+    let inputs = Prepared::new(&input);
     let menu = &fitted(menu, editor, kind);
     let mut s = EditSession::open(
         editor,
@@ -706,109 +845,188 @@ fn run_e4_sequence(
         HistoryLimits::default(),
     )
     .unwrap();
-    let mut cache = NodeCache::new(capacity);
-    let mut prev: Option<Plan> = None;
-    let mut focus = None;
+    let mut track = Track {
+        cache: NodeCache::new(capacity),
+        prev: None,
+        focus: None,
+    };
     let mut broken = false;
     for step in 0..steps {
         if step > 0
             && let Some(n) = random_step(&mut r, editor, menu, &mut s, kind, broken)
         {
-            focus = Some(n);
+            track.focus = Some(n);
         }
-        counts.steps += 1;
         let at = format!("列 {seed}（{kind:?}・上限 {capacity}）の手 {step}");
         let snap = s.current().clone();
-        // エディタの経路の計画（前の計画から差分で）
-        let planned = editor.compile_snapshot(&snap, &shapes, prev.as_ref());
-        // 一括の経路の計画（正規の JSON から、別のエンジンで）
-        let doc = bulk.load(&snap.to_canonical_json().unwrap()).unwrap();
-        let bulk_plan = bulk.compile(&doc, &shapes);
-        assert_same_plan(&planned, &bulk_plan, &at);
-        broken = planned.is_err();
-        let (Ok(plan), Ok(bulk_plan)) = (planned, bulk_plan) else {
-            continue;
-        };
-        counts.planned += 1;
-        let opts = RenderOptions {
-            digests: chance(&mut r, 50),
-            focus,
-            verify_hits: false,
-        };
-        // ときどき中止を挟む（中止のあともキャッシュが正しいこと）
-        if chance(&mut r, 12) {
-            let mon = CancelAfter::new(below(&mut r, 6));
-            match pools[1]
-                .install(|| editor.render_cached(&plan, &fp_inputs, &mut cache, &opts, &mon))
-            {
-                Ok(_) => {}
-                Err(EngineError::Canceled) => counts.canceled += 1,
-                Err(EngineError::Internal(m)) => panic!("{at}：中止の描画が内部の誤り: {m}"),
-                Err(_) => {}
-            }
-        }
-        let ed = pools[1]
-            .install(|| editor.render_cached(&plan, &fp_inputs, &mut cache, &opts, &NoMonitor));
-        let b1 = pools[0].install(|| bulk.render(&bulk_plan, &plain, &NoMonitor));
-        let b16 = pools[2].install(|| bulk.render(&bulk_plan, &plain, &NoMonitor));
-        match (ed, b1, b16) {
-            (Ok(ed), Ok(b1), Ok(b16)) => {
-                counts.rendered += 1;
-                counts.hits += ed.stats.hits;
-                counts.appended += ed.stats.appended;
-                let e = outcome(
-                    codecs,
-                    ed.outputs
-                        .into_iter()
-                        .map(|o| (o.id, o.value, o.digest))
-                        .collect(),
-                    ed.warnings,
-                );
-                let one = outcome(
-                    codecs,
-                    b1.outputs
-                        .into_iter()
-                        .map(|o| (o.id, o.value, Some(o.digest)))
-                        .collect(),
-                    b1.warnings,
-                );
-                assert_eq!(
-                    e, one,
-                    "{at}：エディタの経路と一括の経路（1 スレッド）が違います"
-                );
-                let sixteen: Vec<(OutputId, Digest)> =
-                    b16.outputs.iter().map(|o| (o.id, o.digest)).collect();
-                let want: Vec<(OutputId, Digest)> =
-                    one.outputs.iter().map(|o| (o.0, o.1)).collect();
-                assert_eq!(sixteen, want, "{at}：16 スレッドの一括の経路が違います");
-                assert_eq!(b16.warnings, one.warnings, "{at}");
-            }
-            (Err(a), Err(b), Err(c)) => {
-                counts.render_errors += 1;
-                for e in [&a, &b, &c] {
-                    assert!(
-                        !matches!(e, EngineError::Internal(_)),
-                        "{at}：内部の誤り: {e}"
-                    );
-                }
-            }
-            (a, b, c) => panic!(
-                "{at}：描けたかが違います（エディタ {}・一括 1 {}・一括 16 {}）: {:?} {:?} {:?}",
-                a.is_ok(),
-                b.is_ok(),
-                c.is_ok(),
-                a.err(),
-                b.err(),
-                c.err()
-            ),
-        }
-        prev = Some(plan);
+        broken = check_step(
+            &mut r, &at, &snap, &inputs, editor, bulk, pools, codecs, counts, &mut track,
+        ) == StepOutcome::Unplanned;
     }
+}
+
+/// パレットの画像の描画の動作（番号 `index` の色のペン。点 2 つ）。
+fn index_stroke(index: u8) -> J {
+    json!({
+        "type": "stroke", "tool": "pen", "color": { "index": index }, "blend": "replace",
+        "brush": { "shape": "square", "size": 2 }, "pixelPerfect": false, "frame": 0,
+        "points": PointList(vec![IPoint { x: 2, y: 3 }, IPoint { x: 17, y: 11 }]).pack(),
+    })
+}
+
+/// 決まった列の 1 手（決まった列の手は断られない）。
+fn fixed_commit(engine: &Engine, s: &mut EditSession, e: Edit) -> Option<NodeId> {
+    s.commit(engine, e, CommitMode::Step).unwrap().created
+}
+
+/// 決まった列で、文書の末尾に操作を足す。
+fn fixed_add(engine: &Engine, s: &mut EditSession, op: &str, params: J) -> NodeId {
+    let at = s.current().to_graph().nodes.len();
+    fixed_commit(
+        engine,
+        s,
+        Edit::AddNode {
+            at,
+            op: op.into(),
+            v: 1,
+            params,
+            seed: None,
+            extra_inputs: Vec::new(),
+        },
+    )
+    .unwrap()
+}
+
+/// 決まった列（乱数の選び方によらず、描けない手を必ず含む）：パレットの画像（16 色）に、計画は作れるが実行で断る手
+/// （パレットにない番号のペン・パレットにない番号の置き換え。どちらも推論ではパレットが分からないので実行で確かめる）を、
+/// 確定・追記・取り消し・やり直し・仮の値・相対の指定の操作と混ぜる。どの手のあとも両方の経路で同じで、描けない手は
+/// 描けず、ほかは描けることを確かめる。描けない手の数を返す。操作を足して乱数の列の中身が変わっても、E4 の「描けない手が
+/// 1 回以上」はこの列で必ず起きる。
+fn run_fixed_unrenderable_sequence(
+    editor: &Engine,
+    bulk: &Engine,
+    pools: &[rayon::ThreadPool; 3],
+    codecs: &CodecSet,
+    counts: &mut Counts,
+) -> usize {
+    use StepOutcome::{Rendered, Unrenderable};
+    let mut r = determinism::rng(0xe4_f1ed);
+    let input = Input::new(&Kind::Indexed.input(7));
+    let inputs = Prepared::new(&input);
+    let mut start = Graph::new_single();
+    start
+        .push_linear("image.flip", 1, json!({ "axis": "horizontal" }), 0)
+        .unwrap();
+    let mut s =
+        EditSession::open(editor, &start, Digest([1; 32]), HistoryLimits::default()).unwrap();
+    let mut track = Track {
+        cache: NodeCache::new(64 << 10),
+        prev: None,
+        focus: None,
+    };
+    let mut wants = Vec::new();
+    let mut check = |s: &EditSession, track: &mut Track, counts: &mut Counts, want: StepOutcome| {
+        let at = format!("決まった列の手 {}", wants.len());
+        let got = check_step(
+            &mut r,
+            &at,
+            s.current(),
+            &inputs,
+            editor,
+            bulk,
+            pools,
+            codecs,
+            counts,
+            track,
+        );
+        assert_eq!(got, want, "{at}");
+        wants.push(want);
+    };
+    check(&s, &mut track, counts, Rendered);
+    let paint = fixed_add(
+        editor,
+        &mut s,
+        "paint.actions",
+        json!({ "actions": [index_stroke(3)] }),
+    );
+    track.focus = Some(paint);
+    check(&s, &mut track, counts, Rendered);
+    // パレットにない番号のペンを追記（差分の適用の道）→ 描けない → 取り消す
+    fixed_commit(
+        editor,
+        &mut s,
+        Edit::AppendItems {
+            node: paint,
+            field: "actions".into(),
+            items: vec![index_stroke(16)],
+        },
+    );
+    check(&s, &mut track, counts, Unrenderable);
+    s.undo().unwrap();
+    check(&s, &mut track, counts, Rendered);
+    // パレットにない番号の置き換え → 描けない → 引数を直す
+    let replace = fixed_add(
+        editor,
+        &mut s,
+        "palette.replace",
+        json!({ "entries": [{ "index": 20, "color": [1, 2, 3, 255] }] }),
+    );
+    track.focus = Some(replace);
+    check(&s, &mut track, counts, Unrenderable);
+    fixed_commit(
+        editor,
+        &mut s,
+        Edit::SetParam {
+            node: replace,
+            key: "entries".into(),
+            value: json!([{ "index": 15, "color": [1, 2, 3, 255] }]),
+        },
+    );
+    check(&s, &mut track, counts, Rendered);
+    // 相対の指定の操作（パレットの透明な色で広げる・2 の冪の右下に置く・下中央のピボット）
+    for (op, params) in [
+        (
+            "image.pad",
+            json!({ "top": { "px": 2 }, "right": { "px": 1 }, "bottom": { "px": 0 }, "left": { "scale": { "num": 1, "den": 6 } }, "fill": null }),
+        ),
+        (
+            "image.fit_canvas",
+            json!({ "width": "pow2", "height": "pow2", "anchor": "bottomRight", "fill": null, "allowCrop": false }),
+        ),
+        (
+            "meta.anchor_pivot",
+            json!({ "anchor": "bottom", "offset": { "x": 0, "y": 0 } }),
+        ),
+    ] {
+        track.focus = Some(fixed_add(editor, &mut s, op, params));
+        check(&s, &mut track, counts, Rendered);
+    }
+    // 仮の値でパレットにない番号のペンにする → 描けない → 仮の値をやめる
+    track.focus = Some(paint);
+    s.preview(
+        editor,
+        Edit::SetParam {
+            node: paint,
+            key: "actions".into(),
+            value: json!([index_stroke(3), index_stroke(200)]),
+        },
+    )
+    .unwrap();
+    check(&s, &mut track, counts, Unrenderable);
+    s.cancel_preview();
+    check(&s, &mut track, counts, Rendered);
+    // 取り消して（anchor_pivot を外す）やり直す
+    s.undo().unwrap();
+    check(&s, &mut track, counts, Rendered);
+    s.redo().unwrap();
+    check(&s, &mut track, counts, Rendered);
+    wants.iter().filter(|w| **w == Unrenderable).count()
 }
 
 /// E4：ChaCha8 の編集の列（引数・追記・外す・取り消し・やり直し・置き換え・仮の値・中止）で、エディタの経路（差分の計画・
 /// キャッシュ・差分の適用、3 スレッド）と一括の経路（別のエンジンで読み直して描く、1・16 スレッド）の値のダイジェスト・
 /// 固定のコーデックで書いた PNG・WAV のバイト列・警告が、どの手のあとでも同じ。キャッシュの上限は 0・4 KiB・64 KiB・1 GiB。
+/// 描けない手（計画は作れるが実行で断る手）は、乱数の列のほかに、それを必ず含む決まった列で照らす。
 #[test]
 fn random_edit_sequences_match_the_bulk_path() {
     let editor = Engine::new().unwrap();
@@ -818,9 +1036,7 @@ fn random_edit_sequences_match_the_bulk_path() {
     let codecs = CodecSet::pinned();
     let mut counts = Counts::default();
     let capacities = [0u64, 4 << 10, 64 << 10, 1 << 30];
-    // 列は 24 本（操作を足すと手の選び方がずれ、描けない手の起きる列が変わる。M14 段 1 で image.pad・image.fit_canvas・
-    // meta.anchor_pivot を足したとき、20 本では描けない手が 0 回になったので 4 本足した。前の 20 本は同じ列のまま）
-    for seed in 0..24u64 {
+    for seed in 0..20u64 {
         let capacity = capacities[(seed / KINDS.len() as u64 % 4) as usize];
         run_e4_sequence(
             seed,
@@ -834,7 +1050,14 @@ fn random_edit_sequences_match_the_bulk_path() {
             &mut counts,
         );
     }
-    eprintln!("E4 の数え上げ：{counts:?}");
+    eprintln!("E4 の数え上げ（乱数の列）：{counts:?}");
+    // 描けない手を必ず含む決まった列（乱数の列の描けない手は、操作を足すと手の選び方がずれて起きたり起きなかったりする）
+    let before = counts.render_errors;
+    let unrenderable =
+        run_fixed_unrenderable_sequence(&editor, &bulk, &pools, &codecs, &mut counts);
+    assert_eq!(unrenderable, 3);
+    assert_eq!(counts.render_errors - before, 3, "{counts:?}");
+    eprintln!("E4 の数え上げ（決まった列を含む）：{counts:?}");
     // 偏っていないこと：計画を作れた・描けた・描けなかった・当たり・差分の適用・中止のどれも起きる
     assert!(counts.planned * 2 > counts.steps, "{counts:?}");
     assert!(counts.rendered * 3 > counts.steps, "{counts:?}");
