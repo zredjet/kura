@@ -2183,7 +2183,7 @@ fn relative_ops_after_bound_nodes() {
             "ずれに結ぶ".into(),
             String::new(),
             RecipeKind::Each,
-            chain(&[anchor.clone()]),
+            chain(std::slice::from_ref(&anchor)),
             vec![bind(1, param, None, setting(SettingKey::Pivot))],
         )
         .unwrap();
