@@ -125,6 +125,15 @@ impl Plan {
             .map(|n| n.inferred.shape)
     }
 
+    /// ノードの推論の写し方（入力 0 → 出力の `SpaceMap`・`TimeMap`。外したノードは `Identity`。M14 段 1 のレシピの結び付けが、
+    /// 素材の設定の座標・時刻が動かないかを見るのに使う）。ないノードは None。
+    pub fn node_maps(&self, id: NodeId) -> Option<(SpaceMap, TimeMap)> {
+        self.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| (n.inferred.space.clone(), n.inferred.time.clone()))
+    }
+
     /// ノードが描く前に解く解析（操作の申告）。
     pub fn node_needs(&self, id: NodeId) -> Option<&[Need]> {
         self.nodes

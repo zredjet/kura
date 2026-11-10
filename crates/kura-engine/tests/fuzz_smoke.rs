@@ -1,8 +1,9 @@
 //! stable で回す、変異によるファズ（docs/editing.md §13）。`fuzz/`（cargo-fuzz、nightly）と同じ対象
-//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`・`fuzz_audio_source`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
+//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`・`fuzz_audio_source`・`fuzz_recipe`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
 //! カバレッジは見ない。対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、
 //! 文書は `document`、文書の部品（M12）は `doc_parts`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、3D モデル（glb）は `model_glb`、
-//! フォントを渡した SVG の文字は `svg_text`（`fuzz/` では `decode_svg_text`）、音声の源（M13）は `audio_source`。
+//! フォントを渡した SVG の文字は `svg_text`（`fuzz/` では `decode_svg_text`）、音声の源（M13）は `audio_source`、
+//! レシピのファイル（M14）は `recipe`。
 //!
 //! - ふだんの `cargo test` では、対象ごとに決めた回数だけ回す（`quick`）。
 //! - `KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test fuzz_smoke -- --ignored` で、対象ごとに決めた秒数だけ回す。
@@ -26,7 +27,7 @@ use kura_engine::testfiles::{ApngFrame, AseCel, AseFrame, AseLayer, FileGen, Gif
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::{
     FuzzEncodeMeta, fuzz_audio_source, fuzz_decode, fuzz_doc_parts, fuzz_document, fuzz_encode,
-    fuzz_encode_input, fuzz_encode_input_meta, fuzz_model, fuzz_peaks, fuzz_svg_text,
+    fuzz_encode_input, fuzz_encode_input_meta, fuzz_model, fuzz_peaks, fuzz_recipe, fuzz_svg_text,
 };
 use kura_engine::value::{LoopRange, PixelFormat};
 use kura_engine::{NoMonitor, Value};
@@ -614,6 +615,8 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 fixture("anchor-v1-audio-stereo.wav"),
             ],
         ),
+        // M14 段 1：レシピのファイル（cargo-fuzz の対象も recipe）
+        ("recipe", recipe_seeds()),
         // M11：3D モデル（glb の情報・焼き込み・描画。cargo-fuzz の対象も model_glb）
         (
             "model_glb",
@@ -650,6 +653,118 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 .collect(),
         ),
     ]
+}
+
+/// レシピの種：素材の格子で切ってコマの時間を付けて並べ直すもの（docs の例から B の操作を除いたもの）・音声の秒のもの・
+/// N → 1 の形だけのもの・結び付けのないもの。
+fn recipe_seeds() -> Vec<Vec<u8>> {
+    use kura_engine::doc::{InputRole, NodeId};
+    use kura_engine::recipe::{
+        Binding, RangePart, Recipe, RecipeKind, SettingKey, Source, TimeAnchor,
+    };
+    let chain = |steps: &[(&str, serde_json::Value)]| {
+        let mut g = Graph::new_single();
+        for (op, p) in steps {
+            g.push_linear(op, 1, p.clone(), 0).unwrap();
+        }
+        g
+    };
+    let bind = |node: u32, param: &str, part: Option<RangePart>, from: Source| Binding {
+        node: NodeId(node),
+        param: param.into(),
+        part,
+        from,
+    };
+    let time = |ms, anchor| Source::Time { ms, anchor };
+    let sheet = Recipe::new(
+        "コマを並べ直す".into(),
+        "素材の格子で切って並べ直す".into(),
+        RecipeKind::Each,
+        chain(&[
+            (
+                "sprite.split_grid",
+                json!({ "grid": { "cellW": 4, "cellH": 4, "offsetX": 0, "offsetY": 0, "gapX": 0, "gapY": 0 }, "durationMs": 100, "skipEmpty": false }),
+            ),
+            ("sprite.pack_grid", json!({ "columns": 8, "gapX": 0, "gapY": 0, "fill": null })),
+        ]),
+        vec![
+            bind(1, "grid", None, Source::Setting { key: SettingKey::Grid }),
+            bind(1, "durationMs", None, Source::Setting { key: SettingKey::FrameMs }),
+        ],
+    )
+    .unwrap();
+    let audio = Recipe::new(
+        "頭と終わりを切ってループ".into(),
+        String::new(),
+        RecipeKind::Each,
+        chain(&[
+            ("audio.trim", json!({ "start": 0, "end": null })),
+            (
+                "audio.fade",
+                json!({ "fadeIn": 0, "fadeOut": 0, "curve": "linear" }),
+            ),
+            (
+                "audio.set_loop",
+                json!({ "loop": { "start": 0, "end": 1 } }),
+            ),
+        ]),
+        vec![
+            bind(1, "start", None, time(10, TimeAnchor::Start)),
+            bind(1, "end", None, time(5, TimeAnchor::End)),
+            bind(2, "fadeIn", None, time(2, TimeAnchor::Start)),
+            bind(
+                3,
+                "loop",
+                Some(RangePart::Start),
+                time(0, TimeAnchor::Start),
+            ),
+            bind(3, "loop", Some(RangePart::End), time(0, TimeAnchor::End)),
+        ],
+    )
+    .unwrap();
+    let setting = Recipe::new(
+        "ループとピボット".into(),
+        String::new(),
+        RecipeKind::Each,
+        chain(&[("audio.set_loop", json!({ "loop": null }))]),
+        vec![bind(
+            1,
+            "loop",
+            None,
+            Source::Setting {
+                key: SettingKey::Loop,
+            },
+        )],
+    )
+    .unwrap();
+    let mut merge_graph = chain(&[(
+        "sprite.pack_grid",
+        json!({ "columns": 4, "gapX": 1, "gapY": 1, "fill": null }),
+    )]);
+    merge_graph.inputs[0].role = InputRole::Selection;
+    let merge = Recipe::new(
+        "まとめる".into(),
+        String::new(),
+        RecipeKind::Merge,
+        merge_graph,
+        Vec::new(),
+    )
+    .unwrap();
+    let plain = Recipe::new(
+        "左右".into(),
+        String::new(),
+        RecipeKind::Each,
+        chain(&[
+            ("image.flip", json!({ "axis": "horizontal" })),
+            ("meta.set_grid", json!({ "grid": null })),
+        ]),
+        Vec::new(),
+    )
+    .unwrap();
+    [sheet, audio, setting, merge, plain]
+        .iter()
+        .map(|r| r.to_file().unwrap())
+        .collect()
 }
 
 /// 文書の部品の種：文書の JSON と、部品の組（`testing::fuzz_doc_parts_input`）。描画の動作を 150 個に増やした文書は、
@@ -812,6 +927,8 @@ fn run(target: &str, input: &[u8]) -> Result<(), String> {
         fuzz_audio_source(input)
     } else if target == "model_glb" {
         fuzz_model(input)
+    } else if target == "recipe" {
+        fuzz_recipe(input)
     } else if target == "svg_text" {
         fuzz_svg_text(input)
     } else if let Some(format) = target.strip_prefix("encode_") {
@@ -891,7 +1008,8 @@ fn long() {
 }
 
 /// 種を cargo-fuzz の種の置き場（`fuzz/corpus/<対象>/`。git には入れない）に書き出す（fuzz/README.md）。
-/// 対象の名前は、デコーダは `decode_<形式>`、自前のエンコーダは `encode_<形式>`、文書は `document`、文書の部品は `doc_parts`、3D モデルは `model_glb`。
+/// 対象の名前は、デコーダは `decode_<形式>`、自前のエンコーダは `encode_<形式>`、文書は `document`、文書の部品は `doc_parts`、3D モデルは `model_glb`、
+/// レシピは `recipe`。
 #[test]
 #[ignore]
 fn export_seeds() {
@@ -902,6 +1020,7 @@ fn export_seeds() {
             || target == "doc_parts"
             || target == "model_glb"
             || target == "audio_source"
+            || target == "recipe"
             || target.starts_with("encode_")
         {
             target.to_string()

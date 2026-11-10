@@ -372,6 +372,12 @@ pub fn load(raw: &[u8]) -> Result<Graph, EngineError> {
             format!("JSON が読めません: {e}"),
         )))
     })?;
+    load_value(value)
+}
+
+/// 読んだ JSON の値から文書を読む（[`load`] の JSON を読んだあとの段。レシピのファイルの中の文書も同じ道で読む）：スキーマが
+/// 新しすぎればエラー、古ければ今のスキーマへ移し、型で読み、保存の形の大きさと深さを確かめる。
+pub fn load_value(value: serde_json::Value) -> Result<Graph, EngineError> {
     let schema = value
         .get("schema")
         .and_then(serde_json::Value::as_u64)

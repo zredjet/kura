@@ -1341,6 +1341,120 @@ pub fn fuzz_document(data: &[u8]) -> Result<(), String> {
     }
 }
 
+/// ファズの対象：レシピのファイル（`.kurarecipe`。M14 段 1）を上限を絞ったエンジンで読み、読めたなら書いて読み直すと同じ
+/// レシピ・同じ印・同じバイト列になることを照らす。そのうえで決まった頭の文書（空・編集済みの画像・編集済みの音声）・入力の形
+/// （画像・フレームの列・長さの決まった音声・長さの決まらない音声）・素材の設定 2 通り（全部ある・全部ない）で当て
+/// （`Engine::instantiate`）、当てた文書が保存の形にでき、読み直すと同じ文書で、compile を通せる（通らなくても落ちない）こと。
+/// 見つけたいのは自前のコードの panic と `Internal`（往復の食い違いも `Internal` として返す）。
+pub fn fuzz_recipe(data: &[u8]) -> Result<(), String> {
+    use crate::ops::audio::set_loop::FrameRange;
+    use crate::ops::util::GridParam;
+    use crate::recipe::{BindError, Facts, PivotFact};
+    use crate::shape::{Dim, Fullness, Shape};
+    use crate::value::PixelFormat;
+    let internal = |m: String| EngineError::Internal(m);
+    let r = catch_own_panic(|| {
+        let engine = Engine::with_limits(fuzz_limits())?;
+        let loaded = engine.load_recipe(data)?;
+        let bytes = loaded
+            .recipe
+            .to_file()
+            .map_err(|e| internal(format!("読めたレシピが書けません: {e}")))?;
+        let again = engine
+            .load_recipe(&bytes)
+            .map_err(|e| internal(format!("書いたレシピが読めません: {e}")))?;
+        if again != loaded {
+            return Err(internal("書いて読み直したレシピが違います".into()));
+        }
+        if again.recipe.to_file()? != bytes {
+            return Err(internal("書き直したバイト列が違います".into()));
+        }
+        let mut image = Graph::new_single();
+        image.push_linear(
+            "image.flip",
+            1,
+            serde_json::json!({ "axis": "horizontal" }),
+            3,
+        )?;
+        let mut audio = Graph::new_single();
+        audio.push_linear("audio.gain", 1, serde_json::json!({ "db": -2.0 }), 0)?;
+        let bases = [Graph::new_single(), image, audio];
+        let shapes = [
+            Shape::Image {
+                w: Dim::Exact(24),
+                h: Dim::Exact(16),
+                fmt: PixelFormat::Rgba8,
+            },
+            Shape::Frames {
+                count: Dim::Exact(3),
+                w: Dim::Exact(8),
+                h: Dim::Exact(6),
+                fmt: PixelFormat::Rgba8,
+                full: Fullness::Full,
+            },
+            Shape::Audio {
+                rate: 44_100,
+                channels: 2,
+                frames: Dim::Exact(4_000),
+            },
+            Shape::Audio {
+                rate: 8_000,
+                channels: 1,
+                frames: Dim::AtMost(4_000),
+            },
+        ];
+        let full = Facts {
+            grid: Some(GridParam {
+                cell_w: 4,
+                cell_h: 4,
+                offset_x: 0,
+                offset_y: 0,
+                gap_x: 0,
+                gap_y: 0,
+            }),
+            pivot: Some(PivotFact { x: 2.5, y: 1.0 }),
+            loop_range: Some(FrameRange {
+                start: 10,
+                end: 900,
+            }),
+            frame_ms: Some(80),
+        };
+        for base in &bases {
+            for shape in &shapes {
+                let inputs = BTreeMap::from([(InputId(0), *shape)]);
+                for facts in [&full, &Facts::default()] {
+                    match engine.instantiate(base, &loaded.recipe, &inputs, facts) {
+                        Ok(inst) => {
+                            let raw = inst.graph.to_canonical_json().map_err(|e| {
+                                internal(format!("当てた文書が保存の形にできません: {e}"))
+                            })?;
+                            let g = engine
+                                .load(&raw)
+                                .map_err(|e| internal(format!("当てた文書が読めません: {e}")))?;
+                            // 正規の形で比べる（メモリ上の -2.0 と読み直した -2 は同じ文書）
+                            if g.to_canonical_json()? != raw {
+                                return Err(internal("当てた文書を読み直すと違います".into()));
+                            }
+                            crate::recipe::bound_json(&inst.bound)?;
+                            let _ = engine.compile(&g, &inputs);
+                        }
+                        Err(BindError::Recipe(EngineError::Internal(m))) => {
+                            return Err(EngineError::Internal(m));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+    match r {
+        Err(at) => Err(format!("recipe: 自前のコードの panic（{at}）")),
+        Ok(Err(EngineError::Internal(m))) => Err(m),
+        Ok(_) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

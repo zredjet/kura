@@ -177,3 +177,10 @@ path = "fuzz_targets/doc_parts.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "recipe"
+path = "fuzz_targets/recipe.rs"
+test = false
+doc = false
+bench = false

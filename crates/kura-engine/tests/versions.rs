@@ -570,6 +570,111 @@ fn registry_status_tells_current_legacy_migrated_and_retired() {
     assert!(reg.catalog().iter().all(|d| d.id != "test.gone"));
 }
 
+/// E48（旧版の印）：旧版・移す版・退役した版の操作を含むレシピは読めて、今の版でないノードに印（`OpStatus`）が付く。
+/// 旧版の実装のまま当たり（保存した文書と同じ約束）、実装のない古い版のノードには結び付けを置けない。
+#[test]
+fn recipes_with_old_versions_load_with_notes() {
+    use kura_engine::doc::NodeId;
+    use kura_engine::op::OpStatus;
+    use kura_engine::recipe::{Binding, Facts, Recipe, RecipeKind, RecipeNote, Source, TimeAnchor};
+    let engine = marked();
+    let mut g = Graph::new_single();
+    g.push_linear("test.shift", 1, json!({ "delta": 0.25 }), 0)
+        .unwrap();
+    g.push_linear("test.shift", 2, json!({ "delta": 0.125 }), 0)
+        .unwrap();
+    g.push_linear("test.shift", 3, json!({ "amount": 0.1 }), 0)
+        .unwrap();
+    g.push_linear("test.gone", 1, json!({ "amount": 0.5 }), 0)
+        .unwrap();
+    g.push_linear("test.step", 1, json!({ "n": 2 }), 0).unwrap();
+    g.push_linear("test.noise", 1, json!({ "amount": 0.05 }), 7)
+        .unwrap();
+    let recipe = Recipe::new(
+        "古い版を含む".into(),
+        String::new(),
+        RecipeKind::Each,
+        g.clone(),
+        Vec::new(),
+    )
+    .unwrap();
+    let loaded = engine.load_recipe(&recipe.to_file().unwrap()).unwrap();
+    assert_eq!(loaded.recipe, recipe);
+    let note = |node: u32, op: &str, v: u16, status| RecipeNote {
+        node: NodeId(node),
+        op: op.into(),
+        v,
+        status,
+    };
+    assert_eq!(
+        loaded.notes,
+        [
+            note(
+                1,
+                "test.shift",
+                1,
+                OpStatus::Legacy {
+                    uses: 1,
+                    current: 3
+                }
+            ),
+            note(2, "test.shift", 2, OpStatus::Migrated { current: 3 }),
+            note(4, "test.gone", 1, OpStatus::Retired { uses: 2 }),
+            note(5, "test.step", 1, OpStatus::Migrated { current: 2 }),
+        ]
+    );
+    // requires は文書に書いたままの版
+    let versions: Vec<(String, u16)> = recipe.requires().into_iter().map(|r| (r.op, r.v)).collect();
+    assert_eq!(
+        versions,
+        [
+            ("test.gone".to_string(), 1),
+            ("test.noise".to_string(), 1),
+            ("test.shift".to_string(), 1),
+            ("test.shift".to_string(), 2),
+            ("test.shift".to_string(), 3),
+            ("test.step".to_string(), 1),
+        ]
+    );
+    // 旧版の実装のまま当たる：継いだ文書の値は、文書をそのまま描いたものと同じ（作り直しと同じ扱い）
+    let source = Digest(*blake3::hash(b"old").as_bytes());
+    let base = doc("test.noise", 1, json!({ "amount": 0.1 }));
+    let shapes = BTreeMap::from([(InputId(0), input().shape())]);
+    let inst = engine
+        .instantiate(&base, &loaded.recipe, &shapes, &Facts::default())
+        .unwrap();
+    let step = render(&engine, &base, &input(), source);
+    assert_eq!(
+        render(&engine, &inst.graph, &input(), source),
+        render(&engine, &g, &step, source)
+    );
+    // 実装のない古い版（v2 は v3 へ移す）のノードには結び付けを置けない。旧版（v1）は記述に結び付けがないので置けない
+    for node in [2u32, 1] {
+        let bound = Recipe::new(
+            "結び付け".into(),
+            String::new(),
+            RecipeKind::Each,
+            g.clone(),
+            vec![Binding {
+                node: NodeId(node),
+                param: "delta".into(),
+                part: None,
+                from: Source::Time {
+                    ms: 1,
+                    anchor: TimeAnchor::Start,
+                },
+            }],
+        )
+        .unwrap();
+        let err = engine.check_recipe(&bound).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Invalid(i) if i.0.iter().any(|x| x.code == kura_engine::IssueCode::BadParams && x.node == Some(NodeId(node)))),
+            "{node}: {err}"
+        );
+        assert!(engine.load_recipe(&bound.to_file().unwrap()).is_err());
+    }
+}
+
 /// 移行は正規の JSON に直した引数に当てる：メモリ上の `5.0`・読み直した文書・正規でない書き方（`5.0`）が同じ結果になる
 /// （migrate が整数として読んでも、書き方で結果が分かれない。ADR-145）。
 #[test]

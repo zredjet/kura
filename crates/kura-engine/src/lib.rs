@@ -25,6 +25,7 @@ pub mod monitor;
 pub mod op;
 pub mod ops;
 pub mod paint;
+pub mod recipe;
 pub mod render;
 pub mod session;
 pub mod shape;
