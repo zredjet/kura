@@ -27,7 +27,7 @@ use crate::jobs::JobState;
 use crate::library::Library;
 
 /// 音声のアイテムのファイルを置いて行を入れる（サムネイル・解析は済んだものとして）。
-fn add_audio(lib: &Library, bytes: &[u8], ext: &str, title: &str) -> (i64, [u8; 32]) {
+pub(super) fn add_audio(lib: &Library, bytes: &[u8], ext: &str, title: &str) -> (i64, [u8; 32]) {
     let hash = hash_of(bytes);
     let path = lib.layout().content_path(&hash, ext);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -66,7 +66,7 @@ fn noise_file(codecs: &CodecSet, format: &str, channels: u16, frames: u64, seed:
 }
 
 /// 元に対する累積の音声の文書（`to` があれば出力の形式）。
-fn audio_doc(db: f64, to: Option<&str>) -> Graph {
+pub(super) fn audio_doc(db: f64, to: Option<&str>) -> Graph {
     let mut g = Graph::new_single();
     g.push_linear("audio.gain", 1, json!({ "db": db }), 1)
         .unwrap();
@@ -214,7 +214,7 @@ fn s18_streamed_audio_save_equals_the_whole_path() {
 }
 
 /// 偽の Platform のデコーダ（opus。8 kHz の雑音を読むたびに少しずつ変えて返す）。
-fn opus_decoder(channels: u16, frames: u64) -> Arc<FakePlatformDecoder> {
+pub(super) fn opus_decoder(channels: u16, frames: u64) -> Arc<FakePlatformDecoder> {
     Arc::new(
         FakePlatformDecoder::new(
             "fake-opus-dec/1",
@@ -602,7 +602,7 @@ fn gated_env(
 }
 
 /// 偽の Platform のデコーダ（opus）だけを足した組。
-fn opus_codecs(decoder: &Arc<FakePlatformDecoder>) -> Arc<Mutex<CodecSet>> {
+pub(super) fn opus_codecs(decoder: &Arc<FakePlatformDecoder>) -> Arc<Mutex<CodecSet>> {
     let mut set = CodecSet::pinned();
     set.add_decoder(decoder.clone()).unwrap();
     Arc::new(Mutex::new(set))

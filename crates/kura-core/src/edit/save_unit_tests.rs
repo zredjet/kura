@@ -10,21 +10,24 @@ use kura_engine::{Digest, Graph};
 use serde_json::{Value as Json, json};
 
 use super::save::{Committed, Flow, Mode, Record, Reverted, Saver, UnitCx};
+use super::save_stream_tests::{add_audio, audio_doc, opus_codecs, opus_decoder};
 use super::save_tests::{
-    Env, assert_consistent, assert_done, base_of, doc, flip, gc_version, head, render_png, staged,
-    versions_of,
+    Env, add_item, assert_consistent, assert_done, base_of, doc, flip, gc_version, head,
+    heic_codecs, heic_decoder, render_png, staged, versions_of,
 };
+use super::services::fake::FakeEngineFactory;
 use crate::CoreError;
 use crate::import::{MediaKind, hash_file};
 use crate::jobs::Control;
 use crate::library::{Library, hex};
 
-/// ジョブのない 1 件の場（印・進みを覚える）。
+/// ジョブのない 1 件の場（読む前後の印・進みを覚える）。
 struct TestUnit<'a> {
     lib: &'a Library,
     job: i64,
     tag: &'static str,
     progress: Mutex<Vec<f64>>,
+    marks: Mutex<Vec<Json>>,
 }
 
 impl<'a> TestUnit<'a> {
@@ -34,6 +37,7 @@ impl<'a> TestUnit<'a> {
             job,
             tag,
             progress: Mutex::new(Vec::new()),
+            marks: Mutex::new(Vec::new()),
         }
     }
 }
@@ -53,7 +57,11 @@ impl UnitCx for TestUnit<'_> {
 
     fn log(&self, _line: &str) {}
 
-    fn mark(&self, _result_json: &str, _progress: f64, _message: &str) -> crate::Result<()> {
+    fn mark(&self, result_json: &str, _progress: f64, _message: &str) -> crate::Result<()> {
+        self.marks
+            .lock()
+            .unwrap()
+            .push(serde_json::from_str(result_json).unwrap());
         Ok(())
     }
 
@@ -131,7 +139,8 @@ fn prepared(saver: &Saver, unit: &TestUnit<'_>, item: i64, g: &Graph) -> super::
 }
 
 /// ジョブの文脈なしで 1 件を上書きできる：版の `job_id` と台帳の予告の持ち主は場のジョブ、書きかけは場の印の名前、結果は
-/// 記録（コミットと同じトランザクション）に書かれ、後のジョブは積まない（呼び手が積む）。
+/// 記録（コミットと同じトランザクション）に書かれ、版を足したアイテムの種類を返す（後のジョブは、それを見て呼び手が積む。
+/// `UnitCx` にジョブを積む口はない）。固定の段で読むので、読む前の印は置かない。
 #[test]
 fn a_unit_saves_without_a_job_and_records_in_the_same_transaction() {
     let env = Env::new();
@@ -156,11 +165,7 @@ fn a_unit_saves_without_a_job_and_records_in_the_same_transaction() {
     assert_eq!(vs.len(), 2);
     assert_eq!((vs[1].job_id, vs[1].output_hash), (Some(9001), want));
     assert_eq!(head(&env.lib, a).hash, want);
-    assert_eq!(
-        env.count("SELECT count(*) FROM jobs WHERE kind <> 'import'"),
-        0,
-        "後のジョブは呼び手が積む"
-    );
+    assert!(unit.marks.lock().unwrap().is_empty());
     // 進みは準備とコミットの順に増える
     let p = unit.progress.lock().unwrap().clone();
     assert!(p.windows(2).all(|w| w[0] <= w[1]), "{p:?}");
@@ -187,8 +192,9 @@ fn a_failing_record_leaves_no_version() {
     assert_consistent(&env.lib);
 }
 
-/// 同じジョブで並べて準備した 2 件は、印で別の書きかけになる（同時に残る）。順にコミットすると、土台の変わった 2 件目は
-/// Conflict で、その書きかけも片付く。
+/// 同じアイテムを並べて準備した 2 件は、印で別の書きかけになる（同時に残る）。順にコミットすると、土台の変わった 2 件目は
+/// 予告の前の Conflict で、その書きかけも片付く（別のアイテムを同じ持ち主のジョブでコミットするのは、版の `job_id` が一意
+/// なので段 3 で持ち主を決めてから。`UnitCx::job`）。
 #[test]
 fn units_prepared_side_by_side_commit_in_turn() {
     let env = Env::new();
@@ -240,8 +246,8 @@ fn revert_reuses_or_rebuilds_through_the_unit() {
     gc_version(&env, a, 1);
     let path1 = env.lib.layout().content_path(&v1.output_hash, "png");
     assert!(!path1.exists());
-    // 版の `job_id` は 1 ジョブ 1 版なので、別のジョブの場で
-    let unit = TestUnit::new(&env.lib, 9005, "9005");
+    // 版の `job_id` は 1 ジョブ 1 版なので、別のジョブの場で（印もジョブの ID と違うもので、作り直しの書きかけの名前を見る）
+    let unit = TestUnit::new(&env.lib, 9005, "9005-r");
     let Reverted::Rebuild(plan) = saver
         .revert_reuse(&unit, a, base_of(&env.lib, a), 1, &record_to("test.unused"))
         .unwrap()
@@ -253,13 +259,18 @@ fn revert_reuses_or_rebuilds_through_the_unit() {
         Flow::Go(w) => w,
         Flow::Stop(end) => panic!("止まりました：{end:?}"),
     };
-    assert_eq!(names(&staged(&env.lib)), ["edit-9005-out.png.part"]);
+    assert_eq!(names(&staged(&env.lib)), ["edit-9005-r-out.png.part"]);
     let done = saver
         .commit(&unit, written, record_to("test.rebuild"))
         .unwrap();
+    assert_eq!(done.saved, Some(MediaKind::Image));
     assert_eq!(
         done.outcome["revert"],
         json!({ "to": 1, "reused": false, "rebuilt": true })
+    );
+    assert_eq!(
+        setting(&env.lib, "test.rebuild"),
+        Some(done.outcome.clone())
     );
     assert_eq!(hash_file(&path1).unwrap(), v1.output_hash);
     let last = versions_of(&env.lib, a).pop().unwrap();
@@ -267,6 +278,59 @@ fn revert_reuses_or_rebuilds_through_the_unit() {
         (last.output_hash, last.job_id),
         (v1.output_hash, Some(9005))
     );
+    assert_consistent(&env.lib);
+}
+
+/// 書きかけの名前は、アンカーを作る道（偽の HEIC の最初の保存）でも、音声を流して書いて作業用のファイルをアンカーに昇格する
+/// 道（偽の Opus）でも、場の印（ジョブの ID と違うもの）で付く。OS のデコーダを通るので、読む前後の印を置く。
+#[test]
+fn the_staging_tag_names_every_part() {
+    let decoding = || {
+        vec![
+            json!({ "v": 1, "decoding": true }),
+            json!({ "v": 1, "decoding": false }),
+        ]
+    };
+    let parts = |lib: &Library| {
+        names(&staged(lib))
+            .into_iter()
+            .filter(|n| n.ends_with(".part"))
+            .collect::<Vec<_>>()
+    };
+    // 画像：アンカー（png）と出力
+    let decoder = heic_decoder(false);
+    let env = Env::with(FakeEngineFactory::with_codecs(heic_codecs(&decoder)), None);
+    let (a, _) = add_item(&env.lib, b"fake heic bytes", "heic", "写真");
+    let saver = Saver::new(env.engine.clone());
+    let unit = TestUnit::new(&env.lib, 9006, "9006-h");
+    let written = prepared(&saver, &unit, a, &doc(&[flip("vertical")], Some("png")));
+    assert_eq!(
+        parts(&env.lib),
+        ["edit-9006-h-anchor.png.part", "edit-9006-h-out.png.part"]
+    );
+    assert_eq!(*unit.marks.lock().unwrap(), decoding());
+    let done = saver
+        .commit(&unit, written, record_to("test.heic"))
+        .unwrap();
+    assert_eq!(done.outcome["anchor"], "created");
+    assert_consistent(&env.lib);
+    // 音声：作業用のファイルを写したアンカー（wav）と、流して書いた出力
+    let decoder = opus_decoder(2, 65_536 + 11);
+    let env = Env::with(FakeEngineFactory::with_codecs(opus_codecs(&decoder)), None);
+    let (b, _) = add_audio(&env.lib, b"fake opus bytes", "opus", "声");
+    let saver = Saver::new(env.engine.clone());
+    let unit = TestUnit::new(&env.lib, 9007, "9007-o");
+    let written = prepared(&saver, &unit, b, &audio_doc(-2.0, Some("wav")));
+    assert_eq!(
+        parts(&env.lib),
+        ["edit-9007-o-anchor.wav.part", "edit-9007-o-out.wav.part"]
+    );
+    assert_eq!(*unit.marks.lock().unwrap(), decoding());
+    let done = saver
+        .commit(&unit, written, record_to("test.opus"))
+        .unwrap();
+    assert_eq!(done.saved, Some(MediaKind::Audio));
+    assert_eq!(done.outcome["anchor"], "created");
     assert_consistent(&env.lib);
 }
 

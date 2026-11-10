@@ -1220,6 +1220,19 @@ fn crash_and_reopen(heic: bool, save_as: bool, at: Fault) {
     let (dir, session) = reopen_after_crash(env, job, factory());
     let record = session.jobs().get(job).unwrap();
     assert_done(&record);
+    if at == Fault::AfterCommit {
+        // コミットのときに途中経過へ書いた結果（`committed`）をそのまま返す（なくて版から合成すると `resumed` が付き、
+        // アンカー・警告が抜ける）
+        let result = result_of(&record);
+        assert_eq!(result.get("resumed"), None, "{case}");
+        assert_eq!(result["hash"], hex(&out), "{case}");
+        assert_eq!(
+            result["anchor"],
+            if heic { json!("created") } else { Json::Null },
+            "{case}"
+        );
+        assert_eq!(result["warnings"], json!([]), "{case}");
+    }
     let lib = session.library();
     let item = if save_as {
         assert!(versions_of(lib, a).is_empty(), "{case}");
@@ -2278,7 +2291,18 @@ fn revert_rebuild_crash_at_each_stage_recovers() {
         assert_crashed_state(&env, record.id, at, h1, false);
         let job = record.id;
         let (dir, session) = reopen_after_crash(env, job, FakeEngineFactory::default());
-        assert_done(&session.jobs().get(job).unwrap());
+        let record = session.jobs().get(job).unwrap();
+        assert_done(&record);
+        if at == Fault::AfterCommit {
+            // コミットのときに途中経過へ書いた結果（版に戻すの作り直しの印つき）をそのまま返す
+            let result = result_of(&record);
+            assert_eq!(result.get("resumed"), None, "{at:?}");
+            assert_eq!(
+                result["revert"],
+                json!({ "to": 1, "reused": false, "rebuilt": true }),
+                "{at:?}"
+            );
+        }
         let lib = session.library();
         assert_eq!(head(lib, a).hash, h1, "{at:?}");
         assert_eq!(
