@@ -16,7 +16,11 @@ use std::path::PathBuf;
 
 use kura_engine::NoMonitor;
 use kura_engine::digest::canonical;
-use kura_engine::doc::Graph;
+use kura_engine::doc::{Graph, InputId, NodeId};
+use kura_engine::ops::util::GridParam;
+use kura_engine::recipe::{
+    Binding, Facts, RangePart, Recipe, RecipeKind, SettingKey, Source, TimeAnchor,
+};
 use kura_engine::render::Engine;
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::{render_with, source_of};
@@ -255,7 +259,153 @@ fn examples() -> Vec<(&'static str, bool, Graph, Vec<InputGen>)> {
                 },
             }],
         ),
+        // M14 段 1：レシピを継いで結び付けた文書（頭の編集＋素材の設定・秒を具体的な値にしたレシピのノード）。版の文書は
+        // 具体的な値だけを持つので、読み直して同じ値になることを凍結する（新しい操作 image.pad などを使う見本は B の合流のあと）
+        (
+            "recipe-bound-sheet",
+            true,
+            bound_sheet(),
+            vec![bound_sheet_input()],
+        ),
+        (
+            "recipe-bound-audio-seconds",
+            false,
+            bound_audio(),
+            vec![bound_audio_input()],
+        ),
     ]
+}
+
+fn bound_sheet_input() -> InputGen {
+    InputGen::Sheet {
+        cols: 6,
+        rows: 4,
+        cell: 16,
+    }
+}
+
+fn bound_audio_input() -> InputGen {
+    InputGen::AudioNoise {
+        rate: 22_050,
+        channels: 2,
+        frames: 30_000,
+        seed: 17,
+    }
+}
+
+fn bind(node: u32, param: &str, part: Option<RangePart>, from: Source) -> Binding {
+    Binding {
+        node: NodeId(node),
+        param: param.into(),
+        part,
+        from,
+    }
+}
+
+/// 左右を返した頭に、「素材の格子（32×32）で切ってコマの時間（120 ms）を付け、3 列に並べ直す」レシピを当てた文書。
+fn bound_sheet() -> Graph {
+    let engine = Engine::new().unwrap();
+    let base = chain(&[("image.flip", 1, json!({ "axis": "horizontal" }), 0, true)]);
+    let recipe = Recipe::new(
+        "コマを並べ直す".into(),
+        String::new(),
+        RecipeKind::Each,
+        chain(&[
+            (
+                "sprite.split_grid",
+                1,
+                json!({ "grid": { "cellW": 16, "cellH": 16, "offsetX": 0, "offsetY": 0, "gapX": 0, "gapY": 0 }, "durationMs": 100, "skipEmpty": false }),
+                0,
+                true,
+            ),
+            (
+                "sprite.pack_grid",
+                1,
+                json!({ "columns": 3, "gapX": 1, "gapY": 1, "fill": [0, 0, 0, 255] }),
+                0,
+                true,
+            ),
+        ]),
+        vec![
+            bind(1, "grid", None, Source::Setting { key: SettingKey::Grid }),
+            bind(
+                1,
+                "durationMs",
+                None,
+                Source::Setting {
+                    key: SettingKey::FrameMs,
+                },
+            ),
+        ],
+    )
+    .unwrap();
+    let facts = Facts {
+        grid: Some(GridParam {
+            cell_w: 32,
+            cell_h: 32,
+            offset_x: 0,
+            offset_y: 0,
+            gap_x: 0,
+            gap_y: 0,
+        }),
+        frame_ms: Some(120),
+        ..Facts::default()
+    };
+    let input = bound_sheet_input().generate().unwrap();
+    let shapes = BTreeMap::from([(InputId(0), input.shape())]);
+    engine
+        .instantiate(&base, &recipe, &shapes, &facts)
+        .unwrap()
+        .graph
+}
+
+/// 音量を下げた頭に、「頭 100 ms と終わり 250 ms を切り、50 ms と 80 ms のフェード、全体をループ」のレシピを当てた文書。
+fn bound_audio() -> Graph {
+    let engine = Engine::new().unwrap();
+    let base = chain(&[("audio.gain", 1, json!({ "db": -1.5 }), 0, true)]);
+    let time = |ms, anchor| Source::Time { ms, anchor };
+    let recipe = Recipe::new(
+        "頭と終わりを切ってループ".into(),
+        String::new(),
+        RecipeKind::Each,
+        chain(&[
+            ("audio.trim", 1, json!({ "start": 0, "end": null }), 0, true),
+            (
+                "audio.fade",
+                1,
+                json!({ "fadeIn": 0, "fadeOut": 0, "curve": "equalPower" }),
+                0,
+                true,
+            ),
+            (
+                "audio.set_loop",
+                1,
+                json!({ "loop": { "start": 0, "end": 1 } }),
+                0,
+                true,
+            ),
+        ]),
+        vec![
+            bind(1, "start", None, time(100, TimeAnchor::Start)),
+            bind(1, "end", None, time(250, TimeAnchor::End)),
+            bind(2, "fadeIn", None, time(50, TimeAnchor::Start)),
+            bind(2, "fadeOut", None, time(80, TimeAnchor::Start)),
+            bind(
+                3,
+                "loop",
+                Some(RangePart::Start),
+                time(0, TimeAnchor::Start),
+            ),
+            bind(3, "loop", Some(RangePart::End), time(0, TimeAnchor::End)),
+        ],
+    )
+    .unwrap();
+    let input = bound_audio_input().generate().unwrap();
+    let shapes = BTreeMap::from([(InputId(0), input.shape())]);
+    engine
+        .instantiate(&base, &recipe, &shapes, &Facts::default())
+        .unwrap()
+        .graph
 }
 
 fn dir() -> PathBuf {
