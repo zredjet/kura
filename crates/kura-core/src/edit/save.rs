@@ -26,6 +26,12 @@
 //! 9. 後始末：門を放し、staging の残りを消し、サムネイル・解析・プロキシのジョブを積む（GC の時計を渡されていれば、GC の
 //!    候補があるときだけ GC も。M12 の段 3）。
 //!
+//! 1 件ずつの単位（M14 段 2）：手順はジョブの文脈によらない [`Saver`] が、1 件の場（[`UnitCx`]：ライブラリ・止める指示・進み・
+//! ログ・読む前の印・持ち主のジョブ・書きかけの印）で動かす。0 の再開の確かめと 9 の後のジョブを積むのは呼び手（保存のジョブは
+//! [`EditHandler`]。一括のジョブは段 4）。1〜5 は [`Saver::prepare`]（版に戻すの作り直しは [`Saver::prepare_rebuild`]）で、
+//! 1 件ごとに並べてよい。6〜8 は [`Saver::commit`]（版に戻すの使い直しは [`Saver::revert_reuse`]）で、門を持つので順に呼ぶ。
+//! 8 の結果は呼び手の [`Record`] がトランザクション 2 の中で書く（保存のジョブは途中経過の `committed`）。
+//!
 //! 積む口（[`start_save`]）は、文書の部品を置くのと同じトランザクションでジョブを積む（GC の部品の片付けが、積む前の部品を
 //! 消さないように）。上書き・別名が版を足さずに終わったら（失敗・中止・同じ中身のアイテムがある）、その文書の部品が孤立しうる
 //! ので GC の部品の印（`gc::mark_parts`）を置く。GC の照合（[`verify_version`]）は版に戻すの作り直しと同じ読み・描き・書きを使う。
@@ -518,48 +524,28 @@ pub(crate) enum Stage {
 #[cfg(test)]
 pub(crate) type Hook = Arc<dyn Fn(Stage) + Send + Sync>;
 
-/// 保存のジョブの処理。エンジンの部品（実行の場・コーデックの組）は、このライブラリのもの。
-pub struct EditHandler {
+/// 保存の手順を 1 件ずつ動かすもの（M14 段 2。ジョブの文脈によらない：[`UnitCx`]）。準備（段 0〜5：[`Saver::prepare`]・
+/// [`Saver::prepare_rebuild`]）は 1 件ごとに別のスレッドで並べてよい。コミット（段 6〜8：[`Saver::commit`]・
+/// [`Saver::revert_reuse`]）は台帳の門を持つので、呼び手が 1 件ずつ順に呼ぶ。エンジンの部品（実行の場・コーデックの組）は、
+/// このライブラリのもの。
+pub(crate) struct Saver {
     engine: Arc<EngineServices>,
-    /// GC の時計（あれば、コミットのあとに候補があれば GC を積む。`LibrarySession` が GC と同じものを渡す）。
-    gc: Option<GcClock>,
     #[cfg(test)]
     pub(crate) fault: Option<Fault>,
     #[cfg(test)]
     pub(crate) hook: Option<Hook>,
 }
 
-impl EditHandler {
+impl Saver {
     /// このライブラリのエンジンの部品で保存する。
-    pub fn new(engine: Arc<EngineServices>) -> Self {
+    pub(crate) fn new(engine: Arc<EngineServices>) -> Self {
         Self {
             engine,
-            gc: None,
             #[cfg(test)]
             fault: None,
             #[cfg(test)]
             hook: None,
         }
-    }
-
-    /// コミットのあとに、GC の候補（`clock` で数える）があれば GC のジョブを積む。
-    pub fn with_gc(mut self, clock: GcClock) -> Self {
-        self.gc = Some(clock);
-        self
-    }
-
-    /// 段 `fault` の直後で、後始末を通らずに失敗させる（テストの強制終了）。
-    #[cfg(test)]
-    pub(crate) fn with_fault(mut self, fault: Fault) -> Self {
-        self.fault = Some(fault);
-        self
-    }
-
-    /// 段ごとに `hook` を呼ぶ（テストの割り込み）。
-    #[cfg(test)]
-    pub(crate) fn with_hook(mut self, hook: Hook) -> Self {
-        self.hook = Some(hook);
-        self
     }
 
     #[cfg(test)]
@@ -576,18 +562,46 @@ impl EditHandler {
     }
 }
 
+/// 保存のジョブの処理（`JobKind::Edit`）：入力を読み、再開を確かめ、[`Saver`] で 1 件を準備してコミットし、後のジョブを積む。
+pub struct EditHandler {
+    saver: Saver,
+    /// GC の時計（あれば、コミットのあとに候補があれば GC を積む。`LibrarySession` が GC と同じものを渡す）。
+    gc: Option<GcClock>,
+}
+
+impl EditHandler {
+    /// このライブラリのエンジンの部品で保存する。
+    pub fn new(engine: Arc<EngineServices>) -> Self {
+        Self {
+            saver: Saver::new(engine),
+            gc: None,
+        }
+    }
+
+    /// コミットのあとに、GC の候補（`clock` で数える）があれば GC のジョブを積む。
+    pub fn with_gc(mut self, clock: GcClock) -> Self {
+        self.gc = Some(clock);
+        self
+    }
+
+    /// 段 `fault` の直後で、後始末を通らずに失敗させる（テストの強制終了）。
+    #[cfg(test)]
+    pub(crate) fn with_fault(mut self, fault: Fault) -> Self {
+        self.saver.fault = Some(fault);
+        self
+    }
+
+    /// 段ごとに `hook` を呼ぶ（テストの割り込み）。
+    #[cfg(test)]
+    pub(crate) fn with_hook(mut self, hook: Hook) -> Self {
+        self.saver.hook = Some(hook);
+        self
+    }
+}
+
 #[cfg(test)]
 fn crashed(at: Fault) -> CoreError {
     CoreError::Invalid(format!("テスト用の強制終了（{at:?}）"))
-}
-
-/// ジョブの指示（一時停止・中止・終了）をエンジンの中止に写す。
-struct JobMonitor<'a>(&'a JobContext);
-
-impl Monitor for JobMonitor<'_> {
-    fn canceled(&self) -> bool {
-        self.0.control() != Control::Continue
-    }
 }
 
 /// 段の結果：続けるか、止めるか（一時停止・中止）。
@@ -597,7 +611,7 @@ pub(crate) enum Flow<T> {
 }
 
 /// 止める指示があれば、その止め方。
-fn stop_end(ctx: &JobContext) -> Option<JobEnd> {
+fn stop_end(ctx: &dyn UnitCx) -> Option<JobEnd> {
     match ctx.control() {
         Control::Continue => None,
         Control::Pause => Some(JobEnd::Paused),
@@ -607,7 +621,7 @@ fn stop_end(ctx: &JobContext) -> Option<JobEnd> {
 
 /// エンジンの結果：中止（止める指示があるとき）は止め方に、ほかの誤りは CoreError に。
 fn engine_flow<T>(
-    ctx: &JobContext,
+    ctx: &dyn UnitCx,
     what: &str,
     r: std::result::Result<T, EngineError>,
 ) -> Result<Flow<T>> {
@@ -635,9 +649,11 @@ macro_rules! go {
 mod read;
 mod revert;
 mod stream;
+mod unit;
 
 pub use revert::Verdict;
-pub(crate) use revert::verify_version;
+pub(crate) use revert::{Reverted, verify_version};
+pub(crate) use unit::{Committed, JobUnit, Record, UnitCx, UnitMonitor};
 
 /// このジョブの staging のファイル（落とすと消す。置いたものは改名で消えている）。
 #[derive(Default)]
@@ -932,7 +948,7 @@ impl JobHandler for EditHandler {
             match paused_work_keys(tx, input) {
                 Ok(keys) => {
                     for key in &keys {
-                        self.engine.work_pcm().discard(key);
+                        self.saver.engine.work_pcm().discard(key);
                     }
                 }
                 // 鍵を求められなくても中止は止めない（残したものは期限・上限・閉じるときに消える）
@@ -1057,23 +1073,71 @@ impl EditHandler {
             hash: input.base.hash.0,
             version: input.base.version,
         };
+        let unit = JobUnit(ctx);
+        // 結果は途中経過の `committed` に、版と同じトランザクションで書く（再開の 0 が版と一緒に読む）
+        let record: Record = Arc::new(move |tx, outcome| {
+            save_partial(
+                tx,
+                job,
+                &json!({ "v": 1, "committed": outcome }).to_string(),
+                1.0,
+                "保存しました",
+            )
+        });
         let (mode, doc, names) = match input.action.clone() {
             ActionInput::Overwrite { doc } => (Mode::Overwrite, doc, None),
             ActionInput::SaveAs { doc, title, stem } => (Mode::SaveAs, doc, Some((title, stem))),
-            ActionInput::Revert { to } => return self.revert(ctx, input.item_id, base, to),
+            ActionInput::Revert { to } => {
+                let plan = match self
+                    .saver
+                    .revert_reuse(&unit, input.item_id, base, to, &record)?
+                {
+                    Reverted::Committed(done) => return Ok(self.done(ctx, done)),
+                    Reverted::Rebuild(plan) => plan,
+                };
+                let written = match self.saver.prepare_rebuild(&unit, *plan)? {
+                    Flow::Go(w) => w,
+                    Flow::Stop(end) => return Ok(end),
+                };
+                let done = self.saver.commit(&unit, written, record)?;
+                return Ok(self.done(ctx, done));
+            }
         };
-        let (prepared, staging) = match self.prepare(ctx, mode, input.item_id, base, doc, names)? {
-            Flow::Go(p) => p,
+        let written = match self
+            .saver
+            .prepare(&unit, mode, input.item_id, base, doc, names)?
+        {
+            Flow::Go(w) => w,
             Flow::Stop(end) => return Ok(end),
         };
-        self.commit(ctx, prepared, staging)
+        let done = self.saver.commit(&unit, written, record)?;
+        Ok(self.done(ctx, done))
     }
 
+    /// コミットのあと：版を足したら後のジョブを積み、ジョブの終わりにする。
+    fn done(&self, ctx: &JobContext, c: Committed) -> JobEnd {
+        if let Some(kind) = c.saved {
+            self.queue_follow_ups(ctx, kind);
+        }
+        JobEnd::Done {
+            result_json: c.outcome.to_string(),
+            message: Some(c.message),
+        }
+    }
+}
+
+/// 描いて書き終えた 1 件（段 5 まで。[`Saver::commit`] に渡す。落とすと staging を消す）。
+pub(crate) struct Written {
+    p: Prepared,
+    staging: Staging,
+}
+
+impl Saver {
     /// 書き終えたあと（段 5 の終わり）：止める指示があれば止める（呼び手が staging を落として消す）。テストの強制終了なら
     /// staging を残して失敗する。続けるなら None。
     fn after_written<T>(
         &self,
-        ctx: &JobContext,
+        ctx: &dyn UnitCx,
         _staging: &mut Staging,
     ) -> Option<Result<Flow<T>>> {
         #[cfg(test)]
@@ -1089,20 +1153,22 @@ impl EditHandler {
         None
     }
 
-    /// 段 0〜5：文書を読み、元を読み（アンカーを作り）、描いて書く。
-    fn prepare(
+    /// 上書き・別名で保存の段 0〜5：文書（`doc`。積む前に DB に置いたもの）を読み、土台を確かめ、元を読み（アンカーを作り）、
+    /// 描いて staging に書く。`names` は別名で保存の (表示名, 語幹)。止める指示（一時停止・中止）は `Flow::Stop`。
+    pub(crate) fn prepare(
         &self,
-        ctx: &JobContext,
+        ctx: &dyn UnitCx,
         mode: Mode,
         item_id: i64,
         base: Base,
         doc: Digest,
         names: Option<(String, String)>,
-    ) -> Result<Flow<(Prepared, Staging)>> {
+    ) -> Result<Flow<Written>> {
         let library = ctx.library();
         let db = library.db();
         let layout = library.layout();
-        let job = ctx.id();
+        let job = ctx.job();
+        let tag = ctx.tag();
         let doc_id = db
             .read(|c| store::doc_id_by_digest(c, &doc))?
             .ok_or_else(|| CoreError::NotFound(format!("保存する文書 {doc}")))?;
@@ -1133,7 +1199,7 @@ impl EditHandler {
             .unwrap_or_default();
         let options_digest = anchors::options_digest(&opts)?;
         let found = db.read(|c| anchors::find(c, &original.hash, &options_digest))?;
-        let mon = JobMonitor(ctx);
+        let mon = UnitMonitor(ctx);
         let limits: Limits = runtime.bulk(|e| e.limits().clone());
         let original_path = layout.content_path(&original.hash, &original.ext);
         let (out_format, enc_opts) = match graph.outputs.first().map(|o| &o.format) {
@@ -1304,7 +1370,7 @@ impl EditHandler {
                 };
                 let part = layout
                     .staging_dir()
-                    .join(format!("edit-{job}-anchor.{ext}.part"));
+                    .join(format!("edit-{tag}-anchor.{ext}.part"));
                 staging.add(part.clone());
                 let acx = AnchorContext {
                     source: Some(Digest(original.hash)),
@@ -1365,15 +1431,15 @@ impl EditHandler {
         let ext0 = desc.exts.first().copied().unwrap_or("bin");
         let out_part = layout
             .staging_dir()
-            .join(format!("edit-{job}-out.{ext0}.part"));
+            .join(format!("edit-{tag}-out.{ext0}.part"));
         staging.add(out_part.clone());
         write_synced(&out_part, &bytes)?;
         drop(bytes);
         if let Some(stop) = self.after_written(ctx, &mut staging) {
             return stop;
         }
-        Ok(Flow::Go((
-            Prepared {
+        Ok(Flow::Go(Written {
+            p: Prepared {
                 job,
                 mode,
                 item_id,
@@ -1396,16 +1462,12 @@ impl EditHandler {
                 warnings,
             },
             staging,
-        )))
+        }))
     }
 
     /// 段 0〜5 の流して書く道（M13 段 3。音声）：遅延の入力から計画の出力を窓ごとに描いて流して書く（save/stream.rs）。
     /// 一時停止で止めるときは作業用の PCM を残す印を立てる（再開は初めから。残っているものを使い回す）。
-    fn prepare_stream(
-        &self,
-        ctx: &JobContext,
-        d: Decided<'_>,
-    ) -> Result<Flow<(Prepared, Staging)>> {
+    fn prepare_stream(&self, ctx: &dyn UnitCx, d: Decided<'_>) -> Result<Flow<Written>> {
         let mut work: Option<crate::edit::work_pcm::WorkHandle> = None;
         let r = self.prepare_stream_in(ctx, d, &mut work);
         if matches!(r, Ok(Flow::Stop(JobEnd::Paused)))
@@ -1418,14 +1480,15 @@ impl EditHandler {
 
     fn prepare_stream_in(
         &self,
-        ctx: &JobContext,
+        ctx: &dyn UnitCx,
         d: Decided<'_>,
         work: &mut Option<crate::edit::work_pcm::WorkHandle>,
-    ) -> Result<Flow<(Prepared, Staging)>> {
+    ) -> Result<Flow<Written>> {
         let library = ctx.library();
         let layout = library.layout();
-        let job = ctx.id();
-        let mon = JobMonitor(ctx);
+        let job = ctx.job();
+        let tag = ctx.tag();
+        let mon = UnitMonitor(ctx);
         let (runtime, codecs) = (d.runtime.as_ref(), d.codecs.as_ref());
         let original_path = layout.content_path(&d.original.hash, &d.original.ext);
         let cx = stream::StreamCx {
@@ -1563,7 +1626,7 @@ impl EditHandler {
                 weight: promote_weight,
                 message: "元の読み取りを残しています",
             };
-            let a = match stream::promote(&cx, w, &input.decoded, job, &mut staging, pass)? {
+            let a = match stream::promote(&cx, w, &input.decoded, &tag, &mut staging, pass)? {
                 Flow::Go(a) => a,
                 Flow::Stop(end) => return Ok(Flow::Stop(end)),
             };
@@ -1576,7 +1639,7 @@ impl EditHandler {
         // 4. 描いて書く
         let out_part = layout
             .staging_dir()
-            .join(format!("edit-{job}-out.{}.part", d.ext0));
+            .join(format!("edit-{tag}-out.{}.part", d.ext0));
         staging.add(out_part.clone());
         let written = match stream::write_output(
             &cx,
@@ -1609,8 +1672,8 @@ impl EditHandler {
         if let Some(stop) = self.after_written(ctx, &mut staging) {
             return stop;
         }
-        Ok(Flow::Go((
-            Prepared {
+        Ok(Flow::Go(Written {
+            p: Prepared {
                 job,
                 mode: d.mode,
                 item_id: d.item_id,
@@ -1636,11 +1699,19 @@ impl EditHandler {
                 warnings,
             },
             staging,
-        )))
+        }))
     }
 
-    /// 段 6〜9：台帳の門を持って予告 → 配置 → コミットし、後始末をする。
-    fn commit(&self, ctx: &JobContext, p: Prepared, staging: Staging) -> Result<JobEnd> {
+    /// 段 6〜9：台帳の門を持って予告 → 配置 → コミット（トランザクション 2 の中で `record` が結果を書く）し、門と staging を
+    /// 片付ける。後のジョブは呼び手が積む（[`Committed::saved`]）。土台・持ち主の競合は `Conflict`（置いたファイルと予告は
+    /// 片付けてある）。
+    pub(crate) fn commit(
+        &self,
+        ctx: &dyn UnitCx,
+        written: Written,
+        record: Record,
+    ) -> Result<Committed> {
+        let Written { p, staging } = written;
         let library = ctx.library();
         let db = library.db();
         let layout = library.layout();
@@ -1670,13 +1741,13 @@ impl EditHandler {
                 let message =
                     format!("同じ中身のアイテム（{item_id}）があるので、新しく作りません");
                 ctx.log(&message);
-                return Ok(JobEnd::Done {
-                    result_json: json!({
+                return Ok(Committed {
+                    outcome: json!({
                         "outcome": "existing", "itemId": item_id, "role": role_name, "version": version,
                         "trashed": trashed,
-                    })
-                    .to_string(),
-                    message: Some(message),
+                    }),
+                    message,
+                    saved: None,
                 });
             }
             Tx1::Go(go) => go,
@@ -1705,12 +1776,15 @@ impl EditHandler {
                 let now = now_ms();
                 match &p.act {
                     Act::Edit { doc, names } => match names {
-                        None => commit_overwrite(tx, &p, doc, &go, now),
-                        Some(names) => commit_save_as(tx, &p, doc, names, &go, now),
+                        None => commit_overwrite(tx, &p, doc, &go, now, &record),
+                        Some(names) => commit_save_as(tx, &p, doc, names, &go, now, &record),
                     },
-                    Act::Revert(target) => {
-                        revert::commit_revert(tx, &revert::Out::rebuilt(&p, target, &go)?, now)
-                    }
+                    Act::Revert(target) => revert::commit_revert(
+                        tx,
+                        &revert::Out::rebuilt(&p, target, &go)?,
+                        now,
+                        &record,
+                    ),
                 }
             })
         };
@@ -1728,19 +1802,19 @@ impl EditHandler {
             staging.keep();
             return Err(crashed(Fault::AfterCommit));
         }
-        // 9. 後始末
+        // 9. 後始末（後のジョブは呼び手が積む）
         drop(gate);
         drop(staging);
-        self.queue_follow_ups(ctx, p.kind);
         let message = match (&p.act, go.unchanged) {
             (_, true) => "中身が同じなので、版だけ足しました".to_string(),
             (Act::Revert(t), false) => format!("版 {} に戻しました（作り直しました）", t.to),
             (Act::Edit { .. }, false) => "保存しました".to_string(),
         };
         ctx.log(&message);
-        Ok(JobEnd::Done {
-            result_json: outcome.to_string(),
-            message: Some(message),
+        Ok(Committed {
+            outcome,
+            message,
+            saved: Some(p.kind),
         })
     }
 }
@@ -2085,6 +2159,7 @@ fn commit_overwrite(
     doc: &Digest,
     go: &Go,
     now: i64,
+    record: &Record,
 ) -> Result<serde_json::Value> {
     let id = p.item_id;
     // (a) 土台
@@ -2164,16 +2239,10 @@ fn commit_overwrite(
             version,
         },
     )?;
-    // (j)(l) 予告を消し、結果を途中経過に
+    // (j)(l) 予告を消し、結果を呼び手の行に（保存のジョブは途中経過）
     ledger::clear_announced(tx, p.job)?;
     let outcome = saved_json(p, go, id, version, vid);
-    save_partial(
-        tx,
-        p.job,
-        &json!({ "v": 1, "committed": outcome }).to_string(),
-        1.0,
-        "保存しました",
-    )?;
+    record(tx, &outcome)?;
     Ok(outcome)
 }
 
@@ -2187,6 +2256,7 @@ fn commit_save_as(
     names: &(String, String),
     go: &Go,
     now: i64,
+    record: &Record,
 ) -> Result<serde_json::Value> {
     let a = p.item_id;
     let head =
@@ -2268,13 +2338,7 @@ fn commit_save_as(
     .execute(params![b, a, p.base.version, &p.base.hash[..], now])?;
     ledger::clear_announced(tx, p.job)?;
     let outcome = saved_json(p, go, b, 1, vid);
-    save_partial(
-        tx,
-        p.job,
-        &json!({ "v": 1, "committed": outcome }).to_string(),
-        1.0,
-        "保存しました",
-    )?;
+    record(tx, &outcome)?;
     Ok(outcome)
 }
 

@@ -659,7 +659,7 @@ impl GcHandler {
             *st = next;
             return Ok(Flow::Go(()));
         };
-        let verdict = match save::verify_version(&self.engine, ctx, &version)? {
+        let verdict = match save::verify_version(&self.engine, &save::JobUnit(ctx), &version)? {
             Flow::Go(verdict) => verdict,
             Flow::Stop(end) => return Ok(Flow::Stop(end)),
         };

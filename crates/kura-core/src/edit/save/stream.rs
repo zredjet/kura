@@ -88,7 +88,7 @@ pub(super) struct StreamInput {
 
 /// パスの重みで進み具合を数えるもの（段の間の文言と割合）。
 pub(super) struct Passes<'a> {
-    ctx: &'a JobContext,
+    ctx: &'a dyn UnitCx,
     total: f64,
     done: f64,
     /// 送るか（保存・版に戻すは真。GC の照合は偽：GC は自分の進捗を送る。M13 段 3 の検証の直し）。
@@ -384,7 +384,7 @@ pub(super) fn verify_bytes(shape: &Shape, tasks: u64, resident: u64) -> u64 {
 
 /// 流して読むのに使うもの（1 つのジョブの間は同じ）。
 pub(super) struct StreamCx<'a> {
-    pub ctx: &'a JobContext,
+    pub ctx: &'a dyn UnitCx,
     pub runtime: &'a EngineRuntime,
     pub codecs: &'a CodecSet,
     pub engine: &'a EngineServices,
@@ -394,7 +394,7 @@ pub(super) struct StreamCx<'a> {
     pub format: &'a str,
     pub opts: &'a DecodeOptions,
     pub limits: &'a Limits,
-    pub mon: &'a JobMonitor<'a>,
+    pub mon: &'a UnitMonitor<'a>,
 }
 
 impl StreamCx<'_> {
@@ -959,7 +959,7 @@ pub(super) fn promote(
     cx: &StreamCx<'_>,
     work: &WorkHandle,
     decoded: &DecodeStamp,
-    job: i64,
+    tag: &str,
     staging: &mut Staging,
     pass: Pass<'_, '_>,
 ) -> Result<Flow<AnchorUse>> {
@@ -967,7 +967,7 @@ pub(super) fn promote(
     let part = cx
         .layout
         .staging_dir()
-        .join(format!("edit-{job}-anchor.wav.part"));
+        .join(format!("edit-{tag}-anchor.wav.part"));
     staging.add(part.clone());
     reflink_copy::reflink_or_copy(&work.pcm().path, &part)?;
     File::open(&part)?.sync_all()?;

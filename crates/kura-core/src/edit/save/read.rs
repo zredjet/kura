@@ -17,14 +17,14 @@ use crate::edit::EngineRuntime;
 
 /// 読むのに使うもの（1 つのジョブの間は同じ）。
 pub(super) struct ReadCx<'a> {
-    pub(super) ctx: &'a JobContext,
+    pub(super) ctx: &'a dyn UnitCx,
     pub(super) runtime: &'a EngineRuntime,
     pub(super) codecs: &'a CodecSet,
     pub(super) layout: &'a Layout,
     /// 元のファイル。
     pub(super) original: &'a Path,
     pub(super) limits: &'a Limits,
-    pub(super) mon: &'a JobMonitor<'a>,
+    pub(super) mon: &'a UnitMonitor<'a>,
 }
 
 /// 元の読み方（1 回分）。
@@ -119,7 +119,7 @@ pub(super) enum Attempt<P> {
 
 /// 読みでつまずいたとき：止める指示による中止は止め方に、アンカーの誤り（中止を除く）は使えないことに、ほかは失敗に。
 fn trip<P>(
-    ctx: &JobContext,
+    ctx: &dyn UnitCx,
     what: &str,
     e: EngineError,
     from_anchor: bool,
@@ -137,7 +137,7 @@ fn trip<P>(
 /// OS のデコーダを通りうる読み（`platform`）なら、`f` の前に途中経過の `decoding` を真にしてコミットし、`f` が落ちずに終われば
 /// （失敗・止めるときも）偽に戻す。
 pub(super) fn while_decoding<T>(
-    ctx: &JobContext,
+    ctx: &dyn UnitCx,
     platform: bool,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
@@ -145,9 +145,9 @@ pub(super) fn while_decoding<T>(
 }
 
 /// [`while_decoding`] の印を、割合 `before` と読み終えたときの `after()` で画面へ送る（流して書く道は今の回の割合で。進捗を戻さない。
-/// M13 段 3 の検証の直し）。DB に書くのは印だけ（[`JobContext::mark`]）。
+/// M13 段 3 の検証の直し）。DB に書くのは印だけ（[`UnitCx::mark`]）。
 pub(super) fn while_decoding_at<T>(
-    ctx: &JobContext,
+    ctx: &dyn UnitCx,
     platform: bool,
     before: f64,
     after: impl FnOnce() -> f64,

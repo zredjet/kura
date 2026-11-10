@@ -148,19 +148,37 @@ fn media_record(record: &VersionRecord, v: &Version, ext: &str, same: bool) -> M
     }
 }
 
-impl EditHandler {
-    /// 版 `to` に戻す（ジョブの本体）。使い直せれば門を持って 1 つのトランザクションで、なければ作り直して段 6〜9 へ。
-    pub(super) fn revert(
+/// 版に戻すの使い直しの結果（[`Saver::revert_reuse`]）。
+pub(crate) enum Reverted {
+    /// 版 k のファイルを使い直して戻した（描いていない）。
+    Committed(Committed),
+    /// 版 k のファイルがないので、作り直す（[`Saver::prepare_rebuild`] → [`Saver::commit`]）。
+    Rebuild(Box<RebuildPlan>),
+}
+
+/// 作り直して戻す 1 件（[`Saver::revert_reuse`] が確かめたもの）。
+pub(crate) struct RebuildPlan {
+    item_id: i64,
+    base: Base,
+    kind: MediaKind,
+    target: Target,
+}
+
+impl Saver {
+    /// 版 `to` に戻す：土台と戻す先を確かめ、版 k の中身が台帳にあってファイルがあれば、門を持って 1 つのトランザクションで
+    /// 戻す（`record` が結果を書く）。なければ作り直しの計画を返す（作り直しは門を持たずに、ほかの 1 件と並べてよい）。
+    pub(crate) fn revert_reuse(
         &self,
-        ctx: &JobContext,
+        ctx: &dyn UnitCx,
         item_id: i64,
         base: Base,
         to: i64,
-    ) -> Result<JobEnd> {
+        record: &Record,
+    ) -> Result<Reverted> {
         let library = ctx.library();
         let db = library.db();
         let layout = library.layout();
-        let job = ctx.id();
+        let job = ctx.job();
         let head = db
             .read(|c| versions::head(c, item_id))?
             .ok_or_else(|| CoreError::NotFound(format!("アイテム {item_id}")))?;
@@ -186,43 +204,48 @@ impl EditHandler {
             let listed = db.read(|c| ledger::ext_of(c, &hash))?;
             if let Some(ext) = listed.filter(|ext| layout.content_path(&hash, ext).is_file()) {
                 let out = Out::reused(job, item_id, base, &target, ext)?;
-                let outcome = db.write(move |tx| commit_revert(tx, &out, now_ms()))?;
+                let record = record.clone();
+                let outcome = db.write(move |tx| commit_revert(tx, &out, now_ms(), &record))?;
                 drop(gate);
-                self.queue_follow_ups(ctx, head.kind);
                 let message = if outcome["outcome"] == "unchanged" {
                     format!("版 {to} は今と同じ中身なので、版だけ足しました")
                 } else {
                     format!("版 {to} に戻しました")
                 };
                 ctx.log(&message);
-                return Ok(JobEnd::Done {
-                    result_json: outcome.to_string(),
-                    message: Some(message),
-                });
+                return Ok(Reverted::Committed(Committed {
+                    outcome,
+                    message,
+                    saved: Some(head.kind),
+                }));
             }
         }
         ctx.log(&format!(
             "版 {to} のファイルがないので、版の文書と入力の記録から作り直します"
         ));
-        let (prepared, staging) =
-            match self.prepare_rebuild(ctx, item_id, base, head.kind, target)? {
-                Flow::Go(p) => p,
-                Flow::Stop(end) => return Ok(end),
-            };
-        self.commit(ctx, prepared, staging)
+        Ok(Reverted::Rebuild(Box::new(RebuildPlan {
+            item_id,
+            base,
+            kind: head.kind,
+            target,
+        })))
     }
 
     /// 作り直しの段 1〜5：版 k の文書と入力の記録から作り直し（[`rebuild`]）、staging に書く。
-    fn prepare_rebuild(
+    pub(crate) fn prepare_rebuild(
         &self,
-        ctx: &JobContext,
-        item_id: i64,
-        base: Base,
-        kind: MediaKind,
-        target: Target,
-    ) -> Result<Flow<(Prepared, Staging)>> {
+        ctx: &dyn UnitCx,
+        plan: RebuildPlan,
+    ) -> Result<Flow<Written>> {
+        let RebuildPlan {
+            item_id,
+            base,
+            kind,
+            target,
+        } = plan;
         let layout = ctx.library().layout();
-        let job = ctx.id();
+        let job = ctx.job();
+        let tag = ctx.tag();
         let rules = Rules {
             fallback_encoder: true,
             platform: true,
@@ -234,7 +257,7 @@ impl EditHandler {
         std::fs::create_dir_all(layout.staging_dir())?;
         let out_part = layout
             .staging_dir()
-            .join(format!("edit-{job}-out.{}.part", out_ext0(&target.version)));
+            .join(format!("edit-{tag}-out.{}.part", out_ext0(&target.version)));
         staging.add(out_part.clone());
         let mut r = match rebuild(&self.engine, ctx, item_id, kind, &target, rules, &out_part) {
             Ok(Flow::Go(r)) => r,
@@ -265,8 +288,8 @@ impl EditHandler {
         }
         drop(work);
         let ext_hint = v.ext.clone();
-        Ok(Flow::Go((
-            Prepared {
+        Ok(Flow::Go(Written {
+            p: Prepared {
                 job,
                 mode: Mode::Revert,
                 item_id,
@@ -289,7 +312,7 @@ impl EditHandler {
                 warnings,
             },
             staging,
-        )))
+        }))
     }
 }
 
@@ -380,7 +403,7 @@ struct Rebuilt {
 /// Mismatch）。
 fn rebuild(
     engine: &EngineServices,
-    ctx: &JobContext,
+    ctx: &dyn UnitCx,
     item_id: i64,
     kind: MediaKind,
     target: &Target,
@@ -441,7 +464,7 @@ fn rebuild(
         None => None,
     };
     let limits: Limits = runtime.bulk(|e| e.limits().clone());
-    let mon = JobMonitor(ctx);
+    let mon = UnitMonitor(ctx);
     let mut warnings: Vec<String> = Vec::new();
     // 書き手：記録のエンコーダ（版に戻すなら、なければ今の組の同じ形式のもの）
     let (out_format, enc_opts, recorded_encoder) = match &record.encoded {
@@ -648,7 +671,7 @@ fn rebuild(
 /// 流して作り直すのに使うもの（[`rebuild`] が決めたもの）。
 struct StreamRebuild<'a> {
     engine: &'a EngineServices,
-    ctx: &'a JobContext,
+    ctx: &'a dyn UnitCx,
     k: i64,
     want: Digest,
     rec: RecordedInput,
@@ -706,7 +729,7 @@ fn rebuild_stream_in(
         runtime,
         codecs,
     } = s;
-    let mon = JobMonitor(ctx);
+    let mon = UnitMonitor(ctx);
     let layout = ctx.library().layout();
     let cx = stream::StreamCx {
         ctx,
@@ -889,7 +912,7 @@ pub enum Verdict {
 /// バイト列を比べられない）。予算は一括の予算（`admit_bulk_with`）。止める指示（一時停止・中止）は `Flow::Stop`。
 pub(crate) fn verify_version(
     engine: &EngineServices,
-    ctx: &JobContext,
+    ctx: &dyn UnitCx,
     version: &Version,
 ) -> Result<Flow<Verdict>> {
     let db = ctx.library().db();
@@ -927,7 +950,7 @@ pub(crate) fn verify_version(
     }
     let part = layout
         .staging_dir()
-        .join(format!("gc-{}-verify-{}.part", ctx.id(), version.id));
+        .join(format!("gc-{}-verify-{}.part", ctx.job(), version.id));
     let mut staging = Staging::default();
     staging.add(part.clone());
     Ok(Flow::Go(
@@ -952,7 +975,12 @@ pub(crate) fn verify_version(
 
 /// トランザクション 2（版に戻す）：土台を確かめ直し、別のアイテムの今と同じ中身でないことを確かめ、アイテムを版 k の列に戻し
 /// （同じ中身なら日時だけ）、前の頭を手放し、戻した版と写した入力を書き、下書きを片付け、自分の予告を消して結果を書く。
-pub(super) fn commit_revert(tx: &Connection, o: &Out, now: i64) -> Result<serde_json::Value> {
+pub(super) fn commit_revert(
+    tx: &Connection,
+    o: &Out,
+    now: i64,
+    record_result: &Record,
+) -> Result<serde_json::Value> {
     let id = o.item_id;
     let head =
         versions::head(tx, id)?.ok_or_else(|| CoreError::NotFound(format!("アイテム {id}")))?;
@@ -1088,13 +1116,7 @@ pub(super) fn commit_revert(tx: &Connection, o: &Out, now: i64) -> Result<serde_
         "warnings": o.warnings,
         "revert": { "to": o.to, "reused": o.reused_file, "rebuilt": rebuilt },
     });
-    save_partial(
-        tx,
-        o.job,
-        &json!({ "v": 1, "committed": outcome }).to_string(),
-        1.0,
-        "保存しました",
-    )?;
+    record_result(tx, &outcome)?;
     Ok(outcome)
 }
 
