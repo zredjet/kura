@@ -1326,6 +1326,8 @@ fn compose_follows_the_rules_on_random_documents() {
         let len = below(&mut r, 4) as usize;
         let mut base = random_chain(&engine, &mut r, &input.shape(), len, false);
         random_output(&mut r, &mut base, audio, false);
+        // 出力の ID は 0 とは限らない（継いだ文書は頭の ID を継ぐ）
+        base.outputs[0].id = OutputId(below(&mut r, 3) as u16);
         let shape_after = |g: &Graph| {
             engine
                 .compile(g, &shapes(&input))
@@ -1338,6 +1340,7 @@ fn compose_follows_the_rules_on_random_documents() {
         let len = 1 + below(&mut r, 3) as usize;
         let mut r1 = random_chain(&engine, &mut r, &mid, len, false);
         random_output(&mut r, &mut r1, audio, true);
+        r1.outputs[0].id = OutputId(below(&mut r, 3) as u16);
         let g = compose(&base, &r1).unwrap();
         let at = format!("組 {case}");
         // (a) 構造・ID・種・next_id
@@ -1362,6 +1365,10 @@ fn compose_follows_the_rules_on_random_documents() {
             "{at}"
         );
         assert_eq!(g.outputs[0].expand, Expand::One, "{at}");
+        assert_eq!(
+            g.outputs[0].id, base.outputs[0].id,
+            "{at}：出力の ID は頭のもの"
+        );
         kept += usize::from(r1.outputs[0].format == FormatChoice::Keep);
         // (c) 値：量子化を外した base の値に、出力を継いだレシピを当てた値と同じ
         let mut plain_base = base.clone();
@@ -1387,6 +1394,7 @@ fn compose_follows_the_rules_on_random_documents() {
         let len = below(&mut r, 3) as usize;
         let mut r2 = random_chain(&engine, &mut r, &after, len, false);
         random_output(&mut r, &mut r2, audio, true);
+        r2.outputs[0].id = OutputId(below(&mut r, 3) as u16);
         let left = compose(&compose(&base, &r1).unwrap(), &r2).unwrap();
         let right = compose(&base, &compose(&r1, &r2).unwrap()).unwrap();
         assert_eq!(left, right, "{at}：結合則");

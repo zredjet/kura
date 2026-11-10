@@ -463,7 +463,8 @@ pub fn migrate_with(
 /// - レシピのノード ID は `base.next_id` だけずらす。種はそのまま（元のハッシュと合わせて乱数が決まるので、結果は継ぎ足しても変わらない）。
 /// - 出力：レシピの形式が `Keep`（元と同じ）なら `base` の出力 0 の形式・設定・量子化を継ぐ（エディタで頭を開いて同じ操作を
 ///   足したときと同じ文書になる）。`To` ならレシピの形式・設定・量子化（`base` の量子化は捨てる）。`Keep` に量子化を付けた
-///   レシピは断る。展開はレシピのもの。`base`・レシピとも出力はちょうど 1 つで `Expand::One`（保存できる文書）。
+///   レシピは断る。展開はレシピのもの。出力の ID は `base` のもの（レシピの出力の ID によらない）。`base`・レシピとも出力は
+///   ちょうど 1 つで `Expand::One`（保存できる文書）。
 /// - 継いだ文書の正規の JSON が `MAX_DOC_BYTES` を超えれば `Limit`（保存できず読めなくなる文書をつながない）。
 /// - 結合的：`compose(compose(a, r1), r2) == compose(a, compose(r1, r2))`（E49）。
 pub fn compose(base: &Graph, recipe: &Graph) -> Result<Graph, EngineError> {
@@ -531,8 +532,9 @@ pub fn compose(base: &Graph, recipe: &Graph) -> Result<Graph, EngineError> {
         FormatChoice::Keep => (head.format.clone(), head.quantize),
         FormatChoice::To { .. } => (tail.format.clone(), tail.quantize),
     };
+    // 出力の ID は頭のもの（エディタで頭を開いて同じ操作を足した文書と同じにする。レシピの出力の ID によらない）
     let outputs = vec![OutputSpec {
-        id: tail.id,
+        id: head.id,
         from: remap(tail.from)?,
         format,
         quantize,
