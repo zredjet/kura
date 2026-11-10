@@ -15,6 +15,8 @@ pub mod save;
 mod save_stream_tests;
 #[cfg(test)]
 mod save_tests;
+#[cfg(test)]
+mod save_unit_tests;
 pub mod services;
 pub mod store;
 #[cfg(test)]
