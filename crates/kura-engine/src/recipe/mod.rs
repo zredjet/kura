@@ -173,8 +173,9 @@ pub(crate) fn sort_bindings(bindings: &mut [Binding]) {
 }
 
 /// 名前と説明の確かめ（長さはバイトで数え、制御文字もバイトで見る。多バイト文字のバイトは 0x80 以上なので混ざらない）。
-/// 前後の空白の除き方と NFC への正規化は kura-core が行う（エンジンは Unicode の表を持たない）。
-pub(crate) fn check_text(name: &str, description: &str) -> Result<(), EngineError> {
+/// 前後の空白の除き方と NFC への正規化は kura-core が行う（エンジンは Unicode の表を持たない）。kura-core がレシピの名前・
+/// 説明だけを変えるときにも使う（M14 段 3）。
+pub fn check_text(name: &str, description: &str) -> Result<(), EngineError> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > MAX_NAME_BYTES {
         return Err(EngineError::Invalid(Issues::one(

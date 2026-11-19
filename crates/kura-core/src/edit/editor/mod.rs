@@ -1302,6 +1302,14 @@ fn editor_of(env: &EditorEnv<'_>, session: &str) -> Result<Arc<Editor>, EditorEr
     env.engine.editor_for(session).ok_or(EditorError::NoSession)
 }
 
+/// エディタの頭の文書（確定した手まで。レシピとして保存…・見本で編集の保存が使う。M14 段 3）。
+pub fn head_graph(env: &EditorEnv<'_>, session: &str) -> Result<kura_engine::Graph, EditorError> {
+    let editor = editor_of(env, session)?;
+    let guard = editor.lock_state();
+    let st = guard.as_ref().ok_or(EditorError::NoSession)?;
+    Ok(st.session.head().to_graph())
+}
+
 /// 手を当てて表示する（モジュールの説明）。`steps` が空なら表示だけ（[`view`]）。
 pub fn step(
     env: &EditorEnv<'_>,

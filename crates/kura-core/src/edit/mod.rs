@@ -9,6 +9,7 @@ pub mod editor;
 pub mod gc;
 #[cfg(test)]
 mod gc_tests;
+pub mod recipes;
 pub mod runtime;
 pub mod save;
 #[cfg(test)]

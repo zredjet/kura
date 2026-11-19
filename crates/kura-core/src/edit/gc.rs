@@ -189,7 +189,7 @@ pub enum Scope<'a> {
     Roots(&'a [i64]),
 }
 
-/// 根から辿れない文書の部品を消し、消した部品の数を返す（呼び手のトランザクションの中で）。根は版・下書きが指す部品と、
+/// 根から辿れない文書の部品を消し、消した部品の数を返す（呼び手のトランザクションの中で）。根は版・下書き・レシピ（M14）が指す部品と、
 /// `live`（終わっていない保存のジョブの入力の根のダイジェスト）。範囲 `scope` の部品のうち、どこからも参照されない
 /// （版・下書き・ほかの部品の辺のどれも指さない）ものを消し、その子へ進む。`edit_edges.child_id` は ON DELETE を持たないので、
 /// 親から順に消す（親を消すと親の辺は CASCADE で消え、子は残った辺がなくなったときに消える）。
@@ -215,7 +215,8 @@ pub fn sweep_parts(tx: &Connection, scope: Scope<'_>, live: &[Digest]) -> Result
     let mut referenced = tx.prepare_cached(
         "SELECT EXISTS (SELECT 1 FROM edit_edges WHERE child_id = ?1)
              OR EXISTS (SELECT 1 FROM item_versions WHERE doc_id = ?1)
-             OR EXISTS (SELECT 1 FROM edit_drafts WHERE doc_id = ?1)",
+             OR EXISTS (SELECT 1 FROM edit_drafts WHERE doc_id = ?1)
+             OR EXISTS (SELECT 1 FROM edit_recipes WHERE doc_id = ?1)",
     )?;
     let mut children = tx.prepare_cached("SELECT child_id FROM edit_edges WHERE parent_id = ?1")?;
     let mut delete = tx.prepare_cached("DELETE FROM edit_objects WHERE id = ?1")?;
@@ -1082,12 +1083,14 @@ mod tests {
             &conn,
             "SELECT EXISTS (SELECT 1 FROM edit_edges WHERE child_id = 1)
                  OR EXISTS (SELECT 1 FROM item_versions WHERE doc_id = 1)
-                 OR EXISTS (SELECT 1 FROM edit_drafts WHERE doc_id = 1)",
+                 OR EXISTS (SELECT 1 FROM edit_drafts WHERE doc_id = 1)
+                 OR EXISTS (SELECT 1 FROM edit_recipes WHERE doc_id = 1)",
         );
         for index in [
             "idx_edit_edges_child",
             "idx_item_versions_doc",
             "idx_edit_drafts_doc",
+            "idx_edit_recipes_doc",
         ] {
             assert!(plan.contains(index), "{index}: {plan}");
         }
@@ -1102,6 +1105,27 @@ mod tests {
             "SELECT o.id FROM edit_objects o WHERE NOT EXISTS (SELECT 1 FROM edit_edges e WHERE e.child_id = o.id)",
         );
         assert!(plan.contains("idx_edit_edges_child"), "{plan}");
+    }
+
+    /// レシピ（M14）の文書は部品の片付けの根：レシピが指している間は残り、レシピを消すと孤立して消える（切れ目を版と共有して
+    /// いれば、共有する部品は残る）。
+    #[test]
+    fn sweep_parts_keeps_recipe_documents() {
+        let conn = test_conn();
+        let recipe = split(&doc_with(70, "vertical")).unwrap();
+        let recipe_id = store::put_doc(&conn, &recipe, 1).unwrap();
+        conn.execute(
+            "INSERT INTO edit_recipes (name, kind, doc_id, pos, created_at, updated_at) VALUES ('r', 'each', ?1, 1, 1, 1)",
+            [recipe_id],
+        )
+        .unwrap();
+        assert_eq!(sweep_parts(&conn, Scope::All, &[]).unwrap(), 0);
+        assert!(store::load_doc_bytes(&conn, recipe_id).is_ok());
+        conn.execute("DELETE FROM edit_recipes", []).unwrap();
+        // 根・描画のノード・切れ目 2 つ（70 本 = 64 + 6）・反転のノード
+        assert_eq!(sweep_parts(&conn, Scope::All, &[]).unwrap(), 5);
+        assert_eq!(count(&conn, "SELECT count(*) FROM edit_objects"), 0);
+        assert!(crate::db::violations(&conn).unwrap().is_empty());
     }
 
     /// 部品の片付けで残す保存のジョブの根：終わっていないものと、`since` 以後に失敗・中止したもの（版に戻すは文書を持たない）。
