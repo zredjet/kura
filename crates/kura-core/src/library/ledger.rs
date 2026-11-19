@@ -5,8 +5,10 @@
 //! 行を消さないように）。
 //!
 //! 台帳にまだない中身を `files/` に置く処理（保存）と、台帳から外した中身を消す処理（段 3 の GC・ゴミ箱を空にする処理）は、
-//! 置く・消す前に `announce` で予告を DB にコミットする。'place' の予告は台帳に載せるトランザクションで消し（`clear_announced`）、
-//! 'delete' の予告は台帳から外すトランザクションの前にコミットし、ファイルを消し終えてから行の ID で消す（`clear_pending`）。
+//! 置く・消す前に `announce` で予告を DB にコミットする。'place' の予告は台帳に載せるトランザクションで、その 1 件が書いた行を
+//! ID で消し（`clear_pending`。M14 段 3。予告のあとでやめるときは、ジョブの予告のうち台帳にない中身をまとめて片付ける
+//! `clear_announced`）、'delete' の予告は台帳から外すトランザクションの前にコミットし、ファイルを消し終えてから行の ID で
+//! 消す（`clear_pending`）。
 //! 途中で落ちたら、次に開くときに `settle_pending` が予告を照らして、台帳にないファイルを片付ける（docs/data-model.md §4
 //! 「保存と版（M12）」）。
 
@@ -133,8 +135,8 @@ pub fn announce(
     Ok(conn.last_insert_rowid())
 }
 
-/// 予告の行を ID で消す（'delete' の予告を、ファイルを消し終えてから。同じジョブのほかの予告（消せずに残したもの）は
-/// 残す）。消した数を返す（主キーで引く）。
+/// 予告の行を ID で消す（'place' の予告は台帳に載せるトランザクションで、その 1 件が書いた行を。'delete' の予告はファイルを
+/// 消し終えてから。同じジョブのほかの予告（消せずに残したもの）は残す）。消した数を返す（主キーで引く）。
 pub fn clear_pending(conn: &Connection, ids: &[i64]) -> Result<usize> {
     let mut stmt = conn.prepare_cached("DELETE FROM ledger_pending WHERE id = ?1")?;
     let mut n = 0;
@@ -166,8 +168,8 @@ pub fn remove_files(layout: &Layout, released: &[ReleasedBlob]) -> u64 {
     failed
 }
 
-/// ジョブ `job_id` の予告を消す（'place' の予告は台帳に載せるのと同じトランザクションで、'delete' の予告はファイルを消し終えて
-/// から）。消した数を返す。予告の表は小さい（実行中の保存・GC の分だけ）ので索引を持たず、走査する（docs/data-model.md §4）。
+/// ジョブ `job_id` の予告をまとめて消す（保存を予告のあとでやめるときの片付け `undo_placement` が、台帳にない中身のファイルを
+/// 消し終えてから。コミットは自分の行だけを `clear_pending` で消す）。消した数を返す。予告の表は小さい（実行中の保存・GC の分だけ）ので索引を持たず、走査する（docs/data-model.md §4）。
 pub fn clear_announced(conn: &Connection, job_id: i64) -> Result<usize> {
     let mut stmt = conn.prepare_cached("DELETE FROM ledger_pending WHERE job_id = ?1")?;
     Ok(stmt.execute([job_id])?)

@@ -363,7 +363,7 @@ CREATE INDEX idx_play_events_item ON play_events(item_id, played_at DESC);
 CREATE TABLE jobs (                                -- 0008 で作り直した形
   id            INTEGER PRIMARY KEY,
   kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）、0011：edit（M12 の保存）・gc（M12 の段 3）、0012：batch（M14 の一括）
-                CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc')),
+                CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc','batch')),
   state         TEXT    NOT NULL
                 CONSTRAINT jobs_state CHECK (state IN ('queued','running','paused','done','failed','canceled')),
   priority      INTEGER NOT NULL DEFAULT 0,
@@ -1064,7 +1064,7 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 - **不変条件**（`edit::versions::check_invariants`。表を走査するので、テスト・crash-loop・整合性の確かめだけで呼び、起動の道では呼ばない）：
   1. 版の行は 0 個か 2 個以上で 0..n に欠けなく並ぶ。版 0 と頭は hold、ほかの版は hold でない。頭の output_hash・ext は items.hash・ext。
   2. released でない行の `file_blob_id` が指す台帳の行の hash は output_hash と同じ。
-  3. 版 0 でない版の `base_version` は `version - 1`。文書を持つ版・下書きの文書は根（`kind = 'doc'`）の部品で、部品をつなぎ直せる
+  3. 版 0 でない版の `base_version` は `version - 1`。文書を持つ版・下書き・レシピ（M14）の文書は根（`kind = 'doc'`）の部品で、部品をつなぎ直せる
      （`load_doc_bytes`。本文からダイジェストを求め直す）。
   4. edit の版は入力 0（primary）の行を持つ。revert の版は戻した先の版がそのアイテムにあり、文書・値のダイジェスト・入力の数が同じ。
   5. 入力の `anchor_id` はアンカーの行を指し、アンカーは台帳の行を持ち、元（`source_hash`）が入力の元と同じ。どの入力からも参照されない
