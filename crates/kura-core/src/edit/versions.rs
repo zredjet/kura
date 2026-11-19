@@ -639,7 +639,7 @@ fn check_inputs_and_anchors(conn: &Connection, out: &mut Vec<String>) -> Result<
     )
 }
 
-/// 版・下書きの文書：根（doc）の部品を指し、部品をつなぎ直せる（本文からダイジェストを求め直して照らす）。
+/// 版・下書き・レシピ（M14）の文書：根（doc）の部品を指し、部品をつなぎ直せる（本文からダイジェストを求め直して照らす）。
 fn check_docs(conn: &Connection, out: &mut Vec<String>) -> Result<()> {
     report_pairs(
         conn,
@@ -655,11 +655,20 @@ fn check_docs(conn: &Connection, out: &mut Vec<String>) -> Result<()> {
         out,
         |item, _| format!("アイテム {item}：下書きの文書が根の部品ではありません"),
     )?;
+    report_pairs(
+        conn,
+        "SELECT r.id, r.doc_id FROM edit_recipes r LEFT JOIN edit_objects o ON o.id = r.doc_id
+          WHERE o.id IS NULL OR o.kind <> 'doc'",
+        out,
+        |recipe, _| format!("レシピ {recipe} の文書が根の部品ではありません"),
+    )?;
     let docs: Vec<i64> = {
         let mut stmt = conn.prepare_cached(
             "SELECT v.doc_id FROM item_versions v JOIN edit_objects o ON o.id = v.doc_id AND o.kind = 'doc'
              UNION
-             SELECT d.doc_id FROM edit_drafts d JOIN edit_objects o ON o.id = d.doc_id AND o.kind = 'doc'",
+             SELECT d.doc_id FROM edit_drafts d JOIN edit_objects o ON o.id = d.doc_id AND o.kind = 'doc'
+             UNION
+             SELECT r.doc_id FROM edit_recipes r JOIN edit_objects o ON o.id = r.doc_id AND o.kind = 'doc'",
         )?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<std::result::Result<_, _>>()?
@@ -1067,6 +1076,29 @@ mod tests {
         draft(&conn, a, node);
         found_one(&conn, "下書きの文書が根の部品ではありません");
         draft(&conn, a, root);
+        conn.execute("DELETE FROM edit_edges WHERE parent_id = ?1", [root])
+            .unwrap();
+        found_one(&conn, "つなぎ直せません");
+
+        // レシピ（M14）：根でない部品・つなぎ直せない文書
+        let (conn, _) = setup();
+        let root = store::put_doc(&conn, &kura_engine::doc_parts::split(&g).unwrap(), 1).unwrap();
+        conn.execute(
+            "INSERT INTO edit_recipes (id, name, kind, doc_id, pos, created_at, updated_at) VALUES (1, 'r', 'each', ?1, 1, 1, 1)",
+            [root],
+        )
+        .unwrap();
+        assert!(check_invariants(&conn).unwrap().is_empty());
+        let node: i64 = conn
+            .query_row("SELECT id FROM edit_objects WHERE kind = 'node'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute("UPDATE edit_recipes SET doc_id = ?1", [node])
+            .unwrap();
+        found_one(&conn, "レシピ 1 の文書が根の部品ではありません");
+        conn.execute("UPDATE edit_recipes SET doc_id = ?1", [root])
+            .unwrap();
         conn.execute("DELETE FROM edit_edges WHERE parent_id = ?1", [root])
             .unwrap();
         found_one(&conn, "つなぎ直せません");

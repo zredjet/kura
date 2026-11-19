@@ -1107,8 +1107,8 @@ mod tests {
         assert!(plan.contains("idx_edit_edges_child"), "{plan}");
     }
 
-    /// レシピ（M14）の文書は部品の片付けの根：レシピが指している間は残り、レシピを消すと孤立して消える（切れ目を版と共有して
-    /// いれば、共有する部品は残る）。
+    /// レシピ（M14）の文書は部品の片付けの根：レシピが指している間は残り、レシピを消すと孤立して消える（版・下書きと共有する
+    /// 部品の扱いは、どの根でも同じ辺の数え方で、`sweep_parts_keeps_reachable_parts_and_removes_orphans` が見る）。
     #[test]
     fn sweep_parts_keeps_recipe_documents() {
         let conn = test_conn();
