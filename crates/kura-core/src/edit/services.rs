@@ -245,6 +245,15 @@ impl EngineServices {
             .cloned()
     }
 
+    /// エディタの置き場の錠を持ったまま、開いている（開く途中を含む）アイテムを渡して `f` を呼ぶ（一括を積むとき：開いている
+    /// アイテムを読んでから行を入れ終えるまで、エディタを置かせない。エディタは置いたあとに、待っている保存・一括を確かめ直す。
+    /// M14 段 4 の検証の直し）。
+    pub(crate) fn with_open_item<T>(&self, f: impl FnOnce(Option<i64>) -> T) -> T {
+        let slot = self.editor_slot();
+        let open = slot.as_ref().map(|e| e.item_id());
+        f(open)
+    }
+
     /// エディタを置く（前のエディタがあれば閉じる。開く途中から置き、閉じる・ほかを開くと読みを止められるようにする）。
     pub(crate) fn install_editor(&self, editor: Arc<Editor>) {
         let old = self.editor_slot().replace(editor);

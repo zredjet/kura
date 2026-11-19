@@ -996,6 +996,7 @@ impl JobHandler for EditHandler {
 /// 入力の読み方で、段の順（decoder None。エディタ・試聴と同じ鍵）と、アンカーがあればその記録のデコーダのもの（アンカーが
 /// 使えずに読み直したとき）。版に戻すは版の入力の記録（形式・読み方・記録のデコーダ）のもの。
 fn paused_work_keys(conn: &Connection, input: &JobInput) -> Result<Vec<WorkKey>> {
+    // 版に戻すのほか（上書き・別名）は下の work_keys_of
     let Some(original) = versions::original(conn, input.item_id)? else {
         return Ok(Vec::new());
     };
@@ -1015,25 +1016,7 @@ fn paused_work_keys(conn: &Connection, input: &JobInput) -> Result<Vec<WorkKey>>
                 .first()
                 .map(|slot| slot.decode.clone())
                 .unwrap_or_default();
-            let any = WorkKey {
-                source: original.hash,
-                format: format.to_string(),
-                options,
-                decoder: None,
-            };
-            let found = anchors::find(
-                conn,
-                &original.hash,
-                &anchors::options_digest(&any.options)?,
-            )?;
-            let mut keys = vec![any.clone()];
-            if let Some(a) = found {
-                keys.push(WorkKey {
-                    decoder: Some(a.decoded.codec),
-                    ..any
-                });
-            }
-            Ok(keys)
+            work_keys_of(conn, &original.hash, format, options)
         }
         ActionInput::Revert { to } => {
             let Some(v) = versions::get(conn, input.item_id, *to)? else {
@@ -1051,6 +1034,46 @@ fn paused_work_keys(conn: &Connection, input: &JobInput) -> Result<Vec<WorkKey>>
                 .collect())
         }
     }
+}
+
+/// アイテム `item_id` の元を読み方 `options` で読む保存が、一時停止で残しうる作業用の PCM の鍵（一括の 1 件の後始末。M14 段 4）：
+/// 段の順（decoder None）と、アンカーがあればその記録のデコーダのもの。元の形式を知らなければ空。
+pub(crate) fn work_keys(
+    conn: &Connection,
+    item_id: i64,
+    options: DecodeOptions,
+) -> Result<Vec<WorkKey>> {
+    let Some(original) = versions::original(conn, item_id)? else {
+        return Ok(Vec::new());
+    };
+    let Some(format) = format_id(&original.ext) else {
+        return Ok(Vec::new());
+    };
+    work_keys_of(conn, &original.hash, format, options)
+}
+
+/// 元 `source`（形式 `format`）を `options` で読む作業用の PCM の鍵：段の順と、アンカーがあればその記録のデコーダのもの。
+fn work_keys_of(
+    conn: &Connection,
+    source: &[u8; 32],
+    format: &str,
+    options: DecodeOptions,
+) -> Result<Vec<WorkKey>> {
+    let any = WorkKey {
+        source: *source,
+        format: format.to_string(),
+        options,
+        decoder: None,
+    };
+    let found = anchors::find(conn, source, &anchors::options_digest(&any.options)?)?;
+    let mut keys = vec![any.clone()];
+    if let Some(a) = found {
+        keys.push(WorkKey {
+            decoder: Some(a.decoded.codec),
+            ..any
+        });
+    }
+    Ok(keys)
 }
 
 impl EditHandler {
@@ -1337,10 +1360,10 @@ impl Saver {
             Some(FormatChoice::Keep) | None => (source_format.to_string(), json!({})),
         };
         let desc = format_by_id(&out_format).ok_or_else(|| {
-            CoreError::Unsupported(format!("出力の形式 {out_format} を知りません"))
+            CoreError::Unwritable(format!("出力の形式 {out_format} を知りません"))
         })?;
         if MediaKind::from(desc.item_kind) != head.kind {
-            return Err(CoreError::Invalid(format!(
+            return Err(CoreError::Unfit(format!(
                 "保存でアイテムの種類は変えられません（{} → {out_format}）",
                 head.kind.as_str()
             )));
@@ -1396,14 +1419,14 @@ impl Saver {
             let shapes = BTreeMap::from([(InputId(0), *shape)]);
             let plan = runtime
                 .bulk(|e| e.compile(graph, &shapes))
-                .map_err(|issues| CoreError::Invalid(format!("文書を描けません：{issues}")))?;
+                .map_err(|issues| CoreError::Unfit(format!("文書を描けません：{issues}")))?;
             let out_shape = plan
                 .output_shapes()
                 .first()
                 .map(|(_, s)| *s)
                 .ok_or_else(|| CoreError::Invalid("文書に出力がありません".into()))?;
             if codecs.encoder(&out_format, &out_shape).is_none() {
-                return Err(CoreError::Unsupported(format!(
+                return Err(CoreError::Unwritable(format!(
                     "この結果は {out_format} に書けません（保存する形式を選び直してください。音声の既定は Ogg Vorbis）"
                 )));
             }
@@ -1550,7 +1573,6 @@ impl Saver {
         let media = media_of(&out.value.shape());
         let value_digest = out.digest;
         drop(out);
-        drop(lease);
         let out_hash = *blake3::hash(&bytes).as_bytes();
         let out_size = bytes.len() as u64;
         let ext0 = desc.exts.first().copied().unwrap_or("bin");
@@ -1559,7 +1581,10 @@ impl Saver {
             .join(format!("edit-{tag}-out.{ext0}.part"));
         staging.add(out_part.clone());
         write_synced(ctx, &out_part, &bytes)?;
+        // 書き出したバイト列は見積もりが数えている（書いて手放すまで予算を返さない。一括の k 本が並べて書くときに予算を超えて
+        // 持たない。M14 段 4 の検証の直し）
         drop(bytes);
+        drop(lease);
         if let Some(stop) = self.after_written(ctx, &mut staging) {
             return stop;
         }
@@ -1694,14 +1719,14 @@ impl Saver {
         let shapes = BTreeMap::from([(InputId(0), shape)]);
         let plan = runtime
             .bulk(|e| e.compile(d.graph, &shapes))
-            .map_err(|issues| CoreError::Invalid(format!("文書を描けません：{issues}")))?;
+            .map_err(|issues| CoreError::Unfit(format!("文書を描けません：{issues}")))?;
         let out_shape = plan
             .output_shapes()
             .first()
             .map(|(_, s)| *s)
             .ok_or_else(|| CoreError::Invalid("文書に出力がありません".into()))?;
         if !codecs.encode_streams(&d.out_format, &out_shape) {
-            return Err(CoreError::Unsupported(format!(
+            return Err(CoreError::Unwritable(format!(
                 "この結果は {} に書けません（保存する形式を選び直してください。既定は Ogg Vorbis）",
                 d.out_format
             )));
@@ -1868,8 +1893,11 @@ impl Saver {
                 drop(gate);
                 drop(staging);
                 let (role_name, version) = role_json(role);
-                let message =
-                    format!("同じ中身のアイテム（{item_id}）があるので、新しく作りません");
+                let message = if p.mode == Mode::Overwrite {
+                    format!("同じ中身のアイテム（{item_id}）があるので、版を足しません")
+                } else {
+                    format!("同じ中身のアイテム（{item_id}）があるので、新しく作りません")
+                };
                 ctx.log(&message);
                 return Ok(Committed {
                     outcome: json!({
@@ -2044,6 +2072,20 @@ fn announce(tx: &Connection, p: &Prepared, now: i64) -> Result<Tx1> {
         ));
     }
     let owner = find_owner(tx, &p.out_hash)?;
+    // 一括の上書きで、出力が別のアイテムの今と同じ中身：土台の競合ではないので、やり直さずに「同じ中身のアイテムがある」に
+    // する（版を足さない。docs/editing.md §14.2 段 4。エディタの上書きは Conflict のまま。M14 段 4 の検証の直し）
+    if p.batch.is_some()
+        && p.mode == Mode::Overwrite
+        && let Some(o) = owner.as_ref()
+        && o.role == OwnerRole::Current
+        && o.id != p.item_id
+    {
+        return Ok(Tx1::Existing {
+            item_id: o.id,
+            role: o.role,
+            trashed: o.trashed,
+        });
+    }
     let unchanged = match decide(owner.as_ref(), p.item_id, p.mode) {
         Decision::Conflict(why) => return Ok(Tx1::Conflict(why)),
         Decision::Existing {

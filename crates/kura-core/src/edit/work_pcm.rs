@@ -137,6 +137,21 @@ struct Inner {
     retain_for: Mutex<Duration>,
     /// 書きかけの名前の通し番号・手放した順の番号。
     seq: AtomicU64,
+    /// 書いている途中の作業用の PCM の分（空きの確かめで、並べて書くほかの分を引く。一括の k 本が同時に書く。M14 段 4 の
+    /// 検証の直し）。
+    writing: AtomicU64,
+}
+
+/// 書いている途中の分（落とすと戻す）。
+struct Writing<'a> {
+    count: &'a AtomicU64,
+    bytes: u64,
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
 }
 
 impl Inner {
@@ -312,6 +327,7 @@ impl WorkPcmStore {
                 entries: Mutex::new(BTreeMap::new()),
                 retain_for: Mutex::new(RETAIN_FOR),
                 seq: AtomicU64::new(0),
+                writing: AtomicU64::new(0),
             }),
         }
     }
@@ -368,29 +384,35 @@ impl WorkPcmStore {
         Some(self.handle(&name, e))
     }
 
-    /// ディスクの空きを確かめる（形の上限 `bound` の音声を書く前）。
-    fn check_space(&self, bound: &Shape) -> Result<()> {
+    /// ディスクの空きを確かめ、書き終えるまでその分を取っておく（形の上限 `bound` の音声を書く前）。要る空きは、この 1 本と、
+    /// 書いている途中のほかの分と、余裕（ほかの分がすでに書いた所も数えるので、多めに見る）。
+    fn check_space(&self, bound: &Shape) -> Result<Writing<'_>> {
         let Shape::Audio {
             channels, frames, ..
         } = bound
         else {
             return Err(CoreError::Invalid("音声の形ではありません".into()));
         };
-        let needed = HEADER
+        let bytes = HEADER
             .saturating_add(
                 frames
                     .max()
                     .saturating_mul(u64::from(*channels))
                     .saturating_mul(4),
             )
-            .saturating_add(META)
-            .saturating_add(SPARE);
+            .saturating_add(META);
+        let others = self.inner.writing.fetch_add(bytes, Ordering::AcqRel);
+        let writing = Writing {
+            count: &self.inner.writing,
+            bytes,
+        };
+        let needed = others.saturating_add(bytes).saturating_add(SPARE);
         if let Some(available) = self.inner.free()
             && available < needed
         {
             return Err(CoreError::NoSpace { needed, available });
         }
-        Ok(())
+        Ok(writing)
     }
 
     /// 鍵 `key` の作業用の PCM を返す。なければ、`decode`（受け手に流して読む。`CodecSet::decode_stream_path` など）で
@@ -407,7 +429,7 @@ impl WorkPcmStore {
         if let Some(h) = self.find(key) {
             return Ok(h);
         }
-        self.check_space(bound)?;
+        let _writing = self.check_space(bound)?;
         let name = key.file_name()?;
         std::fs::create_dir_all(&self.inner.dir)?;
         let seq = self.inner.seq.fetch_add(1, Ordering::Relaxed);

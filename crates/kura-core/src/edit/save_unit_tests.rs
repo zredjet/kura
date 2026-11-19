@@ -297,7 +297,8 @@ fn revert_reuses_or_rebuilds_through_the_unit() {
 }
 
 /// 書きかけの名前は、アンカーを作る道（偽の HEIC の最初の保存）でも、音声を流して書いて作業用のファイルをアンカーに昇格する
-/// 道（偽の Opus）でも、場の印（ジョブの ID と違うもの）で付く。OS のデコーダを通るので、読む前後の印を置く。
+/// 道（偽の Opus）でも、場の印（ジョブの ID と違うもの）で付く。OS のデコーダを通るので、読む前後の印を置く（値の道は、形を
+/// 読む間と値を読む間の 2 回。間の予算の確保を待つ間は外す。M14 段 4 の検証の直し）。
 #[test]
 fn the_staging_tag_names_every_part() {
     let decoding = || {
@@ -306,6 +307,7 @@ fn the_staging_tag_names_every_part() {
             json!({ "v": 1, "decoding": false }),
         ]
     };
+    let twice = || [decoding(), decoding()].concat();
     let parts = |lib: &Library| {
         names(&staged(lib))
             .into_iter()
@@ -323,7 +325,7 @@ fn the_staging_tag_names_every_part() {
         parts(&env.lib),
         ["edit-9006-h-anchor.png.part", "edit-9006-h-out.png.part"]
     );
-    assert_eq!(*unit.marks.lock().unwrap(), decoding());
+    assert_eq!(*unit.marks.lock().unwrap(), twice());
     let done = saver
         .commit(&unit, written, record_to("test.heic"))
         .unwrap();

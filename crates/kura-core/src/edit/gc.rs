@@ -242,15 +242,15 @@ pub fn sweep_parts(tx: &Connection, scope: Scope<'_>, live: &[Digest]) -> Result
     Ok(removed)
 }
 
-/// 部品の印を消す問い合わせ：終わっていない保存のジョブも、`?2`（7 日前）から後に失敗・中止した保存のジョブもないときだけ
-/// （どちらも根として残すので、その部品があとで孤立しうる。7 日たつと根から外れるので、印が残っていれば GC が積まれて
-/// 片付ける）。どちらも `idx_jobs_queue`（状態）で引く。
+/// 部品の印を消す問い合わせ：終わっていない保存・一括のジョブも、`?2`（7 日前）から後に失敗・中止した保存・一括のジョブも
+/// ないときだけ（どちらも根として残すので、その部品があとで孤立しうる。7 日たつと根から外れるので、印が残っていれば GC が
+/// 積まれて片付ける。一括の根は M14 段 4 の検証の直し）。どちらも `idx_jobs_queue`（状態）で引く。
 const CLEAR_PARTS_MARK: &str = "DELETE FROM settings WHERE key = ?1
-    AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit')
-    AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('failed', 'canceled') AND kind = 'edit' AND finished_at >= ?2)";
+    AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind IN ('edit', 'batch'))
+    AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('failed', 'canceled') AND kind IN ('edit', 'batch') AND finished_at >= ?2)";
 
-/// GC の部品の片付け（トランザクションの中で）：すべての範囲を片付け（保存のジョブの根は、終わっていないものと `now` の 7 日
-/// 前から後に失敗・中止したもの）、そのどちらの保存のジョブもなければ印を消す（[`CLEAR_PARTS_MARK`]）。
+/// GC の部品の片付け（トランザクションの中で）：すべての範囲を片付け（保存・一括のジョブの根は、終わっていないものと `now` の
+/// 7 日前から後に失敗・中止したもの）、そのどちらのジョブもなければ印を消す（[`CLEAR_PARTS_MARK`]）。
 fn sweep_all_parts(tx: &Connection, now: i64) -> Result<u64> {
     let since = now.saturating_sub(GRACE_MS);
     let live = save::gc_roots(tx, since)?;

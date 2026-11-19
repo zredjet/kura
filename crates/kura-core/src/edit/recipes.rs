@@ -160,6 +160,26 @@ fn row(conn: &Connection, id: i64) -> Result<Row> {
     })
 }
 
+/// レシピ `id` が、読んだとき（`stored`・文書の根 `doc`）から変わっていないか（一括を積むトランザクションの中で照らす。読んで
+/// から積むまでに差し替え・消す・名前を変えると偽か NotFound）。
+pub(crate) fn unchanged(
+    conn: &Connection,
+    id: i64,
+    stored: &StoredRecipe,
+    doc: &kura_engine::Digest,
+) -> Result<bool> {
+    let now = row(conn, id)?;
+    if now.kind != stored.recipe.kind || now.name != stored.recipe.name {
+        return Ok(false);
+    }
+    if doc_root(conn, id)? != *doc {
+        return Ok(false);
+    }
+    let bindings = bindings_from_json(now.bindings.as_bytes())
+        .map_err(|e| from_engine("レシピの結び付けを読めません", e))?;
+    Ok(bindings == stored.recipe.bindings)
+}
+
 /// レシピの文書の根のダイジェスト（一括のジョブの入力に写す）。
 pub fn doc_root(conn: &Connection, id: i64) -> Result<kura_engine::Digest> {
     let digest: Vec<u8> = conn

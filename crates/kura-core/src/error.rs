@@ -18,6 +18,14 @@ pub enum CoreError {
     /// この形式・組み合わせは扱えない（書けない出力の形式など。M12 の保存）。
     #[error("扱えません: {0}")]
     Unsupported(String),
+    /// 保存の出力をこの形式に書けない（書き手がない・知らない形式。code は `Unsupported` と同じ。一括は上書きなら
+    /// FormatUnavailable で飛ばし、別名なら代わりの形式で書く。元を読めないときの `Unsupported` と分ける。M14 段 4）。
+    #[error("扱えません: {0}")]
+    Unwritable(String),
+    /// 文書がこの入力に合わない（推論できず描けない・アイテムの種類を変える出力の形式。code は `Invalid` と同じ。一括は
+    /// このアイテムに当てられない手として NotApplicable で飛ばす。元を読めない・壊れているときの `Invalid` と分ける。M14 段 4）。
+    #[error("入力が正しくありません: {0}")]
+    Unfit(String),
     /// 記録と食い違う（途中の版を作り直した値が版の記録と合わない・アンカーが壊れているなど。M12 の保存）。
     #[error("記録と食い違います: {0}")]
     Mismatch(String),
@@ -190,9 +198,9 @@ impl CoreError {
         match self {
             Self::NotFound(_) => "NotFound",
             Self::Conflict(_) => "Conflict",
-            Self::Invalid(_) => "Invalid",
+            Self::Invalid(_) | Self::Unfit(_) => "Invalid",
             Self::TooLarge(_) => "TooLarge",
-            Self::Unsupported(_) => "Unsupported",
+            Self::Unsupported(_) | Self::Unwritable(_) => "Unsupported",
             Self::Mismatch(_) => "Mismatch",
             Self::Busy(_) => "Busy",
             Self::NoSpace { .. } => "NoSpace",

@@ -69,10 +69,10 @@ impl From<CoreError> for AppError {
         let code = match &err {
             CoreError::NotFound(_) => AppErrorCode::NotFound,
             CoreError::Conflict(_) => AppErrorCode::Conflict,
-            CoreError::Invalid(_) => AppErrorCode::Invalid,
+            CoreError::Invalid(_) | CoreError::Unfit(_) => AppErrorCode::Invalid,
             // 保存（M12）：大きすぎるものは TooLarge、書けない形式などは入力の誤り、記録との食い違いは競合として返す
             CoreError::TooLarge(_) => AppErrorCode::TooLarge,
-            CoreError::Unsupported(_) => AppErrorCode::Invalid,
+            CoreError::Unsupported(_) | CoreError::Unwritable(_) => AppErrorCode::Invalid,
             CoreError::Mismatch(_) => AppErrorCode::Conflict,
             CoreError::Busy(_) => AppErrorCode::Busy,
             // 作業用の PCM（M13 段 2）を書く前の空きの見積もりが足りない

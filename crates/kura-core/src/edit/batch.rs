@@ -7,44 +7,57 @@
 //!    保存していない下書きがある（`includeDrafts` が偽のとき）、画像・音声でない。前回 OS のデコーダで読んでいる途中で落ちた行
 //!    （`decoding = 1`）は、同じファイルで落ち続けないよう `failed`（`Crashed`）にする。
 //! 2. 継ぎ足し：頭の文書（版がなければ空の文書）にレシピをつなぎ、素材の設定（格子・ピボット・試聴のループ・コマの時間）と秒で
-//!    結び付ける（`Engine::instantiate`。結び付けがあるときだけ元の見出しから形を読む）。値がない・当てられない手は `skipped`。
-//!    土台は処理するときの頭（ADR-190 (9)）。
+//!    結び付ける（`Engine::instantiate`。一括のプールで。結び付けがあるときだけ、保存と同じ読み方で入力の形を読む。MP3・AAC の
+//!    終わりからの秒は流して数えた長さで）。値がない・当てられない手は `skipped`。土台は処理するときの頭（ADR-190 (9)）。
 //! 3. 準備（k 本の働き手。k は一括のプールのスレッドの数）：`Saver::prepare_graph`（文書は DB に置かず、部品はトランザクション 2 で
 //!    置く）。1 件の場 [`BatchUnit`]：止める指示はジョブの、読む前の印は行の `decoding`、版の持ち主は空（`batch_items.version_id`
-//!    で引く。ADR-192 (1)）、書きかけの印は `{ジョブ}-{順}`、ファイルの同期は fsync（`Durability::sync_file`）。上書きで書けない形式
-//!    （SVG・aseprite・ffmpeg のない MP3 など）は `skipped`、別名では代わりの形式（画像は PNG、音声は Ogg Vorbis か WAV）で書く。
+//!    で引く。ADR-192 (1)）、書きかけの印は `{ジョブ}-{順}`、ファイルの同期は fsync（`Durability::sync_file`）。書き手のない形式
+//!    （SVG・aseprite・ffmpeg のない MP3 など）は上書きなら `skipped`、別名では代わりの形式（画像は PNG、音声は Ogg Vorbis か WAV）
+//!    で書く（元を読めないときは替えずに `failed`）。準備の途中の土台の競合は 1 回だけ読み直してやり直す。
 //! 4. コミット（ジョブのスレッドで直列、まとまりごと）：書き終えた [`GROUP_ITEMS`] 件か [`GROUP_TIME`] がたまったら、区切りの同期
 //!    （`Durability::barrier`。macOS では F_FULLFSYNC）を 1 回取ってから、1 件ずつ `Saver::commit` する。記録（`Record`）が同じ
 //!    トランザクションで行を `saved`・`unchanged` にし、版・別名で作ったアイテム・土台・時刻を書く（版と行が同じトランザクション
-//!    なので、落ちても二重にも抜けにもならない）。同じ中身のアイテムがあれば `existing`。土台の競合は 1 回だけ頭を読み直して
+//!    なので、落ちても二重にも抜けにもならない）。同じ中身のアイテムがあれば `existing`（上書きで別のアイテムの今と同じも）。
+//!    土台の競合は 1 回だけ頭を読み直して
 //!    やり直し、だめなら `skipped`（Conflict）。ほかの誤りは `failed`。まとまりごとに、後のジョブ（サムネイル・解析・プロキシ）を積む。
 //!
 //! 止め方：一時停止・譲るは新しく渡さず、書き終えた分をコミットしてから止まる（準備中のものは落とし、行は pending のまま）。中止は
-//! 書き終えた分も落とし、残りの pending の行を `canceled` にする（済んだ分は残す）。強制終了は、開く順の staging の掃除と予告の
+//! 見たときにすぐ残りの pending の行を `canceled` にし、書き終えた分も落とす（済んだ分は残す。開き直して canceled の行があれば
+//! 中止で終える）。指示は回ごとに読み直し、中止＞一時停止＞譲る（ADR-194）。強制終了は、開く順の staging の掃除と予告の
 //! 照合のあと、pending の行から続ける。区切りの同期をまとまりのコミットの前に取るので、電源断で DB の最後のコミットを失っても
 //! 「DB にないファイル」が残るだけで、DB が永続になっていない中身を指すことはない（失った行は pending に戻ってやり直す）。
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
+use std::io::BufReader;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use kura_engine::doc::{FormatChoice, Graph, InputId};
+use kura_engine::audio::stream::StreamEnd;
+use kura_engine::budget::Class;
+use kura_engine::codec::stream::{DecodeInfo, DecodeSink};
+use kura_engine::codec::{Tier, anchor};
+use kura_engine::doc::{DecodeOptions, FormatChoice, Graph, InputId};
 use kura_engine::ops::audio::set_loop::FrameRange;
 use kura_engine::ops::util::GridParam;
 use kura_engine::recipe::{BindError, Binding, Facts, PivotFact, Recipe, RecipeKind, bound_json};
-use kura_engine::{Digest, Shape};
+use kura_engine::{Digest, Dim, EngineError, Monitor, Shape};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::save::{
     Base, Committed, Flow, GraphExtra, Mode, Record, Saver, UnitCx, UnitMonitor, Written,
-    pending_edit_job,
+    pending_edit_job, work_keys,
 };
 use super::services::Durability;
-use super::{EngineServices, drafts, from_engine, gc, recipes, store, versions};
+use super::work_pcm::WorkKey;
+use super::{
+    EngineRuntime, EngineServices, anchors, drafts, from_engine, gc, recipes, store, versions,
+};
 use crate::db::Db;
 use crate::import::{MediaKind, format_id};
 use crate::jobs::{Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager};
@@ -119,7 +132,10 @@ enum ModeInput {
 /// 一括のジョブを積む。レシピ（`edit_recipes`）を確かめて、文書の根と結び付けを入力に写し、同じトランザクションで対象の行を
 /// 選んだ順に入れる（ないアイテムは入れない）。エディタで開いているアイテムは、積んだ時点で `skipped`（Open）にする（開いている
 /// 間に保存できるように。あとから開こうとするアイテムは、一括が済むまで開かない：[`super::save::pending_save`]）。レシピに
-/// 当てられない理由がある・N → 1 のレシピ・対象がない・別名の名前の型が空なら Invalid。
+/// 当てられない理由がある・N → 1 のレシピ・対象がない・別名の名前の型が空なら Invalid。読んでから積むまでにレシピが差し替え・
+/// 名前を変える・消すで変わったら Conflict・NotFound（積むトランザクションの中で照らす。入力の写しが古い結び付けと新しい文書の
+/// 組にならず、文書の根が片付けられる前に根になる）。開いているアイテムは、エディタの置き場の錠を持ったまま読んで行を入れる
+/// （開く途中のエディタと重ならない。エディタは置いたあとに確かめ直す。M14 段 4 の検証の直し）。
 pub fn start_batch(
     db: &Db,
     jobs: &JobManager,
@@ -128,7 +144,7 @@ pub fn start_batch(
 ) -> Result<JobId> {
     let runtime = engine.runtime()?.clone();
     let stored = recipes::get(db, &runtime, req.recipe_id)?;
-    if let Some(why) = stored.problem {
+    if let Some(why) = &stored.problem {
         return Err(CoreError::Invalid(format!(
             "このレシピは当てられません：{why}"
         )));
@@ -158,6 +174,7 @@ pub fn start_batch(
         return Err(CoreError::Invalid("当てるアイテムがありません".into()));
     }
     let doc = db.read(|c| recipes::doc_root(c, req.recipe_id))?;
+    let recipe_id = req.recipe_id;
     let input = BatchInput {
         v: INPUT_V,
         recipe: RecipeInput {
@@ -168,12 +185,15 @@ pub fn start_batch(
         mode,
         include_drafts: req.include_drafts,
     };
-    let open = engine.current_editor().map(|e| e.item_id());
+    let input_json = serde_json::to_string(&input)?;
     let now = now_ms();
-    let id = jobs.enqueue_then(
-        JobKind::Batch,
-        serde_json::to_string(&input)?,
-        move |tx, job| {
+    let id = engine.with_open_item(|open| {
+        jobs.enqueue_then(JobKind::Batch, input_json, move |tx, job| {
+            if !recipes::unchanged(tx, recipe_id, &stored, &doc)? {
+                return Err(CoreError::Conflict(
+                    "レシピが変わりました。もう一度当ててください".into(),
+                ));
+            }
             let mut exists = tx.prepare_cached("SELECT 1 FROM items WHERE id = ?1")?;
             let mut insert = tx.prepare_cached(
                 "INSERT INTO batch_items (job_id, ord, item_id, state, code, message, finished_at)
@@ -213,8 +233,8 @@ pub fn start_batch(
                 ));
             }
             Ok(())
-        },
-    )?;
+        })
+    })?;
     Ok(id)
 }
 
@@ -244,12 +264,19 @@ pub struct BatchHandler {
     engine: Arc<EngineServices>,
     /// GC の時計（あれば、終わったあとに候補があれば GC を積む）。
     gc: Option<gc::GcClock>,
+    /// 一時停止・譲るで止めた 1 件が残しうる作業用の PCM の鍵（ジョブごと）。待ち・一時停止のまま中止したら捨てる（保存の
+    /// ジョブの M13 段 3 の直しと同じ。開き直したあとは空：残したものは期限・上限・閉じるときに消える。M14 段 4 の検証の直し）。
+    kept: Mutex<BTreeMap<JobId, Vec<WorkKey>>>,
     /// テストの強制終了：`(n, fault)` なら n 件コミットしたあとの次のコミットを `fault` で落とし、後始末をせずに失敗で戻る。
     #[cfg(test)]
     pub(crate) crash: Option<(usize, super::save::Fault)>,
-    /// テストの割り込み：1 件をコミットする直前に、そのアイテムの ID で呼ぶ（土台の競合を起こす）。
+    /// テストの割り込み：1 件をコミットする直前に、そのアイテムの ID で呼ぶ（土台の競合・動いている間の一時停止・中止・譲る）。
     #[cfg(test)]
     pub(crate) before_commit: Option<Arc<dyn Fn(i64) + Send + Sync>>,
+    /// テストの割り込み：働き手が飛ばす決まりを見たあと、継ぎ足す前に、そのアイテムの ID で呼ぶ（panic する 1 件・準備の途中で
+    /// ゴミ箱に入れる）。
+    #[cfg(test)]
+    pub(crate) before_prepare: Option<Arc<dyn Fn(i64) + Send + Sync>>,
 }
 
 impl BatchHandler {
@@ -259,10 +286,13 @@ impl BatchHandler {
             saver: Saver::new(engine.clone()),
             engine,
             gc: None,
+            kept: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             crash: None,
             #[cfg(test)]
             before_commit: None,
+            #[cfg(test)]
+            before_prepare: None,
         }
     }
 
@@ -271,6 +301,14 @@ impl BatchHandler {
         self.gc = Some(clock);
         self
     }
+
+    /// ジョブ `job` の前の回が残しうる作業用の PCM の鍵を取り出す。
+    fn take_kept(&self, job: JobId) -> Vec<WorkKey> {
+        self.kept
+            .lock()
+            .map(|mut kept| kept.remove(&job).unwrap_or_default())
+            .unwrap_or_default()
+    }
 }
 
 /// 1 件の場（一括の 1 件）。
@@ -278,6 +316,8 @@ struct BatchUnit<'a> {
     ctx: &'a JobContext,
     ord: i64,
     durability: &'a dyn Durability,
+    /// 譲ると決めた（準備の途中のものも一時停止と同じに止める。行は pending のまま。docs/editing.md §14.2 の止め方）。
+    yielding: &'a AtomicBool,
 }
 
 impl UnitCx for BatchUnit<'_> {
@@ -286,7 +326,10 @@ impl UnitCx for BatchUnit<'_> {
     }
 
     fn control(&self) -> Control {
-        self.ctx.control()
+        match self.ctx.control() {
+            Control::Continue if self.yielding.load(Ordering::Acquire) => Control::Pause,
+            other => other,
+        }
     }
 
     fn progress(&self, _progress: f64, _message: &str) {
@@ -329,6 +372,10 @@ impl UnitCx for BatchUnit<'_> {
     }
 }
 
+/// 読む前後の印（`BatchUnit::mark` が `decoding` を読む）。
+const DECODING: &str = r#"{"v":1,"decoding":true}"#;
+const DECODED: &str = r#"{"v":1,"decoding":false}"#;
+
 /// 1 件の仕事。
 #[derive(Debug, Clone, Copy)]
 struct Task {
@@ -342,15 +389,17 @@ struct Task {
 enum Outcome {
     /// 書き終えた（コミットを待つ）。
     Ready(Task, Box<Written>),
-    /// 飛ばした（行の state と理由）。
+    /// 飛ばした・失敗した（行の state と理由）。
     Finished {
         task: Task,
         state: &'static str,
         code: String,
         message: String,
     },
-    /// 止める指示で止まった（行は pending のまま）。
-    Stopped,
+    /// 準備の途中で土台が変わった（ゴミ箱に入れられたのを含む）：頭を読み直して 1 回だけやり直す。
+    Retry(Task),
+    /// 止める指示で止まった（行は pending のまま。一時停止・譲るで残しうる作業用の PCM の鍵）。
+    Stopped(Vec<WorkKey>),
 }
 
 /// 積んだレシピと向き（働き手が読むだけ）。
@@ -372,6 +421,19 @@ impl JobHandler for BatchHandler {
         }
         let db = ctx.library().db();
         let job = ctx.id();
+        // 前の回が残した作業用の PCM は、この回で使い回すか、期限で消える
+        drop(self.take_kept(job));
+        // 中止を書いたあとに落ちた（行は canceled、ジョブは running のまま開き直した）なら、残りを当てずに中止で終える
+        let canceled: bool = db.read(|c| {
+            Ok(c.prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM batch_items WHERE job_id = ?1 AND state = 'canceled')",
+            )?
+            .query_row([job], |r| r.get(0))?)
+        })?;
+        if canceled {
+            ctx.log("前回、中止を受けたあとにアプリが終わったので、中止で終えます");
+            return finish_canceled(db, job);
+        }
         let runtime = self.engine.runtime()?.clone();
         // レシピ（積んだときの写し）
         let graph = {
@@ -391,7 +453,7 @@ impl JobHandler for BatchHandler {
             bindings: input.recipe.bindings.clone(),
         };
         runtime
-            .preview(|e| e.check_recipe(&recipe))
+            .bulk(|e| e.check_recipe(&recipe))
             .map_err(|e| from_engine("このレシピは当てられません", e))?;
         let plan = Plan {
             recipe,
@@ -430,18 +492,10 @@ impl JobHandler for BatchHandler {
             )
         })?;
         let mut done = total - pending.len() as i64;
-        let end = self.process(ctx, &plan, pending, total, &mut done)?;
-        match end {
+        match self.process(ctx, &plan, pending, total, &mut done)? {
             Stop::Paused => return Ok(JobEnd::Paused),
             Stop::Yield => return Ok(JobEnd::Yield),
-            Stop::Canceled => {
-                let now = now_ms();
-                db.write(move |tx| cancel_rows(tx, job, now))?;
-                let result = summary(db, job)?;
-                return Ok(JobEnd::Canceled {
-                    result_json: Some(result.to_string()),
-                });
-            }
+            Stop::Canceled => return finish_canceled(db, job),
             Stop::Finished => {}
         }
         if let Some(clock) = &self.gc
@@ -461,17 +515,49 @@ impl JobHandler for BatchHandler {
         })
     }
 
+    /// 待ち・一時停止のまま中止された（譲ったあとに中止を受けたときも、ジョブの管理が同じトランザクションで呼ぶ）：残りの pending
+    /// の行を canceled にし、一時停止・譲るで残した作業用の PCM を捨てる。
     fn canceled_while_idle(&self, tx: &Connection, job: JobId, _input_json: &str) -> Result<()> {
-        cancel_rows(tx, job, now_ms())
+        cancel_rows(tx, job, now_ms())?;
+        for key in self.take_kept(job) {
+            self.engine.work_pcm().discard(&key);
+        }
+        Ok(())
     }
 }
 
+/// 中止で終える（残りの pending の行を canceled にする。中止を見たときに書いてあるが、そのあとの行もまとめる）。
+fn finish_canceled(db: &Db, job: i64) -> Result<JobEnd> {
+    let now = now_ms();
+    db.write(move |tx| cancel_rows(tx, job, now))?;
+    let result = summary(db, job)?;
+    Ok(JobEnd::Canceled {
+        result_json: Some(result.to_string()),
+    })
+}
+
 /// 止め方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stop {
     Finished,
     Paused,
     Yield,
     Canceled,
+}
+
+/// 止める指示を読む（ループの回ごと）。中止は一時停止・譲るに、一時停止は譲るに勝つ（譲ると決めたあとも読み直す。譲る途中に
+/// 受けた中止・一時停止を落とさない。M14 段 4 の検証の直し）。譲るかは、まだ止めていないときだけ見る。
+fn observe(ctx: &JobContext, stop: Option<Stop>) -> Option<Stop> {
+    match ctx.control() {
+        Control::Cancel => Some(Stop::Canceled),
+        _ if stop == Some(Stop::Canceled) => stop,
+        Control::Pause => Some(Stop::Paused),
+        Control::Continue => match stop {
+            Some(s) => Some(s),
+            None if ctx.should_yield() => Some(Stop::Yield),
+            None => None,
+        },
+    }
 }
 
 /// 残りの pending の行を canceled にする。
@@ -597,10 +683,13 @@ impl BatchHandler {
         let (task_tx, task_rx) = mpsc::channel::<Task>();
         let task_rx = Mutex::new(task_rx);
         let (out_tx, out_rx) = mpsc::channel::<Outcome>();
+        let yielding = AtomicBool::new(false);
         let mut commits = 0usize;
-        std::thread::scope(|s| -> Result<Stop> {
+        let mut kept: Vec<WorkKey> = Vec::new();
+        let end = std::thread::scope(|s| -> Result<Stop> {
             for _ in 0..k {
-                let (task_rx, out_tx, durability) = (&task_rx, out_tx.clone(), durability.as_ref());
+                let (task_rx, out_tx, durability, yielding) =
+                    (&task_rx, out_tx.clone(), durability.as_ref(), &yielding);
                 s.spawn(move || {
                     loop {
                         let task = match task_rx.lock() {
@@ -612,8 +701,24 @@ impl BatchHandler {
                             ctx,
                             ord: task.ord,
                             durability,
+                            yielding,
                         };
-                        let outcome = self.prepare_one(&unit, plan, task);
+                        // 1 件の panic は、その行の失敗にする（結果を返さずに終わると、配った数が戻らずジョブが止まる）
+                        let outcome =
+                            catch_unwind(AssertUnwindSafe(|| self.prepare_one(&unit, plan, task)))
+                                .unwrap_or_else(|_| {
+                                    tracing::error!(
+                                        job = ctx.id(),
+                                        item = task.item_id,
+                                        "一括の 1 件の準備が panic しました"
+                                    );
+                                    Outcome::Finished {
+                                        task,
+                                        state: "failed",
+                                        code: "Internal".into(),
+                                        message: "準備の途中で内部の誤りが起きました".into(),
+                                    }
+                                });
                         if out_tx.send(outcome).is_err() {
                             return;
                         }
@@ -625,7 +730,23 @@ impl BatchHandler {
             let mut ready: Vec<(Task, Box<Written>)> = Vec::new();
             let mut group_since: Option<Instant> = None;
             let mut stop: Option<Stop> = None;
-            loop {
+            let result = loop {
+                let next = observe(ctx, stop);
+                if next == Some(Stop::Canceled) && stop != Some(Stop::Canceled) {
+                    // 中止を見たらすぐ残りの行を canceled にする（このあと落ちても、開き直した一括が残りを当てない）。書き
+                    // 終えた分は落とす
+                    ready.clear();
+                    group_since = None;
+                    let now = now_ms();
+                    if let Err(e) = db.write(move |tx| cancel_rows(tx, job, now)) {
+                        break Err(e);
+                    }
+                }
+                if next == Some(Stop::Yield) {
+                    yielding.store(true, Ordering::Release);
+                }
+                stop = next;
+                let canceled = stop == Some(Stop::Canceled);
                 // 配る（止める指示がなければ）
                 while stop.is_none() && in_flight < k {
                     let Some(task) = queue.pop_front() else { break };
@@ -635,43 +756,44 @@ impl BatchHandler {
                     in_flight += 1;
                 }
                 let drained = in_flight == 0 && (queue.is_empty() || stop.is_some());
-                // まとまりのコミット
-                let due = !ready.is_empty()
+                // まとまりのコミット（一時停止・譲るは書き終えた分をコミットしてから止まる）
+                let due = !canceled
+                    && !ready.is_empty()
                     && (ready.len() >= GROUP_ITEMS
                         || group_since.is_some_and(|t| t.elapsed() >= GROUP_TIME)
                         || drained
                         || matches!(stop, Some(Stop::Paused | Stop::Yield)));
-                if due && !matches!(stop, Some(Stop::Canceled)) {
+                if due {
                     let group = std::mem::take(&mut ready);
                     group_since = None;
-                    let retry = self.commit_group(
+                    match self.commit_group(
                         ctx,
                         plan,
                         group,
                         durability.as_ref(),
+                        &yielding,
                         done,
                         &mut commits,
-                    )?;
-                    report(*done);
-                    for task in retry {
-                        queue.push_front(task);
+                    ) {
+                        Ok(retry) => {
+                            report(*done);
+                            for task in retry.into_iter().rev() {
+                                queue.push_front(task);
+                            }
+                        }
+                        Err(e) => break Err(e),
                     }
                     continue;
                 }
                 if drained && ready.is_empty() {
-                    break;
-                }
-                if drained && matches!(stop, Some(Stop::Canceled)) {
-                    // 書き終えた分も落とす（staging を消す）
-                    ready.clear();
-                    break;
+                    break Ok(());
                 }
                 match out_rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(outcome) => {
                         in_flight = in_flight.saturating_sub(1);
                         match outcome {
                             Outcome::Ready(task, written) => {
-                                if matches!(stop, Some(Stop::Canceled)) {
+                                if canceled {
                                     drop(written);
                                 } else {
                                     group_since.get_or_insert_with(Instant::now);
@@ -684,37 +806,50 @@ impl BatchHandler {
                                 code,
                                 message,
                             } => {
-                                finish_row(db, job, task.ord, state, &code, &message)?;
-                                *done += 1;
-                                report(*done);
+                                if !canceled {
+                                    if let Err(e) =
+                                        finish_row(db, job, task.ord, state, &code, &message)
+                                    {
+                                        break Err(e);
+                                    }
+                                    *done += 1;
+                                    report(*done);
+                                }
                             }
-                            Outcome::Stopped => {}
+                            Outcome::Retry(task) => queue.push_front(Task { attempt: 1, ..task }),
+                            Outcome::Stopped(keys) => kept.extend(keys),
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break Err(CoreError::Invalid("一括の働き手が止まりました".into()));
+                    }
                 }
-                if stop.is_none() {
-                    stop = match ctx.control() {
-                        Control::Pause => Some(Stop::Paused),
-                        Control::Cancel => Some(Stop::Canceled),
-                        Control::Continue if ctx.should_yield() => Some(Stop::Yield),
-                        Control::Continue => None,
-                    };
-                }
-            }
+            };
+            // 誤りで抜けたときも、準備の途中の働き手をすぐ止める（書き終えたものは受けずに落とす）
+            yielding.store(true, Ordering::Release);
             drop(task_tx);
-            Ok(stop.unwrap_or(Stop::Finished))
-        })
+            result.map(|()| stop.unwrap_or(Stop::Finished))
+        });
+        if matches!(end, Ok(Stop::Paused | Stop::Yield))
+            && !kept.is_empty()
+            && let Ok(mut map) = self.kept.lock()
+        {
+            map.insert(job, kept);
+        }
+        end
     }
 
     /// まとまり 1 つ：区切りの同期を 1 回取り、1 件ずつコミットする。土台の競合で 1 回目のものは、やり直す仕事として返す。
+    /// 中止を受けたら、残りはコミットせずに落とす。
+    #[allow(clippy::too_many_arguments)]
     fn commit_group(
         &self,
         ctx: &JobContext,
         plan: &Plan,
         group: Vec<(Task, Box<Written>)>,
         durability: &dyn Durability,
+        yielding: &AtomicBool,
         done: &mut i64,
         commits: &mut usize,
     ) -> Result<Vec<Task>> {
@@ -734,10 +869,14 @@ impl BatchHandler {
         let mut retry = Vec::new();
         let mut saved: Vec<MediaKind> = Vec::new();
         for (task, written) in group {
+            if ctx.control() == Control::Cancel {
+                break;
+            }
             let unit = BatchUnit {
                 ctx,
                 ord: task.ord,
                 durability,
+                yielding,
             };
             let base = written.base();
             #[cfg(test)]
@@ -766,11 +905,10 @@ impl BatchHandler {
                 }
                 Ok(Committed {
                     saved: None,
-                    outcome,
                     message,
+                    ..
                 }) => {
-                    // 同じ中身のアイテムがある（版を足さない）
-                    let _ = outcome;
+                    // 同じ中身のアイテムがある（版を足さない・作らない）
                     finish_row(db, job, task.ord, "existing", "Existing", &message)?;
                     *done += 1;
                 }
@@ -880,35 +1018,23 @@ impl BatchHandler {
                 "保存していない下書きがあるので飛ばしました".into(),
             ));
         }
+        #[cfg(test)]
+        if let Some(hook) = &self.before_prepare {
+            hook(item);
+        }
         // 2. 継ぎ足して結び付ける（土台は今の頭）
         let base = Base {
             hash: head.hash,
             version: head.version,
         };
         let runtime = self.engine.runtime().map_err(failed)?.clone();
-        let head_doc = runtime
-            .preview(|e| db.read(|c| versions::doc_of(c, e, item, head.version)))
-            .map_err(failed)?;
-        let shapes = if plan.recipe.bindings.is_empty() {
-            BTreeMap::new()
-        } else {
-            match self.input_shapes(unit, item, &head_doc) {
-                Ok(Flow::Go(s)) => s,
-                Ok(Flow::Stop(_)) => return Ok(Outcome::Stopped),
-                Err(e) => return Err(failed(e)),
-            }
-        };
+        let head_doc = head_doc(db, &runtime, item, head.version).map_err(failed)?;
+        let stopped = || Outcome::Stopped(kept_keys(db, item, &head_doc));
         let facts = db.read(|c| facts_of(c, item)).map_err(failed)?;
-        let instance = runtime
-            .preview(|e| e.instantiate(&head_doc, &plan.recipe, &shapes, &facts))
-            .map_err(|e| match e {
-                BindError::Recipe(_) | BindError::Invalid(_) => Skip {
-                    state: "failed",
-                    code: "Invalid".into(),
-                    message: e.to_string(),
-                },
-                other => Skip::skipped("NotApplicable", other.to_string()),
-            })?;
+        let instance = match self.bind(unit, &runtime, plan, item, &head_doc, &facts)? {
+            Flow::Go(instance) => instance,
+            Flow::Stop(_) => return Ok(stopped()),
+        };
         let mut graph = instance.graph;
         let bound: serde_json::Value = bound_json(&instance.bound)
             .ok()
@@ -951,13 +1077,13 @@ impl BatchHandler {
             )
         };
         let prepared = match attempt(&graph) {
-            Err(CoreError::Unsupported(why)) if !overwrite => {
-                // 別名は代わりの形式で（ADR-190 (6)）
+            Err(CoreError::Unwritable(why)) if !overwrite => {
+                // 別名は代わりの形式で（ADR-190 (6)。書き手がないときだけ。元を読めないときは替えない）
                 let fallbacks: &[&str] = match head.kind {
                     MediaKind::Audio => &["ogg", "wav"],
                     _ => &["png"],
                 };
-                let mut last = Err(CoreError::Unsupported(why));
+                let mut last = Err(CoreError::Unwritable(why));
                 for format in fallbacks {
                     graph.outputs[0].format = FormatChoice::To {
                         format: (*format).to_string(),
@@ -965,7 +1091,7 @@ impl BatchHandler {
                     };
                     graph.outputs[0].quantize = None;
                     last = attempt(&graph);
-                    if !matches!(last, Err(CoreError::Unsupported(_))) {
+                    if !matches!(last, Err(CoreError::Unwritable(_))) {
                         break;
                     }
                 }
@@ -975,22 +1101,71 @@ impl BatchHandler {
         };
         match prepared {
             Ok(Flow::Go(w)) => Ok(Outcome::Ready(task, Box::new(w))),
-            Ok(Flow::Stop(_)) => Ok(Outcome::Stopped),
-            Err(CoreError::Unsupported(why)) => Err(Skip::skipped("FormatUnavailable", why)),
+            Ok(Flow::Stop(_)) => Ok(stopped()),
+            // 書けない形式（上書き。別名は代わりの形式でも書けない）
+            Err(CoreError::Unwritable(why)) => Err(Skip::skipped("FormatUnavailable", why)),
+            // 準備の途中で土台が変わった（ゴミ箱に入れられたのを含む）：頭を読み直して 1 回だけやり直す（ゴミ箱なら Trashed に
+            // なる）。やり直しても変われば skipped（Conflict）
+            Err(CoreError::Conflict(_)) if task.attempt == 0 => Ok(Outcome::Retry(task)),
+            Err(e @ CoreError::Conflict(_)) => Err(Skip::skipped("Conflict", e.to_string())),
+            // このアイテムに当てられない（レシピの手が種類・形に合わず描けない、アイテムの種類を変える出力の形式。元が壊れて
+            // 読めないときの Invalid は failed のまま）
+            Err(e @ CoreError::Unfit(_)) => Err(Skip::skipped("NotApplicable", e.to_string())),
             Err(e) => Err(failed(e)),
         }
     }
 
-    /// 結び付けのための入力の形（頭の文書の入力 0 ＝ 元の見出しから。OS のデコーダを通りうるなら、読む前後に行の印を置く）。
-    fn input_shapes(
+    /// 継ぎ足して結び付ける（`Engine::instantiate`。一括のプールで）。結び付けがあれば、保存が読むのと同じ入力の形を読む
+    /// （[`Self::input_shape`]）。終わりからの秒で、見出しの長さが上限しか分からない（MP3・AAC）なら、形を読めた段で流して
+    /// 数えた長さで結び付け直す（エディタがデコードした値の長さで結び付けるのと同じ値にする）。
+    fn bind(
+        &self,
+        unit: &BatchUnit<'_>,
+        runtime: &EngineRuntime,
+        plan: &Plan,
+        item: i64,
+        head_doc: &Graph,
+        facts: &Facts,
+    ) -> std::result::Result<Flow<kura_engine::recipe::Instance>, Skip> {
+        let instantiate = |shapes: &BTreeMap<InputId, Shape>| {
+            runtime
+                .bulk(|e| e.instantiate(head_doc, &plan.recipe, shapes, facts))
+                .map_err(bind_skip)
+        };
+        if plan.recipe.bindings.is_empty() {
+            return instantiate(&BTreeMap::new()).map(Flow::Go);
+        }
+        let read = match self.input_shape(unit, item, head_doc) {
+            Ok(Flow::Go(read)) => read,
+            Ok(Flow::Stop(end)) => return Ok(Flow::Stop(end)),
+            Err(e) => return Err(Skip::failed(&e)),
+        };
+        let shapes = BTreeMap::from([(InputId(0), read.shape)]);
+        match runtime.bulk(|e| e.instantiate(head_doc, &plan.recipe, &shapes, facts)) {
+            Err(BindError::NoLength { .. }) if read.stage.is_some() => {
+                let exact = match self.count_frames(unit, &read) {
+                    Ok(Flow::Go(shape)) => shape,
+                    Ok(Flow::Stop(end)) => return Ok(Flow::Stop(end)),
+                    Err(e) => return Err(Skip::failed(&e)),
+                };
+                instantiate(&BTreeMap::from([(InputId(0), exact)])).map(Flow::Go)
+            }
+            other => other.map(Flow::Go).map_err(bind_skip),
+        }
+    }
+
+    /// 結び付けのための入力 0 の形（保存が読むのと同じもの）：アンカーがあればアンカーの見出し（記録の値の形。OS のデコーダを
+    /// 通らない。読めなければ元から）、なければ元を段の順に読む（保存と同じ段。段ごとに、その段で形を読む分を予算から確保し、
+    /// OS の段なら読む前後に行の印を置く）。
+    fn input_shape(
         &self,
         unit: &BatchUnit<'_>,
         item: i64,
         head_doc: &Graph,
-    ) -> Result<Flow<BTreeMap<InputId, Shape>>> {
+    ) -> Result<Flow<InputRead>> {
         let library = unit.ctx.library();
-        let original = library
-            .db()
+        let db = library.db();
+        let original = db
             .read(|c| versions::original(c, item))?
             .ok_or_else(|| CoreError::NotFound(format!("アイテム {item}")))?;
         let format = format_id(&original.ext).ok_or_else(|| {
@@ -1001,30 +1176,229 @@ impl BatchHandler {
             .first()
             .map(|slot| slot.decode.clone())
             .unwrap_or_default();
-        let path = library.layout().content_path(&original.hash, &original.ext);
-        let codecs = self.engine.codecs();
         let runtime = self.engine.runtime()?.clone();
         let limits = runtime.bulk(|e| e.limits().clone());
-        let platform = codecs
-            .decoders_for(format)
-            .iter()
-            .any(|d| !d.reproducible());
-        let mon = UnitMonitor(unit);
-        if platform {
-            unit.mark(r#"{"v":1,"decoding":true}"#, 0.0, "元を読んでいます")?;
-        }
-        let shape = codecs.shape_path_first(&path, format, &opts, &limits, &mon);
-        if platform {
-            unit.mark(r#"{"v":1,"decoding":false}"#, 0.0, "元を読みました")?;
-        }
-        match shape {
-            Ok((shape, _)) => Ok(Flow::Go(BTreeMap::from([(InputId(0), shape)]))),
-            Err(e) if matches!(e.root(), kura_engine::EngineError::Canceled) => {
-                Ok(Flow::Stop(JobEnd::Paused))
+        let path = library.layout().content_path(&original.hash, &original.ext);
+        let options_digest = anchors::options_digest(&opts)?;
+        if let Some(a) = db.read(|c| anchors::find(c, &original.hash, &options_digest))? {
+            let anchor_path = library.layout().content_path(&a.hash, &a.ext);
+            match File::open(&anchor_path)
+                .map_err(EngineError::from)
+                .and_then(|f| anchor::shape(&mut BufReader::new(f), &limits))
+            {
+                Ok(shape) => {
+                    return Ok(Flow::Go(InputRead {
+                        shape,
+                        stage: None,
+                        path,
+                        format,
+                        opts,
+                        platform: false,
+                    }));
+                }
+                // 保存も、アンカーが使えなければ元を読み直す
+                Err(e) => unit.log(&format!(
+                    "アイテム {item} のアンカーの見出しを読めないので、元から読みます：{e}"
+                )),
             }
+        }
+        let codecs = self.engine.codecs();
+        let mon = UnitMonitor(unit);
+        let is_platform = |id: &str| {
+            codecs
+                .decoders_for(format)
+                .iter()
+                .any(|d| d.id() == id && d.tier() == Tier::Platform)
+        };
+        let mut lease = None;
+        let mut stopped: Option<Result<()>> = None;
+        let mut marked = false;
+        let read =
+            codecs.shape_path_staged(&path, format, &opts, &limits, &mon, None, &mut |stage| {
+                lease = None;
+                match runtime
+                    .budget()
+                    .acquire(stage.shape_bytes, Class::Bulk, &mon)
+                {
+                    Ok(l) => lease = Some(l),
+                    Err(e) => {
+                        stopped = Some(if matches!(e.root(), EngineError::Canceled) {
+                            Ok(())
+                        } else {
+                            Err(from_engine("元の大きさを読むメモリを確保できません", e))
+                        });
+                        return Err(EngineError::Canceled);
+                    }
+                }
+                if !marked && is_platform(stage.id) {
+                    if let Err(e) = unit.mark(DECODING, 0.0, "元を読んでいます") {
+                        stopped = Some(Err(e));
+                        return Err(EngineError::Canceled);
+                    }
+                    marked = true;
+                }
+                Ok(())
+            });
+        drop(lease);
+        if marked {
+            unit.mark(DECODED, 0.0, "元を読みました")?;
+        }
+        match stopped {
+            Some(Ok(())) => return Ok(Flow::Stop(JobEnd::Paused)),
+            Some(Err(e)) => return Err(e),
+            None => {}
+        }
+        match read {
+            Ok((shape, stage)) => {
+                let platform = is_platform(stage.id);
+                Ok(Flow::Go(InputRead {
+                    shape,
+                    stage: Some(stage),
+                    path,
+                    format,
+                    opts,
+                    platform,
+                }))
+            }
+            Err(e) if matches!(e.root(), EngineError::Canceled) => Ok(Flow::Stop(JobEnd::Paused)),
             Err(e) => Err(from_engine("元の大きさを読めません", e)),
         }
     }
+
+    /// 見出しの長さが上限しか分からない音声（MP3・AAC）の長さを、形を読めた段で流して数える（予算はその段の流して読む見積もり。
+    /// OS の段なら読む前後に行の印を置く）。
+    fn count_frames(&self, unit: &BatchUnit<'_>, read: &InputRead) -> Result<Flow<Shape>> {
+        let (Some(stage), Shape::Audio { rate, channels, .. }) = (&read.stage, read.shape) else {
+            return Ok(Flow::Go(read.shape));
+        };
+        let runtime = self.engine.runtime()?.clone();
+        let codecs = self.engine.codecs();
+        let limits = runtime.bulk(|e| e.limits().clone());
+        let mon = UnitMonitor(unit);
+        let len = std::fs::metadata(&read.path).map_or(0, |m| m.len());
+        let need = codecs.stage_stream_work_bytes(stage, read.format, &read.shape, len);
+        let _lease = match runtime.budget().acquire(need, Class::Bulk, &mon) {
+            Ok(lease) => lease,
+            Err(e) if matches!(e.root(), EngineError::Canceled) => {
+                return Ok(Flow::Stop(JobEnd::Paused));
+            }
+            Err(e) => return Err(from_engine("元の長さを数えるメモリを確保できません", e)),
+        };
+        if read.platform {
+            unit.mark(DECODING, 0.0, "元を読んでいます")?;
+        }
+        let mut sink = FrameCount(None);
+        let counted = runtime.bulk(|_| {
+            codecs.decode_stream_with_path(
+                stage.id,
+                &read.path,
+                read.format,
+                &read.opts,
+                &limits,
+                &mut sink,
+                &mon,
+            )
+        });
+        if read.platform {
+            unit.mark(DECODED, 0.0, "元を読みました")?;
+        }
+        match (counted, sink.0) {
+            (Ok(_), Some(frames)) => Ok(Flow::Go(Shape::Audio {
+                rate,
+                channels,
+                frames: Dim::Exact(frames),
+            })),
+            (Ok(_), None) => Err(CoreError::Invalid(
+                "元の長さを数えられません（流れが終わりませんでした）".into(),
+            )),
+            (Err(e), _) if matches!(e.root(), EngineError::Canceled) => {
+                Ok(Flow::Stop(JobEnd::Paused))
+            }
+            (Err(e), _) => Err(from_engine("元の長さを数えられません", e)),
+        }
+    }
+}
+
+/// 結び付けのために読んだ入力 0 の形と、読み方（長さを数え直すときに使う）。
+struct InputRead {
+    shape: Shape,
+    /// 元を読んだ段（アンカーの見出しから読んだなら None：長さは決まっている）。
+    stage: Option<kura_engine::codec::PickedStage>,
+    /// 元のファイル。
+    path: std::path::PathBuf,
+    format: &'static str,
+    opts: DecodeOptions,
+    /// 読んだ段が OS のデコーダか。
+    platform: bool,
+}
+
+/// 流れの長さだけを受ける（標本は捨てる）。
+struct FrameCount(Option<u64>);
+
+impl DecodeSink for FrameCount {
+    fn begin(&mut self, _info: &DecodeInfo) -> std::result::Result<(), EngineError> {
+        self.0 = None;
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        _start: u64,
+        _planes: &[&[f32]],
+        _mon: &dyn Monitor,
+    ) -> std::result::Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn end(&mut self, end: &StreamEnd) -> std::result::Result<(), EngineError> {
+        self.0 = Some(end.frames);
+        Ok(())
+    }
+}
+
+/// 結び付けの誤りの分け方：レシピの側（規則の版・大きすぎる・ノードの ID を使い切る）は CoreError の code で失敗、N → 1 は
+/// Invalid、ほか（値がない・前の手が座標を変える・長さが決まらない・音声でない・範囲の外・前の部分をこのアイテムで推論できない）
+/// はこのアイテムに当てられない手として skipped（NotApplicable）。
+fn bind_skip(e: BindError) -> Skip {
+    match e {
+        BindError::Recipe(err) => Skip::failed(&from_engine("レシピを当てられません", err)),
+        BindError::Kind => Skip::failed(&CoreError::Invalid(e.to_string())),
+        other => Skip::skipped("NotApplicable", other.to_string()),
+    }
+}
+
+/// 頭の文書（版 `version`。版 0 と、版 0 に戻した版は空の文書）。DB から読んだバイト列を一括のプールで読み込む（エディタの
+/// プレビューのプールを使わない。M14 段 4 の検証の直し）。
+fn head_doc(db: &Db, runtime: &EngineRuntime, item: i64, version: i64) -> Result<Graph> {
+    let bytes = db.read(|c| match versions::get(c, item, version)? {
+        Some(versions::Version {
+            doc_id: Some(id), ..
+        }) => store::load_doc_bytes(c, id).map(Some),
+        Some(_) => Ok(None),
+        None if version == 0 => Ok(None),
+        None => Err(CoreError::NotFound(format!(
+            "アイテム {item} の版 {version}"
+        ))),
+    })?;
+    match bytes {
+        Some(bytes) => runtime
+            .bulk(|e| e.load(&bytes))
+            .map_err(|e| from_engine("文書を読めません", e)),
+        None => Ok(Graph::new_single()),
+    }
+}
+
+/// 止めた 1 件が一時停止で残しうる作業用の PCM の鍵（求められなければ空。残したものは期限・上限・閉じるときに消える）。
+fn kept_keys(db: &Db, item: i64, head_doc: &Graph) -> Vec<WorkKey> {
+    let opts = head_doc
+        .inputs
+        .first()
+        .map(|slot| slot.decode.clone())
+        .unwrap_or_default();
+    db.read(|c| work_keys(c, item, opts)).unwrap_or_else(|err| {
+        tracing::warn!(%err, item, "止めた 1 件の作業用の PCM の鍵を求められません");
+        Vec::new()
+    })
 }
 
 /// 飛ばす・失敗の理由。

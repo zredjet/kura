@@ -5,8 +5,9 @@
 //! - アンカーが使えない（形・中身を読めない、ファイルがない、壊れている、別の値）ときは、保存（上書き・別名）も版に戻す作り直しも、
 //!   元を記録の識別子のデコーダで読み直して値のダイジェストを記録と照らす（[`read_recorded_input`]）。同じならその値で続け、
 //!   知らせを版の記録の警告に残す（入力の記録は同じ値のアンカーを指したまま）。記録のデコーダがない・値が違えば Mismatch。
-//! - OS のデコーダ（Platform の段。同じプロセスで動く）を通りうる読みは、見出し（形）を読む前に途中経過の `decoding` を真にして
-//!   コミットし、読み終えるまで保つ（落ちずに終われば、失敗・止めるときも偽に戻す）。そこで落ちると、次に動いたときに 0 の
+//! - OS のデコーダ（Platform の段。同じプロセスで動く）を通りうる読みは、見出し（形）を読む間と値を読む間に途中経過の
+//!   `decoding` を真にしてコミットする（間の予算の確保を待つ間は外す。M14 段 4。落ちずに終われば、失敗・止めるときも偽に
+//!   戻す）。そこで落ちると、次に動いたときに 0 の
 //!   確かめが 1 回だけ失敗にする（ADR-158 (3)(9) と同じ決まり。解析のジョブの処理中の印と同じく、どの段が読むかは読む前に
 //!   分からないので、組にその形式の Platform の段のデコーダがあれば付ける）。
 
@@ -170,22 +171,25 @@ pub(super) fn while_decoding_at<T>(
     }
 }
 
-/// 1 回分：形を読み、`plan` で計画と予算を作り、値を読む（OS のデコーダを通りうるなら、形を読む前から読み終えるまで印を保つ）。
+/// 1 回分：形を読み、`plan` で計画と予算を作り、値を読む（OS のデコーダを通りうるなら、形を読む間と値を読む間に印を置く。
+/// 予算の確保を待つ間は外す：一括の k 本が予算を待つ間に別の 1 本が落ちても、待っていただけの行を「読む途中で落ちた」に
+/// しない。M14 段 4 の検証の直し）。
 pub(super) fn read_once<P>(
     cx: &ReadCx<'_>,
     how: &Reading<'_>,
     plan: impl FnOnce(&Shape) -> Result<Flow<P>>,
 ) -> Result<Flow<Attempt<P>>> {
-    while_decoding(cx.ctx, how.platform(cx.codecs), || {
-        let from_anchor = how.is_anchor();
-        let shape = match how.shape(cx) {
-            Ok(shape) => shape,
-            Err(e) => return trip(cx.ctx, "元の大きさを読めません", e, from_anchor),
-        };
-        let prep = match plan(&shape)? {
-            Flow::Go(prep) => prep,
-            Flow::Stop(end) => return Ok(Flow::Stop(end)),
-        };
+    let platform = how.platform(cx.codecs);
+    let from_anchor = how.is_anchor();
+    let shape = match while_decoding_at(cx.ctx, platform, 0.1, || 0.1, || Ok(how.shape(cx)))? {
+        Ok(shape) => shape,
+        Err(e) => return trip(cx.ctx, "元の大きさを読めません", e, from_anchor),
+    };
+    let prep = match plan(&shape)? {
+        Flow::Go(prep) => prep,
+        Flow::Stop(end) => return Ok(Flow::Stop(end)),
+    };
+    while_decoding(cx.ctx, platform, || {
         cx.ctx.progress(0.15, "元を読んでいます");
         let (codecs, original, limits, mon) = (cx.codecs, cx.original, cx.limits, cx.mon);
         let matched = |r: Recorded, rec: &RecordedInput| match r {

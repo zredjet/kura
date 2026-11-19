@@ -1769,6 +1769,24 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
         autosave: Autosave::start(env.library.clone(), item_id, draft_interval()),
     });
     env.engine.install_editor(editor.clone());
+    // 置いたあとに確かめ直す（上の確かめと置くまでの間に、このアイテムを含む一括が積まれたら開かない。一括を積む口は置き場の
+    // 錠を持ったまま開いているアイテムを読んで行を入れるので、置く前に積んだ一括はここで見え、置いたあとに積む一括は Open で
+    // 飛ばす。M14 段 4 の検証の直し）
+    let pending = db
+        .read(|c| pending_save(c, item_id))
+        .map_err(EditorError::from)
+        .and_then(|found| match found {
+            Some(job) => Err(EditorError::SavePending { job }),
+            None => Ok(()),
+        });
+    if let Err(err) = pending {
+        if let Some(e) = env.engine.take_editor(Some(&editor.id)) {
+            e.shutdown();
+        } else {
+            editor.shutdown();
+        }
+        return Err(err);
+    }
     let result = finish_open(
         &editor,
         OpenParts {
