@@ -349,9 +349,9 @@ export const commands = {
 	recipeDuplicate: (id: number) => typedError<number, AppError>(__TAURI_INVOKE("recipe_duplicate", { id })),
 	/**  すぐ消す（画面は確かめてから。動いている一括はジョブの入力の写しで続く）。 */
 	recipeDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("recipe_delete", { id })),
-	/**  `.kurarecipe` を `path`（保存のダイアログで選んだ絶対パス。ライブラリの外）に書き出す。 */
+	/**  `.kurarecipe` を `path`（保存のダイアログで選んだ絶対パス。ライブラリの外）に書き出す（一時ファイルから名前を置き換える）。 */
 	recipeExport: (id: number, path: string) => typedError<null, AppError>(__TAURI_INVOKE("recipe_export", { id, path })),
-	/**  `.kurarecipe`（開くダイアログで選んだ絶対パス）を読み込んで足す。4 MiB を超えるファイルは読まずに断る。 */
+	/**  `.kurarecipe`（開くダイアログで選んだ絶対パス）を読み込んで足す。通常のファイルだけを、4 MiB まで読む。 */
 	recipeImport: (path: string) => typedError<RecipeImportedDto, AppError>(__TAURI_INVOKE("recipe_import", { path })),
 };
 

@@ -2,7 +2,8 @@
 //! 作る・中身を差し替える・名前・説明・並べ替え・複製・消す・`.kurarecipe` の書き出しと読み込み。ロジックは
 //! `kura_core::edit::recipes`。
 
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kura_core::edit::EngineRuntime;
@@ -277,21 +278,32 @@ pub async fn recipe_delete(state: State<'_, AppState>, id: i64) -> Result<(), Ap
     .await
 }
 
-/// 書き出し・読み込みのパス（絶対パスで、ライブラリの外）。
-fn outside_library(session: &LibrarySession, path: &str) -> Result<PathBuf, AppError> {
+/// このライブラリの場所（パスの確かめに使う。シンボリックリンクをたどったもの）。
+fn library_root(session: &LibrarySession) -> Result<PathBuf, AppError> {
+    session
+        .library()
+        .layout()
+        .root()
+        .canonicalize()
+        .map_err(|e| AppError::internal(e.to_string()))
+}
+
+/// 書き出し・読み込みのパス：絶対パスで、ライブラリ（`root`。たどったもの）の外。親のフォルダはたどって確かめ、もうある名前は
+/// リンクをたどった先も確かめる（ライブラリの中を指すシンボリックリンクを選んでも、ライブラリのファイルに触れない）。
+fn outside_library(root: &Path, path: &str) -> Result<PathBuf, AppError> {
     let path = PathBuf::from(path);
-    if !path.is_absolute() {
+    if !path.is_absolute() || path.file_name().is_none() {
         return Err(AppError::new(
             AppErrorCode::Invalid,
             "レシピのファイルの場所が正しくありません",
         ));
     }
-    let root = session
-        .library()
-        .layout()
-        .root()
-        .canonicalize()
-        .map_err(|e| AppError::internal(e.to_string()))?;
+    let inside = || {
+        AppError::new(
+            AppErrorCode::Invalid,
+            "ライブラリの中のファイルは使えません。ほかのフォルダを選んでください",
+        )
+    };
     let dir = path
         .parent()
         .and_then(|p| p.canonicalize().ok())
@@ -301,16 +313,69 @@ fn outside_library(session: &LibrarySession, path: &str) -> Result<PathBuf, AppE
                 "レシピのファイルのフォルダが見つかりません",
             )
         })?;
-    if dir.starts_with(&root) {
-        return Err(AppError::new(
-            AppErrorCode::Invalid,
-            "ライブラリの中のファイルは使えません。ほかのフォルダを選んでください",
-        ));
+    if dir.starts_with(root) {
+        return Err(inside());
+    }
+    if let Ok(target) = path.canonicalize()
+        && target.starts_with(root)
+    {
+        return Err(inside());
     }
     Ok(path)
 }
 
-/// `.kurarecipe` を `path`（保存のダイアログで選んだ絶対パス。ライブラリの外）に書き出す。
+/// `bytes` を `path` に書く：同じフォルダの一時ファイルに書いて同期し、名前を置き換える（`path` がシンボリックリンクなら
+/// リンクそのものを置き換え、リンクの先には触れない。書けなかったら前のファイルは残る）。
+fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("ファイル名がありません"))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".kura-{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// 通常のファイル `path` を `max` バイトまで読む（FIFO・デバイスは開く前に断る。大きければ読み切らずに TooLarge）。
+fn read_limited(path: &Path, max: usize) -> Result<Vec<u8>, AppError> {
+    let io = |e: std::io::Error| {
+        AppError::new(
+            AppErrorCode::Io,
+            format!("レシピのファイルを読めません: {e}"),
+        )
+    };
+    if !std::fs::metadata(path).map_err(io)?.is_file() {
+        return Err(AppError::new(
+            AppErrorCode::Invalid,
+            "レシピのファイルではありません（通常のファイルを選んでください）",
+        ));
+    }
+    let mut raw = Vec::new();
+    std::fs::File::open(path)
+        .map_err(io)?
+        .take(max as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(io)?;
+    if raw.len() > max {
+        return Err(AppError::new(
+            AppErrorCode::TooLarge,
+            format!("レシピのファイルが大きすぎます（上限 {max} バイト）"),
+        ));
+    }
+    Ok(raw)
+}
+
+/// `.kurarecipe` を `path`（保存のダイアログで選んだ絶対パス。ライブラリの外）に書き出す（一時ファイルから名前を置き換える）。
 #[tauri::command]
 #[specta::specta]
 pub async fn recipe_export(
@@ -320,16 +385,16 @@ pub async fn recipe_export(
 ) -> Result<(), AppError> {
     let session = state.session()?;
     blocking(move || {
-        let path = outside_library(&session, &path)?;
+        let path = outside_library(&library_root(&session)?, &path)?;
         let runtime = runtime_of(&session)?;
         let bytes = recipes::export(session.library().db(), &runtime, id)?;
-        std::fs::write(&path, bytes)
+        write_replacing(&path, &bytes)
             .map_err(|e| AppError::new(AppErrorCode::Io, format!("レシピを書き出せません: {e}")))
     })
     .await
 }
 
-/// `.kurarecipe`（開くダイアログで選んだ絶対パス）を読み込んで足す。4 MiB を超えるファイルは読まずに断る。
+/// `.kurarecipe`（開くダイアログで選んだ絶対パス）を読み込んで足す。通常のファイルだけを、4 MiB まで読む。
 #[tauri::command]
 #[specta::specta]
 pub async fn recipe_import(
@@ -338,24 +403,90 @@ pub async fn recipe_import(
 ) -> Result<RecipeImportedDto, AppError> {
     let session = state.session()?;
     blocking(move || {
-        let path = outside_library(&session, &path)?;
-        let io = |e: std::io::Error| {
-            AppError::new(
-                AppErrorCode::Io,
-                format!("レシピのファイルを読めません: {e}"),
-            )
-        };
-        let len = std::fs::metadata(&path).map_err(io)?.len();
-        if len > MAX_RECIPE_BYTES as u64 {
-            return Err(AppError::new(
-                AppErrorCode::TooLarge,
-                format!("レシピのファイルが大きすぎます（{len} バイト。上限 {MAX_RECIPE_BYTES}）"),
-            ));
-        }
-        let raw = std::fs::read(&path).map_err(io)?;
+        let path = outside_library(&library_root(&session)?, &path)?;
+        let raw = read_limited(&path, MAX_RECIPE_BYTES)?;
         let runtime = runtime_of(&session)?;
         let (id, notes) = recipes::import(session.library().db(), &runtime, &raw)?;
         Ok(RecipeImportedDto { id, notes })
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("L.kuralib");
+        let out = d.path().join("out");
+        std::fs::create_dir_all(root.join("files")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let (root, out) = (root.canonicalize().unwrap(), out.canonicalize().unwrap());
+        (d, root, out)
+    }
+
+    /// ライブラリの外の絶対パスだけを受け付ける（相対・ライブラリの中・ライブラリの中を指すリンク・フォルダのないものは断る）。
+    #[test]
+    fn paths_must_be_outside_the_library() {
+        let (_d, root, out) = dirs();
+        let ok = out.join("a.kurarecipe");
+        assert_eq!(outside_library(&root, ok.to_str().unwrap()).unwrap(), ok);
+        let link = out.join("link.kurarecipe");
+        std::fs::write(root.join("files/x.png"), b"x").unwrap();
+        std::os::unix::fs::symlink(root.join("files/x.png"), &link).unwrap();
+        for bad in [
+            "a.kurarecipe".to_string(),
+            root.join("a.kurarecipe").display().to_string(),
+            root.join("files/x.png").display().to_string(),
+            link.display().to_string(),
+            out.join("none/a.kurarecipe").display().to_string(),
+        ] {
+            let e = outside_library(&root, &bad).unwrap_err();
+            assert_eq!(e.code, AppErrorCode::Invalid, "{bad}");
+        }
+    }
+
+    /// 書き出しは名前を置き換える：シンボリックリンクはリンクそのものが置き換わり、リンクの先は変わらない。一時ファイルは残らない。
+    #[test]
+    fn writing_replaces_the_name_not_the_link_target() {
+        let (_d, _root, out) = dirs();
+        let target = out.join("target.txt");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = out.join("r.kurarecipe");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_replacing(&link, b"recipe").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&link).unwrap(), b"recipe");
+        let names: Vec<_> = std::fs::read_dir(&out).unwrap().collect();
+        assert_eq!(names.len(), 2, "一時ファイルが残っている");
+    }
+
+    /// 読み込みは通常のファイルだけを上限まで読む（大きいもの・フォルダ・FIFO は読み切らずに断り、FIFO で止まらない）。
+    #[test]
+    fn reading_is_limited_to_regular_files() {
+        let (_d, _root, out) = dirs();
+        let small = out.join("s.kurarecipe");
+        std::fs::write(&small, b"abc").unwrap();
+        assert_eq!(read_limited(&small, 3).unwrap(), b"abc");
+        assert_eq!(
+            read_limited(&small, 2).unwrap_err().code,
+            AppErrorCode::TooLarge
+        );
+        assert_eq!(
+            read_limited(&out, 10).unwrap_err().code,
+            AppErrorCode::Invalid
+        );
+        let fifo = out.join("f.kurarecipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert_eq!(
+            read_limited(&fifo, 10).unwrap_err().code,
+            AppErrorCode::Invalid
+        );
+    }
 }
