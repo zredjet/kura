@@ -1,5 +1,11 @@
 //! 本当に落とす試験（M12 の段 2。docs/architecture.md §13、docs/editing.md §14.1）：
-//! `edit crash-loop --library <path> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0]`。
+//! `edit crash-loop --library <path> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0] [--batch [N]]`。
+//!
+//! `--batch [N]`（M14 段 4。N の既定は 1,000）を付けると、保存の代わりに一括加工のジョブ（`JobKind::Batch`）を落とす：N 個の
+//! ドット絵の PNG と、レシピ「トリム・4 倍」を 1 つ入れたライブラリで、子は全件に上書きの一括を積む（あれば再開したものを
+//! 動かす）。落としては開き直し、どのアイテムも一括の版が 1 つまで・済んだ行は版を指す・pending の行に版がない・頭の中身が
+//! 期待どおり、などを数え、最後に一括を終わらせて全件ちょうど 1 回を確かめる。`--audio-minutes` とは併せられない。
+//! 流れと確かめの一覧は [`batch`] の冒頭。
 //!
 //! `--audio-minutes n`（M13 段 3。既定 0。確かめるときは 6）を付けると、親は n 分の合成の FLAC（44.1 kHz ステレオ）も
 //! 取り込み、子は画像と音声を交互に保存する（音声はランダムな gain・fade・normalize・trim を、flac・ogg・wav に流して書く。
@@ -26,7 +32,7 @@
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,7 +48,12 @@ use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 use serde_json::{Value as Json, json};
 
-const USAGE: &str = "使い方: kura-devtools edit crash-loop --library <新しいライブラリの場所> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0]";
+mod batch;
+
+const USAGE: &str = "使い方: kura-devtools edit crash-loop --library <新しいライブラリの場所> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0] [--batch [N]]";
+
+/// `--batch` の件数を省いたときの件数（NFR-14 と同じ 1,000 件）。
+const DEFAULT_BATCH_ITEMS: usize = 1_000;
 
 /// 取り込む合成の FLAC のレート。
 const AUDIO_RATE: u32 = 44_100;
@@ -65,6 +76,8 @@ struct Opts {
     max_ms: u64,
     /// 取り込む合成の音声の長さ（分。0 なら音声を入れない）。
     audio_minutes: u64,
+    /// 一括加工を落とすときのアイテムの数（`--batch`。None なら保存を落とす）。
+    batch: Option<usize>,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -75,14 +88,35 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         min_ms: 10,
         max_ms: 500,
         audio_minutes: 0,
+        batch: None,
     };
     let mut library = None;
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        i += 1;
+        // `--batch` の件数は省ける（次が数でなければ既定の件数）
+        if arg == "--batch" {
+            let n = match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                Some(n) => {
+                    i += 1;
+                    n
+                }
+                None => DEFAULT_BATCH_ITEMS,
+            };
+            if n == 0 {
+                return Err("--batch は 1 件以上にしてください".into());
+            }
+            opts.batch = Some(n);
+            continue;
+        }
         let mut value = || {
-            it.next()
+            let v = args
+                .get(i)
                 .cloned()
-                .ok_or_else(|| format!("{arg} の値がありません"))
+                .ok_or_else(|| format!("{arg} の値がありません"));
+            i += 1;
+            v
         };
         let num = |v: String| v.parse::<u64>().map_err(|e| format!("{arg}: {e}"));
         match arg.as_str() {
@@ -101,6 +135,9 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     if opts.min_ms > opts.max_ms {
         return Err("--min-ms は --max-ms 以下にしてください".into());
     }
+    if opts.batch.is_some() && opts.audio_minutes > 0 {
+        return Err("--batch と --audio-minutes は併せられません".into());
+    }
     Ok(opts)
 }
 
@@ -111,6 +148,9 @@ fn quiet() -> kura_core::library::EventSink {
 /// `edit crash-loop` の入口（親）。
 pub fn run(args: &[String]) -> Result<(), String> {
     let opts = parse(args)?;
+    if let Some(n) = opts.batch {
+        return batch::run(&opts, n);
+    }
     let started = Instant::now();
     let root = create_library(&opts.library, opts.audio_minutes)?;
     let log = log_path(&root);
@@ -123,6 +163,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
     };
     let span = max_ms - opts.min_ms + 1;
     let want_items = if opts.audio_minutes > 0 { 2 } else { 1 };
+    let frames = audio_frames(opts.audio_minutes);
+    let child_extra: Vec<String> = if frames > 0 {
+        vec!["--audio-frames".into(), frames.to_string()]
+    } else {
+        Vec::new()
+    };
     let mut runs = Vec::new();
     let mut mismatches = 0usize;
     let mut failed_before = (0i64, 0i64);
@@ -134,7 +180,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let exited_early = crash_once(
             &root,
             child_seed,
-            audio_frames(opts.audio_minutes),
+            &child_extra,
             Duration::from_millis(delay),
             &log,
         )?;
@@ -338,15 +384,15 @@ fn audio_frames(minutes: u64) -> u64 {
         .saturating_mul(u64::from(AUDIO_RATE))
 }
 
-/// 子を起こし（音声の長さ `audio_frames` を渡す。0 なら渡さない）、`delay` 待って SIGKILL する。子が先に終わっていれば、
-/// その終わり方を返す。
+/// 子を起こし（`extra` は子に足す引数：音声の長さ `--audio-frames n`、一括の `--batch`）、`delay` 待って SIGKILL する。子が
+/// 先に終わっていれば、その終わり方を返す。
 fn crash_once(
     root: &Path,
     seed: u64,
-    audio_frames: u64,
+    extra: &[String],
     delay: Duration,
     log: &Path,
-) -> Result<Option<String>, String> {
+) -> Result<Option<ExitStatus>, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let log = OpenOptions::new()
         .create(true)
@@ -358,10 +404,8 @@ fn crash_once(
     command
         .args(["edit", "crash-loop-child", "--library"])
         .arg(root)
-        .args(["--seed", &seed.to_string()]);
-    if audio_frames > 0 {
-        command.args(["--audio-frames", &audio_frames.to_string()]);
-    }
+        .args(["--seed", &seed.to_string()])
+        .args(extra);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(log)
@@ -370,7 +414,7 @@ fn crash_once(
         .map_err(|e| format!("子を起こせません: {e}"))?;
     std::thread::sleep(delay);
     if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-        return Ok(Some(status.to_string()));
+        return Ok(Some(status));
     }
     // Unix では SIGKILL（後始末をさせない）
     child.kill().map_err(|e| format!("子を落とせません: {e}"))?;
@@ -494,27 +538,8 @@ fn files_under(dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// ライブラリを開き直し、ジョブが動き終えるのを待って確かめる。
-fn verify(root: &Path) -> Result<Check, String> {
-    let session = LibrarySession::open(root, quiet(), crate::services())
-        .map_err(|e| format!("開き直せません: {e}"))?;
-    session.wait_ready();
-    // 開いたときの staging の掃除で、前の子の作業用の PCM も消えている（ジョブを動かす前に見る）
-    let mut work_pcm = Vec::new();
-    files_under(
-        &session.library().layout().staging_dir().join("pcm"),
-        &mut work_pcm,
-    );
-    let open = session
-        .integrity()
-        .map(|r| [r.missing_files, r.orphan_files, r.unreferenced_blobs])
-        .unwrap_or([u64::MAX; 3]);
-    if !session.jobs().wait_idle(SETTLE) {
-        return Err("開き直したあと、ジョブが動き終えません".into());
-    }
-    let lib = session.library();
-    let report = check_integrity(lib.db(), lib.layout(), 0, IntegrityDepth::Startup)
-        .map_err(|e| e.to_string())?;
+/// 台帳のどの行も、ファイルの中身が hash と同じか（違う・読めない行の文を返す）。
+fn blob_issues(lib: &Library) -> Result<Vec<String>, String> {
     let blobs: Vec<(Vec<u8>, String)> = lib
         .db()
         .read(|c| {
@@ -536,6 +561,31 @@ fn verify(root: &Path) -> Result<Check, String> {
             Err(e) => bad_blobs.push(format!("読めません：{}（{e}）", path.display())),
         }
     }
+    Ok(bad_blobs)
+}
+
+/// ライブラリを開き直し、ジョブが動き終えるのを待って確かめる。
+fn verify(root: &Path) -> Result<Check, String> {
+    let session = LibrarySession::open(root, quiet(), crate::services())
+        .map_err(|e| format!("開き直せません: {e}"))?;
+    session.wait_ready();
+    // 開いたときの staging の掃除で、前の子の作業用の PCM も消えている（ジョブを動かす前に見る）
+    let mut work_pcm = Vec::new();
+    files_under(
+        &session.library().layout().staging_dir().join("pcm"),
+        &mut work_pcm,
+    );
+    let open = session
+        .integrity()
+        .map(|r| [r.missing_files, r.orphan_files, r.unreferenced_blobs])
+        .unwrap_or([u64::MAX; 3]);
+    if !session.jobs().wait_idle(SETTLE) {
+        return Err("開き直したあと、ジョブが動き終えません".into());
+    }
+    let lib = session.library();
+    let report = check_integrity(lib.db(), lib.layout(), 0, IntegrityDepth::Startup)
+        .map_err(|e| e.to_string())?;
+    let bad_blobs = blob_issues(lib)?;
     let invariants = lib
         .db()
         .read(versions::check_invariants)
@@ -689,16 +739,20 @@ struct ChildArgs {
     seed: u64,
     /// 音声のアイテムの長さ（フレーム。親が渡す。0 は渡されていない）。
     audio_frames: u64,
+    /// 保存の代わりに一括加工を動かす（`--batch`。親の `--batch` のとき）。
+    batch: bool,
 }
 
 fn child_args(args: &[String]) -> Result<ChildArgs, String> {
     let mut library = None;
     let mut seed = 0u64;
     let mut audio_frames = 0u64;
+    let mut batch = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--library" => library = it.next().map(PathBuf::from),
+            "--batch" => batch = true,
             "--seed" => {
                 seed = it
                     .next()
@@ -715,21 +769,30 @@ fn child_args(args: &[String]) -> Result<ChildArgs, String> {
             other => return Err(format!("知らない引数 {other}")),
         }
     }
+    if batch && audio_frames > 0 {
+        return Err("--batch と --audio-frames は併せられません".into());
+    }
     Ok(ChildArgs {
         library: library.ok_or("--library がありません")?,
         seed,
         audio_frames,
+        batch,
     })
 }
 
 /// `edit crash-loop-child`（子）：保存を繰り返す（親が SIGKILL するまで）。GC の時計だけ 8 日進めて開く。音声のアイテムが
-/// あれば、画像と音声を交互に保存する（音声の長さは親が `--audio-frames` で渡す）。
+/// あれば、画像と音声を交互に保存する（音声の長さは親が `--audio-frames` で渡す）。`--batch` なら一括加工を動かす
+/// （[`batch::child`]）。
 pub fn child(args: &[String]) -> Result<(), String> {
     let ChildArgs {
         library,
         seed,
         audio_frames,
+        batch,
     } = child_args(args)?;
+    if batch {
+        return batch::child(&library, seed);
+    }
     let services = crate::services().with_gc_clock(GcClock::shifted(GC_SHIFT_MS));
     let session = LibrarySession::open(&library, quiet(), services)
         .map_err(|e| format!("開けません: {e}"))?;
@@ -844,6 +907,7 @@ mod tests {
                 library: PathBuf::from("/tmp/x.kuralib"),
                 seed: 7,
                 audio_frames: 15_876_000,
+                batch: false,
             }
         );
         assert_eq!(audio_frames(6), 15_876_000);
@@ -857,6 +921,39 @@ mod tests {
         ] {
             assert!(child_args(&args(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    /// `--batch` の件数は省ける（既定 1,000。次の引数が数でなければ件数として読まない）。0 件と、音声との併用は断る。子には
+    /// `--batch` だけを渡す。
+    #[test]
+    fn batch_takes_an_optional_count() {
+        let base = ["--library", "/tmp/x.kuralib"];
+        let with = |more: &[&str]| {
+            let mut list = base.to_vec();
+            list.extend_from_slice(more);
+            parse(&args(&list))
+        };
+        assert_eq!(with(&[]).unwrap().batch, None);
+        assert_eq!(with(&["--batch"]).unwrap().batch, Some(DEFAULT_BATCH_ITEMS));
+        let opts = with(&["--batch", "--runs", "3"]).unwrap();
+        assert_eq!((opts.batch, opts.runs), (Some(DEFAULT_BATCH_ITEMS), 3));
+        let opts = with(&["--batch", "100", "--max-ms", "900"]).unwrap();
+        assert_eq!((opts.batch, opts.max_ms), (Some(100), 900));
+        assert!(with(&["--batch", "0"]).is_err());
+        assert!(with(&["--batch", "5", "--audio-minutes", "1"]).is_err());
+        assert!(with(&["--runs"]).is_err());
+        let child = child_args(&args(&["--library", "/tmp/x.kuralib", "--batch"])).unwrap();
+        assert!(child.batch);
+        assert!(
+            child_args(&args(&[
+                "--library",
+                "/tmp/x.kuralib",
+                "--batch",
+                "--audio-frames",
+                "9"
+            ]))
+            .is_err()
+        );
     }
 
     /// 音声の文書の trim は、渡した長さの 1/4 までの位置から始まる（6 分なら 0.25 秒を大きく超える位置も出る）。

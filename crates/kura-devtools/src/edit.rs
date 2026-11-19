@@ -4,8 +4,8 @@
 //! - `edit caps`：今の環境で読める・書ける形式の表（固定の段・macOS・ffmpeg。docs/editing.md §9.3）を JSON で表示する
 //! - `edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>]`：
 //!   文書を当てて書き出し、値のダイジェスト・読み取りと書き出しの記録・警告を表示する
-//! - `edit crash-loop --library <新しい場所> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500]`：保存を繰り返す子を
-//!   SIGKILL しては開き直して確かめる（M12。`crate::crash_loop`。子は `edit crash-loop-child`）
+//! - `edit crash-loop --library <新しい場所> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--batch [N]]`：保存（`--batch`
+//!   なら一括加工。M14）を動かす子を SIGKILL しては開き直して確かめる（M12。`crate::crash_loop`。子は `edit crash-loop-child`）
 //!
 //! コーデックはアプリと同じ組（`crate::app_codecs`：固定の段 → macOS → ffmpeg。SVG は別のプロセスで読む）で選ぶ。
 
@@ -17,7 +17,7 @@ use kura_engine::doc::{DecodeOptions, InputId};
 use kura_engine::render::{Engine, InputValue};
 use kura_engine::{Digest, NoMonitor};
 
-const USAGE: &str = "使い方: kura-devtools edit shape --in <file> | edit caps | edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>] | edit crash-loop --library <新しい場所> [--runs 50] [--seed 1]";
+const USAGE: &str = "使い方: kura-devtools edit shape --in <file> | edit caps | edit render --doc <文書.json> --in <file> --out <file> [--format <形式>] [--options <JSON>] | edit crash-loop --library <新しい場所> [--runs 50] [--seed 1] [--batch [N]]";
 
 /// `edit` の入口。
 pub fn run(args: &[String]) -> Result<(), String> {
