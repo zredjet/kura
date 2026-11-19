@@ -50,7 +50,13 @@ pub(super) fn add_audio(lib: &Library, bytes: &[u8], ext: &str, title: &str) -> 
 }
 
 /// 8 kHz の雑音を `format` で書いたもの。
-fn noise_file(codecs: &CodecSet, format: &str, channels: u16, frames: u64, seed: u64) -> Vec<u8> {
+pub(super) fn noise_file(
+    codecs: &CodecSet,
+    format: &str,
+    channels: u16,
+    frames: u64,
+    seed: u64,
+) -> Vec<u8> {
     let v = InputGen::AudioNoise {
         rate: 8_000,
         channels,

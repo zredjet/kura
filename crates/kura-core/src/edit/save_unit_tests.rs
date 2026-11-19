@@ -10,7 +10,7 @@ use kura_engine::{Digest, Graph};
 use serde_json::{Value as Json, json};
 
 use super::save::{Committed, Flow, Mode, Record, Reverted, Saver, UnitCx};
-use super::save_stream_tests::{add_audio, audio_doc, opus_codecs, opus_decoder};
+use super::save_stream_tests::{add_audio, audio_doc, noise_file, opus_codecs, opus_decoder};
 use super::save_tests::{
     Env, add_item, assert_consistent, assert_done, base_of, doc, flip, gc_version, head,
     heic_codecs, heic_decoder, render_png, sprite, staged, versions_of,
@@ -390,42 +390,155 @@ fn a_batch_unit_commits_many_items_in_one_job() {
 
 /// トランザクション 2 は、この 1 件が書いた予告だけを消す：同じ持ち主の前の 1 件が消せずに残した予告（と置いたままの
 /// ファイル）は残り、開くときの照合が片付ける（ADR-192 (5)。まとめて消すと、照合が見つけられない孤立したファイルが残った）。
+/// 上書き・別名で保存・版に戻すの作り直しのどの道でも同じ。
 #[test]
 fn a_commit_clears_only_its_own_announcements() {
+    for path_kind in ["overwrite", "save-as", "rebuild"] {
+        let env = Env::new();
+        let (a, _, _) = env.png(30);
+        if path_kind == "rebuild" {
+            assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
+            assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
+            gc_version(&env, a, 1);
+        }
+        // 前の 1 件が置いたが、消せずに残したファイルと予告
+        let stray = sprite(31);
+        let stray_hash = *blake3::hash(&stray).as_bytes();
+        let path = env.lib.layout().content_path(&stray_hash, "png");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &stray).unwrap();
+        env.lib
+            .db()
+            .write(move |tx| {
+                crate::library::ledger::announce(
+                    tx,
+                    &stray_hash,
+                    "png",
+                    crate::library::ledger::PendingKind::Place,
+                    Some(9011),
+                    1,
+                )
+            })
+            .unwrap();
+        let saver = Saver::new(env.engine.clone());
+        let unit = TestUnit::batch(&env.lib, 9011, "9011-1");
+        let written = match path_kind {
+            "overwrite" => prepared(&saver, &unit, a, &doc(&[flip("vertical")], None)),
+            "save-as" => {
+                let root = put(&env.lib, &doc(&[flip("vertical")], None));
+                match saver
+                    .prepare(
+                        &unit,
+                        Mode::SaveAs,
+                        a,
+                        base_of(&env.lib, a),
+                        root,
+                        Some(("別名".into(), "alt".into())),
+                    )
+                    .unwrap()
+                {
+                    Flow::Go(w) => w,
+                    Flow::Stop(end) => panic!("止まりました：{end:?}"),
+                }
+            }
+            _ => {
+                let Reverted::Rebuild(plan) = saver
+                    .revert_reuse(&unit, a, base_of(&env.lib, a), 1, &record_to("test.unused"))
+                    .unwrap()
+                else {
+                    panic!("版 1 のファイルがないのに使い直しました");
+                };
+                match saver.prepare_rebuild(&unit, *plan).unwrap() {
+                    Flow::Go(w) => w,
+                    Flow::Stop(end) => panic!("止まりました：{end:?}"),
+                }
+            }
+        };
+        saver.commit(&unit, written, record_to("test.own")).unwrap();
+        // 前の 1 件の予告とファイルは残る
+        let left: Vec<Vec<u8>> = env
+            .lib
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT hash FROM ledger_pending")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                Ok(rows.collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        assert_eq!(left, vec![stray_hash.to_vec()], "{path_kind}");
+        assert!(path.exists(), "{path_kind}");
+        // 開くときの照合が、台帳にないファイルを消して予告を片付ける
+        crate::library::ledger::settle_pending(env.lib.db(), env.lib.layout()).unwrap();
+        assert!(!path.exists(), "{path_kind}");
+        assert_consistent(&env.lib);
+    }
+}
+
+/// 一括の場（版に持ち主を書かない）では、版に戻す（使い直す・作り直す）も、音声を流して書く保存も、同じジョブで別々の
+/// アイテムを何件もコミットでき、版の `job_id` は空（ADR-192 (1)）。
+#[test]
+fn a_batch_unit_reverts_and_streams_many_items_in_one_job() {
     let env = Env::new();
-    let (a, _, _) = env.png(30);
-    // 前の 1 件が置いたが、消せずに残したファイルと予告
-    let stray = sprite(31);
-    let stray_hash = *blake3::hash(&stray).as_bytes();
-    let path = env.lib.layout().content_path(&stray_hash, "png");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, &stray).unwrap();
-    env.lib
-        .db()
-        .write(move |tx| {
-            crate::library::ledger::announce(
-                tx,
-                &stray_hash,
-                "png",
-                crate::library::ledger::PendingKind::Place,
-                Some(9011),
-                1,
-            )
-        })
-        .unwrap();
     let saver = Saver::new(env.engine.clone());
-    let unit = TestUnit::batch(&env.lib, 9011, "9011-1");
-    let written = prepared(&saver, &unit, a, &doc(&[flip("vertical")], None));
-    saver.commit(&unit, written, record_to("test.own")).unwrap();
-    assert_eq!(
-        env.count("SELECT count(*) FROM ledger_pending"),
-        1,
-        "前の 1 件の予告は残る"
-    );
-    // 開くときの照合が、台帳にないファイルを消して予告を片付ける
-    crate::library::ledger::settle_pending(env.lib.db(), env.lib.layout()).unwrap();
-    assert!(!path.exists());
+    let items: Vec<i64> = (40..42).map(|k| env.png(k).0).collect();
+    for &a in &items {
+        assert_done(&env.overwrite(a, doc(&[flip("vertical")], None)));
+        assert_done(&env.overwrite(a, doc(&[flip("horizontal")], None)));
+        gc_version(&env, a, 1);
+    }
+    let unit = TestUnit::batch(&env.lib, 9040, "9040");
+    // 使い直す（元はいつも hold）
+    for &a in &items {
+        let Reverted::Committed(done) = saver
+            .revert_reuse(&unit, a, base_of(&env.lib, a), 0, &record_to_any())
+            .unwrap()
+        else {
+            panic!("元のファイルがあるのに作り直そうとしました");
+        };
+        assert_eq!(done.outcome["revert"]["reused"], true);
+    }
+    // 作り直す（版 1 のファイルは GC で消した）
+    for &a in &items {
+        let Reverted::Rebuild(plan) = saver
+            .revert_reuse(&unit, a, base_of(&env.lib, a), 1, &record_to_any())
+            .unwrap()
+        else {
+            panic!("版 1 のファイルがないのに使い直しました");
+        };
+        let written = match saver.prepare_rebuild(&unit, *plan).unwrap() {
+            Flow::Go(w) => w,
+            Flow::Stop(end) => panic!("止まりました：{end:?}"),
+        };
+        let done = saver.commit(&unit, written, record_to_any()).unwrap();
+        assert_eq!(done.outcome["revert"]["rebuilt"], true);
+    }
+    for &a in &items {
+        let vs = versions_of(&env.lib, a);
+        assert_eq!(vs.len(), 5);
+        assert_eq!((vs[3].job_id, vs[4].job_id), (None, None));
+    }
+    // 音声を流して書く（WAV → WAV）
+    let pinned = kura_engine::codec::CodecSet::pinned();
+    let audio: Vec<i64> = (0..2)
+        .map(|k| {
+            let bytes = noise_file(&pinned, "wav", 2, 9_000, 50 + k);
+            add_audio(&env.lib, &bytes, "wav", &format!("音{k}")).0
+        })
+        .collect();
+    for &b in &audio {
+        let written = prepared(&saver, &unit, b, &audio_doc(-2.0, None));
+        let done = saver.commit(&unit, written, record_to_any()).unwrap();
+        assert_eq!(done.saved, Some(MediaKind::Audio));
+    }
+    for &b in &audio {
+        assert_eq!(versions_of(&env.lib, b)[1].job_id, None);
+    }
     assert_consistent(&env.lib);
+}
+
+/// 何も書かない記録（コミットと同じトランザクションで呼ばれるだけ）。
+fn record_to_any() -> Record {
+    Arc::new(|_, _| Ok(()))
 }
 
 fn hash_of_png(png: &[u8], g: &Graph) -> [u8; 32] {
