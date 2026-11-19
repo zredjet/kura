@@ -6,11 +6,12 @@
 //! `batch://precheck`（呼び手の決めた `token` で見分ける。100 ms ごとと最後）、シートを閉じたら `batch_precheck_cancel` で止める
 //! （止めた事前チェックは kura-core の `Canceled`、IPC の code は `Conflict` を返す。エディタを開く途中の中止と同じ）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use kura_core::CoreError;
 use kura_core::edit::EngineServices;
 use kura_core::edit::batch::precheck::{
     BoundExample, DiskEstimate, Loss, LossGroup, OutputGroup, PrecheckGroup, ShapeChange, ShapeInfo,
@@ -33,9 +34,57 @@ use crate::state::AppState;
 /// 事前チェックの進みを送る間隔。
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
-/// 動いている事前チェックの中止の印（`token` ごと）。
-static PRECHECKS: LazyLock<Mutex<BTreeMap<String, Arc<AtomicBool>>>> =
-    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+/// 覚えておく先に届いた中止の数（始まらなかった token が積もらないように古いものから捨てる）。
+const EARLY_CANCELS: usize = 64;
+
+/// 動いている事前チェックの中止の印（`token` ごと）と、始まる前に届いた中止（Tauri の async のコマンドはタスクごとに動くので、
+/// `batch_precheck` が印を入れる前に `batch_precheck_cancel` が届きうる）。
+#[derive(Default)]
+struct Prechecks {
+    running: BTreeMap<String, Arc<AtomicBool>>,
+    early: VecDeque<String>,
+}
+
+impl Prechecks {
+    /// 事前チェック `token` を始める（先に中止が届いていれば Canceled、同じ token が動いていれば Busy）。
+    fn begin(&mut self, token: &str) -> Result<Arc<AtomicBool>, AppError> {
+        if let Some(pos) = self.early.iter().position(|t| t == token) {
+            self.early.remove(pos);
+            return Err(CoreError::Canceled.into());
+        }
+        if self.running.contains_key(token) {
+            return Err(AppError::new(
+                AppErrorCode::Busy,
+                "同じ事前チェックが動いています",
+            ));
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        self.running.insert(token.to_string(), flag.clone());
+        Ok(flag)
+    }
+
+    /// 事前チェック `token` を止める（まだ始まっていなければ覚えておく）。
+    fn cancel(&mut self, token: &str) {
+        match self.running.get(token) {
+            Some(flag) => flag.store(true, Ordering::Release),
+            None => {
+                if !self.early.iter().any(|t| t == token) {
+                    self.early.push_back(token.to_string());
+                }
+                while self.early.len() > EARLY_CANCELS {
+                    self.early.pop_front();
+                }
+            }
+        }
+    }
+
+    /// 事前チェック `token` が終わった。
+    fn end(&mut self, token: &str) {
+        self.running.remove(token);
+    }
+}
+
+static PRECHECKS: LazyLock<Mutex<Prechecks>> = LazyLock::new(|| Mutex::new(Prechecks::default()));
 
 /// 当てるレシピの出どころ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Type)]
@@ -220,7 +269,7 @@ impl From<OutputGroup> for OutputGroupDto {
 pub enum LossDto {
     /// 非可逆の形式に書く。
     Lossy,
-    /// 透明を持てない形式（透明な画素があれば書けずに失敗する）。
+    /// 透明を持てない形式（透明な画素・パレットの透明な色があれば書けずに失敗する）。
     Alpha,
     /// 半透明を持てない形式（GIF）。
     SemiAlpha,
@@ -228,7 +277,7 @@ pub enum LossDto {
     HighBits,
     /// 色の数に上限のある形式（減色する）。
     Colors { max: u32 },
-    /// ループ点を保存できない形式。
+    /// ファイルのループ点（解析の事実）を保存できない形式。
     LoopPoints,
     /// 上書きで大きさ・長さが変わり、素材の設定が合わなくなりうる。
     Settings,
@@ -309,10 +358,14 @@ impl From<BoundExample> for BoundExampleDto {
 #[derive(Debug, Clone, PartialEq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchPrecheckDto {
+    /// 確かめた件数（ライブラリにあるもの）。
     pub total: u64,
-    /// 当てる見込み（確かめられなかったものを含む）。
+    /// ライブラリにないアイテム（一括は行を入れない）。
+    pub missing: Vec<i64>,
+    /// 当てる見込み（確かめきれなかったものを含む）。
     pub apply: Vec<i64>,
     pub skips: Vec<PrecheckGroupDto>,
+    /// 当てる側に数えたが確かめきれなかったもの（Busy：形を読めなかった。NoLength：終わりからの秒の長さは当てるときに決まる）。
     pub unchecked: Vec<PrecheckGroupDto>,
     pub outputs: Vec<OutputGroupDto>,
     pub losses: Vec<LossGroupDto>,
@@ -329,6 +382,7 @@ impl From<Precheck> for BatchPrecheckDto {
     fn from(p: Precheck) -> Self {
         Self {
             total: p.total,
+            missing: p.missing,
             apply: p.apply,
             skips: p.skips.into_iter().map(Into::into).collect(),
             unchecked: p.unchecked.into_iter().map(Into::into).collect(),
@@ -477,44 +531,32 @@ pub async fn batch_precheck(
     request: BatchRequestDto,
 ) -> Result<BatchPrecheckDto, AppError> {
     let session = state.session()?;
-    let canceled = Arc::new(AtomicBool::new(false));
-    {
-        let mut running = PRECHECKS
-            .lock()
-            .map_err(|_| AppError::internal("事前チェックの錠が壊れました"))?;
-        if running.contains_key(&token) {
-            return Err(AppError::new(
-                AppErrorCode::Busy,
-                "同じ事前チェックが動いています",
-            ));
-        }
-        running.insert(token.clone(), canceled.clone());
-    }
+    let canceled = PRECHECKS
+        .lock()
+        .map_err(|_| AppError::internal("事前チェックの錠が壊れました"))?
+        .begin(&token)?;
     let key = token.clone();
     let result = blocking(move || {
         let engine = engine_of(&session)?;
-        let last = Mutex::new(None::<Instant>);
+        // 送るかを決めて送るまで錠を持つ（働き手が並べて呼ぶので、送る順を done の順にそろえる。最後の 1 件は必ず送る）
+        let last = Mutex::new((None::<Instant>, 0u64));
         let progress = |done: u64, total: u64| {
-            let due = match last.lock() {
-                Ok(mut at) => {
-                    let due =
-                        done == total || at.is_none_or(|t: Instant| t.elapsed() >= PROGRESS_EVERY);
-                    if due {
-                        *at = Some(Instant::now());
-                    }
-                    due
-                }
-                Err(_) => false,
+            let Ok(mut sent) = last.lock() else { return };
+            let (at, max) = *sent;
+            if done <= max {
+                return;
+            }
+            if done != total && at.is_some_and(|t: Instant| t.elapsed() < PROGRESS_EVERY) {
+                return;
+            }
+            *sent = (Some(Instant::now()), done);
+            let event = BatchPrecheckProgress {
+                token: token.clone(),
+                done,
+                total,
             };
-            if due {
-                let event = BatchPrecheckProgress {
-                    token: token.clone(),
-                    done,
-                    total,
-                };
-                if let Err(err) = tauri_specta::Event::emit(&event, &app) {
-                    tracing::warn!(%err, "事前チェックの進みを送れませんでした");
-                }
+            if let Err(err) = tauri_specta::Event::emit(&event, &app) {
+                tracing::warn!(%err, "事前チェックの進みを送れませんでした");
             }
         };
         let request: BatchRequest = request.into();
@@ -531,19 +573,17 @@ pub async fn batch_precheck(
     })
     .await;
     if let Ok(mut running) = PRECHECKS.lock() {
-        running.remove(&key);
+        running.end(&key);
     }
     result
 }
 
-/// 動いている事前チェック `token` を止める（なければ何もしない）。
+/// 事前チェック `token` を止める（まだ始まっていなければ覚えておき、始まったらすぐ code `Conflict` で返す）。
 #[tauri::command]
 #[specta::specta]
 pub async fn batch_precheck_cancel(token: String) -> Result<(), AppError> {
-    if let Ok(running) = PRECHECKS.lock()
-        && let Some(flag) = running.get(&token)
-    {
-        flag.store(true, Ordering::Release);
+    if let Ok(mut running) = PRECHECKS.lock() {
+        running.cancel(&token);
     }
     Ok(())
 }
@@ -624,4 +664,31 @@ pub async fn batch_undo(state: State<'_, AppState>, job: i64) -> Result<i64, App
         )?)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 始まる前に届いた中止は覚えておき、始まったらすぐ Canceled（code Conflict）。動いている間の中止は印を立てる。同じ
+    /// token は Busy、終われば同じ token で始め直せる。覚える中止は古いものから捨てる。
+    #[test]
+    fn prechecks_remember_early_cancels() {
+        let mut p = Prechecks::default();
+        p.cancel("a");
+        let early = p.begin("a").unwrap_err();
+        assert_eq!(early.code, AppErrorCode::Conflict);
+        let flag = p.begin("a").unwrap();
+        assert!(!flag.load(Ordering::Acquire));
+        assert_eq!(p.begin("a").unwrap_err().code, AppErrorCode::Busy);
+        p.cancel("a");
+        assert!(flag.load(Ordering::Acquire));
+        p.end("a");
+        assert!(p.begin("a").is_ok());
+        for k in 0..(EARLY_CANCELS + 5) {
+            p.cancel(&format!("t{k}"));
+        }
+        assert_eq!(p.early.len(), EARLY_CANCELS);
+        assert!(p.begin("t0").is_ok(), "古い中止は捨てた");
+    }
 }

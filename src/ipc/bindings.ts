@@ -358,7 +358,7 @@ export const commands = {
 	 *  `batch_precheck_cancel` で止めると code `Conflict`（kura-core の Canceled）。同じ `token` の事前チェックが動いていれば Busy。
 	 */
 	batchPrecheck: (token: string, request: BatchRequestDto) => typedError<BatchPrecheckDto, AppError>(__TAURI_INVOKE("batch_precheck", { token, request })),
-	/**  動いている事前チェック `token` を止める（なければ何もしない）。 */
+	/**  事前チェック `token` を止める（まだ始まっていなければ覚えておき、始まったらすぐ code `Conflict` で返す）。 */
 	batchPrecheckCancel: (token: string) => typedError<null, AppError>(__TAURI_INVOKE("batch_precheck_cancel", { token })),
 	/**
 	 *  一括のジョブを積む（ジョブの ID を返す）。レシピが読んだあとに変わったら Conflict、当てられないレシピ・対象がない・
@@ -726,10 +726,14 @@ export type BatchModeDto = { type: "overwrite" } |
 
 /**  事前チェックの結果（アイテムは ID の列だけ）。 */
 export type BatchPrecheckDto = {
+	/**  確かめた件数（ライブラリにあるもの）。 */
 	total: number,
-	/**  当てる見込み（確かめられなかったものを含む）。 */
+	/**  ライブラリにないアイテム（一括は行を入れない）。 */
+	missing: number[],
+	/**  当てる見込み（確かめきれなかったものを含む）。 */
 	apply: number[],
 	skips: PrecheckGroupDto[],
+	/**  当てる側に数えたが確かめきれなかったもの（Busy：形を読めなかった。NoLength：終わりからの秒の長さは当てるときに決まる）。 */
 	unchecked: PrecheckGroupDto[],
 	outputs: OutputGroupDto[],
 	losses: LossGroupDto[],
@@ -2213,7 +2217,7 @@ export type LoginShotEvent = {
 export type LossDto = 
 /**  非可逆の形式に書く。 */
 { type: "lossy" } | 
-/**  透明を持てない形式（透明な画素があれば書けずに失敗する）。 */
+/**  透明を持てない形式（透明な画素・パレットの透明な色があれば書けずに失敗する）。 */
 { type: "alpha" } | 
 /**  半透明を持てない形式（GIF）。 */
 { type: "semiAlpha" } | 
@@ -2221,7 +2225,7 @@ export type LossDto =
 { type: "highBits" } | 
 /**  色の数に上限のある形式（減色する）。 */
 { type: "colors"; max: number } | 
-/**  ループ点を保存できない形式。 */
+/**  ファイルのループ点（解析の事実）を保存できない形式。 */
 { type: "loopPoints" } | 
 /**  上書きで大きさ・長さが変わり、素材の設定が合わなくなりうる。 */
 { type: "settings" };
