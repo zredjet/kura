@@ -2,6 +2,7 @@
 //! Platform のデコーダ）と偽のエンジンの部品で、Linux でも回る。耐久は数える偽物（ファイルの同期は `sync_all`）で、区切りの
 //! 同期の回数を見る。どの試験も終わりに整合性・予告・staging・版の不変条件を確かめる。
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -17,13 +18,18 @@ use kura_engine::{Digest, EngineError, Graph, Limits, Monitor, NoMonitor, Shape}
 use rusqlite::params;
 use serde_json::{Value as Json, json};
 
-use super::batch::{BatchHandler, BatchMode, BatchRequest, pending_batch, start_batch};
+use super::GcHandler;
+use super::batch::precheck::{Loss, OutputGroup, ShapeInfo};
+use super::batch::{
+    BatchAction, BatchHandler, BatchMode, BatchRequest, Precheck, PrecheckCx, RecipeSource,
+    pending_batch, precheck, start_batch, start_undo,
+};
 use super::recipes::{self, EditorPick};
 use super::save::{EditHandler, Fault};
 use super::save_stream_tests::{add_audio, audio_doc, noise_file};
 use super::save_tests::{
-    WAIT, add_item, assert_consistent, count, doc, flip, hash_of, head, heic_codecs, heic_decoder,
-    render_png, sink, sprite, versions_of,
+    DAY, TestClock, WAIT, add_item, assert_consistent, count, doc, flip, hash_of, head,
+    heic_codecs, heic_decoder, render_png, sink, sprite, versions_of,
 };
 use super::services::fake::FakeEngineFactory;
 use super::services::{Durability, EngineFactory};
@@ -106,6 +112,8 @@ struct BatchEnv {
     jobs: Arc<JobManager>,
     durability: Arc<Counting>,
     codecs: Option<Arc<Mutex<CodecSet>>>,
+    /// GC の時計（[`BatchEnv::gc`] が 8 日進める）。
+    clock: TestClock,
 }
 
 impl BatchEnv {
@@ -201,10 +209,18 @@ impl BatchEnv {
             None => Arc::new(EditHandler::new(engine.clone())),
         };
         let events: Arc<Mutex<Vec<JobEvent>>> = Arc::default();
+        let clock = TestClock::default();
         let jobs = Arc::new(
             JobManager::new(
                 lib.clone(),
-                vec![(JobKind::Edit, edit), (JobKind::Batch, Arc::new(batch))],
+                vec![
+                    (JobKind::Edit, edit),
+                    (JobKind::Batch, Arc::new(batch)),
+                    (
+                        JobKind::Gc,
+                        Arc::new(GcHandler::new(engine.clone(), clock.gc())),
+                    ),
+                ],
                 sink(&events),
             )
             .unwrap(),
@@ -220,7 +236,17 @@ impl BatchEnv {
             jobs,
             durability,
             codecs,
+            clock,
         }
+    }
+
+    /// 8 日たったことにして GC を動かす。
+    fn gc(&self) {
+        self.clock.set(Some(crate::time::now_ms() + 8 * DAY));
+        let id = self.jobs.enqueue(JobKind::Gc, "{}".into()).unwrap();
+        assert!(self.jobs.wait_idle(WAIT));
+        self.clock.set(None);
+        assert_done(&self.jobs.get(id).unwrap());
     }
 
     fn png(&self, seed: u64) -> (i64, Vec<u8>) {
@@ -253,7 +279,7 @@ impl BatchEnv {
             &self.jobs,
             &self.engine,
             &BatchRequest {
-                recipe_id: recipe,
+                source: RecipeSource::Recipe(recipe),
                 items: items.to_vec(),
                 mode,
                 include_drafts,
@@ -1683,6 +1709,763 @@ fn a_recipe_changed_after_reading_is_noticed() {
         .unwrap();
     assert!(matches!(
         unchanged(&stored, &root),
+        Err(crate::CoreError::NotFound(_))
+    ));
+}
+
+// ---- 段 5：事前チェック・結果・元に戻す（C1〜C5・U1〜U4・R1。docs/editing.md §14.2）----
+
+/// 事前チェック（中止しない。進みは 1 件ごとに呼ばれ、最後は (total, total)）。
+fn precheck_of(
+    env: &BatchEnv,
+    source: RecipeSource,
+    items: &[i64],
+    mode: BatchMode,
+    include_drafts: bool,
+) -> Precheck {
+    let canceled = AtomicBool::new(false);
+    let calls = Mutex::new(Vec::new());
+    let progress = |n: u64, total: u64| calls.lock().unwrap().push((n, total));
+    let p = precheck(
+        &env.lib,
+        &env.engine,
+        &BatchRequest {
+            source,
+            items: items.to_vec(),
+            mode,
+            include_drafts,
+        },
+        &PrecheckCx {
+            canceled: &canceled,
+            progress: &progress,
+        },
+    )
+    .unwrap();
+    let calls = calls.into_inner().unwrap();
+    assert_eq!(calls.len() as u64, p.total);
+    if p.total > 0 {
+        assert!(calls.contains(&(p.total, p.total)), "{calls:?}");
+    }
+    p
+}
+
+/// 事前チェックの見込み（アイテム → (状態, code)）。当てる見込みは「当てる」。
+fn predicted(p: &Precheck) -> BTreeMap<i64, (String, Option<String>)> {
+    let mut out = BTreeMap::new();
+    for item in &p.apply {
+        out.insert(*item, ("当てる".to_string(), None));
+    }
+    for g in &p.skips {
+        for item in &g.items {
+            out.insert(*item, (g.state.clone(), Some(g.code.clone())));
+        }
+    }
+    out
+}
+
+/// 一括の行（アイテム → (状態, code)）。版を足した・同じ中身は「当てる」にまとめる。
+fn outcomes(env: &BatchEnv, job: i64) -> BTreeMap<i64, (String, Option<String>)> {
+    env.rows(job)
+        .into_iter()
+        .map(|r| {
+            let state = match r.1.as_str() {
+                "saved" | "unchanged" | "existing" => ("当てる".to_string(), None),
+                _ => (r.1, r.2),
+            };
+            (r.0, state)
+        })
+        .collect()
+}
+
+/// アイテムに格子の設定（セル `cell` 四方）を置く。
+fn grid_of(env: &BatchEnv, item: i64, cell: u32) {
+    env.lib
+        .db()
+        .write(move |tx| {
+            crate::asset::set_settings(
+                tx,
+                &[item],
+                &crate::asset::SettingsPatch {
+                    grid: Some(crate::asset::Change::Set(crate::asset::GridSetting {
+                        cell_w: cell,
+                        cell_h: cell,
+                        offset_x: 0,
+                        offset_y: 0,
+                        gap_x: 0,
+                        gap_y: 0,
+                        count: None,
+                    })),
+                    ..Default::default()
+                },
+                1,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// 上書きの保存（ジョブを待つ）。
+fn overwrite(env: &BatchEnv, item: i64, g: Graph) {
+    let h = head(&env.lib, item);
+    let job = super::save::start_save(
+        env.lib.db(),
+        &env.jobs,
+        &super::save::SaveRequest {
+            item_id: item,
+            base: super::save::Base {
+                hash: h.hash,
+                version: h.version,
+            },
+            action: super::save::SaveAction::Overwrite { graph: g },
+        },
+    )
+    .unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_done(&env.jobs.get(job).unwrap());
+}
+
+/// 下書きを置く（頭を土台に）。
+fn put_draft(env: &BatchEnv, item: i64) {
+    let h = head(&env.lib, item);
+    super::drafts::save(
+        env.lib.db(),
+        item,
+        &doc(&[flip("horizontal")], None),
+        super::save::Base {
+            hash: h.hash,
+            version: h.version,
+        },
+        None,
+    )
+    .unwrap();
+}
+
+fn trash(env: &BatchEnv, item: i64) {
+    env.lib
+        .db()
+        .write(move |tx| {
+            crate::items::trash(tx, &[item], 1)?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn undo_and_wait(env: &BatchEnv, of: i64) -> JobRecord {
+    let job = start_undo(env.lib.db(), &env.jobs, &env.engine, of).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    env.jobs.get(job).unwrap()
+}
+
+/// C1：事前チェックの見込みは、同じ頼みで一括を当てた行と同じになる（当てる・ゴミ箱・下書き・上書きで書けない形式（SVG）・
+/// 別名なら代わりの形式（PNG）・画像のレシピを音声に（NotApplicable）・元を読めない（MP3 の中身が Layer II）・音声のレシピを
+/// 画像に）。
+#[test]
+fn c1_the_precheck_predicts_the_rows() {
+    let env = BatchEnv::new();
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="6"><rect width="8" height="6" fill="red"/></svg>"#;
+    let (vector, _) = add_item(&env.lib, svg, "svg", "図");
+    let (layer2, _) = add_audio(&env.lib, &fixture("mp2-layer2.mp3"), "mp3", "古い曲");
+    let pinned = CodecSet::pinned();
+    let (sound, _) = add_audio(
+        &env.lib,
+        &noise_file(&pinned, "wav", 2, 4_000, 3),
+        "wav",
+        "音",
+    );
+    let (plain, _) = env.png(1);
+    let (trashed, _) = env.png(2);
+    let (drafted, _) = env.png(3);
+    trash(&env, trashed);
+    put_draft(&env, drafted);
+    let image = env.recipe("反転", &doc(&[flip("vertical")], None), Vec::new());
+    let mirror = env.recipe("左右", &doc(&[flip("horizontal")], None), Vec::new());
+    let audio = env.recipe("下げる", &audio_doc(-3.0, None), Vec::new());
+    let ids = [plain, trashed, drafted, vector, sound, layer2];
+    let save_as = BatchMode::SaveAs {
+        name: super::batch::DEFAULT_SAVE_AS_NAME.into(),
+    };
+    for (recipe, mode) in [
+        (image, BatchMode::Overwrite),
+        (mirror, save_as),
+        (audio, BatchMode::Overwrite),
+    ] {
+        let p = precheck_of(
+            &env,
+            RecipeSource::Recipe(recipe),
+            &ids,
+            mode.clone(),
+            false,
+        );
+        assert_eq!(p.total, ids.len() as u64);
+        let want = predicted(&p);
+        let record = env.run(recipe, &ids, mode.clone());
+        assert_done(&record);
+        assert_eq!(outcomes(&env, record.id), want, "{mode:?} {p:#?}");
+        if matches!(mode, BatchMode::SaveAs { .. }) {
+            // 別名は書けない形式を PNG で作る
+            let fallback: Vec<&OutputGroup> = p.outputs.iter().filter(|g| g.fallback).collect();
+            assert_eq!(fallback.len(), 1, "{p:#?}");
+            assert_eq!(
+                (fallback[0].format.as_str(), fallback[0].items.clone()),
+                ("png", vec![vector])
+            );
+        }
+    }
+    assert_consistent(&env.lib);
+}
+
+/// C2：出力の形（元 24×20 → 4 倍の 96×80、例と変わる件数）、失うもの（JPEG は非可逆・透明。上書きで大きさが変わり格子の
+/// 設定があれば素材の設定。別名は設定を写さないので出さない）、編集済みに継ぎ足すもの、ディスクの目安（元の大きさ × 値の比 16、
+/// 上書きは版 1 以上の今のファイルが置き換わる）、メモリの見積もり。透明のある絵は JPEG に書けずに失敗する（描かないので
+/// 「透明」は書けないかもしれないという見込み）。PNG なら当てると見込みの大きさになる。
+#[test]
+fn c2_the_precheck_reports_shapes_losses_and_disk() {
+    let env = BatchEnv::new();
+    let (a, png_a) = env.png(1);
+    let (b, png_b) = env.png(2);
+    overwrite(&env, b, doc(&[flip("horizontal")], None));
+    grid_of(&env, a, 4);
+    let g = doc(
+        &[(
+            "image.resize",
+            json!({ "width": { "scale": { "num": 4, "den": 1 } }, "height": "auto", "filter": "nearest" }),
+        )],
+        Some("jpeg"),
+    );
+    let recipe = env.recipe("4 倍の JPEG", &g, Vec::new());
+    let p = precheck_of(
+        &env,
+        RecipeSource::Recipe(recipe),
+        &[a, b],
+        BatchMode::Overwrite,
+        false,
+    );
+    assert_eq!(p.apply, vec![a, b]);
+    assert!(p.skips.is_empty() && p.unchecked.is_empty(), "{p:#?}");
+    assert_eq!(p.composed, vec![b]);
+    assert_eq!(p.outputs.len(), 1);
+    let out = &p.outputs[0];
+    assert_eq!(
+        (
+            out.format.as_str(),
+            out.fallback,
+            out.items.clone(),
+            out.resized
+        ),
+        ("jpeg", false, vec![a, b], 2)
+    );
+    assert_eq!(
+        (out.examples[0].from, out.examples[0].to),
+        (
+            ShapeInfo::Image {
+                w: Some(24),
+                h: Some(20),
+                frames: None
+            },
+            ShapeInfo::Image {
+                w: Some(96),
+                h: Some(80),
+                frames: None
+            }
+        )
+    );
+    let losses: Vec<(Loss, String, Vec<i64>)> = p
+        .losses
+        .iter()
+        .map(|l| (l.loss, l.format.clone(), l.items.clone()))
+        .collect();
+    assert_eq!(
+        losses,
+        vec![
+            (Loss::Lossy, "jpeg".into(), vec![a, b]),
+            (Loss::Alpha, "jpeg".into(), vec![a, b]),
+            (Loss::Settings, String::new(), vec![a]),
+        ]
+    );
+    assert_eq!(
+        p.disk.new_bytes,
+        (png_a.len() + png_b.len()) as u64 * 16,
+        "{p:#?}"
+    );
+    let current_b = versions_of(&env.lib, b)[1].size_bytes as u64;
+    assert_eq!(p.disk.replaced_bytes, current_b);
+    assert!(p.memory_peak > 0 && p.memory_peak <= p.memory_budget);
+    // 別名：素材の設定は写さない・置き換えない
+    let p = precheck_of(
+        &env,
+        RecipeSource::Recipe(recipe),
+        &[a, b],
+        BatchMode::SaveAs {
+            name: super::batch::DEFAULT_SAVE_AS_NAME.into(),
+        },
+        false,
+    );
+    assert!(p.losses.iter().all(|l| l.loss != Loss::Settings), "{p:#?}");
+    assert_eq!(p.disk.replaced_bytes, 0);
+    // 透明のあるドット絵は JPEG に書けずに失敗する（失うものの「透明」）。PNG なら当てると見込みの大きさになる
+    let record = env.run(recipe, &[a], BatchMode::Overwrite);
+    assert_eq!(
+        outcomes(&env, record.id)[&a],
+        ("failed".into(), Some("Unsupported".into()))
+    );
+    let mut g = g;
+    g.outputs[0].format = FormatChoice::Keep;
+    let png = env.recipe("4 倍", &g, Vec::new());
+    let record = env.run(png, &[a], BatchMode::Overwrite);
+    assert_eq!(env.rows(record.id)[0].1, "saved");
+    let size: (i64, i64) = env
+        .lib
+        .db()
+        .read(|c| {
+            Ok(
+                c.query_row("SELECT width, height FROM items WHERE id = ?1", [a], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?,
+            )
+        })
+        .unwrap();
+    assert_eq!(size, (96, 80));
+    assert_consistent(&env.lib);
+}
+
+/// C3：結び付け。値のないアイテムは一括と同じ理由で飛ばす見込みにし、読む値の例を出す。終わりからの秒で長さが見出しで決まらない
+/// MP3 は「確かめられなかった」（NoLength）にして当てる側に数える（当てると版ができる）。
+#[test]
+fn c3_bindings_in_the_precheck() {
+    let env = BatchEnv::new();
+    let mut g = Graph::new_single();
+    g.push_linear(
+        "sprite.split_grid",
+        1,
+        json!({ "grid": { "cellW": 8, "cellH": 8, "offsetX": 0, "offsetY": 0, "gapX": 0, "gapY": 0 },
+                "durationMs": 100, "skipEmpty": false }),
+        0,
+    )
+    .unwrap();
+    g.push_linear(
+        "sprite.pack_grid",
+        1,
+        json!({ "columns": 1, "gapX": 0, "gapY": 0, "fill": null }),
+        0,
+    )
+    .unwrap();
+    let bind = Binding {
+        node: NodeId(1),
+        param: "grid".into(),
+        part: None,
+        from: Source::Setting {
+            key: SettingKey::Grid,
+        },
+    };
+    let recipe = env.recipe("並べ直す", &g, vec![bind]);
+    let (with, _) = env.png(7);
+    let (without, _) = env.png(8);
+    grid_of(&env, with, 4);
+    let p = precheck_of(
+        &env,
+        RecipeSource::Recipe(recipe),
+        &[with, without],
+        BatchMode::Overwrite,
+        false,
+    );
+    assert_eq!(p.apply, vec![with]);
+    assert_eq!(p.skips.len(), 1, "{p:#?}");
+    assert_eq!(
+        (
+            p.skips[0].state.as_str(),
+            p.skips[0].code.as_str(),
+            p.skips[0].items.clone()
+        ),
+        ("skipped", "NotApplicable", vec![without])
+    );
+    assert_eq!(p.bound.len(), 1);
+    assert_eq!(p.bound[0].item_id, with);
+    assert!(
+        p.bound[0].bound.to_string().contains("grid"),
+        "{:?}",
+        p.bound
+    );
+    let message = p.skips[0].message.clone();
+    let record = env.run(recipe, &[with, without], BatchMode::Overwrite);
+    let rows = super::batch::rows(env.lib.db(), record.id, Some("skipped"), None, 0, 10).unwrap();
+    assert_eq!(rows[0].message.as_deref(), Some(message.as_str()));
+    // 終わりからの秒（MP3）
+    let (song, _) = add_audio(&env.lib, &fixture("mp3-lame.mp3"), "mp3", "曲");
+    let mut g = Graph::new_single();
+    g.push_linear("audio.trim", 1, json!({ "start": 0, "end": null }), 0)
+        .unwrap();
+    g.outputs[0].format = FormatChoice::To {
+        format: "wav".into(),
+        options: json!({}),
+    };
+    let bind = Binding {
+        node: NodeId(1),
+        param: "end".into(),
+        part: None,
+        from: Source::Time {
+            ms: 250,
+            anchor: TimeAnchor::End,
+        },
+    };
+    let trim = env.recipe("終わりを切る", &g, vec![bind]);
+    let p = precheck_of(
+        &env,
+        RecipeSource::Recipe(trim),
+        &[song],
+        BatchMode::Overwrite,
+        false,
+    );
+    assert_eq!(p.apply, vec![song]);
+    assert_eq!(p.unchecked.len(), 1);
+    assert_eq!(
+        (p.unchecked[0].code.as_str(), p.unchecked[0].items.clone()),
+        ("NoLength", vec![song])
+    );
+    let record = env.run(trim, &[song], BatchMode::Overwrite);
+    assert_eq!(env.rows(record.id)[0].1, "saved");
+    assert_consistent(&env.lib);
+}
+
+/// C4：事前チェックは中止できる（始める前・途中）。別名の名前の型が空・元に戻した一括の写しは Invalid。
+#[test]
+fn c4_the_precheck_can_be_canceled() {
+    let env = BatchEnv::new();
+    let recipe = env.recipe("反転", &doc(&[flip("vertical")], None), Vec::new());
+    let ids: Vec<i64> = (1..=6).map(|k| env.png(k).0).collect();
+    let req = |mode: BatchMode| BatchRequest {
+        source: RecipeSource::Recipe(recipe),
+        items: ids.clone(),
+        mode,
+        include_drafts: false,
+    };
+    let canceled = AtomicBool::new(true);
+    let progress = |_: u64, _: u64| {};
+    let got = precheck(
+        &env.lib,
+        &env.engine,
+        &req(BatchMode::Overwrite),
+        &PrecheckCx {
+            canceled: &canceled,
+            progress: &progress,
+        },
+    );
+    assert!(matches!(got, Err(crate::CoreError::Canceled)), "{got:?}");
+    let canceled = AtomicBool::new(false);
+    let progress = |n: u64, _: u64| {
+        if n >= 2 {
+            canceled.store(true, Ordering::SeqCst);
+        }
+    };
+    let got = precheck(
+        &env.lib,
+        &env.engine,
+        &req(BatchMode::Overwrite),
+        &PrecheckCx {
+            canceled: &canceled,
+            progress: &progress,
+        },
+    );
+    assert!(matches!(got, Err(crate::CoreError::Canceled)), "{got:?}");
+    let canceled = AtomicBool::new(false);
+    let progress = |_: u64, _: u64| {};
+    let got = precheck(
+        &env.lib,
+        &env.engine,
+        &req(BatchMode::SaveAs { name: "  ".into() }),
+        &PrecheckCx {
+            canceled: &canceled,
+            progress: &progress,
+        },
+    );
+    assert!(matches!(got, Err(crate::CoreError::Invalid(_))), "{got:?}");
+    let record = env.run(recipe, &ids[..1], BatchMode::Overwrite);
+    let undo = undo_and_wait(&env, record.id);
+    assert_done(&undo);
+    let got = precheck(
+        &env.lib,
+        &env.engine,
+        &BatchRequest {
+            source: RecipeSource::Job(undo.id),
+            ..req(BatchMode::Overwrite)
+        },
+        &PrecheckCx {
+            canceled: &canceled,
+            progress: &progress,
+        },
+    );
+    assert!(matches!(got, Err(crate::CoreError::Invalid(_))), "{got:?}");
+    assert_consistent(&env.lib);
+}
+
+/// C5：［やり直す］は一括の写しで当てる（レシピを消したあとも、その一括と同じ文書で当たる）。元に戻した一括の写しは Invalid。
+#[test]
+fn c5_retrying_uses_the_copy_of_the_batch() {
+    let env = BatchEnv::new();
+    let g = doc(&[flip("vertical")], None);
+    let recipe = env.recipe("反転", &g, Vec::new());
+    let (a, _) = env.png(1);
+    let (b, png_b) = env.png(2);
+    trash(&env, b);
+    let record = env.run(recipe, &[a, b], BatchMode::Overwrite);
+    assert_eq!(
+        outcomes(&env, record.id)[&b],
+        ("skipped".into(), Some("Trashed".into()))
+    );
+    env.lib
+        .db()
+        .write(move |tx| {
+            recipes::delete(tx, recipe)?;
+            crate::items::restore(tx, &[b], 2)?;
+            Ok(())
+        })
+        .unwrap();
+    let p = precheck_of(
+        &env,
+        RecipeSource::Job(record.id),
+        &[b],
+        BatchMode::Overwrite,
+        false,
+    );
+    assert_eq!(p.apply, vec![b]);
+    let retry = start_batch(
+        env.lib.db(),
+        &env.jobs,
+        &env.engine,
+        &BatchRequest {
+            source: RecipeSource::Job(record.id),
+            items: vec![b],
+            mode: BatchMode::Overwrite,
+            include_drafts: false,
+        },
+    )
+    .unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_done(&env.jobs.get(retry).unwrap());
+    assert_eq!(head(&env.lib, b).hash, hash_of(&render_png(&png_b, &g)));
+    let rec = versions_of(&env.lib, b)[1].record().unwrap();
+    assert_eq!(rec.batch.unwrap()["recipe"]["name"], "反転");
+    // 元に戻した一括の写しはやり直せない
+    let undo = undo_and_wait(&env, retry);
+    let got = start_batch(
+        env.lib.db(),
+        &env.jobs,
+        &env.engine,
+        &BatchRequest {
+            source: RecipeSource::Job(undo.id),
+            items: vec![a],
+            mode: BatchMode::Overwrite,
+            include_drafts: false,
+        },
+    );
+    assert!(matches!(got, Err(crate::CoreError::Invalid(_))), "{got:?}");
+    assert_consistent(&env.lib);
+}
+
+/// U1：上書きの一括を元に戻すと、一括の前の版（版 0 と、編集済みなら版 1）の中身に戻る（版 kind = revert・revert_to・行の
+/// version_id が戻した版）。一括のあとに保存したアイテムは Changed、下書きのあるアイテムは Draft で飛ばす。結果に戻した一括が
+/// 載り、戻す一括そのものは戻せず、戻し終えたものは次の［元に戻す…］に入らない。
+#[test]
+fn u1_undoing_an_overwrite_batch_restores_the_previous_versions() {
+    let env = BatchEnv::new();
+    let (a, png_a) = env.png(1);
+    let (b, _) = env.png(2);
+    let (c, _) = env.png(3);
+    let (d, png_d) = env.png(4);
+    let h1 = doc(&[flip("horizontal")], None);
+    overwrite(&env, d, h1.clone());
+    let recipe = env.recipe("反転", &doc(&[flip("vertical")], None), Vec::new());
+    let record = env.run(recipe, &[a, b, c, d], BatchMode::Overwrite);
+    assert_done(&record);
+    overwrite(&env, b, doc(&[flip("horizontal")], None));
+    put_draft(&env, c);
+    let undo = undo_and_wait(&env, record.id);
+    assert_done(&undo);
+    let got: Vec<(i64, String, Option<String>)> = env
+        .rows(undo.id)
+        .into_iter()
+        .map(|r| (r.0, r.1, r.2))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (a, "saved".into(), None),
+            (b, "skipped".into(), Some("Changed".into())),
+            (c, "skipped".into(), Some("Draft".into())),
+            (d, "saved".into(), None),
+        ]
+    );
+    assert_eq!(head(&env.lib, a).hash, hash_of(&png_a));
+    assert_eq!(head(&env.lib, d).hash, hash_of(&render_png(&png_d, &h1)));
+    let va = versions_of(&env.lib, a);
+    assert_eq!(
+        (va[2].kind.as_str(), va[2].revert_to, va[2].job_id),
+        ("revert", Some(0), None)
+    );
+    assert_eq!(env.rows(undo.id)[0].3, Some(va[2].id));
+    let vd = versions_of(&env.lib, d);
+    assert_eq!((vd[3].kind.as_str(), vd[3].revert_to), ("revert", Some(1)));
+    // 結果：戻した一括と、まだ戻していない件数（b・c）
+    let result = super::batch::result(env.lib.db(), record.id).unwrap();
+    assert_eq!(result.undo.by, vec![undo.id]);
+    assert_eq!(result.undo.available, 2);
+    let back = super::batch::result(env.lib.db(), undo.id).unwrap();
+    assert_eq!(
+        back.action,
+        BatchAction::Undo {
+            of: record.id,
+            save_as: false
+        }
+    );
+    assert_eq!(back.undo.available, 0);
+    // 戻す一括は戻せない。もう一度戻すと、戻し終えた a・d は入らない
+    assert!(matches!(
+        start_undo(env.lib.db(), &env.jobs, &env.engine, undo.id),
+        Err(crate::CoreError::Invalid(_))
+    ));
+    super::drafts::discard(env.lib.db(), c).unwrap();
+    let again = undo_and_wait(&env, record.id);
+    let items: Vec<i64> = env.rows(again.id).into_iter().map(|r| r.0).collect();
+    assert_eq!(items, vec![b, c]);
+    assert_eq!(env.rows(again.id)[1].1, "saved");
+    assert_consistent(&env.lib);
+}
+
+/// U2：別名の一括を元に戻すと、作ったアイテムのうち未編集のものをゴミ箱へ入れる（元は変えない）。作ったあとに保存したものは
+/// Changed。
+#[test]
+fn u2_undoing_a_save_as_batch_trashes_the_copies() {
+    let env = BatchEnv::new();
+    let (a, _) = env.png(1);
+    let (b, _) = env.png(2);
+    let recipe = env.recipe("反転", &doc(&[flip("vertical")], None), Vec::new());
+    let record = env.run(
+        recipe,
+        &[a, b],
+        BatchMode::SaveAs {
+            name: super::batch::DEFAULT_SAVE_AS_NAME.into(),
+        },
+    );
+    assert_done(&record);
+    let result = super::batch::result(env.lib.db(), record.id).unwrap();
+    assert_eq!(result.created.len(), 2);
+    let (ca, cb) = (result.created[0], result.created[1]);
+    overwrite(&env, cb, doc(&[flip("horizontal")], None));
+    let undo = undo_and_wait(&env, record.id);
+    assert_done(&undo);
+    let got: Vec<(i64, String, Option<String>)> = env
+        .rows(undo.id)
+        .into_iter()
+        .map(|r| (r.0, r.1, r.2))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (ca, "saved".into(), None),
+            (cb, "skipped".into(), Some("Changed".into())),
+        ]
+    );
+    assert!(head(&env.lib, ca).trashed);
+    assert!(!head(&env.lib, cb).trashed);
+    for item in [a, b] {
+        assert!(!head(&env.lib, item).trashed);
+        assert!(versions_of(&env.lib, item).is_empty(), "元は変えない");
+    }
+    assert_consistent(&env.lib);
+}
+
+/// U3：元に戻すのは一括が終わってから（待ちのままなら Busy）。ないジョブは NotFound。
+#[test]
+fn u3_undo_waits_for_the_batch_to_finish() {
+    let env = BatchEnv::with(None, None, false);
+    let recipe = env.recipe("反転", &doc(&[flip("vertical")], None), Vec::new());
+    let (a, _) = env.png(1);
+    let job = env.start(recipe, &[a], BatchMode::Overwrite, false);
+    assert!(matches!(
+        start_undo(env.lib.db(), &env.jobs, &env.engine, job),
+        Err(crate::CoreError::Busy(_))
+    ));
+    assert!(matches!(
+        start_undo(env.lib.db(), &env.jobs, &env.engine, job + 100),
+        Err(crate::CoreError::NotFound(_))
+    ));
+    env.jobs.start().unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    let undo = undo_and_wait(&env, job);
+    assert_done(&undo);
+    assert_eq!(env.rows(undo.id)[0].1, "saved");
+    assert_consistent(&env.lib);
+}
+
+/// U4：戻す先の版のファイルが GC で消えていても、文書と入力の記録から作り直して戻す（同じバイト列）。
+#[test]
+fn u4_undo_rebuilds_a_collected_version() {
+    let env = BatchEnv::new();
+    let (a, png) = env.png(5);
+    let h1 = doc(&[flip("horizontal")], None);
+    overwrite(&env, a, h1.clone());
+    let v1 = versions_of(&env.lib, a)[1].clone();
+    let path1 = env.lib.layout().content_path(&v1.output_hash, "png");
+    let recipe = env.recipe("反転", &doc(&[flip("vertical")], None), Vec::new());
+    let record = env.run(recipe, &[a], BatchMode::Overwrite);
+    assert_done(&record);
+    env.gc();
+    assert!(!path1.exists(), "版 1 のファイルは片付けた");
+    let undo = undo_and_wait(&env, record.id);
+    assert_done(&undo);
+    assert_eq!(env.rows(undo.id)[0].1, "saved");
+    assert_eq!(head(&env.lib, a).hash, v1.output_hash);
+    assert_eq!(std::fs::read(&path1).unwrap(), render_png(&png, &h1));
+    let v3 = versions_of(&env.lib, a)[3].clone();
+    assert_eq!((v3.kind.as_str(), v3.revert_to), ("revert", Some(1)));
+    assert_eq!(v3.record().unwrap().revert.map(|r| r.rebuilt), Some(true));
+    assert_consistent(&env.lib);
+}
+
+/// R1：結果は状態と理由ごとの群（状態の並び、アイテムは行の順）と、1 件ずつの行（状態・理由で絞り、ずらして取る）。
+#[test]
+fn r1_results_group_rows_by_state_and_code() {
+    let env = BatchEnv::new();
+    let recipe = env.recipe("反転", &doc(&[flip("vertical")], None), Vec::new());
+    let (a, _) = env.png(1);
+    let (t, _) = env.png(2);
+    let (b, _) = env.png(3);
+    trash(&env, t);
+    let record = env.run(recipe, &[a, t, b], BatchMode::Overwrite);
+    let result = super::batch::result(env.lib.db(), record.id).unwrap();
+    assert_eq!(result.state, JobState::Done);
+    assert_eq!(result.action, BatchAction::Overwrite);
+    assert_eq!(result.recipe.as_deref(), Some("反転"));
+    assert_eq!(result.total, 3);
+    let groups: Vec<(String, Option<String>, Vec<i64>)> = result
+        .groups
+        .iter()
+        .map(|g| (g.state.clone(), g.code.clone(), g.items.clone()))
+        .collect();
+    assert_eq!(
+        groups,
+        vec![
+            ("saved".into(), None, vec![a, b]),
+            ("skipped".into(), Some("Trashed".into()), vec![t]),
+        ]
+    );
+    assert!(result.created.is_empty());
+    assert_eq!(result.undo.available, 2);
+    let skipped = super::batch::rows(
+        env.lib.db(),
+        record.id,
+        Some("skipped"),
+        Some("Trashed"),
+        0,
+        10,
+    )
+    .unwrap();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].item_id, t);
+    assert!(skipped[0].message.is_some());
+    let second = super::batch::rows(env.lib.db(), record.id, None, None, 1, 1).unwrap();
+    assert_eq!((second.len(), second[0].ord, second[0].item_id), (1, 1, t));
+    assert!(matches!(
+        super::batch::result(env.lib.db(), record.id + 100),
         Err(crate::CoreError::NotFound(_))
     ));
 }

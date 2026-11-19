@@ -66,6 +66,14 @@ use crate::text::nfc;
 use crate::time::now_ms;
 use crate::{CoreError, Result};
 
+pub mod precheck;
+pub mod results;
+pub mod undo;
+
+pub use precheck::{Precheck, PrecheckCx, precheck};
+pub use results::{BatchAction, BatchResult, BatchRow, result, rows};
+pub use undo::start_undo;
+
 /// ジョブの入力の形の版。
 const INPUT_V: u32 = 1;
 /// 区切りの同期を取るまとまりの件数（ADR-190 (2) の「数十件ごと」。ADR-193）。
@@ -86,10 +94,20 @@ pub enum BatchMode {
     SaveAs { name: String },
 }
 
-/// 一括の頼み（[`start_batch`]）。
+/// 当てるレシピの出どころ（[`BatchRequest::source`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipeSource {
+    /// レシピの表（`edit_recipes`）のレシピ。
+    Recipe(i64),
+    /// 一括のジョブを積んだときのレシピの写し（結果のシートの［やり直す］。レシピをあとで直した・消しても、その一括と同じ
+    /// 文書と結び付けで当てる。M14 段 5）。
+    Job(JobId),
+}
+
+/// 一括の頼み（[`start_batch`]・[`precheck::precheck`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchRequest {
-    pub recipe_id: i64,
+    pub source: RecipeSource,
     /// 当てるアイテム（選んだ順。重なりは前のものだけ残す）。
     pub items: Vec<i64>,
     pub mode: BatchMode,
@@ -101,7 +119,9 @@ pub struct BatchRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct BatchInput {
     v: u32,
-    recipe: RecipeInput,
+    /// 当てるレシピの写し（元に戻す一括は持たない）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recipe: Option<RecipeInput>,
     mode: ModeInput,
     #[serde(default)]
     include_drafts: bool,
@@ -126,16 +146,148 @@ struct RecipeInput {
 )]
 enum ModeInput {
     Overwrite,
-    SaveAs { name: String },
+    SaveAs {
+        name: String,
+    },
+    /// 一括の［元に戻す…］（M14 段 5。[`undo`]）：一括 `of` の前の版へ戻す（上書き）、作ったアイテムをゴミ箱へ（別名）。
+    Undo {
+        of: JobId,
+        save_as: bool,
+    },
 }
 
-/// 一括のジョブを積む。レシピ（`edit_recipes`）を確かめて、文書の根と結び付けを入力に写し、同じトランザクションで対象の行を
-/// 選んだ順に入れる（ないアイテムは入れない）。エディタで開いているアイテムは、積んだ時点で `skipped`（Open）にする（開いている
-/// 間に保存できるように。あとから開こうとするアイテムは、一括が済むまで開かない：[`super::save::pending_save`]）。レシピに
-/// 当てられない理由がある・N → 1 のレシピ・対象がない・別名の名前の型が空なら Invalid。読んでから積むまでにレシピが差し替え・
-/// 名前を変える・消すで変わったら Conflict・NotFound（積むトランザクションの中で照らす。入力の写しが古い結び付けと新しい文書の
-/// 組にならず、文書の根が片付けられる前に根になる）。開いているアイテムは、エディタの置き場の錠を持ったまま読んで行を入れる
-/// （開く途中のエディタと重ならない。エディタは置いたあとに確かめ直す。M14 段 4 の検証の直し）。
+/// 出どころから読んだレシピ（積む・事前チェックが使う）。
+pub(crate) struct Resolved {
+    pub(crate) recipe: Recipe,
+    /// 文書の根。
+    pub(crate) doc: Digest,
+    /// 今の版でない操作のノードの印（docs/editing.md §8.4）。
+    pub(crate) notes: Vec<kura_engine::recipe::RecipeNote>,
+    /// 積むトランザクションの中で照らすもの。
+    recheck: Recheck,
+}
+
+/// 積むトランザクションの中で照らすもの。
+enum Recheck {
+    /// レシピが読んだときから変わっていない（[`recipes::unchanged`]）。
+    Recipe {
+        id: i64,
+        stored: Box<recipes::StoredRecipe>,
+    },
+    /// 写しの文書の根がまだある（終わった一括の写しは GC の根でないので、レシピを消したあとは片付けられうる）。
+    Copy,
+}
+
+/// レシピの出どころを読む：レシピの表なら確かめて写し、一括の写しならその文書と結び付けを読んで確かめる。当てられない理由が
+/// ある・N → 1 のレシピ・元に戻す一括は Invalid、ないものは NotFound。
+pub(crate) fn resolve(db: &Db, runtime: &EngineRuntime, source: RecipeSource) -> Result<Resolved> {
+    match source {
+        RecipeSource::Recipe(id) => {
+            let stored = recipes::get(db, runtime, id)?;
+            if let Some(why) = &stored.problem {
+                return Err(CoreError::Invalid(format!(
+                    "このレシピは当てられません：{why}"
+                )));
+            }
+            if stored.recipe.kind != RecipeKind::Each {
+                return Err(CoreError::Invalid(
+                    "まとめて 1 つにするレシピは、1 件ずつの一括では当てられません".into(),
+                ));
+            }
+            let doc = db.read(|c| recipes::doc_root(c, id))?;
+            Ok(Resolved {
+                recipe: stored.recipe.clone(),
+                doc,
+                notes: stored.notes.clone(),
+                recheck: Recheck::Recipe {
+                    id,
+                    stored: Box::new(stored),
+                },
+            })
+        }
+        RecipeSource::Job(of) => {
+            let input = input_of(db, of)?;
+            let Some(copy) = input.recipe else {
+                return Err(CoreError::Invalid(
+                    "元に戻した一括は、やり直せません".into(),
+                ));
+            };
+            let recipe = load_copy(db, &copy)?;
+            let notes = runtime
+                .bulk(|e| e.check_recipe(&recipe))
+                .map_err(|e| from_engine("このレシピは当てられません", e))?;
+            Ok(Resolved {
+                recipe,
+                doc: copy.doc,
+                notes,
+                recheck: Recheck::Copy,
+            })
+        }
+    }
+}
+
+/// 一括のジョブ `job` の入力（ないジョブは NotFound、一括でなければ Invalid）。
+fn input_of(db: &Db, job: JobId) -> Result<BatchInput> {
+    let (kind, input_json): (String, String) = db
+        .read(|c| {
+            Ok(
+                c.prepare_cached("SELECT kind, input_json FROM jobs WHERE id = ?1")?
+                    .query_row([job], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?,
+            )
+        })?
+        .ok_or_else(|| CoreError::NotFound(format!("ジョブ {job}")))?;
+    if kind != JobKind::Batch.as_str() {
+        return Err(CoreError::Invalid(format!(
+            "ジョブ {job} は一括加工ではありません"
+        )));
+    }
+    let input: BatchInput = serde_json::from_str(&input_json)?;
+    if input.v != INPUT_V {
+        return Err(CoreError::Invalid(format!(
+            "一括のジョブの入力の版 {} を知りません",
+            input.v
+        )));
+    }
+    Ok(input)
+}
+
+/// 一括の入力のレシピの写しを読む（文書の根から文書を読み、名前と結び付けを付ける）。文書の根がもうなければ NotFound。
+fn load_copy(db: &Db, copy: &RecipeInput) -> Result<Recipe> {
+    let doc = copy.doc;
+    let doc_id = db
+        .read(|c| store::doc_id_by_digest(c, &doc))?
+        .ok_or_else(|| CoreError::NotFound(format!("レシピの文書 {doc}")))?;
+    let bytes = db.read(|c| store::load_doc_bytes(c, doc_id))?;
+    let graph =
+        kura_engine::doc::load(&bytes).map_err(|e| from_engine("レシピの文書を読めません", e))?;
+    Ok(Recipe {
+        name: copy.name.clone(),
+        description: String::new(),
+        kind: RecipeKind::Each,
+        graph,
+        bindings: copy.bindings.clone(),
+    })
+}
+
+/// 頼みの対象（選んだ順。重なりは前のものだけ残す）。
+pub(crate) fn dedup(items: &[i64]) -> Vec<i64> {
+    let mut seen = std::collections::BTreeSet::new();
+    items
+        .iter()
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
+/// 一括のジョブを積む。レシピ（`edit_recipes`。［やり直す］は一括のジョブの写し）を確かめて、文書の根と結び付けを入力に写し、
+/// 同じトランザクションで対象の行を選んだ順に入れる（ないアイテムは入れない）。エディタで開いているアイテムは、積んだ時点で
+/// `skipped`（Open）にする（開いている間に保存できるように。あとから開こうとするアイテムは、一括が済むまで開かない：
+/// [`super::save::pending_save`]）。レシピに当てられない理由がある・N → 1 のレシピ・元に戻した一括の写し・対象がない・別名の
+/// 名前の型が空なら Invalid。読んでから積むまでにレシピが差し替え・名前を変える・消すで変わったら Conflict・NotFound（積む
+/// トランザクションの中で照らす。入力の写しが古い結び付けと新しい文書の組にならず、文書の根が片付けられる前に根になる）。写しの
+/// 文書の根が片付けられていれば NotFound。開いているアイテムは、エディタの置き場の錠を持ったまま読んで行を入れる（開く途中の
+/// エディタと重ならない。エディタは置いたあとに確かめ直す。M14 段 4 の検証の直し）。
 pub fn start_batch(
     db: &Db,
     jobs: &JobManager,
@@ -143,17 +295,12 @@ pub fn start_batch(
     req: &BatchRequest,
 ) -> Result<JobId> {
     let runtime = engine.runtime()?.clone();
-    let stored = recipes::get(db, &runtime, req.recipe_id)?;
-    if let Some(why) = &stored.problem {
-        return Err(CoreError::Invalid(format!(
-            "このレシピは当てられません：{why}"
-        )));
-    }
-    if stored.recipe.kind != RecipeKind::Each {
-        return Err(CoreError::Invalid(
-            "まとめて 1 つにするレシピは、1 件ずつの一括では当てられません".into(),
-        ));
-    }
+    let Resolved {
+        recipe,
+        doc,
+        recheck,
+        ..
+    } = resolve(db, &runtime, req.source)?;
     let mode = match &req.mode {
         BatchMode::Overwrite => ModeInput::Overwrite,
         BatchMode::SaveAs { name } => {
@@ -164,24 +311,17 @@ pub fn start_batch(
             ModeInput::SaveAs { name }
         }
     };
-    let mut items: Vec<i64> = Vec::with_capacity(req.items.len());
-    for id in &req.items {
-        if !items.contains(id) {
-            items.push(*id);
-        }
-    }
+    let items = dedup(&req.items);
     if items.is_empty() {
         return Err(CoreError::Invalid("当てるアイテムがありません".into()));
     }
-    let doc = db.read(|c| recipes::doc_root(c, req.recipe_id))?;
-    let recipe_id = req.recipe_id;
     let input = BatchInput {
         v: INPUT_V,
-        recipe: RecipeInput {
+        recipe: Some(RecipeInput {
             doc,
-            name: stored.recipe.name.clone(),
-            bindings: stored.recipe.bindings.clone(),
-        },
+            name: recipe.name,
+            bindings: recipe.bindings,
+        }),
         mode,
         include_drafts: req.include_drafts,
     };
@@ -189,45 +329,24 @@ pub fn start_batch(
     let now = now_ms();
     let id = engine.with_open_item(|open| {
         jobs.enqueue_then(JobKind::Batch, input_json, move |tx, job| {
-            if !recipes::unchanged(tx, recipe_id, &stored, &doc)? {
-                return Err(CoreError::Conflict(
-                    "レシピが変わりました。もう一度当ててください".into(),
-                ));
-            }
-            let mut exists = tx.prepare_cached("SELECT 1 FROM items WHERE id = ?1")?;
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO batch_items (job_id, ord, item_id, state, code, message, finished_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?;
-            let mut ord = 0i64;
-            for item in &items {
-                if exists.query_row([item], |_| Ok(())).optional()?.is_none() {
-                    continue;
+            match &recheck {
+                Recheck::Recipe { id, stored } => {
+                    if !recipes::unchanged(tx, *id, stored, &doc)? {
+                        return Err(CoreError::Conflict(
+                            "レシピが変わりました。もう一度当ててください".into(),
+                        ));
+                    }
                 }
-                if open == Some(*item) {
-                    insert.execute(params![
-                        job,
-                        ord,
-                        item,
-                        "skipped",
-                        "Open",
-                        "エディタで開いているので飛ばしました",
-                        now
-                    ])?;
-                } else {
-                    insert.execute(params![
-                        job,
-                        ord,
-                        item,
-                        "pending",
-                        None::<String>,
-                        None::<String>,
-                        None::<i64>
-                    ])?;
+                Recheck::Copy => {
+                    if store::doc_id_by_digest(tx, &doc)?.is_none() {
+                        return Err(CoreError::NotFound(
+                            "元の一括のレシピの文書がもうありません（レシピを消したあと片付けられました）"
+                                .into(),
+                        ));
+                    }
                 }
-                ord += 1;
             }
-            if ord == 0 {
+            if insert_rows(tx, job, &items, open, now)? == 0 {
                 return Err(CoreError::Invalid(
                     "当てるアイテムがありません（どれもライブラリにありません）".into(),
                 ));
@@ -236,6 +355,51 @@ pub fn start_batch(
         })
     })?;
     Ok(id)
+}
+
+/// 対象の行を選んだ順に pending で入れる（ないアイテムは入れない。エディタで開いているアイテム `open` は skipped（Open））。
+/// 入れた行の数を返す。
+pub(crate) fn insert_rows(
+    tx: &Connection,
+    job: JobId,
+    targets: &[i64],
+    open: Option<i64>,
+    now: i64,
+) -> Result<i64> {
+    let mut exists = tx.prepare_cached("SELECT 1 FROM items WHERE id = ?1")?;
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO batch_items (job_id, ord, item_id, state, code, message, finished_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    let mut ord = 0i64;
+    for item in targets {
+        if exists.query_row([item], |_| Ok(())).optional()?.is_none() {
+            continue;
+        }
+        if open == Some(*item) {
+            insert.execute(params![
+                job,
+                ord,
+                item,
+                "skipped",
+                "Open",
+                "エディタで開いているので飛ばしました",
+                now
+            ])?;
+        } else {
+            insert.execute(params![
+                job,
+                ord,
+                item,
+                "pending",
+                None::<String>,
+                None::<String>,
+                None::<i64>
+            ])?;
+        }
+        ord += 1;
+    }
+    Ok(ord)
 }
 
 /// アイテム `item_id` を待っている（pending の行のある、終わっていない）一括のジョブ（`idx_batch_items_item`）。
@@ -255,7 +419,8 @@ pub fn pending_batch(conn: &Connection, item_id: i64) -> Result<Option<JobId>> {
 pub(crate) fn roots_of_input(input_json: &str) -> Option<Digest> {
     serde_json::from_str::<BatchInput>(input_json)
         .ok()
-        .map(|i| i.recipe.doc)
+        .and_then(|i| i.recipe)
+        .map(|r| r.doc)
 }
 
 /// 一括のジョブの処理。
@@ -389,6 +554,9 @@ struct Task {
 enum Outcome {
     /// 書き終えた（コミットを待つ）。
     Ready(Task, Box<Written>),
+    /// 働き手がそのままコミットした（元に戻す一括の、ファイルを書かない戻し・ゴミ箱へ。行は同じトランザクションで書いた）。
+    /// 中身が変わったならその種類（後のジョブを積む）。
+    Done { saved: Option<MediaKind> },
     /// 飛ばした・失敗した（行の state と理由）。
     Finished {
         task: Task,
@@ -404,10 +572,28 @@ enum Outcome {
 
 /// 積んだレシピと向き（働き手が読むだけ）。
 struct Plan {
-    recipe: Recipe,
-    digest: Digest,
+    /// 当てるレシピ（元に戻す一括は None）。
+    recipe: Option<Applied>,
     mode: ModeInput,
     include_drafts: bool,
+}
+
+impl Plan {
+    /// 保存していない下書きのあるアイテムを飛ばすか：上書きは含める指定がなければ（ADR-190 (8)）、元に戻す一括はいつも（下書きの
+    /// 土台を黙って古くしない）。別名は元を変えないので飛ばさない。
+    fn skips_drafts(&self) -> bool {
+        match self.mode {
+            ModeInput::Overwrite => !self.include_drafts,
+            ModeInput::SaveAs { .. } => false,
+            ModeInput::Undo { .. } => true,
+        }
+    }
+}
+
+/// 当てるレシピ（積んだときの写し）と文書の根。
+struct Applied {
+    recipe: Recipe,
+    digest: Digest,
 }
 
 impl JobHandler for BatchHandler {
@@ -434,30 +620,28 @@ impl JobHandler for BatchHandler {
             ctx.log("前回、中止を受けたあとにアプリが終わったので、中止で終えます");
             return finish_canceled(db, job);
         }
-        let runtime = self.engine.runtime()?.clone();
-        // レシピ（積んだときの写し）
-        let graph = {
-            let doc = input.recipe.doc;
-            let doc_id = db
-                .read(|c| store::doc_id_by_digest(c, &doc))?
-                .ok_or_else(|| CoreError::NotFound(format!("レシピの文書 {doc}")))?;
-            let bytes = db.read(|c| store::load_doc_bytes(c, doc_id))?;
-            kura_engine::doc::load(&bytes)
-                .map_err(|e| from_engine("レシピの文書を読めません", e))?
+        // レシピ（積んだときの写し。元に戻す一括は持たない）
+        let recipe = match &input.recipe {
+            Some(copy) => {
+                let runtime = self.engine.runtime()?.clone();
+                let recipe = load_copy(db, copy)?;
+                runtime
+                    .bulk(|e| e.check_recipe(&recipe))
+                    .map_err(|e| from_engine("このレシピは当てられません", e))?;
+                Some(Applied {
+                    recipe,
+                    digest: copy.doc,
+                })
+            }
+            None if matches!(input.mode, ModeInput::Undo { .. }) => None,
+            None => {
+                return Err(CoreError::Invalid(
+                    "一括のジョブの入力にレシピがありません".into(),
+                ));
+            }
         };
-        let recipe = Recipe {
-            name: input.recipe.name.clone(),
-            description: String::new(),
-            kind: RecipeKind::Each,
-            graph,
-            bindings: input.recipe.bindings.clone(),
-        };
-        runtime
-            .bulk(|e| e.check_recipe(&recipe))
-            .map_err(|e| from_engine("このレシピは当てられません", e))?;
         let plan = Plan {
             recipe,
-            digest: input.recipe.doc,
             mode: input.mode.clone(),
             include_drafts: input.include_drafts,
         };
@@ -730,6 +914,8 @@ impl BatchHandler {
             let mut ready: Vec<(Task, Box<Written>)> = Vec::new();
             let mut group_since: Option<Instant> = None;
             let mut stop: Option<Stop> = None;
+            // 働き手がそのままコミットした分の後のジョブ（まとまりごとに積む）
+            let mut follow: Vec<MediaKind> = Vec::new();
             let result = loop {
                 let next = observe(ctx, stop);
                 if next == Some(Stop::Canceled) && stop != Some(Stop::Canceled) {
@@ -816,6 +1002,17 @@ impl BatchHandler {
                                     report(*done);
                                 }
                             }
+                            Outcome::Done { saved } => {
+                                // 行は働き手が同じトランザクションで書いた（中止のあとなら行は canceled でコミットされない）
+                                *done += 1;
+                                report(*done);
+                                if let Some(kind) = saved {
+                                    follow.push(kind);
+                                }
+                                if follow.len() >= GROUP_ITEMS {
+                                    queue_follow_ups(ctx, &std::mem::take(&mut follow));
+                                }
+                            }
                             Outcome::Retry(task) => queue.push_front(Task { attempt: 1, ..task }),
                             Outcome::Stopped(keys) => kept.extend(keys),
                         }
@@ -826,6 +1023,9 @@ impl BatchHandler {
                     }
                 }
             };
+            if !follow.is_empty() {
+                queue_follow_ups(ctx, &follow);
+            }
             // 誤りで抜けたときも、準備の途中の働き手をすぐ止める（書き終えたものは受けずに落とす）
             yielding.store(true, Ordering::Release);
             drop(task_tx);
@@ -969,59 +1169,20 @@ impl BatchHandler {
         let item = task.item_id;
         let failed = |e: CoreError| Skip::failed(&e);
         // 1. 飛ばす
-        let head = db
-            .read(|c| versions::head(c, item))
-            .map_err(failed)?
-            .ok_or_else(|| Skip::skipped("Gone", "アイテムがありません".into()))?;
-        if head.trashed {
-            return Err(Skip::skipped(
-                "Trashed",
-                "ゴミ箱にあるので飛ばしました".into(),
-            ));
-        }
-        if !matches!(head.kind, MediaKind::Image | MediaKind::Audio) {
-            return Err(Skip::skipped(
-                "Kind",
-                format!(
-                    "{} には当てられません（画像と音声だけ）",
-                    head.kind.as_str()
-                ),
-            ));
-        }
-        if self
-            .engine
-            .current_editor()
-            .is_some_and(|e| e.item_id() == item)
-        {
-            return Err(Skip::skipped(
-                "Open",
-                "エディタで開いているので飛ばしました".into(),
-            ));
-        }
-        if db
-            .read(|c| pending_edit_job(c, item))
-            .map_err(failed)?
-            .is_some()
-        {
-            return Err(Skip::skipped(
-                "SavePending",
-                "前の保存が終わっていないので飛ばしました".into(),
-            ));
-        }
-        let overwrite = matches!(plan.mode, ModeInput::Overwrite);
-        if overwrite
-            && !plan.include_drafts
-            && db.read(|c| drafts::get(c, item)).map_err(failed)?.is_some()
-        {
-            return Err(Skip::skipped(
-                "Draft",
-                "保存していない下書きがあるので飛ばしました".into(),
-            ));
-        }
+        let head = skip_rules(&self.engine, db, item, plan.skips_drafts())?;
         #[cfg(test)]
         if let Some(hook) = &self.before_prepare {
             hook(item);
         }
+        if let ModeInput::Undo { of, save_as } = plan.mode {
+            return self.prepare_undo(unit, task, head, of, save_as);
+        }
+        let Some(applied) = &plan.recipe else {
+            return Err(failed(CoreError::Invalid(
+                "一括のジョブにレシピがありません".into(),
+            )));
+        };
+        let overwrite = matches!(plan.mode, ModeInput::Overwrite);
         // 2. 継ぎ足して結び付ける（土台は今の頭）
         let base = Base {
             hash: head.hash,
@@ -1031,7 +1192,7 @@ impl BatchHandler {
         let head_doc = head_doc(db, &runtime, item, head.version).map_err(failed)?;
         let stopped = || Outcome::Stopped(kept_keys(db, item, &head_doc));
         let facts = db.read(|c| facts_of(c, item)).map_err(failed)?;
-        let instance = match self.bind(unit, &runtime, plan, item, &head_doc, &facts)? {
+        let instance = match self.bind(unit, &runtime, &applied.recipe, item, &head_doc, &facts)? {
             Flow::Go(instance) => instance,
             Flow::Stop(_) => return Ok(stopped()),
         };
@@ -1042,12 +1203,12 @@ impl BatchHandler {
             .unwrap_or(serde_json::Value::Null);
         let record = json!({
             "job": ctx.id(),
-            "recipe": { "name": plan.recipe.name, "digest": plan.digest },
+            "recipe": { "name": applied.recipe.name, "digest": applied.digest },
             "bound": bound,
         });
         // 3. 準備
         let names = match &plan.mode {
-            ModeInput::Overwrite => None,
+            ModeInput::Overwrite | ModeInput::Undo { .. } => None,
             ModeInput::SaveAs { name } => {
                 let title: String = db
                     .read(|c| {
@@ -1122,17 +1283,17 @@ impl BatchHandler {
         &self,
         unit: &BatchUnit<'_>,
         runtime: &EngineRuntime,
-        plan: &Plan,
+        recipe: &Recipe,
         item: i64,
         head_doc: &Graph,
         facts: &Facts,
     ) -> std::result::Result<Flow<kura_engine::recipe::Instance>, Skip> {
         let instantiate = |shapes: &BTreeMap<InputId, Shape>| {
             runtime
-                .bulk(|e| e.instantiate(head_doc, &plan.recipe, shapes, facts))
+                .bulk(|e| e.instantiate(head_doc, recipe, shapes, facts))
                 .map_err(bind_skip)
         };
-        if plan.recipe.bindings.is_empty() {
+        if recipe.bindings.is_empty() {
             return instantiate(&BTreeMap::new()).map(Flow::Go);
         }
         let read = match self.input_shape(unit, item, head_doc) {
@@ -1141,7 +1302,7 @@ impl BatchHandler {
             Err(e) => return Err(Skip::failed(&e)),
         };
         let shapes = BTreeMap::from([(InputId(0), read.shape)]);
-        match runtime.bulk(|e| e.instantiate(head_doc, &plan.recipe, &shapes, facts)) {
+        match runtime.bulk(|e| e.instantiate(head_doc, recipe, &shapes, facts)) {
             Err(BindError::NoLength { .. }) if read.stage.is_some() => {
                 let exact = match self.count_frames(unit, &read) {
                     Ok(Flow::Go(shape)) => shape,
@@ -1154,115 +1315,21 @@ impl BatchHandler {
         }
     }
 
-    /// 結び付けのための入力 0 の形（保存が読むのと同じもの）：アンカーがあればアンカーの見出し（記録の値の形。OS のデコーダを
-    /// 通らない。読めなければ元から）、なければ元を段の順に読む（保存と同じ段。段ごとに、その段で形を読む分を予算から確保し、
-    /// OS の段なら読む前後に行の印を置く）。
+    /// 結び付けのための入力 0 の形（保存が読むのと同じもの。[`read_input_shape`]）：段ごとに一括の枠で予算を待ち、OS の段なら
+    /// 読む前後に行の印を置く。
     fn input_shape(
         &self,
         unit: &BatchUnit<'_>,
         item: i64,
         head_doc: &Graph,
     ) -> Result<Flow<InputRead>> {
-        let library = unit.ctx.library();
-        let db = library.db();
-        let original = db
-            .read(|c| versions::original(c, item))?
-            .ok_or_else(|| CoreError::NotFound(format!("アイテム {item}")))?;
-        let format = format_id(&original.ext).ok_or_else(|| {
-            CoreError::Unsupported(format!("元の形式（{}）を読めません", original.ext))
-        })?;
-        let opts = head_doc
-            .inputs
-            .first()
-            .map(|slot| slot.decode.clone())
-            .unwrap_or_default();
         let runtime = self.engine.runtime()?.clone();
-        let limits = runtime.bulk(|e| e.limits().clone());
-        let path = library.layout().content_path(&original.hash, &original.ext);
-        let options_digest = anchors::options_digest(&opts)?;
-        if let Some(a) = db.read(|c| anchors::find(c, &original.hash, &options_digest))? {
-            let anchor_path = library.layout().content_path(&a.hash, &a.ext);
-            match File::open(&anchor_path)
-                .map_err(EngineError::from)
-                .and_then(|f| anchor::shape(&mut BufReader::new(f), &limits))
-            {
-                Ok(shape) => {
-                    return Ok(Flow::Go(InputRead {
-                        shape,
-                        stage: None,
-                        path,
-                        format,
-                        opts,
-                        platform: false,
-                    }));
-                }
-                // 保存も、アンカーが使えなければ元を読み直す
-                Err(e) => unit.log(&format!(
-                    "アイテム {item} のアンカーの見出しを読めないので、元から読みます：{e}"
-                )),
-            }
-        }
-        let codecs = self.engine.codecs();
-        let mon = UnitMonitor(unit);
-        let is_platform = |id: &str| {
-            codecs
-                .decoders_for(format)
-                .iter()
-                .any(|d| d.id() == id && d.tier() == Tier::Platform)
+        let hooks = JobShape {
+            unit,
+            mon: UnitMonitor(unit),
+            runtime: &runtime,
         };
-        let mut lease = None;
-        let mut stopped: Option<Result<()>> = None;
-        let mut marked = false;
-        let read =
-            codecs.shape_path_staged(&path, format, &opts, &limits, &mon, None, &mut |stage| {
-                lease = None;
-                match runtime
-                    .budget()
-                    .acquire(stage.shape_bytes, Class::Bulk, &mon)
-                {
-                    Ok(l) => lease = Some(l),
-                    Err(e) => {
-                        stopped = Some(if matches!(e.root(), EngineError::Canceled) {
-                            Ok(())
-                        } else {
-                            Err(from_engine("元の大きさを読むメモリを確保できません", e))
-                        });
-                        return Err(EngineError::Canceled);
-                    }
-                }
-                if !marked && is_platform(stage.id) {
-                    if let Err(e) = unit.mark(DECODING, 0.0, "元を読んでいます") {
-                        stopped = Some(Err(e));
-                        return Err(EngineError::Canceled);
-                    }
-                    marked = true;
-                }
-                Ok(())
-            });
-        drop(lease);
-        if marked {
-            unit.mark(DECODED, 0.0, "元を読みました")?;
-        }
-        match stopped {
-            Some(Ok(())) => return Ok(Flow::Stop(JobEnd::Paused)),
-            Some(Err(e)) => return Err(e),
-            None => {}
-        }
-        match read {
-            Ok((shape, stage)) => {
-                let platform = is_platform(stage.id);
-                Ok(Flow::Go(InputRead {
-                    shape,
-                    stage: Some(stage),
-                    path,
-                    format,
-                    opts,
-                    platform,
-                }))
-            }
-            Err(e) if matches!(e.root(), EngineError::Canceled) => Ok(Flow::Stop(JobEnd::Paused)),
-            Err(e) => Err(from_engine("元の大きさを読めません", e)),
-        }
+        read_input_shape(&self.engine, unit.ctx.library(), item, head_doc, &hooks)
     }
 
     /// 見出しの長さが上限しか分からない音声（MP3・AAC）の長さを、形を読めた段で流して数える（予算はその段の流して読む見積もり。
@@ -1316,6 +1383,153 @@ impl BatchHandler {
             }
             (Err(e), _) => Err(from_engine("元の長さを数えられません", e)),
         }
+    }
+}
+
+/// 入力の形を読むときの、呼び手ごとの振る舞い（一括の 1 件と事前チェック）。
+trait ShapeHooks {
+    /// 止める指示（中止・一時停止・事前チェックの中止）。
+    fn monitor(&self) -> &dyn Monitor;
+    /// 段の形を読む分を予算から確保する（一括の 1 件は一括の枠で待つ、事前チェックは対話の枠で待たない）。
+    fn acquire(&self, bytes: u64) -> std::result::Result<kura_engine::budget::Lease, EngineError>;
+    /// OS のデコーダで読む前後の印（一括の 1 件は行の `decoding`。事前チェックは置かない）。
+    fn mark(&self, decoding: bool) -> Result<()>;
+    fn log(&self, line: &str);
+}
+
+/// 一括の 1 件の読み方。
+struct JobShape<'a, 'b> {
+    unit: &'a BatchUnit<'b>,
+    mon: UnitMonitor<'a>,
+    runtime: &'a EngineRuntime,
+}
+
+impl ShapeHooks for JobShape<'_, '_> {
+    fn monitor(&self) -> &dyn Monitor {
+        &self.mon
+    }
+
+    fn acquire(&self, bytes: u64) -> std::result::Result<kura_engine::budget::Lease, EngineError> {
+        self.runtime.budget().acquire(bytes, Class::Bulk, &self.mon)
+    }
+
+    fn mark(&self, decoding: bool) -> Result<()> {
+        if decoding {
+            self.unit.mark(DECODING, 0.0, "元を読んでいます")
+        } else {
+            self.unit.mark(DECODED, 0.0, "元を読みました")
+        }
+    }
+
+    fn log(&self, line: &str) {
+        self.unit.log(line);
+    }
+}
+
+/// 入力 0 の形（保存が読むのと同じもの）：アンカーがあればアンカーの見出し（記録の値の形。OS のデコーダを通らない。読めなければ
+/// 元から）、なければ元を段の順に読む（保存と同じ段。段ごとに、その段で形を読む分を `hooks` で確保し、OS の段なら読む前後に
+/// 印を置く）。止める指示・中止の確保は `Flow::Stop`。
+fn read_input_shape(
+    engine: &EngineServices,
+    library: &Library,
+    item: i64,
+    head_doc: &Graph,
+    hooks: &dyn ShapeHooks,
+) -> Result<Flow<InputRead>> {
+    let db = library.db();
+    let original = db
+        .read(|c| versions::original(c, item))?
+        .ok_or_else(|| CoreError::NotFound(format!("アイテム {item}")))?;
+    let format = format_id(&original.ext).ok_or_else(|| {
+        CoreError::Unsupported(format!("元の形式（{}）を読めません", original.ext))
+    })?;
+    let opts = head_doc
+        .inputs
+        .first()
+        .map(|slot| slot.decode.clone())
+        .unwrap_or_default();
+    let runtime = engine.runtime()?.clone();
+    let limits = runtime.bulk(|e| e.limits().clone());
+    let path = library.layout().content_path(&original.hash, &original.ext);
+    let options_digest = anchors::options_digest(&opts)?;
+    if let Some(a) = db.read(|c| anchors::find(c, &original.hash, &options_digest))? {
+        let anchor_path = library.layout().content_path(&a.hash, &a.ext);
+        match File::open(&anchor_path)
+            .map_err(EngineError::from)
+            .and_then(|f| anchor::shape(&mut BufReader::new(f), &limits))
+        {
+            Ok(shape) => {
+                return Ok(Flow::Go(InputRead {
+                    shape,
+                    stage: None,
+                    path,
+                    format,
+                    opts,
+                    platform: false,
+                }));
+            }
+            // 保存も、アンカーが使えなければ元を読み直す
+            Err(e) => hooks.log(&format!(
+                "アイテム {item} のアンカーの見出しを読めないので、元から読みます：{e}"
+            )),
+        }
+    }
+    let codecs = engine.codecs();
+    let mon = hooks.monitor();
+    let is_platform = |id: &str| {
+        codecs
+            .decoders_for(format)
+            .iter()
+            .any(|d| d.id() == id && d.tier() == Tier::Platform)
+    };
+    let mut lease = None;
+    let mut stopped: Option<Result<()>> = None;
+    let mut marked = false;
+    let read = codecs.shape_path_staged(&path, format, &opts, &limits, mon, None, &mut |stage| {
+        lease = None;
+        match hooks.acquire(stage.shape_bytes) {
+            Ok(l) => lease = Some(l),
+            Err(e) => {
+                stopped = Some(if matches!(e.root(), EngineError::Canceled) {
+                    Ok(())
+                } else {
+                    Err(from_engine("元の大きさを読むメモリを確保できません", e))
+                });
+                return Err(EngineError::Canceled);
+            }
+        }
+        if !marked && is_platform(stage.id) {
+            if let Err(e) = hooks.mark(true) {
+                stopped = Some(Err(e));
+                return Err(EngineError::Canceled);
+            }
+            marked = true;
+        }
+        Ok(())
+    });
+    drop(lease);
+    if marked {
+        hooks.mark(false)?;
+    }
+    match stopped {
+        Some(Ok(())) => return Ok(Flow::Stop(JobEnd::Paused)),
+        Some(Err(e)) => return Err(e),
+        None => {}
+    }
+    match read {
+        Ok((shape, stage)) => {
+            let platform = is_platform(stage.id);
+            Ok(Flow::Go(InputRead {
+                shape,
+                stage: Some(stage),
+                path,
+                format,
+                opts,
+                platform,
+            }))
+        }
+        Err(e) if matches!(e.root(), EngineError::Canceled) => Ok(Flow::Stop(JobEnd::Paused)),
+        Err(e) => Err(from_engine("元の大きさを読めません", e)),
     }
 }
 
@@ -1399,6 +1613,60 @@ fn kept_keys(db: &Db, item: i64, head_doc: &Graph) -> Vec<WorkKey> {
         tracing::warn!(%err, item, "止めた 1 件の作業用の PCM の鍵を求められません");
         Vec::new()
     })
+}
+
+/// 飛ばす決まり（ジョブの段 1・事前チェック・元に戻す一括で同じ）：ないアイテム（Gone）・ゴミ箱にある（Trashed）・画像と音声で
+/// ない（Kind）・エディタで開いている（Open）・前の保存が終わっていない（SavePending）・保存していない下書きがある（Draft。
+/// `drafts` が真のとき）。当てられるなら頭を返す。
+fn skip_rules(
+    engine: &EngineServices,
+    db: &Db,
+    item: i64,
+    drafts: bool,
+) -> std::result::Result<versions::Head, Skip> {
+    let failed = |e: CoreError| Skip::failed(&e);
+    let head = db
+        .read(|c| versions::head(c, item))
+        .map_err(failed)?
+        .ok_or_else(|| Skip::skipped("Gone", "アイテムがありません".into()))?;
+    if head.trashed {
+        return Err(Skip::skipped(
+            "Trashed",
+            "ゴミ箱にあるので飛ばしました".into(),
+        ));
+    }
+    if !matches!(head.kind, MediaKind::Image | MediaKind::Audio) {
+        return Err(Skip::skipped(
+            "Kind",
+            format!(
+                "{} には当てられません（画像と音声だけ）",
+                head.kind.as_str()
+            ),
+        ));
+    }
+    if engine.current_editor().is_some_and(|e| e.item_id() == item) {
+        return Err(Skip::skipped(
+            "Open",
+            "エディタで開いているので飛ばしました".into(),
+        ));
+    }
+    if db
+        .read(|c| pending_edit_job(c, item))
+        .map_err(failed)?
+        .is_some()
+    {
+        return Err(Skip::skipped(
+            "SavePending",
+            "前の保存が終わっていないので飛ばしました".into(),
+        ));
+    }
+    if drafts && db.read(|c| drafts::get(c, item)).map_err(failed)?.is_some() {
+        return Err(Skip::skipped(
+            "Draft",
+            "保存していない下書きがあるので飛ばしました".into(),
+        ));
+    }
+    Ok(head)
 }
 
 /// 飛ばす・失敗の理由。

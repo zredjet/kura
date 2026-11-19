@@ -43,7 +43,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kura_core::edit::batch::{BatchMode, BatchRequest, DEFAULT_SAVE_AS_NAME, start_batch};
+use kura_core::edit::batch::{
+    BatchMode, BatchRequest, DEFAULT_SAVE_AS_NAME, RecipeSource, start_batch,
+};
 use kura_core::edit::{GcClock, recipes, versions};
 use kura_core::import::{ImportInput, ImportOptions, start_import};
 use kura_core::jobs::JobState;
@@ -1173,7 +1175,7 @@ pub(super) fn child(library: &Path, seed: u64, save_as: bool) -> Result<(), Stri
             session.jobs(),
             engine,
             &BatchRequest {
-                recipe_id,
+                source: RecipeSource::Recipe(recipe_id),
                 items,
                 mode: if save_as {
                     BatchMode::SaveAs {
