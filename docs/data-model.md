@@ -583,7 +583,7 @@ CREATE TABLE item_versions (
   width         INTEGER,
   height        INTEGER,
   duration_ms   INTEGER,
-  record        TEXT    NOT NULL,                     -- VersionRecord（JSON。エンジンの版・エンコーダ・読み取りの記録・メディア情報・警告）
+  record        TEXT    NOT NULL,                     -- VersionRecord（JSON。エンジンの版・エンコーダ・読み取りの記録・メディア情報・警告・一括の出どころ `batch`（M14））
   file_blob_id  INTEGER REFERENCES blobs(id),         -- この版が持つファイル（released なら NULL。ON DELETE なし。REFERRERS）
   file_state    TEXT    NOT NULL CONSTRAINT item_versions_file_state
                 CHECK (file_state IN ('hold','waiting','kept','released')),
@@ -1092,15 +1092,23 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   `.kurarecipe` の読み込みは `Engine::load_recipe` の確かめを通ったものだけを足す（4 MiB を超えるファイルは読まずに断る）。
 - **部品の片付けの根**：`edit_recipes.doc_id` も参照に数える（`sweep_parts` の `EXISTS (SELECT 1 FROM edit_recipes WHERE doc_id = ?)`。
   `idx_edit_recipes_doc`）。レシピを指している間は部品が残り、`edit_recipes.doc_id` は ON DELETE を持たないので、片付けが誤って消そうと
-  しても外部キーで断られる。動いている一括のジョブの入力の写し（レシピの文書の根）は段 4 で `save::gc_roots` に足す。
-- **一括の対象と結果**（`batch_items`。段 4 で書く）：一括のジョブを積むのと同じトランザクションで、選んだ順に `state = 'pending'` の行を
-  入れる。残りは `SELECT ord, item_id FROM batch_items WHERE job_id = ? AND state = 'pending' ORDER BY ord`（主キー。一時の B 木を作ら
-  ない）、あるアイテムを待っている一括は `SELECT job_id FROM batch_items WHERE item_id = ? AND state = 'pending'`（`idx_batch_items_item`。
-  前の保存が終わっていないアイテムを開かない `SavePending` を一括へ広げる）。1 件ずつのコミットのトランザクション 2 の中で、結果の記録
-  （`save::Record`）が行の `state`・`base_hash`・`base_version`・`version_id`・`out_item_id`・`finished_at` を書く（版と行が同じ
-  トランザクションなので、落ちても「版があるのに pending」「done なのに版がない」にならない）。飛ばした・失敗した・中止した行は
-  `code`・`message`・`finished_at` を書く。OS のデコーダで読む前後の印は行の `decoding` に置く（アイテムごと。並べて準備する 1 件ずつが
-  互いの印を消さない）。
+  しても外部キーで断られる。動いている一括のジョブの入力の写し（レシピの文書の根）も根に数える（下の「一括の根」）。
+- **一括の対象と結果**（`batch_items`。M14 段 4。`edit::batch`）：一括のジョブを積むのと同じトランザクションで（`JobManager::enqueue_then`
+  がジョブの行を入れてから、その ID で）、選んだ順に `state = 'pending'` の行を入れる（ないアイテムは入れない。エディタで開いている
+  アイテムは `skipped`（Open）で入れる）。動くときは、前回 OS のデコーダで読んでいる途中で落ちた行を
+  `UPDATE batch_items SET state = 'failed', code = 'Crashed', … WHERE job_id = ? AND state = 'pending' AND decoding = 1` で失敗にし、
+  残りを `SELECT ord, item_id FROM batch_items WHERE job_id = ? AND state = 'pending' ORDER BY ord`（主キー。一時の B 木を作らない）で
+  取る。あるアイテムを待っている一括は `SELECT b.job_id FROM batch_items b JOIN jobs j ON j.id = b.job_id WHERE b.item_id = ? AND
+  b.state = 'pending' AND j.state IN ('queued','running','paused')`（`idx_batch_items_item`。`save::pending_save` が保存のジョブと
+  一緒に見て、エディタを開かない（`SavePending`）・保存を積まない（Busy））。1 件ずつのコミットのトランザクション 2 の中で、結果の記録
+  （`save::Record`）が `UPDATE batch_items SET state = ?, base_hash = ?, base_version = ?, version_id = ?, out_item_id = ?, finished_at = ?
+  WHERE job_id = ? AND ord = ? AND state = 'pending'` を書き、1 行でなければ（対象のアイテムが消えて行も消えた）Conflict でトランザクション
+  ごと戻す（版と行が同じトランザクションなので、落ちても「版があるのに pending」「done なのに版がない」にならない）。飛ばした・失敗した・
+  同じ中身の行は、同じ形で `state`・`code`・`message`・`finished_at` を書く（pending のときだけ）。中止（実行中・待ちのまま）は残りの
+  pending の行を canceled にする。OS のデコーダで読む前後の印は行の `decoding` に置く（`UPDATE batch_items SET decoding = ? WHERE
+  job_id = ? AND ord = ?`。主キー）。結果は `SELECT state, count(*) FROM batch_items WHERE job_id = ? GROUP BY state`（主キーの頭で引く）。
+- **一括の根**：GC の部品の片付けは、終わっていない（と 7 日以内に失敗・中止した）一括のジョブの入力が写したレシピの文書の根も残す
+  （`save::gc_roots`・`live_roots` が `kind IN ('edit','batch')` を読む）。
 - **一括の版の持ち主**（ADR-192 (1)）：一括で足した版は `item_versions.job_id` を NULL にし（1 件の場の `UnitCx::version_job` が None）、
   `batch_items.version_id` で引く。保存のジョブの 1 ジョブ 1 版（`idx_item_versions_job`・再開の `versions::by_job`）は変えない。台帳の
   予告の持ち主は一括のジョブで、トランザクション 2 はその 1 件の予告だけを行の ID で消す（上の「予告と照合」）。
