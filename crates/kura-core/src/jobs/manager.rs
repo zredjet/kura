@@ -34,9 +34,14 @@ pub trait JobHandler: Send + Sync {
     fn run(&self, ctx: &JobContext) -> Result<JobEnd>;
 
     /// 待ち・一時停止のまま中止された（`run` を通らずに終わった）ジョブの後始末。状態を canceled にするのと同じ
-    /// トランザクションで呼ぶ（`input_json` はそのジョブの入力）。既定は何もしない（保存のジョブは、積む前に置いた文書の
-    /// 部品の印を置く。M12）。
-    fn canceled_while_idle(&self, _tx: &rusqlite::Connection, _input_json: &str) -> Result<()> {
+    /// トランザクションで呼ぶ（`job` はそのジョブ、`input_json` はその入力）。既定は何もしない（保存のジョブは、積む前に
+    /// 置いた文書の部品の印を置く。M12。一括は残りの対象の行を canceled にする。M14）。
+    fn canceled_while_idle(
+        &self,
+        _tx: &rusqlite::Connection,
+        _job: JobId,
+        _input_json: &str,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -353,6 +358,29 @@ impl JobManager {
             before(tx)?;
             store::insert(tx, kind, &input_json, now_ms())
         })?;
+        self.queued(id, kind);
+        Ok(id)
+    }
+
+    /// ジョブを追加し、同じトランザクションでその ID を使って `after` を行う（一括のジョブは、対象の行をジョブの ID で入れる。
+    /// M14 段 4）。`after` が誤りを返せば、ジョブも積まない。
+    pub fn enqueue_then(
+        &self,
+        kind: JobKind,
+        input_json: String,
+        after: impl FnOnce(&rusqlite::Connection, JobId) -> Result<()> + Send + 'static,
+    ) -> Result<JobId> {
+        let id = self.inner.library.db().write(move |tx| {
+            let id = store::insert(tx, kind, &input_json, now_ms())?;
+            after(tx, id)?;
+            Ok(id)
+        })?;
+        self.queued(id, kind);
+        Ok(id)
+    }
+
+    /// 積んだジョブを知らせて、取り出す側を起こす。
+    fn queued(&self, id: JobId, kind: JobKind) {
         self.emit(JobEvent {
             id,
             kind,
@@ -362,7 +390,6 @@ impl JobManager {
             result_json: None,
         });
         self.inner.wake.notify_all();
-        Ok(id)
     }
 
     /// `kind` のジョブが待ち行列になければ積む。積んだら ID を返す。
@@ -570,7 +597,7 @@ impl JobManager {
                     if changed && to.is_terminal() {
                         store::finish(tx, id, to, None, None, None, None, now_ms())?;
                         if let Some((handler, input)) = &cleanup {
-                            handler.canceled_while_idle(tx, input)?;
+                            handler.canceled_while_idle(tx, id, input)?;
                         }
                     }
                     Ok(changed)
@@ -1008,7 +1035,12 @@ mod tests {
         fn run(&self, _ctx: &JobContext) -> Result<JobEnd> {
             Ok(JobEnd::Paused)
         }
-        fn canceled_while_idle(&self, tx: &rusqlite::Connection, input_json: &str) -> Result<()> {
+        fn canceled_while_idle(
+            &self,
+            tx: &rusqlite::Connection,
+            _job: JobId,
+            input_json: &str,
+        ) -> Result<()> {
             crate::settings::set(tx, "test.cleanup", &input_json.to_string())
         }
     }

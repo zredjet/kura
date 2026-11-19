@@ -451,7 +451,7 @@ pub struct ImportFailureDto {
 }
 
 /// ジョブの種類（analyze は M11 の解析。取り込み・サムネイル・保存に譲る。edit は M12 の編集の保存、gc は M12 の段 3 の
-/// 置き換えた版のファイルの片付け）。
+/// 置き換えた版のファイルの片付け、batch は M14 の一括加工）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum JobKindDto {
@@ -464,6 +464,7 @@ pub enum JobKindDto {
     Analyze,
     Edit,
     Gc,
+    Batch,
 }
 
 impl From<JobKind> for JobKindDto {
@@ -478,6 +479,7 @@ impl From<JobKind> for JobKindDto {
             JobKind::Analyze => Self::Analyze,
             JobKind::Edit => Self::Edit,
             JobKind::Gc => Self::Gc,
+            JobKind::Batch => Self::Batch,
         }
     }
 }
@@ -494,6 +496,7 @@ impl From<JobKindDto> for JobKind {
             JobKindDto::Analyze => Self::Analyze,
             JobKindDto::Edit => Self::Edit,
             JobKindDto::Gc => Self::Gc,
+            JobKindDto::Batch => Self::Batch,
         }
     }
 }

@@ -35,13 +35,15 @@ pub enum JobKind {
     /// 編集の保存（M12 の段 2。上書き・別名・元に戻す。1 本ずつ。利用者が待つので誰にも譲らない）。
     Edit,
     /// 置き換えた版のファイルと孤立した文書の部品・アンカーの片付け（M12 の段 3。`edit::gc`。1 本ずつ。取り込み・サムネイル・
-    /// 保存・解析・書き出し・ダウンロード・キャプチャに譲る）。
+    /// 保存・解析・書き出し・ダウンロード・キャプチャ・一括に譲る）。
     Gc,
+    /// 一括加工（M14 段 4。`edit::batch`。1 本ずつ。保存に譲る）。
+    Batch,
 }
 
 impl JobKind {
     /// すべての種類（テストと一覧用）。
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Import,
         Self::Thumbnail,
         Self::Proxy,
@@ -51,6 +53,7 @@ impl JobKind {
         Self::Analyze,
         Self::Edit,
         Self::Gc,
+        Self::Batch,
     ];
 
     /// DB に保存する名前。
@@ -65,6 +68,7 @@ impl JobKind {
             Self::Analyze => "analyze",
             Self::Edit => "edit",
             Self::Gc => "gc",
+            Self::Batch => "batch",
         }
     }
 
@@ -80,6 +84,7 @@ impl JobKind {
             "analyze" => Self::Analyze,
             "edit" => Self::Edit,
             "gc" => Self::Gc,
+            "batch" => Self::Batch,
             _ => return None,
         })
     }
@@ -97,7 +102,8 @@ impl JobKind {
             | Self::Export
             | Self::Analyze
             | Self::Edit
-            | Self::Gc => 1,
+            | Self::Gc
+            | Self::Batch => 1,
         }
     }
 
@@ -110,7 +116,7 @@ impl JobKind {
     /// 必ずここに書く（網羅の match。M14 の一括も同じ一括のプールと予算を使うので、足すときに解析・GC が譲るかを決める）。
     pub fn yields_to(self) -> &'static [JobKind] {
         match self {
-            Self::Analyze => &[Self::Import, Self::Thumbnail, Self::Edit],
+            Self::Analyze => &[Self::Import, Self::Thumbnail, Self::Edit, Self::Batch],
             Self::Gc => &[
                 Self::Import,
                 Self::Thumbnail,
@@ -119,7 +125,10 @@ impl JobKind {
                 Self::Export,
                 Self::Download,
                 Self::Capture,
+                Self::Batch,
             ],
+            // 一括は利用者の保存（その場で待っている）に譲る（同じ一括のプールと予算・台帳の門を使う。M14 段 4）
+            Self::Batch => &[Self::Edit],
             Self::Import
             | Self::Thumbnail
             | Self::Proxy
@@ -142,7 +151,8 @@ impl JobKind {
             | Self::Capture
             | Self::Export
             | Self::Edit
-            | Self::Gc => false,
+            | Self::Gc
+            | Self::Batch => false,
         }
     }
 }
@@ -221,7 +231,8 @@ mod tests {
             | JobKind::Export
             | JobKind::Analyze
             | JobKind::Edit
-            | JobKind::Gc => JobKind::ALL.contains(&kind),
+            | JobKind::Gc
+            | JobKind::Batch => JobKind::ALL.contains(&kind),
         }
     }
 
@@ -234,7 +245,8 @@ mod tests {
         assert_eq!(JobKind::parse("analyze"), Some(JobKind::Analyze));
         assert_eq!(JobKind::parse("edit"), Some(JobKind::Edit));
         assert_eq!(JobKind::parse("gc"), Some(JobKind::Gc));
-        assert_eq!(JobKind::parse("batch"), None);
+        assert_eq!(JobKind::parse("batch"), Some(JobKind::Batch));
+        assert_eq!(JobKind::parse("merge"), None);
         for state in [
             JobState::Queued,
             JobState::Running,
@@ -255,6 +267,7 @@ mod tests {
         assert_eq!(JobKind::Analyze.concurrency(), 1);
         assert_eq!(JobKind::Edit.concurrency(), 1);
         assert_eq!(JobKind::Gc.concurrency(), 1);
+        assert_eq!(JobKind::Batch.concurrency(), 1);
     }
 
     /// 譲る相手の表（解析は取り込み・サムネイル・保存に、GC は取り込み・サムネイル・保存・解析・書き出し・ダウンロード・
@@ -274,7 +287,12 @@ mod tests {
                 (JobKind::Export, &[][..]),
                 (
                     JobKind::Analyze,
-                    &[JobKind::Import, JobKind::Thumbnail, JobKind::Edit][..]
+                    &[
+                        JobKind::Import,
+                        JobKind::Thumbnail,
+                        JobKind::Edit,
+                        JobKind::Batch
+                    ][..]
                 ),
                 (JobKind::Edit, &[][..]),
                 (
@@ -287,8 +305,10 @@ mod tests {
                         JobKind::Export,
                         JobKind::Download,
                         JobKind::Capture,
+                        JobKind::Batch,
                     ][..]
                 ),
+                (JobKind::Batch, &[JobKind::Edit][..]),
             ]
         );
         for kind in JobKind::ALL {

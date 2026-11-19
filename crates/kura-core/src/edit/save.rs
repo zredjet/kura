@@ -941,7 +941,7 @@ impl JobHandler for EditHandler {
     /// 待ち・一時停止のまま中止された上書き・別名（`run` を通らないので上の印が置かれない）：積む前に置いた文書の部品が孤立
     /// しうるので、中止と同じトランザクションで GC の部品の印を置く（版に戻すは文書を持たない）。一時停止で残した作業用の PCM
     /// は、入力から鍵を求めて捨てる（GC のジョブ・閉じるのを待たずに消す。M13 段 3 の検証の直し）。
-    fn canceled_while_idle(&self, tx: &Connection, input_json: &str) -> Result<()> {
+    fn canceled_while_idle(&self, tx: &Connection, _job: JobId, input_json: &str) -> Result<()> {
         let input = serde_json::from_str::<JobInput>(input_json).ok();
         let with_doc = input
             .as_ref()
