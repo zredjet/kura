@@ -753,6 +753,8 @@ enum Act {
 #[derive(Debug, Clone)]
 struct Prepared {
     job: i64,
+    /// 版に書く持ち主（`UnitCx::version_job`。一括は None）。
+    version_job: Option<i64>,
     mode: Mode,
     item_id: i64,
     base: Base,
@@ -890,6 +892,9 @@ struct Go {
     unchanged: bool,
     /// 今回作ったアンカーを置く拡張子。
     anchor_ext: Option<String>,
+    /// この 1 件が書いた予告の行の ID（トランザクション 2 はこれだけを消す。同じ持ち主の前の 1 件が消せずに残した予告を
+    /// 巻き込まない。ADR-192 (5)）。
+    announced: Vec<i64>,
 }
 
 /// 予告のトランザクションの結果。
@@ -1441,6 +1446,7 @@ impl Saver {
         Ok(Flow::Go(Written {
             p: Prepared {
                 job,
+                version_job: ctx.version_job(),
                 mode,
                 item_id,
                 base,
@@ -1675,6 +1681,7 @@ impl Saver {
         Ok(Flow::Go(Written {
             p: Prepared {
                 job,
+                version_job: ctx.version_job(),
                 mode: d.mode,
                 item_id: d.item_id,
                 base: d.base,
@@ -1928,15 +1935,16 @@ fn announce(tx: &Connection, p: &Prepared, now: i64) -> Result<Tx1> {
             p.out_format
         ))
     })?;
+    let mut announced = Vec::new();
     if listed.is_none() {
-        ledger::announce(
+        announced.push(ledger::announce(
             tx,
             &p.out_hash,
             &ext,
             ledger::PendingKind::Place,
             Some(p.job),
             now,
-        )?;
+        )?);
     }
     let anchor_ext = match &p.anchor {
         AnchorUse::New(a) => {
@@ -1947,14 +1955,14 @@ fn announce(tx: &Connection, p: &Prepared, now: i64) -> Result<Tx1> {
             };
             let a_ext = a_listed.clone().unwrap_or_else(|| a.ext.to_string());
             if a_listed.is_none() {
-                ledger::announce(
+                announced.push(ledger::announce(
                     tx,
                     &a.hash,
                     &a_ext,
                     ledger::PendingKind::Place,
                     Some(p.job),
                     now,
-                )?;
+                )?);
             }
             Some(a_ext)
         }
@@ -1965,6 +1973,7 @@ fn announce(tx: &Connection, p: &Prepared, now: i64) -> Result<Tx1> {
         reused: listed.is_some(),
         unchanged,
         anchor_ext,
+        announced,
     }))
 }
 
@@ -2120,7 +2129,7 @@ fn add_head(
             file_blob_id: Some(blob),
             file_state: FileState::Hold,
             replaced_at: None,
-            job_id: Some(p.job),
+            job_id: p.version_job,
             now,
         },
     )?;
@@ -2240,7 +2249,7 @@ fn commit_overwrite(
         },
     )?;
     // (j)(l) 予告を消し、結果を呼び手の行に（保存のジョブは途中経過）
-    ledger::clear_announced(tx, p.job)?;
+    ledger::clear_pending(tx, &go.announced)?;
     let outcome = saved_json(p, go, id, version, vid);
     record(tx, &outcome)?;
     Ok(outcome)
@@ -2336,7 +2345,7 @@ fn commit_save_as(
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )?
     .execute(params![b, a, p.base.version, &p.base.hash[..], now])?;
-    ledger::clear_announced(tx, p.job)?;
+    ledger::clear_pending(tx, &go.announced)?;
     let outcome = saved_json(p, go, b, 1, vid);
     record(tx, &outcome)?;
     Ok(outcome)

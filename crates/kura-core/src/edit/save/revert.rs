@@ -47,6 +47,10 @@ pub(super) struct Target {
 #[derive(Debug, Clone)]
 pub(super) struct Out {
     job: i64,
+    /// 版に書く持ち主（`UnitCx::version_job`）。
+    version_job: Option<i64>,
+    /// この 1 件が書いた予告の行の ID（使い直しは置かないので空）。
+    announced: Vec<i64>,
     item_id: i64,
     base: Base,
     to: i64,
@@ -73,11 +77,20 @@ pub(super) struct Out {
 
 impl Out {
     /// 使い直す：版 k の中身が台帳に拡張子 `ext` で載っていて、ファイルがある。
-    fn reused(job: i64, item_id: i64, base: Base, target: &Target, ext: String) -> Result<Self> {
+    fn reused(
+        job: i64,
+        version_job: Option<i64>,
+        item_id: i64,
+        base: Base,
+        target: &Target,
+        ext: String,
+    ) -> Result<Self> {
         let v = &target.version;
         let record = v.record()?;
         Ok(Self {
             job,
+            version_job,
+            announced: Vec::new(),
             item_id,
             base,
             to: target.to,
@@ -111,6 +124,8 @@ impl Out {
             .map_err(|_| CoreError::TooLarge(format!("出力が大きすぎます: {}", p.out_size)))?;
         Ok(Self {
             job: p.job,
+            version_job: p.version_job,
+            announced: go.announced.clone(),
             item_id: p.item_id,
             base: p.base,
             to: target.to,
@@ -203,7 +218,7 @@ impl Saver {
             let hash = target.version.output_hash;
             let listed = db.read(|c| ledger::ext_of(c, &hash))?;
             if let Some(ext) = listed.filter(|ext| layout.content_path(&hash, ext).is_file()) {
-                let out = Out::reused(job, item_id, base, &target, ext)?;
+                let out = Out::reused(job, ctx.version_job(), item_id, base, &target, ext)?;
                 let record = record.clone();
                 let outcome = db.write(move |tx| commit_revert(tx, &out, now_ms(), &record))?;
                 drop(gate);
@@ -291,6 +306,7 @@ impl Saver {
         Ok(Flow::Go(Written {
             p: Prepared {
                 job,
+                version_job: ctx.version_job(),
                 mode: Mode::Revert,
                 item_id,
                 base,
@@ -1072,7 +1088,7 @@ pub(super) fn commit_revert(
             file_blob_id: Some(blob),
             file_state: FileState::Hold,
             replaced_at: None,
-            job_id: Some(o.job),
+            job_id: o.version_job,
             now,
         },
     )?;
@@ -1103,7 +1119,7 @@ pub(super) fn commit_revert(
             version,
         },
     )?;
-    ledger::clear_announced(tx, o.job)?;
+    ledger::clear_pending(tx, &o.announced)?;
     let outcome = json!({
         "outcome": if unchanged { "unchanged" } else { "saved" },
         "itemId": id,

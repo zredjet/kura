@@ -13,7 +13,7 @@ use super::save::{Committed, Flow, Mode, Record, Reverted, Saver, UnitCx};
 use super::save_stream_tests::{add_audio, audio_doc, opus_codecs, opus_decoder};
 use super::save_tests::{
     Env, add_item, assert_consistent, assert_done, base_of, doc, flip, gc_version, head,
-    heic_codecs, heic_decoder, render_png, staged, versions_of,
+    heic_codecs, heic_decoder, render_png, sprite, staged, versions_of,
 };
 use super::services::fake::FakeEngineFactory;
 use crate::CoreError;
@@ -28,6 +28,8 @@ struct TestUnit<'a> {
     tag: &'static str,
     progress: Mutex<Vec<f64>>,
     marks: Mutex<Vec<Json>>,
+    /// 一括の場のように、版に持ち主を書かない。
+    batch: bool,
 }
 
 impl<'a> TestUnit<'a> {
@@ -38,6 +40,15 @@ impl<'a> TestUnit<'a> {
             tag,
             progress: Mutex::new(Vec::new()),
             marks: Mutex::new(Vec::new()),
+            batch: false,
+        }
+    }
+
+    /// 一括の場（版の `job_id` を空にする）。
+    fn batch(lib: &'a Library, job: i64, tag: &'static str) -> Self {
+        Self {
+            batch: true,
+            ..Self::new(lib, job, tag)
         }
     }
 }
@@ -67,6 +78,10 @@ impl UnitCx for TestUnit<'_> {
 
     fn job(&self) -> i64 {
         self.job
+    }
+
+    fn version_job(&self) -> Option<i64> {
+        (!self.batch).then_some(self.job)
     }
 
     fn tag(&self) -> String {
@@ -331,6 +346,85 @@ fn the_staging_tag_names_every_part() {
         .unwrap();
     assert_eq!(done.saved, Some(MediaKind::Audio));
     assert_eq!(done.outcome["anchor"], "created");
+    assert_consistent(&env.lib);
+}
+
+/// 版に持ち主を書かない場（一括）なら、同じジョブで別々のアイテムを並べて準備し、順に何件もコミットできる（版の `job_id` は
+/// 空。ADR-192 (1)。段 2 の検証で、持ち主を書くと 2 件目が一意の索引で落ちた筋書き）。
+#[test]
+fn a_batch_unit_commits_many_items_in_one_job() {
+    let env = Env::new();
+    let saver = Saver::new(env.engine.clone());
+    let g = doc(&[flip("vertical")], None);
+    let items: Vec<(i64, Vec<u8>)> = (0..3)
+        .map(|k| {
+            let (id, _, png) = env.png(20 + k);
+            (id, png)
+        })
+        .collect();
+    let tags = ["9010-0", "9010-1", "9010-2"];
+    let units: Vec<TestUnit<'_>> = tags
+        .iter()
+        .map(|t| TestUnit::batch(&env.lib, 9010, t))
+        .collect();
+    let written: Vec<_> = items
+        .iter()
+        .zip(&units)
+        .map(|((id, _), unit)| prepared(&saver, unit, *id, &g))
+        .collect();
+    assert_eq!(names(&staged(&env.lib)).len(), 3);
+    for (k, (w, unit)) in written.into_iter().zip(&units).enumerate() {
+        let done = saver
+            .commit(unit, w, record_to(["test.b0", "test.b1", "test.b2"][k]))
+            .unwrap();
+        assert_eq!(done.outcome["outcome"], "saved");
+    }
+    for (id, png) in &items {
+        let vs = versions_of(&env.lib, *id);
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[1].job_id, None);
+        assert_eq!(vs[1].output_hash, hash_of_png(png, &g));
+    }
+    assert_consistent(&env.lib);
+}
+
+/// トランザクション 2 は、この 1 件が書いた予告だけを消す：同じ持ち主の前の 1 件が消せずに残した予告（と置いたままの
+/// ファイル）は残り、開くときの照合が片付ける（ADR-192 (5)。まとめて消すと、照合が見つけられない孤立したファイルが残った）。
+#[test]
+fn a_commit_clears_only_its_own_announcements() {
+    let env = Env::new();
+    let (a, _, _) = env.png(30);
+    // 前の 1 件が置いたが、消せずに残したファイルと予告
+    let stray = sprite(31);
+    let stray_hash = *blake3::hash(&stray).as_bytes();
+    let path = env.lib.layout().content_path(&stray_hash, "png");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &stray).unwrap();
+    env.lib
+        .db()
+        .write(move |tx| {
+            crate::library::ledger::announce(
+                tx,
+                &stray_hash,
+                "png",
+                crate::library::ledger::PendingKind::Place,
+                Some(9011),
+                1,
+            )
+        })
+        .unwrap();
+    let saver = Saver::new(env.engine.clone());
+    let unit = TestUnit::batch(&env.lib, 9011, "9011-1");
+    let written = prepared(&saver, &unit, a, &doc(&[flip("vertical")], None));
+    saver.commit(&unit, written, record_to("test.own")).unwrap();
+    assert_eq!(
+        env.count("SELECT count(*) FROM ledger_pending"),
+        1,
+        "前の 1 件の予告は残る"
+    );
+    // 開くときの照合が、台帳にないファイルを消して予告を片付ける
+    crate::library::ledger::settle_pending(env.lib.db(), env.lib.layout()).unwrap();
+    assert!(!path.exists());
     assert_consistent(&env.lib);
 }
 
