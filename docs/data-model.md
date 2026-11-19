@@ -1011,12 +1011,13 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 
   ```sql
   DELETE FROM settings WHERE key = 'gc.parts'
-     AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('queued','running','paused') AND kind = 'edit')
-     AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('failed','canceled') AND kind = 'edit' AND finished_at >= ?since);  -- どちらも idx_jobs_queue
+     AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('queued','running','paused') AND kind IN ('edit','batch'))
+     AND NOT EXISTS (SELECT 1 FROM jobs WHERE state IN ('failed','canceled') AND kind IN ('edit','batch') AND finished_at >= ?since);  -- どちらも idx_jobs_queue
   ```
 
-  （終わっていない保存と、7 日以内（`?since` は根と同じ今 − 7 日）に失敗・中止した保存は根として残すので、その部品があとで孤立しうるので
-  印を残す。7 日を過ぎて根から外れると、残した印で GC が積まれて片付け、印も消える。`the_parts_mark_outlives_failed_saves_until_their_roots_expire`）。
+  （終わっていない保存・一括と、7 日以内（`?since` は根と同じ今 − 7 日）に失敗・中止した保存・一括は根として残すので、その部品があとで孤立
+  しうるので印を残す。7 日を過ぎて根から外れると、残した印で GC が積まれて片付け、印も消える。`the_parts_mark_outlives_failed_saves_until_their_roots_expire`。
+  一括の根（下の「一括の根」）は M14 段 4 の検証の直し）。
   保存を積む口（`start_save`）は、同じアイテムの終わっていない保存のジョブがあれば何も置かずに `Busy` で断る（`save::pending_save`：
   `SELECT id, input_json FROM jobs WHERE state IN ('queued','running','paused') AND kind = 'edit'`（`idx_jobs_queue`）の入力のアイテムを比べる。
   部品を置くのと同じトランザクション）。保存のジョブは、入力が指す部品を置くのと同じトランザクションで
@@ -1105,10 +1106,11 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   WHERE job_id = ? AND ord = ? AND state = 'pending'` を書き、1 行でなければ（対象のアイテムが消えて行も消えた）Conflict でトランザクション
   ごと戻す（版と行が同じトランザクションなので、落ちても「版があるのに pending」「done なのに版がない」にならない）。飛ばした・失敗した・
   同じ中身の行は、同じ形で `state`・`code`・`message`・`finished_at` を書く（pending のときだけ）。中止（実行中・待ちのまま）は残りの
-  pending の行を canceled にする。OS のデコーダで読む前後の印は行の `decoding` に置く（`UPDATE batch_items SET decoding = ? WHERE
+  pending の行を canceled にする（実行中なら中止を見たときにすぐ。開き直した一括は、動く前に `SELECT EXISTS (SELECT 1 FROM batch_items
+  WHERE job_id = ? AND state = 'canceled')`（主キーの頭で引く）が真なら、中止を書いたあとに落ちたものとして残りを当てずに中止で終える）。OS のデコーダで読む前後の印は行の `decoding` に置く（`UPDATE batch_items SET decoding = ? WHERE
   job_id = ? AND ord = ?`。主キー）。結果は `SELECT state, count(*) FROM batch_items WHERE job_id = ? GROUP BY state`（主キーの頭で引く）。
 - **一括の根**：GC の部品の片付けは、終わっていない（と 7 日以内に失敗・中止した）一括のジョブの入力が写したレシピの文書の根も残す
-  （`save::gc_roots`・`live_roots` が `kind IN ('edit','batch')` を読む）。
+  （`save::gc_roots`・`live_roots` が `kind IN ('edit','batch')` を読む。部品の印を消す条件も同じ種類を見る：上の「文書の部品の片付け」）。
 - **一括の版の持ち主**（ADR-192 (1)）：一括で足した版は `item_versions.job_id` を NULL にし（1 件の場の `UnitCx::version_job` が None）、
   `batch_items.version_id` で引く。保存のジョブの 1 ジョブ 1 版（`idx_item_versions_job`・再開の `versions::by_job`）は変えない。台帳の
   予告の持ち主は一括のジョブで、トランザクション 2 はその 1 件の予告だけを行の ID で消す（上の「予告と照合」）。
