@@ -690,7 +690,7 @@ fn spawn_worker(inner: &Arc<Inner>, sched: &mut Sched, record: JobRecord) {
     let worker_inner = inner.clone();
     match std::thread::Builder::new()
         .name(format!("kura-job-{id}"))
-        .spawn(move || run_worker(&worker_inner, handler.as_ref(), ctx))
+        .spawn(move || run_worker(&worker_inner, &handler, ctx))
     {
         Ok(handle) => {
             sched.controls.insert(id, control);
@@ -707,7 +707,7 @@ fn spawn_worker(inner: &Arc<Inner>, sched: &mut Sched, record: JobRecord) {
     }
 }
 
-fn run_worker(inner: &Arc<Inner>, handler: &dyn JobHandler, ctx: JobContext) {
+fn run_worker(inner: &Arc<Inner>, handler: &Arc<dyn JobHandler>, ctx: JobContext) {
     let id = ctx.id();
     let kind = ctx.record.kind;
     (inner.sink)(JobEvent {
@@ -720,7 +720,18 @@ fn run_worker(inner: &Arc<Inner>, handler: &dyn JobHandler, ctx: JobContext) {
     });
     ctx.log("開始");
 
-    let outcome = handler.run(&ctx);
+    // 処理の panic はジョブの失敗にする（スレッドが黙って終わると、実行中の数と指示の受け口が戻らず、取り出しも終了も止まる。
+    // M14 段 4 の検証の直し）
+    let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.run(&ctx)))
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            tracing::error!(id, kind = kind.as_str(), "ジョブの処理が panic しました");
+            Err(CoreError::Invalid(
+                "ジョブの途中で内部の誤りが起きました".into(),
+            ))
+        }
+    };
     let shutting_down = ctx.control.load(Ordering::Acquire) == SHUTDOWN;
     let db = inner.library.db();
     let saved = match outcome {
@@ -742,13 +753,7 @@ fn run_worker(inner: &Arc<Inner>, handler: &dyn JobHandler, ctx: JobContext) {
                 )
             })
         }
-        Ok(JobEnd::Yield) => {
-            // 譲る相手が終わったらスケジューラが取り出し直す（一時停止にしない。アプリの終了でも queued のまま）
-            ctx.log("ほかのジョブに譲るため中断");
-            db.write(move |tx| {
-                store::transition(tx, id, &[JobState::Running], JobState::Queued).map(|_| ())
-            })
-        }
+        Ok(JobEnd::Yield) => yielded(inner, handler, &ctx),
         Ok(JobEnd::Paused) => {
             // アプリの終了で止めたものは次回自動で再開する
             let to = if shutting_down {
@@ -811,6 +816,46 @@ fn run_worker(inner: &Arc<Inner>, handler: &dyn JobHandler, ctx: JobContext) {
         sched.controls.remove(&id);
     }
     inner.wake.notify_all();
+}
+
+/// 譲ったジョブ：譲る相手が終わったらスケジューラが取り出し直す（一時停止にしない。アプリの終了でも queued のまま）。ただし、
+/// 譲ると決めたあとに受けた中止・一時停止は落とさない：指示の受け口を外して（以後の指示は DB の状態を変える道へ行く）受けた
+/// 指示を読み、同じ錠の中で状態を書く（中止なら、待ちのまま中止したときと同じ後始末。M14 段 4 の検証の直し）。
+fn yielded(inner: &Arc<Inner>, handler: &Arc<dyn JobHandler>, ctx: &JobContext) -> Result<()> {
+    let id = ctx.id();
+    let db = inner.library.db();
+    let Ok(mut sched) = inner.sched.lock() else {
+        ctx.log("ほかのジョブに譲るため中断");
+        return db.write(move |tx| {
+            store::transition(tx, id, &[JobState::Running], JobState::Queued).map(|_| ())
+        });
+    };
+    sched.controls.remove(&id);
+    match ctx.control.load(Ordering::Acquire) {
+        CANCEL => {
+            ctx.log("中止");
+            let (handler, input) = (handler.clone(), ctx.record.input_json.clone());
+            db.write(move |tx| {
+                if store::transition(tx, id, &[JobState::Running], JobState::Canceled)? {
+                    store::finish(tx, id, JobState::Canceled, None, None, None, None, now_ms())?;
+                    handler.canceled_while_idle(tx, id, &input)?;
+                }
+                Ok(())
+            })
+        }
+        PAUSE => {
+            ctx.log("一時停止");
+            db.write(move |tx| {
+                store::transition(tx, id, &[JobState::Running], JobState::Paused).map(|_| ())
+            })
+        }
+        _ => {
+            ctx.log("ほかのジョブに譲るため中断");
+            db.write(move |tx| {
+                store::transition(tx, id, &[JobState::Running], JobState::Queued).map(|_| ())
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1370,5 +1415,94 @@ mod tests {
         jobs.start().unwrap();
         assert!(jobs.wait_idle(Duration::from_secs(5)));
         assert_eq!(jobs.get(id).unwrap().state, JobState::Paused);
+    }
+
+    /// 待ち・一時停止のまま中止されたかを数える処理（`run` は `go` が立つまで待ってから譲る）。
+    struct YieldsLater {
+        go: Arc<AtomicBool>,
+        idle_cancels: Arc<AtomicUsize>,
+    }
+
+    impl JobHandler for YieldsLater {
+        fn run(&self, _ctx: &JobContext) -> Result<JobEnd> {
+            while !self.go.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(JobEnd::Yield)
+        }
+
+        fn canceled_while_idle(
+            &self,
+            _tx: &rusqlite::Connection,
+            _job: JobId,
+            _input_json: &str,
+        ) -> Result<()> {
+            self.idle_cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// 譲ると決めたあとに受けた中止・一時停止を落とさない（待ちに戻して、あとで勝手に再開しない。中止なら待ちのまま中止した
+    /// ときと同じ後始末を呼ぶ。M14 段 4 の検証の直し）。
+    #[test]
+    fn a_signal_received_while_yielding_is_kept() {
+        for (signal, want) in [(CANCEL, JobState::Canceled), (PAUSE, JobState::Paused)] {
+            let f = fixture();
+            let go = Arc::new(AtomicBool::new(false));
+            let idle_cancels = Arc::new(AtomicUsize::new(0));
+            let jobs = JobManager::new(
+                f.library.clone(),
+                vec![(
+                    JobKind::Import,
+                    Arc::new(YieldsLater {
+                        go: go.clone(),
+                        idle_cancels: idle_cancels.clone(),
+                    }) as Arc<dyn JobHandler>,
+                )],
+                sink(&f.events),
+            )
+            .unwrap();
+            let id = jobs.enqueue(JobKind::Import, "{}".into()).unwrap();
+            jobs.start().unwrap();
+            wait_state(&jobs, id, JobState::Running);
+            if signal == CANCEL {
+                jobs.cancel(id).unwrap();
+            } else {
+                jobs.pause(id).unwrap();
+            }
+            go.store(true, Ordering::SeqCst);
+            assert!(jobs.wait_idle(Duration::from_secs(5)));
+            assert_eq!(jobs.get(id).unwrap().state, want);
+            assert_eq!(
+                idle_cancels.load(Ordering::SeqCst),
+                usize::from(signal == CANCEL)
+            );
+        }
+    }
+
+    /// 処理が panic したジョブは失敗にし、実行中の数と指示の受け口を戻す（次のジョブが動き、終了も止まらない）。
+    #[test]
+    fn a_panicking_handler_fails_the_job_and_frees_the_slot() {
+        let f = fixture();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let seen = runs.clone();
+        let jobs = manager(&f, move |_ctx| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("試験の panic");
+            }
+            Ok(JobEnd::Done {
+                result_json: "{}".into(),
+                message: None,
+            })
+        });
+        let first = jobs.enqueue(JobKind::Import, "{}".into()).unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(Duration::from_secs(5)));
+        let record = jobs.get(first).unwrap();
+        assert_eq!(record.state, JobState::Failed);
+        assert_eq!(record.error_code.as_deref(), Some("Invalid"));
+        let second = jobs.enqueue(JobKind::Import, "{}".into()).unwrap();
+        assert!(jobs.wait_idle(Duration::from_secs(5)));
+        assert_eq!(jobs.get(second).unwrap().state, JobState::Done);
     }
 }
