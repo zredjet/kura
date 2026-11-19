@@ -160,16 +160,17 @@ fn row(conn: &Connection, id: i64) -> Result<Row> {
     })
 }
 
-/// 1 件を読む（文書は今のスキーマへ移して読み、当てる前の確かめ `check_recipe` の印か理由を付ける）。
+/// 1 件を読む（文書は今のスキーマへ移して読み、当てる前の確かめ `check_recipe` の印か理由を付ける）。文書は登録表を見ずに
+/// 読むので、この Kura の知らない操作・新しすぎる版を含むレシピ（新しい Kura で作って古い Kura で開いた）も読めて、理由
+/// （`problem`）が付く（書き出しと消すことはできる）。
 pub fn get(db: &Db, runtime: &EngineRuntime, id: i64) -> Result<StoredRecipe> {
     let (row, bytes) = db.read(|c| {
         let row = row(c, id)?;
         let bytes = store::load_doc_bytes(c, row.doc_id)?;
         Ok((row, bytes))
     })?;
-    let graph = runtime
-        .preview(|e| e.load(&bytes))
-        .map_err(|e| from_engine("レシピの文書を読めません", e))?;
+    let graph =
+        kura_engine::doc::load(&bytes).map_err(|e| from_engine("レシピの文書を読めません", e))?;
     let bindings = bindings_from_json(row.bindings.as_bytes())
         .map_err(|e| from_engine("レシピの結び付けを読めません", e))?;
     let recipe = Recipe {
@@ -348,16 +349,34 @@ pub fn reorder(tx: &Connection, ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
+/// 元 `id` のすぐ後ろの並びの値（元と次の中間。間が詰まっていれば、先に 1, 2, … に振り直す）。
+fn pos_after(tx: &Connection, id: i64) -> Result<f64> {
+    let around = |tx: &Connection| -> Result<(f64, Option<f64>)> {
+        let pos: f64 = tx
+            .prepare_cached("SELECT pos FROM edit_recipes WHERE id = ?1")?
+            .query_row([id], |r| r.get(0))?;
+        let next: Option<f64> = tx
+            .prepare_cached("SELECT min(pos) FROM edit_recipes WHERE pos > ?1")?
+            .query_row([pos], |r| r.get(0))?;
+        Ok((pos, next))
+    };
+    let mid = |(pos, next): (f64, Option<f64>)| next.map_or(pos + 1.0, |n| (pos + n) / 2.0);
+    let fits =
+        |(pos, next): (f64, Option<f64>), new: f64| new > pos && next.is_none_or(|n| new < n);
+    let found = around(tx)?;
+    if fits(found, mid(found)) {
+        return Ok(mid(found));
+    }
+    // 同じ間に何度も入れて中間が取れなくなった：今の順のまま振り直す
+    reorder(tx, &[])?;
+    let found = around(tx)?;
+    Ok(mid(found))
+}
+
 /// 複製し、新しい ID を返す（名前は「{名前} のコピー」、元のすぐ後ろに並べる。文書の部品は共有する）。
 pub fn duplicate(tx: &Connection, id: i64, now: i64) -> Result<i64> {
     let row = row(tx, id)?;
-    let pos: f64 = tx
-        .prepare_cached("SELECT pos FROM edit_recipes WHERE id = ?1")?
-        .query_row([id], |r| r.get(0))?;
-    let next: Option<f64> = tx
-        .prepare_cached("SELECT min(pos) FROM edit_recipes WHERE pos > ?1")?
-        .query_row([pos], |r| r.get(0))?;
-    let new_pos = next.map_or(pos + 1.0, |n| (pos + n) / 2.0);
+    let new_pos = pos_after(tx, id)?;
     tx.prepare_cached(
         "INSERT INTO edit_recipes (name, description, kind, doc_id, bindings, pos, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
@@ -651,6 +670,14 @@ mod tests {
             .unwrap();
         let g = editor_doc();
         let keep = [NodeId(2), NodeId(3)];
+        let grid = Binding {
+            node: NodeId(3),
+            param: "grid".into(),
+            part: None,
+            from: Source::Setting {
+                key: SettingKey::Grid,
+            },
+        };
         replace_from_editor(
             env.lib.db(),
             &rt,
@@ -659,7 +686,7 @@ mod tests {
                 graph: &g,
                 keep: &keep,
                 with_format: false,
-                bindings: Vec::new(),
+                bindings: vec![grid.clone()],
             },
         )
         .unwrap();
@@ -679,6 +706,14 @@ mod tests {
             .map(|n| n.op.as_str())
             .collect();
         assert_eq!(ops, ["image.flip", "meta.set_grid"]);
+        // 結び付けもレシピのノード（付け直した 2）で差し替わる
+        assert_eq!(
+            stored.recipe.bindings,
+            vec![Binding {
+                node: NodeId(2),
+                ..grid
+            }]
+        );
         assert_eq!(names(&env), ["A", "B"]);
         assert!(env.lib.db().read(parts_marked).unwrap());
         assert!(matches!(
@@ -696,5 +731,48 @@ mod tests {
             .unwrap_err(),
             CoreError::NotFound(_)
         ));
+    }
+
+    /// この Kura の知らない操作を含むレシピ（新しい Kura で作って古い Kura で開いた形）も、1 件は読めて理由が付き、書き出せる。
+    #[test]
+    fn a_recipe_with_an_unknown_op_reads_with_a_problem() {
+        let env = Env::new();
+        let rt = runtime(&env);
+        let mut g = Graph::new_single();
+        g.push_linear("image.future", 1, json!({}), 0).unwrap();
+        let recipe = Recipe {
+            name: "新しい".into(),
+            description: String::new(),
+            kind: RecipeKind::Each,
+            graph: g,
+            bindings: Vec::new(),
+        };
+        let id = env
+            .lib
+            .db()
+            .write(move |tx| insert(tx, &recipe, 1))
+            .unwrap();
+        let stored = get(env.lib.db(), &rt, id).unwrap();
+        assert!(stored.problem.is_some(), "{stored:?}");
+        assert_eq!(stored.recipe.graph.nodes[0].op, "image.future");
+        let bytes = export(env.lib.db(), &rt, id).unwrap();
+        assert!(String::from_utf8(bytes).unwrap().contains("image.future"));
+        // この Kura では読み込めない（知らない操作）
+        assert!(import(env.lib.db(), &rt, &export(env.lib.db(), &rt, id).unwrap()).is_err());
+    }
+
+    /// 同じ元を何度複製しても、新しいコピーはいつも元のすぐ後ろに並ぶ（中間が取れなくなったら振り直す）。
+    #[test]
+    fn many_copies_stay_right_after_the_original() {
+        let env = Env::new();
+        let a = create(&env, "A", &[1]);
+        create(&env, "B", &[1]);
+        for k in 0..60 {
+            let copy = env.lib.db().write(move |tx| duplicate(tx, a, 5)).unwrap();
+            let rows = env.lib.db().read(list).unwrap();
+            assert_eq!(rows[0].id, a, "{k}");
+            assert_eq!(rows[1].id, copy, "{k}");
+            assert_eq!(rows.last().unwrap().name, "B", "{k}");
+        }
     }
 }
