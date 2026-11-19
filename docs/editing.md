@@ -1450,7 +1450,7 @@ NotFound）で積まない（写しが古い結び付けと新しい文書の組
   （Crashed）、B12 一括で待っているアイテムはエディタで開かず（SavePending）保存も積まない（Busy）、B13 保存のジョブに譲って
   残りから続ける（どの行もちょうど 1 回）・譲ると同時の中止は中止が勝つ、B14 動いている一括のレシピの文書は GC が残す、B15 音声を
   流して書く。ほかに、上書きの出力が別のアイテムの今と同じなら existing、働き手の 1 件の panic はその行だけ failed（Internal）、
-  積むトランザクションの中でレシピの変わり目を見つける。本当に落とす試験は `kura-devtools edit crash-loop --batch N`
+  積むトランザクションの中でレシピの変わり目を見つける。本当に落とす試験は `kura-devtools edit crash-loop --batch N [--save-as]`
   （architecture.md §13）。SVG を別のプロセスの働き手で読むアプリの組は、保存・解析と同じ組を使う（働き手の試験は
   `kura-core/tests/svg_worker.rs`）。
 
