@@ -353,10 +353,32 @@ export const commands = {
 	recipeExport: (id: number, path: string) => typedError<null, AppError>(__TAURI_INVOKE("recipe_export", { id, path })),
 	/**  `.kurarecipe`（開くダイアログで選んだ絶対パス）を読み込んで足す。通常のファイルだけを、4 MiB まで読む。 */
 	recipeImport: (path: string) => typedError<RecipeImportedDto, AppError>(__TAURI_INVOKE("recipe_import", { path })),
+	/**
+	 *  事前チェック（描かずに、当てられるか・出力の形・失うもの・見積もり・飛ばす理由）。進みは `batch://precheck`（`token`）。
+	 *  `batch_precheck_cancel` で止めると code `Conflict`（kura-core の Canceled）。同じ `token` の事前チェックが動いていれば Busy。
+	 */
+	batchPrecheck: (token: string, request: BatchRequestDto) => typedError<BatchPrecheckDto, AppError>(__TAURI_INVOKE("batch_precheck", { token, request })),
+	/**  動いている事前チェック `token` を止める（なければ何もしない）。 */
+	batchPrecheckCancel: (token: string) => typedError<null, AppError>(__TAURI_INVOKE("batch_precheck_cancel", { token })),
+	/**
+	 *  一括のジョブを積む（ジョブの ID を返す）。レシピが読んだあとに変わったら Conflict、当てられないレシピ・対象がない・
+	 *  別名の名前の型が空なら Invalid、写しの文書が片付けられていれば NotFound。
+	 */
+	batchStart: (request: BatchRequestDto) => typedError<number, AppError>(__TAURI_INVOKE("batch_start", { request })),
+	/**  一括の結果（向き・レシピ・状態と理由ごとの群・作ったアイテム・元に戻せるか）。 */
+	batchResult: (job: number) => typedError<BatchResultDto, AppError>(__TAURI_INVOKE("batch_result", { job })),
+	/**  一括の行（行の順。`state`・`code` があればそれだけ。`offset` から `limit` 件、limit は 1〜1,000）。 */
+	batchRows: (job: number, rowState: string | null, code: string | null, offset: number, limit: number) => typedError<BatchRowDto[], AppError>(__TAURI_INVOKE("batch_rows", { job, rowState, code, offset, limit })),
+	/**
+	 *  一括 `job` の［元に戻す…］を積む（ジョブの ID を返す）。元の一括が終わっていない・戻す一括が動いていれば Busy、戻す一括を
+	 *  戻す・戻すものがなければ Invalid。
+	 */
+	batchUndo: (job: number) => typedError<number, AppError>(__TAURI_INVOKE("batch_undo", { job })),
 };
 
 /** Events */
 export const events = {
+	batchPrecheck: makeEvent<BatchPrecheckProgress>("batch://precheck"),
 	captureLoginShot: makeEvent<LoginShotEvent>("capture://login-shot"),
 	jobProgress: makeEvent<JobProgress>("job://progress"),
 	libraryUpgrade: makeEvent<LibraryUpgradeEvent>("library://upgrade"),
@@ -685,6 +707,89 @@ export type BackupDto = {
 	sizeBytes: number,
 };
 
+/**  一括の向き（結果）。 */
+export type BatchActionDto = { type: "overwrite" } | { type: "saveAs"; name: string } | 
+/**  一括 `of` の［元に戻す…］。 */
+{ type: "undo"; of: number; saveAs: boolean };
+
+/**  状態と理由ごとの群。 */
+export type BatchGroupDto = {
+	state: string,
+	code: string | null,
+	items: number[],
+};
+
+/**  一括の向き。 */
+export type BatchModeDto = { type: "overwrite" } | 
+/**  別名（`name` は名前の型。`{名前}` にアイテムの表示名が入る。既定は「{名前} のコピー」）。 */
+{ type: "saveAs"; name: string };
+
+/**  事前チェックの結果（アイテムは ID の列だけ）。 */
+export type BatchPrecheckDto = {
+	total: number,
+	/**  当てる見込み（確かめられなかったものを含む）。 */
+	apply: number[],
+	skips: PrecheckGroupDto[],
+	unchecked: PrecheckGroupDto[],
+	outputs: OutputGroupDto[],
+	losses: LossGroupDto[],
+	/**  編集済みで、今の中身に続けて当てるもの。 */
+	composed: number[],
+	disk: DiskEstimateDto,
+	memoryPeak: number,
+	memoryBudget: number,
+	bound: BoundExampleDto[],
+	notes: RecipeNote[],
+};
+
+/**  事前チェックの進み（イベント `batch://precheck`）。 */
+export type BatchPrecheckProgress = {
+	/**  `batch_precheck` に渡した印。 */
+	token: string,
+	done: number,
+	total: number,
+};
+
+/**  一括の頼み（事前チェックと積むで同じ）。 */
+export type BatchRequestDto = {
+	source: RecipeSourceDto,
+	/**  当てるアイテム（選んだ順）。 */
+	items: number[],
+	mode: BatchModeDto,
+	/**  上書きで、保存していない下書きのあるアイテムも含める（初めは外す）。 */
+	includeDrafts: boolean,
+};
+
+/**  一括の結果（結果のシート）。 */
+export type BatchResultDto = {
+	job: number,
+	state: JobStateDto,
+	action: BatchActionDto,
+	/**  当てたレシピの名前（元に戻す一括は null）。 */
+	recipe: string | null,
+	includeDrafts: boolean,
+	total: number,
+	groups: BatchGroupDto[],
+	/**  別名で作ったアイテム。 */
+	created: number[],
+	/**  この一括を元に戻す一括（古い順）。 */
+	undoneBy: number[],
+	/**  元に戻せる件数（0 なら［元に戻す…］を押せない）。 */
+	undoAvailable: number,
+};
+
+/**  1 件の行。 */
+export type BatchRowDto = {
+	ord: number,
+	itemId: number,
+	state: string,
+	code: string | null,
+	message: string | null,
+	versionId: number | null,
+	outItemId: number | null,
+	finishedAt: number | null,
+};
+
 /**  引数をアイテムの値に結び付けられる出どころの種類（M14 段 1。レシピの結び付け）。 */
 export type BindKind = 
 /**  素材の設定の格子（`ParamKind::Grid` の引数）。 */
@@ -721,6 +826,13 @@ export type Binding_Serialize = {
 	/**  区間（`FrameRange`）の片方だけを結ぶとき。 */
 	part?: RangePart | null,
 	from: Source,
+};
+
+/**  結び付けで読む値の例。 */
+export type BoundExampleDto = {
+	itemId: number,
+	/**  読んだ値と書いた値（`recipe::bound_json` の形の JSON の文字列）。 */
+	boundJson: string,
 };
 
 /**  URL に一致したキャプチャのルール。 */
@@ -829,6 +941,14 @@ export type DetectionDto = {
 
 /**  32 バイトのダイジェスト。文字列では小文字の 16 進。 */
 export type Digest = string;
+
+/**  ディスクの目安（バイト）。 */
+export type DiskEstimateDto = {
+	/**  新しく書くファイルの目安（元の大きさを値の大きさの比で伸ばしたもの）。 */
+	newBytes: number,
+	/**  上書きで置き換わる今のファイル（7 日残してから片付ける）。 */
+	replacedBytes: number,
+};
 
 /**  ディザの種類。 */
 export type Dither = 
@@ -2089,6 +2209,31 @@ export type LoginShotEvent = {
 	result: SnapshotResultDto | null,
 };
 
+/**  失うもの（描かないので「ありうる」もの。docs/editing.md §14.2「事前チェック」）。 */
+export type LossDto = 
+/**  非可逆の形式に書く。 */
+{ type: "lossy" } | 
+/**  透明を持てない形式（透明な画素があれば書けずに失敗する）。 */
+{ type: "alpha" } | 
+/**  半透明を持てない形式（GIF）。 */
+{ type: "semiAlpha" } | 
+/**  16 ビットを 8 ビットに。 */
+{ type: "highBits" } | 
+/**  色の数に上限のある形式（減色する）。 */
+{ type: "colors"; max: number } | 
+/**  ループ点を保存できない形式。 */
+{ type: "loopPoints" } | 
+/**  上書きで大きさ・長さが変わり、素材の設定が合わなくなりうる。 */
+{ type: "settings" };
+
+/**  失うものの群。 */
+export type LossGroupDto = {
+	loss: LossDto,
+	/**  書く形式（素材の設定は空）。 */
+	format: string,
+	items: number[],
+};
+
 /**  メタデータの扱い。 */
 export type MetaAccess = 
 /**  エンジンが `SpaceMap`・`TimeMap` で写す（ふつう）。 */
@@ -2174,6 +2319,17 @@ export type Origin =
 "ratio" | 
 /**  元の座標・長さで書いた値（矩形・点・区間・標本の数・描いたもの・パレットの番号・格子）。ほかのアイテムでは合わないことがある。 */
 "source";
+
+/**  出力の形式ごとの群。 */
+export type OutputGroupDto = {
+	format: string,
+	/**  別名で、レシピの形式に書けないので代わりの形式で作る。 */
+	fallback: boolean,
+	items: number[],
+	examples: ShapeChangeDto[],
+	/**  今の大きさ・長さから変わる件数。 */
+	resized: number,
+};
 
 /**  文書の出力の ID。 */
 export type OutputId = number;
@@ -2420,6 +2576,15 @@ export type PortSpec = {
 	accepts: ValueKind[],
 };
 
+/**  理由ごとの群。 */
+export type PrecheckGroupDto = {
+	/**  `skipped`・`failed`（当てるときの行の状態）。確かめられなかったものは `pending`。 */
+	state: string,
+	code: string,
+	message: string,
+	items: number[],
+};
+
 /**  前に取得したダウンロード。 */
 export type PreviousDownloadDto = {
 	jobId: number,
@@ -2556,6 +2721,13 @@ export type RecipeNote = {
 	status: OpStatus,
 };
 
+/**  当てるレシピの出どころ。 */
+export type RecipeSourceDto = 
+/**  レシピの表のレシピ。 */
+{ type: "recipe"; id: number } | 
+/**  一括のジョブを積んだときのレシピの写し（結果のシートの［やり直す］）。 */
+{ type: "job"; job: number };
+
 /**  一覧の 1 行（サイドバーの節・レシピの画面の見出し）。 */
 export type RecipeSummaryDto = {
 	id: number,
@@ -2602,6 +2774,18 @@ export type Severity =
 "error" | 
 /**  実行できるが、知らせることがある（メタデータを落とした、など）。 */
 "warning";
+
+/**  元の形 → 出力の形。 */
+export type ShapeChangeDto = {
+	itemId: number,
+	from: ShapeInfoDto,
+	to: ShapeInfoDto,
+};
+
+/**  形の要約（大きさ・長さが上限しか分からなければ null）。 */
+export type ShapeInfoDto = { kind: "image"; w: number | null; h: number | null; 
+/**  フレームの列の数（1 枚の画像は null）。 */
+frames: number | null } | { kind: "audio"; rate: number; channels: number; frames: number | null };
 
 /**  操作の型の記述。 */
 export type Signature = {

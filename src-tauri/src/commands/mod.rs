@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod appearance;
 pub mod asset;
+pub mod batch;
 pub mod bench;
 pub mod capture;
 pub mod downloads;
