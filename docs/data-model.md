@@ -1073,7 +1073,7 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   6. 終わっていない（待ち・実行中・一時停止の）保存のジョブの入力の文書は、根の部品があってつなぎ直せる（GC の部品の片付けが消さない。
      段 3）。
 
-### 一括加工（M14。`crates/kura-core/src/edit/recipes.rs`・`edit/save/`。docs/editing.md §4.3、ADR-190・192）
+### 一括加工（M14。`crates/kura-core/src/edit/recipes.rs`・`edit/save/`・`edit/batch.rs`・`edit/batch/`。docs/editing.md §4.3・§14.2、ADR-190・192〜195）
 
 - **レシピの読み書き**（`edit::recipes`）：一覧は並びの順に、操作の数を文書の根の子の数（部品の辺を主キーで引く）、結び付けの数を JSON の
   配列の長さで数える。レシピは利用者が作る小さな表なので、プレイリストと同じく表を走査する（`a_recipe_made_from_the_editor_round_trips`
@@ -1114,6 +1114,17 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 - **一括の版の持ち主**（ADR-192 (1)）：一括で足した版は `item_versions.job_id` を NULL にし（1 件の場の `UnitCx::version_job` が None）、
   `batch_items.version_id` で引く。保存のジョブの 1 ジョブ 1 版（`idx_item_versions_job`・再開の `versions::by_job`）は変えない。台帳の
   予告の持ち主は一括のジョブで、トランザクション 2 はその 1 件の予告だけを行の ID で消す（上の「予告と照合」）。
+- **結果と元に戻す**（M14 段 5。表は変えない）：結果のシートは `SELECT item_id, state, code, out_item_id FROM batch_items WHERE job_id = ?
+  ORDER BY ord`（主キー）で状態と理由ごとに群にし、1 件ずつの行は `... WHERE job_id = ?1 AND (?2 IS NULL OR state = ?2) AND (?3 IS NULL
+  OR code = ?3) ORDER BY ord LIMIT ? OFFSET ?`（主キーの頭）。元に戻す一括（`jobs.input_json` の `mode.type = 'undo'`・`mode.of` が元の
+  一括）の行も `batch_items` に持ち、`item_id` は戻すアイテム（別名なら作ったアイテム）、`base_hash`・`base_version` は処理したときの頭、
+  `version_id` は戻した版（kind = revert。別名をゴミ箱へ入れた行は NULL）。積むときは元の一括の `SELECT item_id, out_item_id FROM
+  batch_items WHERE job_id = ? AND state IN ('saved','unchanged') AND version_id IS NOT NULL ORDER BY ord` から、前に戻した一括で
+  saved・unchanged の行（`UNIQUE (job_id, item_id)`）を除く。ある一括を戻す一括は `SELECT id, state FROM jobs WHERE kind = 'batch' AND
+  json_extract(input_json, '$.mode.type') = 'undo' AND json_extract(input_json, '$.mode.of') = ?`（ジョブの表は小さいので走査する）。
+  1 件を戻すときは元の行を `WHERE job_id = ? AND item_id = ?`（上書き。`UNIQUE (job_id, item_id)`）・`WHERE out_item_id = ? AND job_id = ?`
+  （別名。`idx_batch_items_out_item`）で引き、`item_versions` を ID で結んで一括の版の番号を読む。別名の戻しは、頭を照らしてからゴミ箱へ
+  入れ（`UPDATE items SET trashed_at = ?`）、行を saved にするのを 1 つのトランザクションで行う。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
 
