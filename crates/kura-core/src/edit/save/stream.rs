@@ -970,7 +970,7 @@ pub(super) fn promote(
         .join(format!("edit-{tag}-anchor.wav.part"));
     staging.add(part.clone());
     reflink_copy::reflink_or_copy(&work.pcm().path, &part)?;
-    File::open(&part)?.sync_all()?;
+    cx.ctx.sync_file(&File::open(&part)?)?;
     let opener = path_opener(&part);
     let (limits, mon) = (cx.limits, cx.mon);
     let verified = cx.runtime.bulk(|_| {
@@ -1044,7 +1044,7 @@ pub(super) fn write_output(
         let file = w
             .into_inner()
             .map_err(|e| EngineError::Io(e.into_error()))?;
-        file.sync_all()?;
+        cx.ctx.sync_file(&file)?;
         let warnings = src.warnings().iter().map(|w| w.message.clone()).collect();
         Ok::<_, EngineError>(Written { encoded, warnings })
     });

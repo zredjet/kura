@@ -4,6 +4,9 @@
 //! ここに足す。
 
 pub mod anchors;
+pub mod batch;
+#[cfg(test)]
+mod batch_tests;
 pub mod drafts;
 pub mod editor;
 pub mod gc;
@@ -28,7 +31,9 @@ pub mod work_pcm;
 pub use gc::{GcClock, GcHandler};
 pub use runtime::{EngineRuntime, RuntimeConfig, pool_sizes};
 pub use save::{Base, EditHandler, SaveAction, SaveRequest, start_save};
-pub use services::{CodecSet, ENGINE_WORK_DIR, EngineFactory, EngineServices};
+pub use services::{
+    CodecSet, Durability, ENGINE_WORK_DIR, EngineFactory, EngineServices, FullSync,
+};
 
 use kura_engine::EngineError;
 

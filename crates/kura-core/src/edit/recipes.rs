@@ -160,6 +160,21 @@ fn row(conn: &Connection, id: i64) -> Result<Row> {
     })
 }
 
+/// レシピの文書の根のダイジェスト（一括のジョブの入力に写す）。
+pub fn doc_root(conn: &Connection, id: i64) -> Result<kura_engine::Digest> {
+    let digest: Vec<u8> = conn
+        .prepare_cached(
+            "SELECT o.digest FROM edit_recipes r JOIN edit_objects o ON o.id = r.doc_id WHERE r.id = ?1",
+        )?
+        .query_row([id], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| CoreError::NotFound(format!("レシピ {id}")))?;
+    let digest: [u8; 32] = digest.try_into().map_err(|_| {
+        CoreError::Invalid(format!("レシピ {id} の文書のダイジェストが壊れています"))
+    })?;
+    Ok(kura_engine::Digest(digest))
+}
+
 /// 1 件を読む（文書は今のスキーマへ移して読み、当てる前の確かめ `check_recipe` の印か理由を付ける）。文書は登録表を見ずに
 /// 読むので、この Kura の知らない操作・新しすぎる版を含むレシピ（新しい Kura で作って古い Kura で開いた）も読めて、理由
 /// （`problem`）が付く（書き出しと消すことはできる）。

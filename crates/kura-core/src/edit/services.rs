@@ -49,6 +49,33 @@ pub trait EngineFactory: Send + Sync {
     /// コーデックの組（固定の段 → Platform → ffmpeg）。`work_dir` は ffmpeg の一時ファイルの置き場。呼ぶたびに外部ツールを
     /// 探し直す（設定で指定した場所を含む）。
     fn codecs(&self, work_dir: &Path) -> CodecSet;
+    /// 一括加工のファイルの耐久の取り方（M14 段 4。ADR-190 (2)・ADR-193）。既定は 1 件ずつ `sync_all` で区切りは何もしない
+    /// （[`FullSync`]。保存のジョブと同じ耐久）。kura-mac は 1 件ずつ fsync・区切りで F_FULLFSYNC。
+    fn durability(&self) -> Arc<dyn Durability> {
+        Arc::new(FullSync)
+    }
+}
+
+/// ファイルの耐久の取り方（一括加工。M14 段 4）：1 件ずつは安い同期で置き、まとまりのコミットの前に 1 回だけ区切りの同期を
+/// 取る。区切りの同期のあとにコミットするので、DB が中身の永続になっていないファイルを指すことはない。
+pub trait Durability: Send + Sync {
+    /// 1 つのファイルを同期する（1 件ずつ。ドライブのキャッシュまで流さなくてよい）。
+    fn sync_file(&self, file: &std::fs::File) -> std::io::Result<()>;
+    /// それまでに同期したファイルを永続にする区切り（ドライブのキャッシュを流す。`file` は同じボリュームのファイル）。
+    fn barrier(&self, file: &std::fs::File) -> std::io::Result<()>;
+}
+
+/// 既定の耐久：1 件ずつ `sync_all`（macOS では F_FULLFSYNC）。区切りは何もしない（もう永続になっている）。
+pub struct FullSync;
+
+impl Durability for FullSync {
+    fn sync_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+        file.sync_all()
+    }
+
+    fn barrier(&self, _file: &std::fs::File) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// 開いているライブラリのエンジンの部品。[`crate::library::LibrarySession`] が開くときに作り、閉じると捨てる。
@@ -299,6 +326,11 @@ impl EngineServices {
             "エンジンの実行の場を作りました"
         );
         Ok(self.runtime.get_or_init(|| runtime))
+    }
+
+    /// 一括加工のファイルの耐久の取り方（[`EngineFactory::durability`]）。
+    pub fn durability(&self) -> Arc<dyn Durability> {
+        self.factory.durability()
     }
 
     /// コーデックの組。最初に呼んだとき（とツールの場所を変えたあと）に作る。ffmpeg を探して問い合わせるので、ジョブか

@@ -25,6 +25,7 @@ pub mod alloc;
 mod bridge;
 mod browser;
 pub mod codec;
+mod durability;
 mod external;
 mod files;
 pub mod fonts;
@@ -39,6 +40,7 @@ pub use codec::{
     MacCaps, codec_caps, codec_set, full_codec_set, platform_decoders, platform_encoders,
     platform_status,
 };
+pub use durability::MacDurability;
 pub use external::{ExternalPlayer, open_in_player};
 pub use files::{
     VolumeCapacity, keep_webview_focus_on_fullscreen, physical_memory, reveal_in_finder,

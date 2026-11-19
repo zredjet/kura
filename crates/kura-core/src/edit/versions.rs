@@ -139,6 +139,10 @@ pub struct VersionRecord {
     /// 元に戻した版の記録。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revert: Option<RevertRecord>,
+    /// 一括加工で足した版の出どころ（M14 段 4。`{"job","recipe":{"name","digest"},"bound":[…]}`：一括のジョブ、レシピ、結び付けで
+    /// 読んだ値 `recipe::bound_json`）。版の文書は具体的な値だけを持ち、読んだ値はここに残す（ADR-190 (3)）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<serde_json::Value>,
 }
 
 impl VersionRecord {
@@ -152,6 +156,7 @@ impl VersionRecord {
             media: None,
             warnings: Vec::new(),
             revert: None,
+            batch: None,
         }
     }
 }

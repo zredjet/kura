@@ -29,6 +29,10 @@ impl EngineFactory for MacEngineFactory {
         }
         set
     }
+
+    fn durability(&self) -> std::sync::Arc<dyn kura_core::edit::Durability> {
+        std::sync::Arc::new(kura_mac::MacDurability)
+    }
 }
 
 #[cfg(test)]

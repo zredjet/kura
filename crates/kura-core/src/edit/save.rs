@@ -244,9 +244,19 @@ pub fn start_save(db: &Db, jobs: &JobManager, req: &SaveRequest) -> Result<JobId
     })
 }
 
-/// アイテム `item_id` の終わっていない（待ち・実行中・一時停止の）保存のジョブ（あればその 1 つ）。状態の索引
-/// `idx_jobs_queue` で引き、入力を読んでアイテムを比べる（読めない入力は飛ばす。そのジョブは動くときに失敗する）。
+/// アイテム `item_id` を待っている終わっていない（待ち・実行中・一時停止の）保存のジョブか、一括のジョブ（M14 段 4。その
+/// アイテムの行がまだ pending）。あればその 1 つ。保存のジョブは状態の索引 `idx_jobs_queue` で引いて入力を読んでアイテムを比べ
+/// （読めない入力は飛ばす。そのジョブは動くときに失敗する）、一括は `idx_batch_items_item` で引く。エディタを開くとき
+/// （`SavePending`）と保存を積むとき（Busy）に見る（一括で待っているアイテムを、一括の土台がずれるまで開かない）。
 pub fn pending_save(conn: &Connection, item_id: i64) -> Result<Option<JobId>> {
+    if let Some(job) = pending_edit_job(conn, item_id)? {
+        return Ok(Some(job));
+    }
+    super::batch::pending_batch(conn, item_id)
+}
+
+/// アイテム `item_id` の終わっていない保存のジョブ（上書き・別名・版に戻す。一括は数えない：一括の 1 件が自分を数えないように）。
+pub(crate) fn pending_edit_job(conn: &Connection, item_id: i64) -> Result<Option<JobId>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit'",
     )?;
@@ -330,25 +340,27 @@ fn split_graph(graph: &Graph) -> Result<kura_engine::doc_parts::DocParts> {
     split(graph).map_err(|e| from_engine("文書を部品に分けられません", e))
 }
 
-/// 終わっていない（待ち・実行中・一時停止の）保存のジョブの入力が指す文書の根（版の不変条件で、部品があることを確かめる）。
+/// 終わっていない（待ち・実行中・一時停止の）保存のジョブの入力が指す文書の根と、一括のジョブ（M14）の入力が指すレシピの文書の根
+/// （版の不変条件で、部品があることを確かめる）。
 /// 版に戻すジョブは文書を持たない。読めない入力は飛ばす（そのジョブは動くときに失敗する）。
 pub fn live_roots(conn: &Connection) -> Result<Vec<Digest>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit'",
+        "SELECT input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind IN ('edit', 'batch')",
     )?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     roots_of(rows)
 }
 
-/// GC の部品の片付けで残す保存のジョブの根（docs/data-model.md §4「保存と版（M12）」）：終わっていないジョブと、`since` 以後に
+/// GC の部品の片付けで残す保存のジョブと一括のジョブ（M14。レシピの文書の写し）の根（docs/data-model.md §4「保存と版（M12）」）：
+/// 終わっていないジョブと、`since` 以後に
 /// 失敗・中止したジョブ（利用者がやり直せるように。前回 OS のデコーダで読んでいる途中で落ちた保存は、失敗にしてやり直しで
 /// 読み直す。docs/editing.md §14 の段 0）。どちらも `idx_jobs_queue`（状態）で引く。
 pub fn gc_roots(conn: &Connection, since: i64) -> Result<Vec<Digest>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind = 'edit'
+        "SELECT input_json FROM jobs WHERE state IN ('queued', 'running', 'paused') AND kind IN ('edit', 'batch')
          UNION ALL
          SELECT input_json FROM jobs
-          WHERE state IN ('failed', 'canceled') AND kind = 'edit' AND finished_at >= ?1",
+          WHERE state IN ('failed', 'canceled') AND kind IN ('edit', 'batch') AND finished_at >= ?1",
     )?;
     let rows = stmt.query_map([since], |r| r.get::<_, String>(0))?;
     roots_of(rows)
@@ -358,9 +370,12 @@ pub fn gc_roots(conn: &Connection, since: i64) -> Result<Vec<Digest>> {
 fn roots_of(rows: impl Iterator<Item = rusqlite::Result<String>>) -> Result<Vec<Digest>> {
     let mut out = Vec::new();
     for row in rows {
-        match serde_json::from_str::<JobInput>(&row?).map(|i| i.action) {
+        let row = row?;
+        match serde_json::from_str::<JobInput>(&row).map(|i| i.action) {
             Ok(ActionInput::Overwrite { doc } | ActionInput::SaveAs { doc, .. }) => out.push(doc),
-            Ok(ActionInput::Revert { .. }) | Err(_) => {}
+            Ok(ActionInput::Revert { .. }) => {}
+            // 一括のジョブ（M14 段 4）の入力の写しが指すレシピの文書
+            Err(_) => out.extend(super::batch::roots_of_input(&row)),
         }
     }
     out.sort();
@@ -546,6 +561,13 @@ impl Saver {
             #[cfg(test)]
             hook: None,
         }
+    }
+
+    /// 段 `fault` の直後で、後始末を通らずに失敗させる（テストの強制終了）。
+    #[cfg(test)]
+    pub(crate) fn with_fault(mut self, fault: Fault) -> Self {
+        self.fault = Some(fault);
+        self
     }
 
     #[cfg(test)]
@@ -740,10 +762,12 @@ impl AnchorUse {
 /// 何を書いたか（段 8 の分かれ目）。
 #[derive(Debug, Clone)]
 enum Act {
-    /// 文書を描いた版（上書き・別名で保存）。`names` は別名で保存の (表示名, 語幹)。
+    /// 文書を描いた版（上書き・別名で保存）。`names` は別名で保存の (表示名, 語幹)。`parts` は DB にまだない文書の部品
+    /// （一括で継ぎ足した文書。トランザクション 2 で置く。保存のジョブは積む前に置いたので None）。
     Edit {
         doc: Digest,
         names: Option<(String, String)>,
+        parts: Option<Box<kura_engine::doc_parts::DocParts>>,
     },
     /// 版 k に戻す版（版 k の文書から作り直した）。
     Revert(Box<revert::Target>),
@@ -777,6 +801,8 @@ struct Prepared {
     media: Media,
     encoded: EncodedStamp,
     warnings: Vec<String>,
+    /// 版の記録に足す一括の出どころ（`VersionRecord::batch`。保存のジョブは None）。
+    batch: Option<serde_json::Value>,
 }
 
 /// 段 0 で決めたもの（流して書く道 `prepare_stream` に渡す）。
@@ -786,6 +812,8 @@ struct Decided<'a> {
     base: Base,
     doc: Digest,
     names: Option<(String, String)>,
+    parts: Option<Box<kura_engine::doc_parts::DocParts>>,
+    batch: Option<serde_json::Value>,
     graph: &'a Graph,
     head: Head,
     original: OriginalFile,
@@ -1131,10 +1159,42 @@ impl EditHandler {
     }
 }
 
+/// [`Saver::prepare_graph`] に渡す、文書のほかのもの。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GraphExtra {
+    /// 別名で保存の (表示名, 語幹)。上書きは None。
+    pub(crate) names: Option<(String, String)>,
+    /// 版の記録に足す一括の出どころ（`VersionRecord::batch`）。
+    pub(crate) batch: Option<serde_json::Value>,
+}
+
+/// 上書き・別名で保存の準備に渡すもの（文書の根・DB にまだない部品・別名の名前・版の記録に足す一括の出どころ）。
+struct DocArgs {
+    mode: Mode,
+    item_id: i64,
+    base: Base,
+    doc: Digest,
+    parts: Option<Box<kura_engine::doc_parts::DocParts>>,
+    names: Option<(String, String)>,
+    batch: Option<serde_json::Value>,
+}
+
 /// 描いて書き終えた 1 件（段 5 まで。[`Saver::commit`] に渡す。落とすと staging を消す）。
 pub(crate) struct Written {
     p: Prepared,
     staging: Staging,
+}
+
+impl Written {
+    /// staging に書いた出力（区切りの同期を取るファイル。一括）。
+    pub(crate) fn part(&self) -> &Path {
+        &self.p.out_part
+    }
+
+    /// 準備した土台（一括の行に書く）。
+    pub(crate) fn base(&self) -> Base {
+        self.p.base
+    }
 }
 
 impl Saver {
@@ -1169,22 +1229,80 @@ impl Saver {
         doc: Digest,
         names: Option<(String, String)>,
     ) -> Result<Flow<Written>> {
+        let db = ctx.library().db();
+        let doc_id = db
+            .read(|c| store::doc_id_by_digest(c, &doc))?
+            .ok_or_else(|| CoreError::NotFound(format!("保存する文書 {doc}")))?;
+        let bytes = db.read(|c| store::load_doc_bytes(c, doc_id))?;
+        let graph = self
+            .engine
+            .runtime()?
+            .bulk(|e| e.load(&bytes))
+            .map_err(|e| from_engine("文書を読めません", e))?;
+        drop(bytes);
+        self.prepare_doc(
+            ctx,
+            DocArgs {
+                mode,
+                item_id,
+                base,
+                doc,
+                parts: None,
+                names,
+                batch: None,
+            },
+            &graph,
+        )
+    }
+
+    /// 上書き・別名で保存の段 0〜5 を、DB にまだない文書 `graph` で（一括で継ぎ足した文書。M14 段 4）。文書の部品は
+    /// トランザクション 2 で版と一緒に置く（止めた・断った 1 件の部品が DB に残らない）。
+    pub(crate) fn prepare_graph(
+        &self,
+        ctx: &dyn UnitCx,
+        mode: Mode,
+        item_id: i64,
+        base: Base,
+        graph: &Graph,
+        extra: GraphExtra,
+    ) -> Result<Flow<Written>> {
+        let GraphExtra { names, batch } = extra;
+        let parts = split_graph(graph)?;
+        let doc = parts.root;
+        self.prepare_doc(
+            ctx,
+            DocArgs {
+                mode,
+                item_id,
+                base,
+                doc,
+                parts: Some(Box::new(parts)),
+                names,
+                batch,
+            },
+            graph,
+        )
+    }
+
+    /// 段 0〜5 の本体。
+    fn prepare_doc(&self, ctx: &dyn UnitCx, a: DocArgs, graph: &Graph) -> Result<Flow<Written>> {
+        let DocArgs {
+            mode,
+            item_id,
+            base,
+            doc,
+            parts,
+            names,
+            batch,
+        } = a;
         let library = ctx.library();
         let db = library.db();
         let layout = library.layout();
         let job = ctx.job();
         let tag = ctx.tag();
-        let doc_id = db
-            .read(|c| store::doc_id_by_digest(c, &doc))?
-            .ok_or_else(|| CoreError::NotFound(format!("保存する文書 {doc}")))?;
-        let bytes = db.read(|c| store::load_doc_bytes(c, doc_id))?;
         let runtime = self.engine.runtime()?.clone();
         let codecs = self.engine.codecs();
-        let graph = runtime
-            .bulk(|e| e.load(&bytes))
-            .map_err(|e| from_engine("文書を読めません", e))?;
-        drop(bytes);
-        check_doc(&graph)?;
+        check_doc(graph)?;
         let head = db
             .read(|c| versions::head(c, item_id))?
             .ok_or_else(|| CoreError::NotFound(format!("アイテム {item_id}")))?;
@@ -1241,7 +1359,9 @@ impl Saver {
                     base,
                     doc,
                     names,
-                    graph: &graph,
+                    parts,
+                    batch,
+                    graph,
                     head,
                     original,
                     source_format,
@@ -1275,7 +1395,7 @@ impl Saver {
         let plan_for = |how: &read::Reading<'_>, shape: &Shape| -> Result<Flow<_>> {
             let shapes = BTreeMap::from([(InputId(0), *shape)]);
             let plan = runtime
-                .bulk(|e| e.compile(&graph, &shapes))
+                .bulk(|e| e.compile(graph, &shapes))
                 .map_err(|issues| CoreError::Invalid(format!("文書を描けません：{issues}")))?;
             let out_shape = plan
                 .output_shapes()
@@ -1382,8 +1502,8 @@ impl Saver {
                     format: Some(source_format.to_string()),
                     options: opts.clone(),
                 };
-                let written =
-                    runtime.bulk(|_| write_anchor(&part, &value, &decoded, &acx, &limits, &mon));
+                let written = runtime
+                    .bulk(|_| write_anchor(ctx, &part, &value, &decoded, &acx, &limits, &mon));
                 go!(ctx, "元の読み取りを残せません", written);
                 let hash = hash_file(&part)?;
                 let size = std::fs::metadata(&part)?.len();
@@ -1438,7 +1558,7 @@ impl Saver {
             .staging_dir()
             .join(format!("edit-{tag}-out.{ext0}.part"));
         staging.add(out_part.clone());
-        write_synced(&out_part, &bytes)?;
+        write_synced(ctx, &out_part, &bytes)?;
         drop(bytes);
         if let Some(stop) = self.after_written(ctx, &mut staging) {
             return stop;
@@ -1450,7 +1570,7 @@ impl Saver {
                 mode,
                 item_id,
                 base,
-                act: Act::Edit { doc, names },
+                act: Act::Edit { doc, names, parts },
                 kind: head.kind,
                 ext_hint: head.ext,
                 original,
@@ -1466,6 +1586,7 @@ impl Saver {
                 media,
                 encoded,
                 warnings,
+                batch,
             },
             staging,
         }))
@@ -1688,6 +1809,7 @@ impl Saver {
                 act: Act::Edit {
                     doc: d.doc,
                     names: d.names,
+                    parts: d.parts,
                 },
                 kind: d.head.kind,
                 ext_hint: d.head.ext,
@@ -1704,6 +1826,7 @@ impl Saver {
                 media: media_of(&out_shape),
                 encoded,
                 warnings,
+                batch: d.batch,
             },
             staging,
         }))
@@ -1782,10 +1905,16 @@ impl Saver {
             db.write(move |tx| {
                 let now = now_ms();
                 match &p.act {
-                    Act::Edit { doc, names } => match names {
-                        None => commit_overwrite(tx, &p, doc, &go, now, &record),
-                        Some(names) => commit_save_as(tx, &p, doc, names, &go, now, &record),
-                    },
+                    Act::Edit { doc, names, parts } => {
+                        // DB にまだない文書（一括で継ぎ足した文書）は、版と同じトランザクションで部品を置く
+                        if let Some(parts) = parts {
+                            store::put_doc(tx, parts, now)?;
+                        }
+                        match names {
+                            None => commit_overwrite(tx, &p, doc, &go, now, &record),
+                            Some(names) => commit_save_as(tx, &p, doc, names, &go, now, &record),
+                        }
+                    }
                     Act::Revert(target) => revert::commit_revert(
                         tx,
                         &revert::Out::rebuilt(&p, target, &go)?,
@@ -1864,16 +1993,19 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// バイト列をファイルに書いて `sync_all` する（改名で `files/` に置く前に。電源断で中身のないファイルが台帳に載らないように）。
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+/// バイト列をファイルに書いて同期する（`UnitCx::sync_file`。改名で `files/` に置く前に。電源断で中身のないファイルが台帳に
+/// 載らないように）。
+fn write_synced(ctx: &dyn UnitCx, path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = File::create(path)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
+    ctx.sync_file(&file)?;
     Ok(())
 }
 
-/// アンカーを `part` に書いて `sync_all` し、読み直して元の読み取りの記録と照らす（`anchor::write` → `anchor::verify`）。
+/// アンカーを `part` に書いて同期し（`UnitCx::sync_file`）、読み直して元の読み取りの記録と照らす（`anchor::write` →
+/// `anchor::verify`）。
 fn write_anchor(
+    ctx: &dyn UnitCx,
     part: &Path,
     value: &Value,
     decoded: &DecodeStamp,
@@ -1886,7 +2018,7 @@ fn write_anchor(
     let file = writer
         .into_inner()
         .map_err(|e| EngineError::Io(e.into_error()))?;
-    file.sync_all()?;
+    ctx.sync_file(&file)?;
     drop(file);
     anchor::verify(&mut BufReader::new(File::open(part)?), decoded, limits, mon)?;
     Ok(())
@@ -2106,6 +2238,7 @@ fn add_head(
             codec_info: None,
         }),
         warnings: p.warnings.clone(),
+        batch: p.batch.clone(),
         ..VersionRecord::new()
     };
     let vid = versions::insert_version(
@@ -2191,7 +2324,7 @@ fn commit_overwrite(
     if head.version == 0 {
         versions::insert_original(tx, id, &p.original, &p.decoded, now)?;
     }
-    // (d) 文書（start_save で置き済み）
+    // (d) 文書（start_save で置き済みか、一括ならこのトランザクションで置いた）
     let doc_id = store::doc_id_by_digest(tx, doc)?
         .ok_or_else(|| CoreError::NotFound(format!("保存する文書 {doc}")))?;
     // (e) アンカー

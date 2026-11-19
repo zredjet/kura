@@ -291,7 +291,7 @@ impl Saver {
             ));
         }
         if let RebuiltOut::Bytes(bytes) = r.out {
-            write_synced(&out_part, &bytes)?;
+            write_synced(ctx, &out_part, &bytes)?;
         }
         if let Some(stop) = self.after_written(ctx, &mut staging) {
             if matches!(stop, Ok(Flow::Stop(JobEnd::Paused)))
@@ -326,6 +326,7 @@ impl Saver {
                 media: r.media,
                 encoded: r.encoded,
                 warnings,
+                batch: None,
             },
             staging,
         }))

@@ -203,6 +203,12 @@ impl LibrarySession {
                 JobKind::Gc,
                 Arc::new(GcHandler::new(engine.clone(), gc_clock.clone())),
             ));
+            handlers.push((
+                JobKind::Batch,
+                Arc::new(
+                    crate::edit::batch::BatchHandler::new(engine.clone()).with_gc(gc_clock.clone()),
+                ),
+            ));
         }
         let jobs = Arc::new(JobManager::new(library.clone(), handlers, sink)?);
         let integrity = Arc::new(Mutex::new(None));
