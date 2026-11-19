@@ -1358,7 +1358,14 @@ const V12: usize = 12;
 fn batch_0012_adds_tables_and_keeps_everything_else() {
     let mut conn = filled_v6();
     migrate_until(&mut conn, V12 - 1).unwrap();
-    crate::db::testing::fill_v10(&conn);
+    // 版 11 のすべての表を埋める（0011 の表と、保存・GC のジョブの行も。jobs_kind の入れ替えがそれを断らないこと）
+    crate::db::testing::fill_v11(&conn);
+    for table in ["item_versions", "edit_objects", "ledger_pending"] {
+        assert!(
+            one::<i64>(&conn, &format!("SELECT count(*) FROM {table}")) > 0,
+            "{table}"
+        );
+    }
     assert_eq!(MIGRATIONS[V12 - 1].name, "0012_batch");
     assert_eq!(MIGRATIONS[V12 - 1].kind, Kind::Plain);
     let before = snapshot(&conn);
