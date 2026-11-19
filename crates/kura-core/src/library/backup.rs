@@ -477,7 +477,8 @@ mod tests {
                 "0008_jobs_named_checks",
                 "0009_analysis",
                 "0010_items_blob_id",
-                "0011_edit_versions"
+                "0011_edit_versions",
+                "0012_batch"
             ]
         );
         // 当てたあとの WAL は空

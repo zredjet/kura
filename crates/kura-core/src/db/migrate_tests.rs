@@ -1349,6 +1349,176 @@ fn edit_versions_0011_checks_have_names_and_follow_the_items() {
     }
 }
 
+const V12: usize = 12;
+
+/// 0012：レシピと一括の対象の表を足し、jobs_kind に batch を足す。既存の表の行・索引・トリガ・FTS は同じ。外部キーの向き
+/// （対象のアイテムは CASCADE、版・別名で作ったアイテムは SET NULL、部品は ON DELETE なし。jobs は参照しない）、子の列の索引、
+/// 名前付きの CHECK。
+#[test]
+fn batch_0012_adds_tables_and_keeps_everything_else() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, V12 - 1).unwrap();
+    crate::db::testing::fill_v10(&conn);
+    assert_eq!(MIGRATIONS[V12 - 1].name, "0012_batch");
+    assert_eq!(MIGRATIONS[V12 - 1].kind, Kind::Plain);
+    let before = snapshot(&conn);
+    migrate_until(&mut conn, V12).unwrap();
+    let after = snapshot(&conn);
+    for (key, value) in &before {
+        assert_eq!(after.get(key), Some(value), "{key} が変わった");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(
+        added,
+        vec![
+            "index idx_batch_items_item",
+            "index idx_batch_items_out_item",
+            "index idx_batch_items_version",
+            "index idx_edit_recipes_doc",
+            // WITHOUT ROWID の batch_items は主キーが表そのもの。UNIQUE (job_id, item_id) の索引だけができる
+            "index sqlite_autoindex_batch_items_2",
+            "table batch_items",
+            "table edit_recipes",
+        ]
+    );
+    assert!(violations(&conn).unwrap().is_empty());
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.name, f.\"from\", f.\"table\", f.\"to\", f.on_delete
+               FROM sqlite_schema s, pragma_foreign_key_list(s.name) f
+              WHERE s.type = 'table' AND s.name IN ('edit_recipes', 'batch_items')
+              ORDER BY s.name, f.\"from\"",
+        )
+        .unwrap();
+    let fks: Vec<String> = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "{}.{} → {}.{} {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        fks,
+        vec![
+            "batch_items.item_id → items.id CASCADE",
+            "batch_items.out_item_id → items.id SET NULL",
+            "batch_items.version_id → item_versions.id SET NULL",
+            "edit_recipes.doc_id → edit_objects.id NO ACTION",
+        ]
+    );
+    for (table, column) in [
+        ("batch_items", "item_id"),
+        ("batch_items", "version_id"),
+        ("batch_items", "out_item_id"),
+        ("edit_recipes", "doc_id"),
+    ] {
+        let plan =
+            crate::db::query_plan(&conn, &format!("SELECT 1 FROM {table} WHERE {column} = 1"));
+        assert!(plan.contains("USING"), "{table}.{column}: {plan}");
+    }
+    // 一括の残りを順に引く・アイテムが待っている一括を引くのは索引で
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT ord, item_id FROM batch_items WHERE job_id = 1 AND state = 'pending' ORDER BY ord",
+    );
+    assert!(
+        plan.contains("USING PRIMARY KEY") && !plan.contains("TEMP B-TREE"),
+        "{plan}"
+    );
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT job_id FROM batch_items WHERE item_id = 1 AND state = 'pending'",
+    );
+    assert!(plan.contains("idx_batch_items_item"), "{plan}");
+    // jobs_kind に batch が入る
+    conn.execute(
+        "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('batch', 'queued', '{}', 1)",
+        [],
+    )
+    .unwrap();
+    // 名前付きの CHECK
+    let err = |sql: &str| conn.execute(sql, []).unwrap_err().to_string();
+    conn.execute(
+        "INSERT INTO edit_objects (id, digest, kind, body, created_at) VALUES (50, x'd5', 'doc', CAST('{}' AS BLOB), 1)",
+        [],
+    )
+    .unwrap();
+    let e = err(
+        "INSERT INTO edit_recipes (name, kind, doc_id, pos, created_at, updated_at) VALUES ('x', 'all', 50, 1, 1, 1)",
+    );
+    assert!(e.contains("edit_recipes_kind"), "{e}");
+    // 部品はレシピが指している間は消せない
+    conn.execute(
+        "INSERT INTO edit_recipes (name, kind, doc_id, pos, created_at, updated_at) VALUES ('x', 'each', 50, 1, 1, 1)",
+        [],
+    )
+    .unwrap();
+    let e = err("DELETE FROM edit_objects WHERE id = 50");
+    assert!(e.contains("FOREIGN KEY"), "{e}");
+    for (sql, name) in [
+        (
+            "INSERT INTO batch_items (job_id, ord, item_id, state) VALUES (1, 0, 1, 'done')",
+            "batch_items_state",
+        ),
+        (
+            "INSERT INTO batch_items (job_id, ord, item_id) VALUES (1, -1, 1)",
+            "batch_items_ord",
+        ),
+        (
+            "INSERT INTO batch_items (job_id, ord, item_id, decoding) VALUES (1, 0, 1, 2)",
+            "batch_items_decoding",
+        ),
+        (
+            "INSERT INTO batch_items (job_id, ord, item_id, state) VALUES (1, 0, 1, 'saved')",
+            "batch_items_finished",
+        ),
+        (
+            "INSERT INTO batch_items (job_id, ord, item_id, finished_at) VALUES (1, 0, 1, 5)",
+            "batch_items_finished",
+        ),
+    ] {
+        let e = err(sql);
+        assert!(e.contains(name), "{sql}: {e}");
+    }
+}
+
+/// 0012 の外部キーの向き：対象のアイテムを消すと行も消え（ADR-192 (4)）、別名で作ったアイテム・版を消すと NULL になる。
+#[test]
+fn batch_items_follow_the_items_and_versions() {
+    let mut conn = filled_v6();
+    migrate(&mut conn).unwrap();
+    crate::db::testing::fill_latest(&conn);
+    conn.execute(
+        "UPDATE batch_items SET out_item_id = 1 WHERE job_id = 10 AND ord = 0",
+        [],
+    )
+    .unwrap();
+    // 別名で作ったアイテム（1）を消すと NULL、版（2）を消すと NULL
+    conn.execute("DELETE FROM items WHERE id = 1", []).unwrap();
+    conn.execute("DELETE FROM item_versions WHERE id = 2", [])
+        .unwrap();
+    let row: (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT out_item_id, version_id FROM batch_items WHERE job_id = 10 AND ord = 0",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (None, None));
+    // 対象のアイテム（2）を消すと行も消える
+    conn.execute("DELETE FROM items WHERE id = 2", []).unwrap();
+    let n: i64 = one(&conn, "SELECT count(*) FROM batch_items WHERE item_id = 2");
+    assert_eq!(n, 0);
+    assert!(violations(&conn).unwrap().is_empty());
+}
+
 #[test]
 fn fixture_fills_every_table_at_the_latest_version() {
     // 新しい表も、準備で行を入れる（次に items や blobs を作り直すとき、子が残ることを確かめられるように）

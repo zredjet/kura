@@ -92,6 +92,7 @@ Kura Library.kuralib/
 | `0009_analysis` | 中身ごとの事実 `media_facts`・解析の結果 `analysis_results`（どちらも `blob_id` が鍵で、台帳の行を消すと CASCADE）と、アイテムごとの素材の設定 `asset_settings`（`item_id` が鍵で CASCADE） |
 | `0010_items_blob_id` | `items.blob_id`（台帳の行の ID の写し。CHECK・外部キーなしの `ADD COLUMN`）を足して hash から埋め、`idx_items_blob` と、入れる・hash を変えるときに台帳から引いて入れる AFTER のトリガ `items_blob_id_ai`・`items_blob_id_au` を作る（M12。検索の事実の条件を整数の鍵で引く。M11 の決定 17。10 万件で約 0.2 秒） |
 | `0011_edit_versions` | 保存と版（M12 の段 2。docs/editing.md §4.4・§9.4・§14）：文書の部品 `edit_objects`・`edit_edges`、版 `item_versions`、版の入力 `item_version_inputs`、アンカー `edit_anchors`、来歴 `item_derivations`、下書き `edit_drafts`、台帳の予告 `ledger_pending` を足し、`jobs_kind` に `edit`・`gc` を足す（名前付きの CHECK の入れ替え）。新しい表だけなので Plain。版 0（元）は最初の保存のときに足すので、既存のアイテムには行を足さない（10 万件でも表を作るだけ。合成 10 万件 `--history` で 1.18〜1.21 ms。`bench migrate --runs 3`、2026-10-24）。台帳を参照する列（`item_versions.file_blob_id`・`edit_anchors.blob_id`）は ON DELETE なし（`ledger::REFERRERS` に足した）、items を参照する列は CASCADE（来歴の元だけ SET NULL） |
+| `0012_batch` | 一括加工の表と口（M14 段 3。docs/editing.md §4.3、ADR-190・192）：レシピ `edit_recipes`（文書は `edit_objects` の部品、結び付けは `recipe::bindings_json` の正規の JSON、並びは `pos`）と、一括の対象と結果 `batch_items`（1 件ずつのコミットと同じトランザクションで行を書く。一括の版は `item_versions.job_id` を空にしてこの行の `version_id` で引く）を足し、`jobs_kind` に `batch` を足す（名前付きの CHECK の入れ替え）。新しい表だけなので Plain（合成 10 万件 `--history` で 0.67〜0.70 ms。`bench migrate --runs 3`、2026-11-19）。`batch_items.job_id` は外部キーにしない（`jobs` を参照される表にしない）。対象のアイテムを消すと行も消え（CASCADE）、版・別名で作ったアイテムを消すと NULL（SET NULL） |
 
 ```sql
 -- ===== 実ファイルの台帳（0007。files/ab/cd/<hash>.<ext> 1 つに 1 行）=====
@@ -361,7 +362,7 @@ CREATE INDEX idx_play_events_item ON play_events(item_id, played_at DESC);
 -- ===== ジョブ =====
 CREATE TABLE jobs (                                -- 0008 で作り直した形
   id            INTEGER PRIMARY KEY,
-  kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）、0011：edit（M12 の保存）・gc（M12 の段 3）
+  kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）、0011：edit（M12 の保存）・gc（M12 の段 3）、0012：batch（M14 の一括）
                 CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc')),
   state         TEXT    NOT NULL
                 CONSTRAINT jobs_state CHECK (state IN ('queued','running','paused','done','failed','canceled')),
@@ -653,6 +654,43 @@ CREATE TABLE ledger_pending (                      -- 索引なし（実行中�
   created_at  INTEGER NOT NULL
 );
 
+-- ===== レシピ（0012。M14。docs/editing.md §4.3。§4「一括加工（M14）」）=====
+CREATE TABLE edit_recipes (
+  id           INTEGER PRIMARY KEY,
+  name         TEXT    NOT NULL,                     -- 1〜256 バイト・制御文字なし（recipe::check_text。前後の空白を除いて NFC）。重なってよい
+  description  TEXT    NOT NULL DEFAULT '',          -- 4,096 バイトまで（改行・タブだけ可）
+  kind         TEXT    NOT NULL CONSTRAINT edit_recipes_kind CHECK (kind IN ('each','merge')),
+  doc_id       INTEGER NOT NULL REFERENCES edit_objects(id),   -- 文書の根の部品（部品の片付けの根）
+  bindings     TEXT    NOT NULL DEFAULT '[]',        -- 結び付け（recipe::bindings_json の正規の JSON。64 個・64 KiB まで）
+  pos          REAL    NOT NULL,                     -- サイドバーの並び（プレイリストと同じ）
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+CREATE INDEX idx_edit_recipes_doc ON edit_recipes(doc_id);
+
+-- ===== 一括の対象と結果（0012。M14。1 本の batch のジョブの 1 件ずつ。§4「一括加工（M14）」）=====
+CREATE TABLE batch_items (
+  job_id        INTEGER NOT NULL,                    -- 一括のジョブ（外部キーにしない。jobs を参照される表にしない）
+  ord           INTEGER NOT NULL CONSTRAINT batch_items_ord CHECK (ord >= 0),   -- 選んだ順
+  item_id       INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,       -- 消えたら行も消える（ADR-192 (4)）
+  state         TEXT    NOT NULL DEFAULT 'pending' CONSTRAINT batch_items_state
+                CHECK (state IN ('pending','saved','unchanged','existing','skipped','failed','canceled')),
+  decoding      INTEGER NOT NULL DEFAULT 0 CONSTRAINT batch_items_decoding CHECK (decoding IN (0, 1)),  -- OS のデコーダで読んでいる印
+  base_hash     BLOB,                                -- 処理したときの頭（継ぎ足した土台）
+  base_version  INTEGER,
+  version_id    INTEGER REFERENCES item_versions(id) ON DELETE SET NULL,   -- 足した版（一括の版は item_versions.job_id が NULL）
+  out_item_id   INTEGER REFERENCES items(id) ON DELETE SET NULL,          -- 別名で作ったアイテム
+  code          TEXT,                                -- 飛ばした・失敗した理由（AppError の code）
+  message       TEXT,
+  finished_at   INTEGER,
+  PRIMARY KEY (job_id, ord),
+  UNIQUE (job_id, item_id),
+  CONSTRAINT batch_items_finished CHECK ((state = 'pending') = (finished_at IS NULL))
+) WITHOUT ROWID;
+CREATE INDEX idx_batch_items_item     ON batch_items(item_id);
+CREATE INDEX idx_batch_items_version  ON batch_items(version_id);
+CREATE INDEX idx_batch_items_out_item ON batch_items(out_item_id);
+
 -- ===== 全文検索（外部コンテンツ FTS5、trigram）=====
 CREATE VIRTUAL TABLE items_fts USING fts5(
   title, original_name, note, source_url,
@@ -762,8 +800,9 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   ダウンロード・キャプチャは「置いてから DB に書く」まで読みの側を持つので、取り込みが「もう置いてある」と判断した同じ中身を、
   保存が台帳に載せる前に消すことがない。描く・エンコードする間は持たない。
 - **予告と照合**（`ledger::announce`・`clear_announced`・`clear_pending`・`settle_pending`）：台帳にない中身を置く前に `ledger_pending` に
-  `(hash, ext, 'place', job)` を書いてコミットし、'place' の予告は台帳に載せるトランザクションで `DELETE FROM ledger_pending WHERE job_id = ?`
-  で消す。台帳から外す処理（段 3 の GC・ゴミ箱を空にする処理）は、外す前に消しうる中身を `'delete'` で予告してコミットし（`announce` は
+  `(hash, ext, 'place', job)` を書いてコミットし、'place' の予告は台帳に載せるトランザクションで、その 1 件が書いた予告だけを行の ID で
+  消す（`DELETE FROM ledger_pending WHERE id = ?`。主キー。M14 段 3 までは `WHERE job_id = ?` でジョブの予告をまとめて消していたが、
+  1 本のジョブで何件もコミットする一括で、前の 1 件が消せずに残した予告まで消して孤立したファイルを残すので改めた。ADR-192 (5)）。台帳から外す処理（段 3 の GC・ゴミ箱を空にする処理）は、外す前に消しうる中身を `'delete'` で予告してコミットし（`announce` は
   行の ID を返す。ゴミ箱を空にする処理は `job_id` が NULL）、外したトランザクションのコミットのあとでファイルを消し終えてから、
   その予告を行の ID で消す（`DELETE FROM ledger_pending WHERE id = ?`。主キー。消せなかったファイルの予告は残し、同じジョブのほかの
   予告を消さない）。外さなかった中身（ほかが参照していた）の予告は、照合で行だけ消える。ライブラリを開くとき、staging の掃除の直後・
@@ -841,9 +880,11 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 
   （released の行のファイルは新しい頭か版 0 が持つので、台帳の行は参照されたまま）。最初の保存（n = 0）では前の今は元そのもので、
   版 0 が hold で持つ。新しい頭は `kind = 'edit'`・`doc_id`＝根の行・`base_version = n`・`file_blob_id`＝H の台帳の行・hold・
-  `job_id`（部分の一意の索引で、再開で版を 2 つ足さない）。版の入力（Primary）は `source_hash`＝元、`value_digest`＝元を読んだ値、
-  `recorded`＝`RecordedInput` の正規の JSON、`anchor_id`。最後に `DELETE FROM ledger_pending WHERE job_id = ?` と、途中経過
-  `{"v":1,"committed":{…結果…}}`（`jobs.result_json`）を同じトランザクションで書く。
+  `job_id`（保存のジョブ。部分の一意の索引で、再開で版を 2 つ足さない。一括の版は NULL で、`batch_items.version_id` で引く。
+  ADR-192 (1)）。版の入力（Primary）は `source_hash`＝元、`value_digest`＝元を読んだ値、`recorded`＝`RecordedInput` の正規の JSON、
+  `anchor_id`。最後にこの 1 件の予告を行の ID で消し（`DELETE FROM ledger_pending WHERE id = ?`）、結果を呼び手の行に書く（保存の
+  ジョブは途中経過 `{"v":1,"committed":{…結果…}}`（`jobs.result_json`）、一括はアイテムの行。どちらも同じトランザクション。M14 段 2 の
+  `Record`）。
 - **別名の写し方**（別名のトランザクション 2）：元のアイテム A の土台を確かめ直し、H の持ち主がいないことを確かめ直してから、新しい
   アイテム B を `import::store::insert_item` で入れ（original_name は「語幹．拡張子」、original_path は NULL、幅・高さ・長さは出力から）、
 
@@ -1030,6 +1071,39 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
      アンカーはない（ゴミ箱を空にする処理が片付ける。残っていれば GC も）。
   6. 終わっていない（待ち・実行中・一時停止の）保存のジョブの入力の文書は、根の部品があってつなぎ直せる（GC の部品の片付けが消さない。
      段 3）。
+
+### 一括加工（M14。`crates/kura-core/src/edit/recipes.rs`・`edit/save/`。docs/editing.md §4.3、ADR-190・192）
+
+- **レシピの読み書き**（`edit::recipes`）：一覧は並びの順に、操作の数を文書の根の子の数（部品の辺を主キーで引く）、結び付けの数を JSON の
+  配列の長さで数える。レシピは利用者が作る小さな表なので、プレイリストと同じく表を走査する（`a_recipe_made_from_the_editor_round_trips`
+  の EXPLAIN は部品の辺を走査しないことを見る）：
+
+  ```sql
+  SELECT r.id, r.name, r.description, r.kind, json_array_length(r.bindings), r.created_at, r.updated_at,
+         (SELECT count(*) FROM edit_edges e WHERE e.parent_id = r.doc_id)          -- edit_edges の主キー
+    FROM edit_recipes r ORDER BY r.pos, r.id;
+  ```
+
+  1 件は行と文書の部品（`store::load_doc_bytes`）を読み、エンジンで今のスキーマへ移して読み、当てる前の確かめ（`Engine::check_recipe`）の
+  旧版の印か、当てられない理由を付ける。足すときは文書を部品で置き（`store::put_doc`）、末尾に並べる（`pos = max(pos) + 1`）。複製は
+  同じ文書・結び付けを指す行を元のすぐ後ろに足す（`pos` は元と次の中間。名前は「{名前} のコピー」を 256 バイトに詰める）。名前・説明は
+  前後の空白を除いて NFC にし、エンジンの `recipe::check_text` で確かめる（名前は重なってよい。ADR-192 (2)）。中身の差し替え（同じ ID の
+  まま文書・結び付け・種類）と消す（すぐ消す。ADR-192 (3)）は、古い文書の部品が孤立しうるので GC の部品の印（`gc::mark_parts`）を置く。
+  `.kurarecipe` の読み込みは `Engine::load_recipe` の確かめを通ったものだけを足す（4 MiB を超えるファイルは読まずに断る）。
+- **部品の片付けの根**：`edit_recipes.doc_id` も参照に数える（`sweep_parts` の `EXISTS (SELECT 1 FROM edit_recipes WHERE doc_id = ?)`。
+  `idx_edit_recipes_doc`）。レシピを指している間は部品が残り、`edit_recipes.doc_id` は ON DELETE を持たないので、片付けが誤って消そうと
+  しても外部キーで断られる。動いている一括のジョブの入力の写し（レシピの文書の根）は段 4 で `save::gc_roots` に足す。
+- **一括の対象と結果**（`batch_items`。段 4 で書く）：一括のジョブを積むのと同じトランザクションで、選んだ順に `state = 'pending'` の行を
+  入れる。残りは `SELECT ord, item_id FROM batch_items WHERE job_id = ? AND state = 'pending' ORDER BY ord`（主キー。一時の B 木を作ら
+  ない）、あるアイテムを待っている一括は `SELECT job_id FROM batch_items WHERE item_id = ? AND state = 'pending'`（`idx_batch_items_item`。
+  前の保存が終わっていないアイテムを開かない `SavePending` を一括へ広げる）。1 件ずつのコミットのトランザクション 2 の中で、結果の記録
+  （`save::Record`）が行の `state`・`base_hash`・`base_version`・`version_id`・`out_item_id`・`finished_at` を書く（版と行が同じ
+  トランザクションなので、落ちても「版があるのに pending」「done なのに版がない」にならない）。飛ばした・失敗した・中止した行は
+  `code`・`message`・`finished_at` を書く。OS のデコーダで読む前後の印は行の `decoding` に置く（アイテムごと。並べて準備する 1 件ずつが
+  互いの印を消さない）。
+- **一括の版の持ち主**（ADR-192 (1)）：一括で足した版は `item_versions.job_id` を NULL にし（1 件の場の `UnitCx::version_job` が None）、
+  `batch_items.version_id` で引く。保存のジョブの 1 ジョブ 1 版（`idx_item_versions_job`・再開の `versions::by_job`）は変えない。台帳の
+  予告の持ち主は一括のジョブで、トランザクション 2 はその 1 件の予告だけを行の ID で消す（上の「予告と照合」）。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
 

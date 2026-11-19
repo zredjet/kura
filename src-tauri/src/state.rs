@@ -332,21 +332,25 @@ mod tests {
         }
     }
 
-    /// 1 つ前の版（最後のマイグレーション 0011 を当てる前）のライブラリを作る。
+    /// 1 つ前の版（最後のマイグレーション 0012 を当てる前）のライブラリを作る（マイグレーションを足したら、ここで取り消すものも
+    /// 最後のものに替える）。
     fn library_before_last_migration(root: &Path) {
         let library = kura_core::library::Library::create(root).unwrap();
         let before = kura_core::db::MIGRATIONS.len() - 1;
+        assert_eq!(
+            kura_core::db::MIGRATIONS[before].name,
+            "0012_batch",
+            "取り消すマイグレーションを最後のものに替える"
+        );
         library
             .db()
             .write(move |tx| {
-                // 0011 を取り消す：足した表（子から）を消し、jobs_kind を 0008 の値に戻す
+                // 0012 を取り消す：足した表を消し、jobs_kind を 0011 の値に戻す
                 tx.execute_batch(&format!(
-                    "DROP TABLE item_version_inputs; DROP TABLE item_derivations; DROP TABLE edit_drafts;
-                     DROP TABLE item_versions; DROP TABLE edit_anchors; DROP TABLE edit_edges; DROP TABLE edit_objects;
-                     DROP TABLE ledger_pending;
+                    "DROP TABLE batch_items; DROP TABLE edit_recipes;
                      ALTER TABLE jobs DROP CONSTRAINT jobs_kind;
                      ALTER TABLE jobs ADD CONSTRAINT jobs_kind
-                       CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze'));
+                       CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc'));
                      PRAGMA user_version = {before};"
                 ))?;
                 Ok(())

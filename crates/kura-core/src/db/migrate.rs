@@ -92,6 +92,10 @@ pub const MIGRATIONS: &[Migration] = &[
         "0011_edit_versions",
         include_str!("../../migrations/0011_edit_versions.sql"),
     ),
+    plain(
+        "0012_batch",
+        include_str!("../../migrations/0012_batch.sql"),
+    ),
 ];
 
 /// 当てたマイグレーション 1 つ。

@@ -74,7 +74,8 @@ pub(crate) fn fill_v10(conn: &Connection) {
     .unwrap();
 }
 
-/// 最新の版で足した表（[`fill_v10`] の表と、0011 の版・文書の部品・アンカー・来歴・下書き・予告）にも行を入れる。
+/// 最新の版で足した表（[`fill_v10`] の表と、0011 の版・文書の部品・アンカー・来歴・下書き・予告、0012 のレシピ・一括の対象）にも
+/// 行を入れる。
 /// `fill_v6` のあとに使う（表を足したらここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
 /// 0011 の行はアイテム 4（ゴミ箱を空にする試験で残るもの）に付け、版とアンカーはアイテム 4 の台帳の行を指す
 /// （出力が今と同じ中身の「版だけ足した」形）。
@@ -102,7 +103,13 @@ pub(crate) fn fill_latest(conn: &Connection) {
            VALUES (4, 2, 0, {h2}, 50);
          INSERT INTO edit_drafts (item_id, doc_id, base_hash, base_version, after_job, updated_at)
            VALUES (4, 3, x'04', 1, NULL, 60);
-         INSERT INTO ledger_pending (id, hash, ext, kind, job_id, created_at) VALUES (1, {h9}, 'png', 'place', 9, 70);"
+         INSERT INTO ledger_pending (id, hash, ext, kind, job_id, created_at) VALUES (1, {h9}, 'png', 'place', 9, 70);
+         INSERT INTO edit_recipes (id, name, description, kind, doc_id, bindings, pos, created_at, updated_at)
+           VALUES (1, 'レシピ', '', 'each', 3, '[]', 1.0, 80, 80);
+         INSERT INTO batch_items (job_id, ord, item_id, state, decoding, base_hash, base_version, version_id, out_item_id,
+                                  code, message, finished_at)
+           VALUES (10, 0, 4, 'saved', 0, x'04', 0, 2, NULL, NULL, NULL, 90),
+                  (10, 1, 2, 'pending', 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL);"
         // format! にせず置き換える（JSON の波かっこをそのまま書くため）
         .replace("{h2}", &h(2))
         .replace("{h9}", &h(9));
