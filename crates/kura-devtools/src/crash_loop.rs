@@ -1,10 +1,12 @@
 //! 本当に落とす試験（M12 の段 2。docs/architecture.md §13、docs/editing.md §14.1）：
-//! `edit crash-loop --library <path> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0] [--batch [N]]`。
+//! `edit crash-loop --library <path> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0] [--batch [N] [--save-as]]`。
 //!
 //! `--batch [N]`（M14 段 4。N の既定は 1,000）を付けると、保存の代わりに一括加工のジョブ（`JobKind::Batch`）を落とす：N 個の
 //! ドット絵の PNG と、レシピ「トリム・4 倍」を 1 つ入れたライブラリで、子は全件に上書きの一括を積む（あれば再開したものを
 //! 動かす）。落としては開き直し、どのアイテムも一括の版が 1 つまで・済んだ行は版を指す・pending の行に版がない・頭の中身が
 //! 期待どおり、などを数え、最後に一括を終わらせて全件ちょうど 1 回を確かめる。`--audio-minutes` とは併せられない。
+//! `--save-as`（`--batch` と一緒のときだけ）を足すと、子は上書きの代わりに別名の一括（名前の型は既定の「{名前} のコピー」）を
+//! 積み、確かめを別名に合わせる（元のアイテムは変わらない・どの元にもコピーがちょうど 1 つ・saved の行がそのコピーを指す、など）。
 //! 流れと確かめの一覧は [`batch`] の冒頭。
 //!
 //! `--audio-minutes n`（M13 段 3。既定 0。確かめるときは 6）を付けると、親は n 分の合成の FLAC（44.1 kHz ステレオ）も
@@ -50,7 +52,7 @@ use serde_json::{Value as Json, json};
 
 mod batch;
 
-const USAGE: &str = "使い方: kura-devtools edit crash-loop --library <新しいライブラリの場所> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0] [--batch [N]]";
+const USAGE: &str = "使い方: kura-devtools edit crash-loop --library <新しいライブラリの場所> [--runs 50] [--seed 1] [--min-ms 10] [--max-ms 500] [--audio-minutes 0] [--batch [N] [--save-as]]";
 
 /// `--batch` の件数を省いたときの件数（NFR-14 と同じ 1,000 件）。
 const DEFAULT_BATCH_ITEMS: usize = 1_000;
@@ -78,6 +80,8 @@ struct Opts {
     audio_minutes: u64,
     /// 一括加工を落とすときのアイテムの数（`--batch`。None なら保存を落とす）。
     batch: Option<usize>,
+    /// 一括を別名で積む（`--save-as`。`--batch` のときだけ。偽なら上書き）。
+    save_as: bool,
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
@@ -89,6 +93,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         max_ms: 500,
         audio_minutes: 0,
         batch: None,
+        save_as: false,
     };
     let mut library = None;
     let mut i = 0;
@@ -108,6 +113,10 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 return Err("--batch は 1 件以上にしてください".into());
             }
             opts.batch = Some(n);
+            continue;
+        }
+        if arg == "--save-as" {
+            opts.save_as = true;
             continue;
         }
         let mut value = || {
@@ -137,6 +146,9 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     }
     if opts.batch.is_some() && opts.audio_minutes > 0 {
         return Err("--batch と --audio-minutes は併せられません".into());
+    }
+    if opts.save_as && opts.batch.is_none() {
+        return Err("--save-as は --batch と一緒に使ってください".into());
     }
     Ok(opts)
 }
@@ -384,7 +396,7 @@ fn audio_frames(minutes: u64) -> u64 {
         .saturating_mul(u64::from(AUDIO_RATE))
 }
 
-/// 子を起こし（`extra` は子に足す引数：音声の長さ `--audio-frames n`、一括の `--batch`）、`delay` 待って SIGKILL する。子が
+/// 子を起こし（`extra` は子に足す引数：音声の長さ `--audio-frames n`、一括の `--batch`・`--save-as`）、`delay` 待って SIGKILL する。子が
 /// 先に終わっていれば、その終わり方を返す。
 fn crash_once(
     root: &Path,
@@ -741,6 +753,8 @@ struct ChildArgs {
     audio_frames: u64,
     /// 保存の代わりに一括加工を動かす（`--batch`。親の `--batch` のとき）。
     batch: bool,
+    /// 一括を別名で積む（`--save-as`。親の `--save-as` のとき。`--batch` と一緒のときだけ）。
+    save_as: bool,
 }
 
 fn child_args(args: &[String]) -> Result<ChildArgs, String> {
@@ -748,11 +762,13 @@ fn child_args(args: &[String]) -> Result<ChildArgs, String> {
     let mut seed = 0u64;
     let mut audio_frames = 0u64;
     let mut batch = false;
+    let mut save_as = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--library" => library = it.next().map(PathBuf::from),
             "--batch" => batch = true,
+            "--save-as" => save_as = true,
             "--seed" => {
                 seed = it
                     .next()
@@ -772,26 +788,31 @@ fn child_args(args: &[String]) -> Result<ChildArgs, String> {
     if batch && audio_frames > 0 {
         return Err("--batch と --audio-frames は併せられません".into());
     }
+    if save_as && !batch {
+        return Err("--save-as は --batch と一緒に渡してください".into());
+    }
     Ok(ChildArgs {
         library: library.ok_or("--library がありません")?,
         seed,
         audio_frames,
         batch,
+        save_as,
     })
 }
 
 /// `edit crash-loop-child`（子）：保存を繰り返す（親が SIGKILL するまで）。GC の時計だけ 8 日進めて開く。音声のアイテムが
 /// あれば、画像と音声を交互に保存する（音声の長さは親が `--audio-frames` で渡す）。`--batch` なら一括加工を動かす
-/// （[`batch::child`]）。
+/// （[`batch::child`]。`--save-as` なら別名の一括）。
 pub fn child(args: &[String]) -> Result<(), String> {
     let ChildArgs {
         library,
         seed,
         audio_frames,
         batch,
+        save_as,
     } = child_args(args)?;
     if batch {
-        return batch::child(&library, seed);
+        return batch::child(&library, seed, save_as);
     }
     let services = crate::services().with_gc_clock(GcClock::shifted(GC_SHIFT_MS));
     let session = LibrarySession::open(&library, quiet(), services)
@@ -908,6 +929,7 @@ mod tests {
                 seed: 7,
                 audio_frames: 15_876_000,
                 batch: false,
+                save_as: false,
             }
         );
         assert_eq!(audio_frames(6), 15_876_000);
@@ -943,7 +965,8 @@ mod tests {
         assert!(with(&["--batch", "5", "--audio-minutes", "1"]).is_err());
         assert!(with(&["--runs"]).is_err());
         let child = child_args(&args(&["--library", "/tmp/x.kuralib", "--batch"])).unwrap();
-        assert!(child.batch);
+        assert!(child.batch && !child.save_as);
+        assert!(!with(&["--batch"]).unwrap().save_as);
         assert!(
             child_args(&args(&[
                 "--library",
@@ -954,6 +977,36 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    /// `--save-as` は `--batch` と一緒のときだけ（件数の前後どちらでも。件数を省いても）。子にも `--batch` と一緒に渡す。
+    #[test]
+    fn save_as_goes_with_batch() {
+        let base = ["--library", "/tmp/x.kuralib"];
+        let with = |more: &[&str]| {
+            let mut list = base.to_vec();
+            list.extend_from_slice(more);
+            parse(&args(&list))
+        };
+        for more in [
+            &["--batch", "--save-as"][..],
+            &["--save-as", "--batch"],
+            &["--batch", "50", "--save-as"],
+        ] {
+            let opts = with(more).unwrap();
+            assert!(opts.save_as && opts.batch.is_some(), "{more:?}");
+        }
+        assert_eq!(with(&["--save-as", "--batch", "7"]).unwrap().batch, Some(7));
+        assert!(with(&["--save-as"]).is_err());
+        let child = child_args(&args(&[
+            "--library",
+            "/tmp/x.kuralib",
+            "--batch",
+            "--save-as",
+        ]))
+        .unwrap();
+        assert!(child.batch && child.save_as);
+        assert!(child_args(&args(&["--library", "/tmp/x.kuralib", "--save-as"])).is_err());
     }
 
     /// 音声の文書の trim は、渡した長さの 1/4 までの位置から始まる（6 分なら 0.25 秒を大きく超える位置も出る）。
