@@ -435,6 +435,9 @@ pub struct BatchHandler {
     /// テストの強制終了：`(n, fault)` なら n 件コミットしたあとの次のコミットを `fault` で落とし、後始末をせずに失敗で戻る。
     #[cfg(test)]
     pub(crate) crash: Option<(usize, super::save::Fault)>,
+    /// テストの強制終了を効かせるか（None ならいつも。あとから構える試験が使う：前の一括は落とさず、戻す一括だけを落とす）。
+    #[cfg(test)]
+    pub(crate) crash_armed: Option<Arc<AtomicBool>>,
     /// テストの割り込み：1 件をコミットする直前に、そのアイテムの ID で呼ぶ（土台の競合・動いている間の一時停止・中止・譲る）。
     #[cfg(test)]
     pub(crate) before_commit: Option<Arc<dyn Fn(i64) + Send + Sync>>,
@@ -455,9 +458,35 @@ impl BatchHandler {
             #[cfg(test)]
             crash: None,
             #[cfg(test)]
+            crash_armed: None,
+            #[cfg(test)]
             before_commit: None,
             #[cfg(test)]
             before_prepare: None,
+        }
+    }
+
+    /// 1 件ずつの保存の段ごとに `hook` を呼ぶ（テストの割り込み：作り直しの途中で止める）。
+    #[cfg(test)]
+    pub(crate) fn with_save_hook(mut self, hook: super::save::Hook) -> Self {
+        self.saver.hook = Some(hook);
+        self
+    }
+
+    /// テストの強制終了を効かせるか（[`Self::crash`]）。
+    #[cfg(test)]
+    fn crash_now(&self, commits: usize) -> Option<super::save::Fault> {
+        match self.crash {
+            Some((n, fault))
+                if commits == n
+                    && self
+                        .crash_armed
+                        .as_ref()
+                        .is_none_or(|a| a.load(Ordering::SeqCst)) =>
+            {
+                Some(fault)
+            }
+            _ => None,
         }
     }
 
@@ -697,6 +726,11 @@ impl JobHandler for BatchHandler {
             result_json: result.to_string(),
             message: Some(message),
         })
+    }
+
+    /// もう一度動かす前の確かめ（[`undo::check_retry`]：同じ一括を戻す一括と重ならない）。
+    fn check_retry(&self, tx: &Connection, job: JobId, input_json: &str) -> Result<()> {
+        undo::check_retry(tx, job, input_json)
     }
 
     /// 待ち・一時停止のまま中止された（譲ったあとに中止を受けたときも、ジョブの管理が同じトランザクションで呼ぶ）：残りの pending
@@ -1082,12 +1116,12 @@ impl BatchHandler {
             #[cfg(test)]
             let crash_saver;
             #[cfg(test)]
-            let saver = match self.crash {
-                Some((n, fault)) if *commits == n => {
+            let saver = match self.crash_now(*commits) {
+                Some(fault) => {
                     crash_saver = Saver::new(self.engine.clone()).with_fault(fault);
                     &crash_saver
                 }
-                _ => &self.saver,
+                None => &self.saver,
             };
             #[cfg(not(test))]
             let saver = &self.saver;
@@ -1121,7 +1155,7 @@ impl BatchHandler {
                 }
                 Err(e) => {
                     #[cfg(test)]
-                    if self.crash.is_some_and(|(n, _)| *commits == n) {
+                    if self.crash_now(*commits).is_some() {
                         // テストの強制終了：後始末をせずに戻る
                         return Err(e);
                     }
@@ -1461,6 +1495,7 @@ fn read_input_shape(
             Ok(shape) => {
                 return Ok(Flow::Go(InputRead {
                     shape,
+                    anchor: Some(anchor_path),
                     stage: None,
                     path,
                     format,
@@ -1521,6 +1556,7 @@ fn read_input_shape(
             let platform = is_platform(stage.id);
             Ok(Flow::Go(InputRead {
                 shape,
+                anchor: None,
                 stage: Some(stage),
                 path,
                 format,
@@ -1536,6 +1572,8 @@ fn read_input_shape(
 /// 結び付けのために読んだ入力 0 の形と、読み方（長さを数え直すときに使う）。
 struct InputRead {
     shape: Shape,
+    /// アンカーの見出しから読んだなら、そのファイル（見積もりの読み手と長さ）。
+    anchor: Option<std::path::PathBuf>,
     /// 元を読んだ段（アンカーの見出しから読んだなら None：長さは決まっている）。
     stage: Option<kura_engine::codec::PickedStage>,
     /// 元のファイル。

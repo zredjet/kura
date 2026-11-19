@@ -38,7 +38,7 @@ use crate::edit::work_pcm::{WorkHandle, WorkKey, ensure_estimate};
 const LRU_MAX: u64 = 64 << 20;
 
 /// 流して書くか：音声で、出力の形式の書き手が流して書ける（代表の形 48 kHz ステレオで選んだ書き手）。
-pub(super) fn applies(codecs: &CodecSet, kind: MediaKind, out_format: &str) -> bool {
+pub(crate) fn applies(codecs: &CodecSet, kind: MediaKind, out_format: &str) -> bool {
     kind == MediaKind::Audio
         && codecs.encode_streams(
             out_format,
@@ -51,7 +51,7 @@ pub(super) fn applies(codecs: &CodecSet, kind: MediaKind, out_format: &str) -> b
 }
 
 /// 源の LRU の上限：min(64 MiB, 音声の全体（チャンクに切り上げ）)。並列の仕事 `tasks` 個が 1 チャンクずつ持てる量は下回らない。
-pub(super) fn lru_bytes(shape: &Shape, tasks: usize) -> u64 {
+pub(crate) fn lru_bytes(shape: &Shape, tasks: usize) -> u64 {
     let Shape::Audio {
         channels, frames, ..
     } = shape
@@ -365,7 +365,7 @@ fn verify_source(
 }
 
 /// 照らしの回の作業領域（窓 1 つ ＋ ダイジェスト ＋ 源の LRU）。
-pub(super) fn verify_bytes(shape: &Shape, tasks: u64, resident: u64) -> u64 {
+pub(crate) fn verify_bytes(shape: &Shape, tasks: u64, resident: u64) -> u64 {
     let Shape::Audio {
         channels, frames, ..
     } = shape

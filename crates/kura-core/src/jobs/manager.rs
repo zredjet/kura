@@ -44,6 +44,18 @@ pub trait JobHandler: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// 失敗・中止したジョブをもう一度動かす（[`JobManager::retry`]）前の確かめ。状態を queued に戻すのと同じトランザクションで
+    /// 呼び、誤りを返すと戻さない（`job` はそのジョブ、`input_json` はその入力）。既定は何もしない（一括は、同じ一括を戻す
+    /// 一括と重ならないように確かめる。M14 段 5）。
+    fn check_retry(
+        &self,
+        _tx: &rusqlite::Connection,
+        _job: JobId,
+        _input_json: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// ジョブの終わり方。
@@ -449,11 +461,26 @@ impl JobManager {
     pub fn retry(&self, id: JobId) -> Result<()> {
         let event = {
             let _sched = self.lock()?;
-            let changed = self
+            // 種類の処理の確かめ（同じトランザクションで。断られたら戻さない）
+            let gate = self
                 .inner
                 .library
                 .db()
-                .write(move |tx| store::requeue(tx, id))?;
+                .read(|conn| store::get(conn, id))?
+                .and_then(|r| {
+                    self.inner
+                        .handlers
+                        .get(&r.kind)
+                        .cloned()
+                        .map(|h| (h, r.input_json))
+                });
+            let changed = self.inner.library.db().write(move |tx| {
+                let changed = store::requeue(tx, id)?;
+                if changed && let Some((handler, input)) = &gate {
+                    handler.check_retry(tx, id, input)?;
+                }
+                Ok(changed)
+            })?;
             if changed { Some(self.get(id)?) } else { None }
         };
         if let Some(record) = event {

@@ -10,8 +10,9 @@
 //! - 別名：作ったアイテムをゴミ箱へ入れる（行と同じトランザクション。ゴミ箱から戻せる）。
 //!
 //! 積むのは元の一括が終わってから（待ち・動いている・一時停止なら Busy）。戻す一括そのものは戻さない。前に戻した分（ほかの
-//! 戻す一括で saved・unchanged になった行）は入れない。同じ一括を戻す一括が終わっていなければ Busy。止め方・ちょうど 1 回・
-//! 強制終了は一括と同じ（行と版・ゴミ箱が同じトランザクション）。
+//! 戻す一括で saved・unchanged になった行）は入れない。同じ一括を戻す一括が終わっていなければ Busy。やり直し（`job_retry`）も
+//! 同じ決まりで断る（[`check_retry`]。ADR-196）。止め方・ちょうど 1 回・強制終了は一括と同じ（行と版・ゴミ箱が同じトランザクション。
+//! 作り直しを止めたら作業用の PCM の鍵を返し、待ち・一時停止のまま中止したら捨てる）。
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -21,7 +22,7 @@ use super::{
 };
 use crate::db::Db;
 use crate::edit::EngineServices;
-use crate::edit::save::{Base, Flow, Reverted, UnitCx};
+use crate::edit::save::{Base, Flow, Reverted, UnitCx, revert_work_keys};
 use crate::edit::versions::{self, Head};
 use crate::jobs::{Control, JobId, JobKind, JobManager, JobState};
 use crate::time::now_ms;
@@ -73,6 +74,38 @@ pub fn start_undo(db: &Db, jobs: &JobManager, engine: &EngineServices, of: JobId
             Ok(())
         })
     })
+}
+
+/// 失敗・中止した一括をもう一度動かす前の確かめ（`JobManager::retry` が queued に戻すのと同じトランザクションで呼ぶ）：
+/// 元に戻す一括なら、元の一括が終わっていて、同じ一括を戻すほかの一括がすべて終わっていること。ふつうの一括なら、それを
+/// 戻す一括がすべて終わっていること（積むときの [`start_undo`] の決まりを、やり直しでも崩さない）。違えば Busy。
+pub(crate) fn check_retry(tx: &Connection, job: JobId, input_json: &str) -> Result<()> {
+    let input: BatchInput = serde_json::from_str(input_json)?;
+    match input.mode {
+        ModeInput::Undo { of, .. } => {
+            if !job_state(tx, of)?.is_some_and(finished) {
+                return Err(CoreError::Busy(
+                    "元の一括が終わってから、元に戻す一括をやり直せます".into(),
+                ));
+            }
+            if undo_jobs(tx, of, Some(job))?
+                .iter()
+                .any(|(_, s)| !finished(*s))
+            {
+                return Err(CoreError::Busy(
+                    "同じ一括を元に戻すほかの一括が、まだ終わっていません".into(),
+                ));
+            }
+        }
+        ModeInput::Overwrite | ModeInput::SaveAs { .. } => {
+            if undo_jobs(tx, job, None)?.iter().any(|(_, s)| !finished(*s)) {
+                return Err(CoreError::Busy(
+                    "この一括を元に戻す一括が終わってから、やり直せます".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 終わった状態（済んだ・失敗した・中止した）か。
@@ -208,6 +241,14 @@ impl BatchHandler {
         if unit.control() != Control::Continue {
             return Ok(Outcome::Stopped(Vec::new()));
         }
+        // 作り直しを一時停止・譲るで止めたときに残しうる作業用の PCM の鍵（待ち・一時停止のまま中止したら捨てる。一括と同じ）
+        let kept = |to: i64| {
+            db.read(|c| revert_work_keys(c, item, to))
+                .unwrap_or_else(|err| {
+                    tracing::warn!(%err, item, "戻す 1 件の作業用の PCM の鍵を求められません");
+                    Vec::new()
+                })
+        };
         let base = Base {
             hash: head.hash,
             version: head.version,
@@ -267,8 +308,8 @@ impl BatchHandler {
             Ok(Reverted::Committed(c)) => Ok(Outcome::Done { saved: c.saved }),
             Ok(Reverted::Rebuild(plan)) => match self.saver.prepare_rebuild(unit, *plan) {
                 Ok(Flow::Go(w)) => Ok(Outcome::Ready(task, Box::new(w))),
-                // 作り直しの途中で止めた（一時停止で残した作業用の PCM は期限・上限・閉じるときに消える）
-                Ok(Flow::Stop(_)) => Ok(Outcome::Stopped(Vec::new())),
+                // 作り直しの途中で止めた（一時停止なら作業用の PCM を残しうる。鍵を渡して、中止のときに捨てる）
+                Ok(Flow::Stop(_)) => Ok(Outcome::Stopped(kept(to))),
                 Err(e) => classify(e),
             },
             Err(e) => classify(e),

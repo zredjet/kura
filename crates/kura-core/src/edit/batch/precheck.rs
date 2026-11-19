@@ -1,24 +1,27 @@
-//! 一括の事前チェック（M14 段 5。docs/editing.md §14.2「事前チェック」、ADR-195）。
+//! 一括の事前チェック（M14 段 5。docs/editing.md §14.2「事前チェック」、ADR-195・196）。
 //!
 //! 当てるシートが、積む前に「当てられるか・出力の形・失うもの・見積もり・飛ばす理由」を出すための確かめ。描かない：アイテム
-//! ごとに、一括のジョブと同じ飛ばす決まりを見て、頭の文書にレシピを継ぎ足して結び付け（`Engine::instantiate`）、保存が読むのと
-//! 同じ入力の形（アンカーの見出しか、元を段の順に）で compile し、出力の形式の書き手と保存できるもの（`MetaCaps`）を照らし、
-//! メモリを見積もる（`Engine::estimate`）。ジョブにはしない（利用者がその場で待つ確かめ。spawn_blocking で動かし、進みは
-//! 呼び手がイベントで送り、シートを閉じたら中止する。ADR-195）。見出しを読む分は対話の枠で確保し（待たない）、空いていなければ
-//! そのアイテムは「確かめられなかった」に入れる（当てる側に数え、当てるときに確かめる）。終わりからの秒で長さが見出しで決まらない
-//! 音声（MP3・AAC）も、流して数えるのは当てるときなので「確かめられなかった」に入れる。
+//! ごとに、一括の 1 件と同じ順に確かめる（飛ばす決まり → 結び付けがなければ継ぎ足して出力の形式と種類 → 保存が読むのと同じ
+//! 入力の形 → 結び付けがあれば継ぎ足して結び付け → compile と書き手 → 保存と同じ式のメモリの見積もり）。ジョブにはしない
+//! （利用者がその場で待つ確かめ。spawn_blocking で動かし、進みは呼び手がイベントで送り、シートを閉じたら中止する。ADR-195）。
+//! 見出しを読む分は対話の枠で待たずに確保し、今は空いていなければそのアイテムは「確かめきれなかった」（Busy）に入れる（当てる
+//! 側に数え、当てるときに確かめる）。終わりからの秒で長さが見出しで決まらない音声（MP3・AAC）は、見出しの上限の長さで形式・書き手・
+//! 失うもの・見積もりを確かめ、「確かめきれなかった」（NoLength）にも入れる（流して数えるのは当てるとき）。
 //!
-//! 結果は群にまとめ、アイテムは ID の列だけを返す（10 万件でも詳細を JS に載せない）：当てる・飛ばす／失敗する見込み（理由ごと）・
-//! 確かめられなかった・出力の形式ごと（代わりの形式か・例 3 件・大きさや長さが変わる件数）・失うもの（種類と形式ごと）・編集済みに
-//! 継ぎ足すもの・ディスクの目安・メモリの最大・結び付けで読む値の例 3 件・レシピの旧版の印。ディスクの新しいファイルは、元の
-//! ファイルの大きさを値の大きさ（画素数・長さ × チャンネル）の比で伸ばした目安（形式による圧縮の違いは見ない）。上書きは、今の
-//! ファイル（版 1 以上の頭）が置き換わって 7 日残る分（`replaced_bytes`。元はいつも残すので数えない）も出す。
+//! 結果は群にまとめ、アイテムは ID の列だけを返す（10 万件でも詳細を JS に載せない）：当てる・飛ばす／失敗する見込み（理由ごと。
+//! 言葉は一括の行と同じ）・確かめきれなかった・出力の形式ごと（代わりの形式か・例 3 件・大きさや長さが変わる件数）・失うもの（種類と
+//! 形式ごと）・編集済みに継ぎ足すもの・ディスクの目安・メモリの最大・結び付けで読む値の例 3 件・レシピの旧版の印・ライブラリにない
+//! アイテム。ディスクの新しいファイルは、元のファイルの大きさを値の大きさ（画素数・長さ × チャンネル）の比で伸ばした目安（形式による
+//! 圧縮の違いは見ない）。上書きは、今のファイル（版 1 以上の頭）が置き換わって 7 日残る分（`replaced_bytes`。元はいつも残すので
+//! 数えない）も出す。
 
 use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kura_engine::budget::{Class, Lease, MemoryBudget};
+use kura_engine::codec::anchor;
 use kura_engine::codec::formats::{AlphaCaps, MetaCaps, format_by_id};
 use kura_engine::doc::{FormatChoice, Graph, InputId, OutputId};
 use kura_engine::recipe::{BindError, Recipe, RecipeNote, bound_json};
@@ -32,9 +35,9 @@ use super::{
     BatchMode, BatchRequest, InputRead, ShapeHooks, Skip, bind_skip, dedup, facts_of, head_doc,
     read_input_shape, resolve, skip_rules,
 };
-use crate::edit::save::Flow;
+use crate::edit::save::{Flow, lru_bytes, streams, verify_bytes};
 use crate::edit::{EngineRuntime, EngineServices, versions};
-use crate::import::MediaKind;
+use crate::import::{MediaKind, format_id};
 use crate::library::Library;
 use crate::{CoreError, Result};
 
@@ -52,13 +55,17 @@ pub struct PrecheckCx<'a> {
 /// 事前チェックの結果（モジュールの説明）。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Precheck {
-    /// 確かめた件数（重なりを除いた選んだアイテム）。
+    /// 確かめた件数（重なりを除いた選んだアイテムのうち、ライブラリにあるもの。一括の行の数と同じ）。
     pub total: u64,
+    /// ライブラリにないアイテム（選んだ順。一括は行を入れない）。
+    pub missing: Vec<i64>,
     /// 当てる見込みのアイテム（選んだ順。確かめられなかったものを含む）。
     pub apply: Vec<i64>,
     /// 飛ばす・失敗する見込み（理由ごと。最初に出た順）。
     pub skips: Vec<PrecheckGroup>,
-    /// 当てる側に数えたが、出力の形・失うもの・見積もりを確かめられなかったもの（理由ごと）。
+    /// 当てる側に数えたが、確かめきれなかったもの（理由ごと）：予算が空いていなくて形を読めなかった（Busy。出力の形・失うもの・
+    /// 見積もりもない）、終わりからの秒の長さが当てるときに決まる（NoLength。形式・書き手・失うもの・見積もりは見出しの上限の
+    /// 長さで確かめ、`outputs`・`losses` にも入る）。
     pub unchecked: Vec<PrecheckGroup>,
     /// 当てる見込みのものの出力（形式ごと）。
     pub outputs: Vec<OutputGroup>,
@@ -235,6 +242,8 @@ struct Applies {
     bytes: Bytes,
     peak: u64,
     bound: Option<serde_json::Value>,
+    /// 当てる側に数えるが、確かめきれなかったこと（終わりからの秒の長さ）。
+    note: Option<(&'static str, String)>,
 }
 
 /// 頼み `req` の事前チェック（モジュールの説明）。レシピに当てられない理由がある・N → 1 のレシピ・元に戻した一括の写しは
@@ -258,7 +267,27 @@ pub fn precheck(
         }
     };
     let drafts = !save_as && !req.include_drafts;
-    let items = dedup(&req.items);
+    // ライブラリにないアイテムは確かめない（一括も行を入れない）。どれもなければ一括と同じく Invalid
+    let mut items = Vec::new();
+    let mut missing = Vec::new();
+    db.read(|c| {
+        let mut exists = c.prepare_cached("SELECT 1 FROM items WHERE id = ?1")?;
+        for id in dedup(&req.items) {
+            if exists.query_row([id], |_| Ok(())).optional()?.is_some() {
+                items.push(id);
+            } else {
+                missing.push(id);
+            }
+        }
+        Ok(())
+    })?;
+    if items.is_empty() {
+        return Err(CoreError::Invalid(if missing.is_empty() {
+            "当てるアイテムがありません".into()
+        } else {
+            "当てるアイテムがありません（どれもライブラリにありません）".into()
+        }));
+    }
     let total = items.len() as u64;
     let k = runtime.bulk_threads().max(1).min(items.len().max(1));
     let next = AtomicUsize::new(0);
@@ -284,7 +313,17 @@ pub fn precheck(
                     }
                     let i = next.fetch_add(1, Ordering::AcqRel);
                     let Some(&item) = items.get(i) else { return };
-                    match one.check(item) {
+                    // 1 件の panic はその 1 件の失敗の見込みにする（一括の働き手と同じ。全体を落とさない）
+                    let checked = catch_unwind(AssertUnwindSafe(|| one.check(item)))
+                        .unwrap_or_else(|_| {
+                            tracing::error!(item, "事前チェックの 1 件が panic しました");
+                            Ok(Verdict::Skip(Skip {
+                                state: "failed",
+                                code: "Internal".into(),
+                                message: "確かめる途中で内部の誤りが起きました".into(),
+                            }))
+                        });
+                    match checked {
                         Ok(v) => {
                             if let Ok(mut all) = verdicts.lock()
                                 && let Some(slot) = all.get_mut(i)
@@ -317,6 +356,7 @@ pub fn precheck(
         .map_err(|_| CoreError::Invalid("事前チェックの結果の錠が壊れました".into()))?;
     let mut out = Precheck {
         total,
+        missing,
         memory_budget: runtime.budget().total(),
         notes: resolved.notes,
         ..Precheck::default()
@@ -355,6 +395,9 @@ impl Precheck {
                 self.apply.push(item);
                 if a.composed {
                     self.composed.push(item);
+                }
+                if let Some((code, message)) = &a.note {
+                    push_group(&mut self.unchecked, "pending", code, message.clone(), item);
                 }
                 self.disk.new_bytes = self.disk.new_bytes.saturating_add(a.bytes.new);
                 self.disk.replaced_bytes =
@@ -470,11 +513,17 @@ impl ShapeHooks for PrecheckShape<'_> {
     }
 
     fn acquire(&self, bytes: u64) -> std::result::Result<Lease, EngineError> {
-        let got = self.budget.acquire(bytes, Class::Interactive, &self.mon);
-        if matches!(&got, Err(e) if matches!(e.root(), EngineError::Limit(_))) {
-            self.denied.set(true);
+        if self.mon.canceled() {
+            return Err(EngineError::Canceled);
         }
-        got
+        // 今は空いていないだけなら「確かめられなかった」、予算の全体を超えるなら当てるときも失敗する（TooLarge）
+        match self.budget.try_acquire(bytes, Class::Interactive)? {
+            Some(lease) => Ok(lease),
+            None => {
+                self.denied.set(true);
+                Err(EngineError::Limit("メモリが空いていません".into()))
+            }
+        }
     }
 
     fn mark(&self, _decoding: bool) -> Result<()> {
@@ -486,8 +535,19 @@ impl ShapeHooks for PrecheckShape<'_> {
     }
 }
 
+/// 入力の形の読みの結果。
+enum Read {
+    Go(Box<InputRead>),
+    /// 予算が今は空いていない（確かめられなかった）。
+    Denied,
+    /// 読めない（当てるときも同じ誤りで失敗する）。
+    Failed(CoreError),
+}
+
 impl OneCx<'_> {
-    /// 1 件の見込み（誤りは事前チェックそのものの失敗。アイテムの誤りは Verdict に入れる）。
+    /// 1 件の見込み（誤りは事前チェックそのものの失敗。アイテムの誤りは Verdict に入れる）。一括の 1 件と同じ順に確かめる：
+    /// 結び付けがなければ、継ぎ足してから形を読む前に出力の形式と種類を照らし（保存の段 0）、あれば先に形を読んで結び付ける
+    /// （段 2）。そのあと compile と書き手（保存の段 1・2）。
     fn check(&self, item: i64) -> Result<Verdict> {
         let db = self.library.db();
         let head = match skip_rules(self.engine, db, item, self.drafts) {
@@ -504,14 +564,11 @@ impl OneCx<'_> {
                 .optional()?
                 .unwrap_or((0, None, None, None)))
             })?;
-        let original = match db.read(|c| versions::original(c, item))? {
-            Some(o) => o,
-            None => {
-                return Ok(Verdict::Skip(Skip::skipped(
-                    "Gone",
-                    "アイテムがありません".into(),
-                )));
-            }
+        let Some(original) = db.read(|c| versions::original(c, item))? else {
+            return Ok(Verdict::Skip(Skip::skipped(
+                "Gone",
+                "アイテムがありません".into(),
+            )));
         };
         let replaced = if !self.save_as && head.version > 0 {
             u64::try_from(cur_size).unwrap_or(0)
@@ -522,96 +579,132 @@ impl OneCx<'_> {
             new: u64::try_from(original.size_bytes).unwrap_or(0),
             replaced,
         };
+        let unchecked = |code: &'static str, message: &str| {
+            Ok(Verdict::Unchecked {
+                code,
+                message: message.to_string(),
+                composed,
+                estimate: rough,
+            })
+        };
+        let Some(source_format) = format_id(&original.ext) else {
+            return Ok(Verdict::Skip(Skip::failed(&CoreError::Unsupported(
+                format!("元の形式（{}）を読めません", original.ext),
+            ))));
+        };
         let head_doc = match head_doc(db, self.runtime, item, head.version) {
             Ok(g) => g,
             Err(e) => return Ok(Verdict::Skip(Skip::failed(&e))),
         };
         let facts = db.read(|c| facts_of(c, item))?;
-        // 入力の形（保存が読むのと同じもの）
-        let hooks = PrecheckShape {
-            mon: CancelMon(self.canceled),
-            budget: self.runtime.budget(),
-            denied: std::cell::Cell::new(false),
-        };
-        let read: InputRead =
-            match read_input_shape(self.engine, self.library, item, &head_doc, &hooks) {
-                Ok(Flow::Go(read)) => read,
-                Ok(Flow::Stop(_)) => return Err(CoreError::Canceled),
-                Err(_) if hooks.denied.get() => {
-                    return Ok(Verdict::Unchecked {
-                        code: "Busy",
-                        message: "メモリが空いていないので、当てるときに確かめます".into(),
-                        composed,
-                        estimate: rough,
-                    });
-                }
-                Err(e) => return Ok(Verdict::Skip(Skip::failed(&e))),
+        // ファイルのループ点（解析の事実。解析していなければ分からないので言わない）
+        let file_loop = db
+            .read(|c| crate::asset::get(c, item))
+            .map(|a| a.facts.is_some_and(|f| f.audio.has_loop == Some(true)))
+            .unwrap_or(false);
+        let busy = "メモリが空いていないので、当てるときに確かめます";
+        let mut note: Option<(&'static str, String)> = None;
+        let (graph, bound, read, compile_shape) = if self.recipe.bindings.is_empty() {
+            let instance = match self
+                .runtime
+                .bulk(|e| e.instantiate(&head_doc, self.recipe, &BTreeMap::new(), &facts))
+            {
+                Ok(instance) => instance,
+                Err(e) => return Ok(Verdict::Skip(bind_skip(e))),
             };
-        let shapes = BTreeMap::from([(InputId(0), read.shape)]);
-        // 継ぎ足して結び付ける
-        let instance = match self
-            .runtime
-            .bulk(|e| e.instantiate(&head_doc, self.recipe, &shapes, &facts))
-        {
-            Ok(instance) => instance,
-            Err(BindError::NoLength { .. }) => {
-                return Ok(Verdict::Unchecked {
-                    code: "NoLength",
-                    message: "終わりからの秒は、当てるときに元の長さを数えて決めます".into(),
-                    composed,
-                    estimate: rough,
-                });
+            // 形を読む前に、出力の形式と種類（書き手のない形式は、上書きなら読まずに飛ばす。別名は代わりの形式で読む）
+            match self.format_kind(&instance.graph, source_format, head.kind) {
+                Ok(()) => {}
+                Err(Attempt::Skip(skip)) => return Ok(Verdict::Skip(skip)),
+                Err(Attempt::Unwritable(why)) if !self.save_as => {
+                    return Ok(Verdict::Skip(Skip::skipped("FormatUnavailable", why)));
+                }
+                Err(Attempt::Unwritable(_)) => {}
             }
-            Err(e) => return Ok(Verdict::Skip(bind_skip(e))),
-        };
-        let bound = if self.recipe.bindings.is_empty() {
-            None
+            let read = match self.read(item, &head_doc)? {
+                Read::Go(read) => read,
+                Read::Denied => return unchecked("Busy", busy),
+                Read::Failed(e) => return Ok(Verdict::Skip(Skip::failed(&e))),
+            };
+            let shape = read.shape;
+            (instance.graph, None, read, shape)
         } else {
-            bound_json(&instance.bound)
+            let read = match self.read(item, &head_doc)? {
+                Read::Go(read) => read,
+                Read::Denied => return unchecked("Busy", busy),
+                Read::Failed(e) => return Ok(Verdict::Skip(Skip::failed(&e))),
+            };
+            let shapes = BTreeMap::from([(InputId(0), read.shape)]);
+            let (instance, shape) = match self
+                .runtime
+                .bulk(|e| e.instantiate(&head_doc, self.recipe, &shapes, &facts))
+            {
+                Ok(instance) => (instance, read.shape),
+                Err(BindError::NoLength { .. }) if read.stage.is_some() => {
+                    // 当てるときは流して数えた長さで結び付ける。ここでは見出しの上限の長さで、形式・書き手・失うもの・
+                    // 見積もりを確かめる（結び付けた値と長さは当てるときに決まる）
+                    note = Some((
+                        "NoLength",
+                        "終わりからの秒は、当てるときに元の長さを数えて決めます".into(),
+                    ));
+                    let upper = upper_bound(read.shape);
+                    let shapes = BTreeMap::from([(InputId(0), upper)]);
+                    match self
+                        .runtime
+                        .bulk(|e| e.instantiate(&head_doc, self.recipe, &shapes, &facts))
+                    {
+                        Ok(instance) => (instance, upper),
+                        Err(e) => return Ok(Verdict::Skip(bind_skip(e))),
+                    }
+                }
+                Err(e) => return Ok(Verdict::Skip(bind_skip(e))),
+            };
+            let bound = bound_json(&instance.bound)
                 .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
+                .and_then(|b| serde_json::from_slice(&b).ok());
+            (instance.graph, bound, read, shape)
         };
-        let mut graph = instance.graph;
-        let source_format = read.format;
-        let codecs = self.engine.codecs();
-        // 出力の形と形式（保存の段 1・2 と同じ確かめ。別名は代わりの形式も。一括と同じ順）
+        let mut graph = graph;
+        let shapes = BTreeMap::from([(InputId(0), compile_shape)]);
+        // 出力の形と形式（保存の段 0〜2 と同じ確かめ。別名は代わりの形式も。一括と同じ順）
         let mut fallback = false;
-        let first = self.output(&graph, &shapes, source_format, head.kind);
-        let (plan, out_shape, out_format, enc_opts) = match first {
-            Ok(out) => out,
-            Err(Attempt::Skip(skip)) => return Ok(Verdict::Skip(skip)),
-            Err(Attempt::Unwritable(why)) if !self.save_as => {
-                return Ok(Verdict::Skip(Skip::skipped("FormatUnavailable", why)));
-            }
-            Err(Attempt::Unwritable(why)) => {
-                let fallbacks: &[&str] = match head.kind {
-                    MediaKind::Audio => &["ogg", "wav"],
-                    _ => &["png"],
-                };
-                let mut last = Err(Attempt::Unwritable(why));
-                for format in fallbacks {
-                    if let Some(out) = graph.outputs.first_mut() {
-                        out.format = FormatChoice::To {
-                            format: (*format).to_string(),
-                            options: json!({}),
-                        };
-                        out.quantize = None;
+        let (plan, out_shape, out_format, enc_opts) =
+            match self.output(&graph, &shapes, source_format, head.kind) {
+                Ok(out) => out,
+                Err(Attempt::Skip(skip)) => return Ok(Verdict::Skip(skip)),
+                Err(Attempt::Unwritable(why)) if !self.save_as => {
+                    return Ok(Verdict::Skip(Skip::skipped("FormatUnavailable", why)));
+                }
+                Err(Attempt::Unwritable(why)) => {
+                    let fallbacks: &[&str] = match head.kind {
+                        MediaKind::Audio => &["ogg", "wav"],
+                        _ => &["png"],
+                    };
+                    let mut last = Err(Attempt::Unwritable(why));
+                    for format in fallbacks {
+                        if let Some(out) = graph.outputs.first_mut() {
+                            out.format = FormatChoice::To {
+                                format: (*format).to_string(),
+                                options: json!({}),
+                            };
+                            out.quantize = None;
+                        }
+                        last = self.output(&graph, &shapes, source_format, head.kind);
+                        if !matches!(last, Err(Attempt::Unwritable(_))) {
+                            break;
+                        }
                     }
-                    last = self.output(&graph, &shapes, source_format, head.kind);
-                    if !matches!(last, Err(Attempt::Unwritable(_))) {
-                        break;
+                    fallback = true;
+                    match last {
+                        Ok(out) => out,
+                        Err(Attempt::Skip(skip)) => return Ok(Verdict::Skip(skip)),
+                        Err(Attempt::Unwritable(why)) => {
+                            return Ok(Verdict::Skip(Skip::skipped("FormatUnavailable", why)));
+                        }
                     }
                 }
-                fallback = true;
-                match last {
-                    Ok(out) => out,
-                    Err(Attempt::Skip(skip)) => return Ok(Verdict::Skip(skip)),
-                    Err(Attempt::Unwritable(why)) => {
-                        return Ok(Verdict::Skip(Skip::skipped("FormatUnavailable", why)));
-                    }
-                }
-            }
-        };
+            };
+        let codecs = self.engine.codecs();
         // 失うもの
         let caps = codecs
             .encoder(&out_format, &out_shape)
@@ -629,64 +722,118 @@ impl OneCx<'_> {
                 _,
                 _,
                 Some(ms),
-            ) if rate > 0 => {
+            ) if rate > 0 && note.is_none() => {
                 let out_ms = u128::from(n) * 1000 / u128::from(rate);
                 out_ms.abs_diff(u128::try_from(ms).unwrap_or(0)) > 1
             }
+            // 長さが上限しか分からない音声（MP3・AAC）は、元の見出しの長さと比べる（同じ上限なら変わらない）
+            (Shape::Audio { frames, .. }, ..) => match read.shape {
+                Shape::Audio { frames: from, .. } => frames != from,
+                _ => true,
+            },
             _ => false,
         };
         let has_settings = facts.grid.is_some()
             || facts.pivot.is_some()
             || (matches!(out_shape, Shape::Audio { .. }) && facts.loop_range.is_some());
-        let mut losses: Vec<(Loss, String)> =
-            losses_of(caps.as_ref(), &out_shape, facts.loop_range.is_some())
-                .into_iter()
-                .map(|l| (l, out_format.clone()))
-                .collect();
+        let mut losses: Vec<(Loss, String)> = losses_of(caps.as_ref(), &out_shape, file_loop)
+            .into_iter()
+            .map(|l| (l, out_format.clone()))
+            .collect();
         if !self.save_as && resized && has_settings {
             losses.push((Loss::Settings, String::new()));
         }
-        // 見積もり（メモリ。予算の全体を超えるなら当てるときに失敗する）
-        let streams = matches!(out_shape, Shape::Audio { .. })
-            && codecs.encode_streams(
-                &out_format,
-                &Shape::Audio {
-                    rate: 48_000,
-                    channels: 2,
-                    frames: Dim::Exact(48_000),
-                },
-            );
-        let input_len = std::fs::metadata(&read.path).map_or(0, |m| m.len());
-        let mut spec = EstimateSpec::new(self.runtime.bulk_threads() as u64)
-            .digests(true)
-            .input(
-                InputId(0),
-                Source::Decode {
-                    codecs: &codecs,
-                    format: source_format,
-                },
-            )
-            .input_len(InputId(0), input_len)
-            .output(
-                OutputId(0),
-                Sink::Encode {
-                    codecs: &codecs,
-                    format: &out_format,
-                    opts: &enc_opts,
-                },
-            );
-        if streams {
-            spec = spec.stream(OutputId(0));
-        }
-        let peak = self
-            .runtime
-            .bulk(|e| e.estimate(&plan, &spec, None))
-            .map_or(0, |est| est.peak);
-        let budget = self.runtime.budget().total();
-        if peak > budget {
-            return Ok(Verdict::Skip(Skip::failed(&CoreError::TooLarge(format!(
-                "メモリの予算を超える見込みです（見積もり {peak} バイト。予算は {budget} バイト）"
-            )))));
+        // 見積もり（メモリ。保存と同じ式で、予算の全体を超えるなら当てるときに失敗する）
+        let tasks = self.runtime.bulk_threads();
+        let anchored = read.anchor.is_some();
+        let in_shape = compile_shape;
+        let peak = if streams(&codecs, head.kind, &out_format) {
+            // 流して書く：源は LRU だけ持つ。再現しない読みでアンカーがなければ、昇格の照らしの分
+            let reproducible = read.stage.as_ref().is_none_or(|stage| {
+                codecs
+                    .decoders_for(source_format)
+                    .iter()
+                    .find(|d| d.id() == stage.id)
+                    .is_none_or(|d| d.reproducible())
+            });
+            let promote = if !anchored && !reproducible {
+                verify_bytes(&in_shape, tasks as u64, 32 << 20)
+            } else {
+                0
+            };
+            let spec = EstimateSpec::new(tasks as u64)
+                .stream(OutputId(0))
+                .digests(true)
+                .input(
+                    InputId(0),
+                    Source::Lazy {
+                        resident: lru_bytes(&in_shape, tasks),
+                    },
+                )
+                .output(
+                    OutputId(0),
+                    Sink::Encode {
+                        codecs: &codecs,
+                        format: &out_format,
+                        opts: &enc_opts,
+                    },
+                );
+            self.runtime
+                .bulk(|e| e.estimate(&plan, &spec, None))
+                .map_or(0, |est| est.peak.max(promote))
+        } else {
+            let (source, path) = match &read.anchor {
+                Some(path) => (
+                    Source::Decoder {
+                        decoder: &anchor::AnchorDecoder,
+                        format: anchor::FORMAT,
+                    },
+                    path.as_path(),
+                ),
+                None => (
+                    Source::Decode {
+                        codecs: &codecs,
+                        format: source_format,
+                    },
+                    read.path.as_path(),
+                ),
+            };
+            let input_len = std::fs::metadata(path).map_or(0, |m| m.len());
+            let spec = EstimateSpec::new(tasks as u64)
+                .digests(true)
+                .input(InputId(0), source)
+                .input_len(InputId(0), input_len)
+                .output(
+                    OutputId(0),
+                    Sink::Encode {
+                        codecs: &codecs,
+                        format: &out_format,
+                        opts: &enc_opts,
+                    },
+                );
+            // アンカーを作る読み（再現しないデコーダの形式で、アンカーがない）：読む持ち越し ＋ 値 ＋ 書いて読み直す分
+            let may_anchor = !anchored
+                && codecs
+                    .decoders_for(source_format)
+                    .iter()
+                    .any(|d| !d.reproducible());
+            self.runtime
+                .bulk(|e| e.estimate(&plan, &spec, None))
+                .map_or(0, |est| {
+                    let anchor_need = if may_anchor {
+                        est.carried_decode
+                            .saturating_add(in_shape.value_bytes())
+                            .saturating_add(anchor::work_bytes(&in_shape))
+                    } else {
+                        0
+                    };
+                    est.peak.max(anchor_need)
+                })
+        };
+        if peak > self.runtime.budget().total() {
+            return Ok(Verdict::Skip(Skip::failed(&CoreError::TooLarge(
+                "メモリの予算を超える見込みなので、当てると失敗します".into(),
+            ))));
         }
         // ディスクの目安：元のファイルの大きさを値の大きさの比で伸ばす
         let new = scaled(
@@ -704,24 +851,53 @@ impl OneCx<'_> {
             bytes: Bytes { new, replaced },
             peak,
             bound,
+            note,
         })))
     }
-}
 
-/// 出力を確かめられなかった理由。
-enum Attempt {
-    /// 書き手がない（別名なら代わりの形式を試す）。
-    Unwritable(String),
-    /// このアイテムに当てられない・失敗する。
-    Skip(Skip),
-}
+    /// 入力 0 の形を読む（一括と同じ読み方。予算は対話の枠で待たず、空いていなければ Denied。全体を超えるなら Failed）。
+    fn read(&self, item: i64, head_doc: &Graph) -> Result<Read> {
+        let hooks = PrecheckShape {
+            mon: CancelMon(self.canceled),
+            budget: self.runtime.budget(),
+            denied: std::cell::Cell::new(false),
+        };
+        match read_input_shape(self.engine, self.library, item, head_doc, &hooks) {
+            Ok(Flow::Go(read)) => Ok(Read::Go(Box::new(read))),
+            Ok(Flow::Stop(_)) => Err(CoreError::Canceled),
+            Err(_) if hooks.denied.get() => Ok(Read::Denied),
+            Err(e) => Ok(Read::Failed(e)),
+        }
+    }
 
-/// 確かめた出力（計画・形・形式・設定）。
-type Output = (kura_engine::render::Plan, Shape, String, serde_json::Value);
+    /// 出力の形式と種類（保存の段 0：知らない形式は Unwritable、種類を変える形式は NotApplicable）。
+    fn format_kind(
+        &self,
+        graph: &Graph,
+        source_format: &str,
+        kind: MediaKind,
+    ) -> std::result::Result<(), Attempt> {
+        let out_format = match graph.outputs.first().map(|o| &o.format) {
+            Some(FormatChoice::To { format, .. }) => format.as_str(),
+            Some(FormatChoice::Keep) | None => source_format,
+        };
+        let desc = format_by_id(out_format)
+            .ok_or_else(|| Attempt::Unwritable(format!("出力の形式 {out_format} を知りません")))?;
+        if MediaKind::from(desc.item_kind) != kind {
+            return Err(Attempt::Skip(Skip::skipped(
+                "NotApplicable",
+                CoreError::Unfit(format!(
+                    "保存でアイテムの種類は変えられません（{} → {out_format}）",
+                    kind.as_str()
+                ))
+                .to_string(),
+            )));
+        }
+        Ok(())
+    }
 
-impl OneCx<'_> {
-    /// 文書 `graph` を入力の形で compile し、出力の形と形式を確かめる（保存の段 1・2 と同じ：描けない・種類を変える形式は
-    /// NotApplicable、知らない形式・書き手がないは Unwritable）。
+    /// 文書 `graph` の出力の形式と種類を照らし（[`Self::format_kind`]）、入力の形で compile して、書き手を確かめる（保存の
+    /// 段 0〜2 と同じ順：描けない手は NotApplicable、書き手がなければ Unwritable）。
     fn output(
         &self,
         graph: &Graph,
@@ -729,6 +905,7 @@ impl OneCx<'_> {
         source_format: &str,
         kind: MediaKind,
     ) -> std::result::Result<Output, Attempt> {
+        self.format_kind(graph, source_format, kind)?;
         let plan = self
             .runtime
             .bulk(|e| e.compile(graph, shapes))
@@ -758,18 +935,6 @@ impl OneCx<'_> {
             ),
             Some(FormatChoice::Keep) | None => (source_format.to_string(), json!({})),
         };
-        let desc = format_by_id(&out_format)
-            .ok_or_else(|| Attempt::Unwritable(format!("出力の形式 {out_format} を知りません")))?;
-        if MediaKind::from(desc.item_kind) != kind {
-            return Err(Attempt::Skip(Skip::skipped(
-                "NotApplicable",
-                CoreError::Unfit(format!(
-                    "保存でアイテムの種類は変えられません（{} → {out_format}）",
-                    kind.as_str()
-                ))
-                .to_string(),
-            )));
-        }
         if self
             .engine
             .codecs()
@@ -783,6 +948,33 @@ impl OneCx<'_> {
         Ok((plan, out_shape, out_format, enc_opts))
     }
 }
+
+/// 長さが上限しか分からない音声の形を、上限の長さで決まった形にする（事前チェックで形式・書き手を確かめるため）。
+fn upper_bound(shape: Shape) -> Shape {
+    match shape {
+        Shape::Audio {
+            rate,
+            channels,
+            frames,
+        } => Shape::Audio {
+            rate,
+            channels,
+            frames: Dim::Exact(frames.max()),
+        },
+        other => other,
+    }
+}
+
+/// 出力を確かめられなかった理由。
+enum Attempt {
+    /// 書き手がない（別名なら代わりの形式を試す）。
+    Unwritable(String),
+    /// このアイテムに当てられない・失敗する。
+    Skip(Skip),
+}
+
+/// 確かめた出力（計画・形・形式・設定）。
+type Output = (kura_engine::render::Plan, Shape, String, serde_json::Value);
 
 /// `size` を `to / from` の比で伸ばす（`from` が 0 なら `size`）。
 fn scaled(size: u64, from: u64, to: u64) -> u64 {
@@ -810,6 +1002,10 @@ fn losses_of(caps: Option<&MetaCaps>, out: &Shape, has_loop: bool) -> Vec<Loss> 
                     AlphaCaps::Binary => out_losses.push(Loss::SemiAlpha),
                     AlphaCaps::Full => {}
                 }
+            } else if *fmt == PixelFormat::Indexed8 && caps.alpha == AlphaCaps::None {
+                // パレットは色が透明を持てる（Indexed8 の `has_alpha` は偽）。JPEG の書き手は透明な色があれば断る。GIF（2 値）は
+                // パレットのまま書くことが多く、半透明の色があるかは描かないと分からないので言わない
+                out_losses.push(Loss::Alpha);
             }
             if matches!(
                 fmt,
@@ -879,6 +1075,10 @@ mod tests {
             fmt: PixelFormat::Indexed8,
         };
         assert!(losses_of(Some(&gif), &indexed, false).is_empty());
+        assert_eq!(
+            losses_of(Some(&jpeg), &indexed, false),
+            vec![Loss::Lossy, Loss::Alpha]
+        );
         let png16 = MetaCaps {
             lossless: true,
             alpha: AlphaCaps::Full,

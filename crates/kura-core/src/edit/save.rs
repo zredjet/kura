@@ -675,6 +675,8 @@ mod unit;
 
 pub use revert::Verdict;
 pub(crate) use revert::{Reverted, verify_version};
+/// 流して書くか・源の LRU・照らしの量（一括の事前チェックが保存と同じ見積もりにする。M14 段 5）。
+pub(crate) use stream::{applies as streams, lru_bytes, verify_bytes};
 pub(crate) use unit::{Committed, JobUnit, Record, UnitCx, UnitMonitor};
 
 /// このジョブの staging のファイル（落とすと消す。置いたものは改名で消えている）。
@@ -1018,22 +1020,26 @@ fn paused_work_keys(conn: &Connection, input: &JobInput) -> Result<Vec<WorkKey>>
                 .unwrap_or_default();
             work_keys_of(conn, &original.hash, format, options)
         }
-        ActionInput::Revert { to } => {
-            let Some(v) = versions::get(conn, input.item_id, *to)? else {
-                return Ok(Vec::new());
-            };
-            Ok(versions::inputs(conn, v.id)?
-                .iter()
-                .filter_map(|i| serde_json::from_str::<RecordedInput>(&i.recorded).ok())
-                .map(|rec| WorkKey {
-                    source: rec.source.0,
-                    format: rec.format,
-                    options: rec.options,
-                    decoder: Some(rec.decoded.codec),
-                })
-                .collect())
-        }
+        ActionInput::Revert { to } => revert_work_keys(conn, input.item_id, *to),
     }
+}
+
+/// アイテム `item_id` を版 `to` に戻す作り直しが、一時停止で残しうる作業用の PCM の鍵（版 `to` の入力の記録の読み方。保存の
+/// ジョブの版に戻すと、一括の［元に戻す…］の後始末。M14 段 5）。版がなければ空。
+pub(crate) fn revert_work_keys(conn: &Connection, item_id: i64, to: i64) -> Result<Vec<WorkKey>> {
+    let Some(v) = versions::get(conn, item_id, to)? else {
+        return Ok(Vec::new());
+    };
+    Ok(versions::inputs(conn, v.id)?
+        .iter()
+        .filter_map(|i| serde_json::from_str::<RecordedInput>(&i.recorded).ok())
+        .map(|rec| WorkKey {
+            source: rec.source.0,
+            format: rec.format,
+            options: rec.options,
+            decoder: Some(rec.decoded.codec),
+        })
+        .collect())
 }
 
 /// アイテム `item_id` の元を読み方 `options` で読む保存が、一時停止で残しうる作業用の PCM の鍵（一括の 1 件の後始末。M14 段 4）：
