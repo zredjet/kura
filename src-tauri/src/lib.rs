@@ -176,6 +176,17 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::playlists::playlist_restore_entries,
             commands::playlists::playlist_regenerate,
             commands::playlists::playlist_save_state,
+            commands::recipes::recipes_list,
+            commands::recipes::recipe_get,
+            commands::recipes::recipe_create,
+            commands::recipes::recipe_replace,
+            commands::recipes::recipe_rename,
+            commands::recipes::recipe_describe,
+            commands::recipes::recipes_reorder,
+            commands::recipes::recipe_duplicate,
+            commands::recipes::recipe_delete,
+            commands::recipes::recipe_export,
+            commands::recipes::recipe_import,
         ])
         .events(collect_events![
             dto::JobProgress,

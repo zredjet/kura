@@ -325,6 +325,34 @@ export const commands = {
 	itemId: number | null,
 	positionMs: number,
 } | null) => typedError<null, AppError>(__TAURI_INVOKE("playlist_save_state", { id, playState })),
+	/**  レシピの一覧（並びの順）。 */
+	recipesList: () => typedError<RecipeSummaryDto[], AppError>(__TAURI_INVOKE("recipes_list")),
+	/**  1 件のレシピ。 */
+	recipeGet: (id: number) => typedError<RecipeDto_Serialize, AppError>(__TAURI_INVOKE("recipe_get", { id })),
+	/**
+	 *  エディタ（`session`）の頭の文書からレシピを作る（`keep` のノードだけを含める。`withFormat` が偽なら出力は「元と同じ」。
+	 *  結び付けはエディタの文書のノードで指す）。ID を返す。
+	 */
+	recipeCreate: (session: string, name: string, description: string, keep: NodeId[], withFormat: boolean, bindings: Binding_Deserialize[]) => typedError<number, AppError>(__TAURI_INVOKE("recipe_create", { session, name, description, keep, withFormat, bindings })),
+	/**
+	 *  レシピ `id` の中身（文書と結び付け）を、エディタ（`session`）の頭の文書から作り直して差し替える（ID・名前・説明・並びは
+	 *  そのまま。見本で編集の保存）。
+	 */
+	recipeReplace: (id: number, session: string, keep: NodeId[], withFormat: boolean, bindings: Binding_Deserialize[]) => typedError<null, AppError>(__TAURI_INVOKE("recipe_replace", { id, session, keep, withFormat, bindings })),
+	/**  名前を変える（前後の空白を除き NFC にする。1〜256 バイト、制御文字なし。重なってよい）。 */
+	recipeRename: (id: number, name: string) => typedError<null, AppError>(__TAURI_INVOKE("recipe_rename", { id, name })),
+	/**  説明を変える（空でよい。4,096 バイトまで、改行・タブのほかの制御文字なし）。 */
+	recipeDescribe: (id: number, description: string) => typedError<null, AppError>(__TAURI_INVOKE("recipe_describe", { id, description })),
+	/**  並びを変える（`ids` の順。含まれないものは後ろに今の順で）。 */
+	recipesReorder: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("recipes_reorder", { ids })),
+	/**  複製する（「{名前} のコピー」を元のすぐ後ろに）。新しい ID を返す。 */
+	recipeDuplicate: (id: number) => typedError<number, AppError>(__TAURI_INVOKE("recipe_duplicate", { id })),
+	/**  すぐ消す（画面は確かめてから。動いている一括はジョブの入力の写しで続く）。 */
+	recipeDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("recipe_delete", { id })),
+	/**  `.kurarecipe` を `path`（保存のダイアログで選んだ絶対パス。ライブラリの外）に書き出す。 */
+	recipeExport: (id: number, path: string) => typedError<null, AppError>(__TAURI_INVOKE("recipe_export", { id, path })),
+	/**  `.kurarecipe`（開くダイアログで選んだ絶対パス）を読み込んで足す。4 MiB を超えるファイルは読まずに断る。 */
+	recipeImport: (path: string) => typedError<RecipeImportedDto, AppError>(__TAURI_INVOKE("recipe_import", { path })),
 };
 
 /** Events */
@@ -669,6 +697,31 @@ export type BindKind =
 "frameMs" | 
 /**  秒（ノードの入力のレートでフレームに直す。単位 samples の `ParamKind::Int` か `ParamKind::FrameRange` の片方）。 */
 "time";
+
+/**  レシピの結び付け 1 つ：ノード `node` の引数 `param`（区間なら片方 `part`）を、アイテムの値 `from` で上書きする。 */
+export type Binding = Binding_Serialize | Binding_Deserialize;
+
+/**  レシピの結び付け 1 つ：ノード `node` の引数 `param`（区間なら片方 `part`）を、アイテムの値 `from` で上書きする。 */
+export type Binding_Deserialize = {
+	/**  レシピの文書のノード。 */
+	node: NodeId,
+	/**  引数の名前（`ParamSpec.key`）。 */
+	param: string,
+	/**  区間（`FrameRange`）の片方だけを結ぶとき。 */
+	part?: RangePart | null,
+	from: Source,
+};
+
+/**  レシピの結び付け 1 つ：ノード `node` の引数 `param`（区間なら片方 `part`）を、アイテムの値 `from` で上書きする。 */
+export type Binding_Serialize = {
+	/**  レシピの文書のノード。 */
+	node: NodeId,
+	/**  引数の名前（`ParamSpec.key`）。 */
+	param: string,
+	/**  区間（`FrameRange`）の片方だけを結ぶとき。 */
+	part?: RangePart | null,
+	from: Source,
+};
 
 /**  URL に一致したキャプチャのルール。 */
 export type CaptureMatchDto = {
@@ -2096,6 +2149,20 @@ export type OpDescriptor = {
 	schema: ParamSchema,
 };
 
+/**
+ *  文書のノードの（操作, 版）が、この登録表でどう描かれるか（docs/editing.md §8.4。M14 段 1）。レシピの読み込みの印・
+ *  事前チェックが使う。
+ */
+export type OpStatus = 
+/**  今の版。 */
+{ type: "current" } | 
+/**  実装のない古い版で、今の版の実装へ引数を移して描く（結果は同じ。E7）。 */
+{ type: "migrated"; current: number } | 
+/**  結果を変えた旧版（またはそこへ移す古い版）の実装 `uses` で描く。今の版 `current` とは結果が違いうる（E6）。 */
+{ type: "legacy"; uses: number; current: number } | 
+/**  なくした操作（カタログにない）。実装 `uses` で描く。 */
+{ type: "retired"; uses: number };
+
 /**  ユニットのメンバーの並び順。 */
 export type OrderModeDto = "manual" | "name" | "imported" | "captured" | "duration";
 
@@ -2428,6 +2495,81 @@ export type QuerySymbolDto = {
 	to: string,
 };
 
+/**  区間の片方。 */
+export type RangePart = "start" | "end";
+
+/**  1 件のレシピ（文書・結び付け・旧版の印）。 */
+export type RecipeDto = RecipeDto_Serialize | RecipeDto_Deserialize;
+
+/**  1 件のレシピ（文書・結び付け・旧版の印）。 */
+export type RecipeDto_Deserialize = {
+	id: number,
+	name: string,
+	description: string,
+	kind: RecipeKind,
+	/**  見本の値の文書（今のスキーマ）。 */
+	graph: Graph_Deserialize,
+	bindings: Binding_Deserialize[],
+	/**  今の版でない操作のノード（旧版・移す版・退役した版）。 */
+	notes: RecipeNote[],
+	/**  今の Kura では当てられない理由（あれば当てる画面は断る）。 */
+	problem: string | null,
+	createdAt: number,
+	updatedAt: number,
+};
+
+/**  1 件のレシピ（文書・結び付け・旧版の印）。 */
+export type RecipeDto_Serialize = {
+	id: number,
+	name: string,
+	description: string,
+	kind: RecipeKind,
+	/**  見本の値の文書（今のスキーマ）。 */
+	graph: Graph_Serialize,
+	bindings: Binding_Serialize[],
+	/**  今の版でない操作のノード（旧版・移す版・退役した版）。 */
+	notes: RecipeNote[],
+	/**  今の Kura では当てられない理由（あれば当てる画面は断る）。 */
+	problem: string | null,
+	createdAt: number,
+	updatedAt: number,
+};
+
+/**  読み込んだレシピ（足した ID と、旧版の操作の印。印があれば画面が「古い版の操作を含みます」を出す）。 */
+export type RecipeImportedDto = {
+	id: number,
+	notes: RecipeNote[],
+};
+
+/**  レシピの種類。 */
+export type RecipeKind = 
+/**  1 件ずつ当てる（入力は Primary 1 つ。頭に継ぎ足す）。 */
+"each" | 
+/**  N → 1（入力は Selection 1 つ。M14 段 6。段 1 は形の確かめだけで、結び付けは持てない）。 */
+"merge";
+
+/**  今の版でない操作のノードの印（docs/editing.md §8.4）。 */
+export type RecipeNote = {
+	node: NodeId,
+	op: string,
+	v: number,
+	status: OpStatus,
+};
+
+/**  一覧の 1 行（サイドバーの節・レシピの画面の見出し）。 */
+export type RecipeSummaryDto = {
+	id: number,
+	name: string,
+	description: string,
+	kind: RecipeKind,
+	/**  操作（ノード）の数。 */
+	nodes: number,
+	/**  結び付けの数。 */
+	bindings: number,
+	createdAt: number,
+	updatedAt: number,
+};
+
 export type RepeatModeDto = "off" | "all" | "one";
 
 export type RuleMatchDto = "all" | "any";
@@ -2450,6 +2592,9 @@ export type SelectionInfoDto = {
 	tags: TagCountDto[],
 	folders: FolderCountDto[],
 };
+
+/**  素材の設定の欄。 */
+export type SettingKey = "grid" | "pivot" | "loop" | "frameMs";
 
 /**  指摘の重さ。 */
 export type Severity = 
@@ -2495,6 +2640,16 @@ export type SnapshotResultDto = {
 
 /**  並べる基準。 */
 export type SortKeyDto = "imported" | "captured" | "name" | "rating" | "duration" | "size";
+
+/**  結び付けの出どころ。 */
+export type Source = 
+/**  素材の設定（アイテムごとの利用者の設定。頭の座標・フレーム）。`{"type":"setting","key":"grid"}`。 */
+{ type: "setting"; key: SettingKey } | 
+/**
+ *  秒（ms）。そのノードの入力のレートでフレームに直す。`anchor` が end なら終わりから。
+ *  `{"type":"time","ms":2000,"anchor":"start"}`。
+ */
+{ type: "time"; ms: number; anchor: TimeAnchor };
 
 /**  パレットの候補。 */
 export type SuggestionDto = {
@@ -2574,6 +2729,13 @@ export type TagSuggestionDto = {
 	/**  別名で一致したときの別名。 */
 	alias: string | null,
 };
+
+/**  秒を数える基準。 */
+export type TimeAnchor = 
+/**  頭から。 */
+"start" | 
+/**  終わりから（入力の長さが決まっていること）。 */
+"end";
 
 export type ToolDto = "ytDlp" | "galleryDl";
 
