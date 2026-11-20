@@ -2421,3 +2421,99 @@ fn recipe_sample_opens_the_original_and_never_touches_the_item() {
     .unwrap_err();
     assert!(matches!(missing, EditorError::NotFound(_)), "{missing:?}");
 }
+
+/// レシピの見本のモード（M14 段 7 の検証の直し）：見本に保存した版があっても、文書は元にレシピを継ぎ足したもの（見本の
+/// 既存の編集は映らない）。N → 1 のレシピ（今の Kura で当てられないもの）は Invalid、前の保存が終わっていない見本は
+/// SavePending。
+#[test]
+fn recipe_sample_ignores_saved_edits_and_refuses_merge_and_pending() {
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(20, 20, 31), 20, 20);
+    let runtime = env.engine.runtime().unwrap().clone();
+    // レシピ：裏返す 1 つ
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    env.step(&s, vec![flip("horizontal")]);
+    let graph = head_graph(&env.env(), &s).unwrap();
+    let keep: Vec<NodeId> = graph.nodes.iter().map(|n| n.id).collect();
+    let recipe = crate::edit::recipes::create_from_editor(
+        env.lib.db(),
+        &runtime,
+        "裏返す",
+        "",
+        crate::edit::recipes::EditorPick {
+            graph: &graph,
+            keep: &keep,
+            with_format: false,
+            bindings: Vec::new(),
+        },
+    )
+    .unwrap();
+    // 見本に版を保存する（縦にも裏返して上書き）
+    env.step(&s, vec![flip("vertical")]);
+    save(&env.env(), &s, SaveMode::Overwrite, None).unwrap();
+    env.start_jobs();
+    close(&env.engine, &s);
+    let head = env
+        .lib
+        .db()
+        .read(|c| versions::head(c, id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.version, 1);
+
+    let req = |item_id| OpenRequest {
+        item_id,
+        viewport: Viewport::whole(),
+        from_draft: false,
+    };
+    let sample = open_recipe(&env.env(), &req(id), recipe).unwrap();
+    let ops: Vec<(&str, Json)> = sample
+        .outcome
+        .doc
+        .nodes
+        .iter()
+        .map(|n| (n.op.as_str(), n.params.clone()))
+        .collect();
+    assert_eq!(ops, [("image.flip", json!({ "axis": "horizontal" }))]);
+    close(&env.engine, &sample.session);
+
+    // N → 1 の印のレシピは開かない
+    env.lib
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE edit_recipes SET kind = 'merge' WHERE id = ?1",
+                [recipe],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let merge = open_recipe(&env.env(), &req(id), recipe).unwrap_err();
+    assert!(matches!(merge, EditorError::Invalid { .. }), "{merge:?}");
+    env.lib
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE edit_recipes SET kind = 'each' WHERE id = ?1",
+                [recipe],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // 前の保存が終わっていない見本は開かない（ふだんの開き方と同じ）
+    let other = add_item(&env.lib, &sprite_png(12, 12, 32), 12, 12);
+    let o = env.open(other);
+    env.step(&o.session, vec![flip("horizontal")]);
+    let job = save(&env.env(), &o.session, SaveMode::Overwrite, None)
+        .unwrap()
+        .job;
+    close(&env.engine, &o.session);
+    env.jobs.pause(job).unwrap();
+    let pending = open_recipe(&env.env(), &req(other), recipe).unwrap_err();
+    assert!(
+        matches!(pending, EditorError::SavePending { job: j } if j == job),
+        "{pending:?}"
+    );
+}
