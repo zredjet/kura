@@ -4,6 +4,7 @@
  */
 
 import {
+  type Anchor,
   type BatchActionDto,
   type BatchGroupDto,
   type BatchModeDto,
@@ -18,15 +19,19 @@ import {
   events,
   type LossDto,
   type LossGroupDto,
+  type MergeRequestDto,
   type OutputGroupDto,
   type PrecheckGroupDto,
   type RecipeSourceDto,
   type ShapeChangeDto,
   type ShapeInfoDto,
+  type SheetInfoDto,
+  type SheetParams,
 } from './bindings';
 import { unwrap } from './result';
 
 export type {
+  Anchor,
   BatchActionDto,
   BatchGroupDto,
   BatchModeDto,
@@ -39,15 +44,21 @@ export type {
   DiskEstimateDto,
   LossDto,
   LossGroupDto,
+  MergeRequestDto,
   OutputGroupDto,
   PrecheckGroupDto,
   RecipeSourceDto,
   ShapeChangeDto,
   ShapeInfoDto,
+  SheetInfoDto,
+  SheetParams,
 };
 
 /** 別名の名前の型の既定（Rust の `DEFAULT_SAVE_AS_NAME`）。 */
 export const DEFAULT_SAVE_AS_NAME = '{名前} のコピー';
+
+/** スプライトシートの名前の既定（Rust の `DEFAULT_SHEET_NAME`）。 */
+export const DEFAULT_SHEET_NAME = '{名前} のシート';
 
 /**
  * 事前チェック（描かずに確かめる）。`token` は呼び手が決める印で、進みのイベントと中止に使う。中止すると code が
@@ -92,4 +103,17 @@ export function batchRows(
 /** 一括の［元に戻す…］を積む（ジョブの ID）。 */
 export function undoBatch(job: number): Promise<number> {
   return unwrap(commands.batchUndo(job));
+}
+
+/**
+ * N → 1（スプライトシート）の事前チェック（元ごとの飛ばす理由と、シートの見込み `sheet`）。進み・中止は
+ * `precheckBatch` と同じ（`onPrecheckProgress`・`cancelPrecheck`）。
+ */
+export function precheckMerge(token: string, request: MergeRequestDto): Promise<BatchPrecheckDto> {
+  return unwrap(commands.mergePrecheck(token, request));
+}
+
+/** N → 1（スプライトシート）の一括を積む（ジョブの ID）。結果・［元に戻す…］は `batchResult`・`undoBatch`。 */
+export function startMerge(request: MergeRequestDto): Promise<number> {
+  return unwrap(commands.mergeStart(request));
 }

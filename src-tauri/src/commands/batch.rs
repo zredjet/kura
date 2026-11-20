@@ -14,14 +14,16 @@ use std::time::{Duration, Instant};
 use kura_core::CoreError;
 use kura_core::edit::EngineServices;
 use kura_core::edit::batch::precheck::{
-    BoundExample, DiskEstimate, Loss, LossGroup, OutputGroup, PrecheckGroup, ShapeChange, ShapeInfo,
+    BoundExample, DiskEstimate, Loss, LossGroup, OutputGroup, PrecheckGroup, ShapeChange,
+    ShapeInfo, SheetInfo,
 };
 use kura_core::edit::batch::{
-    self, BatchAction, BatchMode, BatchRequest, BatchResult, BatchRow, Precheck, PrecheckCx,
-    RecipeSource,
+    self, BatchAction, BatchMode, BatchRequest, BatchResult, BatchRow, MergeRequest, Precheck,
+    PrecheckCx, RecipeSource,
 };
 use kura_core::library::LibrarySession;
 use kura_engine::recipe::RecipeNote;
+use kura_engine::selection::SheetParams;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State;
@@ -140,6 +142,55 @@ impl From<BatchRequestDto> for BatchRequest {
                 BatchModeDto::SaveAs { name } => BatchMode::SaveAs { name },
             },
             include_drafts: r.include_drafts,
+        }
+    }
+}
+
+/// N → 1（スプライトシート）の頼み。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeRequestDto {
+    /// 並べるアイテム（並べる順。画面が選んだ順・名前順・一覧の並びを選ぶ）。
+    pub items: Vec<i64>,
+    /// できるアイテムの名前（`{名前}` は最初のアイテムの表示名。既定は「{名前} のシート」）。
+    pub name: String,
+    pub sheet: SheetParams,
+}
+
+impl From<MergeRequestDto> for MergeRequest {
+    fn from(r: MergeRequestDto) -> Self {
+        Self {
+            items: r.items,
+            name: r.name,
+            sheet: r.sheet,
+        }
+    }
+}
+
+/// N → 1 のシートの見込み。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SheetInfoDto {
+    pub width: u64,
+    pub height: u64,
+    pub frames: u64,
+    pub columns: u32,
+    pub cell_w: u64,
+    pub cell_h: u64,
+    /// 大きさ・フレームの数が上限しか分からない（作るときに決まる）。
+    pub approximate: bool,
+}
+
+impl From<SheetInfo> for SheetInfoDto {
+    fn from(s: SheetInfo) -> Self {
+        Self {
+            width: s.width,
+            height: s.height,
+            frames: s.frames,
+            columns: s.columns,
+            cell_w: s.cell_w,
+            cell_h: s.cell_h,
+            approximate: s.approximate,
         }
     }
 }
@@ -376,6 +427,8 @@ pub struct BatchPrecheckDto {
     pub memory_budget: u64,
     pub bound: Vec<BoundExampleDto>,
     pub notes: Vec<RecipeNote>,
+    /// N → 1 のシートの見込み（1 件ずつの一括は null）。
+    pub sheet: Option<SheetInfoDto>,
 }
 
 impl From<Precheck> for BatchPrecheckDto {
@@ -394,6 +447,7 @@ impl From<Precheck> for BatchPrecheckDto {
             memory_budget: p.memory_budget,
             bound: p.bound.into_iter().map(Into::into).collect(),
             notes: p.notes,
+            sheet: p.sheet.map(Into::into),
         }
     }
 }
@@ -410,10 +464,16 @@ pub enum BatchActionDto {
     SaveAs {
         name: String,
     },
-    /// 一括 `of` の［元に戻す…］。
+    /// 一括 `of` の［元に戻す…］（`saveAs` は元が別名か N → 1、`merge` は N → 1 か）。
     Undo {
         of: i64,
         save_as: bool,
+        merge: bool,
+    },
+    /// N → 1（スプライトシート）。
+    Merge {
+        name: String,
+        sheet: SheetParams,
     },
 }
 
@@ -422,7 +482,8 @@ impl From<BatchAction> for BatchActionDto {
         match a {
             BatchAction::Overwrite => Self::Overwrite,
             BatchAction::SaveAs { name } => Self::SaveAs { name },
-            BatchAction::Undo { of, save_as } => Self::Undo { of, save_as },
+            BatchAction::Undo { of, save_as, merge } => Self::Undo { of, save_as, merge },
+            BatchAction::Merge { name, sheet } => Self::Merge { name, sheet },
         }
     }
 }
@@ -520,16 +581,19 @@ fn engine_of(session: &LibrarySession) -> Result<Arc<EngineServices>, AppError> 
     })
 }
 
-/// 事前チェック（描かずに、当てられるか・出力の形・失うもの・見積もり・飛ばす理由）。進みは `batch://precheck`（`token`）。
-/// `batch_precheck_cancel` で止めると code `Conflict`（kura-core の Canceled）。同じ `token` の事前チェックが動いていれば Busy。
-#[tauri::command]
-#[specta::specta]
-pub async fn batch_precheck(
+/// 事前チェックを動かす（`token` の中止の印を登録し、spawn_blocking の中で `run` を呼び、進みを `batch://precheck` で送る。
+/// 送るかを決めて送るまで錠を持つ：働き手が並べて呼ぶので、送る順を done の順にそろえる。最後の 1 件は必ず送る）。
+async fn run_precheck<F>(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     token: String,
-    request: BatchRequestDto,
-) -> Result<BatchPrecheckDto, AppError> {
+    run: F,
+) -> Result<BatchPrecheckDto, AppError>
+where
+    F: FnOnce(&LibrarySession, &EngineServices, &PrecheckCx<'_>) -> kura_core::Result<Precheck>
+        + Send
+        + 'static,
+{
     let session = state.session()?;
     let canceled = PRECHECKS
         .lock()
@@ -538,7 +602,6 @@ pub async fn batch_precheck(
     let key = token.clone();
     let result = blocking(move || {
         let engine = engine_of(&session)?;
-        // 送るかを決めて送るまで錠を持つ（働き手が並べて呼ぶので、送る順を done の順にそろえる。最後の 1 件は必ず送る）
         let last = Mutex::new((None::<Instant>, 0u64));
         let progress = |done: u64, total: u64| {
             let Ok(mut sent) = last.lock() else { return };
@@ -559,11 +622,9 @@ pub async fn batch_precheck(
                 tracing::warn!(%err, "事前チェックの進みを送れませんでした");
             }
         };
-        let request: BatchRequest = request.into();
-        let p = batch::precheck(
-            session.library(),
+        let p = run(
+            &session,
             &engine,
-            &request,
             &PrecheckCx {
                 canceled: &canceled,
                 progress: &progress,
@@ -576,6 +637,52 @@ pub async fn batch_precheck(
         running.end(&key);
     }
     result
+}
+
+/// 事前チェック（描かずに、当てられるか・出力の形・失うもの・見積もり・飛ばす理由）。進みは `batch://precheck`（`token`）。
+/// `batch_precheck_cancel` で止めると code `Conflict`（kura-core の Canceled）。同じ `token` の事前チェックが動いていれば Busy。
+#[tauri::command]
+#[specta::specta]
+pub async fn batch_precheck(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+    request: BatchRequestDto,
+) -> Result<BatchPrecheckDto, AppError> {
+    let request: BatchRequest = request.into();
+    run_precheck(app, state, token, move |session, engine, cx| {
+        batch::precheck(session.library(), engine, &request, cx)
+    })
+    .await
+}
+
+/// N → 1（スプライトシート）の事前チェック（元ごとの飛ばす理由と、シートの大きさ・セル・メモリ・ディスクの見込み `sheet`）。
+/// 進み・中止は `batch_precheck` と同じ（`batch://precheck`・`batch_precheck_cancel`）。
+#[tauri::command]
+#[specta::specta]
+pub async fn merge_precheck(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+    request: MergeRequestDto,
+) -> Result<BatchPrecheckDto, AppError> {
+    let request: MergeRequest = request.into();
+    run_precheck(app, state, token, move |session, engine, cx| {
+        batch::precheck_merge(session.library(), engine, &request, cx)
+    })
+    .await
+}
+
+/// N → 1（スプライトシート）の一括を積む（ジョブの ID を返す）。名前が空・どれもライブラリにないなら Invalid。結果・
+/// ［元に戻す…］は `batch_result`・`batch_undo`（作ったアイテムは結果の `created`）。
+#[tauri::command]
+#[specta::specta]
+pub async fn merge_start(
+    state: State<'_, AppState>,
+    request: MergeRequestDto,
+) -> Result<i64, AppError> {
+    let session = state.session()?;
+    blocking(move || Ok(batch::start_merge(session.jobs(), &request.into())?)).await
 }
 
 /// 事前チェック `token` を止める（まだ始まっていなければ覚えておき、始まったらすぐ code `Conflict` で返す）。

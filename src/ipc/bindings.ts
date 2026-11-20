@@ -374,6 +374,16 @@ export const commands = {
 	 *  戻す・戻すものがなければ Invalid。
 	 */
 	batchUndo: (job: number) => typedError<number, AppError>(__TAURI_INVOKE("batch_undo", { job })),
+	/**
+	 *  N → 1（スプライトシート）の事前チェック（元ごとの飛ばす理由と、シートの大きさ・セル・メモリ・ディスクの見込み `sheet`）。
+	 *  進み・中止は `batch_precheck` と同じ（`batch://precheck`・`batch_precheck_cancel`）。
+	 */
+	mergePrecheck: (token: string, request: MergeRequestDto) => typedError<BatchPrecheckDto, AppError>(__TAURI_INVOKE("merge_precheck", { token, request })),
+	/**
+	 *  N → 1（スプライトシート）の一括を積む（ジョブの ID を返す）。名前が空・どれもライブラリにないなら Invalid。結果・
+	 *  ［元に戻す…］は `batch_result`・`batch_undo`（作ったアイテムは結果の `created`）。
+	 */
+	mergeStart: (request: MergeRequestDto) => typedError<number, AppError>(__TAURI_INVOKE("merge_start", { request })),
 };
 
 /** Events */
@@ -406,6 +416,9 @@ export type AddedDto = {
 	entryIds: number[],
 	unitId: number | null,
 };
+
+/**  9 点の基準（`image.fit_canvas`・`meta.anchor_pivot`。M14 段 1。N → 1 のセルの揃え。段 6）。JSON は列挙の文字列（[`ANCHOR_NAMES`]）。 */
+export type Anchor = "topLeft" | "top" | "topRight" | "left" | "center" | "right" | "bottomLeft" | "bottom" | "bottomRight";
 
 /**  タグの再生の向き（`src/lib/asset/timeline.ts` の `Direction`）。 */
 export type AnimDirectionDto = "forward" | "reverse" | "pingPong" | "pingPongReverse";
@@ -709,8 +722,10 @@ export type BackupDto = {
 
 /**  一括の向き（結果）。 */
 export type BatchActionDto = { type: "overwrite" } | { type: "saveAs"; name: string } | 
-/**  一括 `of` の［元に戻す…］。 */
-{ type: "undo"; of: number; saveAs: boolean };
+/**  一括 `of` の［元に戻す…］（`saveAs` は元が別名か N → 1、`merge` は N → 1 か）。 */
+{ type: "undo"; of: number; saveAs: boolean; merge: boolean } | 
+/**  N → 1（スプライトシート）。 */
+{ type: "merge"; name: string; sheet: SheetParams };
 
 /**  状態と理由ごとの群。 */
 export type BatchGroupDto = {
@@ -744,6 +759,8 @@ export type BatchPrecheckDto = {
 	memoryBudget: number,
 	bound: BoundExampleDto[],
 	notes: RecipeNote[],
+	/**  N → 1 のシートの見込み（1 件ずつの一括は null）。 */
+	sheet: SheetInfoDto | null,
 };
 
 /**  事前チェックの進み（イベント `batch://precheck`）。 */
@@ -2238,6 +2255,15 @@ export type LossGroupDto = {
 	items: number[],
 };
 
+/**  N → 1（スプライトシート）の頼み。 */
+export type MergeRequestDto = {
+	/**  並べるアイテム（並べる順。画面が選んだ順・名前順・一覧の並びを選ぶ）。 */
+	items: number[],
+	/**  できるアイテムの名前（`{名前}` は最初のアイテムの表示名。既定は「{名前} のシート」）。 */
+	name: string,
+	sheet: SheetParams,
+};
+
 /**  メタデータの扱い。 */
 export type MetaAccess = 
 /**  エンジンが `SpaceMap`・`TimeMap` で写す（ふつう）。 */
@@ -2790,6 +2816,30 @@ export type ShapeChangeDto = {
 export type ShapeInfoDto = { kind: "image"; w: number | null; h: number | null; 
 /**  フレームの列の数（1 枚の画像は null）。 */
 frames: number | null } | { kind: "audio"; rate: number; channels: number; frames: number | null };
+
+/**  N → 1 のシートの見込み。 */
+export type SheetInfoDto = {
+	width: number,
+	height: number,
+	frames: number,
+	columns: number,
+	cellW: number,
+	cellH: number,
+	/**  大きさ・フレームの数が上限しか分からない（作るときに決まる）。 */
+	approximate: boolean,
+};
+
+/**  スプライトシートの引数（[`sheet_graph`]）。 */
+export type SheetParams = {
+	/**  1 行のセルの数（None は ⌈√フレームの数⌉。[`columns_for`]）。 */
+	columns?: number | null,
+	gapX?: number,
+	gapY?: number,
+	/**  何も置かない部分の色（ストレートの RGBA8）。null は透明。 */
+	fill?: [number, number, number, number] | null,
+	/**  大きさの違う絵の、セルの中の揃え（既定は中央）。 */
+	anchor?: Anchor,
+};
 
 /**  操作の型の記述。 */
 export type Signature = {

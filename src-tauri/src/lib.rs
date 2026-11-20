@@ -193,6 +193,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::batch::batch_result,
             commands::batch::batch_rows,
             commands::batch::batch_undo,
+            commands::batch::merge_precheck,
+            commands::batch::merge_start,
         ])
         .events(collect_events![
             dto::JobProgress,
