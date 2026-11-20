@@ -182,8 +182,9 @@ impl CanvasLength {
     }
 }
 
-/// 9 点の基準（`image.fit_canvas`・`meta.anchor_pivot`。M14 段 1）。JSON は列挙の文字列（[`ANCHOR_NAMES`]）。
+/// 9 点の基準（`image.fit_canvas`・`meta.anchor_pivot`。M14 段 1。N → 1 のセルの揃え。段 6）。JSON は列挙の文字列（[`ANCHOR_NAMES`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "camelCase")]
 pub enum Anchor {
     TopLeft,

@@ -27,6 +27,7 @@ pub mod ops;
 pub mod paint;
 pub mod recipe;
 pub mod render;
+pub mod selection;
 pub mod session;
 pub mod shape;
 #[cfg(feature = "specta")]
