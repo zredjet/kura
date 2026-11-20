@@ -2183,7 +2183,7 @@ fn place_files(layout: &Layout, p: &Prepared, go: &Go) -> Result<()> {
 
 /// 予告のあとで保存をやめるとき（台帳の門を持ったまま）：このジョブの予告のうち、同じ拡張子で台帳に載っていない中身の
 /// ファイルを消し、予告を消す。消せないファイルがあれば予告を残す（次に開くときの照合がやり直す）。
-fn undo_placement(db: &Db, layout: &Layout, job: i64) {
+pub(crate) fn undo_placement(db: &Db, layout: &Layout, job: i64) {
     let rows: Result<Vec<(Vec<u8>, String)>> = db.read(|c| {
         // 予告の表は小さいので走査する（docs/data-model.md §4 の例外）
         let mut stmt = c.prepare_cached(

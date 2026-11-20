@@ -2436,7 +2436,8 @@ fn u1_undoing_an_overwrite_batch_restores_the_previous_versions() {
         back.action,
         BatchAction::Undo {
             of: record.id,
-            save_as: false
+            save_as: false,
+            merge: false
         }
     );
     assert_eq!(back.undo.available, 0);
@@ -2868,5 +2869,368 @@ fn u8_undo_and_retry_do_not_overlap() {
     env.jobs.retry(u1.id).unwrap();
     assert!(env.jobs.wait_idle(WAIT));
     assert_done(&env.jobs.get(u1.id).unwrap());
+    assert_consistent(&env.lib);
+}
+
+// ---- 段 6：N → 1（スプライトシート。M1〜M4。docs/editing.md §14.2「N → 1」）----
+
+fn merge_req(
+    items: &[i64],
+    sheet: kura_engine::selection::SheetParams,
+) -> super::batch::MergeRequest {
+    super::batch::MergeRequest {
+        items: items.to_vec(),
+        name: super::batch::DEFAULT_SHEET_NAME.into(),
+        sheet,
+    }
+}
+
+fn run_merge(env: &BatchEnv, req: &super::batch::MergeRequest) -> JobRecord {
+    let job = super::batch::start_merge(&env.jobs, req).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    env.jobs.get(job).unwrap()
+}
+
+/// 単色の PNG を足す。
+fn solid_png(env: &BatchEnv, w: u32, h: u32, rgba: [u8; 4], title: &str) -> i64 {
+    let px = kura_engine::value::Raster::filled(w, h, PixelFormat::Rgba8, None, &rgba).unwrap();
+    let value = kura_engine::Value::Image(Arc::new(kura_engine::value::Image {
+        px,
+        meta: Default::default(),
+    }));
+    let bytes = CodecSet::pinned()
+        .encode_bytes(&value, "png", &json!({}), &NoMonitor)
+        .unwrap()
+        .0;
+    add_item(&env.lib, &bytes, "png", title).0
+}
+
+/// 2 フレームのアニメの GIF を足す。
+fn anim_gif(env: &BatchEnv) -> i64 {
+    use kura_engine::value::{Frames, Raster};
+    let a = Raster::filled(24, 20, PixelFormat::Rgba8, None, &[200, 10, 10, 255]).unwrap();
+    let b = Raster::filled(24, 20, PixelFormat::Rgba8, None, &[10, 10, 200, 255]).unwrap();
+    let fr = Frames::full(vec![(a, 50), (b, 70)], Default::default(), 0).unwrap();
+    let bytes = CodecSet::pinned()
+        .encode_bytes(
+            &kura_engine::Value::Frames(Arc::new(fr)),
+            "gif",
+            &json!({}),
+            &NoMonitor,
+        )
+        .unwrap()
+        .0;
+    add_item(&env.lib, &bytes, "gif", "アニメ").0
+}
+
+/// エンジンで直に描いたシートのハッシュ（今の中身を読み、選択の値にして、シートの文書を描いて PNG に書く）。
+fn expected_sheet(
+    env: &BatchEnv,
+    items: &[i64],
+    sheet: &kura_engine::selection::SheetParams,
+) -> [u8; 32] {
+    use kura_engine::render::InputValue;
+    use kura_engine::selection;
+    let pinned = CodecSet::pinned();
+    let limits = env.engine.runtime().unwrap().bulk(|e| e.limits().clone());
+    let mut values = Vec::new();
+    let mut hashes = Vec::new();
+    for id in items {
+        let h = head(&env.lib, *id);
+        let path = env.lib.layout().content_path(&h.hash, &h.ext);
+        let format = crate::import::format_id(&h.ext).unwrap();
+        let (v, _) = pinned
+            .decode_path(
+                &path,
+                format,
+                &DecodeOptions::default(),
+                &limits,
+                &NoMonitor,
+            )
+            .unwrap();
+        values.push(v);
+        hashes.push(h.hash);
+    }
+    let frames = selection::frames(&values, sheet.anchor, &NoMonitor).unwrap();
+    let count = frames.frames().len() as u64;
+    let g = selection::sheet_graph(sheet, count).unwrap();
+    let engine = kura_engine::Engine::new().unwrap();
+    let v = kura_engine::Value::Frames(Arc::new(frames));
+    let plan = engine
+        .compile(&g, &BTreeMap::from([(InputId(0), v.shape())]))
+        .unwrap();
+    let out = engine
+        .render(
+            &plan,
+            &BTreeMap::from([(
+                InputId(0),
+                InputValue {
+                    value: v,
+                    source: selection::source(&hashes),
+                },
+            )]),
+            &NoMonitor,
+        )
+        .unwrap();
+    let bytes = pinned
+        .encode_bytes(&out.outputs[0].value, "png", &json!({}), &NoMonitor)
+        .unwrap()
+        .0;
+    hash_of(&bytes)
+}
+
+/// 来歴（作ったアイテムの元を選んだ順に：(元, 版, 中身, フレームの数)）。
+fn sources_of(lib: &Library, item: i64) -> Vec<(Option<i64>, i64, Vec<u8>, i64)> {
+    lib.db()
+        .read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT source_item_id, source_version, source_hash, frames FROM item_sources WHERE item_id = ?1 ORDER BY ord",
+            )?;
+            let rows = stmt.query_map([item], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+        .unwrap()
+}
+
+/// M1：選んだ順にシートを作る（大きさの違う絵は中央に揃え、アニメは全フレーム、音声・ゴミ箱は飛ばす）。できたアイテムは PNG で、
+/// 元は描いたファイル（版の行はない）、名前は「{最初の名前} のシート」、来歴は元・版・中身・フレームの数、素材の設定に格子
+/// （セル＝最大の大きさ、間隔、コマの数）。中身はエンジンで直に描いたものと同じバイト列。事前チェックの見込みは行と同じで、
+/// シートの大きさも同じ。結果の作ったアイテムは 1 つ。
+#[test]
+fn m1_a_sheet_is_made_from_the_selection_in_order() {
+    let env = BatchEnv::new();
+    let (a, _) = env.png(1);
+    let small = solid_png(&env, 10, 8, [0, 200, 0, 255], "小さい絵");
+    let anim = anim_gif(&env);
+    let pinned = CodecSet::pinned();
+    let (sound, _) = add_audio(
+        &env.lib,
+        &noise_file(&pinned, "wav", 2, 4_000, 3),
+        "wav",
+        "音",
+    );
+    let (gone, _) = env.png(2);
+    trash(&env, gone);
+    let sheet = kura_engine::selection::SheetParams {
+        gap_x: 1,
+        gap_y: 2,
+        ..Default::default()
+    };
+    let ids = [a, sound, small, gone, anim];
+    let req = merge_req(&ids, sheet);
+    let canceled = AtomicBool::new(false);
+    let progress = |_: u64, _: u64| {};
+    let p = super::batch::precheck_merge(
+        &env.lib,
+        &env.engine,
+        &req,
+        &PrecheckCx {
+            canceled: &canceled,
+            progress: &progress,
+        },
+    )
+    .unwrap();
+    let record = run_merge(&env, &req);
+    assert_done(&record);
+    assert_eq!(outcomes(&env, record.id), predicted(&p), "{p:#?}");
+    let result = super::batch::result(env.lib.db(), record.id).unwrap();
+    assert!(matches!(result.action, BatchAction::Merge { .. }));
+    assert_eq!(result.created.len(), 1);
+    let made = result.created[0];
+    let codes: Vec<(i64, String, Option<String>)> = env
+        .rows(record.id)
+        .into_iter()
+        .map(|r| (r.0, r.1, r.2))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            (a, "saved".into(), None),
+            (sound, "skipped".into(), Some("Kind".into())),
+            (small, "saved".into(), None),
+            (gone, "skipped".into(), Some("Trashed".into())),
+            (anim, "saved".into(), None),
+        ]
+    );
+    let h = head(&env.lib, made);
+    assert_eq!((h.ext.as_str(), h.version), ("png", 0));
+    assert_eq!(h.hash, expected_sheet(&env, &[a, small, anim], &sheet));
+    assert!(versions_of(&env.lib, made).is_empty(), "元はできたファイル");
+    let title: String = env
+        .lib
+        .db()
+        .read(|c| {
+            Ok(
+                c.query_row("SELECT title FROM items WHERE id = ?1", [made], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .unwrap();
+    assert_eq!(title, "絵1 のシート");
+    let src = sources_of(&env.lib, made);
+    assert_eq!(
+        src.iter().map(|s| (s.0, s.3)).collect::<Vec<_>>(),
+        vec![(Some(a), 1), (Some(small), 1), (Some(anim), 2)]
+    );
+    assert_eq!(src[0].2, head(&env.lib, a).hash.to_vec());
+    let grid = env
+        .lib
+        .db()
+        .read(|c| crate::asset::get(c, made))
+        .unwrap()
+        .settings
+        .grid
+        .unwrap();
+    assert_eq!(
+        (grid.cell_w, grid.cell_h, grid.gap_x, grid.gap_y, grid.count),
+        (24, 20, 1, 2, Some(4))
+    );
+    // シートの見込みは、できたシートの大きさと同じ（4 フレーム → 2 列 × 2 行、間隔 1・2）
+    let info = p.sheet.unwrap();
+    let (w, hh): (i64, i64) = env
+        .lib
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT width, height FROM items WHERE id = ?1",
+                [made],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!((info.width as i64, info.height as i64), (w, hh));
+    assert_eq!((w, hh), (24 * 2 + 1, 20 * 2 + 2));
+    assert_eq!((info.frames, info.columns, info.approximate), (4, 2, false));
+    assert_consistent(&env.lib);
+}
+
+/// M2：作る途中に強制終了しても（予告のあと・置いたあと・コミットのあと）、開き直すと残りから作り、シートはちょうど 1 枚で、
+/// どの行も同じアイテムを指す。
+#[test]
+fn m2_a_crash_while_merging_makes_exactly_one_sheet() {
+    for at in [Fault::AfterAnnounce, Fault::AfterPlace, Fault::AfterCommit] {
+        let env = BatchEnv::with(None, Some((0, at)), true);
+        let ids: Vec<i64> = (1..=3).map(|k| env.png(k).0).collect();
+        let record = run_merge(&env, &merge_req(&ids, Default::default()));
+        assert_eq!(record.state, JobState::Failed, "{at:?}");
+        let job = record.id;
+        let (dir, session) = reopen(env, job);
+        let lib = session.library();
+        assert_done(&session.jobs().get(job).unwrap());
+        let rows = rows_of(lib, job);
+        let made = rows[0].4.unwrap();
+        for row in &rows {
+            assert_eq!((row.1.as_str(), row.4), ("saved", Some(made)), "{at:?}");
+        }
+        let sheets: i64 = lib
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT count(DISTINCT item_id) FROM item_sources",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(sheets, 1, "{at:?}");
+        assert_consistent(lib);
+        drop(session);
+        drop(dir);
+    }
+}
+
+/// M3：シートの一括を元に戻すと、作ったシートをゴミ箱へ入れる（元は変えない）。作ったあとに保存したシートは Changed。
+#[test]
+fn m3_undoing_a_sheet_trashes_it() {
+    let env = BatchEnv::new();
+    let ids: Vec<i64> = (1..=2).map(|k| env.png(k).0).collect();
+    let record = run_merge(&env, &merge_req(&ids, Default::default()));
+    let made = super::batch::result(env.lib.db(), record.id)
+        .unwrap()
+        .created[0];
+    assert_eq!(
+        super::batch::result(env.lib.db(), record.id)
+            .unwrap()
+            .undo
+            .available,
+        1
+    );
+    let undo = undo_and_wait(&env, record.id);
+    assert_done(&undo);
+    let rows = env.rows(undo.id);
+    assert_eq!(
+        (rows.len(), rows[0].0, rows[0].1.as_str()),
+        (1, made, "saved")
+    );
+    assert!(head(&env.lib, made).trashed);
+    for id in &ids {
+        assert!(!head(&env.lib, *id).trashed);
+    }
+    // 作ったあとに保存したシートは戻さない
+    let ids2: Vec<i64> = (3..=4).map(|k| env.png(k).0).collect();
+    let record = run_merge(&env, &merge_req(&ids2, Default::default()));
+    let made2 = super::batch::result(env.lib.db(), record.id)
+        .unwrap()
+        .created[0];
+    overwrite(&env, made2, doc(&[flip("vertical")], None));
+    let undo = undo_and_wait(&env, record.id);
+    assert_eq!(
+        (
+            env.rows(undo.id)[0].1.as_str(),
+            env.rows(undo.id)[0].2.as_deref()
+        ),
+        ("skipped", Some("Changed"))
+    );
+    assert!(!head(&env.lib, made2).trashed);
+    assert_consistent(&env.lib);
+}
+
+/// M4：同じ選択でもう一度作ると、同じ中身のアイテムがあるので作らずに existing（行は前のシートを指す）。待ちのまま一時停止すると
+/// 行は pending のまま、再開すると作る。待ちのまま中止すると canceled で作らない。名前が空・どれもないなら Invalid。
+#[test]
+fn m4_existing_pause_cancel_and_refusals() {
+    let env = BatchEnv::with(None, None, false);
+    let ids: Vec<i64> = (1..=2).map(|k| env.png(k).0).collect();
+    let req = merge_req(&ids, Default::default());
+    let job = super::batch::start_merge(&env.jobs, &req).unwrap();
+    env.jobs.pause(job).unwrap();
+    env.jobs.start().unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_eq!(env.jobs.get(job).unwrap().state, JobState::Paused);
+    assert!(env.rows(job).iter().all(|r| r.1 == "pending"));
+    env.jobs.resume(job).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_done(&env.jobs.get(job).unwrap());
+    let made = env.rows(job)[0].4.unwrap();
+    let again = run_merge(&env, &req);
+    assert_done(&again);
+    for row in env.rows(again.id) {
+        assert_eq!(
+            (row.1.as_str(), row.2.as_deref(), row.4),
+            ("existing", Some("Existing"), Some(made))
+        );
+    }
+    let canceled = super::batch::start_merge(&env.jobs, &req).unwrap();
+    env.jobs.pause(canceled).unwrap();
+    env.jobs.cancel(canceled).unwrap();
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_eq!(env.jobs.get(canceled).unwrap().state, JobState::Canceled);
+    assert!(env.rows(canceled).iter().all(|r| r.1 == "canceled"));
+    let mut empty = req.clone();
+    empty.name = "  ".into();
+    assert!(matches!(
+        super::batch::start_merge(&env.jobs, &empty),
+        Err(crate::CoreError::Invalid(_))
+    ));
+    assert!(matches!(
+        super::batch::start_merge(&env.jobs, &merge_req(&[9_999_999], Default::default())),
+        Err(crate::CoreError::Invalid(_))
+    ));
+    let items: i64 = count(
+        &env.lib,
+        "SELECT count(*) FROM items WHERE id IN (SELECT item_id FROM item_sources)",
+    );
+    assert_eq!(items, 1);
     assert_consistent(&env.lib);
 }

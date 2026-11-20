@@ -66,11 +66,13 @@ use crate::text::nfc;
 use crate::time::now_ms;
 use crate::{CoreError, Result};
 
+pub mod merge;
 pub mod precheck;
 pub mod results;
 pub mod undo;
 
-pub use precheck::{Precheck, PrecheckCx, precheck};
+pub use merge::{DEFAULT_SHEET_NAME, MergeRequest, start_merge};
+pub use precheck::{Precheck, PrecheckCx, precheck, precheck_merge};
 pub use results::{BatchAction, BatchResult, BatchRow, result, rows};
 pub use undo::start_undo;
 
@@ -149,10 +151,18 @@ enum ModeInput {
     SaveAs {
         name: String,
     },
-    /// 一括の［元に戻す…］（M14 段 5。[`undo`]）：一括 `of` の前の版へ戻す（上書き）、作ったアイテムをゴミ箱へ（別名）。
+    /// 一括の［元に戻す…］（M14 段 5。[`undo`]）：一括 `of` の前の版へ戻す（上書き）、作ったアイテムをゴミ箱へ（別名・N → 1）。
     Undo {
         of: JobId,
         save_as: bool,
+        /// 元の一括が N → 1（作ったアイテムは版を持たない。M14 段 6）。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        merge: bool,
+    },
+    /// N → 1（M14 段 6。[`merge`]）：選んだアイテムから 1 枚のスプライトシートを作る（`name` は名前の型）。
+    Merge {
+        name: String,
+        sheet: kura_engine::selection::SheetParams,
     },
 }
 
@@ -613,7 +623,7 @@ impl Plan {
     fn skips_drafts(&self) -> bool {
         match self.mode {
             ModeInput::Overwrite => !self.include_drafts,
-            ModeInput::SaveAs { .. } => false,
+            ModeInput::SaveAs { .. } | ModeInput::Merge { .. } => false,
             ModeInput::Undo { .. } => true,
         }
     }
@@ -662,7 +672,7 @@ impl JobHandler for BatchHandler {
                     digest: copy.doc,
                 })
             }
-            None if matches!(input.mode, ModeInput::Undo { .. }) => None,
+            None if matches!(input.mode, ModeInput::Undo { .. } | ModeInput::Merge { .. }) => None,
             None => {
                 return Err(CoreError::Invalid(
                     "一括のジョブの入力にレシピがありません".into(),
@@ -685,6 +695,10 @@ impl JobHandler for BatchHandler {
             .execute(params![job, now])?;
             Ok(())
         })?;
+        // N → 1 は 1 本の単位で作る（働き手に配らない）
+        if let ModeInput::Merge { name, sheet } = &plan.mode {
+            return self.run_merge(ctx, name, sheet);
+        }
         let pending: Vec<Task> = db.read(|c| {
             let mut stmt = c.prepare_cached(
                 "SELECT ord, item_id FROM batch_items WHERE job_id = ?1 AND state = 'pending' ORDER BY ord",
@@ -1208,8 +1222,8 @@ impl BatchHandler {
         if let Some(hook) = &self.before_prepare {
             hook(item);
         }
-        if let ModeInput::Undo { of, save_as } = plan.mode {
-            return self.prepare_undo(unit, task, head, of, save_as);
+        if let ModeInput::Undo { of, save_as, merge } = plan.mode {
+            return self.prepare_undo(unit, task, head, of, save_as, merge);
         }
         let Some(applied) = &plan.recipe else {
             return Err(failed(CoreError::Invalid(
@@ -1242,7 +1256,7 @@ impl BatchHandler {
         });
         // 3. 準備
         let names = match &plan.mode {
-            ModeInput::Overwrite | ModeInput::Undo { .. } => None,
+            ModeInput::Overwrite | ModeInput::Undo { .. } | ModeInput::Merge { .. } => None,
             ModeInput::SaveAs { name } => {
                 let title: String = db
                     .read(|c| {
@@ -1509,6 +1523,20 @@ fn read_input_shape(
             )),
         }
     }
+    staged_shape(engine, path, format, opts, hooks)
+}
+
+/// ファイル `path`（形式 `format`・読み方 `opts`）の形を段の順に読む（保存と同じ段。段ごとに、その段で形を読む分を `hooks` で確保し、
+/// OS の段なら読む前後に印を置く）。止める指示・中止の確保は `Flow::Stop`。
+fn staged_shape(
+    engine: &EngineServices,
+    path: std::path::PathBuf,
+    format: &'static str,
+    opts: DecodeOptions,
+    hooks: &dyn ShapeHooks,
+) -> Result<Flow<InputRead>> {
+    let runtime = engine.runtime()?.clone();
+    let limits = runtime.bulk(|e| e.limits().clone());
     let codecs = engine.codecs();
     let mon = hooks.monitor();
     let is_platform = |id: &str| {
@@ -1662,6 +1690,17 @@ fn skip_rules(
     item: i64,
     drafts: bool,
 ) -> std::result::Result<versions::Head, Skip> {
+    skip_rules_with(engine, db, item, drafts, true)
+}
+
+/// [`skip_rules`]。`open` が偽ならエディタで開いているアイテムも飛ばさない（N → 1 は元を読むだけ。今の中身で作る）。
+fn skip_rules_with(
+    engine: &EngineServices,
+    db: &Db,
+    item: i64,
+    drafts: bool,
+    open: bool,
+) -> std::result::Result<versions::Head, Skip> {
     let failed = |e: CoreError| Skip::failed(&e);
     let head = db
         .read(|c| versions::head(c, item))
@@ -1682,7 +1721,7 @@ fn skip_rules(
             ),
         ));
     }
-    if engine.current_editor().is_some_and(|e| e.item_id() == item) {
+    if open && engine.current_editor().is_some_and(|e| e.item_id() == item) {
         return Err(Skip::skipped(
             "Open",
             "エディタで開いているので飛ばしました".into(),

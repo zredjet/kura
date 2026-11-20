@@ -27,10 +27,16 @@ pub enum BatchAction {
     SaveAs {
         name: String,
     },
-    /// 一括 `of` の［元に戻す…］（`save_as` は元の一括が別名か）。
+    /// 一括 `of` の［元に戻す…］（`save_as` は元の一括が別名か N → 1、`merge` は N → 1 か）。
     Undo {
         of: JobId,
         save_as: bool,
+        merge: bool,
+    },
+    /// N → 1（スプライトシート。`name` は名前の型）。
+    Merge {
+        name: String,
+        sheet: kura_engine::selection::SheetParams,
     },
 }
 
@@ -93,9 +99,14 @@ pub fn result(db: &Db, job: JobId) -> Result<BatchResult> {
     let action = match &input.mode {
         ModeInput::Overwrite => BatchAction::Overwrite,
         ModeInput::SaveAs { name } => BatchAction::SaveAs { name: name.clone() },
-        ModeInput::Undo { of, save_as } => BatchAction::Undo {
+        ModeInput::Undo { of, save_as, merge } => BatchAction::Undo {
             of: *of,
             save_as: *save_as,
+            merge: *merge,
+        },
+        ModeInput::Merge { name, sheet } => BatchAction::Merge {
+            name: name.clone(),
+            sheet: *sheet,
         },
     };
     db.read(|c| {
@@ -123,8 +134,10 @@ pub fn result(db: &Db, job: JobId) -> Result<BatchResult> {
         for row in rows {
             let (item, state, code, made) = row?;
             total += 1;
+            // N → 1 はどの行も同じアイテムを指すので 1 つにする
             if let Some(made) = made
                 && state == "saved"
+                && !created.contains(&made)
             {
                 created.push(made);
             }
@@ -143,16 +156,17 @@ pub fn result(db: &Db, job: JobId) -> Result<BatchResult> {
         // 状態の並びに揃える（同じ状態の中は最初に出た順のまま）
         groups.sort_by_key(|g| STATES.iter().position(|s| *s == g.state).unwrap_or(STATES.len()));
         let mut info = UndoInfo::default();
-        if let Some(save_as) = match action {
-            BatchAction::Overwrite => Some(false),
-            BatchAction::SaveAs { .. } => Some(true),
+        if let Some((save_as, merge)) = match action {
+            BatchAction::Overwrite => Some((false, false)),
+            BatchAction::SaveAs { .. } => Some((true, false)),
+            BatchAction::Merge { .. } => Some((true, true)),
             BatchAction::Undo { .. } => None,
         } {
             let undos = undo::undo_jobs(c, job, None)?;
             info.by = undos.iter().map(|(id, _)| *id).collect();
             let finished = |s: JobState| matches!(s, JobState::Done | JobState::Failed | JobState::Canceled);
             if finished(state) && undos.iter().all(|(_, s)| finished(*s)) {
-                info.available = undo::targets(c, job, save_as, &info.by)?.len() as i64;
+                info.available = undo::targets(c, job, save_as, merge, &info.by)?.len() as i64;
             }
         }
         Ok(BatchResult {

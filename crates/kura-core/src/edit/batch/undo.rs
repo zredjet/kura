@@ -33,9 +33,10 @@ use crate::{CoreError, Result};
 /// `skipped`（Open）にする（[`super::start_batch`] と同じ）。
 pub fn start_undo(db: &Db, jobs: &JobManager, engine: &EngineServices, of: JobId) -> Result<JobId> {
     let input = input_of(db, of)?;
-    let save_as = match input.mode {
-        ModeInput::Overwrite => false,
-        ModeInput::SaveAs { .. } => true,
+    let (save_as, merge) = match input.mode {
+        ModeInput::Overwrite => (false, false),
+        ModeInput::SaveAs { .. } => (true, false),
+        ModeInput::Merge { .. } => (true, true),
         ModeInput::Undo { .. } => {
             return Err(CoreError::Invalid(
                 "元に戻した一括は、もう一度戻せません".into(),
@@ -45,7 +46,7 @@ pub fn start_undo(db: &Db, jobs: &JobManager, engine: &EngineServices, of: JobId
     let undo = BatchInput {
         v: INPUT_V,
         recipe: None,
-        mode: ModeInput::Undo { of, save_as },
+        mode: ModeInput::Undo { of, save_as, merge },
         include_drafts: false,
     };
     let input_json = serde_json::to_string(&undo)?;
@@ -65,7 +66,7 @@ pub fn start_undo(db: &Db, jobs: &JobManager, engine: &EngineServices, of: JobId
                 ));
             }
             let earlier: Vec<JobId> = earlier.into_iter().map(|(id, _)| id).collect();
-            let targets = targets(tx, of, save_as, &earlier)?;
+            let targets = targets(tx, of, save_as, merge, &earlier)?;
             if insert_rows(tx, job, &targets, open, now)? == 0 {
                 return Err(CoreError::Invalid(
                     "元に戻すアイテムがありません（この一括で変えたものは、もう戻したか消えました）".into(),
@@ -97,7 +98,7 @@ pub(crate) fn check_retry(tx: &Connection, job: JobId, input_json: &str) -> Resu
                 ));
             }
         }
-        ModeInput::Overwrite | ModeInput::SaveAs { .. } => {
+        ModeInput::Overwrite | ModeInput::SaveAs { .. } | ModeInput::Merge { .. } => {
             if undo_jobs(tx, job, None)?.iter().any(|(_, s)| !finished(*s)) {
                 return Err(CoreError::Busy(
                     "この一括を元に戻す一括が終わってから、やり直せます".into(),
@@ -153,19 +154,21 @@ pub(crate) fn undo_jobs(
 }
 
 /// 戻すアイテム（元の一括の行の順）：版を足した行（saved・unchanged）の、上書きならアイテム、別名なら作ったアイテム（消えたもの
-/// は除く）。前に戻した一括 `earlier` で saved・unchanged になったものは除く。
+/// は除く）。N → 1（`merge`）は作ったアイテム 1 つ（行はどれも同じアイテムを指し、版は持たない）。前に戻した一括 `earlier` で
+/// saved・unchanged になったものは除く。
 pub(crate) fn targets(
     conn: &Connection,
     of: JobId,
     save_as: bool,
+    merge: bool,
     earlier: &[JobId],
 ) -> Result<Vec<i64>> {
     let mut stmt = conn.prepare_cached(
         "SELECT item_id, out_item_id FROM batch_items
-          WHERE job_id = ?1 AND state IN ('saved', 'unchanged') AND version_id IS NOT NULL
+          WHERE job_id = ?1 AND state IN ('saved', 'unchanged') AND (version_id IS NOT NULL OR ?2)
           ORDER BY ord",
     )?;
-    let rows = stmt.query_map([of], |r| {
+    let rows = stmt.query_map(params![of, merge], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
     })?;
     let mut done = conn.prepare_cached(
@@ -176,6 +179,9 @@ pub(crate) fn targets(
         let (item, made) = row?;
         let target = if save_as { made } else { Some(item) };
         let Some(target) = target else { continue };
+        if out.contains(&target) {
+            continue;
+        }
         let mut undone = false;
         for job in earlier {
             if done
@@ -203,12 +209,17 @@ impl BatchHandler {
         head: Head,
         of: JobId,
         save_as: bool,
+        merge: bool,
     ) -> std::result::Result<Outcome, Skip> {
         let db = unit.ctx.library().db();
         let item = task.item_id;
         let failed = |e: CoreError| Skip::failed(&e);
-        // 元の一括の行：足した版の番号と、その前の版（上書きは同じアイテム、別名は作ったアイテムで引く）
-        let sql = if save_as {
+        // 元の一括の行：足した版の番号と、その前の版（上書きは同じアイテム、別名は作ったアイテムで引く。N → 1 の作ったアイテムは
+        // 版を持たないので版 0 のまま）
+        let sql = if merge {
+            "SELECT 0, NULL FROM batch_items b
+              WHERE b.out_item_id = ?2 AND b.job_id = ?1 AND b.state = 'saved' LIMIT 1"
+        } else if save_as {
             "SELECT v.version, b.base_version FROM batch_items b JOIN item_versions v ON v.id = b.version_id
               WHERE b.out_item_id = ?2 AND b.job_id = ?1 AND b.state IN ('saved', 'unchanged')"
         } else {

@@ -31,6 +31,7 @@ use kura_engine::{Dim, EngineError, Monitor, Shape};
 use rusqlite::OptionalExtension;
 use serde_json::json;
 
+use super::merge::{MergeRequest, merge_skip, plan_sheet, read_piece};
 use super::{
     BatchMode, BatchRequest, InputRead, ShapeHooks, Skip, bind_skip, dedup, facts_of, head_doc,
     read_input_shape, resolve, skip_rules,
@@ -82,6 +83,23 @@ pub struct Precheck {
     pub bound: Vec<BoundExample>,
     /// レシピの今の版でない操作の印（docs/editing.md §8.4）。
     pub notes: Vec<RecipeNote>,
+    /// N → 1 のシートの見込み（[`precheck_merge`]。1 件ずつの一括は None）。
+    pub sheet: Option<SheetInfo>,
+}
+
+/// N → 1 のシートの見込み（大きさ・フレームの数は、形を読めたものから。上限しか分からなければ上限）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SheetInfo {
+    pub width: u64,
+    pub height: u64,
+    /// 並べるフレームの数（アニメは全フレーム）。
+    pub frames: u64,
+    pub columns: u32,
+    /// セル（選択のキャンバス）の大きさ。
+    pub cell_w: u64,
+    pub cell_h: u64,
+    /// 大きさ・フレームの数が上限しか分からない（読むまで決まらない）。
+    pub approximate: bool,
 }
 
 /// 理由ごとの群。
@@ -267,12 +285,193 @@ pub fn precheck(
         }
     };
     let drafts = !save_as && !req.include_drafts;
-    // ライブラリにないアイテムは確かめない（一括も行を入れない）。どれもなければ一括と同じく Invalid
+    let (items, missing) = split_missing(db, &req.items, "当てる")?;
+    let total = items.len() as u64;
+    let one = OneCx {
+        library,
+        engine,
+        runtime: &runtime,
+        recipe: &resolved.recipe,
+        save_as,
+        drafts,
+        canceled: cx.canceled,
+    };
+    let verdicts = fan_out(
+        &items,
+        runtime.bulk_threads(),
+        cx,
+        &|item| one.check(item),
+        &|| Verdict::Skip(internal()),
+    )?;
+    let mut out = Precheck {
+        total,
+        missing,
+        memory_budget: runtime.budget().total(),
+        notes: resolved.notes,
+        ..Precheck::default()
+    };
+    for (item, verdict) in items.iter().zip(verdicts) {
+        out.add(*item, verdict);
+    }
+    Ok(out)
+}
+
+/// N → 1 の 1 件の見込み。
+enum PieceVerdict {
+    Skip(Skip),
+    /// 予算が空いていなくて形を読めなかった（並べる側に数える）。
+    Busy,
+    Go {
+        shape: Shape,
+        format: &'static str,
+        size: u64,
+    },
+}
+
+/// N → 1（スプライトシート）の事前チェック（docs/editing.md §14.2「N → 1」）：元ごとに一括と同じ飛ばす決まりを見て今の中身の形を
+/// 読み（対話の枠。空いていなければ Busy で並べる側）、形を読めたものでシートを計画する（大きさ・セル・メモリ。シートにならない・
+/// 予算を超えるなら、どの元も一括と同じ理由で失敗の見込み）。名前が空・どれもライブラリにないなら Invalid、中止なら Canceled。
+pub fn precheck_merge(
+    library: &Library,
+    engine: &EngineServices,
+    req: &MergeRequest,
+    cx: &PrecheckCx<'_>,
+) -> Result<Precheck> {
+    let db = library.db();
+    let runtime = engine.runtime()?.clone();
+    if req.name.trim().is_empty() {
+        return Err(CoreError::Invalid("シートの名前が空です".into()));
+    }
+    let (items, missing) = split_missing(db, &req.items, "並べる")?;
+    let check = |item: i64| -> Result<PieceVerdict> {
+        let head = match merge_skip(engine, db, item) {
+            Ok(head) => head,
+            Err(skip) => return Ok(PieceVerdict::Skip(skip)),
+        };
+        let hooks = PrecheckShape {
+            mon: CancelMon(cx.canceled),
+            budget: runtime.budget(),
+            denied: std::cell::Cell::new(false),
+        };
+        match read_piece(engine, library, 0, item, &head, &hooks) {
+            Ok(Flow::Go(p)) => Ok(PieceVerdict::Go {
+                shape: p.read.shape,
+                format: p.read.format,
+                size: p.size,
+            }),
+            Ok(Flow::Stop(_)) => Err(CoreError::Canceled),
+            Err(_) if hooks.denied.get() => Ok(PieceVerdict::Busy),
+            Err(e @ CoreError::Unfit(_)) => {
+                Ok(PieceVerdict::Skip(Skip::skipped("Kind", e.to_string())))
+            }
+            Err(e) => Ok(PieceVerdict::Skip(Skip::failed(&e))),
+        }
+    };
+    let verdicts = fan_out(&items, runtime.bulk_threads(), cx, &check, &|| {
+        PieceVerdict::Skip(internal())
+    })?;
+    let mut out = Precheck {
+        total: items.len() as u64,
+        missing,
+        memory_budget: runtime.budget().total(),
+        ..Precheck::default()
+    };
+    let mut go: Vec<(i64, Shape, &'static str, u64)> = Vec::new();
+    for (item, v) in items.iter().zip(verdicts) {
+        match v {
+            PieceVerdict::Skip(skip) => {
+                push_group(&mut out.skips, skip.state, &skip.code, skip.message, *item)
+            }
+            PieceVerdict::Busy => {
+                out.apply.push(*item);
+                push_group(
+                    &mut out.unchecked,
+                    "pending",
+                    "Busy",
+                    "メモリが空いていないので、作るときに確かめます".into(),
+                    *item,
+                );
+            }
+            PieceVerdict::Go {
+                shape,
+                format,
+                size,
+            } => {
+                out.apply.push(*item);
+                go.push((*item, shape, format, size));
+            }
+        }
+    }
+    if go.is_empty() {
+        return Ok(out);
+    }
+    let pieces: Vec<(Shape, &'static str)> = go.iter().map(|(_, s, f, _)| (*s, *f)).collect();
+    match plan_sheet(engine, &pieces, &req.sheet) {
+        Ok(sp) => {
+            let (first, first_shape) = (go[0].0, go[0].1);
+            out.outputs.push(OutputGroup {
+                format: "png".into(),
+                fallback: false,
+                items: out.apply.clone(),
+                examples: vec![ShapeChange {
+                    item_id: first,
+                    from: ShapeInfo::of(&first_shape),
+                    to: ShapeInfo::of(&sp.out),
+                }],
+                resized: 0,
+            });
+            out.memory_peak = sp.need;
+            let sizes = go.iter().fold(0u64, |a, (_, _, _, z)| a.saturating_add(*z));
+            let values = go
+                .iter()
+                .fold(0u64, |a, (_, s, _, _)| a.saturating_add(s.value_bytes()));
+            out.disk.new_bytes = scaled(sizes, values, sp.out.value_bytes());
+            let (cell_w, cell_h, frames, exact_sel) = match sp.selection {
+                Shape::Frames { count, w, h, .. } => (
+                    w.max(),
+                    h.max(),
+                    count.max(),
+                    matches!((count, w, h), (Dim::Exact(_), Dim::Exact(_), Dim::Exact(_))),
+                ),
+                _ => (0, 0, 0, false),
+            };
+            let (width, height, exact_out) = match sp.out {
+                Shape::Image { w, h, .. } => (
+                    w.max(),
+                    h.max(),
+                    matches!((w, h), (Dim::Exact(_), Dim::Exact(_))),
+                ),
+                _ => (0, 0, false),
+            };
+            out.sheet = Some(SheetInfo {
+                width,
+                height,
+                frames,
+                columns: sp.columns,
+                cell_w,
+                cell_h,
+                approximate: !(exact_sel && exact_out) || !out.unchecked.is_empty(),
+            });
+        }
+        // シートにならない・予算を超える：一括と同じく、読めたどの元も同じ理由で失敗
+        Err(e) => {
+            for (item, ..) in &go {
+                out.apply.retain(|a| a != item);
+                push_group(&mut out.skips, "failed", e.code(), e.to_string(), *item);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 選んだアイテムを、ライブラリにあるもの（重なりを除いて選んだ順）とないものに分ける（一括も行を入れない）。どれもなければ
+/// 一括と同じく Invalid（`verb` は「当てる」「並べる」）。
+fn split_missing(db: &crate::db::Db, req: &[i64], verb: &str) -> Result<(Vec<i64>, Vec<i64>)> {
     let mut items = Vec::new();
     let mut missing = Vec::new();
     db.read(|c| {
         let mut exists = c.prepare_cached("SELECT 1 FROM items WHERE id = ?1")?;
-        for id in dedup(&req.items) {
+        for id in dedup(req) {
             if exists.query_row([id], |_| Ok(())).optional()?.is_some() {
                 items.push(id);
             } else {
@@ -283,27 +482,38 @@ pub fn precheck(
     })?;
     if items.is_empty() {
         return Err(CoreError::Invalid(if missing.is_empty() {
-            "当てるアイテムがありません".into()
+            format!("{verb}アイテムがありません")
         } else {
-            "当てるアイテムがありません（どれもライブラリにありません）".into()
+            format!("{verb}アイテムがありません（どれもライブラリにありません）")
         }));
     }
+    Ok((items, missing))
+}
+
+/// 1 件の panic の見込み。
+fn internal() -> Skip {
+    Skip {
+        state: "failed",
+        code: "Internal".into(),
+        message: "確かめる途中で内部の誤りが起きました".into(),
+    }
+}
+
+/// `items` を `k` 本の働き手で 1 件ずつ `check` し、選んだ順の結果を返す。進みは 1 件ごと、`cx.canceled` で止め（Canceled）、
+/// `check` の誤りは全体の誤り。1 件の panic は `on_panic` の結果にする（一括の働き手と同じ。全体を落とさない）。
+fn fan_out<T: Send>(
+    items: &[i64],
+    k: usize,
+    cx: &PrecheckCx<'_>,
+    check: &(dyn Fn(i64) -> Result<T> + Sync),
+    on_panic: &(dyn Fn() -> T + Sync),
+) -> Result<Vec<T>> {
     let total = items.len() as u64;
-    let k = runtime.bulk_threads().max(1).min(items.len().max(1));
+    let k = k.max(1).min(items.len().max(1));
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let verdicts: Mutex<Vec<Option<Verdict>>> =
-        Mutex::new((0..items.len()).map(|_| None).collect());
+    let results: Mutex<Vec<Option<T>>> = Mutex::new((0..items.len()).map(|_| None).collect());
     let failure: Mutex<Option<CoreError>> = Mutex::new(None);
-    let one = OneCx {
-        library,
-        engine,
-        runtime: &runtime,
-        recipe: &resolved.recipe,
-        save_as,
-        drafts,
-        canceled: cx.canceled,
-    };
     std::thread::scope(|s| {
         for _ in 0..k {
             s.spawn(|| {
@@ -313,19 +523,14 @@ pub fn precheck(
                     }
                     let i = next.fetch_add(1, Ordering::AcqRel);
                     let Some(&item) = items.get(i) else { return };
-                    // 1 件の panic はその 1 件の失敗の見込みにする（一括の働き手と同じ。全体を落とさない）
-                    let checked = catch_unwind(AssertUnwindSafe(|| one.check(item)))
-                        .unwrap_or_else(|_| {
+                    let checked =
+                        catch_unwind(AssertUnwindSafe(|| check(item))).unwrap_or_else(|_| {
                             tracing::error!(item, "事前チェックの 1 件が panic しました");
-                            Ok(Verdict::Skip(Skip {
-                                state: "failed",
-                                code: "Internal".into(),
-                                message: "確かめる途中で内部の誤りが起きました".into(),
-                            }))
+                            Ok(on_panic())
                         });
                     match checked {
                         Ok(v) => {
-                            if let Ok(mut all) = verdicts.lock()
+                            if let Ok(mut all) = results.lock()
                                 && let Some(slot) = all.get_mut(i)
                             {
                                 *slot = Some(v);
@@ -351,23 +556,12 @@ pub fn precheck(
     if cx.canceled.load(Ordering::Acquire) {
         return Err(CoreError::Canceled);
     }
-    let verdicts = verdicts
+    results
         .into_inner()
-        .map_err(|_| CoreError::Invalid("事前チェックの結果の錠が壊れました".into()))?;
-    let mut out = Precheck {
-        total,
-        missing,
-        memory_budget: runtime.budget().total(),
-        notes: resolved.notes,
-        ..Precheck::default()
-    };
-    for (item, verdict) in items.iter().zip(verdicts) {
-        let Some(verdict) = verdict else {
-            return Err(CoreError::Canceled);
-        };
-        out.add(*item, verdict);
-    }
-    Ok(out)
+        .map_err(|_| CoreError::Invalid("事前チェックの結果の錠が壊れました".into()))?
+        .into_iter()
+        .map(|v| v.ok_or(CoreError::Canceled))
+        .collect()
 }
 
 impl Precheck {
