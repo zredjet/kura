@@ -479,7 +479,8 @@ mod tests {
                 "0010_items_blob_id",
                 "0011_edit_versions",
                 "0012_batch",
-                "0013_item_sources"
+                "0013_item_sources",
+                "0014_credits"
             ]
         );
         // 当てたあとの WAL は空

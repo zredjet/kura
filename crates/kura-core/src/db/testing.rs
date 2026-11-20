@@ -125,13 +125,18 @@ pub(crate) fn fill_v12(conn: &Connection) {
     .unwrap();
 }
 
-/// 最新の版で足した表（[`fill_v12`] の表と、0013 の N → 1 の来歴）にも行を入れる。`fill_v6` のあとに使う（表を足したら
+/// 最新の版で足した表（[`fill_v12`] の表と、0013 の N → 1 の来歴、0014 の自作のライセンスとクレジット）にも行を入れる。`fill_v6` のあとに使う（表を足したら
 /// ここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
 pub(crate) fn fill_latest(conn: &Connection) {
     fill_v12(conn);
     conn.execute_batch(
         "INSERT INTO item_sources (item_id, ord, source_item_id, source_version, source_hash, frames, created_at)
-           VALUES (2, 0, 4, 1, x'04', 1, 95), (2, 1, NULL, 0, x'09', 3, 95);",
+           VALUES (2, 0, 4, 1, x'04', 1, 95), (2, 1, NULL, 0, x'09', 3, 95);
+         INSERT INTO licenses (builtin, name, spdx, url, attribution, commercial, modify, share_alike, note, pos, created_at, updated_at)
+           VALUES (NULL, 'サイトの規約', NULL, 'https://example.com/terms', 'optional', 'unknown', 'yes', 0, '表記は任意', 13, 96, 96);
+         INSERT INTO item_credits (item_id, license_id, author, work, url, credit, updated_at)
+           VALUES (1, (SELECT id FROM licenses WHERE builtin = 'cc-by-4.0'), 'もりの', '森の素材集', NULL, NULL, 96),
+                  (4, (SELECT id FROM licenses WHERE builtin IS NULL), NULL, NULL, 'https://example.com/pack', 'Sound by X', 96);",
     )
     .unwrap();
 }

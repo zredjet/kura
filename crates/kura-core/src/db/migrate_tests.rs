@@ -1620,6 +1620,182 @@ fn item_sources_0013_adds_a_table_and_keeps_everything_else() {
     );
 }
 
+const V14: usize = 14;
+
+/// 0014：ライセンスとクレジットの表を足す。既存の表の行・索引・トリガ・FTS は同じ。既定のライセンス 13 行（鍵・印）、外部キーの
+/// 向き（アイテムを消すとクレジットも消え、自作のライセンスを消すと未設定に戻る）、子の列の索引、名前付きの CHECK、名前の一意
+/// （大文字小文字を問わない）。
+#[test]
+fn credits_0014_adds_tables_and_keeps_everything_else() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, V14 - 1).unwrap();
+    crate::db::testing::fill_v12(&conn);
+    conn.execute_batch(
+        "INSERT INTO item_sources (item_id, ord, source_item_id, source_version, source_hash, frames, created_at)
+           VALUES (2, 0, 4, 1, x'04', 1, 95);",
+    )
+    .unwrap();
+    assert_eq!(MIGRATIONS[V14 - 1].name, "0014_credits");
+    assert_eq!(MIGRATIONS[V14 - 1].kind, Kind::Plain);
+    let before = snapshot(&conn);
+    migrate_until(&mut conn, V14).unwrap();
+    let after = snapshot(&conn);
+    for (key, value) in &before {
+        assert_eq!(after.get(key), Some(value), "{key} が変わった");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(
+        added,
+        vec![
+            "index idx_item_credits_license",
+            "index idx_licenses_builtin",
+            "index idx_licenses_name",
+            "table item_credits",
+            "table licenses"
+        ]
+    );
+    assert!(violations(&conn).unwrap().is_empty());
+    // 既定の行：鍵と並びと表記義務
+    let mut stmt = conn
+        .prepare("SELECT builtin, attribution, commercial, share_alike FROM licenses ORDER BY pos")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "{} {} {} {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            "cc0-1.0 none yes 0",
+            "cc-by-4.0 required yes 0",
+            "cc-by-3.0 required yes 0",
+            "cc-by-sa-4.0 required yes 1",
+            "cc-by-sa-3.0 required yes 1",
+            "cc-by-nc-4.0 required no 0",
+            "cc-by-nc-sa-4.0 required no 1",
+            "oga-by-3.0 required yes 0",
+            "ofl-1.1 required yes 1",
+            "mit required yes 0",
+            "apache-2.0 required yes 0",
+            "public-domain none yes 0",
+            "own none yes 0",
+        ]
+    );
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.\"from\", f.\"table\", f.\"to\", f.on_delete
+               FROM pragma_foreign_key_list('item_credits') f ORDER BY f.\"from\"",
+        )
+        .unwrap();
+    let fks: Vec<String> = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "{} → {}.{} {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        fks,
+        vec![
+            "item_id → items.id CASCADE",
+            "license_id → licenses.id SET NULL"
+        ]
+    );
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT item_id FROM item_credits WHERE license_id = 1",
+    );
+    assert!(plan.contains("idx_item_credits_license"), "{plan}");
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT id FROM licenses WHERE name = 'cc by 4.0' COLLATE NOCASE",
+    );
+    assert!(plan.contains("idx_licenses_name"), "{plan}");
+    let err = |sql: &str| conn.execute(sql, []).unwrap_err().to_string();
+    let insert = |values: &str| {
+        format!(
+            "INSERT INTO licenses (builtin, name, spdx, url, attribution, commercial, modify, share_alike, pos, created_at, updated_at)
+             VALUES {values}"
+        )
+    };
+    for (sql, name) in [
+        (
+            insert("(NULL, 'x', NULL, NULL, 'maybe', 'yes', 'yes', 0, 20, 1, 1)"),
+            "licenses_attribution",
+        ),
+        (
+            insert("(NULL, 'x', NULL, NULL, 'none', 'sometimes', 'yes', 0, 20, 1, 1)"),
+            "licenses_commercial",
+        ),
+        (
+            insert("(NULL, 'x', NULL, NULL, 'none', 'yes', 'no thanks', 0, 20, 1, 1)"),
+            "licenses_modify",
+        ),
+        (
+            insert("(NULL, 'x', NULL, NULL, 'none', 'yes', 'yes', 2, 20, 1, 1)"),
+            "licenses_share_alike",
+        ),
+        // 名前は大文字小文字を問わず一意、既定の鍵も一意
+        (
+            insert("(NULL, 'cc by 4.0', NULL, NULL, 'none', 'yes', 'yes', 0, 20, 1, 1)"),
+            "licenses.name",
+        ),
+        (
+            insert("('mit', 'MIT 2', NULL, NULL, 'none', 'yes', 'yes', 0, 20, 1, 1)"),
+            "licenses.builtin",
+        ),
+    ] {
+        let e = err(&sql);
+        assert!(e.contains(name), "{sql}: {e}");
+    }
+    // 自作のライセンスを消すと未設定（NULL）、アイテムを消すとクレジットの行も消える
+    conn.execute_batch(&insert(
+        "(NULL, 'サイトの規約', NULL, NULL, 'optional', 'unknown', 'yes', 0, 20, 1, 1)",
+    ))
+    .unwrap();
+    let custom: i64 = one(&conn, "SELECT id FROM licenses WHERE builtin IS NULL");
+    let item: i64 = one(&conn, "SELECT min(id) FROM items");
+    conn.execute(
+        "INSERT INTO item_credits (item_id, license_id, author, updated_at) VALUES (?1, ?2, 'もりの', 1)",
+        [item, custom],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM licenses WHERE id = ?1", [custom])
+        .unwrap();
+    assert_eq!(
+        one::<Option<i64>>(
+            &conn,
+            &format!("SELECT license_id FROM item_credits WHERE item_id = {item}")
+        ),
+        None
+    );
+    conn.execute("DELETE FROM items WHERE id = ?1", [item])
+        .unwrap();
+    assert_eq!(
+        one::<i64>(
+            &conn,
+            &format!("SELECT count(*) FROM item_credits WHERE item_id = {item}")
+        ),
+        0
+    );
+    assert!(violations(&conn).unwrap().is_empty());
+}
+
 /// 0012 の外部キーの向き：対象のアイテムを消すと行も消え（ADR-192 (4)）、別名で作ったアイテム・版を消すと NULL になる。
 #[test]
 fn batch_items_follow_the_items_and_versions() {
