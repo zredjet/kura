@@ -1,4 +1,4 @@
-import { type KeyboardEvent, type MouseEvent, useEffect } from 'react';
+import type { KeyboardEvent, MouseEvent } from 'react';
 
 import { InlineName } from '../../components/InlineName/InlineName';
 import { type MenuEntry, openMenuAt, openMenuBelow } from '../../components/Menu/menuStore';
@@ -6,7 +6,6 @@ import { ImportIcon } from '../../components/icons/ImportIcon';
 import { RecipeIcon } from '../../components/icons/RecipeIcon';
 import { ja } from '../../i18n/ja';
 import type { RecipeSummaryDto } from '../../ipc/recipes';
-import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
 import { useDragStore, watchDrag } from '../library/dragState';
 import {
@@ -57,11 +56,6 @@ export function RecipeList() {
   const current = useViewStore((s) => s.recipe);
   const openRecipe = useViewStore((s) => s.openRecipe);
   const dropTarget = useDragStore((s) => s.target);
-  const libraryPath = useLibraryStore((s) => s.info?.path);
-
-  useEffect(() => {
-    void useRecipeStore.getState().load();
-  }, [libraryPath]);
 
   const onKeyDown = (e: KeyboardEvent<HTMLButtonElement>, recipe: RecipeSummaryDto) => {
     const plain = !e.metaKey && !e.altKey && !e.ctrlKey && !e.shiftKey;

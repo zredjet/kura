@@ -116,9 +116,55 @@ describe('batchView', () => {
   it('中止したら当て済みの数を添える。結果をまだ読めていなければ名前は「レシピ」', () => {
     const view = batchProgressView(job({ state: 'canceled' }));
     expect(view.title).toBe(t.canceled('ドット絵 4 倍'));
-    expect(view.detail).toBe(t.canceledDetail('4'));
+    expect(view.detail).toBe([t.canceledDetail('4'), t.skipped('1'), t.failures('1')].join(' · '));
     expect(batchProgressView(job({ state: 'queued', result: null })).title).toBe(
       t.queued(t.unnamed),
     );
+  });
+
+  it('中止した一括も、飛ばした・失敗があれば残し、その数を添える', () => {
+    const canceled = job({
+      state: 'canceled',
+      result: result({
+        groups: [
+          { state: 'saved', code: null, items: [1] },
+          { state: 'failed', code: 'Invalid', items: [2] },
+          { state: 'canceled', code: null, items: [3] },
+        ],
+        total: 3,
+      }),
+    });
+    expect(keepsCapsule(canceled)).toBe(true);
+    expect(batchProgressView(canceled).detail).toBe(
+      [t.canceledDetail('1'), t.failures('1')].join(' · '),
+    );
+    const clean = job({
+      state: 'canceled',
+      result: result({ groups: [{ state: 'canceled', code: null, items: [1] }], total: 1 }),
+    });
+    expect(keepsCapsule(clean)).toBe(false);
+  });
+
+  it('N → 1 が何も作れずに終わったら「作れませんでした」と言い、残す', () => {
+    const none = job({
+      state: 'done',
+      result: result({
+        action: { type: 'merge', name: '{名前} のシート', sheet: {} },
+        recipe: null,
+        groups: [{ state: 'failed', code: 'Invalid', items: [1, 2] }],
+      }),
+    });
+    expect(batchProgressView(none).title).toBe(t.mergeFailed);
+    expect(keepsCapsule(none)).toBe(true);
+    const made = job({
+      state: 'done',
+      result: result({
+        action: { type: 'merge', name: '{名前} のシート', sheet: {} },
+        recipe: null,
+        groups: [{ state: 'saved', code: null, items: [1, 2] }],
+      }),
+    });
+    expect(batchProgressView(made).title).toBe(t.mergeDone);
+    expect(keepsCapsule(made)).toBe(false);
   });
 });

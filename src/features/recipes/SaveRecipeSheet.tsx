@@ -9,6 +9,7 @@ import type { EditNodeDto } from '../../ipc/edit';
 import { createRecipe, replaceRecipe } from '../../ipc/recipes';
 import { isImeKey } from '../../lib/ime';
 import { notify } from '../../stores/noticeStore';
+import { useAudioStore } from '../editor/audio/audioStore';
 import { dismissSheet, recipeSaved } from '../editor/editorSave';
 import { type AfterClose, useEditorStore } from '../editor/editorStore';
 import { opName, summarizeNode } from '../editor/opsCatalog';
@@ -20,6 +21,7 @@ import {
   choicesOf,
   defaultKeep,
   defaultRecipeName,
+  includedByDefault,
   defaultSeconds,
   formatLabel,
   outputFormat,
@@ -58,7 +60,8 @@ export function SaveRecipeSheet({ closeAfter }: { closeAfter: AfterClose | null 
   const doc = useEditorStore((s) => s.doc);
   const recipe = useEditorStore((s) => s.recipe);
   const session = useEditorStore((s) => s.session);
-  const rate = useEditorStore((s) => s.source?.audio?.rate ?? null);
+  const sourceRate = useEditorStore((s) => s.source?.audio?.rate ?? null);
+  const audioNodes = useAudioStore((s) => s.view?.nodes);
   const pending = useEditorStore((s) => s.pendingSteps);
   const titleId = useId();
   const nameId = useId();
@@ -67,20 +70,33 @@ export function SaveRecipeSheet({ closeAfter }: { closeAfter: AfterClose | null 
     () => doc.order.map((id) => doc.nodes[id]).filter((n): n is EditNodeDto => n !== undefined),
     [doc],
   );
-  const initialKeep = useMemo(() => defaultKeep(nodes), [nodes]);
-  const [keep, setKeep] = useState<number[]>(initialKeep);
+  const sample = recipe !== null;
+  // 利用者が付け外ししたものだけを覚え、ほかは既定（シートを開いたあとに応えの届いた手も既定で含める）
+  const [toggled, setToggled] = useState<Record<number, boolean>>({});
+  const keep = useMemo(
+    () => nodes.filter((n) => toggled[n.id] ?? includedByDefault(n, sample)).map((n) => n.id),
+    [nodes, toggled, sample],
+  );
   const [name, setName] = useState(() =>
-    defaultRecipeName(nodes.filter((n) => initialKeep.includes(n.id)).map((n) => n.op)),
+    defaultRecipeName(defaultKeep(nodes).map((id) => doc.nodes[id]?.op ?? '')),
   );
   const [description, setDescription] = useState('');
   const format = outputFormat(doc.outputs);
+  // 見本で編集は、前に保存した（開いた）ときの選びを引き継ぐ。見本で形式を変えていれば含める
   const [withFormat, setWithFormat] = useState(() =>
-    recipe ? recipe.withFormat && format !== null : format !== null,
+    recipe
+      ? format !== null && (format !== recipe.savedFormat || recipe.withFormat)
+      : format !== null,
   );
   const slots = useMemo(() => bindSlots(nodes, keep), [nodes, keep]);
   const [choices, setChoices] = useState<Record<string, BindChoice>>(() =>
-    choicesOf(bindSlots(nodes, initialKeep), recipe?.bindings ?? []),
+    choicesOf(bindSlots(nodes, defaultKeep(nodes, sample)), recipe?.bindings ?? []),
   );
+  /** ノードの入力のレートと長さ（音声。分からなければ元のレート）。 */
+  const timeOf = (node: number) => {
+    const n = audioNodes?.find((x) => x.id === node);
+    return { rate: n?.inRate ?? sourceRate, length: n?.inFrames ?? null };
+  };
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
@@ -92,26 +108,29 @@ export function SaveRecipeSheet({ closeAfter }: { closeAfter: AfterClose | null 
   const excluded = nodes.some((n) => n.op === 'paint.actions' || n.op === 'palette.replace');
   const disabled = nodes.some((n) => !n.enabled);
   const toggle = (id: number, on: boolean) => {
-    setKeep((k) =>
-      on ? doc.order.filter((x) => x === id || k.includes(x)) : k.filter((x) => x !== id),
-    );
+    setToggled((t0) => ({ ...t0, [id]: on }));
   };
   const choose = (slot: BindSlot, value: string) => {
     let next: BindChoice = { type: 'keep' };
     if (value.startsWith('setting:')) {
       next = { type: 'setting', key: value.slice(8) as BindSlot['settings'][number] };
     } else if (value.startsWith('time:')) {
+      const anchor = value === 'time:end' ? 'end' : 'start';
+      const { rate, length } = timeOf(slot.node);
+      // 向きを替えたら見本の値から求め直す（同じ向きのまま選び直したなら打った値を残す）
       const prev = choices[slot.key];
       next = {
         type: 'time',
-        anchor: value === 'time:end' ? 'end' : 'start',
+        anchor,
         seconds:
-          prev?.type === 'time'
+          prev?.type === 'time' && prev.anchor === anchor
             ? prev.seconds
             : defaultSeconds(
                 nodes.find((n) => n.id === slot.node),
                 slot,
+                anchor,
                 rate,
+                length,
               ),
       };
     }
@@ -151,7 +170,11 @@ export function SaveRecipeSheet({ closeAfter }: { closeAfter: AfterClose | null 
         notify(ja.recipes.saved(trimmed));
       }
       void useRecipeStore.getState().load();
-      recipeSaved(closeAfter);
+      recipeSaved(closeAfter, {
+        bindings,
+        withFormat: pick.withFormat,
+        format,
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
@@ -220,8 +243,8 @@ export function SaveRecipeSheet({ closeAfter }: { closeAfter: AfterClose | null 
               ))}
             </ul>
             <p className={styles.note}>{t.opsHint}</p>
-            {excluded && <p className={styles.note}>{t.paintOff}</p>}
-            {disabled && <p className={styles.note}>{t.disabledOff}</p>}
+            {!sample && excluded && <p className={styles.note}>{t.paintOff}</p>}
+            {!sample && disabled && <p className={styles.note}>{t.disabledOff}</p>}
           </section>
           {format !== null && (
             <div className={styles.switchRow}>

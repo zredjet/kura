@@ -696,10 +696,12 @@ export async function installAppMenu(): Promise<void> {
       if (viewKind(now) !== viewKind(before)) {
         swapView(viewKind(now));
       }
-      if ((now.phase === 'open') !== (before.phase === 'open')) {
-        void save.saveAs.setEnabled(now.phase === 'open');
+      // 見本で編集（レシピのモード）では別名で保存を出さず、保存はレシピを保存のシート（M14 段 7）
+      const saveAsOk = (st: typeof now) => st.phase === 'open' && !st.recipe;
+      if (saveAsOk(now) !== saveAsOk(before)) {
+        void save.saveAs.setEnabled(saveAsOk(now));
       }
-      const nowCanSave = canSaveEditor(now);
+      const nowCanSave = now.recipe ? now.phase === 'open' && !now.sheet : canSaveEditor(now);
       if (nowCanSave !== canSave) {
         canSave = nowCanSave;
         void save.save.setEnabled(nowCanSave);

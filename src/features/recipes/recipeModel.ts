@@ -115,11 +115,17 @@ export function defaultRecipeName(ops: readonly string[]): string {
 /** 初めから含めない操作（この画像の座標・色の番号のままの描画とパレットの置き換え）。 */
 export const EXCLUDED_BY_DEFAULT: readonly string[] = ['paint.actions', 'palette.replace'];
 
-/** 含める操作の既定（無効にした操作・描画・パレットの置き換えを外す）。 */
-export function defaultKeep(nodes: readonly RecipeNodeLike[]): number[] {
-  return nodes
-    .filter((n) => (n.enabled ?? true) && !EXCLUDED_BY_DEFAULT.includes(n.op))
-    .map((n) => n.id);
+/**
+ * 初めから含めるか：見本で編集（`sample`）では並ぶ手はすべてレシピの手なので全部含める（往復で同じレシピ。ADR-200 (1)）。
+ * 作るときは無効にした操作・描画・パレットの置き換えを外す。
+ */
+export function includedByDefault(node: RecipeNodeLike, sample = false): boolean {
+  return sample || ((node.enabled ?? true) && !EXCLUDED_BY_DEFAULT.includes(node.op));
+}
+
+/** 含める操作の既定（作るときは無効にした操作・描画・パレットの置き換えを外す。見本で編集は全部）。 */
+export function defaultKeep(nodes: readonly RecipeNodeLike[], sample = false): number[] {
+  return nodes.filter((n) => includedByDefault(n, sample)).map((n) => n.id);
 }
 
 /** 結び付けの欄 1 つ（引数 1 つ。区間は全体か片方）。 */
@@ -169,6 +175,10 @@ export function bindSlots(
       const base = `${paramLabel(node.op, spec.key)} · ${opName(node.op)}`;
       if (spec.kind.type === 'frameRange') {
         const whole = slotKey(node.id, spec.key, null);
+        // 区間の片方を秒に結ぶには、見本の区間（オブジェクト）が要る（Rust の check_binding と同じ。ループを消す null には置けない）
+        const sampleValue = (node.params as Record<string, JsonValue> | undefined)?.[spec.key];
+        const hasRange =
+          sampleValue !== null && typeof sampleValue === 'object' && !Array.isArray(sampleValue);
         if (settings.length > 0) {
           out.push({
             key: whole,
@@ -182,7 +192,7 @@ export function bindSlots(
             whole: null,
           });
         }
-        if (time) {
+        if (time && hasRange) {
           for (const part of ['start', 'end'] as const) {
             out.push({
               key: slotKey(node.id, spec.key, part),
@@ -286,12 +296,15 @@ export function bindingsFrom(
 }
 
 /**
- * 秒の欄の既定（見本の値をフレームから秒に直す。`rate` が分からなければ 0）。区間の片方は `start`・`end` の値。
+ * 秒の欄の既定（見本の値をフレームから秒に直す）。頭からは `値 / レート`、終わりからは `(長さ − 値) / レート`（Rust の
+ * 結び付けと同じ読み方）。レートと長さはノードの入力のもの（分からなければ 0）。区間の片方は `start`・`end` の値。
  */
 export function defaultSeconds(
   node: RecipeNodeLike | undefined,
   slot: BindSlot,
+  anchor: TimeAnchor,
   rate: number | null,
+  length: number | null,
 ): string {
   if (!node || !rate) return '0';
   const params = (node.params ?? {}) as Record<string, JsonValue>;
@@ -303,5 +316,10 @@ export function defaultSeconds(
     const v = (value as Record<string, JsonValue>)[slot.part];
     frames = typeof v === 'number' ? v : null;
   }
-  return frames === null ? '0' : secondsText((frames / rate) * 1000);
+  if (frames === null) return '0';
+  if (anchor === 'end') {
+    if (length === null) return '0';
+    return secondsText((Math.max(0, length - frames) / rate) * 1000);
+  }
+  return secondsText((frames / rate) * 1000);
 }

@@ -111,7 +111,9 @@ function LibraryScreen() {
     closeApply();
     closeMerge();
     closeResult();
+    // レシピの一覧はライブラリごとに読む（サイドバーを隠していても、項目のメニューの「レシピを当てる ▸」に出す）
     useRecipeStore.getState().clear();
+    if (libraryPath) void useRecipeStore.getState().load();
   }, [libraryPath]);
   useEffect(() => () => void closeEditor(), [libraryPath]);
 

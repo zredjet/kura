@@ -70,9 +70,12 @@ describe('applyStore', () => {
     });
     const unit = (LIST_FLAG | 4) >>> 0;
     const out = await expandEntries([2, unit, 9]);
-    expect(out).toEqual({ items: [2, 7, 8, 9], hadUnits: true });
+    expect(out).toMatchObject({ items: [2, 7, 8, 9], hadUnits: true });
+    // 広げたアイテムがどこから来たか（一覧の並びで並べ直すとき）
+    expect(out.origins.get(7)).toBe(unit);
+    expect(out.origins.get(2)).toBe(2);
     expect(queryIds).toHaveBeenCalledWith({ kind: 'unit', id: 4 });
-    expect(await expandEntries([5])).toEqual({ items: [5], hadUnits: false });
+    expect(await expandEntries([5])).toMatchObject({ items: [5], hadUnits: false });
   });
 
   it('頼みの形：別名は名前の型、下書きは上書きのときだけ', () => {
@@ -126,7 +129,13 @@ describe('applyStore', () => {
     setIncludeDrafts(true);
     expect(useApplyStore.getState().phase).toBe('checking');
     // 確かめの途中で別の確かめを始めたら、前のものは止める
-    vi.mocked(precheckBatch).mockResolvedValueOnce(precheck({ apply: [1, 2, 3], skips: [] }));
+    // 当てる見込みは選んだものの一部（2 は飛ばす見込み）
+    vi.mocked(precheckBatch).mockResolvedValueOnce(
+      precheck({
+        apply: [1, 3],
+        skips: [{ state: 'skipped', code: 'Open', message: '開いている', items: [2] }],
+      }),
+    );
     setApplyMode('saveAs');
     expect(cancelPrecheck).toHaveBeenCalledTimes(1);
     await flush();
@@ -134,12 +143,12 @@ describe('applyStore', () => {
     await flush();
     s = useApplyStore.getState();
     expect(s.phase).toBe('ready');
-    expect(s.precheck?.apply).toEqual([1, 2, 3]);
+    expect(s.precheck?.apply).toEqual([1, 3]);
 
     await startApply();
     expect(startBatch).toHaveBeenCalledWith({
       source: { type: 'recipe', id: 3 },
-      items: [1, 2, 3],
+      items: [1, 3],
       mode: { type: 'saveAs', name: '{名前} のコピー' },
       includeDrafts: false,
     });
@@ -160,5 +169,16 @@ describe('applyStore', () => {
     closeApply();
     expect(cancelPrecheck).toHaveBeenCalled();
     expect(useApplyStore.getState().phase).toBe('closed');
+  });
+
+  it('下書きの数は、含めずに確かめたときの数を覚え、含めて確かめ直しても使う', async () => {
+    vi.mocked(precheckBatch).mockResolvedValueOnce(precheck());
+    await openApply({ type: 'recipe', id: 3 }, [1, 2, 3]);
+    expect(useApplyStore.getState().draftCount).toBe(1);
+    vi.mocked(precheckBatch).mockResolvedValueOnce(precheck({ apply: [1, 2, 3], skips: [] }));
+    setIncludeDrafts(true);
+    await flush();
+    expect(useApplyStore.getState().includeDrafts).toBe(true);
+    expect(useApplyStore.getState().draftCount).toBe(1);
   });
 });

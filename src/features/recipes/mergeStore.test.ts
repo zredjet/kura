@@ -18,6 +18,18 @@ describe('まとめて 1 つにする', () => {
     expect(inListOrder([2, 1], null)).toEqual([2, 1]);
   });
 
+  it('一覧の並び：ユニットから広げたアイテムはユニットの印の位置に、中は広げた順で', () => {
+    const unit = 0x8000_0007;
+    // 一覧：1、ユニット、4。ユニットの中は 21、20
+    const origins = new Map([
+      [21, unit],
+      [20, unit],
+    ]);
+    expect(inListOrder([4, 21, 20, 1], new Uint32Array([1, unit, 4]), origins)).toEqual([
+      1, 21, 20, 4,
+    ]);
+  });
+
   it('名前順は自然な順（数字は数として）。同じ名前は選んだ順', () => {
     const titles = new Map([
       [1, 'walk_10'],

@@ -1,4 +1,4 @@
-import { useId } from 'react';
+import { useId, useState } from 'react';
 
 import { Button } from '../../components/Button/Button';
 import { Dialog } from '../../components/Dialog/Dialog';
@@ -13,6 +13,7 @@ import {
   closeMerge,
   MAX_SHEET_NUMBER,
   type MergeOrder,
+  setMergeFieldValid,
   setMergeName,
   setMergeOrder,
   setMergeParams,
@@ -59,14 +60,16 @@ export function hexOf(rgba: readonly number[]): string {
     .join('')}`;
 }
 
-/** 数の欄 1 つ（px）。 */
+/** 数の欄 1 つ（打った文字を持ち、読めなければ欄の下に誤りを出して、確かめ・作るを止める）。 */
 function NumberField({
+  field,
   label,
   value,
   min,
   placeholder,
   onChange,
 }: {
+  field: string;
   label: string;
   value: number | null;
   min: number;
@@ -74,6 +77,9 @@ function NumberField({
   onChange: (v: number | null) => void;
 }) {
   const id = useId();
+  const [text, setText] = useState(value === null ? '' : String(value));
+  const parsed = readSheetNumber(text, min);
+  const bad = parsed === undefined;
   return (
     <div className={styles.numberField}>
       <label htmlFor={id} className={styles.label}>
@@ -83,13 +89,21 @@ function NumberField({
         id={id}
         className={styles.seconds}
         inputMode="numeric"
-        defaultValue={value ?? ''}
+        value={text}
         placeholder={placeholder}
+        aria-invalid={bad || undefined}
         onChange={(e) => {
+          setText(e.target.value);
           const n = readSheetNumber(e.target.value, min);
+          setMergeFieldValid(field, n !== undefined);
           if (n !== undefined) onChange(n);
         }}
       />
+      {bad && (
+        <span className={styles.error} role="alert">
+          {t.numberInvalid(formatCount(min), formatCount(MAX_SHEET_NUMBER))}
+        </span>
+      )}
     </div>
   );
 }
@@ -112,10 +126,12 @@ export function MergeSheet() {
   const precheck = useMergeStore((s) => s.precheck);
   const error = useMergeStore((s) => s.error);
   const starting = useMergeStore((s) => s.starting);
+  const stale = useMergeStore((s) => s.stale);
+  const invalid = useMergeStore((s) => s.invalid);
   const titleId = useId();
   const nameId = useId();
   const colorId = useId();
-  if (phase === 'closed' || phase === 'preparing') return null;
+  if (phase === 'closed') return null;
   const sheet = precheck?.sheet ?? null;
   const n = precheck?.apply.length ?? 0;
   const validName = validNameTemplate(name);
@@ -141,6 +157,7 @@ export function MergeSheet() {
           </div>
           <div className={styles.numberRow}>
             <NumberField
+              field="columns"
               label={t.columns}
               value={columns}
               min={1}
@@ -148,6 +165,7 @@ export function MergeSheet() {
               onChange={(v) => setMergeParams({ columns: v })}
             />
             <NumberField
+              field="gapX"
               label={`${t.gapX}（${t.px}）`}
               value={gapX}
               min={0}
@@ -155,6 +173,7 @@ export function MergeSheet() {
               onChange={(v) => setMergeParams({ gapX: v ?? 0 })}
             />
             <NumberField
+              field="gapY"
               label={`${t.gapY}（${t.px}）`}
               value={gapY}
               min={0}
@@ -226,6 +245,12 @@ export function MergeSheet() {
               </p>
             )}
           </div>
+          {phase === 'preparing' && (
+            <div className={styles.checking} role="status">
+              <span>{ja.batch.preparing}</span>
+              <ProgressBar value={null} label={ja.batch.preparing} />
+            </div>
+          )}
           {phase === 'checking' && (
             <div className={styles.checking} role="status">
               <span>
@@ -284,7 +309,15 @@ export function MergeSheet() {
           <Button onClick={closeMerge}>{ja.batch.cancel}</Button>
           <Button
             variant="primary"
-            disabled={phase !== 'ready' || n === 0 || starting || !validName || !sheet}
+            disabled={
+              phase !== 'ready' ||
+              n === 0 ||
+              starting ||
+              stale ||
+              invalid.length > 0 ||
+              !validName ||
+              !sheet
+            }
             onClick={() => void startMergeJob()}
           >
             {t.start(formatCount(n))}

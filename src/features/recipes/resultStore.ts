@@ -30,6 +30,11 @@ async function load(job: number): Promise<void> {
     const result = await batchResult(job);
     if (mine !== opened) return;
     useResultStore.setState({ result, error: null });
+    // カプセルの写しもそろえる（古い写しで、シートの新しい結果を上書きしない）
+    useBatchJobsStore.setState((s) => {
+      const known = s.jobs[job];
+      return known ? { jobs: { ...s.jobs, [job]: { ...known, result } } } : s;
+    });
   } catch (error) {
     if (mine !== opened) return;
     useResultStore.setState({ error: error instanceof Error ? error.message : String(error) });
@@ -49,12 +54,12 @@ export function closeResult(): void {
   useResultStore.setState({ job: null, result: null, error: null });
 }
 
-// カプセルが読み直した結果に合わせる（開いている一括だけ）
-useBatchJobsStore.subscribe((s) => {
+// カプセルが新しく読み直した結果に合わせる（開いている一括の写しが変わったときだけ。ほかの一括の進みでは替えない）
+useBatchJobsStore.subscribe((s, before) => {
   const { job } = useResultStore.getState();
   if (job === null) return;
   const result = s.jobs[job]?.result;
-  if (result && result !== useResultStore.getState().result) {
+  if (result && result !== before.jobs[job]?.result) {
     useResultStore.setState({ result });
   }
 });

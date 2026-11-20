@@ -10,6 +10,7 @@ import {
   defaultRecipeName,
   defaultSeconds,
   formatLabel,
+  includedByDefault,
   outputFormat,
   parseSeconds,
   recipeMedia,
@@ -44,9 +45,12 @@ describe('recipeModel', () => {
     expect(recipeMedia([])).toBe('image');
   });
 
-  it('含める操作の既定は、無効・描画・パレットの置き換えを外す', () => {
+  it('含める操作の既定は、作るときは無効・描画・パレットの置き換えを外し、見本で編集では全部含める', () => {
     expect(defaultKeep([flip, grid, paint, off])).toEqual([1, 2]);
     expect(defaultKeep([{ id: 9, op: 'palette.replace', v: 1 }])).toEqual([]);
+    expect(defaultKeep([flip, grid, paint, off], true)).toEqual([1, 2, 3, 4]);
+    expect(includedByDefault(paint)).toBe(false);
+    expect(includedByDefault(paint, true)).toBe(true);
   });
 
   it('名前の既定は操作の名前を 3 つまで → でつなぐ', () => {
@@ -159,12 +163,22 @@ describe('recipeModel', () => {
     expect(out.invalid).toBe(slots[0]?.label);
   });
 
-  it('秒の既定は見本の値をレートで割ったもの（区間は片方の値）', () => {
+  it('秒の既定は見本の値をレートで割ったもの。終わりからは長さから引く（区間は片方の値）', () => {
     const slots = bindSlots([loop, trim], [5, 6]);
     const start = slots.find((s) => s.key === '6:start:');
     const loopEnd = slots.find((s) => s.key === '5:loop:end');
-    expect(start && defaultSeconds(trim, start, 44100)).toBe('0.5');
-    expect(loopEnd && defaultSeconds(loop, loopEnd, 44100)).toBe('2');
-    expect(start && defaultSeconds(trim, start, null)).toBe('0');
+    expect(start && defaultSeconds(trim, start, 'start', 44100, null)).toBe('0.5');
+    expect(loopEnd && defaultSeconds(loop, loopEnd, 'start', 44100, null)).toBe('2');
+    expect(start && defaultSeconds(trim, start, 'start', null, null)).toBe('0');
+    // 終わりから：(長さ − 値) / レート。長さが分からなければ 0
+    expect(start && defaultSeconds(trim, start, 'end', 44100, 88200)).toBe('1.5');
+    expect(loopEnd && defaultSeconds(loop, loopEnd, 'end', 44100, 132300)).toBe('1');
+    expect(start && defaultSeconds(trim, start, 'end', 44100, null)).toBe('0');
+  });
+
+  it('見本の区間がない（ループを消す null）なら、始め・終わりの秒の欄は出さない', () => {
+    const cleared: RecipeNodeLike = { ...loop, params: { loop: null } };
+    const slots = bindSlots([cleared], [5]);
+    expect(slots.map((s) => s.key)).toEqual(['5:loop:']);
   });
 });

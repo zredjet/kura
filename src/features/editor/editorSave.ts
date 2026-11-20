@@ -74,6 +74,7 @@ import {
   editorSession,
   type EditorSave,
   type EditorState,
+  type EditRecipeBinding,
   hasUnsavedChanges,
   type ItemSize,
   onEditorResult,
@@ -597,11 +598,23 @@ export function openSaveRecipe(): void {
 /**
  * レシピを保存し終えた（シートが呼ぶ）：シートを閉じ、見本で編集なら今の頭を保存したことにする。閉じる前の保存なら閉じる。
  */
-export function recipeSaved(closeAfter: AfterClose | null): void {
+export function recipeSaved(
+  closeAfter: AfterClose | null,
+  saved: { bindings: EditRecipeBinding[]; withFormat: boolean; format: string | null },
+): void {
   const s = useEditorStore.getState();
   useEditorStore.setState({
     sheet: null,
-    recipe: s.recipe ? { ...s.recipe, savedHead: s.status?.head ?? null } : null,
+    // 保存した結び付け・形式の選びを覚える（次に開く保存のシートはここから始める）
+    recipe: s.recipe
+      ? {
+          ...s.recipe,
+          savedHead: s.status?.head ?? null,
+          bindings: saved.bindings,
+          withFormat: saved.withFormat,
+          savedFormat: saved.format,
+        }
+      : null,
   });
   if (closeAfter !== null) finishClose();
 }

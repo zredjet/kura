@@ -306,12 +306,24 @@ function ratioPercent(scale: JsonValue): number {
   return Math.round((num * 10_000) / den) / 100;
 }
 
-/** % を比にする（整数の % は 100 分の 1、小数は 1 万分の 1。0 以上）。 */
+/** 最大公約数。 */
+function gcd(a: number, b: number): number {
+  let [x, y] = [Math.abs(a), Math.abs(b)];
+  while (y !== 0) [x, y] = [y, x % y];
+  return x === 0 ? 1 : x;
+}
+
+/** 比の項の上限（Rust の `RATIO_TERM_LIMIT`。分子・分母とも 2^16 まで）。 */
+export const RATIO_TERM_LIMIT = 1 << 16;
+
+/** 比の % の欄の上限（約分できない小数でも分子が上限に収まる 655.36%）。 */
+export const PERCENT_MAX = RATIO_TERM_LIMIT / 100;
+
+/** % を比にする（1 万分の 1 まで。約分して項を小さくする。0 以上、上限まで）。 */
 function percentRatio(n: number): JsonValue {
-  const hundredths = Math.max(0, Math.round(n * 100));
-  return hundredths % 100 === 0
-    ? { num: hundredths / 100, den: 100 }
-    : { num: hundredths, den: 10_000 };
+  const tenThousandths = Math.min(RATIO_TERM_LIMIT * 100, Math.max(0, Math.round(n * 100)));
+  const g = gcd(tenThousandths, 10_000);
+  return { num: tenThousandths / g, den: 10_000 / g };
 }
 
 /** 余白の単位。 */

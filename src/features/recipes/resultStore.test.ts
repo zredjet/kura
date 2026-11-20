@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { askConfirm } from '../../components/Overlay/overlayStore';
 import type { BatchResultDto } from '../../ipc/batch';
+import { batchResult, undoBatch } from '../../ipc/batch';
 import { openApply } from './applyStore';
-import { retryBatch, retryItems } from './resultStore';
+import { useBatchJobsStore } from './batchJobsStore';
+import { openResult, retryBatch, retryItems, undoFromResult, useResultStore } from './resultStore';
 
-vi.mock('../../ipc/batch', () => ({ batchResult: vi.fn(), undoBatch: vi.fn() }));
+vi.mock('../../ipc/batch', () => ({ batchResult: vi.fn(), undoBatch: vi.fn(async () => 99) }));
 vi.mock('./applyStore', () => ({ openApply: vi.fn(async () => undefined) }));
+vi.mock('../../components/Overlay/overlayStore', () => ({ askConfirm: vi.fn() }));
+vi.mock('../../stores/noticeStore', () => ({ notify: vi.fn() }));
 
 function result(over: Partial<BatchResultDto>): BatchResultDto {
   return {
@@ -46,5 +51,36 @@ describe('resultStore', () => {
       mode: 'saveAs',
       nameTemplate: '{名前} 2x',
     });
+  });
+
+  it('［元に戻す…］は確かめてから積み、閉じる。やめたら積まない', async () => {
+    vi.mocked(askConfirm).mockResolvedValueOnce(false);
+    await undoFromResult(result({}));
+    expect(undoBatch).not.toHaveBeenCalled();
+    useResultStore.setState({ job: 8, result: result({}) });
+    vi.mocked(askConfirm).mockResolvedValueOnce(true);
+    await undoFromResult(result({}));
+    expect(undoBatch).toHaveBeenCalledWith(8);
+    expect(useResultStore.getState().job).toBeNull();
+  });
+
+  it('シートの新しい結果を、ほかの一括の進みでカプセルの古い写しに戻さない', async () => {
+    const old = result({ undoAvailable: 1 });
+    const fresh = result({ undoAvailable: 0, undoneBy: [12] });
+    useBatchJobsStore.setState({
+      jobs: { 8: { id: 8, state: 'done', progress: 1, message: null, result: old } },
+    });
+    vi.mocked(batchResult).mockResolvedValueOnce(fresh);
+    openResult(8);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(useResultStore.getState().result).toBe(fresh);
+    // 別の一括の進みでストアが変わる
+    useBatchJobsStore.setState((st) => ({
+      jobs: {
+        ...st.jobs,
+        9: { id: 9, state: 'running', progress: 0.5, message: null, result: null },
+      },
+    }));
+    expect(useResultStore.getState().result).toBe(fresh);
   });
 });

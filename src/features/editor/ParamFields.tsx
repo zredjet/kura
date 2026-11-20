@@ -31,6 +31,8 @@ import {
   makeLength,
   makeMargin,
   type MarginMode,
+  PERCENT_MAX,
+  RATIO_TERM_LIMIT,
   numberRange,
   numbers,
   paramLabel,
@@ -503,6 +505,9 @@ function LengthParam({
   );
 }
 
+/** 余白の px の上限（Rust の Margin::Px は ±2^31）。 */
+const MARGIN_PX_LIMIT = 2 ** 31;
+
 /** 余白 1 辺：「px｜%」と数（px は負で削る）。M14 段 7。 */
 function MarginParam({ label, value, send }: { label: string; value: JsonValue; send: Send }) {
   const id = useId();
@@ -525,8 +530,8 @@ function MarginParam({ label, value, send }: { label: string; value: JsonValue; 
         <NumberInput
           id={id}
           value={m.n}
-          min={m.mode === 'px' ? null : 0}
-          max={null}
+          min={m.mode === 'px' ? -MARGIN_PX_LIMIT : 0}
+          max={m.mode === 'px' ? MARGIN_PX_LIMIT : PERCENT_MAX}
           integer={m.mode === 'px'}
           step={1}
           stepBase={m.mode === 'px' ? undefined : 0}
@@ -576,7 +581,9 @@ function CanvasLengthParam({
             id={id}
             value={c.n}
             min={c.mode === 'percent' ? 0.01 : 1}
-            max={null}
+            max={
+              c.mode === 'percent' ? PERCENT_MAX : c.mode === 'multipleOf' ? RATIO_TERM_LIMIT : null
+            }
             integer={c.mode !== 'percent'}
             step={1}
             stepBase={c.mode === 'percent' ? 0 : undefined}

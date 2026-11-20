@@ -7,6 +7,7 @@ import { askConfirm, askPick, type PickerOption } from '../../components/Overlay
 import { ja } from '../../i18n/ja';
 import { pickRecipeFile, pickRecipeSaveLocation } from '../../ipc/dialogs';
 import { getItems, type ItemSummaryDto, queryIds } from '../../ipc/items';
+import { kindWord } from '../../ipc/kinds';
 import {
   deleteRecipe,
   duplicateRecipe,
@@ -113,18 +114,22 @@ export async function importRecipeAction(path?: string): Promise<void> {
   }
 }
 
-/** 見本の候補（名前で探す。空ならすべての一覧の先頭。レシピと同じ種類で、ゴミ箱でないもの）。 */
+/** 見本の候補の問い合わせ（種類で絞り、利用者の語を足す。種類の語は kinds.ts から。FilterBar と同じ組み方）。 */
+export function sampleQuery(media: RecipeMedia, query: string): string {
+  return [`種類:${kindWord(media)}`, query.trim()].filter(Boolean).join(' ');
+}
+
+/** 見本の候補（名前で探す。レシピと同じ種類でゴミ箱にないもの。すべての一覧の並びの先頭 40 件）。 */
 export async function sampleOptions(
   media: RecipeMedia,
   query: string,
 ): Promise<PickerOption<ItemSummaryDto>[]> {
-  const ids = await queryIds({ kind: 'all' }, { query: query.trim() || undefined });
-  const head = Array.from(ids.ids.slice(0, 120));
+  const ids = await queryIds({ kind: 'all' }, { query: sampleQuery(media, query) });
+  const head = Array.from(ids.ids.slice(0, 40));
   if (head.length === 0) return [];
   const items = await getItems(head);
   return items
     .filter((item) => item.kind === media)
-    .slice(0, 40)
     .map((item) => ({
       key: String(item.id),
       label: item.title,

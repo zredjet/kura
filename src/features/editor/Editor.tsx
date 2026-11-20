@@ -110,16 +110,18 @@ function RecipeSaveControls() {
   const ready = useEditorStore((s) => s.phase === 'open' && !s.pendingSteps && !s.sheet);
   return (
     <div className={styles.saveArea}>
-      <button
-        type="button"
-        className={styles.saveButton}
-        data-recipe=""
-        title={t.saveKey}
-        disabled={!ready}
-        onClick={() => requestSave()}
-      >
-        <span className={styles.saveLabel}>{ja.recipeEditor.save}</span>
-      </button>
+      <div className={styles.saveGroup}>
+        <button
+          type="button"
+          className={styles.saveButton}
+          data-recipe=""
+          title={t.saveKey}
+          disabled={!ready}
+          onClick={() => requestSave()}
+        >
+          <span className={styles.saveLabel}>{ja.recipeEditor.save}</span>
+        </button>
+      </div>
     </div>
   );
 }

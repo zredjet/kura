@@ -38,6 +38,11 @@ interface ApplyState {
   mode: ApplyMode;
   nameTemplate: string;
   includeDrafts: boolean;
+  /**
+   * 保存していない下書きのあるアイテムの数（上書きで、下書きを含めずに確かめたときの Draft の群。含めて確かめ直すと群が
+   * なくなるので、前の数を使い回す）。
+   */
+  draftCount: number;
   /** 確かめの進み。 */
   done: number;
   total: number;
@@ -56,6 +61,7 @@ const CLOSED: Omit<ApplyState, never> = {
   mode: 'overwrite',
   nameTemplate: DEFAULT_SAVE_AS_NAME,
   includeDrafts: false,
+  draftCount: 0,
   done: 0,
   total: 0,
   precheck: null,
@@ -82,27 +88,40 @@ function listen(): void {
   });
 }
 
-/** 選んだもの（アイテムとユニット）をアイテムの列に広げる（選んだ順。重なりは最初のものだけ）。 */
-export async function expandEntries(
-  entries: readonly number[],
-): Promise<{ items: number[]; hadUnits: boolean }> {
+/** 一度に読むユニットの数（広げる問い合わせを並べる数）。 */
+const EXPAND_CHUNK = 16;
+
+/**
+ * 選んだもの（アイテムとユニット）をアイテムの列に広げる（選んだ順。ユニットは中の並び。重なりは最初のものだけ）。
+ * `origins` は広げたアイテムがどの選んだもの（ユニットの印）から来たか（一覧の並びで並べ直すときに使う）。
+ */
+export async function expandEntries(entries: readonly number[]): Promise<{
+  items: number[];
+  hadUnits: boolean;
+  origins: Map<number, number>;
+}> {
+  const units = entries.filter(isUnitEntry);
+  const members = new Map<number, number[]>();
+  for (let i = 0; i < units.length; i += EXPAND_CHUNK) {
+    const chunk = units.slice(i, i + EXPAND_CHUNK);
+    const lists = await Promise.all(
+      chunk.map((entry) => queryIds({ kind: 'unit', id: unitIdOf(entry) })),
+    );
+    chunk.forEach((entry, k) => members.set(entry, Array.from(lists[k]?.ids ?? [])));
+  }
   const seen = new Set<number>();
   const items: number[] = [];
-  let hadUnits = false;
+  const origins = new Map<number, number>();
   for (const entry of entries) {
-    let ids: number[] = [entry];
-    if (isUnitEntry(entry)) {
-      hadUnits = true;
-      ids = Array.from((await queryIds({ kind: 'unit', id: unitIdOf(entry) })).ids);
-    }
-    for (const id of ids) {
+    for (const id of members.get(entry) ?? [entry]) {
       if (!seen.has(id)) {
         seen.add(id);
         items.push(id);
+        origins.set(id, entry);
       }
     }
   }
-  return { items, hadUnits };
+  return { items, hadUnits: units.length > 0, origins };
 }
 
 /** 頼みの形。 */
@@ -150,7 +169,12 @@ async function check(): Promise<void> {
     const precheck = await precheckBatch(mine, request);
     if (token !== mine) return;
     token = null;
-    useApplyStore.setState({ phase: 'ready', precheck });
+    const now = useApplyStore.getState();
+    const draftCount =
+      now.mode === 'overwrite' && !now.includeDrafts
+        ? (precheck.skips.find((g) => g.code === 'Draft')?.items.length ?? 0)
+        : now.draftCount;
+    useApplyStore.setState({ phase: 'ready', precheck, draftCount });
   } catch (error) {
     if (token !== mine) return;
     token = null;

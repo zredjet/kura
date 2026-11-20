@@ -8,6 +8,7 @@ import { getRecipe, type RecipeDto } from '../../ipc/recipes';
 import { relativeDateTime } from '../../lib/dates';
 import { formatCount } from '../../lib/format';
 import { notify } from '../../stores/noticeStore';
+import { useViewStore } from '../../stores/viewStore';
 import { recipeMenu } from '../sidebar/RecipeList';
 import {
   describeRecipe,
@@ -20,6 +21,13 @@ import { useRecipeStore } from './recipeStore';
 import styles from './RecipeView.module.css';
 
 const t = ja.recipes;
+
+/** サイドバーの行で名前を変える（サイドバーを隠していれば出してから）。 */
+function renameInSidebar(id: number): void {
+  const view = useViewStore.getState();
+  if (!view.sidebar) view.toggleSidebar();
+  useRecipeStore.getState().setRenaming(id);
+}
 
 /**
  * レシピの画面（M14 段 7。サイドバーの行を押すとグリッドの代わりに出す）：名前・種類・操作の数・説明（その場で直す）・
@@ -118,7 +126,7 @@ export function RecipeView({ id }: { id: number }) {
                 openMenuBelow(
                   e.currentTarget,
                   ja.recipeMenu.label(recipe.name),
-                  recipeMenu(summary, () => useRecipeStore.getState().setRenaming(recipe.id)),
+                  recipeMenu(summary, () => renameInSidebar(recipe.id)),
                 )
               }
             >

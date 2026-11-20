@@ -11,7 +11,21 @@ import styles from './Recipes.module.css';
 
 const t = ja.batch;
 
-/** 群の行（飛ばした・失敗は最初の行の言葉を読んで添える）。 */
+/** 群の言葉を読む行の数（見えている群だけ。理由が何通りあるかもここから数える）。 */
+const MESSAGE_ROWS = 100;
+
+/** 群の行の言葉を、理由の見出しと添え書きにする（1 通りならその言葉、何通りもあれば最初の言葉とほかの数）。 */
+export function groupNote(messages: readonly (string | null)[]): {
+  first: string | null;
+  note: string | null;
+} {
+  const distinct = [...new Set(messages.filter((m): m is string => !!m))];
+  const first = distinct[0] ?? null;
+  if (distinct.length <= 1) return { first, note: first };
+  return { first, note: `${first}（${t.moreReasons(formatCount(distinct.length - 1))}）` };
+}
+
+/** 群の行（飛ばした・失敗は行の言葉を読んで添える。理由がアイテムごとに違えばそう言う）。 */
 function ResultGroup({
   job,
   group,
@@ -21,24 +35,25 @@ function ResultGroup({
   group: BatchGroupDto;
   action: 'apply' | 'undo' | 'merge';
 }) {
-  const [message, setMessage] = useState<string | null>(null);
+  const [messages, setMessages] = useState<(string | null)[]>([]);
   const needsMessage = group.code !== null;
   useEffect(() => {
     if (!needsMessage) return;
     let alive = true;
-    batchRows(job, { state: group.state, code: group.code ?? undefined }, 0, 1)
+    batchRows(job, { state: group.state, code: group.code ?? undefined }, 0, MESSAGE_ROWS)
       .then((rows) => {
-        if (alive) setMessage(rows[0]?.message ?? null);
+        if (alive) setMessages(rows.map((r) => r.message));
       })
       .catch(() => undefined);
     return () => {
       alive = false;
     };
   }, [job, group.state, group.code, needsMessage]);
+  const { first, note } = groupNote(messages);
   const title = group.code
-    ? `${stateLabel(group.state, action)} · ${codeLabel(group.code, message)}`
+    ? `${stateLabel(group.state, action)} · ${codeLabel(group.code, first)}`
     : stateLabel(group.state, action);
-  return <GroupRow title={title} ids={group.items} note={message} onSelect={closeResult} />;
+  return <GroupRow title={title} ids={group.items} note={note} onSelect={closeResult} />;
 }
 
 /**

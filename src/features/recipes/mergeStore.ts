@@ -28,6 +28,12 @@ interface MergeState {
   phase: 'closed' | 'preparing' | 'checking' | 'ready' | 'error';
   /** 選んだ順に広げたアイテム。 */
   selected: number[];
+  /** 広げたアイテムがどの選んだもの（ユニットの印）から来たか。 */
+  origins: Map<number, number>;
+  /** シートの引数を変えたあと、まだ確かめ直していない（見込みが古い）。 */
+  stale: boolean;
+  /** 読めない数の欄（欄の名前）。あれば確かめず、作れない。 */
+  invalid: string[];
   order: MergeOrder;
   /** 1 行の数（null は自動）。 */
   columns: number | null;
@@ -47,6 +53,9 @@ interface MergeState {
 const CLOSED: MergeState = {
   phase: 'closed',
   selected: [],
+  origins: new Map(),
+  stale: false,
+  invalid: [],
   order: 'selected',
   columns: null,
   gapX: 0,
@@ -84,15 +93,24 @@ function listen(): void {
   });
 }
 
-/** 一覧の並びに並べ替える（一覧にないものは後ろに選んだ順で）。 */
-export function inListOrder(items: readonly number[], list: ArrayLike<number> | null): number[] {
+/**
+ * 一覧の並びに並べ替える（一覧にないものは後ろに選んだ順で）。ユニットから広げたアイテムは、一覧のユニットの印の位置
+ * （`origins`）に並べ、同じユニットの中は広げた順のまま。
+ */
+export function inListOrder(
+  items: readonly number[],
+  list: ArrayLike<number> | null,
+  origins: ReadonlyMap<number, number> = new Map(),
+): number[] {
   if (!list) return [...items];
   const at = new Map<number, number>();
   for (let i = 0; i < list.length; i++) at.set(list[i] as number, i);
-  const inList = items.filter((id) => at.has(id));
-  const rest = items.filter((id) => !at.has(id));
-  inList.sort((a, b) => (at.get(a) ?? 0) - (at.get(b) ?? 0));
-  return [...inList, ...rest];
+  const posOf = (id: number) => at.get(id) ?? at.get(origins.get(id) ?? id);
+  const keyed = items.map((id, i) => ({ id, i, pos: posOf(id) }));
+  const inList = keyed.filter((x) => x.pos !== undefined);
+  const rest = keyed.filter((x) => x.pos === undefined);
+  inList.sort((a, b) => (a.pos ?? 0) - (b.pos ?? 0) || a.i - b.i);
+  return [...inList, ...rest].map((x) => x.id);
 }
 
 /** 名前順（自然な順・日本語の照合。同じ名前は選んだ順）。 */
@@ -108,10 +126,11 @@ export function inNameOrder(
 }
 
 /** 今の並べる順のアイテム。 */
-export function orderedItems(s: Pick<MergeState, 'selected' | 'order'>): number[] {
+export function orderedItems(s: Pick<MergeState, 'selected' | 'order' | 'origins'>): number[] {
   if (s.order === 'name') return byName ?? s.selected;
-  if (s.order === 'list')
-    return inListOrder(s.selected, useLibraryStore.getState().list?.ids ?? null);
+  if (s.order === 'list') {
+    return inListOrder(s.selected, useLibraryStore.getState().list?.ids ?? null, s.origins);
+  }
   return s.selected;
 }
 
@@ -149,6 +168,7 @@ async function check(): Promise<void> {
   listen();
   useMergeStore.setState({
     phase: 'checking',
+    stale: false,
     done: 0,
     total: s.selected.length,
     error: null,
@@ -195,14 +215,14 @@ export async function openMerge(entries: readonly number[]): Promise<void> {
   byName = null;
   useMergeStore.setState({ ...CLOSED, phase: 'preparing' });
   try {
-    const { items } = await expandEntries(entries);
+    const { items, origins } = await expandEntries(entries);
     if (mine !== opened) return;
     if (items.length === 0) {
       useMergeStore.setState({ ...CLOSED });
       notify(ja.merge.nothing);
       return;
     }
-    useMergeStore.setState({ selected: items });
+    useMergeStore.setState({ selected: items, origins });
     await check();
   } catch (error) {
     if (mine !== opened) return;
@@ -234,8 +254,17 @@ export async function setMergeOrder(order: MergeOrder): Promise<void> {
 export function setMergeParams(
   patch: Partial<Pick<MergeState, 'columns' | 'gapX' | 'gapY' | 'fill' | 'anchor'>>,
 ): void {
-  useMergeStore.setState(patch);
-  checkSoon();
+  useMergeStore.setState({ ...patch, stale: true });
+  if (useMergeStore.getState().invalid.length === 0) checkSoon();
+}
+
+/** 数の欄が読めるか（読めない欄があるあいだは確かめず、作れない）。 */
+export function setMergeFieldValid(field: string, valid: boolean): void {
+  const s = useMergeStore.getState();
+  if (valid === !s.invalid.includes(field)) return;
+  const invalid = valid ? s.invalid.filter((f) => f !== field) : [...s.invalid, field];
+  useMergeStore.setState({ invalid });
+  if (valid && invalid.length === 0 && s.stale) checkSoon();
 }
 
 /** 名前の型（確かめの結果は変わらない）。 */
@@ -253,7 +282,15 @@ export function closeMerge(): void {
 /** 一括を積む（積めたらシートを閉じる）。 */
 export async function startMergeJob(): Promise<void> {
   const s = useMergeStore.getState();
-  if (s.phase !== 'ready' || s.starting || !validNameTemplate(s.name)) return;
+  if (
+    s.phase !== 'ready' ||
+    s.starting ||
+    s.stale ||
+    s.invalid.length > 0 ||
+    !validNameTemplate(s.name)
+  ) {
+    return;
+  }
   useMergeStore.setState({ starting: true, error: null });
   try {
     await startMerge(requestOf(s));

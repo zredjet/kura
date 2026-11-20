@@ -46,11 +46,28 @@ function problems(c: BatchCounts): string | null {
   return parts.length > 0 ? parts.join(' · ') : null;
 }
 
-/** 残しておく（自動で消さない）終わり方か：失敗した・飛ばした・失敗した行がある。 */
+/** N → 1 が何を作ったか（saved：作った・existing：同じ中身があった・none：作れなかった）。 */
+function mergeOutcome(result: BatchResultDto | null): 'saved' | 'existing' | 'none' {
+  const groups = result?.groups ?? [];
+  if (groups.some((g) => g.state === 'saved')) return 'saved';
+  if (groups.some((g) => g.state === 'existing')) return 'existing';
+  return 'none';
+}
+
+/**
+ * 残しておく（自動で消さない）終わり方か：失敗した、終わった・中止した一括に飛ばした・失敗した行がある、N → 1 が何も
+ * 作れなかった（利用者の決定 4。ADR-200 (2)）。
+ */
 export function keepsCapsule(job: BatchJob): boolean {
   if (job.state === 'failed') return true;
+  if (job.state !== 'done' && job.state !== 'canceled') return false;
   const c = batchCounts(job.result);
-  return job.state === 'done' && (c.skipped > 0 || c.failed > 0);
+  if (c.skipped > 0 || c.failed > 0) return true;
+  return (
+    job.state === 'done' &&
+    job.result?.action.type === 'merge' &&
+    mergeOutcome(job.result) === 'none'
+  );
 }
 
 /** 一括のジョブのカプセルの内容。 */
@@ -96,11 +113,15 @@ export function batchProgressView(job: BatchJob): ProgressView {
     case 'done': {
       let title: string;
       if (action === 'undo') title = t.undoDone(formatCount(c.applied));
-      else if (action === 'merge')
-        title = (result?.groups ?? []).some((g) => g.state === 'existing')
-          ? t.mergeExisting
-          : t.mergeDone;
-      else title = c.applied > 0 ? t.done(formatCount(c.applied)) : t.doneNone;
+      else if (action === 'merge') {
+        const outcome = mergeOutcome(result);
+        title =
+          outcome === 'saved'
+            ? t.mergeDone
+            : outcome === 'existing'
+              ? t.mergeExisting
+              : t.mergeFailed;
+      } else title = c.applied > 0 ? t.done(formatCount(c.applied)) : t.doneNone;
       return {
         title,
         detail: problems(c),
@@ -126,7 +147,10 @@ export function batchProgressView(job: BatchJob): ProgressView {
             : action === 'merge'
               ? t.mergeCanceled
               : t.canceled(name),
-        detail: c.applied > 0 ? t.canceledDetail(formatCount(c.applied)) : null,
+        detail:
+          [c.applied > 0 ? t.canceledDetail(formatCount(c.applied)) : null, problems(c)]
+            .filter(Boolean)
+            .join(' · ') || null,
         progress: undefined,
         actions: ['result', 'close'],
         finished: true,

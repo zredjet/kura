@@ -43,10 +43,8 @@ function SkipGroups({ groups }: { groups: PrecheckGroupDto[] }) {
 }
 
 /** 確かめの結果。 */
-function PrecheckBody({ precheck, mode }: { precheck: BatchPrecheckDto; mode: ApplyMode }) {
-  const includeDrafts = useApplyStore((s) => s.includeDrafts);
+function PrecheckBody({ precheck }: { precheck: BatchPrecheckDto }) {
   const skipped = precheck.skips.reduce((n, g) => n + g.items.length, 0);
-  const drafts = precheck.skips.find((g) => g.code === 'Draft');
   const examples = precheck.outputs.flatMap((o) => o.examples.map((e) => e.itemId));
   const boundIds = precheck.bound.map((b) => b.itemId);
   const titles = useItemTitles([...examples.slice(0, 6), ...boundIds.slice(0, 3)], 9);
@@ -58,19 +56,6 @@ function PrecheckBody({ precheck, mode }: { precheck: BatchPrecheckDto; mode: Ap
       <p className={styles.counts}>{counts.join(' · ')}</p>
       {precheck.composed.length > 0 && (
         <p className={styles.note}>{t.composed(formatCount(precheck.composed.length))}</p>
-      )}
-      {mode === 'overwrite' && (drafts || includeDrafts) && (
-        <div className={styles.switchRow}>
-          <span className={styles.switchText}>
-            <span>{t.includeDrafts(formatCount(drafts?.items.length ?? 0))}</span>
-            <span className={styles.note}>{t.includeDraftsHint}</span>
-          </span>
-          <Switch
-            checked={includeDrafts}
-            onChange={setIncludeDrafts}
-            aria-label={t.includeDrafts(formatCount(drafts?.items.length ?? 0))}
-          />
-        </div>
       )}
       {precheck.skips.length > 0 && (
         <section className={styles.field} aria-label={t.notApplicable('')}>
@@ -166,11 +151,13 @@ export function ApplySheet() {
   const precheck = useApplyStore((s) => s.precheck);
   const error = useApplyStore((s) => s.error);
   const starting = useApplyStore((s) => s.starting);
+  const includeDrafts = useApplyStore((s) => s.includeDrafts);
+  const draftCount = useApplyStore((s) => s.draftCount);
   const firstId = precheck?.apply[0] ?? null;
   const titles = useItemTitles(firstId === null ? [] : [firstId], 1);
   const titleId = useId();
   const nameId = useId();
-  if (phase === 'closed' || phase === 'preparing') return null;
+  if (phase === 'closed') return null;
   const validName = mode === 'overwrite' || validNameTemplate(nameTemplate);
   const n = precheck?.apply.length ?? 0;
   const firstTitle = firstId === null ? undefined : titles.get(firstId);
@@ -178,7 +165,7 @@ export function ApplySheet() {
     <Dialog labelledBy={titleId} onClose={closeApply} size="md">
       <div className={styles.sheet}>
         <h2 id={titleId} className={styles.title}>
-          {retry ? t.retryTitle(recipeName) : t.title(recipeName)}
+          {!recipeName ? t.apply : retry ? t.retryTitle(recipeName) : t.title(recipeName)}
         </h2>
         <div className={styles.body}>
           <Segmented<ApplyMode>
@@ -217,6 +204,12 @@ export function ApplySheet() {
             </div>
           )}
           {hadUnits && <p className={styles.note}>{t.units}</p>}
+          {phase === 'preparing' && (
+            <div className={styles.checking} role="status">
+              <span>{t.preparing}</span>
+              <ProgressBar value={null} label={t.preparing} />
+            </div>
+          )}
           {phase === 'checking' && (
             <div className={styles.checking} role="status">
               <span>
@@ -230,7 +223,20 @@ export function ApplySheet() {
               {t.checkFailed}：{error}
             </p>
           )}
-          {phase === 'ready' && precheck && <PrecheckBody precheck={precheck} mode={mode} />}
+          {mode === 'overwrite' && (draftCount > 0 || includeDrafts) && (
+            <div className={styles.switchRow}>
+              <span className={styles.switchText}>
+                <span>{t.includeDrafts(formatCount(draftCount))}</span>
+                <span className={styles.note}>{t.includeDraftsHint}</span>
+              </span>
+              <Switch
+                checked={includeDrafts}
+                onChange={setIncludeDrafts}
+                aria-label={t.includeDrafts(formatCount(draftCount))}
+              />
+            </div>
+          )}
+          {phase === 'ready' && precheck && <PrecheckBody precheck={precheck} />}
           {phase === 'ready' && error && (
             <p className={styles.error} role="alert">
               {error}

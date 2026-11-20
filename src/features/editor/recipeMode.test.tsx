@@ -200,9 +200,23 @@ describe('レシピの見本のモード（M14 段 7）', () => {
     requestSave();
     expect(useEditorStore.getState().sheet).toEqual({ kind: 'saveRecipe', closeAfter: null });
     useEditorStore.setState({ status: status({ head: 5 }) });
-    recipeSaved(null);
+    const bindings = [
+      {
+        node: 4,
+        param: 'grid',
+        part: null,
+        from: { type: 'setting' as const, key: 'pivot' as const },
+      },
+    ];
+    recipeSaved(null, { bindings, withFormat: true, format: 'png' });
     expect(useEditorStore.getState().sheet).toBeNull();
-    expect(useEditorStore.getState().recipe?.savedHead).toBe(5);
+    // 保存した結び付け・形式の選びを覚える（次のシートはここから始める）
+    expect(useEditorStore.getState().recipe).toMatchObject({
+      savedHead: 5,
+      bindings,
+      withFormat: true,
+      savedFormat: 'png',
+    });
     await closeEditor({ discardDraft: true });
     expect(discardEditDraft).not.toHaveBeenCalled();
   });
@@ -245,7 +259,7 @@ describe('レシピとして保存のシート', () => {
     expect(useEditorStore.getState().sheet).toBeNull();
   });
 
-  it('見本で編集では名前を聞かず、そのレシピを差し替える（今の結び付けから始める）', async () => {
+  it('見本で編集では名前を聞かず、全部の手を含めて、そのレシピを差し替える（今の結び付けから始める）', async () => {
     vi.mocked(openEditRecipe).mockResolvedValue(opened(RECIPE));
     await openEditor(item, { recipe: 9 });
     await flush();
@@ -260,9 +274,51 @@ describe('レシピとして保存のシート', () => {
     await waitFor(() => expect(replaceRecipe).toHaveBeenCalled());
     expect(replaceRecipe).toHaveBeenCalledWith(9, {
       session: 'aa01',
-      keep: [2, 4],
+      keep: [2, 3, 4],
       withFormat: false,
       bindings: [{ node: 4, param: 'grid', part: null, from: { type: 'setting', key: 'grid' } }],
     });
+    // 保存したら、次のシートは保存した結び付けから始める（2 回目の保存で 1 回目の選びが戻らない）
+    expect(useEditorStore.getState().recipe?.bindings).toEqual([
+      { node: 4, param: 'grid', part: null, from: { type: 'setting', key: 'grid' } },
+    ]);
+  });
+
+  it('シートを開いたあとに応えの届いた手も、既定どおり含める', async () => {
+    vi.mocked(openEditRecipe).mockResolvedValue(opened(RECIPE));
+    await openEditor(item, { recipe: 9 });
+    await flush();
+    useEditorStore.setState({
+      sheet: { kind: 'saveRecipe', closeAfter: null },
+      pendingSteps: true,
+    });
+    const { rerender } = render(<SaveRecipeSheet closeAfter={null} />);
+    expect(screen.getByRole('button', { name: ja.saveRecipe.save })).toBeDisabled();
+    // 応えが届いて手が 1 つ増えた
+    const doc = useEditorStore.getState().doc;
+    useEditorStore.setState({
+      pendingSteps: false,
+      doc: {
+        ...doc,
+        order: [...doc.order, 5],
+        nodes: {
+          ...doc.nodes,
+          5: {
+            id: 5,
+            op: 'image.flip',
+            v: 1,
+            enabled: true,
+            params: { axis: 'vertical' },
+            log: null,
+          },
+        },
+      },
+    });
+    rerender(<SaveRecipeSheet closeAfter={null} />);
+    const boxes = screen.getAllByRole('checkbox');
+    expect(boxes.map((b) => (b as HTMLInputElement).checked)).toEqual([true, true, true, true]);
+    fireEvent.click(screen.getByRole('button', { name: ja.saveRecipe.save }));
+    await waitFor(() => expect(replaceRecipe).toHaveBeenCalled());
+    expect(vi.mocked(replaceRecipe).mock.calls[0]?.[1].keep).toEqual([2, 3, 4, 5]);
   });
 });

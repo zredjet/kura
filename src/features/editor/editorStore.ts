@@ -164,6 +164,14 @@ export interface EditorRecipe {
   withFormat: boolean;
   /** レシピに保存した頭の rev（開いたとき・レシピを保存したとき）。違えば保存していない変更がある。 */
   savedHead: number | null;
+  /** 開いたとき・レシピを保存したときの文書の出力の形式（「元と同じ」は null。見本で形式を変えたかを見る）。 */
+  savedFormat: string | null;
+}
+
+/** 文書の出力の形式（指定していれば。「元と同じ」は null）。 */
+function outputFormatOf(outputs: readonly OutputSpec[] | null | undefined): string | null {
+  const f = outputs?.[0]?.format;
+  return f && f.type === 'to' ? f.format : null;
 }
 
 /** レシピの結び付け（エディタの文書のノード）。 */
@@ -643,6 +651,7 @@ export async function openEditorAs<Tag>(
             bindings: opened.recipe.bindings,
             withFormat: opened.recipe.withFormat,
             savedHead: opened.result.status.head,
+            savedFormat: outputFormatOf(opened.result.doc.outputs),
           }
         : null,
     });

@@ -151,8 +151,10 @@ describe('足す操作', () => {
     expect(readMargin({ px: -3 })).toEqual({ mode: 'px', n: -3 });
     expect(readMargin({ scale: { num: 1, den: 4 } })).toEqual({ mode: 'percent', n: 25 });
     expect(makeMargin('px', 2.6)).toEqual({ px: 3 });
-    expect(makeMargin('percent', 12.5)).toEqual({ scale: { num: 1250, den: 10_000 } });
-    expect(makeMargin('percent', -5)).toEqual({ scale: { num: 0, den: 100 } });
+    expect(makeMargin('percent', 12.5)).toEqual({ scale: { num: 1, den: 8 } });
+    // 約分して項を 2^16 に収める（700.5% は 1401/200）
+    expect(makeMargin('percent', 700.5)).toEqual({ scale: { num: 1401, den: 200 } });
+    expect(makeMargin('percent', -5)).toEqual({ scale: { num: 0, den: 1 } });
     for (const v of ['keep', 'pow2', 'longest'] as const) {
       expect(readCanvasLength(v)).toEqual({ mode: v, n: 0 });
       expect(makeCanvasLength(v, 9)).toBe(v);
@@ -162,7 +164,7 @@ describe('足す操作', () => {
     expect(readCanvasLength({ scale: { num: 2, den: 1 } })).toEqual({ mode: 'percent', n: 200 });
     expect(makeCanvasLength('px', 0)).toEqual({ px: 1 });
     expect(makeCanvasLength('multipleOf', 8)).toEqual({ multipleOf: 8 });
-    expect(makeCanvasLength('percent', 150)).toEqual({ scale: { num: 150, den: 100 } });
+    expect(makeCanvasLength('percent', 150)).toEqual({ scale: { num: 3, den: 2 } });
     expect(canvasDefault('px', 48)).toBe(48);
     expect(canvasDefault('multipleOf', null)).toBe(8);
     const pad = param('image.pad', 'top');

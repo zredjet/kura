@@ -1059,6 +1059,11 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* レシピの見本の「レシピを保存」（▾ がないので左右を同じに。M14 段 7） */
+.saveButton[data-recipe] {
+  padding: 0 var(--space-4);
+}
+
 .saveMore {
   width: 28px;
   padding-right: var(--space-0-5);
