@@ -245,12 +245,17 @@ fn one_batch(
     let queue_ns = seen
         .running
         .map_or(0, |r| r.duration_since(t0).as_nanos() as u64);
+    // 後のジョブ：最初に空になった時刻まで（settle の 2 回目の確かめと眠りは時間に入れない）
     let t1 = Instant::now();
+    if !session.jobs().wait_idle(JOB_WAIT) {
+        return Err("後のジョブが動き終えません".into());
+    }
+    let follow_ns = t1.elapsed().as_nanos() as u64;
     super::settle(session)?;
     Ok(Timed {
         job_ns,
         queue_ns,
-        follow_ns: t1.elapsed().as_nanos() as u64,
+        follow_ns,
     })
 }
 
@@ -265,6 +270,17 @@ fn head_hash(session: &LibrarySession, item: i64) -> Result<[u8; 32], String> {
         .ok_or(format!("アイテム {item} がありません"))
 }
 
+/// E4 で照らす入力の番号：等間隔に `e4` 件。偶数番（Rgba8）と奇数番（Indexed8。`sprite_batch` は番号の偶奇で画素の形式を
+/// 替える）が交互になるようにする（パレットの PNG も照らす）。
+pub(crate) fn e4_indices(items: usize, e4: usize) -> Vec<usize> {
+    let step = (items / e4.max(1)).max(1);
+    let mut out: Vec<usize> = (0..e4.min(items))
+        .map(|k| ((k * step) / 2 * 2 + k % 2).min(items - 1))
+        .collect();
+    out.dedup();
+    out
+}
+
 /// E4 の照らし：`names` の元を新しいライブラリに入れ、エディタで同じ文書を保存して、頭の中身が `expected`（一括の結果）と
 /// 同じか。違う元の名前を返す。
 fn editor_matches(
@@ -274,6 +290,7 @@ fn editor_matches(
     threads: usize,
     names: &[String],
     expected: &BTreeMap<String, [u8; 32]>,
+    keep: bool,
 ) -> Result<Vec<String>, String> {
     let picked = root.join("e4-src");
     std::fs::create_dir_all(&picked).map_err(|e| e.to_string())?;
@@ -330,8 +347,13 @@ fn editor_matches(
     super::settle(&session)?;
     session.close();
     drop(session);
-    let _ = std::fs::remove_dir_all(&lib);
-    let _ = std::fs::remove_dir_all(&picked);
+    // 食い違いを調べられるよう、--keep か食い違いがあれば残す
+    if keep || !mismatched.is_empty() {
+        emit(&format!("  E4 のライブラリ：{}", lib.display()));
+    } else {
+        let _ = std::fs::remove_dir_all(&lib);
+        let _ = std::fs::remove_dir_all(&picked);
+    }
     Ok(mismatched)
 }
 
@@ -438,8 +460,10 @@ fn run_all(opts: &Opts, root: &Path) -> Result<(), String> {
                 ));
                 // E4：最後の回の判定のスレッドの数で
                 if judged && run + 1 == opts.runs {
-                    let step = (opts.items / opts.e4).max(1);
-                    let names: Vec<String> = (0..opts.e4).map(|k| sprite_name(k * step)).collect();
+                    let names: Vec<String> = e4_indices(opts.items, opts.e4)
+                        .into_iter()
+                        .map(sprite_name)
+                        .collect();
                     let expected = names
                         .iter()
                         .map(|n| {
@@ -447,7 +471,8 @@ fn run_all(opts: &Opts, root: &Path) -> Result<(), String> {
                             Ok((n.clone(), head_hash(&session, id)?))
                         })
                         .collect::<Result<BTreeMap<_, _>, String>>()?;
-                    let bad = editor_matches(root, &src, &graph, threads, &names, &expected)?;
+                    let bad =
+                        editor_matches(root, &src, &graph, threads, &names, &expected, opts.keep)?;
                     emit(&format!(
                         "  E4：エディタで保存した {} 件のうち、一括の結果とバイト列が違うもの {} 件",
                         names.len(),
@@ -571,6 +596,21 @@ mod tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    /// E4 の番号は等間隔で、偶数番（Rgba8）と奇数番（Indexed8）を交互に含む。
+    #[test]
+    fn e4_picks_both_pixel_formats() {
+        for (items, e4) in [(1000, 20), (24, 3), (8, 3), (7, 7), (5, 20)] {
+            let picked = e4_indices(items, e4);
+            assert!(picked.iter().all(|&i| i < items), "{items} {e4} {picked:?}");
+            assert!(picked.windows(2).all(|w| w[0] < w[1]), "{picked:?}");
+            if picked.len() >= 2 {
+                assert!(picked.iter().any(|i| i % 2 == 0), "{picked:?}");
+                assert!(picked.iter().any(|i| i % 2 == 1), "{picked:?}");
+            }
+        }
+        assert_eq!(e4_indices(1000, 20)[..4], [0, 51, 100, 151]);
     }
 
     #[test]

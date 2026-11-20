@@ -334,7 +334,9 @@ pub(super) fn bulk(ctx: &mut Ctx, timed: bool, check: bool) -> Result<(), String
                     judged,
                     load,
                 )
-                .with_note("各回の通しの時間。判定は最大"),
+                // M14 段 8 から NFR-14 の判定は一括のジョブの通し（bench batch。ADR-201）。エンジンの中の通しは記録
+                .into_reference()
+                .with_note("各回の通しの時間（エンジンの中の記録。判定は bench batch。ADR-201）"),
             );
         }
         if check && judged {

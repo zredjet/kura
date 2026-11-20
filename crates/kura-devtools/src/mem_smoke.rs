@@ -1501,12 +1501,19 @@ mod tests {
         // 予算の一括の使用量の最大を見張る
         let stop = Arc::new(AtomicBool::new(false));
         let max_bulk = Arc::new(AtomicU64::new(0));
+        let max_waiting = Arc::new(AtomicU64::new(0));
         let watcher = {
-            let (stop, max_bulk, rt) = (stop.clone(), max_bulk.clone(), rt.clone());
+            let (stop, max_bulk, max_waiting, rt) = (
+                stop.clone(),
+                max_bulk.clone(),
+                max_waiting.clone(),
+                rt.clone(),
+            );
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     if let Ok(u) = rt.budget().usage() {
                         max_bulk.fetch_max(u.bulk, Ordering::Relaxed);
+                        max_waiting.fetch_max(u.waiting as u64, Ordering::Relaxed);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
@@ -1578,6 +1585,7 @@ mod tests {
                 "result": result,
                 "failed_codes": codes,
                 "max_bulk_bytes": max_bulk.load(Ordering::Relaxed),
+                "max_waiting": max_waiting.load(Ordering::Relaxed),
                 "seconds": seconds,
             })
         );
@@ -1595,11 +1603,13 @@ mod tests {
         AllTooLarge,
     }
 
-    /// 一括のケース：向き・予算・見込む結果。
+    /// 一括のケース：向き・予算・見込む結果と、予算が足りずに待つはずか。予算で数えた使用量が予算を超えないのは予算の
+    /// 仕組みが守る不変条件なので、それに加えて、一括が予算を通って確保したこと（当てるケース）と待ったことを確かめる。
     struct BatchCase {
         mode: &'static str,
         budget: u64,
         expect: Expect,
+        waits: bool,
     }
 
     /// M14 段 8（NFR-17。利用者の決定 3）：ドット絵の PNG 1,000 件（bench batch・NFR-14 と同じ絵）をアプリの取り込みのジョブで
@@ -1643,26 +1653,31 @@ mod tests {
                 mode: "overwrite",
                 budget: 128 * MIB,
                 expect: Expect::AllSaved,
+                waits: true,
             },
             BatchCase {
                 mode: "save-as",
                 budget: 128 * MIB,
                 expect: Expect::AllSaved,
+                waits: true,
             },
             BatchCase {
                 mode: "merge",
                 budget: 4096 * MIB,
                 expect: Expect::AllSaved,
+                waits: false,
             },
             BatchCase {
                 mode: "overwrite",
                 budget: MIB,
                 expect: Expect::SomeTooLarge,
+                waits: false,
             },
             BatchCase {
                 mode: "merge",
                 budget: 64 * MIB,
                 expect: Expect::AllTooLarge,
+                waits: false,
             },
         ];
         let exe = std::env::current_exe().unwrap();
@@ -1718,12 +1733,18 @@ mod tests {
             let max_bulk = got["max_bulk_bytes"].as_u64().unwrap_or(0);
             let counts = &got["result"]["counts"];
             let n = |k: &str| counts[k].as_u64().unwrap_or(0);
-            // N → 1 は 1 本の単位：行は saved（作った）か existing、失敗なら全部 failed
-            let saved = n("saved") + n("existing");
+            // 当てた行：N → 1 は 1 本の単位で、行は saved（作った）か existing（同じ中身のシートがあった）。1 件ずつの一括は
+            // saved だけ（写したライブラリは毎回まっさらなので、existing は出ないはず）
+            let saved = if case.mode == "merge" {
+                n("saved") + n("existing")
+            } else {
+                n("saved")
+            };
+            let max_waiting = got["max_waiting"].as_u64().unwrap_or(0);
             let label = format!("{}（予算 {:.0} MiB）", case.mode, mib(case.budget));
             eprintln!(
                 "batch {label}: 通し {:.1} MiB（予算 × 1.25 ＋ 4 MiB を {:+.1} MiB）・予算の一括の使用量の最大 {:.1} MiB・\
-                 基準 {:.1} MiB・{} {}・当てた {saved}・失敗 {}（{}）・{:.2} 秒",
+                 待った要求の最大 {max_waiting}・基準 {:.1} MiB・{} {}・当てた {saved}・失敗 {}（{}）・{:.2} 秒",
                 mib(used),
                 (used as f64 - bound(case.budget) as f64) / MIB as f64,
                 mib(max_bulk),
@@ -1746,6 +1767,12 @@ mod tests {
                     mib(max_bulk)
                 ));
             }
+            if case.expect == Expect::AllSaved && max_bulk == 0 {
+                failed.push(format!("{label}: 一括が予算を通って確保していない"));
+            }
+            if case.waits && max_waiting == 0 {
+                failed.push(format!("{label}: 予算が足りずに待った一括の要求を見ない"));
+            }
             if got["state"] != "done" {
                 failed.push(format!("{label}: 一括が終わらない（{}）", got["state"]));
             }
@@ -1757,7 +1784,10 @@ mod tests {
                     failed.push(format!("{label}: 当てた行が {saved} / {items}"));
                 }
                 Expect::SomeTooLarge
-                    if saved + n("failed") != items || n("failed") == 0 || !too_large_only =>
+                    if saved + n("failed") != items
+                        || saved == 0
+                        || n("failed") == 0
+                        || !too_large_only =>
                 {
                     failed.push(format!(
                         "{label}: 入るものを当て、ほかが TooLarge で失敗しない（当てた {saved}・失敗 {}・{codes:?}）",
