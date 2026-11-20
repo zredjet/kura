@@ -56,6 +56,8 @@ pub struct BatchResult {
     /// 別名で作ったアイテム（行の順。消えたものは除く）。
     pub created: Vec<i64>,
     pub undo: UndoInfo,
+    /// ジョブの警告（N → 1 で ICC の違う絵を sRGB とみなした、など。ジョブの結果の `warnings`）。
+    pub warnings: Vec<String>,
 }
 
 /// 状態と理由ごとの群。
@@ -110,11 +112,22 @@ pub fn result(db: &Db, job: JobId) -> Result<BatchResult> {
         },
     };
     db.read(|c| {
-        let state: String = c
-            .prepare_cached("SELECT state FROM jobs WHERE id = ?1")?
-            .query_row([job], |r| r.get(0))
+        let (state, result_json): (String, Option<String>) = c
+            .prepare_cached("SELECT state, result_json FROM jobs WHERE id = ?1")?
+            .query_row([job], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?
             .ok_or_else(|| CoreError::NotFound(format!("ジョブ {job}")))?;
+        let warnings: Vec<String> = result_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+            .and_then(|v| {
+                v.get("warnings").and_then(|w| w.as_array()).map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
         let state = JobState::parse(&state)
             .ok_or_else(|| CoreError::Invalid(format!("ジョブ {job} の状態 {state} を知りません")))?;
         let mut groups: Vec<ResultGroup> = Vec::new();
@@ -179,6 +192,7 @@ pub fn result(db: &Db, job: JobId) -> Result<BatchResult> {
             groups,
             created,
             undo: info,
+            warnings,
         })
     })
 }

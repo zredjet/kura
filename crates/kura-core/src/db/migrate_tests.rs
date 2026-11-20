@@ -1561,6 +1561,20 @@ fn item_sources_0013_adds_a_table_and_keeps_everything_else() {
         plan.contains("USING PRIMARY KEY") && !plan.contains("TEMP B-TREE"),
         "{plan}"
     );
+    // N → 1 の予告の pending の数と、元に戻すの作ったアイテムの行は索引で
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT count(*) FROM batch_items WHERE job_id = 1 AND state = 'pending'",
+    );
+    assert!(
+        plan.contains("USING PRIMARY KEY") && !plan.contains("TEMP B-TREE"),
+        "{plan}"
+    );
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT 0, NULL FROM batch_items b WHERE b.out_item_id = 2 AND b.job_id = 1 AND b.state = 'saved' LIMIT 1",
+    );
+    assert!(plan.contains("idx_batch_items_out_item"), "{plan}");
     let err = |sql: &str| conn.execute(sql, []).unwrap_err().to_string();
     for (sql, name) in [
         (

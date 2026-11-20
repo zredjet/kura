@@ -2951,7 +2951,9 @@ fn expected_sheet(
         values.push(v);
         hashes.push(h.hash);
     }
-    let frames = selection::frames(&values, sheet.anchor, &NoMonitor).unwrap();
+    let frames = selection::frames(&values, sheet, &NoMonitor)
+        .unwrap()
+        .frames;
     let count = frames.frames().len() as u64;
     let g = selection::sheet_graph(sheet, count).unwrap();
     let engine = kura_engine::Engine::new().unwrap();
@@ -3134,6 +3136,18 @@ fn m2_a_crash_while_merging_makes_exactly_one_sheet() {
             })
             .unwrap();
         assert_eq!(sheets, 1, "{at:?}");
+        // 結果は行から読む（コミットのあとに落ちて開き直しても「作りました」）
+        let record = session.jobs().get(job).unwrap();
+        assert_eq!(result_of(&record)["made"], made, "{at:?}");
+        assert!(
+            record
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("作りました"),
+            "{at:?} {:?}",
+            record.message
+        );
         assert_consistent(lib);
         drop(session);
         drop(dir);
@@ -3205,6 +3219,17 @@ fn m4_existing_pause_cancel_and_refusals() {
     let made = env.rows(job)[0].4.unwrap();
     let again = run_merge(&env, &req);
     assert_done(&again);
+    assert_eq!(result_of(&again)["existing"], made);
+    assert!(result_of(&again)["made"].is_null());
+    assert!(
+        again
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("新しく作りませんでした"),
+        "{:?}",
+        again.message
+    );
     for row in env.rows(again.id) {
         assert_eq!(
             (row.1.as_str(), row.2.as_deref(), row.4),
@@ -3232,5 +3257,219 @@ fn m4_existing_pause_cancel_and_refusals() {
         "SELECT count(*) FROM items WHERE id IN (SELECT item_id FROM item_sources)",
     );
     assert_eq!(items, 1);
+    assert_consistent(&env.lib);
+}
+
+/// RGB の PNG を足す（アルファなし。ICC があれば付ける）。
+fn rgb_png(env: &BatchEnv, rgb: [u8; 3], icc: Option<Vec<u8>>, title: &str) -> i64 {
+    let px = kura_engine::value::Raster::filled(6, 4, PixelFormat::Rgb8, None, &rgb).unwrap();
+    let value = kura_engine::Value::Image(Arc::new(kura_engine::value::Image {
+        px,
+        meta: kura_engine::value::ImageMeta {
+            icc: icc.map(Arc::new),
+            ..Default::default()
+        },
+    }));
+    let bytes = CodecSet::pinned()
+        .encode_bytes(&value, "png", &json!({}), &NoMonitor)
+        .unwrap()
+        .0;
+    add_item(&env.lib, &bytes, "png", title).0
+}
+
+/// シートを読み直した値。
+fn sheet_value(env: &BatchEnv, item: i64) -> kura_engine::Value {
+    let h = head(&env.lib, item);
+    let limits = env.engine.runtime().unwrap().bulk(|e| e.limits().clone());
+    CodecSet::pinned()
+        .decode_path(
+            &env.lib.layout().content_path(&h.hash, &h.ext),
+            "png",
+            &DecodeOptions::default(),
+            &limits,
+            &NoMonitor,
+        )
+        .unwrap()
+        .0
+}
+
+/// M5：アルファのない絵（RGB）だけでも、透明の fill を指定すればシートを作れる（形式を広げる）。すべての元の ICC が同じなら
+/// シートに運び、違えば持たずに警告を結果に残す。
+#[test]
+fn m5_fill_widens_and_the_icc_is_carried_when_shared() {
+    let env = BatchEnv::new();
+    let icc = vec![9u8; 200];
+    let a = rgb_png(&env, [10, 20, 30], Some(icc.clone()), "赤");
+    let b = rgb_png(&env, [40, 50, 60], Some(icc.clone()), "青");
+    let sheet = kura_engine::selection::SheetParams {
+        fill: Some([0, 0, 0, 0]),
+        gap_x: 2,
+        ..Default::default()
+    };
+    let record = run_merge(&env, &merge_req(&[a, b], sheet));
+    assert_done(&record);
+    let made = result_of(&record)["made"].as_i64().unwrap();
+    let kura_engine::Value::Image(img) = sheet_value(&env, made) else {
+        panic!()
+    };
+    assert_eq!(img.px.format(), PixelFormat::Rgba8);
+    assert_eq!(img.px.pixel(6, 0), Some(&[0, 0, 0, 0][..]), "間隔は透明");
+    assert_eq!(img.meta.icc.as_deref(), Some(&icc));
+    assert!(
+        super::batch::result(env.lib.db(), record.id)
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
+    // ICC が違えば持たず、警告を残す
+    let c = rgb_png(&env, [70, 80, 90], None, "緑");
+    let record = run_merge(&env, &merge_req(&[a, c], Default::default()));
+    assert_done(&record);
+    let made = result_of(&record)["made"].as_i64().unwrap();
+    let kura_engine::Value::Image(img) = sheet_value(&env, made) else {
+        panic!()
+    };
+    assert_eq!(img.meta.icc, None);
+    let warnings = super::batch::result(env.lib.db(), record.id)
+        .unwrap()
+        .warnings;
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("sRGB"), "{warnings:?}");
+    assert_consistent(&env.lib);
+}
+
+/// M6：N → 1 が待っている間も、並べる元は開ける・保存できる（元を読むだけ。読むのは処理するときの今で、来歴に残る）。
+#[test]
+fn m6_a_pending_merge_does_not_block_its_sources() {
+    let env = BatchEnv::with(None, None, false);
+    let ids: Vec<i64> = (1..=2).map(|k| env.png(k).0).collect();
+    let job = super::batch::start_merge(&env.jobs, &merge_req(&ids, Default::default())).unwrap();
+    for id in &ids {
+        let id = *id;
+        assert_eq!(
+            env.lib
+                .db()
+                .read(move |c| super::save::pending_save(c, id))
+                .unwrap(),
+            None
+        );
+    }
+    env.jobs.start().unwrap();
+    overwrite(&env, ids[0], doc(&[flip("vertical")], None));
+    assert!(env.jobs.wait_idle(WAIT));
+    assert_done(&env.jobs.get(job).unwrap());
+    let made = env.rows(job)[0].4.unwrap();
+    // 来歴は読んだときの頭（保存のあとなら版 1、前なら版 0）
+    let src = sources_of(&env.lib, made);
+    assert_eq!(src.len(), 2);
+    assert!(matches!(src[0].1, 0 | 1), "{src:?}");
+    assert_eq!(src[1].1, 0);
+    assert_consistent(&env.lib);
+}
+
+/// M7：N → 1 は保存のジョブに譲る（読む途中に保存が積まれたら止めて待ちに戻り、保存のあとに読み直して 1 枚だけ作る）。
+#[test]
+fn m7_a_merge_yields_to_a_save() {
+    let saw_queued = Arc::new(AtomicBool::new(false));
+    let slot: Arc<Mutex<Option<Weak<JobManager>>>> = Arc::default();
+    let fired = Arc::new(AtomicBool::new(false));
+    let env = {
+        let (slot, fired) = (slot.clone(), fired.clone());
+        BatchEnv::build(
+            None,
+            None,
+            true,
+            Hooks {
+                prepare: Some(Arc::new(move |_lib: &Library, _item| {
+                    if !fired.swap(true, Ordering::SeqCst)
+                        && let Some(jobs) = slot.lock().unwrap().as_ref().and_then(Weak::upgrade)
+                    {
+                        jobs.enqueue(JobKind::Edit, "{}".into()).unwrap();
+                        // 見張りが譲る指示を読むまで待つ（読む途中で止まるように）
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                })),
+                edit: Some(Arc::new(WaitsForTheBatch {
+                    saw_queued: saw_queued.clone(),
+                })),
+                ..Hooks::default()
+            },
+        )
+    };
+    *slot.lock().unwrap() = Some(Arc::downgrade(&env.jobs));
+    let ids: Vec<i64> = (1..=4).map(|k| env.png(k).0).collect();
+    let record = run_merge(&env, &merge_req(&ids, Default::default()));
+    assert_done(&record);
+    assert!(saw_queued.load(Ordering::SeqCst), "N → 1 が譲らなかった");
+    let log = std::fs::read_to_string(env.lib.layout().job_log_path(record.id)).unwrap();
+    assert!(log.contains("ほかのジョブに譲るため中断"), "{log}");
+    let sheets = count(&env.lib, "SELECT count(DISTINCT item_id) FROM item_sources");
+    assert_eq!(sheets, 1);
+    assert!(env.rows(record.id).iter().all(|r| r.1 == "saved"));
+    assert_consistent(&env.lib);
+}
+
+/// M8：シートの引数（間隔・1 行の数）は積む前と事前チェックで確かめる（Invalid）。画像でも音声でもない元は N → 1 の言葉で飛ばす。
+/// 事前チェックの 1 行の数は実際に並ぶ数。
+#[test]
+fn m8_sheet_params_are_checked_before_queueing() {
+    let env = BatchEnv::new();
+    let (a, _) = env.png(1);
+    let (video, _) = add_item(&env.lib, b"fake movie bytes", "mp4", "動画");
+    env.lib
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE items SET kind = 'video', proxy_state = 'pending', analysis_state = 'not_needed' WHERE id = ?1",
+                [video],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let bad = kura_engine::selection::SheetParams {
+        gap_x: kura_engine::selection::MAX_GAP + 1,
+        ..Default::default()
+    };
+    assert!(matches!(
+        super::batch::start_merge(&env.jobs, &merge_req(&[a], bad)),
+        Err(crate::CoreError::Invalid(_))
+    ));
+    let canceled = AtomicBool::new(false);
+    let progress = |_: u64, _: u64| {};
+    let cx = PrecheckCx {
+        canceled: &canceled,
+        progress: &progress,
+    };
+    assert!(matches!(
+        super::batch::precheck_merge(&env.lib, &env.engine, &merge_req(&[a], bad), &cx),
+        Err(crate::CoreError::Invalid(_))
+    ));
+    let p = super::batch::precheck_merge(
+        &env.lib,
+        &env.engine,
+        &merge_req(&[a, video], Default::default()),
+        &cx,
+    )
+    .unwrap();
+    assert_eq!(p.skips.len(), 1);
+    assert!(
+        p.skips[0].message.contains("スプライトシートにできません"),
+        "{:?}",
+        p.skips[0]
+    );
+    let p = super::batch::precheck_merge(
+        &env.lib,
+        &env.engine,
+        &merge_req(
+            &[a],
+            kura_engine::selection::SheetParams {
+                columns: Some(8),
+                ..Default::default()
+            },
+        ),
+        &cx,
+    )
+    .unwrap();
+    assert_eq!(p.sheet.unwrap().columns, 1);
     assert_consistent(&env.lib);
 }

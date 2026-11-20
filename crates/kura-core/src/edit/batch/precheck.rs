@@ -342,6 +342,9 @@ pub fn precheck_merge(
     if req.name.trim().is_empty() {
         return Err(CoreError::Invalid("シートの名前が空です".into()));
     }
+    req.sheet
+        .validate()
+        .map_err(|e| crate::edit::from_engine("シートの引数が正しくありません", e))?;
     let (items, missing) = split_missing(db, &req.items, "並べる")?;
     let check = |item: i64| -> Result<PieceVerdict> {
         let head = match merge_skip(engine, db, item) {
@@ -405,7 +408,8 @@ pub fn precheck_merge(
     if go.is_empty() {
         return Ok(out);
     }
-    let pieces: Vec<(Shape, &'static str)> = go.iter().map(|(_, s, f, _)| (*s, *f)).collect();
+    let pieces: Vec<(Shape, &'static str, u64)> =
+        go.iter().map(|(_, s, f, z)| (*s, *f, *z)).collect();
     match plan_sheet(engine, &pieces, &req.sheet) {
         Ok(sp) => {
             let (first, first_shape) = (go[0].0, go[0].1);

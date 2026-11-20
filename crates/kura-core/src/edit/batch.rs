@@ -412,12 +412,15 @@ pub(crate) fn insert_rows(
     Ok(ord)
 }
 
-/// アイテム `item_id` を待っている（pending の行のある、終わっていない）一括のジョブ（`idx_batch_items_item`）。
+/// アイテム `item_id` を待っている（pending の行のある、終わっていない）一括のジョブ（`idx_batch_items_item`）。N → 1 は元を読むだけ
+/// なので数えない（並べている元も開ける・保存できる。読むのはそのときの今の中身で、来歴に読んだ版と中身が残る。M14 段 6 の
+/// 検証のあとの利用者の決定。ADR-198）。
 pub fn pending_batch(conn: &Connection, item_id: i64) -> Result<Option<JobId>> {
     Ok(conn
         .prepare_cached(
             "SELECT b.job_id FROM batch_items b JOIN jobs j ON j.id = b.job_id
               WHERE b.item_id = ?1 AND b.state = 'pending' AND j.state IN ('queued', 'running', 'paused')
+                AND json_extract(j.input_json, '$.mode.type') IS NOT 'merge'
               ORDER BY b.job_id LIMIT 1",
         )?
         .query_row([item_id], |r| r.get(0))
