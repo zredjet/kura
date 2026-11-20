@@ -111,9 +111,8 @@ pub(crate) fn fill_v11(conn: &Connection) {
     conn.execute_batch(&sql).unwrap();
 }
 
-/// 最新の版で足した表（[`fill_v11`] の表と、0012 のレシピ・一括の対象）にも行を入れる。`fill_v6` のあとに使う（表を足したら
-/// ここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
-pub(crate) fn fill_latest(conn: &Connection) {
+/// 版 12 で足した表（[`fill_v11`] の表と、0012 のレシピ・一括の対象）にも行を入れる。`fill_v6` のあとに、版 12 以降の DB に使う。
+pub(crate) fn fill_v12(conn: &Connection) {
     fill_v11(conn);
     conn.execute_batch(
         "INSERT INTO edit_recipes (id, name, description, kind, doc_id, bindings, pos, created_at, updated_at)
@@ -122,6 +121,17 @@ pub(crate) fn fill_latest(conn: &Connection) {
                                   code, message, finished_at)
            VALUES (10, 0, 4, 'saved', 0, x'04', 0, 2, NULL, NULL, NULL, 90),
                   (10, 1, 2, 'pending', 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
+    )
+    .unwrap();
+}
+
+/// 最新の版で足した表（[`fill_v12`] の表と、0013 の N → 1 の来歴）にも行を入れる。`fill_v6` のあとに使う（表を足したら
+/// ここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
+pub(crate) fn fill_latest(conn: &Connection) {
+    fill_v12(conn);
+    conn.execute_batch(
+        "INSERT INTO item_sources (item_id, ord, source_item_id, source_version, source_hash, frames, created_at)
+           VALUES (2, 0, 4, 1, x'04', 1, 95), (2, 1, NULL, 0, x'09', 3, 95);",
     )
     .unwrap();
 }

@@ -478,7 +478,8 @@ mod tests {
                 "0009_analysis",
                 "0010_items_blob_id",
                 "0011_edit_versions",
-                "0012_batch"
+                "0012_batch",
+                "0013_item_sources"
             ]
         );
         // 当てたあとの WAL は空

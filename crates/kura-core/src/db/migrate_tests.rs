@@ -1496,6 +1496,116 @@ fn batch_0012_adds_tables_and_keeps_everything_else() {
     }
 }
 
+const V13: usize = 13;
+
+/// 0013：N → 1 の来歴の表を足す。既存の表の行・索引・トリガ・FTS は同じ。外部キーの向き（作ったアイテムは CASCADE、元の
+/// アイテムは SET NULL）、子の列の索引、名前付きの CHECK、作ったアイテムの元を順に引く問い合わせ。
+#[test]
+fn item_sources_0013_adds_a_table_and_keeps_everything_else() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, V13 - 1).unwrap();
+    crate::db::testing::fill_v12(&conn);
+    for table in ["item_versions", "edit_recipes", "batch_items"] {
+        assert!(
+            one::<i64>(&conn, &format!("SELECT count(*) FROM {table}")) > 0,
+            "{table}"
+        );
+    }
+    assert_eq!(MIGRATIONS[V13 - 1].name, "0013_item_sources");
+    assert_eq!(MIGRATIONS[V13 - 1].kind, Kind::Plain);
+    let before = snapshot(&conn);
+    migrate_until(&mut conn, V13).unwrap();
+    let after = snapshot(&conn);
+    for (key, value) in &before {
+        assert_eq!(after.get(key), Some(value), "{key} が変わった");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(
+        added,
+        vec!["index idx_item_sources_source", "table item_sources"]
+    );
+    assert!(violations(&conn).unwrap().is_empty());
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.\"from\", f.\"table\", f.\"to\", f.on_delete
+               FROM pragma_foreign_key_list('item_sources') f ORDER BY f.\"from\"",
+        )
+        .unwrap();
+    let fks: Vec<String> = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "{} → {}.{} {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        fks,
+        vec![
+            "item_id → items.id CASCADE",
+            "source_item_id → items.id SET NULL"
+        ]
+    );
+    let plan = crate::db::query_plan(&conn, "SELECT 1 FROM item_sources WHERE source_item_id = 1");
+    assert!(plan.contains("idx_item_sources_source"), "{plan}");
+    let plan = crate::db::query_plan(
+        &conn,
+        "SELECT source_item_id, frames FROM item_sources WHERE item_id = 1 ORDER BY ord",
+    );
+    assert!(
+        plan.contains("USING PRIMARY KEY") && !plan.contains("TEMP B-TREE"),
+        "{plan}"
+    );
+    let err = |sql: &str| conn.execute(sql, []).unwrap_err().to_string();
+    for (sql, name) in [
+        (
+            "INSERT INTO item_sources (item_id, ord, source_item_id, source_version, source_hash, frames, created_at)
+             VALUES (1, -1, NULL, 0, x'01', 1, 1)",
+            "item_sources_ord",
+        ),
+        (
+            "INSERT INTO item_sources (item_id, ord, source_item_id, source_version, source_hash, frames, created_at)
+             VALUES (1, 0, NULL, 0, x'01', 0, 1)",
+            "item_sources_frames",
+        ),
+    ] {
+        let e = err(sql);
+        assert!(e.contains(name), "{sql}: {e}");
+    }
+    // 元のアイテムを消すと NULL、作ったアイテムを消すと行も消える
+    let made: i64 = one(&conn, "SELECT min(id) FROM items");
+    let source: i64 = one(&conn, "SELECT max(id) FROM items");
+    conn.execute(
+        "INSERT INTO item_sources (item_id, ord, source_item_id, source_version, source_hash, frames, created_at)
+         VALUES (?1, 0, ?2, 0, x'01', 1, 1)",
+        [made, source],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM items WHERE id = ?1", [source])
+        .unwrap();
+    assert_eq!(
+        one::<Option<i64>>(
+            &conn,
+            &format!("SELECT source_item_id FROM item_sources WHERE item_id = {made}")
+        ),
+        None
+    );
+    conn.execute("DELETE FROM items WHERE id = ?1", [made])
+        .unwrap();
+    assert_eq!(
+        one::<i64>(
+            &conn,
+            &format!("SELECT count(*) FROM item_sources WHERE item_id = {made}")
+        ),
+        0
+    );
+}
+
 /// 0012 の外部キーの向き：対象のアイテムを消すと行も消え（ADR-192 (4)）、別名で作ったアイテム・版を消すと NULL になる。
 #[test]
 fn batch_items_follow_the_items_and_versions() {
