@@ -206,13 +206,50 @@ fn svg_worker_command() -> Option<WorkerCommand> {
 
 /// テストのハーネス（`target/<profile>/deps/kura_devtools-…`）は働き手になれないので、cargo が隣に作る実行ファイル
 /// （`target/<profile>/kura-devtools`。結合テスト `tests/svg_worker.rs` が使うので `cargo test -p kura-devtools` で作られる）を
-/// 働き手にする。なければ（単体テストだけを組んだとき）SVG はプロセスの中で読む。
+/// 働き手にする。なければ（単体テストだけを組んだとき）SVG はプロセスの中で読む。渡す前に、プロセスで 1 度だけ温める
+/// （[`warm_up_svg_worker`]）。
 #[cfg(test)]
 fn svg_worker_command() -> Option<WorkerCommand> {
+    static WARMED: std::sync::Once = std::sync::Once::new();
     let exe = std::env::current_exe().ok()?;
     let bin = exe.parent()?.parent()?.join("kura-devtools");
-    bin.is_file()
-        .then(|| WorkerCommand::new(bin, [svg_worker::WORKER_ARG]))
+    if !bin.is_file() {
+        return None;
+    }
+    WARMED.call_once(|| {
+        if let Err(e) = warm_up_svg_worker(&bin) {
+            tracing::warn!("SVG の働き手を温められません（そのまま使います）: {e}");
+        }
+    });
+    Some(WorkerCommand::new(bin, [svg_worker::WORKER_ARG]))
+}
+
+/// テストの働き手を温めるのを待つ上限（kura-core と結合テストの `tests/svg_worker.rs` が値の一致を確かめるときの上限と同じ）。
+#[cfg(test)]
+const WARM_UP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// テストの働き手 `bin` を、頼みを送らずに 1 度起こして終わるのを待つ（頼みが読めないエラーを返してすぐ終わる）。
+///
+/// macOS は、新しい実行ファイル（ビルドし直すたびに新しくなる）を最初に起動するとき、動かす前に確かめる。このデバッグの
+/// 実行ファイルで約 1 秒、確かめはシステムで 1 つずつなので、ほかのビルド・テストが新しい実行ファイルを起動していると
+/// その数だけ待つ（6 つ同時で 3〜8 秒）。待つのは起動（`spawn`）が戻ったあとなので、働き手の時間の上限（形は 2 秒）に
+/// 数えられ、最初に読む SVG が「SVG を読むのに時間がかかりすぎます」で失敗になる（`assets` の形式の網羅のテストの
+/// text.svg。全体の実行でときどき落ちた）。アプリの働き手は動いている自分の実行ファイルなので、この待ちはない。時間の
+/// 上限はアプリと同じのまま、ここで最初の起動を済ませる（kura-core の `tests/svg_worker.rs` も、時間を測る前に温める）。
+#[cfg(test)]
+fn warm_up_svg_worker(bin: &std::path::Path) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg(svg_worker::WORKER_ARG);
+    let out = kura_core::tools::run_with_timeout(&mut cmd, WARM_UP_TIMEOUT)
+        .map_err(|e| format!("{} を起動できません: {e}", bin.display()))?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(format!(
+            "{} が答えずに終わりました（{}）",
+            bin.display(),
+            out.status
+        ));
+    }
+    Ok(())
 }
 
 /// アプリと同じ渡しもの（メディアの実装・エンジンの部品・DB を新しい版にするときの空きの確かめ）。知らせはログに出す。
@@ -412,29 +449,40 @@ mod tests {
                 heic.read
             );
             let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40"><text x="4" y="30" font-family="sans-serif" font-size="24">Kq</text></svg>"##;
-            // 働き手の形の上限（2 秒）は release の実測から決めたもので、debug のテストを全体で並べて回すと書体の読み込みが
-            // 超えることがある（ワークスペースのテストで 2 度落ちた）。時間切れのときだけ、負荷が引くのを待って読み直す
-            let decode = || {
-                codecs.decode(
+            // 働き手はアプリと同じ時間の上限で読む。ビルドしたばかりの働き手の最初の起動の待ち（ワークスペースのテストで
+            // 時間切れになった原因）は、組を作るときに済ませてある（`warm_up_svg_worker`）
+            let (value, _) = codecs
+                .decode(
                     &mut Cursor::new(svg.as_bytes().to_vec()),
                     "svg",
                     &DecodeOptions::default(),
                     &Limits::default(),
                     &NoMonitor,
                 )
-            };
-            let mut got = decode();
-            for _ in 0..4 {
-                match &got {
-                    Err(e) if kura_core::codec_ext::svg_worker::is_time_limit(e) => {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        got = decode();
-                    }
-                    _ => break,
-                }
-            }
-            let (value, _) = got.expect("文字を含む SVG を読める");
+                .expect("文字を含む SVG を読める");
             assert!(matches!(value, Value::Image(_)));
         }
+    }
+
+    /// テストの働き手を温めると、頼みのない働き手が答えて終わるのを待つ（隣の実行ファイルがあるとき。単体テストだけを組んだ
+    /// ときは働き手がないので確かめない）。働き手でないもの（答えを書かずに終わる）・起動できないものは誤りにする。
+    #[test]
+    fn warming_up_the_test_worker_waits_for_its_answer() {
+        let exe = std::env::current_exe().unwrap();
+        let bin = exe
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("kura-devtools");
+        if bin.is_file() {
+            assert!(svg_worker_command().is_some());
+            warm_up_svg_worker(&bin).unwrap();
+        }
+        let err = warm_up_svg_worker(std::path::Path::new("/usr/bin/true")).unwrap_err();
+        assert!(err.contains("答えずに終わりました"), "{err}");
+        let err =
+            warm_up_svg_worker(std::path::Path::new("/nonexistent/kura-devtools")).unwrap_err();
+        assert!(err.contains("起動できません"), "{err}");
     }
 }

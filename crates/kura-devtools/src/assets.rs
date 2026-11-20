@@ -1049,6 +1049,7 @@ mod tests {
         assert!(session.jobs().wait_idle(Duration::from_secs(300)));
         let library = session.library();
         type Row = (
+            i64,
             String,
             String,
             String,
@@ -1061,7 +1062,7 @@ mod tests {
             .db()
             .read(|c| {
                 let mut stmt = c.prepare(
-                    "SELECT original_name, kind, thumb_state, width, height, codec_info, hash FROM items",
+                    "SELECT id, original_name, kind, thumb_state, width, height, codec_info, hash FROM items",
                 )?;
                 let rows = stmt.query_map([], |r| {
                     Ok((
@@ -1072,11 +1073,30 @@ mod tests {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 })?;
                 Ok(rows.collect::<std::result::Result<_, _>>()?)
             })
             .unwrap();
+        // サムネイルができていないときに理由を出す：ジョブのログ（`job-*.log`）の、そのアイテムの行
+        let item_log = |id: i64| -> String {
+            let mark = format!("アイテム {id}: ");
+            let mut logs: Vec<_> = std::fs::read_dir(library.layout().logs_dir())
+                .map(|d| d.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            logs.sort();
+            logs.iter()
+                .filter_map(|p| std::fs::read_to_string(p).ok())
+                .flat_map(|t| {
+                    t.lines()
+                        .filter(|l| l.contains(&mark))
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let mut checked = 0;
         for f in FORMATS.iter().filter(|f| {
             matches!(
@@ -1087,7 +1107,7 @@ mod tests {
             let ext_of = |name: &str| name.rsplit('.').next().unwrap_or("").to_string();
             let mine: Vec<&Row> = rows
                 .iter()
-                .filter(|r| f.exts.contains(&ext_of(&r.0).as_str()))
+                .filter(|r| f.exts.contains(&ext_of(&r.1).as_str()))
                 .collect();
             if mine.is_empty() {
                 assert!(
@@ -1099,11 +1119,13 @@ mod tests {
                 );
                 continue;
             }
-            for (name, kind, state, width, height, codec, hash) in mine {
+            for (id, name, kind, state, width, height, codec, hash) in mine {
                 assert_eq!(
-                    state, "ready",
-                    "{name}（{}）のサムネイルができていない",
-                    f.id
+                    state,
+                    "ready",
+                    "{name}（{}）のサムネイルができていない（ジョブのログ：{}）",
+                    f.id,
+                    item_log(*id)
                 );
                 let sample = samples.iter().find(|s| &s.name == name).unwrap();
                 let format = if sample.png {
