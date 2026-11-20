@@ -1,7 +1,8 @@
 //! フィールド（docs/search-query.md §3）の名前と値の読み取り。
 
 use super::ast::{
-    AlphaSpec, CivilDate, DateSpec, FieldCond, KindValue, Op, Orientation, PlayedSpec, UnitSpec,
+    AlphaSpec, AttributionSpec, CivilDate, DateSpec, FieldCond, KindValue, LicenseSpec, Op,
+    Orientation, PlayedSpec, UnitSpec,
 };
 
 /// フィールドの種類（§3 の表の行）。
@@ -24,6 +25,9 @@ pub(crate) enum FieldKind {
     W,
     H,
     Orient,
+    License,
+    Attribution,
+    Credit,
     Alpha,
     Pixel,
     Colors,
@@ -78,6 +82,25 @@ pub const FIELDS: &[FieldDef] = &[
     def("w", "幅", &["幅", "w"], FieldKind::W),
     def("h", "高さ", &["高さ", "h"], FieldKind::H),
     def("orient", "向き", &["向き", "orient"], FieldKind::Orient),
+    // クレジット（M15 段 1）
+    def(
+        "license",
+        "ライセンス",
+        &["ライセンス", "license"],
+        FieldKind::License,
+    ),
+    def(
+        "attribution",
+        "表記",
+        &["表記", "attribution"],
+        FieldKind::Attribution,
+    ),
+    def(
+        "credit",
+        "クレジット",
+        &["クレジット", "credit"],
+        FieldKind::Credit,
+    ),
     // 素材（M11）
     def("alpha", "透過", &["透過", "alpha"], FieldKind::Alpha),
     def(
@@ -269,6 +292,33 @@ pub(crate) fn build(def: &FieldDef, op: Op, value: &str) -> Result<FieldCond, St
                 _ => return Err("向きは 縦・横・正方形 のどれかです".into()),
             };
             FieldCond::Orient { op, value }
+        }
+        FieldKind::License => {
+            only_equality(op)?;
+            let v = text(value)?;
+            let value = match v.to_lowercase().as_str() {
+                "あり" | "any" => LicenseSpec::Any,
+                "なし" | "none" | "未設定" => LicenseSpec::None,
+                _ => LicenseSpec::Name(v),
+            };
+            FieldCond::License { op, value }
+        }
+        FieldKind::Attribution => {
+            only_equality(op)?;
+            let value = match value.trim().to_lowercase().as_str() {
+                "必要" | "必須" | "required" => AttributionSpec::Required,
+                "任意" | "optional" => AttributionSpec::Optional,
+                "不要" | "none" => AttributionSpec::None,
+                _ => return Err("表記は 必要・任意・不要 のどれかです".into()),
+            };
+            FieldCond::Attribution { op, value }
+        }
+        FieldKind::Credit => {
+            only_equality(op)?;
+            FieldCond::Credit {
+                op,
+                value: text(value)?,
+            }
         }
         FieldKind::Alpha => {
             only_equality(op)?;

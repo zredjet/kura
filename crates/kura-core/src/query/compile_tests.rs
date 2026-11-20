@@ -1290,3 +1290,114 @@ fn unit_smart_rules_judge_facts_by_any_member() {
         );
     }
 }
+
+/// クレジットのフィールド（M15 段 1）の小さなライブラリ：`library` の 1〜5 にクレジットを付ける（5 は作者だけでライセンスなし）。
+fn credit_library() -> Connection {
+    let conn = library();
+    conn.execute_batch(
+        "INSERT INTO licenses (builtin, name, spdx, url, attribution, commercial, modify, share_alike, pos, created_at, updated_at)
+           VALUES (NULL, 'サイト_の規約', NULL, NULL, 'optional', 'unknown', 'yes', 0, 13, 0, 0);
+         INSERT INTO item_credits (item_id, license_id, author, work, url, credit, updated_at) VALUES
+           (1, (SELECT id FROM licenses WHERE builtin = 'cc-by-4.0'), 'もりの', '森の素材集', NULL, NULL, 0),
+           (2, (SELECT id FROM licenses WHERE builtin = 'cc-by-sa-4.0'), 'Kenney', NULL, 'https://kenney.nl', NULL, 0),
+           (3, (SELECT id FROM licenses WHERE builtin = 'cc0-1.0'), NULL, NULL, NULL, '100%free', 0),
+           (4, (SELECT id FROM licenses WHERE builtin IS NULL), NULL, NULL, NULL, NULL, 0),
+           (5, NULL, 'もりの', NULL, NULL, NULL, 0);",
+    )
+    .unwrap();
+    conn
+}
+
+/// ライセンス・表記・クレジットは、アイテム自身のクレジットの行で決まる。`!=` と除外は、行のないもの・未設定を含む。
+#[test]
+fn credit_fields_follow_the_items_own_credits() {
+    let conn = credit_library();
+    let cases: &[(&str, &[i64])] = &[
+        ("ライセンス:あり", &[1, 2, 3, 4]),
+        ("ライセンス:なし", &[5, 6, 7]),
+        ("ライセンス!=あり", &[5, 6, 7]),
+        ("ライセンス!=なし", &[1, 2, 3, 4]),
+        ("ライセンス:\"CC BY\"", &[1, 2]),
+        ("ライセンス=\"cc by 4.0\"", &[1]),
+        ("ライセンス=CC-BY-4.0", &[1]),
+        ("ライセンス:cc-by-sa", &[2]),
+        ("ライセンス!=\"CC BY\"", &[3, 4, 5, 6, 7]),
+        ("ライセンス:サイト_の", &[4]),
+        ("ライセンス:サイトXの", &[]),
+        ("表記:必要", &[1, 2]),
+        ("表記:任意", &[4]),
+        ("表記:不要", &[3]),
+        ("表記!=必要", &[3, 4, 5, 6, 7]),
+        ("-表記:必要", &[3, 4, 5, 6, 7]),
+        ("クレジット:もりの", &[1, 5]),
+        ("クレジット:kenney.nl", &[2]),
+        ("クレジット:素材集", &[1]),
+        ("クレジット:100%", &[3]),
+        ("クレジット:1%", &[]),
+        ("クレジット=KENNEY", &[2]),
+        ("クレジット!=もりの", &[2, 3, 4, 6, 7]),
+        ("ライセンス:あり 表記:必要 -クレジット:もりの", &[2]),
+        // 「作者:」は今までどおりタグ
+        ("作者:もりの", &[1, 5]),
+    ];
+    for (query, expected) in cases {
+        assert_eq!(ids(&conn, query), *expected, "{query}");
+    }
+}
+
+/// クレジットの条件は相関しない集合の部分問い合わせで、ライセンスは子の列の索引で引く（items を走査しない）。
+#[test]
+fn credit_conditions_are_list_subqueries() {
+    let conn = credit_library();
+    for (query, index) in [
+        ("ライセンス:\"CC BY\"", Some("idx_item_credits_license")),
+        ("ライセンス=MIT", Some("idx_item_credits_license")),
+        ("表記:必要", Some("idx_item_credits_license")),
+        ("ライセンス:あり", None),
+        ("クレジット:もりの", None),
+    ] {
+        let parsed = parse(query).unwrap();
+        let cond = compile(&parsed.expr, &DbResolver { conn: &conn }, &ctx()).unwrap();
+        let sql = format!(
+            "SELECT i.id FROM items i WHERE i.trashed_at IS NULL AND ({}) ORDER BY i.imported_at DESC, i.id DESC",
+            cond.sql
+        );
+        let plan = explain(&conn, &sql, &cond.params);
+        assert!(plan.contains("LIST SUBQUERY"), "{query}\n{plan}");
+        assert!(!plan.contains("CORRELATED"), "{query}\n{plan}");
+        assert!(!plan.contains("SCAN i"), "{query}\n{plan}");
+        if let Some(index) = index {
+            assert!(plan.contains(index), "{query}\n{plan}");
+        }
+    }
+}
+
+/// ユニット単位のスマートでは、クレジットのフィールドはメンバーのどれかで判定する（playlists.md §4.2）。
+#[test]
+fn unit_smart_rules_judge_credits_by_any_member() {
+    use crate::playlist::UnitMatch;
+    use crate::playlist::generate::to_unit_cond;
+    use crate::playlist::smart::{UnitCond, UnitFacts, unit_matches};
+    let conn = credit_library();
+    let facts = |members: Vec<i64>| UnitFacts {
+        member_tags: vec![Default::default(); members.len()],
+        members,
+        ..UnitFacts::default()
+    };
+    for (query, members, expected) in [
+        ("ライセンス:あり", vec![1, 6], true),
+        ("ライセンス:あり", vec![5, 6], false),
+        ("表記:必要", vec![2, 3], true),
+        ("表記:必要", vec![3, 4], false),
+        ("クレジット:もりの", vec![5], true),
+    ] {
+        let expr = parse(query).unwrap().expr;
+        let cond = to_unit_cond(&conn, &expr, &ctx()).unwrap();
+        assert!(matches!(cond, UnitCond::AnyMember(_)), "{query}: {cond:?}");
+        assert_eq!(
+            unit_matches(&cond, &facts(members.clone()), UnitMatch::Any, &ctx()),
+            expected,
+            "{query} {members:?}"
+        );
+    }
+}

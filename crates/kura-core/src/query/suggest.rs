@@ -214,6 +214,17 @@ fn values(
         FieldKind::Rate => fixed(&["44.1k", "48k", "96k"]),
         FieldKind::Bits => fixed(&["16", "24", "32"]),
         FieldKind::Ch => fixed(&["ステレオ", "モノラル"]),
+        FieldKind::Attribution => fixed(&["必要", "任意", "不要"]),
+        FieldKind::License => {
+            // あり・なしと、ライセンスの名前（並びの順。付けた件数を添える）
+            let mut list = fixed(&["あり", "なし"]);
+            list.extend(
+                crate::credits::licenses::list(conn)?
+                    .into_iter()
+                    .map(|l| (l.name, Some(l.items))),
+            );
+            list
+        }
         FieldKind::Source => {
             let mut stmt = conn.prepare_cached(
                 "SELECT source_site, count(*) FROM items WHERE trashed_at IS NULL AND source_site IS NOT NULL
@@ -419,6 +430,54 @@ mod tests {
         );
         // ラウドネス・ピークは値の候補を出さない（数を書く）
         assert!(values("ラウドネス>").is_empty());
+    }
+
+    #[test]
+    fn suggests_credit_field_values() {
+        let conn = library();
+        conn.execute_batch(
+            "INSERT INTO item_credits (item_id, license_id, updated_at)
+               VALUES (1, (SELECT id FROM licenses WHERE builtin = 'cc-by-4.0'), 0)",
+        )
+        .unwrap();
+        let got = |word: &str| -> Vec<(String, Option<i64>)> {
+            suggest(&conn, word, 8)
+                .unwrap()
+                .into_iter()
+                .inspect(|s| assert_eq!(s.kind, SuggestionKind::Value, "{word}"))
+                .map(|s| (s.insert, s.count))
+                .collect()
+        };
+        assert_eq!(
+            got("表記:"),
+            [
+                ("表記:必要".to_string(), None),
+                ("表記:任意".to_string(), None),
+                ("表記:不要".to_string(), None)
+            ]
+        );
+        // ライセンスの名前は並びの順で、空白を含めば引用符で囲み、付けた件数を添える
+        assert_eq!(
+            got("ライセンス:cc by-"),
+            [
+                ("ライセンス:\"CC BY-SA 4.0\"".to_string(), Some(0)),
+                ("ライセンス:\"CC BY-SA 3.0\"".to_string(), Some(0)),
+                ("ライセンス:\"CC BY-NC 4.0\"".to_string(), Some(0)),
+                ("ライセンス:\"CC BY-NC-SA 4.0\"".to_string(), Some(0)),
+            ]
+        );
+        assert_eq!(
+            got("ライセンス:4.0")[..2],
+            [
+                ("ライセンス:\"CC BY 4.0\"".to_string(), Some(1)),
+                ("ライセンス:\"CC BY-SA 4.0\"".to_string(), Some(0)),
+            ]
+        );
+        assert_eq!(
+            got("ライセンス:な"),
+            [("ライセンス:なし".to_string(), None)]
+        );
+        assert!(got("クレジット:").is_empty());
     }
 
     #[test]

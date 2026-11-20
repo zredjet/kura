@@ -9,7 +9,8 @@ use rusqlite::OptionalExtension;
 use rusqlite::types::Value;
 
 use super::ast::{
-    CivilDate, DateSpec, Expr, FieldCond, KindValue, Op, Orientation, PlayedSpec, TagTerm, UnitSpec,
+    CivilDate, DateSpec, Expr, FieldCond, KindValue, LicenseSpec, Op, Orientation, PlayedSpec,
+    TagTerm, UnitSpec,
 };
 use crate::text::nfc;
 use crate::time::days_from_civil;
@@ -517,6 +518,74 @@ impl Compiler<'_> {
                     Orientation::Landscape => format!("(i.width > i.height AND NOT ({square}))"),
                 };
                 self.negate_if(*op, sql, out);
+            }
+            FieldCond::License { op, value } => {
+                // アイテム自身のクレジットの行のライセンス（来歴の元は見ない）。索引 idx_item_credits_license で引く
+                let (sql, negate) = match value {
+                    LicenseSpec::Any | LicenseSpec::None => (
+                        "i.id IN (SELECT c.item_id FROM item_credits c WHERE c.license_id IS NOT NULL)"
+                            .to_string(),
+                        (*op == Op::Ne) == matches!(value, LicenseSpec::Any),
+                    ),
+                    LicenseSpec::Name(name) => {
+                        let name = nfc(name);
+                        let ids = if *op == Op::Eq {
+                            let a = push(out, name.clone());
+                            let b = push(out, name);
+                            format!(
+                                "SELECT l.id FROM licenses l WHERE lower(l.name) = lower({a}) OR lower(ifnull(l.spdx, '')) = lower({b})"
+                            )
+                        } else {
+                            let a = push(out, like_contains(&name));
+                            let b = push(out, like_contains(&name));
+                            format!(
+                                "SELECT l.id FROM licenses l WHERE l.name LIKE {a} ESCAPE '\\' OR ifnull(l.spdx, '') LIKE {b} ESCAPE '\\'"
+                            )
+                        };
+                        (
+                            format!(
+                                "i.id IN (SELECT c.item_id FROM item_credits c WHERE c.license_id IN ({ids}))"
+                            ),
+                            *op == Op::Ne,
+                        )
+                    }
+                };
+                if negate {
+                    out.sql.push_str(&format!("NOT {sql}"));
+                } else {
+                    out.sql.push_str(&sql);
+                }
+            }
+            FieldCond::Attribution { op, value } => {
+                let mark = push(out, value.as_str().to_string());
+                let sql = format!(
+                    "i.id IN (SELECT c.item_id FROM item_credits c JOIN licenses l ON l.id = c.license_id WHERE l.attribution = {mark})"
+                );
+                self.negate_if(*op, sql, out);
+            }
+            FieldCond::Credit { op, value } => {
+                let value = nfc(value);
+                let parts: Vec<String> = ["c.author", "c.work", "c.url", "c.credit"]
+                    .iter()
+                    .map(|c| {
+                        if *op == Op::Eq {
+                            let mark = push(out, value.clone());
+                            format!("lower(ifnull({c}, '')) = lower({mark})")
+                        } else {
+                            let mark = push(out, like_contains(&value));
+                            format!("{c} LIKE {mark} ESCAPE '\\'")
+                        }
+                    })
+                    .collect();
+                let sql = format!(
+                    "i.id IN (SELECT c.item_id FROM item_credits c WHERE {})",
+                    parts.join(" OR ")
+                );
+                if *op == Op::Ne {
+                    out.sql.push_str(&format!("NOT {sql}"));
+                } else {
+                    out.sql.push_str(&sql);
+                }
             }
             FieldCond::Pot { op, value } => self.power_of_two(*op, *value, out),
             FieldCond::Alpha { .. }

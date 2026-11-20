@@ -132,6 +132,38 @@ pub enum UnitSpec {
     Name(String),
 }
 
+/// ライセンスの指定（M15 段 1）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LicenseSpec {
+    /// ライセンスが付いている（`ライセンス:あり`）。
+    Any,
+    /// ライセンスが未設定（`ライセンス:なし`）。
+    None,
+    /// 名前か SPDX の識別子（`:` は含む、`=` は一致。大文字小文字を問わない）。
+    Name(String),
+}
+
+/// 表記義務の指定（M15 段 1。ライセンスの印）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionSpec {
+    Required,
+    Optional,
+    None,
+}
+
+impl AttributionSpec {
+    /// licenses.attribution の値。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Optional => "optional",
+            Self::None => "none",
+        }
+    }
+}
+
 /// 向き。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -242,6 +274,22 @@ pub enum FieldCond {
         op: Op,
         value: Orientation,
     },
+    // ---- クレジット（M15 段 1。アイテム自身のクレジット `item_credits` で決まり、来歴の元は見ない）----
+    /// ライセンス。
+    License {
+        op: Op,
+        value: LicenseSpec,
+    },
+    /// ライセンスの表記義務（未設定のアイテムはどれにも一致しない。`!=` は「一致しない」なので含む）。
+    Attribution {
+        op: Op,
+        value: AttributionSpec,
+    },
+    /// 作者・作品・出典・表記の文。
+    Credit {
+        op: Op,
+        value: String,
+    },
     // ---- 素材（M11）。`Pot` 以外は解析の事実（`media_facts`）で決まる。まだ解析していないもの・
     // 計れない値は、`:`・`=`・`!=`・大小の比較のどれにも一致しない（除外 `-` だけが含む。§4）----
     /// 透過（画像）。
@@ -322,6 +370,9 @@ impl FieldCond {
             | Self::W { op, .. }
             | Self::H { op, .. }
             | Self::Orient { op, .. }
+            | Self::License { op, .. }
+            | Self::Attribution { op, .. }
+            | Self::Credit { op, .. }
             | Self::Alpha { op, .. }
             | Self::Pixel { op, .. }
             | Self::Colors { op, .. }
@@ -366,6 +417,9 @@ impl FieldCond {
             | Self::W { .. }
             | Self::H { .. }
             | Self::Orient { .. }
+            | Self::License { .. }
+            | Self::Attribution { .. }
+            | Self::Credit { .. }
             | Self::Pot { .. } => None,
         }
     }

@@ -780,3 +780,56 @@ fn kind_lists_accept_japanese_commas() {
         kinds(vec![KindValue::Audio, KindValue::Font])
     );
 }
+
+// ---- クレジットのフィールド（M15 段 1。search-query.md §3） ----
+
+#[test]
+fn credit_fields_parse() {
+    use super::ast::{AttributionSpec, LicenseSpec};
+    use FieldCond::*;
+    for (input, op, value) in [
+        ("ライセンス:あり", Op::Has, LicenseSpec::Any),
+        ("ライセンス:なし", Op::Has, LicenseSpec::None),
+        ("ライセンス:未設定", Op::Has, LicenseSpec::None),
+        ("license=NONE", Op::Eq, LicenseSpec::None),
+        (
+            "ライセンス:\"CC BY 4.0\"",
+            Op::Has,
+            LicenseSpec::Name("CC BY 4.0".into()),
+        ),
+        (
+            "ライセンス!=CC-BY-SA-4.0",
+            Op::Ne,
+            LicenseSpec::Name("CC-BY-SA-4.0".into()),
+        ),
+    ] {
+        assert_eq!(cond(input), License { op, value }, "{input}");
+    }
+    for (input, op, value) in [
+        ("表記:必要", Op::Has, AttributionSpec::Required),
+        ("表記:必須", Op::Has, AttributionSpec::Required),
+        ("表記=任意", Op::Eq, AttributionSpec::Optional),
+        ("attribution!=none", Op::Ne, AttributionSpec::None),
+    ] {
+        assert_eq!(cond(input), Attribution { op, value }, "{input}");
+    }
+    assert_eq!(
+        cond("クレジット:もりの"),
+        Credit {
+            op: Op::Has,
+            value: "もりの".into()
+        }
+    );
+    // 大小の比較と、表記の知らない語は断る。空の値も断る
+    assert!(err_of("ライセンス>CC0").1.contains("大小"));
+    assert!(err_of("表記:たぶん").1.contains("必要・任意・不要"));
+    assert!(err_of("クレジット:\"\"").1.contains("値を入力"));
+    // 「作者:」は今までどおり名前空間付きのタグ
+    assert_eq!(
+        ok("作者:もりの"),
+        Expr::Tag(TagTerm {
+            ns: "作者".into(),
+            name: "もりの".into()
+        })
+    );
+}
