@@ -330,6 +330,25 @@ export const commands = {
 	itemId: number | null,
 	positionMs: number,
 } | null) => typedError<null, AppError>(__TAURI_INVOKE("playlist_save_state", { id, playState })),
+	/**  ライセンスの一覧（並びの順。既定の行が先。付けた件数つき）。 */
+	licensesList: () => typedError<LicenseDto[], AppError>(__TAURI_INVOKE("licenses_list")),
+	/**  利用者のライセンスを足す（並びの最後）。ID を返す。同じ名前（大文字小文字を問わない）があれば Conflict。 */
+	licenseCreate: (input: LicenseInputDto) => typedError<number, AppError>(__TAURI_INVOKE("license_create", { input })),
+	/**  利用者のライセンスを変える（既定の行は Invalid）。 */
+	licenseUpdate: (id: number, input: LicenseInputDto) => typedError<null, AppError>(__TAURI_INVOKE("license_update", { id, input })),
+	/**
+	 *  利用者のライセンスを消す（既定の行は Invalid）。使っていたアイテムは未設定に戻り、その件数を返す（画面は消す前に
+	 *  `items` の件数で確かめる）。
+	 */
+	licenseDelete: (id: number) => typedError<number, AppError>(__TAURI_INVOKE("license_delete", { id })),
+	/**  1 件のクレジット（付けていなければ全部 null）。アイテムがなければ NotFound。 */
+	itemCreditGet: (item: number) => typedError<ItemCreditDto, AppError>(__TAURI_INVOKE("item_credit_get", { item })),
+	/**  選んだアイテムとユニット（メンバー全員）のクレジットの集計（複数選択のインスペクタ）。 */
+	itemCreditsSummary: (itemIds: number[], unitIds: number[]) => typedError<CreditSummaryDto, AppError>(__TAURI_INVOKE("item_credits_summary", { itemIds, unitIds })),
+	/**  選んだアイテムとユニット（メンバー全員）にクレジットの項目をまとめて付ける（省いた項目はアイテムごとのまま）。 */
+	itemCreditsSet: (itemIds: number[], unitIds: number[], patch: CreditPatchDto) => typedError<CreditsSetDto, AppError>(__TAURI_INVOKE("item_credits_set", { itemIds, unitIds, patch })),
+	/**  使ったアイテムのクレジットを、来歴の元をたどって集める（同じ表記の行は 1 つにまとめる）。 */
+	creditsCollect: (items: number[]) => typedError<CreditsDto, AppError>(__TAURI_INVOKE("credits_collect", { items })),
 	/**  レシピの一覧（並びの順）。 */
 	recipesList: () => typedError<RecipeSummaryDto[], AppError>(__TAURI_INVOKE("recipes_list")),
 	/**  1 件のレシピ。 */
@@ -406,7 +425,7 @@ export const EDIT_OPS = [{"id":"audio.fade","schema":{"params":[{"advanced":fals
 
 export const ITEM_KINDS = [{"hasDuration":false,"kind":"image","needsProxy":false,"playable":true},{"hasDuration":true,"kind":"video","needsProxy":true,"playable":true},{"hasDuration":true,"kind":"audio","needsProxy":true,"playable":true},{"hasDuration":false,"kind":"font","needsProxy":false,"playable":false},{"hasDuration":false,"kind":"model","needsProxy":false,"playable":false}] as const;
 
-export const QUERY_FIELD_NAMES = [{"field":"type","names":["種類","type"]},{"field":"rating","names":["評価","rating"]},{"field":"dur","names":["長さ","dur"]},{"field":"added","names":["追加","added"]},{"field":"taken","names":["撮影","taken"]},{"field":"played","names":["再生","played"]},{"field":"plays","names":["再生回数","plays"]},{"field":"folder","names":["フォルダ","folder"]},{"field":"unit","names":["ユニット","unit"]},{"field":"source","names":["取得元","source"]},{"field":"name","names":["名前","name"]},{"field":"url","names":["url"]},{"field":"note","names":["メモ","note"]},{"field":"tags","names":["タグ数","tags"]},{"field":"w","names":["幅","w"]},{"field":"h","names":["高さ","h"]},{"field":"orient","names":["向き","orient"]},{"field":"alpha","names":["透過","alpha"]},{"field":"pixel","names":["ドット絵","pixel"]},{"field":"colors","names":["色数","colors"]},{"field":"pot","names":["2のべき乗","２のべき乗","pot"]},{"field":"rate","names":["レート","rate"]},{"field":"bits","names":["ビット","bits"]},{"field":"ch","names":["チャンネル","ch"]},{"field":"lufs","names":["ラウドネス","lufs"]},{"field":"peak","names":["ピーク","peak"]},{"field":"loop","names":["ループ","loop"]},{"field":"anim","names":["アニメ","anim"]}] as const;
+export const QUERY_FIELD_NAMES = [{"field":"type","names":["種類","type"]},{"field":"rating","names":["評価","rating"]},{"field":"dur","names":["長さ","dur"]},{"field":"added","names":["追加","added"]},{"field":"taken","names":["撮影","taken"]},{"field":"played","names":["再生","played"]},{"field":"plays","names":["再生回数","plays"]},{"field":"folder","names":["フォルダ","folder"]},{"field":"unit","names":["ユニット","unit"]},{"field":"source","names":["取得元","source"]},{"field":"name","names":["名前","name"]},{"field":"url","names":["url"]},{"field":"note","names":["メモ","note"]},{"field":"tags","names":["タグ数","tags"]},{"field":"w","names":["幅","w"]},{"field":"h","names":["高さ","h"]},{"field":"orient","names":["向き","orient"]},{"field":"license","names":["ライセンス","license"]},{"field":"attribution","names":["表記","attribution"]},{"field":"credit","names":["クレジット","credit"]},{"field":"alpha","names":["透過","alpha"]},{"field":"pixel","names":["ドット絵","pixel"]},{"field":"colors","names":["色数","colors"]},{"field":"pot","names":["2のべき乗","２のべき乗","pot"]},{"field":"rate","names":["レート","rate"]},{"field":"bits","names":["ビット","bits"]},{"field":"ch","names":["チャンネル","ch"]},{"field":"lufs","names":["ラウドネス","lufs"]},{"field":"peak","names":["ピーク","peak"]},{"field":"loop","names":["ループ","loop"]},{"field":"anim","names":["アニメ","anim"]}] as const;
 
 export const QUERY_KIND_WORDS = [{"kind":"image","word":"画像"},{"kind":"video","word":"動画"},{"kind":"audio","word":"音楽"},{"kind":"font","word":"フォント"},{"kind":"model","word":"3D"}] as const;
 
@@ -717,6 +736,9 @@ export type AssetSpanDto = {
 	end: number,
 };
 
+/**  表記義務（必要・任意・不要）。 */
+export type AttributionDto = "required" | "optional" | "none";
+
 /**  DB のバックアップ 1 つ（FR-SYS-03。ADR-121）。 */
 export type BackupDto = {
 	name: string,
@@ -944,6 +966,65 @@ export type CoverDto = {
 	alpha: AssetAlphaDto | null,
 	/**  ドット絵として表示するか（実効値）。 */
 	pixelArt: boolean,
+};
+
+/**  警告の 1 件（未設定・元が消えた）。 */
+export type CreditFlagDto = {
+	item: number,
+	used: number[],
+};
+
+/**  集めたクレジットの 1 行（同じ表記をまとめたもの）。 */
+export type CreditLineDto = {
+	licenseId: number,
+	work: string | null,
+	author: string | null,
+	/**  出典（クレジットの URL、なければ取り込み元の URL）。 */
+	url: string | null,
+	credit: string | null,
+	/**  このクレジットを持つアイテム（来歴の元を含む）。 */
+	items: number[],
+	/**  それにたどり着いた、使ったアイテム。 */
+	used: number[],
+};
+
+/**  まとめて付ける項目（省いた項目は変えない。文の空文字は消す）。 */
+export type CreditPatchDto = {
+	license?: LicenseChoiceDto | null,
+	author?: string | null,
+	work?: string | null,
+	url?: string | null,
+	credit?: string | null,
+};
+
+/**  複数選択のクレジットの集計。 */
+export type CreditSummaryDto = {
+	/**  対象のアイテムの数（ユニットはメンバーを数える）。 */
+	count: number,
+	licenseId: SharedDto<number>,
+	author: SharedDto<string>,
+	work: SharedDto<string>,
+	url: SharedDto<string>,
+	credit: SharedDto<string>,
+};
+
+/**  集めたクレジット（行はライセンスの並び → 作品・作者・出典・表記の順）。 */
+export type CreditsDto = {
+	lines: CreditLineDto[],
+	/**  行が使うライセンス（並びの順）。 */
+	licenses: LicenseDto[],
+	/**  来歴の元がなく、ライセンスも未設定のアイテム。 */
+	unset: CreditFlagDto[],
+	/**  来歴の元が消えて、たどれないアイテム。 */
+	lost: CreditFlagDto[],
+};
+
+/**  まとめて付けた結果。 */
+export type CreditsSetDto = {
+	/**  対象のアイテムの数（ユニットはメンバーを数える）。 */
+	items: number,
+	/**  変えた件数（中身が同じものは数えない）。 */
+	changed: number,
 };
 
 /**  読み方の設定（出力に効くので文書に入れる）。形式ごとの項目は段 2 以降で足す。 */
@@ -2018,6 +2099,18 @@ export type IssueCode =
 /**  ピークの上限に当たるので、利得を抑えた（警告。目標より小さく仕上がる）。 */
 "gainLimited";
 
+/**  1 件のクレジット（null は未設定）。 */
+export type ItemCreditDto = {
+	licenseId: number | null,
+	author: string | null,
+	/**  作品・素材集の名前。 */
+	work: string | null,
+	/**  出典（null なら取り込み元の URL を使う）。 */
+	url: string | null,
+	/**  表記の文（null なら作者・作品・出典・ライセンスから組む）。 */
+	credit: string | null,
+};
+
 /**  インスペクタ用の詳細。 */
 export type ItemDetailDto = {
 	item: ItemSummaryDto,
@@ -2240,6 +2333,44 @@ export type LibraryUsageDto = {
 	/**  ライブラリのあるボリュームの容量と空き（読めなければ空）。 */
 	volumeTotalBytes: number | null,
 	volumeAvailableBytes: number | null,
+};
+
+/**  ライセンスの変え方。 */
+export type LicenseChoiceDto = 
+/**  未設定に戻す。 */
+{ type: "unset" } | 
+/**  そのライセンスにする。 */
+{ type: "set"; id: number };
+
+/**  ライセンス 1 行。 */
+export type LicenseDto = {
+	id: number,
+	/**  既定の行の鍵（`cc-by-4.0` など）。利用者が足した行は null（既定の行は変えられず消せない）。 */
+	builtin: string | null,
+	name: string,
+	spdx: string | null,
+	url: string | null,
+	attribution: AttributionDto,
+	commercial: PermissionDto,
+	modify: PermissionDto,
+	shareAlike: boolean,
+	note: string | null,
+	/**  このライセンスを付けたアイテムの数。 */
+	items: number,
+	createdAt: number,
+	updatedAt: number,
+};
+
+/**  足す・変えるライセンスの中身（空の文は「なし」）。 */
+export type LicenseInputDto = {
+	name: string,
+	spdx: string | null,
+	url: string | null,
+	attribution: AttributionDto,
+	commercial: PermissionDto,
+	modify: PermissionDto,
+	shareAlike: boolean,
+	note: string | null,
 };
 
 /**  画像の操作をフレームの列に当てる方法。 */
@@ -2474,6 +2605,9 @@ export type ParseErrorDto = {
 	end: number,
 	message: string,
 };
+
+/**  商用・改変の可否。 */
+export type PermissionDto = "yes" | "no" | "unknown";
 
 /**  再生するキュー（docs/playlists.md §5.1 の Slot 列を列ごとの配列で）。 */
 export type PlayQueueDto = {
@@ -2861,6 +2995,12 @@ export type ShapeChangeDto = {
 export type ShapeInfoDto = { kind: "image"; w: number | null; h: number | null; 
 /**  フレームの列の数（1 枚の画像は null）。 */
 frames: number | null } | { kind: "audio"; rate: number; channels: number; frames: number | null };
+
+/**  複数選択の 1 項目（`mixed` なら食い違い、そうでなければ全件が `value`）。 */
+export type SharedDto<T> = {
+	mixed: boolean,
+	value: T | null,
+};
 
 /**  N → 1 のシートの見込み。 */
 export type SheetInfoDto = {

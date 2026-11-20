@@ -6,6 +6,7 @@ pub mod asset;
 pub mod batch;
 pub mod bench;
 pub mod capture;
+pub mod credits;
 pub mod downloads;
 pub mod edit;
 pub mod export;
