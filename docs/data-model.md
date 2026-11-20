@@ -693,7 +693,7 @@ CREATE TABLE batch_items (
   base_hash     BLOB,                                -- 処理したときの頭（継ぎ足した土台）
   base_version  INTEGER,
   version_id    INTEGER REFERENCES item_versions(id) ON DELETE SET NULL,   -- 足した版（一括の版は item_versions.job_id が NULL）
-  out_item_id   INTEGER REFERENCES items(id) ON DELETE SET NULL,          -- 別名で作ったアイテム
+  out_item_id   INTEGER REFERENCES items(id) ON DELETE SET NULL,          -- 別名・N → 1 で作ったアイテム（N → 1 は同じ中身の既存のアイテムも）
   code          TEXT,                                -- 飛ばした・失敗した理由（AppError の code）
   message       TEXT,
   finished_at   INTEGER,
@@ -1114,7 +1114,8 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   `UPDATE batch_items SET state = 'failed', code = 'Crashed', … WHERE job_id = ? AND state = 'pending' AND decoding = 1` で失敗にし、
   残りを `SELECT ord, item_id FROM batch_items WHERE job_id = ? AND state = 'pending' ORDER BY ord`（主キー。一時の B 木を作らない）で
   取る。あるアイテムを待っている一括は `SELECT b.job_id FROM batch_items b JOIN jobs j ON j.id = b.job_id WHERE b.item_id = ? AND
-  b.state = 'pending' AND j.state IN ('queued','running','paused')`（`idx_batch_items_item`。`save::pending_save` が保存のジョブと
+  b.state = 'pending' AND j.state IN ('queued','running','paused') AND json_extract(j.input_json, '$.mode.type') IS NOT 'merge'`
+  （`idx_batch_items_item`。N → 1 は元を読むだけなので数えない。ADR-198。`save::pending_save` が保存のジョブと
   一緒に見て、エディタを開かない（`SavePending`）・保存を積まない（Busy））。1 件ずつのコミットのトランザクション 2 の中で、結果の記録
   （`save::Record`）が `UPDATE batch_items SET state = ?, base_hash = ?, base_version = ?, version_id = ?, out_item_id = ?, finished_at = ?
   WHERE job_id = ? AND ord = ? AND state = 'pending'` を書き、1 行でなければ（対象のアイテムが消えて行も消えた）Conflict でトランザクション
@@ -1142,7 +1143,8 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   OR code = ?3) ORDER BY ord LIMIT ? OFFSET ?`（主キーの頭）。元に戻す一括（`jobs.input_json` の `mode.type = 'undo'`・`mode.of` が元の
   一括）の行も `batch_items` に持ち、`item_id` は戻すアイテム（別名なら作ったアイテム）、`base_hash`・`base_version` は処理したときの頭、
   `version_id` は戻した版（kind = revert。別名をゴミ箱へ入れた行は NULL）。積むときは元の一括の `SELECT item_id, out_item_id FROM
-  batch_items WHERE job_id = ? AND state IN ('saved','unchanged') AND version_id IS NOT NULL ORDER BY ord` から、前に戻した一括で
+  batch_items WHERE job_id = ? AND state IN ('saved','unchanged') AND (version_id IS NOT NULL OR ?N→1) ORDER BY ord`（N → 1 の行は
+  版を持たないので、作ったアイテムを 1 つにまとめて対象にする）から、前に戻した一括で
   saved・unchanged の行（`UNIQUE (job_id, item_id)`）を除く。ある一括を戻す一括は `SELECT id, state FROM jobs WHERE kind = 'batch' AND
   json_extract(input_json, '$.mode.type') = 'undo' AND json_extract(input_json, '$.mode.of') = ?`（ジョブの表は小さいので走査する）。
   1 件を戻すときは元の行を `WHERE job_id = ? AND item_id = ?`（上書き。`UNIQUE (job_id, item_id)`）・`WHERE out_item_id = ? AND job_id = ?`
