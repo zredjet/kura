@@ -14,6 +14,7 @@ import {
   cancelEditorSave,
   openRevert,
   openSaveAs,
+  openSaveRecipe,
   openVersions,
   pauseEditorSave,
   requestCloseEditor,
@@ -99,7 +100,28 @@ function saveMenu(state: 'idle' | 'running' | 'paused'): MenuEntry[] {
     'separator',
     { label: t.revert, disabled: busy, onSelect: openRevert },
     { label: t.versions, onSelect: openVersions },
+    'separator',
+    { label: ja.saveRecipe.menu, onSelect: openSaveRecipe },
   ];
+}
+
+/** レシピの見本の主ボタン「レシピを保存」（⌘S。応えの来ていない手があれば待つ。M14 段 7）。 */
+function RecipeSaveControls() {
+  const ready = useEditorStore((s) => s.phase === 'open' && !s.pendingSteps && !s.sheet);
+  return (
+    <div className={styles.saveArea}>
+      <button
+        type="button"
+        className={styles.saveButton}
+        data-recipe=""
+        title={t.saveKey}
+        disabled={!ready}
+        onClick={() => requestSave()}
+      >
+        <span className={styles.saveLabel}>{ja.recipeEditor.save}</span>
+      </button>
+    </div>
+  );
 }
 
 /** 主ボタン「保存」（⌘S。進捗はボタンの中。一時停止の間は「一時停止中 42%」）と ▾（このエディタで積んだ保存の操作）。 */
@@ -166,6 +188,7 @@ function SaveControls() {
 function TopBar({ ui }: { ui: EditorKindUi }) {
   const item = useEditorStore((s) => s.item);
   const panel = useEditorStore((s) => s.panel);
+  const recipe = useEditorStore((s) => s.recipe);
   return (
     <div className={styles.top} data-editor-top="" data-tauri-drag-region>
       <button
@@ -178,23 +201,28 @@ function TopBar({ ui }: { ui: EditorKindUi }) {
         <ChevronLeftIcon size={16} strokeWidth={2} />
       </button>
       <div className={styles.heading} data-tauri-drag-region>
-        <span className={styles.title}>{item?.title ?? ''}</span>
+        <span className={styles.title}>
+          {recipe ? ja.recipeEditor.banner(recipe.name, item?.title ?? '') : (item?.title ?? '')}
+        </span>
         <ui.Meta />
       </div>
       <ui.Tools />
-      <div className={styles.segments} role="group" aria-label={t.panels}>
-        <button
-          type="button"
-          className={styles.segment}
-          aria-label={t.info}
-          title={t.withKey(t.info, '⌘I')}
-          aria-pressed={panel === 'info'}
-          onClick={toggleEditorInfo}
-        >
-          <InfoIcon size={16} />
-        </button>
-      </div>
-      <SaveControls />
+      {/* レシピの見本は見本のアイテムの情報を出さない（アイテムには保存しないので） */}
+      {!recipe && (
+        <div className={styles.segments} role="group" aria-label={t.panels}>
+          <button
+            type="button"
+            className={styles.segment}
+            aria-label={t.info}
+            title={t.withKey(t.info, '⌘I')}
+            aria-pressed={panel === 'info'}
+            onClick={toggleEditorInfo}
+          >
+            <InfoIcon size={16} />
+          </button>
+        </div>
+      )}
+      {recipe ? <RecipeSaveControls /> : <SaveControls />}
     </div>
   );
 }
@@ -239,7 +267,8 @@ function FailureCard() {
 
 /** 右のガラスのパネル：種類ごとの「操作」か、アイテムの情報（インスペクタ）。 */
 function SidePanel({ ui }: { ui: EditorKindUi }) {
-  const panel = useEditorStore((s) => s.panel);
+  // レシピの見本は情報を出さず、いつも操作
+  const panel = useEditorStore((s) => (s.recipe ? 'ops' : s.panel));
   const item = useEditorStore((s) => s.item);
   return (
     <aside

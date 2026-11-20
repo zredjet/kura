@@ -3,6 +3,8 @@ import { type ReactNode, useEffect, useMemo } from 'react';
 import { ExportIcon } from '../../components/icons/ExportIcon';
 import { FolderIcon } from '../../components/icons/FolderIcon';
 import { ImportIcon } from '../../components/icons/ImportIcon';
+import { ListIcon } from '../../components/icons/ListIcon';
+import { RecipeIcon } from '../../components/icons/RecipeIcon';
 import { CloseIcon } from '../../components/icons/CloseIcon';
 import { PauseIcon } from '../../components/icons/PauseIcon';
 import { PenIcon } from '../../components/icons/PenIcon';
@@ -19,6 +21,14 @@ import {
   useJobsStore,
 } from '../../stores/jobsStore';
 import { revealExport } from '../library/exportActions';
+import {
+  type BatchJob,
+  isFinished,
+  shownBatches,
+  useBatchJobsStore,
+} from '../recipes/batchJobsStore';
+import { batchProgressView, keepsCapsule } from '../recipes/batchView';
+import { openResult } from '../recipes/resultStore';
 import { useLibraryStore } from '../../stores/libraryStore';
 import styles from './ImportProgress.module.css';
 import {
@@ -56,6 +66,12 @@ export function ImportProgress({ raised = false }: { raised?: boolean }) {
   const job = useJobsStore(selectCurrentImport);
   const saves = useJobsStore((s) => s.saves);
   const shown = useMemo(() => shownSaves(saves), [saves]);
+  const batchJobs = useBatchJobsStore((s) => s.jobs);
+  const batchDismissed = useBatchJobsStore((s) => s.dismissed);
+  const batches = useMemo(
+    () => shownBatches({ jobs: batchJobs, dismissed: batchDismissed }),
+    [batchJobs, batchDismissed],
+  );
   const dismiss = useJobsStore((s) => s.dismiss);
   const refresh = useLibraryStore((s) => s.refresh);
   const id = job?.id;
@@ -77,7 +93,7 @@ export function ImportProgress({ raised = false }: { raised?: boolean }) {
     return () => clearTimeout(timer);
   }, [id, state, exporting, refresh, dismiss]);
 
-  if (!job && shown.length === 0) {
+  if (!job && shown.length === 0 && batches.length === 0) {
     return null;
   }
   return (
@@ -85,8 +101,44 @@ export function ImportProgress({ raised = false }: { raised?: boolean }) {
       {shown.map((save) => (
         <SaveCapsule key={save.id} job={save} />
       ))}
+      {batches.map((batch) => (
+        <BatchCapsule key={batch.id} job={batch} />
+      ))}
       {job && <ImportCapsule job={job} />}
     </div>
+  );
+}
+
+/**
+ * 一括のジョブのカプセル（M14 段 7）。終わったら［結果を見る］［閉じる］：飛ばした・失敗があれば閉じるまで残し、なければ少し
+ * してから消す（利用者の決定 4）。
+ */
+function BatchCapsule({ job }: { job: BatchJob }) {
+  const dismiss = useBatchJobsStore((s) => s.dismiss);
+  const finished = isFinished(job.state);
+  const keep = keepsCapsule(job);
+  const loaded = job.result !== null;
+  useEffect(() => {
+    if (!finished || keep || !loaded) return;
+    const timer = setTimeout(() => dismiss(job.id), AUTO_HIDE_MS);
+    return () => clearTimeout(timer);
+  }, [finished, keep, loaded, job.id, dismiss]);
+  const run = (action: ProgressAction) => {
+    if (action === 'result') {
+      openResult(job.id);
+      return;
+    }
+    if (!controlJob(job.id, action)) {
+      dismiss(job.id);
+    }
+  };
+  return (
+    <Capsule
+      label={ja.batch.capsuleLabel}
+      icon={<RecipeIcon size={18} />}
+      view={batchProgressView(job)}
+      onAction={run}
+    />
   );
 }
 
@@ -169,6 +221,7 @@ function Capsule({
               <CloseIcon size={12} strokeWidth={2.6} />
             )}
             {action === 'reveal' && <FolderIcon size={13} strokeWidth={2} />}
+            {action === 'result' && <ListIcon size={13} strokeWidth={2} />}
           </button>
         ))}
       </div>

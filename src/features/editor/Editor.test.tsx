@@ -255,7 +255,14 @@ describe('保存の一時停止・再開・中止（▾ とボタン）', () => 
     openState();
     render(<Editor />);
     expect(screen.getByRole('button', { name: t.save })).toBeEnabled();
-    expect(labels(openMore())).toEqual([t.saveAs, '-', t.revert, t.versions]);
+    expect(labels(openMore())).toEqual([
+      t.saveAs,
+      '-',
+      t.revert,
+      t.versions,
+      '-',
+      ja.saveRecipe.menu,
+    ]);
   });
 
   it('保存の間：ボタンは「保存中 42%」、▾ は「保存を一時停止」「保存を中止」（別名・元に戻すは押せない）', () => {
@@ -274,6 +281,8 @@ describe('保存の一時停止・再開・中止（▾ とボタン）', () => 
       '-',
       t.revert,
       t.versions,
+      '-',
+      ja.saveRecipe.menu,
     ]);
     expect(action(entries, t.saveAs).disabled).toBe(true);
     expect(action(entries, t.revert).disabled).toBe(true);
@@ -300,6 +309,8 @@ describe('保存の一時停止・再開・中止（▾ とボタン）', () => 
       '-',
       t.revert,
       t.versions,
+      '-',
+      ja.saveRecipe.menu,
     ]);
     action(entries, t.saveResume).onSelect();
     expect(resumeJob).toHaveBeenCalledWith(21);

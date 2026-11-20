@@ -370,6 +370,7 @@ export function appMenuItems(
         keyItem(run, t.play, { key: 'Enter', code: 'Enter', ...META }),
         keyItem(run, t.quickLook, { key: ' ', code: 'Space' }, 'Space'),
         keyItem(run, t.editItem, { key: 'e', code: 'KeyE', ...META }),
+        keyItem(run, t.applyRecipe, { key: 'e', code: 'KeyE', meta: true, alt: true }),
         keyItem(run, ja.asset.menuAudition, { key: 'l', code: 'KeyL' }, 'L'),
         { item: 'Separator' },
         keyItem(run, t.group, { key: 'g', code: 'KeyG', ...META }),

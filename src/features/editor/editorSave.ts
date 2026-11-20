@@ -476,6 +476,15 @@ export function submitFormat(format: string): void {
  */
 export function requestSave(closeAfter: AfterClose | null = null): void {
   const s = useEditorStore.getState();
+  if (s.recipe) {
+    // レシピの見本：アイテムには保存せず、レシピを保存のシート（M14 段 7）
+    if (s.phase === 'open' && !s.sheet) {
+      useEditorStore.setState({ sheet: { kind: 'saveRecipe', closeAfter } });
+    } else if (closeAfter !== null) {
+      settleClose(false);
+    }
+    return;
+  }
   if (s.phase !== 'open' || s.sheet || saveIsBusy(s)) {
     if (saveIsBusy(s)) notifyBusy(s);
     if (closeAfter !== null) settleClose(false);
@@ -503,7 +512,7 @@ export function confirmWarnings(): void {
 /** 別名で保存…（⌘⇧S）：名前のシート。 */
 export function openSaveAs(): void {
   const s = useEditorStore.getState();
-  if (s.phase !== 'open' || s.sheet) return;
+  if (s.phase !== 'open' || s.sheet || s.recipe) return;
   if (s.save) {
     notifyBusy(s);
     return;
@@ -528,14 +537,14 @@ export function submitSaveAs(name: string): void {
 /** 元に戻す…：確認のシート。 */
 export function openRevert(): void {
   const s = useEditorStore.getState();
-  if (s.phase !== 'open' || s.sheet) return;
+  if (s.phase !== 'open' || s.sheet || s.recipe) return;
   useEditorStore.setState({ sheet: { kind: 'revert' } });
 }
 
 /** 版の一覧…。 */
 export function openVersions(): void {
   const s = useEditorStore.getState();
-  if (s.phase !== 'open' || s.sheet) return;
+  if (s.phase !== 'open' || s.sheet || s.recipe) return;
   useEditorStore.setState({ sheet: { kind: 'versions' } });
 }
 
@@ -569,10 +578,32 @@ export function dismissSheet(): void {
   useEditorStore.setState({ sheet: null });
   if (
     sheet.kind === 'unsaved' ||
-    ((sheet.kind === 'saveWarnings' || sheet.kind === 'format') && sheet.closeAfter !== null)
+    ((sheet.kind === 'saveWarnings' || sheet.kind === 'format' || sheet.kind === 'saveRecipe') &&
+      sheet.closeAfter !== null)
   ) {
     settleClose(false);
   }
+}
+
+// ===== レシピ（M14 段 7） =====
+
+/** レシピとして保存…（エディタの ▾。見本で編集では［レシピを保存］）。 */
+export function openSaveRecipe(): void {
+  const s = useEditorStore.getState();
+  if (s.phase !== 'open' || s.sheet) return;
+  useEditorStore.setState({ sheet: { kind: 'saveRecipe', closeAfter: null } });
+}
+
+/**
+ * レシピを保存し終えた（シートが呼ぶ）：シートを閉じ、見本で編集なら今の頭を保存したことにする。閉じる前の保存なら閉じる。
+ */
+export function recipeSaved(closeAfter: AfterClose | null): void {
+  const s = useEditorStore.getState();
+  useEditorStore.setState({
+    sheet: null,
+    recipe: s.recipe ? { ...s.recipe, savedHead: s.status?.head ?? null } : null,
+  });
+  if (closeAfter !== null) finishClose();
 }
 
 // ===== 一時停止・再開・中止 =====

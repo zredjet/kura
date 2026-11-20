@@ -41,6 +41,7 @@ import { formatUnavailableText, outputChoice, unavailableNote } from './formats'
 import { type EditorKind, formatsFor } from './kindTraits';
 import { opName } from './opsCatalog';
 import { issueText } from './ParamFields';
+import { SaveRecipeSheet } from '../recipes/SaveRecipeSheet';
 
 const t = ja.editor;
 
@@ -153,13 +154,16 @@ function PendingSaveSheet() {
 /** 未保存で閉じるとき：［保存しない］［キャンセル］［保存］。 */
 function UnsavedSheet() {
   const title = useEditorStore((s) => s.item?.title ?? '');
+  const recipe = useEditorStore((s) => s.recipe?.name ?? null);
   const titleId = useId();
   return (
     <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
       <h2 id={titleId} className={styles.sheetTitle}>
-        {t.unsavedTitle}
+        {recipe !== null ? ja.recipeEditor.closeTitle : t.unsavedTitle}
       </h2>
-      <p className={styles.sheetMessage}>{t.unsavedMessage(title)}</p>
+      <p className={styles.sheetMessage}>
+        {recipe !== null ? ja.recipeEditor.closeMessage(recipe) : t.unsavedMessage(title)}
+      </p>
       <footer className={styles.sheetActions}>
         <Button className={styles.sheetLeft} onClick={() => answerUnsaved('discard')}>
           {t.dontSave}
@@ -487,6 +491,8 @@ function SheetOf({ sheet }: { sheet: EditorSheet }) {
       return <WarningsSheet />;
     case 'saveAs':
       return <SaveAsSheet />;
+    case 'saveRecipe':
+      return <SaveRecipeSheet closeAfter={sheet.closeAfter} />;
     case 'revert':
       return <RevertSheet to={0} />;
     case 'restore':

@@ -25,6 +25,7 @@ import {
   trashEntries,
 } from './actions';
 import { exportEntries } from './exportActions';
+import { pickRecipeAndApply } from '../recipes/recipeMenus';
 import { TAG_FOCUS_KEY } from './inspector/ItemInspector';
 import { itemMenu, viewedSetUnit } from './itemMenu';
 import { verticalTarget } from './navigation';
@@ -108,6 +109,12 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
       view.setSelection(selectAll(ids));
     } else if (key === 'Enter' && entries.length > 0 && kind !== 'trash') {
       playSelection(entries);
+    } else if (e.altKey && e.code === 'KeyE' && !e.shiftKey) {
+      // レシピを当てる（M14。⌥ を押すと e.key が変わるので、キーの位置で見る）
+      if (entries.length === 0 || kind === 'trash') {
+        return false;
+      }
+      void pickRecipeAndApply(entries);
     } else if (key === 'e' && e.shiftKey) {
       void exportEntries(entries);
     } else if (key === 'e' && !e.altKey) {

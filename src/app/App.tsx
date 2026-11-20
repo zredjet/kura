@@ -21,13 +21,22 @@ import { SearchPalette } from '../features/search/SearchPalette';
 import { SettingsSheet } from '../features/settings/SettingsSheet';
 import { TagDialog } from '../features/tags/TagDialog';
 import { TagsView } from '../features/tags/TagsView';
+import { ApplySheet } from '../features/recipes/ApplySheet';
+import { BatchResultSheet } from '../features/recipes/BatchResultSheet';
+import { closeApply } from '../features/recipes/applyStore';
+import { useBatchJobsStore } from '../features/recipes/batchJobsStore';
+import { closeMerge } from '../features/recipes/mergeStore';
+import { useRecipeStore } from '../features/recipes/recipeStore';
+import { closeResult } from '../features/recipes/resultStore';
+import { MergeSheet } from '../features/recipes/MergeSheet';
+import { RecipeView } from '../features/recipes/RecipeView';
 import { LibraryUpgrade } from '../features/welcome/LibraryUpgrade';
 import { Welcome } from '../features/welcome/Welcome';
 import { closePlayer, loadPlayerPrefs, watchFullscreen } from '../features/player/playerActions';
 import { reportPlaybackSupport } from '../features/player/support';
 import { Theater } from '../features/player/Theater';
 import { useDownloadsStore } from '../stores/downloadsStore';
-import { startJobEvents, useJobsStore } from '../stores/jobsStore';
+import { onAnyJob, startJobEvents, useJobsStore } from '../stores/jobsStore';
 import { useLibraryStore } from '../stores/libraryStore';
 import { useViewStore } from '../stores/viewStore';
 import { AppShell } from './AppShell';
@@ -41,6 +50,8 @@ export function App() {
   }, []);
 
   useEffect(() => (isTauri() ? startJobEvents() : undefined), []);
+  // 一括のジョブ（M14）はグリッドの下のカプセルに出す
+  useEffect(() => onAnyJob((event) => useBatchJobsStore.getState().apply(event)), []);
   useEffect(() => (isTauri() ? startLoginShotEvents() : undefined), []);
   useEffect(() => (isTauri() ? watchFullscreen() : undefined), []);
   // 画像エディタに保存していない変更がある間は、窓を閉じる操作を止めてシートを出す
@@ -83,6 +94,7 @@ function LibraryScreen() {
   const playlist = useViewStore((s) => s.playlist);
   const downloads = useViewStore((s) => s.downloads);
   const tags = useViewStore((s) => s.tags);
+  const recipe = useViewStore((s) => s.recipe);
   const sidebarVisible = useViewStore((s) => s.sidebar);
   // ライブラリを替えたら再生をやめ、画像エディタを閉じる（Rust もライブラリを閉じる前にエディタを閉じる）
   const libraryPath = useLibraryStore((s) => s.info?.path);
@@ -90,6 +102,16 @@ function LibraryScreen() {
   // 終わっていない保存を読む（一時停止した保存はアプリを開き直しても残っている。カプセルから再開・中止できる）
   useEffect(() => {
     void useJobsStore.getState().reloadSaves();
+  }, [libraryPath]);
+  // 終わっていない一括を読む（一時停止した一括もアプリを開き直して残る）
+  useEffect(() => {
+    useBatchJobsStore.getState().clear();
+    void useBatchJobsStore.getState().load();
+    // 前のライブラリのレシピ・一括のシートは閉じる
+    closeApply();
+    closeMerge();
+    closeResult();
+    useRecipeStore.getState().clear();
   }, [libraryPath]);
   useEffect(() => () => void closeEditor(), [libraryPath]);
 
@@ -100,6 +122,8 @@ function LibraryScreen() {
           <DownloadsView />
         ) : tags ? (
           <TagsView />
+        ) : recipe !== null ? (
+          <RecipeView key={recipe} id={recipe} />
         ) : playlist !== null ? (
           <PlaylistView key={playlist} id={playlist} />
         ) : (
@@ -109,6 +133,9 @@ function LibraryScreen() {
       <Theater />
       <Editor />
       <ImportSheet />
+      <ApplySheet />
+      <MergeSheet />
+      <BatchResultSheet />
       <DropOverlay />
       <TagDialog />
       <SearchPalette />

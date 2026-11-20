@@ -3,8 +3,19 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { useEffect } from 'react';
 
 import { ja } from '../../i18n/ja';
-import { pickImportFiles } from '../../ipc/dialogs';
+import { pickImportFiles, RECIPE_EXTENSION } from '../../ipc/dialogs';
 import { useImportStore } from '../../stores/importStore';
+import { importRecipeAction } from '../recipes/recipeActions';
+
+/** レシピのファイル（`.kurarecipe`）か。 */
+export function isRecipeFile(path: string): boolean {
+  return path.toLowerCase().endsWith(`.${RECIPE_EXTENSION}`);
+}
+
+/** 落としたレシピのファイルを 1 つずつ読み込む（M14 段 7）。 */
+async function importRecipes(paths: readonly string[]): Promise<void> {
+  for (const path of paths) await importRecipeAction(path);
+}
 
 /** ドラッグ＆ドロップのイベント（Tauri の DragDropEvent の必要な部分）。 */
 export type DropPayload =
@@ -29,10 +40,15 @@ export function handleDragDrop(payload: DropPayload): void {
     case 'leave':
       store.setDragging(false);
       break;
-    case 'drop':
+    case 'drop': {
       store.setDragging(false);
-      void store.begin(payload.paths);
+      // レシピのファイルは読み込み、ほかは取り込みのシートへ
+      const recipes = payload.paths.filter(isRecipeFile);
+      const media = payload.paths.filter((p) => !isRecipeFile(p));
+      if (recipes.length > 0) void importRecipes(recipes);
+      if (media.length > 0 || recipes.length === 0) void store.begin(media);
       break;
+    }
     case 'over':
       break;
   }

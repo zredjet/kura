@@ -20,6 +20,7 @@ import { FolderTree } from './FolderTree';
 import { LibrarySwitcher } from './LibrarySwitcher';
 import { SidebarFooter } from './SidebarFooter';
 import { PlaylistList } from './PlaylistList';
+import { RecipeList } from './RecipeList';
 import { SmartFolderList } from './SmartFolderList';
 import styles from './Sidebar.module.css';
 
@@ -66,7 +67,8 @@ export function Sidebar() {
   const playlistOpen = useViewStore((s) => s.playlist !== null);
   const downloadsOpen = useViewStore((s) => s.downloads);
   const tagsOpen = useViewStore((s) => s.tags);
-  const otherScreen = playlistOpen || downloadsOpen || tagsOpen;
+  const recipeOpen = useViewStore((s) => s.recipe !== null);
+  const otherScreen = playlistOpen || downloadsOpen || tagsOpen || recipeOpen;
   const activeDownloads = useDownloadsStore(selectActiveCount);
   const filter = useViewStore((s) => s.filter);
   // 「キャプチャ」はすべての一覧をキャプチャで絞り込んだもの
@@ -157,6 +159,7 @@ export function Sidebar() {
         <SmartFolderList current={current} />
         <FolderTree current={current} />
         <PlaylistList />
+        <RecipeList />
         <section className={styles.section} aria-label={ja.sidebar.fetchSection}>
           <h2 className={styles.sectionTitle}>{ja.sidebar.fetchSection}</h2>
           <button

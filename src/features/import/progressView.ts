@@ -7,7 +7,7 @@ import type { SaveJob } from '../../stores/jobsStore';
 
 const t = ja.progress;
 
-export type ProgressAction = 'pause' | 'resume' | 'cancel' | 'close' | 'reveal';
+export type ProgressAction = 'pause' | 'resume' | 'cancel' | 'close' | 'reveal' | 'result';
 
 /** 進捗カプセルに出す内容。 */
 export interface ProgressView {

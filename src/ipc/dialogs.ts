@@ -80,3 +80,31 @@ export function pickToolFile(title: string): Promise<string | null> {
 export function pickExportFolder(title: string): Promise<string | null> {
   return open({ title, directory: true, multiple: false, canCreateDirectories: true });
 }
+
+/** レシピのファイルの拡張子（docs/editing.md §4.3）。 */
+export const RECIPE_EXTENSION = 'kurarecipe';
+
+/** 読み込む `.kurarecipe` を選ぶ。キャンセルなら null。 */
+export async function pickRecipeFile(title: string, filterName: string): Promise<string | null> {
+  const picked = await open({
+    title,
+    multiple: false,
+    directory: false,
+    filters: [{ name: filterName, extensions: [RECIPE_EXTENSION] }],
+  });
+  return typeof picked === 'string' ? picked : null;
+}
+
+/** `.kurarecipe` を書き出す場所を選ぶ（名前の既定は `defaultName`）。キャンセルなら null。 */
+export function pickRecipeSaveLocation(
+  title: string,
+  defaultName: string,
+  filterName: string,
+): Promise<string | null> {
+  return save({
+    title,
+    defaultPath: `${defaultName}.${RECIPE_EXTENSION}`,
+    canCreateDirectories: true,
+    filters: [{ name: filterName, extensions: [RECIPE_EXTENSION] }],
+  });
+}

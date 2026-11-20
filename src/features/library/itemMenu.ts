@@ -8,6 +8,7 @@ import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
 import { exportEntries } from './exportActions';
 import { pixelArtMenu } from './pixelArtMenu';
+import { applyRecipeSubmenu, mergeSubmenu } from '../recipes/recipeMenus';
 import {
   dissolveUnits,
   groupEntries,
@@ -137,6 +138,14 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
   if (pixelArt) {
     out.push('separator');
     out.push(pixelArt);
+  }
+  // 一括加工（M14）：レシピを当てる ▸・まとめて 1 つにする ▸
+  const apply = applyRecipeSubmenu(entries);
+  const merge = mergeSubmenu(entries);
+  if (apply || merge) {
+    out.push('separator');
+    if (apply) out.push(apply);
+    if (merge) out.push(merge);
   }
   out.push('separator');
   out.push({

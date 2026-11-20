@@ -76,7 +76,7 @@ export function everyEditorKindKeys(): EditorKindKeys[] {
  */
 export function openEditor(
   item: ItemSummaryDto,
-  options: { fromDraft?: boolean } = {},
+  options: { fromDraft?: boolean; recipe?: number | null } = {},
 ): Promise<void> {
   const kind = editorKindOf(item);
   if (kind === null) return Promise.resolve();

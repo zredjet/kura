@@ -41,6 +41,7 @@ import {
   listEditFormats,
   type OpDescriptor,
   openEdit,
+  openEditRecipe,
   type OutputSpec,
   stepEdit,
   viewEdit,
@@ -93,6 +94,8 @@ export type EditorSheet =
   | { kind: 'unsaved'; then: AfterClose }
   | { kind: 'saveWarnings'; closeAfter: AfterClose | null }
   | { kind: 'saveAs' }
+  /** レシピとして保存…（エディタの ▾）・レシピを保存（見本で編集）。M14 段 7。 */
+  | { kind: 'saveRecipe'; closeAfter: AfterClose | null }
   | { kind: 'revert' }
   | { kind: 'versions' }
   | { kind: 'restore'; version: number }
@@ -150,6 +153,22 @@ export interface EditorFailure {
   message: string;
 }
 
+/** レシピの見本のモード（M14 段 7。見本の元にレシピを継ぎ足して開いた。アイテムには保存しない）。 */
+export interface EditorRecipe {
+  id: number;
+  name: string;
+  description: string;
+  /** レシピの結び付け（ノードはエディタの文書の ID）。 */
+  bindings: EditRecipeBinding[];
+  /** レシピが出力の形式を決めている。 */
+  withFormat: boolean;
+  /** レシピに保存した頭の rev（開いたとき・レシピを保存したとき）。違えば保存していない変更がある。 */
+  savedHead: number | null;
+}
+
+/** レシピの結び付け（エディタの文書のノード）。 */
+export type EditRecipeBinding = NonNullable<EditOpenedDto['recipe']>['bindings'][number];
+
 export interface EditorState {
   phase: EditorPhase;
   /** 開くたびに増える（表示の面をつなぎ直す）。 */
@@ -185,6 +204,8 @@ export interface EditorState {
    * あと・形式を選ぶシートを出すときに読む）。読めていなければ null で、出力の行は形式の表だけで組む。
    */
   writableFormats: EditWritableFormatDto[] | null;
+  /** レシピの見本のモードで開いていれば、そのレシピ。 */
+  recipe: EditorRecipe | null;
 }
 
 const EMPTY_DOC: EditorDoc = { order: [], nodes: {}, outputs: [] };
@@ -211,6 +232,7 @@ function closedState(panel: EditorPanel, openId: number): EditorState {
     pendingSteps: false,
     acked: 0,
     writableFormats: null,
+    recipe: null,
   };
 }
 
@@ -307,10 +329,15 @@ export function applyDocDelta(doc: EditorDoc, delta: EditDocDeltaDto): EditorDoc
  * 今の頭を保存している途中なら、閉じても保存は続くので含めない（一時停止中も、閉じたあとにカプセルから再開できるので含めない）。
  */
 export function hasUnsavedChanges(
-  s: Pick<EditorState, 'status' | 'save'> & { pendingSteps?: boolean },
+  s: Pick<EditorState, 'status' | 'save'> & {
+    pendingSteps?: boolean;
+    recipe?: EditorRecipe | null;
+  },
 ): boolean {
   if (s.pendingSteps) return true;
   const st = s.status;
+  // レシピの見本：レシピに保存した頭から変わっていれば未保存（アイテムの保存とは関係しない）
+  if (s.recipe) return !!st && st.head !== s.recipe.savedHead;
   if (!st?.dirty) return false;
   const save = s.save;
   return !(
@@ -339,8 +366,10 @@ export function originalFormatOf(
  */
 export function canSaveEditor(
   s: Pick<EditorState, 'phase' | 'save' | 'status' | 'pendingSteps' | 'doc' | 'item'> &
-    Partial<Pick<EditorState, 'originalFormat'>>,
+    Partial<Pick<EditorState, 'originalFormat' | 'recipe'>>,
 ): boolean {
+  // レシピの見本はアイテムに保存しない（⌘S・保存はレシピを保存のシート）
+  if (s.recipe) return false;
   if (s.phase !== 'open' || s.save || !s.status) return false;
   if (s.status.dirty || s.pendingSteps) return true;
   const formats = formatsFor(s.item);
@@ -405,6 +434,8 @@ let openToken = 0;
 let pendingCancel: Promise<void> | null = null;
 /** 最後に開いた種類の口（開き直すときに使う）。 */
 let lastFactory: EditorAdapterFactory | null = null;
+/** 最後に開いたレシピの見本のレシピ（開き直すときに同じモードで開く）。 */
+let lastRecipe: number | null = null;
 
 /** 書ける形式の行が同じか（変わるのは書けるかと道具だけ。同じなら行を差し替えず、手のたびに描き直さない）。 */
 function sameWritable(
@@ -528,9 +559,11 @@ function contextFor<Tag>(holder: { rt: Runtime | null }): EditorAdapterContext<T
 export async function openEditorAs<Tag>(
   factory: EditorAdapterFactory<Tag>,
   item: ItemSummaryDto,
-  options: { fromDraft?: boolean } = {},
+  options: { fromDraft?: boolean; recipe?: number | null } = {},
 ): Promise<void> {
   lastFactory = factory as EditorAdapterFactory;
+  lastRecipe = options.recipe ?? null;
+  const recipeId = lastRecipe;
   const previous = runtime;
   const returnFocus = previous?.returnFocus ?? activeElement();
   if (previous) void disposeRuntime(previous, false);
@@ -564,7 +597,10 @@ export async function openEditorAs<Tag>(
       await pendingCancel;
       if (runtime !== rt) return;
     }
-    const opened = await openEdit(item.id, viewport, options.fromDraft ?? null);
+    const opened =
+      recipeId === null
+        ? await openEdit(item.id, viewport, options.fromDraft ?? null)
+        : await openEditRecipe(item.id, viewport, recipeId);
     if (runtime !== rt) {
       // 閉じた・替えたあとに開き終えた（開く途中の中止が間に合わなかった）
       closeEdit(opened.session).catch(() => undefined);
@@ -596,8 +632,19 @@ export async function openEditorAs<Tag>(
       source: opened.source,
       originalFormat: opened.originalFormat,
       draft: opened.draft,
-      // 下書きがあれば、捨てるか下書きから開くかを聞く（下書きから開いたあとは聞かない）
-      sheet: opened.draft.exists && !opened.draft.opened ? { kind: 'draft' } : null,
+      // 下書きがあれば、捨てるか下書きから開くかを聞く（下書きから開いたあとは聞かない。レシピの見本は下書きを持たない）
+      sheet:
+        opened.draft.exists && !opened.draft.opened && !opened.recipe ? { kind: 'draft' } : null,
+      recipe: opened.recipe
+        ? {
+            id: opened.recipe.id,
+            name: opened.recipe.name,
+            description: opened.recipe.description,
+            bindings: opened.recipe.bindings,
+            withFormat: opened.recipe.withFormat,
+            savedHead: opened.result.status.head,
+          }
+        : null,
     });
     applyResult(rt, opened.result, 0, viewport, false, null);
     // 開いたあとの実際の大きさ・倍率で頼み直す（見積もりと同じなら送らない）
@@ -621,7 +668,10 @@ export function reopenEditorWith(
   item: ItemSummaryDto,
   options: { fromDraft?: boolean } = {},
 ): Promise<void> {
-  return lastFactory ? openEditorAs(lastFactory, item, options) : Promise.resolve();
+  // レシピの見本は同じレシピで開き直す
+  return lastFactory
+    ? openEditorAs(lastFactory, item, { ...options, recipe: lastRecipe })
+    : Promise.resolve();
 }
 
 /** 開き直す（失敗のあと・Rust がセッションを閉じたあと）。 */
@@ -641,7 +691,8 @@ export function closeEditor(options: { discardDraft?: boolean } = {}): Promise<v
   const s = useEditorStore.getState();
   if (!rt && s.phase === 'closed') return Promise.resolve();
   const closing = rt
-    ? disposeRuntime(rt, true, options.discardDraft && s.item ? s.item.id : null)
+    ? // レシピの見本は見本のアイテムの下書きに触れない
+      disposeRuntime(rt, true, options.discardDraft && s.item && !s.recipe ? s.item.id : null)
     : Promise.resolve();
   useEditorStore.setState(closedState(s.panel, s.openId));
   const focus = rt?.returnFocus;
@@ -902,5 +953,7 @@ export function setOutputFormat(format: FormatChoice): void {
 /** 右パネルの「情報」を切り替える（⌘I）。 */
 export function toggleEditorInfo(): void {
   const s = useEditorStore.getState();
+  // レシピの見本は見本のアイテムの情報を出さない
+  if (s.recipe) return;
   useEditorStore.setState({ panel: s.panel === 'info' ? 'ops' : 'info' });
 }

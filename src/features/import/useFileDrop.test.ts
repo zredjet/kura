@@ -2,12 +2,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { previewImport } from '../../ipc/import';
 import { useImportStore } from '../../stores/importStore';
-import { handleDragDrop } from './useFileDrop';
+import { importRecipeAction } from '../recipes/recipeActions';
+import { handleDragDrop, isRecipeFile } from './useFileDrop';
 
 vi.mock('../../ipc/import', () => ({
   previewImport: vi.fn(() => new Promise(() => {})),
   startImport: vi.fn(),
 }));
+vi.mock('../recipes/recipeActions', () => ({ importRecipeAction: vi.fn(async () => undefined) }));
 
 beforeEach(() => {
   useImportStore.setState({
@@ -43,5 +45,16 @@ describe('handleDragDrop', () => {
     expect(useImportStore.getState().dragging).toBe(false);
     handleDragDrop({ type: 'drop', paths: ['/other'] });
     expect(useImportStore.getState().paths).toEqual(['/src']);
+  });
+
+  it('レシピのファイル（.kurarecipe）は読み込み、ほかは取り込みのシートへ（M14 段 7）', async () => {
+    expect(isRecipeFile('/a/b.KURARECIPE')).toBe(true);
+    expect(isRecipeFile('/a/b.png')).toBe(false);
+    handleDragDrop({ type: 'drop', paths: ['/r.kurarecipe'] });
+    await Promise.resolve();
+    expect(importRecipeAction).toHaveBeenCalledWith('/r.kurarecipe');
+    expect(useImportStore.getState().phase).toBe('idle');
+    handleDragDrop({ type: 'drop', paths: ['/x.kurarecipe', '/a.png'] });
+    expect(useImportStore.getState().paths).toEqual(['/a.png']);
   });
 });

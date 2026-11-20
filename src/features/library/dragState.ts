@@ -10,6 +10,8 @@
  * - `data-drop-entry="<id>"`：ユニットの中のタイル・リストの行（並べ替え。`data-drop-axis="y"` なら上下で判定）
  * - `data-drop-playlist="<id>"`：サイドバーの手動プレイリスト（アイテム・ユニット・フォルダを入れる。⌥ で展開を逆に）
  * - `data-drop-playlist-entry="<id>"`：プレイリストの画面の行（並べ替え）
+ * - `data-recipe-row="<id>"`：サイドバーのレシピの行（並べ替え）
+ * - `data-drop-recipe="<id>"`：サイドバーのレシピ（タイルを落とすと、そのレシピを当てるシート。M14 段 7）
  */
 
 import { create } from 'zustand';
@@ -24,6 +26,8 @@ import {
   movePlaylist,
 } from '../playlists/playlistActions';
 import { addToFolder, dropWithinUnit, moveFolderTo } from './actions';
+import { openApply } from '../recipes/applyStore';
+import { moveRecipe } from '../recipes/recipeStore';
 import { viewedSetUnit } from './itemMenu';
 
 export type DragPayload =
@@ -31,7 +35,9 @@ export type DragPayload =
   | { kind: 'folder'; id: number }
   | { kind: 'playlistEntries'; playlistId: number; ids: number[] }
   /** サイドバーのプレイリストの行（並べ替え）。 */
-  | { kind: 'playlist'; id: number };
+  | { kind: 'playlist'; id: number }
+  /** サイドバーのレシピの行（並べ替え）。 */
+  | { kind: 'recipe'; id: number };
 
 export type DropTarget =
   | { kind: 'folder'; id: number; position: DropPosition }
@@ -39,7 +45,10 @@ export type DropTarget =
   | { kind: 'entry'; id: number; side: 'before' | 'after' }
   | { kind: 'playlist'; id: number }
   | { kind: 'playlistEntry'; id: number; side: 'before' | 'after' }
-  | { kind: 'playlistOrder'; id: number; side: 'before' | 'after' };
+  | { kind: 'playlistOrder'; id: number; side: 'before' | 'after' }
+  /** レシピの行（タイルを落とすと当てるシート）。 */
+  | { kind: 'recipe'; id: number }
+  | { kind: 'recipeOrder'; id: number; side: 'before' | 'after' };
 
 interface DragState {
   payload: DragPayload | null;
@@ -76,6 +85,15 @@ export function findTarget(payload: DragPayload, x: number, y: number): DropTarg
     const rect = row.getBoundingClientRect();
     return { kind: 'playlistOrder', id, side: y - rect.top < rect.height / 2 ? 'before' : 'after' };
   }
+  if (payload.kind === 'recipe') {
+    const row = element.closest<HTMLElement>('[data-recipe-row]');
+    const id = Number(row?.dataset.recipeRow);
+    if (!row || id === payload.id) {
+      return null;
+    }
+    const rect = row.getBoundingClientRect();
+    return { kind: 'recipeOrder', id, side: y - rect.top < rect.height / 2 ? 'before' : 'after' };
+  }
   if (payload.kind === 'playlistEntries') {
     const row = element.closest<HTMLElement>('[data-drop-playlist-entry]');
     if (!row) {
@@ -87,6 +105,10 @@ export function findTarget(payload: DragPayload, x: number, y: number): DropTarg
     }
     const rect = row.getBoundingClientRect();
     return { kind: 'playlistEntry', id, side: y - rect.top < rect.height / 2 ? 'before' : 'after' };
+  }
+  const recipeRow = element.closest<HTMLElement>('[data-drop-recipe]');
+  if (recipeRow && payload.kind === 'entries') {
+    return { kind: 'recipe', id: Number(recipeRow.dataset.dropRecipe) };
   }
   const playlistRow = element.closest<HTMLElement>('[data-drop-playlist]');
   if (playlistRow) {
@@ -129,6 +151,18 @@ export function performDrop(payload: DragPayload, target: DropTarget, alt = fals
   if (payload.kind === 'playlist') {
     if (target.kind === 'playlistOrder') {
       void movePlaylist(payload.id, target.id, target.side);
+    }
+    return;
+  }
+  if (payload.kind === 'recipe') {
+    if (target.kind === 'recipeOrder') {
+      void moveRecipe(payload.id, target.id, target.side);
+    }
+    return;
+  }
+  if (target.kind === 'recipe') {
+    if (payload.kind === 'entries') {
+      void openApply({ type: 'recipe', id: target.id }, payload.ids);
     }
     return;
   }
