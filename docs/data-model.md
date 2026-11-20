@@ -94,6 +94,7 @@ Kura Library.kuralib/
 | `0011_edit_versions` | 保存と版（M12 の段 2。docs/editing.md §4.4・§9.4・§14）：文書の部品 `edit_objects`・`edit_edges`、版 `item_versions`、版の入力 `item_version_inputs`、アンカー `edit_anchors`、来歴 `item_derivations`、下書き `edit_drafts`、台帳の予告 `ledger_pending` を足し、`jobs_kind` に `edit`・`gc` を足す（名前付きの CHECK の入れ替え）。新しい表だけなので Plain。版 0（元）は最初の保存のときに足すので、既存のアイテムには行を足さない（10 万件でも表を作るだけ。合成 10 万件 `--history` で 1.18〜1.21 ms。`bench migrate --runs 3`、2026-10-24）。台帳を参照する列（`item_versions.file_blob_id`・`edit_anchors.blob_id`）は ON DELETE なし（`ledger::REFERRERS` に足した）、items を参照する列は CASCADE（来歴の元だけ SET NULL） |
 | `0012_batch` | 一括加工の表と口（M14 段 3。docs/editing.md §4.3、ADR-190・192）：レシピ `edit_recipes`（文書は `edit_objects` の部品、結び付けは `recipe::bindings_json` の正規の JSON、並びは `pos`）と、一括の対象と結果 `batch_items`（1 件ずつのコミットと同じトランザクションで行を書く。一括の版は `item_versions.job_id` を空にしてこの行の `version_id` で引く）を足し、`jobs_kind` に `batch` を足す（名前付きの CHECK の入れ替え）。新しい表だけなので Plain（合成 10 万件 `--history` で 0.67〜0.70 ms。`bench migrate --runs 3`、2026-11-19）。`batch_items.job_id` は外部キーにしない（`jobs` を参照される表にしない）。対象のアイテムを消すと行も消え（CASCADE）、版・別名で作ったアイテムを消すと NULL（SET NULL） |
 | `0013_item_sources` | N → 1 の来歴（M14 段 6。docs/editing.md §4.5・§14.2「N → 1」、ADR-197）：選んだ N 件から作ったスプライトシート（新しいアイテム。元はできたファイル）の元を、選んだ順に元のアイテム・読んだときの頭の版・読んだ中身・並べたフレームの数で持つ `item_sources`（別名で保存の来歴 `item_derivations` は元 1 つなので別の表）。新しい表だけなので Plain（合成 10 万件 `--history` で 0.15〜0.18 ms。`bench migrate --runs 3`、2026-11-20）。作ったアイテムを消すと行も消え（CASCADE）、元のアイテムを消すと NULL（SET NULL） |
+| `0014_credits` | ライセンスとクレジット（M15 段 1。§4「ライセンスとクレジット（M15）」、ADR-202・203）：ライセンスの表 `licenses`（既定の 13 行を入れる。`builtin` に鍵、名前は大文字小文字を問わず一意、表記義務 `attribution`（required・optional・none）・商用・改変・継承の印）と、アイテムごとのクレジット `item_credits`（ライセンス・作者・作品・出典・表記の文。何か入っているアイテムにだけ行がある）を足す。新しい表だけなので Plain（合成 10 万件 `--history` で 0.17〜0.18 ms。照合の差 0。`bench migrate --runs 3`、2026-11-21）。アイテムを消すとクレジットも消え（CASCADE）、自作のライセンスを消すと未設定に戻る（SET NULL） |
 
 ```sql
 -- ===== 実ファイルの台帳（0007。files/ab/cd/<hash>.<ext> 1 つに 1 行）=====
@@ -705,6 +706,40 @@ CREATE INDEX idx_batch_items_item     ON batch_items(item_id);
 CREATE INDEX idx_batch_items_version  ON batch_items(version_id);
 CREATE INDEX idx_batch_items_out_item ON batch_items(out_item_id);
 
+-- ===== ライセンス（0014。M15 段 1。§4「ライセンスとクレジット（M15）」）=====
+CREATE TABLE licenses (
+  id           INTEGER PRIMARY KEY,
+  builtin      TEXT,                                   -- 既定の行の鍵（'cc-by-4.0' など。名前と印を変えられず消せない）。利用者の行は NULL
+  name         TEXT    NOT NULL,                       -- 表示名。大文字小文字を問わず一意（idx_licenses_name）
+  spdx         TEXT,                                   -- SPDX の識別子（'CC-BY-4.0'）
+  url          TEXT,
+  attribution  TEXT    NOT NULL CONSTRAINT licenses_attribution CHECK (attribution IN ('required','optional','none')),  -- 表記義務
+  commercial   TEXT    NOT NULL CONSTRAINT licenses_commercial CHECK (commercial IN ('yes','no','unknown')),
+  modify       TEXT    NOT NULL CONSTRAINT licenses_modify CHECK (modify IN ('yes','no','unknown')),
+  share_alike  INTEGER NOT NULL DEFAULT 0 CONSTRAINT licenses_share_alike CHECK (share_alike IN (0, 1)),
+  note         TEXT,
+  pos          INTEGER NOT NULL,                       -- 並び（既定の行が 0〜12、利用者の行は最後に足す）
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX idx_licenses_builtin ON licenses(builtin) WHERE builtin IS NOT NULL;
+CREATE UNIQUE INDEX idx_licenses_name ON licenses(name COLLATE NOCASE);
+-- 既定の行（pos の順）：cc0-1.0（CC0 1.0・不要）・cc-by-4.0・cc-by-3.0（CC BY・必要）・cc-by-sa-4.0・cc-by-sa-3.0（継承）・
+-- cc-by-nc-4.0・cc-by-nc-sa-4.0（商用 no）・oga-by-3.0・ofl-1.1（SIL OFL 1.1。継承）・mit・apache-2.0（必要）・
+-- public-domain（パブリックドメイン・不要）・own（自作・不要）
+
+-- ===== アイテムのクレジット（0014。M15 段 1。何か 1 つでも入っているアイテムにだけ行がある）=====
+CREATE TABLE item_credits (
+  item_id     INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+  license_id  INTEGER REFERENCES licenses(id) ON DELETE SET NULL,  -- NULL は未設定（自作のライセンスを消すと戻る）
+  author      TEXT,                                    -- 作者
+  work        TEXT,                                    -- 作品・素材集の名前
+  url         TEXT,                                    -- 出典（NULL なら items.source_url）
+  credit      TEXT,                                    -- 表記の文（NULL なら作者・作品・出典・ライセンスから組む）
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_item_credits_license ON item_credits(license_id);
+
 -- ===== 全文検索（外部コンテンツ FTS5、trigram）=====
 CREATE VIRTUAL TABLE items_fts USING fts5(
   title, original_name, note, source_url,
@@ -909,6 +944,8 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
    WHERE id = ?B;
   INSERT INTO item_tags (tag_id, item_id, source) SELECT tag_id, ?B, source FROM item_tags WHERE item_id = ?A;        -- idx_item_tags_item
   INSERT INTO item_folders (folder_id, item_id, pos) SELECT folder_id, ?B, pos FROM item_folders WHERE item_id = ?A; -- idx_item_folders_item
+  INSERT INTO item_credits (item_id, license_id, author, work, url, credit, updated_at)                              -- M15 段 1
+    SELECT ?B, license_id, author, work, url, credit, ? FROM item_credits WHERE item_id = ?A;                         -- 主キー
   INSERT INTO item_derivations (item_id, source_item_id, source_version, source_hash, created_at) VALUES (?B, ?A, ?土台の版, ?A の今, ?);
   ```
 
@@ -1150,6 +1187,28 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   1 件を戻すときは元の行を `WHERE job_id = ? AND item_id = ?`（上書き。`UNIQUE (job_id, item_id)`）・`WHERE out_item_id = ? AND job_id = ?`
   （別名。`idx_batch_items_out_item`）で引き、`item_versions` を ID で結んで一括の版の番号を読む。別名の戻しは、頭を照らしてからゴミ箱へ
   入れ（`UPDATE items SET trashed_at = ?`）、行を saved にするのを 1 つのトランザクションで行う。
+
+### ライセンスとクレジット（M15。`crates/kura-core/src/credits/`。ADR-202・203）
+
+- **ライセンスの表**：既定の 13 行（0014 が入れる。`builtin` に鍵）と利用者の行。既定の行は名前と印を変えられず消せない
+  （`credits::licenses` が `Invalid` で断る）。名前は前後の空白を除いた NFC で、大文字小文字を問わず一意（`Conflict`）。利用者の行は
+  並びの最後（`max(pos) + 1`）に足す。一覧は `SELECT … , (SELECT count(*) FROM item_credits c WHERE c.license_id = l.id) FROM licenses l
+  ORDER BY l.pos, l.id`（付けた件数は `idx_item_credits_license`）。利用者の行を消すと、使っていたアイテムは `ON DELETE SET NULL` で
+  未設定に戻る（画面は件数で確かめてから消す。段 1 の決定 4）。
+- **アイテムのクレジット**：行は何か 1 つでも入っているアイテムにだけある。まとめて付ける（`credits::item::set`）は、アイテムと
+  ユニット（メンバー全員。`unit::members`）を重なりを除いた列にし、1 件ずつ今の行を読んでパッチの項目だけを変え、変わったものだけ
+  `INSERT … ON CONFLICT(item_id) DO UPDATE` で書く（全部空になれば `DELETE`）。文の項目は前後の空白を除いた NFC、空は NULL、
+  4,000 文字まで。ない ID は飛ばし、ないライセンスは `NotFound`。`items.updated_at` は変えない。
+- **別名で保存**は、評価・メモ・出どころと同じトランザクションでクレジットの行を写す（§4「保存と版（M12）」の「別名の写し方」。
+  段 1 の決定 2）。N → 1 で作ったシートには写さない（元が N 件あり、一覧では `item_sources` の元からたどる）。
+- **集める**（`credits::collect`）：使ったアイテムから、`item_derivations`（別名の元）と `item_sources`（N → 1 の元。`ord` の順）を
+  主キーでたどり（`SELECT … FROM items i LEFT JOIN item_credits c ON c.item_id = i.id WHERE i.id = ?`。どれも主キー・`idx` を引く）、
+  ライセンスのあるクレジットを（ライセンス・作品・作者・出典（`coalesce(c.url, i.source_url)`）・表記の文）の鍵でまとめる。来歴の元が
+  なくライセンスも未設定のアイテムは「未設定」、元のアイテムが消えた（`source_item_id` が NULL）アイテムは「元が消えた」として返す。
+  元の元もたどり、ライセンスのあるアイテムの元もたどる（改変したものも元の表記が要る）。並びはライセンスの `pos` → 鍵の順。
+- **検索**（docs/search-query.md §3）：`ライセンス`・`表記`・`クレジット` は、アイテム自身の行で
+  `i.id IN (SELECT c.item_id FROM item_credits c WHERE …)` の集合の部分問い合わせにする（相関しない。ライセンスと表記は
+  `idx_item_credits_license` で引く）。来歴の元は見ない。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
 
