@@ -93,6 +93,7 @@ Kura Library.kuralib/
 | `0010_items_blob_id` | `items.blob_id`（台帳の行の ID の写し。CHECK・外部キーなしの `ADD COLUMN`）を足して hash から埋め、`idx_items_blob` と、入れる・hash を変えるときに台帳から引いて入れる AFTER のトリガ `items_blob_id_ai`・`items_blob_id_au` を作る（M12。検索の事実の条件を整数の鍵で引く。M11 の決定 17。10 万件で約 0.2 秒） |
 | `0011_edit_versions` | 保存と版（M12 の段 2。docs/editing.md §4.4・§9.4・§14）：文書の部品 `edit_objects`・`edit_edges`、版 `item_versions`、版の入力 `item_version_inputs`、アンカー `edit_anchors`、来歴 `item_derivations`、下書き `edit_drafts`、台帳の予告 `ledger_pending` を足し、`jobs_kind` に `edit`・`gc` を足す（名前付きの CHECK の入れ替え）。新しい表だけなので Plain。版 0（元）は最初の保存のときに足すので、既存のアイテムには行を足さない（10 万件でも表を作るだけ。合成 10 万件 `--history` で 1.18〜1.21 ms。`bench migrate --runs 3`、2026-10-24）。台帳を参照する列（`item_versions.file_blob_id`・`edit_anchors.blob_id`）は ON DELETE なし（`ledger::REFERRERS` に足した）、items を参照する列は CASCADE（来歴の元だけ SET NULL） |
 | `0012_batch` | 一括加工の表と口（M14 段 3。docs/editing.md §4.3、ADR-190・192）：レシピ `edit_recipes`（文書は `edit_objects` の部品、結び付けは `recipe::bindings_json` の正規の JSON、並びは `pos`）と、一括の対象と結果 `batch_items`（1 件ずつのコミットと同じトランザクションで行を書く。一括の版は `item_versions.job_id` を空にしてこの行の `version_id` で引く）を足し、`jobs_kind` に `batch` を足す（名前付きの CHECK の入れ替え）。新しい表だけなので Plain（合成 10 万件 `--history` で 0.67〜0.70 ms。`bench migrate --runs 3`、2026-11-19）。`batch_items.job_id` は外部キーにしない（`jobs` を参照される表にしない）。対象のアイテムを消すと行も消え（CASCADE）、版・別名で作ったアイテムを消すと NULL（SET NULL） |
+| `0013_item_sources` | N → 1 の来歴（M14 段 6。docs/editing.md §4.5・§14.2「N → 1」、ADR-197）：選んだ N 件から作ったスプライトシート（新しいアイテム。元はできたファイル）の元を、選んだ順に元のアイテム・読んだときの頭の版・読んだ中身・並べたフレームの数で持つ `item_sources`（別名で保存の来歴 `item_derivations` は元 1 つなので別の表）。新しい表だけなので Plain（合成 10 万件 `--history` で 0.15〜0.18 ms。`bench migrate --runs 3`、2026-11-20）。作ったアイテムを消すと行も消え（CASCADE）、元のアイテムを消すと NULL（SET NULL） |
 
 ```sql
 -- ===== 実ファイルの台帳（0007。files/ab/cd/<hash>.<ext> 1 つに 1 行）=====
@@ -633,6 +634,19 @@ CREATE TABLE item_derivations (
 );
 CREATE INDEX idx_item_derivations_source ON item_derivations(source_item_id);
 
+-- ===== N → 1 の来歴（0013。M14 段 6。選んだ N 件から作ったスプライトシートの元。§4「一括加工（M14）」）=====
+CREATE TABLE item_sources (
+  item_id         INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,     -- 作ったアイテム
+  ord             INTEGER NOT NULL CONSTRAINT item_sources_ord CHECK (ord >= 0),  -- 選んだ順（シートの並び）
+  source_item_id  INTEGER REFERENCES items(id) ON DELETE SET NULL,
+  source_version  INTEGER NOT NULL,                    -- 読んだときの頭の版
+  source_hash     BLOB    NOT NULL,                    -- 読んだ中身（今）
+  frames          INTEGER NOT NULL CONSTRAINT item_sources_frames CHECK (frames >= 1),  -- この元から並べたフレームの数
+  created_at      INTEGER NOT NULL,
+  PRIMARY KEY (item_id, ord)
+) WITHOUT ROWID;
+CREATE INDEX idx_item_sources_source ON item_sources(source_item_id);
+
 -- ===== 下書き（0011。アイテムごとに保存していない文書 1 つ。docs/editing.md §12.12）=====
 CREATE TABLE edit_drafts (
   item_id       INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
@@ -1114,6 +1128,15 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 - **一括の版の持ち主**（ADR-192 (1)）：一括で足した版は `item_versions.job_id` を NULL にし（1 件の場の `UnitCx::version_job` が None）、
   `batch_items.version_id` で引く。保存のジョブの 1 ジョブ 1 版（`idx_item_versions_job`・再開の `versions::by_job`）は変えない。台帳の
   予告の持ち主は一括のジョブで、トランザクション 2 はその 1 件の予告だけを行の ID で消す（上の「予告と照合」）。
+- **N → 1**（M14 段 6。`edit::batch::merge`）：一括のジョブの向き `merge` の行は並べるアイテム（`ord` が並べる順）。作るトランザクションで
+  `INSERT INTO items …`（`import::store::insert_item`。台帳はトリガで載る）・`INSERT INTO item_sources (item_id, ord, source_item_id,
+  source_version, source_hash, frames, created_at)`（選んだ順。`ord` は作ったアイテムの中の順）・素材の設定の格子（`asset::set_settings`）・
+  `UPDATE batch_items SET state = 'saved', base_hash = ?, base_version = ?, out_item_id = ? … WHERE job_id = ? AND ord = ? AND state =
+  'pending'`（1 行でなければ戻す）と予告の片付け（`ledger::clear_pending`）を 1 つで行う（版の行は書かない。作ったアイテムは版 0 の
+  まま）。予告のトランザクションで `SELECT count(*) FROM batch_items WHERE job_id = ? AND state = 'pending'`（主キーの頭）が 0 なら作らない
+  （中止のあと）。作ったアイテムの元は `SELECT … FROM item_sources WHERE item_id = ? ORDER BY ord`（主キー）、元から作ったシートは
+  `idx_item_sources_source` で引く。元に戻すは、元の一括の `out_item_id`（`idx_batch_items_out_item`）で作ったアイテムを引き、頭の版が
+  0 のときだけゴミ箱へ入れる。
 - **結果と元に戻す**（M14 段 5。表は変えない）：結果のシートは `SELECT item_id, state, code, out_item_id FROM batch_items WHERE job_id = ?
   ORDER BY ord`（主キー）で状態と理由ごとに群にし、1 件ずつの行は `... WHERE job_id = ?1 AND (?2 IS NULL OR state = ?2) AND (?3 IS NULL
   OR code = ?3) ORDER BY ord LIMIT ? OFFSET ?`（主キーの頭）。元に戻す一括（`jobs.input_json` の `mode.type = 'undo'`・`mode.of` が元の
