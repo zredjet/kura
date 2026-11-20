@@ -144,6 +144,7 @@ function opened(session = 'aa01', over: Partial<EditStepResultDto> = {}) {
     pixelArt: true,
     draft: { exists: false, fresh: true, updatedAt: null, opened: false },
     result: result(over),
+    recipe: null,
   };
 }
 

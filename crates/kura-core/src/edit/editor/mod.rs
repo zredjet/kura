@@ -378,6 +378,21 @@ pub struct Opened {
     pub draft: DraftInfo,
     /// 開いたときの状態・文書（全体）・表示。
     pub outcome: StepOutcome,
+    /// レシピの見本のモードで開いた（[`open_recipe`]）。
+    pub recipe: Option<RecipeSample>,
+}
+
+/// レシピの見本のモード（M14 段 7。見本のアイテムの元にレシピを継ぎ足して開く。下書きを置かず、アイテムに保存しない。
+/// 中身は `recipes::replace_from_editor` でレシピへ戻す）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecipeSample {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    /// レシピの結び付け（ノードはエディタの文書の ID に付け替えたもの）。
+    pub bindings: Vec<kura_engine::recipe::Binding>,
+    /// レシピが出力の形式を決めている（「元と同じ」でない）。
+    pub with_format: bool,
 }
 
 /// 保存の向き。
@@ -563,6 +578,8 @@ pub struct Editor {
     opened: AtomicBool,
     published: Mutex<Published>,
     autosave: Autosave,
+    /// レシピの見本のモードで開いたレシピ（保存を断る）。
+    recipe: Option<i64>,
 }
 
 impl std::fmt::Debug for Editor {
@@ -1414,6 +1431,12 @@ pub fn save(
     format: Option<FormatChoice>,
 ) -> Result<SaveStarted, EditorError> {
     let editor = editor_of(env, session)?;
+    if editor.recipe.is_some() {
+        return Err(EditorError::Invalid {
+            message: "レシピの見本はアイテムに保存できません（レシピを保存してください）".into(),
+            issues: Vec::new(),
+        });
+    }
     let mut guard = editor.lock_state();
     let st = guard.as_mut().ok_or(EditorError::NoSession)?;
     let mut notices = Vec::new();
@@ -1527,6 +1550,63 @@ pub fn save(
 }
 
 /// 版 `version` の文書（版の行がない・文書のない版は空の文書）。
+/// レシピ `id` を見本のモードの文書にする：元（空の文書）にレシピを継ぎ足し、結び付けのノードをずらした ID に付け替える。
+fn recipe_sample(
+    env: &EditorEnv<'_>,
+    runtime: &EngineRuntime,
+    id: i64,
+) -> Result<(RecipeSample, Graph), EditorError> {
+    let stored = super::recipes::get(env.library.db(), runtime, id).map_err(|e| match e {
+        CoreError::NotFound(m) => EditorError::NotFound(m),
+        e => e.into(),
+    })?;
+    let invalid = |message: String| EditorError::Invalid {
+        message,
+        issues: Vec::new(),
+    };
+    if let Some(problem) = stored.problem {
+        return Err(invalid(problem));
+    }
+    let recipe = stored.recipe;
+    if recipe.kind != kura_engine::recipe::RecipeKind::Each {
+        return Err(invalid(
+            "まとめて 1 つにするレシピは見本で編集できません".into(),
+        ));
+    }
+    let base = Graph::new_single();
+    let offset = base.next_id;
+    let graph = kura_engine::doc::compose(&base, &recipe.graph)
+        .map_err(|e| EditorError::from_engine("レシピを見本につなげません", e))?;
+    let bindings = recipe
+        .bindings
+        .into_iter()
+        .map(|mut b| {
+            b.node = NodeId(
+                b.node
+                    .0
+                    .checked_add(offset)
+                    .ok_or_else(|| invalid("レシピのノードの ID を使い切りました".into()))?,
+            );
+            Ok(b)
+        })
+        .collect::<Result<Vec<_>, EditorError>>()?;
+    let with_format = recipe
+        .graph
+        .outputs
+        .first()
+        .is_some_and(|o| o.format != FormatChoice::Keep);
+    Ok((
+        RecipeSample {
+            id,
+            name: recipe.name,
+            description: recipe.description,
+            bindings,
+            with_format,
+        },
+        graph,
+    ))
+}
+
 fn version_graph(
     env: &EditorEnv<'_>,
     runtime: &EngineRuntime,
@@ -1640,6 +1720,25 @@ fn draft_interval() -> Duration {
 
 /// エディタを開く（モジュールの説明）。前のエディタは閉じる。
 pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorError> {
+    open_inner(env, req, None)
+}
+
+/// レシピ `recipe` の見本のモードで、アイテム `req.item_id` を開く（M14 段 7。docs/editing.md §4.3「見本で編集」）：アイテムの
+/// 元（版 0 の空の文書）にレシピを継ぎ足した文書で開き、下書きは置かず・開かず（`req.from_draft` は見ない）、保存は断る。
+/// N → 1 のレシピ・今の Kura で当てられないレシピは Invalid。前の保存が終わっていないアイテムは開かない（SavePending）。
+pub fn open_recipe(
+    env: &EditorEnv<'_>,
+    req: &OpenRequest,
+    recipe: i64,
+) -> Result<Opened, EditorError> {
+    open_inner(env, req, Some(recipe))
+}
+
+fn open_inner(
+    env: &EditorEnv<'_>,
+    req: &OpenRequest,
+    recipe_id: Option<i64>,
+) -> Result<Opened, EditorError> {
     let db = env.library.db();
     let item_id = req.item_id;
     let runtime = env
@@ -1670,28 +1769,45 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
     if let Some(job) = db.read(|c| pending_save(c, item_id))? {
         return Err(EditorError::SavePending { job });
     }
-    let draft = db.read(|c| {
-        let Some(d) = drafts::get(c, item_id)? else {
-            return Ok(None);
-        };
-        let fresh = drafts::is_fresh(c, &d)?;
-        Ok(Some((d, fresh)))
-    })?;
+    let recipe = match recipe_id {
+        Some(id) => Some(recipe_sample(env, &runtime, id)?),
+        None => None,
+    };
+    let draft = recipe
+        .is_none()
+        .then(|| {
+            db.read(|c| {
+                let Some(d) = drafts::get(c, item_id)? else {
+                    return Ok(None);
+                };
+                let fresh = drafts::is_fresh(c, &d)?;
+                Ok(Some((d, fresh)))
+            })
+        })
+        .transpose()?
+        .flatten();
     let mut info = DraftInfo {
         exists: draft.is_some(),
         fresh: draft.as_ref().is_some_and(|(_, f)| *f),
         updated_at: draft.as_ref().map(|(d, _)| d.updated_at),
         opened: false,
     };
-    let (graph, base) = match (req.from_draft, &draft) {
-        (true, Some(_)) => {
+    let (graph, base) = match (&recipe, req.from_draft, &draft) {
+        (Some((_, graph)), _, _) => (
+            graph.clone(),
+            Base {
+                hash: head.hash,
+                version: head.version,
+            },
+        ),
+        (None, true, Some(_)) => {
             let opened = drafts::open(db, &runtime, item_id)?
                 .ok_or_else(|| EditorError::NotFound(format!("アイテム {item_id} の下書き")))?;
             info.opened = true;
             info.fresh = opened.fresh;
             (opened.graph, opened.base)
         }
-        _ => {
+        (None, _, _) => {
             let graph = version_graph(env, &runtime, item_id, head.version)?;
             (
                 graph,
@@ -1766,7 +1882,12 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
         state: Mutex::new(None),
         opened: AtomicBool::new(false),
         published: Mutex::new(Published::default()),
-        autosave: Autosave::start(env.library.clone(), item_id, draft_interval()),
+        autosave: if recipe.is_some() {
+            Autosave::off(env.library.clone(), item_id)
+        } else {
+            Autosave::start(env.library.clone(), item_id, draft_interval())
+        },
+        recipe: recipe_id,
     });
     env.engine.install_editor(editor.clone());
     // 置いたあとに確かめ直す（上の確かめと置くまでの間に、このアイテムを含む一括が積まれたら開かない。一括を積む口は置き場の
@@ -1822,6 +1943,7 @@ pub fn open(env: &EditorEnv<'_>, req: &OpenRequest) -> Result<Opened, EditorErro
             pixel_art,
             draft: info,
             outcome,
+            recipe: recipe.map(|(sample, _)| sample),
         }),
         Err(err) => {
             if let Some(e) = env.engine.take_editor(Some(&editor.id)) {

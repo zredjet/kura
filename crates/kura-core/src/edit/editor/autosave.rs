@@ -53,6 +53,8 @@ pub(super) struct Autosave {
     library: Arc<Library>,
     item_id: i64,
     threaded: bool,
+    /// 下書きを置かない（レシピの見本のモード。M14 段 7）。
+    off: bool,
 }
 
 impl Autosave {
@@ -74,6 +76,19 @@ impl Autosave {
             thread: Mutex::new(thread),
             library,
             item_id,
+            off: false,
+        }
+    }
+
+    /// 下書きを置かないもの（レシピの見本のモード：見本のアイテムの下書きに触れない。スレッドは起こさない）。
+    pub(super) fn off(library: Arc<Library>, item_id: i64) -> Self {
+        Self {
+            shared: Arc::new((Mutex::new(Queue::default()), Condvar::new())),
+            thread: Mutex::new(None),
+            library,
+            item_id,
+            threaded: false,
+            off: true,
         }
     }
 
@@ -83,6 +98,9 @@ impl Autosave {
 
     /// 頼む（前の頼みは置き換える）。
     pub(super) fn request(&self, job: DraftJob) {
+        if self.off {
+            return;
+        }
         if !self.threaded {
             write(&self.library, self.item_id, job);
             return;

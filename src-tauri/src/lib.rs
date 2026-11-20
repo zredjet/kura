@@ -73,6 +73,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::asset::item_asset_settings_set,
             commands::asset::item_anim_get,
             commands::edit::edit_open,
+            commands::edit::edit_open_recipe,
             commands::edit::edit_step,
             commands::edit::edit_view,
             commands::edit::edit_sample,

@@ -226,6 +226,7 @@ function opened(
     pixelArt: true,
     draft: { exists: false, fresh: true, updatedAt: null, opened: false, ...draft },
     result: result(over),
+    recipe: null,
   };
 }
 

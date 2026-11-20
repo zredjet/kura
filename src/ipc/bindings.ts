@@ -67,6 +67,11 @@ export const commands = {
 	itemAnimGet: (itemId: number) => typedError<AnimDto, AppError>(__TAURI_INVOKE("item_anim_get", { itemId })),
 	/**  エディタを開く（前のエディタは閉じる）。`fromDraft` が真で下書きがあれば、下書きの文書と土台で開く。画像と音声。 */
 	editOpen: (itemId: number, viewport: EditViewportDto, fromDraft: boolean | null) => typedError<EditOpenedDto_Serialize, AppError>(__TAURI_INVOKE("edit_open", { itemId, viewport, fromDraft })),
+	/**
+	 *  レシピ `recipe` の見本のモードでアイテム `itemId` を開く（M14 段 7。見本の元にレシピを継ぎ足す。下書きは置かず・開かず、
+	 *  アイテムに保存しない。N → 1 のレシピ・当てられないレシピは Invalid）。
+	 */
+	editOpenRecipe: (itemId: number, viewport: EditViewportDto, recipe: number) => typedError<EditOpenedDto_Serialize, AppError>(__TAURI_INVOKE("edit_open_recipe", { itemId, viewport, recipe })),
 	/**  手をまとめて当てて表示する（描くのは最後に 1 回）。 */
 	editStep: (session: string, steps: EditStepDto_Deserialize[], viewport: EditViewportDto) => typedError<EditStepResultDto_Serialize, AppError>(__TAURI_INVOKE("edit_step", { session, steps, viewport })),
 	/**  表示だけ（パン・ズーム・段の変更。保存が終わったあとの状態もこれで取り直す）。 */
@@ -1339,6 +1344,8 @@ export type EditOpenedDto_Deserialize = {
 	draft: EditDraftDto,
 	/**  開いたときの状態・文書（全体）・表示。 */
 	result: EditStepResultDto_Deserialize,
+	/**  レシピの見本のモードで開いた（`edit_open_recipe`）。 */
+	recipe: EditRecipeDto_Deserialize | null,
 };
 
 /**  開いた結果。 */
@@ -1358,6 +1365,8 @@ export type EditOpenedDto_Serialize = {
 	draft: EditDraftDto,
 	/**  開いたときの状態・文書（全体）・表示。 */
 	result: EditStepResultDto_Serialize,
+	/**  レシピの見本のモードで開いた（`edit_open_recipe`）。 */
+	recipe: EditRecipeDto_Serialize | null,
 };
 
 /**  波形の段の状態（`/edit/{session}/{rev}/peaks/{bin}/{tile}` の `{rev}` は、この `rev`＝段の世代）。 */
@@ -1404,6 +1413,40 @@ export type EditProblemDto = {
 	code: AppErrorCode,
 	message: string,
 	issues: Issue[],
+};
+
+/**
+ *  レシピの見本のモードの印（M14 段 7）：見本のアイテムの元にレシピを継ぎ足して開いた。下書きは置かず、アイテムに保存しない
+ *  （保存は `recipe_replace` でレシピへ）。
+ */
+export type EditRecipeDto = EditRecipeDto_Serialize | EditRecipeDto_Deserialize;
+
+/**
+ *  レシピの見本のモードの印（M14 段 7）：見本のアイテムの元にレシピを継ぎ足して開いた。下書きは置かず、アイテムに保存しない
+ *  （保存は `recipe_replace` でレシピへ）。
+ */
+export type EditRecipeDto_Deserialize = {
+	id: number,
+	name: string,
+	description: string,
+	/**  レシピの結び付け（ノードはエディタの文書の ID に付け替えたもの）。 */
+	bindings: Binding_Deserialize[],
+	/**  レシピが出力の形式を決めている（「元と同じ」でない）。 */
+	withFormat: boolean,
+};
+
+/**
+ *  レシピの見本のモードの印（M14 段 7）：見本のアイテムの元にレシピを継ぎ足して開いた。下書きは置かず、アイテムに保存しない
+ *  （保存は `recipe_replace` でレシピへ）。
+ */
+export type EditRecipeDto_Serialize = {
+	id: number,
+	name: string,
+	description: string,
+	/**  レシピの結び付け（ノードはエディタの文書の ID に付け替えたもの）。 */
+	bindings: Binding_Serialize[],
+	/**  レシピが出力の形式を決めている（「元と同じ」でない）。 */
+	withFormat: boolean,
 };
 
 /**  矩形（等倍のキャンバスの座標）。 */

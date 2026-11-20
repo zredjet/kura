@@ -979,6 +979,34 @@ pub struct EditOpenedDto {
     pub draft: EditDraftDto,
     /// 開いたときの状態・文書（全体）・表示。
     pub result: EditStepResultDto,
+    /// レシピの見本のモードで開いた（`edit_open_recipe`）。
+    pub recipe: Option<EditRecipeDto>,
+}
+
+/// レシピの見本のモードの印（M14 段 7）：見本のアイテムの元にレシピを継ぎ足して開いた。下書きは置かず、アイテムに保存しない
+/// （保存は `recipe_replace` でレシピへ）。
+#[derive(Debug, Clone, PartialEq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EditRecipeDto {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    /// レシピの結び付け（ノードはエディタの文書の ID に付け替えたもの）。
+    pub bindings: Vec<kura_engine::recipe::Binding>,
+    /// レシピが出力の形式を決めている（「元と同じ」でない）。
+    pub with_format: bool,
+}
+
+impl From<editor::RecipeSample> for EditRecipeDto {
+    fn from(r: editor::RecipeSample) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            description: r.description,
+            bindings: r.bindings,
+            with_format: r.with_format,
+        }
+    }
 }
 
 impl From<Opened> for EditOpenedDto {
@@ -992,6 +1020,7 @@ impl From<Opened> for EditOpenedDto {
             pixel_art: o.pixel_art,
             draft: o.draft.into(),
             result: o.outcome.into(),
+            recipe: o.recipe.map(Into::into),
         }
     }
 }
@@ -1158,6 +1187,33 @@ pub async fn edit_open(
                 viewport: viewport.into(),
                 from_draft: from_draft.unwrap_or(false),
             },
+        )?;
+        Ok(opened.into())
+    })
+    .await
+}
+
+/// レシピ `recipe` の見本のモードでアイテム `itemId` を開く（M14 段 7。見本の元にレシピを継ぎ足す。下書きは置かず・開かず、
+/// アイテムに保存しない。N → 1 のレシピ・当てられないレシピは Invalid）。
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_open_recipe(
+    state: State<'_, AppState>,
+    item_id: i64,
+    viewport: EditViewportDto,
+    recipe: i64,
+) -> Result<EditOpenedDto, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        let env = EditorEnv::of(&session)?;
+        let opened = editor::open_recipe(
+            &env,
+            &OpenRequest {
+                item_id,
+                viewport: viewport.into(),
+                from_draft: false,
+            },
+            recipe,
         )?;
         Ok(opened.into())
     })
@@ -1686,6 +1742,7 @@ mod tests {
                 opened: false,
             },
             outcome: out.clone(),
+            recipe: None,
         }))
         .unwrap();
         assert_eq!(opened["originalFormat"], json!("heic"));

@@ -157,6 +157,18 @@ export function openEdit(
   return unwrap(commands.editOpen(itemId, viewport, fromDraft));
 }
 
+/**
+ * レシピ `recipe` の見本のモードでアイテムを開く（M14 段 7）：見本の元にレシピを継ぎ足して開き、下書きは置かず、アイテムには
+ * 保存しない（中身は `replaceRecipe` でレシピへ）。
+ */
+export function openEditRecipe(
+  itemId: number,
+  viewport: EditViewportDto,
+  recipe: number,
+): Promise<EditOpenedDto> {
+  return unwrap(commands.editOpenRecipe(itemId, viewport, recipe));
+}
+
 /** 手をまとめて当てて表示する（描くのは最後に 1 回）。 */
 export function stepEdit(
   session: string,

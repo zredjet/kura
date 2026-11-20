@@ -2262,3 +2262,162 @@ fn editor_step_latency() {
         close(&env.engine, &s);
     }
 }
+
+/// 格子を書く手（`meta.set_grid`。位置 `at`）。
+fn set_grid(at: usize) -> Step {
+    Step::Commit {
+        edit: Edit::AddNode {
+            at,
+            op: "meta.set_grid".into(),
+            v: 1,
+            params: json!({ "grid": { "cellW": 10, "cellH": 10, "gapX": 0, "gapY": 0, "offsetX": 0, "offsetY": 0 } }),
+            seed: None,
+            extra_inputs: Vec::new(),
+        },
+        mode: CommitMode::Step,
+    }
+}
+
+/// レシピの見本のモード（M14 段 7）：見本の元（版 0 の空の文書）にレシピを継ぎ足して開き、結び付けはエディタの文書の ID に
+/// 付け替える。見本の下書きは開かず・置かず・消さず、アイテムへの保存（上書き・別名・版に戻す）は断る。頭の文書からレシピへ
+/// 戻す（見本で編集の保存）と同じレシピになる。ないレシピは NotFound。
+#[test]
+fn recipe_sample_opens_the_original_and_never_touches_the_item() {
+    use kura_engine::recipe::{Binding, SettingKey, Source as BindFrom};
+
+    let env = Env::new();
+    let id = add_item(&env.lib, &sprite_png(20, 20, 12), 20, 20);
+    let runtime = env.engine.runtime().unwrap().clone();
+    // レシピを作る：裏返す → 格子（素材の格子に結ぶ）
+    let opened = env.open(id);
+    let s = opened.session.clone();
+    env.step(&s, vec![flip("horizontal"), set_grid(1)]);
+    let graph = head_graph(&env.env(), &s).unwrap();
+    let keep: Vec<NodeId> = graph.nodes.iter().map(|n| n.id).collect();
+    let grid_node = graph
+        .nodes
+        .iter()
+        .find(|n| n.op == "meta.set_grid")
+        .unwrap()
+        .id;
+    let recipe = crate::edit::recipes::create_from_editor(
+        env.lib.db(),
+        &runtime,
+        "裏返して格子",
+        "説明",
+        crate::edit::recipes::EditorPick {
+            graph: &graph,
+            keep: &keep,
+            with_format: false,
+            bindings: vec![Binding {
+                node: grid_node,
+                param: "grid".into(),
+                part: None,
+                from: BindFrom::Setting {
+                    key: SettingKey::Grid,
+                },
+            }],
+        },
+    )
+    .unwrap();
+    let before = crate::edit::recipes::get(env.lib.db(), &runtime, recipe).unwrap();
+    // 見本の下書き（今の手）を置いて閉じる
+    env.engine.current_editor().unwrap().autosave.flush();
+    close(&env.engine, &s);
+    let draft = env.lib.db().read(|c| drafts::get(c, id)).unwrap().unwrap();
+
+    let sample = open_recipe(
+        &env.env(),
+        &OpenRequest {
+            item_id: id,
+            viewport: Viewport::whole(),
+            from_draft: true,
+        },
+        recipe,
+    )
+    .unwrap();
+    let info = sample.recipe.clone().unwrap();
+    assert_eq!(info.id, recipe);
+    assert_eq!(info.name, "裏返して格子");
+    assert_eq!(info.description, "説明");
+    assert!(!info.with_format);
+    // 下書きから開かず、下書きがあることも言わない（見本のアイテムの下書きはこのモードと関係しない）
+    assert!(!sample.draft.exists && !sample.draft.opened);
+    assert_eq!(sample.base_version, 0);
+    let ops: Vec<&str> = sample
+        .outcome
+        .doc
+        .nodes
+        .iter()
+        .map(|n| n.op.as_str())
+        .collect();
+    assert_eq!(ops, ["image.flip", "meta.set_grid"]);
+    // 結び付けはエディタの文書の格子のノードを指す
+    let sample_graph = head_graph(&env.env(), &sample.session).unwrap();
+    let sample_grid = sample_graph
+        .nodes
+        .iter()
+        .find(|n| n.op == "meta.set_grid")
+        .unwrap()
+        .id;
+    assert_eq!(info.bindings.len(), 1);
+    assert_eq!(info.bindings[0].node, sample_grid);
+
+    // 手を足しても下書きは置かない。アイテムには保存できない
+    env.step(&sample.session, vec![flip("vertical")]);
+    for mode in [
+        SaveMode::Overwrite,
+        SaveMode::SaveAs {
+            title: "x".into(),
+            stem: "x".into(),
+        },
+        SaveMode::Revert { to: 0 },
+    ] {
+        let err = save(&env.env(), &sample.session, mode, None).unwrap_err();
+        assert!(matches!(err, EditorError::Invalid { .. }), "{err:?}");
+    }
+    env.step(&sample.session, vec![Step::Undo]);
+
+    // 頭の文書からレシピへ戻すと同じレシピ（ID は付け直す）
+    let back = head_graph(&env.env(), &sample.session).unwrap();
+    let keep: Vec<NodeId> = back.nodes.iter().map(|n| n.id).collect();
+    crate::edit::recipes::replace_from_editor(
+        env.lib.db(),
+        &runtime,
+        recipe,
+        crate::edit::recipes::EditorPick {
+            graph: &back,
+            keep: &keep,
+            with_format: info.with_format,
+            bindings: info.bindings.clone(),
+        },
+    )
+    .unwrap();
+    let after = crate::edit::recipes::get(env.lib.db(), &runtime, recipe).unwrap();
+    assert_eq!(after.recipe, before.recipe);
+    close(&env.engine, &sample.session);
+    // 見本の下書きはそのまま、版も足していない
+    let kept = env.lib.db().read(|c| drafts::get(c, id)).unwrap().unwrap();
+    assert_eq!(kept.updated_at, draft.updated_at);
+    assert_eq!(kept.doc_id, draft.doc_id);
+    let head = env
+        .lib
+        .db()
+        .read(|c| versions::head(c, id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.version, 0);
+
+    // ないレシピ
+    let missing = open_recipe(
+        &env.env(),
+        &OpenRequest {
+            item_id: id,
+            viewport: Viewport::whole(),
+            from_draft: false,
+        },
+        recipe + 100,
+    )
+    .unwrap_err();
+    assert!(matches!(missing, EditorError::NotFound(_)), "{missing:?}");
+}
