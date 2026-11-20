@@ -5,8 +5,11 @@
 //! - キャンバスは入力のキャンバスの幅・高さの最大。入力ごとのキャンバスを 9 点の揃え（[`Anchor`]）で置き、フレームはその中の
 //!   位置のまま（割り切れない余りは左・上へ寄せる。`image.fit_canvas` と同じ ⌊余り·係数/2⌋。利用者の決定 2）。
 //! - 形式は、すべて同じで Indexed8 でなければそのまま、ほかは 16 ビットの入力があれば Rgba16、なければ Rgba8（パレットは
-//!   入力ごとに違いうるので、推論でも描画でも同じ決まりにする。値は変えずに広げるだけ）。
-//! - メタデータは持たない（入力の格子・ピボットは捨てる。シートの格子は `sprite.pack_grid` が書く）。繰り返しは無限（0）。
+//!   入力ごとに違いうるので、推論でも描画でも同じ決まりにする。値は変えずに広げるだけ）。シートの `fill` がその形式で表せない
+//!   （グレーに灰色でない色、アルファのない形式に不透明でない色）なら、同じく Rgba8・Rgba16 に広げる（ADR-198）。
+//! - メタデータは ICC だけを運ぶ：すべての入力の ICC が同じ（バイト列が一致）ならそれを持ち、違う・一部にしかないなら持たず、
+//!   sRGB でない ICC があれば警告（`ColorSpaceAssumed`。色の変換はしない。§5.2 の v1 の決まり。利用者の決定）。格子・ピボットは
+//!   捨てる（シートの格子は `sprite.pack_grid` が書く）。繰り返しは無限（0）。
 //! - 乱数の元（`InputValue::source`）は、選んだ順の中身のハッシュの列のダイジェスト（[`source`]）。
 //!
 //! 決定性：入力の値と並びと揃えだけで決まる（並列は形式の変換の `convert_raster` の中だけ）。
@@ -28,6 +31,11 @@ pub const STILL_MS: u32 = 100;
 
 /// 乱数の元のダイジェストのドメイン（凍結する）。
 const SOURCE_DOMAIN: &str = "kura-selection-v1";
+
+/// シートの間隔の上限（`sprite.pack_grid` の引数と同じ）。
+pub const MAX_GAP: u32 = 4_096;
+/// 1 行のセルの数の上限（`sprite.pack_grid` の引数と同じ）。
+pub const MAX_COLUMNS: u32 = 4_096;
 
 fn default_anchor() -> Anchor {
     Anchor::Center
@@ -53,6 +61,26 @@ pub struct SheetParams {
     pub anchor: Anchor,
 }
 
+impl SheetParams {
+    /// 選択によらない引数の確かめ（間隔は 0〜[`MAX_GAP`]、1 行の数は 1〜[`MAX_COLUMNS`]）。積む前・事前チェックの前に呼ぶ。
+    pub fn validate(&self) -> Result<(), EngineError> {
+        if self.gap_x > MAX_GAP || self.gap_y > MAX_GAP {
+            return Err(invalid(format!(
+                "シートの間隔は 0〜{MAX_GAP} です（{}・{}）",
+                self.gap_x, self.gap_y
+            )));
+        }
+        if let Some(c) = self.columns
+            && !(1..=MAX_COLUMNS).contains(&c)
+        {
+            return Err(invalid(format!(
+                "1 行のセルの数は 1〜{MAX_COLUMNS} です（{c}）"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Default for SheetParams {
     fn default() -> Self {
         Self {
@@ -69,8 +97,11 @@ fn invalid(message: impl Into<String>) -> EngineError {
     EngineError::Invalid(Issues::one(Issue::error(IssueCode::BadInput, message)))
 }
 
-/// 選択のフレームの形式（モジュールの説明）。
-pub fn common_format(formats: impl IntoIterator<Item = PixelFormat>) -> PixelFormat {
+/// 選択のフレームの形式（モジュールの説明）。`fill` は何も置かない部分の色（その形式で表せなければ広げる）。
+pub fn common_format(
+    formats: impl IntoIterator<Item = PixelFormat>,
+    fill: Option<[u8; 4]>,
+) -> PixelFormat {
     let mut first: Option<PixelFormat> = None;
     let mut same = true;
     let mut wide = false;
@@ -85,8 +116,15 @@ pub fn common_format(formats: impl IntoIterator<Item = PixelFormat>) -> PixelFor
             Some(_) => {}
         }
     }
+    let fits = |f: PixelFormat| match fill {
+        None => true,
+        Some([r, g, b, a]) => {
+            (f.has_alpha() || a == 255)
+                && (!crate::imaging::pixels::is_gray(f) || (r == g && g == b))
+        }
+    };
     match first {
-        Some(f) if same && f != PixelFormat::Indexed8 => f,
+        Some(f) if same && f != PixelFormat::Indexed8 && fits(f) => f,
         _ if wide => PixelFormat::Rgba16,
         _ => PixelFormat::Rgba8,
     }
@@ -107,8 +145,9 @@ fn dim_max(dims: impl IntoIterator<Item = Dim>) -> Dim {
     }
 }
 
-/// 選択の形：入力の形（選んだ順）から、フレームの列の形を推論する（描かない）。画像とフレームの列だけで、空・音声は断る。
-pub fn shape(inputs: &[Shape]) -> Result<Shape, EngineError> {
+/// 選択の形：入力の形（選んだ順）とシートの引数 `p`（`fill` が形式に効く）から、フレームの列の形を推論する（描かない）。画像と
+/// フレームの列だけで、空・音声は断る。
+pub fn shape(inputs: &[Shape], p: &SheetParams) -> Result<Shape, EngineError> {
     if inputs.is_empty() {
         return Err(invalid("選択が空です"));
     }
@@ -172,7 +211,7 @@ pub fn shape(inputs: &[Shape]) -> Result<Shape, EngineError> {
         },
         w,
         h,
-        fmt: common_format(fmts),
+        fmt: common_format(fmts, p.fill),
         full,
     })
 }
@@ -194,8 +233,30 @@ fn parts(v: &Value) -> Result<(Size, Vec<Frame>), EngineError> {
     }
 }
 
-/// 選択の値：入力の値（選んだ順）を、揃え `anchor` で 1 つのフレームの列にする（モジュールの説明）。
-pub fn frames(inputs: &[Value], anchor: Anchor, mon: &dyn Monitor) -> Result<Frames, EngineError> {
+/// 選択の値と警告（[`frames`]）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Selected {
+    pub frames: Frames,
+    /// ICC の違う入力を sRGB とみなしたなど。
+    pub warnings: Vec<Issue>,
+}
+
+/// 入力のメタデータ。
+fn meta_of(v: &Value) -> Option<&ImageMeta> {
+    match v {
+        Value::Image(img) => Some(&img.meta),
+        Value::Frames(fr) => Some(&fr.meta),
+        Value::Audio(_) => None,
+    }
+}
+
+/// 選択の値：入力の値（選んだ順）を、シートの引数 `p`（揃えと `fill`）で 1 つのフレームの列にする（モジュールの説明）。
+pub fn frames(
+    inputs: &[Value],
+    p: &SheetParams,
+    mon: &dyn Monitor,
+) -> Result<Selected, EngineError> {
+    let anchor = p.anchor;
     if inputs.is_empty() {
         return Err(invalid("選択が空です"));
     }
@@ -208,6 +269,7 @@ pub fn frames(inputs: &[Value], anchor: Anchor, mon: &dyn Monitor) -> Result<Fra
         parts
             .iter()
             .flat_map(|(_, fs)| fs.iter().map(|f| f.px.format())),
+        p.fill,
     );
     let (fx, fy) = anchor.factors();
     let mut out = Vec::new();
@@ -241,7 +303,38 @@ pub fn frames(inputs: &[Value], anchor: Anchor, mon: &dyn Monitor) -> Result<Fra
             });
         }
     }
-    Frames::new(out, canvas, ImageMeta::default(), 0)
+    // ICC：すべて同じなら運び、違えば持たない（sRGB でないものがあれば警告）
+    let iccs: Vec<Option<&std::sync::Arc<Vec<u8>>>> = inputs
+        .iter()
+        .map(|v| meta_of(v).and_then(|m| m.icc.as_ref()))
+        .collect();
+    let same_icc = iccs
+        .windows(2)
+        .all(|w| w[0].map(|a| a.as_slice()) == w[1].map(|b| b.as_slice()));
+    let mut warnings = Vec::new();
+    let icc = if same_icc {
+        iccs.first().copied().flatten().cloned()
+    } else {
+        if iccs
+            .iter()
+            .flatten()
+            .any(|icc| !crate::imaging::icc::is_srgb(icc))
+        {
+            warnings.push(Issue::warning(
+                IssueCode::ColorSpaceAssumed,
+                "色空間（ICC）の違う絵を並べたので、色を変えずに sRGB とみなしました",
+            ));
+        }
+        None
+    };
+    let meta = ImageMeta {
+        icc,
+        ..ImageMeta::default()
+    };
+    Ok(Selected {
+        frames: Frames::new(out, canvas, meta, 0)?,
+        warnings,
+    })
 }
 
 /// 乱数の元：選んだ順の中身のハッシュの列のダイジェスト（並びも数も効く）。
@@ -254,16 +347,23 @@ pub fn source(hashes: &[[u8; 32]]) -> Digest {
     h.finish()
 }
 
-/// 1 行のセルの数：指定があればそれ（1〜4,096）、なければ ⌈√フレームの数⌉（整数で求める）。
+/// 1 行のセルの数（`sprite.pack_grid` の引数）：指定があればそれ（1〜4,096）、なければ ⌈√フレームの数⌉（整数で求める）。
+/// 実際に 1 行に並ぶ数は [`columns_in_row`]。
 pub fn columns_for(count: u64, columns: Option<u32>) -> u32 {
     if let Some(c) = columns {
-        return c.clamp(1, 4_096);
+        return c.clamp(1, MAX_COLUMNS);
     }
     let mut c = 1u64;
     while c.saturating_mul(c) < count {
         c += 1;
     }
-    u32::try_from(c.min(4_096)).unwrap_or(4_096)
+    u32::try_from(c.min(u64::from(MAX_COLUMNS))).unwrap_or(MAX_COLUMNS)
+}
+
+/// 実際に 1 行に並ぶセルの数（`sprite.pack_grid` は min(1 行の数, フレームの数) 列に並べる）。
+pub fn columns_in_row(count: u64, columns: Option<u32>) -> u32 {
+    let c = columns_for(count, columns);
+    u32::try_from(u64::from(c).min(count.max(1))).unwrap_or(c)
 }
 
 /// スプライトシートの文書：選択（入力 0、`Selection`）→ `sprite.pack_grid`（1 行のセルの数は [`columns_for`]）→ PNG。`count` は
@@ -323,12 +423,19 @@ mod tests {
     #[test]
     fn the_common_format_widens_only_when_needed() {
         use PixelFormat::*;
-        assert_eq!(common_format([Rgb8, Rgb8]), Rgb8);
-        assert_eq!(common_format([Rgba16]), Rgba16);
-        assert_eq!(common_format([Indexed8]), Rgba8);
-        assert_eq!(common_format([Indexed8, Indexed8]), Rgba8);
-        assert_eq!(common_format([Rgb8, Rgba8]), Rgba8);
-        assert_eq!(common_format([Gray8, Rgb16]), Rgba16);
+        assert_eq!(common_format([Rgb8, Rgb8], None), Rgb8);
+        assert_eq!(common_format([Rgba16], None), Rgba16);
+        assert_eq!(common_format([Indexed8], None), Rgba8);
+        assert_eq!(common_format([Indexed8, Indexed8], None), Rgba8);
+        assert_eq!(common_format([Rgb8, Rgba8], None), Rgba8);
+        assert_eq!(common_format([Gray8, Rgb16], None), Rgba16);
+        // fill がその形式で表せなければ広げる（グレーに色、アルファのない形式に透明）
+        assert_eq!(common_format([Rgb8], Some([1, 2, 3, 255])), Rgb8);
+        assert_eq!(common_format([Rgb8], Some([0, 0, 0, 0])), Rgba8);
+        assert_eq!(common_format([Gray8], Some([7, 7, 7, 255])), Gray8);
+        assert_eq!(common_format([Gray8], Some([255, 0, 0, 255])), Rgba8);
+        assert_eq!(common_format([Rgb16], Some([0, 0, 0, 128])), Rgba16);
+        assert_eq!(common_format([Rgba8], Some([0, 0, 0, 0])), Rgba8);
     }
 
     /// 揃え：大きさの違う絵は、最大のキャンバスの中で 9 点の位置に置く（余りは左・上へ）。形の推論は描いた値と合う。
@@ -342,7 +449,13 @@ mod tests {
             (Anchor::BottomRight, (3, 1)),
             (Anchor::Bottom, (1, 1)),
         ] {
-            let fr = frames(&[a.clone(), b.clone()], anchor, &NoMonitor).unwrap();
+            let p = SheetParams {
+                anchor,
+                ..SheetParams::default()
+            };
+            let fr = frames(&[a.clone(), b.clone()], &p, &NoMonitor)
+                .unwrap()
+                .frames;
             assert_eq!(fr.canvas(), Size { w: 4, h: 4 });
             assert_eq!(fr.frames().len(), 2);
             assert_eq!(fr.frames()[0].offset, IPoint { x: 0, y: 0 });
@@ -351,7 +464,7 @@ mod tests {
                 want,
                 "{anchor:?}"
             );
-            let inferred = shape(&[a.shape(), b.shape()]).unwrap();
+            let inferred = shape(&[a.shape(), b.shape()], &p).unwrap();
             assert!(inferred.admits(&Value::Frames(Arc::new(fr)).shape()));
             assert!(matches!(
                 inferred,
@@ -384,12 +497,15 @@ mod tests {
             )
             .unwrap(),
         ));
-        let fr = frames(&[anim.clone(), still.clone()], Anchor::Center, &NoMonitor).unwrap();
+        let p = SheetParams::default();
+        let fr = frames(&[anim.clone(), still.clone()], &p, &NoMonitor)
+            .unwrap()
+            .frames;
         let ms: Vec<u32> = fr.frames().iter().map(|f| f.duration_ms).collect();
         assert_eq!(ms, vec![40, 60, STILL_MS]);
         assert_eq!(fr.frames()[0].px.pixel(0, 0), Some(&[1, 2, 3, 255][..]));
         assert!(fr.is_full());
-        let inferred = shape(&[anim.shape(), still.shape()]).unwrap();
+        let inferred = shape(&[anim.shape(), still.shape()], &p).unwrap();
         assert_eq!(
             inferred,
             Shape::Frames {
@@ -406,7 +522,10 @@ mod tests {
     #[test]
     fn indexed_inputs_widen_and_audio_is_refused() {
         let pal = sprite(6, 5, PixelFormat::Indexed8, 3);
-        let fr = frames(std::slice::from_ref(&pal), Anchor::Center, &NoMonitor).unwrap();
+        let p = SheetParams::default();
+        let fr = frames(std::slice::from_ref(&pal), &p, &NoMonitor)
+            .unwrap()
+            .frames;
         assert_eq!(fr.first().px.format(), PixelFormat::Rgba8);
         let Value::Image(img) = &pal else { panic!() };
         let palette = img.px.palette().unwrap();
@@ -415,7 +534,7 @@ mod tests {
             fr.first().px.pixel(2, 2),
             Some(&palette.colors[usize::from(idx)][..])
         );
-        assert!(frames(&[], Anchor::Center, &NoMonitor).is_err());
+        assert!(frames(&[], &p, &NoMonitor).is_err());
         let audio = InputGen::AudioNoise {
             rate: 8_000,
             channels: 1,
@@ -424,9 +543,9 @@ mod tests {
         }
         .generate()
         .unwrap();
-        assert!(frames(std::slice::from_ref(&audio), Anchor::Center, &NoMonitor).is_err());
-        assert!(shape(&[audio.shape()]).is_err());
-        assert!(shape(&[]).is_err());
+        assert!(frames(std::slice::from_ref(&audio), &p, &NoMonitor).is_err());
+        assert!(shape(&[audio.shape()], &p).is_err());
+        assert!(shape(&[], &p).is_err());
     }
 
     /// 乱数の元は並びと数で変わる。1 行のセルの数は ⌈√n⌉ か指定（1〜4,096）。
@@ -451,7 +570,16 @@ mod tests {
         let a = solid(4, 4, [255, 0, 0, 255]);
         let b = solid(2, 2, [0, 0, 255, 255]);
         let fr = Value::Frames(Arc::new(
-            frames(&[a.clone(), b.clone()], Anchor::TopLeft, &NoMonitor).unwrap(),
+            frames(
+                &[a.clone(), b.clone()],
+                &SheetParams {
+                    anchor: Anchor::TopLeft,
+                    ..SheetParams::default()
+                },
+                &NoMonitor,
+            )
+            .unwrap()
+            .frames,
         ));
         let g = sheet_graph(
             &SheetParams {
@@ -487,5 +615,124 @@ mod tests {
         );
         let grid = sheet.meta.grid.unwrap();
         assert_eq!((grid.cell_w, grid.cell_h, grid.gap_x), (4, 4, 1));
+    }
+
+    fn with_icc(v: &Value, icc: Option<Vec<u8>>) -> Value {
+        let Value::Image(img) = v else { panic!() };
+        Value::Image(Arc::new(Image {
+            px: img.px.clone(),
+            meta: ImageMeta {
+                icc: icc.map(Arc::new),
+                ..ImageMeta::default()
+            },
+        }))
+    }
+
+    /// ICC：すべて同じなら運び、違えば持たない（sRGB でないものがあれば警告）。
+    #[test]
+    fn the_icc_is_carried_only_when_all_inputs_agree() {
+        let a = solid(2, 2, [1, 2, 3, 255]);
+        let p3 = vec![7u8; 64];
+        let p = SheetParams::default();
+        let same = frames(
+            &[
+                with_icc(&a, Some(p3.clone())),
+                with_icc(&a, Some(p3.clone())),
+            ],
+            &p,
+            &NoMonitor,
+        )
+        .unwrap();
+        assert_eq!(same.frames.meta.icc.as_deref(), Some(&p3));
+        assert!(same.warnings.is_empty());
+        let mixed = frames(
+            &[with_icc(&a, Some(p3.clone())), with_icc(&a, None)],
+            &p,
+            &NoMonitor,
+        )
+        .unwrap();
+        assert_eq!(mixed.frames.meta.icc, None);
+        assert_eq!(mixed.warnings.len(), 1);
+        assert_eq!(mixed.warnings[0].code, IssueCode::ColorSpaceAssumed);
+        let none = frames(&[a.clone(), a.clone()], &p, &NoMonitor).unwrap();
+        assert_eq!(none.frames.meta.icc, None);
+        assert!(none.warnings.is_empty());
+    }
+
+    /// fill が選択の形式で表せないとき（アルファのない絵に透明・グレーの絵に色）は広げて、シートを描ける。
+    #[test]
+    fn a_fill_widens_the_selection_format() {
+        let rgb = Value::Image(Arc::new(Image {
+            px: Raster::filled(3, 2, PixelFormat::Rgb8, None, &[9, 9, 9]).unwrap(),
+            meta: ImageMeta::default(),
+        }));
+        let small = Value::Image(Arc::new(Image {
+            px: Raster::filled(1, 1, PixelFormat::Rgb8, None, &[1, 1, 1]).unwrap(),
+            meta: ImageMeta::default(),
+        }));
+        let p = SheetParams {
+            fill: Some([0, 0, 0, 0]),
+            ..SheetParams::default()
+        };
+        let sel = frames(&[rgb.clone(), small.clone()], &p, &NoMonitor).unwrap();
+        assert_eq!(sel.frames.first().px.format(), PixelFormat::Rgba8);
+        let inferred = shape(&[rgb.shape(), small.shape()], &p).unwrap();
+        let value = Value::Frames(Arc::new(sel.frames));
+        assert!(inferred.admits(&value.shape()));
+        let g = sheet_graph(&p, 2).unwrap();
+        let engine = Engine::new().unwrap();
+        let plan = engine
+            .compile(&g, &BTreeMap::from([(InputId(0), value.shape())]))
+            .unwrap();
+        let out = engine
+            .render(
+                &plan,
+                &BTreeMap::from([(
+                    InputId(0),
+                    InputValue {
+                        value,
+                        source: source(&[[1; 32], [2; 32]]),
+                    },
+                )]),
+                &NoMonitor,
+            )
+            .unwrap();
+        let Value::Image(sheet) = &out.outputs[0].value else {
+            panic!()
+        };
+        assert_eq!(
+            sheet.px.pixel(4, 1),
+            Some(&[0, 0, 0, 0][..]),
+            "小さい絵の外は透明"
+        );
+    }
+
+    /// 引数の確かめ（間隔・1 行の数）と、実際に 1 行に並ぶ数（フレームの数で切る）。
+    #[test]
+    fn params_are_validated_and_rows_are_clipped() {
+        assert!(SheetParams::default().validate().is_ok());
+        for bad in [
+            SheetParams {
+                gap_x: MAX_GAP + 1,
+                ..SheetParams::default()
+            },
+            SheetParams {
+                gap_y: MAX_GAP + 1,
+                ..SheetParams::default()
+            },
+            SheetParams {
+                columns: Some(0),
+                ..SheetParams::default()
+            },
+            SheetParams {
+                columns: Some(MAX_COLUMNS + 1),
+                ..SheetParams::default()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
+        assert_eq!(columns_in_row(3, Some(8)), 3);
+        assert_eq!(columns_in_row(10, Some(8)), 8);
+        assert_eq!(columns_in_row(5, None), 3);
     }
 }
