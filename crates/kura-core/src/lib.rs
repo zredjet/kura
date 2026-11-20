@@ -6,6 +6,7 @@ pub mod analysis;
 pub mod asset;
 pub mod capture;
 pub mod codec_ext;
+pub mod credits;
 pub mod db;
 pub mod download;
 pub mod edit;

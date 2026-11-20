@@ -2521,6 +2521,8 @@ fn commit_save_as(
         "INSERT INTO item_folders (folder_id, item_id, pos) SELECT folder_id, ?2, pos FROM item_folders WHERE item_id = ?1",
     )?
     .execute(params![a, b])?;
+    // クレジット（ライセンス・作者・作品・出典・表記の文）も写す（M15 段 1 の決定 2。一覧では来歴の元と同じ行にまとまる）
+    crate::credits::item::copy(tx, a, b, now)?;
     tx.prepare_cached(
         "INSERT INTO item_derivations (item_id, source_item_id, source_version, source_hash, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",

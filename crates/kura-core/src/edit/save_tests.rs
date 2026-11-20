@@ -709,13 +709,23 @@ fn s2_second_overwrite_waits_version_1_and_holds_original() {
 // ---- S5：別名で保存 ----
 
 /// S5：別名で保存すると新しいアイテムと来歴ができ、元のアイテムは変わらない（版の行も足さない）。新しいアイテムの元は元の
-/// アイテムの元（今ではない）。タグ・フォルダ・評価・メモ・出どころ（source_site・source_url・captured_at）を写し、ユニット・
-/// プレイリスト・再生の記録・素材の設定は写さない。original_path は空（決定 1・4・9）。
+/// アイテムの元（今ではない）。タグ・フォルダ・評価・メモ・出どころ（source_site・source_url・captured_at）とクレジット（M15 段 1
+/// の決定 2）を写し、ユニット・プレイリスト・再生の記録・素材の設定は写さない。original_path は空（決定 1・4・9）。
 #[test]
 fn s5_save_as_inherits_original_and_copies_metadata() {
     let env = Env::new();
     let (a, h0, _) = env.png(3);
     decorate(&env.lib, a);
+    let credit = crate::credits::item::CreditPatch {
+        license: Some(Some(2)),
+        author: Some(Some("もりの".into())),
+        work: Some(Some("森の素材集".into())),
+        ..crate::credits::item::CreditPatch::default()
+    };
+    env.lib
+        .db()
+        .write(move |tx| crate::credits::item::set(tx, &[a], &credit, 1))
+        .unwrap();
     let a_before = memberships(&env.lib, a);
     let record = env.save_as(a, doc(&[flip("vertical")], None), "コピー", "copy");
     assert_done(&record);
@@ -787,6 +797,18 @@ fn s5_save_as_inherits_original_and_copies_metadata() {
         b,
     );
     assert_eq!(pos, 7.0);
+    let credits = env
+        .lib
+        .db()
+        .read(move |c| {
+            Ok((
+                crate::credits::item::get(c, a)?,
+                crate::credits::item::get(c, b)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(credits.0, credits.1);
+    assert_eq!(credits.1.author.as_deref(), Some("もりの"));
 
     let vs = versions_of(&env.lib, b);
     assert_eq!(vs.len(), 2);
