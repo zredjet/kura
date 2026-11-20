@@ -15,6 +15,10 @@ import { toHex } from './image/color';
 import { ColorPicker, Swatch } from './image/ColorPicker';
 import type { PaintColor } from './image/stroke';
 import {
+  ANCHOR_VALUES,
+  CANVAS_MODES,
+  canvasDefault,
+  type CanvasMode,
   clampNumber,
   controlFor,
   enumLabel,
@@ -22,15 +26,20 @@ import {
   initialValue,
   lengthDefault,
   type LengthMode,
+  makeCanvasLength,
   makeColor,
   makeLength,
+  makeMargin,
+  type MarginMode,
   numberRange,
   numbers,
   paramLabel,
   POINT_KEYS,
   RATIO_KEYS,
+  readCanvasLength,
   readColor,
   readLength,
+  readMargin,
   RECT_KEYS,
   SIZE_KEYS,
   unitLabel,
@@ -494,6 +503,129 @@ function LengthParam({
   );
 }
 
+/** 余白 1 辺：「px｜%」と数（px は負で削る）。M14 段 7。 */
+function MarginParam({ label, value, send }: { label: string; value: JsonValue; send: Send }) {
+  const id = useId();
+  const m = readMargin(value);
+  return (
+    <div className={styles.paramRow}>
+      <label htmlFor={id} className={styles.paramLabel}>
+        {label}
+      </label>
+      <div className={styles.paramControls}>
+        <Segmented<MarginMode>
+          label={t.lengthMode(label)}
+          value={m.mode}
+          options={(['px', 'percent'] as const).map((mode) => ({
+            value: mode,
+            label: t.marginModes[mode],
+          }))}
+          onChange={(mode) => send({ kind: 'set', value: makeMargin(mode, 0) })}
+        />
+        <NumberInput
+          id={id}
+          value={m.n}
+          min={m.mode === 'px' ? null : 0}
+          max={null}
+          integer={m.mode === 'px'}
+          step={1}
+          stepBase={m.mode === 'px' ? undefined : 0}
+          onValue={(v) => send({ kind: 'nudge', value: makeMargin(m.mode, v) })}
+          onSeal={() => send({ kind: 'seal' })}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** キャンバスの 1 辺：決め方（元のまま｜px｜%｜倍数｜2 の冪｜長い辺）と数。M14 段 7。 */
+function CanvasLengthParam({
+  spec,
+  label,
+  value,
+  size,
+  send,
+}: {
+  spec: ParamSpec;
+  label: string;
+  value: JsonValue;
+  size: { w: number; h: number } | null;
+  send: Send;
+}) {
+  const id = useId();
+  const c = readCanvasLength(value);
+  const axis = /height|^h$/i.test(spec.key) ? (size?.h ?? null) : (size?.w ?? null);
+  const numeric = c.mode === 'px' || c.mode === 'percent' || c.mode === 'multipleOf';
+  return (
+    <div className={styles.paramRow}>
+      <label htmlFor={id} className={styles.paramLabel}>
+        {label}
+      </label>
+      <div className={styles.paramControls}>
+        <Select
+          aria-label={t.canvasMode(label)}
+          value={c.mode}
+          options={CANVAS_MODES.map((mode) => ({ value: mode, label: t.canvasModes[mode] }))}
+          onChange={(v) => {
+            const mode = v as CanvasMode;
+            send({ kind: 'set', value: makeCanvasLength(mode, canvasDefault(mode, axis)) });
+          }}
+        />
+        {numeric && (
+          <NumberInput
+            id={id}
+            value={c.n}
+            min={c.mode === 'percent' ? 0.01 : 1}
+            max={null}
+            integer={c.mode !== 'percent'}
+            step={1}
+            stepBase={c.mode === 'percent' ? 0 : undefined}
+            onValue={(v) => send({ kind: 'nudge', value: makeCanvasLength(c.mode, v) })}
+            onSeal={() => send({ kind: 'seal' })}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** 9 点の揃え（3×3 のボタン。押しているものは --fill-pressed）。M14 段 7。 */
+function AnchorParam({
+  op,
+  spec,
+  label,
+  value,
+  send,
+}: {
+  op: string;
+  spec: ParamSpec;
+  label: string;
+  value: JsonValue;
+  send: Send;
+}) {
+  const current = typeof value === 'string' ? value : 'center';
+  return (
+    <div className={styles.paramRow}>
+      <span className={styles.paramLabel}>{label}</span>
+      <div className={styles.paramAnchors} role="group" aria-label={label}>
+        {ANCHOR_VALUES.map((a) => (
+          <button
+            key={a}
+            type="button"
+            className={styles.paramAnchor}
+            aria-label={enumLabel(op, spec.key, a)}
+            title={enumLabel(op, spec.key, a)}
+            aria-pressed={current === a}
+            onClick={() => send({ kind: 'set', value: a })}
+          >
+            <span className={styles.paramAnchorDot} aria-hidden="true" />
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /** 色の手元の値の鍵（RGBA を「,」でつなぐ）。 */
 function colorKey(rgba: readonly number[]): string {
   return rgba.join(',');
@@ -710,6 +842,17 @@ export function ParamField({
         break;
       case 'length':
         body = <LengthParam spec={spec} label={label} value={value} size={size} send={send} />;
+        break;
+      case 'margin':
+        body = <MarginParam label={label} value={value} send={send} />;
+        break;
+      case 'canvasLength':
+        body = (
+          <CanvasLengthParam spec={spec} label={label} value={value} size={size} send={send} />
+        );
+        break;
+      case 'anchor':
+        body = <AnchorParam op={op} spec={spec} label={label} value={value} send={send} />;
         break;
       case 'color':
         body = <ColorParam spec={spec} label={label} value={value} send={send} />;

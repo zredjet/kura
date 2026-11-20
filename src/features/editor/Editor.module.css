@@ -1372,3 +1372,41 @@
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
 }
+
+/* 9 点の揃え（M14 段 7）：3×3 の小さなボタン。押しているものは --fill-pressed。 */
+.paramAnchors {
+  display: grid;
+  grid-template-columns: repeat(3, 22px);
+  gap: var(--space-1);
+}
+
+.paramAnchor {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-sm);
+  background: var(--fill-1);
+}
+
+.paramAnchor[aria-pressed='true'] {
+  background: var(--fill-pressed);
+}
+
+.paramAnchor:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.paramAnchorDot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+
+.paramAnchor[aria-pressed='true'] .paramAnchorDot {
+  background: var(--text-primary);
+}

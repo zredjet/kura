@@ -41,6 +41,12 @@ export type ParamControl =
   | 'ratio'
   | 'count'
   | 'frameRange'
+  /** 余白 1 辺（`image.pad`。px｜%）。M14 段 7。 */
+  | 'margin'
+  /** キャンバスの 1 辺（`image.fit_canvas`。元のまま｜px｜%｜倍数｜2 の冪｜長い辺）。M14 段 7。 */
+  | 'canvasLength'
+  /** 9 点の揃え（左上〜右下の 3×3 のボタン）。M14 段 7。 */
+  | 'anchor'
   | 'readonly';
 
 /** 列挙をセグメントにする数の上限（それより多ければ選択）。 */
@@ -58,16 +64,6 @@ const CATEGORY_ORDER: readonly OpCategory[] = [
   'audioSignal',
   'meta',
   'other',
-];
-
-/**
- * 「操作を追加」にまだ出さない操作（M14 段 1 で入れた相対の指定。余白・キャンバスの長さ・9 点の欄は段 7 で作るので、
- * それまでは足せない。文書に入っていれば、汎用の欄（読むだけ）で表示する）。段 7 でこの一覧から消す。
- */
-export const NOT_ADDABLE_YET: readonly string[] = [
-  'image.pad',
-  'image.fit_canvas',
-  'meta.anchor_pivot',
 ];
 
 /** 音声の時間の操作（切り詰め・フェード・ループ点）。 */
@@ -98,18 +94,14 @@ export function opSpec(
 
 /**
  * その種類のエディタで足せる操作（最初の入力が種類の入力のどれかを受けるもの。画像は画像かフレームの列）を分類ごとに。
- * `NOT_ADDABLE_YET` の操作は除く。
+ * 相対の指定（余白・キャンバスを合わせる・9 点のピボット）も、段 7 で欄を作ったので足せる。
  */
 export function addableOps(
   kind: EditorKind,
   catalog: readonly OpDescriptor[] = EDIT_CATALOG,
 ): { category: OpCategory; ops: OpDescriptor[] }[] {
   const inputs = opInputsOf(kind);
-  const ops = catalog.filter(
-    (o) =>
-      !NOT_ADDABLE_YET.includes(o.id) &&
-      o.signature.inputs[0]?.accepts.some((k) => inputs.includes(k)),
-  );
+  const ops = catalog.filter((o) => o.signature.inputs[0]?.accepts.some((k) => inputs.includes(k)));
   return CATEGORY_ORDER.map((category) => ({
     category,
     ops: ops.filter((o) => opCategory(o.id) === category),
@@ -175,7 +167,12 @@ export function controlFor(spec: ParamSpec): ParamControl {
     case 'bool':
       return 'switch';
     case 'enum':
+      if (isAnchorEnum(k.values)) return 'anchor';
       return k.values.length <= SEGMENTED_MAX ? 'segmented' : 'select';
+    case 'margin':
+      return 'margin';
+    case 'canvasLength':
+      return 'canvasLength';
     case 'rect':
       return 'rect';
     case 'point':
@@ -255,6 +252,24 @@ export const SIZE_KEYS = ['w', 'h'] as const;
 export const RATIO_KEYS = ['num', 'den'] as const;
 export const GRID_KEYS = ['cellW', 'cellH', 'offsetX', 'offsetY', 'gapX', 'gapY'] as const;
 
+/** 9 点の揃えの値（左上から行の順）。 */
+export const ANCHOR_VALUES = [
+  'topLeft',
+  'top',
+  'topRight',
+  'left',
+  'center',
+  'right',
+  'bottomLeft',
+  'bottom',
+  'bottomRight',
+] as const;
+
+/** 列挙の値がちょうど 9 点の揃えか。 */
+export function isAnchorEnum(values: readonly string[]): boolean {
+  return values.length === ANCHOR_VALUES.length && ANCHOR_VALUES.every((v) => values.includes(v));
+}
+
 /** 長さの単位。 */
 export type LengthMode = 'px' | 'percent' | 'auto';
 
@@ -281,6 +296,85 @@ export function makeLength(mode: LengthMode, n: number): JsonValue {
   return hundredths % 100 === 0
     ? { scale: { num: hundredths / 100, den: 100 } }
     : { scale: { num: hundredths, den: 10_000 } };
+}
+
+/** 比（`{num, den}`）を % にする（100 分の 1 まで）。 */
+function ratioPercent(scale: JsonValue): number {
+  if (!scale || typeof scale !== 'object' || Array.isArray(scale)) return 0;
+  const num = typeof scale.num === 'number' ? scale.num : 0;
+  const den = typeof scale.den === 'number' && scale.den > 0 ? scale.den : 1;
+  return Math.round((num * 10_000) / den) / 100;
+}
+
+/** % を比にする（整数の % は 100 分の 1、小数は 1 万分の 1。0 以上）。 */
+function percentRatio(n: number): JsonValue {
+  const hundredths = Math.max(0, Math.round(n * 100));
+  return hundredths % 100 === 0
+    ? { num: hundredths / 100, den: 100 }
+    : { num: hundredths, den: 10_000 };
+}
+
+/** 余白の単位。 */
+export type MarginMode = 'px' | 'percent';
+
+/** 余白 1 辺（`{"px": n}`（負で削る）・`{"scale": {num, den}}`）の単位と数。 */
+export function readMargin(value: JsonValue): { mode: MarginMode; n: number } {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    if (typeof value.px === 'number') return { mode: 'px', n: value.px };
+    if (value.scale !== undefined) return { mode: 'percent', n: ratioPercent(value.scale) };
+  }
+  return { mode: 'px', n: 0 };
+}
+
+/** 余白 1 辺の値を作る（px は整数で負も可、% は 0 以上）。 */
+export function makeMargin(mode: MarginMode, n: number): JsonValue {
+  return mode === 'px' ? { px: Math.round(n) } : { scale: percentRatio(n) };
+}
+
+/** キャンバスの 1 辺の決め方。 */
+export type CanvasMode = 'keep' | 'px' | 'percent' | 'multipleOf' | 'pow2' | 'longest';
+
+/** キャンバスの 1 辺の決め方の並び（選択の順）。 */
+export const CANVAS_MODES: readonly CanvasMode[] = [
+  'keep',
+  'px',
+  'percent',
+  'multipleOf',
+  'pow2',
+  'longest',
+];
+
+/** キャンバスの 1 辺（`"keep"`・`{"px"}`・`{"scale"}`・`{"multipleOf"}`・`"pow2"`・`"longest"`）の決め方と数。 */
+export function readCanvasLength(value: JsonValue): { mode: CanvasMode; n: number } {
+  if (value === 'pow2' || value === 'longest' || value === 'keep') return { mode: value, n: 0 };
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    if (typeof value.px === 'number') return { mode: 'px', n: value.px };
+    if (typeof value.multipleOf === 'number') return { mode: 'multipleOf', n: value.multipleOf };
+    if (value.scale !== undefined) return { mode: 'percent', n: ratioPercent(value.scale) };
+  }
+  return { mode: 'keep', n: 0 };
+}
+
+/** キャンバスの 1 辺の値を作る（px・倍数は 1 以上の整数、% は 1 万分の 1 まで）。 */
+export function makeCanvasLength(mode: CanvasMode, n: number): JsonValue {
+  switch (mode) {
+    case 'px':
+      return { px: Math.max(1, Math.round(n)) };
+    case 'multipleOf':
+      return { multipleOf: Math.max(1, Math.round(n)) };
+    case 'percent':
+      return { scale: percentRatio(Math.max(0.01, n)) };
+    default:
+      return mode;
+  }
+}
+
+/** 決め方を替えたときの既定の数（px は今の大きさ、% は 100、倍数は 8）。 */
+export function canvasDefault(mode: CanvasMode, size: number | null): number {
+  if (mode === 'px') return Math.max(1, size ?? 1);
+  if (mode === 'percent') return 100;
+  if (mode === 'multipleOf') return 8;
+  return 0;
 }
 
 /** 単位を替えたときの既定の数（px は今の大きさ、% は 100）。 */
@@ -415,6 +509,17 @@ export function valueSummary(op: string, spec: ParamSpec, value: JsonValue): str
     case 'frameRange': {
       const r = numbers(value, ['start', 'end']);
       return r ? `${formatCount(r.start ?? 0)} – ${formatCount(r.end ?? 0)}` : null;
+    }
+    case 'margin': {
+      const m = readMargin(value);
+      return m.mode === 'px' ? `${formatCount(m.n)} px` : `${m.n}%`;
+    }
+    case 'canvasLength': {
+      const c = readCanvasLength(value);
+      if (c.mode === 'px') return `${formatCount(c.n)} px`;
+      if (c.mode === 'percent') return `${c.n}%`;
+      if (c.mode === 'multipleOf') return t.canvasMultiple(formatCount(c.n));
+      return t.canvasModes[c.mode];
     }
     default:
       return null;

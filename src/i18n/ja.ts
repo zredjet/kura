@@ -1041,6 +1041,17 @@ export const ja = {
     keepRatio: '縦横比を保つ',
     lengthModes: { px: 'px', percent: '%', auto: '自動' },
     lengthMode: (label: string) => `${label}の単位`,
+    marginModes: { px: 'px', percent: '%' },
+    canvasModes: {
+      keep: '元のまま',
+      px: 'px',
+      percent: '%',
+      multipleOf: '倍数に切り上げ',
+      pow2: '2 の冪に切り上げ',
+      longest: '長い辺に合わせる',
+    },
+    canvasMode: (label: string) => `${label}の決め方`,
+    canvasMultiple: (n: string) => `${n} の倍数`,
     ratio: { num: '分子', den: '分母' },
     grid: {
       cellW: 'セルの幅',

@@ -3,7 +3,11 @@ import { describe, expect, it } from 'vitest';
 import { ja } from '../../i18n/ja';
 import { EDIT_CATALOG, type EditNodeDto, type ParamSpec } from '../../ipc/edit';
 import {
-  NOT_ADDABLE_YET,
+  canvasDefault,
+  makeCanvasLength,
+  makeMargin,
+  readCanvasLength,
+  readMargin,
   addableOps,
   controlFor,
   defaultParams,
@@ -129,26 +133,45 @@ describe('足す操作', () => {
     expect(opCategory('image.rotate90')).toBe('geometry');
   });
 
-  it('相対の指定の操作（余白・キャンバスを合わせる・9 点のピボット）は段 7 まで足せないが、カタログにはある', () => {
-    expect([...NOT_ADDABLE_YET].sort()).toEqual([
-      'image.fit_canvas',
-      'image.pad',
-      'meta.anchor_pivot',
-    ]);
-    const ids = (['image', 'audio'] as const).flatMap((kind) =>
-      addableOps(kind).flatMap((g) => g.ops.map((o) => o.id)),
-    );
-    for (const id of NOT_ADDABLE_YET) {
-      expect(opSpec(id), id).not.toBeNull();
-      expect(ids, id).not.toContain(id);
+  it('相対の指定の操作（余白・キャンバスを合わせる・9 点のピボット）は画像のエディタで足せ、専用の欄で出す（M14 段 7）', () => {
+    const ids = addableOps('image').flatMap((g) => g.ops.map((o) => o.id));
+    for (const id of ['image.pad', 'image.fit_canvas', 'meta.anchor_pivot']) {
+      expect(ids, id).toContain(id);
     }
-    // 文書に入っていれば、余白・長さは読むだけの欄、9 点は選択、ずれは点の欄で出す
-    expect(controlFor(param('image.pad', 'top'))).toBe('readonly');
-    expect(controlFor(param('image.fit_canvas', 'width'))).toBe('readonly');
-    expect(controlFor(param('image.fit_canvas', 'anchor'))).toBe('select');
+    expect(controlFor(param('image.pad', 'top'))).toBe('margin');
+    expect(controlFor(param('image.fit_canvas', 'width'))).toBe('canvasLength');
+    expect(controlFor(param('image.fit_canvas', 'anchor'))).toBe('anchor');
+    expect(controlFor(param('meta.anchor_pivot', 'anchor'))).toBe('anchor');
     expect(controlFor(param('meta.anchor_pivot', 'offset'))).toBe('point');
     expect(opCategory('image.pad')).toBe('geometry');
     expect(opCategory('meta.anchor_pivot')).toBe('meta');
+  });
+
+  it('余白とキャンバスの長さの値を読み書きする（% は比、負の余白は削る）', () => {
+    expect(readMargin({ px: -3 })).toEqual({ mode: 'px', n: -3 });
+    expect(readMargin({ scale: { num: 1, den: 4 } })).toEqual({ mode: 'percent', n: 25 });
+    expect(makeMargin('px', 2.6)).toEqual({ px: 3 });
+    expect(makeMargin('percent', 12.5)).toEqual({ scale: { num: 1250, den: 10_000 } });
+    expect(makeMargin('percent', -5)).toEqual({ scale: { num: 0, den: 100 } });
+    for (const v of ['keep', 'pow2', 'longest'] as const) {
+      expect(readCanvasLength(v)).toEqual({ mode: v, n: 0 });
+      expect(makeCanvasLength(v, 9)).toBe(v);
+    }
+    expect(readCanvasLength({ multipleOf: 16 })).toEqual({ mode: 'multipleOf', n: 16 });
+    expect(readCanvasLength({ px: 64 })).toEqual({ mode: 'px', n: 64 });
+    expect(readCanvasLength({ scale: { num: 2, den: 1 } })).toEqual({ mode: 'percent', n: 200 });
+    expect(makeCanvasLength('px', 0)).toEqual({ px: 1 });
+    expect(makeCanvasLength('multipleOf', 8)).toEqual({ multipleOf: 8 });
+    expect(makeCanvasLength('percent', 150)).toEqual({ scale: { num: 150, den: 100 } });
+    expect(canvasDefault('px', 48)).toBe(48);
+    expect(canvasDefault('multipleOf', null)).toBe(8);
+    const pad = param('image.pad', 'top');
+    expect(valueSummary('image.pad', pad, { px: 4 })).toBe('4 px');
+    const width = param('image.fit_canvas', 'width');
+    expect(valueSummary('image.fit_canvas', width, 'pow2')).toBe(ja.editor.canvasModes.pow2);
+    expect(valueSummary('image.fit_canvas', width, { multipleOf: 16 })).toBe(
+      ja.editor.canvasMultiple('16'),
+    );
   });
 
   it('音声のエディタは音声の操作だけを「時間」「音量・チャンネル・レート」に分ける', () => {
