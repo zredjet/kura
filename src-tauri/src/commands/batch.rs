@@ -515,6 +515,8 @@ pub struct BatchResultDto {
     pub undone_by: Vec<i64>,
     /// 元に戻せる件数（0 なら［元に戻す…］を押せない）。
     pub undo_available: i64,
+    /// ジョブの警告（N → 1 で色空間の違う絵を sRGB とみなした、など）。
+    pub warnings: Vec<String>,
 }
 
 impl From<BatchResult> for BatchResultDto {
@@ -538,6 +540,7 @@ impl From<BatchResult> for BatchResultDto {
             created: r.created,
             undone_by: r.undo.by,
             undo_available: r.undo.available,
+            warnings: r.warnings,
         }
     }
 }

@@ -797,6 +797,8 @@ export type BatchResultDto = {
 	undoneBy: number[],
 	/**  元に戻せる件数（0 なら［元に戻す…］を押せない）。 */
 	undoAvailable: number,
+	/**  ジョブの警告（N → 1 で色空間の違う絵を sRGB とみなした、など）。 */
+	warnings: string[],
 };
 
 /**  1 件の行。 */
