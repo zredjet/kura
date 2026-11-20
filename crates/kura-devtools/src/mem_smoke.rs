@@ -1430,4 +1430,350 @@ mod tests {
         }
         assert!(failed.is_empty(), "{failed:?}");
     }
+
+    // ---- M14 段 8：一括加工のジョブのメモリ（NFR-17。利用者の決定 3） ----
+
+    /// 子プロセスに渡す一括のケース。
+    const BATCH_CASE: &str = "batch";
+    /// 子プロセスに渡す一括の向き（`overwrite`・`save-as`・`merge`）。
+    const MODE_ENV: &str = "KURA_MEM_SMOKE_MODE";
+    /// 子プロセスに渡す予算（バイト）。
+    const BUDGET_ENV: &str = "KURA_MEM_SMOKE_BUDGET";
+    /// 一括の煙のテストのアイテムの数。
+    const BATCH_ITEMS: usize = 1000;
+
+    /// 子プロセス（一括加工）：`base` はライブラリを開いて実行の場とコーデックの組を作るだけ。`run` は全部のアイテムに、上書き・
+    /// 別名ならレシピ「トリム・4 倍」の一括を、`merge` ならスプライトシートの一括を積み、一括のジョブが終わるまで予算の一括の
+    /// 使用量を 2 ms ごとに見て最大を覚える（終わったらすぐ終える。後のジョブは待たない）。1 行の JSON で標準出力に書く。
+    #[test]
+    #[ignore = "batch_1000_stays_within_the_budget が子プロセスとして起こす"]
+    fn batch_child() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        use kura_core::edit::batch::{
+            BatchMode, BatchRequest, DEFAULT_SAVE_AS_NAME, DEFAULT_SHEET_NAME, MergeRequest,
+            RecipeSource, start_batch, start_merge,
+        };
+        use kura_engine::selection::SheetParams;
+
+        use crate::bench_edit::audio;
+
+        let Ok(spec) = std::env::var(CASE_ENV) else {
+            return;
+        };
+        let Some((name, stage)) = spec.split_once(':') else {
+            return;
+        };
+        if name != BATCH_CASE {
+            return;
+        }
+        let lib = std::path::PathBuf::from(std::env::var(FILE_ENV).unwrap());
+        let mode = std::env::var(MODE_ENV).unwrap();
+        let budget: u64 = std::env::var(BUDGET_ENV).unwrap().parse().unwrap();
+        let session = kura_core::library::LibrarySession::open(
+            &lib,
+            audio::quiet(),
+            audio::services(TASKS, TASKS, Some(budget)),
+        )
+        .unwrap();
+        session.wait_ready();
+        crate::bench_app::settle(&session).unwrap();
+        let engine = session.engine().unwrap();
+        let rt = engine.runtime().unwrap().clone();
+        let _codecs = engine.codecs();
+        if stage == "base" {
+            session.close();
+            println!("{RESULT_MARK}{}", json!({ "stage": "base" }));
+            return;
+        }
+        let db = session.library().db();
+        let (items, recipe): (Vec<i64>, i64) = db
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT id FROM items ORDER BY id")?;
+                let items = stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()?;
+                let recipe = c.query_row("SELECT min(id) FROM edit_recipes", [], |r| r.get(0))?;
+                Ok((items, recipe))
+            })
+            .unwrap();
+        // 予算の一括の使用量の最大を見張る
+        let stop = Arc::new(AtomicBool::new(false));
+        let max_bulk = Arc::new(AtomicU64::new(0));
+        let watcher = {
+            let (stop, max_bulk, rt) = (stop.clone(), max_bulk.clone(), rt.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(u) = rt.budget().usage() {
+                        max_bulk.fetch_max(u.bulk, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+        let t = std::time::Instant::now();
+        let job = match mode.as_str() {
+            "merge" => start_merge(
+                session.jobs(),
+                &MergeRequest {
+                    items: items.clone(),
+                    name: DEFAULT_SHEET_NAME.into(),
+                    sheet: SheetParams::default(),
+                },
+            )
+            .unwrap(),
+            m => start_batch(
+                db,
+                session.jobs(),
+                engine,
+                &BatchRequest {
+                    source: RecipeSource::Recipe(recipe),
+                    items: items.clone(),
+                    mode: if m == "save-as" {
+                        BatchMode::SaveAs {
+                            name: DEFAULT_SAVE_AS_NAME.into(),
+                        }
+                    } else {
+                        BatchMode::Overwrite
+                    },
+                    include_drafts: false,
+                },
+            )
+            .unwrap(),
+        };
+        let record = loop {
+            let r = session.jobs().get(job).unwrap();
+            if r.state.is_terminal() {
+                break r;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let seconds = t.elapsed().as_secs_f64();
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().unwrap();
+        let codes: Vec<String> = db
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT DISTINCT coalesce(code, '') FROM batch_items WHERE job_id = ?1 AND state = 'failed'",
+                )?;
+                let rows = stmt.query_map([job], |r| r.get(0))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+            })
+            .unwrap();
+        let result: serde_json::Value = record
+            .result_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or(serde_json::Value::Null);
+        session.close();
+        println!(
+            "{RESULT_MARK}{}",
+            json!({
+                "stage": "run",
+                "mode": mode,
+                "budget": budget,
+                "items": items.len(),
+                "state": record.state.as_str(),
+                "result": result,
+                "failed_codes": codes,
+                "max_bulk_bytes": max_bulk.load(Ordering::Relaxed),
+                "seconds": seconds,
+            })
+        );
+    }
+
+    /// 一括のケースで見込む結果。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Expect {
+        /// 全部当てる（小さな予算でも待って当てる）。通しのメモリを予算 × 1.25 ＋ 4 MiB と比べる。
+        AllSaved,
+        /// 予算に入るものは当て、入らないものは落ちずに TooLarge で失敗する（予算に依らない一括の固定の分（DB・行・
+        /// スレッド）があるので、通しのメモリは予算と比べない）。
+        SomeTooLarge,
+        /// 全部が落ちずに TooLarge で失敗する。
+        AllTooLarge,
+    }
+
+    /// 一括のケース：向き・予算・見込む結果。
+    struct BatchCase {
+        mode: &'static str,
+        budget: u64,
+        expect: Expect,
+    }
+
+    /// M14 段 8（NFR-17。利用者の決定 3）：ドット絵の PNG 1,000 件（bench batch・NFR-14 と同じ絵）をアプリの取り込みのジョブで
+    /// 入れ、レシピ「トリム・4 倍」を足したライブラリを作り、ケースごとに写して子プロセスで一括を回す（`batch_child`）。
+    /// 子が見た予算の一括の使用量が予算を超えない。小さな予算でも待って全部当て（上書き・別名 128 MiB。N → 1 の 1 枚の
+    /// シート（1,000 コマ・8192² ほど）はアプリの予算の上限 4 GiB）、ピークから基準を引いた量が予算 × 1.25 ＋ 4 MiB 以下。
+    /// 入らない予算では落ちずに TooLarge で失敗する（上書き 1 MiB は小さな絵だけ当て、N → 1 64 MiB は全部失敗）。重い（1,000 件を書いて取り込む）ので、ふだんは回さない：
+    /// `cargo test --release -p kura-devtools mem_smoke::tests::batch_1000 -- --ignored --nocapture`。
+    #[test]
+    #[ignore = "重い（--release で --ignored を付けて回す）"]
+    fn batch_1000_stays_within_the_budget() {
+        use crate::bench_app::batch::{RECIPE_NAME, insert_recipe, write_inputs};
+        use crate::bench_edit::audio;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let t = std::time::Instant::now();
+        write_inputs(&src, BATCH_ITEMS).unwrap();
+        let template = dir.path().join("template.kuralib");
+        {
+            let session = kura_core::library::LibrarySession::create(
+                &template,
+                audio::quiet(),
+                audio::services(TASKS, TASKS, None),
+            )
+            .unwrap();
+            session.wait_ready();
+            let items = crate::bench_app::import_all(&session, &src).unwrap();
+            assert_eq!(items.len(), BATCH_ITEMS);
+            let graph = kura_engine::testing::bench::cases::bulk_doc().unwrap();
+            insert_recipe(&session, RECIPE_NAME, &graph).unwrap();
+            crate::bench_app::settle(&session).unwrap();
+            session.close();
+        }
+        eprintln!(
+            "batch: {BATCH_ITEMS} 件を書いて取り込んだ（{:.1} 秒）",
+            t.elapsed().as_secs_f64()
+        );
+        let cases = [
+            BatchCase {
+                mode: "overwrite",
+                budget: 128 * MIB,
+                expect: Expect::AllSaved,
+            },
+            BatchCase {
+                mode: "save-as",
+                budget: 128 * MIB,
+                expect: Expect::AllSaved,
+            },
+            BatchCase {
+                mode: "merge",
+                budget: 4096 * MIB,
+                expect: Expect::AllSaved,
+            },
+            BatchCase {
+                mode: "overwrite",
+                budget: MIB,
+                expect: Expect::SomeTooLarge,
+            },
+            BatchCase {
+                mode: "merge",
+                budget: 64 * MIB,
+                expect: Expect::AllTooLarge,
+            },
+        ];
+        let exe = std::env::current_exe().unwrap();
+        let mut failed = Vec::new();
+        for (k, case) in cases.iter().enumerate() {
+            // ケースごとにライブラリを写す（APFS のクローン）
+            let lib = dir.path().join(format!("case{k}.kuralib"));
+            let ok = Command::new("cp")
+                .arg("-cR")
+                .arg(&template)
+                .arg(&lib)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "ライブラリを写せません");
+            let run = |stage: &str| -> Option<(u64, serde_json::Value)> {
+                let out = time_l()
+                    .arg(&exe)
+                    .args([
+                        "--exact",
+                        "mem_smoke::tests::batch_child",
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                        "-q",
+                    ])
+                    .env(CASE_ENV, format!("{BATCH_CASE}:{stage}"))
+                    .env(FILE_ENV, &lib)
+                    .env(MODE_ENV, case.mode)
+                    .env(BUDGET_ENV, case.budget.to_string())
+                    .output()
+                    .ok()?;
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                let footprint = stderr
+                    .lines()
+                    .find(|l| l.contains("peak memory footprint"))
+                    .and_then(|l| l.split_whitespace().next())
+                    .and_then(|n| n.parse().ok())?;
+                assert!(out.status.success(), "{} {stage}: {stderr}", case.mode);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let got = stdout
+                    .lines()
+                    .find_map(|l| l.strip_prefix(RESULT_MARK))
+                    .and_then(|l| serde_json::from_str(l).ok())
+                    .unwrap_or_else(|| panic!("{stage}: 結果がありません: {stdout} {stderr}"));
+                Some((footprint, got))
+            };
+            let (Some((base, _)), Some((peak, got))) = (run("base"), run("run")) else {
+                eprintln!("/usr/bin/time -l が使えないので、一括のメモリの煙のテストを見送ります");
+                return;
+            };
+            let used = peak.saturating_sub(base);
+            let max_bulk = got["max_bulk_bytes"].as_u64().unwrap_or(0);
+            let counts = &got["result"]["counts"];
+            let n = |k: &str| counts[k].as_u64().unwrap_or(0);
+            // N → 1 は 1 本の単位：行は saved（作った）か existing、失敗なら全部 failed
+            let saved = n("saved") + n("existing");
+            let label = format!("{}（予算 {:.0} MiB）", case.mode, mib(case.budget));
+            eprintln!(
+                "batch {label}: 通し {:.1} MiB（予算 × 1.25 ＋ 4 MiB を {:+.1} MiB）・予算の一括の使用量の最大 {:.1} MiB・\
+                 基準 {:.1} MiB・{} {}・当てた {saved}・失敗 {}（{}）・{:.2} 秒",
+                mib(used),
+                (used as f64 - bound(case.budget) as f64) / MIB as f64,
+                mib(max_bulk),
+                mib(base),
+                got["state"],
+                got["items"],
+                n("failed"),
+                got["failed_codes"],
+                got["seconds"].as_f64().unwrap_or(0.0),
+            );
+            if case.expect != Expect::SomeTooLarge && used > bound(case.budget) {
+                failed.push(format!(
+                    "{label}: 通し {:.1} MiB が予算 × 1.25 ＋ 4 MiB を超える",
+                    mib(used)
+                ));
+            }
+            if max_bulk > case.budget {
+                failed.push(format!(
+                    "{label}: 予算の一括の使用量 {:.1} MiB が予算を超える",
+                    mib(max_bulk)
+                ));
+            }
+            if got["state"] != "done" {
+                failed.push(format!("{label}: 一括が終わらない（{}）", got["state"]));
+            }
+            let items = BATCH_ITEMS as u64;
+            let codes = got["failed_codes"].as_array().cloned().unwrap_or_default();
+            let too_large_only = codes == vec![json!("TooLarge")];
+            match case.expect {
+                Expect::AllSaved if saved != items => {
+                    failed.push(format!("{label}: 当てた行が {saved} / {items}"));
+                }
+                Expect::SomeTooLarge
+                    if saved + n("failed") != items || n("failed") == 0 || !too_large_only =>
+                {
+                    failed.push(format!(
+                        "{label}: 入るものを当て、ほかが TooLarge で失敗しない（当てた {saved}・失敗 {}・{codes:?}）",
+                        n("failed")
+                    ));
+                }
+                Expect::AllTooLarge if n("failed") != items || !too_large_only => {
+                    failed.push(format!(
+                        "{label}: 落ちずに TooLarge で失敗しない（失敗 {}・{codes:?}）",
+                        n("failed")
+                    ));
+                }
+                _ => {}
+            }
+            let _ = std::fs::remove_dir_all(&lib);
+        }
+        assert!(failed.is_empty(), "{failed:?}");
+    }
 }

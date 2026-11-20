@@ -12,6 +12,7 @@
 //! （`InputGen`・`testing::bench::cases`。M10 の bench edit と同じ文書・同じ手）。測り終えたらライブラリを消す（`--keep` で残す）。
 //! 画面（IPC・WebKit）は含めない。
 
+pub(crate) mod batch;
 pub(crate) mod editor;
 mod report;
 pub(crate) mod save;
@@ -56,6 +57,11 @@ impl EngineFactory for BenchFactory {
     fn codecs(&self, work_dir: &Path) -> CodecSet {
         crate::app_codecs(work_dir)
     }
+
+    /// アプリと同じ耐久（一括加工の 1 件ずつの fsync と区切りの F_FULLFSYNC。M14 段 8）。
+    fn durability(&self) -> Arc<dyn kura_core::edit::Durability> {
+        Arc::new(kura_mac::MacDurability)
+    }
 }
 
 /// アプリと同じ渡しもの（ImageIO のメディア・アプリのコーデックの組）で、プールの大きさだけを決めたもの。
@@ -63,7 +69,7 @@ pub(crate) fn services(preview: usize, bulk: usize) -> Services {
     Services::new(kura_mac::media_backend()).with_engine(Arc::new(BenchFactory { preview, bulk }))
 }
 
-/// 保存のジョブの知らせ（動き始め・終わり）の時刻。
+/// 保存・一括のジョブの知らせ（動き始め・終わり）の時刻。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Seen {
     pub running: Option<Instant>,
@@ -78,11 +84,11 @@ pub(crate) struct Recorder {
 }
 
 impl Recorder {
-    /// ライブラリに渡す知らせの口（保存のジョブだけ覚える）。
+    /// ライブラリに渡す知らせの口（保存・一括のジョブだけ覚える）。
     pub fn sink(self: &Arc<Self>) -> EventSink {
         let me = self.clone();
         Arc::new(move |e: JobEvent| {
-            if e.kind != JobKind::Edit {
+            if !matches!(e.kind, JobKind::Edit | JobKind::Batch) {
                 return;
             }
             let now = Instant::now();

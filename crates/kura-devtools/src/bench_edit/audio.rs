@@ -66,9 +66,14 @@ impl EngineFactory for AudioFactory {
     fn codecs(&self, work_dir: &Path) -> CodecSet {
         crate::app_codecs(work_dir)
     }
+
+    /// アプリと同じ耐久（一括加工の 1 件ずつの fsync と区切りの F_FULLFSYNC。M14 段 8 の一括のメモリの煙のテスト）。
+    fn durability(&self) -> Arc<dyn kura_core::edit::Durability> {
+        Arc::new(kura_mac::MacDurability)
+    }
 }
 
-/// アプリと同じ渡しもの（ImageIO のメディア・アプリのコーデックの組）で、プールの大きさと予算を決めたもの。
+/// アプリと同じ渡しもの（ImageIO のメディア・アプリのコーデックの組・耐久）で、プールの大きさと予算を決めたもの。
 pub(crate) fn services(preview: usize, bulk: usize, budget: Option<u64>) -> Services {
     Services::new(kura_mac::media_backend()).with_engine(Arc::new(AudioFactory {
         preview,
