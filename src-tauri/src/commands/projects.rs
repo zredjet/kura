@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 
 use kura_core::project::{self, Engine, ItemUse, Project};
+
+use super::export::ExportPresetDto;
 use kura_core::time::now_ms;
 use serde::Serialize;
 use specta::Type;
@@ -246,6 +248,44 @@ pub async fn item_projects(
             .into_iter()
             .map(Into::into)
             .collect())
+    })
+    .await
+}
+
+/// プロジェクトの持ち出しの既定（命名・形式・JSON。まだ決めていなければエンジンごとの既定）。
+#[tauri::command]
+#[specta::specta]
+pub async fn project_settings(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<ExportPresetDto, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        Ok(session
+            .library()
+            .db()
+            .read(move |c| project::settings(c, id))?
+            .into())
+    })
+    .await
+}
+
+/// プロジェクトの持ち出しの既定を書く（名前のテンプレートと形式を確かめる）。
+#[tauri::command]
+#[specta::specta]
+pub async fn project_settings_set(
+    state: State<'_, AppState>,
+    id: i64,
+    preset: ExportPresetDto,
+) -> Result<(), AppError> {
+    let session = state.session()?;
+    let preset: kura_core::export::ExportPreset = preset.into();
+    blocking(move || {
+        let now = now_ms();
+        Ok(session
+            .library()
+            .db()
+            .write(move |tx| project::set_settings(tx, id, &preset, now))?)
     })
     .await
 }

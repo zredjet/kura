@@ -44,9 +44,22 @@ export const commands = {
 	libraryCheck: () => typedError<IntegrityDto, AppError>(__TAURI_INVOKE("library_check")),
 	/**
 	 *  選んだもの（一覧の ID。ユニットは印付き）を `dest` に書き出すジョブを積む。
-	 *  書き出し先はあるフォルダで、ライブラリの中は受け付けない。
+	 *  書き出し先はあるフォルダで、ライブラリの中は受け付けない。`options` が null なら M9 と同じ（元の名前・形式はそのまま・
+	 *  JSON を添える）。`options.project` があれば、書き出し先がそのプロジェクトのフォルダの中であることを確かめる。
 	 */
-	exportStart: (dest: string, entries: number[]) => typedError<number, AppError>(__TAURI_INVOKE("export_start", { dest, entries })),
+	exportStart: (dest: string, entries: number[], options: {
+	name: NameRuleDto,
+	image: FormatTargetDto,
+	audio: FormatTargetDto,
+	/**  `kura-export.json` を添える。 */
+	manifest: boolean,
+	/**  登録したプロジェクトの中へ書き出す（書き出し先がその中であることを確かめ、終わったら照らし直す）。 */
+	project: number | null,
+} | null) => typedError<number, AppError>(__TAURI_INVOKE("export_start", { dest, entries, options })),
+	/**  書き出しで選べる形式（画像・音声。形式の表の順）。 */
+	exportFormats: () => typedError<ExportFormatsDto, AppError>(__TAURI_INVOKE("export_formats")),
+	/**  選んだアイテムの書き出す名前と形式の見本（先頭の 50 件まで。ばらとして並べた順）。 */
+	exportPreview: (items: number[], options: ExportOptionsDto) => typedError<PreviewNameDto[], AppError>(__TAURI_INVOKE("export_preview", { items, options })),
 	/**  取り込み前の確認（種類別件数・合計サイズ・重複の見込み・フォルダの概要）。 */
 	importPreview: (paths: string[]) => typedError<ImportPreviewDto, AppError>(__TAURI_INVOKE("import_preview", { paths })),
 	/**  取り込みジョブを積み、ジョブの ID を返す。進捗は `job://progress` で届く。 */
@@ -368,6 +381,10 @@ export const commands = {
 	projectItems: (id: number) => typedError<number[], AppError>(__TAURI_INVOKE("project_items", { id })),
 	/**  アイテムを使っているプロジェクト（並びの順。一致したファイルのパスつき）。 */
 	itemProjects: (item: number) => typedError<ItemProjectDto[], AppError>(__TAURI_INVOKE("item_projects", { item })),
+	/**  プロジェクトの持ち出しの既定（命名・形式・JSON。まだ決めていなければエンジンごとの既定）。 */
+	projectSettings: (id: number) => typedError<ExportPresetDto, AppError>(__TAURI_INVOKE("project_settings", { id })),
+	/**  プロジェクトの持ち出しの既定を書く（名前のテンプレートと形式を確かめる）。 */
+	projectSettingsSet: (id: number, preset: ExportPresetDto) => typedError<null, AppError>(__TAURI_INVOKE("project_settings_set", { id, preset })),
 	/**  レシピの一覧（並びの順）。 */
 	recipesList: () => typedError<RecipeSummaryDto[], AppError>(__TAURI_INVOKE("recipes_list")),
 	/**  1 件のレシピ。 */
@@ -1907,6 +1924,31 @@ export type Expand =
 /**  フレーム・クリップごとに 1 つ（例 `"{stem}_{index:03}"`）。 */
 { type: "perElement"; name: string };
 
+/**  書き出しで選べる形式（形式の表の順。今の環境で書けるもの）。 */
+export type ExportFormatsDto = {
+	image: string[],
+	audio: string[],
+};
+
+/**  書き出しの設定。 */
+export type ExportOptionsDto = {
+	name: NameRuleDto,
+	image: FormatTargetDto,
+	audio: FormatTargetDto,
+	/**  `kura-export.json` を添える。 */
+	manifest: boolean,
+	/**  登録したプロジェクトの中へ書き出す（書き出し先がその中であることを確かめ、終わったら照らし直す）。 */
+	project: number | null,
+};
+
+/**  プロジェクトの持ち出しの既定。 */
+export type ExportPresetDto = {
+	name: NameRuleDto,
+	image: FormatTargetDto,
+	audio: FormatTargetDto,
+	manifest: boolean,
+};
+
 /**  書き出しの結果（`JobProgress.resultJson` を読むときの型。ADR-120）。 */
 export type ExportResultDto = {
 	/**  書き出し先のフォルダ。 */
@@ -1914,7 +1956,11 @@ export type ExportResultDto = {
 	total: number,
 	exported: number,
 	failed: number,
-	/**  書いた JSON の名前（終わったとき）。 */
+	/**  形式を変えて書いた数（M15 段 3。それより前の結果にはない）。 */
+	converted: number | null,
+	/**  Kura が同じアイテムから書いたファイルを置き換えた数（中身が同じで書かなかったものを含む。M15 段 3）。 */
+	replaced: number | null,
+	/**  書いた JSON の名前（終わったとき。添えない設定なら null）。 */
 	manifest: string | null,
 };
 
@@ -1958,6 +2004,12 @@ export type FormatChoice =
 { type: "keep" } | 
 /**  形式を指定する（`options` はエンコーダの設定）。 */
 { type: "to"; format: string; options?: JsonValue };
+
+/**
+ *  画像・音声の書く形式（`original` はそのまま写す（M9）、`playable` は変えない（書けない形式は PNG・Ogg Vorbis に変える）、
+ *  `to` はその形式）。
+ */
+export type FormatTargetDto = { type: "original" } | { type: "playable" } | { type: "to"; format: string };
 
 export type GranularityDto = "file" | "unit";
 
@@ -2482,6 +2534,17 @@ export type MetaAccess =
 /**  操作が自分で書く（格子・ループ点を設定する操作）。 */
 "write";
 
+/**  名前の規則（テンプレートの語は {名前}・{元の名前}・{番号}・{ユニット}・{幅}・{高さ}。null は元のファイル名）。 */
+export type NameRuleDto = {
+	template: string | null,
+	style: NameStyleDto,
+	/**  ASCII の文字だけにする（ほかを除き、空なら item-ID）。 */
+	ascii: boolean,
+};
+
+/**  名前の書き方。 */
+export type NameStyleDto = "keep" | "snake" | "kebab" | "pascal" | "camel";
+
 /**  操作 1 つ。 */
 export type Node = Node_Serialize | Node_Deserialize;
 
@@ -2827,6 +2890,14 @@ export type PrecheckGroupDto = {
 	code: string,
 	message: string,
 	items: number[],
+};
+
+/**  書き出す名前の見本の 1 件。 */
+export type PreviewNameDto = {
+	itemId: number,
+	name: string,
+	/**  形式を変えるならその形式。 */
+	convert: string | null,
 };
 
 /**  前に取得したダウンロード。 */

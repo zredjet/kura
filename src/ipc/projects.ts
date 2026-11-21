@@ -1,4 +1,10 @@
-import { commands, type EngineDto, type ItemProjectDto, type ProjectDto } from './bindings';
+import {
+  commands,
+  type EngineDto,
+  type ExportPresetDto,
+  type ItemProjectDto,
+  type ProjectDto,
+} from './bindings';
 import { unwrap } from './result';
 
 export type { EngineDto, ItemProjectDto, ProjectDto };
@@ -44,4 +50,14 @@ export function projectItems(id: number): Promise<number[]> {
 /** アイテムを使っているプロジェクト（一致したファイルのパスつき）。 */
 export function itemProjects(item: number): Promise<ItemProjectDto[]> {
   return unwrap(commands.itemProjects(item));
+}
+
+/** プロジェクトの持ち出しの既定（命名・形式・JSON。まだ決めていなければエンジンごとの既定）。 */
+export function projectSettings(id: number): Promise<ExportPresetDto> {
+  return unwrap(commands.projectSettings(id));
+}
+
+/** プロジェクトの持ち出しの既定を書く。 */
+export function setProjectSettings(id: number, preset: ExportPresetDto): Promise<null> {
+  return unwrap(commands.projectSettingsSet(id, preset));
 }
