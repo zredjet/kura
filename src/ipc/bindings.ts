@@ -349,6 +349,25 @@ export const commands = {
 	itemCreditsSet: (itemIds: number[], unitIds: number[], patch: CreditPatchDto) => typedError<CreditsSetDto, AppError>(__TAURI_INVOKE("item_credits_set", { itemIds, unitIds, patch })),
 	/**  使ったアイテムのクレジットを、来歴の元をたどって集める（同じ表記の行は 1 つにまとめる）。 */
 	creditsCollect: (items: number[]) => typedError<CreditsDto, AppError>(__TAURI_INVOKE("credits_collect", { items })),
+	/**  登録したプロジェクトの一覧（並びの順）。 */
+	projectsList: () => typedError<ProjectDto[], AppError>(__TAURI_INVOKE("projects_list")),
+	/**
+	 *  フォルダをプロジェクトとして登録し、照らし直しを積む（エンジンはフォルダの中身で見分ける。`name` が null ならフォルダの
+	 *  名前）。ない・フォルダでない・ライブラリの中か外側は Invalid／NotFound、ほかのプロジェクトと重なれば Conflict。
+	 */
+	projectAdd: (path: string, name: string | null) => typedError<ProjectDto, AppError>(__TAURI_INVOKE("project_add", { path, name })),
+	/**  名前を変える。 */
+	projectRename: (id: number, name: string) => typedError<null, AppError>(__TAURI_INVOKE("project_rename", { id, name })),
+	/**  場所を選び直し（使った記録は残す）、照らし直しを積む。 */
+	projectRelocate: (id: number, path: string) => typedError<ProjectDto, AppError>(__TAURI_INVOKE("project_relocate", { id, path })),
+	/**  登録を外す（使った記録も消える。プロジェクトのフォルダには触れない）。 */
+	projectRemove: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("project_remove", { id })),
+	/**  登録したプロジェクト全部の照らし直しを積む（待っているものがあれば積まず null）。 */
+	projectsScan: () => typedError<number | null, AppError>(__TAURI_INVOKE("projects_scan")),
+	/**  プロジェクトで使っているアイテム（ID の順。クレジットの一覧の対象）。 */
+	projectItems: (id: number) => typedError<number[], AppError>(__TAURI_INVOKE("project_items", { id })),
+	/**  アイテムを使っているプロジェクト（並びの順。一致したファイルのパスつき）。 */
+	itemProjects: (item: number) => typedError<ItemProjectDto[], AppError>(__TAURI_INVOKE("item_projects", { item })),
 	/**  レシピの一覧（並びの順）。 */
 	recipesList: () => typedError<RecipeSummaryDto[], AppError>(__TAURI_INVOKE("recipes_list")),
 	/**  1 件のレシピ。 */
@@ -1835,6 +1854,11 @@ export type Edit_Serialize =
 /**  文書を丸ごと替える（すべての操作を外す・レシピの読み込みなど。今のスキーマの文書）。 */
 ({ type: "replace"; graph: Graph_Serialize }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; items?: never; key?: never; node?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never };
 
+/**  プロジェクトのエンジン。 */
+export type EngineDto = "godot" | "unity" | 
+/**  どのエンジンでもないフォルダ。 */
+"folder";
+
 /**  まとめて変えた結果：変えたアイテムと、そのうちユニットのメンバーの数。 */
 export type EntriesUpdatedDto = {
 	itemIds: number[],
@@ -2146,6 +2170,15 @@ export type ItemPatchDto = {
 	note?: string | null,
 };
 
+/**  アイテムを使っているプロジェクト 1 つ。 */
+export type ItemProjectDto = {
+	projectId: number,
+	name: string,
+	missing: boolean,
+	/**  そのアイテムと一致したファイル（ルートからの相対パス）。 */
+	paths: string[],
+};
+
 /**  並び順（`items_query_ids` の引数、プレイリストの並び順）。 */
 export type ItemSortDto = {
 	key: SortKeyDto,
@@ -2218,7 +2251,9 @@ export type JobFilterDto = {
  *  ジョブの種類（analyze は M11 の解析。取り込み・サムネイル・保存に譲る。edit は M12 の編集の保存、gc は M12 の段 3 の
  *  置き換えた版のファイルの片付け、batch は M14 の一括加工）。
  */
-export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export" | "analyze" | "edit" | "gc" | "batch";
+export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export" | "analyze" | "edit" | "gc" | "batch" | 
+/**  プロジェクトの照らし直し（M15 段 2）。 */
+"project";
 
 /**  ジョブの進捗（イベント `job://progress`）。 */
 export type JobProgress = {
@@ -2804,6 +2839,25 @@ export type PreviousDownloadDto = {
 	items: number,
 	/**  そのうち今もライブラリにある数（ゴミ箱を除く）。 */
 	inLibrary: number,
+};
+
+/**  登録したプロジェクト 1 つ。 */
+export type ProjectDto = {
+	id: number,
+	name: string,
+	/**  正規化した絶対パス。 */
+	root: string,
+	engine: EngineDto,
+	/**  最後の照らしでフォルダが見つからなかった（使った記録は残っている）。 */
+	missing: boolean,
+	/**  最後に照らし終えた時刻（まだなら null）。 */
+	scannedAt: number | null,
+	/**  照らしたファイルの数。 */
+	files: number,
+	/**  使っているアイテムの数。 */
+	items: number,
+	createdAt: number,
+	updatedAt: number,
 };
 
 /**  画質（`best` / `1080` / `720` / `480`）。 */
