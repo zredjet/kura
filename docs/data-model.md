@@ -848,6 +848,7 @@ GROUP BY item_id HAVING COUNT(*) = 3;
 - フォルダは再帰 CTE で子孫フォルダを求め、`id IN (SELECT item_id FROM item_folders WHERE folder_id IN …)` で絞る。
 - 「ユニットをまとめて表示」は、ゴミ箱以外の set ユニットの所属（`unit_items`）を一度読んで、Rust で最初に現れた位置にまとめる。
 - フォルダの件数は `item_folders` を `item_id` 順に一度読み、祖先へ数え上げる（同じアイテムは 1 回）。
+- プロジェクト（M15 段 6）はプロジェクトが主キーであるかを確かめてから、`i.id IN (SELECT f.item_id FROM project_files f WHERE f.project_id = ? AND f.item_id IS NOT NULL)`（主キー `(project_id, path)` の前の方）で絞り、ゴミ箱は除く。サイドバーの件数（`projects` の一覧の `items`）も、一致したファイルのアイテムのうちゴミ箱にないものを数える（一覧と同じ数）。
 
 ### 全文検索
 
