@@ -9,6 +9,7 @@
 //! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
 //! - `current_executable`・`executable_path`：プロセスの今の実行ファイル（改名・移動を追う。SVG の働き手の起動。`process`）
 //! - `find_chrome`・`snapshot_webview`：キャプチャ用の Google Chrome の場所と、WKWebView の表示範囲の撮影
+//! - `begin_drag`：WKWebView から OS のドラッグを始め、落とす先が求めたらファイルの URL を渡す（ドラッグアウト。M15 段 5）
 //! - `reveal_in_finder`・`volume_capacity`・`physical_memory`：Finder で見せる、ボリュームの容量、物理メモリ（編集のメモリの予算）
 //! - `codec`：編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し）と
 //!   `codec_set`（固定の段に足した組）・`full_codec_set`（さらに ffmpeg の段を足したアプリの組）・`codec_caps`（能力と環境）
@@ -25,6 +26,7 @@ pub mod alloc;
 mod bridge;
 mod browser;
 pub mod codec;
+mod dragout;
 mod durability;
 mod external;
 mod files;
@@ -40,6 +42,7 @@ pub use codec::{
     MacCaps, codec_caps, codec_set, full_codec_set, platform_decoders, platform_encoders,
     platform_status,
 };
+pub use dragout::{DragFile, DragHandler, begin_drag};
 pub use durability::MacDurability;
 pub use external::{ExternalPlayer, open_in_player};
 pub use files::{
