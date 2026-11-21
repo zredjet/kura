@@ -395,12 +395,14 @@ pub(super) struct StreamCx<'a> {
     pub opts: &'a DecodeOptions,
     pub limits: &'a Limits,
     pub mon: &'a UnitMonitor<'a>,
+    /// 予算の枠（ジョブは一括で待つ。ドラッグアウトは対話で待たずに、足りなければ断る。M15 段 5）。
+    pub class: Class,
 }
 
 impl StreamCx<'_> {
-    /// 一括の予算を確保する（待つことがある。中止で止める）。
+    /// 予算を確保する（一括は待つことがある。中止で止める。対話は待たずに、足りなければ Limit）。
     fn acquire(&self, bytes: u64) -> Result<Flow<kura_engine::budget::Lease>> {
-        let r = self.runtime.budget().acquire(bytes, Class::Bulk, self.mon);
+        let r = self.runtime.budget().acquire(bytes, self.class, self.mon);
         engine_flow(self.ctx, "保存のメモリを確保できません", r)
     }
 

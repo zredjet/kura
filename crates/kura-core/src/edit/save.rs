@@ -48,7 +48,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kura_engine::budget::value_bytes;
+use kura_engine::budget::{Class, value_bytes};
 use kura_engine::codec::anchor::{self, AnchorContext};
 use kura_engine::codec::formats::{format_by_ext, format_by_id};
 use kura_engine::codec::recorded::{self, Recorded, RecordedInput};
@@ -809,6 +809,8 @@ struct Prepared {
 
 /// 段 0 で決めたもの（流して書く道 `prepare_stream` に渡す）。
 struct Decided<'a> {
+    /// 予算の枠（[`GraphExtra::interactive`] なら対話）。
+    class: Class,
     mode: Mode,
     item_id: i64,
     base: Base,
@@ -1197,6 +1199,8 @@ pub(crate) struct GraphExtra {
     pub(crate) batch: Option<serde_json::Value>,
     /// コミットしない描き（M15 段 3 の書き出し）：アンカーを作らない（作っても版と一緒に置かれず捨てるだけなので）。
     pub(crate) transient: bool,
+    /// 予算を対話の枠で待たずに確保する（足りなければ Limit で断る。利用者がその場で待つドラッグアウト。M15 段 5）。
+    pub(crate) interactive: bool,
 }
 
 /// 上書き・別名で保存の準備に渡すもの（文書の根・DB にまだない部品・別名の名前・版の記録に足す一括の出どころ）。
@@ -1210,6 +1214,8 @@ struct DocArgs {
     batch: Option<serde_json::Value>,
     /// コミットしない描き（アンカーを作らない。[`GraphExtra::transient`]）。
     transient: bool,
+    /// 予算の枠（[`GraphExtra::interactive`] なら対話）。
+    class: Class,
 }
 
 /// 描いて書き終えた 1 件（段 5 まで。[`Saver::commit`] に渡す。落とすと staging を消す）。
@@ -1300,6 +1306,7 @@ impl Saver {
                 names,
                 batch: None,
                 transient: false,
+                class: Class::Bulk,
             },
             &graph,
         )
@@ -1320,6 +1327,7 @@ impl Saver {
             names,
             batch,
             transient,
+            interactive,
         } = extra;
         let parts = split_graph(graph)?;
         let doc = parts.root;
@@ -1334,6 +1342,11 @@ impl Saver {
                 names,
                 batch,
                 transient,
+                class: if interactive {
+                    Class::Interactive
+                } else {
+                    Class::Bulk
+                },
             },
             graph,
         )
@@ -1350,6 +1363,7 @@ impl Saver {
             names,
             batch,
             transient,
+            class,
         } = a;
         let library = ctx.library();
         let db = library.db();
@@ -1411,6 +1425,7 @@ impl Saver {
             return self.prepare_stream(
                 ctx,
                 Decided {
+                    class,
                     mode,
                     item_id,
                     base,
@@ -1490,7 +1505,7 @@ impl Saver {
             let (_estimate, lease) = go!(
                 ctx,
                 "保存のメモリを確保できません",
-                runtime.admit_bulk_with(&plan, spec, anchor_need, &mon)
+                runtime.admit_with(&plan, spec, anchor_need, class, &mon)
             );
             Ok(Flow::Go((plan, lease)))
         };
@@ -1689,6 +1704,7 @@ impl Saver {
             opts: &d.opts,
             limits: &d.limits,
             mon: &mon,
+            class: d.class,
         };
         // 進捗の重み：入力 1（作業用のファイル 1・照らしの回 0.5）、書く回 × 1、昇格の照らし 0.5、R2 の読み直し 0.25
         let probe = Shape::Audio {
@@ -1799,7 +1815,7 @@ impl Saver {
         let (_estimate, lease) = go!(
             ctx,
             "保存のメモリを確保できません",
-            runtime.admit_bulk_with(&plan, spec, |_| promote_need, &mon)
+            runtime.admit_with(&plan, spec, |_| promote_need, d.class, &mon)
         );
         // 3. アンカーの昇格（Platform・External で読んだ作業用のファイルを、写して照らす）
         let mut staging = Staging::default();

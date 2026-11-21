@@ -150,6 +150,20 @@ impl EngineRuntime {
         extra: impl FnOnce(&MemoryEstimate) -> u64,
         mon: &dyn Monitor,
     ) -> std::result::Result<(MemoryEstimate, Lease), EngineError> {
+        self.admit_with(plan, spec, extra, Class::Bulk, mon)
+    }
+
+    /// [`EngineRuntime::admit_bulk_with`] の枠を選べる形：`Class::Bulk` は確保できるまで待ち、`Class::Interactive` は待たずに、
+    /// 今すぐ確保できなければ Limit（利用者がその場で待つ用意。ドラッグアウトの形式の変換。M15 段 5・ADR-207）。描くのは
+    /// どちらも一括のプール。
+    pub fn admit_with(
+        &self,
+        plan: &Plan,
+        spec: EstimateSpec<'_>,
+        extra: impl FnOnce(&MemoryEstimate) -> u64,
+        class: Class,
+        mon: &dyn Monitor,
+    ) -> std::result::Result<(MemoryEstimate, Lease), EngineError> {
         outside_the_pools("予算は、編集のプールの外で確保します");
         let spec = spec.tasks(self.bulk_threads() as u64);
         let estimate = self.engine.estimate(plan, &spec, None)?;
@@ -160,7 +174,7 @@ impl EngineRuntime {
                 "メモリの予算を超える見込みです（見積もり {need} バイト。予算は {total} バイト）"
             )));
         }
-        let lease = self.budget.acquire(need, Class::Bulk, mon)?;
+        let lease = self.budget.acquire(need, class, mon)?;
         Ok((estimate, lease))
     }
 
@@ -545,6 +559,46 @@ mod tests {
         flag.cancel();
         let r = rt.admit_bulk_with(&plan, EstimateSpec::new(0), |_| 10 * MIB, &flag);
         assert!(matches!(r, Err(EngineError::Canceled)), "{:?}", r.err());
+    }
+
+    /// 対話の枠（ドラッグアウトの形式の変換。M15 段 5）は待たない：埋まっていれば中止を見るまでもなくすぐ Limit、空いて
+    /// いれば確保する。
+    #[test]
+    fn interactive_admission_refuses_at_once_when_the_budget_is_taken() {
+        let rt = EngineRuntime::new(&RuntimeConfig {
+            budget: Some(64 * MIB),
+            bulk_threads: Some(2),
+            preview_threads: Some(1),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let (graph, input) = doc();
+        let plan = compiled(&rt, &graph, &input);
+        let hold = rt
+            .budget()
+            .acquire(60 * MIB, Class::Bulk, &NoMonitor)
+            .unwrap();
+        let start = std::time::Instant::now();
+        let r = rt.admit_with(
+            &plan,
+            EstimateSpec::new(0),
+            |_| 10 * MIB,
+            Class::Interactive,
+            &NoMonitor,
+        );
+        assert!(matches!(r, Err(EngineError::Limit(_))), "{:?}", r.err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        drop(hold);
+        let (_, lease) = rt
+            .admit_with(
+                &plan,
+                EstimateSpec::new(0),
+                |_| 10 * MIB,
+                Class::Interactive,
+                &NoMonitor,
+            )
+            .unwrap();
+        assert_eq!(lease.bytes(), 10 * MIB);
     }
 
     /// 予算の確保をプールの中からすると、debug のビルドで止まる（ほかの描画のワーカーを塞いで待たない）。

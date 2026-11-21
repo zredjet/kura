@@ -760,6 +760,7 @@ fn rebuild_stream_in(
         opts: &rec.options,
         limits,
         mon: &mon,
+        class: kura_engine::budget::Class::Bulk,
     };
     // 進捗の重み：入力 1、書く回 × 回の数（記録の書き手、なければ今の組の同じ形式のもの）、R2 の読み直し 0.25。GC の照合
     // （rules.progress が偽）は送らない（GC は自分の進捗を送る）
