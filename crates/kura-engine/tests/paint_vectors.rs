@@ -6,7 +6,7 @@
 //! - `tests/vectors/paint/points-valid.json`：読める点の列の境界（±2^31 の端など。Rust と TS で同じ点に読む）。
 //! - フロントは `src/lib/paint.test.ts` が同じファイルを読んで、`src/lib/paint.ts` の結果と照らす。
 //! - ベクタは消す・変えるのを認めない（規則を変えるなら操作の版を上げ、新しいファイルを足す）。足りなければ
-//!   `KURA_BLESS=1 cargo test -p kura-engine --test paint_vectors` で書く。
+//!   `KURA_BLESS=1 cargo test -p kura-engine --test suite paint_vectors::` で書く。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

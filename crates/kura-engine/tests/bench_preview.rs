@@ -1,5 +1,5 @@
 //! 段 10 のプレビューの段のベンチ（NFR-11。docs/editing.md §16）。ふだんは回さない：
-//! `cargo test --release -p kura-engine --test bench_preview -- --ignored --nocapture --test-threads 1`
+//! `cargo test --release -p kura-engine --test suite bench_preview:: -- --ignored --nocapture --test-threads 1`
 //!
 //! 判定の条件（ADR-154 (1)(c)）：プレビューのプールを 3 スレッドにして測り、4・16 スレッドも記録する。「エンジンの中」は
 //! 編集（文書）を受けてから、プレビューの値と変わったタイルの一覧ができるまで：compile → plan_level → render_cached

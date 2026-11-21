@@ -7,7 +7,7 @@
 //! - 例の値を直接確かめる（ゴールデンに凍結する前の正しさ）。
 //! - 合成の検査集：最近傍で拡大したドット絵・切り抜き・JPEG を通したもの・平滑な拡大・1 点の書き足し、
 //!   スプライトシート（試作の 12 種）・不規則な配置。
-//! - 16384² の時間（`#[ignore]`）：`cargo test --release -p kura-engine --test analysis_image -- --ignored --nocapture`
+//! - 16384² の時間（`#[ignore]`）：`cargo test --release -p kura-engine --test suite analysis_image:: -- --ignored --nocapture`
 
 // テストの補助関数は #[test] の外にあるので、テストと同じく unwrap などを許す（clippy.toml の allow-*-in-tests が届かない）
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

@@ -8,6 +8,8 @@ publish.workspace = true
 # codec/vorbis/ は aoTuV・libvorbis（BSD-3-Clause）を移したもの（ADR-149。表示は src/codec/vorbis/LICENSE）。
 license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
 repository.workspace = true
+# 結合テストは tests/suite.rs の 1 つのバイナリにまとめ、下の [[test]] だけを別にする（ADR-209。tests/suite.rs の冒頭）
+autotests = false
 
 # 結果に効く依存は `=` で版を固定する（docs/editing.md §8.2、ADR-136）。上げるのはゴールデンが通るときだけ。
 # - blake3：すべてのダイジェスト
@@ -75,3 +77,39 @@ proptest.workspace = true
 
 [lints]
 workspace = true
+
+# 結合テストのバイナリ（autotests = false。ファイルを足したら tests/suite.rs の pub mod か、ここに足す）
+# - suite：ほかのすべての結合テスト（作り直したばかりの実行ファイルの起動待ちとリンクを 1 回にする。ADR-209）
+# - golden・codec_golden・analysis_golden・model_golden・replay：CI の push ごとの最低限が回すゴールデン（ADR-209）
+# - model_json_heap・stream_held：#[global_allocator] で確保を数えるので、ほかのテストと同じプロセスにしない
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
+[[test]]
+name = "golden"
+path = "tests/golden.rs"
+
+[[test]]
+name = "codec_golden"
+path = "tests/codec_golden.rs"
+
+[[test]]
+name = "analysis_golden"
+path = "tests/analysis_golden.rs"
+
+[[test]]
+name = "model_golden"
+path = "tests/model_golden.rs"
+
+[[test]]
+name = "replay"
+path = "tests/replay.rs"
+
+[[test]]
+name = "model_json_heap"
+path = "tests/model_json_heap.rs"
+
+[[test]]
+name = "stream_held"
+path = "tests/stream_held.rs"

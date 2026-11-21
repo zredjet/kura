@@ -1,5 +1,5 @@
 //! E30（docs/editing.md §16・§17、requirements.md の NFR-11〜17）：段 10 の編集の性能のベンチ。ふだんは回さない：
-//! `cargo test --release -p kura-engine --test bench_edit -- --ignored --nocapture --test-threads=1`
+//! `cargo test --release -p kura-engine --test suite bench_edit:: -- --ignored --nocapture --test-threads=1`
 //!
 //! - 時間は表に出すだけで、断言するのは正しさだけ：エディタの経路と一括の経路のダイジェストが同じ（NFR-16）、予算を超える
 //!   計画は Limit（NFR-17・E25）、見積もりが実際（描いた値で数えた生きている値）以上。

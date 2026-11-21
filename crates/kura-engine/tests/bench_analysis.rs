@@ -1,5 +1,5 @@
 //! 段 8 の解析の枠組みのベンチ（docs/editing.md §16）。ふだんは回さない：
-//! `cargo test --release -p kura-engine --test bench_analysis -- --ignored --nocapture`
+//! `cargo test --release -p kura-engine --test suite bench_analysis:: -- --ignored --nocapture`
 //!
 //! 時間は `Engine::analyze_dyn`（引数の確かめ・上限・解析・正規の形）と、申告した解析を先に解く正規化の描画全体。
 

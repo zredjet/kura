@@ -7,7 +7,7 @@
 //! - ヘッダの形の凍結：書くヘッダの正規の JSON（形を変えるなら `v` を上げる）。
 //! - 壊れた入力：ChaCha8 で崩したアンカーを `testing::fuzz_decode` に通し、自前のコードの panic・`Internal`・形と中身の
 //!   食い違いがない。
-//! - 速さと大きさ（ふだんは回さない）：`cargo test --release -p kura-engine --test anchor -- --ignored --nocapture`
+//! - 速さと大きさ（ふだんは回さない）：`cargo test --release -p kura-engine --test suite anchor:: -- --ignored --nocapture`
 
 #![allow(
     clippy::unwrap_used,

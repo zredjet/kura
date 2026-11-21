@@ -30,7 +30,7 @@ cargo install --locked cargo-fuzz
 - 種：`crates/kura-engine/tests/fuzz_smoke.rs` の `targets()`（各形式の小さなファイル・`fixtures/`・自作のエンコーダの出力・`encode_ogg` の見出しと標本）、デコーダのゴールデンに凍結した作り方（`FileGen`）、登録されたすべての操作の例（1 ノードの文書）。`fuzz/corpus/<対象>/` に書き出す（git には入れない）：
 
 ```bash
-cargo test -p kura-engine --test fuzz_smoke export_seeds -- --ignored
+cargo test -p kura-engine --test suite fuzz_smoke::export_seeds -- --ignored
 ```
 
 ## 回す
@@ -70,12 +70,12 @@ $LLVM_COV show target/aarch64-apple-darwin/coverage/aarch64-apple-darwin/release
 同じ対象を stable で変異させる `crates/kura-engine/tests/fuzz_smoke.rs` を回す（カバレッジは見ない）：
 
 ```bash
-KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test fuzz_smoke long -- --ignored --nocapture
+KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test suite fuzz_smoke::long -- --ignored --nocapture
 ```
 
 - `KURA_FUZZ_ONLY=svg,wav` で対象を選べる。見つけた入力は `target/fuzz-smoke/<対象>-<回>.bin` に残る。
 - 直したら、残った入力を流し直して確かめる：
 
 ```bash
-cargo test --release -p kura-engine --test fuzz_smoke replay -- --ignored --nocapture
+cargo test --release -p kura-engine --test suite fuzz_smoke::replay -- --ignored --nocapture
 ```

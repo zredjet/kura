@@ -1,5 +1,5 @@
 //! 大きな画像（16384²）を上限の中で読み書きできること（M10 段 4 の完了条件。docs/editing.md §13）。
-//! 重いので通常のテストでは回さない：`cargo test --release -p kura-engine --test large -- --ignored`。
+//! 重いので通常のテストでは回さない：`cargo test --release -p kura-engine --test suite large:: -- --ignored`。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

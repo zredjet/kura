@@ -1,5 +1,5 @@
 //! 段 10 の差分の経路のベンチ（NFR-12。docs/editing.md §16）。ふだんは回さない：
-//! `cargo test --release -p kura-engine --test bench_append -- --ignored --nocapture --test-threads=1`
+//! `cargo test --release -p kura-engine --test suite bench_append:: -- --ignored --nocapture --test-threads=1`
 //!
 //! 測るのは、セッションに筆 1 本（500 点）を足してから、差分の計画（`Engine::compile_snapshot`）とキャッシュの描画
 //! （`Engine::render_cached`。差分の適用・ダイジェストなし）が終わるまで。セッションの手（commit）は別に測る。エンコード・

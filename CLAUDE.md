@@ -43,7 +43,7 @@ docs/                      # 仕様・設計（下記）
 | 開発起動 | `pnpm tauri dev` |
 | 全チェック | `/verify` スキル |
 | Rust テスト | `cargo test --workspace` |
-| エンジンのテスト | `cargo test -p kura-engine`（ゴールデン・適合・性質テスト） |
+| エンジンのテスト | `cargo test -p kura-engine`（ゴールデン・適合・性質テスト。結合テストの 1 ファイルだけは `--test suite <ファイル名>::`） |
 | Rust lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | 整形 | `cargo fmt --all` と `pnpm run format` |
 | 型チェック | `pnpm run typecheck` |

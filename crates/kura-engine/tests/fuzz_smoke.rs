@@ -6,7 +6,7 @@
 //! レシピのファイル（M14）は `recipe`。
 //!
 //! - ふだんの `cargo test` では、対象ごとに決めた回数だけ回す（`quick`）。
-//! - `KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test fuzz_smoke -- --ignored` で、対象ごとに決めた秒数だけ回す。
+//! - `KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test suite fuzz_smoke:: -- --ignored` で、対象ごとに決めた秒数だけ回す。
 //!   `KURA_FUZZ_ONLY=svg,wav` で対象を選べる。
 //! - 見つけた入力は `target/fuzz-smoke/` に書き、テストを失敗にする。`replay` で流し直せる。
 

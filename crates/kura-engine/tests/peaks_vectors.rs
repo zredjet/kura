@@ -6,7 +6,7 @@
 //!   `parsePeaks` も読まない（並びの約束の照らし合わせ。解析の版の違いは並びの約束ではないので入れない。TS は解析の版を見ない）。
 //! - フロントは `src/lib/asset/peaks.test.ts` が同じファイルを読み、`src/lib/asset/peaks.ts` の `parsePeaks` と照らす。
 //! - ベクタは消す・変えるのを認めない（並びを変えるなら並びの版を上げ、新しいファイルを足す）。足りなければ
-//!   `KURA_BLESS=1 cargo test -p kura-engine --test peaks_vectors` で書く。
+//!   `KURA_BLESS=1 cargo test -p kura-engine --test suite peaks_vectors::` で書く。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

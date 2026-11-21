@@ -1,5 +1,5 @@
 //! 段 10 の範囲の描画と変わった範囲のベンチ（docs/editing.md §16）。ふだんは回さない：
-//! `cargo test --release -p kura-engine --test bench_region -- --ignored --nocapture`
+//! `cargo test --release -p kura-engine --test suite bench_region:: -- --ignored --nocapture`
 //!
 //! 判定の条件（ADR-154 (1)(c)）：プレビューのプールを 3 スレッドにして測り、4・16 スレッドも記録する。時間は表に出すだけで、
 //! assert するのは正しさだけ（E30）。

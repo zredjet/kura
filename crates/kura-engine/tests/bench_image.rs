@@ -1,5 +1,5 @@
 //! 段 5 の画像の操作と描画のベンチ（docs/editing.md §16）。ふだんは回さない：
-//! `cargo test --release -p kura-engine --test bench_image -- --ignored --nocapture`
+//! `cargo test --release -p kura-engine --test suite bench_image:: -- --ignored --nocapture`
 //!
 //! 筆 1,000 本の文書の大きさも測る（文書の大きさの上限を決めるため。ADR-147）。
 //! 時間は操作そのもの（`apply`）で、文書の計画・出力のダイジェストを含まない。

@@ -1,5 +1,5 @@
 //! 段 8 の音声の解析のベンチ（docs/editing.md §16 の「5 分の曲の解析（波形・ラウドネス・トゥルーピーク）2 秒」。NFR-15）。
-//! ふだんは回さない：`cargo test --release -p kura-engine --test bench_audio_analysis -- --ignored --nocapture`
+//! ふだんは回さない：`cargo test --release -p kura-engine --test suite bench_audio_analysis:: -- --ignored --nocapture`
 //!
 //! 時間は `Engine::analyze_dyn`（引数の確かめ・上限・解析・正規の形）と `analyze_many`（4 つの解析）。デコード（WAV・FLAC の
 //! 16 ビット）を含めた時間も測る。3 回の最小。

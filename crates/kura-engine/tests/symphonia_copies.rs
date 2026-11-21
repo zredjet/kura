@@ -3,7 +3,7 @@
 //!
 //! - 壊れた Vorbis が出す NaN：値に入れる前に `0x7fc00000` にそろえるので、読んだ値は生のビットまで arm64 と x86_64 で
 //!   同じ（f32 の WAV に書いたバイト列も）。凍結した値と照らすので、両方のターゲットで回す：
-//!   `cargo test -p kura-engine --test symphonia_copies` と、同じものに `--target x86_64-apple-darwin`（Rosetta）。
+//!   `cargo test -p kura-engine --test suite symphonia_copies::` と、同じものに `--target x86_64-apple-darwin`（Rosetta）。
 //! - 帯域の中の SBR（暗黙の HE-AAC）：写しのデコーダが fill 要素の SBR の拡張を知らせ（`AacDecoder::sbr_seen`）、固定の段は
 //!   HE-AAC の ADTS・ASC に印のない m4a を断って後の段（AudioToolbox・ffmpeg）へ回す。AAC-LC は今までどおり固定の段で読む
 //!   （値はデコーダのゴールデンと `tests/fixtures.rs` が見る）。

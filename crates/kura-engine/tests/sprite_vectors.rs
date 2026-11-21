@@ -6,7 +6,7 @@
 //! - フロントは `src/lib/asset/timeline.test.ts` が同じファイルを読み、`src/lib/asset/timeline.ts` の `cellsOnAxis`・
 //!   `gridCells` と照らす（格子のシートのプレビューと、スプライトのアニメが `sprite.split_grid` と同じセルを切る）。
 //! - ベクタは消す・変えるのを認めない（数え方を変えるなら操作の版を上げ、新しいファイルを足す）。足りなければ
-//!   `KURA_BLESS=1 cargo test -p kura-engine --test sprite_vectors` で書く。
+//!   `KURA_BLESS=1 cargo test -p kura-engine --test suite sprite_vectors::` で書く。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

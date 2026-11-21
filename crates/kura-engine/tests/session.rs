@@ -1041,7 +1041,7 @@ fn matches_the_naive_model_on_random_sequences() {
     at_least("redo=ok", 10);
 }
 
-/// 同じ照合を長く回す（ふだんは回さない：`cargo test --release -p kura-engine --test session -- --ignored`）。
+/// 同じ照合を長く回す（ふだんは回さない：`cargo test --release -p kura-engine --test suite session:: -- --ignored`）。
 #[test]
 #[ignore]
 fn matches_the_naive_model_on_long_random_sequences() {

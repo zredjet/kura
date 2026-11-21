@@ -1024,7 +1024,7 @@ fn digests_are_optional_and_remembered() {
 }
 
 /// 速さ（ふだんは回さない。release で手で回す）：
-/// `cargo test --release -p kura-engine --test cache bench_cache -- --ignored --nocapture`
+/// `cargo test --release -p kura-engine --test suite cache::bench_cache -- --ignored --nocapture`
 ///
 /// - 帯に詰めたダイジェスト（今の `Value::digest`）と、行をタイルごとに足す旧い足し方（4096² RGBA8・24MP RGB8）
 /// - 4096² RGBA8 の反転 20 個の鎖：キャッシュなし（ダイジェスト込み）・冷えた（ダイジェストなし／あり）・温まった（同じ）・

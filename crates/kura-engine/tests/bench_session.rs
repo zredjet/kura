@@ -1,5 +1,5 @@
 //! 段 10 の EditSession のベンチ（docs/editing.md §16）。ふだんは回さない：
-//! `cargo test --release -p kura-engine --test bench_session -- --ignored --nocapture --test-threads=1`
+//! `cargo test --release -p kura-engine --test suite bench_session:: -- --ignored --nocapture --test-threads=1`
 //!
 //! 測るもの：1 手の時間（筆の追記・引数の変更）と履歴のバイトの見積もり、5 万本の筆の文書での追記、to_graph・正規の JSON・
 //! 開く時間、undo・redo。描画（実行器）は含めない。実メモリはアロケータを数えないと測れないので、ここでは測らない

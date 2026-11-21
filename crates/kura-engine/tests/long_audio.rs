@@ -8,7 +8,7 @@
 //! 4. 出力の常駐のバイト（`resident_bytes`）が区間の分以下。
 //!
 //! 60 分は重い（最初の表示で normalize の計測を全体に流すので、デバッグのビルドで数十秒）ので通常のテストでは回さない：
-//! `cargo test --release -p kura-engine --test long_audio -- --ignored`。通常のテストでは同じ確かめを 6 分の音声で回す。
+//! `cargo test --release -p kura-engine --test suite long_audio:: -- --ignored`。通常のテストでは同じ確かめを 6 分の音声で回す。
 //!
 //! 長い音声の保存（M13 段 3。E44）：60 分・48 kHz ステレオの合成の源（LRU 64 MiB）の trim → fade → normalize → gain を、
 //! `Engine::output_stream` から WAV・FLAC・ogg q5 に流して書く（書き先は数えるだけ）。(1) `estimate(spec.stream)` のピーク ≤
