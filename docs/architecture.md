@@ -100,6 +100,8 @@
 | | `item_credits_summary(itemIds, unitIds)` → `CreditSummaryDto` | 複数選択の集計（ユニットはメンバー全員。項目ごとに `{ mixed, value }`） |
 | | `item_credits_set(itemIds, unitIds, patch)` → `{ items, changed }` | まとめて付ける（ユニットはメンバー全員。省いた項目はアイテムごとのまま、文の空文字は消す、`license` は `{ type: "set", id }`・`{ type: "unset" }`。中身が同じものは書かない） |
 | | `credits_collect(items)` → `CreditsDto` | 使ったアイテムのクレジットを、来歴の元（別名・N → 1）をたどって集める（同じ表記の行は 1 つ。`lines`（ライセンスの並び → 鍵の順。`items`・`used`）・`licenses`・`unset`（未設定）・`lost`（元が消えた）） |
+| | `credits_render(scope, options)` → `{ text, lines, omittedOptional, omittedNone, warnings }` | クレジットの一覧を作る（M15 段 4。見本・クリップボードへのコピー）。`scope` は `{ type: "project", id }`（今使っている素材）か `{ type: "items", itemIds, unitIds }`。`options` は `{ lang（ja・en）, format（markdown・text）, includeOptional, includeNone, listItems }`（画面の既定は日本語・Markdown・任意は載せる・不要は載せない・素材の名前は添えない）。ライセンスごとの見出しと表記の行、要確認の節（未設定・元が消えた・記入が足りない）。docs/data-model.md §4「ライセンスとクレジット（M15）」 |
+| | `credits_save(path, scope, options)` → 同じ | 一覧を作って `path`（保存のダイアログで選んだ絶対パス）に書く（同じフォルダの一時ファイルから名前を替えて置き換える。ライブラリの中は `Invalid`） |
 | プロジェクト（M15 段 2） | `projects_list()` → `ProjectDto[]` | 登録したプロジェクト（並びの順。`name`・`root`（正規化した絶対パス）・`engine`（`godot`・`unity`・`folder`）・`missing`（最後の照らしでフォルダがなかった。記録は残る）・`scannedAt`・`files`（照らしたファイル）・`items`（使っているアイテム）・日時）。docs/data-model.md §4「プロジェクトと使った記録（M15）」 |
 | | `project_add(path, name?)` → `ProjectDto` | フォルダを登録して照らし直しを積む（エンジンは中身で見分ける。`name` が null ならフォルダの名前）。ない・フォルダでない・ライブラリの中か外側は `NotFound`・`Invalid`、ほかのプロジェクトと同じ・中・外側は `Conflict` |
 | | `project_rename(id, name)` / `project_relocate(id, path)` → `ProjectDto` / `project_remove(id)` | 名前を変える・場所を選び直す（使った記録は残し、照らし直しを積む）・登録を外す（使った記録も消える。フォルダには触れない） |
