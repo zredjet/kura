@@ -531,3 +531,35 @@ fn containing_finds_the_project_around_a_destination() {
     assert_eq!(containing(&projects, &other).map(|p| p.id), None);
     assert_eq!(containing(&projects, env.dir.path()).map(|p| p.id), None);
 }
+
+/// 使っているアイテムの数はゴミ箱の中を数えない（使っている素材の一覧と同じ。M15 段 6 の検証の直し）。
+#[test]
+fn used_item_count_skips_trashed_items() {
+    let env = Env::new();
+    let game = env.folder("game");
+    std::fs::write(game.join("project.godot"), b"").unwrap();
+    let id = env.add(&game).unwrap();
+    let (a, b) = (env.item(b"a"), env.item(b"b"));
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO project_files (project_id, path, size_bytes, mtime_ns, hash, item_id, matched, seen_at)
+                 VALUES (?1, 'a.png', 1, 0, x'01', ?2, 'current', 0), (?1, 'b.png', 1, 0, x'02', ?3, 'current', 0),
+                        (?1, 'b2.png', 1, 0, x'02', ?3, 'current', 0)",
+                params![id, a, b],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let count = |env: &Env| env.library.db().read(move |c| get(c, id)).unwrap().items;
+    assert_eq!(count(&env), 2);
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute("UPDATE items SET trashed_at = 5 WHERE id = ?1", [b])?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(count(&env), 1);
+}

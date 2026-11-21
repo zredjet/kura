@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use kura_core::export::names::{NameRule, NameStyle};
 use kura_core::export::{
-    ExportInput, ExportOptions, ExportPreset, FormatTarget, PreviewName, preview_names,
+    ExportInput, ExportOptions, ExportPreset, FormatTarget, PreviewName, preview_entries,
     start_export,
 };
 use kura_core::import::MediaKind;
@@ -234,14 +234,24 @@ pub async fn export_formats(state: State<'_, AppState>) -> Result<ExportFormatsD
     .await
 }
 
-/// 選んだアイテムの書き出す名前と形式の見本（先頭の 50 件まで。ばらとして並べた順）。
+/// 書き出しの見本（先頭の 50 件と、書き出す件数）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreviewDto {
+    pub names: Vec<PreviewNameDto>,
+    /// 書き出す件数（ゴミ箱の中・見つからないものを除く。ユニットのメンバーはユニットごとに数える）。
+    pub total: u32,
+}
+
+/// 選んだもの（一覧の ID。ユニットは印付き）の書き出す名前と形式の見本。書き出しのジョブと同じ並び・番号・ユニットの
+/// フォルダ（名前は `フォルダ/名前`）で、先頭の 50 件と件数（M15 段 6 の検証の直し）。
 #[tauri::command]
 #[specta::specta]
 pub async fn export_preview(
     state: State<'_, AppState>,
-    items: Vec<i64>,
+    entries: Vec<i64>,
     options: ExportOptionsDto,
-) -> Result<Vec<PreviewNameDto>, AppError> {
+) -> Result<ExportPreviewDto, AppError> {
     let session = state.session()?;
     let options: ExportOptions = options.into();
     blocking(move || {
@@ -250,14 +260,14 @@ pub async fn export_preview(
         let check = |f: &str| writable.as_ref().is_some_and(|w| w.contains(f));
         let writable_ref: Option<&dyn Fn(&str) -> bool> =
             writable.as_ref().map(|_| &check as &dyn Fn(&str) -> bool);
-        let head: Vec<i64> = items.into_iter().take(50).collect();
-        Ok(session
+        let p = session
             .library()
             .db()
-            .read(move |c| preview_names(c, &head, &options, writable_ref))?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+            .read(move |c| preview_entries(c, &entries, &options, writable_ref, 50))?;
+        Ok(ExportPreviewDto {
+            names: p.names.into_iter().map(Into::into).collect(),
+            total: u32::try_from(p.total).unwrap_or(u32::MAX),
+        })
     })
     .await
 }

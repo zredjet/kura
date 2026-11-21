@@ -63,7 +63,7 @@ pub struct Project {
     pub scanned_at: Option<i64>,
     /// 照らしたファイルの数。
     pub files: i64,
-    /// 使っているアイテムの数（一致したファイルのアイテム。重なりは 1 つ）。
+    /// 使っているアイテムの数（一致したファイルのアイテム。重なりは 1 つ。ゴミ箱の中は数えない＝使っている素材の一覧と同じ）。
     pub items: i64,
     pub pos: f64,
     pub created_at: i64,
@@ -72,7 +72,8 @@ pub struct Project {
 
 const COLUMNS: &str = "p.id, p.name, p.root, p.engine, p.missing, p.scanned_at,
      (SELECT count(*) FROM project_files f WHERE f.project_id = p.id),
-     (SELECT count(DISTINCT f.item_id) FROM project_files f WHERE f.project_id = p.id AND f.item_id IS NOT NULL),
+     (SELECT count(DISTINCT f.item_id) FROM project_files f JOIN items i ON i.id = f.item_id
+        WHERE f.project_id = p.id AND i.trashed_at IS NULL),
      p.pos, p.created_at, p.updated_at";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Project, String)> {

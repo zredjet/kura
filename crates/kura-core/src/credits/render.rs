@@ -447,14 +447,36 @@ fn load_names(conn: &rusqlite::Connection, ids: &[i64]) -> crate::Result<BTreeMa
     Ok(out)
 }
 
-/// 1 件のアイテムの表記の行（来歴の元をたどる。テキストで、インスペクタの見本。未設定・元が消えたものは載らない。M15 段 6）。
-pub fn preview(conn: &rusqlite::Connection, item: i64, lang: Lang) -> crate::Result<Vec<String>> {
+/// インスペクタの表記の見本（M15 段 6）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreditPreview {
+    /// 組んだ行（テキスト。同じ文は 1 つ。並びは一覧と同じ）。
+    pub lines: Vec<String>,
+    /// このアイテム自身のライセンスが未設定（来歴の元がない）。
+    pub unset: bool,
+    /// 来歴の元のうち、ライセンスが未設定のものの数。
+    pub unset_sources: usize,
+    /// 来歴の元が消えて、たどれないものの数。
+    pub lost: usize,
+}
+
+/// 1 件のアイテムの表記の見本（来歴の元をたどる。テキスト。未設定・元が消えたものは行に載せず数える。M15 段 6・段 6 の
+/// 検証の直し：来歴の要確認も知らせる）。
+pub fn preview(conn: &rusqlite::Connection, item: i64, lang: Lang) -> crate::Result<CreditPreview> {
     let credits = super::collect::collect(conn, &[item])?;
-    Ok(credits
-        .lines
-        .iter()
-        .map(|l| credit_line(&l.key, lang, TextFormat::Text))
-        .collect())
+    let mut lines: Vec<String> = Vec::new();
+    for l in &credits.lines {
+        let text = credit_line(&l.key, lang, TextFormat::Text);
+        if !lines.contains(&text) {
+            lines.push(text);
+        }
+    }
+    Ok(CreditPreview {
+        lines,
+        unset: credits.unset.iter().any(|f| f.item == item),
+        unset_sources: credits.unset.iter().filter(|f| f.item != item).count(),
+        lost: credits.lost.len(),
+    })
 }
 
 /// 範囲の素材のクレジットを集めて一覧にする（プロジェクトなら見出しに名前を添え、照らし終えていない・フォルダが見つからない
@@ -1109,7 +1131,8 @@ mod preview_tests {
                       (2, x'02', 'png', 'image', 1, 'tile', 'tile.png', 0, 0, NULL);",
         )
         .unwrap();
-        assert!(preview(&conn, 2, Lang::Ja).unwrap().is_empty());
+        let unset = preview(&conn, 2, Lang::Ja).unwrap();
+        assert!(unset.lines.is_empty() && unset.unset);
         let by: i64 = conn
             .query_row(
                 "SELECT id FROM licenses WHERE builtin = 'cc-by-4.0'",
@@ -1131,11 +1154,54 @@ mod preview_tests {
         .unwrap();
         assert_eq!(
             preview(&conn, 1, Lang::Ja).unwrap(),
-            ["「森の素材集」 もりの（https://example.com/hero）"]
+            CreditPreview {
+                lines: vec!["「森の素材集」 もりの（https://example.com/hero）".into()],
+                ..CreditPreview::default()
+            }
         );
         assert_eq!(
-            preview(&conn, 1, Lang::En).unwrap(),
+            preview(&conn, 1, Lang::En).unwrap().lines,
             ["\"森の素材集\" by もりの (https://example.com/hero)"]
         );
+    }
+
+    /// 来歴（N → 1 のシート）：元の行を組み、未設定の元と消えた元を数える（同じ文の行は 1 つ）。
+    #[test]
+    fn preview_counts_unset_and_lost_sources() {
+        let conn = test_conn();
+        conn.execute_batch(
+            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+               VALUES (1, x'01', 'png', 'image', 1, 'a', 'a.png', 0, 0),
+                      (2, x'02', 'png', 'image', 1, 'b', 'b.png', 0, 0),
+                      (3, x'03', 'png', 'image', 1, 'c', 'c.png', 0, 0),
+                      (9, x'09', 'png', 'image', 1, 'sheet', 'sheet.png', 0, 0);",
+        )
+        .unwrap();
+        let by: i64 = conn
+            .query_row(
+                "SELECT id FROM licenses WHERE builtin = 'cc-by-4.0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        item::set(
+            &conn,
+            &[1, 2],
+            &CreditPatch {
+                license: Some(Some(by)),
+                author: Some(Some("もりの".into())),
+                ..CreditPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO item_sources (item_id, ord, source_item_id, source_version, source_hash, frames, created_at)
+               VALUES (9, 0, 1, 1, x'01', 1, 0), (9, 1, 2, 1, x'02', 1, 0), (9, 2, 3, 1, x'03', 1, 0);",
+        )
+        .unwrap();
+        let got = preview(&conn, 9, Lang::Ja).unwrap();
+        assert_eq!(got.lines, ["もりの"]);
+        assert_eq!((got.unset, got.unset_sources, got.lost), (false, 1, 0));
     }
 }

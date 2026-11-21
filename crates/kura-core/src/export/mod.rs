@@ -100,10 +100,161 @@ pub fn preview_names(
     Ok(out)
 }
 
+/// 書き出しの見本（先頭の数件と、書き出す件数）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preview {
+    pub names: Vec<PreviewName>,
+    /// 書き出す件数（ゴミ箱の中・見つからないものを除く。ユニットのメンバーはユニットごとに数える）。
+    pub total: usize,
+}
+
+/// 選んだもの（一覧の ID。ユニットは `LIST_FLAG | unit_id`。選んだ順）の書き出す名前と形式の見本。書き出しのジョブと同じ
+/// 並び（ばらのアイテムを先、続いてユニット）・番号（ゴミ箱の中も数える）・ユニットのフォルダ（名前は `フォルダ/名前`）で、
+/// 先頭の `limit` 件を返す（同じ名前の番号は見ない。M15 段 6 の検証の直し）。
+pub fn preview_entries(
+    conn: &Connection,
+    entries: &[i64],
+    options: &ExportOptions,
+    writable: Option<formats::Writable<'_>>,
+    limit: usize,
+) -> crate::Result<Preview> {
+    options.check()?;
+    let groups = job::resolve(conn, entries)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT ext, kind, original_name, title, width, height, json_extract(codec_info, '$.codec'),
+                trashed_at IS NOT NULL
+           FROM items WHERE id = ?1",
+    )?;
+    let mut out = Preview {
+        names: Vec::new(),
+        total: 0,
+    };
+    let mut index = 0usize;
+    for group in &groups {
+        let folder = match (&group.unit, group.unit_id) {
+            (Some(unit), Some(uid)) => {
+                let fallback = format!("unit-{uid}");
+                Some(names::safe_name(
+                    &names::rule_folder(&options.name, unit, &fallback),
+                    &fallback,
+                ))
+            }
+            _ => None,
+        };
+        for &id in &group.items {
+            index += 1;
+            type Row = (
+                String,
+                String,
+                String,
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                bool,
+            );
+            let row: Option<Row> = stmt
+                .query_row([id], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                })
+                .optional()?;
+            let Some((ext, kind, original_name, title, width, height, codec, trashed)) = row else {
+                continue;
+            };
+            let Some(kind) = crate::import::MediaKind::parse(&kind) else {
+                continue;
+            };
+            if trashed {
+                continue;
+            }
+            out.total += 1;
+            if out.names.len() >= limit {
+                continue;
+            }
+            let parts = names::NameParts {
+                item_id: id,
+                title: &title,
+                original_name: &original_name,
+                index,
+                unit: group.unit.as_deref(),
+                width,
+                height,
+            };
+            let (out_ext, convert) =
+                match formats::plan(kind, &ext, codec.as_deref(), options.target(kind), writable) {
+                    Plan::Copy => (ext.clone(), None),
+                    Plan::Convert { format } => {
+                        let e = crate::edit::save::output_ext(&format, &ext, None)
+                            .unwrap_or_else(|| format.clone());
+                        (e, Some(format))
+                    }
+                };
+            let name = names::rule_name(&options.name, &parts, &out_ext);
+            out.names.push(PreviewName {
+                item_id: id,
+                name: match &folder {
+                    Some(f) => format!("{f}/{name}"),
+                    None => name,
+                },
+                convert,
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod preview_tests {
     use super::*;
     use crate::db::test_conn;
+
+    /// 書き出しのジョブと同じ並び・番号・ユニットのフォルダ（ゴミ箱の中・見つからないものは番号だけ進めて飛ばし、件数に
+    /// 数えない。ジョブも見つからない 1 件を失敗にして番号を進める）。
+    #[test]
+    fn preview_entries_follow_the_export_job() {
+        let conn = test_conn();
+        conn.execute_batch(
+            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at, trashed_at)
+               VALUES (1, x'01', 'png', 'image', 1, 'A', 'a.png', 0, 0, NULL),
+                      (2, x'02', 'png', 'image', 1, 'B', 'b.png', 0, 0, 5),
+                      (3, x'03', 'png', 'image', 1, 'C', 'c.png', 0, 0, NULL),
+                      (4, x'04', 'png', 'image', 1, 'D', 'd.png', 0, 0, NULL);",
+        )
+        .unwrap();
+        let unit = crate::unit::create_set(&conn, "Enemy Set", &[4, 3], 1).unwrap();
+        let entry = i64::from(crate::unit::LIST_FLAG | u32::try_from(unit).unwrap());
+        let options = ExportOptions {
+            name: names::NameRule {
+                template: Some("{番号}-{ユニット}{名前}".into()),
+                style: names::NameStyle::Snake,
+                ascii: false,
+            },
+            ..ExportOptions::default()
+        };
+        let got = preview_entries(&conn, &[entry, 1, 2, 99], &options, None, 50).unwrap();
+        let names: Vec<&str> = got.names.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "001_a.png",
+                "enemy_set/004_enemy_set_d.png",
+                "enemy_set/005_enemy_set_c.png"
+            ]
+        );
+        assert_eq!(got.total, 3);
+        // 先頭の数件だけ返しても、件数はすべて
+        let head = preview_entries(&conn, &[entry, 1], &options, None, 1).unwrap();
+        assert_eq!((head.names.len(), head.total), (1, 3));
+    }
 
     #[test]
     fn preview_shows_names_and_conversions() {

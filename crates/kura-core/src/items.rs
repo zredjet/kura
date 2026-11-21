@@ -243,7 +243,14 @@ fn scope(conn: &Connection, view: ItemView, ctx: &QueryContext) -> Result<Scope>
             }
         }
         ItemView::Project { id } => {
-            crate::project::get(conn, id)?;
+            // あるかだけを主キーで確かめる（project::get は件数も数える）
+            let found: Option<i64> = conn
+                .prepare_cached("SELECT id FROM projects WHERE id = ?1")?
+                .query_row([id], |r| r.get(0))
+                .optional()?;
+            if found.is_none() {
+                return Err(CoreError::NotFound(format!("プロジェクト {id}")));
+            }
             Scope {
                 sql: format!(
                     "{alive} AND i.id IN (SELECT f.item_id FROM project_files f WHERE f.project_id = ? AND f.item_id IS NOT NULL)"
@@ -1608,11 +1615,14 @@ mod tests {
         assert_eq!(ids(&conn, ItemView::Project { id: 1 }, false), vec![5, 2]);
         trash(&conn, &[2], 10 * DAY_MS).unwrap();
         assert_eq!(ids(&conn, ItemView::Project { id: 1 }, false), vec![5]);
-        // 使っているファイルは主キー（project_id, path）の前の方で引く（project_files を走査しない）
+        // 使っているファイルは主キー（project_id, path）の前の方で引く（project_files を走査しない）。scope が組む文そのものを見る
+        let sc = scope(&conn, ItemView::Project { id: 1 }, &ctx(0)).unwrap();
         let plan = query_plan(
             &conn,
-            "SELECT i.id FROM items i WHERE i.trashed_at IS NULL AND i.id IN
-               (SELECT f.item_id FROM project_files f WHERE f.project_id = 1 AND f.item_id IS NOT NULL)",
+            &format!(
+                "SELECT i.id FROM items i WHERE {}",
+                sc.sql.replace('?', "1")
+            ),
         );
         assert!(!plan.contains("SCAN f"), "{plan}");
         assert!(

@@ -4,6 +4,7 @@ import {
   type CreditFlagDto,
   type CreditLineDto,
   type CreditPatchDto,
+  type CreditPreviewDto,
   type CreditsRenderDto,
   type CreditsScopeDto,
   type CreditsTextDto,
@@ -26,6 +27,7 @@ export type {
   CreditFlagDto,
   CreditLineDto,
   CreditPatchDto,
+  CreditPreviewDto,
   CreditsRenderDto,
   CreditsScopeDto,
   CreditsTextDto,
@@ -62,8 +64,11 @@ export function deleteLicense(id: number): Promise<number> {
   return unwrap(commands.licenseDelete(id));
 }
 
-/** 1 件のアイテムの表記の行（来歴の元をたどる。テキスト。未設定なら空。インスペクタの見本。M15 段 6）。 */
-export function previewItemCredit(item: number, lang: CreditsLangDto = 'ja'): Promise<string[]> {
+/** 1 件のアイテムの表記の見本（来歴の元をたどる。行と、未設定・消えた元の数。インスペクタ。M15 段 6）。 */
+export function previewItemCredit(
+  item: number,
+  lang: CreditsLangDto = 'ja',
+): Promise<CreditPreviewDto> {
   return unwrap(commands.itemCreditPreview(item, lang));
 }
 

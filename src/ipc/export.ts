@@ -3,6 +3,7 @@ import {
   type ExportFormatsDto,
   type ExportOptionsDto,
   type ExportPresetDto,
+  type ExportPreviewDto,
   type ExportResultDto,
   type FormatTargetDto,
   type NameRuleDto,
@@ -15,6 +16,7 @@ export type {
   ExportFormatsDto,
   ExportOptionsDto,
   ExportPresetDto,
+  ExportPreviewDto,
   ExportResultDto,
   FormatTargetDto,
   NameRuleDto,
@@ -39,12 +41,15 @@ export function exportFormats(): Promise<ExportFormatsDto> {
   return unwrap(commands.exportFormats());
 }
 
-/** 選んだアイテムの書き出す名前と形式の見本（先頭の 50 件まで）。 */
+/**
+ * 選んだもの（一覧の ID。ユニットは印付き）の書き出す名前と形式の見本（書き出しのジョブと同じ並び・番号・ユニットの
+ * フォルダ。先頭の 50 件と、書き出す件数）。
+ */
 export function previewExportNames(
-  items: number[],
+  entries: number[],
   options: ExportOptionsDto,
-): Promise<PreviewNameDto[]> {
-  return unwrap(commands.exportPreview(items, options));
+): Promise<ExportPreviewDto> {
+  return unwrap(commands.exportPreview(entries, options));
 }
 
 /** 書き出しのジョブの結果（`resultJson`）を読む。 */

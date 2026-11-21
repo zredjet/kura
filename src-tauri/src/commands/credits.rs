@@ -603,21 +603,44 @@ fn render_scope(
     })?)
 }
 
-/// 1 件のアイテムの表記の行（来歴の元をたどる。テキスト。インスペクタの見本。未設定なら空。M15 段 6）。
+/// インスペクタの表記の見本（M15 段 6）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditPreviewDto {
+    /// 組んだ行（テキスト。同じ文は 1 つ）。
+    pub lines: Vec<String>,
+    /// このアイテム自身のライセンスが未設定。
+    pub unset: bool,
+    /// 来歴の元のうち、ライセンスが未設定のものの数。
+    pub unset_sources: u32,
+    /// 来歴の元が消えて、たどれないものの数。
+    pub lost: u32,
+}
+
+/// 1 件のアイテムの表記の見本（来歴の元をたどる。テキスト。未設定・元が消えたものは行に載せず数える。M15 段 6）。
 #[tauri::command]
 #[specta::specta]
 pub async fn item_credit_preview(
     state: State<'_, AppState>,
     item: i64,
     lang: CreditsLangDto,
-) -> Result<Vec<String>, AppError> {
+) -> Result<CreditPreviewDto, AppError> {
     use kura_core::credits::render::{Lang, preview};
     let session = state.session()?;
     let lang = match lang {
         CreditsLangDto::Ja => Lang::Ja,
         CreditsLangDto::En => Lang::En,
     };
-    blocking(move || Ok(session.library().db().read(|c| preview(c, item, lang))?)).await
+    blocking(move || {
+        let p = session.library().db().read(|c| preview(c, item, lang))?;
+        Ok(CreditPreviewDto {
+            lines: p.lines,
+            unset: p.unset,
+            unset_sources: u32::try_from(p.unset_sources).unwrap_or(u32::MAX),
+            lost: u32::try_from(p.lost).unwrap_or(u32::MAX),
+        })
+    })
+    .await
 }
 
 /// クレジットの一覧を作る（見本・クリップボードへのコピー。M15 段 4）。

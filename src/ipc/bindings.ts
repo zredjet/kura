@@ -58,8 +58,11 @@ export const commands = {
 } | null) => typedError<number, AppError>(__TAURI_INVOKE("export_start", { dest, entries, options })),
 	/**  書き出しで選べる形式（画像・音声。形式の表の順）。 */
 	exportFormats: () => typedError<ExportFormatsDto, AppError>(__TAURI_INVOKE("export_formats")),
-	/**  選んだアイテムの書き出す名前と形式の見本（先頭の 50 件まで。ばらとして並べた順）。 */
-	exportPreview: (items: number[], options: ExportOptionsDto) => typedError<PreviewNameDto[], AppError>(__TAURI_INVOKE("export_preview", { items, options })),
+	/**
+	 *  選んだもの（一覧の ID。ユニットは印付き）の書き出す名前と形式の見本。書き出しのジョブと同じ並び・番号・ユニットの
+	 *  フォルダ（名前は `フォルダ/名前`）で、先頭の 50 件と件数（M15 段 6 の検証の直し）。
+	 */
+	exportPreview: (entries: number[], options: ExportOptionsDto) => typedError<ExportPreviewDto, AppError>(__TAURI_INVOKE("export_preview", { entries, options })),
 	/**  取り込み前の確認（種類別件数・合計サイズ・重複の見込み・フォルダの概要）。 */
 	importPreview: (paths: string[]) => typedError<ImportPreviewDto, AppError>(__TAURI_INVOKE("import_preview", { paths })),
 	/**  取り込みジョブを積み、ジョブの ID を返す。進捗は `job://progress` で届く。 */
@@ -468,8 +471,8 @@ export const commands = {
 	createdAt: number,
 	updatedAt: number,
 } | null, AppError>(__TAURI_INVOKE("project_for_dest", { path })),
-	/**  1 件のアイテムの表記の行（来歴の元をたどる。テキスト。インスペクタの見本。未設定なら空。M15 段 6）。 */
-	itemCreditPreview: (item: number, lang: CreditsLangDto) => typedError<string[], AppError>(__TAURI_INVOKE("item_credit_preview", { item, lang })),
+	/**  1 件のアイテムの表記の見本（来歴の元をたどる。テキスト。未設定・元が消えたものは行に載せず数える。M15 段 6）。 */
+	itemCreditPreview: (item: number, lang: CreditsLangDto) => typedError<CreditPreviewDto, AppError>(__TAURI_INVOKE("item_credit_preview", { item, lang })),
 	/**
 	 *  ドラッグアウトを始める：選んだもの（一覧の ID。ユニットは `LIST_FLAG | unit_id`。選んだ順）の名前と形式を持ち出し先の
 	 *  プロジェクトの既定で決め、一時置き場に作り始めて、OS のドラッグに切り替える。マウスのボタンが離れていれば始めない
@@ -1068,6 +1071,18 @@ export type CreditPatchDto = {
 	work?: string | null,
 	url?: string | null,
 	credit?: string | null,
+};
+
+/**  インスペクタの表記の見本（M15 段 6）。 */
+export type CreditPreviewDto = {
+	/**  組んだ行（テキスト。同じ文は 1 つ）。 */
+	lines: string[],
+	/**  このアイテム自身のライセンスが未設定。 */
+	unset: boolean,
+	/**  来歴の元のうち、ライセンスが未設定のものの数。 */
+	unsetSources: number,
+	/**  来歴の元が消えて、たどれないものの数。 */
+	lost: number,
 };
 
 /**  複数選択のクレジットの集計。 */
@@ -2053,6 +2068,13 @@ export type ExportPresetDto = {
 	image: FormatTargetDto,
 	audio: FormatTargetDto,
 	manifest: boolean,
+};
+
+/**  書き出しの見本（先頭の 50 件と、書き出す件数）。 */
+export type ExportPreviewDto = {
+	names: PreviewNameDto[],
+	/**  書き出す件数（ゴミ箱の中・見つからないものを除く。ユニットのメンバーはユニットごとに数える）。 */
+	total: number,
 };
 
 /**  書き出しの結果（`JobProgress.resultJson` を読むときの型。ADR-120）。 */
