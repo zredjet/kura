@@ -4,6 +4,9 @@ import {
   type CreditFlagDto,
   type CreditLineDto,
   type CreditPatchDto,
+  type CreditsRenderDto,
+  type CreditsScopeDto,
+  type CreditsTextDto,
   type CreditsDto,
   type CreditsSetDto,
   type CreditSummaryDto,
@@ -21,6 +24,9 @@ export type {
   CreditFlagDto,
   CreditLineDto,
   CreditPatchDto,
+  CreditsRenderDto,
+  CreditsScopeDto,
+  CreditsTextDto,
   CreditsDto,
   CreditsSetDto,
   CreditSummaryDto,
@@ -74,4 +80,30 @@ export function setCredits(
 /** 使ったアイテムのクレジットを、来歴の元をたどって集める（同じ表記の行は 1 つ）。 */
 export function collectCredits(items: number[]): Promise<CreditsDto> {
   return unwrap(commands.creditsCollect(items));
+}
+
+/** 一覧の作り方の既定（日本語・Markdown・任意は載せる・不要は載せない・素材の名前は添えない。M15 段 4 の決定）。 */
+export const DEFAULT_CREDITS_RENDER: CreditsRenderDto = {
+  lang: 'ja',
+  format: 'markdown',
+  includeOptional: true,
+  includeNone: false,
+  listItems: false,
+};
+
+/** クレジットの一覧を作る（見本・クリップボードへのコピー）。 */
+export function renderCredits(
+  scope: CreditsScopeDto,
+  options: CreditsRenderDto = DEFAULT_CREDITS_RENDER,
+): Promise<CreditsTextDto> {
+  return unwrap(commands.creditsRender(scope, options));
+}
+
+/** クレジットの一覧を `path`（保存のダイアログで選んだ絶対パス）に書く（あれば置き換える）。 */
+export function saveCredits(
+  path: string,
+  scope: CreditsScopeDto,
+  options: CreditsRenderDto = DEFAULT_CREDITS_RENDER,
+): Promise<CreditsTextDto> {
+  return unwrap(commands.creditsSave(path, scope, options));
 }

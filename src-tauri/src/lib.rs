@@ -187,6 +187,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::credits::item_credits_summary,
             commands::credits::item_credits_set,
             commands::credits::credits_collect,
+            commands::credits::credits_render,
+            commands::credits::credits_save,
             commands::projects::projects_list,
             commands::projects::project_add,
             commands::projects::project_rename,

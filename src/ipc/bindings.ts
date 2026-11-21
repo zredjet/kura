@@ -362,6 +362,10 @@ export const commands = {
 	itemCreditsSet: (itemIds: number[], unitIds: number[], patch: CreditPatchDto) => typedError<CreditsSetDto, AppError>(__TAURI_INVOKE("item_credits_set", { itemIds, unitIds, patch })),
 	/**  使ったアイテムのクレジットを、来歴の元をたどって集める（同じ表記の行は 1 つにまとめる）。 */
 	creditsCollect: (items: number[]) => typedError<CreditsDto, AppError>(__TAURI_INVOKE("credits_collect", { items })),
+	/**  クレジットの一覧を作る（見本・クリップボードへのコピー。M15 段 4）。 */
+	creditsRender: (scope: CreditsScopeDto, options: CreditsRenderDto) => typedError<CreditsTextDto, AppError>(__TAURI_INVOKE("credits_render", { scope, options })),
+	/**  クレジットの一覧を作って `path`（保存のダイアログで選んだ絶対パス）に書く（あれば置き換える。ライブラリの中は Invalid）。 */
+	creditsSave: (path: string, scope: CreditsScopeDto, options: CreditsRenderDto) => typedError<CreditsTextDto, AppError>(__TAURI_INVOKE("credits_save", { path, scope, options })),
 	/**  登録したプロジェクトの一覧（並びの順）。 */
 	projectsList: () => typedError<ProjectDto[], AppError>(__TAURI_INVOKE("projects_list")),
 	/**
@@ -1055,12 +1059,46 @@ export type CreditsDto = {
 	lost: CreditFlagDto[],
 };
 
+/**  一覧の書式。 */
+export type CreditsFormatDto = "markdown" | "text";
+
+/**  一覧の言葉。 */
+export type CreditsLangDto = "ja" | "en";
+
+/**  一覧の作り方（省いた項目は既定：日本語・Markdown・任意は載せる・不要は載せない・素材の名前は添えない）。 */
+export type CreditsRenderDto = {
+	lang: CreditsLangDto,
+	format: CreditsFormatDto,
+	includeOptional: boolean,
+	includeNone: boolean,
+	listItems: boolean,
+};
+
+/**  クレジットの一覧の範囲。 */
+export type CreditsScopeDto = 
+/**  登録したプロジェクトで今使っている素材。 */
+{ type: "project"; id: number } | 
+/**  選んだアイテムとユニット（メンバー全員）。 */
+{ type: "items"; itemIds: number[]; unitIds: number[] };
+
 /**  まとめて付けた結果。 */
 export type CreditsSetDto = {
 	/**  対象のアイテムの数（ユニットはメンバーを数える。ない ID は数えない）。 */
 	items: number,
 	/**  変えた件数（中身が同じものは数えない）。 */
 	changed: number,
+};
+
+/**  作った一覧（文と数）。 */
+export type CreditsTextDto = {
+	text: string,
+	/**  載せた行の数。 */
+	lines: number,
+	/**  載せなかった行の数（任意・不要）。 */
+	omittedOptional: number,
+	omittedNone: number,
+	/**  要確認の件数（未設定・元が消えた・記入が足りない）。 */
+	warnings: number,
 };
 
 /**  読み方の設定（出力に効くので文書に入れる）。形式ごとの項目は段 2 以降で足す。 */

@@ -496,6 +496,152 @@ pub async fn credits_collect(
     .await
 }
 
+/// クレジットの一覧の範囲。
+#[derive(Debug, Clone, Deserialize, Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CreditsScopeDto {
+    /// 登録したプロジェクトで今使っている素材。
+    Project { id: i64 },
+    /// 選んだアイテムとユニット（メンバー全員）。
+    #[serde(rename_all = "camelCase")]
+    Items {
+        item_ids: Vec<i64>,
+        unit_ids: Vec<i64>,
+    },
+}
+
+/// 一覧の言葉。
+#[derive(Debug, Clone, Copy, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum CreditsLangDto {
+    Ja,
+    En,
+}
+
+/// 一覧の書式。
+#[derive(Debug, Clone, Copy, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum CreditsFormatDto {
+    Markdown,
+    Text,
+}
+
+/// 一覧の作り方（省いた項目は既定：日本語・Markdown・任意は載せる・不要は載せない・素材の名前は添えない）。
+#[derive(Debug, Clone, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditsRenderDto {
+    pub lang: CreditsLangDto,
+    pub format: CreditsFormatDto,
+    pub include_optional: bool,
+    pub include_none: bool,
+    pub list_items: bool,
+}
+
+impl From<CreditsRenderDto> for kura_core::credits::render::RenderOptions {
+    fn from(o: CreditsRenderDto) -> Self {
+        use kura_core::credits::render::{Lang, TextFormat};
+        Self {
+            lang: match o.lang {
+                CreditsLangDto::Ja => Lang::Ja,
+                CreditsLangDto::En => Lang::En,
+            },
+            format: match o.format {
+                CreditsFormatDto::Markdown => TextFormat::Markdown,
+                CreditsFormatDto::Text => TextFormat::Text,
+            },
+            include_optional: o.include_optional,
+            include_none: o.include_none,
+            list_items: o.list_items,
+            title: None,
+        }
+    }
+}
+
+/// 作った一覧（文と数）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditsTextDto {
+    pub text: String,
+    /// 載せた行の数。
+    pub lines: u32,
+    /// 載せなかった行の数（任意・不要）。
+    pub omitted_optional: u32,
+    pub omitted_none: u32,
+    /// 要確認の件数（未設定・元が消えた・記入が足りない）。
+    pub warnings: u32,
+}
+
+impl From<kura_core::credits::render::Rendered> for CreditsTextDto {
+    fn from(r: kura_core::credits::render::Rendered) -> Self {
+        Self {
+            text: r.text,
+            lines: count(r.lines),
+            omitted_optional: count(r.omitted_optional),
+            omitted_none: count(r.omitted_none),
+            warnings: count(r.warnings),
+        }
+    }
+}
+
+fn render_scope(
+    session: &kura_core::library::LibrarySession,
+    scope: CreditsScopeDto,
+    options: CreditsRenderDto,
+) -> Result<kura_core::credits::render::Rendered, AppError> {
+    use kura_core::credits::render::{self, Scope};
+    let opts: render::RenderOptions = options.into();
+    Ok(session.library().db().read(move |c| {
+        let scope = match scope {
+            CreditsScopeDto::Project { id } => Scope::Project(id),
+            CreditsScopeDto::Items { item_ids, unit_ids } => {
+                Scope::Items(item::expand(c, &item_ids, &unit_ids)?)
+            }
+        };
+        render::list(c, &scope, &opts)
+    })?)
+}
+
+/// クレジットの一覧を作る（見本・クリップボードへのコピー。M15 段 4）。
+#[tauri::command]
+#[specta::specta]
+pub async fn credits_render(
+    state: State<'_, AppState>,
+    scope: CreditsScopeDto,
+    options: CreditsRenderDto,
+) -> Result<CreditsTextDto, AppError> {
+    let session = state.session()?;
+    blocking(move || Ok(render_scope(&session, scope, options)?.into())).await
+}
+
+/// クレジットの一覧を作って `path`（保存のダイアログで選んだ絶対パス）に書く（あれば置き換える。ライブラリの中は Invalid）。
+#[tauri::command]
+#[specta::specta]
+pub async fn credits_save(
+    state: State<'_, AppState>,
+    path: String,
+    scope: CreditsScopeDto,
+    options: CreditsRenderDto,
+) -> Result<CreditsTextDto, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(AppError::new(
+                crate::error::AppErrorCode::Invalid,
+                "書き出し先を選んでください",
+            ));
+        }
+        let rendered = render_scope(&session, scope, options)?;
+        kura_core::credits::render::write(
+            &path,
+            &rendered.text,
+            session.library().layout().root(),
+        )?;
+        Ok(rendered.into())
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
