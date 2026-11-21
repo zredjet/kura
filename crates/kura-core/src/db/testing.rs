@@ -141,7 +141,7 @@ pub(crate) fn fill_v14(conn: &Connection) {
     .unwrap();
 }
 
-/// 最新の版で足した表（[`fill_v14`] の表と、0015 のプロジェクト・見たファイル・持ち出した出力）にも行を入れる。`fill_v6` の
+/// 最新の版で足した表（[`fill_v14`] の表と、0015 のプロジェクト・見たファイル・持ち出した出力、0016 の書き出したファイル）にも行を入れる。`fill_v6` の
 /// あとに使う（表を足したらここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
 pub(crate) fn fill_latest(conn: &Connection) {
     fill_v14(conn);
@@ -152,7 +152,9 @@ pub(crate) fn fill_latest(conn: &Connection) {
            VALUES (1, 'art/a.png', 10, 5, x'01', 1, 'current', 97), (1, 'sfx/b.ogg', 20, 6, x'0b', NULL, NULL, 97);
          INSERT INTO item_outputs (hash, item_id, source_hash, ext, size_bytes, created_at)
            VALUES (x'0c', 1, x'01', 'png', 30, 97);
-         INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('project', 'done', '{}', 97);",
+         INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('project', 'done', '{}', 97);
+         INSERT INTO export_files (path, item_id, hash, size_bytes, mtime_ns, job_id, written_at)
+           VALUES ('/Users/x/game/art/a.png', 1, x'01', 10, 5, 97, 98);",
     )
     .unwrap();
 }

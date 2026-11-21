@@ -1969,6 +1969,73 @@ fn projects_0015_adds_tables_and_keeps_everything_else() {
     assert!(violations(&conn).unwrap().is_empty());
 }
 
+const V16: usize = 16;
+
+/// 0016：書き出したファイルの記録の表を足す。既存の表の行・索引・トリガ・FTS は同じ。アイテムを消すと記録も消える。
+#[test]
+fn export_files_0016_adds_a_table_and_keeps_everything_else() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, V16 - 1).unwrap();
+    crate::db::testing::fill_v14(&conn);
+    assert_eq!(MIGRATIONS[V16 - 1].name, "0016_export_files");
+    assert_eq!(MIGRATIONS[V16 - 1].kind, Kind::Plain);
+    let before = snapshot(&conn);
+    migrate_until(&mut conn, V16).unwrap();
+    let after = snapshot(&conn);
+    for (key, value) in &before {
+        assert_eq!(after.get(key), Some(value), "{key} が変わった");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(
+        added,
+        vec!["index idx_export_files_item", "table export_files"]
+    );
+    assert!(violations(&conn).unwrap().is_empty());
+    let fk: String = one(
+        &conn,
+        "SELECT f.\"from\" || ' → ' || f.\"table\" || '.' || f.\"to\" || ' ' || f.on_delete
+           FROM pragma_foreign_key_list('export_files') f",
+    );
+    assert_eq!(fk, "item_id → items.id CASCADE");
+    for (sql, index) in [
+        (
+            "SELECT item_id FROM export_files WHERE path = '/a'",
+            "PRIMARY KEY",
+        ),
+        (
+            "SELECT path FROM export_files WHERE path > '/a/' AND path < '/a0'",
+            "PRIMARY KEY",
+        ),
+        (
+            "SELECT path FROM export_files WHERE item_id = 1",
+            "idx_export_files_item",
+        ),
+    ] {
+        let plan = crate::db::query_plan(&conn, sql);
+        assert!(plan.contains(index), "{sql}\n{plan}");
+    }
+    let item: i64 = one(&conn, "SELECT min(id) FROM items");
+    let e = conn
+        .execute(
+            "INSERT INTO export_files (path, item_id, hash, size_bytes, mtime_ns, job_id, written_at)
+             VALUES ('/a', ?1, x'01', -1, 0, 1, 1)",
+            [item],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("export_files_size"), "{e}");
+    conn.execute(
+        "INSERT INTO export_files (path, item_id, hash, size_bytes, mtime_ns, job_id, written_at)
+         VALUES ('/a', ?1, x'01', 1, 0, 1, 1)",
+        [item],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM items WHERE id = ?1", [item])
+        .unwrap();
+    assert_eq!(one::<i64>(&conn, "SELECT count(*) FROM export_files"), 0);
+    assert!(violations(&conn).unwrap().is_empty());
+}
+
 /// 0012 の外部キーの向き：対象のアイテムを消すと行も消え（ADR-192 (4)）、別名で作ったアイテム・版を消すと NULL になる。
 #[test]
 fn batch_items_follow_the_items_and_versions() {

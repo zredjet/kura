@@ -481,7 +481,8 @@ mod tests {
                 "0012_batch",
                 "0013_item_sources",
                 "0014_credits",
-                "0015_projects"
+                "0015_projects",
+                "0016_export_files"
             ]
         );
         // 当てたあとの WAL は空
