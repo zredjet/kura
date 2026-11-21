@@ -407,7 +407,7 @@ register_ops! {
 |---|---|---|
 | R1（値） | 同じ文書・同じ元なら、エンコード前の値のダイジェストが永久に一致する | aarch64-apple-darwin で、固定のコーデックだけを通る |
 | R2（ファイル） | 出力ファイルのバイト列も一致する | R1 に加えて固定のエンコーダ |
-| 整数だけの操作 | すべてのターゲット（Linux を含む）で一致する | CI の ubuntu で確かめる（ADR-142） |
+| 整数だけの操作 | すべてのターゲット（Linux を含む）で一致する | CI の ubuntu で確かめる（ADR-142・ADR-209） |
 | 浮動小数の操作 | ゴールデンをターゲットごとに持つ | — |
 | 環境依存 | 一致を約束しない（同じ macOS でも HE-AAC は実行ごとに値が揺れた）。コーデックの識別子と環境の版（`DecodeStamp.env`・`EncodedStamp.env`）を記録し、読んだ元にアンカーを作り（§9.4）、画面に「環境に依存」と出す | ImageIO・AudioToolbox・ffmpeg を通るとき |
 
@@ -497,7 +497,7 @@ register_ops! {
   - プレビューの道では取らない：`render_cached` は `RenderOptions.digests` が真のとき（保存・一括・照合）だけ取り、取ったものは出力の指紋ごとに覚えて取り直さない（§12.3）。縮小の段の計画でダイジェストを頼むと `Unsupported`、範囲の描画の値（無効なタイルのある値）は `Value::digest` が `Internal` で断る（§12.5・§12.7）。
 - 版ごとに、値のダイジェスト・元のデコードのダイジェスト・使ったコーデックの識別子を記録する。
 - 作り直しは 3 重に確かめる。
-  1. CI：操作ごとのゴールデン（`goldens/`）、作り直しの見本集（`goldens-replay/`）、コーデックのゴールデン（`goldens-codecs/`）を、macOS と ubuntu で流す。
+  1. テスト：操作ごとのゴールデン（`goldens/`）、作り直しの見本集（`goldens-replay/`）、コーデックのゴールデン（`goldens-codecs/`）を、手元の /verify（macOS）と CI の ubuntu で流す（ADR-209。CI は push ごとにこの 3 つと解析・3D のゴールデンだけを回す）。
   2. 保存のあと：置き換えたファイルを消す直前に、その版を文書から作り直して照合する。一致しなければ、その版のファイルを残す（ADR-135）。
   3. `kura-devtools edit audit --library <path>`：実際のライブラリのすべての版を作り直して照合する。
 
@@ -649,7 +649,7 @@ pub trait Encoder: Send + Sync {
 - **流して書く**（M13 段 3）：AAC は窓を 4,096 フレームずつ（値を書くときと同じ区切り。窓の切り方によらない）直して backend に渡し、出力は今どおり backend のメモリ（`aac_max_output` まで。Swift は open で上限まで確保する。kura-mac の口は変えない）。AudioToolbox は呼び出しの道によって最後のパケットのバイト列が変わることがある（同じ道なら同じ。R2 は約束しない）。MP3（ffmpeg）は `run_binary` の `feed`（呼び手のスレッド）の中で生産者を流し、直してインターリーブした f32 を標準入力へ書く。出力は今どおり一時ファイルから写す。生産者の誤りは ffmpeg の失敗に見せずに返す。
 - **ffmpeg の段**（kura-core。External。アンカー）：読み取りは前の段が断った音声だけ（`opus-ffmpeg-dec/1`・`ogg-ffmpeg-dec/1`（Opus・FLAC・Speex）・`wav-ffmpeg-dec/1`・`aiff-ffmpeg-dec/1`（圧縮の WAV・AIFF）・`m4a-ffmpeg-dec/1`・`aac-ffmpeg-dec/1`・`mp3-ffmpeg-dec/1`（layer 1・2））。入力は `file:<絶対パス>` で渡し（mp4 の moov が後ろにあるものを読むため）、分離器とデコーダを強制して `-format_whitelist`・`-codec_whitelist` で同じ名前だけを許し、`-protocol_whitelist` は、読み取りは入力 `file`・出力 `pipe`、MP3 の書き出しは入力 `pipe`（標準入力の f32le）・出力 `file`（一時ファイル）。読み取りの出力は `pcm_f32le` の WAV を標準出力へ。標準エラーの `[error]` 以上の行は失敗にする（ffmpeg は壊れた Ogg でも終了コード 0 で短く出す）。ffprobe で形を確かめてから 1 回デコードして数え、形は `Exact`。Opus は libopus を優先する。MP3 の書き出し（`mp3-ffmpeg-enc/1`）は一時ファイルに書く（パイプでは Xing・LAME のフレームが書かれず gapless の長さが失われる）。既定は CBR 192 kbps（その版で選べなければ 192 以下の最大：MPEG-2 は 160、MPEG-2.5 は 64）、VBR は品質 0〜9（既定 2）、ID3 は書かない（ユーザーの決定）、1・2 チャンネル。`-ar`・`-ch_layout` を明示し（ないと黙って変換される）、標本は NaN → 0・±∞ → ±1・±1 に切り詰めてから渡す（LAME は NaN で abort する）。起動は環境変数を消し（`PATH=/usr/bin:/bin`・`LC_ALL=C` だけ）、新しいプロセスグループで（`tools::run_binary`）、見張りが中止・無出力・時間切れ・出力の上限でグループに TERM、2 秒後に KILL（1 回だけ。回収したあとに pgid が使い回されても、ほかのプロセスに送らないように。`kill` を起動できなかったときだけ、次の刻みで送り直す）する。標準出力の読み手が受け手に渡すのを待っている間と受け手が区切りを処理している間は無出力に数えない（受け手の遅さは道具の無出力ではない）。子が終わったあとも中止・時間切れを見続け、グループの外に出た子孫がパイプを持って残るときは、止めたあとならすぐ（その理由のエラー）、止めていなければ子が終わってから 2 秒で KILL、さらに 2 秒で（`Stopped::Lingering`）、パイプを読むスレッドを見捨てて戻る。パイプに触るのは見捨てられるスレッドだけ。一時ファイル（入力の写し・MP3 の出力）は作業フォルダに、プロセスで 1 つの通し番号の名前で、ないことを確かめて作る（`create_new`。同じ作業フォルダの組が 2 つあっても、ほかのプロセスの残りがあっても、切り詰めたり消したりしない）。引数は `crates/kura-core/goldens-ffmpeg-args/`（追記だけ）に凍結し、引数を変えたら版を上げる（External のバイト列と値は凍結しない）。実物のテストは ffmpeg があるときだけ回る（`KURA_FFMPEG_DIR`・`KURA_FFMPEG_REQUIRED=1`。CI の macOS の job は Homebrew の ffmpeg を入れて必ず回し、Linux の job は回さない）。ffmpeg は同じ名前のコメントを `;` でつなぎ、MP2・ADPCM の長さは ffmpeg が出したままになる（固定の段と扱いが違う）。
 - **symphonia の Vorbis・AAC を再現できるように**（ユーザーの決定。ADR-153）：symphonia-core（IMDCT・FFT の表）・symphonia-codec-aac（窓・TNS・逆量子化とスケールファクターの表・pulse）・symphonia-codec-vorbis（窓・floor 0・`float32_unpack`）の写しを `third_party/` に置いて std の超越関数を `libm =0.2.16` に差し替え（f32 の関数は f64 にして libm の f64 の関数で求めて f32 に丸める）、symphonia-codec-vorbis と symphonia-format-ogg の `lookup1_values` を libvorbis と同じく整数で求めるようにした。識別子は `ogg-vorbis-symphonia-dec/3`・`m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`（公開前なので旧版は残さない）、`reproducible()` は真、デコーダのゴールデンに値を凍結した。aarch64 と x86_64 でビット単位で同じ値（壊れた入力で NaN が出るときも、NaN を 1 つのビット列にそろえる）。AAC の pulse と Vorbis の floor 0 の差し替えは、値のゴールデンで照らしていない（そのフィクスチャがない。ソースの走査だけが守る）。自作の Ogg Vorbis のコーデックのゴールデンの読み直しの行（`/2` で値を持たない 35 行）は書き換えず、`/3` で形だけを照らし、`/3` で読み直した値は新しい名前の行（`<名前>-dec3`）で凍結した。floor 0 の Vorbis は実ファイルで照らしていない。
-- **テスト**：kura-mac（macOS の CI）で ImageIO と png のビット一致、AAC を段 6 の読み取りで読み直してちょうどの長さ・ずれ 0、3〜6 チャンネルの並び（段の順に任せても、形も読みも AudioToolbox が答える）、壊れた入力・上限が展開の前に効く・中止・8 スレッドの同時の呼び出し・ABI の照合。kura-engine で偽の backend の adapter、能力の表、E29（`tests/e29.rs`）とアンカー（`tests/anchor.rs`。実際の SVG・Vorbis・AAC の値とランダムな 200 値の往復、凍結した版 1 のアンカー、崩したアンカー、上限）、アンカーのコーデックのゴールデン（`anchor-kura-dec@1.jsonl`）。kura-core で ffmpeg の引数のゴールデンと、ffmpeg があるときの実物のテスト。ファズの対象 `decode_anchor`。
+- **テスト**：kura-mac（手元の /verify と、手で起こす全部の CI の macOS）で ImageIO と png のビット一致、AAC を段 6 の読み取りで読み直してちょうどの長さ・ずれ 0、3〜6 チャンネルの並び（段の順に任せても、形も読みも AudioToolbox が答える）、壊れた入力・上限が展開の前に効く・中止・8 スレッドの同時の呼び出し・ABI の照合。kura-engine で偽の backend の adapter、能力の表、E29（`tests/e29.rs`）とアンカー（`tests/anchor.rs`。実際の SVG・Vorbis・AAC の値とランダムな 200 値の往復、凍結した版 1 のアンカー、崩したアンカー、上限）、アンカーのコーデックのゴールデン（`anchor-kura-dec@1.jsonl`）。kura-core で ffmpeg の引数のゴールデンと、ffmpeg があるときの実物のテスト。ファズの対象 `decode_anchor`。
 - **アンカーのゴールデン**：`anchor-kura-dec@1.jsonl` はその場の書き手で書いて読むので、値の作り方を守るだけ。決まったバイト列から読めることは、凍結したアンカー `fixtures/anchor-v1-*`（17 本：9 つの画素の形式・パレット・ICC と EXIF のある・ない・シート・16 ビットと 8 ビットのフレームの列・ステレオとモノラルと 6 チャンネルの WAV）が守る。kura-mac のフィクスチャ（`crates/kura-mac/fixtures/`）も追記だけの検査の対象。
 - **後の段に回したもの**：HEIF の EXIF、RAW、HDR、ゲインマップ・プレマルチプライドの HEIF のアルファ（ImageIO が黙って捨てる）、アンカーの保存への結線（M12）、RF64（4 GiB を超える WAV）、ffmpeg のタグの表をエンジンの表と共有すること、Opus の書き出し。
 
@@ -1240,7 +1240,7 @@ impl Plan {     // M13 段 4 で足したもの（音声のエディタ。§12.8
 32  count × C × [min i16, max i16]   ビンの順 → チャンネルの順（kura-peaks の段のデータと同じ並び）
 ```
 
-- CORS はアプリの origin だけ、受け付けるのは main の WebView だけにする。この受け口（ラベル・Origin・メソッドの判定と、ACAO・`CSP: sandbox`・`nosniff`）と CSP の `connect-src`・`font-src` は M11 で入れた（判定は CI が回す kura-core の純粋な関数 `serve::access`。architecture.md §4.1・ADR-155）。`/edit/…` も同じ受け口を通る。
+- CORS はアプリの origin だけ、受け付けるのは main の WebView だけにする。この受け口（ラベル・Origin・メソッドの判定と、ACAO・`CSP: sandbox`・`nosniff`）と CSP の `connect-src`・`font-src` は M11 で入れた（判定は kura-core の純粋な関数 `serve::access`。architecture.md §4.1・ADR-155）。`/edit/…` も同じ受け口を通る。
 - ライブラリのファイル（元の中身）の試聴の PCM は M11 の `/pcm/{hash}/{start}-{end}`、編集中のもの（文書を当てた値）は `/edit/{session}/{rev}/…` で配る（architecture.md §4）。
 
 ## 13. エラー・中止・上限・安全
@@ -1283,7 +1283,7 @@ pub struct Limits { max_dim, max_pixels, max_frames, max_value_bytes, max_audio_
   - 段 9 の外部のツールと OS の機能（詳しくは §9.8）：ffmpeg は入力をファイルのパスで渡し、分離器・デコーダ・プロトコルをホワイトリストで固定し、環境変数を消して新しいプロセスグループで動かし、見張りが中止・無出力・時間切れ・出力の上限でグループごと止める。出力（WAV）は上限で確かめてから確保する。ImageIO の展開は専用のスレッドで行い、時間切れで見捨てる（壊れた HEIC で戻らないことがある）。Swift の側は大きさをすべて確かめ、Rust が確保した領域にだけ書く。
   - パーサー（PNG・JPEG・GIF・WebP・aseprite・PSD・SVG・WAV・AIFF・FLAC・MP3・Ogg・m4a・AAC・アンカー・文書の読み込み・文書の部品）はファズにかける。
     - `fuzz/`（workspace の外。`cargo +nightly fuzz run <対象>`。対象は `kura_engine::testing::fuzz_decode`・`fuzz_encode`・`fuzz_peaks`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_model`・`fuzz_svg_text` を呼ぶだけ）は、カバレッジを見ながら長く回す。nightly と cargo-fuzz が要る。
-    - `tests/fuzz_smoke.rs` は同じ口を stable で回す変異のファズ。種（各形式の小さなファイル・フィクスチャ・文書）をバイトの書き換え・挿入・削除・つなぎ合わせで崩す。ふだんの `cargo test` で対象ごとに 150 回（`quick`）、`KURA_FUZZ_SECS=<秒> cargo test --release -p kura-engine --test fuzz_smoke long -- --ignored` で長く回す（`KURA_FUZZ_ONLY=svg,wav` で対象を選べる）。見つけた入力は `target/fuzz-smoke/` に残し、`replay` で流し直す。
+    - `tests/fuzz_smoke.rs` は同じ口を stable で回す変異のファズ。種（各形式の小さなファイル・フィクスチャ・文書）をバイトの書き換え・挿入・削除・つなぎ合わせで崩す。ふだんの `cargo test` で対象ごとに 150 回（`quick`）、`KURA_FUZZ_SECS=<秒> cargo test --release -p kura-engine --test suite fuzz_smoke::long -- --ignored` で長く回す（`KURA_FUZZ_ONLY=svg,wav` で対象を選べる）。見つけた入力は `target/fuzz-smoke/` に残し、`replay` で流し直す。
     - 文書のファズは、上限を絞ったエンジンで読み込み、小さな入力（画像・パレットの画像・フレームの列・音声、格子・ピボット・スライス付きのシート、ループ点・マーカー付きの音声）で計画を作って描くところまで流す（段 5 から。新しい操作の実行の経路とメタデータの写し方にも届く）。追記だけの引数（`actions` の列）を持つノードは、途中で切って差分の適用（`Op::apply_appended`）が全体を当て直したものと同じかも照らす（E21）。段 10 から実行器も差分を使うので、実行器の経路（セッションで追記して `compile_snapshot` と `render_cached` の差分の適用で描く）も、文書のファズのセッションの道の照合（`testing::snapshot`）と `tests/e4.rs` の `appended_in_executor_equals_full` で照らす。
     - デコーダのファズは、上限を絞って（`testing::fuzz_limits`）その形式のすべてのデコーダ（旧版を含む）で形と中身を読み、自分のコードの panic（panic の場所が `crates/kura-engine/src/` のもの。`testing::catch_own_panic` が panic のフックで見分ける）・形と中身の食い違い・`Internal` を見つけたものとして扱う。壊れたファイルとしてのエラーと第三者のクレートの panic（`codec::contain` がエラーに変える）は正しい振る舞い。
     - 段 4 の長い実行（release で対象ごとに 40〜60 秒、合わせて約 2 億回）で、SVG の DTD の走査が多バイト文字の途中で文字列を切る panic を見つけて直した（`multibyte_text_around_the_dtd`）。直したあとの実行では何も見つかっていない。SVG と文書は、変異の多くが最初の検査（UTF-8・JSON）で断られるので回数ほど深くは試せていない。深い所はカバレッジを見る `fuzz/` に任せる。
@@ -1615,7 +1615,7 @@ NotFound）で積まない（写しが古い結び付けと新しい文書の組
 
 判定の条件として、24MP の写真は縮小の段 2（1500×1000）で判定する（段 1 は記録だけ。3 スレッドで Lanczos3・鎖の p95 64〜72 ms）。
 
-段 5 の実測（`cargo test --release -p kura-engine --test bench_image -- --ignored --nocapture`、Apple M 系の Mac。操作そのもので、文書の計画と出力のダイジェストを含まない）：
+段 5 の実測（`cargo test --release -p kura-engine --test suite bench_image:: -- --ignored --nocapture`、Apple M 系の Mac。操作そのもので、文書の計画と出力のダイジェストを含まない）：
 
 | 項目 | 実測 |
 |---|---|

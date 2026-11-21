@@ -221,7 +221,7 @@ bindings.ts には、コマンドとイベントのほかに Rust の表を定�
 
 ### 4.1 受け付けと応答のヘッダ（M11）
 
-判定と付けるヘッダは `kura-core` の `serve`（`admit`・`response_headers`・`AppOrigin`）に純粋な関数として置き、CI（Linux）で回す。src-tauri はそれを HTTP の型に写すだけ。
+判定と付けるヘッダは `kura-core` の `serve`（`admit`・`response_headers`・`AppOrigin`）に純粋な関数として置き、kura-core の単体テスト（Linux でも通る）で回す。src-tauri はそれを HTTP の型に写すだけ。
 
 | 要求 | 応答 | CORS のヘッダ |
 |---|---|---|
@@ -242,7 +242,7 @@ main への応答には、エラーを含めてすべて次を付ける（エラ
 
 アプリの origin は `url::Url::origin()` に任せない（`tauri:` に対して opaque を返すので、Tauri と同じく手で組む）。
 
-**CSP**（`tauri.conf.json` の `app.security.csp`。`csp_problems` が足りない点を返し、tauri.conf.json を読むテストが CI で見張る）：
+**CSP**（`tauri.conf.json` の `app.security.csp`。`csp_problems` が足りない点を返し、tauri.conf.json を読むテストが見張る）：
 
 ```
 default-src 'self' ipc: http://ipc.localhost; img-src 'self' kura:; media-src 'self' kura:;
@@ -834,6 +834,7 @@ M14 の実測（一括加工。M14 段 8。2026-11-21。Apple M4 Max（高性能
 - **表示の経路**（段 10。docs/editing.md §12.8）：エディタは 1 手ごとに `Engine::render_view` を呼ぶ。前回の表示（`View`）から変わりうる範囲を推論し（`delta`）、表示する範囲（ビューポート）を、前回の表示の値に変わりうるタイルだけを描き直して継ぎはぎし（`render_area`）、変わったタイルの一覧を返す（`refine`）。値は表示する範囲のタイルで `render` とビット単位で同じで、配信にだけ使う（保存・一括・照合は `render`・`render_cached`）。配信に要るもの（形式・パレット・メタデータ・フレームの表示時間と繰り返し）は、表示の値（`PartialValue`）の読むだけの口で取る（音声は `exact()`）。M12 のフロントはビューポートを渡し、変わったタイルだけを kura:// で取り直す。
 - **保存と版**（M12 の段 2。正本は docs/editing.md §12.12・§14、表は docs/data-model.md §4「保存と版（M12）」）：kura-core の `edit::save`（保存のジョブ `EditHandler`・積む口 `start_save`。上書き・別名で保存・版に戻す（`save/revert.rs`）。§5）、`edit::store`（文書を内容アドレスの部品 `edit_objects`・`edit_edges` で置く・読む）、`edit::versions`（版の行・入力・不変条件 `check_invariants`）、`edit::anchors`（アンカーの行）、`edit::drafts`（下書き：頭の文書と土台をアイテムごとに 1 つ）、`edit::gc`（M12 の段 3：GC のジョブ `GcHandler`・時計 `GcClock`・候補 `due`・文書の部品の片付け `sweep_parts`。照合は `save::verify_version`。§5）。台帳の予告と照合は `library::ledger`、重複の判定は `import::store::find_owner`。エディタのセッションは次の項目。
 - **エディタのセッション**（M12 の段 4。正本は docs/editing.md §12.12・§12.13）：kura-core の `edit::editor`（`open`・`step`・`view`・`sample`・`save`・`close`・`cancel_open`・`discard_draft`・`version_list`、配信の `tile::serve`）。開いているライブラリに 1 つで `EngineServices` が持ち（`current_editor`・`editor_for`・`close_editor`）、kura:// の `/edit` もそこから引く。中身は `EditSession`・ノードのキャッシュと確保（`CacheLease`）・入力・版ごとの計画の LRU・前回の表示・表示した今と直前の表示（配信用）・下書きのスレッド（`kura-edit-draft`）。IPC（§3 の `edit_*`）は src-tauri の `commands/edit.rs`（DTO もそこ）で、どれも `spawn_blocking`（ジョブにしない。保存だけが保存のジョブを積む）。閉じるのは `edit_close`・`edit_cancel_open`（開く途中。`editor::cancel_open`）・`LibrarySession::close`（ライブラリを閉じる・切り替える・終了）・`EngineServices` の drop で、どれも同じ（中止 → キャッシュを空に → 確保を落とす → 取り置きを 0）。
-- **ベンチ**：`kura-devtools bench edit`（§13。NFR-11〜17・E30）は同じ `EngineRuntime` で、アプリと同じ順（プレビューのプールでセッションの手を当てて計画（写真は段の計画）を作る → プールの外で `admit_preview` → プレビューのプールで表示の経路（`render_view`）→ `settle`）に回す。NFR-16 の照合は、同じエディタの経路で等倍の全体を描いた（`render_cached`）ダイジェストで行う。見積もりの倍率が実装の変更で足りなくなるのは、`mem_smoke`（§13）が macOS の CI で捕まえる。M12 のアプリの道（`edit::editor` の手と `/edit` のタイル、保存のジョブの全体）は `bench editor`・`bench save`（§13。M12 の段 6）が、アプリと同じ部品（`LibrarySession`・取り込みと保存のジョブ）で測る。音声のエディタの手（M13）は、`bench edit` の NFR-11 の音声のエディタのケース（取り込みのジョブで入れて `editor::step`）と `mem_smoke` の `audio-editor-60min` が測る（`bench editor` は画像だけ）。
-- **CI**：`.github/workflows/ci.yml` で ubuntu と macOS のテストを回す（ADR-142）。
+- **ベンチ**：`kura-devtools bench edit`（§13。NFR-11〜17・E30）は同じ `EngineRuntime` で、アプリと同じ順（プレビューのプールでセッションの手を当てて計画（写真は段の計画）を作る → プールの外で `admit_preview` → プレビューのプールで表示の経路（`render_view`）→ `settle`）に回す。NFR-16 の照合は、同じエディタの経路で等倍の全体を描いた（`render_cached`）ダイジェストで行う。見積もりの倍率が実装の変更で足りなくなるのは、`mem_smoke`（§13）が手元の /verify（と手で起こす全部の CI の macOS）で捕まえる。M12 のアプリの道（`edit::editor` の手と `/edit` のタイル、保存のジョブの全体）は `bench editor`・`bench save`（§13。M12 の段 6）が、アプリと同じ部品（`LibrarySession`・取り込みと保存のジョブ）で測る。音声のエディタの手（M13）は、`bench edit` の NFR-11 の音声のエディタのケース（取り込みのジョブで入れて `editor::step`）と `mem_smoke` の `audio-editor-60min` が測る（`bench editor` は画像だけ）。
+- **CI**（`.github/workflows/ci.yml`。ADR-142・ADR-209）：push・PR では ubuntu の 1 本で最低限だけ回す（整形、ゴールデンの追記だけの検査、エンジンの依存の SIMD の feature の検査、kura-engine・kura-core・vorbis-tables の clippy、ターゲットをまたいで同じ値になるはずのゴールデン `golden`・`codec_golden`・`analysis_golden`・`model_golden`・`replay`）。同じブランチの古い実行は取り消す。全部のテスト（ubuntu の kura-engine・kura-core・vorbis-tables と、macOS の kura-mac・kura-devtools を含む 5 つ。ffmpeg の実物のテストつき）は手で起こすときだけ（`workflow_dispatch`。Actions の「Run workflow」か `gh workflow run ci.yml --ref <ブランチ>`）。ほかのテストは手元の /verify が回す。
+- **テストのバイナリ**（ADR-209）：kura-engine の結合テストは `tests/suite.rs` の 1 つのバイナリにまとめる（ファイルは `tests/` のまま `pub mod` で並べる。`autotests = false`）。別にするのは CI のゴールデン 5 本と、`#[global_allocator]` で確保を数える `model_json_heap`・`stream_held`（`Cargo.toml` の `[[test]]`）。1 つのファイルだけ回すのは `cargo test -p kura-engine --test suite <ファイル名>::`。dev（test）のビルドは `split-debuginfo = "off"`・行番号だけのデバッグ情報（ワークスペースの `Cargo.toml`）。
 - 実装の進み具合は docs/roadmap.md の M10 を見る。実測は §13 に足す。
