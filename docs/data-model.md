@@ -95,6 +95,7 @@ Kura Library.kuralib/
 | `0012_batch` | 一括加工の表と口（M14 段 3。docs/editing.md §4.3、ADR-190・192）：レシピ `edit_recipes`（文書は `edit_objects` の部品、結び付けは `recipe::bindings_json` の正規の JSON、並びは `pos`）と、一括の対象と結果 `batch_items`（1 件ずつのコミットと同じトランザクションで行を書く。一括の版は `item_versions.job_id` を空にしてこの行の `version_id` で引く）を足し、`jobs_kind` に `batch` を足す（名前付きの CHECK の入れ替え）。新しい表だけなので Plain（合成 10 万件 `--history` で 0.67〜0.70 ms。`bench migrate --runs 3`、2026-11-19）。`batch_items.job_id` は外部キーにしない（`jobs` を参照される表にしない）。対象のアイテムを消すと行も消え（CASCADE）、版・別名で作ったアイテムを消すと NULL（SET NULL） |
 | `0013_item_sources` | N → 1 の来歴（M14 段 6。docs/editing.md §4.5・§14.2「N → 1」、ADR-197）：選んだ N 件から作ったスプライトシート（新しいアイテム。元はできたファイル）の元を、選んだ順に元のアイテム・読んだときの頭の版・読んだ中身・並べたフレームの数で持つ `item_sources`（別名で保存の来歴 `item_derivations` は元 1 つなので別の表）。新しい表だけなので Plain（合成 10 万件 `--history` で 0.15〜0.18 ms。`bench migrate --runs 3`、2026-11-20）。作ったアイテムを消すと行も消え（CASCADE）、元のアイテムを消すと NULL（SET NULL） |
 | `0014_credits` | ライセンスとクレジット（M15 段 1。§4「ライセンスとクレジット（M15）」、ADR-202・203）：ライセンスの表 `licenses`（既定の 13 行を入れる。`builtin` に鍵、名前は大文字小文字を問わず一意、表記義務 `attribution`（required・optional・none）・商用・改変・継承の印）と、アイテムごとのクレジット `item_credits`（ライセンス・作者・作品・出典・表記の文。何か入っているアイテムにだけ行がある）を足す。新しい表だけなので Plain（合成 10 万件 `--history` で 0.17〜0.18 ms。照合の差 0。`bench migrate --runs 3`、2026-11-21）。アイテムを消すとクレジットも消え（CASCADE）、自作のライセンスを消すと未設定に戻る（SET NULL） |
+| `0015_projects` | プロジェクトと使った記録（M15 段 2。§4「プロジェクトと使った記録（M15）」、ADR-202・204）：登録したプロジェクト `projects`（名前・正規化した絶対パス（一意）・エンジン（godot・unity・folder）・持ち出しの既定 `settings`（段 3）・並び・見つからない印 `missing`・照らし終えた時刻）、照らし直しが見たファイル `project_files`（相対パス・大きさ・更新時刻・ハッシュ・一致したアイテムと何と一致したか）、持ち出した出力 `item_outputs`（段 3・5 が書く中身とアイテム）を足し、`jobs_kind` に `project`（照らし直し）を足す（名前付きの CHECK の入れ替え）。新しい表と CHECK の入れ替えだけなので Plain（合成 10 万件 `--history` で 0.83〜0.84 ms。jobs の CHECK の入れ替えが全行を確かめる分。照合の差 0。`bench migrate --runs 3`、2026-11-21）。プロジェクトを消すとファイルの行も消え（CASCADE）、アイテムを消すとファイルの行は残って未一致（SET NULL）、持ち出した出力は消える（CASCADE） |
 
 ```sql
 -- ===== 実ファイルの台帳（0007。files/ab/cd/<hash>.<ext> 1 つに 1 行）=====
@@ -364,7 +365,7 @@ CREATE INDEX idx_play_events_item ON play_events(item_id, played_at DESC);
 -- ===== ジョブ =====
 CREATE TABLE jobs (                                -- 0008 で作り直した形
   id            INTEGER PRIMARY KEY,
-  kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）、0011：edit（M12 の保存）・gc（M12 の段 3）、0012：batch（M14 の一括）
+  kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）、0011：edit（M12 の保存）・gc（M12 の段 3）、0012：batch（M14 の一括）、0015：project（M15 のプロジェクトの照らし直し）
                 CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc','batch')),
   state         TEXT    NOT NULL
                 CONSTRAINT jobs_state CHECK (state IN ('queued','running','paused','done','failed','canceled')),
@@ -739,6 +740,47 @@ CREATE TABLE item_credits (
   updated_at  INTEGER NOT NULL
 );
 CREATE INDEX idx_item_credits_license ON item_credits(license_id);
+
+-- ===== プロジェクト（0015。M15 段 2。§4「プロジェクトと使った記録（M15）」）=====
+CREATE TABLE projects (
+  id          INTEGER PRIMARY KEY,
+  name        TEXT    NOT NULL,                        -- 表示名（既定はフォルダの名前。NFC・200 文字まで）
+  root        TEXT    NOT NULL,                        -- 正規化した絶対パス（一意。ほかのプロジェクトと重ならない）
+  engine      TEXT    NOT NULL CONSTRAINT projects_engine CHECK (engine IN ('godot','unity','folder')),
+  settings    TEXT    NOT NULL DEFAULT '{}',           -- 持ち出しの既定（命名・形式。段 3 で形を決める JSON）
+  pos         REAL    NOT NULL,
+  missing     INTEGER NOT NULL DEFAULT 0 CONSTRAINT projects_missing CHECK (missing IN (0, 1)),  -- 最後の照らしでフォルダがなかった
+  scanned_at  INTEGER,                                 -- 最後に照らし終えた時刻（この回の印。前の回より必ず大きい）
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX idx_projects_root ON projects(root);
+
+-- ===== 照らし直しが見たファイル（0015。取り込める形式だけ。使った記録は item_id のある行）=====
+CREATE TABLE project_files (
+  project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  path        TEXT    NOT NULL,                        -- ルートからの相対パス（/ 区切り）
+  size_bytes  INTEGER NOT NULL CONSTRAINT project_files_size CHECK (size_bytes >= 0),
+  mtime_ns    INTEGER NOT NULL,                        -- 更新時刻（Unix ナノ秒。大きさと合わせてハッシュを使い直す）
+  hash        BLOB    NOT NULL,
+  item_id     INTEGER REFERENCES items(id) ON DELETE SET NULL,  -- 一致したアイテム（照らし直しで付け直す）
+  matched     TEXT    CONSTRAINT project_files_matched CHECK (matched IN ('current','original','version','output')),
+  seen_at     INTEGER NOT NULL,                        -- 最後に見た照らしの印（projects.scanned_at と同じ値）
+  PRIMARY KEY (project_id, path)
+) WITHOUT ROWID;
+CREATE INDEX idx_project_files_item ON project_files(item_id);
+
+-- ===== 持ち出した出力（0015。段 3 の書き出し・段 5 のドラッグアウトで形式を変えて作ったファイルの中身）=====
+CREATE TABLE item_outputs (
+  hash         BLOB    NOT NULL,
+  item_id      INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  source_hash  BLOB    NOT NULL,                       -- 描いたときのアイテムの今
+  ext          TEXT    NOT NULL,
+  size_bytes   INTEGER NOT NULL CONSTRAINT item_outputs_size CHECK (size_bytes >= 0),
+  created_at   INTEGER NOT NULL,
+  PRIMARY KEY (hash, item_id)
+) WITHOUT ROWID;
+CREATE INDEX idx_item_outputs_item ON item_outputs(item_id);
 
 -- ===== 全文検索（外部コンテンツ FTS5、trigram）=====
 CREATE VIRTUAL TABLE items_fts USING fts5(
@@ -1212,6 +1254,34 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 - **検索**（docs/search-query.md §3）：`ライセンス`・`表記`・`クレジット` は、アイテム自身の行で
   `i.id IN (SELECT c.item_id FROM item_credits c WHERE …)` の集合の部分問い合わせにする（相関しない。ライセンスと表記は
   `idx_item_credits_license` で引く）。来歴の元は見ない。
+
+### プロジェクトと使った記録（M15。`crates/kura-core/src/project/`。ADR-202・204）
+
+- **登録**（`project::prepare_root`・`add`）：ファイルシステムを見るのは DB の書き手の外。絶対パスを `canonicalize` で正規化し
+  （シンボリックリンク・`..` をたどる）、フォルダで、UTF-8 で、ライブラリの中でもライブラリを含むフォルダでもないことを確かめる
+  （ない・フォルダでないは `NotFound`・`Invalid`）。書き手の中で、ほかのプロジェクトと同じ・中・外側のフォルダなら `Conflict`。エンジンは
+  中身で見分ける（`project.godot` → godot、`ProjectSettings/ProjectVersion.txt` と `Assets/` → unity、ほかは folder。照らすたびに見分け直す）。
+  登録・場所の選び直し（`relocate`。使った記録は残し、`missing` を 0 に）のあとに照らし直しを積む。外す（`remove`）とファイルの行も消える。
+- **照らし直し**（ジョブ `kind = 'project'`。`project::scan`。入力 `{}`。登録したプロジェクト全部を照らす。`ensure_queued` で重ねない）：
+  登録したとき・場所を選び直したとき・ライブラリを開いたとき（登録があれば。起動のスレッドで）・利用者が頼んだときに積む（段 2 の決定 2）。
+  取り込みに譲る。プロジェクトごとに、
+  1. フォルダがなければ（読めなければ）`missing = 1` にして行は残す（段 2 の決定 4）。
+  2. ファイルを集める（`project::walk`）：取り込める形式（`import::classify`）のファイルだけ。`.` で始まる名前と、ルートの直下のエンジンの
+     キャッシュ（unity の `Library`・`Temp`・`Logs`・`obj`・`Build`・`Builds`・`UserSettings`・`MemoryCaptures`。godot の `.godot` は隠し）を
+     見ない。シンボリックリンクはたどらない（段 2 の決定 1）。
+  3. 前の回の行（`SELECT path, size_bytes, mtime_ns, hash FROM project_files WHERE project_id = ?`。主キー）と大きさ・更新時刻が同じならハッシュを
+     使い直し、ほかを 64 件ずつ並べてハッシュする（読めないものは記録しない）。
+  4. すべての行を中身の持ち主と照らし（`project::scan::match_hash`：今 → 元 → 過去の版は取り込みの重複の判定と同じ `find_owner`、なければ
+     `item_outputs` の ID の小さいアイテム。段 2 の決定 3）、500 件ずつ `INSERT … ON CONFLICT(project_id, path) DO UPDATE` で書く（`seen_at` は
+     この回の印 = max(今, 前の `scanned_at` + 1)）。照らしの間に登録を外したら書かない。
+  5. `DELETE FROM project_files WHERE project_id = ? AND seen_at < ?`（見えなくなったファイル。使った記録は今あるもの）と、`missing = 0`・
+     エンジン・`scanned_at` を 1 つのトランザクションで書く。
+  一時停止・中止・譲るは区切りで止め、次は初めから（変わっていないファイルはハッシュし直さない。途中で書いた行は正しい中身で、見えなく
+  なった行は最後まで照らした回だけが消す）。結果は `{ projects, missing, files, hashed, matched, removed, skipped }`。
+- **使った記録**：プロジェクトで使っているアイテムは `SELECT DISTINCT item_id FROM project_files WHERE project_id = ? AND item_id IS NOT NULL`
+  （主キー。クレジットの一覧の対象。段 4）、アイテムを使っているプロジェクトは `idx_project_files_item`。アイテムを消すと行は残って未一致に
+  なり、次の照らしで付け直す（同じ中身のほかのアイテムがあればそれ）。
+- **持ち出した出力** `item_outputs` は段 3・5 が書く（形式を変えて作ったファイルの中身。今と同じ中身なら書かなくても今で一致する）。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
 
