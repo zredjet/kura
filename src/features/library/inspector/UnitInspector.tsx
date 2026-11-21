@@ -32,6 +32,7 @@ import {
 } from '../actions';
 import styles from './Inspector.module.css';
 import { TAG_FOCUS_KEY } from './ItemInspector';
+import { CreditSection } from '../../credits/CreditSection';
 import { NoteField } from './NoteField';
 import { useLoaded } from './useLoaded';
 import { isImeKey } from '../../../lib/ime';
@@ -256,6 +257,8 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
           </button>
         </section>
       )}
+
+      <CreditSection itemIds={[]} unitIds={[unitId]} />
 
       <NoteField
         key={`${unitId}-${detail.note ?? ''}`}

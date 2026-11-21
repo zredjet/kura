@@ -31,6 +31,7 @@ import { useLibraryStore } from '../../stores/libraryStore';
 import { notify } from '../../stores/noticeStore';
 import { type SettingsTab, useSettingsStore } from '../../stores/settingsStore';
 import { useViewStore } from '../../stores/viewStore';
+import { LicensesTab } from '../credits/LicensesTab';
 import { ToolsPanel } from '../downloads/ToolsPanel';
 import { updatePlayerPrefs } from '../player/playerActions';
 import { usePlayerStore } from '../player/playerStore';
@@ -48,7 +49,7 @@ function fail(error: unknown): void {
   notify(error instanceof Error ? error.message : String(error));
 }
 
-/** 設定画面（design.md §3.1。⌘,・サイドバーの歯車）。一般・ライブラリ・ダウンロードのタブ。 */
+/** 設定画面（design.md §3.1。⌘,・サイドバーの歯車）。一般・ライブラリ・ダウンロード・ライセンス（M15 段 6）のタブ。 */
 export function SettingsSheet() {
   const open = useSettingsStore((s) => s.open);
   const tab = useSettingsStore((s) => s.tab);
@@ -62,6 +63,7 @@ export function SettingsSheet() {
     { value: 'general', label: t.tabs.general },
     { value: 'library', label: t.tabs.library },
     { value: 'downloads', label: t.tabs.downloads },
+    { value: 'licenses', label: t.tabs.licenses },
   ];
   return (
     <Dialog labelledBy={id} onClose={close} size="lg">
@@ -75,6 +77,7 @@ export function SettingsSheet() {
         {tab === 'general' && <GeneralTab />}
         {tab === 'library' && <LibraryTab />}
         {tab === 'downloads' && <DownloadsTab />}
+        {tab === 'licenses' && <LicensesTab />}
       </div>
       <div className={styles.actions}>
         <Button variant="primary" onClick={close}>

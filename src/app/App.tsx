@@ -28,6 +28,13 @@ import { closeApply } from '../features/recipes/applyStore';
 import { useBatchJobsStore } from '../features/recipes/batchJobsStore';
 import { closeMerge } from '../features/recipes/mergeStore';
 import { useRecipeStore } from '../features/recipes/recipeStore';
+import { CreditsSheet } from '../features/credits/CreditsSheet';
+import { closeCreditsSheet } from '../features/credits/creditsSheetStore';
+import { ExportSheet } from '../features/export/ExportSheet';
+import { closeExportSheet } from '../features/export/exportSheetStore';
+import { PresetSheet } from '../features/projects/PresetSheet';
+import { closePresetSheet } from '../features/projects/presetSheetStore';
+import { useProjectStore } from '../features/projects/projectStore';
 import { closeResult } from '../features/recipes/resultStore';
 import { MergeSheet } from '../features/recipes/MergeSheet';
 import { RecipeView } from '../features/recipes/RecipeView';
@@ -116,7 +123,27 @@ function LibraryScreen() {
     // レシピの一覧はライブラリごとに読む（サイドバーを隠していても、項目のメニューの「レシピを当てる ▸」に出す）
     useRecipeStore.getState().clear();
     if (libraryPath) void useRecipeStore.getState().load();
+    // プロジェクトと持ち出し先もライブラリごと（M15 段 6）。前のライブラリのシートは閉じる
+    useProjectStore.getState().clear();
+    closePresetSheet();
+    closeCreditsSheet();
+    closeExportSheet();
+    if (libraryPath) void useProjectStore.getState().load();
   }, [libraryPath]);
+  // 照らし直しが終わったら、プロジェクトの件数・見つからない印・照らした時刻を読み直す（使っている素材の一覧も）
+  useEffect(
+    () =>
+      onAnyJob((event) => {
+        if (event.kind !== 'project' || (event.state !== 'done' && event.state !== 'failed')) {
+          return;
+        }
+        void useProjectStore.getState().load();
+        if (useViewStore.getState().view.kind === 'project') {
+          void useLibraryStore.getState().loadList();
+        }
+      }),
+    [],
+  );
   useEffect(() => () => void closeEditor(), [libraryPath]);
 
   return (
@@ -140,6 +167,9 @@ function LibraryScreen() {
       <ApplySheet />
       <MergeSheet />
       <BatchResultSheet />
+      <ExportSheet />
+      <PresetSheet />
+      <CreditsSheet />
       <DropOverlay />
       <TagDialog />
       <SearchPalette />

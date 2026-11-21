@@ -1,14 +1,16 @@
 import { ja } from '../../i18n/ja';
 import type { FolderNodeDto } from '../../ipc/folders';
 import type { ListView } from '../../ipc/items';
+import type { ProjectDto } from '../../ipc/projects';
 import type { SmartFolderDto } from '../../ipc/search';
 import { getCachedUnit } from '../../stores/itemCache';
 
-/** 一覧の見出し（サイドバーの項目名・フォルダ名・ユニット名・スマートフォルダ名）。 */
+/** 一覧の見出し（サイドバーの項目名・フォルダ名・ユニット名・スマートフォルダ名・プロジェクト名）。 */
 export function viewTitle(
   view: ListView,
   folders: readonly FolderNodeDto[],
   smart: readonly SmartFolderDto[] = [],
+  projects: readonly ProjectDto[] = [],
 ): string {
   switch (view.kind) {
     case 'all':
@@ -29,5 +31,7 @@ export function viewTitle(
       return getCachedUnit(view.id)?.name ?? ja.library.unitTitle;
     case 'smart':
       return smart.find((s) => s.id === view.id)?.name ?? ja.library.smartTitle;
+    case 'project':
+      return projects.find((p) => p.id === view.id)?.name ?? ja.library.projectTitle;
   }
 }

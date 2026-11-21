@@ -15,6 +15,7 @@ import { dateTimeLabel } from '../../../lib/dates';
 import { shortHash } from '../../../lib/format';
 import { useViewStore } from '../../../stores/viewStore';
 import { AssetSection } from '../../asset/AssetSection';
+import { CreditSection } from '../../credits/CreditSection';
 import { canEdit, openEditor } from '../../editor/editorKinds';
 import { useAssetStage } from '../../asset/AssetStage';
 import { useAssetData } from '../../asset/useAssetData';
@@ -115,6 +116,8 @@ export function ItemInspector({
       </div>
 
       <AssetSection data={assetData} item={item} audition={audition} />
+
+      {!trashed && <CreditSection itemIds={[id]} unitIds={[]} source={detail.sourceUrl ?? null} />}
 
       {trashed && (
         <section className={styles.trashed}>

@@ -39,6 +39,8 @@ export function emptyMessage(
       return { title: t.unit, hint: null };
     case 'smart':
       return { title: t.smart, hint: t.smartHint };
+    case 'project':
+      return { title: t.project, hint: t.projectHint };
     default:
       return { title: t.other, hint: null };
   }

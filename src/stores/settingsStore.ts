@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 
 /** 設定画面のタブ。 */
-export type SettingsTab = 'general' | 'library' | 'downloads';
+export type SettingsTab = 'general' | 'library' | 'downloads' | 'licenses';
 
 interface SettingsState {
   open: boolean;

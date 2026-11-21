@@ -12,6 +12,7 @@ import { tagLabel } from '../../../ipc/tags';
 import { formatCount } from '../../../lib/format';
 import { getCached, getCachedUnit } from '../../../stores/itemCache';
 import { useViewStore } from '../../../stores/viewStore';
+import { CreditSection } from '../../credits/CreditSection';
 import { TagChips } from '../../tags/TagChips';
 import { TagField } from '../../tags/TagField';
 import { splitTags } from '../../tags/splitTags';
@@ -156,6 +157,13 @@ export function MultiInspector({ entries }: { entries: number[] }) {
               {t.addFolder}
             </button>
           </section>
+
+          {!trash && (
+            <CreditSection
+              itemIds={entries.filter((e) => !isUnitEntry(e))}
+              unitIds={entries.filter(isUnitEntry).map(unitIdOf)}
+            />
+          )}
 
           <NoteField
             key={`${key}-${data.info.sameNote ? (data.info.note ?? '') : '*'}`}

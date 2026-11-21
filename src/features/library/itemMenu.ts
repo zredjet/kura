@@ -6,6 +6,7 @@ import { useViewStore } from '../../stores/viewStore';
 import { canEdit, openEditor } from '../editor/editorKinds';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
+import { openCreditsSheet } from '../credits/creditsSheetStore';
 import { exportEntries } from './exportActions';
 import { pixelArtMenu } from './pixelArtMenu';
 import { applyRecipeSubmenu, mergeSubmenu } from '../recipes/recipeMenus';
@@ -152,6 +153,15 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
     label: ja.itemMenu.export,
     shortcut: '⌘⇧E',
     onSelect: () => void exportEntries(entries),
+  });
+  out.push({
+    label: ja.credit.creditsList,
+    onSelect: () =>
+      openCreditsSheet({
+        type: 'items',
+        itemIds: entries.filter((e) => !isUnitEntry(e)),
+        unitIds: entries.filter(isUnitEntry).map(unitIdOf),
+      }),
   });
   out.push({
     label: ja.itemMenu.trash,

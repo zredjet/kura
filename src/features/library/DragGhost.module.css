@@ -19,6 +19,14 @@
   pointer-events: none;
 }
 
+/* 窓の外へ出すと持ち出せること（M15 段 6。落とし先のない所でだけ） */
+.hint {
+  display: block;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  color: var(--text-tertiary);
+}
+
 /* ドラッグ中は文字を選ばない */
 :global(html[data-dragging]) {
   -webkit-user-select: none;
