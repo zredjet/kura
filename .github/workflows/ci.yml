@@ -1,19 +1,57 @@
-# CI（ADR-142）。ubuntu で kura-engine・kura-core・vorbis-tables（Linux でも通ること・整数のゴールデンと Ogg Vorbis の書くバイト列が
-# ターゲットをまたいで一致すること）、
-# macOS で Swift ヘルパーを含むクレートと、ffmpeg の段の実物のテスト（Homebrew の ffmpeg）を確かめる。src-tauri はフロントの
-# ビルドが要るので、ここでは回さない。
+# CI（ADR-142・ADR-209）。
+# - push・PR では最低限だけ（ubuntu の 1 本）：整形、ゴールデンの追記だけの検査、エンジンの依存に SIMD の feature がないこと、
+#   kura-engine・kura-core・vorbis-tables の clippy（kura-core がテストを含めて Linux でもビルドできること）、
+#   ターゲットをまたいで同じ値になるはずのゴールデン（整数の操作・解析、コーデックの書くバイト列（Ogg Vorbis を含む）、
+#   3D の描画、作り直しの見本集）。ほかのテストは手元の /verify が回す。
+# - 全部のテストは手で起こすときだけ（Actions の「Run workflow」か `gh workflow run ci.yml --ref <ブランチ>`）：ubuntu で
+#   kura-engine・kura-core・vorbis-tables、macOS で Swift ヘルパーを含むクレートと、ffmpeg の段の実物のテスト（Homebrew の ffmpeg）。
+# src-tauri はフロントのビルドが要るので、どちらでも回さない。
 name: CI
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+# 同じブランチ（PR）の同じきっかけの古い実行は取り消す（手で起こした全部の実行は、push で取り消さない）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  minimal:
+    name: 最低限（整形・lint・ゴールデン。ubuntu）
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # テストが止まったときに 6 時間の既定まで待たない
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # ゴールデンの追記だけの検査が基準のコミットとの差分を見る
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99.0'
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - name: ゴールデンは追記だけ
+        run: scripts/check-goldens-append-only.sh "${{ github.event.pull_request.base.sha || github.event.before }}"
+      - name: エンジンの依存に SIMD の feature がない
+        run: scripts/check-engine-features.sh
+      - run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables --all-targets -- -D warnings
+      - name: ターゲットをまたぐゴールデン
+        run: >-
+          cargo test -p kura-engine
+          --test golden --test codec_golden --test analysis_golden --test model_golden --test replay
+
   linux:
-    name: Linux（kura-engine・kura-core・vorbis-tables）
+    name: 全部（Linux。kura-engine・kura-core・vorbis-tables）
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     # ふだんは 8〜12 分。テストが止まったときに 6 時間の既定まで待たない
     timeout-minutes: 25
@@ -30,12 +68,13 @@ jobs:
       - run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables --all-targets -- -D warnings
       - run: cargo test -p kura-engine -p kura-core -p vorbis-tables
       - name: ゴールデンは追記だけ
-        run: scripts/check-goldens-append-only.sh "${{ github.event.pull_request.base.sha || github.event.before }}"
+        run: scripts/check-goldens-append-only.sh
       - name: エンジンの依存に SIMD の feature がない
         run: scripts/check-engine-features.sh
 
   macos:
-    name: macOS（kura-engine・kura-core・vorbis-tables・kura-mac・kura-devtools）
+    name: 全部（macOS。kura-engine・kura-core・vorbis-tables・kura-mac・kura-devtools）
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-26
     # ふだんは 16〜19 分。テストが止まったときに 6 時間の既定まで待たない（2026-10 に sips が止まって 3 時間かかった）
     timeout-minutes: 40
