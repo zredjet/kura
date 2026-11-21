@@ -260,9 +260,11 @@ export function watchDrag(
       useDragStore.setState({ payload: begun.payload, label: begun.label });
     }
     const payload = useDragStore.getState().payload;
-    // 窓の外へ出たら OS のドラッグに切り替える（アプリの中のドラッグは終える。離したときはもう届かない）
+    // 窓の外へ出たら OS のドラッグに切り替える（アプリの中のドラッグは終える）。OS のドラッグが終わると WebView に離した
+    // ことが届くので、そのあとのクリックを捨てる（押したタイルの上で離すと選択が変わらないように）
     if (payload?.kind === 'entries' && outsideWindow(e.clientX, e.clientY)) {
       cleanup();
+      swallowClickAfterHandOff();
       void beginDragOut(payload.ids);
       return;
     }
@@ -279,8 +281,7 @@ export function watchDrag(
     cleanup();
     if (started) {
       // ドラッグの最後のクリックで選択が変わらないようにする
-      window.addEventListener('click', swallow, { capture: true, once: true });
-      setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
+      swallowNextClick();
       if (payload && target) {
         performDrop(payload, target, e.altKey);
       }
@@ -307,4 +308,27 @@ export function watchDrag(
 function swallow(e: MouseEvent): void {
   e.stopPropagation();
   e.preventDefault();
+}
+
+/**
+ * OS のドラッグに切り替えたあと：次に届く離し（OS のドラッグの終わりに WebView へ渡すもの）に続くクリックを捨てる。離しが
+ * 届かずに次の押しが来たら外す（本当のクリックを捨てない）。
+ */
+function swallowClickAfterHandOff(): void {
+  const disarm = () => {
+    window.removeEventListener('pointerup', onUp, true);
+    window.removeEventListener('pointerdown', disarm, true);
+  };
+  const onUp = () => {
+    disarm();
+    swallowNextClick();
+  };
+  window.addEventListener('pointerup', onUp, true);
+  window.addEventListener('pointerdown', disarm, true);
+}
+
+/** 今の離しに続くクリックを 1 回だけ捨てる（続かなければ次のタスクで外す）。 */
+function swallowNextClick(): void {
+  window.addEventListener('click', swallow, { capture: true, once: true });
+  setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
 }

@@ -2,7 +2,7 @@
 //! 作り始めて OS のドラッグに切り替え、落とす先にファイルの URL で渡す。持ち出し先のプロジェクト（名前と形式の既定）を
 //! 読み書きする。ロジックは `kura_core::export::dragout`、OS のドラッグは `kura_mac::begin_drag`。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kura_core::export::{DragSession, dragout};
@@ -29,7 +29,8 @@ pub struct DragOutStartDto {
     pub skipped: u32,
 }
 
-/// ドラッグアウトが終わった知らせ（渡した項目と、落とす先が求めたのに渡さなかった項目の数）。
+/// ドラッグアウトが終わった知らせ（渡した項目と、落とす先が求めたのに渡さなかった項目、渡したフォルダの中で作れなかった
+/// ファイルの数）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type, tauri_specta::Event)]
 #[serde(rename_all = "camelCase")]
 #[tauri_specta(event_name = "dragout://ended")]
@@ -39,6 +40,8 @@ pub struct DragOutEnded {
     pub delivered: u32,
     /// 落とす先が求めたのに渡さなかった項目（作れなかった・待ちきれなかった）。
     pub missed: u32,
+    /// 渡したフォルダ（ユニット）の中で作れなかったファイル。
+    pub incomplete: u32,
 }
 
 /// 持ち出し先のプロジェクト。
@@ -49,6 +52,14 @@ pub struct DragOutTargetDto {
     pub chosen: Option<i64>,
     /// 名前と形式に使うプロジェクト（選んでいなければ、登録が 1 つならそれ）。null なら名前も形式もそのまま。
     pub effective: Option<i64>,
+}
+
+/// OS のドラッグを始めたかの門。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Waiting,
+    Done(bool),
+    GaveUp,
 }
 
 fn count(n: u64) -> u32 {
@@ -75,12 +86,14 @@ impl kura_mac::DragHandler for Handler {
             failed = outcome.failed,
             late = outcome.late,
             missed = outcome.missed,
+            incomplete = outcome.incomplete,
             "ドラッグアウトが終わりました"
         );
         let event = DragOutEnded {
             dir: self.session.dir().display().to_string(),
             delivered: count(outcome.delivered),
             missed: count(outcome.missed),
+            incomplete: count(outcome.incomplete),
         };
         if let Err(err) = tauri_specta::Event::emit(&event, &self.app) {
             tracing::warn!(%err, "ドラッグアウトの終わりを送れませんでした");
@@ -119,7 +132,15 @@ pub async fn dragout_start(
         app,
     });
     let (tx, rx) = std::sync::mpsc::channel();
+    // 始めたかの門：待ちきれずにあきらめたら、そのあとでメインスレッドが閉包を回しても、片付けた回で OS のドラッグを
+    // 始めない（閉包は門を持ったまま始めるので、あきらめる側は始め終えるのを待って答えを読む）
+    let gate = Arc::new(Mutex::new(Gate::Waiting));
+    let gate2 = gate.clone();
     let sent = window.with_webview(move |webview| {
+        let mut g = gate2.lock().unwrap_or_else(PoisonError::into_inner);
+        if *g == Gate::GaveUp {
+            return;
+        }
         #[cfg(target_os = "macos")]
         // SAFETY: with_webview はメインスレッドで、生きている WKWebView を渡す
         let started = unsafe { kura_mac::begin_drag(webview.inner(), &files, handler) };
@@ -128,10 +149,25 @@ pub async fn dragout_start(
             let _ = (webview, files, handler);
             false
         };
-        let _ = tx.send(started);
+        *g = Gate::Done(started);
+        drop(g);
+        let _ = tx.send(());
     });
     let started = match sent {
-        Ok(()) => blocking(move || Ok(rx.recv_timeout(BEGIN_TIMEOUT).unwrap_or(false))).await?,
+        Ok(()) => {
+            blocking(move || {
+                let _ = rx.recv_timeout(BEGIN_TIMEOUT);
+                let mut g = gate.lock().unwrap_or_else(PoisonError::into_inner);
+                Ok(match *g {
+                    Gate::Done(started) => started,
+                    _ => {
+                        *g = Gate::GaveUp;
+                        false
+                    }
+                })
+            })
+            .await?
+        }
         Err(err) => {
             drag.abort();
             return Err(err.into());

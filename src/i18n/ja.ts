@@ -1376,7 +1376,10 @@ export const ja = {
   dragOut: {
     failed: (msg: string) => `ドラッグで持ち出せませんでした：${msg}`,
     skipped: (n: string) => `ゴミ箱の中・見つからない ${n} 項目は持ち出しません`,
-    incomplete: (n: string) => `${n} 項目を渡せませんでした（作れなかった・間に合わなかった）`,
+    missed: (n: string) => `${n} 項目を渡せませんでした（作れなかった・間に合わなかった）`,
+    incomplete: (n: string) => `渡したフォルダの中の ${n} ファイルを作れませんでした`,
+    missedAndIncomplete: (n: string, files: string) =>
+      `${n} 項目を渡せず、渡したフォルダの中の ${files} ファイルを作れませんでした`,
   },
   import: {
     dialogLabel: 'ファイルの取り込み',

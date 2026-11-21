@@ -21,6 +21,7 @@ vi.mock('../../ipc/dragout', () => ({
 }));
 
 beforeEach(() => {
+  resetDragOutForTest();
   useImportStore.setState({
     dragging: false,
     phase: 'idle',
@@ -32,7 +33,6 @@ beforeEach(() => {
 
 describe('handleDragDrop', () => {
   it('Kura から出したドラッグ（一時置き場のファイル）が戻ってきても取り込まない', async () => {
-    resetDragOutForTest();
     await beginDragOut([1]);
     const own = ['/L.kuralib/staging/dragout/1/hero.png'];
     handleDragDrop({ type: 'enter', paths: own });

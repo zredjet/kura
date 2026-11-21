@@ -1,8 +1,8 @@
 /**
  * ドラッグアウト（M15 段 5。ADR-207）：アプリの中のドラッグ（タイル・リストの行）が窓の外へ出たら、OS のドラッグに切り替える。
  * 名前と形式を整えたファイルは Rust が一時置き場に作り、落とす先にファイルの URL で渡す（Godot・Unity・Finder など）。
- * 窓に戻ってきて Kura 自身に落としても取り込まない（Swift が Kura の窓の上では渡さず、念のため一時置き場のファイルの
- * ドロップも `isOwnDrop` で見分けて捨てる）。
+ * 窓に戻ってきて Kura 自身に落としても取り込まない（Swift がドラッグのあいだ Kura の窓を落とす先から外し、念のため
+ * 一時置き場のファイルのドロップも `isOwnDrop` で見分けて捨てる）。
  */
 
 import { isTauri } from '@tauri-apps/api/core';
@@ -13,8 +13,13 @@ import { onDragOutEnded, startDragOut } from '../../ipc/dragout';
 import { formatCount } from '../../lib/format';
 import { notify } from '../../stores/noticeStore';
 
-/** これまでの回の一時置き場のフォルダ（Kura 自身へのドロップを見分ける。開いている間だけ覚える）。 */
+/** これまでの回の一時置き場のフォルダ（Kura 自身へのドロップを見分ける。開いている間だけ覚える。NFC で持つ）。 */
 const ownDirs = new Set<string>();
+
+/** パスを比べる形にする（macOS の URL は名前を NFD に分解して返すことがある）。 */
+function comparable(path: string): string {
+  return path.normalize('NFC');
+}
 
 /** ページの座標 (x, y) が窓（WebView の表示範囲）の外か。 */
 export function outsideWindow(
@@ -31,7 +36,8 @@ export function isOwnDrop(paths: readonly string[]): boolean {
   if (paths.length === 0 || ownDirs.size === 0) {
     return false;
   }
-  return paths.every((path) => {
+  return paths.every((raw) => {
+    const path = comparable(raw);
     for (const dir of ownDirs) {
       if (path === dir || path.startsWith(`${dir}/`)) {
         return true;
@@ -49,8 +55,8 @@ function messageOf(error: unknown): string {
 export async function beginDragOut(ids: readonly number[]): Promise<boolean> {
   try {
     const result = await startDragOut([...ids]);
-    ownDirs.add(result.dir);
-    if (result.skipped > 0) {
+    ownDirs.add(comparable(result.dir));
+    if (result.started && result.skipped > 0) {
       notify(ja.dragOut.skipped(formatCount(result.skipped)));
     }
     return result.started;
@@ -61,7 +67,21 @@ export async function beginDragOut(ids: readonly number[]): Promise<boolean> {
   }
 }
 
-/** ドラッグアウトが終わった知らせを受け、渡せなかった項目があれば知らせる（ライブラリの画面）。 */
+/** 終わったときに知らせる一言（渡せなかった項目・フォルダの中で作れなかったファイル。なければ null）。 */
+export function endedMessage(missed: number, incomplete: number): string | null {
+  if (missed > 0 && incomplete > 0) {
+    return ja.dragOut.missedAndIncomplete(formatCount(missed), formatCount(incomplete));
+  }
+  if (missed > 0) {
+    return ja.dragOut.missed(formatCount(missed));
+  }
+  if (incomplete > 0) {
+    return ja.dragOut.incomplete(formatCount(incomplete));
+  }
+  return null;
+}
+
+/** ドラッグアウトが終わった知らせを受け、渡せなかったものがあれば知らせる（ライブラリの画面）。 */
 export function useDragOutEvents(): void {
   useEffect(() => {
     if (!isTauri()) {
@@ -70,9 +90,11 @@ export function useDragOutEvents(): void {
     let unlisten: (() => void) | null = null;
     let disposed = false;
     onDragOutEnded((event) => {
-      // 落とす先が求めたのに渡せなかった項目だけ知らせる（求められずに終わった回はやめたドラッグ）
-      if (event.missed > 0) {
-        notify(ja.dragOut.incomplete(formatCount(event.missed)));
+      // 落とす先が求めたのに渡せなかった項目と、渡したフォルダの中で作れなかったファイルを知らせる（求められずに終わった
+      // 回はやめたドラッグなので知らせない）
+      const message = endedMessage(event.missed, event.incomplete);
+      if (message) {
+        notify(message);
       }
     })
       .then((fn) => {

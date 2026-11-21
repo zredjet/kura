@@ -6,13 +6,15 @@ import { useNoticeStore } from '../../stores/noticeStore';
 import { useDragStore, watchDrag } from './dragState';
 import {
   beginDragOut,
+  endedMessage,
   isOwnDrop,
   outsideWindow,
   resetDragOutForTest,
   useDragOutEvents,
 } from './dragOut';
 
-vi.mock('@tauri-apps/api/core', () => ({ isTauri: () => true }));
+const tauri = vi.hoisted(() => ({ on: true }));
+vi.mock('@tauri-apps/api/core', () => ({ isTauri: () => tauri.on }));
 vi.mock('../../ipc/dragout', () => ({
   startDragOut: vi.fn(async () => ({
     started: true,
@@ -26,7 +28,9 @@ beforeEach(() => {
   // jsdom には elementFromPoint がない（落とし先は見ない）
   Object.defineProperty(document, 'elementFromPoint', { value: () => null, configurable: true });
   resetDragOutForTest();
+  tauri.on = true;
   vi.mocked(startDragOut).mockClear();
+  vi.mocked(onDragOutEnded).mockClear();
   useNoticeStore.setState({ message: null, action: null });
   useDragStore.setState({ payload: null, target: null });
 });
@@ -56,14 +60,32 @@ describe('beginDragOut', () => {
     expect(isOwnDrop([])).toBe(false);
   });
 
-  it('飛ばしたアイテムと始められなかった理由を知らせる', async () => {
+  it('名前の正規化（NFC・NFD）が違っても同じパスとみなす', async () => {
+    const nfc = '/Users/me/ゲーム素材/Kura.kuralib/staging/dragout/1'.normalize('NFC');
+    vi.mocked(startDragOut).mockResolvedValueOnce({ started: true, dir: nfc, skipped: 0 });
+    await beginDragOut([1]);
+    const nfd = `${nfc}/ヒーロー.png`.normalize('NFD');
+    expect(nfd).not.toBe(`${nfc}/ヒーロー.png`);
+    expect(isOwnDrop([nfd])).toBe(true);
+  });
+
+  it('飛ばしたアイテムは始めたときだけ知らせ、始められなかった理由を知らせる', async () => {
     vi.mocked(startDragOut).mockResolvedValueOnce({
-      started: false,
+      started: true,
       dir: '/L.kuralib/staging/dragout/2',
       skipped: 3,
     });
-    await expect(beginDragOut([1])).resolves.toBe(false);
+    await expect(beginDragOut([1])).resolves.toBe(true);
     expect(useNoticeStore.getState().message).toContain('3');
+    useNoticeStore.setState({ message: null, action: null });
+    // ボタンが離れていて始められなかったときは何も知らせない
+    vi.mocked(startDragOut).mockResolvedValueOnce({
+      started: false,
+      dir: '/L.kuralib/staging/dragout/3',
+      skipped: 3,
+    });
+    await expect(beginDragOut([1])).resolves.toBe(false);
+    expect(useNoticeStore.getState().message).toBeNull();
     vi.mocked(startDragOut).mockRejectedValueOnce(new Error('多すぎます'));
     await expect(beginDragOut([1])).resolves.toBe(false);
     expect(useNoticeStore.getState().message).toContain('多すぎます');
@@ -74,6 +96,13 @@ describe('watchDrag', () => {
   const move = (x: number, y: number) =>
     window.dispatchEvent(new MouseEvent('pointermove', { clientX: x, clientY: y }));
 
+  const up = () => window.dispatchEvent(new MouseEvent('pointerup', { clientX: 30, clientY: 30 }));
+  const click = () => {
+    const event = new MouseEvent('click', { bubbles: true, cancelable: true });
+    document.body.dispatchEvent(event);
+    return event.defaultPrevented;
+  };
+
   it('タイルのドラッグが窓の外へ出たら OS のドラッグに切り替え、アプリの中のドラッグを終える', () => {
     watchDrag({ button: 0, ctrlKey: false, clientX: 10, clientY: 10 }, () => ({
       payload: { kind: 'entries', ids: [4, 5] },
@@ -81,12 +110,48 @@ describe('watchDrag', () => {
     }));
     move(30, 30);
     expect(useDragStore.getState().payload).toEqual({ kind: 'entries', ids: [4, 5] });
+    expect(document.documentElement.dataset.dragging).toBe('true');
     move(-3, 30);
     expect(startDragOut).toHaveBeenCalledWith([4, 5]);
     expect(useDragStore.getState().payload).toBeNull();
-    // もう見張らない
+    expect(document.documentElement.dataset.dragging).toBeUndefined();
+    // もう見張らない（Esc も取らない）
     move(-10, 30);
     expect(startDragOut).toHaveBeenCalledTimes(1);
+    const esc = new KeyboardEvent('keydown', { key: 'Escape', cancelable: true });
+    window.dispatchEvent(esc);
+    expect(esc.defaultPrevented).toBe(false);
+  });
+
+  it('OS のドラッグの終わりに届く離しに続くクリックは捨て、そのあとのクリックは捨てない', () => {
+    vi.useFakeTimers();
+    try {
+      watchDrag({ button: 0, ctrlKey: false, clientX: 10, clientY: 10 }, () => ({
+        payload: { kind: 'entries', ids: [4] },
+        label: '1 項目',
+      }));
+      move(30, 30);
+      move(-3, 30);
+      // OS のドラッグが終わって WebView に離しが届き、押したタイルの上ならクリックが続く
+      up();
+      expect(click()).toBe(true);
+      vi.runAllTimers();
+      expect(click()).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('離しが届かずに次の押しが来たら、そのクリックは捨てない', () => {
+    watchDrag({ button: 0, ctrlKey: false, clientX: 10, clientY: 10 }, () => ({
+      payload: { kind: 'entries', ids: [4] },
+      label: '1 項目',
+    }));
+    move(30, 30);
+    move(-3, 30);
+    window.dispatchEvent(new MouseEvent('pointerdown', { clientX: 30, clientY: 30 }));
+    up();
+    expect(click()).toBe(false);
   });
 
   it('フォルダの行のドラッグは窓の外へ出ても切り替えない', () => {
@@ -103,18 +168,40 @@ describe('watchDrag', () => {
 });
 
 describe('useDragOutEvents', () => {
-  it('落とす先が求めたのに渡せなかった項目があれば知らせる', async () => {
+  it('渡せなかった項目と、渡したフォルダの中で作れなかったファイルを知らせ、外すと受けるのをやめる', async () => {
     let handler: ((event: DragOutEnded) => void) | null = null;
+    const unlisten = vi.fn();
     vi.mocked(onDragOutEnded).mockImplementationOnce(async (h) => {
       handler = h;
-      return () => undefined;
+      return unlisten;
     });
-    renderHook(() => useDragOutEvents());
+    const hook = renderHook(() => useDragOutEvents());
     await act(async () => {});
     expect(handler).not.toBeNull();
-    act(() => handler?.({ dir: '/d', delivered: 2, missed: 0 }));
+    act(() => handler?.({ dir: '/d', delivered: 2, missed: 0, incomplete: 0 }));
     expect(useNoticeStore.getState().message).toBeNull();
-    act(() => handler?.({ dir: '/d', delivered: 0, missed: 1 }));
-    expect(useNoticeStore.getState().message).toContain('1');
+    act(() => handler?.({ dir: '/d', delivered: 0, missed: 1, incomplete: 0 }));
+    expect(useNoticeStore.getState().message).toBe(endedMessage(1, 0));
+    act(() => handler?.({ dir: '/d', delivered: 1, missed: 0, incomplete: 2 }));
+    expect(useNoticeStore.getState().message).toBe(endedMessage(0, 2));
+    hook.unmount();
+    expect(unlisten).toHaveBeenCalled();
+  });
+
+  it('Tauri の外では受けない', () => {
+    tauri.on = false;
+    renderHook(() => useDragOutEvents());
+    expect(onDragOutEnded).not.toHaveBeenCalled();
+  });
+});
+
+describe('endedMessage', () => {
+  it('渡せなかった項目とフォルダの中のファイルを言い分ける', () => {
+    expect(endedMessage(0, 0)).toBeNull();
+    expect(endedMessage(2, 0)).toContain('2 項目');
+    expect(endedMessage(0, 3)).toContain('3 ファイル');
+    const both = endedMessage(2, 3);
+    expect(both).toContain('2 項目');
+    expect(both).toContain('3 ファイル');
   });
 });
