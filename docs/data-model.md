@@ -366,7 +366,7 @@ CREATE INDEX idx_play_events_item ON play_events(item_id, played_at DESC);
 CREATE TABLE jobs (                                -- 0008 で作り直した形
   id            INTEGER PRIMARY KEY,
   kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）、0011：edit（M12 の保存）・gc（M12 の段 3）、0012：batch（M14 の一括）、0015：project（M15 のプロジェクトの照らし直し）
-                CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc','batch')),
+                CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc','batch','project')),
   state         TEXT    NOT NULL
                 CONSTRAINT jobs_state CHECK (state IN ('queued','running','paused','done','failed','canceled')),
   priority      INTEGER NOT NULL DEFAULT 0,
@@ -1258,29 +1258,38 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 ### プロジェクトと使った記録（M15。`crates/kura-core/src/project/`。ADR-202・204）
 
 - **登録**（`project::prepare_root`・`add`）：ファイルシステムを見るのは DB の書き手の外。絶対パスを `canonicalize` で正規化し
-  （シンボリックリンク・`..` をたどる）、フォルダで、UTF-8 で、ライブラリの中でもライブラリを含むフォルダでもないことを確かめる
-  （ない・フォルダでないは `NotFound`・`Invalid`）。書き手の中で、ほかのプロジェクトと同じ・中・外側のフォルダなら `Conflict`。エンジンは
+  （シンボリックリンク・`..` をたどる）、フォルダで、UTF-8 で、ライブラリの中でもライブラリを含むフォルダでもなく、ほかのプロジェクトと
+  同じ・中・外側でもないことを確かめる（ない・途中がファイル・読めない・フォルダでないは `NotFound`・`Invalid`、重なりは `Conflict`）。
+  中・外側の判定は、パスの文字のほか、祖先のどれかが相手と同じボリュームと inode か（`(dev, ino)`）でも見る（APFS の大文字小文字を
+  区別しない名前・ファームリンク `/System/Volumes/Data`・改名で文字が食い違っても気づく）。書き手の中の `add`・`relocate` もパスの文字で
+  重なりを確かめ直す。名前を省けばフォルダの名前（NFC。200 文字で切る）。エンジンは
   中身で見分ける（`project.godot` → godot、`ProjectSettings/ProjectVersion.txt` と `Assets/` → unity、ほかは folder。照らすたびに見分け直す）。
   登録・場所の選び直し（`relocate`。使った記録は残し、`missing` を 0 に）のあとに照らし直しを積む。外す（`remove`）とファイルの行も消える。
 - **照らし直し**（ジョブ `kind = 'project'`。`project::scan`。入力 `{}`。登録したプロジェクト全部を照らす。`ensure_queued` で重ねない）：
-  登録したとき・場所を選び直したとき・ライブラリを開いたとき（登録があれば。起動のスレッドで）・利用者が頼んだときに積む（段 2 の決定 2）。
-  取り込みに譲る。プロジェクトごとに、
+  登録したとき・場所を選び直したとき・ライブラリを開いたとき（登録があれば。起動のスレッドで）・利用者が頼んだときに積む（段 2 の決定 2。
+  登録・選び直しのあとに積めなくても登録は残し、記録だけにする）。取り込みに譲る。プロジェクトごとに、今の行（ジョブの初めの一覧ではなく）
+  を読み直し、その ID・ルート・作った時刻が変わったら（照らしの間に外した・選び直した）書かずに終える。
   1. フォルダがなければ（読めなければ）`missing = 1` にして行は残す（段 2 の決定 4）。
   2. ファイルを集める（`project::walk`）：取り込める形式（`import::classify`）のファイルだけ。`.` で始まる名前と、ルートの直下のエンジンの
      キャッシュ（unity の `Library`・`Temp`・`Logs`・`obj`・`Build`・`Builds`・`UserSettings`・`MemoryCaptures`。godot の `.godot` は隠し）を
-     見ない。シンボリックリンクはたどらない（段 2 の決定 1）。
+     見ない（unity のキャッシュの名前は大文字小文字を問わない）。パッケージ（`.app`・`.kuralib` など。取り込みと同じ）には入らない。
+     シンボリックリンクはたどらない（段 2 の決定 1）。中を読み切れなかったフォルダ（許されていない・照らしの間に外れた）は覚えておく。
   3. 前の回の行（`SELECT path, size_bytes, mtime_ns, hash FROM project_files WHERE project_id = ?`。主キー）と大きさ・更新時刻が同じならハッシュを
-     使い直し、ほかを 64 件ずつ並べてハッシュする（読めないものは記録しない）。
-  4. すべての行を中身の持ち主と照らし（`project::scan::match_hash`：今 → 元 → 過去の版は取り込みの重複の判定と同じ `find_owner`、なければ
-     `item_outputs` の ID の小さいアイテム。段 2 の決定 3）、500 件ずつ `INSERT … ON CONFLICT(project_id, path) DO UPDATE` で書く（`seen_at` は
-     この回の印 = max(今, 前の `scanned_at` + 1)）。照らしの間に登録を外したら書かない。
-  5. `DELETE FROM project_files WHERE project_id = ? AND seen_at < ?`（見えなくなったファイル。使った記録は今あるもの）と、`missing = 0`・
-     エンジン・`scanned_at` を 1 つのトランザクションで書く。
-  一時停止・中止・譲るは区切りで止め、次は初めから（変わっていないファイルはハッシュし直さない。途中で書いた行は正しい中身で、見えなく
-  なった行は最後まで照らした回だけが消す）。結果は `{ projects, missing, files, hashed, matched, removed, skipped }`。
+     使い直す。
+  4. 500 件ずつ、ほかのファイルを 64 件か 256 MiB ずつ並べてハッシュし（専用の 4 スレッドまでのプール。大きなファイルも 64 MiB ごとに
+     止める指示を見る。照らしの間に消えたファイルは記録せず、読めないファイルは前のハッシュで残す）、その 500 件を中身の持ち主と照らして
+     （`project::scan::match_hash`：今 → 元 → 過去の版は取り込みの重複の判定と同じ `find_owner`、なければ `item_outputs` の ID の小さい
+     アイテム。段 2 の決定 3）`INSERT … ON CONFLICT(project_id, path) DO UPDATE` で書く（`seen_at` はこの回の印 = max(今, 前の `scanned_at` + 1)）。
+     止めてもハッシュした分は書く（次の回で大きさと時刻で使い直す）。
+  5. フォルダがまだあることを確かめ直し（なければ `missing = 1` にして何も消さない）、`seen_at` がこの回の印より古い行のうち、読み切れな
+     かったフォルダの下でないものを消し（見えなくなったファイル。使った記録は今あるもの）、`missing = 0`・エンジン・`scanned_at` を
+     1 つのトランザクションで書く。
+  一時停止・中止・譲るは区切りで止め（止めた理由は止めたときに覚えたもの）、次は初めから（変わっていないファイルと止める前にハッシュ
+  した分はハッシュし直さない。見えなくなった行は最後まで照らした回だけが消す）。結果は `{ projects, missing, files, hashed, matched, removed, skipped }`。
 - **使った記録**：プロジェクトで使っているアイテムは `SELECT DISTINCT item_id FROM project_files WHERE project_id = ? AND item_id IS NOT NULL`
   （主キー。クレジットの一覧の対象。段 4）、アイテムを使っているプロジェクトは `idx_project_files_item`。アイテムを消すと行は残って未一致に
-  なり、次の照らしで付け直す（同じ中身のほかのアイテムがあればそれ）。
+  なり、次の照らしで付け直す（同じ中身のほかのアイテムがあればそれ）。`matched` は `item_id` があるときだけ意味を持つ（アイテムを消した
+  直後は前の値が残るので、読み手は `item_id` で絞る）。
 - **持ち出した出力** `item_outputs` は段 3・5 が書く（形式を変えて作ったファイルの中身。今と同じ中身なら書かなくても今で一致する）。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
