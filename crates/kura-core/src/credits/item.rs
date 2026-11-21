@@ -132,16 +132,26 @@ fn write(conn: &Connection, item: i64, c: &ItemCredit, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// 選んだアイテムに同じ項目を付ける（パッチにない項目はアイテムごとのまま）。ないアイテムは飛ばす。変えた件数を返す
-/// （中身が同じものは書かず、数えない）。呼び手が 1 つのトランザクションで呼ぶ。
-pub fn set(conn: &Connection, items: &[i64], patch: &CreditPatch, now: i64) -> Result<usize> {
+/// まとめて付けた件数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetCount {
+    /// 対象のアイテムの数（ない ID と重なりは数えない）。
+    pub items: usize,
+    /// 変えた件数（中身が同じものは書かず、数えない）。
+    pub changed: usize,
+}
+
+/// 選んだアイテムに同じ項目を付ける（パッチにない項目はアイテムごとのまま）。ないアイテムは飛ばす。呼び手が 1 つの
+/// トランザクションで呼ぶ。
+pub fn set(conn: &Connection, items: &[i64], patch: &CreditPatch, now: i64) -> Result<SetCount> {
     let patch = clean_patch(conn, patch)?;
-    let mut changed = 0;
+    let mut count = SetCount::default();
     let mut seen = BTreeSet::new();
     for &item in items.iter().filter(|id| seen.insert(**id)) {
         if !exists(conn, item)? {
             continue;
         }
+        count.items += 1;
         let before = read(conn, item)?;
         let mut after = before.clone();
         if let Some(v) = patch.license {
@@ -161,10 +171,10 @@ pub fn set(conn: &Connection, items: &[i64], patch: &CreditPatch, now: i64) -> R
         }
         if after != before {
             write(conn, item, &after, now)?;
-            changed += 1;
+            count.changed += 1;
         }
     }
-    Ok(changed)
+    Ok(count)
 }
 
 /// アイテムとユニット（メンバー全員）を、重なりを除いたアイテムの列にする（選んだ順。ユニットのメンバーはその後ろ）。
@@ -218,7 +228,9 @@ pub fn summary(conn: &Connection, items: &[i64]) -> Result<CreditSummary> {
 pub fn copy(conn: &Connection, from: i64, to: i64, now: i64) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO item_credits (item_id, license_id, author, work, url, credit, updated_at)
-         SELECT ?2, license_id, author, work, url, credit, ?3 FROM item_credits WHERE item_id = ?1
+         SELECT ?2, license_id, author, work, url, credit, ?3 FROM item_credits
+          WHERE item_id = ?1
+            AND NOT (license_id IS NULL AND author IS NULL AND work IS NULL AND url IS NULL AND credit IS NULL)
          ON CONFLICT(item_id) DO NOTHING",
     )?;
     stmt.execute(params![from, to, now])?;
@@ -264,7 +276,13 @@ mod tests {
             author: Some(Some("  もりの ".into())),
             ..CreditPatch::default()
         };
-        assert_eq!(set(&conn, &[1, 2, 2, 99], &patch, 5).unwrap(), 2);
+        assert_eq!(
+            set(&conn, &[1, 2, 2, 99], &patch, 5).unwrap(),
+            SetCount {
+                items: 2,
+                changed: 2
+            }
+        );
         assert_eq!(
             get(&conn, 1).unwrap(),
             ItemCredit {
@@ -274,13 +292,13 @@ mod tests {
             }
         );
         // 同じ中身はもう一度書かない
-        assert_eq!(set(&conn, &[1, 2], &patch, 6).unwrap(), 0);
+        assert_eq!(set(&conn, &[1, 2], &patch, 6).unwrap().changed, 0);
         // 1 件だけ作品を足す：ほかの項目はそのまま
         let work = CreditPatch {
             work: Some(Some("森の素材集".into())),
             ..CreditPatch::default()
         };
-        assert_eq!(set(&conn, &[2], &work, 7).unwrap(), 1);
+        assert_eq!(set(&conn, &[2], &work, 7).unwrap().changed, 1);
         assert_eq!(get(&conn, 2).unwrap().author.as_deref(), Some("もりの"));
         assert_eq!(get(&conn, 2).unwrap().work.as_deref(), Some("森の素材集"));
         assert_eq!(get(&conn, 1).unwrap().work, None);
@@ -290,7 +308,7 @@ mod tests {
             author: Some(Some("  ".into())),
             ..CreditPatch::default()
         };
-        assert_eq!(set(&conn, &[1, 2], &clear, 8).unwrap(), 2);
+        assert_eq!(set(&conn, &[1, 2], &clear, 8).unwrap().changed, 2);
         assert_eq!(get(&conn, 1).unwrap(), ItemCredit::default());
         assert_eq!(get(&conn, 2).unwrap().work.as_deref(), Some("森の素材集"));
         assert_eq!(rows(&conn), 1);

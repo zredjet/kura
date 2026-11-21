@@ -261,7 +261,7 @@ impl From<CreditSummary> for CreditSummaryDto {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CreditsSetDto {
-    /// 対象のアイテムの数（ユニットはメンバーを数える）。
+    /// 対象のアイテムの数（ユニットはメンバーを数える。ない ID は数えない）。
     pub items: u32,
     /// 変えた件数（中身が同じものは数えない）。
     pub changed: u32,
@@ -468,10 +468,10 @@ pub async fn item_credits_set(
         let now = now_ms();
         Ok(session.library().db().write(move |tx| {
             let items = item::expand(tx, &item_ids, &unit_ids)?;
-            let changed = item::set(tx, &items, &patch, now)?;
+            let done = item::set(tx, &items, &patch, now)?;
             Ok(CreditsSetDto {
-                items: count(items.len()),
-                changed: count(changed),
+                items: count(done.items),
+                changed: count(done.changed),
             })
         })?)
     })

@@ -12,7 +12,7 @@ use crate::text::nfc;
 pub const MAX_NAME_CHARS: usize = 200;
 
 /// ライセンス 1 行。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct License {
     pub id: i64,
     /// 既定の行の鍵（`cc-by-4.0` など）。利用者が足した行は None。
@@ -25,7 +25,7 @@ pub struct License {
     pub modify: Permission,
     pub share_alike: bool,
     pub note: Option<String>,
-    pub pos: i64,
+    pub pos: f64,
     /// このライセンスを付けたアイテムの数（ゴミ箱の中を含む）。
     pub items: i64,
     pub created_at: i64,
@@ -64,6 +64,15 @@ fn clean_input(input: &LicenseInput) -> Result<Clean> {
         return Err(CoreError::Invalid(format!(
             "ライセンスの名前は {MAX_NAME_CHARS} 文字までです"
         )));
+    }
+    // 引用符は検索の値の書き方で逃がせない（`ライセンス:"…"` に入らない）ので、名前に入れない。改行なども入れない
+    if name
+        .chars()
+        .any(|c| matches!(c, '"' | '“' | '”' | '＂') || c.is_control())
+    {
+        return Err(CoreError::Invalid(
+            "ライセンスの名前に引用符や改行は使えません".into(),
+        ));
     }
     Ok(Clean {
         name,
@@ -128,16 +137,21 @@ pub fn get(conn: &Connection, id: i64) -> Result<License> {
     finish(found.ok_or_else(|| CoreError::NotFound(format!("ライセンス {id}")))?)
 }
 
-/// 同じ名前（大文字小文字を問わない）の行がほかにあれば断る。
+/// 同じ名前（大文字小文字を問わない。ASCII 以外も Rust の小文字で比べる。索引の NOCASE は ASCII だけの守り）の行がほかに
+/// あれば断る。ライセンスは少ないので全部を読んで比べる。
 fn check_name(conn: &Connection, name: &str, except: Option<i64>) -> Result<()> {
-    let mut stmt = conn.prepare_cached("SELECT id FROM licenses WHERE name = ?1 COLLATE NOCASE")?;
-    let other: Option<i64> = stmt.query_row([name], |r| r.get(0)).optional()?;
-    match other {
-        Some(other) if Some(other) != except => Err(CoreError::Conflict(format!(
-            "「{name}」というライセンスがあります"
-        ))),
-        _ => Ok(()),
+    let folded = name.to_lowercase();
+    let mut stmt = conn.prepare_cached("SELECT id, name FROM licenses")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (id, other) = row?;
+        if Some(id) != except && other.to_lowercase() == folded {
+            return Err(CoreError::Conflict(format!(
+                "「{other}」というライセンスがあります"
+            )));
+        }
     }
+    Ok(())
 }
 
 /// 利用者のライセンスを足す（並びの最後）。ID を返す。
@@ -204,8 +218,14 @@ pub fn update(conn: &Connection, id: i64, input: &LicenseInput, now: i64) -> Res
 pub fn delete(conn: &Connection, id: i64) -> Result<i64> {
     editable(conn, id, "消せ")?;
     let used = get(conn, id)?.items;
-    let mut stmt = conn.prepare_cached("DELETE FROM licenses WHERE id = ?1")?;
-    stmt.execute([id])?;
+    // ライセンスのほかに何も入っていなかったアイテムは、クレジットの行ごと消す（行は何か入っているアイテムにだけある）
+    conn.prepare_cached(
+        "DELETE FROM item_credits WHERE license_id = ?1
+            AND author IS NULL AND work IS NULL AND url IS NULL AND credit IS NULL",
+    )?
+    .execute([id])?;
+    conn.prepare_cached("DELETE FROM licenses WHERE id = ?1")?
+        .execute([id])?;
     Ok(used)
 }
 
@@ -263,7 +283,7 @@ mod tests {
         assert_eq!(l.url.as_deref(), Some("https://example.com/terms"));
         assert_eq!(l.note, None);
         assert_eq!(l.builtin, None);
-        assert_eq!(l.pos, 13);
+        assert_eq!(l.pos, 13.0);
         assert_eq!((l.created_at, l.updated_at), (7, 7));
         // 名前は大文字小文字を問わず一意（既定の行とも）
         for name in ["cc by 4.0", "魔王魂 利用規約"] {
@@ -281,7 +301,19 @@ mod tests {
             Err(CoreError::Invalid(_))
         ));
         let other = create(&conn, &input("別の規約"), 8).unwrap();
-        assert_eq!(get(&conn, other).unwrap().pos, 14);
+        assert_eq!(get(&conn, other).unwrap().pos, 14.0);
+        // ASCII 以外の大文字小文字も同じ名前とみなす。引用符・改行は名前に入れない
+        create(&conn, &input("Ça va"), 8).unwrap();
+        assert!(matches!(
+            create(&conn, &input("ça VA"), 8),
+            Err(CoreError::Conflict(_))
+        ));
+        for bad in ["\"規約\"", "“規約”", "規約\n2"] {
+            assert!(
+                matches!(create(&conn, &input(bad), 8), Err(CoreError::Invalid(_))),
+                "{bad}"
+            );
+        }
         // 変える：自分の名前のままは通り、ほかの名前とぶつかれば断る
         let mut changed = input("魔王魂 利用規約");
         changed.attribution = Attribution::Required;
@@ -313,14 +345,15 @@ mod tests {
         .unwrap();
         assert_eq!(get(&conn, id).unwrap().items, 2);
         assert_eq!(delete(&conn, id).unwrap(), 2);
-        let unset: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM item_credits WHERE license_id IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(unset, 2);
+        // 作者のあるアイテム 1 は未設定のライセンスで残り、ライセンスだけだったアイテム 2 は行ごと消える
+        let rows: Vec<(i64, Option<i64>, Option<String>)> = conn
+            .prepare("SELECT item_id, license_id, author FROM item_credits ORDER BY item_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, vec![(1, None, Some("a".into()))]);
         assert!(matches!(get(&conn, id), Err(CoreError::NotFound(_))));
     }
 }

@@ -16,7 +16,7 @@ CREATE TABLE licenses (
   modify       TEXT    NOT NULL CONSTRAINT licenses_modify CHECK (modify IN ('yes','no','unknown')),          -- 改変
   share_alike  INTEGER NOT NULL DEFAULT 0 CONSTRAINT licenses_share_alike CHECK (share_alike IN (0, 1)),    -- 継承（同じ条件で配る）
   note         TEXT,                                   -- 規約の要点など
-  pos          INTEGER NOT NULL,                       -- 並び（既定の行が先）
+  pos          REAL    NOT NULL,                       -- 並び（既定の行が 0〜12 で先。ほかの表と同じく間に挿入できる REAL）
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );

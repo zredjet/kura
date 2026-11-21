@@ -123,7 +123,7 @@ pub fn assemble(nodes: &BTreeMap<i64, Node>, used: &[i64]) -> Assembled {
 }
 
 /// 集めたクレジット（行はライセンスの並び → 鍵の順）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Credits {
     pub lines: Vec<CreditLine>,
     /// 行が使うライセンス（並びの順）。

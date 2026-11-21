@@ -833,3 +833,31 @@ fn credit_fields_parse() {
         })
     );
 }
+
+/// クレジットのフィールドの AST は JSON（スマートの rule_json）で往復し、形は search-query.md §4 のとおり。
+#[test]
+fn credit_fields_round_trip_as_json() {
+    for (input, json) in [
+        (
+            "ライセンス:\"CC BY\"",
+            r#"{"field":"license","op":"has","value":{"name":"CC BY"}}"#,
+        ),
+        (
+            "ライセンス:なし",
+            r#"{"field":"license","op":"has","value":"none"}"#,
+        ),
+        (
+            "表記!=必要",
+            r#"{"field":"attribution","op":"ne","value":"required"}"#,
+        ),
+        (
+            "クレジット=もりの",
+            r#"{"field":"credit","op":"eq","value":"もりの"}"#,
+        ),
+    ] {
+        let expr = ok(input);
+        assert_eq!(serde_json::to_string(&expr).unwrap(), json, "{input}");
+        let back: Expr = serde_json::from_str(json).unwrap();
+        assert_eq!(back, expr, "{input}");
+    }
+}

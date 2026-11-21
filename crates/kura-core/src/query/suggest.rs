@@ -60,13 +60,11 @@ pub fn tag_clause(namespace: &str, name: &str) -> String {
 }
 
 fn quote_if_needed(value: &str) -> String {
-    if value.starts_with('-')
-        || value.chars().any(|c| {
+    // 字句解析は引用符の外で全角の記号・読点を半角に直すので、直したあとの文字で調べる（`（`・`、`・`－`・全角の空白など）
+    if value.chars().next().map(lexer::normalize) == Some('-')
+        || value.chars().map(lexer::normalize).any(|c| {
             c.is_whitespace()
-                || matches!(
-                    c,
-                    '(' | ')' | '|' | '"' | ':' | '：' | '=' | '<' | '>' | '!'
-                )
+                || matches!(c, '(' | ')' | '|' | '"' | ':' | '=' | '<' | '>' | '!' | ',')
         })
     {
         format!("\"{}\"", value.replace('"', ""))
@@ -477,6 +475,30 @@ mod tests {
             got("ライセンス:な"),
             [("ライセンス:なし".to_string(), None)]
         );
+        // 全角のかっこ・読点・空白を含む名前も、字句解析が半角に直すので囲む（選んだ候補が 1 つの条件として読める）
+        for (name, typed) in [
+            ("素材（商用可）", "素材"),
+            ("表記、任意の規約", "表記"),
+            ("別の　規約", "別の"),
+        ] {
+            conn.execute(
+                "INSERT INTO licenses (builtin, name, attribution, commercial, modify, pos, created_at, updated_at)
+                 VALUES (NULL, ?1, 'optional', 'unknown', 'unknown', 20, 0, 0)",
+                [name],
+            )
+            .unwrap();
+            let insert = format!("ライセンス:\"{name}\"");
+            assert_eq!(
+                got(&format!("ライセンス:{typed}")),
+                [(insert.clone(), Some(0))]
+            );
+            let parsed = crate::query::parse(&insert).unwrap();
+            assert!(
+                matches!(parsed.expr, crate::query::ast::Expr::Field(_)),
+                "{insert}: {:?}",
+                parsed.expr
+            );
+        }
         assert!(got("クレジット:").is_empty());
     }
 

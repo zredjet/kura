@@ -1657,16 +1657,26 @@ fn credits_0014_adds_tables_and_keeps_everything_else() {
     assert!(violations(&conn).unwrap().is_empty());
     // 既定の行：鍵と並びと表記義務
     let mut stmt = conn
-        .prepare("SELECT builtin, attribution, commercial, share_alike FROM licenses ORDER BY pos")
+        .prepare(
+            "SELECT builtin, name, ifnull(spdx, '-'), ifnull(url, '-'), attribution, commercial, modify, share_alike,
+                    typeof(pos), pos
+               FROM licenses ORDER BY pos",
+        )
         .unwrap();
     let rows: Vec<String> = stmt
         .query_map([], |r| {
             Ok(format!(
-                "{} {} {} {}",
+                "{} | {} | {} | {} | {} {} {} {} | {} {}",
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, f64>(9)?
             ))
         })
         .unwrap()
@@ -1675,19 +1685,19 @@ fn credits_0014_adds_tables_and_keeps_everything_else() {
     assert_eq!(
         rows,
         vec![
-            "cc0-1.0 none yes 0",
-            "cc-by-4.0 required yes 0",
-            "cc-by-3.0 required yes 0",
-            "cc-by-sa-4.0 required yes 1",
-            "cc-by-sa-3.0 required yes 1",
-            "cc-by-nc-4.0 required no 0",
-            "cc-by-nc-sa-4.0 required no 1",
-            "oga-by-3.0 required yes 0",
-            "ofl-1.1 required yes 1",
-            "mit required yes 0",
-            "apache-2.0 required yes 0",
-            "public-domain none yes 0",
-            "own none yes 0",
+            "cc0-1.0 | CC0 1.0 | CC0-1.0 | https://creativecommons.org/publicdomain/zero/1.0/ | none yes yes 0 | real 0",
+            "cc-by-4.0 | CC BY 4.0 | CC-BY-4.0 | https://creativecommons.org/licenses/by/4.0/ | required yes yes 0 | real 1",
+            "cc-by-3.0 | CC BY 3.0 | CC-BY-3.0 | https://creativecommons.org/licenses/by/3.0/ | required yes yes 0 | real 2",
+            "cc-by-sa-4.0 | CC BY-SA 4.0 | CC-BY-SA-4.0 | https://creativecommons.org/licenses/by-sa/4.0/ | required yes yes 1 | real 3",
+            "cc-by-sa-3.0 | CC BY-SA 3.0 | CC-BY-SA-3.0 | https://creativecommons.org/licenses/by-sa/3.0/ | required yes yes 1 | real 4",
+            "cc-by-nc-4.0 | CC BY-NC 4.0 | CC-BY-NC-4.0 | https://creativecommons.org/licenses/by-nc/4.0/ | required no yes 0 | real 5",
+            "cc-by-nc-sa-4.0 | CC BY-NC-SA 4.0 | CC-BY-NC-SA-4.0 | https://creativecommons.org/licenses/by-nc-sa/4.0/ | required no yes 1 | real 6",
+            "oga-by-3.0 | OGA-BY 3.0 | - | https://static.opengameart.org/OGA-BY-3.0.txt | required yes yes 0 | real 7",
+            "ofl-1.1 | SIL OFL 1.1 | OFL-1.1 | https://openfontlicense.org/open-font-license-official-text/ | required yes yes 1 | real 8",
+            "mit | MIT | MIT | https://opensource.org/license/mit | required yes yes 0 | real 9",
+            "apache-2.0 | Apache 2.0 | Apache-2.0 | https://www.apache.org/licenses/LICENSE-2.0 | required yes yes 0 | real 10",
+            "public-domain | パブリックドメイン | - | - | none yes yes 0 | real 11",
+            "own | 自作 | - | - | none yes yes 0 | real 12",
         ]
     );
     let mut stmt = conn
