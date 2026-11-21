@@ -118,14 +118,12 @@ export function pickProjectFolder(title: string): Promise<string | null> {
 export function pickCreditsPath(
   title: string,
   defaultPath: string,
-  markdown: boolean,
+  filter: { name: string; ext: string },
 ): Promise<string | null> {
   return save({
     title,
     defaultPath,
     canCreateDirectories: true,
-    filters: [
-      markdown ? { name: 'Markdown', extensions: ['md'] } : { name: 'Text', extensions: ['txt'] },
-    ],
+    filters: [{ name: filter.name, extensions: [filter.ext] }],
   });
 }

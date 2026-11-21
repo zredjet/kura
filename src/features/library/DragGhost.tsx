@@ -1,4 +1,5 @@
 import { ja } from '../../i18n/ja';
+import { useViewStore } from '../../stores/viewStore';
 import { effectiveTarget, useProjectStore } from '../projects/projectStore';
 import { useDragStore } from './dragState';
 import styles from './DragGhost.module.css';
@@ -14,11 +15,13 @@ export function DragGhost() {
   const label = useDragStore((s) => s.label);
   const target = useDragStore((s) => s.target);
   const project = useProjectStore((s) => effectiveTarget(s.list, s.target));
+  // ゴミ箱の中は持ち出せない（ドラッグアウトが断る）ので添えない
+  const trash = useViewStore((s) => s.view.kind === 'trash');
   if (!payload) {
     return null;
   }
   const hint =
-    payload.kind === 'entries' && target === null
+    payload.kind === 'entries' && target === null && !trash
       ? project
         ? ja.dragOut.hint(project.name)
         : ja.dragOut.hintPlain

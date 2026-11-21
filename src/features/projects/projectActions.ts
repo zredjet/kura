@@ -1,5 +1,5 @@
 import type { MenuEntry } from '../../components/Menu/menuStore';
-import { askConfirm } from '../../components/Overlay/overlayStore';
+import { askConfirm, askText } from '../../components/Overlay/overlayStore';
 import { ja } from '../../i18n/ja';
 import { pickProjectFolder } from '../../ipc/dialogs';
 import { setDragOutTarget } from '../../ipc/dragout';
@@ -13,6 +13,7 @@ import {
   scanProjects,
 } from '../../ipc/projects';
 import { notify } from '../../stores/noticeStore';
+import { bumpRevision } from '../../stores/revisionStore';
 import { useViewStore } from '../../stores/viewStore';
 import { openCreditsSheet } from '../credits/creditsSheetStore';
 import { openPresetSheet } from './presetSheetStore';
@@ -24,8 +25,10 @@ function fail(error: unknown): void {
   notify(ja.common.failed(error instanceof Error ? error.message : String(error)));
 }
 
+/** プロジェクトと持ち出し先を読み直し、インスペクタ（使っているプロジェクト）も読み直す。 */
 async function reload(): Promise<void> {
   await useProjectStore.getState().load();
+  bumpRevision();
 }
 
 /** フォルダを選んでプロジェクトとして登録し、その一覧を開く（照らし直しは Rust が積む）。 */
@@ -52,6 +55,17 @@ export async function renameProjectTo(id: number, name: string): Promise<void> {
   } catch (error) {
     fail(error);
   }
+}
+
+/** 名前を変えるシートを出して変える（見出しの「…」。サイドバーを隠していても使える）。 */
+export async function renameProjectWithPrompt(project: ProjectDto): Promise<void> {
+  const name = await askText({
+    title: t.renameTitle,
+    label: ja.sidebar.projectName,
+    initial: project.name,
+    confirm: t.rename,
+  });
+  if (name !== null) await renameProjectTo(project.id, name);
 }
 
 /** 場所を選び直す（使った記録は残し、照らし直す）。 */
@@ -116,13 +130,18 @@ export function revealProject(project: ProjectDto): void {
 
 /** プロジェクトの行・一覧の見出しの「…」の項目。 */
 export function projectMenu(project: ProjectDto, rename: () => void): MenuEntry[] {
-  const chosen = useProjectStore.getState().target?.chosen === project.id;
+  const target = useProjectStore.getState().target;
+  const chosen = target?.chosen === project.id;
+  // 選んでいないが登録が 1 つなので持ち出し先（外せない。ADR-207 (1)・段 6 の検証の直し）
+  const implicit = !chosen && target?.effective === project.id;
   return [
-    {
-      label: chosen ? t.unsetTarget : t.setTarget,
-      checked: chosen,
-      onSelect: () => void toggleDragOutTarget(project),
-    },
+    implicit
+      ? { label: t.implicitTarget, checked: true, disabled: true, onSelect: () => undefined }
+      : {
+          label: chosen ? t.unsetTarget : t.setTarget,
+          checked: chosen,
+          onSelect: () => void toggleDragOutTarget(project),
+        },
     { label: t.settings, onSelect: () => openPresetSheet(project.id) },
     {
       label: t.credits,

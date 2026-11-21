@@ -15,7 +15,7 @@ import { useSfxOnSelect } from '../asset/useSfxOnSelect';
 import { ImportProgress } from '../import/ImportProgress';
 import { MiniPlayer, useMiniPlayerVisible } from '../player/MiniPlayer';
 import { pickAndImport } from '../import/useFileDrop';
-import { projectMenu } from '../projects/projectActions';
+import { projectMenu, renameProjectWithPrompt } from '../projects/projectActions';
 import { useProjectStore } from '../projects/projectStore';
 import { joinClauses } from '../search/clauses';
 import { emptyTrashWithConfirm } from './actions';
@@ -130,7 +130,9 @@ export function LibraryView() {
         title={viewTitle(view, folders, smartFolders, projects)}
         subtitle={subtitle}
         parentTitle={
-          view.kind === 'unit' ? viewTitle(parent ?? { kind: 'all' }, folders, smartFolders) : null
+          view.kind === 'unit'
+            ? viewTitle(parent ?? { kind: 'all' }, folders, smartFolders, projects)
+            : null
         }
         onBack={back}
         onImport={() => {
@@ -161,9 +163,7 @@ export function LibraryView() {
                   openMenuBelow(
                     anchor,
                     ja.projects.label(viewProject.name),
-                    projectMenu(viewProject, () =>
-                      useProjectStore.getState().setRenaming(viewProject.id),
-                    ),
+                    projectMenu(viewProject, () => void renameProjectWithPrompt(viewProject)),
                   ),
               }
             : null

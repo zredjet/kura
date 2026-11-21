@@ -117,7 +117,14 @@ export function ItemInspector({
 
       <AssetSection data={assetData} item={item} audition={audition} />
 
-      {!trashed && <CreditSection itemIds={[id]} unitIds={[]} source={detail.sourceUrl ?? null} />}
+      {!trashed && (
+        <CreditSection
+          itemIds={[id]}
+          unitIds={[]}
+          source={detail.sourceUrl ?? null}
+          navigable={editable}
+        />
+      )}
 
       {trashed && (
         <section className={styles.trashed}>

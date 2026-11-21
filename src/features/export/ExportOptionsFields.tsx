@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 
 import { Segmented } from '../../components/Segmented/Segmented';
 import { Select, type SelectOption } from '../../components/Select/Select';
@@ -51,80 +51,107 @@ export function targetOptions(
   ];
 }
 
+/** 見本を作り直すまで待つ長さ（打っている途中で見本を作り直さない）。 */
+const PREVIEW_DELAY_MS = 300;
+
 /**
  * 名前の規則（テンプレート・書き方・ASCII）と形式（画像・音声）と JSON の欄（書き出しのシートと持ち出しの設定で共有。M15
- * 段 6）。`items` があれば下に名前の見本（先頭の数件。形式を変えるものは印）を出し、テンプレートが読めなければ理由を出す。
+ * 段 6）。値は打つたびに渡し（すぐ書き出し・保存しても打った値が入る。変換中は確定してから）、見本は少し待ってから作り直す。
+ * `entries` があれば下に名前の見本（書き出しのジョブと同じ並び・番号・ユニットのフォルダ。先頭の数件と件数。形式を変える
+ * ものは印）を出し、テンプレートが読めなければ理由を出す。
  */
 export function ExportOptionsFields({
   value,
   onChange,
   formats,
-  items,
+  entries,
+  onTotal,
   manifest = true,
 }: {
   value: ExportPresetDto;
   onChange: (value: ExportPresetDto) => void;
   formats: ExportFormatsDto | null;
-  /** 名前の見本に使うアイテム（空なら見本を出さない）。 */
-  items: readonly number[];
+  /** 名前の見本に使う一覧の ID（ユニットは印付き。空なら見本を出さない）。 */
+  entries: readonly number[];
+  /** 書き出す件数が分かったら知らせる（見本と同じ数え方）。 */
+  onTotal?: (total: number) => void;
   /** JSON を添えるかの欄を出すか。 */
   manifest?: boolean;
 }) {
   const templateId = useId();
   const [template, setTemplate] = useState(value.name.template ?? '');
-  const [preview, setPreview] = useState<PreviewNameDto[] | null>(null);
+  const [preview, setPreview] = useState<{ names: PreviewNameDto[]; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  // テンプレートは打ち終わるのを少し待って渡す（打っている途中で見本を作り直さない）
+  const composing = useRef(false);
+  const onTotalRef = useRef(onTotal);
   useEffect(() => {
-    const next = template.trim() === '' ? null : template;
-    if (next === value.name.template) return;
-    const timer = setTimeout(
-      () => onChange({ ...value, name: { ...value.name, template: next } }),
-      300,
-    );
-    return () => clearTimeout(timer);
-  }, [template, value, onChange]);
+    onTotalRef.current = onTotal;
+  });
 
-  const key = JSON.stringify([value, items.slice(0, 50)]);
+  const commitTemplate = (text: string) => {
+    const next = text.trim() === '' ? null : text;
+    if (next !== value.name.template)
+      onChange({ ...value, name: { ...value.name, template: next } });
+  };
+
+  const key = JSON.stringify([value, entries]);
   useEffect(() => {
-    // 見本のアイテムがなければ見本を出さない（下で欄ごと出さない）
-    if (items.length === 0) return;
+    // 見本の対象がなければ見本を出さない（下で欄ごと出さない）
+    if (entries.length === 0) return;
     let stale = false;
-    previewExportNames(items.slice(0, 50), { ...value, project: null })
-      .then((names) => {
-        if (stale) return;
-        setPreview(names);
-        setError(null);
-      })
-      .catch((e: unknown) => {
-        if (stale) return;
-        setPreview(null);
-        setError(e instanceof Error ? e.message : String(e));
-      });
+    const options = JSON.parse(key) as [ExportPresetDto, number[]];
+    const timer = setTimeout(() => {
+      previewExportNames(options[1], { ...options[0], project: null })
+        .then((p) => {
+          if (stale) return;
+          setPreview(p);
+          setError(null);
+          onTotalRef.current?.(p.total);
+        })
+        .catch((e: unknown) => {
+          if (stale) return;
+          setPreview(null);
+          setError(e instanceof Error ? e.message : String(e));
+        });
+    }, PREVIEW_DELAY_MS);
     return () => {
       stale = true;
+      clearTimeout(timer);
     };
-    // key に値と見本のアイテムをまとめる
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
+  }, [key, entries.length]);
 
   return (
     <>
       <div className={styles.group}>
-        <label className={styles.field} htmlFor={templateId}>
-          <span className={styles.rowLabel}>{t.template}</span>
+        <div className={styles.field}>
+          <label className={styles.rowLabel} htmlFor={templateId}>
+            {t.template}
+          </label>
           <input
             id={templateId}
+            aria-describedby={`${templateId}-hint`}
             className={styles.input}
             value={template}
             placeholder={t.templatePlaceholder}
             spellCheck={false}
             autoComplete="off"
-            onChange={(e) => setTemplate(e.target.value)}
+            onChange={(e) => {
+              setTemplate(e.target.value);
+              // 変換中は確定するまで渡さない（確定前の文字で見本を作らない）
+              if (!composing.current) commitTemplate(e.target.value);
+            }}
+            onCompositionStart={() => {
+              composing.current = true;
+            }}
+            onCompositionEnd={(e) => {
+              composing.current = false;
+              commitTemplate(e.currentTarget.value);
+            }}
           />
-          <span className={styles.hint}>{t.tokens}</span>
-        </label>
+          <span id={`${templateId}-hint`} className={styles.hint}>
+            {t.tokens}
+          </span>
+        </div>
         <div className={styles.row}>
           <span className={styles.rowLabel}>{t.style}</span>
           <Segmented
@@ -171,24 +198,24 @@ export function ExportOptionsFields({
           </label>
         )}
       </div>
-      {items.length > 0 && (
+      {entries.length > 0 && (
         <div className={styles.group}>
           <span className={styles.rowLabel}>{t.preview}</span>
           {error ? (
             <p className={styles.error}>{error}</p>
-          ) : preview && preview.length > 0 ? (
+          ) : preview && preview.names.length > 0 ? (
             <ul className={styles.preview}>
-              {preview.slice(0, PREVIEW_ROWS).map((p) => (
-                <li key={p.itemId}>
+              {preview.names.slice(0, PREVIEW_ROWS).map((p, i) => (
+                <li key={`${p.itemId}-${i}`}>
                   <span className={styles.previewName}>{p.name}</span>
                   {p.convert && (
                     <span className={styles.previewConvert}>{t.convertTo(p.convert)}</span>
                   )}
                 </li>
               ))}
-              {items.length > PREVIEW_ROWS && (
+              {preview.total > PREVIEW_ROWS && (
                 <li className={styles.previewConvert}>
-                  {t.previewMore(formatCount(items.length - PREVIEW_ROWS))}
+                  {t.previewMore(formatCount(preview.total - PREVIEW_ROWS))}
                 </li>
               )}
             </ul>

@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 
 import { Button } from '../../components/Button/Button';
 import { Dialog } from '../../components/Dialog/Dialog';
@@ -13,7 +13,6 @@ import {
 import { type ProjectDto, projectForDest, projectSettings } from '../../ipc/projects';
 import { formatCount } from '../../lib/format';
 import { notify } from '../../stores/noticeStore';
-import { expandEntries } from '../library/actions';
 import styles from './Export.module.css';
 import { ExportOptionsFields } from './ExportOptionsFields';
 import {
@@ -48,40 +47,49 @@ function Sheet({ entries }: { entries: number[] }) {
   // 既定を入れ替えたら欄を作り直す（テンプレートの入力を合わせる）
   const [presetKey, setPresetKey] = useState(0);
   const [formats, setFormats] = useState<ExportFormatsDto | null>(null);
-  const [items, setItems] = useState<number[]>([]);
+  const [total, setTotal] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  // 選び直しの番号（古い照会の答えで新しい書き出し先を上書きしない）
+  const picking = useRef(0);
 
   useEffect(() => {
     exportFormats()
       .then(setFormats)
       .catch((e: unknown) => console.warn('書き出しの形式を読めませんでした', e));
-    expandEntries(entries)
-      .then(setItems)
-      .catch(() => setItems([]));
-  }, [entries]);
+  }, []);
 
+  /**
+   * 書き出し先を選ぶ。照会し終えてから書き出し先・プロジェクト・名前と形式を一度にそろえる。既定を入れ替えるのは、
+   * プロジェクトが変わったとき（入る・出る・別のプロジェクトへ）だけ（同じプロジェクトの中・外同士なら、シートで変えた値を
+   * 残す。段 6 の検証の直し・利用者の決定）。照会に失敗したらプロジェクトの外として扱う。
+   */
   const choose = async () => {
     const picked = await pickExportFolder(ja.exporting.pickTitle);
     if (!picked) return;
-    setDest(picked);
+    const turn = ++picking.current;
+    let found: ProjectDto | null;
+    let nextPreset: ExportPresetDto | null = null;
     try {
-      const found = await projectForDest(picked);
-      if (found) {
-        setPreset(await projectSettings(found.id));
-        setPresetKey((k) => k + 1);
-      } else if (project) {
-        // プロジェクトの外へ選び直したら、前回の名前と形式に戻す
-        setPreset(lastPreset());
-        setPresetKey((k) => k + 1);
-      }
-      setProject(found);
+      found = await projectForDest(picked);
+      if (found && found.id !== project?.id) nextPreset = await projectSettings(found.id);
     } catch (e) {
       notify(messageOf(e));
+      found = null;
+      nextPreset = null;
+    }
+    if (turn !== picking.current) return;
+    if (!found && project) nextPreset = lastPreset();
+    setDest(picked);
+    setProject(found);
+    if (nextPreset) {
+      setPreset(nextPreset);
+      setPresetKey((k) => k + 1);
     }
   };
 
   const start = async () => {
     if (!dest) return;
+    if (busy) return;
     setBusy(true);
     try {
       await startExport(dest, entries, { ...preset, project: project?.id ?? null });
@@ -99,7 +107,7 @@ function Sheet({ entries }: { entries: number[] }) {
         <h2 id={titleId} className={styles.title}>
           {t.title}
         </h2>
-        <p className={styles.sub}>{t.count(formatCount(items.length || entries.length))}</p>
+        <p className={styles.sub}>{t.count(formatCount(total ?? entries.length))}</p>
       </div>
       <div className={styles.body}>
         <div className={styles.group}>
@@ -117,7 +125,8 @@ function Sheet({ entries }: { entries: number[] }) {
           value={preset}
           onChange={setPreset}
           formats={formats}
-          items={items}
+          entries={entries}
+          onTotal={setTotal}
         />
       </div>
       <div className={styles.actions}>

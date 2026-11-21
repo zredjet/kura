@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-import type { ExportPresetDto } from '../../ipc/export';
+import type { ExportPresetDto, FormatTargetDto } from '../../ipc/export';
 
 /** 書き出しのシート（選んだ一覧の ID。M15 段 6）。 */
 interface ExportSheetState {
@@ -30,23 +30,41 @@ export const M9_PRESET: ExportPresetDto = {
 /** 前回の書き出しの名前と形式を覚える鍵（表示の設定と同じ軽いもの。プロジェクトの既定は覚えない）。 */
 const LAST_KEY = 'kura.export.lastPreset';
 
+const STYLES = ['keep', 'snake', 'kebab', 'pascal', 'camel'];
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** 形式の選び方として読めるか。 */
+function isTarget(v: unknown): v is FormatTargetDto {
+  if (!isRecord(v)) return false;
+  if (v.type === 'original' || v.type === 'playable') return true;
+  return v.type === 'to' && typeof v.format === 'string' && v.format !== '';
+}
+
+/** 覚えた値として読めるか（型の違う値で画面が落ちないように、項目ごとに確かめる）。 */
+export function isPreset(v: unknown): v is ExportPresetDto {
+  if (!isRecord(v) || !isRecord(v.name)) return false;
+  const { template, style, ascii } = v.name;
+  return (
+    (template === null || typeof template === 'string') &&
+    typeof style === 'string' &&
+    STYLES.includes(style) &&
+    typeof ascii === 'boolean' &&
+    isTarget(v.image) &&
+    isTarget(v.audio) &&
+    typeof v.manifest === 'boolean'
+  );
+}
+
 /** 前回の書き出しの名前と形式（なければ・読めなければ M9）。 */
 export function lastPreset(): ExportPresetDto {
   try {
     const raw = localStorage.getItem(LAST_KEY);
     if (!raw) return M9_PRESET;
-    const parsed = JSON.parse(raw) as Partial<ExportPresetDto>;
-    if (
-      !parsed.name ||
-      typeof parsed.name.style !== 'string' ||
-      typeof parsed.name.ascii !== 'boolean' ||
-      !parsed.image ||
-      !parsed.audio ||
-      typeof parsed.manifest !== 'boolean'
-    ) {
-      return M9_PRESET;
-    }
-    return parsed as ExportPresetDto;
+    const parsed: unknown = JSON.parse(raw);
+    return isPreset(parsed) ? parsed : M9_PRESET;
   } catch {
     return M9_PRESET;
   }

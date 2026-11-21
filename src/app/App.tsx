@@ -35,6 +35,8 @@ import { closeExportSheet } from '../features/export/exportSheetStore';
 import { PresetSheet } from '../features/projects/PresetSheet';
 import { closePresetSheet } from '../features/projects/presetSheetStore';
 import { useProjectStore } from '../features/projects/projectStore';
+import { useLicenseStore } from '../features/credits/licenseStore';
+import { bumpRevision } from '../stores/revisionStore';
 import { closeResult } from '../features/recipes/resultStore';
 import { MergeSheet } from '../features/recipes/MergeSheet';
 import { RecipeView } from '../features/recipes/RecipeView';
@@ -125,10 +127,14 @@ function LibraryScreen() {
     if (libraryPath) void useRecipeStore.getState().load();
     // プロジェクトと持ち出し先もライブラリごと（M15 段 6）。前のライブラリのシートは閉じる
     useProjectStore.getState().clear();
+    useLicenseStore.getState().clear();
     closePresetSheet();
     closeCreditsSheet();
     closeExportSheet();
-    if (libraryPath) void useProjectStore.getState().load();
+    if (libraryPath) {
+      void useProjectStore.getState().load();
+      void useLicenseStore.getState().load();
+    }
   }, [libraryPath]);
   // 照らし直しが終わったら、プロジェクトの件数・見つからない印・照らした時刻を読み直す（使っている素材の一覧も）
   useEffect(
@@ -138,6 +144,8 @@ function LibraryScreen() {
           return;
         }
         void useProjectStore.getState().load();
+        // インスペクタの「使っているプロジェクト」も読み直す
+        bumpRevision();
         if (useViewStore.getState().view.kind === 'project') {
           void useLibraryStore.getState().loadList();
         }

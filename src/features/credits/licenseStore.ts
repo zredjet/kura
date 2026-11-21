@@ -12,6 +12,8 @@ interface LicenseState {
 
 let loading: Promise<void> | null = null;
 let again = false;
+/** ライブラリの世代（clear で進める。前のライブラリの読み込みの答えを捨てる）。 */
+let generation = 0;
 
 export const useLicenseStore = create<LicenseState>((set) => ({
   list: [],
@@ -24,7 +26,9 @@ export const useLicenseStore = create<LicenseState>((set) => ({
       try {
         do {
           again = false;
-          set({ list: await listLicenses() });
+          const gen = generation;
+          const list = await listLicenses();
+          if (gen === generation) set({ list });
         } while (again);
       } catch {
         // 読めなければ前の表のまま（ライブラリを閉じた直後など）
@@ -34,5 +38,8 @@ export const useLicenseStore = create<LicenseState>((set) => ({
     })();
     return loading;
   },
-  clear: () => set({ list: [] }),
+  clear: () => {
+    generation += 1;
+    set({ list: [] });
+  },
 }));

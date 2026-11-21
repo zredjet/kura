@@ -130,7 +130,7 @@
 
 .text {
   margin: 0;
-  max-height: 280px;
+  height: 280px;
   overflow: auto;
   padding: var(--space-2-5) var(--space-3);
   border-radius: var(--radius-md);
@@ -145,9 +145,7 @@
 }
 
 .stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-3);
+  margin: 0;
   font-size: var(--text-sm);
   color: var(--text-tertiary);
 }

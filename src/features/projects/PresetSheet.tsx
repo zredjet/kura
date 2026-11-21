@@ -42,7 +42,7 @@ function Sheet({ id }: { id: number }) {
       .then(setFormats)
       .catch((e: unknown) => console.warn('書き出しの形式を読めませんでした', e));
     projectItems(id)
-      .then((ids) => setItems(ids.slice(0, 50)))
+      .then(setItems)
       .catch(() => setItems([]));
   }, [id]);
 
@@ -73,7 +73,7 @@ function Sheet({ id }: { id: number }) {
             value={preset}
             onChange={setPreset}
             formats={formats}
-            items={items}
+            entries={items}
           />
         )}
       </div>

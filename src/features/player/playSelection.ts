@@ -2,6 +2,7 @@ import { useLibraryStore } from '../../stores/libraryStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import { viewTitle } from '../library/viewTitle';
+import { useProjectStore } from '../projects/projectStore';
 import { playEntries } from './playerActions';
 
 /** 選んでいるもの（一覧の並び順）を再生キューにして、シアターで再生する。 */
@@ -16,5 +17,8 @@ export function playSelection(
   const placed = new Set(inList);
   const ordered = [...inList, ...entries.filter((id) => !placed.has(id))];
   const { folders, smartFolders } = useSidebarStore.getState();
-  void playEntries(ordered, viewTitle(view.view, folders, smartFolders));
+  void playEntries(
+    ordered,
+    viewTitle(view.view, folders, smartFolders, useProjectStore.getState().list),
+  );
 }

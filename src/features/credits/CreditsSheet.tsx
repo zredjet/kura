@@ -115,7 +115,11 @@ function Sheet({ scope, name }: { scope: CreditsScopeDto; name: string | null })
   const save = async () => {
     const markdown = options.format === 'markdown';
     const file = markdown ? 'CREDITS.md' : 'CREDITS.txt';
-    const path = await pickCreditsPath(t.saveTitle, root ? `${root}/${file}` : file, markdown);
+    const path = await pickCreditsPath(
+      t.saveTitle,
+      root ? `${root}/${file}` : file,
+      markdown ? { name: t.filterMarkdown, ext: 'md' } : { name: t.filterText, ext: 'txt' },
+    );
     if (!path) return;
     try {
       await saveCredits(path, scope, options);
@@ -183,13 +187,19 @@ function Sheet({ scope, name }: { scope: CreditsScopeDto; name: string | null })
           <p className={styles.error}>{error}</p>
         ) : result ? (
           <>
-            <div className={styles.stats} aria-live="polite">
-              <span>{t.summary(formatCount(result.lines))}</span>
-              {result.warnings > 0 && (
-                <span className={styles.warn}>{t.warnings(formatCount(result.warnings))}</span>
-              )}
-              {omitted > 0 && <span>{t.omitted(formatCount(omitted))}</span>}
-            </div>
+            <p className={styles.stats} aria-live="polite">
+              {[
+                <span key="lines">{t.summary(formatCount(result.lines))}</span>,
+                result.warnings > 0 ? (
+                  <span key="warn" className={styles.warn}>
+                    {t.warnings(formatCount(result.warnings))}
+                  </span>
+                ) : null,
+                omitted > 0 ? <span key="omit">{t.omitted(formatCount(omitted))}</span> : null,
+              ]
+                .filter(Boolean)
+                .flatMap((part, k) => (k === 0 ? [part] : [' · ', part]))}
+            </p>
             <pre className={styles.text}>{result.text}</pre>
           </>
         ) : (

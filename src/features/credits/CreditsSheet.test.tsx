@@ -63,6 +63,10 @@ describe('クレジットの一覧のシート', () => {
     expect(renderCredits).toHaveBeenCalledWith({ type: 'project', id: 5 }, DEFAULT_CREDITS_RENDER);
     expect(screen.getByText(t.warnings('1'))).toBeInTheDocument();
     expect(screen.getByText(t.omitted('1'))).toBeInTheDocument();
+    // 数の行は「 · 」で区切る（design.md §3.1）
+    expect(screen.getByText(t.summary('2')).parentElement?.textContent).toBe(
+      `${t.summary('2')} · ${t.warnings('1')} · ${t.omitted('1')}`,
+    );
     fireEvent.click(screen.getByRole('button', { name: t.langs.en }));
     expect(await screen.findByText(/# Credits/)).toBeInTheDocument();
     expect(JSON.parse(localStorage.getItem('kura.credits.options') ?? '{}')).toMatchObject({
@@ -76,7 +80,10 @@ describe('クレジットの一覧のシート', () => {
     await screen.findByText(/# クレジット/);
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() =>
-      expect(pickCreditsPath).toHaveBeenCalledWith(t.saveTitle, '/Users/me/game/CREDITS.md', true),
+      expect(pickCreditsPath).toHaveBeenCalledWith(t.saveTitle, '/Users/me/game/CREDITS.md', {
+        name: t.filterMarkdown,
+        ext: 'md',
+      }),
     );
     await waitFor(() =>
       expect(saveCredits).toHaveBeenCalledWith(

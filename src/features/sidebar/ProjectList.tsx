@@ -78,12 +78,14 @@ export function ProjectList({ current }: { current: ListView | null }) {
           title={ja.sidebar.addProject}
           onClick={() => void addProjectAction()}
         >
-          <PlusIcon size={14} strokeWidth={2.2} />
+          <PlusIcon size={14} strokeWidth={2} />
         </button>
       </div>
       {projects.map((project) => {
         const selected = current?.kind === 'project' && current.id === project.id;
         const isTarget = target?.effective === project.id;
+        // 選んでいないが登録が 1 つなので持ち出し先（ADR-207 (1)）
+        const implicit = isTarget && target?.chosen !== project.id;
         if (renaming === project.id) {
           return (
             <div key={project.id} className={styles.row}>
@@ -132,7 +134,13 @@ export function ProjectList({ current }: { current: ListView | null }) {
               </span>
             )}
             {isTarget && (
-              <span className={styles.rowMark} data-kind="target" role="img" aria-label={t.target}>
+              <span
+                className={styles.rowMark}
+                data-kind="target"
+                role="img"
+                aria-label={implicit ? t.implicitTarget : t.target}
+                title={implicit ? t.implicitTarget : t.target}
+              >
                 <ExportIcon size={13} strokeWidth={2} />
               </span>
             )}

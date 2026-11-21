@@ -1,4 +1,5 @@
 import { useEffect, useId, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 import { Button } from '../../components/Button/Button';
 import { Dialog } from '../../components/Dialog/Dialog';
@@ -100,10 +101,18 @@ export function LicensesTab() {
               </span>
               {license.builtin === null && (
                 <span className={styles.licenseButtons}>
-                  <Button size="sm" onClick={() => setEditing(license)}>
+                  <Button
+                    size="sm"
+                    aria-label={t.editLabel(license.name)}
+                    onClick={() => setEditing(license)}
+                  >
                     {t.edit}
                   </Button>
-                  <Button size="sm" onClick={() => void remove(license)}>
+                  <Button
+                    size="sm"
+                    aria-label={t.deleteLabel(license.name)}
+                    onClick={() => void remove(license)}
+                  >
                     {t.delete}
                   </Button>
                 </span>
@@ -117,12 +126,15 @@ export function LicensesTab() {
           {t.add}
         </Button>
       </div>
-      {editing !== null && (
-        <LicenseSheet
-          license={editing === 'new' ? null : editing}
-          onClose={() => setEditing(null)}
-        />
-      )}
+      {/* 設定のシートのガラス（backdrop-filter）の外に出す（暗幕が窓全体にかかるように） */}
+      {editing !== null &&
+        createPortal(
+          <LicenseSheet
+            license={editing === 'new' ? null : editing}
+            onClose={() => setEditing(null)}
+          />,
+          document.body,
+        )}
     </>
   );
 }
@@ -204,7 +216,7 @@ function LicenseSheet({ license, onClose }: { license: LicenseDto | null; onClos
             <Segmented<AttributionDto>
               label={t.attribution}
               value={input.attribution}
-              options={ATTRIBUTIONS.map((a) => ({ value: a, label: ja.credit.attribution[a] }))}
+              options={ATTRIBUTIONS.map((a) => ({ value: a, label: t.attributionShort[a] }))}
               onChange={(attribution) => setInput({ ...input, attribution })}
             />
           </div>

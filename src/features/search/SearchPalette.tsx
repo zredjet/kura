@@ -19,6 +19,7 @@ import { type QueryCheckDto, querySuggest, queryParse, type SuggestionDto } from
 import { formatCount } from '../../lib/format';
 import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
+import { useProjectStore } from '../projects/projectStore';
 import { useViewStore } from '../../stores/viewStore';
 import { viewTitle } from '../library/viewTitle';
 import { startPlayback } from '../player/playerActions';
@@ -205,7 +206,7 @@ function PaletteBody() {
         collapseUnits,
         utcOffsetMinutes: utcOffsetMinutes(),
       },
-      viewTitle(scope, folders, smartFolders),
+      viewTitle(scope, folders, smartFolders, useProjectStore.getState().list),
       { shuffle: true },
     );
   };

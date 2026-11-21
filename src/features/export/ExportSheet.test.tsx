@@ -9,6 +9,7 @@ import { ExportSheet } from './ExportSheet';
 import { targetOf, targetOptions, targetValue } from './ExportOptionsFields';
 import {
   closeExportSheet,
+  isPreset,
   lastPreset,
   M9_PRESET,
   openExportSheet,
@@ -43,9 +44,10 @@ vi.mock('../../ipc/dialogs', async (importOriginal) => ({
 vi.mock('../../ipc/export', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../ipc/export')>()),
   exportFormats: vi.fn(async () => ({ image: ['png', 'webp'], audio: ['wav', 'ogg'] })),
-  previewExportNames: vi.fn(async (items: number[]) =>
-    items.map((id) => ({ itemId: id, name: `item_${id}.png`, convert: null })),
-  ),
+  previewExportNames: vi.fn(async (entries: number[]) => ({
+    names: entries.map((id) => ({ itemId: id, name: `item_${id}.png`, convert: null })),
+    total: entries.length,
+  })),
   startExport: vi.fn(async () => 1),
 }));
 vi.mock('../../ipc/projects', async (importOriginal) => ({
@@ -53,7 +55,6 @@ vi.mock('../../ipc/projects', async (importOriginal) => ({
   projectForDest: vi.fn(async () => null),
   projectSettings: vi.fn(async () => godot),
 }));
-vi.mock('../library/actions', () => ({ expandEntries: vi.fn(async (e: number[]) => e) }));
 
 beforeEach(() => {
   localStorage.clear();
@@ -83,6 +84,11 @@ describe('前回の名前と形式', () => {
     expect(lastPreset()).toEqual(godot);
     localStorage.setItem('kura.export.lastPreset', '{"name":1}');
     expect(lastPreset()).toEqual(M9_PRESET);
+    // 項目ごとに確かめる（型の違う値・知らない書き方・形式の形の違い）
+    expect(isPreset({ ...godot, name: { ...godot.name, style: 'upper' } })).toBe(false);
+    expect(isPreset({ ...godot, image: { type: 'to' } })).toBe(false);
+    expect(isPreset({ ...godot, name: { ...godot.name, template: 3 } })).toBe(false);
+    expect(isPreset(godot)).toBe(true);
   });
 });
 
@@ -131,6 +137,58 @@ describe('書き出しのシート', () => {
       }),
     );
     expect(lastPreset()).toEqual(M9_PRESET);
+  });
+
+  it('テンプレートは打ってすぐ書き出しても入る', async () => {
+    vi.mocked(pickExportFolder).mockResolvedValueOnce('/Users/me/out');
+    openExportSheet([1]);
+    render(<ExportSheet />);
+    fireEvent.click(screen.getByRole('button', { name: ja.exportSheet.choose }));
+    await screen.findByText('/Users/me/out');
+    fireEvent.change(screen.getByRole('textbox', { name: ja.exportOptions.template }), {
+      target: { value: '{番号}' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: ja.exportSheet.start }));
+    await waitFor(() =>
+      expect(startExport).toHaveBeenCalledWith('/Users/me/out', [1], {
+        ...M9_PRESET,
+        name: { ...M9_PRESET.name, template: '{番号}' },
+        project: null,
+      }),
+    );
+  });
+
+  it('同じプロジェクトの中で選び直しても、シートで変えた値は残す', async () => {
+    vi.mocked(pickExportFolder)
+      .mockResolvedValueOnce('/Users/me/game/art')
+      .mockResolvedValueOnce('/Users/me/game/sfx');
+    vi.mocked(projectForDest).mockResolvedValue(project);
+    vi.mocked(projectSettings).mockClear();
+    openExportSheet([3]);
+    render(<ExportSheet />);
+    fireEvent.click(screen.getByRole('button', { name: ja.exportSheet.choose }));
+    await screen.findByText(ja.exportSheet.projectHint('My Game'));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'snake_case' })).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      ),
+    );
+    fireEvent.click(screen.getByRole('button', { name: ja.exportOptions.styles.kebab }));
+    fireEvent.click(screen.getByRole('button', { name: ja.exportSheet.choose }));
+    await screen.findByText('/Users/me/game/sfx');
+    expect(projectSettings).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: ja.exportOptions.styles.kebab })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+  });
+
+  it('見本の件数はジョブと同じ数え方（ユニットのメンバーを含む）', async () => {
+    vi.mocked(previewExportNames).mockResolvedValueOnce({ names: [], total: 12 });
+    openExportSheet([1, 2]);
+    render(<ExportSheet />);
+    expect(await screen.findByText(ja.exportSheet.count('12'))).toBeInTheDocument();
   });
 
   it('テンプレートが読めなければ見本の代わりに理由を出す', async () => {

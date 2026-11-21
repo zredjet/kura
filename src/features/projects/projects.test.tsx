@@ -103,6 +103,16 @@ describe('projectMenu', () => {
   });
 });
 
+describe('自動の持ち出し先（登録が 1 つ）', () => {
+  it('メニューはチェック付きで押せない項目、印は自動であることを言う', () => {
+    useProjectStore.setState({ list: [game], target: { chosen: null, effective: 1 } });
+    const first = projectMenu(game, () => undefined)[0];
+    expect(first).toMatchObject({ label: t.implicitTarget, checked: true, disabled: true });
+    render(<ProjectList current={null} />);
+    expect(screen.getByRole('img', { name: t.implicitTarget })).toBeInTheDocument();
+  });
+});
+
 describe('見出し・空の案内・持ち出し先', () => {
   it('プロジェクトの一覧の見出しと空の案内、名前と形式に使う持ち出し先', () => {
     expect(viewTitle({ kind: 'project', id: 1 }, [], [], [game])).toBe('My Game');
