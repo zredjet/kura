@@ -332,23 +332,24 @@ mod tests {
         }
     }
 
-    /// 1 つ前の版（最後のマイグレーション 0014 を当てる前）のライブラリを作る（マイグレーションを足したら、ここで取り消すものも
+    /// 1 つ前の版（最後のマイグレーション 0015 を当てる前）のライブラリを作る（マイグレーションを足したら、ここで取り消すものも
     /// 最後のものに替える）。
     fn library_before_last_migration(root: &Path) {
         let library = kura_core::library::Library::create(root).unwrap();
         let before = kura_core::db::MIGRATIONS.len() - 1;
         assert_eq!(
             kura_core::db::MIGRATIONS[before].name,
-            "0014_credits",
+            "0015_projects",
             "取り消すマイグレーションを最後のものに替える"
         );
         library
             .db()
             .write(move |tx| {
-                // 0014 を取り消す：足した表を消す（索引も一緒に消える）
+                // 0015 を取り消す：足した表を消す（索引も一緒に消える。jobs_kind は当て直しで入れ替わる）
                 tx.execute_batch(&format!(
-                    "DROP TABLE item_credits;
-                     DROP TABLE licenses;
+                    "DROP TABLE project_files;
+                     DROP TABLE projects;
+                     DROP TABLE item_outputs;
                      PRAGMA user_version = {before};"
                 ))?;
                 Ok(())

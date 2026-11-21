@@ -480,7 +480,8 @@ mod tests {
                 "0011_edit_versions",
                 "0012_batch",
                 "0013_item_sources",
-                "0014_credits"
+                "0014_credits",
+                "0015_projects"
             ]
         );
         // 当てたあとの WAL は空

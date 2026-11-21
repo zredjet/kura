@@ -1806,6 +1806,169 @@ fn credits_0014_adds_tables_and_keeps_everything_else() {
     assert!(violations(&conn).unwrap().is_empty());
 }
 
+const V15: usize = 15;
+
+/// 0015：プロジェクト・見たファイル・持ち出した出力の表を足し、jobs_kind に project を足す。既存の表の行・索引・トリガ・FTS は
+/// 同じ。外部キーの向き（プロジェクトを消すとファイルの行も消え、アイテムを消すとファイルの行は残って未一致、持ち出した出力は
+/// 消える）、子の列の索引、名前付きの CHECK、ルートの一意。
+#[test]
+fn projects_0015_adds_tables_and_keeps_everything_else() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, V15 - 1).unwrap();
+    crate::db::testing::fill_v14(&conn);
+    assert_eq!(MIGRATIONS[V15 - 1].name, "0015_projects");
+    assert_eq!(MIGRATIONS[V15 - 1].kind, Kind::Plain);
+    let before = snapshot(&conn);
+    migrate_until(&mut conn, V15).unwrap();
+    let after = snapshot(&conn);
+    for (key, value) in &before {
+        assert_eq!(after.get(key), Some(value), "{key} が変わった");
+    }
+    let added: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    assert_eq!(
+        added,
+        vec![
+            "index idx_item_outputs_item",
+            "index idx_project_files_item",
+            "index idx_projects_root",
+            "table item_outputs",
+            "table project_files",
+            "table projects"
+        ]
+    );
+    assert!(violations(&conn).unwrap().is_empty());
+    let fks = |table: &str| -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT f.\"from\", f.\"table\", f.\"to\", f.on_delete
+                   FROM pragma_foreign_key_list('{table}') f ORDER BY f.\"from\""
+            ))
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok(format!(
+                "{} → {}.{} {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    };
+    assert_eq!(
+        fks("project_files"),
+        vec![
+            "item_id → items.id SET NULL",
+            "project_id → projects.id CASCADE"
+        ]
+    );
+    assert_eq!(fks("item_outputs"), vec!["item_id → items.id CASCADE"]);
+    for (sql, index) in [
+        (
+            "SELECT project_id, path FROM project_files WHERE item_id = 1",
+            "idx_project_files_item",
+        ),
+        (
+            "SELECT hash FROM item_outputs WHERE item_id = 1",
+            "idx_item_outputs_item",
+        ),
+        (
+            "SELECT item_id FROM item_outputs WHERE hash = x'01'",
+            "PRIMARY KEY",
+        ),
+        (
+            "SELECT id FROM projects WHERE root = '/x'",
+            "idx_projects_root",
+        ),
+        (
+            "SELECT path FROM project_files WHERE project_id = 1 ORDER BY path",
+            "PRIMARY KEY",
+        ),
+    ] {
+        let plan = crate::db::query_plan(&conn, sql);
+        assert!(
+            plan.contains(index) && !plan.contains("TEMP B-TREE"),
+            "{sql}\n{plan}"
+        );
+    }
+    // jobs_kind に project が入る。名前付きの CHECK とルートの一意
+    conn.execute(
+        "INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('project', 'queued', '{}', 1)",
+        [],
+    )
+    .unwrap();
+    let err = |sql: &str| conn.execute(sql, []).unwrap_err().to_string();
+    conn.execute_batch(
+        "INSERT INTO projects (id, name, root, engine, pos, created_at, updated_at) VALUES (7, 'g', '/g', 'godot', 1, 1, 1);",
+    )
+    .unwrap();
+    let item: i64 = one(&conn, "SELECT min(id) FROM items");
+    for (sql, name) in [
+        (
+            "INSERT INTO projects (name, root, engine, pos, created_at, updated_at) VALUES ('x', '/x', 'unreal', 1, 1, 1)".to_string(),
+            "projects_engine",
+        ),
+        (
+            "INSERT INTO projects (name, root, engine, pos, missing, created_at, updated_at) VALUES ('x', '/x', 'folder', 1, 2, 1, 1)".to_string(),
+            "projects_missing",
+        ),
+        (
+            "INSERT INTO projects (name, root, engine, pos, created_at, updated_at) VALUES ('x', '/g', 'folder', 1, 1, 1)".to_string(),
+            "projects.root",
+        ),
+        (
+            "INSERT INTO project_files (project_id, path, size_bytes, mtime_ns, hash, seen_at) VALUES (7, 'a', -1, 0, x'01', 1)".to_string(),
+            "project_files_size",
+        ),
+        (
+            format!("INSERT INTO project_files (project_id, path, size_bytes, mtime_ns, hash, item_id, matched, seen_at) VALUES (7, 'a', 1, 0, x'01', {item}, 'similar', 1)"),
+            "project_files_matched",
+        ),
+        (
+            format!("INSERT INTO item_outputs (hash, item_id, source_hash, ext, size_bytes, created_at) VALUES (x'01', {item}, x'01', 'png', -1, 1)"),
+            "item_outputs_size",
+        ),
+    ] {
+        let e = err(&sql);
+        assert!(e.contains(name), "{sql}: {e}");
+    }
+    // アイテムを消すとファイルの行は残って未一致に、持ち出した出力は消える。プロジェクトを消すとファイルの行も消える
+    conn.execute_batch(&format!(
+        "INSERT INTO project_files (project_id, path, size_bytes, mtime_ns, hash, item_id, matched, seen_at)
+           VALUES (7, 'a.png', 1, 0, x'01', {item}, 'current', 1);
+         INSERT INTO item_outputs (hash, item_id, source_hash, ext, size_bytes, created_at)
+           VALUES (x'0d', {item}, x'01', 'png', 1, 1);
+         DELETE FROM items WHERE id = {item};"
+    ))
+    .unwrap();
+    assert_eq!(
+        one::<Option<i64>>(
+            &conn,
+            "SELECT item_id FROM project_files WHERE project_id = 7"
+        ),
+        None
+    );
+    assert_eq!(
+        one::<i64>(
+            &conn,
+            &format!("SELECT count(*) FROM item_outputs WHERE item_id = {item}")
+        ),
+        0
+    );
+    conn.execute("DELETE FROM projects WHERE id = 7", [])
+        .unwrap();
+    assert_eq!(
+        one::<i64>(
+            &conn,
+            "SELECT count(*) FROM project_files WHERE project_id = 7"
+        ),
+        0
+    );
+    assert!(violations(&conn).unwrap().is_empty());
+}
+
 /// 0012 の外部キーの向き：対象のアイテムを消すと行も消え（ADR-192 (4)）、別名で作ったアイテム・版を消すと NULL になる。
 #[test]
 fn batch_items_follow_the_items_and_versions() {

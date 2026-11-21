@@ -125,9 +125,9 @@ pub(crate) fn fill_v12(conn: &Connection) {
     .unwrap();
 }
 
-/// 最新の版で足した表（[`fill_v12`] の表と、0013 の N → 1 の来歴、0014 の自作のライセンスとクレジット）にも行を入れる。`fill_v6` のあとに使う（表を足したら
-/// ここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
-pub(crate) fn fill_latest(conn: &Connection) {
+/// 版 14 までの表（[`fill_v12`] の表と、0013 の N → 1 の来歴、0014 の自作のライセンスとクレジット）に行を入れる。`fill_v6` の
+/// あとに使う。
+pub(crate) fn fill_v14(conn: &Connection) {
     fill_v12(conn);
     conn.execute_batch(
         "INSERT INTO item_sources (item_id, ord, source_item_id, source_version, source_hash, frames, created_at)
@@ -137,6 +137,22 @@ pub(crate) fn fill_latest(conn: &Connection) {
          INSERT INTO item_credits (item_id, license_id, author, work, url, credit, updated_at)
            VALUES (1, (SELECT id FROM licenses WHERE builtin = 'cc-by-4.0'), 'もりの', '森の素材集', NULL, NULL, 96),
                   (4, (SELECT id FROM licenses WHERE builtin IS NULL), NULL, NULL, 'https://example.com/pack', 'Sound by X', 96);",
+    )
+    .unwrap();
+}
+
+/// 最新の版で足した表（[`fill_v14`] の表と、0015 のプロジェクト・見たファイル・持ち出した出力）にも行を入れる。`fill_v6` の
+/// あとに使う（表を足したらここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
+pub(crate) fn fill_latest(conn: &Connection) {
+    fill_v14(conn);
+    conn.execute_batch(
+        "INSERT INTO projects (id, name, root, engine, settings, pos, missing, scanned_at, created_at, updated_at)
+           VALUES (1, 'game', '/Users/x/game', 'godot', '{}', 1, 0, 97, 97, 97);
+         INSERT INTO project_files (project_id, path, size_bytes, mtime_ns, hash, item_id, matched, seen_at)
+           VALUES (1, 'art/a.png', 10, 5, x'01', 1, 'current', 97), (1, 'sfx/b.ogg', 20, 6, x'0b', NULL, NULL, 97);
+         INSERT INTO item_outputs (hash, item_id, source_hash, ext, size_bytes, created_at)
+           VALUES (x'0c', 1, x'01', 'png', 30, 97);
+         INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('project', 'done', '{}', 97);",
     )
     .unwrap();
 }

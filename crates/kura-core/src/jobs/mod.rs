@@ -39,11 +39,13 @@ pub enum JobKind {
     Gc,
     /// 一括加工（M14 段 4。`edit::batch`。1 本ずつ。保存に譲る）。
     Batch,
+    /// 登録したプロジェクトの照らし直し（M15 段 2。`project::scan`。1 本ずつ。取り込みに譲る）。
+    Project,
 }
 
 impl JobKind {
     /// すべての種類（テストと一覧用）。
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Import,
         Self::Thumbnail,
         Self::Proxy,
@@ -54,6 +56,7 @@ impl JobKind {
         Self::Edit,
         Self::Gc,
         Self::Batch,
+        Self::Project,
     ];
 
     /// DB に保存する名前。
@@ -69,6 +72,7 @@ impl JobKind {
             Self::Edit => "edit",
             Self::Gc => "gc",
             Self::Batch => "batch",
+            Self::Project => "project",
         }
     }
 
@@ -85,6 +89,7 @@ impl JobKind {
             "edit" => Self::Edit,
             "gc" => Self::Gc,
             "batch" => Self::Batch,
+            "project" => Self::Project,
             _ => return None,
         })
     }
@@ -103,7 +108,8 @@ impl JobKind {
             | Self::Analyze
             | Self::Edit
             | Self::Gc
-            | Self::Batch => 1,
+            | Self::Batch
+            | Self::Project => 1,
         }
     }
 
@@ -129,6 +135,8 @@ impl JobKind {
             ],
             // 一括は利用者の保存（その場で待っている）に譲る（同じ一括のプールと予算・台帳の門を使う。M14 段 4）
             Self::Batch => &[Self::Edit],
+            // プロジェクトの照らし直しはファイルを読んでハッシュするので、取り込み（NFR-05）に譲る（M15 段 2）
+            Self::Project => &[Self::Import],
             Self::Import
             | Self::Thumbnail
             | Self::Proxy
@@ -152,7 +160,8 @@ impl JobKind {
             | Self::Export
             | Self::Edit
             | Self::Gc
-            | Self::Batch => false,
+            | Self::Batch
+            | Self::Project => false,
         }
     }
 }
@@ -232,7 +241,8 @@ mod tests {
             | JobKind::Analyze
             | JobKind::Edit
             | JobKind::Gc
-            | JobKind::Batch => JobKind::ALL.contains(&kind),
+            | JobKind::Batch
+            | JobKind::Project => JobKind::ALL.contains(&kind),
         }
     }
 
@@ -268,10 +278,11 @@ mod tests {
         assert_eq!(JobKind::Edit.concurrency(), 1);
         assert_eq!(JobKind::Gc.concurrency(), 1);
         assert_eq!(JobKind::Batch.concurrency(), 1);
+        assert_eq!(JobKind::Project.concurrency(), 1);
     }
 
     /// 譲る相手の表（解析は取り込み・サムネイル・保存に、GC は取り込み・サムネイル・保存・解析・書き出し・ダウンロード・
-    /// キャプチャに譲る）。自分に譲らず、譲り合いの輪がない。
+    /// キャプチャに、プロジェクトの照らし直しは取り込みに譲る）。自分に譲らず、譲り合いの輪がない。
     #[test]
     fn yields_to_table() {
         let table: Vec<(JobKind, &[JobKind])> =
@@ -309,6 +320,7 @@ mod tests {
                     ][..]
                 ),
                 (JobKind::Batch, &[JobKind::Edit][..]),
+                (JobKind::Project, &[JobKind::Import][..]),
             ]
         );
         for kind in JobKind::ALL {

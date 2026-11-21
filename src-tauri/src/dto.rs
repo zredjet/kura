@@ -465,6 +465,8 @@ pub enum JobKindDto {
     Edit,
     Gc,
     Batch,
+    /// プロジェクトの照らし直し（M15 段 2）。
+    Project,
 }
 
 impl From<JobKind> for JobKindDto {
@@ -480,6 +482,7 @@ impl From<JobKind> for JobKindDto {
             JobKind::Edit => Self::Edit,
             JobKind::Gc => Self::Gc,
             JobKind::Batch => Self::Batch,
+            JobKind::Project => Self::Project,
         }
     }
 }
@@ -497,6 +500,7 @@ impl From<JobKindDto> for JobKind {
             JobKindDto::Edit => Self::Edit,
             JobKindDto::Gc => Self::Gc,
             JobKindDto::Batch => Self::Batch,
+            JobKindDto::Project => Self::Project,
         }
     }
 }
