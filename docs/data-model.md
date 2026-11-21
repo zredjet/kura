@@ -718,7 +718,7 @@ CREATE TABLE licenses (
   modify       TEXT    NOT NULL CONSTRAINT licenses_modify CHECK (modify IN ('yes','no','unknown')),
   share_alike  INTEGER NOT NULL DEFAULT 0 CONSTRAINT licenses_share_alike CHECK (share_alike IN (0, 1)),
   note         TEXT,
-  pos          INTEGER NOT NULL,                       -- 並び（既定の行が 0〜12、利用者の行は最後に足す）
+  pos          REAL    NOT NULL,                       -- 並び（§2。既定の行が 0〜12、利用者の行は最後に足す）
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );
@@ -1191,15 +1191,18 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 ### ライセンスとクレジット（M15。`crates/kura-core/src/credits/`。ADR-202・203）
 
 - **ライセンスの表**：既定の 13 行（0014 が入れる。`builtin` に鍵）と利用者の行。既定の行は名前と印を変えられず消せない
-  （`credits::licenses` が `Invalid` で断る）。名前は前後の空白を除いた NFC で、大文字小文字を問わず一意（`Conflict`）。利用者の行は
-  並びの最後（`max(pos) + 1`）に足す。一覧は `SELECT … , (SELECT count(*) FROM item_credits c WHERE c.license_id = l.id) FROM licenses l
+  （`credits::licenses` が `Invalid` で断る）。名前は前後の空白を除いた NFC で、大文字小文字を問わず一意（`Conflict`。ASCII 以外も
+  比べるよう、Rust の小文字で全行と比べる。索引 `idx_licenses_name` の NOCASE は ASCII だけの守り）。名前に引用符（`"`・`“`・`”`・`＂`）と
+  制御文字は入れない（検索の値の書き方で逃がせない）。利用者の行は並びの最後（`max(pos) + 1`）に足す。既定の行を後のマイグレーションで
+  足すときは、同じ名前（大文字小文字を問わない）の利用者の行の扱いを決め、利用者の行の `pos` を後ろへずらしてから足す。一覧は `SELECT … , (SELECT count(*) FROM item_credits c WHERE c.license_id = l.id) FROM licenses l
   ORDER BY l.pos, l.id`（付けた件数は `idx_item_credits_license`）。利用者の行を消すと、使っていたアイテムは `ON DELETE SET NULL` で
-  未設定に戻る（画面は件数で確かめてから消す。段 1 の決定 4）。
+  未設定に戻る（画面は件数で確かめてから消す。段 1 の決定 4）。ライセンスのほかに何も入っていなかったアイテムは、同じトランザクションで
+  先にクレジットの行ごと消す（行は何か入っているアイテムにだけある）。
 - **アイテムのクレジット**：行は何か 1 つでも入っているアイテムにだけある。まとめて付ける（`credits::item::set`）は、アイテムと
   ユニット（メンバー全員。`unit::members`）を重なりを除いた列にし、1 件ずつ今の行を読んでパッチの項目だけを変え、変わったものだけ
   `INSERT … ON CONFLICT(item_id) DO UPDATE` で書く（全部空になれば `DELETE`）。文の項目は前後の空白を除いた NFC、空は NULL、
   4,000 文字まで。ない ID は飛ばし、ないライセンスは `NotFound`。`items.updated_at` は変えない。
-- **別名で保存**は、評価・メモ・出どころと同じトランザクションでクレジットの行を写す（§4「保存と版（M12）」の「別名の写し方」。
+- **別名で保存**は、評価・メモ・出どころと同じトランザクションでクレジットの行を写す（全部空の行は写さない。§4「保存と版（M12）」の「別名の写し方」。
   段 1 の決定 2）。N → 1 で作ったシートには写さない（元が N 件あり、一覧では `item_sources` の元からたどる）。
 - **集める**（`credits::collect`）：使ったアイテムから、`item_derivations`（別名の元）と `item_sources`（N → 1 の元。`ord` の順）を
   主キーでたどり（`SELECT … FROM items i LEFT JOIN item_credits c ON c.item_id = i.id WHERE i.id = ?`。どれも主キー・`idx` を引く）、
