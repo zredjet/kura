@@ -1065,7 +1065,10 @@ export type CreditsFormatDto = "markdown" | "text";
 /**  一覧の言葉。 */
 export type CreditsLangDto = "ja" | "en";
 
-/**  一覧の作り方（省いた項目は既定：日本語・Markdown・任意は載せる・不要は載せない・素材の名前は添えない）。 */
+/**
+ *  一覧の作り方（どの項目も渡す。画面の既定は `DEFAULT_CREDITS_RENDER`：日本語・Markdown・任意は載せる・不要は載せない・素材の名前は
+ *  添えない）。
+ */
 export type CreditsRenderDto = {
 	lang: CreditsLangDto,
 	format: CreditsFormatDto,

@@ -526,7 +526,8 @@ pub enum CreditsFormatDto {
     Text,
 }
 
-/// 一覧の作り方（省いた項目は既定：日本語・Markdown・任意は載せる・不要は載せない・素材の名前は添えない）。
+/// 一覧の作り方（どの項目も渡す。画面の既定は `DEFAULT_CREDITS_RENDER`：日本語・Markdown・任意は載せる・不要は載せない・素材の名前は
+/// 添えない）。
 #[derive(Debug, Clone, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CreditsRenderDto {
@@ -553,6 +554,7 @@ impl From<CreditsRenderDto> for kura_core::credits::render::RenderOptions {
             include_none: o.include_none,
             list_items: o.list_items,
             title: None,
+            project: None,
         }
     }
 }
