@@ -17,7 +17,7 @@ use crate::capture::CaptureHandler;
 use crate::download::{DownloadHandler, work_dir_name};
 use crate::edit::gc::{self, GcClock, GcHandler};
 use crate::edit::{ENGINE_WORK_DIR, EditHandler, EngineFactory, EngineServices};
-use crate::export::ExportHandler;
+use crate::export::{DragOuts, ExportHandler};
 use crate::import::ImportHandler;
 use crate::jobs::{JobKind, JobManager};
 use crate::media::{MediaBackend, ThumbnailHandler};
@@ -104,6 +104,8 @@ pub struct LibrarySession {
     /// DB の定期バックアップ（閉じると止める）。
     backup: Mutex<backup::Scheduler>,
     startup: Mutex<Option<JoinHandle<()>>>,
+    /// ドラッグアウトの係（M15 段 5。閉じると作るのをやめ、一時置き場を消す）。
+    dragout: DragOuts,
 }
 
 impl LibrarySession {
@@ -285,6 +287,7 @@ impl LibrarySession {
             on_check,
             backup_checks,
         ));
+        let dragout = DragOuts::new(library.clone(), engine.clone(), jobs.clone());
         Ok(Self {
             library,
             jobs,
@@ -294,6 +297,7 @@ impl LibrarySession {
             integrity,
             backup,
             startup: Mutex::new(Some(startup)),
+            dragout,
         })
     }
 
@@ -310,6 +314,11 @@ impl LibrarySession {
     /// このライブラリのエンジンの部品（エンジンを使わないときは None）。ライブラリを開き直すと別物になる。
     pub fn engine(&self) -> Option<&Arc<EngineServices>> {
         self.engine.as_ref()
+    }
+
+    /// ドラッグアウトの係（M15 段 5）。
+    pub fn dragout(&self) -> &DragOuts {
+        &self.dragout
     }
 
     /// 外部ツールの場所が変わった：エンジンのコーデックの組を、次に使うときに作り直す（ffmpeg を探し直す）。解析のジョブを
@@ -409,6 +418,8 @@ impl LibrarySession {
     /// 閉じる。実行中のジョブは次回の起動で再開する。最後に DB を閉じてライブラリのロックを放す（`Arc` で握られた
     /// ライブラリが残っても、開き直し・ほかのアプリが当たらない）。
     pub fn close(&self) {
+        // ドラッグアウトの用意をやめ、一時置き場（staging/dragout）を消す（描いている途中ならエンジンを止める前に。M15 段 5）
+        self.dragout.close();
         // ライブラリの開いている間だけ有効な中止の印を立てる（試聴の /pcm の作業用のファイル作りを止める。M13 段 7）。
         // エディタを閉じる（中止 → キャッシュを空に → 確保を落とす → 取り置きを 0。待っている下書きは DB を閉じる前に置く）
         if let Some(engine) = &self.engine {

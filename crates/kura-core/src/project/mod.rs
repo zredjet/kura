@@ -395,6 +395,11 @@ pub fn queue_scan(jobs: &JobManager) -> Result<Option<JobId>> {
 
 /// ライブラリを開いたとき：登録したプロジェクトがあれば照らし直しを積む（段 2 の決定 2。読みの接続の外で積む）。
 pub fn queue_on_open(db: &crate::db::Db, jobs: &JobManager) -> Result<Option<JobId>> {
+    queue_if_registered(db, jobs)
+}
+
+/// 登録したプロジェクトがあれば照らし直しを積む（開いたとき・ドラッグアウトで渡したあと。M15 段 5）。
+pub fn queue_if_registered(db: &crate::db::Db, jobs: &JobManager) -> Result<Option<JobId>> {
     let any: Option<i64> = db.read(|c| {
         Ok(c.prepare_cached("SELECT id FROM projects LIMIT 1")?
             .query_row([], |r| r.get(0))

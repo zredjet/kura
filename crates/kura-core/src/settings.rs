@@ -27,6 +27,13 @@ pub fn set<T: Serialize>(conn: &Connection, key: &str, value: &T) -> Result<()> 
     Ok(())
 }
 
+/// `key` の値を消す（なければ何もしない）。
+pub fn remove(conn: &Connection, key: &str) -> Result<()> {
+    conn.prepare_cached("DELETE FROM settings WHERE key = ?1")?
+        .execute([key])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

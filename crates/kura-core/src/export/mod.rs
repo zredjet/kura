@@ -7,10 +7,12 @@
 //! - 名前の規則・形式の変換（エンジンで描く）・JSON の有無・プロジェクトの中への書き出しは `options`（M15 段 3。ADR-205）。
 //! - ユニットを選んだら、ユニット名のフォルダの中に並び順で書き出す。
 
+pub mod dragout;
 pub mod formats;
 mod job;
 pub mod names;
 
+pub use dragout::{DragEntry, DragOutcome, DragOuts, DragSession};
 pub use formats::{ExportOptions, ExportPreset, FormatTarget, Plan};
 pub use job::{ExportHandler, ExportInput, ExportResult, ExportedFile, start_export};
 

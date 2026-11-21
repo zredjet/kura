@@ -218,17 +218,7 @@ impl JobHandler for ExportHandler {
             cursor += 1;
             state.cursor = cursor as u64;
         }
-        let codecs = self
-            .engine
-            .as_ref()
-            .and_then(|e| e.codecs_if_built().or_else(|| Some(e.codecs())));
-        let writable_formats: Option<BTreeSet<String>> = codecs.as_ref().map(|c| {
-            c.capabilities()
-                .into_iter()
-                .filter(|f| !f.write.is_empty())
-                .map(|f| f.format.to_string())
-                .collect()
-        });
+        let writable_formats = writable_formats(self.engine.as_ref());
         let writable = |f: &str| writable_formats.as_ref().is_some_and(|w| w.contains(f));
         let writable_ref: Option<&dyn Fn(&str) -> bool> = writable_formats
             .as_ref()
@@ -347,6 +337,18 @@ impl JobHandler for ExportHandler {
             message: Some(message),
         })
     }
+}
+
+/// エンジンのコーデックの組が書ける形式（エンジンがなければ None：形式を変える 1 件は Unsupported）。
+pub(super) fn writable_formats(engine: Option<&Arc<EngineServices>>) -> Option<BTreeSet<String>> {
+    let codecs = engine.map(|e| e.codecs_if_built().unwrap_or_else(|| e.codecs()));
+    codecs.map(|c| {
+        c.capabilities()
+            .into_iter()
+            .filter(|f| !f.write.is_empty())
+            .map(|f| f.format.to_string())
+            .collect()
+    })
 }
 
 /// 中止：書いたファイルはそのまま残し（書き出し先は消さない）、ファイルとフォルダの一覧は結果に残さない。
@@ -513,20 +515,20 @@ impl UnitCx for ExportUnit<'_> {
 }
 
 /// アイテムの行（書き出しに使う列）。
-struct ItemRow {
-    hash: [u8; 32],
-    ext: String,
-    kind: MediaKind,
-    original_name: String,
-    title: String,
-    width: Option<i64>,
-    height: Option<i64>,
+pub(super) struct ItemRow {
+    pub(super) hash: [u8; 32],
+    pub(super) ext: String,
+    pub(super) kind: MediaKind,
+    pub(super) original_name: String,
+    pub(super) title: String,
+    pub(super) width: Option<i64>,
+    pub(super) height: Option<i64>,
     /// 主なコーデック（codec_info。m4a の可逆を見分ける）。
-    codec: Option<String>,
-    trashed: bool,
+    pub(super) codec: Option<String>,
+    pub(super) trashed: bool,
 }
 
-fn item_row(library: &Library, item_id: i64) -> Result<ItemRow> {
+pub(super) fn item_row(library: &Library, item_id: i64) -> Result<ItemRow> {
     type Row = (
         Vec<u8>,
         String,
@@ -852,48 +854,17 @@ impl ExportHandler {
                 })
             }
             Plan::Convert { format } => {
-                let engine = self.engine.clone().ok_or_else(|| {
-                    CoreError::Unsupported(format!(
-                        "このライブラリでは形式を変えられません（{} → {format}）",
-                        row.ext
-                    ))
-                })?;
-                let runtime = engine.runtime()?.clone();
-                let head = library
-                    .db()
-                    .read(|c| crate::edit::versions::head(c, one.item_id))?
-                    .ok_or_else(|| CoreError::NotFound(format!("アイテム {}", one.item_id)))?;
-                let mut graph = crate::edit::batch::head_doc(
-                    library.db(),
-                    &runtime,
-                    one.item_id,
-                    head.version,
-                )?;
-                if let Some(out) = graph.outputs.first_mut() {
-                    out.format = kura_engine::doc::FormatChoice::To {
-                        format: format.clone(),
-                        options: serde_json::json!({}),
-                    };
-                }
                 let unit = ExportUnit {
                     ctx,
                     state: one.state,
                     cursor: one.cursor,
                 };
-                let saver = Saver::new(engine);
-                let written = match saver.prepare_graph(
+                let written = match render_converted(
+                    self.engine.as_ref(),
                     &unit,
-                    Mode::SaveAs,
                     one.item_id,
-                    Base {
-                        hash: head.hash,
-                        version: head.version,
-                    },
-                    &graph,
-                    GraphExtra {
-                        transient: true,
-                        ..GraphExtra::default()
-                    },
+                    &row,
+                    &format,
                 )? {
                     Flow::Go(w) => w,
                     Flow::Stop(end) => {
@@ -910,24 +881,7 @@ impl ExportHandler {
                 drop(written);
                 let (name, replaced) = placed?;
                 // 形式を変えた出力の中身を記録する（照らし直しが一致させる。今と同じ中身なら要らない）
-                if hash != row.hash {
-                    let (item, source, ext2) = (one.item_id, row.hash, ext.clone());
-                    library.db().write(move |tx| {
-                        tx.prepare_cached(
-                            "INSERT INTO item_outputs (hash, item_id, source_hash, ext, size_bytes, created_at)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(hash, item_id) DO NOTHING",
-                        )?
-                        .execute(rusqlite::params![
-                            &hash[..],
-                            item,
-                            &source[..],
-                            ext2,
-                            i64::try_from(size).unwrap_or(i64::MAX),
-                            now_ms()
-                        ])?;
-                        Ok(())
-                    })?;
-                }
+                record_output(library, one.item_id, &row, hash, &ext, size)?;
                 Ok(Done {
                     name,
                     converted: true,
@@ -937,6 +891,80 @@ impl ExportHandler {
             }
         }
     }
+}
+
+/// 形式を変えて描く（保存の準備の段に、元＋頭の文書を出力の形式だけ変えて渡す。版を足さず、アンカーも作らない。
+/// staging に書いた出力を返し、落とすと消える）。エンジンがなければ Unsupported。
+pub(super) fn render_converted(
+    engine: Option<&Arc<EngineServices>>,
+    unit: &dyn UnitCx,
+    item_id: i64,
+    row: &ItemRow,
+    format: &str,
+) -> Result<Flow<crate::edit::save::Written>> {
+    let engine = engine.cloned().ok_or_else(|| {
+        CoreError::Unsupported(format!(
+            "このライブラリでは形式を変えられません（{} → {format}）",
+            row.ext
+        ))
+    })?;
+    let library = unit.library();
+    let runtime = engine.runtime()?.clone();
+    let head = library
+        .db()
+        .read(|c| crate::edit::versions::head(c, item_id))?
+        .ok_or_else(|| CoreError::NotFound(format!("アイテム {item_id}")))?;
+    let mut graph = crate::edit::batch::head_doc(library.db(), &runtime, item_id, head.version)?;
+    if let Some(out) = graph.outputs.first_mut() {
+        out.format = kura_engine::doc::FormatChoice::To {
+            format: format.to_string(),
+            options: serde_json::json!({}),
+        };
+    }
+    Saver::new(engine).prepare_graph(
+        unit,
+        Mode::SaveAs,
+        item_id,
+        Base {
+            hash: head.hash,
+            version: head.version,
+        },
+        &graph,
+        GraphExtra {
+            transient: true,
+            ..GraphExtra::default()
+        },
+    )
+}
+
+/// 形式を変えた出力の中身を `item_outputs` に記録する（照らし直しが一致させる。今と同じ中身なら書かない）。
+pub(super) fn record_output(
+    library: &Library,
+    item_id: i64,
+    row: &ItemRow,
+    hash: [u8; 32],
+    ext: &str,
+    size: u64,
+) -> Result<()> {
+    if hash == row.hash {
+        return Ok(());
+    }
+    let (source, ext) = (row.hash, ext.to_string());
+    library.db().write(move |tx| {
+        tx.prepare_cached(
+            "INSERT INTO item_outputs (hash, item_id, source_hash, ext, size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(hash, item_id) DO NOTHING",
+        )?
+        .execute(rusqlite::params![
+            &hash[..],
+            item_id,
+            &source[..],
+            ext,
+            i64::try_from(size).unwrap_or(i64::MAX),
+            now_ms()
+        ])?;
+        Ok(())
+    })
 }
 
 /// `src` を `dir` に `name` で置く（同じ名前があれば番号を付ける。上書きはしない。試験用：記録を持たない）。
