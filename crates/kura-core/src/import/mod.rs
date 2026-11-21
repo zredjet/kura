@@ -17,4 +17,5 @@ pub use kind::{
 pub use place::{hash_file, partial_hash};
 pub use plan::{DuplicatePolicy, ImportOptions, TagName, parse_tag};
 pub use preview::{ImportPreview, preview};
+pub(crate) use scan::is_package_name;
 pub use scan::{ScanResult, ScanRoot, ScannedFile, scan};

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use super::Engine;
-use crate::import::classify;
+use crate::import::{classify, is_package_name};
 
 /// ルートの直下で見ないフォルダ（エンジンのキャッシュ・書き出し先。隠しフォルダ `.godot` などは別に見ない）。
 pub fn excluded_at_root(engine: Engine) -> &'static [&'static str] {
@@ -53,8 +53,23 @@ pub struct Found {
 pub struct Walked {
     /// 照らすファイル（パスの順）。
     pub files: Vec<Found>,
-    /// 読めなかったフォルダ・名前が UTF-8 でないもの（飛ばした数）。
+    /// 名前が UTF-8 でないもの・属性を読めなかったもの（飛ばした数）。
     pub skipped: usize,
+    /// 中を読み切れなかったフォルダ（ルートからの相対パス。ルートは空文字）。この下の前の行は、見えなくても消さない
+    /// （外付けのボリュームが照らしの途中で外れた・許されていないなど。使った記録を黙って落とさない）。
+    pub unreadable: Vec<String>,
+}
+
+impl Walked {
+    /// `path` が読み切れなかったフォルダの下か。
+    pub fn under_unreadable(&self, path: &str) -> bool {
+        self.unreadable.iter().any(|d| {
+            d.is_empty()
+                || path
+                    .strip_prefix(d.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
 }
 
 fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
@@ -85,7 +100,8 @@ pub fn walk(
             return Ok(None);
         }
         let Ok(entry) = entry else {
-            out.skipped += 1;
+            // このフォルダの中を読み切れなかった
+            out.unreadable.push(prefix.clone());
             continue;
         };
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
@@ -96,7 +112,7 @@ pub fn walk(
             continue;
         }
         let Ok(kind) = entry.file_type() else {
-            out.skipped += 1;
+            out.unreadable.push(prefix.clone());
             continue;
         };
         // シンボリックリンクはたどらない（プロジェクトの外・ループ）
@@ -109,12 +125,21 @@ pub fn walk(
             format!("{prefix}/{name}")
         };
         if kind.is_dir() {
-            if prefix.is_empty() && excluded_at_root(engine).contains(&name.as_str()) {
+            // キャッシュはルートの直下だけを、大文字小文字を問わず外す（APFS は区別しないことが多く、Unity の .gitignore も
+            // [Ll]ibrary の形）。パッケージ（.app・.kuralib など）には入らない
+            if prefix.is_empty()
+                && excluded_at_root(engine)
+                    .iter()
+                    .any(|x| x.eq_ignore_ascii_case(&name))
+            {
+                continue;
+            }
+            if is_package_name(&name) {
                 continue;
             }
             match std::fs::read_dir(entry.path()) {
                 Ok(sub) => stack.push((sub, rel)),
-                Err(_) => out.skipped += 1,
+                Err(_) => out.unreadable.push(rel),
             }
             continue;
         }
@@ -138,6 +163,8 @@ pub fn walk(
         });
     }
     out.files.sort_by(|a, b| a.path.cmp(&b.path));
+    out.unreadable.sort();
+    out.unreadable.dedup();
     Ok(Some(out))
 }
 
@@ -183,6 +210,9 @@ mod tests {
         write(&root, "Assets/Library/kept.png", b"x");
         write(&root, "Assets/Scripts/Hero.cs", b"class");
         write(&root, "Library/cache.png", b"cache");
+        write(&root, "library2/kept.png", b"k");
+        write(&root, "LOGS/l.png", b"l");
+        write(&root, "Assets/Tool.app/Contents/i.png", b"app");
         write(&root, "Temp/t.png", b"t");
         write(&root, ".git/objects/x.png", b"git");
         write(&root, "Assets/.hidden/h.png", b"h");
@@ -200,8 +230,10 @@ mod tests {
                 ("Assets/Audio/jump.OGG", 4),
                 ("Assets/Library/kept.png", 1),
                 ("Assets/Sprites/hero.png", 3),
+                ("library2/kept.png", 1),
             ]
         );
+        assert!(walked.unreadable.is_empty());
         assert!(walked.files.iter().all(|f| f.mtime_ns > 0));
         // フォルダとして見れば Library も照らす
         let walked = walk(&root, Engine::Folder, &|| false).unwrap().unwrap();
@@ -212,6 +244,25 @@ mod tests {
             write(&many, &format!("{k}.png"), b"p");
         }
         assert_eq!(walk(&many, Engine::Folder, &|| true).unwrap(), None);
+        // 読めないフォルダは「読み切れなかった」に入り、その下のパスを見分けられる
+        let locked = dir.path().join("locked");
+        write(&locked, "open/a.png", b"a");
+        write(&locked, "shut/b.png", b"b");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(locked.join("shut"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let walked = walk(&locked, Engine::Folder, &|| false).unwrap().unwrap();
+        std::fs::set_permissions(locked.join("shut"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(walked.unreadable, vec!["shut".to_string()]);
+        assert!(walked.under_unreadable("shut/b.png"));
+        assert!(!walked.under_unreadable("shutter/c.png"));
+        assert!(!walked.under_unreadable("open/a.png"));
+        let all = Walked {
+            unreadable: vec![String::new()],
+            ..Walked::default()
+        };
+        assert!(all.under_unreadable("x.png"));
         assert!(walk(&dir.path().join("none"), Engine::Folder, &|| false).is_err());
     }
 }

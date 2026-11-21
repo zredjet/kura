@@ -120,9 +120,33 @@ pub fn get(conn: &Connection, id: i64) -> Result<Project> {
     finish(found.ok_or_else(|| CoreError::NotFound(format!("プロジェクト {id}")))?)
 }
 
+/// フォルダの見分け（ボリュームと inode）。読めなければ None。
+fn identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// `inner` が `outer` と同じか、その中か。パスの文字のほか、ファイルの見分け（祖先のどれかが `outer` と同じボリューム・inode）で
+/// 比べる（APFS の大文字小文字を区別しない名前・ファームリンク（/System/Volumes/Data）・改名で文字が食い違っても気づく）。
+fn within(outer: &Path, inner: &Path) -> bool {
+    if inner.starts_with(outer) {
+        return true;
+    }
+    match identity(outer) {
+        Some(id) => inner.ancestors().any(|a| identity(a) == Some(id)),
+        None => false,
+    }
+}
+
 /// 登録するフォルダを確かめて正規化する（ファイルシステムを見るので、DB の書き手の外で呼ぶ）：あるフォルダで、パスが UTF-8 で、
-/// ライブラリの中でも、ライブラリを中に含むフォルダでもない。正規化した絶対パスとエンジンを返す。
-pub fn prepare_root(path: &Path, library_root: &Path) -> Result<(String, Engine)> {
+/// ライブラリの中でも、ライブラリを中に含むフォルダでもなく、`existing` のプロジェクト（`except` を除く）と同じ・中・外側でも
+/// ない。正規化した絶対パスとエンジンを返す。書き手の中の [`add`]・[`relocate`] もパスの文字で重なりを確かめ直す。
+pub fn prepare_root(
+    path: &Path,
+    library_root: &Path,
+    existing: &[Project],
+    except: Option<i64>,
+) -> Result<(String, Engine)> {
     if !path.is_absolute() {
         return Err(CoreError::Invalid(format!(
             "絶対パスを指定してください: {}",
@@ -132,6 +156,12 @@ pub fn prepare_root(path: &Path, library_root: &Path) -> Result<(String, Engine)
     let root = std::fs::canonicalize(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => {
             CoreError::NotFound(format!("フォルダが見つかりません: {}", path.display()))
+        }
+        std::io::ErrorKind::NotADirectory => {
+            CoreError::Invalid(format!("フォルダを選んでください: {}", path.display()))
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            CoreError::Invalid(format!("読めないフォルダです: {}", path.display()))
         }
         _ => CoreError::Io(e),
     })?;
@@ -143,10 +173,19 @@ pub fn prepare_root(path: &Path, library_root: &Path) -> Result<(String, Engine)
     }
     let library =
         std::fs::canonicalize(library_root).unwrap_or_else(|_| library_root.to_path_buf());
-    if root.starts_with(&library) || library.starts_with(&root) {
+    if within(&library, &root) || within(&root, &library) {
         return Err(CoreError::Invalid(
             "ライブラリの中のフォルダや、ライブラリを含むフォルダは登録できません".into(),
         ));
+    }
+    for p in existing.iter().filter(|p| Some(p.id) != except) {
+        let other = Path::new(&p.root);
+        if within(other, &root) || within(&root, other) {
+            return Err(CoreError::Conflict(format!(
+                "プロジェクト「{}」と同じか、中・外側のフォルダです",
+                p.name
+            )));
+        }
     }
     let text = root
         .to_str()
@@ -157,7 +196,8 @@ pub fn prepare_root(path: &Path, library_root: &Path) -> Result<(String, Engine)
     Ok((text, walk::detect(&root)))
 }
 
-/// ほかのプロジェクトと重なる（同じ・中・外側）なら断る。
+/// ほかのプロジェクトと重なる（同じ・中・外側。パスの文字で）なら断る（書き手の中の確かめ直し。ファイルの見分けでの確かめは
+/// [`prepare_root`]）。
 fn check_overlap(conn: &Connection, root: &str, except: Option<i64>) -> Result<()> {
     let mut stmt = conn.prepare_cached("SELECT id, name, root FROM projects")?;
     let rows = stmt.query_map([], |r| {
@@ -208,12 +248,17 @@ pub fn add(
     now: i64,
 ) -> Result<i64> {
     check_overlap(conn, root, None)?;
-    let fallback = Path::new(root)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(root)
-        .to_string();
-    let name = clean_name(name.unwrap_or(&fallback))?;
+    let name = match name {
+        Some(name) => clean_name(name)?,
+        // 名前を省けばフォルダの名前（長ければ上限で切る）
+        None => {
+            let folder = Path::new(root)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(root);
+            clean_name(&nfc(folder).chars().take(MAX_NAME_CHARS).collect::<String>())?
+        }
+    };
     conn.prepare_cached(
         "INSERT INTO projects (name, root, engine, settings, pos, missing, created_at, updated_at)
          VALUES (?1, ?2, ?3, '{}', (SELECT ifnull(max(pos), 0) + 1 FROM projects), 0, ?4, ?4)",

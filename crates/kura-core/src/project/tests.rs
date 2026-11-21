@@ -70,8 +70,13 @@ impl Env {
             .unwrap()
     }
 
+    fn prepare(&self, root: &Path, except: Option<i64>) -> Result<(String, Engine)> {
+        let existing = self.library.db().read(list)?;
+        prepare_root(root, self.library.layout().root(), &existing, except)
+    }
+
     fn add(&self, root: &Path) -> Result<i64> {
-        let (root, engine) = prepare_root(root, self.library.layout().root())?;
+        let (root, engine) = self.prepare(root, None)?;
         self.library
             .db()
             .write(move |tx| add(tx, &root, engine, None, now_ms()))
@@ -112,42 +117,125 @@ fn prepare_root_checks_the_folder_and_the_library() {
     let lib = env.library.layout().root().to_path_buf();
     let game = env.folder("game");
     write(&game, "project.godot", b"");
-    let (root, engine) = prepare_root(&game, &lib).unwrap();
+    let (root, engine) = prepare_root(&game, &lib, &[], None).unwrap();
     assert_eq!(engine, Engine::Godot);
     assert!(Path::new(&root).is_absolute());
     // シンボリックリンク・相対の要素は正規化する
     std::os::unix::fs::symlink(&game, env.dir.path().join("link")).unwrap();
     assert_eq!(
-        prepare_root(&env.dir.path().join("link"), &lib).unwrap().0,
+        prepare_root(&env.dir.path().join("link"), &lib, &[], None)
+            .unwrap()
+            .0,
         root
     );
     assert!(matches!(
-        prepare_root(Path::new("game"), &lib),
+        prepare_root(Path::new("game"), &lib, &[], None),
         Err(CoreError::Invalid(_))
     ));
     assert!(matches!(
-        prepare_root(&env.dir.path().join("none"), &lib),
+        prepare_root(&env.dir.path().join("none"), &lib, &[], None),
         Err(CoreError::NotFound(_))
     ));
     write(&game, "a.png", b"x");
     assert!(matches!(
-        prepare_root(&game.join("a.png"), &lib),
+        prepare_root(&game.join("a.png"), &lib, &[], None),
         Err(CoreError::Invalid(_))
     ));
     // ライブラリの中・ライブラリを含むフォルダは断る
     assert!(matches!(
-        prepare_root(&lib.join("files"), &lib),
+        prepare_root(&lib.join("files"), &lib, &[], None),
         Err(CoreError::Invalid(_)) | Err(CoreError::NotFound(_))
     ));
     std::fs::create_dir_all(lib.join("thumbs")).unwrap();
     assert!(matches!(
-        prepare_root(&lib.join("thumbs"), &lib),
+        prepare_root(&lib.join("thumbs"), &lib, &[], None),
         Err(CoreError::Invalid(_))
     ));
     assert!(matches!(
-        prepare_root(env.dir.path(), &lib),
+        prepare_root(env.dir.path(), &lib, &[], None),
         Err(CoreError::Invalid(_))
     ));
+}
+
+/// 重なりは、パスの文字のほかにファイルの見分けでも確かめる（外側のフォルダ、`..` の入ったパス、大文字小文字だけが違う名前、
+/// ファームリンクの道）。途中がファイルのパスは「フォルダを選んで」、名前を省いた長いフォルダ名は上限で切る。
+#[test]
+fn overlap_is_found_by_path_and_by_identity() {
+    let env = Env::new();
+    let inner = env.folder("outer/Game");
+    let id = env.add(&inner).unwrap();
+    let outer = env.dir.path().join("outer");
+    assert!(matches!(env.add(&outer), Err(CoreError::Conflict(_))));
+    assert!(matches!(
+        env.prepare(&outer.join("Game/../Game"), None),
+        Err(CoreError::Conflict(_))
+    ));
+    // 大文字小文字を区別しないボリュームなら、同じフォルダとして断る
+    let lower = outer.join("game");
+    if lower.exists() {
+        assert!(matches!(env.add(&lower), Err(CoreError::Conflict(_))));
+    }
+    // ファームリンクの道（/System/Volumes/Data の下）でも同じフォルダ・ライブラリを含むフォルダとして断る
+    let real = std::fs::canonicalize(&inner).unwrap();
+    let firm = Path::new("/System/Volumes/Data").join(real.strip_prefix("/").unwrap());
+    if firm.is_dir() {
+        assert!(matches!(env.add(&firm), Err(CoreError::Conflict(_))));
+        let lib = std::fs::canonicalize(env.library.layout().root()).unwrap();
+        let firm_parent = Path::new("/System/Volumes/Data")
+            .join(lib.parent().unwrap().strip_prefix("/").unwrap());
+        assert!(matches!(
+            env.prepare(&firm_parent, None),
+            Err(CoreError::Invalid(_)) | Err(CoreError::Conflict(_))
+        ));
+    }
+    // 自分自身は除いて選び直せる（同じ場所に）
+    assert!(env.prepare(&inner, Some(id)).is_ok());
+    // 途中がファイルのパスは「フォルダを選んで」
+    write(&inner, "a.png", b"x");
+    assert!(matches!(
+        env.prepare(&inner.join("a.png/x"), None),
+        Err(CoreError::Invalid(_))
+    ));
+    // 名前を省けばフォルダの名前を上限で切る（名前を書いたときは長すぎれば断る）
+    let long = env.folder(&"a".repeat(MAX_NAME_CHARS + 10));
+    let id = env.add(&long).unwrap();
+    let p = env.library.db().read(move |c| get(c, id)).unwrap();
+    assert_eq!(p.name, "a".repeat(MAX_NAME_CHARS));
+    let root = p.root.clone();
+    let renamed = env.library.db().write(move |tx| {
+        remove(tx, id)?;
+        add(
+            tx,
+            &root,
+            Engine::Folder,
+            Some(&"い".repeat(MAX_NAME_CHARS + 1)),
+            1,
+        )
+    });
+    assert!(matches!(renamed, Err(CoreError::Invalid(_))));
+}
+
+/// 読み切れなかったフォルダの下の前の行は消さない（照らしの途中で外付けが外れた・許されていないとき）。
+#[test]
+fn unreadable_folders_keep_their_rows() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let a = env.item(b"open");
+    let b = env.item(b"shut");
+    let game = env.folder("game");
+    write(&game, "open/a.png", b"open");
+    write(&game, "shut/b.png", b"shut");
+    let id = env.add(&game).unwrap();
+    let r = env.scan();
+    assert_eq!((r.files, r.matched), (2, 2));
+    std::fs::set_permissions(game.join("shut"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = env.scan();
+    std::fs::set_permissions(game.join("shut"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!((r.files, r.removed), (1, 0));
+    let rows: Vec<Option<i64>> = env.files(id).into_iter().map(|(_, item, _)| item).collect();
+    assert_eq!(rows, vec![Some(a), Some(b)]);
+    let r = env.scan();
+    assert_eq!((r.files, r.hashed, r.removed), (2, 0, 0));
 }
 
 #[test]
@@ -184,8 +272,8 @@ fn projects_are_listed_renamed_relocated_and_removed() {
     ));
     // 場所を選び直す：ほかのプロジェクトと重なれば断る
     let c = env.folder("c");
-    let (croot, cengine) = prepare_root(&c, env.library.layout().root()).unwrap();
-    let (broot, bengine) = prepare_root(&b, env.library.layout().root()).unwrap();
+    let (croot, cengine) = env.prepare(&c, Some(id)).unwrap();
+    let (broot, bengine) = prepare_root(&b, env.library.layout().root(), &[], None).unwrap();
     assert!(matches!(
         env.library
             .db()
@@ -316,7 +404,7 @@ fn scan_matches_current_original_versions_and_outputs_and_follows_changes() {
     let p = env.library.db().read(move |c| get(c, id)).unwrap();
     assert!(p.missing);
     assert_eq!(env.files(id).len(), 5);
-    let (root, engine) = prepare_root(&moved, env.library.layout().root()).unwrap();
+    let (root, engine) = env.prepare(&moved, Some(id)).unwrap();
     env.library
         .db()
         .write(move |tx| relocate(tx, id, &root, engine, now_ms()))

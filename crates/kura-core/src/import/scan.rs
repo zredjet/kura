@@ -203,7 +203,8 @@ fn should_skip(entry: &walkdir::DirEntry) -> bool {
     name.starts_with('.') || (entry.file_type().is_dir() && is_package_name(&name))
 }
 
-fn is_package_name(name: &str) -> bool {
+/// パッケージのフォルダ（`.app`・`.kuralib` など。中に入らない）の名前か。
+pub(crate) fn is_package_name(name: &str) -> bool {
     Path::new(name)
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())

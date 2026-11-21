@@ -94,6 +94,13 @@ impl From<ItemUse> for ItemProjectDto {
     }
 }
 
+/// 登録・場所の選び直しのあとに照らし直しを積む。積めなくても登録は残すので、誤りは記録だけにする（次に開いたときに積む）。
+fn queue(session: &kura_core::library::LibrarySession) {
+    if let Err(err) = project::queue_scan(session.jobs()) {
+        tracing::warn!(%err, "プロジェクトの照らし直しを積めませんでした");
+    }
+}
+
 /// 登録したプロジェクトの一覧（並びの順）。
 #[tauri::command]
 #[specta::specta]
@@ -123,12 +130,18 @@ pub async fn project_add(
     let session = state.session()?;
     blocking(move || {
         let library = session.library();
-        let (root, engine) = project::prepare_root(&PathBuf::from(path), library.layout().root())?;
+        let existing = library.db().read(project::list)?;
+        let (root, engine) = project::prepare_root(
+            &PathBuf::from(path),
+            library.layout().root(),
+            &existing,
+            None,
+        )?;
         let now = now_ms();
         let id = library
             .db()
             .write(move |tx| project::add(tx, &root, engine, name.as_deref(), now))?;
-        project::queue_scan(session.jobs())?;
+        queue(&session);
         Ok(library.db().read(move |c| project::get(c, id))?.into())
     })
     .await
@@ -164,12 +177,18 @@ pub async fn project_relocate(
     let session = state.session()?;
     blocking(move || {
         let library = session.library();
-        let (root, engine) = project::prepare_root(&PathBuf::from(path), library.layout().root())?;
+        let existing = library.db().read(project::list)?;
+        let (root, engine) = project::prepare_root(
+            &PathBuf::from(path),
+            library.layout().root(),
+            &existing,
+            Some(id),
+        )?;
         let now = now_ms();
         library
             .db()
             .write(move |tx| project::relocate(tx, id, &root, engine, now))?;
-        project::queue_scan(session.jobs())?;
+        queue(&session);
         Ok(library.db().read(move |c| project::get(c, id))?.into())
     })
     .await
