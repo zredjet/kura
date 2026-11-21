@@ -33,6 +33,7 @@ pub(crate) fn to_view(view: ItemViewDto, now: i64) -> ItemView {
         ItemViewDto::Folder { id } => ItemView::Folder { id },
         ItemViewDto::Unit { id } => ItemView::Unit { id },
         ItemViewDto::Smart { id } => ItemView::Smart { id },
+        ItemViewDto::Project { id } => ItemView::Project { id },
     }
 }
 

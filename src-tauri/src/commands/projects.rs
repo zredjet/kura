@@ -120,6 +120,21 @@ pub async fn projects_list(state: State<'_, AppState>) -> Result<Vec<ProjectDto>
     .await
 }
 
+/// `path`（書き出し先などのフォルダ）を中に含むプロジェクト（なければ null。書き出しのシートが既定を選ぶ。M15 段 6）。
+#[tauri::command]
+#[specta::specta]
+pub async fn project_for_dest(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Option<ProjectDto>, AppError> {
+    let session = state.session()?;
+    blocking(move || {
+        let projects = session.library().db().read(project::list)?;
+        Ok(project::containing(&projects, &PathBuf::from(path)).map(|p| p.clone().into()))
+    })
+    .await
+}
+
 /// フォルダをプロジェクトとして登録し、照らし直しを積む（エンジンはフォルダの中身で見分ける。`name` が null ならフォルダの
 /// 名前）。ない・フォルダでない・ライブラリの中か外側は Invalid／NotFound、ほかのプロジェクトと重なれば Conflict。
 #[tauri::command]

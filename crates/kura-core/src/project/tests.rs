@@ -514,3 +514,20 @@ fn export_settings_follow_the_engine_and_are_checked() {
         Err(CoreError::Invalid(_))
     ));
 }
+
+/// 書き出し先を中に含むプロジェクト（M15 段 6）：中のフォルダ・ルートそのものは見つかり、外・兄弟の名前の前が同じフォルダは
+/// 見つからない。
+#[test]
+fn containing_finds_the_project_around_a_destination() {
+    let env = Env::new();
+    let game = env.folder("game");
+    std::fs::write(game.join("project.godot"), b"").unwrap();
+    let art = env.folder("game/art/sprites");
+    let other = env.folder("game2");
+    let id = env.add(&game).unwrap();
+    let projects = env.library.db().read(list).unwrap();
+    assert_eq!(containing(&projects, &art).map(|p| p.id), Some(id));
+    assert_eq!(containing(&projects, &game).map(|p| p.id), Some(id));
+    assert_eq!(containing(&projects, &other).map(|p| p.id), None);
+    assert_eq!(containing(&projects, env.dir.path()).map(|p| p.id), None);
+}

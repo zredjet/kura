@@ -603,6 +603,23 @@ fn render_scope(
     })?)
 }
 
+/// 1 件のアイテムの表記の行（来歴の元をたどる。テキスト。インスペクタの見本。未設定なら空。M15 段 6）。
+#[tauri::command]
+#[specta::specta]
+pub async fn item_credit_preview(
+    state: State<'_, AppState>,
+    item: i64,
+    lang: CreditsLangDto,
+) -> Result<Vec<String>, AppError> {
+    use kura_core::credits::render::{Lang, preview};
+    let session = state.session()?;
+    let lang = match lang {
+        CreditsLangDto::Ja => Lang::Ja,
+        CreditsLangDto::En => Lang::En,
+    };
+    blocking(move || Ok(session.library().db().read(|c| preview(c, item, lang))?)).await
+}
+
 /// クレジットの一覧を作る（見本・クリップボードへのコピー。M15 段 4）。
 #[tauri::command]
 #[specta::specta]

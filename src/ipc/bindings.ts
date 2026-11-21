@@ -273,7 +273,9 @@ export const commands = {
 	/**  ユニットを解除する（アイテムは残る）。 */
 	unitDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("unit_delete", { id })),
 	/**  入力を解析し、開いている一覧の中で一致する件数を数える（パレットの「一致 186 項目」）。 */
-	queryParse: (text: string, view: { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number } | null, utcOffsetMinutes: number) => typedError<QueryCheckDto, AppError>(__TAURI_INVOKE("query_parse", { text, view, utcOffsetMinutes })),
+	queryParse: (text: string, view: { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number } | 
+/**  登録したプロジェクトで今使っている素材（M15 段 6）。 */
+{ kind: "project"; id: number } | null, utcOffsetMinutes: number) => typedError<QueryCheckDto, AppError>(__TAURI_INVOKE("query_parse", { text, view, utcOffsetMinutes })),
 	/**  入力中の語の候補（タグ → フィールド名・値 → 保存済みの検索）。 */
 	querySuggest: (word: string, limit: number) => typedError<SuggestionDto[], AppError>(__TAURI_INVOKE("query_suggest", { word, limit })),
 	/**  すべてのスマートフォルダ。`withCounts` なら一致する件数も数える。 */
@@ -448,6 +450,26 @@ export const commands = {
 	 *  ［元に戻す…］は `batch_result`・`batch_undo`（作ったアイテムは結果の `created`）。
 	 */
 	mergeStart: (request: MergeRequestDto) => typedError<number, AppError>(__TAURI_INVOKE("merge_start", { request })),
+	/**  `path`（書き出し先などのフォルダ）を中に含むプロジェクト（なければ null。書き出しのシートが既定を選ぶ。M15 段 6）。 */
+	projectForDest: (path: string) => typedError<{
+	id: number,
+	name: string,
+	/**  正規化した絶対パス。 */
+	root: string,
+	engine: EngineDto,
+	/**  最後の照らしでフォルダが見つからなかった（使った記録は残っている）。 */
+	missing: boolean,
+	/**  最後に照らし終えた時刻（まだなら null）。 */
+	scannedAt: number | null,
+	/**  照らしたファイルの数。 */
+	files: number,
+	/**  使っているアイテムの数。 */
+	items: number,
+	createdAt: number,
+	updatedAt: number,
+} | null, AppError>(__TAURI_INVOKE("project_for_dest", { path })),
+	/**  1 件のアイテムの表記の行（来歴の元をたどる。テキスト。インスペクタの見本。未設定なら空。M15 段 6）。 */
+	itemCreditPreview: (item: number, lang: CreditsLangDto) => typedError<string[], AppError>(__TAURI_INVOKE("item_credit_preview", { item, lang })),
 	/**
 	 *  ドラッグアウトを始める：選んだもの（一覧の ID。ユニットは `LIST_FLAG | unit_id`。選んだ順）の名前と形式を持ち出し先の
 	 *  プロジェクトの既定で決め、一時置き場に作り始めて、OS のドラッグに切り替える。マウスのボタンが離れていれば始めない
@@ -2362,7 +2384,9 @@ export type ItemSummaryDto = {
 };
 
 /**  一覧の種類（`items_query_ids` の引数。生バイトのコマンドなので TS の型は `src/ipc/items.ts` に書く）。 */
-export type ItemViewDto = { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number };
+export type ItemViewDto = { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number } | 
+/**  登録したプロジェクトで今使っている素材（M15 段 6）。 */
+{ kind: "project"; id: number };
 
 /**  ジョブ 1 件。 */
 export type JobDto = {

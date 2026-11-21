@@ -116,6 +116,8 @@ pub enum ItemView {
     Unit { id: i64 },
     /// スマートフォルダ（保存した検索）。
     Smart { id: i64 },
+    /// 登録したプロジェクトで今使っている素材（照らし直しで一致したファイルのアイテム。M15 段 6）。
+    Project { id: i64 },
 }
 
 /// 一覧の条件。
@@ -238,6 +240,15 @@ fn scope(conn: &Connection, view: ItemView, ctx: &QueryContext) -> Result<Scope>
                     "{alive} AND i.id IN (SELECT m.item_id FROM item_folders m WHERE m.folder_id IN ({marks}))"
                 ),
                 params: ids.into_iter().map(Value::Integer).collect(),
+            }
+        }
+        ItemView::Project { id } => {
+            crate::project::get(conn, id)?;
+            Scope {
+                sql: format!(
+                    "{alive} AND i.id IN (SELECT f.item_id FROM project_files f WHERE f.project_id = ? AND f.item_id IS NOT NULL)"
+                ),
+                params: vec![Value::Integer(id)],
             }
         }
         ItemView::Smart { id } => {
@@ -1579,6 +1590,46 @@ mod tests {
         trash(&conn, &[2], 10 * DAY_MS).unwrap();
         assert_eq!(ids(&conn, ItemView::Folder { id: 1 }, false), vec![3, 1]);
         assert_eq!(ids(&conn, ItemView::Trash, false), vec![2]);
+    }
+
+    /// プロジェクトで今使っている素材（一致したファイルのアイテム。ゴミ箱は除く。M15 段 6）。
+    #[test]
+    fn project_view_lists_the_items_the_project_uses() {
+        let conn = library();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, root, engine, pos, created_at, updated_at) VALUES (1, 'g', '/g', 'godot', 1, 0, 0);
+             INSERT INTO project_files (project_id, path, size_bytes, mtime_ns, hash, item_id, matched, seen_at) VALUES
+               (1, 'a.png', 1, 0, x'01', 2, 'current', 0),
+               (1, 'b.png', 1, 0, x'02', 5, 'original', 0),
+               (1, 'c.png', 1, 0, x'03', 5, 'current', 0),
+               (1, 'd.png', 1, 0, x'04', NULL, NULL, 0);",
+        )
+        .unwrap();
+        assert_eq!(ids(&conn, ItemView::Project { id: 1 }, false), vec![5, 2]);
+        trash(&conn, &[2], 10 * DAY_MS).unwrap();
+        assert_eq!(ids(&conn, ItemView::Project { id: 1 }, false), vec![5]);
+        // 使っているファイルは主キー（project_id, path）の前の方で引く（project_files を走査しない）
+        let plan = query_plan(
+            &conn,
+            "SELECT i.id FROM items i WHERE i.trashed_at IS NULL AND i.id IN
+               (SELECT f.item_id FROM project_files f WHERE f.project_id = 1 AND f.item_id IS NOT NULL)",
+        );
+        assert!(!plan.contains("SCAN f"), "{plan}");
+        assert!(
+            plan.contains("SEARCH f USING PRIMARY KEY (project_id=?)"),
+            "{plan}"
+        );
+        assert!(matches!(
+            query_ids(
+                &conn,
+                &ItemQuery {
+                    view: ItemView::Project { id: 9 },
+                    ..ItemQuery::default()
+                },
+                &ctx(0)
+            ),
+            Err(CoreError::NotFound(_))
+        ));
     }
 
     #[test]

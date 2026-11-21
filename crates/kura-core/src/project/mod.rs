@@ -394,6 +394,13 @@ pub fn check_dest(p: &Project, dest: &Path) -> Result<()> {
     }
 }
 
+/// `dest`（書き出し先などのフォルダ）を中に含むプロジェクト（なければ None。ファイルシステムを見るので書き手の外で呼ぶ。
+/// プロジェクトは重ならないので、あれば 1 つ。M15 段 6 の書き出しのシートが既定を選ぶ）。
+pub fn containing<'a>(projects: &'a [Project], dest: &Path) -> Option<&'a Project> {
+    let dest = std::fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
+    projects.iter().find(|p| within(Path::new(&p.root), &dest))
+}
+
 /// 照らし直しのジョブを積む（登録したプロジェクト全部を照らす。待っているものがあれば積まない）。
 pub fn queue_scan(jobs: &JobManager) -> Result<Option<JobId>> {
     jobs.ensure_queued(JobKind::Project, "{}")

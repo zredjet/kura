@@ -108,3 +108,24 @@ export function pickRecipeSaveLocation(
     filters: [{ name: filterName, extensions: [RECIPE_EXTENSION] }],
   });
 }
+
+/** 登録するプロジェクトのフォルダを選ぶ。キャンセルなら null（M15 段 6）。 */
+export function pickProjectFolder(title: string): Promise<string | null> {
+  return open({ title, directory: true, multiple: false });
+}
+
+/** クレジットの一覧の保存先を選ぶ（`defaultPath` はプロジェクトのフォルダの CREDITS.md など）。キャンセルなら null。 */
+export function pickCreditsPath(
+  title: string,
+  defaultPath: string,
+  markdown: boolean,
+): Promise<string | null> {
+  return save({
+    title,
+    defaultPath,
+    canCreateDirectories: true,
+    filters: [
+      markdown ? { name: 'Markdown', extensions: ['md'] } : { name: 'Text', extensions: ['txt'] },
+    ],
+  });
+}

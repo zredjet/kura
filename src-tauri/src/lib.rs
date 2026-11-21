@@ -218,6 +218,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::batch::batch_undo,
             commands::batch::merge_precheck,
             commands::batch::merge_start,
+            commands::projects::project_for_dest,
+            commands::credits::item_credit_preview,
             commands::dragout::dragout_start,
             commands::dragout::dragout_target,
             commands::dragout::dragout_target_set,

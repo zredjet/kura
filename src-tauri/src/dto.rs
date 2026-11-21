@@ -900,11 +900,23 @@ pub enum ItemViewDto {
     Recent,
     Unsorted,
     Untagged,
-    Random { seed: u64 },
+    Random {
+        seed: u64,
+    },
     Trash,
-    Folder { id: i64 },
-    Unit { id: i64 },
-    Smart { id: i64 },
+    Folder {
+        id: i64,
+    },
+    Unit {
+        id: i64,
+    },
+    Smart {
+        id: i64,
+    },
+    /// 登録したプロジェクトで今使っている素材（M15 段 6）。
+    Project {
+        id: i64,
+    },
 }
 
 /// 並び順（`items_query_ids` の引数、プレイリストの並び順）。

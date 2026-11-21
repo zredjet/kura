@@ -8,6 +8,8 @@ import {
   type CreditsScopeDto,
   type CreditsTextDto,
   type CreditsDto,
+  type CreditsFormatDto,
+  type CreditsLangDto,
   type CreditsSetDto,
   type CreditSummaryDto,
   type ItemCreditDto,
@@ -28,6 +30,8 @@ export type {
   CreditsScopeDto,
   CreditsTextDto,
   CreditsDto,
+  CreditsFormatDto,
+  CreditsLangDto,
   CreditsSetDto,
   CreditSummaryDto,
   ItemCreditDto,
@@ -56,6 +60,11 @@ export function updateLicense(id: number, input: LicenseInputDto): Promise<null>
 /** 利用者のライセンスを消す。使っていたアイテムは未設定に戻り、その件数を返す（消す前に `items` で確かめる）。 */
 export function deleteLicense(id: number): Promise<number> {
   return unwrap(commands.licenseDelete(id));
+}
+
+/** 1 件のアイテムの表記の行（来歴の元をたどる。テキスト。未設定なら空。インスペクタの見本。M15 段 6）。 */
+export function previewItemCredit(item: number, lang: CreditsLangDto = 'ja'): Promise<string[]> {
+  return unwrap(commands.itemCreditPreview(item, lang));
 }
 
 /** 1 件のクレジット（付けていなければ全部 null）。 */

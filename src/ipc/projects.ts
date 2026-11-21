@@ -7,7 +7,12 @@ import {
 } from './bindings';
 import { unwrap } from './result';
 
-export type { EngineDto, ItemProjectDto, ProjectDto };
+export type { EngineDto, ExportPresetDto, ItemProjectDto, ProjectDto };
+
+/** `path`（書き出し先などのフォルダ）を中に含むプロジェクト（なければ null。M15 段 6）。 */
+export function projectForDest(path: string): Promise<ProjectDto | null> {
+  return unwrap(commands.projectForDest(path));
+}
 
 /** 登録したプロジェクトの一覧（並びの順）。 */
 export function listProjects(): Promise<ProjectDto[]> {

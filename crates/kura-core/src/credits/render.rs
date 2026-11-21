@@ -447,6 +447,16 @@ fn load_names(conn: &rusqlite::Connection, ids: &[i64]) -> crate::Result<BTreeMa
     Ok(out)
 }
 
+/// 1 件のアイテムの表記の行（来歴の元をたどる。テキストで、インスペクタの見本。未設定・元が消えたものは載らない。M15 段 6）。
+pub fn preview(conn: &rusqlite::Connection, item: i64, lang: Lang) -> crate::Result<Vec<String>> {
+    let credits = super::collect::collect(conn, &[item])?;
+    Ok(credits
+        .lines
+        .iter()
+        .map(|l| credit_line(&l.key, lang, TextFormat::Text))
+        .collect())
+}
+
 /// 範囲の素材のクレジットを集めて一覧にする（プロジェクトなら見出しに名前を添え、照らし終えていない・フォルダが見つからない
 /// ときは要確認に出す。`opts.title` があればそれ）。
 pub fn list(
@@ -1080,5 +1090,52 @@ mod db_tests {
         });
         let got = std::fs::read_to_string(&both).unwrap();
         assert!(got == a || got == b);
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::credits::item::{self, CreditPatch};
+    use crate::db::test_conn;
+
+    /// インスペクタの見本：表記の行をテキストで（未設定は空）。
+    #[test]
+    fn preview_composes_the_line_or_nothing_when_unset() {
+        let conn = test_conn();
+        conn.execute_batch(
+            "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at, source_url)
+               VALUES (1, x'01', 'png', 'image', 1, 'hero', 'hero.png', 0, 0, 'https://example.com/hero'),
+                      (2, x'02', 'png', 'image', 1, 'tile', 'tile.png', 0, 0, NULL);",
+        )
+        .unwrap();
+        assert!(preview(&conn, 2, Lang::Ja).unwrap().is_empty());
+        let by: i64 = conn
+            .query_row(
+                "SELECT id FROM licenses WHERE builtin = 'cc-by-4.0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        item::set(
+            &conn,
+            &[1],
+            &CreditPatch {
+                license: Some(Some(by)),
+                author: Some(Some("もりの".into())),
+                work: Some(Some("森の素材集".into())),
+                ..CreditPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            preview(&conn, 1, Lang::Ja).unwrap(),
+            ["「森の素材集」 もりの（https://example.com/hero）"]
+        );
+        assert_eq!(
+            preview(&conn, 1, Lang::En).unwrap(),
+            ["\"森の素材集\" by もりの (https://example.com/hero)"]
+        );
     }
 }
