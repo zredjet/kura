@@ -1195,6 +1195,8 @@ pub(crate) struct GraphExtra {
     pub(crate) names: Option<(String, String)>,
     /// 版の記録に足す一括の出どころ（`VersionRecord::batch`）。
     pub(crate) batch: Option<serde_json::Value>,
+    /// コミットしない描き（M15 段 3 の書き出し）：アンカーを作らない（作っても版と一緒に置かれず捨てるだけなので）。
+    pub(crate) transient: bool,
 }
 
 /// 上書き・別名で保存の準備に渡すもの（文書の根・DB にまだない部品・別名の名前・版の記録に足す一括の出どころ）。
@@ -1206,6 +1208,8 @@ struct DocArgs {
     parts: Option<Box<kura_engine::doc_parts::DocParts>>,
     names: Option<(String, String)>,
     batch: Option<serde_json::Value>,
+    /// コミットしない描き（アンカーを作らない。[`GraphExtra::transient`]）。
+    transient: bool,
 }
 
 /// 描いて書き終えた 1 件（段 5 まで。[`Saver::commit`] に渡す。落とすと staging を消す）。
@@ -1295,6 +1299,7 @@ impl Saver {
                 parts: None,
                 names,
                 batch: None,
+                transient: false,
             },
             &graph,
         )
@@ -1311,7 +1316,11 @@ impl Saver {
         graph: &Graph,
         extra: GraphExtra,
     ) -> Result<Flow<Written>> {
-        let GraphExtra { names, batch } = extra;
+        let GraphExtra {
+            names,
+            batch,
+            transient,
+        } = extra;
         let parts = split_graph(graph)?;
         let doc = parts.root;
         self.prepare_doc(
@@ -1324,6 +1333,7 @@ impl Saver {
                 parts: Some(Box::new(parts)),
                 names,
                 batch,
+                transient,
             },
             graph,
         )
@@ -1339,6 +1349,7 @@ impl Saver {
             parts,
             names,
             batch,
+            transient,
         } = a;
         let library = ctx.library();
         let db = library.db();
@@ -1390,10 +1401,11 @@ impl Saver {
                 head.kind.as_str()
             )));
         }
-        let may_make_anchor = codecs
-            .decoders_for(source_format)
-            .iter()
-            .any(|d| !d.reproducible());
+        let may_make_anchor = !transient
+            && codecs
+                .decoders_for(source_format)
+                .iter()
+                .any(|d| !d.reproducible());
         // 音声で、出力の形式の書き手が流して書けるなら、値に組まずに流して書く（M13 段 3。save/stream.rs）
         if stream::applies(&codecs, head.kind, &out_format) {
             return self.prepare_stream(
@@ -1753,8 +1765,9 @@ impl Saver {
                 d.out_format
             )));
         }
-        let promote =
-            matches!(input.anchor, AnchorUse::None) && anchor::needs_anchor(&input.decoded);
+        let promote = d.may_make_anchor
+            && matches!(input.anchor, AnchorUse::None)
+            && anchor::needs_anchor(&input.decoded);
         let tasks = runtime.bulk_threads() as u64;
         let promote_need = if promote {
             stream::verify_bytes(&shape, tasks, 32 << 20)

@@ -3,7 +3,7 @@
 //!
 //! - 読むのはライブラリの `files/` だけ。同じボリュームならクローンでコピーする。
 //! - 書き出し先の既存のファイル・フォルダは上書きしない（同じ名前があれば「名前 2.jpg」）。ただし Kura が同じアイテムから
-//!   書いたまま（中身がそのアイテムの今・元・過去の版・持ち出した出力）のファイルは置き換える（M15 段 3）。
+//!   書いた記録（`export_files`）どおりのまま（大きさ・更新時刻・中身が記録と同じ）のファイルは置き換える（M15 段 3）。
 //! - 名前の規則・形式の変換（エンジンで描く）・JSON の有無・プロジェクトの中への書き出しは `options`（M15 段 3。ADR-205）。
 //! - ユニットを選んだら、ユニット名のフォルダの中に並び順で書き出す。
 
@@ -38,11 +38,20 @@ pub fn preview_names(
 ) -> crate::Result<Vec<PreviewName>> {
     options.check()?;
     let mut stmt = conn.prepare_cached(
-        "SELECT ext, kind, original_name, title, width, height FROM items WHERE id = ?1",
+        "SELECT ext, kind, original_name, title, width, height, json_extract(codec_info, '$.codec')
+           FROM items WHERE id = ?1",
     )?;
     let mut out = Vec::new();
     for (k, &id) in items.iter().enumerate() {
-        type Row = (String, String, String, String, Option<i64>, Option<i64>);
+        type Row = (
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        );
         let row: Option<Row> = stmt
             .query_row([id], |r| {
                 Ok((
@@ -52,10 +61,11 @@ pub fn preview_names(
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             })
             .optional()?;
-        let Some((ext, kind, original_name, title, width, height)) = row else {
+        let Some((ext, kind, original_name, title, width, height, codec)) = row else {
             continue;
         };
         let Some(kind) = crate::import::MediaKind::parse(&kind) else {
@@ -70,14 +80,15 @@ pub fn preview_names(
             width,
             height,
         };
-        let (out_ext, convert) = match formats::plan(kind, &ext, options.target(kind), writable) {
-            Plan::Copy => (ext.clone(), None),
-            Plan::Convert { format } => {
-                let e = crate::edit::save::output_ext(&format, &ext, None)
-                    .unwrap_or_else(|| format.clone());
-                (e, Some(format))
-            }
-        };
+        let (out_ext, convert) =
+            match formats::plan(kind, &ext, codec.as_deref(), options.target(kind), writable) {
+                Plan::Copy => (ext.clone(), None),
+                Plan::Convert { format } => {
+                    let e = crate::edit::save::output_ext(&format, &ext, None)
+                        .unwrap_or_else(|| format.clone());
+                    (e, Some(format))
+                }
+            };
         out.push(PreviewName {
             item_id: id,
             name: names::rule_name(&options.name, &parts, &out_ext),

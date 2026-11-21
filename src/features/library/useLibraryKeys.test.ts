@@ -10,8 +10,10 @@ import { EMPTY_SELECTION, selectOne } from './selection';
 import { handleLibraryKey } from './useLibraryKeys';
 import { toggleAuditionKey } from '../asset/auditionStore';
 import { openEditor } from '../editor/editorKinds';
+import { exportEntries } from './exportActions';
 
 vi.mock('../asset/auditionStore', () => ({ toggleAuditionKey: vi.fn(() => true) }));
+vi.mock('./exportActions', () => ({ exportEntries: vi.fn(async () => undefined) }));
 vi.mock('../editor/editorKinds', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../editor/editorKinds')>()),
   openEditor: vi.fn(async () => undefined),
@@ -182,5 +184,28 @@ describe('handleLibraryKey（⌘E：編集…。M12）', () => {
     document.body.append(editor);
     expect(press({ key: '1', code: 'Digit1', metaKey: true })).toBe(false);
     expect(press({ key: 'e', code: 'KeyE', metaKey: true })).toBe(false);
+  });
+});
+
+// ⌘⇧E：書き出す…（M9）。ゴミ箱の中では出さない（M15 段 3 の検証の直し。項目のメニューと同じ）
+describe('handleLibraryKey（⌘⇧E：書き出す…）', () => {
+  const exporting = vi.mocked(exportEntries);
+
+  beforeEach(() => {
+    useLibraryStore.setState({
+      status: 'open',
+      list: { ids: Uint32Array.from([10, 20]), aspects: new Uint16Array(2), groups: [] },
+    });
+    useImportStore.setState({ phase: 'idle' });
+    exporting.mockClear();
+  });
+
+  it('選んだものを書き出し、ゴミ箱の中では書き出さない', () => {
+    useViewStore.setState({ selection: selectOne(10), playlist: null, view: { kind: 'all' } });
+    expect(press({ key: 'E', code: 'KeyE', metaKey: true, shiftKey: true })).toBe(true);
+    expect(exporting).toHaveBeenCalledTimes(1);
+    useViewStore.setState({ selection: selectOne(10), view: { kind: 'trash' } });
+    expect(press({ key: 'E', code: 'KeyE', metaKey: true, shiftKey: true })).toBe(false);
+    expect(exporting).toHaveBeenCalledTimes(1);
   });
 });

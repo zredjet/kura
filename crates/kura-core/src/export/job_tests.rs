@@ -309,11 +309,13 @@ fn resolves_loose_items_first_then_units_in_order() {
             Group {
                 folder: None,
                 unit: None,
+                unit_id: None,
                 items: vec![b, a]
             },
             Group {
                 folder: Some("u".into()),
                 unit: Some("u".into()),
+                unit_id: groups[1].unit_id,
                 items: vec![b, a]
             },
         ]
@@ -409,8 +411,27 @@ fn name_rules_shape_file_and_folder_names() {
     );
 }
 
+/// アイテムの今の中身を差し替える（編集して上書きした形。ファイルをライブラリに置く）。
+fn rewrite(env: &Env, item: i64, body: &[u8]) {
+    let hash = *blake3::hash(body).as_bytes();
+    let path = env.library.layout().content_path(&hash, "png");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let size = body.len() as i64;
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE items SET hash = ?2, size_bytes = ?3 WHERE id = ?1",
+                params![item, hash.to_vec(), size],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
 #[test]
-fn files_kura_wrote_for_the_same_item_are_replaced_and_others_kept() {
+fn files_kura_wrote_are_replaced_only_while_they_match_the_record() {
     let env = Env::new();
     let a = env.item("hero.png", "png", b"a");
     let b = env.item("hero.png", "png", b"b");
@@ -422,39 +443,132 @@ fn files_kura_wrote_for_the_same_item_are_replaced_and_others_kept() {
     let (_, again) = env.run_with(&dest, vec![a], options.clone());
     assert_eq!((again.exported, again.replaced), (1, 1));
     assert_eq!(names_in(&dest), ["hero.png"]);
+    // 編集して中身が変わったアイテムは、記録どおりのままのファイルを置き換える
+    rewrite(&env, a, b"a2");
+    let (_, edited) = env.run_with(&dest, vec![a], options.clone());
+    assert_eq!(edited.replaced, 1);
+    assert_eq!(names_in(&dest), ["hero.png"]);
+    assert_eq!(std::fs::read(dest.join("hero.png")).unwrap(), b"a2");
     // ほかのアイテムの同じ名前は壊さず番号を付ける
     let (_, other) = env.run_with(&dest, vec![b], options.clone());
     assert_eq!(other.replaced, 0);
     assert_eq!(names_in(&dest), ["hero 2.png", "hero.png"]);
-    assert_eq!(std::fs::read(dest.join("hero.png")).unwrap(), b"a");
-    // 利用者が書き換えたファイルは Kura が書いたものでないので残す
+    // 利用者が書き換えたファイルは、記録と違うので残す
     std::fs::write(dest.join("hero.png"), b"edited by hand").unwrap();
+    rewrite(&env, a, b"a3");
     let (_, kept) = env.run_with(&dest, vec![a], options.clone());
     assert_eq!(kept.replaced, 0);
     assert_eq!(
         std::fs::read(dest.join("hero.png")).unwrap(),
         b"edited by hand"
     );
-    assert_eq!(std::fs::read(dest.join("hero 3.png")).unwrap(), b"a");
-    // アイテムの過去の中身（持ち出した出力）なら置き換える
-    let old = *blake3::hash(b"old export").as_bytes();
+    assert_eq!(std::fs::read(dest.join("hero 3.png")).unwrap(), b"a3");
+    // 取り込み元のファイル（記録がない。中身がアイテムの前の中身でも）は置き換えない
+    let source = env.dest("source");
+    std::fs::write(source.join("hero.png"), b"a2").unwrap();
+    let (_, src) = env.run_with(&source, vec![a], options.clone());
+    assert_eq!(src.replaced, 0);
+    assert_eq!(std::fs::read(source.join("hero.png")).unwrap(), b"a2");
+    assert_eq!(names_in(&source), ["hero 2.png", "hero.png"]);
+    // 同じ回に書いたほかのアイテムのファイルは、中身が同じでも置き換えない
+    let c = env.item("twin.png", "png", b"same");
+    let d = env.item("twin.png", "png", b"same2");
+    let twins = env.dest("twins");
+    let (_, both) = env.run_with(&twins, vec![c, d], options.clone());
+    assert_eq!((both.exported, both.replaced), (2, 0));
+    assert_eq!(names_in(&twins), ["twin 2.png", "twin.png"]);
+    // 読めない同じ名前のファイルは、持ち主が分からないので番号を付ける（失敗にしない）
+    let locked = env.dest("locked");
+    std::fs::write(locked.join("hero.png"), b"secret").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        locked.join("hero.png"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let (_, l) = env.run_with(&locked, vec![a], options);
+    std::fs::set_permissions(
+        locked.join("hero.png"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!((l.exported, l.failed), (1, 0));
+    assert_eq!(names_in(&locked), ["hero 2.png", "hero.png"]);
+}
+
+#[test]
+fn case_only_renames_follow_the_new_name_rule() {
+    use crate::export::names::NameStyle;
+    let env = Env::new();
+    let a = env.item("Hero.png", "png", b"a");
+    let dest = env.dest("out");
+    env.run_with(&dest, vec![a], rule(None, NameStyle::Keep, false));
+    assert_eq!(names_in(&dest), ["Hero.png"]);
+    // 書き方を snake に変えて書き出し直すと、大文字小文字だけ違う同じファイルの名前を直す
+    let (_, r) = env.run_with(&dest, vec![a], rule(None, NameStyle::Snake, false));
+    assert_eq!((r.exported, r.replaced), (1, 1));
+    assert_eq!(names_in(&dest), ["hero.png"]);
+}
+
+#[test]
+fn unit_folders_are_reused_when_kura_wrote_into_them() {
+    use crate::export::names::NameStyle;
+    let env = Env::new();
+    let a = env.item("a.png", "png", b"a");
+    let unit = env
+        .library
+        .db()
+        .write(move |tx| crate::unit::create_set(tx, "Boss Fight", &[a], 1))
+        .unwrap();
+    let entry = i64::from(LIST_FLAG | u32::try_from(unit).unwrap());
+    let dest = env.dest("out");
+    let options = rule(None, NameStyle::Snake, false);
+    env.run_with(&dest, vec![entry], options.clone());
+    // 書き出し直すと同じフォルダに書き、中のファイルは記録どおりなので置き換える
+    rewrite(&env, a, b"a2");
+    let (_, again) = env.run_with(&dest, vec![entry], options.clone());
+    assert_eq!(again.replaced, 1);
+    assert_eq!(names_in(&dest), ["boss_fight"]);
+    assert_eq!(std::fs::read(dest.join("boss_fight/a.png")).unwrap(), b"a2");
+    // Kura が書いていない同じ名前のフォルダには入らない
+    let other = env.dest("other");
+    std::fs::create_dir(other.join("boss_fight")).unwrap();
+    env.run_with(&other, vec![entry], options.clone());
+    assert_eq!(names_in(&other), ["boss_fight", "boss_fight 2"]);
+    // ASCII だけにして空になるユニット名は unit-ID に書き方を当てる
+    let b = env.item("b.png", "png", b"b");
+    let jp = env
+        .library
+        .db()
+        .write(move |tx| crate::unit::create_set(tx, "鎌倉", &[b], 1))
+        .unwrap();
+    let jp_entry = i64::from(LIST_FLAG | u32::try_from(jp).unwrap());
+    let ascii = env.dest("ascii");
+    env.run_with(&ascii, vec![jp_entry], rule(None, NameStyle::Snake, true));
+    assert_eq!(names_in(&ascii), [format!("unit_{jp}")]);
+}
+
+#[test]
+fn trashed_items_are_skipped() {
+    let env = Env::new();
+    let a = env.item("a.png", "png", b"a");
+    let b = env.item("b.png", "png", b"b");
     env.library
         .db()
         .write(move |tx| {
-            tx.execute(
-                "INSERT INTO item_outputs (hash, item_id, source_hash, ext, size_bytes, created_at)
-                 VALUES (?1, ?2, x'00', 'png', 10, 1)",
-                params![old.to_vec(), a],
-            )?;
+            tx.execute("UPDATE items SET trashed_at = 5 WHERE id = ?1", [b])?;
             Ok(())
         })
         .unwrap();
-    let fresh = env.dest("fresh");
-    std::fs::write(fresh.join("hero.png"), b"old export").unwrap();
-    let (_, swapped) = env.run_with(&fresh, vec![a], options);
-    assert_eq!(swapped.replaced, 1);
-    assert_eq!(names_in(&fresh), ["hero.png"]);
-    assert_eq!(std::fs::read(fresh.join("hero.png")).unwrap(), b"a");
+    let dest = env.dest("out");
+    let (state, r) = env.run_with(
+        &dest,
+        vec![a, b],
+        rule(None, crate::export::names::NameStyle::Keep, false),
+    );
+    assert_eq!(state, JobState::Done);
+    assert_eq!((r.exported, r.skipped, r.failed), (1, 1, 0));
+    assert_eq!(names_in(&dest), ["a.png"]);
 }
 
 /// 偽のエンジンの固定の段で書いた小さな PNG。

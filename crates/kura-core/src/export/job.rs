@@ -66,9 +66,12 @@ pub struct ExportResult {
     /// 形式を変えて書いた数（M15 段 3）。
     #[serde(default)]
     pub converted: u64,
-    /// Kura が同じアイテムから書いたファイルを置き換えた数（中身が同じで書かなかったものを含む）。
+    /// Kura が書いた記録どおりのファイルを置き換えた数（中身が同じで書かなかったものを含む）。
     #[serde(default)]
     pub replaced: u64,
+    /// 飛ばした数（ゴミ箱の中のアイテム。M15 段 3 の検証の直し）。
+    #[serde(default)]
+    pub skipped: u64,
     /// OS のデコーダで読んでいる 1 件の位置（読む前に書き、読み終えたら消す。残っていれば次の回にその 1 件を失敗にする）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoding: Option<u64>,
@@ -121,6 +124,8 @@ pub(super) struct Group {
     pub folder: Option<String>,
     /// ユニットの名前（テンプレートの {ユニット}）。
     pub unit: Option<String>,
+    /// ユニットの ID（フォルダの名前が空になったときの `unit-<ID>`）。
+    pub unit_id: Option<i64>,
     pub items: Vec<i64>,
 }
 
@@ -130,6 +135,7 @@ pub(super) fn resolve(conn: &Connection, entries: &[i64]) -> Result<Vec<Group>> 
     let mut loose = Group {
         folder: None,
         unit: None,
+        unit_id: None,
         items: Vec::new(),
     };
     let mut seen = HashSet::new();
@@ -148,6 +154,7 @@ pub(super) fn resolve(conn: &Connection, entries: &[i64]) -> Result<Vec<Group>> 
             units.push(Group {
                 folder: Some(safe_name(&summary.name, &fallback)),
                 unit: Some(summary.name.clone()),
+                unit_id: Some(unit_id),
                 items: members,
             });
         } else if entry > 0 && seen.insert(entry) {
@@ -174,12 +181,15 @@ impl JobHandler for ExportHandler {
                 input.dest.display()
             )));
         }
+        // 書いたファイルの記録の鍵にする、書き出し先の正規化したパス
+        let dest_c = std::fs::canonicalize(&input.dest)?;
         let mut groups = library.db().read(|conn| resolve(conn, &input.entries))?;
-        // ユニットのフォルダにも書き方と ASCII を当てる（テンプレートは当てない）
+        // ユニットのフォルダにも書き方と ASCII を当てる（テンプレートは当てない。空になれば unit-<ID>）
         for group in &mut groups {
-            if let (Some(folder), Some(unit)) = (&group.folder, &group.unit) {
-                let named = safe_name(&rule_folder(&options.name, unit, folder), folder);
-                group.folder = Some(named);
+            if let (Some(unit), Some(id)) = (&group.unit, group.unit_id) {
+                let fallback = format!("unit-{id}");
+                let named = rule_folder(&options.name, unit, &fallback);
+                group.folder = Some(safe_name(&named, &fallback));
             }
         }
         let flat: Vec<(usize, i64)> = groups
@@ -231,17 +241,16 @@ impl JobHandler for ExportHandler {
                     save(ctx, library, &state)?;
                     return Ok(JobEnd::Paused);
                 }
-                Control::Cancel => {
-                    // 書いたファイルはそのまま残す（書き出し先は消さない）
-                    state.files.clear();
-                    state.folders.clear();
-                    return Ok(JobEnd::Canceled {
-                        result_json: Some(serde_json::to_string(&state)?),
-                    });
-                }
+                Control::Cancel => return canceled(&mut state),
             }
             let (g, item_id) = flat[cursor];
-            let outcome = match folder_for(&input.dest, &groups[g], &mut state.folders[g]) {
+            let outcome = match folder_for(
+                library,
+                &input.dest,
+                &dest_c,
+                &groups[g],
+                &mut state.folders[g],
+            ) {
                 Err(err) => Err(err),
                 Ok((dir, rel)) => {
                     let one = One {
@@ -253,7 +262,11 @@ impl JobHandler for ExportHandler {
                         state: &state,
                         cursor,
                     };
-                    self.export_one(ctx, &one, &dir).map(|done| {
+                    let dir_c = match &rel {
+                        Some(folder) => dest_c.join(folder),
+                        None => dest_c.clone(),
+                    };
+                    self.export_one(ctx, &one, &dir, &dir_c).map(|done| {
                         let path = match rel {
                             Some(folder) => format!("{folder}/{}", done.name),
                             None => done.name.clone(),
@@ -263,14 +276,19 @@ impl JobHandler for ExportHandler {
                 }
             };
             match outcome {
-                Ok((
-                    _,
-                    Done {
-                        stopped: Some(end), ..
-                    },
-                )) => {
-                    save(ctx, library, &state)?;
-                    return Ok(end);
+                Ok((_, done)) if done.stopped.is_some() => match done.stopped {
+                    Some(JobEnd::Canceled { .. }) => return canceled(&mut state),
+                    Some(end) => {
+                        save(ctx, library, &state)?;
+                        return Ok(end);
+                    }
+                    None => {}
+                },
+                Ok((_, done)) if done.skipped => {
+                    state.skipped += 1;
+                    ctx.log(&format!(
+                        "飛ばしました: アイテム {item_id}（ゴミ箱の中のアイテムは書き出せません）"
+                    ));
                 }
                 Ok((path, done)) => {
                     state.exported += 1;
@@ -331,6 +349,16 @@ impl JobHandler for ExportHandler {
     }
 }
 
+/// 中止：書いたファイルはそのまま残し（書き出し先は消さない）、ファイルとフォルダの一覧は結果に残さない。
+fn canceled(state: &mut ExportResult) -> Result<JobEnd> {
+    state.files.clear();
+    state.folders.clear();
+    state.decoding = None;
+    Ok(JobEnd::Canceled {
+        result_json: Some(serde_json::to_string(state)?),
+    })
+}
+
 fn progress_message(done: usize, total: usize) -> String {
     format!("{done} / {total} 件")
 }
@@ -349,10 +377,13 @@ fn save(ctx: &JobContext, library: &Library, state: &ExportResult) -> Result<()>
         .write(move |tx| save_partial(tx, id, &json, progress, &message))
 }
 
-/// まとまりの書き出し先のフォルダ（ユニットはフォルダを作る。同じ名前のものがあれば番号を付ける）。
+/// まとまりの書き出し先のフォルダ（ユニットはフォルダを作る）。同じ名前のフォルダがあれば、その中にこのユニットのアイテムを
+/// Kura が書いた記録があるならそのフォルダを使い直し（書き出し直し。段 3 の検証の直し・利用者の決定）、ほかは番号を付ける。
 /// 書き出し先からの相対の名前も返す。
 fn folder_for(
+    library: &Library,
     dest: &Path,
+    dest_c: &Path,
     group: &Group,
     chosen: &mut Option<String>,
 ) -> Result<(PathBuf, Option<String>)> {
@@ -362,21 +393,46 @@ fn folder_for(
     if let Some(existing) = chosen {
         return Ok((dest.join(&*existing), Some(existing.clone())));
     }
+    let members: BTreeSet<i64> = group.items.iter().copied().collect();
     for n in 1..=MAX_TRIES {
         let candidate = numbered_dir(name, n);
-        // 作れたら自分のフォルダ（あれば次の番号。既存のフォルダには書かない）
         match std::fs::create_dir(dest.join(&candidate)) {
             Ok(()) => {
                 *chosen = Some(candidate.clone());
                 return Ok((dest.join(&candidate), Some(candidate)));
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let is_dir =
+                    std::fs::symlink_metadata(dest.join(&candidate)).is_ok_and(|m| m.is_dir());
+                if is_dir && recorded_under(library, &dest_c.join(&candidate), &members)? {
+                    *chosen = Some(candidate.clone());
+                    return Ok((dest.join(&candidate), Some(candidate)));
+                }
+                continue;
+            }
             Err(err) => return Err(err.into()),
         }
     }
     Err(CoreError::Invalid(format!(
         "同じ名前のフォルダが多すぎます: {name}"
     )))
+}
+
+/// フォルダ `dir`（正規化したパス）の中に、`members` のどれかのアイテムを Kura が書いた記録があるか（主キーの範囲で引く）。
+fn recorded_under(library: &Library, dir: &Path, members: &BTreeSet<i64>) -> Result<bool> {
+    let Some(prefix) = dir.to_str().map(|p| format!("{p}/")) else {
+        return Ok(false);
+    };
+    // '/' の次の文字 '0' までの範囲がフォルダの中
+    let upper = format!("{}0", &prefix[..prefix.len() - 1]);
+    let items: Vec<i64> = library.db().read(move |c| {
+        let mut stmt = c.prepare_cached(
+            "SELECT item_id FROM export_files WHERE path > ?1 AND path < ?2 LIMIT 10000",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![prefix, upper], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    })?;
+    Ok(items.iter().any(|i| members.contains(i)))
 }
 
 /// 1 件を書き出すのに渡すもの。
@@ -393,20 +449,24 @@ struct One<'a> {
 }
 
 /// 1 件を書き出した結果。
+#[derive(Default)]
 struct Done {
     /// 書き出した名前（そのフォルダの中）。
     name: String,
     converted: bool,
     replaced: bool,
-    /// 形式を変えて描く途中で止めた（一時停止・中止）。
+    /// 飛ばした（ゴミ箱の中のアイテム）。
+    skipped: bool,
+    /// 形式を変えて描く途中で止めた（一時停止・中止・譲る）。
     stopped: Option<JobEnd>,
 }
 
-/// 書き出しの 1 件の場（形式を変えて描くとき、保存の準備の段に渡す）。読む前の印は、書き出しの途中経過の `decoding` に書く。
+/// 書き出しの 1 件の場（形式を変えて描くとき、保存の準備の段に渡す）。読む前の印は、書き出しの途中経過の `decoding` に
+/// DB にだけ書く（画面へは送らない。ファイルの一覧は大きくなるので）。
 struct ExportUnit<'a> {
     ctx: &'a JobContext,
-    marked: String,
-    cleared: String,
+    state: &'a ExportResult,
+    cursor: usize,
 }
 
 impl UnitCx for ExportUnit<'_> {
@@ -424,17 +484,14 @@ impl UnitCx for ExportUnit<'_> {
         self.ctx.log(line);
     }
 
-    fn mark(&self, result_json: &str, progress: f64, message: &str) -> Result<()> {
+    fn mark(&self, result_json: &str, _progress: f64, _message: &str) -> Result<()> {
         let decoding = serde_json::from_str::<serde_json::Value>(result_json)
             .ok()
             .and_then(|v| v.get("decoding").and_then(serde_json::Value::as_bool))
             .unwrap_or(false);
-        let json = if decoding {
-            &self.marked
-        } else {
-            &self.cleared
-        };
-        self.ctx.mark(json, progress, message)
+        let mut state = self.state.clone();
+        state.decoding = decoding.then_some(self.cursor as u64);
+        save(self.ctx, self.ctx.library(), &state)
     }
 
     fn job(&self) -> i64 {
@@ -464,28 +521,46 @@ struct ItemRow {
     title: String,
     width: Option<i64>,
     height: Option<i64>,
+    /// 主なコーデック（codec_info。m4a の可逆を見分ける）。
+    codec: Option<String>,
+    trashed: bool,
 }
 
 fn item_row(library: &Library, item_id: i64) -> Result<ItemRow> {
-    let row = library.db().read(|conn| {
+    type Row = (
+        Vec<u8>,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        bool,
+    );
+    let row: Option<Row> = library.db().read(|conn| {
         let mut stmt = conn.prepare_cached(
-            "SELECT hash, ext, kind, original_name, title, width, height FROM items WHERE id = ?1",
+            "SELECT hash, ext, kind, original_name, title, width, height, json_extract(codec_info, '$.codec'),
+                    trashed_at IS NOT NULL
+               FROM items WHERE id = ?1",
         )?;
         Ok(stmt
             .query_row([item_id], |r| {
                 Ok((
-                    r.get::<_, Vec<u8>>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Option<i64>>(5)?,
-                    r.get::<_, Option<i64>>(6)?,
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
                 ))
             })
             .optional()?)
     })?;
-    let Some((hash, ext, kind, original_name, title, width, height)) = row else {
+    let Some((hash, ext, kind, original_name, title, width, height, codec, trashed)) = row else {
         return Err(CoreError::NotFound(format!("アイテム {item_id}")));
     };
     let hash: [u8; 32] = hash
@@ -501,38 +576,235 @@ fn item_row(library: &Library, item_id: i64) -> Result<ItemRow> {
         title,
         width,
         height,
+        codec,
+        trashed,
     })
 }
 
-/// アイテムが持つ中身（今・元・過去の版・持ち出した出力）。書き出し先の同じ名前のファイルがこのどれかなら、Kura がこの
-/// アイテムから書いたものとして置き換える（段 3 の決定 3）。
-fn owned_hashes(library: &Library, item_id: i64, current: [u8; 32]) -> Result<BTreeSet<[u8; 32]>> {
-    let mut out = BTreeSet::from([current]);
-    let rows: Vec<Vec<u8>> = library.db().read(|conn| {
-        let mut list = Vec::new();
-        let mut stmt =
-            conn.prepare_cached("SELECT output_hash FROM item_versions WHERE item_id = ?1")?;
-        for h in stmt.query_map([item_id], |r| r.get(0))? {
-            list.push(h?);
-        }
-        let mut stmt = conn.prepare_cached("SELECT hash FROM item_outputs WHERE item_id = ?1")?;
-        for h in stmt.query_map([item_id], |r| r.get(0))? {
-            list.push(h?);
-        }
-        Ok(list)
-    })?;
-    out.extend(
-        rows.into_iter()
-            .filter_map(|h| <[u8; 32]>::try_from(h.as_slice()).ok()),
+/// 置き方に渡すもの。
+struct PlaceCx<'a> {
+    library: &'a Library,
+    job: JobId,
+    item_id: i64,
+    /// 書く中身とその大きさ。
+    hash: [u8; 32],
+    size: u64,
+    /// 置くフォルダとその正規化したパス（記録の鍵）。
+    dir: &'a Path,
+    dir_c: &'a Path,
+    temp_name: &'a str,
+}
+
+/// Kura が書いたファイルの記録。
+struct Record {
+    item_id: i64,
+    hash: Vec<u8>,
+    size: i64,
+    mtime_ns: i64,
+    job_id: i64,
+}
+
+fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
+fn key_of(dir_c: &Path, name: &str) -> Option<String> {
+    dir_c.join(name).to_str().map(str::to_string)
+}
+
+fn record_of(library: &Library, key: &str) -> Result<Option<Record>> {
+    let key = key.to_string();
+    library.db().read(move |c| {
+        Ok(c.prepare_cached(
+            "SELECT item_id, hash, size_bytes, mtime_ns, job_id FROM export_files WHERE path = ?1",
+        )?
+        .query_row([key], |r| {
+            Ok(Record {
+                item_id: r.get(0)?,
+                hash: r.get(1)?,
+                size: r.get(2)?,
+                mtime_ns: r.get(3)?,
+                job_id: r.get(4)?,
+            })
+        })
+        .optional()?)
+    })
+}
+
+/// 書いたファイルを記録する（同じパスの前の記録は置き換える）。古い名前の記録（大文字小文字を直したとき）は消す。
+fn write_record(cx: &PlaceCx<'_>, name: &str, old: Option<&str>) -> Result<()> {
+    let Some(key) = key_of(cx.dir_c, name) else {
+        return Ok(());
+    };
+    let meta = std::fs::symlink_metadata(cx.dir.join(name))?;
+    let (item, hash, size, mtime, job) = (
+        cx.item_id,
+        cx.hash,
+        i64::try_from(meta.len()).unwrap_or(i64::MAX),
+        mtime_ns(&meta),
+        cx.job,
     );
-    Ok(out)
+    let old = old.and_then(|o| key_of(cx.dir_c, o)).filter(|o| *o != key);
+    cx.library.db().write(move |tx| {
+        if let Some(old) = old {
+            tx.prepare_cached("DELETE FROM export_files WHERE path = ?1")?
+                .execute([old])?;
+        }
+        tx.prepare_cached(
+            "INSERT INTO export_files (path, item_id, hash, size_bytes, mtime_ns, job_id, written_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(path) DO UPDATE SET item_id = excluded.item_id, hash = excluded.hash,
+               size_bytes = excluded.size_bytes, mtime_ns = excluded.mtime_ns, job_id = excluded.job_id,
+               written_at = excluded.written_at",
+        )?
+        .execute(rusqlite::params![key, item, &hash[..], size, mtime, job, now_ms()])?;
+        Ok(())
+    })
+}
+
+/// フォルダの中の、大文字小文字を問わず `name` と同じ名前の実際の名前（APFS は大文字小文字を区別しないことが多い）。
+fn actual_name(dir: &Path, name: &str) -> String {
+    if dir.join(name).exists()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let lower = name.to_lowercase();
+        let mut found = None;
+        for e in entries.flatten() {
+            if let Some(n) = e.file_name().to_str() {
+                if n == name {
+                    return name.to_string();
+                }
+                if found.is_none() && n.to_lowercase() == lower {
+                    found = Some(n.to_string());
+                }
+            }
+        }
+        if let Some(n) = found {
+            return n;
+        }
+    }
+    name.to_string()
+}
+
+/// `src` を置く。同じ名前のファイルがあれば：
+/// - 中身が書く中身と同じなら書かない（時刻を変えず、エンジンが読み直さない。大文字小文字だけ違えば名前を直す）。
+/// - Kura がこのアイテムとして書いた記録どおりのまま（大きさ・更新時刻・中身が記録と同じで、この回に書いたものでない）なら置き換える。
+/// - ほか（取り込み元のファイル・利用者が直したファイル・ほかのアイテムとして書いたファイル・読めないファイル）は壊さず番号を付ける。
+///
+/// 書いたファイル（新しく置いた・置き換えた）は記録する。一時ファイルは書くと決めてから作る。(名前, 置き換えたか)。
+fn place_recorded(cx: &PlaceCx<'_>, src: &Path, name: &str) -> Result<(String, bool)> {
+    let temp = cx.dir.join(cx.temp_name);
+    let mut temp_ready = false;
+    let make_temp = |ready: &mut bool| -> Result<()> {
+        if !*ready {
+            // 前に中断したときの一時ファイル（自分の名前のもの）だけ消す
+            let _ = std::fs::remove_file(&temp);
+            reflink_copy::reflink_or_copy(src, &temp)?;
+            *ready = true;
+        }
+        Ok(())
+    };
+    let placed = (|| {
+        for n in 1..=MAX_TRIES {
+            let candidate = numbered_file(name, n);
+            let dst = cx.dir.join(&candidate);
+            match std::fs::symlink_metadata(&dst) {
+                Ok(meta) if meta.is_file() => {
+                    let actual = actual_name(cx.dir, &candidate);
+                    let real = cx.dir.join(&actual);
+                    let record = match key_of(cx.dir_c, &actual) {
+                        Some(key) => record_of(cx.library, &key)?,
+                        None => None,
+                    };
+                    // この回にほかのアイテムとして書いたファイルには触れない
+                    if record
+                        .as_ref()
+                        .is_some_and(|r| r.job_id == cx.job && r.item_id != cx.item_id)
+                    {
+                        continue;
+                    }
+                    let same =
+                        meta.len() == cx.size && hash_file(&real).is_ok_and(|h| h == cx.hash);
+                    if same {
+                        if actual != candidate {
+                            std::fs::rename(&real, &dst)?;
+                            if record.is_some() {
+                                write_record(cx, &candidate, Some(&actual))?;
+                            }
+                        }
+                        return Ok((candidate, true));
+                    }
+                    let ours = record.as_ref().is_some_and(|r| {
+                        r.item_id == cx.item_id
+                            && r.job_id != cx.job
+                            && u64::try_from(r.size).ok() == Some(meta.len())
+                            && r.mtime_ns == mtime_ns(&meta)
+                            && hash_file(&real).is_ok_and(|h| h.as_slice() == r.hash.as_slice())
+                    });
+                    if ours {
+                        make_temp(&mut temp_ready)?;
+                        std::fs::rename(&temp, &real)?;
+                        temp_ready = false;
+                        if actual != candidate {
+                            std::fs::rename(&real, &dst)?;
+                        }
+                        write_record(cx, &candidate, Some(&actual))?;
+                        return Ok((candidate, true));
+                    }
+                    continue;
+                }
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                // 読めない（許されていない）名前は、持ち主が分からないので番号を付ける
+                Err(_) => continue,
+            }
+            make_temp(&mut temp_ready)?;
+            match std::fs::hard_link(&temp, &dst) {
+                Ok(()) => {
+                    write_record(cx, &candidate, None)?;
+                    return Ok((candidate, false));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {
+                    // ハードリンクが使えないボリューム（exFAT など）：なければ名前を変える
+                    if std::fs::symlink_metadata(&dst).is_ok() {
+                        continue;
+                    }
+                    std::fs::rename(&temp, &dst)?;
+                    temp_ready = false;
+                    write_record(cx, &candidate, None)?;
+                    return Ok((candidate, false));
+                }
+            }
+        }
+        Err(CoreError::Invalid(format!(
+            "同じ名前のファイルが多すぎます: {name}"
+        )))
+    })();
+    let _ = std::fs::remove_file(&temp);
+    placed
 }
 
 impl ExportHandler {
-    /// 1 件を書き出す（名前の規則で名前を決め、形式を変えるならエンジンで描き、Kura が書いたファイルなら置き換える）。
-    fn export_one(&self, ctx: &JobContext, one: &One<'_>, dir: &Path) -> Result<Done> {
+    /// 1 件を書き出す（名前の規則で名前を決め、形式を変えるならエンジンで描き、Kura が書いた記録どおりのファイルなら置き換える）。
+    fn export_one(
+        &self,
+        ctx: &JobContext,
+        one: &One<'_>,
+        dir: &Path,
+        dir_c: &Path,
+    ) -> Result<Done> {
         let library = ctx.library();
         let row = item_row(library, one.item_id)?;
+        if row.trashed {
+            return Ok(Done {
+                skipped: true,
+                ..Done::default()
+            });
+        }
         let parts = NameParts {
             item_id: one.item_id,
             title: &row.title,
@@ -542,29 +814,41 @@ impl ExportHandler {
             width: row.width,
             height: row.height,
         };
-        let owned = owned_hashes(library, one.item_id, row.hash)?;
         let temp = format!(".kura-export-{}-{}.part", ctx.id(), one.cursor);
+        let place = |hash: [u8; 32], size: u64| PlaceCx {
+            library,
+            job: ctx.id(),
+            item_id: one.item_id,
+            hash,
+            size,
+            dir,
+            dir_c,
+            temp_name: &temp,
+        };
         match plan(
             row.kind,
             &row.ext,
+            row.codec.as_deref(),
             one.options.target(row.kind),
             one.writable,
         ) {
             Plan::Copy => {
                 let src = library.layout().content_path(&row.hash, &row.ext);
-                if !src.is_file() {
-                    return Err(CoreError::NotFound(format!(
-                        "ライブラリのファイルがありません: {}",
-                        src.display()
-                    )));
-                }
+                let size = match std::fs::metadata(&src) {
+                    Ok(m) if m.is_file() => m.len(),
+                    _ => {
+                        return Err(CoreError::NotFound(format!(
+                            "ライブラリのファイルがありません: {}",
+                            src.display()
+                        )));
+                    }
+                };
                 let name = rule_name(&one.options.name, &parts, &row.ext);
-                let (name, replaced) = place_owned(&src, dir, &name, &temp, &owned, row.hash)?;
+                let (name, replaced) = place_recorded(&place(row.hash, size), &src, &name)?;
                 Ok(Done {
                     name,
-                    converted: false,
                     replaced,
-                    stopped: None,
+                    ..Done::default()
                 })
             }
             Plan::Convert { format } => {
@@ -591,12 +875,10 @@ impl ExportHandler {
                         options: serde_json::json!({}),
                     };
                 }
-                let mut marked = one.state.clone();
-                marked.decoding = Some(one.cursor as u64);
                 let unit = ExportUnit {
                     ctx,
-                    marked: serde_json::to_string(&marked)?,
-                    cleared: serde_json::to_string(one.state)?,
+                    state: one.state,
+                    cursor: one.cursor,
                 };
                 let saver = Saver::new(engine);
                 let written = match saver.prepare_graph(
@@ -608,21 +890,22 @@ impl ExportHandler {
                         version: head.version,
                     },
                     &graph,
-                    GraphExtra::default(),
+                    GraphExtra {
+                        transient: true,
+                        ..GraphExtra::default()
+                    },
                 )? {
                     Flow::Go(w) => w,
                     Flow::Stop(end) => {
                         return Ok(Done {
-                            name: String::new(),
-                            converted: false,
-                            replaced: false,
                             stopped: Some(end),
+                            ..Done::default()
                         });
                     }
                 };
                 let (hash, size, ext) = (written.out_hash(), written.out_size(), written.out_ext());
                 let name = rule_name(&one.options.name, &parts, &ext);
-                let placed = place_owned(written.part(), dir, &name, &temp, &owned, hash);
+                let placed = place_recorded(&place(hash, size), written.part(), &name);
                 // staging は落として消す（置いたものは書き出し先の写し）
                 drop(written);
                 let (name, replaced) = placed?;
@@ -649,60 +932,26 @@ impl ExportHandler {
                     name,
                     converted: true,
                     replaced,
-                    stopped: None,
+                    ..Done::default()
                 })
             }
         }
     }
 }
 
-/// `src`（中身 `src_hash`）を `dir` に `name` で置く。同じ名前があれば：中身が `src_hash` なら書かずにそれを使い、`owned`
-/// （Kura がこのアイテムから書いたまま）なら置き換え、ほかは番号を付ける（壊さない。段 3 の決定 3）。一時ファイルにコピーして
-/// から、ないところにはすでにあれば失敗するハードリンクで名前を付け、置き換えは rename で入れ替える。(名前, 置き換えたか)。
-pub(super) fn place_owned(
-    src: &Path,
-    dir: &Path,
-    name: &str,
-    temp_name: &str,
-    owned: &BTreeSet<[u8; 32]>,
-    src_hash: [u8; 32],
-) -> Result<(String, bool)> {
+/// `src` を `dir` に `name` で置く（同じ名前があれば番号を付ける。上書きはしない。試験用：記録を持たない）。
+#[cfg(test)]
+pub(super) fn place_new(src: &Path, dir: &Path, name: &str, temp_name: &str) -> Result<String> {
     let temp = dir.join(temp_name);
-    // 前に中断したときの一時ファイル（自分の名前のもの）だけ消す
     let _ = std::fs::remove_file(&temp);
     reflink_copy::reflink_or_copy(src, &temp)?;
     let placed = (|| {
         for n in 1..=MAX_TRIES {
             let candidate = numbered_file(name, n);
-            let dst = dir.join(&candidate);
-            match std::fs::symlink_metadata(&dst) {
-                Ok(meta) if meta.is_file() => {
-                    let there = hash_file(&dst)?;
-                    if there == src_hash {
-                        // 同じ中身が置いてある：書かない（時刻を変えず、エンジンが読み直さない）
-                        return Ok((candidate, true));
-                    }
-                    if owned.contains(&there) {
-                        std::fs::rename(&temp, &dst)?;
-                        return Ok((candidate, true));
-                    }
-                    continue;
-                }
-                Ok(_) => continue,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
-            match std::fs::hard_link(&temp, &dst) {
-                Ok(()) => return Ok((candidate, false)),
+            match std::fs::hard_link(&temp, dir.join(&candidate)) {
+                Ok(()) => return Ok(candidate),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => {
-                    // ハードリンクが使えないボリューム（exFAT など）：なければ名前を変える
-                    if std::fs::symlink_metadata(&dst).is_ok() {
-                        continue;
-                    }
-                    std::fs::rename(&temp, &dst)?;
-                    return Ok((candidate, false));
-                }
+                Err(err) => return Err(CoreError::from(err)),
             }
         }
         Err(CoreError::Invalid(format!(
@@ -711,13 +960,6 @@ pub(super) fn place_owned(
     })();
     let _ = std::fs::remove_file(&temp);
     placed
-}
-
-/// `src` を `dir` に `name` で置く（同じ名前があれば番号を付ける。上書きはしない）。
-#[cfg(test)]
-pub(super) fn place_new(src: &Path, dir: &Path, name: &str, temp_name: &str) -> Result<String> {
-    let hash = hash_file(src)?;
-    place_owned(src, dir, name, temp_name, &BTreeSet::new(), hash).map(|(n, _)| n)
 }
 
 /// JSON の 1 件。

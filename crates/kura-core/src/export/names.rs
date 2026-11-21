@@ -105,16 +105,34 @@ pub fn check_template(template: &str) -> Result<()> {
     Ok(())
 }
 
-/// テンプレートの語を置き換える（確かめたテンプレートを渡す）。
+/// テンプレートの語を置き換える（確かめたテンプレートを渡す）。前から 1 回だけ読み、入れた値（表示名など）の中の `{…}` は
+/// 置き換えない。
 fn expand(template: &str, parts: &NameParts<'_>) -> String {
     let num = |v: Option<i64>| v.map_or(String::new(), |v| v.to_string());
-    template
-        .replace(TOKEN_TITLE, parts.title)
-        .replace(TOKEN_ORIGINAL, split_ext(parts.original_name).0)
-        .replace(TOKEN_INDEX, &format!("{:03}", parts.index))
-        .replace(TOKEN_UNIT, parts.unit.unwrap_or(""))
-        .replace(TOKEN_WIDTH, &num(parts.width))
-        .replace(TOKEN_HEIGHT, &num(parts.height))
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open..];
+        let Some(close) = after.find('}') else {
+            out.push_str(after);
+            return out;
+        };
+        let token = &after[..=close];
+        let value = match token {
+            TOKEN_TITLE => parts.title.to_string(),
+            TOKEN_ORIGINAL => split_ext(parts.original_name).0.to_string(),
+            TOKEN_INDEX => format!("{:03}", parts.index),
+            TOKEN_UNIT => parts.unit.unwrap_or("").to_string(),
+            TOKEN_WIDTH => num(parts.width),
+            TOKEN_HEIGHT => num(parts.height),
+            other => other.to_string(),
+        };
+        out.push_str(&value);
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 語の区切りか（空白・`_`・`-`・`.`・全角の空白）。
@@ -197,24 +215,34 @@ pub fn apply_style(text: &str, style: NameStyle) -> String {
     }
 }
 
-/// ASCII の文字だけにする（英数字と区切り・ASCII の記号を残す）。続いた区切りは 1 つにし、両端の区切りを除く。
+/// ASCII の文字だけにする（書き方を当てる前に）。ASCII でない文字の並びは語の区切り（空白 1 つ）にし、そのため区切りが続いた
+/// ところと両端だけを詰める（もともと ASCII の名前の区切りは変えない）。
 fn ascii_only(text: &str) -> String {
-    let kept: String = text
-        .chars()
-        .filter(|c| c.is_ascii() && !c.is_ascii_control())
-        .collect();
+    // まず ASCII でない文字の並びを印にする（印は語の区切り）
+    const MARK: char = '\u{1}';
+    let mut marked = String::new();
+    for c in text.chars() {
+        if c.is_ascii() && !c.is_ascii_control() {
+            marked.push(c);
+        } else if !marked.ends_with(MARK) {
+            marked.push(MARK);
+        }
+    }
+    // 印は、両端と区切りの隣なら消し、ほかは空白にする
+    let chars: Vec<char> = marked.chars().collect();
     let mut out = String::new();
-    let mut last_sep = false;
-    for c in kept.chars() {
-        let sep = is_separator(c);
-        if sep && (out.is_empty() || last_sep) {
+    for (i, &c) in chars.iter().enumerate() {
+        if c != MARK {
+            out.push(c);
             continue;
         }
-        out.push(c);
-        last_sep = sep;
-    }
-    while out.ends_with(is_separator) {
-        out.pop();
+        let before = out.chars().last();
+        let after = chars[i + 1..].iter().copied().find(|&n| n != MARK);
+        let at_edge = before.is_none() || after.is_none();
+        let by_sep = before.is_some_and(is_separator) || after.is_some_and(is_separator);
+        if !at_edge && !by_sep {
+            out.push(' ');
+        }
     }
     out
 }
@@ -225,11 +253,12 @@ pub fn rule_stem(rule: &NameRule, parts: &NameParts<'_>) -> String {
         Some(t) => expand(t, parts),
         None => split_ext(parts.original_name).0.to_string(),
     };
-    let mut stem = apply_style(&nfc(raw.trim()), rule.style);
+    let mut raw = nfc(raw.trim());
+    // ASCII にするなら書き方の前に（日本語の語が消えて、camelCase の頭が大文字になったり、前後の語がつながったりしない）
     if rule.ascii {
-        stem = ascii_only(&stem);
+        raw = ascii_only(&raw);
     }
-    let stem = stem.trim().to_string();
+    let stem = apply_style(raw.trim(), rule.style).trim().to_string();
     if stem.is_empty() || stem.chars().all(is_separator) {
         apply_style(&format!("item-{}", parts.item_id), rule.style)
     } else {
@@ -237,14 +266,17 @@ pub fn rule_stem(rule: &NameRule, parts: &NameParts<'_>) -> String {
     }
 }
 
-/// フォルダの名前（ユニット）に書き方と ASCII を当てる（テンプレートは当てない）。空になれば `fallback`。
+/// フォルダの名前（ユニット）に書き方と ASCII を当てる（テンプレートは当てない）。空になれば `fallback`（`unit-<ID>`）に
+/// 書き方を当てたもの。
 pub fn rule_folder(rule: &NameRule, name: &str, fallback: &str) -> String {
-    let mut out = apply_style(name, rule.style);
-    if rule.ascii {
-        out = ascii_only(&out);
-    }
-    if out.trim().is_empty() {
-        fallback.to_string()
+    let raw = if rule.ascii {
+        ascii_only(name)
+    } else {
+        name.to_string()
+    };
+    let out = apply_style(raw.trim(), rule.style);
+    if out.trim().is_empty() || out.chars().all(is_separator) {
+        apply_style(fallback, rule.style)
     } else {
         out
     }
@@ -260,7 +292,10 @@ pub fn rule_name(rule: &NameRule, parts: &NameParts<'_>, ext: &str) -> String {
     if rule == &NameRule::default() {
         return safe_name(&export_name(parts.original_name, ext), &fallback);
     }
-    safe_name(&format!("{}.{ext}", rule_stem(rule, parts)), &fallback)
+    // 長い名前は語幹の側を詰めて拡張子を残す（255 バイト）
+    let room = MAX_NAME_BYTES.saturating_sub(ext.len() + 1);
+    let stem = truncate_bytes(&rule_stem(rule, parts), room);
+    safe_name(&format!("{stem}.{ext}"), &fallback)
 }
 
 /// APFS・HFS+ のファイル名の上限（バイト）。
@@ -496,7 +531,57 @@ mod tests {
         };
         assert_eq!(rule_name(&slash, &parts("a/b", "a.png"), "png"), "_a_b.png");
         assert_eq!(rule_folder(&rule, "鎌倉 Trip", "unit-1"), "trip");
-        assert_eq!(rule_folder(&rule, "鎌倉", "unit-1"), "unit-1");
+        assert_eq!(rule_folder(&rule, "鎌倉", "unit-1"), "unit_1");
+        // camelCase と ASCII：日本語の語が消えても頭は小文字、語の間の日本語は区切り
+        let camel = NameRule {
+            template: Some("{名前}".into()),
+            style: NameStyle::Camel,
+            ascii: true,
+        };
+        assert_eq!(
+            rule_name(&camel, &parts("勇者 idle walk", "a.png"), "png"),
+            "idleWalk.png"
+        );
+        assert_eq!(
+            rule_name(&rule, &parts("Hero勇者Idle", "a.png"), "png"),
+            "hero_idle.png"
+        );
+        // もともと ASCII の名前は、ASCII にしても区切りを変えない
+        let keep_ascii = NameRule {
+            template: Some("{名前}".into()),
+            style: NameStyle::Keep,
+            ascii: true,
+        };
+        assert_eq!(
+            rule_name(&keep_ascii, &parts("Track 01 - Intro", "a.wav"), "wav"),
+            "Track 01 - Intro.wav"
+        );
+        assert_eq!(
+            rule_name(&keep_ascii, &parts("hero__idle", "a.png"), "png"),
+            "hero__idle.png"
+        );
+        assert_eq!(
+            rule_name(&keep_ascii, &parts("夕方 の hero", "a.png"), "png"),
+            "hero.png"
+        );
+        assert_eq!(
+            rule_name(&keep_ascii, &parts("A夕方B", "a.png"), "png"),
+            "A B.png"
+        );
+        // 入れた値の中の語は置き換えない
+        let index = NameRule {
+            template: Some("{名前}_{番号}".into()),
+            style: NameStyle::Keep,
+            ascii: false,
+        };
+        assert_eq!(
+            rule_name(&index, &parts("Frame {番号}", "a.png"), "png"),
+            "Frame {番号}_007.png"
+        );
+        // 長い名前は語幹を詰めて拡張子を残す（文字の途中で切らない）
+        let long = "あ".repeat(90);
+        let name = rule_name(&index, &parts(&long, "a.png"), "png");
+        assert!(name.len() <= 255 && name.ends_with(".png"), "{name}");
     }
 
     #[test]

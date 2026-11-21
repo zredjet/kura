@@ -1957,9 +1957,11 @@ export type ExportResultDto = {
 	exported: number,
 	failed: number,
 	/**  形式を変えて書いた数（M15 段 3。それより前の結果にはない）。 */
-	converted: number | null,
-	/**  Kura が同じアイテムから書いたファイルを置き換えた数（中身が同じで書かなかったものを含む。M15 段 3）。 */
-	replaced: number | null,
+	converted?: number | null,
+	/**  Kura が書いた記録どおりのファイルを置き換えた数（中身が同じで書かなかったものを含む。M15 段 3）。 */
+	replaced?: number | null,
+	/**  飛ばした数（ゴミ箱の中のアイテム。M15 段 3）。 */
+	skipped?: number | null,
 	/**  書いた JSON の名前（終わったとき。添えない設定なら null）。 */
 	manifest: string | null,
 };

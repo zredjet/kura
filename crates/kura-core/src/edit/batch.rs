@@ -1285,6 +1285,7 @@ impl BatchHandler {
                 GraphExtra {
                     names: names.clone(),
                     batch: Some(record.clone()),
+                    transient: false,
                 },
             )
         };

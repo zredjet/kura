@@ -8,10 +8,14 @@ use crate::error::{CoreError, Result};
 use crate::import::{MediaKind, format_id};
 use crate::project::Engine;
 
-/// Kura が書けない形式を変えるときの既定（画像）。
+/// 「変えない」でそのまま写す形式（ゲームエンジン（Godot・Unity）が読める固定の表。段 3 の検証の直し・利用者の決定）。
+pub const PLAYABLE_KEEP_IMAGE: [&str; 3] = ["png", "jpeg", "webp"];
+pub const PLAYABLE_KEEP_AUDIO: [&str; 3] = ["wav", "ogg", "mp3"];
+/// 表にない画像を変える先。
 pub const PLAYABLE_IMAGE: &str = "png";
-/// Kura が書けない形式を変えるときの既定（音声。書けなければ WAV）。
-pub const PLAYABLE_AUDIO: [&str; 2] = ["ogg", "wav"];
+/// 表にない音声を変える先：可逆（FLAC・AIFF・ALAC）は WAV、非可逆（AAC・Opus など）は Ogg Vorbis（書けなければもう一方）。
+pub const PLAYABLE_LOSSLESS_AUDIO: [&str; 2] = ["wav", "ogg"];
+pub const PLAYABLE_LOSSY_AUDIO: [&str; 2] = ["ogg", "wav"];
 
 /// 画像・音声の書く形式。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,8 +24,8 @@ pub enum FormatTarget {
     /// どの形式もそのまま写す（M9 の書き出し）。
     #[default]
     Original,
-    /// 変えない。ただし Kura が書けない形式（PSD・aseprite・SVG・HEIC・AVIF・TIFF・BMP、m4a・Opus など）は、画像は PNG・音声は
-    /// Ogg Vorbis に変えて書く（段 3 の決定 2）。
+    /// 変えない。ただしゲームエンジンが読める表（画像 PNG・JPEG・WebP、音声 WAV・Ogg Vorbis・MP3）にない形式は、画像は PNG、
+    /// 音声は可逆なら WAV・非可逆なら Ogg Vorbis に変えて書く（段 3 の決定 2 と検証の直し）。
     Playable,
     /// この形式で書く（形式の表の ID。`png`・`webp`・`ogg` など）。
     To { format: String },
@@ -39,10 +43,18 @@ pub enum Plan {
 /// 形式を書けるか（形式の表の ID）。
 pub type Writable<'a> = &'a dyn Fn(&str) -> bool;
 
-/// 1 件の書き方を決める。`writable` が None（エンジンの部品がない）なら、書けるかを判断できないので「変えない」は写す。
+/// 音声の形式が可逆か（FLAC・AIFF・WAV と、コーデックが ALAC の m4a）。
+fn lossless_audio(format: Option<&str>, codec: Option<&str>) -> bool {
+    matches!(format, Some("flac" | "aiff" | "wav"))
+        || codec.is_some_and(|c| c.eq_ignore_ascii_case("alac"))
+}
+
+/// 1 件の書き方を決める（`codec` は items.codec_info の主なコーデック。m4a の可逆を見分ける）。`writable` は変える先を選ぶのに
+/// 使う（None ならエンジンの部品がないので、変える 1 件は書くときに失敗する）。
 pub fn plan(
     kind: MediaKind,
     current_ext: &str,
+    codec: Option<&str>,
     target: &FormatTarget,
     writable: Option<Writable<'_>>,
 ) -> Plan {
@@ -53,17 +65,25 @@ pub fn plan(
     match target {
         FormatTarget::Original => Plan::Copy,
         FormatTarget::Playable => {
-            let Some(writable) = writable else {
-                return Plan::Copy;
+            let keep: &[&str] = match kind {
+                MediaKind::Audio => &PLAYABLE_KEEP_AUDIO,
+                _ => &PLAYABLE_KEEP_IMAGE,
             };
-            if current.is_some_and(writable) {
+            if current.is_some_and(|c| keep.contains(&c)) {
                 return Plan::Copy;
             }
             let to = match kind {
-                MediaKind::Audio => PLAYABLE_AUDIO
-                    .into_iter()
-                    .find(|f| writable(f))
-                    .unwrap_or(PLAYABLE_AUDIO[0]),
+                MediaKind::Audio => {
+                    let order = if lossless_audio(current, codec) {
+                        PLAYABLE_LOSSLESS_AUDIO
+                    } else {
+                        PLAYABLE_LOSSY_AUDIO
+                    };
+                    order
+                        .into_iter()
+                        .find(|f| writable.is_some_and(|w| w(f)))
+                        .unwrap_or(order[0])
+                }
                 _ => PLAYABLE_IMAGE,
             };
             Plan::Convert {
@@ -209,78 +229,99 @@ impl ExportPreset {
 mod tests {
     use super::*;
 
-    fn writable(f: &str) -> bool {
-        matches!(
-            f,
-            "png" | "jpeg" | "gif" | "webp" | "wav" | "aiff" | "flac" | "ogg"
-        )
-    }
-
     #[test]
     fn plans_copy_or_convert_by_kind_and_target() {
-        let w: Writable<'_> = &writable;
+        // macOS の組に近い：m4a（AAC）・MP3 も書ける
+        let w: Writable<'_> = &|f: &str| {
+            matches!(
+                f,
+                "png" | "jpeg" | "gif" | "webp" | "wav" | "aiff" | "flac" | "ogg" | "mp3" | "m4a"
+            )
+        };
         let to = |f: &str| FormatTarget::To { format: f.into() };
         let convert = |f: &str| Plan::Convert { format: f.into() };
+        let pl = FormatTarget::Playable;
         // そのまま（M9）はいつも写す
         assert_eq!(
-            plan(MediaKind::Image, "psd", &FormatTarget::Original, Some(w)),
+            plan(
+                MediaKind::Image,
+                "psd",
+                None,
+                &FormatTarget::Original,
+                Some(w)
+            ),
             Plan::Copy
         );
-        // 変えない：書ける形式は写し、書けない形式は PNG・Ogg に
-        assert_eq!(
-            plan(MediaKind::Image, "png", &FormatTarget::Playable, Some(w)),
-            Plan::Copy
-        );
-        assert_eq!(
-            plan(MediaKind::Image, "jpg", &FormatTarget::Playable, Some(w)),
-            Plan::Copy
-        );
-        for ext in ["psd", "ase", "svg", "heic", "avif", "tif", "bmp"] {
+        // 変えない：エンジンが読める表の形式は写し、ほかは変える（Kura が書けても GIF・m4a・FLAC・AIFF は変える）
+        for ext in ["png", "jpg", "jpeg", "webp"] {
             assert_eq!(
-                plan(MediaKind::Image, ext, &FormatTarget::Playable, Some(w)),
+                plan(MediaKind::Image, ext, None, &pl, Some(w)),
+                Plan::Copy,
+                "{ext}"
+            );
+        }
+        for ext in ["psd", "ase", "svg", "heic", "avif", "tif", "bmp", "gif"] {
+            assert_eq!(
+                plan(MediaKind::Image, ext, None, &pl, Some(w)),
                 convert("png"),
                 "{ext}"
             );
         }
-        for ext in ["m4a", "opus", "mp3"] {
+        for ext in ["wav", "ogg", "mp3"] {
             assert_eq!(
-                plan(MediaKind::Audio, ext, &FormatTarget::Playable, Some(w)),
-                convert("ogg"),
+                plan(MediaKind::Audio, ext, None, &pl, Some(w)),
+                Plan::Copy,
                 "{ext}"
             );
         }
-        // Ogg が書けなければ WAV
-        let no_ogg = |f: &str| f == "wav";
+        // 可逆は WAV、非可逆は Ogg（m4a はコーデックで見分ける）
+        for ext in ["flac", "aiff"] {
+            assert_eq!(
+                plan(MediaKind::Audio, ext, None, &pl, Some(w)),
+                convert("wav"),
+                "{ext}"
+            );
+        }
         assert_eq!(
-            plan(
-                MediaKind::Audio,
-                "m4a",
-                &FormatTarget::Playable,
-                Some(&no_ogg)
-            ),
+            plan(MediaKind::Audio, "m4a", Some("alac"), &pl, Some(w)),
+            convert("wav")
+        );
+        assert_eq!(
+            plan(MediaKind::Audio, "m4a", Some("aac"), &pl, Some(w)),
+            convert("ogg")
+        );
+        assert_eq!(
+            plan(MediaKind::Audio, "opus", None, &pl, Some(w)),
+            convert("ogg")
+        );
+        // 変える先が書けなければもう一方
+        let only_wav: Writable<'_> = &|f: &str| f == "wav";
+        assert_eq!(
+            plan(MediaKind::Audio, "opus", None, &pl, Some(only_wav)),
             convert("wav")
         );
         // 選んだ形式：同じ形式なら写す（jpg と jpeg は同じ）
         assert_eq!(
-            plan(MediaKind::Image, "jpg", &to("jpeg"), Some(w)),
+            plan(MediaKind::Image, "jpg", None, &to("jpeg"), Some(w)),
             Plan::Copy
         );
         assert_eq!(
-            plan(MediaKind::Image, "png", &to("webp"), Some(w)),
+            plan(MediaKind::Image, "png", None, &to("webp"), Some(w)),
             convert("webp")
         );
         assert_eq!(
-            plan(MediaKind::Audio, "wav", &to("ogg"), Some(w)),
+            plan(MediaKind::Audio, "wav", None, &to("ogg"), Some(w)),
             convert("ogg")
         );
-        // 動画・フォント・3D はいつも写す。エンジンの部品がなければ「変えない」は写す
+        // 動画・フォント・3D はいつも写す。エンジンの部品がなくても表で決める（変える 1 件は書くときに失敗する）
         for kind in [MediaKind::Video, MediaKind::Font, MediaKind::Model] {
-            assert_eq!(plan(kind, "mp4", &to("png"), Some(w)), Plan::Copy);
+            assert_eq!(plan(kind, "mp4", None, &to("png"), Some(w)), Plan::Copy);
         }
         assert_eq!(
-            plan(MediaKind::Image, "psd", &FormatTarget::Playable, None),
-            Plan::Copy
+            plan(MediaKind::Image, "psd", None, &pl, None),
+            convert("png")
         );
+        assert_eq!(plan(MediaKind::Image, "png", None, &pl, None), Plan::Copy);
     }
 
     #[test]

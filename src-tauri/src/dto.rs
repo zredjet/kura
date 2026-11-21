@@ -310,9 +310,14 @@ pub struct ExportResultDto {
     pub exported: u64,
     pub failed: u64,
     /// 形式を変えて書いた数（M15 段 3。それより前の結果にはない）。
+    #[specta(optional)]
     pub converted: Option<u64>,
-    /// Kura が同じアイテムから書いたファイルを置き換えた数（中身が同じで書かなかったものを含む。M15 段 3）。
+    /// Kura が書いた記録どおりのファイルを置き換えた数（中身が同じで書かなかったものを含む。M15 段 3）。
+    #[specta(optional)]
     pub replaced: Option<u64>,
+    /// 飛ばした数（ゴミ箱の中のアイテム。M15 段 3）。
+    #[specta(optional)]
+    pub skipped: Option<u64>,
     /// 書いた JSON の名前（終わったとき。添えない設定なら null）。
     pub manifest: Option<String>,
 }

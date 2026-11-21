@@ -116,6 +116,10 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
       }
       void pickRecipeAndApply(entries);
     } else if (key === 'e' && e.shiftKey) {
+      // 書き出し：ゴミ箱の中では出さない（項目のメニューと同じ。M15 段 3 の検証の直し）
+      if (kind === 'trash') {
+        return false;
+      }
       void exportEntries(entries);
     } else if (key === 'e' && !e.altKey) {
       // 画像エディタ（M12）：画像 1 件のときだけ（ゴミ箱の中・ユニットでは開かない）
