@@ -96,6 +96,7 @@ Kura Library.kuralib/
 | `0013_item_sources` | N → 1 の来歴（M14 段 6。docs/editing.md §4.5・§14.2「N → 1」、ADR-197）：選んだ N 件から作ったスプライトシート（新しいアイテム。元はできたファイル）の元を、選んだ順に元のアイテム・読んだときの頭の版・読んだ中身・並べたフレームの数で持つ `item_sources`（別名で保存の来歴 `item_derivations` は元 1 つなので別の表）。新しい表だけなので Plain（合成 10 万件 `--history` で 0.15〜0.18 ms。`bench migrate --runs 3`、2026-11-20）。作ったアイテムを消すと行も消え（CASCADE）、元のアイテムを消すと NULL（SET NULL） |
 | `0014_credits` | ライセンスとクレジット（M15 段 1。§4「ライセンスとクレジット（M15）」、ADR-202・203）：ライセンスの表 `licenses`（既定の 13 行を入れる。`builtin` に鍵、名前は大文字小文字を問わず一意、表記義務 `attribution`（required・optional・none）・商用・改変・継承の印）と、アイテムごとのクレジット `item_credits`（ライセンス・作者・作品・出典・表記の文。何か入っているアイテムにだけ行がある）を足す。新しい表だけなので Plain（合成 10 万件 `--history` で 0.17〜0.18 ms。照合の差 0。`bench migrate --runs 3`、2026-11-21）。アイテムを消すとクレジットも消え（CASCADE）、自作のライセンスを消すと未設定に戻る（SET NULL） |
 | `0015_projects` | プロジェクトと使った記録（M15 段 2。§4「プロジェクトと使った記録（M15）」、ADR-202・204）：登録したプロジェクト `projects`（名前・正規化した絶対パス（一意）・エンジン（godot・unity・folder）・持ち出しの既定 `settings`（段 3）・並び・見つからない印 `missing`・照らし終えた時刻）、照らし直しが見たファイル `project_files`（相対パス・大きさ・更新時刻・ハッシュ・一致したアイテムと何と一致したか）、持ち出した出力 `item_outputs`（段 3・5 が書く中身とアイテム）を足し、`jobs_kind` に `project`（照らし直し）を足す（名前付きの CHECK の入れ替え）。新しい表と CHECK の入れ替えだけなので Plain（合成 10 万件 `--history` で 0.83〜0.84 ms。jobs の CHECK の入れ替えが全行を確かめる分。照合の差 0。`bench migrate --runs 3`、2026-11-21）。プロジェクトを消すとファイルの行も消え（CASCADE）、アイテムを消すとファイルの行は残って未一致（SET NULL）、持ち出した出力は消える（CASCADE） |
+| `0016_export_files` | Kura が書き出したファイルの記録（M15 段 3 の検証の直し。§4「プロジェクトと使った記録（M15）」の「書き出したファイル」、ADR-205 (6)）：書いたファイルの絶対パス（書き出し先を正規化したフォルダ＋書いた名前）・アイテム・中身・大きさ・書いた直後の更新時刻・書いたジョブ `export_files`。書き出し先の同じ名前のファイルは、この記録どおりのままのものだけを置き換える。新しい表だけなので Plain（合成 10 万件 `--history` で 0.06〜0.07 ms。照合の差 0。`bench migrate --runs 3`、2026-11-21）。アイテムを消すと記録も消える（CASCADE） |
 
 ```sql
 -- ===== 実ファイルの台帳（0007。files/ab/cd/<hash>.<ext> 1 つに 1 行）=====
@@ -782,6 +783,18 @@ CREATE TABLE item_outputs (
 ) WITHOUT ROWID;
 CREATE INDEX idx_item_outputs_item ON item_outputs(item_id);
 
+-- ===== 書き出したファイル（0016。M15 段 3 の検証の直し。置き換えてよいファイルの記録）=====
+CREATE TABLE export_files (
+  path        TEXT    NOT NULL PRIMARY KEY,              -- 書いたファイルの絶対パス（書き出し先を正規化したフォルダ＋書いた名前）
+  item_id     INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  hash        BLOB    NOT NULL,                          -- 書いた中身
+  size_bytes  INTEGER NOT NULL CONSTRAINT export_files_size CHECK (size_bytes >= 0),
+  mtime_ns    INTEGER NOT NULL,                          -- 書いた直後の更新時刻
+  job_id      INTEGER NOT NULL,                          -- 書いた書き出しのジョブ（同じ回に書いたものは置き換えない）
+  written_at  INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX idx_export_files_item ON export_files(item_id);
+
 -- ===== 全文検索（外部コンテンツ FTS5、trigram）=====
 CREATE VIRTUAL TABLE items_fts USING fts5(
   title, original_name, note, source_url,
@@ -1290,7 +1303,8 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   （主キー。クレジットの一覧の対象。段 4）、アイテムを使っているプロジェクトは `idx_project_files_item`。アイテムを消すと行は残って未一致に
   なり、次の照らしで付け直す（同じ中身のほかのアイテムがあればそれ）。`matched` は `item_id` があるときだけ意味を持つ（アイテムを消した
   直後は前の値が残るので、読み手は `item_id` で絞る）。
-- **持ち出した出力** `item_outputs` は段 3 の書き出し（形式を変えて書いた 1 件ごとに `INSERT … ON CONFLICT(hash, item_id) DO NOTHING`。今と同じ中身なら書かない）と段 5 のドラッグアウトが書く。書き出しは、書き出し先の同じ名前のファイルが、そのアイテムの今・元・過去の版（`item_versions.output_hash`）・持ち出した出力のどれかなら置き換える（`SELECT output_hash FROM item_versions WHERE item_id = ?`・`SELECT hash FROM item_outputs WHERE item_id = ?`。どちらも索引）。
+- **持ち出した出力** `item_outputs` は段 3 の書き出し（形式を変えて書いた 1 件ごとに `INSERT … ON CONFLICT(hash, item_id) DO NOTHING`。今と同じ中身なら書かない）と段 5 のドラッグアウトが書く。
+- **書き出したファイル** `export_files`（0016。段 3 の検証の直し・利用者の決定）：書き出しが新しく置いた・置き換えたファイルを、正規化した絶対パスを鍵に `INSERT … ON CONFLICT(path) DO UPDATE` で記録する（大文字小文字を直したら古いパスの行を消す）。書き出し先に同じ名前のファイルがあれば、実際の名前（大文字小文字を問わず探す）の行を主キーで引き、記録が同じアイテムで、この回のジョブでなく、大きさ・更新時刻・中身が記録と同じときだけ置き換える（取り込み元のファイル・利用者が直したファイル・ほかのアイテムとして書いたファイルは置き換えない）。ユニットのフォルダは、同じ名前のフォルダの中（`path > 'フォルダ/' AND path < 'フォルダ0'`。主キーの範囲）にそのユニットのアイテムの記録があれば使い直す。消えたファイルの記録は残る（同じ名前の新しいファイルは中身が記録と違うので置き換えない）。
 - **持ち出しの既定** `projects.settings`（段 3）：`project::settings` が `export::ExportPreset::from_json` で読む（`'{}'`・読めないものはエンジンの既定：godot は snake_case、unity は PascalCase、folder はそのまま。形式は「変えない（書けない形式は変える）」、JSON は添えない）。`set_settings` は名前のテンプレートと形式を確かめてから書く。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
