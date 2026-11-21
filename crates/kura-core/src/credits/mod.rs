@@ -8,6 +8,7 @@
 pub mod collect;
 pub mod item;
 pub mod licenses;
+pub mod render;
 
 use crate::error::{CoreError, Result};
 use crate::text::nfc;
