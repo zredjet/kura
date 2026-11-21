@@ -183,6 +183,11 @@ impl LibrarySession {
                 Arc::new(ThumbnailHandler::new(backend).with_engine(engine.clone())),
             ),
             (JobKind::Export, Arc::new(ExportHandler)),
+            // 登録したプロジェクトの照らし直し（M15 段 2。エンジンの部品は要らない）
+            (
+                JobKind::Project,
+                Arc::new(crate::project::scan::ProjectHandler),
+            ),
             (
                 JobKind::Proxy,
                 Arc::new(ProxyHandler::new(ProxyTools::detect(), proxy.clone())),
@@ -259,6 +264,10 @@ impl LibrarySession {
                     sync_analysis(&lib, &jobs2);
                     // 置き換えた版の片付け（7 日とバックアップの条件を満たす候補・孤立した部品があるときだけ）
                     queue_gc(&lib, &jobs2, &clock);
+                }
+                // 登録したプロジェクトがあれば照らし直す（裏で。変わったファイルだけハッシュする。M15 段 2 の決定 2）
+                if let Err(err) = crate::project::queue_on_open(lib.db(), &jobs2) {
+                    tracing::error!(%err, "プロジェクトの照らし直しを積めませんでした");
                 }
             })?;
 
