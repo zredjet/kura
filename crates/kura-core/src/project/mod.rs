@@ -126,9 +126,9 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// `inner` が `outer` と同じか、その中か。パスの文字のほか、ファイルの見分け（祖先のどれかが `outer` と同じボリューム・inode）で
+/// `inner` が `outer` と同じか、その中か（書き出し先がプロジェクトの中かの確かめにも使う）。パスの文字のほか、ファイルの見分け（祖先のどれかが `outer` と同じボリューム・inode）で
 /// 比べる（APFS の大文字小文字を区別しない名前・ファームリンク（/System/Volumes/Data）・改名で文字が食い違っても気づく）。
-fn within(outer: &Path, inner: &Path) -> bool {
+pub fn within(outer: &Path, inner: &Path) -> bool {
     if inner.starts_with(outer) {
         return true;
     }
@@ -350,6 +350,42 @@ pub fn item_projects(conn: &Connection, item: i64) -> Result<Vec<ItemUse>> {
         }
     }
     Ok(out)
+}
+
+/// 持ち出しの既定（`projects.settings`。M15 段 3。空ならエンジンごとの既定）。
+pub fn settings(conn: &Connection, id: i64) -> Result<crate::export::ExportPreset> {
+    let p = get(conn, id)?;
+    let json: String = conn
+        .prepare_cached("SELECT settings FROM projects WHERE id = ?1")?
+        .query_row([id], |r| r.get(0))?;
+    Ok(crate::export::ExportPreset::from_json(&json, p.engine))
+}
+
+/// 持ち出しの既定を書く（名前のテンプレートと形式を確かめる）。
+pub fn set_settings(
+    conn: &Connection,
+    id: i64,
+    preset: &crate::export::ExportPreset,
+    now: i64,
+) -> Result<()> {
+    get(conn, id)?;
+    preset.options(id).check()?;
+    let json = serde_json::to_string(preset)?;
+    conn.prepare_cached("UPDATE projects SET settings = ?2, updated_at = ?3 WHERE id = ?1")?
+        .execute(params![id, json, now])?;
+    Ok(())
+}
+
+/// 書き出し先 `dest` がプロジェクト `p` のフォルダの中か確かめる（ファイルシステムを見るので書き手の外で）。
+pub fn check_dest(p: &Project, dest: &Path) -> Result<()> {
+    if within(Path::new(&p.root), dest) {
+        Ok(())
+    } else {
+        Err(CoreError::Invalid(format!(
+            "プロジェクト「{}」のフォルダの中を選んでください",
+            p.name
+        )))
+    }
 }
 
 /// 照らし直しのジョブを積む（登録したプロジェクト全部を照らす。待っているものがあれば積まない）。

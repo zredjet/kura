@@ -1224,6 +1224,22 @@ impl Written {
     pub(crate) fn base(&self) -> Base {
         self.p.base
     }
+
+    /// 書いた出力の中身（M15 段 3 の書き出し）。
+    pub(crate) fn out_hash(&self) -> [u8; 32] {
+        self.p.out_hash
+    }
+
+    /// 書いた出力の大きさ。
+    pub(crate) fn out_size(&self) -> u64 {
+        self.p.out_size
+    }
+
+    /// 書いた出力の拡張子（形式が今と同じなら今の拡張子、ほかは形式の代表の拡張子）。
+    pub(crate) fn out_ext(&self) -> String {
+        output_ext(&self.p.out_format, &self.p.ext_hint, None)
+            .unwrap_or_else(|| self.p.out_format.clone())
+    }
 }
 
 impl Saver {

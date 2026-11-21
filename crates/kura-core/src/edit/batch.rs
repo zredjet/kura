@@ -1652,7 +1652,7 @@ fn bind_skip(e: BindError) -> Skip {
 
 /// 頭の文書（版 `version`。版 0 と、版 0 に戻した版は空の文書）。DB から読んだバイト列を一括のプールで読み込む（エディタの
 /// プレビューのプールを使わない。M14 段 4 の検証の直し）。
-fn head_doc(db: &Db, runtime: &EngineRuntime, item: i64, version: i64) -> Result<Graph> {
+pub(crate) fn head_doc(db: &Db, runtime: &EngineRuntime, item: i64, version: i64) -> Result<Graph> {
     let bytes = db.read(|c| match versions::get(c, item, version)? {
         Some(versions::Version {
             doc_id: Some(id), ..

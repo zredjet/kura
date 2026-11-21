@@ -182,7 +182,10 @@ impl LibrarySession {
                 JobKind::Thumbnail,
                 Arc::new(ThumbnailHandler::new(backend).with_engine(engine.clone())),
             ),
-            (JobKind::Export, Arc::new(ExportHandler)),
+            (
+                JobKind::Export,
+                Arc::new(ExportHandler::new(engine.clone())),
+            ),
             // 登録したプロジェクトの照らし直し（M15 段 2。エンジンの部品は要らない）
             (
                 JobKind::Project,

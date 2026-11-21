@@ -474,3 +474,43 @@ fn scan_queries_use_the_keys() {
         assert!(!plan.contains("SCAN f") && !plan.contains("SCAN project_files"), "{sql}\n{plan}");
     }
 }
+
+/// 持ち出しの既定：空ならエンジンの既定、書いたものを読み戻せ、知らない語のテンプレートは断る。書き出し先がプロジェクトの中か。
+#[test]
+fn export_settings_follow_the_engine_and_are_checked() {
+    use crate::export::names::NameStyle;
+    let env = Env::new();
+    let game = env.folder("game");
+    write(&game, "project.godot", b"");
+    let id = env.add(&game).unwrap();
+    let preset = env.library.db().read(move |c| settings(c, id)).unwrap();
+    assert_eq!(preset.name.style, NameStyle::Snake);
+    let mut changed = preset.clone();
+    changed.name.ascii = true;
+    changed.name.template = Some("{名前}_{番号}".into());
+    let saved = changed.clone();
+    env.library
+        .db()
+        .write(move |tx| set_settings(tx, id, &saved, 5))
+        .unwrap();
+    assert_eq!(
+        env.library.db().read(move |c| settings(c, id)).unwrap(),
+        changed
+    );
+    let mut bad = changed.clone();
+    bad.name.template = Some("{色}".into());
+    assert!(matches!(
+        env.library
+            .db()
+            .write(move |tx| set_settings(tx, id, &bad, 6)),
+        Err(CoreError::Invalid(_))
+    ));
+    let p = env.library.db().read(move |c| get(c, id)).unwrap();
+    let art = env.folder("game/art");
+    assert!(check_dest(&p, &art).is_ok());
+    assert!(check_dest(&p, &game).is_ok());
+    assert!(matches!(
+        check_dest(&p, &env.folder("other")),
+        Err(CoreError::Invalid(_))
+    ));
+}
