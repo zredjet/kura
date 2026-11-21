@@ -287,7 +287,12 @@ impl LibrarySession {
             on_check,
             backup_checks,
         ));
-        let dragout = DragOuts::new(library.clone(), engine.clone(), jobs.clone());
+        let dragout = DragOuts::new(
+            library.clone(),
+            engine.clone(),
+            jobs.clone(),
+            upgrade.free_space.clone(),
+        );
         Ok(Self {
             library,
             jobs,

@@ -865,6 +865,7 @@ impl ExportHandler {
                     one.item_id,
                     &row,
                     &format,
+                    false,
                 )? {
                     Flow::Go(w) => w,
                     Flow::Stop(end) => {
@@ -894,13 +895,15 @@ impl ExportHandler {
 }
 
 /// 形式を変えて描く（保存の準備の段に、元＋頭の文書を出力の形式だけ変えて渡す。版を足さず、アンカーも作らない。
-/// staging に書いた出力を返し、落とすと消える）。エンジンがなければ Unsupported。
+/// staging に書いた出力を返し、落とすと消える）。エンジンがなければ Unsupported。`interactive` なら予算を対話の枠で
+/// 待たずに確保し、足りなければ断る（ドラッグアウト）。書き出しのジョブは一括の枠で待つ。
 pub(super) fn render_converted(
     engine: Option<&Arc<EngineServices>>,
     unit: &dyn UnitCx,
     item_id: i64,
     row: &ItemRow,
     format: &str,
+    interactive: bool,
 ) -> Result<Flow<crate::edit::save::Written>> {
     let engine = engine.cloned().ok_or_else(|| {
         CoreError::Unsupported(format!(
@@ -932,6 +935,7 @@ pub(super) fn render_converted(
         &graph,
         GraphExtra {
             transient: true,
+            interactive,
             ..GraphExtra::default()
         },
     )

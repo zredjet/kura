@@ -291,13 +291,19 @@ pub fn relocate(conn: &Connection, id: i64, root: &str, engine: Engine, now: i64
     Ok(())
 }
 
-/// 登録を外す（使った記録も消える。プロジェクトのフォルダには触れない）。
+/// 登録を外す（使った記録も消える。持ち出し先に選んでいたら選んでいないことにする。プロジェクトのフォルダには触れない）。
 pub fn remove(conn: &Connection, id: i64) -> Result<()> {
     let n = conn
         .prepare_cached("DELETE FROM projects WHERE id = ?1")?
         .execute([id])?;
     if n == 0 {
         return Err(CoreError::NotFound(format!("プロジェクト {id}")));
+    }
+    // 持ち出し先に選んでいたら外す（ID は使い回されうるので、次に登録したプロジェクトを選んだことにしない。M15 段 5 の
+    // 検証の直し）
+    let key = crate::export::dragout::TARGET_KEY;
+    if crate::settings::get::<i64>(conn, key)? == Some(id) {
+        crate::settings::remove(conn, key)?;
     }
     Ok(())
 }

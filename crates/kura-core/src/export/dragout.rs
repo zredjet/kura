@@ -28,6 +28,7 @@ use super::names::{NameParts, numbered_dir, numbered_file, rule_folder, rule_nam
 use crate::edit::save::{Flow, UnitCx};
 use crate::edit::services::EngineServices;
 use crate::jobs::{Control, JobManager};
+use crate::library::upgrade::FreeSpaceFn;
 use crate::library::{Library, ThumbFormat, ThumbSize, hex};
 use crate::{CoreError, Result, settings};
 
@@ -181,6 +182,8 @@ pub struct DragOutcome {
     pub late: u64,
     /// 落とす先が求めたのに渡さなかった項目の数（作れなかった・待ちきれなかった）。
     pub missed: u64,
+    /// 渡したフォルダ（ユニット）の中で作れなかったファイルの数（できた分だけのフォルダを渡す。段 5 の検証の直し・利用者の決定）。
+    pub incomplete: u64,
 }
 
 /// 1 回のドラッグ。
@@ -238,7 +241,8 @@ impl DragSession {
     }
 
     /// 落とす先がデータを求めたとき：`index` の項目ができるまで待つ（回の最初に求められてから [`WAIT_LIMIT`] まで）。
-    /// 渡してよければ true（フォルダは中のどれかができたら）。メインスレッドから呼ばれる。
+    /// 渡してよければ true（フォルダは中が全部終わり、どれかができていれば。期限までに終わらなければ渡さない）。
+    /// メインスレッドから呼ばれる。
     pub fn wait(&self, index: usize) -> bool {
         self.wait_for(index, WAIT_LIMIT)
     }
@@ -292,6 +296,18 @@ impl DragSession {
                     .zip(&st.handed)
                     .filter(|(a, h)| **a && !**h)
                     .count() as u64,
+                incomplete: self
+                    .entries
+                    .iter()
+                    .zip(&st.handed)
+                    .filter(|(_, h)| **h)
+                    .map(|(e, _)| {
+                        st.slots[e.files.clone()]
+                            .iter()
+                            .filter(|s| **s == SlotState::Failed)
+                            .count() as u64
+                    })
+                    .sum(),
             };
             if st.ended {
                 return outcome;
@@ -428,6 +444,8 @@ struct Inner {
     library: Arc<Library>,
     engine: Option<Arc<EngineServices>>,
     jobs: Arc<JobManager>,
+    /// ボリュームの空き（クローンできずに丸写しするときに確かめる。なければ確かめない）。
+    free_space: Option<Arc<FreeSpaceFn>>,
     reg: Mutex<Registry>,
     cond: Condvar,
     timing: Timing,
@@ -464,7 +482,7 @@ fn too_many() -> CoreError {
     ))
 }
 
-/// 同じフォルダの中で同じ名前を避ける（大文字小文字を問わない。APFS は区別しないことが多い）。
+/// 同じフォルダの中で同じ名前を避ける（大文字小文字と Unicode の正規化を問わない。APFS は区別しないことが多い）。
 fn unique(used: &mut BTreeSet<String>, name: &str, dir: bool) -> String {
     for n in 1..=u32::MAX {
         let candidate = if dir {
@@ -472,7 +490,7 @@ fn unique(used: &mut BTreeSet<String>, name: &str, dir: bool) -> String {
         } else {
             numbered_file(name, n)
         };
-        if used.insert(candidate.to_lowercase()) {
+        if used.insert(crate::text::nfc(&candidate).to_lowercase()) {
             return candidate;
         }
     }
@@ -485,14 +503,16 @@ impl DragOuts {
         library: Arc<Library>,
         engine: Option<Arc<EngineServices>>,
         jobs: Arc<JobManager>,
+        free_space: Option<Arc<FreeSpaceFn>>,
     ) -> Self {
-        Self::with_timing(library, engine, jobs, Timing::default())
+        Self::with_timing(library, engine, jobs, free_space, Timing::default())
     }
 
     fn with_timing(
         library: Arc<Library>,
         engine: Option<Arc<EngineServices>>,
         jobs: Arc<JobManager>,
+        free_space: Option<Arc<FreeSpaceFn>>,
         timing: Timing,
     ) -> Self {
         Self {
@@ -500,6 +520,7 @@ impl DragOuts {
                 library,
                 engine,
                 jobs,
+                free_space,
                 reg: Mutex::new(Registry::default()),
                 cond: Condvar::new(),
                 timing,
@@ -524,6 +545,16 @@ impl DragOuts {
             let options = options(c)?;
             Ok((options, resolve(c, entries)?))
         })?;
+        // 見つからないユニット（まとまりにならなかった入力）も飛ばしたものに数える
+        let unit_inputs: BTreeSet<i64> = entries
+            .iter()
+            .filter_map(|&e| {
+                let raw = u32::try_from(e).ok()?;
+                (raw & crate::unit::LIST_FLAG != 0)
+                    .then(|| i64::from(raw & !crate::unit::LIST_FLAG))
+            })
+            .collect();
+        let found_units = groups.iter().filter_map(|g| g.unit_id).count();
         options.check()?;
         // 多すぎる選択は行を読む前に断る（ユニットのメンバーを含めた数。飛ばすものも数える）
         if groups.iter().map(|g| g.items.len()).sum::<usize>() > MAX_FILES {
@@ -536,7 +567,7 @@ impl DragOuts {
             .map(|_| &writable_fn as &dyn Fn(&str) -> bool);
 
         // まとまりごとに行を読み、ゴミ箱の中・見つからないものを飛ばす
-        let mut skipped = 0u64;
+        let mut skipped = unit_inputs.len().saturating_sub(found_units) as u64;
         let mut index = 0usize;
         let mut planned: Vec<(usize, Vec<Planned>)> = Vec::new();
         for (g, group) in groups.iter().enumerate() {
@@ -572,7 +603,7 @@ impl DragOuts {
         let files: usize = planned.iter().map(|(_, items)| items.len()).sum();
         if files == 0 {
             return Err(CoreError::Invalid(
-                "ドラッグできるアイテムがありません（ゴミ箱の中は持ち出せません）".into(),
+                "ドラッグできるアイテムがありません（ゴミ箱の中・見つからないものは持ち出せません）".into(),
             ));
         }
 
@@ -696,14 +727,12 @@ impl DragOuts {
             owner: Arc::downgrade(inner),
             timing: inner.timing,
         });
-        {
-            let mut reg = lock(&inner.reg);
+        // 閉じていないことを確かめ、片付けの係と作る係を動かしてから登録する（ロックの中で。閉じる側が作る係を待てるように）
+        let mut reg = lock(&inner.reg);
+        let started: Result<()> = (|| {
             if reg.closing {
-                drop(reg);
-                session.retire();
                 return Err(CoreError::Invalid("ライブラリを閉じています".into()));
             }
-            reg.sessions.push(session.clone());
             if reg.janitor.is_none() {
                 let weak = Arc::downgrade(inner);
                 reg.janitor = Some(
@@ -712,25 +741,36 @@ impl DragOuts {
                         .spawn(move || janitor(&weak))?,
                 );
             }
-        }
-        let (work, inner2) = (session.clone(), inner.clone());
-        let worker = std::thread::Builder::new()
-            .name("kura-dragout".into())
-            .spawn(move || prepare(&inner2, &work));
-        match worker {
-            Ok(handle) => *lock(&session.worker) = Some(handle),
+            let (work, inner2) = (session.clone(), inner.clone());
+            let worker = std::thread::Builder::new()
+                .name("kura-dragout".into())
+                .spawn(move || prepare(&inner2, &work))?;
+            *lock(&session.worker) = Some(worker);
+            Ok(())
+        })();
+        match started {
+            Ok(()) => {
+                reg.sessions.push(session.clone());
+                drop(reg);
+            }
             Err(err) => {
-                session.abort();
-                return Err(err.into());
+                drop(reg);
+                session.retire();
+                return Err(err);
             }
         }
         Ok(session)
     }
 
-    /// 閉じる：作るのをやめ、片付けの係を止め、一時置き場のドラッグアウトのフォルダを消す（何度呼んでもよい）。
+    /// 閉じる：作るのをやめ、片付けの係を止め、一時置き場のドラッグアウトのフォルダを消す（何度呼んでもよい。2 回目からは
+    /// 何もしない）。
     pub fn close(&self) {
         let (sessions, janitor) = {
             let mut reg = lock(&self.inner.reg);
+            // 2 回目からは何もしない（閉じたあとに同じライブラリを開き直していれば、その一時置き場を消してしまう）
+            if reg.closing {
+                return;
+            }
             reg.closing = true;
             (std::mem::take(&mut reg.sessions), reg.janitor.take())
         };
@@ -774,7 +814,7 @@ fn thumb_of(library: &Library, hash: &[u8; 32]) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// 裏でファイルを作る（写しはクローン、形式を変えるものはエンジンで描く）。やめたら残りは作らない。
+/// 裏でファイルを作る（写しはクローン、できなければ区切って写す。形式を変えるものはエンジンで描く）。やめたら残りは作らない。
 fn prepare(inner: &Inner, session: &DragSession) {
     for &k in &session.order {
         if session.cancel.load(Ordering::SeqCst) {
@@ -782,6 +822,13 @@ fn prepare(inner: &Inner, session: &DragSession) {
             continue;
         }
         let slot = &session.slots[k];
+        // 同じ名前のものがもうあれば書かない（回の中の名前は重ならないはずだが、ファイルシステムの比べ方の違いで重なりうる。
+        // ほかの項目のファイルを上書きしない・消さない）
+        if std::fs::symlink_metadata(&slot.path).is_ok() {
+            tracing::warn!(path = %slot.path.display(), "ドラッグアウトの同じ名前のファイルがもうあります");
+            session.set(k, SlotState::Failed);
+            continue;
+        }
         match make(inner, session, k, slot) {
             Ok(()) => session.set(k, SlotState::Ready),
             Err(err) => {
@@ -795,6 +842,47 @@ fn prepare(inner: &Inner, session: &DragSession) {
     }
 }
 
+/// 区切って写すときの 1 回の大きさ（この間ごとに中止を見る）。
+const COPY_CHUNK: usize = 8 << 20;
+
+/// `src` を `dst`（まだない）に写す。クローンできればクローン、できなければ空きを確かめてから区切って写し、回の中止で
+/// やめる（大きなファイルでも、閉じる・やめるときに待たせない）。
+fn copy_into(inner: &Inner, session: &DragSession, src: &Path, dst: &Path) -> Result<()> {
+    match reflink_copy::reflink(src, dst) {
+        Ok(()) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Err(err.into()),
+        Err(_) => {}
+    }
+    let size = std::fs::metadata(src)?.len();
+    if let Some(free) = inner.free_space.as_ref()
+        && let Some(available) = dst.parent().and_then(|p| free(p))
+        && available < size.saturating_add(64 << 20)
+    {
+        return Err(CoreError::NoSpace {
+            needed: size,
+            available,
+        });
+    }
+    use std::io::{Read, Write};
+    let mut from = std::fs::File::open(src)?;
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    loop {
+        if session.cancel.load(Ordering::SeqCst) {
+            return Err(CoreError::Invalid("ドラッグをやめました".into()));
+        }
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        to.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
 fn make(inner: &Inner, session: &DragSession, k: usize, slot: &Slot) -> Result<()> {
     let library = &inner.library;
     match &slot.plan {
@@ -806,8 +894,7 @@ fn make(inner: &Inner, session: &DragSession, k: usize, slot: &Slot) -> Result<(
                     src.display()
                 )));
             }
-            reflink_copy::reflink_or_copy(&src, &slot.path)?;
-            Ok(())
+            copy_into(inner, session, &src, &slot.path)
         }
         Plan::Convert { format } => {
             let row = item_row(library, slot.item_id)?;
@@ -822,18 +909,30 @@ fn make(inner: &Inner, session: &DragSession, k: usize, slot: &Slot) -> Result<(
                 cancel: &session.cancel,
                 tag: format!("dragout-{}-{k}", session.id),
             };
-            let written =
-                match render_converted(inner.engine.as_ref(), &unit, slot.item_id, &row, format)? {
-                    Flow::Go(w) => w,
-                    Flow::Stop(_) => {
-                        return Err(CoreError::Invalid("ドラッグをやめました".into()));
-                    }
-                };
+            // 予算は対話の枠で待たずに確保し、足りなければ断る（利用者がその場で待つ用意。段 5 の検証の直し・利用者の決定）
+            let written = match render_converted(
+                inner.engine.as_ref(),
+                &unit,
+                slot.item_id,
+                &row,
+                format,
+                true,
+            )? {
+                Flow::Go(w) => w,
+                Flow::Stop(_) => {
+                    return Err(CoreError::Invalid("ドラッグをやめました".into()));
+                }
+            };
             let (hash, size, ext) = (written.out_hash(), written.out_size(), written.out_ext());
-            reflink_copy::reflink_or_copy(written.part(), &slot.path)?;
+            copy_into(inner, session, written.part(), &slot.path)?;
             drop(written);
-            // 形式を変えた出力の中身を記録する（落とした先のプロジェクトの照らし直しが一致させる）
-            record_output(library, slot.item_id, &row, hash, &ext, size)
+            // 置いたら先に渡せるようにしてから記録する（記録の書き込みの列を、落とす先を待たせる時間に入れない）
+            session.set(k, SlotState::Ready);
+            // 形式を変えた出力の中身を記録する（落とした先のプロジェクトの照らし直しが一致させる。書けなくてもファイルは渡す）
+            if let Err(err) = record_output(library, slot.item_id, &row, hash, &ext, size) {
+                tracing::warn!(%err, item = slot.item_id, "ドラッグアウトの出力を記録できませんでした");
+            }
+            Ok(())
         }
     }
 }
