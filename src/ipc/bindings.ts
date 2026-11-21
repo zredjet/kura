@@ -1021,7 +1021,7 @@ export type CreditsDto = {
 
 /**  まとめて付けた結果。 */
 export type CreditsSetDto = {
-	/**  対象のアイテムの数（ユニットはメンバーを数える）。 */
+	/**  対象のアイテムの数（ユニットはメンバーを数える。ない ID は数えない）。 */
 	items: number,
 	/**  変えた件数（中身が同じものは数えない）。 */
 	changed: number,
