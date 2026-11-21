@@ -40,16 +40,40 @@ private final class KuraDragProvider: NSObject, NSPasteboardItemDataProvider {
         guard type == .fileURL else {
             return
         }
-        // Kura 自身の窓の上で求められたら（Tauri のファイルドロップの受け手）渡さず、待たない（取り込まない。
-        // 作り終えるのを待ってメインスレッドを止めない）
-        let under = NSWindow.windowNumber(at: NSEvent.mouseLocation, belowWindowWithWindowNumber: 0)
-        if NSApp.windows.contains(where: { $0.windowNumber == under }) {
-            return
-        }
+        // Kura 自身の窓はドラッグのあいだ落とす先から外している（kuraUnregisterDropTargets）ので、ここで求めるのはほかの
+        // アプリ。渡さずに返すと、その項目はこの回のあいだ二度と求められない（約束を使い切る）
         if wait(session, index) {
             item.setString(url.absoluteString, forType: .fileURL)
         }
     }
+}
+
+/// ドラッグのあいだ落とす先から外した view と、その型（終わったら戻す）。
+private struct KuraDropTarget {
+    weak var view: NSView?
+    let types: [NSPasteboard.PasteboardType]
+}
+
+/// Kura の窓のうち、ドラッグを受ける view（Tauri のファイルドロップの受け手の WebView など）を落とす先から外す。外さないと、
+/// 戻ってきたドラッグを Kura が受けてデータを求め（取り込みの重ね表示）、渡さずに返すと wry がない値を unwrap して落ちる。
+private func kuraUnregisterDropTargets() -> [KuraDropTarget] {
+    var out: [KuraDropTarget] = []
+    func walk(_ view: NSView) {
+        let types = view.registeredDraggedTypes
+        if !types.isEmpty {
+            out.append(KuraDropTarget(view: view, types: types))
+            view.unregisterDraggedTypes()
+        }
+        for sub in view.subviews {
+            walk(sub)
+        }
+    }
+    for window in NSApp.windows {
+        if let root = window.contentView?.superview ?? window.contentView {
+            walk(root)
+        }
+    }
+    return out
 }
 
 /// OS のドラッグの元。アプリの外へだけコピーで渡す（Kura 自身には落とせない）。
@@ -60,6 +84,8 @@ private final class KuraDragSource: NSObject, NSDraggingSource {
     let providers: [KuraDragProvider]
     /// ドラッグを始めた WebView（終わったらボタンを離したことを渡す）。
     weak var view: NSView?
+    /// ドラッグのあいだ落とす先から外した view（終わったら戻す）。
+    var dropTargets: [KuraDropTarget] = []
     var finishedAt: Date?
 
     init(
@@ -89,6 +115,11 @@ private final class KuraDragSource: NSObject, NSDraggingSource {
             return
         }
         finishedAt = Date()
+        // 落とす先から外した Kura の view を戻す
+        for target in dropTargets {
+            target.view?.registerForDraggedTypes(target.types)
+        }
+        dropTargets = []
         // WebView はページの中のドラッグの途中で OS のドラッグに引き継がれたので、ボタンを離したのを知らない（押したままと
         // 思って次のクリックを取り違える）。離したところで離したことを渡して、押したままの状態を終える
         if let view, let window = view.window {
@@ -171,7 +202,10 @@ public func kuraDragoutBegin(
     var providers: [KuraDragProvider] = []
     var items: [NSDraggingItem] = []
     for (k, file) in list.enumerated() {
-        let url = URL(fileURLWithPath: file.path, isDirectory: file.folder)
+        // Rust が作った名前のバイト列のまま URL にする（fileURLWithPath は NFD に分解し、落とす先が作る名前が変わる）
+        let url = file.path.withCString {
+            URL(fileURLWithFileSystemRepresentation: $0, isDirectory: file.folder, relativeTo: nil)
+        }
         let provider = KuraDragProvider(
             session: session, index: UInt32(k), url: url, wait: wait)
         let item = NSPasteboardItem()
@@ -205,6 +239,7 @@ public func kuraDragoutBegin(
     }
     let source = KuraDragSource(session: session, ended: ended, providers: providers, view: view)
     kuraDragSources.append(source)
+    source.dropTargets = kuraUnregisterDropTargets()
     let dragging = view.beginDraggingSession(with: items, event: event, source: source)
     dragging.animatesToStartingPositionsOnCancelOrFail = false
     dragging.draggingFormation = .pile
