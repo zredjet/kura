@@ -8,6 +8,7 @@ pub mod bench;
 pub mod capture;
 pub mod credits;
 pub mod downloads;
+pub mod dragout;
 pub mod edit;
 pub mod export;
 pub mod folders;

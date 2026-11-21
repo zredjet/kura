@@ -12,6 +12,8 @@
  * - `data-drop-playlist-entry="<id>"`：プレイリストの画面の行（並べ替え）
  * - `data-recipe-row="<id>"`：サイドバーのレシピの行（並べ替え）
  * - `data-drop-recipe="<id>"`：サイドバーのレシピ（タイルを落とすと、そのレシピを当てるシート。M14 段 7）
+ *
+ * タイル・リストの行のドラッグが窓の外へ出たら、OS のドラッグ（ドラッグアウト。`dragOut.ts`）に切り替える（M15 段 5）。
  */
 
 import { create } from 'zustand';
@@ -26,6 +28,7 @@ import {
   movePlaylist,
 } from '../playlists/playlistActions';
 import { addToFolder, dropWithinUnit, moveFolderTo } from './actions';
+import { beginDragOut, outsideWindow } from './dragOut';
 import { openApply } from '../recipes/applyStore';
 import { moveRecipe } from '../recipes/recipeStore';
 import { viewedSetUnit } from './itemMenu';
@@ -257,6 +260,12 @@ export function watchDrag(
       useDragStore.setState({ payload: begun.payload, label: begun.label });
     }
     const payload = useDragStore.getState().payload;
+    // 窓の外へ出たら OS のドラッグに切り替える（アプリの中のドラッグは終える。離したときはもう届かない）
+    if (payload?.kind === 'entries' && outsideWindow(e.clientX, e.clientY)) {
+      cleanup();
+      void beginDragOut(payload.ids);
+      return;
+    }
     if (payload) {
       useDragStore.setState({
         x: e.clientX,

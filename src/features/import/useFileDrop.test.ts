@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { previewImport } from '../../ipc/import';
 import { useImportStore } from '../../stores/importStore';
+import { beginDragOut, resetDragOutForTest } from '../library/dragOut';
 import { importRecipeAction } from '../recipes/recipeActions';
 import { handleDragDrop, isRecipeFile } from './useFileDrop';
 
@@ -10,6 +11,14 @@ vi.mock('../../ipc/import', () => ({
   startImport: vi.fn(),
 }));
 vi.mock('../recipes/recipeActions', () => ({ importRecipeAction: vi.fn(async () => undefined) }));
+vi.mock('../../ipc/dragout', () => ({
+  startDragOut: vi.fn(async () => ({
+    started: true,
+    dir: '/L.kuralib/staging/dragout/1',
+    skipped: 0,
+  })),
+  onDragOutEnded: vi.fn(async () => () => undefined),
+}));
 
 beforeEach(() => {
   useImportStore.setState({
@@ -22,6 +31,20 @@ beforeEach(() => {
 });
 
 describe('handleDragDrop', () => {
+  it('Kura から出したドラッグ（一時置き場のファイル）が戻ってきても取り込まない', async () => {
+    resetDragOutForTest();
+    await beginDragOut([1]);
+    const own = ['/L.kuralib/staging/dragout/1/hero.png'];
+    handleDragDrop({ type: 'enter', paths: own });
+    expect(useImportStore.getState().dragging).toBe(false);
+    handleDragDrop({ type: 'drop', paths: own });
+    expect(useImportStore.getState().phase).toBe('idle');
+    expect(previewImport).not.toHaveBeenCalled();
+    // ほかのファイルは今までどおり
+    handleDragDrop({ type: 'enter', paths: ['/a.jpg'] });
+    expect(useImportStore.getState().dragging).toBe(true);
+  });
+
   it('ファイルが入ってきたら重ね表示し、離れたら消す', () => {
     handleDragDrop({ type: 'enter', paths: ['/a.jpg'] });
     expect(useImportStore.getState().dragging).toBe(true);

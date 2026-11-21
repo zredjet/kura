@@ -448,12 +448,23 @@ export const commands = {
 	 *  ［元に戻す…］は `batch_result`・`batch_undo`（作ったアイテムは結果の `created`）。
 	 */
 	mergeStart: (request: MergeRequestDto) => typedError<number, AppError>(__TAURI_INVOKE("merge_start", { request })),
+	/**
+	 *  ドラッグアウトを始める：選んだもの（一覧の ID。ユニットは `LIST_FLAG | unit_id`。選んだ順）の名前と形式を持ち出し先の
+	 *  プロジェクトの既定で決め、一時置き場に作り始めて、OS のドラッグに切り替える。マウスのボタンが離れていれば始めない
+	 *  （`started` が false。作りかけは片付ける）。作るものがない・多すぎるときは `Invalid`。
+	 */
+	dragoutStart: (entries: number[]) => typedError<DragOutStartDto, AppError>(__TAURI_INVOKE("dragout_start", { entries })),
+	/**  持ち出し先のプロジェクト（選んだものと、名前と形式に使うもの）。 */
+	dragoutTarget: () => typedError<DragOutTargetDto, AppError>(__TAURI_INVOKE("dragout_target")),
+	/**  持ち出し先のプロジェクトを選ぶ（null で選ばない。ないプロジェクトは `NotFound`）。 */
+	dragoutTargetSet: (project: number | null) => typedError<null, AppError>(__TAURI_INVOKE("dragout_target_set", { project })),
 };
 
 /** Events */
 export const events = {
 	batchPrecheck: makeEvent<BatchPrecheckProgress>("batch://precheck"),
 	captureLoginShot: makeEvent<LoginShotEvent>("capture://login-shot"),
+	dragoutEnded: makeEvent<DragOutEnded>("dragout://ended"),
 	jobProgress: makeEvent<JobProgress>("job://progress"),
 	libraryUpgrade: makeEvent<LibraryUpgradeEvent>("library://upgrade"),
 };
@@ -1196,6 +1207,33 @@ export type DownloadRuleDto = {
 	pattern: string,
 	tool: ToolDto,
 	args: string[],
+};
+
+/**  ドラッグアウトが終わった知らせ（渡した項目と、落とす先が求めたのに渡さなかった項目の数）。 */
+export type DragOutEnded = {
+	/**  一時置き場のこの回のフォルダ（`dragout_start` の `dir`）。 */
+	dir: string,
+	delivered: number,
+	/**  落とす先が求めたのに渡さなかった項目（作れなかった・待ちきれなかった）。 */
+	missed: number,
+};
+
+/**  ドラッグアウトを始めた結果。 */
+export type DragOutStartDto = {
+	/**  OS のドラッグを始めた（マウスのボタンが離れていれば false）。 */
+	started: boolean,
+	/**  一時置き場のこの回のフォルダ（Kura 自身に落としたファイルを見分ける）。 */
+	dir: string,
+	/**  飛ばしたアイテムの数（ゴミ箱の中・見つからない）。 */
+	skipped: number,
+};
+
+/**  持ち出し先のプロジェクト。 */
+export type DragOutTargetDto = {
+	/**  選んだプロジェクト（選んでいなければ null）。 */
+	chosen: number | null,
+	/**  名前と形式に使うプロジェクト（選んでいなければ、登録が 1 つならそれ）。null なら名前も形式もそのまま。 */
+	effective: number | null,
 };
 
 /**  重複の扱い。 */

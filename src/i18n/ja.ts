@@ -1373,6 +1373,11 @@ export const ja = {
   drop: {
     message: 'ここにドロップして取り込む',
   },
+  dragOut: {
+    failed: (msg: string) => `ドラッグで持ち出せませんでした：${msg}`,
+    skipped: (n: string) => `ゴミ箱の中・見つからない ${n} 項目は持ち出しません`,
+    incomplete: (n: string) => `${n} 項目を渡せませんでした（作れなかった・間に合わなかった）`,
+  },
   import: {
     dialogLabel: 'ファイルの取り込み',
     checking: '取り込む項目を数えています…',

@@ -218,12 +218,16 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::batch::batch_undo,
             commands::batch::merge_precheck,
             commands::batch::merge_start,
+            commands::dragout::dragout_start,
+            commands::dragout::dragout_target,
+            commands::dragout::dragout_target_set,
         ])
         .events(collect_events![
             dto::JobProgress,
             dto::LoginShotEvent,
             dto::LibraryUpgradeEvent,
-            commands::batch::BatchPrecheckProgress
+            commands::batch::BatchPrecheckProgress,
+            commands::dragout::DragOutEnded
         ])
         // ジョブの結果（resultJson）を読むための型
         .typ::<dto::ImportResultDto>()

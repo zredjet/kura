@@ -5,6 +5,7 @@ import { useEffect } from 'react';
 import { ja } from '../../i18n/ja';
 import { pickImportFiles, RECIPE_EXTENSION } from '../../ipc/dialogs';
 import { useImportStore } from '../../stores/importStore';
+import { isOwnDrop } from '../library/dragOut';
 import { importRecipeAction } from '../recipes/recipeActions';
 
 /** レシピのファイル（`.kurarecipe`）か。 */
@@ -24,9 +25,16 @@ export type DropPayload =
   | { type: 'drop'; paths: string[] }
   | { type: 'leave' };
 
-/** ドラッグ＆ドロップのイベントを取り込みの状態に反映する。シートを開いている間は受け付けない。 */
+/** ドラッグ＆ドロップのイベントを取り込みの状態に反映する。シートを開いている間と、Kura から出したドラッグは受け付けない。 */
 export function handleDragDrop(payload: DropPayload): void {
   const store = useImportStore.getState();
+  // Kura から出したドラッグ（一時置き場のファイル）が戻ってきたら取り込まない（M15 段 5）
+  if ((payload.type === 'enter' || payload.type === 'drop') && isOwnDrop(payload.paths)) {
+    if (store.dragging) {
+      store.setDragging(false);
+    }
+    return;
+  }
   if (store.phase !== 'idle') {
     if (store.dragging) {
       store.setDragging(false);

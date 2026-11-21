@@ -13,6 +13,7 @@ import { Editor } from '../features/editor/Editor';
 import { watchWindowClose } from '../features/editor/editorSave';
 import { closeEditor } from '../features/editor/editorStore';
 import { DragGhost } from '../features/library/DragGhost';
+import { useDragOutEvents } from '../features/library/dragOut';
 import { useFileDrop, useImportShortcut } from '../features/import/useFileDrop';
 import { LibraryView } from '../features/library/LibraryView';
 import { PlaylistView } from '../features/playlists/PlaylistView';
@@ -84,6 +85,7 @@ export function App() {
 /** ライブラリを開いているときの画面。 */
 function LibraryScreen() {
   useFileDrop();
+  useDragOutEvents();
   useImportShortcut();
   useDownloadsShortcut();
   useEffect(() => {
