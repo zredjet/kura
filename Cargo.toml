@@ -73,6 +73,19 @@ print_stdout = "deny"
 print_stderr = "deny"
 dbg_macro = "deny"
 
+# 開発（dev・test。`pnpm tauri dev` と /verify）のビルド（ADR-209）：
+# - split-debuginfo = "off"：macOS の既定（unpacked）は、デバッグ情報のために各コード生成単位の .o を target/debug/deps に
+#   残し、作り直すたびに名前が変わって溜まる（2026-11 に 88 万個・188 GB。rustc・rustdoc が起動のたびにこのフォルダを読み、
+#   1 回 12 秒かかって /verify が 40〜50 分になった）。off なら .o を消す。ライブラリのクレートのデバッグ情報は rlib の中に
+#   残るので、バックトレースに行番号が出る（テストのファイル自身のフレームには出ない。panic の場所はいつも出る）
+# - debug = "line-tables-only"・依存は debug = false：バックトレースに要る行番号だけにして、生成・リンクを軽くする
+[profile.dev]
+split-debuginfo = "off"
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
