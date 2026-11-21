@@ -747,7 +747,7 @@ CREATE TABLE projects (
   name        TEXT    NOT NULL,                        -- 表示名（既定はフォルダの名前。NFC・200 文字まで）
   root        TEXT    NOT NULL,                        -- 正規化した絶対パス（一意。ほかのプロジェクトと重ならない）
   engine      TEXT    NOT NULL CONSTRAINT projects_engine CHECK (engine IN ('godot','unity','folder')),
-  settings    TEXT    NOT NULL DEFAULT '{}',           -- 持ち出しの既定（命名・形式。段 3 で形を決める JSON）
+  settings    TEXT    NOT NULL DEFAULT '{}',           -- 持ち出しの既定（`export::ExportPreset` の JSON：name・image・audio・manifest。'{}' はエンジンの既定。段 3）
   pos         REAL    NOT NULL,
   missing     INTEGER NOT NULL DEFAULT 0 CONSTRAINT projects_missing CHECK (missing IN (0, 1)),  -- 最後の照らしでフォルダがなかった
   scanned_at  INTEGER,                                 -- 最後に照らし終えた時刻（この回の印。前の回より必ず大きい）
@@ -1290,7 +1290,8 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
   （主キー。クレジットの一覧の対象。段 4）、アイテムを使っているプロジェクトは `idx_project_files_item`。アイテムを消すと行は残って未一致に
   なり、次の照らしで付け直す（同じ中身のほかのアイテムがあればそれ）。`matched` は `item_id` があるときだけ意味を持つ（アイテムを消した
   直後は前の値が残るので、読み手は `item_id` で絞る）。
-- **持ち出した出力** `item_outputs` は段 3・5 が書く（形式を変えて作ったファイルの中身。今と同じ中身なら書かなくても今で一致する）。
+- **持ち出した出力** `item_outputs` は段 3 の書き出し（形式を変えて書いた 1 件ごとに `INSERT … ON CONFLICT(hash, item_id) DO NOTHING`。今と同じ中身なら書かない）と段 5 のドラッグアウトが書く。書き出しは、書き出し先の同じ名前のファイルが、そのアイテムの今・元・過去の版（`item_versions.output_hash`）・持ち出した出力のどれかなら置き換える（`SELECT output_hash FROM item_versions WHERE item_id = ?`・`SELECT hash FROM item_outputs WHERE item_id = ?`。どちらも索引）。
+- **持ち出しの既定** `projects.settings`（段 3）：`project::settings` が `export::ExportPreset::from_json` で読む（`'{}'`・読めないものはエンジンの既定：godot は snake_case、unity は PascalCase、folder はそのまま。形式は「変えない（書けない形式は変える）」、JSON は添えない）。`set_settings` は名前のテンプレートと形式を確かめてから書く。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
 

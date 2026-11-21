@@ -139,7 +139,10 @@
 | ジョブ | `jobs_list(filter)` / `job_cancel(id)` / `job_pause(id)` / `job_resume(id)` / `job_retry(id)` / `job_log(id)` | 進捗はイベント `job://progress` |
 | 解析 | `request_analysis(ids)` → 待っているか | インスペクタで選んだものを先に解析する（まだなら解析のジョブを積む。取り込み・サムネイルが動いている間はそれを待つ。§5） |
 | | `retry_analysis(ids)` → 戻した数 | 解析できなかったもの（failed）を解析待ちに戻し、先に解く |
-| 書き出し | `export_start(dest, entries)` → JobId | 選んだもの（一覧の ID。ユニットは印付き）を書き出すジョブを積む。書き出し先はあるフォルダで、ライブラリの中は受け付けない（§14） |
+| 書き出し | `export_start(dest, entries, options?)` → JobId | 選んだもの（一覧の ID。ユニットは印付き）を書き出すジョブを積む。書き出し先はあるフォルダで、ライブラリの中は受け付けない（§14）。`options`（M15 段 3）は `{ name: { template, style（keep・snake・kebab・pascal・camel）, ascii }, image, audio（`{ type: "original" }`・`{ type: "playable" }`・`{ type: "to", format }`）, manifest, project }`。null なら M9 と同じ（元の名前・形式はそのまま・JSON を添える）。`project` があれば、書き出し先がそのプロジェクトのフォルダの中であることを確かめる（`Invalid`）。知らない語のテンプレート・種類の違う形式は `Invalid` |
+| | `export_formats()` → `{ image, audio }` | 書き出しで選べる形式（形式の表の順。今の環境で書けるもの。M15 段 3） |
+| | `export_preview(items, options)` → `PreviewNameDto[]` | 書き出す名前と形式の見本（先頭の 50 件。`itemId`・`name`・`convert`（形式を変えるならその形式）。同じ名前の番号は見ない） |
+| | `project_settings(id)` → `ExportPresetDto` / `project_settings_set(id, preset)` | プロジェクトの持ち出しの既定（`{ name, image, audio, manifest }`。まだ決めていなければエンジンごとの既定：godot は snake_case、unity は PascalCase、ほかはそのまま。形式は「変えない（書けない形式は変える）」、JSON は添えない） |
 | バックアップ | `backups_list()` → `Backup[]` / `backup_now()` → `Backup` | DB のバックアップの一覧（新しい順）と、今すぐ作る（§14） |
 | | `reveal_path(path)` | Finder で見せる（書き出したもの・バックアップ・ライブラリ） |
 | タグ | `tags_list()` → `TagListEntry[]` | すべてのタグと、付いているアイテムの数（ゴミ箱を除く）・そのうち自動で付いた数（`item_tags.source` が download / capture）・ユニットの数・絞り込みの条件。名前空間なしを後ろに、名前空間ごとに付いている数の多い順（ADR-126） |
@@ -792,6 +795,11 @@ M14 の実測（一括加工。M14 段 8。2026-11-21。Apple M4 Max（高性能
   - 最後に `kura-export.json`（あれば「kura-export 2.json」）を書く：`{ app, version, exportedAt, items: [{ file, originalName, title, kind, hash, sizeBytes, width, height, durationMs, rating, note, tags, folders, units, sourceSite, sourceUrl, capturedAt, importedAt }] }`。日時は ISO 8601 の UTC、タグは「名前空間:名前」、フォルダはいちばん上からの名前の列。
   - 一時停止・再開できる（位置・書いたファイル・ユニットのフォルダの名前を `result_json` に保存）。中止しても書いたファイルは消さない。ライブラリのファイルがないものは失敗として数えて続ける。
   - 入口：ファイル › 書き出す…（⌘⇧E）、項目のメニュー。進捗は取り込みと同じカプセルに出し、終わったら「Finder で表示」。
+  - **名前の規則と形式の変換**（M15 段 3。ADR-205。`export::names`・`export::formats`。ジョブの入力の `options`。省けば上のとおり）：
+    - 名前：テンプレート（`{名前}`・`{元の名前}`・`{番号}`（書き出す順、3 桁）・`{ユニット}`・`{幅}`・`{高さ}`。null なら元のファイル名）、書き方（そのまま・snake_case・kebab-case・PascalCase・camelCase。区切りは空白・`_`・`-`・`.`・全角の空白と ASCII の大文字小文字の境目）、ASCII だけにする（ほかの文字を除き、空になれば `item-<ID>` に書き方を当てたもの）。ユニットのフォルダにも書き方と ASCII を当てる。最後に上の `safe_name`。
+    - 形式：画像・音声ごとに `original`（そのまま写す。M9）・`playable`（変えない。Kura が書けない形式（書き手のない形式：PSD・aseprite・SVG・HEIC・AVIF・TIFF・BMP、m4a・Opus など）は画像は PNG・音声は Ogg Vorbis（書けなければ WAV）に変える）・`to`（その形式。同じ形式なら写す）。動画・フォント・3D はいつも写す。変えるときは、一括と同じく元＋頭の文書の出力の形式を変えた文書を、保存の準備の段（`Saver::prepare_graph`。予算・プール・アンカー・音声は流して書く・SVG の働き手も同じ）で staging に描き、書き出し先へ置いてから staging を捨てる（版は足さない。同じ設定なら同じバイト列）。エンジンの部品がないライブラリでは、形式を変える 1 件は `Unsupported`。OS のデコーダで読む前後は途中経過の `decoding` に位置を書き、落ちたらその 1 件を次の回に失敗にする。形式を変えた出力の中身は `item_outputs` に記録する（今と同じ中身なら書かない。プロジェクトの照らし直しが「持ち出した出力」として一致させる）。
+    - 同じ名前があるとき：そのファイルの中身が書く中身と同じなら書かない（時刻を変えず、エンジンが読み直さない）。アイテムの今・元・過去の版・持ち出した出力のどれかと同じ（Kura がこのアイテムから書いたまま）なら、一時ファイルを rename で入れ替えて置き換える。ほかのファイル（利用者が書き換えたもの・ほかのアイテム）は壊さず「名前 2」（段 3 の決定 3）。置き換えた数は結果の `replaced`、形式を変えた数は `converted`。
+    - `manifest` が偽なら `kura-export.json` を添えない（登録したプロジェクトの中へは既定で添えない。段 3 の決定 4）。`project` があれば、終わったあとにプロジェクトの照らし直しを積む。
 - **バックアップ**（`kura_core::library::backup`。ADR-121）：
   - SQLite の backup API で、読み取り専用の別の接続から `backups/library-YYYYMMDD-HHMMSS.sqlite`（UTC）へ少しずつ写す（書き込みは止めない）。一時ファイルに写してから名前を変え、1 つのファイルで開けるよう `journal_mode = DELETE` にする。
   - 開いて 20 秒後と、そのあと 1 時間ごとに確かめ、前回から 24 時間以上たっていれば作る。新しい 7 個を残し、`backups/` の中のこの形の名前のものだけ消す。設定画面から今すぐ作れる。
