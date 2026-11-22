@@ -112,8 +112,10 @@ struct Row {
     size: i64,
     mtime_ns: i64,
     hash: Option<[u8; 32]>,
-    /// 前の回のハッシュ（読めなかったときに使い直す）。
-    known: Option<[u8; 32]>,
+    /// 前の回の行（大きさ・更新時刻・ハッシュ）。変わったファイルが読めなかったときは、これをそのまま書き戻す（前の結び付きを
+    /// 保ち、次の回は大きさか時刻が違うので読み直す。新しい大きさ・時刻と前のハッシュを組にすると、読めるようになっても
+    /// 大きさ・時刻が同じとみなして前のハッシュのまま当たり続けた。PR #1 の Codex のレビューの指摘。M15 段 8）。
+    known: Option<(i64, i64, [u8; 32])>,
 }
 
 /// ファイルを読んでハッシュする（`halt` が真になれば途中でやめて None）。
@@ -209,11 +211,16 @@ fn hash_rows(
                     rows[i].hash = Some(h);
                 }
                 Ok(None) => stopped = true,
-                // 照らしの間に消えたファイルは記録しない（前の行は最後に消える）。読めないファイルは前のハッシュで残す
+                // 照らしの間に消えたファイルは記録しない（前の行は最後に消える）。読めないファイルは前の行のまま残す
+                // （大きさ・時刻も前のもの。`Row::known`）
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => {
                     result.skipped += 1;
-                    rows[i].hash = rows[i].known;
+                    if let Some((size, mtime_ns, h)) = rows[i].known {
+                        rows[i].size = size;
+                        rows[i].mtime_ns = mtime_ns;
+                        rows[i].hash = Some(h);
+                    }
                 }
             }
         }
@@ -362,15 +369,16 @@ fn scan_one(
         .iter()
         .map(|f| {
             let size = i64::try_from(f.size).unwrap_or(i64::MAX);
-            let before = known.get(&f.path);
-            let known_hash = before.and_then(|(_, _, h)| <[u8; 32]>::try_from(h.as_slice()).ok());
-            let same = before.is_some_and(|(s, m, _)| *s == size && *m == f.mtime_ns);
+            let before = known
+                .get(&f.path)
+                .and_then(|(s, m, h)| <[u8; 32]>::try_from(h.as_slice()).ok().map(|h| (*s, *m, h)));
+            let same = before.and_then(|(s, m, h)| (s == size && m == f.mtime_ns).then_some(h));
             Row {
                 path: f.path.clone(),
                 size,
                 mtime_ns: f.mtime_ns,
-                hash: if same { known_hash } else { None },
-                known: known_hash,
+                hash: same,
+                known: before,
             }
         })
         .collect();
