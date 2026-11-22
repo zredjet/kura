@@ -348,7 +348,11 @@ fn mdct_butterflies(init: &MdctLookup, x: &mut [f32], points: i32) {
         return;
     };
     for (i, t) in init.bfly.iter().enumerate() {
-        for part in x.chunks_exact_mut(points >> i) {
+        // 呼び手は n/2 を渡すので区切りは 64 個以上（0 で区切らない）
+        let Some(block) = points.checked_shr(i as u32).filter(|b| *b > 0) else {
+            return;
+        };
+        for part in x.chunks_exact_mut(block) {
             mdct_butterfly_stage(part, t);
         }
     }
@@ -1052,26 +1056,37 @@ mod tests {
     }
 
     /// 速い形（範囲を分けて借りる形・蝶の段の表）が、書き直す前の添字の形と同じビットを出す（逆と順の MDCT、n = 64〜8192、
-    /// ChaCha8 の値。大きさの違う値・0・符号の違う 0 を混ぜる）。
+    /// ChaCha8 の値。大きさの違う値・0・符号の違う 0 を混ぜ、終わりの 2 回は大きな値・±∞・NaN も混ぜる）。
     #[test]
     fn fast_forms_match_the_index_forms() {
         use rand_chacha::rand_core::Rng;
         let mut rng = crate::determinism::rng(43);
-        let value = |rng: &mut rand_chacha::ChaCha8Rng| match rng.next_u32() % 16 {
+        let value = |rng: &mut rand_chacha::ChaCha8Rng, wild: bool| match rng.next_u32() % 16 {
             0 => 0.0_f32,
             1 => -0.0,
             2 => f32::from_bits(rng.next_u32() & 0x807f_ffff),
+            // 大きな値（足すと ±∞ になりうる）・±∞・ペイロードつきの NaN（壊れた入力で出うる）
+            3 if wild => f32::from_bits((rng.next_u32() & 0x80ff_ffff) | 0x7e00_0000),
+            4 if wild => [f32::INFINITY, f32::NEG_INFINITY][(rng.next_u32() % 2) as usize],
+            5 if wild && rng.next_u32().is_multiple_of(8) => {
+                f32::from_bits(0x7f80_0001 | rng.next_u32())
+            }
             _ => f32::from_bits((rng.next_u32() & 0x83ff_ffff) | 0x3c00_0000),
+        };
+        // NaN のビット（符号・ペイロード）は約束の外（読み手が `0x7fc00000` にそろえる。LLVM も NaN のビットを保たない）
+        let bits = |v: &[f32]| {
+            v.iter()
+                .map(|f| if f.is_nan() { 0x7fc0_0000 } else { f.to_bits() })
+                .collect::<Vec<_>>()
         };
         for log2n in 6..=13 {
             let n = 1usize << log2n;
             let l = mdct_init(n as i32);
-            for _ in 0..6 {
-                let x: Vec<f32> = (0..n).map(|_| value(&mut rng)).collect();
+            for round in 0..8 {
+                let x: Vec<f32> = (0..n).map(|_| value(&mut rng, round >= 6)).collect();
                 let (mut a, mut b) = (x.clone(), x.clone());
                 mdct_backward(&l, &mut a);
                 index_form::mdct_backward(&l, &mut b);
-                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
                 assert_eq!(bits(&a), bits(&b), "逆 n={n}");
                 let (mut oa, mut ob) = (vec![0.0_f32; n / 2], vec![0.0_f32; n / 2]);
                 let (mut wa, mut wb) = (vec![0.0_f32; n], vec![0.0_f32; n]);

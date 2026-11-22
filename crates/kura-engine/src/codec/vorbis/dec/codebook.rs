@@ -1272,6 +1272,98 @@ mod tests {
         assert!(fast > 100_000 && near > 10_000, "{fast} {near}");
     }
 
+    /// C の `vorbis_book_decodevv_add`（codebook.c:915–928 の SSE でない経路）をそのまま組んだもの（C の流れの読み
+    /// [`c_decode`] と値の表で）。
+    fn c_decodevv_add(
+        c: &DecodeBook,
+        table: &[u32],
+        tablen: i32,
+        a: &mut [Vec<f32>],
+        offset: i64,
+        ch: i64,
+        b: &mut OggpackReader<'_>,
+        n: i64,
+    ) -> i64 {
+        if c.used_entries > 0 {
+            let mut chptr = 0usize;
+            let mut i = offset / ch;
+            while i < (offset + n) / ch {
+                let entry = c_decode(c, table, tablen, b);
+                if entry == -1 {
+                    return -1;
+                }
+                let dim = c.dim as usize;
+                let t = &c.valuelist[entry as usize * dim..entry as usize * dim + dim];
+                let mut j = 0usize;
+                while i < (offset + n) / ch && j < dim {
+                    a[chptr][i as usize] += t[j];
+                    chptr += 1;
+                    if chptr as i64 == ch {
+                        chptr = 0;
+                        i += 1;
+                    }
+                    j += 1;
+                }
+            }
+        }
+        0
+    }
+
+    /// `decodevv_add`（2 チャンネルの速い道と一般の形・窓）が、C の流れと同じ値を同じ順に足し、同じ所まで読む（books.bin の
+    /// 値のある冊 × ChaCha8：チャンネル 1〜4、奇数を含む offset、dim の倍数でない n、短いビット列でパケットの終わりも通す）。
+    #[test]
+    fn decodevv_add_matches_the_c_loop() {
+        use rand_chacha::rand_core::Rng;
+        let mut rng = crate::determinism::rng(61);
+        let mut dims = std::collections::BTreeSet::new();
+        let mut cases = 0;
+        for k in 0..vorbis_tables::BOOKS.len() {
+            let s = vorbis_tables::unpack(vorbis_tables::BookId(k as u16)).unwrap();
+            if s.maptype == 0 {
+                continue;
+            }
+            let w = DecodeBook::init(&s).unwrap().unwrap();
+            let (table, tablen) = c_firsttable(&w);
+            dims.insert(w.dim);
+            for _ in 0..6 {
+                let ch = 1 + i64::from(rng.next_u32() % 4);
+                let offset = i64::from(rng.next_u32() % 40);
+                let n = i64::from(rng.next_u32() % 90);
+                let len = 1 + (rng.next_u32() % 64) as usize;
+                let bytes: Vec<u8> = (0..len).map(|_| rng.next_u32() as u8).collect();
+                let size = ((offset + n) / ch + 1) as usize;
+                let init: Vec<Vec<f32>> = (0..ch)
+                    .map(|_| {
+                        (0..size)
+                            .map(|_| (rng.next_u32() % 7) as f32 - 3.0)
+                            .collect()
+                    })
+                    .collect();
+                let mut want = init.clone();
+                let mut rc = OggpackReader::new(&bytes);
+                let rw_ = c_decodevv_add(&w, &table, tablen, &mut want, offset, ch, &mut rc, n);
+                let mut got = init;
+                let mut rg = OggpackReader::new(&bytes);
+                let mut views: Vec<&mut [f32]> = got.iter_mut().map(Vec::as_mut_slice).collect();
+                let rg_ = w
+                    .decodevv_add(&mut views, offset, ch as i32, &mut rg, n as i32)
+                    .unwrap();
+                assert_eq!(rg_, rw_, "本 {k}");
+                assert_eq!((rg.endbyte, rg.endbit), (rc.endbyte, rc.endbit), "本 {k}");
+                let bits = |v: &[Vec<f32>]| -> Vec<u32> {
+                    v.iter().flatten().map(|f| f.to_bits()).collect()
+                };
+                assert_eq!(
+                    bits(&got),
+                    bits(&want),
+                    "本 {k} ch {ch} offset {offset} n {n}"
+                );
+                cases += 1;
+            }
+        }
+        assert!(cases > 1_000 && dims.len() >= 4, "{cases} {dims:?}");
+    }
+
     /// dim 0 の codebook（maptype 1・値 0 個）を residue 0 が使っても 0 で割らない。照合用の C（arm64）と同じく何も読まずに
     /// 0 を返す。
     #[test]

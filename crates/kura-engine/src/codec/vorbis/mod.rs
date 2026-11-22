@@ -667,22 +667,34 @@ mod tests {
     }
 
     /// 移植の規則 3：FMA（`mul_add`・libm の `fma`・`fmaf`）を使わない（照合用の C は `-ffp-contract=off`。エンジン全体の
-    /// clippy.toml は `mul_add` を許しているので、このモジュールだけここで見張る）。`vorbis/` のすべての `.rs`（新しく足した
-    /// ファイルも）と `../ogg.rs` を実行時に読み、注釈を除いたコードで呼び出しを探す（[`fma_calls`]）。
+    /// clippy.toml は `mul_add` を許しているので、このモジュールだけここで見張る）。`vorbis/` の下のすべての `.rs`（読み手の
+    /// `dec/` も、新しく足したファイルも）と `../ogg.rs`・`../ogg_read.rs` を実行時に読み、注釈を除いたコードで呼び出しを
+    /// 探す（[`fma_calls`]）。
     #[test]
     fn no_fused_multiply_add() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codec/vorbis");
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
+        // 下のディレクトリもたどる（再帰させずに積み上げで）
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut dirs = vec![dir.clone()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
         files.sort();
         assert!(
-            files.iter().any(|p| p.ends_with("mod.rs")) && files.len() >= 19,
+            files.iter().any(|p| p.ends_with("vorbis/mod.rs"))
+                && files.iter().any(|p| p.ends_with("dec/codebook.rs"))
+                && files.len() >= 26,
             "{files:?}"
         );
         files.push(dir.join("../ogg.rs"));
+        files.push(dir.join("../ogg_read.rs"));
         for f in &files {
             let src = std::fs::read_to_string(f).unwrap();
             let found = fma_calls(&src);
