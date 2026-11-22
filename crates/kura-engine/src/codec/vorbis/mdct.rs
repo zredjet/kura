@@ -64,6 +64,8 @@ pub(crate) struct MdctLookup {
     pub bitrev: Vec<i32>,
     /// `4.f/n`。
     pub scale: f32,
+    /// 蝶の段ごとの `T`（[`butterfly_trig`]。C は表を持たない）。
+    pub bfly: Vec<Vec<[f32; 8]>>,
 }
 
 /// `mdct_init`（mdct.c:54–92）。`n` は 2 の累乗で 64 以上（C の前提。そうでなければ表を作らず、[`mdct_forward`] は何もしない）。
@@ -113,6 +115,7 @@ pub(crate) fn mdct_init(n: i32) -> MdctLookup {
         bitrev[i * 2] = ((!acc) & mask) - 1;
         bitrev[i * 2 + 1] = acc;
     }
+    let bfly = butterfly_trig(&t, n2, log2n);
     MdctLookup {
         n,
         log2n,
@@ -120,7 +123,39 @@ pub(crate) fn mdct_init(n: i32) -> MdctLookup {
         bitrev,
         // lookup->scale=FLOAT_CONV(4.f/n);
         scale: 4.0_f32 / n as f32,
+        bfly,
     }
+}
+
+/// 蝶の段（[`mdct_butterflies`] の `mdct_butterfly_first` と `mdct_butterfly_generic`）が組ごとに読む `T` の写し。段 `i`
+/// （0 が first）は `trigint = 4 << i` で、`n/2 >> i` 個の点を 16 個ずつの組 `k` に分け（`2^i` 個の区切りで同じ `T`）、組の
+/// 中の 4 組（C の順で `j` = 0〜3、組の中の位置 `a = 6 − 2j`）は `T[(4k + j)·trigint]`・`T[(4k + j)·trigint + 1]` を読む。
+/// 写しは組ごとに `[T0(a=0), T0(a=2), T0(a=4), T0(a=6), T1(a=0), T1(a=2), T1(a=4), T1(a=6)]`（値はそのまま）。
+fn butterfly_trig(t: &[f32], n2: usize, log2n: i32) -> Vec<Vec<[f32; 8]>> {
+    // C：stages = log2n − 5 から、first は --stages > 0 のとき、generic は i = 1 から --stages > 0 の間
+    let count = (log2n - 6).max(0) as usize;
+    (0..count)
+        .map(|i| {
+            let trigint = 4usize << i;
+            (0..(n2 >> i) / 16)
+                .map(|k| {
+                    let at = |j: usize, o: usize| {
+                        t.get((4 * k + j) * trigint + o).copied().unwrap_or(0.0)
+                    };
+                    [
+                        at(3, 0),
+                        at(2, 0),
+                        at(1, 0),
+                        at(0, 0),
+                        at(3, 1),
+                        at(2, 1),
+                        at(1, 1),
+                        at(0, 1),
+                    ]
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// `init` が `mdct_init` の作った形か（2 の累乗・表の長さ・bitrev の範囲）。
@@ -134,6 +169,12 @@ fn lookup_is_valid(init: &MdctLookup) -> bool {
     init.trig.len() == nu + nu / 4
         && init.bitrev.len() == nu / 4
         && init.bitrev.iter().all(|&b| (0..half - 1).contains(&b))
+        && init.bfly.len() == (init.log2n - 6).max(0) as usize
+        && init
+            .bfly
+            .iter()
+            .enumerate()
+            .all(|(i, b)| b.len() == ((nu / 2) >> i) / 16)
 }
 
 /// `mdct_butterfly_8`（mdct.c:407–454。#else 432–452）。
@@ -266,99 +307,52 @@ fn mdct_butterfly_32(x: &mut [f32; 32]) {
     mdct_butterfly_16(b);
 }
 
-/// `mdct_butterfly_first`・`generic` の 1 回分（C の `x1`・`x2` の 8 個ずつ）：`a` = 6・4・2・0 の 4 組を、それぞれ
-/// `T`（`tr[j]` = `[T[0], T[1]]`。`j` は C の順で、`a` = 6 − 2j）で回す。C の 1 組は
+/// `mdct_butterfly_first`・`generic` の 1 回分（C の `x1`・`x2` の 8 個ずつ）：組の中の 4 組（位置 `a` = 6・4・2・0）を、
+/// それぞれ `T[0]`・`T[1]`（`t` は [`butterfly_trig`] の形で、`a = 2l` の組が `t[l]`・`t[4 + l]`）で回す。C の 1 組は
 /// `r0 = x1[a] − x2[a]; r1 = x1[a+1] − x2[a+1]; x1[a] += x2[a]; x1[a+1] += x2[a+1];
 /// x2[a] = r1·T[1] + r0·T[0]; x2[a+1] = r1·T[0] − r0·T[1]`。組どうしは別の要素を読み書きするので、差と和を先に 8 個まとめて
-/// 求めても、どの要素の式と順も C と同じ。
+/// 求めても、どの要素の式と順も C と同じ（偶数番の差を `e`、奇数番の差を `o` に並べ、4 組を同時に求める）。
 #[inline(always)]
-fn butterfly_8x2(x1: &mut [f32; 8], x2: &mut [f32; 8], tr: [[f32; 2]; 4]) {
-    let mut d = [0.0_f32; 8];
+fn butterfly_8x2(x1: &mut [f32; 8], x2: &mut [f32; 8], t: &[f32; 8]) {
+    let mut e = [0.0_f32; 4];
+    let mut o = [0.0_f32; 4];
+    for l in 0..4 {
+        e[l] = x1[2 * l] - x2[2 * l];
+        o[l] = x1[2 * l + 1] - x2[2 * l + 1];
+    }
     for i in 0..8 {
-        d[i] = x1[i] - x2[i];
         x1[i] += x2[i];
     }
-    for (j, t) in tr.iter().enumerate() {
-        let a = 6 - 2 * j;
-        let (r0, r1) = (d[a], d[a + 1]);
-        x2[a] = r1 * t[1] + r0 * t[0];
-        x2[a + 1] = r1 * t[0] - r0 * t[1];
+    for l in 0..4 {
+        x2[2 * l] = o[l] * t[4 + l] + e[l] * t[l];
+        x2[2 * l + 1] = o[l] * t[l] - e[l] * t[4 + l];
     }
 }
 
-/// `mdct_butterfly_first`（mdct.c:801–896。#else 854–894）。`x` は `points` 個（C の `x1` は後ろ半分を、`x2` は前半分を、
-/// どちらも終わりから 8 個ずつ下る。`T` は 16 個ずつ進む）。
-fn mdct_butterfly_first(t: &[f32], x: &mut [f32], points: usize) {
-    let Some(x) = x.get_mut(..points) else {
-        return;
-    };
+/// `mdct_butterfly_first`（mdct.c:801–896。#else 854–894）と `mdct_butterfly_generic`（mdct.c:899–1080。#else 1032–1078）の
+/// 1 つの区切り（`x` は `points` 個）。C の `x1` は後ろ半分を、`x2` は前半分を、どちらも終わりから 8 個ずつ下り、組 `k`
+/// ごとに `t[k]`（[`butterfly_trig`]）を使う。
+fn mdct_butterfly_stage(x: &mut [f32], t: &[[f32; 8]]) {
+    let points = x.len();
     let (lo, hi) = x.split_at_mut(points >> 1);
     let (lo, hi) = (lo.as_chunks_mut::<8>().0, hi.as_chunks_mut::<8>().0);
-    for ((x1, x2), tt) in hi
-        .iter_mut()
-        .rev()
-        .zip(lo.iter_mut().rev())
-        .zip(t.as_chunks::<16>().0)
-    {
-        butterfly_8x2(
-            x1,
-            x2,
-            [
-                [tt[0], tt[1]],
-                [tt[4], tt[5]],
-                [tt[8], tt[9]],
-                [tt[12], tt[13]],
-            ],
-        );
+    for ((x1, x2), t) in hi.iter_mut().rev().zip(lo.iter_mut().rev()).zip(t) {
+        butterfly_8x2(x1, x2, t);
     }
 }
 
-/// `mdct_butterfly_generic`（mdct.c:899–1080。#else 1032–1078）。[`mdct_butterfly_first`] と同じ形で、`T` は組ごとに
-/// `trigint` 個ずつ進む。
-fn mdct_butterfly_generic(t: &[f32], x: &mut [f32], points: usize, trigint: usize) {
-    let Some(x) = x.get_mut(..points) else {
-        return;
-    };
-    let (lo, hi) = x.split_at_mut(points >> 1);
-    let (lo, hi) = (lo.as_chunks_mut::<8>().0, hi.as_chunks_mut::<8>().0);
-    let mut tc = t.chunks(trigint).map(|c| c.first_chunk::<2>().copied());
-    for (x1, x2) in hi.iter_mut().rev().zip(lo.iter_mut().rev()) {
-        let (Some(Some(a)), Some(Some(b)), Some(Some(c)), Some(Some(d))) =
-            (tc.next(), tc.next(), tc.next(), tc.next())
-        else {
-            return;
-        };
-        butterfly_8x2(x1, x2, [a, b, c, d]);
-    }
-}
-
-/// `mdct_butterflies`（mdct.c:1105–1135）。
+/// `mdct_butterflies`（mdct.c:1105–1135）。段 `i` の区切りは `points >> i` 個ずつ（`2^i` 個）。
 fn mdct_butterflies(init: &MdctLookup, x: &mut [f32], points: i32) {
-    let t = &init.trig;
-    let mut stages = init.log2n - 5;
     let points = points as usize;
-
-    // if(--stages>0)
-    stages -= 1;
-    if stages > 0 {
-        mdct_butterfly_first(t, x, points);
-    }
-
-    // for(i=1;--stages>0;i++)
-    let mut i = 1;
-    loop {
-        stages -= 1;
-        if stages <= 0 {
-            break;
+    let Some(x) = x.get_mut(..points) else {
+        return;
+    };
+    for (i, t) in init.bfly.iter().enumerate() {
+        for part in x.chunks_exact_mut(points >> i) {
+            mdct_butterfly_stage(part, t);
         }
-        let block = points >> i;
-        for part in x[..points].chunks_exact_mut(block) {
-            mdct_butterfly_generic(t, part, block, 4 << i);
-        }
-        i += 1;
     }
-
-    for c in x[..points].as_chunks_mut::<32>().0 {
+    for c in x.as_chunks_mut::<32>().0 {
         mdct_butterfly_32(c);
     }
 }
@@ -534,16 +528,21 @@ pub(crate) fn mdct_backward(init: &MdctLookup, x: &mut [f32]) {
                     .zip(t2.as_chunks::<4>().0.iter().rev()),
             )
         {
-            // iX = 組の頭 + 1
-            o1[0] = -c[3] * t1[3] - c[1] * t1[2];
-            o1[1] = c[1] * t1[3] - c[3] * t1[2];
-            o1[2] = -c[7] * t1[1] - c[5] * t1[0];
-            o1[3] = c[5] * t1[1] - c[7] * t1[0];
-            // iX = 組の頭
-            o2[0] = c[4] * t2[3] + c[6] * t2[2];
-            o2[1] = c[4] * t2[2] - c[6] * t2[3];
-            o2[2] = c[0] * t2[1] + c[2] * t2[0];
-            o2[3] = c[0] * t2[0] - c[2] * t2[1];
+            // iX = 組の頭 + 1：C の 4 つの式 `oX[0] = -iX[2]·T[3] − iX[0]·T[2]`・`oX[1] = iX[0]·T[3] − iX[2]·T[2]`・
+            // `oX[2] = -iX[6]·T[1] − iX[4]·T[0]`・`oX[3] = iX[4]·T[1] − iX[6]·T[0]` を、どれも `p·q − r·s` の形に並べる
+            let p = [-c[3], c[1], -c[7], c[5]];
+            let q = [t1[3], t1[3], t1[1], t1[1]];
+            let r = [c[1], c[3], c[5], c[7]];
+            let s = [t1[2], t1[2], t1[0], t1[0]];
+            for l in 0..4 {
+                o1[l] = p[l] * q[l] - r[l] * s[l];
+            }
+            // iX = 組の頭：`oX[0] = iX[4]·T[3] + iX[6]·T[2]`・`oX[1] = iX[4]·T[2] − iX[6]·T[3]`・
+            // `oX[2] = iX[0]·T[1] + iX[2]·T[0]`・`oX[3] = iX[0]·T[0] − iX[2]·T[1]`（左の積と右の積を先に求め、偶数番は和、
+            // 奇数番は差）
+            let m1 = [c[4] * t2[3], c[4] * t2[2], c[0] * t2[1], c[0] * t2[0]];
+            let m2 = [c[6] * t2[2], c[6] * t2[3], c[2] * t2[0], c[2] * t2[1]];
+            *o2 = [m1[0] + m2[0], m1[1] - m2[1], m1[2] + m2[2], m1[3] - m2[3]];
         }
     }
 
@@ -563,33 +562,525 @@ pub(crate) fn mdct_backward(init: &MdctLookup, x: &mut [f32]) {
         .zip(ha.as_chunks_mut::<4>().0.iter_mut().rev())
         .zip(hb.as_chunks_mut::<4>().0)
     {
-        o1[3] = s[0] * t[1] - s[1] * t[0];
-        o2[0] = -(s[0] * t[0] + s[1] * t[1]);
-        o1[2] = s[2] * t[3] - s[3] * t[2];
-        o2[1] = -(s[2] * t[2] + s[3] * t[3]);
-        o1[1] = s[4] * t[5] - s[5] * t[4];
-        o2[2] = -(s[4] * t[4] + s[5] * t[5]);
-        o1[0] = s[6] * t[7] - s[7] * t[6];
-        o2[3] = -(s[6] * t[6] + s[7] * t[7]);
+        // C の `oX1[3−l] = iX[2l]·T[2l+1] − iX[2l+1]·T[2l]`・`oX2[l] = -(iX[2l]·T[2l] + iX[2l+1]·T[2l+1])`（l = 0〜3）
+        let mut a = [0.0_f32; 4];
+        let mut b = [0.0_f32; 4];
+        for l in 0..4 {
+            a[l] = s[2 * l] * t[2 * l + 1] - s[2 * l + 1] * t[2 * l];
+            b[l] = -(s[2 * l] * t[2 * l] + s[2 * l + 1] * t[2 * l + 1]);
+        }
+        *o1 = [a[3], a[2], a[1], a[0]];
+        *o2 = b;
     }
 
     // iX = [n2, n2+n4) を終わりから読み、oX1 = [0, n4) に同じ位置で写し（`oX1[j] = iX[j]`）、oX2 = [n4, n2) に頭から
     // 符号を変えて逆の順に書く（`oX2[0] = -oX1[3]` …。`oX2[m] = -iX[n4−1−m]`）
     let (l1, l2) = lo.split_at_mut(n4);
     l1.copy_from_slice(ha);
-    for (o, s) in l2.iter_mut().zip(ha.iter().rev()) {
-        *o = -*s;
+    for (o, s) in l2
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(ha.as_chunks::<4>().0.iter().rev())
+    {
+        *o = [-s[3], -s[2], -s[1], -s[0]];
     }
 
     // iX = [n2+n4, n) を頭から読み、oX1 = [n2, n2+n4) に終わりから書く（`oX1[0] = iX[3]` …。逆の順の写し）
-    for (o, s) in ha.iter_mut().rev().zip(hb.iter()) {
-        *o = *s;
+    for (o, s) in ha
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .rev()
+        .zip(hb.as_chunks::<4>().0)
+    {
+        *o = [s[3], s[2], s[1], s[0]];
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 書き直す前の形（C のポインタをそのまま同じ配列の添字にし、`do { … } while` を数えたループにしたもの。M3・M16 段 2 の
+    /// 照合を通った実装）。速い形が同じビットを出すことを [`fast_forms_match_the_index_forms`] が照らす。
+    mod index_form {
+        use super::super::{C_PI1_8, C_PI2_8, C_PI3_8, MdctLookup, lookup_is_valid};
+
+        /// `mdct_butterfly_8`（mdct.c:407–454。#else 432–452）。`x` は 8 個。
+        fn mdct_butterfly_8(x: &mut [f32]) {
+            let mut r0 = x[6] + x[2];
+            let mut r1 = x[6] - x[2];
+            let mut r2 = x[4] + x[0];
+            let r3 = x[4] - x[0];
+
+            x[6] = r0 + r2;
+            x[4] = r0 - r2;
+
+            r0 = x[5] - x[1];
+            r2 = x[7] - x[3];
+            x[0] = r1 + r0;
+            x[2] = r1 - r0;
+
+            r0 = x[5] + x[1];
+            r1 = x[7] + x[3];
+            x[3] = r2 + r3;
+            x[1] = r2 - r3;
+            x[7] = r1 + r0;
+            x[5] = r1 - r0;
+        }
+
+        /// `mdct_butterfly_16`（mdct.c:457–528。#else 495–523）。`x` は 16 個。
+        fn mdct_butterfly_16(x: &mut [f32]) {
+            let mut r0 = x[1] - x[9];
+            let mut r1 = x[0] - x[8];
+
+            x[8] += x[0];
+            x[9] += x[1];
+            x[0] = (r0 + r1) * C_PI2_8;
+            x[1] = (r0 - r1) * C_PI2_8;
+
+            r0 = x[3] - x[11];
+            r1 = x[10] - x[2];
+            x[10] += x[2];
+            x[11] += x[3];
+            x[2] = r0;
+            x[3] = r1;
+
+            r0 = x[12] - x[4];
+            r1 = x[13] - x[5];
+            x[12] += x[4];
+            x[13] += x[5];
+            x[4] = (r0 - r1) * C_PI2_8;
+            x[5] = (r0 + r1) * C_PI2_8;
+
+            r0 = x[14] - x[6];
+            r1 = x[15] - x[7];
+            x[14] += x[6];
+            x[15] += x[7];
+            x[6] = r0;
+            x[7] = r1;
+
+            mdct_butterfly_8(&mut x[..8]);
+            mdct_butterfly_8(&mut x[8..16]);
+        }
+
+        /// `mdct_butterfly_32`（mdct.c:531–664。#else 602–658）。`x` は 32 個。
+        fn mdct_butterfly_32(x: &mut [f32]) {
+            let mut r0 = x[30] - x[14];
+            let mut r1 = x[31] - x[15];
+
+            x[30] += x[14];
+            x[31] += x[15];
+            x[14] = r0;
+            x[15] = r1;
+
+            r0 = x[28] - x[12];
+            r1 = x[29] - x[13];
+            x[28] += x[12];
+            x[29] += x[13];
+            x[12] = r0 * C_PI1_8 - r1 * C_PI3_8;
+            x[13] = r0 * C_PI3_8 + r1 * C_PI1_8;
+
+            r0 = x[26] - x[10];
+            r1 = x[27] - x[11];
+            x[26] += x[10];
+            x[27] += x[11];
+            x[10] = (r0 - r1) * C_PI2_8;
+            x[11] = (r0 + r1) * C_PI2_8;
+
+            r0 = x[24] - x[8];
+            r1 = x[25] - x[9];
+            x[24] += x[8];
+            x[25] += x[9];
+            x[8] = r0 * C_PI3_8 - r1 * C_PI1_8;
+            x[9] = r1 * C_PI3_8 + r0 * C_PI1_8;
+
+            r0 = x[22] - x[6];
+            r1 = x[7] - x[23];
+            x[22] += x[6];
+            x[23] += x[7];
+            x[6] = r1;
+            x[7] = r0;
+
+            r0 = x[4] - x[20];
+            r1 = x[5] - x[21];
+            x[20] += x[4];
+            x[21] += x[5];
+            x[4] = r1 * C_PI1_8 + r0 * C_PI3_8;
+            x[5] = r1 * C_PI3_8 - r0 * C_PI1_8;
+
+            r0 = x[2] - x[18];
+            r1 = x[3] - x[19];
+            x[18] += x[2];
+            x[19] += x[3];
+            x[2] = (r1 + r0) * C_PI2_8;
+            x[3] = (r1 - r0) * C_PI2_8;
+
+            r0 = x[0] - x[16];
+            r1 = x[1] - x[17];
+            x[16] += x[0];
+            x[17] += x[1];
+            x[0] = r1 * C_PI3_8 + r0 * C_PI1_8;
+            x[1] = r1 * C_PI1_8 - r0 * C_PI3_8;
+
+            mdct_butterfly_16(&mut x[..16]);
+            mdct_butterfly_16(&mut x[16..32]);
+        }
+
+        /// 1 組の 2 レジスタの蝶（`mdct_butterfly_first`・`generic` の中の 6 行）：`x1[a..=a+1]` と `x2[a..=a+1]` を
+        /// `T[t]`・`T[t+1]` で回す。
+        #[inline]
+        fn butterfly_pair(t: &[f32], ti: usize, x: &mut [f32], x1: usize, x2: usize, a: usize) {
+            let r0 = x[x1 + a] - x[x2 + a];
+            let r1 = x[x1 + a + 1] - x[x2 + a + 1];
+            x[x1 + a] += x[x2 + a];
+            x[x1 + a + 1] += x[x2 + a + 1];
+            x[x2 + a] = r1 * t[ti + 1] + r0 * t[ti];
+            x[x2 + a + 1] = r1 * t[ti] - r0 * t[ti + 1];
+        }
+
+        /// `mdct_butterfly_first`（mdct.c:801–896。#else 854–894）。
+        fn mdct_butterfly_first(t: &[f32], x: &mut [f32], points: i32) {
+            let points = points as usize;
+            // do{ … x1-=8; x2-=8; T+=16; }while(x2>=x);
+            for k in 0..points / 16 {
+                let x1 = points - 8 - 8 * k;
+                let x2 = (points >> 1) - 8 - 8 * k;
+                let ti = 16 * k;
+                butterfly_pair(t, ti, x, x1, x2, 6);
+                butterfly_pair(t, ti + 4, x, x1, x2, 4);
+                butterfly_pair(t, ti + 8, x, x1, x2, 2);
+                butterfly_pair(t, ti + 12, x, x1, x2, 0);
+            }
+        }
+
+        /// `mdct_butterfly_generic`（mdct.c:899–1080。#else 1032–1078）。
+        fn mdct_butterfly_generic(t: &[f32], x: &mut [f32], points: i32, trigint: i32) {
+            let points = points as usize;
+            let trigint = trigint as usize;
+            let mut ti = 0;
+            for k in 0..points / 16 {
+                let x1 = points - 8 - 8 * k;
+                let x2 = (points >> 1) - 8 - 8 * k;
+                butterfly_pair(t, ti, x, x1, x2, 6);
+                ti += trigint;
+                butterfly_pair(t, ti, x, x1, x2, 4);
+                ti += trigint;
+                butterfly_pair(t, ti, x, x1, x2, 2);
+                ti += trigint;
+                butterfly_pair(t, ti, x, x1, x2, 0);
+                ti += trigint;
+            }
+        }
+
+        /// `mdct_butterflies`（mdct.c:1105–1135）。
+        fn mdct_butterflies(init: &MdctLookup, x: &mut [f32], points: i32) {
+            let t = &init.trig;
+            let mut stages = init.log2n - 5;
+
+            // if(--stages>0)
+            stages -= 1;
+            if stages > 0 {
+                mdct_butterfly_first(t, x, points);
+            }
+
+            // for(i=1;--stages>0;i++)
+            let mut i = 1;
+            loop {
+                stages -= 1;
+                if stages <= 0 {
+                    break;
+                }
+                for j in 0..(1_i32 << i) {
+                    let off = ((points >> i) * j) as usize;
+                    mdct_butterfly_generic(t, &mut x[off..], points >> i, 4 << i);
+                }
+                i += 1;
+            }
+
+            for j in (0..points as usize).step_by(32) {
+                mdct_butterfly_32(&mut x[j..j + 32]);
+            }
+        }
+
+        /// `mdct_bitreverse`（mdct.c:1155–1274。#else 1228–1272）。`x` は作業領域 `w` の全体（n 個）：後ろ半分を読み、前半分に書く。
+        fn mdct_bitreverse(init: &MdctLookup, x: &mut [f32]) {
+            let n = init.n as usize;
+            let bit = &init.bitrev;
+            let t = &init.trig[n..];
+            let mut w0 = 0_usize;
+            let mut w1 = n >> 1;
+            let xb = n >> 1;
+            let mut bi = 0_usize;
+            let mut ti = 0_usize;
+
+            loop {
+                let mut x0 = xb + bit[bi] as usize;
+                let mut x1 = xb + bit[bi + 1] as usize;
+
+                let mut r0 = x[x0 + 1] - x[x1 + 1];
+                let mut r1 = x[x0] + x[x1];
+                let mut r2 = r1 * t[ti] + r0 * t[ti + 1];
+                let mut r3 = r1 * t[ti + 1] - r0 * t[ti];
+
+                w1 -= 4;
+
+                r0 = (x[x0 + 1] + x[x1 + 1]) * 0.5_f32;
+                r1 = (x[x0] - x[x1]) * 0.5_f32;
+
+                x[w0] = r0 + r2;
+                x[w1 + 2] = r0 - r2;
+                x[w0 + 1] = r1 + r3;
+                x[w1 + 3] = r3 - r1;
+
+                x0 = xb + bit[bi + 2] as usize;
+                x1 = xb + bit[bi + 3] as usize;
+
+                r0 = x[x0 + 1] - x[x1 + 1];
+                r1 = x[x0] + x[x1];
+                r2 = r1 * t[ti + 2] + r0 * t[ti + 3];
+                r3 = r1 * t[ti + 3] - r0 * t[ti + 2];
+
+                r0 = (x[x0 + 1] + x[x1 + 1]) * 0.5_f32;
+                r1 = (x[x0] - x[x1]) * 0.5_f32;
+
+                x[w0 + 2] = r0 + r2;
+                x[w1] = r0 - r2;
+                x[w0 + 3] = r1 + r3;
+                x[w1 + 1] = r3 - r1;
+
+                ti += 4;
+                bi += 4;
+                w0 += 4;
+
+                if w0 >= w1 {
+                    break;
+                }
+            }
+        }
+
+        pub(super) fn mdct_forward_with(
+            init: &MdctLookup,
+            input: &[f32],
+            out: &mut [f32],
+            w: &mut [f32],
+        ) {
+            if !lookup_is_valid(init) {
+                return;
+            }
+            let n = init.n as usize;
+            let n2 = n >> 1;
+            let n4 = n >> 2;
+            let n8 = n >> 3;
+            if input.len() < n || out.len() < n2 || w.len() < n {
+                return;
+            }
+            let input = &input[..n];
+            let w = &mut w[..n];
+            let trig = &init.trig;
+
+            // window + rotate + step 1
+            let mut x0 = n2 + n4;
+            let mut x1 = x0 + 1;
+            let mut ti = n2;
+            let mut i = 0;
+
+            while i < n8 {
+                x0 -= 4;
+                ti -= 2;
+                let r0 = input[x0 + 2] + input[x1];
+                let r1 = input[x0] + input[x1 + 2];
+                w[n2 + i] = r1 * trig[ti + 1] + r0 * trig[ti];
+                w[n2 + i + 1] = r1 * trig[ti] - r0 * trig[ti + 1];
+                x1 += 4;
+                i += 2;
+            }
+
+            x1 = 1;
+
+            while i < n2 - n8 {
+                ti -= 2;
+                x0 -= 4;
+                let r0 = input[x0 + 2] - input[x1];
+                let r1 = input[x0] - input[x1 + 2];
+                w[n2 + i] = r1 * trig[ti + 1] + r0 * trig[ti];
+                w[n2 + i + 1] = r1 * trig[ti] - r0 * trig[ti + 1];
+                x1 += 4;
+                i += 2;
+            }
+
+            x0 = n;
+
+            while i < n2 {
+                ti -= 2;
+                x0 -= 4;
+                let r0 = -input[x0 + 2] - input[x1];
+                let r1 = -input[x0] - input[x1 + 2];
+                w[n2 + i] = r1 * trig[ti + 1] + r0 * trig[ti];
+                w[n2 + i + 1] = r1 * trig[ti] - r0 * trig[ti + 1];
+                x1 += 4;
+                i += 2;
+            }
+
+            mdct_butterflies(init, &mut w[n2..], n2 as i32);
+            mdct_bitreverse(init, w);
+
+            // rotate + window
+            let scale = init.scale;
+            let mut ti = n2;
+            let mut xo = n2;
+            for i in 0..n4 {
+                xo -= 1;
+                let a = w[2 * i];
+                let b = w[2 * i + 1];
+                out[i] = (a * trig[ti] + b * trig[ti + 1]) * scale;
+                out[xo] = (a * trig[ti + 1] - b * trig[ti]) * scale;
+                ti += 2;
+            }
+        }
+
+        /// `mdct_backward`（mdct.c:1276–1280・1537–1627 の SSE でない経路）。入力（前半 `n/2` 個）と出力（`n` 個）は同じ配列
+        /// （C の呼び手 `mapping0_inverse` の `mdct_backward(b->transform[vb->W][0],pcm,pcm)`）。長さが足りないときは何もしない。
+        pub(super) fn mdct_backward(init: &MdctLookup, x: &mut [f32]) {
+            if !lookup_is_valid(init) {
+                return;
+            }
+            let n = init.n as usize;
+            let n2 = n >> 1;
+            let n4 = n >> 2;
+            if x.len() < n {
+                return;
+            }
+            let t = &init.trig;
+
+            // rotate
+            let mut ix = n2 as isize - 7;
+            let mut ox = n2 + n4;
+            let mut ti = n4;
+            loop {
+                ox -= 4;
+                let i = ix as usize;
+                x[ox] = -x[i + 2] * t[ti + 3] - x[i] * t[ti + 2];
+                x[ox + 1] = x[i] * t[ti + 3] - x[i + 2] * t[ti + 2];
+                x[ox + 2] = -x[i + 6] * t[ti + 1] - x[i + 4] * t[ti];
+                x[ox + 3] = x[i + 4] * t[ti + 1] - x[i + 6] * t[ti];
+                ix -= 8;
+                ti += 4;
+                if ix < 0 {
+                    break;
+                }
+            }
+            let mut ix = n2 as isize - 8;
+            let mut ox = n2 + n4;
+            let mut ti = n4;
+            loop {
+                ti -= 4;
+                let i = ix as usize;
+                x[ox] = x[i + 4] * t[ti + 3] + x[i + 6] * t[ti + 2];
+                x[ox + 1] = x[i + 4] * t[ti + 2] - x[i + 6] * t[ti + 3];
+                x[ox + 2] = x[i] * t[ti + 1] + x[i + 2] * t[ti];
+                x[ox + 3] = x[i] * t[ti] - x[i + 2] * t[ti + 1];
+                ix -= 8;
+                ox += 4;
+                if ix < 0 {
+                    break;
+                }
+            }
+
+            mdct_butterflies(init, &mut x[n2..n], n2 as i32);
+            mdct_bitreverse(init, x);
+
+            // roatate + window
+            let mut ox1 = n2 + n4;
+            let mut ox2 = n2 + n4;
+            let mut ix = 0usize;
+            let mut ti = n2;
+            loop {
+                ox1 -= 4;
+                x[ox1 + 3] = x[ix] * t[ti + 1] - x[ix + 1] * t[ti];
+                x[ox2] = -(x[ix] * t[ti] + x[ix + 1] * t[ti + 1]);
+                x[ox1 + 2] = x[ix + 2] * t[ti + 3] - x[ix + 3] * t[ti + 2];
+                x[ox2 + 1] = -(x[ix + 2] * t[ti + 2] + x[ix + 3] * t[ti + 3]);
+                x[ox1 + 1] = x[ix + 4] * t[ti + 5] - x[ix + 5] * t[ti + 4];
+                x[ox2 + 2] = -(x[ix + 4] * t[ti + 4] + x[ix + 5] * t[ti + 5]);
+                x[ox1] = x[ix + 6] * t[ti + 7] - x[ix + 7] * t[ti + 6];
+                x[ox2 + 3] = -(x[ix + 6] * t[ti + 6] + x[ix + 7] * t[ti + 7]);
+                ox2 += 4;
+                ix += 8;
+                ti += 8;
+                if ix >= ox1 {
+                    break;
+                }
+            }
+
+            let mut ix = n2 + n4;
+            let mut ox1 = n4;
+            let mut ox2 = ox1;
+            loop {
+                ox1 -= 4;
+                ix -= 4;
+                x[ox1 + 3] = x[ix + 3];
+                x[ox2] = -x[ox1 + 3];
+                x[ox1 + 2] = x[ix + 2];
+                x[ox2 + 1] = -x[ox1 + 2];
+                x[ox1 + 1] = x[ix + 1];
+                x[ox2 + 2] = -x[ox1 + 1];
+                x[ox1] = x[ix];
+                x[ox2 + 3] = -x[ox1];
+                ox2 += 4;
+                if ox2 >= ix {
+                    break;
+                }
+            }
+
+            let mut ix = n2 + n4;
+            let mut ox1 = n2 + n4;
+            let ox2 = n2;
+            loop {
+                ox1 -= 4;
+                x[ox1] = x[ix + 3];
+                x[ox1 + 1] = x[ix + 2];
+                x[ox1 + 2] = x[ix + 1];
+                x[ox1 + 3] = x[ix];
+                ix += 4;
+                if ox1 <= ox2 {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 速い形（範囲を分けて借りる形・蝶の段の表）が、書き直す前の添字の形と同じビットを出す（逆と順の MDCT、n = 64〜8192、
+    /// ChaCha8 の値。大きさの違う値・0・符号の違う 0 を混ぜる）。
+    #[test]
+    fn fast_forms_match_the_index_forms() {
+        use rand_chacha::rand_core::Rng;
+        let mut rng = crate::determinism::rng(43);
+        let value = |rng: &mut rand_chacha::ChaCha8Rng| match rng.next_u32() % 16 {
+            0 => 0.0_f32,
+            1 => -0.0,
+            2 => f32::from_bits(rng.next_u32() & 0x807f_ffff),
+            _ => f32::from_bits((rng.next_u32() & 0x83ff_ffff) | 0x3c00_0000),
+        };
+        for log2n in 6..=13 {
+            let n = 1usize << log2n;
+            let l = mdct_init(n as i32);
+            for _ in 0..6 {
+                let x: Vec<f32> = (0..n).map(|_| value(&mut rng)).collect();
+                let (mut a, mut b) = (x.clone(), x.clone());
+                mdct_backward(&l, &mut a);
+                index_form::mdct_backward(&l, &mut b);
+                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&a), bits(&b), "逆 n={n}");
+                let (mut oa, mut ob) = (vec![0.0_f32; n / 2], vec![0.0_f32; n / 2]);
+                let (mut wa, mut wb) = (vec![0.0_f32; n], vec![0.0_f32; n]);
+                mdct_forward_with(&l, &x, &mut oa, &mut wa);
+                index_form::mdct_forward_with(&l, &x, &mut ob, &mut wb);
+                assert_eq!(bits(&oa), bits(&ob), "順 n={n}");
+            }
+        }
+    }
 
     /// 定義どおりの MDCT（double。`X[k] = Σ x[i] cos(2π/N (i + 1/2 + N/4)(k + 1/2))`）。Vorbis の順方向は
     /// これに `-2/N`… の比例の違いがあるので、比を 1 つ決めて全体を比べる。
