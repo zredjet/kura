@@ -286,6 +286,36 @@ fn lossless_audio_matches_the_source_wav() {
         assert_eq!(ours, head(src, frames), "{file}");
         assert_eq!(meta.source.map(|s| s.bits), Some(bits), "{file}");
     }
+    // M16 段 3 の ALAC（自作の MP4 の読み口と ALAC。afconvert・ffmpeg）：モノラル・20・32 ビット・5.1・断片・タグ
+    let (_, _, _, _, mono) = audio("audio-src-mono16.wav", "wav");
+    let (_, _, _, _, s20) = audio("alac-20.afconvert.wav", "wav");
+    let (_, _, _, _, s32) = audio("audio-src32.wav", "wav");
+    let (_, _, _, _, s6) = audio("audio-src-6ch24.wav", "wav");
+    let (_, _, _, _, s8) = audio("audio-src-8ch16.wav", "wav");
+    for (file, src, frames, bits) in [
+        ("alac-mono.m4a", &mono, 6_615, 16),
+        ("alac-tags.m4a", &mono, 6_615, 16),
+        ("alac-20.m4a", &s20, 11_025, 24),
+        ("alac-32.m4a", &s32, 19_200, 32),
+        ("alac-6ch.m4a", &s6, 9_600, 24),
+        ("alac-frag.m4a", &s6, 9_600, 24),
+    ] {
+        let (codec, reproducible, meta, _, ours) = audio(file, "m4a");
+        assert_eq!(codec, "m4a-alac-symphonia-dec/1", "{file}");
+        assert!(reproducible, "{file}");
+        assert_eq!(ours, head(src, frames), "{file}");
+        assert_eq!(meta.source.map(|s| s.bits), Some(bits), "{file}");
+    }
+    // 8 チャンネル：面の並びは前の symphonia のまま（L R C LFE Lc Rc Ls Rs）。afconvert は WAV の BL・BR を MPEG_7_1_B の
+    // Lc・Rc に入れなかったので、面 4・5 は無音で、ほかは WAV と同じ
+    let (_, _, _, _, ours) = audio("alac-8ch.m4a", "m4a");
+    assert_eq!(ours.len(), 8);
+    for c in [0usize, 1, 2, 3, 6, 7] {
+        assert_eq!(ours[c], s8[c][..9_600], "alac-8ch.m4a 面 {c}");
+    }
+    for c in [4usize, 5] {
+        assert!(ours[c].iter().all(|v| *v == 0.0), "alac-8ch.m4a 面 {c}");
+    }
 }
 
 /// 非可逆の形式は、他のデコーダ（ffmpeg・afconvert・lewton）の読み取りと、長さ（gapless の切り取り）がちょうど同じで、

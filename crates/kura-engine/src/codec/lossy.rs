@@ -30,12 +30,12 @@ use std::io::BufReader;
 use std::path::Path;
 
 use symphonia_core::codecs::audio::AudioDecoder as _;
-use symphonia_core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_ALAC, CODEC_ID_VORBIS};
+use symphonia_core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_VORBIS};
 
 use crate::codec::held::{self, Held};
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
 use crate::codec::symph::{self, Container, Media, read_all};
-use crate::codec::{Decoder, ReadSeek, Tier, pcm};
+use crate::codec::{Decoder, ReadSeek, Tier};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
 use crate::limits::Limits;
@@ -60,9 +60,6 @@ const _: [u32; 4] = [
 /// 読むとき（全部のパケットを読んだあと）に断る。
 const SBR_PROBE_PACKETS: usize = 16;
 
-/// ALAC の 1 パケットのフレームの数の上限（symphonia の `AlacDecoder` が受け付ける magic cookie の frame_length の上限
-/// 4,096 × 16。形からは cookie を見られないので、上限で数える）。
-const ALAC_FRAMES: u64 = 65_536;
 /// `stream_work_bytes` が見込む Vorbis の codebook の表（これを超える分は `held_bytes` が setup から見積もる）。
 const VORBIS_TABLES: u64 = 32 << 20;
 
@@ -70,7 +67,6 @@ const VORBIS_TABLES: u64 = 32 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     OggVorbis,
-    Mp4Alac,
     Mp4Aac,
     AdtsAac,
 }
@@ -85,13 +81,6 @@ impl SymphoniaDecoder {
     pub fn ogg_vorbis() -> Self {
         Self {
             kind: Kind::OggVorbis,
-        }
-    }
-
-    /// MP4 の中の ALAC（`m4a-alac-symphonia-dec/1`）。
-    pub fn m4a_alac() -> Self {
-        Self {
-            kind: Kind::Mp4Alac,
         }
     }
 
@@ -110,7 +99,7 @@ impl SymphoniaDecoder {
     fn container(&self) -> Container {
         match self.kind {
             Kind::OggVorbis => Container::Ogg,
-            Kind::Mp4Alac | Kind::Mp4Aac => Container::Mp4,
+            Kind::Mp4Aac => Container::Mp4,
             Kind::AdtsAac => Container::Adts,
         }
     }
@@ -188,7 +177,6 @@ impl SymphoniaDecoder {
         let mut o = media.open(id, self.container(), mon, limits)?;
         let want = match self.kind {
             Kind::OggVorbis => CODEC_ID_VORBIS,
-            Kind::Mp4Alac => CODEC_ID_ALAC,
             Kind::Mp4Aac | Kind::AdtsAac => CODEC_ID_AAC,
         };
         if o.params.codec != want {
@@ -268,7 +256,6 @@ impl Decoder for SymphoniaDecoder {
             // - Vorbis /1 → /2：3 チャンネル以上の residue 0/1 の不具合を写しで直した（段 7。ADR-149）
             // - Vorbis /2 → /3、AAC /1 → /2：表の超越関数を libm クレートにして値を再現できるようにした（段 9）
             Kind::OggVorbis => "ogg-vorbis-symphonia-dec/3",
-            Kind::Mp4Alac => "m4a-alac-symphonia-dec/1",
             Kind::Mp4Aac => "m4a-aac-symphonia-dec/2",
             Kind::AdtsAac => "aac-adts-symphonia-dec/2",
         }
@@ -286,7 +273,7 @@ impl Decoder for SymphoniaDecoder {
     fn can_decode(&self, format: &str) -> bool {
         match self.kind {
             Kind::OggVorbis => format == "ogg",
-            Kind::Mp4Alac | Kind::Mp4Aac => format == "m4a",
+            Kind::Mp4Aac => format == "m4a",
             Kind::AdtsAac => format == "aac",
         }
     }
@@ -356,7 +343,6 @@ impl Decoder for SymphoniaDecoder {
         };
         let ch = u64::from(*channels);
         let work = match self.kind {
-            Kind::Mp4Alac => ALAC_FRAMES * ch * 12 + ALAC_FRAMES * 4,
             Kind::OggVorbis => 8_192 * ch * 8 + VORBIS_TABLES,
             Kind::Mp4Aac | Kind::AdtsAac => 8_192 * ch * 8,
         };
@@ -377,7 +363,7 @@ impl Decoder for SymphoniaDecoder {
                 h.decode = h.decode.saturating_sub(VORBIS_TABLES);
                 h
             }
-            Container::Mp4 => held::mp4(src)?,
+            Container::Mp4 => held::mp4(src, held::Mp4Reader::Symphonia)?,
             Container::Adts => Held {
                 open: held::READER,
                 decode: 0,
@@ -470,11 +456,6 @@ impl SymphoniaDecoder {
                     symphonia_codec_vorbis::VorbisDecoder::try_new(&o.params, &opts).map_err(e)?;
                 o.decode_all(id, &mut dec, max, out, mon)?;
             }
-            Kind::Mp4Alac => {
-                let mut dec =
-                    symphonia_codec_alac::AlacDecoder::try_new(&o.params, &opts).map_err(e)?;
-                o.decode_all(id, &mut dec, max, out, mon)?;
-            }
             Kind::Mp4Aac | Kind::AdtsAac => {
                 let mut dec =
                     symphonia_codec_aac::AacDecoder::try_new(&o.params, &opts).map_err(e)?;
@@ -492,23 +473,10 @@ impl SymphoniaDecoder {
         let frames = got;
         let vorbis = self.kind == Kind::OggVorbis;
         let mut meta: AudioMeta = symph::meta_from_tags(&p.raw_tags, frames, vorbis, limits);
-        meta.source = Some(match self.kind {
-            Kind::Mp4Alac => AudioSource {
-                bits: pcm::container_bits(u16::from(
-                    o.params
-                        .extra_data
-                        .as_deref()
-                        .and_then(symph::alac_bits)
-                        .unwrap_or(16),
-                )),
-                float: false,
-                rate: p.rate,
-            },
-            _ => AudioSource {
-                bits: 16,
-                float: false,
-                rate: p.rate,
-            },
+        meta.source = Some(AudioSource {
+            bits: 16,
+            float: false,
+            rate: p.rate,
         });
         out.end(meta)
     }

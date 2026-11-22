@@ -272,10 +272,130 @@ pub(crate) fn flac(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
     })
 }
 
+/// m4a の読み手ごとの数え方（[`mp4`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mp4Reader {
+    /// 自作の読み手（`codec::mp4_read`。ALAC）：サンプルの表（stts・stsc・stsz・stco・co64）を 3 倍（読み込む領域と、
+    /// 位置を u64 にした表）、stz2 を 9 倍（4 ビットの項目を u32 にすると 8 倍）。どのトラックを選ぶかは数えないので、すべての
+    /// trak の分。7 つのキーのタグの値は 1 つ `min(3 × 長さ, 4,096)`（不正な UTF-8 の置き換えで 3 倍まで伸び、4,096 を
+    /// 超えるものは持たない）と [`ITEM_COST`]、読む間の写しに [`TAG_VALUE`] の 2 つ分。mdat の前に続く moof の大きさの和の
+    /// 最大を [`MOOF_FACTOR`] 倍。covr・ほかのタグ・mdat は読まない。
+    Kura,
+    /// symphonia の `IsoMp4Reader`（AAC。段 4 まで）。
+    Symphonia,
+}
+
+/// 自作の読み手が読むタグの 1 つの値の上限（UTF-16 の 2 倍と頭）。
+const TAG_VALUE: u64 = 2 * 4_096 + 16;
+/// moof の大きさに対する、自作の読み手が持つ trun の量の倍率（trun 1 つ 16 バイト以上に `Run` 48 バイト、列の伸び 2 倍、
+/// サンプルごとの値の写し、読み込む領域）。
+const MOOF_FACTOR: u64 = 10;
+
+/// m4a。`reader` の数え方で（[`Mp4Reader`]）。
+pub(crate) fn mp4(src: &mut dyn ReadSeek, reader: Mp4Reader) -> Result<Held, EngineError> {
+    match reader {
+        Mp4Reader::Symphonia => mp4_symphonia(src),
+        Mp4Reader::Kura => mp4_kura(src),
+    }
+}
+
+/// 自作の読み手（[`Mp4Reader::Kura`]）。
+fn mp4_kura(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
+    let mut w = Walk::new(src)?;
+    let len = w.len;
+    let (mut tables, mut tags) = (0u64, 0u64);
+    let (mut run, mut run_peak) = (0u64, 0u64);
+    let mut top = Boxes::new(0, len);
+    while let Some((kind, s, e)) = top.next(&mut w)? {
+        match &kind {
+            b"moov" => {
+                let mut moov = Boxes::new(s, e);
+                while let Some((k, ms, me)) = moov.next(&mut w)? {
+                    match &k {
+                        b"trak" => tables = tables.saturating_add(trak_tables(&mut w, ms, me)?),
+                        b"udta" => {
+                            let mut udta = Boxes::new(ms, me);
+                            while let Some((k, us, ue)) = udta.next(&mut w)? {
+                                if &k == b"meta" {
+                                    tags = tags.saturating_add(kura_tags(&mut w, us, ue)?);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            b"meta" => tags = tags.saturating_add(kura_tags(&mut w, s, e)?),
+            b"moof" => {
+                run = run.saturating_add(e - s);
+                run_peak = run_peak.max(run);
+            }
+            b"mdat" => run = 0,
+            _ => {}
+        }
+    }
+    Ok(Held {
+        open: READER
+            .saturating_add(tables)
+            .saturating_add(tags)
+            // タグを読む間の写し（生の値と置き換えた文字列。タグがあるときだけ）
+            .saturating_add(if tags > 0 { TAG_VALUE.saturating_mul(2) } else { 0 })
+            .saturating_add(run_peak.saturating_mul(MOOF_FACTOR)),
+        decode: 0,
+    })
+}
+
+/// trak の中のサンプルの表を持つ量（stz2 は 9 倍、ほかは 3 倍）。
+fn trak_tables(w: &mut Walk<'_>, s: u64, e: u64) -> Result<u64, EngineError> {
+    let mut total = 0u64;
+    let mut stack = vec![(s, e)];
+    while let Some((s, e)) = stack.pop() {
+        let mut b = Boxes::new(s, e);
+        while let Some((k, cs, ce)) = b.next(w)? {
+            match &k {
+                b"mdia" | b"minf" | b"stbl" => stack.push((cs, ce)),
+                b"stts" | b"stsc" | b"stsz" | b"stco" | b"co64" => {
+                    total = total.saturating_add((ce - cs).saturating_mul(3));
+                }
+                b"stz2" => total = total.saturating_add((ce - cs).saturating_mul(9)),
+                _ => {}
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// meta の中の ilst の、自作の読み手が読む 7 つのキーのタグの量。
+fn kura_tags(w: &mut Walk<'_>, s: u64, e: u64) -> Result<u64, EngineError> {
+    let mut total = 0u64;
+    let mut meta = Boxes::new(s.saturating_add(4).min(e), e);
+    while let Some((k, is, ie)) = meta.next(w)? {
+        if &k != b"ilst" {
+            continue;
+        }
+        let mut ilst = Boxes::new(is, ie);
+        while let Some((tag, ts, te)) = ilst.next(w)? {
+            if !crate::codec::mp4_read::TAG_KEYS
+                .iter()
+                .any(|(k, _)| *k == tag)
+            {
+                continue;
+            }
+            let mut parts = Boxes::new(ts, te);
+            while let Some((_, ds, de)) = parts.next(w)? {
+                total = total
+                    .saturating_add((de - ds).saturating_mul(3).min(4_096))
+                    .saturating_add(ITEM_COST);
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// m4a（symphonia の `IsoMp4Reader` が開くときに読む最上位の moov・meta）。moov の中の udta/meta/ilst のタグは、covr を
 /// 1 倍、ほかを [`MP4_TEXT_FACTOR`] 倍、data（と name・mean）1 つにつき [`ITEM_COST`]。ほかの moov の中身は 2 倍。タグの
 /// 中身は 1 つの領域に読むので、最も大きいものを読む間の [`boxed_extra`] を足す。
-pub(crate) fn mp4(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
+fn mp4_symphonia(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
     let mut w = Walk::new(src)?;
     let mut peak = Peak::default();
     let len = w.len;
@@ -684,8 +804,8 @@ mod tests {
                 "flac-16.flac",
                 flac as fn(&mut dyn ReadSeek) -> Result<Held, EngineError>,
             ),
-            ("alac-16.m4a", mp4),
-            ("aac-lc-ffmpeg.m4a", mp4),
+            ("alac-16.m4a", |s| mp4(s, Mp4Reader::Kura)),
+            ("aac-lc-ffmpeg.m4a", |s| mp4(s, Mp4Reader::Symphonia)),
         ] {
             let h = f(&mut Cursor::new(fixture(name))).unwrap();
             assert!(
@@ -819,7 +939,9 @@ mod tests {
                     READER
                 );
             }
-            assert_eq!(mp4(&mut Cursor::new(&bytes)).unwrap().open, READER);
+            for reader in [Mp4Reader::Kura, Mp4Reader::Symphonia] {
+                assert_eq!(mp4(&mut Cursor::new(&bytes), reader).unwrap().open, READER);
+            }
         }
     }
 
@@ -848,7 +970,9 @@ mod tests {
             for tables in TABLES {
                 let _ = ogg(&mut Cursor::new(&b), &limits, tables).unwrap();
             }
-            let _ = mp4(&mut Cursor::new(&b)).unwrap();
+            for reader in [Mp4Reader::Kura, Mp4Reader::Symphonia] {
+                let _ = mp4(&mut Cursor::new(&b), reader).unwrap();
+            }
         }
     }
 }

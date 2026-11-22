@@ -18,6 +18,8 @@
 //!   実装で決まる）。ファイルのダイジェスト（R2）は書いたものを読み直して [`FileDigest`] で取る。
 
 pub mod aiff;
+pub mod alac;
+pub(crate) mod alac_read;
 pub mod anchor;
 pub mod aseprite;
 pub(crate) mod byte_in;
@@ -33,6 +35,7 @@ pub mod jpeg;
 pub mod lossy;
 pub(crate) mod md5;
 pub mod mp3;
+pub(crate) mod mp4_read;
 pub(crate) mod ogg;
 pub(crate) mod ogg_read;
 pub mod pcm;
@@ -650,7 +653,7 @@ impl CodecSet {
                 flac.clone(),
                 Arc::new(mp3::Mp3Codec),
                 Arc::new(vorbis::dec::VorbisDecoder),
-                Arc::new(lossy::SymphoniaDecoder::m4a_alac()),
+                Arc::new(alac::AlacCodec),
                 Arc::new(lossy::SymphoniaDecoder::m4a_aac()),
                 Arc::new(lossy::SymphoniaDecoder::adts_aac()),
                 Arc::new(anchor::AnchorDecoder),

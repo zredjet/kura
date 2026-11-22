@@ -22,8 +22,9 @@ autotests = false
 # - miniz_oxide：aseprite・PSD の zlib の展開（上限付き）
 # - image-webp：WebP の読み取り（可逆・非可逆・アニメ）と可逆の書き出し
 # - resvg：SVG の描画。中で std の三角関数（OS の libm）を使うので、結果は環境に依存する（R1 を約束しない。§9.4 のアンカーを作る）
-# - symphonia-*：ALAC（整数だけ）と AAC-LC・Vorbis（段 9 から、超越関数を libm に差し替えた third_party の写しで
-#   値を再現できる。ADR-153）の読み取り、MP4・Ogg の読み口（FLAC は M16 段 1 で自作の flac_read に替えた。ADR-216）。部品のクレートを直接 `=` で固定し、既定の
+# - symphonia-*：AAC-LC と旧版の Vorbis（段 9 から、超越関数を libm に差し替えた third_party の写しで
+#   値を再現できる。ADR-153）の読み取り、AAC の MP4・ADTS の読み口と旧版の Ogg の読み口（FLAC は M16 段 1、Vorbis は段 2、
+#   MP4 の ALAC は段 3 で自作に替えた。ADR-216・217・219）。部品のクレートを直接 `=` で固定し、既定の
 #   feature（opt-simd の rustfft は AAC・Vorbis の値を変える）と id3v2（スタックのあふれ #562）を入れない
 # - nanomp3：MP3 の読み取り（minimp3 とビット一致の純 Rust。libm を使わない）。SIMD（wide）は外す
 # - vorbis-tables：Ogg Vorbis の書き出しの表（aoTuV b6.03 から生成してコミットしたもの。ワークスペースの中のクレート。
@@ -52,7 +53,6 @@ serde_json.workspace = true
 # 展開して TS に書き出せないので使わない）
 specta = { workspace = true, optional = true, features = ["derive"] }
 symphonia-codec-aac = { version = "=0.6.1", default-features = false }
-symphonia-codec-alac = { version = "=0.6.1", default-features = false }
 symphonia-codec-vorbis = { version = "=0.6.1", default-features = false }
 symphonia-core = { version = "=0.6.1", default-features = false }
 symphonia-format-isomp4 = { version = "=0.6.1", default-features = false }
@@ -74,6 +74,9 @@ proptest.workspace = true
 # symphonia-bundle-flac：自作の FLAC の読み取り（codec/flac_read.rs）の照合相手。前の `flac-symphonia-dec/1` の中身で、
 # 同じ入力から同じ値を読むことを確かめる（M16 段 1。ADR-216）。本番の依存と同じ版・同じ feature
 symphonia-bundle-flac = { version = "=0.6.1", default-features = false }
+# symphonia-codec-alac：自作の ALAC の読み取り（codec/alac_read.rs・mp4_read.rs）の照合相手。前の
+# `m4a-alac-symphonia-dec/1` の中身で、同じ入力から同じ値を読むことを確かめる（M16 段 3。ADR-219）
+symphonia-codec-alac = { version = "=0.6.1", default-features = false }
 
 [lints]
 workspace = true

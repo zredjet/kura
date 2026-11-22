@@ -581,6 +581,10 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
             "m4a",
             vec![
                 fixture("alac-24.m4a"),
+                // M16 段 3：自作の MP4 の読み口（断片・タグ・8 チャンネル）
+                fixture("alac-frag.m4a"),
+                fixture("alac-tags.m4a"),
+                fixture("alac-8ch.m4a"),
                 fixture("aac-lc-afconvert.m4a"),
                 fixture("aac-lc-ffmpeg.m4a"),
                 fixture("aac-he.m4a"),

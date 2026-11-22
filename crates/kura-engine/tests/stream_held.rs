@@ -23,13 +23,8 @@ use kura_engine::audio::digest::PcmTreeDigest;
 use kura_engine::codec::stream::stream_window_bytes;
 use kura_engine::codec::{CodecSet, NullSink, PickedStage};
 use kura_engine::doc::DecodeOptions;
-use kura_engine::{Dim, Limits, NoMonitor, Shape};
+use kura_engine::{Limits, NoMonitor, Shape};
 use serde_json::json;
-use symphonia_core::audio::{Audio as _, GenericAudioBufferRef};
-use symphonia_core::codecs::audio::well_known::CODEC_ID_ALAC;
-use symphonia_core::codecs::audio::{AudioCodecParameters, AudioDecoder as _, AudioDecoderOptions};
-use symphonia_core::packet::Packet;
-use symphonia_core::units::{Duration, Timestamp};
 
 struct Counting;
 static CUR: AtomicUsize = AtomicUsize::new(0);
@@ -693,6 +688,27 @@ fn stream_estimates_cover_what_readers_hold() {
         m4a_with_tags(&[(lyr, 1, vec![b'x'; 4 << 20])]),
         "m4a",
     );
+    // m4a の ALAC（自作の読み手）：小さなタグ 10 万（7 つのキーの 1 つ）・30 万のパケット（大きな stsz）
+    let cmt_tags: Vec<([u8; 4], u32, Vec<u8>)> = (0..100_000)
+        .map(|_| ([0xa9, b'c', b'm', b't'], 1, b"a".to_vec()))
+        .collect();
+    put(
+        "alac-tiny-tags",
+        alac_m4a_with(&mono_cookie(), &[mono_packet(7)], 1, &cmt_tags, false),
+        "m4a",
+    );
+    let many: Vec<Vec<u8>> = (0..300_000u32).map(|i| mono_packet(i as u16)).collect();
+    put(
+        "alac-many-packets",
+        alac_m4a_with(&mono_cookie(), &many, 1, &[], false),
+        "m4a",
+    );
+    // stz2 の 4 ビットの表（自作の読み手は u32 にして 8 倍で持つ）
+    put(
+        "alac-stz2-4bit",
+        alac_m4a_with(&mono_cookie(), &many, 1, &[], true),
+        "m4a",
+    );
     // 自作の FLAC の読み手が読み飛ばす箱と、自作の Ogg Vorbis の読み手が使わない項目（持たない）
     let skipped = [
         "flac-pictures",
@@ -726,9 +742,174 @@ fn stream_estimates_cover_what_readers_hold() {
     }
 }
 
-/// ALAC は magic cookie の frame_length 65,536（symphonia が受け付ける上限）・8 チャンネル・32 ビットの非圧縮のフレームで、
-/// デコーダ・パケット・作業列の山が `stream_work_bytes` を下回らない（前は 8,192 フレームで数え、山 6.25 MiB に対して
-/// 4.5 MiB だった）。
+/// 箱。
+fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut o = u32::try_from(8 + body.len())
+        .unwrap()
+        .to_be_bytes()
+        .to_vec();
+    o.extend_from_slice(kind);
+    o.extend_from_slice(body);
+    o
+}
+
+/// 版と旗のある箱（版 0・旗 0）。
+fn mp4_full(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut b = vec![0u8; 4];
+    b.extend_from_slice(body);
+    mp4_box(kind, &b)
+}
+
+/// ALAC のパケット 1 つ（`frames` フレーム）の m4a（ftyp・moov・mdat）。
+fn alac_m4a(cookie: &[u8], packet: &[u8], frames: u32) -> Vec<u8> {
+    alac_m4a_with(cookie, &[packet.to_vec()], frames, &[], false)
+}
+
+/// ALAC のパケットの列（どれも `frames` フレーム。1 つの chunk）と、moov/udta/meta/ilst のタグ（箱の種類, data の型, 中身）
+/// の m4a。
+fn alac_m4a_with(
+    cookie: &[u8],
+    packets: &[Vec<u8>],
+    frames: u32,
+    tags: &[([u8; 4], u32, Vec<u8>)],
+    stz2_4: bool,
+) -> Vec<u8> {
+    let n = u32::try_from(packets.len()).unwrap();
+    let mut entry = vec![0u8; 6];
+    entry.extend_from_slice(&1u16.to_be_bytes());
+    entry.extend_from_slice(&[0; 8]);
+    entry.extend_from_slice(&2u16.to_be_bytes());
+    entry.extend_from_slice(&16u16.to_be_bytes());
+    entry.extend_from_slice(&[0; 4]);
+    entry.extend_from_slice(&(44_100u32 << 16).to_be_bytes());
+    entry.extend_from_slice(&mp4_full(b"alac", cookie));
+    let mut stsd = 1u32.to_be_bytes().to_vec();
+    stsd.extend_from_slice(&mp4_box(b"alac", &entry));
+    let one = |a: u32, b: u32| [1u32.to_be_bytes(), a.to_be_bytes(), b.to_be_bytes()].concat();
+    let stts = mp4_full(b"stts", &one(n, frames));
+    let mut stsc_body = 1u32.to_be_bytes().to_vec();
+    stsc_body
+        .extend_from_slice(&[1u32.to_be_bytes(), n.to_be_bytes(), 1u32.to_be_bytes()].concat());
+    let stsc = mp4_full(b"stsc", &stsc_body);
+    let mut sizes = [0u32.to_be_bytes(), n.to_be_bytes()].concat();
+    for p in packets {
+        sizes.extend_from_slice(&u32::try_from(p.len()).unwrap().to_be_bytes());
+    }
+    let stsz = if stz2_4 {
+        // stz2（4 ビットの大きさ。パケットは 16 バイト未満）
+        let mut b = vec![0u8, 0, 0, 4];
+        b.extend_from_slice(&n.to_be_bytes());
+        for pair in packets.chunks(2) {
+            let hi = u8::try_from(pair[0].len()).unwrap();
+            let lo = pair.get(1).map_or(0, |p| u8::try_from(p.len()).unwrap());
+            b.push((hi << 4) | lo);
+        }
+        mp4_full(b"stz2", &b)
+    } else {
+        mp4_full(b"stsz", &sizes)
+    };
+    let mut items = Vec::new();
+    for (key, kind, value) in tags {
+        let mut d = kind.to_be_bytes().to_vec();
+        d.extend_from_slice(&[0; 4]);
+        d.extend_from_slice(value);
+        items.extend_from_slice(&mp4_box(key, &mp4_box(b"data", &d)));
+    }
+    let mut meta = vec![0u8; 4];
+    meta.extend_from_slice(&mp4_box(b"ilst", &items));
+    let udta = mp4_box(b"udta", &mp4_box(b"meta", &meta));
+    let moov = |offset: u32| {
+        let stco = mp4_full(
+            b"stco",
+            &[1u32.to_be_bytes(), offset.to_be_bytes()].concat(),
+        );
+        let stbl = mp4_box(
+            b"stbl",
+            &[
+                mp4_full(b"stsd", &stsd),
+                stts.clone(),
+                stsc.clone(),
+                stsz.clone(),
+                stco,
+            ]
+            .concat(),
+        );
+        let minf = mp4_box(b"minf", &stbl);
+        let mut hdlr = vec![0u8; 4];
+        hdlr.extend_from_slice(b"soun");
+        hdlr.extend_from_slice(&[0; 13]);
+        let mut mdhd = vec![0u8; 8];
+        mdhd.extend_from_slice(&44_100u32.to_be_bytes());
+        mdhd.extend_from_slice(&(frames * n).to_be_bytes());
+        mdhd.extend_from_slice(&[0; 4]);
+        let mdia = mp4_box(
+            b"mdia",
+            &[mp4_full(b"mdhd", &mdhd), mp4_full(b"hdlr", &hdlr), minf].concat(),
+        );
+        let mut tkhd = vec![0u8; 8];
+        tkhd.extend_from_slice(&1u32.to_be_bytes());
+        tkhd.extend_from_slice(&[0; 68]);
+        let trak = mp4_box(b"trak", &[mp4_full(b"tkhd", &tkhd), mdia].concat());
+        let mut mvhd = vec![0u8; 8];
+        mvhd.extend_from_slice(&1_000u32.to_be_bytes());
+        mvhd.extend_from_slice(&[0; 84]);
+        mp4_box(
+            b"moov",
+            &[mp4_full(b"mvhd", &mvhd), trak, udta.clone()].concat(),
+        )
+    };
+    let ftyp = mp4_box(b"ftyp", b"M4A \0\0\0\0M4A isom");
+    let head = ftyp.len() + moov(0).len() + 8;
+    [
+        ftyp,
+        moov(u32::try_from(head).unwrap()),
+        mp4_box(b"mdat", &packets.concat()),
+    ]
+    .concat()
+}
+
+/// 1 フレームの非圧縮のモノラルの ALAC のパケット（cookie は [`mono_cookie`]）。
+fn mono_packet(v: u16) -> Vec<u8> {
+    // SCE・部分フレーム 1・escape の 16 ビット 1 つ・END（MSB から）
+    let mut w: Vec<u8> = Vec::new();
+    let mut at = 0usize;
+    let mut put = |v: u64, n: usize| {
+        for k in (0..n).rev() {
+            if at.is_multiple_of(8) {
+                w.push(0);
+            }
+            if (v >> k) & 1 == 1 {
+                let l = w.len() - 1;
+                w[l] |= 0x80 >> (at % 8);
+            }
+            at += 1;
+        }
+    };
+    put(0, 3);
+    put(0, 4);
+    put(0, 12);
+    put(1, 1);
+    put(0, 2);
+    put(1, 1);
+    put(1, 32);
+    put(u64::from(v), 16);
+    put(7, 3);
+    w
+}
+
+/// モノラル 16 ビット・frame_length 4,096 の cookie。
+fn mono_cookie() -> Vec<u8> {
+    let mut c = 4_096u32.to_be_bytes().to_vec();
+    c.extend_from_slice(&[0, 16, 40, 10, 14, 1]);
+    c.extend_from_slice(&255u16.to_be_bytes());
+    c.extend_from_slice(&[0; 8]);
+    c.extend_from_slice(&44_100u32.to_be_bytes());
+    c
+}
+
+/// ALAC は magic cookie の frame_length 65,536（受け付ける上限）・8 チャンネル・32 ビットの非圧縮のフレームで、デコーダ・
+/// パケット・作業列の山が見積もり（`stream_work_bytes` と `held_bytes`）を下回らない（前は 8,192 フレームで数え、山
+/// 6.25 MiB に対して 4.5 MiB だった。M16 段 3 から自作の MP4 の読み口と ALAC で、m4a のファイルとして流して測る）。
 #[test]
 fn alac_largest_frames_fit_the_stream_estimate() {
     let _serial = serial();
@@ -739,11 +920,6 @@ fn alac_largest_frames_fit_the_stream_estimate() {
     cookie.extend_from_slice(&255u16.to_be_bytes());
     cookie.extend_from_slice(&[0; 8]);
     cookie.extend_from_slice(&44_100u32.to_be_bytes());
-    let mut params = AudioCodecParameters::new();
-    params
-        .for_codec(CODEC_ID_ALAC)
-        .with_sample_rate(44_100)
-        .with_extra_data(cookie.into_boxed_slice());
     // 非圧縮（escape）の 1 フレーム：SCE・CPE × 3・SCE（MSB から書く）
     let mut bits: Vec<u8> = Vec::new();
     let mut at = 0usize;
@@ -771,45 +947,10 @@ fn alac_largest_frames_fit_the_stream_estimate() {
         }
     }
     put(7, 3);
-    let packet = bits.into_boxed_slice();
-    let claim = CodecSet::pinned().decode_stream_work_bytes(
-        "m4a",
-        &Shape::Audio {
-            rate: 44_100,
-            channels: u16::from(CH),
-            frames: Dim::Exact(u64::from(FRAMES)),
-        },
-        packet.len() as u64,
-    );
-    // 読み口が読むパケット（isomp4 は Box<[u8]> に読む）は測る前に作ったので、山に足す
-    let len = packet.len() as u64;
-    let (_, peak) = peak_of(move || {
-        // デコーダ・decode_all の作業列
-        let pkt = Packet::new(
-            1,
-            Timestamp::new(0),
-            Duration::new(u64::from(FRAMES)),
-            packet,
-        );
-        let mut dec =
-            symphonia_codec_alac::AlacDecoder::try_new(&params, &AudioDecoderOptions::default())
-                .unwrap();
-        let buf = dec.decode(&pkt).unwrap();
-        let mut planes: Vec<Vec<f32>> = (0..usize::from(CH)).map(|_| Vec::new()).collect();
-        for (ch, plane) in planes.iter_mut().enumerate() {
-            plane.try_reserve(buf.frames()).unwrap();
-            let GenericAudioBufferRef::S32(b) = &buf else {
-                panic!("i32 でない");
-            };
-            plane.extend(b.plane(ch).unwrap().iter().map(|s| *s as f32));
-        }
-        planes.len()
-    });
-    let peak = peak + len;
-    eprintln!(
-        "ALAC: 山 {:.2} MiB（見積もり {:.2}）",
-        mib(peak),
-        mib(claim)
-    );
-    assert!(peak <= claim, "ALAC の山 {peak} > 見積もり {claim}");
+    let path = dir().join("alac-largest.m4a");
+    std::fs::write(&path, alac_m4a(&cookie, &bits, FRAMES)).unwrap();
+    let (_, _, stream_peak, _) = check("alac-largest", &path, "m4a");
+    // 意味のあるケース（パケットと面で数 MiB ある）
+    assert!(stream_peak > 4 << 20, "{stream_peak}");
+    std::fs::remove_file(path).unwrap();
 }

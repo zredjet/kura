@@ -41,6 +41,10 @@ ALAC・AIFF・MP3）の値は `tests/codec_golden.rs` で凍結する。
 
 - 作ったときの道具：SoX 14.4.2、flac 1.5.0、LAME 4.0、FFmpeg 9.0.2、macOS 26.7 の afconvert・afinfo、vorbis_rs 0.5.6
   （aoTuV 20110424、libvorbis 1.3.7 ベース。作業用の小さな Rust のプログラムで呼んだ）、lewton 0.10.2（同じく作業用）。
+- M16 段 3 の元の音（sox）：`audio-src-mono16.wav` は `sox -n -r 22050 -c 1 -b 16 … synth 0.3 sine 300-5000 gain -4`、
+  `audio-src-6ch24.wav` は `sox -n -r 48000 -c 6 -b 24 … synth 0.2 sine 200 sine 400 sine 600 sine 50 sine 800 sine 1000 gain -6`、
+  `audio-src-8ch16.wav` は `sox -n -r 48000 -c 8 -b 16 … synth 0.2 sine 220 sine 330 sine 440 sine 60 sine 550 sine 660 sine 770 sine 880 gain -6`、
+  `audio-src32.wav` は `sox -n -r 96000 -c 2 -b 32 … synth 0.2 sine 1000-20000 whitenoise gain -3`。
 - 元の音：`audio-src16.wav` は `sox -n -r 44100 -c 2 -b 16 audio-src16.wav synth 1.0 sine 100-8000 sine 8000-100 gain -6`
   （左右で逆向きの掃引。44,100 フレーム）、`audio-src24.wav` は
   `sox -n -r 48000 -c 2 -b 24 audio-src24.wav synth 0.5 sine 200-12000 sine 300 gain -3`（24,000 フレーム。拡張形式）。
@@ -51,6 +55,13 @@ ALAC・AIFF・MP3）の値は `tests/codec_golden.rs` で凍結する。
 | `flac-24.flac` | `flac -5 -o flac-24.flac audio-src24.wav` | 同上 |
 | `alac-16.m4a` | `afconvert -f m4af -d alac audio-src16.wav alac-16.m4a`（iTunSMPB 付き） | 同上 |
 | `alac-24.m4a` | `ffmpeg -i audio-src24.wav -c:a alac -sample_fmt s32p alac-24.m4a` | 同上（元の深さ 24 を読む） |
+| `alac-mono.m4a` | `afconvert -f m4af -d alac -c 1 audio-src-mono16.wav alac-mono.m4a`（M16 段 3。22,050 Hz・6,615 フレーム） | `audio-src-mono16.wav` とちょうど同じ |
+| `alac-20.m4a` | `sox -n -r 44100 -c 2 -b 24 src-20.wav synth 0.25 pinknoise sine 440 gain -2`（元は置かない）を `afconvert -f m4af -d alac/2 src-20.wav alac-20.m4a`（format flags 2 = 20 ビット） | `alac-20.afconvert.wav`（`afconvert -f WAVE -d LEI24 alac-20.m4a`。下位 4 ビットは 0） |
+| `alac-32.m4a` | `afconvert -f m4af -d alac audio-src32.wav alac-32.m4a`（96 kHz・19,200 フレーム。要素は sh 16） | `audio-src32.wav` とちょうど同じ |
+| `alac-6ch.m4a` | `afconvert -f m4af -d alac -l MPEG_5_1_A audio-src-6ch24.wav alac-6ch.m4a`（5.1・24 ビット） | `audio-src-6ch24.wav` とちょうど同じ（面 i が WAV の i） |
+| `alac-8ch.m4a` | `afconvert -f m4af -d alac -l MPEG_7_1_C audio-src-8ch16.wav alac-8ch.m4a`（7.1・16 ビット） | `audio-src-8ch16.wav` の 0〜3・6・7 と同じ。読み手の並び（前の symphonia の L R C LFE Lc Rc Ls Rs）の面 4・5 は無音（afconvert が WAV の BL・BR を MPEG_7_1_B の Lc・Rc に入れなかった） |
+| `alac-frag.m4a` | `ffmpeg -i audio-src-6ch24.wav -c:a alac -sample_fmt s32p -movflags frag_keyframe+empty_moov -frag_duration 50000 alac-frag.m4a`（断片化。moof 3 つ・mfra） | `audio-src-6ch24.wav` とちょうど同じ |
+| `alac-tags.m4a` | `ffmpeg -i audio-src-mono16.wav -c:a alac -metadata title="Sweep 掃引" -metadata artist=kura -metadata album="Album ü" -metadata comment=note -metadata date=2026 -metadata genre=Test -metadata copyright="(c) kura" alac-tags.m4a` | `audio-src-mono16.wav` とちょうど同じ。タグ 7 つ |
 | `aiff-24.aiff` | `sox audio-src24.wav aiff-24.aiff trim 0 4800s`（COMT 付き） | 元の先頭 4,800 フレーム |
 | `aifc-f32.aif` | 元の先頭 4,410 フレームを `afconvert -f AIFC -d BEF32`（FVER・長い圧縮の名前付き） | 元の先頭 4,410 フレーム |
 | `mp3-lame.mp3` | `lame -b 128 --tt Sweep --ta kura audio-src16.wav`（ID3v2・LAME タグ） | `mp3-lame.ffmpeg.flac`（gapless で 44,100） |

@@ -11,7 +11,7 @@ yt-dlp・gallery-dl・ffmpeg・deno・mpv・Google Chrome などの外部ツー�
 |---|--:|
 | MIT | 291 |
 | Unicode-3.0 | 19 |
-| MPL-2.0 | 13 |
+| MPL-2.0 | 12 |
 | BSD-3-Clause | 8 |
 | Apache-2.0 | 4 |
 | BSD-2-Clause | 2 |
@@ -5263,7 +5263,7 @@ SOFTWARE.
 
 ### MPL-2.0
 
-対象：cssparser 0.37.0、cssparser-macros 0.7.1、symphonia-codec-aac 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-aac/、変更は KURA.md）、symphonia-codec-alac 0.6.1、symphonia-codec-vorbis 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-vorbis/、変更は KURA.md）、symphonia-common 0.6.1、symphonia-core 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-core/、変更は KURA.md）、symphonia-format-isomp4 0.6.1、symphonia-format-ogg 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-format-ogg/、変更は KURA.md）、symphonia-metadata 0.6.1
+対象：cssparser 0.37.0、cssparser-macros 0.7.1、symphonia-codec-aac 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-aac/、変更は KURA.md）、symphonia-codec-vorbis 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-vorbis/、変更は KURA.md）、symphonia-common 0.6.1、symphonia-core 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-core/、変更は KURA.md）、symphonia-format-isomp4 0.6.1、symphonia-format-ogg 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-format-ogg/、変更は KURA.md）、symphonia-metadata 0.6.1
 
 ````text
 Mozilla Public License Version 2.0
