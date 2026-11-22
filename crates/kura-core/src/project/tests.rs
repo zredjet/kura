@@ -285,6 +285,55 @@ fn a_changed_unreadable_file_keeps_its_old_row_until_it_is_read_again() {
     assert_eq!((r.files, r.hashed), (1, 0));
 }
 
+/// 大きさが同じまま中身と時刻が変わったファイルが読めないときも、前の時刻のまま残す（大きさは同じなので、時刻を書き戻さないと
+/// 次の回に前のハッシュのまま当たり続ける。M15 段 8 の検証の直し）。
+#[test]
+fn a_same_size_change_while_unreadable_keeps_the_old_time() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let a = env.item(b"first");
+    let b = env.item(b"fir5t");
+    let game = env.folder("game");
+    write(&game, "art/a.png", b"first");
+    let id = env.add(&game).unwrap();
+    env.scan();
+    assert_eq!(env.files(id)[0].1, Some(a));
+    let meta = |env: &Env| -> (i64, i64) {
+        env.library
+            .db()
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT size_bytes, mtime_ns FROM project_files WHERE project_id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap()
+    };
+    let before = meta(&env);
+    // 同じ大きさの別の中身にし、時刻を確実にずらしてから読めなくする
+    let file = game.join("art/a.png");
+    write(&game, "art/a.png", b"fir5t");
+    let moved = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(moved)
+        .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = env.scan();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!((r.files, r.hashed, r.skipped), (1, 0, 1));
+    assert_eq!(env.files(id)[0].1, Some(a));
+    assert_eq!(meta(&env), before);
+    // 読めるようになった：時刻が前の行と違うので読み直して付け直す
+    let r = env.scan();
+    assert_eq!((r.files, r.hashed, r.skipped), (1, 1, 0));
+    assert_eq!(env.files(id)[0].1, Some(b));
+    assert_ne!(meta(&env), before);
+}
+
 #[test]
 fn projects_are_listed_renamed_relocated_and_removed() {
     let env = Env::new();

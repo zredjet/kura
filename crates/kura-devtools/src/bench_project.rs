@@ -3,17 +3,22 @@
 //!
 //! 1. `--out` に合成の Godot のプロジェクトを作る（もうあって、同じ大きさで作ったものなら使い直す）：照らす素材のファイルを
 //!    `--files` 個（既定 2 万）、合わせて約 `--bytes`（既定 4 GB）。中身はどれも ChaCha8 の乱数（どれも違う）で、大きさは
-//!    16 KiB〜2 MiB の対数一様を合わせて `--bytes` になるように揃える。うち `--matched` 個（既定は 4 分の 1。
+//!    16 KiB〜2 MiB の対数一様の重みを、合計が `--bytes` になるように縮める（既定の 2 万・4 GB では約 7.5 KiB〜0.94 MiB、
+//!    中央値 約 84 KiB）。中身は固定の種と順番で決まる。うち `--matched` 個（既定は 4 分の 1。
 //!    `library_assets/` の下）は、同じハッシュのアイテムをライブラリに足して（なければ）、照らすと結び付くようにする
 //!    （`seed` の実ファイルは共通のひな形で、アイテムのハッシュと中身が合わないので写しでは結び付かない）。Godot と同じく
 //!    素材ごとに `.import` の添えファイル（照らさない形式）を置き、照らさないキャッシュ（`.godot/imported/`）も置く。
-//! 2. ライブラリにプロジェクトを登録し（登録済みなら使い直す）、前の行を消して、照らし直しのジョブ（アプリと同じ
-//!    `ProjectHandler`）を次の順に回す：初めての照らし（全部ハッシュ）、変わっていない照らし直しを `--runs` 回、素材の 1% を
-//!    同じ大きさの別の中身に書き換えたあとの照らし直し。時間はジョブを積んでから終わる（Done）まで。
-//! 3. 結果を 1 行の JSON で出す（`--json` があれば追記する）。
+//! 2. 前の回の照らし直しのジョブが待ち・一時停止のまま残っていれば中止し、ライブラリにプロジェクトを登録し（登録済みなら
+//!    使い直す）、前の行を消して、照らし直しのジョブ（アプリと同じ `ProjectHandler`。ほかの種類のジョブは動かさない）を
+//!    次の順に回す：初めての照らし（全部ハッシュ）、続けて変わっていない照らし直しを `--runs` 回、素材のうち結び付かない
+//!    ものの 1% を同じ大きさの別の中身に書き換えたあとの照らし直し。時間はジョブを積んでから終わる（Done）まで。
+//! 3. 数え方を確かめ（どの回も照らした数・結び付いた数が合い、ハッシュした数が全部・0・書き換えた数）、結果を 1 行の JSON で
+//!    出す（`--json` があれば追記する。合わなければ `"ok": false` と問題を入れて書いたうえで失敗にする）。
 //!
-//! ファイルは作った直後なので、初めての照らしもページキャッシュから読む（冷えた読み取りは測らない。`purge` は管理者が要る）。
-//! ライブラリは自分で用意する（`seed --items 100000 --out …`）。利用者の本物のライブラリは渡さない（登録と照らしの行を書く）。
+//! 初めての照らしは、作った直後か直前の回で読んだファイルをページキャッシュから読み、変わっていない照らし直しはファイルの
+//! メタデータもキャッシュに乗った状態で測る（冷えた読み取りは測らない。`purge` は管理者が要る。JSON の `reused` で使い直しの
+//! 回を見分ける）。ライブラリは自分で用意する（`seed --items 100000 --out …`）。利用者の本物のライブラリは渡さない（プロジェクトの
+//! 登録と照らしの行、結び付けるアイテムを書く）。`--out` は相対パスでもよい（登録は正規化した絶対パスで行う）。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kura_core::import::classify;
-use kura_core::jobs::{EventSink, JobHandler, JobKind, JobManager, JobState};
+use kura_core::jobs::{EventSink, JobFilter, JobHandler, JobKind, JobManager, JobState};
 use kura_core::library::Library;
 use kura_core::project::scan::{ProjectHandler, ScanResult};
 use kura_core::project::{self, Engine};
@@ -110,6 +115,22 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     }
     let library = Arc::new(Library::open(&opts.library).map_err(|e| e.to_string())?);
+    // 照らし直しのジョブは登録したプロジェクトを全部照らすので、ほかのプロジェクトがあると数も時間も混ざる（作る前に断る）
+    let out_now = opts.out.canonicalize().ok();
+    let others: Vec<String> = library
+        .db()
+        .read(project::list)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|p| Some(Path::new(&p.root)) != out_now.as_deref())
+        .map(|p| p.root)
+        .collect();
+    if !others.is_empty() {
+        return Err(format!(
+            "このライブラリにはほかのプロジェクトが登録されています（照らし直しは全部を照らすので測れません。計測用のライブラリを使ってください）: {}",
+            others.join(", ")
+        ));
+    }
     let matched_want = opts.matched.unwrap_or(opts.files / 4).min(opts.files);
     let built = Instant::now();
     let made = make_project(&opts, &library, matched_want)?;
@@ -123,7 +144,6 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "プロジェクトを用意しました"
     );
 
-    let id = register(&library, &opts.out)?;
     let sink: EventSink = Arc::new(|_| {});
     let jobs = JobManager::new(
         library.clone(),
@@ -134,7 +154,22 @@ pub fn run(args: &[String]) -> Result<(), String> {
         sink,
     )
     .map_err(|e| e.to_string())?;
+    // 前の回の照らし直しのジョブが待ち・一時停止のまま残っていれば中止する（残っていると、積もうとしても積めない）
+    let leftover = jobs
+        .list(&JobFilter {
+            kinds: vec![JobKind::Project],
+            states: vec![JobState::Queued, JobState::Paused],
+            limit: None,
+        })
+        .map_err(|e| e.to_string())?;
+    for job in &leftover {
+        jobs.cancel(job.id).map_err(|e| e.to_string())?;
+    }
+    let id = register(&library, &opts.out)?;
     jobs.start().map_err(|e| e.to_string())?;
+    if !jobs.wait_idle(Duration::from_secs(600)) {
+        return Err("前の照らし直しのジョブが 10 分待っても終わりませんでした".into());
+    }
 
     let (first_ms, first) = scan(&jobs)?;
     tracing::info!(
@@ -145,7 +180,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "初めての照らし"
     );
     let mut unchanged = Vec::new();
-    let mut unchanged_result = ScanResult::default();
+    let mut unchanged_results = Vec::new();
     for n in 0..opts.runs {
         let (ms, r) = scan(&jobs)?;
         tracing::info!(
@@ -155,7 +190,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "変わっていない照らし直し"
         );
         unchanged.push(ms);
-        unchanged_result = r;
+        unchanged_results.push(r);
     }
     let changed = rewrite_some(&made, opts.files.div_ceil(100))?;
     let (changed_ms, after) = scan(&jobs)?;
@@ -178,8 +213,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let mut sorted = unchanged.clone();
     sorted.sort_by(f64::total_cmp);
+    let problems = check(&made, &first, &unchanged_results, changed, &after);
     let line = json!({
         "bench": "project",
+        "ok": problems.is_empty(),
+        "problems": problems,
+        "reused": made.reused,
+        "makeSeconds": round(make_s),
         "files": made.files.len(),
         "matchedFiles": made.matched,
         "bytes": made.bytes,
@@ -188,7 +228,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "first": first,
         "unchangedMs": unchanged.iter().map(|ms| round(*ms)).collect::<Vec<_>>(),
         "unchangedMedianMs": round(sorted[sorted.len() / 2]),
-        "unchanged": unchanged_result,
+        "unchanged": unchanged_results,
         "changedFiles": changed,
         "changedMs": round(changed_ms),
         "changed": after,
@@ -205,52 +245,43 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         writeln!(f, "{line}").map_err(|e| e.to_string())?;
     }
-    check(&made, &first, &unchanged_result, changed, &after)
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n"))
+    }
 }
 
 fn round(ms: f64) -> f64 {
     (ms * 10.0).round() / 10.0
 }
 
-/// 数え方が合っているか（合わなければ測りとして使えないので失敗にする）。
+/// 数え方が合っているか（合わない回は測りとして使えない）。どの回も照らした数は素材の数、結び付いた数は `--matched` と等しく、
+/// ハッシュした数は初めては全部・変わっていない回は 0・書き換えたあとは書き換えた数。合わないことの一覧を返す。
 fn check(
     made: &Made,
     first: &ScanResult,
-    unchanged: &ScanResult,
+    unchanged: &[ScanResult],
     changed: usize,
     after: &ScanResult,
-) -> Result<(), String> {
+) -> Vec<String> {
     let files = made.files.len() as u64;
+    let matched = made.matched as u64;
     let mut wrong = Vec::new();
-    if (first.files, first.hashed) != (files, files) {
-        wrong.push(format!(
-            "初めての照らしは {files} 個をハッシュするはず（{} 個を照らし {} 個をハッシュ）",
-            first.files, first.hashed
-        ));
+    let mut expect = |label: &str, r: &ScanResult, hashed: u64| {
+        if (r.files, r.hashed, r.matched) != (files, hashed, matched) {
+            wrong.push(format!(
+                "{label}：照らした {}・ハッシュ {}・一致 {}（{files}・{hashed}・{matched} のはず）",
+                r.files, r.hashed, r.matched
+            ));
+        }
+    };
+    expect("初めての照らし", first, files);
+    for (n, r) in unchanged.iter().enumerate() {
+        expect(&format!("変わっていない照らし直し {}", n + 1), r, 0);
     }
-    if first.matched < made.matched as u64 {
-        wrong.push(format!(
-            "ライブラリの写し {} 個が結び付くはず（一致 {}）",
-            made.matched, first.matched
-        ));
-    }
-    if (unchanged.files, unchanged.hashed) != (files, 0) {
-        wrong.push(format!(
-            "変わっていない照らし直しはハッシュしないはず（{} 個を照らし {} 個をハッシュ）",
-            unchanged.files, unchanged.hashed
-        ));
-    }
-    if after.hashed != changed as u64 {
-        wrong.push(format!(
-            "書き換えた {changed} 個だけをハッシュするはず（{} 個）",
-            after.hashed
-        ));
-    }
-    if wrong.is_empty() {
-        Ok(())
-    } else {
-        Err(wrong.join("\n"))
-    }
+    expect("書き換えたあとの照らし直し", after, changed as u64);
+    wrong
 }
 
 fn item_count(library: &Library) -> Result<i64, String> {
@@ -305,7 +336,7 @@ fn register(library: &Library, out: &Path) -> Result<i64, String> {
         Some(p) => p.id,
         None => {
             let (root, engine) =
-                project::prepare_root(out, library.layout().root(), &existing, None)
+                project::prepare_root(&canonical, library.layout().root(), &existing, None)
                     .map_err(|e| e.to_string())?;
             if engine != Engine::Godot {
                 return Err(format!(
