@@ -370,7 +370,9 @@ mod tests {
 
     /// 出力の上限は Swift の側でも効く（超える書き込みを断って Limit）。設定の誤りは呼び方の誤り。
     /// M13 段 3 の検証の直し：Swift は出力の配列を open で上限まで確保する（倍々に伸ばさない）。確保する大きさ（上限）は書く
-    /// バイト列を変えない：同じ値を、上限 `aac_max_output` と、その 8 倍で書いたものが同じ。
+    /// バイト列を変えない：同じ値を、上限 `aac_max_output` と、その 8 倍で書いたものが同じ。書き手を直に呼ぶので、m4a の
+    /// 作成・変更の時刻（秒）が入っている。2 回の書き出しが秒をまたぐと違う（2026-11 に CI の macOS で 1 秒ずれて落ちた）ので、
+    /// 書き出しの道と同じく `zero_mp4_times` で 0 にしてから比べる。
     #[test]
     fn reserved_output_capacity_does_not_change_the_bytes() {
         let _g = shared();
@@ -402,9 +404,11 @@ mod tests {
                 out
             };
             let max = kura_engine::codec::platform::aac_max_output(frames as u64, channels);
-            let a = write(max);
-            let b = write(max * 8);
+            let mut a = write(max);
+            let mut b = write(max * 8);
             assert!(!a.is_empty());
+            zero_mp4_times(&mut a).unwrap();
+            zero_mp4_times(&mut b).unwrap();
             assert_eq!(a, b, "{rate} {channels} {frames}");
         }
     }
