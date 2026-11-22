@@ -108,7 +108,7 @@ pnpm tauri dev
 
 開発は [Claude Code](https://claude.com/claude-code) で進めています。プロジェクトの指示は [`CLAUDE.md`](CLAUDE.md)、ファイルの種類ごとのルールと手順は [`.claude/`](.claude) にあります。
 上の確かめをまとめて回すのは `/verify`（Claude Code のスキル）で、手元で 6 分ほどです。
-作業は [`docs/roadmap.md`](docs/roadmap.md) のマイルストーン単位で進めています。M0〜M14 まで終わり（M11 の表示は、耳と画面での確かめが一部残っています）、M15（ライセンス・クレジットと持ち出し）は段 7 まで終わっています。
+作業は [`docs/roadmap.md`](docs/roadmap.md) のマイルストーン単位で進めています。M0〜M15 まで終わっています（M11 の表示は、耳と画面での確かめが一部残っています）。
 
 CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）は、push と PR では Ubuntu で最低限（整形、lint、ゴールデンの追記だけの検査、Linux と macOS で同じ値になるはずのゴールデン）だけを回します。全部のテスト（Ubuntu と macOS）は、Actions から手で起こしたときに回します（ADR-209。Linux・macOS とも 4 つに分けて並べて回す。ADR-212・ADR-214）。
 
