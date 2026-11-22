@@ -319,10 +319,15 @@ fn lossless_audio_matches_the_source_wav() {
 }
 
 /// 非可逆の形式は、他のデコーダ（ffmpeg・afconvert・lewton）の読み取りと、長さ（gapless の切り取り）がちょうど同じで、
-/// 値は 60 dB 以上の比で近い（参照は 16 ビットに丸めてある）。
+/// 値は 60 dB 以上の比で近い（参照は 16 ビットに丸めてある）。ffmpeg が書いた AAC（`aac-lc-ffmpeg.m4a`・`aac-lc.aac`）は
+/// PNS の帯を持ち、雑音の並びが ffmpeg と違う（kura は ChaCha8。ADR-220 (3)）ので、波形の比は 50 dB ほど（右の雑音の帯の分）。
+/// PNS の帯の大きさと、雑音のほかの値は `codec::aac` の単体の試験（ffmpeg と同じ雑音で 86 dB、帯のエネルギーの差 3 dB 未満）で
+/// 確かめるので、ここは 45 dB にする。
 #[test]
 fn lossy_audio_matches_other_decoders() {
     let mut bad = Vec::new();
+    // PNS で雑音の並びが ffmpeg と違うもの
+    const PNS: [&str; 2] = ["aac-lc-ffmpeg.m4a", "aac-lc.aac"];
     for (file, format, id, reference, frames, reproducible) in [
         (
             "mp3-lame.mp3",
@@ -348,7 +353,7 @@ fn lossy_audio_matches_other_decoders() {
             22_050,
             true,
         ),
-        // Vorbis・AAC：段 9 から値を再現できる（symphonia の写しで表の超越関数を libm クレートにした）
+        // Vorbis：段 9 から値を再現できる（M16 段 2 から自作）。AAC：M16 段 4 から自作で値を再現できる
         (
             "ogg-vorbis-loop.ogg",
             "ogg",
@@ -368,7 +373,7 @@ fn lossy_audio_matches_other_decoders() {
         (
             "aac-lc-afconvert.m4a",
             "m4a",
-            "m4a-aac-symphonia-dec/2",
+            "m4a-aac-kura-dec/1",
             "aac-lc-afconvert.afconvert.flac",
             44_100,
             true,
@@ -376,7 +381,7 @@ fn lossy_audio_matches_other_decoders() {
         (
             "aac-lc-ffmpeg.m4a",
             "m4a",
-            "m4a-aac-symphonia-dec/2",
+            "m4a-aac-kura-dec/1",
             "aac-lc-ffmpeg.ffmpeg.flac",
             44_100,
             true,
@@ -384,7 +389,7 @@ fn lossy_audio_matches_other_decoders() {
         (
             "aac-lc.aac",
             "aac",
-            "aac-adts-symphonia-dec/2",
+            "aac-adts-kura-dec/1",
             "aac-lc.ffmpeg.flac",
             46_080,
             true,
@@ -419,7 +424,8 @@ fn lossy_audio_matches_other_decoders() {
             ours[0].len(),
             theirs[0].len()
         );
-        if ours[0].len() != frames || ratio < 1e6 {
+        let min = if PNS.contains(&file) { 3e4 } else { 1e6 };
+        if ours[0].len() != frames || ratio < min {
             bad.push(file);
         }
     }
@@ -470,7 +476,166 @@ fn multichannel_vorbis_matches_lewton() {
     }
 }
 
-/// 扱わない変種（HE-AAC・Ogg の中の Opus・MP2）は `Unsupported`（次の段のデコーダへ回る）。HE-AAC は、ASC の明示の印
+/// 3 チャンネル以上の AAC-LC（channel_configuration 3〜7）・モノラルは、自作の読み手（M16 段 4）が読み、ffmpeg・AudioToolbox の
+/// 読み取り（24 ビットの参照）とチャンネルごとに 100 dB 以上の比で近く、長さ（priming の切り取り）はちょうど同じ。チャンネル
+/// ごとに違う音にしてあるので、並びの誤りも見つかる。7.1（配置 7）の参照は AudioToolbox の AAC の並び（C Lc Rc L R Ls Rs LFE）の
+/// まま保存したので、kura の WAV の並び（FL FR FC LFE BL BR FLC FRC）に直して比べる（fixtures/README.md）。
+#[test]
+fn multichannel_aac_matches_ffmpeg_and_audiotoolbox() {
+    const IDENTITY: &[usize] = &[0, 1, 2, 3, 4, 5, 6, 7];
+    // kura の面 i は参照の面 ORDER_7_1[i]
+    const ORDER_7_1: &[usize] = &[3, 4, 0, 7, 5, 6, 1, 2];
+    for (file, reference, channels, order) in [
+        (
+            "aac-lc-mono.m4a",
+            "aac-lc-mono.ffmpeg.flac",
+            1usize,
+            IDENTITY,
+        ),
+        ("aac-lc-3ch.m4a", "aac-lc-3ch.ffmpeg.flac", 3, IDENTITY),
+        ("aac-lc-4ch.m4a", "aac-lc-4ch.ffmpeg.flac", 4, IDENTITY),
+        (
+            "aac-lc-5ch-tones.m4a",
+            "aac-lc-5ch-tones.ffmpeg.flac",
+            5,
+            IDENTITY,
+        ),
+        (
+            "aac-lc-6ch-afconvert.m4a",
+            "aac-lc-6ch-afconvert.ffmpeg.flac",
+            6,
+            IDENTITY,
+        ),
+        (
+            "aac-lc-8ch-afconvert.m4a",
+            "aac-lc-8ch-afconvert.afconvert.flac",
+            8,
+            ORDER_7_1,
+        ),
+    ] {
+        let (codec, rep, _, rate, ours) = audio(file, "m4a");
+        let (_, _, _, ref_rate, theirs) = audio(reference, "flac");
+        assert_eq!(codec, "m4a-aac-kura-dec/1", "{file}");
+        assert!(rep, "{file}");
+        assert_eq!((rate, ref_rate), (48_000, 48_000), "{file}");
+        assert_eq!((ours.len(), theirs.len()), (channels, channels), "{file}");
+        for ch in 0..channels {
+            let (a, b) = (&ours[ch], &theirs[order[ch]]);
+            assert_eq!((a.len(), b.len()), (14_400, 14_400), "{file} の長さ");
+            let ratio = signal_to_error(&ours[ch..=ch], std::slice::from_ref(b));
+            // 小さな面（帯域を絞った LFE）は参照の 24 ビットの丸めが勝つので、誤差の実効値が 24 ビットの 1 刻みより
+            // 小さければよい
+            let rms = (a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| f64::from(x - y) * f64::from(x - y))
+                .sum::<f64>()
+                / a.len() as f64)
+                .sqrt();
+            eprintln!("{file}：面 {ch} の信号/誤差 {ratio:.3e}、誤差の実効値 {rms:.3e}");
+            assert!(
+                ratio >= 1e10 || rms < 1.0 / 8_388_608.0,
+                "{file}：面 {ch} の信号/誤差 {ratio:.3e}、誤差の実効値 {rms:.3e}"
+            );
+        }
+    }
+    // 段 9 の確認で作った 5.0・5.1（1 チャンネルを広げた音）：音は FC の面だけで、ほかの面は 0。長さは ADTS が切らずに
+    // 25 パケット分、m4a が elst で切った 0.5 秒
+    for (file, format, id, channels, frames) in [
+        (
+            "aac-lc-6ch.aac",
+            "aac",
+            "aac-adts-kura-dec/1",
+            6usize,
+            25_600,
+        ),
+        ("aac-lc-5ch.m4a", "m4a", "m4a-aac-kura-dec/1", 5, 24_000),
+    ] {
+        let (codec, rep, _, rate, ours) = audio(file, format);
+        assert_eq!((codec.as_str(), rep, rate), (id, true, 48_000), "{file}");
+        assert_eq!(ours.len(), channels, "{file}");
+        for (ch, p) in ours.iter().enumerate() {
+            assert_eq!(p.len(), frames, "{file}");
+            let energy: f64 = p.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+            if ch == 2 {
+                assert!(energy > 100.0, "{file}：FC の面");
+            } else {
+                assert!(p.iter().all(|v| *v == 0.0), "{file}：面 {ch}");
+            }
+        }
+    }
+}
+
+/// AAC のコーパス（手で回す：`KURA_AAC_CORPUS=<フォルダ> cargo test --release -p kura-engine --test suite
+/// fixtures::aac_corpus_matches_ffmpeg -- --ignored --nocapture`）。フォルダの `X.m4a`・`X.aac` を自作の読み手で読み、
+/// ffmpeg の f32 の読み取り `X.ffmpeg.wav` と、長さとレートがちょうど同じで、チャンネルごとに 100 dB 以上の比で近い
+/// （小さな面は誤差の実効値が 1e-7 未満）。名前に `pns` を含むもの（ffmpeg の PNS あり。雑音の並びが違う）は比を出すだけ。
+/// M16 段 4 のコーパス（ffmpeg 9.0.2 と afconvert で、3 種の音 × 8〜96 kHz × 24〜256 kbps、モノラル・ADTS・VBR・fast の
+/// 115 本）はすべて通った（作り方は docs/decisions.md の ADR-221）。
+#[test]
+#[ignore]
+#[allow(clippy::disallowed_methods)]
+fn aac_corpus_matches_ffmpeg() {
+    let Ok(dir) = std::env::var("KURA_AAC_CORPUS") else {
+        return;
+    };
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".m4a") || n.ends_with(".aac"))
+        .collect();
+    names.sort();
+    let mut bad = Vec::new();
+    for name in &names {
+        let (stem, format) = name.rsplit_once('.').unwrap();
+        let read = |path: String, format: &str| {
+            let bytes = std::fs::read(&path).unwrap();
+            let (v, stamp) = CodecSet::pinned()
+                .decode(
+                    &mut Cursor::new(bytes),
+                    format,
+                    &DecodeOptions::default(),
+                    &Limits::default(),
+                    &NoMonitor,
+                )
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            let Value::Audio(a) = v else { panic!("{path}") };
+            let planes: Vec<Vec<f32>> = a.to_planes().unwrap().iter().map(|p| p.to_vec()).collect();
+            (stamp.codec, a.rate(), planes)
+        };
+        let (codec, rate, ours) = read(format!("{dir}/{name}"), format);
+        let (_, ref_rate, theirs) = read(format!("{dir}/{stem}.ffmpeg.wav"), "wav");
+        assert!(codec.contains("kura"), "{name}: {codec}");
+        let mut worst = f64::MAX;
+        let mut ok = rate == ref_rate && ours.len() == theirs.len();
+        for (a, b) in ours.iter().zip(&theirs) {
+            ok &= a.len() == b.len();
+            let ratio = signal_to_error(std::slice::from_ref(a), std::slice::from_ref(b));
+            let rms = (a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| f64::from(x - y) * f64::from(x - y))
+                .sum::<f64>()
+                / a.len().max(1) as f64)
+                .sqrt();
+            ok &= ratio >= 1e10 || rms < 1e-7 || name.contains("pns");
+            worst = kura_engine::math::min(worst, ratio);
+        }
+        eprintln!(
+            "{name}: {} Hz・{} ch・{} フレーム、最小の信号/誤差 {worst:.3e}",
+            rate,
+            ours.len(),
+            ours[0].len()
+        );
+        if !ok {
+            bad.push(name.clone());
+        }
+    }
+    assert!(!names.is_empty(), "{dir} にファイルがありません");
+    assert!(bad.is_empty(), "{bad:?}");
+}
+
+/// 扱わない変種（HE-AAC・PCE で配置を決める AAC・Ogg の中の Opus・MP2）は `Unsupported`（次の段のデコーダへ回る）。HE-AAC は、ASC の明示の印
 /// （`aac-he.m4a`）でも、帯域の中だけの印（ADTS の `aac-he.aac`、ADTS から写した m4a の `aac-he-implicit.m4a`）でも断る
 /// （tests/symphonia_copies.rs）。
 #[test]
@@ -489,25 +654,23 @@ fn unsupported_audio_variants_fall_through() {
         decode("ogg-opus.ogg", "ogg"),
         Err(EngineError::Unsupported(_))
     ));
-    // 3 チャンネル以上の AAC-LC（symphonia の AAC は 1・2 チャンネルだけ）は、チャンネルの構成があっても、形の段階で
-    // 断って後の段（AudioToolbox・ffmpeg）へ回す（形と読みを同じ段が答えるように）
-    for (file, format) in [("aac-lc-6ch.aac", "aac"), ("aac-lc-5ch.m4a", "m4a")] {
-        let bytes = std::fs::read(dir().join(file)).unwrap();
-        let shape = CodecSet::pinned().shape(
-            &mut Cursor::new(bytes),
-            format,
-            &DecodeOptions::default(),
-            &Limits::default(),
-        );
-        assert!(
-            matches!(shape, Err(EngineError::Unsupported(_))),
-            "{file}: {shape:?}"
-        );
-        assert!(
-            matches!(decode(file, format), Err(EngineError::Unsupported(_))),
-            "{file}"
-        );
-    }
+    // PCE で配置を決める AAC-LC（ffmpeg の 7.1）は、形の段階で断って後の段（AudioToolbox・ffmpeg）へ回す（形と読みを
+    // 同じ段が答えるように）。channel_configuration 1〜7 は自作の読み手が読む（`multichannel_aac_matches_ffmpeg_and_audiotoolbox`）
+    let bytes = std::fs::read(dir().join("aac-lc-8ch-pce.m4a")).unwrap();
+    let shape = CodecSet::pinned().shape(
+        &mut Cursor::new(bytes),
+        "m4a",
+        &DecodeOptions::default(),
+        &Limits::default(),
+    );
+    assert!(
+        matches!(shape, Err(EngineError::Unsupported(_))),
+        "{shape:?}"
+    );
+    assert!(matches!(
+        decode("aac-lc-8ch-pce.m4a", "m4a"),
+        Err(EngineError::Unsupported(_))
+    ));
     // MPEG layer II（.mp3 の拡張子の MP2）は空の音声にせず、次の段へ
     assert!(matches!(
         decode("mp2-layer2.mp3", "mp3"),

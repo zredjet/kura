@@ -6,7 +6,9 @@
 //!   `cargo test -p kura-engine --test suite symphonia_copies::` と、同じものに `--target x86_64-apple-darwin`（Rosetta）。
 //! - 帯域の中の SBR（暗黙の HE-AAC）：写しのデコーダが fill 要素の SBR の拡張を知らせ（`AacDecoder::sbr_seen`）、固定の段は
 //!   HE-AAC の ADTS・ASC に印のない m4a を断って後の段（AudioToolbox・ffmpeg）へ回す。AAC-LC は今までどおり固定の段で読む
-//!   （値はデコーダのゴールデンと `tests/fixtures.rs` が見る）。
+//!   （値はデコーダのゴールデンと `tests/fixtures.rs` が見る）。M16 段 4 で固定の段の AAC は自作の `m4a-aac-kura-dec/1`・
+//!   `aac-adts-kura-dec/1` になったので、同じ確かめを自作の読み手（固定の段）と、旧版として残した写し（`…-symphonia-dec/2`
+//!   を名指し）の両方で行う。
 //! - 写しが組まれていること自体は、`codec/lossy.rs` が写しにだけある印 `KURA_PATCHED` を参照して、組み立てで確かめる。
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -45,6 +47,38 @@ fn decode_in(
         &Limits::default(),
         &NoMonitor,
     )
+}
+
+/// 識別子 `id` のデコーダ（旧版も）で形を読む。
+fn shape_by(set: &CodecSet, id: &str, name: &str, format: &str) -> Result<Shape, EngineError> {
+    set.decoder_by_id(id).unwrap().shape(
+        &mut Cursor::new(fixture(name)),
+        format,
+        &DecodeOptions::default(),
+        &Limits::default(),
+    )
+}
+
+/// 識別子 `id` のデコーダ（旧版も）で読む。
+fn decode_by(set: &CodecSet, id: &str, name: &str, format: &str) -> Result<Value, EngineError> {
+    set.decode_with(
+        id,
+        &mut Cursor::new(fixture(name)),
+        format,
+        &DecodeOptions::default(),
+        &Limits::default(),
+        &NoMonitor,
+    )
+    .map(|(v, _)| v)
+}
+
+/// 旧版の写しの識別子（入れ物ごと）。
+fn legacy_aac(format: &str) -> &'static str {
+    if format == "aac" {
+        "aac-adts-symphonia-dec/2"
+    } else {
+        "m4a-aac-symphonia-dec/2"
+    }
 }
 
 fn shape_in(
@@ -299,6 +333,22 @@ fn in_band_he_aac_falls_through_to_later_tiers() {
             ),
             "{file}"
         );
+        // 旧版の写し（名指し）も断る
+        let legacy = legacy_aac(format);
+        assert!(
+            matches!(
+                shape_by(&pinned, legacy, file, format),
+                Err(EngineError::Unsupported(_))
+            ),
+            "{file}：{legacy}"
+        );
+        assert!(
+            matches!(
+                decode_by(&pinned, legacy, file, format),
+                Err(EngineError::Unsupported(_))
+            ),
+            "{file}：{legacy}"
+        );
         assert!(
             matches!(
                 decode_in(&pinned, file, format),
@@ -329,7 +379,16 @@ fn late_sbr_is_refused_when_reading() {
     let file = "aac-lc-then-he.aac";
     for set in [CodecSet::pinned(), with_later_tier()] {
         let (shape, id) = shape_in(&set, file, "aac").unwrap();
-        assert_eq!(id, "aac-adts-symphonia-dec/2");
+        assert_eq!(id, "aac-adts-kura-dec/1");
+        // 旧版の写しも同じ形を答え、読むときに断る
+        assert_eq!(
+            shape_by(&set, "aac-adts-symphonia-dec/2", file, "aac").unwrap(),
+            shape
+        );
+        assert!(matches!(
+            decode_by(&set, "aac-adts-symphonia-dec/2", file, "aac"),
+            Err(EngineError::Unsupported(_))
+        ));
         assert!(
             matches!(
                 shape,
@@ -350,29 +409,24 @@ fn late_sbr_is_refused_when_reading() {
     assert_eq!(stamp.codec, "test-later-dec/1");
 }
 
-/// AAC-LC（SBR の拡張のないもの）は、後の段があっても今までどおり固定の段で読む。
+/// AAC-LC（SBR の拡張のないもの）は、後の段があっても今までどおり固定の段（M16 段 4 から自作の読み手）で読む。旧版の写しも
+/// 名指しすれば同じ長さで読む。
 #[test]
 fn aac_lc_stays_on_the_pinned_tier() {
     let set = with_later_tier();
     for (file, format, id, rate, frames) in [
-        (
-            "aac-lc.aac",
-            "aac",
-            "aac-adts-symphonia-dec/2",
-            44_100,
-            46_080,
-        ),
+        ("aac-lc.aac", "aac", "aac-adts-kura-dec/1", 44_100, 46_080),
         (
             "aac-lc-ffmpeg.m4a",
             "m4a",
-            "m4a-aac-symphonia-dec/2",
+            "m4a-aac-kura-dec/1",
             44_100,
             44_100,
         ),
         (
             "aac-lc-afconvert.m4a",
             "m4a",
-            "m4a-aac-symphonia-dec/2",
+            "m4a-aac-kura-dec/1",
             44_100,
             44_100,
         ),
@@ -386,5 +440,9 @@ fn aac_lc_stays_on_the_pinned_tier() {
             (id, Tier::Pinned, rate, frames),
             "{file}"
         );
+        let Value::Audio(old) = decode_by(&set, legacy_aac(format), file, format).unwrap() else {
+            panic!("{file}")
+        };
+        assert_eq!((old.rate(), old.frames()), (rate, frames), "{file}：旧版");
     }
 }

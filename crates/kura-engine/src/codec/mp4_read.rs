@@ -338,14 +338,22 @@ struct Tables {
     chunks: Option<Vec<u64>>,
 }
 
-/// 開いた ALAC のトラック。
-pub(crate) struct Mp4Alac<'a> {
+/// 読むトラックの中身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Want {
+    Alac,
+    /// MP4 の中の AAC（M16 段 4。esds の AudioSpecificConfig）。
+    Aac,
+}
+
+/// 開いたトラック。
+pub(crate) struct Mp4Track<'a> {
     pub src: Source<'a>,
-    /// cookie のレート。
+    /// レート（ALAC は cookie、AAC は AudioSpecificConfig の値）。
     pub rate: u32,
-    /// cookie のチャンネルの数。
+    /// チャンネルの数（同上）。
     pub channels: usize,
-    /// `alac` の子の 24 か 48 バイト（ファイルのバイトのまま）。
+    /// コーデックの設定（ALAC は `alac` の子の 24 か 48 バイト、AAC は esds の DecoderSpecificInfo。ファイルのバイトのまま）。
     pub cookie: Vec<u8>,
     /// 文字列のタグ（キー, 値）。出た順。
     pub tags: Vec<(String, String)>,
@@ -447,15 +455,20 @@ enum Codec {
         /// 見本のレート（cookie が読めないときに symphonia が使う）。
         entry_rate: u32,
     },
+    /// AAC（esds の objectTypeIndication が 0x40・0x66・0x67）。DecoderSpecificInfo（AudioSpecificConfig）。
+    Aac {
+        asc: Vec<u8>,
+    },
     Other,
 }
 
-/// 開いて ALAC のトラックを選び、表とタグを読む。
+/// 開いて `want` の中身のトラックを選び、表とタグを読む。
 pub(crate) fn open<'a>(
     media: &'a mut Media<'_>,
     mon: &'a dyn Monitor,
     codec: &'static str,
-) -> Result<Mp4Alac<'a>, EngineError> {
+    want: Want,
+) -> Result<Mp4Track<'a>, EngineError> {
     let mut src = Source::new(media, mon, codec)?;
     // 最上段の走査
     let mut top = Boxes::top(src.len);
@@ -524,25 +537,34 @@ pub(crate) fn open<'a>(
     let Some((index, trak, codec_kind)) = chosen else {
         return Err(src.unsupported("音声のトラックがありません"));
     };
-    let Codec::Alac {
-        cookie,
-        version_ok,
-        entry_rate,
-    } = codec_kind
-    else {
-        return Err(src.unsupported("このデコーダの扱う中身ではありません"));
-    };
-    if !version_ok {
-        return Err(src.unsupported("alac の箱の版を扱えません"));
-    }
-    // cookie が読めなければ、symphonia はレートを見本の値（0 なら壊れたファイル）にし、チャンネルは決まらない（`Unsupported`）
-    let Some(cfg) = crate::codec::alac_read::Cookie::parse(&cookie).ok() else {
-        if entry_rate == 0 {
-            return Err(src.decode("サンプルレートがありません"));
+    let (cookie, rate, channels) = match (want, codec_kind) {
+        (
+            Want::Alac,
+            Codec::Alac {
+                cookie,
+                version_ok,
+                entry_rate,
+            },
+        ) => {
+            if !version_ok {
+                return Err(src.unsupported("alac の箱の版を扱えません"));
+            }
+            // cookie が読めなければ、symphonia はレートを見本の値（0 なら壊れたファイル）にし、チャンネルは決まらない
+            // （`Unsupported`）
+            let Some(cfg) = crate::codec::alac_read::Cookie::parse(&cookie).ok() else {
+                if entry_rate == 0 {
+                    return Err(src.decode("サンプルレートがありません"));
+                }
+                return Err(src.unsupported("チャンネルの数がありません"));
+            };
+            (cookie, cfg.sample_rate, usize::from(cfg.channels))
         }
-        return Err(src.unsupported("チャンネルの数がありません"));
+        (Want::Aac, Codec::Aac { asc }) => {
+            let cfg = crate::codec::aac::config::parse_asc(&asc)?;
+            (asc, cfg.rate, cfg.channels)
+        }
+        _ => return Err(src.unsupported("このデコーダの扱う中身ではありません")),
     };
-    let (rate, channels) = (cfg.sample_rate, usize::from(cfg.channels));
     if !mvhd {
         return Err(src.decode("MP4：moov に mvhd がありません"));
     }
@@ -553,7 +575,7 @@ pub(crate) fn open<'a>(
         None => None,
     };
     let tags = read_tags(&mut src, udta.as_ref(), top_ilst)?;
-    let mut r = Mp4Alac {
+    let mut r = Mp4Track {
         src,
         rate,
         channels,
@@ -723,16 +745,18 @@ fn trak_codec(src: &mut Source<'_>, trak: &Head) -> Result<Codec, EngineError> {
                 };
             }
             b"esds" => {
-                if esds_is_audio(src, &h)? {
-                    codec = Codec::Other;
+                if let Some(c) = esds_codec(src, &h)? {
+                    codec = c;
                 }
             }
             b"dac3" | b"dec3" | b"dfLa" | b"dOps" => codec = Codec::Other,
             b"wave" => {
                 let mut w = Boxes::inside(&h, 8);
                 while let Some(e) = w.next(src)? {
-                    if &e.kind == b"esds" && esds_is_audio(src, &e)? {
-                        codec = Codec::Other;
+                    if &e.kind == b"esds"
+                        && let Some(c) = esds_codec(src, &e)?
+                    {
+                        codec = c;
                     }
                 }
             }
@@ -754,13 +778,14 @@ fn lpcm_known(bits: u32, flags: u32) -> bool {
     }
 }
 
-/// esds の object type が音声のものか（AAC・MP3・AC-3・E-AC-3・DTS）。symphonia と同じく、ES_Descriptor の頭のあとの記述子を
-/// 順に見て、DecoderConfigDescriptor（tag 4）の最後のものの objectTypeIndication を使う。読めない形は音声とみなさない。
-fn esds_is_audio(src: &mut Source<'_>, h: &Head) -> Result<bool, EngineError> {
+/// esds の中身（symphonia と同じく、ES_Descriptor の頭のあとの記述子を順に見て、DecoderConfigDescriptor（tag 4）の
+/// 最後のものの objectTypeIndication と、その中の DecoderSpecificInfo（tag 5）の最後のもの）。AAC（0x40・0x66・0x67）なら
+/// [`Codec::Aac`]、ほかの音声（MP3・AC-3・E-AC-3・DTS）なら [`Codec::Other`]、ほか・読めない形は None（前の子のまま）。
+fn esds_codec(src: &mut Source<'_>, h: &Head) -> Result<Option<Codec>, EngineError> {
     let body = src.read(h.body, h.len().min(64 << 10))?;
     let mut r = Bytes::new(body);
     if r.take(4).is_none() {
-        return Ok(false);
+        return Ok(None);
     }
     let header = |r: &mut Bytes<'_>| -> Option<(u8, usize)> {
         let tag = r.u8()?;
@@ -774,7 +799,7 @@ fn esds_is_audio(src: &mut Source<'_>, h: &Head) -> Result<bool, EngineError> {
         }
         Some((tag, len))
     };
-    let oti = (|| {
+    let found = (|| {
         let (tag, len) = header(&mut r)?;
         if tag != 3 {
             return None;
@@ -793,20 +818,32 @@ fn esds_is_audio(src: &mut Source<'_>, h: &Head) -> Result<bool, EngineError> {
         if flags & 0x20 != 0 {
             e.u16()?;
         }
-        let mut oti = None;
+        let mut found = None;
         while e.left() > 2 {
             let (tag, len) = header(&mut e)?;
             let d = e.take(len)?;
             if tag == 4 {
-                oti = Some(*d.first()?);
+                let mut c = Bytes::new(d);
+                let oti = c.u8()?;
+                c.take(12)?;
+                let mut dsi = Vec::new();
+                while c.left() > 2 {
+                    let (t, l) = header(&mut c)?;
+                    let v = c.take(l)?;
+                    if t == 5 {
+                        dsi = v.to_vec();
+                    }
+                }
+                found = Some((oti, dsi));
             }
         }
-        oti
+        found
     })();
-    Ok(matches!(
-        oti,
-        Some(0x40 | 0x66 | 0x67 | 0x69 | 0x6b | 0xa5 | 0xa6 | 0xa9)
-    ))
+    Ok(match found {
+        Some((0x40 | 0x66 | 0x67, asc)) => Some(Codec::Aac { asc }),
+        Some((0x69 | 0x6b | 0xa5 | 0xa6 | 0xa9, _)) => Some(Codec::Other),
+        _ => None,
+    })
 }
 
 /// 選んだトラックのサンプルの表。
@@ -1255,6 +1292,10 @@ fn read_tags(
     let mut out = Vec::new();
     let mut items = Boxes::inside(&ilst, 4);
     while let Some(item) = items.next(src)? {
+        if &item.kind == b"----" {
+            freeform(src, &item, &mut out)?;
+            continue;
+        }
         let Some((_, key)) = TAG_KEYS.iter().find(|(k, _)| *k == item.kind) else {
             continue;
         };
@@ -1286,6 +1327,53 @@ fn read_tags(
     Ok(out)
 }
 
+/// 自由形式の項目（`----`）のうち、名前が `iTunSMPB` で終わるもの（AAC の priming。symphonia のキーは `mean:name`）の
+/// UTF-8 の値。読み手（前の symphonia も自作も）は最初の iTunSMPB だけを使うので、項目ごとに最初の値だけを持つ。名前は
+/// 値より先に確かめ、`mean`・`name`・値は置き換え（不正な UTF-8）のあとの長さが [`TEXT_MAX`] を超えれば捨てる（持つ量を
+/// `held::mp4` の数え方の内に収める）。
+fn freeform(
+    src: &mut Source<'_>,
+    item: &Head,
+    out: &mut Vec<(String, String)>,
+) -> Result<(), EngineError> {
+    let text = |src: &mut Source<'_>, at: u64, n: u64| -> Result<Option<String>, EngineError> {
+        let v = String::from_utf8_lossy(src.read(at, n)?).into_owned();
+        Ok((v.len() <= TEXT_MAX).then_some(v))
+    };
+    let (mut mean, mut name) = (None::<String>, None::<String>);
+    let mut b = Boxes::inside(item, 5);
+    while let Some(d) = b.next(src)? {
+        if matches!(&d.kind, b"mean" | b"name") && d.len() >= 4 && d.len() <= TEXT_MAX as u64 {
+            let v = text(src, d.body + 4, d.len() - 4)?;
+            if &d.kind == b"mean" {
+                mean = v.or(mean);
+            } else {
+                name = v.or(name);
+            }
+        }
+    }
+    if mean.is_none() && name.is_none() {
+        return Ok(());
+    }
+    let key = format!("{}:{}", mean.unwrap_or_default(), name.unwrap_or_default());
+    if !key.ends_with("iTunSMPB") {
+        return Ok(());
+    }
+    let mut b = Boxes::inside(item, 5);
+    while let Some(d) = b.next(src)? {
+        if &d.kind == b"data" && d.len() >= 8 && d.len() <= TEXT_MAX as u64 {
+            let head = src.read(d.body, 8)?;
+            if head[0] == 0 && u32::from_be_bytes([0, head[1], head[2], head[3]]) == 1 {
+                if let Some(v) = text(src, d.body + 8, d.len() - 8)? {
+                    out.push((key, v));
+                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// MP4 のタグの UTF-16（symphonia と同じ：`FE FF` なら BE、`FF FE` なら LE、ほかは全体を BE。奇数長の最後のバイトは
 /// 捨て、対にならないサロゲートは U+FFFD）。
 fn utf16(b: &[u8]) -> String {
@@ -1306,7 +1394,7 @@ fn utf16(b: &[u8]) -> String {
         .collect()
 }
 
-impl Mp4Alac<'_> {
+impl Mp4Track<'_> {
     fn decode(&self, message: impl Into<String>) -> EngineError {
         self.src.decode(message)
     }

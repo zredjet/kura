@@ -588,9 +588,21 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 fixture("aac-lc-afconvert.m4a"),
                 fixture("aac-lc-ffmpeg.m4a"),
                 fixture("aac-he.m4a"),
+                // M16 段 4：自作の AAC（モノラル・7.1・PCE の配置）
+                fixture("aac-lc-mono.m4a"),
+                fixture("aac-lc-8ch-afconvert.m4a"),
+                fixture("aac-lc-8ch-pce.m4a"),
             ],
         ),
-        ("aac", vec![fixture("aac-lc.aac")]),
+        (
+            "aac",
+            vec![
+                fixture("aac-lc.aac"),
+                // M16 段 4：5.1 の ADTS・途中から SBR の出る ADTS
+                fixture("aac-lc-6ch.aac"),
+                fixture("aac-lc-then-he.aac"),
+            ],
+        ),
         (
             "document",
             vec![

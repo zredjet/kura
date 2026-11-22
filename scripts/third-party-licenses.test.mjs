@@ -66,6 +66,22 @@ describe('crateLabel', () => {
     expect(crateLabel(crate, root)).toBe('vorbis-tables 0.1.0');
   });
 
+  it('crates/ の下の MPL-2.0 の自前のクレート（symphonia の表の写し）にはソースの在り処を添える', () => {
+    const crate = {
+      name: 'aac-tables',
+      version: '0.2.0',
+      source: null,
+      license: 'MPL-2.0',
+      manifest_path: join(root, 'crates', 'aac-tables', 'Cargo.toml'),
+    };
+    expect(crateLabel(crate, root)).toBe(
+      'aac-tables 0.2.0（ソース：https://github.com/zredjet/kura の crates/aac-tables/）',
+    );
+    expect(crateLabel(crate, root, 'https://example.com/r')).toBe(
+      'aac-tables 0.2.0（ソース：https://example.com/r の crates/aac-tables/）',
+    );
+  });
+
   it('リポジトリの外の third_party/ は写しとみなさない', () => {
     const crate = {
       name: 'x',

@@ -17,6 +17,7 @@
 //!   包んで値のダイジェスト（R1）を取る。流して書くエンコーダの `encode` は値の生産者で同じ道を通す（バイト列は 1 つの
 //!   実装で決まる）。ファイルのダイジェスト（R2）は書いたものを読み直して [`FileDigest`] で取る。
 
+pub mod aac;
 pub mod aiff;
 pub mod alac;
 pub(crate) mod alac_read;
@@ -654,14 +655,17 @@ impl CodecSet {
                 Arc::new(mp3::Mp3Codec),
                 Arc::new(vorbis::dec::VorbisDecoder),
                 Arc::new(alac::AlacCodec),
-                Arc::new(lossy::SymphoniaDecoder::m4a_aac()),
-                Arc::new(lossy::SymphoniaDecoder::adts_aac()),
+                Arc::new(aac::read::AacCodec::m4a()),
+                Arc::new(aac::read::AacCodec::adts()),
                 Arc::new(anchor::AnchorDecoder),
             ],
-            // 旧版：PNG の /1 と、M16 段 2 で自作に替えた Ogg Vorbis の symphonia（/3。段 10 でアンカーに移してから外す。ADR-216・217）
+            // 旧版：PNG の /1 と、M16 段 2・4 で自作に替えた Ogg Vorbis（/3）・AAC（/2）の symphonia（段 10 でアンカーに移してから
+            // 外す。ADR-216・217・220）
             legacy_decoders: {
                 let mut v = png::legacy_decoders();
                 v.push(Arc::new(lossy::SymphoniaDecoder::ogg_vorbis()) as Arc<dyn Decoder>);
+                v.push(Arc::new(lossy::SymphoniaDecoder::m4a_aac()) as Arc<dyn Decoder>);
+                v.push(Arc::new(lossy::SymphoniaDecoder::adts_aac()) as Arc<dyn Decoder>);
                 v
             },
             encoders: vec![

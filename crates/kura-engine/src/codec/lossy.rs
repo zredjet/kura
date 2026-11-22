@@ -1,8 +1,9 @@
 //! symphonia で読む Ogg Vorbis・MP4（AAC-LC・ALAC）・ADTS の AAC（読みだけ。Pinned。docs/editing.md §9.2）。
 //!
-//! Ogg Vorbis（`ogg-vorbis-symphonia-dec/3`）は M16 段 2 から旧版：今の読み手は自作の `ogg-vorbis-kura-dec/1`
-//! （`codec::vorbis::dec`。ADR-217）で、これは前の識別子の文書・アンカーを読み直すためだけに `legacy_decoders` に残す
-//! （段 5 のアンカーの移し替えのあと、段 10 で symphonia ごと外す。ADR-216）。
+//! Ogg Vorbis（`ogg-vorbis-symphonia-dec/3`）は M16 段 2 から、AAC（`m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`）
+//! は M16 段 4 から旧版：今の読み手は自作の `ogg-vorbis-kura-dec/1`（`codec::vorbis::dec`。ADR-217）と
+//! `m4a-aac-kura-dec/1`・`aac-adts-kura-dec/1`（`codec::aac`。ADR-220）で、これらは前の識別子の文書・アンカーを読み直す
+//! ためだけに `legacy_decoders` に残す（段 5 のアンカーの移し替えのあと、段 10 で symphonia ごと外す。ADR-216）。
 //!
 //! - **どれも値を再現できる**（`reproducible()` は真。アンカーを作らない）。Vorbis・AAC は、symphonia の表（MDCT・FFT・
 //!   窓・TNS・逆量子化・スケールファクター・floor 0・codebook）を作る超越関数を、写し（`third_party/symphonia-core`・
@@ -84,12 +85,12 @@ impl SymphoniaDecoder {
         }
     }
 
-    /// MP4 の中の AAC-LC（`m4a-aac-symphonia-dec/2`）。
+    /// MP4 の中の AAC-LC（`m4a-aac-symphonia-dec/2`。M16 段 4 から旧版）。
     pub fn m4a_aac() -> Self {
         Self { kind: Kind::Mp4Aac }
     }
 
-    /// ADTS の AAC-LC（`aac-adts-symphonia-dec/2`）。
+    /// ADTS の AAC-LC（`aac-adts-symphonia-dec/2`。M16 段 4 から旧版）。
     pub fn adts_aac() -> Self {
         Self {
             kind: Kind::AdtsAac,

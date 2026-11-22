@@ -59,6 +59,7 @@ symphonia-format-isomp4 = { version = "=0.6.1", default-features = false }
 symphonia-format-ogg = { version = "=0.6.1", default-features = false }
 thiserror.workspace = true
 vorbis-tables.workspace = true
+aac-tables.workspace = true
 zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
 
 [dev-dependencies]

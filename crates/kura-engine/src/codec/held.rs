@@ -275,13 +275,13 @@ pub(crate) fn flac(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
 /// m4a の読み手ごとの数え方（[`mp4`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mp4Reader {
-    /// 自作の読み手（`codec::mp4_read`。ALAC）：サンプルの表（stts・stsc・stsz・stco・co64）を 3 倍（読み込む領域と、
+    /// 自作の読み手（`codec::mp4_read`。ALAC・AAC）：サンプルの表（stts・stsc・stsz・stco・co64）を 3 倍（読み込む領域と、
     /// 位置を u64 にした表）、stz2 を 9 倍（4 ビットの項目を u32 にすると 8 倍）。どのトラックを選ぶかは数えないので、すべての
     /// trak の分。7 つのキーのタグの値は 1 つ `min(3 × 長さ, 4,096)`（不正な UTF-8 の置き換えで 3 倍まで伸び、4,096 を
     /// 超えるものは持たない）と [`ITEM_COST`]、読む間の写しに [`TAG_VALUE`] の 2 つ分。mdat の前に続く moof の大きさの和の
     /// 最大を [`MOOF_FACTOR`] 倍。covr・ほかのタグ・mdat は読まない。
     Kura,
-    /// symphonia の `IsoMp4Reader`（AAC。段 4 まで）。
+    /// symphonia の `IsoMp4Reader`（旧版の AAC の読み手 `m4a-aac-symphonia-dec/2`。段 10 まで）。
     Symphonia,
 }
 
@@ -339,7 +339,11 @@ fn mp4_kura(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
             .saturating_add(tables)
             .saturating_add(tags)
             // タグを読む間の写し（生の値と置き換えた文字列。タグがあるときだけ）
-            .saturating_add(if tags > 0 { TAG_VALUE.saturating_mul(2) } else { 0 })
+            .saturating_add(if tags > 0 {
+                TAG_VALUE.saturating_mul(2)
+            } else {
+                0
+            })
             .saturating_add(run_peak.saturating_mul(MOOF_FACTOR)),
         decode: 0,
     })
@@ -375,9 +379,11 @@ fn kura_tags(w: &mut Walk<'_>, s: u64, e: u64) -> Result<u64, EngineError> {
         }
         let mut ilst = Boxes::new(is, ie);
         while let Some((tag, ts, te)) = ilst.next(w)? {
+            // 7 つのキーと、自由形式（iTunSMPB。AAC の priming）
             if !crate::codec::mp4_read::TAG_KEYS
                 .iter()
                 .any(|(k, _)| *k == tag)
+                && &tag != b"----"
             {
                 continue;
             }
@@ -805,6 +811,7 @@ mod tests {
                 flac as fn(&mut dyn ReadSeek) -> Result<Held, EngineError>,
             ),
             ("alac-16.m4a", |s| mp4(s, Mp4Reader::Kura)),
+            ("aac-lc-ffmpeg.m4a", |s| mp4(s, Mp4Reader::Kura)),
             ("aac-lc-ffmpeg.m4a", |s| mp4(s, Mp4Reader::Symphonia)),
         ] {
             let h = f(&mut Cursor::new(fixture(name))).unwrap();

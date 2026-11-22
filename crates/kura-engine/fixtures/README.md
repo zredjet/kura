@@ -165,9 +165,28 @@ FFmpeg 9.0.2 の APNG のデコーダ（8 ビットは `rgba`、16 ビットは 
 
 ## 多チャンネルの AAC（段 9 の確認）
 
-`tests/fixtures.rs` の `unsupported_audio_variants_fall_through` が使う。作ったときの道具：FFmpeg 9.0.2。
+`tests/fixtures.rs` の `unsupported_audio_variants_fall_through`（M16 段 4 からは `multichannel_aac_matches_ffmpeg_and_audiotoolbox`）が使う。作ったときの道具：FFmpeg 9.0.2。
 
 | ファイル | 作り方 | 照らすもの |
 |---|---|---|
-| `aac-lc-6ch.aac` | `ffmpeg -f lavfi -i sine=frequency=440:duration=0.5:sample_rate=48000 -ac 6 -c:a aac -b:a 192k -f adts aac-lc-6ch.aac`（AAC-LC の ADTS・48 kHz・5.1） | symphonia の AAC は 1・2 チャンネルだけ（"aac too complex"）。チャンネルの構成があるので開けるが、固定の段は形の段階で断り（`Unsupported`）、形も読みも後の段へ回す（直す前は `aac-adts-symphonia-dec/2` が形を答え、読みで断っていた） |
-| `aac-lc-5ch.m4a` | `ffmpeg -f lavfi -i sine=frequency=440:duration=0.5:sample_rate=48000 -ac 5 -c:a aac -b:a 160k -f mp4 aac-lc-5ch.m4a`（AAC-LC の m4a・48 kHz・5.0） | 同上（`m4a-aac-symphonia-dec/2`） |
+| `aac-lc-6ch.aac` | `ffmpeg -f lavfi -i sine=frequency=440:duration=0.5:sample_rate=48000 -ac 6 -c:a aac -b:a 192k -f adts aac-lc-6ch.aac`（AAC-LC の ADTS・48 kHz・5.1） | symphonia の AAC は 1・2 チャンネルだけ（"aac too complex"）。チャンネルの構成があるので開けるが、固定の段は形の段階で断り（`Unsupported`）、形も読みも後の段へ回す（直す前は `aac-adts-symphonia-dec/2` が形を答え、読みで断っていた）。M16 段 4 から自作の `aac-adts-kura-dec/1` が読む（元は 1 チャンネルを広げたもので、音は FC の面だけ。ほかの面は 0） |
+| `aac-lc-5ch.m4a` | `ffmpeg -f lavfi -i sine=frequency=440:duration=0.5:sample_rate=48000 -ac 5 -c:a aac -b:a 160k -f mp4 aac-lc-5ch.m4a`（AAC-LC の m4a・48 kHz・5.0） | 同上（`m4a-aac-symphonia-dec/2`）。M16 段 4 から自作の `m4a-aac-kura-dec/1` が読む（音は FC の面だけ） |
+
+## 多チャンネルの AAC-LC（M16 段 4）
+
+`tests/fixtures.rs` の `multichannel_aac_matches_ffmpeg_and_audiotoolbox` が使う。作ったときの道具：FFmpeg 9.0.2、macOS 26.7 の
+afconvert。元の音は置かない：`ffmpeg -f lavfi -i "aevalsrc='E0|E1|…':s=48000:d=0.3:c=<配置>" -c:a pcm_s24le src.wav`
+（48 kHz・0.3 秒・14,400 フレーム）で、チャンネル k（0 始まり）の式 Ek は
+`0.2*sin(2*PI*(330+170k)*t)+0.15*exp(-60*(t-0.15-0.01k))*gte(t,0.15+0.01k)*sin(2*PI*(2000+500k)*t)`（チャンネルごとに違う
+高さの音と、ずらした減衰する高い音。短い窓も出る）。参照は 24 ビットの FLAC（`ffmpeg -i X.m4a -c:a flac -sample_fmt s32
+-bits_per_raw_sample 24 X.ffmpeg.flac`。ffmpeg の読み取りの f32 を 24 ビットに丸めたもの）。
+
+| ファイル | 作り方 | 照らすもの |
+|---|---|---|
+| `aac-lc-mono.m4a` | 配置 `mono` の元を `ffmpeg -i src.wav -c:a aac -b:a 64k -aac_pns 0`（channel_configuration 1） | `aac-lc-mono.ffmpeg.flac` と 100 dB 以上の比で近い |
+| `aac-lc-3ch.m4a` | 配置 `3.0` で `-b:a 192k -aac_pns 0`（配置 3：SCE・CPE） | `aac-lc-3ch.ffmpeg.flac` とチャンネルごとに 100 dB 以上（面の並びは FL FR FC） |
+| `aac-lc-4ch.m4a` | 配置 `4.0` で `-b:a 256k -aac_pns 0`（配置 4：SCE・CPE・SCE） | `aac-lc-4ch.ffmpeg.flac` とチャンネルごとに 100 dB 以上（FL FR FC BC） |
+| `aac-lc-5ch-tones.m4a` | 配置 `5.0` で `-b:a 320k -aac_pns 0`（配置 5：SCE・CPE・CPE） | `aac-lc-5ch-tones.ffmpeg.flac` とチャンネルごとに 100 dB 以上（FL FR FC BL BR） |
+| `aac-lc-6ch-afconvert.m4a` | 配置 `5.1` の元を `afconvert -f m4af -d aac -b 288000 -l MPEG_5_1_D src.wav`（AudioToolbox のエンコーダ。配置 6：SCE・CPE・CPE・LFE） | `aac-lc-6ch-afconvert.ffmpeg.flac` とチャンネルごとに 100 dB 以上（FL FR FC LFE BL BR） |
+| `aac-lc-8ch-afconvert.m4a` | 配置 `7.1(wide-side)`（FL FR FC LFE FLC FRC SL SR）の元を `afconvert -f m4af -d aac -b 384000 -l MPEG_7_1_B src.wav`（配置 7：SCE・CPE・CPE・CPE・LFE。afconvert は元の SL・SR を Ls・Rs に入れる） | `aac-lc-8ch-afconvert.afconvert.flac`（`afconvert -f WAVE -d LEI24` を ffmpeg で FLAC にしたもの。並びは AAC の C Lc Rc L R Ls Rs LFE のまま）と、並びを直してチャンネルごとに 100 dB 以上。kura の面は FL FR FC LFE BL BR FLC FRC で、最初の CPE（Lc・Rc）が FLC・FRC、2 つ目（L・R）が FL・FR、3 つ目（Ls・Rs）が BL・BR（ISO と AudioToolbox の読み。ffmpeg 9.0.2 は最初の CPE を FL・FR、2 つ目を SL・SR に置く） |
+| `aac-lc-8ch-pce.m4a` | 配置 `7.1(wide)` の元を `ffmpeg -i src.wav -c:a aac -b:a 512k -aac_pns 0`（ffmpeg は 7.1 を channel_configuration 0 と PCE で書く） | PCE で決める配置は自作の読み手では読まない（`Unsupported`。後の段の AudioToolbox・ffmpeg へ） |

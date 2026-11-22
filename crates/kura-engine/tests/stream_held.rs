@@ -552,20 +552,40 @@ fn atom(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
 
 /// ffmpeg の AAC の m4a（moov が最後）の moov の後ろに udta/meta/ilst（`(名前, 型, 中身)` のタグ）を足す。
 fn m4a_with_tags(tags: &[([u8; 4], u32, Vec<u8>)]) -> Vec<u8> {
-    let b = fixture("aac-lc-ffmpeg.m4a");
     let mut ilst = Vec::new();
     for (name, kind, data) in tags {
-        let mut d = kind.to_be_bytes().to_vec();
-        d.extend_from_slice(&[0; 4]);
-        d.extend_from_slice(data);
-        ilst.extend_from_slice(&atom(name, &atom(b"data", &d)));
+        ilst.extend_from_slice(&atom(name, &data_atom(*kind, data)));
     }
+    m4a_with_ilst(&ilst)
+}
+
+/// ilst の `data`（型と中身）。
+fn data_atom(kind: u32, data: &[u8]) -> Vec<u8> {
+    let mut d = kind.to_be_bytes().to_vec();
+    d.extend_from_slice(&[0; 4]);
+    d.extend_from_slice(data);
+    atom(b"data", &d)
+}
+
+/// 自由形式の項目（`----`：mean・name と、`data` の並び）。
+fn freeform_item(mean: &[u8], name: &[u8], data: &[Vec<u8>]) -> Vec<u8> {
+    let full = |kind: &[u8; 4], body: &[u8]| atom(kind, &[&[0u8; 4][..], body].concat());
+    let mut body = [full(b"mean", mean), full(b"name", name)].concat();
+    for d in data {
+        body.extend_from_slice(&data_atom(1, d));
+    }
+    atom(b"----", &body)
+}
+
+/// ffmpeg の AAC の m4a（moov が最後）の moov の後ろに、中身が `ilst` の udta/meta/ilst を足す。
+fn m4a_with_ilst(ilst: &[u8]) -> Vec<u8> {
+    let b = fixture("aac-lc-ffmpeg.m4a");
     let mut hdlr = vec![0u8; 8];
     hdlr.extend_from_slice(b"mdirappl");
     hdlr.extend_from_slice(&[0u8; 9]);
     let mut meta = vec![0u8; 4];
     meta.extend_from_slice(&atom(b"hdlr", &hdlr));
-    meta.extend_from_slice(&atom(b"ilst", &ilst));
+    meta.extend_from_slice(&atom(b"ilst", ilst));
     let udta = atom(b"udta", &atom(b"meta", &meta));
     let mut at = 0usize;
     let mut moov = None;
@@ -666,7 +686,7 @@ fn stream_estimates_cover_what_readers_hold() {
         ogg_with(|h| h[2] = add_ordered_codebooks(&h[2], 4)),
         "ogg",
     );
-    // m4a：covr（8 MiB）・小さなタグ 10 万・長い歌詞
+    // m4a（AAC。M16 段 4 から自作の MP4 の読み口）：covr（8 MiB）・小さなタグ 10 万・長い歌詞
     put(
         "m4a-covr",
         m4a_with_tags(&[(*b"covr", 14, vec![0x55; mib8])]),
@@ -688,6 +708,21 @@ fn stream_estimates_cover_what_readers_hold() {
         m4a_with_tags(&[(lyr, 1, vec![b'x'; 4 << 20])]),
         "m4a",
     );
+    // 自由形式の iTunSMPB（M16 段 4 の自作の読み口が読む）：項目 10 万と、不正な UTF-8 の長い mean と data 2 万の項目
+    // （見直しの指摘。読み手は項目ごとに最初の値だけを持つ）
+    let smpb = b" 00000000 00000840 000001C0 0000000000005A00 00000000 00000000".to_vec();
+    let many: Vec<u8> = (0..100_000)
+        .flat_map(|_| {
+            freeform_item(
+                b"com.apple.iTunes",
+                b"iTunSMPB",
+                std::slice::from_ref(&smpb),
+            )
+        })
+        .collect();
+    put("m4a-itunsmpb-items", m4a_with_ilst(&many), "m4a");
+    let wide = freeform_item(&[0xff; 1_300], b"x.iTunSMPB", &vec![vec![b'0'; 8]; 20_000]);
+    put("m4a-itunsmpb-data", m4a_with_ilst(&wide), "m4a");
     // m4a の ALAC（自作の読み手）：小さなタグ 10 万（7 つのキーの 1 つ）・30 万のパケット（大きな stsz）
     let cmt_tags: Vec<([u8; 4], u32, Vec<u8>)> = (0..100_000)
         .map(|_| ([0xa9, b'c', b'm', b't'], 1, b"a".to_vec()))
@@ -709,13 +744,17 @@ fn stream_estimates_cover_what_readers_hold() {
         alac_m4a_with(&mono_cookie(), &many, 1, &[], true),
         "m4a",
     );
-    // 自作の FLAC の読み手が読み飛ばす箱と、自作の Ogg Vorbis の読み手が使わない項目（持たない）
+    // 自作の FLAC の読み手が読み飛ばす箱と、自作の Ogg Vorbis の読み手が使わない項目、自作の MP4 の読み口が読まない
+    // タグ（covr と 7 つのキーのほか。持たない）
     let skipped = [
         "flac-pictures",
         "flac-long-description",
         "flac-seektable",
         "flac-application",
         "ogg-big-codebooks",
+        "m4a-covr",
+        "m4a-lyrics",
+        "m4a-itunsmpb-data",
     ];
     for (name, path, format) in &cases {
         let (shape_peak, _, stream_peak, _) = check(name, path, format);

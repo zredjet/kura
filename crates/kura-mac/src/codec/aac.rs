@@ -255,7 +255,8 @@ mod tests {
     }
 
     /// 3〜6 チャンネル：ClientChannelLayout で kura の並び（5.1 は L R C LFE BL BR）を渡して書き、段の順に任せても読め、AudioToolbox で読み直すと
-    /// 同じ並びに戻る（各チャンネルが元の同じチャンネルと最もよく相関する）。7・8 チャンネルは書かない。
+    /// 同じ並びに戻る（各チャンネルが元の同じチャンネルと最もよく相関する）。7・8 チャンネルは書かない。M16 段 4 から、
+    /// channel_configuration で書かれたものは固定の段の自作の AAC（`m4a-aac-kura-dec/1`）が読み、それも同じ並びに戻る。
     #[test]
     fn surround_keeps_the_channel_order() {
         let _g = shared();
@@ -265,8 +266,13 @@ mod tests {
             let (m4a, _) = set
                 .encode_bytes(&src, "m4a", &json!({}), &NoMonitor)
                 .unwrap();
-            // 段の順に任せても、形も読みも macOS の段が答える（symphonia の AAC は 1・2 チャンネルだけ。チャンネルの数を
-            // 読めない 4 チャンネルは開く段階で、ほかはデコーダを作る段階で Unsupported を返す）
+            // 段の順に任せても、形と読みを同じ段が答える：channel_configuration（3・5・6 チャンネル）は固定の段の自作の
+            // AAC、AAC の配置にない kura の 4 チャンネル（L R BL BR。PCE で書かれる）は macOS の段
+            let want = if channels == 4 {
+                AUDIOTOOLBOX_DEC
+            } else {
+                "m4a-aac-kura-dec/1"
+            };
             let (_, shaped_by) = set
                 .shape(
                     &mut std::io::Cursor::new(m4a.clone()),
@@ -275,14 +281,19 @@ mod tests {
                     &kura_engine::Limits::default(),
                 )
                 .unwrap();
-            assert_eq!(shaped_by, AUDIOTOOLBOX_DEC, "{channels} ch の形");
+            assert_eq!(shaped_by, want, "{channels} ch の形");
             let (routed, routed_stamp) = decode(&set, &m4a, "m4a").unwrap();
             assert_eq!(
                 (audio(&routed).channels(), audio(&routed).frames()),
                 (channels, 48_000),
                 "{channels} ch を段の順で読む"
             );
-            assert_eq!(routed_stamp.codec, AUDIOTOOLBOX_DEC, "{channels} ch の読み");
+            assert_eq!(routed_stamp.codec, want, "{channels} ch の読み");
+            let (a, r) = (audio(&src), audio(&routed));
+            for c in 0..channels {
+                let same = ncc(&a.to_planes().unwrap()[c], &r.to_planes().unwrap()[c]);
+                assert!(same > 0.9, "{channels} ch・段の順・チャンネル {c}: {same}");
+            }
             let (back, stamp) = set
                 .decode_with(
                     AUDIOTOOLBOX_DEC,

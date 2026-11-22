@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::codec::alac_read::{AlacDecoder, DEC_ID, MAX_FRAME_LENGTH};
 use crate::codec::held::{self, Held};
-use crate::codec::mp4_read::{self, Mp4Alac};
+use crate::codec::mp4_read::{self, Mp4Track};
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
 use crate::codec::symph::{self, Media};
 use crate::codec::{Decoder, ReadSeek, Tier, pcm};
@@ -52,8 +52,8 @@ fn open<'a>(
     media: &'a mut Media<'_>,
     limits: &Limits,
     mon: &'a dyn Monitor,
-) -> Result<Mp4Alac<'a>, EngineError> {
-    let r = mp4_read::open(media, mon, DEC_ID)?;
+) -> Result<Mp4Track<'a>, EngineError> {
+    let r = mp4_read::open(media, mon, DEC_ID, mp4_read::Want::Alac)?;
     if r.rate == 0 {
         return Err(dec_err("サンプルレートがありません"));
     }
@@ -68,7 +68,7 @@ fn open<'a>(
 
 /// パケットの大きさの上限（どの正しい ALAC のパケットも、非圧縮の標本と頭に収まる。超えるものは作業領域の見積もりの外
 /// なので `Limit`。symphonia は読んだ。docs/editing.md §9.6）。
-fn packet_max(r: &Mp4Alac<'_>) -> u64 {
+fn packet_max(r: &Mp4Track<'_>) -> u64 {
     let fl = crate::codec::alac_read::Cookie::parse(&r.cookie)
         .map_or(u64::from(MAX_FRAME_LENGTH), |c| {
             u64::from(c.frame_length.min(MAX_FRAME_LENGTH))
@@ -77,7 +77,7 @@ fn packet_max(r: &Mp4Alac<'_>) -> u64 {
 }
 
 /// 長さ（パケットの長さの和。読まずに数える。数える量を上限で確かめる）。
-fn count(r: &mut Mp4Alac<'_>, limits: &Limits, mon: &dyn Monitor) -> Result<u64, EngineError> {
+fn count(r: &mut Mp4Track<'_>, limits: &Limits, mon: &dyn Monitor) -> Result<u64, EngineError> {
     let max = packet_max(r);
     let (rate, channels) = (r.rate, u16::try_from(r.channels).unwrap_or(u16::MAX));
     let shape = |n: u64| Shape::Audio {
@@ -800,7 +800,7 @@ mod tests {
     fn speed_against_symphonia() {
         let src = fixture("alac-16.m4a");
         let mut media = Media::Bytes(&src);
-        let mut r = mp4_read::open(&mut media, &NoMonitor, DEC_ID).unwrap();
+        let mut r = mp4_read::open(&mut media, &NoMonitor, DEC_ID, mp4_read::Want::Alac).unwrap();
         let cookie = r.cookie.clone();
         let mut one = Vec::new();
         while let Some(s) = r.next_sample().unwrap() {

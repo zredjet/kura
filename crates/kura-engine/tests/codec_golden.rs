@@ -1761,6 +1761,16 @@ fn decode_examples() -> Vec<(&'static str, FileGen)> {
         "aac-lc-afconvert.m4a",
         "aac-lc-ffmpeg.m4a",
         "aac-lc.aac",
+        // M16 段 4：AAC は自作の `m4a-aac-kura-dec/1`・`aac-adts-kura-dec/1` で読む（上の 3 つも。前の `…-symphonia-dec/2`
+        // の行は旧版で読み直して照らし続ける）。モノラル・3〜7.1 チャンネル（ffmpeg・afconvert）
+        "aac-lc-mono.m4a",
+        "aac-lc-3ch.m4a",
+        "aac-lc-4ch.m4a",
+        "aac-lc-5ch-tones.m4a",
+        "aac-lc-6ch-afconvert.m4a",
+        "aac-lc-8ch-afconvert.m4a",
+        "aac-lc-6ch.aac",
+        "aac-lc-5ch.m4a",
     ] {
         let name: &'static str = Box::leak(format!("fixture-{path}").into_boxed_str());
         v.push((name, FileGen::Fixture { path: path.into() }));

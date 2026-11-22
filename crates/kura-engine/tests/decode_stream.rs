@@ -624,7 +624,7 @@ fn staged_shapes_follow_the_stage_order() {
     assert_eq!((shape, stage.id), (want, want_id));
     assert_eq!(
         seen.iter().map(|s| s.id).collect::<Vec<_>>(),
-        ["m4a-alac-symphonia-dec/1", "m4a-aac-symphonia-dec/2"]
+        ["m4a-alac-symphonia-dec/1", "m4a-aac-kura-dec/1"]
     );
     assert_eq!(seen[1], stage);
     assert!(stage.held.open > 0 && stage.shape_bytes == stage.held.open);
@@ -651,7 +651,7 @@ fn staged_shapes_follow_the_stage_order() {
     };
     assert_eq!(after("m4a-alac-symphonia-dec/1").unwrap().1.id, stage.id);
     assert!(matches!(
-        after("m4a-aac-symphonia-dec/2"),
+        after("m4a-aac-kura-dec/1"),
         Err(EngineError::Unsupported(_))
     ));
     // prepare の誤りはそのまま

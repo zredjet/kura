@@ -28,6 +28,7 @@ crates/kura-core/          # OS 非依存のドメインロジック（DB, 取�
 crates/kura-core/migrations/  # SQL マイグレーション（連番、既存は編集禁止）
 crates/kura-engine/        # 編集の操作エンジン：文書・操作・描画・解析・コーデック・3D（glb）の読み手と描画・エディタのセッション（OS・DB 非依存）
 crates/vorbis-tables/      # Ogg Vorbis のエンコーダの表（aoTuV から生成。BSD-3）と照合用の C の組み方（oracle/）
+crates/aac-tables/         # AAC の符号表と帯の区切り（symphonia-codec-aac から値を変えずに写したもの。MPL-2.0）
 crates/kura-mac/           # macOS 専用：サムネイル, メディア情報, スナップショット, 編集の Platform のコーデック（Swift ヘルパー）, 大きな確保を OS へすぐ返す確保器（アプリの global_allocator）
 crates/kura-devtools/      # ダミーライブラリ生成・ベンチマーク
 third_party/               # 不具合を直した、または kura の要件（libm への差し替え）で手を入れた第三者のクレートの写し（[patch.crates-io]。元のライセンスのまま）
