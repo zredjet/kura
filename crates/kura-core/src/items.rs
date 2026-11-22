@@ -10,8 +10,10 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 
+use crate::asset::{self, Alpha, AnalysisState};
+use crate::import::MediaKind;
 use crate::library::hex;
-use crate::query::{DbResolver, Expr, QueryContext, compile};
+use crate::query::{DbResolver, Expr, QueryContext, compile, compile_unanalyzed};
 use crate::text::{natural_cmp, nfc};
 use crate::unit::{self, LIST_FLAG, SetIndex};
 use crate::{CoreError, Result, folders, random, smart};
@@ -114,6 +116,8 @@ pub enum ItemView {
     Unit { id: i64 },
     /// スマートフォルダ（保存した検索）。
     Smart { id: i64 },
+    /// 登録したプロジェクトで今使っている素材（照らし直しで一致したファイルのアイテム。M15 段 6）。
+    Project { id: i64 },
 }
 
 /// 一覧の条件。
@@ -236,6 +240,22 @@ fn scope(conn: &Connection, view: ItemView, ctx: &QueryContext) -> Result<Scope>
                     "{alive} AND i.id IN (SELECT m.item_id FROM item_folders m WHERE m.folder_id IN ({marks}))"
                 ),
                 params: ids.into_iter().map(Value::Integer).collect(),
+            }
+        }
+        ItemView::Project { id } => {
+            // あるかだけを主キーで確かめる（project::get は件数も数える）
+            let found: Option<i64> = conn
+                .prepare_cached("SELECT id FROM projects WHERE id = ?1")?
+                .query_row([id], |r| r.get(0))
+                .optional()?;
+            if found.is_none() {
+                return Err(CoreError::NotFound(format!("プロジェクト {id}")));
+            }
+            Scope {
+                sql: format!(
+                    "{alive} AND i.id IN (SELECT f.item_id FROM project_files f WHERE f.project_id = ? AND f.item_id IS NOT NULL)"
+                ),
+                params: vec![Value::Integer(id)],
             }
         }
         ItemView::Smart { id } => {
@@ -425,29 +445,13 @@ fn unit_rows(conn: &Connection, members: &[i64]) -> Result<Vec<ListRow>> {
 }
 
 /// 種類ごとの件数（⌘K パレットの「一致 186 項目 — 画像 142 · 動画 44」）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct KindCounts {
-    pub image: i64,
-    pub video: i64,
-    pub audio: i64,
-}
+pub use crate::import::KindCounts;
 
-impl KindCounts {
-    /// 合計。
-    pub fn total(&self) -> i64 {
-        self.image + self.video + self.audio
-    }
-}
-
-/// 一覧と同じ条件で、種類ごとに数える。
+/// 一覧と同じ条件で、種類ごとに数える（フォント・3D も分けて数える）。
 pub fn count_kinds(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> Result<KindCounts> {
     let scope = where_clause(conn, query, ctx)?;
     let mut counts = KindCounts::default();
-    let mut add = |kind: &str, n: i64| match kind {
-        "image" => counts.image += n,
-        "video" => counts.video += n,
-        _ => counts.audio += n,
-    };
+    let mut add = |kind: MediaKind, n: i64| counts.add(kind, u64::try_from(n).unwrap_or(0));
     if let ItemView::Unit { id } = query.view {
         let members: HashSet<i64> = unit::members(conn, id)?.into_iter().collect();
         let mut stmt = conn.prepare(&format!(
@@ -455,12 +459,12 @@ pub fn count_kinds(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> 
             scope.sql
         ))?;
         let rows = stmt.query_map(params_from_iter(scope.params.iter()), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, MediaKind>(1)?))
         })?;
         for row in rows {
             let (id, kind) = row?;
             if members.contains(&id) {
-                add(&kind, 1);
+                add(kind, 1);
             }
         }
         return Ok(counts);
@@ -470,13 +474,40 @@ pub fn count_kinds(conn: &Connection, query: &ItemQuery, ctx: &QueryContext) -> 
         scope.sql
     ))?;
     let rows = stmt.query_map(params_from_iter(scope.params.iter()), |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        Ok((r.get::<_, MediaKind>(0)?, r.get::<_, i64>(1)?))
     })?;
     for row in rows {
         let (kind, n) = row?;
-        add(&kind, n);
+        add(kind, n);
     }
     Ok(counts)
+}
+
+/// 検索の条件が解析の事実（透過・ループ・ラウドネスなど）を使うとき、一覧の中で解析がまだのために一致が
+/// 決まっていないアイテムの数（⌘K パレットの「未解析 N 件」。design.md §3.1）。事実を使わなければ None。
+pub fn count_unanalyzed(
+    conn: &Connection,
+    query: &ItemQuery,
+    ctx: &QueryContext,
+) -> Result<Option<u64>> {
+    let Some(filter) = &query.filter else {
+        return Ok(None);
+    };
+    let Some(cond) = compile_unanalyzed(filter, &DbResolver { conn }, ctx)? else {
+        return Ok(None);
+    };
+    let mut scope = scope(conn, query.view, ctx)?;
+    scope.sql = format!("{} AND ({})", scope.sql, cond.sql);
+    scope.params.extend(cond.params);
+    if let ItemView::Unit { id } = query.view {
+        let members: HashSet<i64> = unit::members(conn, id)?.into_iter().collect();
+        let matching = matching_ids(conn, &scope)?;
+        return Ok(Some(matching.intersection(&members).count() as u64));
+    }
+    let n: i64 = conn
+        .prepare(&format!("SELECT count(*) FROM items i WHERE {}", scope.sql))?
+        .query_row(params_from_iter(scope.params.iter()), |r| r.get(0))?;
+    Ok(Some(u64::try_from(n).unwrap_or(0)))
 }
 
 /// set ユニットに入っているアイテムを、最初に現れた位置の 1 件のユニット（`LIST_FLAG | unit_id`）にまとめる。
@@ -576,7 +607,7 @@ pub struct ItemSummary {
     pub id: i64,
     pub hash: String,
     pub ext: String,
-    pub kind: String,
+    pub kind: MediaKind,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -590,22 +621,69 @@ pub struct ItemSummary {
     /// 再生用プロキシの状態（unknown / not_needed / pending / ready / failed）。
     pub proxy_state: String,
     pub last_played_at: Option<i64>,
+    /// サムネイルを作り直した回数（URL の `?r=`。WebKit のメモリのキャッシュから古い絵を出さないため）。
+    pub thumb_rev: i64,
+    /// 解析の進み具合（`items.analysis_state`）。
+    pub analysis_state: AnalysisState,
+    /// 解析で分かった透過（`media_facts.alpha`。未解析・画像でなければ None）。
+    pub alpha: Option<Alpha>,
+    /// ドット絵として表示するか（実効値。[`asset::effective`]）。
+    pub pixel_art: bool,
+    /// ドット絵の設定（`asset_settings.pixel_art`。None は自動）。右クリックのメニューのチェックに使う。
+    pub pixel_art_setting: Option<bool>,
+    /// アニメとして回せるか（実効値）。
+    pub animated: bool,
+    /// コマの数（実効値。格子があれば帯で使う数）。
+    pub frame_count: Option<u32>,
+    /// 解析で分かったループ点があるか（音声）。
+    pub has_loop: bool,
 }
 
-const SUMMARY_COLUMNS: &str = "id, hash, ext, kind, width, height, duration_ms, size_bytes, title, \
-                               rating, source_site, imported_at, captured_at, thumb_state, proxy_state, last_played_at";
+/// 概要の列。素材の表示（市松模様・ドット絵・アニメとループの印）のために、中身ごとの解析の事実（`media_facts`）と
+/// アイテムごとの設定（`asset_settings`）を [`SUMMARY_FROM`] の LEFT JOIN で引く（docs/data-model.md §4）。
+const SUMMARY_COLUMNS: &str = "i.id, i.hash, i.ext, i.kind, i.width, i.height, i.duration_ms, i.size_bytes, i.title, \
+                               i.rating, i.source_site, i.imported_at, i.captured_at, i.thumb_state, i.proxy_state, \
+                               i.last_played_at, i.thumb_rev, i.analysis_state, f.alpha, f.pixel_art, f.frame_count, \
+                               f.has_loop, s.pixel_art, s.grid_json";
 /// `SUMMARY_COLUMNS` の列数（続けて読む列の位置に使う）。
-const SUMMARY_LEN: usize = 16;
+const SUMMARY_LEN: usize = 24;
+/// 概要の表：アイテム（主キー）→ 事実（台帳の行の ID `items.blob_id` で、事実の主キー）、設定（item_id の主キー）。
+const SUMMARY_FROM: &str = "items i
+     LEFT JOIN media_facts f ON f.blob_id = i.blob_id
+     LEFT JOIN asset_settings s ON s.item_id = i.id";
+
+/// 0 以上で u32 に収まる整数（ほかは None）。
+fn u32_of(v: Option<i64>) -> Option<u32> {
+    v.and_then(|v| u32::try_from(v).ok())
+}
 
 fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ItemSummary> {
     let hash: Vec<u8> = row.get(1)?;
+    let kind: MediaKind = row.get(3)?;
+    let width: Option<i64> = row.get(4)?;
+    let height: Option<i64> = row.get(5)?;
+    let pixel_art_setting = row.get::<_, Option<i64>>(22)?.map(|v| v != 0);
+    let grid = row
+        .get::<_, Option<String>>(23)?
+        .as_deref()
+        .and_then(asset::grid_from_json);
+    let effective = asset::effective(
+        kind,
+        (u32_of(width), u32_of(height)),
+        asset::EffectiveInputs {
+            auto_pixel_art: row.get::<_, Option<i64>>(19)?.map(|v| v != 0),
+            frame_count: u32_of(row.get(20)?),
+            pixel_art_setting,
+            grid: grid.as_ref(),
+        },
+    );
     Ok(ItemSummary {
         id: row.get(0)?,
         hash: hex(&hash),
         ext: row.get(2)?,
-        kind: row.get(3)?,
-        width: row.get(4)?,
-        height: row.get(5)?,
+        kind,
+        width,
+        height,
         duration_ms: row.get(6)?,
         size_bytes: row.get(7)?,
         title: row.get(8)?,
@@ -616,7 +694,30 @@ fn summary_from_row(row: &Row<'_>) -> rusqlite::Result<ItemSummary> {
         thumb_state: row.get(13)?,
         proxy_state: row.get(14)?,
         last_played_at: row.get(15)?,
+        thumb_rev: row.get(16)?,
+        analysis_state: AnalysisState::parse(&row.get::<_, String>(17)?),
+        alpha: row.get::<_, Option<i64>>(18)?.and_then(Alpha::from_code),
+        pixel_art: effective.pixel_art,
+        pixel_art_setting,
+        animated: effective.animated,
+        frame_count: effective.frame_count,
+        has_loop: row.get::<_, Option<i64>>(21)?.is_some_and(|v| v != 0),
     })
+}
+
+/// `summaries` の SQL（`n` 個の `?`）。
+fn summaries_sql(n: usize) -> String {
+    let marks = vec!["?"; n].join(", ");
+    format!("SELECT {SUMMARY_COLUMNS} FROM {SUMMARY_FROM} WHERE i.id IN ({marks})")
+}
+
+/// `detail` の SQL（概要の列のあとにインスペクタの列）。
+fn detail_sql() -> String {
+    format!(
+        "SELECT {SUMMARY_COLUMNS}, i.mime, i.codec_info, i.original_name, i.original_path, i.source_url, i.note,
+                i.trashed_at
+         FROM {SUMMARY_FROM} WHERE i.id = ?1"
+    )
 }
 
 /// 見えている分の詳細を、渡した ID の順で返す（見つからない ID は飛ばす）。
@@ -630,10 +731,7 @@ pub fn summaries(conn: &Connection, ids: &[i64]) -> Result<Vec<ItemSummary>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let marks = vec!["?"; ids.len()].join(", ");
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {SUMMARY_COLUMNS} FROM items WHERE id IN ({marks})"
-    ))?;
+    let mut stmt = conn.prepare_cached(&summaries_sql(ids.len()))?;
     let rows = stmt.query_map(params_from_iter(ids.iter()), summary_from_row)?;
     let mut by_id: HashMap<i64, ItemSummary> = HashMap::with_capacity(ids.len());
     for row in rows {
@@ -668,10 +766,7 @@ pub struct ItemDetail {
 
 /// 1 件の詳細。
 pub fn detail(conn: &Connection, id: i64) -> Result<ItemDetail> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {SUMMARY_COLUMNS}, mime, codec_info, original_name, original_path, source_url, note, trashed_at
-         FROM items WHERE id = ?1"
-    ))?;
+    let mut stmt = conn.prepare_cached(&detail_sql())?;
     let found = stmt
         .query_row([id], |row| {
             Ok((
@@ -755,13 +850,6 @@ pub fn detail(conn: &Connection, id: i64) -> Result<ItemDetail> {
         folders,
         units,
     })
-}
-
-/// ライブラリのファイルの合計サイズ（ゴミ箱を含む。ファイルはゴミ箱を空にするまで残るので）。
-pub fn total_size(conn: &Connection) -> Result<u64> {
-    let mut stmt = conn.prepare_cached("SELECT coalesce(sum(size_bytes), 0) FROM items")?;
-    let total: i64 = stmt.query_row([], |row| row.get(0))?;
-    Ok(u64::try_from(total).unwrap_or(0))
 }
 
 /// 複数選択のインスペクタに出す集計。
@@ -926,7 +1014,7 @@ pub fn restore(conn: &Connection, ids: &[i64], now: i64) -> Result<usize> {
     Ok(n)
 }
 
-/// ゴミ箱を空にするときに消したアイテム（実ファイルを消すのに使う）。
+/// ゴミ箱を空にするときに消したアイテム。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedItem {
     pub hash: [u8; 32],
@@ -934,35 +1022,140 @@ pub struct RemovedItem {
     pub size_bytes: i64,
 }
 
-/// ゴミ箱のアイテムの行を消し、消したものを返す（実ファイルは `Library::empty_trash` が消す）。
-pub fn delete_trashed(conn: &Connection) -> Result<Vec<RemovedItem>> {
-    let removed: Vec<RemovedItem> = {
+/// ゴミ箱を空にした DB の側の結果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrashDeleted {
+    /// 消したアイテム。
+    pub items: Vec<RemovedItem>,
+    /// 使われなくなって解放した台帳の行（このファイルと派生のファイルを、コミットのあとで消す）。
+    pub released: Vec<crate::library::ledger::ReleasedBlob>,
+    /// 消した文書の部品の数（消したアイテムの版・下書きの文書のうち、ほかから辿れないもの）。
+    pub parts: u64,
+}
+
+/// ゴミ箱を空にする前に決めること（トランザクション 1）：消すアイテムと、消しうる中身（アイテムの今・版が持つファイル・
+/// 版の入力が使うアンカーのファイル）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrashPlan {
+    /// 消すアイテム（このあとゴミ箱に入れられたものは、次に空にするまで残す）。
+    pub items: Vec<i64>,
+    /// 消しうる中身の (hash, 拡張子)。'delete' で予告する（解放されなかったものは、予告だけ消える）。
+    pub blobs: Vec<([u8; 32], String)>,
+}
+
+/// ゴミ箱を空にする前に、消すアイテム（ゴミ箱に入れた順）と消しうる中身を集める（ゴミ箱の部分索引 `idx_items_trashed` から
+/// たどる。アイテムは索引の順（`trashed_at, id`）に並べる：`ORDER BY id` だと items を走査する。CROSS JOIN で結ぶ順を決める。
+/// 統計のない小さな表では、版の表を走査する順を選ぶことがあるため）。
+pub fn plan_empty_trash(conn: &Connection) -> Result<TrashPlan> {
+    let items: Vec<i64> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT hash, ext, size_bytes FROM items WHERE trashed_at IS NOT NULL",
+            "SELECT id FROM items WHERE trashed_at IS NOT NULL ORDER BY trashed_at, id",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (hash, ext, size_bytes) = row?;
-            let Ok(hash) = <[u8; 32]>::try_from(hash.as_slice()) else {
-                continue;
-            };
-            out.push(RemovedItem {
-                hash,
-                ext,
-                size_bytes,
-            });
-        }
-        out
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
     };
-    conn.execute("DELETE FROM items WHERE trashed_at IS NOT NULL", [])?;
-    Ok(removed)
+    let mut stmt = conn.prepare_cached(
+        "SELECT b.hash, b.ext FROM items i CROSS JOIN blobs b ON b.hash = i.hash
+          WHERE i.trashed_at IS NOT NULL
+         UNION
+         SELECT b.hash, b.ext FROM items i
+           CROSS JOIN item_versions v ON v.item_id = i.id
+           JOIN blobs b ON b.id = v.file_blob_id
+          WHERE i.trashed_at IS NOT NULL
+         UNION
+         SELECT b.hash, b.ext FROM items i
+           CROSS JOIN item_versions v ON v.item_id = i.id
+           CROSS JOIN item_version_inputs n ON n.version_id = v.id
+           JOIN edit_anchors a ON a.id = n.anchor_id
+           JOIN blobs b ON b.id = a.blob_id
+          WHERE i.trashed_at IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut blobs = Vec::new();
+    for row in rows {
+        let (hash, ext) = row?;
+        if let Ok(hash) = <[u8; 32]>::try_from(hash.as_slice()) {
+            blobs.push((hash, ext));
+        }
+    }
+    Ok(TrashPlan { items, blobs })
+}
+
+/// ゴミ箱のアイテム `ids`（[`plan_empty_trash`] で決めたもの。もうゴミ箱にないものは消さない）の行を消し、使われなくなった
+/// 台帳の行を同じトランザクションで解放する（docs/data-model.md §4「保存と版（M12）」。中身ごとの事実・結果は CASCADE で
+/// 消える）。編集したアイテム（M12）は、版の行（CASCADE で消える）が持つファイル（元・猶予中の版・照合が合わずに残した版）と、
+/// 版の入力が使うアンカーも、ほかから参照されなければ解放し（利用者の決定 6：ゴミ箱そのものが猶予の役をするので、照合しない）、
+/// 版・下書きの文書の部品のうち、ほかから辿れないものも消す。実ファイルと派生のファイルは `Library::empty_trash` がコミットの
+/// あとで消す（'delete' の予告を先にコミットしてある）。
+pub fn delete_trashed(conn: &Connection, ids: &[i64]) -> Result<TrashDeleted> {
+    let mut items = Vec::with_capacity(ids.len());
+    let mut hashes: Vec<[u8; 32]> = Vec::new();
+    let mut anchors: Vec<i64> = Vec::new();
+    let mut docs: Vec<i64> = Vec::new();
+    let mut item_of = conn.prepare_cached(
+        "SELECT hash, ext, size_bytes FROM items WHERE id = ?1 AND trashed_at IS NOT NULL",
+    )?;
+    let mut files_of = conn.prepare_cached(
+        "SELECT b.hash FROM item_versions v JOIN blobs b ON b.id = v.file_blob_id WHERE v.item_id = ?1",
+    )?;
+    let mut anchors_of = conn.prepare_cached(
+        "SELECT n.anchor_id FROM item_versions v CROSS JOIN item_version_inputs n ON n.version_id = v.id
+          WHERE v.item_id = ?1 AND n.anchor_id IS NOT NULL",
+    )?;
+    let mut docs_of = conn.prepare_cached(
+        "SELECT doc_id FROM item_versions WHERE item_id = ?1 AND doc_id IS NOT NULL
+         UNION SELECT doc_id FROM edit_drafts WHERE item_id = ?1",
+    )?;
+    let mut delete = conn.prepare_cached("DELETE FROM items WHERE id = ?1")?;
+    for &id in ids {
+        let row: Option<(Vec<u8>, String, i64)> = item_of
+            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .optional()?;
+        let Some((hash, ext, size_bytes)) = row else {
+            continue;
+        };
+        let Ok(hash) = <[u8; 32]>::try_from(hash.as_slice()) else {
+            continue;
+        };
+        for file in files_of.query_map([id], |row| row.get::<_, Vec<u8>>(0))? {
+            if let Ok(file) = <[u8; 32]>::try_from(file?.as_slice()) {
+                hashes.push(file);
+            }
+        }
+        for anchor in anchors_of.query_map([id], |row| row.get::<_, i64>(0))? {
+            anchors.push(anchor?);
+        }
+        for doc in docs_of.query_map([id], |row| row.get::<_, i64>(0))? {
+            docs.push(doc?);
+        }
+        delete.execute([id])?;
+        hashes.push(hash);
+        items.push(RemovedItem {
+            hash,
+            ext,
+            size_bytes,
+        });
+    }
+    anchors.sort_unstable();
+    anchors.dedup();
+    hashes.extend(crate::edit::anchors::sweep_unreferenced(conn, &anchors)?);
+    hashes.sort_unstable();
+    hashes.dedup();
+    let released = crate::library::ledger::release(conn, &hashes)?;
+    docs.sort_unstable();
+    docs.dedup();
+    let live = crate::edit::save::gc_roots(
+        conn,
+        crate::time::now_ms().saturating_sub(crate::edit::gc::GRACE_MS),
+    )?;
+    let parts = crate::edit::gc::sweep_parts(conn, crate::edit::gc::Scope::Roots(&docs), &live)?;
+    Ok(TrashDeleted {
+        items,
+        released,
+        parts,
+    })
 }
 
 #[cfg(test)]
@@ -989,17 +1182,6 @@ mod tests {
             rusqlite::params![id, vec![id as u8; 32], w, h, format!("t{id}"), at],
         )
         .unwrap();
-    }
-
-    #[test]
-    fn total_size_counts_every_item_including_the_trash() {
-        let conn = test_conn();
-        assert_eq!(total_size(&conn).unwrap(), 0);
-        insert(&conn, 1, None, None, 1);
-        insert(&conn, 2, None, None, 2);
-        conn.execute("UPDATE items SET trashed_at = 5 WHERE id = 2", [])
-            .unwrap();
-        assert_eq!(total_size(&conn).unwrap(), 20);
     }
 
     #[test]
@@ -1075,6 +1257,244 @@ mod tests {
         assert_eq!(items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(items[0].hash, hex(&[3u8; 32]));
         assert!(summaries(&conn, &vec![1; MAX_SUMMARIES + 1]).is_err());
+    }
+
+    /// タイルの詳細（`summaries`・`detail`）は、事実を台帳の行の ID（`items.blob_id`）から、設定をアイテムの主キーから引く。
+    /// 200 件の IN でも items・media_facts・asset_settings のどれも全件走査しない（台帳 blobs は通らない）。
+    #[test]
+    fn summaries_join_facts_and_settings_without_scanning() {
+        let conn = test_conn();
+        for n in [1, MAX_SUMMARIES] {
+            let marks = vec!["1"; n].join(", ");
+            let sql = summaries_sql(n).replace(&vec!["?"; n].join(", "), &marks);
+            let plan = query_plan(&conn, &sql);
+            assert!(!plan.contains("SCAN"), "{n} 件:\n{plan}");
+            assert!(!plan.contains("blobs"), "{n} 件:\n{plan}");
+            for (table, how) in [("f", "INTEGER PRIMARY KEY"), ("s", "INTEGER PRIMARY KEY")] {
+                assert!(
+                    plan.contains(&format!("SEARCH {table} USING")) && plan.contains(how),
+                    "{table} を {how} で引く:\n{plan}"
+                );
+            }
+        }
+        let plan = query_plan(&conn, &detail_sql().replace("?1", "1"));
+        assert!(!plan.contains("SCAN"), "{plan}");
+    }
+
+    /// 解析の事実（解析の書き手 `analysis::store::write` で入れる）と設定（素材の欄の書き手 `asset::set_settings`）を
+    /// 引き、実効値は素材の欄（`asset::get`）と同じ規則（`asset::effective_pixel_art`）で決まる。設定 3 通り ×
+    /// 自動 4 通り（未解析・材料が足りない・いいえ・はい）のすべてで照らし、`detail` の概要も同じ値。
+    #[test]
+    fn summaries_follow_the_effective_values_of_the_asset_panel() {
+        use crate::analysis::facts::{FACTS_V, MediaFacts, PIXEL_RULE};
+        use crate::analysis::store::{ItemWrite, Write, write};
+        use crate::asset::{
+            Change, GridSetting, SettingsPatch, TRISTATE, effective_pixel_art, set_settings,
+        };
+
+        let conn = test_conn();
+        let put = |id: i64, kind: &str, ext: &str, size: Option<(i64, i64)>| {
+            conn.execute(
+                "INSERT INTO items (id, hash, ext, kind, size_bytes, width, height, title, original_name,
+                                    imported_at, updated_at, analysis_state)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, 't', 't', 0, 0, 'pending')",
+                params![
+                    id,
+                    vec![u8::try_from(id).unwrap(); 32],
+                    ext,
+                    kind,
+                    size.map(|s| s.0),
+                    size.map(|s| s.1)
+                ],
+            )
+            .unwrap();
+        };
+        let facts = |id: i64, facts: MediaFacts| {
+            let ready = ItemWrite {
+                id,
+                hash: [u8::try_from(id).unwrap(); 32],
+                write: Write::Ready {
+                    results: Vec::new(),
+                    keep: None,
+                    facts: Box::new(MediaFacts {
+                        facts_v: FACTS_V,
+                        ..facts
+                    }),
+                    stamp: None,
+                },
+            };
+            assert_eq!(write(&conn, &[ready], 0).unwrap().written, 1);
+        };
+        let patch = |ids: &[i64], patch: SettingsPatch| {
+            let n = u32::try_from(ids.len()).unwrap();
+            assert_eq!(set_settings(&conn, ids, &patch, 0).unwrap(), n);
+        };
+
+        // ドット絵：設定 3 通り × 自動 4 通り（None は未解析、Some(None) は解析済みで材料が足りない）
+        let autos: [Option<Option<bool>>; 4] =
+            [None, Some(None), Some(Some(false)), Some(Some(true))];
+        let mut cases = Vec::new();
+        let mut id = 0_i64;
+        for setting in TRISTATE {
+            for auto in autos {
+                id += 1;
+                put(id, "image", "png", Some((64, 64)));
+                if let Some(auto) = auto {
+                    facts(
+                        id,
+                        MediaFacts {
+                            alpha: Some(1),
+                            pixel_art: auto,
+                            pixel_rule: Some(PIXEL_RULE),
+                            frame_count: Some(1),
+                            ..MediaFacts::default()
+                        },
+                    );
+                }
+                if let Some(value) = setting {
+                    patch(
+                        &[id],
+                        SettingsPatch {
+                            pixel_art: Some(Change::Set(value)),
+                            ..SettingsPatch::default()
+                        },
+                    );
+                }
+                cases.push((id, setting, auto));
+            }
+        }
+        let ids: Vec<i64> = cases.iter().map(|c| c.0).collect();
+        let rows = summaries(&conn, &ids).unwrap();
+        assert_eq!(rows.len(), cases.len());
+        for (row, (id, setting, auto)) in rows.iter().zip(&cases) {
+            let want = effective_pixel_art(*setting, auto.flatten());
+            assert_eq!(row.pixel_art, want, "{id}: 設定 {setting:?}・自動 {auto:?}");
+            assert_eq!(row.pixel_art_setting, *setting, "{id}");
+            let panel = crate::asset::get(&conn, *id).unwrap();
+            assert_eq!(row.pixel_art, panel.effective.pixel_art, "{id}");
+            assert_eq!(row.animated, panel.effective.animated, "{id}");
+            assert_eq!(row.frame_count, panel.effective.frame_count, "{id}");
+            let analyzed = auto.is_some();
+            assert_eq!(row.alpha, analyzed.then_some(Alpha::Binary), "{id}");
+            assert_eq!(
+                row.analysis_state,
+                if analyzed {
+                    AnalysisState::Ready
+                } else {
+                    AnalysisState::Pending
+                },
+                "{id}"
+            );
+            assert_eq!(&detail(&conn, *id).unwrap().summary, row, "{id}");
+        }
+
+        // アニメ：解析のコマの数、格子（帯で使う数）。半透明。サムネイルの作り直しの回数
+        put(40, "image", "gif", Some((32, 32)));
+        facts(
+            40,
+            MediaFacts {
+                alpha: Some(2),
+                frame_count: Some(8),
+                ..MediaFacts::default()
+            },
+        );
+        put(41, "image", "png", Some((64, 32)));
+        facts(
+            41,
+            MediaFacts {
+                alpha: Some(0),
+                frame_count: Some(1),
+                ..MediaFacts::default()
+            },
+        );
+        patch(
+            &[41],
+            SettingsPatch {
+                grid: Some(Change::Set(GridSetting {
+                    cell_w: 16,
+                    cell_h: 16,
+                    offset_x: 0,
+                    offset_y: 0,
+                    gap_x: 0,
+                    gap_y: 0,
+                    count: Some(5),
+                })),
+                ..SettingsPatch::default()
+            },
+        );
+        conn.execute(
+            "UPDATE items SET thumb_state = 'stale', thumb_rev = 3 WHERE id = 40",
+            [],
+        )
+        .unwrap();
+        // 音声：ループ点。動画：解析しない
+        put(42, "audio", "ogg", None);
+        facts(
+            42,
+            MediaFacts {
+                has_loop: Some(true),
+                loop_start: Some(10),
+                loop_end: Some(20),
+                ..MediaFacts::default()
+            },
+        );
+        put(43, "audio", "wav", None);
+        facts(
+            43,
+            MediaFacts {
+                has_loop: Some(false),
+                ..MediaFacts::default()
+            },
+        );
+        put(44, "video", "mp4", Some((16, 9)));
+        conn.execute(
+            "UPDATE items SET analysis_state = 'not_needed' WHERE id = 44",
+            [],
+        )
+        .unwrap();
+
+        let rows = summaries(&conn, &[40, 41, 42, 43, 44]).unwrap();
+        let [gif, sheet, looped, plain, video] = rows.as_slice() else {
+            panic!("5 件: {rows:?}");
+        };
+        assert_eq!(
+            (gif.alpha, gif.animated, gif.frame_count),
+            (Some(Alpha::Partial), true, Some(8))
+        );
+        assert_eq!((gif.thumb_state.as_str(), gif.thumb_rev), ("stale", 3));
+        assert_eq!(
+            (sheet.alpha, sheet.animated, sheet.frame_count),
+            (Some(Alpha::None), true, Some(5)),
+            "格子のコマの数"
+        );
+        assert_eq!(
+            (looped.has_loop, looped.alpha, looped.animated),
+            (true, None, false)
+        );
+        assert!(!plain.has_loop);
+        assert_eq!(
+            (
+                video.analysis_state,
+                video.alpha,
+                video.pixel_art,
+                video.has_loop
+            ),
+            (AnalysisState::NotNeeded, None, false, false)
+        );
+        for row in &rows {
+            let panel = crate::asset::get(&conn, row.id).unwrap();
+            assert_eq!(
+                (row.pixel_art, row.animated, row.frame_count),
+                (
+                    panel.effective.pixel_art,
+                    panel.effective.animated,
+                    panel.effective.frame_count
+                ),
+                "{}",
+                row.id
+            );
+            assert_eq!(&detail(&conn, row.id).unwrap().summary, row);
+        }
     }
 
     #[test]
@@ -1177,6 +1597,49 @@ mod tests {
         trash(&conn, &[2], 10 * DAY_MS).unwrap();
         assert_eq!(ids(&conn, ItemView::Folder { id: 1 }, false), vec![3, 1]);
         assert_eq!(ids(&conn, ItemView::Trash, false), vec![2]);
+    }
+
+    /// プロジェクトで今使っている素材（一致したファイルのアイテム。ゴミ箱は除く。M15 段 6）。
+    #[test]
+    fn project_view_lists_the_items_the_project_uses() {
+        let conn = library();
+        conn.execute_batch(
+            "INSERT INTO projects (id, name, root, engine, pos, created_at, updated_at) VALUES (1, 'g', '/g', 'godot', 1, 0, 0);
+             INSERT INTO project_files (project_id, path, size_bytes, mtime_ns, hash, item_id, matched, seen_at) VALUES
+               (1, 'a.png', 1, 0, x'01', 2, 'current', 0),
+               (1, 'b.png', 1, 0, x'02', 5, 'original', 0),
+               (1, 'c.png', 1, 0, x'03', 5, 'current', 0),
+               (1, 'd.png', 1, 0, x'04', NULL, NULL, 0);",
+        )
+        .unwrap();
+        assert_eq!(ids(&conn, ItemView::Project { id: 1 }, false), vec![5, 2]);
+        trash(&conn, &[2], 10 * DAY_MS).unwrap();
+        assert_eq!(ids(&conn, ItemView::Project { id: 1 }, false), vec![5]);
+        // 使っているファイルは主キー（project_id, path）の前の方で引く（project_files を走査しない）。scope が組む文そのものを見る
+        let sc = scope(&conn, ItemView::Project { id: 1 }, &ctx(0)).unwrap();
+        let plan = query_plan(
+            &conn,
+            &format!(
+                "SELECT i.id FROM items i WHERE {}",
+                sc.sql.replace('?', "1")
+            ),
+        );
+        assert!(!plan.contains("SCAN f"), "{plan}");
+        assert!(
+            plan.contains("SEARCH f USING PRIMARY KEY (project_id=?)"),
+            "{plan}"
+        );
+        assert!(matches!(
+            query_ids(
+                &conn,
+                &ItemQuery {
+                    view: ItemView::Project { id: 9 },
+                    ..ItemQuery::default()
+                },
+                &ctx(0)
+            ),
+            Err(CoreError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -1345,9 +1808,26 @@ mod tests {
         assert_eq!(restore(&conn, &[2], 7).unwrap(), 1);
         assert_eq!(detail(&conn, 1).unwrap().trashed_at, Some(5));
 
-        let removed = delete_trashed(&conn).unwrap();
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].hash, [1u8; 32]);
+        let plan = plan_empty_trash(&conn).unwrap();
+        assert_eq!(plan.items, vec![1]);
+        assert_eq!(plan.blobs, vec![([1u8; 32], "jpg".to_string())]);
+        // 決めたあとにゴミ箱から戻したものは消さない
+        trash(&conn, &[2], 8).unwrap();
+        restore(&conn, &[2], 9).unwrap();
+        let removed = delete_trashed(&conn, &[1, 2]).unwrap();
+        assert_eq!(removed.items.len(), 1);
+        assert_eq!(removed.items[0].hash, [1u8; 32]);
+        // 使われなくなった台帳の行も同じトランザクションで解放する
+        assert_eq!(removed.released.len(), 1);
+        assert_eq!(removed.released[0].hash, [1u8; 32]);
+        let ledger: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM blobs WHERE hash = ?1",
+                [&[1u8; 32][..]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledger, 0);
         assert!(matches!(detail(&conn, 1), Err(CoreError::NotFound(_))));
         // 所属（フォルダ・タグ・ユニット）も消え、ユニットには残りがいる
         let left: i64 = conn
@@ -1355,6 +1835,127 @@ mod tests {
             .unwrap();
         assert_eq!(left, 0);
         assert_eq!(crate::unit::members(&conn, unit).unwrap(), vec![2]);
+    }
+
+    /// 編集したアイテムでゴミ箱を空にすると、版が持つファイル（猶予中の版）とアンカーの台帳の行も解放し（決定 6）、版の文書の
+    /// 部品も片付ける。ほかのアイテムの版が持つ同じ中身（別名で保存した B の版 0 が持つ A の元）と、B の版の文書は残し、参照
+    /// されない台帳の行は 0。予告する中身は、消しうるもの（A の今・版のファイル・アンカー）すべて。
+    #[test]
+    fn emptying_the_trash_releases_versions_and_anchors_of_edited_items() {
+        use crate::edit::testing::{insert_anchor, insert_item, insert_version};
+        let conn = test_conn();
+        let (a, b) = (
+            insert_item(&conn, 1, [1; 32]),
+            insert_item(&conn, 2, [2; 32]),
+        );
+        let mine = insert_anchor(&conn, [10; 32], [20; 32]);
+        let theirs = insert_anchor(&conn, [10; 32], [21; 32]);
+        // A：元 [10]・猶予中の版 1 [11]・今の版 2 [1]（版 1 と 2 の入力がアンカーを使う）
+        insert_version(&conn, a, 0, [10; 32], "hold", None);
+        insert_version(&conn, a, 1, [11; 32], "waiting", Some(mine));
+        insert_version(&conn, a, 2, [1; 32], "hold", Some(mine));
+        // B：A から別名で保存（版 0 は A の元 [10]、版 1 は今 [2]、別のアンカー）
+        insert_version(&conn, b, 0, [10; 32], "hold", None);
+        insert_version(&conn, b, 1, [2; 32], "hold", Some(theirs));
+        trash(&conn, &[a], 5).unwrap();
+        let plan = plan_empty_trash(&conn).unwrap();
+        assert_eq!(plan.items, vec![a]);
+        let mut planned: Vec<[u8; 32]> = plan.blobs.iter().map(|(h, _)| *h).collect();
+        planned.sort_unstable();
+        assert_eq!(planned, vec![[1; 32], [10; 32], [11; 32], [20; 32]]);
+        let docs_before: i64 = conn
+            .query_row("SELECT count(*) FROM edit_objects", [], |r| r.get(0))
+            .unwrap();
+        let removed = delete_trashed(&conn, &plan.items).unwrap();
+        assert_eq!(removed.items.len(), 1);
+        // A の版 1・2 の文書は空の文書で、B の版 1 の文書と同じ部品なので残る
+        assert_eq!(removed.parts, 0);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM edit_objects", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            docs_before
+        );
+        let released: Vec<[u8; 32]> = removed.released.iter().map(|r| r.hash).collect();
+        assert_eq!(released, vec![[1; 32], [11; 32], [20; 32]]);
+        assert_eq!(
+            removed
+                .released
+                .iter()
+                .map(|r| r.ext.as_str())
+                .collect::<Vec<_>>(),
+            ["png", "png", "wav"]
+        );
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            count("SELECT count(*) FROM item_versions WHERE item_id = 1"),
+            0
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM item_versions WHERE item_id = 2"),
+            2
+        );
+        assert_eq!(count("SELECT count(*) FROM edit_anchors"), 1);
+        assert_eq!(crate::library::ledger::unreferenced(&conn).unwrap(), 0);
+        // 残った台帳の行：B の今 [2]・A の元 [10]（B の版 0 が持つ）・B のアンカー [21]
+        let mut left: Vec<Vec<u8>> = {
+            let mut stmt = conn.prepare("SELECT hash FROM blobs").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        left.sort();
+        assert_eq!(left, vec![vec![2; 32], vec![10; 32], vec![21; 32]]);
+        assert!(crate::db::violations(&conn).unwrap().is_empty());
+        assert!(
+            crate::edit::versions::check_invariants(&conn)
+                .unwrap()
+                .is_empty()
+        );
+        // 消すアイテムを決める問い合わせは、ゴミ箱の部分索引の順に読む（items を走査しない）
+        let plan = query_plan(
+            &conn,
+            "SELECT id FROM items WHERE trashed_at IS NOT NULL ORDER BY trashed_at, id",
+        );
+        assert!(plan.contains("idx_items_trashed"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        // 予告する中身を集める問い合わせは、ゴミ箱の部分索引からたどる（items・版を走査しない）
+        let plan = query_plan(
+            &conn,
+            "SELECT b.hash, b.ext FROM items i CROSS JOIN blobs b ON b.hash = i.hash
+              WHERE i.trashed_at IS NOT NULL
+             UNION
+             SELECT b.hash, b.ext FROM items i
+               CROSS JOIN item_versions v ON v.item_id = i.id
+               JOIN blobs b ON b.id = v.file_blob_id
+              WHERE i.trashed_at IS NOT NULL
+             UNION
+             SELECT b.hash, b.ext FROM items i
+               CROSS JOIN item_versions v ON v.item_id = i.id
+               CROSS JOIN item_version_inputs n ON n.version_id = v.id
+               JOIN edit_anchors a ON a.id = n.anchor_id
+               JOIN blobs b ON b.id = a.blob_id
+              WHERE i.trashed_at IS NOT NULL",
+        );
+        assert!(plan.contains("idx_items_trashed"), "{plan}");
+        assert!(
+            !plan.contains("SCAN i") && !plan.contains("SCAN v") && !plan.contains("SCAN b"),
+            "{plan}"
+        );
+        // アイテムごとの問い合わせは主キー・版の一意の索引・下書きの主キーで引く
+        for sql in [
+            "SELECT hash, ext, size_bytes FROM items WHERE id = 1 AND trashed_at IS NOT NULL",
+            "SELECT b.hash FROM item_versions v JOIN blobs b ON b.id = v.file_blob_id WHERE v.item_id = 1",
+            "SELECT n.anchor_id FROM item_versions v CROSS JOIN item_version_inputs n ON n.version_id = v.id
+              WHERE v.item_id = 1 AND n.anchor_id IS NOT NULL",
+            "SELECT doc_id FROM item_versions WHERE item_id = 1 AND doc_id IS NOT NULL
+             UNION SELECT doc_id FROM edit_drafts WHERE item_id = 1",
+        ] {
+            let plan = query_plan(&conn, sql);
+            assert!(!plan.contains("SCAN"), "{sql}\n{plan}");
+        }
     }
 
     #[test]
@@ -1500,6 +2101,7 @@ mod tests {
         let conn = library();
         conn.execute_batch(
             "UPDATE items SET title = 'p' || ((7 - id) * 5) WHERE id <= 6;
+             UPDATE blobs SET size_bytes = (SELECT i.id * 10 FROM items i WHERE i.hash = blobs.hash);
              UPDATE items SET rating = id % 3, size_bytes = id * 10;
              UPDATE items SET duration_ms = 100 * id WHERE id IN (2, 4);
              UPDATE items SET captured_at = imported_at WHERE id IN (1, 3);",
@@ -1592,5 +2194,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!((counts.image, counts.video, counts.audio), (1, 0, 1));
+    }
+
+    /// フォント・3D を音楽に数えない（`_ =>` の枝で音楽に落ちていた退行を防ぐ）。
+    #[test]
+    fn kind_counts_include_font_and_model() {
+        let conn = library();
+        conn.execute("UPDATE items SET kind = 'font' WHERE id IN (2, 3)", [])
+            .unwrap();
+        conn.execute("UPDATE items SET kind = 'model' WHERE id = 6", [])
+            .unwrap();
+        let query = ItemQuery::default();
+        let counts = count_kinds(&conn, &query, &ctx(0)).unwrap();
+        let c = counts;
+        assert_eq!(
+            (c.image, c.video, c.audio, c.font, c.model),
+            (3, 0, 0, 2, 1)
+        );
+        assert_eq!(counts.total(), 6);
+        let unit = crate::unit::create_set(&conn, "u", &[2, 6, 1], 0).unwrap();
+        let counts = count_kinds(
+            &conn,
+            &ItemQuery {
+                view: ItemView::Unit { id: unit },
+                ..ItemQuery::default()
+            },
+            &ctx(0),
+        )
+        .unwrap();
+        let c = counts;
+        assert_eq!(
+            (c.image, c.video, c.audio, c.font, c.model),
+            (1, 0, 0, 1, 1)
+        );
+        // 検索の語で種類を選べる
+        let only = |text: &str| {
+            count_kinds(
+                &conn,
+                &ItemQuery {
+                    filter: Some(crate::query::parse(text).unwrap().expr),
+                    ..ItemQuery::default()
+                },
+                &ctx(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(only("種類:フォント").total(), 2);
+        assert_eq!(only("種類:3D").model, 1);
+        assert_eq!(only("-種類:フォント,3D").total(), 3);
     }
 }

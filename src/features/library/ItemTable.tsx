@@ -1,14 +1,13 @@
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
-import { ImageIcon } from '../../components/icons/ImageIcon';
-import { MusicIcon } from '../../components/icons/MusicIcon';
+import { KindIcon } from '../../components/icons/KindIcon';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { StarIcon } from '../../components/icons/StarIcon';
 import { UnitIcon } from '../../components/icons/UnitIcon';
-import { VideoIcon } from '../../components/icons/VideoIcon';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry, type ItemSummaryDto, type SortKey, unitIdOf } from '../../ipc/items';
-import { thumbUrl } from '../../ipc/media';
+import { hasDuration, kindLabel } from '../../ipc/kinds';
 import type { UnitSummaryDto } from '../../ipc/units';
 import { relativeDateTime } from '../../lib/dates';
 import { formatBytes, formatCount, formatDuration } from '../../lib/format';
@@ -31,6 +30,8 @@ import { useEntryHandlers } from './useEntryHandlers';
 
 /** 行の高さ（`--h-sidebar-row` と同じ）。 */
 const ROW_HEIGHT = 32;
+/** 行のサムネイルの大きさ（`.thumbCell` の `--space-6`。市松模様は敷かない大きさ）。 */
+const THUMB_BOX = { w: 24, h: 24 };
 
 /** 列（種類は並び順にない）。 */
 const COLUMNS: { key: SortKey | 'kind'; className: string }[] = [
@@ -226,14 +227,10 @@ const TableRow = memo(function TableRow({
   const t = ja.table;
   const kind = item?.kind;
   const name = unit ? unit.name : (item?.title ?? '');
-  const kindLabel = unit
-    ? t.unitKind(formatCount(unit.count))
-    : kind
-      ? (ja.kinds[kind as keyof typeof ja.kinds] ?? '')
-      : '';
+  const kindText = unit ? t.unitKind(formatCount(unit.count)) : kindLabel(kind);
   const durationMs = unit ? unit.durationMs : (item?.durationMs ?? null);
   const duration =
-    durationMs !== null && durationMs > 0 && (unit || kind !== 'image')
+    durationMs !== null && durationMs > 0 && (unit || hasDuration(kind))
       ? formatDuration(durationMs)
       : '';
   const rating = unit ? unit.rating : (item?.rating ?? 0);
@@ -241,9 +238,18 @@ const TableRow = memo(function TableRow({
   const thumb = unit ? unit.cover : item;
   const label = item
     ? spokenLabel(item)
-    : [name, kindLabel, duration, rating > 0 ? ja.inspector.rating(Math.round(rating)) : '']
+    : [name, kindText, duration, rating > 0 ? ja.inspector.rating(Math.round(rating)) : '']
         .filter(Boolean)
         .join('、');
+  const kindIcon = (
+    <span className={styles.kindIcon}>
+      {unit ? (
+        <UnitIcon size={14} strokeWidth={1.9} />
+      ) : (
+        <KindIcon kind={kind} size={14} strokeWidth={1.9} />
+      )}
+    </span>
+  );
   return (
     <button
       type="button"
@@ -262,25 +268,24 @@ const TableRow = memo(function TableRow({
       onPointerDown={(e) => handlers.onPointerDown(id, e)}
     >
       <span className={styles.thumbCell}>
-        {thumb?.thumbState === 'ready' ? (
-          <img
+        {thumb ? (
+          <MediaImage
+            source={thumb}
+            size="s"
+            fit="cover"
+            box={THUMB_BOX}
             className={styles.thumb}
-            src={thumbUrl(thumb.hash, 's')}
-            alt=""
-            decoding="async"
-            draggable={false}
+            fallback={kindIcon}
           />
         ) : (
-          <span className={styles.kindIcon}>
-            <KindIcon kind={unit ? 'unit' : kind} />
-          </span>
+          kindIcon
         )}
       </span>
       <span className={`${styles.cell} ${styles.name}`}>
         {name}
         {unit && <UnitIcon size={12} strokeWidth={2} />}
       </span>
-      <span className={`${styles.cell} ${styles.kind}`}>{kindLabel}</span>
+      <span className={`${styles.cell} ${styles.kind}`}>{kindText}</span>
       <span className={`${styles.cell} ${styles.duration}`}>{duration}</span>
       <span className={`${styles.cell} ${styles.rating}`}>
         {[1, 2, 3, 4, 5].map((n) => (
@@ -296,16 +301,3 @@ const TableRow = memo(function TableRow({
     </button>
   );
 });
-
-function KindIcon({ kind }: { kind: string | undefined }) {
-  if (kind === 'unit') {
-    return <UnitIcon size={14} strokeWidth={1.9} />;
-  }
-  if (kind === 'video') {
-    return <VideoIcon size={14} strokeWidth={1.9} />;
-  }
-  if (kind === 'audio') {
-    return <MusicIcon size={14} strokeWidth={1.9} />;
-  }
-  return <ImageIcon size={14} strokeWidth={1.9} />;
-}

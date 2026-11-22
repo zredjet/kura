@@ -11,3 +11,5 @@ src-tauri/icons/
 src/ipc/bindings.ts
 # docs/design/tokens.css のそのままのコピー（テストで一致を確認する）
 src/styles/tokens.css
+# 第三者のクレートの写し（手を入れない。third_party/*/KURA.md）
+third_party/

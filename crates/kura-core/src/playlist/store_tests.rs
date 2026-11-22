@@ -8,6 +8,7 @@ use super::play::{PlayRequest, playlist_queue};
 use super::smart::{RuleMatch, SmartRule};
 use super::store::{self, NewEntry, NewPlaylist, PlayState, PlaylistPatch};
 use crate::db::test_conn;
+use crate::import::MediaKind;
 use crate::items::{ItemSort, SortKey};
 use crate::query::QueryContext;
 
@@ -602,4 +603,403 @@ fn smart_units_resolve_quoted_tag_names() {
     .unwrap();
     playlist_queue(&conn, pl, &PlayRequest::default(), &ctx()).unwrap();
     assert_eq!(targets(&conn, pl), vec![EntryTarget::Unit(unit)]);
+}
+
+/// 手動のプレイリストの中身の集計：フォント・3D を音楽に数えず、長さにも足さない。一覧と件数には出す
+/// （入れられるが再生しないだけ。M11 の決定 11）。
+#[test]
+fn kind_counts_include_font_and_model() {
+    let conn = test_conn();
+    let image = item(&conn, "a", "image", 0);
+    let font = item(&conn, "b", "font", 0);
+    let model = item(&conn, "c", "model", 0);
+    let audio = item(&conn, "d", "audio", 0);
+    let loose_font = item(&conn, "e", "font", 0);
+    let unit = set_unit(&conn, "素材", &[image, font, model, audio]);
+    let pl = playlist(&conn, PlaylistKind::Manual, Granularity::Unit);
+    store::add_entries(
+        &conn,
+        pl,
+        &[
+            NewEntry::from(EntryTarget::Unit(unit)),
+            NewEntry::from(EntryTarget::Item(loose_font)),
+        ],
+        None,
+        1,
+    )
+    .unwrap();
+    let rows = store::contents(&conn, pl).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].items, vec![image, font, model, audio]);
+    // 画像 8 秒 + 音楽 60 秒。フォント・3D は足さない
+    assert_eq!(rows[0].duration_ms, 68_000);
+    let k = rows[0].kind_counts;
+    assert_eq!(
+        (k.image, k.video, k.audio, k.font, k.model),
+        (1, 0, 1, 1, 1)
+    );
+    assert_eq!(
+        rows[0].kinds,
+        vec![
+            MediaKind::Image,
+            MediaKind::Audio,
+            MediaKind::Font,
+            MediaKind::Model
+        ]
+    );
+    assert_eq!(rows[1].kinds, vec![MediaKind::Font]);
+    assert_eq!(rows[1].items, vec![loose_font]);
+    assert_eq!(rows[1].duration_ms, 0);
+    assert_eq!(store::item_count(&conn, pl).unwrap(), 5);
+}
+
+/// スマートの候補にフォント・3D を入れない（M11 の決定 11）。件数の上限をフォントが食わず、ユニット単位の
+/// `種類=画像` はフォント・3D のメンバーを数えずに判定し、フォント・3D だけのユニットは候補にならない。
+#[test]
+fn smart_candidates_skip_unplayable_kinds() {
+    let conn = test_conn();
+    // 名前順ではフォントが先に来る
+    let fonts: Vec<i64> = (0..10)
+        .map(|i| item(&conn, &format!("a{i}"), "font", 5))
+        .collect();
+    let model = item(&conn, "b", "model", 5);
+    let images: Vec<i64> = (1..=3)
+        .map(|i| item(&conn, &format!("p{i}"), "image", 0))
+        .collect();
+    let set = |conn: &Connection, pl: i64, clauses: &[&str]| {
+        store::update(
+            conn,
+            pl,
+            &PlaylistPatch {
+                shuffle: Some(false),
+                rule: Some(SmartRule {
+                    match_mode: RuleMatch::All,
+                    clauses: clauses.iter().map(|c| c.to_string()).collect(),
+                }),
+                sort: Some(ItemSort {
+                    key: SortKey::Name,
+                    desc: false,
+                }),
+                limit: Some(Some((LimitKind::Count, 3))),
+                include_loose_items: Some(false),
+                ..PlaylistPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        playlist_queue(conn, pl, &PlayRequest::default(), &ctx()).unwrap();
+        targets(conn, pl)
+    };
+    let as_items = |ids: &[i64]| {
+        ids.iter()
+            .map(|i| EntryTarget::Item(*i))
+            .collect::<Vec<_>>()
+    };
+    let files = playlist(&conn, PlaylistKind::Smart, Granularity::File);
+    assert_eq!(set(&conn, files, &[]), as_items(&images));
+    assert_eq!(set(&conn, files, &["評価>=0"]), as_items(&images));
+    // 種類で選んでも、フォント・3D は候補にならない
+    assert_eq!(set(&conn, files, &["種類:フォント"]), vec![]);
+    assert_eq!(set(&conn, files, &["種類:3D"]), vec![]);
+
+    set_unit(&conn, "フォント集", &fonts[..3]);
+    let mixed = set_unit(&conn, "素材", &[images[0], fonts[3], model, images[1]]);
+    let units = playlist(&conn, PlaylistKind::Smart, Granularity::Unit);
+    // フォントだけのユニットは候補にならない
+    assert_eq!(set(&conn, units, &[]), vec![EntryTarget::Unit(mixed)]);
+    // `種類=画像`（メンバーが画像だけ）はフォント・3D を数えない
+    assert_eq!(
+        set(&conn, units, &["種類=画像"]),
+        vec![EntryTarget::Unit(mixed)]
+    );
+    assert_eq!(set(&conn, units, &["種類:フォント"]), vec![]);
+}
+
+/// 一覧の「ここから再生」（T16・T17 の続き）：エントリの行は先頭のメンバー（`coverItemId`。フォント・3D でもある）を渡すので、
+/// 渡したアイテムがキューにない種類なら、そのアイテムを含むエントリの最初のスロットから始める（プレイリストの先頭からに
+/// しない）。エントリが丸ごとキューにない（フォント・3D だけ）なら、その後ろで最初にキューにあるエントリから。ファイル単位・
+/// ユニット単位、スマートの「今回の並び」でも同じ（Q1）。
+#[test]
+fn playing_from_a_row_whose_item_never_reaches_the_queue_starts_at_its_entry() {
+    let conn = test_conn();
+    let a = item(&conn, "a", "image", 0);
+    let f = item(&conn, "f", "font", 0);
+    let b = item(&conn, "b", "audio", 0);
+    let g = item(&conn, "g", "model", 0);
+    let c = item(&conn, "c", "video", 0);
+    let ux = set_unit(&conn, "X", &[a]);
+    let uy = set_unit(&conn, "Y", &[f, b]);
+    let uz = set_unit(&conn, "Z", &[g]);
+    let uw = set_unit(&conn, "W", &[c]);
+    let from = |pl: i64, item: i64| {
+        let q = playlist_queue(
+            &conn,
+            pl,
+            &PlayRequest {
+                from_item: Some(item),
+                ..PlayRequest::default()
+            },
+            &ctx(),
+        )
+        .unwrap();
+        q.slots[q.start_index].item_id
+    };
+    for granularity in [Granularity::Unit, Granularity::File] {
+        let pl = playlist(&conn, PlaylistKind::Manual, granularity);
+        store::add_entries(
+            &conn,
+            pl,
+            &[ux, uy, uz, uw].map(|u| NewEntry::from(EntryTarget::Unit(u))),
+            None,
+            1,
+        )
+        .unwrap();
+        // 行の先頭のメンバー（dto の coverItemId）はフォント
+        let rows = store::contents(&conn, pl).unwrap();
+        assert_eq!(rows[1].items.first().copied(), Some(f));
+        assert_eq!(from(pl, f), b, "{granularity:?}：ユニット Y から");
+        assert_eq!(
+            from(pl, g),
+            c,
+            "{granularity:?}：3D だけの Z は後ろの W から"
+        );
+        assert_eq!(from(pl, b), b, "{granularity:?}");
+    }
+    // スマート（ユニット単位、条件なし、シャッフルなし）の今回の並びの行でも
+    let smart = playlist(&conn, PlaylistKind::Smart, Granularity::Unit);
+    store::update(
+        &conn,
+        smart,
+        &PlaylistPatch {
+            shuffle: Some(false),
+            include_loose_items: Some(false),
+            ..PlaylistPatch::default()
+        },
+        1,
+    )
+    .unwrap();
+    playlist_queue(&conn, smart, &PlayRequest::default(), &ctx()).unwrap();
+    assert_eq!(from(smart, f), b);
+}
+
+/// M11 の確かめ R4（決定 19）：ファイル単位の一覧ではユニットのメンバーが 1 行ずつ並ぶので、途中のフォント・3D の行から
+/// 「ここから再生」すると、押した行より後ろで最初に再生できるメンバーから始める（ユニットの中になければ後ろのエントリへ）。
+/// ユニット単位の一覧にも ▸ で開いた中身のメンバーが 1 行ずつ並ぶので、先頭でないメンバーの行は同じく後ろから（2 回目の
+/// 確認 P1）。行のエントリを渡さない依頼（`from_entry` なし）は、アイテムを含む最初のエントリの行とみなす。
+#[test]
+fn playing_from_a_font_row_in_the_middle_of_a_unit_starts_after_it_by_file() {
+    let conn = test_conn();
+    let a = item(&conn, "a", "image", 0);
+    let b = item(&conn, "b", "audio", 0);
+    let f = item(&conn, "f", "font", 0);
+    let c = item(&conn, "c", "video", 0);
+    let d = item(&conn, "d", "audio", 0);
+    let g = item(&conn, "g", "model", 0);
+    let e = item(&conn, "e", "image", 0);
+    let ux = set_unit(&conn, "X", &[a]);
+    let uy = set_unit(&conn, "Y", &[b, f, c]);
+    let uz = set_unit(&conn, "Z", &[d, g]);
+    let uw = set_unit(&conn, "W", &[e]);
+    let from = |pl: i64, item: i64| {
+        let q = playlist_queue(
+            &conn,
+            pl,
+            &PlayRequest {
+                from_item: Some(item),
+                ..PlayRequest::default()
+            },
+            &ctx(),
+        )
+        .unwrap();
+        q.slots[q.start_index].item_id
+    };
+    let make = |granularity: Granularity, shuffle: bool| {
+        let pl = playlist(&conn, PlaylistKind::Manual, granularity);
+        store::add_entries(
+            &conn,
+            pl,
+            &[ux, uy, uz, uw].map(|u| NewEntry::from(EntryTarget::Unit(u))),
+            None,
+            1,
+        )
+        .unwrap();
+        store::update(
+            &conn,
+            pl,
+            &PlaylistPatch {
+                shuffle: Some(shuffle),
+                ..PlaylistPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        // 一覧の行の並び（メンバーの順）
+        let rows = store::contents(&conn, pl).unwrap();
+        assert_eq!(rows[1].items, vec![b, f, c]);
+        assert_eq!(rows[2].items, vec![d, g]);
+        pl
+    };
+    for shuffle in [false, true] {
+        let file = make(Granularity::File, shuffle);
+        assert_eq!(
+            from(file, f),
+            c,
+            "ファイル単位（シャッフル {shuffle}）：f の行の次の c から"
+        );
+        assert_eq!(
+            from(file, g),
+            e,
+            "ファイル単位（シャッフル {shuffle}）：ユニットの最後の 3D の行は後ろのエントリの e から"
+        );
+        assert_eq!(from(file, c), c, "再生できる行はその行から");
+        let unit = make(Granularity::Unit, shuffle);
+        // ユニット単位でも、先頭でないメンバーは ▸ で開いた中身の行なので、押した行より後ろから（2 回目の確認 P1。
+        // R4 の直しはユニット単位を「そのエントリの最初から」のまま残していた）
+        assert_eq!(
+            from(unit, f),
+            c,
+            "ユニット単位（シャッフル {shuffle}）：開いた Y の f の行の次の c から"
+        );
+        assert_eq!(
+            from(unit, g),
+            e,
+            "ユニット単位（シャッフル {shuffle}）：開いた Z の最後の 3D の行は後ろのエントリ W の最初から"
+        );
+        assert_eq!(
+            from(unit, b),
+            b,
+            "ユニット単位：Y の行（先頭のメンバー）は Y の最初から"
+        );
+    }
+}
+
+/// M11 の 2 回目の確認 P1・P2（決定 19「後ろで最初に再生できる行から」）：一覧の「ここから再生」は押した行のエントリも渡す
+/// （`from_entry`）。ユニット単位で ▸ で開いた中身の途中のフォント・3D の行は、ファイル単位と同じく、そのエントリの中で
+/// 押した行より後ろで最初に再生できるメンバーから（なければ後ろのエントリの最初から。ユニットの先頭に戻らない。P1）。
+/// エントリの行と、開いた中身の先頭のメンバーの行は、今までどおりそのエントリの最初から。同じアイテムが 2 つのエントリに
+/// あっても、押した行のエントリで探す（前のエントリの行として扱わない。再生できるアイテムも、そのエントリのスロットから。P2）。
+#[test]
+fn playing_from_a_row_starts_within_its_entry() {
+    let conn = test_conn();
+    let a = item(&conn, "a", "image", 0);
+    let b = item(&conn, "b", "audio", 0);
+    let f = item(&conn, "f", "font", 0);
+    let c = item(&conn, "c", "video", 0);
+    let d = item(&conn, "d", "audio", 0);
+    let g = item(&conn, "g", "model", 0);
+    let e = item(&conn, "e", "image", 0);
+    let h = item(&conn, "h", "font", 0);
+    // 始めるスロットの（アイテム, エントリ）
+    let from = |pl: i64, entry: i64, item: i64| {
+        let q = playlist_queue(
+            &conn,
+            pl,
+            &PlayRequest {
+                from_item: Some(item),
+                from_entry: Some(entry),
+                ..PlayRequest::default()
+            },
+            &ctx(),
+        )
+        .unwrap();
+        let s = &q.slots[q.start_index];
+        (s.item_id, s.entry_id.unwrap_or(0))
+    };
+    let make = |granularity: Granularity, shuffle: bool, units: &[i64]| {
+        let pl = playlist(&conn, PlaylistKind::Manual, granularity);
+        let entries: Vec<NewEntry> = units
+            .iter()
+            .map(|u| NewEntry::from(EntryTarget::Unit(*u)))
+            .collect();
+        store::add_entries(&conn, pl, &entries, None, 1).unwrap();
+        store::update(
+            &conn,
+            pl,
+            &PlaylistPatch {
+                shuffle: Some(shuffle),
+                ..PlaylistPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        let ids: Vec<i64> = store::contents(&conn, pl)
+            .unwrap()
+            .iter()
+            .map(|r| r.entry.id)
+            .collect();
+        (pl, ids)
+    };
+
+    // P1：ユニット単位で開いた中身の行。X(a)・Y(b, f, c)・Z(d, g)・V(h, e)
+    let ux = set_unit(&conn, "X", &[a]);
+    let uy = set_unit(&conn, "Y", &[b, f, c]);
+    let uz = set_unit(&conn, "Z", &[d, g]);
+    let uv = set_unit(&conn, "V", &[h, e]);
+    for shuffle in [false, true] {
+        let (pl, ids) = make(Granularity::Unit, shuffle, &[ux, uy, uz, uv]);
+        let (y, z, v) = (ids[1], ids[2], ids[3]);
+        assert_eq!(
+            from(pl, y, f),
+            (c, y),
+            "シャッフル {shuffle}：Y の中の f の行は、1 行上の b でなく後ろの c から"
+        );
+        assert_eq!(
+            from(pl, z, g),
+            (e, v),
+            "シャッフル {shuffle}：Z の最後の 3D の行は、後ろのエントリ V の最初から"
+        );
+        assert_eq!(from(pl, y, c), (c, y), "再生できる行はその行から");
+        assert_eq!(
+            from(pl, y, b),
+            (b, y),
+            "Y の行（先頭のメンバー）は Y の最初から"
+        );
+        assert_eq!(
+            from(pl, v, h),
+            (e, v),
+            "先頭のメンバーがフォントの V の行は V の最初から"
+        );
+    }
+
+    // P2：同じフォントが 2 つのエントリにある。X2(f, a)・Y2(b, f, c)。ファイル単位の一覧の行は
+    // 「X2 から・f・a・Y2 から・b・f・c」、ユニット単位で両方を開くと「X2・f・a・Y2・b・f・c」
+    let ux2 = set_unit(&conn, "X2", &[f, a]);
+    let uy2 = set_unit(&conn, "Y2", &[b, f, c]);
+    for granularity in [Granularity::File, Granularity::Unit] {
+        for shuffle in [false, true] {
+            let (pl, ids) = make(granularity, shuffle, &[ux2, uy2]);
+            let (x2, y2) = (ids[0], ids[1]);
+            assert_eq!(
+                from(pl, y2, f),
+                (c, y2),
+                "{granularity:?}・シャッフル {shuffle}：Y2 の f の行は、前の X2 の a でなく c から"
+            );
+            assert_eq!(
+                from(pl, x2, f),
+                (a, x2),
+                "{granularity:?}・シャッフル {shuffle}：X2 の f の行は a から"
+            );
+        }
+    }
+
+    // P2 の続き：再生できるアイテムが 2 つのエントリにあっても、押した行のエントリのスロットから。X3(b, a)・Y3(c, b)
+    let ux3 = set_unit(&conn, "X3", &[b, a]);
+    let uy3 = set_unit(&conn, "Y3", &[c, b]);
+    for shuffle in [false, true] {
+        let (pl, ids) = make(Granularity::File, shuffle, &[ux3, uy3]);
+        // 既定の「重複を除く」では、後ろの Y3 の b はキューにない（b は X3 の位置で 1 度だけ流れる）ので、b のスロットから
+        assert_eq!(from(pl, ids[1], b), (b, ids[0]), "シャッフル {shuffle}");
+        store::update(
+            &conn,
+            pl,
+            &PlaylistPatch {
+                dedup_items: Some(false),
+                ..PlaylistPatch::default()
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(from(pl, ids[1], b), (b, ids[1]), "シャッフル {shuffle}");
+        assert_eq!(from(pl, ids[0], b), (b, ids[0]), "シャッフル {shuffle}");
+    }
 }

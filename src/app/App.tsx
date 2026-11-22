@@ -9,7 +9,11 @@ import { DownloadsView } from '../features/downloads/DownloadsView';
 import { useDownloadsShortcut } from '../features/downloads/useDownloadsShortcut';
 import { DropOverlay } from '../features/import/DropOverlay';
 import { ImportSheet } from '../features/import/ImportSheet';
+import { Editor } from '../features/editor/Editor';
+import { watchWindowClose } from '../features/editor/editorSave';
+import { closeEditor } from '../features/editor/editorStore';
 import { DragGhost } from '../features/library/DragGhost';
+import { useDragOutEvents } from '../features/library/dragOut';
 import { useFileDrop, useImportShortcut } from '../features/import/useFileDrop';
 import { LibraryView } from '../features/library/LibraryView';
 import { PlaylistView } from '../features/playlists/PlaylistView';
@@ -18,12 +22,31 @@ import { SearchPalette } from '../features/search/SearchPalette';
 import { SettingsSheet } from '../features/settings/SettingsSheet';
 import { TagDialog } from '../features/tags/TagDialog';
 import { TagsView } from '../features/tags/TagsView';
+import { ApplySheet } from '../features/recipes/ApplySheet';
+import { BatchResultSheet } from '../features/recipes/BatchResultSheet';
+import { closeApply } from '../features/recipes/applyStore';
+import { useBatchJobsStore } from '../features/recipes/batchJobsStore';
+import { closeMerge } from '../features/recipes/mergeStore';
+import { useRecipeStore } from '../features/recipes/recipeStore';
+import { CreditsSheet } from '../features/credits/CreditsSheet';
+import { closeCreditsSheet } from '../features/credits/creditsSheetStore';
+import { ExportSheet } from '../features/export/ExportSheet';
+import { closeExportSheet } from '../features/export/exportSheetStore';
+import { PresetSheet } from '../features/projects/PresetSheet';
+import { closePresetSheet } from '../features/projects/presetSheetStore';
+import { useProjectStore } from '../features/projects/projectStore';
+import { useLicenseStore } from '../features/credits/licenseStore';
+import { bumpRevision } from '../stores/revisionStore';
+import { closeResult } from '../features/recipes/resultStore';
+import { MergeSheet } from '../features/recipes/MergeSheet';
+import { RecipeView } from '../features/recipes/RecipeView';
+import { LibraryUpgrade } from '../features/welcome/LibraryUpgrade';
 import { Welcome } from '../features/welcome/Welcome';
 import { closePlayer, loadPlayerPrefs, watchFullscreen } from '../features/player/playerActions';
 import { reportPlaybackSupport } from '../features/player/support';
 import { Theater } from '../features/player/Theater';
 import { useDownloadsStore } from '../stores/downloadsStore';
-import { startJobEvents, useJobsStore } from '../stores/jobsStore';
+import { onAnyJob, startJobEvents, useJobsStore } from '../stores/jobsStore';
 import { useLibraryStore } from '../stores/libraryStore';
 import { useViewStore } from '../stores/viewStore';
 import { AppShell } from './AppShell';
@@ -37,8 +60,12 @@ export function App() {
   }, []);
 
   useEffect(() => (isTauri() ? startJobEvents() : undefined), []);
+  // 一括のジョブ（M14）はグリッドの下のカプセルに出す
+  useEffect(() => onAnyJob((event) => useBatchJobsStore.getState().apply(event)), []);
   useEffect(() => (isTauri() ? startLoginShotEvents() : undefined), []);
   useEffect(() => (isTauri() ? watchFullscreen() : undefined), []);
+  // 画像エディタに保存していない変更がある間は、窓を閉じる操作を止めてシートを出す
+  useEffect(() => (isTauri() ? watchWindowClose() : undefined), []);
 
   // 再生できる形式の表を Rust に渡す（プロキシの要否の判定に使う。docs/architecture.md §8）
   useEffect(() => {
@@ -49,18 +76,25 @@ export function App() {
     }
   }, []);
 
-  if (status === 'loading') {
-    return <div className={styles.loading} data-tauri-drag-region />;
-  }
-  if (status === 'none') {
-    return <Welcome />;
-  }
-  return <LibraryScreen />;
+  return (
+    <>
+      {status === 'loading' ? (
+        <div className={styles.loading} data-tauri-drag-region />
+      ) : status === 'none' ? (
+        <Welcome />
+      ) : (
+        <LibraryScreen />
+      )}
+      {/* 開くときに DB を新しい版にするのが 300ms を超えたら、どの画面の上にも出す */}
+      <LibraryUpgrade />
+    </>
+  );
 }
 
 /** ライブラリを開いているときの画面。 */
 function LibraryScreen() {
   useFileDrop();
+  useDragOutEvents();
   useImportShortcut();
   useDownloadsShortcut();
   useEffect(() => {
@@ -71,10 +105,54 @@ function LibraryScreen() {
   const playlist = useViewStore((s) => s.playlist);
   const downloads = useViewStore((s) => s.downloads);
   const tags = useViewStore((s) => s.tags);
+  const recipe = useViewStore((s) => s.recipe);
   const sidebarVisible = useViewStore((s) => s.sidebar);
-  // ライブラリを替えたら再生をやめる
+  // ライブラリを替えたら再生をやめ、画像エディタを閉じる（Rust もライブラリを閉じる前にエディタを閉じる）
   const libraryPath = useLibraryStore((s) => s.info?.path);
   useEffect(() => closePlayer, [libraryPath]);
+  // 終わっていない保存を読む（一時停止した保存はアプリを開き直しても残っている。カプセルから再開・中止できる）
+  useEffect(() => {
+    void useJobsStore.getState().reloadSaves();
+  }, [libraryPath]);
+  // 終わっていない一括を読む（一時停止した一括もアプリを開き直して残る）
+  useEffect(() => {
+    useBatchJobsStore.getState().clear();
+    void useBatchJobsStore.getState().load();
+    // 前のライブラリのレシピ・一括のシートは閉じる
+    closeApply();
+    closeMerge();
+    closeResult();
+    // レシピの一覧はライブラリごとに読む（サイドバーを隠していても、項目のメニューの「レシピを当てる ▸」に出す）
+    useRecipeStore.getState().clear();
+    if (libraryPath) void useRecipeStore.getState().load();
+    // プロジェクトと持ち出し先もライブラリごと（M15 段 6）。前のライブラリのシートは閉じる
+    useProjectStore.getState().clear();
+    useLicenseStore.getState().clear();
+    closePresetSheet();
+    closeCreditsSheet();
+    closeExportSheet();
+    if (libraryPath) {
+      void useProjectStore.getState().load();
+      void useLicenseStore.getState().load();
+    }
+  }, [libraryPath]);
+  // 照らし直しが終わったら、プロジェクトの件数・見つからない印・照らした時刻を読み直す（使っている素材の一覧も）
+  useEffect(
+    () =>
+      onAnyJob((event) => {
+        if (event.kind !== 'project' || (event.state !== 'done' && event.state !== 'failed')) {
+          return;
+        }
+        void useProjectStore.getState().load();
+        // インスペクタの「使っているプロジェクト」も読み直す
+        bumpRevision();
+        if (useViewStore.getState().view.kind === 'project') {
+          void useLibraryStore.getState().loadList();
+        }
+      }),
+    [],
+  );
+  useEffect(() => () => void closeEditor(), [libraryPath]);
 
   return (
     <>
@@ -83,6 +161,8 @@ function LibraryScreen() {
           <DownloadsView />
         ) : tags ? (
           <TagsView />
+        ) : recipe !== null ? (
+          <RecipeView key={recipe} id={recipe} />
         ) : playlist !== null ? (
           <PlaylistView key={playlist} id={playlist} />
         ) : (
@@ -90,7 +170,14 @@ function LibraryScreen() {
         )}
       </AppShell>
       <Theater />
+      <Editor />
       <ImportSheet />
+      <ApplySheet />
+      <MergeSheet />
+      <BatchResultSheet />
+      <ExportSheet />
+      <PresetSheet />
+      <CreditsSheet />
       <DropOverlay />
       <TagDialog />
       <SearchPalette />

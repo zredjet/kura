@@ -1,0 +1,258 @@
+--- a/vorbis_vendor/lib/block.c
++++ b/vorbis_vendor/lib/block.c
+@@ -29,6 +29,7 @@
+ #include "lpc.h"
+ #include "registry.h"
+ #include "misc.h"
++#include "abl.h"
+ #ifdef __SSE__												/* SSE Optimize */
+ #include "xmmlib.h"
+ #endif														/* SSE Optimize */
+@@ -497,7 +498,7 @@
+     int i,j;
+     for(i=0;i<vals;i++){
+       for(j=0;j<vi->channels;j++){
+-        v->pcmret[j][i]*=hi->pre_amplitude;
++        if(!ABL(PREAMP))v->pcmret[j][i]*=hi->pre_amplitude;
+       }
+     }
+   }
+@@ -596,7 +597,7 @@
+       if(ci->blocksizes[0]==ci->blocksizes[1])
+         v->nW=0;
+       else
+-        v->nW=bp;
++        v->nW=ABL(LONGONLY)?1:bp;
+     }
+   }
+ 
+--- a/vorbis_vendor/lib/envelope.c
++++ b/vorbis_vendor/lib/envelope.c
+@@ -27,6 +27,7 @@
+ #include "envelope.h"
+ #include "mdct.h"
+ #include "misc.h"
++#include "abl.h"
+ #ifdef __SSE__												/* SSE Optimize */
+ #include "xmmlib.h"
+ #endif														/* SSE Optimize */
+@@ -441,7 +442,7 @@
+   /*_analysis_output_always("spread",seq2++,vec,n/4,0,0,0);*/
+ 
+   /* perform preecho/postecho triggering by band */
+-  for(j=0;j<VE_BANDS;j++){
++  for(j=0;j<(ABL(ENV)?7:VE_BANDS);j++){
+     float acc=0.;
+     float valmax,valmin;
+ 
+--- a/vorbis_vendor/lib/masking.h
++++ b/vorbis_vendor/lib/masking.h
+@@ -35,6 +35,7 @@
+   /*8k*/  //-95, -95, -96, -97, -96, -95, -93, -90,
+   /*16k*/ //-80, -70, -50, -40, -30, -30, -30, -30
+ /*Aoyumi's ATH (v6+) */
++#define KURA_ATH_AOTUV 1
+   /*15*/  -31, -33, -35, -37, -39, -41, -43, -45,
+   /*31*/  -47, -49, -51, -53, -55, -57, -59, -61,
+   /*63*/  -63, -65, -67, -69, -71, -73, -75, -77,
+@@ -48,6 +49,20 @@
+   /*16k*/ -80, -70, -50, -40, -30, -26, -22, -18
+ };
+ 
++static const float ATH_XIPH[]={
++  -51, -52, -53, -54, -55, -56, -57, -58,
++  -59, -60, -61, -62, -63, -64, -65, -66,
++  -67, -68, -69, -70, -71, -72, -73, -74,
++  -75, -76, -77, -78, -80, -81, -82, -83,
++  -84, -85, -86, -87, -88, -88, -89, -89,
++  -90, -91, -91, -92, -93, -94, -95, -96,
++  -96, -97, -98, -98, -99, -99,-100,-100,
++ -101,-102,-103,-104,-106,-107,-107,-107,
++ -107,-105,-103,-102,-101, -99, -98, -96,
++  -95, -95, -96, -97, -96, -95, -93, -90,
++  -80, -70, -50, -40, -30, -30, -30, -30
++};
++
+ /* The tone masking curves from Ehmer's and Fielder's papers have been
+    replaced by an empirically collected data set.  The previously
+    published values were, far too often, simply on crack. */
+--- a/vorbis_vendor/lib/psy.c
++++ b/vorbis_vendor/lib/psy.c
+@@ -30,7 +30,7 @@
+ #include "smallft.h"
+ #include "scales.h"
+ #include "misc.h"
+-
++#include "abl.h"
+ #define NEGINF -9999.f
+ 
+ #define existe(x,y) (x<-y || x>=y) // !existe(x,0.5f) is faster than (rint(x)==0.f). (By the same result)
+@@ -440,11 +440,12 @@
+ 
+   /* set up the lookups for a given blocksize and sample rate */
+ 
++  const float *ATHt = ABL(ATH)?ATH_XIPH:ATH;
+   for(i=0,j=0;i<MAX_ATH-1;i++){
+     int endpos=rint(fromOC((i+1)*.125-2.)*2*n/rate);
+-    float base=ATH[i];
++    float base=ATHt[i];
+     if(j<endpos){
+-      float delta=(ATH[i+1]-base)/(endpos-j);
++      float delta=(ATHt[i+1]-base)/(endpos-j);
+       for(;j<endpos && j<n;j++){
+         p->ath[j]=base+100.;
+         base+=delta;
+@@ -498,11 +499,11 @@
+     for(j=0;j<P_NOISECURVES;j++)
+       p->noiseoffset[j][i]=
+         p->vi->noiseoff[j][inthalfoc]*(1.-del) +
+-        p->vi->noiseoff[j][inthalfoc+1]*del;
++        (inthalfoc+1<P_BANDS ? p->vi->noiseoff[j][inthalfoc+1]*del : 0.); /* KURA: [17] の範囲外の読み取りを避ける */
+     
+     /* setup ntfix offset */
+      p->ntfix_noiseoffset[i]=ntfix_offset[inthalfoc]*(1.-del) +
+-                             ntfix_offset[inthalfoc+1]*del;
++                             (inthalfoc+1<P_BANDS ? ntfix_offset[inthalfoc+1]*del : 0.);
+ 
+   }
+ #if 0
+@@ -624,6 +625,7 @@
+   float ret=-1.0;
+   double upt=0, unt=0;
+ 
++  if(ABL(M2))return ret;
+   if(mode!=2)return ret; // only trans. block
+   if(lw_mode!=0)return ret;
+   if(nn<2048)return ret;
+@@ -3652,7 +3654,7 @@
+   float *temp, *inmod;
+   float limit=fabs(p->noiseoffset[1][0]);
+ 
+-  if(!nx)return;
++  if(!nx || ABL(M7))return;
+ 
+   temp=alloca(256*sizeof(*temp));
+   inmod=alloca(256*sizeof(*inmod));
+@@ -4008,7 +4010,7 @@
+     if(dB>=NOISE_COMPAND_LEVELS)dB=NOISE_COMPAND_LEVELS-1;
+     if(dB<0)dB=0;
+     epeak[i]= work[i]+stn_compand[dB];
+-    logmask[i]= work[i]+p->vi->noisecompand[dB];
++    logmask[i]= work[i]+(ABL(NOCOMPAND)?dB:p->vi->noisecompand[dB]);
+   }
+ #endif														/* SSE Optimize */
+ 
+@@ -4031,7 +4033,7 @@
+     npeak (each partition) = min [0 ~ 1.0f] max
+     by Aoyumi @ 2010/09/28
+   */
+-  for(k=0, i=0; i<p->min_nn_lp; i+=partition,k++){
++  for(k=0, i=0; !ABL(M8) && i<p->min_nn_lp; i+=partition,k++){
+     const float nt=4;
+     float o=p->noiseoffset[1][i+partition-1]+6;  // threshold of offset
+     float me=0;  // max energy (per partition)
+@@ -4059,7 +4061,7 @@
+   */
+   {
+     i=0;
+-    if(block_mode>1){ // long and trans. block
++    if(block_mode>1 && !ABL(M9)){ // long and trans. block
+       for(; i<p->tonecomp_endp; i++){
+         float temp=logmdct[i]-epeak[i];
+         epeak[i]=0.f;
+@@ -4136,8 +4138,10 @@
+ #endif														/* SSE Optimize */
+ 
+   /* tone masking */
++  if(!ABL(NOTONE)){
+   seed_loop(p,(const float ***)p->tonecurves,logfft,logmask,seed,global_specmax);
+   max_seeds(p,seed,logmask);
++  }
+ 
+ }
+ 
+@@ -4315,8 +4319,8 @@
+   set_m3p(&mp3, lW_no, impadnum, n, hsrate, toneatt, logmdct, lastmdct, tempmdct,
+           block_mode, lW_block_mode,
+           bit_managed, offset_select);
+-
+-  /** @ M4 PRE **/
++  if(ABL(M3))mp3.sw=0;
++/** @ M4 PRE **/
+   mp4.end_block+=p->vi->normal_partition;
+   if(mp4.end_block>n)mp4.end_block=n;
+   if(!hsrate){
+@@ -4411,7 +4415,7 @@
+     //logmask[i]=max(val,tval);
+     if(val>tval){
+       logmask[i]=val;
+-    }else if((i>mp4.start) && (i<mp4.end)){
++    }else if(!ABL(M4) && (i>mp4.start) && (i<mp4.end)){
+       if(logmdct[i]<tval){
+         if(logmdct[i]<val){
+           tval-=(tval-val)*mp4.thres;
+@@ -4431,7 +4435,7 @@
+     by Aoyumi @ 2004/04/18
+     */
+ 
+-    if(offset_select == 1) {
++    if(offset_select == 1 && !ABL(M1)) {
+       m1_coeffi = -17.2;       /* coeffi is a -17.2dB threshold */
+       val = val - logmdct[i];  /* val == mdct line value relative to floor in dB */
+       
+@@ -4736,7 +4740,7 @@
+   int j,k,count=0;
+   int start = (vi->normal_p ? vi->normal_start-i : n);
+   //if(start>n)start=n;
+-  if((start>n) || (nepeak<-0.5))start=n;
++  if((start>n) || (nepeak<-0.5) || ABL(NN))start=n;
+   
+   /* force classic behavior where only energy in the current band is considered */
+   acc=0.f;
+@@ -5009,7 +5013,7 @@
+             by Aoyumi @ 2010/12/31 
+         */
+         /* In the case of specific depth coupling, invalidate this. */
+-        if(p->tonefix_end>i){
++        if(!ABL(M6) && p->tonefix_end>i){
+           int rp=0;
+           int pp=0;
+           int ap;
+@@ -5049,7 +5053,7 @@
+         for(j=0;j<jn;j++){
+ 
+           if(j<sliding_lowpass-i){
+-            if(fM[j]==1 || fA[j]==1){
++              if(ABL(NOPOINT) || ((fM[j]==1 || fA[j]==1) && !ABL(ALLPOINT))){
+               /* lossless coupling */
+ 
+               reM[j] = fabs(reM[j])+fabs(reA[j]);
+@@ -5071,11 +5075,15 @@
+               }else{
+                 hpL=.18f;  hpH=.04f;
+               }
+-              if(j<limit-i){
+-                reM[j]=min_indemnity_dipole_hypot(reM[j], reA[j], hpL);
+-              }else{
+-                reM[j]=min_indemnity_dipole_hypot(reM[j], reA[j], hpH);
+-              }
++              if(ABL(HYPOT)){
++                  if(j<limit-i){ reM[j] += reA[j]; }
++                  else{ float s2=fabs(reM[j])+fabs(reA[j]); reM[j]=(reM[j]+reA[j]<0)?-s2:s2; }
++                }else
++                if(j<limit-i){
++                  reM[j]=min_indemnity_dipole_hypot(reM[j], reA[j], hpL);
++                }else{
++                  reM[j]=min_indemnity_dipole_hypot(reM[j], reA[j], hpH);
++                }
+ 
+               // aotuv hypot (sub)
+               //reM[j]=min_indemnity_dipole_hypotH(reM[j], reA[j]);
+@@ -5158,6 +5166,7 @@
+   int i, n=p->n, nq1=p->n25p, nq3=p->n75p;
+   double hi_th=0;
+ 
++  if(ABL(M5))return(-1);
+   if(p->m_val < 0.5)return(-1); /* 48/44.1/32kHz only */
+   if(p->vi->normal_thresh>.45)return(-1); /* under q3 */
+ 

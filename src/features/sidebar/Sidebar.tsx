@@ -20,6 +20,8 @@ import { FolderTree } from './FolderTree';
 import { LibrarySwitcher } from './LibrarySwitcher';
 import { SidebarFooter } from './SidebarFooter';
 import { PlaylistList } from './PlaylistList';
+import { ProjectList } from './ProjectList';
+import { RecipeList } from './RecipeList';
 import { SmartFolderList } from './SmartFolderList';
 import styles from './Sidebar.module.css';
 
@@ -56,7 +58,7 @@ function viewFor(kind: LibraryKind): ListView {
 /**
  * サイドバー（Sidebar.dc.html）。先頭の行にはネイティブの信号機が重なる。
  * ライブラリの切り替え・ライブラリの項目・スマートフォルダ・フォルダの木・プレイリスト。
- * 「タグなし」の下に「タグ」（タグの一覧の画面）、いちばん下に容量と設定（M9）。
+ * 「タグなし」の下に「タグ」（タグの一覧の画面）、いちばん下に容量と設定（M9）。レシピの下にプロジェクト（M15 段 6）。
  */
 export function Sidebar() {
   const counts = useSidebarStore((s) => s.counts);
@@ -66,7 +68,8 @@ export function Sidebar() {
   const playlistOpen = useViewStore((s) => s.playlist !== null);
   const downloadsOpen = useViewStore((s) => s.downloads);
   const tagsOpen = useViewStore((s) => s.tags);
-  const otherScreen = playlistOpen || downloadsOpen || tagsOpen;
+  const recipeOpen = useViewStore((s) => s.recipe !== null);
+  const otherScreen = playlistOpen || downloadsOpen || tagsOpen || recipeOpen;
   const activeDownloads = useDownloadsStore(selectActiveCount);
   const filter = useViewStore((s) => s.filter);
   // 「キャプチャ」はすべての一覧をキャプチャで絞り込んだもの
@@ -157,6 +160,8 @@ export function Sidebar() {
         <SmartFolderList current={current} />
         <FolderTree current={current} />
         <PlaylistList />
+        <RecipeList />
+        <ProjectList current={current} />
         <section className={styles.section} aria-label={ja.sidebar.fetchSection}>
           <h2 className={styles.sectionTitle}>{ja.sidebar.fetchSection}</h2>
           <button

@@ -136,8 +136,37 @@
   background: var(--stroke-1);
 }
 
-.error {
+/* 開けなかった理由（M11）：見出し（--danger-text、警告の印）・説明（secondary）・場所（tertiary） */
+.failure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2-5) var(--space-3);
+  border-radius: var(--radius-lg);
+  background: var(--fill-1);
   font-size: var(--text-sm);
   line-height: var(--leading-body);
+}
+
+.failureTitle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  font-weight: var(--weight-semibold);
   color: var(--danger-text);
+}
+
+.failureTitle svg {
+  flex: none;
+}
+
+.failureDetail {
+  color: var(--text-secondary);
+}
+
+.failurePath {
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
 }

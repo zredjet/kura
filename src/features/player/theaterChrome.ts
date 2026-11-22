@@ -27,6 +27,33 @@ export function canHideControls(c: HideContext): boolean {
   return c.playing && !c.hovering && !c.focusInControls && !c.menuOpen && !c.typing;
 }
 
+/** 操作（上部・再生バー・アニメの操作の行）の上にポインタがあるかを覚えるもの。 */
+export interface HoverTracker {
+  /** ポインタが部品に入った。 */
+  enter(element: Element): void;
+  /** ポインタが部品から出た（シアターを閉じた・一時停止したときも呼ぶ）。 */
+  leave(): void;
+  /** いま操作の上にあるか。入った部品が DOM から外れていれば（ポインタを乗せたまま行が消えた）ない。 */
+  hovering(): boolean;
+}
+
+/**
+ * ポインタの出入りを覚える。部品がポインタの下で DOM から外れると pointerleave が来ないので（アイテムを替えて
+ * アニメの操作の行が消えたなど）、入った部品を持っておき、DOM に残っているときだけ乗っているとみなす。
+ */
+export function hoverTracker(): HoverTracker {
+  let over: Element | null = null;
+  return {
+    enter: (element) => {
+      over = element;
+    },
+    leave: () => {
+      over = null;
+    },
+    hovering: () => over?.isConnected === true,
+  };
+}
+
 export interface FullscreenPanels {
   fullscreen: boolean;
   panel: PlayerPanel;

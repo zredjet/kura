@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::import::{KindCounts, MediaKind};
 use crate::text::natural_cmp;
 
 /// ユニットの種類。
@@ -98,7 +99,7 @@ pub struct UnitDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberInfo {
     pub title: String,
-    pub kind: String,
+    pub kind: MediaKind,
     pub imported_at: i64,
     pub captured_at: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -121,6 +122,11 @@ pub struct MemberSnapshot {
 impl MemberSnapshot {
     fn alive(&self, id: i64) -> bool {
         self.items.get(&id).is_some_and(|i| !i.trashed)
+    }
+
+    /// 再生のキュー・スマートの候補に入る種類か（フォント・3D・見つからないアイテムは偽）。
+    pub fn is_playable(&self, id: i64) -> bool {
+        self.items.get(&id).is_some_and(|i| i.kind.is_playable())
     }
 
     /// そのフォルダ（と `recursive` なら子孫フォルダ）に入っているアイテム（重複なし、順不同）。
@@ -237,10 +243,10 @@ fn cmp_nulls_last(a: Option<i64>, b: Option<i64>) -> std::cmp::Ordering {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemberStats {
     pub count: usize,
-    /// 音楽・動画は長さ、画像は表示時間の合計（ミリ秒）。
+    /// 音楽・動画は長さ、画像は表示時間の合計（ミリ秒）。フォント・3D は足さない。
     pub duration_ms: i64,
-    /// メンバーの種類（image → video → audio の順）。
-    pub kinds: Vec<&'static str>,
+    /// メンバーの種類（`MediaKind::ALL` の順：image → video → audio → font → model）。
+    pub kinds: Vec<MediaKind>,
     /// ユニットの評価が 1 以上ならそれ。0 なら評価済みメンバーの平均（四捨五入）。なければ 0。
     pub rating: i64,
 }
@@ -253,33 +259,17 @@ pub fn aggregate(
     image_duration_ms: i64,
 ) -> MemberStats {
     let mut duration_ms = 0i64;
-    let mut has = [false; 3];
+    let mut counts = KindCounts::default();
     let (mut rated, mut rating_sum) = (0i64, 0i64);
     for info in members.iter().filter_map(|id| snap.items.get(id)) {
-        match info.kind.as_str() {
-            "image" => {
-                has[0] = true;
-                duration_ms += image_duration_ms;
-            }
-            "video" => {
-                has[1] = true;
-                duration_ms += info.duration_ms.unwrap_or(0);
-            }
-            _ => {
-                has[2] = true;
-                duration_ms += info.duration_ms.unwrap_or(0);
-            }
-        }
+        counts.add(info.kind, 1);
+        duration_ms += member_duration_ms(info, image_duration_ms);
         if (1..=5).contains(&info.rating) {
             rated += 1;
             rating_sum += info.rating;
         }
     }
-    let kinds = ["image", "video", "audio"]
-        .into_iter()
-        .zip(has)
-        .filter_map(|(k, h)| h.then_some(k))
-        .collect();
+    let kinds = counts.kinds();
     let rating = if unit_rating >= 1 {
         unit_rating
     } else if rated > 0 {
@@ -295,6 +285,15 @@ pub fn aggregate(
     }
 }
 
+/// メンバー 1 件の長さ（§2.4）：画像は表示時間、音楽・動画は長さ（不明は 0）、フォント・3D は 0。
+pub fn member_duration_ms(info: &MemberInfo, image_duration_ms: i64) -> i64 {
+    match info.kind {
+        MediaKind::Image => image_duration_ms,
+        MediaKind::Video | MediaKind::Audio => info.duration_ms.unwrap_or(0),
+        MediaKind::Font | MediaKind::Model => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,7 +301,7 @@ mod tests {
     fn info(title: &str, kind: &str, imported: i64) -> MemberInfo {
         MemberInfo {
             title: title.into(),
-            kind: kind.into(),
+            kind: MediaKind::parse(kind).unwrap_or_else(|| panic!("種類 {kind}")),
             imported_at: imported,
             captured_at: None,
             duration_ms: None,
@@ -496,10 +495,31 @@ mod tests {
         let stats = aggregate(&[1, 2, 3], &s, 0, 8000);
         assert_eq!(stats.count, 3);
         assert_eq!(stats.duration_ms, 98_000);
-        assert_eq!(stats.kinds, vec!["image", "video", "audio"]);
+        assert_eq!(
+            stats.kinds,
+            vec![MediaKind::Image, MediaKind::Video, MediaKind::Audio]
+        );
         assert_eq!(stats.rating, 5); // (4 + 5) / 2 = 4.5 → 5
         assert_eq!(aggregate(&[1, 2, 3], &s, 2, 8000).rating, 2);
         assert_eq!(aggregate(&[3], &s, 0, 8000).rating, 0);
-        assert_eq!(aggregate(&[], &s, 0, 8000).kinds, Vec::<&str>::new());
+        assert_eq!(aggregate(&[], &s, 0, 8000).kinds, Vec::<MediaKind>::new());
+    }
+
+    /// フォント・3D を音楽に数えず、長さにも足さない（件数には入る）。
+    #[test]
+    fn kind_counts_include_font_and_model() {
+        let mut s = snap(&[
+            (1, info("a", "image", 1)),
+            (2, info("b", "font", 1)),
+            (3, info("c", "model", 1)),
+        ]);
+        s.items.get_mut(&2).unwrap().duration_ms = Some(60_000);
+        let stats = aggregate(&[1, 2, 3], &s, 0, 8000);
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.duration_ms, 8000);
+        assert_eq!(
+            stats.kinds,
+            vec![MediaKind::Image, MediaKind::Font, MediaKind::Model]
+        );
     }
 }

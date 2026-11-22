@@ -2,20 +2,60 @@ import { type MouseEvent, type PointerEvent, memo } from 'react';
 
 import { CameraIcon } from '../../components/icons/CameraIcon';
 import { DownloadIcon } from '../../components/icons/DownloadIcon';
-import { MusicIcon } from '../../components/icons/MusicIcon';
+import { KindIcon } from '../../components/icons/KindIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
 import { UnitIcon } from '../../components/icons/UnitIcon';
 import { Waveform } from '../../components/icons/Waveform';
+import { FramesIcon } from '../../components/icons/FramesIcon';
+import { RepeatIcon } from '../../components/icons/RepeatIcon';
+import { KindArt } from '../../components/KindArt/KindArt';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
-import { thumbUrl } from '../../ipc/media';
+import { hasDuration, isItemKind, isPlayable, type ItemKind, kindLabel } from '../../ipc/kinds';
 import type { UnitSummaryDto } from '../../ipc/units';
 import { formatCount, formatDuration } from '../../lib/format';
 import { spokenLabel } from './describeItem';
 import styles from './Tile.module.css';
+import { TileWave } from './TileWave';
 
 /** ダウンロードで取得したものの取得元。 */
 const DOWNLOAD_SITES = new Set(['youtube', 'pixiv', 'x', 'nicovideo', 'soundcloud']);
+
+/** 再生しない素材（フォント・3D）か。サムネイルがなければ種類の絵を出す（design.md §3.1）。 */
+function isAsset(kind: string | undefined): kind is ItemKind {
+  return isItemKind(kind) && !isPlayable(kind);
+}
+
+/** 左下に種類のバッジを出す種類（音楽と、フォント・3D。design.md §4 のタイル）。 */
+function hasKindBadge(kind: string | undefined): kind is ItemKind {
+  return kind === 'audio' || isAsset(kind);
+}
+
+/** ユニットの表紙を下げる分（Tile.module.css の .cover の top）。 */
+const UNIT_COVER_TOP = 6;
+
+/** タイルの絵の元（アイテムの概要か、ユニットの表紙）。 */
+interface PlaceholderSource {
+  hash: string;
+  kind: string;
+  analysisState: string;
+}
+
+/**
+ * サムネイル（音楽ならジャケット）がないとき（まだ・作れなかった・ジャケットがない）の絵：音楽は解析が済んでいれば実波形
+ * （段のファイルは解析のジョブが DB に書く前に置く）、解析の前・解析できないものは飾りの波形。フォント・3D は種類の絵。
+ */
+function placeholderOf(source: PlaceholderSource) {
+  if (source.kind === 'audio') {
+    return source.analysisState === 'ready' ? (
+      <TileWave hash={source.hash} className={styles.waveform} />
+    ) : (
+      <Waveform className={styles.waveform} />
+    );
+  }
+  return isAsset(source.kind) ? <KindArt kind={source.kind} /> : null;
+}
 
 /** タイルのマウス・ドラッグの受け口（グリッドが持つ）。 */
 export interface TileHandlers {
@@ -66,28 +106,40 @@ export const Tile = memo(function Tile({
       onContextMenu={(e) => handlers.onContextMenu(id, e)}
       onPointerDown={(e) => handlers.onPointerDown(id, e)}
     >
-      {item?.thumbState === 'ready' && (
-        <img
+      {item && (
+        <MediaImage
+          source={item}
+          size="s"
+          fit="cover"
+          box={{ w: width, h: height }}
           className={styles.thumb}
-          src={thumbUrl(item.hash, 's')}
-          alt=""
-          decoding="async"
-          draggable={false}
+          fallback={placeholderOf(item)}
         />
       )}
-      {kind === 'audio' && (
-        <>
-          {item?.thumbState !== 'ready' && <Waveform className={styles.waveform} />}
-          <span className={`${styles.badge} ${styles.bottomLeft}`}>
-            <MusicIcon size={10} strokeWidth={2.4} />
-            {ja.tile.music}
-          </span>
-        </>
+      {hasKindBadge(kind) && (
+        <span className={`${styles.badge} ${styles.bottomLeft}`}>
+          <KindIcon kind={kind} size={10} strokeWidth={2.4} />
+          {kindLabel(kind)}
+        </span>
       )}
-      {(kind === 'audio' || kind === 'video') && duration !== null && (
+      {hasDuration(kind) && duration !== null && (
         <span className={`${styles.badge} ${styles.bottomRight}`}>
           {kind === 'video' && <PlayIcon size={8} />}
+          {kind === 'audio' && item?.hasLoop && (
+            <span className={styles.badgeIcon} title={ja.mediaView.loop}>
+              <RepeatIcon size={10} strokeWidth={2.4} />
+            </span>
+          )}
           {formatDuration(duration)}
+        </span>
+      )}
+      {kind === 'image' && item?.animated && (
+        <span
+          className={`${styles.badge} ${styles.bottomRight}`}
+          title={item.frameCount === null ? ja.mediaView.animated : undefined}
+        >
+          <FramesIcon size={10} strokeWidth={2.4} />
+          {item.frameCount !== null && ja.mediaView.frames(formatCount(item.frameCount))}
         </span>
       )}
       {DOWNLOAD_SITES.has(site) && (
@@ -144,17 +196,15 @@ export const UnitTile = memo(function UnitTile({
       <span className={`${styles.plate} ${styles.plateBack}`} />
       <span className={`${styles.plate} ${styles.plateMiddle}`} />
       <span className={styles.cover} data-kind={cover?.kind}>
-        {cover?.thumbState === 'ready' && (
-          <img
+        {cover && (
+          <MediaImage
+            source={cover}
+            size="s"
+            fit="cover"
+            box={{ w: width, h: height - UNIT_COVER_TOP }}
             className={styles.thumb}
-            src={thumbUrl(cover.hash, 's')}
-            alt=""
-            decoding="async"
-            draggable={false}
+            fallback={placeholderOf(cover)}
           />
-        )}
-        {cover?.kind === 'audio' && cover.thumbState !== 'ready' && (
-          <Waveform className={styles.waveform} />
         )}
         <span className={`${styles.badge} ${styles.bottomRight}`}>
           {formatCount(count)}

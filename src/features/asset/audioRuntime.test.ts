@@ -1,0 +1,115 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { pcmUrl } from '../../ipc/media';
+import { writePcmWav } from '../../lib/asset/wav';
+import {
+  type AudioRuntime,
+  closeAudio,
+  holdAudio,
+  IDLE_CLOSE_MS,
+  MediaHttpError,
+  probeFrames,
+  setAudioRuntimeForTest,
+  touchAudio,
+} from './audioRuntime';
+
+function fakeRuntime() {
+  const state = { playing: false };
+  const pool = { closeAll: vi.fn() };
+  const audition = {
+    get playing() {
+      return state.playing;
+    },
+    stop: vi.fn(),
+  };
+  const sfx = { stop: vi.fn() };
+  const runtime = { pool, audition, sfx } as unknown as AudioRuntime;
+  return { runtime, pool, audition, sfx, state };
+}
+
+// critic 23：試聴の文脈は元のレートごとに 1 つを使い回し、使い終えたら閉じる
+describe('使い終えた文脈を閉じる', () => {
+  let fake: ReturnType<typeof fakeRuntime>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fake = fakeRuntime();
+    setAudioRuntimeForTest(fake.runtime);
+  });
+
+  afterEach(() => {
+    closeAudio();
+    setAudioRuntimeForTest(null);
+    vi.useRealTimers();
+  });
+
+  it('最後に鳴らしてから 15 秒、何も鳴らさなければ閉じる（鳴らすたびに数え直す）', () => {
+    touchAudio();
+    vi.advanceTimersByTime(IDLE_CLOSE_MS - 1);
+    touchAudio();
+    vi.advanceTimersByTime(IDLE_CLOSE_MS - 1);
+    expect(fake.pool.closeAll).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('試聴している間は閉じず、止めてから 15 秒で閉じる', () => {
+    fake.state.playing = true;
+    touchAudio();
+    vi.advanceTimersByTime(IDLE_CLOSE_MS * 3);
+    expect(fake.pool.closeAll).not.toHaveBeenCalled();
+    fake.state.playing = false;
+    vi.advanceTimersByTime(IDLE_CLOSE_MS);
+    expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
+  });
+
+  // M13：エディタが鳴らしている間は、試聴・効果音を使い終えても閉じない
+  it('holdAudio の印がある間は閉じず、外してから 15 秒で閉じる（2 回外しても数え違えない）', () => {
+    const release = holdAudio();
+    touchAudio();
+    vi.advanceTimersByTime(IDLE_CLOSE_MS * 3);
+    expect(fake.pool.closeAll).not.toHaveBeenCalled();
+    const other = holdAudio();
+    release();
+    release();
+    vi.advanceTimersByTime(IDLE_CLOSE_MS * 2);
+    expect(fake.pool.closeAll).not.toHaveBeenCalled();
+    other();
+    vi.advanceTimersByTime(IDLE_CLOSE_MS - 1);
+    expect(fake.pool.closeAll).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('画面を離れたらすぐ止めて閉じ、待っていた閉じる時機は取り消す', () => {
+    touchAudio();
+    closeAudio();
+    expect(fake.audition.stop).toHaveBeenCalled();
+    expect(fake.sfx.stop).toHaveBeenCalled();
+    expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(IDLE_CLOSE_MS);
+    expect(fake.pool.closeAll).toHaveBeenCalledTimes(1);
+  });
+});
+
+// 試聴のループのシート：長さは試聴と同じく /pcm の先頭の 1 フレームの応答（kura チャンクの total）で知る
+describe('probeFrames', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('/pcm/{hash}/0-1 を取り、kura チャンクの total を返す。2xx でなければ MediaHttpError', async () => {
+    const wav = writePcmWav({
+      rate: 48_000,
+      format: 'i16',
+      planes: [new Float32Array(1)],
+      info: { start: 0, total: 96_000, loop: [10, 20], decoder: 'wav-kura-dec/1' },
+    });
+    const fetch = vi.fn(async () => new Response(wav));
+    vi.stubGlobal('fetch', fetch);
+    await expect(probeFrames('ab'.repeat(32))).resolves.toBe(96_000);
+    expect(fetch).toHaveBeenCalledWith(pcmUrl('ab'.repeat(32), 0, 1));
+    fetch.mockImplementation(async () => new Response(new Uint8Array([1, 2, 3])));
+    await expect(probeFrames('ab'.repeat(32))).resolves.toBeNull();
+    fetch.mockImplementation(async () => new Response(null, { status: 503 }));
+    await expect(probeFrames('ab'.repeat(32))).rejects.toBeInstanceOf(MediaHttpError);
+  });
+});

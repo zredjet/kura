@@ -408,3 +408,19 @@
   outline: none;
   box-shadow: var(--focus-ring);
 }
+
+/* ---- プロジェクトの行の印（M15 段 6）：フォルダが見つからない・持ち出し先 ---- */
+
+.rowMark {
+  display: flex;
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+
+.rowMark[data-kind='missing'] {
+  color: var(--warning);
+}
+
+.row[aria-current='page'] .rowMark[data-kind='target'] {
+  color: var(--accent);
+}

@@ -1,9 +1,15 @@
 //! フロントから呼ぶコマンド。薄いラッパーに保ち、ロジックは kura-core / kura-mac に置く。
 
+pub mod analysis;
 pub mod appearance;
+pub mod asset;
+pub mod batch;
 pub mod bench;
 pub mod capture;
+pub mod credits;
 pub mod downloads;
+pub mod dragout;
+pub mod edit;
 pub mod export;
 pub mod folders;
 pub mod import;
@@ -12,6 +18,8 @@ pub mod jobs;
 pub mod library;
 pub mod player;
 pub mod playlists;
+pub mod projects;
+pub mod recipes;
 pub mod search;
 pub mod tags;
 pub mod units;

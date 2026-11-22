@@ -1,0 +1,5 @@
+{"digest":"3b816fd8f3a1daf54222e821e64548246d003b4d5155e5012a047af0313a7284","inputs":[{"fmt":"rgba8","h":270,"seed":31,"type":"noise","w":600}],"name":"cw-across-tiles","params":{"turn":"cw"},"target":"*"}
+{"digest":"96a64e4da7ba35be117c66f62e2c45278fd706e1c5d0354d73085bc02841dd31","inputs":[{"fmt":"rgb16","h":7,"seed":32,"type":"noise","w":13}],"name":"ccw-rgb16","params":{"turn":"ccw"},"target":"*"}
+{"digest":"41d85d4fab5d03817971a201784a5d3999eee4a99c2b63c511e28a144961740f","inputs":[{"fmt":"indexed8","h":4,"seed":33,"type":"noise","w":9}],"name":"half-indexed","params":{"turn":"half"},"target":"*"}
+{"digest":"f2d99b7d2166e34e1b202c5c0dd6c79562ff151de8e64111ef6c4b4e0a79455d","inputs":[{"cell":8,"cols":3,"rows":2,"type":"sheet"}],"name":"sheet-rotates-grid","params":{"turn":"cw"},"target":"*"}
+{"digest":"904a97a67b0c6247c610081473e66efee8ac6d53b211adde27ce7637775e874f","inputs":[{"count":2,"fmt":"grayA8","h":4,"seed":34,"type":"noiseFrames","w":6}],"name":"frames-per-frame","params":{"turn":"ccw"},"target":"*"}

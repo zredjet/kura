@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 
 import { CloseIcon } from '../../components/icons/CloseIcon';
 import { DownloadIcon } from '../../components/icons/DownloadIcon';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { ArrowUpIcon } from '../../components/icons/ArrowUpIcon';
 import { PauseIcon } from '../../components/icons/PauseIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
@@ -9,7 +10,6 @@ import { ProgressBar } from '../../components/ProgressBar/ProgressBar';
 import { ja } from '../../i18n/ja';
 import type { DownloadJobDto } from '../../ipc/downloads';
 import { cancelJob, jobLog, pauseJob, prioritizeJob, resumeJob, retryJob } from '../../ipc/jobs';
-import { thumbUrl } from '../../ipc/media';
 import { formatCount } from '../../lib/format';
 import { type DownloadTab, filterJobs, useDownloadsStore } from '../../stores/downloadsStore';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
@@ -18,6 +18,9 @@ import styles from './Downloads.module.css';
 import { TextSheet } from './TextSheet';
 
 const t = ja.downloads;
+
+/** 表紙の大きさ（Downloads.module.css の `.thumb`。市松模様は敷かない大きさ）。 */
+const THUMB_BOX = { w: 64, h: 44 };
 
 const TABS: { value: DownloadTab; label: string }[] = [
   { value: 'all', label: t.tabAll },
@@ -36,12 +39,13 @@ function Thumb({ job }: { job: DownloadJobDto }) {
     }
   }, [first]);
   const item = first !== undefined ? getCached(first) : undefined;
+  const icon = <DownloadIcon size={18} strokeWidth={1.8} />;
   return (
     <span className={styles.thumb} aria-hidden="true">
-      {item?.thumbState === 'ready' ? (
-        <img src={thumbUrl(item.hash, 's')} alt="" draggable={false} />
+      {item ? (
+        <MediaImage source={item} size="s" fit="cover" box={THUMB_BOX} fallback={icon} />
       ) : (
-        <DownloadIcon size={18} strokeWidth={1.8} />
+        icon
       )}
     </span>
   );

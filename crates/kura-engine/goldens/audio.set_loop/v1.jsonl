@@ -1,0 +1,3 @@
+{"digest":"dc82564acc63a523db9fb567ed7c311d2ec79c37cc5edd3ca96b73ea5ad97172","inputs":[{"channels":2,"frames":8000,"freq":220,"loopRange":{"end":20,"start":10},"rate":22050,"type":"sine"}],"name":"set","params":{"loop":{"end":7999,"start":1000}},"target":"*"}
+{"digest":"20e86ae232125b0ba95b3bea40afde480497bbfdc6c5ec93bcbde1ea149ed284","inputs":[{"channels":2,"frames":8000,"freq":220,"loopRange":{"end":20,"start":10},"rate":22050,"type":"sine"}],"name":"clear","params":{"loop":null},"target":"*"}
+{"digest":"910c6e27d47506e8ed5f32536d951be040feaa56eff68ceb3b34eb4156b7f62e","inputs":[{"channels":2,"frames":131109,"freq":330,"loopRange":null,"rate":8000,"type":"sine"}],"name":"crosses-audio-chunks","params":{"loop":{"end":131000,"start":60000}},"target":"*"}

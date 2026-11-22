@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 
+import { MediaImage, type MediaSource } from '../../../components/MediaImage/MediaImage';
 import { openMenuBelow } from '../../../components/Menu/menuStore';
 import { RatingInput } from '../../../components/RatingInput/RatingInput';
 import { CloseIcon } from '../../../components/icons/CloseIcon';
@@ -7,11 +8,11 @@ import { FolderIcon } from '../../../components/icons/FolderIcon';
 import { MoreIcon } from '../../../components/icons/MoreIcon';
 import { ja } from '../../../i18n/ja';
 import { isUnitEntry, selectionInfo, unitIdOf } from '../../../ipc/items';
-import { thumbUrl } from '../../../ipc/media';
 import { tagLabel } from '../../../ipc/tags';
 import { formatCount } from '../../../lib/format';
 import { getCached, getCachedUnit } from '../../../stores/itemCache';
 import { useViewStore } from '../../../stores/viewStore';
+import { CreditSection } from '../../credits/CreditSection';
 import { TagChips } from '../../tags/TagChips';
 import { TagField } from '../../tags/TagField';
 import { splitTags } from '../../tags/splitTags';
@@ -31,14 +32,15 @@ import { useLoaded } from './useLoaded';
 
 const t = ja.inspector;
 
-/** 重ねて見せるサムネイル（最初の 3 件）。 */
-function thumbOf(entry: number): string | null {
+/** 重ねて見せるカードの大きさ（Inspector.module.css の `.stackCard`）。 */
+const STACK_CARD = { w: 120, h: 120 };
+
+/** 重ねて見せるサムネイルの元（最初の 3 件。ユニットは表紙）。 */
+function thumbOf(entry: number): MediaSource | null {
   if (isUnitEntry(entry)) {
-    const cover = getCachedUnit(unitIdOf(entry))?.cover;
-    return cover?.thumbState === 'ready' ? thumbUrl(cover.hash, 's') : null;
+    return getCachedUnit(unitIdOf(entry))?.cover ?? null;
   }
-  const item = getCached(entry);
-  return item?.thumbState === 'ready' ? thumbUrl(item.hash, 's') : null;
+  return getCached(entry) ?? null;
 }
 
 /**
@@ -62,9 +64,17 @@ export function MultiInspector({ entries }: { entries: number[] }) {
   return (
     <>
       <div className={styles.stack} aria-hidden="true">
-        {thumbs.map((src, i) => (
+        {thumbs.map((source, i) => (
           <span key={i} className={styles.stackCard} data-index={i}>
-            {src && <img src={src} alt="" className={styles.stackImage} />}
+            {source && (
+              <MediaImage
+                source={source}
+                size="s"
+                fit="cover"
+                box={STACK_CARD}
+                className={styles.stackImage}
+              />
+            )}
           </span>
         ))}
       </div>
@@ -147,6 +157,13 @@ export function MultiInspector({ entries }: { entries: number[] }) {
               {t.addFolder}
             </button>
           </section>
+
+          {!trash && (
+            <CreditSection
+              itemIds={entries.filter((e) => !isUnitEntry(e))}
+              unitIds={entries.filter(isUnitEntry).map(unitIdOf)}
+            />
+          )}
 
           <NoteField
             key={`${key}-${data.info.sameNote ? (data.info.note ?? '') : '*'}`}

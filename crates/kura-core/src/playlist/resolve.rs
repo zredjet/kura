@@ -37,14 +37,16 @@ pub struct ResolvedEntry {
     pub items: Vec<i64>,
 }
 
-/// エントリを `pos` の順に展開する。ゴミ箱・存在しないアイテムは除き、空になったエントリは捨てる。
+/// エントリを `pos` の順に展開する。ゴミ箱・存在しないアイテムと、再生しない種類（フォント・3D）は除き、
+/// 空になったエントリは捨てる（§5.2 の 1。フォント・3D はエントリ・ユニットに入れられるが、キューには入らない）。
 pub fn resolve(snap: &Snapshot) -> Vec<ResolvedEntry> {
     let mut entries: Vec<&Entry> = snap.entries.iter().collect();
     entries.sort_by(|a, b| a.pos.total_cmp(&b.pos).then_with(|| a.id.cmp(&b.id)));
     entries
         .into_iter()
         .filter_map(|entry| {
-            let (unit_key, items) = expand(snap, entry.target);
+            let (unit_key, mut items) = expand(snap, entry.target);
+            items.retain(|id| snap.members.is_playable(*id));
             (!items.is_empty()).then_some(ResolvedEntry {
                 entry_id: entry.id,
                 unit_key,
@@ -54,7 +56,7 @@ pub fn resolve(snap: &Snapshot) -> Vec<ResolvedEntry> {
         .collect()
 }
 
-/// 1 つのエントリの中身（§2.2・§3.2）。
+/// 1 つのエントリの中身（§2.2・§3.2）。一覧に出す中身なので、再生しない種類（フォント・3D）も含む。
 pub fn expand(snap: &Snapshot, target: EntryTarget) -> (Option<UnitKey>, Vec<i64>) {
     match target {
         EntryTarget::Item(id) => {

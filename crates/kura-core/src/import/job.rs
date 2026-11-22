@@ -20,12 +20,13 @@ use super::plan::{
 use super::scan::{ScannedFile, scan};
 use super::store::{
     NewItem, add_tag, add_to_folder, add_unit_member, create_import_unit, ensure_folder_path,
-    ensure_tag, find_by_hash, folder_exists, insert_item, restore_item, unit_exists,
+    ensure_tag, find_owner, folder_exists, insert_item, restore_item, unit_exists,
 };
 use crate::jobs::{
     Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, save_partial,
 };
-use crate::library::Layout;
+use crate::library::{Layout, ledger};
+use crate::media::inflight::{self, ProbeWay};
 use crate::media::{MediaBackend, MediaInfo, NoBackend};
 use crate::time::now_ms;
 use crate::{CoreError, Result};
@@ -75,6 +76,8 @@ pub struct ImportResult {
     pub failed: u64,
     /// 失敗の明細（上限あり）。
     pub failures: Vec<ImportFailure>,
+    /// 拡張子は対応しているが中身が違うので取り込まなかったもの（`.ase` の色見本など。`skipped` に含む）と理由（上限あり）。
+    pub rejected: Vec<ImportFailure>,
     /// 作ったユニット（末端フォルダ → unit_id）。再開のときに同じユニットへ足すため。
     pub units: BTreeMap<String, i64>,
 }
@@ -148,6 +151,14 @@ impl JobHandler for ImportHandler {
         let total = files.len();
         state.total = total as u64;
         state.skipped = scan.skipped;
+        state.rejected.clear();
+        for (path, reason) in scan.rejected.iter().take(MAX_FAILURE_DETAILS) {
+            ctx.log(&format!("取り込みません: {} ({reason})", path.display()));
+            state.rejected.push(ImportFailure {
+                path: path.to_string_lossy().into_owned(),
+                reason: reason.clone(),
+            });
+        }
 
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.threads)
@@ -175,9 +186,17 @@ impl JobHandler for ImportHandler {
             }
             let end = batch_end(&files, cursor, self.batch_files, self.batch_bytes);
             let job_id = ctx.id();
-            // コピー・ハッシュ・配置・メディア情報の読み取りは並列に（DB には触らない）
+            // files/ に置いてから DB に書き終えるまで、ゴミ箱を空にする処理を待たせる（同じ中身を消されないように）
+            let ingest = library.ingest_guard();
+            // メディア情報（OS のデコーダ）は処理中の印を付けて読む（落ちても、次の起動で同じファイルで落ち続けない。
+            // media::inflight::ProbeBatch。M11 の検証 S2）。印はバッチの前に 1 回書き、コピー・ハッシュ・配置・読み取りは
+            // 続けて並列に（DB には触らない）。前回まとめて読んでいて落ちたものは、あとで 1 件ずつ印を付けて読む
+            let keys: Vec<String> = (cursor..end)
+                .map(|i| inflight::probe_key(&files[i].path))
+                .collect();
+            let probes = inflight::ProbeBatch::begin(library.db(), job_id, keys.clone())?;
             let backend = self.backend.as_ref();
-            let outcomes: Vec<(usize, PlaceOutcome)> = pool.install(|| {
+            let mut outcomes: Vec<(usize, PlaceOutcome)> = pool.install(|| {
                 (cursor..end)
                     .into_par_iter()
                     .map(|i| {
@@ -185,12 +204,46 @@ impl JobHandler for ImportHandler {
                         let staging = layout
                             .staging_dir()
                             .join(format!("import-{job_id}-{i}.{}", file.ext));
-                        let outcome = stage_and_place(&layout, backend, file, &staging)
+                        let key = &keys[i - cursor];
+                        let outcome = stage_and_place(&layout, file, &staging)
+                            .map(|(size, hash)| Placed {
+                                hash,
+                                size,
+                                info: probes.probe_together(
+                                    key,
+                                    backend,
+                                    &layout.content_path(&hash, &file.ext),
+                                    file.kind,
+                                ),
+                                crashed: probes.way(key) == ProbeWay::Skip,
+                            })
                             .map_err(|err| err.to_string());
                         (i, outcome)
                     })
                     .collect()
             });
+            for (i, outcome) in &mut outcomes {
+                let (file, key) = (&files[*i], &keys[*i - cursor]);
+                let Ok(placed) = outcome else {
+                    continue;
+                };
+                match probes.way(key) {
+                    ProbeWay::Together => {}
+                    ProbeWay::Alone => {
+                        placed.info = probes.probe_alone(
+                            library.db(),
+                            key,
+                            backend,
+                            &layout.content_path(&placed.hash, &file.ext),
+                            file.kind,
+                        )?;
+                    }
+                    ProbeWay::Skip => ctx.log(&format!(
+                        "前回、メディア情報を読んでいる途中でアプリが終わったファイルなので、読まずに入れます（サムネイルは作りません）: {}",
+                        file.path.display()
+                    )),
+                }
+            }
 
             #[cfg(test)]
             {
@@ -229,6 +282,8 @@ impl JobHandler for ImportHandler {
                 ctx.ensure_queued(JobKind::Thumbnail, "{}")?;
                 // 動画・音楽は再生できるかを確かめ、要ればプロキシを作る
                 ctx.ensure_queued(JobKind::Proxy, "{}")?;
+                // 画像・音声の事実と波形（取り込み・サムネイルが終わるまで譲って待つ）
+                ctx.ensure_queued(JobKind::Analyze, "{}")?;
             }
             // 既存と同じ中身で拡張子だけ違ったコピーは、どのアイテムも使わないので消す
             for path in extra_files {
@@ -236,6 +291,7 @@ impl JobHandler for ImportHandler {
                     tracing::warn!(%err, path = %path.display(), "不要なコピーを消せませんでした");
                 }
             }
+            drop(ingest);
             state = next;
             cursor = end;
             ctx.progress(fraction(cursor, total), &progress_message(cursor, total));
@@ -259,6 +315,8 @@ struct Placed {
     size: u64,
     /// 読めたメディア情報（読めなければサムネイルのジョブがあとで読む）。
     info: Option<MediaInfo>,
+    /// 前回このファイルのメディア情報を読んでいて落ちたので読まなかった（アイテムはサムネイルを作れなかったものにする）。
+    crashed: bool,
 }
 
 /// 1 ファイルを配置した結果、または失敗の理由。
@@ -292,6 +350,13 @@ impl BatchCommit {
         let mut extra_files = Vec::new();
         let mut folders: HashMap<FolderTarget, Option<i64>> = HashMap::new();
         let mut tags: HashMap<TagName, i64> = HashMap::new();
+        // 入れたファイル（probe の印と覚えを片付ける）
+        let done: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.outcome.is_ok())
+            .map(|e| inflight::probe_key(&e.file.path))
+            .collect();
 
         for entry in self.entries {
             let file = &entry.file;
@@ -309,28 +374,41 @@ impl BatchCommit {
                 }
             };
             let hash = placed.hash;
-            let item_id = match find_by_hash(tx, &hash)? {
-                Some(existing) => {
+            // 置いたファイル（files/<hash>.<file.ext>）は、台帳にその中身が同じ拡張子で載っているときだけ使われる
+            let kept_ext = ledger::ext_of(tx, &hash)?;
+            let unused_copy = |owned: bool| match &kept_ext {
+                Some(kept) => *kept != file.ext,
+                None => owned,
+            };
+            // 今・元・過去の版のどれかと同じ中身なら、そのアイテムの重複（docs/editing.md §14）
+            let item_id = match find_owner(tx, &hash)? {
+                Some(owner) => {
                     state.duplicates += 1;
-                    if existing.ext != file.ext {
+                    // 違う拡張子のコピーと、台帳に行がない（消えた過去の版と同じ中身）コピーは、どの行も使わない
+                    if unused_copy(true) {
                         extra_files.push(self.layout.content_path(&hash, &file.ext));
                     }
                     if self.policy == DuplicatePolicy::Ignore {
                         continue;
                     }
-                    if existing.trashed {
-                        restore_item(tx, existing.id, now)?;
+                    if owner.trashed {
+                        restore_item(tx, owner.id, now)?;
                     }
-                    existing.id
+                    owner.id
                 }
                 None => {
+                    // 台帳にだけある中身（アンカーなど）は、台帳の拡張子で入れる（items のトリガが食い違いを断るため）
+                    if unused_copy(false) {
+                        extra_files.push(self.layout.content_path(&hash, &file.ext));
+                    }
+                    let ext = kept_ext.as_deref().unwrap_or(&file.ext);
                     let id = insert_item(
                         tx,
                         &NewItem {
                             hash: &hash,
-                            ext: &file.ext,
+                            ext,
                             kind: file.kind,
-                            mime: mime_for(&file.ext),
+                            mime: mime_for(ext),
                             size: placed.size,
                             title: &title_from_name(&file.name),
                             original_name: &file.name,
@@ -346,6 +424,9 @@ impl BatchCommit {
                     id
                 }
             };
+            if placed.crashed {
+                inflight::fail_crashed_thumb(tx, item_id)?;
+            }
 
             if let Some(target) = &entry.assignment.folder {
                 let folder = match folders.get(target) {
@@ -390,6 +471,7 @@ impl BatchCommit {
             }
         }
 
+        inflight::settle_probes(tx, self.job_id, &done)?;
         state.cursor = self.end as u64;
         save_partial(
             tx,
@@ -402,22 +484,12 @@ impl BatchCommit {
     }
 }
 
-/// staging にコピーしてハッシュを取り、files/ に置いてからメディア情報を読む。
-fn stage_and_place(
-    layout: &Layout,
-    backend: &dyn MediaBackend,
-    file: &ScannedFile,
-    staging: &Path,
-) -> Result<Placed> {
+/// staging にコピーしてハッシュを取り、files/ に置く。(大きさ, ハッシュ) を返す（メディア情報は印を付けてから読む）。
+fn stage_and_place(layout: &Layout, file: &ScannedFile, staging: &Path) -> Result<(u64, [u8; 32])> {
     let staged = stage(&file.path, staging)?;
     let final_path = layout.content_path(&staged.hash, &file.ext);
     place(&staged, &final_path)?;
-    let info = backend.probe(&final_path, file.kind).ok();
-    Ok(Placed {
-        hash: staged.hash,
-        size: staged.size,
-        info,
-    })
+    Ok((staged.size, staged.hash))
 }
 
 /// 「ファイルの情報からタグ」：音楽のアーティストとアルバム（docs/decisions.md ADR-30）。
@@ -814,6 +886,95 @@ mod tests {
         env.assert_files_match_db();
     }
 
+    /// S14（docs/editing.md §14.1）：取り込んだファイルが、あるアイテムの元・消えた過去の版と同じ中身なら、そのアイテムの重複に
+    /// なり（アイテムは増えず、ゴミ箱から戻る）、孤立したファイルが残らない。元と同じ中身で拡張子が違うコピーも消す。
+    /// 版の行は、保存のジョブ（段 2 の B）の代わりにテストの補助で入れる。
+    #[test]
+    fn duplicate_of_original_or_released_version_is_owned() {
+        use crate::edit::testing::insert_version_with;
+        let env = Env::new();
+        let first = env.dir.path().join("first");
+        write(&first.join("now.png"), b"now");
+        let (_, result) = env.import(vec![first], ImportOptions::default());
+        assert_eq!(result.added, 1);
+        let (now, orig, past) = (
+            *blake3::hash(b"now").as_bytes(),
+            *blake3::hash(b"orig").as_bytes(),
+            *blake3::hash(b"past").as_bytes(),
+        );
+        // 元 orig（files/ と台帳にある）・版 1 past（GC で消えた）・版 2 が今。アイテムはゴミ箱に入れておく
+        write(&env.library.layout().content_path(&orig, "png"), b"orig");
+        env.library
+            .db()
+            .write(move |tx| {
+                insert_version_with(tx, 1, 0, orig, "png", 4, "hold", None);
+                insert_version_with(tx, 1, 1, past, "png", 4, "released", None);
+                insert_version_with(tx, 1, 2, now, "png", 3, "hold", None);
+                tx.execute("UPDATE items SET trashed_at = 5 WHERE id = 1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let again = env.dir.path().join("again");
+        write(&again.join("a.png"), b"orig");
+        write(&again.join("b.png"), b"past");
+        write(&again.join("c.jpg"), b"orig");
+        let options = ImportOptions {
+            tags: vec!["二回目".into()],
+            ..Default::default()
+        };
+        let (_, result) = env.import(vec![again], options);
+        assert_eq!((result.added, result.duplicates), (0, 3));
+        assert_eq!(env.count("SELECT COUNT(*) FROM items"), 1);
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM items WHERE id = 1 AND trashed_at IS NULL"),
+            1
+        );
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM item_tags WHERE item_id = 1"),
+            1
+        );
+        let layout = env.library.layout();
+        assert!(layout.content_path(&orig, "png").exists());
+        assert!(
+            !layout.content_path(&past, "png").exists(),
+            "消えた版のコピーが残った"
+        );
+        assert!(
+            !layout.content_path(&orig, "jpg").exists(),
+            "拡張子だけ違うコピーが残った"
+        );
+        env.assert_files_match_db();
+    }
+
+    /// 台帳にだけある中身（アンカーのファイル。アイテムの今・元・版のどれでもない）を別の拡張子で取り込むと、台帳の拡張子で
+    /// 入れる（items のトリガが食い違いで断らない）。置いたコピーは消える。
+    #[test]
+    fn content_only_in_the_ledger_is_imported_with_the_ledger_ext() {
+        let env = Env::new();
+        let anchor = *blake3::hash(b"anchor").as_bytes();
+        write(
+            &env.library.layout().content_path(&anchor, "png"),
+            b"anchor",
+        );
+        env.library
+            .db()
+            .write(move |tx| {
+                ledger::register(tx, &anchor, "png", 6, 1)?;
+                Ok(())
+            })
+            .unwrap();
+        let src = env.src();
+        write(&src.join("a.apng"), b"anchor");
+        let (_, result) = env.import(vec![src], ImportOptions::default());
+        assert_eq!((result.added, result.duplicates, result.failed), (1, 0, 0));
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM items WHERE ext = 'png' AND mime = 'image/png'"),
+            1
+        );
+        assert!(!env.library.layout().content_path(&anchor, "apng").exists());
+        env.assert_files_match_db();
+    }
+
     #[test]
     fn pause_and_resume_continue_from_cursor() {
         let env = Env::new();
@@ -1043,7 +1204,27 @@ mod tests {
         write(&src.join("photo.jpg"), b"photo");
         write(&src.join("song.flac"), b"song");
         let handler = ImportHandler::new(Arc::new(crate::media::fake::FakeBackend));
-        let jobs = env.manager(handler);
+        // 取り込みのあとに積むサムネイル・解析を数えるため、何もしないハンドラで登録する（登録のない種類は積まない）
+        struct Noop;
+        impl crate::jobs::JobHandler for Noop {
+            fn run(&self, _: &crate::jobs::JobContext) -> crate::Result<crate::jobs::JobEnd> {
+                Ok(crate::jobs::JobEnd::Done {
+                    result_json: "{}".into(),
+                    message: None,
+                })
+            }
+        }
+        let sink: EventSink = Arc::new(|_| {});
+        let jobs = JobManager::new(
+            env.library.clone(),
+            vec![
+                (JobKind::Import, Arc::new(handler)),
+                (JobKind::Thumbnail, Arc::new(Noop)),
+                (JobKind::Analyze, Arc::new(Noop)),
+            ],
+            sink,
+        )
+        .unwrap();
         let options = ImportOptions {
             file_info_tags: true,
             ..ImportOptions::default()
@@ -1088,11 +1269,284 @@ mod tests {
             env.count("SELECT COUNT(*) FROM tags WHERE (namespace, name) IN (VALUES ('アーティスト', '灯野'), ('アルバム', '夜'))"),
             2
         );
-        // 取り込んだらサムネイルのジョブが積まれる
+        // 取り込んだらサムネイルと解析のジョブが積まれる（登録のないプロキシは積まない）
         assert_eq!(
-            env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'thumbnail' AND state = 'queued'"),
+            env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'thumbnail'"),
             1
         );
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'analyze'"),
+            1
+        );
+        assert_eq!(
+            env.count("SELECT COUNT(*) FROM jobs WHERE kind = 'proxy'"),
+            0
+        );
+    }
+
+    /// フォント・3D・Aseprite を取り込み、プロキシ・解析の対象にしない。Aseprite でない `.ase` は取り込まず、
+    /// 理由を取り込みの結果に出す。
+    #[test]
+    fn imports_fonts_and_models_and_reports_rejected_ase() {
+        let env = Env::new();
+        let src = env.src();
+        write(&src.join("a.otf"), b"OTTO font");
+        write(&src.join("b.glb"), b"glTF model");
+        write(&src.join("c.ase"), &[0x80, 0, 0, 0, 0xE0, 0xA5, 1, 0]);
+        write(&src.join("colors.ase"), b"ASEF\x00\x01\x00\x00");
+        let jobs = env.manager(ImportHandler::new(Arc::new(
+            crate::media::fake::FakeBackend,
+        )));
+        let id = start_import(
+            &jobs,
+            &ImportInput {
+                paths: vec![src.clone()],
+                options: ImportOptions::default(),
+            },
+        )
+        .unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(WAIT));
+        let record = jobs.get(id).unwrap();
+        assert_eq!(record.state, JobState::Done);
+        let result: ImportResult =
+            serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
+        assert_eq!((result.added, result.skipped, result.failed), (3, 1, 0));
+        assert_eq!(result.rejected.len(), 1);
+        assert_eq!(
+            result.rejected[0].path,
+            src.join("colors.ase").to_string_lossy()
+        );
+        assert!(result.rejected[0].reason.contains("Aseprite"));
+
+        let rows: Vec<(String, String, String, String)> = env
+            .library
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT ext, kind, proxy_state, analysis_state FROM items ORDER BY ext",
+                )?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            })
+            .unwrap();
+        let rows: Vec<(&str, &str, &str, &str)> = rows
+            .iter()
+            .map(|(a, b, c, d)| (a.as_str(), b.as_str(), c.as_str(), d.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("ase", "image", "not_needed", "pending"),
+                ("glb", "model", "not_needed", "not_needed"),
+                ("otf", "font", "not_needed", "not_needed"),
+            ]
+        );
+    }
+
+    /// probe を呼んだファイル（中身のハッシュの 16 進）と、そのときの settings の `probe.inflight` を記録する backend
+    /// （検証 S2）。幅と高さは 1 を返す。
+    struct ProbeLog {
+        library: Arc<Library>,
+        calls: Mutex<Vec<(String, Option<serde_json::Value>)>>,
+    }
+
+    impl MediaBackend for ProbeLog {
+        fn probe(
+            &self,
+            path: &Path,
+            _: crate::import::MediaKind,
+        ) -> std::result::Result<MediaInfo, crate::media::MediaError> {
+            let mark = self
+                .library
+                .db()
+                .read(|c| crate::settings::get::<serde_json::Value>(c, "probe.inflight"))
+                .unwrap();
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            self.calls.lock().unwrap().push((stem, mark));
+            Ok(MediaInfo {
+                width: Some(1),
+                height: Some(1),
+                ..MediaInfo::default()
+            })
+        }
+        fn image_thumbnails(
+            &self,
+            _: &Path,
+            _: &crate::media::ThumbTargets,
+        ) -> std::result::Result<crate::media::ThumbFormat, crate::media::MediaError> {
+            Err(crate::media::MediaError::Unsupported)
+        }
+        fn video_thumbnails(
+            &self,
+            _: &Path,
+            _: f64,
+            _: &crate::media::ThumbTargets,
+        ) -> std::result::Result<crate::media::ThumbFormat, crate::media::MediaError> {
+            Err(crate::media::MediaError::Unsupported)
+        }
+        fn audio_artwork(
+            &self,
+            _: &Path,
+            _: &Path,
+            _: &crate::media::ThumbTargets,
+        ) -> std::result::Result<Option<crate::media::ThumbFormat>, crate::media::MediaError>
+        {
+            Err(crate::media::MediaError::Unsupported)
+        }
+        fn font_thumbnails(
+            &self,
+            _: &Path,
+            _: &crate::media::ThumbTargets,
+        ) -> std::result::Result<crate::media::ThumbFormat, crate::media::MediaError> {
+            Err(crate::media::MediaError::Unsupported)
+        }
+    }
+
+    fn hex_of(path: &Path) -> String {
+        crate::library::hex(&hash_file(path).unwrap())
+    }
+
+    fn thumb_state_of(env: &Env, hex: &str) -> String {
+        env.library
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT thumb_state FROM items WHERE lower(hex(hash)) = ?1",
+                    [hex],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    fn setting(env: &Env, key: &str) -> Option<serde_json::Value> {
+        env.library
+            .db()
+            .read(|c| crate::settings::get::<serde_json::Value>(c, key))
+            .unwrap()
+    }
+
+    /// 検証 S2：probe（OS のデコーダ。CoreText のフォントなど）を 1 件だけで読んでいる途中で落ちた（1 件だけの印が
+    /// 残った）ファイルは、次に開いたあとの取り込みで読み直さず、サムネイルを作れなかったものとして入れる
+    /// （起動のたびに同じファイルで落ち続けない）。ほかのファイルはふつうに読む。
+    #[test]
+    fn a_file_that_crashed_the_probe_is_not_probed_again() {
+        let env = Env::new();
+        let src = env.src();
+        write(&src.join("a.otf"), b"crashes-coretext");
+        write(&src.join("b.png"), b"fine");
+        let (a, b) = (hex_of(&src.join("a.otf")), hex_of(&src.join("b.png")));
+        // 前の取り込み（ジョブ 99）が a を 1 件だけで読んでいて落ちた
+        let a_key = crate::media::inflight::probe_key(&src.join("a.otf"));
+        let mark = serde_json::json!([{ "job": 99, "solo": true, "paths": [a_key] }]);
+        env.library
+            .db()
+            .write(move |tx| crate::settings::set(tx, "probe.inflight", &mark))
+            .unwrap();
+        crate::media::prepare_on_open(env.library.db());
+        let log = Arc::new(ProbeLog {
+            library: env.library.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let jobs = env.manager(ImportHandler::new(log.clone()));
+        let id = start_import(
+            &jobs,
+            &ImportInput {
+                paths: vec![src.clone()],
+                options: ImportOptions::default(),
+            },
+        )
+        .unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(WAIT));
+        assert_eq!(jobs.get(id).unwrap().state, JobState::Done);
+        let probed: Vec<String> = log
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.0.clone())
+            .collect();
+        assert_eq!(probed, vec![b.clone()], "落ちたファイルは読み直さない");
+        assert_eq!(thumb_state_of(&env, &a), "failed");
+        assert_eq!(thumb_state_of(&env, &b), "pending");
+        assert_eq!(setting(&env, "probe.inflight"), None);
+        assert_eq!(
+            setting(&env, "probe.crashed"),
+            None,
+            "入れたら落ちた印は片付ける"
+        );
+    }
+
+    /// 検証 S2：まとめて読んでいる途中で落ちた（まとめての印が残った）ファイルは、どれが原因か分からないので、次の取り込みで
+    /// 1 件ずつ、1 件だけの印を付けて読む（ほかのファイルを巻き込まない）。印のないファイルはまとめての印の下で読む。
+    /// 読み終えたら印を片付ける。
+    #[test]
+    fn files_probed_together_before_a_crash_are_probed_one_at_a_time() {
+        let env = Env::new();
+        let src = env.src();
+        write(&src.join("a.otf"), b"suspect-a");
+        write(&src.join("b.ttf"), b"suspect-b");
+        write(&src.join("c.png"), b"never-seen");
+        let (a, b, c) = (
+            hex_of(&src.join("a.otf")),
+            hex_of(&src.join("b.ttf")),
+            hex_of(&src.join("c.png")),
+        );
+        let key = |name: &str| crate::media::inflight::probe_key(&src.join(name));
+        let mark =
+            serde_json::json!([{ "job": 7, "solo": false, "paths": [key("a.otf"), key("b.ttf")] }]);
+        env.library
+            .db()
+            .write(move |tx| crate::settings::set(tx, "probe.inflight", &mark))
+            .unwrap();
+        crate::media::prepare_on_open(env.library.db());
+        let log = Arc::new(ProbeLog {
+            library: env.library.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let jobs = env.manager(ImportHandler::new(log.clone()));
+        let id = start_import(
+            &jobs,
+            &ImportInput {
+                paths: vec![src.clone()],
+                options: ImportOptions::default(),
+            },
+        )
+        .unwrap();
+        jobs.start().unwrap();
+        assert!(jobs.wait_idle(WAIT));
+        assert_eq!(jobs.get(id).unwrap().state, JobState::Done);
+        let calls = log.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        for (hash, mark) in &calls {
+            let mark = mark
+                .as_ref()
+                .unwrap_or_else(|| panic!("{hash} を印なしで読んだ"));
+            let ours = mark
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["job"] == serde_json::json!(id))
+                .unwrap_or_else(|| panic!("{hash}: このジョブの印がない（{mark}）"));
+            let paths: Vec<String> = serde_json::from_value(ours["paths"].clone()).unwrap();
+            if *hash == c {
+                assert_eq!(ours["solo"], serde_json::json!(false));
+                assert_eq!(paths, vec![key("c.png")]);
+            } else {
+                let name = if *hash == a { "a.otf" } else { "b.ttf" };
+                assert!(*hash == a || *hash == b);
+                assert_eq!(ours["solo"], serde_json::json!(true), "{hash}");
+                assert_eq!(paths, vec![key(name)]);
+            }
+        }
+        for h in [&a, &b, &c] {
+            assert_eq!(thumb_state_of(&env, h), "pending");
+        }
+        assert_eq!(setting(&env, "probe.inflight"), None);
+        assert_eq!(setting(&env, "probe.suspects"), None);
     }
 
     #[test]

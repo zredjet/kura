@@ -4,7 +4,13 @@
  * 形の決まっていない条件は「検索式」の行として文字のまま扱う。
  */
 
-export type KindValue = 'image' | 'video' | 'audio';
+import { kindWord, PLAYABLE_KINDS, type PlayableKind } from '../../ipc/kinds';
+import { clauseParts } from '../search/clauses';
+
+/**
+ * ルールの行で選べる種類：再生できる種類だけ（スマートの候補にフォント・3D は入らない。docs/playlists.md §1.1）。
+ */
+export type KindValue = PlayableKind;
 
 export type RuleRow =
   | { field: 'rating'; op: 'ge' | 'le' | 'eq'; value: number }
@@ -19,8 +25,8 @@ export type RuleRow =
 
 export type RuleField = RuleRow['field'];
 
-const KIND_WORDS: Record<KindValue, string> = { image: '画像', video: '動画', audio: '音楽' };
-const KIND_ORDER: KindValue[] = ['image', 'audio', 'video'];
+/** 行で選べる種類（並びは `ITEM_KINDS` の順）。 */
+export const RULE_KINDS: readonly KindValue[] = PLAYABLE_KINDS;
 
 /** 空白・記号を含む値は引用符で囲む（パレットの候補と同じ。ADR-52）。 */
 function quote(value: string): string {
@@ -48,7 +54,7 @@ export function newRow(field: RuleField): RuleRow {
     case 'rating':
       return { field, op: 'ge', value: 4 };
     case 'kind':
-      return { field, op: 'has', value: ['image', 'audio', 'video'] };
+      return { field, op: 'has', value: [...RULE_KINDS] };
     case 'tags':
       return { field, op: 'all', value: [] };
     case 'duration':
@@ -72,7 +78,7 @@ export function toClause(row: RuleRow): string {
     case 'rating':
       return `評価${{ ge: '>=', le: '<=', eq: '=' }[row.op]}${row.value}`;
     case 'kind': {
-      const kinds = KIND_ORDER.filter((k) => row.value.includes(k)).map((k) => KIND_WORDS[k]);
+      const kinds = RULE_KINDS.filter((k) => row.value.includes(k)).map(kindWord);
       return kinds.length === 0 ? '' : `種類${row.op === 'only' ? '=' : ':'}${kinds.join(',')}`;
     }
     case 'tags': {
@@ -119,11 +125,12 @@ function splitTerms(text: string): string[] | null {
   return terms && terms.join(' ') === text.trim().replace(/\s+/g, ' ') ? terms : null;
 }
 
-/** タグとして読める語か（フィールドの条件・記号を含まない）。 */
+/**
+ * タグとして読める語か（フィールドの条件・記号を含まない）。フィールドかどうかは Rust の表
+ * （bindings の `QUERY_FIELD_NAMES`。clauses.ts の `clauseParts`）で見分ける（`透過:あり` はタグではない）。
+ */
 function isTagTerm(term: string): boolean {
-  const field =
-    /^(種類|評価|長さ|追加|撮影|再生|再生回数|フォルダ|ユニット|取得元|名前|url|メモ|タグ数|幅|高さ|向き|type|rating|dur|added|taken|played|plays|folder|unit|source|name|note|tags|w|h|orient)[:=<>!]/i;
-  return !field.test(term) && !/[()|]/.test(term) && !term.startsWith('-');
+  return clauseParts(term).field === null && !/[()|]/.test(term) && !term.startsWith('-');
 }
 
 function tagValue(term: string): string {
@@ -139,10 +146,13 @@ export function fromClause(clause: string): RuleRow {
     const op = m[1] === '>=' ? 'ge' : m[1] === '<=' ? 'le' : 'eq';
     return { field: 'rating', op, value: Number(m[2]) };
   }
-  if ((m = text.match(/^種類([:=])((?:画像|動画|音楽)(?:,(?:画像|動画|音楽))*)$/))) {
+  if ((m = text.match(/^種類([:=])([^,\s]+(?:,[^,\s]+)*)$/))) {
+    // 行に戻すのは、行で書いた形（再生できる種類の語だけ）のとき。ほかは「検索式」の行のまま
     const words = (m[2] ?? '').split(',');
-    const value = KIND_ORDER.filter((k) => words.includes(KIND_WORDS[k]));
-    return { field: 'kind', op: m[1] === '=' ? 'only' : 'has', value };
+    if (words.every((w) => RULE_KINDS.some((k) => kindWord(k) === w))) {
+      const value = RULE_KINDS.filter((k) => words.includes(kindWord(k)));
+      return { field: 'kind', op: m[1] === '=' ? 'only' : 'has', value };
+    }
   }
   if ((m = text.match(/^長さ([<>])(\d+)分$/))) {
     return { field: 'duration', op: m[1] === '>' ? 'gt' : 'lt', minutes: Number(m[2]) };

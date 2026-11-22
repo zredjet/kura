@@ -4,13 +4,34 @@
 //! - 実ファイルとサムネイルは、少数のひな形 JPEG を APFS クローンで複製する（容量はほとんど増えない）。
 //! - タグ（2,000 個、1 件あたり 0〜5 個）と仮想フォルダ（60 個）も付ける（M4 の検索の計測用）。
 //! - 200 件ごとに 10 件の set ユニットを作る（M3 の「ユニットをまとめて表示」の計測用）。
+//! - `--analysis ready` なら、画像・音声に偽の事実（透過・色数・ドット絵・アニメ・ラウドネス・ループなど）を解析のジョブと
+//!   同じ書き込み（`kura_core::analysis::store::write`）で入れて解析済みにする（M11 の NFR-02・NFR-03・NFR-07 の計測用。
+//!   JPEG・HEIC は形式からの事実）。既定の `pending` は解析待ちのまま（画像・音声）。
+//! - `--analysis ready` の音声には、解析のジョブが書くのと同じ波形の段のファイル（`peaks/ab/<hash>.peaks`。`kura-peaks` 版 1）も
+//!   置く（長さ・形の違う 8 つのひな形をクローンで。グリッドの実波形 `/wave` とインスペクタの波形が描ける。M13 段 5）。
+//! - `--audio <百分率>` で音楽の割合を変える（残りは画像 7・動画 2）。`--no-art` は音楽にジャケットを付けない（サムネイルの
+//!   ファイルなし・`thumb_state` は failed。グリッドは実波形か飾りの波形）。グリッドの実波形の NFR-02 の計測用：
+//!   `seed --items 100000 --audio 100 --no-art --analysis ready --out <path>`。
 //! - 乱数はシード付きの ChaCha8 なので、同じ件数なら毎回同じライブラリになる。
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use kura_core::analysis::facts::{
+    FACTS_V, MediaFacts, PIXEL_RULE, PixelArtInput, from_format, pixel_art_v1,
+};
+use kura_core::analysis::plan::{PlanFingerprint, from_format_unless_read, peaks_params};
+use kura_core::analysis::store::{
+    self as analysis_store, ItemWrite, ReadStamp, Write, write as write_facts,
+};
 use kura_core::library::{Library, ThumbSize, hex};
+use kura_core::media::route;
 use kura_core::time::now_ms;
+use kura_engine::analysis::audio::peaks::{PEAK_BINS, PeakLevel, Peaks};
+use kura_engine::analysis::image::alpha::{AlphaKind, AlphaOutput};
+use kura_engine::analysis::image::colors::ColorsOutput;
+use kura_engine::analysis::image::pixel_scale::{AxisScale, PixelScaleOutput};
+use kura_engine::analysis::output::AnalysisOutput;
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 use rayon::prelude::*;
@@ -45,6 +66,9 @@ const UNIT_EVERY: usize = 200;
 const UNIT_SIZE: usize = 10;
 /// 1 トランザクションで入れる件数（.claude/rules/database.md：大量挿入は 500 件程度ずつ）。
 const CHUNK: usize = 500;
+/// 波形の段のひな形の長さ（秒。短い効果音から 8 分の曲まで。44.1 kHz ステレオ）。
+const PEAK_TEMPLATE_SECONDS: [u64; 8] = [4, 30, 95, 150, 200, 260, 340, 480];
+const PEAK_RATE: u32 = 44_100;
 
 /// ひな形 1 つ（s と l の JPEG）。
 struct Template {
@@ -71,10 +95,14 @@ struct Seeded {
     tags: Vec<i64>,
 }
 
-/// `--items` 件のダミーライブラリを `--out` に作る。
+/// `--items` 件のダミーライブラリを `--out` に作る（`--analysis ready` なら偽の事実と音声の波形の段を入れて解析済みにする。
+/// `--audio` は音楽の割合（百分率）、`--no-art` は音楽にジャケットを付けない）。
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut items = 100_000usize;
     let mut out = None;
+    let mut analyzed = false;
+    let mut audio_percent = None;
+    let mut no_art = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -85,6 +113,22 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     .ok_or("--items には件数を指定してください")?;
             }
             "--out" => out = it.next().map(PathBuf::from),
+            "--analysis" => {
+                analyzed = match it.next().map(String::as_str) {
+                    Some("ready") => true,
+                    Some("pending") => false,
+                    _ => return Err("--analysis には pending か ready を指定してください".into()),
+                };
+            }
+            "--audio" => {
+                audio_percent = Some(
+                    it.next()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .filter(|p| *p <= 100)
+                        .ok_or("--audio には音楽の割合（0〜100 の百分率）を指定してください")?,
+                );
+            }
+            "--no-art" => no_art = true,
             other => return Err(format!("不明な引数: {other}")),
         }
     }
@@ -95,13 +139,23 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let layout = library.layout().clone();
     let template_dir = layout.staging_dir().join("seed-templates");
     let templates = make_templates(&template_dir)?;
-    tracing::info!(templates = templates.len(), "ひな形を作りました");
+    // 解析済みにする音声の波形の段（解析のジョブが DB に書く前に置くもの）
+    let peak_templates = if analyzed {
+        make_peak_templates(&template_dir)?
+    } else {
+        Vec::new()
+    };
+    tracing::info!(
+        templates = templates.len(),
+        peaks = peak_templates.len(),
+        "ひな形を作りました"
+    );
 
     let mut rng = ChaCha8Rng::seed_from_u64(0x6b75_7261);
     let now = now_ms();
     let folders = seed_folders(&library, now)?;
     seed_tags(&library, now)?;
-    let seeded = plan_items(&mut rng, items, &templates, &folders, now);
+    let seeded = plan_items(&mut rng, items, &templates, &folders, now, audio_percent);
     tracing::info!(items = seeded.len(), "アイテムを決めました");
 
     // 実ファイル・サムネイル・ジャケットをクローンで置く（APFS のクローンは並列にしすぎると遅いので 6 並列）
@@ -113,11 +167,19 @@ pub fn run(args: &[String]) -> Result<(), String> {
         seeded.par_iter().try_for_each(|item| {
             let t = &templates[item.template];
             let hash_hex = hex(&item.hash);
+            let audio = item.kind == "audio";
             clone(&t.large, &layout.content_path(&item.hash, item.ext))?;
-            clone(&t.small, &layout.thumb_path(&hash_hex, ThumbSize::Small))?;
-            clone(&t.large, &layout.thumb_path(&hash_hex, ThumbSize::Large))?;
-            if item.kind == "audio" {
-                clone(&t.large, &layout.art_path(&hash_hex))?;
+            // 音楽のサムネイルはジャケット（--no-art ならどちらも置かない）
+            if !(audio && no_art) {
+                clone(&t.small, &layout.thumb_path(&hash_hex, ThumbSize::Small))?;
+                clone(&t.large, &layout.thumb_path(&hash_hex, ThumbSize::Large))?;
+                if audio {
+                    clone(&t.large, &layout.art_path(&hash_hex))?;
+                }
+            }
+            if audio && !peak_templates.is_empty() {
+                let k = usize::from(item.hash[0]) % peak_templates.len();
+                clone(&peak_templates[k], &layout.peaks_path(&hash_hex))?;
             }
             Ok::<(), String>(())
         })
@@ -127,8 +189,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
         "ファイルを置きました"
     );
 
-    insert_items(&library, &templates, seeded)?;
+    insert_items(&library, &templates, seeded, no_art)?;
     seed_units(&library, items, now)?;
+    write_plans(&library)?;
+    if analyzed {
+        let n = seed_facts(&library)?;
+        tracing::info!(n, "偽の事実を入れました");
+    }
     std::fs::remove_dir_all(&template_dir).map_err(|e| e.to_string())?;
     tracing::info!(
         items,
@@ -174,6 +241,83 @@ fn write_jpeg(path: &Path, w: u32, h: u32, palette: usize) -> Result<(), String>
         .map_err(|e| e.to_string())?
         .encode(&buf, w16, h16, jpeg_encoder::ColorType::Rgb)
         .map_err(|e| e.to_string())
+}
+
+/// 波形の段のひな形を書く（[`PEAK_TEMPLATE_SECONDS`] の長さごとに 1 つ。段は解析と同じ引数 `peaks_params`）。
+fn make_peak_templates(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    PEAK_TEMPLATE_SECONDS
+        .iter()
+        .enumerate()
+        .map(|(k, seconds)| {
+            let path = dir.join(format!("p{k}.peaks"));
+            let bytes = fake_peaks(*seconds * u64::from(PEAK_RATE), k as u64)?;
+            std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+            Ok(path)
+        })
+        .collect()
+}
+
+/// `frames` フレーム（44.1 kHz ステレオ）の偽の波形の段（`kura-peaks` 版 1）。段は解析のジョブと同じ（`peaks_params`）で、
+/// 最も細かい段だけを乱数で作り（8〜23 の区間ごとの大きさ × 前後のフェード × ビンごとのゆらぎ）、上の段は 4 ビンずつの
+/// min の min・max の max（エンジンの決まりと同じ）。
+fn fake_peaks(frames: u64, seed: u64) -> Result<Vec<u8>, String> {
+    let params = peaks_params(frames);
+    let bin_of = |key: &str| {
+        params
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|b| u32::try_from(b).ok())
+            .ok_or_else(|| format!("段の引数 {key} がありません"))
+    };
+    let (finest, coarsest) = (bin_of("finest")?, bin_of("coarsest")?);
+    let bins: Vec<u32> = PEAK_BINS
+        .iter()
+        .copied()
+        .filter(|b| (finest..=coarsest).contains(b))
+        .collect();
+    let channels = 2usize;
+    let mut rng = ChaCha8Rng::seed_from_u64(0x7065_616b ^ seed);
+    let n = frames.div_ceil(u64::from(finest)) as usize;
+    let sections = 8 + (rng.next_u32() % 16) as usize;
+    let levels: Vec<f64> = (0..sections)
+        .map(|_| 0.25 + 0.75 * unit(&mut rng))
+        .collect();
+    let fade = (n / 20).max(1);
+    let mut data = Vec::with_capacity(n * channels * 2);
+    for k in 0..n {
+        let section = levels[k * sections / n.max(1)];
+        let edge = (k.min(n - 1 - k) as f64 / fade as f64).min(1.0);
+        for _ in 0..channels {
+            let a = section * edge * (0.55 + 0.45 * unit(&mut rng));
+            let hi = (a * 32_767.0) as i16;
+            let lo = -((a * (0.9 + 0.1 * unit(&mut rng))) * 32_767.0) as i16;
+            data.extend([lo, hi]);
+        }
+    }
+    let mut out = vec![PeakLevel { bin: finest, data }];
+    for b in bins.iter().skip(1) {
+        let prev = out.last().ok_or("段がありません")?;
+        let group = (b / prev.bin) as usize * channels * 2;
+        let mut up = Vec::with_capacity(prev.data.len() / 4 + channels * 2);
+        for chunk in prev.data.chunks(group) {
+            for ch in 0..channels {
+                let pairs = chunk.chunks(channels * 2);
+                let lo = pairs.clone().map(|p| p[ch * 2]).min().unwrap_or(0);
+                let hi = pairs.map(|p| p[ch * 2 + 1]).max().unwrap_or(0);
+                up.extend([lo, hi]);
+            }
+        }
+        out.push(PeakLevel { bin: *b, data: up });
+    }
+    Peaks {
+        rate: PEAK_RATE,
+        channels: channels as u16,
+        frames,
+        levels: out,
+    }
+    .to_canonical()
+    .map_err(|e| e.to_string())
 }
 
 fn make_templates(dir: &Path) -> Result<Vec<Template>, String> {
@@ -285,18 +429,255 @@ fn seed_units(library: &Library, items: usize, now: i64) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// 解析を待つ画像・音声の行。
+type PendingRow = (
+    i64,
+    Vec<u8>,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// 解析を待つ画像・音声に偽の事実を入れて解析済みにする（解析のジョブと同じ書き込み。500 件ずつ）。入れた数を返す。
+/// 今の作り方の指紋（サムネイルの `thumbs.plan`・解析の `analysis.plan`）を置く。置かないと、初めて開いたときに M10 の
+/// 作り方と比べて png・heic などのサムネイルがすべて作り直しになり、計測（NFR-01・02・03・07）にジョブが混ざる。
+/// seed のサムネイルは今の作り方で作ったものとみなす（中身は JPEG のひな形）。
+fn write_plans(library: &Library) -> Result<(), String> {
+    let current = kura_engine::analysis::registry()
+        .map_err(|e| e.to_string())
+        .and_then(|r| PlanFingerprint::current(&r).map_err(|e| e.to_string()))?;
+    library
+        .db()
+        .write(move |tx| {
+            kura_core::settings::set(tx, route::PLAN_KEY, &route::plan())?;
+            // 指紋がなければすべての種類を pending に戻すが、seed のアイテムはまだ pending なので変わらない
+            analysis_store::sync_plan(tx, &current)?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
+}
+
+fn seed_facts(library: &Library) -> Result<u64, String> {
+    let mut rng = ChaCha8Rng::seed_from_u64(0x6661_6374);
+    let mut after = 0i64;
+    let mut written = 0;
+    loop {
+        let rows: Vec<PendingRow> = library
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare_cached(
+                    "SELECT id, hash, ext, kind, width, height, duration_ms FROM items
+                      WHERE id > ?1 AND analysis_state = 'pending' ORDER BY id LIMIT ?2",
+                )?;
+                let rows = stmt
+                    .query_map((after, CHUNK as i64), |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(rows)
+            })
+            .map_err(|e| e.to_string())?;
+        let Some(last) = rows.last() else {
+            return Ok(written);
+        };
+        after = last.0;
+        let writes: Vec<ItemWrite> = rows
+            .into_iter()
+            .filter_map(|(id, hash, ext, kind, w, h, duration)| {
+                let hash: [u8; 32] = hash.as_slice().try_into().ok()?;
+                let (facts, stamp) = fake_facts(&mut rng, &kind, &ext, w.zip(h), duration);
+                Some(ItemWrite {
+                    id,
+                    hash,
+                    write: Write::Ready {
+                        results: Vec::new(),
+                        keep: None,
+                        facts: Box::new(facts),
+                        stamp: Some(stamp),
+                    },
+                })
+            })
+            .collect();
+        let w = library
+            .db()
+            .write(move |tx| write_facts(tx, &writes, now_ms()))
+            .map_err(|e| e.to_string())?;
+        written += w.written;
+    }
+}
+
+/// 0〜1 の一様な数。
+fn unit(rng: &mut ChaCha8Rng) -> f64 {
+    f64::from(rng.next_u32()) / f64::from(u32::MAX)
+}
+
+/// 偽の画像の事実：透過は 6 割（半透明 2 割）、色数は 2 割が 256 色以下、倍率は 1 割が 2・3・4・8 倍、アニメは 5%。
+/// ドット絵は v1 の規則で決める。
+fn fake_image(rng: &mut ChaCha8Rng, format: &str, size: Option<(i64, i64)>) -> MediaFacts {
+    let alpha = match rng.next_u32() % 10 {
+        0..=3 => AlphaKind::None,
+        4..=7 => AlphaKind::Binary,
+        _ => AlphaKind::Partial,
+    };
+    let colors: u16 = if rng.next_u32().is_multiple_of(5) {
+        2 + (rng.next_u32() % 255) as u16
+    } else {
+        257
+    };
+    let k = if rng.next_u32().is_multiple_of(10) {
+        [2, 3, 4, 8][(rng.next_u32() % 4) as usize]
+    } else {
+        1
+    };
+    let axis = Some(AxisScale {
+        k,
+        phase: 0,
+        lines: 8,
+    });
+    let a = AlphaOutput {
+        kind: alpha,
+        transparent: u64::from(alpha != AlphaKind::None),
+        partial: u64::from(alpha == AlphaKind::Partial),
+        opaque: 1,
+        uncovered: 0,
+    };
+    let c = ColorsOutput {
+        count: colors,
+        colors: None,
+        visible: colors,
+        palette_lossless: colors <= 256,
+        palette: None,
+    };
+    let s = PixelScaleOutput {
+        x: axis,
+        y: axis,
+        lossless: k > 1,
+    };
+    let frames = if rng.next_u32().is_multiple_of(20) {
+        2 + i64::from(rng.next_u32() % 23)
+    } else {
+        1
+    };
+    MediaFacts {
+        facts_v: FACTS_V,
+        alpha: Some(match alpha {
+            AlphaKind::None => 0,
+            AlphaKind::Binary => 1,
+            AlphaKind::Partial => 2,
+        }),
+        colors: Some(i64::from(colors)),
+        visible_colors: Some(i64::from(colors)),
+        pixel_kx: Some(i64::from(k)),
+        pixel_ky: Some(i64::from(k)),
+        pixel_lossless: Some(k > 1),
+        pixel_art: pixel_art_v1(&PixelArtInput {
+            format,
+            size: size.map(|(w, h)| (w.max(1).unsigned_abs(), h.max(1).unsigned_abs())),
+            alpha: Some(&a),
+            colors: Some(&c),
+            scale: Some(&s),
+        }),
+        pixel_rule: Some(PIXEL_RULE),
+        frame_count: Some(frames),
+        ..MediaFacts::default()
+    }
+}
+
+/// 偽の音声の事実：ラウドネスは 9 割が −35〜−6 LUFS（ほかは短すぎて計れない）、ループは 5%、深さは FLAC だけ。
+fn fake_audio(rng: &mut ChaCha8Rng, format: &str, duration_ms: Option<i64>) -> MediaFacts {
+    let rate: i64 = if rng.next_u32().is_multiple_of(2) {
+        44_100
+    } else {
+        48_000
+    };
+    let frames = duration_ms.unwrap_or(180_000) * rate / 1000;
+    let measured = !rng.next_u32().is_multiple_of(10);
+    let peak = -6.0 * unit(rng);
+    let looped = rng.next_u32().is_multiple_of(20);
+    let start = frames / 10;
+    let loudness = -35.0 + 29.0 * unit(rng);
+    let range = 2.0 + 13.0 * unit(rng);
+    let channels = if rng.next_u32().is_multiple_of(10) {
+        1
+    } else {
+        2
+    };
+    let bits = if rng.next_u32().is_multiple_of(2) {
+        16
+    } else {
+        24
+    };
+    let clips = if rng.next_u32().is_multiple_of(10) {
+        1 + i64::from(rng.next_u32() % 5)
+    } else {
+        0
+    };
+    MediaFacts {
+        facts_v: FACTS_V,
+        loudness: measured.then_some(loudness),
+        loudness_reason: (!measured).then(|| "tooShort".to_string()),
+        loudness_range: measured.then_some(range),
+        true_peak: Some(peak),
+        sample_peak: Some(peak - 0.3),
+        has_loop: Some(looped),
+        loop_start: looped.then_some(start),
+        loop_end: looped.then_some(frames - start),
+        sample_rate: Some(rate),
+        channels: Some(channels),
+        bits: (format == "flac").then_some(bits),
+        clip_runs: Some(clips),
+        ..MediaFacts::default()
+    }
+}
+
+/// 種類と形式に合った偽の事実と、読み取りの記録の列。JPEG は読まずに形式から、HEIC は見出しでアルファがないと分かった写真
+/// として形式から（解析のジョブと同じ。決定 5・15）。
+fn fake_facts(
+    rng: &mut ChaCha8Rng,
+    kind: &str,
+    ext: &str,
+    size: Option<(i64, i64)>,
+    duration_ms: Option<i64>,
+) -> (MediaFacts, ReadStamp) {
+    let format = kura_core::import::format_id(ext).unwrap_or_default();
+    let read = ReadStamp {
+        decoder: Some("seed-fake-dec/1".into()),
+        reproducible: Some(true),
+        value_digest: None,
+        env: None,
+    };
+    match kind {
+        "image" if from_format_unless_read(format) => (from_format(format), ReadStamp::default()),
+        "image" => (fake_image(rng, format, size), read),
+        _ => (fake_audio(rng, format, duration_ms), read),
+    }
+}
+
 /// 0..n を偏りのある分布で選ぶ（小さい番号ほど選ばれやすい。人気のタグを再現する）。
 fn skewed(rng: &mut ChaCha8Rng, n: usize) -> usize {
     let u = (rng.next_u32() as f64) / (u32::MAX as f64);
     ((u * u * u) * n as f64) as usize % n
 }
 
+/// アイテムを決める。種類は画像 7・動画 2・音楽 1（`audio_percent` があれば音楽をその割合にし、残りを画像 7・動画 2）。
+/// `audio_percent` がなければ乱数の引き方は前と同じ（同じ件数なら前と同じライブラリ）。
 fn plan_items(
     rng: &mut ChaCha8Rng,
     count: usize,
     templates: &[Template],
     folders: &[i64],
     now: i64,
+    audio_percent: Option<u32>,
 ) -> Vec<Seeded> {
     let span = 730 * DAY_MS;
     let mut times: Vec<i64> = (0..count)
@@ -308,7 +689,12 @@ fn plan_items(
         .into_iter()
         .enumerate()
         .map(|(i, imported_at)| {
-            let roll = rng.next_u32() % 10;
+            // 0〜6 画像・7〜8 動画・9 音楽
+            let roll = match audio_percent {
+                None => rng.next_u32() % 10,
+                Some(p) if rng.next_u32() % 100 < p => 9,
+                Some(_) => rng.next_u32() % 9,
+            };
             let palette = (rng.next_u32() as usize) % per_shape;
             let (kind, ext, shape, size, duration_ms) = match roll {
                 0..=6 => {
@@ -396,6 +782,7 @@ fn insert_items(
     library: &Library,
     templates: &[Template],
     seeded: Vec<Seeded>,
+    no_art: bool,
 ) -> Result<(), String> {
     let dims: Vec<(u32, u32)> = templates.iter().map(|t| (t.width, t.height)).collect();
     let mut seeded = seeded;
@@ -409,8 +796,9 @@ fn insert_items(
                 let mut item_stmt = tx.prepare_cached(
                     "INSERT INTO items (hash, ext, kind, mime, size_bytes, width, height, duration_ms,
                                         title, original_name, original_path, source_site, rating,
-                                        captured_at, imported_at, updated_at, thumb_state, proxy_state)
-                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, 'ready', 'not_needed')",
+                                        captured_at, imported_at, updated_at, thumb_state, proxy_state, analysis_state)
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15, 'not_needed',
+                             CASE WHEN ?3 IN ('image', 'audio') THEN 'pending' ELSE 'not_needed' END)",
                 )?;
                 let mut tag_stmt =
                     tx.prepare_cached("INSERT OR IGNORE INTO item_tags (tag_id, item_id, source) VALUES (?1, ?2, 'user')")?;
@@ -424,6 +812,12 @@ fn insert_items(
                         (Some(i64::from(w)), Some(i64::from(h)))
                     };
                     let name = format!("{}.{}", item.title, item.ext);
+                    // ジャケットのない音楽はサムネイルの作り方で「ジャケットなし」と同じ（failed）
+                    let thumb_state = if item.kind == "audio" && no_art {
+                        "failed"
+                    } else {
+                        "ready"
+                    };
                     item_stmt.execute(rusqlite::params![
                         &item.hash[..],
                         item.ext,
@@ -439,6 +833,7 @@ fn insert_items(
                         item.rating,
                         item.captured_at,
                         item.imported_at,
+                        thumb_state,
                     ])?;
                     let id = tx.last_insert_rowid();
                     for tag in item.tags {
@@ -491,6 +886,20 @@ mod tests {
             .unwrap();
         assert_eq!(items, 1200);
         assert_eq!(pending, 0);
+        // 解析するのは画像・音声だけ（動画は not_needed）。台帳にも 1 件ずつ載る
+        let (video_pending, ledger) = library
+            .db()
+            .read(|c| {
+                let count = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0));
+                Ok((
+                    count(
+                        "SELECT count(*) FROM items WHERE kind = 'video' AND analysis_state <> 'not_needed'",
+                    )?,
+                    count("SELECT count(*) FROM blobs")?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((video_pending, ledger), (0, 1200));
         assert!(tagged > 600, "tagged {tagged}");
         assert!(filed > 400, "filed {filed}");
         assert_eq!(tags, TAGS as i64);
@@ -507,6 +916,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!((units, members), (6, 60));
+
+        // 今の作り方の指紋が置かれていて、開いてもサムネイル・解析の作り直しは起きない
+        let (thumbs_sync, analysis_sync) = library
+            .db()
+            .write(|tx| {
+                let current =
+                    PlanFingerprint::current(&kura_engine::analysis::registry().unwrap()).unwrap();
+                Ok((
+                    route::sync_plan(tx)?,
+                    analysis_store::sync_plan(tx, &current)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            (thumbs_sync.stale, thumbs_sync.retried, analysis_sync.reset),
+            (0, 0, 0)
+        );
 
         // 実ファイル・サムネイル・ジャケットが置かれ、ひな形は消えている
         let layout = library.layout();
@@ -527,8 +953,131 @@ mod tests {
             assert!(layout.thumb_path(&hash_hex, ThumbSize::Small).exists());
             assert!(layout.thumb_path(&hash_hex, ThumbSize::Large).exists());
             assert_eq!(layout.art_path(&hash_hex).exists(), kind == "audio");
+            assert!(!layout.peaks_path(&hash_hex).exists(), "解析待ちに段はない");
         }
         assert!(!layout.staging_dir().join("seed-templates").exists());
+    }
+
+    /// `--analysis ready`：画像・音声に偽の事実を入れて解析済みにする（JPEG・HEIC は形式から。動画は not_needed のまま）。
+    #[test]
+    fn seeds_fake_facts_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("facts.kuralib");
+        let mut a = args(400, &out);
+        a.extend(["--analysis".to_string(), "ready".to_string()]);
+        run(&a).unwrap();
+        let library = Library::open(&out).unwrap();
+        let count = |sql: &str| {
+            let sql = sql.to_string();
+            library
+                .db()
+                .read(move |c| Ok(c.query_row(&sql, [], |r| r.get::<_, i64>(0))?))
+                .unwrap()
+        };
+        assert_eq!(
+            count("SELECT count(*) FROM items WHERE analysis_state = 'pending'"),
+            0
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM media_facts"),
+            count("SELECT count(*) FROM items WHERE kind IN ('image', 'audio')")
+        );
+        assert!(count("SELECT count(*) FROM media_facts WHERE alpha > 0") > 0);
+        assert!(count("SELECT count(*) FROM media_facts WHERE loudness IS NOT NULL") > 0);
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM media_facts f JOIN blobs b ON b.id = f.blob_id
+                  WHERE b.ext IN ('jpg', 'heic') AND (f.alpha <> 0 OR f.decoder IS NOT NULL)"
+            ),
+            0,
+            "JPEG・HEIC は形式から"
+        );
+        assert_eq!(
+            count("SELECT count(*) FROM media_facts WHERE facts_v <> 1"),
+            0,
+            "読まずに作り直すものはない"
+        );
+        assert!(run(&["--analysis".into(), "maybe".into()]).is_err());
+    }
+
+    /// グリッドの実波形の計測用（M13 段 5）：`--audio 100 --no-art --analysis ready` は、すべて音楽で、ジャケット・
+    /// サムネイルのファイルがなく（thumb_state は failed）、解析済みで、波形の段のファイルがある（`/wave` が読む段を読める）。
+    #[test]
+    fn seeds_audio_without_art_and_with_peaks() {
+        use kura_core::asset::wave::{BARS, read_level};
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("wave.kuralib");
+        let mut a = args(120, &out);
+        a.extend(["--audio", "100", "--no-art", "--analysis", "ready"].map(String::from));
+        run(&a).unwrap();
+        let library = Library::open(&out).unwrap();
+        let rows: Vec<(Vec<u8>, String, String, String, String)> = library
+            .db()
+            .read(|c| {
+                let mut stmt =
+                    c.prepare("SELECT hash, ext, kind, thumb_state, analysis_state FROM items")?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 120);
+        let layout = library.layout();
+        let mut bins = std::collections::BTreeSet::new();
+        for (hash, ext, kind, thumb, analysis) in &rows {
+            let hash: [u8; 32] = hash.as_slice().try_into().unwrap();
+            let hash_hex = hex(&hash);
+            assert_eq!(
+                (kind.as_str(), thumb.as_str(), analysis.as_str()),
+                ("audio", "failed", "ready")
+            );
+            assert!(layout.content_path(&hash, ext).exists());
+            assert!(!layout.thumb_path(&hash_hex, ThumbSize::Small).exists());
+            assert!(!layout.art_path(&hash_hex).exists());
+            let peaks = std::fs::read(layout.peaks_path(&hash_hex)).unwrap();
+            let parsed = Peaks::from_canonical(&peaks).unwrap();
+            assert_eq!(parsed.channels, 2);
+            let level = read_level(&layout.peaks_path(&hash_hex), BARS).unwrap();
+            bins.insert(level.bin);
+        }
+        // 短い効果音のひな形は細かい段、長い曲は最も粗い段を読む
+        assert!(bins.len() > 1, "{bins:?}");
+        assert!(bins.contains(&65_536), "{bins:?}");
+        assert!(run(&["--audio".into(), "101".into()]).is_err());
+        assert!(run(&["--audio".into(), "x".into()]).is_err());
+    }
+
+    /// 偽の段は解析の引数どおりの段を持ち、上の段は下の段の 4 ビンずつの min・max（エンジンの読み手が受け付ける）。
+    #[test]
+    fn fake_peaks_follow_the_analysis_levels() {
+        for (seconds, want) in [
+            (4, vec![256, 1_024, 4_096, 16_384, 65_536]),
+            (480, vec![16_384, 65_536]),
+        ] {
+            let frames = seconds * u64::from(PEAK_RATE);
+            let p = Peaks::from_canonical(&fake_peaks(frames, 1).unwrap()).unwrap();
+            assert_eq!(p.frames, frames);
+            assert_eq!(p.levels.iter().map(|l| l.bin).collect::<Vec<_>>(), want);
+            for w in p.levels.windows(2) {
+                let (fine, coarse) = (&w[0], &w[1]);
+                let ratio = (coarse.bin / fine.bin) as usize;
+                for (i, pair) in coarse.data.chunks(4).enumerate() {
+                    for ch in 0..2 {
+                        let group: Vec<&[i16]> =
+                            fine.data.chunks(4).skip(i * ratio).take(ratio).collect();
+                        assert_eq!(pair[ch * 2], group.iter().map(|g| g[ch * 2]).min().unwrap());
+                        assert_eq!(
+                            pair[ch * 2 + 1],
+                            group.iter().map(|g| g[ch * 2 + 1]).max().unwrap()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -543,7 +1092,14 @@ mod tests {
             .collect();
         let plan = || {
             let mut rng = ChaCha8Rng::seed_from_u64(7);
-            plan_items(&mut rng, 3000, &templates, &[1, 2, 3], 1_800_000_000_000)
+            plan_items(
+                &mut rng,
+                3000,
+                &templates,
+                &[1, 2, 3],
+                1_800_000_000_000,
+                None,
+            )
         };
         let key = |s: &Seeded| {
             (
@@ -566,5 +1122,24 @@ mod tests {
         assert!((share("video") - 0.2).abs() < 0.05);
         assert!((share("audio") - 0.1).abs() < 0.05);
         assert!(a.iter().all(|s| s.template < templates.len()));
+
+        // --audio：音楽の割合（残りは画像 7・動画 2）
+        let with = |p| {
+            let mut rng = ChaCha8Rng::seed_from_u64(7);
+            plan_items(
+                &mut rng,
+                3000,
+                &templates,
+                &[1, 2, 3],
+                1_800_000_000_000,
+                Some(p),
+            )
+        };
+        assert!(with(100).iter().all(|s| s.kind == "audio"));
+        assert!(with(0).iter().all(|s| s.kind != "audio"));
+        let half = with(50);
+        let share = |kind: &str| half.iter().filter(|s| s.kind == kind).count() as f64 / 3000.0;
+        assert!((share("audio") - 0.5).abs() < 0.05);
+        assert!((share("image") - 0.5 * 7.0 / 9.0).abs() < 0.05);
     }
 }

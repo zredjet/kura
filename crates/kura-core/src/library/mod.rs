@@ -3,25 +3,62 @@
 pub mod backup;
 mod integrity;
 mod layout;
+pub mod ledger;
 mod location;
+mod lock;
 mod session;
+pub mod upgrade;
 
-pub use integrity::{IntegrityReport, check_files, clean_staging};
-pub use layout::{DB_FILE, Layout, SUBDIRS, ThumbSize, content_rel_path, hex, parse_hex32};
+pub use integrity::{
+    Depth as IntegrityDepth, IntegrityReport, check as check_integrity, check_files, clean_staging,
+    repair_blob_ids,
+};
+pub use layout::{
+    ANIM_V, DB_FILE, Layout, SUBDIRS, ThumbFormat, ThumbSize, content_rel_path, hex, parse_hex32,
+};
 pub use location::{
     LIBRARY_EXT, LocationCheck, LocationStatus, check_location, is_library, normalize_library_path,
 };
-pub use session::{EventSink, LibraryInfo, LibrarySession};
+pub use lock::{LOCK_FILE, LibraryLock};
+pub use session::{EventSink, LibraryInfo, LibrarySession, Services};
+pub use upgrade::{UpgradeEvent, UpgradeHooks};
 
+use std::cell::Cell;
 use std::path::Path;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Instant;
 
-use crate::db::Db;
+use crate::db::{Db, MigrationReport};
 use crate::{CoreError, Result};
 
-/// 開いているライブラリ。フォルダ構成と DB を持つ。
+/// `path` のライブラリを開くとマイグレーションを当てるか（開く前に「ライブラリを更新しています」を出すのに使う）。
+/// DB がなければ false。読み取り専用で版（user_version）だけを読む。
+pub fn needs_upgrade(path: &Path) -> Result<bool> {
+    let db = path.join(DB_FILE);
+    if !db.is_file() {
+        return Ok(false);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let version = crate::db::applied(&conn)?;
+    Ok(version > 0 && version < crate::db::MIGRATIONS.len())
+}
+
+/// 開いているライブラリ。フォルダ構成と DB とライブラリのロックを持つ。
 pub struct Library {
     layout: Layout,
     db: Db,
+    /// 開いたときに当てたマイグレーション。
+    migration: MigrationReport,
+    /// 取り込み（files/ に置いてから DB に書くまで）と、台帳から外す・台帳にない中身を置く処理（ゴミ箱を空にする・保存の
+    /// 予告から後始末まで・段 3 の GC）を直列にする鍵（台帳の門）。取り込みどうしは並べてよい（読み取りの側）。
+    /// 台帳の門を通る処理は 1 つだけ（書き込みの側）。
+    ingest: RwLock<()>,
+    /// ライブラリのロック（`library.lock`。ほかのアプリが同じライブラリを開くのを断る）。閉じるときに DB を閉じてから放す
+    /// （[`Library::close`]）。
+    lock: LibraryLock,
 }
 
 impl Library {
@@ -44,27 +81,113 @@ impl Library {
             }
         }
         std::fs::create_dir_all(&path)?;
-        Self::open_dir(&path)
+        // 根のフォルダを作ってからロックを取る（同じ場所に同時に作るほかのアプリとぶつかれば LibraryInUse）。
+        // 新しい DB（版 0）には当てる前の手順がないので、空きの確かめと知らせは要らない
+        let lock = LibraryLock::acquire(&path)?;
+        Self::open_dir(lock, &UpgradeHooks::default())
     }
 
     /// 既存のライブラリを開く。足りないフォルダは作り直し、マイグレーションを適用する。
     pub fn open(path: &Path) -> Result<Self> {
-        if !is_library(path) {
-            return Err(CoreError::NotFound(format!(
-                "ライブラリが見つかりません: {}",
-                path.display()
-            )));
-        }
-        Self::open_dir(path)
+        Self::open_with(path, &UpgradeHooks::default())
     }
 
-    fn open_dir(path: &Path) -> Result<Self> {
-        let layout = Layout::new(path);
+    /// 既存のライブラリを開く。新しい版にするときは、当てる前に空きを確かめ（`hooks.free_space`）、始まり・終わり・失敗を
+    /// 知らせる（`hooks.notify`。`upgrade` の冒頭）。ほかのアプリが開いていれば `CoreError::LibraryInUse` で、何もせずに断る。
+    pub fn open_with(path: &Path, hooks: &UpgradeHooks) -> Result<Self> {
+        ensure_library(path)?;
+        // 何より先にロックを取る（断るときは、フォルダの作り直し・DB・バックアップ・知らせのどれもしない）
+        let lock = LibraryLock::acquire(path)?;
+        Self::open_dir(lock, hooks)
+    }
+
+    /// 先に取ったロック（[`LibraryLock::acquire`]）で、そのライブラリを開く（別のライブラリから切り替えるとき、今の
+    /// ライブラリを閉じる前に開く先のロックを取っておく。src-tauri の `AppState::replace_session`）。
+    pub fn open_locked(lock: LibraryLock, hooks: &UpgradeHooks) -> Result<Self> {
+        ensure_library(lock.root())?;
+        Self::open_dir(lock, hooks)
+    }
+
+    /// `lock` を取ったライブラリを開く（ロックは呼び手が取る。失敗したら drop で放す）。
+    fn open_dir(lock: LibraryLock, hooks: &UpgradeHooks) -> Result<Self> {
+        let layout = Layout::new(lock.root());
         for dir in SUBDIRS {
             std::fs::create_dir_all(layout.root().join(dir))?;
         }
-        let db = Db::open(&layout.db_path())?;
-        Ok(Self { layout, db })
+        let to = crate::db::MIGRATIONS.len();
+        // 当て始めた時刻と版（フックが呼ばれた = 既存の DB に未適用のものがある）
+        let started: Cell<Option<(Instant, usize)>> = Cell::new(None);
+        // 未適用のマイグレーションがある既存の DB は、空きを確かめ、当てる前にバックアップを取る（どちらかが失敗したら
+        // 当てずに開くのを失敗にする）
+        let opened = Db::open_with(&layout.db_path(), |conn, from| {
+            started.set(Some((Instant::now(), from)));
+            let db_bytes = upgrade::db_bytes(conn)?;
+            hooks.notify(&UpgradeEvent::Started {
+                path: layout.root().to_path_buf(),
+                from,
+                to,
+                db_bytes,
+            });
+            hooks.ensure_space(layout.root(), db_bytes)?;
+            backup::before_migration(&layout, conn, crate::time::now_ms()).map(|_| ())
+        });
+        if let Some((at, from)) = started.get() {
+            let (path, ms) = (
+                layout.root().to_path_buf(),
+                at.elapsed().as_secs_f64() * 1000.0,
+            );
+            match &opened {
+                Err(CoreError::Upgrade(error)) => hooks.notify(&UpgradeEvent::Failed {
+                    path,
+                    from,
+                    to,
+                    ms,
+                    error: error.clone(),
+                }),
+                // 当てたあとの失敗（読み取りの接続・書き込みのスレッドの用意）は、更新は終わっている。理由は戻り値で返る
+                Ok(_) | Err(_) => hooks.notify(&UpgradeEvent::Finished { path, from, to, ms }),
+            }
+        }
+        let (db, migration) = opened?;
+        Ok(Self {
+            layout,
+            db,
+            migration,
+            ingest: RwLock::new(()),
+            lock,
+        })
+    }
+
+    /// 閉じる：DB を閉じてから、ライブラリのロックを放す（何度呼んでもよい）。閉じたあとの DB の読み書きは `DbClosed`。
+    /// `Arc<Library>` を握るもの（IPC・ジョブ）が残っていても、ここで放すので、開き直しやほかのアプリが当たらない。
+    pub fn close(&self) {
+        self.db.close();
+        self.lock.release();
+    }
+
+    /// ライブラリのロック（同じライブラリかを比べる：[`LibraryLock::is_for`]）。
+    pub fn lock(&self) -> &LibraryLock {
+        &self.lock
+    }
+
+    /// 取り込みの鍵：files/ にファイルを置いてから DB に書き終えるまで持つ（取り込み・ダウンロード・キャプチャ）。
+    /// 持っている間はゴミ箱を空にする処理が待つので、同じ中身を置いたファイルを消されない（docs/data-model.md §4）。
+    /// 同じスレッドで重ねて取らないこと。
+    pub fn ingest_guard(&self) -> RwLockReadGuard<'_, ()> {
+        self.ingest.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 台帳の門（取り込みの鍵の書き込みの側）：保存の「予告 → 配置 → コミット → 後始末」・ゴミ箱を空にする処理・段 3 の GC が
+    /// 持つ（M12。docs/data-model.md §4「保存と版（M12）」）。持っている間は取り込み・ダウンロード・キャプチャの「置いてから
+    /// DB に書く」が待つので、取り込みが「もう置いてある」と判断した同じ中身のファイルを、台帳に載せる前に消されない。
+    /// 描く・エンコードする間は持たない。同じスレッドで重ねて取らないこと（読み取りの側とも）。
+    pub fn ingest_exclusive(&self) -> RwLockWriteGuard<'_, ()> {
+        self.ingest.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 開いたときに当てたマイグレーション（当てていなければ `applied` が空）。
+    pub fn migration(&self) -> &MigrationReport {
+        &self.migration
     }
 
     /// フォルダ構成。
@@ -96,34 +219,114 @@ impl Library {
         })
     }
 
-    /// ゴミ箱を空にする。DB の行を先に消し、そのあと実ファイル・サムネイル・ジャケット・プロキシを消す
-    /// （途中で落ちてもファイルが残るだけで、整合性チェックで「DB にないファイル」として数えられる）。
+    /// ゴミ箱を空にする（docs/data-model.md §4「保存と版（M12）」。段 3 の GC と同じ消す手順）：台帳の門
+    /// （[`Library::ingest_exclusive`]）を取り、(1) 消すアイテムと消しうる中身（アイテムの今と、編集したアイテムの元・猶予中の版・
+    /// アンカー）を決めて 'delete' で予告してコミット、(2) アイテムの行を消し、使われなくなった台帳の行を解放し、消えたアイテムの
+    /// 文書の部品を片付けてコミット、(3) 解放した中身の実ファイルと派生のファイル（サムネイル・ジャケット・プロキシ・波形・
+    /// アニメの帯）を消し、(4) 予告を消す。途中で落ちても、開くときの予告の照合（`ledger::settle_pending`）が台帳にないファイルを
+    /// 片付ける。猶予中のファイル・元・アンカーも照合せずにすぐ消す（M12 の利用者の決定 6）。ほかのアイテムが同じ中身を持って
+    /// いれば（別名で保存したアイテムの版 0 が持つ元など）、台帳の行もファイルも残る。
     pub fn empty_trash(&self) -> Result<TrashEmptied> {
-        let removed = self.db.write(|tx| crate::items::delete_trashed(tx))?;
-        let mut result = TrashEmptied::default();
-        for item in &removed {
-            let hash_hex = hex(&item.hash);
-            let paths = [
-                self.layout.content_path(&item.hash, &item.ext),
-                self.layout.thumb_path(&hash_hex, ThumbSize::Small),
-                self.layout.thumb_path(&hash_hex, ThumbSize::Large),
-                self.layout.art_path(&hash_hex),
-                self.layout.proxy_path(&hash_hex),
-            ];
-            for path in paths {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        result.failed += 1;
-                        tracing::warn!(%err, path = %path.display(), "ゴミ箱のファイルを消せませんでした");
-                    }
+        self.empty_trash_with(TrashFault::None)
+    }
+
+    /// ゴミ箱を空にする途中、台帳の行を解放したあと・ファイルを消す前に、後始末を通らずに失敗する（テストの強制終了）。
+    #[cfg(test)]
+    pub(crate) fn empty_trash_crashing_after_release(&self) -> Result<TrashEmptied> {
+        self.empty_trash_with(TrashFault::AfterRelease)
+    }
+
+    fn empty_trash_with(&self, _fault: TrashFault) -> Result<TrashEmptied> {
+        let _gate = self.ingest_exclusive();
+        // (1) 予告
+        let (plan, pending) = self.db.write(|tx| {
+            let plan = crate::items::plan_empty_trash(tx)?;
+            let now = crate::time::now_ms();
+            let mut pending = Vec::with_capacity(plan.blobs.len());
+            for (hash, ext) in &plan.blobs {
+                pending.push(ledger::announce(
+                    tx,
+                    hash,
+                    ext,
+                    ledger::PendingKind::Delete,
+                    None,
+                    now,
+                )?);
+            }
+            Ok((plan, pending))
+        })?;
+        if plan.items.is_empty() {
+            return Ok(TrashEmptied::default());
+        }
+        // (2) 行を消して台帳を解放する
+        let (deleted, pending) = self.db.write(move |tx| {
+            let deleted = crate::items::delete_trashed(tx, &plan.items)?;
+            // 予告していない中身は解放しないはずだが（門を持ち、消すアイテムは決めてある）、念のため、解放したものは必ず予告
+            // してからファイルを消す（同じトランザクションでコミットするので、消す前にコミットされている）
+            let mut pending = pending;
+            let announced: std::collections::BTreeSet<&([u8; 32], String)> =
+                plan.blobs.iter().collect();
+            for blob in &deleted.released {
+                if !announced.contains(&(blob.hash, blob.ext.clone())) {
+                    pending.push(ledger::announce(
+                        tx,
+                        &blob.hash,
+                        &blob.ext,
+                        ledger::PendingKind::Delete,
+                        None,
+                        crate::time::now_ms(),
+                    )?);
                 }
             }
+            Ok((deleted, pending))
+        })?;
+        #[cfg(test)]
+        if _fault == TrashFault::AfterRelease {
+            return Err(CoreError::Invalid(
+                "テスト用の強制終了（AfterRelease）".into(),
+            ));
+        }
+        // (3) ファイルを消し、(4) 予告を消す（消せなかったファイルがあれば予告を残し、次に開くときの照合が消す）
+        let mut result = TrashEmptied {
+            failed: ledger::remove_files(&self.layout, &deleted.released),
+            ..TrashEmptied::default()
+        };
+        if result.failed == 0 {
+            self.db
+                .write(move |tx| ledger::clear_pending(tx, &pending).map(|_| ()))?;
+        }
+        for item in &deleted.items {
             result.items += 1;
             result.bytes += u64::try_from(item.size_bytes).unwrap_or(0);
         }
         Ok(result)
+    }
+}
+
+/// ゴミ箱を空にする処理の、強制終了を写す段（テスト）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrashFault {
+    None,
+    /// 台帳の行を解放したあと、ファイルを消す前。
+    #[cfg_attr(not(test), allow(dead_code))]
+    AfterRelease,
+}
+
+impl Drop for Library {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// `path` がライブラリ（DB がある）でなければ NotFound。
+fn ensure_library(path: &Path) -> Result<()> {
+    if is_library(path) {
+        Ok(())
+    } else {
+        Err(CoreError::NotFound(format!(
+            "ライブラリが見つかりません: {}",
+            path.display()
+        )))
     }
 }
 
@@ -187,6 +390,151 @@ mod tests {
         assert!(lib.layout().content_path(&kept, "jpg").exists());
         assert_eq!(lib.item_count().unwrap(), 1);
         assert_eq!(lib.empty_trash().unwrap(), TrashEmptied::default());
+    }
+
+    /// S16（docs/editing.md §14.1）：編集したアイテムでゴミ箱を空にすると、元・猶予中の版・アンカーのファイルも消え、参照されない
+    /// 台帳の行も DB にないファイルも 0（決定 6）。版の行は、保存のジョブ（段 2 の B）の代わりにテストの補助で入れる。
+    #[test]
+    fn empty_trash_removes_the_original_waiting_versions_and_anchors_of_edited_items() {
+        use crate::edit::testing::{insert_anchor, insert_item, insert_version};
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::create(&dir.path().join("L")).unwrap();
+        lib.db()
+            .write(|tx| {
+                let a = insert_item(tx, 1, [1; 32]);
+                let anchor = insert_anchor(tx, [10; 32], [20; 32]);
+                insert_version(tx, a, 0, [10; 32], "hold", None);
+                insert_version(tx, a, 1, [11; 32], "waiting", Some(anchor));
+                insert_version(tx, a, 2, [1; 32], "hold", Some(anchor));
+                crate::items::trash(tx, &[a], 5)?;
+                Ok(())
+            })
+            .unwrap();
+        let files = [
+            ([1u8; 32], "png"),
+            ([10; 32], "png"),
+            ([11; 32], "png"),
+            ([20; 32], "wav"),
+        ];
+        for (hash, ext) in files {
+            let path = lib.layout().content_path(&hash, ext);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+            let thumb = lib.layout().thumb_path(&hex(&hash), ThumbSize::Small);
+            std::fs::create_dir_all(thumb.parent().unwrap()).unwrap();
+            std::fs::write(&thumb, b"t").unwrap();
+        }
+        assert_eq!(check_files(lib.db(), lib.layout()).unwrap(), (0, 0));
+        let result = lib.empty_trash().unwrap();
+        assert_eq!((result.items, result.failed), (1, 0));
+        for (hash, ext) in files {
+            assert!(!lib.layout().content_path(&hash, ext).exists(), "{ext}");
+            assert!(
+                !lib.layout()
+                    .thumb_path(&hex(&hash), ThumbSize::Small)
+                    .exists()
+            );
+        }
+        assert_eq!(check_files(lib.db(), lib.layout()).unwrap(), (0, 0));
+        assert_eq!(lib.db().read(ledger::unreferenced).unwrap(), 0);
+        let blobs: i64 = lib
+            .db()
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(blobs, 0);
+    }
+
+    #[test]
+    fn empty_trash_releases_ledger_rows_facts_and_peaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::create(&dir.path().join("L")).unwrap();
+        let (gone, kept) = ([1u8; 32], [2u8; 32]);
+        let put = |path: std::path::PathBuf| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        };
+        for (id, hash) in [(1, gone), (2, kept)] {
+            put(lib.layout().content_path(&hash, "png"));
+            for path in lib.layout().derived_paths(&hex(&hash)) {
+                put(path);
+            }
+            lib.db()
+                .write(move |tx| {
+                    tx.execute(
+                        "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at, updated_at)
+                         VALUES (?1, ?2, 'png', 'image', 10, 't', 't', 0, 0)",
+                        rusqlite::params![id, &hash[..]],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO media_facts (blob_id, state, facts_v, alpha, analyzed_at)
+                         SELECT id, 'ok', 1, 2, 1 FROM blobs WHERE hash = ?1",
+                        [&hash[..]],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO analysis_results (blob_id, analysis, version, params, encoding, output_len, digest, created_at)
+                         SELECT id, 'audio.peaks', 1, '{}', 'binary', 0, x'00', 1 FROM blobs WHERE hash = ?1",
+                        [&hash[..]],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO asset_settings (item_id, pixel_art, updated_at) VALUES (?1, 1, 1)",
+                        [id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        lib.db()
+            .write(|tx| crate::items::trash(tx, &[1], 5))
+            .unwrap();
+
+        let result = lib.empty_trash().unwrap();
+        assert_eq!((result.items, result.bytes, result.failed), (1, 10, 0));
+        // 台帳の行が解放され、中身ごとの事実と結果、アイテムごとの設定も消える
+        let counts: (i64, i64, i64, i64) = lib
+            .db()
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT (SELECT count(*) FROM blobs), (SELECT count(*) FROM media_facts),
+                            (SELECT count(*) FROM analysis_results), (SELECT count(*) FROM asset_settings)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(counts, (1, 1, 1, 1));
+        // 実ファイルと、png・jpg のサムネイル・ジャケット・プロキシ・波形・アニメの帯を消す。残すものは残す
+        assert!(!lib.layout().content_path(&gone, "png").exists());
+        for path in lib.layout().derived_paths(&hex(&gone)) {
+            assert!(!path.exists(), "{} が残った", path.display());
+        }
+        assert!(lib.layout().content_path(&kept, "png").exists());
+        for path in lib.layout().derived_paths(&hex(&kept)) {
+            assert!(path.exists(), "{} が消えた", path.display());
+        }
+        let (missing, orphans) = check_files(lib.db(), lib.layout()).unwrap();
+        assert_eq!((missing, orphans), (0, 0));
+    }
+
+    #[test]
+    fn empty_trash_waits_for_an_ingest_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = std::sync::Arc::new(Library::create(&dir.path().join("L")).unwrap());
+        let guard = lib.ingest_guard();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lib2 = lib.clone();
+        let handle = std::thread::spawn(move || {
+            let result = lib2.empty_trash();
+            tx.send(()).unwrap();
+            result.map(|_| ())
+        });
+        // 取り込みが鍵を持っている間は始まらない
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+        );
+        drop(guard);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]

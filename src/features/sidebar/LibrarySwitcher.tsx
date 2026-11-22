@@ -7,10 +7,21 @@ import { checkLocation } from '../../ipc/library';
 import { isIpcError } from '../../ipc/result';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { notify } from '../../stores/noticeStore';
+import { requestCloseEditor } from '../editor/editorSave';
 import styles from './Sidebar.module.css';
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 開く・作るのに失敗したことを知らせる。前のライブラリも閉じて初回の画面に戻ったときは、画面のカードが理由と場所を
+ * 出すので知らせない（知らせの一行はライブラリの画面にしかない）。
+ */
+function notifyUnlessClosed(message: string): void {
+  if (useLibraryStore.getState().status === 'open') {
+    notify(message);
+  }
 }
 
 /** 別のライブラリを選んで開く（サイドバーの切り替え・設定画面）。 */
@@ -19,10 +30,14 @@ export async function openOther(): Promise<void> {
   if (!picked) {
     return;
   }
+  // 画像エディタに保存していない変更があれば、先に聞く（設定のシートから切り替えるとき）
+  if (!(await requestCloseEditor('library'))) {
+    return;
+  }
   try {
     await useLibraryStore.getState().open(picked);
   } catch (error) {
-    notify(
+    notifyUnlessClosed(
       isIpcError(error, 'NotFound') ? ja.welcome.notALibrary : ja.welcome.failed(messageOf(error)),
     );
   }
@@ -40,12 +55,15 @@ export async function createNew(): Promise<void> {
       notify(ja.welcome.occupied);
       return;
     }
+    if (!(await requestCloseEditor('library'))) {
+      return;
+    }
     const store = useLibraryStore.getState();
     await (location.status === 'existingLibrary'
       ? store.open(location.path)
       : store.create(location.path));
   } catch (error) {
-    notify(ja.welcome.failed(messageOf(error)));
+    notifyUnlessClosed(ja.welcome.failed(messageOf(error)));
   }
 }
 

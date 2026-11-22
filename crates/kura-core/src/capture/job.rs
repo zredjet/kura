@@ -16,7 +16,7 @@ use super::rules::{CaptureRule, record_run};
 use super::shoot::{Pace, shoot};
 use crate::download::meta::FileMeta;
 use crate::download::register::{Downloaded, Origin, place_all, write_entries};
-use crate::import::MediaKind;
+use crate::import::classify_file;
 use crate::jobs::{
     Control, JobContext, JobEnd, JobHandler, JobId, JobKind, JobManager, save_partial,
 };
@@ -109,25 +109,41 @@ pub fn register_png(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "capture.png".into());
+    // 取り込み・ダウンロードと同じ表で種類を決める（png は画像）
+    let ext = "png";
+    let kind = classify_file(png, ext).map_err(|rejected| {
+        CoreError::Tool(format!("撮った画像を読めません: {}", rejected.reason()))
+    })?;
     let file = Downloaded {
         path: png.to_path_buf(),
         sidecar: None,
         name,
-        ext: "png".into(),
-        kind: MediaKind::Image,
+        ext: ext.into(),
+        kind,
         meta: meta.clone(),
     };
     let job_id = job.as_ref().map_or(0, |(id, _)| *id);
+    // files/ に置いてから DB に書き終えるまで、ゴミ箱を空にする処理を待たせる（同じ中身を消されないように）
+    let _ingest = library.ingest_guard();
     let placed = place_all(
+        library.db(),
         library.layout(),
         backend,
         job_id,
         std::slice::from_ref(&file),
-    );
+    )?;
     let entries: Vec<_> = vec![file].into_iter().zip(placed).collect();
     let title = meta.title.clone();
+    let layout = library.layout().clone();
     let (result, _) = library.db().write(move |tx| {
-        let registered = write_entries(tx, entries, dest_folder_id, Origin::Capture)?;
+        let registered = write_entries(
+            tx,
+            &layout,
+            entries,
+            dest_folder_id,
+            Origin::Capture,
+            job_id,
+        )?;
         if registered.failed > 0 {
             return Err(CoreError::Tool(
                 "撮った画像をライブラリに入れられませんでした".into(),
@@ -290,6 +306,7 @@ impl CaptureHandler {
         let result = result?;
         if result.added > 0 {
             ctx.ensure_queued(JobKind::Thumbnail, "{}")?;
+            ctx.ensure_queued(JobKind::Analyze, "{}")?;
         }
         Ok(Some(result))
     }

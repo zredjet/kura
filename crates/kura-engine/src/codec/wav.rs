@@ -1,0 +1,1381 @@
+//! WAV（自作。Pinned）。
+//!
+//! - 読む：PCM の 8/16/24/32 ビットと浮動小数の 32/64 ビット（`WAVE_FORMAT_EXTENSIBLE` を含む）。
+//!   `smpl` の最初のループをループ点（終わりは含まない形に直す）、`cue ` と `LIST adtl` の `labl` をマーカー、
+//!   `LIST INFO` をタグにする。メタデータのチャンクは大きすぎれば読まない（展開や巨大な確保を避ける）。
+//! - 書く：PCM の 8/16/24/32 ビットか浮動小数の 32 ビット。整数への丸めは偶数への丸めで、範囲で止める（ディザはしない）。
+//!   int16・int24 を読んで同じビット数で書くと、ビット単位で元に戻る（E17）。
+
+use std::io::{Seek, SeekFrom, Write};
+use std::sync::Arc;
+
+use serde_json::json;
+
+use crate::audio::source::{Opener, PcmFileSource};
+use crate::audio::stream::StreamEnd;
+use crate::audio::stream::{AudioProducer, ValueProducer};
+use crate::codec::pcm::{self, PackOrder, PackSink, PcmLayout, SampleEncoding};
+use crate::codec::stream::{self, DecodeInfo, DecodeOut, DecodeSink};
+use crate::codec::{
+    Decoder, Encoder, MetaCaps, NoSeek, OpenedSource, ReadSeek, Tier, WriteSeek, caps_of, try_vec,
+};
+use crate::doc::DecodeOptions;
+use crate::error::EngineError;
+use crate::limits::Limits;
+use crate::monitor::Monitor;
+use crate::op::{ParamKind, ParamSchema, Unit, spec};
+use crate::shape::{Dim, Shape};
+use crate::value::{Audio, AudioMeta, AudioSource, LoopRange, Marker, Value};
+
+/// WAV の読み書き。
+pub struct WavCodec;
+
+/// 読み取りの約束の版（読む値が変わる変更は上げ、旧版を残す。§9.1）。
+pub const DEC_ID: &str = "wav-kura-dec/1";
+/// 書き出しの約束の版（書くバイト列が変わる変更は上げる。§9.1）。
+const ENC_ID: &str = "wav-kura-enc/1";
+/// メタデータのチャンクとして読む大きさの上限。
+const META_CHUNK_MAX: u32 = 1 << 20;
+
+fn err(message: impl Into<String>) -> EngineError {
+    EngineError::Decode {
+        codec: DEC_ID.to_string(),
+        message: message.into(),
+    }
+}
+
+/// `LIST INFO` の ID とタグの名前。
+const INFO_TAGS: [(&[u8; 4], &str); 8] = [
+    (b"INAM", "title"),
+    (b"IART", "artist"),
+    (b"IPRD", "album"),
+    (b"ICMT", "comment"),
+    (b"ICRD", "date"),
+    (b"IGNR", "genre"),
+    (b"ISFT", "software"),
+    (b"ICOP", "copyright"),
+];
+
+/// 読んだヘッダ。
+struct Header {
+    channels: u16,
+    rate: u32,
+    bits: u16,
+    float: bool,
+    block_align: u16,
+    data_offset: u64,
+    data_len: u64,
+    meta: AudioMeta,
+}
+
+fn read_exact_or(src: &mut dyn ReadSeek, buf: &mut [u8], what: &str) -> Result<(), EngineError> {
+    src.read_exact(buf)
+        .map_err(|_| err(format!("{what}が途中で切れています")))
+}
+
+fn u16_at(b: &[u8], i: usize) -> u16 {
+    u16::from_le_bytes([b[i], b[i + 1]])
+}
+
+fn u32_at(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+
+fn text_of(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim().to_string()
+}
+
+/// labl の名前を 1 つ足す（同じ ID は最初のもの）。数はマーカーの上限、バイトは予算（1 項目ごとの固定の重さを含む）で抑える。
+/// cue を先に読んでいれば（`cues` が Some）、cue にない ID の名前は予算を使わずに捨てる。
+fn add_label(
+    labels: &mut std::collections::BTreeMap<u32, String>,
+    cues: Option<&std::collections::BTreeMap<u32, u64>>,
+    budget: &mut Budget,
+    id: u32,
+    text: String,
+) {
+    if labels.contains_key(&id)
+        || labels.len() as u64 >= budget.markers
+        || cues.is_some_and(|c| !c.contains_key(&id))
+    {
+        return;
+    }
+    if budget.take(text.len() + ITEM_COST) {
+        labels.insert(id, text);
+    }
+}
+
+/// チャンクを順に読み、ヘッダとメタデータを集める（標本は読まない）。
+/// 名前・タグとして読む 1 つの文字列の長さの上限（バイト）。
+const TEXT_MAX: usize = 4_096;
+
+/// メタデータの 1 項目（タグ・名前）ごとに予算から引く固定の重さ（バイト）。空の名前でも数だけで予算を使い切れるように。
+const ITEM_COST: usize = 32;
+
+/// メタデータの読み取りの予算（マーカーの数とバイト数）。
+struct Budget {
+    markers: u64,
+    bytes: u64,
+}
+
+impl Budget {
+    /// `len` バイトを使えれば true（使えなければ、そのメタデータは読まない）。
+    fn take(&mut self, len: usize) -> bool {
+        let len = len as u64;
+        if len > self.bytes {
+            self.bytes = 0;
+            false
+        } else {
+            self.bytes -= len;
+            true
+        }
+    }
+}
+
+fn parse(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Header, EngineError> {
+    let mut budget = Budget {
+        markers: limits.max_markers,
+        bytes: limits.max_meta_bytes,
+    };
+    let file_len = src.seek(SeekFrom::End(0))?;
+    src.seek(SeekFrom::Start(0))?;
+    let mut riff = [0u8; 12];
+    read_exact_or(src, &mut riff, "RIFF のヘッダ")?;
+    if &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
+        return Err(err("WAV ではありません"));
+    }
+    let mut fmt: Option<(u16, u32, u16, bool, u16)> = None;
+    let mut data: Option<(u64, u64)> = None;
+    let mut meta = AudioMeta::default();
+    // cue の ID → 位置（同じ ID は最初のもの）と、ID → 名前（最初のもの）
+    let mut cues: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    let mut labels: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
+    let mut cues_seen = false;
+    let mut pos = 12u64;
+    let mut chunks = 0usize;
+    while pos.saturating_add(8) <= file_len {
+        chunks += 1;
+        if chunks > crate::codec::MAX_CHUNKS {
+            return Err(err("チャンクが多すぎます"));
+        }
+        crate::codec::seek_to(src, pos)?;
+        let mut head = [0u8; 8];
+        read_exact_or(src, &mut head, "チャンクのヘッダ")?;
+        let id: [u8; 4] = [head[0], head[1], head[2], head[3]];
+        let size = u32_at(&head, 4);
+        let body = pos + 8;
+        let available = file_len - body;
+        match &id {
+            b"fmt " => {
+                if size < 16 || u64::from(size) > available {
+                    return Err(err("fmt チャンクが正しくありません"));
+                }
+                let mut b = [0u8; 40];
+                let n = size.min(40) as usize;
+                read_exact_or(src, &mut b[..n], "fmt チャンク")?;
+                let mut tag = u16_at(&b, 0);
+                let channels = u16_at(&b, 2);
+                let rate = u32_at(&b, 4);
+                let block_align = u16_at(&b, 12);
+                let bits = u16_at(&b, 14);
+                if tag == 0xFFFE {
+                    if n < 40 {
+                        return Err(err("拡張の fmt チャンクが短すぎます"));
+                    }
+                    tag = u16_at(&b, 24);
+                }
+                let float = match (tag, bits) {
+                    (1, 8 | 16 | 24 | 32) => false,
+                    (3, 32 | 64) => true,
+                    _ => {
+                        return Err(EngineError::Unsupported(format!(
+                            "この WAV の形式（{tag}・{bits} ビット）は読めません"
+                        )));
+                    }
+                };
+                if channels == 0
+                    || rate == 0
+                    || u32::from(block_align) != u32::from(channels) * u32::from(bits / 8)
+                {
+                    return Err(err("fmt チャンクの値が正しくありません"));
+                }
+                fmt = Some((channels, rate, bits, float, block_align));
+            }
+            b"data" => {
+                // 大きさが分からない（0xFFFFFFFF）・ファイルより長いときは、ファイルの終わりまで
+                let len = if size == u32::MAX {
+                    available
+                } else {
+                    u64::from(size).min(available)
+                };
+                data = Some((body, len));
+            }
+            b"smpl" if (36..=META_CHUNK_MAX).contains(&size) && u64::from(size) <= available => {
+                let mut b = try_vec(size as usize, 0u8)?;
+                read_exact_or(src, &mut b, "smpl チャンク")?;
+                let loops = u32_at(&b, 28);
+                if loops > 0 && b.len() >= 36 + 24 {
+                    let (start, end) = (u32_at(&b, 36 + 8), u32_at(&b, 36 + 12));
+                    // smpl の終わりは含む。値では含まない形に直す
+                    if end >= start {
+                        meta.loop_range = Some(LoopRange {
+                            start: u64::from(start),
+                            end: u64::from(end) + 1,
+                        });
+                    }
+                }
+            }
+            b"cue " if (4..=META_CHUNK_MAX).contains(&size) && u64::from(size) <= available => {
+                let mut b = try_vec(size as usize, 0u8)?;
+                read_exact_or(src, &mut b, "cue チャンク")?;
+                cues_seen = true;
+                let count = (u32_at(&b, 0) as usize).min((b.len() - 4) / 24);
+                for i in 0..count {
+                    if cues.len() as u64 >= budget.markers {
+                        break;
+                    }
+                    let o = 4 + i * 24;
+                    cues.entry(u32_at(&b, o))
+                        .or_insert(u64::from(u32_at(&b, o + 20)));
+                }
+            }
+            b"LIST" if (4..=META_CHUNK_MAX).contains(&size) && u64::from(size) <= available => {
+                let mut b = try_vec(size as usize, 0u8)?;
+                read_exact_or(src, &mut b, "LIST チャンク")?;
+                let kind = &b[0..4];
+                let mut o = 4usize;
+                while o + 8 <= b.len() {
+                    let sub = &b[o..o + 4];
+                    let len = u32_at(&b, o + 4) as usize;
+                    let start = o + 8;
+                    let end = start.saturating_add(len).min(b.len());
+                    let content = &b[start..end];
+                    if kind == b"INFO" {
+                        let key = INFO_TAGS
+                            .iter()
+                            .find(|(id, _)| id.as_slice() == sub)
+                            .map(|(_, k)| (*k).to_string())
+                            .unwrap_or_else(|| format!("riff:{}", String::from_utf8_lossy(sub)));
+                        let text = text_of(&content[..content.len().min(TEXT_MAX)]);
+                        if !text.is_empty()
+                            && !meta.tags.contains_key(&key)
+                            && budget.take(key.len() + text.len() + ITEM_COST)
+                        {
+                            meta.tags.insert(key, text);
+                        }
+                    } else if kind == b"adtl" && sub == b"labl" && content.len() >= 4 {
+                        let id = u32_at(content, 0);
+                        let text = text_of(&content[4..content.len().min(4 + TEXT_MAX)]);
+                        add_label(
+                            &mut labels,
+                            cues_seen.then_some(&cues),
+                            &mut budget,
+                            id,
+                            text,
+                        );
+                    }
+                    o = start.saturating_add(len).saturating_add(len & 1);
+                }
+            }
+            _ => {}
+        }
+        // 次のチャンク（大きさが奇数なら 1 バイト詰める）
+        pos = body
+            .saturating_add(u64::from(size))
+            .saturating_add(u64::from(size & 1));
+        if id == *b"data" && size == u32::MAX {
+            break;
+        }
+    }
+    let (channels, rate, bits, float, block_align) =
+        fmt.ok_or_else(|| err("fmt チャンクがありません"))?;
+    let (data_offset, data_len) = data.ok_or_else(|| err("data チャンクがありません"))?;
+    let frames = data_len / u64::from(block_align);
+    meta.markers = cues
+        .iter()
+        .filter(|(_, p)| **p < frames)
+        .map(|(id, p)| Marker {
+            pos: *p,
+            name: labels.get(id).cloned().unwrap_or_default(),
+        })
+        .collect();
+    meta.markers.sort_by_key(|m| m.pos);
+    if let Some(l) = meta.loop_range
+        && (l.start >= frames || l.end > frames)
+    {
+        meta.loop_range = None;
+    }
+    meta.source = Some(AudioSource { bits, float, rate });
+    Ok(Header {
+        channels,
+        rate,
+        bits,
+        float,
+        block_align,
+        data_offset,
+        data_len,
+        meta,
+    })
+}
+
+impl Decoder for WavCodec {
+    fn id(&self) -> &'static str {
+        DEC_ID
+    }
+
+    fn tier(&self) -> Tier {
+        Tier::Pinned
+    }
+
+    fn can_decode(&self, format: &str) -> bool {
+        format == "wav"
+    }
+
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        let h = parse(src, limits)?;
+        Ok(Shape::Audio {
+            rate: h.rate,
+            channels: h.channels,
+            frames: Dim::Exact(h.data_len / u64::from(h.block_align)),
+        })
+    }
+
+    fn decode(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        stream::collect(mon, |out| decode_into(src, limits, out, mon))
+    }
+
+    fn streams(&self, _format: &str) -> bool {
+        true
+    }
+
+    /// 読みの塊（16,384 フレーム）のバイト列と平面の分。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _len: u64) -> u64 {
+        stream_read_bytes(shape)
+    }
+
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        _format: &str,
+        _opts: &DecodeOptions,
+        limits: &Limits,
+        _shape: &Shape,
+        out: &mut DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        decode_into(src, limits, out, mon)
+    }
+}
+
+/// WAV・AIFF を流して読むときの読みの塊の作業領域（16,384 フレーム × チャンネル ×（標本の幅 8 ＋ 平面 4）。WAV の 64 ビットの
+/// 浮動小数を上限に）。
+pub(crate) fn stream_read_bytes(shape: &Shape) -> u64 {
+    let Shape::Audio { channels, .. } = shape else {
+        return 0;
+    };
+    16_384u64 * u64::from(*channels) * 12
+}
+
+/// data を 16,384 フレームずつ順に読んで `out` に渡す（`decode`・`decode_stream` が通る。値は源（`open_source`）とも同じ）。
+fn decode_into(
+    src: &mut dyn ReadSeek,
+    limits: &Limits,
+    out: &mut DecodeOut<'_>,
+    mon: &dyn Monitor,
+) -> Result<(), EngineError> {
+    let h = parse(src, limits)?;
+    let frames = h.data_len / u64::from(h.block_align);
+    limits
+        .check(&Shape::Audio {
+            rate: h.rate,
+            channels: h.channels,
+            frames: Dim::Exact(frames),
+        })
+        .map_err(EngineError::Limit)?;
+    let frames =
+        usize::try_from(frames).map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
+    let ch = usize::from(h.channels);
+    let layout = h.layout();
+    out.begin(DecodeInfo {
+        rate: h.rate,
+        channels: ch,
+        frames: Dim::Exact(frames as u64),
+        expect: frames as u64,
+    })?;
+    src.seek(SeekFrom::Start(h.data_offset))?;
+    let block = layout.block();
+    let chunk_frames = 16_384usize;
+    let mut buf = try_vec(chunk_frames * block, 0u8)?;
+    let mut planes: Vec<Vec<f32>> = (0..ch)
+        .map(|_| try_vec(chunk_frames.min(frames), 0f32))
+        .collect::<Result<_, _>>()?;
+    let mut done = 0usize;
+    while done < frames {
+        if mon.canceled() {
+            return Err(EngineError::Canceled);
+        }
+        let n = (frames - done).min(chunk_frames);
+        let bytes = &mut buf[..n * block];
+        read_exact_or(src, bytes, "data チャンク")?;
+        // 標本の変換は音声の源（open_source）と同じ関数を通る
+        layout.decode_frames(bytes, &mut planes)?;
+        let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+        out.push_frames(&views)?;
+        done += n;
+    }
+    out.end(h.meta)
+}
+
+impl Header {
+    /// data の標本の配置（8 ビットは符号なし、ほかは符号付きのリトルエンディアン。浮動小数の 32・64 ビット）。
+    fn layout(&self) -> PcmLayout {
+        let encoding = match (self.bits, self.float) {
+            (8, false) => SampleEncoding::U8,
+            (32, true) => SampleEncoding::F32Le,
+            (64, true) => SampleEncoding::F64Le,
+            (bits, _) => SampleEncoding::IntLe { bytes: bits / 8 },
+        };
+        PcmLayout {
+            data_offset: self.data_offset,
+            frames: self.data_len / u64::from(self.block_align),
+            channels: self.channels,
+            encoding,
+        }
+    }
+}
+
+/// WAV を音声の源として開く（M13 段 1）：ヘッダとメタデータを読み、標本は読むときにチャンクごとにシークして読む遅延の値に
+/// する（開くときに全体を読まない）。値は `decode` と同じ（同じヘッダの読み・同じ標本の変換）。読めない形式（この
+/// デコーダが `Unsupported` を返すもの）は None（呼び手は作業用のファイルへ回す）。`lru_bytes` は源の LRU の上限。
+pub fn open_source(
+    opener: &Opener,
+    limits: &Limits,
+    lru_bytes: u64,
+) -> Result<Option<OpenedSource>, EngineError> {
+    let mut src = opener()?;
+    let h = match parse(src.as_mut(), limits) {
+        Ok(h) => h,
+        Err(EngineError::Unsupported(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let layout = h.layout();
+    limits
+        .check(&Shape::Audio {
+            rate: h.rate,
+            channels: h.channels,
+            frames: Dim::Exact(layout.frames),
+        })
+        .map_err(EngineError::Limit)?;
+    let source = PcmFileSource::new(h.rate, layout, opener.clone(), lru_bytes);
+    source.give(src);
+    let audio = Audio::from_source(Arc::new(source), h.meta)?;
+    Ok(Some(OpenedSource {
+        value: Value::Audio(Arc::new(audio)),
+        decoder: DEC_ID,
+        recorded: None,
+    }))
+}
+
+/// 長さを切り詰められる書き先（作業用の f32 WAV を書き直すとき、前の中身を捨てる）。
+pub trait SetLen {
+    /// 長さを `len` バイトにする。
+    fn set_len(&mut self, len: u64) -> std::io::Result<()>;
+}
+
+impl SetLen for std::fs::File {
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        std::fs::File::set_len(self, len)
+    }
+}
+
+impl SetLen for std::io::BufWriter<std::fs::File> {
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        self.flush()?;
+        self.get_ref().set_len(len)
+    }
+}
+
+impl SetLen for std::io::Cursor<Vec<u8>> {
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        let len = usize::try_from(len).map_err(|_| std::io::Error::other("長すぎます"))?;
+        self.get_mut().truncate(len);
+        Ok(())
+    }
+}
+
+/// 作業用の f32 WAV の書き手（M13 段 2。docs/editing.md §9.11）：流れのデコード（`DecodeSink`）を、アンカーの中と同じ並びの
+/// f32 の WAV（2 チャンネル以下は形式 3、3 チャンネル以上は拡張形式で既定のマスク）に書く。`begin` で頭から書き直し
+/// （大きさ 0 のヘッダ）、`feed` でインターリーブの f32 LE（ビットはそのまま）を 1 MiB の作業列を通して書き、`end` で
+/// data と RIFF の大きさを書き直す。このあと `anchor::seal_wav` で封をすれば、`anchor::write` と同じバイト列のアンカーになる。
+pub struct F32WavWriter<W: Write + Seek + SetLen + Send> {
+    out: W,
+    channels: usize,
+    rate: u32,
+    /// data の中身の始まり（ヘッダの長さ）。
+    data_start: u64,
+    /// 書いたフレームの数。
+    frames: u64,
+    buf: Vec<u8>,
+    done: bool,
+    end: Option<StreamEnd>,
+}
+
+/// 作業列の大きさ（バイト）。
+const WRITER_BUF: usize = 1 << 20;
+
+impl<W: Write + Seek + SetLen + Send> F32WavWriter<W> {
+    /// 書き先 `out` で作る。
+    pub fn new(out: W) -> Self {
+        Self {
+            out,
+            channels: 0,
+            rate: 0,
+            data_start: 0,
+            frames: 0,
+            buf: Vec::new(),
+            done: false,
+            end: None,
+        }
+    }
+
+    /// 書き終えた流れの終わり（長さとメタデータ。`end` のあと。`anchor::seal_wav` にメタデータを渡す）。
+    pub fn stream_end(&self) -> Option<&StreamEnd> {
+        self.end.as_ref()
+    }
+
+    /// 書いている音声のレートとチャンネルの数（`begin` のあと）。
+    pub fn format(&self) -> (u32, usize) {
+        (self.rate, self.channels)
+    }
+
+    /// 書き先を返す。
+    pub fn into_inner(self) -> W {
+        self.out
+    }
+
+    /// data の終わり（`end` のあと。`anchor::seal_wav` に渡す）。
+    pub fn data_end(&self) -> u64 {
+        self.data_start + self.frames * self.channels as u64 * 4
+    }
+
+    /// 書き終えたか（`end` を呼んだ）。
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// 作業領域（作業列）の大きさ（バイト）。
+    pub fn work_bytes() -> u64 {
+        WRITER_BUF as u64
+    }
+
+    fn header(&self, data_len: u64) -> Result<Vec<u8>, EngineError> {
+        let too_big =
+            || EngineError::Limit("4 GiB を超える音声は作業用のファイルにできません".into());
+        let channels = u16::try_from(self.channels).map_err(|_| too_big())?;
+        let block_align = channels.checked_mul(4).ok_or_else(too_big)?;
+        let extensible = channels > 2;
+        let fmt_len: u64 = if extensible { 40 } else { 16 };
+        let riff = 4 + 8 + fmt_len + 8 + data_len;
+        if riff > u64::from(u32::MAX) || data_len >= u64::from(u32::MAX) {
+            return Err(too_big());
+        }
+        let byte_rate = self
+            .rate
+            .checked_mul(u32::from(block_align))
+            .ok_or_else(too_big)?;
+        let mut head = Vec::with_capacity(12 + 8 + 40 + 8);
+        head.extend_from_slice(b"RIFF");
+        head.extend_from_slice(&(riff as u32).to_le_bytes());
+        head.extend_from_slice(b"WAVE");
+        head.extend_from_slice(b"fmt ");
+        head.extend_from_slice(&(fmt_len as u32).to_le_bytes());
+        head.extend_from_slice(&(if extensible { 0xFFFEu16 } else { 3 }).to_le_bytes());
+        head.extend_from_slice(&channels.to_le_bytes());
+        head.extend_from_slice(&self.rate.to_le_bytes());
+        head.extend_from_slice(&byte_rate.to_le_bytes());
+        head.extend_from_slice(&block_align.to_le_bytes());
+        head.extend_from_slice(&32u16.to_le_bytes());
+        if extensible {
+            head.extend_from_slice(&22u16.to_le_bytes());
+            head.extend_from_slice(&32u16.to_le_bytes());
+            let mask = crate::codec::platform::default_channel_mask(channels).unwrap_or(0);
+            head.extend_from_slice(&mask.to_le_bytes());
+            // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+            head.extend_from_slice(&[
+                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+                0x9B, 0x71,
+            ]);
+        }
+        head.extend_from_slice(b"data");
+        head.extend_from_slice(&(data_len as u32).to_le_bytes());
+        Ok(head)
+    }
+
+    fn flush_buf(&mut self) -> Result<(), EngineError> {
+        if !self.buf.is_empty() {
+            self.out.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+impl<W: Write + Seek + SetLen + Send> DecodeSink for F32WavWriter<W> {
+    fn begin(&mut self, info: &DecodeInfo) -> Result<(), EngineError> {
+        self.channels = info.channels;
+        self.rate = info.rate;
+        self.frames = 0;
+        self.done = false;
+        self.end = None;
+        // 形の上限で RIFF に収まるかを先に確かめる
+        let bound = info
+            .frames
+            .max()
+            .checked_mul(info.channels as u64 * 4)
+            .ok_or_else(|| {
+                EngineError::Limit("4 GiB を超える音声は作業用のファイルにできません".into())
+            })?;
+        self.header(bound)?;
+        let head = self.header(0)?;
+        self.data_start = head.len() as u64;
+        self.out.seek(SeekFrom::Start(0))?;
+        self.out.set_len(0)?;
+        self.out.write_all(&head)?;
+        if self.buf.capacity() == 0 {
+            self.buf
+                .try_reserve_exact(WRITER_BUF)
+                .map_err(|_| EngineError::Limit("書き出しの作業領域を確保できません".into()))?;
+        }
+        self.buf.clear();
+        Ok(())
+    }
+
+    fn feed(
+        &mut self,
+        start: u64,
+        planes: &[&[f32]],
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let n = planes.first().map_or(0, |p| p.len());
+        if start != self.frames
+            || planes.len() != self.channels
+            || planes.iter().any(|p| p.len() != n)
+        {
+            return Err(EngineError::Internal(format!(
+                "作業用の WAV の窓が順でないか形が違います（{start} から。次は {}）",
+                self.frames
+            )));
+        }
+        let block = self.channels * 4;
+        for f in 0..n {
+            if self.buf.len() + block > WRITER_BUF {
+                if mon.canceled() {
+                    return Err(EngineError::Canceled);
+                }
+                self.flush_buf()?;
+            }
+            for p in planes {
+                self.buf.extend_from_slice(&p[f].to_bits().to_le_bytes());
+            }
+        }
+        self.frames += n as u64;
+        Ok(())
+    }
+
+    fn end(&mut self, end: &StreamEnd) -> Result<(), EngineError> {
+        if end.frames != self.frames {
+            return Err(EngineError::Internal(format!(
+                "作業用の WAV の長さが合いません（{} と {}）",
+                end.frames, self.frames
+            )));
+        }
+        self.flush_buf()?;
+        let data_len = self.frames * self.channels as u64 * 4;
+        let head = self.header(data_len)?;
+        self.out.seek(SeekFrom::Start(0))?;
+        self.out.write_all(&head)?;
+        self.out.seek(SeekFrom::Start(self.data_start + data_len))?;
+        self.out.flush()?;
+        self.done = true;
+        self.end = Some(end.clone());
+        Ok(())
+    }
+}
+
+impl Encoder for WavCodec {
+    fn id(&self) -> &'static str {
+        ENC_ID
+    }
+
+    fn tier(&self) -> Tier {
+        Tier::Pinned
+    }
+
+    fn can_encode(&self, format: &str, shape: &Shape) -> bool {
+        format == "wav" && matches!(shape, Shape::Audio { .. })
+    }
+
+    fn options(&self, _format: &str) -> ParamSchema {
+        ParamSchema {
+            params: vec![
+                spec(
+                    "bits",
+                    ParamKind::Int {
+                        min: 8,
+                        max: 32,
+                        step: 8,
+                    },
+                    Unit::None,
+                    json!(16),
+                ),
+                spec("float", ParamKind::Bool, Unit::None, json!(false)),
+            ],
+        }
+    }
+
+    fn caps(&self, format: &str, _opts: &serde_json::Value) -> MetaCaps {
+        caps_of(format)
+    }
+
+    fn encode(
+        &self,
+        value: &Value,
+        format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn Write,
+        mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        let Value::Audio(a) = value else {
+            return Err(EngineError::Unsupported(
+                "WAV には音声だけを書けます".into(),
+            ));
+        };
+        // 値も流して書く口を通る（実装は 1 つ。シークしない）
+        let mut src = ValueProducer::new(a);
+        self.encode_stream(&mut src, format, opts, &mut NoSeek::new(out), mon)
+    }
+
+    fn streams(&self, format: &str) -> bool {
+        format == "wav"
+    }
+
+    /// 作業列（16,384 フレーム × チャンネル × 4 バイトまで）とメタデータのチャンク（64 KiB の見込み）。
+    fn stream_work_bytes(&self, _format: &str, shape: &Shape, _opts: &serde_json::Value) -> u64 {
+        let channels = match shape {
+            Shape::Audio { channels, .. } => usize::from(*channels),
+            _ => 0,
+        };
+        PackSink::work_bytes(channels).saturating_add(64 << 10)
+    }
+
+    /// 長さ・メタデータは流れの形で分かるので、ヘッダ（fmt・data の大きさ・RIFF の大きさ）を先に書き、窓を量子化して
+    /// 書き、最後に smpl・cue・LIST を書く（シークしない）。
+    fn encode_stream(
+        &self,
+        src: &mut dyn AudioProducer,
+        _format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn WriteSeek,
+        mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        let info = src.info().clone();
+        let meta = &info.meta;
+        // float を指定すればそれ、bits だけを指定すれば整数、どちらもなければ元の形式（docs/editing.md §5.3）
+        let (bits, float) = pcm::target(opts, meta.source, &[8, 16, 24, 32], true, "WAV")?;
+        let channels = u16::try_from(info.channels)
+            .map_err(|_| EngineError::Unsupported("チャンネルが多すぎます".into()))?;
+        let rate = info.rate;
+        let block_align = u32::from(channels) * u32::from(bits / 8);
+        let frames = info.frames;
+        let data_len = frames * u64::from(block_align);
+        let extensible = channels > 2;
+
+        // メタデータのチャンクを先に作る（RIFF の大きさを決めるため）
+        let mut fmt = Vec::new();
+        let tag: u16 = if float { 3 } else { 1 };
+        fmt.extend_from_slice(&(if extensible { 0xFFFEu16 } else { tag }).to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        let byte_rate = rate.checked_mul(block_align).ok_or_else(|| {
+            EngineError::Unsupported("サンプルレートが大きすぎて WAV に書けません".into())
+        })?;
+        let block_align_16 = u16::try_from(block_align).map_err(|_| {
+            EngineError::Unsupported("チャンネルが多すぎて WAV に書けません".into())
+        })?;
+        fmt.extend_from_slice(&byte_rate.to_le_bytes());
+        fmt.extend_from_slice(&block_align_16.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        if extensible {
+            fmt.extend_from_slice(&22u16.to_le_bytes());
+            fmt.extend_from_slice(&bits.to_le_bytes());
+            fmt.extend_from_slice(&0u32.to_le_bytes());
+            // KSDATAFORMAT_SUBTYPE_PCM / IEEE_FLOAT
+            fmt.extend_from_slice(&tag.to_le_bytes());
+            fmt.extend_from_slice(&[
+                0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+            ]);
+        }
+        let mut chunks: Vec<([u8; 4], Vec<u8>)> = Vec::new();
+        if let Some(l) = meta
+            .loop_range
+            .filter(|l| l.start < l.end && l.end <= frames && l.end <= u64::from(u32::MAX))
+        {
+            let mut b = Vec::new();
+            for v in [0u32, 0, 1_000_000_000 / rate.max(1), 60, 0, 0, 0, 1, 0] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [0u32, 0, l.start as u32, (l.end - 1) as u32, 0, 0] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            chunks.push((*b"smpl", b));
+        }
+        let markers: Vec<&Marker> = meta
+            .markers
+            .iter()
+            .filter(|m| m.pos < frames && m.pos <= u64::from(u32::MAX))
+            .collect();
+        if !markers.is_empty() {
+            let mut cue = (markers.len() as u32).to_le_bytes().to_vec();
+            let mut adtl = b"adtl".to_vec();
+            for (i, m) in markers.iter().enumerate() {
+                let id = i as u32 + 1;
+                for v in [id, m.pos as u32] {
+                    cue.extend_from_slice(&v.to_le_bytes());
+                }
+                cue.extend_from_slice(b"data");
+                for v in [0u32, 0, m.pos as u32] {
+                    cue.extend_from_slice(&v.to_le_bytes());
+                }
+                let mut labl = id.to_le_bytes().to_vec();
+                labl.extend_from_slice(m.name.as_bytes());
+                labl.push(0);
+                push_sub(&mut adtl, b"labl", &labl);
+            }
+            chunks.push((*b"cue ", cue));
+            chunks.push((*b"LIST", adtl));
+        }
+        let mut list = b"INFO".to_vec();
+        for (key, text) in &meta.tags {
+            let id: Option<[u8; 4]> = INFO_TAGS
+                .iter()
+                .find(|(_, k)| k == key)
+                .map(|(id, _)| **id)
+                .or_else(|| {
+                    key.strip_prefix("riff:")
+                        .and_then(|s| s.as_bytes().try_into().ok())
+                });
+            if let Some(id) = id {
+                let mut t = text.as_bytes().to_vec();
+                t.push(0);
+                push_sub(&mut list, &id, &t);
+            }
+        }
+        if list.len() > 4 {
+            chunks.push((*b"LIST", list));
+        }
+
+        let padded = |n: u64| 8 + n + (n & 1);
+        let riff_len = 4
+            + padded(fmt.len() as u64)
+            + padded(data_len)
+            + chunks
+                .iter()
+                .map(|(_, b)| padded(b.len() as u64))
+                .sum::<u64>();
+        let riff_len = u32::try_from(riff_len)
+            .map_err(|_| EngineError::Unsupported("4GB を超える WAV は書けません".into()))?;
+        let mut written = 0u64;
+        put(out, &mut written, b"RIFF")?;
+        put(out, &mut written, &riff_len.to_le_bytes())?;
+        put(out, &mut written, b"WAVE")?;
+        put(out, &mut written, b"fmt ")?;
+        put(out, &mut written, &(fmt.len() as u32).to_le_bytes())?;
+        put(out, &mut written, &fmt)?;
+        put(out, &mut written, b"data")?;
+        put(out, &mut written, &(data_len as u32).to_le_bytes())?;
+        let mut data = PackSink::new(out, PackOrder::WavLe, bits, float, info.channels)?;
+        src.produce(None, &mut data, mon)?;
+        if data.frames() != frames {
+            return Err(EngineError::Internal(format!(
+                "流した長さが形と違います（{} / {frames}）",
+                data.frames()
+            )));
+        }
+        written += data.written;
+        if data_len & 1 == 1 {
+            put(out, &mut written, &[0])?;
+        }
+        for (id, body) in &chunks {
+            put(out, &mut written, id)?;
+            put(out, &mut written, &(body.len() as u32).to_le_bytes())?;
+            put(out, &mut written, body)?;
+            if body.len() & 1 == 1 {
+                put(out, &mut written, &[0])?;
+            }
+        }
+        Ok(written)
+    }
+}
+
+/// `bytes` を書いて `written` に数える。
+fn put(out: &mut dyn WriteSeek, written: &mut u64, bytes: &[u8]) -> Result<(), EngineError> {
+    out.write_all(bytes)?;
+    *written += bytes.len() as u64;
+    Ok(())
+}
+
+/// LIST の中の小さなチャンクを足す（奇数なら 1 バイト詰める）。
+fn push_sub(list: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
+    list.extend_from_slice(id);
+    list.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    list.extend_from_slice(body);
+    if body.len() & 1 == 1 {
+        list.push(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::CodecSet;
+    use crate::codec::pcm::quantize;
+    use crate::monitor::NoMonitor;
+    use crate::testgen::InputGen;
+    use crate::value::Audio;
+    use std::io::Cursor;
+
+    fn decode(bytes: Vec<u8>) -> Result<Value, EngineError> {
+        CodecSet::pinned()
+            .decode(
+                &mut Cursor::new(bytes),
+                "wav",
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .map(|(v, _)| v)
+    }
+
+    fn encode(v: &Value, opts: serde_json::Value) -> Vec<u8> {
+        CodecSet::pinned()
+            .encode_bytes(v, "wav", &opts, &NoMonitor)
+            .unwrap()
+            .0
+    }
+
+    /// 整数の標本を読んで同じビット数で書くと、ビット単位で元に戻る（E17）。ループ点・マーカー・タグも往復する（E20）。
+    #[test]
+    fn integer_round_trips_are_exact_and_keep_metadata() {
+        for (bits, channels) in [(8u16, 1u16), (16, 2), (24, 2), (32, 1), (16, 6)] {
+            // 整数の標本を直接作った WAV（メタデータ付き）
+            let frames = 1_001u64;
+            let mut r = crate::determinism::rng(u64::from(bits));
+            use rand_chacha::rand_core::Rng;
+            let planes: Vec<Arc<Vec<f32>>> = (0..channels)
+                .map(|_| {
+                    Arc::new(
+                        (0..frames)
+                            .map(|_| {
+                                let v = (r.next_u64() as i64) >> (64 - bits);
+                                if bits == 8 {
+                                    v as f32 / 128.0
+                                } else {
+                                    (v as f64 / (1u64 << (bits - 1)) as f64) as f32
+                                }
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            let meta = AudioMeta {
+                loop_range: Some(LoopRange {
+                    start: 10,
+                    end: 900,
+                }),
+                markers: vec![
+                    Marker {
+                        pos: 5,
+                        name: "attack".into(),
+                    },
+                    Marker {
+                        pos: 700,
+                        name: "".into(),
+                    },
+                ],
+                source: Some(AudioSource {
+                    bits,
+                    float: false,
+                    rate: 44_100,
+                }),
+                tags: [
+                    ("title".to_string(), "爆発".to_string()),
+                    ("riff:ISBJ".to_string(), "se".to_string()),
+                ]
+                .into(),
+            };
+            let v = Value::Audio(Arc::new(Audio::new(44_100, planes, meta).unwrap()));
+            let bytes = encode(&v, json!({ "bits": bits }));
+            let back = decode(bytes.clone()).unwrap();
+            assert_eq!(back, v, "{bits} ビット・{channels} チャンネル");
+            assert_eq!(encode(&back, json!({ "bits": bits })), bytes);
+        }
+    }
+
+    #[test]
+    fn float_round_trip_is_exact() {
+        let v = (InputGen::Sine {
+            rate: 48_000,
+            channels: 2,
+            frames: 5_000,
+            freq: 440,
+            loop_range: None,
+        })
+        .generate()
+        .unwrap();
+        let Value::Audio(a) = &v else { panic!() };
+        let back = decode(encode(&v, json!({ "float": true }))).unwrap();
+        let Value::Audio(b) = &back else { panic!() };
+        assert_eq!(a.to_planes().unwrap(), b.to_planes().unwrap());
+        assert_eq!(
+            b.meta.source,
+            Some(AudioSource {
+                bits: 32,
+                float: true,
+                rate: 48_000
+            })
+        );
+    }
+
+    #[test]
+    fn quantization_rounds_half_even_and_clips() {
+        assert_eq!(quantize(1.0, 16), 32_767);
+        assert_eq!(quantize(-1.0, 16), -32_768);
+        assert_eq!(quantize(2.0, 16), 32_767);
+        assert_eq!(quantize(0.5 / 32_768.0, 16), 0);
+        assert_eq!(quantize(1.5 / 32_768.0, 16), 2);
+        assert_eq!(quantize(f32::NAN, 24), 0);
+    }
+
+    /// 壊れたファイル・巨大な大きさを書いたファイルは、落ちずにエラーになる（E25）。panic を受け止めずに直接呼ぶ。
+    #[test]
+    fn broken_files_are_errors_not_panics() {
+        let v = (InputGen::AudioNoise {
+            rate: 8_000,
+            channels: 2,
+            frames: 300,
+            seed: 1,
+        })
+        .generate()
+        .unwrap();
+        let mut a = match &v {
+            Value::Audio(a) => Arc::unwrap_or_clone(a.clone()),
+            _ => panic!(),
+        };
+        a.meta.loop_range = Some(LoopRange { start: 1, end: 200 });
+        a.meta.markers = vec![Marker {
+            pos: 3,
+            name: "m".into(),
+        }];
+        a.meta.tags.insert("artist".into(), "kura".into());
+        let bytes = encode(&Value::Audio(Arc::new(a)), json!({ "bits": 24 }));
+        assert!(decode(bytes.clone()).is_ok());
+        assert!(decode(b"RIFF\0\0\0\0WAVE".to_vec()).is_err());
+        assert!(decode(b"not a wav at all".to_vec()).is_err());
+        let small = Limits {
+            max_audio_frames: 10,
+            ..Limits::default()
+        };
+        assert!(matches!(
+            CodecSet::pinned().decode(
+                &mut Cursor::new(bytes.clone()),
+                "wav",
+                &DecodeOptions::default(),
+                &small,
+                &NoMonitor
+            ),
+            Err(EngineError::Limit(_))
+        ));
+        let tight = Limits {
+            max_audio_frames: 1 << 16,
+            max_markers: 64,
+            max_meta_bytes: 1 << 16,
+            ..Limits::default()
+        };
+        let mut r = crate::determinism::rng(3);
+        use rand_chacha::rand_core::Rng;
+        let (mut ok, mut failed) = (0, 0);
+        for _ in 0..2_000 {
+            let mut broken = bytes.clone();
+            for _ in 0..1 + (r.next_u32() % 6) {
+                let i = r.next_u32() as usize % broken.len();
+                broken[i] = r.next_u32() as u8;
+            }
+            if r.next_u32().is_multiple_of(4) {
+                let cut = r.next_u32() as usize % broken.len();
+                broken.truncate(cut);
+            }
+            match WavCodec.shape(
+                &mut Cursor::new(broken.clone()),
+                "wav",
+                &DecodeOptions::default(),
+                &tight,
+            ) {
+                Ok(shape) if tight.check(&shape).is_ok() => {
+                    match WavCodec.decode(
+                        &mut Cursor::new(broken),
+                        "wav",
+                        &DecodeOptions::default(),
+                        &tight,
+                        &NoMonitor,
+                    ) {
+                        Ok(_) => ok += 1,
+                        Err(_) => failed += 1,
+                    }
+                }
+                _ => failed += 1,
+            }
+        }
+        assert!(ok > 100 && failed > 50, "ok {ok} failed {failed}");
+    }
+
+    /// 同じ ID の cue を大量に並べ、長い labl を付けても、名前は複製されず、マーカーとメタデータの上限で止まる。
+    #[test]
+    fn cue_and_label_floods_are_bounded() {
+        use crate::testfiles::FileGen;
+        let cues: Vec<(u32, u32)> = (0..20_000)
+            .map(|i| (i % 3, i % 50))
+            .chain((0..20_000).map(|i| (100 + i, i % 50)))
+            .collect();
+        let labels: Vec<(u32, String)> = vec![
+            (0, "x".repeat(100_000)),
+            (1, "y".repeat(10)),
+            (0, "dup".into()),
+        ];
+        let bytes = FileGen::Wav {
+            tag: 1,
+            bits: 16,
+            channels: 1,
+            rate: 8_000,
+            frames: 50,
+            extensible: false,
+            smpl: None,
+            cues,
+            labels,
+            info: vec![],
+            unknown_size: false,
+            seed: 1,
+        }
+        .bytes()
+        .unwrap();
+        let limits = Limits {
+            max_markers: 1_000,
+            ..Limits::default()
+        };
+        let (v, _) = CodecSet::pinned()
+            .decode(
+                &mut Cursor::new(bytes),
+                "wav",
+                &DecodeOptions::default(),
+                &limits,
+                &NoMonitor,
+            )
+            .unwrap();
+        let Value::Audio(a) = v else { panic!() };
+        assert!(a.meta.markers.len() <= 1_000);
+        let total: usize = a.meta.markers.iter().map(|m| m.name.len()).sum();
+        // 名前は上限の長さで切り、同じ ID は 1 回だけ
+        assert!(total <= TEXT_MAX + 10, "{total}");
+    }
+
+    /// 空の名前の labl を大量に並べても、数はマーカーの上限で止まり、1 つごとに予算を使う。cue を読んだ後なら、cue にない ID は捨てる。
+    #[test]
+    fn empty_label_floods_are_bounded() {
+        let mut labels = std::collections::BTreeMap::new();
+        let mut budget = Budget {
+            markers: 1_000,
+            bytes: 1 << 20,
+        };
+        for id in 0..200_000u32 {
+            add_label(&mut labels, None, &mut budget, id, String::new());
+        }
+        assert_eq!(labels.len(), 1_000);
+        assert_eq!(budget.bytes, (1 << 20) - 1_000 * ITEM_COST as u64);
+        // 予算が尽きれば、数の上限の前でも止まる
+        let mut labels = std::collections::BTreeMap::new();
+        let mut budget = Budget {
+            markers: 1_000_000,
+            bytes: 10 * ITEM_COST as u64,
+        };
+        for id in 0..200_000u32 {
+            add_label(&mut labels, None, &mut budget, id, String::new());
+        }
+        assert_eq!(labels.len(), 10);
+        // cue にない ID は予算を使わない
+        let cues = std::collections::BTreeMap::from([(7u32, 0u64)]);
+        let mut labels = std::collections::BTreeMap::new();
+        let mut budget = Budget {
+            markers: 1_000,
+            bytes: 1 << 20,
+        };
+        for id in 0..200_000u32 {
+            add_label(&mut labels, Some(&cues), &mut budget, id, "x".into());
+        }
+        assert_eq!(labels.keys().copied().collect::<Vec<_>>(), vec![7]);
+        assert_eq!(budget.bytes, (1 << 20) - 1 - ITEM_COST as u64);
+    }
+
+    /// 浮動小数の元に bits だけを指定すると整数で書き、設定がなければ元の形式・ビット数のまま元のバイト列に戻る（E17）。
+    #[test]
+    fn explicit_bits_win_and_defaults_follow_the_source() {
+        let src = (InputGen::AudioNoise {
+            rate: 22_050,
+            channels: 1,
+            frames: 100,
+            seed: 4,
+        })
+        .generate()
+        .unwrap();
+        let float_file = encode(&src, json!({ "float": true }));
+        let float_value = decode(float_file.clone()).unwrap();
+        let int16 = encode(&float_value, json!({ "bits": 16 }));
+        let Value::Audio(back) = decode(int16).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            back.meta.source,
+            Some(AudioSource {
+                bits: 16,
+                float: false,
+                rate: 22_050
+            })
+        );
+        assert_eq!(encode(&float_value, json!({})), float_file);
+        let int24_file = encode(&src, json!({ "bits": 24 }));
+        assert_eq!(
+            encode(&decode(int24_file.clone()).unwrap(), json!({})),
+            int24_file
+        );
+        assert!(
+            CodecSet::pinned()
+                .encode_bytes(
+                    &float_value,
+                    "wav",
+                    &json!({ "float": true, "bits": 16 }),
+                    &NoMonitor
+                )
+                .is_err()
+        );
+    }
+
+    /// 上限を超えるサンプルレートは読む段階で断り、書くときもあふれずにエラーにする。
+    #[test]
+    fn extreme_rates_are_rejected_without_overflow() {
+        use crate::testfiles::FileGen;
+        let bytes = FileGen::Wav {
+            tag: 3,
+            bits: 32,
+            channels: 1,
+            rate: 0x4000_0000,
+            frames: 4,
+            extensible: false,
+            smpl: None,
+            cues: vec![],
+            labels: vec![],
+            info: vec![],
+            unknown_size: false,
+            seed: 1,
+        }
+        .bytes()
+        .unwrap();
+        assert!(matches!(decode(bytes.clone()), Err(EngineError::Limit(_))));
+        let loose = Limits {
+            max_sample_rate: u32::MAX,
+            ..Limits::default()
+        };
+        let (v, _) = CodecSet::pinned()
+            .decode(
+                &mut Cursor::new(bytes),
+                "wav",
+                &DecodeOptions::default(),
+                &loose,
+                &NoMonitor,
+            )
+            .unwrap();
+        assert!(matches!(
+            CodecSet::pinned().encode_bytes(&v, "wav", &json!({}), &NoMonitor),
+            Err(EngineError::Unsupported(_))
+        ));
+    }
+
+    /// 自前のエンコーダが書かない形（64 ビットの浮動小数・拡張形式の浮動小数・大きさの分からない data・他のツールのメタデータ）を読む。
+    #[test]
+    fn reads_shapes_our_encoder_does_not_write() {
+        use crate::testfiles::FileGen;
+        let make = |tag, bits, extensible, unknown_size| FileGen::Wav {
+            tag,
+            bits,
+            channels: 2,
+            rate: 44_100,
+            frames: 64,
+            extensible,
+            smpl: Some((4, 9)),
+            cues: vec![(7, 2), (8, 60)],
+            labels: vec![(8, "end".into())],
+            info: vec![
+                ("INAM".into(), "name".into()),
+                ("ISBJ".into(), "subject".into()),
+            ],
+            unknown_size,
+            seed: 5,
+        };
+        for (tag, bits, ext, unknown) in [
+            (3u16, 64u16, false, false),
+            (3, 32, true, false),
+            (1, 24, true, true),
+            (1, 8, false, true),
+        ] {
+            let v = decode(make(tag, bits, ext, unknown).bytes().unwrap()).unwrap();
+            let Value::Audio(a) = v else { panic!() };
+            assert_eq!((a.channels(), a.frames()), (2, 64), "{tag}/{bits}");
+            assert!(
+                a.to_planes()
+                    .unwrap()
+                    .iter()
+                    .all(|p| p.iter().all(|s| (-1.0..=1.0).contains(s)))
+            );
+            assert_eq!(a.meta.loop_range, Some(LoopRange { start: 4, end: 10 }));
+            assert_eq!(
+                a.meta.markers,
+                vec![
+                    Marker {
+                        pos: 2,
+                        name: "".into()
+                    },
+                    Marker {
+                        pos: 60,
+                        name: "end".into()
+                    }
+                ]
+            );
+            assert_eq!(a.meta.tags.get("title").map(String::as_str), Some("name"));
+            assert_eq!(
+                a.meta.tags.get("riff:ISBJ").map(String::as_str),
+                Some("subject")
+            );
+        }
+    }
+}

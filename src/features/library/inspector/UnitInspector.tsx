@@ -8,9 +8,11 @@ import { Switch } from '../../../components/Switch/Switch';
 import { CloseIcon } from '../../../components/icons/CloseIcon';
 import { FolderIcon } from '../../../components/icons/FolderIcon';
 import { Waveform } from '../../../components/icons/Waveform';
+import { KindArt } from '../../../components/KindArt/KindArt';
+import { MediaImage } from '../../../components/MediaImage/MediaImage';
 import { ja } from '../../../i18n/ja';
 import { selectionInfo, unitEntry } from '../../../ipc/items';
-import { thumbUrl } from '../../../ipc/media';
+import { isPlayable } from '../../../ipc/kinds';
 import { tagLabel } from '../../../ipc/tags';
 import { getUnitDetail, type OrderModeDto, type UnitFolderDto } from '../../../ipc/units';
 import { formatCount, formatDuration } from '../../../lib/format';
@@ -30,6 +32,7 @@ import {
 } from '../actions';
 import styles from './Inspector.module.css';
 import { TAG_FOCUS_KEY } from './ItemInspector';
+import { CreditSection } from '../../credits/CreditSection';
 import { NoteField } from './NoteField';
 import { useLoaded } from './useLoaded';
 import { isImeKey } from '../../../lib/ime';
@@ -74,11 +77,20 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
   return (
     <>
       <div className={styles.preview}>
-        {cover?.thumbState === 'ready' && (
-          <img className={styles.previewImage} src={thumbUrl(cover.hash, 'l')} alt="" />
-        )}
-        {cover?.kind === 'audio' && cover.thumbState !== 'ready' && (
-          <Waveform className={styles.previewWave} />
+        {cover && (
+          <MediaImage
+            source={cover}
+            size="l"
+            fit="contain"
+            className={styles.previewImage}
+            fallback={
+              cover.kind === 'audio' ? (
+                <Waveform className={styles.previewWave} />
+              ) : !isPlayable(cover.kind) ? (
+                <KindArt kind={cover.kind} />
+              ) : null
+            }
+          />
         )}
       </div>
 
@@ -245,6 +257,8 @@ export function UnitInspector({ unitId, opened }: { unitId: number; opened: bool
           </button>
         </section>
       )}
+
+      <CreditSection itemIds={[]} unitIds={[unitId]} />
 
       <NoteField
         key={`${unitId}-${detail.note ?? ''}`}

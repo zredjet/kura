@@ -2,16 +2,19 @@
 //!
 //! できる条件は `items i` に対する式（`WHERE` の中身）。ゴミ箱の扱いは呼ぶ側（一覧の種類）が決める。
 
+use std::cell::Cell;
+
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::types::Value;
 
 use super::ast::{
-    CivilDate, DateSpec, Expr, FieldCond, KindValue, Op, Orientation, PlayedSpec, TagTerm, UnitSpec,
+    CivilDate, DateSpec, Expr, FieldCond, KindValue, LicenseSpec, Op, Orientation, PlayedSpec,
+    TagTerm, UnitSpec,
 };
 use crate::text::nfc;
 use crate::time::days_from_civil;
-use crate::{Result, folders, tags};
+use crate::{Result, asset, folders, tags};
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -56,13 +59,36 @@ pub fn compile(expr: &Expr, resolver: &dyn Resolver, ctx: &QueryContext) -> Resu
         sql: String::new(),
         params: Vec::new(),
     };
-    Compiler { resolver, ctx }.expr(expr, &mut out)?;
+    Compiler {
+        resolver,
+        ctx,
+        facts: Facts::Known,
+        negated: Cell::new(false),
+        kind_unindexed: Cell::new(false),
+    }
+    .expr(expr, &mut out)?;
     Ok(out)
+}
+
+/// 解析の事実の条件をどう SQL にするか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Facts {
+    /// 事実で判定する（ふつうの検索）。
+    Known,
+    /// 事実を知らないものとして、一致しうるか（上限。未解析の件数）。
+    Upper,
+    /// 事実を知らないものとして、必ず一致するか（下限。未解析の件数）。
+    Lower,
 }
 
 struct Compiler<'a> {
     resolver: &'a dyn Resolver,
     ctx: &'a QueryContext,
+    facts: Facts,
+    /// いま否定（`-`）の中か（入れ子の数が奇数か）。上限・下限を入れ替えるのに使う。
+    negated: Cell<bool>,
+    /// いま事実の集合を引く AND の中か（種類の列に索引を使わせない。`kind_column`）。
+    kind_unindexed: Cell<bool>,
 }
 
 fn placeholders(out: &mut SqlCond, ids: &[i64]) -> String {
@@ -173,7 +199,10 @@ impl Compiler<'_> {
             }
             Expr::Not(inner) => {
                 out.sql.push_str("NOT coalesce(");
-                self.expr(inner, out)?;
+                self.negated.set(!self.negated.get());
+                let done = self.expr(inner, out);
+                self.negated.set(!self.negated.get());
+                done?;
                 out.sql.push_str(", 0)");
                 Ok(())
             }
@@ -234,6 +263,11 @@ impl Compiler<'_> {
             rest = items.iter().collect();
             tag_sets.clear();
         }
+        // 事実の条件（ドット絵・`アニメ:あり` を除く）は 1 つの部分問い合わせにまとめる。事実の行は中身ごとに 1 行なので、
+        // `hash IN A AND hash IN B` と `hash IN (A かつ B)` は同じ（集合が小さくなり、10 万件で数十 ms 縮む）
+        let (facts, rest): (Vec<&Expr>, Vec<&Expr>) = rest
+            .into_iter()
+            .partition(|item| self.mergeable_fact(item).is_some());
         out.sql.push('(');
         let mut first = true;
         if !tag_sets.is_empty() {
@@ -248,13 +282,47 @@ impl Compiler<'_> {
                 .push_str(&format!("i.id IN ({})", selects.join(" INTERSECT ")));
             first = false;
         }
+        if !facts.is_empty() {
+            if !first {
+                out.sql.push_str(" AND ");
+            }
+            first = false;
+            let conds: Vec<&FieldCond> = facts
+                .iter()
+                .filter_map(|item| self.mergeable_fact(item))
+                .collect();
+            let wheres: Vec<String> = conds
+                .iter()
+                .map(|cond| {
+                    self.fact_where(cond, out)
+                        .unwrap_or_else(|| "0".to_string())
+                })
+                .collect();
+            out.sql.push_str(&facts_in(&wheres.join(" AND ")));
+            // `アニメ:なし` は、まとめた事実（コマが 1 つ）に格子がないことを足す（[`Self::anim`] と同じ意味）
+            if conds.iter().any(|c| matches!(c, FieldCond::Anim { .. })) {
+                out.sql.push_str(&format!(" AND {}", no_grid()));
+            }
+        }
+        // 事実・設定の集合から items をハッシュ・主キーで引けるとき（まとめた事実と、ドット絵・アニメ）、種類の索引に
+        // 引っ張られないようにする（`+i.kind`。`種類:画像 透過:あり 色数<=16` が 10 万件で 35ms → 3ms）
+        let by_sets = !facts.is_empty() || rest.iter().any(|item| self.found_by_sets(item));
+        let unindexed = self
+            .kind_unindexed
+            .replace(self.kind_unindexed.get() || by_sets);
+        let mut done = Ok(());
         for item in rest {
             if !first {
                 out.sql.push_str(" AND ");
             }
             first = false;
-            self.expr(item, out)?;
+            done = self.expr(item, out);
+            if done.is_err() {
+                break;
+            }
         }
+        self.kind_unindexed.set(unindexed);
+        done?;
         out.sql.push(')');
         Ok(())
     }
@@ -358,7 +426,8 @@ impl Compiler<'_> {
                 let marks = vec!["?"; kinds.len()].join(", ");
                 out.params.extend(kinds);
                 let not = if *op == Op::Ne { "NOT " } else { "" };
-                out.sql.push_str(&format!("i.kind {not}IN ({marks})"));
+                out.sql
+                    .push_str(&format!("{} {not}IN ({marks})", self.kind_column()));
             }
             FieldCond::Rating { op, value } => self.compare("i.rating", *op, *value, out),
             FieldCond::Dur { op, value } => self.compare("i.duration_ms", *op, *value, out),
@@ -450,9 +519,386 @@ impl Compiler<'_> {
                 };
                 self.negate_if(*op, sql, out);
             }
+            FieldCond::License { op, value } => {
+                // アイテム自身のクレジットの行のライセンス（来歴の元は見ない）。索引 idx_item_credits_license で引く
+                let (sql, negate) = match value {
+                    LicenseSpec::Any | LicenseSpec::None => (
+                        "i.id IN (SELECT c.item_id FROM item_credits c WHERE c.license_id IS NOT NULL)"
+                            .to_string(),
+                        (*op == Op::Ne) == matches!(value, LicenseSpec::Any),
+                    ),
+                    LicenseSpec::Name(name) => {
+                        let name = nfc(name);
+                        let ids = if *op == Op::Eq {
+                            let a = push(out, name.clone());
+                            let b = push(out, name);
+                            format!(
+                                "SELECT l.id FROM licenses l WHERE lower(l.name) = lower({a}) OR lower(ifnull(l.spdx, '')) = lower({b})"
+                            )
+                        } else {
+                            let a = push(out, like_contains(&name));
+                            let b = push(out, like_contains(&name));
+                            format!(
+                                "SELECT l.id FROM licenses l WHERE l.name LIKE {a} ESCAPE '\\' OR ifnull(l.spdx, '') LIKE {b} ESCAPE '\\'"
+                            )
+                        };
+                        (
+                            format!(
+                                "i.id IN (SELECT c.item_id FROM item_credits c WHERE c.license_id IN ({ids}))"
+                            ),
+                            *op == Op::Ne,
+                        )
+                    }
+                };
+                if negate {
+                    out.sql.push_str(&format!("NOT {sql}"));
+                } else {
+                    out.sql.push_str(&sql);
+                }
+            }
+            FieldCond::Attribution { op, value } => {
+                let mark = push(out, value.as_str().to_string());
+                let sql = format!(
+                    "i.id IN (SELECT c.item_id FROM item_credits c JOIN licenses l ON l.id = c.license_id WHERE l.attribution = {mark})"
+                );
+                self.negate_if(*op, sql, out);
+            }
+            FieldCond::Credit { op, value } => {
+                let value = nfc(value);
+                let parts: Vec<String> = ["c.author", "c.work", "c.url", "c.credit"]
+                    .iter()
+                    .map(|c| {
+                        if *op == Op::Eq {
+                            let mark = push(out, value.clone());
+                            format!("lower(ifnull({c}, '')) = lower({mark})")
+                        } else {
+                            let mark = push(out, like_contains(&value));
+                            format!("{c} LIKE {mark} ESCAPE '\\'")
+                        }
+                    })
+                    .collect();
+                let sql = format!(
+                    "i.id IN (SELECT c.item_id FROM item_credits c WHERE {})",
+                    parts.join(" OR ")
+                );
+                if *op == Op::Ne {
+                    out.sql.push_str(&format!("NOT {sql}"));
+                } else {
+                    out.sql.push_str(&sql);
+                }
+            }
+            FieldCond::Pot { op, value } => self.power_of_two(*op, *value, out),
+            FieldCond::Alpha { .. }
+            | FieldCond::Pixel { .. }
+            | FieldCond::Colors { .. }
+            | FieldCond::Rate { .. }
+            | FieldCond::Bits { .. }
+            | FieldCond::Ch { .. }
+            | FieldCond::Lufs { .. }
+            | FieldCond::Peak { .. }
+            | FieldCond::Loop { .. }
+            | FieldCond::Anim { .. } => match self.facts {
+                Facts::Known => self.fact(cond, out),
+                Facts::Upper | Facts::Lower => self.unknown_fact(cond, out),
+            },
         }
         Ok(())
     }
+
+    /// 幅と高さがどちらも 2 のべき乗か（画像。幅・高さがわからないものは、どちらにも入れない）。
+    fn power_of_two(&self, op: Op, value: bool, out: &mut SqlCond) {
+        let want = match op {
+            Op::Has | Op::Eq => value,
+            Op::Ne => !value,
+            _ => {
+                out.sql.push('0');
+                return;
+            }
+        };
+        let kind = push(out, KindValue::Image.as_str().to_string());
+        let both = "(i.width & (i.width - 1)) = 0 AND (i.height & (i.height - 1)) = 0";
+        let test = if want {
+            both.to_string()
+        } else {
+            format!("NOT ({both})")
+        };
+        out.sql.push_str(&format!(
+            "({} = {kind} AND i.width > 0 AND i.height > 0 AND {test})",
+            self.kind_column()
+        ));
+    }
+
+    /// 解析の事実の条件（`i.blob_id IN (SELECT f.blob_id FROM media_facts f WHERE …)`。
+    /// 部分索引から集合を作り、相関した EXISTS にしない）。事実がない・計れない値（NULL）はどの比較にも入らない。
+    fn fact(&self, cond: &FieldCond, out: &mut SqlCond) {
+        match cond {
+            FieldCond::Pixel { op, value } => return self.pixel(*op, *value, out),
+            FieldCond::Anim { op, value } => return self.anim(*op, *value, out),
+            _ => {}
+        }
+        match self.fact_where(cond, out) {
+            Some(sql) => out.sql.push_str(&facts_in(&sql)),
+            None => out.sql.push('0'),
+        }
+    }
+
+    /// AND の中で 1 つの事実の部分問い合わせにまとめられる条件（事実で判定するときだけ）。ドット絵は素材の設定が勝つので、
+    /// `アニメ:あり` は格子との OR なので除く（`アニメ:なし` は事実の条件と、格子がないことの AND なのでまとめられる）。
+    fn mergeable_fact<'e>(&self, expr: &'e Expr) -> Option<&'e FieldCond> {
+        match expr {
+            Expr::Field(
+                cond @ (FieldCond::Alpha { .. }
+                | FieldCond::Colors { .. }
+                | FieldCond::Rate { .. }
+                | FieldCond::Bits { .. }
+                | FieldCond::Ch { .. }
+                | FieldCond::Lufs { .. }
+                | FieldCond::Peak { .. }
+                | FieldCond::Loop { .. }),
+            ) if self.facts == Facts::Known => Some(cond),
+            Expr::Field(cond @ FieldCond::Anim { op, value })
+                if self.facts == Facts::Known && flag_target(*op, *value) == Some(false) =>
+            {
+                Some(cond)
+            }
+            _ => None,
+        }
+    }
+
+    /// 事実・素材の設定の集合で items を引く条件か（AND の直下のドット絵・アニメ。否定の中は集合で引けない）。
+    fn found_by_sets(&self, expr: &Expr) -> bool {
+        self.facts == Facts::Known
+            && matches!(
+                expr,
+                Expr::Field(FieldCond::Pixel { .. } | FieldCond::Anim { .. })
+            )
+    }
+
+    /// 事実の条件の `media_facts f` に対する WHERE（値はバインドする）。一致しない指定（大小の比較の
+    /// できないフィールドの比較など）は None。
+    fn fact_where(&self, cond: &FieldCond, out: &mut SqlCond) -> Option<String> {
+        // あり・なしの列は部分索引（`WHERE x = 1`）を使えるよう、定数（利用者の値ではない）を SQL に書く
+        match cond {
+            FieldCond::Alpha { op, value } => {
+                let not = match op {
+                    Op::Has | Op::Eq => "",
+                    Op::Ne => "NOT ",
+                    _ => return None,
+                };
+                let marks = placeholders(out, value.levels());
+                Some(format!("f.alpha IS NOT NULL AND f.alpha {not}IN ({marks})"))
+            }
+            FieldCond::Loop { op, value } => {
+                flag_target(*op, *value).map(|want| format!("f.has_loop = {}", i64::from(want)))
+            }
+            // `アニメ:なし` の事実の側（格子がないことは呼ぶ側が足す）。`アニメ:あり` は格子との OR なので、ここでは作らない
+            FieldCond::Anim { op, value } => {
+                (flag_target(*op, *value) == Some(false)).then(|| ANIM_STILL.to_string())
+            }
+            FieldCond::Colors { op, value } => Some(colors_compare(*op, *value, out)),
+            FieldCond::Rate { op, value } => Some(fact_compare("f.sample_rate", *op, *value, out)),
+            FieldCond::Bits { op, value } => Some(fact_compare("f.bits", *op, *value, out)),
+            FieldCond::Ch { op, value } => Some(fact_compare("f.channels", *op, *value, out)),
+            FieldCond::Lufs { op, value } => {
+                Some(fact_compare_milli("f.loudness", *op, *value, out))
+            }
+            FieldCond::Peak { op, value } => {
+                Some(fact_compare_milli("f.true_peak", *op, *value, out))
+            }
+            _ => None,
+        }
+    }
+
+    /// 種類の列。事実の集合から items を引く AND の中では索引を使わない（`+i.kind`）。
+    fn kind_column(&self) -> &'static str {
+        if self.kind_unindexed.get() {
+            "+i.kind"
+        } else {
+            "i.kind"
+        }
+    }
+
+    /// ドット絵の実効値「素材の設定 ?? 自動の判定」が `want` か。設定があればそれだけで決まる。
+    fn pixel(&self, op: Op, value: bool, out: &mut SqlCond) {
+        let Some(want) = flag_target(op, value) else {
+            out.sql.push('0');
+            return;
+        };
+        let flag = i64::from(want);
+        out.sql.push_str(&format!(
+            "(i.id IN (SELECT item_id FROM asset_settings WHERE pixel_art = {flag}) \
+             OR ({} AND i.id NOT IN (SELECT item_id FROM asset_settings WHERE pixel_art IS NOT NULL)))",
+            facts_in(&format!("f.pixel_art = {flag}"))
+        ));
+    }
+
+    /// アニメの実効値「格子の設定 ?? 解析のコマ」が `want` か（素材の欄・タイルの `asset::effective_animated`。M11 の
+    /// ユーザーの決定 16）。格子があればアニメ、なければコマが 2 つ以上か。格子は「なし」を決めないので、`アニメ:なし` は
+    /// 格子がなく、コマが 1 つと分かっているもの（未解析・計れないものは入れない）。格子の集合は `asset_settings`
+    /// （変えたアイテムにだけ行がある）から作り、items を主キーで引く。
+    fn anim(&self, op: Op, value: bool, out: &mut SqlCond) {
+        let Some(want) = flag_target(op, value) else {
+            out.sql.push('0');
+            return;
+        };
+        if want {
+            out.sql
+                .push_str(&format!("({} OR {})", grid_items(), facts_in(ANIM_MOVING)));
+        } else {
+            out.sql
+                .push_str(&format!("({} AND {})", facts_in(ANIM_STILL), no_grid()));
+        }
+    }
+
+    /// 事実を知らないものとしたときの条件（「未解析 N 件」）。否定の中かどうかで、一致しうる側（上限）と
+    /// 必ず一致する側（下限）を入れ替える。上限は「その事実を持ちうる種類」、下限は偽。ドット絵とアニメは、素材の設定が
+    /// あれば決まる（ドット絵は設定の値、アニメは格子があれば「あり」）。
+    fn unknown_fact(&self, cond: &FieldCond, out: &mut SqlCond) {
+        let upper = (self.facts == Facts::Upper) != self.negated.get();
+        if let FieldCond::Anim { op, value } = cond {
+            let Some(want) = flag_target(*op, *value) else {
+                out.sql.push('0');
+                return;
+            };
+            let kind = |out: &mut SqlCond| push(out, KindValue::Image.as_str().to_string());
+            let sql = match (want, upper) {
+                (true, true) => format!("({} OR i.kind = {})", grid_items(), kind(out)),
+                (true, false) => grid_items(),
+                (false, true) => format!("(i.kind = {} AND {})", kind(out), no_grid()),
+                (false, false) => "0".to_string(),
+            };
+            out.sql.push_str(&sql);
+            return;
+        }
+        if let FieldCond::Pixel { op, value } = cond {
+            let Some(want) = flag_target(*op, *value) else {
+                out.sql.push('0');
+                return;
+            };
+            let set = format!(
+                "i.id IN (SELECT item_id FROM asset_settings WHERE pixel_art = {})",
+                i64::from(want)
+            );
+            if upper {
+                let kind = push(out, KindValue::Image.as_str().to_string());
+                out.sql.push_str(&format!(
+                    "({set} OR (i.kind = {kind} AND i.id NOT IN (SELECT item_id FROM asset_settings WHERE pixel_art IS NOT NULL)))"
+                ));
+            } else {
+                out.sql.push_str(&set);
+            }
+            return;
+        }
+        match cond.analyzed_kind() {
+            Some(kind) if upper => {
+                let mark = push(out, kind.as_str().to_string());
+                out.sql.push_str(&format!("i.kind = {mark}"));
+            }
+            _ => out.sql.push('0'),
+        }
+    }
+}
+
+/// あり・なしのフィールド（ドット絵・ループ・アニメ）の条件が求める値（`!=` は逆。大小の比較は一致なし）。
+fn flag_target(op: Op, value: bool) -> Option<bool> {
+    match op {
+        Op::Has | Op::Eq => Some(value),
+        Op::Ne => Some(!value),
+        _ => None,
+    }
+}
+
+/// アニメの事実の側：コマが 2 つ以上（`アニメ:あり`）と、1 つ（`アニメ:なし`。計れないものはどちらにも入らない）。
+const ANIM_MOVING: &str = "f.frame_count > 1";
+const ANIM_STILL: &str = "f.frame_count <= 1";
+
+/// 格子の設定があるアイテム（`asset::grid_items_sql`。表は変えたアイテムにだけ行がある）。
+fn grid_items() -> String {
+    format!("i.id IN ({})", asset::grid_items_sql())
+}
+
+/// 格子の設定がないアイテム。
+fn no_grid() -> String {
+    format!("i.id NOT IN ({})", asset::grid_items_sql())
+}
+
+/// 事実の条件を、台帳の行の ID（`items.blob_id`。0010）の集合にする。整数の鍵で引くので、一致が数万件の広い条件も速い
+/// （M11 の決定 17。32 バイトのハッシュで引くと 6〜9 万件で 43〜114ms だった）。
+fn facts_in(cond: &str) -> String {
+    format!("i.blob_id IN (SELECT f.blob_id FROM media_facts f WHERE {cond})")
+}
+
+/// 事実の数の比較（NULL は `!=` を含むどの比較にも入らない）。
+fn fact_compare(column: &str, op: Op, value: i64, out: &mut SqlCond) -> String {
+    let mark = push(out, value);
+    format!("{column} IS NOT NULL AND {column} {} {mark}", sql_op(op))
+}
+
+/// 色数の事実の打ち切り（`image.colors` の `COLOR_CAP`。この値の行は「256 より多い」で、数は計っていない）。
+const COLOR_CAP: i64 = kura_engine::analysis::image::colors::COLOR_CAP as i64;
+
+/// 色数の比較。打ち切った行（257 = 256 より多い）は数として比べず、256 より多いどの数でも結果が同じになる比較（`>`・`!=` は
+/// 256 以下の値と、`>=` は 257 以下の値と）だけに入れる。ほかの比較・一致には、計れない値と同じに入れない
+/// （docs/search-query.md §4。`色数<1000` に数万色の写真を入れず、`色数:257` を「ちょうど 257 色」と読まない）。
+fn colors_compare(op: Op, value: i64, out: &mut SqlCond) -> String {
+    let cmp = fact_compare("f.colors", op, value, out);
+    let decided = match op {
+        Op::Gt | Op::Ne => value < COLOR_CAP,
+        Op::Ge => value <= COLOR_CAP,
+        Op::Has | Op::Eq | Op::Lt | Op::Le => false,
+    };
+    if decided {
+        cmp
+    } else {
+        format!("{cmp} AND f.colors < {COLOR_CAP}")
+    }
+}
+
+/// 1/1000 の整数で持つ値（ラウドネス・ピーク）を、REAL の列と比べる。
+fn fact_compare_milli(column: &str, op: Op, milli: i64, out: &mut SqlCond) -> String {
+    let mark = push(out, milli as f64 / 1000.0);
+    format!("{column} IS NOT NULL AND {column} {} {mark}", sql_op(op))
+}
+
+/// 未解析の件数を数える条件（`items i` に対する式）。検索の条件が解析の事実を使わなければ None。
+///
+/// 解析がまだのアイテム（`analysis_state = 'pending'`）のうち、事実を知らないものとして「一致しうる」（上限）が
+/// 「必ず一致する」（下限）ではないもの、つまり解析が終わると一致が変わりうるものを数える（design.md §3.1）。
+/// 事実の部分問い合わせは使わない（種類と素材の設定だけで決まる）。
+pub fn compile_unanalyzed(
+    expr: &Expr,
+    resolver: &dyn Resolver,
+    ctx: &QueryContext,
+) -> Result<Option<SqlCond>> {
+    if !expr.uses_analysis() {
+        return Ok(None);
+    }
+    let bound = |facts: Facts| -> Result<SqlCond> {
+        let mut out = SqlCond {
+            sql: String::new(),
+            params: Vec::new(),
+        };
+        Compiler {
+            resolver,
+            ctx,
+            facts,
+            negated: Cell::new(false),
+            kind_unindexed: Cell::new(false),
+        }
+        .expr(expr, &mut out)?;
+        Ok(out)
+    };
+    let upper = bound(Facts::Upper)?;
+    let lower = bound(Facts::Lower)?;
+    let mut params = upper.params;
+    params.extend(lower.params);
+    Ok(Some(SqlCond {
+        sql: format!(
+            "i.analysis_state = 'pending' AND coalesce(({}), 0) AND NOT coalesce(({}), 0)",
+            upper.sql, lower.sql
+        ),
+        params,
+    }))
 }
 
 /// DB を見て名前を ID にする。

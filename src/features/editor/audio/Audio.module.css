@@ -1,0 +1,263 @@
+/*
+ * 音声エディタ（design.md §3.1 の「音声エディタ」の案文。M13 の段 6）：画像エディタと同じ層・右パネル・保存（殻は
+ * `../Editor.module.css`）。舞台は 1 枚の canvas（地は --bg-media）。再生位置は canvas の上の要素を transform で動かす。
+ */
+
+.waveHost {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.waveHost[data-cursor='grab'] .wave {
+  cursor: grab;
+}
+
+.waveHost[data-cursor='ew'] .wave {
+  cursor: ew-resize;
+}
+
+.waveHost[data-cursor='text'] .wave {
+  cursor: text;
+}
+
+.wave {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+
+/* 再生位置（1.5px の --accent。描き直さずに transform で動かす） */
+.playhead {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1.5px;
+  background: var(--accent);
+  pointer-events: none;
+  will-change: transform;
+}
+
+.playhead[hidden] {
+  display: none;
+}
+
+/* ===== 下のカプセル（2 段：上に再生の操作と道具の切り替え、下に今の道具の欄） ===== */
+
+/*
+ * 殻の .capsule は真ん中に置いて両側を同じだけ空けるが、音声は左下（カーソル・選択の時刻。.corner の 204px まで）と
+ * 右下（表示の幅。.zoom の 160px まで）を避けた帯の真ん中に置く。帯より広い中身は段の中で折り返す（ガラスの外へ出さない）。
+ * 測った値は scratchpad の stage6-notes「検証の直し」（窓の幅 1280〜1512pt で重ならない）。
+ */
+.capsule {
+  left: calc(var(--space-4) + 204px + var(--space-2));
+  right: calc(var(--space-4) + 160px + var(--space-2));
+  width: fit-content;
+  max-width: none;
+  margin-inline: auto;
+  transform: none;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1-5);
+  padding: var(--space-2) var(--space-3);
+}
+
+.capsuleRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1-5) var(--space-2-5);
+}
+
+.transport {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.playButton {
+  background: var(--fill-2);
+}
+
+.position {
+  min-width: 120px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+/* 道具の切り替え（画像の上部の道具のカプセルと同じボタンを、カプセルの段に詰める） */
+.toolSwitch {
+  height: auto;
+  padding: var(--space-0-5);
+}
+
+.toolSwitch > button {
+  width: 28px;
+}
+
+.toolFields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5) var(--space-2-5);
+  min-width: 0;
+}
+
+/* 使い方の一言（欄の下の行。カプセルの幅は欄で決め、一言はその幅に収める） */
+.toolHint {
+  flex-basis: 100%;
+  min-width: 0;
+  contain: inline-size;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+/* ===== 左下：カーソル・選択の時刻（上の行に、波形の段を作り直している間の一言） ===== */
+
+.corner {
+  position: absolute;
+  left: var(--space-4);
+  bottom: var(--space-4);
+  max-width: 204px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  pointer-events: none;
+}
+
+.cornerPill {
+  max-width: 100%;
+  padding: var(--space-1) var(--space-2-5);
+  border-radius: var(--radius-pill);
+  background: var(--scrim);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cornerStatus {
+  color: var(--text-tertiary);
+}
+
+/* ===== 時刻の欄（時間で入れ、下に標本の位置） ===== */
+
+.timeField {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.timeLabel {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  color: var(--text-tertiary);
+}
+
+.timeStack {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-0-5);
+}
+
+.timeInput {
+  width: 92px;
+  height: 24px;
+  padding: 0 var(--space-1-5);
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.timeInput:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.timeInput[aria-invalid='true'] {
+  border-color: var(--danger-text);
+}
+
+.samples {
+  font-size: var(--text-2xs);
+  line-height: 1;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ===== 右下の表示の幅（160px まで。下のカプセルはこの幅を避ける） ===== */
+
+.zoom {
+  max-width: 160px;
+}
+
+.widthValue {
+  width: 96px;
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== 右パネル：ラウドネス・失うもの ===== */
+
+.loudness {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-1-5);
+  padding: var(--space-2-5) var(--space-1-5) 0;
+  border-top: 1px solid var(--stroke-1);
+}
+
+.loudness > button {
+  align-self: flex-start;
+}
+
+.loudnessValue {
+  font-size: var(--text-md);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.loudnessValue[data-stale] {
+  color: var(--text-tertiary);
+}
+
+.loudnessNote {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.losses {
+  flex: none;
+  margin: 0;
+  padding: 0 var(--space-1-5) 0 calc(var(--space-1-5) + var(--space-3));
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
+  list-style: disc;
+}

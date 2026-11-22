@@ -9,5 +9,11 @@
 	<array>
 		<string>ja</string>
 	</array>
+	<!-- 解放した 1 MiB 未満の確保を libmalloc がすぐ OS へ返す（音声のチャンクの抱え込みをなくす。man にない設定。ADR-183） -->
+	<key>LSEnvironment</key>
+	<dict>
+		<key>MallocSpaceEfficient</key>
+		<string>1</string>
+	</dict>
 </dict>
 </plist>

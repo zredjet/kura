@@ -10,6 +10,10 @@
  * - `data-drop-entry="<id>"`：ユニットの中のタイル・リストの行（並べ替え。`data-drop-axis="y"` なら上下で判定）
  * - `data-drop-playlist="<id>"`：サイドバーの手動プレイリスト（アイテム・ユニット・フォルダを入れる。⌥ で展開を逆に）
  * - `data-drop-playlist-entry="<id>"`：プレイリストの画面の行（並べ替え）
+ * - `data-recipe-row="<id>"`：サイドバーのレシピの行（並べ替え）
+ * - `data-drop-recipe="<id>"`：サイドバーのレシピ（タイルを落とすと、そのレシピを当てるシート。M14 段 7）
+ *
+ * タイル・リストの行のドラッグが窓の外へ出たら、OS のドラッグ（ドラッグアウト。`dragOut.ts`）に切り替える（M15 段 5）。
  */
 
 import { create } from 'zustand';
@@ -24,6 +28,9 @@ import {
   movePlaylist,
 } from '../playlists/playlistActions';
 import { addToFolder, dropWithinUnit, moveFolderTo } from './actions';
+import { beginDragOut, outsideWindow } from './dragOut';
+import { openApply } from '../recipes/applyStore';
+import { moveRecipe } from '../recipes/recipeStore';
 import { viewedSetUnit } from './itemMenu';
 
 export type DragPayload =
@@ -31,7 +38,9 @@ export type DragPayload =
   | { kind: 'folder'; id: number }
   | { kind: 'playlistEntries'; playlistId: number; ids: number[] }
   /** サイドバーのプレイリストの行（並べ替え）。 */
-  | { kind: 'playlist'; id: number };
+  | { kind: 'playlist'; id: number }
+  /** サイドバーのレシピの行（並べ替え）。 */
+  | { kind: 'recipe'; id: number };
 
 export type DropTarget =
   | { kind: 'folder'; id: number; position: DropPosition }
@@ -39,7 +48,10 @@ export type DropTarget =
   | { kind: 'entry'; id: number; side: 'before' | 'after' }
   | { kind: 'playlist'; id: number }
   | { kind: 'playlistEntry'; id: number; side: 'before' | 'after' }
-  | { kind: 'playlistOrder'; id: number; side: 'before' | 'after' };
+  | { kind: 'playlistOrder'; id: number; side: 'before' | 'after' }
+  /** レシピの行（タイルを落とすと当てるシート）。 */
+  | { kind: 'recipe'; id: number }
+  | { kind: 'recipeOrder'; id: number; side: 'before' | 'after' };
 
 interface DragState {
   payload: DragPayload | null;
@@ -76,6 +88,15 @@ export function findTarget(payload: DragPayload, x: number, y: number): DropTarg
     const rect = row.getBoundingClientRect();
     return { kind: 'playlistOrder', id, side: y - rect.top < rect.height / 2 ? 'before' : 'after' };
   }
+  if (payload.kind === 'recipe') {
+    const row = element.closest<HTMLElement>('[data-recipe-row]');
+    const id = Number(row?.dataset.recipeRow);
+    if (!row || id === payload.id) {
+      return null;
+    }
+    const rect = row.getBoundingClientRect();
+    return { kind: 'recipeOrder', id, side: y - rect.top < rect.height / 2 ? 'before' : 'after' };
+  }
   if (payload.kind === 'playlistEntries') {
     const row = element.closest<HTMLElement>('[data-drop-playlist-entry]');
     if (!row) {
@@ -87,6 +108,10 @@ export function findTarget(payload: DragPayload, x: number, y: number): DropTarg
     }
     const rect = row.getBoundingClientRect();
     return { kind: 'playlistEntry', id, side: y - rect.top < rect.height / 2 ? 'before' : 'after' };
+  }
+  const recipeRow = element.closest<HTMLElement>('[data-drop-recipe]');
+  if (recipeRow && payload.kind === 'entries') {
+    return { kind: 'recipe', id: Number(recipeRow.dataset.dropRecipe) };
   }
   const playlistRow = element.closest<HTMLElement>('[data-drop-playlist]');
   if (playlistRow) {
@@ -129,6 +154,18 @@ export function performDrop(payload: DragPayload, target: DropTarget, alt = fals
   if (payload.kind === 'playlist') {
     if (target.kind === 'playlistOrder') {
       void movePlaylist(payload.id, target.id, target.side);
+    }
+    return;
+  }
+  if (payload.kind === 'recipe') {
+    if (target.kind === 'recipeOrder') {
+      void moveRecipe(payload.id, target.id, target.side);
+    }
+    return;
+  }
+  if (target.kind === 'recipe') {
+    if (payload.kind === 'entries') {
+      void openApply({ type: 'recipe', id: target.id }, payload.ids);
     }
     return;
   }
@@ -223,6 +260,14 @@ export function watchDrag(
       useDragStore.setState({ payload: begun.payload, label: begun.label });
     }
     const payload = useDragStore.getState().payload;
+    // 窓の外へ出たら OS のドラッグに切り替える（アプリの中のドラッグは終える）。OS のドラッグが終わると WebView に離した
+    // ことが届くので、そのあとのクリックを捨てる（押したタイルの上で離すと選択が変わらないように）
+    if (payload?.kind === 'entries' && outsideWindow(e.clientX, e.clientY)) {
+      cleanup();
+      swallowClickAfterHandOff();
+      void beginDragOut(payload.ids);
+      return;
+    }
     if (payload) {
       useDragStore.setState({
         x: e.clientX,
@@ -236,8 +281,7 @@ export function watchDrag(
     cleanup();
     if (started) {
       // ドラッグの最後のクリックで選択が変わらないようにする
-      window.addEventListener('click', swallow, { capture: true, once: true });
-      setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
+      swallowNextClick();
       if (payload && target) {
         performDrop(payload, target, e.altKey);
       }
@@ -264,4 +308,27 @@ export function watchDrag(
 function swallow(e: MouseEvent): void {
   e.stopPropagation();
   e.preventDefault();
+}
+
+/**
+ * OS のドラッグに切り替えたあと：次に届く離し（OS のドラッグの終わりに WebView へ渡すもの）に続くクリックを捨てる。離しが
+ * 届かずに次の押しが来たら外す（本当のクリックを捨てない）。
+ */
+function swallowClickAfterHandOff(): void {
+  const disarm = () => {
+    window.removeEventListener('pointerup', onUp, true);
+    window.removeEventListener('pointerdown', disarm, true);
+  };
+  const onUp = () => {
+    disarm();
+    swallowNextClick();
+  };
+  window.addEventListener('pointerup', onUp, true);
+  window.addEventListener('pointerdown', disarm, true);
+}
+
+/** 今の離しに続くクリックを 1 回だけ捨てる（続かなければ次のタスクで外す）。 */
+function swallowNextClick(): void {
+  window.addEventListener('click', swallow, { capture: true, once: true });
+  setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
 }

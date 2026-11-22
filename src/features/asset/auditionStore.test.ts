@@ -1,0 +1,403 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { ja } from '../../i18n/ja';
+import { getAsset } from '../../ipc/asset';
+import type { AuditionOutcome } from '../../lib/assetAudio';
+import { IpcError } from '../../ipc/result';
+import { notify } from '../../stores/noticeStore';
+import { useViewStore } from '../../stores/viewStore';
+import { playerController } from '../player/playerActions';
+import { DEFAULT_PREFS, usePlayerStore } from '../player/playerStore';
+import { type AudioRuntime, MediaHttpError, setAudioRuntimeForTest } from './audioRuntime';
+import {
+  auditionBlocker,
+  auditionTarget,
+  recentAsset,
+  rememberAsset,
+  restartAudition,
+  startAudition,
+  stopAudition,
+  toggleAudition,
+  toggleAuditionKey,
+  useAuditionStore,
+} from './auditionStore';
+import { audioAsset, AUDIO_FACTS, imageAsset, withAuditionLoop } from './testAssets';
+
+vi.mock('../../ipc/asset', () => ({ getAsset: vi.fn() }));
+vi.mock('../../stores/noticeStore', () => ({ notify: vi.fn() }));
+vi.mock('../player/playerActions', () => ({ playerController: vi.fn() }));
+
+const t = ja.asset;
+const PLAN = { mode: 'loop', intro: null, body: [0, 10], offset: 0 } as const;
+const FACTS = { frames: 10, rate: 44_100, channels: 2, loop: null };
+
+function fakeRuntime(outcome: () => Promise<AuditionOutcome>) {
+  const audition = {
+    startProbed: vi.fn(outcome),
+    stop: vi.fn(),
+    position: vi.fn(() => null),
+  };
+  const sfx = { play: vi.fn(), stop: vi.fn() };
+  const runtime = { audition, sfx, pool: { closeAll: vi.fn() } } as unknown as AudioRuntime;
+  return { runtime, audition, sfx };
+}
+
+const playing = async (): Promise<AuditionOutcome> => ({
+  status: 'playing',
+  plan: { ...PLAN, body: [0, 10] },
+  facts: FACTS,
+});
+
+/** 待っている約束をすべて片付ける。 */
+const settle = () => new Promise((r) => setTimeout(r, 0));
+
+describe('試聴の状態と口', () => {
+  let fake: ReturnType<typeof fakeRuntime>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fake = fakeRuntime(playing);
+    setAudioRuntimeForTest(fake.runtime);
+    useAuditionStore.setState({ itemId: null, status: 'idle', mode: null, fromStart: false });
+    usePlayerStore.setState({ active: false, prefs: DEFAULT_PREFS });
+    useViewStore.setState({ quickLook: false });
+  });
+
+  afterEach(() => setAudioRuntimeForTest(null));
+
+  it('試聴できない理由：音声でない・解析の前・作れないレート', () => {
+    expect(auditionBlocker(audioAsset())).toBeNull();
+    expect(auditionTarget(audioAsset())).toEqual({
+      itemId: 2,
+      hash: 'cd'.repeat(32),
+      rate: 44_100,
+      channels: 2,
+      loop: null,
+    });
+    expect(auditionBlocker(imageAsset())).toBe(t.auditionUnsupported);
+    expect(auditionBlocker(audioAsset({ analysisState: 'pending', facts: null }))).toBe(
+      t.auditionNoFacts,
+    );
+    expect(
+      auditionBlocker(
+        audioAsset({
+          analysisState: 'failed',
+          facts: { ...audioAsset().facts!, ok: false, audio: { ...AUDIO_FACTS, sampleRate: null } },
+        }),
+      ),
+    ).toBe(t.auditionUnsupported);
+    const rate = (sampleRate: number) =>
+      audioAsset({ facts: { ...audioAsset().facts!, audio: { ...AUDIO_FACTS, sampleRate } } });
+    expect(auditionBlocker(rate(2_999))).toBe(t.auditionRate);
+    expect(auditionBlocker(rate(768_000))).toBe(t.auditionRate);
+    expect(auditionBlocker(rate(384_000))).toBeNull();
+    expect(auditionTarget(rate(768_000))).toBeNull();
+  });
+
+  it('始めると効果音を止め、再生中のプレーヤーを一時停止し、応答で長さを知ってから鳴らす', async () => {
+    const pause = vi.fn();
+    vi.mocked(playerController).mockReturnValue({ pause } as never);
+    usePlayerStore.setState({
+      active: true,
+      snapshot: { ...usePlayerStore.getState().snapshot, playing: true },
+    });
+    const target = auditionTarget(audioAsset());
+    if (!target) throw new Error('対象がない');
+    startAudition(target, true);
+    expect(fake.sfx.stop).toHaveBeenCalled();
+    expect(pause).toHaveBeenCalled();
+    expect(fake.audition.startProbed).toHaveBeenCalledWith(
+      target.hash,
+      { rate: 44_100, channels: 2, loop: null },
+      { fromStart: true },
+    );
+    expect(useAuditionStore.getState()).toMatchObject({
+      itemId: 2,
+      status: 'loading',
+      fromStart: true,
+    });
+    await settle();
+    expect(useAuditionStore.getState()).toMatchObject({ status: 'playing', mode: 'loop' });
+  });
+
+  it('試聴の設定の区間があれば対象に入れ、長さ（/pcm の応答）で確かめるよう Audition に渡す（L も同じ）', async () => {
+    const asset = withAuditionLoop(audioAsset(), 44_100, 88_200);
+    const target = auditionTarget(asset);
+    expect(target?.loop).toEqual([44_100, 88_200]);
+    startAudition(target!);
+    expect(fake.audition.startProbed).toHaveBeenLastCalledWith(
+      asset.hash,
+      { rate: 44_100, channels: 2, loop: [44_100, 88_200] },
+      { fromStart: false },
+    );
+    await settle();
+    stopAudition();
+    rememberAsset(asset);
+    expect(toggleAuditionKey(asset.itemId, 'audio')).toBe(true);
+    expect(fake.audition.startProbed).toHaveBeenLastCalledWith(
+      asset.hash,
+      { rate: 44_100, channels: 2, loop: [44_100, 88_200] },
+      { fromStart: false },
+    );
+  });
+
+  it('混んでいて読めなければ（503）知らせのカプセルに「混んでいます…」', async () => {
+    fake.audition.startProbed.mockImplementation(async () => ({
+      status: 'failed',
+      error: new MediaHttpError(503),
+    }));
+    startAudition(auditionTarget(audioAsset())!);
+    await settle();
+    expect(notify).toHaveBeenCalledWith(t.auditionBusy);
+    expect(useAuditionStore.getState().status).toBe('idle');
+    fake.audition.startProbed.mockImplementation(async () => ({ status: 'unsupported' }));
+    startAudition(auditionTarget(audioAsset())!);
+    await settle();
+    expect(notify).toHaveBeenLastCalledWith(t.auditionUnsupported);
+  });
+
+  it('/pcm が 2xx でなければ HTTP の番号を出さず、分かる言葉で知らせる（ファイルがない・範囲の外・空き不足・ほか）', async () => {
+    const cases: [unknown, string][] = [
+      [new MediaHttpError(404), t.auditionFailed(t.auditionMissing)],
+      [new MediaHttpError(416), t.auditionFailed(t.auditionRange)],
+      // 試聴の PCM を作る一時の置き場の空きが足りない（PcmError::NoSpace）
+      [new MediaHttpError(507), t.auditionFailed(t.auditionNoSpace)],
+      [new MediaHttpError(500), t.auditionFailed(t.auditionUnreadable)],
+      // fetch そのものの失敗（WebKit の英語の message）・応答を読めない
+      [new TypeError('Load failed'), t.auditionFailed(t.auditionUnreadable)],
+      [new RangeError('レートが範囲の外です'), t.auditionFailed(t.auditionUnreadable)],
+    ];
+    for (const [error, text] of cases) {
+      fake.audition.startProbed.mockImplementationOnce(async () => ({ status: 'failed', error }));
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      expect(notify).toHaveBeenLastCalledWith(text);
+      expect(vi.mocked(notify).mock.lastCall?.[0]).not.toMatch(/HTTP|Load failed/);
+    }
+    // Rust の失敗（IpcError）は日本語の message をそのまま
+    vi.mocked(getAsset).mockRejectedValueOnce(
+      new IpcError({ code: 'Db', message: 'データベースを読めません' }),
+    );
+    toggleAuditionKey(11, 'audio');
+    await settle();
+    expect(notify).toHaveBeenLastCalledWith(t.auditionFailed('データベースを読めません'));
+  });
+
+  it('ライブラリを閉じた・切り替えた中止（/pcm の 409）は知らせず、警告も出さず、止まっただけにする', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    fake.audition.startProbed.mockImplementationOnce(async () => ({
+      status: 'failed',
+      error: new MediaHttpError(409),
+    }));
+    startAudition(auditionTarget(audioAsset())!);
+    expect(useAuditionStore.getState().status).toBe('loading');
+    await settle();
+    expect(useAuditionStore.getState()).toEqual({
+      itemId: null,
+      status: 'idle',
+      mode: null,
+      fromStart: false,
+    });
+    expect(notify).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('待つ間に止めたら、あとから鳴り始めの知らせが来ても状態を戻さない', async () => {
+    let resolve: (o: AuditionOutcome) => void = () => undefined;
+    fake.audition.startProbed.mockImplementation(
+      () => new Promise<AuditionOutcome>((r) => (resolve = r)),
+    );
+    startAudition(auditionTarget(audioAsset())!);
+    stopAudition();
+    resolve({ status: 'playing', plan: PLAN as never, facts: FACTS });
+    await settle();
+    expect(useAuditionStore.getState().status).toBe('idle');
+  });
+
+  describe('素材の設定を保存したあとの鳴らし直し（restartAudition）', () => {
+    const asset = withAuditionLoop(audioAsset(), 44_100, 88_200);
+
+    /** 読み直しの応えを待たせる。 */
+    function deferAsset() {
+      let resolve: (value: typeof asset) => void = () => undefined;
+      let reject: (error: unknown) => void = () => undefined;
+      vi.mocked(getAsset).mockImplementationOnce(
+        () =>
+          new Promise((res, rej) => {
+            resolve = res;
+            reject = rej;
+          }),
+      );
+      return { resolve: (v: typeof asset) => resolve(v), reject: (e: unknown) => reject(e) };
+    }
+
+    it('試聴していない・ほかのアイテムを試聴しているなら、読みも鳴らしもしない', async () => {
+      restartAudition(asset.itemId);
+      startAudition(auditionTarget(audioAsset({ itemId: 9 }))!);
+      await settle();
+      restartAudition(asset.itemId);
+      await settle();
+      expect(getAsset).not.toHaveBeenCalled();
+      expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+    });
+
+    it('試聴中なら、読み直した区間で同じ鳴らし方で始め直し、覚えている素材の欄も新しくする', async () => {
+      startAudition(auditionTarget(audioAsset())!, true);
+      await settle();
+      vi.mocked(getAsset).mockResolvedValueOnce(asset);
+      restartAudition(asset.itemId);
+      await settle();
+      expect(fake.audition.startProbed).toHaveBeenLastCalledWith(
+        asset.hash,
+        { rate: 44_100, channels: 2, loop: [44_100, 88_200] },
+        { fromStart: true },
+      );
+      expect(useAuditionStore.getState()).toMatchObject({ status: 'playing', fromStart: true });
+      expect(recentAsset(asset.itemId)).toBe(asset);
+    });
+
+    it('読み終える前に試聴を止めた・ほかへ移ったら、鳴らさない', async () => {
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      const stopped = deferAsset();
+      restartAudition(asset.itemId);
+      stopAudition();
+      stopped.resolve(asset);
+      await settle();
+      expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+      expect(useAuditionStore.getState().status).toBe('idle');
+
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      const moved = deferAsset();
+      restartAudition(asset.itemId);
+      startAudition(auditionTarget(audioAsset({ itemId: 9 }))!);
+      await settle();
+      moved.resolve(asset);
+      await settle();
+      expect(fake.audition.startProbed).toHaveBeenCalledTimes(3);
+      expect(useAuditionStore.getState().itemId).toBe(9);
+    });
+
+    it('読み終える前に［はじめから］で始め直していたら、読み直した区間でその鳴らし方にする', async () => {
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      const later = deferAsset();
+      restartAudition(asset.itemId);
+      startAudition(auditionTarget(audioAsset())!, true);
+      await settle();
+      later.resolve(asset);
+      await settle();
+      expect(fake.audition.startProbed).toHaveBeenLastCalledWith(
+        asset.hash,
+        { rate: 44_100, channels: 2, loop: [44_100, 88_200] },
+        { fromStart: true },
+      );
+    });
+
+    it('読み直せなければ、前の区間を鳴らし続けずに止めて知らせる', async () => {
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      vi.mocked(getAsset).mockRejectedValueOnce(
+        new IpcError({ code: 'Db', message: 'データベースを読めません' }),
+      );
+      restartAudition(asset.itemId);
+      await settle();
+      expect(useAuditionStore.getState().status).toBe('idle');
+      expect(fake.audition.stop).toHaveBeenCalledTimes(2);
+      expect(notify).toHaveBeenCalledWith(t.auditionFailed('データベースを読めません'));
+    });
+
+    it('読み直したら試聴できなくなっていれば、止めて理由を知らせる', async () => {
+      startAudition(auditionTarget(audioAsset())!);
+      await settle();
+      vi.mocked(getAsset).mockResolvedValueOnce(
+        audioAsset({ analysisState: 'pending', facts: null }),
+      );
+      restartAudition(asset.itemId);
+      await settle();
+      expect(useAuditionStore.getState().status).toBe('idle');
+      expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+      expect(notify).toHaveBeenCalledWith(t.auditionNoFacts);
+    });
+  });
+
+  it('ボタン：同じものを同じ鳴らし方でもう一度押すと止める', async () => {
+    const target = auditionTarget(audioAsset())!;
+    toggleAudition(target);
+    await settle();
+    expect(useAuditionStore.getState().status).toBe('playing');
+    toggleAudition(target, true);
+    expect(fake.audition.startProbed).toHaveBeenCalledTimes(2);
+    await settle();
+    toggleAudition(target, true);
+    expect(useAuditionStore.getState().status).toBe('idle');
+    expect(fake.audition.startProbed).toHaveBeenCalledTimes(2);
+  });
+
+  it('L：試聴していれば止める。音声なら覚えている素材の欄ですぐ始める', async () => {
+    rememberAsset(audioAsset());
+    expect(toggleAuditionKey(2, 'audio')).toBe(true);
+    expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+    expect(getAsset).not.toHaveBeenCalled();
+    await settle();
+    expect(toggleAuditionKey(null, undefined)).toBe(true);
+    expect(useAuditionStore.getState().status).toBe('idle');
+    // 音声でなければ扱わない
+    expect(toggleAuditionKey(4, 'image')).toBe(false);
+    expect(toggleAuditionKey(null, undefined)).toBe(false);
+  });
+
+  it('L：素材の欄を読んでいなければ読んでから始め、試聴できなければ理由を知らせる', async () => {
+    vi.mocked(getAsset).mockResolvedValueOnce(audioAsset({ itemId: 7 }));
+    expect(toggleAuditionKey(7, 'audio')).toBe(true);
+    await settle();
+    expect(getAsset).toHaveBeenCalledWith(7);
+    expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+    stopAudition();
+    vi.mocked(getAsset).mockResolvedValueOnce(
+      audioAsset({ itemId: 8, analysisState: 'pending', facts: null }),
+    );
+    toggleAuditionKey(8, 'audio');
+    await settle();
+    expect(notify).toHaveBeenCalledWith(t.auditionNoFacts);
+    expect(fake.audition.startProbed).toHaveBeenCalledTimes(1);
+  });
+
+  it('クイックルック中は L・メニューで始めない（クイックルックが自分で鳴らす。効果音と同じ条件）', async () => {
+    rememberAsset(audioAsset());
+    useViewStore.setState({ quickLook: true });
+    expect(toggleAuditionKey(2, 'audio')).toBe(false);
+    expect(fake.audition.startProbed).not.toHaveBeenCalled();
+    expect(useAuditionStore.getState().status).toBe('idle');
+    // 素材の欄を読んでいる間にクイックルックを開いた：読めても始めない
+    useViewStore.setState({ quickLook: false });
+    let resolve: (asset: ReturnType<typeof audioAsset>) => void = () => undefined;
+    vi.mocked(getAsset).mockImplementationOnce(() => new Promise((r) => (resolve = r)));
+    expect(toggleAuditionKey(9, 'audio')).toBe(true);
+    useViewStore.setState({ quickLook: true });
+    resolve(audioAsset({ itemId: 9 }));
+    await settle();
+    expect(fake.audition.startProbed).not.toHaveBeenCalled();
+    expect(useAuditionStore.getState().status).toBe('idle');
+  });
+
+  it('プレーヤーが鳴り始めたら試聴を止める（試聴とプレーヤーを重ねない。シアターの再生ボタンなど）', async () => {
+    usePlayerStore.setState({
+      active: true,
+      snapshot: { ...usePlayerStore.getState().snapshot, playing: false },
+    });
+    startAudition(auditionTarget(audioAsset())!);
+    await settle();
+    expect(useAuditionStore.getState().status).toBe('playing');
+    // 鳴っていないプレーヤーの変化（位置など）では止めない
+    usePlayerStore.setState({ snapshot: { ...usePlayerStore.getState().snapshot, positionMs: 5 } });
+    expect(fake.audition.stop).toHaveBeenCalledTimes(1);
+    usePlayerStore.setState({
+      snapshot: { ...usePlayerStore.getState().snapshot, playing: true },
+    });
+    expect(fake.audition.stop).toHaveBeenCalledTimes(2);
+    expect(useAuditionStore.getState().status).toBe('idle');
+  });
+});

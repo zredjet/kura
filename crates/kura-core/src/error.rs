@@ -12,6 +12,38 @@ pub enum CoreError {
     /// 入力が正しくない。
     #[error("入力が正しくありません: {0}")]
     Invalid(String),
+    /// 大きすぎて扱えない（文書・値・メモリの予算の全体。やり直しても同じ。M12 の保存）。
+    #[error("大きすぎます: {0}")]
+    TooLarge(String),
+    /// この形式・組み合わせは扱えない（書けない出力の形式など。M12 の保存）。
+    #[error("扱えません: {0}")]
+    Unsupported(String),
+    /// 保存の出力をこの形式に書けない（書き手がない・知らない形式。code は `Unsupported` と同じ。一括は上書きなら
+    /// FormatUnavailable で飛ばし、別名なら代わりの形式で書く。元を読めないときの `Unsupported` と分ける。M14 段 4）。
+    #[error("扱えません: {0}")]
+    Unwritable(String),
+    /// 文書がこの入力に合わない（推論できず描けない・アイテムの種類を変える出力の形式。code は `Invalid` と同じ。一括は
+    /// このアイテムに当てられない手として NotApplicable で飛ばす。元を読めない・壊れているときの `Invalid` と分ける。M14 段 4）。
+    #[error("入力が正しくありません: {0}")]
+    Unfit(String),
+    /// 記録と食い違う（途中の版を作り直した値が版の記録と合わない・アンカーが壊れているなど。M12 の保存）。
+    #[error("記録と食い違います: {0}")]
+    Mismatch(String),
+    /// 混んでいる（同じアイテムの保存が終わっていないなど。待ってやり直せば通りうる。M12 の保存）。
+    #[error("混んでいます: {0}")]
+    Busy(String),
+    /// ディスクの空きが足りない（作業用の PCM を書く前の見積もり。M13 段 2。書く途中の ENOSPC は `Io`（`is_no_space`））。
+    #[error(
+        "ディスクの空き容量が足りません。あと約 {} MB の空きを作ってからやり直してください（要る空きは約 {} MB、いまの空きは約 {} MB）",
+        megabytes(.needed.saturating_sub(*.available)),
+        megabytes(*.needed),
+        megabytes(*.available)
+    )]
+    NoSpace { needed: u64, available: u64 },
+    /// 中止した（ジョブの一時停止・中止の指示で、途中で止めた。作業用の PCM を書く途中など。M13 段 3。ジョブは止め方
+    /// （一時停止・中止）に写す）。
+    #[error("中止しました")]
+    Canceled,
     /// ファイル操作の失敗。
     #[error("ファイル操作に失敗しました: {0}")]
     Io(#[from] std::io::Error),
@@ -30,6 +62,134 @@ pub enum CoreError {
     /// 外部ツールが失敗した（画面に出す説明）。
     #[error("{0}")]
     Tool(String),
+    /// ライブラリの DB を新しい版にできなかった（開くのを失敗にする。画面に出す説明）。
+    #[error("{0}")]
+    Upgrade(#[from] UpgradeError),
+    /// ほかのアプリ（プロセス）が同じライブラリを開いている（ライブラリのロック `library.lock` を取れない。
+    /// `library::LibraryLock`。開く側は何もせずに断る）。
+    #[error(
+        "このライブラリはほかのアプリで開かれています。同じライブラリを 2 つのアプリで同時に開くことはできません。もう一方を終了してから開き直してください"
+    )]
+    LibraryInUse,
+}
+
+/// ライブラリの DB を新しい版にできなかった理由（docs/data-model.md §5）。当てる前に断ったもの（`Newer`・`NoSpace`・
+/// `Backup*`）はライブラリを変えていない。当てる途中の失敗（`Apply*`）は、失敗した 1 つだけが戻り、それより前に当てたものは
+/// 残る（`reached` が `from` より大きければ途中の版）。
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum UpgradeError {
+    /// DB の方が新しい（新しい版の Kura で作られた）。
+    #[error(
+        "このライブラリは新しい版の Kura で作られています（スキーマ {found}。この Kura が扱えるのは {supported} まで）。Kura を新しくしてから開いてください"
+    )]
+    Newer { found: usize, supported: usize },
+    /// 当てる前に確かめた空きが、見積もり（`library::upgrade::space_needed`）に足りない（バックアップも取っていない）。
+    #[error(
+        "ディスクの空き容量が足りないため、ライブラリを新しい版にできません。あと約 {} MB の空きを作ってから開き直してください（ライブラリは変えていません。要る空きは約 {} MB、いまの空きは約 {} MB）",
+        megabytes(.needed.saturating_sub(*.available)),
+        megabytes(*.needed),
+        megabytes(*.available)
+    )]
+    NoSpace { needed: u64, available: u64 },
+    /// 当てる前のバックアップを作れなかった（ディスクの空きが足りない）。
+    #[error(
+        "ライブラリを新しい版にする前のバックアップを作れませんでした。ディスクの空き容量が足りません。空きを作ってから開き直してください（ライブラリは変えていません。{detail}）"
+    )]
+    BackupNoSpace { detail: String },
+    /// 当てる前のバックアップを作れなかった。
+    #[error(
+        "ライブラリを新しい版にする前のバックアップを作れませんでした（ライブラリは変えていません。{detail}）"
+    )]
+    Backup { detail: String },
+    /// 当てている途中でディスクの空きが足りなくなった（`migration` は戻した。`from` は当てる前の版、`reached` は今の版）。
+    #[error(
+        "ディスクの空き容量が足りず、ライブラリを新しい版にできませんでした。空きを作ってから開き直してください（{}）",
+        where_it_stands(*.from, *.reached, .migration, .detail)
+    )]
+    ApplyNoSpace {
+        migration: String,
+        detail: String,
+        from: usize,
+        reached: usize,
+    },
+    /// 当てられなかった（`migration` は戻した。`from` は当てる前の版、`reached` は今の版）。
+    #[error(
+        "ライブラリを新しい版にできませんでした（{}）",
+        where_it_stands(*.from, *.reached, .migration, .detail)
+    )]
+    Apply {
+        migration: String,
+        detail: String,
+        from: usize,
+        reached: usize,
+    },
+}
+
+/// 当てる途中で失敗したときの、ライブラリの今の版の説明。前の版から 1 つでも当てていれば、前の版の Kura ではもう開けない
+/// （新しい版のスキーマとして断る）ので、そう言い、当てる前のバックアップの場所を添える。
+fn where_it_stands(from: usize, reached: usize, migration: &str, detail: &str) -> String {
+    if from == 0 {
+        // 新しいライブラリを作っている途中（前の版も当てる前のバックアップもない）
+        format!(
+            "新しいライブラリを作る途中で止まりました。開き直すと続きを当てます。{migration}：{detail}"
+        )
+    } else if reached > from {
+        format!(
+            "途中の版（スキーマ {reached}）まで当てたので、前の版の Kura ではもう開けません。原因を取り除いて開き直すと続きを当てます。当てる前のバックアップがライブラリの backups にあります。{migration}：{detail}"
+        )
+    } else {
+        format!("ライブラリは前の版のまま残っています。{migration}：{detail}")
+    }
+}
+
+impl UpgradeError {
+    /// 理由の種類（`newer`・`noSpace`・`backup`・`apply`。画面の出し分けに使う）。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Newer { .. } => "newer",
+            Self::NoSpace { .. } | Self::BackupNoSpace { .. } | Self::ApplyNoSpace { .. } => {
+                "noSpace"
+            }
+            Self::Backup { .. } => "backup",
+            Self::Apply { .. } => "apply",
+        }
+    }
+
+    /// 当てる前のバックアップの失敗から作る。
+    pub fn backup(err: &CoreError) -> Self {
+        let detail = err.to_string();
+        if err.is_no_space() {
+            Self::BackupNoSpace { detail }
+        } else {
+            Self::Backup { detail }
+        }
+    }
+
+    /// 当てる失敗から作る（`migration` は失敗したマイグレーションの名前、`from` は当てる前の版、`reached` は失敗したときの版）。
+    /// 説明に SQL の本文は入れない（[`CoreError::short`]）。
+    pub fn apply(migration: &str, err: &CoreError, from: usize, reached: usize) -> Self {
+        let (migration, detail) = (migration.to_string(), err.short());
+        if err.is_no_space() {
+            Self::ApplyNoSpace {
+                migration,
+                detail,
+                from,
+                reached,
+            }
+        } else {
+            Self::Apply {
+                migration,
+                detail,
+                from,
+                reached,
+            }
+        }
+    }
+}
+
+/// バイト数を、切り上げた MB（10^6。Finder の表示と同じ）にする。
+fn megabytes(bytes: u64) -> u64 {
+    bytes.div_ceil(1_000_000)
 }
 
 impl CoreError {
@@ -38,11 +198,46 @@ impl CoreError {
         match self {
             Self::NotFound(_) => "NotFound",
             Self::Conflict(_) => "Conflict",
-            Self::Invalid(_) => "Invalid",
+            Self::Invalid(_) | Self::Unfit(_) => "Invalid",
+            Self::TooLarge(_) => "TooLarge",
+            Self::Unsupported(_) | Self::Unwritable(_) => "Unsupported",
+            Self::Mismatch(_) => "Mismatch",
+            Self::Busy(_) => "Busy",
+            Self::NoSpace { .. } => "NoSpace",
+            Self::Canceled => "Canceled",
             Self::Io(_) => "Io",
             Self::Db(_) | Self::Json(_) | Self::DbClosed => "Db",
             Self::ToolMissing(_) => "ToolMissing",
             Self::Tool(_) => "ToolFailed",
+            Self::Upgrade(_) => "Upgrade",
+            Self::LibraryInUse => "LibraryInUse",
+        }
+    }
+
+    /// 画面に出す短い説明。SQL の位置を指すエラー（rusqlite の `SqlInputError`）は、SQL の本文を落として SQLite の言葉と
+    /// 位置だけにする（マイグレーションなら数 KB の本文が入る）。ほかは `to_string` と同じ。
+    pub fn short(&self) -> String {
+        match self {
+            Self::Db(rusqlite::Error::SqlInputError { msg, offset, .. }) => {
+                format!("データベースの操作に失敗しました: {msg}（SQL の {offset} バイト目）")
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// ディスクの空きが足りないことによる失敗か（ENOSPC・SQLITE_FULL）。
+    pub fn is_no_space(&self) -> bool {
+        /// macOS と Linux の ENOSPC。
+        const ENOSPC: i32 = 28;
+        match self {
+            Self::Io(err) => {
+                err.kind() == std::io::ErrorKind::StorageFull || err.raw_os_error() == Some(ENOSPC)
+            }
+            Self::Db(rusqlite::Error::SqliteFailure(err, _)) => {
+                err.code == rusqlite::ErrorCode::DiskFull
+            }
+            Self::NoSpace { .. } => true,
+            _ => false,
         }
     }
 }
@@ -75,5 +270,110 @@ mod tests {
     fn message_includes_detail() {
         let err = CoreError::NotFound("item 42".into());
         assert_eq!(err.to_string(), "見つかりません: item 42");
+    }
+
+    /// 保存（M12）で使う種類：大きすぎる・扱えない・記録と食い違う。
+    #[test]
+    fn save_errors_have_their_own_codes() {
+        for (err, code, text) in [
+            (
+                CoreError::TooLarge("x".into()),
+                "TooLarge",
+                "大きすぎます: x",
+            ),
+            (
+                CoreError::Unsupported("x".into()),
+                "Unsupported",
+                "扱えません: x",
+            ),
+            (
+                CoreError::Mismatch("x".into()),
+                "Mismatch",
+                "記録と食い違います: x",
+            ),
+        ] {
+            assert_eq!(err.code(), code);
+            assert_eq!(err.to_string(), text);
+        }
+    }
+
+    /// SQL の位置を指すエラーは、SQL の本文を落として SQLite の言葉と位置だけにする。
+    #[test]
+    fn short_drops_the_sql_text() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sql = "CREATE TABLE t (x); CREATE TABLE t (y); -- ここから下は長い本文";
+        let err = CoreError::from(conn.execute_batch(sql).unwrap_err());
+        assert!(err.to_string().contains("長い本文"), "{err}");
+        let short = err.short();
+        assert!(short.contains("already exists"), "{short}");
+        assert!(!short.contains("長い本文"), "{short}");
+        let other = CoreError::Invalid("x".into());
+        assert_eq!(other.short(), other.to_string());
+    }
+
+    #[test]
+    fn upgrade_errors_say_what_happened_and_tell_no_space_apart() {
+        let full = CoreError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert!(full.is_no_space());
+        let enospc = CoreError::Io(std::io::Error::from_raw_os_error(28));
+        assert!(enospc.is_no_space());
+        let disk_full = CoreError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        ));
+        assert!(disk_full.is_no_space());
+        let other = CoreError::Invalid("x".into());
+        assert!(!other.is_no_space());
+
+        let backup = UpgradeError::backup(&full);
+        assert_eq!(backup.kind(), "noSpace");
+        assert!(backup.to_string().contains("空き容量"), "{backup}");
+        assert_eq!(UpgradeError::backup(&other).kind(), "backup");
+        let apply = UpgradeError::apply("0007_blobs_and_kinds", &other, 6, 6);
+        assert_eq!(apply.kind(), "apply");
+        assert!(
+            apply.to_string().contains("0007_blobs_and_kinds"),
+            "{apply}"
+        );
+        assert!(apply.to_string().contains("前の版のまま"), "{apply}");
+        // 途中の版まで当てたら、前の版のままとは言わない
+        let partial = UpgradeError::apply("0009_analysis", &other, 6, 8);
+        assert_eq!(partial.kind(), "apply");
+        assert!(!partial.to_string().contains("前の版のまま"), "{partial}");
+        assert!(partial.to_string().contains("スキーマ 8"), "{partial}");
+        let partial_full = UpgradeError::apply("0009_analysis", &full, 6, 8);
+        assert_eq!(partial_full.kind(), "noSpace");
+        assert!(
+            partial_full.to_string().contains("空き容量"),
+            "{partial_full}"
+        );
+        assert!(
+            partial_full.to_string().contains("前の版の Kura"),
+            "{partial_full}"
+        );
+        // 新しいライブラリ（版 0）は「前の版」・バックアップと言わず、作る途中で止まったと言う（docs/data-model.md §5 の 5・
+        // ADR-156 (4)。M11 の確かめ C3）
+        let fresh = UpgradeError::apply("0009_analysis", &other, 0, 8);
+        assert!(!fresh.to_string().contains("前の版"), "{fresh}");
+        assert!(!fresh.to_string().contains("backups"), "{fresh}");
+        assert!(
+            fresh
+                .to_string()
+                .contains("新しいライブラリを作る途中で止まりました。開き直すと続きを当てます。0009_analysis："),
+            "{fresh}"
+        );
+        let short = UpgradeError::NoSpace {
+            needed: 300_000_000,
+            available: 120_500_000,
+        };
+        assert_eq!(short.kind(), "noSpace");
+        assert!(short.to_string().contains("あと約 180 MB"), "{short}");
+        assert!(short.to_string().contains("変えていません"), "{short}");
+        let newer = CoreError::from(UpgradeError::Newer {
+            found: 12,
+            supported: 9,
+        });
+        assert_eq!(newer.code(), "Upgrade");
+        assert!(newer.to_string().contains("新しい版の Kura"), "{newer}");
     }
 }

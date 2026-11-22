@@ -1,21 +1,32 @@
 [workspace]
 resolver = "3"
-members = ["crates/kura-core", "crates/kura-mac", "crates/kura-devtools", "src-tauri"]
+members = ["crates/kura-core", "crates/kura-engine", "crates/kura-mac", "crates/kura-devtools", "crates/vorbis-tables", "src-tauri"]
+# 第三者のクレートの写し（[patch.crates-io] で差し替える）。ワークスペースの lint・整形・テストの対象にしない
+exclude = [
+    "third_party/symphonia-codec-aac",
+    "third_party/symphonia-codec-vorbis",
+    "third_party/symphonia-core",
+    "third_party/symphonia-format-ogg",
+]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99"
 publish = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zredjet/kura"
 
 [workspace.dependencies]
 kura-core = { path = "crates/kura-core" }
+kura-engine = { path = "crates/kura-engine" }
 kura-mac = { path = "crates/kura-mac" }
+# aoTuV の Vorbis のエンコーダの表（BSD-3-Clause。第三者のライセンスの一覧に、移植の kura-engine と同じ節で載る）
+vorbis-tables = { path = "crates/vorbis-tables" }
 
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip：小数を正しく丸めて読む。既定の速い読み方は 1 ULP ずれることがあり、保存した編集の文書を読み直すと引数が変わる（ADR-136）
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -36,7 +47,11 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 base64 = "0.22"
 tempfile = "3"
 rand_chacha = "0.10"
-jpeg-encoder = "0.7"
+jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
+# 編集のエンジンの超越関数（OS の libm に頼らない。arch を外して CPU の命令にも頼らない。ADR-136・138）
+libm = { version = "=0.2.16", default-features = false }
+# 性質テスト（dev のみ）
+proptest = "1.12"
 
 tauri = "2.12"
 tauri-build = "2.7"
@@ -58,7 +73,33 @@ print_stdout = "deny"
 print_stderr = "deny"
 dbg_macro = "deny"
 
+# 開発（dev・test。`pnpm tauri dev` と /verify）のビルド（ADR-209）：
+# - split-debuginfo = "off"：macOS の既定（unpacked）は、デバッグ情報のために各コード生成単位の .o を target/debug/deps に
+#   残し、作り直すたびに名前が変わって溜まる（2026-11 に 88 万個・188 GB。rustc・rustdoc が起動のたびにこのフォルダを読み、
+#   1 回 12 秒かかって /verify が 40〜50 分になった）。off なら .o を消す。ライブラリのクレートのデバッグ情報は rlib の中に
+#   残るので、バックトレースに行番号が出る（テストのファイル自身のフレームには出ない。panic の場所はいつも出る）
+# - debug = "line-tables-only"・依存は debug = false：バックトレースに要る行番号だけにして、生成・リンクを軽くする
+[profile.dev]
+split-debuginfo = "off"
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
 strip = true
+
+# symphonia 0.6.1 の写し（どれも third_party/<クレート>/KURA.md に変更と理由）。fuzz/Cargo.toml にも同じものを書く
+# - symphonia-codec-vorbis：residue 0/1 を 2 チャンネル以上で使うとき、次のチャンネルの分類を上書きする不具合の 1 行の
+#   修正（ADR-149。上流が直した版を出したら、この修正は外す）と、下の超越関数の差し替え
+# - symphonia-core（MDCT・FFT の表）・symphonia-codec-aac（窓・TNS・逆量子化・スケールファクターの表）・
+#   symphonia-codec-vorbis（窓・floor 0・codebook）：OS の libm の超越関数を libm クレート（kura-engine と同じ =0.2.16）に
+#   差し替え、Vorbis・AAC の読み取りの値をどの環境でも同じにする（再現できるデコーダにしてアンカーを作らない。段 9 の D2）
+# - symphonia-format-ogg・symphonia-codec-vorbis：lookup1_values を powf でなく整数で求める（OS・CPU で panic する組が違った）
+[patch.crates-io]
+symphonia-codec-aac = { path = "third_party/symphonia-codec-aac" }
+symphonia-codec-vorbis = { path = "third_party/symphonia-codec-vorbis" }
+symphonia-core = { path = "third_party/symphonia-core" }
+symphonia-format-ogg = { path = "third_party/symphonia-format-ogg" }

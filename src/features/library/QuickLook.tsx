@@ -1,31 +1,55 @@
-import { useEffect, useId } from 'react';
+import { useCallback, useEffect, useId, useRef } from 'react';
 
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
 import { CloseIcon } from '../../components/icons/CloseIcon';
+import { KindArt } from '../../components/KindArt/KindArt';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
+import { stillOriginal } from '../../components/MediaImage/still';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry } from '../../ipc/items';
-import { fileUrl, playUrl, thumbUrl } from '../../ipc/media';
+import { isPlayable } from '../../ipc/kinds';
+import { fileUrl, playUrl } from '../../ipc/media';
 import { formatCount } from '../../lib/format';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
+import { FontSpecimen, QuickLookAnim, useFontFace } from '../asset/AssetStage';
+import { canEdit, openEditor } from '../editor/editorKinds';
+import { useEditorStore } from '../editor/editorStore';
+import { useAssetData } from '../asset/useAssetData';
+import { loopOf } from '../asset/useLoopRange';
+import { WaveformView } from '../asset/WaveformView';
 import styles from './QuickLook.module.css';
 
 const t = ja.quickLook;
 
-/** クイックルック（design.md §3.1：黒地の全画面、上に名前と「3 / 128」、左右に移動、esc で閉じる）。 */
+/**
+ * クイックルック（design.md §3.1：黒地の全画面、上に名前と「3 / 128」、左右に移動、esc で閉じる）。画像エディタを開いて
+ * いる間は描かない（クイックルックの層はエディタより上なので、隠さないとエディタが下に隠れる）。開いている印は残すので、
+ * エディタを閉じるとクイックルックに戻る。
+ */
 export function QuickLook() {
-  const open = useViewStore((s) => s.quickLook);
+  const shown = useViewStore((s) => s.quickLook);
+  const editing = useEditorStore((s) => s.phase !== 'closed');
+  const open = shown && !editing;
   const selectedId = useViewStore((s) => s.selection.focus);
   const select = useViewStore((s) => s.select);
   const setQuickLook = useViewStore((s) => s.setQuickLook);
   const ids = useLibraryStore((s) => s.list?.ids);
+  const trashView = useViewStore((s) => s.view.kind === 'trash');
   useItemCacheVersion((s) => s.version);
   const titleId = useId();
 
   const index = selectedId !== null && ids ? ids.indexOf(selectedId) : -1;
   const item = selectedId !== null ? getCached(selectedId) : undefined;
+  // 素材（M11）：アニメは帯を canvas で回し、音声は波形と再生の位置を出す
+  const assetData = useAssetData(open && item && item.kind !== 'video' ? item.id : null);
+  const asset = assetData.asset?.itemId === item?.id ? assetData.asset : null;
+  const anim = asset && assetData.anim.status === 'ready' ? assetData.anim.anim : null;
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const audioSeconds = useCallback(() => audioRef.current?.currentTime ?? null, []);
+  const specimen = useFontFace(open && item?.kind === 'font' ? item.hash : null);
 
   useEffect(() => {
     if (open && selectedId !== null && !item) {
@@ -62,6 +86,17 @@ export function QuickLook() {
         <span className={styles.position}>
           {t.position(formatCount(index + 1), formatCount(ids.length))}
         </span>
+        {item && canEdit(item) && !trashView && (
+          // 画像エディタ（M12）：画像 1 件のときだけ。閉じるとクイックルックに戻る
+          <button
+            type="button"
+            className={styles.edit}
+            title={`${t.edit}（⌘E）`}
+            onClick={() => void openEditor(item)}
+          >
+            {t.edit}
+          </button>
+        )}
         <button
           type="button"
           className={styles.close}
@@ -73,16 +108,19 @@ export function QuickLook() {
       </header>
 
       <div className={styles.stage}>
-        {item?.kind === 'image' && (
-          <img
+        {asset && anim && (
+          <QuickLookAnim key={`${anim.hash}:${anim.rev}`} asset={asset} anim={anim} />
+        )}
+        {item?.kind === 'image' && !anim && (
+          // 元のファイル（ブラウザで表示できない形式は大きいサムネイル）。透過は市松模様、ドット絵は整数倍。
+          // アニメは帯を待つ間・作れないときも先頭のコマ（WebKit が <img> で回さないように大きいサムネイル）
+          <MediaImage
             key={item.id}
+            source={item}
+            size="l"
+            fit="contain"
+            original={stillOriginal(item, fileUrl(item.hash), asset?.effective.animated)}
             className={styles.media}
-            src={fileUrl(item.hash)}
-            alt=""
-            // ブラウザで表示できない形式は大きいサムネイルにする
-            onError={(e) => {
-              e.currentTarget.src = thumbUrl(item.hash, 'l');
-            }}
           />
         )}
         {item?.kind === 'video' && (
@@ -98,13 +136,38 @@ export function QuickLook() {
         )}
         {item?.kind === 'audio' && (
           <div key={item.id} className={styles.audio}>
-            {item.thumbState === 'ready' && (
-              <img className={styles.art} src={thumbUrl(item.hash, 'l')} alt="" />
-            )}
+            <MediaImage source={item} size="l" fit="cover" className={styles.art} />
             {/* 手元のメディアには字幕ファイルがない */}
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-            <audio src={playUrl(item.hash)} controls autoPlay />
+            <audio ref={audioRef} src={playUrl(item.hash)} controls autoPlay />
+            <WaveformView
+              hash={item.hash}
+              version={asset?.facts?.analyzedAt ?? null}
+              loop={loopOf(asset)}
+              positionSeconds={audioSeconds}
+              className={styles.wave}
+            />
           </div>
+        )}
+        {item?.kind === 'font' && specimen && (
+          <FontSpecimen
+            key={item.id}
+            family={specimen}
+            name={asset?.font?.family ?? item.title}
+            className={styles.specimen}
+            centered
+          />
+        )}
+        {/* フォント（見本を読めるまで）・3D：描いたサムネイル（フォントは字の形を mask にする）。なければ種類の絵 */}
+        {item && !isPlayable(item.kind) && !(item.kind === 'font' && specimen) && (
+          <MediaImage
+            key={item.id}
+            source={item}
+            size="l"
+            fit="contain"
+            className={styles.asset}
+            fallback={<KindArt kind={item.kind} className={styles.kindArt} />}
+          />
         )}
       </div>
 

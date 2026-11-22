@@ -17,6 +17,7 @@ export const DEFAULT_PREFS: PlayerPrefsDto = {
   bgmThroughImages: true,
   bgmLoop: false,
   imageDurationMs: 8000,
+  sfxAudition: true,
 };
 
 const IDLE: PlayerSnapshot = {

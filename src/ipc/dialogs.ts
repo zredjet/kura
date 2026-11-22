@@ -1,33 +1,53 @@
 import { open, save } from '@tauri-apps/plugin-dialog';
 
-/** 取り込める拡張子（docs/architecture.md §6）。 */
+/**
+ * 取り込める拡張子（docs/architecture.md §6。kura-engine の形式の表 `FORMATS` と同じ。dialogs.test.ts で照らす）。
+ * `.ase` は選べるが、Aseprite でない中身（Adobe の色見本）は取り込みで対象外になる。
+ */
 export const MEDIA_EXTENSIONS = [
+  // 画像
+  'png',
+  'apng',
   'jpg',
   'jpeg',
-  'png',
   'gif',
   'webp',
+  'aseprite',
+  'ase',
+  'psd',
+  'psb',
+  'svg',
   'heic',
   'heif',
   'avif',
   'tif',
   'tiff',
   'bmp',
+  // 動画
   'mp4',
   'm4v',
   'mov',
   'webm',
   'mkv',
   'avi',
-  'mp3',
-  'm4a',
-  'aac',
-  'flac',
+  // 音楽
   'wav',
   'aif',
   'aiff',
+  'flac',
+  'mp3',
+  'm4a',
+  'aac',
   'ogg',
   'opus',
+  // フォント
+  'ttf',
+  'otf',
+  'ttc',
+  'woff',
+  'woff2',
+  // 3D
+  'glb',
 ];
 
 /** 新しいライブラリの場所を選ぶ（保存のダイアログ）。キャンセルなら null。 */
@@ -59,4 +79,51 @@ export function pickToolFile(title: string): Promise<string | null> {
 /** 書き出し先のフォルダを選ぶ（新しいフォルダも作れる）。キャンセルなら null。 */
 export function pickExportFolder(title: string): Promise<string | null> {
   return open({ title, directory: true, multiple: false, canCreateDirectories: true });
+}
+
+/** レシピのファイルの拡張子（docs/editing.md §4.3）。 */
+export const RECIPE_EXTENSION = 'kurarecipe';
+
+/** 読み込む `.kurarecipe` を選ぶ。キャンセルなら null。 */
+export async function pickRecipeFile(title: string, filterName: string): Promise<string | null> {
+  const picked = await open({
+    title,
+    multiple: false,
+    directory: false,
+    filters: [{ name: filterName, extensions: [RECIPE_EXTENSION] }],
+  });
+  return typeof picked === 'string' ? picked : null;
+}
+
+/** `.kurarecipe` を書き出す場所を選ぶ（名前の既定は `defaultName`）。キャンセルなら null。 */
+export function pickRecipeSaveLocation(
+  title: string,
+  defaultName: string,
+  filterName: string,
+): Promise<string | null> {
+  return save({
+    title,
+    defaultPath: `${defaultName}.${RECIPE_EXTENSION}`,
+    canCreateDirectories: true,
+    filters: [{ name: filterName, extensions: [RECIPE_EXTENSION] }],
+  });
+}
+
+/** 登録するプロジェクトのフォルダを選ぶ。キャンセルなら null（M15 段 6）。 */
+export function pickProjectFolder(title: string): Promise<string | null> {
+  return open({ title, directory: true, multiple: false });
+}
+
+/** クレジットの一覧の保存先を選ぶ（`defaultPath` はプロジェクトのフォルダの CREDITS.md など）。キャンセルなら null。 */
+export function pickCreditsPath(
+  title: string,
+  defaultPath: string,
+  filter: { name: string; ext: string },
+): Promise<string | null> {
+  return save({
+    title,
+    defaultPath,
+    canCreateDirectories: true,
+    filters: [{ name: filter.name, extensions: [filter.ext] }],
+  });
 }

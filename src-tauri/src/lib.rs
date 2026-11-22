@@ -3,8 +3,10 @@
 mod commands;
 mod config;
 mod dto;
+mod engine;
 mod error;
 mod logging;
+mod navigation;
 mod protocol;
 mod shortcut;
 mod state;
@@ -60,12 +62,32 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::library::backup_now,
             commands::library::reveal_path,
             commands::library::library_usage,
+            commands::library::library_cache_usage,
             commands::library::library_check,
             commands::export::export_start,
+            commands::export::export_formats,
+            commands::export::export_preview,
             commands::import::import_preview,
             commands::import::import_start,
             commands::items::items_get,
             commands::items::item_detail,
+            commands::asset::item_asset_get,
+            commands::asset::item_asset_settings_set,
+            commands::asset::item_anim_get,
+            commands::edit::edit_open,
+            commands::edit::edit_open_recipe,
+            commands::edit::edit_step,
+            commands::edit::edit_view,
+            commands::edit::edit_sample,
+            commands::edit::edit_snap,
+            commands::edit::edit_measure,
+            commands::edit::edit_formats,
+            commands::edit::edit_close,
+            commands::edit::edit_cancel_open,
+            commands::edit::edit_save,
+            commands::edit::edit_versions,
+            commands::edit::edit_pending_saves,
+            commands::edit::edit_draft_discard,
             commands::items::library_counts,
             commands::items::items_selection_info,
             commands::items::items_update,
@@ -137,6 +159,8 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::player::play_queue,
             commands::player::playback_report,
             commands::player::proxy_request,
+            commands::analysis::request_analysis,
+            commands::analysis::retry_analysis,
             commands::player::open_external,
             commands::player::player_prefs_get,
             commands::player::player_prefs_set,
@@ -155,11 +179,78 @@ fn specta_builder() -> Builder<tauri::Wry> {
             commands::playlists::playlist_restore_entries,
             commands::playlists::playlist_regenerate,
             commands::playlists::playlist_save_state,
+            commands::credits::licenses_list,
+            commands::credits::license_create,
+            commands::credits::license_update,
+            commands::credits::license_delete,
+            commands::credits::item_credit_get,
+            commands::credits::item_credits_summary,
+            commands::credits::item_credits_set,
+            commands::credits::credits_collect,
+            commands::credits::credits_render,
+            commands::credits::credits_save,
+            commands::projects::projects_list,
+            commands::projects::project_add,
+            commands::projects::project_rename,
+            commands::projects::project_relocate,
+            commands::projects::project_remove,
+            commands::projects::projects_scan,
+            commands::projects::project_items,
+            commands::projects::item_projects,
+            commands::projects::project_settings,
+            commands::projects::project_settings_set,
+            commands::recipes::recipes_list,
+            commands::recipes::recipe_get,
+            commands::recipes::recipe_create,
+            commands::recipes::recipe_replace,
+            commands::recipes::recipe_rename,
+            commands::recipes::recipe_describe,
+            commands::recipes::recipes_reorder,
+            commands::recipes::recipe_duplicate,
+            commands::recipes::recipe_delete,
+            commands::recipes::recipe_export,
+            commands::recipes::recipe_import,
+            commands::batch::batch_precheck,
+            commands::batch::batch_precheck_cancel,
+            commands::batch::batch_start,
+            commands::batch::batch_result,
+            commands::batch::batch_rows,
+            commands::batch::batch_undo,
+            commands::batch::merge_precheck,
+            commands::batch::merge_start,
+            commands::projects::project_for_dest,
+            commands::credits::item_credit_preview,
+            commands::dragout::dragout_start,
+            commands::dragout::dragout_target,
+            commands::dragout::dragout_target_set,
         ])
-        .events(collect_events![dto::JobProgress, dto::LoginShotEvent])
+        .events(collect_events![
+            dto::JobProgress,
+            dto::LoginShotEvent,
+            dto::LibraryUpgradeEvent,
+            commands::batch::BatchPrecheckProgress,
+            commands::dragout::DragOutEnded
+        ])
         // ジョブの結果（resultJson）を読むための型
         .typ::<dto::ImportResultDto>()
         .typ::<dto::ExportResultDto>()
+        // 種類の表（順・キューに入るか・プロキシ・長さ）。フロントの src/ipc/kinds.ts はこれを読む
+        .typ::<dto::ItemKindInfoDto>()
+        .constant("ITEM_KINDS", dto::item_kinds())
+        // 検索の表（フィールドの名前・種類の語・半角と同じに扱う記号）。フロントの clauses.ts・ruleRows.ts・
+        // kinds.ts はこれを読み、`透過:あり` を名前空間付きのタグとして扱わない（docs/search-query.md §3）
+        .typ::<dto::QueryFieldNameDto>()
+        .constant("QUERY_FIELD_NAMES", dto::query_field_names())
+        .typ::<dto::QueryKindWordDto>()
+        .constant("QUERY_KIND_WORDS", dto::query_kind_words())
+        .typ::<dto::QuerySymbolDto>()
+        .constant("QUERY_SYMBOLS", dto::query_symbols())
+        // 解析の失敗の理由（`AssetFactsDto.errorCode`）。フロントの describe.test.ts が理由ごとの文言と照らす
+        .constant("ANALYSIS_ERROR_CODES", dto::analysis_error_codes())
+        // 編集の操作のカタログ（今の版の操作の ID・版・入力・引数の記述と表示の条件。エディタの「操作を追加」と引数パネルは
+        // これを読む。docs/editing.md §7.2・§7.3）
+        .typ::<kura_engine::op::OpDescriptor>()
+        .constant("EDIT_OPS", commands::edit::edit_ops())
         // ID・ミリ秒・バイト数は 2^53 を超えないので number として扱う
         .dangerously_cast_bigints_to_number()
 }
@@ -205,6 +296,18 @@ pub fn run() -> ExitCode {
 
     let typed = builder.invoke_handler();
     let raw = raw_handler();
+    // kura:// の ACAO と main の移動の制限に使う、アプリのページの origin（docs/architecture.md §4.1・§11）
+    let origin = kura_core::serve::AppOrigin::new(
+        tauri::is_dev(),
+        context
+            .config()
+            .build
+            .dev_url
+            .as_ref()
+            .map(tauri::Url::as_str),
+    );
+    let main_origin = origin.clone();
+    tracing::debug!(origin = origin.as_str(), "アプリの origin");
     let app = tauri::Builder::<tauri::Wry>::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -215,10 +318,19 @@ pub fn run() -> ExitCode {
                 typed(invoke)
             }
         })
-        .register_asynchronous_uri_scheme_protocol("kura", |ctx, request, responder| {
+        .register_asynchronous_uri_scheme_protocol("kura", move |ctx, request, responder| {
+            // ラベル・Origin・メソッドの判定は、ファイルに触る前（スレッドを起こす前）に行う
+            let head = match protocol::gate(ctx.webview_label(), &request, &origin) {
+                protocol::Gate::Done(response) => {
+                    responder.respond(response);
+                    return;
+                }
+                protocol::Gate::Serve { head } => head,
+            };
             let app = ctx.app_handle().clone();
+            let origin = origin.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                responder.respond(protocol::respond(&app, &request));
+                responder.respond(protocol::respond(&app, &request, &origin, head));
             });
         })
         .setup(move |app| {
@@ -231,6 +343,9 @@ pub fn run() -> ExitCode {
             }
             // フルスクリーンを抜けたあとも、キー（シアターの esc など）が WebView に届くように（ADR-128）
             kura_mac::keep_webview_focus_on_fullscreen();
+            // main の窓は tauri.conf.json では作らず（create: false）、移動の制限を付けてここで作る（§11）。
+            // 状態を manage したあとなので、ページの最初の invoke から AppState がある
+            navigation::create_main_window(app, main_origin)?;
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "Kura を起動しました");
             Ok(())
         })
@@ -263,5 +378,34 @@ mod tests {
     #[test]
     fn export_bindings() {
         super::export_bindings(&super::specta_builder()).unwrap();
+    }
+
+    /// 型定義に、引数の記述の印（`origin`・`binds`）と新しい引数の種類（余白・キャンバスの長さ）が出る（M14 段 1）。
+    /// `EDIT_OPS` の各引数にも同じ項目が入る。
+    #[test]
+    fn bindings_describe_param_origin_and_binds() {
+        let temp =
+            std::env::temp_dir().join(format!("kura-bindings-origin-{}.ts", std::process::id()));
+        super::specta_builder()
+            .export(super::Typescript::default(), &temp)
+            .unwrap();
+        let ts = std::fs::read_to_string(&temp).unwrap();
+        std::fs::remove_file(&temp).unwrap();
+        for needle in [
+            "export type Origin = ",
+            "\"free\" | ",
+            "\"ratio\" | ",
+            "\"source\";",
+            "export type BindKind = ",
+            "\"frameMs\" | ",
+            "origin: Origin,",
+            "binds: BindKind[],",
+            "{ type: \"margin\" }",
+            "{ type: \"canvasLength\" }",
+            "\"binds\":[],",
+            "\"origin\":\"free\",",
+        ] {
+            assert!(ts.contains(needle), "bindings に {needle} がありません");
+        }
     }
 }

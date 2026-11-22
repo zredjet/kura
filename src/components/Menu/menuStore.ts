@@ -11,11 +11,26 @@ export interface MenuAction {
   disabled?: boolean;
   /** 左に出す小さな印（フォルダの色など）。 */
   icon?: ReactNode;
+  /** 選択肢のチェック（「自動・はい・いいえ」など）。真なら左にチェックの印。省けば普通の項目。 */
+  checked?: boolean;
   onSelect: () => void;
 }
 
+/** 右に ▸ を出し、選ぶ（→・Return・クリック・ポインタを載せる）と横に開く項目（「ドット絵として表示 ▸」）。 */
+export interface MenuSubmenu {
+  label: string;
+  icon?: ReactNode;
+  disabled?: boolean;
+  submenu: MenuAction[];
+}
+
 /** メニューの 1 行（区切り線は 'separator'）。 */
-export type MenuEntry = MenuAction | 'separator';
+export type MenuEntry = MenuAction | MenuSubmenu | 'separator';
+
+/** 横に開く項目か。 */
+export function isSubmenu(entry: MenuEntry): entry is MenuSubmenu {
+  return entry !== 'separator' && 'submenu' in entry;
+}
 
 interface OpenMenu {
   x: number;

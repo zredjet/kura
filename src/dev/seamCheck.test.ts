@@ -1,0 +1,372 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import { planAudition } from '../lib/asset/audition';
+import type { Pcm } from '../lib/asset/wav';
+import type { CrossfadeRecord, PlacedRecord } from '../features/editor/audio/playback';
+import {
+  compareSamples,
+  crossfadePlacement,
+  editorSeamWindow,
+  expectedSamples,
+  maxJump,
+  offlineCrossfade,
+  type RenderCrossfade,
+  type RenderWindow,
+  runCrossfadeCheck,
+  runEditorSeamCheck,
+  runSeamCheck,
+  SEAM_TOLERANCE,
+  type SeamWindow,
+  seamWindows,
+} from './seamCheck';
+
+const R = 8_000;
+
+/** 区間 [from, to) の PCM（標本の値はフレームの番号から決める。チャンネルごとに違う）。 */
+function pcm(from: number, to: number, channels = 2): Pcm {
+  const frames = to - from;
+  return {
+    rate: R,
+    channels,
+    frames,
+    format: 'f32',
+    planes: Array.from({ length: channels }, (_, ch) =>
+      Float32Array.from({ length: frames }, (_, i) => ((from + i) % 1000) / 1000 + ch),
+    ),
+    info: { start: from, total: R * 20, loop: null, decoder: 'test' },
+  } as Pcm;
+}
+
+/** 本物の組み立ての意味（loop・始める時刻・バッファの中の始まり）で描く偽物。`glitch` のフレームだけ値をずらす。 */
+function idealRender(glitch: number[] = []): RenderWindow {
+  return async (window, pcms, _rate, channels) => {
+    const out = expectedSamples(window, pcms, channels);
+    for (const k of glitch) {
+      const plane = out[0];
+      if (plane && k < plane.length) plane[k] = (plane[k] ?? 0) + 1e-3;
+    }
+    return out;
+  };
+}
+
+describe('継ぎ目の自己点検（VITE_KURA_CHECK）', () => {
+  it('本体だけ：本物と同じく継ぎ目の 3 秒前から、継ぎ目のあと 1 秒まで', () => {
+    const plan = planAudition({ frames: R * 20, rate: R, channels: 2, loop: [R, R * 11] });
+    if (!plan) throw new Error('計画がない');
+    const [w] = seamWindows(plan, [R * 10], R);
+    expect(w).toEqual({
+      parts: [{ pcm: 0, loop: true, at: 0, offset: R * 7 }],
+      frames: R * 4,
+      seams: [R * 3],
+    });
+  });
+
+  it('短いループは窓の中の折り返しをすべて数える', () => {
+    const plan = planAudition({ frames: 1000, rate: R, channels: 1, loop: [100, 600] });
+    if (!plan) throw new Error('計画がない');
+    const [w] = seamWindows(plan, [500], R);
+    expect(w?.seams[0]).toBe(500);
+    expect(w?.seams).toHaveLength(Math.ceil((500 + R - 500) / 500));
+  });
+
+  it('前奏つき：前奏から本体へのつなぎ目と本体の折り返し。長ければ 2 つの窓に分ける', () => {
+    const plan = planAudition(
+      { frames: R * 20, rate: R, channels: 2, loop: [R, R * 11] },
+      { fromStart: true },
+    );
+    if (!plan) throw new Error('計画がない');
+    const [w] = seamWindows(plan, [R, R * 10], R);
+    expect(w?.parts).toEqual([
+      { pcm: 0, loop: false, at: 0, offset: 0 },
+      { pcm: 1, loop: true, at: R, offset: 0 },
+    ]);
+    expect(w?.seams).toEqual([R, R * 11]);
+    // 前奏 40 秒・本体 10 秒は 30 秒の窓に収まらない
+    const long = seamWindows(plan, [R * 40, R * 10], R);
+    expect(long).toHaveLength(2);
+    expect(long[0]?.parts).toEqual([
+      { pcm: 0, loop: false, at: 0, offset: R * 39 },
+      { pcm: 1, loop: true, at: R, offset: 0 },
+    ]);
+    expect(long[1]?.parts).toEqual([{ pcm: 1, loop: true, at: 0, offset: R * 9 }]);
+  });
+
+  it('継ぎ目だけ：手前と始まりを続けて 1 回', () => {
+    const plan = planAudition(
+      { frames: R * 20, rate: R, channels: 2, loop: [R, R * 11] },
+      { capBytes: 1_000 },
+    );
+    if (plan?.mode !== 'seam') throw new Error('継ぎ目の計画でない');
+    const [w] = seamWindows(plan, [62, 62], R);
+    expect(w).toEqual({
+      parts: [
+        { pcm: 0, loop: false, at: 0, offset: 0 },
+        { pcm: 1, loop: false, at: 62, offset: 0 },
+      ],
+      frames: 124,
+      seams: [62],
+    });
+  });
+
+  it('期待の標本は PCM を計画の順につないだもの（ループは本体の始まりへ戻る）', () => {
+    const w: SeamWindow = {
+      parts: [
+        { pcm: 0, loop: false, at: 0, offset: 0 },
+        { pcm: 1, loop: true, at: 2, offset: 0 },
+      ],
+      frames: 7,
+      seams: [2, 5],
+    };
+    const [left] = expectedSamples(w, [pcm(0, 2, 1), pcm(2, 5, 1)], 1);
+    expect([...(left ?? [])].map((v) => Math.round(v * 1000))).toEqual([0, 1, 2, 3, 4, 2, 3]);
+  });
+
+  it('1 標本でも違えば数え、最初の違いを返す（足りないチャンネルも違い）', () => {
+    const a = [Float32Array.of(0, 1, 2), Float32Array.of(5, 6, 7)];
+    expect(compareSamples(a, [Float32Array.of(0, 1, 2), Float32Array.of(5, 6, 7)])).toEqual({
+      frames: 3,
+      mismatches: 0,
+      inexact: 0,
+      maxDiff: 0,
+      first: null,
+    });
+    const b = compareSamples(a, [Float32Array.of(0, 1, 2.5), Float32Array.of(5, 6.5, 7)]);
+    expect(b.mismatches).toBe(2);
+    expect(b.inexact).toBe(2);
+    expect(b.maxDiff).toBe(0.5);
+    expect(b.first).toEqual({ frame: 1, channel: 1, expected: 6, got: 6.5 });
+    const short = compareSamples(a, [Float32Array.of(0, 1, 2)]);
+    expect(short.mismatches).toBe(3);
+    expect(short.maxDiff).toBe(Infinity);
+    expect(
+      compareSamples([Float32Array.of(Number.NaN)], [Float32Array.of(Number.NaN)]).mismatches,
+    ).toBe(0);
+    expect(compareSamples([Float32Array.of(Number.NaN)], [Float32Array.of(0)]).mismatches).toBe(1);
+  });
+
+  it('聞こえない差（2^-24 以下）は違いに数えず、1 標本ずつ一致しなかった数と差の最大だけに出す', () => {
+    expect(SEAM_TOLERANCE).toBe(2 ** -24);
+    // WebKit が標本の途中から鳴らして、0 ちょうどの標本に残る 1e-14 ほどの値（実機の edit-seam で見たもの）
+    const residue = compareSamples(
+      [Float32Array.of(0, 0.5, 0)],
+      [Float32Array.of(1.1086617734967774e-14, 0.5, -9.7e-15)],
+    );
+    expect(residue).toMatchObject({ mismatches: 0, inexact: 2, first: null });
+    expect(residue.maxDiff).toBeGreaterThan(0);
+    expect(residue.maxDiff).toBeLessThanOrEqual(SEAM_TOLERANCE);
+    // 幅ちょうどは許し、それを超えれば違い
+    expect(compareSamples([Float32Array.of(0)], [Float32Array.of(SEAM_TOLERANCE)]).mismatches).toBe(
+      0,
+    );
+    const over = compareSamples([Float32Array.of(0, 0)], [Float32Array.of(0, 2 ** -23)]);
+    expect(over).toMatchObject({ mismatches: 1, inexact: 1, maxDiff: 2 ** -23 });
+    expect(over.first).toEqual({ frame: 1, channel: 0, expected: 0, got: 2 ** -23 });
+  });
+
+  it('試聴 1 回分を照らして報告にまとめる（ずれがあれば数える）', async () => {
+    const plan = planAudition({ frames: R * 20, rate: R, channels: 2, loop: [R, R * 11] });
+    if (!plan) throw new Error('計画がない');
+    const scheduled = { hash: 'h', plan, rate: R, pcms: [pcm(R, R * 11)] };
+    let t = 0;
+    const now = () => (t += 5);
+    const ok = await runSeamCheck(scheduled, idealRender(), now);
+    expect(ok).toMatchObject({
+      hash: 'h',
+      mode: 'loop',
+      rate: R,
+      channels: 2,
+      windows: 1,
+      seams: 1,
+      frames: R * 4,
+      mismatches: 0,
+      first: null,
+      ms: 5,
+    });
+    const bad = await runSeamCheck(scheduled, idealRender([R * 3, R * 3 + 1]), now);
+    expect(bad.mismatches).toBe(2);
+    expect(bad.first?.frame).toBe(R * 3);
+  });
+});
+
+/** src の .ts・.tsx（テストを除く）。 */
+const sources = Object.entries(
+  import.meta.glob<string>(['/src/**/*.ts', '/src/**/*.tsx'], {
+    query: '?raw',
+    import: 'default',
+    eager: true,
+  }),
+).filter(([path]) => !/\.test\.tsx?$/.test(path));
+
+describe('自己点検は通常のビルドに入らない', () => {
+  it('読み込むのは audioRuntime.ts の VITE_KURA_CHECK の枝の動的な import だけ', () => {
+    const users = sources
+      .filter(([, text]) => /(?:from|import\()\s*'[^']*dev\/seamCheck'/.test(text))
+      .map(([path]) => path);
+    expect(users).toEqual(['/src/features/asset/audioRuntime.ts']);
+    const text =
+      sources.find(([path]) => path === '/src/features/asset/audioRuntime.ts')?.[1] ?? '';
+    expect(text).toMatch(
+      /if \(import\.meta\.env\.VITE_KURA_CHECK === '1'\) \{\s*void import\('\.\.\/\.\.\/dev\/seamCheck'\)/,
+    );
+    expect(text).not.toMatch(/^import .*dev\/seamCheck/m);
+  });
+});
+
+// ===== 音声エディタ（M13 の段 6） =====
+
+/** エディタが置いた区間（標本は元の位置から決める）。 */
+function placed(abs: number, start: number, end: number, fadeIn = false): PlacedRecord {
+  const p = pcm(start, end);
+  return {
+    source: 'edited',
+    rate: R,
+    abs,
+    start,
+    end,
+    cycle: end - start,
+    planes: p.planes,
+    fadeIn,
+  };
+}
+
+/** 窓をそのまま描いたことにする（本物と同じ置き方なら、期待の標本と同じ）。 */
+const exactRender: RenderWindow = async (w, pcms, _rate, channels) =>
+  expectedSamples(w, pcms, channels);
+
+describe('エディタの継ぎ目の自己点検', () => {
+  it('続けて置いた区間だけで窓を作る（交差フェードで入れた区間・間の空いた所で切る）', () => {
+    const records = [
+      placed(100, 0, 500),
+      placed(600, 500, 900),
+      placed(1000, 900, 1000),
+      placed(1200, 0, 10),
+    ];
+    const built = editorSeamWindow(records);
+    expect(built?.window.parts.map((p) => p.at)).toEqual([0, 500, 900]);
+    expect(built?.window.seams).toEqual([500, 900]);
+    expect(built?.window.frames).toBe(1000);
+    // ループの折り返し：同じ区間を続けて置く
+    const loop = editorSeamWindow([
+      placed(0, 200, 400),
+      placed(200, 200, 400),
+      placed(400, 200, 400),
+    ]);
+    expect(loop?.window.seams).toEqual([200, 400]);
+    expect(editorSeamWindow([placed(0, 0, 10)])).toBeNull();
+    expect(editorSeamWindow([placed(0, 0, 10, true), placed(10, 10, 20)])).toBeNull();
+    expect(editorSeamWindow([placed(0, 0, 10), placed(10, 10, 20, true)])).toBeNull();
+  });
+
+  it('同じ置き方で描けば食い違いは 0、継ぎ目で 1 標本ずれれば数える', async () => {
+    const records = [placed(0, 0, 300), placed(300, 300, 700), placed(700, 200, 400)];
+    const ok = await runEditorSeamCheck(records, exactRender, () => 0);
+    expect(ok).toMatchObject({
+      rate: R,
+      channels: 2,
+      segments: 3,
+      seams: 2,
+      frames: 900,
+      mismatches: 0,
+    });
+    const shifted: RenderWindow = async (w, pcms, rate, channels) => {
+      const out = await exactRender(w, pcms, rate, channels);
+      for (const plane of out) plane.copyWithin(301, 300);
+      return out;
+    };
+    const bad = await runEditorSeamCheck(records, shifted, () => 0);
+    expect(bad?.mismatches).toBeGreaterThan(0);
+    expect(bad?.first?.frame).toBe(301);
+    expect(await runEditorSeamCheck([placed(0, 0, 10)], exactRender)).toBeNull();
+  });
+});
+
+describe('交差フェードの自己点検', () => {
+  it('窓の頭より前に始まった区間は、窓の 0 秒からバッファの中のずらした位置で鳴らす', () => {
+    // base = 1000：abs 400 の区間は 600 フレーム目から、abs 1500 は 500 フレーム後から頭で
+    expect(crossfadePlacement({ abs: 400 }, 1000, R)).toEqual({ when: 0, offset: 600 / R });
+    expect(crossfadePlacement({ abs: 1500 }, 1000, R)).toEqual({ when: 500 / R, offset: 0 });
+  });
+
+  it('OfflineAudioContext に組むとき、start（ずらした位置）を stop より先に呼ぶ', async () => {
+    const calls: string[] = [];
+    class FakeOffline {
+      readonly destination = {};
+      constructor(
+        readonly channels: number,
+        readonly length: number,
+        readonly sampleRate: number,
+      ) {}
+      createBuffer(channels: number, length: number) {
+        return { length, numberOfChannels: channels, copyToChannel: () => undefined };
+      }
+      createBufferSource() {
+        let started = false;
+        return {
+          buffer: null as unknown,
+          connect: () => undefined,
+          start(when: number, offset?: number) {
+            started = true;
+            calls.push(`start ${when} ${offset ?? 0}`);
+          },
+          stop(when: number) {
+            // 仕様と WebKit：start の前の stop は InvalidStateError
+            if (!started)
+              throw new Error('InvalidStateError: cannot call stop without calling start first.');
+            calls.push(`stop ${when}`);
+          },
+        };
+      }
+      createGain() {
+        return {
+          gain: { setValueAtTime: () => undefined, linearRampToValueAtTime: () => undefined },
+          connect: () => undefined,
+        };
+      }
+      async startRendering() {
+        return { getChannelData: () => new Float32Array(this.length) };
+      }
+    }
+    vi.stubGlobal('OfflineAudioContext', FakeOffline);
+    try {
+      const record: CrossfadeRecord = {
+        rate: R,
+        t: 1000,
+        old: [placed(0, 0, 2000)],
+        fresh: placed(1000, 1000, 2000),
+      };
+      const base = 680;
+      await offlineCrossfade(record, base, 640, true);
+      expect(calls[0]).toBe(`start 0 ${680 / R}`);
+      expect(calls[1]).toBe(`stop ${(1000 - base) / R + 0.01}`);
+      expect(calls[2]).toBe(`start ${(1000 - base) / R} 0`);
+      calls.length = 0;
+      await offlineCrossfade(record, base, 640, false);
+      expect(calls.slice(0, 2)).toEqual([`start 0 ${680 / R}`, `stop ${(1000 - base) / R}`]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('隣り合う標本の差の最大', () => {
+    expect(maxJump([Float32Array.from([0, 0.1, 0.5, 0.4])], 0, 3)).toBeCloseTo(0.4, 6);
+    expect(maxJump([Float32Array.from([0, 1])], 1, 5)).toBe(0);
+  });
+
+  it('前後 20 ms の跳びを T で切り替えたときと比べる', async () => {
+    const record: CrossfadeRecord = {
+      rate: R,
+      t: 1000,
+      old: [placed(0, 0, 2000)],
+      fresh: placed(1000, 1000, 2000),
+    };
+    const render: RenderCrossfade = async (_r, _base, frames, fade) => {
+      const out = new Float32Array(frames);
+      for (let k = 0; k < frames; k++) out[k] = fade ? k / frames : k < frames / 2 ? 0 : 0.9;
+      return [out];
+    };
+    const report = await runCrossfadeCheck(record, render, () => 0);
+    expect(report?.ok).toBe(true);
+    expect(report?.withFade).toBeLessThan(report?.hardCut ?? 0);
+    expect(await runCrossfadeCheck({ ...record, fresh: null }, render)).toBeNull();
+  });
+});

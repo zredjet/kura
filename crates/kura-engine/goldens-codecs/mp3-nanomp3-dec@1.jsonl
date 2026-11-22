@@ -1,0 +1,5 @@
+{"name":"fixture-mp3-lame.mp3","source":{"path":"mp3-lame.mp3","type":"fixture"},"value":"fc691726befb558bbdb25f7814fee3325ef4176fad18a41f7cb85d7e13441df7"}
+{"name":"fixture-mp3-notag.mp3","source":{"path":"mp3-notag.mp3","type":"fixture"},"value":"143082bc51d43a36458c89325520d2a38f3feea4675b8d3e53aba0dcad41e99a"}
+{"name":"fixture-mp3-mpeg2-mono.mp3","source":{"path":"mp3-mpeg2-mono.mp3","type":"fixture"},"value":"cd115a720640bc70eda02adbd4e34784b4f2238bac292fdf3dd2b138ddde8715"}
+{"name":"fixture-mp3-free.mp3","source":{"path":"mp3-free.mp3","type":"fixture"},"value":"8a70cad86fa60146a7cedbbef46f3b283b104024617ce3099c6cfa4dff4a92e6"}
+{"name":"fixture-mp3-info-frames0.mp3","source":{"path":"mp3-info-frames0.mp3","type":"fixture"},"value":"31dc752bad2b1ca8e00c75b0058aaaf4fb0bbe58c2210e42be9d5a612fd1b71c"}

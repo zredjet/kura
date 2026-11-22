@@ -1,0 +1,536 @@
+//! エンジンの部品（実行の場とコーデックの組）を、開いているライブラリごとに 1 つ持つ（M11。docs/editing.md §12）。
+//!
+//! - 解析・エンジンのサムネイル（ジョブ）・試聴の PCM・アニメの帯（その場の読み取り）が、同じ実行の場（プレビューと一括の
+//!   2 つのプールとメモリの予算。[`EngineRuntime`]）と、同じコーデックの組（[`CodecSet`]）を使う。
+//! - どちらも最初に使うときに、使うスレッド（ジョブ・IPC の `spawn_blocking`）で作る。ライブラリを開くだけでは作らない
+//!   （NFR-01 の起動の道に載せない。プールのスレッドと ffmpeg の問い合わせは、使うまで起こさない）。
+//! - 作る関数（[`EngineFactory`]）はアプリが外から渡す。kura-core は OS を知らない（物理メモリ・ImageIO・AudioToolbox・
+//!   システムのフォントは kura-mac）。テストは偽のファクトリで Linux でも回る。
+//! - ライブラリごとに作る（ライブラリを切り替えたら別物）。コーデックの組の ffmpeg の一時ファイルの置き場は、そのライブラリの
+//!   `staging/engine`（開くときの掃除で消える）。
+//! - 外部ツールの場所を変えたら（`tools_set_path`）コーデックの組を作り直す（[`EngineServices::reload_codecs`]。ffmpeg を
+//!   探し直す）。使っている途中の組（`Arc`）は使い終わるまで生きる。実行の場は作り直さない（予算を 2 つにしない。プールも
+//!   ツールに依らない）。そのため、実行の場は `OnceLock`、コーデックの組は作り直せる置き場に持つ。
+//! - 試聴の PCM の読んだ結果の置き場（[`PcmCache`]。覚えている間はこの実行の場の予算を持つ）もライブラリごとに持ち、閉じる
+//!   （部品を捨てる）ときにすぐ手放す（M11 の検証 E2：アプリに 1 つだと、前のライブラリの音声と予算の確保を TTL まで持ち続け、
+//!   新しいライブラリの予算はそれを数えなかった）。
+//! - ライブラリの開いている間だけ有効な中止の印（[`EngineServices::closing`]。M13 段 7）：閉じる・切り替えるときに
+//!   [`EngineServices::begin_close`] で立て（`LibrarySession::close` の最初。部品を捨てるときも）、戻さない（部品はライブラリ
+//!   ごとに作り直す）。試聴の `/pcm` の作業用のファイル作りなど、ジョブでないその場の用意が見張りに使い、閉じたら止まる
+//!   （作りかけの `.part` は消える）。エディタの開く途中の中止（`editor::cancel_open`・`close_editor`）とは別の道。
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Instant;
+
+use kura_engine::codec::DecodeStamp;
+use kura_engine::monitor::CancelFlag;
+use kura_engine::{Digest, Monitor, Value};
+
+pub use kura_engine::codec::CodecSet;
+
+use super::anchors::Anchor;
+use super::editor::{Editor, Reservation};
+use super::runtime::{EngineRuntime, RuntimeConfig};
+use super::work_pcm::{WORK_PCM_DIR, WorkHandle, WorkPcmStore};
+use crate::Result;
+use crate::asset::pcm::{CACHE_TTL, PcmCache};
+use crate::library::upgrade::FreeSpaceFn;
+
+/// ffmpeg の段の一時ファイルの置き場（ライブラリの `staging/` の下の名前）。
+pub const ENGINE_WORK_DIR: &str = "engine";
+
+/// エンジンの部品を作る口。アプリ（src-tauri・kura-devtools）が kura-mac で実装して渡す。どちらも最初に使うときに 1 回だけ
+/// 呼ばれる（コーデックの組は、ツールの場所を変えたあとにもう一度）。
+pub trait EngineFactory: Send + Sync {
+    /// 実行の場の設定（物理メモリなど）。
+    fn runtime_config(&self) -> RuntimeConfig;
+    /// コーデックの組（固定の段 → Platform → ffmpeg）。`work_dir` は ffmpeg の一時ファイルの置き場。呼ぶたびに外部ツールを
+    /// 探し直す（設定で指定した場所を含む）。
+    fn codecs(&self, work_dir: &Path) -> CodecSet;
+    /// 一括加工のファイルの耐久の取り方（M14 段 4。ADR-190 (2)・ADR-193）。既定は 1 件ずつ `sync_all` で区切りは何もしない
+    /// （[`FullSync`]。保存のジョブと同じ耐久）。kura-mac は 1 件ずつ fsync・区切りで F_FULLFSYNC。
+    fn durability(&self) -> Arc<dyn Durability> {
+        Arc::new(FullSync)
+    }
+}
+
+/// ファイルの耐久の取り方（一括加工。M14 段 4）：1 件ずつは安い同期で置き、まとまりのコミットの前に 1 回だけ区切りの同期を
+/// 取る。区切りの同期のあとにコミットするので、DB が中身の永続になっていないファイルを指すことはない。
+pub trait Durability: Send + Sync {
+    /// 1 つのファイルを同期する（1 件ずつ。ドライブのキャッシュまで流さなくてよい）。
+    fn sync_file(&self, file: &std::fs::File) -> std::io::Result<()>;
+    /// それまでに同期したファイルを永続にする区切り（ドライブのキャッシュを流す。`file` は同じボリュームのファイル）。
+    fn barrier(&self, file: &std::fs::File) -> std::io::Result<()>;
+}
+
+/// 既定の耐久：1 件ずつ `sync_all`（macOS では F_FULLFSYNC）。区切りは何もしない（もう永続になっている）。
+pub struct FullSync;
+
+impl Durability for FullSync {
+    fn sync_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+        file.sync_all()
+    }
+
+    fn barrier(&self, _file: &std::fs::File) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 開いているライブラリのエンジンの部品。[`crate::library::LibrarySession`] が開くときに作り、閉じると捨てる。
+pub struct EngineServices {
+    factory: Arc<dyn EngineFactory>,
+    work_dir: PathBuf,
+    runtime: OnceLock<Arc<EngineRuntime>>,
+    /// 実行の場を作るのを 1 つにする（同時に使い始めても、プールを 2 回作らない）。
+    runtime_init: Mutex<()>,
+    /// コーデックの組（作り直せるように `OnceLock` ではなく置き場にする。作る間は錠を持ち、2 回作らない）。
+    codecs: Mutex<Option<Arc<CodecSet>>>,
+    /// 試聴の PCM の読んだ結果の置き場（このライブラリの分。見張りのスレッドは覚えたときだけ起きる）。
+    pcm: Arc<PcmCache>,
+    /// 開いているエディタ（ライブラリに 1 つ。M12。kura:// の `/edit` もここから引く）。
+    editor: Mutex<Option<Arc<Editor>>>,
+    /// エディタの取り置きの持ち主（エディタどうしで共有し、外すのは持ち主だけ）。
+    reservation: Arc<Reservation>,
+    /// 作業用の PCM の置き場（`staging/pcm`。M13 段 2）。
+    work_pcm: Arc<WorkPcmStore>,
+    /// エディタが保存に貸している入力（エディタのセッションごと。M13 段 3）。
+    lent: Mutex<BTreeMap<String, LentInput>>,
+    /// ライブラリの開いている間だけ有効な中止の印（閉じる・切り替えるときに立てる。M13 段 7）。
+    closing: CancelFlag,
+    /// テストの割り込み（保存の流れの途中の段。保存のジョブの割り込みと同じもの。M13 段 3 の検証の直し）。
+    #[cfg(test)]
+    hook: Mutex<Option<crate::edit::save::Hook>>,
+}
+
+/// 貸す入力のアンカーの使い方（保存の `AnchorUse` の、作ったものを除いた形）。
+#[derive(Debug, Clone)]
+pub enum LentAnchor {
+    /// アンカーなし（再現できるデコーダで読んだ・作業用の PCM から読んだ）。
+    None,
+    /// あったアンカーから読んだ。
+    Existing(Anchor),
+    /// あったアンカーが使えず、元を記録のデコーダで読み直した（値は記録と同じ）。
+    Fallback(Anchor),
+}
+
+/// エディタが保存に貸す入力（M13 段 3。docs/editing.md §14）：同じ元・同じ読み方なら、エディタの遅延の値と保存が読む値は同じ
+/// なので、保存は元を読み直さずにこれを使う。`verified` が偽（遅延のアンカーで、まだ値を照らしていない）なら、保存が照らしの
+/// 回を回す（違えば元を読み直す）。作業用の PCM の参照を持つ（貸している間は消えない）。
+#[derive(Clone)]
+pub struct LentInput {
+    pub item_id: i64,
+    /// 元の中身。
+    pub source: [u8; 32],
+    /// 読み方の設定のダイジェスト（`anchors::options_digest`）。
+    pub options_digest: Digest,
+    /// 元の形式。
+    pub format: String,
+    /// 遅延の値（チャンクは源の参照）。
+    pub value: Value,
+    /// 元を読んだ記録（アンカーから読んだときはアンカーの元の読み取りの記録）。
+    pub decoded: DecodeStamp,
+    pub anchor: LentAnchor,
+    /// 作業用の PCM（Platform・External・symphonia などで読んだとき。保存がアンカーに昇格するときに写す）。
+    pub work: Option<WorkHandle>,
+    /// 値を記録と照らし済みか。
+    pub verified: bool,
+}
+
+impl EngineServices {
+    /// ファクトリと一時ファイルの置き場から作る（まだ何も作らない）。
+    pub fn new(factory: Arc<dyn EngineFactory>, work_dir: PathBuf) -> Self {
+        // 作業用の PCM は staging/engine の隣（staging/pcm）
+        let pcm_dir = work_dir
+            .parent()
+            .map_or_else(|| work_dir.join(WORK_PCM_DIR), |p| p.join(WORK_PCM_DIR));
+        Self {
+            work_pcm: Arc::new(WorkPcmStore::new(pcm_dir, None)),
+            factory,
+            work_dir,
+            runtime: OnceLock::new(),
+            runtime_init: Mutex::new(()),
+            codecs: Mutex::new(None),
+            pcm: PcmCache::new(CACHE_TTL),
+            editor: Mutex::new(None),
+            reservation: Arc::new(Reservation::default()),
+            lent: Mutex::new(BTreeMap::new()),
+            closing: CancelFlag::default(),
+            #[cfg(test)]
+            hook: Mutex::new(None),
+        }
+    }
+
+    /// ライブラリを閉じる・切り替える：中止の印（[`EngineServices::closing`]）を立てる。試聴の `/pcm` の作業用のファイル作り
+    /// などが止まる（作りかけの `.part` は消える）。立てたら戻さない。`LibrarySession::close` が最初に呼ぶ。
+    pub fn begin_close(&self) {
+        self.closing.cancel();
+    }
+
+    /// ライブラリの開いている間だけ有効な中止の印（[`EngineServices::begin_close`] で立つ）。ジョブでないその場の用意（試聴の
+    /// `/pcm`）が見張りに渡す。
+    pub fn closing(&self) -> &dyn Monitor {
+        &self.closing
+    }
+
+    /// テストの割り込みを入れる（保存の流れの途中の段で呼ぶ）。
+    #[cfg(test)]
+    pub(crate) fn set_hook(&self, hook: Option<crate::edit::save::Hook>) {
+        *self.hook.lock().unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// テストの割り込み（保存の流れの途中の段 `stage`）。
+    #[cfg(test)]
+    pub(crate) fn at(&self, stage: crate::edit::save::Stage) {
+        let hook = self
+            .hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(stage);
+        }
+    }
+
+    fn lent_slot(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, LentInput>> {
+        self.lent.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// エディタ（セッション `editor`）が入力を保存に貸す（前に貸していたものは置き換える。段 4 で音声のエディタが開いたあとに
+    /// 呼ぶ）。
+    pub fn lend_input(&self, editor: &str, input: LentInput) {
+        self.lent_slot().insert(editor.to_string(), input);
+    }
+
+    /// エディタ（セッション `editor`）が貸していた入力を引き上げる（閉じるとき。保存が借りている写しはそのまま使える）。
+    pub fn withdraw_input(&self, editor: &str) {
+        let taken = self.lent_slot().remove(editor);
+        drop(taken);
+    }
+
+    /// 保存が入力を借りる：アイテム `item_id`・元 `source`・読み方 `options` が同じ貸しものがあれば、その写し（作業用の PCM の
+    /// 参照も増える）。
+    pub(crate) fn borrow_input(
+        &self,
+        item_id: i64,
+        source: &[u8; 32],
+        options: &Digest,
+    ) -> Option<LentInput> {
+        self.lent_slot()
+            .values()
+            .find(|l| l.item_id == item_id && l.source == *source && l.options_digest == *options)
+            .cloned()
+    }
+
+    /// エディタの取り置きの持ち主（エディタを作るときに渡す）。
+    pub(crate) fn reservation(&self) -> Arc<Reservation> {
+        self.reservation.clone()
+    }
+
+    fn editor_slot(&self) -> std::sync::MutexGuard<'_, Option<Arc<Editor>>> {
+        self.editor.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 開いているエディタ（なければ None）。
+    pub fn current_editor(&self) -> Option<Arc<Editor>> {
+        self.editor_slot().clone()
+    }
+
+    /// セッション `session` のエディタ（今のエディタのセッションでなければ None）。
+    pub fn editor_for(&self, session: &str) -> Option<Arc<Editor>> {
+        self.editor_slot()
+            .as_ref()
+            .filter(|e| e.id() == session)
+            .cloned()
+    }
+
+    /// エディタの置き場の錠を持ったまま、開いている（開く途中を含む）アイテムを渡して `f` を呼ぶ（一括を積むとき：開いている
+    /// アイテムを読んでから行を入れ終えるまで、エディタを置かせない。エディタは置いたあとに、待っている保存・一括を確かめ直す。
+    /// M14 段 4 の検証の直し）。
+    pub(crate) fn with_open_item<T>(&self, f: impl FnOnce(Option<i64>) -> T) -> T {
+        let slot = self.editor_slot();
+        let open = slot.as_ref().map(|e| e.item_id());
+        f(open)
+    }
+
+    /// エディタを置く（前のエディタがあれば閉じる。開く途中から置き、閉じる・ほかを開くと読みを止められるようにする）。
+    pub(crate) fn install_editor(&self, editor: Arc<Editor>) {
+        let old = self.editor_slot().replace(editor);
+        if let Some(old) = old {
+            old.shutdown();
+        }
+    }
+
+    /// エディタを置き場から外す（`session` を渡せば、そのセッションのときだけ）。閉じるのは呼び手（`Editor::shutdown`）。
+    pub(crate) fn take_editor(&self, session: Option<&str>) -> Option<Arc<Editor>> {
+        let mut slot = self.editor_slot();
+        match session {
+            Some(id) if slot.as_ref().is_some_and(|e| e.id() != id) => None,
+            _ => slot.take(),
+        }
+    }
+
+    /// アイテム `item_id` を開いている途中のエディタを置き場から外す（開き終えたもの・別のアイテムなら None。開く途中の
+    /// 中止 `editor::cancel_open`）。閉じるのは呼び手。
+    pub(crate) fn take_opening(&self, item_id: i64) -> Option<Arc<Editor>> {
+        let mut slot = self.editor_slot();
+        if slot
+            .as_ref()
+            .is_some_and(|e| e.item_id() == item_id && e.is_opening())
+        {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    /// 開いているエディタを閉じる（エディタを閉じる・ライブラリを閉じる・切り替える・終了のどれでも同じ：中止 → キャッシュ
+    /// を空に → 確保を落とす → 取り置きを 0。docs/editing.md §12.10）。
+    pub fn close_editor(&self) {
+        if let Some(editor) = self.take_editor(None) {
+            editor.shutdown();
+        }
+    }
+
+    /// 試聴の PCM の読んだ結果の置き場（このライブラリの分）。
+    pub fn pcm_cache(&self) -> &Arc<PcmCache> {
+        &self.pcm
+    }
+
+    /// 作業用の PCM の置き場（`staging/pcm`。M13 段 2）。
+    pub fn work_pcm(&self) -> &Arc<WorkPcmStore> {
+        &self.work_pcm
+    }
+
+    /// 作業用の PCM の置き場の空きを測る関数（ライブラリを開くとき。kura-mac の `volume_capacity`）。
+    pub fn set_free_space(&self, f: Option<Arc<FreeSpaceFn>>) {
+        self.work_pcm.set_free_space(f);
+    }
+
+    /// ffmpeg の段の一時ファイルの置き場（そのライブラリの `staging/engine`）。
+    pub fn work_dir(&self) -> &Path {
+        &self.work_dir
+    }
+
+    /// 実行の場（2 つのプールと予算）。最初に呼んだときに作る。編集のプールの中から呼ばない。
+    pub fn runtime(&self) -> Result<&Arc<EngineRuntime>> {
+        if let Some(runtime) = self.runtime.get() {
+            return Ok(runtime);
+        }
+        let _init = self
+            .runtime_init
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(runtime) = self.runtime.get() {
+            return Ok(runtime);
+        }
+        let started = Instant::now();
+        let runtime = Arc::new(EngineRuntime::new(&self.factory.runtime_config())?);
+        tracing::info!(
+            preview_threads = runtime.preview_threads(),
+            bulk_threads = runtime.bulk_threads(),
+            budget_bytes = runtime.budget().total(),
+            ms = started.elapsed().as_secs_f64() * 1000.0,
+            "エンジンの実行の場を作りました"
+        );
+        Ok(self.runtime.get_or_init(|| runtime))
+    }
+
+    /// 一括加工のファイルの耐久の取り方（[`EngineFactory::durability`]）。
+    pub fn durability(&self) -> Arc<dyn Durability> {
+        self.factory.durability()
+    }
+
+    /// コーデックの組。最初に呼んだとき（とツールの場所を変えたあと）に作る。ffmpeg を探して問い合わせるので、ジョブか
+    /// `spawn_blocking` のスレッドで呼ぶ。
+    pub fn codecs(&self) -> Arc<CodecSet> {
+        let mut slot = self.codecs.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(set) = slot.as_ref() {
+            return set.clone();
+        }
+        let started = Instant::now();
+        let set = Arc::new(self.factory.codecs(&self.work_dir));
+        tracing::info!(
+            work_dir = %self.work_dir.display(),
+            ms = started.elapsed().as_secs_f64() * 1000.0,
+            "エンジンのコーデックの組を作りました"
+        );
+        *slot = Some(set.clone());
+        set
+    }
+
+    /// 外部ツールの場所が変わった：コーデックの組を捨て、次に使うときに作り直す（使っている途中の組はそのまま使える）。
+    pub fn reload_codecs(&self) {
+        let old = self
+            .codecs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if old.is_some() {
+            tracing::info!(
+                "外部ツールの場所が変わったので、エンジンのコーデックの組を作り直します"
+            );
+        }
+    }
+
+    /// 実行の場を作ってあるか（作らずに見る。診断とテスト用）。
+    pub fn runtime_if_built(&self) -> Option<&Arc<EngineRuntime>> {
+        self.runtime.get()
+    }
+
+    /// コーデックの組を作ってあるか（作らずに見る。診断とテスト用）。
+    pub fn codecs_if_built(&self) -> Option<Arc<CodecSet>> {
+        self.codecs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for EngineServices {
+    /// 閉じるとき：試聴の PCM で覚えていた音声と予算の確保をすぐ手放す（TTL の見張りは置き場への強い参照を持って待つので、
+    /// 置き場が捨てられるのを待たずに空にする）。
+    fn drop(&mut self) {
+        self.begin_close();
+        self.close_editor();
+        self.pcm.clear();
+    }
+}
+
+/// テスト用の偽のファクトリ（Linux でも回る：固定の段だけの組と、小さな実行の場）。
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// 呼ばれた回数と、渡された一時ファイルの置き場を覚える。コーデックの組は既定で固定の段だけ、[`FakeEngineFactory::with_codecs`]
+    /// で作ったものは置き場の組の写し（テストが中身を入れ替え、`EngineServices::reload_codecs` で作り直させる）。
+    #[derive(Default)]
+    pub struct FakeEngineFactory {
+        runtimes: AtomicUsize,
+        work_dirs: Mutex<Vec<PathBuf>>,
+        codecs: Option<Arc<Mutex<CodecSet>>>,
+        /// 予算（None は 64 MiB）。
+        budget: Option<u64>,
+    }
+
+    impl FakeEngineFactory {
+        /// コーデックの組を `codecs` の写しにする（偽の Platform のデコーダを足した組など）。
+        pub fn with_codecs(codecs: Arc<Mutex<CodecSet>>) -> Self {
+            Self {
+                codecs: Some(codecs),
+                ..Self::default()
+            }
+        }
+
+        /// 予算を `bytes` にする（既定は 64 MiB。長い ogg の保存など）。
+        pub fn with_budget(mut self, bytes: u64) -> Self {
+            self.budget = Some(bytes);
+            self
+        }
+
+        /// 実行の場の設定を作った回数。
+        pub fn runtimes(&self) -> usize {
+            self.runtimes.load(Ordering::SeqCst)
+        }
+
+        /// コーデックの組を作った回数。
+        pub fn codec_builds(&self) -> usize {
+            self.work_dirs().len()
+        }
+
+        /// コーデックの組を作るときに渡された置き場（順に）。
+        pub fn work_dirs(&self) -> Vec<PathBuf> {
+            self.work_dirs.lock().unwrap().clone()
+        }
+    }
+
+    impl EngineFactory for FakeEngineFactory {
+        fn runtime_config(&self) -> RuntimeConfig {
+            self.runtimes.fetch_add(1, Ordering::SeqCst);
+            RuntimeConfig {
+                cores: Some(2),
+                budget: Some(self.budget.unwrap_or(64 << 20)),
+                ..RuntimeConfig::default()
+            }
+        }
+
+        fn codecs(&self, work_dir: &Path) -> CodecSet {
+            self.work_dirs.lock().unwrap().push(work_dir.to_path_buf());
+            match &self.codecs {
+                Some(set) => set.lock().unwrap().clone(),
+                None => CodecSet::pinned(),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::FakeEngineFactory;
+    use super::*;
+
+    fn services() -> (Arc<FakeEngineFactory>, EngineServices) {
+        let factory = Arc::new(FakeEngineFactory::default());
+        let services = EngineServices::new(factory.clone(), PathBuf::from("/lib/staging/engine"));
+        (factory, services)
+    }
+
+    /// 作っただけでは何も作らない。最初に使うときに 1 回だけ作り、あとは同じものを返す。
+    #[test]
+    fn nothing_is_built_until_first_use() {
+        let (factory, services) = services();
+        assert_eq!((factory.runtimes(), factory.codec_builds()), (0, 0));
+        assert!(services.runtime_if_built().is_none());
+        assert!(services.codecs_if_built().is_none());
+
+        let runtime = services.runtime().unwrap().clone();
+        assert_eq!((factory.runtimes(), factory.codec_builds()), (1, 0));
+        assert_eq!(runtime.bulk_threads() + runtime.preview_threads(), 2);
+        assert_eq!(runtime.budget().total(), 64 << 20);
+        let codecs = services.codecs();
+        assert_eq!(factory.work_dirs(), [PathBuf::from("/lib/staging/engine")]);
+
+        assert!(Arc::ptr_eq(services.runtime().unwrap(), &runtime));
+        assert!(Arc::ptr_eq(&services.codecs(), &codecs));
+        assert_eq!((factory.runtimes(), factory.codec_builds()), (1, 1));
+    }
+
+    /// ツールの場所を変えたら、コーデックの組だけを作り直す（実行の場はそのまま。使っていた組もそのまま使える）。
+    #[test]
+    fn reloading_rebuilds_codecs_and_keeps_the_runtime() {
+        let (factory, services) = services();
+        services.reload_codecs();
+        assert_eq!(factory.codec_builds(), 0, "作っていなければ何もしない");
+        let runtime = services.runtime().unwrap().clone();
+        let before = services.codecs();
+
+        services.reload_codecs();
+        assert!(services.codecs_if_built().is_none());
+        let after = services.codecs();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(factory.codec_builds(), 2);
+        assert!(Arc::ptr_eq(services.runtime().unwrap(), &runtime));
+        assert_eq!(factory.runtimes(), 1);
+        assert!(!before.capabilities().is_empty(), "前の組も使える");
+    }
+
+    /// 同時に使い始めても、実行の場とコーデックの組は 1 回だけ作る。
+    #[test]
+    fn concurrent_first_use_builds_once() {
+        let (factory, services) = services();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let _ = services.codecs();
+                    services.runtime().unwrap();
+                });
+            }
+        });
+        assert_eq!((factory.runtimes(), factory.codec_builds()), (1, 1));
+    }
+}

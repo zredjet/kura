@@ -9,7 +9,10 @@
   contain: strict;
 }
 
-.tile[data-kind='audio'] {
+/* 音楽とフォント・3D（字の形・描いたモデルの外は地のまま。design.md §3.1）は --fill-2 の地 */
+.tile[data-kind='audio'],
+.tile[data-kind='font'],
+.tile[data-kind='model'] {
   background: var(--fill-2);
 }
 
@@ -142,4 +145,9 @@
 
 .unit[aria-pressed='true']::after {
   top: 6px;
+}
+
+/* バッジの中の小さな印（ループの繰り返しなど。読み上げはタイルの名前に含める） */
+.badgeIcon {
+  display: flex;
 }

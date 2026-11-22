@@ -16,3 +16,13 @@ node_modules/
 .vscode/*
 !.vscode/extensions.json
 .idea/
+
+# cargo-fuzz（fuzz/README.md）
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/Cargo.lock
+
+# 照合用のエンコーダ（crates/vorbis-tables/oracle/README.md）：出力は既定で /target/vorbis-oracle/。rlibm を直に cargo で組んだときの target
+/crates/vorbis-tables/oracle/rlibm/target/

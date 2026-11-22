@@ -31,6 +31,7 @@ import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
 import { closePlayer, startPlayback } from '../player/playerActions';
 import { usePlayerStore } from '../player/playerStore';
+import type { PlayFrom } from './rows';
 
 /** 「1 つのユニットにまとめる／1 件ずつ」の前回の選び方（見た目の設定なので localStorage）。 */
 const ADD_MODE_KEY = 'kura.playlistAddMode';
@@ -170,14 +171,18 @@ export async function regenerate(id: number): Promise<void> {
   }
 }
 
-/** プレイリストを再生する（`resume` なら続きから、`fromItem` ならそのアイテムから）。 */
+/** プレイリストを再生する（`resume` なら続きから、`from` なら一覧のその行（アイテムとエントリ）から）。 */
 export function playPlaylist(
   id: number,
   name: string,
   resume = false,
-  fromItem?: number,
+  from?: PlayFrom,
 ): Promise<void> {
-  return startPlayback({ kind: 'playlist', id }, name, { resume, fromItem: fromItem ?? null });
+  return startPlayback({ kind: 'playlist', id }, name, {
+    resume,
+    fromItem: from?.itemId ?? null,
+    fromEntry: from?.entryId ?? null,
+  });
 }
 
 function loadAddMode(): { mode: 'group' | 'each'; remember: boolean } {

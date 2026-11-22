@@ -3,11 +3,14 @@ import { useEffect } from 'react';
 import { openMenuBelow } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry, unitIdOf } from '../../ipc/items';
+import { getCached } from '../../stores/itemCache';
 import { useImportStore } from '../../stores/importStore';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { LAYOUT_MODES, useViewStore } from '../../stores/viewStore';
+import { toggleAuditionKey } from '../asset/auditionStore';
+import { canEdit, openEditor } from '../editor/editorKinds';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
 import {
@@ -22,6 +25,7 @@ import {
   trashEntries,
 } from './actions';
 import { exportEntries } from './exportActions';
+import { pickRecipeAndApply } from '../recipes/recipeMenus';
 import { TAG_FOCUS_KEY } from './inspector/ItemInspector';
 import { itemMenu, viewedSetUnit } from './itemMenu';
 import { verticalTarget } from './navigation';
@@ -35,12 +39,17 @@ function isTyping(target: EventTarget | null): boolean {
   );
 }
 
-/** シート（ダイアログ）・メニュー・シアターが開いているか。 */
+/** シート（ダイアログ）・メニュー・シアター・画像エディタが開いているか。 */
 function isBlocked(): boolean {
-  return document.querySelector('[data-sheet], [role="menu"], [data-theater]') !== null;
+  return (
+    document.querySelector('[data-sheet], [role="menu"], [data-theater], [data-editor]') !== null
+  );
 }
 
-/** ライブラリのキー操作を受け付けるか（取り込みのシート・入力欄・ダイアログ・メニュー・シアターの上では受け付けない）。 */
+/**
+ * ライブラリのキー操作を受け付けるか（取り込みのシート・入力欄・ダイアログ・メニュー・シアター・画像エディタの上では
+ * 受け付けない）。
+ */
 function acceptsKeys(target: EventTarget | null): boolean {
   return useImportStore.getState().phase === 'idle' && !isTyping(target) && !isBlocked();
 }
@@ -100,8 +109,27 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
       view.setSelection(selectAll(ids));
     } else if (key === 'Enter' && entries.length > 0 && kind !== 'trash') {
       playSelection(entries);
+    } else if (e.altKey && e.code === 'KeyE' && !e.shiftKey) {
+      // レシピを当てる（M14。⌥ を押すと e.key が変わるので、キーの位置で見る）
+      if (entries.length === 0 || kind === 'trash') {
+        return false;
+      }
+      void pickRecipeAndApply(entries);
     } else if (key === 'e' && e.shiftKey) {
+      // 書き出し：ゴミ箱の中では出さない（項目のメニューと同じ。M15 段 3 の検証の直し）
+      if (kind === 'trash') {
+        return false;
+      }
       void exportEntries(entries);
+    } else if (key === 'e' && !e.altKey) {
+      // 画像エディタ（M12）：画像 1 件のときだけ（ゴミ箱の中・ユニットでは開かない）
+      const only = entries.length === 1 ? entries[0] : undefined;
+      const item =
+        only !== undefined && !isUnitEntry(only) && kind !== 'trash' ? getCached(only) : undefined;
+      if (!item || !canEdit(item)) {
+        return false;
+      }
+      void openEditor(item);
     } else if (key === 'g' && e.shiftKey) {
       void dissolveUnits(entries);
     } else if (key === 'g' && entries.length > 0 && kind !== 'trash') {
@@ -183,6 +211,11 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
       view.select(null);
     }
     return true;
+  }
+  if (key === 'l') {
+    // ループを試聴（もう一度で止める。選んでいなくても、試聴していれば止める。M11）
+    const item = focus !== null && !isUnitEntry(focus) ? getCached(focus) : undefined;
+    return toggleAuditionKey(item ? item.id : null, item?.kind);
   }
   if (entries.length === 0 || kind === 'trash') {
     return false;

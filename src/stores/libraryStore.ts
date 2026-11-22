@@ -4,6 +4,7 @@ import { prune } from '../features/library/selection';
 import { joinClauses } from '../features/search/clauses';
 import { type IdList, queryIds } from '../ipc/items';
 import {
+  type AppError,
   createLibrary,
   libraryInfo,
   type LibraryInfoDto,
@@ -13,7 +14,9 @@ import {
 import { isIpcError } from '../ipc/result';
 import { clearItems } from './itemCache';
 import { notify } from './noticeStore';
+import { useSettingsStore } from './settingsStore';
 import { useSidebarStore } from './sidebarStore';
+import { settleUpgrade, watchUpgrades } from './upgradeStore';
 import { useViewStore } from './viewStore';
 
 type Status = 'loading' | 'none' | 'open';
@@ -23,24 +26,36 @@ interface LibraryState {
   info: LibraryInfoDto | null;
   /** 前回のライブラリが見つからなかったときの場所。 */
   missingPath: string | null;
+  /**
+   * 前回のライブラリ（か `KURA_LIBRARY`）を開けなかった理由と場所（新しい版の Kura のライブラリ・空き容量・
+   * バックアップの失敗・新しい版にできない、など。M11）。
+   */
+  restoreError: { path: string | null; error: AppError } | null;
   /** 一覧（ID・縦横比・日付のグループ）。 */
   list: IdList | null;
   /** 一覧を読み直す。 */
   loadList: () => Promise<void>;
-  /** 起動時に前回のライブラリを開く。 */
+  /** 起動時に前回のライブラリを開く（起動の間に 1 回だけ。続けて呼ばれたら同じ 1 回を待つ）。 */
   restore: () => Promise<void>;
-  /** 新しいライブラリを作って開く（失敗は呼び出し側へ）。 */
+  /**
+   * 新しいライブラリを作って開く（失敗は呼び出し側へ）。開いていたライブラリから作るのに失敗して、前のライブラリも
+   * 閉じていたら、初回の画面に戻して理由と場所を `restoreError` に持つ（`followFailedSwitch`）。
+   */
   create: (path: string) => Promise<void>;
-  /** 既存のライブラリを開く（失敗は呼び出し側へ）。 */
+  /** 既存のライブラリを開く（失敗は呼び出し側へ。開いていたライブラリから開くのに失敗したときは `create` と同じ）。 */
   open: (path: string) => Promise<void>;
   /** 件数などを読み直す。 */
   refresh: () => Promise<void>;
 }
 
-export const useLibraryStore = create<LibraryState>((set) => ({
+/** 開いている途中の「前回のライブラリを開く」。 */
+let restoring: Promise<void> | null = null;
+
+export const useLibraryStore = create<LibraryState>((set, get) => ({
   status: 'loading',
   info: null,
   missingPath: null,
+  restoreError: null,
   list: null,
   loadList: async () => {
     const { view, collapseUnits, filter, sort } = useViewStore.getState();
@@ -73,28 +88,48 @@ export const useLibraryStore = create<LibraryState>((set) => ({
       console.warn('一覧を取得できませんでした', error);
     }
   },
-  restore: async () => {
-    try {
-      const result = await restoreLibrary();
-      if (result.info) {
-        set({ status: 'open', info: result.info, missingPath: null });
-      } else {
-        set({ status: 'none', info: null, missingPath: result.lastPath });
-      }
-    } catch (error) {
-      console.warn('前回のライブラリを開けませんでした', error);
-      set({ status: 'none', info: null, missingPath: null });
+  restore: () => {
+    // 開発時は StrictMode で effect が 2 回走る。同じライブラリを並べて 2 回開くと、DB を新しい版にする前の
+    // バックアップがぶつかって両方失敗する（実測）ので、開いている途中ならそれを待ち、開き終えたら何もしない
+    if (restoring) {
+      return restoring;
     }
+    if (get().status !== 'loading') {
+      return Promise.resolve();
+    }
+    restoring = restoreOnce(set).finally(() => {
+      restoring = null;
+    });
+    return restoring;
   },
   create: async (path) => {
-    const info = await createLibrary(path);
-    resetForLibrary();
-    set({ status: 'open', info, missingPath: null, list: null });
+    const switching = get().status === 'open';
+    try {
+      const info = await createLibrary(path);
+      resetForLibrary();
+      set({ status: 'open', info, missingPath: null, restoreError: null, list: null });
+    } catch (error) {
+      if (switching) {
+        await followFailedSwitch(set, path, error);
+      }
+      throw error;
+    }
   },
   open: async (path) => {
-    const info = await openLibrary(path);
-    resetForLibrary();
-    set({ status: 'open', info, missingPath: null, list: null });
+    const switching = get().status === 'open';
+    await watchUpgrades();
+    try {
+      const info = await openLibrary(path);
+      resetForLibrary();
+      set({ status: 'open', info, missingPath: null, restoreError: null, list: null });
+    } catch (error) {
+      if (switching) {
+        await followFailedSwitch(set, path, error);
+      }
+      throw error;
+    } finally {
+      settleUpgrade();
+    }
   },
   refresh: async () => {
     try {
@@ -104,6 +139,74 @@ export const useLibraryStore = create<LibraryState>((set) => ({
     }
   },
 }));
+
+/** 前回のライブラリを開く（`restore` の中身）。 */
+async function restoreOnce(set: (state: Partial<LibraryState>) => void): Promise<void> {
+  // 開く途中で DB を新しい版にするときの知らせを落とさないよう、受け取りを始めてから開く
+  await watchUpgrades();
+  try {
+    const result = await restoreLibrary();
+    if (result.info) {
+      set({ status: 'open', info: result.info, missingPath: null, restoreError: null });
+    } else if (result.error) {
+      set({
+        status: 'none',
+        info: null,
+        missingPath: null,
+        restoreError: { path: result.lastPath, error: result.error },
+      });
+    } else {
+      set({ status: 'none', info: null, missingPath: result.lastPath, restoreError: null });
+    }
+  } catch (error) {
+    console.warn('前回のライブラリを開けませんでした', error);
+    set({ status: 'none', info: null, missingPath: null, restoreError: null });
+  } finally {
+    settleUpgrade();
+  }
+}
+
+/**
+ * 開いていたライブラリから別のライブラリを開く・作るのに失敗したあと、画面を Rust に合わせる。既存のライブラリへは、
+ * Rust が開く先のロックを先に取り、取れなければ（ほかのアプリが開いている。`LibraryInUse`）前のライブラリを開いたまま
+ * 返す。それ以外の失敗・作るときは前のライブラリを閉じてから開く（src-tauri の `AppState::replace_session`。ADR-168）
+ * ので、前のライブラリも閉じている。どれも開いていなければ（`library_info` が NotFound）初回の画面に戻し、開けなかった
+ * 理由と場所を出す（`restoreError` と同じカード。design.md §3.1「ライブラリの更新」）。まだ開いていればそのまま。
+ */
+async function followFailedSwitch(
+  set: (state: Partial<LibraryState>) => void,
+  path: string,
+  error: unknown,
+): Promise<void> {
+  try {
+    await libraryInfo();
+    return;
+  } catch (probe) {
+    if (!isIpcError(probe, 'NotFound')) {
+      console.warn('ライブラリが開いているかを確かめられませんでした', probe);
+      return;
+    }
+  }
+  resetForLibrary();
+  // 設定のシートは LibraryScreen の中にあり、初回の画面ではシートごと外れる。開いた印を残すと、次に開いたライブラリで
+  // いきなり出る（M11 の確かめ F1。シートのライブラリのタブから切り替えたとき）
+  useSettingsStore.getState().close();
+  set({
+    status: 'none',
+    info: null,
+    list: null,
+    missingPath: null,
+    restoreError: { path, error: appErrorOf(error) },
+  });
+}
+
+/** 開く操作の例外を AppError の形にする（IpcError でなければ Internal）。 */
+function appErrorOf(error: unknown): AppError {
+  if (isIpcError(error)) {
+    return { code: error.code, message: error.message };
+  }
+  return { code: 'Internal', message: error instanceof Error ? error.message : String(error) };
+}
 
 /** ライブラリを切り替えたときに、前のライブラリの表示を捨てる。 */
 function resetForLibrary(): void {

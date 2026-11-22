@@ -1,0 +1,115 @@
+[package]
+name = "kura-engine"
+description = "Kura の編集の操作エンジン（OS・DB 非依存。docs/editing.md）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+# codec/vorbis/ は aoTuV・libvorbis（BSD-3-Clause）を移したもの（ADR-149。表示は src/codec/vorbis/LICENSE）。
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
+repository.workspace = true
+# 結合テストは tests/suite.rs の 1 つのバイナリにまとめ、下の [[test]] だけを別にする（ADR-209。tests/suite.rs の冒頭）
+autotests = false
+
+# 結果に効く依存は `=` で版を固定する（docs/editing.md §8.2、ADR-136）。上げるのはゴールデンが通るときだけ。
+# - blake3：すべてのダイジェスト
+# - rand_chacha：乱数（ChaCha8）。鍵は determinism::key_from_seed で自前に作るので rand_core の実装には頼らない
+# - libm：超越関数（ワークスペースで固定）
+# - png：PNG の読み書き（R2 は Cargo.lock の fdeflate・flate2・miniz_oxide の版にも依存する。コーデックのゴールデンで見張る）
+# - zune-jpeg：JPEG の読み取り。SIMD を外して（default-features = false）、どのターゲットでも同じ整数の経路にする
+# - jpeg-encoder：JPEG の書き出し（SIMD の feature は入れない）
+# - gif：GIF の読み書き（R2 は Cargo.lock の weezl の版にも依存する）
+# - miniz_oxide：aseprite・PSD の zlib の展開（上限付き）
+# - image-webp：WebP の読み取り（可逆・非可逆・アニメ）と可逆の書き出し
+# - resvg：SVG の描画。中で std の三角関数（OS の libm）を使うので、結果は環境に依存する（R1 を約束しない。§9.4 のアンカーを作る）
+# - symphonia-*：FLAC・ALAC（整数だけ）と AAC-LC・Vorbis（段 9 から、超越関数を libm に差し替えた third_party の写しで
+#   値を再現できる。ADR-153）の読み取り、MP4・Ogg の読み口。部品のクレートを直接 `=` で固定し、既定の
+#   feature（opt-simd の rustfft は AAC・Vorbis の値を変える）と id3v2（スタックのあふれ #562）を入れない
+# - nanomp3：MP3 の読み取り（minimp3 とビット一致の純 Rust。libm を使わない）。SIMD（wide）は外す
+# - md-5：FLAC の STREAMINFO の MD5（入力の標本だけで決まる）
+# - vorbis-tables：Ogg Vorbis の書き出しの表（aoTuV b6.03 から生成してコミットしたもの。ワークスペースの中のクレート。
+#   中身を変えるとテストの凍結した値が合わなくなり、エンコーダの版を上げる）
+# serde_json は固定しない：正規の JSON は自前で書き（digest.rs）、読み込みは float_roundtrip で正しく丸めるので、結果は版によらない。
+[features]
+# エディタとの境界の型（手 `Edit`・引数の記述・操作のカタログ・文書・指摘）に specta::Type を付けて TS に出す（src-tauri が
+# 有効にする。specta はこの feature の中だけで使う。docs/editing.md §3、ADR-134）。結果には効かない
+specta = ["dep:specta"]
+
+[dependencies]
+blake3 = { version = "=1.8.7", features = ["rayon"] }
+libm.workspace = true
+miniz_oxide = "=0.8.9"
+gif = { version = "=0.14.2", default-features = false, features = ["std", "raii_no_panic"] }
+image-webp = "=0.2.4"
+md-5 = { version = "=0.11.0", default-features = false }
+nanomp3 = { version = "=0.2.0", default-features = false, features = ["alloc"] }
+jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
+png = "=0.18.1"
+rand_chacha = "=0.10.0"
+rayon.workspace = true
+resvg = { version = "=0.48.1", default-features = false, features = ["text"] }
+serde.workspace = true
+serde_json.workspace = true
+# feature `specta` のときだけ（引数の JSON の値は specta_types::JsonValue の名前で出す。specta の serde_json の型は入れ子を
+# 展開して TS に書き出せないので使わない）
+specta = { workspace = true, optional = true, features = ["derive"] }
+symphonia-bundle-flac = { version = "=0.6.1", default-features = false }
+symphonia-codec-aac = { version = "=0.6.1", default-features = false }
+symphonia-codec-alac = { version = "=0.6.1", default-features = false }
+symphonia-codec-vorbis = { version = "=0.6.1", default-features = false }
+symphonia-core = { version = "=0.6.1", default-features = false }
+symphonia-format-isomp4 = { version = "=0.6.1", default-features = false }
+symphonia-format-ogg = { version = "=0.6.1", default-features = false }
+thiserror.workspace = true
+vorbis-tables.workspace = true
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# asefile：aseprite の合成の照合相手（Aseprite の blend_funcs.cpp の移植。tests/aseprite_ref.rs）
+asefile = "=0.3.8"
+# lewton：Ogg Vorbis の独立したデコーダ（E28 で自作のエンコーダの出力を読む。純 Rust。ogg・非同期の feature は入れない）
+lewton = { version = "=0.10.2", default-features = false }
+# ebur128：ラウドネス・LRA の照合相手（libebur128 の純 Rust の移植。短期ラウドネスを 1 秒ごとに取るので、kura の LRA を
+# 1 秒ごとに切り替えた内部の関数と照らす。analysis/loudness.rs のテスト）。c-tests などの feature は入れない
+ebur128 = { version = "=0.1.10", default-features = false }
+blake3 = { version = "=1.8.7", features = ["rayon"] }
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+# 結合テストのバイナリ（autotests = false。ファイルを足したら tests/suite.rs の pub mod か、ここに足す）
+# - suite：ほかのすべての結合テスト（作り直したばかりの実行ファイルの起動待ちとリンクを 1 回にする。ADR-209）
+# - golden・codec_golden・analysis_golden・model_golden・replay：CI の push ごとの最低限が回すゴールデン（ADR-209）
+# - model_json_heap・stream_held：#[global_allocator] で確保を数えるので、ほかのテストと同じプロセスにしない
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
+[[test]]
+name = "golden"
+path = "tests/golden.rs"
+
+[[test]]
+name = "codec_golden"
+path = "tests/codec_golden.rs"
+
+[[test]]
+name = "analysis_golden"
+path = "tests/analysis_golden.rs"
+
+[[test]]
+name = "model_golden"
+path = "tests/model_golden.rs"
+
+[[test]]
+name = "replay"
+path = "tests/replay.rs"
+
+[[test]]
+name = "model_json_heap"
+path = "tests/model_json_heap.rs"
+
+[[test]]
+name = "stream_held"
+path = "tests/stream_held.rs"

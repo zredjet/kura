@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use kura_core::tools::find;
+use kura_core::tools::{self, find};
 
 /// 開いたプレイヤー。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,15 +16,17 @@ pub enum ExternalPlayer {
 /// `path` を外部プレイヤーで開く（待たずに戻る）。
 pub fn open_in_player(path: &Path) -> Result<ExternalPlayer, String> {
     if let Some(mpv) = find("mpv") {
-        let mut child = Command::new(mpv)
-            .arg("--force-window=immediate")
-            .arg("--")
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("mpv を起動できません: {e}"))?;
+        // 起動は kura-core の起動の鍵を通す（ほかの起動のパイプの端を、長く生きる mpv が受け継がないように）
+        let mut child = tools::spawn(
+            Command::new(mpv)
+                .arg("--force-window=immediate")
+                .arg("--")
+                .arg(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .map_err(|e| format!("mpv を起動できません: {e}"))?;
         // 終わったプロセスを片付ける
         std::thread::spawn(move || {
             let _ = child.wait();
@@ -36,11 +38,12 @@ pub fn open_in_player(path: &Path) -> Result<ExternalPlayer, String> {
 
 #[cfg(target_os = "macos")]
 fn open_with_quicktime(path: &Path) -> Result<ExternalPlayer, String> {
-    let status = Command::new("/usr/bin/open")
-        .args(["-a", "QuickTime Player", "--"])
-        .arg(path)
-        .status()
-        .map_err(|e| format!("QuickTime Player を開けません: {e}"))?;
+    let status = tools::status(
+        Command::new("/usr/bin/open")
+            .args(["-a", "QuickTime Player", "--"])
+            .arg(path),
+    )
+    .map_err(|e| format!("QuickTime Player を開けません: {e}"))?;
     if status.success() {
         Ok(ExternalPlayer::QuickTime)
     } else {

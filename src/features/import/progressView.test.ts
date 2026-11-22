@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
+import { ja } from '../../i18n/ja';
 import type { JobProgress } from '../../ipc/jobs';
-import { progressView } from './progressView';
+import type { SaveJob } from '../../stores/jobsStore';
+import { progressView, saveProgressView } from './progressView';
 
 function job(over: Partial<JobProgress>): JobProgress {
   return {
@@ -46,6 +48,25 @@ describe('progressView', () => {
     expect(progressView(job({ state: 'done', resultJson: result(3, 0, 0) })).detail).toBeNull();
   });
 
+  it('中身が違うので取り込まなかったもの（Aseprite でない .ase など。M11）は対象外として数える', () => {
+    const rejected = JSON.stringify({
+      cursor: 0,
+      total: 0,
+      added: 3,
+      duplicates: 1,
+      skipped: 2,
+      failed: 0,
+      failures: [],
+      rejected: [
+        { path: '/a/swatch.ase', reason: 'Aseprite のファイルではありません' },
+        { path: '/a/b.ase', reason: 'Aseprite のファイルではありません' },
+      ],
+    });
+    expect(progressView(job({ state: 'done', resultJson: rejected })).detail).toBe(
+      '重複 1・対象外 2',
+    );
+  });
+
   it('失敗・中止', () => {
     expect(progressView(job({ state: 'failed', message: '書き込めません' }))).toMatchObject({
       title: '取り込みに失敗しました',
@@ -85,5 +106,71 @@ describe('progressView（書き出し）', () => {
       progressView(job({ kind: 'export', state: 'canceled', resultJson: exported(0, 0, null) }))
         .actions,
     ).toEqual(['close']);
+  });
+});
+
+describe('saveProgressView（保存のジョブのカプセル）', () => {
+  function save(over: Partial<SaveJob> = {}): SaveJob {
+    return {
+      id: 9,
+      itemId: 7,
+      itemTitle: 'long-60min',
+      mode: 'overwrite',
+      newTitle: null,
+      state: 'running',
+      progress: 0.42,
+      message: '描いています',
+      shown: true,
+      ...over,
+    };
+  }
+
+  it('保存中：名前・進捗・一時停止・中止', () => {
+    expect(saveProgressView(save())).toEqual({
+      title: '「long-60min」を保存しています',
+      detail: '描いています',
+      progress: 0.42,
+      actions: ['pause', 'cancel'],
+      finished: false,
+    });
+  });
+
+  it('一時停止中：再開すると初めから書き直すことを添え、再開・中止', () => {
+    const view = saveProgressView(save({ state: 'paused' }));
+    expect(view).toMatchObject({
+      title: '「long-60min」の保存を一時停止しています',
+      detail: ja.savingJob.resumeNote,
+      progress: 0.42,
+      actions: ['resume', 'cancel'],
+    });
+    // 進捗の分からない一時停止でも棒は止まっている
+    expect(saveProgressView(save({ state: 'paused', progress: null })).progress).toBe(0);
+  });
+
+  it('待っている間も止められる（棒は動き続ける）', () => {
+    expect(saveProgressView(save({ state: 'queued', progress: null }))).toMatchObject({
+      title: '「long-60min」の保存の順番を待っています',
+      progress: null,
+      actions: ['pause', 'cancel'],
+    });
+  });
+
+  it('別名で保存は新しい名前、版に戻すは「戻す」の言葉', () => {
+    expect(saveProgressView(save({ mode: 'saveAs', newTitle: '夕方' })).title).toBe(
+      '「夕方」を保存しています',
+    );
+    expect(saveProgressView(save({ mode: 'revert' })).title).toBe('「long-60min」を戻しています');
+    expect(saveProgressView(save({ mode: 'revert', state: 'paused' })).title).toBe(
+      '「long-60min」を戻すのを一時停止しています',
+    );
+    expect(saveProgressView(save({ mode: 'revert', state: 'queued' })).title).toBe(
+      '「long-60min」を戻す順番を待っています',
+    );
+  });
+
+  it('アイテムの行がなくても出せる', () => {
+    expect(saveProgressView(save({ itemTitle: null })).title).toBe(
+      `「${ja.savingJob.unnamed}」を保存しています`,
+    );
   });
 });

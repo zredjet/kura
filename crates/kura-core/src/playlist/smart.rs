@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use super::model::UnitMatch;
+use crate::import::MediaKind;
 use crate::query::QueryContext;
 use crate::query::ast::{FieldCond, Op, PlayedSpec, UnitSpec};
 use crate::query::compile::date_matches;
@@ -79,8 +80,8 @@ pub struct UnitFacts {
     /// メンバー（並び順）と、それぞれのタグ。
     pub members: Vec<i64>,
     pub member_tags: Vec<HashSet<i64>>,
-    /// メンバーの種類（"image" / "video" / "audio"）。
-    pub kinds: HashSet<String>,
+    /// メンバーの種類（スマートの候補では再生できるメンバーだけ。フォント・3D を数えない）。
+    pub kinds: HashSet<MediaKind>,
     /// 集計の評価・合計時間（§2.4）。
     pub rating: i64,
     pub duration_ms: i64,
@@ -171,14 +172,10 @@ fn field_matches(field: &FieldCond, facts: &UnitFacts, ctx: &QueryContext) -> bo
     match field {
         // `種類:動画` はメンバーに動画を含む。`種類=動画` はメンバーが動画だけ
         FieldCond::Type { op, value } => {
-            let wanted: HashSet<&str> = value.iter().map(|k| k.as_str()).collect();
-            let has_any = facts.kinds.iter().any(|k| wanted.contains(k.as_str()));
+            let has_any = facts.kinds.iter().any(|k| value.contains(k));
             match op {
                 Op::Has => has_any,
-                Op::Eq => {
-                    !facts.kinds.is_empty()
-                        && facts.kinds.iter().all(|k| wanted.contains(k.as_str()))
-                }
+                Op::Eq => !facts.kinds.is_empty() && facts.kinds.iter().all(|k| value.contains(k)),
                 Op::Ne => !has_any,
                 _ => false,
             }
@@ -226,7 +223,7 @@ mod tests {
         UnitFacts {
             members: vec![1, 2, 3],
             member_tags: vec![HashSet::new(); 3],
-            kinds: HashSet::from(["image".to_string(), "audio".to_string()]),
+            kinds: HashSet::from([MediaKind::Image, MediaKind::Audio]),
             rating: 4,
             duration_ms: 90_000,
             play_count: 2,

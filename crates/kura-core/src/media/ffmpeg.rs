@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{MediaBackend, MediaError, MediaInfo, ThumbTargets};
+use super::{MediaBackend, MediaError, MediaInfo, ThumbFormat, ThumbTargets};
 use crate::import::MediaKind;
 use crate::time::parse_iso8601_ms;
 use crate::tools::{find, run_with_timeout};
@@ -63,9 +63,11 @@ impl FfmpegBackend {
         }
     }
 
-    /// 長辺 1600 の画像から 512 を作る。
-    fn small_from_large(&self, out: &ThumbTargets) -> Result<(), MediaError> {
-        self.frame(&out.large, &out.small, 512, None, None)
+    /// 長辺 1600 の画像から 512 を作る（どちらも JPEG）。
+    fn small_from_large(&self, out: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
+        let (large, small) = out.files(ThumbFormat::Jpeg);
+        self.frame(&large, &small, 512, None, None)?;
+        Ok(ThumbFormat::Jpeg)
     }
 }
 
@@ -80,6 +82,10 @@ fn stderr_line(stderr: &[u8]) -> String {
 
 impl MediaBackend for FfmpegBackend {
     fn probe(&self, path: &Path, kind: MediaKind) -> Result<MediaInfo, MediaError> {
+        // フォント・3D は ffprobe では読まない（段 3 の専用の道で読む）
+        if !reads_with_ffprobe(kind) {
+            return Err(MediaError::Unsupported);
+        }
         let output = run_with_timeout(
             Command::new(&self.ffprobe)
                 .args([
@@ -99,8 +105,9 @@ impl MediaBackend for FfmpegBackend {
         parse_ffprobe(&String::from_utf8_lossy(&output.stdout), kind)
     }
 
-    fn image_thumbnails(&self, path: &Path, out: &ThumbTargets) -> Result<(), MediaError> {
-        self.frame(path, &out.large, 1600, None, None)?;
+    fn image_thumbnails(&self, path: &Path, out: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
+        // ffmpeg の道はいつも JPEG（透明は落ちる。macOS で読めない形式の受け皿）
+        self.frame(path, &out.files(ThumbFormat::Jpeg).0, 1600, None, None)?;
         self.small_from_large(out)
     }
 
@@ -109,13 +116,14 @@ impl MediaBackend for FfmpegBackend {
         path: &Path,
         at_sec: f64,
         out: &ThumbTargets,
-    ) -> Result<(), MediaError> {
+    ) -> Result<ThumbFormat, MediaError> {
+        let large = out.files(ThumbFormat::Jpeg).0;
         // 指定の地点が取れなければ先頭で作り直す
         if self
-            .frame(path, &out.large, 1600, Some(at_sec.max(0.0)), Some("0:v:0"))
+            .frame(path, &large, 1600, Some(at_sec.max(0.0)), Some("0:v:0"))
             .is_err()
         {
-            self.frame(path, &out.large, 1600, None, Some("0:v:0"))?;
+            self.frame(path, &large, 1600, None, Some("0:v:0"))?;
         }
         self.small_from_large(out)
     }
@@ -125,7 +133,7 @@ impl MediaBackend for FfmpegBackend {
         path: &Path,
         art: &Path,
         out: &ThumbTargets,
-    ) -> Result<bool, MediaError> {
+    ) -> Result<Option<ThumbFormat>, MediaError> {
         // 埋め込まれた画像（attached picture）は動画のストリームとして見える
         let info = self.probe(path, MediaKind::Audio);
         let has_picture = info.is_ok() && {
@@ -147,19 +155,33 @@ impl MediaBackend for FfmpegBackend {
             !String::from_utf8_lossy(&output.stdout).trim().is_empty()
         };
         if !has_picture {
-            return Ok(false);
+            return Ok(None);
         }
         self.frame(path, art, 1600, None, Some("0:v:0"))?;
-        if let Some(parent) = out.large.parent() {
+        let large = out.files(ThumbFormat::Jpeg).0;
+        if let Some(parent) = large.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(art, &out.large)?;
-        self.small_from_large(out)?;
-        Ok(true)
+        std::fs::copy(art, &large)?;
+        self.small_from_large(out).map(Some)
+    }
+
+    fn font_thumbnails(&self, _: &Path, _: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
+        // フォントの見本は CoreText（kura-mac）だけ
+        Err(MediaError::Unsupported)
+    }
+}
+
+/// ffprobe で情報を読む種類か（画像・動画・音楽）。
+fn reads_with_ffprobe(kind: MediaKind) -> bool {
+    match kind {
+        MediaKind::Image | MediaKind::Video | MediaKind::Audio => true,
+        MediaKind::Font | MediaKind::Model => false,
     }
 }
 
 /// ffprobe の JSON（`-show_format -show_streams`）からメディア情報を取り出す。
+/// 映像の大きさは画像・動画で、主なコーデックは画像・動画は映像、音楽は音声から、長さは動画・音楽で読む。
 pub fn parse_ffprobe(json: &str, kind: MediaKind) -> Result<MediaInfo, MediaError> {
     let root: Value = serde_json::from_str(json).map_err(|e| MediaError::Failed(e.to_string()))?;
     let streams = root["streams"].as_array().cloned().unwrap_or_default();
@@ -169,8 +191,14 @@ pub fn parse_ffprobe(json: &str, kind: MediaKind) -> Result<MediaInfo, MediaErro
         .find(|s| s["codec_type"] == "video" && !is_picture(s));
     let audio = streams.iter().find(|s| s["codec_type"] == "audio");
 
+    // (映像の大きさ・コーデックを読む, 音声のコーデックを読む)
+    let (picture, sound) = match kind {
+        MediaKind::Image | MediaKind::Video => (true, false),
+        MediaKind::Audio => (false, true),
+        MediaKind::Font | MediaKind::Model => (false, false),
+    };
     let mut info = MediaInfo::default();
-    if let Some(v) = video.filter(|_| kind != MediaKind::Audio) {
+    if let Some(v) = video.filter(|_| picture) {
         let (w, h) = (v["width"].as_i64(), v["height"].as_i64());
         let rotation = v["side_data_list"]
             .as_array()
@@ -181,12 +209,12 @@ pub fn parse_ffprobe(json: &str, kind: MediaKind) -> Result<MediaInfo, MediaErro
         (info.width, info.height) = if quarter { (h, w) } else { (w, h) };
         info.codec = v["codec_name"].as_str().map(str::to_string);
     }
-    if kind == MediaKind::Audio {
+    if sound {
         info.codec = audio
             .and_then(|a| a["codec_name"].as_str())
             .map(str::to_string);
     }
-    if kind != MediaKind::Image {
+    if kind.has_duration() {
         info.duration_ms = root["format"]["duration"]
             .as_str()
             .and_then(|d| d.parse::<f64>().ok())
@@ -263,6 +291,32 @@ mod tests {
         assert!(parse_ffprobe("not json", MediaKind::Image).is_err());
     }
 
+    /// フォント・3D は ffprobe を起動せずに断る（次の実装か、段 3 の専用の道に回す）。
+    #[test]
+    fn fonts_and_models_are_not_probed_with_ffprobe() {
+        let backend = FfmpegBackend {
+            ffmpeg: PathBuf::from("/nonexistent/ffmpeg"),
+            ffprobe: PathBuf::from("/nonexistent/ffprobe"),
+        };
+        for kind in [MediaKind::Font, MediaKind::Model] {
+            assert!(matches!(
+                backend.probe(Path::new("x.ttf"), kind),
+                Err(MediaError::Unsupported)
+            ));
+        }
+        // 起動しようとした種類は、ないファイルの失敗になる（Unsupported ではない）
+        assert!(!matches!(
+            backend.probe(Path::new("x.jpg"), MediaKind::Image),
+            Err(MediaError::Unsupported)
+        ));
+        let json = r#"{"streams": [{"codec_type": "video", "codec_name": "png", "width": 8, "height": 8}],
+                       "format": {"duration": "1.0"}}"#;
+        assert_eq!(
+            parse_ffprobe(json, MediaKind::Font).unwrap(),
+            MediaInfo::default()
+        );
+    }
+
     /// ffmpeg があれば実際に動かす（ない環境では何もしない）。
     #[test]
     fn real_ffmpeg_makes_thumbnails_when_available() {
@@ -291,13 +345,21 @@ mod tests {
         assert!(info.duration_ms.unwrap() >= 1900);
 
         let out = ThumbTargets {
-            large: dir.path().join("l.jpg"),
-            small: dir.path().join("s.jpg"),
+            large: dir.path().join("l"),
+            small: dir.path().join("s"),
         };
-        backend.video_thumbnails(&video, 0.2, &out).unwrap();
-        assert!(out.large.is_file() && out.small.is_file());
+        assert_eq!(
+            backend.video_thumbnails(&video, 0.2, &out).unwrap(),
+            ThumbFormat::Jpeg
+        );
+        let (large, small) = out.files(ThumbFormat::Jpeg);
+        assert!(large.is_file() && small.is_file());
 
         let art = dir.path().join("art.jpg");
-        assert!(!backend.audio_artwork(&video, &art, &out).unwrap() || art.is_file());
+        assert!(backend.audio_artwork(&video, &art, &out).unwrap().is_none() || art.is_file());
+        assert!(matches!(
+            backend.font_thumbnails(&video, &out),
+            Err(MediaError::Unsupported)
+        ));
     }
 }

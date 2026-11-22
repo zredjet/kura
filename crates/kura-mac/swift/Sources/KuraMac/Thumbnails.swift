@@ -4,10 +4,14 @@ import Foundation
 import ImageIO
 
 /// 画像のサムネイル（ImageIO の CGImageSourceCreateThumbnailAtIndex。HEIC・RAW・AVIF も扱える）。
+/// `outLargeStem`・`outSmallStem` は拡張子のない書き先で、書いた形式の拡張子（`.jpg`・`.png`）を足して書く。
+/// `keepAlpha` が 0 でなく、元がアルファを持ち（`kCGImagePropertyHasAlpha` か、サムネイルがアルファの列を持つ）、透明な画素が
+/// あれば PNG を書く（M11 の決定 3・4）。0 なら今までどおりいつも JPEG。
+/// 戻り値は kOK（JPEG を書いた）・kPNG（PNG を書いた）・kUnsupported・kFailed。
 @_cdecl("kura_image_thumbnails")
 public func kuraImageThumbnails(
-    _ path: UnsafePointer<CChar>, _ outLarge: UnsafePointer<CChar>, _ outSmall: UnsafePointer<CChar>,
-    _ largePx: Int32, _ smallPx: Int32
+    _ path: UnsafePointer<CChar>, _ outLargeStem: UnsafePointer<CChar>, _ outSmallStem: UnsafePointer<CChar>,
+    _ largePx: Int32, _ smallPx: Int32, _ keepAlpha: Int32
 ) -> Int32 {
     let options = [kCGImageSourceShouldCache: false] as CFDictionary
     guard let source = CGImageSourceCreateWithURL(fileURL(path) as CFURL, options),
@@ -25,14 +29,24 @@ public func kuraImageThumbnails(
     guard let large = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
         return kFailed
     }
-    return writeThumbnails(large, outLarge, outSmall, largePx, smallPx)
+    if keepAlpha != 0 {
+        let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        let declared = props?[kCGImagePropertyHasAlpha] as? Bool ?? false
+        if declared || hasAlphaChannel(large) {
+            return writeThumbnailsKeepingAlpha(large, outLargeStem, outSmallStem, largePx, smallPx)
+        }
+    }
+    return writeThumbnails(
+        large, stemURL(outLargeStem, "jpg"), stemURL(outSmallStem, "jpg"), largePx, smallPx
+    )
 }
 
 /// 動画の `atSec` 秒の地点のサムネイル（AVAssetImageGenerator）。取れなければ先頭で作り直す。
+/// `outLargeStem`・`outSmallStem` は拡張子のない書き先で、いつも JPEG（`<stem>.jpg`）を書く（M11）。
 @_cdecl("kura_video_thumbnails")
 public func kuraVideoThumbnails(
-    _ path: UnsafePointer<CChar>, _ atSec: Double, _ outLarge: UnsafePointer<CChar>,
-    _ outSmall: UnsafePointer<CChar>, _ largePx: Int32, _ smallPx: Int32
+    _ path: UnsafePointer<CChar>, _ atSec: Double, _ outLargeStem: UnsafePointer<CChar>,
+    _ outSmallStem: UnsafePointer<CChar>, _ largePx: Int32, _ smallPx: Int32
 ) -> Int32 {
     let asset = AVURLAsset(url: fileURL(path))
     let tracks = waitFor { try await asset.loadTracks(withMediaType: .video) } ?? []
@@ -61,14 +75,17 @@ public func kuraVideoThumbnails(
     guard let large = frame(at: max(0, atSec)) ?? frame(at: 0) else {
         return kFailed
     }
-    return writeThumbnails(large, outLarge, outSmall, largePx, smallPx)
+    return writeThumbnails(
+        large, stemURL(outLargeStem, "jpg"), stemURL(outSmallStem, "jpg"), largePx, smallPx
+    )
 }
 
 /// 音楽のジャケット（メタデータの artwork）を `outArt` に書き、サムネイルも作る。
+/// `outLargeStem`・`outSmallStem` は拡張子のない書き先で、いつも JPEG（`<stem>.jpg`）を書く（M11）。
 @_cdecl("kura_audio_artwork")
 public func kuraAudioArtwork(
-    _ path: UnsafePointer<CChar>, _ outArt: UnsafePointer<CChar>, _ outLarge: UnsafePointer<CChar>,
-    _ outSmall: UnsafePointer<CChar>, _ largePx: Int32, _ smallPx: Int32
+    _ path: UnsafePointer<CChar>, _ outArt: UnsafePointer<CChar>, _ outLargeStem: UnsafePointer<CChar>,
+    _ outSmallStem: UnsafePointer<CChar>, _ largePx: Int32, _ smallPx: Int32
 ) -> Int32 {
     let asset = AVURLAsset(url: fileURL(path))
     let tracks = waitFor { try await asset.loadTracks(withMediaType: .audio) } ?? []
@@ -94,5 +111,7 @@ public func kuraAudioArtwork(
     else {
         return kFailed
     }
-    return writeThumbnails(art, outLarge, outSmall, largePx, smallPx)
+    return writeThumbnails(
+        art, stemURL(outLargeStem, "jpg"), stemURL(outSmallStem, "jpg"), largePx, smallPx
+    )
 }

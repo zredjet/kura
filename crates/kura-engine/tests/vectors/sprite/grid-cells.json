@@ -1,0 +1,506 @@
+{
+  "axis": [
+    {
+      "cell": 16,
+      "count": 4,
+      "gap": 0,
+      "len": 64,
+      "offset": 0
+    },
+    {
+      "cell": 16,
+      "count": 3,
+      "gap": 0,
+      "len": 63,
+      "offset": 0
+    },
+    {
+      "cell": 16,
+      "count": 3,
+      "gap": 2,
+      "len": 70,
+      "offset": 2
+    },
+    {
+      "cell": 16,
+      "count": 4,
+      "gap": 2,
+      "len": 72,
+      "offset": 2
+    },
+    {
+      "cell": 0,
+      "count": 0,
+      "gap": 0,
+      "len": 10,
+      "offset": 0
+    },
+    {
+      "cell": 16,
+      "count": 1,
+      "gap": 100,
+      "len": 16,
+      "offset": 0
+    },
+    {
+      "cell": 16,
+      "count": 0,
+      "gap": 0,
+      "len": 15,
+      "offset": 0
+    },
+    {
+      "cell": 16,
+      "count": 0,
+      "gap": 0,
+      "len": 100,
+      "offset": 90
+    },
+    {
+      "cell": 16,
+      "count": 1,
+      "gap": 0,
+      "len": 100,
+      "offset": 84
+    },
+    {
+      "cell": 3,
+      "count": 143,
+      "gap": 4,
+      "len": 1000,
+      "offset": 1
+    },
+    {
+      "cell": 1,
+      "count": 0,
+      "gap": 0,
+      "len": 0,
+      "offset": 0
+    },
+    {
+      "cell": 1,
+      "count": 4294967295,
+      "gap": 0,
+      "len": 4294967295,
+      "offset": 0
+    },
+    {
+      "cell": 4294967295,
+      "count": 1,
+      "gap": 4294967295,
+      "len": 4294967295,
+      "offset": 0
+    },
+    {
+      "cell": 1,
+      "count": 0,
+      "gap": 0,
+      "len": 4294967295,
+      "offset": 4294967295
+    },
+    {
+      "cell": 4294967294,
+      "count": 1,
+      "gap": 0,
+      "len": 4294967295,
+      "offset": 1
+    },
+    {
+      "cell": 1000,
+      "count": 1,
+      "gap": 4294966295,
+      "len": 4294967295,
+      "offset": 7
+    }
+  ],
+  "grids": [
+    {
+      "cells": [
+        [
+          0,
+          0,
+          16,
+          16
+        ],
+        [
+          16,
+          0,
+          16,
+          16
+        ],
+        [
+          32,
+          0,
+          16,
+          16
+        ],
+        [
+          48,
+          0,
+          16,
+          16
+        ],
+        [
+          0,
+          16,
+          16,
+          16
+        ],
+        [
+          16,
+          16,
+          16,
+          16
+        ],
+        [
+          32,
+          16,
+          16,
+          16
+        ],
+        [
+          48,
+          16,
+          16,
+          16
+        ]
+      ],
+      "grid": {
+        "cellH": 16,
+        "cellW": 16,
+        "gapX": 0,
+        "gapY": 0,
+        "offsetX": 0,
+        "offsetY": 0
+      },
+      "height": 32,
+      "name": "exact-4x2",
+      "width": 64
+    },
+    {
+      "cells": [
+        [
+          2,
+          1,
+          16,
+          8
+        ],
+        [
+          20,
+          1,
+          16,
+          8
+        ],
+        [
+          2,
+          11,
+          16,
+          8
+        ],
+        [
+          20,
+          11,
+          16,
+          8
+        ]
+      ],
+      "grid": {
+        "cellH": 8,
+        "cellW": 16,
+        "gapX": 2,
+        "gapY": 2,
+        "offsetX": 2,
+        "offsetY": 1
+      },
+      "height": 20,
+      "name": "offset-and-gap",
+      "width": 36
+    },
+    {
+      "cells": [
+        [
+          0,
+          0,
+          16,
+          16
+        ],
+        [
+          16,
+          0,
+          16,
+          16
+        ],
+        [
+          32,
+          0,
+          16,
+          16
+        ]
+      ],
+      "grid": {
+        "cellH": 16,
+        "cellW": 16,
+        "gapX": 0,
+        "gapY": 0,
+        "offsetX": 0,
+        "offsetY": 0
+      },
+      "height": 20,
+      "name": "partial-edge-dropped",
+      "width": 50
+    },
+    {
+      "cells": [
+        [
+          0,
+          0,
+          20,
+          20
+        ]
+      ],
+      "grid": {
+        "cellH": 20,
+        "cellW": 20,
+        "gapX": 100,
+        "gapY": 100,
+        "offsetX": 0,
+        "offsetY": 0
+      },
+      "height": 20,
+      "name": "one-cell-wide-gap",
+      "width": 20
+    },
+    {
+      "cells": [
+        [
+          0,
+          0,
+          16,
+          16
+        ],
+        [
+          0,
+          16,
+          16,
+          16
+        ],
+        [
+          0,
+          32,
+          16,
+          16
+        ],
+        [
+          0,
+          48,
+          16,
+          16
+        ],
+        [
+          0,
+          64,
+          16,
+          16
+        ]
+      ],
+      "grid": {
+        "cellH": 16,
+        "cellW": 16,
+        "gapX": 0,
+        "gapY": 0,
+        "offsetX": 0,
+        "offsetY": 0
+      },
+      "height": 80,
+      "name": "tall-strip",
+      "width": 16
+    },
+    {
+      "cells": [
+        [
+          0,
+          0,
+          10,
+          10
+        ],
+        [
+          15,
+          0,
+          10,
+          10
+        ],
+        [
+          30,
+          0,
+          10,
+          10
+        ],
+        [
+          45,
+          0,
+          10,
+          10
+        ],
+        [
+          60,
+          0,
+          10,
+          10
+        ],
+        [
+          75,
+          0,
+          10,
+          10
+        ],
+        [
+          90,
+          0,
+          10,
+          10
+        ]
+      ],
+      "grid": {
+        "cellH": 10,
+        "cellW": 10,
+        "gapX": 5,
+        "gapY": 0,
+        "offsetX": 0,
+        "offsetY": 0
+      },
+      "height": 10,
+      "name": "wide-strip-with-gap",
+      "width": 100
+    },
+    {
+      "cells": [
+        [
+          0,
+          0,
+          12,
+          10
+        ],
+        [
+          12,
+          0,
+          12,
+          10
+        ],
+        [
+          24,
+          0,
+          12,
+          10
+        ],
+        [
+          36,
+          0,
+          12,
+          10
+        ],
+        [
+          0,
+          10,
+          12,
+          10
+        ],
+        [
+          12,
+          10,
+          12,
+          10
+        ],
+        [
+          24,
+          10,
+          12,
+          10
+        ],
+        [
+          36,
+          10,
+          12,
+          10
+        ],
+        [
+          0,
+          20,
+          12,
+          10
+        ],
+        [
+          12,
+          20,
+          12,
+          10
+        ],
+        [
+          24,
+          20,
+          12,
+          10
+        ],
+        [
+          36,
+          20,
+          12,
+          10
+        ]
+      ],
+      "grid": {
+        "cellH": 10,
+        "cellW": 12,
+        "gapX": 0,
+        "gapY": 0,
+        "offsetX": 0,
+        "offsetY": 0
+      },
+      "height": 30,
+      "name": "non-square-cells",
+      "width": 48
+    },
+    {
+      "cells": [],
+      "grid": {
+        "cellH": 16,
+        "cellW": 16,
+        "gapX": 0,
+        "gapY": 0,
+        "offsetX": 20,
+        "offsetY": 0
+      },
+      "height": 32,
+      "name": "offset-beyond-image",
+      "width": 32
+    },
+    {
+      "cells": [],
+      "grid": {
+        "cellH": 16,
+        "cellW": 16,
+        "gapX": 0,
+        "gapY": 0,
+        "offsetX": 0,
+        "offsetY": 0
+      },
+      "height": 10,
+      "name": "nothing-fits",
+      "width": 10
+    },
+    {
+      "cells": [],
+      "grid": {
+        "cellH": 16,
+        "cellW": 0,
+        "gapX": 0,
+        "gapY": 0,
+        "offsetX": 0,
+        "offsetY": 0
+      },
+      "height": 64,
+      "name": "zero-cell",
+      "width": 64
+    }
+  ],
+  "version": 1
+}

@@ -4,15 +4,19 @@ import { type MenuEntry, openMenuBelow } from '../../components/Menu/menuStore';
 import { CheckIcon } from '../../components/icons/CheckIcon';
 import { ja } from '../../i18n/ja';
 import type { ItemSort, SortKey } from '../../ipc/items';
+import { dateTimeLabel } from '../../lib/dates';
 import { formatCount } from '../../lib/format';
 import { getCachedUnit, useItemCacheVersion } from '../../stores/itemCache';
 import { useLibraryStore } from '../../stores/libraryStore';
 import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
 import { useViewStore } from '../../stores/viewStore';
+import { useSfxOnSelect } from '../asset/useSfxOnSelect';
 import { ImportProgress } from '../import/ImportProgress';
 import { MiniPlayer, useMiniPlayerVisible } from '../player/MiniPlayer';
 import { pickAndImport } from '../import/useFileDrop';
+import { projectMenu, renameProjectWithPrompt } from '../projects/projectActions';
+import { useProjectStore } from '../projects/projectStore';
 import { joinClauses } from '../search/clauses';
 import { emptyTrashWithConfirm } from './actions';
 import { FilterBar } from './FilterBar';
@@ -66,6 +70,7 @@ export function LibraryView() {
   const itemCount = useLibraryStore((s) => s.info?.itemCount ?? 0);
   const folders = useSidebarStore((s) => s.folders);
   const smartFolders = useSidebarStore((s) => s.smartFolders);
+  const projects = useProjectStore((s) => s.list);
   const filter = useViewStore((s) => s.filter);
   const setFilter = useViewStore((s) => s.setFilter);
   const sort = useViewStore((s) => s.sort);
@@ -82,6 +87,7 @@ export function LibraryView() {
   const setLayout = useViewStore((s) => s.setLayout);
   useItemCacheVersion((s) => s.version);
   useLibraryKeys();
+  useSfxOnSelect();
 
   useEffect(() => {
     void useLibraryStore.getState().loadList();
@@ -105,15 +111,28 @@ export function LibraryView() {
       count,
       kind === 'folder' ? ja.unitInspector.folder : ja.unitInspector.set,
     );
+  } else if (view.kind === 'project') {
+    const project = projects.find((p) => p.id === view.id);
+    if (project) {
+      const state = project.missing
+        ? ja.projects.missing
+        : project.scannedAt === null
+          ? ja.projects.notScanned
+          : ja.projects.scannedAt(dateTimeLabel(project.scannedAt));
+      subtitle = ja.projects.subtitle(count, ja.projects.engines[project.engine], state);
+    }
   }
+  const viewProject = view.kind === 'project' ? projects.find((p) => p.id === view.id) : undefined;
 
   return (
     <>
       <Toolbar
-        title={viewTitle(view, folders, smartFolders)}
+        title={viewTitle(view, folders, smartFolders, projects)}
         subtitle={subtitle}
         parentTitle={
-          view.kind === 'unit' ? viewTitle(parent ?? { kind: 'all' }, folders, smartFolders) : null
+          view.kind === 'unit'
+            ? viewTitle(parent ?? { kind: 'all' }, folders, smartFolders, projects)
+            : null
         }
         onBack={back}
         onImport={() => {
@@ -136,6 +155,19 @@ export function LibraryView() {
         onSortMenu={sortMenu}
         layout={layout}
         onLayout={setLayout}
+        viewMenu={
+          viewProject
+            ? {
+                label: ja.projects.menuButton,
+                open: (anchor) =>
+                  openMenuBelow(
+                    anchor,
+                    ja.projects.label(viewProject.name),
+                    projectMenu(viewProject, () => void renameProjectWithPrompt(viewProject)),
+                  ),
+              }
+            : null
+        }
       />
       <FilterBar />
       <div className={styles.content}>

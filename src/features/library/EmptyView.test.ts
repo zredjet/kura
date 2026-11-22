@@ -1,7 +1,21 @@
-import { describe, expect, it } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import { createElement } from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../../i18n/ja';
-import { emptyMessage } from './EmptyView';
+import { queryParse } from '../../ipc/search';
+import { useViewStore } from '../../stores/viewStore';
+import { EmptyView, emptyMessage } from './EmptyView';
+
+vi.mock('../../ipc/search', () => ({
+  // 解析で決まるフィールド（ここでは「透過」）を使うときだけ、未解析の数が来る
+  queryParse: vi.fn(async (text: string) => ({
+    error: null,
+    clauses: [],
+    counts: { image: 0, video: 0, audio: 0, font: 0, model: 0, total: 0 },
+    unanalyzed: text.includes('透過:') ? 1234 : null,
+  })),
+}));
 
 const t = ja.library.emptyView;
 
@@ -22,5 +36,39 @@ describe('emptyMessage', () => {
       title: t.filtered,
       hint: t.filteredHint,
     });
+  });
+
+  it('解析がまだのものがあれば、解析が終わると一致しうることを言う', () => {
+    expect(emptyMessage({ kind: 'all' }, true, 1234)).toEqual({
+      title: t.filtered,
+      hint: t.filteredUnanalyzed('1,234'),
+    });
+    expect(emptyMessage({ kind: 'all' }, true, 0).hint).toBe(t.filteredHint);
+  });
+});
+
+describe('EmptyView', () => {
+  beforeEach(() => {
+    vi.mocked(queryParse).mockClear();
+  });
+
+  it('解析で決まる条件なら、未解析の数を出す', async () => {
+    useViewStore.setState({ filter: ['透過:あり'] });
+    render(createElement(EmptyView, { view: { kind: 'all' } }));
+    expect(await screen.findByText(t.filteredUnanalyzed('1,234'))).toBeInTheDocument();
+    expect(queryParse).toHaveBeenCalledWith('透過:あり', { kind: 'all' });
+  });
+
+  it('ほかの条件では今までどおりの案内', async () => {
+    useViewStore.setState({ filter: ['評価>=4'] });
+    render(createElement(EmptyView, { view: { kind: 'all' } }));
+    await waitFor(() => expect(queryParse).toHaveBeenCalled());
+    expect(screen.getByText(t.filteredHint)).toBeInTheDocument();
+  });
+
+  it('条件がなければ数えない', () => {
+    useViewStore.setState({ filter: [] });
+    render(createElement(EmptyView, { view: { kind: 'all' } }));
+    expect(queryParse).not.toHaveBeenCalled();
   });
 });

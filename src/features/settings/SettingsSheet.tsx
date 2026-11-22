@@ -31,10 +31,13 @@ import { useLibraryStore } from '../../stores/libraryStore';
 import { notify } from '../../stores/noticeStore';
 import { type SettingsTab, useSettingsStore } from '../../stores/settingsStore';
 import { useViewStore } from '../../stores/viewStore';
+import { LicensesTab } from '../credits/LicensesTab';
 import { ToolsPanel } from '../downloads/ToolsPanel';
 import { updatePlayerPrefs } from '../player/playerActions';
 import { usePlayerStore } from '../player/playerStore';
 import { createNew, openOther } from '../sidebar/LibrarySwitcher';
+import { CacheUsage } from './CacheUsage';
+import { integritySummary } from './integrity';
 import styles from './Settings.module.css';
 
 const t = ja.settings;
@@ -46,7 +49,7 @@ function fail(error: unknown): void {
   notify(error instanceof Error ? error.message : String(error));
 }
 
-/** 設定画面（design.md §3.1。⌘,・サイドバーの歯車）。一般・ライブラリ・ダウンロードのタブ。 */
+/** 設定画面（design.md §3.1。⌘,・サイドバーの歯車）。一般・ライブラリ・ダウンロード・ライセンス（M15 段 6）のタブ。 */
 export function SettingsSheet() {
   const open = useSettingsStore((s) => s.open);
   const tab = useSettingsStore((s) => s.tab);
@@ -60,6 +63,7 @@ export function SettingsSheet() {
     { value: 'general', label: t.tabs.general },
     { value: 'library', label: t.tabs.library },
     { value: 'downloads', label: t.tabs.downloads },
+    { value: 'licenses', label: t.tabs.licenses },
   ];
   return (
     <Dialog labelledBy={id} onClose={close} size="lg">
@@ -73,6 +77,7 @@ export function SettingsSheet() {
         {tab === 'general' && <GeneralTab />}
         {tab === 'library' && <LibraryTab />}
         {tab === 'downloads' && <DownloadsTab />}
+        {tab === 'licenses' && <LicensesTab />}
       </div>
       <div className={styles.actions}>
         <Button variant="primary" onClick={close}>
@@ -86,6 +91,7 @@ export function SettingsSheet() {
 /** 一般：画像の表示時間・ユニットをまとめて表示。 */
 function GeneralTab() {
   const imageMs = usePlayerStore((s) => s.prefs.imageDurationMs);
+  const sfxAudition = usePlayerStore((s) => s.prefs.sfxAudition);
   const collapseUnits = useViewStore((s) => s.collapseUnits);
   const toggleCollapseUnits = useViewStore((s) => s.toggleCollapseUnits);
   const seconds = Math.round(imageMs / 1000);
@@ -115,6 +121,17 @@ function GeneralTab() {
           checked={collapseUnits}
           aria-label={ja.library.collapseUnits}
           onChange={toggleCollapseUnits}
+        />
+      </div>
+      <div className={styles.row}>
+        <span className={styles.label}>
+          {ja.asset.sfx}
+          <span className={styles.hint}>{ja.asset.sfxHint}</span>
+        </span>
+        <Switch
+          checked={sfxAudition}
+          aria-label={ja.asset.sfx}
+          onChange={(on) => updatePlayerPrefs({ sfxAudition: on })}
         />
       </div>
     </>
@@ -167,7 +184,7 @@ function LibraryTab() {
   const reveal = (path: string) => {
     revealPath(path).catch(fail);
   };
-  const healthy = integrity && integrity.missingFiles === 0 && integrity.orphanFiles === 0;
+  const summary = integrity === null ? null : integritySummary(integrity);
 
   return (
     <>
@@ -191,6 +208,7 @@ function LibraryTab() {
         <dl className={styles.facts}>
           <dt>{t.libraryBytes}</dt>
           <dd>{usage ? formatBytes(usage.libraryBytes) : '—'}</dd>
+          <CacheUsage />
           <dt>{t.diskFree}</dt>
           <dd>
             {usage?.volumeAvailableBytes != null && usage.volumeTotalBytes != null
@@ -205,15 +223,9 @@ function LibraryTab() {
       <section className={styles.group} aria-label={t.integrity}>
         <h3 className={styles.groupTitle}>{t.integrity}</h3>
         <p className={styles.text} role="status">
-          {integrity === null
-            ? t.integrityPending
-            : healthy
-              ? t.integrityOk
-              : t.integrityIssues(
-                  formatCount(integrity.missingFiles),
-                  formatCount(integrity.orphanFiles),
-                )}
+          {summary === null ? t.integrityPending : summary.text}
         </p>
+        {summary?.notes && <p className={styles.hint}>{summary.notes}</p>}
         <div className={styles.buttons}>
           <Button size="sm" disabled={checking} onClick={check}>
             {checking ? t.checking : t.checkAgain}

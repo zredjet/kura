@@ -14,13 +14,15 @@ use serde_json::Value;
 use super::detect::Tool;
 use super::meta::{FileMeta, TagPolicy, from_gallerydl, from_ytdlp};
 use crate::Result;
+use crate::db::Db;
 use crate::import::place::{place, stage};
 use crate::import::store::{
-    NewItem, add_tag, add_to_folder, add_unit_member, create_unit, ensure_tag, find_by_hash,
+    NewItem, add_tag, add_to_folder, add_unit_member, create_unit, ensure_tag, find_owner,
     folder_exists, insert_item, restore_item, unit_exists,
 };
-use crate::import::{MediaKind, classify, mime_for};
+use crate::import::{MediaKind, Rejected, classify_file, mime_for};
 use crate::library::Layout;
+use crate::media::inflight::{self, ProbeWay};
 use crate::media::{MediaBackend, MediaInfo};
 use crate::tags::TagName;
 use crate::text::{natural_cmp, nfc};
@@ -47,7 +49,7 @@ pub struct Collect<'a> {
     pub job_url: &'a str,
 }
 
-/// 作業フォルダからメディアのファイルを集める（対応していない形式・書きかけ・メタデータは除く）。
+/// 作業フォルダからメディアのファイルを集める（対応していない形式・中身が拡張子と違うもの・書きかけ・メタデータは除く）。
 /// 並びはまとまり（ユニット）の中の順、次にファイル名の自然順。
 pub fn collect(dir: &Path, how: &Collect<'_>) -> Result<(Vec<Downloaded>, u64)> {
     let mut files = Vec::new();
@@ -76,9 +78,16 @@ pub fn collect(dir: &Path, how: &Collect<'_>) -> Result<(Vec<Downloaded>, u64)> 
         if ext == "ytdl" || ext == "temp" || is_format_fragment(stem) {
             continue;
         }
-        let Some(kind) = classify(&ext) else {
-            unsupported += 1;
-            continue;
+        // 取り込みと同じ判定（`.ase` は先頭のバイトで Aseprite かを見分ける）
+        let kind = match classify_file(&path, &ext) {
+            Ok(kind) => kind,
+            Err(rejected) => {
+                if !matches!(rejected, Rejected::Unsupported) {
+                    tracing::warn!(path = %path.display(), reason = rejected.reason(), "取り込みません");
+                }
+                unsupported += 1;
+                continue;
+            }
         };
         let sidecar = match how.tool {
             Tool::YtDlp => dir.join(format!("{stem}.info.json")),
@@ -175,45 +184,73 @@ pub struct Placed {
     hash: [u8; 32],
     size: u64,
     info: Option<MediaInfo>,
+    /// 前回このファイルのメディア情報を読んでいて落ちたので読まなかった（アイテムはサムネイルを作れなかったものにする）。
+    crashed: bool,
 }
 
 /// 配置した結果、または失敗の理由。
 pub type PlaceOutcome = std::result::Result<Placed, String>;
 
-/// ファイルを配置する（DB には触れない。並列）。作業フォルダのファイルはクローンでコピーするので残る。
+/// ファイルを配置し、メディア情報を処理中の印を付けて読む（`media::inflight::ProbeBatch`。OS のデコーダで落ちても、次の起動で
+/// 同じファイル（作業フォルダのパスで覚える）で落ち続けない。M11 の検証 S2）。印は配置の前に 1 回書き、配置と読み取りは
+/// 続けて並列に。前回まとめて読んでいて落ちたものは、あとで 1 件ずつ印を付けて読む。DB に書くのは印だけ。作業フォルダの
+/// ファイルはクローンでコピーするので残る。印は [`write_entries`] が片付ける。
 pub fn place_all(
+    db: &Db,
     layout: &Layout,
     backend: &dyn MediaBackend,
     job_id: i64,
     files: &[Downloaded],
-) -> Vec<PlaceOutcome> {
-    files
+) -> Result<Vec<PlaceOutcome>> {
+    let keys: Vec<String> = files.iter().map(|f| inflight::probe_key(&f.path)).collect();
+    let probes = inflight::ProbeBatch::begin(db, job_id, keys.clone())?;
+    let mut placed: Vec<PlaceOutcome> = files
         .par_iter()
+        .zip(keys.par_iter())
         .enumerate()
-        .map(|(i, file)| {
+        .map(|(i, (file, key))| {
             let staging = layout
                 .staging_dir()
                 .join(format!("import-dl-{job_id}-{i}.{}", file.ext));
             let staged = stage(&file.path, &staging).map_err(|e| e.to_string())?;
             let final_path = layout.content_path(&staged.hash, &file.ext);
             place(&staged, &final_path).map_err(|e| e.to_string())?;
-            let info = backend.probe(&final_path, file.kind).ok();
             Ok(Placed {
                 hash: staged.hash,
                 size: staged.size,
-                info,
+                info: probes.probe_together(key, backend, &final_path, file.kind),
+                crashed: probes.way(key) == ProbeWay::Skip,
             })
         })
-        .collect()
+        .collect();
+    for ((file, key), outcome) in files.iter().zip(&keys).zip(&mut placed) {
+        if let Ok(p) = outcome
+            && probes.way(key) == ProbeWay::Alone
+        {
+            p.info = probes.probe_alone(
+                db,
+                key,
+                backend,
+                &layout.content_path(&p.hash, &file.ext),
+                file.kind,
+            )?;
+        }
+    }
+    Ok(placed)
 }
 
 /// 配置したファイルを DB に入れる（アイテム・フォルダ・タグ・ユニット・`remote_sources`）。
-/// 同じ中身がすでにあれば、そのアイテムに所属とタグを足し、空いている取得元と投稿日だけ埋める。
+/// 同じ中身がすでにあれば（アイテムの今・元・過去の版。M12）、そのアイテムに所属とタグを足し、空いている取得元と投稿日だけ
+/// 埋める。同じ中身で拡張子だけ違うコピー（台帳の拡張子と違う `files/` のファイル）と、消えた過去の版と同じ中身のコピー
+/// （台帳に行がない）は、どの行も使わないのでここで消す。台帳にだけある中身（アンカーなど）は台帳の拡張子で入れる。
+/// [`place_all`] がジョブ `job_id` に付けた probe の印を、同じトランザクションで片付ける。
 pub fn write_entries(
     tx: &Connection,
+    layout: &Layout,
     entries: Vec<(Downloaded, PlaceOutcome)>,
     dest_folder_id: Option<i64>,
     origin: Origin,
+    job_id: i64,
 ) -> Result<Registered> {
     let now = crate::time::now_ms();
     let mut out = Registered::default();
@@ -223,6 +260,11 @@ pub fn write_entries(
     };
     let mut tags: HashMap<TagName, i64> = HashMap::new();
     let mut units: HashMap<String, i64> = HashMap::new();
+    let done: Vec<String> = entries
+        .iter()
+        .filter(|(_, o)| o.is_ok())
+        .map(|(f, _)| inflight::probe_key(&f.path))
+        .collect();
     for (file, outcome) in entries {
         let Ok(placed) = outcome else {
             out.failed += 1;
@@ -230,9 +272,11 @@ pub fn write_entries(
         };
         let meta = &file.meta;
         let title = nfc(&meta.title);
-        let item_id = match find_by_hash(tx, &placed.hash)? {
+        // 今・元・過去の版のどれかと同じ中身なら、そのアイテムの重複（docs/editing.md §14）
+        let item_id = match find_owner(tx, &placed.hash)? {
             Some(existing) => {
                 out.duplicates += 1;
+                remove_unused_copy(tx, layout, &placed.hash, &file.ext, true)?;
                 if existing.trashed {
                     restore_item(tx, existing.id, now)?;
                 }
@@ -252,13 +296,16 @@ pub fn write_entries(
                 existing.id
             }
             None => {
+                // 台帳にだけある中身（アンカーなど）は、台帳の拡張子で入れる（items のトリガが食い違いを断るため）
+                let kept = remove_unused_copy(tx, layout, &placed.hash, &file.ext, false)?;
+                let ext = kept.as_deref().unwrap_or(&file.ext);
                 let id = insert_item(
                     tx,
                     &NewItem {
                         hash: &placed.hash,
-                        ext: &file.ext,
+                        ext,
                         kind: file.kind,
-                        mime: mime_for(&file.ext),
+                        mime: mime_for(ext),
                         size: placed.size,
                         title: &title,
                         original_name: &file.name,
@@ -275,6 +322,9 @@ pub fn write_entries(
             }
         };
         out.item_ids.push(item_id);
+        if placed.crashed {
+            inflight::fail_crashed_thumb(tx, item_id)?;
+        }
         if let Some(folder) = folder {
             add_to_folder(tx, folder, item_id)?;
         }
@@ -337,10 +387,40 @@ pub fn write_entries(
         }
     }
     out.tags = tags.len() as u64;
+    inflight::settle_probes(tx, job_id, &done)?;
     Ok(out)
 }
 
 /// 同じ取得元（サイト・ID）のアイテムが入っているユニット。
+/// 置いたコピー（`files/<hash>.<ext>`）は、台帳にその中身が同じ拡張子で載っているときだけ使われる。台帳の拡張子と違う
+/// コピーと、持ち主がいる（`owned`）のに台帳に行がない（消えた過去の版と同じ中身の）コピーは、どの行も使わないので消す
+/// （CLAUDE.md の「files/ を DB を通さずに消さない」に沿って、書き込みのトランザクションの中で台帳を見てから消す）。
+/// 台帳の拡張子を返す（載っていなければ None）。
+fn remove_unused_copy(
+    conn: &Connection,
+    layout: &Layout,
+    hash: &[u8; 32],
+    ext: &str,
+    owned: bool,
+) -> Result<Option<String>> {
+    let kept = crate::library::ledger::ext_of(conn, hash)?;
+    let unused = match &kept {
+        Some(kept) => kept != ext,
+        None => owned,
+    };
+    if unused {
+        let path = layout.content_path(hash, ext);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "どの行も使わないコピーを消せませんでした");
+            }
+        }
+    }
+    Ok(kept)
+}
+
 fn unit_of_remote(conn: &Connection, site: &str, remote_id: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare_cached(
         "SELECT unit_id FROM remote_sources
@@ -398,6 +478,30 @@ mod tests {
         );
         assert_eq!(files[0].meta.title, "作品（1/2）");
         assert!(files[0].sidecar.is_some());
+    }
+
+    /// 種類の判定は取り込みと同じ：フォント・3D は取り、Aseprite でない `.ase` は対象外にする。
+    #[test]
+    fn collects_fonts_and_models_and_skips_swatch_ase() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |name: &str, body: &[u8]| std::fs::write(dir.path().join(name), body).unwrap();
+        w("a.woff2", b"wOF2");
+        w("b.glb", b"glTF");
+        w("c.ase", &[0x80, 0, 0, 0, 0xE0, 0xA5, 1, 0]);
+        w("d.ase", b"ASEF\x00\x01\x00\x00");
+        let (files, unsupported) = collect(dir.path(), &how(Tool::GalleryDl)).unwrap();
+        assert_eq!(unsupported, 1);
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| (f.name.as_str(), f.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("a.woff2", MediaKind::Font),
+                ("b.glb", MediaKind::Model),
+                ("c.ase", MediaKind::Image)
+            ]
+        );
     }
 
     #[test]
@@ -466,6 +570,7 @@ mod tests {
                 hash: [hash; 32],
                 size: 3,
                 info: None,
+                crashed: false,
             }),
         )
     }
@@ -480,12 +585,14 @@ mod tests {
         .unwrap();
         let out = write_entries(
             &conn,
+            &Layout::new("/kura-test-no-library"),
             vec![
                 entry(1, meta("100", 1, true)),
                 entry(2, meta("100", 2, true)),
             ],
             Some(9),
             Origin::Download,
+            1,
         )
         .unwrap();
         assert_eq!((out.added, out.duplicates, out.tags), (2, 0, 2));
@@ -558,12 +665,14 @@ mod tests {
         // 同じ作品を取り直すと、既存のアイテムとユニットを使う
         let again = write_entries(
             &conn,
+            &Layout::new("/kura-test-no-library"),
             vec![
                 entry(1, meta("100", 1, true)),
                 entry(3, meta("100", 3, true)),
             ],
             None,
             Origin::Download,
+            1,
         )
         .unwrap();
         assert_eq!((again.added, again.duplicates), (1, 1));
@@ -597,9 +706,11 @@ mod tests {
             .unwrap();
         let out = write_entries(
             &conn,
+            &Layout::new("/kura-test-no-library"),
             vec![entry(5, meta("7", 1, false))],
             None,
             Origin::Download,
+            1,
         )
         .unwrap();
         assert_eq!(
@@ -623,8 +734,8 @@ mod tests {
     #[test]
     fn places_files_and_counts_failures() {
         let lib_dir = tempfile::tempdir().unwrap();
-        let layout = Layout::new(lib_dir.path());
-        std::fs::create_dir_all(layout.staging_dir()).unwrap();
+        let lib = crate::library::Library::create(&lib_dir.path().join("L")).unwrap();
+        let layout = lib.layout().clone();
         let work = tempfile::tempdir().unwrap();
         let good = work.path().join("a.jpg");
         std::fs::write(&good, "image").unwrap();
@@ -632,11 +743,222 @@ mod tests {
         ok.path = good.clone();
         let mut missing = entry(2, meta("2", 1, false)).0;
         missing.path = work.path().join("missing.jpg");
-        let placed = place_all(&layout, &NoBackend, 7, &[ok, missing]);
+        let placed = place_all(lib.db(), &layout, &NoBackend, 7, &[ok, missing]).unwrap();
         assert!(placed[0].is_ok() && placed[1].is_err());
         let hash = placed[0].as_ref().unwrap().hash;
         assert!(layout.content_path(&hash, "jpg").is_file());
         // 元のファイル（作業フォルダ）はクローンでコピーしただけなので残る
         assert!(good.is_file());
+    }
+
+    /// 検証 S2：ダウンロード・キャプチャでも、メディア情報は処理中の印を付けて読む。前回 1 件だけで読んでいて落ちたファイルは
+    /// 読まずに入れ、サムネイルを作れなかったものにする。入れたら印と覚えを片付ける。
+    #[test]
+    fn place_all_marks_probes_and_skips_files_that_crashed() {
+        let lib_dir = tempfile::tempdir().unwrap();
+        let lib = crate::library::Library::create(&lib_dir.path().join("L")).unwrap();
+        let layout = lib.layout().clone();
+        let work = tempfile::tempdir().unwrap();
+        let (a_path, b_path) = (work.path().join("a.jpg"), work.path().join("b.jpg"));
+        std::fs::write(&a_path, "crashed-imageio").unwrap();
+        std::fs::write(&b_path, "fine").unwrap();
+        let crashed = serde_json::json!([inflight::probe_key(&a_path)]);
+        lib.db()
+            .write(move |tx| crate::settings::set(tx, "probe.crashed", &crashed))
+            .unwrap();
+        let mut fa = entry(1, meta("1", 1, false)).0;
+        fa.path = a_path;
+        let mut fb = entry(2, meta("2", 1, false)).0;
+        fb.path = b_path;
+        let files = vec![fa, fb];
+        let placed = place_all(
+            lib.db(),
+            &layout,
+            &crate::media::fake::FakeBackend,
+            7,
+            &files,
+        )
+        .unwrap();
+        let (pa, pb) = (placed[0].as_ref().unwrap(), placed[1].as_ref().unwrap());
+        assert!(pa.crashed && pa.info.is_none(), "落ちたファイルは読まない");
+        assert!(!pb.crashed && pb.info.is_some());
+        let mark: serde_json::Value = lib
+            .db()
+            .read(|c| crate::settings::get(c, "probe.inflight"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mark[0]["job"], serde_json::json!(7));
+        assert_eq!(mark[0]["solo"], serde_json::json!(false));
+        let written = layout.clone();
+        let entries: Vec<_> = files.into_iter().zip(placed).collect();
+        let out = lib
+            .db()
+            .write(move |tx| write_entries(tx, &written, entries, None, Origin::Download, 7))
+            .unwrap();
+        assert_eq!(out.added, 2);
+        let states: Vec<String> = lib
+            .db()
+            .read(|c| {
+                let mut stmt = c.prepare("SELECT thumb_state FROM items ORDER BY id")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                Ok(rows.collect::<std::result::Result<_, _>>()?)
+            })
+            .unwrap();
+        assert_eq!(states, vec!["failed".to_string(), "pending".to_string()]);
+        for key in ["probe.inflight", "probe.crashed"] {
+            let left: Option<serde_json::Value> =
+                lib.db().read(|c| crate::settings::get(c, key)).unwrap();
+            assert_eq!(left, None, "{key}");
+        }
+    }
+
+    /// S14（docs/editing.md §14.1）：取得したファイルが、あるアイテムの元・消えた過去の版と同じ中身なら、そのアイテムの重複に
+    /// なり、孤立したファイルが残らない（消えた版と同じ中身のコピーは台帳に行がないので、書き込みのトランザクションの中で消す）。
+    /// 版の行は、保存のジョブ（段 2 の B）の代わりにテストの補助で入れる。
+    #[test]
+    fn download_duplicate_of_original_or_released_version_is_owned() {
+        use crate::edit::testing::insert_version_with;
+        let dir = tempfile::tempdir().unwrap();
+        let lib = crate::library::Library::create(&dir.path().join("L")).unwrap();
+        let layout = lib.layout().clone();
+        let put = |hash: [u8; 32], ext: &str| {
+            let path = layout.content_path(&hash, ext);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "abc").unwrap();
+        };
+        // アイテム（今 [5]）：元 [6]・版 1 [7]（GC で消えた）・版 2 が今
+        let id = lib
+            .db()
+            .write(|tx| {
+                let id = insert_item(
+                    tx,
+                    &NewItem {
+                        hash: &[5; 32],
+                        ext: "jpg",
+                        kind: MediaKind::Image,
+                        mime: None,
+                        size: 3,
+                        title: "手元",
+                        original_name: "a.jpg",
+                        original_path: "/a.jpg",
+                        info: None,
+                        source_site: "local",
+                        source_url: None,
+                        captured_at: None,
+                        now: 1,
+                    },
+                )?;
+                insert_version_with(tx, id, 0, [6; 32], "jpg", 3, "hold", None);
+                insert_version_with(tx, id, 1, [7; 32], "jpg", 3, "released", None);
+                insert_version_with(tx, id, 2, [5; 32], "jpg", 3, "hold", None);
+                Ok(id)
+            })
+            .unwrap();
+        put([5; 32], "jpg");
+        put([6; 32], "jpg");
+        // 取得したファイル（どちらも jpg）を place_all が置いたところ（元と同じ中身は、もうあるので置き直さない）
+        put([7; 32], "jpg");
+        let written = layout.clone();
+        let out = lib
+            .db()
+            .write(move |tx| {
+                write_entries(
+                    tx,
+                    &written,
+                    vec![entry(6, meta("7", 1, false)), entry(7, meta("8", 1, false))],
+                    None,
+                    Origin::Download,
+                    1,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            (out.added, out.duplicates, out.item_ids.clone()),
+            (0, 2, vec![id, id])
+        );
+        assert!(layout.content_path(&[6; 32], "jpg").exists());
+        assert!(
+            !layout.content_path(&[7; 32], "jpg").exists(),
+            "消えた版と同じ中身のコピーが残った"
+        );
+        let items: i64 = lib
+            .db()
+            .read(|c| Ok(c.query_row("SELECT count(*) FROM items", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(items, 1);
+        assert_eq!(
+            crate::library::check_files(lib.db(), lib.layout()).unwrap(),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn download_duplicate_with_other_ext_leaves_no_orphan() {
+        // 同じ中身を別の拡張子で取ると、place_all が files/ に置いたコピーをどの行も使わない。
+        // 台帳の拡張子と違うファイルだけを、書き込みのトランザクションの中で消す（同じ拡張子なら消さない）
+        let dir = tempfile::tempdir().unwrap();
+        let lib = crate::library::Library::create(&dir.path().join("L")).unwrap();
+        let layout = lib.layout().clone();
+        let put = |hash: [u8; 32], ext: &str| {
+            let path = layout.content_path(&hash, ext);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "abc").unwrap();
+        };
+        for (hash, ext) in [([5u8; 32], "jpeg"), ([6u8; 32], "jpg")] {
+            lib.db()
+                .write(move |tx| {
+                    insert_item(
+                        tx,
+                        &NewItem {
+                            hash: &hash,
+                            ext,
+                            kind: MediaKind::Image,
+                            mime: None,
+                            size: 3,
+                            title: "手元",
+                            original_name: "a",
+                            original_path: "/a",
+                            info: None,
+                            source_site: "local",
+                            source_url: None,
+                            captured_at: None,
+                            now: 1,
+                        },
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            put(hash, ext);
+        }
+        // 取得したファイル（どちらも jpg）を place_all が置いたところ
+        put([5u8; 32], "jpg");
+        let written = layout.clone();
+        let out = lib
+            .db()
+            .write(move |tx| {
+                write_entries(
+                    tx,
+                    &written,
+                    vec![entry(5, meta("7", 1, false)), entry(6, meta("8", 1, false))],
+                    None,
+                    Origin::Download,
+                    1,
+                )
+            })
+            .unwrap();
+        assert_eq!((out.added, out.duplicates), (0, 2));
+        assert!(
+            !layout.content_path(&[5u8; 32], "jpg").exists(),
+            "拡張子だけ違うコピーが残った"
+        );
+        assert!(layout.content_path(&[5u8; 32], "jpeg").exists());
+        assert!(
+            layout.content_path(&[6u8; 32], "jpg").exists(),
+            "同じ拡張子の重複は消さない"
+        );
+        assert_eq!(
+            crate::library::check_files(lib.db(), lib.layout()).unwrap(),
+            (0, 0)
+        );
     }
 }

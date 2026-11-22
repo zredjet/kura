@@ -1,0 +1,260 @@
+//! テストの道具：0006 までのすべての表を埋める準備と、中身・索引・トリガ・FTS のスナップショット。
+
+use std::collections::BTreeMap;
+
+use rusqlite::Connection;
+
+/// 32 バイトのハッシュの SQL のリテラル（`x'0101…'`）。
+pub(crate) fn h(b: u8) -> String {
+    format!("x'{}'", format!("{b:02x}").repeat(32))
+}
+
+/// 1 つの値を読む。
+pub(crate) fn one<T: rusqlite::types::FromSql>(conn: &Connection, sql: &str) -> T {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+/// 0006 までの DB に、items を参照するすべての子と、それ以外のすべての表の行を入れる
+/// （表を足したらここにも行を足す。`fixture_fills_every_table` が見張る）。
+pub(crate) fn fill_v6(conn: &Connection) {
+    let sql = format!(
+        "INSERT INTO items (id, hash, ext, kind, mime, size_bytes, width, height, duration_ms, codec_info, title,
+                            original_name, original_path, source_url, source_site, rating, note, captured_at,
+                            imported_at, updated_at, trashed_at, play_count, last_played_at, thumb_state, proxy_state)
+           VALUES (1, {h1}, 'jpg', 'image', 'image/jpeg', 10, 1600, 900, NULL, NULL,
+                   '夕方の海', '夕方の海.jpg', '/Users/a/夕方の海.jpg', NULL, 'local', 4, 'メモ', 5, 10, 11, NULL, 2, 12, 'ready', 'not_needed'),
+                  (2, {h2}, 'mkv', 'video', NULL, 20, 1920, 1080, 61000, '{{\"codec\":\"h264\"}}',
+                   '港の朝', '港の朝.mkv', NULL, 'https://example.com/v/2', 'youtube', 0, NULL, NULL, 20, 21, NULL, 0, NULL, 'pending', 'unknown'),
+                  (3, {h3}, 'ogg', 'audio', NULL, 30, NULL, NULL, 180000, NULL,
+                   '雨', '雨.ogg', NULL, NULL, 'local', 0, NULL, NULL, 30, 31, 40, 0, NULL, 'failed', 'pending'),
+                  (4, x'04', 'png', 'image', NULL, 1, 1, 1, NULL, NULL, '短い', '短い.png', NULL, NULL, NULL, 0, NULL, NULL, 40, 40, NULL, 0, NULL, 'pending', 'unknown');
+         INSERT INTO folders (id, parent_id, name, color, pos, created_at) VALUES (1, NULL, '写真', 'blue', 1, 1), (2, 1, '鎌倉', NULL, 1, 1);
+         INSERT INTO item_folders (folder_id, item_id, pos) VALUES (1, 1, 1), (2, 2, NULL), (2, 3, 2);
+         INSERT INTO tags (id, namespace, name, color, created_at) VALUES (1, '', '海', NULL, 1), (2, '作者', 'A', 'teal', 1);
+         INSERT INTO tag_aliases (alias, tag_id) VALUES ('うみ', 1);
+         INSERT INTO tag_parents (child_id, parent_id) VALUES (2, 1);
+         INSERT INTO item_tags (tag_id, item_id, source) VALUES (1, 1, 'user'), (2, 2, 'download'), (1, 3, 'import');
+         INSERT INTO units (id, kind, name, cover_item_id, order_mode, inner_shuffle, rating, note, origin, created_at, updated_at, order_reverse)
+           VALUES (1, 'set', '鎌倉', 2, 'manual', 1, 3, 'メモ', 'download', 1, 2, 1), (2, 'folder', '写真', NULL, 'name', 0, 0, NULL, 'user', 1, 1, 0);
+         INSERT INTO unit_items (unit_id, item_id, pos) VALUES (1, 1, 1), (1, 2, 2);
+         INSERT INTO unit_folders (unit_id, folder_id, recursive, pos) VALUES (2, 1, 1, 1);
+         INSERT INTO unit_tags (tag_id, unit_id) VALUES (1, 1);
+         INSERT INTO smart_folders (id, name, query, pos, created_at) VALUES (1, '海', '海 種類:画像', 1, 1);
+         INSERT INTO playlists (id, name, kind, pos, created_at, updated_at, generated_at, sort_key, sort_desc)
+           VALUES (1, '夜', 'manual', 1, 1, 1, NULL, 'imported', 1), (2, '海', 'smart', 2, 1, 1, 9, 'name', 0);
+         INSERT INTO playlist_entries (id, playlist_id, pos, entry_type, item_id, unit_id, folder_id, start_ms)
+           VALUES (1, 1, 1, 'item', 1, NULL, NULL, 500), (2, 1, 2, 'unit', NULL, 1, NULL, NULL), (3, 1, 3, 'folder', NULL, NULL, 2, NULL), (4, 2, 1, 'item', 3, NULL, NULL, NULL);
+         INSERT INTO playlist_state (playlist_id, seed, slot_index, position_ms, updated_at, item_id) VALUES (1, 7, 3, 1500, 20, 2);
+         INSERT INTO play_events (id, item_id, unit_id, playlist_id, played_at, played_ms, completed)
+           VALUES (1, 1, 1, 1, 100, 8000, 1), (2, 2, NULL, NULL, 200, 3000, 0), (3, 3, NULL, 2, 300, 1, 0);
+         INSERT INTO jobs (id, kind, state, priority, input_json, progress, message, result_json, created_at, started_at)
+           VALUES (7, 'download', 'paused', 2, '{{}}', 0.5, '途中', '{{}}', 100, 110), (8, 'export', 'queued', 0, '{{\"ids\":[1,2]}}', NULL, NULL, NULL, 200, NULL);
+         INSERT INTO remote_sources (site, remote_id, item_id, unit_id, page_index, fetched_at) VALUES ('pixiv', '123', 1, 1, 0, 5), ('youtube', 'abc', 2, NULL, NULL, 6);
+         INSERT INTO capture_rules (id, name, url_pattern, mode, dest_folder_id, pos) VALUES (1, 'r', 'https://example.com/*', 'viewport', 2, 1);
+         INSERT INTO settings (key, value) VALUES ('playback.support', '\"abc\"');",
+        h1 = h(1),
+        h2 = h(2),
+        h3 = h(3)
+    );
+    conn.execute_batch(&sql).unwrap();
+}
+
+/// 0010 までの版で足した表（0009 の media_facts・analysis_results・asset_settings）に行を入れる。`fill_v6` のあとに、
+/// 版 9 以降の DB に使う（0011 を当てる前の行が残ることを確かめるのにも使う）。
+pub(crate) fn fill_v10(conn: &Connection) {
+    conn.execute_batch(
+        "INSERT INTO media_facts (blob_id, state, decoder, reproducible, facts_v, alpha, colors, has_loop, loudness, analyzed_at)
+           SELECT id, 'ok', 'png-rs-dec/1', 1, 1, 2, 16, 0, NULL, 1 FROM blobs;
+         INSERT INTO analysis_results (blob_id, analysis, version, params, encoding, output, output_len, digest, created_at)
+           SELECT id, 'image.alpha', 1, '{}', 'json', '{}', 2, x'00', 1 FROM blobs;
+         INSERT INTO asset_settings (item_id, pixel_art, pixel_scale, grid_json, frame_ms, loop_start, loop_end, anim_tag, updated_at)
+           VALUES (1, 1, 4, '{\"v\":1}', 100, NULL, NULL, 'idle', 1), (2, 0, NULL, NULL, NULL, NULL, NULL, NULL, 1),
+                  (3, NULL, NULL, NULL, NULL, 10, 20, NULL, 1);",
+    )
+    .unwrap();
+}
+
+/// 0011 までの版で足した表（[`fill_v10`] の表と、0011 の版・文書の部品・アンカー・来歴・下書き・予告、版 11 で入れられるように
+/// なった保存・GC のジョブ）に行を入れる。`fill_v6` のあとに、版 11 以降の DB に使う（0012 を当てる前の行が残ることを確かめる
+/// のにも使う）。0011 の行はアイテム 4（ゴミ箱を空にする試験で残るもの）に付け、版とアンカーはアイテム 4 の台帳の行を指す
+/// （出力が今と同じ中身の「版だけ足した」形）。
+pub(crate) fn fill_v11(conn: &Connection) {
+    fill_v10(conn);
+    let sql = "INSERT INTO jobs (id, kind, state, priority, input_json, created_at, finished_at)
+           VALUES (9, 'edit', 'done', 0, '{}', 40, 45), (11, 'gc', 'done', 0, '{}', 41, 46);
+         INSERT INTO edit_objects (id, digest, kind, body, created_at)
+           VALUES (1, x'c1', 'chunk', CAST('[1,2]' AS BLOB), 1), (2, x'a1', 'node', CAST('{}' AS BLOB), 1),
+                  (3, x'd1', 'doc', CAST('{}' AS BLOB), 1);
+         INSERT INTO edit_edges (parent_id, ord, child_id) VALUES (2, 0, 1), (3, 0, 2);
+         INSERT INTO edit_anchors (id, source_hash, options_digest, options, decoded, value_digest, blob_id, created_at)
+           SELECT 1, x'04', x'0d', '{}', '{}', x'0e', id, 1 FROM blobs WHERE hash = x'04';
+         INSERT INTO item_versions (id, item_id, version, kind, doc_id, base_version, revert_to, output_hash, ext, size_bytes,
+                                    format, value_digest, width, height, duration_ms, record, file_blob_id, file_state,
+                                    replaced_at, job_id, created_at)
+           SELECT 1, 4, 0, 'original', NULL, NULL, NULL, x'04', 'png', 1, 'png', x'0e', 1, 1, NULL, '{\"v\":1}', id, 'hold',
+                  NULL, NULL, 50 FROM blobs WHERE hash = x'04';
+         INSERT INTO item_versions (id, item_id, version, kind, doc_id, base_version, revert_to, output_hash, ext, size_bytes,
+                                    format, value_digest, width, height, duration_ms, record, file_blob_id, file_state,
+                                    replaced_at, job_id, created_at)
+           SELECT 2, 4, 1, 'edit', 3, 0, NULL, x'04', 'png', 1, 'png', x'0e', 1, 1, NULL, '{\"v\":1}', id, 'hold',
+                  NULL, 9, 50 FROM blobs WHERE hash = x'04';
+         INSERT INTO item_version_inputs (version_id, input, role, source_hash, value_digest, recorded, anchor_id)
+           VALUES (2, 0, 'primary', x'04', x'0e', '{}', 1);
+         INSERT INTO item_derivations (item_id, source_item_id, source_version, source_hash, created_at)
+           VALUES (4, 2, 0, {h2}, 50);
+         INSERT INTO edit_drafts (item_id, doc_id, base_hash, base_version, after_job, updated_at)
+           VALUES (4, 3, x'04', 1, NULL, 60);
+         INSERT INTO ledger_pending (id, hash, ext, kind, job_id, created_at) VALUES (1, {h9}, 'png', 'place', 9, 70);"
+        // format! にせず置き換える（JSON の波かっこをそのまま書くため）
+        .replace("{h2}", &h(2))
+        .replace("{h9}", &h(9));
+    conn.execute_batch(&sql).unwrap();
+}
+
+/// 版 12 で足した表（[`fill_v11`] の表と、0012 のレシピ・一括の対象）にも行を入れる。`fill_v6` のあとに、版 12 以降の DB に使う。
+pub(crate) fn fill_v12(conn: &Connection) {
+    fill_v11(conn);
+    conn.execute_batch(
+        "INSERT INTO edit_recipes (id, name, description, kind, doc_id, bindings, pos, created_at, updated_at)
+           VALUES (1, 'レシピ', '', 'each', 3, '[]', 1.0, 80, 80);
+         INSERT INTO batch_items (job_id, ord, item_id, state, decoding, base_hash, base_version, version_id, out_item_id,
+                                  code, message, finished_at)
+           VALUES (10, 0, 4, 'saved', 0, x'04', 0, 2, NULL, NULL, NULL, 90),
+                  (10, 1, 2, 'pending', 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
+    )
+    .unwrap();
+}
+
+/// 版 14 までの表（[`fill_v12`] の表と、0013 の N → 1 の来歴、0014 の自作のライセンスとクレジット）に行を入れる。`fill_v6` の
+/// あとに使う。
+pub(crate) fn fill_v14(conn: &Connection) {
+    fill_v12(conn);
+    conn.execute_batch(
+        "INSERT INTO item_sources (item_id, ord, source_item_id, source_version, source_hash, frames, created_at)
+           VALUES (2, 0, 4, 1, x'04', 1, 95), (2, 1, NULL, 0, x'09', 3, 95);
+         INSERT INTO licenses (builtin, name, spdx, url, attribution, commercial, modify, share_alike, note, pos, created_at, updated_at)
+           VALUES (NULL, 'サイトの規約', NULL, 'https://example.com/terms', 'optional', 'unknown', 'yes', 0, '表記は任意', 13, 96, 96);
+         INSERT INTO item_credits (item_id, license_id, author, work, url, credit, updated_at)
+           VALUES (1, (SELECT id FROM licenses WHERE builtin = 'cc-by-4.0'), 'もりの', '森の素材集', NULL, NULL, 96),
+                  (4, (SELECT id FROM licenses WHERE builtin IS NULL), NULL, NULL, 'https://example.com/pack', 'Sound by X', 96);",
+    )
+    .unwrap();
+}
+
+/// 最新の版で足した表（[`fill_v14`] の表と、0015 のプロジェクト・見たファイル・持ち出した出力、0016 の書き出したファイル）にも行を入れる。`fill_v6` の
+/// あとに使う（表を足したらここにも行を足す。`fixture_fills_every_table_at_the_latest_version` が見張る）。
+pub(crate) fn fill_latest(conn: &Connection) {
+    fill_v14(conn);
+    conn.execute_batch(
+        "INSERT INTO projects (id, name, root, engine, settings, pos, missing, scanned_at, created_at, updated_at)
+           VALUES (1, 'game', '/Users/x/game', 'godot', '{}', 1, 0, 97, 97, 97);
+         INSERT INTO project_files (project_id, path, size_bytes, mtime_ns, hash, item_id, matched, seen_at)
+           VALUES (1, 'art/a.png', 10, 5, x'01', 1, 'current', 97), (1, 'sfx/b.ogg', 20, 6, x'0b', NULL, NULL, 97);
+         INSERT INTO item_outputs (hash, item_id, source_hash, ext, size_bytes, created_at)
+           VALUES (x'0c', 1, x'01', 'png', 30, 97);
+         INSERT INTO jobs (kind, state, input_json, created_at) VALUES ('project', 'done', '{}', 97);
+         INSERT INTO export_files (path, item_id, hash, size_bytes, mtime_ns, job_id, written_at)
+           VALUES ('/Users/x/game/art/a.png', 1, x'01', 10, 5, 97, 98);",
+    )
+    .unwrap();
+}
+
+/// 名前の一覧を読む。
+fn names(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// 表ごとの列（前の版の列だけで比べるのに使う）。
+pub(crate) fn columns(conn: &Connection) -> BTreeMap<String, Vec<String>> {
+    names(
+        conn,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )
+    .into_iter()
+    .map(|t| {
+        let cols = names(conn, &format!("SELECT name FROM pragma_table_info('{t}')"));
+        (t, cols)
+    })
+    .collect()
+}
+
+/// すべての表の行（`only` にある表はその列だけ）・索引とトリガの定義・FTS の照合（rank=1）と件数。
+pub(crate) fn snapshot_cols(
+    conn: &Connection,
+    only: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for t in names(
+        conn,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+           AND name NOT LIKE 'items_fts_%' AND name <> 'items_fts'",
+    ) {
+        let mut cols = match only.get(&t) {
+            Some(c) => c.clone(),
+            None => names(conn, &format!("SELECT name FROM pragma_table_info('{t}')")),
+        };
+        cols.sort();
+        let pk = names(
+            conn,
+            &format!("SELECT name FROM pragma_table_info('{t}') WHERE pk > 0 ORDER BY pk"),
+        );
+        let order = if pk.is_empty() {
+            "rowid".to_string()
+        } else {
+            pk.join(", ")
+        };
+        let expr: Vec<String> = cols.iter().map(|c| format!("quote(\"{c}\")")).collect();
+        let rows = names(
+            conn,
+            &format!(
+                "SELECT {} FROM \"{t}\" ORDER BY {order}",
+                expr.join(" || '|' || ")
+            ),
+        );
+        out.insert(
+            format!("table {t}"),
+            format!("{}\n{}", cols.join(","), rows.join("\n")),
+        );
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT type || ' ' || name, tbl_name || ': ' || ifnull(sql, '(自動)')
+               FROM sqlite_schema WHERE type IN ('index', 'trigger', 'view')",
+        )
+        .unwrap();
+    let defs = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap();
+    for row in defs {
+        let (k, v) = row.unwrap();
+        out.insert(k, v.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    let fts = conn.execute(
+        "INSERT INTO items_fts(items_fts, rank) VALUES ('integrity-check', 1)",
+        [],
+    );
+    out.insert("fts integrity".into(), format!("{:?}", fts.map(|_| ())));
+    out.insert(
+        "fts rows".into(),
+        one::<i64>(conn, "SELECT count(*) FROM items_fts").to_string(),
+    );
+    out
+}
+
+/// すべての列でのスナップショット。
+pub(crate) fn snapshot(conn: &Connection) -> BTreeMap<String, String> {
+    snapshot_cols(conn, &BTreeMap::new())
+}
+
+/// 表の名前（sqlite_ と FTS の影の表を除く）。
+pub(crate) fn tables(conn: &Connection) -> Vec<String> {
+    names(
+        conn,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+           AND name NOT LIKE 'items_fts%' ORDER BY name",
+    )
+}

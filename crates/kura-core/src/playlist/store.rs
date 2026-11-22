@@ -7,11 +7,12 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use super::model::{
     Entry, EntryTarget, Granularity, LimitKind, PlaylistKind, QueueOptions, RepeatMode, UnitMatch,
 };
-use super::resolve::{Snapshot, UnitData, expand, resolve};
+use super::resolve::{Snapshot, UnitData, expand};
 use super::smart::SmartRule;
+use crate::import::{KindCounts, MediaKind};
 use crate::items::{ItemSort, SortKey};
 use crate::text::nfc;
-use crate::unit::{DEFAULT_IMAGE_DURATION_MS, load_member_snapshot, play_info};
+use crate::unit::{DEFAULT_IMAGE_DURATION_MS, load_member_snapshot, member_duration_ms, play_info};
 use crate::{CoreError, Result};
 
 /// 位置の差がこれより小さくなったら、プレイリスト全体の位置を振り直す（§3.2）。
@@ -591,7 +592,7 @@ pub fn snapshot_to_files(
                 .members
                 .items
                 .get(item)
-                .is_some_and(|m| m.kind == "image");
+                .is_some_and(|m| m.kind == MediaKind::Image);
             insert_entry(
                 conn,
                 id,
@@ -663,10 +664,14 @@ pub fn load_snapshot(conn: &Connection, id: i64) -> Result<Snapshot> {
     snapshot_of(conn, entries(conn, id)?)
 }
 
-/// 展開したアイテムの数（サイドバー・見出しの件数）。
+/// 展開したアイテムの数（サイドバー・見出しの件数）。一覧（`contents`）と同じく、再生しない種類（フォント・3D）も数える。
 pub fn item_count(conn: &Connection, id: i64) -> Result<usize> {
     let snap = load_snapshot(conn, id)?;
-    Ok(resolve(&snap).iter().map(|r| r.items.len()).sum())
+    Ok(snap
+        .entries
+        .iter()
+        .map(|e| expand(&snap, e.target).1.len())
+        .sum())
 }
 
 // ===== 再開（§6.5） =====
@@ -741,12 +746,12 @@ pub struct EntryRow {
     pub name: String,
     /// 展開したアイテム（ゴミ箱を除く）。
     pub items: Vec<i64>,
-    /// 合計時間（画像は表示時間）。
+    /// 合計時間（画像は表示時間。フォント・3D は足さない）。
     pub duration_ms: i64,
-    /// メンバーの種類（image → video → audio の順）。
-    pub kinds: Vec<&'static str>,
-    /// 種類ごとの件数（画像・動画・音楽）。
-    pub kind_counts: [u32; 3],
+    /// メンバーの種類（`MediaKind::ALL` の順）。
+    pub kinds: Vec<MediaKind>,
+    /// 種類ごとの件数。
+    pub kind_counts: KindCounts,
 }
 
 /// プレイリストの中身：エントリごとの行（空になったものも含む）。
@@ -778,29 +783,13 @@ pub fn contents(conn: &Connection, id: i64) -> Result<Vec<EntryRow>> {
             .image_duration_ms
             .or(unit.and_then(|u| u.image_duration_ms))
             .unwrap_or(playlist.image_duration_ms);
-        let mut counts = [0u32; 3];
+        let mut counts = KindCounts::default();
         let mut duration_ms = 0;
         for info in items.iter().filter_map(|i| snap.members.items.get(i)) {
-            match info.kind.as_str() {
-                "image" => {
-                    counts[0] += 1;
-                    duration_ms += image_ms;
-                }
-                "video" => {
-                    counts[1] += 1;
-                    duration_ms += info.duration_ms.unwrap_or(0);
-                }
-                _ => {
-                    counts[2] += 1;
-                    duration_ms += info.duration_ms.unwrap_or(0);
-                }
-            }
+            counts.add(info.kind, 1);
+            duration_ms += member_duration_ms(info, image_ms);
         }
-        let kinds = ["image", "video", "audio"]
-            .into_iter()
-            .zip(counts)
-            .filter_map(|(k, n)| (n > 0).then_some(k))
-            .collect();
+        let kinds = counts.kinds();
         rows.push(EntryRow {
             entry: entry.clone(),
             name,

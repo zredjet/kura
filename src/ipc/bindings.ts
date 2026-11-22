@@ -13,9 +13,17 @@ export const commands = {
 	libraryCheckLocation: (path: string) => typedError<LocationCheckDto, AppError>(__TAURI_INVOKE("library_check_location", { path })),
 	/**  新しいライブラリを作って開く。 */
 	libraryCreate: (path: string) => typedError<LibraryInfoDto, AppError>(__TAURI_INVOKE("library_create", { path })),
-	/**  既存のライブラリを開く。 */
+	/**
+	 *  既存のライブラリを開く。新しい版にするときは、始まり・終わり・失敗をイベント `library://upgrade` で知らせる。開けなければ
+	 *  理由の種類（`LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed`・`LibraryInUse` など）と説明を返す。ほかのアプリが
+	 *  開いているライブラリへの切り替え（`LibraryInUse`）では、今のライブラリは開いたまま。
+	 */
 	libraryOpen: (path: string) => typedError<LibraryInfoDto, AppError>(__TAURI_INVOKE("library_open", { path })),
-	/**  起動時に前回のライブラリを開く。開けなければ `info` は空で、前回の場所だけ返す。 */
+	/**
+	 *  起動時に前回のライブラリ（`KURA_LIBRARY` があればそれ）を開く。前回の場所が見つからなければ `info` も `error` も空で、
+	 *  前回の場所だけ返す。開けなければ `error` に理由（`library_open` と同じ種類）を入れて返す（失敗にはしない）。
+	 *  新しい版にするときは、始まり・終わり・失敗をイベント `library://upgrade` で知らせる。
+	 */
 	libraryRestore: () => typedError<LibraryRestoreDto, AppError>(__TAURI_INVOKE("library_restore")),
 	/**  開いているライブラリの概要。 */
 	libraryInfo: () => typedError<LibraryInfoDto, AppError>(__TAURI_INVOKE("library_info")),
@@ -27,13 +35,34 @@ export const commands = {
 	revealPath: (path: string) => typedError<null, AppError>(__TAURI_INVOKE("reveal_path", { path })),
 	/**  ライブラリの容量と、あるボリュームの容量・空き。 */
 	libraryUsage: () => typedError<LibraryUsageDto, AppError>(__TAURI_INVOKE("library_usage")),
-	/**  整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数える）。 */
+	/**  サムネイル・波形・アニメのキャッシュの大きさ（設定の「容量」の行。ファイルを数えるので、設定の画面を開いたときだけ呼ぶ）。 */
+	libraryCacheUsage: () => typedError<LibraryCacheUsageDto, AppError>(__TAURI_INVOKE("library_cache_usage")),
+	/**
+	 *  整合性チェックをいま行う（DB にあってファイルがないもの・ファイルがあって DB にないものを数え、台帳の行の ID の写し
+	 *  `items.blob_id` の食い違いを直す。起動時の分は同じ `check_integrity`）。
+	 */
 	libraryCheck: () => typedError<IntegrityDto, AppError>(__TAURI_INVOKE("library_check")),
 	/**
 	 *  選んだもの（一覧の ID。ユニットは印付き）を `dest` に書き出すジョブを積む。
-	 *  書き出し先はあるフォルダで、ライブラリの中は受け付けない。
+	 *  書き出し先はあるフォルダで、ライブラリの中は受け付けない。`options` が null なら M9 と同じ（元の名前・形式はそのまま・
+	 *  JSON を添える）。`options.project` があれば、書き出し先がそのプロジェクトのフォルダの中であることを確かめる。
 	 */
-	exportStart: (dest: string, entries: number[]) => typedError<number, AppError>(__TAURI_INVOKE("export_start", { dest, entries })),
+	exportStart: (dest: string, entries: number[], options: {
+	name: NameRuleDto,
+	image: FormatTargetDto,
+	audio: FormatTargetDto,
+	/**  `kura-export.json` を添える。 */
+	manifest: boolean,
+	/**  登録したプロジェクトの中へ書き出す（書き出し先がその中であることを確かめ、終わったら照らし直す）。 */
+	project: number | null,
+} | null) => typedError<number, AppError>(__TAURI_INVOKE("export_start", { dest, entries, options })),
+	/**  書き出しで選べる形式（画像・音声。形式の表の順）。 */
+	exportFormats: () => typedError<ExportFormatsDto, AppError>(__TAURI_INVOKE("export_formats")),
+	/**
+	 *  選んだもの（一覧の ID。ユニットは印付き）の書き出す名前と形式の見本。書き出しのジョブと同じ並び・番号・ユニットの
+	 *  フォルダ（名前は `フォルダ/名前`）で、先頭の 50 件と件数（M15 段 6 の検証の直し）。
+	 */
+	exportPreview: (entries: number[], options: ExportOptionsDto) => typedError<ExportPreviewDto, AppError>(__TAURI_INVOKE("export_preview", { entries, options })),
 	/**  取り込み前の確認（種類別件数・合計サイズ・重複の見込み・フォルダの概要）。 */
 	importPreview: (paths: string[]) => typedError<ImportPreviewDto, AppError>(__TAURI_INVOKE("import_preview", { paths })),
 	/**  取り込みジョブを積み、ジョブの ID を返す。進捗は `job://progress` で届く。 */
@@ -42,6 +71,72 @@ export const commands = {
 	itemsGet: (ids: number[]) => typedError<ItemSummaryDto[], AppError>(__TAURI_INVOKE("items_get", { ids })),
 	/**  インスペクタ用の詳細（タグ・フォルダ・ユニットを含む）。 */
 	itemDetail: (id: number) => typedError<ItemDetailDto, AppError>(__TAURI_INVOKE("item_detail", { id })),
+	/**  素材の欄の中身（DB だけを読む）。 */
+	itemAssetGet: (itemId: number) => typedError<AssetDto, AppError>(__TAURI_INVOKE("item_asset_get", { itemId })),
+	/**
+	 *  素材の設定を変える（右クリックの複数の選択にも使う。画像の欄は画像だけ、試聴のループは音声だけに付け、ほかは飛ばす）。
+	 *  変えた数を返す。格子が合わない画像・長さ（解析の読み取りで分かっていれば）を超える試聴のループ・始め ≥ 終わりがあれば、
+	 *  どれも変えずに `Invalid`。
+	 */
+	itemAssetSettingsSet: (ids: number[], patch: AssetSettingsPatchDto) => typedError<number, AppError>(__TAURI_INVOKE("item_asset_settings_set", { ids, patch })),
+	/**  アニメの帯の情報。帯がまだなければ、その場で作って `anim/ab/<hash>-1.png` に書く（長くても 0.4 秒ほど。ジョブにしない）。 */
+	itemAnimGet: (itemId: number) => typedError<AnimDto, AppError>(__TAURI_INVOKE("item_anim_get", { itemId })),
+	/**  エディタを開く（前のエディタは閉じる）。`fromDraft` が真で下書きがあれば、下書きの文書と土台で開く。画像と音声。 */
+	editOpen: (itemId: number, viewport: EditViewportDto, fromDraft: boolean | null) => typedError<EditOpenedDto_Serialize, AppError>(__TAURI_INVOKE("edit_open", { itemId, viewport, fromDraft })),
+	/**
+	 *  レシピ `recipe` の見本のモードでアイテム `itemId` を開く（M14 段 7。見本の元にレシピを継ぎ足す。下書きは置かず・開かず、
+	 *  アイテムに保存しない。N → 1 のレシピ・当てられないレシピは Invalid）。
+	 */
+	editOpenRecipe: (itemId: number, viewport: EditViewportDto, recipe: number) => typedError<EditOpenedDto_Serialize, AppError>(__TAURI_INVOKE("edit_open_recipe", { itemId, viewport, recipe })),
+	/**  手をまとめて当てて表示する（描くのは最後に 1 回）。 */
+	editStep: (session: string, steps: EditStepDto_Deserialize[], viewport: EditViewportDto) => typedError<EditStepResultDto_Serialize, AppError>(__TAURI_INVOKE("edit_step", { session, steps, viewport })),
+	/**  表示だけ（パン・ズーム・段の変更。保存が終わったあとの状態もこれで取り直す）。 */
+	editView: (session: string, viewport: EditViewportDto) => typedError<EditStepResultDto_Serialize, AppError>(__TAURI_INVOKE("edit_view", { session, viewport })),
+	/**  スポイト：今の rev の等倍の値の 1 画素（キャンバスの座標）。画像の外は null。 */
+	editSample: (session: string, frame: number, x: number, y: number) => typedError<{
+	/**  ストレートの RGBA8。 */
+	rgba: [number, number, number, number],
+	/**  パレットの番号（Indexed8）。 */
+	index: number | null,
+} | null, AppError>(__TAURI_INVOKE("edit_sample", { session, frame, x, y })),
+	/**
+	 *  音声のエディタ：今の rev の出力で、`frame` に最も近いゼロ交差（半径 `radius` フレーム。4,096 で切る）。描いている途中の表示を
+	 *  止めない（表示の外なら区間だけを描いて読む）。
+	 */
+	editSnap: (session: string, frame: number, radius: number) => typedError<EditSnapDto, AppError>(__TAURI_INVOKE("edit_snap", { session, frame, radius })),
+	/**
+	 *  音声のエディタ：今の rev の出力（量子化のあと）のラウドネス。出力の指紋ごとに覚え、短い音声はその場で計って `ready` を
+	 *  返す（長い音声は計りを予約して `measuring` を返し、`edit_view { work: true }` の裏の仕事で計る）。描いている途中の表示を止めない。
+	 */
+	editMeasure: (session: string) => typedError<EditLoudnessStateDto, AppError>(__TAURI_INVOKE("edit_measure", { session })),
+	/**
+	 *  書ける形式の一覧（確定した頭の出力の形で、保存のジョブと同じ今のコーデックの組で確かめる）。保存が `FormatUnavailable` で
+	 *  断られたときに、フロントが形式を選ぶシートに使う。
+	 */
+	editFormats: (session: string) => typedError<EditFormatsDto, AppError>(__TAURI_INVOKE("edit_formats", { session })),
+	/**  エディタを閉じる（キャッシュ・予算の取り置きを外す。待っている下書きは置く）。今のセッションでなければ何もしない。 */
+	editClose: (session: string) => typedError<null, AppError>(__TAURI_INVOKE("edit_close", { session })),
+	/**
+	 *  開く途中のエディタを止める（`edit_open` が返る前に閉じたとき。セッションはまだ分からないのでアイテムで指す）。そのアイテムを
+	 *  開いている途中なら止め、止められた `edit_open` は `Conflict`（中止）で返る（作業用のファイルの書きかけは消える）。開き終えた
+	 *  エディタ・別のアイテム・ライブラリがないときは何もしない。
+	 */
+	editCancelOpen: (itemId: number) => typedError<null, AppError>(__TAURI_INVOKE("edit_cancel_open", { itemId })),
+	/**
+	 *  保存のジョブを積む（確定した頭を保存する。`format` を渡すと先に出力の形式を変える手を確定する）。保存が待っている間は
+	 *  Busy。
+	 */
+	editSave: (session: string, mode: EditSaveModeDto, format: 
+/**  元と同じ形式。 */
+{ type: "keep" } | 
+/**  形式を指定する（`options` はエンコーダの設定）。 */
+{ type: "to"; format: string; options?: JsonValue } | null) => typedError<EditSaveStartedDto_Serialize, AppError>(__TAURI_INVOKE("edit_save", { session, mode, format })),
+	/**  アイテムの版の一覧（版の順。まだ保存していなければ空）。 */
+	editVersions: (itemId: number) => typedError<EditVersionDto[], AppError>(__TAURI_INVOKE("edit_versions", { itemId })),
+	/**  終わっていない保存のジョブ（古い順。エディタを閉じたあとのカプセル・開き直したエディタの保存のボタン。ADR-189）。 */
+	editPendingSaves: () => typedError<EditPendingSaveDto[], AppError>(__TAURI_INVOKE("edit_pending_saves")),
+	/**  アイテムの下書きを捨てる（あったら真）。 */
+	editDraftDiscard: (itemId: number) => typedError<boolean, AppError>(__TAURI_INVOKE("edit_draft_discard", { itemId })),
 	/**  サイドバーの「ライブラリ」の件数。 */
 	libraryCounts: () => typedError<LibraryCountsDto, AppError>(__TAURI_INVOKE("library_counts")),
 	/**  複数選択のインスペクタに出す集計（評価・メモ・タグ・フォルダ）。 */
@@ -181,7 +276,9 @@ export const commands = {
 	/**  ユニットを解除する（アイテムは残る）。 */
 	unitDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("unit_delete", { id })),
 	/**  入力を解析し、開いている一覧の中で一致する件数を数える（パレットの「一致 186 項目」）。 */
-	queryParse: (text: string, view: { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number } | null, utcOffsetMinutes: number) => typedError<QueryCheckDto, AppError>(__TAURI_INVOKE("query_parse", { text, view, utcOffsetMinutes })),
+	queryParse: (text: string, view: { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number } | 
+/**  登録したプロジェクトで今使っている素材（M15 段 6）。 */
+{ kind: "project"; id: number } | null, utcOffsetMinutes: number) => typedError<QueryCheckDto, AppError>(__TAURI_INVOKE("query_parse", { text, view, utcOffsetMinutes })),
 	/**  入力中の語の候補（タグ → フィールド名・値 → 保存済みの検索）。 */
 	querySuggest: (word: string, limit: number) => typedError<SuggestionDto[], AppError>(__TAURI_INVOKE("query_suggest", { word, limit })),
 	/**  すべてのスマートフォルダ。`withCounts` なら一致する件数も数える。 */
@@ -206,6 +303,10 @@ export const commands = {
 	playbackReport: (report: PlayReportDto) => typedError<boolean, AppError>(__TAURI_INVOKE("playback_report", { report })),
 	/**  再生キューの今と次のアイテムのプロキシを先に作る。`force` なら、元のまま再生できなかったものを作り直す。 */
 	proxyRequest: (ids: number[], force: boolean) => typedError<null, AppError>(__TAURI_INVOKE("proxy_request", { ids, force })),
+	/**  選んだアイテムを先に解析する（まだ解析していないものがあれば解析のジョブを積む）。解析を待つものがあれば true。 */
+	requestAnalysis: (ids: number[]) => typedError<boolean, AppError>(__TAURI_INVOKE("request_analysis", { ids })),
+	/**  解析できなかったアイテムを、もう一度解析する（先に解く）。解き直すことにした数を返す。 */
+	retryAnalysis: (ids: number[]) => typedError<number, AppError>(__TAURI_INVOKE("retry_analysis", { ids })),
 	/**  元のファイルを外部プレイヤー（mpv、なければ QuickTime Player）で開く。 */
 	openExternal: (hash: string) => typedError<ExternalPlayerDto, AppError>(__TAURI_INVOKE("open_external", { hash })),
 	/**  再生の設定。 */
@@ -247,13 +348,164 @@ export const commands = {
 	itemId: number | null,
 	positionMs: number,
 } | null) => typedError<null, AppError>(__TAURI_INVOKE("playlist_save_state", { id, playState })),
+	/**  ライセンスの一覧（並びの順。既定の行が先。付けた件数つき）。 */
+	licensesList: () => typedError<LicenseDto[], AppError>(__TAURI_INVOKE("licenses_list")),
+	/**  利用者のライセンスを足す（並びの最後）。ID を返す。同じ名前（大文字小文字を問わない）があれば Conflict。 */
+	licenseCreate: (input: LicenseInputDto) => typedError<number, AppError>(__TAURI_INVOKE("license_create", { input })),
+	/**  利用者のライセンスを変える（既定の行は Invalid）。 */
+	licenseUpdate: (id: number, input: LicenseInputDto) => typedError<null, AppError>(__TAURI_INVOKE("license_update", { id, input })),
+	/**
+	 *  利用者のライセンスを消す（既定の行は Invalid）。使っていたアイテムは未設定に戻り、その件数を返す（画面は消す前に
+	 *  `items` の件数で確かめる）。
+	 */
+	licenseDelete: (id: number) => typedError<number, AppError>(__TAURI_INVOKE("license_delete", { id })),
+	/**  1 件のクレジット（付けていなければ全部 null）。アイテムがなければ NotFound。 */
+	itemCreditGet: (item: number) => typedError<ItemCreditDto, AppError>(__TAURI_INVOKE("item_credit_get", { item })),
+	/**  選んだアイテムとユニット（メンバー全員）のクレジットの集計（複数選択のインスペクタ）。 */
+	itemCreditsSummary: (itemIds: number[], unitIds: number[]) => typedError<CreditSummaryDto, AppError>(__TAURI_INVOKE("item_credits_summary", { itemIds, unitIds })),
+	/**  選んだアイテムとユニット（メンバー全員）にクレジットの項目をまとめて付ける（省いた項目はアイテムごとのまま）。 */
+	itemCreditsSet: (itemIds: number[], unitIds: number[], patch: CreditPatchDto) => typedError<CreditsSetDto, AppError>(__TAURI_INVOKE("item_credits_set", { itemIds, unitIds, patch })),
+	/**  使ったアイテムのクレジットを、来歴の元をたどって集める（同じ表記の行は 1 つにまとめる）。 */
+	creditsCollect: (items: number[]) => typedError<CreditsDto, AppError>(__TAURI_INVOKE("credits_collect", { items })),
+	/**  クレジットの一覧を作る（見本・クリップボードへのコピー。M15 段 4）。 */
+	creditsRender: (scope: CreditsScopeDto, options: CreditsRenderDto) => typedError<CreditsTextDto, AppError>(__TAURI_INVOKE("credits_render", { scope, options })),
+	/**  クレジットの一覧を作って `path`（保存のダイアログで選んだ絶対パス）に書く（あれば置き換える。ライブラリの中は Invalid）。 */
+	creditsSave: (path: string, scope: CreditsScopeDto, options: CreditsRenderDto) => typedError<CreditsTextDto, AppError>(__TAURI_INVOKE("credits_save", { path, scope, options })),
+	/**  登録したプロジェクトの一覧（並びの順）。 */
+	projectsList: () => typedError<ProjectDto[], AppError>(__TAURI_INVOKE("projects_list")),
+	/**
+	 *  フォルダをプロジェクトとして登録し、照らし直しを積む（エンジンはフォルダの中身で見分ける。`name` が null ならフォルダの
+	 *  名前）。ない・フォルダでない・ライブラリの中か外側は Invalid／NotFound、ほかのプロジェクトと重なれば Conflict。
+	 */
+	projectAdd: (path: string, name: string | null) => typedError<ProjectDto, AppError>(__TAURI_INVOKE("project_add", { path, name })),
+	/**  名前を変える。 */
+	projectRename: (id: number, name: string) => typedError<null, AppError>(__TAURI_INVOKE("project_rename", { id, name })),
+	/**  場所を選び直し（使った記録は残す）、照らし直しを積む。 */
+	projectRelocate: (id: number, path: string) => typedError<ProjectDto, AppError>(__TAURI_INVOKE("project_relocate", { id, path })),
+	/**  登録を外す（使った記録も消える。プロジェクトのフォルダには触れない）。 */
+	projectRemove: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("project_remove", { id })),
+	/**  登録したプロジェクト全部の照らし直しを積む（待っているものがあれば積まず null）。 */
+	projectsScan: () => typedError<number | null, AppError>(__TAURI_INVOKE("projects_scan")),
+	/**  プロジェクトで使っているアイテム（ID の順。クレジットの一覧の対象）。 */
+	projectItems: (id: number) => typedError<number[], AppError>(__TAURI_INVOKE("project_items", { id })),
+	/**  アイテムを使っているプロジェクト（並びの順。一致したファイルのパスつき）。 */
+	itemProjects: (item: number) => typedError<ItemProjectDto[], AppError>(__TAURI_INVOKE("item_projects", { item })),
+	/**  プロジェクトの持ち出しの既定（命名・形式・JSON。まだ決めていなければエンジンごとの既定）。 */
+	projectSettings: (id: number) => typedError<ExportPresetDto, AppError>(__TAURI_INVOKE("project_settings", { id })),
+	/**  プロジェクトの持ち出しの既定を書く（名前のテンプレートと形式を確かめる）。 */
+	projectSettingsSet: (id: number, preset: ExportPresetDto) => typedError<null, AppError>(__TAURI_INVOKE("project_settings_set", { id, preset })),
+	/**  レシピの一覧（並びの順）。 */
+	recipesList: () => typedError<RecipeSummaryDto[], AppError>(__TAURI_INVOKE("recipes_list")),
+	/**  1 件のレシピ。 */
+	recipeGet: (id: number) => typedError<RecipeDto_Serialize, AppError>(__TAURI_INVOKE("recipe_get", { id })),
+	/**
+	 *  エディタ（`session`）の頭の文書からレシピを作る（`keep` のノードだけを含める。`withFormat` が偽なら出力は「元と同じ」。
+	 *  結び付けはエディタの文書のノードで指す）。ID を返す。
+	 */
+	recipeCreate: (session: string, name: string, description: string, keep: NodeId[], withFormat: boolean, bindings: Binding_Deserialize[]) => typedError<number, AppError>(__TAURI_INVOKE("recipe_create", { session, name, description, keep, withFormat, bindings })),
+	/**
+	 *  レシピ `id` の中身（文書と結び付け）を、エディタ（`session`）の頭の文書から作り直して差し替える（ID・名前・説明・並びは
+	 *  そのまま。見本で編集の保存）。
+	 */
+	recipeReplace: (id: number, session: string, keep: NodeId[], withFormat: boolean, bindings: Binding_Deserialize[]) => typedError<null, AppError>(__TAURI_INVOKE("recipe_replace", { id, session, keep, withFormat, bindings })),
+	/**  名前を変える（前後の空白を除き NFC にする。1〜256 バイト、制御文字なし。重なってよい）。 */
+	recipeRename: (id: number, name: string) => typedError<null, AppError>(__TAURI_INVOKE("recipe_rename", { id, name })),
+	/**  説明を変える（空でよい。4,096 バイトまで、改行・タブのほかの制御文字なし）。 */
+	recipeDescribe: (id: number, description: string) => typedError<null, AppError>(__TAURI_INVOKE("recipe_describe", { id, description })),
+	/**  並びを変える（`ids` の順。含まれないものは後ろに今の順で）。 */
+	recipesReorder: (ids: number[]) => typedError<null, AppError>(__TAURI_INVOKE("recipes_reorder", { ids })),
+	/**  複製する（「{名前} のコピー」を元のすぐ後ろに）。新しい ID を返す。 */
+	recipeDuplicate: (id: number) => typedError<number, AppError>(__TAURI_INVOKE("recipe_duplicate", { id })),
+	/**  すぐ消す（画面は確かめてから。動いている一括はジョブの入力の写しで続く）。 */
+	recipeDelete: (id: number) => typedError<null, AppError>(__TAURI_INVOKE("recipe_delete", { id })),
+	/**  `.kurarecipe` を `path`（保存のダイアログで選んだ絶対パス。ライブラリの外）に書き出す（一時ファイルから名前を置き換える）。 */
+	recipeExport: (id: number, path: string) => typedError<null, AppError>(__TAURI_INVOKE("recipe_export", { id, path })),
+	/**  `.kurarecipe`（開くダイアログで選んだ絶対パス）を読み込んで足す。通常のファイルだけを、4 MiB まで読む。 */
+	recipeImport: (path: string) => typedError<RecipeImportedDto, AppError>(__TAURI_INVOKE("recipe_import", { path })),
+	/**
+	 *  事前チェック（描かずに、当てられるか・出力の形・失うもの・見積もり・飛ばす理由）。進みは `batch://precheck`（`token`）。
+	 *  `batch_precheck_cancel` で止めると code `Conflict`（kura-core の Canceled）。同じ `token` の事前チェックが動いていれば Busy。
+	 */
+	batchPrecheck: (token: string, request: BatchRequestDto) => typedError<BatchPrecheckDto, AppError>(__TAURI_INVOKE("batch_precheck", { token, request })),
+	/**  事前チェック `token` を止める（まだ始まっていなければ覚えておき、始まったらすぐ code `Conflict` で返す）。 */
+	batchPrecheckCancel: (token: string) => typedError<null, AppError>(__TAURI_INVOKE("batch_precheck_cancel", { token })),
+	/**
+	 *  一括のジョブを積む（ジョブの ID を返す）。レシピが読んだあとに変わったら Conflict、当てられないレシピ・対象がない・
+	 *  別名の名前の型が空なら Invalid、写しの文書が片付けられていれば NotFound。
+	 */
+	batchStart: (request: BatchRequestDto) => typedError<number, AppError>(__TAURI_INVOKE("batch_start", { request })),
+	/**  一括の結果（向き・レシピ・状態と理由ごとの群・作ったアイテム・元に戻せるか）。 */
+	batchResult: (job: number) => typedError<BatchResultDto, AppError>(__TAURI_INVOKE("batch_result", { job })),
+	/**  一括の行（行の順。`state`・`code` があればそれだけ。`offset` から `limit` 件、limit は 1〜1,000）。 */
+	batchRows: (job: number, rowState: string | null, code: string | null, offset: number, limit: number) => typedError<BatchRowDto[], AppError>(__TAURI_INVOKE("batch_rows", { job, rowState, code, offset, limit })),
+	/**
+	 *  一括 `job` の［元に戻す…］を積む（ジョブの ID を返す）。元の一括が終わっていない・戻す一括が動いていれば Busy、戻す一括を
+	 *  戻す・戻すものがなければ Invalid。
+	 */
+	batchUndo: (job: number) => typedError<number, AppError>(__TAURI_INVOKE("batch_undo", { job })),
+	/**
+	 *  N → 1（スプライトシート）の事前チェック（元ごとの飛ばす理由と、シートの大きさ・セル・メモリ・ディスクの見込み `sheet`）。
+	 *  進み・中止は `batch_precheck` と同じ（`batch://precheck`・`batch_precheck_cancel`）。
+	 */
+	mergePrecheck: (token: string, request: MergeRequestDto) => typedError<BatchPrecheckDto, AppError>(__TAURI_INVOKE("merge_precheck", { token, request })),
+	/**
+	 *  N → 1（スプライトシート）の一括を積む（ジョブの ID を返す）。名前が空・どれもライブラリにないなら Invalid。結果・
+	 *  ［元に戻す…］は `batch_result`・`batch_undo`（作ったアイテムは結果の `created`）。
+	 */
+	mergeStart: (request: MergeRequestDto) => typedError<number, AppError>(__TAURI_INVOKE("merge_start", { request })),
+	/**  `path`（書き出し先などのフォルダ）を中に含むプロジェクト（なければ null。書き出しのシートが既定を選ぶ。M15 段 6）。 */
+	projectForDest: (path: string) => typedError<{
+	id: number,
+	name: string,
+	/**  正規化した絶対パス。 */
+	root: string,
+	engine: EngineDto,
+	/**  最後の照らしでフォルダが見つからなかった（使った記録は残っている）。 */
+	missing: boolean,
+	/**  最後に照らし終えた時刻（まだなら null）。 */
+	scannedAt: number | null,
+	/**  照らしたファイルの数。 */
+	files: number,
+	/**  使っているアイテムの数。 */
+	items: number,
+	createdAt: number,
+	updatedAt: number,
+} | null, AppError>(__TAURI_INVOKE("project_for_dest", { path })),
+	/**  1 件のアイテムの表記の見本（来歴の元をたどる。テキスト。未設定・元が消えたものは行に載せず数える。M15 段 6）。 */
+	itemCreditPreview: (item: number, lang: CreditsLangDto) => typedError<CreditPreviewDto, AppError>(__TAURI_INVOKE("item_credit_preview", { item, lang })),
+	/**
+	 *  ドラッグアウトを始める：選んだもの（一覧の ID。ユニットは `LIST_FLAG | unit_id`。選んだ順）の名前と形式を持ち出し先の
+	 *  プロジェクトの既定で決め、一時置き場に作り始めて、OS のドラッグに切り替える。マウスのボタンが離れていれば始めない
+	 *  （`started` が false。作りかけは片付ける）。作るものがない・多すぎるときは `Invalid`。
+	 */
+	dragoutStart: (entries: number[]) => typedError<DragOutStartDto, AppError>(__TAURI_INVOKE("dragout_start", { entries })),
+	/**  持ち出し先のプロジェクト（選んだものと、名前と形式に使うもの）。 */
+	dragoutTarget: () => typedError<DragOutTargetDto, AppError>(__TAURI_INVOKE("dragout_target")),
+	/**  持ち出し先のプロジェクトを選ぶ（null で選ばない。ないプロジェクトは `NotFound`）。 */
+	dragoutTargetSet: (project: number | null) => typedError<null, AppError>(__TAURI_INVOKE("dragout_target_set", { project })),
 };
 
 /** Events */
 export const events = {
+	batchPrecheck: makeEvent<BatchPrecheckProgress>("batch://precheck"),
 	captureLoginShot: makeEvent<LoginShotEvent>("capture://login-shot"),
+	dragoutEnded: makeEvent<DragOutEnded>("dragout://ended"),
 	jobProgress: makeEvent<JobProgress>("job://progress"),
+	libraryUpgrade: makeEvent<LibraryUpgradeEvent>("library://upgrade"),
 };
+
+/* Constants */
+export const ANALYSIS_ERROR_CODES = ["unsupported","too_large","decode","crashed"] as const;
+
+export const EDIT_OPS = [{"id":"audio.fade","schema":{"params":[{"advanced":false,"binds":["time"],"default":0,"key":"fadeIn","kind":{"max":1099511627776,"min":0,"step":1,"type":"int"},"origin":"source","unit":"samples","visible":null},{"advanced":false,"binds":["time"],"default":0,"key":"fadeOut","kind":{"max":1099511627776,"min":0,"step":1,"type":"int"},"origin":"source","unit":"samples","visible":null},{"advanced":false,"binds":[],"default":"linear","key":"curve","kind":{"type":"enum","values":["linear","equalPower"]},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["audio"],"name":"audio"}],"lift":"none","meta":"map","numeric":"float"},"version":1},{"id":"audio.gain","schema":{"params":[{"advanced":false,"binds":[],"default":0.0,"key":"db","kind":{"max":48.0,"min":-96.0,"step":0.1,"type":"float"},"origin":"free","unit":"db","visible":null}]},"signature":{"inputs":[{"accepts":["audio"],"name":"audio"}],"lift":"none","meta":"map","numeric":"float"},"version":1},{"id":"audio.mono","schema":{"params":[]},"signature":{"inputs":[{"accepts":["audio"],"name":"audio"}],"lift":"none","meta":"map","numeric":"float"},"version":1},{"id":"audio.normalize","schema":{"params":[{"advanced":false,"binds":[],"default":-23.0,"key":"target","kind":{"max":0.0,"min":-69.0,"step":0.1,"type":"float"},"origin":"free","unit":"lufs","visible":null},{"advanced":false,"binds":[],"default":null,"key":"peakLimit","kind":{"max":0.0,"min":-30.0,"step":0.1,"type":"float"},"origin":"free","unit":"db","visible":null}]},"signature":{"inputs":[{"accepts":["audio"],"name":"audio"}],"lift":"none","meta":"map","numeric":"float"},"version":1},{"id":"audio.resample","schema":{"params":[{"advanced":false,"binds":[],"default":48000,"key":"rate","kind":{"max":768000,"min":1000,"step":1,"type":"int"},"origin":"free","unit":"hz","visible":null}]},"signature":{"inputs":[{"accepts":["audio"],"name":"audio"}],"lift":"none","meta":"map","numeric":"float"},"version":1},{"id":"audio.set_loop","schema":{"params":[{"advanced":false,"binds":["loop","time"],"default":null,"key":"loop","kind":{"type":"frameRange"},"origin":"source","unit":"samples","visible":null}]},"signature":{"inputs":[{"accepts":["audio"],"name":"audio"}],"lift":"none","meta":"write","numeric":"exact"},"version":1},{"id":"audio.trim","schema":{"params":[{"advanced":false,"binds":["time"],"default":0,"key":"start","kind":{"max":1099511627776,"min":0,"step":1,"type":"int"},"origin":"source","unit":"samples","visible":null},{"advanced":false,"binds":["time"],"default":null,"key":"end","kind":{"max":1099511627776,"min":1,"step":1,"type":"int"},"origin":"source","unit":"samples","visible":null}]},"signature":{"inputs":[{"accepts":["audio"],"name":"audio"}],"lift":"none","meta":"map","numeric":"exact"},"version":1},{"id":"image.canvas","schema":{"params":[{"advanced":false,"binds":[],"default":{"h":1,"w":1,"x":0,"y":0},"key":"rect","kind":{"type":"rect"},"origin":"source","unit":"px","visible":null},{"advanced":false,"binds":[],"default":null,"key":"fill","kind":{"alpha":true,"type":"color"},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image"],"name":"image"}],"lift":"perFrame","meta":"map","numeric":"exact"},"version":1},{"id":"image.convert","schema":{"params":[{"advanced":false,"binds":[],"default":"rgba8","key":"format","kind":{"type":"enum","values":["gray8","grayA8","rgb8","rgba8","gray16","grayA16","rgb16","rgba16","indexed8"]},"origin":"free","unit":"none","visible":null},{"advanced":false,"binds":[],"default":256,"key":"colors","kind":{"max":256,"min":1,"step":1,"type":"int"},"origin":"free","unit":"none","visible":{"key":"format","values":["indexed8"]}},{"advanced":false,"binds":[],"default":"none","key":"dither","kind":{"type":"enum","values":["none","ordered","errorDiffusion"]},"origin":"free","unit":"none","visible":{"key":"format","values":["indexed8"]}},{"advanced":false,"binds":[],"default":[255,255,255],"key":"matte","kind":{"alpha":false,"type":"color"},"origin":"free","unit":"none","visible":{"key":"format","values":["gray8","rgb8","gray16","rgb16"]}}]},"signature":{"inputs":[{"accepts":["image","frames"],"name":"image"}],"lift":"none","meta":"map","numeric":"exact"},"version":1},{"id":"image.crop","schema":{"params":[{"advanced":false,"binds":[],"default":{"h":1,"w":1,"x":0,"y":0},"key":"rect","kind":{"type":"rect"},"origin":"source","unit":"px","visible":null}]},"signature":{"inputs":[{"accepts":["image"],"name":"image"}],"lift":"perFrame","meta":"map","numeric":"exact"},"version":1},{"id":"image.fit_canvas","schema":{"params":[{"advanced":false,"binds":[],"default":"keep","key":"width","kind":{"type":"canvasLength"},"origin":"ratio","unit":"px","visible":null},{"advanced":false,"binds":[],"default":"keep","key":"height","kind":{"type":"canvasLength"},"origin":"ratio","unit":"px","visible":null},{"advanced":false,"binds":[],"default":"center","key":"anchor","kind":{"type":"enum","values":["topLeft","top","topRight","left","center","right","bottomLeft","bottom","bottomRight"]},"origin":"free","unit":"none","visible":null},{"advanced":false,"binds":[],"default":null,"key":"fill","kind":{"alpha":true,"type":"color"},"origin":"free","unit":"none","visible":null},{"advanced":false,"binds":[],"default":false,"key":"allowCrop","kind":{"type":"bool"},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image"],"name":"image"}],"lift":"perFrame","meta":"map","numeric":"exact"},"version":1},{"id":"image.flip","schema":{"params":[{"advanced":false,"binds":[],"default":"horizontal","key":"axis","kind":{"type":"enum","values":["horizontal","vertical"]},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image"],"name":"image"}],"lift":"perFrame","meta":"map","numeric":"exact"},"version":1},{"id":"image.pad","schema":{"params":[{"advanced":false,"binds":[],"default":{"px":0},"key":"top","kind":{"type":"margin"},"origin":"ratio","unit":"px","visible":null},{"advanced":false,"binds":[],"default":{"px":0},"key":"right","kind":{"type":"margin"},"origin":"ratio","unit":"px","visible":null},{"advanced":false,"binds":[],"default":{"px":0},"key":"bottom","kind":{"type":"margin"},"origin":"ratio","unit":"px","visible":null},{"advanced":false,"binds":[],"default":{"px":0},"key":"left","kind":{"type":"margin"},"origin":"ratio","unit":"px","visible":null},{"advanced":false,"binds":[],"default":null,"key":"fill","kind":{"alpha":true,"type":"color"},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image"],"name":"image"}],"lift":"perFrame","meta":"map","numeric":"exact"},"version":1},{"id":"image.resize","schema":{"params":[{"advanced":false,"binds":[],"default":{"px":1},"key":"width","kind":{"type":"length"},"origin":"ratio","unit":"px","visible":null},{"advanced":false,"binds":[],"default":"auto","key":"height","kind":{"type":"length"},"origin":"ratio","unit":"px","visible":null},{"advanced":false,"binds":[],"default":"nearest","key":"filter","kind":{"type":"enum","values":["nearest","box","bilinear","lanczos3"]},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image"],"name":"image"}],"lift":"perFrame","meta":"map","numeric":"float"},"version":1},{"id":"image.rotate90","schema":{"params":[{"advanced":false,"binds":[],"default":"cw","key":"turn","kind":{"type":"enum","values":["cw","ccw","half"]},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image"],"name":"image"}],"lift":"perFrame","meta":"map","numeric":"exact"},"version":1},{"id":"image.trim_alpha","schema":{"params":[{"advanced":false,"binds":[],"default":0,"key":"threshold","kind":{"max":254,"min":0,"step":1,"type":"int"},"origin":"free","unit":"none","visible":null},{"advanced":false,"binds":[],"default":"union","key":"mode","kind":{"type":"enum","values":["union","perFrame"]},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image","frames"],"name":"image"}],"lift":"none","meta":"map","numeric":"exact"},"version":1},{"id":"meta.anchor_pivot","schema":{"params":[{"advanced":false,"binds":[],"default":"bottom","key":"anchor","kind":{"type":"enum","values":["topLeft","top","topRight","left","center","right","bottomLeft","bottom","bottomRight"]},"origin":"free","unit":"none","visible":null},{"advanced":false,"binds":[],"default":{"x":0,"y":0},"key":"offset","kind":{"type":"point"},"origin":"free","unit":"px","visible":null}]},"signature":{"inputs":[{"accepts":["image","frames"],"name":"image"}],"lift":"none","meta":"write","numeric":"exact"},"version":1},{"id":"meta.set_grid","schema":{"params":[{"advanced":false,"binds":["grid"],"default":null,"key":"grid","kind":{"type":"grid"},"origin":"source","unit":"px","visible":null}]},"signature":{"inputs":[{"accepts":["image","frames"],"name":"image"}],"lift":"none","meta":"write","numeric":"exact"},"version":1},{"id":"meta.set_pivot","schema":{"params":[{"advanced":false,"binds":["pivot"],"default":null,"key":"pivot","kind":{"type":"point"},"origin":"source","unit":"px","visible":null}]},"signature":{"inputs":[{"accepts":["image","frames"],"name":"image"}],"lift":"none","meta":"write","numeric":"exact"},"version":1},{"id":"paint.actions","schema":{"params":[{"advanced":false,"binds":[],"default":[],"key":"actions","kind":{"type":"strokes"},"origin":"source","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image","frames"],"name":"image"}],"lift":"none","meta":"map","numeric":"exact"},"version":1},{"id":"palette.replace","schema":{"params":[{"advanced":false,"binds":[],"default":[],"key":"entries","kind":{"type":"paletteEntries"},"origin":"source","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image","frames"],"name":"image"}],"lift":"none","meta":"map","numeric":"exact"},"version":1},{"id":"sprite.pack_grid","schema":{"params":[{"advanced":false,"binds":[],"default":8,"key":"columns","kind":{"max":4096,"min":1,"step":1,"type":"int"},"origin":"free","unit":"none","visible":null},{"advanced":false,"binds":[],"default":0,"key":"gapX","kind":{"max":4096,"min":0,"step":1,"type":"int"},"origin":"free","unit":"px","visible":null},{"advanced":false,"binds":[],"default":0,"key":"gapY","kind":{"max":4096,"min":0,"step":1,"type":"int"},"origin":"free","unit":"px","visible":null},{"advanced":false,"binds":[],"default":null,"key":"fill","kind":{"alpha":true,"type":"color"},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["frames"],"name":"frames"}],"lift":"none","meta":"write","numeric":"exact"},"version":1},{"id":"sprite.split_grid","schema":{"params":[{"advanced":false,"binds":["grid"],"default":{"cellH":16,"cellW":16,"gapX":0,"gapY":0,"offsetX":0,"offsetY":0},"key":"grid","kind":{"type":"grid"},"origin":"source","unit":"px","visible":null},{"advanced":false,"binds":["frameMs"],"default":100,"key":"durationMs","kind":{"max":65535,"min":1,"step":1,"type":"int"},"origin":"free","unit":"ms","visible":null},{"advanced":false,"binds":[],"default":false,"key":"skipEmpty","kind":{"type":"bool"},"origin":"free","unit":"none","visible":null}]},"signature":{"inputs":[{"accepts":["image"],"name":"image"}],"lift":"none","meta":"write","numeric":"exact"},"version":1}] as const;
+
+export const ITEM_KINDS = [{"hasDuration":false,"kind":"image","needsProxy":false,"playable":true},{"hasDuration":true,"kind":"video","needsProxy":true,"playable":true},{"hasDuration":true,"kind":"audio","needsProxy":true,"playable":true},{"hasDuration":false,"kind":"font","needsProxy":false,"playable":false},{"hasDuration":false,"kind":"model","needsProxy":false,"playable":false}] as const;
+
+export const QUERY_FIELD_NAMES = [{"field":"type","names":["種類","type"]},{"field":"rating","names":["評価","rating"]},{"field":"dur","names":["長さ","dur"]},{"field":"added","names":["追加","added"]},{"field":"taken","names":["撮影","taken"]},{"field":"played","names":["再生","played"]},{"field":"plays","names":["再生回数","plays"]},{"field":"folder","names":["フォルダ","folder"]},{"field":"unit","names":["ユニット","unit"]},{"field":"source","names":["取得元","source"]},{"field":"name","names":["名前","name"]},{"field":"url","names":["url"]},{"field":"note","names":["メモ","note"]},{"field":"tags","names":["タグ数","tags"]},{"field":"w","names":["幅","w"]},{"field":"h","names":["高さ","h"]},{"field":"orient","names":["向き","orient"]},{"field":"license","names":["ライセンス","license"]},{"field":"attribution","names":["表記","attribution"]},{"field":"credit","names":["クレジット","credit"]},{"field":"alpha","names":["透過","alpha"]},{"field":"pixel","names":["ドット絵","pixel"]},{"field":"colors","names":["色数","colors"]},{"field":"pot","names":["2のべき乗","２のべき乗","pot"]},{"field":"rate","names":["レート","rate"]},{"field":"bits","names":["ビット","bits"]},{"field":"ch","names":["チャンネル","ch"]},{"field":"lufs","names":["ラウドネス","lufs"]},{"field":"peak","names":["ピーク","peak"]},{"field":"loop","names":["ループ","loop"]},{"field":"anim","names":["アニメ","anim"]}] as const;
+
+export const QUERY_KIND_WORDS = [{"kind":"image","word":"画像"},{"kind":"video","word":"動画"},{"kind":"audio","word":"音楽"},{"kind":"font","word":"フォント"},{"kind":"model","word":"3D"}] as const;
+
+export const QUERY_SYMBOLS = [{"from":"｜","to":"|"},{"from":"－","to":"-"},{"from":"−","to":"-"},{"from":"＞","to":">"},{"from":"＜","to":"<"},{"from":"＝","to":"="},{"from":"：","to":":"},{"from":"！","to":"!"},{"from":"（","to":"("},{"from":"）","to":")"},{"from":"“","to":"\""},{"from":"”","to":"\""},{"from":"＂","to":"\""},{"from":"，","to":","},{"from":"、","to":","},{"from":"　","to":" "}] as const;
 
 /* Types */
 /**  追加するもの。 */
@@ -263,6 +515,40 @@ export type AddSourceDto = { kind: "item"; id: number } | { kind: "unit"; id: nu
 export type AddedDto = {
 	entryIds: number[],
 	unitId: number | null,
+};
+
+/**  9 点の基準（`image.fit_canvas`・`meta.anchor_pivot`。M14 段 1。N → 1 のセルの揃え。段 6）。JSON は列挙の文字列（[`ANCHOR_NAMES`]）。 */
+export type Anchor = "topLeft" | "top" | "topRight" | "left" | "center" | "right" | "bottomLeft" | "bottom" | "bottomRight";
+
+/**  タグの再生の向き（`src/lib/asset/timeline.ts` の `Direction`）。 */
+export type AnimDirectionDto = "forward" | "reverse" | "pingPong" | "pingPongReverse";
+
+/**
+ *  アニメの帯の情報。帯は `/anim/{hash}/{version}`（`rev` が 0 でなければ `?r={rev}`）。帯の中のコマ f の左上は
+ *  `((f % cols) × canvasW, ⌊f / cols⌋ × canvasH)`。
+ */
+export type AnimDto = {
+	hash: string,
+	/**  帯の並べ方の版（今は 1）。 */
+	version: number,
+	/**  格子の帯なら 1 以上（格子を変えると変わる）、ファイルのコマなら 0。 */
+	rev: number,
+	canvasW: number,
+	canvasH: number,
+	cols: number,
+	frameCount: number,
+	/**  コマの長さ（ms。0 はそのまま。フロントが 100ms にする）。 */
+	durations: number[],
+	tags: AnimTagDto[],
+};
+
+/**  アニメのタグ（`timeline.ts` の `AnimTag`。`from`・`to` は両端を含む。`repeat` の 0 は無限）。 */
+export type AnimTagDto = {
+	name: string,
+	from: number,
+	to: number,
+	direction: AnimDirectionDto,
+	repeat: number,
 };
 
 /**  コマンドが返すエラー。JSON では `{ code, message }` になる。 */
@@ -276,7 +562,37 @@ export type AppErrorCode = "NotFound" | "InvalidQuery" | "Invalid" | "ToolMissin
 /**  外部ツールが失敗した。 */
 "ToolFailed" | "Io" | "Db" | "Conflict" | 
 /**  アプリ内部の想定外の失敗。 */
-"Internal";
+"Internal" | 
+/**  ライブラリが新しい版の Kura で作られている（開けない。Kura を新しくする）。 */
+"LibraryTooNew" | 
+/**
+ *  ディスクの空きが足りず、ライブラリを新しい版にできない（当てる前の見積もり・バックアップ・当てる途中）。
+ *  当てる前ならライブラリは前の版のまま。当てる途中なら、失敗した 1 つだけを戻し、それより前に当てたものは残る（説明が言う）。
+ */
+"NoSpace" | 
+/**  ライブラリを新しい版にする前のバックアップを作れない（ライブラリは変えていない）。 */
+"BackupFailed" | 
+/**  ライブラリを新しい版にできない（失敗した 1 つを戻した。それより前に当てたものは残り、途中の版なら説明がそう言う）。 */
+"UpgradeFailed" | 
+/**
+ *  ほかのアプリが同じライブラリを開いている（ライブラリのロック `library.lock` を取れない。開く側は何もしていない。
+ *  別のライブラリへの切り替えなら、今のライブラリは開いたまま。M12）。
+ */
+"LibraryInUse" | 
+/**  大きすぎてその場で用意できない（アニメの帯の 1 辺・画素の数・メモリの予算の全体。やり直しても同じ。M11）。 */
+"TooLarge" | 
+/**  混んでいる（メモリの予算が空いていない。少し待ってやり直せば通りうる。M11）。 */
+"Busy" | 
+/**
+ *  保存する形式（文書の出力の形式）をこの環境では書けない（MP3 で ffmpeg がない、など。保存を積む前に断った。M13 段 3）。
+ *  保存する形式を選び直す（音声の既定は Ogg Vorbis）。
+ */
+"FormatUnavailable" | 
+/**
+ *  同じアイテムの前の保存が終わっていないのでエディタを開かない（ADR-189。`Busy` と違い、予算ではなく保存を待つ）。フロントは
+ *  「前の保存が終わっていません」のシートを出し、終わったら開き直す。
+ */
+"SavePending";
 
 /**  OS の表示設定。 */
 export type Appearance = {
@@ -292,12 +608,357 @@ export type ArchiveStatusDto = {
 	sizeBytes: number,
 };
 
+/**  透過。 */
+export type AssetAlphaDto = 
+/**  透明な画素がない。 */
+"none" | 
+/**  透明か不透明だけ。 */
+"binary" | 
+/**  半透明がある。 */
+"partial";
+
+/**  解析の進み具合（DB の `items.analysis_state` と同じ綴り）。 */
+export type AssetAnalysisStateDto = "pending" | "ready" | "failed" | "not_needed";
+
+/**  音声の事実。 */
+export type AssetAudioFactsDto = {
+	/**  積分ラウドネス（LUFS）。計れなければ null で `loudnessReason`。 */
+	loudness: number | null,
+	loudnessReason: string | null,
+	/**  LRA（LU）。 */
+	loudnessRange: number | null,
+	/**  dBTP。 */
+	truePeak: number | null,
+	samplePeak: number | null,
+	hasLoop: boolean | null,
+	/**  ループ点（解析のときの読み取り。試聴は /pcm の kura チャンクの値を使う）。 */
+	loopRange: AssetSpanDto | null,
+	sampleRate: number | null,
+	channels: number | null,
+	/**  非可逆の形式は null。 */
+	bits: number | null,
+	clipRuns: number | null,
+	/**
+	 *  長さ（フレーム。解析の読み取りの記録 `kura.read` の値。今の版の記録がなければ null）。素材の欄が試聴のループの
+	 *  長さ超えを出す・波形のループの区間を選ぶのに使う。試聴は /pcm の kura チャンクの値を使う。
+	 */
+	frames: number | null,
+};
+
+/**  「ドット絵として表示」の 3 択。 */
+export type AssetChoiceDto = "auto" | "yes" | "no";
+
+/**  素材の欄の中身。 */
+export type AssetDto = {
+	itemId: number,
+	hash: string,
+	kind: ItemKindDto,
+	ext: string,
+	width: number | null,
+	height: number | null,
+	analysisState: AssetAnalysisStateDto,
+	/**  解析の事実（まだなければ null）。 */
+	facts: AssetFactsDto | null,
+	settings: AssetSettingsDto,
+	effective: AssetEffectiveDto,
+	/**  解析の格子の推定（今のエンジンの版の結果で候補があるときだけ。自動では当てない）。 */
+	gridEstimate: AssetGridEstimateDto | null,
+	/**  フォントのときだけ。 */
+	font: AssetFontDto | null,
+	/**  3D のときだけ。 */
+	model: AssetModelDto | null,
+};
+
+/**  実効値（表示と検索の値）。 */
+export type AssetEffectiveDto = {
+	/**  ドット絵として表示するか（設定 ?? 自動の判定 ?? 偽）。 */
+	pixelArt: boolean,
+	/**  アニメとして回せるか（コマが 2 つ以上か、格子がある）。 */
+	animated: boolean,
+	/**  コマの数（格子があれば帯で使う数）。 */
+	frameCount: number | null,
+};
+
+/**  解析の事実（`media_facts`）。 */
+export type AssetFactsDto = {
+	/**
+	 *  解析できたか（false なら `errorCode`：`unsupported`・`too_large`・`decode`・`crashed`。一覧は bindings の
+	 *  定数 `ANALYSIS_ERROR_CODES`）。
+	 */
+	ok: boolean,
+	errorCode: string | null,
+	/**  読んだデコーダ（形式だけで決めたときは null）。 */
+	decoder: string | null,
+	factsVersion: number,
+	analyzedAt: number,
+	image: AssetImageFactsDto,
+	audio: AssetAudioFactsDto,
+};
+
+/**  フォントの情報。 */
+export type AssetFontDto = {
+	family: string | null,
+	style: string | null,
+	fullName: string | null,
+	postscriptName: string | null,
+	glyphs: number | null,
+	faces: number | null,
+	variable: boolean | null,
+	/**  形式（`ttf`・`otf`・`ttc`・`woff`・`woff2`）。 */
+	format: string | null,
+};
+
+/**  格子の変え方（`"clear"` か `{ set: … }`）。 */
+export type AssetGridChangeDto = "clear" | { set: AssetGridDto };
+
+/**  スプライトシートの格子（`count` は使うコマの数。null はすべて）。 */
+export type AssetGridDto = {
+	cellW: number,
+	cellH: number,
+	offsetX: number,
+	offsetY: number,
+	gapX: number,
+	gapY: number,
+	count: number | null,
+};
+
+/**  解析の格子の推定（`image.sprite_grid` の最良の候補。格子のシートの「推定を使う」が入力欄をこれで埋める）。 */
+export type AssetGridEstimateDto = {
+	/**  推定の格子（`count` は中身のあるセルの数。すべてのセルに中身があれば null＝すべて）。 */
+	grid: AssetGridDto,
+	cols: number,
+	rows: number,
+	/**  中身のあるセルの数。 */
+	filled: number,
+};
+
+/**  画像の事実（計っていないものは null）。 */
+export type AssetImageFactsDto = {
+	alpha: AssetAlphaDto | null,
+	/**  1〜257（257 は 256 色を超える）。 */
+	colors: number | null,
+	visibleColors: number | null,
+	pixelKx: number | null,
+	pixelKy: number | null,
+	pixelLossless: boolean | null,
+	/**  ドット絵の自動の判定。 */
+	pixelArt: boolean | null,
+	pixelRule: number | null,
+	frameCount: number | null,
+};
+
+/**  試聴のループの変え方（`"clear"` か `{ set: { start, end } }`。M13）。 */
+export type AssetLoopChangeDto = "clear" | { set: AssetSpanDto };
+
+/**  3D モデルの情報。 */
+export type AssetModelDto = {
+	vertices: number | null,
+	triangles: number | null,
+	materials: number | null,
+	textures: number | null,
+	meshes: number | null,
+	/**  大きさ（範囲の max − min。x・y・z の順。glb の単位はメートル）。 */
+	size: [(number | null), (number | null), (number | null)] | null,
+	/**  描けない理由（必須の Draco・meshopt・知らない拡張の名前、`skin`）。空なら描ける。 */
+	unsupported: string[],
+};
+
+/**  ピボットの変え方（`"clear"` か `{ set: … }`）。 */
+export type AssetPivotChangeDto = "clear" | { set: AssetPivotDto };
+
+/**  ピボット（画素の座標）。 */
+export type AssetPivotDto = {
+	x: number | null,
+	y: number | null,
+};
+
+/**  利用者の設定（null は自動・設定なし）。 */
+export type AssetSettingsDto = {
+	/**  ドット絵として表示（null は自動）。 */
+	pixelArt: boolean | null,
+	pixelScale: number | null,
+	grid: AssetGridDto | null,
+	/**  格子のアニメのコマの長さ（ms）。 */
+	frameMs: number | null,
+	pivot: AssetPivotDto | null,
+	/**
+	 *  試聴のループ（音声だけ。ファイルは変えない。M13）。試聴と波形のループの区間は、これが長さに収まればこれ、
+	 *  なければファイルのループ点。
+	 */
+	loopRange: AssetSpanDto | null,
+	animTag: string | null,
+	updatedAt: number | null,
+};
+
+/**  素材の設定の変更（省いた項目は変えない）。数の 0 と文字の空は「自動に戻す」。 */
+export type AssetSettingsPatchDto = {
+	/**  ドット絵として表示（自動・はい・いいえ）。 */
+	pixelArt?: AssetChoiceDto | null,
+	/**  倍率（1〜64。0 は自動）。 */
+	pixelScale?: number | null,
+	grid?: AssetGridChangeDto | null,
+	/**  格子のアニメのコマの長さ（ms。0 は自動 = ファイルの長さか 100ms）。 */
+	frameMs?: number | null,
+	pivot?: AssetPivotChangeDto | null,
+	/**  再生するタグ（空文字は自動）。 */
+	animTag?: string | null,
+	/**  試聴のループ（音声だけ。始め < 終わり、長さが分かっていれば終わり ≤ 長さ）。 */
+	loopRange?: AssetLoopChangeDto | null,
+};
+
+/**  フレームの半開区間 [start, end)。 */
+export type AssetSpanDto = {
+	start: number,
+	end: number,
+};
+
+/**  表記義務（必要・任意・不要）。 */
+export type AttributionDto = "required" | "optional" | "none";
+
 /**  DB のバックアップ 1 つ（FR-SYS-03。ADR-121）。 */
 export type BackupDto = {
 	name: string,
 	path: string,
 	createdAt: number,
 	sizeBytes: number,
+};
+
+/**  一括の向き（結果）。 */
+export type BatchActionDto = { type: "overwrite" } | { type: "saveAs"; name: string } | 
+/**  一括 `of` の［元に戻す…］（`saveAs` は元が別名か N → 1、`merge` は N → 1 か）。 */
+{ type: "undo"; of: number; saveAs: boolean; merge: boolean } | 
+/**  N → 1（スプライトシート）。 */
+{ type: "merge"; name: string; sheet: SheetParams };
+
+/**  状態と理由ごとの群。 */
+export type BatchGroupDto = {
+	state: string,
+	code: string | null,
+	items: number[],
+};
+
+/**  一括の向き。 */
+export type BatchModeDto = { type: "overwrite" } | 
+/**  別名（`name` は名前の型。`{名前}` にアイテムの表示名が入る。既定は「{名前} のコピー」）。 */
+{ type: "saveAs"; name: string };
+
+/**  事前チェックの結果（アイテムは ID の列だけ）。 */
+export type BatchPrecheckDto = {
+	/**  確かめた件数（ライブラリにあるもの）。 */
+	total: number,
+	/**  ライブラリにないアイテム（一括は行を入れない）。 */
+	missing: number[],
+	/**  当てる見込み（確かめきれなかったものを含む）。 */
+	apply: number[],
+	skips: PrecheckGroupDto[],
+	/**  当てる側に数えたが確かめきれなかったもの（Busy：形を読めなかった。NoLength：終わりからの秒の長さは当てるときに決まる）。 */
+	unchecked: PrecheckGroupDto[],
+	outputs: OutputGroupDto[],
+	losses: LossGroupDto[],
+	/**  編集済みで、今の中身に続けて当てるもの。 */
+	composed: number[],
+	disk: DiskEstimateDto,
+	memoryPeak: number,
+	memoryBudget: number,
+	bound: BoundExampleDto[],
+	notes: RecipeNote[],
+	/**  N → 1 のシートの見込み（1 件ずつの一括は null）。 */
+	sheet: SheetInfoDto | null,
+};
+
+/**  事前チェックの進み（イベント `batch://precheck`）。 */
+export type BatchPrecheckProgress = {
+	/**  `batch_precheck` に渡した印。 */
+	token: string,
+	done: number,
+	total: number,
+};
+
+/**  一括の頼み（事前チェックと積むで同じ）。 */
+export type BatchRequestDto = {
+	source: RecipeSourceDto,
+	/**  当てるアイテム（選んだ順）。 */
+	items: number[],
+	mode: BatchModeDto,
+	/**  上書きで、保存していない下書きのあるアイテムも含める（初めは外す）。 */
+	includeDrafts: boolean,
+};
+
+/**  一括の結果（結果のシート）。 */
+export type BatchResultDto = {
+	job: number,
+	state: JobStateDto,
+	action: BatchActionDto,
+	/**  当てたレシピの名前（元に戻す一括は null）。 */
+	recipe: string | null,
+	includeDrafts: boolean,
+	total: number,
+	groups: BatchGroupDto[],
+	/**  別名で作ったアイテム。 */
+	created: number[],
+	/**  この一括を元に戻す一括（古い順）。 */
+	undoneBy: number[],
+	/**  元に戻せる件数（0 なら［元に戻す…］を押せない）。 */
+	undoAvailable: number,
+	/**  ジョブの警告（N → 1 で色空間の違う絵を sRGB とみなした、など）。 */
+	warnings: string[],
+};
+
+/**  1 件の行。 */
+export type BatchRowDto = {
+	ord: number,
+	itemId: number,
+	state: string,
+	code: string | null,
+	message: string | null,
+	versionId: number | null,
+	outItemId: number | null,
+	finishedAt: number | null,
+};
+
+/**  引数をアイテムの値に結び付けられる出どころの種類（M14 段 1。レシピの結び付け）。 */
+export type BindKind = 
+/**  素材の設定の格子（`ParamKind::Grid` の引数）。 */
+"grid" | 
+/**  素材の設定のピボット（`ParamKind::Point` の引数）。 */
+"pivot" | 
+/**  素材の設定の試聴のループ（`ParamKind::FrameRange` の引数）。 */
+"loop" | 
+/**  素材の設定のコマの時間（単位 ms の `ParamKind::Int` の引数）。 */
+"frameMs" | 
+/**  秒（ノードの入力のレートでフレームに直す。単位 samples の `ParamKind::Int` か `ParamKind::FrameRange` の片方）。 */
+"time";
+
+/**  レシピの結び付け 1 つ：ノード `node` の引数 `param`（区間なら片方 `part`）を、アイテムの値 `from` で上書きする。 */
+export type Binding = Binding_Serialize | Binding_Deserialize;
+
+/**  レシピの結び付け 1 つ：ノード `node` の引数 `param`（区間なら片方 `part`）を、アイテムの値 `from` で上書きする。 */
+export type Binding_Deserialize = {
+	/**  レシピの文書のノード。 */
+	node: NodeId,
+	/**  引数の名前（`ParamSpec.key`）。 */
+	param: string,
+	/**  区間（`FrameRange`）の片方だけを結ぶとき。 */
+	part?: RangePart | null,
+	from: Source,
+};
+
+/**  レシピの結び付け 1 つ：ノード `node` の引数 `param`（区間なら片方 `part`）を、アイテムの値 `from` で上書きする。 */
+export type Binding_Serialize = {
+	/**  レシピの文書のノード。 */
+	node: NodeId,
+	/**  引数の名前（`ParamSpec.key`）。 */
+	param: string,
+	/**  区間（`FrameRange`）の片方だけを結ぶとき。 */
+	part?: RangePart | null,
+	from: Source,
+};
+
+/**  結び付けで読む値の例。 */
+export type BoundExampleDto = {
+	itemId: number,
+	/**  読んだ値と書いた値（`recipe::bound_json` の形の JSON の文字列）。 */
+	boundJson: string,
 };
 
 /**  URL に一致したキャプチャのルール。 */
@@ -353,6 +1014,13 @@ export type ClauseDto = {
 	field: string | null,
 };
 
+/**  確定のしかた。 */
+export type CommitMode = 
+/**  1 手にする。 */
+"step" | 
+/**  同じ引数を続けて変える手（キーボードの矢印・数値の入力）を 1 手にまとめる。まとめられない手は `Step` と同じ。 */
+"merge";
+
 /**  入れ物（`kura_core::playback::Container`）。 */
 export type ContainerDto = "mp4" | "webm" | "ogg" | "mp3" | "flac" | "wav" | "aiff" | "aac" | "other";
 
@@ -362,11 +1030,130 @@ export type CookieSourceDto = "none" | "firefox" | "safari" | "chrome";
 export type CoverDto = {
 	itemId: number,
 	hash: string,
-	kind: string,
+	kind: ItemKindDto,
 	thumbState: string,
 	width: number | null,
 	height: number | null,
+	/**  サムネイルを作り直した回数（アイテムの概要の `thumbRev` と同じ）。 */
+	thumbRev: number,
+	/**  解析の進み具合（`pending` なら解析のジョブが進んだら取り直す）。 */
+	analysisState: AssetAnalysisStateDto,
+	/**  解析で分かった透過（市松模様）。 */
+	alpha: AssetAlphaDto | null,
+	/**  ドット絵として表示するか（実効値）。 */
+	pixelArt: boolean,
 };
+
+/**  警告の 1 件（未設定・元が消えた）。 */
+export type CreditFlagDto = {
+	item: number,
+	used: number[],
+};
+
+/**  集めたクレジットの 1 行（同じ表記をまとめたもの）。 */
+export type CreditLineDto = {
+	licenseId: number,
+	work: string | null,
+	author: string | null,
+	/**  出典（クレジットの URL、なければ取り込み元の URL）。 */
+	url: string | null,
+	credit: string | null,
+	/**  このクレジットを持つアイテム（来歴の元を含む）。 */
+	items: number[],
+	/**  それにたどり着いた、使ったアイテム。 */
+	used: number[],
+};
+
+/**  まとめて付ける項目（省いた項目は変えない。文の空文字は消す）。 */
+export type CreditPatchDto = {
+	license?: LicenseChoiceDto | null,
+	author?: string | null,
+	work?: string | null,
+	url?: string | null,
+	credit?: string | null,
+};
+
+/**  インスペクタの表記の見本（M15 段 6）。 */
+export type CreditPreviewDto = {
+	/**  組んだ行（テキスト。同じ文は 1 つ）。 */
+	lines: string[],
+	/**  このアイテム自身のライセンスが未設定。 */
+	unset: boolean,
+	/**  来歴の元のうち、ライセンスが未設定のものの数。 */
+	unsetSources: number,
+	/**  来歴の元が消えて、たどれないものの数。 */
+	lost: number,
+};
+
+/**  複数選択のクレジットの集計。 */
+export type CreditSummaryDto = {
+	/**  対象のアイテムの数（ユニットはメンバーを数える）。 */
+	count: number,
+	licenseId: SharedDto<number>,
+	author: SharedDto<string>,
+	work: SharedDto<string>,
+	url: SharedDto<string>,
+	credit: SharedDto<string>,
+};
+
+/**  集めたクレジット（行はライセンスの並び → 作品・作者・出典・表記の順）。 */
+export type CreditsDto = {
+	lines: CreditLineDto[],
+	/**  行が使うライセンス（並びの順）。 */
+	licenses: LicenseDto[],
+	/**  来歴の元がなく、ライセンスも未設定のアイテム。 */
+	unset: CreditFlagDto[],
+	/**  来歴の元が消えて、たどれないアイテム。 */
+	lost: CreditFlagDto[],
+};
+
+/**  一覧の書式。 */
+export type CreditsFormatDto = "markdown" | "text";
+
+/**  一覧の言葉。 */
+export type CreditsLangDto = "ja" | "en";
+
+/**
+ *  一覧の作り方（どの項目も渡す。画面の既定は `DEFAULT_CREDITS_RENDER`：日本語・Markdown・任意は載せる・不要は載せない・素材の名前は
+ *  添えない）。
+ */
+export type CreditsRenderDto = {
+	lang: CreditsLangDto,
+	format: CreditsFormatDto,
+	includeOptional: boolean,
+	includeNone: boolean,
+	listItems: boolean,
+};
+
+/**  クレジットの一覧の範囲。 */
+export type CreditsScopeDto = 
+/**  登録したプロジェクトで今使っている素材。 */
+{ type: "project"; id: number } | 
+/**  選んだアイテムとユニット（メンバー全員）。 */
+{ type: "items"; itemIds: number[]; unitIds: number[] };
+
+/**  まとめて付けた結果。 */
+export type CreditsSetDto = {
+	/**  対象のアイテムの数（ユニットはメンバーを数える。ない ID は数えない）。 */
+	items: number,
+	/**  変えた件数（中身が同じものは数えない）。 */
+	changed: number,
+};
+
+/**  作った一覧（文と数）。 */
+export type CreditsTextDto = {
+	text: string,
+	/**  載せた行の数。 */
+	lines: number,
+	/**  載せなかった行の数（任意・不要）。 */
+	omittedOptional: number,
+	omittedNone: number,
+	/**  要確認の件数（未設定・元が消えた・記入が足りない）。 */
+	warnings: number,
+};
+
+/**  読み方の設定（出力に効くので文書に入れる）。形式ごとの項目は段 2 以降で足す。 */
+export type DecodeOptions = Record<string, never>;
 
 /**  URL の判定の結果。 */
 export type DetectionDto = {
@@ -385,6 +1172,24 @@ export type DetectionDto = {
 	/**  前に同じものをダウンロードしていれば、そのとき（「再ダウンロード」を選べるようにする。ADR-132）。 */
 	previous: PreviousDownloadDto | null,
 };
+
+/**  32 バイトのダイジェスト。文字列では小文字の 16 進。 */
+export type Digest = string;
+
+/**  ディスクの目安（バイト）。 */
+export type DiskEstimateDto = {
+	/**  新しく書くファイルの目安（元の大きさを値の大きさの比で伸ばしたもの）。 */
+	newBytes: number,
+	/**  上書きで置き換わる今のファイル（7 日残してから片付ける）。 */
+	replacedBytes: number,
+};
+
+/**  ディザの種類。 */
+export type Dither = 
+/**  足さない（偶数への丸めだけ）。 */
+"none" | 
+/**  ±1 LSB の三角分布の雑音（TPDF）。 */
+"tpdf";
 
 /**  ダウンロードの一覧の 1 件（ジョブの入力と結果を読んだもの）。 */
 export type DownloadJobDto = {
@@ -441,8 +1246,756 @@ export type DownloadRuleDto = {
 	args: string[],
 };
 
+/**
+ *  ドラッグアウトが終わった知らせ（渡した項目と、落とす先が求めたのに渡さなかった項目、渡したフォルダの中で作れなかった
+ *  ファイルの数）。
+ */
+export type DragOutEnded = {
+	/**  一時置き場のこの回のフォルダ（`dragout_start` の `dir`）。 */
+	dir: string,
+	delivered: number,
+	/**  落とす先が求めたのに渡さなかった項目（作れなかった・待ちきれなかった）。 */
+	missed: number,
+	/**  渡したフォルダ（ユニット）の中で作れなかったファイル。 */
+	incomplete: number,
+};
+
+/**  ドラッグアウトを始めた結果。 */
+export type DragOutStartDto = {
+	/**  OS のドラッグを始めた（マウスのボタンが離れていれば false）。 */
+	started: boolean,
+	/**  一時置き場のこの回のフォルダ（Kura 自身に落としたファイルを見分ける）。 */
+	dir: string,
+	/**  飛ばしたアイテムの数（ゴミ箱の中・見つからない）。 */
+	skipped: number,
+};
+
+/**  持ち出し先のプロジェクト。 */
+export type DragOutTargetDto = {
+	/**  選んだプロジェクト（選んでいなければ null）。 */
+	chosen: number | null,
+	/**  名前と形式に使うプロジェクト（選んでいなければ、登録が 1 つならそれ）。null なら名前も形式もそのまま。 */
+	effective: number | null,
+};
+
 /**  重複の扱い。 */
 export type DuplicatePolicyDto = "addMemberships" | "ignore";
+
+/**
+ *  文書への変更 1 つ。JSON（エディタとの通信。M12）では `type` で種類を分ける（`{"type":"appendItems","node":3,…}`。
+ *  項目は camelCase、種は 10 進の文字列）。
+ */
+export type Edit = Edit_Serialize | Edit_Deserialize;
+
+/**  音声の長さ（フレームと標本化周波数）。 */
+export type EditAudioLengthDto = {
+	frames: number,
+	rate: number,
+};
+
+/**  保存の前（アイテムの今）と後の音声の長さ。 */
+export type EditAudioLengthsDto = {
+	before: EditAudioLengthDto,
+	after: EditAudioLengthDto,
+};
+
+/**  ノードの引数の位置を出力のフレームに写したもの。 */
+export type EditAudioMarksDto = 
+/**  切り詰めの枠（このノードを外して入力を出しているときの位置）。 */
+{ type: "trim"; start: number; end: number } | 
+/**
+ *  フェード。`inEnd`・`outStart` は三角の位置（フェードインの終わり・フェードアウトの始まり）。`inStart`・`outEnd` は
+ *  曲線を引く見かけの始まり・終わり（フェードの区間の写しを延ばした位置。符号つきで、下流で頭・終わりを切られていれば
+ *  出力の範囲の外）。どれも長さ 0・写せなければ null（`inStart`・`outEnd` が null なら曲線を描かない）。
+ */
+{ type: "fade"; inStart: number | null; inEnd: number | null; outStart: number | null; outEnd: number | null } | 
+/**  ループの区間。 */
+{ type: "loop"; start: number; end: number };
+
+/**  出力につながるノード 1 つ（入力 → 出力の順）。 */
+export type EditAudioNodeDto = {
+	id: number,
+	op: string,
+	enabled: boolean,
+	/**  入力 0 のレートと長さ（引数の欄で時間と標本を変換する）。 */
+	inRate: number,
+	inFrames: number,
+	/**  ハンドルの位置（写せない・印のない操作は null）。 */
+	marks: EditAudioMarksDto | null,
+};
+
+/**  音声の元の形。 */
+export type EditAudioSourceDto = {
+	rate: number,
+	channels: number,
+	frames: number,
+	/**  元のファイルの標本のビット数（分かれば）と浮動小数か。 */
+	bits: number | null,
+	float: boolean,
+	/**  元のループ点。 */
+	loop: EditSpanDto | null,
+	/**  値を読んだデコーダの識別子。 */
+	decoder: string,
+	/**  遅延の源で開いた（全体を読んでいない）。 */
+	lazy: boolean,
+};
+
+/**  音声の表示した結果（`/edit/{session}/{rev}/pcm/{a}-{b}` で、`valid` の区間の PCM を取る）。 */
+export type EditAudioViewDto = {
+	rev: number,
+	/**  今の出力のレート・チャンネル数・長さ（フレーム）。 */
+	rate: number,
+	channels: number,
+	frames: number,
+	/**  今の出力のループ点（終わりは含まない）。 */
+	loop: EditSpanDto | null,
+	markers: EditMarkerDto[],
+	/**  出力の指紋（量子化を含む）の先頭 8 バイトの 16 進。PCM の kura チャンクのデコーダ `kura-edit/1:{samplesId}`。 */
+	samplesId: string,
+	/**  前回の表示から変わった区間（出力のフレーム。この区間の PCM・波形を捨てる）。 */
+	changed: EditSpansChangeDto,
+	metaChanged: boolean,
+	/**  公開した表示の値の有効な区間（PCM を取れる所）。 */
+	valid: EditSpanDto[],
+	/**  波形の段の状態。 */
+	peaks: EditPeaksInfoDto,
+	/**  出力のフレームを元のフレームへ写す区分（写せなければ null：聞き比べを出さない）。 */
+	sourceMap: EditSourcePieceDto[] | null,
+	/**  出力につながるノード。 */
+	nodes: EditAudioNodeDto[],
+	/**  ラウドネスの状態（覚えているもの。`edit_measure` で頼む）。 */
+	loudness: EditLoudnessStateDto,
+	/**  裏の仕事が残っている（手が止まったら `work: true` で頼み直す）。 */
+	work: boolean,
+	/**
+	 *  この `work: true` の頼みでは、誤り・予算の断りのために裏の仕事が 1 チャンクも進まなかった（中止は含めない）。連鎖をやめて
+	 *  待ってから頼み直す。
+	 */
+	workStalled: boolean,
+	warnings: Issue[],
+	drawnNodes: number,
+	/**  描くのにかかった時間（ミリ秒）。 */
+	ms: number | null,
+};
+
+/**  音声の表示の要求。区間はどれも出力のフレーム。 */
+export type EditAudioViewportDto = {
+	/**  見えている区間（波形の段の作り直しを見えている所から進める。描く範囲には入れない）。 */
+	visible: EditSpanDto | null,
+	/**  描いて配ってほしい区間（4 つまで。先のものほど優先。`/edit/{session}/{rev}/pcm/…` で取る区間）。 */
+	spans: EditSpanDto[],
+	/**  操作中（ドラッグの途中）：波形の段を直さない・裏の仕事をしない。 */
+	interacting: boolean,
+	/**  編集中のノード（キャッシュに固定する）。 */
+	focus: number | null,
+	/**  裏の仕事（波形の段の作り直し・ラウドネスの計り）を少し進める。 */
+	work: boolean,
+};
+
+/**  変わったタイル。 */
+export type EditChangedDto = 
+/**  すべて取り直す（最初の表示・段や形が変わった）。 */
+{ type: "all" } | 
+/**  このタイルだけ取り直す（空なら何も変わっていない）。 */
+{ type: "tiles"; frames: EditFrameTilesDto[] };
+
+/**  文書の差分（前に返した文書から）。 */
+export type EditDocDeltaDto = EditDocDeltaDto_Serialize | EditDocDeltaDto_Deserialize;
+
+/**  文書の差分（前に返した文書から）。 */
+export type EditDocDeltaDto_Deserialize = {
+	/**  差分の元の rev（null は全体：`nodes` にすべてのノード）。 */
+	base: number | null,
+	/**  今のノードの並び。ここにないノードは消えた。 */
+	order: number[],
+	/**  足した・変わったノード。 */
+	nodes: EditNodeDto[],
+	/**  出力（変わったときだけ）。 */
+	outputs: OutputSpec_Deserialize[] | null,
+};
+
+/**  文書の差分（前に返した文書から）。 */
+export type EditDocDeltaDto_Serialize = {
+	/**  差分の元の rev（null は全体：`nodes` にすべてのノード）。 */
+	base: number | null,
+	/**  今のノードの並び。ここにないノードは消えた。 */
+	order: number[],
+	/**  足した・変わったノード。 */
+	nodes: EditNodeDto[],
+	/**  出力（変わったときだけ）。 */
+	outputs: OutputSpec_Serialize[] | null,
+};
+
+/**  下書きの有無。 */
+export type EditDraftDto = {
+	exists: boolean,
+	/**  このまま保存できる（偽なら、保存すると Conflict：置いたあとに別の保存でアイテムが変わった）。 */
+	fresh: boolean,
+	updatedAt: number | null,
+	/**  下書きから開いた。 */
+	opened: boolean,
+};
+
+/**  書ける形式の一覧（形式の表の順で、アイテムの種類の行すべて）。 */
+export type EditFormatsDto = {
+	formats: EditWritableFormatDto[],
+	/**
+	 *  今の出力の形式（Rust が解いた形式：「元と同じ」は元の形式（アイテムの今の拡張子ではない）、ほかはその形式）。保存が
+	 *  `FormatUnavailable` で断られた直後なら、断った形式。
+	 */
+	current: string,
+	/**  今の出力の形式に書けないときに保存が使う形式（音声は Ogg Vorbis、書けなければ WAV。画像は PNG）。書ければ null。 */
+	fallback: string | null,
+};
+
+/**  フレームの矩形（段の座標）と表示時間。 */
+export type EditFrameDto = {
+	index: number,
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	durationMs: number | null,
+};
+
+/**  フレームの変わったタイル（`[tx, ty]`。フレームの画像の座標）。 */
+export type EditFrameTilesDto = {
+	frame: number,
+	tiles: ([number, number])[],
+};
+
+/**  音声のハンドル（どれも表示している出力のフレーム）。 */
+export type EditHandleDto = 
+/**  切り詰めの枠 `[start, end)`。 */
+{ type: "trim"; start: number; end: number } | 
+/**  フェードインの終わり。 */
+{ type: "fadeIn"; end: number } | 
+/**  フェードアウトの始まり。 */
+{ type: "fadeOut"; start: number } | 
+/**  ループの区間（null は消す）。 */
+{ type: "loop"; range: EditSpanDto | null };
+
+/**  ハンドルの手の当て方（`preview` はドラッグの途中、`step`・`merge` は確定）。 */
+export type EditHandleModeDto = "preview" | "step" | "merge";
+
+/**  画像の表示した結果。 */
+export type EditImageViewDto = {
+	rev: number,
+	/**  描いた段（0 は等倍。段 k は各軸 ⌈n/2^k⌉）。タイルの URL の `{level}`。 */
+	level: number,
+	/**  求めた段から段 0 に落ちた理由。 */
+	fallback: string | null,
+	/**  等倍の出力の大きさ。 */
+	fullWidth: number,
+	fullHeight: number,
+	/**  段のキャンバスの大きさ。 */
+	width: number,
+	height: number,
+	frames: EditFrameDto[],
+	/**  画素の形式（`rgba8` など）。タイルは形式によらず RGBA8。 */
+	format: string | null,
+	/**  タイルの 1 辺（256）。 */
+	tile: number,
+	changed: EditChangedDto,
+	metaChanged: boolean,
+	warnings: Issue[],
+	drawnNodes: number,
+	/**  描くのにかかった時間（ミリ秒）。 */
+	ms: number | null,
+};
+
+/**  画像の表示の要求。 */
+export type EditImageViewportDto = {
+	/**  表示するフレーム（1 枚の画像は 0）。 */
+	frame: number,
+	/**  表示する範囲（等倍のキャンバスの座標）。null は全体。 */
+	rect: EditRectDto | null,
+	/**  等倍の 1 画素あたりの装置の画素（拡大率 × devicePixelRatio）。段は Rust が決める。 */
+	scale: number | null,
+	/**  操作中（ドラッグ・ズームの途中）なら 1 段粗く描く。 */
+	interacting: boolean,
+	/**  編集中のノード（キャッシュに固定する）。 */
+	focus: number | null,
+};
+
+/**  追記だけの配列の引数の数。 */
+export type EditLogDto = {
+	field: string,
+	count: number,
+};
+
+/**  ラウドネスの値（`AssetAudioFactsDto` の同じ名前の欄と同じ意味。計れない値は null）。 */
+export type EditLoudnessDto = {
+	/**  積分ラウドネス（LUFS）。 */
+	loudness: number | null,
+	/**  積分を計れなかった理由（`tooShort`・`silent`・`belowGate`・`lowRate`・`nonFinite`）。 */
+	loudnessReason: string | null,
+	/**  ラウドネスレンジ（LU）。 */
+	loudnessRange: number | null,
+	/**  トゥルーピーク（dBTP）。 */
+	truePeak: number | null,
+	/**  サンプルピーク（dBFS）。 */
+	samplePeak: number | null,
+};
+
+/**  ラウドネスの状態（`samplesId` は計った出力の指紋。今の表示の `samplesId` と違えば古い）。 */
+export type EditLoudnessStateDto = 
+/**  まだ計っていない（`edit_measure` で頼む）。 */
+{ type: "idle" } | 
+/**  計っている（裏の仕事で進む）。 */
+{ type: "measuring"; samplesId: string; progress: number | null } | { type: "ready"; samplesId: string; loudness: EditLoudnessDto } | { type: "failed"; samplesId: string; message: string };
+
+/**  マーカー（出力のフレームの位置と名前）。 */
+export type EditMarkerDto = {
+	pos: number,
+	name: string,
+};
+
+/**  ノードの要約。 */
+export type EditNodeDto = {
+	id: number,
+	op: string,
+	v: number,
+	enabled: boolean,
+	/**  正規の形の引数（追記だけの配列は `[]`。要素の数は `log`）。 */
+	params: JsonValue,
+	log: EditLogDto | null,
+};
+
+/**  開いた結果。 */
+export type EditOpenedDto = EditOpenedDto_Serialize | EditOpenedDto_Deserialize;
+
+/**  開いた結果。 */
+export type EditOpenedDto_Deserialize = {
+	/**  セッション（kura:// の `/edit/{session}/…` と、ほかのコマンドに渡す）。 */
+	session: string,
+	itemId: number,
+	baseVersion: number,
+	source: EditSourceDto,
+	/**
+	 *  元のファイルの形式の ID（`png`・`mp3` など。出力の形式の「元と同じ」が書く形式で、アイテムの今の拡張子とは違うことが
+	 *  ある：HEIC の元を PNG で保存したあとなど）。
+	 */
+	originalFormat: string,
+	/**  ドット絵として表示する（段は 0、拡大は最近傍・装置の画素の整数倍）。 */
+	pixelArt: boolean,
+	draft: EditDraftDto,
+	/**  開いたときの状態・文書（全体）・表示。 */
+	result: EditStepResultDto_Deserialize,
+	/**  レシピの見本のモードで開いた（`edit_open_recipe`）。 */
+	recipe: EditRecipeDto_Deserialize | null,
+};
+
+/**  開いた結果。 */
+export type EditOpenedDto_Serialize = {
+	/**  セッション（kura:// の `/edit/{session}/…` と、ほかのコマンドに渡す）。 */
+	session: string,
+	itemId: number,
+	baseVersion: number,
+	source: EditSourceDto,
+	/**
+	 *  元のファイルの形式の ID（`png`・`mp3` など。出力の形式の「元と同じ」が書く形式で、アイテムの今の拡張子とは違うことが
+	 *  ある：HEIC の元を PNG で保存したあとなど）。
+	 */
+	originalFormat: string,
+	/**  ドット絵として表示する（段は 0、拡大は最近傍・装置の画素の整数倍）。 */
+	pixelArt: boolean,
+	draft: EditDraftDto,
+	/**  開いたときの状態・文書（全体）・表示。 */
+	result: EditStepResultDto_Serialize,
+	/**  レシピの見本のモードで開いた（`edit_open_recipe`）。 */
+	recipe: EditRecipeDto_Serialize | null,
+};
+
+/**  波形の段の状態（`/edit/{session}/{rev}/peaks/{bin}/{tile}` の `{rev}` は、この `rev`＝段の世代）。 */
+export type EditPeaksInfoDto = {
+	/**
+	 *  公開した今の段の世代（`/edit/{s}/{rev}/peaks/…` に使う番号。なければ null）。文書の rev とは別の数で、セッションの
+	 *  中で公開のたびに増え、同じ番号のタイルの中身は変わらない（immutable）。直している途中（`pending`）は、前の文書の段か、
+	 *  開いたときの仮の段（ライブラリの解析の段）のことがある。
+	 */
+	rev: number | null,
+	/**  その段のレート・チャンネル数・長さ。 */
+	rate: number,
+	channels: number,
+	frames: number,
+	/**  その段が持つ段のビンのフレーム数（細かい順。ライブラリの粗い段だけを仮に出しているときはその段だけ）。 */
+	bins: number[],
+	/**  タイル 1 枚のビンの数（1,024）。 */
+	tileBins: number,
+	/**  前に返した世代の段から変わった区間（この区間に掛かるタイルを取り直す）。 */
+	changed: EditSpansChangeDto,
+	/**  直している途中（古い段・仮の段を出している。手が止まったら `work: true` で頼み直す）。 */
+	pending: boolean,
+};
+
+/**  終わっていない保存のジョブ 1 件。 */
+export type EditPendingSaveDto = {
+	job: number,
+	itemId: number,
+	/**  保存しているアイテムの表示名（別名で保存では元にしたアイテム。行がなければ null）。 */
+	itemTitle: string | null,
+	mode: EditPendingSaveModeDto,
+	state: JobStateDto,
+	progress: number | null,
+	message: string | null,
+};
+
+/**  終わっていない保存のジョブの向き。 */
+export type EditPendingSaveModeDto = { type: "overwrite" } | 
+/**  別名で保存（新しいアイテムの表示名）。 */
+{ type: "saveAs"; title: string } | { type: "revert" };
+
+/**  断り・失敗（指摘はノード・引数つき）。 */
+export type EditProblemDto = {
+	code: AppErrorCode,
+	message: string,
+	issues: Issue[],
+};
+
+/**
+ *  レシピの見本のモードの印（M14 段 7）：見本のアイテムの元にレシピを継ぎ足して開いた。下書きは置かず、アイテムに保存しない
+ *  （保存は `recipe_replace` でレシピへ）。
+ */
+export type EditRecipeDto = EditRecipeDto_Serialize | EditRecipeDto_Deserialize;
+
+/**
+ *  レシピの見本のモードの印（M14 段 7）：見本のアイテムの元にレシピを継ぎ足して開いた。下書きは置かず、アイテムに保存しない
+ *  （保存は `recipe_replace` でレシピへ）。
+ */
+export type EditRecipeDto_Deserialize = {
+	id: number,
+	name: string,
+	description: string,
+	/**  レシピの結び付け（ノードはエディタの文書の ID に付け替えたもの）。 */
+	bindings: Binding_Deserialize[],
+	/**  レシピが出力の形式を決めている（「元と同じ」でない）。 */
+	withFormat: boolean,
+};
+
+/**
+ *  レシピの見本のモードの印（M14 段 7）：見本のアイテムの元にレシピを継ぎ足して開いた。下書きは置かず、アイテムに保存しない
+ *  （保存は `recipe_replace` でレシピへ）。
+ */
+export type EditRecipeDto_Serialize = {
+	id: number,
+	name: string,
+	description: string,
+	/**  レシピの結び付け（ノードはエディタの文書の ID に付け替えたもの）。 */
+	bindings: Binding_Serialize[],
+	/**  レシピが出力の形式を決めている（「元と同じ」でない）。 */
+	withFormat: boolean,
+};
+
+/**  矩形（等倍のキャンバスの座標）。 */
+export type EditRectDto = {
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+};
+
+/**  断った手（それより前の手は当たり、後の手は当てていない）。 */
+export type EditRejectedDto = {
+	index: number,
+	problem: EditProblemDto,
+};
+
+/**  スポイトで拾った 1 画素。 */
+export type EditSampleDto = {
+	/**  ストレートの RGBA8。 */
+	rgba: [number, number, number, number],
+	/**  パレットの番号（Indexed8）。 */
+	index: number | null,
+};
+
+/**  保存の向き。 */
+export type EditSaveModeDto = 
+/**  上書き（アイテム ID を保ったまま版を足す）。 */
+{ type: "overwrite" } | 
+/**  別名で保存（新しいアイテム。`stem` は元のファイル名の語幹、拡張子は出力の形式で決まる）。 */
+{ type: "saveAs"; title: string; stem: string } | 
+/**  版 `to` に戻す（0 が元）。終わったら `status.needsReopen` が真になるので開き直す。 */
+{ type: "revert"; to: number };
+
+/**  保存を積んだ結果。 */
+export type EditSaveStartedDto = EditSaveStartedDto_Serialize | EditSaveStartedDto_Deserialize;
+
+/**  保存を積んだ結果。 */
+export type EditSaveStartedDto_Deserialize = {
+	/**  保存のジョブ（進み具合はジョブのイベント）。 */
+	job: number,
+	status: EditStatusDto,
+	/**  出力の形式を変えたときの文書の差分。 */
+	doc: EditDocDeltaDto_Deserialize,
+	/**
+	 *  音声の上書き・版に戻すの前後の長さ（素材の設定が新しい長さに合うかを比べる。ms では 1 ms 未満の切り詰めもレート変換も
+	 *  同じになる）。画像・別名は null。文書を描けなくても null。
+	 */
+	lengths: EditAudioLengthsDto | null,
+};
+
+/**  保存を積んだ結果。 */
+export type EditSaveStartedDto_Serialize = {
+	/**  保存のジョブ（進み具合はジョブのイベント）。 */
+	job: number,
+	status: EditStatusDto,
+	/**  出力の形式を変えたときの文書の差分。 */
+	doc: EditDocDeltaDto_Serialize,
+	/**
+	 *  音声の上書き・版に戻すの前後の長さ（素材の設定が新しい長さに合うかを比べる。ms では 1 ms 未満の切り詰めもレート変換も
+	 *  同じになる）。画像・別名は null。文書を描けなくても null。
+	 */
+	lengths: EditAudioLengthsDto | null,
+};
+
+/**  ゼロ交差に寄せた位置。 */
+export type EditSnapDto = {
+	/**  寄せた位置（見つからなければ頼んだ位置）。 */
+	frame: number,
+	found: boolean,
+};
+
+/**  元の形。 */
+export type EditSourceDto = {
+	/**  `image`・`frames`・`audio`。 */
+	kind: string,
+	width: number,
+	height: number,
+	frames: number | null,
+	/**  画素の形式（`rgba8`・`indexed8` など）。ファイルの形式ではない（元のファイルの形式は `EditOpenedDto.originalFormat`）。 */
+	format: string | null,
+	/**  音声の元（音声だけ）。 */
+	audio: EditAudioSourceDto | null,
+};
+
+/**  元への写しの 1 区分（出力の `[outStart, outEnd)` は元の `inStart + round((out − outStart) × inRate / outRate)`）。 */
+export type EditSourcePieceDto = {
+	outStart: number,
+	outEnd: number,
+	inStart: number,
+	inRate: number,
+	outRate: number,
+};
+
+/**  区間（フレームの半開区間 [start, end)）。 */
+export type EditSpanDto = {
+	start: number,
+	end: number,
+};
+
+/**  出力のフレームの区間の変わり。 */
+export type EditSpansChangeDto = 
+/**  すべて取り直す（最初の表示・形が変わった）。 */
+{ type: "all" } | 
+/**  この区間だけ取り直す（空なら何も変わっていない）。 */
+{ type: "spans"; spans: EditSpanDto[] };
+
+/**  エディタの状態。 */
+export type EditStatusDto = {
+	/**  今の文書の番号（仮の値があればその番号）。タイルはこの番号で取る。 */
+	rev: number,
+	/**  確定した頭の番号。 */
+	head: number,
+	provisional: boolean,
+	canUndo: boolean,
+	canRedo: boolean,
+	/**  確定した頭が保存したものと違う（閉じるときに確かめる）。 */
+	dirty: boolean,
+	/**  動いている保存のジョブ（終わったら `edit_view` で状態を取り直す）。 */
+	saving: number | null,
+	/**  版に戻したので開き直す。 */
+	needsReopen: boolean,
+};
+
+/**  手 1 つ。 */
+export type EditStepDto = EditStepDto_Serialize | EditStepDto_Deserialize;
+
+/**  手 1 つ。 */
+export type EditStepDto_Deserialize = 
+/**  確定する（`merge` は同じ引数を続けて変える手を 1 手にまとめる：キーボードの矢印・数値の入力）。 */
+({ type: "commit"; edit: Edit_Deserialize; mode: CommitMode }) & { actions?: never; handle?: never; node?: never } | 
+/**  仮の値（スライダー・ドラッグの途中。履歴に入らない）。 */
+({ type: "preview"; edit: Edit_Deserialize }) & { actions?: never; handle?: never; mode?: never; node?: never } | 
+/**  仮の値を確定する（ドラッグを離したら `step`）。 */
+({ type: "commitPreview"; mode: CommitMode }) & { actions?: never; edit?: never; handle?: never; node?: never } | 
+/**  仮の値を捨てる。 */
+({ type: "cancelPreview" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | ({ type: "undo" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | ({ type: "redo" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | 
+/**  まとめている途中の手を閉じる（blur・Enter）。 */
+({ type: "seal" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | 
+/**  描画の動作（`paint.actions` の要素）を 1 手で足す：末尾が有効な `paint.actions` ならそこへ追記、ほかなら末尾に足す。 */
+({ type: "paint"; actions: JsonValue[] }) & { edit?: never; handle?: never; mode?: never; node?: never } | 
+/**
+ *  音声のハンドル（表示している出力のフレーム）を、ノード `node` の引数にする（なければ末尾に足す）。Rust が下流の時間の
+ *  写しを逆にたどってノードの座標にする。外したノードは有効に戻す。写せなければ断る。
+ */
+({ type: "handle"; handle: EditHandleDto; node: number | null; mode: EditHandleModeDto }) & { actions?: never; edit?: never };
+
+/**  手 1 つ。 */
+export type EditStepDto_Serialize = 
+/**  確定する（`merge` は同じ引数を続けて変える手を 1 手にまとめる：キーボードの矢印・数値の入力）。 */
+({ type: "commit"; edit: Edit_Serialize; mode: CommitMode }) & { actions?: never; handle?: never; node?: never } | 
+/**  仮の値（スライダー・ドラッグの途中。履歴に入らない）。 */
+({ type: "preview"; edit: Edit_Serialize }) & { actions?: never; handle?: never; mode?: never; node?: never } | 
+/**  仮の値を確定する（ドラッグを離したら `step`）。 */
+({ type: "commitPreview"; mode: CommitMode }) & { actions?: never; edit?: never; handle?: never; node?: never } | 
+/**  仮の値を捨てる。 */
+({ type: "cancelPreview" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | ({ type: "undo" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | ({ type: "redo" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | 
+/**  まとめている途中の手を閉じる（blur・Enter）。 */
+({ type: "seal" }) & { actions?: never; edit?: never; handle?: never; mode?: never; node?: never } | 
+/**  描画の動作（`paint.actions` の要素）を 1 手で足す：末尾が有効な `paint.actions` ならそこへ追記、ほかなら末尾に足す。 */
+({ type: "paint"; actions: JsonValue[] }) & { edit?: never; handle?: never; mode?: never; node?: never } | 
+/**
+ *  音声のハンドル（表示している出力のフレーム）を、ノード `node` の引数にする（なければ末尾に足す）。Rust が下流の時間の
+ *  写しを逆にたどってノードの座標にする。外したノードは有効に戻す。写せなければ断る。
+ */
+({ type: "handle"; handle: EditHandleDto; node: number | null; mode: EditHandleModeDto }) & { actions?: never; edit?: never };
+
+/**  手（と表示）の結果。 */
+export type EditStepResultDto = EditStepResultDto_Serialize | EditStepResultDto_Deserialize;
+
+/**  手（と表示）の結果。 */
+export type EditStepResultDto_Deserialize = {
+	status: EditStatusDto,
+	/**  足したノード。 */
+	created: number[],
+	rejected: EditRejectedDto | null,
+	doc: EditDocDeltaDto_Deserialize,
+	view: EditViewOutcomeDto,
+	/**  知らせ（保存が終わった・失敗した、など）。 */
+	notices: string[],
+};
+
+/**  手（と表示）の結果。 */
+export type EditStepResultDto_Serialize = {
+	status: EditStatusDto,
+	/**  足したノード。 */
+	created: number[],
+	rejected: EditRejectedDto | null,
+	doc: EditDocDeltaDto_Serialize,
+	view: EditViewOutcomeDto,
+	/**  知らせ（保存が終わった・失敗した、など）。 */
+	notices: string[],
+};
+
+/**  版の一覧の行。 */
+export type EditVersionDto = {
+	version: number,
+	/**  `original`・`edit`・`revert`。 */
+	kind: string,
+	revertTo: number | null,
+	ext: string,
+	format: string | null,
+	sizeBytes: number,
+	width: number | null,
+	height: number | null,
+	durationMs: number | null,
+	/**  `hold`・`waiting`・`kept`・`released`（実ファイルを持っているか）。 */
+	fileState: string,
+	createdAt: number,
+};
+
+/**  表示した結果：種類ごとの和（`type` で分ける）。 */
+export type EditViewDto = {
+	type: "image",
+} & EditImageViewDto | 
+/**  音声（箱に入れる：画像の結果より大きい）。 */
+{
+	type: "audio",
+} & EditAudioViewDto;
+
+/**  表示の結果。 */
+export type EditViewOutcomeDto = { type: "shown"; view: EditViewDto } | 
+/**  新しい要求に取って代わられた（当てた手は残る。新しい要求の結果を待つ）。 */
+{ type: "superseded" } | 
+/**  描けない（手は当たっている。取り消せる）。 */
+{ type: "failed"; problem: EditProblemDto };
+
+/**  表示の要求（ビューポート）：種類ごとの和（`type` で分ける）。 */
+export type EditViewportDto = {
+	type: "image",
+} & EditImageViewportDto | {
+	type: "audio",
+} & EditAudioViewportDto;
+
+/**  書ける形式 1 つ（形式の表の行。M13 段 4C）。 */
+export type EditWritableFormatDto = {
+	/**  形式の ID（`edit_save` の `format: { type: "to", format }` に渡す）。 */
+	format: string,
+	/**  代表の拡張子。 */
+	ext: string,
+	/**  今の環境（今のコーデックの組）で、今の出力の形を書けるか（MP3 は ffmpeg がなければ偽）。 */
+	available: boolean,
+	/**
+	 *  書けない理由が道具のないことなら、その道具（`"ffmpeg"`：外部の道具に頼る形式で、書き手が今の組にない）。書き手は
+	 *  あるが今の出力の形（レート・チャンネル数・大きさ）が合わない・書けるときは null。
+	 */
+	missingTool: string | null,
+	/**  形式の表の保存できるもの：可逆・ループ点・マーカー・16 ビットより細かい標本。 */
+	lossless: boolean,
+	loopPoints: boolean,
+	markers: boolean,
+	highBitDepth: boolean,
+};
+
+/**
+ *  文書への変更 1 つ。JSON（エディタとの通信。M12）では `type` で種類を分ける（`{"type":"appendItems","node":3,…}`。
+ *  項目は camelCase、種は 10 進の文字列）。
+ */
+export type Edit_Deserialize = 
+/**
+ *  線形の列の `at` 番目（0 が先頭、ノードの数なら末尾）にノードを足す。ID は `next_id` から払い出し、種は `seed`
+ *  （なければ ID の値）。`extra_inputs` は 2 つ目からの入力（文書の入力か、`at` より前のノード）。
+ */
+({ type: "addNode"; at: number; op: string; v: number; params: JsonValue; seed?: string | null; extraInputs?: PortRef[] }) & { enabled?: never; expand?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; node?: never; output?: never; quantize?: never; to?: never; value?: never } | 
+/**  線形の列からノードを消し、前後をつなぎ直す。 */
+({ type: "removeNode"; node: NodeId }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  線形の列の中でノードを `to` 番目へ動かし、つなぎ直す。 */
+({ type: "moveNode"; node: NodeId; to: number }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; v?: never; value?: never } | 
+/**  有効か無効かを替える。 */
+({ type: "setEnabled"; node: NodeId; enabled: boolean }) & { at?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  引数をまとめて替える。 */
+({ type: "setParams"; node: NodeId; params: JsonValue }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; op?: never; output?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  引数の項目 1 つを替える。 */
+({ type: "setParam"; node: NodeId; key: string; value: JsonValue }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never } | 
+/**  追記だけの配列の引数（`field`）に要素を足す。 */
+({ type: "appendItems"; node: NodeId; field: string; items: JsonValue[] }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; format?: never; graph?: never; key?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  出力の形式・量子化・展開を替える（つなぐ先は変えない）。 */
+({ type: "setOutput"; output: OutputId; format: FormatChoice; quantize: Quantize_Deserialize | null; expand: Expand }) & { at?: never; enabled?: never; extraInputs?: never; field?: never; graph?: never; items?: never; key?: never; node?: never; op?: never; params?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  文書を丸ごと替える（すべての操作を外す・レシピの読み込みなど。今のスキーマの文書）。 */
+({ type: "replace"; graph: Graph_Deserialize }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; items?: never; key?: never; node?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never };
+
+/**
+ *  文書への変更 1 つ。JSON（エディタとの通信。M12）では `type` で種類を分ける（`{"type":"appendItems","node":3,…}`。
+ *  項目は camelCase、種は 10 進の文字列）。
+ */
+export type Edit_Serialize = 
+/**
+ *  線形の列の `at` 番目（0 が先頭、ノードの数なら末尾）にノードを足す。ID は `next_id` から払い出し、種は `seed`
+ *  （なければ ID の値）。`extra_inputs` は 2 つ目からの入力（文書の入力か、`at` より前のノード）。
+ */
+({ type: "addNode"; at: number; op: string; v: number; params: JsonValue; seed: string | null; extraInputs: PortRef[] }) & { enabled?: never; expand?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; node?: never; output?: never; quantize?: never; to?: never; value?: never } | 
+/**  線形の列からノードを消し、前後をつなぎ直す。 */
+({ type: "removeNode"; node: NodeId }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  線形の列の中でノードを `to` 番目へ動かし、つなぎ直す。 */
+({ type: "moveNode"; node: NodeId; to: number }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; v?: never; value?: never } | 
+/**  有効か無効かを替える。 */
+({ type: "setEnabled"; node: NodeId; enabled: boolean }) & { at?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  引数をまとめて替える。 */
+({ type: "setParams"; node: NodeId; params: JsonValue }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; key?: never; op?: never; output?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  引数の項目 1 つを替える。 */
+({ type: "setParam"; node: NodeId; key: string; value: JsonValue }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; graph?: never; items?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never } | 
+/**  追記だけの配列の引数（`field`）に要素を足す。 */
+({ type: "appendItems"; node: NodeId; field: string; items: JsonValue[] }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; format?: never; graph?: never; key?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  出力の形式・量子化・展開を替える（つなぐ先は変えない）。 */
+({ type: "setOutput"; output: OutputId; format: FormatChoice; quantize: Quantize_Serialize | null; expand: Expand }) & { at?: never; enabled?: never; extraInputs?: never; field?: never; graph?: never; items?: never; key?: never; node?: never; op?: never; params?: never; seed?: never; to?: never; v?: never; value?: never } | 
+/**  文書を丸ごと替える（すべての操作を外す・レシピの読み込みなど。今のスキーマの文書）。 */
+({ type: "replace"; graph: Graph_Serialize }) & { at?: never; enabled?: never; expand?: never; extraInputs?: never; field?: never; format?: never; items?: never; key?: never; node?: never; op?: never; output?: never; params?: never; quantize?: never; seed?: never; to?: never; v?: never; value?: never };
+
+/**  プロジェクトのエンジン。 */
+export type EngineDto = "godot" | "unity" | 
+/**  どのエンジンでもないフォルダ。 */
+"folder";
 
 /**  まとめて変えた結果：変えたアイテムと、そのうちユニットのメンバーの数。 */
 export type EntriesUpdatedDto = {
@@ -475,7 +2028,8 @@ export type EntryRowDto = {
 	name: string,
 	itemCount: number,
 	durationMs: number,
-	kinds: string[],
+	/**  メンバーの種類（`ITEM_KINDS` の順。フォント・3D も出す）。 */
+	kinds: ItemKindDto[],
 	/**  表紙にするアイテム（先頭のメンバー）。 */
 	coverItemId: number | null,
 	imageDurationMs: number | null,
@@ -484,6 +2038,45 @@ export type EntryRowDto = {
 /**  エントリが参照するもの。 */
 export type EntryTargetDto = { kind: "item"; id: number } | { kind: "unit"; id: number } | { kind: "folder"; id: number; recursive: boolean };
 
+/**  出力をいくつのファイルにするか。 */
+export type Expand = 
+/**  1 つのファイル。 */
+{ type: "one" } | 
+/**  フレーム・クリップごとに 1 つ（例 `"{stem}_{index:03}"`）。 */
+{ type: "perElement"; name: string };
+
+/**  書き出しで選べる形式（形式の表の順。今の環境で書けるもの）。 */
+export type ExportFormatsDto = {
+	image: string[],
+	audio: string[],
+};
+
+/**  書き出しの設定。 */
+export type ExportOptionsDto = {
+	name: NameRuleDto,
+	image: FormatTargetDto,
+	audio: FormatTargetDto,
+	/**  `kura-export.json` を添える。 */
+	manifest: boolean,
+	/**  登録したプロジェクトの中へ書き出す（書き出し先がその中であることを確かめ、終わったら照らし直す）。 */
+	project: number | null,
+};
+
+/**  プロジェクトの持ち出しの既定。 */
+export type ExportPresetDto = {
+	name: NameRuleDto,
+	image: FormatTargetDto,
+	audio: FormatTargetDto,
+	manifest: boolean,
+};
+
+/**  書き出しの見本（先頭の 50 件と、書き出す件数）。 */
+export type ExportPreviewDto = {
+	names: PreviewNameDto[],
+	/**  書き出す件数（ゴミ箱の中・見つからないものを除く。ユニットのメンバーはユニットごとに数える）。 */
+	total: number,
+};
+
 /**  書き出しの結果（`JobProgress.resultJson` を読むときの型。ADR-120）。 */
 export type ExportResultDto = {
 	/**  書き出し先のフォルダ。 */
@@ -491,7 +2084,13 @@ export type ExportResultDto = {
 	total: number,
 	exported: number,
 	failed: number,
-	/**  書いた JSON の名前（終わったとき）。 */
+	/**  形式を変えて書いた数（M15 段 3。それより前の結果にはない）。 */
+	converted?: number | null,
+	/**  Kura が書いた記録どおりのファイルを置き換えた数（中身が同じで書かなかったものを含む。M15 段 3）。 */
+	replaced?: number | null,
+	/**  飛ばした数（ゴミ箱の中のアイテム。M15 段 3）。 */
+	skipped?: number | null,
+	/**  書いた JSON の名前（終わったとき。添えない設定なら null）。 */
 	manifest: string | null,
 };
 
@@ -529,7 +2128,47 @@ export type FolderRefDto = {
 	path: string[],
 };
 
+/**  出力の形式。 */
+export type FormatChoice = 
+/**  元と同じ形式。 */
+{ type: "keep" } | 
+/**  形式を指定する（`options` はエンコーダの設定）。 */
+{ type: "to"; format: string; options?: JsonValue };
+
+/**
+ *  画像・音声の書く形式（`original` はそのまま写す（M9）、`playable` は変えない（書けない形式は PNG・Ogg Vorbis に変える）、
+ *  `to` はその形式）。
+ */
+export type FormatTargetDto = { type: "original" } | { type: "playable" } | { type: "to"; format: string };
+
 export type GranularityDto = "file" | "unit";
+
+/**  文書。 */
+export type Graph = Graph_Serialize | Graph_Deserialize;
+
+/**  文書。 */
+export type Graph_Deserialize = {
+	schema: number,
+	/**  この文書を作ったときの全体の規則の版。 */
+	rules: number,
+	inputs: InputSlot[],
+	nodes: Node_Deserialize[],
+	outputs: OutputSpec_Deserialize[],
+	/**  次に払い出すノード ID。 */
+	nextId: number,
+};
+
+/**  文書。 */
+export type Graph_Serialize = {
+	schema: number,
+	/**  この文書を作ったときの全体の規則の版。 */
+	rules: number,
+	inputs: InputSlot[],
+	nodes: Node_Serialize[],
+	outputs: OutputSpec_Serialize[],
+	/**  次に払い出すノード ID。 */
+	nextId: number,
+};
 
 /**  キューのまとまり（ユニット単位で再生するときのユニット・フォルダ・単体）。 */
 export type GroupDto = {
@@ -564,6 +2203,8 @@ export type ImportPreviewDto = {
 	images: number,
 	videos: number,
 	audios: number,
+	fonts: number,
+	models: number,
 	totalBytes: number,
 	duplicates: number,
 	skipped: number,
@@ -579,9 +2220,34 @@ export type ImportResultDto = {
 	total: number,
 	added: number,
 	duplicates: number,
+	/**  対応していない形式・空のファイルの数（`rejected` を含む）。 */
 	skipped: number,
 	failed: number,
 	failures: ImportFailureDto[],
+	/**
+	 *  拡張子は対応しているが中身が違うので取り込まなかったもの（Aseprite でない `.ase` など）と理由。
+	 *  M11 より前の結果にはない。
+	 */
+	rejected?: ImportFailureDto[],
+};
+
+/**  文書の入力の ID。 */
+export type InputId = number;
+
+/**  入力の役割。 */
+export type InputRole = 
+/**  編集・一括の対象。アイテムの元に結び付く。 */
+{ type: "primary" } | 
+/**  中身を固定した素材（透かし・パレットの元など）。 */
+{ type: "fixed"; hash: Digest } | 
+/**  一括の選択全体（N → 1 の結合）。 */
+{ type: "selection" };
+
+/**  文書の入力。 */
+export type InputSlot = {
+	id: InputId,
+	role: InputRole,
+	decode?: DecodeOptions,
 };
 
 /**  起動時の整合性チェックの結果。 */
@@ -589,6 +2255,66 @@ export type IntegrityDto = {
 	stagingRemoved: number,
 	missingFiles: number,
 	orphanFiles: number,
+	/**  どの表からも参照されない台帳の行の数（M11。docs/data-model.md §4）。 */
+	unreferencedBlobs: number,
+	/**
+	 *  GC の照合が合わずにファイルを残した版の数（M12 の段 3。問題には数えない。設定の「いま確かめる」だけで数え、起動時は
+	 *  null）。
+	 */
+	keptVersions: number | null,
+	/**
+	 *  7 日とバックアップの条件を満たしたのに、まだ消していない消し待ちの版の数（M12 の段 3。問題には数えない。いま確かめる
+	 *  ときだけ数え、起動時は null）。
+	 */
+	overdueVersions: number | null,
+};
+
+/**  検証の指摘 1 つ。 */
+export type Issue = {
+	node: NodeId | null,
+	param: string | null,
+	code: IssueCode,
+	severity: Severity,
+	message: string,
+};
+
+/**  指摘の種類。画面の文言はこの値から引く。 */
+export type IssueCode = 
+/**  文書の形が正しくない（ID の重複・前にないノードの参照など）。 */
+"badGraph" | 
+/**  知らない操作。 */
+"unknownOp" | 
+/**  操作の版が新しすぎる、または移せない古い版。 */
+"unknownVersion" | 
+/**  文書のスキーマが新しすぎる。 */
+"schemaTooNew" | 
+/**  引数が読めない。 */
+"badParams" | 
+/**  引数が範囲の外。 */
+"outOfRange" | 
+/**  入力の種類・数が操作に合わない。 */
+"badInput" | 
+/**  大きすぎる（上限）。 */
+"tooLarge" | 
+/**  メタデータを落とした（警告）。 */
+"metadataDropped" | 
+/**  sRGB でない（と見える）色空間の画像を、sRGB とみなして混色した（警告。v1 は色の変換をしない。§5.2）。 */
+"colorSpaceAssumed" | 
+/**  ラウドネスを計れない（無音・400 ms より短い）ので、正規化しなかった（警告）。 */
+"loudnessUnmeasurable" | 
+/**  ピークの上限に当たるので、利得を抑えた（警告。目標より小さく仕上がる）。 */
+"gainLimited";
+
+/**  1 件のクレジット（null は未設定）。 */
+export type ItemCreditDto = {
+	licenseId: number | null,
+	author: string | null,
+	/**  作品・素材集の名前。 */
+	work: string | null,
+	/**  出典（null なら取り込み元の URL を使う）。 */
+	url: string | null,
+	/**  表記の文（null なら作者・作品・出典・ライセンスから組む）。 */
+	credit: string | null,
 };
 
 /**  インスペクタ用の詳細。 */
@@ -606,11 +2332,33 @@ export type ItemDetailDto = {
 	units: UnitRefDto[],
 };
 
+export type ItemKindDto = "image" | "video" | "audio" | "font" | "model";
+
+/**  種類の表の 1 行（bindings の定数 `ITEM_KINDS`。フロントの種類の型と述語はこの表から作る）。 */
+export type ItemKindInfoDto = {
+	kind: ItemKindDto,
+	/**  再生のキュー・スマートの候補に入るか（画像・動画・音楽。フォント・3D は入らない）。 */
+	playable: boolean,
+	/**  再生用プロキシの対象か（動画・音楽）。 */
+	needsProxy: boolean,
+	/**  長さを持つか（動画・音楽）。 */
+	hasDuration: boolean,
+};
+
 /**  アイテムの変更（省略した項目は変えない。`note` の空文字はメモを消す）。 */
 export type ItemPatchDto = {
 	title?: string | null,
 	rating?: number | null,
 	note?: string | null,
+};
+
+/**  アイテムを使っているプロジェクト 1 つ。 */
+export type ItemProjectDto = {
+	projectId: number,
+	name: string,
+	missing: boolean,
+	/**  そのアイテムと一致したファイル（ルートからの相対パス）。 */
+	paths: string[],
 };
 
 /**  並び順（`items_query_ids` の引数、プレイリストの並び順）。 */
@@ -625,8 +2373,7 @@ export type ItemSummaryDto = {
 	/**  BLAKE3 の 16 進（`kura://localhost/thumb/{hash}/s` などに使う）。 */
 	hash: string,
 	ext: string,
-	/**  `image` / `video` / `audio`。 */
-	kind: string,
+	kind: ItemKindDto,
 	width: number | null,
 	height: number | null,
 	durationMs: number | null,
@@ -636,14 +2383,32 @@ export type ItemSummaryDto = {
 	sourceSite: string | null,
 	importedAt: number,
 	capturedAt: number | null,
-	/**  `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。 */
+	/**  `pending` / `ready` / `stale` / `failed`。`ready` と `stale`（作り直すまで今の絵を出す）のときサムネイルがある。 */
 	thumbState: string,
 	proxyState: string,
 	lastPlayedAt: number | null,
+	/**  サムネイルを作り直した回数（`thumbUrl` の `rev`。0 より大きければ URL に `?r=`）。 */
+	thumbRev: number,
+	/**  解析の進み具合（`pending` のものは、解析のジョブが進んだら取り直す）。 */
+	analysisState: AssetAnalysisStateDto,
+	/**  解析で分かった透過（未解析・画像でなければ null）。`binary`・`partial` なら市松模様を敷く。 */
+	alpha: AssetAlphaDto | null,
+	/**  ドット絵として表示するか（実効値：設定 ?? 自動の判定 ?? 偽）。広げるときだけ最近傍。 */
+	pixelArt: boolean,
+	/**  ドット絵の設定（null は自動）。右クリックの「ドット絵として表示」のチェックに使う。 */
+	pixelArtSetting: boolean | null,
+	/**  アニメとして回せるか（コマが 2 つ以上か、格子を設定してある）。 */
+	animated: boolean,
+	/**  コマの数（格子があれば帯で使う数）。タイルの「8 コマ」。 */
+	frameCount: number | null,
+	/**  ループ点がある音声か。 */
+	hasLoop: boolean,
 };
 
 /**  一覧の種類（`items_query_ids` の引数。生バイトのコマンドなので TS の型は `src/ipc/items.ts` に書く）。 */
-export type ItemViewDto = { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number };
+export type ItemViewDto = { kind: "all" } | { kind: "recent" } | { kind: "unsorted" } | { kind: "untagged" } | { kind: "random"; seed: number } | { kind: "trash" } | { kind: "folder"; id: number } | { kind: "unit"; id: number } | { kind: "smart"; id: number } | 
+/**  登録したプロジェクトで今使っている素材（M15 段 6）。 */
+{ kind: "project"; id: number };
 
 /**  ジョブ 1 件。 */
 export type JobDto = {
@@ -666,8 +2431,13 @@ export type JobFilterDto = {
 	limit?: number | null,
 };
 
-/**  ジョブの種類。 */
-export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export";
+/**
+ *  ジョブの種類（analyze は M11 の解析。取り込み・サムネイル・保存に譲る。edit は M12 の編集の保存、gc は M12 の段 3 の
+ *  置き換えた版のファイルの片付け、batch は M14 の一括加工）。
+ */
+export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export" | "analyze" | "edit" | "gc" | "batch" | 
+/**  プロジェクトの照らし直し（M15 段 2）。 */
+"project";
 
 /**  ジョブの進捗（イベント `job://progress`）。 */
 export type JobProgress = {
@@ -682,12 +2452,33 @@ export type JobProgress = {
 /**  ジョブの状態。 */
 export type JobStateDto = "queued" | "running" | "paused" | "done" | "failed" | "canceled";
 
+/**  任意の JSON の値（TS の `JsonValue`：null・真偽・数・文字列・配列・オブジェクト）。 */
+export type JsonValue = null | boolean | number | null | string | JsonValue[] | { [key in string]: JsonValue };
+
 /**  種類ごとの件数。 */
 export type KindCountsDto = {
 	image: number,
 	video: number,
 	audio: number,
+	font: number,
+	model: number,
 	total: number,
+};
+
+/**
+ *  中身から作ったキャッシュの大きさ（設定の「容量」の行。M11 の決定 4 で ADR-122 を広げる）。ファイルを数えるので、
+ *  サイドバーの `library_usage` とは別に、設定の画面を開いたときだけ読む。ゴミ箱のアイテムの分も含む。
+ */
+export type LibraryCacheUsageDto = {
+	/**  サムネイル（`thumbs/` の JPEG・PNG）と音楽のジャケット（`art/`）のバイト数とファイルの数。 */
+	thumbsBytes: number,
+	thumbsFiles: number,
+	/**  音声の波形の段（`peaks/`）。 */
+	peaksBytes: number,
+	peaksFiles: number,
+	/**  アニメの帯（`anim/`）。 */
+	animBytes: number,
+	animFiles: number,
 };
 
 /**  サイドバーの「ライブラリ」の件数。 */
@@ -709,11 +2500,50 @@ export type LibraryInfoDto = {
 	integrity: IntegrityDto | null,
 };
 
-/**  前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかった。 */
+/**
+ *  前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかったか（`error` が空）、
+ *  開けなかった（`error` に理由。`code` は `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed`・`LibraryInUse`
+ *  （ほかのアプリが開いている）など）。
+ */
 export type LibraryRestoreDto = {
 	info: LibraryInfoDto | null,
 	lastPath: string | null,
+	/**  前回のライブラリ（か `KURA_LIBRARY`）を開けなかった理由。 */
+	error?: AppError | null,
 };
+
+/**
+ *  ライブラリの DB を新しい版にする知らせ（イベント `library://upgrade`。M11 の決定 1）。開く IPC（`library_restore`・
+ *  `library_open`）が終わる前に、同じライブラリについて `started` のあと `finished` か `failed` が 1 つ来る。フロントは
+ *  `started` から 300ms を超えたら「ライブラリを更新しています」を出す。当てるものがない・新しいライブラリでは来ない。
+ */
+export type LibraryUpgradeEvent = {
+	phase: LibraryUpgradePhase,
+	/**  ライブラリのフォルダ。 */
+	path: string,
+	/**  当てる前のスキーマの版（user_version）。 */
+	fromVersion: number,
+	/**  当てたあとの版。 */
+	toVersion: number,
+	/**  DB の大きさ（バイト。`started` だけ）。 */
+	dbBytes: number | null,
+	/**  始まりからの時間（ミリ秒。`finished`・`failed` だけ）。 */
+	elapsedMs: number | null,
+	/**  当てられなかった理由（`failed` だけ）。 */
+	error: AppError | null,
+};
+
+/**  ライブラリの DB を新しい版にする段階（イベント `library://upgrade`）。 */
+export type LibraryUpgradePhase = 
+/**  当て始めた（空きの確かめとバックアップの前）。 */
+"started" | 
+/**  当て終えた。 */
+"finished" | 
+/**
+ *  当てられなかった（失敗した 1 つは戻り、それより前に当てたものは残る。理由と今の版は `error`。開く IPC も同じ理由で
+ *  失敗を返す）。
+ */
+"failed";
 
 /**  ライブラリの容量（サイドバーの下・設定画面）。 */
 export type LibraryUsageDto = {
@@ -723,6 +2553,51 @@ export type LibraryUsageDto = {
 	volumeTotalBytes: number | null,
 	volumeAvailableBytes: number | null,
 };
+
+/**  ライセンスの変え方。 */
+export type LicenseChoiceDto = 
+/**  未設定に戻す。 */
+{ type: "unset" } | 
+/**  そのライセンスにする。 */
+{ type: "set"; id: number };
+
+/**  ライセンス 1 行。 */
+export type LicenseDto = {
+	id: number,
+	/**  既定の行の鍵（`cc-by-4.0` など）。利用者が足した行は null（既定の行は変えられず消せない）。 */
+	builtin: string | null,
+	name: string,
+	spdx: string | null,
+	url: string | null,
+	attribution: AttributionDto,
+	commercial: PermissionDto,
+	modify: PermissionDto,
+	shareAlike: boolean,
+	note: string | null,
+	/**  このライセンスを付けたアイテムの数。 */
+	items: number,
+	createdAt: number,
+	updatedAt: number,
+};
+
+/**  足す・変えるライセンスの中身（空の文は「なし」）。 */
+export type LicenseInputDto = {
+	name: string,
+	spdx: string | null,
+	url: string | null,
+	attribution: AttributionDto,
+	commercial: PermissionDto,
+	modify: PermissionDto,
+	shareAlike: boolean,
+	note: string | null,
+};
+
+/**  画像の操作をフレームの列に当てる方法。 */
+export type Lift = 
+/**  持ち上げない（受け付ける種類だけ）。 */
+"none" | 
+/**  フレームの列なら、各フレームに同じ操作を当てる（出力の大きさは推論で決まること）。 */
+"perFrame";
 
 /**  上限（`kind` が null なら上限なし）。 */
 export type LimitDto = {
@@ -750,8 +2625,209 @@ export type LoginShotEvent = {
 	result: SnapshotResultDto | null,
 };
 
+/**  失うもの（描かないので「ありうる」もの。docs/editing.md §14.2「事前チェック」）。 */
+export type LossDto = 
+/**  非可逆の形式に書く。 */
+{ type: "lossy" } | 
+/**  透明を持てない形式（透明な画素・パレットの透明な色があれば書けずに失敗する）。 */
+{ type: "alpha" } | 
+/**  半透明を持てない形式（GIF）。 */
+{ type: "semiAlpha" } | 
+/**  16 ビットを 8 ビットに。 */
+{ type: "highBits" } | 
+/**  色の数に上限のある形式（減色する）。 */
+{ type: "colors"; max: number } | 
+/**  ファイルのループ点（解析の事実）を保存できない形式。 */
+{ type: "loopPoints" } | 
+/**  上書きで大きさ・長さが変わり、素材の設定が合わなくなりうる。 */
+{ type: "settings" };
+
+/**  失うものの群。 */
+export type LossGroupDto = {
+	loss: LossDto,
+	/**  書く形式（素材の設定は空）。 */
+	format: string,
+	items: number[],
+};
+
+/**  N → 1（スプライトシート）の頼み。 */
+export type MergeRequestDto = {
+	/**  並べるアイテム（並べる順。画面が選んだ順・名前順・一覧の並びを選ぶ）。 */
+	items: number[],
+	/**  できるアイテムの名前（`{名前}` は最初のアイテムの表示名。既定は「{名前} のシート」）。 */
+	name: string,
+	sheet: SheetParams,
+};
+
+/**  メタデータの扱い。 */
+export type MetaAccess = 
+/**  エンジンが `SpaceMap`・`TimeMap` で写す（ふつう）。 */
+"map" | 
+/**  操作が自分で書く（格子・ループ点を設定する操作）。 */
+"write";
+
+/**  名前の規則（テンプレートの語は {名前}・{元の名前}・{番号}・{ユニット}・{幅}・{高さ}。null は元のファイル名）。 */
+export type NameRuleDto = {
+	template: string | null,
+	style: NameStyleDto,
+	/**  ASCII の文字だけにする（ほかを除き、空なら item-ID）。 */
+	ascii: boolean,
+};
+
+/**  名前の書き方。 */
+export type NameStyleDto = "keep" | "snake" | "kebab" | "pascal" | "camel";
+
+/**  操作 1 つ。 */
+export type Node = Node_Serialize | Node_Deserialize;
+
+/**  ノードの ID。文書の中で一意。消しても使い回さない。 */
+export type NodeId = number;
+
+/**  操作 1 つ。 */
+export type Node_Deserialize = {
+	id: NodeId,
+	/**  操作の名前（例 `image.crop`）。 */
+	op: string,
+	/**  作ったときの操作の版。勝手に上げない。 */
+	v: number,
+	/**  引数（その版の型で読む）。 */
+	params?: JsonValue,
+	inputs: PortRef[],
+	/**  乱数を使う操作の種。作るときに決め、移行しても変えない。 */
+	seed?: string,
+	/**  false なら一時的に外す（入力 0 をそのまま通す）。 */
+	enabled?: boolean,
+};
+
+/**  操作 1 つ。 */
+export type Node_Serialize = {
+	id: NodeId,
+	/**  操作の名前（例 `image.crop`）。 */
+	op: string,
+	/**  作ったときの操作の版。勝手に上げない。 */
+	v: number,
+	/**  引数（その版の型で読む）。 */
+	params: JsonValue,
+	inputs: PortRef[],
+	/**  乱数を使う操作の種。作るときに決め、移行しても変えない。 */
+	seed: string,
+	/**  false なら一時的に外す（入力 0 をそのまま通す）。 */
+	enabled: boolean,
+};
+
+/**  結果の数値の性質（ゴールデンをターゲットごとに持つかどうか）。 */
+export type Numeric = 
+/**  整数だけ。すべてのターゲットで同じ結果。 */
+"exact" | 
+/**  浮動小数を使う。ゴールデンはターゲットごと。 */
+"float";
+
+/**  操作の記述（UI のカタログ）。 */
+export type OpDescriptor = {
+	id: string,
+	version: number,
+	signature: Signature,
+	schema: ParamSchema,
+};
+
+/**
+ *  文書のノードの（操作, 版）が、この登録表でどう描かれるか（docs/editing.md §8.4。M14 段 1）。レシピの読み込みの印・
+ *  事前チェックが使う。
+ */
+export type OpStatus = 
+/**  今の版。 */
+{ type: "current" } | 
+/**  実装のない古い版で、今の版の実装へ引数を移して描く（結果は同じ。E7）。 */
+{ type: "migrated"; current: number } | 
+/**  結果を変えた旧版（またはそこへ移す古い版）の実装 `uses` で描く。今の版 `current` とは結果が違いうる（E6）。 */
+{ type: "legacy"; uses: number; current: number } | 
+/**  なくした操作（カタログにない）。実装 `uses` で描く。 */
+{ type: "retired"; uses: number };
+
 /**  ユニットのメンバーの並び順。 */
 export type OrderModeDto = "manual" | "name" | "imported" | "captured" | "duration";
+
+/**  引数の値が元（見本）によるか（M14 段 1。レシピを作る画面が印を付ける。結果には効かないので、直しても操作の版は上げない）。 */
+export type Origin = 
+/**  元によらない（色・フィルタ・dB・列の数など）。 */
+"free" | 
+/**  比で書ける（`Length`・`Margin`・`CanvasLength`）。px で書けば絶対の値（意図して決めた大きさのこともある）。 */
+"ratio" | 
+/**  元の座標・長さで書いた値（矩形・点・区間・標本の数・描いたもの・パレットの番号・格子）。ほかのアイテムでは合わないことがある。 */
+"source";
+
+/**  出力の形式ごとの群。 */
+export type OutputGroupDto = {
+	format: string,
+	/**  別名で、レシピの形式に書けないので代わりの形式で作る。 */
+	fallback: boolean,
+	items: number[],
+	examples: ShapeChangeDto[],
+	/**  今の大きさ・長さから変わる件数。 */
+	resized: number,
+};
+
+/**  文書の出力の ID。 */
+export type OutputId = number;
+
+/**  文書の出力。 */
+export type OutputSpec = OutputSpec_Serialize | OutputSpec_Deserialize;
+
+/**  文書の出力。 */
+export type OutputSpec_Deserialize = {
+	id: OutputId,
+	from: PortRef,
+	format?: FormatChoice,
+	/**  整数への丸めとディザ（音声だけ）。なければ書かない（スキーマ 2 までの文書の正規の形を変えない）。 */
+	quantize?: Quantize_Deserialize | null,
+	expand?: Expand,
+};
+
+/**  文書の出力。 */
+export type OutputSpec_Serialize = {
+	id: OutputId,
+	from: PortRef,
+	format: FormatChoice,
+	/**  整数への丸めとディザ（音声だけ）。なければ書かない（スキーマ 2 までの文書の正規の形を変えない）。 */
+	quantize?: Quantize_Serialize | null,
+	expand: Expand,
+};
+
+/**  引数の種類（エディタの汎用の引数パネルはここから組む）。 */
+export type ParamKind = { type: "int"; min: number; max: number; step: number } | { type: "float"; min: number | null; max: number | null; step: number | null } | { type: "bool" } | { type: "enum"; values: string[] } | { type: "rect" } | { type: "point" } | { type: "size" } | { type: "ratio" } | { type: "color"; alpha: boolean } | { type: "timePos" } | { type: "strokes" } | 
+/**  長さ（画素・入力に対する比・縦横比を保つ自動）。 */
+{ type: "length" } | 
+/**  スプライトの格子（セルの大きさ・左上・間隔）。 */
+{ type: "grid" } | 
+/**  パレットの色の置き換え（番号と色の組）。 */
+{ type: "paletteEntries" } | 
+/**  音声の区間（フレーム。`{start, end}`、end は含まない。null で消す）。 */
+{ type: "frameRange" } | 
+/**  余白 1 辺（`{"px": n}`（負で削る。±2^31）か `{"scale": {"num", "den"}}`（その軸の長さに対する比）。M14 段 1）。 */
+{ type: "margin" } | 
+/**  キャンバスの 1 辺の長さ（`{"px": n}`・`{"scale": …}`・`"keep"`・`{"multipleOf": n}`・`"pow2"`・`"longest"`。M14 段 1）。 */
+{ type: "canvasLength" };
+
+/**  引数の記述の一覧。 */
+export type ParamSchema = {
+	params: ParamSpec[],
+};
+
+/**  引数 1 つの記述。`key` は serde のフィールド名と一致させる（適合テストで確かめる）。文言は ja.ts で `key` から引く。 */
+export type ParamSpec = {
+	key: string,
+	kind: ParamKind,
+	unit: Unit,
+	default: JsonValue,
+	/**  詳細な設定（ふだんは畳んでおく）。 */
+	advanced: boolean,
+	/**  表示の条件（None はいつも出す）。 */
+	visible: Visible | null,
+	/**  値が元（見本）によるか（[`Origin`]。[`spec`] の既定は `Free`）。 */
+	origin: Origin,
+	/**  結び付けられる出どころの種類（[`BindKind`]。既定は空＝結び付けられない）。 */
+	binds: BindKind[],
+};
 
 /**  解析のエラー（位置は入力の UTF-16 の文字位置）。 */
 export type ParseErrorDto = {
@@ -759,6 +2835,9 @@ export type ParseErrorDto = {
 	end: number,
 	message: string,
 };
+
+/**  商用・改変の可否。 */
+export type PermissionDto = "yes" | "no" | "unknown";
 
 /**  再生するキュー（docs/playlists.md §5.1 の Slot 列を列ごとの配列で）。 */
 export type PlayQueueDto = {
@@ -804,6 +2883,8 @@ export type PlayRequestDto = {
 	startItem?: number | null,
 	/**  並びはそのままで、このアイテムから始める（一覧の「ここから再生」）。 */
 	fromItem?: number | null,
+	/**  `from_item` を押した一覧の行のエントリ（同じアイテムが複数のエントリにあっても、その行から始める）。 */
+	fromEntry?: number | null,
 	/**  その場のキューを同じシードで作り直すとき（16 進）。 */
 	seed?: string | null,
 };
@@ -832,6 +2913,8 @@ export type PlayerPrefsDto = {
 	bgmThroughImages: boolean,
 	bgmLoop: boolean,
 	imageDurationMs: number,
+	/**  選んだ短い音声をすぐ鳴らす（M11。既定でオン）。 */
+	sfxAudition: boolean,
 };
 
 /**  プレイリストの中身。 */
@@ -845,6 +2928,9 @@ export type PlaylistContentsDto = {
 	images: number,
 	videos: number,
 	audios: number,
+	/**  フォント・3D（一覧には出すが、キューには入らない）。 */
+	fonts: number,
+	models: number,
 };
 
 /**  プレイリストの設定。 */
@@ -916,6 +3002,36 @@ export type PlaylistSummaryDto = {
 	itemCount: number,
 };
 
+/**  ノードの入力の参照。 */
+export type PortRef = 
+/**  文書の入力。 */
+{ from: "input"; id: InputId } | 
+/**  前のノードの出力（出力の口は 1 つ。複数の結果は値の中の数で表す）。 */
+{ from: "node"; id: NodeId };
+
+/**  入力の口の記述。 */
+export type PortSpec = {
+	name: string,
+	accepts: ValueKind[],
+};
+
+/**  理由ごとの群。 */
+export type PrecheckGroupDto = {
+	/**  `skipped`・`failed`（当てるときの行の状態）。確かめられなかったものは `pending`。 */
+	state: string,
+	code: string,
+	message: string,
+	items: number[],
+};
+
+/**  書き出す名前の見本の 1 件。 */
+export type PreviewNameDto = {
+	itemId: number,
+	name: string,
+	/**  形式を変えるならその形式。 */
+	convert: string | null,
+};
+
 /**  前に取得したダウンロード。 */
 export type PreviousDownloadDto = {
 	jobId: number,
@@ -928,14 +3044,168 @@ export type PreviousDownloadDto = {
 	inLibrary: number,
 };
 
+/**  登録したプロジェクト 1 つ。 */
+export type ProjectDto = {
+	id: number,
+	name: string,
+	/**  正規化した絶対パス。 */
+	root: string,
+	engine: EngineDto,
+	/**  最後の照らしでフォルダが見つからなかった（使った記録は残っている）。 */
+	missing: boolean,
+	/**  最後に照らし終えた時刻（まだなら null）。 */
+	scannedAt: number | null,
+	/**  照らしたファイルの数。 */
+	files: number,
+	/**  使っているアイテムの数。 */
+	items: number,
+	createdAt: number,
+	updatedAt: number,
+};
+
 /**  画質（`best` / `1080` / `720` / `480`）。 */
 export type QualityDto = "best" | "1080" | "720" | "480";
+
+/**  出力の量子化（整数への丸めとディザ。docs/editing.md §4.1）。音声の出力だけに付けられる。 */
+export type Quantize = Quantize_Serialize | Quantize_Deserialize;
+
+/**  出力の量子化（整数への丸めとディザ。docs/editing.md §4.1）。音声の出力だけに付けられる。 */
+export type Quantize_Deserialize = {
+	/**  約束の版（`QUANTIZE_VERSION`。知らない版は計画を作るときに断る）。 */
+	v: number,
+	/**  ビット数（8・16・24）。 */
+	bits: number,
+	dither: Dither,
+	/**  ディザの乱数の種（作るときに決め、変えない）。 */
+	seed: string,
+};
+
+/**  出力の量子化（整数への丸めとディザ。docs/editing.md §4.1）。音声の出力だけに付けられる。 */
+export type Quantize_Serialize = {
+	/**  約束の版（`QUANTIZE_VERSION`。知らない版は計画を作るときに断る）。 */
+	v: number,
+	/**  ビット数（8・16・24）。 */
+	bits: number,
+	dither: Dither,
+	/**  ディザの乱数の種（作るときに決め、変えない）。 */
+	seed: string,
+};
 
 /**  パレットに出す解析の結果。 */
 export type QueryCheckDto = {
 	error: ParseErrorDto | null,
 	clauses: ClauseDto[],
 	counts: KindCountsDto | null,
+	/**
+	 *  解析の事実（透過・ループ・ラウドネスなど）を使う条件のとき、解析がまだで一致が決まっていない件数
+	 *  （パレットの「未解析 N 件」）。使わない条件・解析できない入力では null。
+	 */
+	unanalyzed: number | null,
+};
+
+/**
+ *  検索のフィールドの名前（bindings の定数 `QUERY_FIELD_NAMES`。docs/search-query.md §3）。
+ *  フロントの clauses.ts・ruleRows.ts はこの表で「フィールドの条件か、名前空間付きのタグか」を見分ける。
+ */
+export type QueryFieldNameDto = {
+	/**  英語名（AST の `field`・`ClauseDto.field`）。 */
+	field: string,
+	/**  入力で使える名前（日本語・英語。英語は大文字小文字を問わない）。 */
+	names: string[],
+};
+
+/**  種類の検索の語（bindings の定数 `QUERY_KIND_WORDS`。`種類:フォント` の「フォント」）。 */
+export type QueryKindWordDto = {
+	kind: ItemKindDto,
+	word: string,
+};
+
+/**  半角と同じに扱う記号（bindings の定数 `QUERY_SYMBOLS`。字句解析の表）。 */
+export type QuerySymbolDto = {
+	from: string,
+	to: string,
+};
+
+/**  区間の片方。 */
+export type RangePart = "start" | "end";
+
+/**  1 件のレシピ（文書・結び付け・旧版の印）。 */
+export type RecipeDto = RecipeDto_Serialize | RecipeDto_Deserialize;
+
+/**  1 件のレシピ（文書・結び付け・旧版の印）。 */
+export type RecipeDto_Deserialize = {
+	id: number,
+	name: string,
+	description: string,
+	kind: RecipeKind,
+	/**  見本の値の文書（今のスキーマ）。 */
+	graph: Graph_Deserialize,
+	bindings: Binding_Deserialize[],
+	/**  今の版でない操作のノード（旧版・移す版・退役した版）。 */
+	notes: RecipeNote[],
+	/**  今の Kura では当てられない理由（あれば当てる画面は断る）。 */
+	problem: string | null,
+	createdAt: number,
+	updatedAt: number,
+};
+
+/**  1 件のレシピ（文書・結び付け・旧版の印）。 */
+export type RecipeDto_Serialize = {
+	id: number,
+	name: string,
+	description: string,
+	kind: RecipeKind,
+	/**  見本の値の文書（今のスキーマ）。 */
+	graph: Graph_Serialize,
+	bindings: Binding_Serialize[],
+	/**  今の版でない操作のノード（旧版・移す版・退役した版）。 */
+	notes: RecipeNote[],
+	/**  今の Kura では当てられない理由（あれば当てる画面は断る）。 */
+	problem: string | null,
+	createdAt: number,
+	updatedAt: number,
+};
+
+/**  読み込んだレシピ（足した ID と、旧版の操作の印。印があれば画面が「古い版の操作を含みます」を出す）。 */
+export type RecipeImportedDto = {
+	id: number,
+	notes: RecipeNote[],
+};
+
+/**  レシピの種類。 */
+export type RecipeKind = 
+/**  1 件ずつ当てる（入力は Primary 1 つ。頭に継ぎ足す）。 */
+"each" | 
+/**  N → 1（入力は Selection 1 つ。M14 段 6。段 1 は形の確かめだけで、結び付けは持てない）。 */
+"merge";
+
+/**  今の版でない操作のノードの印（docs/editing.md §8.4）。 */
+export type RecipeNote = {
+	node: NodeId,
+	op: string,
+	v: number,
+	status: OpStatus,
+};
+
+/**  当てるレシピの出どころ。 */
+export type RecipeSourceDto = 
+/**  レシピの表のレシピ。 */
+{ type: "recipe"; id: number } | 
+/**  一括のジョブを積んだときのレシピの写し（結果のシートの［やり直す］）。 */
+{ type: "job"; job: number };
+
+/**  一覧の 1 行（サイドバーの節・レシピの画面の見出し）。 */
+export type RecipeSummaryDto = {
+	id: number,
+	name: string,
+	description: string,
+	kind: RecipeKind,
+	/**  操作（ノード）の数。 */
+	nodes: number,
+	/**  結び付けの数。 */
+	bindings: number,
+	createdAt: number,
+	updatedAt: number,
 };
 
 export type RepeatModeDto = "off" | "all" | "one";
@@ -959,6 +3229,66 @@ export type SelectionInfoDto = {
 	note: string | null,
 	tags: TagCountDto[],
 	folders: FolderCountDto[],
+};
+
+/**  素材の設定の欄。 */
+export type SettingKey = "grid" | "pivot" | "loop" | "frameMs";
+
+/**  指摘の重さ。 */
+export type Severity = 
+/**  実行できない。 */
+"error" | 
+/**  実行できるが、知らせることがある（メタデータを落とした、など）。 */
+"warning";
+
+/**  元の形 → 出力の形。 */
+export type ShapeChangeDto = {
+	itemId: number,
+	from: ShapeInfoDto,
+	to: ShapeInfoDto,
+};
+
+/**  形の要約（大きさ・長さが上限しか分からなければ null）。 */
+export type ShapeInfoDto = { kind: "image"; w: number | null; h: number | null; 
+/**  フレームの列の数（1 枚の画像は null）。 */
+frames: number | null } | { kind: "audio"; rate: number; channels: number; frames: number | null };
+
+/**  複数選択の 1 項目（`mixed` なら食い違い、そうでなければ全件が `value`）。 */
+export type SharedDto<T> = {
+	mixed: boolean,
+	value: T | null,
+};
+
+/**  N → 1 のシートの見込み。 */
+export type SheetInfoDto = {
+	width: number,
+	height: number,
+	frames: number,
+	columns: number,
+	cellW: number,
+	cellH: number,
+	/**  大きさ・フレームの数が上限しか分からない（作るときに決まる）。 */
+	approximate: boolean,
+};
+
+/**  スプライトシートの引数（[`sheet_graph`]）。 */
+export type SheetParams = {
+	/**  1 行のセルの数（None は ⌈√フレームの数⌉。[`columns_for`]）。 */
+	columns?: number | null,
+	gapX?: number,
+	gapY?: number,
+	/**  何も置かない部分の色（ストレートの RGBA8）。null は透明。 */
+	fill?: [number, number, number, number] | null,
+	/**  大きさの違う絵の、セルの中の揃え（既定は中央）。 */
+	anchor?: Anchor,
+};
+
+/**  操作の型の記述。 */
+export type Signature = {
+	inputs: PortSpec[],
+	lift: Lift,
+	numeric: Numeric,
+	meta: MetaAccess,
 };
 
 /**  スマートフォルダ。 */
@@ -990,6 +3320,16 @@ export type SnapshotResultDto = {
 
 /**  並べる基準。 */
 export type SortKeyDto = "imported" | "captured" | "name" | "rating" | "duration" | "size";
+
+/**  結び付けの出どころ。 */
+export type Source = 
+/**  素材の設定（アイテムごとの利用者の設定。頭の座標・フレーム）。`{"type":"setting","key":"grid"}`。 */
+{ type: "setting"; key: SettingKey } | 
+/**
+ *  秒（ms）。そのノードの入力のレートでフレームに直す。`anchor` が end なら終わりから。
+ *  `{"type":"time","ms":2000,"anchor":"start"}`。
+ */
+{ type: "time"; ms: number; anchor: TimeAnchor };
 
 /**  パレットの候補。 */
 export type SuggestionDto = {
@@ -1070,6 +3410,13 @@ export type TagSuggestionDto = {
 	alias: string | null,
 };
 
+/**  秒を数える基準。 */
+export type TimeAnchor = 
+/**  頭から。 */
+"start" | 
+/**  終わりから（入力の長さが決まっていること）。 */
+"end";
+
 export type ToolDto = "ytDlp" | "galleryDl";
 
 /**  外部ツールの状態。 */
@@ -1104,6 +3451,9 @@ export type TrashEmptiedDto = {
 	bytes: number,
 	failed: number,
 };
+
+/**  引数の単位。 */
+export type Unit = "none" | "px" | "percent" | "degrees" | "db" | "lufs" | "ms" | "samples" | "hz" | "times";
 
 /**  ユニットのインスペクタ用の詳細。 */
 export type UnitDetailDto = {
@@ -1164,8 +3514,8 @@ export type UnitSummaryDto = {
 	count: number,
 	/**  音楽・動画は長さ、画像は表示時間の合計（ミリ秒）。 */
 	durationMs: number,
-	/**  メンバーの種類（`image` / `video` / `audio`）。 */
-	kinds: string[],
+	/**  メンバーの種類（`ITEM_KINDS` の順）。 */
+	kinds: ItemKindDto[],
 	/**  集計した評価（ユニットの評価、なければメンバーの平均）。 */
 	rating: number,
 	/**  ユニット自体の評価（0 は未評価）。 */
@@ -1174,6 +3524,20 @@ export type UnitSummaryDto = {
 	origin: string,
 	createdAt: number,
 	lastPlayedAt: number | null,
+};
+
+/**  値の種類。 */
+export type ValueKind = "image" | "frames" | "audio";
+
+/**
+ *  引数を表示する条件（docs/editing.md §7.2 の「表示の条件」）：同じ操作の列挙の引数 `key` の値が `values` のどれかのとき
+ *  だけ、この引数を出す（例：`image.convert` の `colors`・`dither` は `format` が `indexed8` のときだけ）。値の検証・既定値には
+ *  効かない（出さない引数も文書に書いたまま読み、既定値を持つ）。条件の引数は同じ記述の `Enum` で、値はその列挙の中
+ *  （適合テストで確かめる）。
+ */
+export type Visible = {
+	key: string,
+	values: string[],
 };
 
 /* Tauri Specta runtime */

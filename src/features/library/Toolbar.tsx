@@ -4,6 +4,7 @@ import { GridIcon } from '../../components/icons/GridIcon';
 import { InspectorIcon } from '../../components/icons/InspectorIcon';
 import { JustifyIcon } from '../../components/icons/JustifyIcon';
 import { ListIcon } from '../../components/icons/ListIcon';
+import { MoreIcon } from '../../components/icons/MoreIcon';
 import { PlusIcon } from '../../components/icons/PlusIcon';
 import { SearchIcon } from '../../components/icons/SearchIcon';
 import { SortIcon } from '../../components/icons/SortIcon';
@@ -39,6 +40,8 @@ interface ToolbarProps {
   /** 表示形式（⌘1〜⌘3）。 */
   layout: LayoutMode;
   onLayout: (layout: LayoutMode) => void;
+  /** 見出しの横の「…」（プロジェクトの一覧の操作。M15 段 6）。null なら出さない。 */
+  viewMenu?: { label: string; open: (anchor: HTMLElement) => void } | null;
 }
 
 /**
@@ -63,6 +66,7 @@ export function Toolbar({
   onSortMenu,
   layout,
   onLayout,
+  viewMenu = null,
 }: ToolbarProps) {
   return (
     <header className={styles.toolbar} data-tauri-drag-region>
@@ -89,6 +93,17 @@ export function Toolbar({
           {subtitle}
         </span>
       </div>
+      {viewMenu && (
+        <button
+          type="button"
+          className={styles.iconButton}
+          aria-label={viewMenu.label}
+          aria-haspopup="menu"
+          onClick={(e) => viewMenu.open(e.currentTarget)}
+        >
+          <MoreIcon size={18} strokeWidth={1.8} />
+        </button>
+      )}
       <div className={styles.search} data-active={query !== '' || undefined}>
         <button
           type="button"

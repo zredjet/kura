@@ -10,6 +10,7 @@ import { SkipForwardIcon } from '../../components/icons/SkipForwardIcon';
 import { VolumeIcon } from '../../components/icons/VolumeIcon';
 import { ja } from '../../i18n/ja';
 import { getItemDetail } from '../../ipc/items';
+import { kindLabel } from '../../ipc/kinds';
 import { formatDuration } from '../../lib/format';
 import { useLoaded } from '../library/inspector/useLoaded';
 import { cycleRepeat, playerController, toggleShuffle, updatePlayerPrefs } from './playerActions';
@@ -33,7 +34,7 @@ export function PlayBar() {
   const item = snapshot.itemId !== null ? controller.item(snapshot.itemId) : undefined;
   const duration = snapshot.durationMs ?? item?.durationMs ?? null;
   const pct = duration ? Math.min(100, (snapshot.positionMs / duration) * 100) : 0;
-  const kindLabel = snapshot.kind ? ja.kinds[snapshot.kind] : '';
+  const kindText = kindLabel(snapshot.kind);
 
   return (
     <div className={styles.bar}>
@@ -57,7 +58,7 @@ export function PlayBar() {
         <div className={styles.meta}>
           <span className={styles.title}>{item?.title ?? ''}</span>
           <span className={styles.sub}>
-            {snapshot.itemId !== null && <TagLine itemId={snapshot.itemId} kind={kindLabel} />}
+            {snapshot.itemId !== null && <TagLine itemId={snapshot.itemId} kind={kindText} />}
           </span>
         </div>
         <div className={styles.transport}>

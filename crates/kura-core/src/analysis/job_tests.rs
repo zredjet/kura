@@ -1,0 +1,1941 @@
+//! 解析のジョブのテスト（plan.md の tests 11）。固定の段のコーデックと小さな実行の場で、Linux でも回る。
+
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use kura_engine::analysis::AnalysisOutput;
+use kura_engine::analysis::audio::peaks::Peaks;
+use kura_engine::budget::Class;
+use kura_engine::codec::{CodecSet, Decoder, ReadSeek, Tier};
+use kura_engine::doc::DecodeOptions;
+use kura_engine::testgen::InputGen;
+use kura_engine::testing::platform::FakePlatformDecoder;
+use kura_engine::value::{LoopRange, PixelFormat};
+use kura_engine::{EngineError, Limits, Monitor, NoMonitor, Shape, Value};
+use rusqlite::params;
+use serde_json::json;
+
+use super::facts::FACTS_V;
+use super::plan::{PLAN_KEY, PlanFingerprint, READ_ID};
+use super::store::{self, INFLIGHT_KEY, Inflight};
+use super::{AnalyzeHandler, AnalyzeShared};
+use crate::edit::{EngineFactory, EngineServices, RuntimeConfig};
+use crate::jobs::{EventSink, JobFilter, JobHandler, JobKind, JobManager, JobRecord, JobState};
+use crate::library::{Library, hex};
+
+const WAIT: Duration = Duration::from_secs(30);
+
+type Hook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 読んだファイル（中身のハッシュの 16 進）を順に記録し、読む前にフックを呼ぶデコーダ（中身は包んだデコーダで読む）。
+struct Watching {
+    inner: Arc<dyn Decoder>,
+    log: Arc<Mutex<Vec<String>>>,
+    hook: Option<Hook>,
+}
+
+impl Decoder for Watching {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+    fn tier(&self) -> Tier {
+        self.inner.tier()
+    }
+    fn reproducible(&self) -> bool {
+        self.inner.reproducible()
+    }
+    fn env(&self) -> Option<kura_engine::codec::CodecEnv> {
+        self.inner.env()
+    }
+    fn can_decode(&self, format: &str) -> bool {
+        self.inner.can_decode(format)
+    }
+    fn work_bytes(&self, format: &str, shape: &Shape) -> u64 {
+        self.inner.work_bytes(format, shape)
+    }
+    fn file_work_bytes(&self, format: &str, shape: &Shape, len: u64) -> u64 {
+        self.inner.file_work_bytes(format, shape, len)
+    }
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.inner.shape(src, format, opts, limits)
+    }
+    fn shape_file(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.log.lock().unwrap().push(format!("shape:{name}"));
+        self.inner.shape_file(path, format, opts, limits)
+    }
+    fn decode(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        self.inner.decode(src, format, opts, limits, mon)
+    }
+    fn decode_file(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.log.lock().unwrap().push(name.clone());
+        if let Some(hook) = &self.hook {
+            hook(&name);
+        }
+        self.inner.decode_file(path, format, opts, limits, mon)
+    }
+    fn streams(&self, format: &str) -> bool {
+        self.inner.streams(format)
+    }
+    fn stream_work_bytes(&self, format: &str, shape: &Shape, len: u64) -> u64 {
+        self.inner.stream_work_bytes(format, shape, len)
+    }
+    fn shape_work_bytes(&self, format: &str, len: u64) -> u64 {
+        self.inner.shape_work_bytes(format, len)
+    }
+    fn held_bytes(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        limits: &Limits,
+    ) -> Result<kura_engine::codec::Held, EngineError> {
+        self.inner.held_bytes(src, format, limits)
+    }
+    fn held_bytes_file(
+        &self,
+        path: &Path,
+        format: &str,
+        limits: &Limits,
+    ) -> Result<kura_engine::codec::Held, EngineError> {
+        self.inner.held_bytes_file(path, format, limits)
+    }
+    fn decode_stream(
+        &self,
+        src: &mut (dyn ReadSeek + Send),
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut kura_engine::codec::DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .decode_stream(src, format, opts, limits, shape, out, mon)
+    }
+    /// 流して読む（音声の解析のジョブ。M13 段 2）も、読んだものとして記録してフックを呼ぶ。
+    fn decode_stream_file(
+        &self,
+        path: &Path,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+        shape: &Shape,
+        out: &mut kura_engine::codec::DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.log.lock().unwrap().push(name.clone());
+        if let Some(hook) = &self.hook {
+            hook(&name);
+        }
+        self.inner
+            .decode_stream_file(path, format, opts, limits, shape, out, mon)
+    }
+}
+
+/// 決まったコーデックの組と予算を返すファクトリ。
+struct TestFactory {
+    codecs: CodecSet,
+    budget: u64,
+}
+
+impl EngineFactory for TestFactory {
+    fn runtime_config(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            cores: Some(2),
+            budget: Some(self.budget),
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn codecs(&self, _work_dir: &Path) -> CodecSet {
+        self.codecs.clone()
+    }
+}
+
+struct Env {
+    _dir: tempfile::TempDir,
+    library: Arc<Library>,
+    engine: Arc<EngineServices>,
+    shared: Arc<AnalyzeShared>,
+    jobs: Arc<JobManager>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+/// 固定の段の png・wav のデコーダを、読んだものを記録する形で包んだ組（`extra` を足す）。
+fn watched_set(
+    log: &Arc<Mutex<Vec<String>>>,
+    hook: Option<Hook>,
+    extra: Vec<Arc<dyn Decoder>>,
+) -> CodecSet {
+    let pinned = CodecSet::pinned();
+    let mut set = CodecSet::default();
+    for format in ["png", "wav"] {
+        for d in pinned.decoders_for(format) {
+            set.add_decoder(Arc::new(Watching {
+                inner: d.clone(),
+                log: log.clone(),
+                hook: hook.clone(),
+            }))
+            .unwrap();
+        }
+    }
+    for d in extra {
+        set.add_decoder(Arc::new(Watching {
+            inner: d,
+            log: log.clone(),
+            hook: hook.clone(),
+        }))
+        .unwrap();
+    }
+    set
+}
+
+impl Env {
+    fn new() -> Self {
+        Self::with(|log, _| watched_set(log, None, Vec::new()), 64 << 20)
+    }
+
+    /// コーデックの組を `make(記録, ライブラリ)` で作る。
+    fn with(
+        make: impl FnOnce(&Arc<Mutex<Vec<String>>>, &Arc<Library>) -> CodecSet,
+        budget: u64,
+    ) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let library = Arc::new(Library::create(&dir.path().join("L.kuralib")).unwrap());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let codecs = make(&log, &library);
+        let engine = Arc::new(EngineServices::new(
+            Arc::new(TestFactory { codecs, budget }),
+            library.layout().staging_dir().join("engine"),
+        ));
+        let shared = Arc::new(AnalyzeShared::default());
+        let sink: EventSink = Arc::new(|_| {});
+        let jobs = Arc::new(
+            JobManager::new(
+                library.clone(),
+                vec![(
+                    JobKind::Analyze,
+                    Arc::new(AnalyzeHandler::new(engine.clone(), shared.clone()))
+                        as Arc<dyn JobHandler>,
+                )],
+                sink,
+            )
+            .unwrap(),
+        );
+        jobs.start().unwrap();
+        Self {
+            _dir: dir,
+            library,
+            engine,
+            shared,
+            jobs,
+            log,
+        }
+    }
+
+    /// 中身 `body` のアイテムを入れる（ハッシュは中身から。新しい順は ID の大きい順）。中身のハッシュの 16 進を返す。
+    fn add(&self, id: i64, kind: &str, ext: &str, body: &[u8]) -> String {
+        let hash = *blake3::hash(body).as_bytes();
+        let path = self.library.layout().content_path(&hash, ext);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        let (kind, ext, size) = (kind.to_string(), ext.to_string(), body.len() as i64);
+        self.library
+            .db()
+            .write(move |tx| {
+                tx.execute(
+                    "INSERT INTO items (id, hash, ext, kind, size_bytes, title, original_name, imported_at,
+                                        updated_at, analysis_state, proxy_state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 't', 't', ?1, ?1, 'pending', 'not_needed')",
+                    params![id, hash.to_vec(), ext, kind, size],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        hex(&hash)
+    }
+
+    /// 解析のジョブを積んで、終わるまで待つ。最後の解析のジョブを返す。
+    fn run(&self) -> JobRecord {
+        self.run_within(WAIT)
+    }
+
+    /// [`Env::run`] を、待つ上限を `wait` にして行う（長い音声を解く重いテスト用）。
+    fn run_within(&self, wait: Duration) -> JobRecord {
+        self.jobs.ensure_queued(JobKind::Analyze, "{}").unwrap();
+        assert!(self.jobs.wait_idle(wait));
+        self.last()
+    }
+
+    fn last(&self) -> JobRecord {
+        self.jobs
+            .list(&JobFilter {
+                kinds: vec![JobKind::Analyze],
+                states: vec![],
+                limit: Some(1),
+            })
+            .unwrap()
+            .remove(0)
+    }
+
+    fn state(&self, id: i64) -> String {
+        self.query(&format!("SELECT analysis_state FROM items WHERE id = {id}"))
+    }
+
+    fn query<T: rusqlite::types::FromSql + Send + 'static>(&self, sql: &str) -> T {
+        let sql = sql.to_string();
+        self.library
+            .db()
+            .read(move |c| Ok(c.query_row(&sql, [], |r| r.get(0))?))
+            .unwrap()
+    }
+
+    /// 中身 `hash_hex` の事実の列 `col`。
+    fn fact<T: rusqlite::types::FromSql + Send + 'static>(&self, hash_hex: &str, col: &str) -> T {
+        self.query(&format!(
+            "SELECT f.{col} FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE hex(b.hash) = upper('{hash_hex}')"
+        ))
+    }
+
+    /// 中身を読んだもの（順に）。
+    fn reads(&self) -> Vec<String> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| !n.starts_with("shape:"))
+            .cloned()
+            .collect()
+    }
+
+    /// ヘッダを読もうとした回数（中身を読む前に失敗したものも数える）。
+    fn tries(&self) -> usize {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.starts_with("shape:"))
+            .count()
+    }
+
+    fn exec(&self, sql: &str) {
+        let sql = sql.to_string();
+        self.library
+            .db()
+            .write(move |tx| {
+                tx.execute_batch(&sql)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+fn png(input: InputGen) -> Vec<u8> {
+    let v = input.generate().unwrap();
+    CodecSet::pinned()
+        .encode_bytes(&v, "png", &json!({}), &NoMonitor)
+        .unwrap()
+        .0
+}
+
+fn wav(frames: u64, loop_range: Option<LoopRange>) -> Vec<u8> {
+    let v = InputGen::Sine {
+        rate: 8_000,
+        channels: 1,
+        frames,
+        freq: 440,
+        loop_range,
+    }
+    .generate()
+    .unwrap();
+    CodecSet::pinned()
+        .encode_bytes(&v, "wav", &json!({}), &NoMonitor)
+        .unwrap()
+        .0
+}
+
+fn sprite(seed: u64) -> Vec<u8> {
+    png(InputGen::PixelSprite {
+        w: 64,
+        h: 64,
+        fmt: PixelFormat::Rgba8,
+        seed,
+    })
+}
+
+fn result_json(record: &JobRecord) -> serde_json::Value {
+    serde_json::from_str(record.result_json.as_deref().unwrap_or("{}")).unwrap()
+}
+
+/// 新しい順に読み、画像・音声の事実と結果を書いて ready にする。JPEG は読まずに形式から、動画は not_needed。
+#[test]
+fn analyzes_newest_first_and_marks_ready() {
+    let env = Env::new();
+    let old = env.add(1, "image", "png", &sprite(7));
+    let song = env.add(
+        2,
+        "audio",
+        "wav",
+        &wav(
+            8_000,
+            Some(LoopRange {
+                start: 100,
+                end: 7_000,
+            }),
+        ),
+    );
+    let noise = env.add(
+        3,
+        "image",
+        "png",
+        &png(InputGen::Noise {
+            w: 32,
+            h: 24,
+            fmt: PixelFormat::Rgba8,
+            seed: 3,
+        }),
+    );
+    let photo = env.add(4, "image", "jpg", b"not really a jpeg");
+    env.add(5, "video", "mp4", b"movie");
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    assert_eq!(
+        env.reads(),
+        [noise.clone(), song.clone(), old.clone()],
+        "新しい順"
+    );
+    for id in 1..=4 {
+        assert_eq!(env.state(id), "ready", "{id}");
+    }
+    assert_eq!(env.state(5), "not_needed");
+
+    // ドット絵のスプライト：二値の透過・16 色以下・等倍でドット絵
+    assert_eq!(env.fact::<i64>(&old, "alpha"), 1);
+    assert_eq!(env.fact::<i64>(&old, "pixel_art"), 1);
+    assert_eq!(env.fact::<i64>(&old, "frame_count"), 1);
+    assert_eq!(env.fact::<i64>(&old, "facts_v"), FACTS_V);
+    assert!(
+        env.fact::<String>(&old, "decoder")
+            .starts_with("png-rs-dec/")
+    );
+    // 乱数の画素：半透明あり・257 色以上でドット絵でない
+    assert_eq!(env.fact::<i64>(&noise, "alpha"), 2);
+    assert_eq!(env.fact::<i64>(&noise, "colors"), 257);
+    assert_eq!(env.fact::<i64>(&noise, "pixel_art"), 0);
+    // 音声：ループ点・レート・深さ・波形の段
+    assert_eq!(env.fact::<i64>(&song, "has_loop"), 1);
+    assert_eq!(
+        (
+            env.fact::<i64>(&song, "loop_start"),
+            env.fact::<i64>(&song, "loop_end")
+        ),
+        (100, 7_000)
+    );
+    assert_eq!(env.fact::<i64>(&song, "sample_rate"), 8_000);
+    assert_eq!(env.fact::<i64>(&song, "channels"), 1);
+    assert!(env.fact::<Option<f64>>(&song, "loudness").is_some());
+    assert!(env.library.layout().peaks_path(&song).is_file());
+    // JPEG：読まずに形式から（透過なし・色数は計らない・ドット絵でない・デコーダなし）
+    assert_eq!(env.fact::<i64>(&photo, "alpha"), 0);
+    assert_eq!(env.fact::<Option<i64>>(&photo, "colors"), None);
+    assert_eq!(env.fact::<i64>(&photo, "pixel_art"), 0);
+    assert_eq!(env.fact::<Option<String>>(&photo, "decoder"), None);
+    // 結果の表：読み取りの記録・段 1・段 2（スプライトは透過があるので格子の推定も）
+    let analyses: String = env.query(&format!(
+        "SELECT group_concat(r.analysis, ',') FROM (SELECT r.analysis FROM analysis_results r JOIN blobs b
+           ON b.id = r.blob_id WHERE hex(b.hash) = upper('{old}') ORDER BY r.analysis) r"
+    ));
+    assert_eq!(
+        analyses,
+        "image.alpha,image.colors,image.pixel_scale,image.sprite_grid,kura.read"
+    );
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM media_facts"),
+        4,
+        "動画には事実を書かない"
+    );
+    let summary = result_json(&record);
+    assert_eq!(
+        (summary["done"].as_u64(), summary["reused"].as_u64()),
+        (Some(5), Some(0))
+    );
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.inflight'"),
+        0
+    );
+}
+
+/// 優先の指定（インスペクタで選んだもの）を先に解く。
+#[test]
+fn prioritized_items_go_first() {
+    let env = Env::new();
+    let a = env.add(1, "image", "png", &sprite(1));
+    let b = env.add(2, "image", "png", &sprite(2));
+    let c = env.add(3, "image", "png", &sprite(3));
+    env.shared.prioritize(vec![1, 99]);
+    env.run();
+    assert_eq!(env.reads(), [a, c, b]);
+}
+
+/// 中止したら、解いていた 1 件と残りは pending のまま（書きためた分は書く）。書く前に落ちても（書き込みの失敗）pending のまま。
+#[test]
+fn cancel_or_crash_leaves_items_pending() {
+    let manager: Arc<OnceLock<Arc<JobManager>>> = Arc::new(OnceLock::new());
+    let slot = manager.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let r = reads.clone();
+    let hook: Hook = Arc::new(move |_| {
+        // 2 件目を読んでいる途中で中止を頼む
+        if r.fetch_add(1, Ordering::SeqCst) == 1
+            && let Some(jobs) = slot.get()
+        {
+            let running = jobs
+                .list(&JobFilter {
+                    kinds: vec![JobKind::Analyze],
+                    states: vec![JobState::Running],
+                    limit: Some(1),
+                })
+                .unwrap();
+            jobs.cancel(running[0].id).unwrap();
+        }
+    });
+    let env = Env::with(|log, _| watched_set(log, Some(hook), Vec::new()), 64 << 20);
+    let _ = manager.set(env.jobs.clone());
+    for id in 1..=3 {
+        env.add(id, "image", "png", &sprite(id as u64));
+    }
+    let record = env.run();
+    assert_eq!(record.state, JobState::Canceled);
+    assert_eq!(env.state(3), "ready", "中止の前に解いたものは書く");
+    assert_eq!(env.state(2), "pending", "解いていたものは捨てる");
+    assert_eq!(env.state(1), "pending");
+    assert_eq!(env.query::<i64>("SELECT count(*) FROM media_facts"), 1);
+
+    // 書き込みが失敗する（書く前に落ちたのと同じく、何も書かれない）
+    env.exec(
+        "CREATE TRIGGER fail_facts BEFORE INSERT ON media_facts BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    );
+    let record = env.run();
+    assert_eq!(record.state, JobState::Failed);
+    assert_eq!(
+        (env.state(2), env.state(1)),
+        ("pending".into(), "pending".into())
+    );
+    env.exec("DROP TRIGGER fail_facts");
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    assert_eq!(
+        (env.state(2), env.state(1)),
+        ("ready".into(), "ready".into())
+    );
+}
+
+/// 音声を流して解いている途中で中止すると、解いていたものは捨てて pending のまま（流れのデコード・解析の扇の中止。
+/// M13 段 2 の検証の直し）。前に解いたものは書く。
+#[test]
+fn cancel_while_streaming_audio_leaves_it_pending() {
+    let manager: Arc<OnceLock<Arc<JobManager>>> = Arc::new(OnceLock::new());
+    let slot = manager.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let r = reads.clone();
+    let hook: Hook = Arc::new(move |_| {
+        // 2 件目を流して読む前に中止を頼む（流れの中で見張りが中止を見る）
+        if r.fetch_add(1, Ordering::SeqCst) == 1
+            && let Some(jobs) = slot.get()
+        {
+            let running = jobs
+                .list(&JobFilter {
+                    kinds: vec![JobKind::Analyze],
+                    states: vec![JobState::Running],
+                    limit: Some(1),
+                })
+                .unwrap();
+            jobs.cancel(running[0].id).unwrap();
+        }
+    });
+    let env = Env::with(|log, _| watched_set(log, Some(hook), Vec::new()), 64 << 20);
+    let _ = manager.set(env.jobs.clone());
+    for id in 1..=3 {
+        env.add(id, "audio", "wav", &wav(8_000 * (id as u64 + 2), None));
+    }
+    let record = env.run();
+    assert_eq!(record.state, JobState::Canceled);
+    assert_eq!(env.state(3), "ready", "中止の前に解いたものは書く");
+    assert_eq!(env.state(2), "pending", "解いていたものは捨てる");
+    assert_eq!(env.state(1), "pending");
+    assert_eq!(env.query::<i64>("SELECT count(*) FROM media_facts"), 1);
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    assert_eq!(
+        (env.state(2), env.state(1)),
+        ("ready".into(), "ready".into())
+    );
+}
+
+/// 同じ中身の結果がそろっていれば、読まずに使う（読み取りの記録の列も変えない）。
+#[test]
+fn same_content_results_are_reused_without_decoding() {
+    let env = Env::new();
+    let img = env.add(1, "image", "png", &sprite(5));
+    let song = env.add(2, "audio", "wav", &wav(4_000, None));
+    env.run();
+    assert_eq!(env.reads().len(), 2);
+    let before: (String, i64) = (env.fact(&img, "decoder"), env.fact(&img, "pixel_art"));
+    env.exec("UPDATE items SET analysis_state = 'pending'");
+    let record = env.run();
+    assert_eq!(env.reads().len(), 2, "読み直さない");
+    assert_eq!(
+        (env.state(1), env.state(2)),
+        ("ready".into(), "ready".into())
+    );
+    assert_eq!(
+        (
+            env.fact::<String>(&img, "decoder"),
+            env.fact::<i64>(&img, "pixel_art")
+        ),
+        before
+    );
+    assert_eq!(result_json(&record)["reused"].as_u64(), Some(2));
+
+    // 波形の段のファイルがなくなっていたら、読み直して作る
+    std::fs::remove_file(env.library.layout().peaks_path(&song)).unwrap();
+    env.exec("UPDATE items SET analysis_state = 'pending'");
+    env.run();
+    assert_eq!(env.reads().len(), 3);
+    assert!(env.library.layout().peaks_path(&song).is_file());
+}
+
+/// 起動のスレッドの `sync_plan` で、前の指紋を置いてから今の指紋と比べる（前の版の Kura から更新した起動の代わり）。
+fn sync_from(env: &Env, older: PlanFingerprint) -> store::PlanSync {
+    let current = PlanFingerprint::current(&kura_engine::analysis::registry().unwrap()).unwrap();
+    let old_json = older.to_canonical().unwrap();
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![PLAN_KEY, old_json],
+            )?;
+            store::sync_plan(tx, &current)
+        })
+        .unwrap()
+}
+
+/// デコーダの識別子が変わって pending に戻したもの（前の組のデコーダで読んだもの）は、同じ中身の結果がそろっていても使い回さず、
+/// 今のデコーダで読み直す（E1。docs/data-model.md「解析の読み書き」の「デコーダの識別子が変わったときだけ解き直す」）。
+#[test]
+fn a_decoder_change_rereads_instead_of_reusing_old_results() {
+    let env = Env::new();
+    let img = env.add(1, "image", "png", &sprite(9));
+    env.run();
+    assert_eq!(env.reads().len(), 1);
+    let now: String = env.fact(&img, "decoder");
+    // 前の実行は、今の組にない古いデコーダ（png-rs-dec/0）で読んだことにする（kura の更新でデコーダの版を上げたとき）
+    env.exec(&format!(
+        "UPDATE media_facts SET decoder = 'png-rs-dec/0';
+         UPDATE settings SET value = replace(value, '{now}', 'png-rs-dec/0') WHERE key = 'analysis.decoders';"
+    ));
+    let record = env.run();
+    assert_eq!(env.reads().len(), 2, "デコーダが変わったので読み直す");
+    assert_eq!(result_json(&record)["reused"].as_u64(), Some(0));
+    assert_eq!(env.fact::<String>(&img, "decoder"), now);
+    assert_eq!(env.state(1), "ready");
+    env.run();
+    assert_eq!(env.reads().len(), 2, "読み直したあとは読まない");
+}
+
+/// 投影の版が上がったら（古い行）、読まずに結果の表から作り直し、作り直しの印を消す。
+#[test]
+fn facts_version_bump_reprojects_without_decoding() {
+    let env = Env::new();
+    let img = env.add(1, "image", "png", &sprite(6));
+    let photo = env.add(2, "image", "jpg", b"jpeg");
+    env.run();
+    assert_eq!(env.reads().len(), 1);
+    // 前の版の Kura の投影（facts_v 0）で書いた行
+    env.exec("UPDATE media_facts SET facts_v = 0, pixel_art = NULL, alpha = NULL, colors = NULL, frame_count = NULL");
+    let current = PlanFingerprint::current(&kura_engine::analysis::registry().unwrap()).unwrap();
+    let mut older = current.clone();
+    older.facts_v = 0;
+    let synced = sync_from(&env, older);
+    assert_eq!((synced.reset, synced.todo), (0, true));
+    let record = env.run();
+    assert_eq!(env.reads().len(), 1, "読み直さない");
+    assert_eq!(result_json(&record)["reprojected"].as_u64(), Some(2));
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.reproject'"),
+        0,
+        "作り直し終えたら印を消す"
+    );
+    let again = env.run();
+    assert_eq!(result_json(&again)["reprojected"].as_u64(), Some(0));
+    assert_eq!(env.fact::<i64>(&img, "facts_v"), FACTS_V);
+    assert_eq!(
+        (
+            env.fact::<i64>(&img, "alpha"),
+            env.fact::<i64>(&img, "pixel_art"),
+            env.fact::<i64>(&img, "frame_count")
+        ),
+        (1, 1, 1)
+    );
+    assert!(env.fact::<i64>(&img, "colors") <= 16);
+    assert_eq!(
+        (
+            env.fact::<i64>(&photo, "alpha"),
+            env.fact::<i64>(&photo, "pixel_art")
+        ),
+        (0, 0)
+    );
+    assert_eq!(env.state(1), "ready");
+}
+
+/// 投影の古い行の走査は、起動のスレッドが計画の指紋（投影の版・ドット絵の規則）の変化を見たときだけ。変わっていなければ、
+/// ジョブは動くたびに事実の表を走査しない（D3）。
+#[test]
+fn reprojection_waits_for_the_projection_to_change() {
+    let env = Env::new();
+    let img = env.add(1, "image", "png", &sprite(6));
+    env.run();
+    env.exec("UPDATE media_facts SET facts_v = 0");
+    let record = env.run();
+    assert_eq!(result_json(&record)["reprojected"].as_u64(), Some(0));
+    assert_eq!(env.fact::<i64>(&img, "facts_v"), 0);
+}
+
+/// 読めないものは失敗を記録し、指紋が変わるか頼まれるまで読み直さない。
+#[test]
+fn failure_is_recorded_and_not_retried_until_fingerprint_changes() {
+    let env = Env::new();
+    let broken = env.add(1, "image", "png", b"\x89PNG broken");
+    env.run();
+    assert_eq!(env.state(1), "failed");
+    assert_eq!(env.fact::<String>(&broken, "state"), "failed");
+    assert_eq!(env.fact::<String>(&broken, "error_code"), "decode");
+    let tried = env.tries();
+    env.run();
+    assert_eq!(env.tries(), tried, "失敗したものは読み直さない");
+    assert_eq!(env.state(1), "failed");
+
+    // 画像の解析の版が変わった（起動のスレッドの sync_plan）
+    let registry = kura_engine::analysis::registry().unwrap();
+    let current = PlanFingerprint::current(&registry).unwrap();
+    let mut older = current.clone();
+    older
+        .kinds
+        .get_mut("image")
+        .unwrap()
+        .get_mut("image.alpha")
+        .unwrap()
+        .0 = 0;
+    let old_json = older.to_canonical().unwrap();
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![PLAN_KEY, old_json],
+            )?;
+            store::sync_plan(tx, &current)
+        })
+        .unwrap();
+    assert_eq!(env.state(1), "pending");
+    env.run();
+    assert_eq!(env.tries(), tried + 1);
+    assert_eq!(env.state(1), "failed");
+
+    // 利用者が頼んだ（retry_analysis）
+    env.library
+        .db()
+        .write(|tx| store::retry_failed(tx, &[1]))
+        .unwrap();
+    env.run();
+    assert_eq!(env.tries(), tried + 2);
+}
+
+/// 固定の段の SVG のデコーダを、`/bin/sh -c script` の偽の働き手（時間の上限 `ms`）に頼む形に差し替えた組。
+fn svg_worker_set(log: &Arc<Mutex<Vec<String>>>, script: &str, ms: u64) -> CodecSet {
+    use crate::codec_ext::svg_worker::WorkerCommand;
+    svg_worker_set_with(log, WorkerCommand::new("/bin/sh", ["-c", script]), ms)
+}
+
+/// 固定の段の SVG のデコーダを、`worker` の働き手（時間の上限 `ms`）に頼む形に差し替えた組。
+fn svg_worker_set_with(
+    log: &Arc<Mutex<Vec<String>>>,
+    worker: crate::codec_ext::svg_worker::WorkerCommand,
+    ms: u64,
+) -> CodecSet {
+    use crate::codec_ext::svg_worker::{Deadlines, install_with};
+    let mut set = watched_set(log, None, Vec::new());
+    let svg = CodecSet::pinned()
+        .decoder_by_id(kura_engine::codec::svg::DEC_ID)
+        .cloned()
+        .unwrap();
+    set.add_decoder(svg).unwrap();
+    install_with(
+        &mut set,
+        &kura_engine::codec::PinnedOptions::default(),
+        worker,
+        Deadlines {
+            shape: Duration::from_millis(ms),
+            decode: Duration::from_millis(ms),
+        },
+    )
+    .unwrap();
+    set
+}
+
+const TINY_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"/>"#;
+
+/// 決定 23：別のプロセスで読む SVG が時間の上限を超えたら、そのアイテムは failed（too_large）にして先へ進む。形を読む子は
+/// ジョブの中止で止める（中止を時間の上限まで待たせない。ライブラリを閉じるときも同じ）。
+#[test]
+fn svg_worker_time_limits_fail_the_item_and_cancel_stops_the_child() {
+    let env = Env::with(|log, _| svg_worker_set(log, "sleep 40.4159", 200), 64 << 20);
+    let svg = env.add(2, "image", "svg", TINY_SVG);
+    env.add(1, "image", "png", &sprite(3));
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    assert_eq!(env.state(2), "failed");
+    assert_eq!(env.fact::<String>(&svg, "error_code"), "too_large");
+    assert_eq!(env.state(1), "ready", "次のアイテムへ進む");
+
+    let env = Env::with(
+        |log, _| svg_worker_set(log, "sleep 41.4159", 60_000),
+        64 << 20,
+    );
+    env.add(1, "image", "svg", TINY_SVG);
+    env.jobs.ensure_queued(JobKind::Analyze, "{}").unwrap();
+    let running = loop {
+        let r = env
+            .jobs
+            .list(&JobFilter {
+                kinds: vec![JobKind::Analyze],
+                states: vec![JobState::Running],
+                limit: Some(1),
+            })
+            .unwrap();
+        if let Some(r) = r.into_iter().next() {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // 子が形を読み始めるまで待ってから中止する
+    std::thread::sleep(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    env.jobs.cancel(running.id).unwrap();
+    assert!(
+        env.jobs.wait_idle(Duration::from_secs(3)),
+        "中止を待たされる"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(env.last().state, JobState::Canceled);
+    assert_eq!(env.state(1), "pending");
+}
+
+/// M11 の 3 回目の確認 W2：SVG の働き手を使えない（別のビルド・起動できない）のはアイテムのせいではない。そのアイテムは
+/// 失敗にせず（pending のまま）、書きためた分を書いて処理中の印を消し、ジョブを失敗にしてその場で止める（同じアイテムを
+/// 拾い続けない）。次にジョブを積めばやり直す（1 回の実行で働き手を 1 回だけ起動する）。
+#[test]
+fn an_unavailable_svg_worker_leaves_the_item_pending_and_stops_the_job() {
+    use crate::codec_ext::svg_worker::{WORKER_ARG, WorkerCommand};
+    let dir = tempfile::tempdir().unwrap();
+    let count = dir.path().join("spawned");
+    let spawned = || {
+        std::fs::read_to_string(&count)
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    };
+    // 前の版のやり取り（版 1）で答える働き手（動かしたまま置き換えた前のビルド）
+    let script = format!(
+        r"echo x >> '{}'; cat >/dev/null; printf 'KURASVG<\001\000\000\000\000\000\000\000'",
+        count.display()
+    );
+    let env = Env::with(|log, _| svg_worker_set(log, &script, 5_000), 64 << 20);
+    env.add(1, "image", "png", &sprite(3));
+    let svg = env.add(2, "image", "svg", TINY_SVG);
+    env.add(3, "image", "png", &sprite(4));
+    for round in 1..=2 {
+        let record = env.run();
+        assert_eq!(record.state, JobState::Failed, "{round}");
+        let message = record.message.unwrap_or_default();
+        assert!(
+            message.contains("SVG を読む働き手") && message.contains("解析を止めました"),
+            "{message}"
+        );
+        assert_eq!(record.error_code.as_deref(), Some("ToolFailed"));
+        assert_eq!(env.state(2), "pending", "{round}: 失敗にしない");
+        assert_eq!(env.state(3), "ready", "{round}: 先に解いた分は書く");
+        assert_eq!(env.state(1), "pending", "{round}: その場で止める");
+        assert_eq!(spawned(), round, "1 回の実行で起動は 1 回");
+        let mark: i64 = env.query(&format!(
+            "SELECT COUNT(*) FROM settings WHERE key = '{INFLIGHT_KEY}'"
+        ));
+        assert_eq!(mark, 0, "処理中の印を消す");
+    }
+    let facts: i64 = env.query(&format!(
+        "SELECT COUNT(*) FROM media_facts f JOIN blobs b ON b.id = f.blob_id WHERE hex(b.hash) = upper('{svg}')"
+    ));
+    assert_eq!(facts, 0, "失敗の事実を書かない");
+
+    // 起動できない（動かしたまま移した・消した）も同じ
+    let missing = dir.path().join("moved/kura-app");
+    let env = Env::with(
+        |log, _| svg_worker_set_with(log, WorkerCommand::new(&missing, [WORKER_ARG]), 5_000),
+        64 << 20,
+    );
+    env.add(1, "image", "svg", TINY_SVG);
+    let record = env.run();
+    assert_eq!(record.state, JobState::Failed);
+    assert!(
+        record
+            .message
+            .unwrap_or_default()
+            .contains("起動できません"),
+        "{:?}",
+        env.last()
+    );
+    assert_eq!(env.state(1), "pending");
+}
+
+/// 見積もりが min(予算/2, 1 GiB) を超えるものは、予算を確保せずに failed（too_large）にする（予算が埋まっていても待たない）。
+#[test]
+fn too_large_fails_without_acquiring() {
+    let env = Env::with(|log, _| watched_set(log, None, Vec::new()), 1 << 20);
+    let big = env.add(
+        1,
+        "image",
+        "png",
+        &png(InputGen::Noise {
+            w: 256,
+            h: 256,
+            fmt: PixelFormat::Rgba8,
+            seed: 1,
+        }),
+    );
+    // 予算をすべて持っておく：確保しようとすれば待ち続けて終わらない
+    let runtime = env.engine.runtime().unwrap().clone();
+    let held = runtime
+        .budget()
+        .try_acquire(runtime.budget().total(), Class::Interactive)
+        .unwrap()
+        .unwrap();
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    assert_eq!(env.state(1), "failed");
+    assert_eq!(env.fact::<String>(&big, "error_code"), "too_large");
+    assert!(env.reads().is_empty(), "読まない");
+    assert_eq!(env.tries(), 1, "ヘッダだけ読んで見積もる");
+    drop(held);
+    assert_eq!(runtime.budget().used().unwrap(), 0);
+}
+
+/// 波形の段のファイルは DB に書く前に置く（書き込みが失敗してもファイルはあり、アイテムは pending のまま）。
+#[test]
+fn peaks_file_written_before_commit() {
+    let env = Env::new();
+    let song = env.add(1, "audio", "wav", &wav(20_000, None));
+    let peaks = env.library.layout().peaks_path(&song);
+    env.exec(
+        "CREATE TRIGGER fail_facts BEFORE INSERT ON media_facts BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+    );
+    let record = env.run();
+    assert_eq!(record.state, JobState::Failed);
+    assert!(peaks.is_file(), "コミットの前に置いている");
+    assert_eq!(env.state(1), "pending");
+    assert_eq!(env.query::<i64>("SELECT count(*) FROM analysis_results"), 0);
+    env.exec("DROP TRIGGER fail_facts");
+    env.run();
+    assert_eq!(env.state(1), "ready");
+    let bytes = std::fs::read(&peaks).unwrap();
+    let parsed = Peaks::from_canonical(&bytes).unwrap();
+    assert_eq!(parsed.frames, 20_000);
+    let (encoding, output_len, has_output): (String, i64, bool) = env
+        .library
+        .db()
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT encoding, output_len, output IS NOT NULL FROM analysis_results WHERE analysis = 'audio.peaks'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        (encoding.as_str(), output_len, has_output),
+        ("binary", bytes.len() as i64, false)
+    );
+    // 置き場の一時ファイルは残さない
+    let leftovers: Vec<_> = std::fs::read_dir(env.library.layout().staging_dir())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("peaks-"))
+        .collect();
+    assert!(leftovers.is_empty());
+}
+
+/// OS のデコーダ（Platform の段）で読むときは、読む前に処理中の印を付けてコミットし、書いたら消す。前の実行が印を残して
+/// 終わっていたら（読んでいる途中で落ちた）、そのアイテムを failed（crashed）にして先へ進む。
+#[test]
+fn os_decoder_marks_the_item_before_reading_and_a_crash_fails_it() {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let s = seen.clone();
+    let env = Env::with(
+        |log, library| {
+            let library = library.clone();
+            let hook: Hook = Arc::new(move |_| {
+                let mark: Option<String> = library
+                    .db()
+                    .read(|c| {
+                        Ok(c.query_row(
+                            "SELECT value FROM settings WHERE key = ?1",
+                            [INFLIGHT_KEY],
+                            |r| r.get(0),
+                        )
+                        .ok())
+                    })
+                    .unwrap();
+                s.lock().unwrap().push(mark);
+            });
+            let fake = FakePlatformDecoder::new(
+                "fake-imageio-dec/1",
+                &["bmp"],
+                InputGen::Noise {
+                    w: 8,
+                    h: 8,
+                    fmt: PixelFormat::Rgba8,
+                    seed: 2,
+                },
+            );
+            watched_set(log, Some(hook), vec![Arc::new(fake)])
+        },
+        64 << 20,
+    );
+    let bmp = env.add(1, "image", "bmp", b"BM fake");
+    let pngh = env.add(2, "image", "png", &sprite(2));
+    env.run();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    let marks: Vec<Option<Inflight>> = seen
+        .iter()
+        .map(|m| m.as_deref().and_then(|j| serde_json::from_str(j).ok()))
+        .collect();
+    assert_eq!(marks[0], None, "固定の段では印を付けない");
+    assert_eq!(
+        marks[1],
+        Some(Inflight {
+            id: 1,
+            hash: bmp.clone()
+        }),
+        "OS のデコーダで読む前に印をコミットしている"
+    );
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.inflight'"),
+        0
+    );
+    assert_eq!(
+        (env.state(1), env.state(2)),
+        ("ready".into(), "ready".into())
+    );
+    assert_eq!(env.fact::<String>(&bmp, "decoder"), "fake-imageio-dec/1");
+    assert_eq!(env.fact::<i64>(&bmp, "reproducible"), 0);
+    assert!(env.fact::<String>(&bmp, "env").contains("fake"));
+    assert!(!pngh.is_empty());
+
+    // 前回、3 を OS のデコーダで読んでいる途中で落ちた
+    let crashed = env.add(3, "image", "bmp", b"BM crash");
+    env.add(4, "image", "png", &sprite(4));
+    let mark = serde_json::to_string(&Inflight {
+        id: 3,
+        hash: crashed.clone(),
+    })
+    .unwrap();
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)",
+                params![INFLIGHT_KEY, mark],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let reads = env.reads().len();
+    env.run();
+    assert_eq!(env.state(3), "failed");
+    assert_eq!(env.fact::<String>(&crashed, "error_code"), "crashed");
+    assert_eq!(env.state(4), "ready");
+    assert_eq!(env.reads().len(), reads + 1, "落ちたものは読み直さない");
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.inflight'"),
+        0
+    );
+}
+
+/// M11 の確かめ C1：印を付けるかは、コーデックの組にその形式の Platform のデコーダがあるかで決める（どの段が読むかは読む前に
+/// 分からない）。アプリの組では、固定の段が先に読む形式（WAV・AIFF・Ogg・m4a・PSD など）の後ろの段に AudioToolbox・ImageIO が
+/// あるので、それらも読む前に印を付け、強制終了ならその 1 件は crashed になる（docs/data-model.md §4「解析の読み書き」）。
+#[test]
+fn the_mark_covers_formats_a_platform_decoder_could_read_even_when_a_fixed_stage_reads_them() {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let s = seen.clone();
+    let env = Env::with(
+        |log, library| {
+            let library = library.clone();
+            let hook: Hook = Arc::new(move |_| {
+                let mark: Option<String> = library
+                    .db()
+                    .read(|c| {
+                        Ok(c.query_row(
+                            "SELECT value FROM settings WHERE key = ?1",
+                            [INFLIGHT_KEY],
+                            |r| r.get(0),
+                        )
+                        .ok())
+                    })
+                    .unwrap();
+                s.lock().unwrap().push(mark);
+            });
+            // png の後ろの段に偽の OS のデコーダを置く（読むのは前の段の固定の png）
+            let fake = FakePlatformDecoder::new(
+                "fake-imageio-dec/1",
+                &["png"],
+                InputGen::Noise {
+                    w: 8,
+                    h: 8,
+                    fmt: PixelFormat::Rgba8,
+                    seed: 2,
+                },
+            );
+            watched_set(log, Some(hook), vec![Arc::new(fake)])
+        },
+        64 << 20,
+    );
+    let pngh = env.add(1, "image", "png", &sprite(2));
+    env.run();
+    let marks: Vec<Option<Inflight>> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_deref().and_then(|j| serde_json::from_str(j).ok()))
+        .collect();
+    assert_eq!(
+        marks,
+        vec![Some(Inflight {
+            id: 1,
+            hash: pngh.clone()
+        })],
+        "固定の段が読む形式でも、組に OS のデコーダがあれば読む前に印をコミットしている"
+    );
+    assert!(
+        env.fact::<String>(&pngh, "decoder")
+            .starts_with("png-rs-dec/")
+    );
+    assert_eq!(env.state(1), "ready");
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.inflight'"),
+        0,
+        "書いたら消す"
+    );
+}
+
+/// OS のデコーダで読んだあとに落ちずに失敗した（波形の段を書けない）ときは、処理中の印を消してジョブを失敗にする
+/// （次に動いたときに crashed と取り違えない。アイテムは pending のまま）。
+#[test]
+fn an_error_after_marking_clears_the_mark() {
+    let env = Env::with(
+        |log, _| {
+            let fake = FakePlatformDecoder::new(
+                "fake-audiotoolbox-dec/1",
+                &["opus"],
+                InputGen::Sine {
+                    rate: 8_000,
+                    channels: 1,
+                    frames: 4_000,
+                    freq: 440,
+                    loop_range: None,
+                },
+            );
+            watched_set(log, None, vec![Arc::new(fake)])
+        },
+        64 << 20,
+    );
+    let song = env.add(1, "audio", "opus", b"OggS fake opus");
+    // 波形の段の置き場を塞ぐ
+    let peaks_dir = env
+        .library
+        .layout()
+        .peaks_path(&song)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::create_dir_all(peaks_dir.parent().unwrap()).unwrap();
+    std::fs::write(&peaks_dir, b"not a dir").unwrap();
+    let record = env.run();
+    assert_eq!(record.state, JobState::Failed);
+    assert_eq!(env.state(1), "pending");
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.inflight'"),
+        0
+    );
+    std::fs::remove_file(&peaks_dir).unwrap();
+    env.run();
+    assert_eq!(env.state(1), "ready", "crashed にしない");
+    assert_eq!(
+        env.fact::<String>(&song, "decoder"),
+        "fake-audiotoolbox-dec/1"
+    );
+}
+
+/// 知らない種類（DB の CHECK を外して入れたもの）・知らない拡張子は読まずに failed（unsupported）にし、ほかは止めずに解く。
+#[test]
+fn unknown_kinds_and_formats_fail_without_stopping() {
+    let env = Env::new();
+    env.exec("ALTER TABLE items DROP CONSTRAINT items_kind");
+    let sticker = env.add(1, "sticker", "png", &sprite(1));
+    let odd = env.add(2, "image", "xyz", b"odd");
+    env.add(3, "image", "png", &sprite(3));
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    assert_eq!(
+        (env.state(1), env.state(2), env.state(3)),
+        ("failed".into(), "failed".into(), "ready".into())
+    );
+    assert_eq!(env.fact::<String>(&sticker, "error_code"), "unsupported");
+    assert_eq!(env.fact::<String>(&odd, "error_code"), "unsupported");
+    assert_eq!(env.reads().len(), 1);
+}
+
+/// 読み取りの記録は結果の表に kura.read として残り、読まずに計画を立てるのに使う。
+/// 解析のジョブが書いた格子の推定（`image.sprite_grid`）を、素材の欄（`asset::get`）が同じ形で読む（書き手と読み手。
+/// 格子のシートの「推定を使う」。M12）。コマの数は中身のあるセルの数（末尾の 2 つが空）。透過も 256 色以下でもない
+/// 写真は段 2 に入らないので推定がない。
+#[test]
+fn the_sprite_grid_written_by_the_job_is_the_asset_grid_estimate() {
+    let env = Env::new();
+    let sheet = png(InputGen::SpriteSheet {
+        cols: 5,
+        rows: 4,
+        cell_w: 8,
+        cell_h: 8,
+        gap_x: 1,
+        gap_y: 1,
+        margin_x: 1,
+        margin_y: 1,
+        pad_right: 1,
+        pad_bottom: 1,
+        background: None,
+        full: true,
+        empty: vec![18, 19],
+        seed: 7,
+    });
+    env.add(1, "image", "png", &sheet);
+    env.add(
+        2,
+        "image",
+        "png",
+        &png(InputGen::Noise {
+            w: 32,
+            h: 24,
+            fmt: PixelFormat::Rgb8,
+            seed: 3,
+        }),
+    );
+    env.run();
+    let read = |id: i64| {
+        env.library
+            .db()
+            .read(move |c| crate::asset::get(c, id))
+            .unwrap()
+    };
+    let estimate = read(1).grid_estimate.unwrap();
+    assert_eq!(
+        estimate.grid,
+        crate::asset::GridSetting {
+            cell_w: 8,
+            cell_h: 8,
+            offset_x: 1,
+            offset_y: 1,
+            gap_x: 1,
+            gap_y: 1,
+            count: Some(18),
+        }
+    );
+    assert_eq!((estimate.cols, estimate.rows, estimate.filled), (5, 4, 18));
+    assert_eq!(read(2).grid_estimate, None);
+}
+
+#[test]
+fn read_record_is_kept_with_the_results() {
+    let env = Env::new();
+    let song = env.add(1, "audio", "wav", &wav(1_000, None));
+    env.run();
+    let read: Vec<u8> = env.query(&format!(
+        "SELECT r.output FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+          WHERE r.analysis = '{READ_ID}' AND hex(b.hash) = upper('{song}')"
+    ));
+    let read = super::facts::ReadRecord::from_canonical(&read).unwrap();
+    assert!(matches!(
+        read,
+        super::facts::ReadRecord::Audio {
+            rate: 8_000,
+            channels: 1,
+            frames: 1_000,
+            ..
+        }
+    ));
+}
+
+/// HEIC・HEIF の偽の OS のデコーダ（段は Platform。決定 15 のテスト）：中身の先頭が `ALPHA` ならアルファのある形（読むと
+/// 二値の透過のスプライト）、`BROKEN` なら見出しも読めない（壊れたファイル）、ほかは不透明な形（読むと不透明な乱数）。
+/// 見出し（形）を読む前に `on_shape` を呼ぶ。
+struct FakeHeif {
+    on_shape: Option<Hook>,
+}
+
+impl FakeHeif {
+    fn input(bytes: &[u8]) -> InputGen {
+        if bytes.starts_with(b"ALPHA") {
+            InputGen::PixelSprite {
+                w: 64,
+                h: 64,
+                fmt: PixelFormat::Rgba8,
+                seed: 1,
+            }
+        } else {
+            InputGen::Noise {
+                w: 32,
+                h: 24,
+                fmt: PixelFormat::Rgb8,
+                seed: 2,
+            }
+        }
+    }
+
+    fn read(src: &mut dyn ReadSeek) -> Result<Vec<u8>, EngineError> {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(src, &mut bytes)?;
+        if bytes.starts_with(b"BROKEN") {
+            return Err(EngineError::Decode {
+                codec: "fake-heif-dec/1".into(),
+                message: "壊れた見出し".into(),
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+impl Decoder for FakeHeif {
+    fn id(&self) -> &'static str {
+        "fake-heif-dec/1"
+    }
+    fn tier(&self) -> Tier {
+        Tier::Platform
+    }
+    fn reproducible(&self) -> bool {
+        false
+    }
+    fn can_decode(&self, format: &str) -> bool {
+        matches!(format, "heic" | "heif")
+    }
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        _opts: &DecodeOptions,
+        _limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        if let Some(hook) = &self.on_shape {
+            hook("shape");
+        }
+        let bytes = Self::read(src)?;
+        Ok(Self::input(&bytes).generate()?.shape())
+    }
+    fn decode(
+        &self,
+        src: &mut dyn ReadSeek,
+        _format: &str,
+        _opts: &DecodeOptions,
+        _limits: &Limits,
+        _mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        let bytes = Self::read(src)?;
+        Self::input(&bytes).generate()
+    }
+}
+
+/// 検索の一致（ID の順）。
+fn search(env: &Env, text: &str) -> Vec<u32> {
+    let expr = crate::query::parse(text).unwrap().expr;
+    let mut ids = env
+        .library
+        .db()
+        .read(move |c| {
+            let query = crate::items::ItemQuery {
+                filter: Some(expr),
+                ..crate::items::ItemQuery::default()
+            };
+            let ctx = crate::query::QueryContext {
+                now_ms: 0,
+                utc_offset_minutes: 0,
+            };
+            Ok(crate::items::query_ids(c, &query, &ctx)?.ids)
+        })
+        .unwrap();
+    ids.sort_unstable();
+    ids
+}
+
+/// 見出し（形）を読んだもの（中身のハッシュの 16 進。順に）。
+fn headers(env: &Env) -> Vec<String> {
+    env.log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n.strip_prefix("shape:").map(str::to_string))
+        .collect()
+}
+
+/// 固定の段の JPEG のデコーダと、見出しを読む前に処理中の印を記録する偽の HEIC・HEIF のデコーダを足した環境。
+fn heif_env(seen: &Arc<Mutex<Vec<Option<Inflight>>>>) -> Env {
+    let s = seen.clone();
+    Env::with(
+        |log, library| {
+            let library = library.clone();
+            let on_shape: Hook = Arc::new(move |_| {
+                let mark: Option<String> = library
+                    .db()
+                    .read(|c| {
+                        Ok(c.query_row(
+                            "SELECT value FROM settings WHERE key = ?1",
+                            [INFLIGHT_KEY],
+                            |r| r.get(0),
+                        )
+                        .ok())
+                    })
+                    .unwrap();
+                s.lock()
+                    .unwrap()
+                    .push(mark.and_then(|j| serde_json::from_str(&j).ok()));
+            });
+            let mut extra: Vec<Arc<dyn Decoder>> = CodecSet::pinned()
+                .decoders_for("jpeg")
+                .into_iter()
+                .cloned()
+                .collect();
+            extra.push(Arc::new(FakeHeif {
+                on_shape: Some(on_shape),
+            }));
+            watched_set(log, None, extra)
+        },
+        64 << 20,
+    )
+}
+
+/// 決定 15：HEIC・HEIF は見出しだけを読み、アルファを持つものだけを読んで解析する（透過・色数・ドット絵。検索の
+/// `透過:あり` に入る）。ほかの HEIC・HEIF と、見出しを読めないものは読まずに形式から書く（透過なし・色数は計らない・
+/// デコーダなし）。JPEG は見出しも読まない。見出しは OS のデコーダで読むので、読む前に処理中の印をコミットする。
+#[test]
+fn heic_with_alpha_is_read_and_other_photos_come_from_the_format() {
+    let seen: Arc<Mutex<Vec<Option<Inflight>>>> = Arc::default();
+    let env = heif_env(&seen);
+    let alpha = env.add(1, "image", "heic", b"ALPHA heic 1");
+    let opaque = env.add(2, "image", "heic", b"opaque heic 2");
+    let heif = env.add(3, "image", "heif", b"opaque heif 3");
+    let photo = env.add(4, "image", "jpg", b"not really a jpeg");
+    let broken = env.add(5, "image", "heic", b"BROKEN heic 5");
+    let record = env.run();
+    assert_eq!(record.state, JobState::Done);
+    for id in 1..=5 {
+        assert_eq!(env.state(id), "ready", "{id}");
+    }
+    assert_eq!(
+        env.reads(),
+        std::slice::from_ref(&alpha),
+        "読んだのはアルファのある HEIC だけ"
+    );
+    let looked = headers(&env);
+    for h in [&alpha, &opaque, &heif, &broken] {
+        assert!(looked.contains(h), "見出しを読む: {h}");
+    }
+    assert!(!looked.contains(&photo), "JPEG は見出しも読まない");
+
+    // アルファのある HEIC：読んで解析した事実と結果
+    assert_eq!(env.fact::<i64>(&alpha, "alpha"), 1);
+    assert!(env.fact::<Option<i64>>(&alpha, "colors").is_some());
+    assert_eq!(env.fact::<i64>(&alpha, "frame_count"), 1);
+    assert!(env.fact::<Option<i64>>(&alpha, "pixel_art").is_some());
+    assert_eq!(env.fact::<String>(&alpha, "decoder"), "fake-heif-dec/1");
+    let analyses: String = env.query(&format!(
+        "SELECT group_concat(r.analysis, ',') FROM (SELECT r.analysis FROM analysis_results r JOIN blobs b
+           ON b.id = r.blob_id WHERE hex(b.hash) = upper('{alpha}') ORDER BY r.analysis) r"
+    ));
+    assert_eq!(
+        analyses,
+        "image.alpha,image.colors,image.pixel_scale,image.sprite_grid,kura.read"
+    );
+    // 不透明な HEIC・HEIF、見出しを読めない HEIC、JPEG：形式から（決定 5 のまま）
+    for h in [&opaque, &heif, &broken, &photo] {
+        assert_eq!(env.fact::<i64>(h, "alpha"), 0, "{h}");
+        assert_eq!(env.fact::<Option<i64>>(h, "colors"), None, "{h}");
+        assert_eq!(env.fact::<i64>(h, "pixel_art"), 0, "{h}");
+        assert_eq!(env.fact::<i64>(h, "frame_count"), 1, "{h}");
+        assert_eq!(env.fact::<Option<String>>(h, "decoder"), None, "{h}");
+        assert_eq!(env.fact::<String>(h, "state"), "ok", "{h}");
+    }
+    assert_eq!(
+        env.query::<i64>(&format!(
+            "SELECT count(*) FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+              WHERE hex(b.hash) IN (upper('{opaque}'), upper('{heif}'), upper('{broken}'))"
+        )),
+        0
+    );
+
+    // 検索と表示が一致する：アルファのある HEIC は「透過:あり」、ほかの写真は「透過:なし」
+    assert_eq!(search(&env, "透過:あり"), [1]);
+    assert_eq!(search(&env, "透過:なし"), [2, 3, 4, 5]);
+
+    // 見出しを読む前に、そのアイテムの処理中の印がコミットされている（読む前の見出しも、アルファのある HEIC を読む中の
+    // 見出しも）。終えたら消す
+    let seen = seen.lock().unwrap().clone();
+    let hash_of = |id: i64| match id {
+        1 => alpha.clone(),
+        2 => opaque.clone(),
+        3 => heif.clone(),
+        _ => broken.clone(),
+    };
+    assert!(seen.len() >= 4, "{seen:?}");
+    for mark in &seen {
+        let mark = mark.as_ref().expect("見出しを読む前に印がある");
+        assert_eq!(mark.hash, hash_of(mark.id));
+    }
+    assert_eq!(
+        env.query::<i64>("SELECT count(*) FROM settings WHERE key = 'analysis.inflight'"),
+        0
+    );
+    let summary = result_json(&record);
+    assert_eq!(summary["headerMs"]["count"].as_u64(), Some(4));
+    assert_eq!(summary["readMs"]["count"].as_u64(), Some(1));
+
+    // 前回、6 の見出しを OS のデコーダで読んでいる途中で落ちた：見出しを読み直さずに crashed にする
+    let crashed = env.add(6, "image", "heic", b"opaque heic 6");
+    let mark = serde_json::to_string(&Inflight {
+        id: 6,
+        hash: crashed.clone(),
+    })
+    .unwrap();
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)",
+                params![INFLIGHT_KEY, mark],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    env.run();
+    assert_eq!(env.state(6), "failed");
+    assert_eq!(env.fact::<String>(&crashed, "error_code"), "crashed");
+    assert!(!headers(&env).contains(&crashed));
+}
+
+/// 決定 15 の前の Kura で形式から書いた HEIC・HEIF は、計画の指紋の変化（起動のスレッドの `sync_plan`）で見出しを
+/// 見直し、アルファのあるものだけを読む。JPEG は戻さない。投影の作り直しでは、読んだ HEIC は結果の表から、見出しで
+/// 決めたものは形式から作る（読まない）。
+#[test]
+fn a_plan_change_rechecks_heic_written_from_the_format() {
+    let seen: Arc<Mutex<Vec<Option<Inflight>>>> = Arc::default();
+    let env = heif_env(&seen);
+    let alpha = env.add(1, "image", "heic", b"ALPHA heic 1");
+    let opaque = env.add(2, "image", "heif", b"opaque heif 2");
+    let photo = env.add(3, "image", "jpg", b"jpeg 3");
+    // 前の Kura：3 つとも読まずに形式から書いた
+    let old_writes: Vec<store::ItemWrite> = [
+        (1, &alpha, "heic"),
+        (2, &opaque, "heif"),
+        (3, &photo, "jpeg"),
+    ]
+    .into_iter()
+    .map(|(id, h, format)| store::ItemWrite {
+        id,
+        hash: crate::library::parse_hex32(h).unwrap(),
+        write: store::Write::Ready {
+            results: Vec::new(),
+            keep: Some(Vec::new()),
+            facts: Box::new(super::facts::from_format(format)),
+            stamp: Some(store::ReadStamp::default()),
+        },
+    })
+    .collect();
+    env.library
+        .db()
+        .write(move |tx| store::write(tx, &old_writes, 1))
+        .unwrap();
+    assert_eq!(env.fact::<i64>(&alpha, "alpha"), 0);
+    let current = PlanFingerprint::current(&kura_engine::analysis::registry().unwrap()).unwrap();
+    let mut json = serde_json::to_value(&current).unwrap();
+    json.as_object_mut().unwrap().remove("formats");
+    let before: PlanFingerprint = serde_json::from_value(json).unwrap();
+    let synced = sync_from(&env, before);
+    assert_eq!((synced.reset, synced.todo), (2, true));
+    assert_eq!(
+        (env.state(1), env.state(2), env.state(3)),
+        ("pending".into(), "pending".into(), "ready".into())
+    );
+    env.run();
+    assert_eq!(env.reads(), std::slice::from_ref(&alpha));
+    assert!(!headers(&env).contains(&photo));
+    assert_eq!(env.fact::<i64>(&alpha, "alpha"), 1);
+    assert_eq!(env.fact::<i64>(&opaque, "alpha"), 0);
+    assert_eq!(search(&env, "透過:あり"), [1]);
+
+    // 投影の版が上がった：読まずに作り直す（読んだ HEIC は結果の表から、見出しで決めたものと JPEG は形式から）
+    env.exec(
+        "UPDATE media_facts SET facts_v = 0, alpha = NULL, colors = NULL, pixel_art = NULL, frame_count = NULL",
+    );
+    let mut older = current.clone();
+    older.facts_v = 0;
+    sync_from(&env, older);
+    let record = env.run();
+    assert_eq!(result_json(&record)["reprojected"].as_u64(), Some(3));
+    assert_eq!(env.reads().len(), 1, "読み直さない");
+    assert_eq!(env.fact::<i64>(&alpha, "alpha"), 1);
+    assert!(env.fact::<Option<i64>>(&alpha, "colors").is_some());
+    for h in [&opaque, &photo] {
+        assert_eq!(env.fact::<i64>(h, "alpha"), 0, "{h}");
+        assert_eq!(env.fact::<Option<i64>>(h, "colors"), None, "{h}");
+        assert_eq!(env.fact::<i64>(h, "frame_count"), 1, "{h}");
+    }
+}
+
+/// M13 段 2：音声は流して解き、結果の行（正規の形）・事実・読み取りの記録・値のダイジェストが、値に読んで `analyze_many` した
+/// 参照と同じ（WAV・AIFF・FLAC・Ogg Vorbis・m4a（ALAC・AAC）・MP3。長さが上限しか分からない MP3・AAC は波形の段を
+/// 最も細かい段から作って終わりの長さの引数に合わせる）。値を組んで読まない（`decode_file` を呼ばない）。
+#[test]
+fn streamed_results_equal_whole_results() {
+    use super::facts::ReadRecord;
+    use super::plan::stage1;
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kura-engine/fixtures");
+    let cases: Vec<(&str, &str, Vec<u8>)> = vec![
+        (
+            "wav",
+            "wav",
+            wav(
+                20_000,
+                Some(LoopRange {
+                    start: 10,
+                    end: 900,
+                }),
+            ),
+        ),
+        (
+            "aiff",
+            "aiff",
+            std::fs::read(fixtures.join("aiff-24.aiff")).unwrap(),
+        ),
+        (
+            "flac",
+            "flac",
+            std::fs::read(fixtures.join("flac-24.flac")).unwrap(),
+        ),
+        (
+            "ogg",
+            "ogg",
+            std::fs::read(fixtures.join("ogg-vorbis-loop.ogg")).unwrap(),
+        ),
+        (
+            "m4a",
+            "m4a",
+            std::fs::read(fixtures.join("alac-16.m4a")).unwrap(),
+        ),
+        (
+            "m4a",
+            "m4a",
+            std::fs::read(fixtures.join("aac-lc-ffmpeg.m4a")).unwrap(),
+        ),
+        (
+            "mp3",
+            "mp3",
+            std::fs::read(fixtures.join("mp3-lame.mp3")).unwrap(),
+        ),
+        (
+            "aac",
+            "aac",
+            std::fs::read(fixtures.join("aac-lc.aac")).unwrap(),
+        ),
+    ];
+    let env = Env::with(
+        |log, _| {
+            let pinned = CodecSet::pinned();
+            let mut set = CodecSet::default();
+            for format in ["png", "wav", "aiff", "flac", "ogg", "m4a", "mp3", "aac"] {
+                for d in pinned.decoders_for(format) {
+                    if set.decoder_by_id(d.id()).is_none() {
+                        set.add_decoder(Arc::new(Watching {
+                            inner: d.clone(),
+                            log: log.clone(),
+                            hook: None,
+                        }))
+                        .unwrap();
+                    }
+                }
+            }
+            set
+        },
+        256 << 20,
+    );
+    let mut hashes = Vec::new();
+    for (i, (ext, _, body)) in cases.iter().enumerate() {
+        hashes.push(env.add(i as i64 + 1, "audio", ext, body));
+    }
+    let job = env.run();
+    assert_eq!(job.state, JobState::Done, "{:?}", job.message);
+    let engine = kura_engine::Engine::new().unwrap();
+    let pinned = CodecSet::pinned();
+    for ((ext, format, body), hash) in cases.iter().zip(&hashes) {
+        let id = hashes.iter().position(|h| h == hash).unwrap() as i64 + 1;
+        assert_eq!(env.state(id), "ready", "{ext}");
+        let (v, stamp) = pinned
+            .decode(
+                &mut std::io::Cursor::new(body),
+                format,
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+        let read = ReadRecord::from_value(&v, format);
+        let want = engine.analyze_many(&v, &stage1(&read), &NoMonitor);
+        for a in want {
+            let a = a.unwrap();
+            let got: Vec<u8> = if a.encoding == kura_engine::analysis::Encoding::Binary {
+                std::fs::read(env.library.layout().peaks_path(hash)).unwrap()
+            } else {
+                env.query(&format!(
+                    "SELECT r.output FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+                      WHERE hex(b.hash) = upper('{hash}') AND r.analysis = '{}'",
+                    a.id
+                ))
+            };
+            assert!(got == a.output, "{ext}・{}", a.id);
+            let params: String = env.query(&format!(
+                "SELECT r.params FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+                  WHERE hex(b.hash) = upper('{hash}') AND r.analysis = '{}'",
+                a.id
+            ));
+            assert_eq!(
+                params,
+                super::plan::canonical_string(&a.params).unwrap(),
+                "{ext}"
+            );
+        }
+        let stored: Vec<u8> = env.query(&format!(
+            "SELECT r.output FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+              WHERE hex(b.hash) = upper('{hash}') AND r.analysis = '{READ_ID}'"
+        ));
+        assert_eq!(stored, read.to_canonical().unwrap(), "{ext}");
+        let digest: Vec<u8> = env.fact(hash, "value_digest");
+        assert_eq!(digest, stamp.value_digest.0.to_vec(), "{ext}");
+        let decoder: String = env.fact(hash, "decoder");
+        assert_eq!(decoder, stamp.codec, "{ext}");
+    }
+}
+
+/// M13 段 2：長い音声も流して解く。10 分の合成の WAV（8 kHz モノラル）を実際に流し、事実が値の長さで書かれる。値の 3 倍の
+/// 見積もり（前の上限）を超える予算の小さな場でも、流れの見積もりは長さによらないので解ける。
+#[test]
+fn long_audio_is_analyzed_by_streaming() {
+    let frames = 8_000 * 600;
+    let body = wav(frames, None);
+    // 値は 19 MB（f32）。予算 24 MiB（1 件の上限は 12 MiB）では値を持って解けないが、流れなら収まる
+    let env = Env::with(|log, _| watched_set(log, None, Vec::new()), 24 << 20);
+    let hash = env.add(1, "audio", "wav", &body);
+    let job = env.run();
+    assert_eq!(job.state, JobState::Done, "{:?}", job.message);
+    assert_eq!(env.state(1), "ready");
+    let n: i64 = env.query(&format!(
+        "SELECT json_extract(r.output, '$.frames') FROM analysis_results r JOIN blobs b ON b.id = r.blob_id
+          WHERE hex(b.hash) = upper('{hash}') AND r.analysis = 'audio.silence'"
+    ));
+    assert_eq!(n, frames as i64);
+    assert!(env.reads().contains(&hash));
+}
+
+/// 形は WAV の固定の段と同じに読むが、流して読むと `Unsupported` を返す段（後ろの段へ回るときの見積もりのテスト）。
+struct RefusingStream(Arc<dyn Decoder>);
+
+impl Decoder for RefusingStream {
+    fn id(&self) -> &'static str {
+        "refusing-wav-dec/1"
+    }
+    fn tier(&self) -> Tier {
+        Tier::Pinned
+    }
+    fn can_decode(&self, format: &str) -> bool {
+        format == "wav"
+    }
+    fn shape(
+        &self,
+        src: &mut dyn ReadSeek,
+        format: &str,
+        opts: &DecodeOptions,
+        limits: &Limits,
+    ) -> Result<Shape, EngineError> {
+        self.0.shape(src, format, opts, limits)
+    }
+    fn decode(
+        &self,
+        _src: &mut dyn ReadSeek,
+        _format: &str,
+        _opts: &DecodeOptions,
+        _limits: &Limits,
+        _mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        Err(EngineError::Unsupported("この段では読まない".into()))
+    }
+    fn streams(&self, _format: &str) -> bool {
+        true
+    }
+    fn decode_stream(
+        &self,
+        _src: &mut (dyn ReadSeek + Send),
+        _format: &str,
+        _opts: &DecodeOptions,
+        _limits: &Limits,
+        _shape: &Shape,
+        _out: &mut kura_engine::codec::DecodeOut<'_>,
+        _mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported("この段では読まない".into()))
+    }
+}
+
+/// M13 段 2 の検証の直し：形を読んだ段が流して読む途中で `Unsupported` を返したら、次の段で形を読み直し、その段の見積もりで
+/// 確保し直して解く（`decode_stream_path` が次の段へ回るのと同じ。読み取りの記録は次の段のもの）。
+#[test]
+fn a_stage_refusing_the_stream_falls_through_to_the_next_stage() {
+    let env = Env::with(
+        |log, _| {
+            let pinned = CodecSet::pinned();
+            let wav = pinned.decoders_for("wav")[0].clone();
+            let mut set = CodecSet::default();
+            set.add_decoder(Arc::new(RefusingStream(wav.clone())))
+                .unwrap();
+            set.add_decoder(Arc::new(Watching {
+                inner: wav,
+                log: log.clone(),
+                hook: None,
+            }))
+            .unwrap();
+            set
+        },
+        64 << 20,
+    );
+    let hash = env.add(1, "audio", "wav", &wav(8_000 * 3, None));
+    let job = env.run();
+    assert_eq!(job.state, JobState::Done, "{:?}", job.message);
+    assert_eq!(env.state(1), "ready");
+    assert_eq!(env.fact::<String>(&hash, "decoder"), "wav-kura-dec/1");
+    assert!(env.reads().contains(&hash));
+}
+
+/// M13 段 2 の検証の直し：アプリの組（AudioToolbox が WAV・AIFF も読む）と同じく、後ろの段に WAV も読む Platform の音声
+/// デコーダ（形を読むのも流して読むのもファイルの長さで見積もる）を置いても、WAV は実際に読む前の段（固定の WAV）の
+/// 見積もりで解く。予算 24 MiB（1 件の上限 12 MiB）で 10 分・20 分の WAV（9.6 MB・19.2 MB）が ready になり、読む間に確保
+/// している量はファイルの長さによらない（前は後ろの段の長さで見積もり、どちらも too_large だった）。
+#[test]
+fn a_later_platform_stage_does_not_size_the_wav_estimate() {
+    use kura_engine::budget::MemoryBudget;
+    use kura_engine::codec::platform::PlatformAudioDecoder;
+    use kura_engine::testing::platform::{FakeAudio, FakeAudioBackend};
+
+    let used = Arc::new(Mutex::new(Vec::new()));
+    let budget: Arc<OnceLock<Arc<MemoryBudget>>> = Arc::default();
+    let hook: Hook = {
+        let (used, budget) = (used.clone(), budget.clone());
+        Arc::new(move |_: &str| {
+            if let Some(b) = budget.get() {
+                used.lock().unwrap().push(b.used().unwrap());
+            }
+        })
+    };
+    let env = Env::with(
+        |log, _| {
+            let mut backend = FakeAudioBackend::new(FakeAudio::new(8_000, vec![vec![0.0; 4]]));
+            backend.formats = vec!["wav"];
+            let platform: Arc<dyn Decoder> = Arc::new(PlatformAudioDecoder::new(backend));
+            let set = watched_set(log, Some(hook), vec![platform]);
+            assert_eq!(
+                set.decoders_for("wav")
+                    .iter()
+                    .map(|d| d.id())
+                    .collect::<Vec<_>>(),
+                ["wav-kura-dec/1", "fake-audiotoolbox-dec/1"]
+            );
+            set
+        },
+        24 << 20,
+    );
+    assert!(
+        budget
+            .set(env.engine.runtime().unwrap().budget().clone())
+            .is_ok()
+    );
+    let short = env.add(1, "audio", "wav", &wav(8_000 * 600, None));
+    let long = env.add(2, "audio", "wav", &wav(8_000 * 1_200, None));
+    // 30 分ぶんの標本をデバッグのビルドで解くので、全体のテストの重い中では 30 秒を超えることがある
+    let job = env.run_within(Duration::from_secs(180));
+    assert_eq!(job.state, JobState::Done, "{:?}", job.message);
+    for (id, hash) in [(1, &short), (2, &long)] {
+        assert_eq!(env.state(id), "ready", "{id}");
+        assert_eq!(env.fact::<String>(hash, "decoder"), "wav-kura-dec/1");
+    }
+    let used = used.lock().unwrap().clone();
+    assert_eq!(used.len(), 2, "{used:?}");
+    // 2 つの長さの差は 9.6 MB。確保の差は波形の段の結果の見積もりだけ（1 MiB 未満）
+    assert!(
+        used[0].abs_diff(used[1]) < 1 << 20 && used.iter().all(|&u| u <= 12 << 20),
+        "確保が長さで伸びた：{used:?}"
+    );
+}

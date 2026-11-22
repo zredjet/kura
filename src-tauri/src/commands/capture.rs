@@ -269,6 +269,7 @@ pub fn login_snapshot(
     let _ = std::fs::remove_file(&path);
     let result = result?;
     session.jobs().ensure_queued(JobKind::Thumbnail, "{}")?;
+    session.jobs().ensure_queued(JobKind::Analyze, "{}")?;
     Ok(SnapshotResultDto {
         title: result.title.unwrap_or_default(),
         url: shot.url,
@@ -391,6 +392,7 @@ pub async fn browser_snapshot(
                 None,
             )?;
             session.jobs().ensure_queued(JobKind::Thumbnail, "{}")?;
+            session.jobs().ensure_queued(JobKind::Analyze, "{}")?;
             Ok(SnapshotResultDto {
                 title: result.title.unwrap_or_default(),
                 url: info.url,

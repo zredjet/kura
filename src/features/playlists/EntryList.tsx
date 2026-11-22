@@ -14,64 +14,57 @@ import {
 import { type MenuEntry, openMenuAt } from '../../components/Menu/menuStore';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
 import { GripIcon } from '../../components/icons/GripIcon';
-import { ImageIcon } from '../../components/icons/ImageIcon';
-import { MusicIcon } from '../../components/icons/MusicIcon';
-import { VideoIcon } from '../../components/icons/VideoIcon';
+import { KindIcon } from '../../components/icons/KindIcon';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
-import { thumbUrl } from '../../ipc/media';
+import { hasDuration, kindLabel } from '../../ipc/kinds';
 import type { EntryRowDto, PlaylistContentsDto, PlaylistDto } from '../../ipc/playlists';
 import { formatCount, formatDuration } from '../../lib/format';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
 import { bumpRevision } from '../../stores/revisionStore';
 import { setPlaylistOrderSource, useDragStore, watchDrag } from '../library/dragState';
 import { playPlaylist, removeFromPlaylist, snapshotPlaylist } from './playlistActions';
-import { type ListRow, listRows, rowHeight } from './rows';
+import { enterRow, type ListRow, listRows, playFromOf, rowHeight } from './rows';
 import styles from './PlaylistView.module.css';
 
 const t = ja.playlist;
 
-type Kind = 'image' | 'video' | 'audio';
+/** 行のサムネイルの大きさ（PlaylistView.module.css の `.thumb`。市松模様は敷かない大きさ）。 */
+const ROW_THUMB = { w: 40, h: 40 };
 
-function KindIcon({ kind, size = 18 }: { kind: string | undefined; size?: number }) {
-  if (kind === 'audio') {
-    return <MusicIcon size={size} />;
-  }
-  if (kind === 'video') {
-    return <VideoIcon size={size} />;
-  }
-  return <ImageIcon size={size} />;
-}
-
-/** サムネイル（なければ種類の絵）。 */
+/** サムネイル（なければ種類の絵）。`box` は表示の大きさ（表紙のモザイクは大きい）。 */
 export function Thumb({
   item,
   className,
+  box = ROW_THUMB,
 }: {
   item: ItemSummaryDto | undefined;
   className?: string;
+  box?: { w: number; h: number };
 }) {
+  const icon = <KindIcon kind={item?.kind} size={18} />;
   return (
     <span className={className ?? styles.thumb} aria-hidden="true">
-      {item?.thumbState === 'ready' ? (
-        <img src={thumbUrl(item.hash, 's')} alt="" loading="lazy" />
+      {item ? (
+        <MediaImage source={item} size="s" fit="cover" box={box} loading="lazy" fallback={icon} />
       ) : (
-        <KindIcon kind={item?.kind} />
+        icon
       )}
     </span>
   );
 }
 
-/** 「動画 · 0:45」「画像 · 8秒」。 */
+/** 「動画 · 0:45」「画像 · 8秒」「フォント」（フォント・3D は再生しないので長さを出さない）。 */
 export function itemSub(item: ItemSummaryDto | undefined, imageMs: number): string {
   if (!item) {
     return '';
   }
-  const kind = ja.kinds[item.kind as Kind] ?? '';
+  const kind = kindLabel(item.kind);
   const length =
     item.kind === 'image'
       ? ja.player.seconds(String(Math.round(imageMs / 1000)))
-      : item.durationMs !== null
+      : hasDuration(item.kind) && item.durationMs !== null
         ? formatDuration(item.durationMs)
         : '';
   return length ? `${kind} · ${length}` : kind;
@@ -106,7 +99,7 @@ export function useListMargin(
 
 /**
  * 手動プレイリストの中身（design.md §3.1）。ファイル単位は平らな行と「〇〇から」の見出し、
- * ユニット単位はエントリの行（▸ で中身）。選んでドラッグで並べ替え、⌫ で外す、ダブルクリックでそこから再生。
+ * ユニット単位はエントリの行（▸ で中身）。選んでドラッグで並べ替え、⌫ で外す、↩・ダブルクリックでそこから再生。
  */
 export function EntryList({
   playlist,
@@ -199,9 +192,7 @@ export function EntryList({
   };
 
   const playFrom = (row: ListRow) => {
-    const entry = entryOf(row);
-    const itemId = row.kind === 'item' ? row.itemId : (entry?.coverItemId ?? undefined);
-    void playPlaylist(playlist.id, playlist.name, false, itemId);
+    void playPlaylist(playlist.id, playlist.name, false, playFromOf(row, contents));
   };
 
   const menuFor = (row: ListRow): MenuEntry[] => {
@@ -230,8 +221,12 @@ export function EntryList({
     return out;
   };
 
-  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (selected.size === 0) {
+  /**
+   * ⌫・↩。行のボタンで押したら `focused` にその行が来る（行で受けて preventDefault したものは、一覧では受け直さない）。
+   * ↩ はダブルクリック・右クリックの「ここから再生」と同じく押した行から（M11 の 3 回目の確認 P1）。
+   */
+  const onKeyDown = (e: KeyboardEvent<HTMLElement>, focused?: ListRow) => {
+    if (e.defaultPrevented || selected.size === 0) {
       return;
     }
     if (e.key === 'Backspace' || e.key === 'Delete') {
@@ -240,9 +235,9 @@ export function EntryList({
       setSelected(new Set());
     } else if (e.key === 'Enter') {
       e.preventDefault();
-      const first = rows.find((r) => selected.has(entryOf(r)?.entryId ?? -1));
-      if (first) {
-        playFrom(first);
+      const target = enterRow(rows, focused, (r) => selected.has(entryOf(r)?.entryId ?? -1));
+      if (target) {
+        playFrom(target);
       }
     }
   };
@@ -288,14 +283,14 @@ export function EntryList({
   }
 
   return (
-    // 行のキー操作（⌫・↩）をまとめて受ける。操作の対象は中の行のボタン
+    // 行の外（▸）で押したキー操作（⌫・↩）を受ける。行のボタンで押したものは行で受ける
     // eslint-disable-next-line jsx-a11y/no-static-element-interactions
     <div
       ref={listRef}
       className={styles.list}
       style={{ height: virtualizer.getTotalSize() }}
       aria-label={t.listLabel}
-      onKeyDown={onKeyDown}
+      onKeyDown={(e) => onKeyDown(e)}
     >
       {visible.map((v) => {
         const row = rows[v.index];
@@ -323,6 +318,7 @@ export function EntryList({
             select(entry.entryId, e);
           },
           onDoubleClick: () => playFrom(row),
+          onKeyDown: (e: KeyboardEvent<HTMLButtonElement>) => onKeyDown(e, row),
           onPointerDown: (e: PointerEvent<HTMLButtonElement>) => startDrag(e, entry.entryId),
           onContextMenu: (e: MouseEvent) => {
             e.preventDefault();
@@ -385,7 +381,7 @@ export function EntryList({
           );
         }
         const open = opened.has(entry.entryId);
-        const kinds = entry.kinds.map((k) => ja.kinds[k as Kind] ?? k).join('・');
+        const kinds = entry.kinds.map(kindLabel).join('・');
         const cover = entry.coverItemId !== null ? getCached(entry.coverItemId) : undefined;
         return (
           <div

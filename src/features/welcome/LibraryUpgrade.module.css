@@ -1,0 +1,33 @@
+/* design.md §3.1「ライブラリの更新」：窓の地の上の中央に 13px secondary の一行と、進捗の溝（割合が分からないので溝だけ） */
+
+.layer {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-window);
+}
+
+.box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  /* 窓を動かすドラッグの領域は地の側だけにし、文字の上では選べるようにしない */
+  pointer-events: none;
+}
+
+.text {
+  font-size: var(--text-md);
+  color: var(--text-secondary);
+}
+
+/* ProgressBar の溝と同じ形（design.md §4：高さ 4px、--fill-track） */
+.track {
+  width: 200px;
+  height: var(--space-1);
+  border-radius: var(--radius-pill);
+  background: var(--fill-track);
+}

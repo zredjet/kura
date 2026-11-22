@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
+import { type PointerEvent, type ReactNode, useCallback, useEffect, useState } from 'react';
 
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
 import { ExpandIcon } from '../../components/icons/ExpandIcon';
@@ -8,10 +8,18 @@ import { MusicIcon } from '../../components/icons/MusicIcon';
 import { ShrinkIcon } from '../../components/icons/ShrinkIcon';
 import { TagIcon } from '../../components/icons/TagIcon';
 import { Waveform } from '../../components/icons/Waveform';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
+import { stillOriginal } from '../../components/MediaImage/still';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
-import { playUrl, thumbUrl } from '../../ipc/media';
+import { playUrl } from '../../ipc/media';
 import { formatCount, formatDuration } from '../../lib/format';
+import type { AnimPlayerHooks } from '../asset/AnimPlayer';
+import { QuickLookAnim } from '../asset/AssetStage';
+import { useAssetData } from '../asset/useAssetData';
+import { canEdit } from '../editor/kindTraits';
+import { useLoopRange } from '../asset/useLoopRange';
+import { WaveformView } from '../asset/WaveformView';
 import { PlayBar } from './PlayBar';
 import {
   closePlayer,
@@ -21,9 +29,9 @@ import {
 } from './playerActions';
 import { usePlayerStore } from './playerStore';
 import { SidePanel } from './SidePanel';
-import { canHideControls, HIDE_AFTER_MS } from './theaterChrome';
+import { canHideControls, HIDE_AFTER_MS, hoverTracker } from './theaterChrome';
 import styles from './Theater.module.css';
-import { usePlayerKeys } from './usePlayerKeys';
+import { editCurrentItem, usePlayerKeys } from './usePlayerKeys';
 
 const t = ja.player;
 
@@ -41,12 +49,12 @@ function isTyping(el: Element | null): boolean {
  */
 function useControlsIdle(visible: boolean): {
   idle: boolean;
-  onPointerEnter: () => void;
+  onPointerEnter: (event: PointerEvent<Element>) => void;
   onPointerLeave: () => void;
 } {
   const playing = usePlayerStore((s) => s.snapshot.playing);
   const [idle, setIdle] = useState(false);
-  const hovering = useRef(false);
+  const [hover] = useState(hoverTracker);
   useEffect(() => {
     if (!visible || !playing) {
       return;
@@ -58,7 +66,7 @@ function useControlsIdle(visible: boolean): {
         const focused = document.activeElement;
         const hide = canHideControls({
           playing: true,
-          hovering: hovering.current,
+          hovering: hover.hovering(),
           focusInControls:
             focused instanceof HTMLElement && focused.closest('[data-chrome]') !== null,
           menuOpen: document.querySelector('[data-sheet], [role="menu"]') !== null,
@@ -81,18 +89,15 @@ function useControlsIdle(visible: boolean): {
     return () => {
       clearTimeout(timer);
       events.forEach((name) => window.removeEventListener(name, wake));
-      // 一時停止・閉じたら出し直す
+      // 一時停止・閉じたら出し直す（閉じたときはポインタの出入りが来ないので、乗っていないことにする）
       setIdle(false);
+      hover.leave();
     };
-  }, [visible, playing]);
+  }, [visible, playing, hover]);
   return {
     idle: idle && visible && playing,
-    onPointerEnter: () => {
-      hovering.current = true;
-    },
-    onPointerLeave: () => {
-      hovering.current = false;
-    },
+    onPointerEnter: (event) => hover.enter(event.currentTarget),
+    onPointerLeave: () => hover.leave(),
   };
 }
 
@@ -121,7 +126,7 @@ export function Theater() {
       role="region"
     >
       <section className={styles.stage} aria-label={t.label} data-idle={idle || undefined}>
-        <Stage />
+        <Stage active={visible} chrome={chrome} />
         {visible && <div className={styles.shade} aria-hidden="true" />}
         {visible && <TopBar chrome={chrome} />}
         {visible && <BgmPill />}
@@ -136,9 +141,10 @@ export function Theater() {
   );
 }
 
-interface ChromeProps {
+/** シアターの操作（上部・再生バー・アニメの操作の行）に付けるもの：隠してよいかを見るための印とポインタの出入り。 */
+export interface ChromeProps {
   'data-chrome': string;
-  onPointerEnter: () => void;
+  onPointerEnter: (event: PointerEvent<Element>) => void;
   onPointerLeave: () => void;
 }
 
@@ -153,6 +159,9 @@ function TopBar({ chrome }: { chrome: ChromeProps }) {
   const togglePanel = usePlayerStore((s) => s.togglePanel);
   const requestTagFocus = usePlayerStore((s) => s.requestTagFocus);
   const setMode = usePlayerStore((s) => s.setMode);
+  // エディタ（M12・M13）：今出しているのがエディタで開ける種類（画像・音声）のときだけ
+  const editable =
+    snapshot.itemId !== null && snapshot.kind !== null && canEdit({ kind: snapshot.kind });
 
   return (
     <div className={styles.top} data-tauri-drag-region {...chrome}>
@@ -182,6 +191,16 @@ function TopBar({ chrome }: { chrome: ChromeProps }) {
             .join(' · ')}
         </span>
       </div>
+      {editable && (
+        <button
+          type="button"
+          className={styles.edit}
+          title={`${ja.editor.edit}（⌘E）`}
+          onClick={() => editCurrentItem()}
+        >
+          {ja.editor.edit}
+        </button>
+      )}
       <button
         type="button"
         className={styles.back}
@@ -227,8 +246,11 @@ function TopBar({ chrome }: { chrome: ChromeProps }) {
   );
 }
 
-/** メディア（動画・画像・音楽のジャケット）と、待ち・失敗・終わりの案内。 */
-function Stage() {
+/**
+ * メディア（動画・画像・音楽のジャケット）と、待ち・失敗・終わりの案内。`active` はシアターを出しているか（隠して
+ * いる間も `<video>` は残すが、アニメは回さない）。
+ */
+function Stage({ active, chrome }: { active: boolean; chrome: ChromeProps }) {
   const snapshot = usePlayerStore((s) => s.snapshot);
   const attach = useCallback((el: HTMLVideoElement | null) => {
     playerController().attachVideo(el);
@@ -246,7 +268,9 @@ function Stage() {
         hidden={snapshot.kind !== 'video' || !showMedia}
         playsInline
       />
-      {item && snapshot.kind === 'image' && <ImageLayer key={item.id} item={item} />}
+      {item && snapshot.kind === 'image' && (
+        <ImageLayer key={item.id} item={item} active={active} chrome={chrome} />
+      )}
       {item && snapshot.kind === 'audio' && showMedia && <AudioArt key={item.id} item={item} />}
       {snapshot.phase === 'waiting' && (
         <Status title={t.waiting} hint={t.waitingHint}>
@@ -287,36 +311,80 @@ function Stage() {
   );
 }
 
-/** 画像（ブラウザで表示できない形式は大きいサムネイルにする）。 */
-function ImageLayer({ item }: { item: ItemSummaryDto }) {
-  const [fallback, setFallback] = useState(false);
-  const src = fallback ? thumbUrl(item.hash, 'l') : playUrl(item.hash);
+/**
+ * 画像（ブラウザで表示できない形式は大きいサムネイルにする）。透過と分かったものは市松模様、ドット絵は整数倍
+ * （design.md §3.1）。アニメ（M12）は、シアターを出している間だけ素材の欄と帯を読み（`useAssetData`）、帯ができたら
+ * クイックルックと同じ部品（`QuickLookAnim`）で回す。操作の行（再生／一時停止・「7 / 8」・コマ送り・タグ）は再生バーの
+ * 上に重ね、上の操作・再生バーと一緒に隠す・出す。Space はプレーヤーの操作のまま（`usePlayerKeys` が先に取る）。
+ * 帯を待つ間・大きすぎて作れないとき・作れなかったときは先頭のコマ（元のファイルを `<img>` に置くと WebKit が回すので、
+ * 大きいサムネイル。`stillOriginal`）。「視差効果を減らす」では自動で再生しない（AnimPlayer。クイックルックと同じ）。
+ */
+export function ImageLayer({
+  item,
+  active,
+  chrome,
+  player,
+}: {
+  item: ItemSummaryDto;
+  /** シアターを出しているか（隠している間は素材の欄も帯も読まず、回さない）。 */
+  active: boolean;
+  /** アニメの操作の行に付けるもの（シアターの操作と一緒に隠す・出す）。 */
+  chrome?: ChromeProps;
+  /** テスト用：アニメの時計・描く関数・画像を読む口など。 */
+  player?: AnimPlayerHooks;
+}) {
+  const data = useAssetData(active ? item.id : null);
+  const asset = data.asset?.itemId === item.id ? data.asset : null;
+  const anim = asset && data.anim.status === 'ready' ? data.anim.anim : null;
+  if (active && asset && anim) {
+    return (
+      <QuickLookAnim
+        key={`${anim.hash}:${anim.rev}`}
+        asset={asset}
+        anim={anim}
+        controls={{ ...chrome, className: styles.animControls }}
+        {...player}
+      />
+    );
+  }
   return (
-    <img
+    <MediaImage
+      source={item}
+      size="l"
+      fit="contain"
+      original={stillOriginal(item, playUrl(item.hash), asset?.effective.animated)}
       className={styles.image}
-      src={src}
-      alt=""
-      onError={() => {
-        if (!fallback && item.thumbState === 'ready') {
-          setFallback(true);
-        }
-      }}
     />
   );
 }
 
-/** 音楽：ジャケット（なければ音符）と波形の飾り。 */
-function AudioArt({ item }: { item: ItemSummaryDto }) {
+/**
+ * 音楽：ジャケット（なければ音符）と波形（解析の前は飾りの波形。M11）。インスペクタと同じくループの区間を出す（試聴の設定が
+ * 長さに収まればそれ、なければファイルのループ点。M13）。
+ */
+export function AudioArt({ item }: { item: ItemSummaryDto }) {
+  const positionMs = usePlayerStore((s) => s.snapshot.positionMs);
+  const loop = useLoopRange(item.id);
   return (
     <div className={styles.audio}>
-      {item.thumbState === 'ready' ? (
-        <img className={styles.art} src={thumbUrl(item.hash, 'l')} alt="" />
-      ) : (
-        <span className={styles.artEmpty} aria-hidden="true">
-          <MusicIcon size={64} strokeWidth={1.4} />
-        </span>
-      )}
-      <Waveform className={styles.waveform} />
+      <MediaImage
+        source={item}
+        size="l"
+        fit="cover"
+        className={styles.art}
+        fallback={
+          <span className={styles.artEmpty} aria-hidden="true">
+            <MusicIcon size={64} strokeWidth={1.4} />
+          </span>
+        }
+      />
+      <WaveformView
+        hash={item.hash}
+        loop={loop}
+        positionMs={positionMs}
+        className={styles.waveform}
+        fallback={<Waveform />}
+      />
     </div>
   );
 }

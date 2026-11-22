@@ -1,7 +1,8 @@
 //! フィールド（docs/search-query.md §3）の名前と値の読み取り。
 
 use super::ast::{
-    CivilDate, DateSpec, FieldCond, KindValue, Op, Orientation, PlayedSpec, UnitSpec,
+    AlphaSpec, AttributionSpec, CivilDate, DateSpec, FieldCond, KindValue, LicenseSpec, Op,
+    Orientation, PlayedSpec, UnitSpec,
 };
 
 /// フィールドの種類（§3 の表の行）。
@@ -24,19 +25,36 @@ pub(crate) enum FieldKind {
     W,
     H,
     Orient,
+    License,
+    Attribution,
+    Credit,
+    Alpha,
+    Pixel,
+    Colors,
+    Pot,
+    Rate,
+    Bits,
+    Ch,
+    Lufs,
+    Peak,
+    Loop,
+    Anim,
 }
 
 /// フィールド 1 つ。
-pub(crate) struct FieldDef {
+pub struct FieldDef {
     /// 英語名（AST の `field`）。
     pub key: &'static str,
     /// 日本語名（エラーの文に使う）。
     pub label: &'static str,
+    /// 入力で使える名前（日本語・英語。英語は大文字小文字を問わない）。
     pub names: &'static [&'static str],
-    pub kind: FieldKind,
+    pub(crate) kind: FieldKind,
 }
 
-pub(crate) const FIELDS: &[FieldDef] = &[
+/// フィールドの表（§3）。フロントは bindings の定数 `QUERY_FIELD_NAMES` でこの表を読む
+/// （`透過:あり` を名前空間付きのタグとして扱わないため。表を 1 か所にする）。
+pub const FIELDS: &[FieldDef] = &[
     def("type", "種類", &["種類", "type"], FieldKind::Type),
     def("rating", "評価", &["評価", "rating"], FieldKind::Rating),
     def("dur", "長さ", &["長さ", "dur"], FieldKind::Dur),
@@ -64,6 +82,53 @@ pub(crate) const FIELDS: &[FieldDef] = &[
     def("w", "幅", &["幅", "w"], FieldKind::W),
     def("h", "高さ", &["高さ", "h"], FieldKind::H),
     def("orient", "向き", &["向き", "orient"], FieldKind::Orient),
+    // クレジット（M15 段 1）
+    def(
+        "license",
+        "ライセンス",
+        &["ライセンス", "license"],
+        FieldKind::License,
+    ),
+    def(
+        "attribution",
+        "表記",
+        &["表記", "attribution"],
+        FieldKind::Attribution,
+    ),
+    def(
+        "credit",
+        "クレジット",
+        &["クレジット", "credit"],
+        FieldKind::Credit,
+    ),
+    // 素材（M11）
+    def("alpha", "透過", &["透過", "alpha"], FieldKind::Alpha),
+    def(
+        "pixel",
+        "ドット絵",
+        &["ドット絵", "pixel"],
+        FieldKind::Pixel,
+    ),
+    def("colors", "色数", &["色数", "colors"], FieldKind::Colors),
+    // 日本語の入力では数字が全角になりやすいので「２のべき乗」も受ける
+    def(
+        "pot",
+        "2のべき乗",
+        &["2のべき乗", "２のべき乗", "pot"],
+        FieldKind::Pot,
+    ),
+    def("rate", "レート", &["レート", "rate"], FieldKind::Rate),
+    def("bits", "ビット", &["ビット", "bits"], FieldKind::Bits),
+    def("ch", "チャンネル", &["チャンネル", "ch"], FieldKind::Ch),
+    def(
+        "lufs",
+        "ラウドネス",
+        &["ラウドネス", "lufs"],
+        FieldKind::Lufs,
+    ),
+    def("peak", "ピーク", &["ピーク", "peak"], FieldKind::Peak),
+    def("loop", "ループ", &["ループ", "loop"], FieldKind::Loop),
+    def("anim", "アニメ", &["アニメ", "anim"], FieldKind::Anim),
 ];
 
 const fn def(
@@ -228,7 +293,221 @@ pub(crate) fn build(def: &FieldDef, op: Op, value: &str) -> Result<FieldCond, St
             };
             FieldCond::Orient { op, value }
         }
+        FieldKind::License => {
+            only_equality(op)?;
+            let v = text(value)?;
+            let value = match v.to_lowercase().as_str() {
+                "あり" | "any" => LicenseSpec::Any,
+                "なし" | "none" | "未設定" => LicenseSpec::None,
+                _ => LicenseSpec::Name(v),
+            };
+            FieldCond::License { op, value }
+        }
+        FieldKind::Attribution => {
+            only_equality(op)?;
+            let value = match value.trim().to_lowercase().as_str() {
+                "必要" | "必須" | "required" => AttributionSpec::Required,
+                "任意" | "optional" => AttributionSpec::Optional,
+                "不要" | "none" => AttributionSpec::None,
+                _ => return Err("表記は 必要・任意・不要 のどれかです".into()),
+            };
+            FieldCond::Attribution { op, value }
+        }
+        FieldKind::Credit => {
+            only_equality(op)?;
+            FieldCond::Credit {
+                op,
+                value: text(value)?,
+            }
+        }
+        FieldKind::Alpha => {
+            only_equality(op)?;
+            let value = match value.trim().to_lowercase().as_str() {
+                "あり" | "はい" | "yes" | "any" => AlphaSpec::Any,
+                "なし" | "いいえ" | "no" | "none" => AlphaSpec::None,
+                "二値" | "binary" => AlphaSpec::Binary,
+                "半透明" | "partial" => AlphaSpec::Partial,
+                _ => return Err("透過は あり・なし・半透明・二値 のどれかです".into()),
+            };
+            FieldCond::Alpha { op, value }
+        }
+        FieldKind::Pixel => {
+            only_equality(op)?;
+            FieldCond::Pixel {
+                op,
+                value: yes_no(value, label)?,
+            }
+        }
+        FieldKind::Pot => {
+            only_equality(op)?;
+            FieldCond::Pot {
+                op,
+                value: yes_no(value, label)?,
+            }
+        }
+        FieldKind::Loop => {
+            only_equality(op)?;
+            FieldCond::Loop {
+                op,
+                value: yes_no(value, label)?,
+            }
+        }
+        FieldKind::Anim => {
+            only_equality(op)?;
+            FieldCond::Anim {
+                op,
+                value: yes_no(value, label)?,
+            }
+        }
+        FieldKind::Colors => FieldCond::Colors {
+            op,
+            value: count(value, label)?,
+        },
+        FieldKind::Rate => FieldCond::Rate {
+            op,
+            value: parse_rate(value).ok_or_else(|| {
+                "レートは Hz の数で指定してください（例：44100・44.1k・48kHz）".to_string()
+            })?,
+        },
+        FieldKind::Bits => FieldCond::Bits {
+            op,
+            value: positive(strip_suffix(value, &["ビット", "bit"])).ok_or_else(|| {
+                "ビットは 1 以上の数で指定してください（例：ビット:24）".to_string()
+            })?,
+        },
+        FieldKind::Ch => {
+            let v = value.trim();
+            let channels = match v.to_lowercase().as_str() {
+                "モノラル" | "mono" => Some(1),
+                "ステレオ" | "stereo" => Some(2),
+                _ => positive(v),
+            };
+            FieldCond::Ch {
+                op,
+                value: channels.ok_or_else(|| {
+                    "チャンネルは 1 以上の数か、モノラル・ステレオで指定してください".to_string()
+                })?,
+            }
+        }
+        FieldKind::Lufs => {
+            only_comparison(op, label, "ラウドネス>-14")?;
+            FieldCond::Lufs {
+                op,
+                value: decibels(strip_suffix(value, &["lufs"])).ok_or_else(|| {
+                    "ラウドネスは LUFS の数で指定してください（例：ラウドネス>-14）".to_string()
+                })?,
+            }
+        }
+        FieldKind::Peak => {
+            only_comparison(op, label, "ピーク>-1")?;
+            FieldCond::Peak {
+                op,
+                value: decibels(strip_suffix(value, &["dbtp", "db"])).ok_or_else(|| {
+                    "ピークは dBTP の数で指定してください（例：ピーク>-1）".to_string()
+                })?,
+            }
+        }
     })
+}
+
+/// 大小の比較だけのフィールド（ラウドネス・ピーク。実数なので一致では探さない）。
+fn only_comparison(op: Op, label: &str, example: &str) -> Result<(), String> {
+    if op.is_comparison() {
+        Ok(())
+    } else {
+        Err(format!(
+            "「{label}」は大小で比べてください（例：{example}）"
+        ))
+    }
+}
+
+/// あり・なし（はい・いいえ、yes・no、true・false）。
+fn yes_no(value: &str, label: &str) -> Result<bool, String> {
+    match value.trim().to_lowercase().as_str() {
+        "あり" | "はい" | "yes" | "true" => Ok(true),
+        "なし" | "いいえ" | "no" | "false" => Ok(false),
+        _ => Err(format!("「{label}」は あり・なし で指定してください")),
+    }
+}
+
+/// 末尾の単位（大文字小文字を問わない）を外す。
+fn strip_suffix<'a>(value: &'a str, units: &[&str]) -> &'a str {
+    let v = value.trim();
+    let lower = v.to_lowercase();
+    for unit in units {
+        // 単位は ASCII かかなで、小文字にしても長さが変わらない
+        if lower.ends_with(unit)
+            && v.len() >= unit.len()
+            && v.is_char_boundary(v.len() - unit.len())
+        {
+            return v[..v.len() - unit.len()].trim_end();
+        }
+    }
+    v
+}
+
+/// 1 以上の整数。
+fn positive(value: &str) -> Option<i64> {
+    parse_int(value).filter(|v| *v >= 1)
+}
+
+/// 10 進の数（符号・小数点付き。指数・inf・NaN は受けない）を `10^digits` 倍の整数にする。
+/// `digits` 桁の次の桁で四捨五入し（5 以上なら絶対値を 1 上げる。0 から遠い方へ：`-23.0005` → `-23001`）、丸めずに
+/// 済んだか（exact）も返す。符号は `-`・`+`・U+2212 の `−`。
+fn scaled(value: &str, digits: u32) -> Option<(i64, bool)> {
+    let v = value.trim();
+    let (negative, body) = if let Some(rest) = v.strip_prefix(['-', '−']) {
+        (true, rest)
+    } else if let Some(rest) = v.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, v)
+    };
+    let (int, frac) = body.split_once('.').unwrap_or((body, ""));
+    let digits_only = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if (int.is_empty() && frac.is_empty()) || !digits_only(int) || !digits_only(frac) {
+        return None;
+    }
+    // 桁があふれないように（ここで扱う値はどれも 12 桁で足りる）
+    if int.len() > 12 {
+        return None;
+    }
+    let mut n: i64 = if int.is_empty() { 0 } else { int.parse().ok()? };
+    let frac: Vec<i64> = frac.bytes().map(|b| i64::from(b - b'0')).collect();
+    let keep = usize::try_from(digits).ok()?;
+    for i in 0..keep {
+        n = n
+            .checked_mul(10)?
+            .checked_add(frac.get(i).copied().unwrap_or(0))?;
+    }
+    let rest = frac.get(keep..).unwrap_or(&[]);
+    let exact = rest.iter().all(|d| *d == 0);
+    if rest.first().is_some_and(|d| *d >= 5) {
+        n = n.checked_add(1)?;
+    }
+    Some((if negative { -n } else { n }, exact))
+}
+
+/// サンプリングレート（Hz の整数）：`44100`・`44100Hz`・`44.1k`・`48kHz`。0 以下と、Hz にして端数の出るものは受けない。
+fn parse_rate(value: &str) -> Option<i64> {
+    let v = strip_suffix(value, &["hz"]);
+    let hz = match v.strip_suffix(['k', 'K']) {
+        Some(khz) => match scaled(khz, 3)? {
+            (hz, true) => hz,
+            (_, false) => return None,
+        },
+        None => match scaled(v, 0)? {
+            (hz, true) => hz,
+            (_, false) => return None,
+        },
+    };
+    (1..=100_000_000).contains(&hz).then_some(hz)
+}
+
+/// デシベルの値（LUFS・dBTP）を 1/1000 の整数にする。±1000 dB を超える値は受けない。
+fn decibels(value: &str) -> Option<i64> {
+    let (milli, _) = scaled(value, 3)?;
+    (-1_000_000..=1_000_000).contains(&milli).then_some(milli)
 }
 
 fn count(value: &str, label: &str) -> Result<i64, String> {
@@ -241,21 +520,36 @@ fn parse_int(value: &str) -> Option<i64> {
     value.trim().parse().ok()
 }
 
+/// 種類の値の語（日本語の語・英語の名前）。候補（suggest）もこの順に出す。
+pub const KIND_WORDS: [(&str, KindValue); 5] = [
+    ("画像", KindValue::Image),
+    ("動画", KindValue::Video),
+    ("音楽", KindValue::Audio),
+    ("フォント", KindValue::Font),
+    ("3D", KindValue::Model),
+];
+
+/// 種類の語を読む：日本語の語（`3D` は大文字・小文字を問わない）か、英語の名前（`image`・`font`・`model` など）。
+fn parse_kind(word: &str) -> Option<KindValue> {
+    let lower = word.to_lowercase();
+    KIND_WORDS
+        .iter()
+        .find(|(ja, _)| ja.to_lowercase() == lower)
+        .map(|(_, kind)| *kind)
+        .or_else(|| KindValue::parse(&lower))
+}
+
 fn parse_kinds(value: &str) -> Result<Vec<KindValue>, String> {
+    const MESSAGE: &str = "種類は 画像・動画・音楽・フォント・3D のどれかです（「,」で複数）";
     let mut kinds = Vec::new();
     for part in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let kind = match part.to_lowercase().as_str() {
-            "画像" | "image" => KindValue::Image,
-            "動画" | "video" => KindValue::Video,
-            "音楽" | "audio" => KindValue::Audio,
-            _ => return Err("種類は 画像・動画・音楽 のどれかです（「,」で複数）".into()),
-        };
+        let kind = parse_kind(part).ok_or(MESSAGE)?;
         if !kinds.contains(&kind) {
             kinds.push(kind);
         }
     }
     if kinds.is_empty() {
-        return Err("種類は 画像・動画・音楽 のどれかです（「,」で複数）".into());
+        return Err(MESSAGE.into());
     }
     Ok(kinds)
 }
@@ -445,6 +739,39 @@ mod tests {
         assert_eq!(find_field("種類").map(|f| f.key), Some("type"));
         assert_eq!(find_field("URL").map(|f| f.key), Some("url"));
         assert_eq!(find_field("Type").map(|f| f.key), Some("type"));
+        assert_eq!(find_field("２のべき乗").map(|f| f.key), Some("pot"));
+        assert_eq!(find_field("LUFS").map(|f| f.key), Some("lufs"));
         assert!(find_field("作者").is_none());
+    }
+
+    /// 名前は表の中で重ならず、記号・空白を含まない（フロントは bindings の `QUERY_FIELD_NAMES` で同じ表を読む）。
+    #[test]
+    fn field_names_are_unique_plain_words() {
+        let mut seen: Vec<String> = Vec::new();
+        let mut keys: Vec<&str> = Vec::new();
+        for def in FIELDS {
+            assert!(!keys.contains(&def.key), "{}", def.key);
+            keys.push(def.key);
+            assert!(
+                def.names.contains(&def.label) || def.label == "URL",
+                "{}",
+                def.key
+            );
+            for name in def.names {
+                let lower = name.to_lowercase();
+                assert!(!seen.contains(&lower), "{name} が重なっています");
+                seen.push(lower);
+                assert!(
+                    name.chars().all(|c| !c.is_whitespace()
+                        && !matches!(
+                            c,
+                            ':' | '=' | '<' | '>' | '!' | '(' | ')' | '"' | '|' | ',' | '-'
+                        )
+                        && super::super::lexer::normalize(c) == c),
+                    "{name}"
+                );
+                assert_eq!(find_field(name).map(|f| f.key), Some(def.key), "{name}");
+            }
+        }
     }
 }

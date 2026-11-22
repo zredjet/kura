@@ -1,24 +1,58 @@
 //! Kura の macOS 専用機能。Swift ヘルパー（`swift/`）を C 互換関数として呼ぶ。
 //!
 //! - `reduce_transparency`：「透明度を下げる」の設定
-//! - `MacBackend`：`MediaBackend` の macOS 実装（ImageIO / AVFoundation）
+//! - `MacBackend`：`MediaBackend` の macOS 実装（ImageIO はアルファを保つ・AVFoundation・CoreText のフォント）
 //! - `media_backend`：macOS の実装で扱えない形式を ffmpeg に回す組み合わせ
+//! - `image_thumbnails_keep_alpha`・`font_thumbnails`・`probe_font`：M11 の ImageIO のアルファを保つサムネイル、
+//!   CoreText のフォントの見本とフォントの情報（`thumbs`）
+//! - `pinned_options`・`system_svg_fonts`：SVG の文字を描くシステムのフォント（mmap して渡す。`fonts`）
 //! - `open_in_player`：外部プレイヤー（mpv / QuickTime Player）で開く
+//! - `current_executable`・`executable_path`：プロセスの今の実行ファイル（改名・移動を追う。SVG の働き手の起動。`process`）
 //! - `find_chrome`・`snapshot_webview`：キャプチャ用の Google Chrome の場所と、WKWebView の表示範囲の撮影
-//! - `reveal_in_finder`・`volume_capacity`：Finder で見せる、ボリュームの容量
+//! - `begin_drag`：WKWebView から OS のドラッグを始め、落とす先が求めたらファイルの URL を渡す（ドラッグアウト。M15 段 5）
+//! - `reveal_in_finder`・`volume_capacity`・`physical_memory`：Finder で見せる、ボリュームの容量、物理メモリ（編集のメモリの予算）
+//! - `codec`：編集の Platform の段のコーデック（ImageIO・AudioToolbox の読み取り、AudioToolbox の AAC の書き出し）と
+//!   `codec_set`（固定の段に足した組）・`full_codec_set`（さらに ffmpeg の段を足したアプリの組）・`codec_caps`（能力と環境）
+//!
+//! - `ReturningAllocator`：1 MiB 以上の確保を mmap で取り、解放したら OS へすぐ返す確保器（アプリと kura-devtools の
+//!   `#[global_allocator]`。libmalloc が大きな領域を抱えたままにして NFR-07 に戻らないため。`alloc`）。確保の量を数える目印を
+//!   持ち、SVG の働き手のときだけ上限を付ける（ADR-164 (4)）
 //!
 //! macOS 以外では同じ関数・型が「扱えない」を返すだけの空の実装になり、ワークスペース全体がビルドできる。
 
+mod abi;
+pub mod alloc;
+#[cfg(target_os = "macos")]
+mod bridge;
 mod browser;
+pub mod codec;
+mod dragout;
+mod durability;
 mod external;
 mod files;
+pub mod fonts;
+mod process;
+mod thumbs;
 
+pub use alloc::{ReturningAllocator, SPACE_EFFICIENT_ENV};
 pub use browser::{
     SnapshotDone, SnapshotInfo, find_chrome, frontmost_pid, play_capture_sound, snapshot_webview,
 };
+pub use codec::{
+    MacCaps, codec_caps, codec_set, full_codec_set, platform_decoders, platform_encoders,
+    platform_status,
+};
+pub use dragout::{DragFile, DragHandler, begin_drag};
+pub use durability::MacDurability;
 pub use external::{ExternalPlayer, open_in_player};
 pub use files::{
-    VolumeCapacity, keep_webview_focus_on_fullscreen, reveal_in_finder, volume_capacity,
+    VolumeCapacity, keep_webview_focus_on_fullscreen, physical_memory, reveal_in_finder,
+    volume_capacity,
+};
+pub use fonts::{pinned_options, system_svg_fonts};
+pub use process::{current_executable, executable_path};
+pub use thumbs::{
+    FONT_SAMPLES, FontInfo, FontProbe, font_thumbnails, image_thumbnails_keep_alpha, probe_font,
 };
 
 use std::path::Path;
@@ -26,7 +60,7 @@ use std::sync::Arc;
 
 use kura_core::import::MediaKind;
 use kura_core::media::{
-    ChainBackend, FfmpegBackend, MediaBackend, MediaError, MediaInfo, ThumbTargets,
+    ChainBackend, FfmpegBackend, MediaBackend, MediaError, MediaInfo, ThumbFormat, ThumbTargets,
 };
 
 /// サムネイルの長辺（docs/architecture.md §4：s = 512、l = 1600）。
@@ -39,31 +73,22 @@ mod ffi {
 
     unsafe extern "C" {
         pub fn kura_reduce_transparency() -> bool;
-        pub fn kura_image_thumbnails(
-            path: *const c_char,
-            out_large: *const c_char,
-            out_small: *const c_char,
-            large_px: i32,
-            small_px: i32,
-        ) -> i32;
         pub fn kura_video_thumbnails(
             path: *const c_char,
             at_sec: f64,
-            out_large: *const c_char,
-            out_small: *const c_char,
+            out_large_stem: *const c_char,
+            out_small_stem: *const c_char,
             large_px: i32,
             small_px: i32,
         ) -> i32;
         pub fn kura_audio_artwork(
             path: *const c_char,
             out_art: *const c_char,
-            out_large: *const c_char,
-            out_small: *const c_char,
+            out_large_stem: *const c_char,
+            out_small_stem: *const c_char,
             large_px: i32,
             small_px: i32,
         ) -> i32;
-        pub fn kura_probe(path: *const c_char, kind: i32) -> *mut c_char;
-        pub fn kura_free_string(pointer: *mut c_char);
     }
 }
 
@@ -120,7 +145,7 @@ impl MediaBackend for RoutedBackend {
     fn probe(&self, path: &Path, kind: MediaKind) -> Result<MediaInfo, MediaError> {
         self.pick(path).probe(path, kind)
     }
-    fn image_thumbnails(&self, path: &Path, out: &ThumbTargets) -> Result<(), MediaError> {
+    fn image_thumbnails(&self, path: &Path, out: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
         self.pick(path).image_thumbnails(path, out)
     }
     fn video_thumbnails(
@@ -128,7 +153,7 @@ impl MediaBackend for RoutedBackend {
         path: &Path,
         at_sec: f64,
         out: &ThumbTargets,
-    ) -> Result<(), MediaError> {
+    ) -> Result<ThumbFormat, MediaError> {
         self.pick(path).video_thumbnails(path, at_sec, out)
     }
     fn audio_artwork(
@@ -136,8 +161,11 @@ impl MediaBackend for RoutedBackend {
         path: &Path,
         art: &Path,
         out: &ThumbTargets,
-    ) -> Result<bool, MediaError> {
+    ) -> Result<Option<ThumbFormat>, MediaError> {
         self.pick(path).audio_artwork(path, art, out)
+    }
+    fn font_thumbnails(&self, path: &Path, out: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
+        self.pick(path).font_thumbnails(path, out)
     }
 }
 
@@ -146,66 +174,36 @@ pub struct MacBackend;
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use std::ffi::{CStr, CString};
-    use std::os::unix::ffi::OsStrExt;
-
     use super::*;
+    use crate::thumbs::mac::{KIND_FONT, NO_ARTWORK, c_path, check, probe_json};
 
-    const OK: i32 = 0;
-    const UNSUPPORTED: i32 = 1;
-    const NO_ARTWORK: i32 = 3;
-
-    fn c_path(path: &Path) -> Result<CString, MediaError> {
-        CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            MediaError::Failed(format!("パスに NUL 文字があります: {}", path.display()))
-        })
-    }
-
-    fn check(code: i32) -> Result<(), MediaError> {
-        match code {
-            OK => Ok(()),
-            UNSUPPORTED => Err(MediaError::Unsupported),
-            _ => Err(MediaError::Failed("macOS での処理に失敗しました".into())),
-        }
-    }
-
-    fn kind_code(kind: MediaKind) -> i32 {
+    /// `kura_probe` の種類の番号（0 画像・1 動画・2 音楽・3 フォント）。3D は kura-core が kura-engine の glb の読み手で読むので
+    /// 扱わない（次の実装に回す）。
+    fn kind_code(kind: MediaKind) -> Option<i32> {
         match kind {
-            MediaKind::Image => 0,
-            MediaKind::Video => 1,
-            MediaKind::Audio => 2,
+            MediaKind::Image => Some(0),
+            MediaKind::Video => Some(1),
+            MediaKind::Audio => Some(2),
+            MediaKind::Font => Some(KIND_FONT),
+            MediaKind::Model => None,
         }
     }
 
     impl MediaBackend for MacBackend {
         fn probe(&self, path: &Path, kind: MediaKind) -> Result<MediaInfo, MediaError> {
-            let path = c_path(path)?;
-            // SAFETY: path は NUL 終端。戻り値は NULL か strdup した文字列で、kura_free_string で解放する。
-            let pointer = unsafe { ffi::kura_probe(path.as_ptr(), kind_code(kind)) };
-            if pointer.is_null() {
-                return Err(MediaError::Unsupported);
-            }
-            // SAFETY: NULL でない戻り値は NUL 終端の UTF-8（JSON）。
-            let json = unsafe { CStr::from_ptr(pointer) }
-                .to_string_lossy()
-                .into_owned();
-            // SAFETY: kura_probe が返したポインタを一度だけ解放する。
-            unsafe { ffi::kura_free_string(pointer) };
+            let code = kind_code(kind).ok_or(MediaError::Unsupported)?;
+            let json = probe_json(path, code)?;
+            // フォントは `{"codec": 形式, "font": {…}}`（幅・高さは空）
             serde_json::from_str(&json).map_err(|e| MediaError::Failed(e.to_string()))
         }
 
-        fn image_thumbnails(&self, path: &Path, out: &ThumbTargets) -> Result<(), MediaError> {
-            let (src, large, small) = (c_path(path)?, c_path(&out.large)?, c_path(&out.small)?);
-            // SAFETY: すべて NUL 終端の文字列。Swift 側は読むだけ。
-            check(unsafe {
-                ffi::kura_image_thumbnails(
-                    src.as_ptr(),
-                    large.as_ptr(),
-                    small.as_ptr(),
-                    LARGE_PX,
-                    SMALL_PX,
-                )
-            })
+        fn image_thumbnails(
+            &self,
+            path: &Path,
+            out: &ThumbTargets,
+        ) -> Result<ThumbFormat, MediaError> {
+            // アルファを保つ道（決定 3・4）：透明な画素があれば PNG、なければ JPEG
+            crate::thumbs::mac::image_thumbnails(path, out, true)
         }
 
         fn video_thumbnails(
@@ -213,9 +211,9 @@ mod mac {
             path: &Path,
             at_sec: f64,
             out: &ThumbTargets,
-        ) -> Result<(), MediaError> {
+        ) -> Result<ThumbFormat, MediaError> {
             let (src, large, small) = (c_path(path)?, c_path(&out.large)?, c_path(&out.small)?);
-            // SAFETY: すべて NUL 終端の文字列。Swift 側は読むだけ。
+            // SAFETY: すべて NUL 終端の文字列。Swift 側は読むだけ（stem に `.jpg` を足して書く）。
             check(unsafe {
                 ffi::kura_video_thumbnails(
                     src.as_ptr(),
@@ -226,6 +224,7 @@ mod mac {
                     SMALL_PX,
                 )
             })
+            .map(|()| ThumbFormat::Jpeg)
         }
 
         fn audio_artwork(
@@ -233,14 +232,14 @@ mod mac {
             path: &Path,
             art: &Path,
             out: &ThumbTargets,
-        ) -> Result<bool, MediaError> {
+        ) -> Result<Option<ThumbFormat>, MediaError> {
             let (src, art, large, small) = (
                 c_path(path)?,
                 c_path(art)?,
                 c_path(&out.large)?,
                 c_path(&out.small)?,
             );
-            // SAFETY: すべて NUL 終端の文字列。Swift 側は読むだけ。
+            // SAFETY: すべて NUL 終端の文字列。Swift 側は読むだけ（stem に `.jpg` を足して書く）。
             let code = unsafe {
                 ffi::kura_audio_artwork(
                     src.as_ptr(),
@@ -252,9 +251,17 @@ mod mac {
                 )
             };
             if code == NO_ARTWORK {
-                return Ok(false);
+                return Ok(None);
             }
-            check(code).map(|()| true)
+            check(code).map(|()| Some(ThumbFormat::Jpeg))
+        }
+
+        fn font_thumbnails(
+            &self,
+            path: &Path,
+            out: &ThumbTargets,
+        ) -> Result<ThumbFormat, MediaError> {
+            crate::thumbs::mac::font_thumbnails(path, out)
         }
     }
 }
@@ -264,13 +271,26 @@ impl MediaBackend for MacBackend {
     fn probe(&self, _: &Path, _: MediaKind) -> Result<MediaInfo, MediaError> {
         Err(MediaError::Unsupported)
     }
-    fn image_thumbnails(&self, _: &Path, _: &ThumbTargets) -> Result<(), MediaError> {
+    fn image_thumbnails(&self, _: &Path, _: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
         Err(MediaError::Unsupported)
     }
-    fn video_thumbnails(&self, _: &Path, _: f64, _: &ThumbTargets) -> Result<(), MediaError> {
+    fn video_thumbnails(
+        &self,
+        _: &Path,
+        _: f64,
+        _: &ThumbTargets,
+    ) -> Result<ThumbFormat, MediaError> {
         Err(MediaError::Unsupported)
     }
-    fn audio_artwork(&self, _: &Path, _: &Path, _: &ThumbTargets) -> Result<bool, MediaError> {
+    fn audio_artwork(
+        &self,
+        _: &Path,
+        _: &Path,
+        _: &ThumbTargets,
+    ) -> Result<Option<ThumbFormat>, MediaError> {
+        Err(MediaError::Unsupported)
+    }
+    fn font_thumbnails(&self, _: &Path, _: &ThumbTargets) -> Result<ThumbFormat, MediaError> {
         Err(MediaError::Unsupported)
     }
 }
@@ -403,8 +423,8 @@ mod tests {
 
     fn targets(dir: &Path) -> ThumbTargets {
         ThumbTargets {
-            large: dir.join("t/l.jpg"),
-            small: dir.join("t/s.jpg"),
+            large: dir.join("t/l"),
+            small: dir.join("t/s"),
         }
     }
 
@@ -447,41 +467,129 @@ mod tests {
         assert_eq!(audio.album.as_deref(), Some("夜の作業"));
     }
 
-    /// 完了条件：HEIC・MOV・FLAC のサムネイルが出る。
+    /// M11 の既定（フォントの情報）：フォントは `kura_probe` の種類 3（CoreText）で、書体名・字の数などを `font` に、形式を
+    /// `codec` に読む（幅・高さは空。codec_info に入る）。3D は kura-core が kura-engine で読むので、ここでは読まない（ffmpeg にも
+    /// 回さない）。
+    #[test]
+    fn fonts_are_probed_with_coretext_and_models_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let font = Path::new("/System/Library/Fonts/Geneva.ttf");
+        for backend in [
+            Arc::new(MacBackend) as Arc<dyn MediaBackend>,
+            media_backend(),
+        ] {
+            let info = backend.probe(font, MediaKind::Font).unwrap();
+            assert_eq!(info.codec.as_deref(), Some("ttf"));
+            assert_eq!((info.width, info.height), (None, None));
+            let f = info.font.clone().unwrap();
+            assert_eq!(f.family.as_deref(), Some("Geneva"));
+            assert!(f.glyphs > 100);
+            let json: serde_json::Value =
+                serde_json::from_str(&info.codec_json().unwrap()).unwrap();
+            assert_eq!(json["font"]["family"], "Geneva");
+        }
+        let glb = dir.path().join("x.glb");
+        std::fs::write(&glb, b"glTF\x02\0\0\0\x0c\0\0\0").unwrap();
+        assert!(matches!(
+            MacBackend.probe(&glb, MediaKind::Model),
+            Err(MediaError::Unsupported)
+        ));
+        assert!(matches!(
+            media_backend().probe(&glb, MediaKind::Model),
+            Err(MediaError::Unsupported)
+        ));
+        // フォントでないものは扱えない（音楽として読まない）
+        let fake = dir.path().join("fake.ttf");
+        std::fs::write(&fake, b"\0\x01\0\0 not a font").unwrap();
+        assert!(matches!(
+            MacBackend.probe(&fake, MediaKind::Font),
+            Err(MediaError::Unsupported)
+        ));
+    }
+
+    /// 決定 3・4（MediaBackend の道）：ImageIO の道はアルファを保ち、透明のある HEIC・TIFF は PNG、透明のないものは JPEG を
+    /// 書く（書き先は stem）。フォントの見本は PNG。
+    #[test]
+    fn the_backend_keeps_alpha_and_draws_fonts() {
+        let _g = crate::codec::testutil::shared();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = media_backend();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        for name in ["heic-alpha-48x32.heic", "tiff-alpha-48x32.tif"] {
+            let out = targets(&dir.path().join(name));
+            assert_eq!(
+                backend
+                    .image_thumbnails(&fixtures.join(name), &out)
+                    .unwrap(),
+                ThumbFormat::Png,
+                "{name}"
+            );
+            assert!(out.files(ThumbFormat::Png).1.is_file());
+            assert!(!out.files(ThumbFormat::Jpeg).0.exists());
+        }
+        let out = targets(&dir.path().join("opaque"));
+        assert_eq!(
+            backend
+                .image_thumbnails(&fixtures.join("heic-gradient-300x200.heic"), &out)
+                .unwrap(),
+            ThumbFormat::Jpeg
+        );
+        let out = targets(&dir.path().join("font"));
+        assert_eq!(
+            backend
+                .font_thumbnails(Path::new("/System/Library/Fonts/Geneva.ttf"), &out)
+                .unwrap(),
+            ThumbFormat::Png
+        );
+        assert!(out.files(ThumbFormat::Png).0.is_file());
+    }
+
+    /// 完了条件：HEIC・MOV・FLAC のサムネイルが出る（動画・ジャケットはいつも JPEG。書き先は stem）。
     #[test]
     fn makes_heic_mov_and_flac_thumbnails() {
         let Some(m) = media() else { return };
         let dir = tempfile::tempdir().unwrap();
         let backend = media_backend();
+        let jpg = |t: &ThumbTargets| t.files(ThumbFormat::Jpeg);
 
         let heic = targets(&dir.path().join("heic"));
-        backend.image_thumbnails(&m.heic, &heic).unwrap();
-        assert_eq!(long_edge(&heic.large), 1200); // 元より大きくはしない
-        assert_eq!(long_edge(&heic.small), 512);
+        assert_eq!(
+            backend.image_thumbnails(&m.heic, &heic).unwrap(),
+            ThumbFormat::Jpeg
+        );
+        assert_eq!(long_edge(&jpg(&heic).0), 1200); // 元より大きくはしない
+        assert_eq!(long_edge(&jpg(&heic).1), 512);
 
         let jpeg = targets(&dir.path().join("jpeg"));
         backend.image_thumbnails(&m.jpeg, &jpeg).unwrap();
-        assert!(jpeg.small.is_file());
+        assert!(jpg(&jpeg).1.is_file());
 
         let mov = targets(&dir.path().join("mov"));
-        backend.video_thumbnails(&m.mov, 0.3, &mov).unwrap();
-        assert_eq!(long_edge(&mov.large), 640);
-        assert_eq!(long_edge(&mov.small), 512);
+        assert_eq!(
+            backend.video_thumbnails(&m.mov, 0.3, &mov).unwrap(),
+            ThumbFormat::Jpeg
+        );
+        assert_eq!(long_edge(&jpg(&mov).0), 640);
+        assert_eq!(long_edge(&jpg(&mov).1), 512);
 
         let mkv = targets(&dir.path().join("mkv"));
         backend.video_thumbnails(&m.mkv, 0.2, &mkv).unwrap();
-        assert!(mkv.small.is_file());
+        assert!(jpg(&mkv).1.is_file());
 
         let flac = targets(&dir.path().join("flac"));
         let art = dir.path().join("art.jpg");
-        assert!(backend.audio_artwork(&m.flac, &art, &flac).unwrap());
-        assert!(art.is_file() && flac.large.is_file() && flac.small.is_file());
+        assert_eq!(
+            backend.audio_artwork(&m.flac, &art, &flac).unwrap(),
+            Some(ThumbFormat::Jpeg)
+        );
+        assert!(art.is_file() && jpg(&flac).0.is_file() && jpg(&flac).1.is_file());
 
         let plain = targets(&dir.path().join("plain"));
-        assert!(
-            !backend
+        assert_eq!(
+            backend
                 .audio_artwork(&m.flac_plain, &dir.path().join("none.jpg"), &plain)
-                .unwrap()
+                .unwrap(),
+            None
         );
     }
 

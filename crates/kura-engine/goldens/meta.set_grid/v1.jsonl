@@ -1,0 +1,2 @@
+{"digest":"50dafbf67ecd600255ece43ab82d72363423106510984b59d299ade1da20a6e4","inputs":[{"fmt":"rgba8","h":20,"seed":91,"type":"noise","w":30}],"name":"set","params":{"grid":{"cellH":6,"cellW":8,"gapX":1,"gapY":2,"offsetX":1,"offsetY":0}},"target":"*"}
+{"digest":"6ab23a06653501da3a034cad078b6b57bebf048f04ff5b4739b7d8682e96f5b6","inputs":[{"cell":8,"cols":2,"rows":2,"type":"sheet"}],"name":"clear","params":{"grid":null},"target":"*"}

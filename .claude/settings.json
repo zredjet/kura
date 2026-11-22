@@ -18,14 +18,18 @@
       "Bash(git status)",
       "Bash(git diff *)",
       "Bash(git log *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git -C * add *)",
+      "Bash(git -C * commit *)",
       "Bash(which *)",
       "Bash(yt-dlp --version)",
       "Bash(gallery-dl --version)",
       "Bash(ffprobe *)"
     ],
     "ask": [
-      "Bash(git commit *)",
       "Bash(git push *)",
+      "Bash(git -C * push *)",
       "Bash(pnpm add *)",
       "Bash(cargo add *)",
       "Bash(brew *)"

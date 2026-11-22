@@ -92,6 +92,8 @@ interface ViewState extends Saved {
   downloads: boolean;
   /** タグの一覧の画面を開いているか（一覧の代わりに出す）。 */
   tags: boolean;
+  /** レシピの画面を開いていればその ID（一覧の代わりに出す。M14 段 7）。 */
+  recipe: number | null;
   /** ユニットを開いているときの戻り先。 */
   parent: ListView | null;
   /** 検索の条件（チップの列。docs/search-query.md）。一覧を切り替えると外す（ADR-53）。 */
@@ -108,6 +110,8 @@ interface ViewState extends Saved {
   openDownloads: () => void;
   /** タグの一覧の画面を開く。 */
   openTags: () => void;
+  /** レシピの画面を開く。 */
+  openRecipe: (id: number) => void;
   /** ユニットの中を開く（戻り先は今の一覧）。 */
   openUnit: (unitId: number) => void;
   /** ユニットの中から戻る。 */
@@ -133,6 +137,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
   playlist: null,
   downloads: false,
   tags: false,
+  recipe: null,
   parent: null,
   filter: [],
   parentFilter: [],
@@ -144,6 +149,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
       playlist: null,
       downloads: false,
       tags: false,
+      recipe: null,
       parent: null,
       filter: [],
       parentFilter: [],
@@ -155,6 +161,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
       playlist: id,
       downloads: false,
       tags: false,
+      recipe: null,
       selection: EMPTY_SELECTION,
       quickLook: false,
     }),
@@ -163,12 +170,23 @@ export const useViewStore = create<ViewState>((set, get) => ({
       downloads: true,
       playlist: null,
       tags: false,
+      recipe: null,
       selection: EMPTY_SELECTION,
       quickLook: false,
     }),
   openTags: () =>
     set({
       tags: true,
+      downloads: false,
+      playlist: null,
+      recipe: null,
+      selection: EMPTY_SELECTION,
+      quickLook: false,
+    }),
+  openRecipe: (id) =>
+    set({
+      recipe: id,
+      tags: false,
       downloads: false,
       playlist: null,
       selection: EMPTY_SELECTION,
@@ -182,6 +200,7 @@ export const useViewStore = create<ViewState>((set, get) => ({
       playlist: null,
       downloads: false,
       tags: false,
+      recipe: null,
       parent: fromUnit ? parent : view,
       filter: [],
       parentFilter: fromUnit ? parentFilter : filter,

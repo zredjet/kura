@@ -22,6 +22,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::support::{
     Container, PlaybackSupport, ProxyPlan, StreamAction, Streams, forced_plan, parse_streams, plan,
 };
+use crate::import::MediaKind;
 use crate::jobs::{Control, JobContext, JobEnd, JobHandler};
 use crate::library::{Layout, hex};
 use crate::time::now_ms;
@@ -207,7 +208,7 @@ struct Todo {
     id: i64,
     hash: [u8; 32],
     ext: String,
-    kind: String,
+    kind: MediaKind,
 }
 
 /// 次にすること。
@@ -218,11 +219,11 @@ enum Work {
     Nothing,
 }
 
-fn todo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Vec<u8>, String, String)> {
+fn todo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, Vec<u8>, String, MediaKind)> {
     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
 }
 
-fn to_todo((id, hash, ext, kind): (i64, Vec<u8>, String, String)) -> Option<Todo> {
+fn to_todo((id, hash, ext, kind): (i64, Vec<u8>, String, MediaKind)) -> Option<Todo> {
     let hash = <[u8; 32]>::try_from(hash.as_slice()).ok()?;
     Some(Todo {
         id,
@@ -236,7 +237,7 @@ fn to_todo((id, hash, ext, kind): (i64, Vec<u8>, String, String)) -> Option<Todo
 fn next_work(conn: &Connection, priority: &[i64]) -> Result<Work> {
     let mut by_id = conn.prepare_cached(
         "SELECT id, hash, ext, kind, proxy_state FROM items
-         WHERE id = ?1 AND kind != 'image' AND trashed_at IS NULL",
+         WHERE id = ?1 AND +kind IN ('video', 'audio') AND trashed_at IS NULL",
     )?;
     let mut decide = Vec::new();
     let mut make = None;
@@ -261,7 +262,7 @@ fn next_work(conn: &Connection, priority: &[i64]) -> Result<Work> {
 
     let mut unknown = conn.prepare_cached(
         "SELECT id, hash, ext, kind FROM items
-         WHERE proxy_state = 'unknown' AND kind != 'image' AND trashed_at IS NULL
+         WHERE proxy_state = 'unknown' AND +kind IN ('video', 'audio') AND trashed_at IS NULL
          ORDER BY imported_at DESC, id DESC LIMIT ?1",
     )?;
     let batch: Vec<Todo> = unknown
@@ -275,7 +276,7 @@ fn next_work(conn: &Connection, priority: &[i64]) -> Result<Work> {
     }
     let mut pending = conn.prepare_cached(
         "SELECT id, hash, ext, kind FROM items
-         WHERE proxy_state = 'pending' AND kind != 'image' AND trashed_at IS NULL
+         WHERE proxy_state = 'pending' AND +kind IN ('video', 'audio') AND trashed_at IS NULL
          ORDER BY imported_at DESC, id DESC LIMIT 1",
     )?;
     let next = pending.query_row([], todo_from_row).optional()?;
@@ -285,8 +286,8 @@ fn next_work(conn: &Connection, priority: &[i64]) -> Result<Work> {
 /// 判定・作成を待っている数。
 fn count_todo(conn: &Connection) -> Result<u64> {
     let mut stmt = conn.prepare_cached(
-        "SELECT (SELECT COUNT(*) FROM items WHERE proxy_state = 'unknown' AND kind != 'image' AND trashed_at IS NULL)
-              + (SELECT COUNT(*) FROM items WHERE proxy_state = 'pending' AND kind != 'image' AND trashed_at IS NULL)",
+        "SELECT (SELECT COUNT(*) FROM items WHERE proxy_state = 'unknown' AND +kind IN ('video', 'audio') AND trashed_at IS NULL)
+              + (SELECT COUNT(*) FROM items WHERE proxy_state = 'pending' AND +kind IN ('video', 'audio') AND trashed_at IS NULL)",
     )?;
     let count: i64 = stmt.query_row([], |r| r.get(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
@@ -311,7 +312,7 @@ pub fn sync_support(tx: &Connection, fingerprint: &str) -> Result<bool> {
     if stored.as_deref() != Some(current.as_str()) {
         let reset = tx.execute(
             "UPDATE items SET proxy_state = 'unknown'
-             WHERE kind != 'image' AND proxy_state IN ('not_needed', 'pending', 'failed')",
+             WHERE +kind IN ('video', 'audio') AND proxy_state IN ('not_needed', 'pending', 'failed')",
             [],
         )?;
         tx.execute(
@@ -332,7 +333,7 @@ pub fn sync_support(tx: &Connection, fingerprint: &str) -> Result<bool> {
 pub fn force_pending(tx: &Connection, ids: &[i64]) -> Result<bool> {
     let mut update = tx.prepare_cached(
         "UPDATE items SET proxy_state = 'pending'
-         WHERE id = ?1 AND kind != 'image' AND proxy_state IN ('not_needed', 'unknown', 'failed')",
+         WHERE id = ?1 AND +kind IN ('video', 'audio') AND proxy_state IN ('not_needed', 'unknown', 'failed')",
     )?;
     for &id in ids {
         update.execute([id])?;
@@ -343,7 +344,7 @@ pub fn force_pending(tx: &Connection, ids: &[i64]) -> Result<bool> {
 /// `ids` に判定・作成を待っているものがあるか。
 pub fn any_todo(conn: &Connection, ids: &[i64]) -> Result<bool> {
     let mut stmt = conn.prepare_cached(
-        "SELECT EXISTS (SELECT 1 FROM items WHERE id = ?1 AND kind != 'image'
+        "SELECT EXISTS (SELECT 1 FROM items WHERE id = ?1 AND +kind IN ('video', 'audio')
                         AND proxy_state IN ('unknown', 'pending') AND trashed_at IS NULL)",
     )?;
     for &id in ids {
@@ -358,6 +359,8 @@ pub fn any_todo(conn: &Connection, ids: &[i64]) -> Result<bool> {
 #[derive(Debug)]
 struct Decision {
     id: i64,
+    /// 判定したときの中身（書くときの条件。保存で中身が変わっていたら書かない）。
+    hash: [u8; 32],
     state: &'static str,
     codec_json: Option<String>,
     error: Option<String>,
@@ -372,13 +375,14 @@ fn decide(tools: &ProxyTools, layout: &Layout, support: &PlaybackSupport, todo: 
                 ProxyPlan::Make { .. } => "pending",
                 ProxyPlan::Unplayable => "failed",
             };
-            let main = if todo.kind == "video" {
+            let main = if todo.kind == MediaKind::Video {
                 streams.video.clone()
             } else {
                 streams.audio.clone()
             };
             Decision {
                 id: todo.id,
+                hash: todo.hash,
                 state,
                 codec_json: Some(
                     serde_json::json!({ "codec": main, "video": streams.video, "audio": streams.audio })
@@ -389,6 +393,7 @@ fn decide(tools: &ProxyTools, layout: &Layout, support: &PlaybackSupport, todo: 
         }
         Err(err) => Decision {
             id: todo.id,
+            hash: todo.hash,
             state: "failed",
             codec_json: None,
             error: Some(err),
@@ -400,19 +405,20 @@ fn apply_decisions(tx: &Connection, decisions: &[Decision]) -> Result<()> {
     let now = now_ms();
     let mut stmt = tx.prepare_cached(
         "UPDATE items SET proxy_state = ?2, codec_info = coalesce(?3, codec_info), updated_at = ?4
-         WHERE id = ?1 AND proxy_state = 'unknown'",
+         WHERE id = ?1 AND hash = ?5 AND proxy_state = 'unknown'",
     )?;
     for d in decisions {
-        stmt.execute(params![d.id, d.state, d.codec_json, now])?;
+        stmt.execute(params![d.id, d.state, d.codec_json, now, &d.hash[..]])?;
     }
     Ok(())
 }
 
-fn set_state(tx: &Connection, id: i64, state: &str) -> Result<()> {
-    tx.execute(
-        "UPDATE items SET proxy_state = ?2, updated_at = ?3 WHERE id = ?1",
-        params![id, state, now_ms()],
-    )?;
+/// 作った結果を書く。作り始めたときと中身（`hash`）が同じときだけ（保存で中身が変わっていたら書かない）。
+fn set_state(tx: &Connection, id: i64, hash: &[u8; 32], state: &str) -> Result<()> {
+    tx.prepare_cached(
+        "UPDATE items SET proxy_state = ?2, updated_at = ?3 WHERE id = ?1 AND hash = ?4",
+    )?
+    .execute(params![id, state, now_ms(), &hash[..]])?;
     Ok(())
 }
 
@@ -433,13 +439,14 @@ fn run_ffmpeg(
     control: &dyn Fn() -> Control,
     on_progress: &dyn Fn(f64),
 ) -> std::result::Result<Option<Control>, String> {
-    let mut child: Child = Command::new(&tools.ffmpeg)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
+    let mut child: Child = crate::tools::spawn(
+        Command::new(&tools.ffmpeg)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|e| format!("ffmpeg を起動できません: {e}"))?;
     let (sender, receiver) = mpsc::channel::<f64>();
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
@@ -674,14 +681,18 @@ impl JobHandler for ProxyHandler {
                     match make(ctx, tools, &support, &todo, &on_progress) {
                         Made::Ready => {
                             made += 1;
-                            let id = todo.id;
-                            library.db().write(move |tx| set_state(tx, id, "ready"))?;
+                            let (id, hash) = (todo.id, todo.hash);
+                            library
+                                .db()
+                                .write(move |tx| set_state(tx, id, &hash, "ready"))?;
                         }
                         Made::Failed(err) => {
                             failed += 1;
                             ctx.log(&format!("アイテム {}: {err}", todo.id));
-                            let id = todo.id;
-                            library.db().write(move |tx| set_state(tx, id, "failed"))?;
+                            let (id, hash) = (todo.id, todo.hash);
+                            library
+                                .db()
+                                .write(move |tx| set_state(tx, id, &hash, "failed"))?;
                         }
                         Made::Interrupted(Control::Cancel) => {
                             return Ok(JobEnd::Canceled {

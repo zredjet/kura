@@ -1,0 +1,4 @@
+{"name":"fixture-jpeg-progressive.jpg","source":{"path":"jpeg-progressive.jpg","type":"fixture"},"value":"eca475503c671b0a146371bcc707fb53af7438637e9b91c92c49aa26fc99c4b3"}
+{"name":"fixture-jpeg-gray.jpg","source":{"path":"jpeg-gray.jpg","type":"fixture"},"value":"616e39ad9381552c1f4308bf44518698dc88c06d5c540998346c85f9e31baf98"}
+{"name":"fixture-jpeg-422.jpg","source":{"path":"jpeg-422.jpg","type":"fixture"},"value":"913aa021c78d03ef92a995fec812af434ac88ffbf89e70935b3557affe7dc2f7"}
+{"name":"fixture-jpeg-restart.jpg","source":{"path":"jpeg-restart.jpg","type":"fixture"},"value":"fd0a5ffd76b5969518ec76c443e84d575fc0544fed2a01d3e1a0f2d3ee66fbb5"}

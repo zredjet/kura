@@ -15,7 +15,7 @@ use super::cdp::{Cdp, Page};
 use super::chrome::{login_args, profile_in_use};
 use super::rules::CaptureMode;
 use super::shoot::{Shot, shoot_live};
-use crate::tools::terminate_group;
+use crate::tools::{self, terminate_group};
 use crate::{CoreError, Result};
 
 /// 起動して DevTools の準備ができるまで待つ時間。
@@ -49,14 +49,15 @@ impl LoginBrowser {
         }
         std::fs::create_dir_all(profile)?;
         let _ = std::fs::remove_file(profile.join("DevToolsActivePort"));
-        let mut child = Command::new(chrome)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| CoreError::Tool(format!("Chrome を起動できませんでした: {e}")))?;
+        let mut child = tools::spawn(
+            Command::new(chrome)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0),
+        )
+        .map_err(|e| CoreError::Tool(format!("Chrome を起動できませんでした: {e}")))?;
         let connected = Cdp::connect_from_profile(profile, START_TIMEOUT, &mut || {
             matches!(child.try_wait(), Ok(None))
         });

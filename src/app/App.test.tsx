@@ -1,12 +1,18 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ja } from '../i18n/ja';
+import { listPendingSaves } from '../ipc/edit';
 import { restoreLibrary } from '../ipc/library';
 import { useLibraryStore } from '../stores/libraryStore';
 import { App } from './App';
 
+vi.mock(import('../ipc/edit'), async (importOriginal) => ({
+  ...(await importOriginal()),
+  listPendingSaves: vi.fn(async () => []),
+}));
 vi.mock('../ipc/library', () => ({
+  onLibraryUpgrade: vi.fn(async () => () => {}),
   restoreLibrary: vi.fn(),
   libraryInfo: vi.fn(),
   createLibrary: vi.fn(),
@@ -62,7 +68,12 @@ const info = {
 };
 
 beforeEach(() => {
-  useLibraryStore.setState({ status: 'loading', info: null, missingPath: null });
+  useLibraryStore.setState({
+    status: 'loading',
+    info: null,
+    missingPath: null,
+    restoreError: null,
+  });
   vi.mocked(restoreLibrary).mockReset();
 });
 
@@ -85,6 +96,15 @@ describe('App（前回のライブラリを開けたとき）', () => {
     expect(
       screen.getByRole('complementary', { name: ja.library.inspectorLabel }),
     ).toBeInTheDocument();
+  });
+
+  it('ライブラリを開いたら・替えたら、終わっていない保存を読む（カプセルから再開できる）', async () => {
+    vi.mocked(listPendingSaves).mockClear();
+    render(<App />);
+    await screen.findByRole('navigation', { name: ja.sidebar.label });
+    expect(listPendingSaves).toHaveBeenCalledTimes(1);
+    act(() => useLibraryStore.setState({ info: { ...info, path: '/Users/me/other.kuralib' } }));
+    await waitFor(() => expect(listPendingSaves).toHaveBeenCalledTimes(2));
   });
 
   it('サイドバーの先頭行とツールバーがウィンドウのドラッグ領域になっている', async () => {
@@ -111,5 +131,20 @@ describe('App（ライブラリがないとき）', () => {
       await screen.findByRole('heading', { level: 1, name: ja.welcome.title }),
     ).toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('/Volumes/SSD/Kura Library.kuralib');
+  });
+
+  it('前回のライブラリを新しい版にできなければ、初回の画面に理由を出す（M11）', async () => {
+    vi.mocked(restoreLibrary).mockResolvedValue({
+      info: null,
+      lastPath: '/Volumes/SSD/Kura Library.kuralib',
+      error: {
+        code: 'BackupFailed',
+        message: 'バックアップを作れませんでした（ライブラリは変えていません）',
+      },
+    });
+    render(<App />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(ja.libraryOpen.failure.BackupFailed);
+    expect(screen.queryByRole('status')).toBeNull();
   });
 });

@@ -1,0 +1,916 @@
+import { type ReactNode, useCallback, useId, useRef, useState } from 'react';
+
+import { LinkIcon } from '../../components/icons/LinkIcon';
+import { Segmented } from '../../components/Segmented/Segmented';
+import { Select } from '../../components/Select/Select';
+import { Switch } from '../../components/Switch/Switch';
+import { ja } from '../../i18n/ja';
+import type { Issue, JsonValue, ParamSpec } from '../../ipc/edit';
+import { formatCount } from '../../lib/format';
+import { isImeKey } from '../../lib/ime';
+import { TimeField } from './audio/TimeField';
+import styles from './Editor.module.css';
+import { sendParam, useEditorStore } from './editorStore';
+import { toHex } from './image/color';
+import { ColorPicker, Swatch } from './image/ColorPicker';
+import type { PaintColor } from './image/stroke';
+import {
+  ANCHOR_VALUES,
+  CANVAS_MODES,
+  canvasDefault,
+  type CanvasMode,
+  clampNumber,
+  controlFor,
+  enumLabel,
+  GRID_KEYS,
+  initialValue,
+  lengthDefault,
+  type LengthMode,
+  makeCanvasLength,
+  makeColor,
+  makeLength,
+  makeMargin,
+  type MarginMode,
+  PERCENT_MAX,
+  RATIO_TERM_LIMIT,
+  numberRange,
+  numbers,
+  paramLabel,
+  POINT_KEYS,
+  RATIO_KEYS,
+  readCanvasLength,
+  readColor,
+  readLength,
+  readMargin,
+  RECT_KEYS,
+  SIZE_KEYS,
+  unitLabel,
+} from './opsCatalog';
+import type { ParamGesture } from './paramSend';
+
+const t = ja.editor;
+
+/** 欄が送るもの（ノード・引数は呼ぶ側が決める）。送った手の番号を返す（送れなければ null）。 */
+type Send = (gesture: ParamGesture) => number | null;
+
+/** 指摘の文（種類の言葉と、Rust の言葉）。 */
+export function issueText(issue: Issue): string {
+  const lead = t.issues[issue.code] ?? '';
+  if (!issue.message) return lead;
+  return lead && lead !== issue.message ? `${lead}（${issue.message}）` : issue.message;
+}
+
+/**
+ * 数の入力欄（文字を打っている間は手元の文字。読める値になるたびに `onValue`、Enter・欄を離れたら `onSeal`）。範囲の外の
+ * 値は、Enter・欄を離れたときに収めて送る。空・途中の値は送らない。打っている間に送った値は、Enter・離れたときに送り
+ * 直さない（断られた値を何度も送らない）。`stepBase` は矢印の刻みの起点（HTML の `min` 属性。収める下限は `min`）。
+ */
+export function NumberInput({
+  id,
+  label,
+  value,
+  min,
+  max,
+  step = 1,
+  integer = true,
+  disabled,
+  stepBase,
+  className = styles.paramNumber,
+  onValue,
+  onSeal,
+}: {
+  id?: string;
+  label?: string;
+  value: number | null;
+  min: number | null;
+  max: number | null;
+  step?: number;
+  integer?: boolean;
+  disabled?: boolean;
+  stepBase?: number;
+  className?: string;
+  onValue: (v: number) => void;
+  onSeal: () => void;
+}) {
+  const [text, setText] = useState<string | null>(null);
+  const emitted = useRef<number | null>(null);
+  const clamp = (v: number): number => {
+    let out = integer ? Math.round(v) : v;
+    if (min !== null) out = Math.max(min, out);
+    if (max !== null) out = Math.min(max, out);
+    return out;
+  };
+  const finish = () => {
+    if (text !== null && text.trim() !== '') {
+      const v = Number(text);
+      if (Number.isFinite(v)) {
+        const c = clamp(v);
+        if (c !== value && c !== emitted.current) onValue(c);
+      }
+    }
+    emitted.current = null;
+    setText(null);
+    onSeal();
+  };
+  return (
+    <input
+      id={id}
+      aria-label={id ? undefined : label}
+      className={className}
+      type="number"
+      inputMode={integer ? 'numeric' : 'decimal'}
+      min={stepBase ?? min ?? undefined}
+      max={max ?? undefined}
+      step={step}
+      disabled={disabled}
+      value={text ?? value ?? ''}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        if (raw.trim() === '') return;
+        const v = Number(raw);
+        // 範囲の中のときだけ打つたびに送る（外は Enter・離れたときに収める）
+        if (Number.isFinite(v) && clamp(v) === v && v !== value) {
+          emitted.current = v;
+          onValue(v);
+        }
+      }}
+      onBlur={finish}
+      onKeyDown={(e) => {
+        if (isImeKey(e)) return;
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          finish();
+        } else if (e.key === 'Escape' && text !== null) {
+          e.preventDefault();
+          e.stopPropagation();
+          emitted.current = null;
+          setText(null);
+        }
+      }}
+    />
+  );
+}
+
+/**
+ * 送った値を手元に持つ（スライダーが古い値に戻ってちらつかない・応えの前に続けて変えても前の変更を土台にする）。Rust の
+ * 結果が同じ値になったか、送った手の結果が確定したら（断られた・失敗した・仮でない結果が届いた：`acked` が送った手の番号
+ * 以上）やめて、文書の値を出す（断られた値を欄に残さない）。
+ */
+function usePending<T>(current: T): [T, (v: T | null, ticket?: number | null) => void] {
+  const acked = useEditorStore((s) => s.acked);
+  const [pending, setPending] = useState<{ v: T; ticket: number | null } | null>(null);
+  // 描画の途中で直す（effect で直すと 1 回古い値で描く）
+  if (
+    pending &&
+    (Object.is(pending.v, current) || (pending.ticket !== null && acked >= pending.ticket))
+  ) {
+    setPending(null);
+  }
+  const set = useCallback(
+    (v: T | null, ticket: number | null = null) =>
+      setPending(v === null ? null : { v, ticket: ticket ?? null }),
+    [],
+  );
+  return [pending ? pending.v : current, set];
+}
+
+/** 整数・小数：数の欄とスライダー（ドラッグ中は preview、離したら確定、矢印と数の入力は merge、Enter・離れたら seal）。 */
+function NumberParam({
+  spec,
+  label,
+  value,
+  send,
+}: {
+  spec: ParamSpec;
+  label: string;
+  value: JsonValue;
+  send: Send;
+}) {
+  const id = useId();
+  const r = numberRange(spec);
+  const current = typeof value === 'number' ? value : null;
+  const [shown, setPending] = usePending<number | null>(current);
+  const dragging = useRef(false);
+  const unit = unitLabel(spec.unit);
+  const endDrag = (cancel: boolean) => {
+    if (!dragging.current) return;
+    dragging.current = false;
+    send(cancel ? { kind: 'cancel' } : { kind: 'release' });
+    if (cancel) setPending(null);
+  };
+  return (
+    <div className={styles.paramRow}>
+      <label htmlFor={id} className={styles.paramLabel}>
+        {label}
+      </label>
+      <div className={styles.paramControls}>
+        {r.slider && r.min !== null && r.max !== null && (
+          <input
+            type="range"
+            className={styles.paramSlider}
+            aria-label={label}
+            min={r.min}
+            max={r.max}
+            step={r.step}
+            value={shown ?? r.min}
+            onPointerDown={() => {
+              dragging.current = true;
+            }}
+            onPointerUp={() => endDrag(false)}
+            onPointerCancel={() => endDrag(true)}
+            onChange={(e) => {
+              const v = clampNumber(spec, Number(e.target.value));
+              if (v === null) return;
+              setPending(
+                v,
+                send(dragging.current ? { kind: 'drag', value: v } : { kind: 'nudge', value: v }),
+              );
+            }}
+            onBlur={() => {
+              endDrag(false);
+              send({ kind: 'seal' });
+            }}
+          />
+        )}
+        <NumberInput
+          id={id}
+          value={shown}
+          min={r.min}
+          max={r.max}
+          step={r.step}
+          integer={r.integer}
+          onValue={(v) => setPending(v, send({ kind: 'nudge', value: v }))}
+          onSeal={() => send({ kind: 'seal' })}
+        />
+        {unit && <span className={styles.paramUnit}>{unit}</span>}
+      </div>
+    </div>
+  );
+}
+
+/** 数の組（矩形・点・大きさ・比・格子）。どの欄を変えても同じ引数の merge、Enter・離れたら seal。 */
+function NumbersParam({
+  label,
+  value,
+  keys,
+  names,
+  min,
+  send,
+  columns = keys.length > 2 ? 2 : keys.length,
+  chain = false,
+}: {
+  label: string;
+  value: JsonValue;
+  keys: readonly string[];
+  names: Record<string, string>;
+  min: Record<string, number>;
+  send: Send;
+  columns?: number;
+  chain?: boolean;
+}) {
+  const now = numbers(value, keys) ?? Object.fromEntries(keys.map((k) => [k, 0]));
+  const [linked, setLinked] = useState(false);
+  const [shown, setPending] = usePending<string>(JSON.stringify(now));
+  const vals = JSON.parse(shown) as Record<string, number>;
+  const setOne = (key: string, v: number) => {
+    const next = { ...vals, [key]: v };
+    // 鎖：幅と高さの比を保つ
+    if (chain && linked && keys.length === 2) {
+      const [a, b] = keys as [string, string];
+      const other = key === a ? b : a;
+      const base = vals[key] ?? 0;
+      if (base > 0) next[other] = Math.max(1, Math.round(((vals[other] ?? 0) * v) / base));
+    }
+    setPending(JSON.stringify(next), send({ kind: 'nudge', value: next }));
+  };
+  return (
+    <fieldset className={styles.paramGroup}>
+      <legend className={styles.paramLabel}>{label}</legend>
+      <div
+        className={styles.paramGrid}
+        style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+      >
+        {keys.map((key) => (
+          <NumberLabeled
+            key={key}
+            name={names[key] ?? key}
+            value={vals[key] ?? 0}
+            min={min[key] ?? null}
+            onValue={(v) => setOne(key, v)}
+            onSeal={() => send({ kind: 'seal' })}
+          />
+        ))}
+      </div>
+      {chain && (
+        <button
+          type="button"
+          className={styles.iconButton}
+          aria-label={t.keepRatio}
+          title={t.keepRatio}
+          aria-pressed={linked}
+          onClick={() => setLinked((v) => !v)}
+        >
+          <LinkIcon size={14} />
+        </button>
+      )}
+    </fieldset>
+  );
+}
+
+function NumberLabeled({
+  name,
+  value,
+  min,
+  onValue,
+  onSeal,
+}: {
+  name: string;
+  value: number;
+  min: number | null;
+  onValue: (v: number) => void;
+  onSeal: () => void;
+}) {
+  const id = useId();
+  return (
+    <span className={styles.paramCell}>
+      <label htmlFor={id} className={styles.paramCellLabel}>
+        {name}
+      </label>
+      <NumberInput id={id} value={value} min={min} max={null} onValue={onValue} onSeal={onSeal} />
+    </span>
+  );
+}
+
+/**
+ * 標本の位置・長さ（音声。`Unit 'samples'` の整数）：時刻の欄（`m:ss.mmm`。下に標本の位置）。数の入力と同じく merge で
+ * 送り、Enter・離れたら seal。
+ */
+function SamplesParam({
+  spec,
+  label,
+  value,
+  rate,
+  send,
+}: {
+  spec: ParamSpec;
+  label: string;
+  value: JsonValue;
+  rate: number;
+  send: Send;
+}) {
+  const r = numberRange(spec);
+  const current = typeof value === 'number' ? value : null;
+  const [shown, setPending] = usePending<number | null>(current);
+  return (
+    <div className={styles.paramRow}>
+      <TimeField
+        label={label}
+        frames={shown}
+        rate={rate}
+        min={r.min ?? 0}
+        max={r.max ?? Number.POSITIVE_INFINITY}
+        onValue={(v) => setPending(v, send({ kind: 'nudge', value: v }))}
+        onSeal={() => send({ kind: 'seal' })}
+      />
+    </div>
+  );
+}
+
+/** 音声の区間（ループの区間など）：始め・終わりの時刻の欄 2 つ（終わりは含まない）。 */
+function FrameRangeParam({
+  label,
+  value,
+  rate,
+  frames,
+  send,
+}: {
+  label: string;
+  value: JsonValue;
+  rate: number | null;
+  frames: number | null;
+  send: Send;
+}) {
+  const now = numbers(value, ['start', 'end']) ?? { start: 0, end: 1 };
+  const [shown, setPending] = usePending<string>(JSON.stringify(now));
+  const vals = JSON.parse(shown) as { start: number; end: number };
+  const max = frames ?? Number.POSITIVE_INFINITY;
+  const setOne = (key: 'start' | 'end', v: number) => {
+    const next = { ...vals, [key]: v };
+    if (key === 'start' && next.end <= v) next.end = Math.min(max, v + 1);
+    if (key === 'end' && next.start >= v) next.start = Math.max(0, v - 1);
+    setPending(JSON.stringify(next), send({ kind: 'nudge', value: next }));
+  };
+  const a = t.audio;
+  return (
+    <fieldset className={styles.paramGroup}>
+      <legend className={styles.paramLabel}>{label}</legend>
+      <div
+        className={styles.paramGrid}
+        style={{ gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' }}
+      >
+        {rate !== null ? (
+          <>
+            <TimeField
+              label={a.start}
+              frames={vals.start}
+              rate={rate}
+              max={max - 1}
+              onValue={(v) => setOne('start', v)}
+              onSeal={() => send({ kind: 'seal' })}
+            />
+            <TimeField
+              label={a.end}
+              frames={vals.end}
+              rate={rate}
+              min={1}
+              max={max}
+              onValue={(v) => setOne('end', v)}
+              onSeal={() => send({ kind: 'seal' })}
+            />
+          </>
+        ) : (
+          <>
+            <NumberLabeled
+              name={a.start}
+              value={vals.start}
+              min={0}
+              onValue={(v) => setOne('start', v)}
+              onSeal={() => send({ kind: 'seal' })}
+            />
+            <NumberLabeled
+              name={a.end}
+              value={vals.end}
+              min={1}
+              onValue={(v) => setOne('end', v)}
+              onSeal={() => send({ kind: 'seal' })}
+            />
+          </>
+        )}
+      </div>
+    </fieldset>
+  );
+}
+
+/** 長さ：「px｜%｜自動」と数。 */
+function LengthParam({
+  spec,
+  label,
+  value,
+  size,
+  send,
+}: {
+  spec: ParamSpec;
+  label: string;
+  value: JsonValue;
+  size: { w: number; h: number } | null;
+  send: Send;
+}) {
+  const id = useId();
+  const len = readLength(value);
+  const axis = /height|^h$/i.test(spec.key) ? (size?.h ?? null) : (size?.w ?? null);
+  return (
+    <div className={styles.paramRow}>
+      <label htmlFor={id} className={styles.paramLabel}>
+        {label}
+      </label>
+      <div className={styles.paramControls}>
+        <Segmented<LengthMode>
+          label={t.lengthMode(label)}
+          value={len.mode}
+          options={(['px', 'percent', 'auto'] as const).map((m) => ({
+            value: m,
+            label: t.lengthModes[m],
+          }))}
+          onChange={(mode) =>
+            send({ kind: 'set', value: makeLength(mode, lengthDefault(mode, axis)) })
+          }
+        />
+        {len.mode !== 'auto' && (
+          <NumberInput
+            id={id}
+            value={len.n}
+            min={len.mode === 'px' ? 1 : 0.01}
+            max={null}
+            integer={len.mode === 'px'}
+            step={1}
+            // % の刻みは整数から（下限の 0.01 を起点にすると 100 → 100.01 と刻まれる）
+            stepBase={len.mode === 'px' ? undefined : 0}
+            onValue={(v) => send({ kind: 'nudge', value: makeLength(len.mode, v) })}
+            onSeal={() => send({ kind: 'seal' })}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** 余白の px の上限（Rust の Margin::Px は ±2^31）。 */
+const MARGIN_PX_LIMIT = 2 ** 31;
+
+/** 余白 1 辺：「px｜%」と数（px は負で削る）。M14 段 7。 */
+function MarginParam({ label, value, send }: { label: string; value: JsonValue; send: Send }) {
+  const id = useId();
+  const m = readMargin(value);
+  return (
+    <div className={styles.paramRow}>
+      <label htmlFor={id} className={styles.paramLabel}>
+        {label}
+      </label>
+      <div className={styles.paramControls}>
+        <Segmented<MarginMode>
+          label={t.lengthMode(label)}
+          value={m.mode}
+          options={(['px', 'percent'] as const).map((mode) => ({
+            value: mode,
+            label: t.marginModes[mode],
+          }))}
+          onChange={(mode) => send({ kind: 'set', value: makeMargin(mode, 0) })}
+        />
+        <NumberInput
+          id={id}
+          value={m.n}
+          min={m.mode === 'px' ? -MARGIN_PX_LIMIT : 0}
+          max={m.mode === 'px' ? MARGIN_PX_LIMIT : PERCENT_MAX}
+          integer={m.mode === 'px'}
+          step={1}
+          stepBase={m.mode === 'px' ? undefined : 0}
+          onValue={(v) => send({ kind: 'nudge', value: makeMargin(m.mode, v) })}
+          onSeal={() => send({ kind: 'seal' })}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** キャンバスの 1 辺：決め方（元のまま｜px｜%｜倍数｜2 の冪｜長い辺）と数。M14 段 7。 */
+function CanvasLengthParam({
+  spec,
+  label,
+  value,
+  size,
+  send,
+}: {
+  spec: ParamSpec;
+  label: string;
+  value: JsonValue;
+  size: { w: number; h: number } | null;
+  send: Send;
+}) {
+  const id = useId();
+  const c = readCanvasLength(value);
+  const axis = /height|^h$/i.test(spec.key) ? (size?.h ?? null) : (size?.w ?? null);
+  const numeric = c.mode === 'px' || c.mode === 'percent' || c.mode === 'multipleOf';
+  return (
+    <div className={styles.paramRow}>
+      <label htmlFor={id} className={styles.paramLabel}>
+        {label}
+      </label>
+      <div className={styles.paramControls}>
+        <Select
+          aria-label={t.canvasMode(label)}
+          value={c.mode}
+          options={CANVAS_MODES.map((mode) => ({ value: mode, label: t.canvasModes[mode] }))}
+          onChange={(v) => {
+            const mode = v as CanvasMode;
+            send({ kind: 'set', value: makeCanvasLength(mode, canvasDefault(mode, axis)) });
+          }}
+        />
+        {numeric && (
+          <NumberInput
+            id={id}
+            value={c.n}
+            min={c.mode === 'percent' ? 0.01 : 1}
+            max={
+              c.mode === 'percent' ? PERCENT_MAX : c.mode === 'multipleOf' ? RATIO_TERM_LIMIT : null
+            }
+            integer={c.mode !== 'percent'}
+            step={1}
+            stepBase={c.mode === 'percent' ? 0 : undefined}
+            onValue={(v) => send({ kind: 'nudge', value: makeCanvasLength(c.mode, v) })}
+            onSeal={() => send({ kind: 'seal' })}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** 9 点の揃え（3×3 のボタン。押しているものは --fill-pressed）。M14 段 7。 */
+function AnchorParam({
+  op,
+  spec,
+  label,
+  value,
+  send,
+}: {
+  op: string;
+  spec: ParamSpec;
+  label: string;
+  value: JsonValue;
+  send: Send;
+}) {
+  const current = typeof value === 'string' ? value : 'center';
+  return (
+    <div className={styles.paramRow}>
+      <span className={styles.paramLabel}>{label}</span>
+      <div className={styles.paramAnchors} role="group" aria-label={label}>
+        {ANCHOR_VALUES.map((a) => (
+          <button
+            key={a}
+            type="button"
+            className={styles.paramAnchor}
+            aria-label={enumLabel(op, spec.key, a)}
+            title={enumLabel(op, spec.key, a)}
+            aria-pressed={current === a}
+            onClick={() => send({ kind: 'set', value: a })}
+          >
+            <span className={styles.paramAnchorDot} aria-hidden="true" />
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** 色の手元の値の鍵（RGBA を「,」でつなぐ）。 */
+function colorKey(rgba: readonly number[]): string {
+  return rgba.join(',');
+}
+
+function parseColorKey(key: string): [number, number, number, number] {
+  const [r = 0, g = 0, b = 0, a = 255] = key.split(',').map(Number);
+  return [r, g, b, a];
+}
+
+/**
+ * 色：見本（押すと欄の下に色を選ぶ部品）。アルファを持たない引数は不透明度を出さない。つまみ・16 進は merge で送り、
+ * 閉じたら（見本・外を押す・esc）seal。送った色は手元に持ち、色を選ぶ部品はそれを土台にする（応えの前に別のつまみを
+ * 動かしても前の変更が消えない）。
+ */
+function ColorParam({
+  spec,
+  label,
+  value,
+  send,
+}: {
+  spec: ParamSpec;
+  label: string;
+  value: JsonValue;
+  send: Send;
+}) {
+  const alpha = spec.kind.type === 'color' && spec.kind.alpha;
+  const current = readColor(value) ?? [0, 0, 0, alpha ? 0 : 255];
+  const [shown, setPending] = usePending<string>(colorKey(current));
+  const rgba = parseColorKey(shown);
+  const [open, setOpen] = useState(false);
+  const close = useCallback(() => {
+    setOpen(false);
+    send({ kind: 'seal' });
+  }, [send, setOpen]);
+  const change = (c: PaintColor) => {
+    const v = makeColor(c.rgba, alpha);
+    setPending(colorKey(readColor(v) ?? c.rgba), send({ kind: 'nudge', value: v }));
+  };
+  const hex = toHex(rgba);
+  return (
+    <div className={styles.paramRow}>
+      <span className={styles.paramLabel}>{label}</span>
+      <div className={styles.paramColor}>
+        <div className={styles.paramControls}>
+          <Swatch
+            color={{ rgba, index: null }}
+            label={t.paramColor(label, hex)}
+            pressed={open}
+            onClick={() => (open ? close() : setOpen(true))}
+          />
+          <span className={styles.paramHex}>{hex}</span>
+        </div>
+        {open && (
+          <ColorPicker
+            color={{ rgba, index: null }}
+            recent={[]}
+            inline
+            alpha={alpha}
+            label={label}
+            onChange={change}
+            onClose={close}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** 引数 1 つの欄（`ParamSchema` の種類から組む。既定値が null の引数は「指定する」のスイッチを添える）。 */
+export function ParamField({
+  node,
+  op,
+  spec,
+  value,
+  issues,
+  size,
+  count = null,
+  time,
+}: {
+  node: number;
+  op: string;
+  spec: ParamSpec;
+  value: JsonValue;
+  issues: readonly Issue[];
+  size: { w: number; h: number } | null;
+  /** 追記だけの配列の要素の数（ノードの `log`。引数の値は `[]` で届く）。 */
+  count?: number | null;
+  /** 音声のノードの入力のレートと長さ（標本の引数を時間の欄にする）。 */
+  time?: { rate: number | null; frames: number | null };
+}) {
+  const label = paramLabel(op, spec.key);
+  const send = useCallback<Send>((g) => sendParam(node, spec.key, g), [node, spec.key]);
+  const control = controlFor(spec);
+  const optional = spec.default === null && control !== 'count' && control !== 'readonly';
+  const mine = issues.filter((i) => i.node === node && i.param === spec.key);
+  let body: ReactNode = null;
+  if (!(optional && value === null)) {
+    switch (control) {
+      case 'number':
+        body =
+          spec.unit === 'samples' && spec.kind.type === 'int' && time?.rate ? (
+            <SamplesParam spec={spec} label={label} value={value} rate={time.rate} send={send} />
+          ) : (
+            <NumberParam spec={spec} label={label} value={value} send={send} />
+          );
+        break;
+      case 'frameRange':
+        body = (
+          <FrameRangeParam
+            label={label}
+            value={value}
+            rate={time?.rate ?? null}
+            frames={time?.frames ?? null}
+            send={send}
+          />
+        );
+        break;
+      case 'switch':
+        body = (
+          <label className={styles.paramSwitch}>
+            <Switch checked={value === true} onChange={(on) => send({ kind: 'set', value: on })} />
+            {label}
+          </label>
+        );
+        break;
+      case 'segmented':
+      case 'select': {
+        const values = spec.kind.type === 'enum' ? spec.kind.values : [];
+        const options = values.map((v) => ({ value: v, label: enumLabel(op, spec.key, v) }));
+        const current = typeof value === 'string' ? value : (values[0] ?? '');
+        body = (
+          <div className={styles.paramRow}>
+            <span className={styles.paramLabel}>{label}</span>
+            {control === 'segmented' ? (
+              <Segmented
+                label={label}
+                value={current}
+                options={options}
+                onChange={(v) => send({ kind: 'set', value: v })}
+              />
+            ) : (
+              <Select
+                aria-label={label}
+                value={current}
+                options={options}
+                onChange={(v) => send({ kind: 'set', value: v })}
+              />
+            )}
+          </div>
+        );
+        break;
+      }
+      case 'rect':
+        body = (
+          <NumbersParam
+            label={label}
+            value={value}
+            keys={RECT_KEYS}
+            names={t.rect}
+            min={{ w: 1, h: 1 }}
+            send={send}
+          />
+        );
+        break;
+      case 'point':
+        body = (
+          <NumbersParam
+            label={label}
+            value={value}
+            keys={POINT_KEYS}
+            names={t.point}
+            min={{}}
+            send={send}
+          />
+        );
+        break;
+      case 'size':
+        body = (
+          <NumbersParam
+            label={label}
+            value={value}
+            keys={SIZE_KEYS}
+            names={t.sizeFields}
+            min={{ w: 1, h: 1 }}
+            send={send}
+            chain
+          />
+        );
+        break;
+      case 'ratio':
+        body = (
+          <NumbersParam
+            label={label}
+            value={value}
+            keys={RATIO_KEYS}
+            names={t.ratio}
+            min={{ num: 0, den: 1 }}
+            send={send}
+          />
+        );
+        break;
+      case 'grid':
+        body = (
+          <NumbersParam
+            label={label}
+            value={value}
+            keys={GRID_KEYS}
+            names={t.grid}
+            min={{ cellW: 1, cellH: 1, offsetX: 0, offsetY: 0, gapX: 0, gapY: 0 }}
+            send={send}
+          />
+        );
+        break;
+      case 'length':
+        body = <LengthParam spec={spec} label={label} value={value} size={size} send={send} />;
+        break;
+      case 'margin':
+        body = <MarginParam label={label} value={value} send={send} />;
+        break;
+      case 'canvasLength':
+        body = (
+          <CanvasLengthParam spec={spec} label={label} value={value} size={size} send={send} />
+        );
+        break;
+      case 'anchor':
+        body = <AnchorParam op={op} spec={spec} label={label} value={value} send={send} />;
+        break;
+      case 'color':
+        body = <ColorParam spec={spec} label={label} value={value} send={send} />;
+        break;
+      case 'count':
+        body = (
+          <div className={styles.paramRow}>
+            <span className={styles.paramLabel}>{label}</span>
+            <span className={styles.paramValue}>
+              {count !== null
+                ? formatCount(count)
+                : Array.isArray(value)
+                  ? formatCount(value.length)
+                  : '—'}
+            </span>
+          </div>
+        );
+        break;
+      default:
+        body = (
+          <div className={styles.paramRow}>
+            <span className={styles.paramLabel}>{label}</span>
+            <span className={styles.paramValue}>
+              {value === null ? t.none : JSON.stringify(value)}
+            </span>
+          </div>
+        );
+    }
+  }
+  return (
+    <div className={styles.param} data-param={spec.key}>
+      {optional && (
+        <label className={styles.paramSwitch}>
+          <Switch
+            checked={value !== null}
+            onChange={(on) =>
+              send({
+                kind: 'set',
+                value: on ? initialValue(spec, size, time?.frames ?? null) : null,
+              })
+            }
+          />
+          {t.specifyParam(label)}
+        </label>
+      )}
+      {body}
+      {mine.map((issue, i) => (
+        <p key={i} className={styles.paramIssue} role="alert">
+          {issueText(issue)}
+        </p>
+      ))}
+    </div>
+  );
+}

@@ -4,13 +4,12 @@ import { type MenuEntry, openMenuBelow } from '../../components/Menu/menuStore';
 import { CheckIcon } from '../../components/icons/CheckIcon';
 import { CloseIcon } from '../../components/icons/CloseIcon';
 import { ChevronDownIcon } from '../../components/icons/ChevronDownIcon';
-import { ImageIcon } from '../../components/icons/ImageIcon';
-import { NoteIcon } from '../../components/icons/NoteIcon';
+import { KindIcon } from '../../components/icons/KindIcon';
 import { StarIcon } from '../../components/icons/StarIcon';
 import { ThumbLargeIcon } from '../../components/icons/ThumbLargeIcon';
 import { ThumbSmallIcon } from '../../components/icons/ThumbSmallIcon';
-import { VideoIcon } from '../../components/icons/VideoIcon';
 import { ja } from '../../i18n/ja';
+import { KIND_ORDER, kindLabel, kindWord } from '../../ipc/kinds';
 import { querySuggest } from '../../ipc/search';
 import { formatCount } from '../../lib/format';
 import { useSearchStore } from '../../stores/searchStore';
@@ -23,11 +22,15 @@ const t = ja.filterBar;
 /** フィルタバーが編集するフィールド（これらはチップを別に並べない）。 */
 const EDITED_FIELDS = new Set(['type', 'rating', 'dur', 'source']);
 
-const KIND_SEGMENTS: { kind: 'image' | 'video' | 'audio'; label: string; icon: ReactNode }[] = [
-  { kind: 'image', label: ja.kinds.image, icon: <ImageIcon size={13} strokeWidth={2} /> },
-  { kind: 'video', label: ja.kinds.video, icon: <VideoIcon size={13} strokeWidth={2} /> },
-  { kind: 'audio', label: ja.kinds.audio, icon: <NoteIcon size={13} strokeWidth={2} /> },
-];
+/**
+ * 種類のセグメント（design.md §3.1：すべて・画像・動画・音楽・フォント・3D の 6 区切り）。
+ * 押すと置く条件は検索の語（`種類:フォント`）で、ラベルとは別に持つ（ラベルを変えても式が壊れない）。
+ */
+const KIND_SEGMENTS = KIND_ORDER.map((kind) => ({
+  kind,
+  label: kindLabel(kind),
+  clause: `種類:${kindWord(kind)}`,
+}));
 
 function check(on: boolean): ReactNode {
   return on ? <CheckIcon size={12} strokeWidth={2.4} /> : null;
@@ -154,10 +157,10 @@ export function FilterBar() {
             className={styles.segmentButton}
             aria-pressed={kind === s.kind}
             onClick={() =>
-              setFilter(replaceField(filter, 'type', kind === s.kind ? null : `種類:${s.label}`))
+              setFilter(replaceField(filter, 'type', kind === s.kind ? null : s.clause))
             }
           >
-            {s.icon}
+            <KindIcon kind={s.kind} size={13} strokeWidth={2} />
             {s.label}
           </button>
         ))}

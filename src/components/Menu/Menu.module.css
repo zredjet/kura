@@ -70,3 +70,19 @@
   margin: var(--space-1) var(--space-2);
   background: var(--stroke-1);
 }
+
+/* ▸ の項目で横に開く面（元の面を基準に置く。ガラスの面は fixed の子の基準になる） */
+.submenu {
+  position: absolute;
+}
+
+/* 横の面を開いている行は選んでいる色のまま */
+.item[data-open] {
+  background: var(--fill-selected);
+}
+
+.chevron {
+  display: flex;
+  flex: none;
+  color: var(--text-tertiary);
+}

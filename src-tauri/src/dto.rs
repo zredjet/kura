@@ -5,14 +5,14 @@ use specta::Type;
 
 use kura_core::entries::{EntryPatch, EntryUpdate};
 use kura_core::folders::{FolderNode, FolderPatch};
-use kura_core::import::{DuplicatePolicy, ImportOptions, ImportPreview, ScanRoot};
+use kura_core::import::{DuplicatePolicy, ImportOptions, ImportPreview, MediaKind, ScanRoot};
 use kura_core::items::{
     FolderRef, ItemDetail, ItemPatch, ItemSort, ItemSummary, KindCounts, LibraryCounts,
     SelectionInfo, SortKey, TagRef, UnitRef,
 };
 use kura_core::jobs::{JobEvent, JobFilter, JobKind, JobRecord, JobState};
 use kura_core::library::{
-    IntegrityReport, LibraryInfo, LocationCheck, LocationStatus, TrashEmptied,
+    IntegrityReport, LibraryInfo, LocationCheck, LocationStatus, TrashEmptied, UpgradeEvent,
 };
 use kura_core::playback::{Container, PlayReport, SupportEntry};
 use kura_core::playlist::add::AddSource;
@@ -26,7 +26,9 @@ use kura_core::query::QueryCheck;
 use kura_core::queue::UnitKey;
 use kura_mac::ExternalPlayer;
 
+use crate::commands::asset::{AssetAlphaDto, AssetAnalysisStateDto};
 use crate::config::PlayerPrefs;
+use kura_core::asset::{Alpha, AnalysisState};
 use kura_core::query::suggest::{Suggestion, SuggestionKind};
 use kura_core::tags::{TagDetail, TagPatch, TagSuggestion};
 use kura_core::unit::{Cover, OrderMode, UnitDetail, UnitKind, UnitPatch, UnitSummary};
@@ -59,6 +61,14 @@ pub struct IntegrityDto {
     pub staging_removed: u64,
     pub missing_files: u64,
     pub orphan_files: u64,
+    /// どの表からも参照されない台帳の行の数（M11。docs/data-model.md §4）。
+    pub unreferenced_blobs: u64,
+    /// GC の照合が合わずにファイルを残した版の数（M12 の段 3。問題には数えない。設定の「いま確かめる」だけで数え、起動時は
+    /// null）。
+    pub kept_versions: Option<u64>,
+    /// 7 日とバックアップの条件を満たしたのに、まだ消していない消し待ちの版の数（M12 の段 3。問題には数えない。いま確かめる
+    /// ときだけ数え、起動時は null）。
+    pub overdue_versions: Option<u64>,
 }
 
 impl From<IntegrityReport> for IntegrityDto {
@@ -67,16 +77,100 @@ impl From<IntegrityReport> for IntegrityDto {
             staging_removed: r.staging_removed,
             missing_files: r.missing_files,
             orphan_files: r.orphan_files,
+            unreferenced_blobs: r.unreferenced_blobs,
+            kept_versions: r.kept_versions,
+            overdue_versions: r.overdue_versions,
         }
     }
 }
 
-/// 前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかった。
+/// 前回のライブラリを開いた結果。`info` が空で `lastPath` があれば、前回の場所が見つからなかったか（`error` が空）、
+/// 開けなかった（`error` に理由。`code` は `LibraryTooNew`・`NoSpace`・`BackupFailed`・`UpgradeFailed`・`LibraryInUse`
+/// （ほかのアプリが開いている）など）。
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryRestoreDto {
     pub info: Option<LibraryInfoDto>,
     pub last_path: Option<String>,
+    /// 前回のライブラリ（か `KURA_LIBRARY`）を開けなかった理由。
+    #[specta(optional)]
+    pub error: Option<crate::error::AppError>,
+}
+
+/// ライブラリの DB を新しい版にする段階（イベント `library://upgrade`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum LibraryUpgradePhase {
+    /// 当て始めた（空きの確かめとバックアップの前）。
+    Started,
+    /// 当て終えた。
+    Finished,
+    /// 当てられなかった（失敗した 1 つは戻り、それより前に当てたものは残る。理由と今の版は `error`。開く IPC も同じ理由で
+    /// 失敗を返す）。
+    Failed,
+}
+
+/// ライブラリの DB を新しい版にする知らせ（イベント `library://upgrade`。M11 の決定 1）。開く IPC（`library_restore`・
+/// `library_open`）が終わる前に、同じライブラリについて `started` のあと `finished` か `failed` が 1 つ来る。フロントは
+/// `started` から 300ms を超えたら「ライブラリを更新しています」を出す。当てるものがない・新しいライブラリでは来ない。
+#[derive(Debug, Clone, Serialize, Deserialize, Type, tauri_specta::Event)]
+#[serde(rename_all = "camelCase")]
+#[tauri_specta(event_name = "library://upgrade")]
+pub struct LibraryUpgradeEvent {
+    pub phase: LibraryUpgradePhase,
+    /// ライブラリのフォルダ。
+    pub path: String,
+    /// 当てる前のスキーマの版（user_version）。
+    pub from_version: u32,
+    /// 当てたあとの版。
+    pub to_version: u32,
+    /// DB の大きさ（バイト。`started` だけ）。
+    pub db_bytes: Option<u64>,
+    /// 始まりからの時間（ミリ秒。`finished`・`failed` だけ）。
+    pub elapsed_ms: Option<f64>,
+    /// 当てられなかった理由（`failed` だけ）。
+    pub error: Option<crate::error::AppError>,
+}
+
+impl From<&UpgradeEvent> for LibraryUpgradeEvent {
+    fn from(event: &UpgradeEvent) -> Self {
+        let version = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
+        let base = |phase, path: &std::path::Path, from, to| Self {
+            phase,
+            path: path.to_string_lossy().into_owned(),
+            from_version: version(from),
+            to_version: version(to),
+            db_bytes: None,
+            elapsed_ms: None,
+            error: None,
+        };
+        match event {
+            UpgradeEvent::Started {
+                path,
+                from,
+                to,
+                db_bytes,
+            } => Self {
+                db_bytes: Some(*db_bytes),
+                ..base(LibraryUpgradePhase::Started, path, *from, *to)
+            },
+            UpgradeEvent::Finished { path, from, to, ms } => Self {
+                elapsed_ms: Some(*ms),
+                ..base(LibraryUpgradePhase::Finished, path, *from, *to)
+            },
+            UpgradeEvent::Failed {
+                path,
+                from,
+                to,
+                ms,
+                error,
+            } => Self {
+                elapsed_ms: Some(*ms),
+                error: Some(kura_core::CoreError::Upgrade(error.clone()).into()),
+                ..base(LibraryUpgradePhase::Failed, path, *from, *to)
+            },
+        }
+    }
 }
 
 /// 場所の状態。
@@ -136,6 +230,8 @@ pub struct ImportPreviewDto {
     pub images: u64,
     pub videos: u64,
     pub audios: u64,
+    pub fonts: u64,
+    pub models: u64,
     pub total_bytes: u64,
     pub duplicates: u64,
     pub skipped: u64,
@@ -149,9 +245,11 @@ impl From<ImportPreview> for ImportPreviewDto {
     fn from(p: ImportPreview) -> Self {
         Self {
             total: p.total,
-            images: p.images,
-            videos: p.videos,
-            audios: p.audios,
+            images: p.kinds.image,
+            videos: p.kinds.video,
+            audios: p.kinds.audio,
+            fonts: p.kinds.font,
+            models: p.kinds.model,
             total_bytes: p.total_bytes,
             duplicates: p.duplicates,
             skipped: p.skipped,
@@ -211,7 +309,16 @@ pub struct ExportResultDto {
     pub total: u64,
     pub exported: u64,
     pub failed: u64,
-    /// 書いた JSON の名前（終わったとき）。
+    /// 形式を変えて書いた数（M15 段 3。それより前の結果にはない）。
+    #[specta(optional)]
+    pub converted: Option<u64>,
+    /// Kura が書いた記録どおりのファイルを置き換えた数（中身が同じで書かなかったものを含む。M15 段 3）。
+    #[specta(optional)]
+    pub replaced: Option<u64>,
+    /// 飛ばした数（ゴミ箱の中のアイテム。M15 段 3）。
+    #[specta(optional)]
+    pub skipped: Option<u64>,
+    /// 書いた JSON の名前（終わったとき。添えない設定なら null）。
     pub manifest: Option<String>,
 }
 
@@ -224,6 +331,65 @@ pub struct LibraryUsageDto {
     /// ライブラリのあるボリュームの容量と空き（読めなければ空）。
     pub volume_total_bytes: Option<u64>,
     pub volume_available_bytes: Option<u64>,
+}
+
+/// 中身から作ったキャッシュの大きさ（設定の「容量」の行。M11 の決定 4 で ADR-122 を広げる）。ファイルを数えるので、
+/// サイドバーの `library_usage` とは別に、設定の画面を開いたときだけ読む。ゴミ箱のアイテムの分も含む。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryCacheUsageDto {
+    /// サムネイル（`thumbs/` の JPEG・PNG）と音楽のジャケット（`art/`）のバイト数とファイルの数。
+    pub thumbs_bytes: u64,
+    pub thumbs_files: u64,
+    /// 音声の波形の段（`peaks/`）。
+    pub peaks_bytes: u64,
+    pub peaks_files: u64,
+    /// アニメの帯（`anim/`）。
+    pub anim_bytes: u64,
+    pub anim_files: u64,
+}
+
+impl From<kura_core::media::usage::CacheUsage> for LibraryCacheUsageDto {
+    fn from(u: kura_core::media::usage::CacheUsage) -> Self {
+        Self {
+            thumbs_bytes: u.thumbs.bytes,
+            thumbs_files: u.thumbs.files,
+            peaks_bytes: u.peaks.bytes,
+            peaks_files: u.peaks.files,
+            anim_bytes: u.anim.bytes,
+            anim_files: u.anim.files,
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_usage_tests {
+    use kura_core::media::usage::{CacheUsage, DirUsage};
+
+    use super::LibraryCacheUsageDto;
+
+    /// フロント（設定の「容量」）へは camelCase の 6 つの数で送る。
+    #[test]
+    fn cache_usage_serializes_for_the_front() {
+        let dto = LibraryCacheUsageDto::from(CacheUsage {
+            thumbs: DirUsage {
+                bytes: 1_234,
+                files: 4,
+            },
+            peaks: DirUsage {
+                bytes: 56,
+                files: 1,
+            },
+            anim: DirUsage { bytes: 0, files: 0 },
+        });
+        assert_eq!(
+            serde_json::to_value(&dto).unwrap(),
+            serde_json::json!({
+                "thumbsBytes": 1_234, "thumbsFiles": 4, "peaksBytes": 56, "peaksFiles": 1,
+                "animBytes": 0, "animFiles": 0
+            })
+        );
+    }
 }
 
 /// 取得済みの記録の状態（設定画面。ADR-95）。
@@ -275,9 +441,14 @@ pub struct ImportResultDto {
     pub total: u64,
     pub added: u64,
     pub duplicates: u64,
+    /// 対応していない形式・空のファイルの数（`rejected` を含む）。
     pub skipped: u64,
     pub failed: u64,
     pub failures: Vec<ImportFailureDto>,
+    /// 拡張子は対応しているが中身が違うので取り込まなかったもの（Aseprite でない `.ase` など）と理由。
+    /// M11 より前の結果にはない。
+    #[specta(optional)]
+    pub rejected: Vec<ImportFailureDto>,
 }
 
 /// 取り込みに失敗したファイル。
@@ -288,7 +459,8 @@ pub struct ImportFailureDto {
     pub reason: String,
 }
 
-/// ジョブの種類。
+/// ジョブの種類（analyze は M11 の解析。取り込み・サムネイル・保存に譲る。edit は M12 の編集の保存、gc は M12 の段 3 の
+/// 置き換えた版のファイルの片付け、batch は M14 の一括加工）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum JobKindDto {
@@ -298,6 +470,12 @@ pub enum JobKindDto {
     Download,
     Capture,
     Export,
+    Analyze,
+    Edit,
+    Gc,
+    Batch,
+    /// プロジェクトの照らし直し（M15 段 2）。
+    Project,
 }
 
 impl From<JobKind> for JobKindDto {
@@ -309,6 +487,11 @@ impl From<JobKind> for JobKindDto {
             JobKind::Download => Self::Download,
             JobKind::Capture => Self::Capture,
             JobKind::Export => Self::Export,
+            JobKind::Analyze => Self::Analyze,
+            JobKind::Edit => Self::Edit,
+            JobKind::Gc => Self::Gc,
+            JobKind::Batch => Self::Batch,
+            JobKind::Project => Self::Project,
         }
     }
 }
@@ -322,6 +505,11 @@ impl From<JobKindDto> for JobKind {
             JobKindDto::Download => Self::Download,
             JobKindDto::Capture => Self::Capture,
             JobKindDto::Export => Self::Export,
+            JobKindDto::Analyze => Self::Analyze,
+            JobKindDto::Edit => Self::Edit,
+            JobKindDto::Gc => Self::Gc,
+            JobKindDto::Batch => Self::Batch,
+            JobKindDto::Project => Self::Project,
         }
     }
 }
@@ -450,8 +638,7 @@ pub struct ItemSummaryDto {
     /// BLAKE3 の 16 進（`kura://localhost/thumb/{hash}/s` などに使う）。
     pub hash: String,
     pub ext: String,
-    /// `image` / `video` / `audio`。
-    pub kind: String,
+    pub kind: ItemKindDto,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -461,10 +648,47 @@ pub struct ItemSummaryDto {
     pub source_site: Option<String>,
     pub imported_at: i64,
     pub captured_at: Option<i64>,
-    /// `pending` / `ready` / `failed`。`ready` のときだけサムネイルがある。
+    /// `pending` / `ready` / `stale` / `failed`。`ready` と `stale`（作り直すまで今の絵を出す）のときサムネイルがある。
     pub thumb_state: String,
     pub proxy_state: String,
     pub last_played_at: Option<i64>,
+    /// サムネイルを作り直した回数（`thumbUrl` の `rev`。0 より大きければ URL に `?r=`）。
+    pub thumb_rev: i64,
+    /// 解析の進み具合（`pending` のものは、解析のジョブが進んだら取り直す）。
+    pub analysis_state: AssetAnalysisStateDto,
+    /// 解析で分かった透過（未解析・画像でなければ null）。`binary`・`partial` なら市松模様を敷く。
+    pub alpha: Option<AssetAlphaDto>,
+    /// ドット絵として表示するか（実効値：設定 ?? 自動の判定 ?? 偽）。広げるときだけ最近傍。
+    pub pixel_art: bool,
+    /// ドット絵の設定（null は自動）。右クリックの「ドット絵として表示」のチェックに使う。
+    pub pixel_art_setting: Option<bool>,
+    /// アニメとして回せるか（コマが 2 つ以上か、格子を設定してある）。
+    pub animated: bool,
+    /// コマの数（格子があれば帯で使う数）。タイルの「8 コマ」。
+    pub frame_count: Option<u32>,
+    /// ループ点がある音声か。
+    pub has_loop: bool,
+}
+
+impl From<Alpha> for AssetAlphaDto {
+    fn from(a: Alpha) -> Self {
+        match a {
+            Alpha::None => Self::None,
+            Alpha::Binary => Self::Binary,
+            Alpha::Partial => Self::Partial,
+        }
+    }
+}
+
+impl From<AnalysisState> for AssetAnalysisStateDto {
+    fn from(s: AnalysisState) -> Self {
+        match s {
+            AnalysisState::Pending => Self::Pending,
+            AnalysisState::Ready => Self::Ready,
+            AnalysisState::Failed => Self::Failed,
+            AnalysisState::NotNeeded => Self::NotNeeded,
+        }
+    }
 }
 
 impl From<ItemSummary> for ItemSummaryDto {
@@ -473,7 +697,7 @@ impl From<ItemSummary> for ItemSummaryDto {
             id: i.id,
             hash: i.hash,
             ext: i.ext,
-            kind: i.kind,
+            kind: i.kind.into(),
             width: i.width,
             height: i.height,
             duration_ms: i.duration_ms,
@@ -486,6 +710,14 @@ impl From<ItemSummary> for ItemSummaryDto {
             thumb_state: i.thumb_state,
             proxy_state: i.proxy_state,
             last_played_at: i.last_played_at,
+            thumb_rev: i.thumb_rev,
+            analysis_state: i.analysis_state.into(),
+            alpha: i.alpha.map(Into::into),
+            pixel_art: i.pixel_art,
+            pixel_art_setting: i.pixel_art_setting,
+            animated: i.animated,
+            frame_count: i.frame_count,
+            has_loop: i.has_loop,
         }
     }
 }
@@ -668,11 +900,23 @@ pub enum ItemViewDto {
     Recent,
     Unsorted,
     Untagged,
-    Random { seed: u64 },
+    Random {
+        seed: u64,
+    },
     Trash,
-    Folder { id: i64 },
-    Unit { id: i64 },
-    Smart { id: i64 },
+    Folder {
+        id: i64,
+    },
+    Unit {
+        id: i64,
+    },
+    Smart {
+        id: i64,
+    },
+    /// 登録したプロジェクトで今使っている素材（M15 段 6）。
+    Project {
+        id: i64,
+    },
 }
 
 /// 並び順（`items_query_ids` の引数、プレイリストの並び順）。
@@ -752,10 +996,12 @@ pub struct ClauseDto {
 #[derive(Debug, Clone, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct KindCountsDto {
-    pub image: i64,
-    pub video: i64,
-    pub audio: i64,
-    pub total: i64,
+    pub image: u64,
+    pub video: u64,
+    pub audio: u64,
+    pub font: u64,
+    pub model: u64,
+    pub total: u64,
 }
 
 impl From<KindCounts> for KindCountsDto {
@@ -764,6 +1010,8 @@ impl From<KindCounts> for KindCountsDto {
             image: c.image,
             video: c.video,
             audio: c.audio,
+            font: c.font,
+            model: c.model,
             total: c.total(),
         }
     }
@@ -776,6 +1024,9 @@ pub struct QueryCheckDto {
     pub error: Option<ParseErrorDto>,
     pub clauses: Vec<ClauseDto>,
     pub counts: Option<KindCountsDto>,
+    /// 解析の事実（透過・ループ・ラウドネスなど）を使う条件のとき、解析がまだで一致が決まっていない件数
+    /// （パレットの「未解析 N 件」）。使わない条件・解析できない入力では null。
+    pub unanalyzed: Option<u64>,
 }
 
 fn to_u32(n: usize) -> u32 {
@@ -802,8 +1053,78 @@ impl From<QueryCheck> for QueryCheckDto {
                 })
                 .collect(),
             counts: c.counts.map(Into::into),
+            unanalyzed: c.unanalyzed,
         }
     }
+}
+
+/// 検索のフィールドの名前（bindings の定数 `QUERY_FIELD_NAMES`。docs/search-query.md §3）。
+/// フロントの clauses.ts・ruleRows.ts はこの表で「フィールドの条件か、名前空間付きのタグか」を見分ける。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryFieldNameDto {
+    /// 英語名（AST の `field`・`ClauseDto.field`）。
+    pub field: String,
+    /// 入力で使える名前（日本語・英語。英語は大文字小文字を問わない）。
+    pub names: Vec<String>,
+}
+
+/// フィールドの名前の表（`kura_core::query::FIELDS` の順）。
+pub fn query_field_names() -> Vec<QueryFieldNameDto> {
+    kura_core::query::FIELDS
+        .iter()
+        .map(|f| QueryFieldNameDto {
+            field: f.key.to_string(),
+            names: f.names.iter().map(|n| (*n).to_string()).collect(),
+        })
+        .collect()
+}
+
+/// 種類の検索の語（bindings の定数 `QUERY_KIND_WORDS`。`種類:フォント` の「フォント」）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryKindWordDto {
+    pub kind: ItemKindDto,
+    pub word: String,
+}
+
+/// 種類の検索の語の表（`kura_core::query::KIND_WORDS` の順）。
+pub fn query_kind_words() -> Vec<QueryKindWordDto> {
+    kura_core::query::KIND_WORDS
+        .iter()
+        .map(|(word, kind)| QueryKindWordDto {
+            kind: (*kind).into(),
+            word: (*word).to_string(),
+        })
+        .collect()
+}
+
+/// 半角と同じに扱う記号（bindings の定数 `QUERY_SYMBOLS`。字句解析の表）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct QuerySymbolDto {
+    pub from: String,
+    pub to: String,
+}
+
+/// 記号の表（`kura_core::query::SYMBOLS` の順）。
+pub fn query_symbols() -> Vec<QuerySymbolDto> {
+    kura_core::query::SYMBOLS
+        .iter()
+        .map(|(from, to)| QuerySymbolDto {
+            from: from.to_string(),
+            to: to.to_string(),
+        })
+        .collect()
+}
+
+/// 解析の失敗の理由（bindings の定数 `ANALYSIS_ERROR_CODES`。`AssetFactsDto.errorCode` の値。
+/// `kura_core::analysis::store::error_code::ALL` の順）。フロントは理由ごとの文言（`ja.asset.failureReasons`）と照らす。
+pub fn analysis_error_codes() -> Vec<String> {
+    kura_core::analysis::store::error_code::ALL
+        .iter()
+        .map(|code| (*code).to_string())
+        .collect()
 }
 
 /// 候補の種類。
@@ -1158,10 +1479,18 @@ impl From<OrderModeDto> for OrderMode {
 pub struct CoverDto {
     pub item_id: i64,
     pub hash: String,
-    pub kind: String,
+    pub kind: ItemKindDto,
     pub thumb_state: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    /// サムネイルを作り直した回数（アイテムの概要の `thumbRev` と同じ）。
+    pub thumb_rev: i64,
+    /// 解析の進み具合（`pending` なら解析のジョブが進んだら取り直す）。
+    pub analysis_state: AssetAnalysisStateDto,
+    /// 解析で分かった透過（市松模様）。
+    pub alpha: Option<AssetAlphaDto>,
+    /// ドット絵として表示するか（実効値）。
+    pub pixel_art: bool,
 }
 
 impl From<Cover> for CoverDto {
@@ -1169,10 +1498,14 @@ impl From<Cover> for CoverDto {
         Self {
             item_id: c.item_id,
             hash: c.hash,
-            kind: c.kind,
+            kind: c.kind.into(),
             thumb_state: c.thumb_state,
             width: c.width,
             height: c.height,
+            thumb_rev: c.thumb_rev,
+            analysis_state: c.analysis_state.into(),
+            alpha: c.alpha.map(Into::into),
+            pixel_art: c.pixel_art,
         }
     }
 }
@@ -1188,8 +1521,8 @@ pub struct UnitSummaryDto {
     pub count: i64,
     /// 音楽・動画は長さ、画像は表示時間の合計（ミリ秒）。
     pub duration_ms: i64,
-    /// メンバーの種類（`image` / `video` / `audio`）。
-    pub kinds: Vec<String>,
+    /// メンバーの種類（`ITEM_KINDS` の順）。
+    pub kinds: Vec<ItemKindDto>,
     /// 集計した評価（ユニットの評価、なければメンバーの平均）。
     pub rating: i64,
     /// ユニット自体の評価（0 は未評価）。
@@ -1209,7 +1542,7 @@ impl From<UnitSummary> for UnitSummaryDto {
             cover: u.cover.map(Into::into),
             count: i64::try_from(u.stats.count).unwrap_or(i64::MAX),
             duration_ms: u.stats.duration_ms,
-            kinds: u.stats.kinds.into_iter().map(str::to_string).collect(),
+            kinds: u.stats.kinds.into_iter().map(Into::into).collect(),
             rating: u.stats.rating,
             own_rating: u.own_rating,
             origin: u.origin,
@@ -1333,6 +1666,136 @@ mod tests {
         assert_eq!(json["state"], "running");
         assert_eq!(json["resultJson"], serde_json::Value::Null);
     }
+
+    /// 更新の知らせは、段階・版・時間・理由（失敗のとき AppError の形）を camelCase で送る。
+    #[test]
+    fn upgrade_events_serialize_for_the_front() {
+        let path = std::path::PathBuf::from("/L.kuralib");
+        let started = LibraryUpgradeEvent::from(&UpgradeEvent::Started {
+            path: path.clone(),
+            from: 6,
+            to: 9,
+            db_bytes: 51_834_880,
+        });
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            serde_json::json!({
+                "phase": "started", "path": "/L.kuralib", "fromVersion": 6, "toVersion": 9,
+                "dbBytes": 51_834_880, "elapsedMs": null, "error": null
+            })
+        );
+        let finished = LibraryUpgradeEvent::from(&UpgradeEvent::Finished {
+            path: path.clone(),
+            from: 6,
+            to: 9,
+            ms: 812.5,
+        });
+        let json = serde_json::to_value(&finished).unwrap();
+        assert_eq!(json["phase"], "finished");
+        assert_eq!(json["elapsedMs"], 812.5);
+        let failed = LibraryUpgradeEvent::from(&UpgradeEvent::Failed {
+            path,
+            from: 6,
+            to: 9,
+            ms: 3.0,
+            error: kura_core::UpgradeError::NoSpace {
+                needed: 300_000_000,
+                available: 1,
+            },
+        });
+        let json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(json["phase"], "failed");
+        assert_eq!(json["error"]["code"], "NoSpace");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("空き容量")
+        );
+    }
+
+    /// `ITEM_KINDS` は `MediaKind::ALL` の順で、名前は items.kind と同じ。キューに入るのは画像・動画・音楽だけ。
+    #[test]
+    fn item_kinds_table_follows_the_core_kinds() {
+        let json = serde_json::to_value(item_kinds()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                { "kind": "image", "playable": true, "needsProxy": false, "hasDuration": false },
+                { "kind": "video", "playable": true, "needsProxy": true, "hasDuration": true },
+                { "kind": "audio", "playable": true, "needsProxy": true, "hasDuration": true },
+                { "kind": "font", "playable": false, "needsProxy": false, "hasDuration": false },
+                { "kind": "model", "playable": false, "needsProxy": false, "hasDuration": false },
+            ])
+        );
+        for kind in MediaKind::ALL {
+            let dto = ItemKindDto::from(kind);
+            assert_eq!(serde_json::to_value(dto).unwrap(), kind.as_str());
+            assert_eq!(MediaKind::from(dto), kind);
+        }
+    }
+
+    /// 解析の失敗の理由（`ANALYSIS_ERROR_CODES`）は kura-core の一覧をそのまま出す（`crashed` を含む）。
+    #[test]
+    fn analysis_error_codes_follow_the_core_list() {
+        assert_eq!(
+            analysis_error_codes(),
+            ["unsupported", "too_large", "decode", "crashed"]
+        );
+    }
+
+    /// 検索の表（`QUERY_FIELD_NAMES`・`QUERY_KIND_WORDS`・`QUERY_SYMBOLS`）は kura-core の表をそのまま出す。
+    #[test]
+    fn query_tables_follow_the_core_tables() {
+        let fields = serde_json::to_value(query_field_names()).unwrap();
+        assert_eq!(
+            fields[0],
+            serde_json::json!({ "field": "type", "names": ["種類", "type"] })
+        );
+        let alpha = fields
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["field"] == "alpha")
+            .unwrap();
+        assert_eq!(alpha["names"], serde_json::json!(["透過", "alpha"]));
+        assert_eq!(query_field_names().len(), kura_core::query::FIELDS.len());
+        assert_eq!(
+            serde_json::to_value(query_kind_words()).unwrap(),
+            serde_json::json!([
+                { "kind": "image", "word": "画像" },
+                { "kind": "video", "word": "動画" },
+                { "kind": "audio", "word": "音楽" },
+                { "kind": "font", "word": "フォント" },
+                { "kind": "model", "word": "3D" },
+            ])
+        );
+        let symbols = serde_json::to_value(query_symbols()).unwrap();
+        assert!(
+            symbols
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!({ "from": "、", "to": "," }))
+        );
+        assert!(
+            symbols
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!({ "from": "−", "to": "-" }))
+        );
+    }
+
+    #[test]
+    fn query_check_carries_the_unanalyzed_count() {
+        let dto = QueryCheckDto::from(QueryCheck {
+            error: None,
+            clauses: Vec::new(),
+            counts: None,
+            unanalyzed: Some(3),
+        });
+        let json = serde_json::to_value(dto).unwrap();
+        assert_eq!(json["unanalyzed"], 3);
+    }
 }
 
 // ===== 再生（M5） =====
@@ -1425,6 +1888,8 @@ pub struct PlayerPrefsDto {
     pub bgm_through_images: bool,
     pub bgm_loop: bool,
     pub image_duration_ms: i64,
+    /// 選んだ短い音声をすぐ鳴らす（M11。既定でオン）。
+    pub sfx_audition: bool,
 }
 
 impl From<PlayerPrefs> for PlayerPrefsDto {
@@ -1434,6 +1899,7 @@ impl From<PlayerPrefs> for PlayerPrefsDto {
             bgm_through_images: p.bgm_through_images,
             bgm_loop: p.bgm_loop,
             image_duration_ms: p.image_duration_ms,
+            sfx_audition: p.sfx_audition,
         }
     }
 }
@@ -1445,6 +1911,7 @@ impl From<PlayerPrefsDto> for PlayerPrefs {
             bgm_through_images: p.bgm_through_images,
             bgm_loop: p.bgm_loop,
             image_duration_ms: p.image_duration_ms,
+            sfx_audition: p.sfx_audition,
         }
     }
 }
@@ -1509,6 +1976,33 @@ simple_enum!(GranularityDto, Granularity, { File, Unit });
 simple_enum!(RepeatModeDto, RepeatMode, { Off, All, One });
 simple_enum!(UnitMatchDto, UnitMatch, { Any, All, UnitOnly });
 simple_enum!(LimitKindDto, LimitKind, { Count, Duration });
+simple_enum!(ItemKindDto, MediaKind, { Image, Video, Audio, Font, Model });
+
+/// 種類の表の 1 行（bindings の定数 `ITEM_KINDS`。フロントの種類の型と述語はこの表から作る）。
+#[derive(Debug, Clone, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemKindInfoDto {
+    pub kind: ItemKindDto,
+    /// 再生のキュー・スマートの候補に入るか（画像・動画・音楽。フォント・3D は入らない）。
+    pub playable: bool,
+    /// 再生用プロキシの対象か（動画・音楽）。
+    pub needs_proxy: bool,
+    /// 長さを持つか（動画・音楽）。
+    pub has_duration: bool,
+}
+
+/// 種類の表（`MediaKind::ALL` の順。グリッド・集計・フィルタの並びもこの順）。
+pub fn item_kinds() -> Vec<ItemKindInfoDto> {
+    MediaKind::ALL
+        .into_iter()
+        .map(|k| ItemKindInfoDto {
+            kind: k.into(),
+            playable: k.is_playable(),
+            needs_proxy: k.needs_proxy(),
+            has_duration: k.has_duration(),
+        })
+        .collect()
+}
 simple_enum!(RuleMatchDto, RuleMatch, { All, Any });
 
 /// スマートの条件（検索の文字列を条件ごとに。docs/playlists.md §3.1・ADR）。
@@ -1769,7 +2263,8 @@ pub struct EntryRowDto {
     pub name: String,
     pub item_count: u32,
     pub duration_ms: i64,
-    pub kinds: Vec<String>,
+    /// メンバーの種類（`ITEM_KINDS` の順。フォント・3D も出す）。
+    pub kinds: Vec<ItemKindDto>,
     /// 表紙にするアイテム（先頭のメンバー）。
     pub cover_item_id: Option<i64>,
     pub image_duration_ms: Option<i64>,
@@ -1788,6 +2283,9 @@ pub struct PlaylistContentsDto {
     pub images: u32,
     pub videos: u32,
     pub audios: u32,
+    /// フォント・3D（一覧には出すが、キューには入らない）。
+    pub fonts: u32,
+    pub models: u32,
 }
 
 impl PlaylistContentsDto {
@@ -1802,15 +2300,20 @@ impl PlaylistContentsDto {
             images: 0,
             videos: 0,
             audios: 0,
+            fonts: 0,
+            models: 0,
         };
         for row in rows {
             for item in &row.items {
                 dto.flat_entry_ids.push(row.entry.id);
                 dto.flat_item_ids.push(*item);
             }
-            dto.images += row.kind_counts[0];
-            dto.videos += row.kind_counts[1];
-            dto.audios += row.kind_counts[2];
+            let n = |kind: MediaKind| u32::try_from(row.kind_counts.get(kind)).unwrap_or(u32::MAX);
+            dto.images = dto.images.saturating_add(n(MediaKind::Image));
+            dto.videos = dto.videos.saturating_add(n(MediaKind::Video));
+            dto.audios = dto.audios.saturating_add(n(MediaKind::Audio));
+            dto.fonts = dto.fonts.saturating_add(n(MediaKind::Font));
+            dto.models = dto.models.saturating_add(n(MediaKind::Model));
             dto.total_ms += row.duration_ms;
             dto.rows.push(EntryRowDto {
                 entry_id: row.entry.id,
@@ -1818,7 +2321,7 @@ impl PlaylistContentsDto {
                 name: row.name,
                 item_count: u32::try_from(row.items.len()).unwrap_or(u32::MAX),
                 duration_ms: row.duration_ms,
-                kinds: row.kinds.iter().map(|k| (*k).to_string()).collect(),
+                kinds: row.kinds.iter().map(|k| (*k).into()).collect(),
                 cover_item_id: row.items.first().copied(),
                 image_duration_ms: row.entry.image_duration_ms,
             });
@@ -1884,6 +2387,8 @@ pub struct PlayRequestDto {
     pub start_item: Option<i64>,
     /// 並びはそのままで、このアイテムから始める（一覧の「ここから再生」）。
     pub from_item: Option<i64>,
+    /// `from_item` を押した一覧の行のエントリ（同じアイテムが複数のエントリにあっても、その行から始める）。
+    pub from_entry: Option<i64>,
     /// その場のキューを同じシードで作り直すとき（16 進）。
     pub seed: Option<String>,
 }
@@ -1896,6 +2401,7 @@ impl From<&PlayRequestDto> for PlayRequest {
             reseed: r.reseed,
             start_item: r.start_item,
             from_item: r.from_item,
+            from_entry: r.from_entry,
         }
     }
 }

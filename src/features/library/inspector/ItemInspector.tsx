@@ -11,10 +11,14 @@ import { MoreIcon } from '../../../components/icons/MoreIcon';
 import { UnitIcon } from '../../../components/icons/UnitIcon';
 import { ja } from '../../../i18n/ja';
 import { getItemDetail } from '../../../ipc/items';
-import { thumbUrl } from '../../../ipc/media';
 import { dateTimeLabel } from '../../../lib/dates';
 import { shortHash } from '../../../lib/format';
 import { useViewStore } from '../../../stores/viewStore';
+import { AssetSection } from '../../asset/AssetSection';
+import { CreditSection } from '../../credits/CreditSection';
+import { canEdit, openEditor } from '../../editor/editorKinds';
+import { useAssetStage } from '../../asset/AssetStage';
+import { useAssetData } from '../../asset/useAssetData';
 import { TagChips } from '../../tags/TagChips';
 import { TagField } from '../../tags/TagField';
 import {
@@ -29,6 +33,7 @@ import {
 import { itemMenu } from '../itemMenu';
 import { itemMeta } from '../describeItem';
 import styles from './Inspector.module.css';
+import { ItemPreview } from './ItemPreview';
 import { NoteField } from './NoteField';
 import { useLoaded } from './useLoaded';
 
@@ -37,12 +42,28 @@ const t = ja.inspector;
 /** T キーで移るタグの入力欄の印。 */
 export const TAG_FOCUS_KEY = 'inspector-tags';
 
-/** 1 件のアイテムの詳細と編集（Main.dc.html のインスペクタ）。 */
-export function ItemInspector({ id }: { id: number }) {
+/**
+ * 1 件のアイテムの詳細と編集（Main.dc.html のインスペクタ）。エディタで開ける種類（画像・音声）なら見出しの下に「編集…」（M12・M13）。
+ * エディタの右パネルの中（`editable` が偽）では、「編集…」と「その他の操作」のメニュー（編集・クイックルック・再生・
+ * ゴミ箱に入れるなど：編集中のアイテムを開き直す・ゴミ箱に入れる操作がエディタを通らずに動く）を出さない。
+ */
+export function ItemInspector({
+  id,
+  editable = true,
+  audition = true,
+}: {
+  id: number;
+  editable?: boolean;
+  /** 素材の欄の試聴のボタンを出すか（エディタの中では出さない）。 */
+  audition?: boolean;
+}) {
   const detail = useLoaded(`item-${id}`, () => getItemDetail(id));
   const openUnit = useViewStore((s) => s.openUnit);
   const [editingTitle, setEditingTitle] = useState(false);
   const tagIds = useMemo(() => new Set(detail?.tags.map((tag) => tag.id) ?? []), [detail]);
+  // 素材の欄（M11）：アニメ・フォントの見本はプレビューの枠を置き換える
+  const assetData = useAssetData(id);
+  const assetStage = useAssetStage(assetData);
 
   if (!detail) {
     return null;
@@ -52,15 +73,7 @@ export function ItemInspector({ id }: { id: number }) {
   const trashed = detail.trashedAt !== null;
   return (
     <>
-      <div className={styles.preview}>
-        {item.thumbState === 'ready' ? (
-          <img className={styles.previewImage} src={thumbUrl(item.hash, 'l')} alt="" />
-        ) : (
-          <span className={styles.previewNote}>
-            {item.thumbState === 'pending' ? t.noThumbnail : ''}
-          </span>
-        )}
-      </div>
+      {assetStage ?? <ItemPreview item={item} />}
 
       <div className={styles.head}>
         {editingTitle ? (
@@ -95,7 +108,23 @@ export function ItemInspector({ id }: { id: number }) {
             onChange={(rating) => void setRating([id], rating)}
           />
         )}
+        {editable && !trashed && canEdit(item) && (
+          <Button size="sm" className={styles.editButton} onClick={() => void openEditor(item)}>
+            {ja.itemMenu.edit}
+          </Button>
+        )}
       </div>
+
+      <AssetSection data={assetData} item={item} audition={audition} />
+
+      {!trashed && (
+        <CreditSection
+          itemIds={[id]}
+          unitIds={[]}
+          source={detail.sourceUrl ?? null}
+          navigable={editable}
+        />
+      )}
 
       {trashed && (
         <section className={styles.trashed}>
@@ -194,17 +223,19 @@ export function ItemInspector({ id }: { id: number }) {
         <dd className={styles.mono}>{shortHash(item.hash)}</dd>
       </dl>
 
-      <div className={styles.actions}>
-        <button
-          type="button"
-          className={styles.moreButton}
-          aria-label={t.more}
-          aria-haspopup="menu"
-          onClick={(e) => openMenuBelow(e.currentTarget, ja.itemMenu.label, itemMenu([id]))}
-        >
-          <MoreIcon size={16} />
-        </button>
-      </div>
+      {editable && (
+        <div className={styles.actions}>
+          <button
+            type="button"
+            className={styles.moreButton}
+            aria-label={t.more}
+            aria-haspopup="menu"
+            onClick={(e) => openMenuBelow(e.currentTarget, ja.itemMenu.label, itemMenu([id]))}
+          >
+            <MoreIcon size={16} />
+          </button>
+        </div>
+      )}
     </>
   );
 }

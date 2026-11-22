@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { QUERY_FIELD_NAMES } from '../../ipc/bindings';
 import { fromClause, newRow, type RuleRow, toClause } from './ruleRows';
 
 const rows: [RuleRow, string][] = [
@@ -36,9 +37,49 @@ describe('ルールの行と検索の文字列', () => {
     expect(toClause(newRow('folder'))).toBe('');
   });
 
+  it('種類の行は再生できる種類（画像・動画・音楽）だけで、並びは種類の表の順', () => {
+    expect(toClause(newRow('kind'))).toBe('種類:画像,動画,音楽');
+    // 前の版で保存した並びも行に戻る
+    expect(fromClause('種類:画像,音楽,動画')).toEqual({
+      field: 'kind',
+      op: 'has',
+      value: ['image', 'video', 'audio'],
+    });
+    // フォント・3D はスマートの候補にならないので、行にせず検索式のまま
+    expect(fromClause('種類:フォント')).toEqual({ field: 'query', text: '種類:フォント' });
+    expect(fromClause('種類=画像,3D')).toEqual({ field: 'query', text: '種類=画像,3D' });
+  });
+
   it('決まった形でない条件は検索式の行', () => {
     expect(fromClause('評価>=4 海')).toEqual({ field: 'query', text: '評価>=4 海' });
     expect(fromClause('(海 | 評価>=3)')).toEqual({ field: 'query', text: '(海 | 評価>=3)' });
     expect(fromClause('-種類:動画')).toEqual({ field: 'query', text: '-種類:動画' });
+  });
+
+  it('素材のフィールド（M11）はタグの行にしない', () => {
+    // フィールドの名前は Rust の表（bindings の QUERY_FIELD_NAMES）で見分ける
+    expect(fromClause('透過:あり')).toEqual({ field: 'query', text: '透過:あり' });
+    expect(fromClause('ループ:あり ドット絵:あり')).toEqual({
+      field: 'query',
+      text: 'ループ:あり ドット絵:あり',
+    });
+    expect(fromClause('-透過:あり')).toEqual({ field: 'query', text: '-透過:あり' });
+    expect(fromClause('(海 | アニメ:あり)')).toEqual({
+      field: 'query',
+      text: '(海 | アニメ:あり)',
+    });
+    // どのフィールドの名前も、名前空間付きのタグとしては読まない（フォルダ・名前などは専用の行になる）
+    for (const { names } of QUERY_FIELD_NAMES) {
+      for (const name of names) {
+        expect(fromClause(`${name}:x`).field, name).not.toBe('tags');
+        expect(fromClause(`海 ${name}:x`).field, name).not.toBe('tags');
+      }
+    }
+    // 名前空間付きのタグは今までどおりタグの行
+    expect(fromClause('作者:もりの 透過')).toEqual({
+      field: 'tags',
+      op: 'all',
+      value: ['作者:もりの', '透過'],
+    });
   });
 });

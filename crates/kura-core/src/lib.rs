@@ -2,9 +2,14 @@
 //!
 //! macOS 固有の処理は `kura-mac` に置き、このクレートには `cfg(target_os)` を書かない。
 
+pub mod analysis;
+pub mod asset;
 pub mod capture;
+pub mod codec_ext;
+pub mod credits;
 pub mod db;
 pub mod download;
+pub mod edit;
 pub mod entries;
 pub mod error;
 pub mod export;
@@ -16,6 +21,7 @@ pub mod library;
 pub mod media;
 pub mod playback;
 pub mod playlist;
+pub mod project;
 pub mod query;
 pub mod queue;
 pub mod random;
@@ -28,4 +34,4 @@ pub mod time;
 pub mod tools;
 pub mod unit;
 
-pub use error::{CoreError, Result};
+pub use error::{CoreError, Result, UpgradeError};

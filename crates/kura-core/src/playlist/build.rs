@@ -9,6 +9,7 @@ use rand_chacha::ChaCha8Rng;
 
 use super::model::{Entry, EntryTarget, Granularity, QueueOptions};
 use super::resolve::{ResolvedEntry, Snapshot};
+use crate::import::MediaKind;
 use crate::queue::{Slot, UnitKey};
 use crate::random::{fnv1a64, open_unit, rng, shuffle, splitmix64};
 
@@ -35,20 +36,30 @@ pub fn weight(rating: i64, last_played_at: Option<i64>, now_ms: i64) -> f64 {
     }
 }
 
-/// 種類の番号（連続制限の比較に使う）。
-pub(crate) fn kind_code(kind: &str) -> u8 {
+/// 種類の番号（連続制限の比較に使う）。フォント・3D はキューに入らない（`resolve` が除く）が、番号は分けておく。
+pub(crate) fn kind_code(kind: MediaKind) -> u8 {
     match kind {
-        "video" => 2,
-        "audio" => 1,
-        _ => 0,
+        MediaKind::Image => 0,
+        MediaKind::Audio => 1,
+        MediaKind::Video => 2,
+        MediaKind::Font => 3,
+        MediaKind::Model => 4,
     }
 }
 
 /// ユニットの代表種類：メンバーで最も多い種類。同数なら video > audio > image（§5.4）。
-pub fn representative_kind<'a>(kinds: impl Iterator<Item = &'a str>) -> u8 {
+/// フォント・3D は数えない（再生しないので、連続制限の判定に効かせない）。
+pub fn representative_kind(kinds: impl Iterator<Item = MediaKind>) -> u8 {
+    // [image, audio, video] の数（kind_code の順）
     let mut counts = [0usize; 3];
     for kind in kinds {
-        counts[kind_code(kind) as usize] += 1;
+        let slot = match kind {
+            MediaKind::Image => &mut counts[0],
+            MediaKind::Audio => &mut counts[1],
+            MediaKind::Video => &mut counts[2],
+            MediaKind::Font | MediaKind::Model => continue,
+        };
+        *slot += 1;
     }
     let mut best = 2u8;
     for code in [1u8, 0] {
@@ -209,7 +220,7 @@ pub fn build_queue(
         .collect();
 
     let info = |id: i64| snap.members.items.get(&id);
-    let item_kind = |id: i64| info(id).map_or(0, |i| kind_code(&i.kind));
+    let item_kind = |id: i64| info(id).map_or(0, |i| kind_code(i.kind));
     let mut rng = rng(seed);
 
     // (グループの番号, グループの中の位置) の列
@@ -261,7 +272,7 @@ pub fn build_queue(
                                     .items
                                     .iter()
                                     .filter_map(|id| info(*id))
-                                    .map(|m| m.kind.as_str()),
+                                    .map(|m| m.kind),
                             ),
                         }
                     })
@@ -332,7 +343,7 @@ fn slot(group: &Group<'_>, index: usize, snap: &Snapshot, options: &QueueOptions
         .members
         .items
         .get(&item_id)
-        .is_some_and(|m| m.kind == "image");
+        .is_some_and(|m| m.kind == MediaKind::Image);
     let unit_ms = match group.resolved.unit_key {
         Some(UnitKey::Unit(unit_id)) => snap.units.get(&unit_id).and_then(|u| u.image_duration_ms),
         _ => None,
@@ -374,16 +385,17 @@ mod tests {
 
     #[test]
     fn representative_kind_prefers_video_then_audio_on_ties() {
-        assert_eq!(
-            representative_kind(["image", "image", "audio"].into_iter()),
-            0
-        );
-        assert_eq!(representative_kind(["image", "audio"].into_iter()), 1);
-        assert_eq!(
-            representative_kind(["image", "video", "audio"].into_iter()),
-            2
-        );
+        use MediaKind::{Audio, Font, Image, Model, Video};
+        assert_eq!(representative_kind([Image, Image, Audio].into_iter()), 0);
+        assert_eq!(representative_kind([Image, Audio].into_iter()), 1);
+        assert_eq!(representative_kind([Image, Video, Audio].into_iter()), 2);
         assert_eq!(representative_kind(std::iter::empty()), 2);
+        // フォント・3D は数えない（多くても代表にならない）
+        assert_eq!(
+            representative_kind([Font, Font, Model, Image, Audio, Audio].into_iter()),
+            1
+        );
+        assert_eq!(representative_kind([Font, Model, Image].into_iter()), 0);
     }
 
     #[test]

@@ -1,11 +1,15 @@
 import type { MenuEntry } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry, unitIdOf } from '../../ipc/items';
-import { getCachedUnit } from '../../stores/itemCache';
+import { getCached, getCachedUnit } from '../../stores/itemCache';
 import { useViewStore } from '../../stores/viewStore';
+import { canEdit, openEditor } from '../editor/editorKinds';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
+import { openCreditsSheet } from '../credits/creditsSheetStore';
 import { exportEntries } from './exportActions';
+import { pixelArtMenu } from './pixelArtMenu';
+import { applyRecipeSubmenu, mergeSubmenu } from '../recipes/recipeMenus';
 import {
   dissolveUnits,
   groupEntries,
@@ -65,6 +69,11 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
       shortcut: 'Space',
       onSelect: () => state.setQuickLook(true),
     });
+    // 画像エディタ（M12）：画像 1 件のときだけ
+    const item = getCached(only);
+    if (item && canEdit(item)) {
+      out.push({ label: ja.itemMenu.edit, shortcut: '⌘E', onSelect: () => void openEditor(item) });
+    }
   }
   if (only !== undefined && units.length === 1) {
     out.push({
@@ -125,11 +134,34 @@ export function itemMenu(entries: readonly number[]): MenuEntry[] {
       onSelect: () => void dissolveUnits(entries),
     });
   }
+  // 素材の表示（M11）：画像を選んでいるときだけ
+  const pixelArt = pixelArtMenu(entries);
+  if (pixelArt) {
+    out.push('separator');
+    out.push(pixelArt);
+  }
+  // 一括加工（M14）：レシピを当てる ▸・まとめて 1 つにする ▸
+  const apply = applyRecipeSubmenu(entries);
+  const merge = mergeSubmenu(entries);
+  if (apply || merge) {
+    out.push('separator');
+    if (apply) out.push(apply);
+    if (merge) out.push(merge);
+  }
   out.push('separator');
   out.push({
     label: ja.itemMenu.export,
     shortcut: '⌘⇧E',
     onSelect: () => void exportEntries(entries),
+  });
+  out.push({
+    label: ja.credit.creditsList,
+    onSelect: () =>
+      openCreditsSheet({
+        type: 'items',
+        itemIds: entries.filter((e) => !isUnitEntry(e)),
+        unitIds: entries.filter(isUnitEntry).map(unitIdOf),
+      }),
   });
   out.push({
     label: ja.itemMenu.trash,

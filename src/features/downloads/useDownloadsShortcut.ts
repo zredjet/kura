@@ -2,9 +2,11 @@ import { useEffect } from 'react';
 
 import { useViewStore } from '../../stores/viewStore';
 
-/** シート・メニュー・シアターが開いているか（そのあいだは画面を替えない）。 */
+/** シート・メニュー・シアター・画像エディタが開いているか（そのあいだは画面を替えない）。 */
 function isBlocked(): boolean {
-  return document.querySelector('[data-sheet], [role="menu"], [data-theater]') !== null;
+  return (
+    document.querySelector('[data-sheet], [role="menu"], [data-theater], [data-editor]') !== null
+  );
 }
 
 /** ⌘⇧D でダウンロードの画面を開く（design.md §6）。 */

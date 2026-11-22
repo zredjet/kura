@@ -2,15 +2,34 @@
 //!
 //! | パス | 返すもの |
 //! |---|---|
-//! | `/thumb/{hash}/s`・`/thumb/{hash}/l` | サムネイル（長辺 512 / 1600） |
+//! | `/thumb/{hash}/s`・`/thumb/{hash}/l` | サムネイル（長辺 512 / 1600。png、jpg の順に探す。M11） |
 //! | `/art/{hash}` | 音楽のジャケット |
 //! | `/file/{hash}` | 元ファイル |
 //! | `/play/{hash}` | 再生用：プロキシがあればプロキシ、なければ元ファイル |
+//! | `/peaks/{hash}` | 波形の段（`peaks/ab/<hash>.peaks`。解析のジョブが書く） |
+//! | `/pcm/{hash}/{start}-{end}` | 試聴用の PCM（WAV。その場で作る。[`crate::asset::pcm`]。元は [`pcm_source`]） |
+//! | `/anim/{hash}/{版}` | アニメの帯（`anim/ab/<hash>-<版>.png`。`item_anim_get` が書く。[`crate::asset::anim`]） |
+//! | `/wave/{hash}/{版}` | グリッドの実波形（棒のアルファの PNG。波形の段からその場で作る。[`crate::asset::wave`]。M13） |
+//! | `/edit/{session}/{rev}/{段}/{frame}/{tx}/{ty}` | エディタの表示のタイル（M12。RGBA8 の行、`{ty}.png` なら PNG。その場で表示の値から作る。[`crate::edit::editor::tile`]） |
+//!
+//! 受け付け（WebView のラベル・Origin・メソッド）と応答のヘッダ・CSP の確かめは [`access`]。
+
+pub mod access;
+
+pub use access::{
+    ALLOWED_METHODS, Admit, AppOrigin, MAIN_WEBVIEW, RELEASE_ORIGIN, admit, csp_problems,
+    origin_of, preflight_headers, response_headers,
+};
 
 use std::path::{Path, PathBuf};
 
-use crate::import::mime_for;
-use crate::library::{Layout, ThumbSize};
+use kura_engine::render::preview::MAX_LEVEL;
+
+use crate::edit::editor::is_session_id;
+use crate::import::{MediaKind, classify, format_id, mime_for};
+use kura_engine::analysis::audio::peaks::PEAK_BINS;
+
+use crate::library::{ANIM_V, Layout, ThumbFormat, ThumbSize};
 
 /// 1 回の応答で返す最大の大きさ（Range のとき）。
 pub const MAX_CHUNK: u64 = 4 * 1024 * 1024;
@@ -18,16 +37,106 @@ pub const MAX_CHUNK: u64 = 4 * 1024 * 1024;
 /// パスの種類。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    Thumb { hash: String, size: ThumbSize },
-    Art { hash: String },
-    File { hash: String },
-    Play { hash: String },
+    Thumb {
+        hash: String,
+        size: ThumbSize,
+    },
+    Art {
+        hash: String,
+    },
+    File {
+        hash: String,
+    },
+    Play {
+        hash: String,
+    },
+    /// 波形の段（`kura-peaks`）。
+    Peaks {
+        hash: String,
+    },
+    /// 試聴用の PCM。フレーム `[start, end)`（`start < end`）。
+    Pcm {
+        hash: String,
+        start: u64,
+        end: u64,
+    },
+    /// アニメの帯の PNG。`version` は帯の並べ方の版（1 から）。
+    Anim {
+        hash: String,
+        version: u32,
+    },
+    /// グリッドの実波形の PNG（M13）。`version` は形の版（1 から。今の版でなければ作る側が 404）。
+    Wave {
+        hash: String,
+        version: u32,
+    },
+    /// エディタの表示のタイル（M12）：セッション・文書の番号・段（0〜3）・フレーム・タイルの位置（1 辺 256、フレームの画像の
+    /// 座標）。`png` なら PNG、ほかは行を詰めた RGBA8。(セッション, rev, 段, フレーム, タイル) の中身は変わらない。
+    Edit {
+        session: String,
+        rev: u64,
+        level: u8,
+        frame: u32,
+        tx: u32,
+        ty: u32,
+        png: bool,
+    },
+    /// 音声のエディタの出力の PCM（M13 段 4）：公開した今か直前の rev の、出力のフレーム `[start, end)`（`start < end`）。
+    EditPcm {
+        session: String,
+        rev: u64,
+        start: u64,
+        end: u64,
+    },
+    /// 音声のエディタの元（文書の入力）の PCM：フレーム `[start, end)`。
+    EditInputPcm {
+        session: String,
+        start: u64,
+        end: u64,
+    },
+    /// 音声のエディタの波形の段のタイル：公開した段の世代 `rev`（表示の情報の `peaks.rev`。文書の rev ではない）の段 `bin`
+    /// （1 ビンのフレーム数）のタイル `tile`（1,024 ビンずつ）。(セッション, 世代, 段, タイル) の中身は変わらない。
+    EditPeaks {
+        session: String,
+        /// 段の世代。
+        rev: u64,
+        bin: u32,
+        tile: u32,
+    },
 }
 
+/// 中身が変わらないものの `Cache-Control`。
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
 impl Route {
-    /// 中身が変わらないもの（ハッシュ名のサムネイル・ジャケット）。長くキャッシュしてよい。
+    /// 中身が変わらないもの（ハッシュ名のサムネイル・ジャケット・波形の段・アニメの帯・実波形・エディタのタイル）。長く
+    /// キャッシュしてよい。
     pub fn immutable(&self) -> bool {
-        matches!(self, Self::Thumb { .. } | Self::Art { .. })
+        matches!(
+            self,
+            Self::Thumb { .. }
+                | Self::Art { .. }
+                | Self::Peaks { .. }
+                | Self::Anim { .. }
+                | Self::Wave { .. }
+                | Self::Edit { .. }
+                | Self::EditPeaks { .. }
+        )
+    }
+
+    /// `Cache-Control` の値（付けないなら None）。PCM はその場で作るので残させない。
+    pub fn cache_control(&self) -> Option<&'static str> {
+        match self {
+            Self::Thumb { .. }
+            | Self::Art { .. }
+            | Self::Peaks { .. }
+            | Self::Anim { .. }
+            | Self::Wave { .. }
+            | Self::Edit { .. }
+            | Self::EditPeaks { .. } => Some(IMMUTABLE),
+            Self::Pcm { .. } | Self::EditPcm { .. } | Self::EditInputPcm { .. } => Some("no-store"),
+            Self::File { .. } | Self::Play { .. } => None,
+        }
     }
 }
 
@@ -35,6 +144,9 @@ impl Route {
 pub fn parse_route(path: &str) -> Option<Route> {
     let mut parts = path.trim_start_matches('/').split('/');
     let kind = parts.next()?;
+    if kind == "edit" {
+        return parse_edit(parts);
+    }
     let hash = parts.next().filter(|h| is_hash(h))?.to_string();
     let rest = parts.next();
     if parts.next().is_some() {
@@ -48,8 +160,111 @@ pub fn parse_route(path: &str) -> Option<Route> {
         ("art", None) => Some(Route::Art { hash }),
         ("file", None) => Some(Route::File { hash }),
         ("play", None) => Some(Route::Play { hash }),
+        ("peaks", None) => Some(Route::Peaks { hash }),
+        ("pcm", Some(span)) => {
+            let (start, end) = span.split_once('-')?;
+            let (start, end) = (parse_decimal(start)?, parse_decimal(end)?);
+            (start < end).then_some(Route::Pcm { hash, start, end })
+        }
+        ("anim", Some(version)) => {
+            let version = u32::try_from(parse_decimal(version)?).ok()?;
+            (version >= 1).then_some(Route::Anim { hash, version })
+        }
+        ("wave", Some(version)) => {
+            let version = u32::try_from(parse_decimal(version)?).ok()?;
+            (version >= 1).then_some(Route::Wave { hash, version })
+        }
         _ => None,
     }
+}
+
+/// `/edit/{session}/{rev}/{段}/{frame}/{tx}/{ty}`（`{ty}` は `.png`・`.rgba` を付けてよい）、`/edit/{session}/{rev}/pcm/{a}-{b}`、
+/// `/edit/{session}/input/pcm/{a}-{b}` の `edit` より後を読む。セッションは小文字の 16 進（1〜64 文字）、段は 0〜[`MAX_LEVEL`]、
+/// ほかは符号・空白のない 10 進（あふれたら None）。段は 10 進なので `input`・`pcm` と綴りは重ならない。
+fn parse_edit<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Route> {
+    let session = parts.next().filter(|s| is_session_id(s))?.to_string();
+    let second = parts.next()?;
+    if second == "input" {
+        let (start, end) = match (parts.next()?, parts.next()?, parts.next()) {
+            ("pcm", span, None) => parse_span(span)?,
+            _ => return None,
+        };
+        return Some(Route::EditInputPcm {
+            session,
+            start,
+            end,
+        });
+    }
+    let rev = parse_decimal(second)?;
+    let third = parts.next()?;
+    if third == "peaks" {
+        let bin = u32::try_from(parse_decimal(parts.next()?)?)
+            .ok()
+            .filter(|b| PEAK_BINS.contains(b))?;
+        let tile = u32::try_from(parse_decimal(parts.next()?)?).ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some(Route::EditPeaks {
+            session,
+            rev,
+            bin,
+            tile,
+        });
+    }
+    if third == "pcm" {
+        let span = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let (start, end) = parse_span(span)?;
+        return Some(Route::EditPcm {
+            session,
+            rev,
+            start,
+            end,
+        });
+    }
+    let level = u8::try_from(parse_decimal(third)?)
+        .ok()
+        .filter(|l| *l <= MAX_LEVEL)?;
+    let frame = u32::try_from(parse_decimal(parts.next()?)?).ok()?;
+    let tx = u32::try_from(parse_decimal(parts.next()?)?).ok()?;
+    let last = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (ty, png) = match last.split_once('.') {
+        Some((ty, "png")) => (ty, true),
+        Some((ty, "rgba")) => (ty, false),
+        Some(_) => return None,
+        None => (last, false),
+    };
+    let ty = u32::try_from(parse_decimal(ty)?).ok()?;
+    Some(Route::Edit {
+        session,
+        rev,
+        level,
+        frame,
+        tx,
+        ty,
+        png,
+    })
+}
+
+/// `{start}-{end}`（10 進、`start < end`。等しい・逆なら None）。
+fn parse_span(span: &str) -> Option<(u64, u64)> {
+    let (start, end) = span.split_once('-')?;
+    let (start, end) = (parse_decimal(start)?, parse_decimal(end)?);
+    (start < end).then_some((start, end))
+}
+
+/// 符号・空白のない 10 進（u64 にあふれたら None）。
+fn parse_decimal(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 fn is_hash(text: &str) -> bool {
@@ -59,12 +274,26 @@ fn is_hash(text: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// パスに対応するファイル（なければ None）。
+/// パスに対応するファイル（なければ None）。PCM・実波形・エディタのタイルはファイルではなくその場で作るので None（PCM の元は
+/// [`pcm_source`]、実波形は [`crate::asset::wave::serve`]）。
 pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
     let path = match route {
-        Route::Thumb { hash, size } => layout.thumb_path(hash, *size),
+        Route::Thumb { hash, size } => return thumb_file(layout, hash, *size),
         Route::Art { hash } => layout.art_path(hash),
         Route::File { hash } => find_content(layout, hash)?,
+        // 波形の段（解析のジョブが書く）。解析していなければ 404
+        Route::Peaks { hash } => layout.peaks_path(hash),
+        // アニメの帯（item_anim_get が書く）。並べ方の版が今のものだけ（古い版は残さない）
+        Route::Anim { hash, version } if *version == ANIM_V => layout.anim_path(hash),
+        Route::Anim { .. }
+        | Route::Pcm { .. }
+        | Route::Wave { .. }
+        | Route::Edit { .. }
+        | Route::EditPcm { .. }
+        | Route::EditInputPcm { .. }
+        | Route::EditPeaks { .. } => {
+            return None;
+        }
         Route::Play { hash } => {
             let proxy = layout.proxy_path(hash);
             if proxy.is_file() {
@@ -77,6 +306,34 @@ pub fn resolve(layout: &Layout, route: &Route) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// サムネイルのファイル：png、jpg の順に探す（透明のあるものは PNG。M11 の決定 4。URL に形式を含めないので DB を引かない）。
+fn thumb_file(layout: &Layout, hash: &str, size: ThumbSize) -> Option<PathBuf> {
+    [ThumbFormat::Png, ThumbFormat::Jpeg]
+        .into_iter()
+        .map(|format| layout.thumb_path_as(hash, size, format))
+        .find(|path| path.is_file())
+}
+
+/// 試聴の PCM の元（files/ の中の音声のファイルと、コーデックの形式の ID）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PcmSource {
+    pub path: PathBuf,
+    pub format: &'static str,
+}
+
+/// `/pcm/{hash}/…` の元を探す（files/ になければ、音声の形式でなければ None）。
+pub fn pcm_source(layout: &Layout, hash: &str) -> Option<PcmSource> {
+    let path = find_content(layout, hash)?;
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if classify(&ext) != Some(MediaKind::Audio) {
+        return None;
+    }
+    Some(PcmSource {
+        format: format_id(&ext)?,
+        path,
+    })
+}
+
 /// `files/ab/cd/<hash>.<ext>` を探す（拡張子は URL に含めないので、フォルダの中から探す）。
 fn find_content(layout: &Layout, hash: &str) -> Option<PathBuf> {
     let prefix = format!("{hash}.");
@@ -87,12 +344,13 @@ fn find_content(layout: &Layout, hash: &str) -> Option<PathBuf> {
         .map(|entry| entry.path())
 }
 
-/// 拡張子から Content-Type を決める。
+/// 拡張子から Content-Type を決める。応答に `nosniff` を付けるので、`<img>` で出す SVG は `image/svg+xml` にする。
 pub fn content_type(path: &Path) -> &'static str {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
+    // 形式の表（kura-engine の FORMATS）の MIME。表にない派生のファイル（`.peaks` など）はバイト列として配る
     mime_for(&ext).unwrap_or("application/octet-stream")
 }
 
@@ -184,6 +442,327 @@ mod tests {
                 .immutable()
         );
         assert!(!parse_route(&format!("/play/{HASH}")).unwrap().immutable());
+    }
+
+    #[test]
+    fn parses_peaks_pcm_anim_routes() {
+        assert_eq!(
+            parse_route(&format!("/peaks/{HASH}")),
+            Some(Route::Peaks { hash: HASH.into() })
+        );
+        assert_eq!(
+            parse_route(&format!("/pcm/{HASH}/0-100")),
+            Some(Route::Pcm {
+                hash: HASH.into(),
+                start: 0,
+                end: 100
+            })
+        );
+        assert_eq!(
+            parse_route(&format!("/pcm/{HASH}/44100-{}", u64::MAX)),
+            Some(Route::Pcm {
+                hash: HASH.into(),
+                start: 44100,
+                end: u64::MAX
+            })
+        );
+        assert_eq!(
+            parse_route(&format!("/anim/{HASH}/1")),
+            Some(Route::Anim {
+                hash: HASH.into(),
+                version: 1
+            })
+        );
+        // 実波形：形の版は 1 以上（今の版でないものは作る側が 404）
+        assert_eq!(
+            parse_route(&format!("/wave/{HASH}/1")),
+            Some(Route::Wave {
+                hash: HASH.into(),
+                version: 1
+            })
+        );
+        assert_eq!(
+            parse_route(&format!("/wave/{HASH}/2")),
+            Some(Route::Wave {
+                hash: HASH.into(),
+                version: 2
+            })
+        );
+        // 逆の範囲・空の範囲・片側だけ・あふれ・符号・空白・余分な区切り
+        for bad in [
+            format!("/pcm/{HASH}/100-0"),
+            format!("/pcm/{HASH}/5-5"),
+            format!("/pcm/{HASH}/0-"),
+            format!("/pcm/{HASH}/-100"),
+            format!("/pcm/{HASH}/0-18446744073709551616"),
+            format!("/pcm/{HASH}/+1-2"),
+            format!("/pcm/{HASH}/1 -2"),
+            format!("/pcm/{HASH}/1-2-3"),
+            format!("/pcm/{HASH}"),
+            format!("/pcm/{HASH}/0-100/x"),
+            format!("/peaks/{HASH}/x"),
+            format!("/anim/{HASH}"),
+            format!("/anim/{HASH}/0"),
+            format!("/anim/{HASH}/4294967296"),
+            format!("/anim/{HASH}/x"),
+            "/peaks/abc".to_string(),
+            format!("/wave/{HASH}"),
+            format!("/wave/{HASH}/0"),
+            format!("/wave/{HASH}/1/x"),
+            format!("/wave/{HASH}/4294967296"),
+            format!("/wave/{HASH}/+1"),
+            format!("/wave/{HASH}/1.png"),
+            format!("/wave/{}/1", HASH.to_uppercase()),
+            "/wave/abc/1".to_string(),
+        ] {
+            assert_eq!(parse_route(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn cache_control_by_route() {
+        let immutable = Some("public, max-age=31536000, immutable");
+        for (path, expected) in [
+            (format!("/thumb/{HASH}/s"), immutable),
+            (format!("/art/{HASH}"), immutable),
+            (format!("/peaks/{HASH}"), immutable),
+            (format!("/anim/{HASH}/1"), immutable),
+            (format!("/wave/{HASH}/1"), immutable),
+            (format!("/pcm/{HASH}/0-1"), Some("no-store")),
+            (format!("/file/{HASH}"), None),
+            (format!("/play/{HASH}"), None),
+            ("/edit/0af/3/0/0/1/2".to_string(), immutable),
+            ("/edit/0af/3/pcm/0-65536".to_string(), Some("no-store")),
+            ("/edit/0af/input/pcm/5-9".to_string(), Some("no-store")),
+            ("/edit/0af/3/peaks/256/0".to_string(), immutable),
+        ] {
+            let route = parse_route(&path).unwrap();
+            assert_eq!(route.cache_control(), expected, "{path}");
+            assert_eq!(route.immutable(), expected == immutable, "{path}");
+        }
+    }
+
+    /// エディタのタイル：セッション（小文字の 16 進）・rev・段（0〜3）・フレーム・タイル。`.png` で PNG、`.rgba` か拡張子なしで
+    /// RGBA8。ファイルではないので resolve は None。ほかの綴りは 404 になる（None）。
+    #[test]
+    fn parses_edit_tile_routes() {
+        let edit = |rev, level, frame, tx, ty, png| Route::Edit {
+            session: "3fa9c0de".into(),
+            rev,
+            level,
+            frame,
+            tx,
+            ty,
+            png,
+        };
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/12/2/0/3/4"),
+            Some(edit(12, 2, 0, 3, 4, false))
+        );
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/12/0/1/3/4.png"),
+            Some(edit(12, 0, 1, 3, 4, true))
+        );
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/0/3/0/0/0.rgba"),
+            Some(edit(0, 3, 0, 0, 0, false))
+        );
+        let long = "a".repeat(64);
+        assert!(parse_route(&format!("/edit/{long}/1/0/0/0/0")).is_some());
+        for bad in [
+            "/edit/3fa9c0de/12/4/0/0/0".to_string(),       // 段は 3 まで
+            "/edit/3FA9/12/0/0/0/0".to_string(),           // 大文字
+            "/edit/xyz/12/0/0/0/0".to_string(),            // 16 進でない
+            format!("/edit/{}/1/0/0/0/0", "a".repeat(65)), // 長すぎる
+            "/edit//12/0/0/0/0".to_string(),
+            "/edit/3fa9/12/0/0/0".to_string(),     // 足りない
+            "/edit/3fa9/12/0/0/0/0/0".to_string(), // 多い
+            "/edit/3fa9/12/0/0/0/0.jpg".to_string(),
+            "/edit/3fa9/12/0/0/0/.png".to_string(),
+            "/edit/3fa9/-1/0/0/0/0".to_string(),
+            "/edit/3fa9/1/0/0/0/+1".to_string(),
+            "/edit/3fa9/1/0/4294967296/0/0".to_string(), // フレームが u32 を超える
+            "/edit/3fa9/18446744073709551616/0/0/0/0".to_string(),
+        ] {
+            assert_eq!(parse_route(&bad), None, "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        assert_eq!(resolve(&layout, &edit(1, 0, 0, 0, 0, true)), None);
+    }
+
+    /// 音声のエディタの PCM（M13 段 4）：`/edit/{s}/{rev}/pcm/{a}-{b}`・`/edit/{s}/input/pcm/{a}-{b}`。区間は `/pcm` と同じ
+    /// （10 進・`start < end`）。ファイルではないので resolve は None。
+    #[test]
+    fn parses_edit_audio_routes() {
+        let session = "3fa9c0de".to_string();
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/12/pcm/65536-131072"),
+            Some(Route::EditPcm {
+                session: session.clone(),
+                rev: 12,
+                start: 65_536,
+                end: 131_072
+            })
+        );
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/input/pcm/0-1"),
+            Some(Route::EditInputPcm {
+                session,
+                start: 0,
+                end: 1
+            })
+        );
+        for bad in [
+            "/edit/3fa9c0de/12/pcm/5-5",
+            "/edit/3fa9c0de/12/pcm/9-5",
+            "/edit/3fa9c0de/12/pcm/5",
+            "/edit/3fa9c0de/12/pcm/-1-5",
+            "/edit/3fa9c0de/12/pcm/0-5/x",
+            "/edit/3fa9c0de/12/pcm",
+            "/edit/3fa9c0de/input/pcm/5-5",
+            "/edit/3fa9c0de/input/pcm",
+            "/edit/3fa9c0de/input/wave/0-5",
+            "/edit/3fa9c0de/input/pcm/0-5/x",
+            "/edit/3fa9c0de/input/3/pcm/0-5",
+            "/edit/3fa9c0de/x/pcm/0-5",
+        ] {
+            assert_eq!(parse_route(bad), None, "{bad}");
+        }
+        assert_eq!(
+            parse_route("/edit/3fa9c0de/7/peaks/65536/12"),
+            Some(Route::EditPeaks {
+                session: "3fa9c0de".into(),
+                rev: 7,
+                bin: 65_536,
+                tile: 12
+            })
+        );
+        for bad in [
+            "/edit/3fa9c0de/7/peaks/512/0",
+            "/edit/3fa9c0de/7/peaks/256",
+            "/edit/3fa9c0de/7/peaks/256/0/1",
+            "/edit/3fa9c0de/7/peaks/256/4294967296",
+            "/edit/3fa9c0de/input/peaks/256/0",
+        ] {
+            assert_eq!(parse_route(bad), None, "{bad}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let route = parse_route("/edit/3fa9c0de/1/pcm/0-1").unwrap();
+        assert_eq!(resolve(&layout, &route), None);
+        assert!(!route.immutable());
+    }
+
+    fn put(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// 波形の段と帯は、作ってあれば派生のファイルを返す（作るのは解析のジョブと item_anim_get）。帯は今の版だけ。
+    /// PCM はファイルではない（その場で作る。[`pcm_source`]）。
+    #[test]
+    fn peaks_and_anim_resolve_to_their_derived_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let peaks = parse_route(&format!("/peaks/{HASH}")).unwrap();
+        let anim = parse_route(&format!("/anim/{HASH}/1")).unwrap();
+        let pcm = parse_route(&format!("/pcm/{HASH}/0-1")).unwrap();
+        let wave = parse_route(&format!("/wave/{HASH}/1")).unwrap();
+        // まだ作っていない
+        for route in [&peaks, &anim, &pcm, &wave] {
+            assert_eq!(resolve(&layout, route), None, "{route:?}");
+        }
+        put(&layout.peaks_path(HASH), b"kurapeak");
+        put(&layout.anim_path(HASH), b"png");
+        assert_eq!(resolve(&layout, &peaks), Some(layout.peaks_path(HASH)));
+        assert_eq!(resolve(&layout, &anim), Some(layout.anim_path(HASH)));
+        assert_eq!(resolve(&layout, &pcm), None, "PCM はファイルから返さない");
+        assert_eq!(
+            resolve(&layout, &wave),
+            None,
+            "実波形は段のファイルから毎回作る"
+        );
+        // 帯の版が違えば（古い・新しい並べ方）404
+        let other = parse_route(&format!("/anim/{HASH}/2")).unwrap();
+        assert_eq!(resolve(&layout, &other), None);
+        assert_eq!(
+            content_type(&layout.anim_path(HASH)),
+            "image/png",
+            "帯は PNG"
+        );
+    }
+
+    /// サムネイルは png、jpg の順に探す（透明のあるものは PNG、ないものは JPEG。作り直して形式が変わっても古い形式を
+    /// 出さない。書いたら別の形式の古いファイルを消すのはサムネイルのジョブ）。
+    #[test]
+    fn resolve_prefers_png_thumb_then_jpg() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        for size in [ThumbSize::Small, ThumbSize::Large] {
+            let route = Route::Thumb {
+                hash: HASH.into(),
+                size,
+            };
+            let jpg = layout.thumb_path_as(HASH, size, ThumbFormat::Jpeg);
+            let png = layout.thumb_path_as(HASH, size, ThumbFormat::Png);
+            assert_eq!(resolve(&layout, &route), None);
+            put(&jpg, b"jpg");
+            assert_eq!(resolve(&layout, &route), Some(jpg.clone()));
+            assert_eq!(content_type(&jpg), "image/jpeg");
+            put(&png, b"png");
+            assert_eq!(resolve(&layout, &route), Some(png.clone()), "PNG が先");
+            assert_eq!(content_type(&png), "image/png");
+            std::fs::remove_file(&jpg).unwrap();
+            assert_eq!(resolve(&layout, &route), Some(png));
+        }
+    }
+
+    /// 試聴の PCM の元：files/ の中の音声のファイルだけ（画像・動画・ないものは None）。
+    #[test]
+    fn pcm_source_is_an_audio_file_in_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::new(dir.path());
+        let hash: [u8; 32] = crate::library::parse_hex32(HASH).unwrap();
+        assert_eq!(pcm_source(&layout, HASH), None);
+        let png = layout.content_path(&hash, "png");
+        put(&png, b"png");
+        assert_eq!(pcm_source(&layout, HASH), None, "画像は試聴しない");
+        std::fs::remove_file(&png).unwrap();
+        let ogg = layout.content_path(&hash, "ogg");
+        put(&ogg, b"ogg");
+        assert_eq!(
+            pcm_source(&layout, HASH),
+            Some(PcmSource {
+                path: ogg,
+                format: "ogg"
+            })
+        );
+    }
+
+    #[test]
+    fn content_types_for_new_kinds() {
+        for (name, mime) in [
+            ("x.svg", "image/svg+xml"),
+            ("x.SVG", "image/svg+xml"),
+            ("x.ttf", "font/ttf"),
+            ("x.otf", "font/otf"),
+            ("x.woff", "font/woff"),
+            ("x.woff2", "font/woff2"),
+            ("x.ttc", "font/collection"),
+            ("x.glb", "model/gltf-binary"),
+            ("x.psd", "image/vnd.adobe.photoshop"),
+            ("x.psb", "image/vnd.adobe.photoshop"),
+            ("x.peaks", "application/octet-stream"),
+            // 形式の表の MIME（WebKit は描かないが、nosniff と CSP: sandbox で文書としても開かない）
+            ("x.aseprite", "image/x-aseprite"),
+            ("x.ase", "image/x-aseprite"),
+            ("x.png", "image/png"),
+            ("x.wav", "audio/wav"),
+            ("x", "application/octet-stream"),
+        ] {
+            assert_eq!(content_type(Path::new(name)), mime, "{name}");
+        }
     }
 
     #[test]

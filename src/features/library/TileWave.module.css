@@ -1,0 +1,12 @@
+/* design.md §4 のタイル：ジャケットのない音声の実波形。棒のアルファの PNG を mask にし、色は文字の色（呼ぶ側の .waveform の
+   --text-secondary。明るい表示・暗い表示のどちらでも効く）。枠の位置・大きさは呼ぶ側のクラス（飾りの波形と同じ枠）で、
+   PNG は枠いっぱいに伸ばす（棒の並びなので縦横の比が変わっても崩れない） */
+
+.wave {
+  display: block;
+  background-color: currentColor;
+  -webkit-mask-size: 100% 100%;
+  mask-size: 100% 100%;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}

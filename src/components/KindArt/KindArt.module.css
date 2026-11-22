@@ -1,0 +1,18 @@
+/* design.md §3.1：フォント・3D のサムネイルがないとき（段 2）は、地の上に種類のアイコンだけを出す */
+
+.art {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--text-tertiary);
+}
+
+/* 枠の短い辺の 3 分の 1 ほど（大きい枠でも 72px まで） */
+.art svg {
+  width: 36%;
+  height: 36%;
+  max-width: 72px;
+  max-height: 72px;
+}

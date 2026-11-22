@@ -4,7 +4,8 @@ import Foundation
 import ImageIO
 
 /// メディア情報を JSON（`{"width":…,"height":…,"durationMs":…,"capturedAt":…,"codec":…,"artist":…,"album":…,"title":…}`）で返す。
-/// `kind` は 0 = 画像、1 = 動画、2 = 音楽。扱えない形式なら NULL。返した文字列は `kura_free_string` で解放する。
+/// `kind` は 0 = 画像、1 = 動画、2 = 音楽、3 = フォント（`{"codec":…,"font":{…}}`。Fonts.swift）。扱えない形式・知らない種類なら
+/// NULL。返した文字列は `kura_free_string` で解放する。
 @_cdecl("kura_probe")
 public func kuraProbe(_ path: UnsafePointer<CChar>, _ kind: Int32) -> UnsafeMutablePointer<CChar>? {
     let url = fileURL(path)
@@ -12,7 +13,9 @@ public func kuraProbe(_ path: UnsafePointer<CChar>, _ kind: Int32) -> UnsafeMuta
     switch kind {
     case 0: info = probeImage(url)
     case 1: info = probeVideo(url)
-    default: info = probeAudio(url)
+    case 2: info = probeAudio(url)
+    case 3: info = probeFont(url)
+    default: info = nil
     }
     guard let info,
           let data = try? JSONSerialization.data(withJSONObject: info),

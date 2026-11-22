@@ -1,0 +1,518 @@
+import { useEffect, useId, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+
+import { Button } from '../../components/Button/Button';
+import { Dialog } from '../../components/Dialog/Dialog';
+import { ProgressBar } from '../../components/ProgressBar/ProgressBar';
+import { ja } from '../../i18n/ja';
+import type { EditVersionDto } from '../../ipc/edit';
+import { relativeDateTime } from '../../lib/dates';
+import { formatBytes, formatCount } from '../../lib/format';
+import { isImeKey } from '../../lib/ime';
+import { selectItemSave, useJobsStore } from '../../stores/jobsStore';
+import { saveProgressView } from '../import/progressView';
+import { editorKindModule } from './editorKinds';
+import {
+  answerDraft,
+  answerUnsaved,
+  askRestore,
+  cancelEditorSave,
+  confirmRevert,
+  confirmWarnings,
+  defaultFormatChoice,
+  dismissSheet,
+  formatChoices,
+  loadVersions,
+  pauseEditorSave,
+  resumeEditorSave,
+  saveFailureText,
+  submitFormat,
+  submitSaveAs,
+  validSaveAsName,
+} from './editorSave';
+import {
+  type EditorSheet,
+  hasUnsavedChanges,
+  originalFormatOf,
+  useEditorStore,
+} from './editorStore';
+import styles from './Editor.module.css';
+import { formatUnavailableText, outputChoice, unavailableNote } from './formats';
+import { type EditorKind, formatsFor } from './kindTraits';
+import { opName } from './opsCatalog';
+import { issueText } from './ParamFields';
+import { SaveRecipeSheet } from '../recipes/SaveRecipeSheet';
+
+const t = ja.editor;
+
+/** 形式の名前。 */
+function formatName(format: string | null): string {
+  return format ? (t.formats[format] ?? format.toUpperCase()) : '—';
+}
+
+/** 版の一覧を読む（読めなければ空）。 */
+function useVersions(): EditVersionDto[] | null {
+  const [versions, setVersions] = useState<EditVersionDto[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    loadVersions().then(
+      (list) => {
+        if (alive) setVersions(list);
+      },
+      () => {
+        if (alive) setVersions([]);
+      },
+    );
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return versions;
+}
+
+/**
+ * 下書きのシート：「前回の編集の下書きがあります（日時）」［捨てる］［下書きから開く］。土台が変わっていれば捨てるだけ（同じアイテムの
+ * 保存が待っている間はここへ来ない：前の保存のシートで止める）。
+ */
+function DraftSheet() {
+  const draft = useEditorStore((s) => s.draft);
+  const titleId = useId();
+  if (!draft) return null;
+  const when = draft.updatedAt !== null ? relativeDateTime(draft.updatedAt) : '';
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {t.draftTitle}
+      </h2>
+      <p className={styles.sheetMessage}>{t.draftMessage(when)}</p>
+      <p className={styles.sheetNote}>{draft.fresh ? t.draftHistory : t.draftStale}</p>
+      <footer className={styles.sheetActions}>
+        <Button
+          variant={draft.fresh ? 'secondary' : 'primary'}
+          onClick={() => answerDraft('discard')}
+        >
+          {t.draftDiscard}
+        </Button>
+        {draft.fresh && (
+          <Button variant="primary" onClick={() => answerDraft('open')}>
+            {t.draftOpen}
+          </Button>
+        )}
+      </footer>
+    </Dialog>
+  );
+}
+
+/**
+ * 前の保存が終わっていないアイテムを開いたとき（ADR-189）：そのジョブの進捗と操作だけを出す（動いていれば［一時停止］、止まっていれば
+ * ［再開］、［中止］、［閉じる］）。文言と進捗はカプセルと同じ。終わる・中止すると開き直す（`editorSave`）。［閉じる］・esc はエディタを
+ * 閉じるだけで、ジョブはそのまま（カプセルから続けられる）。ジョブを読めないうちは［閉じる］だけ。
+ */
+function PendingSaveSheet() {
+  const itemId = useEditorStore((s) => s.item?.id);
+  const job = useJobsStore((s) => (itemId === undefined ? null : selectItemSave(s.saves, itemId)));
+  const titleId = useId();
+  const view = job && saveProgressView(job);
+  const paused = job?.state === 'paused';
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {t.pendingSaveTitle}
+      </h2>
+      <p className={styles.sheetMessage}>{t.pendingSaveMessage}</p>
+      {view && (
+        <div className={styles.pendingSave}>
+          <p className={styles.sheetMessage} role="status">
+            {view.title}
+          </p>
+          {view.progress !== undefined && (
+            <ProgressBar value={view.progress} label={ja.savingJob.label} />
+          )}
+          {view.detail && <p className={styles.sheetNote}>{view.detail}</p>}
+        </div>
+      )}
+      <footer className={styles.sheetActions}>
+        {job && (
+          <Button className={styles.sheetLeft} onClick={cancelEditorSave}>
+            {t.pendingSaveCancel}
+          </Button>
+        )}
+        <Button onClick={dismissSheet}>{ja.common.close}</Button>
+        {job && (
+          <Button
+            variant={paused ? 'primary' : 'secondary'}
+            onClick={paused ? resumeEditorSave : pauseEditorSave}
+          >
+            {paused ? t.pendingSaveResume : t.pendingSavePause}
+          </Button>
+        )}
+      </footer>
+    </Dialog>
+  );
+}
+
+/** 未保存で閉じるとき：［保存しない］［キャンセル］［保存］。 */
+function UnsavedSheet() {
+  const title = useEditorStore((s) => s.item?.title ?? '');
+  const recipe = useEditorStore((s) => s.recipe?.name ?? null);
+  const titleId = useId();
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {recipe !== null ? ja.recipeEditor.closeTitle : t.unsavedTitle}
+      </h2>
+      <p className={styles.sheetMessage}>
+        {recipe !== null ? ja.recipeEditor.closeMessage(recipe) : t.unsavedMessage(title)}
+      </p>
+      <footer className={styles.sheetActions}>
+        <Button className={styles.sheetLeft} onClick={() => answerUnsaved('discard')}>
+          {t.dontSave}
+        </Button>
+        <Button onClick={() => answerUnsaved('cancel')}>{ja.common.cancel}</Button>
+        <Button variant="primary" onClick={() => answerUnsaved('save')}>
+          {t.save}
+        </Button>
+      </footer>
+    </Dialog>
+  );
+}
+
+/** 警告があるときの保存の確認：警告を並べる。 */
+function WarningsSheet() {
+  const warnings = useEditorStore((s) => s.warnings);
+  const nodes = useEditorStore((s) => s.doc.nodes);
+  const titleId = useId();
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {t.warningsTitle}
+      </h2>
+      <ul className={styles.sheetList}>
+        {warnings.map((w, i) => {
+          const node = w.node === null ? undefined : nodes[w.node];
+          return <li key={i}>{t.warningLine(node ? opName(node.op) : null, issueText(w))}</li>;
+        })}
+      </ul>
+      <p className={styles.sheetMessage}>{t.warningsMessage}</p>
+      <footer className={styles.sheetActions}>
+        <Button onClick={dismissSheet}>{ja.common.cancel}</Button>
+        <Button variant="primary" onClick={confirmWarnings}>
+          {t.saveAnyway}
+        </Button>
+      </footer>
+    </Dialog>
+  );
+}
+
+/** 別名で保存：名前のシート（ファイル名は名前と出力の形式の拡張子）。 */
+function SaveAsSheet() {
+  const item = useEditorStore((s) => s.item);
+  const outputs = useEditorStore((s) => s.doc.outputs);
+  const sourceFormat = useEditorStore(originalFormatOf);
+  const titleId = useId();
+  const inputId = useId();
+  const [name, setName] = useState(() => t.saveAsDefault(item?.title ?? ''));
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+  const formats = formatsFor(item);
+  // 「元と同じ」は元のファイルの形式（source.format は画素の形式で、ファイルの形式ではない）
+  const eff = formats?.effectiveFormat(outputChoice(outputs), sourceFormat) ?? null;
+  const ext = eff && formats ? formats.savedExt(eff.format, item?.ext ?? '') : (item?.ext ?? '');
+  const trimmed = name.trim();
+  const valid = validSaveAsName(trimmed);
+  const submit = () => {
+    if (valid) submitSaveAs(trimmed);
+  };
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {t.saveAsTitle}
+      </h2>
+      <div className={styles.sheetField}>
+        <label htmlFor={inputId} className={styles.sheetLabel}>
+          {t.saveAsName}
+        </label>
+        <input
+          ref={inputRef}
+          id={inputId}
+          className={styles.sheetInput}
+          value={name}
+          spellCheck={false}
+          autoComplete="off"
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !isImeKey(e)) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+        {trimmed.includes('/') ? (
+          <p className={styles.paramIssue} role="alert">
+            {t.saveAsBadName}
+          </p>
+        ) : (
+          trimmed && <p className={styles.sheetNote}>{t.saveAsFile(`${trimmed}.${ext}`)}</p>
+        )}
+      </div>
+      <p className={styles.sheetNote}>{t.saveAsNote}</p>
+      <footer className={styles.sheetActions}>
+        <Button onClick={dismissSheet}>{ja.common.cancel}</Button>
+        <Button variant="primary" disabled={!valid} onClick={submit}>
+          {t.save}
+        </Button>
+      </footer>
+    </Dialog>
+  );
+}
+
+/** 戻せる版があるか（版の一覧の頭が版 1 以降）。 */
+export function canRevert(versions: readonly EditVersionDto[]): boolean {
+  return versions.some((v) => v.version > 0);
+}
+
+/** 元に戻す・途中の版に戻すの確認。別名で作ったアイテムは Conflict になりうることを添える。 */
+function RevertSheet({ to }: { to: number }) {
+  const unsaved = useEditorStore((s) => hasUnsavedChanges(s));
+  const versions = useVersions();
+  const titleId = useId();
+  const ready = versions !== null;
+  const possible = ready && canRevert(versions);
+  const label = to === 0 ? t.revertTitle : t.versionRestoreTitle(formatCount(to));
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {label}
+      </h2>
+      {ready && !possible ? (
+        <p className={styles.sheetMessage}>{t.versionsEmpty}</p>
+      ) : (
+        <>
+          <p className={styles.sheetMessage}>
+            {to === 0 ? t.revertMessage : t.versionRestoreMessage(formatCount(to))}
+          </p>
+          {to === 0 && unsaved && <p className={styles.sheetMessage}>{t.revertUnsaved}</p>}
+          {to === 0 && <p className={styles.sheetNote}>{t.revertConflictHint}</p>}
+        </>
+      )}
+      <footer className={styles.sheetActions}>
+        <Button onClick={dismissSheet}>{ja.common.cancel}</Button>
+        <Button variant="primary" disabled={!possible} onClick={() => confirmRevert(to)}>
+          {to === 0 ? t.revertConfirm : t.versionRestore}
+        </Button>
+      </footer>
+    </Dialog>
+  );
+}
+
+/** 版の一覧の 1 行の文（日時・種類・形式・大きさ）。 */
+export function versionLine(v: EditVersionDto, now: number = Date.now()): string {
+  const kind =
+    v.kind === 'revert' && v.revertTo !== null
+      ? t.versionRevertTo(formatCount(v.revertTo))
+      : (t.versionKinds[v.kind] ?? v.kind);
+  const size =
+    v.width !== null && v.height !== null
+      ? t.size(formatCount(v.width), formatCount(v.height))
+      : null;
+  return [
+    relativeDateTime(v.createdAt, now),
+    kind,
+    formatName(v.format),
+    size,
+    formatBytes(v.sizeBytes),
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+/** 版の一覧（文字だけ）：日時・種類・形式・大きさ、照合が合わずに残した版の印。途中の版に戻せる。 */
+function VersionsSheet() {
+  const versions = useVersions();
+  const titleId = useId();
+  const head = versions && versions.length > 0 ? Math.max(...versions.map((v) => v.version)) : -1;
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {t.versionsTitle}
+      </h2>
+      {versions === null ? (
+        <p className={styles.sheetMessage}>{t.versionsLoading}</p>
+      ) : versions.length === 0 ? (
+        <p className={styles.sheetMessage}>{t.versionsEmpty}</p>
+      ) : (
+        <>
+          <ol className={styles.versionList}>
+            {[...versions].reverse().map((v) => (
+              <li key={v.version} className={styles.versionRow}>
+                <span className={styles.versionText}>
+                  <span className={styles.versionName}>
+                    {t.versionName(formatCount(v.version))}
+                    {v.version === head && <span className={styles.badge}>{t.versionCurrent}</span>}
+                    {v.fileState === 'kept' && (
+                      <span className={styles.badge} title={t.versionKept}>
+                        {t.versionKept}
+                      </span>
+                    )}
+                  </span>
+                  <span className={styles.versionMeta}>{versionLine(v)}</span>
+                </span>
+                {v.version !== head && (
+                  <Button size="sm" onClick={() => askRestore(v.version)}>
+                    {t.versionRestore}
+                  </Button>
+                )}
+              </li>
+            ))}
+          </ol>
+          <p className={styles.sheetNote}>{t.versionsHint}</p>
+        </>
+      )}
+      <footer className={styles.sheetActions}>
+        <Button onClick={dismissSheet}>{ja.common.close}</Button>
+      </footer>
+    </Dialog>
+  );
+}
+
+/** 保存できなかったとき：code ごとの分かる言葉と、Rust の言葉。 */
+function FailedSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'saveFailed' }> }) {
+  const titleId = useId();
+  const text = saveFailureText(sheet.mode, sheet.code, sheet.message);
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {t.saveFailed}
+      </h2>
+      <div role="alert">
+        {text.lead && <p className={styles.sheetMessage}>{text.lead}</p>}
+        {text.detail && <p className={styles.sheetNote}>{text.detail}</p>}
+        {text.hint && <p className={styles.sheetMessage}>{text.hint}</p>}
+      </div>
+      <footer className={styles.sheetActions}>
+        <Button variant="primary" onClick={dismissSheet}>
+          {t.ok}
+        </Button>
+      </footer>
+    </Dialog>
+  );
+}
+
+/** 書けなかった理由の文（右パネルの出力の行の一言と同じ。`formatUnavailableText`）。 */
+function formatUnavailableBody(
+  sheet: Extract<EditorSheet, { kind: 'format' }>,
+  kind: EditorKind | null,
+): string {
+  const format = sheet.unavailable;
+  if (!format) return formatUnavailableText(null, null, kind);
+  const row = sheet.formats.find((r) => r.format === format);
+  return formatUnavailableText(formatName(format), row, kind);
+}
+
+/**
+ * 保存が書けない形式で断られたとき（M13）：「MP3 では保存できません」と理由、書ける形式の選択（既定は代わりの既定。
+ * 書けない形式は押せず、道具（ffmpeg）がないものはそう添える）、選んだ形式で失うもの（種類の部品）。［保存］で選んだ形式で
+ * 積み直す。
+ */
+function FormatSheet({ sheet }: { sheet: Extract<EditorSheet, { kind: 'format' }> }) {
+  const item = useEditorStore((s) => s.item);
+  const kind = useEditorStore((s) => s.kind);
+  const titleId = useId();
+  const groupName = useId();
+  const table = formatsFor(item);
+  const choices = formatChoices(table, sheet.formats);
+  const [chosen, setChosen] = useState(() => defaultFormatChoice(choices, sheet.fallback));
+  const selected = choices.find((c) => c.format === chosen && c.available) ?? null;
+  const FormatLosses = editorKindModule(kind)?.ui.FormatLosses;
+  const name = sheet.unavailable ? formatName(sheet.unavailable) : null;
+  const body = formatUnavailableBody(sheet, kind);
+  return (
+    <Dialog labelledBy={titleId} onClose={dismissSheet} size="sm">
+      <h2 id={titleId} className={styles.sheetTitle}>
+        {name === null ? t.formatUnavailableTitleAny : t.formatUnavailableTitle(name)}
+      </h2>
+      <p className={styles.sheetMessage}>{body}</p>
+      <fieldset className={styles.formatChoices}>
+        <legend className={styles.sheetLabel}>{t.formatChoose}</legend>
+        {choices.map((c) => (
+          <label
+            key={c.format}
+            className={styles.formatChoice}
+            data-disabled={c.available ? undefined : ''}
+          >
+            <input
+              type="radio"
+              name={groupName}
+              value={c.format}
+              checked={chosen === c.format}
+              disabled={!c.available}
+              onChange={() => setChosen(c.format)}
+            />
+            <span>{formatName(c.format)}</span>
+            {!c.available && (
+              <>
+                {' '}
+                <span className={styles.formatChoiceNote}>{unavailableNote(c)}</span>
+              </>
+            )}
+          </label>
+        ))}
+      </fieldset>
+      {selected === null && <p className={styles.sheetNote}>{t.formatNoneWritable}</p>}
+      {selected && FormatLosses && <FormatLosses format={selected} />}
+      <footer className={styles.sheetActions}>
+        <Button onClick={dismissSheet}>{ja.common.cancel}</Button>
+        <Button
+          variant="primary"
+          disabled={selected === null}
+          onClick={() => {
+            if (selected) submitFormat(selected.format);
+          }}
+        >
+          {t.save}
+        </Button>
+      </footer>
+    </Dialog>
+  );
+}
+
+function SheetOf({ sheet }: { sheet: EditorSheet }) {
+  switch (sheet.kind) {
+    case 'draft':
+      return <DraftSheet />;
+    case 'pendingSave':
+      return <PendingSaveSheet />;
+    case 'unsaved':
+      return <UnsavedSheet />;
+    case 'saveWarnings':
+      return <WarningsSheet />;
+    case 'saveAs':
+      return <SaveAsSheet />;
+    case 'saveRecipe':
+      return <SaveRecipeSheet closeAfter={sheet.closeAfter} />;
+    case 'revert':
+      return <RevertSheet to={0} />;
+    case 'restore':
+      return <RevertSheet to={sheet.version} />;
+    case 'versions':
+      return <VersionsSheet />;
+    case 'saveFailed':
+      return <FailedSheet sheet={sheet} />;
+    case 'format':
+      return <FormatSheet sheet={sheet} />;
+  }
+}
+
+/**
+ * エディタの上に出すシート（下書き・前の保存・未保存で閉じる・警告・別名・元に戻す・版の一覧・失敗・形式を選ぶ）。エディタの層（z-index 16）の
+ * 中に描くと、ルートのシート（設定など）の下に隠れるので、body に出す（設定のシートからライブラリを切り替えるとき・
+ * 設定を開いたまま窓を閉じるときも、未保存のシートがいちばん上に出る）。
+ */
+export function EditorSheets() {
+  const sheet = useEditorStore((s) => s.sheet);
+  if (!sheet) return null;
+  return createPortal(<SheetOf sheet={sheet} />, document.body);
+}

@@ -3,15 +3,14 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 import glass from '../../components/glass/glass.module.css';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
-import { ImageIcon } from '../../components/icons/ImageIcon';
-import { MusicIcon } from '../../components/icons/MusicIcon';
+import { KindIcon } from '../../components/icons/KindIcon';
+import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { NowPlayingIcon } from '../../components/icons/NowPlayingIcon';
 import { ReshuffleIcon } from '../../components/icons/ReshuffleIcon';
-import { VideoIcon } from '../../components/icons/VideoIcon';
 import { Switch } from '../../components/Switch/Switch';
 import { ja } from '../../i18n/ja';
 import type { ItemSummaryDto } from '../../ipc/items';
-import { thumbUrl } from '../../ipc/media';
+import { hasDuration, kindLabel } from '../../ipc/kinds';
 import { formatCount, formatDuration, formatLongDuration } from '../../lib/format';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
 import { TAG_FOCUS_KEY } from '../library/inspector/ItemInspector';
@@ -29,6 +28,8 @@ import styles from './SidePanel.module.css';
 const t = ja.player;
 /** キューの行の高さ（54px）と間隔（2px）、ユニットの見出しの高さ。 */
 const ROW = 56;
+/** キューの行のサムネイル（SidePanel.module.css の `.thumb`。市松模様は敷かない大きさ）。 */
+const QUEUE_THUMB = { w: 40, h: 40 };
 const GROUP_ROW = 34;
 
 /** シアターの右パネル：キュー（Player.dc.html「次に再生」）か、今のアイテムの情報（インスペクタ）。 */
@@ -363,7 +364,7 @@ function rowSub(
   if (!item) {
     return '';
   }
-  const kind = ja.kinds[item.kind as 'image' | 'video' | 'audio'] ?? '';
+  const kind = kindLabel(item.kind);
   if (current) {
     return t.nowPlaying(kind);
   }
@@ -375,7 +376,7 @@ function rowSub(
       ? imageMs !== null
         ? t.seconds(String(Math.round(imageMs / 1000)))
         : ''
-      : item.durationMs !== null
+      : hasDuration(item.kind) && item.durationMs !== null
         ? formatDuration(item.durationMs)
         : '';
   return duration ? t.rowSub(kind, duration) : kind;
@@ -403,14 +404,17 @@ function Row({
   const content = (
     <>
       <span className={styles.thumb} aria-hidden="true">
-        {item?.thumbState === 'ready' ? (
-          <img src={thumbUrl(item.hash, 's')} alt="" loading="lazy" />
-        ) : item?.kind === 'audio' ? (
-          <MusicIcon size={18} />
-        ) : item?.kind === 'video' ? (
-          <VideoIcon size={18} />
+        {item ? (
+          <MediaImage
+            source={item}
+            size="s"
+            fit="cover"
+            box={QUEUE_THUMB}
+            loading="lazy"
+            fallback={<KindIcon kind={item.kind} size={18} />}
+          />
         ) : (
-          <ImageIcon size={18} />
+          <KindIcon kind={undefined} size={18} />
         )}
       </span>
       <span className={styles.text}>

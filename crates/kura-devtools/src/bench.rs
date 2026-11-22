@@ -1,4 +1,5 @@
-//! ベンチマーク（`bench query --library <path>`）。NFR の目標と比べるための数値を出す。
+//! ベンチマーク（`bench query --library <path>` など）。NFR の目標と比べるための数値を出す。編集のベンチ（`bench edit`）は
+//! `bench_edit` に振り分ける。
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,12 +13,41 @@ use kura_core::query::{QueryContext, parse};
 use kura_core::time::now_ms;
 
 /// `bench query --library <path>` / `bench thumbs --src <dir> [--threads N]` /
-/// `bench import --src <dir> [--threads N] [--out <dir>]` / `bench backup --library <path>`。
+/// `bench import --src <dir> [--threads N] [--out <dir>]` / `bench backup --library <path>` /
+/// `bench edit …`（編集のベンチ。`bench_edit`）/ `bench migrate …`（マイグレーション。`bench_migrate`）/
+/// `bench analyze …`（解析のジョブ。`bench_analyze`）/ `bench thumbs-job --src <dir> …`（サムネイルのジョブ。`bench_thumbs`）/
+/// `bench svg-worker …`（SVG の働き手の手間。`bench_svg`）/ `bench editor …`・`bench save …`（M12 のアプリの道：エディタの
+/// 1 手とタイル、保存のジョブの全体。`bench_app`）/ `bench batch …`（M14 の一括加工のジョブの通しと E4。`bench_app::batch`）。
 pub fn run(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("edit") {
+        return crate::bench_edit::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("editor") {
+        return crate::bench_app::editor::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("save") {
+        return crate::bench_app::save::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("batch") {
+        return crate::bench_app::batch::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("thumbs-job") {
+        return crate::bench_thumbs::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("migrate") {
+        return crate::bench_migrate::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("analyze") {
+        return crate::bench_analyze::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("svg-worker") {
+        return crate::bench_svg::run(&args[1..]);
+    }
     let mut library = None;
     let mut src = None;
     let mut threads = None;
     let mut out = None;
+    let mut fake_facts = false;
     let mut it = args.iter().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -25,17 +55,21 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--src" => src = it.next().map(PathBuf::from),
             "--threads" => threads = it.next().and_then(|n| n.parse().ok()),
             "--out" => out = it.next().map(PathBuf::from),
+            "--fake-facts" => fake_facts = true,
             _ => {}
         }
     }
     match args.first().map(String::as_str) {
-        Some("query") => query(&library.ok_or("--library を指定してください")?),
+        Some("query") => query(&library.ok_or("--library を指定してください")?, fake_facts),
         Some("thumbs") => thumbs(&src.ok_or("--src を指定してください")?, threads),
         Some("import") => import(&src.ok_or("--src を指定してください")?, threads, out),
         Some("backup") => backup(&library.ok_or("--library を指定してください")?),
         _ => Err(
-            "使い方: kura-devtools bench query --library <path> | thumbs --src <dir> [--threads N] \
-             | import --src <dir> [--threads N] [--out <dir>] | backup --library <path>"
+            "使い方: kura-devtools bench query --library <path> [--fake-facts] | thumbs --src <dir> [--threads N] \
+             | import --src <dir> [--threads N] [--out <dir>] | backup --library <path> | edit [--quick] … \
+             | migrate (--library <path> | --items <件数> [--history]) [--runs 3] [--work <dir>] [--json <file>] \
+             | analyze --kind image|audio [--limit N] [--src <dir>] [--work <dir>] [--json <file>] \
+             | editor --work <dir> [--threads 4,16] [--runs 3] [--quick] … | save --work <dir> [--threads 4,16] [--runs 3] [--quick] …"
                 .into(),
         ),
     }
@@ -74,9 +108,10 @@ fn thumbs(src: &std::path::Path, threads: Option<usize>) -> Result<(), String> {
             .par_iter()
             .enumerate()
             .filter(|(i, path)| {
+                // 書き先は拡張子のない stem（書いた形式の拡張子が付く）
                 let targets = ThumbTargets {
-                    large: out.join(format!("{i}_l.jpg")),
-                    small: out.join(format!("{i}_s.jpg")),
+                    large: out.join(format!("{i}_l")),
+                    small: out.join(format!("{i}_s")),
                 };
                 backend.image_thumbnails(path, &targets).is_err()
             })
@@ -214,7 +249,8 @@ fn median(mut runs: Vec<Duration>) -> Duration {
     runs[runs.len() / 2]
 }
 
-fn query(path: &std::path::Path) -> Result<(), String> {
+/// `fake_facts`：素材の事実の擬似の行を入れて、事実のフィールドの検索も測る（終わったら消す。`bench_facts`）。
+fn query(path: &std::path::Path, fake_facts: bool) -> Result<(), String> {
     let opened = Instant::now();
     let library = Library::open(path).map_err(|e| e.to_string())?;
     let open_time = opened.elapsed();
@@ -223,6 +259,20 @@ fn query(path: &std::path::Path) -> Result<(), String> {
         now_ms: now_ms(),
         utc_offset_minutes: 540,
     };
+    if fake_facts {
+        let started = Instant::now();
+        let (images, audios, settings) = crate::bench_facts::insert(db)?;
+        tracing::info!(
+            images,
+            audios,
+            settings,
+            ms = started.elapsed().as_secs_f64() * 1000.0,
+            "擬似の事実を入れました（測り終えたら消します）"
+        );
+        let measured = crate::bench_facts::search(db, &ctx);
+        crate::bench_facts::remove(db)?;
+        measured?;
+    }
 
     let mut list_runs = Vec::new();
     let mut bytes = 0;

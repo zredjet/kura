@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { canHideControls, onFullscreenChange } from './theaterChrome';
+import { canHideControls, hoverTracker, onFullscreenChange } from './theaterChrome';
 
 const base = {
   playing: true,
@@ -21,6 +21,27 @@ describe('canHideControls', () => {
     expect(canHideControls({ ...base, focusInControls: true })).toBe(false);
     expect(canHideControls({ ...base, menuOpen: true })).toBe(false);
     expect(canHideControls({ ...base, typing: true })).toBe(false);
+  });
+});
+
+describe('hoverTracker', () => {
+  it('入ったら乗っていて、出たら乗っていない', () => {
+    const row = document.body.appendChild(document.createElement('div'));
+    const hover = hoverTracker();
+    expect(hover.hovering()).toBe(false);
+    hover.enter(row);
+    expect(hover.hovering()).toBe(true);
+    hover.leave();
+    expect(hover.hovering()).toBe(false);
+    row.remove();
+  });
+
+  it('乗せたまま部品が DOM から外れたら（pointerleave は来ない）乗っていないとみなす', () => {
+    const row = document.body.appendChild(document.createElement('div'));
+    const hover = hoverTracker();
+    hover.enter(row);
+    row.remove();
+    expect(hover.hovering()).toBe(false);
   });
 });
 

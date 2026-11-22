@@ -1,0 +1,2 @@
+{"digest":"5eb955d9552f14848e049838e6e591d2d7eb703af810baa21d8fb7067eea8961","inputs":[{"count":2,"fmt":"rgba8","h":16,"seed":92,"type":"noiseFrames","w":16}],"name":"bottom-center","params":{"pivot":{"x":8,"y":16}},"target":"*"}
+{"digest":"6e21fee91aaca385dcc92433a9d2847775a85f290c6bd48ade787a0947be5d17","inputs":[{"cell":8,"cols":2,"rows":1,"type":"sheet"}],"name":"clear","params":{"pivot":null},"target":"*"}

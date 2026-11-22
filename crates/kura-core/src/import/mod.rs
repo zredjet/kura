@@ -11,8 +11,11 @@ pub(crate) mod store;
 pub use job::{
     ImportFailure, ImportHandler, ImportInput, ImportResult, MAX_IMPORT_THREADS, start_import,
 };
-pub use kind::{MediaKind, classify, mime_for};
+pub use kind::{
+    KindCounts, MediaKind, Rejected, check_head, classify, classify_file, format_id, mime_for,
+};
 pub use place::{hash_file, partial_hash};
 pub use plan::{DuplicatePolicy, ImportOptions, TagName, parse_tag};
 pub use preview::{ImportPreview, preview};
+pub(crate) use scan::is_package_name;
 pub use scan::{ScanResult, ScanRoot, ScannedFile, scan};

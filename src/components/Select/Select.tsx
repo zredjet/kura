@@ -6,6 +6,8 @@ import styles from './Select.module.css';
 export interface SelectOption {
   value: string;
   label: string;
+  /** 押せない（選べない）選択肢。 */
+  disabled?: boolean;
 }
 
 interface SelectProps extends Omit<SelectHTMLAttributes<HTMLSelectElement>, 'onChange'> {
@@ -19,7 +21,7 @@ export function Select({ options, onChange, className, ...props }: SelectProps) 
     <span className={[styles.wrap, className].filter(Boolean).join(' ')}>
       <select className={styles.select} onChange={(e) => onChange(e.target.value)} {...props}>
         {options.map((o) => (
-          <option key={o.value} value={o.value}>
+          <option key={o.value} value={o.value} disabled={o.disabled}>
             {o.label}
           </option>
         ))}

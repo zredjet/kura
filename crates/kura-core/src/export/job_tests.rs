@@ -22,18 +22,38 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
+        Self::build(false)
+    }
+
+    /// エンジンの部品（偽のファクトリ。固定の段だけの組）とプロジェクトの照らし直しもある環境（M15 段 3）。
+    fn with_engine() -> Self {
+        Self::build(true)
+    }
+
+    fn build(engine: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let library = Arc::new(Library::create(&dir.path().join("L.kuralib")).unwrap());
         let sink: EventSink = Arc::new(|_| {});
-        let jobs = JobManager::new(
-            library.clone(),
-            vec![(
-                JobKind::Export,
-                Arc::new(ExportHandler) as Arc<dyn JobHandler>,
-            )],
-            sink,
-        )
-        .unwrap();
+        let services = engine.then(|| {
+            Arc::new(crate::edit::EngineServices::new(
+                Arc::new(crate::edit::services::fake::FakeEngineFactory::default()),
+                library
+                    .layout()
+                    .staging_dir()
+                    .join(crate::edit::ENGINE_WORK_DIR),
+            ))
+        });
+        let mut handlers: Vec<(JobKind, Arc<dyn JobHandler>)> = vec![(
+            JobKind::Export,
+            Arc::new(ExportHandler::new(services)) as Arc<dyn JobHandler>,
+        )];
+        if engine {
+            handlers.push((
+                JobKind::Project,
+                Arc::new(crate::project::scan::ProjectHandler) as Arc<dyn JobHandler>,
+            ));
+        }
+        let jobs = JobManager::new(library.clone(), handlers, sink).unwrap();
         jobs.start().unwrap();
         Self { dir, library, jobs }
     }
@@ -69,11 +89,21 @@ impl Env {
     }
 
     fn run(&self, dest: &std::path::Path, entries: Vec<i64>) -> (JobState, ExportResult) {
+        self.run_with(dest, entries, ExportOptions::default())
+    }
+
+    fn run_with(
+        &self,
+        dest: &std::path::Path,
+        entries: Vec<i64>,
+        options: ExportOptions,
+    ) -> (JobState, ExportResult) {
         let id = start_export(
             &self.jobs,
             &ExportInput {
                 dest: dest.to_path_buf(),
                 entries,
+                options,
             },
         )
         .unwrap();
@@ -220,6 +250,24 @@ fn counts_missing_library_files_as_failures_and_continues() {
     assert_eq!(names_in(&dest), ["b.jpg", "kura-export.json"]);
 }
 
+/// 形式を変えて上書きしたアイテム（original_name は元の拡張子のまま。M12 の段 2 の決定 10）は、語幹に今の拡張子で書き出す。
+/// 形式が同じなら（jpg と jpeg）元の名前のまま。
+#[test]
+fn exports_items_saved_in_another_format_with_the_current_extension() {
+    let env = Env::new();
+    let a = env.item("hero.psd", "png", b"a");
+    let b = env.item("photo.jpeg", "jpg", b"b");
+    let dest = env.dest("out");
+
+    let (state, result) = env.run(&dest, vec![a, b]);
+    assert_eq!(state, JobState::Done);
+    assert_eq!((result.exported, result.failed), (2, 0));
+    assert_eq!(
+        names_in(&dest),
+        ["hero.png", "kura-export.json", "photo.jpeg"]
+    );
+}
+
 #[test]
 fn rejects_a_missing_destination_and_an_empty_selection() {
     let env = Env::new();
@@ -232,6 +280,7 @@ fn rejects_a_missing_destination_and_an_empty_selection() {
             &ExportInput {
                 dest: env.dir.path().to_path_buf(),
                 entries: vec![],
+                options: ExportOptions::default(),
             },
         )
         .is_err()
@@ -259,10 +308,14 @@ fn resolves_loose_items_first_then_units_in_order() {
         [
             Group {
                 folder: None,
+                unit: None,
+                unit_id: None,
                 items: vec![b, a]
             },
             Group {
                 folder: Some("u".into()),
+                unit: Some("u".into()),
+                unit_id: groups[1].unit_id,
                 items: vec![b, a]
             },
         ]
@@ -284,4 +337,344 @@ fn place_new_picks_the_next_free_name() {
     assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"old");
     assert_eq!(std::fs::read(out.join("a 3.txt")).unwrap(), b"x");
     assert!(!out.join(".tmp.part").exists());
+}
+
+// ---- M15 段 3：名前の規則・置き換え・形式の変換・プロジェクト ----
+
+fn rule(
+    template: Option<&str>,
+    style: crate::export::names::NameStyle,
+    ascii: bool,
+) -> ExportOptions {
+    ExportOptions {
+        name: crate::export::names::NameRule {
+            template: template.map(str::to_string),
+            style,
+            ascii,
+        },
+        manifest: false,
+        ..ExportOptions::default()
+    }
+}
+
+#[test]
+fn name_rules_shape_file_and_folder_names() {
+    use crate::export::names::NameStyle;
+    let env = Env::new();
+    let a = env.item("Hero Idle.png", "png", b"a");
+    let b = env.item("夕方の空.png", "png", b"b");
+    let c = env.item("Jump Up.png", "png", b"c");
+    let unit = env
+        .library
+        .db()
+        .write(move |tx| crate::unit::create_set(tx, "Boss Fight", &[c], 1))
+        .unwrap();
+    let unit_entry = i64::from(LIST_FLAG | u32::try_from(unit).unwrap());
+    let dest = env.dest("snake");
+    let (state, result) = env.run_with(
+        &dest,
+        vec![a, b, unit_entry],
+        rule(None, NameStyle::Snake, true),
+    );
+    assert_eq!(state, JobState::Done);
+    assert_eq!((result.exported, result.manifest.as_deref()), (3, None));
+    // ASCII だけにして空になった名前は item-ID。ユニットのフォルダにも書き方を当てる
+    assert_eq!(
+        names_in(&dest),
+        ["boss_fight", "hero_idle.png", &format!("item_{b}.png")]
+    );
+    assert_eq!(names_in(&dest.join("boss_fight")), ["jump_up.png"]);
+    // テンプレート：番号は書き出す順、{ユニット} はユニットの名前
+    let dest = env.dest("template");
+    let (_, result) = env.run_with(
+        &dest,
+        vec![a, unit_entry],
+        rule(Some("{ユニット}{番号}-{名前}"), NameStyle::Kebab, false),
+    );
+    assert_eq!(result.exported, 2);
+    assert_eq!(names_in(&dest), ["001-hero-idle.png", "boss-fight"]);
+    assert_eq!(
+        names_in(&dest.join("boss-fight")),
+        ["boss-fight002-jump-up.png"]
+    );
+    // 知らない語のテンプレートは積む前に断る
+    assert!(
+        start_export(
+            &env.jobs,
+            &ExportInput {
+                dest: dest.clone(),
+                entries: vec![a],
+                options: rule(Some("{色}"), NameStyle::Keep, false),
+            },
+        )
+        .is_err()
+    );
+}
+
+/// アイテムの今の中身を差し替える（編集して上書きした形。ファイルをライブラリに置く）。
+fn rewrite(env: &Env, item: i64, body: &[u8]) {
+    let hash = *blake3::hash(body).as_bytes();
+    let path = env.library.layout().content_path(&hash, "png");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, body).unwrap();
+    let size = body.len() as i64;
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE items SET hash = ?2, size_bytes = ?3 WHERE id = ?1",
+                params![item, hash.to_vec(), size],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn files_kura_wrote_are_replaced_only_while_they_match_the_record() {
+    let env = Env::new();
+    let a = env.item("hero.png", "png", b"a");
+    let b = env.item("hero.png", "png", b"b");
+    let dest = env.dest("out");
+    let options = rule(None, crate::export::names::NameStyle::Keep, false);
+    let (_, first) = env.run_with(&dest, vec![a], options.clone());
+    assert_eq!((first.exported, first.replaced), (1, 0));
+    // 同じアイテムをもう一度：同じ中身なので書かずに同じ名前（「hero 2」にしない）
+    let (_, again) = env.run_with(&dest, vec![a], options.clone());
+    assert_eq!((again.exported, again.replaced), (1, 1));
+    assert_eq!(names_in(&dest), ["hero.png"]);
+    // 編集して中身が変わったアイテムは、記録どおりのままのファイルを置き換える
+    rewrite(&env, a, b"a2");
+    let (_, edited) = env.run_with(&dest, vec![a], options.clone());
+    assert_eq!(edited.replaced, 1);
+    assert_eq!(names_in(&dest), ["hero.png"]);
+    assert_eq!(std::fs::read(dest.join("hero.png")).unwrap(), b"a2");
+    // ほかのアイテムの同じ名前は壊さず番号を付ける
+    let (_, other) = env.run_with(&dest, vec![b], options.clone());
+    assert_eq!(other.replaced, 0);
+    assert_eq!(names_in(&dest), ["hero 2.png", "hero.png"]);
+    // 利用者が書き換えたファイルは、記録と違うので残す
+    std::fs::write(dest.join("hero.png"), b"edited by hand").unwrap();
+    rewrite(&env, a, b"a3");
+    let (_, kept) = env.run_with(&dest, vec![a], options.clone());
+    assert_eq!(kept.replaced, 0);
+    assert_eq!(
+        std::fs::read(dest.join("hero.png")).unwrap(),
+        b"edited by hand"
+    );
+    assert_eq!(std::fs::read(dest.join("hero 3.png")).unwrap(), b"a3");
+    // 取り込み元のファイル（記録がない。中身がアイテムの前の中身でも）は置き換えない
+    let source = env.dest("source");
+    std::fs::write(source.join("hero.png"), b"a2").unwrap();
+    let (_, src) = env.run_with(&source, vec![a], options.clone());
+    assert_eq!(src.replaced, 0);
+    assert_eq!(std::fs::read(source.join("hero.png")).unwrap(), b"a2");
+    assert_eq!(names_in(&source), ["hero 2.png", "hero.png"]);
+    // 同じ回に書いたほかのアイテムのファイルは、中身が同じでも置き換えない
+    let c = env.item("twin.png", "png", b"same");
+    let d = env.item("twin.png", "png", b"same2");
+    let twins = env.dest("twins");
+    let (_, both) = env.run_with(&twins, vec![c, d], options.clone());
+    assert_eq!((both.exported, both.replaced), (2, 0));
+    assert_eq!(names_in(&twins), ["twin 2.png", "twin.png"]);
+    // 読めない同じ名前のファイルは、持ち主が分からないので番号を付ける（失敗にしない）
+    let locked = env.dest("locked");
+    std::fs::write(locked.join("hero.png"), b"secret").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        locked.join("hero.png"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let (_, l) = env.run_with(&locked, vec![a], options);
+    std::fs::set_permissions(
+        locked.join("hero.png"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!((l.exported, l.failed), (1, 0));
+    assert_eq!(names_in(&locked), ["hero 2.png", "hero.png"]);
+}
+
+#[test]
+fn case_only_renames_follow_the_new_name_rule() {
+    use crate::export::names::NameStyle;
+    let env = Env::new();
+    let a = env.item("Hero.png", "png", b"a");
+    let dest = env.dest("out");
+    env.run_with(&dest, vec![a], rule(None, NameStyle::Keep, false));
+    assert_eq!(names_in(&dest), ["Hero.png"]);
+    // 書き方を snake に変えて書き出し直すと、大文字小文字だけ違う同じファイルの名前を直す
+    let (_, r) = env.run_with(&dest, vec![a], rule(None, NameStyle::Snake, false));
+    assert_eq!((r.exported, r.replaced), (1, 1));
+    assert_eq!(names_in(&dest), ["hero.png"]);
+}
+
+#[test]
+fn unit_folders_are_reused_when_kura_wrote_into_them() {
+    use crate::export::names::NameStyle;
+    let env = Env::new();
+    let a = env.item("a.png", "png", b"a");
+    let unit = env
+        .library
+        .db()
+        .write(move |tx| crate::unit::create_set(tx, "Boss Fight", &[a], 1))
+        .unwrap();
+    let entry = i64::from(LIST_FLAG | u32::try_from(unit).unwrap());
+    let dest = env.dest("out");
+    let options = rule(None, NameStyle::Snake, false);
+    env.run_with(&dest, vec![entry], options.clone());
+    // 書き出し直すと同じフォルダに書き、中のファイルは記録どおりなので置き換える
+    rewrite(&env, a, b"a2");
+    let (_, again) = env.run_with(&dest, vec![entry], options.clone());
+    assert_eq!(again.replaced, 1);
+    assert_eq!(names_in(&dest), ["boss_fight"]);
+    assert_eq!(std::fs::read(dest.join("boss_fight/a.png")).unwrap(), b"a2");
+    // Kura が書いていない同じ名前のフォルダには入らない
+    let other = env.dest("other");
+    std::fs::create_dir(other.join("boss_fight")).unwrap();
+    env.run_with(&other, vec![entry], options.clone());
+    assert_eq!(names_in(&other), ["boss_fight", "boss_fight 2"]);
+    // ASCII だけにして空になるユニット名は unit-ID に書き方を当てる
+    let b = env.item("b.png", "png", b"b");
+    let jp = env
+        .library
+        .db()
+        .write(move |tx| crate::unit::create_set(tx, "鎌倉", &[b], 1))
+        .unwrap();
+    let jp_entry = i64::from(LIST_FLAG | u32::try_from(jp).unwrap());
+    let ascii = env.dest("ascii");
+    env.run_with(&ascii, vec![jp_entry], rule(None, NameStyle::Snake, true));
+    assert_eq!(names_in(&ascii), [format!("unit_{jp}")]);
+}
+
+#[test]
+fn trashed_items_are_skipped() {
+    let env = Env::new();
+    let a = env.item("a.png", "png", b"a");
+    let b = env.item("b.png", "png", b"b");
+    env.library
+        .db()
+        .write(move |tx| {
+            tx.execute("UPDATE items SET trashed_at = 5 WHERE id = ?1", [b])?;
+            Ok(())
+        })
+        .unwrap();
+    let dest = env.dest("out");
+    let (state, r) = env.run_with(
+        &dest,
+        vec![a, b],
+        rule(None, crate::export::names::NameStyle::Keep, false),
+    );
+    assert_eq!(state, JobState::Done);
+    assert_eq!((r.exported, r.skipped, r.failed), (1, 1, 0));
+    assert_eq!(names_in(&dest), ["a.png"]);
+}
+
+/// 偽のエンジンの固定の段で書いた小さな PNG。
+fn sprite_png() -> Vec<u8> {
+    use kura_engine::testgen::InputGen;
+    use kura_engine::value::PixelFormat;
+    let value = InputGen::PixelSprite {
+        w: 16,
+        h: 12,
+        fmt: PixelFormat::Rgba8,
+        seed: 3,
+    }
+    .generate()
+    .unwrap();
+    kura_engine::codec::CodecSet::pinned()
+        .encode_bytes(
+            &value,
+            "png",
+            &serde_json::json!({}),
+            &kura_engine::NoMonitor,
+        )
+        .unwrap()
+        .0
+}
+
+#[test]
+fn converted_exports_are_rendered_recorded_and_matched_in_projects() {
+    use crate::export::formats::FormatTarget;
+    let env = Env::with_engine();
+    let a = env.item("hero.png", "png", &sprite_png());
+    let game = env.dest("game");
+    std::fs::write(game.join("project.godot"), b"").unwrap();
+    std::fs::create_dir_all(game.join("art")).unwrap();
+    let project = {
+        let existing = env.library.db().read(crate::project::list).unwrap();
+        let (root, engine) =
+            crate::project::prepare_root(&game, env.library.layout().root(), &existing, None)
+                .unwrap();
+        env.library
+            .db()
+            .write(move |tx| crate::project::add(tx, &root, engine, None, 1))
+            .unwrap()
+    };
+    let mut options =
+        crate::export::ExportPreset::for_engine(crate::project::Engine::Godot).options(project);
+    options.image = FormatTarget::To {
+        format: "webp".into(),
+    };
+    let (state, result) = env.run_with(&game.join("art"), vec![a], options.clone());
+    assert_eq!(state, JobState::Done);
+    assert_eq!(
+        (result.exported, result.converted, result.manifest),
+        (1, 1, None)
+    );
+    let out = std::fs::read(game.join("art/hero.webp")).unwrap();
+    assert_eq!(&out[..4], b"RIFF");
+    assert_eq!(&out[8..12], b"WEBP");
+    // 形式を変えた出力の中身を記録し、プロジェクトの照らし直しが「持ち出した出力」として付ける
+    let out_hash = blake3::hash(&out).as_bytes().to_vec();
+    let recorded: i64 = env
+        .library
+        .db()
+        .read(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM item_outputs WHERE hash = ?1 AND item_id = ?2",
+                params![out_hash, a],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(recorded, 1);
+    assert!(env.jobs.wait_idle(WAIT));
+    let used = env
+        .library
+        .db()
+        .read(move |c| crate::project::used_items(c, project))
+        .unwrap();
+    assert_eq!(used, vec![a]);
+    // 同じ設定でもう一度書き出すと同じバイト列で、書かずに置き換えたことにする
+    let (_, again) = env.run_with(&game.join("art"), vec![a], options);
+    assert_eq!((again.converted, again.replaced), (1, 1));
+    assert_eq!(std::fs::read(game.join("art/hero.webp")).unwrap(), out);
+    assert_eq!(names_in(&game.join("art")), ["hero.webp"]);
+    // 変えない（書けない形式だけ変える）：PNG は書けるのでそのまま写す
+    let mut keep = rule(None, crate::export::names::NameStyle::Keep, false);
+    keep.image = FormatTarget::Playable;
+    let plain = env.dest("plain");
+    let (_, copied) = env.run_with(&plain, vec![a], keep);
+    assert_eq!(copied.converted, 0);
+    assert_eq!(std::fs::read(plain.join("hero.png")).unwrap(), sprite_png());
+}
+
+#[test]
+fn converting_without_an_engine_fails_that_item() {
+    use crate::export::formats::FormatTarget;
+    let env = Env::new();
+    let a = env.item("hero.png", "png", b"a");
+    let b = env.item("photo.webp", "webp", b"b");
+    let mut options = rule(None, crate::export::names::NameStyle::Keep, false);
+    options.image = FormatTarget::To {
+        format: "webp".into(),
+    };
+    let dest = env.dest("out");
+    let (state, result) = env.run_with(&dest, vec![a, b], options);
+    assert_eq!(state, JobState::Done);
+    // 形式を変える 1 件は描けずに失敗し、同じ形式の 1 件はそのまま写す
+    assert_eq!((result.exported, result.failed), (1, 1));
+    assert_eq!(names_in(&dest), ["photo.webp"]);
 }

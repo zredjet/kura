@@ -14,10 +14,12 @@ import { SparkleIcon } from '../../components/icons/SparkleIcon';
 import { TagIcon } from '../../components/icons/TagIcon';
 import { ja } from '../../i18n/ja';
 import { type ListView, utcOffsetMinutes } from '../../ipc/items';
+import { kindBreakdown } from '../../ipc/kinds';
 import { type QueryCheckDto, querySuggest, queryParse, type SuggestionDto } from '../../ipc/search';
 import { formatCount } from '../../lib/format';
 import { useSearchStore } from '../../stores/searchStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
+import { useProjectStore } from '../projects/projectStore';
 import { useViewStore } from '../../stores/viewStore';
 import { viewTitle } from '../library/viewTitle';
 import { startPlayback } from '../player/playerActions';
@@ -204,7 +206,7 @@ function PaletteBody() {
         collapseUnits,
         utcOffsetMinutes: utcOffsetMinutes(),
       },
-      viewTitle(scope, folders, smartFolders),
+      viewTitle(scope, folders, smartFolders, useProjectStore.getState().list),
       { shuffle: true },
     );
   };
@@ -284,16 +286,11 @@ function PaletteBody() {
   });
 
   const counts = check?.counts ?? null;
+  // 解析で決まるフィールドを使っていて、解析がまだで一致が決まっていないものがあるときだけ（design.md §3.1）
+  const unanalyzed = check?.unanalyzed ?? 0;
   const breakdown = counts
-    ? (
-        [
-          [ja.kinds.image, counts.image],
-          [ja.kinds.video, counts.video],
-          [ja.kinds.audio, counts.audio],
-        ] as const
-      )
-        .filter(([, n]) => n > 0)
-        .map(([label, n]) => `${label} ${formatCount(n)}`)
+    ? kindBreakdown(counts)
+        .map(({ label, count }) => `${label} ${formatCount(count)}`)
         .join(' · ')
     : '';
 
@@ -409,7 +406,16 @@ function PaletteBody() {
               {error.message}
             </span>
           ) : (
-            suggestions.length > 0 && draft && <span className={styles.statusHint}>{t.typing}</span>
+            <span className={styles.statusEnd}>
+              {unanalyzed > 0 && (
+                <span className={styles.statusHint} title={t.unanalyzedHint}>
+                  {t.unanalyzed(formatCount(unanalyzed))}
+                </span>
+              )}
+              {suggestions.length > 0 && draft && (
+                <span className={styles.statusHint}>{t.typing}</span>
+              )}
+            </span>
           )}
         </div>
 
@@ -440,7 +446,8 @@ function PaletteBody() {
                       {s.prefix && <span className={styles.chipPrefix}>{s.prefix}</span>}
                       {s.label}
                     </span>
-                    {s.kind === 'saved' && s.detail && (
+                    {/* 保存済みの検索は条件、比較だけのフィールド（ラウドネスなど）は書き方の例 */}
+                    {(s.kind === 'saved' || s.kind === 'field') && s.detail && (
                       <span className={styles.optionQuery}>{s.detail}</span>
                     )}
                   </span>

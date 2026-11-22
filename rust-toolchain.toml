@@ -1,0 +1,5 @@
+# Rust の版を固定する（ADR-165）。CI（.github/workflows/ci.yml）と Cargo.toml の rust-version もこの版に合わせる。
+# ファズは `cargo +nightly fuzz …` で nightly を明示して使う（fuzz/README.md）。
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

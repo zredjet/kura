@@ -89,6 +89,28 @@ fn example_type_list() {
     );
 }
 
+/// フォント・3D（M11）。日本語の語は「フォント」「3D」（`3d` も）、英語は `font`・`model`。
+#[test]
+fn type_field_accepts_font_and_model() {
+    let kinds = |value: Vec<KindValue>| field(FieldCond::Type { op: Op::Has, value });
+    assert_eq!(ok("種類:フォント"), kinds(vec![KindValue::Font]));
+    assert_eq!(ok("種類:3D"), kinds(vec![KindValue::Model]));
+    assert_eq!(ok("種類:3d"), kinds(vec![KindValue::Model]));
+    assert_eq!(ok("type:font"), kinds(vec![KindValue::Font]));
+    assert_eq!(ok("TYPE:Model"), kinds(vec![KindValue::Model]));
+    assert_eq!(
+        ok("種類:画像,フォント,3D"),
+        kinds(vec![KindValue::Image, KindValue::Font, KindValue::Model])
+    );
+    // AST の JSON の名前は items.kind と同じ
+    assert_eq!(
+        serde_json::to_value(ok("種類:フォント,3D")).unwrap(),
+        serde_json::json!({ "field": "type", "op": "has", "value": ["font", "model"] })
+    );
+    let err = parse("種類:3Dモデル").unwrap_err();
+    assert!(err.message.contains("フォント・3D"), "{}", err.message);
+}
+
 #[test]
 fn example_rating_comparison() {
     assert_eq!(
@@ -526,4 +548,316 @@ fn splits_top_level_clauses_for_chips() {
     let parsed = parse("海 | 港").unwrap();
     assert_eq!(parsed.clauses.len(), 1);
     assert!(parse("").unwrap().clauses.is_empty());
+}
+
+// ---- 素材の事実のフィールド（M11。search-query.md §3） ----
+
+fn cond(input: &str) -> FieldCond {
+    match ok(input) {
+        Expr::Field(cond) => cond,
+        other => panic!("{input}: {other:?}"),
+    }
+}
+
+/// エラーの位置と理由。
+fn err_of(input: &str) -> ((usize, usize), String) {
+    match parse(input) {
+        Ok(parsed) => panic!("「{input}」はエラーになるはず: {:?}", parsed.expr),
+        Err(err) => ((err.start, err.end), err.message),
+    }
+}
+
+#[test]
+fn image_fact_fields_parse() {
+    use FieldCond::*;
+    for (input, op, value) in [
+        ("透過:あり", Op::Has, AlphaSpec::Any),
+        ("透過:なし", Op::Has, AlphaSpec::None),
+        ("透過:半透明", Op::Has, AlphaSpec::Partial),
+        ("alpha=binary", Op::Eq, AlphaSpec::Binary),
+        ("透過:二値", Op::Has, AlphaSpec::Binary),
+        ("透過!=あり", Op::Ne, AlphaSpec::Any),
+    ] {
+        assert_eq!(cond(input), Alpha { op, value }, "{input}");
+    }
+    assert_eq!(
+        cond("ドット絵:あり"),
+        Pixel {
+            op: Op::Has,
+            value: true
+        }
+    );
+    assert_eq!(
+        cond("PIXEL:no"),
+        Pixel {
+            op: Op::Has,
+            value: false
+        }
+    );
+    assert_eq!(
+        cond("色数<=16"),
+        Colors {
+            op: Op::Le,
+            value: 16
+        }
+    );
+    assert_eq!(
+        cond("colors>256"),
+        Colors {
+            op: Op::Gt,
+            value: 256
+        }
+    );
+    assert_eq!(
+        cond("2のべき乗:あり"),
+        Pot {
+            op: Op::Has,
+            value: true
+        }
+    );
+    assert_eq!(
+        cond("pot!=yes"),
+        Pot {
+            op: Op::Ne,
+            value: true
+        }
+    );
+    assert_eq!(
+        cond("アニメ:なし"),
+        Anim {
+            op: Op::Has,
+            value: false
+        }
+    );
+}
+
+#[test]
+fn audio_fact_fields_parse() {
+    use FieldCond::*;
+    // レート：Hz の整数。「44.1k」「48kHz」も受ける
+    for (input, op, value) in [
+        ("レート:44100", Op::Has, 44_100),
+        ("レート:44.1k", Op::Has, 44_100),
+        ("レート>=48kHz", Op::Ge, 48_000),
+        ("rate=22.05khz", Op::Eq, 22_050),
+        ("レート<96000Hz", Op::Lt, 96_000),
+    ] {
+        assert_eq!(cond(input), Rate { op, value }, "{input}");
+    }
+    assert_eq!(
+        cond("ビット:24"),
+        Bits {
+            op: Op::Has,
+            value: 24
+        }
+    );
+    assert_eq!(
+        cond("bits>=24bit"),
+        Bits {
+            op: Op::Ge,
+            value: 24
+        }
+    );
+    // チャンネル：数のほか、ステレオ・モノラル
+    for (input, op, value) in [
+        ("チャンネル:ステレオ", Op::Has, 2),
+        ("ch=モノラル", Op::Eq, 1),
+        ("チャンネル>2", Op::Gt, 2),
+    ] {
+        assert_eq!(cond(input), Ch { op, value }, "{input}");
+    }
+    // ラウドネス・ピーク：1/1000 の整数（0 から遠い方へ丸める）。U+2212 の「−」も受ける
+    for (input, op, value) in [
+        ("ラウドネス>-14", Op::Gt, -14_000),
+        ("ラウドネス>−14.2", Op::Gt, -14_200),
+        ("ラウドネス<=\"−23\"", Op::Le, -23_000),
+        ("lufs<=-23.0004", Op::Le, -23_000),
+        ("lufs<=-23.0005", Op::Le, -23_001),
+        ("LUFS>=-16LUFS", Op::Ge, -16_000),
+        ("ラウドネス<0.5", Op::Lt, 500),
+    ] {
+        assert_eq!(cond(input), Lufs { op, value }, "{input}");
+    }
+    assert_eq!(
+        cond("ピーク>-1"),
+        Peak {
+            op: Op::Gt,
+            value: -1_000
+        }
+    );
+    assert_eq!(
+        cond("peak>=-0.3dBTP"),
+        Peak {
+            op: Op::Ge,
+            value: -300
+        }
+    );
+    assert_eq!(
+        cond("ループ:あり"),
+        Loop {
+            op: Op::Has,
+            value: true
+        }
+    );
+    assert_eq!(
+        cond("loop!=なし"),
+        Loop {
+            op: Op::Ne,
+            value: false
+        }
+    );
+}
+
+#[test]
+fn fact_field_errors_point_at_the_value() {
+    for (input, span, word) in [
+        // ラウドネス・ピークは大小の比較だけ
+        ("ラウドネス:-14", (6, 9), "大小"),
+        ("ピーク=-1", (4, 6), "大小"),
+        ("ラウドネス!=-14", (7, 10), "大小"),
+        // あり・なしのフィールドは大小を比べられない
+        ("透過>1", (3, 4), "大小"),
+        ("ループ<=1", (5, 6), "大小"),
+        ("色数<=abc", (4, 7), "色数"),
+        ("ラウドネス>inf", (6, 9), "ラウドネス"),
+        ("ラウドネス>1e3", (6, 9), "ラウドネス"),
+        ("ラウドネス>NaN", (6, 9), "ラウドネス"),
+        ("ラウドネス>-99999", (6, 12), "ラウドネス"),
+        ("レート:0", (4, 5), "レート"),
+        ("レート:44.1005k", (4, 12), "レート"),
+        ("レート:-48k", (4, 8), "レート"),
+        ("ビット:0", (4, 5), "ビット"),
+        ("チャンネル:サラウンド", (6, 11), "チャンネル"),
+        ("透過:まだら", (3, 6), "透過"),
+        ("アニメ:たぶん", (4, 7), "アニメ"),
+    ] {
+        let (at, message) = err_of(input);
+        assert_eq!(at, span, "{input}: {message}");
+        assert!(message.contains(word), "{input}: {message}");
+    }
+}
+
+#[test]
+fn fact_fields_are_fields_not_namespaces() {
+    // 「透過:あり」は名前空間「透過」のタグではない（フロントの isTagTerm もこの表を読む）
+    for input in [
+        "透過:あり",
+        "ドット絵:あり",
+        "色数<=16",
+        "2のべき乗:あり",
+        "レート:48k",
+        "ビット:16",
+        "チャンネル:ステレオ",
+        "ラウドネス>-14",
+        "ピーク>-1",
+        "ループ:あり",
+        "アニメ:あり",
+    ] {
+        let parsed = parse(input).unwrap();
+        assert!(matches!(parsed.expr, Expr::Field(_)), "{input}");
+        assert!(parsed.clauses[0].field.is_some(), "{input}");
+    }
+    // 除外とチップ
+    let parsed = parse("-透過:あり ループ:あり").unwrap();
+    let fields: Vec<(bool, Option<&str>)> = parsed
+        .clauses
+        .iter()
+        .map(|c| (c.negated, c.field))
+        .collect();
+    assert_eq!(fields, vec![(true, Some("alpha")), (false, Some("loop"))]);
+}
+
+#[test]
+fn kind_lists_accept_japanese_commas() {
+    // 読点「、」と全角の「，」は「,」と同じ（字句解析で直す。search-query.md §3）
+    let kinds = |value: Vec<KindValue>| field(FieldCond::Type { op: Op::Has, value });
+    assert_eq!(
+        ok("種類:画像、動画"),
+        kinds(vec![KindValue::Image, KindValue::Video])
+    );
+    assert_eq!(
+        ok("種類:音楽，フォント"),
+        kinds(vec![KindValue::Audio, KindValue::Font])
+    );
+}
+
+// ---- クレジットのフィールド（M15 段 1。search-query.md §3） ----
+
+#[test]
+fn credit_fields_parse() {
+    use super::ast::{AttributionSpec, LicenseSpec};
+    use FieldCond::*;
+    for (input, op, value) in [
+        ("ライセンス:あり", Op::Has, LicenseSpec::Any),
+        ("ライセンス:なし", Op::Has, LicenseSpec::None),
+        ("ライセンス:未設定", Op::Has, LicenseSpec::None),
+        ("license=NONE", Op::Eq, LicenseSpec::None),
+        (
+            "ライセンス:\"CC BY 4.0\"",
+            Op::Has,
+            LicenseSpec::Name("CC BY 4.0".into()),
+        ),
+        (
+            "ライセンス!=CC-BY-SA-4.0",
+            Op::Ne,
+            LicenseSpec::Name("CC-BY-SA-4.0".into()),
+        ),
+    ] {
+        assert_eq!(cond(input), License { op, value }, "{input}");
+    }
+    for (input, op, value) in [
+        ("表記:必要", Op::Has, AttributionSpec::Required),
+        ("表記:必須", Op::Has, AttributionSpec::Required),
+        ("表記=任意", Op::Eq, AttributionSpec::Optional),
+        ("attribution!=none", Op::Ne, AttributionSpec::None),
+    ] {
+        assert_eq!(cond(input), Attribution { op, value }, "{input}");
+    }
+    assert_eq!(
+        cond("クレジット:もりの"),
+        Credit {
+            op: Op::Has,
+            value: "もりの".into()
+        }
+    );
+    // 大小の比較と、表記の知らない語は断る。空の値も断る
+    assert!(err_of("ライセンス>CC0").1.contains("大小"));
+    assert!(err_of("表記:たぶん").1.contains("必要・任意・不要"));
+    assert!(err_of("クレジット:\"\"").1.contains("値を入力"));
+    // 「作者:」は今までどおり名前空間付きのタグ
+    assert_eq!(
+        ok("作者:もりの"),
+        Expr::Tag(TagTerm {
+            ns: "作者".into(),
+            name: "もりの".into()
+        })
+    );
+}
+
+/// クレジットのフィールドの AST は JSON（スマートの rule_json）で往復し、形は search-query.md §4 のとおり。
+#[test]
+fn credit_fields_round_trip_as_json() {
+    for (input, json) in [
+        (
+            "ライセンス:\"CC BY\"",
+            r#"{"field":"license","op":"has","value":{"name":"CC BY"}}"#,
+        ),
+        (
+            "ライセンス:なし",
+            r#"{"field":"license","op":"has","value":"none"}"#,
+        ),
+        (
+            "表記!=必要",
+            r#"{"field":"attribution","op":"ne","value":"required"}"#,
+        ),
+        (
+            "クレジット=もりの",
+            r#"{"field":"credit","op":"eq","value":"もりの"}"#,
+        ),
+    ] {
+        let expr = ok(input);
+        assert_eq!(serde_json::to_string(&expr).unwrap(), json, "{input}");
+        let back: Expr = serde_json::from_str(json).unwrap();
+        assert_eq!(back, expr, "{input}");
+    }
 }

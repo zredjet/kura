@@ -50,6 +50,20 @@
   height: 32px;
 }
 
+/* 画像エディタを開く（M12。画像のときだけ） */
+.edit {
+  height: 32px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--fill-2);
+  color: var(--text-primary);
+  font-size: var(--text-md);
+}
+
+.edit:hover {
+  background: var(--fill-3);
+}
+
 .close:hover,
 .nav:not(:disabled):hover {
   background: var(--fill-3);
@@ -84,6 +98,32 @@
   object-fit: cover;
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-media);
+}
+
+/* フォント・3D のサムネイル（フォントは字の形の mask、3D は透明の地に描いたもの）。影は付けず、枠に収める */
+.asset {
+  width: min(100%, 720px);
+  height: min(100%, 720px);
+  object-fit: contain;
+}
+
+/* 音声の波形（M11。インスペクタと同じ部品を大きく） */
+.wave {
+  width: min(520px, 80vw);
+  height: 72px;
+  color: var(--text-secondary);
+}
+
+/* フォントの見本（M11。地はクイックルックの黒のまま） */
+.specimen {
+  width: min(720px, 80vw);
+  height: min(360px, 60vh);
+}
+
+/* フォント・3D の種類の絵（クイックルックでは大きめに） */
+.stage .kindArt svg {
+  max-width: 120px;
+  max-height: 120px;
 }
 
 .nav {
