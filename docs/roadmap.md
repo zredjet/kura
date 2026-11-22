@@ -308,3 +308,29 @@
 
 **依頼文**
 > docs/roadmap.md の M15 を進めてください。仕様の判断が要る点（ライセンスの持ち方・プロジェクトの扱い）は、最初に案を出して私の承認を待ってください。
+
+---
+
+## M16　依存の自作化（音声の読み取り・可逆の圧縮・DevTools の通り道）
+
+- [ ] 音声の読み取り（FLAC・Ogg Vorbis・MP4 の ALAC と AAC-LC・ADTS の AAC-LC）を自作に替え、symphonia（third_party の写し 4 つを含む）を外す
+- [ ] 可逆の圧縮（inflate・deflate・LZW）を自作し、PNG・GIF の読み書きと aseprite・PSD の展開を替える
+- [ ] キャプチャの DevTools の WebSocket と、FLAC の MD5 を自作に替える
+
+**段**（2026-11-22 の計画。ADR-216。各段は実装 → /verify → 検証のワークフロー → 直し → コミット。どの段も、外す依存をdev 依存の照合の相手に残し、フィクスチャ・コーパス・差分のファズで一致を確かめてから差し替える）：
+- [ ] 段 1 FLAC の読み取りと MD5：自作の FLAC のデコーダ（STREAMINFO・SEEKTABLE・VORBIS_COMMENT・PICTURE、CONSTANT・VERBATIM・FIXED・LPC、Rice の 2 種、左右の相関 3 種、フレームの CRC-8・CRC-16、可変のブロック）。値は仕様で 1 つに決まるので識別子は `flac-symphonia-dec/1` のまま。MD5 は `codec/md5.rs`（RFC 1321 のテストベクタと、他のツールで作ったフィクスチャの STREAMINFO の MD5 で照らす）にし、書き出しの STREAMINFO もこれで書いて md-5 を外す
+- [ ] 段 2 Ogg の読み口と Vorbis の読み取り：Ogg のページ（CRC・ページをまたぐパケット・グラニュール・途中の切れ）とVorbis（識別・コメント・setup の codebook・floor 0/1・residue 0/1/2・mapping・mode、逆 MDCT・窓・重ね合わせ）。超越関数は `math` だけ。識別子は新しく `ogg-vorbis-kura-dec/1`、旧版 `ogg-vorbis-symphonia-dec/3` は `legacy` の読み手に移す（段 10 まで）。照合は lewton・ffmpeg（フィクスチャ）と自作のエンコーダの出力（`ogg-vorbis-kura-enc@1.jsonl`に、新しい読み手で読み直した行を新しい名前で足す）。Opus・FLAC の Ogg は形式の表どおり次の段へ回す
+- [ ] 段 3 MP4 の読み口と ALAC：箱（ftyp・moov・trak・mdia・minf・stbl の stsd・stts・stsc・stsz・stz2・stco・co64、edts の elst、udta・meta の ilst、iTunSMPB）を上限つきで読み、`held_bytes` を数え直す。ALAC（整数）は`m4a-alac-symphonia-dec/1` のまま
+- [ ] 段 4 AAC-LC：ADTS と MP4 の esds（AudioSpecificConfig）、SCE・CPE・LFE・DSE・PCE・FIL、ハフマン、逆量子化、スケールファクター、M/S・intensity、PNS、TNS、サイン・KBD の窓、逆 MDCT。SBR・PS は見つけて断る（HE-AAC は今どおり AudioToolbox へ）。表は新しいクレート `aac-tables`（symphonia-codec-aac から元の MPL-2.0 のまま写す。vorbis-tables と同じ形）。識別子は新しく `m4a-aac-kura-dec/1`・`aac-adts-kura-dec/1`、旧版は段 2 と同じ扱い。照合は ffmpeg・AudioToolbox（フィクスチャ）
+- [ ] 段 5 旧版の Vorbis・AAC をアンカーへ移す：旧版の読み手で読んだ版の入力のうちアンカーのないものに、旧版の読み手で1 度だけアンカーを作るジョブ（読み直して記録の値のダイジェストと照らす。ライブラリを開いたときに積む。中止・再開できる）。旧識別子が記録されているほかの所（解析の事実・サムネイル・波形の指紋など）を洗い出し、読み直しで済むものとアンカーが要るものを分ける
+- [ ] 段 6 inflate と PNG・aseprite・PSD の読み取り：CRC-32・Adler-32・inflate（stored・固定・動的ハフマン、上限つきの出力、流して展開、中止）、PNG の IDAT（フィルタ 5 種・Adam7・ビット深度 1〜16）。値は同じなので `png-rs-dec/1`・`/2` のまま（アンカーの中身の読み手も同じ）。aseprite・PSD の zlib の展開もこれにし、直接の miniz_oxide を外す。速さは今の png（fdeflate）と比べ、NFR-14 を満たす
+- [ ] 段 7 deflate と PNG・APNG の書き出し：fast・balanced・high の 3 段を自分の式で凍結（一致の探し方・遅延一致・ブロックの切り方・ハフマンの作り方・フィルタの選び方）、APNG の acTL・fcTL・fdAT。識別子は `png-kura-enc/1`（旧`png-rs-enc/1` は残さない。§8.4）。balanced の大きさは今の png の 5% 増しまで（コーパスで測って記録）。直接の png を外す（resvg 経由では残る）
+- [ ] 段 8 GIF の読み書き：読み口（論理画面・色表・GCE・NETSCAPE2.0 の繰り返し・インターレース・ブロックの継ぎ）とLZW の読み書き（表が満ちたときの clear を自分の規則で凍結）。読みは `gif-rs-dec/1` のまま、書きは `gif-kura-enc/1`。gif・weezl を外す
+- [ ] 段 9 DevTools の WebSocket：`capture/ws.rs`（クライアントの握手（Sec-WebSocket-Accept を SHA-1 で照らす）、マスク（鍵は種つきの ChaCha8。種は `/dev/urandom`）、テキスト・分割・ping・pong・close、今の tungstenite の既定と同じフレーム 16 MiB・メッセージ 64 MiB の上限）と SHA-1（RFC 3174 のテストベクタ）。tungstenite は dev 依存に移し、テストの偽のサーバー兼照合の相手にする。本番から tungstenite と、ほかに使う所のない 10 クレート（data-encoding・httparse・rand 0.10・chacha20・sha1・digest 0.11・block-buffer・crypto-common・hybrid-array・const-oid）が消える（段 1 の md-5 と合わせて 12）
+- [ ] 段 10 symphonia を外す：段 5 のジョブを利用者のライブラリで回し終えてから、symphonia の 7 クレート・third_party の写し 4 つ・`[patch.crates-io]`（ワークスペースと fuzz）・旧版の Vorbis・AAC の読み手を外す。旧識別子の版はアンカーから作り直す（アンカーがなければ `DecoderGone`）
+- [ ] 段 11 計測と締め：依存の数・ビルドの時間・リリースのバイナリの大きさの前後、NFR-14・NFR-15・60 分の音声の保存・`mem_smoke`・`bench edit`、長いファズ（cargo-fuzz）、第三者のライセンスの一覧、architecture.md §13 の実測
+
+**完了条件**：symphonia・md-5・gif・weezl・tungstenite が本番の依存から消え、png・miniz_oxide は直接の依存でなくなる／値が同じはずの読み手（FLAC・ALAC・PNG・GIF）が、ゴールデン・コーパス・差分のファズで旧実装と一致する／旧版の Vorbis・AAC で読んだ版をアンカーから作り直せる／NFR-14・NFR-15 を満たす
+
+**依頼文**
+> docs/roadmap.md の M16 を進めてください。段ごとに計画を出し、仕様の判断が要る点は私の承認を待ってください。
