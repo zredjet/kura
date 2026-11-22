@@ -199,7 +199,8 @@ mod tests {
     /// M13 段 3：流して書く口（`CodecSet::encode_stream`。値の生産者）でも、値を書いたものと同じ形の m4a（backend には同じ
     /// 4,096 フレームずつ渡る）。AudioToolbox は呼び出しの道によって最後のパケットのバイト列が変わることがある（同じ道なら
     /// 同じ。R2 は約束しない）ので、固定の段の読み取りで読み直した長さと音が同じことを確かめる。値のダイジェストは流した
-    /// 標本のもの。
+    /// 標本のもの。書いたバイト数は比べない（macOS 26.7.2 では最後のパケットの長さが 1 バイト違った。26.7 では同じ。
+    /// ADR-213）。記録のバイト数が、それぞれ実際に書いた長さと合うことだけを確かめる。
     #[test]
     fn streamed_aac_equals_encode_here() {
         let _g = shared();
@@ -217,10 +218,14 @@ mod tests {
                 .encode_stream(&mut producer, "m4a", &json!({}), &mut out, &NoMonitor)
                 .unwrap();
             let got = out.into_inner();
-            assert_eq!(got.len(), want.len(), "{rate} {channels} {frames}");
             assert_eq!(
-                (se.codec.as_str(), se.tier, se.bytes),
-                (stamp.codec.as_str(), stamp.tier, stamp.bytes)
+                (se.codec.as_str(), se.tier),
+                (stamp.codec.as_str(), stamp.tier)
+            );
+            assert_eq!(
+                (se.bytes, stamp.bytes),
+                (got.len() as u64, want.len() as u64),
+                "{rate} {channels} {frames}"
             );
             assert_eq!(se.value_digest, src.digest().unwrap());
             let (x, _) = decode(&pinned, &got, "m4a").unwrap();
