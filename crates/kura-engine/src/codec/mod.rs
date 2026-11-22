@@ -649,13 +649,18 @@ impl CodecSet {
                 aiff.clone(),
                 flac.clone(),
                 Arc::new(mp3::Mp3Codec),
-                Arc::new(lossy::SymphoniaDecoder::ogg_vorbis()),
+                Arc::new(vorbis::dec::VorbisDecoder),
                 Arc::new(lossy::SymphoniaDecoder::m4a_alac()),
                 Arc::new(lossy::SymphoniaDecoder::m4a_aac()),
                 Arc::new(lossy::SymphoniaDecoder::adts_aac()),
                 Arc::new(anchor::AnchorDecoder),
             ],
-            legacy_decoders: png::legacy_decoders(),
+            // 旧版：PNG の /1 と、M16 段 2 で自作に替えた Ogg Vorbis の symphonia（/3。段 10 でアンカーに移してから外す。ADR-216・217）
+            legacy_decoders: {
+                let mut v = png::legacy_decoders();
+                v.push(Arc::new(lossy::SymphoniaDecoder::ogg_vorbis()) as Arc<dyn Decoder>);
+                v
+            },
             encoders: vec![
                 png,
                 jpeg,

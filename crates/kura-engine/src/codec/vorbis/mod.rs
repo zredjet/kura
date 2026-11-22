@@ -202,6 +202,7 @@
 pub(crate) mod bitpack;
 pub(crate) mod block;
 pub(crate) mod codebook;
+pub(crate) mod dec;
 pub(crate) mod encoder;
 pub(crate) mod envelope;
 pub(crate) mod floor1;

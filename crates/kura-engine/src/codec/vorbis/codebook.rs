@@ -92,7 +92,10 @@ pub(crate) fn make_words(l: &[u8], n: i64, sparsecount: i64) -> Result<Vec<u32>,
     } else {
         n
     };
-    let mut r = vec![0u32; size];
+    let mut r = Vec::new();
+    r.try_reserve_exact(size)
+        .map_err(|_| EngineError::Limit("codebook の符号語の表を確保できません".into()))?;
+    r.resize(size, 0u32);
     let mut marker = [0u32; 33];
     let mut count = 0usize;
 

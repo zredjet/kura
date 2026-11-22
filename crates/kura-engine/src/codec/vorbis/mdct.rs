@@ -13,6 +13,7 @@
 //! | `mdct_butterflies` | 1105–1135 | `stages = log2n - 5` |
 //! | `mdct_bitreverse` | 1155–1274（#else 1228–1272） | |
 //! | `mdct_forward` | 1799–1869（`#else` の側） | 作業領域 `w` は n 個。`out[i] = (w[0]*T[0]+w[1]*T[1])*scale` の順で掛ける |
+//! | `mdct_backward` | 1276–1280・1537–1627（`#else` の側） | デコーダ（M16 段 2。ADR-217）。C の呼び手（mapping0.c:1572）は入力と出力に同じ配列を渡すので、同じ配列の上で C と同じ順に読み書きする（[`mdct_backward`]） |
 //!
 //! - `MULT_NORM(x)`・`FLOAT_CONV(x)` は何もしない（mdct.h:48–49）。`HALVE(x)` は `x*.5f`。
 //! - 式の中の演算の順・どれを先に掛けるかを変えない（例：1824 行 `r1*T[1] + r0*T[0]`）。FMA にしない。
@@ -21,7 +22,7 @@
 //!
 //! # 移さないもの
 //!
-//! `mdct_backward`（デコーダ）、SSE の枝と `mdct_butterfly_first_backward`・`mdct_butterflies_backward`（93–403・667–799・
+//! SSE の枝と `mdct_butterfly_first_backward`・`mdct_butterflies_backward`（93–403・667–799・
 //! 1082–1103）、`mdct_clear`。
 //!
 //! # 型の対応
@@ -468,6 +469,116 @@ pub(crate) fn mdct_forward_with(init: &MdctLookup, input: &[f32], out: &mut [f32
         out[i] = (a * trig[ti] + b * trig[ti + 1]) * scale;
         out[xo] = (a * trig[ti + 1] - b * trig[ti]) * scale;
         ti += 2;
+    }
+}
+
+/// `mdct_backward`（mdct.c:1276–1280・1537–1627 の SSE でない経路）。入力（前半 `n/2` 個）と出力（`n` 個）は同じ配列
+/// （C の呼び手 `mapping0_inverse` の `mdct_backward(b->transform[vb->W][0],pcm,pcm)`）。長さが足りないときは何もしない。
+pub(crate) fn mdct_backward(init: &MdctLookup, x: &mut [f32]) {
+    if !lookup_is_valid(init) {
+        return;
+    }
+    let n = init.n as usize;
+    let n2 = n >> 1;
+    let n4 = n >> 2;
+    if x.len() < n {
+        return;
+    }
+    let t = &init.trig;
+
+    // rotate
+    let mut ix = n2 as isize - 7;
+    let mut ox = n2 + n4;
+    let mut ti = n4;
+    loop {
+        ox -= 4;
+        let i = ix as usize;
+        x[ox] = -x[i + 2] * t[ti + 3] - x[i] * t[ti + 2];
+        x[ox + 1] = x[i] * t[ti + 3] - x[i + 2] * t[ti + 2];
+        x[ox + 2] = -x[i + 6] * t[ti + 1] - x[i + 4] * t[ti];
+        x[ox + 3] = x[i + 4] * t[ti + 1] - x[i + 6] * t[ti];
+        ix -= 8;
+        ti += 4;
+        if ix < 0 {
+            break;
+        }
+    }
+    let mut ix = n2 as isize - 8;
+    let mut ox = n2 + n4;
+    let mut ti = n4;
+    loop {
+        ti -= 4;
+        let i = ix as usize;
+        x[ox] = x[i + 4] * t[ti + 3] + x[i + 6] * t[ti + 2];
+        x[ox + 1] = x[i + 4] * t[ti + 2] - x[i + 6] * t[ti + 3];
+        x[ox + 2] = x[i] * t[ti + 1] + x[i + 2] * t[ti];
+        x[ox + 3] = x[i] * t[ti] - x[i + 2] * t[ti + 1];
+        ix -= 8;
+        ox += 4;
+        if ix < 0 {
+            break;
+        }
+    }
+
+    mdct_butterflies(init, &mut x[n2..n], n2 as i32);
+    mdct_bitreverse(init, x);
+
+    // roatate + window
+    let mut ox1 = n2 + n4;
+    let mut ox2 = n2 + n4;
+    let mut ix = 0usize;
+    let mut ti = n2;
+    loop {
+        ox1 -= 4;
+        x[ox1 + 3] = x[ix] * t[ti + 1] - x[ix + 1] * t[ti];
+        x[ox2] = -(x[ix] * t[ti] + x[ix + 1] * t[ti + 1]);
+        x[ox1 + 2] = x[ix + 2] * t[ti + 3] - x[ix + 3] * t[ti + 2];
+        x[ox2 + 1] = -(x[ix + 2] * t[ti + 2] + x[ix + 3] * t[ti + 3]);
+        x[ox1 + 1] = x[ix + 4] * t[ti + 5] - x[ix + 5] * t[ti + 4];
+        x[ox2 + 2] = -(x[ix + 4] * t[ti + 4] + x[ix + 5] * t[ti + 5]);
+        x[ox1] = x[ix + 6] * t[ti + 7] - x[ix + 7] * t[ti + 6];
+        x[ox2 + 3] = -(x[ix + 6] * t[ti + 6] + x[ix + 7] * t[ti + 7]);
+        ox2 += 4;
+        ix += 8;
+        ti += 8;
+        if ix >= ox1 {
+            break;
+        }
+    }
+
+    let mut ix = n2 + n4;
+    let mut ox1 = n4;
+    let mut ox2 = ox1;
+    loop {
+        ox1 -= 4;
+        ix -= 4;
+        x[ox1 + 3] = x[ix + 3];
+        x[ox2] = -x[ox1 + 3];
+        x[ox1 + 2] = x[ix + 2];
+        x[ox2 + 1] = -x[ox1 + 2];
+        x[ox1 + 1] = x[ix + 1];
+        x[ox2 + 2] = -x[ox1 + 1];
+        x[ox1] = x[ix];
+        x[ox2 + 3] = -x[ox1];
+        ox2 += 4;
+        if ox2 >= ix {
+            break;
+        }
+    }
+
+    let mut ix = n2 + n4;
+    let mut ox1 = n2 + n4;
+    let ox2 = n2;
+    loop {
+        ox1 -= 4;
+        x[ox1] = x[ix + 3];
+        x[ox1 + 1] = x[ix + 2];
+        x[ox1 + 2] = x[ix + 1];
+        x[ox1 + 3] = x[ix];
+        ix += 4;
+        if ox1 <= ox2 {
+            break;
+        }
     }
 }
 

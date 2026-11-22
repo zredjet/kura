@@ -1,5 +1,9 @@
 //! symphonia で読む Ogg Vorbis・MP4（AAC-LC・ALAC）・ADTS の AAC（読みだけ。Pinned。docs/editing.md §9.2）。
 //!
+//! Ogg Vorbis（`ogg-vorbis-symphonia-dec/3`）は M16 段 2 から旧版：今の読み手は自作の `ogg-vorbis-kura-dec/1`
+//! （`codec::vorbis::dec`。ADR-217）で、これは前の識別子の文書・アンカーを読み直すためだけに `legacy_decoders` に残す
+//! （段 5 のアンカーの移し替えのあと、段 10 で symphonia ごと外す。ADR-216）。
+//!
 //! - **どれも値を再現できる**（`reproducible()` は真。アンカーを作らない）。Vorbis・AAC は、symphonia の表（MDCT・FFT・
 //!   窓・TNS・逆量子化・スケールファクター・floor 0・codebook）を作る超越関数を、写し（`third_party/symphonia-core`・
 //!   `symphonia-codec-aac`・`symphonia-codec-vorbis`。各 KURA.md）で OS の libm から libm クレート（kura-engine と同じ
@@ -369,7 +373,7 @@ impl Decoder for SymphoniaDecoder {
     ) -> Result<Held, EngineError> {
         Ok(match self.container() {
             Container::Ogg => {
-                let mut h = held::ogg(src, limits)?;
+                let mut h = held::ogg(src, limits, held::VorbisTables::Symphonia)?;
                 h.decode = h.decode.saturating_sub(VORBIS_TABLES);
                 h
             }

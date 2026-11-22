@@ -605,11 +605,18 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
     // `/2` の識別子のまま value を持たず、書き換えないため。`SUPERSEDED`）。書いたバイト列は元の名前の行と同じ
     let ogg: Vec<_> = v
         .iter()
-        .filter(|e| e.1 == "ogg" && !e.0.ends_with(REREAD_SUFFIX))
+        .filter(|e| e.1 == "ogg" && !e.0.ends_with(REREAD_SUFFIX) && !e.0.ends_with(KDEC_SUFFIX))
         .cloned()
         .collect();
-    for (name, format, options, input) in ogg {
+    for (name, format, options, input) in ogg.iter().cloned() {
         let twin: &'static str = Box::leak(format!("{name}{REREAD_SUFFIX}").into_boxed_str());
+        v.push((twin, format, options, input));
+    }
+    // M16 段 2：同じ Ogg Vorbis の例を `<名前>-kdec1` の名前でもう一度並べる。読み直しのデコーダが自作の
+    // `ogg-vorbis-kura-dec/1` になったので、この行が読み直した値を凍結する（元の名前・`-dec3` の行は旧版の
+    // `ogg-vorbis-symphonia-dec/3` で読み直して照らし続ける。ADR-217）。書いたバイト列は元の名前の行と同じ
+    for (name, format, options, input) in ogg {
+        let twin: &'static str = Box::leak(format!("{name}{KDEC_SUFFIX}").into_boxed_str());
         v.push((twin, format, options, input));
     }
     // M13 段 1 の検証の直し：チャンク（65,536 フレーム）と書き出しの窓（WAV・AIFF は 16,384、FLAC はブロック 4,096、Vorbis は
@@ -728,6 +735,8 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
 
 /// 段 9 で、読み直した値を凍結するために同じ Ogg Vorbis の例を足し直した行の名前の接尾辞。
 const REREAD_SUFFIX: &str = "-dec3";
+/// M16 段 2 で、自作の Ogg Vorbis の読み取りで読み直した値を凍結するために足し直した行の名前の接尾辞。
+const KDEC_SUFFIX: &str = "-kdec1";
 
 /// 再現を約束しなかったデコーダの版を上げ、旧版を残さなかったもの：（凍結した行の識別子, 今の版の識別子）。
 /// 凍結した行（value なし）は書き換えないので、今の版で読み直して形だけを照らす（値は `REREAD_SUFFIX` の行が凍結する）。

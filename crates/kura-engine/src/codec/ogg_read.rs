@@ -18,9 +18,6 @@
 //!   BOS の組のあとに新しい BOS が来る（EOS の前でも）のも連結。
 //! - パケットは [`MAX_PACKET`] まで（それを超えるものは `Limit`）。中止はページごとと、読み口を補うたびに見る。
 
-// 段 2 の組み込み（2e）で Vorbis の読み取りから使うまで、本番のコードからは呼ばれない
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::VecDeque;
 
 use crate::codec::byte_in::Input;

@@ -65,27 +65,73 @@ fn shape_in(
 /// `0x7fc00000`）と演算の順で決まり、直す前は arm64 と x86_64 で生のビットも、f32 の WAV に書いたバイト列も違った（値の
 /// ダイジェストは NaN をそろえるので同じ）。読み取りが NaN を `0x7fc00000` にそろえるので、どのターゲットでも凍結した値と
 /// ビット単位で同じになる。値のダイジェストは直す前と同じ（デコーダの識別子は変えない）。
+///
+/// M16 段 2 で今の読み手は自作の `ogg-vorbis-kura-dec/1` になったので、ここでは旧版として残した symphonia の写し
+/// （`ogg-vorbis-symphonia-dec/3`）を名指しして読む。自作の読み手の同じ確かめは `kura_vorbis_nans_have_the_same_bits_on_every_target`。
 #[test]
 fn broken_vorbis_nans_have_the_same_bits_on_every_target() {
-    for (file, nans, value, raw, wav) in [
-        (
-            "ogg-vorbis-3ch-nan.ogg",
-            34_628,
-            "5f884da681a1a5571086cbb040516601820674e3c1b381bdf00d5343293f0e41",
-            "b0a276b3aa0a8feb868891f23a867942d180a9effdd2b65077a6fbc3d72c1403",
-            "231430ff203985726ddca36ac9a064a6933d8aa04f978247dd08d173d662ed82",
-        ),
-        (
-            "ogg-vorbis-ffmpeg-nan.ogg",
-            22_784,
-            "58cc551eace11bdcbb251c08a7d5921e40315c908be054d812501a1c53ff6c9a",
-            "87d3867cbe6f2ee43fb52f036b1e3d0cdefbe47a7d5186bab10eb23947782b12",
-            "ffb7b96cb713d66e7287e7f29c9155b351f03f29e2e6b4544186e85e5fbe4dfe",
-        ),
-    ] {
+    check_nan_bits(
+        "ogg-vorbis-symphonia-dec/3",
+        &[
+            (
+                "ogg-vorbis-3ch-nan.ogg",
+                34_628,
+                "5f884da681a1a5571086cbb040516601820674e3c1b381bdf00d5343293f0e41",
+                "b0a276b3aa0a8feb868891f23a867942d180a9effdd2b65077a6fbc3d72c1403",
+                "231430ff203985726ddca36ac9a064a6933d8aa04f978247dd08d173d662ed82",
+            ),
+            (
+                "ogg-vorbis-ffmpeg-nan.ogg",
+                22_784,
+                "58cc551eace11bdcbb251c08a7d5921e40315c908be054d812501a1c53ff6c9a",
+                "87d3867cbe6f2ee43fb52f036b1e3d0cdefbe47a7d5186bab10eb23947782b12",
+                "ffb7b96cb713d66e7287e7f29c9155b351f03f29e2e6b4544186e85e5fbe4dfe",
+            ),
+        ],
+    );
+}
+
+/// 自作の読み手（`ogg-vorbis-kura-dec/1`。M16 段 2）も、同じ壊れた Vorbis の NaN を `0x7fc00000` にそろえ、どのターゲットでも
+/// 凍結した値とビット単位で同じ（自作の読み手は libvorbis と同じく、この 2 本では NaN を出さない。出したときは
+/// `symph::canonical_nan` でそろえる）。
+#[test]
+fn kura_vorbis_nans_have_the_same_bits_on_every_target() {
+    check_nan_bits(
+        "ogg-vorbis-kura-dec/1",
+        &[
+            (
+                "ogg-vorbis-3ch-nan.ogg",
+                0,
+                "04083100a00848f1e5b94de33043e4769ef9aa099f7ffc1eb62dadafd74ab3e9",
+                "6c92e621b82282336889d6715f32e311d032908653c194d2bf3d38dae9395d1c",
+                "3090205fff6b55223793bb305bb446083c9e97df0001888e769b71fe723f8377",
+            ),
+            (
+                "ogg-vorbis-ffmpeg-nan.ogg",
+                0,
+                "553c93e83c749d76fa11a5707d30966ff69a775e38040c5280210c3dccd1f9dc",
+                "8bcf2b392ddef45efd212c14e69f739fe1d6ef50572922fc4bd1d2d48f57627a",
+                "145a46673ad4d8dc912928cdbfb2908770e4298bbf60fd3f092440f9417e378a",
+            ),
+        ],
+    );
+}
+
+/// 識別子 `decoder` で読み、NaN の数・値のダイジェスト・生のビット・f32 の WAV のダイジェストを凍結した値と照らす。
+fn check_nan_bits(decoder: &str, cases: &[(&str, usize, &str, &str, &str)]) {
+    for &(file, nans, value, raw, wav) in cases {
         let set = CodecSet::pinned();
-        let (v, stamp) = decode_in(&set, file, "ogg").unwrap();
-        assert_eq!(stamp.codec, "ogg-vorbis-symphonia-dec/3", "{file}");
+        let (v, stamp) = set
+            .decode_with(
+                decoder,
+                &mut Cursor::new(fixture(file)),
+                "ogg",
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+        assert_eq!(stamp.codec, decoder, "{file}");
         assert!(stamp.reproducible, "{file}");
         let Value::Audio(a) = &v else {
             panic!("{file}")

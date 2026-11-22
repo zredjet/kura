@@ -322,7 +322,7 @@ fn lossy_audio_matches_other_decoders() {
         (
             "ogg-vorbis-loop.ogg",
             "ogg",
-            "ogg-vorbis-symphonia-dec/3",
+            "ogg-vorbis-kura-dec/1",
             "ogg-vorbis-loop.lewton.flac",
             44_100,
             true,
@@ -330,7 +330,7 @@ fn lossy_audio_matches_other_decoders() {
         (
             "ogg-vorbis-ffmpeg.ogg",
             "ogg",
-            "ogg-vorbis-symphonia-dec/3",
+            "ogg-vorbis-kura-dec/1",
             "ogg-vorbis-ffmpeg.lewton.flac",
             44_160,
             true,
@@ -411,7 +411,7 @@ fn multichannel_vorbis_matches_lewton() {
     ] {
         let (codec, rep, meta, rate, ours) = audio(file, "ogg");
         let (_, _, _, ref_rate, raw) = audio(reference, "flac");
-        assert_eq!(codec, "ogg-vorbis-symphonia-dec/3", "{file}");
+        assert_eq!(codec, "ogg-vorbis-kura-dec/1", "{file}");
         assert!(rep, "{file}");
         assert_eq!((rate, ref_rate), (44_100, 44_100), "{file}");
         assert_eq!(meta.tags.get("title").map(String::as_str), Some("Channels"));
@@ -534,6 +534,10 @@ fn short_edit_list_is_applied() {
 /// ページのグラニュールで長さを 1 フレームに詰めた Ogg Vorbis（8 ch・ブロック 8192 のパケット 2,000 個、4 KB）は、
 /// 形は小さくてもデコードする量（切り取る前の長さ。2,000 × 4,096 フレーム × 8 ch × 4 バイト ≒ 262 MB）を上限で
 /// 確かめて断る（検証で見つけた、時間だけを使わせる形。上限を 64 MiB にして確かめる）。
+///
+/// M16 段 2 で読み手を libvorbis の移植（`ogg-vorbis-kura-dec/1`）に替えてからは、このファイルの setup（値のない codebook
+/// を floor 0 が使う）を libvorbis と同じく setup の段で断る（`Decode`）。libvorbis の切り取りは出す前のブロックの分だけ
+/// なので、出す長さとデコードする量はほぼ同じになり、デコードする量の上限（`vorbis::dec` の `run`）もそのまま残す。
 #[test]
 fn trimmed_away_decoding_is_bounded() {
     let bytes = std::fs::read(dir().join("ogg-vorbis-granule-trim.ogg")).unwrap();
@@ -548,5 +552,8 @@ fn trimmed_away_decoding_is_bounded() {
         &limits,
         &NoMonitor,
     );
-    assert!(matches!(r, Err(EngineError::Limit(_))), "{r:?}");
+    assert!(
+        matches!(r, Err(EngineError::Limit(_) | EngineError::Decode { .. })),
+        "{r:?}"
+    );
 }

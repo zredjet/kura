@@ -20,8 +20,10 @@
 //! - moov のほかの部分（標本の表）は 2 倍。FLAC の VORBIS_COMMENT は箱の 1 倍（読む間だけ）とタグ（読めない UTF-8 を置き換えると
 //!   最大 3 倍）で、コメントの倍率の内。
 //! - 読み手そのものの緩衝（[`READER`]）。
-//! - Vorbis の codebook の表（流して読む間だけ。`symph::vorbis_setup_bytes`）：setup が [`SETUP_MAX`] を超えて組み立てられない
-//!   ときは、読み口が受け付ける上限（`min(max_value_bytes, 256 MiB)`）とみなす。
+//! - Vorbis の codebook の表（読み手ごとの式。[`VorbisTables`]）：自作の読み手は `vorbis::dec::codebook::book_bytes` の和で、
+//!   setup の静的な表は開いている間（形を読む間も）、復号の表は流して読む間だけ。旧版の symphonia の読み手は
+//!   `symph::vorbis_setup_bytes` で、流して読む間だけ。setup が [`SETUP_MAX`] を超えて組み立てられないときは、読み口が
+//!   受け付ける上限（`min(max_value_bytes, 256 MiB)`）とみなす。
 //!
 //! 数えられない頭（壊れた箱・違う形式）は、そこまでの量を返す（読み手はそこで断るか、読み飛ばしたところで止まる）。
 //! I/O の誤りだけを返す。
@@ -41,6 +43,42 @@ pub struct Held {
     /// 流して読む間だけ、それに足して持つ量（デコーダの表。Vorbis の codebook のうち、`stream_work_bytes` が見込む分を
     /// 超える分）。
     pub decode: u64,
+}
+
+/// Vorbis の codebook の表の数え方（読み手ごと。[`ogg`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VorbisTables {
+    /// 自作の読み手（`ogg-vorbis-kura-dec/1`。`vorbis::dec::codebook::setup_table_bytes`）：setup の静的な表は開いている間
+    /// （[`Held::open`]）、復号の表は流して読む間だけ（[`Held::decode`]）。数えられない setup は、上限の全部を開いている間に
+    /// 持つとみなす（読み手は表の量の和を上限で断るので、持つのは上限まで）。
+    Kura,
+    /// 旧版の symphonia の読み手（`symph::vorbis_setup_bytes`）：表は流して読む間だけ。
+    Symphonia,
+}
+
+impl VorbisTables {
+    /// 識別ヘッダ `ident` と setup のパケット（組み立てられなければ None）から、（開いている間、流して読む間）の量。
+    fn count(self, ident: &[u8], setup: Option<&[u8]>, worst: u64) -> (u64, u64) {
+        match (self, setup) {
+            (Self::Kura, Some(setup)) => {
+                crate::codec::vorbis::dec::codebook::setup_table_bytes(setup)
+                    .map_or((0, 0), |t| (t.setup.min(worst), t.decode.min(worst)))
+            }
+            (Self::Kura, None) => (worst, 0),
+            (Self::Symphonia, Some(setup)) => {
+                let mut extra = ident.to_vec();
+                extra.extend_from_slice(setup);
+                (0, vorbis_setup_bytes(&extra).map_or(0, |b| b.min(worst)))
+            }
+            (Self::Symphonia, None) => (0, worst),
+        }
+    }
+
+    /// 識別ヘッダのパケット（頭 `head`・長さ `len`）を Vorbis とみなすか。symphonia はちょうど 30 バイトだけ、自作の読み手
+    /// （`codec::ogg_read`・`vorbis::dec::info::unpack_info`）は長さを見ない。
+    fn is_vorbis_ident(self, head: &[u8], len: u64) -> bool {
+        head.starts_with(b"\x01vorbis") && (self == Self::Kura || len == 30)
+    }
 }
 
 /// 読み手そのものの緩衝（symphonia の `MediaSourceStream`・Ogg のページ・パケットの組み立て）。
@@ -392,15 +430,21 @@ struct Stream {
     len: u64,
     /// 今のパケットの頭（[`PACKET_HEAD`] まで。Vorbis の setup は [`SETUP_MAX`] まで）。
     head: Vec<u8>,
-    /// Vorbis の識別ヘッダ（30 バイト）。
+    /// Vorbis の識別ヘッダ（symphonia が Vorbis とみなすのは 30 バイトのものだけ）。
     ident: Vec<u8>,
 }
 
 /// Ogg の頭で数えたもの。
 #[derive(Default)]
 struct OggCount {
+    /// 最初の Vorbis の論理ストリーム（自作の読み手が読むもの）。
+    vorbis_serial: Option<u32>,
+    /// その setup を数え終えた（自作の読み手は、ここまでの頭を読んで開く）。
+    vorbis_setup_done: bool,
     comments: u64,
-    /// Vorbis の codebook の表の見積もりの最大。
+    /// Vorbis の codebook の表のうち、開いている間に持つ量の見積もりの最大。
+    open_tables: u64,
+    /// Vorbis の codebook の表のうち、流して読む間だけ持つ量の見積もりの最大。
     tables: u64,
 }
 
@@ -421,13 +465,13 @@ impl Stream {
     }
 
     /// パケットが終わった：種類を決め、コメントの数・Vorbis の表を数える。
-    fn finish(&mut self, count: &mut OggCount, limits: &Limits) {
+    fn finish(&mut self, count: &mut OggCount, limits: &Limits, tables: VorbisTables) {
         let head = std::mem::take(&mut self.head);
         let len = self.len;
         if self.index == 0 {
-            // Vorbis の識別ヘッダはちょうど 30 バイト（symphonia もそれ以外は Vorbis とみなさない）
-            self.mapping = if head.starts_with(b"\x01vorbis") && len == 30 {
+            self.mapping = if tables.is_vorbis_ident(&head, len) {
                 self.ident = head.clone();
+                count.vorbis_serial.get_or_insert(self.serial);
                 Mapping::Vorbis
             } else if head.starts_with(b"OpusHead") {
                 Mapping::Opus
@@ -450,14 +494,16 @@ impl Stream {
             }
             if self.mapping == Mapping::Vorbis && head.starts_with(b"\x05vorbis") {
                 let worst = limits.max_value_bytes.min(256 << 20);
-                let tables = if (head.len() as u64) < len {
-                    worst
+                let (open, decode) = if (head.len() as u64) < len {
+                    tables.count(&self.ident, None, worst)
                 } else {
-                    let mut extra = self.ident.clone();
-                    extra.extend_from_slice(&head);
-                    vorbis_setup_bytes(&extra).map_or(0, |b| b.min(worst))
+                    tables.count(&self.ident, Some(&head), worst)
                 };
-                count.tables = count.tables.max(tables);
+                count.open_tables = count.open_tables.max(open);
+                count.tables = count.tables.max(decode);
+                if count.vorbis_serial == Some(self.serial) {
+                    count.vorbis_setup_done = true;
+                }
             }
         }
         self.index = self.index.saturating_add(1);
@@ -487,9 +533,15 @@ fn head_comment_count(head: &[u8], at: usize, len: u64) -> u64 {
 }
 
 /// Ogg（symphonia の `OggReader` が開くときに読む頭のページ：CRC の合うページを、グラニュールが 0 か −1（パケットが
-/// 終わらない）のあいだと、その次の 1 ページまで。捕まえの印 `OggS` を探して、合わないページは読み飛ばす）。`decode` は
-/// Vorbis の codebook の表の見積もりの全体（`SymphoniaDecoder` が `stream_work_bytes` の見込みの分を引く）。
-pub(crate) fn ogg(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Held, EngineError> {
+/// 終わらない）のあいだと、その次の 1 ページまで。捕まえの印 `OggS` を探して、合わないページは読み飛ばす。自作の読み手
+/// （`codec::ogg_read`）が頭のパケットを組み立てるまでに読むページもこの内）。Vorbis の codebook の表は `tables` の数え方で、
+/// 開いている間の分を `open` に、流して読む間だけの分を `decode` に足す（デコーダが `stream_work_bytes` の見込みの分を
+/// `decode` から引く）。
+pub(crate) fn ogg(
+    src: &mut dyn ReadSeek,
+    limits: &Limits,
+    tables: VorbisTables,
+) -> Result<Held, EngineError> {
     let mut w = Walk::new(src)?;
     let mut bytes = 0u64;
     let mut count = OggCount::default();
@@ -552,17 +604,27 @@ pub(crate) fn ogg(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Held, Engin
                 s.push(&page[off..off + l]);
                 off += l;
                 if l < 255 {
-                    s.finish(&mut count, limits);
+                    s.finish(&mut count, limits, tables);
                 }
             }
         }
-        if granule != 0 && granule != u64::MAX {
+        let stop = match tables {
+            // symphonia はグラニュールが 0 か −1 のページと、そのあとの最初のページまで
+            VorbisTables::Symphonia => granule != 0 && granule != u64::MAX,
+            // 自作の読み手は、最初の Vorbis の setup を読み終えるまで（グラニュールは見ない）。BOS の組が終わっても Vorbis が
+            // なければ、そこで断る
+            VorbisTables::Kura => {
+                count.vorbis_setup_done || (!first && count.vorbis_serial.is_none())
+            }
+        };
+        if stop {
             break;
         }
     }
     let open = READER
         .saturating_add(bytes.saturating_mul(TEXT_FACTOR))
-        .saturating_add(count.comments.saturating_mul(ITEM_COST));
+        .saturating_add(count.comments.saturating_mul(ITEM_COST))
+        .saturating_add(count.open_tables);
     Ok(Held {
         open,
         decode: count.tables,
@@ -601,6 +663,9 @@ mod tests {
 
     use rand_chacha::rand_core::Rng;
 
+    /// 自作の読み手と旧版の symphonia の読み手の、codebook の表の数え方。
+    const TABLES: [VorbisTables; 2] = [VorbisTables::Kura, VorbisTables::Symphonia];
+
     fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -629,9 +694,16 @@ mod tests {
             );
             assert_eq!(h.decode, 0, "{name}");
         }
-        let h = ogg(&mut Cursor::new(fixture("ogg-vorbis-ffmpeg.ogg")), &limits).unwrap();
-        assert!(h.open >= READER && h.open < READER + (256 << 10), "{h:?}");
-        assert!(h.decode > 0 && h.decode < 8 << 20, "{h:?}");
+        for tables in TABLES {
+            let h = ogg(
+                &mut Cursor::new(fixture("ogg-vorbis-ffmpeg.ogg")),
+                &limits,
+                tables,
+            )
+            .unwrap();
+            assert!(h.open >= READER && h.open < READER + (512 << 10), "{h:?}");
+            assert!(h.decode > 0 && h.decode < 8 << 20, "{h:?}");
+        }
     }
 
     /// symphonia の `safe_read_into_boxed_slice` の伸ばし方（4・8・16 MiB… を足す）で、最後に伸ばすときに前と新しい領域を
@@ -656,13 +728,97 @@ mod tests {
         assert!(boxed_read_peak(u64::MAX / 2) >= u64::MAX / 2);
     }
 
+    /// 自作の読み手が開くときに読む頭（識別ヘッダが 30 バイトでない・頭のページのグラニュールが 0 でない）でも、setup の
+    /// codebook の表を数える（ordered の 2^22 項目の codebook。setup は数十バイト）。symphonia の数え方はどちらも数えない。
+    #[test]
+    fn kura_counts_the_headers_its_reader_reads() {
+        use crate::codec::ogg::tests::page;
+        use crate::codec::vorbis::bitpack::OggpackBuffer;
+        let mut ident = b"\x01vorbis".to_vec();
+        ident.extend_from_slice(&0u32.to_le_bytes());
+        ident.push(2);
+        ident.extend_from_slice(&44_100u32.to_le_bytes());
+        ident.extend_from_slice(&[0; 12]);
+        ident.push(0xb8);
+        ident.push(1);
+        assert_eq!(ident.len(), 30);
+        let mut comment = b"\x03vorbis".to_vec();
+        comment.extend_from_slice(&[0; 8]);
+        comment.push(1);
+        let mut w = OggpackBuffer::oggpack_writeinit();
+        let entries = 1u64 << 22;
+        for (v, bits) in [
+            (5u64, 8u32),
+            (u64::from(b'v'), 8),
+            (u64::from(b'o'), 8),
+            (u64::from(b'r'), 8),
+            (u64::from(b'b'), 8),
+            (u64::from(b'i'), 8),
+            (u64::from(b's'), 8),
+            (0, 8),
+            (0x56_4342, 24),
+            (1, 16),
+            (entries, 24),
+            (1, 1),
+            (21, 5),
+            (entries, 23),
+            (0, 4),
+        ] {
+            w.oggpack_write(v, bits).unwrap();
+        }
+        let setup = w.oggpack_get_buffer().to_vec();
+        let tables = crate::codec::vorbis::dec::codebook::setup_table_bytes(&setup).unwrap();
+        assert!(
+            tables.setup >= 4 << 20 && tables.decode >= 100 << 20,
+            "{tables:?}"
+        );
+        let file = |ident: &[u8], granule: u64| {
+            let mut f = page(7, 0, 0x02, granule, &[ident]);
+            f.extend_from_slice(&page(7, 1, 0, granule, &[&comment]));
+            f.extend_from_slice(&page(7, 2, 0, 0, &[&setup]));
+            f.extend_from_slice(&page(7, 3, 0x04, 4_096, &[&[0u8]]));
+            f
+        };
+        let mut long = ident.clone();
+        long.push(0);
+        let limits = Limits::default();
+        for (name, bytes) in [
+            ("30 バイト", file(&ident, 0)),
+            ("31 バイト", file(&long, 0)),
+            ("頭のグラニュール 1", file(&ident, 1)),
+        ] {
+            let h = ogg(&mut Cursor::new(&bytes), &limits, VorbisTables::Kura).unwrap();
+            assert!(h.open >= READER + tables.setup, "{name}: {h:?}");
+            assert_eq!(h.decode, tables.decode, "{name}: {h:?}");
+            let old = ogg(&mut Cursor::new(&bytes), &limits, VorbisTables::Symphonia).unwrap();
+            assert_eq!(old.decode, 0, "{name}: {old:?}");
+        }
+        // Vorbis のない BOS の組が終わったら（BOS でないページが来たら）、そのあとは見ない（自作の読み手はそこで断る。
+        // あとの Vorbis は連結）。同じ BOS の組にある Vorbis は読む（多重化）
+        let opus_head = page(9, 0, 0x02, 0, &[b"OpusHead\x01\x02\0\0\x80\xbb\0\0\0\0\0"]);
+        let mut muxed = opus_head.clone();
+        muxed.extend_from_slice(&file(&ident, 0));
+        let h = ogg(&mut Cursor::new(&muxed), &limits, VorbisTables::Kura).unwrap();
+        assert_eq!(h.decode, tables.decode, "{h:?}");
+        let mut opus = opus_head;
+        opus.extend_from_slice(&page(9, 1, 0, 0, &[b"OpusTags\0\0\0\0\0\0\0\0"]));
+        opus.extend_from_slice(&file(&ident, 0));
+        let h = ogg(&mut Cursor::new(&opus), &limits, VorbisTables::Kura).unwrap();
+        assert_eq!(h.decode, 0, "{h:?}");
+    }
+
     /// 違う形式・空・壊れた頭でも、落ちずに読み手の緩衝だけを返す。
     #[test]
     fn foreign_bytes_count_nothing() {
         let limits = Limits::default();
         for bytes in [Vec::new(), b"RIFF0000WAVE".to_vec(), vec![0xff; 100]] {
             assert_eq!(flac(&mut Cursor::new(&bytes)).unwrap().open, READER);
-            assert_eq!(ogg(&mut Cursor::new(&bytes), &limits).unwrap().open, READER);
+            for tables in TABLES {
+                assert_eq!(
+                    ogg(&mut Cursor::new(&bytes), &limits, tables).unwrap().open,
+                    READER
+                );
+            }
             assert_eq!(mp4(&mut Cursor::new(&bytes)).unwrap().open, READER);
         }
     }
@@ -689,7 +845,9 @@ mod tests {
                 b.truncate(cut);
             }
             let _ = flac(&mut Cursor::new(&b)).unwrap();
-            let _ = ogg(&mut Cursor::new(&b), &limits).unwrap();
+            for tables in TABLES {
+                let _ = ogg(&mut Cursor::new(&b), &limits, tables).unwrap();
+            }
             let _ = mp4(&mut Cursor::new(&b)).unwrap();
         }
     }

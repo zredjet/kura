@@ -187,7 +187,7 @@ fn is_chapter_key(key: &str) -> bool {
 ///
 /// 値は 1 度だけ確保する（読めない UTF-8 を置き換えた文字列は、そのまま名前の分を切り落として値にする。持つ量の見積もり
 /// `held::flac` の倍率に収めるため）。
-fn comment_tag(data: &[u8]) -> Option<(String, String)> {
+pub(crate) fn comment_tag(data: &[u8]) -> Option<(String, String)> {
     let comment = String::from_utf8_lossy(data);
     let eq = comment.find('=')?;
     let key: String = comment[..eq]

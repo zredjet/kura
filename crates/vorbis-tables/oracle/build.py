@@ -428,6 +428,9 @@ def build_c(out, cc, rlibm, san, syslibm):
         "oracle_enc": [cc, "-O2", *common, *srcs, os.path.join(tools, "oracle_enc.c"), rlibm],
         "oracle_enc_O0": [cc, "-O0", *common, *srcs, os.path.join(tools, "oracle_enc.c"), rlibm],
         "oracle_setup": [cc, "-O2", *common, *srcs, os.path.join(tools, "oracle_setup.c"), rlibm],
+        # 照合用のデコーダ（M16 段 2・ADR-217）。書き出しと同じ組み方（超越関数の差し替え・CODEGEN）
+        "oracle_dec": [cc, "-O2", *common, *srcs, os.path.join(tools, "oracle_dec.c"), rlibm],
+        "oracle_dec_O0": [cc, "-O0", *common, *srcs, os.path.join(tools, "oracle_dec.c"), rlibm],
         "pkt2ogg": [cc, "-O2", "-w", f"-I{oinc}", *[os.path.join(out, p) for p in OGGSRC],
                     os.path.join(tools, "pkt2ogg.c")],
         "ogg2pkt": [cc, "-O2", "-w", f"-I{oinc}", *[os.path.join(out, p) for p in OGGSRC],
@@ -449,6 +452,9 @@ def build_c(out, cc, rlibm, san, syslibm):
     o = os.path.join(objp, "oracle_enc.o")
     objs.append(o)
     jobs["obj:oracle_enc"] = [cc, "-O2", "-c", *common, os.path.join(tools, "oracle_enc.c"), "-o", o]
+    o = os.path.join(objp, "oracle_dec.o")
+    objs.append(o)
+    jobs["obj:oracle_dec"] = [cc, "-O2", "-c", *common, os.path.join(tools, "oracle_dec.c"), "-o", o]
     for name in list(jobs):
         if not name.startswith("obj:"):
             jobs[name] = jobs[name] + ["-o", os.path.join(binp, name)]

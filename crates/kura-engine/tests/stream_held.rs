@@ -460,9 +460,9 @@ fn skip_codebook(r: &mut Bits) {
     }
 }
 
-/// setup の codebook の列の後ろに、表が 16 MiB になる VQ の codebook（疎・使う項目 2・項目 131,072・次元 32・lookup 1）を
-/// `extra` 個足す（音声は前と同じに読める）。
-fn add_big_codebooks(setup: &[u8], extra: u64) -> Vec<u8> {
+/// setup の codebook の列の後ろに、`book` が書く codebook を `extra` 個足す（floor・residue はもとの codebook を指したままなので、
+/// 音声は前と同じに読める）。
+fn add_codebooks(setup: &[u8], extra: u64, book: impl Fn(&mut Bits)) -> Vec<u8> {
     let mut r = Bits {
         b: setup.to_vec(),
         at: 56,
@@ -484,6 +484,21 @@ fn add_big_codebooks(setup: &[u8], extra: u64) -> Vec<u8> {
         w.put(v, 1);
     }
     for _ in 0..extra {
+        book(&mut w);
+    }
+    let total = setup.len() * 8;
+    while r.at < total {
+        let v = r.take(1);
+        w.put(v, 1);
+    }
+    w.b
+}
+
+/// 表が 16 MiB になる VQ の codebook（疎・使う項目 2・項目 131,072・次元 32・lookup 1）を `extra` 個足す。前の symphonia の
+/// 読み手は項目のぶんの表を作ったが、自作の読み手（libvorbis と同じ）は使う項目のぶんだけ作るので、持つ量は長さの表
+/// （項目ごとに 1 バイト）だけ。
+fn add_big_codebooks(setup: &[u8], extra: u64) -> Vec<u8> {
+    add_codebooks(setup, extra, |w| {
         w.put(0x56_4342, 24);
         w.put(32, 16);
         w.put(1 << 17, 24);
@@ -503,13 +518,29 @@ fn add_big_codebooks(setup: &[u8], extra: u64) -> Vec<u8> {
         w.put(0, 4);
         w.put(0, 1);
         w.put(0, 1);
-    }
-    let total = setup.len() * 8;
-    while r.at < total {
-        let v = r.take(1);
-        w.put(v, 1);
-    }
-    w.b
+    })
+}
+
+/// 自作の読み手が多く持つ codebook（ordered・長さ 19 が 2^19 個で全部使う・次元 2・lookup 1）を `extra` 個足す。1 冊は数百
+/// バイトで、表は約 8.5 MiB（値 2^19 × 2 × 4 バイト・符号語と番号と長さ 2^19 × 9 バイト）。
+fn add_ordered_codebooks(setup: &[u8], extra: u64) -> Vec<u8> {
+    const ENTRIES: u64 = 1 << 19;
+    add_codebooks(setup, extra, |w| {
+        w.put(0x56_4342, 24);
+        w.put(2, 16);
+        w.put(ENTRIES, 24);
+        w.put(1, 1);
+        w.put(18, 5);
+        w.put(ENTRIES, (64 - ENTRIES.leading_zeros()) as usize);
+        w.put(1, 4);
+        w.put(0, 32);
+        w.put(0, 32);
+        w.put(0, 4);
+        w.put(0, 1);
+        for _ in 0..lookup1(ENTRIES, 2) {
+            w.put(0, 1);
+        }
+    })
 }
 
 // ---- m4a ----
@@ -613,7 +644,8 @@ fn stream_estimates_cover_what_readers_hold() {
     let mut app = b"kura".to_vec();
     app.resize(mib8, 0);
     put("flac-application", flac_with(&[(2, app)]), "flac");
-    // Ogg Vorbis：base64 の画像・小さなコメント 20 万・長い文字・表が 64 MiB になる codebook
+    // Ogg Vorbis：base64 の画像・小さなコメント 20 万・長い文字・前の symphonia の表が 64 MiB になる codebook（自作の読み手は
+    // 持たない。下の `skipped`）・自作の読み手の表が 34 MiB になる codebook（`stream_work_bytes` の見込みの 32 MiB を超える）
     put(
         "ogg-base64-picture",
         ogg_with(|h| h[1] = vorbis_comment_packet(&[picture_comment(4 << 20)])),
@@ -632,6 +664,11 @@ fn stream_estimates_cover_what_readers_hold() {
     put(
         "ogg-big-codebooks",
         ogg_with(|h| h[2] = add_big_codebooks(&h[2], 4)),
+        "ogg",
+    );
+    put(
+        "ogg-ordered-codebooks",
+        ogg_with(|h| h[2] = add_ordered_codebooks(&h[2], 4)),
         "ogg",
     );
     // m4a：covr（8 MiB）・小さなタグ 10 万・長い歌詞
@@ -656,12 +693,13 @@ fn stream_estimates_cover_what_readers_hold() {
         m4a_with_tags(&[(lyr, 1, vec![b'x'; 4 << 20])]),
         "m4a",
     );
-    // 自作の FLAC の読み手が読み飛ばす箱（持たない）
+    // 自作の FLAC の読み手が読み飛ばす箱と、自作の Ogg Vorbis の読み手が使わない項目（持たない）
     let skipped = [
         "flac-pictures",
         "flac-long-description",
         "flac-seektable",
         "flac-application",
+        "ogg-big-codebooks",
     ];
     for (name, path, format) in &cases {
         let (shape_peak, _, stream_peak, _) = check(name, path, format);
