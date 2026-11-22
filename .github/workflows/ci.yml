@@ -1,4 +1,4 @@
-# CI（ADR-142・ADR-209）。
+# CI（ADR-142・ADR-209・ADR-211）。
 # - push・PR では最低限だけ（ubuntu の 1 本）：整形、ゴールデンの追記だけの検査、エンジンの依存に SIMD の feature がないこと、
 #   kura-engine・kura-core・vorbis-tables の clippy（kura-core がテストを含めて Linux でもビルドできること）、
 #   ターゲットをまたいで同じ値になるはずのゴールデン（整数の操作・解析、コーデックの書くバイト列（Ogg Vorbis を含む）、
@@ -66,7 +66,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables --all-targets -- -D warnings
-      - run: cargo test -p kura-engine -p kura-core -p vorbis-tables
+      # Linux では成り立たない前提のテストは、Mac のテストを変えずにここで外す（ADR-211）：
+      # - a_slow_consumer_is_not_counted_as_a_stall：macOS のパイプの渡し方（1 回に 64 KiB ほど）で、受け手が遅いときの
+      #   待ちの場面を作る。Linux は 1 回に 256 KiB まで渡すので場面が起きず、前提の確かめで落ちる
+      - run: >-
+          cargo test -p kura-engine -p kura-core -p vorbis-tables
+          -- --skip tools::tests::a_slow_consumer_is_not_counted_as_a_stall
       - name: ゴールデンは追記だけ
         run: scripts/check-goldens-append-only.sh
       - name: エンジンの依存に SIMD の feature がない

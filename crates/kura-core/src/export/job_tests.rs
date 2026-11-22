@@ -127,6 +127,15 @@ fn names_in(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
+/// `dir` が大文字小文字を区別しないフォルダか（APFS の既定は区別しない。Linux と、大文字小文字を区別する APFS は区別する）。
+fn case_insensitive(dir: &std::path::Path) -> bool {
+    let probe = dir.join("CaseProbe.tmp");
+    std::fs::write(&probe, b"").unwrap();
+    let insensitive = dir.join("caseprobe.tmp").exists();
+    std::fs::remove_file(&probe).unwrap();
+    insensitive
+}
+
 #[test]
 fn exports_with_original_names_units_in_folders_and_a_manifest() {
     let env = Env::new();
@@ -502,12 +511,20 @@ fn case_only_renames_follow_the_new_name_rule() {
     let env = Env::new();
     let a = env.item("Hero.png", "png", b"a");
     let dest = env.dest("out");
+    let insensitive = case_insensitive(&dest);
     env.run_with(&dest, vec![a], rule(None, NameStyle::Keep, false));
     assert_eq!(names_in(&dest), ["Hero.png"]);
-    // 書き方を snake に変えて書き出し直すと、大文字小文字だけ違う同じファイルの名前を直す
     let (_, r) = env.run_with(&dest, vec![a], rule(None, NameStyle::Snake, false));
-    assert_eq!((r.exported, r.replaced), (1, 1));
-    assert_eq!(names_in(&dest), ["hero.png"]);
+    if insensitive {
+        // 書き方を snake に変えて書き出し直すと、大文字小文字だけ違う同じファイルの名前を直す
+        assert_eq!((r.exported, r.replaced), (1, 1));
+        assert_eq!(names_in(&dest), ["hero.png"]);
+    } else {
+        // 大文字小文字を区別するフォルダ（Linux など）では別の名前なので、新しく置いて前のファイルは残す（名前の決め方を
+        // 変えたときと同じ）
+        assert_eq!((r.exported, r.replaced), (1, 0));
+        assert_eq!(names_in(&dest), ["Hero.png", "hero.png"]);
+    }
 }
 
 #[test]

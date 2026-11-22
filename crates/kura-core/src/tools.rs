@@ -2203,6 +2203,8 @@ mod tests {
 
     /// 受け手が遅くて読み手が渡すのを待っている間は、無出力に数えない（受け手が呼び手の一括のプールで入れ子の仕事に
     /// 取られている間など。M13 段 2 の検証の直し）。道具は出し続けて終わり、受け手は区切りごとに無出力の上限より長く眠る。
+    /// macOS のパイプの渡し方（1 回に 64 KiB ほど）を前提にする。Linux は 1 回に `READ_CHUNK` まで渡して待ちの場面が
+    /// 起きないので、CI の Linux では外す（`.github/workflows/ci.yml`。ADR-211）。
     #[test]
     fn a_slow_consumer_is_not_counted_as_a_stall() {
         let d = tempfile::tempdir().unwrap();
