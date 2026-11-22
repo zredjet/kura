@@ -199,7 +199,8 @@ mod tests {
     /// M13 段 3：流して書く口（`CodecSet::encode_stream`。値の生産者）でも、値を書いたものと同じ形の m4a（backend には同じ
     /// 4,096 フレームずつ渡る）。AudioToolbox は呼び出しの道によって最後のパケットのバイト列が変わることがある（同じ道なら
     /// 同じ。R2 は約束しない）ので、固定の段の読み取りで読み直した長さと音が同じことを確かめる。値のダイジェストは流した
-    /// 標本のもの。
+    /// 標本のもの。書いたバイト数は比べない（macOS 26.7.2 では最後のパケットの長さが 1 バイト違った。26.7 では同じ。
+    /// ADR-213）。記録のバイト数が、それぞれ実際に書いた長さと合うことだけを確かめる。
     #[test]
     fn streamed_aac_equals_encode_here() {
         let _g = shared();
@@ -217,10 +218,14 @@ mod tests {
                 .encode_stream(&mut producer, "m4a", &json!({}), &mut out, &NoMonitor)
                 .unwrap();
             let got = out.into_inner();
-            assert_eq!(got.len(), want.len(), "{rate} {channels} {frames}");
             assert_eq!(
-                (se.codec.as_str(), se.tier, se.bytes),
-                (stamp.codec.as_str(), stamp.tier, stamp.bytes)
+                (se.codec.as_str(), se.tier),
+                (stamp.codec.as_str(), stamp.tier)
+            );
+            assert_eq!(
+                (se.bytes, stamp.bytes),
+                (got.len() as u64, want.len() as u64),
+                "{rate} {channels} {frames}"
             );
             assert_eq!(se.value_digest, src.digest().unwrap());
             let (x, _) = decode(&pinned, &got, "m4a").unwrap();
@@ -365,7 +370,9 @@ mod tests {
 
     /// 出力の上限は Swift の側でも効く（超える書き込みを断って Limit）。設定の誤りは呼び方の誤り。
     /// M13 段 3 の検証の直し：Swift は出力の配列を open で上限まで確保する（倍々に伸ばさない）。確保する大きさ（上限）は書く
-    /// バイト列を変えない：同じ値を、上限 `aac_max_output` と、その 8 倍で書いたものが同じ。
+    /// バイト列を変えない：同じ値を、上限 `aac_max_output` と、その 8 倍で書いたものが同じ。書き手を直に呼ぶので、m4a の
+    /// 作成・変更の時刻（秒）が入っている。2 回の書き出しが秒をまたぐと違う（2026-11 に CI の macOS で 1 秒ずれて落ちた）ので、
+    /// 書き出しの道と同じく `zero_mp4_times` で 0 にしてから比べる。
     #[test]
     fn reserved_output_capacity_does_not_change_the_bytes() {
         let _g = shared();
@@ -397,9 +404,11 @@ mod tests {
                 out
             };
             let max = kura_engine::codec::platform::aac_max_output(frames as u64, channels);
-            let a = write(max);
-            let b = write(max * 8);
+            let mut a = write(max);
+            let mut b = write(max * 8);
             assert!(!a.is_empty());
+            zero_mp4_times(&mut a).unwrap();
+            zero_mp4_times(&mut b).unwrap();
             assert_eq!(a, b, "{rate} {channels} {frames}");
         }
     }

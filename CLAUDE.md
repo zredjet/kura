@@ -61,7 +61,7 @@ docs/                      # 仕様・設計（下記）
 - **編集**：操作は `kura-engine` に置き、決定性と版の契約（`docs/editing.md` §8）を守る。エディタとの通信で送るのは文書（操作の列）だけ。
 - **ブロックしない**：SQLite・ハッシュ計算・ファイル I/O は専用スレッドか `spawn_blocking`。DB 書き込みは単一ライター。
 - **DB**：スキーマ変更は新しいマイグレーションの追加のみ。`docs/data-model.md` も同時に更新する。
-- **OS 依存の分離**：macOS 専用コードは `kura-mac` に閉じ込める。`cargo test -p kura-core` は Linux でも通ること。
+- **OS 依存の分離**：macOS 専用コードは `kura-mac` に閉じ込める。`cargo test -p kura-core` は Linux でも通ること（macOS の振る舞いを前提にするテストは、Mac のテストを変えずに CI の Linux で外す。ADR-211）。
 - **外部ツールのパス**：GUI アプリはシェルの PATH を引き継がない。`/opt/homebrew/bin`・`/usr/local/bin` を探し、設定で上書き可能にする。
 - **乱数**：シャッフル等は必ずシード付き ChaCha8（`docs/playlists.md`）。`thread_rng` や `StdRng` は使わない。
 

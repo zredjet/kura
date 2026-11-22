@@ -1,10 +1,11 @@
-# CI（ADR-142・ADR-209）。
+# CI（ADR-142・ADR-209・ADR-211・ADR-212・ADR-214）。
 # - push・PR では最低限だけ（ubuntu の 1 本）：整形、ゴールデンの追記だけの検査、エンジンの依存に SIMD の feature がないこと、
 #   kura-engine・kura-core・vorbis-tables の clippy（kura-core がテストを含めて Linux でもビルドできること）、
 #   ターゲットをまたいで同じ値になるはずのゴールデン（整数の操作・解析、コーデックの書くバイト列（Ogg Vorbis を含む）、
 #   3D の描画、作り直しの見本集）。ほかのテストは手元の /verify が回す。
 # - 全部のテストは手で起こすときだけ（Actions の「Run workflow」か `gh workflow run ci.yml --ref <ブランチ>`）：ubuntu で
 #   kura-engine・kura-core・vorbis-tables、macOS で Swift ヘルパーを含むクレートと、ffmpeg の段の実物のテスト（Homebrew の ffmpeg）。
+#   Linux・macOS とも、同じ分け方の 4 つの段に分けて並べて回す（ADR-212・ADR-214）。
 # src-tauri はフロントのビルドが要るので、どちらでも回さない。
 name: CI
 
@@ -20,6 +21,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # 全部のテストの 1 段目（Linux・macOS とも）で回す kura-engine の suite のモジュール（`<ファイル名>::`）。2 段目は同じものを
+  # `--skip` して残りを回す。libtest の絞り込みと `--skip` は同じ「名前に含む」で決まるので、2 つの段はちょうど裏表になり、
+  # 漏れも重なりもない（新しいモジュールは 2 段目に入る。`view::` は `preview::` にも含まれる）。手元で CI の macOS と同じ
+  # 3 スレッドで測ると、この 6 つで 141 秒、残りの 46 で 99 秒。CI では 2 段目が重く出る（audio_props を入れる前の 5 つで
+  # macOS 268 秒・残り 353 秒）ので、手元の比より 1 段目を重くしてある（2026-11-22。ADR-212・ADR-214）。偏ったら
+  # CI の段の時間を見て入れ替える
+  SUITE_HEAVY: >-
+    encode_stream:: decode_stream:: audio_region:: view:: preview:: audio_props::
 
 jobs:
   minimal:
@@ -50,34 +59,104 @@ jobs:
           --test golden --test codec_golden --test analysis_golden --test model_golden --test replay
 
   linux:
-    name: 全部（Linux。kura-engine・kura-core・vorbis-tables）
+    name: 全部（Linux ${{ matrix.part }}）
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # ふだんは 8〜12 分。テストが止まったときに 6 時間の既定まで待たない
+    # テストが止まったときに 6 時間の既定まで待たない
     timeout-minutes: 25
+    strategy:
+      # 1 つの段が落ちても、ほかの段は最後まで回して結果を見る
+      fail-fast: false
+      matrix:
+        # macOS と同じ分け方（ADR-214）
+        include:
+          - part: 1/4 エンジンの結合テスト（重いもの）
+            key: suite-heavy
+            fetch-depth: 1
+          - part: 2/4 エンジンの結合テスト（残り）
+            key: suite-rest
+            fetch-depth: 1
+          - part: 3/4 kura-core
+            key: core
+            fetch-depth: 1
+          - part: 4/4 整形・lint・検査・vorbis-tables・エンジンの lib と suite でない結合テスト
+            key: rest
+            # ゴールデンの追記だけの検査が origin/main との差分を見る
+            fetch-depth: 0
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: ${{ matrix.fetch-depth }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.99.0'
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables --all-targets -- -D warnings
-      - run: cargo test -p kura-engine -p kura-core -p vorbis-tables
+        with:
+          # 段ごとにビルドするものが違うので、キャッシュも段ごとに分ける
+          key: ${{ matrix.key }}
+      - if: matrix.key == 'rest'
+        run: cargo fmt --all -- --check
+      - if: matrix.key == 'rest'
+        run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables --all-targets -- -D warnings
       - name: ゴールデンは追記だけ
+        if: matrix.key == 'rest'
         run: scripts/check-goldens-append-only.sh
       - name: エンジンの依存に SIMD の feature がない
+        if: matrix.key == 'rest'
         run: scripts/check-engine-features.sh
+      - name: エンジンの結合テスト（重いもの）
+        if: matrix.key == 'suite-heavy'
+        run: |
+          read -ra heavy <<< "$SUITE_HEAVY"
+          cargo test -p kura-engine --test suite -- "${heavy[@]}"
+      - name: エンジンの結合テスト（残り）
+        if: matrix.key == 'suite-rest'
+        run: |
+          read -ra heavy <<< "$SUITE_HEAVY"
+          skip=()
+          for m in "${heavy[@]}"; do skip+=(--skip "$m"); done
+          cargo test -p kura-engine --test suite -- "${skip[@]}"
+      # Linux では成り立たない前提のテストは、Mac のテストを変えずにここで外す（ADR-211）：
+      # - a_slow_consumer_is_not_counted_as_a_stall：macOS のパイプの渡し方（1 回に 64 KiB ほど）で、受け手が遅いときの
+      #   待ちの場面を作る。Linux は 1 回に 256 KiB まで渡すので場面が起きず、前提の確かめで落ちる
+      - name: kura-core
+        if: matrix.key == 'core'
+        run: cargo test -p kura-core -- --skip tools::tests::a_slow_consumer_is_not_counted_as_a_stall
+      - name: vorbis-tables・エンジンの lib と suite でない結合テスト
+        if: matrix.key == 'rest'
+        run: |
+          # suite でない結合テストは Cargo.toml の [[test]] から拾う（足したものも漏れない）
+          tests=()
+          while read -r t; do
+            if [ "$t" != suite ]; then tests+=(--test "$t"); fi
+          done < <(sed -n 's|^path = "tests/\(.*\)\.rs"$|\1|p' crates/kura-engine/Cargo.toml)
+          cargo test -p vorbis-tables
+          cargo test -p kura-engine --lib "${tests[@]}"
+          cargo test -p kura-engine --doc
 
   macos:
-    name: 全部（macOS。kura-engine・kura-core・vorbis-tables・kura-mac・kura-devtools）
+    name: 全部（macOS ${{ matrix.part }}）
     if: github.event_name == 'workflow_dispatch'
     runs-on: macos-26
-    # ふだんは 16〜19 分。テストが止まったときに 6 時間の既定まで待たない（2026-10 に sips が止まって 3 時間かかった）
-    timeout-minutes: 40
+    # 1 段は 7〜11 分（2026-11-22 の実測。4 段に分ける前の 1 本は 24 分。ADR-212）。テストが止まったときに 6 時間の既定まで待たない
+    # （2026-10 に sips が止まって 3 時間かかった）
+    timeout-minutes: 30
+    strategy:
+      # 1 つの段が落ちても、ほかの段は最後まで回して結果を見る
+      fail-fast: false
+      matrix:
+        include:
+          - part: 1/4 エンジンの結合テスト（重いもの）
+            key: suite-heavy
+          - part: 2/4 エンジンの結合テスト（残り）
+            key: suite-rest
+          - part: 3/4 kura-core・kura-devtools
+            key: core
+            ffmpeg: true
+          - part: 4/4 kura-mac・vorbis-tables・エンジンの lib と suite でない結合テスト・clippy
+            key: mac
+            ffmpeg: true
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -85,17 +164,48 @@ jobs:
           toolchain: '1.99.0'
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables -p kura-mac -p kura-devtools --all-targets -- -D warnings
+        with:
+          # 段ごとにビルドするものが違うので、キャッシュも段ごとに分ける
+          key: ${{ matrix.key }}
+      - if: matrix.key == 'mac'
+        run: cargo clippy -p kura-engine -p kura-core -p vorbis-tables -p kura-mac -p kura-devtools --all-targets -- -D warnings
       # ffmpeg の段の実物のテスト（real_ffmpeg_*）は ffmpeg がないと何も確かめずに通るので、入れたうえで
       # KURA_FFMPEG_REQUIRED=1 にして、見つからなければ落とす（Linux の job は見送る。real_tools() が見るのは
-      # KURA_FFMPEG_DIR か /opt/homebrew/bin だけ）。brew install は依存を含めて 15 個ほどの瓶で、1 分前後
+      # KURA_FFMPEG_DIR か /opt/homebrew/bin だけ）。kura-mac・kura-devtools も ffmpeg があれば使うので、4 段目にも入れる。
+      # brew install は依存を含めて 15 個ほどの瓶で、1 分前後
       - name: ffmpeg を入れる（Homebrew）
+        if: matrix.ffmpeg
         run: brew install ffmpeg
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_NO_INSTALL_CLEANUP: '1'
           HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: '1'
-      - run: /opt/homebrew/bin/ffmpeg -hide_banner -version
-      - run: cargo test -p kura-engine -p kura-core -p vorbis-tables -p kura-mac -p kura-devtools
+      - if: matrix.ffmpeg
+        run: /opt/homebrew/bin/ffmpeg -hide_banner -version
+      - name: エンジンの結合テスト（重いもの）
+        if: matrix.key == 'suite-heavy'
+        run: |
+          read -ra heavy <<< "$SUITE_HEAVY"
+          cargo test -p kura-engine --test suite -- "${heavy[@]}"
+      - name: エンジンの結合テスト（残り）
+        if: matrix.key == 'suite-rest'
+        run: |
+          read -ra heavy <<< "$SUITE_HEAVY"
+          skip=()
+          for m in "${heavy[@]}"; do skip+=(--skip "$m"); done
+          cargo test -p kura-engine --test suite -- "${skip[@]}"
+      - name: kura-core・kura-devtools
+        if: matrix.key == 'core'
+        run: cargo test -p kura-core -p kura-devtools
         env:
           KURA_FFMPEG_REQUIRED: '1'
+      - name: kura-mac・vorbis-tables・エンジンの lib と suite でない結合テスト
+        if: matrix.key == 'mac'
+        run: |
+          # suite でない結合テストは Cargo.toml の [[test]] から拾う（足したものも漏れない）
+          tests=()
+          while read -r t; do
+            if [ "$t" != suite ]; then tests+=(--test "$t"); fi
+          done < <(sed -n 's|^path = "tests/\(.*\)\.rs"$|\1|p' crates/kura-engine/Cargo.toml)
+          cargo test -p kura-mac -p vorbis-tables
+          cargo test -p kura-engine --lib "${tests[@]}"
