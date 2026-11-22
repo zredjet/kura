@@ -2335,6 +2335,100 @@ mod tests {
     // -------------------------------------------------------------------------------------------------------
     // 細部
 
+    /// 少しずつしか読ませない読み口（`Bits::fill` の読み口を補う枝を通す）。
+    struct Trickle {
+        data: Vec<u8>,
+        pos: usize,
+        step: usize,
+    }
+
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.step.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    impl std::io::Seek for Trickle {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            let at = match to {
+                std::io::SeekFrom::Start(v) => v as i64,
+                std::io::SeekFrom::Current(d) => self.pos as i64 + d,
+                std::io::SeekFrom::End(d) => self.data.len() as i64 + d,
+            };
+            self.pos = at.clamp(0, self.data.len() as i64) as usize;
+            Ok(self.pos as u64)
+        }
+    }
+
+    /// `Bits::rice` が、`unary` と `read` を順に呼ぶのと同じ値・同じ誤り・同じ先読み（`acc`・`n`）・同じ読み口の位置になる
+    /// （ChaCha8 のバイト列：0 のバイトの多さを変えて長い 1 進の数も作る。k は 0〜30。`read` も混ぜる。読み込んだバイト列と、
+    /// 1〜20 バイトずつ補う読み口の両方）。
+    #[test]
+    fn rice_reads_like_unary_then_read() {
+        let mut r = crate::determinism::rng(67);
+        let mut fast = 0u64;
+        for round in 0..600 {
+            let zeros = (r.next_u32() % 100) as u64;
+            let len = 1 + (r.next_u32() % 4_000) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    if u64::from(r.next_u32() % 100) < zeros {
+                        0
+                    } else {
+                        r.next_u32() as u8
+                    }
+                })
+                .collect();
+            let step = 1 + (r.next_u32() % 20) as usize;
+            let (mut ta, mut tb) = (
+                Trickle {
+                    data: data.clone(),
+                    pos: 0,
+                    step,
+                },
+                Trickle {
+                    data: data.clone(),
+                    pos: 0,
+                    step,
+                },
+            );
+            let (mut ma, mut mb) = if round % 2 == 0 {
+                (Media::Bytes(&data), Media::Bytes(&data))
+            } else {
+                (Media::Reader(&mut ta), Media::Reader(&mut tb))
+            };
+            let mut ia = Input::new(&mut ma, &NoMonitor, DEC_ID).unwrap();
+            let mut ib = Input::new(&mut mb, &NoMonitor, DEC_ID).unwrap();
+            ia.mark();
+            ib.mark();
+            let (mut a, mut b) = (Bits::new(&mut ia), Bits::new(&mut ib));
+            for _ in 0..6_000 {
+                let (x, y) = if r.next_u32().is_multiple_of(5) {
+                    let w = r.next_u32() % 33;
+                    (a.read(w), b.read(w))
+                } else {
+                    let k = r.next_u32() % 31;
+                    if a.acc.leading_zeros() + 1 + k <= a.n {
+                        fast += 1;
+                    }
+                    let y = b.unary().and_then(|q| Ok((q << k) | b.read(k)?));
+                    (a.rice(k), y)
+                };
+                assert_eq!(x.as_ref().ok(), y.as_ref().ok(), "{round}");
+                assert_eq!(x.is_err(), y.is_err(), "{round}");
+                assert_eq!((a.acc, a.n), (b.acc, b.n), "{round}");
+                assert_eq!(a.input.pos, b.input.pos, "{round}");
+                if x.is_err() {
+                    break;
+                }
+            }
+        }
+        assert!(fast > 100_000, "{fast}");
+    }
+
     /// [`full_scale`] が `pcm::int_to_f32(v, 32)` と同じビット（端の値、0 の近く、2 の累乗の前後、16・24 ビットを左詰めした
     /// 値、ChaCha8 の値）。
     #[test]
