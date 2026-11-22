@@ -39,7 +39,7 @@ use crate::codec::byte_in::Input;
 use crate::codec::md5::Md5;
 use crate::codec::stream::DecodeOut;
 use crate::codec::symph::Media;
-use crate::codec::{pcm, try_vec};
+use crate::codec::try_vec;
 use crate::error::EngineError;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
@@ -106,10 +106,32 @@ const fn crc16_table() -> [u16; 256] {
     t
 }
 
+/// CRC-16 を 8 バイトずつ進める表：`[k][x]` は、バイト `x` のあとに 0 のバイトを `k` 個続けたものの CRC（`[0]` が
+/// [`CRC16`]）。CRC は線形なので、8 バイトの CRC は、今の値の上位・下位のバイトを最初の 2 バイトに足して、各バイトの
+/// 寄与を足し合わせたもの（[`crc16`]）。
+const fn crc16_slices() -> [[u16; 256]; 8] {
+    let base = crc16_table();
+    let mut t = [[0u16; 256]; 8];
+    t[0] = base;
+    let mut k = 1;
+    while k < 8 {
+        let mut x = 0;
+        while x < 256 {
+            let c = t[k - 1][x];
+            t[k][x] = (c << 8) ^ base[(c >> 8) as usize];
+            x += 1;
+        }
+        k += 1;
+    }
+    t
+}
+
 /// CRC-8（多項式 0x07、初期値 0。フレームの頭）。
 static CRC8: [u8; 256] = crc8_table();
 /// CRC-16（多項式 0x8005、初期値 0。フレーム全体）。
 static CRC16: [u16; 256] = crc16_table();
+/// [`crc16_slices`]。
+static CRC16_SLICES: [[u16; 256]; 8] = crc16_slices();
 
 fn crc8(data: &[u8]) -> u8 {
     data.iter().fold(0u8, |c, b| CRC8[usize::from(c ^ b)])
@@ -118,6 +140,25 @@ fn crc8(data: &[u8]) -> u8 {
 #[inline]
 fn crc16_byte(c: u16, b: u8) -> u16 {
     (c << 8) ^ CRC16[usize::from((c >> 8) as u8 ^ b)]
+}
+
+/// バイト列の CRC-16（[`crc16_byte`] を順に当てたものと同じ値。8 バイトずつ表を引く）。
+fn crc16(data: &[u8]) -> u16 {
+    let t = &CRC16_SLICES;
+    let (blocks, rest) = data.as_chunks::<8>();
+    let mut c = 0u16;
+    for b in blocks {
+        let [hi, lo] = c.to_be_bytes();
+        c = t[7][usize::from(b[0] ^ hi)]
+            ^ t[6][usize::from(b[1] ^ lo)]
+            ^ t[5][usize::from(b[2])]
+            ^ t[4][usize::from(b[3])]
+            ^ t[3][usize::from(b[4])]
+            ^ t[2][usize::from(b[5])]
+            ^ t[1][usize::from(b[6])]
+            ^ t[0][usize::from(b[7])];
+    }
+    rest.iter().fold(c, |c, b| crc16_byte(c, *b))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -493,6 +534,26 @@ impl<'i, 'a> Bits<'i, 'a> {
         }
     }
 
+    /// ライスの符号語 1 つ（1 進の数 `q` と続く `k` ビット `r` を、symphonia と同じく u32 で `(q << k) | r` に組む。あふれた
+    /// ビットは捨てる）。符号語がすべて先読みの中にあれば先読みから直に取る（[`Bits::unary`] と [`Bits::read`] を順に呼ぶ
+    /// のと同じ値・同じ位置。読み足さない）。そうでなければその 2 つを呼ぶ。
+    #[inline]
+    fn rice(&mut self, k: u32) -> Result<u32, EngineError> {
+        let zeros = self.acc.leading_zeros();
+        let used = zeros + 1 + k;
+        if used <= self.n {
+            // 64 ビットずらすと溢れるので 2 回に分ける（zeros ≤ 63、1 + k ≤ 32）
+            let head = self.acc << zeros;
+            let r = (head << 1).checked_shr(64 - k).unwrap_or(0) as u32;
+            self.acc = head << (1 + k);
+            self.n -= used;
+            return Ok((zeros << k) | r);
+        }
+        let q = self.unary()?;
+        let r = self.read(k)?;
+        Ok((q << k) | r)
+    }
+
     /// バイトの境目までの詰め物を捨て、先読みした丸ごとのバイトを読み口へ返す。
     fn finish(self) {
         self.input.pos -= (self.n / 8) as usize;
@@ -613,10 +674,7 @@ fn residual(bits: &mut Bits<'_, '_>, order: usize, buf: &mut [i32]) -> Result<()
         let k = bits.read(pbits)?;
         if k < escape {
             for s in &mut buf[start..end] {
-                let q = bits.unary()?;
-                let r = bits.read(k)?;
-                // symphonia と同じく u32 で組む（あふれたビットは捨てる）
-                let w = (q << k) | r;
+                let w = bits.rice(k)?;
                 *s = ((w >> 1) as i32) ^ -((w & 1) as i32);
             }
         } else {
@@ -630,8 +688,11 @@ fn residual(bits: &mut Bits<'_, '_>, order: usize, buf: &mut [i32]) -> Result<()
     Ok(())
 }
 
+/// 固定の予測（次数 1〜4）。C の式 `x[i] = r[i] + 2x[i−1] − x[i−2]` などは、`r` を次数の回だけ順に足し上げたもの（`r` が
+/// 次数の階差）と同じなので、階差を持って回す（足し算は i32 の折り返し：2³² を法とする和なので、i64 で予測してから i32 に
+/// 戻す symphonia の式と同じ値。試験 `fixed_predict_matches_the_direct_form`）。どの階差も前の標本の 1 回の足し算で
+/// 決まるので、標本ごとに掛け算を待たない。
 fn fixed_predict(order: usize, buf: &mut [i32]) {
-    // 直前の標本を変数に持って回す（予測は i64、足し算は i32 の折り返し。symphonia と同じ）
     match order {
         1 => {
             let Some((first, rest)) = buf.split_first_mut() else {
@@ -644,29 +705,38 @@ fn fixed_predict(order: usize, buf: &mut [i32]) {
             }
         }
         2 if buf.len() > 2 => {
-            let (mut a, mut b) = (i64::from(buf[0]), i64::from(buf[1]));
+            let mut x = buf[1];
+            let mut d1 = buf[1].wrapping_sub(buf[0]);
             for v in &mut buf[2..] {
-                *v = v.wrapping_add((2 * b - a) as i32);
-                (a, b) = (b, i64::from(*v));
+                d1 = d1.wrapping_add(*v);
+                x = x.wrapping_add(d1);
+                *v = x;
             }
         }
         3 if buf.len() > 3 => {
-            let (mut a, mut b, mut c) = (i64::from(buf[0]), i64::from(buf[1]), i64::from(buf[2]));
+            let mut x = buf[2];
+            let mut d1 = buf[2].wrapping_sub(buf[1]);
+            let mut d2 = d1.wrapping_sub(buf[1].wrapping_sub(buf[0]));
             for v in &mut buf[3..] {
-                *v = v.wrapping_add((3 * c - 3 * b + a) as i32);
-                (a, b, c) = (b, c, i64::from(*v));
+                d2 = d2.wrapping_add(*v);
+                d1 = d1.wrapping_add(d2);
+                x = x.wrapping_add(d1);
+                *v = x;
             }
         }
         4 if buf.len() > 4 => {
-            let (mut a, mut b, mut c, mut d) = (
-                i64::from(buf[0]),
-                i64::from(buf[1]),
-                i64::from(buf[2]),
-                i64::from(buf[3]),
-            );
+            let mut x = buf[3];
+            let mut d1 = buf[3].wrapping_sub(buf[2]);
+            let e1 = buf[2].wrapping_sub(buf[1]);
+            let f1 = buf[1].wrapping_sub(buf[0]);
+            let mut d2 = d1.wrapping_sub(e1);
+            let mut d3 = d2.wrapping_sub(e1.wrapping_sub(f1));
             for v in &mut buf[4..] {
-                *v = v.wrapping_add((4 * d - 6 * c + 4 * b - a) as i32);
-                (a, b, c, d) = (b, c, d, i64::from(*v));
+                d3 = d3.wrapping_add(*v);
+                d2 = d2.wrapping_add(d3);
+                d1 = d1.wrapping_add(d2);
+                x = x.wrapping_add(d1);
+                *v = x;
             }
         }
         _ => {}
@@ -1071,12 +1141,7 @@ impl Reader<'_> {
         if !self.input.ensure_rel(body + 2)? {
             return Err(truncated());
         }
-        let crc_of = |input: &Input<'_>, end: usize| {
-            input
-                .slice_rel(0, end)
-                .iter()
-                .fold(0u16, |c, b| crc16_byte(c, *b))
-        };
+        let crc_of = |input: &Input<'_>, end: usize| crc16(input.slice_rel(0, end));
         let be16 = |input: &Input<'_>, at: usize| {
             let b = input.slice_rel(at, at + 2);
             u16::from_be_bytes([b[0], b[1]])
@@ -1198,7 +1263,7 @@ impl Reader<'_> {
                 dst.clear();
                 dst.try_reserve(n)
                     .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-                dst.extend(src[..n].iter().map(|s| pcm::int_to_f32(*s << shift, 32)));
+                dst.extend(src[..n].iter().map(|s| full_scale(*s << shift)));
             }
             let views: Vec<&[f32]> = f32s.iter().map(Vec::as_slice).collect();
             out.push_frames(&views)?;
@@ -1213,6 +1278,14 @@ impl Reader<'_> {
         }
         Ok(())
     }
+}
+
+/// 左詰めした標本を −1〜1 の f32 にする（`pcm::int_to_f32(v, 32)` と同じ値：あちらは f64 で 2³¹ で割ってから f32 に丸め、
+/// こちらは f32 に丸めてから 2⁻³¹ を掛ける。i32 は f64 で正確、2 の累乗で割る・掛けるのは正規の範囲で正確なので、どちらも
+/// `v · 2⁻³¹` を 1 回丸めた値。試験 `full_scale_is_int_to_f32`）。4 つずつの演算にまとめられる。
+#[inline]
+fn full_scale(v: i32) -> f32 {
+    v as f32 * (1.0 / 2_147_483_648.0)
 }
 
 /// フレームの標本（左詰めする前）を MD5 に足す（入れ物の幅のリトルエンディアン。時刻の順・チャンネルの順）。
@@ -1231,23 +1304,70 @@ fn md5_frame(md5: &mut Md5, planes: &[Vec<i32>], n: usize, bps: u32) {
     while t0 < n {
         let t1 = (t0 + step).min(n);
         let len = (t1 - t0) * per;
-        for (c, p) in planes.iter().enumerate() {
-            let dst = buf[c * width..len].chunks_mut(per);
-            match width {
-                1 => dst.zip(&p[t0..t1]).for_each(|(d, s)| d[0] = *s as u8),
-                2 => dst
-                    .zip(&p[t0..t1])
-                    .for_each(|(d, s)| d[..2].copy_from_slice(&(*s as i16).to_le_bytes())),
-                3 => dst
-                    .zip(&p[t0..t1])
-                    .for_each(|(d, s)| d[..3].copy_from_slice(&s.to_le_bytes()[..3])),
-                _ => dst
-                    .zip(&p[t0..t1])
-                    .for_each(|(d, s)| d[..4].copy_from_slice(&s.to_le_bytes())),
-            }
-        }
+        pack_frames(planes, t0, t1, width, &mut buf[..len]);
         md5.update(&buf[..len]);
         t0 = t1;
+    }
+}
+
+/// 標本 `t0..t1` を、時刻の順・チャンネルの順に `width` バイトのリトルエンディアンで `out` に並べる。多い形（16 ビットの
+/// モノラル・ステレオ、24 ビットのステレオ）は時刻の順に 1 つずつ書き、ほかはチャンネルごとに飛び飛びに書く（同じバイト列。
+/// 試験 `packed_frames_are_the_same_bytes`）。
+fn pack_frames(planes: &[Vec<i32>], t0: usize, t1: usize, width: usize, out: &mut [u8]) {
+    match (width, planes) {
+        (2, [l]) => {
+            for (d, a) in out.as_chunks_mut::<2>().0.iter_mut().zip(&l[t0..t1]) {
+                *d = (*a as i16).to_le_bytes();
+            }
+        }
+        (2, [l, r]) => {
+            for ((d, a), b) in out
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(&l[t0..t1])
+                .zip(&r[t0..t1])
+            {
+                let (a, b) = ((*a as i16).to_le_bytes(), (*b as i16).to_le_bytes());
+                *d = [a[0], a[1], b[0], b[1]];
+            }
+        }
+        (3, [l, r]) => {
+            for ((d, a), b) in out
+                .as_chunks_mut::<6>()
+                .0
+                .iter_mut()
+                .zip(&l[t0..t1])
+                .zip(&r[t0..t1])
+            {
+                let (a, b) = (a.to_le_bytes(), b.to_le_bytes());
+                *d = [a[0], a[1], a[2], b[0], b[1], b[2]];
+            }
+        }
+        _ => pack_frames_strided(planes, t0, t1, width, out),
+    }
+}
+
+/// [`pack_frames`] の一般の形（チャンネルごとに、`width × チャンネル` バイトおきに書く）。
+fn pack_frames_strided(planes: &[Vec<i32>], t0: usize, t1: usize, width: usize, out: &mut [u8]) {
+    let per = width * planes.len();
+    for (c, p) in planes.iter().enumerate() {
+        let Some(dst) = out.get_mut(c * width..) else {
+            return;
+        };
+        let dst = dst.chunks_mut(per);
+        match width {
+            1 => dst.zip(&p[t0..t1]).for_each(|(d, s)| d[0] = *s as u8),
+            2 => dst
+                .zip(&p[t0..t1])
+                .for_each(|(d, s)| d[..2].copy_from_slice(&(*s as i16).to_le_bytes())),
+            3 => dst
+                .zip(&p[t0..t1])
+                .for_each(|(d, s)| d[..3].copy_from_slice(&s.to_le_bytes()[..3])),
+            _ => dst
+                .zip(&p[t0..t1])
+                .for_each(|(d, s)| d[..4].copy_from_slice(&s.to_le_bytes())),
+        }
     }
 }
 
@@ -1267,7 +1387,7 @@ mod tests {
 
     use super::*;
     use crate::codec::stream::{self, DecodeInfo};
-    use crate::codec::{CodecSet, Decoder as _, symph};
+    use crate::codec::{CodecSet, Decoder as _, pcm, symph};
     use crate::doc::DecodeOptions;
     use crate::monitor::NoMonitor;
     use crate::value::{Audio, AudioMeta, AudioSource, LoopRange, Value};
@@ -2215,6 +2335,120 @@ mod tests {
     // -------------------------------------------------------------------------------------------------------
     // 細部
 
+    /// [`full_scale`] が `pcm::int_to_f32(v, 32)` と同じビット（端の値、0 の近く、2 の累乗の前後、16・24 ビットを左詰めした
+    /// 値、ChaCha8 の値）。
+    #[test]
+    fn full_scale_is_int_to_f32() {
+        let mut r = crate::determinism::rng(59);
+        let mut vals: Vec<i32> = vec![i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1, -1, 0, 1];
+        for k in 0..31 {
+            for d in -3..=3 {
+                vals.push((1i32 << k).wrapping_add(d));
+                vals.push((-(1i64 << k) as i32).wrapping_add(d));
+            }
+        }
+        vals.extend((i32::from(i16::MIN)..=i32::from(i16::MAX)).map(|v| v << 16));
+        vals.extend((0..200_000).map(|_| (r.next_u32() as i32) & !0xff));
+        vals.extend((0..200_000).map(|_| r.next_u32() as i32));
+        for v in vals {
+            assert_eq!(
+                full_scale(v).to_bits(),
+                pcm::int_to_f32(v, 32).to_bits(),
+                "{v}"
+            );
+        }
+    }
+
+    /// 速い並べ方（16 ビットのモノラル・ステレオ、24 ビットのステレオ）が、一般の形と同じバイト列（幅 1〜4 × チャンネル
+    /// 1〜8 × 区間、ChaCha8 の標本）。
+    #[test]
+    fn packed_frames_are_the_same_bytes() {
+        let mut r = crate::determinism::rng(53);
+        for width in 1..=4usize {
+            for ch in 1..=8usize {
+                let n = 300usize;
+                let planes: Vec<Vec<i32>> = (0..ch)
+                    .map(|_| (0..n).map(|_| r.next_u32() as i32).collect())
+                    .collect();
+                for (t0, t1) in [(0, n), (0, 1), (5, 6), (17, 250), (n, n)] {
+                    let len = (t1 - t0) * width * ch;
+                    let (mut a, mut b) = (vec![0xaau8; len], vec![0x55u8; len]);
+                    pack_frames(&planes, t0, t1, width, &mut a);
+                    pack_frames_strided(&planes, t0, t1, width, &mut b);
+                    assert_eq!(a, b, "{width} {ch} {t0} {t1}");
+                }
+            }
+        }
+    }
+
+    /// 固定の予測の前の形（symphonia と同じく予測を i64 で求め、i32 の折り返しで足す）。
+    fn fixed_predict_direct(order: usize, buf: &mut [i32]) {
+        // 直前の標本を変数に持って回す（予測は i64、足し算は i32 の折り返し。symphonia と同じ）
+        match order {
+            1 => {
+                let Some((first, rest)) = buf.split_first_mut() else {
+                    return;
+                };
+                let mut a = *first;
+                for v in rest {
+                    *v = v.wrapping_add(a);
+                    a = *v;
+                }
+            }
+            2 if buf.len() > 2 => {
+                let (mut a, mut b) = (i64::from(buf[0]), i64::from(buf[1]));
+                for v in &mut buf[2..] {
+                    *v = v.wrapping_add((2 * b - a) as i32);
+                    (a, b) = (b, i64::from(*v));
+                }
+            }
+            3 if buf.len() > 3 => {
+                let (mut a, mut b, mut c) =
+                    (i64::from(buf[0]), i64::from(buf[1]), i64::from(buf[2]));
+                for v in &mut buf[3..] {
+                    *v = v.wrapping_add((3 * c - 3 * b + a) as i32);
+                    (a, b, c) = (b, c, i64::from(*v));
+                }
+            }
+            4 if buf.len() > 4 => {
+                let (mut a, mut b, mut c, mut d) = (
+                    i64::from(buf[0]),
+                    i64::from(buf[1]),
+                    i64::from(buf[2]),
+                    i64::from(buf[3]),
+                );
+                for v in &mut buf[4..] {
+                    *v = v.wrapping_add((4 * d - 6 * c + 4 * b - a) as i32);
+                    (a, b, c, d) = (b, c, d, i64::from(*v));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 階差で回す固定の予測が、前の形と同じ値（次数 0〜5、長さ 0〜40、ChaCha8 の残差と頭の標本。i32 の端の値も混ぜて
+    /// 折り返しを通す）。
+    #[test]
+    fn fixed_predict_matches_the_direct_form() {
+        let mut r = crate::determinism::rng(47);
+        for round in 0..4_000 {
+            let len = (r.next_u32() % 41) as usize;
+            let buf: Vec<i32> = (0..len)
+                .map(|_| match r.next_u32() % 8 {
+                    0 => i32::MIN,
+                    1 => i32::MAX,
+                    2 => r.next_u32() as i32,
+                    _ => (r.next_u32() % 2001) as i32 - 1000,
+                })
+                .collect();
+            let order = round % 6;
+            let (mut a, mut b) = (buf.clone(), buf);
+            fixed_predict(order, &mut a);
+            fixed_predict_direct(order, &mut b);
+            assert_eq!(a, b, "{order} {len}");
+        }
+    }
+
     #[test]
     fn crc_tables_match_the_bitwise_definitions() {
         let bitwise16 = |data: &[u8]| {
@@ -2254,6 +2488,10 @@ mod tests {
                 data[..n].iter().fold(0u16, |c, b| crc16_byte(c, *b)),
                 bitwise16(&data[..n])
             );
+        }
+        // 8 バイトずつ進める形は、どの長さでも 1 バイトずつと同じ
+        for n in 0..data.len() {
+            assert_eq!(crc16(&data[..n]), bitwise16(&data[..n]), "{n}");
         }
     }
 
