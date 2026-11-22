@@ -41,6 +41,7 @@ mod bench_app;
 mod bench_edit;
 mod bench_facts;
 mod bench_migrate;
+mod bench_project;
 mod bench_svg;
 mod bench_thumbs;
 mod crash_loop;
