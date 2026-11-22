@@ -210,31 +210,58 @@ fn render_point(x0: i32, x1: i32, y0: i32, y1: i32, x: i32) -> i32 {
 }
 
 /// `render_line`（floor1.c:368–395）。`x0..min(n, x1)` を順に（最初の点のあと、点ごとに `err`・`y` を進めて）掛ける。
+///
+/// C は点ごとに `err += ady; if err >= adx { err -= adx; y += sy } else { y += base }` と進める。`ady` は
+/// `|dy| mod adx`（0 以上 `adx` 未満）なので、`k` 点目の `err` は `k·ady mod adx`、`y` は `y0 + k·base` に
+/// `⌊k·ady / adx⌋ ·（sy − base）` を足したもの。点を 4 つの組（`k mod 4`）に分け、組ごとに 4 点ずつ同じ式で進める
+/// （`4·ady = q4·adx + r4` として `err += r4`、`y += 4·base + q4·(sy − base)`、`err >= adx` なら `err -= adx`・
+/// `y += sy − base`）。どの点の `y` も C と同じで、掛け算は点ごとに 1 回（`d[x] *= fromdB[y]`）。組どうしは依存しないので、
+/// 点ごとに前の点を待たない（C の形は試験 `render_line_matches_the_c_loop` が照らす）。
 fn render_line(n: i32, x0: i32, x1: i32, y0: i32, y1: i32, d: &mut [f32]) {
     let dy = y1 - y0;
     let adx = x1 - x0;
     let mut ady = dy.abs();
-    let base = dy / adx;
+    let Some(base) = dy.checked_div(adx) else {
+        return;
+    };
     let sy = if dy < 0 { base - 1 } else { base + 1 };
-    let mut y = y0;
-    let mut err = 0;
     ady -= (base * adx).abs();
     let n = if n > x1 { x1 } else { n };
     if x0 >= n {
         return;
     }
-    let Some((first, rest)) = d[x0 as usize..n as usize].split_first_mut() else {
+    let Some(d) = d.get_mut(x0 as usize..n as usize) else {
         return;
     };
-    *first *= FLOOR1_FROMDB_LOOKUP[y as usize];
-    for v in rest {
-        err += ady;
-        if err >= adx {
-            err -= adx;
-            y += sy;
+    let carry = sy - base;
+    // 最初の 4 点は C の形で
+    let mut err = [0i32; 4];
+    let mut y = [y0; 4];
+    for l in 1..4 {
+        err[l] = err[l - 1] + ady;
+        y[l] = y[l - 1];
+        if err[l] >= adx {
+            err[l] -= adx;
+            y[l] += sy;
         } else {
-            y += base;
+            y[l] += base;
         }
+    }
+    let (q4, r4) = (4 * ady / adx, 4 * ady % adx);
+    let step = 4 * base + q4 * carry;
+    let (chunks, rest) = d.as_chunks_mut::<4>();
+    for c in chunks {
+        for l in 0..4 {
+            c[l] *= FLOOR1_FROMDB_LOOKUP[y[l] as usize];
+            err[l] += r4;
+            y[l] += step;
+            if err[l] >= adx {
+                err[l] -= adx;
+                y[l] += carry;
+            }
+        }
+    }
+    for (v, y) in rest.iter_mut().zip(y) {
         *v *= FLOOR1_FROMDB_LOOKUP[y as usize];
     }
 }
@@ -361,6 +388,80 @@ pub(crate) fn floor1_inverse2(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C の `render_line`（floor1.c:368–395）をそのまま（点ごとに前の点から進める形で）組んだもの。
+    fn render_line_c(n: i32, x0: i32, x1: i32, y0: i32, y1: i32, d: &mut [f32]) {
+        let dy = y1 - y0;
+        let adx = x1 - x0;
+        let mut ady = dy.abs();
+        let base = dy / adx;
+        let sy = if dy < 0 { base - 1 } else { base + 1 };
+        let mut x = x0;
+        let mut y = y0;
+        let mut err = 0;
+        ady -= (base * adx).abs();
+        let n = if n > x1 { x1 } else { n };
+        if x < n {
+            d[x as usize] *= FLOOR1_FROMDB_LOOKUP[y as usize];
+        }
+        loop {
+            x += 1;
+            if x >= n {
+                break;
+            }
+            err += ady;
+            if err >= adx {
+                err -= adx;
+                y += sy;
+            } else {
+                y += base;
+            }
+            d[x as usize] *= FLOOR1_FROMDB_LOOKUP[y as usize];
+        }
+    }
+
+    /// 4 つの組に分けて進める `render_line` が、C の形と同じビットを出す（ChaCha8 の線：長さ 1〜2,100、傾きは平ら・急・
+    /// 上り・下り、`n` は線の内・端・外）。
+    #[test]
+    fn render_line_matches_the_c_loop() {
+        use rand_chacha::rand_core::Rng;
+        let mut rng = crate::determinism::rng(41);
+        for round in 0..20_000 {
+            let len = 1 + (rng.next_u32() % if round % 4 == 0 { 2_100 } else { 40 }) as i32;
+            let x0 = (rng.next_u32() % 300) as i32;
+            let x1 = x0 + len;
+            let y0 = (rng.next_u32() % 256) as i32;
+            let y1 = match round % 3 {
+                0 => (rng.next_u32() % 256) as i32,
+                1 => (y0 + (rng.next_u32() % 5) as i32 - 2).clamp(0, 255),
+                _ => {
+                    if y0 < 128 {
+                        255
+                    } else {
+                        0
+                    }
+                }
+            };
+            let n = match round % 5 {
+                0 => x1,
+                1 => x0,
+                2 => x0 + (rng.next_u32() % (len as u32 + 1)) as i32,
+                _ => x1 + (rng.next_u32() % 10) as i32,
+            };
+            let size = (x1.max(n) + 3) as usize;
+            let init: Vec<f32> = (0..size)
+                .map(|_| f32::from_bits(0x3f00_0000 | (rng.next_u32() >> 9)))
+                .collect();
+            let (mut a, mut b) = (init.clone(), init);
+            render_line(n, x0, x1, y0, y1, &mut a);
+            render_line_c(n, x0, x1, y0, y1, &mut b);
+            let (a, b): (Vec<u32>, Vec<u32>) = (
+                a.iter().map(|v| v.to_bits()).collect(),
+                b.iter().map(|v| v.to_bits()).collect(),
+            );
+            assert_eq!(a, b, "{n} {x0} {x1} {y0} {y1}");
+        }
+    }
 
     #[test]
     fn render_point_and_line_follow_the_c() {
