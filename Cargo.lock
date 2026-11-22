@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "kura-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kura-core",
  "kura-engine",
@@ -2139,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "kura-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "kura-devtools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "jpeg-encoder",
@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "kura-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "asefile",
  "blake3",
@@ -2218,7 +2218,7 @@ dependencies = [
 
 [[package]]
 name = "kura-mac"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kura-core",
  "kura-engine",
@@ -5115,7 +5115,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vorbis-tables"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sha2",
 ]

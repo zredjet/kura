@@ -704,7 +704,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 ### BSD-3-Clause
 
-対象：kura-engine（codec/vorbis：aoTuV・libvorbis・libogg の移植）、vorbis-tables 0.1.0
+対象：kura-engine（codec/vorbis：aoTuV・libvorbis・libogg の移植）、vorbis-tables 0.2.0
 
 ````text
 aoTuV - Copyright (c) 2003-2021 Aoyumi

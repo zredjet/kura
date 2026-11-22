@@ -487,7 +487,7 @@ import_start:    ジョブとして実行
 - `backgroundThrottling: "disabled"`（M5）：既定では、ウィンドウがほかのウィンドウに隠れると WebKit が動画の再生開始や CSS アニメーションを止め、再生キューが動画のところで止まる。メディアプレーヤーなので隠れていても再生を続ける（ADR-72）。
 - メニューバーはフロントで組む（`src/app/appMenu.ts`）。文言は ja.ts。「すべてを選択」（⌘A）だけは自前の項目で、入力欄なら文字、それ以外は一覧のすべてを選ぶ（ADR-76）。Kura の操作の項目は、押すとそのキーのイベントをフォーカスのある要素から送る（`replayKey`）ので、キーの処理と同じ条件で動く。表示形式・まとめて表示のチェックとサイドバーの項目の文字は、表示の設定に合わせて書き換える（ADR-116）。「項目 › ドット絵として表示 ▸」（M11）はキーを送らず、一覧で選んでいる画像に直接当てる（`pixelArtMenu.ts` の `applyPixelArtToSelection`。右クリックの ▸ と同じ当て方）。▸ の無効とチェックは、選択・表示・一覧のキャッシュの変化を 100ms にまとめて合わせ直す（`pixelArtSyncer`。ADR-160 (3)）。アプリの言語は `src-tauri/Info.plist` で日本語と宣言し、OS が出す文言も日本語にする（ADR-77）。
 - 署名は個人利用なのでアドホック署名（`bundle.macOS.signingIdentity: "-"`）。App Store には出さない。
-  - リリース（M9。ADR-123）：`pnpm tauri build` で `target/release/bundle/macos/Kura.app` と `bundle/dmg/Kura_<版>_aarch64.dmg` ができる。`codesign -dv` は `Signature=adhoc`（flags adhoc,runtime）、`codesign --verify --deep --strict` は通る。公証はしないので `spctl --assess` は rejected になる。
+  - リリース（M9。ADR-123。0.2.0 は ADR-210）：`pnpm tauri build` で `target/release/bundle/macos/Kura.app` と `bundle/dmg/Kura_<版>_aarch64.dmg` ができる。`codesign -dv` は `Signature=adhoc`（flags adhoc,runtime）、`codesign --verify --deep --strict` は通る。公証はしないので `spctl --assess` は rejected になる。
   - 自分の Mac でビルドしたものは隔離の属性が付かないので、`/Applications` にコピー（`ditto`）すればそのまま開ける。ほかの Mac へ dmg で渡すと Gatekeeper に止められるので、システム設定 › プライバシーとセキュリティの「このまま開く」で開く。
   - 新しい版で既存のライブラリを開くと、足りないマイグレーションを当てる（M9 は 0005、M11 は 0007〜0009）。当てる前に空きを確かめてバックアップを作り（§14）、300ms を超えたら「ライブラリを更新しています」を出す（§3）。当てたあとは前の版では開けない（「新しい版の Kura で作られています」）。
 - 書類・デスクトップ・ダウンロードを「ファイルを選択」で開くと macOS の許可ダイアログが出る。ドラッグ＆ドロップした項目は許可なしで読める。
