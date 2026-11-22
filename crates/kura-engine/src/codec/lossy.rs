@@ -374,7 +374,7 @@ impl Decoder for SymphoniaDecoder {
                 h
             }
             Container::Mp4 => held::mp4(src)?,
-            Container::Flac | Container::Adts => Held {
+            Container::Adts => Held {
                 open: held::READER,
                 decode: 0,
             },
@@ -392,7 +392,7 @@ impl Decoder for SymphoniaDecoder {
                 let mut f = BufReader::new(std::fs::File::open(path)?);
                 self.held_bytes(&mut f, format, limits)
             }
-            Container::Flac | Container::Adts => Ok(Held {
+            Container::Adts => Ok(Held {
                 open: held::READER,
                 decode: 0,
             }),

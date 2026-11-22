@@ -5,7 +5,7 @@
 # - zune-jpeg の neon・x86・portable_simd（既定の feature に入っている）、jpeg-encoder の simd（SIMD の経路）
 # - flate2 の zlib 系（miniz_oxide より優先されて、PNG の書くバイト列が変わる）、png の zlib-rs
 # - symphonia-core の opt-simd（rustfft。AAC・Vorbis の値が変わる）、symphonia-metadata の id3 系（スタックのあふれ）、
-#   nanomp3 の SIMD（wide）。md-5 は FLAC の MD5 を書くだけで、値はどの実装でも同じなので見張らない
+#   nanomp3 の SIMD（wide）
 set -eu
 
 check() {

@@ -9,9 +9,9 @@ yt-dlp・gallery-dl・ffmpeg・deno・mpv・Google Chrome などの外部ツー�
 
 | ライセンス | 件数 |
 |---|--:|
-| MIT | 292 |
+| MIT | 291 |
 | Unicode-3.0 | 19 |
-| MPL-2.0 | 14 |
+| MPL-2.0 | 13 |
 | BSD-3-Clause | 8 |
 | Apache-2.0 | 4 |
 | BSD-2-Clause | 2 |
@@ -3357,41 +3357,6 @@ SOFTWARE.
 
 ### MIT
 
-対象：md-5 0.11.0、sha1 0.11.0
-
-````text
-Copyright (c) 2016-2026 The RustCrypto Project Developers
-Copyright (c) 2016 Artyom Pavlov
-Copyright (c) 2009-2013 Mozilla Foundation
-Copyright (c) 2006-2009 Graydon Hoare
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-````
-
-### MIT
-
 対象：mime 0.3.17
 
 ````text
@@ -4292,6 +4257,41 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+````
+
+### MIT
+
+対象：sha1 0.11.0
+
+````text
+Copyright (c) 2016-2026 The RustCrypto Project Developers
+Copyright (c) 2016 Artyom Pavlov
+Copyright (c) 2009-2013 Mozilla Foundation
+Copyright (c) 2006-2009 Graydon Hoare
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ````
 
 ### MIT
@@ -5263,7 +5263,7 @@ SOFTWARE.
 
 ### MPL-2.0
 
-対象：cssparser 0.37.0、cssparser-macros 0.7.1、symphonia-bundle-flac 0.6.1、symphonia-codec-aac 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-aac/、変更は KURA.md）、symphonia-codec-alac 0.6.1、symphonia-codec-vorbis 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-vorbis/、変更は KURA.md）、symphonia-common 0.6.1、symphonia-core 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-core/、変更は KURA.md）、symphonia-format-isomp4 0.6.1、symphonia-format-ogg 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-format-ogg/、変更は KURA.md）、symphonia-metadata 0.6.1
+対象：cssparser 0.37.0、cssparser-macros 0.7.1、symphonia-codec-aac 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-aac/、変更は KURA.md）、symphonia-codec-alac 0.6.1、symphonia-codec-vorbis 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-vorbis/、変更は KURA.md）、symphonia-common 0.6.1、symphonia-core 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-core/、変更は KURA.md）、symphonia-format-isomp4 0.6.1、symphonia-format-ogg 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-format-ogg/、変更は KURA.md）、symphonia-metadata 0.6.1
 
 ````text
 Mozilla Public License Version 2.0

@@ -47,7 +47,6 @@ const ITEM_COST: usize = 32;
 /// 入れ物の形式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Container {
-    Flac,
     Ogg,
     Mp4,
     Adts,
@@ -210,7 +209,6 @@ fn open_src<'a>(
     let o = FormatOptions::default();
     let e = |e| sym_err(id, e, mon);
     let reader: Box<dyn FormatReader + 'a> = match c {
-        Container::Flac => Box::new(symphonia_bundle_flac::FlacReader::try_new(mss, o).map_err(e)?),
         Container::Ogg => Box::new(symphonia_format_ogg::OggReader::try_new(mss, o).map_err(e)?),
         Container::Mp4 => {
             Box::new(symphonia_format_isomp4::IsoMp4Reader::try_new(mss, o).map_err(e)?)

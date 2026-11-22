@@ -904,7 +904,8 @@ mod tests {
 
     /// M13 段 2 の検証の直し：大きな画像を埋め込んだ FLAC（15 MiB の PICTURE が 3 つ）と m4a（30 MiB の covr）を流して
     /// 解析する子プロセスのピークから基準を引いた量が、解析のジョブの見積もり × 1.25 ＋ 4 MiB 以下（読み手が持ち続ける画像を
-    /// 数える。前の見積もりは中身によらない定数で、FLAC は 9.4 MiB に対して山 46.5 MiB だった）。
+    /// 数える。前の見積もりは中身によらない定数で、FLAC は 9.4 MiB に対して山 46.5 MiB だった）。M16 段 1 の自作の FLAC の
+    /// 読み手は PICTURE を読み飛ばすので、FLAC の見積もりは画像を数えず、実測も画像の分を持たないことをこの上限で確かめる。
     #[test]
     fn held_pictures_analyze_within_estimate() {
         let dir = tempfile::tempdir().unwrap();
@@ -915,8 +916,12 @@ mod tests {
             let path = dir.path().join(format!("{name}.{format}"));
             std::fs::write(&path, &bytes).unwrap();
             let est = analyze_estimate(&path, format);
-            // 見積もりは画像を数える
-            assert!(est > (bytes.len() as u64), "{name}: 見積もり {est}");
+            // m4a の見積もりは画像を数え、FLAC の見積もりは数えない（読み手が持つかどうか）
+            if format == "m4a" {
+                assert!(est > (bytes.len() as u64), "{name}: 見積もり {est}");
+            } else {
+                assert!(est < (bytes.len() as u64), "{name}: 見積もり {est}");
+            }
             let Some((used, base, _)) = analyze_peak(name, &path, format) else {
                 eprintln!(
                     "/usr/bin/time -l が使えないので、{name} のメモリの煙のテストを見送ります"

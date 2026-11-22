@@ -1,14 +1,15 @@
 //! 読み手が音声でない部分で持つ量を、ファイルの頭だけを見て安く数える（M13 段 2 の検証の直し。[`Held`]）。
 //!
-//! symphonia の読み手は、開くときに埋め込みの画像・タグ・箱を読み込み、読み終えるまで持ち続ける（FLAC の PICTURE・
-//! APPLICATION・VORBIS_COMMENT、m4a の moov と ilst の covr、Ogg の頭のパケットのコメントと METADATA_BLOCK_PICTURE）。
+//! 読み手は、開くときに埋め込みの画像・タグ・箱を読み込み、読み終えるまで持ち続ける（symphonia の m4a の moov と ilst の
+//! covr、Ogg の頭のパケットのコメントと METADATA_BLOCK_PICTURE。M16 段 1 の自作の FLAC の読み手は VORBIS_COMMENT のタグだけで、
+//! PICTURE・APPLICATION・SEEKTABLE・CUESHEET は読み飛ばす）。
 //! 形を読む間・流して読む間の作業領域の見積もり（`CodecSet::shape_path_staged`・`stage_stream_work_bytes`）に、ここで数えた量を
 //! 足す。数えるのは箱・ページの頭と、数を決める数バイトだけ（中身は読まずにシークで飛ばす。Ogg の頭のページは CRC を照らす
 //! ために読むが、確保は 1 ページ分だけ）。
 //!
 //! 量は実測（数える確保器。realloc は写す間に前と新しい領域を両方持つと数える。tests/stream_held.rs・kura-devtools の
 //! mem_smoke）に合わせた上からの見積もり：
-//! - 画像（FLAC の PICTURE・m4a の covr）・APPLICATION：中身の 1 倍（そのまま持つ）。FLAC の PICTURE の MIME・説明は 2 倍。
+//! - 画像（m4a の covr）：中身の 1 倍（そのまま持つ）。
 //!   1 つの領域に読む中身は、4 MiB を超えると伸ばし直しながら読むので、読む間は最大でほぼ 2 倍（[`boxed_read_peak`]。
 //!   箱を 1 つずつ読むので、その最大だけを足す）。
 //! - コメント・タグの中身：[`TEXT_FACTOR`] 倍（Ogg はパケットを組み立てる写し、base64 の画像は復号した写しと画像の写し、
@@ -16,7 +17,8 @@
 //!   （実測 3 倍）。
 //! - コメント・タグ 1 つあたり [`ITEM_COST`]（タグの構造と小さな確保。実測 176〜210 バイト）。数はコメントの数の欄を、
 //!   残りの長さで入りうる数（1 つ 4 バイト以上）で抑える。
-//! - FLAC の SEEKTABLE は 2 倍（実測 1.5 倍）、CUESHEET は 8 倍（小さい）、moov のほかの部分（標本の表）は 2 倍。
+//! - moov のほかの部分（標本の表）は 2 倍。FLAC の VORBIS_COMMENT は箱の 1 倍（読む間だけ）とタグ（読めない UTF-8 を置き換えると
+//!   最大 3 倍）で、コメントの倍率の内。
 //! - 読み手そのものの緩衝（[`READER`]）。
 //! - Vorbis の codebook の表（流して読む間だけ。`symph::vorbis_setup_bytes`）：setup が [`SETUP_MAX`] を超えて組み立てられない
 //!   ときは、読み口が受け付ける上限（`min(max_value_bytes, 256 MiB)`）とみなす。
@@ -190,8 +192,9 @@ fn comment_count(w: &mut Walk<'_>, end: u64) -> Result<u64, EngineError> {
     Ok(u64::from(count).min(end.saturating_sub(w.pos) / 4))
 }
 
-/// FLAC（symphonia の `FlacReader` がメタデータの箱を読む順に、`last` の箱まで）。箱ごとに持ち続ける量を足し、1 つの領域に
-/// 読む間だけ持つ量（[`boxed_extra`]）の最大を足す。
+/// FLAC（自作の読み手 `codec::flac_read` がメタデータの箱を読む順に、`last` の箱まで）。持つのは VORBIS_COMMENT（箱を
+/// ちょうどの大きさの 1 つの領域に読み、タグに写す）だけで、ほかの箱は読み飛ばす（M16 段 1。前の symphonia の読み手は
+/// PICTURE・APPLICATION・SEEKTABLE・CUESHEET も持っていた）。
 pub(crate) fn flac(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
     let mut w = Walk::new(src)?;
     let mut peak = Peak::default();
@@ -211,48 +214,14 @@ pub(crate) fn flac(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
         if end > w.len {
             break;
         }
-        match kind {
-            // STREAMINFO
-            0 => peak.add(len, 0),
-            // APPLICATION（中身を 1 つの領域に読んで持つ）
-            2 => peak.add(len.saturating_add(ITEM_COST), boxed_extra(len)),
-            // SEEKTABLE（点を 1 つずつ伸ばす列に足す）
-            3 => peak.add(len.saturating_mul(2), len.saturating_mul(2)),
-            // VORBIS_COMMENT（コメントを 1 つずつ 1 つの領域に読んで、タグに写す）
-            4 => {
-                let n = comment_count(&mut w, end)?;
-                peak.add(
-                    len.saturating_mul(TEXT_FACTOR)
-                        .saturating_add(n.saturating_add(1).saturating_mul(ITEM_COST)),
-                    boxed_extra(len),
-                );
-            }
-            // CUESHEET
-            5 => peak.add(len.saturating_mul(8), 0),
-            // PICTURE：種類・MIME の長さ・MIME・説明の長さ・説明・…・画像の長さ・画像（画像は 1 つの領域に読んで持つ。
-            // MIME・説明は写しも持つ）
-            6 => {
-                let mut text = 0u64;
-                if w.u32_be()?.is_some()
-                    && let Some(mime) = w.u32_be()?
-                {
-                    text = u64::from(mime);
-                    w.goto(w.pos.saturating_add(u64::from(mime)))?;
-                    if w.pos.saturating_add(4) <= end
-                        && let Some(desc) = w.u32_be()?
-                    {
-                        text = text.saturating_add(u64::from(desc));
-                    }
-                }
-                let text = text.min(len);
-                peak.add(
-                    len.saturating_add(text.saturating_mul(2))
-                        .saturating_add(ITEM_COST),
-                    boxed_extra(len),
-                );
-            }
-            // PADDING・知らない箱は読み飛ばす（持たない）
-            _ => {}
+        // VORBIS_COMMENT（箱を 1 つの領域に読んでタグに写す）。ほかの箱は読み飛ばす（持たない）
+        if kind == 4 {
+            let n = comment_count(&mut w, end)?;
+            peak.add(
+                len.saturating_mul(TEXT_FACTOR)
+                    .saturating_add(n.saturating_add(1).saturating_mul(ITEM_COST)),
+                0,
+            );
         }
         w.goto(end)?;
         if last {

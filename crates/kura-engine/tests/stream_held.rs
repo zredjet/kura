@@ -571,7 +571,7 @@ fn stream_estimates_cover_what_readers_hold() {
         cases.push((name, path, format));
     };
     // FLAC：画像 3 つ（各 8 MiB）・説明の長い画像・base64 の画像のコメント・小さなコメント 20 万・長い文字・シークの表・
-    // APPLICATION
+    // APPLICATION（画像・シークの表・APPLICATION は、M16 段 1 の自作の読み手が読み飛ばす。下の `skipped`）
     put(
         "flac-pictures",
         flac_with(&[
@@ -656,10 +656,21 @@ fn stream_estimates_cover_what_readers_hold() {
         m4a_with_tags(&[(lyr, 1, vec![b'x'; 4 << 20])]),
         "m4a",
     );
+    // 自作の FLAC の読み手が読み飛ばす箱（持たない）
+    let skipped = [
+        "flac-pictures",
+        "flac-long-description",
+        "flac-seektable",
+        "flac-application",
+    ];
     for (name, path, format) in &cases {
         let (shape_peak, _, stream_peak, _) = check(name, path, format);
-        // 見積もりの意味があるケース（持つ量が数 MiB ある）
-        assert!(shape_peak.max(stream_peak) > 3 << 20, "{name}");
+        if skipped.contains(name) {
+            assert!(shape_peak.max(stream_peak) < 2 << 20, "{name}");
+        } else {
+            // 見積もりの意味があるケース（持つ量が数 MiB ある）
+            assert!(shape_peak.max(stream_peak) > 3 << 20, "{name}");
+        }
         std::fs::remove_file(path).unwrap();
     }
     // 画像もタグもないフィクスチャも、見積もりの中
