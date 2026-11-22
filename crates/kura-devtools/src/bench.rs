@@ -17,7 +17,8 @@ use kura_core::time::now_ms;
 /// `bench edit …`（編集のベンチ。`bench_edit`）/ `bench migrate …`（マイグレーション。`bench_migrate`）/
 /// `bench analyze …`（解析のジョブ。`bench_analyze`）/ `bench thumbs-job --src <dir> …`（サムネイルのジョブ。`bench_thumbs`）/
 /// `bench svg-worker …`（SVG の働き手の手間。`bench_svg`）/ `bench editor …`・`bench save …`（M12 のアプリの道：エディタの
-/// 1 手とタイル、保存のジョブの全体。`bench_app`）/ `bench batch …`（M14 の一括加工のジョブの通しと E4。`bench_app::batch`）。
+/// 1 手とタイル、保存のジョブの全体。`bench_app`）/ `bench batch …`（M14 の一括加工のジョブの通しと E4。`bench_app::batch`）/
+/// `bench project …`（M15 のプロジェクトの照らし直し。`bench_project`）。
 pub fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("edit") {
         return crate::bench_edit::run(&args[1..]);
@@ -42,6 +43,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("svg-worker") {
         return crate::bench_svg::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("project") {
+        return crate::bench_project::run(&args[1..]);
     }
     let mut library = None;
     let mut src = None;
