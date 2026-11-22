@@ -20,7 +20,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::facts::{FACTS_V, MediaFacts, PIXEL_RULE};
-use super::plan::{DECODERS_KEY, DecoderFingerprint, PLAN_KEY, PlanFingerprint, canonical_string};
+use super::plan::{
+    DECODERS_KEY, DecoderFingerprint, PINNED_KEY, PLAN_KEY, PlanFingerprint, canonical_string,
+};
 use crate::Result;
 use crate::import::MediaKind;
 use crate::settings;
@@ -629,6 +631,27 @@ pub fn sync_decoders(tx: &Connection, current: &DecoderFingerprint) -> Result<us
     Ok(reset)
 }
 
+/// 起動のスレッド：固定の段のデコーダだけの指紋 `current`（`DecoderFingerprint::of(&CodecSet::pinned())`）を置いた指紋と比べ、
+/// 違えば置き換える。解析のジョブを積むべきか（前の指紋と違った。前の指紋がなければ、解析のジョブが全体の指紋を置いたことが
+/// あるとき）を返す。全体の指紋（Platform・External の段を含む）は組を作らないと分からないので、起動の道では作らず、積んだ
+/// ジョブが `sync_decoders` で比べて、並びの変わった形式を読み直す（固定の段の読み手を替えた更新のあと、取り込みも保存も
+/// しなくても読み直すように。M16 段 5）。settings を主キーで引くだけで、items は走査しない。
+pub fn sync_pinned(tx: &Connection, current: &DecoderFingerprint) -> Result<bool> {
+    let stored: Option<DecoderFingerprint> = settings::get(tx, PINNED_KEY)?;
+    if stored.as_ref() == Some(current) {
+        return Ok(false);
+    }
+    put_canonical(
+        tx,
+        PINNED_KEY,
+        &canonical_string(&serde_json::to_value(current)?)?,
+    )?;
+    Ok(match stored {
+        Some(_) => true,
+        None => settings::get::<DecoderFingerprint>(tx, DECODERS_KEY)?.is_some(),
+    })
+}
+
 fn put_canonical(tx: &Connection, key: &str, json: &str) -> Result<()> {
     let mut stmt = tx.prepare_cached(
         "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -1032,6 +1055,29 @@ mod tests {
         let stored: DecoderFingerprint = settings::get(&conn, DECODERS_KEY).unwrap().unwrap();
         assert_eq!(stored, now);
         assert_eq!(sync_decoders(&conn, &now).unwrap(), 0);
+    }
+
+    /// 起動の固定の段の指紋（M16 段 5）：置いた指紋と同じなら積まない。違えば置き換えて積む。前の指紋がなければ、解析のジョブが
+    /// 全体の指紋を置いたことがあるときだけ積む（新しいライブラリは置くだけ）。items は走査しない。
+    #[test]
+    fn pinned_decoders_are_compared_on_open() {
+        let conn = test_conn();
+        let current = DecoderFingerprint::of(&kura_engine::codec::CodecSet::pinned());
+        assert!(!sync_pinned(&conn, &current).unwrap(), "最初は置くだけ");
+        assert!(!sync_pinned(&conn, &current).unwrap());
+        let mut older = current.clone();
+        older
+            .0
+            .insert("ogg".into(), vec!["ogg-vorbis-symphonia-dec/3".into()]);
+        settings::set(&conn, PINNED_KEY, &older).unwrap();
+        assert!(sync_pinned(&conn, &current).unwrap(), "替わった");
+        assert!(!sync_pinned(&conn, &current).unwrap(), "置き換えた");
+        // 前の指紋がなく、解析のジョブが全体の指紋を置いたことがある（この版より前のアプリで解析した）
+        settings::remove(&conn, PINNED_KEY).unwrap();
+        settings::set(&conn, DECODERS_KEY, &older).unwrap();
+        assert!(sync_pinned(&conn, &current).unwrap());
+        let stored: DecoderFingerprint = settings::get(&conn, PINNED_KEY).unwrap().unwrap();
+        assert_eq!(stored, current);
     }
 
     /// 決定 15：計画の指紋の形式ごとの扱いが変わったら（形式から書いていた HEIC・HEIF を見出しで決める）、その形式の ready・

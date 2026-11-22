@@ -320,6 +320,12 @@ pub trait Decoder: Send + Sync {
     fn env(&self) -> Option<CodecEnv> {
         None
     }
+    /// 後の版で外す旧版の読み手か（既定は偽）。真なら、kura-core の移し替えのジョブ（`edit::retire`）が、この識別子で読んだ版の
+    /// 入力のうちアンカーのないものに、この読み手で 1 度だけアンカーを作る（M16 段 5。docs/editing.md §9.4）。旧版
+    /// （`add_legacy_decoder`）にだけ付ける。
+    fn retiring(&self) -> bool {
+        false
+    }
     /// この形式を読めるか。
     fn can_decode(&self, format: &str) -> bool;
     /// 形 `shape`（[`Decoder::shape`] の結果）の値を読む間に、読んだ値のほかに使う作業領域の見積もり（バイト。§12 の
@@ -774,6 +780,16 @@ impl CodecSet {
         self.decoders
             .iter()
             .filter(|d| d.can_decode(format))
+            .collect()
+    }
+
+    /// 後の版で外す旧版の読み手の識別子（[`Decoder::retiring`] が真の旧版。足した順）。移し替えのジョブが、この識別子で
+    /// 読んだ版の入力にアンカーを作る（M16 段 5）。
+    pub fn retiring_ids(&self) -> Vec<&'static str> {
+        self.legacy_decoders
+            .iter()
+            .filter(|d| d.retiring())
+            .map(|d| d.id())
             .collect()
     }
 
@@ -1861,6 +1877,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stamp.tier, Tier::Pinned);
+    }
+
+    /// 退役する旧版（M16 段 5）は symphonia の Vorbis・AAC の 3 つだけで、どれも旧版の読み手（記録の識別子で選べ、ふつうの
+    /// 読み取りでは選ばれない）。PNG の /1 は外さない（段 6 で同じ値を読む自作に替える）ので退役させない。
+    #[test]
+    fn retiring_decoders_are_the_symphonia_legacy_ones() {
+        let set = CodecSet::pinned();
+        let ids = set.retiring_ids();
+        assert_eq!(
+            ids,
+            [
+                "ogg-vorbis-symphonia-dec/3",
+                "m4a-aac-symphonia-dec/2",
+                "aac-adts-symphonia-dec/2"
+            ]
+        );
+        for id in ids {
+            let d = set.decoder_by_id(id).unwrap();
+            assert!(d.retiring() && d.reproducible() && d.tier() == Tier::Pinned);
+            for f in ["ogg", "m4a", "aac"] {
+                assert!(set.decoders_for(f).iter().all(|c| c.id() != id), "{id}");
+            }
+        }
+        assert!(set.decoders.iter().all(|d| !d.retiring()));
+        assert!(
+            !set.decoder_by_id("png-rs-dec/1").unwrap().retiring(),
+            "PNG の旧版は退役させない"
+        );
     }
 
     /// 形は読めても中身で扱えないと分かった（`decode` が `Unsupported`）ときも、次の段へ回す。

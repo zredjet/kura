@@ -11,7 +11,7 @@ use super::ledger;
 use super::upgrade::UpgradeHooks;
 use super::{Library, LibraryLock};
 use crate::Result;
-use crate::analysis::plan::PlanFingerprint;
+use crate::analysis::plan::{DecoderFingerprint, PlanFingerprint};
 use crate::analysis::{AnalyzeHandler, AnalyzeShared, store as analysis_store};
 use crate::capture::CaptureHandler;
 use crate::download::{DownloadHandler, work_dir_name};
@@ -219,6 +219,11 @@ impl LibrarySession {
                     crate::edit::batch::BatchHandler::new(engine.clone()).with_gc(gc_clock.clone()),
                 ),
             ));
+            // 退役する読み手の記録をアンカーへ移す（M16 段 5）
+            handlers.push((
+                JobKind::Retire,
+                Arc::new(crate::edit::retire::RetireHandler::new(engine.clone())),
+            ));
         }
         let jobs = Arc::new(JobManager::new(library.clone(), handlers, sink)?);
         let integrity = Arc::new(Mutex::new(None));
@@ -269,6 +274,13 @@ impl LibrarySession {
                     sync_analysis(&lib, &jobs2);
                     // 置き換えた版の片付け（7 日とバックアップの条件を満たす候補・孤立した部品があるときだけ）
                     queue_gc(&lib, &jobs2, &clock);
+                    // 退役する読み手の記録をアンカーへ移す（移し終えた印と退役の識別子の一覧が違うときだけ。M16 段 5）
+                    let retiring = kura_engine::codec::CodecSet::pinned().retiring_ids();
+                    if let Err(err) =
+                        crate::edit::retire::queue_on_open(lib.db(), &jobs2, &retiring)
+                    {
+                        tracing::error!(%err, "旧版の読み取りを残すジョブを積めませんでした");
+                    }
                 }
                 // 登録したプロジェクトがあれば照らし直す（裏で。変わったファイルだけハッシュする。M15 段 2 の決定 2）
                 if let Err(err) = crate::project::queue_on_open(lib.db(), &jobs2) {
@@ -481,18 +493,23 @@ fn queue_gc(lib: &Library, jobs: &JobManager, clock: &GcClock) {
 }
 
 /// 起動のスレッドで、整合性チェックのあとに呼ぶ：解析の計画の指紋を比べ（変わった種類だけ pending に戻す）、解析を待つもの・
-/// 投影の作り直しの印があれば解析のジョブを積む。デコーダの指紋はジョブがコーデックの組を作ったときに比べる（起動の道で組を
-/// 作らない）。
+/// 投影の作り直しの印があれば解析のジョブを積む。デコーダの全体の指紋はジョブがコーデックの組を作ったときに比べる（起動の道で
+/// Platform・External の段の組を作らない）が、固定の段だけの指紋（`CodecSet::pinned()`。組み立ては軽い）は起動で比べ、変わって
+/// いれば解析のジョブを積む（更新で固定の段の読み手が替わったら、取り込みも保存もしなくても読み直す。M16 段 5）。
 fn sync_analysis(lib: &Library, jobs: &JobManager) {
     let synced = kura_engine::analysis::registry()
         .map_err(|e| crate::CoreError::Invalid(format!("解析の登録表を作れません: {e}")))
         .and_then(|registry| PlanFingerprint::current(&registry))
         .and_then(|current| {
-            lib.db()
-                .write(move |tx| analysis_store::sync_plan(tx, &current))
+            let pinned = DecoderFingerprint::of(&kura_engine::codec::CodecSet::pinned());
+            lib.db().write(move |tx| {
+                let sync = analysis_store::sync_plan(tx, &current)?;
+                let pinned = analysis_store::sync_pinned(tx, &pinned)?;
+                Ok((sync, pinned))
+            })
         });
     match synced {
-        Ok(sync) if sync.todo => {
+        Ok((sync, pinned)) if sync.todo || pinned => {
             if let Err(err) = jobs.ensure_queued(JobKind::Analyze, "{}") {
                 tracing::error!(%err, "解析のジョブを積めませんでした");
             }
@@ -591,6 +608,115 @@ mod tests {
         let session = LibrarySession::open(&path, sink(), services()).unwrap();
         session.wait_ready();
         assert_eq!(gc_jobs(&session), 1);
+    }
+
+    /// 開いたとき（M16 段 5）：退役する読み手の移し替えは、退役の識別子の一覧が移し終えた印と違うときだけ積む（版の入力が
+    /// なければ印だけ置く）。固定の段のデコーダの指紋が前と違えば解析のジョブを積む（最初は置くだけ）。同じなら、開き直しても
+    /// どちらも積まない。
+    #[test]
+    fn retire_and_pinned_decoders_are_checked_on_open() {
+        use crate::analysis::plan::{DECODERS_KEY, PINNED_KEY};
+        use crate::edit::retire::DONE_KEY;
+        use crate::edit::testing::{insert_item, insert_version};
+        use crate::settings;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("L.kuralib");
+        let jobs_of = |session: &LibrarySession, kind: &str| -> i64 {
+            let kind = kind.to_string();
+            session
+                .library()
+                .db()
+                .read(|c| {
+                    Ok(
+                        c.query_row("SELECT count(*) FROM jobs WHERE kind = ?1", [&kind], |r| {
+                            r.get(0)
+                        })?,
+                    )
+                })
+                .unwrap()
+        };
+        let engine = || {
+            Services::new(Arc::new(FakeBackend)).with_engine(Arc::new(FakeEngineFactory::default()))
+        };
+        let retiring: Vec<String> = kura_engine::codec::CodecSet::pinned()
+            .retiring_ids()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(retiring.len(), 3);
+        let open = || {
+            let session = LibrarySession::open(&path, sink(), engine()).unwrap();
+            session.wait_ready();
+            assert!(session.jobs().wait_idle(Duration::from_secs(30)));
+            session
+        };
+        {
+            let session = LibrarySession::create(&path, sink(), engine()).unwrap();
+            session.wait_ready();
+            assert!(session.jobs().wait_idle(Duration::from_secs(30)));
+            assert_eq!(jobs_of(&session, "retire"), 0, "版の入力がなければ積まない");
+            assert_eq!(jobs_of(&session, "analyze"), 0, "指紋は置くだけ");
+            let (done, pinned): (Option<Vec<String>>, Option<DecoderFingerprint>) = session
+                .library()
+                .db()
+                .read(|c| Ok((settings::get(c, DONE_KEY)?, settings::get(c, PINNED_KEY)?)))
+                .unwrap();
+            assert_eq!(done.as_ref(), Some(&retiring));
+            assert_eq!(
+                pinned,
+                Some(DecoderFingerprint::of(
+                    &kura_engine::codec::CodecSet::pinned()
+                ))
+            );
+            // 旧版の読み手の記録の入力（記録は読めない形にして、移せないものとして数えさせる）と、前の版のアプリの印・指紋
+            let mut older = DecoderFingerprint::of(&kura_engine::codec::CodecSet::pinned());
+            older
+                .0
+                .insert("ogg".into(), vec!["ogg-vorbis-symphonia-dec/3".into()]);
+            session
+                .library()
+                .db()
+                .write(move |tx| {
+                    let a = insert_item(tx, 1, [1; 32]);
+                    insert_version(tx, a, 0, [10; 32], "hold", None);
+                    insert_version(tx, a, 1, [1; 32], "hold", None);
+                    tx.execute(
+                        r#"UPDATE item_version_inputs
+                              SET recorded = '{"decoded":{"codec":"ogg-vorbis-symphonia-dec/3"}}'"#,
+                        [],
+                    )?;
+                    // 解析を待つものはない（解析のジョブを積むのは指紋が変わったときだけ）
+                    tx.execute("UPDATE items SET analysis_state = 'ready'", [])?;
+                    settings::remove(tx, DONE_KEY)?;
+                    settings::set(tx, PINNED_KEY, &older)?;
+                    settings::set(tx, DECODERS_KEY, &older)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let session = open();
+        assert_eq!(jobs_of(&session, "retire"), 1);
+        assert_eq!(jobs_of(&session, "analyze"), 1, "固定の段の指紋が変わった");
+        let record = session
+            .jobs()
+            .list(&crate::jobs::JobFilter {
+                kinds: vec![JobKind::Retire],
+                ..Default::default()
+            })
+            .unwrap()
+            .remove(0);
+        assert_eq!(record.state, crate::jobs::JobState::Done);
+        let result: serde_json::Value =
+            serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            result["left"],
+            serde_json::json!({ "badRecord": 1 }),
+            "{result}"
+        );
+        drop(session);
+        let session = open();
+        assert_eq!(jobs_of(&session, "retire"), 1, "印が同じなら積まない");
+        assert_eq!(jobs_of(&session, "analyze"), 1, "指紋が同じなら積まない");
     }
 
     /// バックアップの 1 時間ごとの確かめのあとにも GC の候補を数え、候補があれば GC を 1 本積む（開いたときは候補がなく、開いた

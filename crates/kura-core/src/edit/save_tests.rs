@@ -317,6 +317,8 @@ pub(super) struct Setup {
     pub(super) fault: Option<Fault>,
     pub(super) gc_hook: Option<GcHook>,
     pub(super) gc_fault: Option<GcFault>,
+    pub(super) retire_hook: Option<crate::edit::retire::RetireHook>,
+    pub(super) retire_fault: Option<Fault>,
 }
 
 /// 保存・GC・取り込みのジョブだけを動かすライブラリ（サムネイル・解析のジョブは登録しないので、置き換えたあとの pending が
@@ -358,6 +360,8 @@ impl Env {
             fault,
             gc_hook,
             gc_fault,
+            retire_hook,
+            retire_fault,
         } = setup;
         let dir = tempfile::tempdir().unwrap();
         let lib = Arc::new(Library::create(&dir.path().join("L")).unwrap());
@@ -382,12 +386,20 @@ impl Env {
         if let Some(fault) = gc_fault {
             gc = gc.with_fault(fault);
         }
+        let mut retire = crate::edit::retire::RetireHandler::new(engine.clone());
+        if let Some(hook) = retire_hook {
+            retire = retire.with_hook(hook);
+        }
+        if let Some(fault) = retire_fault {
+            retire = retire.with_fault(fault);
+        }
         let events = Arc::new(Mutex::new(Vec::new()));
         let jobs = JobManager::new(
             lib.clone(),
             vec![
                 (JobKind::Edit, Arc::new(handler)),
                 (JobKind::Gc, Arc::new(gc)),
+                (JobKind::Retire, Arc::new(retire)),
                 (
                     JobKind::Import,
                     Arc::new(crate::import::ImportHandler::new(Arc::new(FakeBackend))),

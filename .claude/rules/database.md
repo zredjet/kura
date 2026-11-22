@@ -20,7 +20,9 @@ paths:
   「いま確かめる」を押したときだけ走る `items.blob_id` の確かめと、GC が残した版（kept）の数え上げの
   `full_check_repairs_blob_ids_and_startup_leaves_them`、GC のジョブが部品の印か消し待ちの候補があるときだけ走る文書の部品の片付けの
   出発点（`edit_objects` の走査。`sweep_parts_keeps_reachable_parts_and_removes_orphans`）と、参照されないアンカーの確かめ（元 × 読み方の
-  設定ごとの小さな `edit_anchors` の走査。`unreferenced_anchors_use_the_input_index`）。docs/data-model.md §4）。
+  設定ごとの小さな `edit_anchors` の走査。`unreferenced_anchors_use_the_input_index`）、退役する読み手の移し替えのジョブ（M16 段 5）が
+  移し終えた印 `edit.retired` が今の退役の識別子の一覧と同じになるまでの一度きりに走る、版の入力の全件の走査（主キーの範囲で引き、記録の
+  識別子は行ごとに `json_extract` で見る。`target_queries_use_the_primary_key`）。docs/data-model.md §4）。
   起動ごと・ジョブごとに走る問い合わせを例外にしない（印や指紋で、変わったときだけ走らせる）。ただし、行が実行中の処理の分しか
   ない小さな表は索引を持たずに走査してよい（今の例外：台帳の予告 `ledger_pending`。開くときの照合と `job_id` での削除。
   `announcements_are_cleared_by_job`。docs/data-model.md §4「保存と版（M12）」）。

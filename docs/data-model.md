@@ -97,6 +97,7 @@ Kura Library.kuralib/
 | `0014_credits` | ライセンスとクレジット（M15 段 1。§4「ライセンスとクレジット（M15）」、ADR-202・203）：ライセンスの表 `licenses`（既定の 13 行を入れる。`builtin` に鍵、名前は大文字小文字を問わず一意、表記義務 `attribution`（required・optional・none）・商用・改変・継承の印）と、アイテムごとのクレジット `item_credits`（ライセンス・作者・作品・出典・表記の文。何か入っているアイテムにだけ行がある）を足す。新しい表だけなので Plain（合成 10 万件 `--history` で 0.17〜0.18 ms。照合の差 0。`bench migrate --runs 3`、2026-11-21）。アイテムを消すとクレジットも消え（CASCADE）、自作のライセンスを消すと未設定に戻る（SET NULL） |
 | `0015_projects` | プロジェクトと使った記録（M15 段 2。§4「プロジェクトと使った記録（M15）」、ADR-202・204）：登録したプロジェクト `projects`（名前・正規化した絶対パス（一意）・エンジン（godot・unity・folder）・持ち出しの既定 `settings`（段 3）・並び・見つからない印 `missing`・照らし終えた時刻）、照らし直しが見たファイル `project_files`（相対パス・大きさ・更新時刻・ハッシュ・一致したアイテムと何と一致したか）、持ち出した出力 `item_outputs`（段 3・5 が書く中身とアイテム）を足し、`jobs_kind` に `project`（照らし直し）を足す（名前付きの CHECK の入れ替え）。新しい表と CHECK の入れ替えだけなので Plain（合成 10 万件 `--history` で 0.83〜0.84 ms。jobs の CHECK の入れ替えが全行を確かめる分。照合の差 0。`bench migrate --runs 3`、2026-11-21）。プロジェクトを消すとファイルの行も消え（CASCADE）、アイテムを消すとファイルの行は残って未一致（SET NULL）、持ち出した出力は消える（CASCADE） |
 | `0016_export_files` | Kura が書き出したファイルの記録（M15 段 3 の検証の直し。§4「プロジェクトと使った記録（M15）」の「書き出したファイル」、ADR-205 (6)）：書いたファイルの絶対パス（書き出し先を正規化したフォルダ＋書いた名前）・アイテム・中身・大きさ・書いた直後の更新時刻・書いたジョブ `export_files`。書き出し先の同じ名前のファイルは、この記録どおりのままのものだけを置き換える。新しい表だけなので Plain（合成 10 万件 `--history` で 0.06〜0.07 ms。照合の差 0。`bench migrate --runs 3`、2026-11-21）。アイテムを消すと記録も消える（CASCADE） |
+| `0017_retire_job` | 退役する読み手の記録をアンカーへ移すジョブ（M16 段 5。§4「退役する読み手の移し替え（M16）」、docs/editing.md §9.4、ADR-222）：`jobs_kind` に `retire` を足す（名前付きの CHECK の入れ替えだけ。表・列・索引は足さない。移したアンカーは `edit_anchors` の行で、鍵の `options_digest` を別のドメインにする）。Plain（合成 10 万件 `--history` で 0.60〜0.61 ms。照合の差 0。`bench migrate --runs 3`、2026-11-23） |
 
 ```sql
 -- ===== 実ファイルの台帳（0007。files/ab/cd/<hash>.<ext> 1 つに 1 行）=====
@@ -366,8 +367,8 @@ CREATE INDEX idx_play_events_item ON play_events(item_id, played_at DESC);
 -- ===== ジョブ =====
 CREATE TABLE jobs (                                -- 0008 で作り直した形
   id            INTEGER PRIMARY KEY,
-  kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）、0011：edit（M12 の保存）・gc（M12 の段 3）、0012：batch（M14 の一括）、0015：project（M15 のプロジェクトの照らし直し）
-                CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc','batch','project')),
+  kind          TEXT    NOT NULL                    -- 0005：export、0008：analyze（M11 の解析）、0011：edit（M12 の保存）・gc（M12 の段 3）、0012：batch（M14 の一括）、0015：project（M15 のプロジェクトの照らし直し）、0017：retire（M16 段 5 の退役する読み手の移し替え）
+                CONSTRAINT jobs_kind CHECK (kind IN ('import','thumbnail','proxy','download','capture','export','analyze','edit','gc','batch','project','retire')),
   state         TEXT    NOT NULL
                 CONSTRAINT jobs_state CHECK (state IN ('queued','running','paused','done','failed','canceled')),
   priority      INTEGER NOT NULL DEFAULT 0,
@@ -429,6 +430,14 @@ CREATE TABLE settings (
 --       'analysis.decoders' = 解析で読む形式（見出しで決める HEIC・HEIF を含む）ごとの、段の順のデコーダの識別子（解析のジョブが
 --                             コーデックの組を作ったときに比べ、今の組にないデコーダで読んだものと、並びが変わった形式で失敗して
 --                             いたもの・読まずに形式から書いたもの（decoder が NULL）を pending に戻す。M11）
+--       'analysis.pinned'   = 固定の段のデコーダだけの 'analysis.decoders' と同じ形の指紋（CodecSet::pinned() から作る。起動の
+--                             スレッドが比べ、違えば置き換えて解析のジョブを積む（前の指紋がなければ、'analysis.decoders' が
+--                             あるときだけ積む）。積んだジョブが 'analysis.decoders' を比べて読み直す。固定の段の読み手を替えた
+--                             更新のあと、取り込みも保存もしなくても読み直すため。M16 段 5）
+--       'edit.retired'      = 退役する読み手の移し替えを終えた退役の識別子の一覧（["ogg-vorbis-symphonia-dec/3", …]。移し替えの
+--                             ジョブが終わったとき（移せないもの・1 件の失敗が残っても）に置く。ジョブが失敗・中止したら置かない。
+--                             開いたときに今の退役の識別子の一覧と違えばジョブを積む。版の入力がひとつもないライブラリは積まずに
+--                             置く。kura-devtools の `retired --again` が消す。M16 段 5）
 --       'analysis.retry'    = 一度きりの解き直しの印（{"v":1}。M13 段 2。起動のスレッドの sync_plan が、置いた版より新しい版の
 --                             UPDATE を一度だけ当てる。v1 は前の版で too_large になった音声を pending に戻す。事実の表の全件の
 --                             走査は版が上がったときだけ）
@@ -563,7 +572,8 @@ CREATE INDEX idx_edit_edges_child ON edit_edges(child_id);
 CREATE TABLE edit_anchors (
   id              INTEGER PRIMARY KEY,
   source_hash     BLOB    NOT NULL,                  -- 元のファイルの中身
-  options_digest  BLOB    NOT NULL,                  -- 読み方の設定（DecodeOptions の正規の JSON）のダイジェスト
+  options_digest  BLOB    NOT NULL,                  -- 読み方の設定（DecodeOptions の正規の JSON）のダイジェスト。移したアンカー
+                                                     --（M16 段 5）は読み方の設定と記録の識別子の、別のドメインのダイジェスト
   options         TEXT    NOT NULL,
   decoded         TEXT    NOT NULL,                  -- 元を読んだ記録（DecodeStamp の正規の JSON）
   value_digest    BLOB    NOT NULL,
@@ -956,7 +966,10 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 - **アンカー**（`edit::anchors`）：引くのは `SELECT … FROM edit_anchors a JOIN blobs b ON b.id = a.blob_id WHERE a.source_hash = ?1 AND
   a.options_digest = ?2`（`UNIQUE(source_hash, options_digest)` の索引）。足すのは保存のトランザクション 2 で、`ledger::register` のあと
   `INSERT … ON CONFLICT(source_hash, options_digest) DO NOTHING` → 行を読み、別のファイルを指す行が先にあれば Conflict（参照されない台帳の
-  行を残さない）。`options` と `decoded` は正規の JSON、`value_digest` は元を読んだ記録の値のダイジェスト。
+  行を残さない）。`options` と `decoded` は正規の JSON、`value_digest` は元を読んだ記録の値のダイジェスト。移し替えのジョブ（M16 段 5。
+  下の「退役する読み手の移し替え」）が作るアンカーは鍵を `anchors::retired_key`（ドメイン `kura-decode-options-retired-v1` の、読み方の
+  設定の正規の JSON と記録の識別子のダイジェスト）にするので、保存・エディタ・一括が元 × 読み方で引いても当たらず、版の入力の
+  `anchor_id` から `anchors::get` でだけ引ける。
 - **保存のトランザクション 1（予告）**（`edit::save`。台帳の門を持って）：土台（`versions::head`）を確かめ直し、読んだアンカー（前からあった
   もの）の行がまだ同じ台帳の行を指して残っていることを `anchors::get` で確かめ直し（描いている間にゴミ箱を空にして片付けられていれば、何も
   置かずに Conflict。トランザクション 2 の外部キーの誤りにしない）、出力の中身 H の持ち主を
@@ -1322,6 +1335,59 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 - **持ち出し先のプロジェクト**（段 5。ADR-207）：設定 `project.dragout` にプロジェクトの ID を置く（`export::dragout::set_target`。ないプロジェクトは断り、null は行を消す）。`dragout::target` は、置いた ID のプロジェクトが `projects` に主キーであればそれ、なければ（選んでいない）`SELECT id FROM projects LIMIT 2` が 1 行だけならそれを使う。`project::remove` は、外すプロジェクトが選んだものなら同じトランザクションで設定の行を消す（`projects.id` は AUTOINCREMENT でなく、最大の ID を外すと次の登録が同じ ID になるので、残すと次の登録を選んだことになる。段 5 の検証の直し）。ドラッグアウトの名前と形式はそのプロジェクトの持ち出しの既定（なければ名前も形式もそのまま）。
 - **書き出したファイル** `export_files`（0016。段 3 の検証の直し・利用者の決定）：書き出しが新しく置いた・置き換えたファイルを、正規化した絶対パスを鍵に `INSERT … ON CONFLICT(path) DO UPDATE` で記録する（大文字小文字を直したら古いパスの行を消す）。書き出し先に同じ名前のファイルがあれば、実際の名前（大文字小文字を問わず探す）の行を主キーで引き、記録が同じアイテムで、この回のジョブでなく、大きさ・更新時刻・中身が記録と同じときだけ置き換える（取り込み元のファイル・利用者が直したファイル・ほかのアイテムとして書いたファイルは置き換えない）。ユニットのフォルダは、同じ名前のフォルダの中（`path > 'フォルダ/' AND path < 'フォルダ0'`。主キーの範囲）にそのユニットのアイテムの記録があれば使い直す。消えたファイルの記録は残る（同じ名前の新しいファイルは中身が記録と違うので置き換えない）。
 - **持ち出しの既定** `projects.settings`（段 3）：`project::settings` が `export::ExportPreset::from_json` で読む（`'{}'`・読めないものはエンジンの既定：godot は snake_case、unity は PascalCase、folder はそのまま。形式は「変えない（書けない形式は変える）」、JSON は添えない）。`set_settings` は名前のテンプレートと形式を確かめてから書く。
+
+### 退役する読み手の移し替え（M16 段 5。`crates/kura-core/src/edit/retire.rs`・`edit/save/retire.rs`。docs/editing.md §9.4、ADR-222）
+
+- **対象**（ジョブ `kind = 'retire'`。入力 `{}`）：退役する識別子（`CodecSet::retiring_ids()`。今は `ogg-vorbis-symphonia-dec/3`・
+  `m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`）で読んだ、アンカーのない版の入力。版の行の ID・入力の番号の順に 16 件ずつ、
+  カーソルの次から：
+
+  ```sql
+  SELECT i.version_id, i.input, v.item_id, i.recorded
+    FROM item_version_inputs i JOIN item_versions v ON v.id = i.version_id
+   WHERE (i.version_id, i.input) > (?cursor_version, ?cursor_input)
+     AND +i.anchor_id IS NULL
+     AND CASE WHEN json_valid(i.recorded) THEN json_extract(i.recorded, '$.decoded.codec') END
+         IN (SELECT value FROM json_each(?ids))
+   ORDER BY i.version_id, i.input LIMIT 16;
+  ```
+
+  主キーの範囲で引き（`+` で `idx_item_version_inputs_anchor` を使わせない）、記録の識別子は行ごとに見る（JSON として壊れた記録は
+  `json_extract` が問い合わせごと失敗させるので、`json_valid` で守って対象にしない）。版の入力の全件の走査で、
+  移し終えた印（settings の `'edit.retired'`）が今の退役の識別子の一覧と同じになるまでの一度きり（例外。`target_queries_use_the_primary_key`）。
+  進み具合の数え上げ（同じ条件の `count(*)`）も、ジョブを始める・再開するときだけ。
+- **1 件**：記録の元がアイテムの元（`versions::original`）と同じか確かめ、退役の鍵（`anchors::retired_key`）のアンカーがあれば、記録の
+  読み取りの記録（`DecodeStamp` の全体）が同じで、アンカーのファイルがあるときだけ結び付ける（書くトランザクションの中で
+  `anchors::get` で確かめ直し、決めたあとに片付けられていれば、もう一度決めて作る）。なければ元を記録の識別子のデコーダで作業用の PCM へ流して読み、値の
+  ダイジェストと封の読み取りの記録が版の記録と同じなら（進捗はジョブが対象の数で送り、読みの回は送らない）、staging に写して照らし（`anchor::verify_stream`）、台帳の門を持って
+  予告（`ledger::announce(…, 'place', job)`）→ `files/<hash>.wav` へ置く → 1 つのトランザクションで `ledger::register`・アンカーの行
+  （退役の鍵）・結び付け・予告の消去（`ledger::clear_pending`）・途中経過。結び付けは、同じアイテムの版の入力のうちアンカーがなく、記録
+  の元・形式・読み方・読み取りの記録が同じもの（戻した版の写しを含む）にまとめて `anchor_id` と記録の `anchor` を付ける：
+
+  ```sql
+  SELECT i.version_id, i.input, i.recorded
+    FROM item_versions v JOIN item_version_inputs i ON i.version_id = v.id
+   WHERE v.item_id = ?1 AND +i.anchor_id IS NULL;              -- 版の行は item_id の索引、入力は版の行の主キー
+  UPDATE item_version_inputs SET anchor_id = ?1, recorded = ?2
+   WHERE version_id = ?3 AND input = ?4 AND anchor_id IS NULL;
+  ```
+
+  結び付ける入力がもうなければ（読んでいる間にゴミ箱を空にした）、アンカーの行も途中経過も書かず、置いたファイルと予告を片付ける
+  （不変条件 5「参照されないアンカーはない」）。途中で落ちたら、開くときの `ledger::settle_pending` が片付ける（保存と同じ）。
+- **移せないもの**（触らずに数える。結果の `left` に理由ごと）：`badRecord`（記録を読めない）・`noOriginal`（元が記録と違う・ない・
+  版がなくなった）・`missing`（元のファイルがない）・`noDecoder`（記録の読み手がない）・`mismatch`（読み直した値・記録が違う）・
+  `otherAnchor`（退役の鍵に別の記録のアンカー）・`brokenAnchor`（移したアンカーのファイルがない）。誤り（読めない元など）は
+  `failed` に数えて次へ進む。どちらが残っても、終われば印を置く（やり直しても同じになりうるので、開くたびに全件を走査して読み直さ
+  ない。直したあとは `retired --again`）。ディスクの空き・DB の誤りはジョブを失敗にし、印を置かない（次に開いたときにまた積む）。
+- **結果**（`result_json`）：`{v, ids, cursor?, anchored, linked, left?, failed}`。1 件ごとのトランザクションで途中経過に書き、一時停止の
+  再開はカーソルの次から（数は引き継ぐ。組の退役の識別子の一覧が変わっていれば初めから）。中止は途中までの数を結果に残す。
+- **数え上げ**（`retire::remaining_in`。kura-devtools の `retired --library <path>`）：DB を読み取り専用で開き、残っている対象を
+  （記録の識別子, 版のファイルの状態）ごとに数え、先頭の 20 件（アイテム・版）・印・移したアンカーの数と大きさの合計・最後の移し替えの
+  ジョブを出す（全件の走査。手で回す確かめだけ。残りがあれば失敗で終わる）。段 10 で旧版の読み手を外す前に、利用者のライブラリで 0 を
+  確かめる。`--again` は印を消す（`retire::forget`）。
+- **ディスク**：移したアンカーは元を全部読んだ f32 の WAV（ステレオ 44.1 kHz で 1 分あたり約 21 MB。5 分で約 106 MB。Ogg・AAC の元の
+  10〜20 倍）で、編集した旧版の音声の元ごとに 1 つ、ゴミ箱を空にして参照されなくなるまで残る。作業用の PCM を書く前に、要る量
+  （形の上限の標本 ＋ 16 MiB ＋ 余裕 1 GiB）より空きが少なければ `NoSpace` でジョブを失敗にする。
 
 ### 解析の読み書き（M11。`crates/kura-core/src/analysis/`）
 

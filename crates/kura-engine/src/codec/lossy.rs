@@ -271,6 +271,11 @@ impl Decoder for SymphoniaDecoder {
         true
     }
 
+    /// 3 つとも旧版で、段 10 で symphonia ごと外す（M16 段 5 の移し替えのジョブがアンカーを作る。ADR-216 (1)）。
+    fn retiring(&self) -> bool {
+        true
+    }
+
     fn can_decode(&self, format: &str) -> bool {
         match self.kind {
             Kind::OggVorbis => format == "ogg",

@@ -40,6 +40,9 @@ pub const PLAN_V: u32 = 1;
 pub const PLAN_KEY: &str = "analysis.plan";
 /// 解析した形式ごとのデコーダの指紋を置く settings のキー（解析のジョブが比べる）。
 pub const DECODERS_KEY: &str = "analysis.decoders";
+/// 固定の段のデコーダだけの指紋を置く settings のキー（起動のスレッドが `CodecSet::pinned()` から作って比べ、変わっていれば
+/// 解析のジョブを積む。ジョブが全体の指紋 [`DECODERS_KEY`] を比べて読み直す。M16 段 5）。
+pub const PINNED_KEY: &str = "analysis.pinned";
 /// 読み取りの記録（kura-core の ID。値の種類・大きさ・長さ。投影と、読まずに計画を立てるのに使う）を置く結果の ID。
 pub const READ_ID: &str = "kura.read";
 /// 読み取りの記録の版。

@@ -476,6 +476,8 @@ pub enum JobKindDto {
     Batch,
     /// プロジェクトの照らし直し（M15 段 2）。
     Project,
+    /// 退役する読み手の記録をアンカーへ移す（M16 段 5）。
+    Retire,
 }
 
 impl From<JobKind> for JobKindDto {
@@ -492,6 +494,7 @@ impl From<JobKind> for JobKindDto {
             JobKind::Gc => Self::Gc,
             JobKind::Batch => Self::Batch,
             JobKind::Project => Self::Project,
+            JobKind::Retire => Self::Retire,
         }
     }
 }
@@ -510,6 +513,7 @@ impl From<JobKindDto> for JobKind {
             JobKindDto::Gc => Self::Gc,
             JobKindDto::Batch => Self::Batch,
             JobKindDto::Project => Self::Project,
+            JobKindDto::Retire => Self::Retire,
         }
     }
 }

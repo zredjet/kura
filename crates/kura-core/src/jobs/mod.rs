@@ -41,11 +41,13 @@ pub enum JobKind {
     Batch,
     /// 登録したプロジェクトの照らし直し（M15 段 2。`project::scan`。1 本ずつ。取り込みに譲る）。
     Project,
+    /// 退役する読み手の記録をアンカーへ移す（M16 段 5。`edit::retire`。1 本ずつ。GC と同じ相手と GC に譲る）。
+    Retire,
 }
 
 impl JobKind {
     /// すべての種類（テストと一覧用）。
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Import,
         Self::Thumbnail,
         Self::Proxy,
@@ -57,6 +59,7 @@ impl JobKind {
         Self::Gc,
         Self::Batch,
         Self::Project,
+        Self::Retire,
     ];
 
     /// DB に保存する名前。
@@ -73,6 +76,7 @@ impl JobKind {
             Self::Gc => "gc",
             Self::Batch => "batch",
             Self::Project => "project",
+            Self::Retire => "retire",
         }
     }
 
@@ -90,6 +94,7 @@ impl JobKind {
             "gc" => Self::Gc,
             "batch" => Self::Batch,
             "project" => Self::Project,
+            "retire" => Self::Retire,
             _ => return None,
         })
     }
@@ -109,7 +114,8 @@ impl JobKind {
             | Self::Edit
             | Self::Gc
             | Self::Batch
-            | Self::Project => 1,
+            | Self::Project
+            | Self::Retire => 1,
         }
     }
 
@@ -137,6 +143,19 @@ impl JobKind {
             Self::Batch => &[Self::Edit],
             // プロジェクトの照らし直しはファイルを読んでハッシュするので、取り込み（NFR-05）に譲る（M15 段 2）
             Self::Project => &[Self::Import],
+            // 退役する読み手の移し替えは急がない（段 10 の前に 1 度回ればよい）ので、GC と同じ相手と GC に譲る（元を読み直して
+            // アンカーを書き、台帳の門を書きの側で持つ。M16 段 5）
+            Self::Retire => &[
+                Self::Import,
+                Self::Thumbnail,
+                Self::Edit,
+                Self::Analyze,
+                Self::Export,
+                Self::Download,
+                Self::Capture,
+                Self::Batch,
+                Self::Gc,
+            ],
             Self::Import
             | Self::Thumbnail
             | Self::Proxy
@@ -161,7 +180,8 @@ impl JobKind {
             | Self::Edit
             | Self::Gc
             | Self::Batch
-            | Self::Project => false,
+            | Self::Project
+            | Self::Retire => false,
         }
     }
 }
@@ -242,7 +262,8 @@ mod tests {
             | JobKind::Edit
             | JobKind::Gc
             | JobKind::Batch
-            | JobKind::Project => JobKind::ALL.contains(&kind),
+            | JobKind::Project
+            | JobKind::Retire => JobKind::ALL.contains(&kind),
         }
     }
 
@@ -256,6 +277,7 @@ mod tests {
         assert_eq!(JobKind::parse("edit"), Some(JobKind::Edit));
         assert_eq!(JobKind::parse("gc"), Some(JobKind::Gc));
         assert_eq!(JobKind::parse("batch"), Some(JobKind::Batch));
+        assert_eq!(JobKind::parse("retire"), Some(JobKind::Retire));
         assert_eq!(JobKind::parse("merge"), None);
         for state in [
             JobState::Queued,
@@ -279,6 +301,7 @@ mod tests {
         assert_eq!(JobKind::Gc.concurrency(), 1);
         assert_eq!(JobKind::Batch.concurrency(), 1);
         assert_eq!(JobKind::Project.concurrency(), 1);
+        assert_eq!(JobKind::Retire.concurrency(), 1);
     }
 
     /// 譲る相手の表（解析は取り込み・サムネイル・保存に、GC は取り込み・サムネイル・保存・解析・書き出し・ダウンロード・
@@ -321,6 +344,20 @@ mod tests {
                 ),
                 (JobKind::Batch, &[JobKind::Edit][..]),
                 (JobKind::Project, &[JobKind::Import][..]),
+                (
+                    JobKind::Retire,
+                    &[
+                        JobKind::Import,
+                        JobKind::Thumbnail,
+                        JobKind::Edit,
+                        JobKind::Analyze,
+                        JobKind::Export,
+                        JobKind::Download,
+                        JobKind::Capture,
+                        JobKind::Batch,
+                        JobKind::Gc,
+                    ][..]
+                ),
             ]
         );
         for kind in JobKind::ALL {

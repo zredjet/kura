@@ -374,6 +374,7 @@ pub(super) fn place_anchor(
                     ext: "wav",
                     size,
                     now: 1,
+                    retired: false,
                 },
             )
         })
