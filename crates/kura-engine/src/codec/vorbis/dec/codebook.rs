@@ -26,6 +26,14 @@
 //!   （[`FIRSTTABLE_MAX`] まで）の大きいほう。表は「直に当たる符号語」と「二分探索の範囲」を与えるだけで、その範囲はいつも
 //!   探索の答え（`codelist` のうち読んだビット以下の最後のもの）を含むので、どの幅でも読める番号・進むビット・パケットの
 //!   終わりの −1 は同じ（残りが表の幅より短いときは、どちらも範囲を狭めずに探す）。
+//! - 最初の表の「直に当たる符号語」の値は、C の `番号 + 1` でなく `長さ << 24 | 番号`（[`direct_entry`]）にして、長さの表を
+//!   引き直さない（同じ長さ。番号は 2^24 より小さく、長さは表の幅以下なので、C の探索の範囲の印 `0x80000000` とは重ならない）。
+//! - パケットの終わりまで 8 バイト以上あるときは、8 バイトをまとめて読んだ語（[`OggpackReader::peek_word`]）から表を引く。
+//!   aoTuV の覗きの範囲の確かめはそのとき必ず通る（−1 にならない）ので、表の幅でも最長の符号語の長さでも、覗いた値は語の
+//!   下位のビットと同じ。それより終わりに近いときは C の形のまま（`decode_near_end`）。値を足す復号のループ
+//!   （`decodev_add`・`decodevv_add`）は、覗きの窓（[`Window`]。読んだビットを語に持ち、32 ビット以上あれば覗きは −1 に
+//!   ならない）から読み、窓に読み足せなくなったら読み手に戻して C の形で読む（[`Entries`]）。試験
+//!   `decode_reads_like_the_c_decoder` が、C の表と C の流れをそのまま組んだものと全冊で照らす。
 //!
 //! # 表の量（kura の側で決めること）
 //!
@@ -37,7 +45,7 @@
 
 use vorbis_tables::StaticCodebook;
 
-use super::bitwise::OggpackReader;
+use super::bitwise::{OggpackReader, Window};
 use crate::codec::vorbis::codebook::{float32_unpack, make_words};
 use crate::error::EngineError;
 
@@ -468,6 +476,61 @@ pub(crate) fn book_unquantize(
     Ok(r)
 }
 
+/// 最初の表の「直に当たる符号語」の値（並べた番号 `index` と長さ `len`。モジュールの説明）。
+fn direct_entry(index: usize, len: u8) -> u32 {
+    (u32::from(len) << 24) | (index as u32 & 0x00ff_ffff)
+}
+
+/// 下位 `bits` ビット（0〜32）の印（`mask[bits]`）。
+#[inline]
+fn low_mask(bits: i32) -> u64 {
+    (1u64 << bits.clamp(0, 32)) - 1
+}
+
+/// 値のない codebook で値を読もうとしたときの誤り。
+#[cold]
+fn no_values() -> EngineError {
+    EngineError::Decode {
+        codec: super::DEC_ID.to_string(),
+        message: "値のない codebook で値を読もうとしました".into(),
+    }
+}
+
+/// 復号のループの読み手：パケットの終わりから遠い間は窓（[`Window`]）から読み、近づいたら読み手に戻して C の形
+/// （[`DecodeBook::decode_packed_entry_number`]）で読む。落とすときに読み手を窓の位置に戻す。
+struct Entries<'r, 'a> {
+    b: &'r mut OggpackReader<'a>,
+    win: Option<Window<'a>>,
+}
+
+impl<'r, 'a> Entries<'r, 'a> {
+    fn new(b: &'r mut OggpackReader<'a>) -> Self {
+        let win = Window::open(b);
+        Self { b, win }
+    }
+
+    /// 次の並べた番号か −1（`decode_packed_entry_number` と同じ）。
+    #[inline]
+    fn next(&mut self, book: &DecodeBook) -> i64 {
+        if let Some(w) = self.win.as_mut() {
+            if w.fill() {
+                return book.decode_window(w);
+            }
+            w.close(self.b);
+            self.win = None;
+        }
+        book.decode_packed_entry_number(self.b)
+    }
+}
+
+impl Drop for Entries<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(w) = self.win.take() {
+            w.close(self.b);
+        }
+    }
+}
+
 /// `bitreverse`（sharedbook.c:319–325）。
 fn bitreverse(x: u32) -> u32 {
     x.reverse_bits()
@@ -546,7 +609,7 @@ impl DecodeBook {
             // special case the 'single entry codebook' with a single bit fastpath table (that always returns entry 0)
             c.dec_firsttablen = 1;
             c.dec_firsttable = zeroed(2)?;
-            c.dec_firsttable.fill(1);
+            c.dec_firsttable.fill(direct_entry(0, 1));
         } else {
             // C は clamp(ilog(used) − 4, 5, 8)。最長の符号語まで（FIRSTTABLE_MAX まで）広げる（モジュールの説明）
             c.dec_firsttablen = (ov_ilog(c.used_entries as u32) - 4)
@@ -559,7 +622,8 @@ impl DecodeBook {
                 if len <= c.dec_firsttablen {
                     let orig = bitreverse(c.codelist[i]);
                     for j in 0..(1u32 << (c.dec_firsttablen - len)) {
-                        c.dec_firsttable[(orig | (j << len)) as usize] = (i + 1) as u32;
+                        c.dec_firsttable[(orig | (j << len)) as usize] =
+                            direct_entry(i, c.dec_codelengths[i]);
                     }
                 }
             }
@@ -587,22 +651,60 @@ impl DecodeBook {
         Ok(Some(c))
     }
 
-    /// `decode_packed_entry_number`（codebook.c:452–505）。並べ替えた番号か −1。
+    /// `decode_packed_entry_number`（codebook.c:452–505）。並べ替えた番号か −1。パケットの終わりまで 8 バイト以上あれば、
+    /// まとめて読んだ語で C と同じ流れをたどる（覗きは −1 にならない。モジュールの説明）。
+    #[inline]
     fn decode_packed_entry_number(&self, b: &mut OggpackReader<'_>) -> i64 {
+        let Some(word) = b.peek_word() else {
+            return self.decode_near_end(b);
+        };
+        let (entry, adv) = self.decode_word(word);
+        b.vadv(adv as i32);
+        entry
+    }
+
+    /// 覗いた語（下位の 32 ビット以上が有効で、aoTuV の覗きが −1 にならないもの）から、並べた番号か −1 と進むビット数。
+    #[inline]
+    fn decode_word(&self, word: u64) -> (i64, u32) {
+        let Some(&entry) = self
+            .dec_firsttable
+            .get((word & low_mask(self.dec_firsttablen)) as usize)
+        else {
+            return (-1, 0);
+        };
+        if entry & 0x8000_0000 == 0 {
+            return (i64::from(entry & 0x00ff_ffff), entry >> 24);
+        }
+        let lo = i64::from((entry >> 15) & 0x7fff);
+        let hi = self.used_entries - i64::from(entry & 0x7fff);
+        let read = self.dec_maxlength;
+        self.search((word & low_mask(read)) as u32, read, lo, hi)
+    }
+
+    /// [`DecodeBook::decode_packed_entry_number`] の、窓（[`Window`]。32 ビット以上あるもの）から読む形。
+    #[inline]
+    fn decode_window(&self, w: &mut Window<'_>) -> i64 {
+        let (entry, adv) = self.decode_word(w.bits());
+        w.consume(adv);
+        entry
+    }
+
+    /// [`DecodeBook::decode_packed_entry_number`] の、パケットの終わりまで 8 バイトないとき（C の流れのまま）。
+    #[inline(never)]
+    fn decode_near_end(&self, b: &mut OggpackReader<'_>) -> i64 {
         let mut read = self.dec_maxlength;
-        let (mut lo, mut hi): (i64, i64);
+        let (lo, hi): (i64, i64);
         let lok = b.vlook(self.dec_firsttablen);
         if lok >= 0 {
-            let entry = i64::from(self.dec_firsttable.get(lok as usize).copied().unwrap_or(0));
+            let Some(&entry) = self.dec_firsttable.get(lok as usize) else {
+                return -1;
+            };
             if entry & 0x8000_0000 != 0 {
-                lo = (entry >> 15) & 0x7fff;
-                hi = self.used_entries - (entry & 0x7fff);
+                lo = i64::from((entry >> 15) & 0x7fff);
+                hi = self.used_entries - i64::from(entry & 0x7fff);
             } else {
-                let Some(len) = self.dec_codelengths.get((entry - 1) as usize) else {
-                    return -1;
-                };
-                b.vadv(i32::from(*len));
-                return entry - 1;
+                b.vadv((entry >> 24) as i32);
+                return i64::from(entry & 0x00ff_ffff);
             }
         } else {
             lo = 0;
@@ -616,8 +718,17 @@ impl DecodeBook {
         if lok < 0 {
             return -1;
         }
+        let (entry, adv) = self.search(lok as u32, read, lo, hi);
+        b.vadv(adv as i32);
+        entry
+    }
+
+    /// 覗いた `read` ビット（`lok`）の符号語を、並べた符号語の `lo..hi` から二分探索で探す（codebook.c:489–504）。並べた番号か
+    /// −1 と、進むビット数（見つかれば符号語の長さ、なければ `read`）。
+    #[inline]
+    fn search(&self, lok: u32, read: i32, mut lo: i64, mut hi: i64) -> (i64, u32) {
         // bisect search for the codeword in the ordered list
-        let testword = bitreverse(lok as u32);
+        let testword = bitreverse(lok);
         while hi - lo > 1 {
             let p = (hi - lo) >> 1;
             let test = i64::from(self.codelist[(lo + p) as usize] > testword);
@@ -626,22 +737,19 @@ impl DecodeBook {
         }
         let len = i32::from(self.dec_codelengths[lo as usize]);
         if len <= read {
-            b.vadv(len);
-            return lo;
+            return (lo, len as u32);
         }
-        b.vadv(read);
-        -1
+        (-1, read as u32)
     }
 
+    #[inline]
     fn values(&self, entry: i64) -> Result<&[f32], EngineError> {
         let dim = self.dim as usize;
         let start = entry as usize * dim;
-        self.valuelist
-            .get(start..start + dim)
-            .ok_or_else(|| EngineError::Decode {
-                codec: super::DEC_ID.to_string(),
-                message: "値のない codebook で値を読もうとしました".into(),
-            })
+        match self.valuelist.get(start..start + dim) {
+            Some(t) => Ok(t),
+            None => Err(no_values()),
+        }
     }
 
     /// `vorbis_book_decode`（codebook.c:518–527）：元の項目の番号か −1。
@@ -702,8 +810,9 @@ impl DecodeBook {
         if self.used_entries > 0 {
             let n = n as usize;
             let mut i = 0usize;
+            let mut src = Entries::new(b);
             while i < n {
-                let entry = self.decode_packed_entry_number(b);
+                let entry = src.next(self);
                 if entry == -1 {
                     return Ok(-1);
                 }
@@ -764,12 +873,31 @@ impl DecodeBook {
             let m = ((offset + i64::from(n)) / 2) as usize;
             let mut i = (offset / 2) as usize;
             let mut second = false;
+            let pairs = self.dim as usize / 2;
+            let even = self.dim % 2 == 0;
+            let mut src = Entries::new(b);
             while i < m {
-                let entry = self.decode_packed_entry_number(b);
+                let entry = src.next(self);
                 if entry == -1 {
                     return Ok(-1);
                 }
-                for &v in self.values(entry)? {
+                let t = self.values(entry)?;
+                // 左から始まり、dim が偶数で、この項目の値がすべて m の内に入るとき：値は左・右・左・右…の順に
+                // `i..i + dim/2` へ 1 つずつ足す（下の 1 つずつの形と同じ足し算）
+                if !second
+                    && even
+                    && i + pairs <= m
+                    && let (Some(d0), Some(d1)) =
+                        (a0.get_mut(i..i + pairs), a1.get_mut(i..i + pairs))
+                {
+                    for ((x0, x1), v) in d0.iter_mut().zip(d1).zip(t.as_chunks::<2>().0) {
+                        *x0 += v[0];
+                        *x1 += v[1];
+                    }
+                    i += pairs;
+                    continue;
+                }
+                for &v in t {
                     if i >= m {
                         break;
                     }
@@ -789,8 +917,9 @@ impl DecodeBook {
             let m = (offset + i64::from(n)) / ch;
             let mut i = offset / ch;
             let mut chptr = 0usize;
+            let mut src = Entries::new(b);
             while i < m {
-                let entry = self.decode_packed_entry_number(b);
+                let entry = src.next(self);
                 if entry == -1 {
                     return Ok(-1);
                 }
@@ -982,6 +1111,165 @@ mod tests {
             }
         }
         assert!(widened > 50, "{widened}");
+    }
+
+    /// C の最初の表（sharedbook.c:401–455：C の幅 `clamp(ilog(used) − 4, 5, 8)`・直に当たる値は `番号 + 1`）。符号語の列と
+    /// 長さは [`DecodeBook::init`] が C と同じ形に作ったもの（`codelist`・`dec_codelengths`）を使う。
+    fn c_firsttable(c: &DecodeBook) -> (Vec<u32>, i32) {
+        let n = c.used_entries as usize;
+        if n == 1 && c.dec_maxlength == 1 {
+            return (vec![1, 1], 1);
+        }
+        let tablen = (ov_ilog(c.used_entries as u32) - 4).clamp(5, 8);
+        let tabn = 1usize << tablen;
+        let mut table = vec![0u32; tabn];
+        for i in 0..n {
+            let len = i32::from(c.dec_codelengths[i]);
+            if len <= tablen {
+                let orig = bitreverse(c.codelist[i]);
+                for j in 0..(1u32 << (tablen - len)) {
+                    table[(orig | (j << len)) as usize] = (i + 1) as u32;
+                }
+            }
+        }
+        let mask = ((0xffff_fffe_u64 << (31 - tablen)) & 0xffff_ffff) as u32;
+        let (mut lo, mut hi) = (0usize, 0usize);
+        for i in 0..tabn {
+            let word = (i as u32) << (32 - tablen);
+            let slot = bitreverse(word) as usize;
+            if table[slot] == 0 {
+                while lo + 1 < n && c.codelist[lo + 1] <= word {
+                    lo += 1;
+                }
+                while hi < n && word >= (c.codelist[hi] & mask) {
+                    hi += 1;
+                }
+                let loval = (lo as u32).min(0x7fff);
+                let hival = ((n - hi) as u32).min(0x7fff);
+                table[slot] = 0x8000_0000 | (loval << 15) | hival;
+            }
+        }
+        (table, tablen)
+    }
+
+    /// C の `decode_packed_entry_number`（codebook.c:452–505）を、C の表（[`c_firsttable`]）と aoTuV の覗き（`vlook`・`vadv`）で
+    /// そのまま組んだもの。
+    fn c_decode(c: &DecodeBook, table: &[u32], tablen: i32, b: &mut OggpackReader<'_>) -> i64 {
+        let mut read = c.dec_maxlength;
+        let (mut lo, mut hi): (i64, i64);
+        let lok = b.vlook(tablen);
+        if lok >= 0 {
+            let entry = i64::from(table[lok as usize]);
+            if entry & 0x8000_0000 != 0 {
+                lo = (entry >> 15) & 0x7fff;
+                hi = c.used_entries - (entry & 0x7fff);
+            } else {
+                b.vadv(i32::from(c.dec_codelengths[(entry - 1) as usize]));
+                return entry - 1;
+            }
+        } else {
+            lo = 0;
+            hi = c.used_entries;
+        }
+        let mut lok = b.vlook(read);
+        while lok < 0 && read > 1 {
+            read -= 1;
+            lok = b.vlook(read);
+        }
+        if lok < 0 {
+            return -1;
+        }
+        let testword = bitreverse(lok as u32);
+        while hi - lo > 1 {
+            let p = (hi - lo) >> 1;
+            let test = i64::from(c.codelist[(lo + p) as usize] > testword);
+            lo += p & (test - 1);
+            hi -= p & (-test);
+        }
+        let len = i32::from(c.dec_codelengths[lo as usize]);
+        if len <= read {
+            b.vadv(len);
+            return lo;
+        }
+        b.vadv(read);
+        -1
+    }
+
+    /// 復号（広げた表・表の値の形・8 バイトの覗きの速い道・窓）が、C の表と C の流れ（[`c_decode`]）と同じ番号を読み、同じだけ
+    /// 進み、同じ所で −1 になる（books.bin の全冊 × ChaCha8 のビット列。1〜48 バイトで、速い道とパケットの終わりの近くの
+    /// 両方を通す。1 つの項目だけの codebook も）。
+    #[test]
+    fn decode_reads_like_the_c_decoder() {
+        use rand_chacha::rand_core::Rng;
+        let mut rng = crate::determinism::rng(37);
+        let mut books: Vec<StaticCodebook> = (0..vorbis_tables::BOOKS.len())
+            .map(|k| vorbis_tables::unpack(vorbis_tables::BookId(k as u16)).unwrap())
+            .collect();
+        // 1 つの項目だけ（長さ 1。sharedbook.c が受け付ける唯一の足りない木）
+        books.push(StaticCodebook {
+            dim: 1,
+            entries: 4,
+            lengthlist: vec![0, 1, 0, 0],
+            maptype: 0,
+            q_min: 0,
+            q_delta: 0,
+            q_quant: 0,
+            q_sequencep: 0,
+            quantlist: vec![],
+        });
+        let (mut fast, mut near) = (0u64, 0u64);
+        for (k, s) in books.iter().enumerate() {
+            let w = DecodeBook::init(s).unwrap().unwrap();
+            let (table, tablen) = c_firsttable(&w);
+            for _ in 0..60 {
+                let len = 1 + (rng.next_u32() % 48) as usize;
+                let bytes: Vec<u8> = (0..len).map(|_| rng.next_u32() as u8).collect();
+                let (mut rc, mut rw) = (OggpackReader::new(&bytes), OggpackReader::new(&bytes));
+                // C の流れの番号と、各回のあとの位置
+                let mut seq = Vec::new();
+                loop {
+                    if rw.peek_word().is_some() {
+                        fast += 1;
+                    } else {
+                        near += 1;
+                    }
+                    let (a, b) = (
+                        c_decode(&w, &table, tablen, &mut rc),
+                        w.decode_packed_entry_number(&mut rw),
+                    );
+                    assert_eq!(a, b, "本 {k}");
+                    assert_eq!((rc.endbyte, rc.endbit), (rw.endbyte, rw.endbit), "本 {k}");
+                    seq.push((a, rc.endbyte, rc.endbit));
+                    if a == -1 || rc.endbyte >= rc.storage {
+                        break;
+                    }
+                }
+                // 窓で読む復号のループ（`Entries`）：途中の回数で止めて、落としたあとの位置も同じ（途中から読み直しても同じ）
+                for _ in 0..3 {
+                    let stop = 1 + (rng.next_u32() as usize) % seq.len();
+                    let mut r = OggpackReader::new(&bytes);
+                    let mut got = Vec::new();
+                    {
+                        let mut src = Entries::new(&mut r);
+                        for _ in 0..stop {
+                            got.push(src.next(&w));
+                        }
+                    }
+                    let want: Vec<i64> = seq[..stop].iter().map(|s| s.0).collect();
+                    assert_eq!(got, want, "本 {k}");
+                    assert_eq!(
+                        (r.endbyte, r.endbit),
+                        (seq[stop - 1].1, seq[stop - 1].2),
+                        "本 {k}"
+                    );
+                    let mut src = Entries::new(&mut r);
+                    for s in &seq[stop..] {
+                        assert_eq!(src.next(&w), s.0, "本 {k}");
+                    }
+                }
+            }
+        }
+        assert!(fast > 100_000 && near > 10_000, "{fast} {near}");
     }
 
     /// dim 0 の codebook（maptype 1・値 0 個）を residue 0 が使っても 0 で割らない。照合用の C（arm64）と同じく何も読まずに

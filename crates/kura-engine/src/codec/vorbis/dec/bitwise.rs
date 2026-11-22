@@ -158,11 +158,95 @@ impl<'a> OggpackReader<'a> {
         (m & self.gather(bits)) as i64
     }
 
+    /// パケットの終わりまで 8 バイト以上あれば、今の位置からの 8 バイト（リトルエンディアン）を `endbit` だけずらした語
+    /// （下位の 57 ビット以上が有効）。このとき [`OggpackReader::vlook`] の範囲の確かめは、32 ビットまでのどの幅でも通る
+    /// （`endbyte + 4 < storage`）ので、`vlook(bits)` は語の下位 `bits` ビットと同じ。
+    #[inline]
+    pub fn peek_word(&self) -> Option<u64> {
+        let i = usize::try_from(self.endbyte).ok()?;
+        let w = self.buf.get(i..i.checked_add(8)?)?.first_chunk::<8>()?;
+        Some(u64::from_le_bytes(*w) >> self.endbit as u32)
+    }
+
     /// aoTuV の `vorbis_oggpack_adv`（codebook.c:149–154）：範囲を確かめずに進める。
+    #[inline]
     pub fn vadv(&mut self, bits: i32) {
         let bits = bits + self.endbit;
         self.endbyte += i64::from(bits / 8);
         self.endbit = bits & 7;
+    }
+}
+
+/// codebook の復号のループで使う覗きの窓：読み手の今の位置からのビットを語（`cache`）に持ち、覗くたびにパケットを読み直さない。
+///
+/// 位置 `P`（ビット）の次の `n` ビットが `cache` の下位 `n` ビット（`n = next·8 − P`。`next` までのバイトは読み終えた）。
+/// どのビットもパケットの内から読んだもの（`cache` の `n` より上のビットは、そこにある本当のビットか 0。読み足すときに
+/// 本当のビットを OR するので、どちらでも同じ値になる）。`n` が 32 以上なら、aoTuV の覗き（[`OggpackReader::vlook`]）は
+/// 32 ビットまでのどの幅でも範囲の確かめを通り（`P + bits ≤ storage·8`）、覗いた値は `cache` の下位のビットと同じ。
+pub(crate) struct Window<'a> {
+    buf: &'a [u8],
+    next: usize,
+    cache: u64,
+    n: u32,
+}
+
+impl<'a> Window<'a> {
+    /// 読み手の今の位置から開く（8 バイト読めなければ None）。
+    #[inline]
+    pub fn open(r: &OggpackReader<'a>) -> Option<Self> {
+        let i = usize::try_from(r.endbyte).ok()?;
+        let next = i.checked_add(8)?;
+        let w = r.buf.get(i..next)?.first_chunk::<8>()?;
+        let e = (r.endbit & 7) as u32;
+        Some(Self {
+            buf: r.buf,
+            next,
+            cache: u64::from_le_bytes(*w) >> e,
+            n: 64 - e,
+        })
+    }
+
+    /// 32 ビット以上あるようにする（読み足す 8 バイトがパケットの内になければ偽。そのときは読み手に戻して C の形で読む）。
+    #[inline]
+    pub fn fill(&mut self) -> bool {
+        if self.n >= 32 {
+            return true;
+        }
+        let Some(w) = self
+            .next
+            .checked_add(8)
+            .and_then(|end| self.buf.get(self.next..end))
+            .and_then(|w| w.first_chunk::<8>())
+        else {
+            return false;
+        };
+        self.cache |= u64::from_le_bytes(*w) << self.n;
+        let take = (64 - self.n) / 8;
+        self.n += take * 8;
+        self.next += take as usize;
+        true
+    }
+
+    /// 今の位置からのビット（下位 `n` ビットが有効）。
+    #[inline]
+    pub fn bits(&self) -> u64 {
+        self.cache
+    }
+
+    /// `k` ビット進める（`k` は 32 以下。[`Window::fill`] が真のあとに、`n` を超えない分だけ呼ぶ）。
+    #[inline]
+    pub fn consume(&mut self, k: u32) {
+        let k = k.min(self.n);
+        self.cache = self.cache.checked_shr(k).unwrap_or(0);
+        self.n -= k;
+    }
+
+    /// 読み手を窓の位置に戻す。
+    #[inline]
+    pub fn close(&self, r: &mut OggpackReader<'_>) {
+        let p = self.next as i64 * 8 - i64::from(self.n);
+        r.endbyte = p >> 3;
+        r.endbit = (p & 7) as i32;
     }
 }
 
