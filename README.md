@@ -1,18 +1,41 @@
 # Kura
 
 画像・音楽・動画をひとつのライブラリで管理し、種類を混ぜたプレイリストで再生する、個人用の macOS アプリです。
-Tauri 2（Rust）と React / TypeScript で作っています。名前の「Kura」は仮称です。
+ゲームなどに使う素材（ドット絵・スプライト・効果音・フォント・3D モデル）の置き場も兼ねていて、画像・音声の編集、
+レシピでの一括加工、ライセンスとクレジットの記録、Godot・Unity のプロジェクトへの持ち出しまでを 1 つのアプリで行います。
+Tauri 2（Rust）と React / TypeScript で作っています。名前の「Kura」は仮称です。今の版は 0.2.0 です。
 
 ![ライブラリ画面：ジャスティファイ表示のグリッドと、タグ・フォルダ・取得元・メモを表示するインスペクタ](docs/images/library.jpg)
 
 ## 特長
 
+### ライブラリ
+
 - **元のファイルを壊さない取り込み**：ファイルはライブラリへコピーし（同じボリュームなら APFS クローンで容量を使わない）、取り込み元は移動も変更もしない。内容のハッシュ（BLAKE3）で重複を見分ける。
 - **整理**：仮想フォルダ（1 つのアイテムを複数のフォルダに入れられる）、名前空間・別名・親子関係を持つタグ、評価・メモ、まとめて扱う「ユニット」、スマートフォルダ（保存した検索）。
-- **検索**：⌘K のパレットで、`夜景 種類:画像 評価>=4` のような検索言語で絞り込む。
+- **検索**：⌘K のパレットで、`夜景 種類:画像 評価>=4` のような検索言語で絞り込む。素材の情報（`種類:フォント`・`透過:あり`・`ループ:あり`・`ラウドネス`・`ライセンス` など）でも絞り込める。
 - **混ぜて再生**：画像・音楽・動画を 1 つのプレイリストに並べ、画像の間も直前の音楽を流し続けられる。ファイル単位とユニット単位を切り替えられ、シャッフルはシードを固定して再現できる。
 - **取得**：URL を貼ると yt-dlp / gallery-dl で取得して取り込み、投稿者・タグなどのメタデータも反映する。Web ページのキャプチャもできる。
 - **速さ**：10 万件のライブラリで、起動から操作できるまで 1.5 秒以内、グリッドのスクロール 60fps を目標に作っている。重い処理は Rust 側で行う。
+
+### 素材
+
+- **種類**：画像・音楽・動画のほかに、フォント（ttf・otf・ttc・woff・woff2）、3D モデル（glb）、PSD・PSB・aseprite・SVG を取り込み、サムネイルと情報を出す。
+- **表示**：透過のある画像は市松模様の上に、ドット絵は最近傍法で拡大して表示する。スプライトシートと aseprite のアニメーションを再生し、短い効果音は選ぶとすぐ鳴る。波形を出し、ループ点でループを試聴できる。
+- **素材の情報**：透過の有無・2 のべき乗・色数・サンプルレート・ビット深度・チャンネル・ラウドネス・ループ点を解析して表示する。
+
+### 編集
+
+- **画像エディタ**：切り抜き、キャンバスの大きさ、リサイズ（ドット絵は最近傍法）、回転・反転、透明な余白のトリム、形式の変換、スプライトの分割・結合と、ペン・消しゴム・塗りつぶし・スポイト。
+- **音声エディタ**：トリム、フェード、ゲイン、ラウドネスの正規化、ループ点、モノラル化、サンプルレートの変換、形式の変換（WAV → Ogg Vorbis など）。60 分の音声も区間ごとに読んで扱う。
+- **版**：編集は「元のファイルに対する操作の列」として持ち、上書き・別名で保存・元に戻す・途中の版に戻すができる。同じ操作の列と同じ元からは、いつ作り直しても同じ結果になる（操作エンジン `kura-engine`。Ogg Vorbis のエンコーダも自前で移した）。
+- **一括加工**：エディタの操作の列をレシピにして、選んだ多数のアイテムにまとめて当てる。当てる前の事前チェック、一時停止・再開、アイテムごとに変わる引数（幅の 50% など）、スプライトシートへのまとめ。
+
+### 持ち出し
+
+- **ライセンスとクレジット**：素材ごとにライセンス・作者・作品・出典・表記の文を記録し、使った素材のクレジットの一覧（テキスト・Markdown）を書き出す。
+- **プロジェクト**：Godot・Unity のプロジェクトのフォルダを登録すると、どの素材をどのプロジェクトで使ったかを、ファイルの中身で照らして記録する。
+- **書き出しとドラッグアウト**：命名規則（snake_case・PascalCase など）と形式の変換（PSD → PNG、FLAC → WAV など）を指定して書き出せる。グリッドからプロジェクトのフォルダへ直接ドラッグしても、同じ名前と形式のファイルができる。
 
 ## 画面
 
@@ -20,12 +43,12 @@ Tauri 2（Rust）と React / TypeScript で作っています。名前の「Kura
 | --- | --- |
 | ![シアター再生：動画を再生中のプレーヤーと、画像・音楽・動画が混ざったキュー](docs/images/player.jpg) | ![⌘K 検索パレット：検索条件のチップ、一致件数、保存済みの検索、書き方の例](docs/images/search.jpg) |
 
-画面に写っている画像・動画・音楽は、すべてこのリポジトリのために図形と合成音で生成したダミーです。
+画面に写っている画像・動画・音楽は、すべてこのリポジトリのために図形と合成音で生成したダミーです。写真は 0.1 の時点のもので、エディタ・一括加工・持ち出しの画面はまだ載せていません。
 
 ## 動作環境
 
 - macOS 26 以降、Apple Silicon
-- 配布用のビルドはまだありません。下の手順でソースからビルドしてください。
+- 配布用のビルドは公開していません。下の手順でソースからビルドしてください。
 
 ### 外部ツール（任意）
 
@@ -42,7 +65,7 @@ brew install yt-dlp gallery-dl deno ffmpeg
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | 動画・音楽のダウンロード | Unlicense |
 | [gallery-dl](https://github.com/mikf/gallery-dl) | 画像のダウンロード | GPL-2.0 |
 | [deno](https://deno.com/) | yt-dlp が一部のサイトで使う JavaScript の実行 | MIT |
-| [FFmpeg](https://ffmpeg.org/)（ffmpeg / ffprobe） | 再生用プロキシの作成、メディア情報 | LGPL-2.1 以降または GPL（ビルドによる） |
+| [FFmpeg](https://ffmpeg.org/)（ffmpeg / ffprobe） | 再生用プロキシの作成、メディア情報、エディタで直接読めない音声（Opus など）の読み込みと MP3 での保存 | LGPL-2.1 以降または GPL（ビルドによる） |
 | [Google Chrome](https://www.google.com/chrome/) | Web ページのキャプチャ | Google の利用規約 |
 | [mpv](https://mpv.io/) | 外部プレイヤーで開く | GPL-2.0 以降 / LGPL-2.1 以降 |
 
@@ -65,7 +88,8 @@ pnpm install
 pnpm tauri dev
 ```
 
-配布用のビルドは `pnpm tauri build` です。`target/release/bundle/` に `Kura.app` と `.dmg` ができます（署名・公証はしていません）。
+配布用のビルドは `pnpm tauri build` です。`target/release/bundle/macos/Kura.app` と `target/release/bundle/dmg/Kura_0.2.0_aarch64.dmg` ができます。
+署名はアドホック署名だけで、公証はしていません。自分の Mac でビルドしたものは `/Applications` にコピーすればそのまま開けますが、ほかの Mac に渡すと Gatekeeper に止められます（システム設定 › プライバシーとセキュリティの「このまま開く」で開けます）。
 
 ## 開発
 
@@ -73,24 +97,34 @@ pnpm tauri dev
 |---|---|
 | 開発起動 | `pnpm tauri dev` |
 | Rust のテスト | `cargo test --workspace` |
+| 操作エンジンのテスト | `cargo test -p kura-engine`（結合テストの 1 ファイルだけは `--test suite <ファイル名>::`） |
 | Rust の lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | 整形 | `cargo fmt --all` と `pnpm run format` |
 | 型チェック | `pnpm run typecheck` |
 | フロントのテスト | `pnpm test` |
 | 依存ライブラリのライセンス一覧 | `pnpm run licenses`（確認だけなら `pnpm run licenses:check`） |
 | ダミーライブラリの生成 | `cargo run -p kura-devtools -- seed --items 100000 --out /tmp/bench.kuralib` |
+| ファズ | [`fuzz/README.md`](fuzz/README.md)（`cargo +nightly fuzz …`） |
 
-開発は [Claude Code](https://claude.com/claude-code) で進めています。プロジェクトの指示は [`CLAUDE.md`](CLAUDE.md)、ファイルの種類ごとのルールと手順（`/verify` など）は [`.claude/`](.claude) にあります。
-作業は [`docs/roadmap.md`](docs/roadmap.md) のマイルストーン単位で進め、M0〜M9 まで終わっています。
+開発は [Claude Code](https://claude.com/claude-code) で進めています。プロジェクトの指示は [`CLAUDE.md`](CLAUDE.md)、ファイルの種類ごとのルールと手順は [`.claude/`](.claude) にあります。
+上の確かめをまとめて回すのは `/verify`（Claude Code のスキル）で、手元で 6 分ほどです。
+作業は [`docs/roadmap.md`](docs/roadmap.md) のマイルストーン単位で進めています。M0〜M14 まで終わり（M11 の表示は、耳と画面での確かめが一部残っています）、M15（ライセンス・クレジットと持ち出し）は段 7 まで終わっています。
+
+CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）は、push と PR では Ubuntu で最低限（整形、lint、ゴールデンの追記だけの検査、Linux と macOS で同じ値になるはずのゴールデン）だけを回します。全部のテスト（Ubuntu と macOS）は、Actions から手で起こしたときに回します（ADR-209）。
 
 ### リポジトリ構成
 
 ```text
-crates/kura-core/      OS に依存しないドメインロジック（DB、取り込み、検索、ユニット、プレイリスト、ジョブ）
-crates/kura-mac/       macOS 専用の機能（サムネイル、メディア情報、スナップショット。Swift ヘルパー）
+crates/kura-core/      OS に依存しないドメインロジック（DB、取り込み、検索、ユニット、プレイリスト、ジョブ、保存と版、一括加工、プロジェクトとクレジット）
+crates/kura-engine/    編集の操作エンジン（文書・操作・描画・解析・コーデック・3D。OS と DB に依存しない）
+crates/kura-mac/       macOS 専用の機能（サムネイル、メディア情報、スナップショット、ImageIO・AudioToolbox のコーデック、ドラッグアウト。Swift ヘルパー）
+crates/vorbis-tables/  Ogg Vorbis のエンコーダの表（aoTuV から生成）と照合用の C
 crates/kura-devtools/  ダミーライブラリの生成とベンチマーク
 src-tauri/             Tauri アプリ本体（コマンド、kura:// プロトコル、ウィンドウ）
 src/                   React のフロントエンド
+third_party/           不具合の修正と超越関数の差し替えをした第三者のクレートの写し（symphonia）
+fuzz/                  ファズの対象
+scripts/               CI の検査と、ライセンス一覧の生成
 docs/                  仕様と設計
 ```
 
@@ -101,7 +135,9 @@ docs/                  仕様と設計
 - [`docs/data-model.md`](docs/data-model.md)：SQLite のスキーマ
 - [`docs/playlists.md`](docs/playlists.md)：ユニットとプレイリスト、シャッフル、再生
 - [`docs/search-query.md`](docs/search-query.md)：検索言語と ⌘K パレット
+- [`docs/editing.md`](docs/editing.md)：操作エンジン（文書・決定性と版・コーデック・描画・解析・保存）
 - [`docs/design.md`](docs/design.md)：デザインの方針と部品（モックは [`docs/design/mockups/`](docs/design/mockups)）
+- [`docs/roadmap.md`](docs/roadmap.md)：マイルストーンと完了条件
 - [`docs/decisions.md`](docs/decisions.md)：設計判断の記録
 
 ### まだ決めていないこと
