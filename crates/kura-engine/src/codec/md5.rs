@@ -176,12 +176,16 @@ impl Md5 {
             *w = u32::from_le_bytes(*c);
         }
         let [mut a, mut b, mut c, mut d] = self.state;
+        // 1 段：b ← b + ((a + F(b, c, d) + K[i] + X[g]) <<< s)。足し算は 2³² を法とするので、足す順を変えても同じ値。
+        // 前の段の b を待たない項（a・K・X と、c・d だけで決まる部分）を先に足し、b に依る項を最後に足す（RFC 1321 の
+        // F・G は、ビットの重ならない 2 つの項の OR なので、OR を足し算にしてよい）
         macro_rules! step {
-            ($f:expr, $i:expr) => {{
-                let f = $f
-                    .wrapping_add(a)
+            ($early:expr, $late:expr, $i:expr) => {{
+                let f = a
                     .wrapping_add(K[$i])
-                    .wrapping_add(m[G[$i]]);
+                    .wrapping_add(m[G[$i]])
+                    .wrapping_add($early)
+                    .wrapping_add($late);
                 a = d;
                 d = c;
                 c = b;
@@ -189,16 +193,20 @@ impl Md5 {
             }};
         }
         for i in 0..16 {
-            step!((b & c) | (!b & d), i);
+            // F = (b & c) | (!b & d) = d ^ (b & (c ^ d))
+            step!(0, d ^ (b & (c ^ d)), i);
         }
         for i in 16..32 {
-            step!((d & b) | (!d & c), i);
+            // G = (d & b) | (!d & c)：2 つの項はビットが重ならないので和
+            step!(!d & c, d & b, i);
         }
         for i in 32..48 {
-            step!(b ^ c ^ d, i);
+            // H = b ^ c ^ d
+            step!(0, b ^ (c ^ d), i);
         }
         for i in 48..64 {
-            step!(c ^ (b | !d), i);
+            // I = c ^ (b | !d)
+            step!(0, c ^ (b | !d), i);
         }
         self.state[0] = self.state[0].wrapping_add(a);
         self.state[1] = self.state[1].wrapping_add(b);
