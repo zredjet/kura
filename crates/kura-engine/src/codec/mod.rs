@@ -20,6 +20,7 @@
 pub mod aiff;
 pub mod anchor;
 pub mod aseprite;
+pub(crate) mod byte_in;
 pub mod caps;
 pub mod exif;
 pub mod flac;
@@ -33,6 +34,7 @@ pub mod lossy;
 pub(crate) mod md5;
 pub mod mp3;
 pub(crate) mod ogg;
+pub(crate) mod ogg_read;
 pub mod pcm;
 pub mod platform;
 pub mod png;
