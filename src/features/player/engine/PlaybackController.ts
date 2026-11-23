@@ -1,5 +1,6 @@
 import type { ItemSummaryDto } from '../../../ipc/items';
 import { hasDuration, isPlayable, needsProxy, type TimedKind } from '../../../ipc/kinds';
+import { clampSeek } from '../../../lib/seek';
 import { type BgmAction, type BgmStatus, bgmOnEnter, bgmOnTrackEnd } from './bgm';
 import { FADE_MS, Fader } from './fade';
 import { nextIndex, playedDelta, prevTarget, stepImageMs } from './nav';
@@ -74,6 +75,8 @@ export class PlaybackController {
   private completed = false;
   private lastTick = 0;
   private lastMediaSec = 0;
+  /** シークバー・波形をドラッグしている間（要素・画像の時計を止める。ADR-230）。 */
+  private scrubbing = false;
 
   private readonly attempts = new Map<number, number>();
   private readonly forced = new Set<number>();
@@ -301,15 +304,69 @@ export class PlaybackController {
     }
   }
 
-  /** 再生位置を変える（画像は表示した時間）。シークで飛ばした分は再生時間に数えない。 */
+  /**
+   * 再生位置を変える（画像は表示した時間）。シークで飛ばした分は再生時間に数えない。今のスロットの中だけ（0 と終わりの
+   * 手前で止める。トリムがあればトリムの終わりの手前。ADR-230）。
+   */
   seek(ms: number): void {
-    const target = Math.max(0, ms);
+    const target = clampSeek(ms, this.endMs());
     const media = this.slotMedia();
     if (media) {
       media.currentTime = target / 1000;
       this.lastMediaSec = target / 1000;
     }
     this.positionMs = target;
+    this.emit();
+  }
+
+  /** 今の位置（ms）。音楽・動画は要素の位置を読む（刻みの 200ms の遅れを避ける。シークのキー）。 */
+  currentMs(): number {
+    const media = this.slotMedia();
+    if (media && (this.phase === 'playing' || this.phase === 'loading')) {
+      const sec = media.currentTime;
+      if (Number.isFinite(sec)) {
+        return sec * 1000;
+      }
+    }
+    return this.positionMs;
+  }
+
+  /** 今のスロットの終わり（ms。長さとトリムの終わりの早いほう。画像は表示時間。分からなければ null）。 */
+  endMs(): number | null {
+    const trim = this.queue?.endMs[this.index] ?? null;
+    const length = this.currentKind() === 'image' ? this.imageMs() : this.durationMs;
+    if (length === null) {
+      return trim;
+    }
+    return trim !== null ? Math.min(length, trim) : length;
+  }
+
+  /**
+   * シークバー・波形のドラッグを始める：要素（画像は表示の時計）だけを止め、再生中の印は変えない。ドラッグ中は
+   * 再生時間を数えず、画像の終わり・トリムの終わりでも次へ進まない（ADR-230）。
+   */
+  beginScrub(): void {
+    if (!this.queue || this.scrubbing) {
+      return;
+    }
+    this.scrubbing = true;
+    const media = this.slotMedia();
+    if (media && this.playing) {
+      media.pause();
+    }
+  }
+
+  /** ドラッグを終える：再生中なら続きから鳴らす。 */
+  endScrub(): void {
+    if (!this.scrubbing) {
+      return;
+    }
+    this.scrubbing = false;
+    this.lastTick = this.deps.clock.now();
+    const media = this.slotMedia();
+    if (media && this.playing && (this.phase === 'playing' || this.phase === 'loading')) {
+      playSafely(media);
+    }
     this.emit();
   }
 
@@ -369,6 +426,7 @@ export class PlaybackController {
     this.durationMs = null;
     this.playedMs = 0;
     this.completed = false;
+    this.scrubbing = false;
     this.lastMediaSec = 0;
     this.lastTick = this.deps.clock.now();
     this.phase = 'loading';
@@ -457,13 +515,19 @@ export class PlaybackController {
     }
     const unitId = queue.unitIds[this.index] ?? null;
     const item = this.items.get(itemId);
+    // 画像の「最後まで表示した」は、実際に表示した時間が表示時間に届いたときだけ（シークで終わりへ飛ばしただけでは
+    // 当たらない。1 曲リピートの判定の `completed` とは分ける。ADR-230）
+    const completed =
+      item?.kind === 'image'
+        ? this.completed && this.playedMs >= (this.durationMs ?? this.imageMs())
+        : this.completed;
     const report = {
       itemId,
       unitId,
       playlistId: queue.playlist?.id ?? null,
       unitStart: unitId !== null && queue.indexInUnit[this.index] === 0,
       playedMs: Math.round(this.playedMs),
-      completed: this.completed,
+      completed,
       durationMs:
         item?.kind === 'image'
           ? null
@@ -772,6 +836,10 @@ export class PlaybackController {
     this.lastTick = now;
     if (!this.queue || (this.phase !== 'playing' && this.phase !== 'loading')) {
       this.emit();
+      return;
+    }
+    // ドラッグ中は進めず、終わりの判定もしない（位置はシークが出す）
+    if (this.scrubbing) {
       return;
     }
     const kind = this.currentKind();
