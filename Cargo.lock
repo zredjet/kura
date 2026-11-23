@@ -2218,6 +2218,7 @@ dependencies = [
  "symphonia-format-ogg",
  "thiserror 2.0.21",
  "vorbis-tables",
+ "weezl",
  "zune-jpeg",
 ]
 

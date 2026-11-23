@@ -1,6 +1,7 @@
-//! GIF（`gif` クレート。版は `=` で固定。Pinned）。
+//! GIF（Pinned）。読み取りは自作の読み口 `gif_read`、書き出しは自作の入れ物 `gif_write` と LZW `lzw`（M16 段 8。ADR-225。
+//! 前は `gif` クレート 0.14.2。前の読み書きは試験だけの `gif_old` に写して照らす）。
 //!
-//! 読み取り（`gif-rs-dec/1`）：
+//! 読み取り（`gif-rs-dec/1`。前の gif クレートが読めた GIF は同じ値で読む。ブロックの層の受け付けは `gif_read` の冒頭）：
 //! - 論理画面の大きさのキャンバス（初めは透明）に、フレームを順に描く。透明の番号の画素は描かない（下が見える）。
 //!   画面の外にはみ出す部分は切る。描いた直後のキャンバスを 1 フレームにし、そのあと dispose を当てる
 //!   （Background はフレームの範囲を透明に、Previous は描く前に戻す。Any・Keep はそのまま）。背景色の番号は使わない（ブラウザと同じ）。
@@ -12,8 +13,13 @@
 //!   透明が見えうる：最初のフレームが画面いっぱいでない・透明の番号を持つ・Background か Previous のフレームがある。
 //!   この判断と形は、LZW を展開しない走査で先に決める（形と中身を一致させる）。
 //! - パレットの外の番号の画素はエラー。ICC（アプリケーションの拡張）を運ぶ。
+//! - 途中で切れた GIF（終わりのブロックがない・フレームのデータが途中で終わる）はブラウザのように読み、届いた画素まで描く
+//!   （利用者の決定。前は誤り。最初のフレームが切れていれば、届かなかった画素は透明に見えるので消す色を持つ形式にする）。
+//!   ファイルは終わりまであるのに画素が足りないフレームは前と同じく誤り。画素は 1 行ずつ展開してキャンバスに描く。インターレースのフレームは素直な LZW で読む（前の gif クレートは、行が符号の切れ目で終わると
+//!   正しいファイルを断ったり、まれにずれた値で読んだりしていた。利用者の決定で、その稀な値は正しい値に変わる）。
 //!
-//! 書き出し（`gif-rs-enc/1`）：
+//! 書き出し（`gif-kura-enc/1`。前の `gif-rs-enc/1` は退いた書き手。入れ物の書き方は前と同じ意味で、LZW は自作。表が満ちたら
+//! すぐ clear（利用者の決定））：
 //! - 設定は `alphaThreshold`（0〜255、既定 128）：アルファがこれより小さい画素を透明、ほかを不透明にする（GIF の透明は 2 値）。
 //! - 色（不透明な画素の RGB）が、透明の分を除いた空きに収まればそのままのパレット、収まらなければ `imaging::quantize`（自作の
 //!   メディアンカット）で減色し、いちばん近い色にする（ディザはかけない）。フレームの列は全フレームの色で 1 つの大域パレットを作る。
@@ -22,12 +28,13 @@
 //!   （`Unsupported`。先に 1 枚の画像にする）。
 //! - 16 ビットの画像は書けない（先に 8 ビットへ変換する）。トリムしたフレームの列も書かない（先に広げる）。
 
-use std::io::{BufReader, Write};
-use std::num::NonZeroU64;
+use std::io::Write;
 use std::sync::Arc;
 
 use serde_json::json;
 
+use crate::codec::gif_read::{self, Dispose, Repeat, Scan};
+use crate::codec::gif_write::{FrameOut, GifOut};
 use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, caps_of, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -42,7 +49,7 @@ use crate::value::{Frames, Image, ImageMeta, Palette, PixelFormat, Raster, Value
 pub struct GifCodec;
 
 const DEC_ID: &str = "gif-rs-dec/1";
-const ENC_ID: &str = "gif-rs-enc/1";
+const ENC_ID: &str = "gif-kura-enc/1";
 
 fn err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Decode {
@@ -58,32 +65,8 @@ fn enc_err(e: impl std::fmt::Display) -> EngineError {
     }
 }
 
-fn options(limits: &Limits, skip: bool) -> gif::DecodeOptions {
-    let mut o = gif::DecodeOptions::new();
-    o.set_color_output(gif::ColorOutput::Indexed);
-    // 1 フレームの作業領域（番号は 1 画素 1 バイト）
-    let bytes = NonZeroU64::new(limits.max_pixels.max(1)).unwrap_or(NonZeroU64::MIN);
-    o.set_memory_limit(gif::MemoryLimit::Bytes(bytes));
-    o.skip_frame_decoding(skip);
-    o
-}
-
-/// フレームの記述（LZW を展開せずに読んだもの）。
-#[derive(Debug, Clone, Copy)]
-struct FrameInfo {
-    left: u32,
-    top: u32,
-    w: u32,
-    h: u32,
-    local: bool,
-    transparent: Option<u8>,
-    dispose: gif::DisposalMethod,
-}
-
 struct Plan {
-    w: u32,
-    h: u32,
-    frames: Vec<FrameInfo>,
+    scan: Scan,
     /// フレームの列にするか（2 つ以上か、繰り返しの拡張がある）。
     animated: bool,
     fmt: PixelFormat,
@@ -95,60 +78,33 @@ struct Plan {
 }
 
 fn plan(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Plan, EngineError> {
-    let mut d = options(limits, true)
-        .read_info(BufReader::new(src))
-        .map_err(err)?;
-    let (w, h) = (u32::from(d.width()), u32::from(d.height()));
+    let scan = gif_read::scan(src, limits)?;
+    let (w, h) = (scan.w, scan.h);
     if w == 0 || h == 0 {
         return Err(err("論理画面の大きさが 0 です"));
     }
-    let global: Option<Vec<[u8; 4]>> = d.global_palette().map(|p| {
-        p.as_chunks::<3>()
-            .0
-            .iter()
-            .map(|c| [c[0], c[1], c[2], 255])
-            .collect()
-    });
-    let mut frames = Vec::new();
-    while let Some(f) = d.read_next_frame().map_err(err)? {
-        if frames.len() as u64 >= limits.max_frames {
-            return Err(EngineError::Limit(format!(
-                "フレームが {} を超えます",
-                limits.max_frames
-            )));
-        }
-        frames.push(FrameInfo {
-            left: u32::from(f.left),
-            top: u32::from(f.top),
-            w: u32::from(f.width),
-            h: u32::from(f.height),
-            local: f.palette.is_some(),
-            transparent: f.transparent,
-            dispose: f.dispose,
-        });
-    }
-    let Some(first) = frames.first().copied() else {
+    let Some(first) = scan.frames.first() else {
         return Err(err("フレームがありません"));
     };
-    let plays = match d.repeat() {
-        gif::Repeat::Infinite => 0,
-        gif::Repeat::Finite(n) => u32::from(n) + 1,
+    let plays = match scan.repeat {
+        Repeat::None => 1,
+        Repeat::Infinite => 0,
+        Repeat::Finite(n) => u32::from(n) + 1,
     };
-    // 拡張がないときは Finite(0)（1 回）。拡張の 0 は無限、n は Finite(n)
-    let animated = frames.len() > 1 || d.repeat() != gif::Repeat::Finite(0);
-    let need_clear = !(first.left == 0
+    let animated = scan.frames.len() > 1 || scan.repeat != Repeat::None;
+    // 途中で切れた最初のフレームは、届かなかった画素が透明のまま見える
+    let need_clear = !(first.complete
+        && first.left == 0
         && first.top == 0
         && first.w >= w
         && first.h >= h
         && first.transparent.is_none()
-        && frames.iter().all(|f| {
-            matches!(
-                f.dispose,
-                gif::DisposalMethod::Any | gif::DisposalMethod::Keep
-            )
-        }));
-    let indexed_palette = match &global {
-        Some(g) if !g.is_empty() && !frames.iter().any(|f| f.local) => {
+        && scan
+            .frames
+            .iter()
+            .all(|f| matches!(f.dispose, Dispose::Any | Dispose::Keep)));
+    let indexed_palette = match &scan.global {
+        Some(g) if !g.is_empty() && !scan.frames.iter().any(|f| f.local.is_some()) => {
             if !need_clear {
                 Some((g.clone(), 0u8))
             } else if g.len() < 256 {
@@ -166,9 +122,7 @@ fn plan(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Plan, EngineError> {
         None => (PixelFormat::Rgba8, None, 0),
     };
     Ok(Plan {
-        w,
-        h,
-        frames,
+        scan,
         animated,
         fmt,
         palette,
@@ -190,6 +144,19 @@ impl Decoder for GifCodec {
         format == "gif"
     }
 
+    /// 値のほかに、キャンバス（1 フレーム）と Previous で戻すための写し（1 フレーム）、1 行の置き場と LZW の表。フレーム
+    /// 全体の置き場は持たない（1 行ずつ展開してキャンバスに描く。M16 段 8）。
+    fn work_bytes(&self, _format: &str, shape: &Shape) -> u64 {
+        let frame = match *shape {
+            Shape::Image { w, h, fmt } | Shape::Frames { w, h, fmt, .. } => w
+                .max()
+                .saturating_mul(h.max())
+                .saturating_mul(fmt.bytes_per_pixel() as u64),
+            Shape::Audio { .. } => 0,
+        };
+        frame.saturating_mul(2).saturating_add(256 * 1024)
+    }
+
     fn shape(
         &self,
         src: &mut dyn ReadSeek,
@@ -198,12 +165,15 @@ impl Decoder for GifCodec {
         limits: &Limits,
     ) -> Result<Shape, EngineError> {
         let p = plan(src, limits)?;
-        let (w, h) = (Dim::Exact(u64::from(p.w)), Dim::Exact(u64::from(p.h)));
+        let (w, h) = (
+            Dim::Exact(u64::from(p.scan.w)),
+            Dim::Exact(u64::from(p.scan.h)),
+        );
         Ok(if !p.animated {
             Shape::Image { w, h, fmt: p.fmt }
         } else {
             Shape::Frames {
-                count: Dim::Exact(p.frames.len() as u64),
+                count: Dim::Exact(p.scan.frames.len() as u64),
                 w,
                 h,
                 fmt: p.fmt,
@@ -221,28 +191,12 @@ impl Decoder for GifCodec {
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
         let p = plan(src, limits)?;
-        src.rewind()?;
-        let mut d = options(limits, false)
-            .read_info(BufReader::new(src))
-            .map_err(err)?;
-        let global: Vec<[u8; 4]> = d
-            .global_palette()
-            .map(|g| {
-                g.as_chunks::<3>()
-                    .0
-                    .iter()
-                    .map(|c| [c[0], c[1], c[2], 255])
-                    .collect()
-            })
-            .unwrap_or_default();
+        let global: Vec<[u8; 4]> = p.scan.global.clone().unwrap_or_default();
         let mut meta = ImageMeta::default();
-        if let Some(icc) = d.icc_profile() {
-            if icc.len() as u64 > limits.max_meta_bytes {
-                return Err(EngineError::Limit("ICC プロファイルが大きすぎます".into()));
-            }
-            meta.icc = Some(Arc::new(icc.to_vec()));
+        if let Some(icc) = &p.scan.icc {
+            meta.icc = Some(Arc::new(icc.clone()));
         }
-        let (cw, ch) = (p.w as usize, p.h as usize);
+        let (cw, ch) = (p.scan.w as usize, p.scan.h as usize);
         let indexed = p.fmt == PixelFormat::Indexed8;
         let bpp = p.fmt.bytes_per_pixel();
         let clear: Vec<u8> = if indexed {
@@ -256,61 +210,59 @@ impl Decoder for GifCodec {
         }
         let palette = p.palette.clone().map(|colors| Palette { colors });
         let mut out: Vec<(Raster, u32)> = Vec::new();
-        let mut k = 0usize;
-        while let Some(f) = d.read_next_frame().map_err(err)? {
-            let info = *p
-                .frames
-                .get(k)
-                .ok_or_else(|| err("フレームの数が合いません"))?;
-            k += 1;
-            if (u32::from(f.width), u32::from(f.height)) != (info.w, info.h) {
-                return Err(err("フレームの記述が合いません"));
+        for info in &p.scan.frames {
+            if u64::from(info.w) * u64::from(info.h) > limits.max_pixels {
+                return Err(EngineError::Limit(format!(
+                    "フレームの画素が上限 {} を超えます",
+                    limits.max_pixels
+                )));
             }
             // 局所パレットがあるのは Rgba8 のときだけ（計画でそう決めてある）
-            let colors: Vec<[u8; 4]> = match &f.palette {
-                Some(local) if !indexed => local
-                    .as_chunks::<3>()
-                    .0
-                    .iter()
-                    .map(|c| [c[0], c[1], c[2], 255])
-                    .collect(),
-                _ => global.clone(),
+            let colors: &[[u8; 4]] = match &info.local {
+                Some(local) if !indexed => local,
+                _ => &global,
             };
             // 画面の中に切った範囲
-            let x1 = (info.left + info.w).min(p.w);
-            let y1 = (info.top + info.h).min(p.h);
-            let saved = (info.dispose == gif::DisposalMethod::Previous).then(|| canvas.clone());
-            for y in info.top..y1 {
-                for x in info.left..x1 {
-                    let idx = *f
-                        .buffer
-                        .get(((y - info.top) * info.w + (x - info.left)) as usize)
-                        .ok_or_else(|| err("フレームの画素が足りません"))?;
-                    if Some(idx) == f.transparent {
+            let x1 = (info.left + info.w).min(p.scan.w);
+            let y1 = (info.top + info.h).min(p.scan.h);
+            let saved = (info.dispose == Dispose::Previous).then(|| canvas.clone());
+            // 1 行ずつ展開して描く（届いた画素だけ。途中で切れたフレームは最後の行が短い）
+            gif_read::decode_frame(src, info, |fy, idx| {
+                let y = info.top as usize + fy;
+                if y >= y1 as usize {
+                    return Ok(());
+                }
+                for (dx, &i) in idx.iter().enumerate() {
+                    let x = info.left as usize + dx;
+                    if x >= x1 as usize {
+                        break;
+                    }
+                    if Some(i) == info.transparent {
                         continue;
                     }
-                    if usize::from(idx) >= colors.len() {
+                    if usize::from(i) >= colors.len() {
                         return Err(err("パレットにない番号の画素があります"));
                     }
-                    let at = (y as usize * cw + x as usize) * bpp;
+                    let at = (y * cw + x) * bpp;
                     if indexed {
-                        canvas[at] = idx;
+                        canvas[at] = i;
                     } else {
-                        canvas[at..at + 4].copy_from_slice(&colors[usize::from(idx)]);
+                        canvas[at..at + 4].copy_from_slice(&colors[usize::from(i)]);
                     }
                 }
-            }
-            let ms = u32::from(f.delay) * 10;
+                Ok(())
+            })?;
+            let ms = u32::from(info.delay) * 10;
             out.push((
-                Raster::from_rows(p.w, p.h, p.fmt, palette.clone(), &canvas)?,
+                Raster::from_rows(p.scan.w, p.scan.h, p.fmt, palette.clone(), &canvas)?,
                 ms,
             ));
             if mon.canceled() {
                 return Err(EngineError::Canceled);
             }
             match (info.dispose, saved) {
-                (gif::DisposalMethod::Previous, Some(prev)) => canvas = prev,
-                (gif::DisposalMethod::Background, _) => {
+                (Dispose::Previous, Some(prev)) => canvas = prev,
+                (Dispose::Background, _) => {
                     for y in info.top..y1 {
                         for x in info.left..x1 {
                             let at = (y as usize * cw + x as usize) * bpp;
@@ -320,9 +272,6 @@ impl Decoder for GifCodec {
                 }
                 _ => {}
             }
-        }
-        if k != p.frames.len() {
-            return Err(err("フレームの数が合いません"));
         }
         if !p.animated {
             let (px, _) = out.remove(0);
@@ -466,65 +415,54 @@ impl Encoder for GifCodec {
             palette.push([0, 0, 0, 255]);
         }
         let rgb: Vec<u8> = palette.iter().flat_map(|c| [c[0], c[1], c[2]]).collect();
-        let mut bytes = Vec::new();
-        {
-            let mut enc = gif::Encoder::new(&mut bytes, w, h, &rgb).map_err(enc_err)?;
-            if let Some(plays) = plays {
-                let repeat = match plays {
-                    0 => gif::Repeat::Infinite,
-                    n => gif::Repeat::Finite(u16::try_from(n - 1).unwrap_or(u16::MAX)),
-                };
-                enc.set_repeat(repeat).map_err(enc_err)?;
-            }
-            let dispose = if any_transparent {
-                gif::DisposalMethod::Background
-            } else {
-                gif::DisposalMethod::Keep
-            };
-            for (rgba, (_, ms)) in rgba_frames.iter().zip(&rasters) {
-                let fh = quantize::histogram(rgba, mon)?;
-                // 透明は透明の番号へ、ほかはいちばん近いパレットの色へ
-                let opaque_palette: Vec<[u8; 4]> =
-                    palette.iter().copied().filter(|c| c[3] == 255).collect();
-                let mut idx = quantize::map_to_palette(
-                    rgba,
-                    &fh,
-                    if opaque_palette.is_empty() {
-                        &palette
-                    } else {
-                        &opaque_palette
-                    },
-                    mon,
-                )?;
-                if let Some(t) = transparent {
-                    for (i, p) in idx.iter_mut().zip(rgba.as_chunks::<4>().0.iter()) {
-                        if p[3] == 0 {
-                            *i = t;
-                        }
+        // 繰り返し：0 は無限、n は n − 1 回の繰り返し（1 回なら書かない）
+        let repeat = plays.and_then(|n| match n {
+            0 => Some(0),
+            1 => None,
+            n => Some(u16::try_from(n - 1).unwrap_or(u16::MAX)),
+        });
+        let mut gif = GifOut::new(w, h, &rgb, repeat)?;
+        let dispose = if any_transparent { 2 } else { 1 };
+        // 透明は透明の番号へ、ほかはいちばん近いパレットの色へ
+        let opaque_palette: Vec<[u8; 4]> =
+            palette.iter().copied().filter(|c| c[3] == 255).collect();
+        for (rgba, (_, ms)) in rgba_frames.iter().zip(&rasters) {
+            let fh = quantize::histogram(rgba, mon)?;
+            let mut idx = quantize::map_to_palette(
+                rgba,
+                &fh,
+                if opaque_palette.is_empty() {
+                    &palette
+                } else {
+                    &opaque_palette
+                },
+                mon,
+            )?;
+            if let Some(t) = transparent {
+                for (i, p) in idx.iter_mut().zip(rgba.as_chunks::<4>().0.iter()) {
+                    if p[3] == 0 {
+                        *i = t;
                     }
                 }
-                let delay = u16::try_from((u64::from(*ms) + 5) / 10).unwrap_or(u16::MAX);
-                let frame = gif::Frame {
-                    width: w,
-                    height: h,
-                    buffer: std::borrow::Cow::Owned(idx),
-                    transparent,
-                    delay: if plays.is_some() { delay } else { 0 },
-                    dispose: if plays.is_some() {
-                        dispose
-                    } else {
-                        gif::DisposalMethod::Any
-                    },
-                    ..gif::Frame::default()
-                };
-                enc.write_frame(&frame).map_err(enc_err)?;
-                if mon.canceled() {
-                    return Err(EngineError::Canceled);
-                }
+            }
+            let delay = u16::try_from((u64::from(*ms) + 5) / 10).unwrap_or(u16::MAX);
+            gif.frame(&FrameOut {
+                left: 0,
+                top: 0,
+                width: w,
+                height: h,
+                palette: None,
+                transparent,
+                delay: if plays.is_some() { delay } else { 0 },
+                dispose: if plays.is_some() { dispose } else { 0 },
+                interlaced: false,
+                indices: &idx,
+            })?;
+            if mon.canceled() {
+                return Err(EngineError::Canceled);
             }
         }
-        out.write_all(&bytes)?;
-        Ok(bytes.len() as u64)
+        gif.write_to(out)
     }
 }
 

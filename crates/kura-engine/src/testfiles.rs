@@ -1234,82 +1234,68 @@ fn gif_bytes(
     frames: &[GifFrame],
     seed: u64,
 ) -> Result<Vec<u8>, EngineError> {
-    let bad = |e: gif::EncodingError| EngineError::Internal(format!("GIF を作れません: {e}"));
     let palette = |len: u16, stream: u64| -> Vec<u8> {
         let mut r = determinism::rng_stream(seed, stream);
         (0..u32::from(len) * 3)
             .map(|_| r.next_u32() as u8)
             .collect()
     };
-    let mut out = Vec::new();
-    {
-        let mut enc =
-            gif::Encoder::new(&mut out, w, h, &palette(global_len, u64::MAX)).map_err(bad)?;
-        match repeat {
-            Some(0) => enc.set_repeat(gif::Repeat::Infinite).map_err(bad)?,
-            Some(n) => enc.set_repeat(gif::Repeat::Finite(n)).map_err(bad)?,
-            None => {}
+    // 前の gif クレートの書き出しと同じ意味（大域パレットはいつも書き、色がなければ 2 色の黒。GCE はいつも書く）で、
+    // LZW は自作（`codec::gif_write`）
+    let mut gif =
+        crate::codec::gif_write::GifOut::new(w, h, &palette(global_len, u64::MAX), repeat)?;
+    for (k, f) in frames.iter().enumerate() {
+        let len = if f.local_len > 0 {
+            f.local_len
+        } else {
+            global_len
+        };
+        if len == 0 {
+            return Err(EngineError::Internal(
+                "パレットのない GIF のフレーム".into(),
+            ));
         }
-        for (k, f) in frames.iter().enumerate() {
-            let len = if f.local_len > 0 {
-                f.local_len
-            } else {
-                global_len
-            };
-            if len == 0 {
-                return Err(EngineError::Internal(
-                    "パレットのない GIF のフレーム".into(),
-                ));
-            }
-            // 行 y の画素（番号）。透明の番号もときどき混ぜる
-            let row = |y: u16| -> Vec<u8> {
-                (0..f.w)
-                    .map(|x| {
-                        let mut r = determinism::rng_at(
-                            determinism::splitmix64(seed ^ k as u64),
-                            u64::from(y),
-                            u128::from(x),
-                        );
-                        let v = r.next_u32();
-                        match f.transparent {
-                            Some(t) if v.is_multiple_of(4) => t,
-                            _ => (v % u32::from(len)) as u8,
-                        }
-                    })
-                    .collect()
-            };
-            let order: Vec<u16> = if f.interlaced {
-                [(0u16, 8u16), (4, 8), (2, 4), (1, 2)]
-                    .iter()
-                    .flat_map(|(start, step)| (*start..f.h).step_by(usize::from(*step)))
-                    .collect()
-            } else {
-                (0..f.h).collect()
-            };
-            let buffer: Vec<u8> = order.into_iter().flat_map(row).collect();
-            let dispose = match f.dispose {
-                1 => gif::DisposalMethod::Keep,
-                2 => gif::DisposalMethod::Background,
-                3 => gif::DisposalMethod::Previous,
-                _ => gif::DisposalMethod::Any,
-            };
-            let frame = gif::Frame {
-                left: f.left,
-                top: f.top,
-                width: f.w,
-                height: f.h,
-                delay: f.delay,
-                dispose,
-                transparent: f.transparent,
-                interlaced: f.interlaced,
-                palette: (f.local_len > 0).then(|| palette(f.local_len, k as u64)),
-                buffer: std::borrow::Cow::Owned(buffer),
-                ..gif::Frame::default()
-            };
-            enc.write_frame(&frame).map_err(bad)?;
-        }
+        // 行 y の画素（番号）。透明の番号もときどき混ぜる
+        let row = |y: u16| -> Vec<u8> {
+            (0..f.w)
+                .map(|x| {
+                    let mut r = determinism::rng_at(
+                        determinism::splitmix64(seed ^ k as u64),
+                        u64::from(y),
+                        u128::from(x),
+                    );
+                    let v = r.next_u32();
+                    match f.transparent {
+                        Some(t) if v.is_multiple_of(4) => t,
+                        _ => (v % u32::from(len)) as u8,
+                    }
+                })
+                .collect()
+        };
+        let order: Vec<u16> = if f.interlaced {
+            [(0u16, 8u16), (4, 8), (2, 4), (1, 2)]
+                .iter()
+                .flat_map(|(start, step)| (*start..f.h).step_by(usize::from(*step)))
+                .collect()
+        } else {
+            (0..f.h).collect()
+        };
+        let buffer: Vec<u8> = order.into_iter().flat_map(row).collect();
+        let local = (f.local_len > 0).then(|| palette(f.local_len, k as u64));
+        gif.frame(&crate::codec::gif_write::FrameOut {
+            left: f.left,
+            top: f.top,
+            width: f.w,
+            height: f.h,
+            palette: local.as_deref(),
+            transparent: f.transparent,
+            dispose: if f.dispose <= 3 { f.dispose } else { 0 },
+            delay: f.delay,
+            interlaced: f.interlaced,
+            indices: &buffer,
+        })?;
     }
-    Ok(out)
+    Ok(gif.finish())
 }
 
 #[allow(clippy::too_many_arguments)]

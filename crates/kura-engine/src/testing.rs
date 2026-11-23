@@ -584,6 +584,57 @@ pub fn fuzz_png_write(data: &[u8]) -> Result<(), String> {
     }
 }
 
+/// ファズの対象（`fuzz/` の `lzw` と `tests/fuzz_smoke.rs` の `lzw`。M16 段 8）：入力の頭のバイトで最小の符号の長さを決め、
+/// 残りを (1) そのまま LZW の流れとして展開し（出力は 4 KiB まで。panic・進まない読みを見つける）、(2) 番号の列として圧縮して
+/// 展開し直すと元に戻ることを、入力を渡す切れ目を変えて確かめる。見つけたい不具合は `Err`。
+pub fn fuzz_lzw(data: &[u8]) -> Result<(), String> {
+    use crate::codec::lzw;
+    let r = catch_own_panic(|| -> Result<Result<(), String>, EngineError> {
+        let check = || -> Result<(), String> {
+            let head = data.first().copied().unwrap_or(0);
+            let body = data.get(1..).unwrap_or(&[]);
+            // (1) そのまま展開
+            let min = 1 + u32::from(head) % 11;
+            let mut d = lzw::Decoder::new(min);
+            let mut out = vec![0u8; 4096];
+            let mut at = 0;
+            let step = 1 + usize::from(head >> 4);
+            for piece in body.chunks(step) {
+                if d.feed(piece, &mut out, &mut at).is_err() {
+                    break;
+                }
+            }
+            // (2) 往復
+            let min = 2 + u32::from(head) % 7;
+            let mask = ((1u16 << min) - 1) as u8;
+            let idx: Vec<u8> = body.iter().map(|&b| b & mask).collect();
+            let mut z = Vec::new();
+            if !lzw::encode(&idx, min, &mut z) {
+                return Err("lzw: 範囲の中の番号を書けない".into());
+            }
+            for step in [1usize, 7, 4096] {
+                let mut d = lzw::Decoder::new(min);
+                let mut out = vec![0u8; idx.len()];
+                let mut at = 0;
+                for piece in z.chunks(step) {
+                    d.feed(piece, &mut out, &mut at)
+                        .map_err(|_| "lzw: 書いたものを読めない".to_string())?;
+                }
+                if at < idx.len() || out != idx {
+                    return Err(format!("lzw: 元に戻らない（{step} バイトずつ）"));
+                }
+            }
+            Ok(())
+        };
+        Ok(check())
+    });
+    match r {
+        Err(at) => Err(format!("lzw: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(r)) => r,
+    }
+}
+
 /// ファズの対象（`fuzz/` の `model_glb` と `tests/fuzz_smoke.rs` の `model_glb`）：glb の情報を読み、焼き込み、2 つの向きで
 /// 小さく描く（上限は `ModelLimits::fuzz`）。見つけたい不具合（自前のコードの panic・`Internal`・情報と焼き込みの食い違い・
 /// 大きさの食い違い）は `Err`、壊れた glb としてのエラー・上限は `Ok`。

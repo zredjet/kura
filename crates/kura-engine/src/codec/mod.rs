@@ -31,9 +31,14 @@ pub(crate) mod flac_read;
 pub mod fonts;
 pub mod formats;
 pub mod gif;
+#[cfg(test)]
+pub(crate) mod gif_old;
+pub(crate) mod gif_read;
+pub(crate) mod gif_write;
 pub(crate) mod held;
 pub mod jpeg;
 pub mod lossy;
+pub(crate) mod lzw;
 pub(crate) mod md5;
 pub mod mp3;
 pub(crate) mod mp4_read;
@@ -630,7 +635,8 @@ pub struct PinnedOptions {
 /// 記録がこれらの書き手の版は、GC が作り直した値だけで照らして手放し（[`CodecSet::is_retired_encoder`]）、版に戻すは今の組の
 /// 同じ形式の書き手で書き直す（同じ値・新しいバイト列）。足すだけで、消さない。
 /// - `png-rs-enc/1`：png クレート 0.18.1 の書き出し（M16 段 7 で自作の `png-kura-enc/1` に替えた）。
-pub const RETIRED_ENCODERS: &[&str] = &["png-rs-enc/1"];
+/// - `gif-rs-enc/1`：gif クレート 0.14.2 の書き出し（M16 段 8 で自作の `gif-kura-enc/1` に替えた）。
+pub const RETIRED_ENCODERS: &[&str] = &["png-rs-enc/1", "gif-rs-enc/1"];
 
 /// 形式ごとに、段の順に試すコーデックの組。
 #[derive(Clone, Default)]
@@ -2046,6 +2052,11 @@ mod tests {
             pinned
                 .encoder("png", &shape)
                 .is_some_and(|e| e.id() == "png-kura-enc/1")
+        );
+        assert!(
+            pinned
+                .encoder("gif", &shape)
+                .is_some_and(|e| e.id() == "gif-kura-enc/1")
         );
         // この組にないだけの書き手は退いたものではない
         assert!(!pinned.is_retired_encoder("gone-png-enc/9"));

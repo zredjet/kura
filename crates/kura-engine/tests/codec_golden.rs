@@ -13,7 +13,7 @@
 //! - **追記だけ**（scripts/check-goldens-append-only.sh が見る）。
 //!   - 書くバイト列が変わったら、エンコーダの約束の版を上げる（`-enc/1` → `-enc/2`）。旧版のエンコーダは残さなくてよい
 //!     （そのファイルは照らさなくなる。M16 段 7 の `png-rs-enc@1.jsonl`）。外した旧版の識別子は `codec::RETIRED_ENCODERS` に
-//!     足す。依存（gif の weezl・jpeg-encoder など）を上げたときも、ここで気づく。
+//!     足す。依存（jpeg-encoder・image-webp など）を上げたときも、ここで気づく。
 //!   - 読む値は変えない。どうしても変えるなら、デコーダの約束の版を上げ、旧版を `CodecSet::add_legacy_decoder` で残す。
 //!     デコーダのファイルは、その ID のデコーダ（今の版か旧版）がないと失敗にする（作り直しが記録の識別子で読むため。§9.1）。
 //! - 足りない行は `KURA_BLESS=1 cargo test -p kura-engine --test codec_golden` で足せる。
