@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef } from 'react';
+import { useCallback, useEffect, useId, useState } from 'react';
 
 import { ChevronLeftIcon } from '../../components/icons/ChevronLeftIcon';
 import { ChevronRightIcon } from '../../components/icons/ChevronRightIcon';
@@ -8,7 +8,7 @@ import { MediaImage } from '../../components/MediaImage/MediaImage';
 import { stillOriginal } from '../../components/MediaImage/still';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry } from '../../ipc/items';
-import { isPlayable } from '../../ipc/kinds';
+import { hasDuration, isPlayable } from '../../ipc/kinds';
 import { fileUrl, playUrl } from '../../ipc/media';
 import { formatCount } from '../../lib/format';
 import { getCached, requestItems, useItemCacheVersion } from '../../stores/itemCache';
@@ -20,14 +20,17 @@ import { useEditorStore } from '../editor/editorStore';
 import { useAssetData } from '../asset/useAssetData';
 import { loopOf } from '../asset/useLoopRange';
 import { WaveformView } from '../asset/WaveformView';
+import { usePlayerStore } from '../player/playerStore';
 import styles from './QuickLook.module.css';
+import { QuickLookControls } from './QuickLookControls';
+import { applyVolume, beginMediaScrub, endMediaScrub, seekMedia } from './quickLookMedia';
 
 const t = ja.quickLook;
 
 /**
  * クイックルック（design.md §3.1：黒地の全画面、上に名前と「3 / 128」、左右に移動、esc で閉じる）。画像エディタを開いて
  * いる間は描かない（クイックルックの層はエディタより上なので、隠さないとエディタが下に隠れる）。開いている印は残すので、
- * エディタを閉じるとクイックルックに戻る。
+ * エディタを閉じるとクイックルックに戻る。動画・音声は WebKit の標準の操作を使わず、下に自前のカプセルを置く（ADR-230）。
  */
 export function QuickLook() {
   const shown = useViewStore((s) => s.quickLook);
@@ -47,8 +50,15 @@ export function QuickLook() {
   const assetData = useAssetData(open && item && item.kind !== 'video' ? item.id : null);
   const asset = assetData.asset?.itemId === item?.id ? assetData.asset : null;
   const anim = asset && assetData.anim.status === 'ready' ? assetData.anim.anim : null;
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const audioSeconds = useCallback(() => audioRef.current?.currentTime ?? null, []);
+  // 動画・音声の要素（自前のカプセル・波形のシークが動かす。置いたときにプレーヤーと同じ音量にする）
+  const [media, setMedia] = useState<HTMLMediaElement | null>(null);
+  const attachMedia = useCallback((el: HTMLMediaElement | null) => {
+    if (el) {
+      applyVolume(el, usePlayerStore.getState().prefs.volume);
+    }
+    setMedia(el);
+  }, []);
+  const audioSeconds = useCallback(() => media?.currentTime ?? null, [media]);
   const specimen = useFontFace(open && item?.kind === 'font' ? item.hash : null);
 
   useEffect(() => {
@@ -128,9 +138,9 @@ export function QuickLook() {
           // eslint-disable-next-line jsx-a11y/media-has-caption
           <video
             key={item.id}
+            ref={attachMedia}
             className={styles.media}
             src={playUrl(item.hash)}
-            controls
             autoPlay
           />
         )}
@@ -139,13 +149,16 @@ export function QuickLook() {
             <MediaImage source={item} size="l" fit="cover" className={styles.art} />
             {/* 手元のメディアには字幕ファイルがない */}
             {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-            <audio ref={audioRef} src={playUrl(item.hash)} controls autoPlay />
+            <audio ref={attachMedia} src={playUrl(item.hash)} autoPlay />
             <WaveformView
               hash={item.hash}
               version={asset?.facts?.analyzedAt ?? null}
               loop={loopOf(asset)}
               positionSeconds={audioSeconds}
               className={styles.wave}
+              onSeek={media ? (ms) => seekMedia(media, ms) : undefined}
+              onScrubStart={media ? () => beginMediaScrub(media) : undefined}
+              onScrubEnd={media ? () => endMediaScrub(media) : undefined}
             />
           </div>
         )}
@@ -170,6 +183,12 @@ export function QuickLook() {
           />
         )}
       </div>
+
+      {item && hasDuration(item.kind) && media && (
+        <div className={styles.footer}>
+          <QuickLookControls key={item.id} media={media} itemId={item.id} />
+        </div>
+      )}
 
       <button
         type="button"

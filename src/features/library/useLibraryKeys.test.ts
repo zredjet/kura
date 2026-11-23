@@ -11,6 +11,9 @@ import { handleLibraryKey } from './useLibraryKeys';
 import { toggleAuditionKey } from '../asset/auditionStore';
 import { openEditor } from '../editor/editorKinds';
 import { exportEntries } from './exportActions';
+import { markReplayed } from '../../lib/keys';
+import type { SeekTarget } from '../../lib/seekKeys';
+import { registerQuickLookMedia } from './quickLookMedia';
 
 vi.mock('../asset/auditionStore', () => ({ toggleAuditionKey: vi.fn(() => true) }));
 vi.mock('./exportActions', () => ({ exportEntries: vi.fn(async () => undefined) }));
@@ -207,5 +210,99 @@ describe('handleLibraryKey（⌘⇧E：書き出す…）', () => {
     useViewStore.setState({ selection: selectOne(10), view: { kind: 'trash' } });
     expect(press({ key: 'E', code: 'KeyE', metaKey: true, shiftKey: true })).toBe(false);
     expect(exporting).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ADR-230：クイックルックの動画・音声のシークのキー
+describe('handleLibraryKey（クイックルックのシーク）', () => {
+  const toggle = vi.mocked(toggleAuditionKey);
+  let target: SeekTarget & {
+    seek: ReturnType<typeof vi.fn<(ms: number) => void>>;
+    togglePlay: ReturnType<typeof vi.fn<() => void>>;
+  };
+  let unregister: (() => void) | null = null;
+
+  beforeEach(() => {
+    useLibraryStore.setState({
+      status: 'open',
+      list: { ids: Uint32Array.from([10, 20]), aspects: new Uint16Array(2), groups: [] },
+    });
+    useImportStore.setState({ phase: 'idle' });
+    useViewStore.setState({
+      selection: selectOne(20),
+      playlist: null,
+      view: { kind: 'all' },
+      quickLook: true,
+    });
+    toggle.mockReset();
+    toggle.mockReturnValue(true);
+    target = {
+      positionMs: () => 10_000,
+      endMs: () => 60_000,
+      seek: vi.fn<(ms: number) => void>(),
+      pause: vi.fn(),
+      togglePlay: vi.fn<() => void>(),
+      frameMs: () => null,
+    };
+    unregister = registerQuickLookMedia(target);
+  });
+
+  afterEach(() => {
+    unregister?.();
+    useViewStore.setState({ quickLook: false });
+  });
+
+  it('J・L・⇧, ⇧. は動かし、K は再生／一時停止、, . は 0.1 秒（コマが分からないとき）', () => {
+    expect(press({ key: 'l', code: 'KeyL' })).toBe(true);
+    expect(target.seek).toHaveBeenLastCalledWith(15_000);
+    expect(press({ key: 'j', code: 'KeyJ' })).toBe(true);
+    expect(target.seek).toHaveBeenLastCalledWith(5_000);
+    expect(press({ key: '>', code: 'Period', shiftKey: true })).toBe(true);
+    expect(target.seek).toHaveBeenLastCalledWith(11_000);
+    expect(press({ key: ',', code: 'Comma' })).toBe(true);
+    expect(target.seek).toHaveBeenLastCalledWith(9_900);
+    expect(press({ key: 'k', code: 'KeyK' })).toBe(true);
+    expect(target.togglePlay).toHaveBeenCalledOnce();
+    // L はシークになり、試聴を始めない
+    expect(toggle).not.toHaveBeenCalled();
+  });
+
+  it('メニューが送った L は今どおり試聴の口へ（シークしない）', () => {
+    const e = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', cancelable: true });
+    markReplayed(e);
+    expect(handleLibraryKey(e)).toBe(true);
+    expect(toggle).toHaveBeenCalled();
+    expect(target.seek).not.toHaveBeenCalled();
+  });
+
+  it('動画・音声を出していなければ（当て先がない）今どおり', () => {
+    unregister?.();
+    expect(press({ key: ',', code: 'Comma' })).toBe(false);
+    expect(press({ key: 'l', code: 'KeyL' })).toBe(true);
+    expect(toggle).toHaveBeenCalled();
+  });
+
+  it('クイックルックを閉じていれば L は試聴', () => {
+    useViewStore.setState({ quickLook: false });
+    expect(press({ key: 'l', code: 'KeyL' })).toBe(true);
+    expect(toggle).toHaveBeenCalled();
+    expect(target.seek).not.toHaveBeenCalled();
+  });
+
+  it('スライダーの上では矢印をスライダーに任せ、esc・シークのキーは受ける', () => {
+    const range = document.createElement('input');
+    range.type = 'range';
+    document.body.append(range);
+    const on = (init: KeyboardEventInit) =>
+      handleLibraryKey(
+        Object.defineProperty(new KeyboardEvent('keydown', init), 'target', { value: range }),
+      );
+    expect(on({ key: 'ArrowRight' })).toBe(false);
+    expect(useViewStore.getState().selection.focus).toBe(20);
+    expect(on({ key: 'l', code: 'KeyL' })).toBe(true);
+    expect(target.seek).toHaveBeenCalled();
+    expect(on({ key: 'Escape' })).toBe(true);
+    expect(useViewStore.getState().quickLook).toBe(false);
+    range.remove();
   });
 });
