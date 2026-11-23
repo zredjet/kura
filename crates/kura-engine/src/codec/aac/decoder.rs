@@ -36,10 +36,6 @@ pub(crate) enum Noise {
     /// バイト列（`fill_bytes`）の 1 バイト b ごとに 2b − 255（−255〜255 の奇数で、平均がちょうど 0）。帯ごとにエネルギーで
     /// 正規化するので大きさは効かず、ChaCha8 のブロックを作る手間が小さく、2 乗の和は整数でちょうど求まる。
     ChaCha(ChaCha8Rng),
-    /// 試験だけ：symphonia と同じ LCG（`(state >> 16) as i16`）と、チャンネルごとに別の並び（symphonia の形。PNS のほかの
-    /// 道を symphonia と照らすため）。
-    #[cfg(test)]
-    Lcg(u32),
     /// 試験だけ：ffmpeg（9.0 の浮動小数の読み手）と同じ LCG（状態をそのまま `i32` にした値）。チャンネルをまたいで 1 つの
     /// 並びを順に使い、M/S の印のある帯も別の並び（ffmpeg の形。PNS の帯まで ffmpeg と波形で照らすため）。
     #[cfg(test)]
@@ -64,16 +60,6 @@ impl Noise {
                 f64::from(energy)
             }
             #[cfg(test)]
-            Self::Lcg(state) => {
-                let mut energy = 0f64;
-                for v in dst.iter_mut() {
-                    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    *v = f32::from(((*state as i32) >> 16) as i16);
-                    energy += f64::from(*v) * f64::from(*v);
-                }
-                energy
-            }
-            #[cfg(test)]
             Self::Ffmpeg(state) => {
                 let mut energy = 0f64;
                 for v in dst.iter_mut() {
@@ -90,7 +76,7 @@ impl Noise {
         match self {
             Self::ChaCha(_) => true,
             #[cfg(test)]
-            Self::Lcg(_) | Self::Ffmpeg(_) => false,
+            Self::Ffmpeg(_) => false,
         }
     }
 }

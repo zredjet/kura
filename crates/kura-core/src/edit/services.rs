@@ -132,7 +132,7 @@ pub struct LentInput {
     /// 元を読んだ記録（アンカーから読んだときはアンカーの元の読み取りの記録）。
     pub decoded: DecodeStamp,
     pub anchor: LentAnchor,
-    /// 作業用の PCM（Platform・External・symphonia などで読んだとき。保存がアンカーに昇格するときに写す）。
+    /// 作業用の PCM（Platform・External などで読んだとき。保存がアンカーに昇格するときに写す）。
     pub work: Option<WorkHandle>,
     /// 値を記録と照らし済みか。
     pub verified: bool,

@@ -6,7 +6,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::codec::ReadSeek;
-use crate::codec::symph::Media;
+use crate::codec::common::Media;
 use crate::error::EngineError;
 use crate::monitor::Monitor;
 

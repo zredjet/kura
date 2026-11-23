@@ -1,15 +1,17 @@
-//! 退役する読み手の移し替え（M16 段 5。`edit::retire`）の受け入れテスト。旧版の読み手（symphonia の Ogg Vorbis）を今の Ogg の
-//! 読み手にした組で保存して旧識別子の版を作り、組を今のもの（旧版は旧版の読み手）・旧版を除いたものに差し替えて確かめる。
-//! どのテストも終わりに `assert_consistent` で締める。
+//! 退役する読み手の移し替え（M16 段 5。`edit::retire`）の受け入れテスト。旧版の読み手を今の Ogg の読み手にした組で保存して
+//! 旧識別子の版を作り、組を今のもの（旧版は旧版の読み手）・旧版を除いたものに差し替えて確かめる。旧版の読み手は、段 9 までは
+//! symphonia の Ogg Vorbis（`ogg-vorbis-symphonia-dec/3`）、段 10 で外したあとは、今の Ogg Vorbis の読み手を別の識別子と
+//! 退役の印で包んだ試験の読み手（`kura_engine::testing::RenamedDecoder`）。どのテストも終わりに `assert_consistent` で締める。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
-use kura_engine::codec::CodecSet;
 use kura_engine::codec::recorded::RecordedInput;
+use kura_engine::codec::{CodecSet, Decoder};
 use kura_engine::digest::canonical;
 use kura_engine::doc::DecodeOptions;
 use kura_engine::testgen::InputGen;
+use kura_engine::testing::RenamedDecoder;
 use kura_engine::{Digest, NoMonitor};
 use rusqlite::params;
 use serde_json::{Value as Json, json};
@@ -26,13 +28,33 @@ use crate::jobs::{JobKind, JobRecord, JobState};
 use crate::library::Library;
 use crate::settings;
 
-const LEGACY: &str = "ogg-vorbis-symphonia-dec/3";
+const LEGACY: &str = "ogg-vorbis-retiring-test-dec/1";
 const CURRENT: &str = "ogg-vorbis-kura-dec/1";
+/// 退役する読み手（試験の 3 つ。[`now_set`]）：Ogg Vorbis・m4a の AAC・ADTS の AAC を、それぞれ今の読み手で包んだもの。
 const RETIRING: [&str; 3] = [
-    "ogg-vorbis-symphonia-dec/3",
-    "m4a-aac-symphonia-dec/2",
-    "aac-adts-symphonia-dec/2",
+    LEGACY,
+    "m4a-aac-retiring-test-dec/1",
+    "aac-adts-retiring-test-dec/1",
 ];
+
+/// 今の固定の組から、識別子 `of` の読み手を識別子 `id` で包んだ試験の旧版の読み手（`retiring` は退役の印）。
+fn renamed(of: &str, id: &'static str, retiring: bool) -> Arc<dyn Decoder> {
+    let inner = CodecSet::pinned().decoder_by_id(of).unwrap().clone();
+    Arc::new(RenamedDecoder::new(inner, id, retiring))
+}
+
+/// 段 10 の前のアプリと同じ組：固定の組に、退役する読み手（[`RETIRING`]）を旧版として足したもの。
+fn now_set() -> CodecSet {
+    let mut set = CodecSet::pinned();
+    for (of, id) in [
+        (CURRENT, RETIRING[0]),
+        ("m4a-aac-kura-dec/1", RETIRING[1]),
+        ("aac-adts-kura-dec/1", RETIRING[2]),
+    ] {
+        set.add_legacy_decoder(renamed(of, id, true)).unwrap();
+    }
+    set
+}
 
 /// 8 kHz ステレオの雑音の Ogg Vorbis（自作の書き手の既定）。
 fn ogg(seed: u64, frames: u64) -> Vec<u8> {
@@ -50,9 +72,9 @@ fn ogg(seed: u64, frames: u64) -> Vec<u8> {
         .0
 }
 
-/// 固定の組から識別子 `ids` のデコーダと WAV の書き手を取った組（旧版の読み手も今の版として足す）。
+/// 固定の組（と試験の旧版の読み手）から識別子 `ids` のデコーダと WAV の書き手を取った組（旧版の読み手も今の版として足す）。
 fn set_of(ids: &[&str]) -> CodecSet {
-    let pinned = CodecSet::pinned();
+    let pinned = now_set();
     let mut set = CodecSet::default();
     for id in ids {
         set.add_decoder(pinned.decoder_by_id(id).unwrap().clone())
@@ -63,7 +85,7 @@ fn set_of(ids: &[&str]) -> CodecSet {
     set
 }
 
-/// 段 4 より前のアプリと同じ読み方：Ogg は旧版の読み手（symphonia）が今の読み手。
+/// 段 4 より前のアプリと同じ読み方：Ogg は旧版の読み手が今の読み手。
 fn old_set() -> CodecSet {
     set_of(&[LEGACY, "wav-kura-dec/1", "anchor-kura-dec/1"])
 }
@@ -71,6 +93,12 @@ fn old_set() -> CodecSet {
 /// 段 10 のあと：旧版の読み手を外した組。
 fn removed_set() -> CodecSet {
     set_of(&[CURRENT, "wav-kura-dec/1", "anchor-kura-dec/1"])
+}
+
+/// Ogg の読み手を 1 つも持たない組（アンカーの中身の WAV だけを読める）。試験の旧版の読み手は今の読み手を包んだもので値が
+/// 同じなので、外したあとの作り直しがアンカーから読んだこと（元を今の読み手で読み直していないこと）を、この組で確かめる。
+fn anchor_only_set() -> CodecSet {
+    set_of(&["wav-kura-dec/1", "anchor-kura-dec/1"])
 }
 
 /// 組を `set` に差し替える（次に使うときに作り直す）。
@@ -172,7 +200,7 @@ fn legacy_versions_get_one_anchor_and_rebuild_after_the_reader_is_gone() {
         .collect();
 
     // 今の組（旧版は旧版の読み手）で移す
-    swap(&env, &shared, CodecSet::pinned());
+    swap(&env, &shared, now_set());
     let record = run_retire(&env);
     assert_done(&record);
     let result = result_of(&record);
@@ -232,9 +260,11 @@ fn legacy_versions_get_one_anchor_and_rebuild_after_the_reader_is_gone() {
         (&json!(0), &json!(0))
     );
 
-    // 旧版の読み手を外した組：手放した版 1 に戻すとアンカーから作り直して同じ中身
-    swap(&env, &shared, removed_set());
+    // 旧版の読み手を外した組：手放した版 1 に戻すとアンカーから作り直して同じ中身（Ogg の読み手のない組で、アンカーから
+    // 読んだことを確かめる）
+    swap(&env, &shared, anchor_only_set());
     assert!(env.engine.codecs().decoder_by_id(LEGACY).is_none());
+    assert!(env.engine.codecs().decoders_for("ogg").is_empty());
     let reverted = env.revert(item, 1);
     assert_done(&reverted);
     assert_eq!(head(&env.lib, item).hash, v1.output_hash);
@@ -246,6 +276,7 @@ fn legacy_versions_get_one_anchor_and_rebuild_after_the_reader_is_gone() {
     // GC の照合も移したアンカーから作り直す（版 2 は版 3 に置き換えられて消し待ち）
     gc_version(&env, item, 2);
     // 新しい保存は今の読み手で読む（移したアンカーを使わない）
+    swap(&env, &shared, removed_set());
     assert_done(&env.overwrite(item, audio_doc(-7.0, Some("wav"))));
     let (rec, anchor_id) = input_of(&env.lib, item, 4);
     assert_eq!((rec.decoded.codec.as_str(), anchor_id), (CURRENT, None));
@@ -297,7 +328,7 @@ fn left_and_failed_targets_are_counted_and_the_mark_is_set_anyway() {
     let broken_bytes = std::fs::read(&broken_path).unwrap();
     std::fs::write(&broken_path, b"OggS but not really").unwrap();
 
-    swap(&env, &shared, CodecSet::pinned());
+    swap(&env, &shared, now_set());
     let record = run_retire(&env);
     assert_done(&record);
     let result = result_of(&record);
@@ -369,7 +400,7 @@ fn left_and_failed_targets_are_counted_and_the_mark_is_set_anyway() {
     assert!(left.retired_bytes > 3 * 4 * 2 * 12_000, "{left:?}");
     assert_eq!(left.examples.len(), 3);
     // ライブラリのパスから読み取り専用で開いても同じ（最後の移し替えのジョブの結果も出す）
-    let from_path = retire::remaining_in(env.lib.layout().root()).unwrap();
+    let from_path = retire::remaining_in(env.lib.layout().root(), &RETIRING).unwrap();
     assert_eq!(
         (
             from_path.total,
@@ -384,7 +415,7 @@ fn left_and_failed_targets_are_counted_and_the_mark_is_set_anyway() {
         job.unwrap()["left"],
         json!({ "badRecord": 1, "mismatch": 2 })
     );
-    assert!(retire::remaining_in(&env.dir.path().join("none")).is_err());
+    assert!(retire::remaining_in(&env.dir.path().join("none"), &RETIRING).is_err());
     let was = garbled_was.lock().unwrap().clone();
     rewrite_input(&env.lib, garbled_vid, move |_| was);
     assert_consistent(&env.lib);
@@ -408,7 +439,7 @@ fn items_sharing_an_original_link_to_one_anchor() {
         rec.decoded.value_digest = Digest([7; 32]);
         String::from_utf8(canonical(&rec).unwrap()).unwrap()
     });
-    swap(&env, &shared, CodecSet::pinned());
+    swap(&env, &shared, now_set());
     let result = result_of(&run_retire(&env));
     assert_eq!(
         (&result["anchored"], &result["linked"], &result["failed"]),
@@ -437,7 +468,7 @@ fn a_crash_after_placing_is_settled_on_open() {
         |_| None,
     );
     let (item, _) = legacy_item(&env, 51, 1);
-    swap(&env, &shared, CodecSet::pinned());
+    swap(&env, &shared, now_set());
     let result = result_of(&run_retire(&env));
     assert_eq!(
         (&result["anchored"], &result["failed"]),
@@ -474,7 +505,7 @@ fn a_crash_after_placing_is_settled_on_open() {
 fn no_space_fails_the_job_and_leaves_the_mark_unset() {
     let (env, shared) = env_with(None);
     let (item, _) = legacy_item(&env, 61, 1);
-    swap(&env, &shared, CodecSet::pinned());
+    swap(&env, &shared, now_set());
     env.engine
         .work_pcm()
         .set_free_space(Some(Arc::new(|_: &std::path::Path| Some(0))));
@@ -545,7 +576,7 @@ fn pauses_resume_from_the_cursor_and_cancels_keep_the_mark_unset() {
         let (a, _) = legacy_item(&env, 21, 1);
         let (b, _) = legacy_item(&env, 22, 1);
         *second.lock().unwrap() = version_id(&env.lib, b, 1);
-        swap(&env, &shared, CodecSet::pinned());
+        swap(&env, &shared, now_set());
         let id = env.jobs.enqueue(JobKind::Retire, "{}".into()).unwrap();
         reached.recv_timeout(WAIT).unwrap();
         if cancel {
@@ -606,7 +637,7 @@ fn versions_gone_while_reading_leave_no_anchor() {
     *lib_slot.lock().unwrap() = Some(env.lib.clone());
     let (a, _) = legacy_item(&env, 31, 1);
     *target.lock().unwrap() = (version_id(&env.lib, a, 1), a);
-    swap(&env, &shared, CodecSet::pinned());
+    swap(&env, &shared, now_set());
     let record = run_retire(&env);
     assert_done(&record);
     let result = result_of(&record);

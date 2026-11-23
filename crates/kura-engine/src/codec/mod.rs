@@ -25,11 +25,14 @@ pub mod anchor;
 pub mod aseprite;
 pub(crate) mod byte_in;
 pub mod caps;
+pub(crate) mod common;
 pub mod exif;
 pub mod flac;
 pub(crate) mod flac_read;
 pub mod fonts;
 pub mod formats;
+#[cfg(test)]
+pub(crate) mod frozen;
 pub mod gif;
 #[cfg(test)]
 pub(crate) mod gif_old;
@@ -37,7 +40,6 @@ pub(crate) mod gif_read;
 pub(crate) mod gif_write;
 pub(crate) mod held;
 pub mod jpeg;
-pub mod lossy;
 pub(crate) mod lzw;
 pub(crate) mod md5;
 pub mod mp3;
@@ -56,7 +58,6 @@ pub mod recorded;
 pub mod stream;
 pub mod svg;
 pub(crate) mod svg_text;
-pub(crate) mod symph;
 pub mod vorbis;
 pub mod wav;
 pub mod webp;
@@ -638,6 +639,25 @@ pub struct PinnedOptions {
 /// - `gif-rs-enc/1`：gif クレート 0.14.2 の書き出し（M16 段 8 で自作の `gif-kura-enc/1` に替えた）。
 pub const RETIRED_ENCODERS: &[&str] = &["png-rs-enc/1", "gif-rs-enc/1"];
 
+/// 外した固定のデコーダの識別子（読む値の約束ごと、このビルドから外したもの。§9.1・§9.4・ADR-227）。記録がこれらの読み手の版の
+/// 入力は、アンカーがあればアンカーから作り直し、なければ `Mismatch::DecoderGone`（`recorded::read_recorded`）。同じ識別子の
+/// デコーダはもう足せない（[`CodecSet::add_decoder`]・[`CodecSet::add_legacy_decoder`] が断る。記録の識別子が別の読み方を
+/// 指さないように）。足すだけで、消さない。
+/// - `ogg-vorbis-symphonia-dec/3`・`m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`：symphonia 0.6.1 の Ogg Vorbis・AAC-LC
+///   （超越関数を libm に差し替えた写し）。M16 段 2・4 で自作（`ogg-vorbis-kura-dec/1`・`m4a-aac-kura-dec/1`・
+///   `aac-adts-kura-dec/1`）に替えて旧版の読み手に残し、段 5 の移し替えのジョブでアンカーに移してから、段 10 で外した。
+/// - `ogg-vorbis-symphonia-dec/1`・`/2`・`m4a-aac-symphonia-dec/1`・`aac-adts-symphonia-dec/1`：M10 の段 6〜9 で版を上げた
+///   ときに残さなかった前の版（版の記録（M12）より前なので、版の入力の記録にはない）。
+pub const RETIRED_DECODERS: &[&str] = &[
+    "ogg-vorbis-symphonia-dec/3",
+    "m4a-aac-symphonia-dec/2",
+    "aac-adts-symphonia-dec/2",
+    "ogg-vorbis-symphonia-dec/1",
+    "ogg-vorbis-symphonia-dec/2",
+    "m4a-aac-symphonia-dec/1",
+    "aac-adts-symphonia-dec/1",
+];
+
 /// 形式ごとに、段の順に試すコーデックの組。
 #[derive(Clone, Default)]
 pub struct CodecSet {
@@ -683,15 +703,9 @@ impl CodecSet {
                 Arc::new(aac::read::AacCodec::adts()),
                 Arc::new(anchor::AnchorDecoder),
             ],
-            // 旧版：PNG の /1 と、M16 段 2・4 で自作に替えた Ogg Vorbis（/3）・AAC（/2）の symphonia（段 10 でアンカーに移してから
-            // 外す。ADR-216・217・220）
-            legacy_decoders: {
-                let mut v = png::legacy_decoders();
-                v.push(Arc::new(lossy::SymphoniaDecoder::ogg_vorbis()) as Arc<dyn Decoder>);
-                v.push(Arc::new(lossy::SymphoniaDecoder::m4a_aac()) as Arc<dyn Decoder>);
-                v.push(Arc::new(lossy::SymphoniaDecoder::adts_aac()) as Arc<dyn Decoder>);
-                v
-            },
+            // 旧版：PNG の /1（M16 段 2・4 で自作に替えた symphonia の Ogg Vorbis・AAC は、段 5 でアンカーに移してから段 10 で
+            // 外した。[`RETIRED_DECODERS`]）
+            legacy_decoders: png::legacy_decoders(),
             encoders: vec![
                 png,
                 jpeg,
@@ -705,7 +719,8 @@ impl CodecSet {
         }
     }
 
-    /// 旧版のデコーダを足す（読む値を変えた版を上げたとき、前の版を残す。ふつうの読み取りでは選ばない）。同じ識別子は断る。
+    /// 旧版のデコーダを足す（読む値を変えた版を上げたとき、前の版を残す。ふつうの読み取りでは選ばない）。同じ識別子と外した
+    /// 識別子（[`RETIRED_DECODERS`]）は断る。
     pub fn add_legacy_decoder(&mut self, d: Arc<dyn Decoder>) -> Result<(), EngineError> {
         self.check_new_decoder(d.id())?;
         self.legacy_decoders.push(d);
@@ -713,6 +728,11 @@ impl CodecSet {
     }
 
     fn check_new_decoder(&self, id: &str) -> Result<(), EngineError> {
+        if RETIRED_DECODERS.contains(&id) {
+            return Err(EngineError::Internal(format!(
+                "外した識別子のデコーダは足せません（{id}）。記録の識別子が別の読み方を指すことになります"
+            )));
+        }
         if self.decoder_by_id(id).is_some() {
             return Err(EngineError::Internal(format!(
                 "同じ識別子のデコーダがあります（{id}）。記録の識別子で読み直すときに選べなくなります"
@@ -740,7 +760,8 @@ impl CodecSet {
         RETIRED_ENCODERS.contains(&id) && self.encoder_by_id(id).is_none()
     }
 
-    /// デコーダを足す（Platform・External。段の順に並べ直す。同じ段なら足した順）。同じ識別子は断る。
+    /// デコーダを足す（Platform・External。段の順に並べ直す。同じ段なら足した順）。同じ識別子と外した識別子
+    /// （[`RETIRED_DECODERS`]）は断る。
     /// 固定の段でないのに値の再現を約束する（`reproducible()` が真）デコーダも断る（記録を偽れないように。アンカーを作らない
     /// ことになるため）。
     pub fn add_decoder(&mut self, d: Arc<dyn Decoder>) -> Result<(), EngineError> {
@@ -1925,31 +1946,75 @@ mod tests {
         assert_eq!(stamp.tier, Tier::Pinned);
     }
 
-    /// 退役する旧版（M16 段 5）は symphonia の Vorbis・AAC の 3 つだけで、どれも旧版の読み手（記録の識別子で選べ、ふつうの
-    /// 読み取りでは選ばれない）。PNG の /1 は外さない（段 6 で同じ値を読む自作に替える）ので退役させない。
+    /// M16 段 10：外したデコーダ（[`RETIRED_DECODERS`]）は固定の組になく、同じ識別子は今の版にも旧版にも足せない。固定の組に
+    /// 退役する旧版はもうない（移し替えのジョブは積まれない）が、旧版に `retiring` の印を付ければ、移し替えの対象になる
+    /// （後の版で外す読み手のための仕組みは残す）。PNG の /1 は退役させない。
     #[test]
-    fn retiring_decoders_are_the_symphonia_legacy_ones() {
-        let set = CodecSet::pinned();
-        let ids = set.retiring_ids();
-        assert_eq!(
-            ids,
-            [
-                "ogg-vorbis-symphonia-dec/3",
-                "m4a-aac-symphonia-dec/2",
-                "aac-adts-symphonia-dec/2"
-            ]
-        );
-        for id in ids {
-            let d = set.decoder_by_id(id).unwrap();
-            assert!(d.retiring() && d.reproducible() && d.tier() == Tier::Pinned);
-            for f in ["ogg", "m4a", "aac"] {
-                assert!(set.decoders_for(f).iter().all(|c| c.id() != id), "{id}");
+    fn retired_decoders_are_gone_and_cannot_come_back() {
+        struct Named(&'static str, bool);
+        impl Decoder for Named {
+            fn id(&self) -> &'static str {
+                self.0
             }
+            fn tier(&self) -> Tier {
+                Tier::Pinned
+            }
+            fn retiring(&self) -> bool {
+                self.1
+            }
+            fn can_decode(&self, format: &str) -> bool {
+                format == "ogg"
+            }
+            fn shape(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+            ) -> Result<Shape, EngineError> {
+                Err(EngineError::Unsupported("x".into()))
+            }
+            fn decode(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+                _: &dyn Monitor,
+            ) -> Result<Value, EngineError> {
+                Err(EngineError::Unsupported("x".into()))
+            }
+        }
+        let mut set = CodecSet::pinned();
+        assert!(set.retiring_ids().is_empty());
+        for id in RETIRED_DECODERS {
+            assert!(set.decoder_by_id(id).is_none(), "{id}");
+            assert!(set.add_decoder(Arc::new(Named(id, false))).is_err(), "{id}");
+            assert!(
+                set.add_legacy_decoder(Arc::new(Named(id, true))).is_err(),
+                "{id}"
+            );
         }
         assert!(set.decoders.iter().all(|d| !d.retiring()));
         assert!(
             !set.decoder_by_id("png-rs-dec/1").unwrap().retiring(),
             "PNG の旧版は退役させない"
+        );
+        // 今の読み手は自作
+        for (f, id) in [
+            ("ogg", "ogg-vorbis-kura-dec/1"),
+            ("m4a", "m4a-aac-kura-dec/1"),
+            ("aac", "aac-adts-kura-dec/1"),
+        ] {
+            assert!(set.decoders_for(f).iter().any(|d| d.id() == id), "{f}");
+        }
+        set.add_legacy_decoder(Arc::new(Named("old-ogg-dec/1", true)))
+            .unwrap();
+        assert_eq!(set.retiring_ids(), ["old-ogg-dec/1"]);
+        assert!(
+            set.decoders_for("ogg")
+                .iter()
+                .all(|d| d.id() != "old-ogg-dec/1")
         );
     }
 

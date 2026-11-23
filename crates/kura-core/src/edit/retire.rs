@@ -1,8 +1,9 @@
 //! 退役する読み手の移し替え（`JobKind::Retire`。M16 段 5。docs/editing.md §9.4「退役する読み手の移し替え」、ADR-222）。
 //!
-//! 後の版で外す旧版の読み手（`Decoder::retiring`。今は symphonia の Vorbis・AAC の 3 つ）で読んだ版の入力のうち、アンカーの
-//! ないもの（[`targets`]）に、その読み手で 1 度だけアンカーを作る。旧版の読み手を外したあとも、その版を作り直せる（版に戻す・
-//! 一括の［元に戻す…］・GC の照合）ようにするため。
+//! 後の版で外す旧版の読み手（`Decoder::retiring`）で読んだ版の入力のうち、アンカーのないもの（[`targets`]）に、その読み手で
+//! 1 度だけアンカーを作る。旧版の読み手を外したあとも、その版を作り直せる（版に戻す・一括の［元に戻す…］・GC の照合）ように
+//! するため。M16 段 5 で symphonia の Vorbis・AAC の 3 つのために作り、段 10 でそれらを外した（`codec::RETIRED_DECODERS`）
+//! ので、今の固定の組に退役する読み手はない（ジョブは積まれない）。後の版で読み手を外すときに、同じ仕組みを使う。
 //!
 //! - 1 件ずつ（版の行の ID・入力の番号の順）：記録の元がアイテムの元と同じか確かめ、同じ元・読み方・識別子の移したアンカーが
 //!   すでにあれば（同じアイテムの戻した版の写しなど）記録が同じときだけ結び付け、なければ元を記録の読み手で読み直して値の
@@ -705,9 +706,22 @@ pub fn remaining(conn: &Connection, ids: &[&str]) -> Result<Remaining> {
     Ok(out)
 }
 
-/// ライブラリ `path`（`*.kuralib`）の DB を読み取り専用で開いて数える（kura-devtools。アプリを閉じてから回す。ジョブもマイグレーションも
-/// 動かさない）。退役の識別子は固定の組（`CodecSet::pinned()`）のもの。版の表のない古い DB は、先にアプリで開くよう断る。
-pub fn remaining_in(path: &std::path::Path) -> Result<Remaining> {
+/// 数える識別子（kura-devtools の `retired`）：固定の組の退役する読み手（[`kura_engine::codec::CodecSet::retiring_ids`]）と、
+/// 外した読み手（[`kura_engine::codec::RETIRED_DECODERS`]。アンカーのない版の入力は作り直せない：`DecoderGone`）。
+pub fn watched_ids() -> Vec<&'static str> {
+    let mut ids = kura_engine::codec::CodecSet::pinned().retiring_ids();
+    for id in kura_engine::codec::RETIRED_DECODERS {
+        if !ids.contains(id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// ライブラリ `path`（`*.kuralib`）の DB を読み取り専用で開いて、識別子 `ids`（ふつうは [`watched_ids`]）で読んだアンカーのない
+/// 版の入力を数える（kura-devtools。アプリを閉じてから回す。ジョブもマイグレーションも動かさない）。版の表のない古い DB は、
+/// 先にアプリで開くよう断る。
+pub fn remaining_in(path: &std::path::Path, ids: &[&str]) -> Result<Remaining> {
     let db = path.join(crate::library::DB_FILE);
     if !db.is_file() {
         return Err(CoreError::NotFound(format!("{} の DB", path.display())));
@@ -721,6 +735,5 @@ pub fn remaining_in(path: &std::path::Path) -> Result<Remaining> {
             "ライブラリの DB が古い版です。先に今のアプリで開いてください".into(),
         ));
     }
-    let ids = kura_engine::codec::CodecSet::pinned().retiring_ids();
-    remaining(&conn, &ids)
+    remaining(&conn, ids)
 }

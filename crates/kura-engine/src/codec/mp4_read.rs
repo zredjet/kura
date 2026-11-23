@@ -24,7 +24,7 @@
 //! - タグ：最後の版だけ（moov/udta の最後の meta の最後の ilst。なければ走査の止まる前の最上段の meta のうち ilst のある
 //!   最後のもの）。kura が使う 7 つのキー（`©nam`・`©ART`・`©alb`・`©cmt`・`©day`・`©gen`・`cprt`）の項目の、型 1・4
 //!   （UTF-8。不正な列は U+FFFD、NUL も残す）・2・5（UTF-16。BOM で向きを決め、なければ BE。奇数長の最後のバイトは捨てる）の
-//!   `data` を出た順に。ほかの項目・型は読まない（`symph::meta_from_tags` は MP4 ではこの 7 つのキーしか使わない）。
+//!   `data` を出た順に。ほかの項目・型は読まない（`common::meta_from_tags` は MP4 ではこの 7 つのキーしか使わない）。
 //!   [`TEXT_MAX`] より長くなる値は読まずに捨てる（`meta_from_tags` も捨てる）。
 //!
 //! # symphonia と違うところ（壊れたファイルと、symphonia が読み違える形。ADR-219 (3)。docs/editing.md §9.6）
@@ -44,13 +44,13 @@
 //! [`MAX_READ`] まで（それを超えるものは `Limit`）。
 
 use crate::codec::ReadSeek;
-use crate::codec::symph::Media;
+use crate::codec::common::Media;
 use crate::error::EngineError;
 use crate::monitor::Monitor;
 
 /// 1 つの箱（表・タグの項目）・1 つのサンプルとして読み込む大きさの上限（バイト）。
 pub(crate) const MAX_READ: u64 = 256 << 20;
-/// 文字列のタグとして運ぶ値の長さの上限（`symph::meta_from_tags` と同じ。これより長いものは捨てる）。
+/// 文字列のタグとして運ぶ値の長さの上限（`common::meta_from_tags` と同じ。これより長いものは捨てる）。
 const TEXT_MAX: usize = 4_096;
 /// 箱の入れ子の深さの上限（symphonia と同じ 32。ALAC の m4a は 8 段）。
 const MAX_DEPTH: u32 = 32;
@@ -344,6 +344,10 @@ pub(crate) enum Want {
     Alac,
     /// MP4 の中の AAC（M16 段 4。esds の AudioSpecificConfig）。
     Aac,
+    /// 中身を問わずタグだけ（M16 段 10。Platform・External の段が読んだ m4a のタグ。[`tags`]）。音声の最初のトラックを
+    /// 選ぶところまでは同じで、トラックの箱・表・断片は読まない（タグは moov の udta と最上段の meta にあり、音声はほかの段が
+    /// 読み終えている）。レート・チャンネルは 0、設定と表は空。
+    Tags,
 }
 
 /// 開いたトラック。
@@ -563,6 +567,31 @@ pub(crate) fn open<'a>(
             let cfg = crate::codec::aac::config::parse_asc(&asc)?;
             (asc, cfg.rate, cfg.channels)
         }
+        (Want::Tags, _) => {
+            let tags = read_tags(&mut src, udta.as_ref(), top_ilst)?;
+            return Ok(Mp4Track {
+                src,
+                rate: 0,
+                channels: 0,
+                cookie: Vec::new(),
+                tags,
+                tables: Tables {
+                    stts: Vec::new(),
+                    stsc: Vec::new(),
+                    sizes: Sizes::Constant { size: 0, count: 0 },
+                    chunks: None,
+                },
+                frag: None,
+                stts_i: 0,
+                stts_left: 0,
+                stsc_i: 0,
+                chunk: 0,
+                in_chunk: 0,
+                sample: 0,
+                next_pos: 0,
+                moov_done: false,
+            });
+        }
         _ => return Err(src.unsupported("このデコーダの扱う中身ではありません")),
     };
     if !mvhd {
@@ -595,6 +624,16 @@ pub(crate) fn open<'a>(
     r.check_tables()?;
     r.start();
     Ok(r)
+}
+
+/// 音声の最初のトラックのある MP4 のタグ（キー, 値。出た順。`Mp4Track::tags`）。[`Want::Tags`] で開くので、トラックの箱・
+/// 表・断片は読まない。開けない（MP4 でない・音声のトラックがない・見本が 2 つ以上・タグの箱が壊れているなど）なら誤り。
+pub(crate) fn tags(
+    media: &mut Media<'_>,
+    mon: &dyn Monitor,
+    codec: &'static str,
+) -> Result<Vec<(String, String)>, EngineError> {
+    Ok(open(media, mon, codec, Want::Tags)?.tags)
 }
 
 /// 選んだ trak に、symphonia が求める箱があるか（tkhd・mdia、mdia の mdhd・hdlr・minf、minf の stbl。stbl の表は

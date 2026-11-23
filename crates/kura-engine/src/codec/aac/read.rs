@@ -1,13 +1,13 @@
 //! AAC-LC のデコーダの口（`m4a-aac-kura-dec/1`・`aac-adts-kura-dec/1`）。入れ物は m4a（`codec::mp4_read`）と ADTS
 //! （[`super::adts`]）。
 //!
-//! 形・切り取り・長さの決め方は前の symphonia の読み手（`lossy.rs` の AAC。`m4a-aac-symphonia-dec/2`・
+//! 形・切り取り・長さの決め方は前の symphonia の読み手（M16 段 10 で外した `lossy.rs` の AAC。`m4a-aac-symphonia-dec/2`・
 //! `aac-adts-symphonia-dec/2`）と同じ：
 //! - 形は上限（`AtMost`）。m4a は priming を自前で切る：iTunSMPB（Apple）があればそれ、なければ MP4 の elst（ffmpeg）の
-//!   最初の空でない編集（`symph::Media::mp4_edit`）。どちらもなければ切らない。ADTS は切らない。
+//!   最初の空でない編集（`common::Media::mp4_edit`）。どちらもなければ切らない。ADTS は切らない。
 //! - HE-AAC：AudioSpecificConfig の明示の印は開くときに、帯域の中の印（SBR の fill 要素）は形を決めるときに最初の
 //!   [`SBR_PROBE_PACKETS`] パケットを読んで、読むときは見つけた所で `Unsupported`（次の段の AudioToolbox・ffmpeg へ）。
-//! - 標本は f32（NaN は `symph::canonical_nan` でそろえる）。元の形式は 16 ビットの整数とみなす。タグは MP4 の 7 つのキー。
+//! - 標本は f32（NaN は `common::canonical_nan` でそろえる）。元の形式は 16 ビットの整数とみなす。タグは MP4 の 7 つのキー。
 
 use std::io::BufReader;
 use std::path::Path;
@@ -16,10 +16,10 @@ use super::adts::{self, Adts};
 use super::config::{self, Config};
 use super::decoder::AacDecoder;
 use super::{ADTS_ID, M4A_ID};
+use crate::codec::common::{self, Media};
 use crate::codec::held::{self, Held};
 use crate::codec::mp4_read::{self, Mp4Track, Want};
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
-use crate::codec::symph::{self, Media};
 use crate::codec::{Decoder, ReadSeek, Tier};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -191,7 +191,7 @@ impl AacCodec {
                 let smpb = tags
                     .iter()
                     .find(|(k, _)| k.ends_with("iTunSMPB"))
-                    .and_then(|(_, v)| symph::parse_itunsmpb(v));
+                    .and_then(|(_, v)| common::parse_itunsmpb(v));
                 let trim = match smpb {
                     Some(t) => Some(t),
                     None => media.mp4_edit(cfg.rate)?,
@@ -267,7 +267,7 @@ impl AacCodec {
                 plane
                     .try_reserve(n)
                     .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-                plane.extend(src[..n].iter().map(|s| symph::canonical_nan(*s)));
+                plane.extend(src[..n].iter().map(|s| common::canonical_nan(*s)));
             }
             let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
             out.push_frames(&views)?;
@@ -279,7 +279,7 @@ impl AacCodec {
                 message: "長さがヘッダと合いません".into(),
             });
         }
-        let mut meta = symph::meta_from_tags(&o.tags, got, false, limits);
+        let mut meta = common::meta_from_tags(&o.tags, got, false, limits);
         meta.source = Some(AudioSource {
             bits: 16,
             float: false,
@@ -338,7 +338,7 @@ impl Decoder for AacCodec {
         _opts: &DecodeOptions,
         limits: &Limits,
     ) -> Result<Shape, EngineError> {
-        let data = symph::read_all(src, limits)?;
+        let data = common::read_all(src, limits)?;
         let p = self
             .probe(&mut Media::Bytes(&data), limits, &NoMonitor)
             .map_err(|e| own(e, self.id()))?;
@@ -378,7 +378,7 @@ impl Decoder for AacCodec {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
-        let data = symph::read_all(src, limits)?;
+        let data = common::read_all(src, limits)?;
         stream::collect(mon, |out| {
             self.decode_media(&mut Media::Bytes(&data), limits, out, mon)
                 .map_err(|e| own(e, self.id()))
@@ -406,7 +406,7 @@ impl Decoder for AacCodec {
         _limits: &Limits,
     ) -> Result<Held, EngineError> {
         Ok(match self.kind {
-            Kind::M4a => held::mp4(src, held::Mp4Reader::Kura)?,
+            Kind::M4a => held::mp4(src)?,
             Kind::Adts => Held {
                 open: held::READER,
                 decode: 0,

@@ -1002,11 +1002,11 @@ fn show_comments(entries: &[(String, String)]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/// コメントの名前を、読み取りが同じものとみなす形にする：読み取りの表（`codec::symph::comment_name`）が付ける kura の
+/// コメントの名前を、読み取りが同じものとみなす形にする：読み取りの表（`codec::common::comment_name`）が付ける kura の
 /// 名前（大文字と小文字だけの違い・DESCRIPTION と COMMENT・小文字ちょうどの `cprt` と COPYRIGHT は同じ名前になる）。
 /// ループ点の名前と、読み取りがタグにしない名前は大文字にしたもの。
 fn same_tag_name(name: &str) -> String {
-    use crate::codec::symph::{CommentName, comment_name};
+    use crate::codec::common::{CommentName, comment_name};
     match comment_name(name, true) {
         Some(CommentName::Tag(n)) => n,
         _ => name.to_ascii_uppercase(),
@@ -1053,7 +1053,7 @@ pub fn fuzz_encode(format: &str, data: &[u8]) -> Result<(), String> {
     use std::sync::Arc;
 
     use crate::codec::Encoder as _;
-    use crate::codec::symph::{vorbis_comments_for, writable_loop};
+    use crate::codec::common::{vorbis_comments_for, writable_loop};
     use crate::value::Audio;
 
     // 足りない見出しは 0 で埋めて読む
@@ -1704,6 +1704,167 @@ pub fn fuzz_recipe(data: &[u8]) -> Result<(), String> {
         Err(at) => Err(format!("recipe: 自前のコードの panic（{at}）")),
         Ok(Err(EngineError::Internal(m))) => Err(m),
         Ok(_) => Ok(()),
+    }
+}
+
+/// 試験だけ：ほかのデコーダを、別の識別子（と退役の印）で包んだもの（M16 段 10）。読み方・段・再現の約束・見積もりはすべて
+/// 中のデコーダのまま。kura-core の移し替えのジョブ（`edit::retire`）の試験が、段 10 で外した symphonia の Vorbis の代わりに、
+/// 「後の版で外す旧版の読み手」として使う（`CodecSet::add_legacy_decoder` で足せば `retiring_ids` に出る）。
+pub struct RenamedDecoder {
+    inner: std::sync::Arc<dyn crate::codec::Decoder>,
+    id: &'static str,
+    retiring: bool,
+}
+
+impl RenamedDecoder {
+    /// `inner` を識別子 `id` で包む。`retiring` は [`crate::codec::Decoder::retiring`] の値。
+    pub fn new(
+        inner: std::sync::Arc<dyn crate::codec::Decoder>,
+        id: &'static str,
+        retiring: bool,
+    ) -> Self {
+        Self {
+            inner,
+            id,
+            retiring,
+        }
+    }
+}
+
+impl crate::codec::Decoder for RenamedDecoder {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn tier(&self) -> crate::codec::Tier {
+        self.inner.tier()
+    }
+    fn reproducible(&self) -> bool {
+        self.inner.reproducible()
+    }
+    fn env(&self) -> Option<crate::codec::CodecEnv> {
+        self.inner.env()
+    }
+    fn retiring(&self) -> bool {
+        self.retiring
+    }
+    fn can_decode(&self, format: &str) -> bool {
+        self.inner.can_decode(format)
+    }
+    fn work_bytes(&self, format: &str, shape: &crate::shape::Shape) -> u64 {
+        self.inner.work_bytes(format, shape)
+    }
+    fn file_work_bytes(&self, format: &str, shape: &crate::shape::Shape, len: u64) -> u64 {
+        self.inner.file_work_bytes(format, shape, len)
+    }
+    fn shape(
+        &self,
+        src: &mut dyn crate::codec::ReadSeek,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+    ) -> Result<crate::shape::Shape, EngineError> {
+        self.inner.shape(src, format, opts, limits)
+    }
+    fn decode(
+        &self,
+        src: &mut dyn crate::codec::ReadSeek,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        self.inner.decode(src, format, opts, limits, mon)
+    }
+    fn shape_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+    ) -> Result<crate::shape::Shape, EngineError> {
+        self.inner.shape_file(path, format, opts, limits)
+    }
+    fn shape_monitored(
+        &self,
+        src: &mut dyn crate::codec::ReadSeek,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        mon: &dyn Monitor,
+    ) -> Result<crate::shape::Shape, EngineError> {
+        self.inner.shape_monitored(src, format, opts, limits, mon)
+    }
+    fn shape_file_monitored(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        mon: &dyn Monitor,
+    ) -> Result<crate::shape::Shape, EngineError> {
+        self.inner
+            .shape_file_monitored(path, format, opts, limits, mon)
+    }
+    fn decode_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        self.inner.decode_file(path, format, opts, limits, mon)
+    }
+    fn streams(&self, format: &str) -> bool {
+        self.inner.streams(format)
+    }
+    fn stream_work_bytes(&self, format: &str, shape: &crate::shape::Shape, len: u64) -> u64 {
+        self.inner.stream_work_bytes(format, shape, len)
+    }
+    fn shape_work_bytes(&self, format: &str, len: u64) -> u64 {
+        self.inner.shape_work_bytes(format, len)
+    }
+    fn held_bytes(
+        &self,
+        src: &mut dyn crate::codec::ReadSeek,
+        format: &str,
+        limits: &crate::limits::Limits,
+    ) -> Result<crate::codec::Held, EngineError> {
+        self.inner.held_bytes(src, format, limits)
+    }
+    fn held_bytes_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        limits: &crate::limits::Limits,
+    ) -> Result<crate::codec::Held, EngineError> {
+        self.inner.held_bytes_file(path, format, limits)
+    }
+    fn decode_stream(
+        &self,
+        src: &mut (dyn crate::codec::ReadSeek + Send),
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        shape: &crate::shape::Shape,
+        out: &mut crate::codec::DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .decode_stream(src, format, opts, limits, shape, out, mon)
+    }
+    fn decode_stream_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        shape: &crate::shape::Shape,
+        out: &mut crate::codec::DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .decode_stream_file(path, format, opts, limits, shape, out, mon)
     }
 }
 

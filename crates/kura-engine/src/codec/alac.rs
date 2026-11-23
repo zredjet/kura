@@ -8,16 +8,16 @@
 //!   長く出てきたものも `Decode`）。数える量も `max_audio_frames`・`max_value_bytes` で確かめる。
 //! - 標本：32 ビットに左詰めした整数を `pcm::int_to_f32(v, 32)`（WAV・AIFF・FLAC と同じ値）。
 //! - 元の形式：cookie のビットの深さを入れ物の幅にしたもの（`pcm::container_bits`）。タグは MP4 の 7 つのキー
-//!   （`symph::meta_from_tags`）。
+//!   （`common::meta_from_tags`）。
 
 use std::io::BufReader;
 use std::path::Path;
 
 use crate::codec::alac_read::{AlacDecoder, DEC_ID, MAX_FRAME_LENGTH};
+use crate::codec::common::{self, Media};
 use crate::codec::held::{self, Held};
 use crate::codec::mp4_read::{self, Mp4Track};
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
-use crate::codec::symph::{self, Media};
 use crate::codec::{Decoder, ReadSeek, Tier, pcm};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
@@ -170,9 +170,9 @@ fn decode_media(
     if out.frames() != p.frames {
         return Err(dec_err("長さがヘッダと合いません"));
     }
-    let mut meta = symph::meta_from_tags(&r.tags, p.frames, false, limits);
+    let mut meta = common::meta_from_tags(&r.tags, p.frames, false, limits);
     meta.source = Some(AudioSource {
-        bits: pcm::container_bits(u16::from(symph::alac_bits(&r.cookie).unwrap_or(16))),
+        bits: pcm::container_bits(u16::from(common::alac_bits(&r.cookie).unwrap_or(16))),
         float: false,
         rate: p.rate,
     });
@@ -203,7 +203,7 @@ impl Decoder for AlacCodec {
         _opts: &DecodeOptions,
         limits: &Limits,
     ) -> Result<Shape, EngineError> {
-        let data = symph::read_all(src, limits)?;
+        let data = common::read_all(src, limits)?;
         let p = probe(&mut Media::Bytes(&data), limits, &NoMonitor)?;
         Ok(shape_of(&p))
     }
@@ -240,7 +240,7 @@ impl Decoder for AlacCodec {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
-        let data = symph::read_all(src, limits)?;
+        let data = common::read_all(src, limits)?;
         stream::collect(mon, |out| {
             decode_media(&mut Media::Bytes(&data), limits, out, mon)
         })
@@ -269,7 +269,7 @@ impl Decoder for AlacCodec {
         _format: &str,
         _limits: &Limits,
     ) -> Result<Held, EngineError> {
-        held::mp4(src, held::Mp4Reader::Kura)
+        held::mp4(src)
     }
 
     fn held_bytes_file(
@@ -302,67 +302,11 @@ mod tests {
 
     use rand_chacha::ChaCha8Rng;
     use rand_chacha::rand_core::Rng;
-    use symphonia_core::codecs::audio::well_known::CODEC_ID_ALAC;
 
     use super::*;
     use crate::codec::alac_read::tests::{BitWriter, cookie as make_cookie};
+    use crate::codec::frozen::Log;
     use crate::codec::mp4_read::m4a_gen::{Extra, M4a, Tag};
-    use crate::codec::symph::Container;
-
-    /// 前の読み手（symphonia の `IsoMp4Reader` と `AlacDecoder`。M16 段 3 の前の `lossy` の道そのまま）。panic は None。
-    fn old(data: &[u8]) -> Option<Result<Value, EngineError>> {
-        let data = data.to_vec();
-        std::panic::catch_unwind(move || old_inner(&data)).ok()
-    }
-
-    fn old_inner(data: &[u8]) -> Result<Value, EngineError> {
-        let limits = Limits::default();
-        let mon = NoMonitor;
-        stream::collect(&mon, |out| {
-            let mut o = symph::open(DEC_ID, data, Container::Mp4, &mon, &limits)?;
-            if o.params.codec != CODEC_ID_ALAC {
-                return Err(EngineError::Unsupported("ALAC でない".into()));
-            }
-            let raw = o.raw_tags();
-            let counted = o.count_frames(DEC_ID, &mon, &limits)?;
-            let (rate, ch) = (o.rate, o.channels);
-            drop(o);
-            limits
-                .check(&Shape::Audio {
-                    rate,
-                    channels: ch as u16,
-                    frames: Dim::Exact(counted),
-                })
-                .map_err(EngineError::Limit)?;
-            let mut o = symph::open(DEC_ID, data, Container::Mp4, &mon, &limits)?;
-            out.begin(DecodeInfo {
-                rate,
-                channels: ch,
-                frames: Dim::Exact(counted),
-                expect: counted,
-            })?;
-            let mut dec =
-                symphonia_codec_alac::AlacDecoder::try_new(&o.params, &symph::decoder_options())
-                    .map_err(|e| symph::sym_err(DEC_ID, e, &mon))?;
-            o.decode_all(DEC_ID, &mut dec, counted, out, &mon)?;
-            if out.frames() != counted {
-                return Err(dec_err("長さがヘッダと合いません"));
-            }
-            let mut meta = symph::meta_from_tags(&raw, counted, false, &limits);
-            meta.source = Some(AudioSource {
-                bits: pcm::container_bits(u16::from(
-                    o.params
-                        .extra_data
-                        .as_deref()
-                        .and_then(symph::alac_bits)
-                        .unwrap_or(16),
-                )),
-                float: false,
-                rate,
-            });
-            out.end(meta)
-        })
-    }
 
     fn ours(data: &[u8]) -> Result<Value, EngineError> {
         AlacCodec.decode(
@@ -399,17 +343,13 @@ mod tests {
         "alac-tags.m4a",
     ];
 
-    /// afconvert・ffmpeg の ALAC（16・20・24・32 ビット、1・2・6・8 チャンネル、断片、タグ）を、前の symphonia の読み手と
-    /// 同じ値（標本・タグ・元の形式のダイジェスト）で読む。流して読む道も同じ。
+    /// afconvert・ffmpeg の ALAC（16・20・24・32 ビット、1・2・6・8 チャンネル、断片、タグ）を読む（段 3〜9 は前の symphonia の
+    /// 読み手と同じ値を確かめていた。値はデコーダのゴールデンが凍結する）。流して読む道も同じ。
     #[test]
-    fn fixtures_match_symphonia() {
+    fn fixtures_are_read_both_ways() {
         for name in FIXTURES {
             let data = fixture(name);
             let a = ours(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let b = old(&data)
-                .unwrap()
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(a.digest().unwrap(), b.digest().unwrap(), "{name}");
             let s = ours_stream(&data).unwrap();
             assert_eq!(a.digest().unwrap(), s.digest().unwrap(), "{name}：流す道");
             if name == "alac-tags.m4a" {
@@ -577,23 +517,18 @@ mod tests {
     }
 
     /// 乱数で作った形の m4a（moov の前後・co64・chunk の分け方と詰め物・見本の版 1・48 バイトの cookie・タグの型と BOM・
-    /// 最上段の meta・前のチャプターのトラック・断片）を、前の symphonia の読み手と同じ値で読む。stz2 は前の読み手が
-    /// 読めなかったもの（自作は読む）、前の AAC のトラックは両方とも `Unsupported`。
+    /// 最上段の meta・前のチャプターのトラック・断片）を読む（段 3〜9 は前の symphonia の読み手と同じ値を確かめていた。値は
+    /// 凍結したダイジェスト。`codec::frozen`）。stz2 にしても同じ値（前の読み手は読めなかった）、前の AAC のトラックは
+    /// `Unsupported`（前の読み手も同じ）。
     #[test]
-    fn generated_files_match_symphonia() {
+    fn generated_files_keep_their_values() {
         let mut rng = crate::determinism::rng(43);
+        let mut log = Log::default();
         for round in 0..300 {
             let mut m = random_m4a(&mut rng);
             let data = m.build();
             let a = ours(&data).unwrap_or_else(|e| panic!("回 {round}: {e}\n{m:?}"));
-            let b = old(&data)
-                .unwrap()
-                .unwrap_or_else(|e| panic!("回 {round}（前）: {e}"));
-            assert_eq!(
-                a.digest().unwrap(),
-                b.digest().unwrap(),
-                "回 {round}\n{m:?}"
-            );
+            log.push(&Ok(a.clone()));
             assert_eq!(
                 a.digest().unwrap(),
                 ours_stream(&data).unwrap().digest().unwrap(),
@@ -608,10 +543,6 @@ mod tests {
                         a.digest().unwrap(),
                         "回 {round}：stz2"
                     );
-                    assert!(
-                        old(&z).unwrap().is_err(),
-                        "回 {round}：前の読み手は stz2 を読めなかった"
-                    );
                 }
                 m.stz2 = false;
                 m.extra_before.insert(0, Extra::Aac);
@@ -620,34 +551,28 @@ mod tests {
                     matches!(ours(&aac), Err(EngineError::Unsupported(_))),
                     "回 {round}：AAC が前"
                 );
-                assert!(matches!(old(&aac), Some(Err(EngineError::Unsupported(_)))));
             }
         }
+        assert_eq!(log.digest(), FROZEN_GENERATED);
     }
 
-    /// 自作の読み手が前の読み手より厳しく断る形の誤り（ADR-219 (3)。モジュール `mp4_read` の説明）。
-    const STRICT: [&str; 9] = [
-        "stts と stsz",
-        "大きさ 0 のサンプル",
-        "chunk の位置が前",
-        "trun の位置が前",
-        "moof のあとに mdat",
-        "パケットが大きすぎます",
-        "traf が 2 つ",
-        "trex の並び",
-        "ファイルの外",
-    ];
+    /// 凍結した結果（`codec::frozen`。M16 段 10 で、symphonia と照らし終えた段 9 の実装で作った）。
+    const FROZEN_GENERATED: &str =
+        "98a497cb1f642015c643cb9dc94e5f3454b3e53442d5a305574bf5923b77bd70";
+    const FROZEN_BROKEN: &str = "197c1272db0082432119283023aa7650a61c6df9acea853fcf92228d3e3af30c";
+    const FROZEN_REVIEW: &str = "1a7a207b4869a3cf70bc20d3eaaafbb5e7354e2775cefa9f21f95b1258280173";
 
-    /// 壊したファイル（乱数で数バイトを変える・切る。フィクスチャと作ったもの）で、前の読み手が読めたものは同じ値で読むか、
-    /// 厳しく断る形（[`STRICT`]）の誤りにする。panic しない。
+    /// 壊したファイル（乱数で数バイトを変える・切る。フィクスチャと作ったもの）でも panic せず、誤りは壊れたファイル・扱わない
+    /// 形・上限のどれか（段 3〜9 は、前の読み手が読めたものを同じ値で読むか、厳しく断る形（ADR-219 (3)）の誤りにすることを
+    /// 確かめていた。結果は凍結したダイジェスト）。
     #[test]
-    fn broken_files_follow_symphonia() {
+    fn broken_files_keep_their_outcomes() {
         let mut rng = crate::determinism::rng(47);
         let mut seeds: Vec<Vec<u8>> = FIXTURES.iter().map(|n| fixture(n)).collect();
         for _ in 0..12 {
             seeds.push(random_m4a(&mut rng).build());
         }
-        let (mut same, mut strict, mut both_err, mut better, mut panicked) = (0, 0, 0, 0, 0);
+        let mut log = Log::default();
         for round in 0..1_500 {
             let mut b = seeds[(rng.next_u32() as usize) % seeds.len()].clone();
             for _ in 0..1 + rng.next_u32() % 4 {
@@ -665,40 +590,31 @@ mod tests {
                 b.truncate(cut);
             }
             let a = ours(&b);
-            let Some(o) = old(&b) else {
-                panicked += 1;
-                continue;
-            };
-            match (&a, &o) {
-                (Ok(x), Ok(y)) => {
-                    assert_eq!(x.digest().unwrap(), y.digest().unwrap(), "回 {round}");
-                    same += 1;
-                }
-                (Err(e), Ok(_)) => {
-                    let msg = e.to_string();
-                    assert!(
-                        STRICT.iter().any(|s| msg.contains(s)),
-                        "回 {round}：前は読めた：{msg}"
-                    );
-                    strict += 1;
-                }
-                // 自作だけが読む：ほかのトラック・使わないタグの項目・ftyp・mvhd の版の誤り（モジュール `mp4_read` の説明）
-                (Ok(_), Err(_)) => better += 1,
-                (Err(_), Err(_)) => both_err += 1,
+            if let Err(e) = &a {
+                assert!(
+                    matches!(
+                        e,
+                        EngineError::Decode { .. }
+                            | EngineError::Unsupported(_)
+                            | EngineError::Limit(_)
+                    ),
+                    "回 {round}：{e:?}"
+                );
             }
+            log.push(&a);
         }
-        eprintln!(
-            "同じ {same}・厳しい {strict}・両方とも誤り {both_err}・自作だけ読む {better}・前が panic {panicked}"
-        );
-        assert!(same > 100 && both_err > 100, "{same} {both_err}");
+        eprintln!("読めた {}・読めない {}", log.ok, log.err);
+        assert!(log.ok > 100 && log.err > 100, "{} {}", log.ok, log.err);
+        assert_eq!(log.digest(), FROZEN_BROKEN);
     }
 
     /// 見直しで見つけた、symphonia と食い違っていた形（M16 段 3）：stsz と stz2 の両方、UTF-16 の長さの境目、前の trak の
-    /// esds の記述子の並び・v2 の PCM の見本、断片のサンプル 0 の trun・mdat のない空の moof・終わりの切れた頭。どれも前の
-    /// 読み手と同じ値か、同じく `Unsupported`。
+    /// esds の記述子の並び・v2 の PCM の見本、断片のサンプル 0 の trun・mdat のない空の moof・終わりの切れた頭。段 3〜9 は前の
+    /// 読み手と同じ値か、同じく `Unsupported` であることを確かめていた（値は凍結したダイジェスト）。
     #[test]
-    fn review_shapes_match_symphonia() {
+    fn review_shapes_keep_their_values() {
         let mut rng = crate::determinism::rng(53);
+        let mut log = Log::default();
         for round in 0..40 {
             let mut m = random_m4a(&mut rng);
             m.fragment = if round % 2 == 0 {
@@ -724,10 +640,7 @@ mod tests {
             );
             let data = m.build();
             let a = ours(&data).unwrap_or_else(|e| panic!("回 {round}: {e}"));
-            let b = old(&data)
-                .unwrap()
-                .unwrap_or_else(|e| panic!("回 {round}（前）: {e}"));
-            assert_eq!(a.digest().unwrap(), b.digest().unwrap(), "回 {round}");
+            log.push(&Ok(a.clone()));
             let Value::Audio(au) = &a else { panic!() };
             assert_eq!(
                 au.meta.tags.get("title").map(String::len),
@@ -741,11 +654,8 @@ mod tests {
                 matches!(ours(&aac), Err(EngineError::Unsupported(_))),
                 "回 {round}"
             );
-            assert!(
-                matches!(old(&aac), Some(Err(EngineError::Unsupported(_)))),
-                "回 {round}"
-            );
         }
+        assert_eq!(log.digest(), FROZEN_REVIEW);
     }
 
     /// 断片の trun が小さな箱で多くのサンプルを宣言しても（既定の大きさ 0 か 1・サンプル 2³² − 1）、数えるのに回らずに断る。
@@ -788,51 +698,5 @@ mod tests {
             let took = t.elapsed();
             assert!(took.as_secs() < 5, "{took:?}");
         }
-    }
-
-    /// 速さの目安（release で `--ignored`）：`alac-16.m4a`（afconvert の 1 秒のステレオ 16 ビット）のパケットを 300 回並べた
-    /// 5 分の m4a を、前の symphonia の読み手と自作の読み手で読む（値のダイジェストは含めない）。M16 段 3 の実測（M4 Max）：
-    /// symphonia 0.35 秒、自作 0.30 秒。
-    #[test]
-    #[ignore]
-    // 計るだけの試験（値は時刻によらない）
-    #[allow(clippy::disallowed_methods)]
-    fn speed_against_symphonia() {
-        let src = fixture("alac-16.m4a");
-        let mut media = Media::Bytes(&src);
-        let mut r = mp4_read::open(&mut media, &NoMonitor, DEC_ID, mp4_read::Want::Alac).unwrap();
-        let cookie = r.cookie.clone();
-        let mut one = Vec::new();
-        while let Some(s) = r.next_sample().unwrap() {
-            one.push((r.read_sample(&s).unwrap().to_vec(), s.dur));
-        }
-        // 最後の短いパケットは最後に 1 度だけ
-        let last = one.pop().unwrap();
-        let mut packets = Vec::new();
-        for _ in 0..300 {
-            packets.extend(one.iter().cloned());
-        }
-        packets.push(last);
-        let mut m = M4a::new(cookie, packets);
-        m.chunking = vec![20];
-        let data = m.build();
-        let mut best = [f64::MAX; 2];
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            let a = old_inner(&data).unwrap();
-            best[0] = crate::math::min(best[0], t.elapsed().as_secs_f64());
-            let t = std::time::Instant::now();
-            let b = ours(&data).unwrap();
-            best[1] = crate::math::min(best[1], t.elapsed().as_secs_f64());
-            let Value::Audio(x) = a else { panic!() };
-            let Value::Audio(y) = b else { panic!() };
-            assert_eq!(x.frames(), y.frames());
-        }
-        println!(
-            "{} バイト：symphonia {:.3} 秒、自作 {:.3} 秒",
-            data.len(),
-            best[0],
-            best[1]
-        );
     }
 }

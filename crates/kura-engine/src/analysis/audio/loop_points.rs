@@ -1,7 +1,7 @@
 //! `audio.loop` v1：ファイルに書かれたループ点とマーカー（`AudioMeta`）。ID は `audio.loop`（`loop` は Rust の予約語なので
 //! ファイル名は `loop_points.rs`）。
 //!
-//! - ループ点は書き出しと同じ判定（`codec::symph::writable_loop`：start < end ≤ 長さ）を通ったものだけ。表示する
+//! - ループ点は書き出しと同じ判定（`codec::common::writable_loop`：start < end ≤ 長さ）を通ったものだけ。表示する
 //!   ループ点と、保存して書かれるループ点が一致する。範囲の外・長さ 0・逆向きのループ点は null にして `droppedLoop`。
 //!   （デコーダと写し方がすでに落とすので、ふつうは起きない。`AudioMeta` を直接組む呼び手のため。）
 //! - マーカーは pos < 長さのもの（WAV・AIFF の読み取り・写し方と同じ）。位置の順（同じ位置は元の順。安定な並べ替え）。
@@ -18,7 +18,7 @@ use crate::analysis::{
     Analysis, AnalysisExample, AnalyzeCx, AnyOutput, AudioStream, Estimate, NoParams,
 };
 use crate::audio::stream::StreamEnd;
-use crate::codec::symph::writable_loop;
+use crate::codec::common::writable_loop;
 use crate::error::EngineError;
 use crate::op::Numeric;
 use crate::shape::{Shape, ValueKind};

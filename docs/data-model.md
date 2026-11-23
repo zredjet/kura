@@ -436,8 +436,9 @@ CREATE TABLE settings (
 --                             更新のあと、取り込みも保存もしなくても読み直すため。M16 段 5）
 --       'edit.retired'      = 退役する読み手の移し替えを終えた退役の識別子の一覧（["ogg-vorbis-symphonia-dec/3", …]。移し替えの
 --                             ジョブが終わったとき（移せないもの・1 件の失敗が残っても）に置く。ジョブが失敗・中止したら置かない。
---                             開いたときに今の退役の識別子の一覧と違えばジョブを積む。版の入力がひとつもないライブラリは積まずに
---                             置く。kura-devtools の `retired --again` が消す。M16 段 5）
+--                             開いたときに今の退役の識別子の一覧と違えばジョブを積む（一覧が空なら積まず、印も変えない。M16 段 10
+--                             で symphonia を外したあとの固定の組）。版の入力がひとつもないライブラリは積まずに置く。kura-devtools の
+--                             `retired --again` が消す。M16 段 5）
 --       'analysis.retry'    = 一度きりの解き直しの印（{"v":1}。M13 段 2。起動のスレッドの sync_plan が、置いた版より新しい版の
 --                             UPDATE を一度だけ当てる。v1 は前の版で too_large になった音声を pending に戻す。事実の表の全件の
 --                             走査は版が上がったときだけ）
@@ -1338,8 +1339,9 @@ C（版に戻す・下書き・不変条件）と、段 3（GC・ゴミ箱を空
 
 ### 退役する読み手の移し替え（M16 段 5。`crates/kura-core/src/edit/retire.rs`・`edit/save/retire.rs`。docs/editing.md §9.4、ADR-222）
 
-- **対象**（ジョブ `kind = 'retire'`。入力 `{}`）：退役する識別子（`CodecSet::retiring_ids()`。今は `ogg-vorbis-symphonia-dec/3`・
-  `m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`）で読んだ、アンカーのない版の入力。版の行の ID・入力の番号の順に 16 件ずつ、
+- **対象**（ジョブ `kind = 'retire'`。入力 `{}`）：退役する識別子（`CodecSet::retiring_ids()`。段 5 では `ogg-vorbis-symphonia-dec/3`・
+  `m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`。段 10 でそれらを外した（`RETIRED_DECODERS`）ので、今の固定の組では空で、
+  ジョブは積まれない）で読んだ、アンカーのない版の入力。版の行の ID・入力の番号の順に 16 件ずつ、
   カーソルの次から：
 
   ```sql

@@ -16,6 +16,9 @@
 //!     足す。依存（jpeg-encoder・image-webp など）を上げたときも、ここで気づく。
 //!   - 読む値は変えない。どうしても変えるなら、デコーダの約束の版を上げ、旧版を `CodecSet::add_legacy_decoder` で残す。
 //!     デコーダのファイルは、その ID のデコーダ（今の版か旧版）がないと失敗にする（作り直しが記録の識別子で読むため。§9.1）。
+//!     例外は、アンカーに移してから外したデコーダ（`codec::RETIRED_DECODERS`。M16 段 10 の symphonia の Vorbis・AAC）：
+//!     そのファイルは照らさない（値は同じ例を今の読み手のファイルが凍結する）。書き出しのファイルの読み直しがそのデコーダの
+//!     行は、今の組で読み直して形だけを照らす（値は `<名前>-kdec1` の行が凍結する）。
 //! - 足りない行は `KURA_BLESS=1 cargo test -p kura-engine --test codec_golden` で足せる。
 
 // テストの補助関数は #[test] の外にあるので、テストと同じく unwrap などを許す（clippy.toml の allow-*-in-tests が届かない）
@@ -28,7 +31,7 @@ use std::path::PathBuf;
 
 use kura_engine::Limits;
 use kura_engine::NoMonitor;
-use kura_engine::codec::CodecSet;
+use kura_engine::codec::{CodecSet, RETIRED_DECODERS};
 use kura_engine::digest::{Hasher, canonical};
 use kura_engine::doc::DecodeOptions;
 use kura_engine::testfiles::{
@@ -615,7 +618,8 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
     }
     // M16 段 2：同じ Ogg Vorbis の例を `<名前>-kdec1` の名前でもう一度並べる。読み直しのデコーダが自作の
     // `ogg-vorbis-kura-dec/1` になったので、この行が読み直した値を凍結する（元の名前・`-dec3` の行は旧版の
-    // `ogg-vorbis-symphonia-dec/3` で読み直して照らし続ける。ADR-217）。書いたバイト列は元の名前の行と同じ
+    // `ogg-vorbis-symphonia-dec/3` で読み直して照らし続けた。段 10 で外したあとは形だけ。ADR-217・ADR-227）。書いたバイト列は
+    // 元の名前の行と同じ
     for (name, format, options, input) in ogg {
         let twin: &'static str = Box::leak(format!("{name}{KDEC_SUFFIX}").into_boxed_str());
         v.push((twin, format, options, input));
@@ -731,6 +735,16 @@ fn examples() -> Vec<(&'static str, &'static str, serde_json::Value, InputGen)> 
             },
         ));
     }
+    // M16 段 10：上の `ogg-crosses-chunks-q0` は M13 段 1 に `ogg-vorbis-symphonia-dec/3` で読み直して凍結し、段 2 の
+    // `-kdec1` の行を足したときに漏れていた。段 10 で /3 を外したので、同じ例を今の読み手で読み直した値をここで凍結する
+    // （書いたバイト列は元の名前の行と同じ）
+    let crosses = v
+        .iter()
+        .find(|e| e.0 == "ogg-crosses-chunks-q0")
+        .cloned()
+        .unwrap();
+    let (_, format, options, input) = crosses;
+    v.push(("ogg-crosses-chunks-q0-kdec1", format, options, input));
     v
 }
 
@@ -858,7 +872,21 @@ fn check_reread(
             );
             return;
         }
-        match decode_stamped(codecs, now, bytes, &old.format) {
+        // 後の版も外した（M16 段 10。`/3`）なら、今の組で読む
+        let read = if RETIRED_DECODERS.contains(&now) {
+            codecs
+                .decode(
+                    &mut Cursor::new(bytes),
+                    &old.format,
+                    &DecodeOptions::default(),
+                    &Limits::default(),
+                    &NoMonitor,
+                )
+                .map_err(|e| e.to_string())
+        } else {
+            decode_stamped(codecs, now, bytes, &old.format)
+        };
+        match read {
             Ok((back, _)) if &back.shape() == want_shape => {}
             Ok((back, _)) => {
                 let _ = writeln!(
@@ -872,6 +900,44 @@ fn check_reread(
                 let _ = writeln!(
                     failures,
                     "{key} {name}：{now}（{} の後の版）で読めません: {e}",
+                    old.decoder
+                );
+            }
+        }
+        return;
+    }
+    // 外したデコーダの行（M16 段 10。SUPERSEDED の行は上で照らした）は、今の組で読み直して形だけを照らす（値は今の読み手で読み直した行が凍結する）
+    if RETIRED_DECODERS.contains(&old.decoder.as_str()) {
+        if codecs.decoder_by_id(&old.decoder).is_some() {
+            let _ = writeln!(
+                failures,
+                "{key} {name}：{} は外したはずのデコーダです",
+                old.decoder
+            );
+            return;
+        }
+        let back = codecs.decode(
+            &mut Cursor::new(bytes),
+            &old.format,
+            &DecodeOptions::default(),
+            &Limits::default(),
+            &NoMonitor,
+        );
+        match back {
+            Ok((back, _)) if &back.shape() == want_shape => {}
+            Ok((back, stamp)) => {
+                let _ = writeln!(
+                    failures,
+                    "{key} {name}：{}（{} の後）で読み直した形が元の値と違う（{want_shape:?} → {:?}）",
+                    stamp.codec,
+                    old.decoder,
+                    back.shape()
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    failures,
+                    "{key} {name}：{} の後の読み手で読めません: {e}",
                     old.decoder
                 );
             }
@@ -1183,8 +1249,10 @@ fn ogg_templates_are_covered() {
     assert_eq!(ogg_template(192_000, 8), "X_uncoupled");
 }
 
-/// 旧版を残さなかったデコーダ（`SUPERSEDED`）の行には、今の版で読み直した値を凍結した `<名前>-dec3` の行が必ずある：
-/// 同じ設定・入力・書いたバイト列で、読み直しのデコーダが今の版、value を持つ。今の版は登録されていて値を再現できる。
+/// 旧版を残さなかったデコーダ（`SUPERSEDED`）の行には、後の版で読み直した値を凍結した `<名前>-dec3` の行が必ずある：
+/// 同じ設定・入力・書いたバイト列で、読み直しのデコーダが後の版、value を持つ。後の版は登録されていて値を再現できるか、
+/// アンカーに移してから外した（`RETIRED_DECODERS`。M16 段 10）もの。外したなら、さらに今の読み手で読み直した値を凍結した
+/// `<名前>-kdec1` の行がある（`retired_rows_have_current_rereads`）。
 #[test]
 fn superseded_rows_have_frozen_rereads() {
     let codecs = CodecSet::pinned();
@@ -1193,6 +1261,10 @@ fn superseded_rows_have_frozen_rereads() {
             codecs.decoder_by_id(gone).is_none(),
             "{gone} はまだあります"
         );
+        if RETIRED_DECODERS.contains(&now) {
+            assert!(codecs.decoder_by_id(now).is_none(), "{now} はまだあります");
+            continue;
+        }
         let d = codecs
             .decoder_by_id(now)
             .unwrap_or_else(|| panic!("{now} がありません"));
@@ -1230,61 +1302,47 @@ fn superseded_rows_have_frozen_rereads() {
     assert_eq!(seen, 35);
 }
 
-/// 値を凍結する symphonia の Vorbis・AAC の経路（`third_party/` の写し）は、std の超越関数（OS の libm）と `mul_add`
-/// を呼ばない（段 9。上流の版を上げて写しを作り直したとき、差し替えを当て忘れると、OS によっては値が変わってもこの
-/// 機械のゴールデンが通ってしまう（手元の macOS では Vorbis の値が OS の libm でも同じだった）ので、ソースで見張る）。
-/// 超越関数は libm クレート（`libm::`）か、各写しの `kura_math` を使う。`sqrt`・`floor` などの IEEE で決まるものはよい。
+/// 外したデコーダ（`RETIRED_DECODERS`。M16 段 10）で読み直した書き出しの行には、今の読み手で読み直した値を凍結した
+/// `<名前>-kdec1` の行が必ずある：同じ設定・入力・書いたバイト列で、読み直しのデコーダが今の版、value を持つ。
 #[test]
-fn symphonia_copies_do_not_call_os_libm() {
-    const BANNED: &[&str] = &[
-        "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "asinh",
-        "acosh", "atanh", "exp", "exp2", "exp_m1", "ln", "log", "log2", "log10", "ln_1p", "powf",
-        "powi", "cbrt", "hypot", "sin_cos", "mul_add",
-    ];
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party");
-    let mut files = 0;
-    let mut bad = Vec::new();
-    for krate in [
-        "symphonia-core",
-        "symphonia-codec-aac",
-        "symphonia-codec-vorbis",
-        "symphonia-format-ogg",
-    ] {
-        // 再帰せず、積み上げで src/ の下をたどる
-        let mut dirs = vec![root.join(krate).join("src")];
-        while let Some(dir) = dirs.pop() {
-            for entry in
-                std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-            {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    dirs.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") {
-                    continue;
-                }
-                files += 1;
-                let text = std::fs::read_to_string(&path).unwrap();
-                for (no, line) in text.lines().enumerate() {
-                    // 行の注釈は見ない（文字列の中の // は、この写しにはない）
-                    let code = line.split("//").next().unwrap_or("");
-                    for f in BANNED {
-                        let calls = [format!(".{f}("), format!("f32::{f}("), format!("f64::{f}(")];
-                        if calls.iter().any(|c| code.contains(c.as_str())) {
-                            bad.push(format!("{}:{}: {}", path.display(), no + 1, line.trim()));
-                        }
-                    }
-                }
+fn retired_rows_have_current_rereads() {
+    let codecs = CodecSet::pinned();
+    let mut seen = 0;
+    for ((kind, id), (path, text)) in read_dir() {
+        if kind != Kind::Enc {
+            continue;
+        }
+        let lines: Vec<Line> = parse(&path, &text);
+        for old in lines.iter() {
+            if !RETIRED_DECODERS.contains(&old.decoder.as_str()) {
+                continue;
             }
+            seen += 1;
+            // `-dec3` の行は、元の名前の行と同じ `-kdec1` の行に読み直しがある（`ogg-crosses-chunks-q0` は段 10 で足した）
+            let base = old.name.strip_suffix(REREAD_SUFFIX).unwrap_or(&old.name);
+            let twin = format!("{base}{KDEC_SUFFIX}");
+            let t = lines
+                .iter()
+                .find(|l| l.name == twin)
+                .unwrap_or_else(|| panic!("{id} {}：{twin} の行がありません", old.name));
+            assert_eq!(
+                (&t.format, &t.file),
+                (&old.format, &old.file),
+                "{id} {twin}"
+            );
+            assert!(
+                same(&t.options, &old.options) && same(&t.input, &old.input),
+                "{id} {twin}"
+            );
+            let d = codecs
+                .decoder_by_id(&t.decoder)
+                .unwrap_or_else(|| panic!("{id} {twin}：{} がありません", t.decoder));
+            assert!(d.reproducible() && t.value.is_some(), "{id} {twin}");
         }
     }
-    assert!(files > 50, "写しのソースが見つかりません（{files} 個）");
-    assert!(
-        bad.is_empty(),
-        "OS の libm を呼んでいます:\n{}",
-        bad.join("\n")
-    );
+    // 段 7 の元の名前の 35 行（`/2`。SUPERSEDED）と、`/3` の 36 行（段 9 の `-dec3` の 35 行と M13 段 1 の
+    // `ogg-crosses-chunks-q0`）
+    assert_eq!(seen, 71);
 }
 
 /// 読み取りだけの例：（名前、作り方）。自前のエンコーダが書かない形を、下の層で組んだファイルから読む（R1 のうちデコーダだけの経路）。
@@ -1763,7 +1821,7 @@ fn decode_examples() -> Vec<(&'static str, FileGen)> {
         "aac-lc-ffmpeg.m4a",
         "aac-lc.aac",
         // M16 段 4：AAC は自作の `m4a-aac-kura-dec/1`・`aac-adts-kura-dec/1` で読む（上の 3 つも。前の `…-symphonia-dec/2`
-        // の行は旧版で読み直して照らし続ける）。モノラル・3〜7.1 チャンネル（ffmpeg・afconvert）
+        // の行は段 9 まで旧版で読み直して照らし、段 10 で外したあとは照らさない）。モノラル・3〜7.1 チャンネル（ffmpeg・afconvert）
         "aac-lc-mono.m4a",
         "aac-lc-3ch.m4a",
         "aac-lc-4ch.m4a",
@@ -1922,7 +1980,12 @@ fn decoder_goldens_match_and_are_complete() {
         }
         let lines: Vec<DecodeLine> = parse(&path, &text);
         check_unique(&id, lines.iter().map(|l| l.name.as_str()), &mut failures);
-        if codecs.decoder_by_id(&id).is_none() {
+        if RETIRED_DECODERS.contains(&id.as_str()) {
+            // アンカーに移してから外したデコーダ（M16 段 10）：照らさない（同じ例は今の読み手のファイルが凍結する）
+            if codecs.decoder_by_id(&id).is_some() {
+                let _ = writeln!(failures, "{id}：外したはずのデコーダです");
+            }
+        } else if codecs.decoder_by_id(&id).is_none() {
             let _ = writeln!(
                 failures,
                 "{id}：デコーダがありません。読む値を変えるときは、旧版のデコーダを残す（docs/editing.md §9.1）"

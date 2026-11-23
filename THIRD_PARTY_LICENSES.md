@@ -9,10 +9,10 @@ yt-dlp・gallery-dl・ffmpeg・deno・mpv・Google Chrome などの外部ツー�
 
 | ライセンス | 件数 |
 |---|--:|
-| MIT | 277 |
+| MIT | 274 |
 | Unicode-3.0 | 19 |
-| MPL-2.0 | 13 |
 | BSD-3-Clause | 8 |
+| MPL-2.0 | 6 |
 | Apache-2.0 | 4 |
 | BSD-2-Clause | 2 |
 | Zlib | 2 |
@@ -1159,7 +1159,7 @@ DEALINGS IN THE SOFTWARE.
 
 ### MIT
 
-対象：bitflags 1.3.2、bitflags 2.13.2、glob 0.3.4、log 0.4.34、num-complex 0.4.6、num-traits 0.2.19、regex 1.13.1、regex-automata 0.4.18、regex-lite 0.1.9、regex-syntax 0.8.11
+対象：bitflags 1.3.2、bitflags 2.13.2、glob 0.3.4、log 0.4.34、regex 1.13.1、regex-automata 0.4.18、regex-syntax 0.8.11
 
 ````text
 Copyright (c) 2014 The Rust Project Developers
@@ -4897,7 +4897,7 @@ SOFTWARE.
 
 ### MPL-2.0
 
-対象：aac-tables 0.2.0（ソース：https://github.com/zredjet/kura の crates/aac-tables/）、cssparser 0.37.0、cssparser-macros 0.7.1、symphonia-codec-aac 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-aac/、変更は KURA.md）、symphonia-codec-vorbis 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-vorbis/、変更は KURA.md）、symphonia-common 0.6.1、symphonia-core 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-core/、変更は KURA.md）、symphonia-format-isomp4 0.6.1、symphonia-format-ogg 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-format-ogg/、変更は KURA.md）、symphonia-metadata 0.6.1
+対象：aac-tables 0.2.0（ソース：https://github.com/zredjet/kura の crates/aac-tables/）、cssparser 0.37.0、cssparser-macros 0.7.1
 
 ````text
 Mozilla Public License Version 2.0

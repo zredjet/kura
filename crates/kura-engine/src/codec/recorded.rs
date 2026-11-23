@@ -330,6 +330,92 @@ mod tests {
         assert_eq!(codes, ["SourceChanged", "DecoderGone", "AnchorBroken"]);
     }
 
+    /// M16 段 10：外した読み手（`RETIRED_DECODERS`。symphonia の Ogg Vorbis・AAC）で読んだ版の入力は、移したアンカー
+    /// （段 5 の移し替えのジョブが、その読み手で読んだ値で作ったもの）があればアンカーから作り直し、なければ
+    /// `DecoderGone`（元のファイルがあっても、今の読み手では読み直さない）。
+    #[test]
+    fn retired_decoders_rebuild_from_anchors_or_are_gone() {
+        use crate::codec::RETIRED_DECODERS;
+        let codecs = CodecSet::pinned();
+        let ogg = {
+            let v = InputGen::AudioNoise {
+                rate: 8_000,
+                channels: 2,
+                frames: 3_000,
+                seed: 5,
+            }
+            .generate()
+            .unwrap();
+            codecs
+                .encode_bytes(&v, "ogg", &serde_json::json!({}), &NoMonitor)
+                .unwrap()
+                .0
+        };
+        // 移し替えのジョブが作ったのと同じ形：外した読み手の識別子の記録と、その値のアンカー（ここでは今の読み手で読んだ値を
+        // 外した読み手の値とみなす）
+        let (value, now) = codecs
+            .decode(
+                &mut Cursor::new(&ogg),
+                "ogg",
+                &DecodeOptions::default(),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+        for id in [
+            "ogg-vorbis-symphonia-dec/3",
+            "m4a-aac-symphonia-dec/2",
+            "aac-adts-symphonia-dec/2",
+        ] {
+            assert!(RETIRED_DECODERS.contains(&id));
+            let stamp = DecodeStamp {
+                codec: id.into(),
+                ..now.clone()
+            };
+            let source = Digest([9; 32]);
+            let mut rec = RecordedInput::new(source, "ogg", DecodeOptions::default(), stamp);
+            let (bytes, _) = anchor::write_verified(
+                &value,
+                &rec.decoded,
+                &rec.anchor_context(),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+            // 台帳の鍵（アンカーのファイルの中身のハッシュ。ここでは読む元を直に渡すので値は効かない）
+            rec.anchor = Some(Digest([7; 32]));
+            let r = read_recorded(
+                &codecs,
+                &rec,
+                Some(Source::Reader(&mut Cursor::new(&bytes))),
+                Some(Source::Reader(&mut Cursor::new(&ogg))),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+            let Recorded::Matched { input, origin } = r else {
+                panic!("{id}：アンカーから作り直せない")
+            };
+            assert_eq!(origin, InputOrigin::Anchor, "{id}");
+            assert_eq!(input.source, source, "{id}");
+            assert_eq!(input.value.digest().unwrap(), now.value_digest, "{id}");
+            // アンカーがなければ、元があっても読み手がない
+            let r = read_recorded(
+                &codecs,
+                &rec,
+                None,
+                Some(Source::Reader(&mut Cursor::new(&ogg))),
+                &Limits::default(),
+                &NoMonitor,
+            )
+            .unwrap();
+            assert!(
+                matches!(r.mismatch(), Some(Mismatch::DecoderGone { codec }) if codec == id),
+                "{id}"
+            );
+        }
+    }
+
     /// 元から読むとき、記録と同じなら元のハッシュを付けて返し、違えば今の値を添えて食い違いを返す。
     #[test]
     fn original_is_checked_against_the_record() {

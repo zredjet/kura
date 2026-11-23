@@ -186,7 +186,7 @@
 //!   （symphonia の `map_vorbis_channel` と同じ表。Vorbis I §4.3.9）。
 //! - 入力の NaN は 0、±∞ は ±1 にしてから渡す（NaN のビットの形がターゲットで違い、todB がビットを値にするため）。1 を超える
 //!   有限の値はそのまま（libvorbis と同じ）。照合用のエンコーダにも同じ値を渡す。
-//! - コメントヘッダ：vendor は [`VENDOR`]（`"kura"`）。項目は E28 の約束（`symph::vorbis_comments_for` の LOOPSTART・LOOPLENGTH のあとに
+//! - コメントヘッダ：vendor は [`VENDOR`]（`"kura"`）。項目は E28 の約束（`common::vorbis_comments_for` の LOOPSTART・LOOPLENGTH のあとに
 //!   `ENCODER=ogg-vorbis-kura-enc/1`、そのあとにタグ。元の `ENCODER` は運ばない）。16 MiB 以上なら `Unsupported`。
 //! - Ogg のページの切り方・グラニュール・シリアル番号は `codec/ogg.rs`（kura の規則）。空の音声（0 フレーム）も書く（libvorbis と
 //!   同じく、短いブロックの 1 パケット）。

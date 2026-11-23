@@ -2,19 +2,19 @@
 //! 出した記録の表の案（作業の記録。リポジトリにはない。決めたことは `docs/decisions.md` の ADR-149 (13)）。
 //! 時刻を書かないので、同じ入力なら同じ文書になる（コミットの欄を除く）。
 //!
-//! 1. **頭書き**：道具の版（[`TOOL_ID`]）・実行の引数・kura のコミット・エンコーダの識別子と段・デコーダ（指標は symphonia、
+//! 1. **頭書き**：道具の版（[`TOOL_ID`]）・実行の引数・kura のコミット・エンコーダの識別子と段・デコーダ（指標は kura の読み取り、
 //!    長さと値の照合は lewton）・乱数の種・聴取のレベルの仮定（1019.5 Hz の満幅の正弦 = 92 dB SPL）・同じビットレートでの
 //!    比較の基準の族。続けて指標の短い定義、試験の音（作り方・レート・チャンネル・秒・SHA-256）、参照（音・ラベル・族・段・
 //!    ファイル・SHA-256）。
 //! 2. **表 0**：飛ばした（書けない段）・測れなかった測定を、エンコーダ・種類・理由ごとにまとめる（段・音）。
 //! 3. **表 1：段ごとの記録**。1 行 1 測定（音 × 段 × エンコーダ）。欄：音声 kbps（音声のパケット（4 つ目から）のバイト × 8 ÷
 //!    元の秒、（　）は識別ヘッダの公称）・ヘッダ B（識別・コメント・setup の 3 パケット）・ファイル B・上限 kHz・NMR 全体・
-//!    p95・最悪 dB@秒・乱れたフレーム・LSD・長さ（symphonia／lewton が読んだフレームの数。「=」は元と同じ）・ずれ（標本）。
+//!    p95・最悪 dB@秒・乱れたフレーム・LSD・長さ（kura／lewton が読んだフレームの数。「=」は元と同じ）・ずれ（標本）。
 //!    並びは音・段・族（kura が先、参照は渡した順）・ラベル。
 //! 4. **表 2：同じビットレートでの比較**。音ごと・族ごとに、基準の族の曲線に対する点の数・BD-rate・各点の ΔNMR（段@kbps）・
 //!    同じ段の上限の差（kHz）。基準の族の点が 2 つ未満の音は作らない。
-//! 5. **表 3：長さとずれ**。音ごとに、測定の数と、そのうち symphonia・lewton の長さが元と同じもの・ずれが 0 のもの・音声が
-//!    1 ページだけのもの（lewton・ffmpeg が最後のページのグラニュールで末尾を切らない形）の数、lewton と symphonia の値の差の
+//! 5. **表 3：長さとずれ**。音ごとに、測定の数と、そのうち kura・lewton の長さが元と同じもの・ずれが 0 のもの・音声が
+//!    1 ページだけのもの（lewton・ffmpeg が最後のページのグラニュールで末尾を切らない形）の数、lewton と kura の読み取りの値の差の
 //!    最大、例外（6 件まで）。
 //! 6. **表 4：短い効果音**（[`SHORT_SECONDS`] 秒より短い音）。エンコーダ・段ごとに、音の数と、音声 kbps・ファイル kbps・
 //!    ヘッダの割合の中央値、NMR 全体の中央値・最悪、フレームの最悪の NMR の中央値、乱れたフレームの中央値、長さが違う数。
@@ -92,7 +92,7 @@ fn len_cell(m: &Measured, frames_ref: usize) -> String {
         }
     };
     let lew = m.frames_lewton.map_or_else(|| "読めない".into(), one);
-    format!("{}／{lew}", one(m.frames_symphonia))
+    format!("{}／{lew}", one(m.frames_kura))
 }
 
 /// 族の並び：kura が先、参照は渡した順。
@@ -148,7 +148,7 @@ fn header(out: &mut String, ctx: &Context, sounds: &[Sound], refs: &[Reference])
     );
     line!(
         out,
-        "- デコーダ：指標は `{}`（symphonia。超越関数を libm に差し替えた写しで、どの機械でも同じ値）で読んだ値、長さと値の照合に {LEWTON_ID}（最後のページのグラニュールで切る）",
+        "- デコーダ：指標は `{}`（kura の読み取り。超越関数は自前の `math` で、どの機械でも同じ値）で読んだ値、長さと値の照合に {LEWTON_ID}（最後のページのグラニュールで切る）",
         ctx.decoder_id
     );
     line!(
@@ -186,7 +186,7 @@ fn header(out: &mut String, ctx: &Context, sounds: &[Sound], refs: &[Reference])
     );
     line!(
         out,
-        "- **長さ**：symphonia／lewton の読んだ長さ（「=」は元と同じ）。**ずれ**：相互相関（±4,096 標本、先頭 131,072 標本、チャンネルの和）の最大の遅れ。指標は ずれ をそろえ、共通の長さで測る。"
+        "- **長さ**：kura／lewton の読んだ長さ（「=」は元と同じ）。**ずれ**：相互相関（±4,096 標本、先頭 131,072 標本、チャンネルの和）の最大の遅れ。指標は ずれ をそろえ、共通の長さで測る。"
     );
     line!(
         out,
@@ -341,7 +341,7 @@ fn table1(out: &mut String, sounds: &[Sound], rows: &[Row], order: &[String]) {
     }
     line!(
         out,
-        "| 音 | 段 | エンコーダ | 音声 kbps（公称） | ヘッダ B | ファイル B | 上限 kHz | NMR 全体 dB | NMR p95 dB | NMR 最悪 dB@秒 | 乱れたフレーム | LSD dB | 長さ（symphonia／lewton） | ずれ |"
+        "| 音 | 段 | エンコーダ | 音声 kbps（公称） | ヘッダ B | ファイル B | 上限 kHz | NMR 全体 dB | NMR p95 dB | NMR 最悪 dB@秒 | 乱れたフレーム | LSD dB | 長さ（kura／lewton） | ずれ |"
     );
     line!(
         out,
@@ -498,7 +498,7 @@ fn table3(out: &mut String, sounds: &[Sound], rows: &[Row]) {
         }
         let n = s.frames();
         let count = |f: &dyn Fn(&Measured) -> bool| ms.iter().filter(|(_, m)| f(m)).count();
-        let sym = count(&|m| m.frames_symphonia == n);
+        let sym = count(&|m| m.frames_kura == n);
         let lew = count(&|m| m.frames_lewton == Some(n));
         let lag0 = count(&|m| m.lag == 0);
         let one_page = count(&|m| m.stats.audio_pages == 1);
@@ -508,15 +508,15 @@ fn table3(out: &mut String, sounds: &[Sound], rows: &[Row]) {
             .fold(None, |a: Option<f64>, d| Some(a.map_or(d, |a| a.max(d))));
         let mut ex: Vec<String> = ms
             .iter()
-            .filter(|(_, m)| m.frames_symphonia != n || m.frames_lewton != Some(n) || m.lag != 0)
+            .filter(|(_, m)| m.frames_kura != n || m.frames_lewton != Some(n) || m.lag != 0)
             .map(|(r, m)| {
                 let lew = m
                     .frames_lewton
                     .map_or_else(|| "読めない".into(), |v| thousands(v as u64));
                 format!(
-                    "{}（symphonia {}・lewton {}・ずれ {}・音声 {} ページ）",
+                    "{}（kura {}・lewton {}・ずれ {}・音声 {} ページ）",
                     r.label,
-                    thousands(m.frames_symphonia as u64),
+                    thousands(m.frames_kura as u64),
                     lew,
                     m.lag,
                     m.stats.audio_pages
@@ -552,12 +552,12 @@ fn table3(out: &mut String, sounds: &[Sound], rows: &[Row]) {
     }
     line!(
         out,
-        "測定の数のうち、symphonia・lewton の長さが元と同じもの、ずれが 0 のもの、音声が 1 ページだけのもの（lewton・ffmpeg が最後のページのグラニュールで末尾を切らない形）の数。"
+        "測定の数のうち、kura・lewton の長さが元と同じもの、ずれが 0 のもの、音声が 1 ページだけのもの（lewton・ffmpeg が最後のページのグラニュールで末尾を切らない形）の数。"
     );
     line!(out);
     line!(
         out,
-        "| 音 | 元の長さ | 測定 | symphonia＝元 | lewton＝元 | ずれ 0 | 音声 1 ページ | lewton と symphonia の差の最大 | 例外 |"
+        "| 音 | 元の長さ | 測定 | kura＝元 | lewton＝元 | ずれ 0 | 音声 1 ページ | lewton と kura の差の最大 | 例外 |"
     );
     line!(out, "|---|---:|---:|---:|---:|---:|---:|---:|---|");
     for b in body {
@@ -609,7 +609,7 @@ fn table4(out: &mut String, sounds: &[Sound], rows: &[Row], order: &[String]) {
             .iter()
             .filter(|(r, m)| {
                 let n = sounds[r.sound].frames();
-                m.frames_symphonia != n || m.frames_lewton != Some(n)
+                m.frames_kura != n || m.frames_lewton != Some(n)
             })
             .count();
         line!(

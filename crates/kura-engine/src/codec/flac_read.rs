@@ -1,7 +1,8 @@
 //! FLAC の読み取り（自作。RFC 9639。M16 段 1・ADR-216）。`flac.rs` の `flac-symphonia-dec/1` の中身。
 //!
 //! 標本の値は仕様で 1 つに決まるので、前の symphonia 0.6.1 の FLAC と同じ値になる（識別子は変えない。ADR-216 (2)）。
-//! 受け付ける範囲と値に効く細部も symphonia に合わせる（照合は下のテストの `same_values_as_symphonia_*` ほか）：
+//! 受け付ける範囲と値に効く細部も symphonia に合わせた（段 1〜9 は下のテストで symphonia と 1 つずつ照らし、段 10 で
+//! symphonia を外したときに、その結果を凍結した。`Frozen`）：
 //! - 頭が `fLaC` でなければ `Unsupported`（ID3v2 の付いた FLAC などを次の段へ回す）。LPC の係数のずらしが負なら `Unsupported`。
 //! - STREAMINFO：34 バイト、ブロックの最小・最大は 16 以上で最小 ≤ 最大、フレームの最小・最大は両方 0 でなければ最小 ≤ 最大、
 //!   レート 1〜655,350、ビット数 4〜32。2 つあれば壊れたファイル。総フレーム数 0 は「不明」、MD5 が 0 なら照らさない。
@@ -36,9 +37,9 @@
 //! 頭を探して走査する所では 65,536 バイトごとに見る。
 
 use crate::codec::byte_in::Input;
+use crate::codec::common::Media;
 use crate::codec::md5::Md5;
 use crate::codec::stream::DecodeOut;
-use crate::codec::symph::Media;
 use crate::codec::try_vec;
 use crate::error::EngineError;
 use crate::limits::Limits;
@@ -253,6 +254,16 @@ pub(crate) fn comment_tag(data: &[u8]) -> Option<(String, String)> {
 
 /// VORBIS_COMMENT の中身（リトルエンディアンの長さ付き）からタグを足す。箱の中で切れていれば壊れたファイル。
 fn parse_comments(block: &[u8], tags: &mut Vec<(String, String)>) -> Result<(), EngineError> {
+    parse_comments_up_to(block, tags, usize::MAX)
+}
+
+/// [`parse_comments`] で、タグにするコメントを `max` 個までにしたもの（それより後ろは読まない）。Ogg の Vorbis・Opus の
+/// コメントのパケットも同じ並び（`ogg_read::tags`。Platform・External の段のタグを、読み取りの上限で抑えて読む）。
+pub(crate) fn parse_comments_up_to(
+    block: &[u8],
+    tags: &mut Vec<(String, String)>,
+    max: usize,
+) -> Result<(), EngineError> {
     let broken = || dec_err("VORBIS_COMMENT が箱の中で切れています");
     let mut at = 0usize;
     let u32le = |at: &mut usize| -> Result<u32, EngineError> {
@@ -273,6 +284,9 @@ fn parse_comments(block: &[u8], tags: &mut Vec<(String, String)>) -> Result<(), 
             .filter(|e| *e <= block.len())
             .ok_or_else(broken)?;
         if let Some(t) = comment_tag(&block[at..end]) {
+            if tags.len() >= max {
+                return Ok(());
+            }
             tags.try_reserve(1)
                 .map_err(|_| EngineError::Limit("タグが多すぎます".into()))?;
             tags.push(t);
@@ -1380,95 +1394,13 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
     use rand_chacha::rand_core::Rng;
     use serde_json::json;
-    use symphonia_core::codecs::CodecParameters;
-    use symphonia_core::codecs::audio::AudioDecoder as _;
-    use symphonia_core::formats::{FormatOptions, FormatReader as _, TrackType};
-    use symphonia_core::io::MediaSourceStream;
 
     use super::*;
     use crate::codec::stream::{self, DecodeInfo};
-    use crate::codec::{CodecSet, Decoder as _, pcm, symph};
+    use crate::codec::{CodecSet, pcm};
     use crate::doc::DecodeOptions;
     use crate::monitor::NoMonitor;
-    use crate::value::{Audio, AudioMeta, AudioSource, LoopRange, Value};
-
-    // -------------------------------------------------------------------------------------------------------
-    // 照合相手：前の `flac-symphonia-dec/1`（symphonia 0.6.1 の FLAC の読み口とデコーダ）をそのまま組んだもの
-
-    fn old_open(data: &[u8], limits: &Limits) -> Result<symph::Opened<'static>, EngineError> {
-        let mss = MediaSourceStream::new(Box::new(Cursor::new(data.to_vec())), Default::default());
-        let reader = symphonia_bundle_flac::FlacReader::try_new(mss, FormatOptions::default())
-            .map_err(|e| symph::sym_err(DEC_ID, e, &NoMonitor))?;
-        let track = reader
-            .default_track(TrackType::Audio)
-            .cloned()
-            .ok_or_else(|| EngineError::Unsupported("トラックがありません".into()))?;
-        let params = track
-            .codec_params
-            .as_ref()
-            .and_then(CodecParameters::audio)
-            .cloned()
-            .ok_or_else(|| EngineError::Unsupported("トラックがありません".into()))?;
-        let rate = params
-            .sample_rate
-            .filter(|r| *r > 0)
-            .ok_or_else(|| dec_err("サンプルレートがありません"))?;
-        let channels = params
-            .channels
-            .as_ref()
-            .map(|c| c.count())
-            .filter(|n| *n > 0)
-            .ok_or_else(|| EngineError::Unsupported("チャンネルの数がありません".into()))?;
-        if channels as u64 > limits.max_channels || rate > limits.max_sample_rate {
-            return Err(EngineError::Limit("上限".into()));
-        }
-        Ok(symph::Opened {
-            reader: Box::new(reader),
-            track,
-            params,
-            rate,
-            channels,
-        })
-    }
-
-    /// 前の flac.rs の `decode_media` と同じ組み方。
-    fn old_decode(data: &[u8]) -> Result<Value, EngineError> {
-        let limits = Limits::default();
-        let mon = NoMonitor;
-        let mut o = old_open(data, &limits)?;
-        let frames = match o.track.num_frames.filter(|n| *n > 0) {
-            Some(n) => n,
-            None => o.count_frames(DEC_ID, &mon, &limits)?,
-        };
-        let (rate, channels, bits) = (o.rate, o.channels, o.params.bits_per_sample);
-        let mut o = old_open(data, &limits)?;
-        let raw = o.raw_tags();
-        let opts = symph::decoder_options().verify(true);
-        let mut dec = symphonia_bundle_flac::FlacDecoder::try_new(&o.params, &opts)
-            .map_err(|e| symph::sym_err(DEC_ID, e, &mon))?;
-        stream::collect(&mon, |out| {
-            out.begin(DecodeInfo {
-                rate,
-                channels,
-                frames: Dim::Exact(frames),
-                expect: frames,
-            })?;
-            o.decode_all(DEC_ID, &mut dec, frames, out, &mon)?;
-            if dec.finalize().verify_ok == Some(false) {
-                return Err(dec_err("MD5"));
-            }
-            if out.frames() != frames {
-                return Err(dec_err("長さ"));
-            }
-            let mut meta = symph::meta_from_tags(&raw, frames, true, &limits);
-            meta.source = Some(AudioSource {
-                bits: pcm::container_bits(bits.unwrap_or(16).clamp(1, 32) as u16),
-                float: false,
-                rate,
-            });
-            out.end(meta)
-        })
-    }
+    use crate::value::{Audio, AudioMeta, LoopRange, Value};
 
     fn new_decode(data: &[u8]) -> Result<Value, EngineError> {
         CodecSet::pinned()
@@ -1511,78 +1443,42 @@ mod tests {
         }
     }
 
-    /// STREAMINFO の総フレーム数と MD5 があるか（symphonia がフレームを黙って捨てられるのは、どちらもないときだけ）。
-    fn guarded(data: &[u8]) -> bool {
-        let Some(si) = data.get(8..42) else {
-            return false;
-        };
-        let total = u64::from_be_bytes([
-            si[10], si[11], si[12], si[13], si[14], si[15], si[16], si[17],
-        ]) & 0xf_ffff_ffff;
-        total > 0 || si[18..34].iter().any(|b| *b != 0)
-    }
+    /// 自作の読み手の結果を順に畳むもの（M16 段 10。段 1〜9 は前の `flac-symphonia-dec/1` の中身（symphonia 0.6.1 の FLAC）と
+    /// 1 つずつ照らし、symphonia が読めたものは同じ値（総フレーム数も MD5 もないファイルで symphonia が壊れたフレームを黙って
+    /// 捨てたものを除く）・自作が厳しく断るものを数えていた。symphonia を外したあとは、照らし終えた結果（読めたものは値の
+    /// ダイジェスト、読めないものは印）を畳んだダイジェストで凍結し、読む値・読める範囲が変わればここで気づく）。読めたものは
+    /// 流して読む道とも同じ標本。
+    #[derive(Default)]
+    struct Frozen(crate::codec::frozen::Log);
 
-    /// 照らした結果の数。
-    #[derive(Default, Debug)]
-    struct Tally {
-        both: usize,
-        neither: usize,
-        new_only: usize,
-        /// 総フレーム数も MD5 もない FLAC で、symphonia が壊れたフレームを黙って捨てたもの（自作は断るか、余分な
-        /// データとして読み飛ばして全部読む）。
-        dropped: usize,
-    }
-
-    /// 同じ入力を前の読み手と自作の読み手で読み、symphonia が読めたものは同じ値であることを確かめる。
-    fn compare(data: &[u8], tally: &mut Tally, what: &str) {
-        let old = catch_unwind(AssertUnwindSafe(|| old_decode(data)))
-            .unwrap_or_else(|_| Err(dec_err("panic")));
-        let new = catch_unwind(AssertUnwindSafe(|| new_decode(data)))
-            .unwrap_or_else(|_| panic!("自作の読み手が panic した：{what}"));
-        match (old, new) {
-            (Ok(a), Ok(b)) => {
-                let (da, db) = (a.digest().unwrap(), b.digest().unwrap());
-                if da == db {
-                    tally.both += 1;
-                } else if !guarded(data) && frames_of(&a) < frames_of(&b) {
-                    tally.dropped += 1;
-                } else {
-                    panic!(
-                        "値が違う：{what}（フレーム {} / {}、{} バイト）",
-                        frames_of(&a),
-                        frames_of(&b),
-                        data.len()
-                    );
-                }
-                // 流して読む道も同じ標本
-                let s = new_decode_reader(data).unwrap();
-                let plain = |v: &Value| match v {
-                    Value::Audio(a) => (0..a.channels())
-                        .map(|c| {
-                            let mut v = vec![0f32; a.frames()];
-                            a.read(c, 0, &mut v).unwrap();
-                            v
-                        })
-                        .collect::<Vec<_>>(),
-                    _ => Vec::new(),
-                };
-                assert_eq!(plain(&s).len(), plain(&b).len(), "{what}");
-                assert!(
-                    plain(&s).iter().zip(plain(&b).iter()).all(|(x, y)| x
-                        .iter()
-                        .map(|v| v.to_bits())
-                        .eq(y.iter().map(|v| v.to_bits()))),
-                    "流して読んだ値が違う：{what}"
-                );
-            }
-            (Ok(_), Err(e)) => {
-                if guarded(data) {
-                    panic!("symphonia が読めたものを断った：{what}：{e}");
-                }
-                tally.dropped += 1;
-            }
-            (Err(_), Ok(_)) => tally.new_only += 1,
-            (Err(_), Err(_)) => tally.neither += 1,
+    impl Frozen {
+        fn check(&mut self, data: &[u8], what: &str) {
+            let new = catch_unwind(AssertUnwindSafe(|| new_decode(data)))
+                .unwrap_or_else(|_| panic!("自作の読み手が panic した：{what}"));
+            self.0.push(&new);
+            let Ok(b) = new else {
+                return;
+            };
+            // 流して読む道も同じ標本
+            let s = new_decode_reader(data).unwrap();
+            let plain = |v: &Value| match v {
+                Value::Audio(a) => (0..a.channels())
+                    .map(|c| {
+                        let mut v = vec![0f32; a.frames()];
+                        a.read(c, 0, &mut v).unwrap();
+                        v
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            assert_eq!(plain(&s).len(), plain(&b).len(), "{what}");
+            assert!(
+                plain(&s).iter().zip(plain(&b).iter()).all(|(x, y)| x
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .eq(y.iter().map(|v| v.to_bits()))),
+                "流して読んだ値が違う：{what}"
+            );
         }
     }
 
@@ -2058,101 +1954,67 @@ mod tests {
     // -------------------------------------------------------------------------------------------------------
     // 照合
 
+    /// フィクスチャと自作の書き出しの出力は、すべて読める（フィクスチャの値はデコーダのゴールデン、書き出しの出力の値は凍結した
+    /// ダイジェスト。フィクスチャは足すことがあるので畳まない）。
     #[test]
-    fn same_values_as_symphonia_on_fixtures_and_encoder_outputs() {
-        let mut t = Tally::default();
-        for (name, data) in fixtures().into_iter().chain(encoded()) {
-            compare(&data, &mut t, &name);
+    fn fixtures_and_encoder_outputs_are_read() {
+        let mut t = Frozen::default();
+        for (name, data) in fixtures() {
+            t.check(&data, &name);
         }
-        assert_eq!(t.neither + t.new_only + t.dropped, 0, "{t:?}");
+        let mut e = Frozen::default();
+        for (name, data) in encoded() {
+            e.check(&data, &name);
+        }
+        assert_eq!((t.0.err, e.0.err), (0, 0));
+        assert_eq!(e.0.digest(), FROZEN_ENCODED);
     }
 
+    /// 乱数で作った正しい FLAC（3,000 本。段 1〜9 は symphonia と同じ値を確かめていた）。
     #[test]
-    fn same_values_as_symphonia_on_random_valid_streams() {
+    fn random_valid_streams_keep_their_values() {
         let mut r = crate::determinism::rng(216);
-        let mut t = Tally::default();
+        let mut t = Frozen::default();
         for i in 0..3_000 {
             let data = random_stream(&mut r);
-            compare(&data, &mut t, &format!("乱数の FLAC {i}"));
+            t.check(&data, &format!("乱数の FLAC {i}"));
         }
-        // 正しい FLAC は（symphonia が LPC の i32 の足し算であふれる形などを除き）両方で読める
-        assert!(t.both > 2_500, "{t:?}");
-        assert_eq!(t.dropped, 0, "{t:?}");
+        assert!(t.0.ok > 2_500, "{} {}", t.0.ok, t.0.err);
+        assert_eq!(t.0.digest(), FROZEN_RANDOM);
     }
 
+    /// 壊した FLAC（段 1〜9 は symphonia が読めたものを同じ値で読むか厳しく断ることを確かめていた）。
     #[test]
-    fn same_values_as_symphonia_on_broken_files() {
+    fn broken_files_keep_their_outcomes() {
         let mut r = crate::determinism::rng(9_639);
-        let mut t = Tally::default();
+        let mut t = Frozen::default();
         let mut seeds: Vec<Vec<u8>> = (0..200).map(|_| random_stream(&mut r)).collect();
         seeds.extend(encoded().into_iter().map(|(_, d)| d));
-        seeds.extend(fixtures().into_iter().take(4).map(|(_, d)| d));
+        // フィクスチャの名前の順で頭の 4 つだった（凍結した結果が、あとで足すフィクスチャで変わらないように名前で選ぶ）
+        for name in [
+            "aac-lc-3ch.ffmpeg.flac",
+            "aac-lc-4ch.ffmpeg.flac",
+            "aac-lc-5ch-tones.ffmpeg.flac",
+            "aac-lc-6ch-afconvert.ffmpeg.flac",
+        ] {
+            let path = format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+            seeds.push(std::fs::read(path).unwrap());
+        }
         for (i, s) in seeds.iter().enumerate() {
             let rounds = if s.len() > 20_000 { 20 } else { 40 };
             for j in 0..rounds {
                 let m = mutate(&mut r, s);
-                compare(&m, &mut t, &format!("壊した FLAC {i}-{j}"));
+                t.check(&m, &format!("壊した FLAC {i}-{j}"));
             }
         }
-        assert!(t.both > 100 && t.neither > 1_000, "{t:?}");
+        assert!(t.0.ok > 100 && t.0.err > 1_000, "{} {}", t.0.ok, t.0.err);
+        assert_eq!(t.0.digest(), FROZEN_BROKEN);
     }
 
-    /// 速さの目安（release で `--ignored`）：5 分のステレオ 16 ビットを前の読み手と自作の読み手で読む（M16 段 1 の実測：
-    /// M4 Max で symphonia 0.175 秒、自作 0.19 秒。うち MD5 が 0.075 秒）。段 2 のあとの速さの見直し（ADR-218 (6)）で自作は
-    /// 0.12〜0.14 秒（MD5 込み。うち MD5 の圧縮が約 0.06 秒。同じ条件で、段 1 の版は 0.19〜0.21 秒、symphonia は 0.20 秒前後。
-    /// 計ったときは機械の負荷が高かった）。
-    #[test]
-    #[ignore]
-    // 計るだけの試験（値は時刻によらない）
-    #[allow(clippy::disallowed_methods)]
-    fn speed_against_symphonia() {
-        let frames = 44_100 * 300;
-        let planes = (0..2)
-            .map(|c| {
-                Arc::new(
-                    (0..frames)
-                        .map(|i| {
-                            let w = crate::math::sin(i as f64 * (0.01 + c as f64 * 0.003)) * 0.5
-                                + crate::math::sin(i as f64 * 0.37) * 0.1;
-                            ((w * 32_768.0).round() / 32_768.0) as f32
-                        })
-                        .collect::<Vec<f32>>(),
-                )
-            })
-            .collect();
-        let v = Value::Audio(Arc::new(
-            Audio::new(44_100, planes, AudioMeta::default()).unwrap(),
-        ));
-        let data = CodecSet::pinned()
-            .encode_bytes(&v, "flac", &json!({ "bits": 16 }), &NoMonitor)
-            .unwrap()
-            .0;
-        let mut best = [f64::MAX; 2];
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            let a = old_decode(&data).unwrap();
-            best[0] = best[0].min(t.elapsed().as_secs_f64());
-            // 前の道と同じく、値のダイジェスト（CodecSet が読み取りの記録に付ける）を含めずに計る
-            let t = std::time::Instant::now();
-            let b = crate::codec::flac::FlacCodec
-                .decode(
-                    &mut Cursor::new(&data[..]),
-                    "flac",
-                    &DecodeOptions::default(),
-                    &Limits::default(),
-                    &NoMonitor,
-                )
-                .unwrap();
-            best[1] = best[1].min(t.elapsed().as_secs_f64());
-            assert_eq!(a.digest().unwrap(), b.digest().unwrap());
-        }
-        println!(
-            "{} バイト：symphonia {:.3} 秒、自作 {:.3} 秒",
-            data.len(),
-            best[0],
-            best[1]
-        );
-    }
+    /// 凍結した結果（[`Frozen`]。M16 段 10 で、symphonia と照らし終えた段 9 の実装で作った）。
+    const FROZEN_ENCODED: &str = "af8581b3310ff5ae6166ea3ed86579341f78fdb6e220f96c762afbb5b44f8ba2";
+    const FROZEN_RANDOM: &str = "cee69b450f9ea0271dea4f9677b890cf8bb1acc9714fa134a9f78e55cf326c4b";
+    const FROZEN_BROKEN: &str = "c9081983edad8e7aa375e9ff3257a3656e24ca5ed6899549c8c38b9694bb46b2";
 
     /// STREAMINFO の総フレーム数と MD5 を 0 にする（「不明」にする）。
     fn unguard(data: &mut [u8]) {
@@ -2180,11 +2042,24 @@ mod tests {
         let (_, mut data) = encoded().into_iter().nth(1).unwrap();
         unguard(&mut data);
         let full = new_decode(&data).unwrap();
+        let planes = |v: &Value| {
+            let Value::Audio(a) = v else { panic!() };
+            (0..a.channels())
+                .map(|c| {
+                    let mut p = vec![0f32; a.frames()];
+                    a.read(c, 0, &mut p).unwrap();
+                    p
+                })
+                .collect::<Vec<_>>()
+        };
         for cut in [1usize, 7, 100, 2_000] {
             let d = &data[..data.len() - cut];
-            let (a, b) = (old_decode(d).unwrap(), new_decode(d).unwrap());
-            assert_eq!(a.digest().unwrap(), b.digest().unwrap(), "{cut}");
+            let b = new_decode(d).unwrap();
             assert!(frames_of(&b) < frames_of(&full), "{cut}");
+            // 途中で切れた最後のフレームを捨てて、前のフレームまでは同じ標本（symphonia と同じ。段 1〜9 は値を照らしていた）
+            let n = frames_of(&b);
+            let (got, all) = (planes(&b), planes(&full));
+            assert!(got.iter().zip(&all).all(|(g, f)| g[..] == f[..n]), "{cut}");
         }
         // 総フレーム数があれば、切れたファイルは読まない
         let (_, guarded) = encoded().into_iter().nth(1).unwrap();
@@ -2208,8 +2083,7 @@ mod tests {
         let mut padded = data[..first].to_vec();
         padded.extend_from_slice(&frame);
         padded.extend_from_slice(&data[second..]);
-        let (a, b) = (old_decode(&padded).unwrap(), new_decode(&padded).unwrap());
-        assert_eq!(a.digest().unwrap(), b.digest().unwrap());
+        let b = new_decode(&padded).unwrap();
         assert_eq!(
             b.digest().unwrap(),
             new_decode(&data).unwrap().digest().unwrap()
@@ -2321,17 +2195,11 @@ mod tests {
                 .unwrap()
             });
         }
-        // 左右が同じなら差は 0 の定数（33 ビット）。symphonia の release はこの形を正しく読めていた
+        // 左右が同じなら差は 0 の定数（33 ビット）。symphonia の release はこの形を正しく読めていた（段 1〜9 は値を照らした）
         let same: Vec<i64> = l.clone();
         let data = stereo32(8, &same, &[0; 16], true);
         let v = new_decode(&data).unwrap();
         assert_eq!(want(&v), vec![as_f32(&same), as_f32(&same)]);
-        if !cfg!(debug_assertions) {
-            assert_eq!(
-                old_decode(&data).unwrap().digest().unwrap(),
-                v.digest().unwrap()
-            );
-        }
     }
 
     // -------------------------------------------------------------------------------------------------------

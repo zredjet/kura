@@ -436,7 +436,8 @@ fn lossy_audio_matches_other_decoders() {
 /// 使う）は、lewton の読み取りと長さがちょうど同じで、値はチャンネルごとに 60 dB 以上の比で近い（無音のチャンネルは無音）。
 /// 参照は lewton の出力をそのままの並び（Vorbis の並び）で保存したので、kura の WAV の並びに直して比べる。チャンネルごとに
 /// 違う音にしてあるので、並びの誤りも見つかる。symphonia-codec-vorbis 0.6.1 の不具合（residue 0/1 を 2 チャンネル以上で使うと、
-/// 次のチャンネルの分類を上書きする。third_party/symphonia-codec-vorbis/KURA.md）の回帰の試験。
+/// 次のチャンネルの分類を上書きする。M16 段 10 で外した写し `third_party/symphonia-codec-vorbis/KURA.md`）の回帰の試験として
+/// 作り、今は自作の読み手の 3 チャンネル以上の試験。
 #[test]
 fn multichannel_vorbis_matches_lewton() {
     // Vorbis のチャンネル i は kura の planes[ORDER[n - 1][i]]（Vorbis I §4.3.9。codec::vorbis::ORDER と同じ表を、ここでは独立に書く）
@@ -636,8 +637,7 @@ fn aac_corpus_matches_ffmpeg() {
 }
 
 /// 扱わない変種（HE-AAC・PCE で配置を決める AAC・Ogg の中の Opus・MP2）は `Unsupported`（次の段のデコーダへ回る）。HE-AAC は、ASC の明示の印
-/// （`aac-he.m4a`）でも、帯域の中だけの印（ADTS の `aac-he.aac`、ADTS から写した m4a の `aac-he-implicit.m4a`）でも断る
-/// （tests/symphonia_copies.rs）。
+/// （`aac-he.m4a`）でも、帯域の中だけの印（ADTS の `aac-he.aac`、ADTS から写した m4a の `aac-he-implicit.m4a`）でも断る。
 #[test]
 fn unsupported_audio_variants_fall_through() {
     for (file, format) in [

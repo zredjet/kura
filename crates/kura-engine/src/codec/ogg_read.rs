@@ -1,4 +1,6 @@
-//! Ogg の読み口（RFC 3533。M16 段 2・ADR-217）：最初の Vorbis の論理ストリームのパケットを順に返す。
+//! Ogg の読み口（RFC 3533。M16 段 2・ADR-217）：最初の Vorbis の論理ストリームのパケットを順に返す（M16 段 10 から、
+//! Platform・External の段のタグを読むために、Vorbis・Opus・FLAC の最初の論理ストリームも選べる：[`OggReader::open_selecting`]・
+//! [`tags`]。下の説明の「Vorbis」は、そのときは選んだ論理ストリーム）。
 //!
 //! libogg（framing.c）の移植ではなく、正しいファイルで libogg と同じパケット・グラニュール・旗を返す自前の実装。違うのは
 //! 壊れたファイルの扱いだけ（libogg は飛ばして読み、ここは断る。ADR-217 (2)）。
@@ -21,8 +23,8 @@
 use std::collections::VecDeque;
 
 use crate::codec::byte_in::Input;
+use crate::codec::common::Media;
 use crate::codec::ogg::crc32;
-use crate::codec::symph::Media;
 use crate::error::EngineError;
 use crate::monitor::Monitor;
 
@@ -61,11 +63,22 @@ impl Page {
     fn continued(&self) -> bool {
         self.flags & 0x01 != 0
     }
-    /// BOS のページの最初のパケットが Vorbis の識別ヘッダか。
-    fn is_vorbis_bos(&self) -> bool {
-        self.bos() && self.body.get(..7) == Some(b"\x01vorbis".as_slice())
-    }
 }
+
+/// 選ぶ論理ストリーム（BOS のページの最初のパケットの頭で見分ける）。
+#[derive(Clone, Copy)]
+pub(crate) struct Select {
+    /// 識別のパケットの頭がこの論理ストリームのものか。
+    pub first: fn(&[u8]) -> bool,
+    /// 見つからないときの言葉（「Ogg の中身が … ではありません」）。
+    pub name: &'static str,
+}
+
+/// Vorbis の論理ストリーム（識別ヘッダ `\x01vorbis`）。
+pub(crate) const VORBIS: Select = Select {
+    first: |b| b.get(..7) == Some(b"\x01vorbis".as_slice()),
+    name: "Vorbis",
+};
 
 /// 次に来るもの。
 enum Next {
@@ -100,6 +113,17 @@ impl<'a> OggReader<'a> {
         mon: &'a dyn Monitor,
         codec: &'static str,
     ) -> Result<Self, EngineError> {
+        Self::open_selecting(media, mon, codec, VORBIS)
+    }
+
+    /// 開いて、最初の BOS の組から `select` の論理ストリームの最初のものを選ぶ（[`OggReader::open`] と同じ規則）。
+    pub fn open_selecting(
+        media: &'a mut Media<'_>,
+        mon: &'a dyn Monitor,
+        codec: &'static str,
+        select: Select,
+    ) -> Result<Self, EngineError> {
+        let not_it = format!("Ogg の中身が {} ではありません", select.name);
         let input = Input::new(media, mon, codec)?;
         let mut r = Self {
             input,
@@ -127,7 +151,7 @@ impl<'a> OggReader<'a> {
                 // BOS の組の終わり。選んだ論理ストリームのページなら並べる
                 r.past_bos_group = true;
                 let Some(first) = chosen.take() else {
-                    return Err(r.unsupported("Ogg の中身が Vorbis ではありません"));
+                    return Err(r.unsupported(&not_it));
                 };
                 r.start(first)?;
                 if page.serial == r.serial {
@@ -135,13 +159,13 @@ impl<'a> OggReader<'a> {
                 }
                 return Ok(r);
             }
-            if chosen.is_none() && page.is_vorbis_bos() {
+            if chosen.is_none() && page.bos() && (select.first)(&page.body) {
                 chosen = Some(page);
             }
         }
         // BOS のページだけで終わる（音声のパケットのない Vorbis など）
         let Some(first) = chosen else {
-            return Err(r.unsupported("Ogg の中身が Vorbis ではありません"));
+            return Err(r.unsupported(&not_it));
         };
         r.start(first)?;
         r.past_bos_group = true;
@@ -323,6 +347,85 @@ impl<'a> OggReader<'a> {
             }
         }
     }
+}
+
+/// Vorbis・Opus・FLAC の論理ストリーム（タグを読むもの）。
+const TAGGED: Select = Select {
+    first: |b| {
+        b.get(..7) == Some(b"\x01vorbis".as_slice())
+            || b.get(..8) == Some(b"OpusHead".as_slice())
+            || b.get(..5) == Some(b"\x7fFLAC".as_slice())
+    },
+    name: "Vorbis・Opus・FLAC",
+};
+
+/// Ogg の FLAC の頭のパケットの数の上限（識別のパケットの数を書かない（0）ファイルで、メタデータの箱を探すのをやめる数）。
+const FLAC_HEADER_PACKETS: usize = 1_024;
+
+/// 最初の BOS の組の Vorbis・Opus・FLAC の論理ストリームの最初のもののタグ（キー, 値。出た順）を読む（M16 段 10。Platform・
+/// External の段が読んだ ogg・opus のタグ。`platform::audio`）。コメントは Vorbis は 2 つ目のパケット（`\x03vorbis`）、Opus は
+/// 2 つ目のパケット（`OpusTags`）、FLAC は頭のパケットの VORBIS_COMMENT の箱。名前の扱いは FLAC と同じ（`flac_read::comment_tag`）。
+/// コメントがなければ空。中身の音声のパケットは読まない（後ろの連結・壊れたページは見ない）。タグにするコメントは `max` 個
+/// まで（それより後ろは読まない。小さなコメントを数百万並べたパケットで、タグの列が大きくなりすぎないように）。
+pub(crate) fn tags(
+    media: &mut Media<'_>,
+    mon: &dyn Monitor,
+    codec: &'static str,
+    max: usize,
+) -> Result<Vec<(String, String)>, EngineError> {
+    let mut r = OggReader::open_selecting(media, mon, codec, TAGGED)?;
+    let Some(first) = r.next_packet()? else {
+        return Ok(Vec::new());
+    };
+    let mut tags = Vec::new();
+    let comment_at = |p: &OggPacket, head: &[u8]| -> Option<usize> {
+        p.data.starts_with(head).then_some(head.len())
+    };
+    if first.data.starts_with(b"\x7fFLAC") {
+        // 識別のパケット（0x7F FLAC・版・頭のパケットの数・fLaC・STREAMINFO）のあとの頭のパケットが、メタデータの箱 1 つずつ
+        let count = first
+            .data
+            .get(7..9)
+            .map_or(0, |b| usize::from(u16::from_be_bytes([b[0], b[1]])));
+        let limit = if count == 0 {
+            FLAC_HEADER_PACKETS
+        } else {
+            count
+        };
+        for _ in 0..limit {
+            let Some(p) = r.next_packet()? else {
+                break;
+            };
+            let Some(&head) = p.data.first() else {
+                break;
+            };
+            // 0xFF は音声のフレーム（頭のパケットの終わり）
+            if head == 0xff {
+                break;
+            }
+            if head & 0x7f == 4 {
+                let body = p.data.get(4..).unwrap_or(&[]);
+                crate::codec::flac_read::parse_comments_up_to(body, &mut tags, max)?;
+                break;
+            }
+            if head & 0x80 != 0 {
+                break;
+            }
+        }
+        return Ok(tags);
+    }
+    let Some(second) = r.next_packet()? else {
+        return Ok(tags);
+    };
+    let at = if first.data.starts_with(b"OpusHead") {
+        comment_at(&second, b"OpusTags")
+    } else {
+        comment_at(&second, b"\x03vorbis")
+    };
+    if let Some(at) = at {
+        crate::codec::flac_read::parse_comments_up_to(&second.data[at..], &mut tags, max)?;
+    }
+    Ok(tags)
 }
 
 #[cfg(test)]

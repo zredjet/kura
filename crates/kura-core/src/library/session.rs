@@ -274,7 +274,8 @@ impl LibrarySession {
                     sync_analysis(&lib, &jobs2);
                     // 置き換えた版の片付け（7 日とバックアップの条件を満たす候補・孤立した部品があるときだけ）
                     queue_gc(&lib, &jobs2, &clock);
-                    // 退役する読み手の記録をアンカーへ移す（移し終えた印と退役の識別子の一覧が違うときだけ。M16 段 5）
+                    // 退役する読み手の記録をアンカーへ移す（固定の組に退役する読み手があり、移し終えた印と一覧が違うときだけ。
+                    // M16 段 5。段 10 のあとは退役する読み手がないので積まない）
                     let retiring = kura_engine::codec::CodecSet::pinned().retiring_ids();
                     if let Err(err) =
                         crate::edit::retire::queue_on_open(lib.db(), &jobs2, &retiring)
@@ -610,9 +611,11 @@ mod tests {
         assert_eq!(gc_jobs(&session), 1);
     }
 
-    /// 開いたとき（M16 段 5）：退役する読み手の移し替えは、退役の識別子の一覧が移し終えた印と違うときだけ積む（版の入力が
-    /// なければ印だけ置く）。固定の段のデコーダの指紋が前と違えば解析のジョブを積む（最初は置くだけ）。同じなら、開き直しても
-    /// どちらも積まない。
+    /// 開いたとき（M16 段 5・10）：退役する読み手の移し替えは、固定の組に退役する読み手があり、その一覧が移し終えた印と違う
+    /// ときだけ積む（`edit::retire::queue_on_open`。積み方は retire_tests が確かめる）。段 10 で symphonia の Vorbis・AAC を
+    /// 外したので、今の固定の組には退役する読み手がなく、外した識別子の記録の入力があっても積まない（読み手がないので移せない。
+    /// アンカーのないものは作り直すと `DecoderGone`）。固定の段のデコーダの指紋が前と違えば解析のジョブを積む（最初は置くだけ）。
+    /// 同じなら、開き直しても積まない。
     #[test]
     fn retire_and_pinned_decoders_are_checked_on_open() {
         use crate::analysis::plan::{DECODERS_KEY, PINNED_KEY};
@@ -638,37 +641,43 @@ mod tests {
         let engine = || {
             Services::new(Arc::new(FakeBackend)).with_engine(Arc::new(FakeEngineFactory::default()))
         };
-        let retiring: Vec<String> = kura_engine::codec::CodecSet::pinned()
-            .retiring_ids()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(retiring.len(), 3);
+        assert!(
+            kura_engine::codec::CodecSet::pinned()
+                .retiring_ids()
+                .is_empty()
+        );
         let open = || {
             let session = LibrarySession::open(&path, sink(), engine()).unwrap();
             session.wait_ready();
             assert!(session.jobs().wait_idle(Duration::from_secs(30)));
             session
         };
+        let mark = |session: &LibrarySession| -> Option<Vec<String>> {
+            session
+                .library()
+                .db()
+                .read(|c| settings::get(c, DONE_KEY))
+                .unwrap()
+        };
         {
             let session = LibrarySession::create(&path, sink(), engine()).unwrap();
             session.wait_ready();
             assert!(session.jobs().wait_idle(Duration::from_secs(30)));
-            assert_eq!(jobs_of(&session, "retire"), 0, "版の入力がなければ積まない");
+            assert_eq!(jobs_of(&session, "retire"), 0);
             assert_eq!(jobs_of(&session, "analyze"), 0, "指紋は置くだけ");
-            let (done, pinned): (Option<Vec<String>>, Option<DecoderFingerprint>) = session
+            assert_eq!(mark(&session), None, "退役する読み手がなければ印も置かない");
+            let pinned: Option<DecoderFingerprint> = session
                 .library()
                 .db()
-                .read(|c| Ok((settings::get(c, DONE_KEY)?, settings::get(c, PINNED_KEY)?)))
+                .read(|c| settings::get(c, PINNED_KEY))
                 .unwrap();
-            assert_eq!(done.as_ref(), Some(&retiring));
             assert_eq!(
                 pinned,
                 Some(DecoderFingerprint::of(
                     &kura_engine::codec::CodecSet::pinned()
                 ))
             );
-            // 旧版の読み手の記録の入力（記録は読めない形にして、移せないものとして数えさせる）と、前の版のアプリの印・指紋
+            // 外した読み手の記録の入力（段 5 のジョブを回す前のライブラリ）と、前の版のアプリの印・指紋
             let mut older = DecoderFingerprint::of(&kura_engine::codec::CodecSet::pinned());
             older
                 .0
@@ -687,7 +696,11 @@ mod tests {
                     )?;
                     // 解析を待つものはない（解析のジョブを積むのは指紋が変わったときだけ）
                     tx.execute("UPDATE items SET analysis_state = 'ready'", [])?;
-                    settings::remove(tx, DONE_KEY)?;
+                    settings::set(
+                        tx,
+                        DONE_KEY,
+                        &vec!["ogg-vorbis-symphonia-dec/3".to_string()],
+                    )?;
                     settings::set(tx, PINNED_KEY, &older)?;
                     settings::set(tx, DECODERS_KEY, &older)?;
                     Ok(())
@@ -695,27 +708,20 @@ mod tests {
                 .unwrap();
         }
         let session = open();
-        assert_eq!(jobs_of(&session, "retire"), 1);
-        assert_eq!(jobs_of(&session, "analyze"), 1, "固定の段の指紋が変わった");
-        let record = session
-            .jobs()
-            .list(&crate::jobs::JobFilter {
-                kinds: vec![JobKind::Retire],
-                ..Default::default()
-            })
-            .unwrap()
-            .remove(0);
-        assert_eq!(record.state, crate::jobs::JobState::Done);
-        let result: serde_json::Value =
-            serde_json::from_str(record.result_json.as_deref().unwrap()).unwrap();
         assert_eq!(
-            result["left"],
-            serde_json::json!({ "badRecord": 1 }),
-            "{result}"
+            jobs_of(&session, "retire"),
+            0,
+            "退役する読み手がないので積まない"
+        );
+        assert_eq!(jobs_of(&session, "analyze"), 1, "固定の段の指紋が変わった");
+        assert_eq!(
+            mark(&session),
+            Some(vec!["ogg-vorbis-symphonia-dec/3".to_string()]),
+            "前の印はそのまま"
         );
         drop(session);
         let session = open();
-        assert_eq!(jobs_of(&session, "retire"), 1, "印が同じなら積まない");
+        assert_eq!(jobs_of(&session, "retire"), 0);
         assert_eq!(jobs_of(&session, "analyze"), 1, "指紋が同じなら積まない");
     }
 

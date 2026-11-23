@@ -45,11 +45,9 @@ pub(crate) fn unsupported(message: &str) -> EngineError {
 
 #[cfg(test)]
 mod tests {
-    use symphonia_core::audio::{Audio as _, GenericAudioBufferRef};
-    use symphonia_core::codecs::audio::AudioDecoder as _;
-
     use super::*;
-    use crate::codec::symph::{self, Container};
+    use crate::codec::common::Media;
+    use crate::codec::mp4_read;
     use crate::limits::Limits;
     use crate::monitor::NoMonitor;
 
@@ -57,69 +55,35 @@ mod tests {
         std::fs::read(format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
-    /// symphonia の読み口でパケットを取り出し、自作のデコーダと symphonia の AAC のデコーダの標本を照らす（信号 / 誤差）。
-    fn snr_against_symphonia(name: &str, c: Container, lcg: bool) -> f64 {
+    /// 自作の読み口（m4a は `mp4_read`、ほかは ADTS）でパケットを取り出し、自作のデコーダ（雑音の源は `noise`。None なら
+    /// 既定の ChaCha8）で読んだ面（priming も切らない）。
+    fn raw(name: &str, noise: Option<decoder::Noise>) -> Vec<Vec<f32>> {
         let data = fixture(name);
-        let limits = Limits::default();
-        let mut o = symph::open("t", &data, c, &NoMonitor, &limits).unwrap();
-        let cfg = match o.params.extra_data.as_deref() {
-            Some(asc) => config::parse_asc(asc).unwrap(),
-            None => {
-                // ADTS：最初の頭から
-                let b = &data;
-                let profile = u32::from(b[2] >> 6);
-                let index = u32::from((b[2] >> 2) & 0xf);
-                let layout = (u32::from(b[2] & 1) << 2) | u32::from(b[3] >> 6);
-                config::from_adts(profile, index, layout).unwrap()
+        let mut media = Media::Bytes(&data);
+        let mut packets: Vec<Vec<u8>> = Vec::new();
+        let cfg = if name.ends_with(".m4a") {
+            let mut t =
+                mp4_read::open(&mut media, &NoMonitor, M4A_ID, mp4_read::Want::Aac).unwrap();
+            let cfg = config::parse_asc(&t.cookie).unwrap();
+            while let Some(s) = t.next_sample().unwrap() {
+                packets.push(t.read_sample(&s).unwrap().to_vec());
             }
-        };
-        let mut ours = decoder::AacDecoder::new(cfg).unwrap();
-        if lcg {
-            // symphonia と同じ種（ffmpeg と同じ）
-            ours.noise = decoder::Noise::Lcg(0x1f2e_3d4c);
-        }
-        let mut theirs =
-            symphonia_codec_aac::AacDecoder::try_new(&o.params, &symph::decoder_options()).unwrap();
-        let (mut sig, mut err) = (0f64, 0f64);
-        while let Some(pkt) = o.reader.next_packet().unwrap() {
-            let n = ours.decode(&pkt.data).unwrap();
-            let buf = theirs.decode(&pkt).unwrap();
-            let GenericAudioBufferRef::F32(b) = &buf else {
-                panic!()
-            };
-            assert_eq!(n, b.frames(), "{name}");
-            for ch in 0..cfg.channels {
-                let t = b.plane(ch).unwrap();
-                for (a, x) in ours.planes[ch][..n].iter().zip(t) {
-                    sig += f64::from(*x) * f64::from(*x);
-                    err += f64::from(a - x) * f64::from(a - x);
-                }
+            cfg
+        } else {
+            let mut a = adts::open(&mut media, &NoMonitor).unwrap();
+            let cfg = a.cfg;
+            while let Some(p) = a.next().unwrap() {
+                packets.push(p.to_vec());
             }
-        }
-        10.0 * crate::math::log10(sig / crate::math::max(err, 1e-300))
-    }
-
-    /// symphonia の読み口でパケットを取り出し、自作のデコーダ（雑音の源は `noise`。None なら既定の ChaCha8）で読んだ面。
-    fn raw(name: &str, c: Container, noise: Option<decoder::Noise>) -> Vec<Vec<f32>> {
-        let data = fixture(name);
-        let mut o = symph::open("t", &data, c, &NoMonitor, &Limits::default()).unwrap();
-        let cfg = match o.params.extra_data.as_deref() {
-            Some(asc) => config::parse_asc(asc).unwrap(),
-            None => {
-                let b = &data;
-                let profile = u32::from(b[2] >> 6);
-                let index = u32::from((b[2] >> 2) & 0xf);
-                let layout = (u32::from(b[2] & 1) << 2) | u32::from(b[3] >> 6);
-                config::from_adts(profile, index, layout).unwrap()
-            }
+            cfg
         };
         let mut d = decoder::AacDecoder::new(cfg).unwrap();
         if let Some(n) = noise {
             d.noise = n;
         }
         let mut planes = vec![Vec::new(); cfg.channels];
-        while let Some(pkt) = o.reader.next_packet().unwrap() {
-            let n = d.decode(&pkt.data).unwrap();
+        for pkt in &packets {
+            let n = d.decode(pkt).unwrap();
             for (p, src) in planes.iter_mut().zip(&d.planes) {
                 p.extend_from_slice(&src[..n]);
             }
@@ -129,14 +93,8 @@ mod tests {
 
     /// 自作のデコーダ（雑音の源 `noise`）の標本を、ffmpeg の読み取りの参照（16 ビットの FLAC）と照らす（信号 / 誤差）。
     /// 頭の `skip` フレーム（priming）を飛ばし、参照の長さだけ比べる。参照が 16 ビットの端に張り付いた標本は比べない。
-    fn snr_against_ffmpeg(
-        name: &str,
-        c: Container,
-        noise: decoder::Noise,
-        reference: &str,
-        skip: usize,
-    ) -> f64 {
-        let planes = raw(name, c, Some(noise));
+    fn snr_against_ffmpeg(name: &str, noise: decoder::Noise, reference: &str, skip: usize) -> f64 {
+        let planes = raw(name, Some(noise));
         let (v, _) = crate::codec::CodecSet::pinned()
             .decode(
                 &mut std::io::Cursor::new(fixture(reference)),
@@ -170,25 +128,14 @@ mod tests {
     /// PNS の帯の雑音の大きさ・帯の並び・窓の扱いの確かめ）。ChaCha8 の雑音では、PNS の帯の分だけ離れる。
     #[test]
     fn pns_matches_ffmpeg_with_its_noise() {
-        for (name, c, reference, skip) in [
-            (
-                "aac-lc-ffmpeg.m4a",
-                Container::Mp4,
-                "aac-lc-ffmpeg.ffmpeg.flac",
-                1_024,
-            ),
-            ("aac-lc.aac", Container::Adts, "aac-lc.ffmpeg.flac", 0),
+        for (name, reference, skip) in [
+            ("aac-lc-ffmpeg.m4a", "aac-lc-ffmpeg.ffmpeg.flac", 1_024),
+            ("aac-lc.aac", "aac-lc.ffmpeg.flac", 0),
         ] {
-            let same = snr_against_ffmpeg(
-                name,
-                c,
-                decoder::Noise::Ffmpeg(0x1f2e_3d4c),
-                reference,
-                skip,
-            );
+            let same =
+                snr_against_ffmpeg(name, decoder::Noise::Ffmpeg(0x1f2e_3d4c), reference, skip);
             let chacha = snr_against_ffmpeg(
                 name,
-                c,
                 decoder::Noise::ChaCha(crate::determinism::rng(0)),
                 reference,
                 skip,
@@ -251,12 +198,9 @@ mod tests {
     /// 切り方を変えると 1.4 dB ほどまで揺れるので、許す差は 3 dB）。
     #[test]
     fn chacha_noise_keeps_the_band_energies() {
-        for (name, c) in [
-            ("aac-lc-ffmpeg.m4a", Container::Mp4),
-            ("aac-lc.aac", Container::Adts),
-        ] {
-            let ours = raw(name, c, None);
-            let theirs = raw(name, c, Some(decoder::Noise::Ffmpeg(0x1f2e_3d4c)));
+        for name in ["aac-lc-ffmpeg.m4a", "aac-lc.aac"] {
+            let ours = raw(name, None);
+            let theirs = raw(name, Some(decoder::Noise::Ffmpeg(0x1f2e_3d4c)));
             assert_ne!(ours, theirs, "{name}：PNS の帯がない");
             let mut worst = 0f64;
             for (a, b) in ours.iter().zip(&theirs) {
@@ -278,7 +222,7 @@ mod tests {
 
     /// 壊したファイル（乱数で数バイトを変える・切る。m4a と ADTS のフィクスチャ）を自作の読み手で読んでも panic せず、必ず
     /// 終わり、誤りは壊れたファイル・扱わない形・上限のどれか（`Internal` にしない）。形を答えたら値はその形に収まり、
-    /// ダイジェストを取れる。旧版（symphonia）と両方で読めたら長さとレートとチャンネルの数が同じ。
+    /// ダイジェストを取れる。
     #[test]
     fn broken_files_are_refused_or_read() {
         use crate::codec::Decoder as _;
@@ -301,7 +245,7 @@ mod tests {
         .collect();
         let limits = Limits::default();
         let opts = crate::doc::DecodeOptions::default();
-        let (mut read, mut refused, mut same_as_old) = (0, 0, 0);
+        let (mut read, mut refused) = (0, 0);
         for round in 0..1_200 {
             let (format, seed) = &seeds[(rng.next_u32() as usize) % seeds.len()];
             let mut b = seed.clone();
@@ -319,16 +263,10 @@ mod tests {
                 let cut = (rng.next_u32() as usize) % b.len();
                 b.truncate(cut);
             }
-            let (ours, old) = if *format == "m4a" {
-                (
-                    read::AacCodec::m4a(),
-                    crate::codec::lossy::SymphoniaDecoder::m4a_aac(),
-                )
+            let ours = if *format == "m4a" {
+                read::AacCodec::m4a()
             } else {
-                (
-                    read::AacCodec::adts(),
-                    crate::codec::lossy::SymphoniaDecoder::adts_aac(),
-                )
+                read::AacCodec::adts()
             };
             let ok_err = |e: &EngineError| {
                 matches!(
@@ -352,19 +290,7 @@ mod tests {
                     assert!(s.admits(&v.shape()), "回 {round}：{s:?} と {:?}", v.shape());
                     v.digest().unwrap();
                     read += 1;
-                    let Value::Audio(a) = &v else {
-                        panic!("回 {round}")
-                    };
-                    if let Ok(Value::Audio(o)) =
-                        old.decode(&mut Cursor::new(&b), format, &opts, &limits, &NoMonitor)
-                    {
-                        assert_eq!(
-                            (a.rate(), a.channels(), a.frames()),
-                            (o.rate(), o.channels(), o.frames()),
-                            "回 {round}：旧版と形が違う"
-                        );
-                        same_as_old += 1;
-                    }
+                    assert!(matches!(v, Value::Audio(_)), "回 {round}");
                 }
                 Err(e) => {
                     assert!(ok_err(&e), "回 {round}：{e:?}");
@@ -372,58 +298,7 @@ mod tests {
                 }
             }
         }
-        eprintln!("読めた {read}（旧版とも同じ形 {same_as_old}）・断った {refused}");
+        eprintln!("読めた {read}・断った {refused}");
         assert!(read > 100 && refused > 100, "{read} {refused}");
-    }
-
-    /// 速さの目安（release で `--ignored`）：`aac-lc.aac`（ffmpeg の 1.04 秒のステレオ 128 kbps の ADTS。PNS あり）を 290 回
-    /// つないだ 5 分の ADTS を、前の symphonia の読み手と自作の読み手で読む（値のダイジェストは含めない）。M16 段 4 の実測
-    /// （M4 Max）：symphonia 0.118 秒、自作 0.100 秒。
-    #[test]
-    #[ignore]
-    // 計るだけの試験（値は時刻によらない）
-    #[allow(clippy::disallowed_methods)]
-    fn speed_against_symphonia() {
-        use crate::codec::Decoder as _;
-        use std::io::Cursor;
-        let one = fixture("aac-lc.aac");
-        let data = one.repeat(290);
-        let (limits, opts) = (Limits::default(), crate::doc::DecodeOptions::default());
-        let ours = read::AacCodec::adts();
-        let old = crate::codec::lossy::SymphoniaDecoder::adts_aac();
-        let mut best = [f64::MAX; 2];
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            let a = old
-                .decode(&mut Cursor::new(&data), "aac", &opts, &limits, &NoMonitor)
-                .unwrap();
-            best[0] = crate::math::min(best[0], t.elapsed().as_secs_f64());
-            let t = std::time::Instant::now();
-            let b = ours
-                .decode(&mut Cursor::new(&data), "aac", &opts, &limits, &NoMonitor)
-                .unwrap();
-            best[1] = crate::math::min(best[1], t.elapsed().as_secs_f64());
-            assert_eq!(a.shape(), b.shape());
-        }
-        println!(
-            "{} バイト：symphonia {:.3} 秒、自作 {:.3} 秒",
-            data.len(),
-            best[0],
-            best[1]
-        );
-    }
-
-    #[test]
-    fn close_to_symphonia_on_fixtures() {
-        for (name, c) in [
-            ("aac-lc-afconvert.m4a", Container::Mp4),
-            ("aac-lc-ffmpeg.m4a", Container::Mp4),
-            ("aac-lc.aac", Container::Adts),
-        ] {
-            let snr = snr_against_symphonia(name, c, true);
-            let chacha = snr_against_symphonia(name, c, false);
-            eprintln!("{name}: {snr:.1} dB（ChaCha8 の雑音では {chacha:.1} dB）");
-            assert!(snr > 100.0, "{name}: {snr:.1} dB");
-        }
     }
 }

@@ -9,7 +9,7 @@
 //! （symphonia は最初の形のまま読み進めた。ADR-221 (6)）。
 
 use crate::codec::byte_in::Input;
-use crate::codec::symph::Media;
+use crate::codec::common::Media;
 use crate::error::EngineError;
 use crate::monitor::Monitor;
 

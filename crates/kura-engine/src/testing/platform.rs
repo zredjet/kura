@@ -11,13 +11,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::codec::common::read_all;
 use crate::codec::formats::{NONE, format_by_id};
 use crate::codec::platform::aac::boxes;
 use crate::codec::platform::{
     AacBackend, AacHandle, AacSettings, AudioBackend, AudioHandle, AudioInfo, BackendError,
     DecodedFrame, ImageBackend, ImageHandle, ImageInfo, PlatformAlpha, Priming,
 };
-use crate::codec::symph::read_all;
 use crate::codec::{CodecEnv, Decoder, Encoder, MetaCaps, ReadSeek, Tier};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;

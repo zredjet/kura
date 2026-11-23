@@ -3,7 +3,7 @@
 //! - 読む（`flac-symphonia-dec/1`。M16 段 1 で symphonia から自作の `flac_read` に替えた。値は同じなので識別子はそのまま。
 //!   ADR-216）：STREAMINFO の MD5 を照らし、合わなければ壊れたファイル。標本は 32 ビットに左詰めした整数を
 //!   `pcm::int_to_f32(v, 32)`（WAV・AIFF と同じ値）。元の形式のビット数は入れ物の幅（8・16・24・32）。Vorbis コメントの
-//!   タグ・LOOPSTART・LOOPLENGTH を読む（`symph::meta_from_tags`）。
+//!   タグ・LOOPSTART・LOOPLENGTH を読む（`common::meta_from_tags`）。
 //! - 書く（`flac-kura-enc/1`。ADR-148）：8・16・24 ビットの整数（`pcm::quantize`）、1〜8 チャンネル、レートは 1〜655,350 Hz。
 //!   ブロックは 4,096 フレームの固定（最後だけ短い。STREAMINFO の最小・最大のブロックは 4,096）。サブフレームは定数・生・固定の予測子 0〜4 から最小のビット数のものを
 //!   選び（下位の 0 のビット（wasted bits）も使う）、残差は分割ライス（分割の次数 0〜8。パラメタは平均から見積もって
@@ -19,11 +19,11 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::audio::stream::{AudioProducer, ValueProducer};
+use crate::codec::common::{self, Media};
 use crate::codec::flac_read::{self, DEC_ID};
 use crate::codec::held::{self, Held};
 use crate::codec::md5::Md5;
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
-use crate::codec::symph::{self, Media};
 use crate::codec::{Decoder, Encoder, MetaCaps, ReadSeek, Tier, WriteSeek, caps_of, pcm};
 use crate::determinism::{block_count, par_blocks};
 use crate::doc::DecodeOptions;
@@ -90,7 +90,7 @@ impl Decoder for FlacCodec {
         _opts: &DecodeOptions,
         limits: &Limits,
     ) -> Result<Shape, EngineError> {
-        let data = symph::read_all(src, limits)?;
+        let data = common::read_all(src, limits)?;
         let p = probe(&mut Media::Bytes(&data), limits, &NoMonitor)?;
         Ok(shape_of(&p))
     }
@@ -127,7 +127,7 @@ impl Decoder for FlacCodec {
         limits: &Limits,
         mon: &dyn Monitor,
     ) -> Result<Value, EngineError> {
-        let data = symph::read_all(src, limits)?;
+        let data = common::read_all(src, limits)?;
         stream::collect(mon, |out| {
             decode_media(&mut Media::Bytes(&data), limits, out, mon)
         })
@@ -210,7 +210,7 @@ fn decode_media(
     if out.frames() != p.frames {
         return Err(dec_err("長さがヘッダと合いません"));
     }
-    let mut meta = symph::meta_from_tags(&r.tags, p.frames, true, limits);
+    let mut meta = common::meta_from_tags(&r.tags, p.frames, true, limits);
     meta.source = Some(AudioSource {
         bits: pcm::container_bits(p.bits.unwrap_or(16).clamp(1, 32) as u16),
         float: false,
@@ -794,7 +794,7 @@ impl Encoder for FlacCodec {
                 "長すぎて FLAC に書けません".into(),
             ));
         }
-        let comments = symph::vorbis_comments_for(&info.meta, total64);
+        let comments = common::vorbis_comments_for(&info.meta, total64);
         let streaminfo = |min_fs: u32, max_fs: u32, md5: &[u8]| {
             let mut si = Bits::new();
             // 最小・最大のブロックは決まった大きさ（最後の短いブロックは数えない。libFLAC と同じ）

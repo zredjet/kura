@@ -36,7 +36,7 @@
 //!   パケットの中の終わり（floor・residue の途中で切れる）は C と同じく残りを 0 にする（仕様の「終わりの扱い」）。
 //! - チャンネルの並び：Vorbis のチャンネル `i` を kura の `ORDER[n − 1][i]` 番目に置く（書き出しの逆。前の symphonia と同じ）。
 //!   9 チャンネル以上は `Unsupported`（前の symphonia と同じく次の段へ）。
-//! - NaN は `0x7fc00000` にそろえる（`symph::canonical_nan`。壊れた入力で出る NaN のビットを環境によらずそろえる）。
+//! - NaN は `0x7fc00000` にそろえる（`common::canonical_nan`。壊れた入力で出る NaN のビットを環境によらずそろえる）。
 //! - タグは段 1 の FLAC と同じ規則（`flac_read::comment_tag`）。元の形式は 16 ビットの整数とみなす（前と同じ）。
 //! - 形（長さ）は、値を作らずにパケットの頭だけを読んで `blockin` の位置の計算を回して数える（[`synth`] の冒頭）。
 //!
@@ -55,11 +55,11 @@ pub(crate) mod synth;
 use std::io::BufReader;
 use std::path::Path;
 
+use crate::codec::common::{self, Media, read_all};
 use crate::codec::flac_read::comment_tag;
 use crate::codec::held::{self, Held};
 use crate::codec::ogg_read::OggReader;
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
-use crate::codec::symph::{self, Media, read_all};
 use crate::codec::vorbis::ORDER;
 use crate::codec::{Decoder, ReadSeek, Tier};
 use crate::doc::DecodeOptions;
@@ -237,7 +237,11 @@ impl VorbisReader<'_> {
                 plane
                     .try_reserve(n)
                     .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-                plane.extend(dsp.pcm_slice(i, n).iter().map(|s| symph::canonical_nan(*s)));
+                plane.extend(
+                    dsp.pcm_slice(i, n)
+                        .iter()
+                        .map(|s| common::canonical_nan(*s)),
+                );
             }
             let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
             out.push_frames(&views)
@@ -292,7 +296,7 @@ fn decode_media(
     if out.frames() != p.frames {
         return Err(bad_header("長さが数えた長さと合いません"));
     }
-    let mut meta = symph::meta_from_tags(&r.tags, p.frames, true, limits);
+    let mut meta = common::meta_from_tags(&r.tags, p.frames, true, limits);
     meta.source = Some(AudioSource {
         bits: 16,
         float: false,
@@ -391,7 +395,7 @@ impl Decoder for VorbisDecoder {
         _format: &str,
         limits: &Limits,
     ) -> Result<Held, EngineError> {
-        let mut h = held::ogg(src, limits, held::VorbisTables::Kura)?;
+        let mut h = held::ogg(src, limits)?;
         h.decode = h.decode.saturating_sub(VORBIS_TABLES);
         Ok(h)
     }
@@ -425,21 +429,7 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::codec::lossy::SymphoniaDecoder;
     use crate::value::Value;
-
-    fn planes(v: &Value) -> Vec<Vec<f32>> {
-        let Value::Audio(a) = v else {
-            panic!("音声でない")
-        };
-        (0..a.channels())
-            .map(|c| {
-                let mut p = vec![0f32; a.frames()];
-                a.read(c, 0, &mut p).unwrap();
-                p
-            })
-            .collect()
-    }
 
     fn decode_with(d: &dyn Decoder, data: &[u8]) -> Result<Value, EngineError> {
         d.decode(
@@ -683,103 +673,19 @@ mod tests {
         assert!(n > 150, "{n}");
     }
 
-    /// 前の symphonia の読み取り（/3）とほぼ同じ値（演算の順が違うので少しずれる）・同じ長さ・同じタグ。
+    /// 上限の試験のために作った細工のフィクスチャ：floor 0 が値のない codebook を使うので、libvorbis（floor0.c:85）と同じく
+    /// 断る（段 2〜9 は、ほかのフィクスチャを前の symphonia の読み取り（/3）とも照らしていた：差の最大 1e-4 未満・同じ長さ・
+    /// 同じタグ。値の正は照合用の C とのビット一致）。
     #[test]
-    fn close_to_symphonia_on_fixtures() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures");
-        let mut n = 0;
-        let mut names: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .collect();
-        names.sort();
-        for p in names {
-            if p.extension().is_none_or(|x| x != "ogg") {
-                continue;
-            }
-            let data = std::fs::read(&p).unwrap();
-            // 上限の試験のために作った細工のファイル：floor 0 が値のない codebook を使うので、libvorbis（floor0.c:85）と同じく断る
-            if p.ends_with("ogg-vorbis-granule-trim.ogg") {
-                assert!(matches!(
-                    decode_with(&VorbisDecoder, &data),
-                    Err(EngineError::Decode { .. })
-                ));
-                continue;
-            }
-            let old = decode_with(&SymphoniaDecoder::ogg_vorbis(), &data);
-            let new = decode_with(&VorbisDecoder, &data);
-            match (old, new) {
-                (Ok(a), Ok(b)) => {
-                    let (pa, pb) = (planes(&a), planes(&b));
-                    assert_eq!(pa.len(), pb.len(), "{}", p.display());
-                    assert_eq!(pa[0].len(), pb[0].len(), "{}：長さ", p.display());
-                    let mut max = 0f32;
-                    for (x, y) in pa.iter().zip(&pb) {
-                        for (u, v) in x.iter().zip(y) {
-                            max = crate::math::max32(max, (u - v).abs());
-                        }
-                    }
-                    assert!(max < 1e-4, "{}：差の最大 {max}", p.display());
-                    let (Value::Audio(a), Value::Audio(b)) = (&a, &b) else {
-                        unreachable!()
-                    };
-                    assert_eq!(a.meta.tags, b.meta.tags, "{}", p.display());
-                    assert_eq!(a.meta.loop_range, b.meta.loop_range, "{}", p.display());
-                    n += 1;
-                }
-                (Err(EngineError::Unsupported(_)), Err(EngineError::Unsupported(_))) => {}
-                (a, b) => panic!("{}：{:?} / {:?}", p.display(), a.err(), b.err()),
-            }
-        }
-        assert!(n >= 3, "{n}");
-    }
-    /// 速さの目安（release で `--ignored`）：5 分のステレオ（自作の書き出しの品質 5。6.5 MB）を前の symphonia の読み手と自作の
-    /// 読み手で読む（値のダイジェストは含めない）。M16 段 2 の実測（M4 Max）：symphonia 0.176 秒、自作 0.270 秒（うち長さを
-    /// 数える道 0.004 秒）。同じ旗（-O2・FMA なし・-fwrapv）で組んだ C の libvorbis（出力を書かない `oracle_dec`）は 0.32 秒。
-    /// 段 2 のあとの速さの見直し（ADR-218 (6)）で自作は 0.16〜0.17 秒（同じ条件で、段 2 の終わりの版は 0.27 秒、symphonia は
-    /// 0.18 秒前後。計ったときは機械の負荷が高く、数字は 1 割ほど揺れた）。
-    #[test]
-    #[ignore]
-    // 計るだけの試験（値は時刻によらない）
-    #[allow(clippy::disallowed_methods)]
-    fn speed_against_symphonia() {
-        use crate::codec::vorbis::oracle::{Signal, signal};
-        use std::sync::Arc;
-        let input = signal(Signal::Music, 44_100, 2, 44_100 * 300, 7)
-            .into_iter()
-            .map(Arc::new)
-            .collect();
-        let v = Value::Audio(Arc::new(
-            crate::value::Audio::new(44_100, input, crate::value::AudioMeta::default()).unwrap(),
+    fn crafted_floor0_fixture_is_refused_like_libvorbis() {
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/ogg-vorbis-granule-trim.ogg"
+        ))
+        .unwrap();
+        assert!(matches!(
+            decode_with(&VorbisDecoder, &data),
+            Err(EngineError::Decode { .. })
         ));
-        let data = crate::codec::CodecSet::pinned()
-            .encode_bytes(&v, "ogg", &serde_json::json!({ "quality": 5 }), &NoMonitor)
-            .unwrap()
-            .0;
-        let mut best = [f64::MAX; 2];
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            let a = decode_with(&SymphoniaDecoder::ogg_vorbis(), &data).unwrap();
-            best[0] = crate::math::min(best[0], t.elapsed().as_secs_f64());
-            let t = std::time::Instant::now();
-            let b = decode_with(&VorbisDecoder, &data).unwrap();
-            best[1] = crate::math::min(best[1], t.elapsed().as_secs_f64());
-            assert_eq!(planes(&a)[0].len(), planes(&b)[0].len());
-        }
-        // 内訳：長さを数える道だけ
-        let mut count = f64::MAX;
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            let mut media = Media::Bytes(&data);
-            probe(&mut media, &Limits::default(), &NoMonitor).unwrap();
-            count = crate::math::min(count, t.elapsed().as_secs_f64());
-        }
-        println!(
-            "{} バイト：symphonia {:.3} 秒、自作 {:.3} 秒（うち長さを数える道 {:.3} 秒）",
-            data.len(),
-            best[0],
-            best[1],
-            count
-        );
     }
 }

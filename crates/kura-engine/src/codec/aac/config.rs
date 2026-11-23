@@ -63,7 +63,7 @@ impl Rd<'_> {
 /// object type・960 フレーム（frameLengthFlag）・dependsOnCoreCoder・配置 0 は `Unsupported`（次の段へ）。
 pub(crate) fn parse_asc(asc: &[u8]) -> Result<Config, EngineError> {
     let broken = || decode_err("AudioSpecificConfig が正しくありません");
-    if crate::codec::symph::is_he_aac(asc) {
+    if crate::codec::common::is_he_aac(asc) {
         return Err(unsupported("HE-AAC は次の段で読みます"));
     }
     let mut r = Rd { b: asc, at: 0 };

@@ -31,7 +31,6 @@ crates/vorbis-tables/      # Ogg Vorbis のエンコーダの表（aoTuV から�
 crates/aac-tables/         # AAC の符号表と帯の区切り（symphonia-codec-aac から値を変えずに写したもの。MPL-2.0）
 crates/kura-mac/           # macOS 専用：サムネイル, メディア情報, スナップショット, 編集の Platform のコーデック（Swift ヘルパー）, 大きな確保を OS へすぐ返す確保器（アプリの global_allocator）
 crates/kura-devtools/      # ダミーライブラリ生成・ベンチマーク
-third_party/               # 不具合を直した、または kura の要件（libm への差し替え）で手を入れた第三者のクレートの写し（[patch.crates-io]。元のライセンスのまま）
 src-tauri/                 # Tauri アプリ本体：main.rs（--kura-svg-worker で起動されたら SVG の働き手）, commands/, protocol.rs（kura://）, navigation.rs（main の窓と移動の制限）, engine.rs（エンジンの部品を作る口）, state.rs（開いているライブラリ）, dto.rs（型とイベント）, error.rs（AppError と code）, config.rs, shortcut.rs, logging.rs
 src/                       # React フロント：features/, components/, styles/, ipc/, stores/
 docs/                      # 仕様・設計（下記）

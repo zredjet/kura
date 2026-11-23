@@ -621,13 +621,6 @@ fn predict(out: &mut [i32], h: &mut ChannelHead, bps: u32) -> Result<(), EngineE
 pub(crate) mod tests {
     use rand_chacha::ChaCha8Rng;
     use rand_chacha::rand_core::Rng;
-    use symphonia_core::audio::{Audio as _, GenericAudioBufferRef};
-    use symphonia_core::codecs::audio::well_known::CODEC_ID_ALAC;
-    use symphonia_core::codecs::audio::{
-        AudioCodecParameters, AudioDecoder as _, AudioDecoderOptions,
-    };
-    use symphonia_core::packet::Packet;
-    use symphonia_core::units::{Duration, Timestamp};
 
     use super::*;
 
@@ -670,44 +663,27 @@ pub(crate) mod tests {
         c
     }
 
-    /// 前の読み手（symphonia の `AlacDecoder`）。標本（面ごと）か誤り。panic したものは None。
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn theirs(cookie: &[u8], packet: &[u8]) -> Option<Result<Vec<Vec<i32>>, bool>> {
-        let cookie = cookie.to_vec();
-        let packet = packet.to_vec();
-        std::panic::catch_unwind(move || {
-            let mut params = AudioCodecParameters::new();
-            params
-                .for_codec(CODEC_ID_ALAC)
-                .with_sample_rate(44_100)
-                .with_extra_data(cookie.into_boxed_slice());
-            let mut dec = match symphonia_codec_alac::AlacDecoder::try_new(
-                &params,
-                &AudioDecoderOptions::default(),
-            ) {
-                Ok(d) => d,
-                Err(e) => return Err(matches!(e, symphonia_core::errors::Error::Unsupported(_))),
-            };
-            let pkt = Packet::new(
-                1,
-                Timestamp::new(0),
-                Duration::new(1),
-                packet.into_boxed_slice(),
-            );
-            match dec.decode(&pkt) {
-                Ok(buf) => {
-                    let GenericAudioBufferRef::S32(b) = &buf else {
-                        return Err(false);
-                    };
-                    let n = b.frames();
-                    Ok((0..b.num_planes())
-                        .map(|c| b.plane(c).map_or(Vec::new(), |p| p[..n].to_vec()))
-                        .collect())
+    /// 結果（標本か、誤りの種類）を畳んだダイジェスト（M16 段 10。段 3〜9 は前の読み手（symphonia の `AlacDecoder`）と
+    /// 1 つずつ照らしていた。外したあとは、照らし終えた結果を凍結する。`codec::frozen` と同じ考え）。
+    fn fold(results: &[Result<Vec<Vec<i32>>, bool>]) -> String {
+        let mut h = crate::digest::Hasher::new("kura-test-frozen-alac-v1");
+        for r in results {
+            match r {
+                Ok(planes) => {
+                    h.u8(1).u64(planes.len() as u64);
+                    for p in planes {
+                        h.u64(p.len() as u64);
+                        for v in p {
+                            h.u32(*v as u32);
+                        }
+                    }
                 }
-                Err(e) => Err(matches!(e, symphonia_core::errors::Error::Unsupported(_))),
+                Err(unsupported) => {
+                    h.u8(if *unsupported { 2 } else { 0 });
+                }
             }
-        })
-        .ok()
+        }
+        h.finish().to_hex()
     }
 
     /// 自作の読み手。標本（面ごと）か誤り（`Unsupported` なら真）。
@@ -790,13 +766,10 @@ pub(crate) mod tests {
         let mut res = vec![2u64];
         res.extend(std::iter::repeat_n(0, 39));
         let shift = |v: Vec<i32>| v.iter().map(|s| s >> 16).collect::<Vec<_>>();
-        // どの例も symphonia の読み取りと同じ（symphonia が出した値を書いた）
+        // どの例も symphonia の読み取りと同じ（symphonia が出した値を書いた。段 3〜9 は symphonia とも照らしていた）
         let check = |c: &[u8], p: &[u8], want: Vec<i32>, name: &str| {
             let got = ours(c, p).unwrap();
-            assert_eq!(Some(Ok(got.clone())), theirs(c, p), "{name}");
-            if !want.is_empty() {
-                assert_eq!(shift(got[0].clone()), want, "{name}");
-            }
+            assert_eq!(shift(got[0].clone()), want, "{name}");
         };
         let (c, p) = compressed(0, 31, &res, 16, 40);
         let mut want: Vec<i32> = (1..=32).collect();
@@ -808,9 +781,9 @@ pub(crate) mod tests {
         check(&c, &p, want, "mode 15・order 0");
         let (c, p) = compressed(0, 1, &res, 16, 40);
         check(&c, &p, vec![1; 40], "order 1");
-        // mode 15・order 1：係数の適応で値が育つ（symphonia と同じ値であることだけを見る）
+        // mode 15・order 1：係数の適応で値が育つ（段 3〜9 は symphonia と同じ値であることを見ていた。凍結した値）
         let (c, p) = compressed(15, 1, &res, 16, 40);
-        check(&c, &p, Vec::new(), "mode 15・order 1");
+        assert_eq!(fold(&[ours(&c, &p)]), FROZEN_MODE15, "mode 15・order 1");
         let (c, p) = compressed(1, 0, &res, 16, 40);
         assert!(ours(&c, &p).is_err(), "mode 1");
         // 32 ビット・order 1・残差 [MAX, 1, 0, 0]（release の symphonia と同じく折り返す）
@@ -832,9 +805,20 @@ pub(crate) mod tests {
         );
     }
 
-    /// 非圧縮の要素でチャンネルの並びを symphonia と照らす（1〜8 チャンネル、Apple の要素の並び）。
+    /// 非圧縮の要素でチャンネルの並び（1〜8 チャンネル、Apple の要素の並び）。段 3〜9 は symphonia と照らしていた並び：
+    /// 面 `p` に、要素に出た順の何番目のチャンネルが来るか。
     #[test]
     fn channel_order_matches_symphonia() {
+        const ORDER: [&[u64]; 8] = [
+            &[0],
+            &[0, 1],
+            &[1, 2, 0],
+            &[1, 2, 0, 3],
+            &[1, 2, 0, 3, 4],
+            &[1, 2, 0, 5, 3, 4],
+            &[1, 2, 0, 6, 5, 3, 4],
+            &[3, 4, 0, 7, 1, 2, 5, 6],
+        ];
         let layouts: [&[u64]; 8] = [
             &[0],
             &[1],
@@ -862,41 +846,34 @@ pub(crate) mod tests {
             }
             w.put(7, 3);
             let a = ours(&c, &w.b).unwrap();
-            assert_eq!(Some(Ok(a)), theirs(&c, &w.b), "{ch} チャンネル");
+            let order: Vec<u64> = a.iter().map(|p| (p[0] >> 16) as u64 / 100 - 1).collect();
+            assert_eq!(order, ORDER[i], "{ch} チャンネル");
+            for (p, &e) in a.iter().zip(ORDER[i]) {
+                assert!(p.iter().all(|v| (*v >> 16) as u64 == (e + 1) * 100), "{ch}");
+            }
         }
     }
 
-    /// 乱数で作った構造のあるパケット（要素の並び・頭の欄・係数・tail・残差のビット・DSE・FIL・END・ごみ）を、symphonia の
-    /// 読み取りと照らす（標本が同じか、どちらも誤りか。symphonia が panic した入力（debug の算術のあふれ）は比べない）。
+    /// 乱数で作った構造のあるパケット（要素の並び・頭の欄・係数・tail・残差のビット・DSE・FIL・END・ごみ）。段 3〜9 は
+    /// symphonia の読み取りと照らしていた（標本が同じか、どちらも同じ種類の誤りか。symphonia が panic した入力（debug の算術の
+    /// あふれ）は比べなかった）。外したあとは結果を凍結する（[`fold`]）。
     #[test]
-    fn random_packets_match_symphonia() {
+    fn random_packets_keep_their_values() {
         let mut rng = crate::determinism::rng(41);
-        let (mut same, mut both_err, mut skipped) = (0, 0, 0);
-        for round in 0..4_000 {
+        let mut results = Vec::new();
+        for _ in 0..4_000 {
             let (c, p) = random_packet(&mut rng);
-            let Some(t) = theirs(&c, &p) else {
-                skipped += 1;
-                continue;
-            };
-            let o = ours(&c, &p);
-            match (&o, &t) {
-                (Ok(a), Ok(b)) => {
-                    assert_eq!(a, b, "回 {round}");
-                    same += 1;
-                }
-                (Err(a), Err(b)) => {
-                    assert_eq!(a, b, "回 {round}：誤りの種類");
-                    both_err += 1;
-                }
-                _ => panic!("回 {round}：ours {o:?} / symphonia {t:?}"),
-            }
+            results.push(ours(&c, &p));
         }
+        let ok = results.iter().filter(|r| r.is_ok()).count();
         // どちらの枝も十分に通る
-        assert!(
-            same > 1_000 && both_err > 300,
-            "{same} {both_err} {skipped}"
-        );
+        assert!(ok > 1_000 && results.len() - ok > 300, "{ok}");
+        assert_eq!(fold(&results), FROZEN_RANDOM);
     }
+
+    /// 凍結した結果（[`fold`]。M16 段 10 で、symphonia と照らし終えた段 9 の実装で作った）。
+    const FROZEN_MODE15: &str = "e6c19505a38cc33708f4c9fcc853a75da59f6145810b3cf6544adf3b95eae2dc";
+    const FROZEN_RANDOM: &str = "60640f3966a37aca598fb5b28119d816bb6a9114f550545faf894a83838ce9a5";
 
     /// 乱数のパケット（cookie と中身）。
     pub(crate) fn random_packet(rng: &mut ChaCha8Rng) -> (Vec<u8>, Vec<u8>) {

@@ -84,7 +84,7 @@ ALAC・AIFF・MP3）の値は `tests/codec_golden.rs` で凍結する。
 - 参照の `*.ffmpeg.flac`・`*.lewton.flac`・`*.afconvert.flac` は、そのデコーダの出力を 16 ビットに（ディザなしで）丸め、
   `flac -8` で保存したもの。端（±1）に張り付いた標本は比べない。
 - 段 7 の `ogg-vorbis-3ch.ogg`・`ogg-vorbis-5ch.ogg`（symphonia-codec-vorbis 0.6.1 の 3 ch 以上の不具合の回帰の試験。
-  `third_party/symphonia-codec-vorbis/KURA.md`）：
+  M16 段 10 で外した写しの `third_party/symphonia-codec-vorbis/KURA.md`。今は自作の読み手の 3 ch 以上の試験）：
   - 音（0.5 秒・44.1 kHz。t = n / 44100、n = 0〜22,049。チャンネル k は Vorbis の並びで 0 始まり）：k = 0 は 0.4·sin(2π·300·t)、
     k = 1 は 0.2·sin(2π·1000·t) + 0.1·雑音、k = 2 は 0.3·sin(2π·(200·t + 3900·t²))（200 Hz → 8,000 Hz の掃引）、k = 3 は無音、
     k = 4 は 0.3·雑音。雑音は 32 ビットの LCG（x ← 1664525·x + 1013904223、種 1。上位 24 ビットを −1〜1 に）の 1 本の列から、
@@ -146,7 +146,9 @@ FFmpeg 9.0.2 の APNG のデコーダ（8 ビットは `rgba`、16 ビットは 
 
 ## symphonia の写しの確かめ（段 9 の検証）
 
-`tests/symphonia_copies.rs` が使う（`tests/fixtures.rs` の `unsupported_audio_variants_fall_through` も HE-AAC の 2 本を使う）。
+段 9〜M16 段 9 は `tests/symphonia_copies.rs` が使った（M16 段 10 で symphonia と一緒に外し、自作の読み手にかかわる確かめは
+`tests/audio_tiers.rs` に移した。フィクスチャは残す）。`tests/fixtures.rs` の `unsupported_audio_variants_fall_through` も HE-AAC の
+2 本を使う。
 作ったときの道具：macOS 26.7 の afconvert・afinfo、FFmpeg 9.0.2。元の音は上の `audio-src16.wav`。
 
 | ファイル | 作り方 | 照らすもの |

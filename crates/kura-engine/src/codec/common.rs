@@ -1,56 +1,32 @@
-//! symphonia を使う読み取りの共通の部品（FLAC・ALAC・AAC・Vorbis。docs/editing.md §9.2）。
+//! 自作の読み取り・書き出しの共通の部品（音声のタグ・ループ点・MP4 の編集リスト・NaN・読む元。docs/editing.md §9.2）。M16 段 10 で
+//! symphonia を外したとき、symphonia の読み口を包んでいた `codec::symph` から、symphonia によらない部品だけを残した。
 //!
-//! - 部品のクレートを `=0.6.1` で直接使い、Probe は通さない（形式の表で読み口とデコーダを選ぶ）。既定の feature
-//!   （opt-simd・id3v2）は入れない（Cargo.toml と `scripts/check-engine-features.sh`）。
-//! - 読む元は 2 つ（[`Media`]）：読み込んだバイト列（読み口の口 `shape`・`decode`。大きさは `max_value_bytes` まで）と、
-//!   シークできる読み口（ファイル。流して読む口 `decode_stream`・形 `shape_file`。M13 段 2。全体を読み込まない）。どちらも
-//!   同じ読み口・同じデコーダを通るので値は同じ。読み口は `read` のたびに中止を見て、パケットごとにも中止を確かめる。
-//!   symphonia の panic は `codec::contain` が受け止める。
-//! - 長さ：FLAC は STREAMINFO の総フレーム数（0 ならパケットの長さの和）、ALAC・Vorbis は、デコードせずにパケットの
-//!   長さ（`dur`。遅延・詰め物を除いた数）を足した値を形にし、デコードした長さがそれと違えば壊れたファイルとして扱う
-//!   （形と中身が必ず一致する。形より長く出てきたものも `Decode`）。AAC は priming を自前で切るので（`lossy.rs`）、
-//!   形は上限（`AtMost`）。壊れたパケットは飛ばさずエラーにする（長さが形と食い違わないように）。
-//! - 標本：FLAC・ALAC は 32 ビットに左詰めした整数を `pcm::int_to_f32(v, 32)`（元の幅の式と同じ値。WAV・AIFF と一致）、
-//!   AAC・Vorbis は f32 のまま（NaN だけは `0x7fc00000` にそろえる。[`canonical_nan`]）。
+//! - 読む元は 2 つ（[`Media`]）：読み込んだバイト列（読み口の口 `shape`・`decode`。大きさは `max_value_bytes` まで。
+//!   [`read_all`]）と、シークできる読み口（ファイル。流して読む口 `decode_stream`・形 `shape_file`。M13 段 2。全体を読み込まない）。
+//!   自作の読み口（`byte_in`・`ogg_read`・`mp4_read`・`flac_read`・`aac::adts`）がどちらも同じ道で読むので、値は同じ。
+//! - 標本：AAC・Vorbis の NaN は `0x7fc00000` にそろえる（[`canonical_nan`]）。
 //! - タグ：Vorbis コメント（FLAC・Ogg）と MP4 の iTunes のタグから、title・artist・album・comment・date・genre・
-//!   copyright を読み、FLAC・Ogg のほかのキーは `vorbis:<KEY>` のまま運ぶ（FLAC に書き戻せる）。
+//!   copyright を読み、FLAC・Ogg のほかのキーは `vorbis:<KEY>` のまま運ぶ（FLAC に書き戻せる。[`meta_from_tags`]）。
 //!   `LOOPSTART`・`LOOPLENGTH`（Vorbis コメント）をループ点にする（終わり = LOOPSTART + LOOPLENGTH。含まない）。
 //! - 書き出し（FLAC・Ogg の Vorbis コメント。[`vorbis_comments_for`]）は読み取りの逆：ループ点は `start < end ≤ 長さ` の
 //!   ときだけ書き、読み取りが同じタグにまとめる名前（大文字と小文字だけの違い・DESCRIPTION と COMMENT・`cprt` と
 //!   COPYRIGHT）が重なれば先の 1 つだけを書く（既知の名前を優先）。名前の扱いは読み取りと書き出しで 1 つの表
 //!   （`KNOWN_TAGS`・[`comment_name`]）から決める。
+//! - AAC の切り取り（[`mp4_edit`]・[`parse_itunsmpb`]）・HE-AAC の明示の印（[`is_he_aac`]）・ALAC の cookie のビット数
+//!   （[`alac_bits`]）。
 
 use std::collections::BTreeSet;
-use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::sync::Mutex;
+use std::io::SeekFrom;
 
-use symphonia_core::audio::{Audio as _, GenericAudioBufferRef};
-use symphonia_core::codecs::CodecParameters;
-use symphonia_core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
-use symphonia_core::errors::Error as SymError;
-use symphonia_core::formats::{FormatOptions, FormatReader, Track, TrackType};
-use symphonia_core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
-use symphonia_core::meta::RawValue;
-
-use crate::codec::stream::DecodeOut;
-use crate::codec::{ReadSeek, pcm, try_vec};
+use crate::codec::{ReadSeek, try_vec};
 use crate::error::EngineError;
 use crate::limits::Limits;
-use crate::monitor::Monitor;
 use crate::value::{AudioMeta, LoopRange};
 
 /// 名前・タグとして読む 1 つの文字列の長さの上限（バイト）。
 const TEXT_MAX: usize = 4_096;
 /// メタデータの 1 項目ごとに予算から引く固定の重さ（バイト。WAV と同じ）。
 const ITEM_COST: usize = 32;
-
-/// 入れ物の形式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Container {
-    Ogg,
-    Mp4,
-    Adts,
-}
 
 /// 読む元（モジュールの説明）。
 pub(crate) enum Media<'a> {
@@ -61,103 +37,12 @@ pub(crate) enum Media<'a> {
 }
 
 impl Media<'_> {
-    /// 読み口を開き、最初の音声のトラックを選ぶ（[`open`] と同じ）。読み口は頭へ戻してから包む。
-    pub fn open<'s>(
-        &'s mut self,
-        id: &str,
-        c: Container,
-        mon: &'s dyn Monitor,
-        limits: &Limits,
-    ) -> Result<Opened<'s>, EngineError> {
-        let inner = match self {
-            Media::Bytes(data) => SrcInner::Bytes(Cursor::new(*data)),
-            Media::Reader(r) => {
-                let len = r.seek(SeekFrom::End(0))?;
-                r.seek(SeekFrom::Start(0))?;
-                SrcInner::Reader {
-                    r: Mutex::new(&mut **r),
-                    len,
-                }
-            }
-        };
-        open_src(id, Src { inner, mon }, c, limits)
-    }
-
     /// MP4 の編集リストの切り取り（[`mp4_edit`]。読み口は箱の頭をたどり、要る箱の頭だけを読む：[`mp4_edit_reader`]）。
     pub fn mp4_edit(&mut self, rate: u32) -> Result<Option<(u64, u64)>, EngineError> {
         match self {
             Media::Bytes(data) => Ok(mp4_edit(data, rate)),
             Media::Reader(r) => mp4_edit_reader(&mut **r, rate),
         }
-    }
-}
-
-/// 中止を見る読み口の中身。
-enum SrcInner<'a> {
-    Bytes(Cursor<&'a [u8]>),
-    /// 読み口（symphonia の読み口は `Sync` を求めるので `Mutex` で包む）と長さ。
-    Reader {
-        r: Mutex<&'a mut (dyn ReadSeek + Send)>,
-        len: u64,
-    },
-}
-
-/// 中止を見る読み口（読み込んだバイト列か、シークできる読み口を包む）。
-struct Src<'a> {
-    inner: SrcInner<'a>,
-    mon: &'a dyn Monitor,
-}
-
-fn poisoned() -> std::io::Error {
-    std::io::Error::other("kura: 読み口の鍵が壊れています")
-}
-
-impl Read for Src<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.mon.canceled() {
-            // Interrupted は read_exact が再試行するので使わない
-            return Err(std::io::Error::other("kura: canceled"));
-        }
-        match &mut self.inner {
-            SrcInner::Bytes(c) => c.read(buf),
-            SrcInner::Reader { r, .. } => r.get_mut().map_err(|_| poisoned())?.read(buf),
-        }
-    }
-}
-
-impl Seek for Src<'_> {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        match &mut self.inner {
-            SrcInner::Bytes(c) => c.seek(pos),
-            SrcInner::Reader { r, .. } => r.get_mut().map_err(|_| poisoned())?.seek(pos),
-        }
-    }
-}
-
-impl MediaSource for Src<'_> {
-    fn is_seekable(&self) -> bool {
-        true
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        match &self.inner {
-            SrcInner::Bytes(c) => Some(c.get_ref().len() as u64),
-            SrcInner::Reader { len, .. } => Some(*len),
-        }
-    }
-}
-
-/// symphonia の誤りを直す（中止を頼まれていれば `Canceled`。扱えない形式は `Unsupported` で次の段へ）。
-pub(crate) fn sym_err(id: &str, e: SymError, mon: &dyn Monitor) -> EngineError {
-    if mon.canceled() {
-        return EngineError::Canceled;
-    }
-    match e {
-        SymError::Unsupported(m) => EngineError::Unsupported(format!("{id}: {m}")),
-        other => EngineError::Decode {
-            codec: id.to_string(),
-            message: other.to_string(),
-        },
     }
 }
 
@@ -171,208 +56,6 @@ pub(crate) fn read_all(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Vec<u8
     let mut buf = try_vec(len as usize, 0u8)?;
     src.read_exact(&mut buf)?;
     Ok(buf)
-}
-
-/// 開いた読み口と、音声のトラック。
-pub(crate) struct Opened<'a> {
-    pub reader: Box<dyn FormatReader + 'a>,
-    pub track: Track,
-    pub params: AudioCodecParameters,
-    pub rate: u32,
-    pub channels: usize,
-}
-
-/// 読み口を開き、最初の音声のトラックを選ぶ。
-pub(crate) fn open<'a>(
-    id: &str,
-    data: &'a [u8],
-    c: Container,
-    mon: &'a dyn Monitor,
-    limits: &Limits,
-) -> Result<Opened<'a>, EngineError> {
-    let src = Src {
-        inner: SrcInner::Bytes(Cursor::new(data)),
-        mon,
-    };
-    open_src(id, src, c, limits)
-}
-
-/// 包んだ読み口を開き、最初の音声のトラックを選ぶ。
-fn open_src<'a>(
-    id: &str,
-    src: Src<'a>,
-    c: Container,
-    limits: &Limits,
-) -> Result<Opened<'a>, EngineError> {
-    let mon = src.mon;
-    let mss = MediaSourceStream::new(Box::new(src), MediaSourceStreamOptions::default());
-    let o = FormatOptions::default();
-    let e = |e| sym_err(id, e, mon);
-    let reader: Box<dyn FormatReader + 'a> = match c {
-        Container::Ogg => Box::new(symphonia_format_ogg::OggReader::try_new(mss, o).map_err(e)?),
-        Container::Mp4 => {
-            Box::new(symphonia_format_isomp4::IsoMp4Reader::try_new(mss, o).map_err(e)?)
-        }
-        Container::Adts => Box::new(symphonia_codec_aac::AdtsReader::try_new(mss, o).map_err(e)?),
-    };
-    let track = reader
-        .default_track(TrackType::Audio)
-        .cloned()
-        .ok_or_else(|| EngineError::Unsupported(format!("{id}: 音声のトラックがありません")))?;
-    let params = track
-        .codec_params
-        .as_ref()
-        .and_then(CodecParameters::audio)
-        .cloned()
-        .ok_or_else(|| EngineError::Unsupported(format!("{id}: 音声のトラックがありません")))?;
-    let rate = params
-        .sample_rate
-        .filter(|r| *r > 0)
-        .ok_or_else(|| EngineError::Decode {
-            codec: id.to_string(),
-            message: "サンプルレートがありません".into(),
-        })?;
-    let channels = params
-        .channels
-        .as_ref()
-        .map(|c| c.count())
-        .filter(|n| *n > 0)
-        // チャンネルの数を読めない（4・7 チャンネルの AAC の m4a など、symphonia が配置を知らない）ものは、このデコーダでは
-        // 扱えない形として次の段（macOS）へ回す。壊れたファイルなら、どの段も読めずに読み取りの失敗になる
-        .ok_or_else(|| EngineError::Unsupported(format!("{id}: チャンネルの数がありません")))?;
-    if channels as u64 > limits.max_channels {
-        return Err(EngineError::Limit("チャンネルが多すぎます".into()));
-    }
-    if rate > limits.max_sample_rate {
-        return Err(EngineError::Limit("サンプルレートが大きすぎます".into()));
-    }
-    Ok(Opened {
-        reader,
-        track,
-        params,
-        rate,
-        channels,
-    })
-}
-
-impl Opened<'_> {
-    /// デコードせずに、パケットの長さ（遅延・詰め物を除く）を足す。切り取る前の長さ（デコーダが実際に作る量）の和も
-    /// `max_audio_frames`・`max_value_bytes` で確かめる（ページのグラニュールで長さを 0 近くまで詰めると、形は小さい
-    /// まま、大量のパケットのデコードを通せてしまうため。検証で見つけた）。
-    pub fn count_frames(
-        &mut self,
-        id: &str,
-        mon: &dyn Monitor,
-        limits: &Limits,
-    ) -> Result<u64, EngineError> {
-        let mut total = 0u64;
-        let mut decoded = 0u64;
-        loop {
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            let Some(pkt) = self.reader.next_packet().map_err(|e| sym_err(id, e, mon))? else {
-                break;
-            };
-            if pkt.track_id == self.track.id {
-                total = total.saturating_add(pkt.dur.get());
-                decoded = decoded
-                    .saturating_add(pkt.dur.get())
-                    .saturating_add(pkt.trim_start.get())
-                    .saturating_add(pkt.trim_end.get());
-            }
-        }
-        let channels = u16::try_from(self.channels).unwrap_or(u16::MAX);
-        limits
-            .check(&crate::shape::Shape::Audio {
-                rate: self.rate,
-                channels,
-                frames: crate::shape::Dim::Exact(decoded),
-            })
-            .map_err(|m| EngineError::Limit(format!("デコードする量が大きすぎます（{m}）")))?;
-        Ok(total)
-    }
-
-    /// 生のタグ（キー, 文字列）。全体とトラックごとのものを、出た順に。
-    pub fn raw_tags(&mut self) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        if let Some(rev) = self.reader.metadata().skip_to_latest() {
-            let all = rev
-                .media
-                .tags
-                .iter()
-                .chain(rev.per_track.iter().flat_map(|t| t.metadata.tags.iter()));
-            for tag in all {
-                if let RawValue::String(s) = &tag.raw.value {
-                    out.push((tag.raw.key.clone(), s.as_ref().clone()));
-                }
-            }
-        }
-        out
-    }
-
-    /// すべてのパケットをデコードして、標本を `out` に足す（長さは `max_frames` まで。組み手の形でも流す形でも同じ道）。
-    pub fn decode_all(
-        &mut self,
-        id: &str,
-        dec: &mut dyn AudioDecoder,
-        max_frames: u64,
-        out: &mut DecodeOut<'_>,
-        mon: &dyn Monitor,
-    ) -> Result<(), EngineError> {
-        let mut total = 0u64;
-        let mut planes: Vec<Vec<f32>> = (0..self.channels).map(|_| Vec::new()).collect();
-        loop {
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            let Some(pkt) = self.reader.next_packet().map_err(|e| sym_err(id, e, mon))? else {
-                break;
-            };
-            if pkt.track_id != self.track.id {
-                continue;
-            }
-            let buf = dec.decode(&pkt).map_err(|e| sym_err(id, e, mon))?;
-            let n = buf.frames();
-            total = total.saturating_add(n as u64);
-            if total > max_frames {
-                // 上限は形（ヘッダ）から決めたものなので、超えるのはヘッダと中身の食い違い
-                return Err(EngineError::Decode {
-                    codec: id.to_string(),
-                    message: "長さがヘッダより長い".into(),
-                });
-            }
-            // パケットの標本を作業列に写してから組み手に足す（持つ量は値とパケットの分だけ）
-            for (ch, plane) in planes.iter_mut().enumerate() {
-                plane.clear();
-                plane
-                    .try_reserve(n)
-                    .map_err(|_| EngineError::Limit("音声が長すぎます".into()))?;
-                let missing = || EngineError::Decode {
-                    codec: id.to_string(),
-                    message: "チャンネルの数が途中で変わりました".into(),
-                };
-                match &buf {
-                    GenericAudioBufferRef::S32(b) => {
-                        let src = b.plane(ch).ok_or_else(missing)?;
-                        plane.extend(src.iter().map(|s| pcm::int_to_f32(*s, 32)));
-                    }
-                    GenericAudioBufferRef::F32(b) => {
-                        let src = b.plane(ch).ok_or_else(missing)?;
-                        plane.extend(src.iter().map(|s| canonical_nan(*s)));
-                    }
-                    _ => {
-                        return Err(EngineError::Unsupported(format!(
-                            "{id}: 標本の形式を扱えません"
-                        )));
-                    }
-                }
-            }
-            let views: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
-            out.push_frames(&views)?;
-        }
-        Ok(())
-    }
 }
 
 /// NaN を 1 つのビット列（`0x7fc00000`。値のダイジェスト `kura-pcm-v1` がそろえる形と同じ）にする。ほかの値はそのまま。
@@ -762,17 +445,11 @@ pub(crate) fn vorbis_comments_for(meta: &AudioMeta, frames: u64) -> Vec<(String,
     out
 }
 
-/// AAC のデコーダの設定（gapless：MP3・Vorbis の切り取りは読み口が付ける。AAC は自前で切る）。
-pub(crate) fn decoder_options() -> AudioDecoderOptions {
-    AudioDecoderOptions::default()
-}
-
-/// AudioSpecificConfig を見て、HE-AAC（SBR・PS）なら true（symphonia は半分のレートで読んでしまう。次の段へ回す）。
+/// AudioSpecificConfig を見て、HE-AAC（SBR・PS）なら true（AAC-LC の読み手は SBR を持たないので、次の段へ回す）。
 /// 明示の印だけを見る：オブジェクトの種類 5・29、または GASpecificConfig のあとの同期の拡張（0x2B7・種類 5・
 /// sbrPresentFlag = 1）。ffmpeg は「SBR なし」を同期の拡張（sbrPresentFlag = 0）で明示するので、旗まで読む。
-/// 帯域の中だけの SBR（暗黙の印。ADTS はいつもこれ）は ASC では見分けられないので、`lossy.rs` が先頭のパケットを
-/// デコードして fill 要素の SBR の拡張を見る（写しの `AacDecoder::sbr_seen`）。チャンネルの構成 0（PCE）は読まない
-/// （LC とみなす）。
+/// 帯域の中だけの SBR（暗黙の印。ADTS はいつもこれ）は ASC では見分けられないので、AAC の読み手（`aac::read`）が先頭の
+/// パケットを読んで fill 要素の SBR の拡張を見る。チャンネルの構成 0（PCE）は読まない（LC とみなす）。
 pub(crate) fn is_he_aac(asc: &[u8]) -> bool {
     let bit = |i: usize| -> Option<u32> {
         let b = asc.get(i / 8)?;
@@ -890,172 +567,10 @@ pub(crate) fn mp4_edit(data: &[u8], rate: u32) -> Option<(u64, u64)> {
     None
 }
 
-/// Vorbis の setup ヘッダの codebook が symphonia（`symphonia-codec-vorbis` 0.6.1）の中で確保する大きさ（バイト）の
-/// 上からの見積もり。小さなファイルが数 GB を確保させられる（VQ の表と探索表）ので、デコーダに渡す前に断るために使う。
-/// `extra` は Ogg の読み口が作る「識別ヘッダ（30 バイト）＋ setup ヘッダ」。読めないもの・symphonia が確保の前に断る
-/// もの（次元 0・33 以上、項目 131,073 以上、長さ 33 以上の符号語）は None。
-///
-/// codebook 1 つあたり（symphonia の `VorbisCodebook::read` と `CodebookBuilder::make` に合わせる）：
-/// - VQ の表：lookup 1・2 は 項目 × 次元 × 4（f32）と、読んだ値 × 4（u16 の `Vec` の伸びを見込む）。
-/// - 項目ごと：長さ・値の配列は使わない項目の分も先に確保するので 16 バイト、使う符号語ごとに符号と木の葉
-///   （`CodebookValue`）で 32 バイトとみなす。
-/// - 探索表：B = clamp(最長, 4, 8) ビットずつ読むブロックの木。ブロックは根と、深さ d = kB（d < 最長）の節のうち
-///   もっと長い符号語の接頭辞になるもの。symphonia は完全な木（クラフトの等式）でなければ表を作る前に断るので、
-///   その数はちょうど 2^d − Σ_{長さ ≤ d} 数 · 2^(d − 長さ)（d より長い符号語の数も超えない）。表はブロックごとに
-///   2^B 個 × 8 バイトで、`Vec` の伸び（最大 2 倍）を見込んで 16 バイトとみなし、ブロックの付帯分を 128 バイトとみなす。
-pub(crate) fn vorbis_setup_bytes(extra: &[u8]) -> Option<u64> {
-    let setup = extra.get(30..)?;
-    if setup.get(..7)? != b"\x05vorbis" {
-        return None;
-    }
-    let mut r = Bits {
-        b: setup,
-        at: 7 * 8,
-    };
-    let books = r.take(8)? + 1;
-    let mut total = 0u64;
-    for _ in 0..books {
-        if r.take(24)? != 0x56_4342 {
-            return None;
-        }
-        let dims = r.take(16)?;
-        let entries = r.take(24)?;
-        if dims == 0 || dims > 32 || entries > 128 * 1024 {
-            return None;
-        }
-        // 長さごとの符号語の数（長さ 1〜32）
-        let mut count = [0u64; 33];
-        let mut put = |len: u32, n: u64| -> Option<()> {
-            if n > 0 {
-                *count.get_mut(usize::try_from(len).ok()?)? += n;
-            }
-            Some(())
-        };
-        if r.take(1)? == 1 {
-            // ordered：長さの順に、その長さの数を並べる
-            let mut cur = 0u64;
-            let mut len = r.take(5)? + 1;
-            while cur < u64::from(entries) {
-                let n = r.take(ilog(entries - cur as u32))?;
-                put(len, u64::from(n))?;
-                cur = cur.checked_add(u64::from(n))?;
-                len = len.checked_add(1)?;
-            }
-            if cur > u64::from(entries) {
-                return None;
-            }
-        } else {
-            let sparse = r.take(1)? == 1;
-            for _ in 0..entries {
-                if !sparse || r.take(1)? == 1 {
-                    put(r.take(5)? + 1, 1)?;
-                }
-            }
-        }
-        let codes: u64 = count.iter().sum();
-        // 1 つだけの長さ 1 の符号語は、symphonia が 2 つにして完全な木にする
-        if codes == 1 && count[1] == 1 {
-            count[1] = 2;
-        }
-        let lookup = r.take(4)?;
-        let vq = match lookup {
-            0 => 0u64,
-            1 | 2 => {
-                r.take(32)?;
-                r.take(32)?;
-                let value_bits = r.take(4)? + 1;
-                r.take(1)?;
-                let n = if lookup == 1 {
-                    lookup1_values(entries, dims)?
-                } else {
-                    u64::from(entries).checked_mul(u64::from(dims))?
-                };
-                // 値を読み飛ばす
-                let skip = n.checked_mul(u64::from(value_bits))?;
-                r.at = r.at.checked_add(usize::try_from(skip).ok()?)?;
-                if r.at > r.b.len() * 8 {
-                    return None;
-                }
-                (u64::from(entries) * u64::from(dims) * 4).saturating_add(n.saturating_mul(4))
-            }
-            _ => return None,
-        };
-        total = total
-            .saturating_add(vq)
-            .saturating_add(u64::from(entries) * 16)
-            .saturating_add(codes.saturating_mul(32))
-            .saturating_add(vorbis_lut_bytes(&count));
-    }
-    Some(total)
-}
-
-/// symphonia の探索表（`CodebookBuilder::make`）の大きさの上からの見積もり（`vorbis_setup_bytes` の式）。
-fn vorbis_lut_bytes(count: &[u64; 33]) -> u64 {
-    let Some(longest) = (1..=32u32).rev().find(|&l| count[l as usize] > 0) else {
-        return 0;
-    };
-    let b = longest.clamp(4, 8);
-    let mut blocks = 1u128;
-    let mut d = b;
-    while d < longest {
-        // 深さ d の節のうち、もっと長い符号語の接頭辞になるもの
-        let used: u128 = (1..=d)
-            .map(|l| u128::from(count[l as usize]) << (d - l))
-            .sum();
-        let longer: u128 = (d + 1..=32).map(|l| u128::from(count[l as usize])).sum();
-        let open = (1u128 << d).checked_sub(used).unwrap_or(longer);
-        blocks += open.min(longer);
-        d += b;
-    }
-    let per_block = (1u128 << b) * 16 + 128;
-    u64::try_from(blocks * per_block).unwrap_or(u64::MAX)
-}
-
-/// lookup1_values：value^dims ≤ entries となる最大の value（整数だけ）。
-fn lookup1_values(entries: u32, dims: u32) -> Option<u64> {
-    if dims == 0 {
-        return None;
-    }
-    let (mut lo, mut hi) = (0u64, u64::from(entries));
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        let fits = (0..dims)
-            .try_fold(1u64, |acc, _| acc.checked_mul(mid))
-            .is_some_and(|p| p <= u64::from(entries));
-        if fits {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    Some(lo)
-}
-
-fn ilog(v: u32) -> usize {
-    (32 - v.leading_zeros()) as usize
-}
-
-/// Vorbis のビットの読み手（下位のビットから）。
-struct Bits<'a> {
-    b: &'a [u8],
-    at: usize,
-}
-
-impl Bits<'_> {
-    fn take(&mut self, n: usize) -> Option<u32> {
-        let mut v = 0u32;
-        for k in 0..n {
-            let byte = *self.b.get(self.at / 8)?;
-            let bit = u32::from((byte >> (self.at % 8)) & 1);
-            v |= bit << k;
-            self.at += 1;
-        }
-        Some(v)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     /// M13 段 2：読み口から moov だけを読む編集リストの解析は、全体を読み込んだものと同じ（フィクスチャの m4a と、moov を
@@ -1188,145 +703,13 @@ mod tests {
         assert!(!is_he_aac(&[0x12, 0x10, 0x56, 0xE5, 0x00]));
         assert!(!is_he_aac(&[]));
         // 暗黙の SBR（ADTS から写した m4a の ASC：LC・22,050 Hz・2 チャンネルだけ）は ASC では見分けられない
-        // （lossy.rs が帯域の中を見る。tests/symphonia_copies.rs）
+        // （自作の AAC の読み手が帯域の中の fill 要素を見る。`aac::decoder`）
         assert!(!is_he_aac(&[0x13, 0x90]));
         assert_eq!(alac_bits(&[0, 0, 16, 0, 0, 24, 0]), Some(24));
         let mut boxed = b"\0\0\0\x0cfrma\0\0\0\0\0\0\0\x24alac\0\0\0\0".to_vec();
         boxed.extend_from_slice(&[0, 0, 16, 0, 0, 20, 0]);
         assert_eq!(alac_bits(&boxed), Some(20));
         assert_eq!(alac_bits(&[0, 0, 16, 0, 0, 0]), None);
-        assert_eq!(lookup1_values(100, 2), Some(10));
-        assert_eq!(lookup1_values(99, 2), Some(9));
-        assert_eq!(lookup1_values(u32::MAX, 32), Some(1));
-        assert_eq!(lookup1_values(u32::MAX, 31), Some(2));
-    }
-
-    /// setup ヘッダを組む（下位のビットから）。
-    pub(crate) struct VorbisSetup {
-        b: Vec<u8>,
-        at: usize,
-    }
-
-    impl VorbisSetup {
-        /// codebook の数（1〜256）から始める。
-        pub(crate) fn new(books: u32) -> Self {
-            let mut w = Self {
-                b: b"\x05vorbis".to_vec(),
-                at: 7 * 8,
-            };
-            w.put(u64::from(books - 1), 8);
-            w
-        }
-
-        pub(crate) fn put(&mut self, v: u64, n: usize) {
-            for k in 0..n {
-                if self.at.is_multiple_of(8) {
-                    self.b.push(0);
-                }
-                if (v >> k) & 1 == 1 {
-                    let last = self.b.len() - 1;
-                    self.b[last] |= 1 << (self.at % 8);
-                }
-                self.at += 1;
-            }
-        }
-
-        /// ordered の codebook：`runs` は（長さ, 数）を長さの順に。lookup 0。
-        pub(crate) fn ordered(&mut self, dims: u64, runs: &[(u32, u64)]) {
-            let entries: u64 = runs.iter().map(|r| r.1).sum();
-            self.put(0x56_4342, 24);
-            self.put(dims, 16);
-            self.put(entries, 24);
-            self.put(1, 1);
-            self.put(u64::from(runs[0].0 - 1), 5);
-            let mut cur = 0u64;
-            for &(_, n) in runs {
-                self.put(n, ilog((entries - cur) as u32));
-                cur += n;
-            }
-            self.put(0, 4);
-        }
-
-        /// 識別ヘッダ（30 バイト）を前に付けた `extra_data` の形。
-        pub(crate) fn extra(&self) -> Vec<u8> {
-            let mut extra = vec![0u8; 30];
-            extra.extend_from_slice(&self.b);
-            extra
-        }
-    }
-
-    /// 小さな setup ヘッダが巨大な表を作らせる形（検証で見つけた）を、見積もりで捉える。
-    #[test]
-    fn vorbis_setup_estimate_catches_huge_codebooks() {
-        // 長さ 17 の符号語 131,072 個（完全な木）：探索表は 2 段目のブロックが 65,536 個で約 134 MB
-        let mut w = VorbisSetup::new(1);
-        w.ordered(1, &[(17, 1 << 17)]);
-        let lut = vorbis_setup_bytes(&w.extra()).unwrap();
-        assert!(lut >= 2 * 134_000_000, "{lut}");
-        // 同じものを 8 つ並べると 8 倍（数百バイトで 2 GB を超える）
-        let mut w = VorbisSetup::new(8);
-        for _ in 0..8 {
-            w.ordered(1, &[(17, 1 << 17)]);
-        }
-        assert!(w.extra().len() < 200);
-        assert!(vorbis_setup_bytes(&w.extra()).unwrap() >= 8 * lut);
-        // ふつうの形（長さ 1〜10 の完全な木）は小さい
-        let mut w = VorbisSetup::new(1);
-        w.ordered(
-            2,
-            &[
-                (1, 1),
-                (2, 1),
-                (3, 1),
-                (4, 1),
-                (5, 1),
-                (6, 1),
-                (7, 1),
-                (8, 1),
-                (9, 1),
-                (10, 2),
-            ],
-        );
-        let small = vorbis_setup_bytes(&w.extra()).unwrap();
-        assert!(small < 1 << 16, "{small}");
-        // VQ の表（lookup 1：項目 × 次元 × 4）
-        let mut w = VorbisSetup::new(1);
-        w.put(0x56_4342, 24);
-        w.put(32, 16);
-        w.put(1 << 17, 24);
-        w.put(1, 1);
-        w.put(16, 5);
-        w.put(1 << 17, 18);
-        w.put(1, 4);
-        w.put(0, 64);
-        w.put(0, 5);
-        w.put(0, 8);
-        let vq = vorbis_setup_bytes(&w.extra()).unwrap();
-        assert!(vq >= (1 << 17) * 32 * 4, "{vq}");
-        // symphonia が確保の前に断る形と、識別の印がないものは読まない
-        let mut w = VorbisSetup::new(1);
-        w.ordered(33, &[(1, 2)]);
-        assert_eq!(vorbis_setup_bytes(&w.extra()), None);
-        assert_eq!(vorbis_setup_bytes(&[0u8; 40]), None);
-        // 実際のファイル（libvorbis・ffmpeg）の setup は小さい
-        for name in ["ogg-vorbis-loop.ogg", "ogg-vorbis-ffmpeg.ogg"] {
-            let data = std::fs::read(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("fixtures")
-                    .join(name),
-            )
-            .unwrap();
-            let o = open(
-                "t",
-                &data,
-                Container::Ogg,
-                &crate::monitor::NoMonitor,
-                &Limits::default(),
-            )
-            .unwrap();
-            let bytes = vorbis_setup_bytes(o.params.extra_data.as_deref().unwrap()).unwrap();
-            assert!(bytes < 8 << 20, "{name}: {bytes}");
-        }
     }
 
     #[test]

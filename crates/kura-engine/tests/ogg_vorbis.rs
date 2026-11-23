@@ -1,5 +1,6 @@
-//! 段 7 の受け入れテスト（docs/editing.md §17 の E28）：自作の Ogg Vorbis の出力が、独立したデコーダ 2 つ
-//! （symphonia・lewton）で読め、長さ・位置・ループのコメントが保たれる。ページの割り方の規則（ADR-149）も確かめる。
+//! 段 7 の受け入れテスト（docs/editing.md §17 の E28）：自作の Ogg Vorbis の出力が、デコーダ 2 つ（kura の読み取りと
+//! 独立した lewton。kura の読み取りは段 7〜M16 段 1 は symphonia、M16 段 2 から自作の `ogg-vorbis-kura-dec/1`）で読め、
+//! 長さ・位置・ループのコメントが保たれる。ページの割り方の規則（ADR-149）も確かめる。
 //!
 //! - lewton は低い層の口（ヘッダとパケットの読み取り）だけを使い、Ogg のページはここで読む（lewton の
 //!   `OggStreamReader` は末尾の切り取りを誤ることがあるため。ADR-149）。最後のページのグラニュールで長さを切る。
@@ -30,8 +31,8 @@ fn encode(v: &Value, opts: serde_json::Value) -> Vec<u8> {
         .0
 }
 
-/// symphonia（kura の Ogg Vorbis のデコーダ）で読む。
-fn decode_symphonia(bytes: &[u8]) -> Arc<Audio> {
+/// kura の Ogg Vorbis の読み取り（固定の組の今の読み手）で読む。
+fn decode_kura(bytes: &[u8]) -> Arc<Audio> {
     let (v, _) = CodecSet::pinned()
         .decode(
             &mut Cursor::new(bytes.to_vec()),
@@ -40,7 +41,7 @@ fn decode_symphonia(bytes: &[u8]) -> Arc<Audio> {
             &Limits::default(),
             &NoMonitor,
         )
-        .unwrap_or_else(|e| panic!("symphonia で読めません: {e}"));
+        .unwrap_or_else(|e| panic!("kura の読み取りで読めません: {e}"));
     audio(&v).clone()
 }
 
@@ -197,7 +198,7 @@ fn sine(rate: u32, channels: u16, frames: u64) -> Value {
     .unwrap()
 }
 
-/// E28：長さ・位置が、symphonia と lewton の両方で元とちょうど同じ。2 つのデコーダの値も一致する。
+/// E28：長さ・位置が、kura の読み取りと lewton の両方で元とちょうど同じ。2 つのデコーダの値も一致する。
 #[test]
 fn e28_lengths_and_positions_match_in_two_decoders() {
     for &rate in &[8_000u32, 22_050, 44_100, 48_000, 96_000] {
@@ -205,10 +206,10 @@ fn e28_lengths_and_positions_match_in_two_decoders() {
             for &frames in &[0u64, 1, 37, 1_000, 4_410, 44_101] {
                 let v = sine(rate, channels, frames);
                 let bytes = encode(&v, json!({}));
-                let sym = decode_symphonia(&bytes);
+                let sym = decode_kura(&bytes);
                 let (lew, _) = decode_lewton(&bytes);
                 let name = format!("{rate} Hz・{channels} ch・{frames} フレーム");
-                assert_eq!(sym.frames() as u64, frames, "{name}：symphonia の長さ");
+                assert_eq!(sym.frames() as u64, frames, "{name}：kura の読み取りの長さ");
                 assert_eq!(lew[0].len() as u64, frames, "{name}：lewton の長さ");
                 assert_eq!(
                     (sym.rate(), sym.channels()),
@@ -251,7 +252,7 @@ fn e28_loop_comments_are_kept() {
     a.meta.tags.insert("vorbis:ENCODER".into(), "other".into());
     let v = Value::Audio(Arc::new(a));
     let bytes = encode(&v, json!({ "quality": 3 }));
-    let back = decode_symphonia(&bytes);
+    let back = decode_kura(&bytes);
     assert_eq!(
         back.meta.loop_range,
         Some(LoopRange {
@@ -345,7 +346,7 @@ fn quality_steps_encode_and_grow() {
     let mut sizes = Vec::new();
     for q in -1..=10 {
         let bytes = encode(&v, json!({ "quality": q }));
-        assert_eq!(decode_symphonia(&bytes).frames(), 88_200, "q{q}");
+        assert_eq!(decode_kura(&bytes).frames(), 88_200, "q{q}");
         sizes.push(bytes.len());
     }
     assert!(sizes.windows(2).all(|w| w[0] <= w[1]), "{sizes:?}");
@@ -412,8 +413,8 @@ fn vorbis_to_wav(channels: usize) -> &'static [usize] {
 }
 
 /// 1〜8 チャンネルとレート 8〜192 kHz：チャンネルの並びが保たれる（チャンネルごとに違う周波数で確かめる）。
-/// symphonia（WAV の並びで出す）で元と照らし、lewton（Vorbis の並びのまま出す）の値を [`vorbis_to_wav`] で WAV の並びに
-/// 直して symphonia と照らす（エンコーダと symphonia が同じ並びの誤りをしても、仕様の表とは合わない）。
+/// kura の読み取り（WAV の並びで出す）で元と照らし、lewton（Vorbis の並びのまま出す）の値を [`vorbis_to_wav`] で WAV の
+/// 並びに直して kura の読み取りと照らす（エンコーダと読み取りが同じ並びの誤りをしても、仕様の表とは合わない）。
 #[test]
 fn channels_and_rates_round_trip() {
     for &(rate, channels) in &[
@@ -428,7 +429,7 @@ fn channels_and_rates_round_trip() {
     ] {
         let v = sine(rate, channels, u64::from(rate));
         let bytes = encode(&v, json!({}));
-        let back = decode_symphonia(&bytes);
+        let back = decode_kura(&bytes);
         assert_eq!(back.channels(), usize::from(channels), "{rate}・{channels}");
         assert_eq!(back.frames() as u64, u64::from(rate));
         for (ch, p) in audio(&v).to_planes().unwrap().iter().enumerate() {
@@ -451,7 +452,7 @@ fn channels_and_rates_round_trip() {
                 .fold(0f32, kura_engine::math::max32);
             assert!(
                 d <= 1e-4,
-                "{rate} Hz・{channels} ch：lewton の {vi} 番（Vorbis の並び）と symphonia の {wi} 番（WAV の並び）の差 {d}"
+                "{rate} Hz・{channels} ch：lewton の {vi} 番（Vorbis の並び）と kura の読み取りの {wi} 番（WAV の並び）の差 {d}"
             );
             // 元の同じチャンネルとも位置が合う
             let snr = aligned_snr(&audio(&v).to_planes().unwrap()[wi], plane);
@@ -562,7 +563,7 @@ fn non_finite_samples_are_tamed() {
             without_serial(&fixed_bytes),
             "{name}：1.5 を 1 と同じに書いた"
         );
-        let back = decode_symphonia(&raw_bytes);
+        let back = decode_kura(&raw_bytes);
         assert_eq!(back.frames(), frames, "{name}");
         assert!(
             back.to_planes()
