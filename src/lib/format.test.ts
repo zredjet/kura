@@ -56,6 +56,16 @@ describe('formatDuration', () => {
     expect(formatDuration(45_000)).toBe('0:45');
     expect(formatDuration(0)).toBe('0:00');
   });
+
+  it('0.1 秒までの形（丸めてから分けるので桁上がりがそろう）', () => {
+    expect(formatDuration(0, true)).toBe('0:00.0');
+    expect(formatDuration(83_449, true)).toBe('1:23.4');
+    expect(formatDuration(83_450, true)).toBe('1:23.5');
+    expect(formatDuration(59_960, true)).toBe('1:00.0');
+    expect(formatDuration(3_723_450, true)).toBe('1:02:03.5');
+    expect(formatDuration(-5, true)).toBe('0:00.0');
+    expect(formatDuration(Number.NaN, true)).toBe('0:00.0');
+  });
 });
 
 describe('shortHash', () => {
