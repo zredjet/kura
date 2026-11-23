@@ -22,12 +22,13 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tungstenite.workspace = true
 unicode-normalization.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# tungstenite：DevTools の WebSocket（自作の `capture::ws`。M16 段 9）の試験の偽のサーバー兼照合の相手
+tungstenite.workspace = true
 
 [lints]
 workspace = true

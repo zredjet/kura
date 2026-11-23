@@ -456,7 +456,7 @@ import_start:    ジョブとして実行
 
 ## 10. キャプチャ
 
-- **ルールで自動キャプチャ**：インストール済みの Google Chrome をアプリ専用のプロファイル（`~/Library/Application Support/<bundle id>/capture-profile`）でヘッドレス起動し、DevTools（CDP）で操作する。CDP のクライアントは tungstenite で作った小さなもの（ADR-104。当初は chromiumoxide）。
+- **ルールで自動キャプチャ**：インストール済みの Google Chrome をアプリ専用のプロファイル（`~/Library/Application Support/<bundle id>/capture-profile`）でヘッドレス起動し、DevTools（CDP）で操作する。CDP のクライアントは小さな自作のもの（ADR-104。当初は chromiumoxide）。WebSocket も M16 段 9 から自作の `capture::ws`（RFC 6455 のクライアントの握手と SHA-1・マスク・分割・ping・close、フレーム 16 MiB・メッセージ 64 MiB まで。ADR-226。前は tungstenite）。
   1. ルールの `viewport_width` で開く → `wait_ms` 待つ（または対象セレクタの出現）
   2. `hide_selectors` を非表示にする
   3. `scroll_times` 回スクロールして遅延読み込みを発火させ、先頭に戻す

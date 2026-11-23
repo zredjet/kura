@@ -6,7 +6,9 @@ pub mod chrome;
 pub mod job;
 pub mod login;
 pub mod rules;
+pub(crate) mod sha1;
 pub mod shoot;
+pub(crate) mod ws;
 
 pub use chrome::{CHROME_TOOL, profile_dir, profile_in_use};
 pub use job::{

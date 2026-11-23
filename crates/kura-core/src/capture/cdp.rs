@@ -5,15 +5,15 @@
 //! - 1 本の通り道で、ページに `flatten` で付いたセッションへ命令を送る。イベントは読み捨てる
 //!   （読み込みの完了などは問い合わせで確かめる）。
 //! - 同期の API なので、ジョブ・コマンドのスレッドからそのまま使える。
+//! - WebSocket は自作のクライアント（`capture::ws`。M16 段 9。前は tungstenite）。
 
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tungstenite::protocol::WebSocket;
-use tungstenite::{Message, client};
 
+use super::ws::{self, Message, WebSocket, WsError};
 use crate::{CoreError, Result};
 
 /// 1 つの命令の返事を待つ時間の上限。
@@ -36,11 +36,14 @@ pub fn endpoint_from_port_file(text: &str) -> Option<String> {
     Some(format!("ws://127.0.0.1:{port}{path}"))
 }
 
-/// 接続先が 127.0.0.1 の ws:// か確かめ、ポートを返す。
-fn local_port(url: &str) -> Option<u16> {
+/// 接続先が 127.0.0.1 の ws:// か確かめ、ポートとパス（`/` から）を返す。
+fn local_endpoint(url: &str) -> Option<(u16, &str)> {
     let rest = url.strip_prefix("ws://127.0.0.1:")?;
-    let port = rest.split('/').next()?;
-    port.parse().ok()
+    let (port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    Some((port.parse().ok()?, path))
 }
 
 /// 命令と返事の通り道。
@@ -51,30 +54,24 @@ pub trait Transport: Send {
     fn recv(&mut self, wait: Duration) -> Result<Option<String>>;
 }
 
-/// 127.0.0.1 の WebSocket。
+/// 127.0.0.1 の WebSocket（自作のクライアント `ws`。M16 段 9）。
 struct WsTransport(WebSocket<TcpStream>);
 
 impl Transport for WsTransport {
     fn send(&mut self, text: &str) -> Result<()> {
         self.0
-            .send(Message::text(text.to_string()))
+            .send_text(text)
             .map_err(|e| CoreError::Tool(format!("DevTools に送れませんでした: {e}")))
     }
 
     fn recv(&mut self, _wait: Duration) -> Result<Option<String>> {
         // 読み取りは 250ms で区切ってある（connect で設定）
         match self.0.read() {
-            Ok(Message::Text(text)) => Ok(Some(text.as_str().to_string())),
-            Ok(Message::Close(_)) => Err(CoreError::Tool("DevTools の接続が切れました".into())),
-            Ok(_) => Ok(None),
-            Err(tungstenite::Error::Io(e))
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                Ok(None)
+            Ok(Some(Message::Text(text))) => Ok(Some(text)),
+            Ok(Some(Message::Close(_))) | Err(WsError::Closed) => {
+                Err(CoreError::Tool("DevTools の接続が切れました".into()))
             }
+            Ok(_) => Ok(None),
             Err(e) => Err(CoreError::Tool(format!(
                 "DevTools から読めませんでした: {e}"
             ))),
@@ -103,14 +100,15 @@ impl Cdp {
 
     /// `ws://127.0.0.1:<port>/devtools/browser/<id>` に接続する。
     pub fn connect(url: &str, timeout: Duration) -> Result<Self> {
-        let port = local_port(url).ok_or_else(|| {
+        let (port, path) = local_endpoint(url).ok_or_else(|| {
             CoreError::Tool(format!("DevTools の接続先が正しくありません: {url}"))
         })?;
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-        let (socket, _) = client(url, stream)
+        let rng = ws::os_seeded_rng()?;
+        let socket = WebSocket::connect(stream, &format!("127.0.0.1:{port}"), path, rng)
             .map_err(|e| CoreError::Tool(format!("DevTools に接続できませんでした: {e}")))?;
         // 返事を待つあいだも区切りよく時間を確かめられるよう、読み取りは短く区切る
         socket
@@ -251,11 +249,14 @@ mod tests {
     #[test]
     fn only_connects_to_localhost() {
         assert_eq!(
-            local_port("ws://127.0.0.1:9222/devtools/browser/x"),
-            Some(9222)
+            local_endpoint("ws://127.0.0.1:9222/devtools/browser/x"),
+            Some((9222, "/devtools/browser/x"))
         );
-        assert_eq!(local_port("ws://example.com:9222/devtools/browser/x"), None);
-        assert_eq!(local_port("ws://127.0.0.1.evil:9222/x"), None);
+        assert_eq!(
+            local_endpoint("ws://example.com:9222/devtools/browser/x"),
+            None
+        );
+        assert_eq!(local_endpoint("ws://127.0.0.1.evil:9222/x"), None);
         assert!(Cdp::connect("ws://10.0.0.1:9222/devtools/browser/x", CALL_TIMEOUT).is_err());
     }
 
@@ -289,7 +290,7 @@ mod tests {
             let mut ws = tungstenite::accept(stream).unwrap();
             let mut seen = Vec::new();
             loop {
-                let Ok(Message::Text(text)) = ws.read() else {
+                let Ok(tungstenite::Message::Text(text)) = ws.read() else {
                     break;
                 };
                 let msg: Value = serde_json::from_str(text.as_str()).unwrap();
@@ -303,9 +304,11 @@ mod tests {
                     "Target.attachToTarget" => json!({"sessionId": "S1"}),
                     _ => json!({"result": {"value": "done"}}),
                 };
-                ws.send(Message::text(json!({"method": "Some.event"}).to_string()))
-                    .unwrap();
-                ws.send(Message::text(
+                ws.send(tungstenite::Message::text(
+                    json!({"method": "Some.event"}).to_string(),
+                ))
+                .unwrap();
+                ws.send(tungstenite::Message::text(
                     json!({"id": id, "result": result}).to_string(),
                 ))
                 .unwrap();
