@@ -1,4 +1,5 @@
-//! PNG（`png` クレート。版は `=` で固定。Pinned）。
+//! PNG（Pinned）。読み取りは自作の読み口 `png_read`（M16 段 6。png クレート 0.18.1 が読めた PNG は同じ値で読む。ADR-223）、
+//! 書き出しは `png` クレート（版は `=` で固定。段 7 で自作に替える）。
 //!
 //! 読み取り（`png-rs-dec/2`。`png-rs-dec/1` は旧版として残す）：
 //! - 8/16 ビット、グレー・グレー＋アルファ・RGB・RGBA・パレット（1/2/4/8 ビット）。
@@ -22,6 +23,8 @@
 
 use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
+
+use super::png_read::{self, ColorType, Info, Reader};
 use std::sync::Arc;
 
 use serde_json::json;
@@ -68,13 +71,9 @@ fn enc_err(e: impl std::fmt::Display) -> EngineError {
 }
 
 /// PNG の色の種類とビット深度から、値の画素の形式を決める（tRNS があればアルファ付きに）。
-fn target_format(
-    color: png::ColorType,
-    depth: png::BitDepth,
-    has_trns: bool,
-) -> Result<PixelFormat, EngineError> {
-    use png::{BitDepth as B, ColorType as C};
-    let sixteen = depth == B::Sixteen;
+fn target_format(color: ColorType, depth: u8, has_trns: bool) -> Result<PixelFormat, EngineError> {
+    use ColorType as C;
+    let sixteen = depth == 16;
     Ok(match (color, sixteen, has_trns) {
         (C::Indexed, _, _) => PixelFormat::Indexed8,
         (C::Grayscale, false, false) => PixelFormat::Gray8,
@@ -92,21 +91,20 @@ fn target_format(
     })
 }
 
-/// png の読み手を作る。png クレートの上限（`Limits.bytes`）は、行の作業領域とメタデータのチャンク（ICC の展開を含む）に使われるので、
-/// 画素の上限ではなくメタデータの上限を渡す。形だけ読むときは ICC とテキストを読まない（展開もしない）。
+/// 読み手を作る（最初の IDAT の頭まで読む）。上限（png クレートの `Limits.bytes` と同じ数え方）はメタデータの上限を渡す。形だけ
+/// 読むときは ICC とテキストを読まない（展開もしない）。
 fn reader<'a>(
     src: &'a mut dyn ReadSeek,
     limits: &Limits,
     header_only: bool,
-) -> Result<png::Reader<BufReader<&'a mut dyn ReadSeek>>, EngineError> {
-    let bytes = usize::try_from(limits.max_meta_bytes).unwrap_or(usize::MAX);
-    let mut dec = png::Decoder::new_with_limits(BufReader::new(src), png::Limits { bytes });
-    dec.set_transformations(png::Transformations::IDENTITY);
-    if header_only {
-        dec.set_ignore_iccp_chunk(true);
-        dec.set_ignore_text_chunk(true);
-    }
-    dec.read_info().map_err(err)
+) -> Result<Reader<BufReader<&'a mut dyn ReadSeek>>, EngineError> {
+    png_read::read_info(
+        BufReader::with_capacity(32 * 1024, src),
+        png_read::Options {
+            limit: limits.max_meta_bytes,
+            header_only,
+        },
+    )
 }
 
 /// fcTL の中身。
@@ -124,7 +122,7 @@ struct Fctl {
     blend: u8,
 }
 
-/// チャンクの並びを先に読んだ結果（画素は読まない）。IHDR・PLTE・tRNS は png クレートの読み方（`read_info`）に任せる。
+/// チャンクの並びを先に読んだ結果（画素は読まない）。IHDR・PLTE・tRNS は読み口の読み方（`png_read::read_info`）に任せる。
 #[derive(Debug, Default)]
 struct Scan {
     /// acTL（フレームの数・繰り返し）。
@@ -164,7 +162,7 @@ fn scan(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Scan, EngineError> {
     let mut seen_idat = false;
     loop {
         let mut head = [0u8; 8];
-        // 壊れた末尾（途中で切れたファイル）は png クレートの読み取りに任せる
+        // 壊れた末尾（途中で切れたファイル）は読み口の読み取りに任せる
         if src.read_exact(&mut head).is_err() {
             break;
         }
@@ -252,15 +250,11 @@ struct Plan {
     orientation: u8,
 }
 
-/// 計画を決める。色・深さ・パレット・tRNS は png クレートが読んだもの（`read_info` の結果。形だけ読むときも同じ）を使う。
-fn plan_of(s: &Scan, info: &png::Info<'_>) -> Result<Plan, EngineError> {
-    let (color, depth) = (info.color_type, info.bit_depth);
+/// 計画を決める。色・深さ・パレット・tRNS は読み口が読んだもの（`read_info` の結果。形だけ読むときも同じ）を使う。
+fn plan_of(s: &Scan, info: &Info) -> Result<Plan, EngineError> {
+    let (color, depth) = (info.color(), info.bit_depth);
     let trns = info.trns.as_deref();
-    let base = target_format(
-        color,
-        depth,
-        trns.is_some() && color != png::ColorType::Indexed,
-    )?;
+    let base = target_format(color, depth, trns.is_some() && color != ColorType::Indexed)?;
     let orientation = s.exif.as_deref().map_or(1, exif::orientation);
     let (w, h) = (info.width, info.height);
     let animated = match s.actl {
@@ -339,7 +333,7 @@ fn shape_of(p: &Plan) -> Shape {
     }
 }
 
-/// eXIf に使ったメタデータの予算を引いた上限（ICC・テキストは png クレートがこの残りで抑える）。
+/// eXIf に使ったメタデータの予算を引いた上限（ICC・テキストは読み口が、png クレートと同じ数え方でこの残りで抑える）。
 fn rest_of(limits: &Limits, s: &Scan) -> Limits {
     let used = s.exif.as_ref().map_or(0, |e| e.len() as u64);
     Limits {
@@ -412,10 +406,10 @@ const ADAM7: [(u32, u32, u32, u32); 7] = [
 ];
 
 /// 今の画像（既定の画像か、いまのフレーム）の行を読み、値の形式の行を上から順に `put` に渡す。
-/// インターレースは、png クレートの行の並べ方に頼らず、行が来る順（Adam7 の段の順）から自分で戻す。
+/// インターレースは、読み口が段ごとの生の行を返す（png クレートと同じ）ので、行が来る順（Adam7 の段の順）から自分で戻す。
 #[allow(clippy::too_many_arguments)]
-fn read_rows<R: std::io::BufRead + std::io::Seek>(
-    r: &mut png::Reader<R>,
+fn read_rows<R: Read>(
+    r: &mut Reader<R>,
     w: u32,
     h: u32,
     interlaced: bool,
@@ -423,15 +417,11 @@ fn read_rows<R: std::io::BufRead + std::io::Seek>(
     mon: &dyn Monitor,
     mut put: impl FnMut(&[u8]) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
-    let (color, depth) = (r.info().color_type, r.info().bit_depth);
-    let trns: Option<Vec<u8>> = r.info().trns.as_ref().map(|t| t.to_vec());
-    let fmt = target_format(
-        color,
-        depth,
-        color != png::ColorType::Indexed && trns.is_some(),
-    )?;
+    let (color, depth) = (r.info().color(), r.info().bit_depth);
+    let trns: Option<Vec<u8>> = r.info().trns.clone();
+    let fmt = target_format(color, depth, color != ColorType::Indexed && trns.is_some())?;
     let bpp = fmt.bytes_per_pixel();
-    let (bits, channels) = (depth as u8, color.samples());
+    let (bits, channels) = (depth, color.samples());
     let row_len = (w as usize)
         .checked_mul(bpp)
         .ok_or_else(|| EngineError::Limit("画像が大きすぎます".into()))?;
@@ -446,12 +436,9 @@ fn read_rows<R: std::io::BufRead + std::io::Seek>(
     if !interlaced {
         let mut dst = try_vec(row_len, 0u8)?;
         for y in 0..h {
-            let row = r
-                .next_row()
-                .map_err(err)?
-                .ok_or_else(|| err("行が足りません"))?;
+            let row = r.next_row()?.ok_or_else(|| err("行が足りません"))?;
             unpack_row(
-                row.data(),
+                row,
                 &mut dst,
                 w as usize,
                 color,
@@ -481,13 +468,10 @@ fn read_rows<R: std::io::BufRead + std::io::Seek>(
             continue;
         }
         for line in 0..ph {
-            let row = r
-                .next_row()
-                .map_err(err)?
-                .ok_or_else(|| err("行が足りません"))?;
+            let row = r.next_row()?.ok_or_else(|| err("行が足りません"))?;
             let part = &mut tmp[..pw as usize * bpp];
             unpack_row(
-                row.data(),
+                row,
                 part,
                 pw as usize,
                 color,
@@ -514,26 +498,19 @@ fn read_rows<R: std::io::BufRead + std::io::Seek>(
 }
 
 /// 1 枚の画像を読む。インターレースでなければ行ごとに組む（作業領域は 1 行と 1 タイル行。値の大きさの写しを持たない）。
-fn read_still<R: std::io::BufRead + std::io::Seek>(
-    r: &mut png::Reader<R>,
-    mon: &dyn Monitor,
-) -> Result<Raster, EngineError> {
+fn read_still<R: Read>(r: &mut Reader<R>, mon: &dyn Monitor) -> Result<Raster, EngineError> {
     let (w, h, color, depth, interlaced) = {
         let info = r.info();
         (
             info.width,
             info.height,
-            info.color_type,
+            info.color(),
             info.bit_depth,
             info.interlaced,
         )
     };
-    let trns: Option<Vec<u8>> = r.info().trns.as_ref().map(|t| t.to_vec());
-    let fmt = target_format(
-        color,
-        depth,
-        color != png::ColorType::Indexed && trns.is_some(),
-    )?;
+    let trns: Option<Vec<u8>> = r.info().trns.clone();
+    let fmt = target_format(color, depth, color != ColorType::Indexed && trns.is_some())?;
     let palette = palette_of(color, r.info().palette.as_deref(), trns.as_deref())?;
     let palette_len = palette.as_ref().map(|p| p.colors.len());
     let mut b = crate::value::RasterBuilder::new(w, h, fmt, palette)?;
@@ -543,12 +520,12 @@ fn read_still<R: std::io::BufRead + std::io::Seek>(
 
 /// PLTE と tRNS からパレットを作る（パレットの画像でなければ None）。
 fn palette_of(
-    color: png::ColorType,
+    color: ColorType,
     rgb: Option<&[u8]>,
     trns: Option<&[u8]>,
 ) -> Result<Option<Palette>, EngineError> {
     match (color, rgb) {
-        (png::ColorType::Indexed, Some(rgb)) => {
+        (ColorType::Indexed, Some(rgb)) => {
             let alphas = trns.unwrap_or_default();
             Ok(Some(Palette {
                 colors: rgb
@@ -560,15 +537,15 @@ fn palette_of(
                     .collect(),
             }))
         }
-        (png::ColorType::Indexed, None) => Err(err("パレットがありません")),
+        (ColorType::Indexed, None) => Err(err("パレットがありません")),
         _ => Ok(None),
     }
 }
 
 /// APNG のフレームを重ねて、キャンバスいっぱいのフレームの列にする。
 /// Indexed8 の経路で消した画素は、消す色の番号（パレットの色、アルファ 0）になる（RGB は仕様の「透明な黒」と違うが見えない）。
-fn read_animation<R: std::io::BufRead + std::io::Seek>(
-    r: &mut png::Reader<R>,
+fn read_animation<R: Read>(
+    r: &mut Reader<R>,
     s: &Scan,
     p: &Plan,
     frames: &[Fctl],
@@ -579,13 +556,13 @@ fn read_animation<R: std::io::BufRead + std::io::Seek>(
     let bpp = fmt.bytes_per_pixel();
     let indexed = fmt == PixelFormat::Indexed8;
     let interlaced = r.info().interlaced;
-    let color = r.info().color_type;
-    let trns: Option<Vec<u8>> = r.info().trns.as_ref().map(|t| t.to_vec());
+    let color = r.info().color();
+    let trns: Option<Vec<u8>> = r.info().trns.clone();
     let src_palette = palette_of(color, r.info().palette.as_deref(), trns.as_deref())?;
     let src_fmt = target_format(
         color,
         r.info().bit_depth,
-        color != png::ColorType::Indexed && trns.is_some(),
+        color != ColorType::Indexed && trns.is_some(),
     )?;
     let palette_len = src_palette.as_ref().map(|q| q.colors.len());
     let colors: Option<Vec<[u8; 4]>> = src_palette.as_ref().map(|q| q.colors.clone());
@@ -606,7 +583,7 @@ fn read_animation<R: std::io::BufRead + std::io::Seek>(
         // 既定の画像がアニメの最初のフレームなら、読み手はもうその画素の前にいる。ほかは次のフレームへ進む
         // （既定の画像がアニメの外なら、その画素は読み捨てられる）
         if k > 0 || !s.default_is_frame {
-            let fc = r.next_frame_info().map_err(err)?;
+            let fc = r.next_frame_info()?;
             if (fc.width, fc.height, fc.x_offset, fc.y_offset) != (f.w, f.h, f.x, f.y) {
                 return Err(err("fcTL の読み方が合いません"));
             }
@@ -703,9 +680,9 @@ impl Decoder for PngDecoderV1 {
         let r = reader(src, limits, true)?;
         let info = r.info();
         let fmt = target_format(
-            info.color_type,
+            info.color(),
             info.bit_depth,
-            info.trns.is_some() && info.color_type != png::ColorType::Indexed,
+            info.trns.is_some() && info.color() != ColorType::Indexed,
         )?;
         Ok(Shape::Image {
             w: Dim::Exact(u64::from(info.width)),
@@ -734,12 +711,12 @@ fn unpack_row(
     row: &[u8],
     dst: &mut [u8],
     w: usize,
-    color: png::ColorType,
+    color: ColorType,
     bits: u8,
     channels: usize,
     trns: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    use png::ColorType as C;
+    use ColorType as C;
     if bits < 8 {
         // グレーかパレットの 1/2/4 ビット
         let per_byte = 8 / bits as usize;
@@ -767,6 +744,11 @@ fn unpack_row(
     }
     let add_alpha = matches!(color, C::Grayscale | C::Rgb) && trns.is_some();
     let dst_px = (channels + usize::from(add_alpha)) * sample_bytes;
+    if sample_bytes == 1 && !add_alpha {
+        // 8 ビットでアルファを足さなければ、行をそのまま写す（画素ごとに写すのと同じ値）
+        dst[..w * src_px].copy_from_slice(&row[..w * src_px]);
+        return Ok(());
+    }
     for x in 0..w {
         let s = &row[x * src_px..(x + 1) * src_px];
         let d = &mut dst[x * dst_px..(x + 1) * dst_px];
@@ -800,7 +782,8 @@ fn unpack_row(
     Ok(())
 }
 
-/// tRNS のサンプルの値。png クレートは 16 ビット未満なら下位の 1 バイトだけ、16 ビットなら 2 バイト（ビッグエンディアン）で持つ。
+/// tRNS のサンプルの値。読み口は（png クレートと同じく）16 ビット未満なら下位の 1 バイトだけ、16 ビットなら 2 バイト（ビッグ
+/// エンディアン）で持つ。
 fn trns_sample(t: &[u8], c: usize, sixteen: bool) -> Option<u16> {
     if sixteen {
         t.get(c * 2..c * 2 + 2)
@@ -810,28 +793,25 @@ fn trns_sample(t: &[u8], c: usize, sixteen: bool) -> Option<u16> {
     }
 }
 
-fn read_meta(info: &png::Info<'_>) -> ImageMeta {
+fn read_meta(info: &Info) -> ImageMeta {
     let mut meta = ImageMeta::default();
     if let Some(icc) = &info.icc_profile {
-        meta.icc = Some(Arc::new(icc.to_vec()));
+        meta.icc = Some(Arc::new(icc.clone()));
     }
-    if let Some(d) = info.pixel_dims
-        && d.unit == png::Unit::Meter
+    if let Some((x, y, unit)) = info.pixel_dims
+        && unit == 1
     {
         // 1 メートルあたり → 1 インチあたり（四捨五入。整数で計算する）
         let dpi =
             |ppm: u32| u32::try_from((u64::from(ppm) * 254 + 5_000) / 10_000).unwrap_or(u32::MAX);
-        meta.dpi = Some((dpi(d.xppu), dpi(d.yppu)));
+        meta.dpi = Some((dpi(x), dpi(y)));
     }
-    for t in &info.uncompressed_latin1_text {
-        meta.text
-            .entry(t.keyword.clone())
-            .or_insert_with(|| t.text.clone());
+    for (k, t) in &info.uncompressed_latin1_text {
+        meta.text.entry(k.clone()).or_insert_with(|| t.clone());
     }
-    for t in info.utf8_text.iter().filter(|t| !t.compressed) {
-        if let Ok(text) = t.get_text() {
-            meta.text.entry(t.keyword.clone()).or_insert(text);
-        }
+    // 圧縮していない iTXt（読み口は圧縮したものを持たない）
+    for (k, t) in &info.utf8_text {
+        meta.text.entry(k.clone()).or_insert_with(|| t.clone());
     }
     meta
 }
@@ -1221,7 +1201,7 @@ mod tests {
     }
 
     /// 壊れたファイル・上限を超えるファイルは、落ちずにエラーになる（E25）。壊したあとで CRC を付け直し、
-    /// png クレートの検査の先（自前の行の展開・パレットの番号の確かめ）まで届かせる。panic を受け止めずに直接呼ぶ。
+    /// 読み口の検査の先（自前の行の展開・パレットの番号の確かめ）まで届かせる。panic を受け止めずに直接呼ぶ。
     #[test]
     fn broken_or_huge_files_are_errors() {
         use crate::testfiles::{FileGen, crc32};

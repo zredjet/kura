@@ -42,6 +42,9 @@ pub(crate) mod ogg_read;
 pub mod pcm;
 pub mod platform;
 pub mod png;
+#[cfg(test)]
+pub(crate) mod png_old;
+pub(crate) mod png_read;
 pub mod psd;
 pub mod recorded;
 pub mod stream;
@@ -51,6 +54,7 @@ pub(crate) mod symph;
 pub mod vorbis;
 pub mod wav;
 pub mod webp;
+pub mod zlib;
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Seek, Write};

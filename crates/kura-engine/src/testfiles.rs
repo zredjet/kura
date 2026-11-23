@@ -961,10 +961,7 @@ fn psd_bytes(g: &PsdGen) -> Result<Vec<u8>, EngineError> {
                 out.extend(r);
             }
         }
-        2 => out.extend(miniz_oxide::deflate::compress_to_vec_zlib(
-            &planes.concat(),
-            6,
-        )),
+        2 => out.extend(crate::codec::zlib::store_zlib(&planes.concat())),
         _ => {
             for p in planes {
                 out.extend(p);
@@ -1013,7 +1010,7 @@ fn aseprite_bytes(
             ));
         }
     };
-    let zlib = |d: &[u8]| miniz_oxide::deflate::compress_to_vec_zlib(d, 6);
+    let zlib = |d: &[u8]| crate::codec::zlib::store_zlib(d);
     // 画素の値（流れはフレームと層、位置は画素の番号）
     let pixel = |stream: u64, i: u64| -> Vec<u8> {
         let mut r =

@@ -2193,6 +2193,7 @@ dependencies = [
  "asefile",
  "blake3",
  "ebur128",
+ "fdeflate",
  "gif",
  "image-webp",
  "jpeg-encoder",

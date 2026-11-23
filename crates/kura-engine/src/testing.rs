@@ -383,6 +383,64 @@ pub fn fuzz_peaks(data: &[u8]) -> Result<(), String> {
     }
 }
 
+/// ファズの対象（`fuzz/` の `inflate` と `tests/fuzz_smoke.rs` の `inflate`。M16 段 6）：zlib と生の deflate を、3 つの受け付け
+/// （zlib・miniz_oxide・fdeflate）で、出力の上限 1 MiB・いろいろな取り方で展開する。見つけたい不具合（panic・上限を超えた
+/// 出力・進まない読み・zlib と miniz の受け付けの両方が読めたのに値が違う）は `Err`、壊れた流れとしてのエラーは `Ok`。
+pub fn fuzz_inflate(data: &[u8]) -> Result<(), String> {
+    use crate::codec::zlib::{Flavor, Inflate, Options, SliceInput};
+    const LIMIT: u64 = 1 << 20;
+    let run = |zlib: bool, flavor: Flavor, want: usize| -> Result<Option<Vec<u8>>, String> {
+        let mut z = Inflate::new(
+            SliceInput::new(data),
+            Options {
+                zlib,
+                check_adler: true,
+                limit: LIMIT,
+                flavor,
+            },
+        );
+        let mut out = Vec::new();
+        loop {
+            let n = match z.fill(want) {
+                Ok(n) => n,
+                Err(_) => return Ok(None),
+            };
+            out.extend_from_slice(&z.ready()[..n]);
+            z.consume(n);
+            if out.len() as u64 > LIMIT {
+                return Err(format!("inflate: 上限を超えて出した（{}）", out.len()));
+            }
+            if z.finished() {
+                return Ok(Some(out));
+            }
+            if n == 0 {
+                return Err("inflate: 終わらないのに進まない".into());
+            }
+        }
+    };
+    let r = catch_own_panic(|| -> Result<Result<(), String>, EngineError> {
+        let check = || -> Result<(), String> {
+            for zlib in [true, false] {
+                let a = run(zlib, Flavor::Zlib, 4096)?;
+                let b = run(zlib, Flavor::Miniz, 1)?;
+                let _ = run(zlib, Flavor::Fdeflate, 65_536)?;
+                if let (Some(a), Some(b)) = (&a, &b)
+                    && a != b
+                {
+                    return Err("inflate: zlib と miniz の受け付けで値が違う".into());
+                }
+            }
+            Ok(())
+        };
+        Ok(check())
+    });
+    match r {
+        Err(at) => Err(format!("inflate: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(r)) => r,
+    }
+}
+
 /// ファズの対象（`fuzz/` の `model_glb` と `tests/fuzz_smoke.rs` の `model_glb`）：glb の情報を読み、焼き込み、2 つの向きで
 /// 小さく描く（上限は `ModelLimits::fuzz`）。見つけたい不具合（自前のコードの panic・`Internal`・情報と焼き込みの食い違い・
 /// 大きさの食い違い）は `Err`、壊れた glb としてのエラー・上限は `Ok`。

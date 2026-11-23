@@ -15,11 +15,11 @@ autotests = false
 # - blake3：すべてのダイジェスト
 # - rand_chacha：乱数（ChaCha8）。鍵は determinism::key_from_seed で自前に作るので rand_core の実装には頼らない
 # - libm：超越関数（ワークスペースで固定）
-# - png：PNG の読み書き（R2 は Cargo.lock の fdeflate・flate2・miniz_oxide の版にも依存する。コーデックのゴールデンで見張る）
+# - png：PNG の書き出し（R2 は Cargo.lock の fdeflate・flate2・miniz_oxide の版にも依存する。コーデックのゴールデンで見張る）。
+#   読み取りは M16 段 6 から自作（codec/png_read.rs・zlib.rs）で、png クレートは段 7 で外す
 # - zune-jpeg：JPEG の読み取り。SIMD を外して（default-features = false）、どのターゲットでも同じ整数の経路にする
 # - jpeg-encoder：JPEG の書き出し（SIMD の feature は入れない）
 # - gif：GIF の読み書き（R2 は Cargo.lock の weezl の版にも依存する）
-# - miniz_oxide：aseprite・PSD の zlib の展開（上限付き）
 # - image-webp：WebP の読み取り（可逆・非可逆・アニメ）と可逆の書き出し
 # - resvg：SVG の描画。中で std の三角関数（OS の libm）を使うので、結果は環境に依存する（R1 を約束しない。§9.4 のアンカーを作る）
 # - symphonia-*：AAC-LC と旧版の Vorbis（段 9 から、超越関数を libm に差し替えた third_party の写しで
@@ -38,7 +38,6 @@ specta = ["dep:specta"]
 [dependencies]
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 libm.workspace = true
-miniz_oxide = "=0.8.9"
 gif = { version = "=0.14.2", default-features = false, features = ["std", "raii_no_panic"] }
 image-webp = "=0.2.4"
 nanomp3 = { version = "=0.2.0", default-features = false, features = ["alloc"] }
@@ -78,6 +77,12 @@ symphonia-bundle-flac = { version = "=0.6.1", default-features = false }
 # symphonia-codec-alac：自作の ALAC の読み取り（codec/alac_read.rs・mp4_read.rs）の照合相手。前の
 # `m4a-alac-symphonia-dec/1` の中身で、同じ入力から同じ値を読むことを確かめる（M16 段 3。ADR-219）
 symphonia-codec-alac = { version = "=0.6.1", default-features = false }
+# miniz_oxide：自作の zlib の展開（codec/zlib.rs）の照合相手と、試験で圧縮した zlib を作る（M16 段 6 で本番から外した。前は
+# aseprite の zlib の展開）
+miniz_oxide = "=0.8.9"
+# fdeflate：自作の展開の fdeflate の受け付け（`zlib::Flavor::Fdeflate`。PNG の IDAT・iCCP）の照合相手（png クレート 0.18.1 の
+# 中の展開と同じ版。M16 段 6）
+fdeflate = "=0.3.7"
 
 [lints]
 workspace = true

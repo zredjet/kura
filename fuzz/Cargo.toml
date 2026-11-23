@@ -184,3 +184,10 @@ path = "fuzz_targets/recipe.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "inflate"
+path = "fuzz_targets/inflate.rs"
+test = false
+doc = false
+bench = false

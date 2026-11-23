@@ -873,18 +873,19 @@ fn inflate(
     let src = file
         .get(start..start.saturating_add(len))
         .ok_or_else(|| err("圧縮したデータが途中で切れています"))?;
-    let mut out = try_vec(expect, 0u8)?;
-    let n = miniz_oxide::inflate::decompress_slice_iter_to_slice(
-        &mut out,
-        std::iter::once(src),
-        true,
-        false,
-    )
-    .map_err(|_| err("圧縮したデータが壊れているか、大きすぎます"))?;
-    if n != expect {
-        return Err(err("展開したデータの大きさが合いません"));
+    // 自作の展開（M16 段 6。前の miniz_oxide の `decompress_slice_iter_to_slice` と同じ受け付け：zlib の頭・Adler-32 を照らし、
+    // 1 つだけの符号の不完全な表を許し、流れのあとのデータは読まない）
+    match crate::codec::zlib::inflate_exact(src, expect) {
+        Ok(out) => Ok(out),
+        Err(crate::codec::zlib::Error::Z(crate::codec::zlib::ZError::Short)) => {
+            Err(err("展開したデータの大きさが合いません"))
+        }
+        // 確保できないのは前（`try_vec`）と同じく上限の誤り
+        Err(crate::codec::zlib::Error::Z(crate::codec::zlib::ZError::Alloc(n))) => {
+            Err(EngineError::Limit(format!("{n} 個の領域を確保できません")))
+        }
+        Err(_) => Err(err("圧縮したデータが壊れているか、大きすぎます")),
     }
-    Ok(out)
 }
 
 /// 1 フレームを描く間の状態。
