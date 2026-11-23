@@ -1,0 +1,9 @@
+{"name":"fixture-aac-lc-afconvert.m4a","source":{"path":"aac-lc-afconvert.m4a","type":"fixture"},"value":"57522b8ec923ef4105d7b876eccb685a880986be589e5ea7ac547a8dd5b0028e"}
+{"name":"fixture-aac-lc-ffmpeg.m4a","source":{"path":"aac-lc-ffmpeg.m4a","type":"fixture"},"value":"ec1bbc6c99f07ec96fd664a985f14b08a0483eca88f93f8ed7931eaae3ef5055"}
+{"name":"fixture-aac-lc-mono.m4a","source":{"path":"aac-lc-mono.m4a","type":"fixture"},"value":"ad8c632bd05e7b0c7816590202b5ba1c7632a1f7a5e218415120e2a1966532b0"}
+{"name":"fixture-aac-lc-3ch.m4a","source":{"path":"aac-lc-3ch.m4a","type":"fixture"},"value":"2e64cf88129bee702d8fbeb5986b6879e7b91d72d309d7dcb2e2bcbc9109d5a3"}
+{"name":"fixture-aac-lc-4ch.m4a","source":{"path":"aac-lc-4ch.m4a","type":"fixture"},"value":"d46ce4ecf72c5441599d2d2ee5c2c68db24bc8bdf3d171fdaad3216b951b7be2"}
+{"name":"fixture-aac-lc-5ch-tones.m4a","source":{"path":"aac-lc-5ch-tones.m4a","type":"fixture"},"value":"3dbef992122211d3597fa72c2ea4c44bffe449ec052e35fcf2685118d73a19b0"}
+{"name":"fixture-aac-lc-6ch-afconvert.m4a","source":{"path":"aac-lc-6ch-afconvert.m4a","type":"fixture"},"value":"6a1cc1cfa04e77cd3de7e78be104f05df1ac5fc03657a2b8a2abb1950f2c54e3"}
+{"name":"fixture-aac-lc-8ch-afconvert.m4a","source":{"path":"aac-lc-8ch-afconvert.m4a","type":"fixture"},"value":"ed60d3b58f194fbc761a7cba5e09e3e2c313456f2dbd0f07ae2d5370f272876f"}
+{"name":"fixture-aac-lc-5ch.m4a","source":{"path":"aac-lc-5ch.m4a","type":"fixture"},"value":"cade16fb23822308604723eaf0c8244ec5fc91d631d4a6d01a53ba193a7233f5"}

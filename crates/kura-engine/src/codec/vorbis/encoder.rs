@@ -43,7 +43,7 @@
 //!
 //! # 決まっていること
 //!
-//! - コメント：vendor は `super::VENDOR`（"kura"）。項目は `symph::vorbis_comments_for(&meta, frames)` の LOOPSTART・LOOPLENGTH（あれば）の
+//! - コメント：vendor は `super::VENDOR`（"kura"）。項目は `common::vorbis_comments_for(&meta, frames)` の LOOPSTART・LOOPLENGTH（あれば）の
 //!   直後に `ENCODER=ogg-vorbis-kura-enc/1`、続いて残りのタグ。元の `ENCODER`（`vorbis:ENCODER`。名前は大文字小文字を
 //!   問わない）は運ばない（E28：RPG ツクール MV/MZ の読み方に合わせ、LOOPLENGTH の次の項目の長さの下位バイトが数字に
 //!   ならない番兵になる）。
@@ -541,9 +541,9 @@ pub(crate) fn vorbis_planes(audio: &Audio) -> Result<Vec<Vec<f32>>, EngineError>
 }
 
 /// コメントの項目（E28 の並び）：LOOPSTART・LOOPLENGTH（あれば）、`ENCODER=ogg-vorbis-kura-enc/1`、残りのタグ
-/// （`symph::vorbis_comments_for` の順。元の ENCODER は落とす）。`frames` は音声の長さ（ループ点は `start < end ≤ frames` だけ書く）。
+/// （`common::vorbis_comments_for` の順。元の ENCODER は落とす）。`frames` は音声の長さ（ループ点は `start < end ≤ frames` だけ書く）。
 pub(crate) fn comment_list(meta: &AudioMeta, frames: u64) -> Vec<(String, String)> {
-    let all = crate::codec::symph::vorbis_comments_for(meta, frames);
+    let all = crate::codec::common::vorbis_comments_for(meta, frames);
     let mut out = Vec::with_capacity(all.len() + 1);
     let mut rest = Vec::with_capacity(all.len());
     for (key, value) in all {
@@ -2100,8 +2100,8 @@ mod tests {
         planes
     }
 
-    /// symphonia（kura の Ogg Vorbis の読み口）で読む。
-    fn decode_symphonia(bytes: &[u8]) -> Arc<Audio> {
+    /// kura の Ogg Vorbis の読み取り（固定の組の今の読み手。M16 段 2 から自作の `ogg-vorbis-kura-dec/1`）で読む。
+    fn decode_kura(bytes: &[u8]) -> Arc<Audio> {
         let (v, _) = crate::codec::CodecSet::pinned()
             .decode(
                 &mut Cursor::new(bytes.to_vec()),
@@ -2110,7 +2110,7 @@ mod tests {
                 &crate::limits::Limits::default(),
                 &crate::monitor::NoMonitor,
             )
-            .unwrap_or_else(|e| panic!("symphonia で読めません：{e}"));
+            .unwrap_or_else(|e| panic!("kura の読み取りで読めません：{e}"));
         match v {
             Value::Audio(a) => a,
             _ => panic!("音声ではありません"),
@@ -2288,11 +2288,11 @@ mod tests {
         if count >= 3 && plan[count - 2].window.long_to_short() {
             stats.a5_before_last += 1;
         }
-        // symphonia：長さ・チャンネル・レート
-        let sym = decode_symphonia(&bytes);
-        assert_eq!(sym.frames(), frames, "{name}：symphonia の長さ");
+        // kura の読み取り：長さ・チャンネル・レート
+        let sym = decode_kura(&bytes);
+        assert_eq!(sym.frames(), frames, "{name}：kura の読み取りの長さ");
         assert_eq!((sym.channels(), sym.rate()), (ch, rate), "{name}");
-        // lewton（低い層。最後のページのグラニュールで切る）：長さと、symphonia との値の差
+        // lewton（低い層。最後のページのグラニュールで切る）：長さと、kura の読み取りとの値の差
         let (outs, mut lew) = decode_lewton(&bodies);
         for p in &mut lew {
             assert!(
@@ -2302,9 +2302,8 @@ mod tests {
             );
             p.truncate(frames);
         }
-        // 値：symphonia（planes は kura の並び＝WAV）と lewton（Vorbis の並び）が、すべてのチャンネルの数で 1e-4 以内。
-        // symphonia は third_party/ の直した写し（residue 0・1 を 3 チャンネル以上で読むときの分類の語のはみ出しを直したもの。
-        // 読み取りの識別子 /2）を使うので、3 チャンネル以上（uncoupled）も lewton と同じ値になる
+        // 値：kura の読み取り（planes は kura の並び＝WAV）と lewton（Vorbis の並び）が、すべてのチャンネルの数で 1e-4 以内
+        // （3 チャンネル以上（uncoupled）も。M16 段 2 までは symphonia の直した写しで読んでいた）
         for c in 0..ch {
             let d = sym.to_planes().unwrap()[ORDER[ch - 1][c]]
                 .iter()
@@ -2313,7 +2312,7 @@ mod tests {
                 .fold(0f32, crate::math::max32);
             assert!(
                 d <= 1e-4,
-                "{name}：チャンネル {c} で symphonia と lewton の差 {d}"
+                "{name}：チャンネル {c} で kura の読み取りと lewton の差 {d}"
             );
         }
         // lewton の読み口（OggStreamReader）の数え方の写しでも N。合わないなら、ページの割り方で避けられない場合

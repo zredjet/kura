@@ -1,0 +1,4 @@
+{"name":"fixture-ogg-vorbis-loop.ogg","source":{"path":"ogg-vorbis-loop.ogg","type":"fixture"},"value":"66b088f3b88aef344d59d4db0d2f6f8144342ba6c6cb819828b77ca03f7126c3"}
+{"name":"fixture-ogg-vorbis-ffmpeg.ogg","source":{"path":"ogg-vorbis-ffmpeg.ogg","type":"fixture"},"value":"b39a556c0e06d22140d7b70c7f90725d6c39d48999b0e3449b5cbb85feb7c3ca"}
+{"name":"fixture-ogg-vorbis-3ch.ogg","source":{"path":"ogg-vorbis-3ch.ogg","type":"fixture"},"value":"e1a0c65c5239a0db0188de531236adfa2bf2d17afb54c129440fe9770eba58a4"}
+{"name":"fixture-ogg-vorbis-5ch.ogg","source":{"path":"ogg-vorbis-5ch.ogg","type":"fixture"},"value":"8f13034b98f1926f54a07485eacc538e83a2a340e59ecd9a9a49d53268671041"}

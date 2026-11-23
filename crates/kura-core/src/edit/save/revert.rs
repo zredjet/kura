@@ -916,7 +916,8 @@ fn rebuild_stream_in(
 /// GC の照合の結果（[`verify_version`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// 作り直したバイト列の生の BLAKE3 が版の出力と同じ（消してよい）。
+    /// 作り直したバイト列の生の BLAKE3 が版の出力と同じ（消してよい）。記録の書き手が退いたものなら、作り直した値が記録と
+    /// 同じ（バイト列は比べない。ADR-224）。
     Match,
     /// 値かバイト列が記録と違う（ファイルを残す：kept）。
     Mismatch(String),
@@ -927,7 +928,9 @@ pub enum Verdict {
 
 /// 猶予中の版 `version` を、版の文書と入力の記録から作り直して照らす（GC。docs/editing.md §14 の安全網 2）。読みは
 /// [`read::read_recorded_input`]（アンカー → 元。OS のデコーダは呼ばない）、書くのは記録のエンコーダだけ（ほかで書くと
-/// バイト列を比べられない）。予算は一括の予算（`admit_bulk_with`）。止める指示（一時停止・中止）は `Flow::Stop`。
+/// バイト列を比べられない）。ただし記録のエンコーダが退いたもの（`CodecSet::is_retired_encoder`）なら、今の組の同じ形式の
+/// エンコーダで書き、値の一致だけで Match にする（ADR-224）。予算は一括の予算（`admit_bulk_with`）。止める指示（一時停止・
+/// 中止）は `Flow::Stop`。
 pub(crate) fn verify_version(
     engine: &EngineServices,
     ctx: &dyn UnitCx,
@@ -955,8 +958,15 @@ pub(crate) fn verify_version(
         version: version.clone(),
         inputs,
     };
+    // 記録の書き手が退いたもの（`codec::RETIRED_ENCODERS`。このビルドにない）なら、値だけで照らす：今の組の同じ形式の
+    // 書き手で書き、バイト列は比べない（作り直しは値を記録と照らしてから書く。ADR-224）
+    let retired = version
+        .record()
+        .ok()
+        .and_then(|r| r.encoded)
+        .is_some_and(|e| engine.codecs().is_retired_encoder(&e.codec));
     let rules = Rules {
-        fallback_encoder: false,
+        fallback_encoder: retired,
         platform: false,
         progress: false,
         retain_work: false,
@@ -975,7 +985,7 @@ pub(crate) fn verify_version(
         match rebuild(engine, ctx, version.item_id, kind, &target, rules, &part) {
             Ok(Flow::Stop(end)) => return Ok(Flow::Stop(end)),
             Ok(Flow::Go(r)) => {
-                if r.out_hash == version.output_hash {
+                if retired || r.out_hash == version.output_hash {
                     Verdict::Match
                 } else {
                     Verdict::Mismatch(format!(

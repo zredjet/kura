@@ -1,5 +1,6 @@
 // scripts/third-party-licenses.mjs の Rust の部分（第三者のライセンスの一覧に載せる依存の名前と節）。
-import { readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -31,17 +32,25 @@ describe('crateLabel', () => {
   });
 
   it('third_party/ の写し（path の依存）には改変とソースの在り処を添える', () => {
+    // 今のリポジトリに写しはない（M16 段 10 で symphonia の写しを外した）ので、写しのあるリポジトリの形を一時のディレクトリに作る
+    const repo = mkdtempSync(join(tmpdir(), 'kura-licenses-'));
+    writeFileSync(
+      join(repo, 'Cargo.toml'),
+      '[workspace.package]\nlicense = "MIT OR Apache-2.0"\nrepository = "https://github.com/zredjet/kura"\n',
+    );
+    mkdirSync(join(repo, 'third_party', 'symphonia-codec-vorbis'), { recursive: true });
+    writeFileSync(join(repo, 'third_party', 'symphonia-codec-vorbis', 'KURA.md'), '# 変更\n');
     const crate = {
       name: 'symphonia-codec-vorbis',
       version: '0.6.1',
       source: null,
-      manifest_path: join(root, 'third_party', 'symphonia-codec-vorbis', 'Cargo.toml'),
+      manifest_path: join(repo, 'third_party', 'symphonia-codec-vorbis', 'Cargo.toml'),
     };
     // .app の受け手がたどれるよう、リポジトリの URL（ルートの Cargo.toml の workspace.package.repository）を書く
-    expect(crateLabel(crate, root)).toBe(
+    expect(crateLabel(crate, repo)).toBe(
       'symphonia-codec-vorbis 0.6.1（kura が改変。ソース：https://github.com/zredjet/kura の third_party/symphonia-codec-vorbis/、変更は KURA.md）',
     );
-    expect(crateLabel(crate, root, 'https://example.com/r')).toBe(
+    expect(crateLabel(crate, repo, 'https://example.com/r')).toBe(
       'symphonia-codec-vorbis 0.6.1（kura が改変。ソース：https://example.com/r の third_party/symphonia-codec-vorbis/、変更は KURA.md）',
     );
   });
@@ -64,6 +73,22 @@ describe('crateLabel', () => {
       manifest_path: join(root, 'crates', 'vorbis-tables', 'Cargo.toml'),
     };
     expect(crateLabel(crate, root)).toBe('vorbis-tables 0.1.0');
+  });
+
+  it('crates/ の下の MPL-2.0 の自前のクレート（symphonia の表の写し）にはソースの在り処を添える', () => {
+    const crate = {
+      name: 'aac-tables',
+      version: '0.2.0',
+      source: null,
+      license: 'MPL-2.0',
+      manifest_path: join(root, 'crates', 'aac-tables', 'Cargo.toml'),
+    };
+    expect(crateLabel(crate, root)).toBe(
+      'aac-tables 0.2.0（ソース：https://github.com/zredjet/kura の crates/aac-tables/）',
+    );
+    expect(crateLabel(crate, root, 'https://example.com/r')).toBe(
+      'aac-tables 0.2.0（ソース：https://example.com/r の crates/aac-tables/）',
+    );
   });
 
   it('リポジトリの外の third_party/ は写しとみなさない', () => {

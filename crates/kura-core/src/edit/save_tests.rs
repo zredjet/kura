@@ -317,6 +317,8 @@ pub(super) struct Setup {
     pub(super) fault: Option<Fault>,
     pub(super) gc_hook: Option<GcHook>,
     pub(super) gc_fault: Option<GcFault>,
+    pub(super) retire_hook: Option<crate::edit::retire::RetireHook>,
+    pub(super) retire_fault: Option<Fault>,
 }
 
 /// 保存・GC・取り込みのジョブだけを動かすライブラリ（サムネイル・解析のジョブは登録しないので、置き換えたあとの pending が
@@ -358,6 +360,8 @@ impl Env {
             fault,
             gc_hook,
             gc_fault,
+            retire_hook,
+            retire_fault,
         } = setup;
         let dir = tempfile::tempdir().unwrap();
         let lib = Arc::new(Library::create(&dir.path().join("L")).unwrap());
@@ -382,12 +386,20 @@ impl Env {
         if let Some(fault) = gc_fault {
             gc = gc.with_fault(fault);
         }
+        let mut retire = crate::edit::retire::RetireHandler::new(engine.clone());
+        if let Some(hook) = retire_hook {
+            retire = retire.with_hook(hook);
+        }
+        if let Some(fault) = retire_fault {
+            retire = retire.with_fault(fault);
+        }
         let events = Arc::new(Mutex::new(Vec::new()));
         let jobs = JobManager::new(
             lib.clone(),
             vec![
                 (JobKind::Edit, Arc::new(handler)),
                 (JobKind::Gc, Arc::new(gc)),
+                (JobKind::Retire, Arc::new(retire)),
                 (
                     JobKind::Import,
                     Arc::new(crate::import::ImportHandler::new(Arc::new(FakeBackend))),
@@ -661,7 +673,7 @@ fn s1_overwrite_keeps_identity_and_adds_versions_0_and_1() {
     assert_eq!(vs[0].value_digest, Some(r0.decoded.unwrap().value_digest));
     assert_eq!(
         vs[1].record().unwrap().encoded.unwrap().codec,
-        "png-rs-enc/1"
+        "png-kura-enc/1"
     );
     let inputs = env
         .lib
@@ -1975,7 +1987,7 @@ fn s4_revert_rebuilds_after_gc() {
         ]
     );
     let r3 = vs[3].record().unwrap();
-    assert_eq!(r3.encoded.unwrap().codec, "png-rs-enc/1");
+    assert_eq!(r3.encoded.unwrap().codec, "png-kura-enc/1");
     assert_eq!(r3.revert.map(|r| r.rebuilt), Some(true));
     assert_consistent(&env.lib);
 }
@@ -2039,7 +2051,7 @@ fn revert_rebuild_without_the_recorded_encoder_uses_the_current_one() {
         let r3 = vs[3].record().unwrap();
         assert_eq!(
             r3.encoded.map(|e| e.codec),
-            Some("png-rs-enc/1".to_string()),
+            Some("png-kura-enc/1".to_string()),
             "新しい書き出しの記録"
         );
         assert_eq!(r3.warnings, warnings);

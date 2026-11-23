@@ -2036,6 +2036,54 @@ fn export_files_0016_adds_a_table_and_keeps_everything_else() {
     assert!(violations(&conn).unwrap().is_empty());
 }
 
+const V17: usize = 17;
+
+/// 0017：jobs_kind に retire（退役する読み手の記録をアンカーへ移すジョブ。M16 段 5）を足す。CHECK の入れ替えだけなので、
+/// 表・索引・トリガ・FTS と既存の行は同じで、増えるものはない。前からの種類は入り、知らない種類は名前付きの CHECK で断る。
+#[test]
+fn retire_job_0017_widens_jobs_kind_and_keeps_everything_else() {
+    let mut conn = filled_v6();
+    migrate_until(&mut conn, V17 - 1).unwrap();
+    crate::db::testing::fill_v14(&conn);
+    assert_eq!(MIGRATIONS[V17 - 1].name, "0017_retire_job");
+    assert_eq!(MIGRATIONS[V17 - 1].kind, Kind::Plain);
+    let err = |conn: &Connection, kind: &str| {
+        conn.execute(
+            "INSERT INTO jobs (kind, state, input_json, created_at) VALUES (?1, 'queued', '{}', 1)",
+            [kind],
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    assert!(err(&conn, "retire").contains("jobs_kind"), "当てる前は断る");
+    let before = snapshot(&conn);
+    migrate_until(&mut conn, V17).unwrap();
+    let after = snapshot(&conn);
+    assert_eq!(before, after, "行・索引・トリガ・FTS は同じ");
+    for kind in [
+        "import",
+        "thumbnail",
+        "proxy",
+        "download",
+        "capture",
+        "export",
+        "analyze",
+        "edit",
+        "gc",
+        "batch",
+        "project",
+        "retire",
+    ] {
+        conn.execute(
+            "INSERT INTO jobs (kind, state, input_json, created_at) VALUES (?1, 'queued', '{}', 1)",
+            [kind],
+        )
+        .unwrap();
+    }
+    assert!(err(&conn, "unknown").contains("jobs_kind"));
+    assert!(violations(&conn).unwrap().is_empty());
+}
+
 /// 0012 の外部キーの向き：対象のアイテムを消すと行も消え（ADR-192 (4)）、別名で作ったアイテム・版を消すと NULL になる。
 #[test]
 fn batch_items_follow_the_items_and_versions() {

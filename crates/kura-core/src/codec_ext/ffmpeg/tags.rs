@@ -1,6 +1,6 @@
 //! ffprobe のタグを kura のメタデータ（タグ・ループ点）にする（純粋な関数）。
 //!
-//! 規則は固定の段の読み取り（kura-engine の `codec/symph.rs` の `KNOWN_TAGS`・`comment_name`・`meta_from_tags`、WAV の
+//! 規則は固定の段の読み取り（kura-engine の `codec/common.rs` の `KNOWN_TAGS`・`comment_name`・`meta_from_tags`、WAV の
 //! INFO、AIFF の NAME・AUTH）と同じにする。kura-engine はその表を公開していないので、ここに同じ表を持つ（公開されたら
 //! 置き換える）。ffmpeg は読むときに名前を一般の名前に直すので、その分を戻してから照らす：
 //!

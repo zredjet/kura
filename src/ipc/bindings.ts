@@ -2437,7 +2437,9 @@ export type JobFilterDto = {
  */
 export type JobKindDto = "import" | "thumbnail" | "proxy" | "download" | "capture" | "export" | "analyze" | "edit" | "gc" | "batch" | 
 /**  プロジェクトの照らし直し（M15 段 2）。 */
-"project";
+"project" | 
+/**  退役する読み手の記録をアンカーへ移す（M16 段 5）。 */
+"retire";
 
 /**  ジョブの進捗（イベント `job://progress`）。 */
 export type JobProgress = {

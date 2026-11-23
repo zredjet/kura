@@ -9,7 +9,7 @@
 //! - 試験の音：記述から作る合成の音（[`signals`]）と `--input` のファイル（kura の `CodecSet` で読む）。
 //!   合成の音は `<dir>/signals/<名前>.wav`（16 ビット）にも書く（外のエンコーダで参照を作るため）。
 //! - 各音を kura の Ogg Vorbis のエンコーダ（`CodecSet::pinned().encode_bytes(v, "ogg", {"quality": q})`）で
-//!   q −1〜10（`--quick` は −1・3・5・10）に書き（`<dir>/ogg/<音>.kura-q<q>.ogg`）、symphonia（kura の読み取り）で読んで
+//!   q −1〜10（`--quick` は −1・3・5・10）に書き（`<dir>/ogg/<音>.kura-q<q>.ogg`）、kura の読み取り（`ogg-vorbis-kura-dec/1`）で読んで
 //!   指標を測る。lewton でも読み、長さと値の一致を見る。書けない q は飛ばし、理由を表に書く。
 //! - `--reference <音>/<ラベル>=<ogg>`：外のエンコーダ（libvorbis など）で同じ音から作った ogg。ラベルの末尾の
 //!   `-q<n>` を段、その前を族（`aotuv-q3` → 族 `aotuv`・段 3）として、同じ指標で測り同じ表に並べる。
@@ -48,8 +48,9 @@ const USAGE: &str = "使い方: kura-devtools vorbis-quality --out <dir> [--quic
                      [--input [<名前>=]<file>]... [--reference <音>/<ラベル>=<ogg>]... \
                      [--reference-dir <dir>]... [--curve-ref <族>] [--only <名前>]... [--seed <n>]";
 
-/// 道具の版（指標の定義・表の形を変えたら上げる）。
-pub const TOOL_ID: &str = "kura-devtools vorbis-quality/1";
+/// 道具の版（指標の定義・表の形を変えたら上げる）。/2：M16 段 10 で、読み取りの長さの欄の名前を `frames_symphonia` から
+/// `frames_kura` にした（中身は M16 段 2 から自作の読み取り。指標は変えていない）。
+pub const TOOL_ID: &str = "kura-devtools vorbis-quality/2";
 /// 既定の乱数の種。
 const DEFAULT_SEED: u64 = 20_261_017;
 /// 全部の段。
@@ -107,14 +108,14 @@ pub struct Reference {
 #[derive(Debug, Clone)]
 pub struct Measured {
     pub stats: OggStats,
-    /// 指標に使った読み取り（symphonia）の識別子。
+    /// 指標に使った読み取り（kura の読み取り）の識別子。
     pub decoder: String,
-    pub frames_symphonia: usize,
+    pub frames_kura: usize,
     pub frames_lewton: Option<usize>,
     /// lewton が最後のグラニュールで切る前の長さ。
     pub frames_lewton_raw: Option<usize>,
     pub lewton_error: Option<String>,
-    /// lewton と symphonia の値の差の最大（そろえずに、共通の長さで）。
+    /// lewton と kura の読み取りの値の差の最大（そろえずに、共通の長さで）。
     pub lewton_max_abs_diff: Option<f64>,
     pub lag: i64,
     pub nmr: Nmr,
@@ -338,7 +339,7 @@ fn measure(
             &Limits::default(),
             &NoMonitor,
         )
-        .map_err(|e| format!("symphonia で読めません: {e}"))?;
+        .map_err(|e| format!("kura の読み取りで読めません: {e}"))?;
     let Value::Audio(a) = value else {
         return Err("音声ではありません".into());
     };
@@ -352,7 +353,7 @@ fn measure(
         ));
     }
     let sym: Vec<Vec<f32>> = a.read_planes(0, a.frames()).map_err(|e| e.to_string())?;
-    let frames_symphonia = a.frames();
+    let frames_kura = a.frames();
 
     let (frames_lewton, frames_lewton_raw, lewton_error, lewton_max_abs_diff) =
         match ogg::decode_lewton(&packets, &stats) {
@@ -394,7 +395,7 @@ fn measure(
             .then(|| f64::from(stats.bitrate_nominal) / 1000.0),
         stats,
         decoder: stamp.codec,
-        frames_symphonia,
+        frames_kura,
         frames_lewton,
         frames_lewton_raw,
         lewton_error,
@@ -539,7 +540,7 @@ fn row_json(row: &Row, sound: &Sound) -> serde_json::Value {
             json!({
                 "status": "ok",
                 "decoder": m.decoder,
-                "frames_symphonia": m.frames_symphonia,
+                "frames_kura": m.frames_kura,
                 "frames_lewton": m.frames_lewton,
                 "frames_lewton_raw": m.frames_lewton_raw,
                 "lewton_error": m.lewton_error,
@@ -897,7 +898,7 @@ mod tests {
             }
             Outcome::Failed(reason) => panic!("測れません: {reason}"),
             Outcome::Ok(m) => {
-                assert_eq!(m.frames_symphonia, sounds[0].frames());
+                assert_eq!(m.frames_kura, sounds[0].frames());
                 assert_eq!(m.lag, 0);
                 assert!(m.nmr.total_db.is_finite() && m.kbps_audio > 0.0);
                 assert!(m.stats.header_bytes > 0);

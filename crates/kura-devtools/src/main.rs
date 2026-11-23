@@ -4,6 +4,12 @@
 //!   再開だけ待つ。`--close-after-ms` は N ms 待ってジョブの途中でライブラリを閉じ、閉じるのにかかった時間を出す）
 //! - `download --library <path> <url>...`：アプリと同じジョブで取得してライブラリに入れる（M7 の確認用）
 //! - `check --library <path>`：件数と整合性（DB とファイルの食い違い）を表示する
+//! - `retired --library <path> [--again]`：退役する読み手と外した読み手（M16 段 10 で外した symphonia の Vorbis・AAC。
+//!   `kura_core::edit::retire::watched_ids`）で読んだ版の入力のうち、アンカーのないものの数（記録の識別子 × 版のファイルの状態
+//!   ごと）・移し終えた印・移したアンカーの数と大きさ・最後の移し替えのジョブの結果を出す（M16 段 5。アプリを閉じてから回す。DB を
+//!   読み取り専用で開き、ジョブもマイグレーションも動かさない）。残りがあれば失敗で終わる（段 10 の前に 0 を確かめた。外した読み手
+//!   の残りは作り直せない版）。`--again` は先に移し終えた印を消す（ライブラリを開いてロックを取る。次にアプリで開くと移し替えの
+//!   ジョブをまた積む。元や記録を直したあとのやり直しに）
 //! - `seed --items <件数> --out <path> [--analysis pending|ready] [--audio <百分率>] [--no-art]`：ダミーライブラリを作る
 //!   （グリッドと起動時間の計測用。`--analysis ready` は画像・音声に偽の事実を入れて解析済みにし、音声には波形の段のファイルも
 //!   置く。`--audio` は音楽の割合、`--no-art` は音楽にジャケットを付けない（グリッドの実波形の計測。`seed` の冒頭））
@@ -65,6 +71,7 @@ use kura_core::library::{LibrarySession, Services, UpgradeEvent, UpgradeHooks, c
 
 const USAGE: &str = "使い方: kura-devtools import --library <path> [--create] [<src>...] | \
                      download --library <path> <url>... | check --library <path> | \
+                     retired --library <path> [--again] | \
                      vorbis-quality --out <dir> [--quick] [--input <file>]... [--reference <音>/<ラベル>=<ogg>]...";
 
 /// アプリと同じ libmalloc の設定（アプリは Info.plist の `LSEnvironment`。ADR-183）で動くように、なければ付けて自分を起こし直す
@@ -112,6 +119,7 @@ fn main() -> ExitCode {
         Some("import") => import(&args[1..]),
         Some("download") => download(&args[1..]),
         Some("check") => check(&args[1..]),
+        Some("retired") => retired(&args[1..]),
         Some("seed") => seed::run(&args[1..]),
         Some("assets") => assets::run(&args[1..]),
         Some("selftest-library") => selftest::run(&args[1..]),
@@ -385,6 +393,47 @@ fn check(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     session.wait_ready();
     report(&session)
+}
+
+/// 退役する読み手・外した読み手で読んだ、アンカーのない版の入力を数える（M16 段 5・10。`kura_core::edit::retire::remaining_in`）。
+/// `--again` は先に移し終えた印を消す（`retire::forget`）。残りがあれば失敗で終わる。
+fn retired(args: &[String]) -> Result<(), String> {
+    let again = args.iter().any(|a| a == "--again");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--again").cloned().collect();
+    let args = parse(&rest)?;
+    if again {
+        let lib = kura_core::library::Library::open(&args.library).map_err(|e| e.to_string())?;
+        kura_core::edit::retire::forget(lib.db()).map_err(|e| e.to_string())?;
+        drop(lib);
+        tracing::info!(
+            "移し終えた印を消しました（次にアプリで開くと、移し替えのジョブをまた積みます）"
+        );
+    }
+    let ids = kura_core::edit::retire::watched_ids();
+    let left =
+        kura_core::edit::retire::remaining_in(&args.library, &ids).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&left).map_err(|e| e.to_string())?;
+    tracing::info!("退役する読み手の移し替え：\n{json}");
+    let gone: u64 = left
+        .by_codec
+        .iter()
+        .filter(|(id, _)| kura_engine::codec::RETIRED_DECODERS.contains(&id.as_str()))
+        .map(|(_, states)| states.values().sum::<u64>())
+        .sum();
+    if left.total == 0 {
+        tracing::info!("アンカーのない旧版の読み取りは残っていません");
+        Ok(())
+    } else if gone > 0 {
+        Err(format!(
+            "外した読み手で読んだ、アンカーのない版の入力が {gone} 件あります（このアプリでは作り直せません：DecoderGone。外す前の版のアプリで移し替えのジョブを回す必要がありました）。退役する読み手の残りは {} 件",
+            left.total - gone
+        ))
+    } else {
+        Err(format!(
+            "アンカーのない旧版の読み取りが {} 件残っています（アプリで開いて移し替えのジョブを回し、移せないものは理由をジョブのログで確かめてください。直したあとは --again）",
+            left.total
+        ))
+    }
 }
 
 fn report(session: &LibrarySession) -> Result<(), String> {

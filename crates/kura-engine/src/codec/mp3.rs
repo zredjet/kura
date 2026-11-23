@@ -17,8 +17,8 @@
 //! - 流して読む（M13 段 2）：ファイルは今どおり全体を読んで持ち（nanomp3 にフレームを読み口から読む公開の口がない）、標本を
 //!   フレームごとに流す（値は持たない）。形を読むのにも全体を読むので、`shape_work_bytes` は長さ。見込みの長さは形の上限。
 
+use crate::codec::common::read_all;
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
-use crate::codec::symph::read_all;
 use crate::codec::{Decoder, ReadSeek, Tier};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;

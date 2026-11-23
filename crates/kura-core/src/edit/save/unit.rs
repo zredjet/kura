@@ -45,6 +45,11 @@ pub(crate) trait UnitCx: Sync {
     fn sync_file(&self, file: &std::fs::File) -> std::io::Result<()> {
         file.sync_all()
     }
+    /// 試験の強制終了を写す段（移し替えの 1 件が、置いたあとに後始末を通らずに誤りを返す。M16 段 5）。
+    #[cfg(test)]
+    fn fault(&self) -> Option<super::Fault> {
+        None
+    }
     /// staging の書きかけの名前に入れる印（`edit-<印>-out.<拡張子>.part`・`edit-<印>-anchor.<拡張子>.part`）。既定は持ち主の
     /// ジョブの ID。並べて準備する 1 件ずつは別の印にする（同じ書きかけに書くと、ハッシュを取ったあとで中身が入れ替わる）。
     fn tag(&self) -> String {

@@ -1,25 +1,24 @@
 //! 読み手が音声でない部分で持つ量を、ファイルの頭だけを見て安く数える（M13 段 2 の検証の直し。[`Held`]）。
 //!
-//! symphonia の読み手は、開くときに埋め込みの画像・タグ・箱を読み込み、読み終えるまで持ち続ける（FLAC の PICTURE・
-//! APPLICATION・VORBIS_COMMENT、m4a の moov と ilst の covr、Ogg の頭のパケットのコメントと METADATA_BLOCK_PICTURE）。
+//! 読み手は、開くときにタグ・箱・頭のパケットを読み込み、読み終えるまで持ち続ける（Ogg の頭のパケットのコメントと
+//! METADATA_BLOCK_PICTURE、m4a のサンプルの表と 7 つのキーのタグ。M16 段 1 の自作の FLAC の読み手は VORBIS_COMMENT のタグだけで、
+//! PICTURE・APPLICATION・SEEKTABLE・CUESHEET は読み飛ばす。前の symphonia の読み手（段 10 で外した）は m4a の moov と ilst の
+//! covr も持った）。
 //! 形を読む間・流して読む間の作業領域の見積もり（`CodecSet::shape_path_staged`・`stage_stream_work_bytes`）に、ここで数えた量を
 //! 足す。数えるのは箱・ページの頭と、数を決める数バイトだけ（中身は読まずにシークで飛ばす。Ogg の頭のページは CRC を照らす
 //! ために読むが、確保は 1 ページ分だけ）。
 //!
 //! 量は実測（数える確保器。realloc は写す間に前と新しい領域を両方持つと数える。tests/stream_held.rs・kura-devtools の
 //! mem_smoke）に合わせた上からの見積もり：
-//! - 画像（FLAC の PICTURE・m4a の covr）・APPLICATION：中身の 1 倍（そのまま持つ）。FLAC の PICTURE の MIME・説明は 2 倍。
-//!   1 つの領域に読む中身は、4 MiB を超えると伸ばし直しながら読むので、読む間は最大でほぼ 2 倍（[`boxed_read_peak`]。
-//!   箱を 1 つずつ読むので、その最大だけを足す）。
-//! - コメント・タグの中身：[`TEXT_FACTOR`] 倍（Ogg はパケットを組み立てる写し、base64 の画像は復号した写しと画像の写し、
-//!   文字はタグと読み取りの写し `raw_tags` を持つ。実測は 2.5〜5.6 倍）。m4a の ilst の covr 以外は [`MP4_TEXT_FACTOR`] 倍
-//!   （実測 3 倍）。
-//! - コメント・タグ 1 つあたり [`ITEM_COST`]（タグの構造と小さな確保。実測 176〜210 バイト）。数はコメントの数の欄を、
-//!   残りの長さで入りうる数（1 つ 4 バイト以上）で抑える。
-//! - FLAC の SEEKTABLE は 2 倍（実測 1.5 倍）、CUESHEET は 8 倍（小さい）、moov のほかの部分（標本の表）は 2 倍。
+//! - コメント・タグの中身：[`TEXT_FACTOR`] 倍（Ogg はパケットを組み立てる写し、文字はタグとその写しを持つ）。
+//! - コメント・タグ 1 つあたり [`ITEM_COST`]（タグの構造と小さな確保）。数はコメントの数の欄を、残りの長さで入りうる数
+//!   （1 つ 4 バイト以上）で抑える。
+//! - m4a（[`mp4`]）：サンプルの表・moof の中身とタグの値（[`mp4`] の説明）。FLAC の VORBIS_COMMENT は箱の 1 倍（読む間だけ）と
+//!   タグ（読めない UTF-8 を置き換えると最大 3 倍）で、コメントの倍率の内。
 //! - 読み手そのものの緩衝（[`READER`]）。
-//! - Vorbis の codebook の表（流して読む間だけ。`symph::vorbis_setup_bytes`）：setup が [`SETUP_MAX`] を超えて組み立てられない
-//!   ときは、読み口が受け付ける上限（`min(max_value_bytes, 256 MiB)`）とみなす。
+//! - Vorbis の codebook の表：自作の読み手の `vorbis::dec::codebook::setup_table_bytes` で、setup の静的な表は開いている間
+//!   （形を読む間も）、復号の表は流して読む間だけ。setup が [`SETUP_MAX`] を超えて組み立てられないときは、読み口が受け付ける
+//!   上限（`min(max_value_bytes, 256 MiB)`）とみなす。
 //!
 //! 数えられない頭（壊れた箱・違う形式）は、そこまでの量を返す（読み手はそこで断るか、読み飛ばしたところで止まる）。
 //! I/O の誤りだけを返す。
@@ -27,7 +26,6 @@
 use std::io::SeekFrom;
 
 use crate::codec::ReadSeek;
-use crate::codec::symph::vorbis_setup_bytes;
 use crate::error::EngineError;
 use crate::limits::Limits;
 
@@ -41,14 +39,24 @@ pub struct Held {
     pub decode: u64,
 }
 
-/// 読み手そのものの緩衝（symphonia の `MediaSourceStream`・Ogg のページ・パケットの組み立て）。
+/// 自作の Vorbis の読み手（`ogg-vorbis-kura-dec/1`。`vorbis::dec::codebook::setup_table_bytes`）の codebook の表の量
+/// （開いている間、流して読む間）。setup の静的な表は開いている間（[`Held::open`]）、復号の表は流して読む間だけ
+/// （[`Held::decode`]）。setup（組み立てられなければ None）を数えられなければ、上限 `worst` の全部を開いている間に持つと
+/// みなす（読み手は表の量の和を上限で断るので、持つのは上限まで）。
+fn vorbis_tables(setup: Option<&[u8]>, worst: u64) -> (u64, u64) {
+    match setup {
+        Some(setup) => crate::codec::vorbis::dec::codebook::setup_table_bytes(setup)
+            .map_or((0, 0), |t| (t.setup.min(worst), t.decode.min(worst))),
+        None => (worst, 0),
+    }
+}
+
+/// 読み手そのものの緩衝（読み口の緩衝・Ogg のページ・パケットの組み立て）。
 pub(crate) const READER: u64 = 1 << 20;
 /// コメント・タグ 1 つあたりの量。
 pub(crate) const ITEM_COST: u64 = 256;
 /// Vorbis コメント（FLAC・Ogg）の中身の倍率。
 pub(crate) const TEXT_FACTOR: u64 = 6;
-/// m4a の ilst の、covr 以外の中身の倍率。
-pub(crate) const MP4_TEXT_FACTOR: u64 = 4;
 /// Vorbis の setup を組み立てて表の大きさを見積もる上限（これを超える setup は表を上限とみなす）。正しく作られた
 /// ファイルの setup は数 KB。
 pub(crate) const SETUP_MAX: usize = 1 << 20;
@@ -56,38 +64,6 @@ pub(crate) const SETUP_MAX: usize = 1 << 20;
 const PACKET_HEAD: usize = 64 << 10;
 /// 読み飛ばしをシークでなく読んで捨てる長さの上限（小さな箱が続くときに、緩衝を捨てるシークを繰り返さない）。
 const SKIP_BY_READ: u64 = 64 << 10;
-
-/// symphonia の読み口から長さ `len` を 1 つの領域に読む（`ReadBytes::read_boxed_slice_exact`）間の確保の山。4 MiB を超える
-/// ものは 4・8・16 MiB… ずつ伸ばし直して読む（`safe_read_into_boxed_slice`）ので、伸ばすときに前の領域と新しい領域を両方
-/// 持つ（大きな確保の realloc は写す）。
-pub(crate) fn boxed_read_peak(len: u64) -> u64 {
-    const FIRST: u64 = 4 << 20;
-    const MAX_STEP: u64 = 1 << 30;
-    let (mut have, mut step, mut peak) = (0u64, FIRST, len);
-    while have < len {
-        if step == MAX_STEP {
-            // 残りは 1 GiB ずつ足す：山は最後に伸ばすとき（len − r から len へ）
-            let r = (len - have - 1) % MAX_STEP + 1;
-            let before = len - r;
-            if before > 0 {
-                peak = peak.max(before.saturating_add(len));
-            }
-            break;
-        }
-        let next = have + step.min(len - have);
-        if have > 0 {
-            peak = peak.max(have.saturating_add(next));
-        }
-        have = next;
-        step = step.saturating_mul(2).min(MAX_STEP);
-    }
-    peak
-}
-
-/// 1 つの領域に読む間だけ、読んだものに足して持つ量（[`boxed_read_peak`] − `len`）。
-fn boxed_extra(len: u64) -> u64 {
-    boxed_read_peak(len) - len
-}
 
 /// 持ち続ける量と、読む間だけ持つ量（箱を 1 つずつ読むので、その最大）。
 #[derive(Default)]
@@ -190,8 +166,9 @@ fn comment_count(w: &mut Walk<'_>, end: u64) -> Result<u64, EngineError> {
     Ok(u64::from(count).min(end.saturating_sub(w.pos) / 4))
 }
 
-/// FLAC（symphonia の `FlacReader` がメタデータの箱を読む順に、`last` の箱まで）。箱ごとに持ち続ける量を足し、1 つの領域に
-/// 読む間だけ持つ量（[`boxed_extra`]）の最大を足す。
+/// FLAC（自作の読み手 `codec::flac_read` がメタデータの箱を読む順に、`last` の箱まで）。持つのは VORBIS_COMMENT（箱を
+/// ちょうどの大きさの 1 つの領域に読み、タグに写す）だけで、ほかの箱は読み飛ばす（M16 段 1。前の symphonia の読み手は
+/// PICTURE・APPLICATION・SEEKTABLE・CUESHEET も持っていた）。
 pub(crate) fn flac(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
     let mut w = Walk::new(src)?;
     let mut peak = Peak::default();
@@ -211,48 +188,14 @@ pub(crate) fn flac(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
         if end > w.len {
             break;
         }
-        match kind {
-            // STREAMINFO
-            0 => peak.add(len, 0),
-            // APPLICATION（中身を 1 つの領域に読んで持つ）
-            2 => peak.add(len.saturating_add(ITEM_COST), boxed_extra(len)),
-            // SEEKTABLE（点を 1 つずつ伸ばす列に足す）
-            3 => peak.add(len.saturating_mul(2), len.saturating_mul(2)),
-            // VORBIS_COMMENT（コメントを 1 つずつ 1 つの領域に読んで、タグに写す）
-            4 => {
-                let n = comment_count(&mut w, end)?;
-                peak.add(
-                    len.saturating_mul(TEXT_FACTOR)
-                        .saturating_add(n.saturating_add(1).saturating_mul(ITEM_COST)),
-                    boxed_extra(len),
-                );
-            }
-            // CUESHEET
-            5 => peak.add(len.saturating_mul(8), 0),
-            // PICTURE：種類・MIME の長さ・MIME・説明の長さ・説明・…・画像の長さ・画像（画像は 1 つの領域に読んで持つ。
-            // MIME・説明は写しも持つ）
-            6 => {
-                let mut text = 0u64;
-                if w.u32_be()?.is_some()
-                    && let Some(mime) = w.u32_be()?
-                {
-                    text = u64::from(mime);
-                    w.goto(w.pos.saturating_add(u64::from(mime)))?;
-                    if w.pos.saturating_add(4) <= end
-                        && let Some(desc) = w.u32_be()?
-                    {
-                        text = text.saturating_add(u64::from(desc));
-                    }
-                }
-                let text = text.min(len);
-                peak.add(
-                    len.saturating_add(text.saturating_mul(2))
-                        .saturating_add(ITEM_COST),
-                    boxed_extra(len),
-                );
-            }
-            // PADDING・知らない箱は読み飛ばす（持たない）
-            _ => {}
+        // VORBIS_COMMENT（箱を 1 つの領域に読んでタグに写す）。ほかの箱は読み飛ばす（持たない）
+        if kind == 4 {
+            let n = comment_count(&mut w, end)?;
+            peak.add(
+                len.saturating_mul(TEXT_FACTOR)
+                    .saturating_add(n.saturating_add(1).saturating_mul(ITEM_COST)),
+                0,
+            );
         }
         w.goto(end)?;
         if last {
@@ -265,97 +208,113 @@ pub(crate) fn flac(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
     })
 }
 
-/// m4a（symphonia の `IsoMp4Reader` が開くときに読む最上位の moov・meta）。moov の中の udta/meta/ilst のタグは、covr を
-/// 1 倍、ほかを [`MP4_TEXT_FACTOR`] 倍、data（と name・mean）1 つにつき [`ITEM_COST`]。ほかの moov の中身は 2 倍。タグの
-/// 中身は 1 つの領域に読むので、最も大きいものを読む間の [`boxed_extra`] を足す。
+/// 自作の読み手が読むタグの 1 つの値の上限（UTF-16 の 2 倍と頭）。
+const TAG_VALUE: u64 = 2 * 4_096 + 16;
+/// moof の大きさに対する、自作の読み手が持つ trun の量の倍率（trun 1 つ 16 バイト以上に `Run` 48 バイト、列の伸び 2 倍、
+/// サンプルごとの値の写し、読み込む領域）。
+const MOOF_FACTOR: u64 = 10;
+
+/// m4a（自作の読み手 `codec::mp4_read`。ALAC・AAC）：サンプルの表（stts・stsc・stsz・stco・co64）を 3 倍（読み込む領域と、
+/// 位置を u64 にした表）、stz2 を 9 倍（4 ビットの項目を u32 にすると 8 倍）。どのトラックを選ぶかは数えないので、すべての
+/// trak の分。7 つのキーのタグの値は 1 つ `min(3 × 長さ, 4,096)`（不正な UTF-8 の置き換えで 3 倍まで伸び、4,096 を
+/// 超えるものは持たない）と [`ITEM_COST`]、読む間の写しに [`TAG_VALUE`] の 2 つ分。mdat の前に続く moof の大きさの和の
+/// 最大を [`MOOF_FACTOR`] 倍。covr・ほかのタグ・mdat は読まない。
 pub(crate) fn mp4(src: &mut dyn ReadSeek) -> Result<Held, EngineError> {
     let mut w = Walk::new(src)?;
-    let mut peak = Peak::default();
     let len = w.len;
+    let (mut tables, mut tags) = (0u64, 0u64);
+    let (mut run, mut run_peak) = (0u64, 0u64);
     let mut top = Boxes::new(0, len);
     while let Some((kind, s, e)) = top.next(&mut w)? {
-        let tags = match &kind {
+        match &kind {
             b"moov" => {
-                let mut tags = Tags::default();
-                let mut inner = Boxes::new(s, e);
-                while let Some((k, us, ue)) = inner.next(&mut w)? {
-                    if &k != b"udta" {
-                        continue;
-                    }
-                    let mut udta = Boxes::new(us, ue);
-                    while let Some((k, ms, me)) = udta.next(&mut w)? {
-                        if &k == b"meta" {
-                            tags.add_meta(&mut w, ms, me)?;
+                let mut moov = Boxes::new(s, e);
+                while let Some((k, ms, me)) = moov.next(&mut w)? {
+                    match &k {
+                        b"trak" => tables = tables.saturating_add(trak_tables(&mut w, ms, me)?),
+                        b"udta" => {
+                            let mut udta = Boxes::new(ms, me);
+                            while let Some((k, us, ue)) = udta.next(&mut w)? {
+                                if &k == b"meta" {
+                                    tags = tags.saturating_add(kura_tags(&mut w, us, ue)?);
+                                }
+                            }
                         }
+                        _ => {}
                     }
                 }
-                Some(tags)
             }
-            b"meta" => {
-                let mut tags = Tags::default();
-                tags.add_meta(&mut w, s, e)?;
-                Some(tags)
+            b"meta" => tags = tags.saturating_add(kura_tags(&mut w, s, e)?),
+            b"moof" => {
+                run = run.saturating_add(e - s);
+                run_peak = run_peak.max(run);
             }
-            _ => None,
-        };
-        if let Some(t) = tags {
-            let rest = (e - s).saturating_sub(t.ilst);
-            peak.add(
-                rest.saturating_mul(2)
-                    .saturating_add(t.visual)
-                    .saturating_add(t.text.saturating_mul(MP4_TEXT_FACTOR))
-                    .saturating_add(t.items.saturating_mul(ITEM_COST)),
-                boxed_extra(t.largest),
-            );
+            b"mdat" => run = 0,
+            _ => {}
         }
     }
     Ok(Held {
-        open: peak.total(),
+        open: READER
+            .saturating_add(tables)
+            .saturating_add(tags)
+            // タグを読む間の写し（生の値と置き換えた文字列。タグがあるときだけ）
+            .saturating_add(if tags > 0 {
+                TAG_VALUE.saturating_mul(2)
+            } else {
+                0
+            })
+            .saturating_add(run_peak.saturating_mul(MOOF_FACTOR)),
         decode: 0,
     })
 }
 
-/// ilst の中で数えたもの。
-#[derive(Default)]
-struct Tags {
-    /// ilst の大きさの合計（ほかの moov の中身から引く）。
-    ilst: u64,
-    /// covr の中身。
-    visual: u64,
-    /// covr 以外の中身。
-    text: u64,
-    /// data・name・mean の数。
-    items: u64,
-    /// 最も大きい中身。
-    largest: u64,
-}
-
-impl Tags {
-    /// meta（版と旗の 4 バイトのあとに箱が並ぶ）の中の ilst を数える。
-    fn add_meta(&mut self, w: &mut Walk<'_>, s: u64, e: u64) -> Result<(), EngineError> {
-        let mut meta = Boxes::new(s.saturating_add(4).min(e), e);
-        while let Some((k, is, ie)) = meta.next(w)? {
-            if &k != b"ilst" {
-                continue;
-            }
-            self.ilst = self.ilst.saturating_add(ie - is);
-            let mut ilst = Boxes::new(is, ie);
-            while let Some((tag, ts, te)) = ilst.next(w)? {
-                self.items = self.items.saturating_add(1);
-                let mut parts = Boxes::new(ts, te);
-                while let Some((_, ds, de)) = parts.next(w)? {
-                    self.items = self.items.saturating_add(1);
-                    self.largest = self.largest.max(de - ds);
-                    if &tag == b"covr" {
-                        self.visual = self.visual.saturating_add(de - ds);
-                    } else {
-                        self.text = self.text.saturating_add(de - ds);
-                    }
+/// trak の中のサンプルの表を持つ量（stz2 は 9 倍、ほかは 3 倍）。
+fn trak_tables(w: &mut Walk<'_>, s: u64, e: u64) -> Result<u64, EngineError> {
+    let mut total = 0u64;
+    let mut stack = vec![(s, e)];
+    while let Some((s, e)) = stack.pop() {
+        let mut b = Boxes::new(s, e);
+        while let Some((k, cs, ce)) = b.next(w)? {
+            match &k {
+                b"mdia" | b"minf" | b"stbl" => stack.push((cs, ce)),
+                b"stts" | b"stsc" | b"stsz" | b"stco" | b"co64" => {
+                    total = total.saturating_add((ce - cs).saturating_mul(3));
                 }
+                b"stz2" => total = total.saturating_add((ce - cs).saturating_mul(9)),
+                _ => {}
             }
         }
-        Ok(())
     }
+    Ok(total)
+}
+
+/// meta の中の ilst の、自作の読み手が読む 7 つのキーのタグの量。
+fn kura_tags(w: &mut Walk<'_>, s: u64, e: u64) -> Result<u64, EngineError> {
+    let mut total = 0u64;
+    let mut meta = Boxes::new(s.saturating_add(4).min(e), e);
+    while let Some((k, is, ie)) = meta.next(w)? {
+        if &k != b"ilst" {
+            continue;
+        }
+        let mut ilst = Boxes::new(is, ie);
+        while let Some((tag, ts, te)) = ilst.next(w)? {
+            // 7 つのキーと、自由形式（iTunSMPB。AAC の priming）
+            if !crate::codec::mp4_read::TAG_KEYS
+                .iter()
+                .any(|(k, _)| *k == tag)
+                && &tag != b"----"
+            {
+                continue;
+            }
+            let mut parts = Boxes::new(ts, te);
+            while let Some((_, ds, de)) = parts.next(w)? {
+                total = total
+                    .saturating_add((de - ds).saturating_mul(3).min(4_096))
+                    .saturating_add(ITEM_COST);
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// `[at, end)` の箱を頭だけ読んでたどる（symphonia の `AtomIterator` と同じ形：大きさ 0 は範囲の終わりまで、1 は 64 ビット。
@@ -423,15 +382,19 @@ struct Stream {
     len: u64,
     /// 今のパケットの頭（[`PACKET_HEAD`] まで。Vorbis の setup は [`SETUP_MAX`] まで）。
     head: Vec<u8>,
-    /// Vorbis の識別ヘッダ（30 バイト）。
-    ident: Vec<u8>,
 }
 
 /// Ogg の頭で数えたもの。
 #[derive(Default)]
 struct OggCount {
+    /// 最初の Vorbis の論理ストリーム（自作の読み手が読むもの）。
+    vorbis_serial: Option<u32>,
+    /// その setup を数え終えた（自作の読み手は、ここまでの頭を読んで開く）。
+    vorbis_setup_done: bool,
     comments: u64,
-    /// Vorbis の codebook の表の見積もりの最大。
+    /// Vorbis の codebook の表のうち、開いている間に持つ量の見積もりの最大。
+    open_tables: u64,
+    /// Vorbis の codebook の表のうち、流して読む間だけ持つ量の見積もりの最大。
     tables: u64,
 }
 
@@ -456,9 +419,9 @@ impl Stream {
         let head = std::mem::take(&mut self.head);
         let len = self.len;
         if self.index == 0 {
-            // Vorbis の識別ヘッダはちょうど 30 バイト（symphonia もそれ以外は Vorbis とみなさない）
-            self.mapping = if head.starts_with(b"\x01vorbis") && len == 30 {
-                self.ident = head.clone();
+            // 自作の読み手（`codec::ogg_read`・`vorbis::dec::info::unpack_info`）は識別ヘッダの長さを見ない
+            self.mapping = if head.starts_with(b"\x01vorbis") {
+                count.vorbis_serial.get_or_insert(self.serial);
                 Mapping::Vorbis
             } else if head.starts_with(b"OpusHead") {
                 Mapping::Opus
@@ -481,14 +444,16 @@ impl Stream {
             }
             if self.mapping == Mapping::Vorbis && head.starts_with(b"\x05vorbis") {
                 let worst = limits.max_value_bytes.min(256 << 20);
-                let tables = if (head.len() as u64) < len {
-                    worst
+                let (open, decode) = if (head.len() as u64) < len {
+                    vorbis_tables(None, worst)
                 } else {
-                    let mut extra = self.ident.clone();
-                    extra.extend_from_slice(&head);
-                    vorbis_setup_bytes(&extra).map_or(0, |b| b.min(worst))
+                    vorbis_tables(Some(&head), worst)
                 };
-                count.tables = count.tables.max(tables);
+                count.open_tables = count.open_tables.max(open);
+                count.tables = count.tables.max(decode);
+                if count.vorbis_serial == Some(self.serial) {
+                    count.vorbis_setup_done = true;
+                }
             }
         }
         self.index = self.index.saturating_add(1);
@@ -517,9 +482,10 @@ fn head_comment_count(head: &[u8], at: usize, len: u64) -> u64 {
     }
 }
 
-/// Ogg（symphonia の `OggReader` が開くときに読む頭のページ：CRC の合うページを、グラニュールが 0 か −1（パケットが
-/// 終わらない）のあいだと、その次の 1 ページまで。捕まえの印 `OggS` を探して、合わないページは読み飛ばす）。`decode` は
-/// Vorbis の codebook の表の見積もりの全体（`SymphoniaDecoder` が `stream_work_bytes` の見込みの分を引く）。
+/// Ogg（自作の読み手 `codec::ogg_read` が頭のパケットを組み立てるまでに読むページ：最初の Vorbis の setup を読み終える
+/// まで。BOS の組が終わっても Vorbis がなければそこまで。捕まえの印 `OggS` を探して、合わないページは読み飛ばす）。Vorbis の
+/// codebook の表は、開いている間の分を `open` に、流して読む間だけの分を `decode` に足す（デコーダが `stream_work_bytes` の
+/// 見込みの分を `decode` から引く）。
 pub(crate) fn ogg(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Held, EngineError> {
     let mut w = Walk::new(src)?;
     let mut bytes = 0u64;
@@ -553,12 +519,11 @@ pub(crate) fn ogg(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Held, Engin
         let crc = u32::from_le_bytes([h[22], h[23], h[24], h[25]]);
         page[22..26].fill(0);
         if h[4] != 0 || crate::codec::ogg::crc32(&page) != crc {
-            // 合わないページ：印の次から探し直す（symphonia の読み手と同じ）
+            // 合わないページ：印の次から探し直す
             w.goto(at + 4)?;
             continue;
         }
         bytes = bytes.saturating_add(page.len() as u64);
-        let granule = u64::from_le_bytes([h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13]]);
         let serial = u32::from_le_bytes([h[14], h[15], h[16], h[17]]);
         let first = h[5] & 0x02 != 0;
         let i = match streams.iter().position(|s| s.serial == serial) {
@@ -570,7 +535,6 @@ pub(crate) fn ogg(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Held, Engin
                     index: 0,
                     len: 0,
                     head: Vec::new(),
-                    ident: Vec::new(),
                 });
                 streams.len() - 1
             }
@@ -587,13 +551,16 @@ pub(crate) fn ogg(src: &mut dyn ReadSeek, limits: &Limits) -> Result<Held, Engin
                 }
             }
         }
-        if granule != 0 && granule != u64::MAX {
+        // 最初の Vorbis の setup を読み終えるまで（グラニュールは見ない）。BOS の組が終わっても Vorbis がなければ、読み手は
+        // そこで断る
+        if count.vorbis_setup_done || (!first && count.vorbis_serial.is_none()) {
             break;
         }
     }
     let open = READER
         .saturating_add(bytes.saturating_mul(TEXT_FACTOR))
-        .saturating_add(count.comments.saturating_mul(ITEM_COST));
+        .saturating_add(count.comments.saturating_mul(ITEM_COST))
+        .saturating_add(count.open_tables);
     Ok(Held {
         open,
         decode: count.tables,
@@ -661,30 +628,86 @@ mod tests {
             assert_eq!(h.decode, 0, "{name}");
         }
         let h = ogg(&mut Cursor::new(fixture("ogg-vorbis-ffmpeg.ogg")), &limits).unwrap();
-        assert!(h.open >= READER && h.open < READER + (256 << 10), "{h:?}");
+        assert!(h.open >= READER && h.open < READER + (512 << 10), "{h:?}");
         assert!(h.decode > 0 && h.decode < 8 << 20, "{h:?}");
     }
 
-    /// symphonia の `safe_read_into_boxed_slice` の伸ばし方（4・8・16 MiB… を足す）で、最後に伸ばすときに前と新しい領域を
-    /// 両方持つ。
+    /// 自作の読み手が開くときに読む頭（識別ヘッダが 30 バイトでない・頭のページのグラニュールが 0 でない）でも、setup の
+    /// codebook の表を数える（ordered の 2^22 項目の codebook。setup は数十バイト）。前の symphonia の数え方はどちらも数えな
+    /// かった。
     #[test]
-    fn boxed_reads_peak_while_growing() {
-        const M: u64 = 1 << 20;
-        for (len, peak) in [
-            (0, 0),
-            (100, 100),
-            (4 * M, 4 * M),
-            (4 * M + 1, 8 * M + 1),
-            (8 * M, 12 * M),
-            (12 * M, 16 * M),
-            (15 * M, 27 * M),
-            (30 * M, 58 * M),
-            // 1 GiB ずつ足すところ（4 + 8 + … + 512 = 1,020 MiB のあと）：1,020 → 2,044 → 3,068 MiB → 長さ
-            ((3 << 30) + 5, 3_068 * M + (3 << 30) + 5),
+    fn kura_counts_the_headers_its_reader_reads() {
+        use crate::codec::ogg::tests::page;
+        use crate::codec::vorbis::bitpack::OggpackBuffer;
+        let mut ident = b"\x01vorbis".to_vec();
+        ident.extend_from_slice(&0u32.to_le_bytes());
+        ident.push(2);
+        ident.extend_from_slice(&44_100u32.to_le_bytes());
+        ident.extend_from_slice(&[0; 12]);
+        ident.push(0xb8);
+        ident.push(1);
+        assert_eq!(ident.len(), 30);
+        let mut comment = b"\x03vorbis".to_vec();
+        comment.extend_from_slice(&[0; 8]);
+        comment.push(1);
+        let mut w = OggpackBuffer::oggpack_writeinit();
+        let entries = 1u64 << 22;
+        for (v, bits) in [
+            (5u64, 8u32),
+            (u64::from(b'v'), 8),
+            (u64::from(b'o'), 8),
+            (u64::from(b'r'), 8),
+            (u64::from(b'b'), 8),
+            (u64::from(b'i'), 8),
+            (u64::from(b's'), 8),
+            (0, 8),
+            (0x56_4342, 24),
+            (1, 16),
+            (entries, 24),
+            (1, 1),
+            (21, 5),
+            (entries, 23),
+            (0, 4),
         ] {
-            assert_eq!(boxed_read_peak(len), peak, "{len}");
+            w.oggpack_write(v, bits).unwrap();
         }
-        assert!(boxed_read_peak(u64::MAX / 2) >= u64::MAX / 2);
+        let setup = w.oggpack_get_buffer().to_vec();
+        let tables = crate::codec::vorbis::dec::codebook::setup_table_bytes(&setup).unwrap();
+        assert!(
+            tables.setup >= 4 << 20 && tables.decode >= 100 << 20,
+            "{tables:?}"
+        );
+        let file = |ident: &[u8], granule: u64| {
+            let mut f = page(7, 0, 0x02, granule, &[ident]);
+            f.extend_from_slice(&page(7, 1, 0, granule, &[&comment]));
+            f.extend_from_slice(&page(7, 2, 0, 0, &[&setup]));
+            f.extend_from_slice(&page(7, 3, 0x04, 4_096, &[&[0u8]]));
+            f
+        };
+        let mut long = ident.clone();
+        long.push(0);
+        let limits = Limits::default();
+        for (name, bytes) in [
+            ("30 バイト", file(&ident, 0)),
+            ("31 バイト", file(&long, 0)),
+            ("頭のグラニュール 1", file(&ident, 1)),
+        ] {
+            let h = ogg(&mut Cursor::new(&bytes), &limits).unwrap();
+            assert!(h.open >= READER + tables.setup, "{name}: {h:?}");
+            assert_eq!(h.decode, tables.decode, "{name}: {h:?}");
+        }
+        // Vorbis のない BOS の組が終わったら（BOS でないページが来たら）、そのあとは見ない（自作の読み手はそこで断る。
+        // あとの Vorbis は連結）。同じ BOS の組にある Vorbis は読む（多重化）
+        let opus_head = page(9, 0, 0x02, 0, &[b"OpusHead\x01\x02\0\0\x80\xbb\0\0\0\0\0"]);
+        let mut muxed = opus_head.clone();
+        muxed.extend_from_slice(&file(&ident, 0));
+        let h = ogg(&mut Cursor::new(&muxed), &limits).unwrap();
+        assert_eq!(h.decode, tables.decode, "{h:?}");
+        let mut opus = opus_head;
+        opus.extend_from_slice(&page(9, 1, 0, 0, &[b"OpusTags\0\0\0\0\0\0\0\0"]));
+        opus.extend_from_slice(&file(&ident, 0));
+        let h = ogg(&mut Cursor::new(&opus), &limits).unwrap();
+        assert_eq!(h.decode, 0, "{h:?}");
     }
 
     /// 違う形式・空・壊れた頭でも、落ちずに読み手の緩衝だけを返す。

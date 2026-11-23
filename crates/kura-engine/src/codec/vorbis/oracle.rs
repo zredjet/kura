@@ -59,7 +59,7 @@ pub(crate) fn root() -> Option<PathBuf> {
 }
 
 /// 一時ファイルの名前（プロセスと通し番号で重ならない）。
-fn temp(name: &str) -> PathBuf {
+pub(crate) fn temp(name: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(

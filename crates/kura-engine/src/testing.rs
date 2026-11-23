@@ -383,6 +383,258 @@ pub fn fuzz_peaks(data: &[u8]) -> Result<(), String> {
     }
 }
 
+/// ファズの対象（`fuzz/` の `inflate` と `tests/fuzz_smoke.rs` の `inflate`。M16 段 6）：zlib と生の deflate を、3 つの受け付け
+/// （zlib・miniz_oxide・fdeflate）で、出力の上限 1 MiB・いろいろな取り方で展開する。見つけたい不具合（panic・上限を超えた
+/// 出力・進まない読み・zlib と miniz の受け付けの両方が読めたのに値が違う）は `Err`、壊れた流れとしてのエラーは `Ok`。
+pub fn fuzz_inflate(data: &[u8]) -> Result<(), String> {
+    use crate::codec::zlib::{Flavor, Inflate, Options, SliceInput};
+    const LIMIT: u64 = 1 << 20;
+    let run = |zlib: bool, flavor: Flavor, want: usize| -> Result<Option<Vec<u8>>, String> {
+        let mut z = Inflate::new(
+            SliceInput::new(data),
+            Options {
+                zlib,
+                check_adler: true,
+                limit: LIMIT,
+                flavor,
+            },
+        );
+        let mut out = Vec::new();
+        loop {
+            let n = match z.fill(want) {
+                Ok(n) => n,
+                Err(_) => return Ok(None),
+            };
+            out.extend_from_slice(&z.ready()[..n]);
+            z.consume(n);
+            if out.len() as u64 > LIMIT {
+                return Err(format!("inflate: 上限を超えて出した（{}）", out.len()));
+            }
+            if z.finished() {
+                return Ok(Some(out));
+            }
+            if n == 0 {
+                return Err("inflate: 終わらないのに進まない".into());
+            }
+        }
+    };
+    let r = catch_own_panic(|| -> Result<Result<(), String>, EngineError> {
+        let check = || -> Result<(), String> {
+            for zlib in [true, false] {
+                let a = run(zlib, Flavor::Zlib, 4096)?;
+                let b = run(zlib, Flavor::Miniz, 1)?;
+                let _ = run(zlib, Flavor::Fdeflate, 65_536)?;
+                if let (Some(a), Some(b)) = (&a, &b)
+                    && a != b
+                {
+                    return Err("inflate: zlib と miniz の受け付けで値が違う".into());
+                }
+            }
+            Ok(())
+        };
+        Ok(check())
+    });
+    match r {
+        Err(at) => Err(format!("inflate: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(r)) => r,
+    }
+}
+
+/// ファズの対象（`fuzz/` の `deflate` と `tests/fuzz_smoke.rs` の `deflate`。M16 段 7）：入力を 3 つの段で圧縮し、自作の展開の
+/// 2 つの受け付け（zlib・fdeflate。fdeflate は完全な符号だけを受け付ける）で元に戻ること、入力を渡す切れ目（入力の頭の
+/// バイトから決める）によらず同じバイト列になることを確かめる。見つけたい不具合（panic・戻らない・切れ目で変わる）は `Err`。
+pub fn fuzz_deflate(data: &[u8]) -> Result<(), String> {
+    use crate::codec::zlib::{Deflate, Flavor, Inflate, Level, Options, SliceInput, deflate_zlib};
+    let inflate = |z: &[u8], flavor: Flavor| -> Result<Vec<u8>, String> {
+        let mut f = Inflate::new(
+            SliceInput::new(z),
+            Options {
+                zlib: true,
+                check_adler: true,
+                limit: data.len() as u64 + 1,
+                flavor,
+            },
+        );
+        let mut out = Vec::new();
+        loop {
+            let n = f
+                .fill(65_536)
+                .map_err(|e| format!("deflate: 展開できない（{e:?}）"))?;
+            out.extend_from_slice(&f.ready()[..n]);
+            f.consume(n);
+            if f.finished() {
+                return Ok(out);
+            }
+            if n == 0 {
+                return Err("deflate: 展開が進まない".into());
+            }
+        }
+    };
+    let r = catch_own_panic(|| -> Result<Result<(), String>, EngineError> {
+        let check = || -> Result<(), String> {
+            let step = 1 + data.first().map_or(0, |&b| usize::from(b)) * 37;
+            for level in [Level::Fast, Level::Balanced, Level::High] {
+                let whole = deflate_zlib(data, level);
+                for flavor in [Flavor::Zlib, Flavor::Fdeflate] {
+                    if inflate(&whole, flavor)? != data {
+                        return Err(format!("deflate: {level:?} が元に戻らない（{flavor:?}）"));
+                    }
+                }
+                let mut d = Deflate::new(level);
+                for piece in data.chunks(step) {
+                    d.write(piece);
+                }
+                d.finish();
+                if *d.output() != whole {
+                    return Err(format!("deflate: {level:?} が渡す切れ目で変わる"));
+                }
+            }
+            Ok(())
+        };
+        Ok(check())
+    });
+    match r {
+        Err(at) => Err(format!("deflate: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(r)) => r,
+    }
+}
+
+/// ファズの対象（`fuzz/` の `png_write` と `tests/fuzz_smoke.rs` の `png_write`。M16 段 7）：入力の頭のバイトで形式・大きさ・
+/// 段・フレームの数・パレット・dpi を決め、残りを画素にした値を PNG・APNG に書いて読み直し、同じ値に戻ることを確かめる。
+/// 見つけたい不具合（panic・書けない・読めない・値が変わる）は `Err`。
+pub fn fuzz_png_write(data: &[u8]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    use crate::codec::{Decoder as _, Encoder as _};
+    use crate::value::{Frames, Image, ImageMeta, Palette, PixelFormat, Raster};
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0);
+    let fmt = PixelFormat::ALL[usize::from(byte(0)) % PixelFormat::ALL.len()];
+    let w = 1 + u32::from(byte(1)) % 70;
+    let h = 1 + u32::from(byte(2)) % 40;
+    let level = ["fast", "balanced", "high"][usize::from(byte(3)) % 3];
+    let count = usize::from(byte(4)) % 4;
+    let colors = 1 + usize::from(byte(5)) % 20;
+    let body = data.get(8..).unwrap_or(&[]);
+    let pixel = |i: usize| body.get(i % body.len().max(1)).copied().unwrap_or(0);
+    let n = w as usize * h as usize * fmt.bytes_per_pixel();
+    let r = catch_own_panic(|| -> Result<Result<(), String>, EngineError> {
+        let mut frames = Vec::new();
+        for f in 0..count.max(1) {
+            let mut rows: Vec<u8> = (0..n).map(|i| pixel(i + f * 7)).collect();
+            let palette = (fmt == PixelFormat::Indexed8).then(|| Palette {
+                colors: (0..colors)
+                    .map(|c| {
+                        [
+                            pixel(3 * c),
+                            pixel(3 * c + 1),
+                            pixel(3 * c + 2),
+                            pixel(c + 5),
+                        ]
+                    })
+                    .collect(),
+            });
+            if palette.is_some() {
+                for b in &mut rows {
+                    *b = (usize::from(*b) % colors) as u8;
+                }
+            }
+            frames.push((
+                Raster::from_rows(w, h, fmt, palette, &rows)?,
+                u32::from(byte(6)) * 300,
+            ));
+        }
+        let mut meta = ImageMeta::default();
+        if byte(7) % 2 == 1 {
+            meta.dpi = Some((u32::from(byte(7)) + 1, u32::from(byte(6)) + 1));
+        }
+        let v = if count == 0 {
+            let (px, _) = frames.remove(0);
+            Value::Image(Arc::new(Image { px, meta }))
+        } else {
+            Value::Frames(Arc::new(Frames::full(frames, meta, u32::from(byte(5)))?))
+        };
+        let mut out = Vec::new();
+        crate::codec::png::PngCodec.encode(
+            &v,
+            "png",
+            &serde_json::json!({ "compression": level }),
+            &mut out,
+            &NoMonitor,
+        )?;
+        let back = crate::codec::png::PngCodec.decode(
+            &mut std::io::Cursor::new(&out),
+            "png",
+            &crate::doc::DecodeOptions::default(),
+            &crate::limits::Limits::default(),
+            &NoMonitor,
+        )?;
+        if back.digest()? != v.digest()? {
+            return Ok(Err(format!(
+                "png_write: {fmt:?} {w}×{h} {level} の値が変わる"
+            )));
+        }
+        Ok(Ok(()))
+    });
+    match r {
+        Err(at) => Err(format!("png_write: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(format!("png_write: 書けない・読めない（{e}）")),
+        Ok(Ok(r)) => r,
+    }
+}
+
+/// ファズの対象（`fuzz/` の `lzw` と `tests/fuzz_smoke.rs` の `lzw`。M16 段 8）：入力の頭のバイトで最小の符号の長さを決め、
+/// 残りを (1) そのまま LZW の流れとして展開し（出力は 4 KiB まで。panic・進まない読みを見つける）、(2) 番号の列として圧縮して
+/// 展開し直すと元に戻ることを、入力を渡す切れ目を変えて確かめる。見つけたい不具合は `Err`。
+pub fn fuzz_lzw(data: &[u8]) -> Result<(), String> {
+    use crate::codec::lzw;
+    let r = catch_own_panic(|| -> Result<Result<(), String>, EngineError> {
+        let check = || -> Result<(), String> {
+            let head = data.first().copied().unwrap_or(0);
+            let body = data.get(1..).unwrap_or(&[]);
+            // (1) そのまま展開
+            let min = 1 + u32::from(head) % 11;
+            let mut d = lzw::Decoder::new(min);
+            let mut out = vec![0u8; 4096];
+            let mut at = 0;
+            let step = 1 + usize::from(head >> 4);
+            for piece in body.chunks(step) {
+                if d.feed(piece, &mut out, &mut at).is_err() {
+                    break;
+                }
+            }
+            // (2) 往復
+            let min = 2 + u32::from(head) % 7;
+            let mask = ((1u16 << min) - 1) as u8;
+            let idx: Vec<u8> = body.iter().map(|&b| b & mask).collect();
+            let mut z = Vec::new();
+            if !lzw::encode(&idx, min, &mut z) {
+                return Err("lzw: 範囲の中の番号を書けない".into());
+            }
+            for step in [1usize, 7, 4096] {
+                let mut d = lzw::Decoder::new(min);
+                let mut out = vec![0u8; idx.len()];
+                let mut at = 0;
+                for piece in z.chunks(step) {
+                    d.feed(piece, &mut out, &mut at)
+                        .map_err(|_| "lzw: 書いたものを読めない".to_string())?;
+                }
+                if at < idx.len() || out != idx {
+                    return Err(format!("lzw: 元に戻らない（{step} バイトずつ）"));
+                }
+            }
+            Ok(())
+        };
+        Ok(check())
+    });
+    match r {
+        Err(at) => Err(format!("lzw: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(r)) => r,
+    }
+}
+
 /// ファズの対象（`fuzz/` の `model_glb` と `tests/fuzz_smoke.rs` の `model_glb`）：glb の情報を読み、焼き込み、2 つの向きで
 /// 小さく描く（上限は `ModelLimits::fuzz`）。見つけたい不具合（自前のコードの panic・`Internal`・情報と焼き込みの食い違い・
 /// 大きさの食い違い）は `Err`、壊れた glb としてのエラー・上限は `Ok`。
@@ -750,11 +1002,11 @@ fn show_comments(entries: &[(String, String)]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/// コメントの名前を、読み取りが同じものとみなす形にする：読み取りの表（`codec::symph::comment_name`）が付ける kura の
+/// コメントの名前を、読み取りが同じものとみなす形にする：読み取りの表（`codec::common::comment_name`）が付ける kura の
 /// 名前（大文字と小文字だけの違い・DESCRIPTION と COMMENT・小文字ちょうどの `cprt` と COPYRIGHT は同じ名前になる）。
 /// ループ点の名前と、読み取りがタグにしない名前は大文字にしたもの。
 fn same_tag_name(name: &str) -> String {
-    use crate::codec::symph::{CommentName, comment_name};
+    use crate::codec::common::{CommentName, comment_name};
     match comment_name(name, true) {
         Some(CommentName::Tag(n)) => n,
         _ => name.to_ascii_uppercase(),
@@ -801,7 +1053,7 @@ pub fn fuzz_encode(format: &str, data: &[u8]) -> Result<(), String> {
     use std::sync::Arc;
 
     use crate::codec::Encoder as _;
-    use crate::codec::symph::{vorbis_comments_for, writable_loop};
+    use crate::codec::common::{vorbis_comments_for, writable_loop};
     use crate::value::Audio;
 
     // 足りない見出しは 0 で埋めて読む
@@ -1452,6 +1704,167 @@ pub fn fuzz_recipe(data: &[u8]) -> Result<(), String> {
         Err(at) => Err(format!("recipe: 自前のコードの panic（{at}）")),
         Ok(Err(EngineError::Internal(m))) => Err(m),
         Ok(_) => Ok(()),
+    }
+}
+
+/// 試験だけ：ほかのデコーダを、別の識別子（と退役の印）で包んだもの（M16 段 10）。読み方・段・再現の約束・見積もりはすべて
+/// 中のデコーダのまま。kura-core の移し替えのジョブ（`edit::retire`）の試験が、段 10 で外した symphonia の Vorbis の代わりに、
+/// 「後の版で外す旧版の読み手」として使う（`CodecSet::add_legacy_decoder` で足せば `retiring_ids` に出る）。
+pub struct RenamedDecoder {
+    inner: std::sync::Arc<dyn crate::codec::Decoder>,
+    id: &'static str,
+    retiring: bool,
+}
+
+impl RenamedDecoder {
+    /// `inner` を識別子 `id` で包む。`retiring` は [`crate::codec::Decoder::retiring`] の値。
+    pub fn new(
+        inner: std::sync::Arc<dyn crate::codec::Decoder>,
+        id: &'static str,
+        retiring: bool,
+    ) -> Self {
+        Self {
+            inner,
+            id,
+            retiring,
+        }
+    }
+}
+
+impl crate::codec::Decoder for RenamedDecoder {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn tier(&self) -> crate::codec::Tier {
+        self.inner.tier()
+    }
+    fn reproducible(&self) -> bool {
+        self.inner.reproducible()
+    }
+    fn env(&self) -> Option<crate::codec::CodecEnv> {
+        self.inner.env()
+    }
+    fn retiring(&self) -> bool {
+        self.retiring
+    }
+    fn can_decode(&self, format: &str) -> bool {
+        self.inner.can_decode(format)
+    }
+    fn work_bytes(&self, format: &str, shape: &crate::shape::Shape) -> u64 {
+        self.inner.work_bytes(format, shape)
+    }
+    fn file_work_bytes(&self, format: &str, shape: &crate::shape::Shape, len: u64) -> u64 {
+        self.inner.file_work_bytes(format, shape, len)
+    }
+    fn shape(
+        &self,
+        src: &mut dyn crate::codec::ReadSeek,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+    ) -> Result<crate::shape::Shape, EngineError> {
+        self.inner.shape(src, format, opts, limits)
+    }
+    fn decode(
+        &self,
+        src: &mut dyn crate::codec::ReadSeek,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        self.inner.decode(src, format, opts, limits, mon)
+    }
+    fn shape_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+    ) -> Result<crate::shape::Shape, EngineError> {
+        self.inner.shape_file(path, format, opts, limits)
+    }
+    fn shape_monitored(
+        &self,
+        src: &mut dyn crate::codec::ReadSeek,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        mon: &dyn Monitor,
+    ) -> Result<crate::shape::Shape, EngineError> {
+        self.inner.shape_monitored(src, format, opts, limits, mon)
+    }
+    fn shape_file_monitored(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        mon: &dyn Monitor,
+    ) -> Result<crate::shape::Shape, EngineError> {
+        self.inner
+            .shape_file_monitored(path, format, opts, limits, mon)
+    }
+    fn decode_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        mon: &dyn Monitor,
+    ) -> Result<Value, EngineError> {
+        self.inner.decode_file(path, format, opts, limits, mon)
+    }
+    fn streams(&self, format: &str) -> bool {
+        self.inner.streams(format)
+    }
+    fn stream_work_bytes(&self, format: &str, shape: &crate::shape::Shape, len: u64) -> u64 {
+        self.inner.stream_work_bytes(format, shape, len)
+    }
+    fn shape_work_bytes(&self, format: &str, len: u64) -> u64 {
+        self.inner.shape_work_bytes(format, len)
+    }
+    fn held_bytes(
+        &self,
+        src: &mut dyn crate::codec::ReadSeek,
+        format: &str,
+        limits: &crate::limits::Limits,
+    ) -> Result<crate::codec::Held, EngineError> {
+        self.inner.held_bytes(src, format, limits)
+    }
+    fn held_bytes_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        limits: &crate::limits::Limits,
+    ) -> Result<crate::codec::Held, EngineError> {
+        self.inner.held_bytes_file(path, format, limits)
+    }
+    fn decode_stream(
+        &self,
+        src: &mut (dyn crate::codec::ReadSeek + Send),
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        shape: &crate::shape::Shape,
+        out: &mut crate::codec::DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .decode_stream(src, format, opts, limits, shape, out, mon)
+    }
+    fn decode_stream_file(
+        &self,
+        path: &std::path::Path,
+        format: &str,
+        opts: &crate::doc::DecodeOptions,
+        limits: &crate::limits::Limits,
+        shape: &crate::shape::Shape,
+        out: &mut crate::codec::DecodeOut<'_>,
+        mon: &dyn Monitor,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .decode_stream_file(path, format, opts, limits, shape, out, mon)
     }
 }
 

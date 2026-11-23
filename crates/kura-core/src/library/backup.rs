@@ -482,7 +482,8 @@ mod tests {
                 "0013_item_sources",
                 "0014_credits",
                 "0015_projects",
-                "0016_export_files"
+                "0016_export_files",
+                "0017_retire_job"
             ]
         );
         // 当てたあとの WAL は空

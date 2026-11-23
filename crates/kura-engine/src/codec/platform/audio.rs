@@ -15,10 +15,11 @@
 
 use std::sync::Arc;
 
+use crate::codec::common::{self, Media, read_all};
 use crate::codec::platform::BackendError;
 use crate::codec::stream::{self, DecodeInfo, DecodeOut};
-use crate::codec::symph::{self, Container, read_all};
-use crate::codec::{CodecEnv, Decoder, ReadSeek, Stage, Tier, contain, try_vec};
+use crate::codec::{CodecEnv, Decoder, ReadSeek, Stage, Tier, try_vec};
+use crate::codec::{mp4_read, ogg_read};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;
 use crate::limits::Limits;
@@ -294,26 +295,27 @@ impl<B: AudioBackend> PlatformAudioDecoder<B> {
     }
 }
 
-/// 入れ物のタグ・ループ点を固定の段のパーサーで読む（m4a・ogg・opus。ほかの形式はタグなし）。読めなければタグなし
-/// （中止だけは返す）。
+/// 入れ物のタグ・ループ点を固定の段のパーサーで読む（m4a は自作の MP4 の読み口、ogg・opus は自作の Ogg の読み口。ほかの形式は
+/// タグなし。M16 段 10 で symphonia の読み口から替えた。docs/editing.md §9.2）。読めなければタグなし（中止だけは返す）。
 fn container_meta(
-    id: &str,
+    id: &'static str,
     bytes: &[u8],
     format: &str,
     frames: u64,
     limits: &Limits,
     mon: &dyn Monitor,
 ) -> Result<AudioMeta, EngineError> {
-    let (container, vorbis) = match format {
-        "m4a" => (Container::Mp4, false),
-        "ogg" | "opus" => (Container::Ogg, true),
+    let mut media = Media::Bytes(bytes);
+    // タグにするコメントの数の上限：1 つのタグは値に入るとき 32 バイト以上を予算から引く（`common::meta_from_tags`）ので、
+    // それを超える数は値にならない（ループ点だけはそのあとでも読めたが、そこまで並べたファイルは読まない）
+    let max = usize::try_from(limits.max_meta_bytes / 32).unwrap_or(usize::MAX);
+    let (raw, vorbis) = match format {
+        "m4a" => (mp4_read::tags(&mut media, mon, id), false),
+        "ogg" | "opus" => (ogg_read::tags(&mut media, mon, id, max), true),
         _ => return Ok(AudioMeta::default()),
     };
-    let raw = contain(id, Stage::Decode, || {
-        symph::open(id, bytes, container, mon, limits).map(|mut o| o.raw_tags())
-    });
     match raw {
-        Ok(raw) => Ok(symph::meta_from_tags(&raw, frames, vorbis, limits)),
+        Ok(raw) => Ok(common::meta_from_tags(&raw, frames, vorbis, limits)),
         Err(EngineError::Canceled) => Err(EngineError::Canceled),
         Err(_) => Ok(AudioMeta::default()),
     }
@@ -328,6 +330,7 @@ mod tests {
     use crate::codec::CodecSet;
     use crate::monitor::{CancelAfter, NoMonitor};
     use crate::testing::platform::{AudioFault, FakeAudio, FakeAudioBackend};
+    use crate::value::LoopRange;
 
     fn planes(channels: usize, frames: usize) -> Vec<Vec<f32>> {
         (0..channels)
@@ -536,5 +539,116 @@ mod tests {
             panic!()
         };
         assert!(a.meta.tags.is_empty() && a.meta.loop_range.is_none());
+    }
+
+    /// Vorbis コメント 1 つ（長さつき）の並び。
+    fn comment_list(items: &[&str]) -> Vec<u8> {
+        let mut b = 4u32.to_le_bytes().to_vec();
+        b.extend_from_slice(b"test");
+        b.extend_from_slice(&(items.len() as u32).to_le_bytes());
+        for c in items {
+            b.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            b.extend_from_slice(c.as_bytes());
+        }
+        b
+    }
+
+    fn meta_of(bytes: &[u8], format: &str) -> AudioMeta {
+        container_meta(
+            "test-dec/1",
+            bytes,
+            format,
+            1_000,
+            &Limits::default(),
+            &NoMonitor,
+        )
+        .unwrap()
+    }
+
+    /// M16 段 10：入れ物のタグは自作の読み口で読む。Ogg は最初の BOS の組の Vorbis・Opus・FLAC の最初の論理ストリームの
+    /// コメント（Vorbis・Opus は 2 つ目のパケット、FLAC は頭のパケットの VORBIS_COMMENT。前の symphonia は最後に読んだ
+    /// コメント（多重化なら後の論理ストリームの、FLAC なら PICTURE のあとは空）を使っていた）。頭だけを読むので、あとの
+    /// ページが壊れていてもタグを読む。m4a は中身を問わず音声のトラックがあればタグを読む。
+    #[test]
+    fn container_tags_are_read_by_the_own_readers() {
+        use crate::codec::ogg::tests::page;
+        // Ogg の FLAC：STREAMINFO・PICTURE・VORBIS_COMMENT（最後の箱）
+        let mut head = b"\x7fFLAC\x01\x00\x00\x02fLaC".to_vec();
+        head.extend_from_slice(&[0, 0, 0, 34]);
+        head.extend_from_slice(&[0; 34]);
+        let picture = [6u8, 0, 0, 4, 1, 2, 3, 4];
+        let mut comment = vec![0x84];
+        let list = comment_list(&["TITLE=ふぁいる", "LOOPSTART=10", "LOOPLENGTH=20"]);
+        comment.extend_from_slice(&(list.len() as u32).to_be_bytes()[1..]);
+        comment.extend_from_slice(&list);
+        let mut flac = page(5, 0, 0x02, 0, &[&head]);
+        flac.extend_from_slice(&page(5, 1, 0, 0, &[&picture, &comment]));
+        flac.extend_from_slice(&page(5, 2, 0x04, 1_000, &[&[0xff, 0xf8]]));
+        let m = meta_of(&flac, "ogg");
+        assert_eq!(m.tags.get("title").map(String::as_str), Some("ふぁいる"));
+        assert_eq!(m.loop_range, Some(LoopRange { start: 10, end: 30 }));
+        // 多重化：Opus と Vorbis が同じ BOS の組にあれば、最初の Opus のコメント
+        let opus_head = b"OpusHead\x01\x02\x00\x00\x80\xbb\x00\x00\x00\x00\x00".to_vec();
+        let mut opus_tags = b"OpusTags".to_vec();
+        opus_tags.extend_from_slice(&comment_list(&["TITLE=first"]));
+        let mut vorbis_id = b"\x01vorbis".to_vec();
+        vorbis_id.extend_from_slice(&[0; 23]);
+        let mut vorbis_comment = b"\x03vorbis".to_vec();
+        vorbis_comment.extend_from_slice(&comment_list(&["TITLE=second"]));
+        vorbis_comment.push(1);
+        let mut muxed = page(1, 0, 0x02, 0, &[&opus_head]);
+        muxed.extend_from_slice(&page(2, 0, 0x02, 0, &[&vorbis_id]));
+        muxed.extend_from_slice(&page(1, 1, 0, 0, &[&opus_tags]));
+        muxed.extend_from_slice(&page(2, 1, 0, 0, &[&vorbis_comment]));
+        assert_eq!(
+            meta_of(&muxed, "opus")
+                .tags
+                .get("title")
+                .map(String::as_str),
+            Some("first")
+        );
+        // 頭のあとが壊れていても（ページの頭でないものが続く）タグは読む
+        let mut tail = muxed.clone();
+        tail.extend_from_slice(b"garbage that is not a page");
+        assert_eq!(
+            meta_of(&tail, "opus").tags.get("title").map(String::as_str),
+            Some("first")
+        );
+        // コメントが途中で切れていればタグなし（誤りにしない）
+        let mut cut = b"OpusTags".to_vec();
+        cut.extend_from_slice(&comment_list(&["TITLE=first"])[..12]);
+        let mut broken = page(1, 0, 0x02, 0, &[&opus_head]);
+        broken.extend_from_slice(&page(1, 1, 0, 0, &[&cut]));
+        assert!(meta_of(&broken, "opus").tags.is_empty());
+        // タグにするコメントは、メタデータの予算（1 つ 32 バイト以上）に入る数まで
+        let mut many = b"OpusTags".to_vec();
+        many.extend_from_slice(&comment_list(&[
+            "A=1", "B=2", "C=3", "D=4", "E=5", "F=6", "G=7", "H=8",
+        ]));
+        let mut capped = page(1, 0, 0x02, 0, &[&opus_head]);
+        capped.extend_from_slice(&page(1, 1, 0, 0, &[&many]));
+        let tight = Limits {
+            max_meta_bytes: 3 * 32,
+            ..Limits::default()
+        };
+        let m = container_meta("test-dec/1", &capped, "opus", 1_000, &tight, &NoMonitor).unwrap();
+        assert!(m.tags.len() <= 3, "{:?}", m.tags);
+        assert_eq!(meta_of(&capped, "opus").tags.len(), 8);
+        // Vorbis でも Opus でも FLAC でもない Ogg・空はタグなし
+        assert!(
+            meta_of(&page(3, 0, 0x02, 0, &[b"\x80theora"]), "ogg")
+                .tags
+                .is_empty()
+        );
+        assert!(meta_of(&[], "ogg").tags.is_empty());
+        // m4a：ALAC のトラックのタグ（AAC など、ほかの中身でも同じ道）
+        let alac = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/alac-tags.m4a"
+        ))
+        .unwrap();
+        assert_eq!(meta_of(&alac, "m4a").tags.len(), 7);
+        // タグを読む形式でなければ読まない
+        assert!(meta_of(&alac, "wav").tags.is_empty());
     }
 }

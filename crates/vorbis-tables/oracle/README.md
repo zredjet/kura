@@ -51,6 +51,7 @@ aoTuV（Copyright (c) 2003-2021 Aoyumi）と libvorbis・libogg（Copyright (c) 
 | `lib/kura_libm.h` | 超越関数の差し替え（`-include` で全部の翻訳単位に読ませる。§6） |
 | `lib/kura_port.{h,c}` | ダンプの書き出し（§4.3） |
 | `tools/oracle_enc.c` | 照合用のエンコーダ（§3.2） |
+| `tools/oracle_dec.c` | 照合用のデコーダ（M16 段 2・ADR-217）：libogg と libvorbis で Ogg Vorbis を読み（`decoder_example` と同じ流れ）、合成した PCM の float のビットを書く。自作の読み取り（`codec/vorbis/dec/`）とビット単位で照らす（`KURA_VORBIS_ORACLE=… cargo test --release -p kura-engine --lib codec::vorbis::dec`）。読み取りの経路（synthesis.c・block.c の合成・info.c の unpack・codebook.c・sharedbook.c・floor0.c・lsp.c・floor1.c・res0.c・mapping0.c の inverse・mdct.c）には差分（`patches/`）が当たっていない |
 | `tools/oracle_setup.c` | 設定（codec_setup_info ほか）と導出の表を JSON で出す（§3.3） |
 | `tools/pkt2ogg.c`・`tools/ogg2pkt.c` | パケットのファイル ⇔ Ogg（§3.4） |
 | `rlibm/` | Rust の staticlib。`libm = { version = "=0.2.16", default-features = false }`（kura のワークスペースと同じ指定）の関数を `kura_exp` などの名前で出す。`Cargo.toml` に空の `[workspace]` を置いて kura のワークスペースから独立させている（lint・整形・テスト・第三者のライセンスの一覧の対象にならない）。`Cargo.lock` もここに置く |

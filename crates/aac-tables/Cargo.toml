@@ -1,0 +1,14 @@
+[package]
+name = "aac-tables"
+description = "AAC（ISO/IEC 14496-3）の符号表と帯の区切り。symphonia-codec-aac の表を値を変えずに写したもの。kura-engine の自作の AAC の読み手が使う"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+# 中身は symphonia（と NihAV）の表なので、その条件（MPL-2.0）で配る。本文は LICENSE（symphonia-codec-aac の LICENSE）。
+# 名前を kura- で始めないのは、symphonia の表のクレートだと名前で分かるようにするため（vorbis-tables と同じ）。
+license = "MPL-2.0"
+repository.workspace = true
+
+[lints]
+workspace = true

@@ -17,32 +17,51 @@
 //!   包んで値のダイジェスト（R1）を取る。流して書くエンコーダの `encode` は値の生産者で同じ道を通す（バイト列は 1 つの
 //!   実装で決まる）。ファイルのダイジェスト（R2）は書いたものを読み直して [`FileDigest`] で取る。
 
+pub mod aac;
 pub mod aiff;
+pub mod alac;
+pub(crate) mod alac_read;
 pub mod anchor;
 pub mod aseprite;
+pub(crate) mod byte_in;
 pub mod caps;
+pub(crate) mod common;
 pub mod exif;
 pub mod flac;
+pub(crate) mod flac_read;
 pub mod fonts;
 pub mod formats;
+#[cfg(test)]
+pub(crate) mod frozen;
 pub mod gif;
+#[cfg(test)]
+pub(crate) mod gif_old;
+pub(crate) mod gif_read;
+pub(crate) mod gif_write;
 pub(crate) mod held;
 pub mod jpeg;
-pub mod lossy;
+pub(crate) mod lzw;
+pub(crate) mod md5;
 pub mod mp3;
+pub(crate) mod mp4_read;
 pub(crate) mod ogg;
+pub(crate) mod ogg_read;
 pub mod pcm;
 pub mod platform;
 pub mod png;
+#[cfg(test)]
+pub(crate) mod png_old;
+pub(crate) mod png_read;
+pub(crate) mod png_write;
 pub mod psd;
 pub mod recorded;
 pub mod stream;
 pub mod svg;
 pub(crate) mod svg_text;
-pub(crate) mod symph;
 pub mod vorbis;
 pub mod wav;
 pub mod webp;
+pub mod zlib;
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Seek, Write};
@@ -267,7 +286,7 @@ pub struct OpenedSource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EncodedStamp {
-    /// 使ったエンコーダ（例 `png-rs-enc/1`）。同じ書き手で書き直すときは `CodecSet::encode_bytes_with` に渡す。
+    /// 使ったエンコーダ（例 `png-kura-enc/1`）。同じ書き手で書き直すときは `CodecSet::encode_bytes_with` に渡す。
     pub codec: String,
     pub tier: Tier,
     /// 書いた形式の ID。
@@ -311,6 +330,12 @@ pub trait Decoder: Send + Sync {
     /// 呼ぶたびにプロセスを起動したり OS に問い合わせたりしない（組み立てたときに調べた値を返す）。
     fn env(&self) -> Option<CodecEnv> {
         None
+    }
+    /// 後の版で外す旧版の読み手か（既定は偽）。真なら、kura-core の移し替えのジョブ（`edit::retire`）が、この識別子で読んだ版の
+    /// 入力のうちアンカーのないものに、この読み手で 1 度だけアンカーを作る（M16 段 5。docs/editing.md §9.4）。旧版
+    /// （`add_legacy_decoder`）にだけ付ける。
+    fn retiring(&self) -> bool {
+        false
     }
     /// この形式を読めるか。
     fn can_decode(&self, format: &str) -> bool;
@@ -464,7 +489,8 @@ pub trait Decoder: Send + Sync {
 
 /// エンコーダ。
 pub trait Encoder: Send + Sync {
-    /// 識別子（例 `png-rs-enc/1`。約束の版を含む）。書くバイト列が変わる変更は版を上げる（R2。旧版は残さなくてよい）。
+    /// 識別子（例 `png-kura-enc/1`。約束の版を含む）。書くバイト列が変わる変更は版を上げる（R2。旧版は残さなくてよい。
+    /// 外した旧版は [`RETIRED_ENCODERS`] に足す）。
     fn id(&self) -> &'static str;
     fn tier(&self) -> Tier;
     /// 同じ値・同じ設定なら、どの環境でも同じバイト列を書くか（R2）。既定は固定の段なら真。固定の段でないものは真に
@@ -606,6 +632,32 @@ pub struct PinnedOptions {
     pub svg_fonts: Option<SvgFonts>,
 }
 
+/// 退いた固定のエンコーダの識別子（書くバイト列の約束を新しい識別子に譲り、このビルドにはないもの。§9.1・ADR-224）。
+/// 記録がこれらの書き手の版は、GC が作り直した値だけで照らして手放し（[`CodecSet::is_retired_encoder`]）、版に戻すは今の組の
+/// 同じ形式の書き手で書き直す（同じ値・新しいバイト列）。足すだけで、消さない。
+/// - `png-rs-enc/1`：png クレート 0.18.1 の書き出し（M16 段 7 で自作の `png-kura-enc/1` に替えた）。
+/// - `gif-rs-enc/1`：gif クレート 0.14.2 の書き出し（M16 段 8 で自作の `gif-kura-enc/1` に替えた）。
+pub const RETIRED_ENCODERS: &[&str] = &["png-rs-enc/1", "gif-rs-enc/1"];
+
+/// 外した固定のデコーダの識別子（読む値の約束ごと、このビルドから外したもの。§9.1・§9.4・ADR-227）。記録がこれらの読み手の版の
+/// 入力は、アンカーがあればアンカーから作り直し、なければ `Mismatch::DecoderGone`（`recorded::read_recorded`）。同じ識別子の
+/// デコーダはもう足せない（[`CodecSet::add_decoder`]・[`CodecSet::add_legacy_decoder`] が断る。記録の識別子が別の読み方を
+/// 指さないように）。足すだけで、消さない。
+/// - `ogg-vorbis-symphonia-dec/3`・`m4a-aac-symphonia-dec/2`・`aac-adts-symphonia-dec/2`：symphonia 0.6.1 の Ogg Vorbis・AAC-LC
+///   （超越関数を libm に差し替えた写し）。M16 段 2・4 で自作（`ogg-vorbis-kura-dec/1`・`m4a-aac-kura-dec/1`・
+///   `aac-adts-kura-dec/1`）に替えて旧版の読み手に残し、段 5 の移し替えのジョブでアンカーに移してから、段 10 で外した。
+/// - `ogg-vorbis-symphonia-dec/1`・`/2`・`m4a-aac-symphonia-dec/1`・`aac-adts-symphonia-dec/1`：M10 の段 6〜9 で版を上げた
+///   ときに残さなかった前の版（版の記録（M12）より前なので、版の入力の記録にはない）。
+pub const RETIRED_DECODERS: &[&str] = &[
+    "ogg-vorbis-symphonia-dec/3",
+    "m4a-aac-symphonia-dec/2",
+    "aac-adts-symphonia-dec/2",
+    "ogg-vorbis-symphonia-dec/1",
+    "ogg-vorbis-symphonia-dec/2",
+    "m4a-aac-symphonia-dec/1",
+    "aac-adts-symphonia-dec/1",
+];
+
 /// 形式ごとに、段の順に試すコーデックの組。
 #[derive(Clone, Default)]
 pub struct CodecSet {
@@ -645,12 +697,14 @@ impl CodecSet {
                 aiff.clone(),
                 flac.clone(),
                 Arc::new(mp3::Mp3Codec),
-                Arc::new(lossy::SymphoniaDecoder::ogg_vorbis()),
-                Arc::new(lossy::SymphoniaDecoder::m4a_alac()),
-                Arc::new(lossy::SymphoniaDecoder::m4a_aac()),
-                Arc::new(lossy::SymphoniaDecoder::adts_aac()),
+                Arc::new(vorbis::dec::VorbisDecoder),
+                Arc::new(alac::AlacCodec),
+                Arc::new(aac::read::AacCodec::m4a()),
+                Arc::new(aac::read::AacCodec::adts()),
                 Arc::new(anchor::AnchorDecoder),
             ],
+            // 旧版：PNG の /1（M16 段 2・4 で自作に替えた symphonia の Ogg Vorbis・AAC は、段 5 でアンカーに移してから段 10 で
+            // 外した。[`RETIRED_DECODERS`]）
             legacy_decoders: png::legacy_decoders(),
             encoders: vec![
                 png,
@@ -665,7 +719,8 @@ impl CodecSet {
         }
     }
 
-    /// 旧版のデコーダを足す（読む値を変えた版を上げたとき、前の版を残す。ふつうの読み取りでは選ばない）。同じ識別子は断る。
+    /// 旧版のデコーダを足す（読む値を変えた版を上げたとき、前の版を残す。ふつうの読み取りでは選ばない）。同じ識別子と外した
+    /// 識別子（[`RETIRED_DECODERS`]）は断る。
     pub fn add_legacy_decoder(&mut self, d: Arc<dyn Decoder>) -> Result<(), EngineError> {
         self.check_new_decoder(d.id())?;
         self.legacy_decoders.push(d);
@@ -673,6 +728,11 @@ impl CodecSet {
     }
 
     fn check_new_decoder(&self, id: &str) -> Result<(), EngineError> {
+        if RETIRED_DECODERS.contains(&id) {
+            return Err(EngineError::Internal(format!(
+                "外した識別子のデコーダは足せません（{id}）。記録の識別子が別の読み方を指すことになります"
+            )));
+        }
         if self.decoder_by_id(id).is_some() {
             return Err(EngineError::Internal(format!(
                 "同じ識別子のデコーダがあります（{id}）。記録の識別子で読み直すときに選べなくなります"
@@ -694,7 +754,14 @@ impl CodecSet {
         self.encoders.iter().find(|e| e.id() == id)
     }
 
-    /// デコーダを足す（Platform・External。段の順に並べ直す。同じ段なら足した順）。同じ識別子は断る。
+    /// 退いた固定のエンコーダ（[`RETIRED_ENCODERS`]）で、この組にないものか。記録がこの書き手の版は、GC が値だけで照らして
+    /// 手放す（バイト列は比べない）。この環境にないだけの書き手（Platform・External）は退いたものではない（今までどおり次回へ）。
+    pub fn is_retired_encoder(&self, id: &str) -> bool {
+        RETIRED_ENCODERS.contains(&id) && self.encoder_by_id(id).is_none()
+    }
+
+    /// デコーダを足す（Platform・External。段の順に並べ直す。同じ段なら足した順）。同じ識別子と外した識別子
+    /// （[`RETIRED_DECODERS`]）は断る。
     /// 固定の段でないのに値の再現を約束する（`reproducible()` が真）デコーダも断る（記録を偽れないように。アンカーを作らない
     /// ことになるため）。
     pub fn add_decoder(&mut self, d: Arc<dyn Decoder>) -> Result<(), EngineError> {
@@ -758,6 +825,16 @@ impl CodecSet {
         self.decoders
             .iter()
             .filter(|d| d.can_decode(format))
+            .collect()
+    }
+
+    /// 後の版で外す旧版の読み手の識別子（[`Decoder::retiring`] が真の旧版。足した順）。移し替えのジョブが、この識別子で
+    /// 読んだ版の入力にアンカーを作る（M16 段 5）。
+    pub fn retiring_ids(&self) -> Vec<&'static str> {
+        self.legacy_decoders
+            .iter()
+            .filter(|d| d.retiring())
+            .map(|d| d.id())
             .collect()
     }
 
@@ -1628,12 +1705,30 @@ mod tests {
             ))))
             .unwrap();
         assert_eq!(with_platform.decode_work_bytes("heic", &rgb), 2 * v);
-        // 書き：PNG は 3 倍（fast は 4 倍）、APNG は 1 フレームぶん
-        assert_eq!(set.encode_work_bytes("png", &rgb, &json!({})), 3 * v);
+        // 書き：PNG は行の帯ずつ流して書くので、値の大きさによらず幅に比例する分だけ（M16 段 7）。APNG は 1 フレームぶん
+        for c in ["fast", "balanced", "high"] {
+            let o = json!({ "compression": c });
+            let level = match c {
+                "fast" => crate::codec::zlib::Level::Fast,
+                "high" => crate::codec::zlib::Level::High,
+                _ => crate::codec::zlib::Level::Balanced,
+            };
+            assert_eq!(
+                set.encode_work_bytes("png", &rgb, &o),
+                png_write::work_bytes(level, 600, 400, 3)
+            );
+        }
+        // 高さによらず上限で止まる（流して書く）
+        let tall = |h| Shape::Image {
+            w: Dim::Exact(600),
+            h: Dim::Exact(h),
+            fmt: PixelFormat::Rgb8,
+        };
         assert_eq!(
-            set.encode_work_bytes("png", &rgb, &json!({ "compression": "fast" })),
-            4 * v
+            set.encode_work_bytes("png", &tall(40_000), &json!({})),
+            set.encode_work_bytes("png", &tall(400_000), &json!({}))
         );
+        assert!(set.encode_work_bytes("png", &tall(40_000), &json!({})) < 12 << 20);
         let apng = Shape::Frames {
             count: Dim::Exact(10),
             w: Dim::Exact(600),
@@ -1641,7 +1736,10 @@ mod tests {
             fmt: PixelFormat::Rgb8,
             full: crate::shape::Fullness::Full,
         };
-        assert_eq!(set.encode_work_bytes("png", &apng, &json!({})), 3 * v);
+        assert_eq!(
+            set.encode_work_bytes("png", &apng, &json!({})),
+            set.encode_work_bytes("png", &rgb, &json!({}))
+        );
         // JPEG：画素あたり 行 3 ＋ 書いた列 6（プログレッシブはさらに 9）。透明を持ちうる形式は RGBA8 の行
         let px = 600 * 400;
         assert_eq!(set.encode_work_bytes("jpeg", &rgb, &json!({})), 9 * px);
@@ -1663,10 +1761,11 @@ mod tests {
             14_400 + (8 << 20)
         );
         assert_eq!(set.encode_work_bytes("wav", &audio, &json!({})), 8_000);
-        // アンカー：読み直す値の 1 倍（値を含めて 2 倍）。APNG は 1 フレームの PNG（fast）の 4 倍と比べて大きいほう
-        assert_eq!(anchor::work_bytes(&rgb), v);
+        // アンカー：読み直す値の 1 倍（値を含めて 2 倍）と、PNG（fast）の作業領域の大きいほう
+        let png_fast = set.encode_work_bytes("png", &rgb, &json!({ "compression": "fast" }));
+        assert_eq!(anchor::work_bytes(&rgb), v.max(png_fast));
         assert_eq!(anchor::work_bytes(&audio), 8_000);
-        assert_eq!(anchor::work_bytes(&apng), 10 * v);
+        assert_eq!(anchor::work_bytes(&apng), (10 * v).max(png_fast));
         let short = Shape::Frames {
             count: Dim::Exact(2),
             w: Dim::Exact(600),
@@ -1674,7 +1773,7 @@ mod tests {
             fmt: PixelFormat::Rgb8,
             full: crate::shape::Fullness::Full,
         };
-        assert_eq!(anchor::work_bytes(&short), 4 * v);
+        assert_eq!(anchor::work_bytes(&short), (2 * v).max(png_fast));
     }
 
     /// 書き出しの設定は厳しく確かめる（知らないキー・型の違い・範囲の外はエラー）。正規の形に直してから確かめるので、24.0 は 24 と同じ。
@@ -1847,6 +1946,78 @@ mod tests {
         assert_eq!(stamp.tier, Tier::Pinned);
     }
 
+    /// M16 段 10：外したデコーダ（[`RETIRED_DECODERS`]）は固定の組になく、同じ識別子は今の版にも旧版にも足せない。固定の組に
+    /// 退役する旧版はもうない（移し替えのジョブは積まれない）が、旧版に `retiring` の印を付ければ、移し替えの対象になる
+    /// （後の版で外す読み手のための仕組みは残す）。PNG の /1 は退役させない。
+    #[test]
+    fn retired_decoders_are_gone_and_cannot_come_back() {
+        struct Named(&'static str, bool);
+        impl Decoder for Named {
+            fn id(&self) -> &'static str {
+                self.0
+            }
+            fn tier(&self) -> Tier {
+                Tier::Pinned
+            }
+            fn retiring(&self) -> bool {
+                self.1
+            }
+            fn can_decode(&self, format: &str) -> bool {
+                format == "ogg"
+            }
+            fn shape(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+            ) -> Result<Shape, EngineError> {
+                Err(EngineError::Unsupported("x".into()))
+            }
+            fn decode(
+                &self,
+                _: &mut dyn ReadSeek,
+                _: &str,
+                _: &DecodeOptions,
+                _: &Limits,
+                _: &dyn Monitor,
+            ) -> Result<Value, EngineError> {
+                Err(EngineError::Unsupported("x".into()))
+            }
+        }
+        let mut set = CodecSet::pinned();
+        assert!(set.retiring_ids().is_empty());
+        for id in RETIRED_DECODERS {
+            assert!(set.decoder_by_id(id).is_none(), "{id}");
+            assert!(set.add_decoder(Arc::new(Named(id, false))).is_err(), "{id}");
+            assert!(
+                set.add_legacy_decoder(Arc::new(Named(id, true))).is_err(),
+                "{id}"
+            );
+        }
+        assert!(set.decoders.iter().all(|d| !d.retiring()));
+        assert!(
+            !set.decoder_by_id("png-rs-dec/1").unwrap().retiring(),
+            "PNG の旧版は退役させない"
+        );
+        // 今の読み手は自作
+        for (f, id) in [
+            ("ogg", "ogg-vorbis-kura-dec/1"),
+            ("m4a", "m4a-aac-kura-dec/1"),
+            ("aac", "aac-adts-kura-dec/1"),
+        ] {
+            assert!(set.decoders_for(f).iter().any(|d| d.id() == id), "{f}");
+        }
+        set.add_legacy_decoder(Arc::new(Named("old-ogg-dec/1", true)))
+            .unwrap();
+        assert_eq!(set.retiring_ids(), ["old-ogg-dec/1"]);
+        assert!(
+            set.decoders_for("ogg")
+                .iter()
+                .all(|d| d.id() != "old-ogg-dec/1")
+        );
+    }
+
     /// 形は読めても中身で扱えないと分かった（`decode` が `Unsupported`）ときも、次の段へ回す。
     /// 旧版のデコーダはふつうの読み取りでは選ばれず、記録した識別子でだけ選べる。
     #[test]
@@ -1925,8 +2096,36 @@ mod tests {
         assert!(set.decoder_by_id("pinned-dec/1").is_some());
         let pinned = CodecSet::pinned();
         assert!(pinned.decoder_by_id("png-rs-dec/1").is_some());
-        assert!(pinned.encoder_by_id("png-rs-enc/1").is_some());
-        assert!(pinned.decoder_by_id("png-rs-enc/1").is_none());
+        assert!(pinned.encoder_by_id("png-kura-enc/1").is_some());
+        assert!(pinned.decoder_by_id("png-kura-enc/1").is_none());
+    }
+
+    /// 退いたエンコーダは固定の組になく、同じ形式を書く今の書き手がある（GC は値で照らし、版に戻すはその書き手で書く）。
+    #[test]
+    fn retired_encoders_are_gone_and_have_successors() {
+        let pinned = CodecSet::pinned();
+        for id in RETIRED_ENCODERS {
+            assert!(pinned.encoder_by_id(id).is_none(), "{id}");
+            assert!(pinned.is_retired_encoder(id), "{id}");
+        }
+        let shape = Shape::Image {
+            w: Dim::Exact(1),
+            h: Dim::Exact(1),
+            fmt: crate::value::PixelFormat::Rgba8,
+        };
+        assert!(
+            pinned
+                .encoder("png", &shape)
+                .is_some_and(|e| e.id() == "png-kura-enc/1")
+        );
+        assert!(
+            pinned
+                .encoder("gif", &shape)
+                .is_some_and(|e| e.id() == "gif-kura-enc/1")
+        );
+        // この組にないだけの書き手は退いたものではない
+        assert!(!pinned.is_retired_encoder("gone-png-enc/9"));
+        assert!(!pinned.is_retired_encoder("png-kura-enc/1"));
     }
 
     /// 同じ識別子のコーデックは重ねて登録できない（記録の識別子で読み直すときに選べなくなるため）。
@@ -2334,14 +2533,14 @@ mod tests {
         let json = serde_json::to_value(&enc).unwrap();
         assert!(json.get("reproducible").is_none() && json.get("env").is_none());
         let stage8 = format!(
-            r#"{{"codec":"png-rs-enc/1","tier":"pinned","format":"png","options":{{}},"bytes":{},"fileDigest":"{}"}}"#,
+            r#"{{"codec":"png-kura-enc/1","tier":"pinned","format":"png","options":{{}},"bytes":{},"fileDigest":"{}"}}"#,
             enc.bytes, enc.file_digest
         );
         assert_eq!(serde_json::to_string(&enc).unwrap(), stage8);
         assert_eq!(
             String::from_utf8(crate::digest::canonical(&enc).unwrap()).unwrap(),
             format!(
-                r#"{{"bytes":{},"codec":"png-rs-enc/1","fileDigest":"{}","format":"png","options":{{}},"tier":"pinned"}}"#,
+                r#"{{"bytes":{},"codec":"png-kura-enc/1","fileDigest":"{}","format":"png","options":{{}},"tier":"pinned"}}"#,
                 enc.bytes, enc.file_digest
             )
         );
@@ -2508,7 +2707,7 @@ mod tests {
         let before = alac_last.lock().unwrap().unwrap();
         for (id, value, format) in [
             ("missing-enc/1", &v, "m4a"),
-            ("png-rs-enc/1", &v, "m4a"),
+            ("png-kura-enc/1", &v, "m4a"),
             ("fake-alac-enc/1", &v, "mp3"),
             ("fake-alac-enc/1", &hi, "m4a"),
             ("png-rs-dec/2", &v, "m4a"),

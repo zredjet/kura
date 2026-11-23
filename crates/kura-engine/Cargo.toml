@@ -15,18 +15,11 @@ autotests = false
 # - blake3：すべてのダイジェスト
 # - rand_chacha：乱数（ChaCha8）。鍵は determinism::key_from_seed で自前に作るので rand_core の実装には頼らない
 # - libm：超越関数（ワークスペースで固定）
-# - png：PNG の読み書き（R2 は Cargo.lock の fdeflate・flate2・miniz_oxide の版にも依存する。コーデックのゴールデンで見張る）
 # - zune-jpeg：JPEG の読み取り。SIMD を外して（default-features = false）、どのターゲットでも同じ整数の経路にする
 # - jpeg-encoder：JPEG の書き出し（SIMD の feature は入れない）
-# - gif：GIF の読み書き（R2 は Cargo.lock の weezl の版にも依存する）
-# - miniz_oxide：aseprite・PSD の zlib の展開（上限付き）
 # - image-webp：WebP の読み取り（可逆・非可逆・アニメ）と可逆の書き出し
 # - resvg：SVG の描画。中で std の三角関数（OS の libm）を使うので、結果は環境に依存する（R1 を約束しない。§9.4 のアンカーを作る）
-# - symphonia-*：FLAC・ALAC（整数だけ）と AAC-LC・Vorbis（段 9 から、超越関数を libm に差し替えた third_party の写しで
-#   値を再現できる。ADR-153）の読み取り、MP4・Ogg の読み口。部品のクレートを直接 `=` で固定し、既定の
-#   feature（opt-simd の rustfft は AAC・Vorbis の値を変える）と id3v2（スタックのあふれ #562）を入れない
 # - nanomp3：MP3 の読み取り（minimp3 とビット一致の純 Rust。libm を使わない）。SIMD（wide）は外す
-# - md-5：FLAC の STREAMINFO の MD5（入力の標本だけで決まる）
 # - vorbis-tables：Ogg Vorbis の書き出しの表（aoTuV b6.03 から生成してコミットしたもの。ワークスペースの中のクレート。
 #   中身を変えるとテストの凍結した値が合わなくなり、エンコーダの版を上げる）
 # serde_json は固定しない：正規の JSON は自前で書き（digest.rs）、読み込みは float_roundtrip で正しく丸めるので、結果は版によらない。
@@ -38,13 +31,9 @@ specta = ["dep:specta"]
 [dependencies]
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 libm.workspace = true
-miniz_oxide = "=0.8.9"
-gif = { version = "=0.14.2", default-features = false, features = ["std", "raii_no_panic"] }
 image-webp = "=0.2.4"
-md-5 = { version = "=0.11.0", default-features = false }
 nanomp3 = { version = "=0.2.0", default-features = false, features = ["alloc"] }
 jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
-png = "=0.18.1"
 rand_chacha = "=0.10.0"
 rayon.workspace = true
 resvg = { version = "=0.48.1", default-features = false, features = ["text"] }
@@ -53,15 +42,9 @@ serde_json.workspace = true
 # feature `specta` のときだけ（引数の JSON の値は specta_types::JsonValue の名前で出す。specta の serde_json の型は入れ子を
 # 展開して TS に書き出せないので使わない）
 specta = { workspace = true, optional = true, features = ["derive"] }
-symphonia-bundle-flac = { version = "=0.6.1", default-features = false }
-symphonia-codec-aac = { version = "=0.6.1", default-features = false }
-symphonia-codec-alac = { version = "=0.6.1", default-features = false }
-symphonia-codec-vorbis = { version = "=0.6.1", default-features = false }
-symphonia-core = { version = "=0.6.1", default-features = false }
-symphonia-format-isomp4 = { version = "=0.6.1", default-features = false }
-symphonia-format-ogg = { version = "=0.6.1", default-features = false }
 thiserror.workspace = true
 vorbis-tables.workspace = true
+aac-tables.workspace = true
 zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
 
 [dev-dependencies]
@@ -74,6 +57,19 @@ lewton = { version = "=0.10.2", default-features = false }
 ebur128 = { version = "=0.1.10", default-features = false }
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 proptest.workspace = true
+# miniz_oxide：自作の zlib の展開（codec/zlib.rs）の照合相手と、試験で圧縮した zlib を作る（M16 段 6 で本番から外した。前は
+# aseprite の zlib の展開）
+miniz_oxide = "=0.8.9"
+# fdeflate：自作の展開の fdeflate の受け付け（`zlib::Flavor::Fdeflate`。PNG の IDAT・iCCP）の照合相手（png クレート 0.18.1 の
+# 中の展開と同じ版。M16 段 6）
+fdeflate = "=0.3.7"
+# png：前の PNG の読み書き（試験だけの `codec::png_old`）。読み取りは M16 段 6、書き出しは段 7 で自作（codec/png_read.rs・
+# png_write.rs・zlib.rs）に替えたので、照合の相手（同じ値に読む・書いたものを png クレートでも読める・大きさと速さの比べ）
+png = "=0.18.1"
+# gif・weezl：前の GIF の読み書き（試験だけの `codec::gif_old`）と LZW（`codec::lzw`）の照合の相手。M16 段 8 で自作
+# （codec/gif_read.rs・gif_write.rs・lzw.rs）に替えた。本番と同じ版・同じ feature
+gif = { version = "=0.14.2", default-features = false, features = ["std", "raii_no_panic"] }
+weezl = "=0.1.12"
 
 [lints]
 workspace = true

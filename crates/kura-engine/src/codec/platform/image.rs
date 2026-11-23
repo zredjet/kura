@@ -14,8 +14,8 @@
 
 use std::sync::Arc;
 
+use crate::codec::common::read_all;
 use crate::codec::platform::BackendError;
-use crate::codec::symph::read_all;
 use crate::codec::{CodecEnv, Decoder, ReadSeek, Stage, Tier, exif, format_by_id, try_vec};
 use crate::doc::DecodeOptions;
 use crate::error::EngineError;

@@ -108,7 +108,7 @@ pnpm tauri dev
 
 開発は [Claude Code](https://claude.com/claude-code) で進めています。プロジェクトの指示は [`CLAUDE.md`](CLAUDE.md)、ファイルの種類ごとのルールと手順は [`.claude/`](.claude) にあります。
 上の確かめをまとめて回すのは `/verify`（Claude Code のスキル）で、手元で 6 分ほどです。
-作業は [`docs/roadmap.md`](docs/roadmap.md) のマイルストーン単位で進めています。M0〜M15 まで終わっています（M11 の表示は、耳と画面での確かめが一部残っています）。
+作業は [`docs/roadmap.md`](docs/roadmap.md) のマイルストーン単位で進めています。M0〜M16 まで終わっています（M11 の表示は、耳と画面での確かめが一部残っています）。
 
 CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）は、push と PR では Ubuntu で最低限（整形、lint、ゴールデンの追記だけの検査、Linux と macOS で同じ値になるはずのゴールデン）だけを回します。全部のテスト（Ubuntu と macOS）は、Actions から手で起こしたときに回します（ADR-209。Linux・macOS とも 4 つに分けて並べて回す。ADR-212・ADR-214）。
 
@@ -119,10 +119,10 @@ crates/kura-core/      OS に依存しないドメインロジック（DB、取�
 crates/kura-engine/    編集の操作エンジン（文書・操作・描画・解析・コーデック・3D。OS と DB に依存しない）
 crates/kura-mac/       macOS 専用の機能（サムネイル、メディア情報、スナップショット、ImageIO・AudioToolbox のコーデック、ドラッグアウト。Swift ヘルパー）
 crates/vorbis-tables/  Ogg Vorbis のエンコーダの表（aoTuV から生成）と照合用の C
+crates/aac-tables/     AAC の符号表と帯の区切り（symphonia-codec-aac から値を変えずに写したもの）
 crates/kura-devtools/  ダミーライブラリの生成とベンチマーク
 src-tauri/             Tauri アプリ本体（コマンド、kura:// プロトコル、ウィンドウ）
 src/                   React のフロントエンド
-third_party/           不具合の修正と超越関数の差し替えをした第三者のクレートの写し（symphonia）
 fuzz/                  ファズの対象
 scripts/               CI の検査と、ライセンス一覧の生成
 docs/                  仕様と設計
@@ -156,7 +156,7 @@ Kura は次のどちらかのライセンスを選んで利用できます（二
 例外として、次のものは元のライセンスに従います。
 
 - `crates/vorbis-tables/` と `crates/kura-engine/src/codec/vorbis/`・`crates/kura-engine/src/codec/ogg.rs`（aoTuV・libvorbis・libogg のエンコーダを移したもの）：BSD-3-Clause（aoTuV の Aoyumi と Xiph.org Foundation の著作権表示。[crates/vorbis-tables/LICENSE](crates/vorbis-tables/LICENSE)）。そのため `kura-engine` のライセンスは `(MIT OR Apache-2.0) AND BSD-3-Clause`。
-- `third_party/` の各クレート（不具合を直した写し）：それぞれの元のライセンス（`symphonia-codec-vorbis` は MPL-2.0。変更は各ディレクトリの `KURA.md`）。
+- `crates/aac-tables/`（symphonia-codec-aac 0.6.1 の AAC の符号表と帯の区切りを、値を変えずに写したもの）：MPL-2.0（[crates/aac-tables/LICENSE](crates/aac-tables/LICENSE)）。
 
 このリポジトリに送られた貢献は、明示しない限り、Apache License 2.0 の定義に従い、追加の条件なしに上と同じ二重ライセンスで提供されるものとします。
 

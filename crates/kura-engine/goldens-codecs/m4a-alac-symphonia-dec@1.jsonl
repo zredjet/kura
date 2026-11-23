@@ -1,2 +1,9 @@
 {"name":"fixture-alac-16.m4a","source":{"path":"alac-16.m4a","type":"fixture"},"value":"908985a12ea8757241fe6013709e8eb232aca20eec52b5669c7fb2bc10fd6555"}
 {"name":"fixture-alac-24.m4a","source":{"path":"alac-24.m4a","type":"fixture"},"value":"5cf7a1b308bb07a88550a11022690bf2a501218b21f4b7c2a81924ccb9a77300"}
+{"name":"fixture-alac-mono.m4a","source":{"path":"alac-mono.m4a","type":"fixture"},"value":"26175fc11f9d24769e76cd556bd658b058d056e2b3c145b6951d8bef63d0e24c"}
+{"name":"fixture-alac-20.m4a","source":{"path":"alac-20.m4a","type":"fixture"},"value":"f0d3fe6e1f738294d6907f7b0ef23a9d2608eadb39f28eb02e337dee37cd53b8"}
+{"name":"fixture-alac-32.m4a","source":{"path":"alac-32.m4a","type":"fixture"},"value":"2a63a75b7864180f385b84954edae7d627518421a9d8e3e5382d708e1adf7a7e"}
+{"name":"fixture-alac-6ch.m4a","source":{"path":"alac-6ch.m4a","type":"fixture"},"value":"0c8c44316af32f0a7eeabb4e9dee20c27073c0dd1f16514875d76e450c429f95"}
+{"name":"fixture-alac-8ch.m4a","source":{"path":"alac-8ch.m4a","type":"fixture"},"value":"76f1165896c47302648a81253b9422a7557e893347b0ef2aa99dbb0094b002a4"}
+{"name":"fixture-alac-frag.m4a","source":{"path":"alac-frag.m4a","type":"fixture"},"value":"0c8c44316af32f0a7eeabb4e9dee20c27073c0dd1f16514875d76e450c429f95"}
+{"name":"fixture-alac-tags.m4a","source":{"path":"alac-tags.m4a","type":"fixture"},"value":"bc58c3c1ebb757b2c7a2b6a0b6790dfc6f91c0d7d0211f17f1e8298f0e6e3ed2"}

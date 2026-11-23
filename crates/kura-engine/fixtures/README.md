@@ -41,6 +41,10 @@ ALAC・AIFF・MP3）の値は `tests/codec_golden.rs` で凍結する。
 
 - 作ったときの道具：SoX 14.4.2、flac 1.5.0、LAME 4.0、FFmpeg 9.0.2、macOS 26.7 の afconvert・afinfo、vorbis_rs 0.5.6
   （aoTuV 20110424、libvorbis 1.3.7 ベース。作業用の小さな Rust のプログラムで呼んだ）、lewton 0.10.2（同じく作業用）。
+- M16 段 3 の元の音（sox）：`audio-src-mono16.wav` は `sox -n -r 22050 -c 1 -b 16 … synth 0.3 sine 300-5000 gain -4`、
+  `audio-src-6ch24.wav` は `sox -n -r 48000 -c 6 -b 24 … synth 0.2 sine 200 sine 400 sine 600 sine 50 sine 800 sine 1000 gain -6`、
+  `audio-src-8ch16.wav` は `sox -n -r 48000 -c 8 -b 16 … synth 0.2 sine 220 sine 330 sine 440 sine 60 sine 550 sine 660 sine 770 sine 880 gain -6`、
+  `audio-src32.wav` は `sox -n -r 96000 -c 2 -b 32 … synth 0.2 sine 1000-20000 whitenoise gain -3`。
 - 元の音：`audio-src16.wav` は `sox -n -r 44100 -c 2 -b 16 audio-src16.wav synth 1.0 sine 100-8000 sine 8000-100 gain -6`
   （左右で逆向きの掃引。44,100 フレーム）、`audio-src24.wav` は
   `sox -n -r 48000 -c 2 -b 24 audio-src24.wav synth 0.5 sine 200-12000 sine 300 gain -3`（24,000 フレーム。拡張形式）。
@@ -51,6 +55,13 @@ ALAC・AIFF・MP3）の値は `tests/codec_golden.rs` で凍結する。
 | `flac-24.flac` | `flac -5 -o flac-24.flac audio-src24.wav` | 同上 |
 | `alac-16.m4a` | `afconvert -f m4af -d alac audio-src16.wav alac-16.m4a`（iTunSMPB 付き） | 同上 |
 | `alac-24.m4a` | `ffmpeg -i audio-src24.wav -c:a alac -sample_fmt s32p alac-24.m4a` | 同上（元の深さ 24 を読む） |
+| `alac-mono.m4a` | `afconvert -f m4af -d alac -c 1 audio-src-mono16.wav alac-mono.m4a`（M16 段 3。22,050 Hz・6,615 フレーム） | `audio-src-mono16.wav` とちょうど同じ |
+| `alac-20.m4a` | `sox -n -r 44100 -c 2 -b 24 src-20.wav synth 0.25 pinknoise sine 440 gain -2`（元は置かない）を `afconvert -f m4af -d alac/2 src-20.wav alac-20.m4a`（format flags 2 = 20 ビット） | `alac-20.afconvert.wav`（`afconvert -f WAVE -d LEI24 alac-20.m4a`。下位 4 ビットは 0） |
+| `alac-32.m4a` | `afconvert -f m4af -d alac audio-src32.wav alac-32.m4a`（96 kHz・19,200 フレーム。要素は sh 16） | `audio-src32.wav` とちょうど同じ |
+| `alac-6ch.m4a` | `afconvert -f m4af -d alac -l MPEG_5_1_A audio-src-6ch24.wav alac-6ch.m4a`（5.1・24 ビット） | `audio-src-6ch24.wav` とちょうど同じ（面 i が WAV の i） |
+| `alac-8ch.m4a` | `afconvert -f m4af -d alac -l MPEG_7_1_C audio-src-8ch16.wav alac-8ch.m4a`（7.1・16 ビット） | `audio-src-8ch16.wav` の 0〜3・6・7 と同じ。読み手の並び（前の symphonia の L R C LFE Lc Rc Ls Rs）の面 4・5 は無音（afconvert が WAV の BL・BR を MPEG_7_1_B の Lc・Rc に入れなかった） |
+| `alac-frag.m4a` | `ffmpeg -i audio-src-6ch24.wav -c:a alac -sample_fmt s32p -movflags frag_keyframe+empty_moov -frag_duration 50000 alac-frag.m4a`（断片化。moof 3 つ・mfra） | `audio-src-6ch24.wav` とちょうど同じ |
+| `alac-tags.m4a` | `ffmpeg -i audio-src-mono16.wav -c:a alac -metadata title="Sweep 掃引" -metadata artist=kura -metadata album="Album ü" -metadata comment=note -metadata date=2026 -metadata genre=Test -metadata copyright="(c) kura" alac-tags.m4a` | `audio-src-mono16.wav` とちょうど同じ。タグ 7 つ |
 | `aiff-24.aiff` | `sox audio-src24.wav aiff-24.aiff trim 0 4800s`（COMT 付き） | 元の先頭 4,800 フレーム |
 | `aifc-f32.aif` | 元の先頭 4,410 フレームを `afconvert -f AIFC -d BEF32`（FVER・長い圧縮の名前付き） | 元の先頭 4,410 フレーム |
 | `mp3-lame.mp3` | `lame -b 128 --tt Sweep --ta kura audio-src16.wav`（ID3v2・LAME タグ） | `mp3-lame.ffmpeg.flac`（gapless で 44,100） |
@@ -73,7 +84,7 @@ ALAC・AIFF・MP3）の値は `tests/codec_golden.rs` で凍結する。
 - 参照の `*.ffmpeg.flac`・`*.lewton.flac`・`*.afconvert.flac` は、そのデコーダの出力を 16 ビットに（ディザなしで）丸め、
   `flac -8` で保存したもの。端（±1）に張り付いた標本は比べない。
 - 段 7 の `ogg-vorbis-3ch.ogg`・`ogg-vorbis-5ch.ogg`（symphonia-codec-vorbis 0.6.1 の 3 ch 以上の不具合の回帰の試験。
-  `third_party/symphonia-codec-vorbis/KURA.md`）：
+  M16 段 10 で外した写しの `third_party/symphonia-codec-vorbis/KURA.md`。今は自作の読み手の 3 ch 以上の試験）：
   - 音（0.5 秒・44.1 kHz。t = n / 44100、n = 0〜22,049。チャンネル k は Vorbis の並びで 0 始まり）：k = 0 は 0.4·sin(2π·300·t)、
     k = 1 は 0.2·sin(2π·1000·t) + 0.1·雑音、k = 2 は 0.3·sin(2π·(200·t + 3900·t²))（200 Hz → 8,000 Hz の掃引）、k = 3 は無音、
     k = 4 は 0.3·雑音。雑音は 32 ビットの LCG（x ← 1664525·x + 1013904223、種 1。上位 24 ビットを −1〜1 に）の 1 本の列から、
@@ -135,7 +146,9 @@ FFmpeg 9.0.2 の APNG のデコーダ（8 ビットは `rgba`、16 ビットは 
 
 ## symphonia の写しの確かめ（段 9 の検証）
 
-`tests/symphonia_copies.rs` が使う（`tests/fixtures.rs` の `unsupported_audio_variants_fall_through` も HE-AAC の 2 本を使う）。
+段 9〜M16 段 9 は `tests/symphonia_copies.rs` が使った（M16 段 10 で symphonia と一緒に外し、自作の読み手にかかわる確かめは
+`tests/audio_tiers.rs` に移した。フィクスチャは残す）。`tests/fixtures.rs` の `unsupported_audio_variants_fall_through` も HE-AAC の
+2 本を使う。
 作ったときの道具：macOS 26.7 の afconvert・afinfo、FFmpeg 9.0.2。元の音は上の `audio-src16.wav`。
 
 | ファイル | 作り方 | 照らすもの |
@@ -154,9 +167,28 @@ FFmpeg 9.0.2 の APNG のデコーダ（8 ビットは `rgba`、16 ビットは 
 
 ## 多チャンネルの AAC（段 9 の確認）
 
-`tests/fixtures.rs` の `unsupported_audio_variants_fall_through` が使う。作ったときの道具：FFmpeg 9.0.2。
+`tests/fixtures.rs` の `unsupported_audio_variants_fall_through`（M16 段 4 からは `multichannel_aac_matches_ffmpeg_and_audiotoolbox`）が使う。作ったときの道具：FFmpeg 9.0.2。
 
 | ファイル | 作り方 | 照らすもの |
 |---|---|---|
-| `aac-lc-6ch.aac` | `ffmpeg -f lavfi -i sine=frequency=440:duration=0.5:sample_rate=48000 -ac 6 -c:a aac -b:a 192k -f adts aac-lc-6ch.aac`（AAC-LC の ADTS・48 kHz・5.1） | symphonia の AAC は 1・2 チャンネルだけ（"aac too complex"）。チャンネルの構成があるので開けるが、固定の段は形の段階で断り（`Unsupported`）、形も読みも後の段へ回す（直す前は `aac-adts-symphonia-dec/2` が形を答え、読みで断っていた） |
-| `aac-lc-5ch.m4a` | `ffmpeg -f lavfi -i sine=frequency=440:duration=0.5:sample_rate=48000 -ac 5 -c:a aac -b:a 160k -f mp4 aac-lc-5ch.m4a`（AAC-LC の m4a・48 kHz・5.0） | 同上（`m4a-aac-symphonia-dec/2`） |
+| `aac-lc-6ch.aac` | `ffmpeg -f lavfi -i sine=frequency=440:duration=0.5:sample_rate=48000 -ac 6 -c:a aac -b:a 192k -f adts aac-lc-6ch.aac`（AAC-LC の ADTS・48 kHz・5.1） | symphonia の AAC は 1・2 チャンネルだけ（"aac too complex"）。チャンネルの構成があるので開けるが、固定の段は形の段階で断り（`Unsupported`）、形も読みも後の段へ回す（直す前は `aac-adts-symphonia-dec/2` が形を答え、読みで断っていた）。M16 段 4 から自作の `aac-adts-kura-dec/1` が読む（元は 1 チャンネルを広げたもので、音は FC の面だけ。ほかの面は 0） |
+| `aac-lc-5ch.m4a` | `ffmpeg -f lavfi -i sine=frequency=440:duration=0.5:sample_rate=48000 -ac 5 -c:a aac -b:a 160k -f mp4 aac-lc-5ch.m4a`（AAC-LC の m4a・48 kHz・5.0） | 同上（`m4a-aac-symphonia-dec/2`）。M16 段 4 から自作の `m4a-aac-kura-dec/1` が読む（音は FC の面だけ） |
+
+## 多チャンネルの AAC-LC（M16 段 4）
+
+`tests/fixtures.rs` の `multichannel_aac_matches_ffmpeg_and_audiotoolbox` が使う。作ったときの道具：FFmpeg 9.0.2、macOS 26.7 の
+afconvert。元の音は置かない：`ffmpeg -f lavfi -i "aevalsrc='E0|E1|…':s=48000:d=0.3:c=<配置>" -c:a pcm_s24le src.wav`
+（48 kHz・0.3 秒・14,400 フレーム）で、チャンネル k（0 始まり）の式 Ek は
+`0.2*sin(2*PI*(330+170k)*t)+0.15*exp(-60*(t-0.15-0.01k))*gte(t,0.15+0.01k)*sin(2*PI*(2000+500k)*t)`（チャンネルごとに違う
+高さの音と、ずらした減衰する高い音。短い窓も出る）。参照は 24 ビットの FLAC（`ffmpeg -i X.m4a -c:a flac -sample_fmt s32
+-bits_per_raw_sample 24 X.ffmpeg.flac`。ffmpeg の読み取りの f32 を 24 ビットに丸めたもの）。
+
+| ファイル | 作り方 | 照らすもの |
+|---|---|---|
+| `aac-lc-mono.m4a` | 配置 `mono` の元を `ffmpeg -i src.wav -c:a aac -b:a 64k -aac_pns 0`（channel_configuration 1） | `aac-lc-mono.ffmpeg.flac` と 100 dB 以上の比で近い |
+| `aac-lc-3ch.m4a` | 配置 `3.0` で `-b:a 192k -aac_pns 0`（配置 3：SCE・CPE） | `aac-lc-3ch.ffmpeg.flac` とチャンネルごとに 100 dB 以上（面の並びは FL FR FC） |
+| `aac-lc-4ch.m4a` | 配置 `4.0` で `-b:a 256k -aac_pns 0`（配置 4：SCE・CPE・SCE） | `aac-lc-4ch.ffmpeg.flac` とチャンネルごとに 100 dB 以上（FL FR FC BC） |
+| `aac-lc-5ch-tones.m4a` | 配置 `5.0` で `-b:a 320k -aac_pns 0`（配置 5：SCE・CPE・CPE） | `aac-lc-5ch-tones.ffmpeg.flac` とチャンネルごとに 100 dB 以上（FL FR FC BL BR） |
+| `aac-lc-6ch-afconvert.m4a` | 配置 `5.1` の元を `afconvert -f m4af -d aac -b 288000 -l MPEG_5_1_D src.wav`（AudioToolbox のエンコーダ。配置 6：SCE・CPE・CPE・LFE） | `aac-lc-6ch-afconvert.ffmpeg.flac` とチャンネルごとに 100 dB 以上（FL FR FC LFE BL BR） |
+| `aac-lc-8ch-afconvert.m4a` | 配置 `7.1(wide-side)`（FL FR FC LFE FLC FRC SL SR）の元を `afconvert -f m4af -d aac -b 384000 -l MPEG_7_1_B src.wav`（配置 7：SCE・CPE・CPE・CPE・LFE。afconvert は元の SL・SR を Ls・Rs に入れる） | `aac-lc-8ch-afconvert.afconvert.flac`（`afconvert -f WAVE -d LEI24` を ffmpeg で FLAC にしたもの。並びは AAC の C Lc Rc L R Ls Rs LFE のまま）と、並びを直してチャンネルごとに 100 dB 以上。kura の面は FL FR FC LFE BL BR FLC FRC で、最初の CPE（Lc・Rc）が FLC・FRC、2 つ目（L・R）が FL・FR、3 つ目（Ls・Rs）が BL・BR（ISO と AudioToolbox の読み。ffmpeg 9.0.2 は最初の CPE を FL・FR、2 つ目を SL・SR に置く） |
+| `aac-lc-8ch-pce.m4a` | 配置 `7.1(wide)` の元を `ffmpeg -i src.wav -c:a aac -b:a 512k -aac_pns 0`（ffmpeg は 7.1 を channel_configuration 0 と PCE で書く） | PCE で決める配置は自作の読み手では読まない（`Unsupported`。後の段の AudioToolbox・ffmpeg へ） |

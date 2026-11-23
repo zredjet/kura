@@ -289,6 +289,54 @@ fn s11_gc_keeps_a_version_whose_rebuild_does_not_match() {
     assert_consistent(&env.lib);
 }
 
+/// 記録のエンコーダが退いたもの（`png-rs-enc/1`。M16 段 7 で外した png クレートの書き出し）の版は、作り直した値だけで照らして
+/// 手放す（今の書き手で書くのでバイト列は比べない。記録のバイト列と違っても released。ADR-224）。この環境にないだけの
+/// エンコーダの版は、今までどおり次回へ。
+#[test]
+fn gc_releases_a_version_whose_recorded_encoder_is_retired() {
+    let env = Env::new();
+    let (a, h1) = edited_twice(&env, 45);
+    let (b, hb) = edited_twice(&env, 46);
+    for (item, codec, hash) in [(a, "png-rs-enc/1", [0x5a; 32]), (b, "gone-png-enc/9", hb)] {
+        let v1 = versions_of(&env.lib, item)[1].clone();
+        let mut record: Json = serde_json::from_str(&v1.record).unwrap();
+        record["encoded"]["codec"] = json!(codec);
+        let text = record.to_string();
+        env.lib
+            .db()
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE item_versions SET record = ?1, output_hash = ?2 WHERE item_id = ?3 AND version = 1",
+                    params![text, &hash[..], item],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+    let result = env.gc();
+    assert_eq!(
+        (&result["released"], &result["kept"], &result["deferred"]),
+        (&json!(1), &json!(0), &json!(1)),
+        "{result}"
+    );
+    assert_eq!(states(&env.lib, a)[1], (1, FileState::Released));
+    assert!(!env.lib.layout().content_path(&h1, "png").exists());
+    assert!(!blob_exists(&env.lib, h1));
+    assert_eq!(states(&env.lib, b)[1], (1, FileState::Waiting), "次回へ");
+    assert!(env.lib.layout().content_path(&hb, "png").exists());
+    // 手放した版に戻すと、今の書き手で書き直す（値は記録と同じ）
+    let record = env.revert(a, 1);
+    assert_done(&record);
+    let result = result_of(&record);
+    assert_eq!(result["revert"]["rebuilt"], true);
+    let vs = versions_of(&env.lib, a);
+    assert_eq!(vs[3].value_digest, vs[1].value_digest);
+    assert_eq!(
+        vs[3].record().unwrap().encoded.map(|e| e.codec),
+        Some("png-kura-enc/1".to_string())
+    );
+}
+
 // ---- S12：作り直している間に同じ中身を使う ----
 
 /// 照合が一致したあと・門を取る前に一度だけ止まる GC の割り込み。止まったら `reached` に知らせ、`go` を待つ。

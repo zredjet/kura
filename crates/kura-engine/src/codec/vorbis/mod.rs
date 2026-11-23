@@ -186,7 +186,7 @@
 //!   （symphonia の `map_vorbis_channel` と同じ表。Vorbis I §4.3.9）。
 //! - 入力の NaN は 0、±∞ は ±1 にしてから渡す（NaN のビットの形がターゲットで違い、todB がビットを値にするため）。1 を超える
 //!   有限の値はそのまま（libvorbis と同じ）。照合用のエンコーダにも同じ値を渡す。
-//! - コメントヘッダ：vendor は [`VENDOR`]（`"kura"`）。項目は E28 の約束（`symph::vorbis_comments_for` の LOOPSTART・LOOPLENGTH のあとに
+//! - コメントヘッダ：vendor は [`VENDOR`]（`"kura"`）。項目は E28 の約束（`common::vorbis_comments_for` の LOOPSTART・LOOPLENGTH のあとに
 //!   `ENCODER=ogg-vorbis-kura-enc/1`、そのあとにタグ。元の `ENCODER` は運ばない）。16 MiB 以上なら `Unsupported`。
 //! - Ogg のページの切り方・グラニュール・シリアル番号は `codec/ogg.rs`（kura の規則）。空の音声（0 フレーム）も書く（libvorbis と
 //!   同じく、短いブロックの 1 パケット）。
@@ -202,6 +202,7 @@
 pub(crate) mod bitpack;
 pub(crate) mod block;
 pub(crate) mod codebook;
+pub(crate) mod dec;
 pub(crate) mod encoder;
 pub(crate) mod envelope;
 pub(crate) mod floor1;
@@ -666,22 +667,34 @@ mod tests {
     }
 
     /// 移植の規則 3：FMA（`mul_add`・libm の `fma`・`fmaf`）を使わない（照合用の C は `-ffp-contract=off`。エンジン全体の
-    /// clippy.toml は `mul_add` を許しているので、このモジュールだけここで見張る）。`vorbis/` のすべての `.rs`（新しく足した
-    /// ファイルも）と `../ogg.rs` を実行時に読み、注釈を除いたコードで呼び出しを探す（[`fma_calls`]）。
+    /// clippy.toml は `mul_add` を許しているので、このモジュールだけここで見張る）。`vorbis/` の下のすべての `.rs`（読み手の
+    /// `dec/` も、新しく足したファイルも）と `../ogg.rs`・`../ogg_read.rs` を実行時に読み、注釈を除いたコードで呼び出しを
+    /// 探す（[`fma_calls`]）。
     #[test]
     fn no_fused_multiply_add() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codec/vorbis");
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
+        // 下のディレクトリもたどる（再帰させずに積み上げで）
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut dirs = vec![dir.clone()];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
         files.sort();
         assert!(
-            files.iter().any(|p| p.ends_with("mod.rs")) && files.len() >= 19,
+            files.iter().any(|p| p.ends_with("vorbis/mod.rs"))
+                && files.iter().any(|p| p.ends_with("dec/codebook.rs"))
+                && files.len() >= 26,
             "{files:?}"
         );
         files.push(dir.join("../ogg.rs"));
+        files.push(dir.join("../ogg_read.rs"));
         for f in &files {
             let src = std::fs::read_to_string(f).unwrap();
             let found = fma_calls(&src);

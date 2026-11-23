@@ -112,6 +112,10 @@ pub const MIGRATIONS: &[Migration] = &[
         "0016_export_files",
         include_str!("../../migrations/0016_export_files.sql"),
     ),
+    plain(
+        "0017_retire_job",
+        include_str!("../../migrations/0017_retire_job.sql"),
+    ),
 ];
 
 /// 当てたマイグレーション 1 つ。

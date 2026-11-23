@@ -669,10 +669,12 @@ macro_rules! go {
 
 // 段 1・2 の読みと、版に戻す・GC の照合と、音声を流して書く道（`go!` を使うので、マクロの定義のあとに置く）
 mod read;
+mod retire;
 mod revert;
 mod stream;
 mod unit;
 
+pub(crate) use retire::{After, Promote, commit_retired, link_inputs, promote_recorded};
 pub use revert::Verdict;
 pub(crate) use revert::{Reverted, verify_version};
 /// 流して書くか・源の LRU・照らしの量（一括の事前チェックが保存と同じ見積もりにする。M14 段 5）。
@@ -2302,6 +2304,7 @@ fn anchor_row(tx: &Connection, p: &Prepared, go: &Go, now: i64) -> Result<Option
                 ext: go.anchor_ext.as_deref().unwrap_or(a.ext),
                 size: a.size,
                 now,
+                retired: false,
             },
         )?),
     })

@@ -81,12 +81,20 @@ export function clarifiedCrates(aboutToml) {
  * （MPL-2.0 §3.2(a) などが求める、実行形式の受け手へのソースの入手方法の知らせ）。在り処は、.app の受け手がたどれる
  * よう、リポジトリの URL（`repository`。省くとルートの Cargo.toml の `[workspace.package]` から読む）と場所で書く。
  * 写しには変更の記録 `third_party/<ディレクトリ>/KURA.md` がなければならず、ないときは誤った注記を書かないよう止める。
- * それ以外（crates.io の依存、crates/ の下の自前のクレートなど）は名前と版だけ。
+ * `crates/<ディレクトリ>/Cargo.toml` の自前のクレートのうち、ライセンス（`license`）が MPL-2.0 のもの（symphonia の表を
+ * 写した aac-tables。M16 段 4）も、同じ理由でソースの在り処を添える。それ以外（crates.io の依存、crates/ の下のほかの
+ * 自前のクレートなど）は名前と版だけ。
  */
 export function crateLabel(crate, repoRoot, repository) {
   const label = `${crate.name} ${crate.version}`;
   if (crate.source != null || typeof crate.manifest_path !== 'string') return label;
   const rel = relative(repoRoot, crate.manifest_path).split(sep).join('/');
+  const own = /^crates\/([^/]+)\/Cargo\.toml$/.exec(rel);
+  if (own && typeof crate.license === 'string' && crate.license.includes('MPL-2.0')) {
+    const url =
+      repository ?? workspacePackage(readFileSync(join(repoRoot, 'Cargo.toml'), 'utf8')).repository;
+    return `${label}（ソース：${url} の crates/${own[1]}/）`;
+  }
   const m = /^third_party\/([^/]+)\/Cargo\.toml$/.exec(rel);
   if (!m) return label;
   const dir = `third_party/${m[1]}`;

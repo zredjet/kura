@@ -13,6 +13,9 @@ pub mod gc;
 #[cfg(test)]
 mod gc_tests;
 pub mod recipes;
+pub mod retire;
+#[cfg(test)]
+mod retire_tests;
 pub mod runtime;
 pub mod save;
 #[cfg(test)]

@@ -16,11 +16,27 @@ use crate::{CoreError, Result};
 
 /// 読み方の設定のダイジェストのドメイン。
 const OPTIONS_DOMAIN: &str = "kura-decode-options-v1";
+/// 移したアンカー（退役する読み手の記録のアンカー。M16 段 5）の鍵のドメイン。
+const RETIRED_DOMAIN: &str = "kura-decode-options-retired-v1";
 
 /// 読み方の設定（`DecodeOptions`）のダイジェスト（正規の JSON の、ドメイン付きの BLAKE3。アンカーの行の鍵の片方）。
 pub fn options_digest(opts: &DecodeOptions) -> Result<[u8; 32]> {
     let json = canonical(opts).map_err(|e| from_engine("読み方の設定を正規の形にできません", e))?;
     Ok(Hasher::new(OPTIONS_DOMAIN).bytes_with_len(&json).finish().0)
+}
+
+/// 移したアンカーの鍵の片方（`options_digest` の列に入れる）：読み方の設定の正規の JSON と記録の識別子 `codec` の、別の
+/// ドメインの BLAKE3（M16 段 5。docs/editing.md §9.4「退役する読み手の移し替え」）。ふつうの鍵（[`options_digest`]）と
+/// 重ならないので、保存・エディタ・一括が元 × 読み方で探す [`find`] には見つからず（新しい読みは今の読み手で読む）、版の
+/// 入力の `anchor_id` から [`get`] でだけ引ける。同じ元に、今の読み手が再現しない読み（Platform・External）で作るふつうの
+/// アンカーとも並べて置ける。
+pub fn retired_key(opts: &DecodeOptions, codec: &str) -> Result<[u8; 32]> {
+    let json = canonical(opts).map_err(|e| from_engine("読み方の設定を正規の形にできません", e))?;
+    Ok(Hasher::new(RETIRED_DOMAIN)
+        .bytes_with_len(&json)
+        .bytes_with_len(codec.as_bytes())
+        .finish()
+        .0)
 }
 
 /// アンカーの行と、そのファイルの台帳の行。
@@ -114,6 +130,8 @@ pub(crate) struct NewAnchor<'a> {
     pub ext: &'a str,
     pub size: u64,
     pub now: i64,
+    /// 移したアンカー（鍵を [`retired_key`] にする。M16 段 5 の移し替えのジョブ）。ふつうは偽（鍵は [`options_digest`]）。
+    pub retired: bool,
 }
 
 /// アンカーのファイルを台帳に載せ（`ledger::register`）、行を足して ID を返す（呼び手のトランザクションの中で）。同じ元 ×
@@ -129,7 +147,11 @@ pub(crate) fn insert(tx: &Connection, a: &NewAnchor<'_>) -> Result<i64> {
         canonical(a.decoded).map_err(|e| from_engine("読み取りの記録を正規の形にできません", e))?;
     let decoded = String::from_utf8(decoded)
         .map_err(|e| CoreError::Invalid(format!("読み取りの記録が UTF-8 ではありません: {e}")))?;
-    let digest = options_digest(a.options)?;
+    let digest = if a.retired {
+        retired_key(a.options, &a.decoded.codec)?
+    } else {
+        options_digest(a.options)?
+    };
     let mut stmt = tx.prepare_cached(
         "INSERT INTO edit_anchors (source_hash, options_digest, options, decoded, value_digest, blob_id, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -249,6 +271,7 @@ mod tests {
             ext: "png",
             size: 9,
             now: 3,
+            retired: false,
         };
         let id = insert(&conn, &new([7; 32])).unwrap();
         let found = find(&conn, &[1; 32], &od).unwrap().unwrap();

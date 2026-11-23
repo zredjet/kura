@@ -278,10 +278,43 @@ const fn crc_table() -> [u32; 256] {
     table
 }
 
-/// Ogg の CRC32（多項式 0x04C11DB7、反射なし、初期値 0）。framing.c:110–125・255–271 と同じ値。
+/// 8 バイトずつ進める表（libogg 1.3.4 以降の crctable.h の `crc_lookup[8][256]` と同じ作り方。`[0]` が [`CRC_TABLE`]）。
+const CRC_SLICES: [[u32; 256]; 8] = crc_slices();
+
+const fn crc_slices() -> [[u32; 256]; 8] {
+    let mut t = [[0u32; 256]; 8];
+    t[0] = CRC_TABLE;
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = t[k - 1][i];
+            t[k][i] = (prev << 8) ^ CRC_TABLE[(prev >> 24) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+}
+
+/// Ogg の CRC32（多項式 0x04C11DB7、反射なし、初期値 0）。framing.c:110–125・255–271 と同じ値。8 バイトずつは
+/// libogg 1.3.4 以降の `_os_update_crc` と同じ表引き（1 バイトずつと同じ値。試験が照らす）。
 pub(crate) fn crc32(data: &[u8]) -> u32 {
+    let t = &CRC_SLICES;
     let mut crc = 0u32;
-    for &b in data {
+    let (chunks, rest) = data.as_chunks::<8>();
+    for b in chunks {
+        crc ^= u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        crc = t[7][(crc >> 24) as usize]
+            ^ t[6][((crc >> 16) & 0xff) as usize]
+            ^ t[5][((crc >> 8) & 0xff) as usize]
+            ^ t[4][(crc & 0xff) as usize]
+            ^ t[3][usize::from(b[4])]
+            ^ t[2][usize::from(b[5])]
+            ^ t[1][usize::from(b[6])]
+            ^ t[0][usize::from(b[7])];
+    }
+    for &b in rest {
         let idx = ((crc >> 24) as u8) ^ b;
         crc = (crc << 8) ^ CRC_TABLE[usize::from(idx)];
     }
@@ -306,6 +339,38 @@ pub(crate) mod tests {
     use rand_chacha::rand_core::Rng;
 
     use super::*;
+
+    /// 試験用の Ogg のページ（`packets` を 1 ページに入れる。255 バイト以上のパケットも lacing を続けて書く）。
+    pub(crate) fn page(
+        serial: u32,
+        seq: u32,
+        flags: u8,
+        granule: u64,
+        packets: &[&[u8]],
+    ) -> Vec<u8> {
+        let mut lacing = Vec::new();
+        let mut body = Vec::new();
+        for p in packets {
+            let mut n = p.len();
+            while n >= 255 {
+                lacing.push(255u8);
+                n -= 255;
+            }
+            lacing.push(n as u8);
+            body.extend_from_slice(p);
+        }
+        let mut b = b"OggS\0".to_vec();
+        b.push(flags);
+        b.extend_from_slice(&granule.to_le_bytes());
+        b.extend_from_slice(&serial.to_le_bytes());
+        b.extend_from_slice(&seq.to_le_bytes());
+        b.extend_from_slice(&[0; 4]);
+        b.push(lacing.len() as u8);
+        b.extend_from_slice(&lacing);
+        b.extend_from_slice(&body);
+        page_checksum_set(&mut b);
+        b
+    }
 
     /// 読み直したページ。
     #[derive(Debug, Clone)]
@@ -428,7 +493,7 @@ pub(crate) mod tests {
         assert_eq!(crc32(b"123456789"), 0x89A1_897F);
         assert_eq!(crc32(b""), 0);
         let mut r = crate::determinism::rng(7);
-        for len in [1usize, 2, 3, 27, 255, 4_096, 10_000] {
+        for len in [0usize, 1, 2, 3, 7, 8, 9, 15, 16, 17, 27, 255, 4_096, 10_000] {
             let data: Vec<u8> = (0..len).map(|_| (r.next_u32() & 0xff) as u8).collect();
             assert_eq!(crc32(&data), crc32_bitwise(&data), "{len}");
         }
