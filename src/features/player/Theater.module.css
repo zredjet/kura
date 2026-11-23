@@ -288,12 +288,13 @@
 
 /*
  * アニメの操作の行（M12。クイックルックと同じ 28px の行：再生／一時停止・「7 / 8」・コマ送り・タグ）。枠はメディアの面
- * いっぱいのまま、行は再生バーの上に重ねる（背景の音楽の表示と同じ下から 150px。音楽の表示があればその上に）。
+ * いっぱいのまま、行は再生バーの上に重ねる（背景の音楽の表示と同じ下から 162px。音楽の表示があればその上に。ADR-230 で
+ * 再生バーが 12px 高くなったので 150px から上げた）。
  * 明るいメディアの上でも読めるよう、背景の音楽の表示と同じ暗幕のカプセルにする。左端は丸い再生ボタンがそのまま収まる。
  */
 .animControls {
   position: absolute;
-  bottom: 150px;
+  bottom: 162px;
   left: 50%;
   transform: translateX(-50%);
   max-width: calc(100% - var(--space-6) * 2);
@@ -303,13 +304,13 @@
 }
 
 .stage:has(.bgm) .animControls {
-  bottom: calc(150px + 30px + var(--space-2));
+  bottom: calc(162px + 30px + var(--space-2));
 }
 
-/* 画像の間に流している音楽（下から 150px） */
+/* 画像の間に流している音楽（下から 162px。再生バーの上 28px） */
 .bgm {
   position: absolute;
-  bottom: 150px;
+  bottom: 162px;
   left: 50%;
   transform: translateX(-50%);
   display: flex;

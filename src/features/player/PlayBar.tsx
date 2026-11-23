@@ -1,9 +1,8 @@
-import type { CSSProperties } from 'react';
-
 import { PauseIcon } from '../../components/icons/PauseIcon';
 import { PlayIcon } from '../../components/icons/PlayIcon';
 import { RepeatIcon } from '../../components/icons/RepeatIcon';
 import { RepeatOneIcon } from '../../components/icons/RepeatOneIcon';
+import { SeekRow } from '../../components/SeekBar/SeekRow';
 import { ShuffleIcon } from '../../components/icons/ShuffleIcon';
 import { SkipBackIcon } from '../../components/icons/SkipBackIcon';
 import { SkipForwardIcon } from '../../components/icons/SkipForwardIcon';
@@ -11,7 +10,6 @@ import { VolumeIcon } from '../../components/icons/VolumeIcon';
 import { ja } from '../../i18n/ja';
 import { getItemDetail } from '../../ipc/items';
 import { kindLabel } from '../../ipc/kinds';
-import { formatDuration } from '../../lib/format';
 import { useLoaded } from '../library/inspector/useLoaded';
 import { cycleRepeat, playerController, toggleShuffle, updatePlayerPrefs } from './playerActions';
 import { usePlayerStore } from './playerStore';
@@ -23,8 +21,8 @@ const t = ja.player;
 export const IMAGE_STEP_MS = 1000;
 
 /**
- * 再生バー（Player.dc.html の下のガラスのカプセル）：再生位置、題名と「種類 · タグ」、
- * シャッフル・前・再生／一時停止・次・リピート（オフ → 全体 → 1 曲）、画像の表示時間、音量。
+ * 再生バー（Player.dc.html の下のガラスのカプセル）：再生位置（共通のシークの行。時刻の入力・ドラッグ・⌥ の微調整。
+ * ADR-230）、題名と「種類 · タグ」、シャッフル・前・再生／一時停止・次・リピート（オフ → 全体 → 1 曲）、画像の表示時間、音量。
  */
 export function PlayBar() {
   const snapshot = usePlayerStore((s) => s.snapshot);
@@ -33,27 +31,19 @@ export function PlayBar() {
   const controller = playerController();
   const item = snapshot.itemId !== null ? controller.item(snapshot.itemId) : undefined;
   const duration = snapshot.durationMs ?? item?.durationMs ?? null;
-  const pct = duration ? Math.min(100, (snapshot.positionMs / duration) * 100) : 0;
   const kindText = kindLabel(snapshot.kind);
 
   return (
     <div className={styles.bar}>
-      <div className={styles.progressRow}>
-        <span>{formatDuration(snapshot.positionMs)}</span>
-        <input
-          type="range"
-          className={styles.seek}
-          aria-label={t.seek}
-          min={0}
-          max={duration ?? 0}
-          step={100}
-          value={Math.min(snapshot.positionMs, duration ?? 0)}
-          disabled={duration === null}
-          style={{ '--pct': `${pct}%` } as CSSProperties}
-          onChange={(e) => controller.seek(Number(e.target.value))}
-        />
-        <span>{duration !== null ? formatDuration(duration) : '--:--'}</span>
-      </div>
+      <SeekRow
+        positionMs={snapshot.positionMs}
+        durationMs={duration}
+        onSeek={(ms) => controller.seek(ms)}
+        onScrubStart={() => controller.beginScrub()}
+        onScrubEnd={() => controller.endScrub()}
+        resetKey={`${snapshot.index}:${snapshot.itemId ?? ''}`}
+        disabled={snapshot.itemId === null}
+      />
       <div className={styles.controls}>
         <div className={styles.meta}>
           <span className={styles.title}>{item?.title ?? ''}</span>

@@ -1,18 +1,18 @@
 import { useEffect } from 'react';
 
+import { controlOwnsKey, isTextEntry } from '../../lib/keys';
+import { applySeekAction, seekKeyAction } from '../../lib/seekKeys';
 import { setRating } from '../library/actions';
 import { IMAGE_STEP_MS } from './PlayBar';
 import { canEdit, openEditor } from '../editor/editorKinds';
-import { cycleRepeat, playerController, toggleFullscreen, toggleShuffle } from './playerActions';
+import {
+  cycleRepeat,
+  playerController,
+  theaterSeekTarget,
+  toggleFullscreen,
+  toggleShuffle,
+} from './playerActions';
 import { usePlayerStore } from './playerStore';
-
-/** 文字を入力している場所ではキー操作を奪わない。 */
-function isTyping(target: EventTarget | null): boolean {
-  return (
-    target instanceof HTMLElement &&
-    (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
-  );
-}
 
 /** シアターの上にダイアログ・メニュー・画像エディタが開いているか。 */
 function isBlocked(): boolean {
@@ -37,9 +37,9 @@ export function handlePlayerKey(e: KeyboardEvent): boolean {
   if (e.defaultPrevented || isBlocked()) {
     return false;
   }
-  const typing = isTyping(e.target);
-  // 入力欄の中でも esc はシアターを閉じず、入力欄から抜けるだけにする
-  if (typing) {
+  // 文字を打つ欄の中ではキーを受けない（esc もシアターを閉じず、入力欄から抜けるだけ）。スライダー・選択などの上では、
+  // その部品が使うキー（スライダーは矢印・Home・End）だけを任せ、Space・esc・F などは受ける（ADR-230）
+  if (isTextEntry(e.target) || controlOwnsKey(e.target, e.key)) {
     return false;
   }
   const controller = playerController();
@@ -114,6 +114,12 @@ export function handlePlayerKey(e: KeyboardEvent): boolean {
       void setRating([itemId], Number(key));
       return true;
     }
+  }
+  // シーク（, . で 1 コマ、⇧, ⇧. で 1 秒、J・L で 5 秒、K で再生／一時停止。ADR-230）
+  const action = seekKeyAction(e);
+  if (action !== null && store.snapshot.itemId !== null) {
+    applySeekAction(action, theaterSeekTarget());
+    return true;
   }
   return false;
 }

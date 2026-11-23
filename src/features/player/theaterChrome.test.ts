@@ -8,6 +8,7 @@ const base = {
   focusInControls: false,
   menuOpen: false,
   typing: false,
+  scrubbing: false,
 };
 
 describe('canHideControls', () => {
@@ -21,6 +22,10 @@ describe('canHideControls', () => {
     expect(canHideControls({ ...base, focusInControls: true })).toBe(false);
     expect(canHideControls({ ...base, menuOpen: true })).toBe(false);
     expect(canHideControls({ ...base, typing: true })).toBe(false);
+  });
+
+  it('シークバー・波形をドラッグしている間は隠さない（ADR-230）', () => {
+    expect(canHideControls({ ...base, scrubbing: true })).toBe(false);
   });
 });
 

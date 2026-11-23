@@ -1,6 +1,6 @@
 import type { ItemSummaryDto } from '../../../ipc/items';
 import { hasDuration, isPlayable, needsProxy, type TimedKind } from '../../../ipc/kinds';
-import { clampSeek } from '../../../lib/seek';
+import { clampSeek, END_GUARD_MS } from '../../../lib/seek';
 import { type BgmAction, type BgmStatus, bgmOnEnter, bgmOnTrackEnd } from './bgm';
 import { FADE_MS, Fader } from './fade';
 import { nextIndex, playedDelta, prevTarget, stepImageMs } from './nav';
@@ -306,10 +306,11 @@ export class PlaybackController {
 
   /**
    * 再生位置を変える（画像は表示した時間）。シークで飛ばした分は再生時間に数えない。今のスロットの中だけ（0 と終わりの
-   * 手前で止める。トリムがあればトリムの終わりの手前。ADR-230）。
+   * `guardMs` 手前で止める。トリムがあればトリムの終わりの手前。ADR-230）。コマ送りは自分で終わりの半コマ手前に
+   * 収めてから `guardMs` 0 で呼ぶ。
    */
-  seek(ms: number): void {
-    const target = clampSeek(ms, this.endMs());
+  seek(ms: number, guardMs = END_GUARD_MS): void {
+    const target = clampSeek(ms, this.endMs(), guardMs);
     const media = this.slotMedia();
     if (media) {
       media.currentTime = target / 1000;

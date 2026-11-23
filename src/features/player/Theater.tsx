@@ -26,6 +26,7 @@ import {
   openCurrentExternally,
   playerController,
   toggleFullscreen,
+  watchTheaterFrames,
 } from './playerActions';
 import { usePlayerStore } from './playerStore';
 import { SidePanel } from './SidePanel';
@@ -71,6 +72,7 @@ function useControlsIdle(visible: boolean): {
             focused instanceof HTMLElement && focused.closest('[data-chrome]') !== null,
           menuOpen: document.querySelector('[data-sheet], [role="menu"]') !== null,
           typing: isTyping(focused),
+          scrubbing: document.querySelector('[data-theater] [data-scrubbing]') !== null,
         });
         if (hide) {
           setIdle(true);
@@ -254,6 +256,7 @@ function Stage({ active, chrome }: { active: boolean; chrome: ChromeProps }) {
   const snapshot = usePlayerStore((s) => s.snapshot);
   const attach = useCallback((el: HTMLVideoElement | null) => {
     playerController().attachVideo(el);
+    watchTheaterFrames(el);
   }, []);
   const item = snapshot.itemId !== null ? playerController().item(snapshot.itemId) : undefined;
   const showMedia = snapshot.phase !== 'waiting' && snapshot.phase !== 'failed';

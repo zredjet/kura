@@ -24,6 +24,11 @@ describe('clampSeek', () => {
     expect(clampSeek(Number.NaN, 10_000)).toBe(0);
     expect(clampSeek(50, 80)).toBe(0);
   });
+
+  it('余白を変えられる（0 なら終わりちょうどまで）', () => {
+    expect(clampSeek(99_999, 10_000, 0)).toBe(10_000);
+    expect(clampSeek(9_990, 10_000, 0)).toBe(9_990);
+  });
 });
 
 describe('msAtX', () => {

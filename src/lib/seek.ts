@@ -15,13 +15,16 @@ export const FINE_SCRUB_RATE = 0.1;
 /** コマの長さが分からないとき・動画でないときの細かい送り（ms）。 */
 export const FINE_STEP_MS = 100;
 
-/** シークの先を `[0, 長さ − END_GUARD_MS]` に収める（長さが分からなければ 0 以上だけ）。 */
-export function clampSeek(ms: number, durationMs: number | null): number {
+/**
+ * シークの先を `[0, 長さ − guardMs]` に収める（長さが分からなければ 0 以上だけ）。`guardMs` は既定で
+ * `END_GUARD_MS`（呼ぶ側が先に収めたもの・コマ送りの先は 0 で渡す）。
+ */
+export function clampSeek(ms: number, durationMs: number | null, guardMs = END_GUARD_MS): number {
   const lo = Number.isFinite(ms) ? Math.max(0, ms) : 0;
   if (durationMs === null || !(durationMs > 0)) {
     return lo;
   }
-  return Math.min(lo, Math.max(0, durationMs - END_GUARD_MS));
+  return Math.min(lo, Math.max(0, durationMs - guardMs));
 }
 
 /** バーの中の x（px）を時刻（ms）にする（外側は端に寄せる。幅・長さがなければ 0）。 */

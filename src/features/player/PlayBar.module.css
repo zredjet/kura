@@ -1,6 +1,6 @@
 /*
  * Player.dc.html の再生バー：下から 20px、幅 780px まで、余白 12px 16px 14px、角丸 22px のガラスのカプセル。
- * 1 段目は再生位置、2 段目は題名・操作・表示時間と音量。
+ * 1 段目は再生位置（共通のシークの行。components/SeekBar。ADR-230）、2 段目は題名・操作・表示時間と音量。
  */
 
 .bar {
@@ -19,56 +19,6 @@
   box-shadow: var(--shadow-capsule);
   -webkit-backdrop-filter: var(--glass-blur-strong);
   backdrop-filter: var(--glass-blur-strong);
-}
-
-.progressRow {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2-5);
-  font-size: var(--text-xs);
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-}
-
-/* 再生位置：溝 4px、進んだ分はアクセント。つまみはホバー・フォーカスのときだけ */
-.seek {
-  flex: 1;
-  height: 16px;
-  margin: 0;
-  background: transparent;
-  appearance: none;
-  -webkit-appearance: none;
-  cursor: pointer;
-}
-
-.seek::-webkit-slider-runnable-track {
-  height: 4px;
-  border-radius: 2px;
-  background: linear-gradient(
-    to right,
-    var(--accent) var(--pct, 0%),
-    var(--fill-track) var(--pct, 0%)
-  );
-}
-
-.seek::-webkit-slider-thumb {
-  width: 12px;
-  height: 12px;
-  margin-top: -4px;
-  border-radius: 50%;
-  background: var(--text-primary);
-  opacity: 0;
-  -webkit-appearance: none;
-  appearance: none;
-}
-
-.seek:hover::-webkit-slider-thumb,
-.seek:focus-visible::-webkit-slider-thumb {
-  opacity: 1;
-}
-
-.seek:disabled {
-  cursor: default;
 }
 
 .controls {

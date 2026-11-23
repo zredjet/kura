@@ -57,6 +57,7 @@ export interface SeekTarget {
   positionMs(): number;
   /** 今のアイテムの終わり（ms。トリムがあればトリムの終わり。分からなければ null）。 */
   endMs(): number | null;
+  /** 飛ぶ（先は `applySeekAction` が 0 と終わりの手前に収めて渡す。コマ送りは終わりの半コマ手前まで）。 */
   seek(ms: number): void;
   pause(): void;
   togglePlay(): void;

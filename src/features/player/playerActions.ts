@@ -13,6 +13,9 @@ import {
   setPlayerPrefs,
 } from '../../ipc/player';
 import { savePlayState, updatePlaylist } from '../../ipc/playlists';
+import { type FrameWatch, watchFrames } from '../../lib/frameProbe';
+import { DEFAULT_FRAME_MS } from '../../lib/frameRate';
+import type { SeekTarget } from '../../lib/seekKeys';
 import { notify } from '../../stores/noticeStore';
 import { bumpRevision } from '../../stores/revisionStore';
 import { useSidebarStore } from '../../stores/sidebarStore';
@@ -61,6 +64,39 @@ export function playerController(): PlaybackController {
   applyPrefs(controller, usePlayerStore.getState().prefs);
   instance = controller;
   return controller;
+}
+
+let frames: { el: HTMLVideoElement; watch: FrameWatch } | null = null;
+
+/**
+ * シアターの `<video>` のコマを見張る（コマ送りのキーの 1 コマの長さ。ADR-230）。`Stage` が `<video>` を置いた・外した
+ * ときに呼ぶ。シアターは 1 つの `<video>` を使い回すので、ファイルが替わったら集め直す（`watchFrames`）。
+ */
+export function watchTheaterFrames(el: HTMLVideoElement | null): void {
+  if (frames?.el === el) {
+    return;
+  }
+  frames?.watch.stop();
+  frames = el ? { el, watch: watchFrames(el) } : null;
+}
+
+/**
+ * シアターのシークのキーを当てる先（ADR-230）。位置は要素から読み、先は `applySeekAction` が収めて渡すので、
+ * コントローラの余白は付けない。1 コマは動画のときだけ（分からなければ 1/30 秒）、ほかは 0.1 秒の送り。
+ */
+export function theaterSeekTarget(): SeekTarget {
+  const controller = playerController();
+  return {
+    positionMs: () => controller.currentMs(),
+    endMs: () => controller.endMs(),
+    seek: (ms) => controller.seek(ms, 0),
+    pause: () => controller.pause(),
+    togglePlay: () => controller.togglePlay(),
+    frameMs: () =>
+      usePlayerStore.getState().snapshot.kind === 'video'
+        ? (frames?.watch.frameMs() ?? DEFAULT_FRAME_MS)
+        : null,
+  };
 }
 
 /** 再生の設定を反映する。プレイリストを再生しているときは、画像の間の音楽はプレイリストの設定。 */
