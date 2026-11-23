@@ -3,7 +3,7 @@
 画像・音楽・動画をひとつのライブラリで管理し、種類を混ぜたプレイリストで再生する、個人用の macOS アプリです。
 ゲームなどに使う素材（ドット絵・スプライト・効果音・フォント・3D モデル）の置き場も兼ねていて、画像・音声の編集、
 レシピでの一括加工、ライセンスとクレジットの記録、Godot・Unity のプロジェクトへの持ち出しまでを 1 つのアプリで行います。
-Tauri 2（Rust）と React / TypeScript で作っています。名前の「Kura」は仮称です。今の版は 0.2.0 です。
+Tauri 2（Rust）と React / TypeScript で作っています。名前の「Kura」は仮称です。今の版は 0.3.0 です。
 
 ![ライブラリ画面：ジャスティファイ表示のグリッドと、タグ・フォルダ・取得元・メモを表示するインスペクタ](docs/images/library.jpg)
 
@@ -88,7 +88,7 @@ pnpm install
 pnpm tauri dev
 ```
 
-配布用のビルドは `pnpm tauri build` です。`target/release/bundle/macos/Kura.app` と `target/release/bundle/dmg/Kura_0.2.0_aarch64.dmg` ができます。
+配布用のビルドは `pnpm tauri build` です。`target/release/bundle/macos/Kura.app` と `target/release/bundle/dmg/Kura_0.3.0_aarch64.dmg` ができます。
 署名はアドホック署名だけで、公証はしていません。自分の Mac でビルドしたものは `/Applications` にコピーすればそのまま開けますが、ほかの Mac に渡すと Gatekeeper に止められます（システム設定 › プライバシーとセキュリティの「このまま開く」で開けます）。
 
 ## 開発

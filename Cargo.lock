@@ -10,7 +10,7 @@ checksum = "fe438c63458706e03479442743baae6c88256498e6431708f6dfc520a26515d3"
 
 [[package]]
 name = "aac-tables"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "adler2"
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "kura-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "kura-core",
  "kura-engine",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "kura-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2165,7 +2165,7 @@ dependencies = [
 
 [[package]]
 name = "kura-devtools"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "jpeg-encoder",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "kura-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aac-tables",
  "asefile",
@@ -2217,7 +2217,7 @@ dependencies = [
 
 [[package]]
 name = "kura-mac"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "kura-core",
  "kura-engine",
@@ -4986,7 +4986,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vorbis-tables"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "sha2",
 ]
