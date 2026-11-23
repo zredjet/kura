@@ -363,7 +363,7 @@ export function ImageLayer({
 
 /**
  * 音楽：ジャケット（なければ音符）と波形（解析の前は飾りの波形。M11）。インスペクタと同じくループの区間を出す（試聴の設定が
- * 長さに収まればそれ、なければファイルのループ点。M13）。
+ * 長さに収まればそれ、なければファイルのループ点。M13）。波形は押す・ドラッグでシークする（ADR-230）。
  */
 export function AudioArt({ item }: { item: ItemSummaryDto }) {
   const positionMs = usePlayerStore((s) => s.snapshot.positionMs);
@@ -387,6 +387,9 @@ export function AudioArt({ item }: { item: ItemSummaryDto }) {
         positionMs={positionMs}
         className={styles.waveform}
         fallback={<Waveform />}
+        onSeek={(ms) => playerController().seek(ms)}
+        onScrubStart={() => playerController().beginScrub()}
+        onScrubEnd={() => playerController().endScrub()}
       />
     </div>
   );

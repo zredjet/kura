@@ -111,6 +111,14 @@
   height: 100%;
 }
 
+/* 押す・ドラッグでシークできる波形（クイックルック・シアター。ADR-230） */
+.waveform[data-seekable] {
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 .wavePath {
   fill: none;
   stroke: currentColor;

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getAsset } from '../../ipc/asset';
@@ -7,9 +7,38 @@ import { AudioArt } from './Theater';
 
 vi.mock('../../ipc/asset', () => ({ getAsset: vi.fn() }));
 vi.mock('../asset/WaveformView', () => ({
-  WaveformView: (p: { hash: string; loop: readonly [number, number] | null }) => (
-    <div data-testid="waveform" data-hash={p.hash} data-loop={p.loop?.join('-') ?? ''} />
+  WaveformView: (p: {
+    hash: string;
+    loop: readonly [number, number] | null;
+    onSeek?: (ms: number) => void;
+    onScrubStart?: () => void;
+    onScrubEnd?: () => void;
+  }) => (
+    <button
+      type="button"
+      data-testid="waveform"
+      data-hash={p.hash}
+      data-loop={p.loop?.join('-') ?? ''}
+      onClick={() => {
+        p.onScrubStart?.();
+        p.onSeek?.(1234);
+        p.onScrubEnd?.();
+      }}
+    />
   ),
+}));
+
+const controller = vi.hoisted(() => ({
+  seek: vi.fn(),
+  beginScrub: vi.fn(),
+  endScrub: vi.fn(),
+}));
+vi.mock('./playerActions', () => ({
+  closePlayer: vi.fn(),
+  openCurrentExternally: vi.fn(),
+  playerController: () => controller,
+  toggleFullscreen: vi.fn(),
+  watchTheaterFrames: vi.fn(),
 }));
 
 const AUDIO = summary({
@@ -66,5 +95,15 @@ describe('シアターの音声の波形（M11）', () => {
     await waitFor(() =>
       expect(screen.getByTestId('waveform')).toHaveAttribute('data-loop', '185220-4057200'),
     );
+  });
+
+  it('波形を押したらプレーヤーをスクラブしてシークする（ADR-230）', async () => {
+    vi.mocked(getAsset).mockResolvedValue(audioAsset());
+    render(<AudioArt item={AUDIO} />);
+    fireEvent.click(screen.getByTestId('waveform'));
+    expect(controller.beginScrub).toHaveBeenCalledOnce();
+    expect(controller.seek).toHaveBeenCalledWith(1234);
+    expect(controller.endScrub).toHaveBeenCalledOnce();
+    await waitFor(() => expect(getAsset).toHaveBeenCalled());
   });
 });

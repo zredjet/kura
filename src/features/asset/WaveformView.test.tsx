@@ -1,9 +1,10 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import validText from '../../../crates/kura-engine/tests/vectors/peaks/valid.json?raw';
 import { ja } from '../../i18n/ja';
 import { peaksUrl } from '../../ipc/media';
+import { END_GUARD_MS } from '../../lib/seek';
 import { type FrameClock, WaveformView } from './WaveformView';
 
 interface ValidCase {
@@ -185,5 +186,78 @@ describe('WaveformView（/peaks の波形）', () => {
     expect(screen.getByText('飾りの波形')).toBeInTheDocument();
     await waitFor(() => expect(load).toHaveBeenCalled());
     expect(screen.getByText('飾りの波形')).toBeInTheDocument();
+  });
+
+  describe('押してシークする（ADR-230）', () => {
+    // default-five-levels：48kHz・70,000 フレーム（1,458.33 ms）
+    const LENGTH = (70_000 * 1000) / 48_000;
+
+    function mockRect() {
+      vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+        left: 0,
+        top: 0,
+        right: 400,
+        bottom: 48,
+        width: 400,
+        height: 48,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      });
+      Object.assign(HTMLElement.prototype, { setPointerCapture: vi.fn() });
+    }
+
+    it('押した位置の割合で長さの中へ飛び、ドラッグで追い、離すと終わる', async () => {
+      mockRect();
+      const { buf } = vector('default-five-levels');
+      const onSeek = vi.fn();
+      const onScrubStart = vi.fn();
+      const onScrubEnd = vi.fn();
+      render(
+        <WaveformView
+          hash={HASH}
+          loop={null}
+          positionMs={0}
+          load={async () => buf}
+          onSeek={onSeek}
+          onScrubStart={onScrubStart}
+          onScrubEnd={onScrubEnd}
+        />,
+      );
+      const img = screen.getByRole('img', { name: ja.asset.waveform });
+      await waitFor(() => expect(img).toHaveAttribute('data-seekable', 'true'));
+      fireEvent.pointerDown(img, { button: 0, pointerId: 1, clientX: 100 });
+      expect(onScrubStart).toHaveBeenCalledOnce();
+      expect(onSeek.mock.lastCall?.[0]).toBeCloseTo(LENGTH / 4, 6);
+      expect(img).toHaveAttribute('data-scrubbing', 'true');
+      fireEvent.pointerMove(img, { pointerId: 1, clientX: 400 });
+      fireEvent.pointerUp(img, { pointerId: 1, clientX: 400 });
+      expect(onSeek.mock.lastCall?.[0]).toBeCloseTo(LENGTH - END_GUARD_MS, 6);
+      expect(onScrubEnd).toHaveBeenCalledOnce();
+      vi.restoreAllMocks();
+    });
+
+    it('段がなければ押しても飛ばない', async () => {
+      mockRect();
+      const onSeek = vi.fn();
+      const load = vi.fn(async () => null);
+      render(<WaveformView hash={HASH} loop={null} load={load} onSeek={onSeek} />);
+      await waitFor(() => expect(load).toHaveBeenCalled());
+      const img = screen.getByRole('img', { name: ja.asset.waveform });
+      expect(img).not.toHaveAttribute('data-seekable');
+      fireEvent.pointerDown(img, { button: 0, pointerId: 1, clientX: 100 });
+      expect(onSeek).not.toHaveBeenCalled();
+      vi.restoreAllMocks();
+    });
+
+    it('onSeek を渡さなければ見るだけ（インスペクタ）', async () => {
+      mockRect();
+      const { buf } = vector('default-five-levels');
+      render(<WaveformView hash={HASH} loop={null} load={async () => buf} />);
+      const img = screen.getByRole('img', { name: ja.asset.waveform });
+      await waitFor(() => expect(img).toHaveAttribute('data-loaded', 'true'));
+      expect(img).not.toHaveAttribute('data-seekable');
+      vi.restoreAllMocks();
+    });
   });
 });
