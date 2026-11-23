@@ -23,33 +23,31 @@
 //! - 断るもの：キャンバスいっぱいでないフレームの列（`Unsupported`。どのデコーダもキャンバスいっぱいに合成する）、上限を
 //!   超える値・メタデータ（`Limit`）、4 GiB を超える WAV（`Limit`）。浮動小数の画素の形式は値にない（足すときは `v` を上げて
 //!   入れ物を増やす。形式の `match` が網羅でないと組み立てが通らない）。
-//! - 中止：書くのは 1 枚の画像は 64 行ごと（帯ずつ写して流すので、値と同じ大きさの写しを作らない）、APNG はフレームごと
-//!   （png クレートの StreamWriter は APNG の最初の IDAT に fdAT の番号を書いてしまうので、フレームを詰めて書く）、音声は
-//!   16,384 フレームごと。読むのは中のデコーダ（PNG は 256 行・WAV は 16,384 フレームごと）と、
+//! - 中止：書くのは PNG は行の帯ごと（自作の書き手 `png_write` の fast の段で、帯ずつ読んで流すので、値と同じ大きさの写しを
+//!   作らない。M16 段 7 から）、音声は 16,384 フレームごと。読むのは中のデコーダ（PNG は 256 行・WAV は 16,384 フレームごと）と、
 //!   音声のダイジェストの塊ごとに確かめる。
 //! - 形式の表（`FORMATS`）には載せない内部の形式 [`FORMAT`]（`"anchor"`）。`CodecSet::pinned()` が [`AnchorDecoder`] を持つ
 //!   （`decode_with`・ファズ・ゴールデンを同じ口で使うため）。書き出しは `Encoder` にしない（元の読み取りの記録を渡す口が
 //!   ないため。[`write`] を直接呼ぶ）。
 
-use std::borrow::Cow;
 use std::io::{BufReader, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::codec::zlib::Level;
 use crate::codec::{
-    DecodeStamp, Decoder, Encoder, MAX_CHUNKS, ReadSeek, Stage, Tier, contain, png, seek_to,
-    try_vec, wav,
+    DecodeStamp, Decoder, Encoder, MAX_CHUNKS, ReadSeek, Stage, Tier, contain, png, png_write,
+    seek_to, try_vec, wav,
 };
 use crate::digest::{Digest, Hasher, canonical};
 use crate::doc::DecodeOptions;
 use crate::error::{EngineError, Mismatch};
-use crate::geom::IRect;
 use crate::limits::Limits;
 use crate::monitor::Monitor;
 use crate::shape::{Fullness, Shape};
-use crate::value::{Audio, AudioMeta, Frame, Frames, Image, ImageMeta, PixelFormat, Raster, Value};
+use crate::value::{Audio, AudioMeta, Frame, Frames, Image, ImageMeta, Raster, Value};
 
 /// 書き出しの約束の版（値だけの約束。ヘッダの形・中のデコーダの選び方・チャンクの意味を変えるときに上げる）。
 pub const ENC_ID: &str = "anchor-kura-enc/1";
@@ -72,8 +70,6 @@ const WAV_HEADER: [u8; 4] = *b"kura";
 const HEADER_DOMAIN: &str = "kura-anchor-header-v1";
 /// ヘッダの前に置くダイジェストの長さ。
 const HEADER_DIGEST_LEN: usize = 32;
-/// PNG を書くときに中止を確かめる行の数。
-const BAND_ROWS: u32 = 64;
 /// WAV を書くときに中止を確かめるフレームの数。
 const CHUNK_FRAMES: usize = 16_384;
 /// WAV を書くときの作業領域の上限（チャンネルが多いときは塊のフレームを減らす）。
@@ -381,19 +377,19 @@ pub fn write_verified(
 }
 
 /// アンカーを書いて読み直す（[`write`] → [`verify`]）間に、値のほかに使う作業領域の見積もり（バイト。§12 のメモリの予算。
-/// 書いたバイト列の置き場所は含めない）。読み直す間は読み直した値（値の 1 倍。§9.4 の「値の 2 倍」）を持つ。1 枚の画像と
-/// 音声は帯・塊ごとに流しながら書くので、書く間は小さい。APNG はフレームごとに PNG（`fast`）で組むので、1 フレームの
-/// 4 倍（`PngCodec` の `work_bytes`）のほうが大きくなりうる。
+/// 書いたバイト列の置き場所は含めない）。読み直す間は読み直した値（値の 1 倍。§9.4 の「値の 2 倍」）を持つ。書く間は、
+/// 画像・フレームの列は PNG の書き手（`fast`）の作業領域（`PngCodec` の `work_bytes`。行の帯ずつ流すので小さいが、定まった
+/// 分があるので小さい値では値より大きい）、音声は塊ごとに流すので小さい。
 pub fn work_bytes(shape: &Shape) -> u64 {
     let value = crate::budget::value_bytes(shape);
     match shape {
-        Shape::Frames { .. } => value.max(Encoder::work_bytes(
+        Shape::Image { .. } | Shape::Frames { .. } => value.max(Encoder::work_bytes(
             &png::PngCodec,
             "png",
             shape,
             &serde_json::json!({ "compression": "fast" }),
         )),
-        _ => value,
+        Shape::Audio { .. } => value,
     }
 }
 
@@ -1055,31 +1051,14 @@ impl Write for Counting<'_> {
     }
 }
 
-fn enc_err(e: impl std::fmt::Display) -> EngineError {
-    EngineError::Encode {
-        codec: ENC_ID.to_string(),
-        message: e.to_string(),
-    }
+/// fcTL の表示時間（外のツールのため。値の表示時間はヘッダ）。65,535 ms を超える分は詰める。
+fn png_delay(ms: u32) -> (u16, u16) {
+    (u16::try_from(ms).unwrap_or(u16::MAX), 1000)
 }
 
-/// PNG の色の種類とビット深度（値の形式のまま）。
-fn png_color(fmt: PixelFormat) -> (::png::ColorType, ::png::BitDepth) {
-    use ::png::{BitDepth as B, ColorType as C};
-    match fmt {
-        PixelFormat::Gray8 => (C::Grayscale, B::Eight),
-        PixelFormat::GrayA8 => (C::GrayscaleAlpha, B::Eight),
-        PixelFormat::Rgb8 => (C::Rgb, B::Eight),
-        PixelFormat::Rgba8 => (C::Rgba, B::Eight),
-        PixelFormat::Gray16 => (C::Grayscale, B::Sixteen),
-        PixelFormat::GrayA16 => (C::GrayscaleAlpha, B::Sixteen),
-        PixelFormat::Rgb16 => (C::Rgb, B::Sixteen),
-        PixelFormat::Rgba16 => (C::Rgba, B::Sixteen),
-        PixelFormat::Indexed8 => (C::Indexed, B::Eight),
-    }
-}
-
-/// PNG（`plays` が `None` なら `frames` の最初の 1 枚の画像、`Some` なら APNG）を書く。私用のチャンクは IDAT の前に置く。
-/// 1 枚の画像は `BAND_ROWS` 行ずつ写して流し、帯ごとに中止を確かめる。APNG はフレームごとに書いて確かめる。
+/// PNG（`plays` が `None` なら `frames` の最初の 1 枚の画像、`Some` なら APNG）を書く（自作の書き手 `png_write` の fast の段。
+/// M16 段 7 から。前は png クレート）。私用のチャンクは IDAT の前に置く。行の帯ずつ読んで流し、帯ごとに中止を確かめ、進捗を
+/// 送る（APNG はフレームごと）。
 fn write_png(
     frames: &[(&Raster, u32)],
     plays: Option<u32>,
@@ -1088,113 +1067,22 @@ fn write_png(
     out: &mut dyn Write,
     mon: &dyn Monitor,
 ) -> Result<(), EngineError> {
-    let Some((first, first_ms)) = frames.first() else {
+    if frames.is_empty() {
         return Err(EngineError::Internal("フレームがありません".into()));
+    }
+    let spec = png_write::Spec {
+        frames: frames.to_vec(),
+        // acTL の繰り返しは PNG の整数（2³¹ − 1 まで）。正確な値はヘッダ
+        plays: plays.map(|p| p.min(PNG_CHUNK_MAX)),
+        dpi: None,
+        icc,
+        exif: None,
+        text: None,
+        private: chunks,
+        delay: png_delay,
+        progress: true,
     };
-    let (w, h, fmt) = (first.width(), first.height(), first.format());
-    let (color, depth) = png_color(fmt);
-    let mut info = ::png::Info::with_size(w, h);
-    info.color_type = color;
-    info.bit_depth = depth;
-    if let Some(p) = first.palette() {
-        let rgb: Vec<u8> = p.colors.iter().flat_map(|c| [c[0], c[1], c[2]]).collect();
-        let mut alphas: Vec<u8> = p.colors.iter().map(|c| c[3]).collect();
-        while alphas.last() == Some(&255) {
-            alphas.pop();
-        }
-        info.palette = Some(Cow::Owned(rgb));
-        if !alphas.is_empty() {
-            info.trns = Some(Cow::Owned(alphas));
-        }
-    }
-    if let Some(icc) = icc {
-        info.icc_profile = Some(Cow::Borrowed(icc));
-    }
-    let mut enc = ::png::Encoder::with_info(out, info).map_err(enc_err)?;
-    enc.set_compression(::png::Compression::Fast);
-    if let Some(plays) = plays {
-        let n = u32::try_from(frames.len())
-            .map_err(|_| EngineError::Limit("フレームが多すぎます".into()))?;
-        // acTL の繰り返しは PNG の整数（2³¹ − 1 まで。超えると png クレートが acTL を断る）。正確な値はヘッダ
-        enc.set_animated(n, plays.min(PNG_CHUNK_MAX))
-            .map_err(enc_err)?;
-    }
-    let mut writer = enc.write_header().map_err(enc_err)?;
-    for (kind, data) in chunks {
-        writer
-            .write_chunk(::png::chunk::ChunkType(*kind), data)
-            .map_err(enc_err)?;
-    }
-    // fcTL の表示時間は外のツールのため（値の表示時間はヘッダ）。65,535 ms を超える分は詰める
-    let delay = |ms: u32| (u16::try_from(ms).unwrap_or(u16::MAX), 1000u16);
-    if plays.is_some() {
-        let (num, den) = delay(*first_ms);
-        writer.set_frame_delay(num, den).map_err(enc_err)?;
-        writer
-            .set_dispose_op(::png::DisposeOp::None)
-            .map_err(enc_err)?;
-        writer
-            .set_blend_op(::png::BlendOp::Source)
-            .map_err(enc_err)?;
-    }
-    let swap16 = |band: &mut [u8]| {
-        if depth == ::png::BitDepth::Sixteen {
-            // 値はリトルエンディアン、PNG はビッグエンディアン
-            for pair in band.as_chunks_mut::<2>().0 {
-                pair.swap(0, 1);
-            }
-        }
-    };
-    for (px, _) in frames {
-        if px.width() != w || px.height() != h || px.format() != fmt {
-            return Err(EngineError::Internal(
-                "フレームの大きさ・形式がそろっていません".into(),
-            ));
-        }
-    }
-    if plays.is_none() {
-        // 1 枚の画像：BAND_ROWS 行ずつ写して流す（値と同じ大きさの写しを作らない）
-        let row_len = (w as usize)
-            .checked_mul(fmt.bytes_per_pixel())
-            .ok_or_else(|| EngineError::Limit("画像が大きすぎます".into()))?;
-        let band_len = row_len
-            .checked_mul(BAND_ROWS as usize)
-            .ok_or_else(|| EngineError::Limit("画像が大きすぎます".into()))?;
-        let mut buf = try_vec(band_len, 0u8)?;
-        let mut stream = writer.stream_writer().map_err(enc_err)?;
-        let mut y = 0u32;
-        while y < h {
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            let rows = BAND_ROWS.min(h - y);
-            let band = &mut buf[..row_len * rows as usize];
-            first.read_rect(IRect::new(0, i64::from(y), w, rows), band)?;
-            swap16(band);
-            stream.write_all(band).map_err(enc_err)?;
-            y += rows;
-            mon.progress(u64::from(y), u64::from(h));
-        }
-        stream.finish().map_err(enc_err)?;
-    } else {
-        // APNG：フレームごとに書く（png クレートの StreamWriter は、APNG の最初の IDAT にも fdAT の番号を書いてしまうので
-        // 使わない）。中止はフレームごとに確かめる
-        let total = frames.len() as u64;
-        for (i, (px, ms)) in frames.iter().enumerate() {
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            if i > 0 {
-                let (num, den) = delay(*ms);
-                writer.set_frame_delay(num, den).map_err(enc_err)?;
-            }
-            let mut rows = px.to_rows()?;
-            swap16(&mut rows);
-            writer.write_image_data(&rows).map_err(enc_err)?;
-            mon.progress(i as u64 + 1, total);
-        }
-    }
-    writer.finish().map_err(enc_err)?;
+    png_write::write(&spec, Level::Fast, out, mon)?;
     Ok(())
 }
 
@@ -1325,9 +1213,10 @@ fn crc32(kind: &[u8; 4], data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use crate::codec::{CodecEnv, CodecSet};
-    use crate::geom::IPoint;
+    use crate::geom::{IPoint, IRect};
     use crate::monitor::{CancelAfter, NoMonitor};
     use crate::testgen::{InputGen, MetaGen};
+    use crate::value::PixelFormat;
     use crate::value::{AnimTag, AudioSource, Grid, LoopRange, Marker, Slice, TagDirection};
     use std::io::Cursor;
 

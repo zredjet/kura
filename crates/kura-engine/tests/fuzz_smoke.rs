@@ -1,9 +1,9 @@
 //! stable で回す、変異によるファズ（docs/editing.md §13）。`fuzz/`（cargo-fuzz、nightly）と同じ対象
-//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`・`fuzz_audio_source`・`fuzz_recipe`・`fuzz_inflate`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
+//! （`testing::fuzz_decode`・`fuzz_encode`・`fuzz_document`・`fuzz_doc_parts`・`fuzz_peaks`・`fuzz_model`・`fuzz_svg_text`・`fuzz_audio_source`・`fuzz_recipe`・`fuzz_inflate`・`fuzz_deflate`・`fuzz_png_write`）を、種のファイルに ChaCha8 で変異をかけて呼ぶ。
 //! カバレッジは見ない。対象の名前は、デコーダは形式（`ogg`）、自前のエンコーダは `encode_<形式>`（`encode_ogg`）、
 //! 文書は `document`、文書の部品（M12）は `doc_parts`、波形の段の読み口は `peaks`（`fuzz/` では `decode_peaks`）、3D モデル（glb）は `model_glb`、
 //! フォントを渡した SVG の文字は `svg_text`（`fuzz/` では `decode_svg_text`）、音声の源（M13）は `audio_source`、
-//! レシピのファイル（M14）は `recipe`、zlib・deflate の展開（M16 段 6）は `inflate`。
+//! レシピのファイル（M14）は `recipe`、zlib・deflate の展開（M16 段 6）は `inflate`、圧縮（M16 段 7）は `deflate`、PNG の書き出し（M16 段 7）は `png_write`。
 //!
 //! - ふだんの `cargo test` では、対象ごとに決めた回数だけ回す（`quick`）。
 //! - `KURA_FUZZ_SECS=60 cargo test --release -p kura-engine --test suite fuzz_smoke:: -- --ignored` で、対象ごとに決めた秒数だけ回す。
@@ -26,9 +26,9 @@ use kura_engine::doc::Graph;
 use kura_engine::testfiles::{ApngFrame, AseCel, AseFrame, AseLayer, FileGen, GifFrame, PsdGen};
 use kura_engine::testgen::{InputGen, MetaGen};
 use kura_engine::testing::{
-    FuzzEncodeMeta, fuzz_audio_source, fuzz_decode, fuzz_doc_parts, fuzz_document, fuzz_encode,
-    fuzz_encode_input, fuzz_encode_input_meta, fuzz_inflate, fuzz_model, fuzz_peaks, fuzz_recipe,
-    fuzz_svg_text,
+    FuzzEncodeMeta, fuzz_audio_source, fuzz_decode, fuzz_deflate, fuzz_doc_parts, fuzz_document,
+    fuzz_encode, fuzz_encode_input, fuzz_encode_input_meta, fuzz_inflate, fuzz_model, fuzz_peaks,
+    fuzz_png_write, fuzz_recipe, fuzz_svg_text,
 };
 use kura_engine::value::{LoopRange, PixelFormat};
 use kura_engine::{NoMonitor, Value};
@@ -654,6 +654,27 @@ fn targets() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                 v
             },
         ),
+        // M16 段 7：deflate の圧縮（cargo-fuzz の対象も deflate）。文字・0 の列・繰り返し・雑音
+        (
+            "deflate",
+            vec![
+                b"kura deflate seeds kura deflate seeds".to_vec(),
+                vec![0u8; 3000],
+                (0..5000u32).map(|i| (i % 7) as u8).collect(),
+                (0..3000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect(),
+                vec![],
+            ],
+        ),
+        // M16 段 7：PNG・APNG の書き出し（cargo-fuzz の対象も png_write）。頭の 8 バイトで形を決め、残りが画素
+        (
+            "png_write",
+            vec![
+                vec![3, 40, 20, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+                vec![8, 64, 9, 2, 3, 15, 10, 3, 0, 0, 0, 1, 1, 1, 2, 2, 2],
+                vec![5, 7, 33, 1, 1, 0, 200, 0, 255, 0, 255, 0],
+                vec![0; 8],
+            ],
+        ),
         // M11：3D モデル（glb の情報・焼き込み・描画。cargo-fuzz の対象も model_glb）
         (
             "model_glb",
@@ -1066,6 +1087,10 @@ fn run(target: &str, input: &[u8]) -> Result<(), String> {
         fuzz_recipe(input)
     } else if target == "inflate" {
         fuzz_inflate(input)
+    } else if target == "deflate" {
+        fuzz_deflate(input)
+    } else if target == "png_write" {
+        fuzz_png_write(input)
     } else if target == "svg_text" {
         fuzz_svg_text(input)
     } else if let Some(format) = target.strip_prefix("encode_") {
@@ -1159,6 +1184,8 @@ fn export_seeds() {
             || target == "audio_source"
             || target == "recipe"
             || target == "inflate"
+            || target == "deflate"
+            || target == "png_write"
             || target.starts_with("encode_")
         {
             target.to_string()

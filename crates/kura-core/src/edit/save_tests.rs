@@ -673,7 +673,7 @@ fn s1_overwrite_keeps_identity_and_adds_versions_0_and_1() {
     assert_eq!(vs[0].value_digest, Some(r0.decoded.unwrap().value_digest));
     assert_eq!(
         vs[1].record().unwrap().encoded.unwrap().codec,
-        "png-rs-enc/1"
+        "png-kura-enc/1"
     );
     let inputs = env
         .lib
@@ -1987,7 +1987,7 @@ fn s4_revert_rebuilds_after_gc() {
         ]
     );
     let r3 = vs[3].record().unwrap();
-    assert_eq!(r3.encoded.unwrap().codec, "png-rs-enc/1");
+    assert_eq!(r3.encoded.unwrap().codec, "png-kura-enc/1");
     assert_eq!(r3.revert.map(|r| r.rebuilt), Some(true));
     assert_consistent(&env.lib);
 }
@@ -2051,7 +2051,7 @@ fn revert_rebuild_without_the_recorded_encoder_uses_the_current_one() {
         let r3 = vs[3].record().unwrap();
         assert_eq!(
             r3.encoded.map(|e| e.codec),
-            Some("png-rs-enc/1".to_string()),
+            Some("png-kura-enc/1".to_string()),
             "新しい書き出しの記録"
         );
         assert_eq!(r3.warnings, warnings);

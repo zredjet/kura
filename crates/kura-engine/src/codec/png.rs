@@ -1,5 +1,5 @@
 //! PNG（Pinned）。読み取りは自作の読み口 `png_read`（M16 段 6。png クレート 0.18.1 が読めた PNG は同じ値で読む。ADR-223）、
-//! 書き出しは `png` クレート（版は `=` で固定。段 7 で自作に替える）。
+//! 書き出しは自作の書き手 `png_write`（M16 段 7。ADR-224）。
 //!
 //! 読み取り（`png-rs-dec/2`。`png-rs-dec/1` は旧版として残す）：
 //! - 8/16 ビット、グレー・グレー＋アルファ・RGB・RGBA・パレット（1/2/4/8 ビット）。
@@ -17,14 +17,15 @@
 //!   ほかは Rgba8 にする。この判断と形は、チャンクの並び（`scan`）を先に読んで決める（形と中身を必ず一致させる）。
 //! - `png-rs-dec/1`：eXIf を読まず、APNG は既定の画像だけを読む。
 //!
-//! 書き出し（`png-rs-enc/1`）：値の形式のまま（16 ビットはビッグエンディアンに戻す）。Indexed8 は PLTE と tRNS。
-//! EXIF は eXIf に書く。フレームの列（キャンバスいっぱいのもの）は APNG（既定の画像が最初のフレーム、dispose NONE・blend SOURCE）。
-//! 時刻（tIME）は書かない。
+//! 書き出し（`png-kura-enc/1`。前の `png-rs-enc/1` は退いた書き手）：値の形式のまま（16 ビットはビッグエンディアンに戻す）。
+//! Indexed8 は PLTE と tRNS。EXIF は eXIf に書く。フレームの列（キャンバスいっぱいのもの）は APNG（既定の画像が最初の
+//! フレーム、dispose NONE・blend SOURCE）。時刻（tIME）は書かない。チャンクの並び・フィルタ・圧縮の 3 段は `png_write`。
 
-use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
 
 use super::png_read::{self, ColorType, Info, Reader};
+use super::png_write;
+use super::zlib::Level;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -54,18 +55,11 @@ pub fn legacy_decoders() -> Vec<Arc<dyn Decoder>> {
 const DEC_ID: &str = "png-rs-dec/2";
 const DEC_ID_V1: &str = "png-rs-dec/1";
 /// 書き出しの約束の版（書くバイト列が変わる変更は上げる。§9.1）。
-const ENC_ID: &str = "png-rs-enc/1";
+const ENC_ID: &str = png_write::ENC_ID;
 
 fn err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Decode {
         codec: DEC_ID.to_string(),
-        message: e.to_string(),
-    }
-}
-
-fn enc_err(e: impl std::fmt::Display) -> EngineError {
-    EngineError::Encode {
-        codec: ENC_ID.to_string(),
         message: e.to_string(),
     }
 }
@@ -852,20 +846,15 @@ impl Encoder for PngCodec {
         caps_of(format)
     }
 
-    /// フレームごとに順に書くので 1 フレームぶんの倍率：行を詰めた写し（1 倍。§13）と、圧縮した列（png クレートは IDAT を
-    /// まとめてメモリに組んでから書く。縮まない画素なら値と同じほどで、伸ばすので容量は 2 倍まで）で 3 倍。`fast` は、
-    /// 圧縮が無圧縮より大きければ無圧縮で組み直す（その間はもう 1 倍）ので 4 倍。段 10 の実測（4096² の乱数の Rgba8 を
-    /// 捨てる書き出し先に書いたピークから値を引いたもの）：`balanced` 131 MiB（値の 2.0 倍）、`fast` 219 MiB（3.4 倍）。
+    /// フレームごとに順に、行の帯ずつ読んで流して書くので、値の大きさによらず幅に比例する分と定まった分だけ
+    /// （`png_write::work_bytes`。M16 段 7 から。前の png クレートは行を詰めた写しと IDAT をまとめて組むので値の 3〜4 倍
+    /// だった）。
     fn work_bytes(&self, _format: &str, shape: &Shape, opts: &serde_json::Value) -> u64 {
-        let frame = match *shape {
-            Shape::Frames { w, h, fmt, .. } => w
-                .max()
-                .saturating_mul(h.max())
-                .saturating_mul(fmt.bytes_per_pixel() as u64),
-            _ => crate::budget::value_bytes(shape),
+        let (w, h, fmt) = match *shape {
+            Shape::Image { w, h, fmt } | Shape::Frames { w, h, fmt, .. } => (w.max(), h.max(), fmt),
+            Shape::Audio { .. } => return 0,
         };
-        let fast = opts.get("compression").and_then(serde_json::Value::as_str) == Some("fast");
-        frame.saturating_mul(if fast { 4 } else { 3 })
+        png_write::work_bytes(level_of(opts), w, h, fmt.bytes_per_pixel() as u64)
     }
 
     fn encode(
@@ -876,150 +865,20 @@ impl Encoder for PngCodec {
         out: &mut dyn Write,
         mon: &dyn Monitor,
     ) -> Result<u64, EngineError> {
-        let (frames, meta, plays): (Vec<(&Raster, u32)>, &ImageMeta, Option<u32>) = match value {
-            Value::Image(img) => (vec![(&img.px, 0)], &img.meta, None),
-            Value::Frames(fr) if fr.is_full() => (
-                fr.frames().iter().map(|f| (&f.px, f.duration_ms)).collect(),
-                &fr.meta,
-                Some(fr.loop_count),
-            ),
-            _ => {
-                return Err(EngineError::Unsupported(
-                    "PNG には画像か、キャンバスいっぱいのフレームの列だけを書けます".into(),
-                ));
-            }
-        };
-        let Some((px, _)) = frames.first().copied() else {
-            return Err(EngineError::Unsupported("フレームがありません".into()));
-        };
-        let (color, depth) = match px.format() {
-            PixelFormat::Gray8 => (png::ColorType::Grayscale, png::BitDepth::Eight),
-            PixelFormat::GrayA8 => (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight),
-            PixelFormat::Rgb8 => (png::ColorType::Rgb, png::BitDepth::Eight),
-            PixelFormat::Rgba8 => (png::ColorType::Rgba, png::BitDepth::Eight),
-            PixelFormat::Gray16 => (png::ColorType::Grayscale, png::BitDepth::Sixteen),
-            PixelFormat::GrayA16 => (png::ColorType::GrayscaleAlpha, png::BitDepth::Sixteen),
-            PixelFormat::Rgb16 => (png::ColorType::Rgb, png::BitDepth::Sixteen),
-            PixelFormat::Rgba16 => (png::ColorType::Rgba, png::BitDepth::Sixteen),
-            PixelFormat::Indexed8 => (png::ColorType::Indexed, png::BitDepth::Eight),
-        };
-        let compression = match opts
-            .get("compression")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("balanced")
-        {
-            "fast" => png::Compression::Fast,
-            "high" => png::Compression::High,
-            _ => png::Compression::Balanced,
-        };
-        let rows_of = |px: &Raster| -> Result<Vec<u8>, EngineError> {
-            let mut rows = px.to_rows()?;
-            if depth == png::BitDepth::Sixteen {
-                // 値はリトルエンディアン、PNG はビッグエンディアン
-                for pair in rows.as_chunks_mut::<2>().0 {
-                    pair.swap(0, 1);
-                }
-            }
-            Ok(rows)
-        };
-        let mut info = png::Info::with_size(px.width(), px.height());
-        info.color_type = color;
-        info.bit_depth = depth;
-        if let Some(p) = px.palette() {
-            let rgb: Vec<u8> = p.colors.iter().flat_map(|c| [c[0], c[1], c[2]]).collect();
-            let mut alphas: Vec<u8> = p.colors.iter().map(|c| c[3]).collect();
-            while alphas.last() == Some(&255) {
-                alphas.pop();
-            }
-            info.palette = Some(Cow::Owned(rgb));
-            if !alphas.is_empty() {
-                info.trns = Some(Cow::Owned(alphas));
-            }
-        }
-        if let Some((x, y)) = meta.dpi {
-            // 1 インチあたり → 1 メートルあたり（四捨五入）
-            let ppm =
-                |dpi: u32| u32::try_from((u64::from(dpi) * 10_000 + 127) / 254).unwrap_or(u32::MAX);
-            info.pixel_dims = Some(png::PixelDimensions {
-                xppu: ppm(x),
-                yppu: ppm(y),
-                unit: png::Unit::Meter,
-            });
-        }
-        if let Some(icc) = &meta.icc {
-            info.icc_profile = Some(Cow::Owned(icc.as_ref().clone()));
-        }
-        if let Some(e) = &meta.exif {
-            info.exif_metadata = Some(Cow::Owned(e.as_ref().clone()));
-        }
-        let mut counter = CountingWriter {
-            inner: out,
-            count: 0,
-        };
-        {
-            let mut enc = png::Encoder::with_info(&mut counter, info).map_err(enc_err)?;
-            enc.set_compression(compression);
-            if let Some(plays) = plays {
-                enc.set_animated(frames.len() as u32, plays)
-                    .map_err(enc_err)?;
-            }
-            for (k, v) in &meta.text {
-                if v.is_ascii() && k.is_ascii() {
-                    enc.add_text_chunk(k.clone(), v.clone()).map_err(enc_err)?;
-                } else {
-                    enc.add_itxt_chunk(k.clone(), v.clone()).map_err(enc_err)?;
-                }
-            }
-            if mon.canceled() {
-                return Err(EngineError::Canceled);
-            }
-            let mut writer = enc.write_header().map_err(enc_err)?;
-            for (frame, ms) in &frames {
-                if plays.is_some() {
-                    let (num, den) = delay_fraction(*ms);
-                    writer.set_frame_delay(num, den).map_err(enc_err)?;
-                }
-                writer.write_image_data(&rows_of(frame)?).map_err(enc_err)?;
-                if mon.canceled() {
-                    return Err(EngineError::Canceled);
-                }
-            }
-            writer.finish().map_err(enc_err)?;
-        }
-        Ok(counter.count)
+        png_write::encode(value, level_of(opts), out, mon)
     }
 }
 
-/// 表示時間（ms）を fcTL の分数（秒）にする。65,535 ms までは ms のまま（読むと同じ値に戻る）、
-/// それより長いと 10 ms、さらに長いと 1 秒の単位に四捨五入する。
-fn delay_fraction(ms: u32) -> (u16, u16) {
-    if let Ok(n) = u16::try_from(ms) {
-        (n, 1000)
-    } else if let Ok(n) = u16::try_from((u64::from(ms) + 5) / 10) {
-        (n, 100)
-    } else {
-        (
-            u16::try_from((u64::from(ms) + 500) / 1000).unwrap_or(u16::MAX),
-            1,
-        )
-    }
-}
-
-/// 書いたバイト数を数える。
-struct CountingWriter<'a> {
-    inner: &'a mut dyn Write,
-    count: u64,
-}
-
-impl Write for CountingWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.count += n as u64;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+/// 設定 `compression`（fast・balanced・high。既定は balanced）の段。
+fn level_of(opts: &serde_json::Value) -> Level {
+    match opts
+        .get("compression")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("balanced")
+    {
+        "fast" => Level::Fast,
+        "high" => Level::High,
+        _ => Level::Balanced,
     }
 }
 
@@ -1936,8 +1795,8 @@ mod tests {
                 assert_eq!(a.px, b.px, "{fmt:?}");
             }
         }
-        assert_eq!(delay_fraction(0), (0, 1000));
-        assert_eq!(delay_fraction(65_536), (6_554, 100));
-        assert_eq!(delay_fraction(u32::MAX), (u16::MAX, 1));
+        assert_eq!(png_write::delay_fraction(0), (0, 1000));
+        assert_eq!(png_write::delay_fraction(65_536), (6_554, 100));
+        assert_eq!(png_write::delay_fraction(u32::MAX), (u16::MAX, 1));
     }
 }

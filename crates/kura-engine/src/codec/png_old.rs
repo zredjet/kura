@@ -1,10 +1,12 @@
-//! 前の PNG の読み手（png クレート 0.18.1。M16 段 6 で自作の `png_read` に替える前の `png.rs` の読み取りをそのまま写したもの）。
-//! 試験だけで使う照合の相手（`png-rs-dec/1`・`/2` の識別子のまま実装を替えたので、前に読めた PNG を同じ値で読むかを照らす）。
-//! 段 7 で png クレートの書き出しも外すとき、dev 依存に移す。
+//! 前の PNG の読み手と書き手（png クレート 0.18.1。M16 段 6・7 で自作の `png_read`・`png_write` に替える前の `png.rs` の
+//! 読み取りと書き出しをそのまま写したもの）。試験だけで使う照合の相手（`png-rs-dec/1`・`/2` の識別子のまま読み手を替えた
+//! ので、前に読めた PNG を同じ値で読むかを照らす。書き手は大きさ・速さを比べ、同じ値に読めるかを照らす）。png クレートは
+//! 段 7 から dev 依存。
 
 #![allow(dead_code)]
 
-use std::io::{BufReader, Read};
+use std::borrow::Cow;
+use std::io::{BufReader, Read, Write};
 use std::sync::Arc;
 
 use crate::codec::{Decoder, ReadSeek, Tier, exif, try_vec};
@@ -800,4 +802,171 @@ fn read_meta(info: &png::Info<'_>) -> ImageMeta {
         }
     }
     meta
+}
+
+/// 前の PNG の書き手（png クレート 0.18.1。M16 段 7 で自作の `png_write` に替える前の `png.rs` の書き出しをそのまま写したもの）。
+/// 試験だけで使う照合の相手（大きさ・速さを比べ、読み直した値が同じかを照らす）。
+pub struct OldPngEnc;
+
+impl OldPngEnc {
+    /// 前の書き出し（`compression` は fast・balanced・high）。
+    pub fn encode(
+        &self,
+        value: &Value,
+        _format: &str,
+        opts: &serde_json::Value,
+        out: &mut dyn Write,
+        mon: &dyn Monitor,
+    ) -> Result<u64, EngineError> {
+        let (frames, meta, plays): (Vec<(&Raster, u32)>, &ImageMeta, Option<u32>) = match value {
+            Value::Image(img) => (vec![(&img.px, 0)], &img.meta, None),
+            Value::Frames(fr) if fr.is_full() => (
+                fr.frames().iter().map(|f| (&f.px, f.duration_ms)).collect(),
+                &fr.meta,
+                Some(fr.loop_count),
+            ),
+            _ => {
+                return Err(EngineError::Unsupported(
+                    "PNG には画像か、キャンバスいっぱいのフレームの列だけを書けます".into(),
+                ));
+            }
+        };
+        let Some((px, _)) = frames.first().copied() else {
+            return Err(EngineError::Unsupported("フレームがありません".into()));
+        };
+        let (color, depth) = match px.format() {
+            PixelFormat::Gray8 => (png::ColorType::Grayscale, png::BitDepth::Eight),
+            PixelFormat::GrayA8 => (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight),
+            PixelFormat::Rgb8 => (png::ColorType::Rgb, png::BitDepth::Eight),
+            PixelFormat::Rgba8 => (png::ColorType::Rgba, png::BitDepth::Eight),
+            PixelFormat::Gray16 => (png::ColorType::Grayscale, png::BitDepth::Sixteen),
+            PixelFormat::GrayA16 => (png::ColorType::GrayscaleAlpha, png::BitDepth::Sixteen),
+            PixelFormat::Rgb16 => (png::ColorType::Rgb, png::BitDepth::Sixteen),
+            PixelFormat::Rgba16 => (png::ColorType::Rgba, png::BitDepth::Sixteen),
+            PixelFormat::Indexed8 => (png::ColorType::Indexed, png::BitDepth::Eight),
+        };
+        let compression = match opts
+            .get("compression")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("balanced")
+        {
+            "fast" => png::Compression::Fast,
+            "high" => png::Compression::High,
+            _ => png::Compression::Balanced,
+        };
+        let rows_of = |px: &Raster| -> Result<Vec<u8>, EngineError> {
+            let mut rows = px.to_rows()?;
+            if depth == png::BitDepth::Sixteen {
+                // 値はリトルエンディアン、PNG はビッグエンディアン
+                for pair in rows.as_chunks_mut::<2>().0 {
+                    pair.swap(0, 1);
+                }
+            }
+            Ok(rows)
+        };
+        let mut info = png::Info::with_size(px.width(), px.height());
+        info.color_type = color;
+        info.bit_depth = depth;
+        if let Some(p) = px.palette() {
+            let rgb: Vec<u8> = p.colors.iter().flat_map(|c| [c[0], c[1], c[2]]).collect();
+            let mut alphas: Vec<u8> = p.colors.iter().map(|c| c[3]).collect();
+            while alphas.last() == Some(&255) {
+                alphas.pop();
+            }
+            info.palette = Some(Cow::Owned(rgb));
+            if !alphas.is_empty() {
+                info.trns = Some(Cow::Owned(alphas));
+            }
+        }
+        if let Some((x, y)) = meta.dpi {
+            // 1 インチあたり → 1 メートルあたり（四捨五入）
+            let ppm =
+                |dpi: u32| u32::try_from((u64::from(dpi) * 10_000 + 127) / 254).unwrap_or(u32::MAX);
+            info.pixel_dims = Some(png::PixelDimensions {
+                xppu: ppm(x),
+                yppu: ppm(y),
+                unit: png::Unit::Meter,
+            });
+        }
+        if let Some(icc) = &meta.icc {
+            info.icc_profile = Some(Cow::Owned(icc.as_ref().clone()));
+        }
+        if let Some(e) = &meta.exif {
+            info.exif_metadata = Some(Cow::Owned(e.as_ref().clone()));
+        }
+        let mut counter = CountingWriter {
+            inner: out,
+            count: 0,
+        };
+        {
+            let mut enc = png::Encoder::with_info(&mut counter, info).map_err(enc_err)?;
+            enc.set_compression(compression);
+            if let Some(plays) = plays {
+                enc.set_animated(frames.len() as u32, plays)
+                    .map_err(enc_err)?;
+            }
+            for (k, v) in &meta.text {
+                if v.is_ascii() && k.is_ascii() {
+                    enc.add_text_chunk(k.clone(), v.clone()).map_err(enc_err)?;
+                } else {
+                    enc.add_itxt_chunk(k.clone(), v.clone()).map_err(enc_err)?;
+                }
+            }
+            if mon.canceled() {
+                return Err(EngineError::Canceled);
+            }
+            let mut writer = enc.write_header().map_err(enc_err)?;
+            for (frame, ms) in &frames {
+                if plays.is_some() {
+                    let (num, den) = delay_fraction(*ms);
+                    writer.set_frame_delay(num, den).map_err(enc_err)?;
+                }
+                writer.write_image_data(&rows_of(frame)?).map_err(enc_err)?;
+                if mon.canceled() {
+                    return Err(EngineError::Canceled);
+                }
+            }
+            writer.finish().map_err(enc_err)?;
+        }
+        Ok(counter.count)
+    }
+}
+
+/// 表示時間（ms）を fcTL の分数（秒）にする（前の書き手と同じ）。
+fn delay_fraction(ms: u32) -> (u16, u16) {
+    if let Ok(n) = u16::try_from(ms) {
+        (n, 1000)
+    } else if let Ok(n) = u16::try_from((u64::from(ms) + 5) / 10) {
+        (n, 100)
+    } else {
+        (
+            u16::try_from((u64::from(ms) + 500) / 1000).unwrap_or(u16::MAX),
+            1,
+        )
+    }
+}
+
+/// 書いたバイト数を数える。
+struct CountingWriter<'a> {
+    inner: &'a mut dyn Write,
+    count: u64,
+}
+
+impl Write for CountingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn enc_err(e: impl std::fmt::Display) -> EngineError {
+    EngineError::Encode {
+        codec: "png-rs-enc/1".to_string(),
+        message: e.to_string(),
+    }
 }

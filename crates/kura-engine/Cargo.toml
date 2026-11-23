@@ -15,8 +15,6 @@ autotests = false
 # - blake3：すべてのダイジェスト
 # - rand_chacha：乱数（ChaCha8）。鍵は determinism::key_from_seed で自前に作るので rand_core の実装には頼らない
 # - libm：超越関数（ワークスペースで固定）
-# - png：PNG の書き出し（R2 は Cargo.lock の fdeflate・flate2・miniz_oxide の版にも依存する。コーデックのゴールデンで見張る）。
-#   読み取りは M16 段 6 から自作（codec/png_read.rs・zlib.rs）で、png クレートは段 7 で外す
 # - zune-jpeg：JPEG の読み取り。SIMD を外して（default-features = false）、どのターゲットでも同じ整数の経路にする
 # - jpeg-encoder：JPEG の書き出し（SIMD の feature は入れない）
 # - gif：GIF の読み書き（R2 は Cargo.lock の weezl の版にも依存する）
@@ -42,7 +40,6 @@ gif = { version = "=0.14.2", default-features = false, features = ["std", "raii_
 image-webp = "=0.2.4"
 nanomp3 = { version = "=0.2.0", default-features = false, features = ["alloc"] }
 jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
-png = "=0.18.1"
 rand_chacha = "=0.10.0"
 rayon.workspace = true
 resvg = { version = "=0.48.1", default-features = false, features = ["text"] }
@@ -83,6 +80,9 @@ miniz_oxide = "=0.8.9"
 # fdeflate：自作の展開の fdeflate の受け付け（`zlib::Flavor::Fdeflate`。PNG の IDAT・iCCP）の照合相手（png クレート 0.18.1 の
 # 中の展開と同じ版。M16 段 6）
 fdeflate = "=0.3.7"
+# png：前の PNG の読み書き（試験だけの `codec::png_old`）。読み取りは M16 段 6、書き出しは段 7 で自作（codec/png_read.rs・
+# png_write.rs・zlib.rs）に替えたので、照合の相手（同じ値に読む・書いたものを png クレートでも読める・大きさと速さの比べ）
+png = "=0.18.1"
 
 [lints]
 workspace = true

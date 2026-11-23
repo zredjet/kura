@@ -441,6 +441,149 @@ pub fn fuzz_inflate(data: &[u8]) -> Result<(), String> {
     }
 }
 
+/// ファズの対象（`fuzz/` の `deflate` と `tests/fuzz_smoke.rs` の `deflate`。M16 段 7）：入力を 3 つの段で圧縮し、自作の展開の
+/// 2 つの受け付け（zlib・fdeflate。fdeflate は完全な符号だけを受け付ける）で元に戻ること、入力を渡す切れ目（入力の頭の
+/// バイトから決める）によらず同じバイト列になることを確かめる。見つけたい不具合（panic・戻らない・切れ目で変わる）は `Err`。
+pub fn fuzz_deflate(data: &[u8]) -> Result<(), String> {
+    use crate::codec::zlib::{Deflate, Flavor, Inflate, Level, Options, SliceInput, deflate_zlib};
+    let inflate = |z: &[u8], flavor: Flavor| -> Result<Vec<u8>, String> {
+        let mut f = Inflate::new(
+            SliceInput::new(z),
+            Options {
+                zlib: true,
+                check_adler: true,
+                limit: data.len() as u64 + 1,
+                flavor,
+            },
+        );
+        let mut out = Vec::new();
+        loop {
+            let n = f
+                .fill(65_536)
+                .map_err(|e| format!("deflate: 展開できない（{e:?}）"))?;
+            out.extend_from_slice(&f.ready()[..n]);
+            f.consume(n);
+            if f.finished() {
+                return Ok(out);
+            }
+            if n == 0 {
+                return Err("deflate: 展開が進まない".into());
+            }
+        }
+    };
+    let r = catch_own_panic(|| -> Result<Result<(), String>, EngineError> {
+        let check = || -> Result<(), String> {
+            let step = 1 + data.first().map_or(0, |&b| usize::from(b)) * 37;
+            for level in [Level::Fast, Level::Balanced, Level::High] {
+                let whole = deflate_zlib(data, level);
+                for flavor in [Flavor::Zlib, Flavor::Fdeflate] {
+                    if inflate(&whole, flavor)? != data {
+                        return Err(format!("deflate: {level:?} が元に戻らない（{flavor:?}）"));
+                    }
+                }
+                let mut d = Deflate::new(level);
+                for piece in data.chunks(step) {
+                    d.write(piece);
+                }
+                d.finish();
+                if *d.output() != whole {
+                    return Err(format!("deflate: {level:?} が渡す切れ目で変わる"));
+                }
+            }
+            Ok(())
+        };
+        Ok(check())
+    });
+    match r {
+        Err(at) => Err(format!("deflate: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(e.to_string()),
+        Ok(Ok(r)) => r,
+    }
+}
+
+/// ファズの対象（`fuzz/` の `png_write` と `tests/fuzz_smoke.rs` の `png_write`。M16 段 7）：入力の頭のバイトで形式・大きさ・
+/// 段・フレームの数・パレット・dpi を決め、残りを画素にした値を PNG・APNG に書いて読み直し、同じ値に戻ることを確かめる。
+/// 見つけたい不具合（panic・書けない・読めない・値が変わる）は `Err`。
+pub fn fuzz_png_write(data: &[u8]) -> Result<(), String> {
+    use std::sync::Arc;
+
+    use crate::codec::{Decoder as _, Encoder as _};
+    use crate::value::{Frames, Image, ImageMeta, Palette, PixelFormat, Raster};
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0);
+    let fmt = PixelFormat::ALL[usize::from(byte(0)) % PixelFormat::ALL.len()];
+    let w = 1 + u32::from(byte(1)) % 70;
+    let h = 1 + u32::from(byte(2)) % 40;
+    let level = ["fast", "balanced", "high"][usize::from(byte(3)) % 3];
+    let count = usize::from(byte(4)) % 4;
+    let colors = 1 + usize::from(byte(5)) % 20;
+    let body = data.get(8..).unwrap_or(&[]);
+    let pixel = |i: usize| body.get(i % body.len().max(1)).copied().unwrap_or(0);
+    let n = w as usize * h as usize * fmt.bytes_per_pixel();
+    let r = catch_own_panic(|| -> Result<Result<(), String>, EngineError> {
+        let mut frames = Vec::new();
+        for f in 0..count.max(1) {
+            let mut rows: Vec<u8> = (0..n).map(|i| pixel(i + f * 7)).collect();
+            let palette = (fmt == PixelFormat::Indexed8).then(|| Palette {
+                colors: (0..colors)
+                    .map(|c| {
+                        [
+                            pixel(3 * c),
+                            pixel(3 * c + 1),
+                            pixel(3 * c + 2),
+                            pixel(c + 5),
+                        ]
+                    })
+                    .collect(),
+            });
+            if palette.is_some() {
+                for b in &mut rows {
+                    *b = (usize::from(*b) % colors) as u8;
+                }
+            }
+            frames.push((
+                Raster::from_rows(w, h, fmt, palette, &rows)?,
+                u32::from(byte(6)) * 300,
+            ));
+        }
+        let mut meta = ImageMeta::default();
+        if byte(7) % 2 == 1 {
+            meta.dpi = Some((u32::from(byte(7)) + 1, u32::from(byte(6)) + 1));
+        }
+        let v = if count == 0 {
+            let (px, _) = frames.remove(0);
+            Value::Image(Arc::new(Image { px, meta }))
+        } else {
+            Value::Frames(Arc::new(Frames::full(frames, meta, u32::from(byte(5)))?))
+        };
+        let mut out = Vec::new();
+        crate::codec::png::PngCodec.encode(
+            &v,
+            "png",
+            &serde_json::json!({ "compression": level }),
+            &mut out,
+            &NoMonitor,
+        )?;
+        let back = crate::codec::png::PngCodec.decode(
+            &mut std::io::Cursor::new(&out),
+            "png",
+            &crate::doc::DecodeOptions::default(),
+            &crate::limits::Limits::default(),
+            &NoMonitor,
+        )?;
+        if back.digest()? != v.digest()? {
+            return Ok(Err(format!(
+                "png_write: {fmt:?} {w}×{h} {level} の値が変わる"
+            )));
+        }
+        Ok(Ok(()))
+    });
+    match r {
+        Err(at) => Err(format!("png_write: 自前のコードの panic（{at}）")),
+        Ok(Err(e)) => Err(format!("png_write: 書けない・読めない（{e}）")),
+        Ok(Ok(r)) => r,
+    }
+}
+
 /// ファズの対象（`fuzz/` の `model_glb` と `tests/fuzz_smoke.rs` の `model_glb`）：glb の情報を読み、焼き込み、2 つの向きで
 /// 小さく描く（上限は `ModelLimits::fuzz`）。見つけたい不具合（自前のコードの panic・`Internal`・情報と焼き込みの食い違い・
 /// 大きさの食い違い）は `Err`、壊れた glb としてのエラー・上限は `Ok`。

@@ -191,3 +191,17 @@ path = "fuzz_targets/inflate.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "deflate"
+path = "fuzz_targets/deflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "png_write"
+path = "fuzz_targets/png_write.rs"
+test = false
+doc = false
+bench = false

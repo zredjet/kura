@@ -45,6 +45,7 @@ pub mod png;
 #[cfg(test)]
 pub(crate) mod png_old;
 pub(crate) mod png_read;
+pub(crate) mod png_write;
 pub mod psd;
 pub mod recorded;
 pub mod stream;
@@ -279,7 +280,7 @@ pub struct OpenedSource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EncodedStamp {
-    /// 使ったエンコーダ（例 `png-rs-enc/1`）。同じ書き手で書き直すときは `CodecSet::encode_bytes_with` に渡す。
+    /// 使ったエンコーダ（例 `png-kura-enc/1`）。同じ書き手で書き直すときは `CodecSet::encode_bytes_with` に渡す。
     pub codec: String,
     pub tier: Tier,
     /// 書いた形式の ID。
@@ -482,7 +483,8 @@ pub trait Decoder: Send + Sync {
 
 /// エンコーダ。
 pub trait Encoder: Send + Sync {
-    /// 識別子（例 `png-rs-enc/1`。約束の版を含む）。書くバイト列が変わる変更は版を上げる（R2。旧版は残さなくてよい）。
+    /// 識別子（例 `png-kura-enc/1`。約束の版を含む）。書くバイト列が変わる変更は版を上げる（R2。旧版は残さなくてよい。
+    /// 外した旧版は [`RETIRED_ENCODERS`] に足す）。
     fn id(&self) -> &'static str;
     fn tier(&self) -> Tier;
     /// 同じ値・同じ設定なら、どの環境でも同じバイト列を書くか（R2）。既定は固定の段なら真。固定の段でないものは真に
@@ -624,6 +626,12 @@ pub struct PinnedOptions {
     pub svg_fonts: Option<SvgFonts>,
 }
 
+/// 退いた固定のエンコーダの識別子（書くバイト列の約束を新しい識別子に譲り、このビルドにはないもの。§9.1・ADR-224）。
+/// 記録がこれらの書き手の版は、GC が作り直した値だけで照らして手放し（[`CodecSet::is_retired_encoder`]）、版に戻すは今の組の
+/// 同じ形式の書き手で書き直す（同じ値・新しいバイト列）。足すだけで、消さない。
+/// - `png-rs-enc/1`：png クレート 0.18.1 の書き出し（M16 段 7 で自作の `png-kura-enc/1` に替えた）。
+pub const RETIRED_ENCODERS: &[&str] = &["png-rs-enc/1"];
+
 /// 形式ごとに、段の順に試すコーデックの組。
 #[derive(Clone, Default)]
 pub struct CodecSet {
@@ -718,6 +726,12 @@ impl CodecSet {
     /// 識別子でエンコーダを探す。
     pub fn encoder_by_id(&self, id: &str) -> Option<&Arc<dyn Encoder>> {
         self.encoders.iter().find(|e| e.id() == id)
+    }
+
+    /// 退いた固定のエンコーダ（[`RETIRED_ENCODERS`]）で、この組にないものか。記録がこの書き手の版は、GC が値だけで照らして
+    /// 手放す（バイト列は比べない）。この環境にないだけの書き手（Platform・External）は退いたものではない（今までどおり次回へ）。
+    pub fn is_retired_encoder(&self, id: &str) -> bool {
+        RETIRED_ENCODERS.contains(&id) && self.encoder_by_id(id).is_none()
     }
 
     /// デコーダを足す（Platform・External。段の順に並べ直す。同じ段なら足した順）。同じ識別子は断る。
@@ -1664,12 +1678,30 @@ mod tests {
             ))))
             .unwrap();
         assert_eq!(with_platform.decode_work_bytes("heic", &rgb), 2 * v);
-        // 書き：PNG は 3 倍（fast は 4 倍）、APNG は 1 フレームぶん
-        assert_eq!(set.encode_work_bytes("png", &rgb, &json!({})), 3 * v);
+        // 書き：PNG は行の帯ずつ流して書くので、値の大きさによらず幅に比例する分だけ（M16 段 7）。APNG は 1 フレームぶん
+        for c in ["fast", "balanced", "high"] {
+            let o = json!({ "compression": c });
+            let level = match c {
+                "fast" => crate::codec::zlib::Level::Fast,
+                "high" => crate::codec::zlib::Level::High,
+                _ => crate::codec::zlib::Level::Balanced,
+            };
+            assert_eq!(
+                set.encode_work_bytes("png", &rgb, &o),
+                png_write::work_bytes(level, 600, 400, 3)
+            );
+        }
+        // 高さによらず上限で止まる（流して書く）
+        let tall = |h| Shape::Image {
+            w: Dim::Exact(600),
+            h: Dim::Exact(h),
+            fmt: PixelFormat::Rgb8,
+        };
         assert_eq!(
-            set.encode_work_bytes("png", &rgb, &json!({ "compression": "fast" })),
-            4 * v
+            set.encode_work_bytes("png", &tall(40_000), &json!({})),
+            set.encode_work_bytes("png", &tall(400_000), &json!({}))
         );
+        assert!(set.encode_work_bytes("png", &tall(40_000), &json!({})) < 12 << 20);
         let apng = Shape::Frames {
             count: Dim::Exact(10),
             w: Dim::Exact(600),
@@ -1677,7 +1709,10 @@ mod tests {
             fmt: PixelFormat::Rgb8,
             full: crate::shape::Fullness::Full,
         };
-        assert_eq!(set.encode_work_bytes("png", &apng, &json!({})), 3 * v);
+        assert_eq!(
+            set.encode_work_bytes("png", &apng, &json!({})),
+            set.encode_work_bytes("png", &rgb, &json!({}))
+        );
         // JPEG：画素あたり 行 3 ＋ 書いた列 6（プログレッシブはさらに 9）。透明を持ちうる形式は RGBA8 の行
         let px = 600 * 400;
         assert_eq!(set.encode_work_bytes("jpeg", &rgb, &json!({})), 9 * px);
@@ -1699,10 +1734,11 @@ mod tests {
             14_400 + (8 << 20)
         );
         assert_eq!(set.encode_work_bytes("wav", &audio, &json!({})), 8_000);
-        // アンカー：読み直す値の 1 倍（値を含めて 2 倍）。APNG は 1 フレームの PNG（fast）の 4 倍と比べて大きいほう
-        assert_eq!(anchor::work_bytes(&rgb), v);
+        // アンカー：読み直す値の 1 倍（値を含めて 2 倍）と、PNG（fast）の作業領域の大きいほう
+        let png_fast = set.encode_work_bytes("png", &rgb, &json!({ "compression": "fast" }));
+        assert_eq!(anchor::work_bytes(&rgb), v.max(png_fast));
         assert_eq!(anchor::work_bytes(&audio), 8_000);
-        assert_eq!(anchor::work_bytes(&apng), 10 * v);
+        assert_eq!(anchor::work_bytes(&apng), (10 * v).max(png_fast));
         let short = Shape::Frames {
             count: Dim::Exact(2),
             w: Dim::Exact(600),
@@ -1710,7 +1746,7 @@ mod tests {
             fmt: PixelFormat::Rgb8,
             full: crate::shape::Fullness::Full,
         };
-        assert_eq!(anchor::work_bytes(&short), 4 * v);
+        assert_eq!(anchor::work_bytes(&short), (2 * v).max(png_fast));
     }
 
     /// 書き出しの設定は厳しく確かめる（知らないキー・型の違い・範囲の外はエラー）。正規の形に直してから確かめるので、24.0 は 24 と同じ。
@@ -1989,8 +2025,31 @@ mod tests {
         assert!(set.decoder_by_id("pinned-dec/1").is_some());
         let pinned = CodecSet::pinned();
         assert!(pinned.decoder_by_id("png-rs-dec/1").is_some());
-        assert!(pinned.encoder_by_id("png-rs-enc/1").is_some());
-        assert!(pinned.decoder_by_id("png-rs-enc/1").is_none());
+        assert!(pinned.encoder_by_id("png-kura-enc/1").is_some());
+        assert!(pinned.decoder_by_id("png-kura-enc/1").is_none());
+    }
+
+    /// 退いたエンコーダは固定の組になく、同じ形式を書く今の書き手がある（GC は値で照らし、版に戻すはその書き手で書く）。
+    #[test]
+    fn retired_encoders_are_gone_and_have_successors() {
+        let pinned = CodecSet::pinned();
+        for id in RETIRED_ENCODERS {
+            assert!(pinned.encoder_by_id(id).is_none(), "{id}");
+            assert!(pinned.is_retired_encoder(id), "{id}");
+        }
+        let shape = Shape::Image {
+            w: Dim::Exact(1),
+            h: Dim::Exact(1),
+            fmt: crate::value::PixelFormat::Rgba8,
+        };
+        assert!(
+            pinned
+                .encoder("png", &shape)
+                .is_some_and(|e| e.id() == "png-kura-enc/1")
+        );
+        // この組にないだけの書き手は退いたものではない
+        assert!(!pinned.is_retired_encoder("gone-png-enc/9"));
+        assert!(!pinned.is_retired_encoder("png-kura-enc/1"));
     }
 
     /// 同じ識別子のコーデックは重ねて登録できない（記録の識別子で読み直すときに選べなくなるため）。
@@ -2398,14 +2457,14 @@ mod tests {
         let json = serde_json::to_value(&enc).unwrap();
         assert!(json.get("reproducible").is_none() && json.get("env").is_none());
         let stage8 = format!(
-            r#"{{"codec":"png-rs-enc/1","tier":"pinned","format":"png","options":{{}},"bytes":{},"fileDigest":"{}"}}"#,
+            r#"{{"codec":"png-kura-enc/1","tier":"pinned","format":"png","options":{{}},"bytes":{},"fileDigest":"{}"}}"#,
             enc.bytes, enc.file_digest
         );
         assert_eq!(serde_json::to_string(&enc).unwrap(), stage8);
         assert_eq!(
             String::from_utf8(crate::digest::canonical(&enc).unwrap()).unwrap(),
             format!(
-                r#"{{"bytes":{},"codec":"png-rs-enc/1","fileDigest":"{}","format":"png","options":{{}},"tier":"pinned"}}"#,
+                r#"{{"bytes":{},"codec":"png-kura-enc/1","fileDigest":"{}","format":"png","options":{{}},"tier":"pinned"}}"#,
                 enc.bytes, enc.file_digest
             )
         );
@@ -2572,7 +2631,7 @@ mod tests {
         let before = alac_last.lock().unwrap().unwrap();
         for (id, value, format) in [
             ("missing-enc/1", &v, "m4a"),
-            ("png-rs-enc/1", &v, "m4a"),
+            ("png-kura-enc/1", &v, "m4a"),
             ("fake-alac-enc/1", &v, "mp3"),
             ("fake-alac-enc/1", &hi, "m4a"),
             ("png-rs-dec/2", &v, "m4a"),

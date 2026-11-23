@@ -1,7 +1,7 @@
 //! コーデックのゴールデン（docs/editing.md §8.5）。固定のエンコーダが書くバイト列（R2）と、固定のデコーダが読む値（R1）を凍結する。
 //!
 //! - ファイルは `goldens-codecs/<コーデックの ID の / を @ にしたもの>.jsonl`。ID は読み取り（`-dec`）と書き出し（`-enc`）で別。
-//!   - `png-rs-enc@1.jsonl`：1 行に `{"decoder","file","format","input","name","options","value"}`。
+//!   - `png-kura-enc@1.jsonl`：1 行に `{"decoder","file","format","input","name","options","value"}`。
 //!     file は書いたバイト列のダイジェスト、value はそれを `decoder` で読み直した値のダイジェスト。
 //!     読み直しのデコーダが値の再現を約束しない（`reproducible()` が偽）行は value を書かず、
 //!     書いたバイト列（file）と、読み直した形（長さ・レート・チャンネル）が元の値と同じことだけを照らす。値を持たないのに
@@ -12,7 +12,8 @@
 //!   - `png-rs-dec@1.jsonl`：1 行に `{"name","source","value"}`。下の層で組んだファイル（source）を読んだ値のダイジェスト。
 //! - **追記だけ**（scripts/check-goldens-append-only.sh が見る）。
 //!   - 書くバイト列が変わったら、エンコーダの約束の版を上げる（`-enc/1` → `-enc/2`）。旧版のエンコーダは残さなくてよい
-//!     （そのファイルは照らさなくなる）。png クレートや依存（fdeflate・flate2・miniz_oxide）を上げたときも、ここで気づく。
+//!     （そのファイルは照らさなくなる。M16 段 7 の `png-rs-enc@1.jsonl`）。外した旧版の識別子は `codec::RETIRED_ENCODERS` に
+//!     足す。依存（gif の weezl・jpeg-encoder など）を上げたときも、ここで気づく。
 //!   - 読む値は変えない。どうしても変えるなら、デコーダの約束の版を上げ、旧版を `CodecSet::add_legacy_decoder` で残す。
 //!     デコーダのファイルは、その ID のデコーダ（今の版か旧版）がないと失敗にする（作り直しが記録の識別子で読むため。§9.1）。
 //! - 足りない行は `KURA_BLESS=1 cargo test -p kura-engine --test codec_golden` で足せる。

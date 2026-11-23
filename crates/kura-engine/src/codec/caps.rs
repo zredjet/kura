@@ -265,7 +265,7 @@ mod tests {
         let png = caps(&set, "png");
         assert_eq!(png.read_reproducible(), Some(true));
         let w = png.default_writer().expect("png を書ける");
-        assert_eq!(w.codec, "png-rs-enc/1");
+        assert_eq!(w.codec, "png-kura-enc/1");
         assert_eq!(w.kinds, [ValueKind::Image, ValueKind::Frames]);
         assert!(w.meta.lossless && w.meta.icc && w.meta.alpha == AlphaCaps::Full);
         let jpeg = caps(&set, "jpeg");

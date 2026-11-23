@@ -148,6 +148,25 @@ fn adler32_matches_the_check_values() {
             "{cut}"
         );
     }
+    // 乱数の中身・いろいろな長さと切れ目（16 バイトずつ足す道と 1 バイトずつの残り）
+    let mut rng = crate::determinism::rng(31);
+    let data: Vec<u8> = (0..200_000).map(|_| rng.next_u32() as u8).collect();
+    for len in (0..70).chain([5_535, 5_536, 5_537, 11_104, 199_999]) {
+        let d = &data[..len];
+        let (mut a, mut b) = (1u64, 0u64);
+        for &x in d {
+            a = (a + u64::from(x)) % 65_521;
+            b = (b + a) % 65_521;
+        }
+        let naive = ((b << 16) | a) as u32;
+        assert_eq!(adler32(d), naive, "{len}");
+        let cut = rng.next_u32() as usize % (len + 1);
+        assert_eq!(
+            adler32_update(adler32(&d[..cut]), &d[cut..]),
+            naive,
+            "{len} {cut}"
+        );
+    }
 }
 
 /// miniz_oxide の全部の水準（0 は stored のブロック、1 は固定のハフマンが多い）で圧縮したものを、入力の切り方と出力の取り方を
@@ -734,5 +753,24 @@ fn asking_beyond_the_hint_still_progresses() {
             z.consume(n);
         }
         assert!(out == data, "{level}");
+    }
+}
+
+/// Adler-32 の速さ（手で回す）。
+#[test]
+#[ignore]
+#[allow(clippy::disallowed_methods)]
+fn adler32_speed() {
+    let data: Vec<u8> = (0..64u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    for piece in [64usize << 20, 4097, 257] {
+        let s = std::time::Instant::now();
+        let mut a = 1;
+        for c in data.chunks(piece) {
+            a = adler32_update(a, c);
+        }
+        let t = s.elapsed().as_secs_f64();
+        eprintln!("ZZADLER {piece} {:.1} GB/s {a:08x}", 64.0 / 1024.0 / t);
     }
 }
