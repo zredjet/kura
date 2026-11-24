@@ -415,6 +415,39 @@ describe('裏の仕事の頼みの連鎖', () => {
     expect(idle).toHaveLength(5);
   });
 
+  it('流し解きの間（solving）は、ドラッグ中でも手が止まって 150 ms で work: true を頼み、応えのたびに続ける。再生の頼みにも work を載せる（M17 段 3）', () => {
+    const { c, clock, idle } = setup();
+    const solving = (p: number) =>
+      audioView({
+        work: true,
+        solving: p,
+        peaks: { rev: 3, changed: { type: 'spans', spans: [] } },
+      });
+    c.setInteracting(true);
+    c.applyView(solving(0));
+    clock.advance(WAVE_IDLE_MS);
+    expect(idle).toHaveLength(1);
+    expect(idle[0]).toEqual([expect.objectContaining({ work: true, interacting: true }), true]);
+    c.applyView(solving(0.3), true);
+    clock.advance(0);
+    expect(idle).toHaveLength(2);
+    // ドラッグの手が出たら連鎖をやめ、止まって 150 ms から（操作中のまま）
+    c.noteSent(false);
+    c.applyView(solving(0), false);
+    clock.advance(WAVE_IDLE_MS);
+    expect(idle).toHaveLength(3);
+    expect(idle[2]?.[0].work).toBe(true);
+    // 再生の先読みの頼みも流し解きを進める
+    c.applyView(solving(0.5), true);
+    c.setPlaybackSpans([{ start: 0, end: CHUNK }]);
+    expect(idle.at(-1)).toEqual([expect.objectContaining({ work: true }), false]);
+    // 解き終えたら（solving が null・work が偽）、操作中は頼まない
+    c.applyView(audioView({ work: false, solving: null }), true);
+    const n = idle.length;
+    clock.advance(WAVE_IDLE_MS * 3);
+    expect(idle).toHaveLength(n);
+  });
+
   it('work が偽になったら止まる（ラウドネスの仕事が終わったときも）', () => {
     const { c, clock, idle } = started();
     c.applyView(done(), true);

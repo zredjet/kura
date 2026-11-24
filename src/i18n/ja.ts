@@ -1328,6 +1328,8 @@ export const ja = {
       cursorAt: (time: string, samples: string) => `${time}（${samples} 標本）`,
       selectionAt: (from: string, to: string, length: string) => `${from} – ${to}（${length}）`,
       peaksPending: '波形を更新しています…',
+      /** 長い音声の流し解きの間（M17 段 3。表示は前の内容のまま、新しい音に替わるまでの進み）。 */
+      solving: (percent: string) => `変更を反映しています… ${percent}`,
       peaksBuilding: '波形を作っています…',
       timeField: (label: string) => `${label}（分:秒.ミリ秒）`,
       badTime: '「1:02.345」の形で入れてください',

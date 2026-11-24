@@ -78,6 +78,7 @@ export function AudioStatus() {
   const span = useAudioStore((s) => s.window.span);
   const pending = useAudioStore((s) => s.peaksPending);
   const building = useAudioStore((s) => s.peaksBuilding);
+  const solving = useAudioStore((s) => s.view?.solving ?? null);
   if (!open) return null;
   const where =
     selection && selection.end > selection.start
@@ -91,10 +92,16 @@ export function AudioStatus() {
     <>
       {/* 左下：カーソル・選択の時刻。波形の段を作り直している間の一言はその上の行（カプセルと重ならない幅に収める） */}
       <div className={styles.corner}>
-        {(pending || building) && (
+        {solving !== null ? (
           <span className={`${styles.cornerPill} ${styles.cornerStatus}`} aria-live="polite">
-            {building ? t.peaksBuilding : t.peaksPending}
+            {t.solving(`${Math.floor(solving * 100)}%`)}
           </span>
+        ) : (
+          (pending || building) && (
+            <span className={`${styles.cornerPill} ${styles.cornerStatus}`} aria-live="polite">
+              {building ? t.peaksBuilding : t.peaksPending}
+            </span>
+          )
         )}
         <span className={styles.cornerPill} aria-live="off">
           {where}

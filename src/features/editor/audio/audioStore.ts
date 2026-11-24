@@ -78,6 +78,11 @@ export interface AudioViewSummary {
   valid: EditSpanDto[];
   sourceMap: EditSourcePieceDto[] | null;
   nodes: EditAudioNodeDto[];
+  /**
+   * 流し解きの進み（0〜1。M17 段 3）。null でなければ、この表示は頭の文書より古い（最後に公開した rev の計画で描いた
+   * もの）。手元の値・枠をこの表示から戻さず、解き終えた表示を待つ。
+   */
+  solving: number | null;
 }
 
 /** 切り詰めの枠（T）。 */
@@ -173,6 +178,7 @@ export function summarizeAudioView(view: EditAudioView): AudioViewSummary {
     valid: view.valid,
     sourceMap: view.sourceMap,
     nodes: view.nodes,
+    solving: view.solving,
   };
 }
 
@@ -525,6 +531,9 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
     applyView(view, info) {
       if (view.type !== 'audio') return;
       checkHook?.shown?.(info.seq, view);
+      // 流し解きの間の表示（頭より古い。M17 段 3）：波形・PCM・再生は当てるが、手元の値・切り詰めの枠・計りの頼みは
+      // この表示から決めない（解き終えた表示で決める）
+      const stale = view.solving !== null;
       const prev = rt.lastView;
       rt.lastView = view;
       const s = useAudioStore.getState();
@@ -556,7 +565,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       // 切り詰めの枠：その操作の入力（仮に無効にした結果）を表示し終えたら、その表示の印と長さで枠を置く。外した表示
       // でも写せなければ、枠を出さずに引数パネルで直すよう知らせる（仮の値は結果を受け終えてから捨てる）
       const trim = s.trim;
-      if (trim && trim.bounds === null && (!trim.previewed || info.provisional)) {
+      if (!stale && trim && trim.bounds === null && (!trim.previewed || info.provisional)) {
         const framed = trimFrameOf(trim, view.nodes, view.frames);
         if (framed) {
           rt.patch.trim = framed;
@@ -570,8 +579,8 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
         }
       }
 
-      // ドラッグの手元の値は、仮でない結果が届いたらやめる（文書の値を出す）
-      if (!info.provisional && !rt.dragging) rt.patch.local = null;
+      // ドラッグの手元の値は、仮でない結果が届いたらやめる（文書の値を出す。古い表示では残す）
+      if (!stale && !info.provisional && !rt.dragging) rt.patch.local = null;
     },
     onFailed() {
       // 表示できなかった：前の表示のまま（裏の仕事の頼みの連鎖はやめる）
@@ -658,7 +667,8 @@ function applyLoudness(
     rt.measuringFor = null;
   } else {
     rt.patch.loudnessFresh = false;
-    if (!info.provisional) {
+    // 流し解きの間の表示は頭より古いので、その出力の計りは頼まない（解き終えた表示で頼む）
+    if (!info.provisional && view.solving === null) {
       // 計っていると分かったあとに頼んだ表示が、今の出力を計っていない：計りかけを捨てたので頼み直す
       if (l.type === 'idle' && rt.measuringFor === id && info.seq > rt.measuringAfter) {
         rt.measuringFor = null;
@@ -794,6 +804,8 @@ function followLoop(rt: AudioRuntime): void {
   if (!player.playing || !player.looping || rt.dragging) return;
   const s = useAudioStore.getState();
   if (s.local && 'loop' in s.local) return;
+  // 流し解きの間の表示（頭より古い）のループ点には合わせない
+  if (s.view?.solving != null) return;
   const loop = s.view?.loop ?? null;
   if (!loop || loop.end <= loop.start) {
     stopPlayback();

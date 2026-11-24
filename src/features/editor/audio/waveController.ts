@@ -304,6 +304,8 @@ export class WaveController {
   private overlay: WaveOverlay = EMPTY_OVERLAY;
   private extraSpans: EditSpanDto[] = [];
   private interacting = false;
+  /** 頭の文書の流し解きを裏で進めている（表示は頭より古い。M17 段 3）：操作中でも、手が止まったら裏の仕事を頼む。 */
+  private solving = false;
   private focusNode: number | null = null;
   private frameId: number | null = null;
   private idleId: number | null = null;
@@ -433,17 +435,21 @@ export class WaveController {
       );
     if (same) return;
     this.extraSpans = [...spans];
-    // 再生の頼みを先にする（裏の仕事の続きは、また 150 ms から）
+    // 再生の頼みを先にする（裏の仕事の続きは、また 150 ms から）。流し解きの間は、再生の頼みでも流し解きを進める（再生が
+    // 続くと連鎖が切れ続けるため）
     this.breakChain();
-    this.options.onIdle?.(this.viewport(), false);
+    this.options.onIdle?.({ ...this.viewport(), work: this.solving }, false);
   }
 
   /** 操作中（ドラッグの途中。波形の段を直さない・裏の仕事をしない）。 */
   setInteracting(on: boolean): void {
     if (this.interacting === on) return;
     this.interacting = on;
-    if (on) this.stopChain();
-    else this.scheduleIdle();
+    if (on) {
+      this.stopChain();
+      // 流し解きは操作中でも進める（押したまま止めて聴けば新しい音に替わる）
+      if (this.solving) this.scheduleIdle();
+    } else this.scheduleIdle();
   }
 
   /**
@@ -649,6 +655,7 @@ export class WaveController {
       this.shape.frames !== shape.frames;
     this.shape = shape;
     this.view = view;
+    this.solving = view.solving !== null;
     // 変わった区間の PCM を捨てる（読んでいる途中のものも古い）
     if (view.changed.type === 'all' || view.changed.spans.length > 0) {
       this.pcm.invalidate(view.changed);
@@ -700,7 +707,7 @@ export class WaveController {
     this.idleId = this.scheduler.later(() => {
       this.idleId = null;
       if (this.disposed) return;
-      if (this.interacting) return;
+      if (this.interacting && !this.solving) return;
       const vp = this.viewport();
       if (this.workWanted) {
         // 送るとすぐ核の `sent` が `noteSent` を呼ぶので、先に連鎖に入る
@@ -718,7 +725,7 @@ export class WaveController {
     this.chainId = this.scheduler.later(() => {
       this.chainId = null;
       if (this.disposed || !this.chaining) return;
-      if (!this.workWanted || this.interacting) {
+      if (!this.workWanted || (this.interacting && !this.solving)) {
         this.chaining = false;
         return;
       }

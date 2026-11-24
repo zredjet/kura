@@ -192,6 +192,17 @@ describe('音声エディタの画面', () => {
     expect(screen.getByText(a.selectionAt('0:00.000', '0:00.500', '0:00.500'))).toBeInTheDocument();
   });
 
+  it('流し解きの間は「変更を反映しています… n%」を波形の札より先に出す（M17 段 3）', () => {
+    openState();
+    const view = useAudioStore.getState().view;
+    useAudioStore.setState({
+      peaksPending: true,
+      view: view ? { ...view, solving: 0.426 } : null,
+    });
+    render(<Editor />);
+    expect(screen.getByText(a.solving('42%'))).toHaveAttribute('aria-live', 'polite');
+    expect(screen.queryByText(a.peaksPending)).toBeNull();
+  });
   it('右パネル：ラウドネス（値・目標との差・そろえる）・出力の形式・失うもの', () => {
     openState([], [{ port: { node: 0, port: 0 }, format: { type: 'to', format: 'mp3' } }]);
     useAudioStore.setState({

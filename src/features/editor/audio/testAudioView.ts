@@ -49,9 +49,10 @@ export function audioView(over: AudioViewOver = {}): EditAudioView {
     warnings: [],
     drawnNodes: 0,
     ms: 1,
+    solving: null,
     ...over,
     peaks,
-  };
+  } as EditAudioView;
 }
 
 /** タイルのバイト列（`value` を全ビンの [−value, value] に）。 */

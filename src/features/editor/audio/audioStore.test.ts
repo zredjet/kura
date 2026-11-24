@@ -363,6 +363,27 @@ describe('音声のアダプタ', () => {
     });
   });
 
+  it('流し解きの間の表示（頭より古い。M17 段 3）では、手元の値を捨てず・計りを頼まない。解き終えた表示で捨てる', async () => {
+    vi.mocked(measureEdit).mockClear();
+    await open();
+    const asked = vi.mocked(measureEdit).mock.calls.length;
+    setAudioLocal({ fadeIn: 1234 });
+    const stale = view({ rev: 1, samplesId: 'ffeeddccbbaa9988', solving: 0.2, work: true });
+    vi.mocked(stepEdit).mockResolvedValueOnce(
+      result(stale, { status: status({ rev: 2, head: 2 }) }),
+    );
+    pushEditorSteps([{ type: 'undo' }]);
+    await flush();
+    expect(useAudioStore.getState().local).toEqual({ fadeIn: 1234 });
+    expect(useAudioStore.getState().view?.solving).toBe(0.2);
+    expect(vi.mocked(measureEdit).mock.calls.length).toBe(asked);
+    vi.mocked(stepEdit).mockResolvedValueOnce(result(view({ rev: 2, solving: null })));
+    pushEditorSteps([{ type: 'redo' }]);
+    await flush();
+    expect(useAudioStore.getState().local).toBeNull();
+    expect(useAudioStore.getState().view?.solving).toBeNull();
+  });
+
   it('断られた手のあとは、ドラッグの手元の値をやめて文書の値を出す', async () => {
     await open();
     setAudioLocal({ fadeIn: 1234 });
