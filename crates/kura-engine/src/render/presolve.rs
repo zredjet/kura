@@ -10,6 +10,8 @@
 //!   持つ（後ろの仕事の窓を描くとき、上流の結果を窓の中で解き直さない。キャッシュから追い出されても同じ）。
 //! - 入力に直結した申告（描画の中では値に `run` を当てる）も流して解く（E35 で同じ値）。
 //! - 仕事を作った計画と違う計画で進めると誤り（鍵を引き直して照らす）。
+//! - 内部のポート（ノードの入力 0・出力）を流す前に解くもの（[`Engine::missing_port_solves`]。M17 段 4）も同じ走査を、出力では
+//!   なくそのポートから行う（`Engine::stream_node_port` は、これが空でなければ錠の中で全体を解かずに断る）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, PoisonError};
@@ -17,6 +19,7 @@ use std::sync::{Mutex, PoisonError};
 use super::area::{PassCx, Presolved};
 use super::audio::{Solving, StreamStats, port_analysis_key, start_solving};
 use super::cache::{Fingerprint, FingerprintedInput, NodeCache};
+use super::port::{PortSide, node_port};
 use super::region::Spans;
 use super::{Engine, Plan, bad_input};
 use crate::analysis::{AnyOutput, Need};
@@ -392,6 +395,37 @@ impl Engine {
         cache: &NodeCache,
         output: OutputId,
     ) -> Result<MissingSolves, EngineError> {
+        self.check_solve_plan(plan, inputs)?;
+        let Some((_, from, _, _)) = plan.outputs.iter().find(|o| o.0 == output) else {
+            return Err(bad_input(format!("出力 {} はありません", output.0)));
+        };
+        let cx = PassCx::new(self, plan, inputs)?;
+        self.missing_from(&cx, cache, *from)
+    }
+
+    /// ノード `node` の入力 0・出力のポート（`side`）を流すのに要る申告した解析のうち、キャッシュにないもの（
+    /// [`Engine::missing_solves`] と同じ走査を、出力ではなくそのポートから。`Engine::stream_node_port` はこれが空でなければ
+    /// 断るので、先にこの仕事を [`PresolveJob`] で解く）。キャッシュの使った順は変えない。
+    pub fn missing_port_solves(
+        &self,
+        plan: &Plan,
+        inputs: &BTreeMap<InputId, FingerprintedInput>,
+        cache: &NodeCache,
+        node: NodeId,
+        side: PortSide,
+    ) -> Result<MissingSolves, EngineError> {
+        self.check_solve_plan(plan, inputs)?;
+        let from = node_port(plan, node, side)?;
+        let cx = PassCx::new(self, plan, inputs)?;
+        self.missing_from(&cx, cache, from)
+    }
+
+    /// 解く仕事を数える口の前の確かめ（このエンジンの計画・入力の数）。
+    fn check_solve_plan(
+        &self,
+        plan: &Plan,
+        inputs: &BTreeMap<InputId, FingerprintedInput>,
+    ) -> Result<(), EngineError> {
         if plan.engine != self.token {
             return Err(EngineError::Internal(
                 "別のエンジンで作った計画です（キャッシュの指紋が登録表に縛られないため）".into(),
@@ -400,13 +434,21 @@ impl Engine {
         if inputs.len() != plan.inputs.len() {
             return Err(bad_input("入力の数が計画と違います"));
         }
-        let Some((_, from, _, _)) = plan.outputs.iter().find(|o| o.0 == output) else {
-            return Err(bad_input(format!("出力 {} はありません", output.0)));
-        };
-        let cx = PassCx::new(self, plan, inputs)?;
-        // 出力に届くノード
+        Ok(())
+    }
+
+    /// ポート `from` の値を描くのに要る申告した解析のうち、キャッシュにないもの（`from` に届くノードを計画の順に見る。
+    /// [`Engine::missing_solves`]・[`Engine::missing_port_solves`] と、`Engine::stream_node_port` の判定が共有する走査）。
+    pub(super) fn missing_from(
+        &self,
+        cx: &PassCx<'_>,
+        cache: &NodeCache,
+        from: PortRef,
+    ) -> Result<MissingSolves, EngineError> {
+        let plan = cx.plan;
+        // ポートに届くノード
         let mut reach = BTreeSet::new();
-        let mut stack = vec![*from];
+        let mut stack = vec![from];
         while let Some(p) = stack.pop() {
             let PortRef::Node { id } = p else { continue };
             if !reach.insert(id) {
@@ -425,7 +467,7 @@ impl Engine {
                         "解析する入力のポートがありません".into(),
                     ));
                 };
-                let key = port_analysis_key(&cx, r, need)?;
+                let key = port_analysis_key(cx, r, need)?;
                 if !seen.insert(key) {
                     continue;
                 }
