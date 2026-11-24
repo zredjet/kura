@@ -176,11 +176,11 @@
   --eq-band: color-mix(in srgb, var(--text-tertiary) 70%, transparent);          /* 各バンドの曲線 */
   --eq-band-fill: color-mix(in srgb, var(--accent) 16%, transparent);            /* 選んだバンドが効く帯 */
   --gr-fill: color-mix(in srgb, var(--accent) 18%, transparent);                 /* ゲインリダクションの重ね */
-  --spectro-0: #0B0B0D;  /* スペクトログラムの色の表（弱い → 強い）。メディアの表示として扱い、アクセントを含めない無彩色の明るさの段 */
+  --spectro-0: var(--bg-media);  /* スペクトログラムの色の表（弱い → 強い）。メディアの表示として扱い、アクセントを含めない無彩色の明るさの段 */
   --spectro-1: #26262B;
   --spectro-2: #55555E;
-  --spectro-3: #A3A3AC;
-  --spectro-4: #F4F4F6;
+  --spectro-3: var(--text-tertiary);
+  --spectro-4: var(--text-primary);
   --note: var(--warning);  /* この案の注釈の番号（画面の部品ではない） */
 }
 
@@ -274,7 +274,7 @@ button { font: inherit; color: inherit; border: 0; background: none; padding: 0;
 .switch.sm.on::after { left: 12px; }
 .add { display: flex; align-items: center; justify-content: center; height: 32px; border-radius: var(--radius-md); border: 1px dashed var(--stroke-dashed); color: var(--text-secondary); font-size: var(--text-sm); }
 .sep { height: 1px; background: var(--stroke-1); margin: 0 var(--space-1-5); }
-.params { flex: 1; display: flex; flex-direction: column; gap: var(--space-3); padding: 0 var(--space-1-5); min-height: 0; overflow: hidden; -webkit-mask-image: linear-gradient(180deg, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(180deg, #000 calc(100% - 28px), transparent); }
+.params { flex: 1; display: flex; flex-direction: column; gap: var(--space-3); padding: 0 var(--space-1-5); min-height: 0; overflow: hidden; -webkit-mask-image: linear-gradient(180deg, var(--text-primary) calc(100% - 28px), transparent); mask-image: linear-gradient(180deg, var(--text-primary) calc(100% - 28px), transparent); }
 .fixed { flex: none; display: flex; flex-direction: column; gap: var(--space-2); padding: 0 var(--space-1-5); font-size: var(--text-sm); color: var(--text-secondary); }
 .fixed .sep { margin: 0 0 var(--space-1); }
 .phead { display: flex; align-items: baseline; justify-content: space-between; }
@@ -321,14 +321,14 @@ tr[data-off] .bn { border-style: dashed; color: var(--text-tertiary); }
   <h2>1. スペクトルでイコライザを直す（M17）</h2>
   <div class="fit"><div class="win"></div></div>
   <ol class="notes">
-    <li><span class="num">1</span><span><b>表示の切り替え</b>（D4）。上部の中央に「波形｜スペクトル｜スペクトログラム」（⌘1・⌘2・⌘3）。イコライザを足したとき・波形を見ていてイコライザを選んだときにスペクトルへ替わる。ADR-177 の改訂。左の名前と情報の行は切り替えの左端までで省略し、「未保存」は名前の横の印にする。</span></li>
+    <li><span class="num">1</span><span><b>表示の切り替え</b>（D4）。上部の中央に「波形｜スペクトル｜スペクトログラム」（⌘1・⌘2・⌘3。表示のメニューにも足す）。イコライザを足したとき・波形を見ていてイコライザを選んだときにスペクトルへ替わる。ADR-177 の改訂。左の名前と情報の行は切り替えの左端までで省略し、「未保存」は名前の横の印にする（画像エディタも揃える）。</span></li>
     <li><span class="num">2</span><span><b>細い波形の帯</b>。曲の全体・選択・再生位置を残し、選択はここで行う。切り詰め・フェード・ループの道具（T・F・R）を押すと波形に戻る。止まっているときのアナライザは、この選択の平均。</span></li>
     <li><span class="num">3</span><span><b>アナライザ</b>（D3）。後（塗り）・前（実線）・最大の保持（点線）を線の形で分ける。再生中は鳴っている位置、止まっていれば選択の平均。左の目盛りがイコライザの dB、右がスペクトルの dBFS。</span></li>
     <li><span class="num">4</span><span><b>曲線</b>。合成の曲線は柿色。選んだバンドだけ細い曲線と効く帯の塗りを出し、ほかのバンドの曲線はポインタを載せたときだけ。左右の小さな印のドラッグで Q。オフのバンドは点線の点で、合成に入らない。</span></li>
     <li><span class="num">5</span><span><b>山をつかむ</b>。ポインタの近くのスペクトルの山に印を出し、そこからドラッグするとその周波数にベルができる。ホバーで周波数・音名とセント・スペクトルと曲線の dB。</span></li>
     <li><span class="num">6</span><span><b>右パネルの引数</b>。位相（最小｜直線）・出力・バンドの表（行はボタン。キーと読み上げの道）・［＋ バンドを足す］・選んだバンドの欄・［ソロで聞く］。値の欄は右パネルだけ。下に固定のラウドネスと出力の形式を残し、引数の欄はその上でスクロールする。</span></li>
     <li><span class="num">7</span><span><b>試聴だけの重ね</b>（D9）。聞き比べの隣に「音量を合わせて聞く」（大きいほうを下げる）、カプセルの下の段に「一時的に外して聞く」。どちらも音だけに効き、文書に入らず、取り消しの外。</span></li>
-    <li><span class="num">8</span><span><b>キーと色</b>。面にフォーカスがあるとき ←→ で周波数・↑↓ で利得・⇧ で大きく・⌥ で細かく・⌫ でバンドを消す・Q を押している間ソロ。アクセントは合成の曲線と選んだバンドだけで、バンドごとに色を変えない。</span></li>
+    <li><span class="num">8</span><span><b>キーと色</b>。面にフォーカスがあるとき ←→ で周波数・↑↓ で利得・⇧ で大きく・⌥ で細かく・⌫ でバンドを消す・[ ] で前・次のバンド・Q を押している間ソロ。アクセントは合成の曲線と選んだバンドだけで、バンドごとに色を変えない。</span></li>
   </ol>
 </section>
 
@@ -426,8 +426,9 @@ function shell({ view, meta, stage, panel, row2, hint, left, right, badges }) {
     </div>
     <aside class="panel">${panel}
       <div class="fixed"><div class="sep"></div>
-        <div class="frow" style="padding-top:var(--space-1)"><b style="color:var(--text-primary);font-size:var(--text-md)">ラウドネス</b><span class="field sel" style="min-width:96px">目標 −16 LUFS</span></div>
-        <div style="font-size:var(--text-md)">−14.2 LUFS（LRA 6.1 LU） · −1.0 dBTP</div>
+        <div class="frow" style="padding-top:var(--space-1)"><b style="color:var(--text-primary);font-size:var(--text-md)">ラウドネス</b><span>正規化の目標 −16 LUFS</span></div>
+        <div style="font-size:var(--text-md);color:var(--text-primary)">−16.1 LUFS（LRA 6.1 LU） · −1.0 dBTP</div>
+        <div style="font-size:var(--text-xs);color:var(--text-tertiary)">目標との差 −0.1 LU</div>
         <div class="frow">出力の形式<span class="field sel" style="min-width:150px">元と同じ（WAV）</span></div>
       </div></aside>
   </div>
@@ -486,10 +487,10 @@ function magDb(bq, f) {
   return 10 * Math.log10((nr * nr + ni * ni) / (dr * dr + di * di));
 }
 const BANDS = [
-  { n: 1, type: 'hp', icon: 'hp', label: 'ローカット', f: 30, g: 0, q: 0, slope: '24 dB/oct', ch: 'ステレオ', on: true, parts: [biquad('hp', 30, 0, 0.5412), biquad('hp', 30, 0, 1.3066)] },
+  { n: 1, type: 'hp', icon: 'hp', label: 'ローカット', f: 30, g: 0, q: 0, slope: '24 dB/oct', ch: 'すべて', on: true, parts: [biquad('hp', 30, 0, 0.5412), biquad('hp', 30, 0, 1.3066)] },
   { n: 2, type: 'bell', icon: 'bellDown', label: 'ベル', f: 180, g: -3.0, q: 1.0, ch: 'M', on: true },
-  { n: 3, type: 'bell', icon: 'bellDown', label: 'ベル', f: 2800, g: -5.0, q: 6.0, ch: 'ステレオ', on: true },
-  { n: 4, type: 'shelfHi', icon: 'shelfHi', label: 'ハイシェルフ', f: 9000, g: 2.5, q: 0.707, ch: 'ステレオ', on: true },
+  { n: 3, type: 'bell', icon: 'bellDown', label: 'ベル', f: 2800, g: -5.0, q: 6.0, ch: 'すべて', on: true },
+  { n: 4, type: 'shelfHi', icon: 'shelfHi', label: 'ハイシェルフ', f: 9000, g: 2.5, q: 0.707, ch: 'すべて', on: true },
   { n: 5, type: 'bell', icon: 'bellUp', label: 'ベル', f: 450, g: 1.5, q: 0.8, ch: 'S', on: false },
 ];
 for (const b of BANDS) if (!b.parts) b.parts = [biquad(b.type, b.f, b.g, b.q)];
@@ -561,7 +562,7 @@ function screen1(win) {
   let pk = 0; for (let i = 0; i < N; i++) if (fr[i] > 1050 && fr[i] < 1320 && (pk === 0 || post[i] > post[pk])) pk = i;
   const px = fx(fr[pk]), py = spY(post[pk]);
   const grab = `<circle cx="${px}" cy="${py}" r="7" style="fill:none;stroke:var(--text-primary);stroke-width:1.5"/><path d="M${px - 3.5},${py}h7M${px},${py - 3.5}v7" style="stroke:var(--text-primary);stroke-width:1.5;stroke-linecap:round"/><line x1="${px}" y1="${py + 9}" x2="${px}" y2="${Y1}" style="stroke:var(--text-primary);stroke-width:1;stroke-dasharray:2 3;opacity:.45"/>`;
-  const plane = `<svg class="layer" style="left:${PL}px;top:${PT}px" width="${PW}" height="${PH}">
+  const plane = `<svg class="layer" role="group" aria-label="スペクトルの面" style="left:${PL}px;top:${PT}px" width="${PW}" height="${PH}">
     ${grid}
     <path d="${postPath}" style="fill:var(--spec-post);stroke:var(--spec-post-line);stroke-width:1"/>
     <path d="${line(pre, spY)}" style="fill:none;stroke:var(--spec-pre);stroke-width:1"/>
@@ -569,7 +570,7 @@ function screen1(win) {
     <path d="${selFill}" style="fill:var(--eq-band-fill)"/>
     ${bands}
     <path d="${eqLine(eqDb)}" style="fill:none;stroke:var(--accent);stroke-width:2.2;stroke-linejoin:round"/>
-    ${qMarks}${grab}${points}
+    <g aria-hidden="true">${qMarks}${grab}${points}</g>
   </svg>`;
   const tipX = PL + px + 18, tipY = PT + py + 14;
   const stage = `
@@ -601,7 +602,7 @@ function screen1(win) {
           <label>利得<span class="field">−5.0 dB</span></label>
           <label>Q<span class="field">6.00</span></label>
           <label>傾き<span class="field" style="color:var(--text-tertiary)">—</span></label>
-          <label>チャンネル<span class="field sel">ステレオ</span></label>
+          <label>チャンネル<span class="field sel">すべて</span></label>
         </div>
         <div class="btns"><button class="pill" aria-pressed="false">ソロで聞く</button><button class="pill">バンドを消す</button></div>
       </div>
