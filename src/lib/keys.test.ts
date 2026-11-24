@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { isKeyControl, isReplayed, isTextEntry, markReplayed } from './keys';
+import { controlOwnsKey, isKeyControl, isReplayed, isTextEntry, markReplayed } from './keys';
 
 function input(type: string): HTMLInputElement {
   const el = document.createElement('input');
@@ -28,6 +28,32 @@ describe('キーの受け方の判定', () => {
     expect(isKeyControl(input('checkbox'))).toBe(true);
     expect(isKeyControl(input('text'))).toBe(false);
     expect(isKeyControl(document.createElement('button'))).toBe(false);
+  });
+
+  it('部品が自分で使うキー：スライダーは位置を動かすキーだけ', () => {
+    const range = input('range');
+    for (const key of [
+      'ArrowLeft',
+      'ArrowRight',
+      'ArrowUp',
+      'ArrowDown',
+      'Home',
+      'End',
+      'PageUp',
+    ]) {
+      expect(controlOwnsKey(range, key)).toBe(true);
+    }
+    for (const key of [' ', 'Escape', 'f', ',', 'j']) {
+      expect(controlOwnsKey(range, key)).toBe(false);
+    }
+    expect(controlOwnsKey(document.createElement('select'), 'f')).toBe(true);
+    expect(controlOwnsKey(input('checkbox'), ' ')).toBe(true);
+    expect(controlOwnsKey(input('checkbox'), 'ArrowRight')).toBe(false);
+    expect(controlOwnsKey(input('radio'), 'ArrowDown')).toBe(true);
+    expect(controlOwnsKey(input('button'), 'Enter')).toBe(true);
+    expect(controlOwnsKey(input('text'), 'ArrowLeft')).toBe(false);
+    expect(controlOwnsKey(document.createElement('button'), ' ')).toBe(false);
+    expect(controlOwnsKey(null, ' ')).toBe(false);
   });
 
   it('メニューが送ったキーの印', () => {

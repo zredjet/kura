@@ -34,13 +34,18 @@ export function tildePath(path: string, home: string | null): string {
   return path === base || path.startsWith(`${base}/`) ? `~${path.slice(base.length)}` : path;
 }
 
-/** 長さを「1:12:40」「4:18」「0:45」の形にする。 */
-export function formatDuration(ms: number): string {
-  const total = Math.max(0, Math.round(ms / 1000));
+/**
+ * 長さを「1:12:40」「4:18」「0:45」の形にする。`tenths` なら 0.1 秒まで（「1:23.4」。シークのドラッグ中・時刻の欄。
+ * 0.1 秒に丸めてから分けるので、59.96 秒は「1:00.0」）。
+ */
+export function formatDuration(ms: number, tenths = false): string {
+  const unit = tenths ? 100 : 1000;
+  const count = Number.isFinite(ms) ? Math.max(0, Math.round(ms / unit)) : 0;
+  const total = tenths ? Math.floor(count / 10) : count;
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
-  const ss = String(s).padStart(2, '0');
+  const ss = String(s).padStart(2, '0') + (tenths ? `.${count % 10}` : '');
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
 }
 

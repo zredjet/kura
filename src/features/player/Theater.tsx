@@ -26,6 +26,7 @@ import {
   openCurrentExternally,
   playerController,
   toggleFullscreen,
+  watchTheaterFrames,
 } from './playerActions';
 import { usePlayerStore } from './playerStore';
 import { SidePanel } from './SidePanel';
@@ -71,6 +72,7 @@ function useControlsIdle(visible: boolean): {
             focused instanceof HTMLElement && focused.closest('[data-chrome]') !== null,
           menuOpen: document.querySelector('[data-sheet], [role="menu"]') !== null,
           typing: isTyping(focused),
+          scrubbing: document.querySelector('[data-theater] [data-scrubbing]') !== null,
         });
         if (hide) {
           setIdle(true);
@@ -254,6 +256,7 @@ function Stage({ active, chrome }: { active: boolean; chrome: ChromeProps }) {
   const snapshot = usePlayerStore((s) => s.snapshot);
   const attach = useCallback((el: HTMLVideoElement | null) => {
     playerController().attachVideo(el);
+    watchTheaterFrames(el);
   }, []);
   const item = snapshot.itemId !== null ? playerController().item(snapshot.itemId) : undefined;
   const showMedia = snapshot.phase !== 'waiting' && snapshot.phase !== 'failed';
@@ -360,7 +363,7 @@ export function ImageLayer({
 
 /**
  * 音楽：ジャケット（なければ音符）と波形（解析の前は飾りの波形。M11）。インスペクタと同じくループの区間を出す（試聴の設定が
- * 長さに収まればそれ、なければファイルのループ点。M13）。
+ * 長さに収まればそれ、なければファイルのループ点。M13）。波形は押す・ドラッグでシークする（ADR-230）。
  */
 export function AudioArt({ item }: { item: ItemSummaryDto }) {
   const positionMs = usePlayerStore((s) => s.snapshot.positionMs);
@@ -384,6 +387,9 @@ export function AudioArt({ item }: { item: ItemSummaryDto }) {
         positionMs={positionMs}
         className={styles.waveform}
         fallback={<Waveform />}
+        onSeek={(ms) => playerController().seek(ms)}
+        onScrubStart={() => playerController().beginScrub()}
+        onScrubEnd={() => playerController().endScrub()}
       />
     </div>
   );

@@ -5,6 +5,7 @@ import type { ItemKind } from '../../../ipc/kinds';
 import { bgmOnEnter } from './bgm';
 import { FADE_MS } from './fade';
 import { prevTarget, stepImageMs } from './nav';
+import { END_GUARD_MS } from '../../../lib/seek';
 import { PlaybackController, POLL_MS, TICK_MS } from './PlaybackController';
 import type { MediaPort, PlayerSnapshot, Queue, SlotReport } from './types';
 
@@ -590,5 +591,166 @@ describe('プレイリスト（M6）', () => {
     h.controller.start(queue);
     await advance(1000 + TICK_MS);
     expect(h.reports[0]).toMatchObject({ itemId: 1, playlistId: 9 });
+  });
+});
+
+describe('シーク（ADR-230）', () => {
+  it('今の位置は要素から読み、終わりは長さとトリムの早いほう（画像は表示時間）', async () => {
+    const h = setup([item(1, 'video'), item(2, 'image')]);
+    const queue = queueOf([1, 2], [null, 3000]);
+    queue.endMs[0] = 90_000;
+    h.controller.start(queue);
+    await advance(0);
+    h.video.currentTime = 12.34;
+    expect(h.controller.currentMs()).toBeCloseTo(12_340, 6);
+    expect(h.controller.endMs()).toBe(90_000);
+    h.video.duration = 60;
+    h.video.fire('loadeddata');
+    expect(h.controller.endMs()).toBe(60_000);
+    h.controller.next();
+    await advance(0);
+    expect(h.controller.endMs()).toBe(3000);
+  });
+
+  it('シークは 0 と終わりの手前に収める（トリムがあればトリムの終わりの手前）', async () => {
+    const h = setup([item(1, 'video')]);
+    const queue = queueOf([1]);
+    queue.endMs[0] = 50_000;
+    h.controller.start(queue);
+    await advance(0);
+    h.controller.seek(-100);
+    expect(h.video.currentTime).toBe(0);
+    h.controller.seek(80_000);
+    expect(h.video.currentTime).toBe((50_000 - END_GUARD_MS) / 1000);
+    await advance(TICK_MS);
+    expect(h.last().index).toBe(0);
+    expect(h.last().phase).not.toBe('ended');
+  });
+
+  it('ドラッグ中は要素だけ止めて再生中の印は保ち、離したら続きから鳴らす', async () => {
+    const h = setup([item(1, 'video'), item(2, 'video')]);
+    h.controller.start(queueOf([1, 2]));
+    await advance(0);
+    expect(h.video.paused).toBe(false);
+    h.controller.beginScrub();
+    expect(h.video.pause).toHaveBeenCalled();
+    expect(h.video.paused).toBe(true);
+    expect(h.last().playing).toBe(true);
+    h.controller.seek(30_000);
+    h.controller.seek(31_000);
+    await advance(TICK_MS * 3);
+    h.controller.endScrub();
+    expect(h.video.paused).toBe(false);
+    expect(h.video.currentTime).toBe(31);
+    h.controller.next();
+    await advance(0);
+    // 飛ばした分もドラッグの間も数えない
+    expect(h.reports[0]?.playedMs ?? 0).toBeLessThan(TICK_MS);
+  });
+
+  it('一時停止中のドラッグは離しても鳴らさない', async () => {
+    const h = setup([item(1, 'audio')]);
+    h.controller.start(queueOf([1]));
+    await advance(0);
+    h.controller.pause();
+    const music = h.tracks[1];
+    music?.play.mockClear();
+    h.controller.beginScrub();
+    h.controller.seek(10_000);
+    h.controller.endScrub();
+    expect(music?.play).not.toHaveBeenCalled();
+    expect(music?.currentTime).toBe(10);
+  });
+
+  it('画像はドラッグ中に時間が進まず、終わりでも次へ行かない（離したら行く）', async () => {
+    const h = setup([item(1, 'image'), item(2, 'image')]);
+    h.controller.start(queueOf([1, 2], [2000, null]));
+    await advance(500);
+    h.controller.beginScrub();
+    h.controller.seek(1950);
+    await advance(3000);
+    expect(h.last().index).toBe(0);
+    expect(h.last().positionMs).toBe(2000 - END_GUARD_MS);
+    h.controller.endScrub();
+    await advance(TICK_MS + 50);
+    expect(h.last().index).toBe(1);
+  });
+
+  it('画像をシークで終わりへ飛ばしただけでは「最後まで表示した」にしない', async () => {
+    const h = setup([item(1, 'image'), item(2, 'image')]);
+    h.controller.start(queueOf([1, 2], [8000, null]));
+    await advance(400);
+    h.controller.seek(8000);
+    await advance(TICK_MS + 50);
+    expect(h.last().index).toBe(1);
+    await advance(0);
+    expect(h.reports[0]).toMatchObject({ itemId: 1, completed: false });
+    expect(h.reports[0]?.playedMs ?? 0).toBeLessThan(1000);
+  });
+
+  it('再開で途中から始めた画像は、最後まで出せば「最後まで表示した」', async () => {
+    const h = setup([item(1, 'image'), item(2, 'image')]);
+    h.controller.start(queueOf([1, 2], [8000, null]), 0, 6500);
+    await advance(1500 + TICK_MS);
+    expect(h.last().index).toBe(1);
+    await advance(0);
+    expect(h.reports[0]).toMatchObject({ itemId: 1, completed: true });
+  });
+
+  it('前へ戻すシークでは「最後まで表示した」を外さない', async () => {
+    const h = setup([item(1, 'image'), item(2, 'image')]);
+    h.controller.start(queueOf([1, 2], [2000, null]));
+    await advance(1000);
+    h.controller.seek(200);
+    await advance(1800 + TICK_MS);
+    expect(h.last().index).toBe(1);
+    await advance(0);
+    expect(h.reports[0]).toMatchObject({ itemId: 1, completed: true });
+  });
+
+  it('プロキシ待ちに入ったらスクラブを終える（外れた波形の代わり）', async () => {
+    // 元のまま再生できるはずだったもの（読めなければプロキシを作ってもらって待つ）
+    const h = setup([item(1, 'audio', { proxyState: 'not_needed' }), item(2, 'image')]);
+    h.controller.start(queueOf([1, 2]));
+    await advance(0);
+    h.controller.beginScrub();
+    h.tracks[1]?.fire('error');
+    await advance(0);
+    expect(h.last().phase).toBe('waiting');
+    // スクラブが残っていれば tick が位置を進めない。プロキシができて鳴り出したら位置が出ることで見る
+    h.items.set(1, { ...item(1, 'audio'), proxyState: 'ready' });
+    await advance(POLL_MS + TICK_MS);
+    // プロキシはもう一方の <audio> で鳴らす
+    h.tracks.forEach((t) => {
+      t.currentTime = 4;
+    });
+    await advance(TICK_MS);
+    expect(h.last().positionMs).toBe(4000);
+  });
+
+  it('1 曲リピートは、画像をシークで終わりへ飛ばしても同じスロットを繰り返す', async () => {
+    const h = setup([item(1, 'image'), item(2, 'image')]);
+    h.controller.start(queueOf([1, 2], [3000, null]));
+    h.controller.setRepeat('one');
+    await advance(200);
+    h.controller.seek(3000);
+    await advance(TICK_MS + 50);
+    expect(h.last().index).toBe(0);
+    expect(h.reports.at(-1)).toMatchObject({ itemId: 1, completed: false });
+  });
+
+  it('トリムの終わりを越えてドラッグしている間は次へ進まない', async () => {
+    const h = setup([item(1, 'video'), item(2, 'image')]);
+    const queue = queueOf([1, 2], [null, 8000]);
+    queue.endMs[0] = 4000;
+    h.controller.start(queue);
+    await advance(0);
+    h.controller.beginScrub();
+    h.video.currentTime = 4.5;
+    await advance(TICK_MS * 2);
+    expect(h.last().index).toBe(0);
+    h.controller.endScrub();
+    await advance(TICK_MS);
+    expect(h.last().index).toBe(1);
   });
 });

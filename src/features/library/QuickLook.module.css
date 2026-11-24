@@ -107,6 +107,82 @@
   object-fit: contain;
 }
 
+/*
+ * 再生の操作（ADR-230）：動画・音声のときだけステージの下に置く再生バーと同じガラスのカプセル（動画には重ねず、
+ * 隠さない）。再生／一時停止・5 秒戻す・5 秒進める・シークの行・音量。
+ */
+.footer {
+  flex: none;
+  display: flex;
+  justify-content: center;
+  padding: 0 calc(var(--space-6) * 3) var(--space-5);
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: min(960px, 100%);
+  padding: var(--space-2) var(--space-4) var(--space-2) var(--space-2);
+  border: 1px solid var(--stroke-3);
+  border-radius: var(--radius-2xl);
+  background: var(--glass-capsule);
+  box-shadow: var(--shadow-capsule);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  backdrop-filter: var(--glass-blur-strong);
+}
+
+.play {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-pill);
+  background: var(--text-primary);
+  color: var(--bg-window);
+}
+
+.skip {
+  flex: none;
+  min-width: 40px;
+  height: 32px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  color: var(--text-primary);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.skip:not(:disabled):hover {
+  background: var(--fill-2);
+}
+
+.skip:disabled {
+  opacity: 0.4;
+}
+
+.seekRow {
+  flex: 1;
+  margin-left: var(--space-1);
+}
+
+.volume {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  margin-left: var(--space-2);
+  color: var(--text-secondary);
+}
+
+.volumeInput {
+  width: 120px;
+  accent-color: var(--text-primary);
+}
+
 /* 音声の波形（M11。インスペクタと同じ部品を大きく） */
 .wave {
   width: min(520px, 80vw);

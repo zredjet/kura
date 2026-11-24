@@ -1,7 +1,8 @@
 /**
  * シアターの操作（上の操作・再生バー）の出し方の決まり（純粋関数。design.md §3.1・ADR-128）。
  * - 再生中にマウスを `HIDE_AFTER_MS` 動かさなければ隠す。一時停止中・操作の上にポインタやフォーカスが
- *   あるとき・メニューやシートを開いているとき・入力欄で文字を入れているときは隠さない。
+ *   あるとき・メニューやシートを開いているとき・入力欄で文字を入れているとき・シークバーや波形をドラッグしているときは
+ *   隠さない。
  * - フルスクリーンに入ったら右のパネルを閉じ、出たら入る前の状態に戻す。
  */
 
@@ -20,11 +21,13 @@ export interface HideContext {
   menuOpen: boolean;
   /** 入力欄で文字を入れているか（右のパネルのタグの入力など）。 */
   typing: boolean;
+  /** シークバー・波形をドラッグしているか（ADR-230）。 */
+  scrubbing: boolean;
 }
 
 /** いま操作を隠してよいか。 */
 export function canHideControls(c: HideContext): boolean {
-  return c.playing && !c.hovering && !c.focusInControls && !c.menuOpen && !c.typing;
+  return c.playing && !c.hovering && !c.focusInControls && !c.menuOpen && !c.typing && !c.scrubbing;
 }
 
 /** 操作（上部・再生バー・アニメの操作の行）の上にポインタがあるかを覚えるもの。 */

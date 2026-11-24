@@ -3,6 +3,8 @@ import { useEffect } from 'react';
 import { openMenuBelow } from '../../components/Menu/menuStore';
 import { ja } from '../../i18n/ja';
 import { isUnitEntry, unitIdOf } from '../../ipc/items';
+import { controlOwnsKey, isTextEntry } from '../../lib/keys';
+import { applySeekAction, seekKeyAction } from '../../lib/seekKeys';
 import { getCached } from '../../stores/itemCache';
 import { useImportStore } from '../../stores/importStore';
 import { useLibraryStore } from '../../stores/libraryStore';
@@ -13,6 +15,7 @@ import { toggleAuditionKey } from '../asset/auditionStore';
 import { canEdit, openEditor } from '../editor/editorKinds';
 import { playSelection } from '../player/playSelection';
 import { pickPlaylistFor } from '../playlists/playlistActions';
+import { quickLookSeekTarget } from './quickLookMedia';
 import {
   dissolveUnits,
   groupEntries,
@@ -48,10 +51,15 @@ function isBlocked(): boolean {
 
 /**
  * ライブラリのキー操作を受け付けるか（取り込みのシート・入力欄・ダイアログ・メニュー・シアター・画像エディタの上では
- * 受け付けない）。
+ * 受け付けない）。クイックルックを開いている間は、スライダー（シークバー・音量）の上でも、その部品が使うキー（矢印・
+ * Home・End）のほかは受ける（Space で閉じる・esc・シークのキー。ADR-230）。
  */
-function acceptsKeys(target: EventTarget | null): boolean {
-  return useImportStore.getState().phase === 'idle' && !isTyping(target) && !isBlocked();
+function acceptsKeys(target: EventTarget | null, key?: string): boolean {
+  const typing =
+    key !== undefined && useViewStore.getState().quickLook
+      ? isTextEntry(target) || controlOwnsKey(target, key)
+      : isTyping(target);
+  return useImportStore.getState().phase === 'idle' && !typing && !isBlocked();
 }
 
 /**
@@ -79,7 +87,7 @@ function focusTagInput(): void {
 
 /** ライブラリ画面のキー操作（design.md §6）。 */
 export function handleLibraryKey(e: KeyboardEvent): boolean {
-  if (e.defaultPrevented || !acceptsKeys(e.target)) {
+  if (e.defaultPrevented || !acceptsKeys(e.target, e.key)) {
     return false;
   }
   const view = useViewStore.getState();
@@ -165,6 +173,17 @@ export function handleLibraryKey(e: KeyboardEvent): boolean {
   }
   if (e.ctrlKey || e.altKey) {
     return false;
+  }
+
+  // クイックルックの動画・音声のシーク（, . で 1 コマ、⇧, ⇧. で 1 秒、J・L で 5 秒、K で再生／一時停止。L の試聴より
+  // 先。メニューが送った L は試聴のまま。ADR-230）
+  if (view.quickLook) {
+    const action = seekKeyAction(e);
+    const target = action !== null ? quickLookSeekTarget() : null;
+    if (action !== null && target !== null) {
+      applySeekAction(action, target);
+      return true;
+    }
   }
 
   if (key === 'ArrowRight' || key === 'ArrowLeft') {

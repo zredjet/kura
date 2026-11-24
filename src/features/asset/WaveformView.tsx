@@ -1,5 +1,6 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 
+import { useScrub } from '../../components/SeekBar/useScrub';
 import { ja } from '../../i18n/ja';
 import { peaksUrl } from '../../ipc/media';
 import {
@@ -49,6 +50,14 @@ interface WaveformViewProps {
   className?: string;
   /** 段のファイルがない・読んでいる間に出すもの（シアターの飾りの波形）。既定は何も出さない。 */
   fallback?: ReactNode;
+  /**
+   * 押した位置・ドラッグでシークする（ms。クイックルック・シアター。ADR-230）。段を読めたときだけ効き、飛び先は位置の
+   * 線と同じ段のフレームとレートからの逆算（終わりの手前で止める）。渡さなければ見るだけ（インスペクタ）。
+   */
+  onSeek?: (ms: number) => void;
+  /** ドラッグを始めた・終えた（再生を止めて戻すのは呼ぶ側）。 */
+  onScrubStart?: () => void;
+  onScrubEnd?: () => void;
   /** テスト用：段のファイルを読む口・描く時刻・装置の画素の比。 */
   load?: (url: string) => Promise<ArrayBuffer | null>;
   frames?: FrameClock;
@@ -58,7 +67,8 @@ interface WaveformViewProps {
 /**
  * 波形（design.md §3.1「波形」）：`/peaks/{hash}` の段から、列ごとの縦の線を SVG で描く（チャンネルはまとめて 1 本、
  * 色は currentColor）。ループの区間は `--loop-region` の矩形と両端の 1px の `--accent` の線、試聴中の位置は 1.5px の線。
- * 段のファイルがない（解析の前・失敗）ときは何も描かない。
+ * 段のファイルがない（解析の前・失敗）ときは何も描かない。`onSeek` があれば押す・ドラッグでシークする（ADR-230。
+ * ⌥ で 1/10 の速さ。フォーカスは取らず、キーはシークバーに任せる）。
  */
 export function WaveformView({
   hash,
@@ -69,6 +79,9 @@ export function WaveformView({
   positionMs = null,
   className,
   fallback = null,
+  onSeek,
+  onScrubStart,
+  onScrubEnd,
   load = fetchPeaks,
   frames: clock = realFrames,
   dpr = typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1,
@@ -145,12 +158,25 @@ export function WaveformView({
   const total = data?.frames ?? 0;
   const region = data && loop ? regionX(loop[0], loop[1], 0, total, n) : null;
   const rate = data?.rate ?? 0;
-  const at =
+  const lengthMs = data && rate > 0 && total > 0 ? (total * 1000) / rate : null;
+  const playing =
     positionMs !== null
       ? (positionMs * rate) / 1000
       : playhead !== null && positionSeconds && !position
         ? playhead * rate
         : playhead;
+  const seekable = onSeek !== undefined && lengthMs !== null;
+  const { scrubMs, handlers } = useScrub({
+    durationMs: seekable ? lengthMs : null,
+    positionMs: playing !== null && rate > 0 ? (playing * 1000) / rate : 0,
+    onSeek: (ms) => onSeek?.(ms),
+    onScrubStart,
+    onScrubEnd,
+    resetKey: key,
+    disabled: !seekable,
+  });
+  // ドラッグ中は、送った位置が戻るのを待たずにその位置へ線を引く
+  const at = scrubMs !== null ? (scrubMs * rate) / 1000 : playing;
   const head =
     data && at !== null && Number.isFinite(at) && total > 0
       ? Math.min(n, Math.max(0, (at / total) * n))
@@ -163,6 +189,11 @@ export function WaveformView({
       role="img"
       aria-label={ja.asset.waveform}
       data-loaded={data ? 'true' : 'false'}
+      data-seekable={seekable || undefined}
+      data-scrubbing={scrubMs !== null || undefined}
+      // 段を読み直している間（version が替わった）もドラッグの終わりを受けられるよう、onSeek があれば付けたままにする
+      // （押せない間は useScrub が押すのを無視する）
+      {...(onSeek ? handlers : {})}
     >
       {path === null ? (
         fallback

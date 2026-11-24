@@ -1,5 +1,5 @@
-import { act, render, screen } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AnimDto } from '../../ipc/asset';
 import type { ItemSummaryDto } from '../../ipc/items';
@@ -9,6 +9,9 @@ import { useLibraryStore } from '../../stores/libraryStore';
 import { useViewStore } from '../../stores/viewStore';
 import { useFontFace } from '../asset/AssetStage';
 import { useEditorStore } from '../editor/editorStore';
+import { updatePlayerPrefs } from '../player/playerActions';
+import { usePlayerStore } from '../player/playerStore';
+import { ja } from '../../i18n/ja';
 import { audioAsset, imageAsset, summary, withAuditionLoop } from '../asset/testAssets';
 import { type AssetData, useAssetData } from '../asset/useAssetData';
 import { selectOne } from './selection';
@@ -28,10 +31,22 @@ vi.mock('../asset/AssetStage', () => ({
   ),
 }));
 vi.mock('../asset/WaveformView', () => ({
-  WaveformView: (p: { hash: string; loop: readonly [number, number] | null }) => (
-    <div data-testid="waveform" data-hash={p.hash} data-loop={p.loop?.join('-') ?? ''} />
+  WaveformView: (p: {
+    hash: string;
+    loop: readonly [number, number] | null;
+    onSeek?: (ms: number) => void;
+  }) => (
+    <button
+      type="button"
+      data-testid="waveform"
+      data-hash={p.hash}
+      data-loop={p.loop?.join('-') ?? ''}
+      data-seekable={p.onSeek ? 'true' : undefined}
+      onClick={() => p.onSeek?.(4_000)}
+    />
   ),
 }));
+vi.mock('../player/playerActions', () => ({ updatePlayerPrefs: vi.fn() }));
 
 const ANIM = { hash: 'ab'.repeat(32), rev: 0 } as AnimDto;
 
@@ -139,5 +154,65 @@ describe('QuickLook と画像エディタ', () => {
     act(() => useEditorStore.setState({ phase: 'closed' }));
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     view.unmount();
+  });
+});
+
+// ADR-230：動画・音声は WebKit の標準の操作を使わず、下に自前のカプセル
+describe('QuickLook の再生の操作', () => {
+  const play = vi.fn(() => Promise.resolve());
+  const pause = vi.fn();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockImplementation(play);
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(pause);
+    usePlayerStore.setState({ prefs: { ...usePlayerStore.getState().prefs, volume: 40 } });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('動画は標準の操作を出さず、カプセルに再生・5 秒・シーク・音量を出す', () => {
+    const { container } = show(summary({ kind: 'video' }));
+    const video = container.querySelector('video');
+    expect(video).not.toBeNull();
+    expect(video).not.toHaveAttribute('controls');
+    expect(video?.volume).toBeCloseTo(0.4, 6);
+    const group = screen.getByRole('group', { name: ja.quickLook.controls });
+    expect(group).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: ja.quickLook.back })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: ja.quickLook.forward })).toBeInTheDocument();
+    expect(screen.getByRole('slider', { name: ja.seek.label })).toBeInTheDocument();
+    expect(screen.getByRole('slider', { name: ja.quickLook.volume })).toHaveValue('40');
+  });
+
+  it('再生ボタンで鳴らし、音量はプレーヤーの設定を変える', () => {
+    show(summary({ kind: 'video' }));
+    // jsdom の要素は止まったまま（paused）なので、押すと鳴らす
+    fireEvent.click(screen.getByRole('button', { name: ja.quickLook.play }));
+    expect(play).toHaveBeenCalled();
+    fireEvent.change(screen.getByRole('slider', { name: ja.quickLook.volume }), {
+      target: { value: '75' },
+    });
+    expect(updatePlayerPrefs).toHaveBeenCalledWith({ volume: 75 });
+  });
+
+  it('音声も標準の操作を出さず、波形を押すとシークする', () => {
+    const { container } = show(summary({ id: 2, hash: 'cd'.repeat(32), kind: 'audio' }), {
+      asset: audioAsset(),
+    });
+    const audio = container.querySelector('audio');
+    expect(audio).not.toHaveAttribute('controls');
+    expect(screen.getByRole('group', { name: ja.quickLook.controls })).toBeInTheDocument();
+    const wave = screen.getByTestId('waveform');
+    expect(wave).toHaveAttribute('data-seekable', 'true');
+    fireEvent.click(wave);
+    expect(audio?.currentTime).toBe(4);
+  });
+
+  it('画像・フォントではカプセルを出さない', () => {
+    show(summary());
+    expect(screen.queryByRole('group', { name: ja.quickLook.controls })).toBeNull();
   });
 });

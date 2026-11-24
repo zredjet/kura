@@ -1,5 +1,6 @@
 import type { ItemSummaryDto } from '../../../ipc/items';
 import { hasDuration, isPlayable, needsProxy, type TimedKind } from '../../../ipc/kinds';
+import { clampSeek, END_GUARD_MS } from '../../../lib/seek';
 import { type BgmAction, type BgmStatus, bgmOnEnter, bgmOnTrackEnd } from './bgm';
 import { FADE_MS, Fader } from './fade';
 import { nextIndex, playedDelta, prevTarget, stepImageMs } from './nav';
@@ -74,6 +75,10 @@ export class PlaybackController {
   private completed = false;
   private lastTick = 0;
   private lastMediaSec = 0;
+  /** シークバー・波形をドラッグしている間（要素・画像の時計を止める。ADR-230）。 */
+  private scrubbing = false;
+  /** 今のスロットでシークで先へ飛ばしたか（画像の「最後まで表示した」の判定。ADR-230）。 */
+  private skipped = false;
 
   private readonly attempts = new Map<number, number>();
   private readonly forced = new Set<number>();
@@ -301,15 +306,73 @@ export class PlaybackController {
     }
   }
 
-  /** 再生位置を変える（画像は表示した時間）。シークで飛ばした分は再生時間に数えない。 */
-  seek(ms: number): void {
-    const target = Math.max(0, ms);
+  /**
+   * 再生位置を変える（画像は表示した時間）。シークで飛ばした分は再生時間に数えない。今のスロットの中だけ（0 と終わりの
+   * `guardMs` 手前で止める。トリムがあればトリムの終わりの手前。ADR-230）。コマ送りは自分で終わりの半コマ手前に
+   * 収めてから `guardMs` 0 で呼ぶ。
+   */
+  seek(ms: number, guardMs = END_GUARD_MS): void {
+    const target = clampSeek(ms, this.endMs(), guardMs);
+    if (target > this.positionMs) {
+      this.skipped = true;
+    }
     const media = this.slotMedia();
     if (media) {
       media.currentTime = target / 1000;
       this.lastMediaSec = target / 1000;
     }
     this.positionMs = target;
+    this.emit();
+  }
+
+  /** 今の位置（ms）。音楽・動画は要素の位置を読む（刻みの 200ms の遅れを避ける。シークのキー）。 */
+  currentMs(): number {
+    const media = this.slotMedia();
+    if (media && (this.phase === 'playing' || this.phase === 'loading')) {
+      const sec = media.currentTime;
+      if (Number.isFinite(sec)) {
+        return sec * 1000;
+      }
+    }
+    return this.positionMs;
+  }
+
+  /** 今のスロットの終わり（ms。長さとトリムの終わりの早いほう。画像は表示時間。分からなければ null）。 */
+  endMs(): number | null {
+    const trim = this.queue?.endMs[this.index] ?? null;
+    const length = this.currentKind() === 'image' ? this.imageMs() : this.durationMs;
+    if (length === null) {
+      return trim;
+    }
+    return trim !== null ? Math.min(length, trim) : length;
+  }
+
+  /**
+   * シークバー・波形のドラッグを始める：要素（画像は表示の時計）だけを止め、再生中の印は変えない。ドラッグ中は
+   * 再生時間を数えず、画像の終わり・トリムの終わりでも次へ進まない（ADR-230）。
+   */
+  beginScrub(): void {
+    if (!this.queue || this.scrubbing) {
+      return;
+    }
+    this.scrubbing = true;
+    const media = this.slotMedia();
+    if (media && this.playing) {
+      media.pause();
+    }
+  }
+
+  /** ドラッグを終える：再生中なら続きから鳴らす。 */
+  endScrub(): void {
+    if (!this.scrubbing) {
+      return;
+    }
+    this.scrubbing = false;
+    this.lastTick = this.deps.clock.now();
+    const media = this.slotMedia();
+    if (media && this.playing && (this.phase === 'playing' || this.phase === 'loading')) {
+      playSafely(media);
+    }
     this.emit();
   }
 
@@ -369,6 +432,8 @@ export class PlaybackController {
     this.durationMs = null;
     this.playedMs = 0;
     this.completed = false;
+    this.scrubbing = false;
+    this.skipped = false;
     this.lastMediaSec = 0;
     this.lastTick = this.deps.clock.now();
     this.phase = 'loading';
@@ -457,13 +522,17 @@ export class PlaybackController {
     }
     const unitId = queue.unitIds[this.index] ?? null;
     const item = this.items.get(itemId);
+    // 画像の「最後まで表示した」は、シークで先へ飛ばしたスロットでは当たらない（シークで終わりへ飛ばしただけで記録
+    // しない。再開・作り直しで途中から始めたスロットは、最後まで出せば当たる。1 曲リピートの判定の `completed` とは
+    // 分ける。ADR-230）
+    const completed = item?.kind === 'image' ? this.completed && !this.skipped : this.completed;
     const report = {
       itemId,
       unitId,
       playlistId: queue.playlist?.id ?? null,
       unitStart: unitId !== null && queue.indexInUnit[this.index] === 0,
       playedMs: Math.round(this.playedMs),
-      completed: this.completed,
+      completed,
       durationMs:
         item?.kind === 'image'
           ? null
@@ -524,6 +593,7 @@ export class PlaybackController {
   private finish(): void {
     this.leave();
     this.playing = false;
+    this.scrubbing = false;
     this.phase = 'ended';
     this.video?.pause();
     if (this.bgmStatus === 'playing') {
@@ -703,6 +773,8 @@ export class PlaybackController {
   /** プロキシができるまで待ち、できたら再生する。 */
   private waitForProxy(item: ItemSummaryDto, force: boolean): void {
     this.phase = 'waiting';
+    // ドラッグしていた波形が外れても止まったままにならないよう、スクラブを終える
+    this.scrubbing = false;
     this.stopPolling();
     const token = this.enterToken;
     void this.deps.requestProxies([item.id], force).catch((error: unknown) => {
@@ -771,6 +843,11 @@ export class PlaybackController {
     const dt = now - this.lastTick;
     this.lastTick = now;
     if (!this.queue || (this.phase !== 'playing' && this.phase !== 'loading')) {
+      this.emit();
+      return;
+    }
+    // ドラッグ中は進めず、終わりの判定もしない（位置はシークが出す）
+    if (this.scrubbing) {
       this.emit();
       return;
     }
