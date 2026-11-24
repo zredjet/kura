@@ -28,6 +28,7 @@ import {
   type EditSpanDto,
   type EditStepDto,
   type EditViewportDto,
+  eqCurve,
   measureEdit,
   specAverageEdit,
 } from '../../../ipc/edit';
@@ -42,8 +43,11 @@ import {
   type EditorAdapter,
   type EditorAdapterContext,
   type EditorAdapterFactory,
+  sendParam,
   useEditorStore,
 } from '../editorStore';
+import { addSteps, type ParamGesture } from '../paramSend';
+import { approxCompatible, bandsJson, type EqBand, type EqParams, eqJson, readEq } from './eqModel';
 import { defaultParams } from '../opsCatalog';
 import { drawSpectrum } from './drawSpectrum';
 import { drawWave } from './drawWave';
@@ -190,6 +194,15 @@ export interface AudioEditorState {
   face: AudioFace;
   /** スペクトルの面の表示の設定。 */
   spectrum: SpectrumSettings;
+  /** 面と右パネルで選んだイコライザのバンド（番号）とポインタを載せたバンド。 */
+  eqBand: number | null;
+  eqHover: number | null;
+  /**
+   * 送ったバンドの列を手元に持つ（応えの前に続けて変えても前の手を土台にする。`ticket` は送った手の番号で、`acked` が
+   * それ以上になったら、または文書の値が同じになったらやめる。ドラッグの間は `ticket` が null）。ノードがまだない（足す
+   * 前の山からのドラッグ）ときは `node` が null。
+   */
+  eqLocal: { node: number | null; bands: EqBand[]; ticket: number | null } | null;
 }
 
 const IDLE_PLAY: AudioPlayState = { status: 'idle', mode: 'cursor' };
@@ -215,6 +228,9 @@ function initialState(
     loudnessTarget: keep?.loudnessTarget ?? -23,
     snapZero: keep?.snapZero ?? true,
     face: 'wave',
+    eqBand: null,
+    eqHover: null,
+    eqLocal: null,
     spectrum: keep?.spectrum ?? loadSpectrumSettings(),
   };
 }
@@ -431,6 +447,89 @@ export function setAudioFace(face: AudioFace): void {
   }
 }
 
+/** 面が出すイコライザの今の引数（頭の文書 ＋ 手元の値。ノードがなければ null）。 */
+export function eqTargetParams(): { node: number; params: EqParams } | null {
+  const node = spectrumTarget();
+  if (node === null) return null;
+  const params = readEq(useEditorStore.getState().doc.nodes[node]?.params);
+  const local = useAudioStore.getState().eqLocal;
+  return {
+    node,
+    params: local && local.node === node ? { ...params, bands: local.bands } : params,
+  };
+}
+
+/**
+ * イコライザのバンドの列を送る（手元に持つ）。ドラッグの途中は preview、離したら commitPreview、キー・ホイールは merge
+ * （同じバンド・同じ項目の続きを 1 手に。替わったら先に seal）、ほかは 1 手。送った手の番号を返す。
+ */
+let eqMergeKey: string | null = null;
+export function sendEqBands(
+  node: number,
+  bands: EqBand[],
+  gesture: ParamGesture['kind'],
+  mergeKey: string | null = null,
+): number | null {
+  if (gesture === 'nudge' && mergeKey !== eqMergeKey) sealEq();
+  if (gesture === 'nudge') eqMergeKey = mergeKey;
+  const g: ParamGesture =
+    gesture === 'drag' || gesture === 'nudge' || gesture === 'set'
+      ? { kind: gesture, value: bandsJson(bands) }
+      : gesture === 'release'
+        ? { kind: 'release' }
+        : gesture === 'cancel'
+          ? { kind: 'cancel' }
+          : { kind: 'seal' };
+  const ticket = sendParam(node, 'bands', g);
+  if (gesture === 'cancel') {
+    useAudioStore.setState({ eqLocal: null });
+  } else if (gesture !== 'seal') {
+    useAudioStore.setState({
+      eqLocal: { node, bands, ticket: gesture === 'drag' ? null : ticket },
+    });
+  }
+  return ticket;
+}
+
+/** キー・ホイールのまとめを閉じる（バンド・項目が替わった・ポインタの手を始めた・面からフォーカスが出た）。 */
+export function sealEq(): void {
+  if (eqMergeKey === null) return;
+  eqMergeKey = null;
+  const node = spectrumTarget();
+  if (node !== null) sendParam(node, 'bands', { kind: 'seal' });
+}
+
+/** バンドを選ぶ（null で外す）。 */
+export function setEqBand(band: number | null): void {
+  if (useAudioStore.getState().eqBand === band) return;
+  sealEq();
+  useAudioStore.setState({ eqBand: band });
+}
+
+/** ポインタを載せたバンド。 */
+export function setEqHover(band: number | null): void {
+  if (useAudioStore.getState().eqHover !== band) useAudioStore.setState({ eqHover: band });
+}
+
+/**
+ * イコライザを足す（面のダブルクリック・山からのドラッグで、イコライザがないとき。P5・P6）：正規化があればその前、なければ
+ * 末尾に、バンドの列 `bands` で 1 手で足し、足したノードを選ぶ。
+ */
+export function addEqNode(bands: EqBand[]): void {
+  const rt = live();
+  if (!rt) return;
+  const order = useEditorStore.getState().doc.order;
+  const nodes = useEditorStore.getState().doc.nodes;
+  const norm = order.findIndex((id) => nodes[id]?.op === 'audio.normalize');
+  const at = norm >= 0 ? norm : order.length;
+  const params = eqJson({ bands, phase: 'minimum', gainDb: 0 }) as Record<string, never>;
+  rt.ctx.push(
+    addSteps(at, 'audio.eq', 1, params).map((step) => ({ step })),
+    { selectCreated: true },
+  );
+  useAudioStore.setState({ eqLocal: null, eqBand: 0 });
+}
+
 /** スペクトルの面の表示の設定を替える（覚える）。 */
 export function setSpectrumSettings(patch: Partial<SpectrumSettings>): void {
   const next = { ...useAudioStore.getState().spectrum, ...patch };
@@ -615,8 +714,70 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       controller.setSpec(spectrum.specRequests());
     }
   };
+  // イコライザの重ね：頭の文書 ＋ 手元の値の曲線を、引数が変わるたびに 1 つずつ求める（新しいものが勝つ）
+  let curveSeq = 0;
+  let curveKey = '';
+  let curve: import('./spectrumController').EqCurve | null = null;
+  const refreshEq = () => {
+    const s = useAudioStore.getState();
+    if (s.face !== 'spectrum') {
+      spectrum.setEqModel(null);
+      spectrum.setPostMode('shown');
+      return;
+    }
+    const target = eqTargetParams();
+    const local = s.eqLocal;
+    const params: EqParams | null = target
+      ? target.params
+      : local && local.node === null
+        ? { bands: local.bands, phase: 'minimum', gainDb: 0 }
+        : null;
+    if (!params) {
+      spectrum.setEqModel(null);
+      spectrum.setPostMode('shown');
+      return;
+    }
+    // 選んだバンドが消えた（消した・取り消した）：外す
+    if (s.eqBand !== null && s.eqBand >= params.bands.length) {
+      useAudioStore.setState({ eqBand: null });
+      return;
+    }
+    const view = rt.lastView;
+    const node = target ? view?.nodes.find((n) => n.id === target.node) : undefined;
+    const rate = node?.inRate ?? view?.rate ?? s.source?.rate ?? 48_000;
+    const channels = node?.inChannels ?? view?.channels ?? s.source?.channels ?? 2;
+    const points = Math.max(64, Math.min(2_048, Math.round(spectrum.inner().w / 2) || 512));
+    const key = JSON.stringify([eqJson(params), rate, channels, points]);
+    const model = () => ({ bands: params.bands, curve, selected: s.eqBand, hovered: s.eqHover });
+    if (key !== curveKey) {
+      curveKey = key;
+      const seq = ++curveSeq;
+      eqCurve(eqJson(params), rate, channels, points)
+        .then((c) => {
+          if (seq !== curveSeq || live() !== rt) return;
+          curve = { freqs: c.freqs, total: c.total, bands: c.bands };
+          refreshEq();
+        })
+        .catch(() => undefined);
+    }
+    spectrum.setEqModel(model());
+    // 後の出し方：ドラッグ中・流し解きの間は「前 ＋ 曲線」（チャンネルが合えば）か、前の後を薄く（P9）
+    const busy = rt.dragging || (view?.solving ?? null) !== null;
+    spectrum.setPostMode(
+      !busy ? 'shown' : approxCompatible(params.bands, s.spectrum.channel) ? 'approx' : 'dim',
+    );
+  };
   const offAudio = useAudioStore.subscribe((s, before) => {
     controller.setOverlay(overlayOf(s));
+    if (
+      s.face !== before.face ||
+      s.eqLocal !== before.eqLocal ||
+      s.eqBand !== before.eqBand ||
+      s.eqHover !== before.eqHover ||
+      s.spectrum !== before.spectrum
+    ) {
+      refreshEq();
+    }
     if (
       s.face !== before.face ||
       s.spectrum !== before.spectrum ||
@@ -633,6 +794,16 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
   // 選んだ操作・文書が変わったら、フェードの印を出し直し、面の見るノードを決め直す。イコライザをポインタで選んだ・足した
   // ときは、波形からスペクトルへ替える（↑↓ でたどって通っただけでは替えない）
   const offEditor = useEditorStore.subscribe((now, before) => {
+    // 手元のバンドの列：送った手の結果が確定した・文書が同じ値になったらやめる（ドラッグの間は残す）
+    const local = useAudioStore.getState().eqLocal;
+    if (local && local.node !== null && !rt.dragging) {
+      const doc = readEq(now.doc.nodes[local.node]?.params).bands;
+      const acked = local.ticket !== null && now.acked >= local.ticket;
+      if (acked || JSON.stringify(doc) === JSON.stringify(local.bands)) {
+        useAudioStore.setState({ eqLocal: null });
+      }
+    }
+    if (now.doc !== before.doc || now.selected !== before.selected) refreshEq();
     if (now.selected !== before.selected || now.doc !== before.doc) {
       controller.setOverlay(overlayOf(useAudioStore.getState()));
       const chosenEq =
@@ -723,6 +894,7 @@ function createAudioAdapter(_item: ItemSummaryDto, ctx: EditorAdapterContext): E
       applyLoudness(rt, view, s.loudness, info);
       controller.applyView(view, isWorkRequest(info.viewport));
       spectrum.applyView(view);
+      refreshEq();
       feed.setView(view, view.changed);
       const summary = summarizeAudioView(view);
       rt.patch.view = summary;

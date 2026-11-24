@@ -1393,6 +1393,28 @@ export const ja = {
         eqScale: 'イコライザの目盛り',
         eqScaleValue: (v: number) => `±${v} dB`,
         resetHold: '最大の保持を消す',
+        // イコライザの点（右クリックのメニュー・ホバーの吹き出し）
+        bandMenu: 'バンド',
+        bandType: '型',
+        bandTypes: {
+          bell: 'ベル',
+          lowShelf: 'ローシェルフ',
+          highShelf: 'ハイシェルフ',
+          lowCut: 'ローカット',
+          highCut: 'ハイカット',
+          notch: 'ノッチ',
+          bandPass: 'バンドパス',
+          tilt: 'チルト',
+        },
+        bandChannel: 'チャンネル',
+        bandChannels: { all: '両方', left: 'L', right: 'R', mid: 'M', side: 'S' },
+        bandOn: 'オンにする',
+        bandOff: 'オフにする',
+        /** ホバーの吹き出し。 */
+        hoverNote: (name: string, cents: number) =>
+          `${name} ${cents > 0 ? '+' : cents < 0 ? '−' : '±'}${Math.abs(cents)} セント`,
+        hoverSpec: (db: string) => `スペクトル ${db}`,
+        hoverCurve: (db: string) => `曲線 ${db}`,
       },
     },
   },

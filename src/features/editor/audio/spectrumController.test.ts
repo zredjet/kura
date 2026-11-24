@@ -246,3 +246,61 @@ describe('スペクトルの面の制御', () => {
     expect(toPortFrame(p, 1_100)).toBeNull();
   });
 });
+
+describe('イコライザの重ね（M17 段 5）', () => {
+  it('点を周波数と ±dB で置き、当たり（点・選んだ点の Q の印）を返す。ドラッグ中は「前 ＋ 曲線」で後を描く', async () => {
+    const { c, clock, io, scenes } = setup();
+    c.setInsets({ top: 0, left: 0, right: 0, bottom: 0 });
+    c.setTarget(3);
+    c.setStill({ cursor: 0, selection: null });
+    c.applyView(
+      audioView({
+        rate: RATE,
+        frames: FRAMES,
+        spec: [port({ node: 3, side: 'input', key: KEY_PRE }), port({ node: 3, side: 'output' })],
+      }),
+    );
+    io.resolve(
+      editSpecUrl(SESSION, KEY_PRE, { type: 'sum' }, 0),
+      tile(0, () => 160),
+    );
+    io.resolve(
+      editSpecUrl(SESSION, KEY_POST, { type: 'sum' }, 0),
+      tile(0, () => 100),
+    );
+    await settle();
+    const bell = {
+      type: 'bell' as const,
+      freq: 1_000,
+      gainDb: 6,
+      q: 1,
+      slope: 12,
+      channel: 'all' as const,
+      enabled: true,
+    };
+    c.setEqModel({
+      bands: [bell],
+      curve: { freqs: [20, 4_000], total: [6, 6], bands: [{ index: 0, db: [6, 6] }] },
+      selected: 0,
+      hovered: null,
+    });
+    clock.flushFrames();
+    const scene = scenes[scenes.length - 1];
+    const p = scene?.eqLayer?.points[0];
+    expect(p?.x).toBeCloseTo(c.xOfFreq(1_000), 6);
+    expect(p?.y).toBeCloseTo(c.yOfEqDb(6), 6);
+    expect(p?.q).not.toBeNull();
+    expect(c.hitBand(p?.x ?? 0, p?.y ?? 0)).toEqual({ band: 0, part: 'point' });
+    expect(c.hitBand(p?.q?.right ?? 0, p?.y ?? 0)).toEqual({ band: 0, part: 'qHi' });
+    expect(c.hitBand(5, 5)).toBeNull();
+    // ふつうは後のタイル、ドラッグ中は前（−40）＋ 曲線（+6）
+    expect(scene?.post?.[0]).toBe(-70);
+    c.setPostMode('approx');
+    clock.flushFrames();
+    expect(scenes[scenes.length - 1]?.post?.[0]).toBe(-34);
+    c.setPostMode('dim');
+    clock.flushFrames();
+    expect(scenes[scenes.length - 1]?.dimPost).toBe(true);
+    expect(c.curveDbAt(1_000)).toBe(6);
+  });
+});

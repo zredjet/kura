@@ -28,15 +28,23 @@ import {
   DEFAULT_SPECTRUM_COLORS,
   type SpectrumColors,
   type SpectrumEq,
+  type SpectrumPoint,
   type SpectrumScene,
 } from './drawSpectrum';
+import { type EqBand, bandPoint, qHandles } from './eqModel';
 import {
   type SpecBandEdge,
+  curveAt,
+  dbToY,
   decayToward,
+  findPeak,
   freqAxis,
+  freqToX,
   holdMax,
   specBands,
   tiltDb,
+  xToFreq,
+  yToDb,
 } from './spectrumMath';
 import { SPEC_CHUNK_FRAMES, SpecTileCache, isReady, parseEditSpecTile, specDb } from './specTiles';
 import {
@@ -84,6 +92,33 @@ export interface SpectrumStill {
 }
 
 export type DrawSpectrum = (canvas: HTMLCanvasElement, scene: SpectrumScene) => void;
+
+/** イコライザの曲線（`edit_eq_curve` の応え。対数の格子の周波数と、合成・バンドごとの dB）。 */
+export interface EqCurve {
+  freqs: readonly (number | null)[];
+  total: readonly (number | null)[];
+  bands: readonly { index: number; db: readonly (number | null)[] }[];
+}
+
+/** 面に重ねるイコライザ（頭の文書 ＋ 手元の値）。 */
+export interface EqModel {
+  bands: readonly EqBand[];
+  curve: EqCurve | null;
+  selected: number | null;
+  hovered: number | null;
+}
+
+/** 後の出し方（P9）：ふつう・「前 ＋ 曲線」で描く・前の後を薄く出す。 */
+export type PostMode = 'shown' | 'approx' | 'dim';
+
+/** 点の当たり（点・左右の Q の印）。 */
+export interface BandHit {
+  band: number;
+  part: 'point' | 'qLo' | 'qHi';
+}
+
+/** 点の当たりの半径（CSS px）。 */
+const HIT_RADIUS = 9;
 
 export interface SpectrumOptions {
   fetch?: FetchBytes;
@@ -161,7 +196,8 @@ export class SpectrumController {
     post: null,
   };
   private averageEpoch = 0;
-  private eq: SpectrumEq | null = null;
+  private eqModel: EqModel | null = null;
+  private postMode: PostMode = 'shown';
   private peak: { x: number; y: number } | null = null;
   private frameId: number | null = null;
   private loopId: number | null = null;
@@ -285,11 +321,178 @@ export class SpectrumController {
     this.playbackSpans = [...spans];
   }
 
-  /** イコライザの重ね（段 4 の手）。 */
-  setEq(eq: SpectrumEq | null, peak: { x: number; y: number } | null = null): void {
-    this.eq = eq;
+  /** イコライザの重ね（頭の文書 ＋ 手元の値と、その曲線。null なら曲線・点なし）。 */
+  setEqModel(model: EqModel | null): void {
+    this.eqModel = model;
+    this.invalidate();
+  }
+
+  /** 後の出し方（ドラッグ中・流し解きの間は「前 ＋ 曲線」か、前の後を薄く。P9）。 */
+  setPostMode(mode: PostMode): void {
+    if (this.postMode === mode) return;
+    this.postMode = mode;
+    this.invalidate();
+  }
+
+  /** 山の印（面の中の CSS px。なければ null）。 */
+  setPeakMark(peak: { x: number; y: number } | null): void {
+    if (peak?.x === this.peak?.x && peak?.y === this.peak?.y) return;
     this.peak = peak;
     this.invalidate();
+  }
+
+  // ===== 座標 =====
+
+  private axisNow() {
+    const rate = this.portRate();
+    return freqAxis(rate > 0 ? rate : 48_000);
+  }
+
+  /** 面の中の x の周波数。 */
+  freqAt(x: number): number {
+    const inner = this.inner();
+    return xToFreq(x - inner.x, this.axisNow(), inner.w);
+  }
+
+  /** 周波数の面の中の x。 */
+  xOfFreq(f: number): number {
+    const inner = this.inner();
+    return inner.x + freqToX(f, this.axisNow(), inner.w);
+  }
+
+  /** 面の中の y のイコライザの dB。 */
+  eqDbAt(y: number): number {
+    const inner = this.inner();
+    const s = this.settings.eqScale;
+    return yToDb(y - inner.y, { top: s, bottom: -s }, inner.h);
+  }
+
+  /** イコライザの dB の面の中の y。 */
+  yOfEqDb(db: number): number {
+    const inner = this.inner();
+    const s = this.settings.eqScale;
+    return inner.y + dbToY(db, { top: s, bottom: -s }, inner.h);
+  }
+
+  /** 1 px のイコライザの dB。 */
+  eqDbPerPx(): number {
+    const h = this.inner().h;
+    return h > 0 ? (2 * this.settings.eqScale) / h : 0;
+  }
+
+  /** 1 px のオクターブ。 */
+  octPerPx(): number {
+    const inner = this.inner();
+    const a = this.axisNow();
+    return inner.w > 0 ? Math.log2(a.hi / a.lo) / inner.w : 0;
+  }
+
+  /** 点・Q の印の当たり（選んだ点の印を先に）。 */
+  hitBand(x: number, y: number): BandHit | null {
+    const m = this.eqModel;
+    if (!m) return null;
+    const sel = m.selected;
+    const selBand = sel === null ? undefined : m.bands[sel];
+    if (sel !== null && selBand) {
+      const q = qHandles(selBand);
+      const py = this.yOfEqDb(bandPoint(selBand).db);
+      if (q) {
+        if (Math.hypot(x - this.xOfFreq(q.lo), y - py) <= HIT_RADIUS)
+          return { band: sel, part: 'qLo' };
+        if (Math.hypot(x - this.xOfFreq(q.hi), y - py) <= HIT_RADIUS)
+          return { band: sel, part: 'qHi' };
+      }
+    }
+    let best: BandHit | null = null;
+    let bestD = HIT_RADIUS;
+    m.bands.forEach((b, i) => {
+      const p = bandPoint(b);
+      const d = Math.hypot(x - this.xOfFreq(p.freq), y - this.yOfEqDb(p.db));
+      if (d <= bestD) {
+        best = { band: i, part: 'point' };
+        bestD = d;
+      }
+    });
+    return best;
+  }
+
+  /** ポインタの x の近くの山（後、なければ前。周りより 3 dB 以上高い極大。面の中の CSS px と周波数）。 */
+  peakNear(x: number): { freq: number; x: number; y: number } | null {
+    const values = this.postShown ?? this.preShown;
+    if (!values) return null;
+    const peak = findPeak(this.bands, values, this.freqAt(x));
+    if (!peak) return null;
+    const inner = this.inner();
+    const range = { top: 0, bottom: -this.settings.range };
+    return {
+      freq: peak.freq,
+      x: this.xOfFreq(peak.freq),
+      y: inner.y + Math.min(inner.h, Math.max(0, dbToY(peak.db, range, inner.h))),
+    };
+  }
+
+  /** 帯の中心の後のスペクトルの dB（ホバーの吹き出し。なければ null）。 */
+  specDbAt(f: number): number | null {
+    const values = this.shownPost() ?? this.preShown;
+    if (!values) return null;
+    let best = -1;
+    for (let k = 0; k < this.bands.length; k++) {
+      const b = this.bands[k];
+      if (b && b.lo <= f && f < b.hi) {
+        best = k;
+        break;
+      }
+    }
+    const v = best >= 0 ? values[best] : undefined;
+    return v !== undefined && Number.isFinite(v) ? v : null;
+  }
+
+  /** 合成の曲線の周波数 `f` の dB（ホバーの吹き出し。曲線がなければ null）。 */
+  curveDbAt(f: number): number | null {
+    const curve = this.eqModel?.curve;
+    return curve ? curveAt(curve.freqs, curve.total, f) : null;
+  }
+
+  /** 出す後（「前 ＋ 曲線」なら作る）。 */
+  private shownPost(): Float32Array | null {
+    const curve = this.eqModel?.curve;
+    if (this.postMode === 'approx' && this.preShown && curve) {
+      const out = new Float32Array(this.preShown.length);
+      for (let k = 0; k < out.length; k++) {
+        const b = this.bands[k];
+        const add = b ? curveAt(curve.freqs, curve.total, b.center) : null;
+        out[k] = (this.preShown[k] ?? Number.NEGATIVE_INFINITY) + (add ?? 0);
+      }
+      return out;
+    }
+    return this.postShown;
+  }
+
+  /** 描くイコライザの重ね。 */
+  private eqLayer(): SpectrumEq | null {
+    const m = this.eqModel;
+    if (!m) return null;
+    const curve = m.curve;
+    const pick = (i: number | null) =>
+      i === null ? null : (curve?.bands.find((b) => b.index === i)?.db ?? null);
+    const points: SpectrumPoint[] = m.bands.map((b, i) => {
+      const p = bandPoint(b);
+      const q = i === m.selected ? qHandles(b) : null;
+      return {
+        x: this.xOfFreq(p.freq),
+        y: this.yOfEqDb(p.db),
+        selected: i === m.selected,
+        enabled: b.enabled,
+        q: q ? { left: this.xOfFreq(q.lo), right: this.xOfFreq(q.hi) } : null,
+      };
+    });
+    return {
+      freqs: curve?.freqs ?? [],
+      total: curve?.total ?? [],
+      selected: pick(m.selected),
+      hovered: m.hovered !== m.selected ? pick(m.hovered) : null,
+      points,
+    };
   }
 
   /** 最大の保持を消す（札の［リセット］）。 */
@@ -666,11 +869,11 @@ export class SpectrumController {
       spec: { top: 0, bottom: -s.range },
       eq: { top: s.eqScale, bottom: -s.eqScale },
       bands: this.bands,
-      post: this.postShown,
+      post: this.shownPost(),
       pre: this.preShown,
       hold: this.hold,
-      dimPost: this.dimPost,
-      eqLayer: this.eq,
+      dimPost: this.dimPost || this.postMode === 'dim',
+      eqLayer: this.eqLayer(),
       colors: this.colors,
       font: this.font,
       peak: this.peak,

@@ -10,6 +10,7 @@
 import {
   commands,
   EDIT_OPS,
+  EQ_LIMITS,
   type CommitMode,
   type EditAudioLengthDto,
   type EditAudioMarksDto,
@@ -74,7 +75,7 @@ import {
 } from './bindings';
 import { unwrap } from './result';
 
-export { EDIT_OPS };
+export { EDIT_OPS, EQ_LIMITS };
 
 /**
  * 操作のカタログ（`EDIT_OPS` を型の付いた配列として読む。`as const` の定数は読み取り専用の字面の型なので、引数パネルが

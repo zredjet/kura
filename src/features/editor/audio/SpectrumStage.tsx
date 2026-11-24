@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { type PointerEvent, useEffect, useLayoutEffect, useRef, useState } from 'react';
 
 import { Select } from '../../../components/Select/Select';
 import { ja } from '../../../i18n/ja';
@@ -6,11 +6,16 @@ import type { EditSpecChannelDto } from '../../../ipc/edit';
 import { useEditorStore } from '../editorStore';
 import styles from './Audio.module.css';
 import {
+  sealEq,
+  setEqHover,
   setSpectrumSettings,
   spectrumController,
   useAudioStore,
   usableChannel,
 } from './audioStore';
+import { dbText, freqText } from './eqModel';
+import { SPECTRUM_POINTER } from './spectrumPointer';
+import { noteOf } from './spectrumMath';
 import { DEFAULT_SPECTRUM_COLORS, type SpectrumColors } from './drawSpectrum';
 import { targetNode } from './handles';
 import { SPECTRUM_CHOICES } from './spectrumController';
@@ -194,6 +199,8 @@ export function SpectrumStage() {
   const openId = useEditorStore((s) => s.openId);
   const phase = useEditorStore((s) => s.phase);
   const [stripHeight, setStripHeight] = useState(0);
+  const [hover, setHover] = useState<{ x: number; y: number; lines: string[] } | null>(null);
+  const pointer = useRef<number | null>(null);
 
   // 帯の高さ：上部の下から目盛りと 1 段
   useLayoutEffect(() => {
@@ -250,6 +257,77 @@ export function SpectrumStage() {
     };
   }, [openId, phase, stripHeight]);
 
+  // 選んだ点の上のホイールで Q（ページのスクロールを止めるため passive にしない）
+  useEffect(() => {
+    const host = faceRef.current;
+    if (!host) return;
+    const onWheel = (e: WheelEvent) => {
+      const r = host.getBoundingClientRect();
+      if (SPECTRUM_POINTER.wheel(e.deltaY, e.clientX - r.left, e.clientY - r.top))
+        e.preventDefault();
+    };
+    host.addEventListener('wheel', onWheel, { passive: false });
+    return () => host.removeEventListener('wheel', onWheel);
+  }, []);
+
+  const local = (e: { clientX: number; clientY: number }) => {
+    const r = faceRef.current?.getBoundingClientRect();
+    return { x: e.clientX - (r?.left ?? 0), y: e.clientY - (r?.top ?? 0) };
+  };
+
+  /** ポインタを載せた所：バンドの曲線・山の印・吹き出し。 */
+  const hoverAt = (x: number, y: number) => {
+    const c = spectrumController();
+    if (!c) return;
+    const inner = c.inner();
+    const inside = x >= inner.x && x <= inner.x + inner.w && y >= inner.y && y <= inner.y + inner.h;
+    const hit = c.hitBand(x, y);
+    setEqHover(hit?.band ?? null);
+    const peak = !hit && inside ? c.peakNear(x) : null;
+    c.setPeakMark(peak ? { x: peak.x, y: peak.y } : null);
+    if (!inside) {
+      setHover(null);
+      return;
+    }
+    const f = c.freqAt(x);
+    const note = noteOf(f);
+    const spec = c.specDbAt(f);
+    const curve = c.curveDbAt(f);
+    setHover({
+      x,
+      y,
+      lines: [
+        note ? `${freqText(f)} · ${ts.hoverNote(note.name, note.cents)}` : freqText(f),
+        ...(spec !== null ? [ts.hoverSpec(dbText(spec).replace(' dB', ' dBFS'))] : []),
+        ...(curve !== null ? [ts.hoverCurve(dbText(curve))] : []),
+      ],
+    });
+  };
+
+  const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    faceRef.current?.focus();
+    const { x, y } = local(e);
+    if (SPECTRUM_POINTER.down(e, x, y)) {
+      e.currentTarget.setPointerCapture(e.pointerId);
+      pointer.current = e.pointerId;
+      setHover(null);
+    }
+  };
+
+  const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
+    const { x, y } = local(e);
+    if (pointer.current === e.pointerId) SPECTRUM_POINTER.move(e, x, y);
+    else hoverAt(x, y);
+  };
+
+  const finish = (e: PointerEvent<HTMLDivElement>, canceled: boolean) => {
+    if (pointer.current !== e.pointerId) return;
+    pointer.current = null;
+    const { x, y } = local(e);
+    SPECTRUM_POINTER.up(e, x, y, canceled);
+  };
+
   return (
     <div ref={rootRef} className={styles.spectrumStage}>
       <div className={styles.specStrip} style={{ height: stripHeight }}>
@@ -265,8 +343,38 @@ export function SpectrumStage() {
         aria-label={ts.face}
         // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- 面はキーを取るまとまり
         tabIndex={0}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={(e) => finish(e, false)}
+        onPointerCancel={(e) => finish(e, true)}
+        onPointerLeave={() => {
+          setHover(null);
+          setEqHover(null);
+          spectrumController()?.setPeakMark(null);
+        }}
+        onDoubleClick={(e) => {
+          const { x, y } = local(e);
+          SPECTRUM_POINTER.doubleClick(x, y);
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          const { x, y } = local(e);
+          SPECTRUM_POINTER.contextMenu(e.clientX, e.clientY, x, y);
+        }}
+        onBlur={sealEq}
       >
         <canvas ref={canvasRef} className={styles.wave} aria-hidden="true" />
+        {hover && (
+          <div
+            className={styles.specHover}
+            style={{ transform: `translate(${hover.x + 12}px, ${hover.y + 12}px)` }}
+            aria-hidden="true"
+          >
+            {hover.lines.map((line) => (
+              <span key={line}>{line}</span>
+            ))}
+          </div>
+        )}
         <SpectrumChip />
       </div>
     </div>

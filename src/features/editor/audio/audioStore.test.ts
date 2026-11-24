@@ -62,6 +62,8 @@ import {
   setLoop as setLoopFromField,
 } from './audioTools';
 import { CHUNK, FAIL_RETRY_MS } from './pcmChunks';
+import { SPECTRUM_POINTER } from './spectrumPointer';
+import { useMenuStore } from '../../../components/Menu/menuStore';
 import { audioView, type AudioViewOver, fakeFetch, pcmBytes } from './testAudioView';
 import { WAVE_IDLE_MS } from './waveController';
 
@@ -994,5 +996,133 @@ describe('スペクトルの面（M17 段 5）', () => {
     expect(usableChannel({ type: 'mid' }, 1)).toEqual({ type: 'sum' });
     expect(usableChannel({ type: 'side' }, 2)).toEqual({ type: 'side' });
     expect(usableChannel({ type: 'index', index: 2 }, 2)).toEqual({ type: 'sum' });
+  });
+});
+
+describe('スペクトルの面の点の手（M17 段 5）', () => {
+  const band = {
+    type: 'bell',
+    freq: 1_000,
+    gainDb: 0,
+    q: 1,
+    slope: 12,
+    channel: 'all',
+    enabled: true,
+  };
+  const eqDoc = (bands: unknown[], extra: Record<number, unknown> = {}, order = [5]) =>
+    ({
+      order,
+      nodes: {
+        5: {
+          id: 5,
+          op: 'audio.eq',
+          v: 1,
+          enabled: true,
+          params: { bands, phase: 'minimum', gainDb: 0 },
+        },
+        ...extra,
+      },
+      outputs: [],
+    }) as never;
+
+  async function openSpectrum(doc: never) {
+    await open();
+    useEditorStore.setState({ doc, selected: 5 });
+    setAudioFace('spectrum');
+    const c = spectrumController();
+    if (!c) throw new Error('面がない');
+    c.resize(800, 400, 1);
+    c.setInsets({ top: 0, left: 0, right: 0, bottom: 0 });
+    // 応えを返さない（送った手は手元の値で土台にする）
+    vi.mocked(stepEdit).mockImplementation(() => new Promise(() => undefined));
+    return c;
+  }
+
+  it('点のドラッグ：動いてから preview（操作中）、手元の値で描き、離すと確定。esc でやめると手元の値を捨てる', async () => {
+    const c = await openSpectrum(eqDoc([band]));
+    const x = c.xOfFreq(1_000);
+    const y = c.yOfEqDb(0);
+    expect(SPECTRUM_POINTER.down({ altKey: false }, x, y)).toBe(true);
+    expect(useAudioStore.getState().eqBand).toBe(0);
+    SPECTRUM_POINTER.move({ altKey: false }, x + 1, y);
+    await flush();
+    expect(stepEdit).not.toHaveBeenCalled();
+    SPECTRUM_POINTER.move({ altKey: false }, x + 100, y - 40);
+    await flush();
+    const steps = vi.mocked(stepEdit).mock.calls[0]?.[1];
+    expect(steps?.[0]).toMatchObject({
+      type: 'preview',
+      edit: { type: 'setParam', node: 5, key: 'bands' },
+    });
+    expect(vi.mocked(stepEdit).mock.calls[0]?.[2]).toMatchObject({ interacting: true });
+    const local = useAudioStore.getState().eqLocal;
+    expect(local?.bands[0]?.freq).toBeGreaterThan(1_000);
+    expect(local?.bands[0]?.gainDb).toBeGreaterThan(0);
+    expect(SPECTRUM_POINTER.cancel()).toBe(true);
+    expect(useAudioStore.getState().eqLocal).toBeNull();
+  });
+
+  it('選んだ点の上のホイールで Q（応えの前に続けても前の手を土台にする）。点の外では手にしない', async () => {
+    const c = await openSpectrum(eqDoc([band]));
+    useAudioStore.setState({ eqBand: 0 });
+    const x = c.xOfFreq(1_000);
+    const y = c.yOfEqDb(0);
+    for (let i = 0; i < 3; i++) expect(SPECTRUM_POINTER.wheel(-100, x, y)).toBe(true);
+    expect(useAudioStore.getState().eqLocal?.bands[0]?.q).toBeCloseTo(1.1 ** 3, 9);
+    expect(SPECTRUM_POINTER.wheel(-100, x + 200, y)).toBe(false);
+  });
+
+  it('空きのダブルクリックでベルを足して選び、点のダブルクリックで消す', async () => {
+    const c = await openSpectrum(eqDoc([band]));
+    SPECTRUM_POINTER.doubleClick(c.xOfFreq(4_000), c.yOfEqDb(-6));
+    const added = useAudioStore.getState().eqLocal?.bands;
+    expect(added).toHaveLength(2);
+    expect(added?.[1]?.freq).toBeCloseTo(4_000, 3);
+    expect(added?.[1]?.gainDb).toBeCloseTo(-6, 6);
+    expect(useAudioStore.getState().eqBand).toBe(1);
+    SPECTRUM_POINTER.doubleClick(c.xOfFreq(1_000), c.yOfEqDb(0));
+    expect(useAudioStore.getState().eqLocal?.bands).toHaveLength(1);
+    expect(useAudioStore.getState().eqLocal?.bands[0]?.freq).toBeCloseTo(4_000, 3);
+  });
+
+  it('点の右クリックで型・チャンネル・オン／オフのメニュー', async () => {
+    const c = await openSpectrum(eqDoc([band]));
+    expect(SPECTRUM_POINTER.contextMenu(10, 10, c.xOfFreq(1_000), c.yOfEqDb(0))).toBe(true);
+    const menu = useMenuStore.getState().menu;
+    expect(menu?.label).toBe(ja.editor.audio.spectrum.bandMenu);
+    const types = menu?.entries[0];
+    if (!types || types === 'separator' || !('submenu' in types)) throw new Error('型の項目がない');
+    types.submenu.find((e) => e.label === ja.editor.audio.spectrum.bandTypes.notch)?.onSelect();
+    expect(useAudioStore.getState().eqLocal?.bands[0]?.type).toBe('notch');
+    useMenuStore.getState().close();
+    expect(SPECTRUM_POINTER.contextMenu(10, 10, 5, 5)).toBe(false);
+  });
+
+  it('イコライザがなければ、ダブルクリックで正規化の前にイコライザを 1 手で足す（P5・P6）', async () => {
+    await open();
+    useEditorStore.setState({
+      doc: {
+        order: [6, 7],
+        nodes: {
+          6: { id: 6, op: 'audio.gain', v: 1, enabled: true, params: { db: 0 } },
+          7: { id: 7, op: 'audio.normalize', v: 1, enabled: true, params: {} },
+        },
+        outputs: [],
+      } as never,
+      selected: null,
+    });
+    setAudioFace('spectrum');
+    const c = spectrumController();
+    if (!c) throw new Error('面がない');
+    c.resize(800, 400, 1);
+    c.setInsets({ top: 0, left: 0, right: 0, bottom: 0 });
+    vi.mocked(stepEdit).mockImplementation(() => new Promise(() => undefined));
+    SPECTRUM_POINTER.doubleClick(c.xOfFreq(500), c.yOfEqDb(3));
+    await flush();
+    const steps = vi.mocked(stepEdit).mock.calls[0]?.[1];
+    expect(steps?.[0]).toMatchObject({
+      type: 'commit',
+      edit: { type: 'addNode', at: 1, op: 'audio.eq' },
+    });
   });
 });

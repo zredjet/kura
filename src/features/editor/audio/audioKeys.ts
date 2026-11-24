@@ -38,6 +38,7 @@ import {
   useAudioStore,
 } from './audioStore';
 import { cancelAudioDrag, confirmTrim, selectAudioTool, setInOut } from './audioTools';
+import { SPECTRUM_POINTER } from './spectrumPointer';
 
 const TOOL_KEYS: Record<string, AudioTool> = { s: 'select', t: 'trim', f: 'fade', r: 'loop' };
 
@@ -122,10 +123,11 @@ function down(e: KeyboardEvent, key: string): boolean | null {
 }
 
 /**
- * esc：フェード・ループのドラッグ中ならやめる（仮の値を捨てる）→ 切り詰めをやめる → 選択を外す（どれもなければ核が
- * 閉じる）。
+ * esc：スペクトルの面の点・フェード・ループのドラッグ中ならやめる（仮の値を捨てる）→ 切り詰めをやめる → 選択を外す
+ * （どれもなければ核が閉じる）。
  */
 function escape(): boolean {
+  if (SPECTRUM_POINTER.cancel()) return true;
   if (cancelAudioDrag()) return true;
   if (useAudioStore.getState().trim) {
     cancelTrim();
