@@ -137,6 +137,8 @@ fn random_params(r: &mut ChaCha8Rng, schema: &ParamSchema) -> J {
                 }
             }
             ParamKind::Strokes => J::Array((0..below(r, 4)).map(|_| random_action(r)).collect()),
+            // イコライザのバンドの列（M17 段 2）
+            ParamKind::EqBands => kura_engine::testing::region::random_eq_bands(r),
             _ => spec.default.clone(),
         };
         map.insert(spec.key.to_string(), v);

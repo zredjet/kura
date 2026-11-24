@@ -243,7 +243,7 @@ fn stateful_streamed_encode_equals_encode_bytes() {
         with_state += usize::from(
             g.nodes
                 .iter()
-                .any(|n| n.op == kura_engine::testing::stateful::OP_ID),
+                .any(|n| n.op == kura_engine::testing::stateful::OP_ID || n.op == "audio.eq"),
         );
         checked += check_doc(
             &engine,

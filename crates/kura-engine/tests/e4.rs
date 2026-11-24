@@ -294,6 +294,8 @@ fn random_params(r: &mut ChaCha8Rng, schema: &ParamSchema, kind: Kind) -> J {
             ParamKind::Strokes => {
                 J::Array((0..below(r, 3)).map(|_| paint_action(r, kind)).collect())
             }
+            // イコライザのバンドの列（M17 段 2）
+            ParamKind::EqBands => kura_engine::testing::region::random_eq_bands(r),
             ParamKind::FrameRange => match below(r, 4) {
                 0 => J::Null,
                 _ => {

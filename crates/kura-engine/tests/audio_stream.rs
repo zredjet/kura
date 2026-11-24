@@ -132,7 +132,7 @@ fn windows_concatenate(seed: u64, cases: usize, stateful: bool) -> (usize, usize
         with_state += usize::from(
             g.nodes
                 .iter()
-                .any(|n| n.op == kura_engine::testing::stateful::OP_ID),
+                .any(|n| n.op == kura_engine::testing::stateful::OP_ID || n.op == "audio.eq"),
         );
         let Some(plan) = compile(&engine, &g, &input) else {
             continue;

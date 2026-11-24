@@ -578,3 +578,97 @@ fn stateful_chain_timings() {
         );
     }
 }
+
+/// 測り（M17 段 2 の F6。`--release -- --ignored --nocapture`）：48 kHz ステレオの短い音声（5・10・20・40 秒）に `audio.eq`
+/// （2 次の段 8 と 24）をかけ、バンドの利得を 1 手変えたときの表示（全体。短い音声のエディタの道）の時間。手ごとに状態の表を
+/// 流し直す（入力の全体を 1 回）ので、手間（段 × フレーム）に比例する。中央値（5 回）。
+#[test]
+#[ignore = "測り（--release -- --ignored --nocapture）"]
+fn eq_step_timings() {
+    #![allow(clippy::disallowed_methods)]
+    use kura_engine::ops::audio::eq::{BandType, EqParams, Phase, band};
+    let engine = engine();
+    let bells = |n: usize, gain: f64| -> Vec<kura_engine::ops::audio::eq::Band> {
+        [
+            60.0, 120.0, 250.0, 500.0, 1_000.0, 2_000.0, 4_000.0, 8_000.0,
+        ]
+        .iter()
+        .take(n)
+        .enumerate()
+        .map(|(i, f)| band(BandType::Bell, *f, gain - i as f64 * 0.5, 1.2))
+        .collect()
+    };
+    for secs in [5u64, 10, 20, 40] {
+        let input = InputGen::AudioNoise {
+            rate: 48_000,
+            channels: 2,
+            frames: secs * 48_000,
+            seed: 7,
+        }
+        .generate()
+        .unwrap();
+        for sections in [8usize, 24] {
+            let doc = |gain: f64| {
+                let mut b = bells(8, gain);
+                if sections == 24 {
+                    for kind in [BandType::LowCut, BandType::HighCut] {
+                        let mut c = band(
+                            kind,
+                            if kind == BandType::LowCut {
+                                30.0
+                            } else {
+                                16_000.0
+                            },
+                            0.0,
+                            0.7,
+                        );
+                        c.slope = 96;
+                        b.push(c);
+                    }
+                }
+                let p = EqParams {
+                    bands: b,
+                    phase: Phase::Minimum,
+                    gain_db: 0.0,
+                };
+                let mut g = Graph::new_single();
+                g.push_linear("audio.eq", 1, serde_json::to_value(&p).unwrap(), 1)
+                    .unwrap();
+                g
+            };
+            let req = ViewRequest {
+                output: OutputId(0),
+                area: Area::All,
+                focus: None,
+            };
+            let mut cache = NodeCache::new(512 << 20);
+            let plan = compile(&engine, &doc(3.0), &input);
+            let mut prev = engine
+                .render_view(&plan, &fin(&input), &mut cache, &req, None, &NoMonitor)
+                .unwrap()
+                .view;
+            let mut times = Vec::new();
+            for k in 0..5 {
+                let plan = compile(&engine, &doc(3.5 + k as f64 * 0.5), &input);
+                let t = std::time::Instant::now();
+                let got = engine
+                    .render_view(
+                        &plan,
+                        &fin(&input),
+                        &mut cache,
+                        &req,
+                        Some(&prev),
+                        &NoMonitor,
+                    )
+                    .unwrap();
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                prev = got.view;
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "{secs} 秒・段 {sections}：1 手 {:.1} ms（中央値。最小 {:.1}・最大 {:.1}）",
+                times[2], times[0], times[4]
+            );
+        }
+    }
+}

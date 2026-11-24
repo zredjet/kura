@@ -1308,6 +1308,52 @@ pub fn random_stateful_op(r: &mut ChaCha8Rng) -> (&'static str, serde_json::Valu
     )
 }
 
+/// ランダムなイコライザのバンドの列（M17 段 2。0〜6 個。範囲の中で、ローカット・バンドパスは 3 kHz まで（低いレートでも
+/// ナイキストを超えにくく）、ほかは 20 Hz〜20 kHz（ナイキストを超えれば推論の扱いで止める・外す）。ときどきオフ・M/S・L・R）。
+pub fn random_eq_bands(r: &mut ChaCha8Rng) -> serde_json::Value {
+    let kinds = [
+        "bell",
+        "lowShelf",
+        "highShelf",
+        "lowCut",
+        "highCut",
+        "notch",
+        "bandPass",
+        "tilt",
+    ];
+    let channels = ["all", "all", "all", "left", "right", "mid", "side"];
+    let n = below(r, 7);
+    let bands: Vec<serde_json::Value> = (0..n)
+        .map(|_| {
+            let kind = kinds[below(r, kinds.len() as u64) as usize];
+            let top: u64 = if matches!(kind, "lowCut" | "bandPass") {
+                3_000
+            } else {
+                20_000
+            };
+            // 20 Hz〜top（0.1 Hz 刻み。低い周波数を多めに：2 回引いた小さいほう）
+            let span = (top - 20) * 10;
+            let freq = (200 + below(r, span + 1).min(below(r, span + 1))) as f64 / 10.0;
+            let q_max = if kind.ends_with("Shelf") { 40 } else { 400 };
+            // 整数の値は整数で書く（正規の JSON は 2017.0 を 2017 と書くので、往復で同じ文書になるように）
+            let num = |x: f64| {
+                let i = x as i64;
+                if i as f64 == x { json!(i) } else { json!(x) }
+            };
+            json!({
+                "type": kind,
+                "freq": num(freq),
+                "gainDb": num((below(r, 601) as f64 - 300.0) / 10.0),
+                "q": num((1 + below(r, q_max)) as f64 / 10.0),
+                "slope": crate::ops::audio::eq::SLOPES[below(r, 8) as usize],
+                "channel": channels[below(r, channels.len() as u64) as usize],
+                "enabled": below(r, 8) != 0,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(bands)
+}
+
 /// [`random_audio_op`] の、`stateful` なら 4 回に 1 回は試験の状態を運ぶ操作（[`random_stateful_op`]）を選ぶ版（M17 段 1。
 /// 試験用のエンジン `testing::stateful::engine` で使う）。`stateful` が偽なら [`random_audio_op`] と同じ乱数の列。
 pub fn random_audio_op_in(
@@ -1316,6 +1362,17 @@ pub fn random_audio_op_in(
     stateful: bool,
 ) -> (&'static str, serde_json::Value) {
     if stateful && below(r, 4) == 0 {
+        // 試験の操作とイコライザ（M17 段 2）を半々に
+        if below(r, 2) == 0 {
+            return (
+                "audio.eq",
+                json!({
+                    "bands": random_eq_bands(r),
+                    "phase": "minimum",
+                    "gainDb": (below(r, 120) as f64 - 60.0) / 10.0 + 0.05,
+                }),
+            );
+        }
         return random_stateful_op(r);
     }
     let (rate, frames) = match shape {
